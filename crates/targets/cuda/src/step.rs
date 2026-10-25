@@ -741,12 +741,48 @@ pub enum MatmulKernel {
     Gemv,
 }
 
+/// Which buffer a MoE step's weight index names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum MoeWeight {
+    /// Qwen's packed bundle ([`moe_bundle`]): the router at byte 0, then every expert's fused gate
+    /// and up, then every expert's down.
+    Bundle,
+    /// Gemma's own tensors: the router step's `[experts, hidden]` projection, an expert step's
+    /// expert bank ([`expert_bank`]: every expert's fused gate and up, then every expert's down,
+    /// with no router).
+    Own,
+}
+
+impl MoeWeight {
+    /// The layout an expert step reads its slab from: the bundle's, or the bank's (its gate and
+    /// up at byte 0). `None` on overflow.
+    pub const fn experts(self, experts: u32, hidden: u32, inter: u32) -> Option<MoeBundle> {
+        match self {
+            Self::Bundle => moe_bundle(experts, hidden, inter),
+            Self::Own => expert_bank(experts, hidden, inter),
+        }
+    }
+
+    /// The bytes a router step reads its weight as: the whole bundle, or the projection.
+    pub const fn router_bytes(self, experts: u32, hidden: u32, inter: u32) -> Option<u64> {
+        match self {
+            Self::Bundle => match moe_bundle(experts, hidden, inter) {
+                Some(b) => Some(b.bytes),
+                None => None,
+            },
+            Self::Own => bf16_bytes(experts, hidden),
+        }
+    }
+}
+
 /// `logits[m, experts] = x[m, hidden] · routerᵀ`, the router `[experts, hidden]` bf16 at byte 0
-/// of the MoE bundle `bundle` ([`moe_bundle`]), into the tape's MoE logits region.
+/// of `bundle` (the MoE bundle, [`moe_bundle`], or Gemma's own projection, as `weight` says), into
+/// the tape's MoE logits region. Gemma's `x` is the MoE scratch's router-norm rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct RouterLogitsBf16 {
     pub x: ArenaOffset,
     pub bundle: WeightIx,
+    pub weight: MoeWeight,
     pub logits: ArenaOffset,
     pub m: u32,
     pub experts: u32,
@@ -868,6 +904,8 @@ impl ExpertProjection {
 pub struct ExpertGemmBf16 {
     pub a: ArenaOffset,
     pub bundle: WeightIx,
+    /// The bundle's layout: Qwen's MoE bundle, or Gemma's expert bank.
+    pub weight: MoeWeight,
     pub proj: ExpertProjection,
     pub offsets: ArenaOffset,
     pub tile_expert: ArenaOffset,
@@ -904,6 +942,8 @@ pub struct ExpertGemvBf16 {
     pub a: ArenaOffset,
     pub rows: PairRows,
     pub bundle: WeightIx,
+    /// As [`ExpertGemmBf16::weight`].
+    pub weight: MoeWeight,
     pub proj: ExpertProjection,
     pub topk_idx: ArenaOffset,
     pub c: ArenaOffset,
@@ -995,6 +1035,21 @@ pub const fn moe_bundle(experts: u32, hidden: u32, inter: u32) -> Option<MoeBund
         gate_up,
         down,
         bytes,
+    })
+}
+
+/// Gemma's expert bank, [`moe_bundle`] with no router: the fused gate and up `[experts, 2·inter,
+/// hidden]` at byte 0, then the down `[experts, hidden, inter]`. Its `router` is 0 and empty.
+/// `None` when a byte count overflows `u64`.
+pub const fn expert_bank(experts: u32, hidden: u32, inter: u32) -> Option<MoeBundle> {
+    let Some(b) = moe_bundle(experts, hidden, inter) else {
+        return None;
+    };
+    Some(MoeBundle {
+        router: 0,
+        gate_up: 0,
+        down: b.down - b.gate_up,
+        bytes: b.bytes - b.gate_up,
     })
 }
 
@@ -1312,6 +1367,7 @@ impl CudaStep {
             Self::RouterLogits(RouterLogitsBf16 {
                 x,
                 bundle,
+                weight,
                 logits,
                 m,
                 experts,
@@ -1322,7 +1378,7 @@ impl CudaStep {
                 let (Some(xb), Some(lb), Some(bu)) = (
                     bf16_bytes(m, hidden),
                     bf16_bytes(m, experts),
-                    moe_bundle(experts, hidden, inter),
+                    weight.router_bytes(experts, hidden, inter),
                 ) else {
                     return None;
                 };
@@ -1332,7 +1388,7 @@ impl CudaStep {
                     second_write: None,
                     weight: Some(WeightRead {
                         ix: bundle,
-                        bytes: bu.bytes,
+                        bytes: bu,
                     }),
                     kv: None,
                     gdn: None,
@@ -1396,7 +1452,7 @@ impl CudaStep {
                 let (Some(ab), Some(cb), Some(bu)) = (
                     (rows * k as u64).checked_mul(CUDA_ACT_BYTES),
                     (rows * n as u64).checked_mul(CUDA_ACT_BYTES),
-                    moe_bundle(g.experts, g.hidden, g.inter),
+                    g.weight.experts(g.experts, g.hidden, g.inter),
                 ) else {
                     return None;
                 };
@@ -1429,7 +1485,7 @@ impl CudaStep {
                 let (Some(ab), Some(cb), Some(bu)) = (
                     bf16_bytes(a_rows, k),
                     bf16_bytes(pairs, n),
-                    moe_bundle(g.experts, g.hidden, g.inter),
+                    g.weight.experts(g.experts, g.hidden, g.inter),
                 ) else {
                     return None;
                 };

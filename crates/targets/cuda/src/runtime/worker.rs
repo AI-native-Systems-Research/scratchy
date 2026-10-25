@@ -41,8 +41,8 @@ use crate::step::{
     AddBf16, AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16,
     ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16,
     GatedDeltaNetBf16, GemmBf16, KV_APPEND_BF16_HEAD_DIM, MOE_ROUTE_EXPERTS, MatmulKernel,
-    MoeRouteBf16, PairRows, RmsNormBf16, RopeAppendBf16, RopeBf16, RouterLogitsBf16, SiluMulBf16,
-    moe_bundle,
+    MoeRouteBf16, MoeWeight, PairRows, RmsNormBf16, RopeAppendBf16, RopeBf16, RouterLogitsBf16,
+    SiluMulBf16,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape, TapeError,
@@ -569,7 +569,7 @@ fn gdn_pool_layout(layout: &GdnStateLayout, layers: usize) -> Option<(Vec<(u64, 
 /// The name of `s` when it is a step the lowering emits and no kernel launches yet: every Gemma
 /// step (#885's 13b and 13c), a rope or attention of a class with a window or a head dim not 256
 /// or a half-head pairing, a Gemma routing, an expert step at another count than 256 or on
-/// 64-column tiles. `None` for every step a Qwen tape holds.
+/// 64-column tiles, and a router or expert step reading Gemma's own tensors. `None` for every step a Qwen tape holds.
 fn not_launched(tape: &CudaTape, s: &CudaStep) -> Option<&'static str> {
     use crate::step::{RopePairing, RouteProgram};
     let qwen_class = |layer: u32| {
@@ -607,12 +607,24 @@ fn not_launched(tape: &CudaTape, s: &CudaStep) -> Option<&'static str> {
         }) if program != RouteProgram::QwenSoftmax || experts != MOE_ROUTE_EXPERTS => {
             Some("MoeRoute")
         }
-        CudaStep::RouterLogits(r) if r.experts != MOE_ROUTE_EXPERTS => Some("RouterLogits"),
+        CudaStep::RouterLogits(r)
+            if r.experts != MOE_ROUTE_EXPERTS || r.weight != MoeWeight::Bundle =>
+        {
+            Some("RouterLogits")
+        }
         CudaStep::ExpertSort(e) if e.experts != MOE_ROUTE_EXPERTS => Some("ExpertSort"),
-        CudaStep::ExpertGemm(e) if e.experts != MOE_ROUTE_EXPERTS || e.n_tile != 256 => {
+        CudaStep::ExpertGemm(e)
+            if e.experts != MOE_ROUTE_EXPERTS
+                || e.n_tile != 256
+                || e.weight != MoeWeight::Bundle =>
+        {
             Some("ExpertGemm")
         }
-        CudaStep::ExpertGemv(e) if e.experts != MOE_ROUTE_EXPERTS => Some("ExpertGemv"),
+        CudaStep::ExpertGemv(e)
+            if e.experts != MOE_ROUTE_EXPERTS || e.weight != MoeWeight::Bundle =>
+        {
+            Some("ExpertGemv")
+        }
         _ => None,
     }
 }
@@ -1855,11 +1867,11 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
     /// expert's block (the expert stride in rows of `k`), or `None` on overflow.
     fn expert_slab(
         weights: &[DeviceBuffer],
-        bundle: WeightIx,
+        (bundle, weight): (WeightIx, MoeWeight),
         proj: ExpertProjection,
         (experts, hidden, inter): (u32, u32, u32),
     ) -> Option<(*const c_void, u32)> {
-        let layout = moe_bundle(experts, hidden, inter)?;
+        let layout = weight.experts(experts, hidden, inter)?;
         let (part, stride) = proj.slab(layout, hidden, inter)?;
         let (_, k) = proj.n_k(hidden, inter);
         let row_bytes = u64::from(k).checked_mul(CUDA_ACT_BYTES)?;
@@ -1878,9 +1890,12 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         stream: &Stream,
     ) -> Result<(), KernelError> {
         let (n, k) = g.n_k();
-        let Some((b, expert_rows)) =
-            Self::expert_slab(weights, g.bundle, g.proj, (g.experts, g.hidden, g.inter))
-        else {
+        let Some((b, expert_rows)) = Self::expert_slab(
+            weights,
+            (g.bundle, g.weight),
+            g.proj,
+            (g.experts, g.hidden, g.inter),
+        ) else {
             return Err(KernelError::MoeShape {
                 kernel: "expert_gemm_bf16",
                 dims: [g.max_tiles, n, k, 0],
@@ -1913,9 +1928,12 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         stream: &Stream,
     ) -> Result<(), KernelError> {
         let (n, k) = g.n_k();
-        let Some((b, expert_rows)) =
-            Self::expert_slab(weights, g.bundle, g.proj, (g.experts, g.hidden, g.inter))
-        else {
+        let Some((b, expert_rows)) = Self::expert_slab(
+            weights,
+            (g.bundle, g.weight),
+            g.proj,
+            (g.experts, g.hidden, g.inter),
+        ) else {
             return Err(KernelError::MoeShape {
                 kernel: "expert_gemv_bf16",
                 dims: [g.m, g.top_k, n, k],

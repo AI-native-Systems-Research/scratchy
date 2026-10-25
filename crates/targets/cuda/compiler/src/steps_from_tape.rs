@@ -32,7 +32,7 @@ use scratchy_target_cuda::step::{
     GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_NARROW_BF16_MAX_N, GEMM_NARROW_BF16_MULTIPLE,
     GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE, GateApplyBf16, GateScaleBf16, GateSplitBf16,
     GatedDeltaNetBf16, GemmBf16, LayerScaleBf16, MOE_ROUTE_EXPERTS, MOE_ROUTE_MAX_TOP_K,
-    MatmulKernel, MoeRouteBf16, PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE,
+    MatmulKernel, MoeRouteBf16, MoeWeight, PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE,
     ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram,
     RouterLogitsBf16, SCALE_BF16_COLS, SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS, ScaleBf16,
     SiluMulBf16, SoftCapBf16,
@@ -116,7 +116,10 @@ pub fn lower_step(
         } => attention(cx, s, *geom, *scale, *mask, computes),
         L::GatedDeltaNet => gated_delta_net(cx, s).map(CudaStep::GatedDeltaNet),
         L::RouterLogits { experts, router } => {
-            router_logits(cx, s, experts.get(), *router).map(CudaStep::RouterLogits)
+            router_logits(cx, s, experts.get(), *router, computes).map(CudaStep::RouterLogits)
+        }
+        L::RouterNorm { eps, router } => {
+            router_norm(cx, s, *eps, *router).map(CudaStep::RouterNorm)
         }
         L::ExpertSort { experts, k, bundle } => {
             return expert_sort(cx, s, (experts.get(), k.get()), *bundle, computes)
@@ -141,12 +144,14 @@ pub fn lower_step(
         L::ScalarWeightMul => layer_scale(cx, s).map(CudaStep::LayerScale),
         L::TanhSoftCap { cap } => soft_cap(cx, s, *cap).map(CudaStep::SoftCap),
         // A routing runs only as the `MoeRoute` fold its top-k drives: one the fold left (a
-        // softmax or argsort it did not absorb, a top-k driving none, a gather or renorm no
-        // top-k took as its epilogue) has no kernel.
+        // softmax or argsort it did not absorb, a top-k driving none, a gather, scale, renorm or
+        // per-expert scale no top-k took as its epilogue) has no kernel.
         L::RouteSoftmax
         | L::RouteArgsort
         | L::RouteTopK { .. }
         | L::RouteGatherScores
+        | L::RouteScale { .. }
+        | L::RouteExpertScale { .. }
         | L::RouteRenorm => Err(CanonicalRefusal::MoeShape {
             step: s.step,
             op: op.name(),
@@ -172,11 +177,8 @@ pub fn lower_step(
         | L::EncoderAttn { .. }
         | L::Mamba2 { .. }
         | L::Mean
-        | L::RouterNorm { .. }
         | L::RouteSigmoidBias { .. }
         | L::RouteBias { .. }
-        | L::RouteScale { .. }
-        | L::RouteExpertScale { .. }
         | L::ExpertAct { .. }
         | L::KvEncode { .. }
         | L::KvStage { .. }
@@ -1253,24 +1255,36 @@ fn moe_counts(
     Ok(())
 }
 
-/// `RouterLogits { experts, router }` as the bf16 GEMM over the router at byte 0 of the layer's
-/// MoE bundle: `x` (operand 0) a computed slot or the embedded hidden, `[m, hidden]`; the bundle
-/// (operand 1) a `[1, 1]` source bound to the layer's MoE weight. The tiled GEMM, or the GEMV at
-/// one row, as [`gemm_kernel`] chooses for a `MatmulTile` (the router's `n` is its experts, never
-/// narrow). Only the shared-fused router: its bundle is the one `op_abi::CUDA_GROUPED_EXPERTS`
-/// names.
+/// The expert bundle of a router, and the buffer its weight is: Qwen's shared-fused router reads
+/// its bundle, Gemma's its own projection beside the SwitchGLU bank. `None` for a router CUDA has
+/// no MoE step for.
+fn router_weight(router: RouterBundle) -> Option<(ExpertBundle, MoeWeight)> {
+    match router {
+        RouterBundle::SharedFused => Some((ExpertBundle::SharedFused, MoeWeight::Bundle)),
+        RouterBundle::Gemma => Some((ExpertBundle::SwitchGlu, MoeWeight::Own)),
+        RouterBundle::Fused | RouterBundle::GptOss => None,
+    }
+}
+
+/// `RouterLogits { experts, router }` as the bf16 GEMM over the router: at byte 0 of the layer's
+/// MoE bundle (Qwen), or Gemma's own `[experts, hidden]` projection. `x` (operand 0) is `[m,
+/// hidden]`: a computed slot or the embedded hidden, or (Gemma) the `RouterNorm` it reads, in the
+/// MoE scratch's router-norm rows. The weight (operand 1) is a source bound to the bundle or the
+/// projection. The tiled GEMM, or the GEMV at one row, as [`gemm_kernel`] chooses for a
+/// `MatmulTile` (the router's `n` is its experts, never narrow). Only a router whose bundle
+/// `op_abi::CUDA_GROUPED_EXPERTS` names.
 fn router_logits(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
     experts: u32,
     router: RouterBundle,
+    computes: &[TapeStep<'_>],
 ) -> Result<RouterLogitsBf16, CanonicalRefusal> {
     let (step, node) = (s.step, s.node);
-    if router != RouterBundle::SharedFused
-        || !CUDA_GROUPED_EXPERTS.contains(&ExpertBundle::SharedFused)
-    {
-        return Err(moe_refusal(s, MoeShapeRule::Bundle));
-    }
+    let weight = match router_weight(router) {
+        Some((bundle, weight)) if CUDA_GROUPED_EXPERTS.contains(&bundle) => weight,
+        _ => return Err(moe_refusal(s, MoeShapeRule::Bundle)),
+    };
     let (x, w) = match node.inputs.as_slice() {
         [x, w] => (x, w),
         _ => return Err(operand(s, 1, OperandRefusal::Missing)),
@@ -1284,6 +1298,9 @@ fn router_logits(
     }
     same_shape(cx, s, 0, x, m, hidden)?;
     whole_tensors(cx, s, &[(0, x), (1, w)])?;
+    if weight == MoeWeight::Own {
+        same_shape(cx, s, 1, w, hidden, experts)?;
+    }
     let kernel = match m {
         1 => gemv_shape(experts, hidden).map(|()| MatmulKernel::Gemv),
         _ => gemm_shape(m, experts, hidden).map(|()| MatmulKernel::Tiled),
@@ -1297,11 +1314,25 @@ fn router_logits(
     })?;
     let at = arena(cx)?;
     let mut inputs = s.inputs.iter();
-    let xc = activation(cx, s, 0, inputs.next())?;
+    // Gemma's router reads its own pre-norm, which the scratch holds; Qwen's reads the hidden.
+    let x = match router {
+        RouterBundle::Gemma => {
+            moe_producer(cx, s, 0, computes, |op| {
+                matches!(op, SubOp::RouterNorm { .. })
+            })?;
+            inputs.next();
+            let region = moe
+                .router_norm
+                .ok_or(moe_refusal(s, MoeShapeRule::Geometry))?;
+            region.offset
+        }
+        _ => at(activation(cx, s, 0, inputs.next())?),
+    };
     let bundle = weight_operand(cx, s, 1, inputs.next())?;
     Ok(RouterLogitsBf16 {
-        x: at(xc),
+        x,
         bundle,
+        weight,
         logits: moe.logits.offset,
         m,
         experts,
@@ -1311,10 +1342,16 @@ fn router_logits(
     })
 }
 
-/// The `MoeRoute` fold its `RouteTopK { k }` drives, as the one routing launch: the folded
-/// softmax (the fold's `pre`) over the `RouterLogits` it reads, its argsort (the fold's `sort`),
-/// the top-k, the gathered scores and, when the fold took one as tail stage 1, their renorm.
-/// No other pre or tail stage: CUDA routes Qwen's softmax-first way only.
+/// The `MoeRoute` fold its `RouteTopK { k }` drives, as the one routing launch, in one of two
+/// programs:
+/// - Qwen's: the folded softmax (the fold's `pre`) over the `RouterLogits` it reads, its argsort
+///   (the fold's `sort`), the top-k, the gathered scores and, when the fold took one as tail stage
+///   1, their renorm;
+/// - Gemma's: no `pre`, the argsort and top-k over the raw logits, the gathered scores times the
+///   `RouteScale` (tail stage 0), their softmax (stage 1), and the `RouteExpertScale` by the
+///   router's per-expert scale (stage 2, its operand 2 a `[1, experts]` weight).
+///
+/// No other pre or tail stage.
 fn moe_route(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
@@ -1323,9 +1360,7 @@ fn moe_route(
 ) -> Result<MoeRouteBf16, CanonicalRefusal> {
     let routing = || moe_refusal(s, MoeShapeRule::Routing);
     let FusedShape::Route {
-        pre: Some(pre),
-        tail: [None, renorm, None, None],
-        ..
+        sort, pre, tail, ..
     } = shape
     else {
         return Err(routing());
@@ -1333,22 +1368,55 @@ fn moe_route(
     let SubOp::RouteTopK { k } = s.node.op else {
         return Err(routing());
     };
-    let softmax = (computes.iter().find(|c| c.writes == pre))
-        .filter(|c| matches!(c.node.op, SubOp::RouteSoftmax))
-        .ok_or_else(routing)?;
-    let logits = moe_producer(cx, softmax, 0, computes, |op| {
+    let at = |slot: SlotId| computes.iter().find(|c| c.writes == slot);
+    let of = |slot: SlotId, want: fn(&SubOp) -> bool| at(slot).filter(|c| want(&c.node.op));
+    // The step the logits are read through: the softmax (Qwen), else the argsort (Gemma).
+    let (reader, program, renorm, expert_scale) = match (pre, tail) {
+        (Some(pre), [None, renorm, None, None]) => {
+            let softmax = of(pre, |op| matches!(op, SubOp::RouteSoftmax)).ok_or_else(routing)?;
+            if renorm.is_some_and(|r| of(r, |op| matches!(op, SubOp::RouteRenorm)).is_none()) {
+                return Err(routing());
+            }
+            (softmax, RouteProgram::QwenSoftmax, renorm.is_some(), None)
+        }
+        (None, [Some(scale), Some(softmax), Some(per_expert), None]) => {
+            let scale = at(scale).ok_or_else(routing)?;
+            let SubOp::RouteScale { scale: by } = scale.node.op else {
+                return Err(routing());
+            };
+            of(softmax, |op| matches!(op, SubOp::RouteSoftmax)).ok_or_else(routing)?;
+            let per_expert = of(per_expert, |op| {
+                matches!(op, SubOp::RouteExpertScale { .. })
+            })
+            .ok_or_else(routing)?;
+            finite_scalar(scale, by, true)?;
+            let argsort = of(sort, |op| matches!(op, SubOp::RouteArgsort)).ok_or_else(routing)?;
+            let program = RouteProgram::GemmaScaledSoftmax {
+                scale_bits: by.to_bits(),
+            };
+            (argsort, program, false, Some(per_expert))
+        }
+        _ => return Err(routing()),
+    };
+    let logits = moe_producer(cx, reader, 0, computes, |op| {
         matches!(op, SubOp::RouterLogits { .. })
     })?;
     let SubOp::RouterLogits { experts, .. } = logits.node.op else {
         return Err(routing());
     };
-    if renorm.is_some_and(|r| {
-        !(computes.iter()).any(|c| c.writes == r && matches!(c.node.op, SubOp::RouteRenorm))
-    }) {
-        return Err(routing());
-    }
     let moe = moe_tape(cx, s)?;
     moe_counts(cx, s, &moe, (experts.get(), k.get()))?;
+    let expert_scale = match expert_scale {
+        Some(per_expert) => {
+            let [_, _, w] = per_expert.node.inputs.as_slice() else {
+                return Err(operand(per_expert, 2, OperandRefusal::Missing));
+            };
+            same_shape(cx, per_expert, 2, w, 1, moe.experts)?;
+            let input = per_expert.inputs.iter().nth(2);
+            Some(weight_operand(cx, per_expert, 2, input)?)
+        }
+        None => None,
+    };
     Ok(MoeRouteBf16 {
         logits: moe.logits.offset,
         topk_idx: moe.topk_idx.offset,
@@ -1356,9 +1424,59 @@ fn moe_route(
         m: cx.tokens.unwrap_or(0),
         experts: moe.experts,
         top_k: moe.top_k,
-        renorm: renorm.is_some(),
-        program: RouteProgram::QwenSoftmax,
-        expert_scale: None,
+        renorm,
+        program,
+        expert_scale,
+    })
+}
+
+/// `RouterNorm { eps, router }` as the bf16 RMSNorm of Gemma's router input into the MoE
+/// scratch's router-norm rows: `x` (operand 0) `[m, hidden]` a computed slot or the embedded
+/// hidden, its gain (operand 1) the router's `[1, hidden]` `router.scale`. Only Gemma's router has
+/// a pre-norm.
+fn router_norm(
+    cx: &StepCx<'_>,
+    s: &TapeStep<'_>,
+    eps: f32,
+    router: RouterBundle,
+) -> Result<RmsNormBf16, CanonicalRefusal> {
+    if router != RouterBundle::Gemma {
+        return Err(moe_refusal(s, MoeShapeRule::Bundle));
+    }
+    let (x, g) = match s.node.inputs.as_slice() {
+        [x, g] => (x, g),
+        _ => return Err(operand(s, 1, OperandRefusal::Missing)),
+    };
+    let moe = moe_tape(cx, s)?;
+    let region = moe
+        .router_norm
+        .ok_or(moe_refusal(s, MoeShapeRule::Geometry))?;
+    let TensorShape { rows, cols } = cx.graph.shape(s.node.output.tensor);
+    if cx.tokens != Some(rows) {
+        return Err(moe_refusal(s, MoeShapeRule::Rows));
+    }
+    if cols != moe.hidden {
+        return Err(moe_refusal(s, MoeShapeRule::Geometry));
+    }
+    row_shape(s, rows, cols, RMS_NORM_BF16_COLS)?;
+    if !(eps.is_finite() && eps > 0.0) {
+        return Err(CanonicalRefusal::NormEps { step: s.step, eps });
+    }
+    same_shape(cx, s, 0, x, rows, cols)?;
+    same_shape(cx, s, 1, g, 1, cols)?;
+    whole_tensors(cx, s, &[(0, x), (1, g)])?;
+    let at = arena(cx)?;
+    let mut inputs = s.inputs.iter();
+    let xc = activation(cx, s, 0, inputs.next())?;
+    let gain = weight_operand(cx, s, 1, inputs.next())?;
+    Ok(RmsNormBf16 {
+        x: at(xc),
+        gain,
+        y: region.offset,
+        rows,
+        cols,
+        eps_bits: eps.to_bits(),
+        convention: GainConvention::Scale,
     })
 }
 
@@ -1443,6 +1561,11 @@ fn expert_matmul(
         return Err(moe_refusal(s, MoeShapeRule::Routing));
     };
     let moe = expert_bundle(cx, s, bundle, (experts.get(), top_k))?;
+    // Gemma's SwitchGLU bank is its own expert bank, with no router in it.
+    let layout = match bundle {
+        ExpertBundle::SwitchGlu => MoeWeight::Own,
+        _ => MoeWeight::Bundle,
+    };
     let (projection, reads) = match proj {
         ExpertProj::Gate => (ExpertProjection::Gate, PairRows::Token),
         ExpertProj::Up => (ExpertProjection::Up, PairRows::Token),
@@ -1481,6 +1604,7 @@ fn expert_matmul(
             a,
             rows: reads,
             bundle,
+            weight: layout,
             proj: projection,
             topk_idx: moe.topk_idx.offset,
             c: out.1.offset,
@@ -1504,6 +1628,7 @@ fn expert_matmul(
     Ok(CudaStep::ExpertGemm(ExpertGemmBf16 {
         a,
         bundle,
+        weight: layout,
         proj: projection,
         offsets: sorted.offsets.offset,
         tile_expert: sorted.tile_expert.offset,
@@ -1586,7 +1711,10 @@ fn expert_combine(
     }
     moe_producer(cx, s, 0, computes, |op| matches!(op, SubOp::ExpertUnsort))?;
     moe_producer(cx, s, 1, computes, |op| {
-        matches!(op, SubOp::RouteGatherScores | SubOp::RouteRenorm)
+        matches!(
+            op,
+            SubOp::RouteGatherScores | SubOp::RouteRenorm | SubOp::RouteExpertScale { .. }
+        )
     })?;
     let moe = moe_tape(cx, s)?;
     let m = cx.tokens.unwrap_or(0);

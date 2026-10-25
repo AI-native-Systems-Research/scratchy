@@ -1782,6 +1782,9 @@ pub struct MoeGeometry {
     pub top_k: u32,
     pub hidden: u32,
     pub inter: u32,
+    /// Whether the block's router reads a pre-norm of its own (Gemma's `RouterNorm`), which the
+    /// scratch then holds in its router-norm rows.
+    pub router_norm: bool,
 }
 
 /// The canonical's MoE geometry, or `None` when it has no MoE op: the experts of its first
@@ -1802,16 +1805,19 @@ fn moe_geometry(plan: &CudaPlan) -> Option<MoeGeometry> {
         SubOp::ExpertCombine { hidden, .. } => Some(hidden),
         _ => None,
     })?;
+    let router_norm = tape_steps(plan).any(|s| matches!(s.node.op, SubOp::RouterNorm { .. }));
     Some(MoeGeometry {
         experts,
         top_k,
         hidden,
         inter,
+        router_norm,
     })
 }
 
 /// The MoE scratch of `geometry` at `bucket_m` rows, placed by `place`: its regions in
-/// `MoeTape`'s order, sorted when the bucket's pairs reach `op_abi::CUDA_SORTED_PAIRS`.
+/// `MoeTape`'s order, sorted when the bucket's pairs reach `op_abi::CUDA_SORTED_PAIRS`, then the
+/// router-norm rows (`[bucket_m, hidden]` bf16) when the block's router has a pre-norm.
 fn moe_scratch(
     bucket_m: u32,
     g: MoeGeometry,
@@ -1828,6 +1834,16 @@ fn moe_scratch(
             bytes: b,
         });
     }
+    let router_norm = match g.router_norm {
+        true => {
+            let b = elements_bytes(bucket_m, g.hidden).ok_or(ArenaRefusal::TooLarge)?;
+            Some(ArenaSpan {
+                offset: ArenaOffset(place(b)?),
+                bytes: b,
+            })
+        }
+        false => None,
+    };
     let (head, tail) = spans.split_at(3);
     let (sort, experts) = if sorted {
         let (s, e) = tail.split_at(6);
@@ -1858,7 +1874,7 @@ fn moe_scratch(
         up: experts[1],
         act: experts[2],
         down: experts[3],
-        router_norm: None,
+        router_norm,
     })
 }
 

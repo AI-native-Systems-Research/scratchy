@@ -48,7 +48,7 @@ use scratchy_subtile::handoff::{
 };
 use scratchy_target_cuda::step::{
     CudaStep, EmbedBf16, ExpertGemmBf16, ExpertGemvBf16, GatedDeltaNetBf16, GemmBf16,
-    LayerScaleBf16, MoeRouteBf16, RmsNormBf16, RouterLogitsBf16, gdn_conv_dim,
+    LayerScaleBf16, MoeRouteBf16, MoeWeight, RmsNormBf16, RouterLogitsBf16, gdn_conv_dim,
 };
 use scratchy_target_cuda::tape::{ArenaLayout, CudaTape, GdnTape, KvTape, TapeError, WeightIx};
 use scratchy_target_cuda::weights::CudaWeight;
@@ -101,6 +101,7 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "RouterLogitsBf16",
                 "MatmulKernel",
                 "MoeRouteBf16",
+                "MoeWeight",
                 "ExpertSortBf16",
                 "ExpertGemmBf16",
                 "ExpertGemvBf16",
@@ -493,6 +494,7 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         }
         CudaStep::RouterLogits(RouterLogitsBf16 {
             bundle,
+            weight: MoeWeight::Bundle,
             experts,
             hidden,
             inter,
@@ -500,6 +502,7 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         })
         | CudaStep::ExpertGemm(ExpertGemmBf16 {
             bundle,
+            weight: MoeWeight::Bundle,
             experts,
             hidden,
             inter,
@@ -507,11 +510,32 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         })
         | CudaStep::ExpertGemv(ExpertGemvBf16 {
             bundle,
+            weight: MoeWeight::Bundle,
             experts,
             hidden,
             inter,
             ..
         }) => Some((bundle, Role::MoeBundle([experts, hidden, inter]))),
+        // Gemma's router projection, one bf16 tensor.
+        CudaStep::RouterLogits(RouterLogitsBf16 {
+            bundle,
+            weight: MoeWeight::Own,
+            experts,
+            hidden,
+            ..
+        }) => Some((
+            bundle,
+            Role::Bf16([u64::from(experts), u64::from(hidden)], 2),
+        )),
+        // Gemma's expert bank: its role is item 5's (`CudaWeight::ExpertBank`).
+        CudaStep::ExpertGemm(ExpertGemmBf16 {
+            weight: MoeWeight::Own,
+            ..
+        })
+        | CudaStep::ExpertGemv(ExpertGemvBf16 {
+            weight: MoeWeight::Own,
+            ..
+        }) => None,
         CudaStep::Add(_)
         | CudaStep::SiluMul(_)
         | CudaStep::Rope(_)
