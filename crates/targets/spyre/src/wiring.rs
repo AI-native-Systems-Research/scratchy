@@ -1999,4 +1999,23 @@ mod constant_tape_tests {
             ..Default::default()
         }
     }
+    /// The staged pad lanes spell the kernel's all-NaN answer (#666): an all-NaN row's one-hot falls
+    /// on a pad lane, whose `ginc`, `binc` and `linc` give idx = `ginc·4096 + binc·64 + linc` — the
+    /// worker's `argmax_sentinel`, which it reads as token 0. A change to either side fails here.
+    #[test]
+    fn the_staged_pad_lanes_spell_the_all_nan_sentinel() {
+        use scratchy_subtile::subtile_ir::{ARGMAX_BLOCK, ARGMAX_GROUP_BLOCKS, argmax_sentinel};
+        for vocab in [5u32, 49155, 262144] {
+            let tables = argmax_staged_tables(vocab);
+            // The last lane of a `[1, pad_v]` fp16 table is a pad lane at every vocab.
+            let pad = |t: usize| {
+                let bytes = &tables[t].0;
+                let last = [bytes[bytes.len() - 2], bytes[bytes.len() - 1]];
+                half::f16::from_le_bytes(last).to_f32() as u32
+            };
+            let (binc, linc, ginc) = (pad(2), pad(3), pad(8));
+            let idx = ginc * (ARGMAX_BLOCK * ARGMAX_GROUP_BLOCKS) + binc * ARGMAX_BLOCK + linc;
+            assert_eq!(idx, argmax_sentinel(vocab), "vocab {vocab}");
+        }
+    }
 }
