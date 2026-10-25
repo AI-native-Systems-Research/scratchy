@@ -838,6 +838,41 @@ impl RuntimeGate {
             _ => RuntimeGate::All(baked(all)),
         }
     }
+
+    /// Whether no step runs both a command gated `self` and one gated `other`: one is the other's
+    /// complement (a twin and the command it replaces), or a list's gates decide it.
+    pub fn excludes(self, other: RuntimeGate) -> bool {
+        use RuntimeGate as G;
+        match (self, other) {
+            (G::All(gates), _) => gates.iter().any(|g| g.excludes(other)),
+            (_, G::All(gates)) => gates.iter().any(|g| self.excludes(*g)),
+            (G::Any(gates), _) => gates.iter().all(|g| g.excludes(other)),
+            (_, G::Any(gates)) => gates.iter().all(|g| self.excludes(*g)),
+            (gate, other) => gate.complement() == Some(other),
+        }
+    }
+
+    /// The gate that runs exactly on the steps this one does not, if one does.
+    fn complement(self) -> Option<RuntimeGate> {
+        use RuntimeGate as G;
+        Some(match self {
+            G::UnlessEveryRowSampled => G::OnlyIfEveryRowSampled,
+            G::OnlyIfEveryRowSampled => G::UnlessEveryRowSampled,
+            G::OnlyIfDecodeStep => G::UnlessDecodeStep,
+            G::UnlessDecodeStep => G::OnlyIfDecodeStep,
+            G::OnlyIfSmallMTokens => G::UnlessSmallMTokens,
+            G::UnlessSmallMTokens => G::OnlyIfSmallMTokens,
+            G::OnlyIfOneSequence => G::UnlessOneSequence,
+            G::UnlessOneSequence => G::OnlyIfOneSequence,
+            G::OnlyIfUnrotatedBlocks => G::UnlessUnrotatedBlocks,
+            G::UnlessUnrotatedBlocks => G::OnlyIfUnrotatedBlocks,
+            G::OnlyIfPlainGdn => G::UnlessPlainGdn,
+            G::UnlessPlainGdn => G::OnlyIfPlainGdn,
+            G::OnlyIfDraftCycle => G::UnlessDraftCycle,
+            G::UnlessDraftCycle => G::OnlyIfDraftCycle,
+            G::OnlyIfPlainGdnRows | G::All(_) | G::Any(_) => return None,
+        })
+    }
 }
 
 impl DispatchShape {
