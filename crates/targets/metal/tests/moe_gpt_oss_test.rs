@@ -262,13 +262,22 @@ struct Block {
     routed_gated: BakedPipeline,
     combine: BakedPipeline,
     // The unrouted chain's outputs.
-    gate_y: common::Buffer,
+    rows: GatedRows,
     down_y: common::Buffer,
     out: common::Buffer,
     // The routed chain's.
-    routed_gate_y: common::Buffer,
+    routed_rows: GatedRows,
     routed_down_y: common::Buffer,
     routed_out: common::Buffer,
+}
+
+/// The gated kernel's rows, a pair's each: the gate rows it writes its activation over, and the up
+/// rows it writes and reads back — both bound, as the bake binds the MoE scratch's (`ExpertGate`
+/// at 5, `ExpertUp` at 9). An unbound slot reaches the dispatcher's 16-byte gap filler: the up
+/// rows written there ran past it into whatever buffer came next (#484).
+struct GatedRows {
+    gate: common::Buffer,
+    up: common::Buffer,
 }
 
 impl Block {
@@ -348,28 +357,35 @@ impl Block {
             gate_up_bias,
             down_bias,
             router_bias: common::shared_slice(device, &router_bias_host),
-            gate_y: zeroed(pairs * INTER),
+            rows: GatedRows {
+                gate: zeroed(pairs * INTER),
+                up: zeroed(pairs * INTER),
+            },
             down_y: zeroed(pairs * HIDDEN),
             out: zeroed(tokens * HIDDEN),
-            routed_gate_y: zeroed(pairs * INTER),
+            routed_rows: GatedRows {
+                gate: zeroed(pairs * INTER),
+                up: zeroed(pairs * INTER),
+            },
             routed_down_y: zeroed(pairs * HIDDEN),
             routed_out: zeroed(tokens * HIDDEN),
         }
     }
 
-    /// The gated kernel over `indices`' picks, its activation into `gate_y`: buffers 0-2 the
-    /// gate projection, 3-5 x / indices / gate_y, 6-9 the up projection and its rows, 14 the
+    /// The gated kernel over `indices`' picks, its activation into `rows.gate`: buffers 0-2 the
+    /// gate projection, 3-5 x / indices / the gate rows, 6-9 the up projection and its rows, 14 the
     /// gate/up linear biases.
     fn gated<'a>(
         &'a self,
         pso: &'a BakedPipeline,
         indices: &'a common::Buffer,
-        gate_y: &'a common::Buffer,
+        rows: &'a GatedRows,
         routed: Option<(&'a common::Buffer, &'a common::Buffer, &'a common::Buffer)>,
     ) -> Dispatch<'a> {
         let mut buffers = self.gate.bindings().to_vec();
-        buffers.extend([(&self.x, 3), (indices, 4), (gate_y, 5)]);
+        buffers.extend([(&self.x, 3), (indices, 4), (&rows.gate, 5)]);
         buffers.extend([(&self.up.w, 6), (&self.up.s, 7), (&self.up.b, 8)]);
+        buffers.push((&rows.up, 9));
         buffers.push((&self.gate_up_bias.buf, 14));
         if let Some((logits, scores, router_bias)) = routed {
             buffers.extend([(logits, 10), (scores, 11), (router_bias, 13)]);
@@ -418,11 +434,11 @@ impl Block {
                 groups: size(1, self.tokens, 1),
                 threads: size(32, 1, 1),
             },
-            self.gated(&self.gated, &self.indices, &self.gate_y, None),
+            self.gated(&self.gated, &self.indices, &self.rows, None),
             self.combine(
                 &self.indices,
                 &self.scores,
-                &self.gate_y,
+                &self.rows.gate,
                 &self.down_y,
                 &self.out,
             ),
@@ -436,13 +452,13 @@ impl Block {
             self.gated(
                 &self.routed_gated,
                 &self.routed_indices,
-                &self.routed_gate_y,
+                &self.routed_rows,
                 Some((&self.logits, &self.routed_scores, &self.router_bias)),
             ),
             self.combine(
                 &self.routed_indices,
                 &self.routed_scores,
-                &self.routed_gate_y,
+                &self.routed_rows.gate,
                 &self.routed_down_y,
                 &self.routed_out,
             ),
@@ -480,8 +496,8 @@ fn routed_gpt_oss_moe_matches_the_routing_command_then_the_unrouted_chain() {
         "the stored scores differ"
     );
     assert_eq!(
-        bits(&block.gate_y, pairs * INTER),
-        bits(&block.routed_gate_y, pairs * INTER),
+        bits(&block.rows.gate, pairs * INTER),
+        bits(&block.routed_rows.gate, pairs * INTER),
         "act(gate) * up differs"
     );
     let out = bits(&block.out, 2 * HIDDEN);
@@ -543,7 +559,7 @@ fn gpt_oss_linear_biases_match_the_reference() {
             act.push(bf16::from_f32(swiglu_oai(g, u)));
         }
     }
-    let got_act = bits(&block.gate_y, pairs * INTER);
+    let got_act = bits(&block.rows.gate, pairs * INTER);
     let mut max_act_err = 0.0f32;
     for p in 0..pairs {
         for j in 0..INTER {
