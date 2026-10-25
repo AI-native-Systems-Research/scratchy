@@ -1135,7 +1135,10 @@ impl<K: Copy + PartialEq> Folder<'_, K> {
             Some(w) => self.is_matvec(i, w),
             None => self.ops.kind(i) == anchor,
         };
-        if !self.model.matvec_ends || !anchors || self.absorbed[i].is_some() {
+        // The matvec band bounds a matvec's ends; an anchor that is no matvec (an expert combine,
+        // whose command stores each row itself) takes them at every bucket the pass folds.
+        let bounded = weights.is_some() && !self.model.matvec_ends;
+        if bounded || !anchors || self.absorbed[i].is_some() {
             return Ok(());
         }
         let free = |f: &Self, j: usize| {
