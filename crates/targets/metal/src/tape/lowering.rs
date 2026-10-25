@@ -11462,17 +11462,22 @@ mod tests {
                 true => F::Ordered.max(gather_fences),
                 false => gather_fences,
             };
+            // A command no step runs with any before it (the small-M twin, gated against the GEMM's
+            // commands) fences as the step does; the step's other later commands (the SplitK reduce,
+            // the W4A8 GEMM) read what an earlier one wrote: RAW.
             let flags: Vec<F> = (0..n)
-                .map(|c| match matmul[c].command.kernel {
-                    _ if c == 0 => first,
-                    // The small-M twin runs instead of the GEMM's commands, never after them: it
-                    // fences as the step does.
-                    K::AffineQmmSmallM => first,
-                    // The step's later commands (the SplitK reduce, the W4A8 GEMM) read what the
-                    // first wrote: RAW.
-                    _ => F::Coherent,
+                .map(|c| {
+                    let alone = matmul[..c].iter().all(|e| match (e.gate, matmul[c].gate) {
+                        (Some(e), Some(g)) => e.excludes(g),
+                        _ => false,
+                    });
+                    if alone { first } else { F::Coherent }
                 })
                 .collect();
+            // At the twin's bucket, the twin is the one such later command.
+            if last == K::AffineQmmSmallM {
+                assert_eq!(flags.last(), Some(&first), "bucket {bucket_m}: the twin");
+            }
             assert_eq!(
                 tape.barrier_before[..n],
                 flags,
