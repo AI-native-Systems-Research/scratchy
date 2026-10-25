@@ -8060,11 +8060,14 @@ impl MoeScratch {
         // 64 pairs, a quarter of the slab reads repeats — 17% of the base-M5 conc-8 step). Anything
         // else gathers. Either runs the step's live pairs alone.
         use crate::op_abi::{
-            METAL_GROUPED_PAIRS_PER_EXPERT, METAL_SORTED_PAIRS, METAL_SORTED_PAIRS_PER_EXPERT,
+            METAL_DECODE_GROUPED_ROWS, METAL_GROUPED_PAIRS_PER_EXPERT, METAL_SORTED_PAIRS,
+            METAL_SORTED_PAIRS_PER_EXPERT,
         };
         let pairs = bucket_m * b.top_k.0;
         let per_expert = pairs as f32 / b.experts.0 as f32;
         let grouping = match groups && pairs >= METAL_SORTED_PAIRS {
+            // A lane's verify, Splash's decode plan, groups every route by expert.
+            true if bucket_m == METAL_DECODE_GROUPED_ROWS => MoeGrouping::Sorted,
             true if per_expert >= METAL_GROUPED_PAIRS_PER_EXPERT => MoeGrouping::Grouped,
             true if METAL_SORTED_PAIRS_PER_EXPERT.contains(&per_expert) => MoeGrouping::Sorted,
             _ => MoeGrouping::Gathered,
@@ -13189,10 +13192,11 @@ mod tests {
     }
 
     /// A bake groups its experts from 4 pairs per expert (mlx's gate) and sorts them at 0.5–1
-    /// (where #232 measured the sort winning); anything else gathers. On the bucket ladder at top
-    /// 8: Gemma-4's 128 experts keep the choices they were measured at (sorted at 8, grouped from
-    /// 64). Qwen3.6's 256 gather below 512, as they did before they could group: at bucket 64 (2
-    /// per expert) a short prompt prefilled in 98 ms gathered, 105 ms grouped, 161 ms sorted.
+    /// (where #232 measured the sort winning), and at a lane's verify bucket at any density
+    /// (Splash's decode plan); anything else gathers. On the bucket ladder at top 8: Gemma-4's 128
+    /// experts keep the choices they were measured at (sorted at 8, grouped from 64). Qwen3.6's
+    /// 256 sort at 8 and gather at 64, where a short prompt prefilled in 98 ms gathered, 105 ms
+    /// grouped, 161 ms sorted.
     #[test]
     fn a_bake_groups_and_sorts_where_measured_to_win() {
         let p = tp();
@@ -13207,7 +13211,7 @@ mod tests {
             ),
             (
                 256,
-                [Gathered, Gathered, Gathered, Gathered, Gathered, Grouped],
+                [Gathered, Gathered, Gathered, Sorted, Gathered, Grouped],
             ),
         ] {
             let got = [1, 2, 4, 8, 64, 512].map(|bucket_m| grouping(experts, bucket_m));
