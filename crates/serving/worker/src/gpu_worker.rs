@@ -1648,12 +1648,10 @@ impl MetalWorker {
         let init = |what: &str| ExecutorError::WorkerInit(format!("DFlash2 drafter: {what}"));
         let gpu_device = (self.gpu_device.as_ref()).ok_or_else(|| init("no gpu_device"))?;
         let target = (self.model.as_deref()).ok_or_else(|| init("its target must load first"))?;
-        let accept = scratchy_target_metal::dflash2::DraftAcceptKernel::new(
-            &gpu_device.device,
-            kernels,
-        )
-        .map_err(|e| init(&format!("acceptance compile: {e:?}")))?
-        .ok_or_else(|| init("its bake has no acceptance kernel"))?;
+        let accept =
+            scratchy_target_metal::dflash2::DraftAcceptKernel::new(&gpu_device.device, kernels)
+                .map_err(|e| init(&format!("acceptance compile: {e:?}")))?
+                .ok_or_else(|| init("its bake has no acceptance kernel"))?;
         let dflash = config.extra.get("dflash_config");
         let window = (dflash.and_then(|d| d.get("swa_window_size")))
             .and_then(|v| v.as_u64())
@@ -1676,19 +1674,22 @@ impl MetalWorker {
             elem_bytes,
         );
         let (device, residency) = (&gpu_device.device, gpu_device.allocator.residency());
-        let rings =
-            scratchy_target_metal::dflash2::DraftRingPool::new(layers, slots, slot_bytes, |bytes| {
-                Ok(MetalMem::new_pinned(device, residency, bytes))
-            })
-            .map_err(|e| init(&format!("rings: {e}")))?;
+        let rings = scratchy_target_metal::dflash2::DraftRingPool::new(
+            layers,
+            slots,
+            slot_bytes,
+            |bytes| Ok(MetalMem::new_pinned(device, residency, bytes)),
+        )
+        .map_err(|e| init(&format!("rings: {e}")))?;
         residency.commit();
         info!(
             "ScratchyWorker(metal): DFlash2 drafter — {layers} layers' rings of {window} positions \
              for {slots} sequences ({} MiB)",
             (2 * layers * slots * slot_bytes) >> 20
         );
-        let target_kernels = scratchy_target_metal::off_tape::OffTapeKernels::of(target.metal_off_tape())
-            .map_err(|e| init(&format!("its target's off-tape kernels: {e}")))?;
+        let target_kernels =
+            scratchy_target_metal::off_tape::OffTapeKernels::of(target.metal_off_tape())
+                .map_err(|e| init(&format!("its target's off-tape kernels: {e}")))?;
         let sampling = scratchy_target_metal::dflash2::TargetSamplingKernels::new(
             &gpu_device.device,
             target_kernels,
@@ -4114,18 +4115,22 @@ impl MetalWorker {
             }
         }
         let head = match (then, head_device) {
-            (Some(Then::Block(step)), Some(device)) => Some(HeadEncoder::Block(BlockPassesEncoder {
-                step,
-                model: (self.draft_model.as_deref())
-                    .ok_or_else(|| BackendError::Backend("DFlash2 drafter not loaded".into()))?,
-                target: (self.model.as_deref())
-                    .ok_or_else(|| BackendError::Backend("target not loaded".into()))?,
-                kv_cache: (self.kv_cache.as_ref())
-                    .ok_or_else(|| BackendError::Backend("target kv_cache missing".into()))?,
-                dflash2: (self.dflash2.as_ref())
-                    .ok_or_else(|| BackendError::Backend("DFlash2 drafter not loaded".into()))?,
-                device,
-            })),
+            (Some(Then::Block(step)), Some(device)) => {
+                Some(HeadEncoder::Block(BlockPassesEncoder {
+                    step,
+                    model: (self.draft_model.as_deref()).ok_or_else(|| {
+                        BackendError::Backend("DFlash2 drafter not loaded".into())
+                    })?,
+                    target: (self.model.as_deref())
+                        .ok_or_else(|| BackendError::Backend("target not loaded".into()))?,
+                    kv_cache: (self.kv_cache.as_ref())
+                        .ok_or_else(|| BackendError::Backend("target kv_cache missing".into()))?,
+                    dflash2: (self.dflash2.as_ref()).ok_or_else(|| {
+                        BackendError::Backend("DFlash2 drafter not loaded".into())
+                    })?,
+                    device,
+                }))
+            }
             (Some(Then::Mtp(passes)), Some(device)) => {
                 let model = (self.draft_model.as_deref())
                     .ok_or_else(|| BackendError::Backend("MTP head not loaded".into()))?;
@@ -4381,7 +4386,9 @@ impl MetalWorker {
             self.committed = Some((in_flight, argmax));
             // The head's worker goes back now: its staging slot outlives this step (`Onto`).
             self.committed_chain = match head.borrow().as_ref() {
-                Some(HeadEncoder::Mtp(h)) => (h.buffer.clone()).map(|b| (h.layout.clone(), b, h.behind)),
+                Some(HeadEncoder::Mtp(h)) => {
+                    (h.buffer.clone()).map(|b| (h.layout.clone(), b, h.behind))
+                }
                 _ => None,
             };
             return Ok(Forwarded::default());
@@ -5184,7 +5191,13 @@ impl<'a> BlockPassesEncoder<'a> {
             // SAFETY: the buffer holds `layout.total` bytes for the widest step's lanes, and no
             // command buffer reads it (the step before this one is done).
             unsafe {
-                let at = |section: u64| buffer.contents().as_ptr().cast::<u8>().add(section as usize);
+                let at = |section: u64| {
+                    buffer
+                        .contents()
+                        .as_ptr()
+                        .cast::<u8>()
+                        .add(section as usize)
+                };
                 let write = |section: u64, bytes: &[u8]| {
                     std::ptr::copy_nonoverlapping(bytes.as_ptr(), at(section), bytes.len())
                 };
@@ -5203,7 +5216,9 @@ impl<'a> BlockPassesEncoder<'a> {
                     argument_table(&self.device, &draw)?,
                 ];
                 let tables = [&*tables[0], &*tables[1], &*tables[2]];
-                self.dflash2.sampling.encode(enc, tables, (lanes * rows) as u32);
+                self.dflash2
+                    .sampling
+                    .encode(enc, tables, (lanes * rows) as u32);
             }
             let table = argument_table(&self.device, &layout.accept(base, tokens.gpuAddress()))?;
             self.dflash2.accept.encode(enc, &table, lanes as u32);
@@ -5297,7 +5312,11 @@ impl<'a> BlockPassesEncoder<'a> {
         // SAFETY: the buffer holds the retained and accepted counts of `lanes` lanes, written by
         // the command buffer that is done.
         let read = |section: u64| unsafe {
-            let at = buffer.contents().as_ptr().cast::<u8>().add(section as usize);
+            let at = buffer
+                .contents()
+                .as_ptr()
+                .cast::<u8>()
+                .add(section as usize);
             std::slice::from_raw_parts(at.cast::<u32>(), lanes).to_vec()
         };
         (read(layout.retained).into_iter())
@@ -5323,7 +5342,9 @@ impl<'a> BlockPassesEncoder<'a> {
                     len: usize| unsafe {
             std::slice::from_raw_parts(buffer.contents().as_ptr().cast::<u32>(), len).to_vec()
         };
-        let q_probs = read(selection.q_probs, candidates).into_iter().map(f32::from_bits);
+        let q_probs = read(selection.q_probs, candidates)
+            .into_iter()
+            .map(f32::from_bits);
         let verify_rows = read(selection.verify_rows, block.lanes.len());
         Some(Selection {
             drafts: read(selection.tokens, proposals),
@@ -5348,7 +5369,9 @@ struct Selection {
 #[cfg(feature = "metal")]
 fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
     // SAFETY: `T: Copy` plain data, read as the bytes it occupies.
-    unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values)) }
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
 }
 
 /// The passes a step runs after its target, as encoded in its command buffer.
@@ -5386,7 +5409,10 @@ impl<'a> HeadEncoder<'a> {
 
     /// What the passes left, once the command buffer they ran in is done: an MTP head's drafts
     /// from its chain buffer, a block drafter's from `onto`'s outputs and its cycle buffer.
-    fn outcome(&self, onto: Option<&dyn scratchy_forward_compiler::MetalForwardOnto>) -> HeadOutcome {
+    fn outcome(
+        &self,
+        onto: Option<&dyn scratchy_forward_compiler::MetalForwardOnto>,
+    ) -> HeadOutcome {
         match self {
             Self::Mtp(h) => HeadOutcome {
                 drafts: h.drafts(),
@@ -7774,7 +7800,10 @@ impl Worker for MetalWorker {
         // and its next block's policy and uniforms.
         let block_step = match self.dflash2.as_mut() {
             Some(d) if !scheduler_output.draft_req_ids.is_empty() => {
-                match d.drafter.passes(&step_rows, &scheduler_output.draft_req_ids) {
+                match d
+                    .drafter
+                    .passes(&step_rows, &scheduler_output.draft_req_ids)
+                {
                     Some(passes) => {
                         let commit_slots = (passes.commit.steps.iter())
                             .map(|&i| d.slots.of(&req_ids_in_order[i]))
@@ -7847,25 +7876,28 @@ impl Worker for MetalWorker {
                             step.candidates.extend(candidates);
                             step.q_probs.extend(q_probs);
                             step.verify_uniforms.extend(uniforms);
-                            step.verify.push(scratchy_target_metal::dflash2::VerifyLane {
-                                sampled: lane.sampled,
-                                drafts: lane.drafts,
-                                position: lane.position,
-                                remaining,
-                                stop,
-                                sampling: verify_sampling,
-                                top_k: params.map_or(0, |p| p.top_k.max(0) as u32),
-                                temperature,
-                                top_p: params.map_or(1.0, |p| p.top_p as f32),
-                                min_p: params.map_or(0.0, |p| p.min_p as f32),
-                                exclude_stop: u32::from(params.is_some_and(|p| p.ignore_eos)),
-                            });
-                            step.lane_params.push(scratchy_target_metal::dflash2::DraftLaneParams {
-                                temperature,
-                                sampling,
-                                maximum: rows,
-                                remaining,
-                            });
+                            step.verify
+                                .push(scratchy_target_metal::dflash2::VerifyLane {
+                                    sampled: lane.sampled,
+                                    drafts: lane.drafts,
+                                    position: lane.position,
+                                    remaining,
+                                    stop,
+                                    sampling: verify_sampling,
+                                    top_k: params.map_or(0, |p| p.top_k.max(0) as u32),
+                                    temperature,
+                                    top_p: params.map_or(1.0, |p| p.top_p as f32),
+                                    min_p: params.map_or(0.0, |p| p.min_p as f32),
+                                    exclude_stop: u32::from(params.is_some_and(|p| p.ignore_eos)),
+                                });
+                            step.lane_params.push(
+                                scratchy_target_metal::dflash2::DraftLaneParams {
+                                    temperature,
+                                    sampling,
+                                    maximum: rows,
+                                    remaining,
+                                },
+                            );
                             step.uniforms.extend(d.next_uniforms(req_id));
                         }
                         step.passes.block = passes.block;
@@ -7928,7 +7960,12 @@ impl Worker for MetalWorker {
         let target_sampled: std::collections::HashSet<usize> = (block_step.as_ref())
             .and_then(|s| {
                 let lanes = s.passes.block.as_ref()?.lanes.iter().zip(&s.verify);
-                Some(lanes.filter(|(_, v)| v.sampling != 0).map(|(l, _)| l.step).collect())
+                Some(
+                    lanes
+                        .filter(|(_, v)| v.sampling != 0)
+                        .map(|(l, _)| l.step)
+                        .collect(),
+                )
             })
             .unwrap_or_default();
         let mut fused_sample_jobs: Vec<(usize, u32)> = Vec::new();
@@ -8388,13 +8425,7 @@ impl Worker for MetalWorker {
                     (None, None) => None,
                 };
                 let mut out = self
-                    .forward_argmax_then(
-                        ModelHandle::TARGET,
-                        KvPoolHandle::TARGET,
-                        &req,
-                        &[],
-                        then,
-                    )
+                    .forward_argmax_then(ModelHandle::TARGET, KvPoolHandle::TARGET, &req, &[], then)
                     .map_err(|e| {
                         ExecutorError::WorkerExecution(format!("spec verify forward: {e}"))
                     })?;
@@ -8704,7 +8735,8 @@ impl Worker for MetalWorker {
                             d.cycles.insert(req_ids_in_order[l.step].clone(), cycle);
                         }
                         let rows = &head_outcome.verify_rows;
-                        d.drafter.drafts(b, &picked_drafts, rows, &step_rows, &sampled_token_ids)
+                        d.drafter
+                            .drafts(b, &picked_drafts, rows, &step_rows, &sampled_token_ids)
                     });
                     Some(drafts.unwrap_or_default())
                 }

@@ -8252,10 +8252,13 @@ fn emit_canonical_params_impl(
     let hidden_size_lit = proc_macro2::Literal::usize_unsuffixed(hidden_size_for_const);
     // A head's `target_hidden` rows: a DFlash2 drafter's captured layers side by side, else its
     // target's hidden width.
-    let target_hidden_width = (model.bounds.get("backbone_hidden_size"))
-        .map_or(hidden_size_for_const, |&w| w as usize);
+    let target_hidden_width =
+        (model.bounds.get("backbone_hidden_size")).map_or(hidden_size_for_const, |&w| w as usize);
     let target_hidden_width_lit = proc_macro2::Literal::usize_unsuffixed(target_hidden_width);
-    let target_routes_experts = model.bounds.get("target_num_experts").is_some_and(|&n| n > 0);
+    let target_routes_experts = model
+        .bounds
+        .get("target_num_experts")
+        .is_some_and(|&n| n > 0);
     let intermediate_size_lit = proc_macro2::Literal::usize_unsuffixed(intermediate_size);
     // VOCAB_SIZE: lm_head output dim. Read from the verbatim HF config
     // (`vocab_size` bound). Used by the generic `Instruction::Gemm` arm
@@ -14964,8 +14967,15 @@ pub fn emit_model(
     // and its arena holds what the commit's tiles (`commit_tiles`) write: the block's — its
     // lm_head's logits, a vocabulary a row, above all — are never written there.
     let plays_result_through = match model.bounds.get("selector_rank") {
-        Some(&rank) if rank > 0 => (model.bounds.get("spec_verify_rows").copied())
-            .and_then(|rows| num_tokens_points.iter().copied().filter(|&m| m >= rows).min()),
+        Some(&rank) if rank > 0 => {
+            (model.bounds.get("spec_verify_rows").copied()).and_then(|rows| {
+                num_tokens_points
+                    .iter()
+                    .copied()
+                    .filter(|&m| m >= rows)
+                    .min()
+            })
+        }
         _ => None,
     };
     let commit_tiles: HashSet<TileId> = {
@@ -17981,12 +17991,17 @@ mod fingerprint_tests {
                 "{arch}: a target with no drafter must unroll as its DSL does",
             );
             let set = LayerSet::of([1]);
-            model.layer_sets.insert(DRAFT_CAPTURE_LAYERS.to_string(), set);
+            model
+                .layer_sets
+                .insert(DRAFT_CAPTURE_LAYERS.to_string(), set);
             let (_, captured) = fuf_of(arch, &model);
             let captures = (captured.nodes.iter())
                 .filter(|n| n.op == OpKind::CaptureHidden)
                 .count();
-            assert_eq!(captures, 1, "{arch}: a drafter reading layer 1 captures it alone");
+            assert_eq!(
+                captures, 1,
+                "{arch}: a drafter reading layer 1 captures it alone"
+            );
         }
     }
 

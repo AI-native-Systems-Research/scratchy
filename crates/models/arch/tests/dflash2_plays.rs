@@ -76,7 +76,11 @@ fn buckets_past_its_block_play_its_commit_alone() {
     use scratchy_models::dflash2::qwen3_6_35b_a3b_dflash2_mlx_affine_b4_g64_qembed as drafter;
     for spec in drafter::METAL_BUCKETS {
         let m = spec.bucket_m;
-        assert_eq!(spec.plays_result, m <= 8, "m={m}: whether it plays its block draft");
+        assert_eq!(
+            spec.plays_result,
+            m <= 8,
+            "m={m}: whether it plays its block draft"
+        );
         let logits = u64::from(m) * 248_320 * 2;
         let arena: u64 = spec.arena_bytes.iter().sum();
         assert!(
