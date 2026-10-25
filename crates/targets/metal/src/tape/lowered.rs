@@ -1943,11 +1943,10 @@ impl LoweredMetalTape {
     /// in exactly one pattern (`LayerId(literal + layer_offset)`); a weight's source family
     /// does not vary.
     /// The bytes of each scratch buffer the tape binds ([`ScratchKind`]), the MoE scratch holding
-    /// the decode split's partials for at most `decode_rows` of the bucket's rows (`None`: every
-    /// row).
+    /// the decode split's partials for the rows its steps bring, of at most `decode_rows` a decode
+    /// step brings (`None`: every row) — [`DecodePartials::bytes`].
     pub fn scratch_bytes(&self, decode_rows: Option<DecodeRows>) -> PerScratch<u32> {
-        let rows = decode_rows.map_or(self.bucket_m, |r| r.get().min(self.bucket_m));
-        let partials = self.decode_partials_row_bytes.saturating_mul(rows);
+        let partials = self.decode_partials.bytes(self.bucket_m, decode_rows);
         PerScratch::from_fn(|kind| match kind {
             ScratchKind::SplitK => self.splitk_scratch_bytes,
             ScratchKind::Moe => self.moe_scratch_bytes.max(partials),
@@ -2063,6 +2062,65 @@ pub enum LogitsRows {
     Sampled { tile: RowTile },
 }
 
+/// The TurboQuant decode split's partials a tape's steps write at the MoE scratch's front: a row's
+/// bytes, for the rows the steps that run the split bring ([`LoweredMetalTape::scratch_bytes`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
+pub struct DecodePartials {
+    /// One row's (`num_q_heads * splits * (2 + head_dim)` f32s); zero without the split.
+    pub row_bytes: u32,
+    pub steps: SplitSteps,
+}
+
+/// The steps a tape's TurboQuant decode split runs on, as its gate admits them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+pub enum SplitSteps {
+    /// Decode steps alone ([`RuntimeGate::OnlyIfDecodeStep`]): a row a sequence, at most the
+    /// device's decode rows.
+    #[default]
+    Decode,
+    /// Every step: a verify-sized bucket's packed-store attention, which a prefill of no more
+    /// tokens than its rows runs too, a row a token — the bucket's every row.
+    Every,
+}
+
+impl SplitSteps {
+    /// The steps a split command gated by `gate` runs on.
+    pub fn of(gate: Option<RuntimeGate>) -> Self {
+        fn decode_only(gate: RuntimeGate) -> bool {
+            match gate {
+                RuntimeGate::OnlyIfDecodeStep => true,
+                RuntimeGate::All(gates) => gates.iter().any(|&g| decode_only(g)),
+                RuntimeGate::Any(gates) => gates.iter().all(|&g| decode_only(g)),
+                _ => false,
+            }
+        }
+        match gate.is_some_and(decode_only) {
+            true => Self::Decode,
+            false => Self::Every,
+        }
+    }
+}
+
+impl DecodePartials {
+    /// One buffer for both: the wider row, on the steps either runs on.
+    pub fn max(self, other: Self) -> Self {
+        Self {
+            row_bytes: self.row_bytes.max(other.row_bytes),
+            steps: self.steps.max(other.steps),
+        }
+    }
+
+    /// The partials' bytes in a bucket of `bucket_m` rows whose decode steps bring at most
+    /// `decode_rows` (`None`: every row).
+    pub fn bytes(self, bucket_m: u32, decode_rows: Option<DecodeRows>) -> u32 {
+        let rows = match (self.steps, decode_rows) {
+            (SplitSteps::Decode, Some(rows)) => rows.get().min(bucket_m),
+            (SplitSteps::Every, _) | (_, None) => bucket_m,
+        };
+        self.row_bytes.saturating_mul(rows)
+    }
+}
+
 /// Logits rows a step writes (`writes`) past the rows its bucket's buffer holds (`holds`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LogitsOverflow {
@@ -2167,12 +2225,10 @@ pub struct LoweredMetalTape {
     /// one bucket execute serially through the dispatch, so they can share
     /// scratch). Zero when no MoE instruction was lowered.
     pub moe_scratch_bytes: u32,
-    /// Bytes one row of the TurboQuant decode split's partials takes at the MoE scratch's front
-    /// (`num_q_heads * splits * (2 + head_dim)` f32s). Only a decode or verify step runs the split
-    /// — a row a sequence, a verify step's drafts too — so the buffer holds them for the rows such
-    /// a step can bring, not for the bucket's every row ([`Self::scratch_bytes`]). Zero without
-    /// the split.
-    pub decode_partials_row_bytes: u32,
+    /// The TurboQuant decode split's partials at the MoE scratch's front: a decode-gated split's
+    /// for the rows a decode step can bring, an every-step one's — a verify-sized bucket's, which
+    /// a short prefill runs too — for the bucket's every row ([`Self::scratch_bytes`]).
+    pub decode_partials: DecodePartials,
     /// Byte size of the shared roped-K scratch buffer the worker
     /// allocates if any spans rope-on-read NAX prefill (`KernelId::
     /// RopeOnceNax` + `Binding::RopedKScratch`) was lowered. Computed as

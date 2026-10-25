@@ -322,8 +322,8 @@ u32_newtype!(
     /// one chip name ships with several core counts (an M1 Max has 24 or 32).
     GpuCores,
     /// The most rows a step samples, and a decode or verify step brings — one a sequence of the
-    /// serving engine's `max_num_seqs`, a verify step's drafts too — read at load: the rows the
-    /// TurboQuant decode split's partials are reserved for
+    /// serving engine's `max_num_seqs`, a verify step's drafts too — read at load: the rows a
+    /// decode-gated TurboQuant decode split's partials are reserved for
     /// ([`crate::tape::lowered::LoweredMetalTape::scratch_bytes`]), and the logits buffer holds
     /// ([`crate::tape::lowered::LoweredMetalTape::logits_rows`]).
     DecodeRows,

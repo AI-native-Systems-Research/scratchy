@@ -2527,7 +2527,7 @@ mod tests {
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
             moe_scratch_bytes: 0,
-            decode_partials_row_bytes: 0,
+            decode_partials: crate::tape::lowered::DecodePartials::default(),
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
@@ -3514,7 +3514,7 @@ mod tests {
             loops: &[],
             splitk_scratch_bytes: 0,
             moe_scratch_bytes: 0,
-            decode_partials_row_bytes: 0,
+            decode_partials: crate::tape::lowered::DecodePartials::default(),
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,

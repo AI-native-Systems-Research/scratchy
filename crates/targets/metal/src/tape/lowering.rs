@@ -55,9 +55,10 @@ use crate::quantized::{
 use crate::specialized_pipeline_cache::ConstantValue;
 
 use crate::tape::lowered::{
-    Binding, DispatchShape, Fence, GatedCommand, GemmDims, IntoBaked, KernelId, LogitsRows,
-    LoweredCommand, LoweredMetalTape, LoweringError, MScaleAxis, MScaling, MetalDtype, RowTile,
-    RuntimeBindingKind, SetAxis, WeightTensor, baked, baked_commands,
+    Binding, DecodePartials, DispatchShape, Fence, GatedCommand, GemmDims, IntoBaked, KernelId,
+    LogitsRows, LoweredCommand, LoweredMetalTape, LoweringError, MScaleAxis, MScaling, MetalDtype,
+    RowTile, RuntimeBindingKind, RuntimeGate, SetAxis, SplitSteps, WeightTensor, baked,
+    baked_commands,
 };
 
 /// Where one bucket's tape is baked: the bucket, its two halves' tape
@@ -194,7 +195,7 @@ pub fn lower_subtile_tape_to_metal(
         loops: bb.loops,
         splitk_scratch_bytes: bb.splitk_scratch_bytes.max(lh.splitk_scratch_bytes),
         moe_scratch_bytes: bb.moe_scratch_bytes.max(lh.moe_scratch_bytes),
-        decode_partials_row_bytes: (bb.decode_partials_row_bytes).max(lh.decode_partials_row_bytes),
+        decode_partials: bb.decode_partials.max(lh.decode_partials),
         roped_k_scratch_bytes: bb.roped_k_scratch_bytes.max(lh.roped_k_scratch_bytes),
         attn_unfused_scratch_bytes: bb
             .attn_unfused_scratch_bytes
@@ -1333,18 +1334,21 @@ const fn combine_threads(hd: u32) -> u32 {
 /// threadgroups the rung's KV cap calls for (`ATTN_SPLITS`, [`ATTN_SPLIT_KEYS`] of the cap
 /// each, at most [`ATTN_MAX_SPLITS`]), each storing its heads' partials at the op scratch's
 /// front, `[rows, num_q_heads, splits, 2 + head_dim]` floats, and a combine merges them
-/// into the output. Only a decode or verify step runs it — a row a sequence, a verify step's
-/// drafts too — so the scratch holds the partials of the rows such a step brings, not of the
-/// bucket's every row: it records a row's bytes (`decode_partials_row_bytes`,
-/// [`LoweredMetalTape::scratch_bytes`]). A bucket whose every row's partials would outgrow the
-/// u32 its offsets are computed in keeps the twin — a wide prefill bucket carrying the gated
-/// decode row (gemma-4's 4096-token buckets at 4.3 GiB) is the case that refuses.
+/// into the output. It records a row's bytes and the steps it runs on, as its gate — the
+/// command's, or else `row_gate`, the row's — admits them (`partials`,
+/// [`LoweredMetalTape::scratch_bytes`]): gated to decode steps, a row a sequence, the scratch
+/// holds the partials of the rows such a step brings, not of the bucket's every row; a
+/// verify-sized bucket runs it on every step, a prefill of no more tokens than its rows too, so
+/// it holds every row's. A bucket whose every row's partials would outgrow the u32 its offsets
+/// are computed in keeps the twin — a wide prefill bucket carrying the gated decode row
+/// (gemma-4's 4096-token buckets at 4.3 GiB) is the case that refuses.
 fn decode_attention_per_kv_head(
     p: &MetalModelConsts,
     step: &MetalStep,
     cmds: Vec<GatedCommand>,
     at: &BakePoint<'_>,
-    decode_partials_row_bytes: &mut u32,
+    row_gate: Option<RuntimeGate>,
+    partials: &mut DecodePartials,
 ) -> Vec<GatedCommand> {
     let attention = match step {
         MetalStep::RopedAttention(f) => &f.attention,
@@ -1378,7 +1382,7 @@ fn decode_attention_per_kv_head(
     // computed in — gemma-4's 4096-token prefill buckets land at 4.3 GiB — and such a bucket
     // keeps the twin.
     let row_partials = u64::from(p.num_q_heads) * u64::from(splits) * (u64::from(hd) + 2) * 4;
-    let partials = u64::from(at.bucket_m) * row_partials;
+    let bucket_partials = u64::from(at.bucket_m) * row_partials;
     let geometry = p.kv_codec == KvCodec::TurboQuant(TqBits::new(4))
         && (1..=GQA_HEADS).contains(&group)
         && p.num_q_heads == group * p.num_global_kv_heads
@@ -1387,12 +1391,12 @@ fn decode_attention_per_kv_head(
         // `NSG % SG` assert backs the same set at the bake).
         && matches!(hd, 64 | 128 | 256 | 512)
         && p.global_block_size.is_multiple_of(8)
-        && partials <= u32::MAX as u64;
+        && bucket_partials <= u32::MAX as u64;
     if !full || !geometry || !cmds.iter().any(|c| takes(&c.command)) {
         return cmds;
     }
-    *decode_partials_row_bytes = (*decode_partials_row_bytes).max(row_partials as u32);
-    let partials = scratch_at(16, 0);
+    let row_bytes = row_partials as u32;
+    let scratch = scratch_at(16, 0);
     let symbol = |f16, bf16| pick_specialized_symbol(f16, bf16, p.metal_dtype);
     let mut out = Vec::with_capacity(cmds.len() + 1);
     for GatedCommand { command, gate } in cmds {
@@ -1400,6 +1404,8 @@ fn decode_attention_per_kv_head(
             out.push(GatedCommand { command, gate });
             continue;
         }
+        let steps = SplitSteps::of(gate.or(row_gate));
+        *partials = partials.max(DecodePartials { row_bytes, steps });
         // The heads it serves are the kernel's own: no TurboQuant heads variant binds it.
         let mut constants: Vec<_> = (command.constants.iter())
             .filter(|k| k.ty != super::constants::ConstantType::TqHeads)
@@ -1423,7 +1429,7 @@ fn decode_attention_per_kv_head(
             },
             bindings: baked(
                 (command.bindings.iter().copied())
-                    .chain([partials])
+                    .chain([scratch])
                     .collect(),
             ),
             ..command
@@ -1445,7 +1451,7 @@ fn decode_attention_per_kv_head(
                 threads_per_threadgroup: (combine_threads(hd), 1, 1),
                 ..command.dispatch
             },
-            bindings: baked(kept.chain([partials]).collect()),
+            bindings: baked(kept.chain([scratch]).collect()),
             gemm_dims: None,
         };
         let gated = |command| GatedCommand { command, gate };
@@ -1567,7 +1573,7 @@ fn lower(
     let mut open_spans: Vec<OpenSpan> = Vec::new();
     let mut splitk_scratch_bytes: u32 = 0;
     let mut moe_scratch_bytes: u32 = 0;
-    let mut decode_partials_row_bytes: u32 = 0;
+    let mut decode_partials = DecodePartials::default();
     let mut roped_k_scratch_bytes: u32 = 0;
     let mut attn_unfused_scratch_bytes: u32 = 0;
     // What the sampled rows' steps write of the logits, and the slot they sit in; `None` until
@@ -1676,7 +1682,7 @@ fn lower(
                 let cmds = route_small_m(p, step, own, bucket_m, w, profile)?;
                 let cmds = route_gdn(p, step, cmds, bucket_m);
                 let cmds =
-                    decode_attention_per_kv_head(p, step, cmds, at, &mut decode_partials_row_bytes);
+                    decode_attention_per_kv_head(p, step, cmds, at, *gate, &mut decode_partials);
                 let (cmds, rows) = sample_rows(p, step, cmds, bucket_m, w, profile)?;
                 logits_rows = writes_logits(logits_rows, rows);
                 // Past the sampled rows, a command over their logits other than the logit tail's
@@ -1775,7 +1781,7 @@ fn lower(
         loops: baked(loops),
         splitk_scratch_bytes,
         moe_scratch_bytes,
-        decode_partials_row_bytes,
+        decode_partials,
         roped_k_scratch_bytes,
         attn_unfused_scratch_bytes,
         logits_rows: logits_rows.unwrap_or(LogitsRows::Bucket),
@@ -8691,13 +8697,23 @@ mod tests {
         }
     }
 
+    /// [`coded_with`] under `METAL_GUARD_GATES`: a bucket past the verify rows, or of one row.
+    fn coded(writer: MetalStep, attention: MetalStep) -> Vec<StepRow> {
+        coded_with(&crate::op_abi::METAL_GUARD_GATES, writer, attention)
+    }
+
     /// A TurboQuant-coded layer's rows — `writer`, then `attention` — as the codec steps expand
-    /// them from `op_abi::METAL_KV_CODEC` and the folds leave them, each gated by its guard's
-    /// `METAL_GUARD_GATES` gate: the writer encoding its rows (its encodes folded in), then the
+    /// them from `op_abi::METAL_KV_CODEC` and the folds leave them, each gated by its guard's gate
+    /// in `guards` (a bucket's `op_abi::metal_guard_gates`, as the bake realizes them) or dropped
+    /// where they drop it: the writer encoding its rows (its encodes folded in), then the
     /// attention's decode or prefill form around it. Every codec row carries the writer's offsets,
     /// as the step records give it them.
-    fn coded(writer: MetalStep, attention: MetalStep) -> Vec<StepRow> {
-        use crate::op_abi::{METAL_GUARD_GATES, METAL_KV_CODEC};
+    fn coded_with(
+        guards: &scratchy_subtile::kv_codec::GuardGates<GuardRun>,
+        writer: MetalStep,
+        attention: MetalStep,
+    ) -> Vec<StepRow> {
+        use crate::op_abi::METAL_KV_CODEC;
         use scratchy_subtile::kv_codec::{After, Before};
         let MetalStep::RopeAppend(q0, k0, v0, q1, k1, v1, wl, wp, wc, offsets, _) = writer else {
             panic!("a coded writer: {writer:?}");
@@ -8710,11 +8726,9 @@ mod tests {
             S::SlidingAttentionPrefillPaged(q, o, l, p) => (false, q, o, l, p, SW),
             other => panic!("a coded attention: {other:?}"),
         };
-        let gated = |step, guard| match METAL_GUARD_GATES.gate(guard) {
-            crate::op_abi::GuardRun::Gated(gate) => StepRow::Step(step, gate),
-            crate::op_abi::GuardRun::Dropped => {
-                panic!("{guard:?}: the default guards drop nothing")
-            }
+        let gated = |step, guard| match guards.gate(guard) {
+            GuardRun::Gated(gate) => Some(StepRow::Step(step, gate)),
+            GuardRun::Dropped => None,
         };
         let codec = METAL_KV_CODEC;
         assert_eq!(codec.after_writer.len(), 2, "the writer's K and V encodes");
@@ -8728,15 +8742,15 @@ mod tests {
                 Before::Stage(operand) => S::KvStage(operand, layer, class, offsets),
                 Before::RotateQuery => S::RotateRows(q, RotatedRows::Query),
             };
-            rows.push(gated(step, g.guard));
+            rows.extend(gated(step, g.guard));
         }
-        rows.push(gated(attention, around.anchor));
+        rows.extend(gated(attention, around.anchor));
         for g in around.after {
             let step = match g.step {
                 After::RotateOutput => S::RotateRows(out, RotatedRows::Output),
                 After::PackedTwin => S::AttnPackedKv(q, out, layer, pairing, class, offsets),
             };
-            rows.push(gated(step, g.guard));
+            rows.extend(gated(step, g.guard));
         }
         rows
     }
@@ -9860,6 +9874,41 @@ mod tests {
             .collect()
     }
 
+    /// A split runs on decode steps alone where its gate requires a decode step: the gate itself,
+    /// one member of an `All`, every member of an `Any`. Any other gate — none, one that never
+    /// names decode steps, an `Any` one of whose members admits other steps — sizes it for every
+    /// step: too large at worst, never short of the rows it writes (#475).
+    #[test]
+    fn a_split_runs_on_decode_steps_alone_only_where_its_gate_requires_one() {
+        use crate::tape::lowered::RuntimeGate::{
+            All, Any, OnlyIfDecodeStep, OnlyIfPlainGdn, UnlessDecodeStep, UnlessOneSequence,
+        };
+        let decode = [
+            Some(OnlyIfDecodeStep),
+            Some(All(&[OnlyIfDecodeStep, OnlyIfPlainGdn])),
+            Some(All(&[UnlessOneSequence, OnlyIfDecodeStep])),
+            Some(All(&[Any(&[OnlyIfDecodeStep])])),
+            Some(Any(&[
+                OnlyIfDecodeStep,
+                All(&[OnlyIfPlainGdn, OnlyIfDecodeStep]),
+            ])),
+        ];
+        let every = [
+            None,
+            Some(UnlessDecodeStep),
+            Some(OnlyIfPlainGdn),
+            Some(All(&[UnlessOneSequence, OnlyIfPlainGdn])),
+            Some(Any(&[OnlyIfDecodeStep, OnlyIfPlainGdn])),
+            Some(All(&[Any(&[OnlyIfDecodeStep, UnlessDecodeStep])])),
+        ];
+        for gate in decode {
+            assert_eq!(SplitSteps::of(gate), SplitSteps::Decode, "{gate:?}");
+        }
+        for gate in every {
+            assert_eq!(SplitSteps::of(gate), SplitSteps::Every, "{gate:?}");
+        }
+    }
+
     /// A one-row bucket's TurboQuant decode at `attention_decode_gqa_tq`'s geometry (8 query
     /// heads a KV head, head_dim 256) serves each KV head's heads together: the packed twin's
     /// command becomes the per-KV-head kernel — its bindings and the partials at the op scratch's
@@ -9946,7 +9995,14 @@ mod tests {
             out_and_signs.copied().chain([partials]).collect::<Vec<_>>()
         );
         let row = p.num_q_heads * splits * (2 + p.global_head_dim) * 4;
-        assert_eq!(tape.decode_partials_row_bytes, row);
+        let steps = SplitSteps::Decode;
+        assert_eq!(
+            tape.decode_partials,
+            DecodePartials {
+                row_bytes: row,
+                steps
+            }
+        );
         assert_eq!(
             tape.scratch_bytes(None)[crate::tape::lowered::ScratchKind::Moe],
             row
@@ -9972,20 +10028,46 @@ mod tests {
             1,
         );
         assert!(kernels(&between).contains(&KernelId::AttentionViaCacheTq));
-        // A verify-sized bucket: a threadgroup row a token (`ATTN_ROW_QUERIES`, its sequence's
-        // start in `cu_seqlens_q`), a row's partials the same, every row's held at most.
-        let verify = lower_tq(&p, rows(), 4);
-        assert_eq!(gated_steps(&verify), gated_steps(&tape));
-        let (gqa, combine) = (&verify.commands[2].command, &verify.commands[3].command);
+        // A verify-sized bucket, its guards as the bake realizes them (`metal_guard_gates`): the
+        // packed-store attention on every step, the prefill form dropped, a threadgroup row a
+        // token (`ATTN_ROW_QUERIES`, its sequence's start in `cu_seqlens_q`), a row's partials
+        // the same. A prefill of no more tokens than its rows runs it too, so the scratch holds
+        // every row's partials however few rows a decode step brings: sized for a decode step's,
+        // the rest of a short prefill's ran past what the bucket maps of it (#475).
+        let verify_rows = coded_with(
+            crate::op_abi::metal_guard_gates(4),
+            tq_writer(0, Causal, LLAMA_KV),
+            attention(MetalStep::AttentionViaCache, 0, Interleaved),
+        );
+        let verify = lower_tq(&p, verify_rows, 4);
+        assert_eq!(
+            gated_steps(&verify),
+            [
+                (KernelId::RopeAppend, None),
+                (KernelId::AttentionDecodeGqaTq, None),
+                (KernelId::AttentionDecodeCombine, None),
+            ]
+        );
+        let (gqa, combine) = (&verify.commands[1].command, &verify.commands[2].command);
         assert_eq!(gqa.dispatch.threadgroups, (4, 4, splits));
         assert_eq!(combine.dispatch.threadgroups, (4, p.num_q_heads, 1));
         assert!((gqa.constants.iter()).any(|k| *k == ConstantValue::uint(22, 1)));
         assert!((gqa.bindings.iter()).any(|b| b.index() == 23));
-        assert_eq!(verify.decode_partials_row_bytes, row);
+        let steps = SplitSteps::Every;
         assert_eq!(
-            verify.scratch_bytes(None)[crate::tape::lowered::ScratchKind::Moe],
-            4 * row
+            verify.decode_partials,
+            DecodePartials {
+                row_bytes: row,
+                steps
+            }
         );
+        for decode_rows in [None, Some(DecodeRows(1)), Some(DecodeRows(128))] {
+            assert_eq!(
+                verify.scratch_bytes(decode_rows)[crate::tape::lowered::ScratchKind::Moe],
+                4 * row,
+                "{decode_rows:?}"
+            );
+        }
 
         // Running its KV writer (Gemma 4's global layers), it is the tape's only encoder.
         use crate::tape::step::RopedAttention;
@@ -10074,7 +10156,14 @@ mod tests {
         assert_eq!(combine.dispatch.threadgroups, (1, p.num_q_heads, 1));
         assert_eq!(combine.dispatch.threads_per_threadgroup, (128, 1, 1));
         let row = p.num_q_heads * splits * (2 + p.global_head_dim) * 4;
-        assert_eq!(tape.decode_partials_row_bytes, row);
+        let steps = SplitSteps::Decode;
+        assert_eq!(
+            tape.decode_partials,
+            DecodePartials {
+                row_bytes: row,
+                steps
+            }
+        );
         assert_eq!(
             tape.scratch_bytes(None)[crate::tape::lowered::ScratchKind::Moe],
             row
@@ -10186,7 +10275,14 @@ mod tests {
         assert_eq!(combine.dispatch.threadgroups, (4, p.num_q_heads, 1));
         // Every row's partials, or only those of the rows a decode or verify step brings.
         let row = p.num_q_heads * splits * (2 + p.global_head_dim) * 4;
-        assert_eq!(batched.decode_partials_row_bytes, row);
+        let steps = SplitSteps::Decode;
+        assert_eq!(
+            batched.decode_partials,
+            DecodePartials {
+                row_bytes: row,
+                steps
+            }
+        );
         assert_eq!(
             batched.scratch_bytes(None)[crate::tape::lowered::ScratchKind::Moe],
             4 * row
