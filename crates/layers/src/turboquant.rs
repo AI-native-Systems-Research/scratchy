@@ -280,14 +280,39 @@ impl std::fmt::Display for KvCodec {
 /// is not the constraint and the trade is a bad one. Sized to sit
 /// between the models measured on metal:
 ///
-///     qwen2.5-0.5b   24 x 2 kv x 64  =  12 KiB/token   -> dense
-///     llama-3.2-1b   16 x 8 kv x 64  =  32 KiB/token   -> TurboQuant
-///     granite-4.1-3b 40 x 8 kv x 64  =  80 KiB/token   -> TurboQuant
-///     gemma-3-4b     34 x 4 kv x 256 = 544 KiB/token   -> TurboQuant
+/// ```text
+/// qwen2.5-0.5b   24 x 2 kv x 64  =  12 KiB/token   -> dense
+/// llama-3.2-1b   16 x 8 kv x 64  =  32 KiB/token   -> TurboQuant
+/// granite-4.1-3b 40 x 8 kv x 64  =  80 KiB/token   -> TurboQuant
+/// gemma-3-4b     34 x 4 kv x 256 = 136 KiB/token   -> TurboQuant
+/// ```
 ///
 /// A model between 12 and 32 KiB/token is untested either way; the
 /// threshold is set at 24 KiB so the two measured points stay on the
 /// sides they were measured on, and is a POLICY knob, not a law.
+///
+/// On a mixed-attention model the figure is not the cache that grows with
+/// the session; it is an upper bound on it (#281). It charges every layer a
+/// full-context row, where a windowed layer's cache stops at its window and
+/// a recurrent layer keeps a fixed state — and the codec codes neither, only
+/// the full-context layers. Such a model clears the bar on a figure several
+/// times what it codes:
+///
+/// ```text
+/// gemma-3-4b      5 of 34 layers full-context, 4 kv x 256   20 KiB/token   x6.8
+/// gemma-4-12b     8 of 48, 1 kv x 512                      16 KiB/token   x24
+/// gemma-4-26b     5 of 30, 2 kv x 512                      20 KiB/token   x12
+/// qwen3.6-35b    10 of 40 (the rest recurrent), 2 x 256    20 KiB/token   x4
+/// ```
+///
+/// Each of those growing parts lies in the untested band above, so neither
+/// side of the trade is measured for them. The figure stays the all-layers
+/// one because measuring the growing part instead moves some model across
+/// the bar whatever the bar: qwen2.5-0.5b (12 KiB) and smollm2-135m
+/// (22.5 KiB), both uniform, are dense, gemma-4-12b's 16 KiB growing part is
+/// coded, and no threshold keeps all three where they are. Which models code
+/// is what the threshold decides, so that move waits on a dense-against-coded
+/// measurement of them (#275), not on this definition.
 pub const MIN_KV_BYTES_PER_TOKEN: usize = 24 * 1024;
 
 /// The widest head the codec's metal kernels take: their threadgroup arrays
