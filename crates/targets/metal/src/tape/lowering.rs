@@ -1782,10 +1782,19 @@ fn lower(
                 };
                 commands.extend(cmds);
                 if n_cmds >= 1 {
-                    barrier_before.push(flag_for(i).max(writes_scratch).max(carried));
-                    // A step's later commands (a SplitK partial-writer → reduce
-                    // pair) read what its first wrote: RAW, Coherent.
-                    barrier_before.extend(std::iter::repeat_n(Fence::Coherent, n_cmds - 1));
+                    let flag = flag_for(i).max(writes_scratch).max(carried);
+                    // A step's later commands (a SplitK partial-writer → reduce pair) read what
+                    // an earlier one wrote: RAW, Coherent. One no step runs with any before it (a
+                    // small-M twin and the GEMM it replaces) is the step's first wherever it runs,
+                    // and fences as the step does: its siblings run between the same barriers.
+                    let step = &commands[commands.len() - n_cmds..];
+                    barrier_before.extend(step.iter().enumerate().map(|(j, c)| {
+                        let alone = step[..j].iter().all(|e| match (e.gate, c.gate) {
+                            (Some(e), Some(c)) => e.excludes(c),
+                            _ => false,
+                        });
+                        if alone { flag } else { Fence::Coherent }
+                    }));
                     carried = Fence::None;
                 } else {
                     carried = carried.max(flag_for(i));
@@ -11704,19 +11713,21 @@ mod tests {
                     .iter()
                     .any(|b| matches!(b, Binding::Scratch { .. }))
             });
+            // A scratch write fences Ordered on its own; the elided gather's carried fence maxes
+            // with it.
+            let first = match writes_scratch {
+                true => F::Ordered.max(gather_fences),
+                false => gather_fences,
+            };
             let flags: Vec<F> = (0..n)
-                .map(|c| {
-                    if c == 0 && writes_scratch {
-                        // A scratch write fences Ordered on its own; the
-                        // elided gather's carried fence maxes with it.
-                        F::Ordered.max(gather_fences)
-                    } else if c > 0 {
-                        // The step's later commands (the SplitK reduce, the
-                        // W4A8 GEMM) read what the first wrote: RAW.
-                        F::Coherent
-                    } else {
-                        gather_fences
-                    }
+                .map(|c| match matmul[c].command.kernel {
+                    _ if c == 0 => first,
+                    // The small-M twin runs instead of the GEMM's commands, never after them: it
+                    // fences as the step does.
+                    K::AffineQmmSmallM => first,
+                    // The step's later commands (the SplitK reduce, the W4A8 GEMM) read what the
+                    // first wrote: RAW.
+                    _ => F::Coherent,
                 })
                 .collect();
             assert_eq!(
