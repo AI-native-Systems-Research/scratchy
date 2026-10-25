@@ -1785,16 +1785,1342 @@ fn a_context_window_reads_back_what_splash_stores() {
         batch.commit(true);
     }
     let got: Vec<u16> = read(&loaded, rows * h);
-    for row in 0..rows {
+    for (row, position) in positions.iter().enumerate() {
         for g in 0..h / group {
             let at = row * h + g * group;
             let values: Vec<f32> = context[at..at + group].iter().map(|&b| value(b)).collect();
             assert_eq!(
                 got[at..at + group],
                 window_round_trip(&values)[..],
-                "row {row} group {g} at position {}",
-                positions[row]
+                "row {row} group {g} at position {position}"
             );
+        }
+    }
+}
+
+// ── The target policy (Splash dev/tests/engine/target_sampling_metal_test.mm) ─────────────────
+//
+// Splash's target policy against a direct CPU reference, transcribed. A sampled verify row draws
+// from its distribution over the whole vocabulary — the tokens min_p leaves, the top-k of those,
+// then top-p of their mass — and its largest logit, its draft token's probability and its draw
+// must match an evaluation of the same rules in f64: the draw falls where the reference
+// distribution's cumulative sum in token order places the uniform. Data within float rounding of a
+// min_p or top_p cut or of a draw's boundary are allowed either way, never passing by chance.
+//
+// Scratchy's differences, the tests' only ones: the logits are bf16; a row's uniforms are its
+// lane's step's draws (`draft_uniform`), not uploaded, so where Splash pins an acceptance uniform
+// the draft probability is set against the drawn one instead; a greedy lane's rows take scratchy's
+// argmax and this policy leaves them; a grammar's mask arrives as -inf logits (`grammar_mask`);
+// penalties wait for their port.
+
+use scratchy_target_metal::dflash2::UNIFORM_CORRECTION;
+use scratchy_target_metal::tape::kernel_constants::TargetSamplingConstants;
+
+const TARGET_SHARDS: usize = 16;
+const VOCABULARY_THREADS: usize = 1024;
+const VOCABULARY_GROUPS: usize = 8;
+const VOCABULARY_RANGES: usize = VOCABULARY_GROUPS * (VOCABULARY_THREADS / 32);
+const SENTINEL: u32 = u32::MAX;
+/// Splash's stop tokens, below every spike of `spiked_row`.
+const STOPS: [u32; 2] = [1, 2];
+/// How close a top_p cut may lie to a token's preceding mass, relative to the top-k mass, before
+/// float sums over the vocabulary could keep or cut it either way (Splash `kTopPMargin`).
+const TOP_P_MARGIN: f64 = 1e-5;
+/// How close a logit may lie to the min_p cut, relative to the larger of the cut and the row's
+/// maximum (Splash `kMinPMargin`).
+const MIN_P_MARGIN: f64 = 1e-5;
+
+/// A lane's policy (Splash `SamplingPolicy`): top-k (0: every token), temperature, top-p, min-p,
+/// and whether it ignores end-of-sequence.
+#[derive(Clone, Copy, Debug)]
+struct Policy {
+    top_k: u32,
+    temperature: f32,
+    top_p: f32,
+    min_p: f32,
+    excludes_stop: bool,
+}
+
+impl Policy {
+    const fn new(top_k: u32, temperature: f32, top_p: f32) -> Self {
+        Self {
+            top_k,
+            temperature,
+            top_p,
+            min_p: 0.0,
+            excludes_stop: false,
+        }
+    }
+    const fn min_p(self, min_p: f32) -> Self {
+        Self { min_p, ..self }
+    }
+    const fn excluding_stop(self) -> Self {
+        Self {
+            excludes_stop: true,
+            ..self
+        }
+    }
+}
+
+/// The tokens a row may select (Splash `Admission`): its mask's, less the stop tokens when its lane
+/// ignores end-of-sequence.
+#[derive(Clone, Copy, Default)]
+struct Admission<'a> {
+    mask: Option<&'a [bool]>,
+    excludes_stop: bool,
+    stops: [u32; 2],
+}
+
+impl Admission<'_> {
+    fn admits(&self, token: u32) -> bool {
+        self.mask.is_none_or(|m| m[token as usize])
+            && !(self.excludes_stop && self.stops.contains(&token))
+    }
+}
+
+/// A row's distribution (Splash `Distribution`): its admitted tokens in the order of the logits,
+/// those min_p, top_k and top_p keep, each one's probability, and those within float rounding of a
+/// cut (`ambiguous`, of `ambiguous_mass`).
+#[derive(Clone, Default)]
+struct Distribution {
+    order: Vec<u32>,
+    maximum: f32,
+    mass: f64,
+    margin: f64,
+    ambiguous_mass: f64,
+    probabilities: Vec<f64>,
+    ambiguous: Vec<bool>,
+}
+
+impl Distribution {
+    fn probability(&self, token: u32) -> f64 {
+        self.probabilities
+            .get(token as usize)
+            .copied()
+            .unwrap_or(0.0)
+    }
+}
+
+/// Splash `referenceDistribution`.
+fn reference_distribution(row: &[f32], policy: Policy, admits: Admission) -> Distribution {
+    let vocabulary = row.len();
+    let mut d = Distribution {
+        margin: 1.0,
+        ..Distribution::default()
+    };
+    d.order = (0..vocabulary as u32)
+        .filter(|&t| admits.admits(t))
+        .collect();
+    let beats = |a: u32, b: u32| {
+        let (x, y) = (row[a as usize], row[b as usize]);
+        x > y || (x == y && a < b)
+    };
+    d.order.sort_by(|&a, &b| match (beats(a, b), beats(b, a)) {
+        (true, _) => std::cmp::Ordering::Less,
+        (_, true) => std::cmp::Ordering::Greater,
+        _ => std::cmp::Ordering::Equal,
+    });
+    d.maximum = row[d.order[0] as usize];
+    let maximum = f64::from(d.maximum);
+    let temperature = f64::from(policy.temperature);
+    let weight = |t: u32| ((f64::from(row[t as usize]) - maximum) / temperature).exp();
+    d.ambiguous = vec![false; vocabulary];
+    if policy.min_p > 0.0 {
+        let cut = maximum + temperature * f64::from(policy.min_p).ln();
+        let tolerance = MIN_P_MARGIN * 1f64.max(cut.abs()).max(maximum.abs());
+        let mut kept = 0;
+        let mut rank = 0;
+        while rank < d.order.len() && f64::from(row[d.order[rank] as usize]) >= cut - tolerance {
+            let token = d.order[rank];
+            let value = f64::from(row[token as usize]);
+            if value >= cut {
+                kept = rank + 1;
+            }
+            if (value - cut).abs() <= tolerance
+                && row[token as usize] != d.maximum
+                && (policy.top_k == 0 || rank < policy.top_k as usize)
+            {
+                d.ambiguous[token as usize] = true;
+                d.ambiguous_mass += weight(token);
+            }
+            rank += 1;
+        }
+        d.order.truncate(kept);
+    }
+    if policy.top_k != 0 && (policy.top_k as usize) < d.order.len() {
+        d.order.truncate(policy.top_k as usize);
+    }
+    let top_mass: f64 = d.order.iter().map(|&t| weight(t)).sum();
+    if policy.top_p < 1.0 {
+        let slack = TOP_P_MARGIN + d.ambiguous_mass / top_mass;
+        let target = f64::from(policy.top_p) * top_mass;
+        let mut kept = d.order.len();
+        let mut before = 0.0;
+        for rank in 0..d.order.len() {
+            let token = d.order[rank];
+            let distance = (before - target).abs() / top_mass;
+            d.margin = d.margin.min(distance);
+            if distance <= slack {
+                d.ambiguous[token as usize] = true;
+                d.ambiguous_mass += weight(token);
+            }
+            if before > target && kept == d.order.len() {
+                kept = rank;
+            }
+            if before > target * (1.0 + slack) + slack * top_mass {
+                break;
+            }
+            before += weight(token);
+        }
+        d.order.truncate(kept);
+    }
+    d.probabilities = vec![0.0; vocabulary];
+    d.mass = d.order.iter().map(|&t| weight(t)).sum();
+    for &t in &d.order {
+        d.probabilities[t as usize] = weight(t) / d.mass;
+    }
+    d.ambiguous_mass /= d.mass;
+    d
+}
+
+/// The row's best `count` admitted tokens: value descending, id ascending (Splash
+/// `referenceBest`).
+fn reference_best(row: &[f32], count: usize, admits: Admission) -> Vec<u32> {
+    let d = reference_distribution(row, Policy::new(0, 1.0, 1.0), admits);
+    d.order.into_iter().take(count).collect()
+}
+
+/// The draw a sampled row must make (Splash `requireDraw`): the token whose interval of the
+/// weights' cumulative sum, in token order, holds `uniform` times their total, within the float
+/// rounding of the GPU's sums and `slack` of the total.
+fn require_draw(token: u32, weights: &[f64], uniform: f64, slack: f64, label: &str) {
+    let total: f64 = weights.iter().sum();
+    let target = uniform * total;
+    let tolerance = (1e-5 + slack) * total;
+    assert!(
+        (token as usize) < weights.len() && (weights[token as usize] > 0.0 || slack > 0.0),
+        "{label}: drew token {token}, which has no weight"
+    );
+    let before: f64 = weights[..token as usize].iter().sum();
+    assert!(
+        before - tolerance <= target && target <= before + weights[token as usize] + tolerance,
+        "{label}: drew token {token} whose interval [{}, {}) misses {uniform}",
+        before / total,
+        (before + weights[token as usize]) / total
+    );
+}
+
+/// A rejected draft token's residual (Splash `residualWeights`): each token's probability less its
+/// draft probability (a token's first entry), never below zero, or the distribution itself when
+/// nothing remains.
+fn residual_weights(target: &Distribution, candidates: &[u32], proposal: &[f32]) -> Vec<f64> {
+    let mut weights = target.probabilities.clone();
+    for (index, &token) in candidates.iter().enumerate() {
+        if token as usize >= weights.len() || candidates[..index].contains(&token) {
+            continue;
+        }
+        let w = &mut weights[token as usize];
+        *w = (*w - f64::from(proposal[index])).max(0.0);
+    }
+    match weights.iter().sum::<f64>() <= 0.0 {
+        true => target.probabilities.clone(),
+        false => weights,
+    }
+}
+
+/// Splash's `fillRow`: low noise with forty distinct spikes, every stop token below them.
+fn spiked_row(row: &mut [f32], random: &mut Random) {
+    let vocabulary = row.len() as u32;
+    for x in row.iter_mut() {
+        *x = -8.0 + 3.0 * random.unit() * random.unit();
+    }
+    for spike in 0..40 {
+        let token = 3 + random.next() % (vocabulary - 3);
+        row[token as usize] = 1.0 + 0.25 * spike as f32 + 0.1 * random.unit();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Shape {
+    Peaked,
+    Flat,
+    Graded,
+    Ties,
+}
+
+/// Splash's `fillShaped`.
+fn fill_shaped(row: &mut [f32], shape: Shape, random: &mut Random) {
+    let vocabulary = row.len() as u32;
+    match shape {
+        Shape::Peaked => return spiked_row(row, random),
+        Shape::Ties => {
+            for x in row.iter_mut() {
+                *x = match random.next().is_multiple_of(11) {
+                    true => f32::NEG_INFINITY,
+                    false => (random.next() % 7) as f32 - 3.0,
+                };
+            }
+            return;
+        }
+        Shape::Flat | Shape::Graded => {}
+    }
+    for x in row.iter_mut() {
+        *x = match shape {
+            Shape::Flat => random.unit(),
+            _ => -6.0 + 2.0 * random.unit(),
+        };
+    }
+    if let Shape::Graded = shape {
+        for rank in 0..300u32 {
+            let token = 3 + (rank * 7919 + 11) % (vocabulary - 3);
+            row[token as usize] = 4.0 - 0.02 * rank as f32 + 0.005 * random.unit();
+        }
+    }
+}
+
+/// One step's target policy over `lanes` lanes of `ROWS` verify rows (`dflash2_target_sampling`):
+/// the logits (bf16), each lane's `VerifyLane`, and its drafts with their candidates.
+struct Targets {
+    vocabulary: usize,
+    logits: Vec<u16>,
+    lanes: Vec<VerifyLane>,
+    drafted: Vec<u32>,
+    draft_ids: Vec<u32>,
+    draft_probs: Vec<f32>,
+}
+
+/// What a policy run left: each row's token, `TargetVocabularyRow` and arrival count.
+struct Drawn {
+    tokens: Vec<u32>,
+    records: Vec<[u32; 4]>,
+    arrivals: Vec<u32>,
+}
+
+impl Drawn {
+    fn maximum(&self, index: usize) -> f32 {
+        f32::from_bits(self.records[index][0])
+    }
+    fn draft_probability(&self, index: usize) -> f32 {
+        f32::from_bits(self.records[index][3])
+    }
+}
+
+impl Targets {
+    /// `policies`' lanes, every one drafting its block's proposals, at positions of their own.
+    fn of(vocabulary: usize, policies: &[Policy], stops: [u32; 2], seed: u64) -> Self {
+        let lanes = policies.len();
+        let p = P;
+        Self {
+            vocabulary,
+            logits: vec![0; lanes * ROWS as usize * vocabulary],
+            lanes: (policies.iter().enumerate())
+                .map(|(lane, policy)| VerifyLane {
+                    sampled: lane as u32 * ROWS,
+                    drafts: p as u32,
+                    position: 1000 * lane as u32 + 17,
+                    remaining: ROWS,
+                    stop: stops,
+                    sampling: u32::from(policy.temperature > 0.0),
+                    top_k: policy.top_k,
+                    temperature: policy.temperature,
+                    top_p: policy.top_p,
+                    min_p: policy.min_p,
+                    exclude_stop: u32::from(policy.excludes_stop),
+                    seed: DraftSeed::of(seed.wrapping_mul(0x9e37_79b9).wrapping_add(lane as u64)),
+                })
+                .collect(),
+            drafted: vec![0; lanes * p],
+            draft_ids: vec![u32::MAX; lanes * p * CANDIDATES as usize],
+            draft_probs: vec![0.0; lanes * p * CANDIDATES as usize],
+        }
+    }
+
+    fn rows(&self) -> usize {
+        self.lanes.len() * ROWS as usize
+    }
+
+    fn set_row(&mut self, index: usize, values: &[f32]) {
+        let v = self.vocabulary;
+        for (to, &x) in self.logits[index * v..(index + 1) * v]
+            .iter_mut()
+            .zip(values)
+        {
+            *to = bits(x);
+        }
+    }
+
+    /// Row `index` as the kernels read it: its bf16 logits, in f32.
+    fn row(&self, index: usize) -> Vec<f32> {
+        let v = self.vocabulary;
+        self.logits[index * v..(index + 1) * v]
+            .iter()
+            .map(|&b| value(b))
+            .collect()
+    }
+
+    /// The uniform a lane's correction draws with: its step's draw `UNIFORM_CORRECTION`.
+    fn correction_uniform(&self, lane: usize) -> f32 {
+        let l = &self.lanes[lane];
+        draft_uniform(l.seed, l.position, UNIFORM_CORRECTION)
+    }
+
+    fn acceptance_uniform(&self, lane: usize, position: usize) -> f32 {
+        let l = &self.lanes[lane];
+        draft_uniform(l.seed, l.position, UNIFORM_ACCEPTANCE + position as u32)
+    }
+
+    /// Splash's `setDraft`: `candidates`, made up to sixteen with random ids, their probabilities
+    /// random and normalized, and `draft` the drafted token.
+    fn set_draft(
+        &mut self,
+        lane: usize,
+        position: usize,
+        mut candidates: Vec<u32>,
+        draft: u32,
+        random: &mut Random,
+    ) {
+        let at = (lane * P + position) * CANDIDATES as usize;
+        while candidates.len() < CANDIDATES as usize {
+            candidates.push(3 + random.next() % (self.vocabulary as u32 - 3));
+        }
+        let probabilities: Vec<f32> = (0..CANDIDATES)
+            .map(|_| 0.05 + 0.5 * (random.unit() + 1.0))
+            .collect();
+        let total: f32 = probabilities.iter().sum();
+        for (index, (&id, &q)) in candidates.iter().zip(&probabilities).enumerate() {
+            self.draft_ids[at + index] = id;
+            self.draft_probs[at + index] = q / total;
+        }
+        self.drafted[lane * P + position] = draft;
+    }
+
+    /// A one-candidate draft of `token` with probability `q` (the others none).
+    fn set_one_hot_draft(&mut self, lane: usize, position: usize, token: u32, q: f32) {
+        let at = (lane * P + position) * CANDIDATES as usize;
+        self.draft_ids[at..at + CANDIDATES as usize].fill(u32::MAX);
+        self.draft_probs[at..at + CANDIDATES as usize].fill(0.0);
+        self.draft_ids[at] = token;
+        self.draft_probs[at] = q;
+        self.drafted[lane * P + position] = token;
+    }
+
+    /// Mass, search and draw over every row, the outputs poisoned first.
+    fn run(&self, gpu: &Gpu) -> Drawn {
+        let rows = self.rows();
+        let constants = || TargetSamplingConstants {
+            vocab: scratchy_target_metal::tape::ids::LogitsWidth(self.vocabulary as u32),
+            rows: ROWS,
+        };
+        let pso = |symbol| gpu.pipeline("dflash2_target_sampling", symbol, constants());
+        let (mass, search, draw) = (
+            pso("dflash2_sample_mass_bf16"),
+            pso("dflash2_sample_search_bf16"),
+            pso("dflash2_sample_draw_bf16"),
+        );
+        let b_logits = gpu.buffer(&self.logits);
+        let b_lanes = gpu.buffer(&self.lanes);
+        let b_masses = gpu.buffer(&vec![0xA5A5_A5A5u32; rows * TARGET_SHARDS * 3]);
+        let b_records = gpu.buffer(&vec![0xA5A5_A5A5u32; rows * 4]);
+        let b_drafted = gpu.buffer(&self.drafted);
+        let b_ids = gpu.buffer(&self.draft_ids);
+        let b_probs = gpu.buffer(&self.draft_probs);
+        let b_tokens = gpu.buffer(&vec![0xA5A5_A5A5u32; rows]);
+        let b_ranges = gpu.buffer(&vec![0xA5A5_A5A5u32; rows * VOCABULARY_RANGES * 2]);
+        let b_arrivals = gpu.buffer(&vec![0u32; rows]);
+        let mut batch = gpu.batch();
+        batch.encode(
+            &mass,
+            &[(&b_logits, 0), (&b_lanes, 1), (&b_masses, 2)],
+            &[],
+            &[],
+            &[],
+            tg(rows * TARGET_SHARDS, 1, 1),
+            tg(256, 1, 1),
+        );
+        batch.barrier();
+        batch.encode(
+            &search,
+            &[
+                (&b_logits, 0),
+                (&b_lanes, 1),
+                (&b_masses, 2),
+                (&b_records, 3),
+            ],
+            &[],
+            &[],
+            &[],
+            tg(rows, 1, 1),
+            tg(VOCABULARY_THREADS, 1, 1),
+        );
+        batch.barrier();
+        batch.encode(
+            &draw,
+            &[
+                (&b_logits, 0),
+                (&b_lanes, 1),
+                (&b_records, 2),
+                (&b_drafted, 3),
+                (&b_ids, 4),
+                (&b_probs, 5),
+                (&b_tokens, 6),
+                (&b_ranges, 7),
+                (&b_arrivals, 8),
+            ],
+            &[],
+            &[],
+            &[],
+            tg(rows * VOCABULARY_GROUPS, 1, 1),
+            tg(VOCABULARY_THREADS, 1, 1),
+        );
+        batch.commit(true);
+        Drawn {
+            tokens: read(&b_tokens, rows),
+            records: (read::<u32>(&b_records, rows * 4).chunks(4))
+                .map(|r| [r[0], r[1], r[2], r[3]])
+                .collect(),
+            arrivals: read(&b_arrivals, rows),
+        }
+    }
+
+    /// Splash's `requireSampledRow`: row `index`'s largest logit, its draft token's probability
+    /// and the correction a rejection takes, or, for the last row, the bonus token.
+    fn require_sampled_row(&self, drawn: &Drawn, index: usize, target: &Distribution, label: &str) {
+        let (lane, row) = (index / ROWS as usize, index % ROWS as usize);
+        assert_eq!(
+            drawn.arrivals[index], 0,
+            "{label}: the draw left its arrival count"
+        );
+        assert_eq!(
+            drawn.maximum(index),
+            target.maximum,
+            "{label}: the scan's largest logit differs"
+        );
+        let uniform = f64::from(self.correction_uniform(lane));
+        let token = drawn.tokens[index];
+        if row == P {
+            return require_draw(
+                token,
+                &target.probabilities,
+                uniform,
+                target.ambiguous_mass,
+                &format!("{label} bonus"),
+            );
+        }
+        let draft = self.drafted[lane * P + row];
+        let expected = target.probability(draft);
+        let got = f64::from(drawn.draft_probability(index));
+        assert!(
+            target.ambiguous[draft as usize]
+                || match expected == 0.0 {
+                    true => got == 0.0,
+                    false => (got - expected).abs() <= (1e-4 + target.ambiguous_mass) * expected,
+                },
+            "{label}: draft token probability {got} for {expected}"
+        );
+        let at = (lane * P + row) * CANDIDATES as usize;
+        let residual = residual_weights(
+            target,
+            &self.draft_ids[at..at + CANDIDATES as usize],
+            &self.draft_probs[at..at + CANDIDATES as usize],
+        );
+        require_draw(
+            token,
+            &residual,
+            uniform,
+            target.ambiguous_mass,
+            &format!("{label} correction"),
+        );
+    }
+}
+
+/// Splash's `shardEdgeStopTokens`: stop tokens in the vocabulary's first shard and its last.
+fn shard_edge_stops(vocabulary: usize) -> [u32; 2] {
+    [1, vocabulary as u32 - 2]
+}
+
+/// Splash's `sampledRows`: sampled lanes with the default top-k of 20, larger ones, a disabled one
+/// and one past the vocabulary, masked or ignoring end-of-sequence, over every row shape, beside
+/// a greedy lane, which the policy leaves; with `min_p`, cutting by min_p first: alone, before a
+/// top-k and a nucleus, at 1, and so low it drops nothing.
+fn sampled_rows(gpu: &Gpu, vocabulary: usize, lanes: usize, min_p: bool) {
+    let mut random =
+        Random(0x7769_6465 + vocabulary as u64 * 8 + lanes as u64 + u64::from(min_p) * 64);
+    let narrow = Policy::new(20, 0.9, 0.95);
+    let disabled = Policy::new(0, 1.0, 0.95);
+    let fifty = Policy::new(50, 0.8, 0.9);
+    let thousand = Policy::new(1000, 1.3, 1.0).excluding_stop();
+    let wide = Policy::new(2000, 1.0, 0.95);
+    let beyond = Policy::new(vocabulary as u32 + 5, 0.6, 0.7);
+    let greedy = Policy::new(1, 0.0, 1.0);
+    let floor = Policy::new(0, 1.0, 1.0).min_p(0.05);
+    let floor_nucleus = Policy::new(50, 0.8, 0.9).min_p(0.2);
+    let heaviest = Policy::new(0, 0.9, 1.0).min_p(1.0);
+    let floorless = Policy::new(20, 0.9, 0.95).excluding_stop().min_p(1e-30);
+    let batches: [Vec<Policy>; 4] = match min_p {
+        true => [
+            vec![floor],
+            vec![floor_nucleus, greedy],
+            vec![heaviest, floorless, greedy],
+            vec![floor, floor_nucleus, greedy, heaviest],
+        ],
+        false => [
+            vec![disabled],
+            vec![fifty, greedy],
+            vec![beyond, narrow, greedy],
+            vec![wide, thousand, greedy, fifty],
+        ],
+    };
+    let policies = &batches[lanes - 1];
+    // Splash's top-k-50 lanes (`fifty`, `floorNucleus`) are constrained: their mask arrives as -inf
+    // logits.
+    let masked = |lane: usize| policies[lane].top_k == 50;
+    let mut t = Targets::of(
+        vocabulary,
+        policies,
+        STOPS,
+        vocabulary as u64 + lanes as u64,
+    );
+    let mut references = vec![Distribution::default(); t.rows()];
+    let mut masks = vec![Vec::new(); t.rows()];
+    for lane in 0..lanes {
+        for row in 0..ROWS as usize {
+            let index = lane * ROWS as usize + row;
+            let mut values = vec![0.0f32; vocabulary];
+            let shape = [Shape::Peaked, Shape::Flat, Shape::Graded][row % 3];
+            fill_shaped(&mut values, shape, &mut random);
+            if row % 2 == 1 {
+                values[STOPS[0] as usize] = 13.0;
+            }
+            if masked(lane) {
+                let mask: Vec<bool> = (0..vocabulary).map(|t| (t * 7 + row) % 5 != 0).collect();
+                for (x, &keep) in values.iter_mut().zip(&mask) {
+                    if !keep {
+                        *x = f32::NEG_INFINITY;
+                    }
+                }
+                masks[index] = mask;
+            }
+            t.set_row(index, &values);
+            if policies[lane].temperature > 0.0 {
+                let admits = Admission {
+                    mask: masked(lane).then_some(masks[index].as_slice()),
+                    excludes_stop: policies[lane].excludes_stop,
+                    stops: STOPS,
+                };
+                references[index] = reference_distribution(&t.row(index), policies[lane], admits);
+            }
+        }
+        // Draft tokens from the start and the middle of the distribution, and a random one.
+        for position in 0..P {
+            let kept = &references[lane * ROWS as usize + position].order;
+            let mut candidates = Vec::new();
+            if !kept.is_empty() {
+                candidates = vec![kept[0], kept[kept.len() / 2]];
+            }
+            candidates.push(3 + random.next() % (vocabulary as u32 - 3));
+            let draft = candidates[match candidates.len() == 3 {
+                true => position % 3,
+                false => 0,
+            }];
+            t.set_draft(lane, position, candidates, draft, &mut random);
+        }
+    }
+    let drawn = t.run(gpu);
+    let label = format!(
+        "{} rows B{lanes} vocabulary {vocabulary}",
+        ["sampled", "min_p"][usize::from(min_p)]
+    );
+    for (index, reference) in references.iter().enumerate() {
+        let lane = index / ROWS as usize;
+        let label = format!("{label} row {index}");
+        match policies[lane].temperature > 0.0 {
+            true => t.require_sampled_row(&drawn, index, reference, &label),
+            false => assert_eq!(
+                drawn.tokens[index], 0xA5A5_A5A5,
+                "{label}: a greedy lane's row was drawn"
+            ),
+        }
+    }
+}
+
+#[test]
+fn target_policy_draws_sampled_rows_as_splash_does() {
+    let Some(gpu) = Gpu::new() else { return };
+    for vocabulary in [1003, 248_320] {
+        for lanes in 1..=4 {
+            sampled_rows(&gpu, vocabulary, lanes, false);
+            sampled_rows(&gpu, vocabulary, lanes, true);
+        }
+    }
+}
+
+/// Splash's `mixedVerify`: a lane's rows select the same, bit for bit, whatever lanes share its
+/// batch, under every mix of sampling lanes (a greedy lane leaves its rows).
+#[test]
+fn target_policy_selects_a_lane_alone_as_in_a_batch() {
+    let Some(gpu) = Gpu::new() else { return };
+    let vocabulary = 1003;
+    let stops = shard_edge_stops(vocabulary);
+    for lanes in 1..=4usize {
+        for mask in 0..(1u32 << lanes) {
+            let mut random = Random(9831 + lanes as u64);
+            let policies: Vec<Policy> = (0..lanes)
+                .map(|lane| {
+                    let temperature = if mask >> lane & 1 == 1 { 0.7 } else { 0.0 };
+                    Policy::new(8 + lane as u32, temperature, 0.9)
+                })
+                .collect();
+            let mut t = Targets::of(vocabulary, &policies, stops, 77);
+            for lane in 0..lanes {
+                for row in 0..ROWS as usize {
+                    let mut values = vec![0.0f32; vocabulary];
+                    let shape = if row % 2 == 1 {
+                        Shape::Ties
+                    } else {
+                        Shape::Peaked
+                    };
+                    fill_shaped(&mut values, shape, &mut random);
+                    t.set_row(lane * ROWS as usize + row, &values);
+                }
+            }
+            for entry in t.drafted.iter_mut() {
+                *entry = random.next() % vocabulary as u32;
+            }
+            for (id, q) in t.draft_ids.iter_mut().zip(t.draft_probs.iter_mut()) {
+                *id = random.next() % vocabulary as u32;
+                *q = 0.5 * (random.unit() + 1.0) / CANDIDATES as f32;
+            }
+            let together = t.run(&gpu);
+            for lane in 0..lanes {
+                let mut alone = Targets::of(vocabulary, &policies[lane..=lane], stops, 0);
+                alone.lanes[0] = VerifyLane {
+                    sampled: 0,
+                    ..t.lanes[lane]
+                };
+                let (r, v) = (ROWS as usize, vocabulary);
+                alone.logits = t.logits[lane * r * v..(lane + 1) * r * v].to_vec();
+                alone.drafted = t.drafted[lane * P..(lane + 1) * P].to_vec();
+                let c = P * CANDIDATES as usize;
+                alone.draft_ids = t.draft_ids[lane * c..(lane + 1) * c].to_vec();
+                alone.draft_probs = t.draft_probs[lane * c..(lane + 1) * c].to_vec();
+                let single = alone.run(&gpu);
+                let rows = lane * r..(lane + 1) * r;
+                assert_eq!(
+                    together.tokens[rows.clone()],
+                    single.tokens[..],
+                    "B{lanes} mask {mask:b}: lane {lane}'s tokens"
+                );
+                if policies[lane].temperature > 0.0 {
+                    assert_eq!(
+                        together.records[rows],
+                        single.records[..],
+                        "B{lanes} mask {mask:b}: lane {lane}'s rows"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Splash's `ties`: top-k and top-p cuts inside thousands of tied logits keep exactly the ties the
+/// reference keeps, ids ascending, over the 248,320-token vocabulary.
+#[test]
+fn target_policy_cuts_within_ties_as_splash_does() {
+    let Some(gpu) = Gpu::new() else { return };
+    let vocabulary = 248_320;
+    for (name, tied, above, policy) in [
+        (
+            "top_k within 3000 ties",
+            3000u32,
+            10u32,
+            Policy::new(1510, 1.0, 1.0),
+        ),
+        ("top_k within 600 ties", 600, 10, Policy::new(310, 0.7, 1.0)),
+        (
+            "top_k then top_p within 3000 ties",
+            3000,
+            10,
+            Policy::new(1510, 2.0, 0.9),
+        ),
+        (
+            "top_p within 3000 ties",
+            3000,
+            0,
+            Policy::new(0, 1.0, 0.4999),
+        ),
+    ] {
+        let mut random = Random(0x7469_6573 + u64::from(tied) + u64::from(policy.top_k));
+        let tied: Vec<u32> = (0..tied).map(|i| 40 + i * 79).collect();
+        let mut t = Targets::of(vocabulary, &[policy], STOPS, u64::from(policy.top_k));
+        for row in 0..ROWS as usize {
+            let mut values: Vec<f32> = (0..vocabulary).map(|_| -12.0 + random.unit()).collect();
+            for &token in &tied {
+                values[token as usize] = 2.0;
+            }
+            for index in 0..above {
+                values[(5 + index * 13) as usize] = 5.0 + index as f32;
+            }
+            t.set_row(row, &values);
+        }
+        let target = reference_distribution(&t.row(0), policy, Admission::default());
+        assert!(
+            target.margin > TOP_P_MARGIN,
+            "{name}: test data is ambiguous"
+        );
+        let kept = target.order.len() - above as usize;
+        assert!(
+            kept > 0 && kept < tied.len(),
+            "{name}: the cut is not within the ties"
+        );
+        for position in 0..P {
+            let draft = if position % 2 == 1 {
+                tied[kept]
+            } else {
+                tied[kept - 1]
+            };
+            t.set_draft(0, position, vec![draft], draft, &mut random);
+        }
+        let drawn = t.run(&gpu);
+        for row in 0..ROWS as usize {
+            t.require_sampled_row(&drawn, row, &target, &format!("{name} row {row}"));
+        }
+    }
+}
+
+/// Splash's `minPCuts`: on rows whose weights are known — the heaviest 1, ten at 0.3, twenty at
+/// 0.1, a hundred at 0.01 — min_p keeps the classes that weigh at least it, each tie whole; top_k
+/// then counts and top_p measures within what it kept; the cut follows the temperature. A draft
+/// token of the last class kept and one of the first dropped test it from both sides.
+#[test]
+fn target_policy_cuts_by_min_p_as_splash_does() {
+    let Some(gpu) = Gpu::new() else { return };
+    let vocabulary = 4096;
+    let classes: [(u32, u32, f32); 4] = [
+        (5, 1, 1.0),
+        (100, 10, 0.3),
+        (200, 20, 0.1),
+        (300, 100, 0.01),
+    ];
+    let mut random = Random(0x6d69_6e70);
+    let mut values = vec![-1000.0f32; vocabulary];
+    for (first, count, weight) in classes {
+        for index in 0..count {
+            values[(first + index) as usize] = weight.ln();
+        }
+    }
+    for (name, policy, kept, last, dropped) in [
+        (
+            "min_p 0.2",
+            Policy::new(0, 1.0, 1.0).min_p(0.2),
+            11,
+            109u32,
+            200u32,
+        ),
+        (
+            "min_p 0.05",
+            Policy::new(0, 1.0, 1.0).min_p(0.05),
+            31,
+            219,
+            300,
+        ),
+        (
+            "min_p 0.31 drops a whole tie",
+            Policy::new(0, 1.0, 1.0).min_p(0.31),
+            1,
+            5,
+            109,
+        ),
+        (
+            "min_p 0.05 at temperature 0.5",
+            Policy::new(0, 0.5, 1.0).min_p(0.05),
+            11,
+            109,
+            200,
+        ),
+        (
+            "min_p 0.2 then top_k 5",
+            Policy::new(5, 1.0, 1.0).min_p(0.2),
+            5,
+            103,
+            104,
+        ),
+        (
+            "min_p 0.05 then top_p 0.5 of what it kept",
+            Policy::new(0, 1.0, 0.5).min_p(0.05),
+            8,
+            106,
+            107,
+        ),
+    ] {
+        let mut t = Targets::of(vocabulary, &[policy], STOPS, kept as u64);
+        for row in 0..ROWS as usize {
+            t.set_row(row, &values);
+        }
+        let target = reference_distribution(&t.row(0), policy, Admission::default());
+        assert!(
+            target.order.len() == kept
+                && target.ambiguous_mass == 0.0
+                && target.probability(last) > 0.0
+                && target.probability(dropped) == 0.0,
+            "{name}: the reference keeps {} tokens",
+            target.order.len()
+        );
+        for position in 0..P {
+            let draft = if position % 2 == 1 { dropped } else { last };
+            t.set_draft(0, position, vec![draft], draft, &mut random);
+        }
+        let drawn = t.run(&gpu);
+        for row in 0..ROWS as usize {
+            t.require_sampled_row(&drawn, row, &target, &format!("{name} row {row}"));
+        }
+    }
+}
+
+/// Splash's `targetTop1`: a sampled lane whose distribution keeps one token draws its masked
+/// argmax at every verify row, and its draft token's probability is one-hot.
+#[test]
+fn target_policy_draws_a_one_token_distribution_as_its_argmax() {
+    let Some(gpu) = Gpu::new() else { return };
+    for vocabulary in [1003, 248_320] {
+        let stops = shard_edge_stops(vocabulary);
+        for lanes in 1..=4usize {
+            let policies: Vec<Policy> = (0..lanes).map(|_| Policy::new(1, 0.8, 0.5)).collect();
+            let mut t = Targets::of(vocabulary, &policies, stops, lanes as u64);
+            let best: Vec<u32> = (0..t.rows())
+                .map(|row| {
+                    let values: Vec<f32> = (0..vocabulary)
+                        .map(|token| match (token + row).is_multiple_of(17) {
+                            true => {
+                                ((token * 7 + row * 13) % 23) as f32 - 11.0
+                                    + (token % 3) as f32 * 2f32.powi(-12)
+                            }
+                            false => f32::NEG_INFINITY,
+                        })
+                        .collect();
+                    t.set_row(row, &values);
+                    reference_best(&t.row(row), 1, Admission::default())[0]
+                })
+                .collect();
+            for (row, &argmax) in best.iter().enumerate() {
+                let (lane, r) = (row / ROWS as usize, row % ROWS as usize);
+                if r < P {
+                    let draft = if r % 2 == 1 {
+                        argmax
+                    } else {
+                        (argmax + 1) % vocabulary as u32
+                    };
+                    t.set_one_hot_draft(lane, r, draft, 1.0);
+                }
+            }
+            let drawn = t.run(&gpu);
+            for (row, &argmax) in best.iter().enumerate() {
+                assert_eq!(
+                    drawn.tokens[row], argmax,
+                    "B{lanes} row {row}: a sampled top-1 row drew other than its argmax"
+                );
+                let (lane, r) = (row / ROWS as usize, row % ROWS as usize);
+                if r < P {
+                    let one_hot = if t.drafted[lane * P + r] == argmax {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    assert_eq!(
+                        drawn.draft_probability(row),
+                        one_hot,
+                        "B{lanes} row {row}: not one-hot"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Splash's `nonFiniteRowsSelectTheSentinel`: a row with no selectable logit, every one NaN or
+/// -inf, draws 0xFFFFFFFF at every verify row, and acceptance retains it as the next anchor.
+#[test]
+fn target_policy_draws_the_sentinel_from_a_row_with_no_logit() {
+    let Some(gpu) = Gpu::new() else { return };
+    let vocabulary = 1003;
+    let policy = Policy::new(20, 1.0, 0.9);
+    for logit in [f32::NAN, f32::NEG_INFINITY] {
+        let mut random = Random(0x6e_616e);
+        let mut t = Targets::of(vocabulary, &[policy], STOPS, 3);
+        for row in 0..ROWS as usize {
+            t.set_row(row, &vec![logit; vocabulary]);
+        }
+        for position in 0..P {
+            let draft = 3 + random.next() % (vocabulary as u32 - 3);
+            t.set_draft(0, position, vec![draft], draft, &mut random);
+        }
+        let drawn = t.run(&gpu);
+        for row in 0..ROWS as usize {
+            assert_eq!(
+                drawn.tokens[row], SENTINEL,
+                "{logit}: verify row {row} with no selectable logit selected {}",
+                drawn.tokens[row]
+            );
+        }
+        let accepted = t.accept(&gpu, &drawn);
+        let kept = accepted.retained[0];
+        assert!(
+            (1..=ROWS).contains(&kept) && accepted.tokens[kept as usize - 1] == SENTINEL,
+            "{logit}: acceptance did not retain the sentinel"
+        );
+    }
+}
+
+impl Targets {
+    /// The acceptance after the policy (`dflash2_accept`): each lane's drafts against what the
+    /// policy drew, its records' draft token probabilities.
+    fn accept(&self, gpu: &Gpu, drawn: &Drawn) -> Accepted {
+        Acceptance {
+            lanes: self.lanes.clone(),
+            drafted: self.drafted.clone(),
+            tokens: drawn.tokens.clone(),
+            draft_ids: self.draft_ids.clone(),
+            draft_probs: self.draft_probs.clone(),
+            target_rows: drawn.records.clone(),
+        }
+        .run(gpu)
+    }
+
+    /// Splash's acceptance uniform pinned through the draft probability instead: a one-hot draft of
+    /// `token`, which the lane's acceptance test (u · q < p) keeps when `accept`, its probability
+    /// half of what the target gives it over the lane's uniform; else at least the target's,
+    /// rejected, and wholly out of the residual.
+    fn set_tested_draft(&mut self, lane: usize, position: usize, token: u32, p: f64, accept: bool) {
+        let u = f64::from(self.acceptance_uniform(lane, position)).max(1e-6);
+        let q = match accept {
+            true => 0.5 * p / u,
+            false => (2.0 * p + 0.01).min(1.0) / u,
+        };
+        self.set_one_hot_draft(lane, position, token, q as f32);
+    }
+}
+
+/// The correction a rejected row draws, or the bonus token (Splash's expectation in
+/// `speculativeExactness`, `speculativeWholeVocabulary`): the target less the one-hot draft
+/// token, at the lane's correction uniform, the data refused as ambiguous within `slack`.
+fn expected_correction(
+    target: &Distribution,
+    draft: Option<u32>,
+    uniform: f64,
+    label: &str,
+) -> u32 {
+    let mut weights = target.probabilities.clone();
+    if let Some(d) = draft {
+        weights[d as usize] = 0.0;
+    }
+    let total: f64 = weights.iter().sum();
+    let threshold = uniform * total;
+    let slack = (1e-5 + target.ambiguous_mass) * total;
+    let (mut cumulative, mut token) = (0.0, 0usize);
+    while cumulative + weights[token] <= threshold {
+        cumulative += weights[token];
+        token += 1;
+    }
+    assert!(
+        threshold - cumulative > slack
+            && cumulative + weights[token] - threshold > slack
+            && !target.ambiguous[token],
+        "{label}: test data is ambiguous at the correction draw"
+    );
+    token as u32
+}
+
+/// Splash's `speculativeExactness` (its penalties wait for their port): acceptance over the
+/// policy's rows must accept and correct as a sequential decode would. Lane 0 drafts its first
+/// wrong token at position 3, lane 1 every token right, taking the bonus row.
+#[test]
+fn target_policy_and_acceptance_decode_as_a_sequential_decode_does() {
+    let Some(gpu) = Gpu::new() else { return };
+    let vocabulary = 1003;
+    let wrong_at = [3usize, P];
+    let policy = Policy::new(32, 0.9, 0.9);
+    let mut random = Random(0x7370_6563);
+    let mut t = Targets::of(vocabulary, &[policy, policy], STOPS, 11);
+    let mut expected = [[0u32; ROWS as usize]; 2];
+    for lane in 0..2 {
+        let mut base = vec![0.0f32; vocabulary];
+        spiked_row(&mut base, &mut random);
+        let mut targets = Vec::new();
+        for row in 0..ROWS as usize {
+            let values: Vec<f32> = base.iter().map(|&b| b + 0.01 * random.unit()).collect();
+            t.set_row(lane * ROWS as usize + row, &values);
+            let logits = t.row(lane * ROWS as usize + row);
+            let order = reference_best(&logits, 8, Admission::default());
+            assert!(
+                logits[order[0] as usize] - logits[order[1] as usize] > 1e-4,
+                "test data is ambiguous at a greedy selection"
+            );
+            targets.push(reference_distribution(
+                &logits,
+                policy,
+                Admission::default(),
+            ));
+            if row == P {
+                break;
+            }
+            // The best token until the wrong position, then the eighth best.
+            let right = row < wrong_at[lane];
+            let draft = if right { order[0] } else { order[7] };
+            let p = targets[row].probability(draft);
+            assert!(
+                !right || p > 1e-4,
+                "a sampled lane drafted a token its target cannot accept"
+            );
+            t.set_tested_draft(lane, row, draft, p, right);
+        }
+        let accepted = wrong_at[lane];
+        expected[lane][..accepted].copy_from_slice(&t.drafted[lane * P..lane * P + accepted]);
+        let draft = (accepted < P).then(|| t.drafted[lane * P + accepted]);
+        let uniform = f64::from(t.correction_uniform(lane));
+        expected[lane][accepted] =
+            expected_correction(&targets[accepted], draft, uniform, &format!("lane {lane}"));
+    }
+    let drawn = t.run(&gpu);
+    let got = t.accept(&gpu, &drawn);
+    for lane in 0..2 {
+        let accepted = wrong_at[lane];
+        assert_eq!(
+            (got.accepted[lane], got.retained[lane]),
+            (accepted as u32, accepted as u32 + 1),
+            "lane {lane} accepted"
+        );
+        let first = lane * ROWS as usize;
+        assert_eq!(
+            got.tokens[first..=first + accepted],
+            expected[lane][..=accepted],
+            "lane {lane}: output differs from a sequential decode"
+        );
+    }
+}
+
+/// Splash's `speculativeWholeVocabulary`: acceptance over broad distributions against a
+/// sequential decode, beside a lane with the default top-k of 20 and one that min_p cuts.
+#[test]
+fn target_policy_and_acceptance_decode_broad_rows_as_a_sequential_decode_does() {
+    let Some(gpu) = Gpu::new() else { return };
+    let vocabulary = 5003;
+    let wrong_at = [2usize, P, 4, 6];
+    let policies = [
+        Policy::new(0, 1.0, 1.0),
+        Policy::new(2000, 0.8, 0.97),
+        Policy::new(20, 0.9, 0.9),
+        Policy::new(0, 1.0, 1.0).min_p(0.02),
+    ];
+    let mut random = Random(0x7768_6f6c);
+    let mut t = Targets::of(vocabulary, &policies, STOPS, 23);
+    let mut expected = [[0u32; ROWS as usize]; 4];
+    for (lane, expected) in expected.iter_mut().enumerate() {
+        for (row, expected_row) in expected.iter_mut().enumerate() {
+            let mut values = vec![0.0f32; vocabulary];
+            fill_shaped(
+                &mut values,
+                if row % 2 == 1 {
+                    Shape::Flat
+                } else {
+                    Shape::Graded
+                },
+                &mut random,
+            );
+            t.set_row(lane * ROWS as usize + row, &values);
+            let target = reference_distribution(
+                &t.row(lane * ROWS as usize + row),
+                policies[lane],
+                Admission::default(),
+            );
+            if row < P {
+                let right = row < wrong_at[lane];
+                let draft = match right {
+                    true => target.order[0],
+                    false => target.order[5.min(target.order.len() - 1)],
+                };
+                let p = target.probability(draft);
+                assert!(!right || p > 1e-6, "a draft token its target cannot accept");
+                t.set_tested_draft(lane, row, draft, p, right);
+                if right {
+                    *expected_row = draft;
+                }
+            }
+            if row == wrong_at[lane] {
+                let draft = (row < P).then(|| t.drafted[lane * P + row]);
+                let uniform = f64::from(t.correction_uniform(lane));
+                *expected_row =
+                    expected_correction(&target, draft, uniform, &format!("lane {lane}"));
+            }
+        }
+    }
+    let drawn = t.run(&gpu);
+    let got = t.accept(&gpu, &drawn);
+    for lane in 0..4 {
+        assert_eq!(
+            got.accepted[lane], wrong_at[lane] as u32,
+            "acceptance lane {lane}"
+        );
+        let first = lane * ROWS as usize;
+        assert_eq!(
+            got.tokens[first..=first + wrong_at[lane]],
+            expected[lane][..=wrong_at[lane]],
+            "acceptance lane {lane}: output differs from a sequential decode"
+        );
+    }
+}
+
+/// A position whose correction draw is `want` units of 2^-24 for `seed`, and whose first
+/// acceptance draw is at least `reject` (`overProposedResidual` pins both uniforms).
+fn position_drawing(seed: DraftSeed, want: u32, reject: f32) -> u32 {
+    (0..u32::MAX)
+        .find(|&p| {
+            draft_uniform(seed, p, UNIFORM_CORRECTION) * (1u64 << 24) as f32 == want as f32
+                && draft_uniform(seed, p, UNIFORM_ACCEPTANCE) >= reject
+        })
+        .expect("a position drawing the uniform")
+}
+
+/// Splash's `overProposedResidual`: a rejected draft token's correction when the only weighted
+/// tokens of one simdgroup's share of the vocabulary are draft candidates proposed at least as
+/// likely as the target keeps them — nothing of that share remains in the residual, and the
+/// correction comes from the others at every correction uniform down to 0. Acceptance takes the
+/// correction as the next anchor.
+#[test]
+fn target_policy_corrects_from_an_over_proposed_residual() {
+    let Some(gpu) = Gpu::new() else { return };
+    let vocabulary = 4096;
+    let policy = Policy::new(0, 1.0, 1.0);
+    let mut values = vec![-1000.0f32; vocabulary];
+    values[5] = 0.0;
+    values[6] = (0.75 * 2f32.powi(-23)).ln();
+    values[1000] = 0.5f32.ln();
+    for index in 0..40 {
+        values[1200 + 50 * index] = 0.01f32.ln() - 1e-4 * index as f32;
+    }
+    for want in [0u32, 1, 1 << 23, (1 << 24) - 1] {
+        let label = format!("over-proposed residual, correction uniform {want}/2^24");
+        let mut t = Targets::of(vocabulary, &[policy], STOPS, 31);
+        for row in 0..ROWS as usize {
+            t.set_row(row, &values);
+        }
+        let target = reference_distribution(&t.row(0), policy, Admission::default());
+        // The first draft token is rejected: its acceptance draw times 0.9 exceeds its probability.
+        let reject = (target.probability(5) / 0.9) as f32 + 1e-3;
+        t.lanes[0].position = position_drawing(t.lanes[0].seed, want, reject);
+        // Every position drafts token 5 with 0.9 and token 6 with 0.1, beside fourteen weightless.
+        for position in 0..P {
+            let at = position * CANDIDATES as usize;
+            for index in 0..CANDIDATES as usize {
+                t.draft_ids[at + index] = if index < 2 {
+                    5 + index as u32
+                } else {
+                    6 + index as u32
+                };
+                t.draft_probs[at + index] = match index {
+                    0 => 0.9,
+                    1 => 0.1,
+                    _ => 0.0,
+                };
+            }
+            t.drafted[position] = 5;
+        }
+        let drawn = t.run(&gpu);
+        for row in 0..ROWS as usize {
+            t.require_sampled_row(&drawn, row, &target, &format!("{label} row {row}"));
+        }
+        let got = t.accept(&gpu, &drawn);
+        assert_eq!(
+            (got.accepted[0], got.retained[0]),
+            (0, 1),
+            "{label}: acceptance did not take the correction as its anchor"
+        );
+    }
+}
+
+/// Splash's `excludedStopTokens`: a lane that ignores end-of-sequence never draws a stop token at
+/// a verify row, alone or beside lanes that keep them, and a stop token its draft proposes is
+/// rejected; a lane that keeps them accepts it. The stop tokens lead every row.
+#[test]
+fn target_policy_never_draws_an_excluded_stop_token() {
+    let Some(gpu) = Gpu::new() else { return };
+    for vocabulary in [1003, 248_320] {
+        let stops = shard_edge_stops(vocabulary);
+        let best = |row: usize| 5 + (row * 7919) % (vocabulary - 8);
+        let stop = |token: u32| stops.contains(&token);
+        for lanes in 1..=4usize {
+            for exclude in 0..(1u32 << lanes) {
+                let policies: Vec<Policy> = (0..lanes)
+                    .map(|lane| {
+                        let p = Policy::new(32, 0.8, 1.0);
+                        if exclude >> lane & 1 == 1 {
+                            p.excluding_stop()
+                        } else {
+                            p
+                        }
+                    })
+                    .collect();
+                let mut t = Targets::of(vocabulary, &policies, stops, u64::from(exclude));
+                for row in 0..t.rows() {
+                    let mut values: Vec<f32> = (0..vocabulary)
+                        .map(|token| -4.0 + (token % 7) as f32 * 0.01)
+                        .collect();
+                    values[best(row)] = 8.0;
+                    values[stops[0] as usize] = 12.0;
+                    values[stops[1] as usize] = 11.0;
+                    t.set_row(row, &values);
+                }
+                // Drafts propose the first stop token, with all of their mass on it; a lane that keeps
+                // the stop tokens accepts it (Splash's uniforms of 0.5, pinned here through q).
+                for (lane, &policy) in policies.iter().enumerate() {
+                    let admits = Admission {
+                        mask: None,
+                        excludes_stop: policy.excludes_stop,
+                        stops,
+                    };
+                    let row = t.row(lane * ROWS as usize);
+                    let p = reference_distribution(&row, policy, admits).probability(stops[0]);
+                    t.set_tested_draft(lane, 0, stops[0], p, !policy.excludes_stop);
+                }
+                let drawn = t.run(&gpu);
+                for row in 0..t.rows() {
+                    let policy = policies[row / ROWS as usize];
+                    let label =
+                        format!("vocabulary {vocabulary} B{lanes} exclude {exclude:b} row {row}");
+                    assert!(
+                        row % ROWS as usize != 0
+                            || (drawn.draft_probability(row) > 0.0) != policy.excludes_stop,
+                        "{label}: a verify distribution mishandled the stop tokens"
+                    );
+                    assert!(
+                        !policy.excludes_stop
+                            || ((drawn.tokens[row] as usize) < vocabulary
+                                && !stop(drawn.tokens[row])),
+                        "{label}: an excluding verify row drew a stop token"
+                    );
+                }
+                let got = t.accept(&gpu, &drawn);
+                for (lane, policy) in policies.iter().enumerate() {
+                    let output = &got.tokens[lane * ROWS as usize..];
+                    let kept = got.retained[lane] as usize;
+                    match policy.excludes_stop {
+                        false => assert!(
+                            kept == 1 && output[0] == stops[0],
+                            "lane {lane}: the target did not accept the drafted stop token"
+                        ),
+                        true => {
+                            assert!(
+                                (1..=ROWS as usize).contains(&kept),
+                                "lane {lane}: an excluding lane retained no token"
+                            );
+                            assert!(
+                                output[..kept]
+                                    .iter()
+                                    .all(|&t| (t as usize) < vocabulary && !stop(t)),
+                                "lane {lane}: an excluding lane accepted a stop token"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 }

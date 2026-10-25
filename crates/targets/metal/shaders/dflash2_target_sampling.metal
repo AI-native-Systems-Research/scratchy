@@ -7,8 +7,9 @@
 //
 //   - The logits are the model's activation type (half or bfloat); Splash's are f32. Every value
 //     is read as f32.
-//   - A row admits every token but the stop tokens of a lane that ignores end-of-sequence: a lane
-//     whose grammar constrains it drafts nothing here (Splash's `constrained` mask rows).
+//   - A row admits every token but the stop tokens of a lane that ignores end-of-sequence. A
+//     grammar's mask arrives as -inf logits, which the grammar mask writes before this policy runs
+//     and which weigh nothing (Splash reads its `constrained` mask rows here).
 //   - A lane's policy and its rows are its `VerifyLane` (dflash2_cycle.h): selected row s is row
 //     s % ROWS of lane s / ROWS, at its logits row `sampled + s % ROWS`; a lane has `drafts + 1`
 //     rows, the others return at once. Splash reads them from `TargetSamplingParams`.
