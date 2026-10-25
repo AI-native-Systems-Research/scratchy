@@ -359,6 +359,9 @@ pub struct MetalWorker {
     /// The chain buffer and layout `execute_model` laid this step's head passes out in, and whether
     /// the step is behind a speculative one in flight, for `forward_argmax_then`.
     pending_chain: Option<(ChainLayout, Arc<ChainBuffer>, bool)>,
+    /// When the last blocking forward returned: the host's time from there to the next forward's
+    /// start is time the GPU waits on it (logged at debug with each forward's own).
+    last_forward_end: Option<std::time::Instant>,
     /// The chain of the deferred step `forward_argmax_then` committed, back for `execute_model`, and
     /// whether that step is behind a speculative one in flight (as `pending_chain` had it).
     committed_chain: Option<(ChainLayout, Arc<ChainBuffer>, bool)>,
@@ -1110,6 +1113,7 @@ impl MetalWorker {
             argmax_slots: Vec::new(),
             deferral: None,
             pending_chain: None,
+            last_forward_end: None,
             committed_chain: None,
             spec_tail: None,
             committed: None,
@@ -4487,6 +4491,7 @@ impl MetalWorker {
                 Ok(())
             },
         );
+        let forward_start = std::time::Instant::now();
         let logits = unsafe {
             model_ref.forward_with_metal_followup(
                 scratchy_target_metal::ForwardCtxHandle::new(&ctx),
@@ -4497,6 +4502,22 @@ impl MetalWorker {
         }
         .map_err(|e| BackendError::Backend(e.0))?;
         let _ = logits; // argmax_out is what we read
+        // A blocking forward's time (its encoding and the GPU's run), and the host's since the last
+        // one returned, which the GPU spent waiting.
+        if deferral.is_none() {
+            let end = std::time::Instant::now();
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+            let host = self
+                .last_forward_end
+                .replace(end)
+                .map(|last| ms(forward_start - last));
+            tracing::debug!(
+                "forward of {} rows: {:.2} ms, host {:.2} ms since the last",
+                req.num_tokens,
+                ms(end - forward_start),
+                host.unwrap_or(f64::NAN),
+            );
+        }
         if let Some(deferral) = deferral.as_mut() {
             let in_flight = deferral.take_in_flight().ok_or_else(|| {
                 BackendError::Backend("a deferred forward returned uncommitted".into())

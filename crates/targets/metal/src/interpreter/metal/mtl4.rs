@@ -106,7 +106,7 @@ pub struct KernelTimeHeap {
     /// dispatches (pushing entries) on one thread while another command
     /// buffer's wait prints this heap — a `RefCell` there is a data race
     /// that panics ("already borrowed", measured mid-run).
-    entries: std::sync::Mutex<Vec<(super::lowered::KernelId, String)>>,
+    entries: std::sync::Mutex<Vec<(super::lowered::KernelId, String, bool)>>,
     /// Registration label ("heap 0", "heap 1", ...), so a print names which
     /// worker's — and so which model's — tape it is.
     label: String,
@@ -154,7 +154,8 @@ impl KernelTimeHeap {
     }
 
     /// Write one timestamp after the dispatch the caller just encoded,
-    /// remembering its kernel id + grid for the printout. The physical slot
+    /// remembering its kernel id, grid, threadgroup and whether a barrier precedes it for the
+    /// printout. The physical slot
     /// wraps at the driver's heap cap; the un-printed tail stays far below
     /// it, so a rewritten slot was long since printed.
     pub fn write_timestamp(
@@ -162,6 +163,8 @@ impl KernelTimeHeap {
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         kernel: super::lowered::KernelId,
         grid: MTLSize,
+        threads: MTLSize,
+        fence: super::lowered::Fence,
     ) {
         let logical = self
             .written
@@ -180,11 +183,14 @@ impl KernelTimeHeap {
                 idx,
             );
         }
-        let grid_str = format!("{}x{}x{}", grid.width, grid.height, grid.depth);
+        let grid_str = format!(
+            "{}x{}x{}@{}x{}x{}",
+            grid.width, grid.height, grid.depth, threads.width, threads.height, threads.depth
+        );
         self.entries
             .lock()
             .expect("kernel-time entries mutex")
-            .push((kernel, grid_str));
+            .push((kernel, grid_str, fence != super::lowered::Fence::None));
     }
 
     /// Resolve the heap and print the per-kernel deltas of the logical stamps
@@ -240,6 +246,12 @@ impl KernelTimeHeap {
         // Slowest single dispatches, for the grid-shape question: (ticks,
         // kernel, grid string), printed top-first.
         let mut slowest: Vec<(u64, super::lowered::KernelId, String)> = Vec::new();
+        // Per (kernel, grid@threadgroup) aggregates, for the occupancy question: (count, ticks).
+        let mut shapes: BTreeMap<(String, String), (u64, u64)> = BTreeMap::new();
+        // The window's dispatches in order, `|` where a barrier precedes one
+        // (`SCRATCHY_METAL_KERNEL_TIME=order`): which run between the same barriers.
+        let order = std::env::var_os("SCRATCHY_METAL_KERNEL_TIME").is_some_and(|v| v == "order");
+        let mut sequence = String::new();
         {
             let entries = self.entries.lock().expect("kernel-time entries mutex");
             // `start + 1` skips the window's first dispatch (see the doc);
@@ -251,12 +263,25 @@ impl KernelTimeHeap {
                 // Stamp l is written AFTER dispatch l in the encoder stream,
                 // so the delta between stamp l-1 and stamp l measures the
                 // kernel dispatched AT l (it started once l-1's work drained).
-                let (kernel, grid) = &entries[l as usize];
+                let (kernel, grid, barrier) = &entries[l as usize];
+                if order {
+                    use std::fmt::Write as _;
+                    let _ = write!(
+                        sequence,
+                        "{}{kernel:?}[{grid}] ",
+                        if *barrier { "| " } else { "" }
+                    );
+                }
                 let key = format!("{kernel:?}");
                 let e = agg.entry(key).or_insert((0, 0, 0));
                 e.0 += 1;
                 e.1 += dt;
                 e.2 = e.2.max(dt);
+                let s = shapes
+                    .entry((format!("{kernel:?}"), grid.clone()))
+                    .or_insert((0, 0));
+                s.0 += 1;
+                s.1 += dt;
                 slowest.push((dt, *kernel, grid.clone()));
             }
         }
@@ -270,6 +295,17 @@ impl KernelTimeHeap {
             );
         }
         eprintln!("[kernel-time]   TOTAL {:>9.3} ms", ms(total));
+        if order {
+            eprintln!("[kernel-order] {sequence}");
+        }
+        let mut shapes: Vec<_> = shapes.into_iter().collect();
+        shapes.sort_unstable_by_key(|(_, (_, ticks))| std::cmp::Reverse(*ticks));
+        for ((kernel, grid), (count, ticks)) in &shapes {
+            eprintln!(
+                "[kernel-time]   shape {kernel} {grid} n={count} sum={:.3} ms",
+                ms(*ticks)
+            );
+        }
         slowest.sort_unstable_by_key(|s| std::cmp::Reverse(s.0));
         for (ticks, kernel, grid) in slowest.iter().take(12) {
             if *ticks == 0 {
