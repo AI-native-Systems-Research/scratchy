@@ -917,7 +917,12 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         | SubOp::AttnPackedKv
         | SubOp::SampleRowsGather
         | SubOp::SampleRowsScatter
-        | SubOp::AllRowsMatmul => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
+        | SubOp::AllRowsMatmul
+        | SubOp::CaptureHidden { .. }
+        | SubOp::DraftConv { .. }
+        | SubOp::DraftAttention { .. }
+        | SubOp::DraftContextKv { .. }
+        | SubOp::DraftSelect => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
         // ── THE 2a KINDS — every one through `lower_all`: the TanhSoftCap logits fold
         // and the head-norm sandwich's three seats (Reshape split / norm middle /
         // Reshape flatten) are `lower_all`'s interceptions, and every other node of
