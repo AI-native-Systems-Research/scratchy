@@ -486,12 +486,17 @@ template <typename T>
         owners[at] = lane;
       }
     }
+    // The host's cost line when it gives one (a row's bytes past zero), else the seed.
+    const float fixed = lane_params[0].cost_fixed, per_row = lane_params[0].cost_per_row;
+    auto cost = [&](uint rows) {
+      return per_row > 0.0f ? fixed + per_row * float(rows) : select_cost(lanes, rows);
+    };
     float expected = float(lanes);
-    float best = expected / select_cost(lanes, total);
+    float best = expected / cost(total);
     uint taken = 0;
     for (uint i = 0; i < count; ++i) {
       expected += survivals[i];
-      const float value = expected / select_cost(lanes, total + i + 1);
+      const float value = expected / cost(total + i + 1);
       if (value > best) {
         best = value;
         taken = i + 1;

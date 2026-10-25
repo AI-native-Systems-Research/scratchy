@@ -140,8 +140,9 @@ impl VerifyRows {
     }
 }
 
-/// One lane's policy for a cycle (`dflash2_cycle.h` `DraftLaneParams`), and the request's seed
-/// and the step's verify position its proposals draw their uniforms from ([`draft_uniform`]).
+/// One lane's policy for a cycle (`dflash2_cycle.h` `DraftLaneParams`), the request's seed and the
+/// step's verify position its proposals draw their uniforms from ([`draft_uniform`]), and the
+/// cycle's cost line ([`VerifyLine`]).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DraftLaneParams {
@@ -151,6 +152,33 @@ pub struct DraftLaneParams {
     pub remaining: u32,
     pub seed: DraftSeed,
     pub position: u32,
+    pub cost: VerifyLine,
+}
+
+/// A cycle's cost in the rows its target verifies in all: `fixed + per_row · rows`, the weight
+/// bytes (GiB) its forwards — its target's verify and its drafter's passes — read whatever their
+/// rows and each row's experts ([`crate::tape::step::WeightBytes`]). Splash's verify budget prices
+/// rows by the line it fits to its timed cycles (runtime/model/VerifyBudget.cpp `line`, `costs`);
+/// a compiler times none, and counts the bytes. No bytes a row (the default): the seed.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct VerifyLine {
+    pub fixed: f32,
+    pub per_row: f32,
+}
+
+impl VerifyLine {
+    /// The line of a cycle of `target`'s verify and `drafter`'s passes.
+    pub fn of(
+        target: crate::tape::step::WeightBytes,
+        drafter: crate::tape::step::WeightBytes,
+    ) -> Self {
+        let gib = |bytes: u64| bytes as f32 / (1u64 << 30) as f32;
+        Self {
+            fixed: gib(target.fixed + drafter.fixed),
+            per_row: gib(target.per_row + drafter.per_row),
+        }
+    }
 }
 
 /// The shards a sampled verify row's softmax denominator is summed over

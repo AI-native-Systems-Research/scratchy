@@ -859,3 +859,74 @@ pub struct MetalStepTape {
     /// Per lm_head row, likewise: never a play of cache writes alone.
     pub lm_head_live: Vec<super::lowered::PlayLive>,
 }
+
+/// The bytes of weights a forward of a bucket reads ([`MetalStepTape::weight_bytes`]): what it reads
+/// whatever its rows — its projections' — and what each row adds, the experts it routes through.
+/// What a cycle's time is linear in on a memory-bound decode (Splash fits that line to its timed
+/// cycles, runtime/model/VerifyBudget.cpp `line`; a compiler, which times none, counts it).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct WeightBytes {
+    pub fixed: u64,
+    pub per_row: u64,
+}
+
+impl WeightBytes {
+    /// An MLX-affine `n x k` weight's bytes: its codes, and a bf16 scale and bias a group.
+    fn affine(n: u32, k: u32, group_size: AffineGroupSize, bits: AffineBits) -> u64 {
+        let (n, k) = (u64::from(n), u64::from(k));
+        n * k * u64::from(bits.get()) / 8 + n * (k / u64::from(group_size.get())) * 4
+    }
+
+    /// One row's experts of `b`: its top-k experts' every projection.
+    fn routed(b: &MoeBlock) -> u64 {
+        let (inter, hidden) = (b.inter.get(), b.hidden.get());
+        let (w, gs) = (b.quant.widths, b.quant.group_size);
+        let expert = (w.gate.map_or(0, |g| Self::affine(inter, hidden, gs, g)))
+            + Self::affine(inter, hidden, gs, w.up)
+            + Self::affine(hidden, inter, gs, w.down);
+        u64::from(b.top_k.get()) * expert
+    }
+}
+
+impl MetalStepTape {
+    /// The weight bytes a forward of this tape reads ([`WeightBytes`]): every projection's once a
+    /// layer, and a routed block's experts a row, each loop's body as many times as it iterates.
+    /// Norm gains and the like are left out: a row of them is a projection's weight row.
+    pub fn weight_bytes(&self) -> WeightBytes {
+        let mut total = WeightBytes::default();
+        for rows in [&self.backbone, &self.lm_head] {
+            // Each open loop's end and its iterations, innermost last.
+            let mut loops: Vec<(usize, u64)> = Vec::new();
+            for (i, row) in rows.iter().enumerate() {
+                loops.retain(|&(end, _)| i < end);
+                let times: u64 = loops.iter().map(|&(_, n)| n).product();
+                let step = match row {
+                    StepRow::Loop { iters, body, .. } => {
+                        loops.push((i + 1 + body.get() as usize, u64::from(iters.get())));
+                        continue;
+                    }
+                    StepRow::Step(step, _) => step,
+                };
+                let (fixed, per_row) = match step {
+                    MetalStep::AffineQmm(g)
+                    | MetalStep::SampleRows(SampledMatmul::Affine(g), _) => (
+                        WeightBytes::affine(g.n.get(), g.k.get(), g.group_size, g.bits),
+                        0,
+                    ),
+                    MetalStep::Gemm(_, _, _, n, k)
+                    | MetalStep::SampleRows(SampledMatmul::Dense(_, _, _, n, k), _) => {
+                        (2 * u64::from(n.get()) * u64::from(k.get()), 0)
+                    }
+                    // A block's experts once a layer, at the step that combines them.
+                    MetalStep::Moe(b, MoeStep::DownCombine(..) | MoeStep::Combine(_)) => {
+                        (0, WeightBytes::routed(b))
+                    }
+                    _ => (0, 0),
+                };
+                total.fixed += times * fixed;
+                total.per_row += times * per_row;
+            }
+        }
+        total
+    }
+}

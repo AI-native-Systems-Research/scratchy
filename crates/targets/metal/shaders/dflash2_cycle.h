@@ -37,8 +37,11 @@ inline float draft_uniform(uint seed_lo, uint seed_hi, uint position, uint draw)
 // One lane's policy for a cycle: its temperature and whether it samples (Splash's
 // SelectorBatchParams `temperature`, `sampling_mask`), the most rows its verify takes (its
 // retention limit, VerifyRowsParams `maximum`) and the tokens it may still emit
-// (AcceptBatchParams `remaining`); and the request's seed and the step's verify position, which
-// its proposals' uniforms are drawn from (`draft_uniform`).
+// (AcceptBatchParams `remaining`); the request's seed and the step's verify position, which its
+// proposals' uniforms are drawn from (`draft_uniform`); and the cycle's cost line in the rows it
+// verifies in all — the weight bytes its forwards read whatever their rows and a row's, in GiB
+// (VerifyRowsParams `cost`, of Splash's line fit to its timed cycles); no bytes a row: the verify
+// budget's seed.
 struct DraftLaneParams {
   float temperature;
   uint sampling;
@@ -47,6 +50,8 @@ struct DraftLaneParams {
   uint seed_lo;
   uint seed_hi;
   uint position;
+  float cost_fixed;
+  float cost_per_row;
 };
 
 // One lane of a step's verify, as Splash's AcceptBatchParams and TargetSamplingParams carry it:

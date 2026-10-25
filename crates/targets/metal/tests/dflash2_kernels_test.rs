@@ -17,7 +17,7 @@ use scratchy_target_metal::detect_device;
 use scratchy_target_metal::dflash2::{
     ATTENTION_SPLITS, BUDGET_LANES, CANDIDATES, DraftLaneParams, DraftSeed, EDGE_THREADS,
     PROPOSALS, SAMPLING_SHARDS, UNIFORM_ACCEPTANCE, UNIFORM_PROPOSALS, VERIFY_COST_SEED,
-    VerifyCost, VerifyLane, VerifyRows, draft_uniform,
+    VerifyCost, VerifyLane, VerifyLine, VerifyRows, draft_uniform,
 };
 use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
 use scratchy_target_metal::specialized_pipeline_cache::{
@@ -1112,6 +1112,7 @@ fn select_case(gpu: &Gpu, codebooks: &Codebooks, vocab: u32, lanes: u32, samplin
             remaining: ROWS,
             seed: DraftSeed::of(u64::from(random.next()) << 32 | u64::from(random.next())),
             position: random.next() % 100_000,
+            cost: VerifyLine::default(),
         })
         .collect();
     let s = selector_buffers(gpu, &logits, &hidden, codebooks, &anchors, &params);
@@ -1259,6 +1260,7 @@ fn draft_confidence_ignores_draws() {
             remaining: ROWS,
             seed: DraftSeed::of(seed),
             position: 4096,
+            cost: VerifyLine::default(),
         }];
         let s = selector_buffers(&gpu, &logits, &hidden, &codebooks, &[7], &params);
         s.run(&gpu, vocab, 1);
@@ -1292,25 +1294,34 @@ fn draft_confidence_ignores_draws() {
 }
 
 /// `verifyRowsChoice`: for random confidences (with exact 0 and 1), acceptance models, costs
-/// (Splash's seed, and random nondecreasing shapes, flat among them) and lane maxima, a budget's
-/// verify rows' expected tokens per cost, evaluated in f64, is the best of every assignment of 1
-/// to its maximum rows per lane; with every row, each lane verifies its maximum.
+/// (Splash's seed, random nondecreasing shapes, flat among them, and lines the host gives in the
+/// lanes' parameters) and lane maxima, a budget's verify rows' expected tokens per cost, evaluated
+/// in f64, is the best of every assignment of 1 to its maximum rows per lane; with every row, each
+/// lane verifies its maximum.
 #[test]
 fn draft_verify_rows_choose_the_best_assignment() {
     let Some(gpu) = Gpu::new() else { return };
     let mut random = Random(0xb0d9e7);
     let lanes_max = MAX_LANES as usize;
-    let mut models = vec![VerifyRows::EveryRow, VerifyRows::of_target(true)];
+    let seedless = VerifyLine::default();
+    let mut models = vec![
+        (VerifyRows::EveryRow, seedless),
+        (VerifyRows::of_target(true), seedless),
+    ];
     let flat = VerifyCost([[1.0; 4]; BUDGET_LANES]);
     let steep = VerifyCost([[0.1, 0.2, 0.4, 0.8]; BUDGET_LANES]);
     for cost in [flat, steep, VERIFY_COST_SEED] {
-        models.push(VerifyRows::Budget {
+        let model = VerifyRows::Budget {
             slope: 0.3 + 0.5 * (random.unit() + 1.0),
             intercepts: std::array::from_fn(|_| 1.5 * random.unit()),
             cost,
-        });
+        };
+        models.push((model, seedless));
     }
-    for (m, &model) in models.iter().enumerate() {
+    for (fixed, per_row) in [(1.63, 0.566), (1.0, 1.0), (10.0, 0.1)] {
+        models.push((VerifyRows::of_target(true), VerifyLine { fixed, per_row }));
+    }
+    for (m, &(model, line)) in models.iter().enumerate() {
         let pso = gpu.pipeline(
             "dflash2_select",
             "draft_verify_rows",
@@ -1330,6 +1341,7 @@ fn draft_verify_rows_choose_the_best_assignment() {
                 .map(|&maximum| DraftLaneParams {
                     maximum,
                     remaining: ROWS,
+                    cost: line,
                     ..DraftLaneParams::default()
                 })
                 .collect();
@@ -1384,7 +1396,11 @@ fn draft_verify_rows_choose_the_best_assignment() {
                     expected += 1.0 + survival[lane][..r as usize - 1].iter().sum::<f64>();
                     total += r;
                 }
-                expected / f64::from(cost.of(lanes as u32, total))
+                let cost = match line.per_row > 0.0 {
+                    true => f64::from(line.fixed) + f64::from(line.per_row) * f64::from(total),
+                    false => f64::from(cost.of(lanes as u32, total)),
+                };
+                expected / cost
             };
             let mut rows = vec![1u32; lanes];
             let mut best = 0.0f64;

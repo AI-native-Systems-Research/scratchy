@@ -144,6 +144,9 @@ pub struct MetalBucketSpec {
     /// buckets past the one its block draft runs at play its context commit alone, and their
     /// arenas hold only what the commit writes.
     pub plays_result: bool,
+    /// The weight bytes a forward of the bucket reads, fixed and per row
+    /// ([`crate::tape::step::WeightBytes`]).
+    pub weight_bytes: crate::tape::step::WeightBytes,
 }
 
 impl MetalBucketSpec {
@@ -2101,9 +2104,10 @@ fn write_draft_inputs(
     let lanes: Vec<u8> = (draft.lane_params.iter())
         .flat_map(|p| {
             let [seed_lo, seed_hi] = p.seed.words();
+            let (fixed, per_row) = (p.cost.fixed.to_bits(), p.cost.per_row.to_bits());
             let words = [p.temperature.to_bits(), p.sampling, p.maximum, p.remaining];
             (words.into_iter())
-                .chain([seed_lo, seed_hi, p.position])
+                .chain([seed_lo, seed_hi, p.position, fixed, per_row])
                 .flat_map(u32::to_le_bytes)
         })
         .collect();
@@ -3730,6 +3734,7 @@ mod tests {
                     tapes: &[],
                     kernels: &[],
                     plays_result: true,
+                    weight_bytes: crate::tape::step::WeightBytes::default(),
                 }));
                 (spec, tape)
             })
@@ -3833,6 +3838,7 @@ mod tests {
             tapes: test_empty_tapes(1, 2),
             kernels: &[],
             plays_result: true,
+            weight_bytes: crate::tape::step::WeightBytes::default(),
         };
         let specs = twin_rows(&spec);
         let Some(res) = build_via_for_buckets(&specs, 2) else {
@@ -3868,6 +3874,7 @@ mod tests {
             tapes: &[],
             kernels: &[],
             plays_result: true,
+            weight_bytes: crate::tape::step::WeightBytes::default(),
         };
         let specs = twin_rows(&spec);
         let Some(res) = build_via_for_buckets(&specs, 1) else {
@@ -3907,6 +3914,7 @@ mod tests {
                 tapes: test_empty_tapes(1, 2),
                 kernels: &[],
                 plays_result: true,
+                weight_bytes: crate::tape::step::WeightBytes::default(),
             },
             MetalBucketSpec {
                 bucket_m: 8,
@@ -3923,6 +3931,7 @@ mod tests {
                 tapes: test_empty_tapes(8, 2),
                 kernels: &[],
                 plays_result: true,
+                weight_bytes: crate::tape::step::WeightBytes::default(),
             },
         ];
         let specs = narrow.iter().flat_map(twin_rows).collect::<Vec<_>>();
@@ -3966,6 +3975,7 @@ mod tests {
                 tapes: test_empty_tapes(bucket_m, 2),
                 kernels: &[],
                 plays_result: true,
+                weight_bytes: crate::tape::step::WeightBytes::default(),
             }
         };
         let specs = ([1, 8].into_iter())
@@ -4003,6 +4013,7 @@ mod tests {
             tapes: &[],
             kernels: &[],
             plays_result: true,
+            weight_bytes: crate::tape::step::WeightBytes::default(),
         };
         let specs = [spec(1), spec(8)]
             .iter()
@@ -4043,6 +4054,7 @@ mod tests {
             tapes: test_empty_tapes(1, 3),
             kernels: &[],
             plays_result: true,
+            weight_bytes: crate::tape::step::WeightBytes::default(),
         };
         let (host, guest) = (
             twin_rows(&spec(&HOST_ARENA, 2)),
