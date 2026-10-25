@@ -594,6 +594,18 @@ mod tests {
                 | KernelId::GateSplit
                 | KernelId::GateScale
                 | KernelId::GatedDeltaNet
+                | KernelId::CaptureRows
+                | KernelId::DraftConv
+                | KernelId::DraftAttentionQkv
+                | KernelId::DraftAttentionSplit
+                | KernelId::DraftAttentionReduce
+                | KernelId::DraftAttentionReorder
+                | KernelId::DraftContextCommit
+                | KernelId::DraftContextPrefill
+                | KernelId::DraftSelectTop16
+                | KernelId::DraftSelectEdges
+                | KernelId::DraftSelectWalk
+                | KernelId::DraftVerifyRows
                 | KernelId::SplitKReduceSum
             | KernelId::RmsNormUnit
             | KernelId::ScalarWeightMul
@@ -777,6 +789,18 @@ mod tests {
             | KernelId::GateSplit
             | KernelId::GateScale
             | KernelId::GatedDeltaNet
+            | KernelId::CaptureRows
+            | KernelId::DraftConv
+            | KernelId::DraftAttentionQkv
+            | KernelId::DraftAttentionSplit
+            | KernelId::DraftAttentionReduce
+            | KernelId::DraftAttentionReorder
+            | KernelId::DraftContextCommit
+            | KernelId::DraftContextPrefill
+            | KernelId::DraftSelectTop16
+            | KernelId::DraftSelectEdges
+            | KernelId::DraftSelectWalk
+            | KernelId::DraftVerifyRows
             | KernelId::SplitKReduceSum
             | KernelId::RopeOnceNax
             | KernelId::RopeOnceSteel

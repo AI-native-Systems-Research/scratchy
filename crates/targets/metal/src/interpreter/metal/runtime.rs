@@ -45,6 +45,32 @@ pub struct TqRuntimeBuffers {
     pub mapped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
+/// A DFlash2 drafter's runtime buffers (`crate::dflash2`): its rings, a pool of every ring slot
+/// per layer (`[num_layers]`), kept across forwards; and a cycle's per-lane inputs and outputs.
+#[derive(Clone)]
+pub struct DraftRuntimeBuffers {
+    pub ring_keys: Vec<Buffer>,
+    pub ring_values: Vec<Buffer>,
+    pub ring_slots: Buffer,
+    pub retained: Buffer,
+    pub lane_params: Buffer,
+    pub uniforms: Buffer,
+    /// One buffer per [`crate::dflash2::DraftOutput`] region, in [`DraftOutput::ALL`]'s order.
+    ///
+    /// [`DraftOutput::ALL`]: crate::dflash2::DraftOutput::ALL
+    pub outputs: [Buffer; 6],
+}
+
+impl DraftRuntimeBuffers {
+    /// The buffer of output region `region`.
+    pub fn output(&self, region: crate::dflash2::DraftOutput) -> &Buffer {
+        let at = (crate::dflash2::DraftOutput::ALL.iter())
+            .position(|&r| r == region)
+            .expect("every region is in ALL");
+        &self.outputs[at]
+    }
+}
+
 /// A TurboQuant pool's fp16 scratch: one layer's K and V at the pool's capacity, reused by every
 /// coded layer of a forward — chunk tables (bound at each layer's `kv_cache_k/v` slot: attention,
 /// rope, dequant and quantize all use it) and their backing data (kept alive and resident here).
@@ -184,6 +210,13 @@ pub struct RuntimeBindings {
     pub vision_reverse_indices: Buffer,
     /// u32 SigLIP positional-embedding indices (`PosEmbed` gather).
     pub vision_position_ids: Buffer,
+    /// `[max_m, slots · hidden]` model-dtype — the rows a target captures for the DFlash2 drafter
+    /// compiled beside it (`RuntimeBindingKind::DraftCapture`), kept past the forward for the
+    /// drafter's commit. 16-byte placeholder on a model no drafter reads.
+    pub draft_capture: Buffer,
+    /// A DFlash2 drafter's buffers — `Some` exactly for a drafter, the only model whose tapes
+    /// bind them.
+    pub draft: Option<DraftRuntimeBuffers>,
     /// How much of each input buffer the last forward wrote ([`WrittenExtents`]).
     pub written: WrittenExtents,
 }
@@ -321,6 +354,13 @@ impl RuntimeBindings {
             .unwrap_or(0)
     }
 
+    /// The drafter buffers a `Draft*` binding resolves to: only a drafter's tape binds them, and
+    /// its factory always provisions them.
+    fn draft(&self) -> &DraftRuntimeBuffers {
+        (self.draft.as_ref())
+            .expect("a drafter's binding in the tape of a model that is no drafter")
+    }
+
     /// The TurboQuant buffers a `Tq*` binding resolves to. Only a TurboQuant
     /// model's tape binds them, and its factory always provisions them, so a
     /// miss is a model-meta bug like an out-of-range `KvCache*` layer.
@@ -380,6 +420,18 @@ impl RuntimeBindings {
             RuntimeBindingKind::VisionWindowIndex => &self.vision_window_index,
             RuntimeBindingKind::VisionReverseIndices => &self.vision_reverse_indices,
             RuntimeBindingKind::VisionPositionIds => &self.vision_position_ids,
+            RuntimeBindingKind::DraftCapture => &self.draft_capture,
+            RuntimeBindingKind::DraftRingKeys { layer } => {
+                &self.draft().ring_keys[layer.get() as usize]
+            }
+            RuntimeBindingKind::DraftRingValues { layer } => {
+                &self.draft().ring_values[layer.get() as usize]
+            }
+            RuntimeBindingKind::DraftRingSlots => &self.draft().ring_slots,
+            RuntimeBindingKind::DraftRetained => &self.draft().retained,
+            RuntimeBindingKind::DraftLaneParams => &self.draft().lane_params,
+            RuntimeBindingKind::DraftUniforms => &self.draft().uniforms,
+            RuntimeBindingKind::DraftOutputs(region) => self.draft().output(region),
         }
     }
 }

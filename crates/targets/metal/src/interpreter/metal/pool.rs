@@ -140,6 +140,10 @@ pub struct MetalBucketSpec {
     /// Every kernel of a baked library ([`crate::aot::baked_library`]) the model's tapes name,
     /// compiled with its constants: the model's one table, which each of its buckets names.
     pub kernels: &'static [crate::tape::lowered::BakedKernel],
+    /// Whether a forward at this bucket may read more than its cache writes. A DFlash2 drafter's
+    /// buckets past the one its block draft runs at play its context commit alone, and their
+    /// arenas hold only what the commit writes.
+    pub plays_result: bool,
 }
 
 impl MetalBucketSpec {
@@ -1087,6 +1091,14 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     /// ([`LoweredMetalTape::logits_overflow`]): a step writing more would write past it.
     pub fn pick_bucket_for(&self, inputs: &ForwardInputs<'_>) -> Result<usize, ForwardError> {
         let bucket_idx = self.pick_bucket(inputs.num_tokens)?;
+        let spec = self.bucket_specs[bucket_idx];
+        if !spec.plays_result && inputs.reads != ForwardReads::CacheWrites {
+            return Err(ForwardError::CacheWritesOnly {
+                num_tokens: inputs.num_tokens,
+                bucket_m: spec.bucket_m,
+                reads: inputs.reads,
+            });
+        }
         let sampled = inputs.sampled_row_count();
         let tape = &self.bucket_tapes[bucket_idx];
         match tape.logits_overflow(self.decode_rows, sampled) {
@@ -1471,6 +1483,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         self.forward_with_tail::<R, fn(
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
             &MetalWorker<W>,
+            &RuntimeBindings,
             usize,
         ) -> Result<(), ForwardError>>(inputs, with_output, None)
     }
@@ -1491,6 +1504,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         F: FnOnce(
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
             &MetalWorker<W>,
+            &RuntimeBindings,
             usize,
         ) -> Result<(), ForwardError>,
     {
@@ -1501,6 +1515,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
 
         let guard = self.checkout()?;
         let writes = begin_step(&guard, inputs, self.block_table_stride)?;
+        let runtime = &guard.runtime;
+        let tail = tail.map(|f| move |enc: &_, worker: &_, idx| f(enc, worker, runtime, idx));
 
         // All execution goes through the MTL4 path. (The opt-in MTL3
         // dispatch path was removed — it only ever ran the all-dispatch
@@ -1887,6 +1903,12 @@ impl<W: CanonicalParams> Onto<'_, W> {
     pub fn bucket_spec(&self) -> &'static MetalBucketSpec {
         self.guard.pool.bucket_spec(self.bucket_idx)
     }
+
+    /// The worker's runtime bindings, which hold its last forward's runtime outputs (a DFlash2
+    /// drafter's).
+    pub fn runtime(&self) -> &RuntimeBindings {
+        &self.guard.runtime
+    }
 }
 
 /// Commit options for ONE command buffer, whose feedback handler delivers how that command buffer
@@ -1956,6 +1978,13 @@ fn begin_step<W: CanonicalParams>(
     let mut writes = InputWrites::default();
     let runtime = &worker.runtime;
     write_runtime_inputs(runtime, inputs, block_table_stride, &mut writes)?;
+    if let Some(draft) = inputs.draft {
+        write_draft_inputs(runtime, draft, &mut writes)?;
+    }
+    worker
+        .worker
+        .draft_cycle
+        .store(inputs.draft.is_some_and(|d| d.cycle), Relaxed);
     for (to, bytes) in inputs.deferred.iter().flat_map(|d| &d.host_writes) {
         writes.stage(to, bytes);
     }
@@ -1982,6 +2011,11 @@ fn begin_step<W: CanonicalParams>(
         DeviceInputInto::SeqUsedK => &runtime.seq_used_k,
         DeviceInputInto::RopeRows => &runtime.mrope_cos_sin,
         DeviceInputInto::GdnSteps => &runtime.gdn_is_fresh,
+        DeviceInputInto::DraftRetained => {
+            &(runtime.draft.as_ref())
+                .expect("a retained-count device input to a forward of no drafter")
+                .retained
+        }
     };
     for input in inputs.device_inputs.iter().map(|d| (d, input(d.into))) {
         let (input, to) = input;
@@ -2049,6 +2083,51 @@ fn begin_step<W: CanonicalParams>(
         Relaxed,
     );
     Ok(writes)
+}
+
+/// A drafter's per-forward inputs into its runtime buffers: each lane's ring slot, policy and
+/// uniforms. A lane past them reads zeros: ring slot 0, a greedy policy.
+fn write_draft_inputs(
+    runtime: &RuntimeBindings,
+    draft: super::DraftInputs<'_>,
+    writes: &mut InputWrites,
+) -> Result<(), ForwardError> {
+    let buffers = (runtime.draft.as_ref()).ok_or(ForwardError::BufferTooSmall {
+        kind: "draft inputs to a model that is no drafter",
+        bytes_needed: 1,
+        bytes_available: 0,
+    })?;
+    let as_bytes = |words: &[u32]| bytemuck_words(words).to_vec();
+    let floats: Vec<u8> = draft
+        .uniforms
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    let lanes: Vec<u8> = (draft.lane_params.iter())
+        .flat_map(|p| {
+            [p.temperature.to_bits(), p.sampling, p.maximum, p.remaining]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+        })
+        .collect();
+    for (kind, to, bytes) in [
+        (
+            "draft ring slots",
+            &buffers.ring_slots,
+            as_bytes(draft.ring_slots),
+        ),
+        ("draft lane params", &buffers.lane_params, lanes),
+        ("draft uniforms", &buffers.uniforms, floats),
+    ] {
+        (runtime.written)
+            .write(to, &bytes, Padding::Zero, writes)
+            .map_err(|bytes_needed| ForwardError::BufferTooSmall {
+                kind,
+                bytes_needed,
+                bytes_available: to.length(),
+            })?;
+    }
+    Ok(())
 }
 
 /// Whether some sequence of the step has an unrotated (bit-31, span) block
@@ -2470,6 +2549,8 @@ mod tests {
             vision_window_index: alloc(device, 16),
             vision_reverse_indices: alloc(device, 16),
             vision_position_ids: alloc(device, 16),
+            draft_capture: alloc(device, 16),
+            draft: None,
             written: Default::default(),
         }
     }
@@ -2531,7 +2612,7 @@ mod tests {
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
-            cache_live: &[],
+            live: &[],
         }
     }
 
@@ -2821,6 +2902,8 @@ mod tests {
             vision_window_index: alloc(d, 16),
             vision_reverse_indices: alloc(d, 16),
             vision_position_ids: alloc(d, 16),
+            draft_capture: alloc(d, 16),
+            draft: None,
             written: Default::default(),
         });
         let pool = MetalWorkerPool::<TestWeights>::new(
@@ -2939,6 +3022,7 @@ mod tests {
             sampled_rows: &EVERY_ROW[..2],
             gdn_state_indices: None,
             gdn_is_fresh: None,
+            draft: None,
             vision_rope_freqs: None,
             vision_cu_seqlens_full: None,
             vision_cu_seqlens_window: None,
@@ -3002,6 +3086,7 @@ mod tests {
             sampled_rows: &EVERY_ROW[..1],
             gdn_state_indices: None,
             gdn_is_fresh: None,
+            draft: None,
             vision_rope_freqs: None,
             vision_cu_seqlens_full: None,
             vision_cu_seqlens_window: None,
@@ -3101,6 +3186,7 @@ mod tests {
                 sampled_rows: &EVERY_ROW[..ids.len()],
                 gdn_state_indices: None,
                 gdn_is_fresh: None,
+                draft: None,
                 vision_rope_freqs: None,
                 vision_cu_seqlens_full: None,
                 vision_cu_seqlens_window: None,
@@ -3181,6 +3267,7 @@ mod tests {
             sampled_rows: &EVERY_ROW[..4],
             gdn_state_indices: None,
             gdn_is_fresh: None,
+            draft: None,
             vision_rope_freqs: None,
             vision_cu_seqlens_full: None,
             vision_cu_seqlens_window: None,
@@ -3238,6 +3325,7 @@ mod tests {
             sampled_rows: &EVERY_ROW[..<[u32]>::len(ids)],
             gdn_state_indices: None,
             gdn_is_fresh: None,
+            draft: None,
             vision_rope_freqs: None,
             vision_cu_seqlens_full: None,
             vision_cu_seqlens_window: None,
@@ -3342,6 +3430,7 @@ mod tests {
             sampled_rows: &EVERY_ROW[..0],
             gdn_state_indices: None,
             gdn_is_fresh: None,
+            draft: None,
             vision_rope_freqs: None,
             vision_cu_seqlens_full: None,
             vision_cu_seqlens_window: None,
@@ -3385,6 +3474,7 @@ mod tests {
             sampled_rows: &EVERY_ROW[..9],
             gdn_state_indices: None,
             gdn_is_fresh: None,
+            draft: None,
             vision_rope_freqs: None,
             vision_cu_seqlens_full: None,
             vision_cu_seqlens_window: None,
@@ -3438,6 +3528,7 @@ mod tests {
             sampled_rows: &EVERY_ROW[..1],
             gdn_state_indices: None,
             gdn_is_fresh: None,
+            draft: None,
             vision_rope_freqs: None,
             vision_cu_seqlens_full: None,
             vision_cu_seqlens_window: None,
@@ -3518,7 +3609,7 @@ mod tests {
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
-            cache_live: &[],
+            live: &[],
         };
         let mut v = Vec::new();
         for gen_class in [GenClass::M1, GenClass::Mid, GenClass::M5, GenClass::M5Wide] {
@@ -3561,6 +3652,7 @@ mod tests {
                     lm_head_barriers: EMPTY_BARRIERS,
                     tapes: &[],
                     kernels: &[],
+                    plays_result: true,
                 }));
                 (spec, tape)
             })
@@ -3663,6 +3755,7 @@ mod tests {
             lm_head_barriers: EMPTY_BARRIERS,
             tapes: test_empty_tapes(1, 2),
             kernels: &[],
+            plays_result: true,
         };
         let specs = twin_rows(&spec);
         let Some(res) = build_via_for_buckets(&specs, 2) else {
@@ -3697,6 +3790,7 @@ mod tests {
             lm_head_barriers: EMPTY_BARRIERS,
             tapes: &[],
             kernels: &[],
+            plays_result: true,
         };
         let specs = twin_rows(&spec);
         let Some(res) = build_via_for_buckets(&specs, 1) else {
@@ -3735,6 +3829,7 @@ mod tests {
                 lm_head_barriers: EMPTY_BARRIERS,
                 tapes: test_empty_tapes(1, 2),
                 kernels: &[],
+                plays_result: true,
             },
             MetalBucketSpec {
                 bucket_m: 8,
@@ -3750,6 +3845,7 @@ mod tests {
                 lm_head_barriers: EMPTY_BARRIERS,
                 tapes: test_empty_tapes(8, 2),
                 kernels: &[],
+                plays_result: true,
             },
         ];
         let specs = narrow.iter().flat_map(twin_rows).collect::<Vec<_>>();
@@ -3792,6 +3888,7 @@ mod tests {
                 lm_head_barriers: EMPTY_BARRIERS,
                 tapes: test_empty_tapes(bucket_m, 2),
                 kernels: &[],
+                plays_result: true,
             }
         };
         let specs = ([1, 8].into_iter())
@@ -3828,6 +3925,7 @@ mod tests {
             lm_head_barriers: EMPTY_BARRIERS,
             tapes: &[],
             kernels: &[],
+            plays_result: true,
         };
         let specs = [spec(1), spec(8)]
             .iter()
@@ -3867,6 +3965,7 @@ mod tests {
             lm_head_barriers: EMPTY_BARRIERS,
             tapes: test_empty_tapes(1, 3),
             kernels: &[],
+            plays_result: true,
         };
         let (host, guest) = (
             twin_rows(&spec(&HOST_ARENA, 2)),

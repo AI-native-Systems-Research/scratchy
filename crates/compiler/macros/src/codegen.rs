@@ -293,6 +293,15 @@ enum FieldLoad {
         /// `.weight` width is `ceil(K*bits/32)`. See [`FieldLoad::LinearAffine`].
         in_features: u32,
     },
+    /// One MLX-affine linear whose rows are several on-disk projections' rows in order, kept
+    /// packed (weights.json `__packed_concats__`: Splash's fused QKV). Emits
+    /// `LinearLayer::load_affine_quant_rows_concat`.
+    LinearAffineRowConcat {
+        prefixes: Vec<String>,
+        group_size: u32,
+        bits: u32,
+        in_features: u32,
+    },
     /// NVFP4 int4 quantized linear (Metal-only), single source. Emits
     /// `LinearLayer::load_nvfp4_quant` (forward-time `nvfp4_qmv` /
     /// `nvfp4_qmm_t`). `group_size` from `quantization_config` (16);
@@ -316,12 +325,11 @@ enum FieldLoad {
     /// only; fused-concat raw-linear isn't a real PyTorch shape and would
     /// be a manifest authoring error.
     RawLinear(String),
-    /// gpt-oss attention sinks: the per-layer `[num_attention_heads]`
-    /// plain dense GpuTensor, read verbatim via `gw.take` (the
-    /// on-disk key is `<prefix>` itself — an `nn.Parameter`, like
-    /// [`Self::RawLinear`]). Layered by construction (one per layer);
-    /// never quantized, so [`affine_tensors_of`] lists no row for it.
-    AttnSinks(String),
+    /// A plain dense GpuTensor read verbatim via `gw.take` (the on-disk key is `<prefix>` itself —
+    /// an `nn.Parameter`, like [`Self::RawLinear`]): gpt-oss's per-layer attention sinks, a
+    /// DFlash2 drafter's per-layer convolution base kernels and its selector's codebooks. Never
+    /// quantized, so [`affine_tensors_of`] lists no row for it.
+    RawTensor(String),
     /// The model has `tie_word_embeddings: true`: `lm_head` shares
     /// its weight with `embed_tokens`. No safetensors read — build
     /// the `LinearLayer` from the already-loaded embedding field
@@ -581,6 +589,12 @@ fn affine_tensors_of(fl: &FieldLoad) -> Vec<(String, u32, u32)> {
             ..
         } => one(prefix, *bits, *group_size),
         FieldLoad::LinearAffineConcat {
+            prefixes,
+            group_size,
+            bits,
+            ..
+        }
+        | FieldLoad::LinearAffineRowConcat {
             prefixes,
             group_size,
             bits,
@@ -992,12 +1006,11 @@ fn plan_field_load(
         ty.ends_with("::RmsNorm") || ty == "RmsNorm" || ty.ends_with("layers::RmsNorm");
     let is_layer_norm =
         ty.ends_with("::LayerNorm") || ty == "LayerNorm" || ty.ends_with("layers::LayerNorm");
-    // gpt-oss attention sinks: a bare `GpuTensor` field. The rotary
-    // (`WeightKind::CosSin`) is the only other GpuTensor on a Weights
-    // struct and is planted directly by `emit_weights_struct`, never
-    // through this walk — so a GpuTensor-typed accessor here is the
-    // sinks.
-    let is_attn_sinks =
+    // A bare `GpuTensor` field (gpt-oss's sinks, a DFlash2 drafter's convolution kernels and
+    // codebooks). The rotary (`WeightKind::CosSin`) is the only other GpuTensor on a Weights
+    // struct and is planted directly by `emit_weights_struct`, never through this walk — so a
+    // GpuTensor-typed accessor here is read verbatim.
+    let is_raw_tensor =
         ty.ends_with("::GpuTensor") || ty == "GpuTensor" || ty.ends_with("tensor::GpuTensor");
     let is_linear =
         ty.ends_with("::LinearLayer") || ty == "LinearLayer" || ty.ends_with("layers::LinearLayer");
@@ -1721,15 +1734,15 @@ fn plan_field_load(
         return FieldLoad::GatedDeltaNet(prefixes.into_iter().next().unwrap());
     }
 
-    if is_attn_sinks {
+    if is_raw_tensor {
         assert_eq!(
             prefixes.len(),
             1,
-            "AttnSinks accessor `{}` with {} sources (expected 1 per layer)",
+            "raw tensor accessor `{}` with {} sources (expected 1)",
             accessor.name,
             prefixes.len(),
         );
-        return FieldLoad::AttnSinks(prefixes.into_iter().next().unwrap());
+        return FieldLoad::RawTensor(prefixes.into_iter().next().unwrap());
     }
 
     if is_embedding || is_affine_quant_embedding {
@@ -1949,6 +1962,24 @@ fn plan_field_load(
                 "affine_params set implies at least one Affine source resolved in_features",
             );
             if prefixes.len() == 1 {
+                // A weight the manifest packs from several on-disk projections' rows.
+                let dotted = program.weights.path(accessor.source_weights[0].0).join(".");
+                if let Some(parts) = manifest.packed_concats.get(&dotted) {
+                    let prefix = &prefixes[0];
+                    let stem = prefix.strip_suffix(dotted.as_str()).unwrap_or_else(|| {
+                        panic!(
+                            "accessor `{}`: prefix `{prefix}` does not end in its packed weight \
+                             `{dotted}`",
+                            accessor.name,
+                        )
+                    });
+                    return FieldLoad::LinearAffineRowConcat {
+                        prefixes: parts.iter().map(|p| format!("{stem}{p}")).collect(),
+                        group_size,
+                        bits,
+                        in_features,
+                    };
+                }
                 return FieldLoad::LinearAffine {
                     prefix: prefixes.into_iter().next().unwrap(),
                     group_size,
@@ -5276,10 +5307,9 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             // gemm op via `dense_weight()`.
             let #name = crate::__gpu::layers::LinearLayer::load_raw(gw, #key)?;
         },
-        FieldLoad::AttnSinks(_) => panic!(
-            "codegen: AttnSinks is per-layer by construction (one sink vector per \
-             attention layer) — should never appear in an unindexed group"
-        ),
+        FieldLoad::RawTensor(key) => quote! {
+            let #name = gw.take(#key)?;
+        },
         FieldLoad::LinearAffine {
             prefix,
             group_size,
@@ -5328,6 +5358,28 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
                 .collect();
             quote! {
                 let #name = crate::__gpu::layers::LinearLayer::load_affine_dequant_concat_as_dense(
+                    gw,
+                    &[#(#prefix_lits),*],
+                    #gs_lit,
+                    #bits_lit,
+                    #inf_lit,
+                )?;
+            }
+        }
+        FieldLoad::LinearAffineRowConcat {
+            prefixes,
+            group_size,
+            bits,
+            in_features,
+        } => {
+            let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
+            let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
+            let inf_lit = proc_macro2::Literal::u32_unsuffixed(*in_features);
+            let prefix_lits = prefixes
+                .iter()
+                .map(|p| syn::LitStr::new(p, proc_macro2::Span::call_site()));
+            quote! {
+                let #name = crate::__gpu::layers::LinearLayer::load_affine_quant_rows_concat(
                     gw,
                     &[#(#prefix_lits),*],
                     #gs_lit,
@@ -5876,6 +5928,7 @@ fn field_load_affine_bits(plan: &FieldLoad) -> Option<PlanBits> {
     match plan {
         FieldLoad::LinearAffine { bits, .. }
         | FieldLoad::LinearAffineConcat { bits, .. }
+        | FieldLoad::LinearAffineRowConcat { bits, .. }
         | FieldLoad::GemmaSwitchGlu { bits, .. } => Some(PlanBits::Width(*bits)),
         // MoE bundles carry the routed-expert bits in `affine`; the router
         // `gate_bits` is uniform across layers so it stays out of the
@@ -6314,6 +6367,29 @@ fn emit_layered_load_body(
                 },
             }
         }
+        FieldLoad::LinearAffineRowConcat {
+            prefixes,
+            group_size,
+            bits,
+            in_features,
+        } => {
+            assert!(
+                per_layer_bits_lit.is_none(),
+                "a packed-rows linear loads at one width across its layers"
+            );
+            let suffixes = prefixes.iter().map(|p| {
+                let s = layered_suffix(p, vision_zero_prefix_ref, decoder_zero_prefix_ref);
+                quote! { #s }
+            });
+            let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
+            let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
+            let inf_lit = proc_macro2::Literal::u32_unsuffixed(*in_features);
+            quote! {
+                crate::__gpu::load_layered_linear_affine_quant_rows_concat(
+                    gw, #n_lit, #quant_root_lit, &[ #(#suffixes),* ], #gs_lit, #bits_lit, #inf_lit,
+                )?
+            }
+        }
         FieldLoad::LinearNvfp4 { prefix, group_size } => {
             let suffix = layered_suffix(prefix, vision_zero_prefix_ref, decoder_zero_prefix_ref);
             let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
@@ -6525,7 +6601,7 @@ fn emit_layered_load_body(
                     .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
             }
         }
-        FieldLoad::AttnSinks(prefix) => {
+        FieldLoad::RawTensor(prefix) => {
             let p = layer_templated_prefix_expr(
                 prefix,
                 vision_zero_prefix_ref,
@@ -7007,6 +7083,7 @@ pub(crate) fn weight_kind_accessor_method(kind: &crate::weight_vocab::WeightKind
         WeightKind::CosSin => "cos_sin_at",
         WeightKind::AffineQuantEmbedding => "affine_quant_embedding_at",
         WeightKind::AttnSinks => "sinks_at",
+        WeightKind::Tensor => "tensor_at",
     }
 }
 
@@ -7538,9 +7615,11 @@ fn metal_off_tape_tokens(
     head: Option<(u32, u32)>,
     vocab_suffix: Option<scratchy_target_metal::off_tape::VocabSuffix>,
 ) -> TokenStream {
-    use scratchy_target_metal::off_tape::{ByCodes, OffTape, SuffixKernels, VocabSuffix};
+    use scratchy_target_metal::off_tape::{
+        ByCodes, Dflash2Role, OffTape, SuffixKernels, TargetSampling, VocabSuffix,
+    };
     use scratchy_target_metal::tape::ids::{BlockSize, HiddenSize, LogitsWidth, NumDrafts, RotDim};
-    use scratchy_target_metal::tape::kernel_constants::MtpChainConstants;
+    use scratchy_target_metal::tape::kernel_constants::{DraftAcceptConstants, MtpChainConstants};
     let width = u32::try_from(width).expect("logits width fits u32");
     // The chain advances the full-context group's slots (KV group 0).
     let block_size = BlockSize(mc.global_block_size);
@@ -7557,6 +7636,18 @@ fn metal_off_tape_tokens(
         head,
         mc.spec_drafts > 0,
         vocab_suffix,
+        // A DFlash2 drafter (its block and the token its proposal rows embed), or a target one
+        // drafts for (the rows a lane of its verify holds: the drafter's block).
+        match (mc.draft_selector_rank > 0, mc.draft_capture_slots > 0) {
+            (true, _) => Dflash2Role::Drafter(DraftAcceptConstants {
+                rows: mc.spec_drafts + 1,
+                mask: mc.draft_mask_token,
+            }),
+            (false, true) => Dflash2Role::Target {
+                block_rows: mc.spec_drafts + 1,
+            },
+            (false, false) => Dflash2Role::None,
+        },
     );
     let ids = keys.map(|key| scratchy_target_metal_compiler::static_tape::kernel_ref(&key));
     let OffTape {
@@ -7569,7 +7660,16 @@ fn metal_off_tape_tokens(
         mtp_chain,
         select_rows,
         vocab_suffix,
+        dflash2_accept,
+        dflash2_sampling,
     } = ids;
+    let dflash2_sampling = dflash2_sampling.map(|TargetSampling { mass, search, draw }| {
+        quote!(::scratchy_target_metal::off_tape::TargetSampling {
+            mass: #mass,
+            search: #search,
+            draw: #draw,
+        })
+    });
     let vocab_suffix = vocab_suffix.map(
         |SuffixKernels {
              suffix,
@@ -7627,8 +7727,13 @@ fn metal_off_tape_tokens(
         Some(k) => quote!(::core::option::Option::Some(#k)),
         None => quote!(::core::option::Option::None),
     };
-    let (mtp_chain, select_rows, vocab_suffix) =
-        (option(mtp_chain), option(select_rows), option(vocab_suffix));
+    let (mtp_chain, select_rows, vocab_suffix, dflash2_accept, dflash2_sampling) = (
+        option(mtp_chain),
+        option(select_rows),
+        option(vocab_suffix),
+        option(dflash2_accept),
+        option(dflash2_sampling),
+    );
     quote! {
         /// This model's off-tape kernels, baked for its logits.
         #[cfg(feature = "metal")]
@@ -7643,6 +7748,8 @@ fn metal_off_tape_tokens(
                 mtp_chain: #mtp_chain,
                 select_rows: #select_rows,
                 vocab_suffix: #vocab_suffix,
+                dflash2_accept: #dflash2_accept,
+                dflash2_sampling: #dflash2_sampling,
             }
         };
     }
@@ -8006,6 +8113,13 @@ fn emit_canonical_params_impl(
     } = RecurrentDims::of(model).unwrap_or_default();
     let gdn_conv_dim = conv_dim as usize;
     let spec_drafts = *model.bounds.get("spec_drafts").unwrap_or(&0) as u32;
+    // A DFlash2 drafter's geometry (its arch.json params), and the blocks of the rows a target
+    // captures for one.
+    let draft_conv_group = *model.bounds.get("conv_group_size").unwrap_or(&0) as u32;
+    let draft_selector_rank = *model.bounds.get("selector_rank").unwrap_or(&0) as u32;
+    let draft_mask_token = *model.bounds.get("mask_token_id").unwrap_or(&0) as u32;
+    let draft_capture_slots = (model.layer_sets.get(crate::config::DRAFT_CAPTURE_LAYERS))
+        .map_or(0, |s| s.members().len() as u32);
 
     // Vision-tower constants. Set in `#[vision_forward]` configs via
     // `vision_num_heads` / `vision_head_dim` bounds; absent in text
@@ -8136,6 +8250,12 @@ fn emit_canonical_params_impl(
             q_size
         });
     let hidden_size_lit = proc_macro2::Literal::usize_unsuffixed(hidden_size_for_const);
+    // A head's `target_hidden` rows: a DFlash2 drafter's captured layers side by side, else its
+    // target's hidden width.
+    let target_hidden_width = (model.bounds.get("backbone_hidden_size"))
+        .map_or(hidden_size_for_const, |&w| w as usize);
+    let target_hidden_width_lit = proc_macro2::Literal::usize_unsuffixed(target_hidden_width);
+    let target_routes_experts = model.bounds.get("target_num_experts").is_some_and(|&n| n > 0);
     let intermediate_size_lit = proc_macro2::Literal::usize_unsuffixed(intermediate_size);
     // VOCAB_SIZE: lm_head output dim. Read from the verbatim HF config
     // (`vocab_size` bound). Used by the generic `Instruction::Gemm` arm
@@ -8161,6 +8281,10 @@ fn emit_canonical_params_impl(
     let gdn_conv_kernel_lit = proc_macro2::Literal::u32_unsuffixed(gdn_conv_kernel);
     let gdn_conv_dim_lit = proc_macro2::Literal::usize_unsuffixed(gdn_conv_dim);
     let spec_drafts_lit = proc_macro2::Literal::u32_unsuffixed(spec_drafts);
+    let draft_conv_group_lit = proc_macro2::Literal::u32_unsuffixed(draft_conv_group);
+    let draft_selector_rank_lit = proc_macro2::Literal::u32_unsuffixed(draft_selector_rank);
+    let draft_mask_token_lit = proc_macro2::Literal::u32_unsuffixed(draft_mask_token);
+    let draft_capture_slots_lit = proc_macro2::Literal::u32_unsuffixed(draft_capture_slots);
     let norm_weight_offset_lit =
         proc_macro2::Literal::f32_suffixed(norm_weight_runtime_offset(model));
     // RMSNorm eps from config (Qwen3.5: 1e-6). Without this the metal
@@ -8498,6 +8622,13 @@ fn emit_canonical_params_impl(
             gdn_conv_kernel,
             gdn_conv_dim,
             spec_drafts,
+            draft_conv_group,
+            draft_selector_rank,
+            draft_mask_token,
+            draft_capture_slots,
+            target_hidden_width,
+            target_routes_experts,
+            vocab_size: vocab_size_for_const,
         });
     }
 
@@ -8537,6 +8668,12 @@ fn emit_canonical_params_impl(
             const GDN_CONV_KERNEL: u32 = #gdn_conv_kernel_lit;
             const GDN_CONV_DIM: usize = #gdn_conv_dim_lit;
             const SPEC_DRAFTS: u32 = #spec_drafts_lit;
+            const DRAFT_CONV_GROUP: u32 = #draft_conv_group_lit;
+            const DRAFT_SELECTOR_RANK: u32 = #draft_selector_rank_lit;
+            const DRAFT_MASK_TOKEN: u32 = #draft_mask_token_lit;
+            const TARGET_HIDDEN_WIDTH: usize = #target_hidden_width_lit;
+            const TARGET_ROUTES_EXPERTS: bool = #target_routes_experts;
+            const DRAFT_CAPTURE_SLOTS: u32 = #draft_capture_slots_lit;
             const NORM_WEIGHT_OFFSET: f32 = #norm_weight_offset_lit;
             const RMS_NORM_EPS: f32 = #rms_norm_eps_lit;
             const ROT_DIM: u32 = #rot_dim_lit;
@@ -14785,6 +14922,12 @@ pub fn emit_model(
     // states: what the model's arena ranks are baked from (`ArenaRanks`).
     let mut metal_ladder_arena: Vec<u64> = Vec::new();
     let mut metal_hidden_slots: std::collections::BTreeSet<u32> = Default::default();
+    // Whether the model's tapes read a paged KV pool. One that reads none (Splash's DFlash2
+    // drafter, whose rings are its KV) holds any pool's block count at its ladder's floor.
+    let pool_block_cap = match KvCacheLayers::of(fuf).any() {
+        true => quote! { ctx.kv_cache.max_blocks_per_seq },
+        false => quote! { 0 },
+    };
     // The KV cap rungs every bucket bakes, topped by every block the model's positions fill.
     #[cfg(feature = "metal")]
     let metal_cap_ladder = {
@@ -14813,6 +14956,33 @@ pub fn emit_model(
             model.source_stem
         );
         ladder
+    };
+    // Splash's two draft graphs (runtime/model/DFlashDraft.cpp `addContextCommit`, `addDecode`)
+    // are one tape here, played apart. A DFlash2 drafter's block draft runs a step's lanes'
+    // blocks: at most its target's verify rows (`spec_verify_rows`), so at the smallest bucket
+    // that holds them (`plays_result_through`). A bucket past it plays the context commit alone,
+    // and its arena holds what the commit's tiles (`commit_tiles`) write: the block's — its
+    // lm_head's logits, a vocabulary a row, above all — are never written there.
+    let plays_result_through = match model.bounds.get("selector_rank") {
+        Some(&rank) if rank > 0 => (model.bounds.get("spec_verify_rows").copied())
+            .and_then(|rows| num_tokens_points.iter().copied().filter(|&m| m >= rows).min()),
+        _ => None,
+    };
+    let commit_tiles: HashSet<TileId> = {
+        let mut live: HashSet<TileId> = HashSet::new();
+        let mut todo: Vec<TileId> = (fuf.nodes.iter())
+            .filter(|n| n.op == crate::classified::OpKind::DraftContextKv)
+            .map(|n| n.id)
+            .collect();
+        while let Some(id) = todo.pop() {
+            if live.insert(id) {
+                todo.extend(fuf.get(id).inputs.iter().filter_map(|i| match *i {
+                    crate::fuf::FufInput::Tile { id, .. } => Some(id),
+                    _ => None,
+                }));
+            }
+        }
+        live
     };
     for &m in &num_tokens_points {
         // Prefer the sk=0 canonical for this `m`; fall back to any wp
@@ -14845,6 +15015,7 @@ pub fn emit_model(
         // entries once at init time to size the per-worker arena
         // (init-time alloc, reused across every forward).
         let bp_bounds = bounds_for_wp(model, wp, tp_world_size);
+        let plays_result = plays_result_through.is_none_or(|through| m <= through);
         // One fold band's bucket facts — its colouring's slot count, terminal, hidden and
         // per-slot bytes; each band's step tape was coloured under its own colouring, so its
         // bucket row carries its own. The logits: the terminal tile and the in-place logit
@@ -14885,6 +15056,9 @@ pub fn emit_model(
             let mut bucket_arena_bytes: Vec<u64> = vec![0u64; num_slots as usize];
             let mut logits_row_bytes: u64 = 0;
             for ((tile_id, out_slot), color) in slots.iter() {
+                if !plays_result && !commit_tiles.contains(&tile_id) {
+                    continue;
+                }
                 let node = fuf.get(tile_id);
                 let shape = &node.outputs[out_slot as usize];
                 let dims = crate::weight_vocab::eval_shape_with(shape, &bp_bounds)
@@ -15043,6 +15217,7 @@ pub fn emit_model(
                     lm_head_barriers: #lh_barriers_static,
                     tapes: #tapes_static_toks,
                     kernels: #kernels_toks,
+                    plays_result: #plays_result,
                 },
             });
         }
@@ -15155,6 +15330,28 @@ pub fn emit_model(
             proc_macro2::Literal::u64_unsuffixed(mrope_cos_sin_bytes),
         )
     };
+    // The rows a target captures for its DFlash2 drafter (model dtype, `[max_m, slots · hidden]`;
+    // 0 on a model no drafter reads), and a drafter's block (its drafts and their anchor).
+    let (draft_capture_bytes_lit, draft_rows_lit, captured_rows) = {
+        let max_m = num_tokens_points.iter().copied().max().unwrap_or(0);
+        let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(0);
+        let slots = (model.layer_sets.get(crate::config::DRAFT_CAPTURE_LAYERS))
+            .map_or(0, |s| s.members().len() as u64);
+        let rows = *model.bounds.get("spec_drafts").unwrap_or(&0) + 1;
+        let bytes = max_m * slots * hidden_size * 2;
+        // What a step's followup gets of them, from the worker's runtime bindings: they, or none
+        // on a model no drafter reads.
+        let captured_rows = match bytes > 0 {
+            true => (quote! { runtime }, quote! { Some(&*runtime.draft_capture) }),
+            false => (quote! { _ }, quote! { None }),
+        };
+        (
+            proc_macro2::Literal::u64_unsuffixed(bytes),
+            proc_macro2::Literal::u64_unsuffixed(rows),
+            captured_rows,
+        )
+    };
+    let (captured_runtime, captured_rows) = captured_rows;
 
     // Width of ONE row of the terminal arena slot, baked at
     // macro-expansion time: the metal forward shapes its returned
@@ -15360,6 +15557,15 @@ pub fn emit_model(
         #[cfg(feature = "metal")]
         pub const METAL_TARGET_HIDDEN_BYTES: u64 = #target_hidden_bytes_lit;
 
+        /// Byte size of the rows a target captures for its DFlash2 drafter (model dtype
+        /// `[max_bucket_m, slots · hidden]`). 0 on a model no drafter reads.
+        #[cfg(feature = "metal")]
+        pub const METAL_DRAFT_CAPTURE_BYTES: u64 = #draft_capture_bytes_lit;
+
+        /// A DFlash2 drafter's block: its drafts and their anchor.
+        #[cfg(feature = "metal")]
+        pub const METAL_DRAFT_ROWS: u64 = #draft_rows_lit;
+
         /// Byte size of the `mm_embeds` splice buffer (bf16
         /// `[max_bucket_m, hidden]`) and the `mm_dst_rows` buffer (u32
         /// `[max_bucket_m]`). 0 on arches without the multimodal splice.
@@ -15546,6 +15752,19 @@ pub fn emit_model(
                         (::std::vec::Vec::new(), ::std::vec::Vec::new())
                     }
                 };
+                // A DFlash2 drafter's rings, the pool `ctx` lends (the sibling of `gdn_state`):
+                // `Some` exactly for a drafter.
+                let __draft_rings: ::core::option::Option<(
+                    ::std::vec::Vec<Buffer>,
+                    ::std::vec::Vec<Buffer>,
+                )> = ctx.draft_ring.map(|pool| {
+                    (0..pool.num_layers())
+                        .map(|l| {
+                            let (k, v) = pool.layer(l);
+                            (k.buffer().clone(), v.buffer().clone())
+                        })
+                        .unzip()
+                });
                 // TurboQuant: captured (Copy) so the 'static factory closure can
                 // provision the packed stores + scratch per worker for a model
                 // whose `KV_CODEC` is TurboQuant. UNIFORM arches (num_kv_groups
@@ -15740,6 +15959,35 @@ pub fn emit_model(
                             vision_position_ids: alloc(
                                 (METAL_MAX_BUCKET_M as u64 + 8) * 4,
                             ),
+                            // The rows a target captures for its DFlash2 drafter: every row of
+                            // the largest bucket, a block a captured layer (16-byte floor on a
+                            // model no drafter reads).
+                            draft_capture: alloc(METAL_DRAFT_CAPTURE_BYTES),
+                            // A DFlash2 drafter's buffers: its rings, the pool `ctx` lends (kept
+                            // across forwards, pinned by it), and a cycle's per-lane inputs and
+                            // outputs, sized for the largest bucket's lanes.
+                            draft: __draft_rings.as_ref().map(|(keys, values)| {
+                                let lanes = max_m / METAL_DRAFT_ROWS.max(1);
+                                ::scratchy_target_metal::interpreter::metal::DraftRuntimeBuffers {
+                                    ring_keys: keys.clone(),
+                                    ring_values: values.clone(),
+                                    ring_slots: alloc(lanes * 4),
+                                    retained: alloc(lanes * 4),
+                                    lane_params: alloc(
+                                        lanes
+                                            * ::std::mem::size_of::<
+                                                ::scratchy_target_metal::dflash2::DraftLaneParams,
+                                            >() as u64,
+                                    ),
+                                    uniforms: alloc(
+                                        lanes
+                                            * u64::from(::scratchy_target_metal::dflash2::SAMPLING_UNIFORMS)
+                                            * 4,
+                                    ),
+                                    outputs: ::scratchy_target_metal::dflash2::DraftOutput::ALL
+                                        .map(|r| alloc(r.bytes(lanes))),
+                                }
+                            }),
                             written: ::std::default::Default::default(),
                         }
                     });
@@ -15755,8 +16003,8 @@ pub fn emit_model(
                     // ladder so the colored arena fits the KV budget.
                     device.metal_bucket_max_m,
                     // Runtime per-sequence block-table capacity, read off the KV
-                    // pool: it picks the KV cap rung.
-                    ctx.kv_cache.max_blocks_per_seq,
+                    // pool: it picks the KV cap rung — none for a model reading no KV.
+                    #pool_block_cap,
                     device.kv_addressing,
                     // The serving engine's batch, stashed by the worker: the decode split's
                     // partials are reserved for that many rows.
@@ -16057,6 +16305,7 @@ pub fn emit_model(
                 mm_embeds,
                 mm_dst_rows,
                 mrope_cos_sin,
+                draft: ctx.draft,
                 device_inputs: ctx.device_inputs,
                 deferred: ctx.deferred,
                 reads: ctx.reads,
@@ -16106,26 +16355,32 @@ pub fn emit_model(
             // ownership of the worker's arena.
             with_forward_inputs(ctx, num_tokens, |inputs| {
                 let rows = #terminal_rows;
-                // Adapter: pool's tail receives `(encoder, worker, bucket_idx)`
+                // Adapter: pool's tail receives `(encoder, worker, runtime, bucket_idx)`
                 // and returns `Result<(), ForwardError>`. The public hook
-                // is `(encoder, logits_buf, total_n, vocab) -> Result<(), String>`.
-                // Resolve logits + dims from the worker's arena and the
+                // is `(encoder, FollowupOutputs) -> Result<(), String>`.
+                // Resolve the outputs from the worker's arena, its runtime bindings and the
                 // canonical's compile-time vocab; map error variants.
                 let tail_adapter = followup.map(|f| {
                     move |enc: &::scratchy_forward_compiler::metal_followup_reexports::ProtocolObject<
                               dyn ::scratchy_forward_compiler::metal_followup_reexports::MTL4ComputeCommandEncoder,
                           >,
                           worker: &::scratchy_target_metal::interpreter::metal::MetalWorker<Weights>,
+                          #captured_runtime: &::scratchy_target_metal::interpreter::metal::RuntimeBindings,
                           bucket_idx: usize|
                           -> ::core::result::Result<
                         (),
                         ::scratchy_target_metal::interpreter::metal::ForwardError,
                     > {
                         let spec = pool.bucket_spec(bucket_idx);
-                        let logits_buf = &worker.arena[spec.terminal_slot as usize];
-                        let hidden_buf = &worker.arena[spec.backbone_slot as usize];
-                        let vocab = METAL_VOCAB_SIZE as u32;
-                        f(enc, logits_buf, hidden_buf, rows as u32, vocab).map_err(
+                        let outputs = ::scratchy_forward_compiler::FollowupOutputs {
+                            logits: &worker.arena[spec.terminal_slot as usize],
+                            hidden: &worker.arena[spec.backbone_slot as usize],
+                            // A DFlash2 head's target's captured rows.
+                            captured: #captured_rows,
+                            rows: rows as u32,
+                            vocab: METAL_VOCAB_SIZE as u32,
+                        };
+                        f(enc, outputs).map_err(
                             ::scratchy_target_metal::interpreter::metal::ForwardError::Followup,
                         )
                     }
@@ -16244,6 +16499,20 @@ pub fn emit_model(
                     dyn ::scratchy_forward_compiler::metal_followup_reexports::MTLBuffer,
                 > {
                     &self.0.worker().arena[self.0.bucket_spec().terminal_slot as usize]
+                }
+
+                fn draft_selection(
+                    &self,
+                ) -> ::core::option::Option<::scratchy_forward_compiler::DraftSelection<'_>> {
+                    use ::scratchy_target_metal::dflash2::DraftOutput as O;
+                    (self.0.runtime().draft.as_ref()).map(|d| {
+                        ::scratchy_forward_compiler::DraftSelection {
+                            tokens: d.output(O::Tokens),
+                            candidates: d.output(O::Candidates),
+                            q_probs: d.output(O::QProbs),
+                            verify_rows: d.output(O::VerifyRows),
+                        }
+                    })
                 }
 
                 fn vocab(&self) -> u32 {

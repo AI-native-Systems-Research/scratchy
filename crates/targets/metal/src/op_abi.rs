@@ -124,6 +124,14 @@ pub fn metal_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRul
         L::MatmulTile { .. } | L::VarlenAttention { .. } | L::EncoderAttn { .. } => {
             FRESH.reads_across()
         }
+        // Splash's drafter: a convolution reads the row before each row of a block, an attention
+        // every row of it, each into a buffer of its own; a capture copies its rows out, a context
+        // commit writes the ring and a selection the drafter's runtime outputs, each publishing
+        // its operand 0 as it found it.
+        L::DraftConv { .. } | L::DraftAttention { .. } => FRESH.reads_across(),
+        L::CaptureHidden { .. } | L::DraftContextKv { .. } | L::DraftSelect => {
+            FRESH.output(A::Operand(OperandIx(0)))
+        }
         // Two-output ops bind a SECOND buffer (VisionRope's k', GateSplit's gate).
         L::VisionRope => FRESH.reads_across().two_outputs(),
         L::GateSplit { .. } => FRESH.two_outputs(),
@@ -347,11 +355,14 @@ pub const METAL_SORTED_PAIRS: u32 = 64;
 pub const METAL_GROUPED_PAIRS_PER_EXPERT: f32 = 4.0;
 
 /// The pairs per expert at which a bake sorts the per-pair matvecs' rows by expert, so an expert
-/// two rows pick is read once: where it was measured to win (#232: Gemma-4's 128 experts at
-/// bucket 8, the full conc-8 decode step). The sorted matvecs run the bucket's every pair, so
-/// thicker, they lose to the gathered ones on a short prompt (Qwen3.6, 2 per expert: 161 ms vs
-/// 98 ms).
-pub const METAL_SORTED_PAIRS_PER_EXPERT: std::ops::Range<f32> = 0.5..1.0;
+/// two rows pick is read once (Splash groups a decode step's routes by expert for the same reason,
+/// ~/git/splash runtime/metal/kernels/shared/moe.metal:5-6). Where it was measured to win: #232,
+/// Gemma-4's 128 experts at bucket 8 (0.5 a expert), the full conc-8 decode step; Qwen3.6's 256
+/// at bucket 8 (0.25), once the sort lays out the step's live pairs alone — a DFlash2 verify of 8
+/// rows 46.6 → 43.9 ms a cycle on a base M5 (5 rows 34.5 → 33.9), its conc-8 decode 113 → 122
+/// tok/s. Thicker, the matvecs lose to the gathered ones on a short prompt (Qwen3.6, 2 per
+/// expert: 161 ms vs 98 ms).
+pub const METAL_SORTED_PAIRS_PER_EXPERT: std::ops::Range<f32> = 0.25..1.0;
 
 /// The bucket rows from which a gathered bake's gate/up command runs the pairs that share an
 /// expert in the expert's first pair (`SharedExperts::InFirstPair`, up to [`METAL_VERIFY_ROWS`]):

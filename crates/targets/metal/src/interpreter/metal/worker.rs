@@ -379,9 +379,9 @@ pub struct BucketBaking {
     /// a kernel exceeds the 31-binding argument-table cap (such buckets
     /// have no MTL4 execution path).
     pub mtl4_steps: Option<Vec<super::mtl4::Mtl4Step>>,
-    /// Per dispatch, in dispatch order, whether a forward reading only its cache writes plays it
-    /// ([`LoweredMetalTape::cache_live_expanded`]).
-    pub cache_live: Vec<bool>,
+    /// Per dispatch, in dispatch order, the plays short of the whole forward that play it
+    /// ([`LoweredMetalTape::live_expanded`]).
+    pub live: Vec<crate::tape::lowered::PlayLive>,
 }
 
 #[derive(Debug)]
@@ -616,6 +616,9 @@ pub struct MetalWorker<W: CanonicalParams> {
     /// step that also replays or records, the pipelined scan's twin runs those
     /// sequences (`RuntimeGate::OnlyIfPlainGdnRows`).
     pub gdn_plain_rows: std::sync::atomic::AtomicBool,
+    /// Whether the step about to run is a DFlash2 cycle's context commit
+    /// (`RuntimeGate::OnlyIfDraftCycle`), set from its inputs before it is encoded.
+    pub draft_cycle: std::sync::atomic::AtomicBool,
     /// Per-dispatch GPU timestamp heap (`SCRATCHY_METAL_KERNEL_TIME`).
     /// `None` unless the env var is set at worker build — the probe is
     /// opt-in and costs nothing otherwise. One timestamp is written
@@ -979,6 +982,12 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // TurboQuant packed stores + codebook — pinned below when Some
                 // (dispatch-bound by baked gpuAddress, same lazy-pager hazard).
                 tq,
+                // A target's captured rows for its drafter: bound by baked gpuAddress (16-byte
+                // placeholder on a model no drafter reads), pinned below.
+                draft_capture,
+                // A drafter's per-forward buffers, pinned below when Some; its ring pools are
+                // pinned by their owner, as the GDN state pools are.
+                draft,
                 // Host bookkeeping of the input buffers' written bytes, not a GPU buffer.
                 written: _,
             } = runtime;
@@ -1057,6 +1066,15 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 pin(&t.scratch.k_table);
                 pin(&t.scratch.v_table);
             }
+            pin(draft_capture);
+            if let Some(d) = draft {
+                for b in [&d.ring_slots, &d.retained, &d.lane_params, &d.uniforms] {
+                    pin(b);
+                }
+                for b in &d.outputs {
+                    pin(b);
+                }
+            }
             r.commit();
         }
 
@@ -1101,6 +1119,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             unrotated_blocks: std::sync::atomic::AtomicBool::new(false),
             gdn_plain: std::sync::atomic::AtomicBool::new(true),
             gdn_plain_rows: std::sync::atomic::AtomicBool::new(true),
+            draft_cycle: std::sync::atomic::AtomicBool::new(false),
             kernel_time_heap: if std::env::var_os("SCRATCHY_METAL_KERNEL_TIME").is_some() {
                 Some(super::mtl4::new_registered_kernel_time_heap(&device))
             } else {
@@ -1246,6 +1265,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 .load(std::sync::atomic::Ordering::Relaxed),
             gdn_plain: self.gdn_plain.load(std::sync::atomic::Ordering::Relaxed),
             gdn_plain_rows: (self.gdn_plain_rows).load(std::sync::atomic::Ordering::Relaxed),
+            draft_cycle: (self.draft_cycle).load(std::sync::atomic::Ordering::Relaxed),
         };
         // A skipped dispatch's fence, owed to the next one played.
         let mut carried = Fence::None;
@@ -1261,10 +1281,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
             {
                 let this_idx = flat_idx;
                 flat_idx += 1;
-                // A forward reading only its cache writes skips what none of them needs, its fence
-                // passed on to the next dispatch it plays: the fence orders what came before it
-                // against what comes after, whichever dispatch that is.
-                if reads == super::ForwardReads::CacheWrites && !baking.cache_live[this_idx] {
+                // A forward reading less than the whole skips what none of its reads needs, its
+                // fence passed on to the next dispatch it plays: the fence orders what came before
+                // it against what comes after, whichever dispatch that is.
+                if !baking.live[this_idx].plays(reads) {
                     carried = carried.max(*need_barrier);
                     continue;
                 }
@@ -1726,7 +1746,7 @@ fn bake_bucket<W: CanonicalParams>(
     Ok(BucketBaking {
         bucket_m: tape.bucket_m,
         mtl4_steps,
-        cache_live: tape.cache_live_expanded(),
+        live: tape.live_expanded(),
     })
 }
 
@@ -1979,6 +1999,7 @@ pub fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) 
         unrotated_blocks,
         gdn_plain,
         gdn_plain_rows,
+        draft_cycle,
     } = step;
     let decode_step = num_tokens == num_seqs;
     match gate {
@@ -2002,6 +2023,8 @@ pub fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) 
         Some(super::lowered::RuntimeGate::OnlyIfPlainGdn) => gdn_plain,
         Some(super::lowered::RuntimeGate::UnlessPlainGdn) => !gdn_plain,
         Some(super::lowered::RuntimeGate::OnlyIfPlainGdnRows) => gdn_plain_rows,
+        Some(super::lowered::RuntimeGate::OnlyIfDraftCycle) => draft_cycle,
+        Some(super::lowered::RuntimeGate::UnlessDraftCycle) => !draft_cycle,
         Some(super::lowered::RuntimeGate::All(gates)) => {
             gates.iter().all(|g| gate_matches(Some(*g), step))
         }
@@ -2025,6 +2048,9 @@ pub struct StepFacts {
     pub gdn_plain: bool,
     /// Some sequence takes a plain Gated-DeltaNet step over more than one row.
     pub gdn_plain_rows: bool,
+    /// The forward is a DFlash2 cycle's context commit: each lane its verify's block, of which
+    /// it retained a count ([`super::DraftInputs::cycle`]).
+    pub draft_cycle: bool,
 }
 
 /// Rewrite the m-axis of a baked threadgroup grid to match the
@@ -2177,6 +2203,7 @@ mod tests {
             unrotated_blocks,
             gdn_plain: true,
             gdn_plain_rows: true,
+            draft_cycle: false,
         };
         for (tokens, seqs, decode) in [
             (1, 1, true),
@@ -2369,6 +2396,7 @@ mod tests {
                 unrotated_blocks: false,
                 gdn_plain: true,
                 gdn_plain_rows: true,
+                draft_cycle: false,
             };
             for cmd in cmds {
                 let key = crate::specialized_pipeline_cache::PipelineKey::new(
@@ -2546,6 +2574,8 @@ mod tests {
             vision_window_index: alloc_buffer(device, 16),
             vision_reverse_indices: alloc_buffer(device, 16),
             vision_position_ids: alloc_buffer(device, 16),
+            draft_capture: alloc_buffer(device, 16),
+            draft: None,
             written: Default::default(),
         }
     }
@@ -2643,7 +2673,7 @@ mod tests {
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
-            cache_live: &[],
+            live: &[],
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
@@ -2736,6 +2766,7 @@ mod tests {
             lm_head_barriers: &[],
             tapes: &[],
             kernels: &[],
+            plays_result: true,
         };
         hidden.iter().map(bucket).collect()
     }
@@ -3040,7 +3071,7 @@ mod tests {
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
-            cache_live: &[],
+            live: &[],
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
@@ -3133,7 +3164,7 @@ mod tests {
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
-            cache_live: &[],
+            live: &[],
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
@@ -3260,7 +3291,7 @@ mod tests {
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
             logits_rows: crate::tape::lowered::LogitsRows::Bucket,
-            cache_live: &[],
+            live: &[],
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],

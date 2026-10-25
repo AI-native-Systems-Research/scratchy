@@ -2006,6 +2006,8 @@ pub fn compile_carrier(
             /// Its `spec_drafts` and `spec_verify_rows`.
             spec: [u64; 2],
             reads_target_kv: bool,
+            /// It drafts a block a pass: its forward selects its block's drafts.
+            block: bool,
         }
         let head_facts: std::collections::BTreeMap<String, HeadFacts> = solved
             .iter()
@@ -2025,6 +2027,7 @@ pub fn compile_carrier(
                     spec: ["spec_drafts", "spec_verify_rows"]
                         .map(|b| sm.model.bounds.get(b).copied().unwrap_or(0)),
                     reads_target_kv: sm.model.arch.reads_target_kv,
+                    block: (sm.fuf.nodes.iter()).any(|n| n.op == classified::OpKind::DraftSelect),
                 };
                 (sm.mod_name.clone(), facts)
             })
@@ -2094,6 +2097,7 @@ pub fn compile_carrier(
                         checkpoint_prefix,
                         spec,
                         reads_target_kv,
+                        block,
                         ..
                     } = first
                     else {
@@ -2109,6 +2113,10 @@ pub fn compile_carrier(
                     let (lm_head, repo_infix, checkpoint_prefix) =
                         (some(lm_head), some(repo_infix), some(checkpoint_prefix));
                     let lm_head_rows = proc_macro2::Literal::u32_unsuffixed(*lm_head_rows as u32);
+                    let drafting = match block {
+                        true => quote! { ::scratchy_forward_compiler::HeadDrafting::Block },
+                        false => quote! { ::scratchy_forward_compiler::HeadDrafting::Chained },
+                    };
                     let [drafts, verify_rows] =
                         spec.map(|v| u8::try_from(v).expect("a head's spec facts fit a u8"));
                     // An absent fact reads 0, and a head that fits no draft in a verify step
@@ -2161,6 +2169,7 @@ pub fn compile_carrier(
                             published: &[#(#published),*],
                             drafts: #drafts,
                             verify_rows: #verify_rows,
+                            drafting: #drafting,
                         })
                     }
                 }

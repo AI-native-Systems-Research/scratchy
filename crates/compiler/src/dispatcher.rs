@@ -452,26 +452,36 @@ impl std::error::Error for GpuExecutionFailed {}
 /// forward dispatches and BEFORE `endEncoding`. The callee can
 /// append additional dispatches (e.g. argmax sampling, an MTP head's
 /// forward) so they run inside the same command buffer with one
-/// commit and one host wait. Receives:
-///   - the MTL4 compute encoder to append dispatches onto;
-///   - the logits MTLBuffer (the bucket's terminal arena slot): the logits of the rows the
-///     step samples, at its front, in order;
-///   - the final (post-norm) hidden states, `[num_tokens, hidden]` (the
-///     bucket's backbone slot);
-///   - `total_n` (the sampled rows: the logits row count) and `vocab` (column count).
+/// commit and one host wait. Receives the MTL4 compute encoder to append dispatches onto and
+/// what the forward left ([`FollowupOutputs`]).
 ///
 /// MTL4 only.
 #[cfg(feature = "metal")]
 pub type MetalForwardFollowup<'a> = Box<
     dyn FnOnce(
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
-            &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
-            &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
-            u32,
-            u32,
+            FollowupOutputs<'_>,
         ) -> Result<(), String>
         + 'a,
 >;
+
+/// What a forward leaves its [`MetalForwardFollowup`].
+#[cfg(feature = "metal")]
+#[derive(Clone, Copy)]
+pub struct FollowupOutputs<'a> {
+    /// The bucket's terminal arena slot: the logits of the rows the step samples, at its front,
+    /// in order.
+    pub logits: &'a ::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
+    /// The final (post-norm) hidden states, `[num_tokens, hidden]` (the bucket's backbone slot).
+    pub hidden: &'a ::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
+    /// The rows a DFlash2 head's target captured, `[num_tokens, slots, hidden]`; `None` for a
+    /// model that captures none.
+    pub captured: Option<&'a ::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>>,
+    /// The sampled rows: the logits' row count.
+    pub rows: u32,
+    /// The logits' row width.
+    pub vocab: u32,
+}
 
 /// The forwards [`ScratchyWeights::metal_forward_onto`] and [`Self::then`] encoded onto another
 /// model's command buffer, on one worker. Their outputs are read once that command buffer is done;
@@ -499,6 +509,22 @@ pub trait MetalForwardOnto {
 
     /// The logits' row width.
     fn vocab(&self) -> u32;
+
+    /// What a DFlash2 drafter's last block draft selected; `None` for any other model.
+    fn draft_selection(&self) -> Option<DraftSelection<'_>>;
+}
+
+/// A DFlash2 drafter's selection (`scratchy_target_metal::dflash2::DraftOutput`): its proposals,
+/// `[lanes, proposals]` u32; each position's candidates, `[lanes, proposals, candidates]` u32; and
+/// a sampling lane's candidate probabilities, `[lanes, proposals, candidates]` f32; and the rows
+/// of its block each lane's next verify checks, `[lanes]` u32.
+#[cfg(feature = "metal")]
+#[derive(Clone, Copy)]
+pub struct DraftSelection<'a> {
+    pub tokens: &'a ::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
+    pub candidates: &'a ::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
+    pub q_probs: &'a ::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
+    pub verify_rows: &'a ::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
 }
 
 /// The rows one forward samples (its sampled rows' count): one a sequence, every row of a
