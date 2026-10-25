@@ -181,7 +181,6 @@ fn write_if_changed(out: &Path, text: &str) {
     }
 }
 
-
 /// A checkpoint config's identity for matching: its architecture and shape (hidden size, layers,
 /// vocab size; the text decoder's when `text_config` nests it).
 fn config_shape(path: &Path) -> Option<(String, u64, u64, u64)> {
