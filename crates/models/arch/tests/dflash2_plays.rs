@@ -30,6 +30,41 @@ fn a_block_draft_and_its_commit_play_apart() {
                 assert_eq!(commit, [true; 6], "m={at}: {kernel:?} in the cache play");
                 let result = plays(kernel, ForwardReads::Result);
                 assert_eq!(result, [false; 6], "m={at}: {kernel:?} in the result play");
+                let rebuild = plays(kernel, ForwardReads::Rebuild);
+                assert_eq!(rebuild, [true; 6], "m={at}: {kernel:?} in the rebuild play");
+            }
+            // Its context window (Splash `DFlashContextWindow`): a commit stores its rows, its
+            // layers reading them exact; a rebuild loads them back, and plays nothing before.
+            for kernel in [K::DraftWindowStoreCommit, K::DraftWindowStorePrefill] {
+                assert_eq!(plays(kernel, ForwardReads::CacheWrites), [true], "m={at}");
+                assert_eq!(plays(kernel, ForwardReads::Rebuild), [false], "m={at}");
+                assert_eq!(plays(kernel, ForwardReads::Result), [false], "m={at}");
+            }
+            for reads in [
+                ForwardReads::CacheWrites,
+                ForwardReads::Result,
+                ForwardReads::Outputs,
+            ] {
+                let load = plays(K::DraftWindowLoad, reads);
+                assert_eq!(
+                    load,
+                    [false],
+                    "m={at}: the window's load in a {reads:?} play"
+                );
+            }
+            assert_eq!(
+                plays(K::DraftWindowLoad, ForwardReads::Rebuild),
+                [true],
+                "m={at}"
+            );
+            let load = (commands.iter()).position(|c| c.command.kernel == K::DraftWindowLoad);
+            let before = (commands.iter().zip(&live)).take(load.expect("a window load"));
+            for (c, l) in before {
+                let kernel = c.command.kernel;
+                assert!(
+                    !l.plays(ForwardReads::Rebuild),
+                    "m={at}: {kernel:?} before the load"
+                );
             }
             for kernel in [
                 K::DraftConv,

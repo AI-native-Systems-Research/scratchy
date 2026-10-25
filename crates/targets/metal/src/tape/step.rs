@@ -336,6 +336,13 @@ pub enum MetalStep {
     /// `draft_context_kv_commit` on a cycle's verify rows, `prefill_draft_context_kv` on a
     /// prompt's).
     DraftContextKv(Slot, LayerId),
+    /// `context`: a DFlash2 drafter's commit of its context rows into its lanes' context
+    /// windows, 4-bit (Splash `prefill_draft_context_store`): a cycle's retained rows, a
+    /// prompt's every row.
+    DraftWindowStore(Slot),
+    /// `context`: a ring rebuild's context rows out of its lanes' windows, written over
+    /// `context` (Splash `prefill_draft_context_load`).
+    DraftWindowLoad(Slot),
     /// `(logits, selector)`: a DFlash2 drafter's proposals and verify rows (Splash
     /// `draft_select_top16_sharded`, `_edges`, `_dflash`, `draft_verify_rows`).
     DraftSelect(Slot, Slot),
@@ -797,6 +804,8 @@ impl MetalStep {
             | S::Concat(..)
             | S::GateScale(..)
             | S::CaptureHidden(..)
+            | S::DraftWindowStore(..)
+            | S::DraftWindowLoad(..)
             | S::DraftSelect(..)
             | S::RotateRows(..)
             | S::SampleRows(..)

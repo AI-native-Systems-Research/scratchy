@@ -1414,6 +1414,18 @@ pub fn lower_decode_to_wavefront(
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
+            // draft_window_store(context, positions) and draft_window_load(context, positions):
+            // the drafter's context window. Their positions are the forward's, a runtime binding.
+            OpKind::DraftWindowStore | OpKind::DraftWindowLoad => {
+                let context = bx.input_at(tile, 0)?;
+                let op = match node.op {
+                    OpKind::DraftWindowStore => SubOp::DraftWindowStore,
+                    _ => SubOp::DraftWindowLoad,
+                };
+                let idx = bx.push_op(op, vec![context]);
+                bx.produced.insert((tile.0, 0), Producer::Op(idx));
+                result = Some(idx);
+            }
             // draft_select(logits, selector, predecessor_codebook, successor_codebook).
             OpKind::DraftSelect => {
                 let inputs = (0..4)

@@ -1705,19 +1705,24 @@ impl MetalWorker {
             head_dim,
             elem_bytes,
         );
+        let hidden =
+            (config.hidden_size()).ok_or_else(|| init("its config names no hidden_size"))?;
+        let window_bytes =
+            scratchy_target_metal::dflash2::DraftRingPool::window_bytes(window as usize, hidden);
         let (device, residency) = (&gpu_device.device, gpu_device.allocator.residency());
         let rings = scratchy_target_metal::dflash2::DraftRingPool::new(
             layers,
             slots,
             slot_bytes,
+            window_bytes,
             |bytes| Ok(MetalMem::new_pinned(device, residency, bytes)),
         )
         .map_err(|e| init(&format!("rings: {e}")))?;
         residency.commit();
         info!(
             "ScratchyWorker(metal): DFlash2 drafter — {layers} layers' rings of {window} positions \
-             for {slots} sequences ({} MiB)",
-            (2 * layers * slots * slot_bytes) >> 20
+             for {slots} sequences, and their context windows ({} MiB)",
+            (2 * layers * slots * slot_bytes + slots * window_bytes) >> 20
         );
         let target_kernels =
             scratchy_target_metal::off_tape::OffTapeKernels::of(target.metal_off_tape())
