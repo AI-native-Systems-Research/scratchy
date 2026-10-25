@@ -244,6 +244,17 @@ pub trait WeightAccessors {
     ) -> ::scratchy_tensors::tensor::GpuTensor {
         unreachable!("sinks_at not implemented for this arch")
     }
+    /// A bare tensor read verbatim (a DFlash2 drafter's convolution base kernels and selector
+    /// codebooks).
+    fn tensor_at(
+        &self,
+        _bucket: u32,
+        _op_idx: u32,
+        _slot: u32,
+        _layer: u32,
+    ) -> ::scratchy_tensors::tensor::GpuTensor {
+        unreachable!("tensor_at not implemented for this arch")
+    }
     /// Metal-only: gpt-oss fused MoE bundle (`GptOssMoe` op, base `mlp`) —
     /// affine router gate + F32 router bias + pre-stacked affine experts +
     /// per-expert SwiGLU-OAI linear biases under one layer struct.
@@ -1117,6 +1128,23 @@ pub trait CanonicalParams: WeightAccessors {
     /// The drafts each sequence of a speculative verify step carries: an MTP head's (its
     /// arch.json), and the target's whose head this build compiles. 0 without one.
     const SPEC_DRAFTS: u32 = 0;
+
+    // ── A DFlash2 drafter's geometry (Splash's DFlashDraftLayout), 0 for every other model ──
+    /// The channels each dynamic-convolution weight covers (`dflash_config.conv_group_size`).
+    const DRAFT_CONV_GROUP: u32 = 0;
+    /// The rank of its selector's codebooks (`dflash_config.selector_rank`).
+    const DRAFT_SELECTOR_RANK: u32 = 0;
+    /// The token its block's proposal rows embed (`dflash_config.mask_token_id`).
+    const DRAFT_MASK_TOKEN: u32 = 0;
+    /// The width of a `target_hidden` row a head reads: its target's hidden size, or a DFlash2
+    /// drafter's every captured layer's side by side (`backbone_hidden_size`).
+    const TARGET_HIDDEN_WIDTH: usize = Self::HIDDEN_SIZE;
+    /// Whether a head's target routes each row it verifies through experts of its own
+    /// (`target_num_experts`): what a DFlash2 drafter's verify budget prices.
+    const TARGET_ROUTES_EXPERTS: bool = false;
+    /// The blocks of a target's captured rows: the layers a drafter compiled beside it reads
+    /// (`draft_capture_layers`), 0 when none does.
+    const DRAFT_CAPTURE_SLOTS: u32 = 0;
 
     /// A block-table row stride (in u32s) for callers with no KV pool to read
     /// one from: kernel tests, and the metal TurboQuant dequant grid before a

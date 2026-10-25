@@ -359,18 +359,19 @@ fn fused_moe_kernels_match_the_unfused_chain() {
     }
 }
 
-/// The sorted gathered path (`MG_BM=1`): the `moe_group` sort, then the fused gated kernel and
-/// the split down over the SORTED rows, then the unsort — must give the same bits as the fused
-/// token-order chain. This is the layout a `Sorted` bake dispatches (pairs 64–127: bucket-8
-/// decode), so it pins that the sort's `indices_pad`/`x_pad` views feed the gather kernels
-/// exactly as the router's `topk_inds`/token rows do.
+/// The sorted gathered path (`MG_BM=1`): the `moe_group` sort, then the fused gated kernel over
+/// the SORTED rows, then either the split down and the unsort or the fused down+combine reading
+/// each pair's sorted row through `pos` (`COMBINE_ROWS_SORTED`) — must give the same bits as the
+/// fused token-order chain. This is the layout a `Sorted` bake dispatches (pairs 64–127:
+/// bucket-8 decode), so it pins that the sort's `indices_pad`/`x_pad` views feed the gather
+/// kernels exactly as the router's `topk_inds`/token rows do.
 #[test]
 fn sorted_gathered_moe_matches_the_token_order_chain() {
     let Some(d) = detect_device() else { return };
     let device = d.device;
     // Gemma-4's 128 experts and Qwen3.5/3.6-MoE's 256; the bucket full, and a short step's 5 live
-    // rows in the bucket of 8 — the sort's offsets count every static row, the scatter, unsort
-    // and sum run the live ones, the matvecs the full grid over stale rows.
+    // rows in the bucket of 8 — the sort counts the live rows' pairs alone (their stale picks
+    // past them left out), so they sit first, and the scatter, matvecs, unsort and sum run them.
     let tokens = 8usize;
     for (gelu, experts, live) in [true, false]
         .into_iter()
@@ -405,6 +406,7 @@ fn sorted_gathered_moe_matches_the_token_order_chain() {
             vec![
                 int(0, pairs as i32),
                 int(1, experts as i32),
+                int(3, TOP_K as i32),
                 int(6, 1), // MG_BM = 1: no padding — a sorted bake.
             ],
         )
@@ -463,6 +465,19 @@ fn sorted_gathered_moe_matches_the_token_order_chain() {
         let sorted_gate_y = e_buf(pairs * INTER);
         let sorted_up_y = e_buf(pairs * INTER);
         let sorted_out = e_buf(tokens * HIDDEN);
+        let num_tokens = common::shared_slice(&device, &[live as u32]);
+        // The fused down+combine over the sorted act rows, through `pos`.
+        let mut combine_constants = block.down.constants(GatherRows::Tokens(TopK(TOP_K as u32)));
+        combine_constants.push(ConstantValue::boolean(ConstSlot(22), true));
+        let combine_pso =
+            block
+                .down
+                .pipeline(&device, "affine_gather_qmv_combine", combine_constants);
+        let (combined_down_y, combined_out) = (e_buf(pairs * HIDDEN), e_buf(tokens * HIDDEN));
+        let mut combine = block.down.bindings().to_vec();
+        combine.extend([(&sorted_gate_y, 3), (&block.indices[0], 4)]);
+        combine.extend([(&combined_down_y, 5), (&block.scores, 6), (&combined_out, 7)]);
+        combine.push((&pos, 11));
 
         run(&device, 1, 1, |_| {
             vec![
@@ -473,6 +488,7 @@ fn sorted_gathered_moe_matches_the_token_order_chain() {
                         (&count, 1),
                         (&offset, 2),
                         (&total, 3),
+                        (&num_tokens, 4),
                     ],
                     groups: size(1, 1, 1),
                     threads: size(256, 1, 1),
@@ -511,8 +527,8 @@ fn sorted_gathered_moe_matches_the_token_order_chain() {
                         (&block.up.b, 8),
                         (&sorted_up_y, 9),
                     ],
-                    // Pairs along X, as the fused path.
-                    groups: size(pairs, INTER.div_ceil(8), 1),
+                    // The live pairs along X, as the fused path.
+                    groups: size(live_pairs, INTER.div_ceil(8), 1),
                     threads: size(32, 4, 1),
                 },
                 Dispatch {
@@ -525,7 +541,7 @@ fn sorted_gathered_moe_matches_the_token_order_chain() {
                         (&indices_pad, 4),
                         (&sorted_down_y, 5),
                     ],
-                    groups: size(1, HIDDEN.div_ceil(8), pairs),
+                    groups: size(1, HIDDEN.div_ceil(8), live_pairs),
                     threads: size(32, 2, 1),
                 },
                 Dispatch {
@@ -539,12 +555,22 @@ fn sorted_gathered_moe_matches_the_token_order_chain() {
                     groups: size(HIDDEN.div_ceil(64), live, 1),
                     threads: size(64, 1, 1),
                 },
+                Dispatch {
+                    pso: &combine_pso,
+                    buffers: combine.clone(),
+                    groups: size(live, HIDDEN.div_ceil(4), 1),
+                    threads: size(32, TOP_K, 1),
+                },
             ]
         });
         let what = format!("sorted gelu={gelu} experts={experts} live={live}/{tokens}");
         // The sum reads through pos, so the act rows compare after applying pos, and the
         // combined output compares directly.
         let pos_v = common::read_slice::<u32>(&pos, live_pairs);
+        assert!(
+            pos_v.iter().all(|&p| (p as usize) < live_pairs),
+            "{what}: the live pairs sit first"
+        );
         let act_ref = bits(&block.fused_gate_y, pairs * INTER);
         let act_sorted = bits(&sorted_gate_y, pairs * INTER);
         for (p, &sorted_p) in pos_v.iter().enumerate() {
@@ -561,6 +587,11 @@ fn sorted_gathered_moe_matches_the_token_order_chain() {
             reference_out[..live * HIDDEN],
             bits(&sorted_out, live * HIDDEN),
             "{what}: combined rows"
+        );
+        assert_eq!(
+            reference_out[..live * HIDDEN],
+            bits(&combined_out, live * HIDDEN),
+            "{what}: rows the fused down+combine read through pos"
         );
     }
 }
@@ -738,34 +769,24 @@ fn routed_moe_kernels_match_the_routing_command_then_the_fused_kernels() {
 
 /// The sort's histogram + padded scan at Qwen3.5/3.6-MoE's 256 experts — twice Gemma-4's — with
 /// pairs routed to every expert, the ones past 128 included: each expert's count and padded
-/// offset, and the padded total, must match the host's. Dispatched as a grouped bake does it
-/// (`MG_BM = 64`, one threadgroup of 256 threads, a 4096-token bucket at top 8).
+/// offset, and the padded total, must match the host's over the step's live pairs — every row of
+/// a full 4096-token bucket at top 8, then the first 3000 rows of it, whose pairs past them (picks
+/// no step made) the sort leaves out as Splash's grouping does a lane's unverified rows.
+/// Dispatched as a grouped bake does it (`MG_BM = 64`, one threadgroup of 256 threads).
 #[test]
 fn moe_group_offsets_count_every_expert_at_256() {
     let Some(d) = detect_device() else { return };
     let device = d.device;
     const QWEN_EXPERTS: usize = 256;
     const BM: usize = 64;
-    let pairs = 4096 * TOP_K;
+    const BUCKET: usize = 4096;
+    let pairs = BUCKET * TOP_K;
     // Skewed: expert e takes a share growing with e, so the high experts carry the most rows.
     let mut rng = Lcg(7);
     let inds: Vec<u32> = (0..pairs)
         .map(|_| (rng.next().sqrt() * QWEN_EXPERTS as f32) as u32)
         .collect();
-    let mut want_count = vec![0u32; QWEN_EXPERTS];
-    for &e in &inds {
-        want_count[e as usize] += 1;
-    }
-    assert!(want_count[QWEN_EXPERTS / 2..].iter().all(|&c| c > 0));
-    let mut want_offset = Vec::with_capacity(QWEN_EXPERTS);
-    let mut acc = 0u32;
-    for &c in &want_count {
-        want_offset.push(acc);
-        acc += c.div_ceil(BM as u32) * BM as u32;
-    }
-
     let u32_buf = |n: usize| common::shared_zeroed(&device, n * 4);
-    let (count, offset, total) = (u32_buf(QWEN_EXPERTS), u32_buf(QWEN_EXPERTS), u32_buf(1));
     let topk_inds = common::shared_slice(&device, &inds);
     let int = |slot: u16, v: i32| ConstantValue::int(ConstSlot(slot), v);
     let offsets_pso = baked_pipeline(
@@ -775,24 +796,47 @@ fn moe_group_offsets_count_every_expert_at_256() {
         vec![
             int(0, pairs as i32),
             int(1, QWEN_EXPERTS as i32),
+            int(3, TOP_K as i32),
             int(6, BM as i32),
         ],
     )
     .expect("offsets");
-    run(&device, 1, 1, |_| {
-        vec![Dispatch {
-            pso: &offsets_pso,
-            buffers: vec![(&topk_inds, 0), (&count, 1), (&offset, 2), (&total, 3)],
-            groups: size(1, 1, 1),
-            threads: size(256, 1, 1),
-        }]
-    });
-    assert_eq!(common::read_slice::<u32>(&count, QWEN_EXPERTS), want_count);
-    assert_eq!(
-        common::read_slice::<u32>(&offset, QWEN_EXPERTS),
-        want_offset
-    );
-    assert_eq!(common::read_slice::<u32>(&total, 1), vec![acc]);
+    for tokens in [BUCKET, 3000] {
+        let live = &inds[..tokens * TOP_K];
+        let mut want_count = vec![0u32; QWEN_EXPERTS];
+        for &e in live {
+            want_count[e as usize] += 1;
+        }
+        assert!(want_count[QWEN_EXPERTS / 2..].iter().all(|&c| c > 0));
+        let mut want_offset = Vec::with_capacity(QWEN_EXPERTS);
+        let mut acc = 0u32;
+        for &c in &want_count {
+            want_offset.push(acc);
+            acc += c.div_ceil(BM as u32) * BM as u32;
+        }
+        let (count, offset, total) = (u32_buf(QWEN_EXPERTS), u32_buf(QWEN_EXPERTS), u32_buf(1));
+        let num_tokens = common::shared_slice(&device, &[tokens as u32]);
+        run(&device, 1, 1, |_| {
+            vec![Dispatch {
+                pso: &offsets_pso,
+                buffers: vec![
+                    (&topk_inds, 0),
+                    (&count, 1),
+                    (&offset, 2),
+                    (&total, 3),
+                    (&num_tokens, 4),
+                ],
+                groups: size(1, 1, 1),
+                threads: size(256, 1, 1),
+            }]
+        });
+        let what = format!("{tokens} of {BUCKET} rows");
+        let got_count = common::read_slice::<u32>(&count, QWEN_EXPERTS);
+        assert_eq!(got_count, want_count, "{what}: counts");
+        let got_offset = common::read_slice::<u32>(&offset, QWEN_EXPERTS);
+        assert_eq!(got_offset, want_offset, "{what}: offsets");
+        assert_eq!(common::read_slice::<u32>(&total, 1), vec![acc], "{what}: total");
+    }
 }
 
 /// A grouped bake's act (`SILU_MUL_ROW` / `SILU_MUL_EXPERTS` set, the sort's `indices_pad` at

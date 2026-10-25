@@ -172,6 +172,10 @@ pub mod qwen3_5_mtp;
 #[path = "arch/gemma4_assistant.rs"]
 pub mod gemma4_assistant;
 
+#[cfg(all(feature = "arch-dflash2", feature = "metal"))]
+#[path = "arch/dflash2.rs"]
+pub mod dflash2;
+
 #[cfg(all(feature = "arch-qwen3-5-vl", any(feature = "cuda", feature = "metal")))]
 #[path = "arch/qwen3_5_vl.rs"]
 pub mod qwen3_5_vl;

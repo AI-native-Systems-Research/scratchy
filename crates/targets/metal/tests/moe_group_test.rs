@@ -1,6 +1,7 @@
 // The grouped MoE path's counting sort (`moe_group.metal`): `moe_group_offsets` histograms a step's
 // (token, expert) pairs by expert and lays out each expert's run padded to the grouped GEMM's
-// 64-row tile. Its histogram holds every expert of the model — Gemma-4's 128 and Qwen3.5/3.6's 256.
+// 64-row tile. Its histogram holds every expert of the model — Gemma-4's 128 and Qwen3.5/3.6's 256 —
+// and counts the step's rows alone, not the rest of its bucket.
 mod common;
 
 use objc2_metal::MTLSize;
@@ -37,13 +38,17 @@ fn routes(tokens: u32, top_k: u32, experts: u32) -> Vec<u32> {
 fn offsets_count_every_expert() {
     let Some(d) = detect_device() else { return };
     let device = d.device;
-    for (experts, tokens) in [(128u32, 64u32), (256, 64), (256, 1024)] {
+    for (experts, bucket, tokens) in [(128u32, 64u32, 64u32), (256, 64, 64), (256, 1024, 1024)]
+        .into_iter()
+        .chain([(256, 1024, 700)])
+    {
         let top_k = 8;
-        let pairs = tokens * top_k;
-        let inds = routes(tokens, top_k, experts);
+        let pairs = bucket * top_k;
+        let inds = routes(bucket, top_k, experts);
         let constants = vec![
             ConstantValue::int(ConstSlot(0), pairs as i32),
             ConstantValue::int(ConstSlot(1), experts as i32),
+            ConstantValue::int(ConstSlot(3), top_k as i32),
             ConstantValue::int(ConstSlot(6), BM as i32),
         ];
         let pso = baked_pipeline(&device, "moe_group", "moe_group_offsets", constants)
@@ -52,6 +57,7 @@ fn offsets_count_every_expert() {
         let count = common::shared_zeroed(&device, experts as usize * 4);
         let offset = common::shared_zeroed(&device, experts as usize * 4);
         let total = common::shared_zeroed(&device, 4);
+        let num_tokens = common::shared_slice(&device, &[tokens]);
         let one = MTLSize {
             width: 1,
             height: 1,
@@ -65,12 +71,12 @@ fn offsets_count_every_expert() {
         assert!(common::dispatch_threadgroups(
             &device,
             &pso,
-            &[&inds_buf, &count, &offset, &total],
+            &[&inds_buf, &count, &offset, &total, &num_tokens],
             one,
             threads,
         ));
         let mut want_count = vec![0u32; experts as usize];
-        for &e in &inds {
+        for &e in &inds[..(tokens * top_k) as usize] {
             want_count[e as usize] += 1;
         }
         let want_offset: Vec<u32> = (want_count.iter())
@@ -81,7 +87,7 @@ fn offsets_count_every_expert() {
             })
             .collect();
         let want_total: u32 = want_count.iter().map(|c| c.div_ceil(BM) * BM).sum();
-        let what = format!("{experts} experts, {tokens} tokens");
+        let what = format!("{experts} experts, {tokens} of {bucket} tokens");
         let got_count: Vec<u32> = common::read_slice(&count, experts as usize);
         assert_eq!(got_count, want_count, "{what}: counts");
         let got_offset: Vec<u32> = common::read_slice(&offset, experts as usize);

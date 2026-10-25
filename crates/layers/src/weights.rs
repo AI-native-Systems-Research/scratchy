@@ -2521,6 +2521,18 @@ impl<A: DeviceAllocator> GpuWeights<A> {
         let data = unsafe { std::slice::from_raw_parts(ptr, size_bytes) }.to_vec();
         Ok((data, cpu_ref.shape, dtype))
     }
+
+    /// [`Self::take_cpu`], leaving the tensor in the store: for a tensor more than one weight is
+    /// built from (a projection two fused ones pack, as Splash's DFlash2 drafter packs its K and V
+    /// into its q|k|v and its k|v).
+    pub fn copy_cpu(&mut self, name: &str) -> Result<(Vec<u8>, Vec<usize>, DType)> {
+        let cpu_ref = (self.tensors.get(name).cloned())
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
+        let (ptr, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
+        // SAFETY: as `take_cpu`'s.
+        let data = unsafe { std::slice::from_raw_parts(ptr, size_bytes) }.to_vec();
+        Ok((data, cpu_ref.shape, dtype))
+    }
 }
 
 impl<A: DeviceAllocator> Drop for GpuWeights<A> {

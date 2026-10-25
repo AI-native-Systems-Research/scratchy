@@ -768,6 +768,7 @@ impl Speculation {
         DraftBudget {
             drafts: usize::from(head.drafts),
             verify_rows: usize::from(head.verify_rows),
+            block: head.drafting == scratchy_forward_compiler::HeadDrafting::Block,
         }
     }
 
@@ -899,18 +900,20 @@ fn target_head(
     let target = HfModelConfig::from_dir(&target_dir)
         .with_context(|| format!("reading config.json at {target_dir:?}"))?;
     let arch = target.arch_hint().unwrap_or_default();
-    let head = scratchy_forward_compiler::head_of(arch);
     let shape = (target.hidden_size().zip(target.num_hidden_layers())).map(
         |(hidden_size, num_hidden_layers)| scratchy_forward_compiler::TargetShape {
             hidden_size,
             num_hidden_layers,
         },
     );
-    if let Some(head) = head
+    if let Some(head) = scratchy_forward_compiler::head_of(arch, shape)
         && let Some(repo) = shape.and_then(|shape| head.published_for(shape))
     {
         return Ok(published_head(config, head, repo.to_string()));
     }
+    // A head that ships with its target: in its checkpoint, beside it, or under a name made from
+    // its repo's.
+    let head = scratchy_forward_compiler::heads_of(arch).find(|head| head.published.is_empty());
     // A multimodal checkpoint nests its language model's fields under `text_config`.
     let text = target.extra.get("text_config");
     let mtp_layers = (target.extra.get("mtp_num_hidden_layers"))

@@ -129,6 +129,22 @@ macro_rules! for_each_subop {
                 rows = [in0], gemm_w = [none];
             GateScale [SubOp::GateScale] arity = (|n| n == 3), cols = [in0], rows = [in0],
                 gemm_w = [none];
+            // Splash's DFlash2 drafter. The ring a draft attention reads and a context commit
+            // writes is runtime-ambient per layer, as a GDN's state: no operand.
+            CaptureHidden [SubOp::CaptureHidden { .. }] arity = (|n| n == 1), cols = [in0],
+                rows = [in0], gemm_w = [none];
+            // `[x, dynamic, base]`, plus the residual for the finishing stage.
+            DraftConv [SubOp::DraftConv { .. }] arity = (|n| n == 3 || n == 4), cols = [in0],
+                rows = [in0], gemm_w = [none];
+            // `[qkv, q_norm, k_norm, cos, sin]`.
+            DraftAttention [SubOp::DraftAttention { .. }] arity = (|n| n == 5),
+                cols = [field width], rows = [in0], gemm_w = [none];
+            // `[kv, k_norm, cos, sin]`.
+            DraftContextKv [SubOp::DraftContextKv { .. }] arity = (|n| n == 4), cols = [in0],
+                rows = [in0], gemm_w = [none];
+            // `[logits, selector, predecessor_codebook, successor_codebook]`.
+            DraftSelect [SubOp::DraftSelect] arity = (|n| n == 4), cols = [in0], rows = [in0],
+                gemm_w = [none];
             // Host-staged: the buffer is delivered by the runtime, not by an operand — so there is
             // no operand to inherit rows from.
             LoadRows [SubOp::LoadRows { .. }] arity = (|n| n == 0), cols = [field width],

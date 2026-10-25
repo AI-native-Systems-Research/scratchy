@@ -1,0 +1,6 @@
+{
+  "_comment": "The MLX preset compiles the drafter its target drafts with by default: mlx-community/Qwen3.6-35B-A3B-DFlash2-4bit, every projection 4-bit g64 (the norms, the convolutions' base kernels and the selector's codebooks bf16, as Splash keeps them: runtime/model/DraftCheckpoint.cpp), its embedding and lm_head its target's (Qwen3.6-35B-A3B-4bit's, the embedding quantized too).",
+  "quantizations": [
+    "mlx-affine-b4-g64-qembed"
+  ]
+}

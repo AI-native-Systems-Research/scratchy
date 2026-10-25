@@ -115,6 +115,26 @@ pub fn load_layered_linear_affine_quant(
         .collect()
 }
 
+/// Fused-rows sibling of [`load_layered_linear_affine_quant`]: one AffineQuant LinearLayer per
+/// layer, the per-layer prefixes' rows in order, still packed (Splash's fused QKV).
+pub fn load_layered_linear_affine_quant_rows_concat(
+    gw: &mut GpuWeights,
+    n_layers: u32,
+    root: &str,
+    suffixes: &[&str],
+    group_size: u32,
+    bits: u32,
+    in_features: u32,
+) -> Result<Vec<LinearLayer>> {
+    (0..n_layers)
+        .map(|layer| {
+            let paths = concat_paths_for_layer(root, layer, suffixes);
+            let refs = as_str_refs(&paths);
+            LinearLayer::load_affine_quant_rows_concat(gw, &refs, group_size, bits, in_features)
+        })
+        .collect()
+}
+
 /// NVFP4 int4 layered forward-time load (Metal-only). One
 /// `LinearLayer::Nvfp4` per decoder layer, packed E2M1 weight + folded
 /// F16 scales kept on device for the `nvfp4_qmv` / `nvfp4_qmm_t`
