@@ -274,11 +274,7 @@ fn draft_prepare_and_reorder_match_reference() {
     let rope = rope_table(6200);
     let ones = vec![bits(1.0); HEAD_DIM as usize];
     let (q_norm, k_norm) = (gpu.buffer(&ones), gpu.buffer(&ones));
-    let prepare = gpu.pipeline(
-        "dflash2",
-        "draft_attention_qkv_bf16",
-        draft_constants(true),
-    );
+    let prepare = gpu.pipeline("dflash2", "draft_attention_qkv_bf16", draft_constants(true));
     let reorder = gpu.pipeline(
         "dflash2",
         "draft_attention_reorder_bf16",
@@ -1299,10 +1295,7 @@ fn draft_verify_rows_choose_the_best_assignment() {
     let Some(gpu) = Gpu::new() else { return };
     let mut random = Random(0xb0d9e7);
     let lanes_max = MAX_LANES as usize;
-    let mut models = vec![
-        VerifyRows::EveryRow,
-        VerifyRows::of_target(true),
-    ];
+    let mut models = vec![VerifyRows::EveryRow, VerifyRows::of_target(true)];
     let flat = VerifyCost([[1.0; 4]; BUDGET_LANES]);
     let steep = VerifyCost([[0.1, 0.2, 0.4, 0.8]; BUDGET_LANES]);
     for cost in [flat, steep, VERIFY_COST_SEED] {
@@ -1511,7 +1504,8 @@ fn greedy_lane(a: &mut Acceptance, lane: usize, drafts: u32, matched: u32, remai
         let proposal = 1000 + lane as u32 * 100 + token as u32;
         a.drafted[lane * P + token] = proposal;
         let matches = (token as u32) < matched;
-        a.tokens.push(if matches { proposal } else { proposal + 50 });
+        a.tokens
+            .push(if matches { proposal } else { proposal + 50 });
     }
     a.tokens.push(9000 + lane as u32);
     a.lanes.push(VerifyLane {
@@ -1537,7 +1531,11 @@ fn assert_next_blocks(a: &Acceptance, got: &Accepted) {
                 assert_eq!(got.ids[row(r)], MASK, "lane {lane} row {r} embeds the mask");
             }
             let want = params.position + kept + r as u32;
-            assert_eq!(got.positions[row(r)], want, "lane {lane} row {r}'s position");
+            assert_eq!(
+                got.positions[row(r)],
+                want,
+                "lane {lane} row {r}'s position"
+            );
         }
     }
 }
@@ -1576,7 +1574,10 @@ fn accept_case(
         assert_eq!(got.accepted[lane], want_accepted, "lane {lane} accepted");
         assert_eq!(got.retained[lane], want_retained, "lane {lane} retained");
     }
-    assert_eq!(got.tokens, a.tokens, "a greedy acceptance rewrote a target token");
+    assert_eq!(
+        got.tokens, a.tokens,
+        "a greedy acceptance rewrote a target token"
+    );
     assert_next_blocks(&a, &got);
 }
 
@@ -1619,7 +1620,12 @@ fn sampled_acceptance_tests_each_draft_against_its_target_probability() {
     let Some(gpu) = Gpu::new() else { return };
     // Per sampled lane, per draft: (q, p, u), accepted iff u · q < p.
     let lanes: [&[(f32, f32, f32)]; 4] = [
-        &[(0.5, 0.4, 0.7), (0.9, 0.2, 0.1), (0.3, 0.3, 0.9), (0.6, 0.1, 0.5)],
+        &[
+            (0.5, 0.4, 0.7),
+            (0.9, 0.2, 0.1),
+            (0.3, 0.3, 0.9),
+            (0.6, 0.1, 0.5),
+        ],
         &[(0.8, 0.1, 0.5), (0.5, 0.5, 0.0)],
         &[(0.0, 0.2, 0.9), (0.4, 0.0, 0.1)],
         &[(0.2, 0.3, 0.9), (0.7, 0.6, 0.8), (0.1, 0.2, 0.0)],
@@ -1673,7 +1679,11 @@ fn sampled_acceptance_tests_each_draft_against_its_target_probability() {
                 true => a.drafted[lane * P + row],
                 false => a.tokens[first + row],
             };
-            assert_eq!(got.tokens[first + row], want, "lane {lane} row {row}'s token");
+            assert_eq!(
+                got.tokens[first + row],
+                want,
+                "lane {lane} row {row}'s token"
+            );
         }
     }
     assert_eq!(
