@@ -16,6 +16,7 @@
 //! 2. **Spans** — `llm.execute_query()` with `cross` + `plus`, documents as
 //!    relocatable blocks. Shared documents hit the prefix cache automatically.
 
+use crate::scoring::token_len;
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::sync::Arc;
@@ -24,7 +25,7 @@ use std::time::Instant;
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use scratchy_core_config::{CudaGraphConfig, CudaGraphMode};
-use scratchy_serving_api::llm::{ChatMessage, LLM, LLMBuilder, SamplingParams};
+use scratchy_serving_api::llm::{LLM, LLMBuilder, SamplingParams};
 use scratchy_serving_api::tokenizer::Tokenizer;
 
 use crate::args::BenchMusiqueArgs;
@@ -162,16 +163,37 @@ fn fetch_dataset(num_queries: usize) -> Result<Dataset> {
     })
 }
 
+/// The first `n` tasks of the dataset, as `scr bench serve` sends them over HTTP
+/// ([`crate::workloads`]): every paragraph, supporting and distractor, as a document.
+pub(crate) fn tasks(n: usize) -> Result<Vec<crate::workloads::Task>> {
+    Ok(fetch_dataset(n)?
+        .queries
+        .iter()
+        .map(|q| task(q, crate::workloads::RAG_MAX_TOKENS))
+        .collect())
+}
+
+/// A query as a dataset task ([`crate::workloads`]): every paragraph, supporting and distractor, as
+/// a document by title; its answer and aliases accepted.
+fn task(q: &Query, max_tokens: usize) -> crate::workloads::Task {
+    let docs: Vec<(String, String)> = (q.paragraphs.iter())
+        .map(|p| (p.title.clone(), p.text.clone()))
+        .collect();
+    let answers: Vec<String> = std::iter::once(q.answer.clone())
+        .chain(q.answer_aliases.iter().cloned())
+        .collect();
+    crate::workloads::rag_task(
+        &crate::workloads::DOCUMENTS,
+        &docs,
+        &q.question,
+        &answers,
+        max_tokens,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Tokenizer helpers
 // ---------------------------------------------------------------------------
-
-fn token_len(text: &str, tokenizer: &Tokenizer) -> usize {
-    tokenizer
-        .encode(text, false)
-        .map(|ids| ids.len())
-        .unwrap_or(0)
-}
 
 // ---------------------------------------------------------------------------
 // Evaluation
@@ -190,67 +212,22 @@ fn evaluate(response: &str, expected: &str, aliases: &[String], debug: bool) -> 
         }
         eprintln!("  response: {response}");
     }
-
-    let resp_lower = response.to_lowercase();
-
-    // Check all acceptable answers (primary + aliases).
-    let all_answers: Vec<&str> = std::iter::once(expected)
-        .chain(aliases.iter().map(|a| a.as_str()))
+    let all: Vec<&str> = std::iter::once(expected)
+        .chain(aliases.iter().map(String::as_str))
         .collect();
-
-    for ans in &all_answers {
-        let ans_lower = ans.to_lowercase();
-
-        // Substring match.
-        if resp_lower.contains(&ans_lower) {
-            return 1.0;
-        }
-
-        // Token F1 match.
-        let f1 = compute_token_f1(&ans_lower, &resp_lower);
-        if f1 >= 0.5 {
-            return 1.0;
-        }
+    if crate::scoring::any_contains_or_f1(response, &all) {
+        1.0
+    } else {
+        0.0
     }
-
-    0.0
-}
-
-fn normalize_tokens(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
-}
-
-fn compute_token_f1(expected: &str, actual: &str) -> f64 {
-    let et = normalize_tokens(expected);
-    let at = normalize_tokens(actual);
-    if et.is_empty() && at.is_empty() {
-        return 1.0;
-    }
-    if et.is_empty() || at.is_empty() {
-        return 0.0;
-    }
-    let common: usize = et.iter().filter(|t| at.contains(t)).count();
-    if common == 0 {
-        return 0.0;
-    }
-    let p = common as f64 / at.len() as f64;
-    let r = common as f64 / et.len() as f64;
-    2.0 * p * r / (p + r)
 }
 
 /// Compute raw token F1 (0.0-1.0) — best F1 across all acceptable answers.
 fn token_f1(expected: &str, aliases: &[String], actual: &str) -> f64 {
-    let all_answers: Vec<&str> = std::iter::once(expected)
-        .chain(aliases.iter().map(|a| a.as_str()))
+    let all: Vec<String> = std::iter::once(expected.to_string())
+        .chain(aliases.iter().cloned())
         .collect();
-
-    all_answers
-        .iter()
-        .map(|ans| compute_token_f1(&ans.to_lowercase(), &actual.to_lowercase()))
-        .fold(0.0_f64, f64::max)
+    crate::scoring::best_token_f1(&all, actual)
 }
 
 // ---------------------------------------------------------------------------
@@ -442,8 +419,6 @@ pub(crate) fn run_bench_musique(args: BenchMusiqueArgs) -> Result<()> {
         ..SamplingParams::default()
     };
 
-    let system_prompt = "You are a helpful assistant. Answer the question based only on the provided documents. Be concise — answer with just the entity, date, or fact requested.";
-
     let plain_style = ProgressStyle::default_bar()
         .template("  plain {bar:40.yellow/yellow} {pos:>4}/{len} {msg}")
         .unwrap();
@@ -463,15 +438,7 @@ pub(crate) fn run_bench_musique(args: BenchMusiqueArgs) -> Result<()> {
         let debug = args.debug && i == 0;
         llm.reset_prefix_cache()?;
 
-        let mut msgs = vec![ChatMessage::system(system_prompt)];
-        for (j, para) in query.paragraphs.iter().enumerate() {
-            msgs.push(ChatMessage::user(format!(
-                "Document {j} ({title}): {text}",
-                title = para.title,
-                text = para.text,
-            )));
-        }
-        msgs.push(ChatMessage::user(&query.question));
+        let msgs = task(query, args.max_tokens).chat_messages();
 
         let start = Instant::now();
         let result = llm.chat(&msgs, Some(sampling.clone()))?;
@@ -517,19 +484,6 @@ pub(crate) fn run_bench_musique(args: BenchMusiqueArgs) -> Result<()> {
     for (i, query) in dataset.queries.iter().enumerate() {
         let debug = args.debug && i == 0;
 
-        let doc_json: Vec<serde_json::Value> = query
-            .paragraphs
-            .iter()
-            .enumerate()
-            .map(|(j, para)| {
-                serde_json::json!({ "user": format!(
-                    "Document {j} ({title}): {text}",
-                    title = para.title,
-                    text = para.text,
-                )})
-            })
-            .collect();
-
         // Track cache hit stats.
         for para in &query.paragraphs {
             total_doc_refs += 1;
@@ -540,20 +494,9 @@ pub(crate) fn run_bench_musique(args: BenchMusiqueArgs) -> Result<()> {
             }
         }
 
-        let span_query = serde_json::json!({
-            "g": {
-                "model": model_name,
-                "max_tokens": args.max_tokens,
-                "temperature": 0.0,
-                "input": {
-                    "cross": [
-                        { "system": system_prompt },
-                        { "plus": doc_json },
-                        { "user": &query.question }
-                    ]
-                }
-            }
-        });
+        let span_query = task(query, args.max_tokens)
+            .span_query(&model_name, args.max_tokens, 0.0)
+            .expect("a multi-document task has its span query");
 
         let start = Instant::now();
         let results = llm.execute_query(
@@ -629,6 +572,7 @@ pub(crate) fn run_bench_musique(args: BenchMusiqueArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scoring::normalize_tokens;
 
     #[test]
     fn evaluate_exact_substring() {

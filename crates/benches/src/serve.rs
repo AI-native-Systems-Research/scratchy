@@ -45,6 +45,11 @@ struct RequestResult {
     generated_text: String,
     /// Why the request failed; empty when it didn't (vLLM's `errors` entry).
     error: String,
+    /// `usage.prompt_tokens_details.cached_tokens`, where the server sent it: the prompt tokens
+    /// its prefix cache served.
+    cached_tokens: Option<usize>,
+    /// `usage.prompt_tokens`, where the server sent it.
+    prompt_tokens: Option<usize>,
 }
 
 impl RequestResult {
@@ -60,6 +65,8 @@ impl RequestResult {
             success: false,
             generated_text: String::new(),
             error,
+            cached_tokens: None,
+            prompt_tokens: None,
         }
     }
 
@@ -114,12 +121,13 @@ impl Client {
 
     fn post(
         &self,
+        url: &str,
         body: &serde_json::Value,
         request_id: &str,
     ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
         let mut req = self
             .agent
-            .post(&self.api_url)
+            .post(url)
             .header("content-type", "application/json")
             .header("x-request-id", request_id);
         if let Some(key) = &self.api_key {
@@ -161,7 +169,19 @@ fn send_request(
         "repetition_penalty": 1.0,
     });
     client.sampling(&mut body);
+    send_body(client, &client.api_url, &body, request_id, bench_start)
+}
 
+/// Post one streaming request body and measure its timing: TTFT, ITL, E2EL, the server's token
+/// counts, and the answer's text. The body is a completions or a chat one; their chunks carry
+/// text as `text` and `delta.content`, both read here.
+fn send_body(
+    client: &Client,
+    url: &str,
+    body: &serde_json::Value,
+    request_id: &str,
+    bench_start: Instant,
+) -> RequestResult {
     let request_start = Instant::now();
     let start_time = request_start.duration_since(bench_start).as_secs_f64();
     let mut first_token_time: Option<Instant> = None;
@@ -169,7 +189,7 @@ fn send_request(
     let mut itl = Vec::new();
     let mut output_tokens = 0usize;
 
-    let resp = match client.post(&body, request_id) {
+    let resp = match client.post(url, body, request_id) {
         Ok(r) => r,
         Err(e) => {
             return RequestResult::failed(
@@ -198,6 +218,8 @@ fn send_request(
     let mut chunk = [0u8; 8192];
     let mut buf = String::new();
     let mut usage_completion_tokens: Option<usize> = None;
+    let mut cached_tokens: Option<usize> = None;
+    let mut prompt_tokens: Option<usize> = None;
     let mut chunks = 0usize;
     let mut generated_text = String::new();
     let mut last_choices_time: Option<Instant> = None;
@@ -243,6 +265,14 @@ fn send_request(
                     // timing any chunk put TTFT before the prefill was done.
                     if has_choices(&parsed) {
                         last_choices_time = Some(Instant::now());
+                    }
+                    if let Some(n) =
+                        parsed["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64()
+                    {
+                        cached_tokens = Some(n as usize);
+                    }
+                    if let Some(n) = parsed["usage"]["prompt_tokens"].as_u64() {
+                        prompt_tokens = Some(n as usize);
                     }
                     if let Some(text) = chunk_text(&parsed) {
                         let now = Instant::now();
@@ -302,6 +332,8 @@ fn send_request(
         success: first_token_time.is_some(),
         generated_text,
         error: String::new(),
+        cached_tokens,
+        prompt_tokens,
     }
 }
 
@@ -534,6 +566,9 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
             anyhow::bail!("--save-detailed keeps single-turn requests; a multi-turn run has none");
         }
         return run_multi_turn(&args, agent, api_url, &model, &tokenizer);
+    }
+    if args.is_task_dataset() {
+        return run_tasks(&args, agent, api_url, &model, &tokenizer);
     }
 
     let client = Arc::new(Client {
@@ -1435,6 +1470,303 @@ fn run_prompts(args: &BenchServeArgs, client: &Arc<Client>, tokenizer: &Tokenize
     })
 }
 
+/// The tasks of a dataset workload ([`crate::workloads`]), loaded from its loader, those whose
+/// prompt fits `--max-prompt-tokens`, then `--num-prompts` of them sampled by `--seed` (and the
+/// warmups from a seed disjoint from it).
+fn load_tasks(
+    args: &BenchServeArgs,
+    tokenizer: &Tokenizer,
+) -> Result<(String, Vec<crate::workloads::Task>)> {
+    use crate::args::RagSource;
+    // Loaders read the first N records; take enough that the sample is drawn from many.
+    let pool = (args.num_prompts + args.num_warmups + 1).max(200);
+    let (name, all) = match args.dataset_name {
+        ServeDataset::Longbench => (
+            format!("longbench-v2-{}", args.longbench_length),
+            crate::longbench::tasks(&args.longbench_length, args.output_len)?,
+        ),
+        _ => match args.rag_source {
+            RagSource::Musique => ("musique".to_string(), crate::musique::tasks(pool)?),
+            #[cfg(feature = "datasets")]
+            RagSource::TwoWiki => ("2wikimqa".to_string(), crate::multihop::tasks(pool)?),
+            #[cfg(feature = "datasets")]
+            RagSource::Hotpotqa => ("hotpotqa".to_string(), crate::hotpotqa::tasks(pool)?),
+            #[cfg(not(feature = "datasets"))]
+            other => anyhow::bail!(
+                "--rag-source {other:?} needs scr built with the bench crate's `datasets` feature"
+            ),
+        },
+    };
+    let fits = |t: &crate::workloads::Task| {
+        args.max_prompt_tokens.is_none_or(|max| {
+            let text: String = (t.messages.iter())
+                .filter_map(|m| m["content"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            datasets::token_count(tokenizer, &text).is_ok_and(|n| n <= max)
+        })
+    };
+    let fitting: Vec<_> = all.into_iter().filter(fits).collect();
+    Ok((name, fitting))
+}
+
+/// A dataset workload: each task streamed as a chat request (or, for `rag-spans`, a span query),
+/// its answer ending on its own, timed, scored, and its cached prompt tokens read from the
+/// server's usage.
+fn run_tasks(
+    args: &BenchServeArgs,
+    agent: Agent,
+    api_url: String,
+    model: &str,
+    tokenizer: &Tokenizer,
+) -> Result<()> {
+    let (dataset, fitting) = load_tasks(args, tokenizer)?;
+    anyhow::ensure!(
+        !fitting.is_empty(),
+        "no {dataset} task fits --max-prompt-tokens {:?}",
+        args.max_prompt_tokens
+    );
+    // Warmups from a seed disjoint from --seed, so no measured task is cached before it is timed;
+    // drawn first so they never overlap the measured sample.
+    let mut pool =
+        crate::workloads::sample(fitting, usize::MAX, datasets::throwaway_seed(args.seed));
+    let warmups: Vec<_> = pool
+        .drain(..args.num_warmups.min(pool.len().saturating_sub(1)))
+        .collect();
+    let tasks = crate::workloads::sample(pool, args.num_prompts, args.seed);
+    eprintln!(
+        "{dataset}: {} tasks (seed {}), {} warmups",
+        tasks.len(),
+        args.seed,
+        warmups.len()
+    );
+
+    let spans = args.dataset_name == ServeDataset::RagSpans;
+    let client = Arc::new(Client {
+        agent,
+        api_url,
+        model: model.to_string(),
+        api_key: args.api_key.clone(),
+        // Answers end on their own: a task's tokens are what it took.
+        ignore_eos: false,
+        temperature: Some(args.temperature.unwrap_or(0.0)),
+        top_p: args.top_p,
+        top_k: args.top_k,
+    });
+    let body = |t: &crate::workloads::Task| task_body(&client, args, t, spans);
+    let send = |t: &crate::workloads::Task, id: &str, start: Instant| {
+        send_body(&client, &client.api_url, &body(t), id, start)
+    };
+    if let Some(first) = warmups.first().or(tasks.first()) {
+        preflight(|| send(first, "preflight", Instant::now()).success)?;
+    }
+    warm_up(warmups.len(), |i| {
+        send(&warmups[i], &format!("warmup-{i}"), Instant::now());
+    });
+
+    let pb = progress_bar(args, tasks.len());
+    let semaphore = args.max_concurrency.map(|n| Arc::new(Semaphore::new(n)));
+    let tasks = Arc::new(tasks);
+    let start = Instant::now();
+    let mut handles = Vec::with_capacity(tasks.len());
+    for i in 0..tasks.len() {
+        let (client, tasks, pb) = (client.clone(), tasks.clone(), pb.clone());
+        let body = task_body(&client, args, &tasks[i], spans);
+        let permit = semaphore.as_ref().map(|s| s.acquire_owned());
+        handles.push(std::thread::spawn(move || {
+            let _permit = permit;
+            let r = send_body(
+                &client,
+                &client.api_url,
+                &body,
+                &format!("bench-{i}"),
+                start,
+            );
+            if let Some(ref pb) = pb {
+                pb.inc(1);
+            }
+            r
+        }));
+    }
+    let results = join_all(handles)?;
+    let total_time = start.elapsed().as_secs_f64();
+    if let Some(pb) = pb {
+        pb.finish_and_clear();
+    }
+    if let Some(path) = &args.save_answers {
+        let rows: Vec<serde_json::Value> = (results.iter().zip(tasks.iter()))
+            .map(|(r, t)| {
+                serde_json::json!({
+                    "reference": t.score.reference(),
+                    "answer": r.generated_text,
+                    "score": r.success.then(|| t.score.score(&r.generated_text)),
+                    "answer_tokens": r.output_tokens,
+                })
+            })
+            .collect();
+        std::fs::write(path, serde_json::to_string_pretty(&rows)?)?;
+    }
+    let json = task_metrics(&results, &tasks, tokenizer, total_time, &dataset, args.seed);
+    print_task_summary(&dataset, &json);
+    write_results(args, model, &json)
+}
+
+/// One task's request body: a streamed chat request, or for `rag-spans` a span query.
+fn task_body(
+    client: &Client,
+    args: &BenchServeArgs,
+    t: &crate::workloads::Task,
+    spans: bool,
+) -> serde_json::Value {
+    let mut body = if spans {
+        serde_json::json!({"g": {
+            "model": client.model,
+            "max_tokens": t.max_tokens,
+            "temperature": client.temperature.unwrap_or(0.0),
+            "input": t.spans_input.clone().unwrap_or(serde_json::Value::Null),
+        }})
+    } else {
+        let mut b = serde_json::json!({
+            "model": client.model,
+            "messages": t.messages,
+            "max_tokens": t.max_tokens,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        });
+        client.sampling(&mut b);
+        b
+    };
+    if !spans && let Some(kwargs) = &args.chat_template_kwargs {
+        body["chat_template_kwargs"] = serde_json::Value::Object(kwargs.clone());
+    }
+    body
+}
+
+/// A dataset workload's JSON: the serving metrics of `bench serve`, over the requests that
+/// answered, plus accuracy, prompt and answer tokens, and cached prompt tokens.
+fn task_metrics(
+    results: &[RequestResult],
+    tasks: &[crate::workloads::Task],
+    tokenizer: &Tokenizer,
+    total_time: f64,
+    dataset: &str,
+    seed: u64,
+) -> serde_json::Value {
+    let ok: Vec<(&RequestResult, &crate::workloads::Task)> = (results.iter().zip(tasks))
+        .filter(|(r, _)| r.success)
+        .collect();
+    let sorted = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v
+    };
+    let ms = |v: &[f64], p: f64| (!v.is_empty()).then(|| percentile(v, p) * 1000.0);
+    // A span query's stream carries no usage, so its answer tokens are counted here.
+    let answer_tokens = |r: &RequestResult| {
+        if r.output_tokens > 0 {
+            r.output_tokens
+        } else {
+            datasets::token_count(tokenizer, &r.generated_text).unwrap_or(0)
+        }
+    };
+    let ttft = sorted(ok.iter().map(|(r, _)| r.ttft).collect());
+    let e2el = sorted(ok.iter().map(|(r, _)| r.e2el).collect());
+    let tpot = sorted(
+        (ok.iter())
+            .filter(|(r, _)| answer_tokens(r) > 1)
+            .map(|(r, _)| (r.e2el - r.ttft) / (answer_tokens(r) - 1) as f64)
+            .collect(),
+    );
+    let out: Vec<usize> = ok.iter().map(|(r, _)| answer_tokens(r)).collect();
+    let total_out: usize = out.iter().sum();
+    let mean = |v: &[f64]| (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64);
+    let accuracy = mean(
+        &ok.iter()
+            .map(|(r, t)| t.score.score(&r.generated_text))
+            .collect::<Vec<_>>(),
+    );
+    // Answers that open as a thought: a request whose `enable_thinking: false` did not reach the
+    // template (a span query has no template kwargs), so its accuracy and tokens count reasoning
+    // too and are no like-for-like with a plain answer.
+    let thought = (ok.iter())
+        .filter(|(r, _)| opens_as_thought(&r.generated_text))
+        .count();
+    let cached: Vec<f64> = (ok.iter())
+        .filter_map(|(r, _)| r.cached_tokens.map(|c| c as f64))
+        .collect();
+    let prompt: Vec<f64> = (ok.iter())
+        .filter_map(|(r, _)| r.prompt_tokens.map(|c| c as f64))
+        .collect();
+    serde_json::json!({
+        "dataset": dataset,
+        "task_seed": seed,
+        "duration": total_time,
+        "completed": ok.len(),
+        "failed": results.len() - ok.len(),
+        // Requests that answered with no tokens at all: with answers ending on their own, the
+        // only sign of a server that had stopped answering.
+        "empty_answers": out.iter().filter(|&&n| n == 0).count(),
+        "total_output_tokens": total_out,
+        "output_throughput": total_out as f64 / total_time,
+        "median_ttft_ms": ms(&ttft, 50.0),
+        "p90_ttft_ms": ms(&ttft, 90.0),
+        "p99_ttft_ms": ms(&ttft, 99.0),
+        "median_tpot_ms": ms(&tpot, 50.0),
+        "median_e2el_ms": ms(&e2el, 50.0),
+        "p90_e2el_ms": ms(&e2el, 90.0),
+        "p99_e2el_ms": ms(&e2el, 99.0),
+        "mean_output_tokens": mean(&out.iter().map(|&n| n as f64).collect::<Vec<_>>()),
+        "mean_prompt_tokens": mean(&prompt),
+        // Null where the server sent no cached-token count, not 0.
+        "mean_cached_tokens": mean(&cached),
+        "accuracy": accuracy,
+        "thinking_answers": thought,
+    })
+}
+
+/// Whether an answer opens as reasoning rather than the answer: a think tag, or the openings the
+/// matrix's reasoning models write when thinking reaches them as plain text ("We need to...",
+/// "Okay, let's see"), as span queries do.
+fn opens_as_thought(text: &str) -> bool {
+    let t = text.trim_start();
+    [
+        "<think>",
+        "<|channel|>analysis",
+        "We need to",
+        "Okay, let's",
+        "Okay, so",
+        "Let me ",
+    ]
+    .iter()
+    .any(|p| t.starts_with(p))
+}
+
+fn print_task_summary(dataset: &str, j: &serde_json::Value) {
+    let f = |k: &str| j[k].as_f64().map_or("-".to_string(), |v| format!("{v:.1}"));
+    println!();
+    println!("{:=^50}", format!(" {dataset} "));
+    println!(
+        "{:<40} {} / {}",
+        "Completed / failed:", j["completed"], j["failed"]
+    );
+    println!("{:<40} {}", "Median TTFT (ms):", f("median_ttft_ms"));
+    println!("{:<40} {}", "Median end-to-end (ms):", f("median_e2el_ms"));
+    println!("{:<40} {}", "Mean answer tokens:", f("mean_output_tokens"));
+    println!("{:<40} {}", "Mean prompt tokens:", f("mean_prompt_tokens"));
+    println!(
+        "{:<40} {}",
+        "Mean cached prompt tokens:",
+        f("mean_cached_tokens")
+    );
+    println!(
+        "{:<40} {}",
+        "Accuracy:",
+        j["accuracy"]
+            .as_f64()
+            .map_or("-".to_string(), |a| format!("{:.0}%", a * 100.0))
+    );
+    println!("{:=^50}", "");
+}
+
 /// Send one request to verify connectivity, and fail fast if it does not land.
 fn preflight(send: impl FnOnce() -> bool) -> Result<()> {
     eprintln!("Sending pre-flight request to verify connectivity...");
@@ -1659,6 +1991,148 @@ mod tests {
         );
     }
 
+    fn task_client() -> Client {
+        Client {
+            agent: crate::http::agent(false),
+            api_url: "http://127.0.0.1:1/v1/chat/completions".into(),
+            model: "m".into(),
+            api_key: None,
+            ignore_eos: false,
+            temperature: Some(0.0),
+            top_p: None,
+            top_k: None,
+        }
+    }
+
+    fn rag(answer: &str) -> crate::workloads::Task {
+        let docs = vec![("Paris".to_string(), "The capital of France.".to_string())];
+        crate::workloads::rag_task(
+            &crate::workloads::DOCUMENTS,
+            &docs,
+            "Capital of France?",
+            &[answer.to_string()],
+            crate::workloads::RAG_MAX_TOKENS,
+        )
+    }
+
+    /// A dataset task goes as a streamed chat request with its own messages and answer cap, and
+    /// no `ignore_eos`, so the answer ends on its own; `rag-spans` sends the same documents as a
+    /// span query instead.
+    #[test]
+    fn a_task_is_sent_as_chat_or_as_a_span_query() {
+        let args = <BenchServeArgs as clap::Parser>::try_parse_from([
+            "serve",
+            "--dataset-name",
+            "rag",
+            "--chat-template-kwargs",
+            r#"{"enable_thinking":false}"#,
+        ])
+        .unwrap();
+        let (client, t) = (task_client(), rag("Paris"));
+        let chat = task_body(&client, &args, &t, false);
+        assert_eq!(chat["messages"], serde_json::json!(t.messages));
+        assert_eq!(chat["max_tokens"], crate::workloads::RAG_MAX_TOKENS);
+        assert_eq!(chat["stream"], true);
+        assert_eq!(chat["stream_options"]["include_usage"], true);
+        assert!(chat.get("ignore_eos").is_none(), "answers end on their own");
+        assert_eq!(chat["chat_template_kwargs"]["enable_thinking"], false);
+        let spans = task_body(&client, &args, &t, true);
+        assert_eq!(spans["g"]["input"], t.spans_input.clone().unwrap());
+        assert_eq!(spans["g"]["max_tokens"], crate::workloads::RAG_MAX_TOKENS);
+        assert!(spans.get("messages").is_none());
+    }
+
+    /// A dataset workload's metrics: accuracy over the answers, cached prompt tokens from the
+    /// server's usage (null where it sent none), and the failed and empty answers counted apart.
+    #[test]
+    fn a_workloads_metrics_score_the_answers_and_read_the_cache() {
+        let tok_path = std::env::var("SCR_TEST_TOKENIZER").ok();
+        let Some(tokenizer) = tok_path
+            .as_deref()
+            .and_then(|p| scratchy_serving_api::Tokenizer::from_file(std::path::Path::new(p)).ok())
+        else {
+            eprintln!("skipped: set SCR_TEST_TOKENIZER to a tokenizer.json");
+            return;
+        };
+        let answered = |text: &str, tokens: usize, cached: Option<usize>| {
+            let mut r = req(tokens, tokens, 0.1, 0.5);
+            r.generated_text = text.into();
+            r.cached_tokens = cached;
+            r.prompt_tokens = Some(100);
+            r
+        };
+        let results = vec![
+            answered("Paris.", 2, Some(80)),
+            answered("Lyon.", 2, Some(40)),
+            RequestResult::failed(0.0, 1.0, "timed out".into()),
+        ];
+        let tasks = vec![rag("Paris"), rag("Paris"), rag("Paris")];
+        let j = task_metrics(&results, &tasks, &tokenizer, 1.0, "musique", 7);
+        assert_eq!(j["completed"], 2);
+        assert_eq!(j["failed"], 1);
+        assert_eq!(j["accuracy"], 0.5);
+        assert_eq!(j["mean_cached_tokens"], 60.0);
+        assert_eq!(j["mean_prompt_tokens"], 100.0);
+        assert_eq!(j["dataset"], "musique");
+        assert_eq!(j["task_seed"], 7);
+        assert_eq!(j["empty_answers"], 0);
+        assert_eq!(j["thinking_answers"], 0);
+        let thinking = vec![answered("We need to answer: what is the capital?", 9, None)];
+        let j = task_metrics(&thinking, &tasks[..1], &tokenizer, 1.0, "musique", 7);
+        assert_eq!(j["thinking_answers"], 1);
+        let no_usage = vec![answered("Paris", 1, None)];
+        let j = task_metrics(&no_usage, &tasks[..1], &tokenizer, 1.0, "musique", 7);
+        assert!(j["mean_cached_tokens"].is_null(), "no count is not zero");
+    }
+
+    /// A streamed chat answer comes back with its text and the server's cached and prompt token
+    /// counts, read from the usage chunk.
+    #[test]
+    fn a_chat_answer_brings_its_text_and_cached_tokens() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut req = [0u8; 8192];
+            let _ = s.read(&mut req);
+            let events = [
+                r#"{"choices":[{"delta":{"content":"Par"},"finish_reason":null}]}"#,
+                r#"{"choices":[{"delta":{"content":"is"},"finish_reason":"stop"}]}"#,
+                r#"{"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":96}}}"#,
+            ];
+            let mut body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+            body += "data: [DONE]\n\n";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+                body.len()
+            );
+            s.write_all(head.as_bytes()).unwrap();
+            s.write_all(body.as_bytes()).unwrap();
+            s.flush().unwrap();
+            // Half-close, then read what is left of the request, as the read-error test does: a
+            // socket closed with unread input sends a reset, and on macOS the client's next read
+            // then fails before it has read the response this wrote.
+            s.shutdown(std::net::Shutdown::Write).unwrap();
+            let _ = std::io::copy(&mut s, &mut std::io::sink());
+        });
+        let mut client = task_client();
+        client.api_url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        let r = send_body(
+            &client,
+            &client.api_url,
+            &serde_json::json!({"messages": []}),
+            "t",
+            Instant::now(),
+        );
+        server.join().unwrap();
+        assert!(r.success);
+        assert_eq!(r.generated_text, "Paris");
+        assert_eq!(r.output_tokens, 2);
+        assert_eq!(r.cached_tokens, Some(96));
+        assert_eq!(r.prompt_tokens, Some(120));
+    }
+
     /// A stream that breaks off mid-answer failed; one that breaks off only after `[DONE]` finished.
     /// The server here streams one token in a chunked body it closes without the final empty
     /// chunk, so the client's read ends in an error rather than EOF.
@@ -1720,6 +2194,8 @@ mod tests {
             success: true,
             generated_text: String::new(),
             error: String::new(),
+            cached_tokens: None,
+            prompt_tokens: None,
         }
     }
 

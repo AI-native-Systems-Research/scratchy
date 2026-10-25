@@ -24,6 +24,7 @@
 //! 5. **Spans-chunked-permuted** — same as spans-chunked but chunks in random
 //!    order. Tests position-independence and cross-query chunk reuse.
 
+use crate::scoring::token_len;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -118,13 +119,6 @@ fn fetch_dataset() -> Result<Dataset> {
 // Tokenizer helpers
 // ---------------------------------------------------------------------------
 
-fn token_len(text: &str, tokenizer: &Tokenizer) -> usize {
-    tokenizer
-        .encode(text, false)
-        .map(|ids| ids.len())
-        .unwrap_or(0)
-}
-
 // ---------------------------------------------------------------------------
 // Evaluation
 // ---------------------------------------------------------------------------
@@ -138,7 +132,49 @@ fn token_len(text: &str, tokenizer: &Tokenizer) -> usize {
 /// Additionally handles common model outputs not covered by the official code:
 /// 3. Starts with "(X)" or "X." or "X)" — direct answer
 /// 4. Single letter response
-fn extract_answer(response: &str) -> Option<String> {
+/// LongBench v2's official prompt for a task.
+fn prompt(q: &Query) -> String {
+    format!(
+        "Please read the following text and answer the question below.\n\
+\n\
+<text>\n\
+{}\n\
+</text>\n\
+\n\
+What is the correct answer to this question: {}\n\
+Choices:\n\
+(A) {}\n\
+(B) {}\n\
+(C) {}\n\
+(D) {}\n\
+\n\
+Format your response as follows: \"The correct answer is (insert answer here)\".",
+        q.context.trim(),
+        q.question.trim(),
+        q.choices[0].trim(),
+        q.choices[1].trim(),
+        q.choices[2].trim(),
+        q.choices[3].trim(),
+    )
+}
+
+/// LongBench v2's tasks of one length class (`short`, `medium` or `long`), as `scr bench serve`
+/// sends them over HTTP ([`crate::workloads`]). Its answer is a letter, so the cap is short.
+pub(crate) fn tasks(length: &str, max_tokens: usize) -> Result<Vec<crate::workloads::Task>> {
+    Ok(fetch_dataset()?
+        .queries
+        .iter()
+        .filter(|q| q.length == length)
+        .map(|q| crate::workloads::Task {
+            messages: vec![serde_json::json!({"role": "user", "content": prompt(q)})],
+            spans_input: None,
+            max_tokens,
+            score: crate::workloads::Score::Choice(q.answer.clone()),
+        })
+        .collect())
+}
+
+pub(crate) fn extract_answer(response: &str) -> Option<String> {
     let cleaned = response.replace('*', "");
     let trimmed = cleaned.trim();
     let upper = trimmed.to_uppercase();
@@ -751,30 +787,7 @@ pub(crate) fn run_bench_longbench(args: BenchLongbenchArgs) -> Result<()> {
     // The entire prompt is a single user message (no system prompt).
     // Prompt template matching official LongBench v2 prompts/0shot.txt exactly.
     // NOTE: no leading whitespace — Rust `\` continuations preserve indentation.
-    let make_prompt = |q: &Query| -> String {
-        format!(
-            "Please read the following text and answer the question below.\n\
-\n\
-<text>\n\
-{}\n\
-</text>\n\
-\n\
-What is the correct answer to this question: {}\n\
-Choices:\n\
-(A) {}\n\
-(B) {}\n\
-(C) {}\n\
-(D) {}\n\
-\n\
-Format your response as follows: \"The correct answer is (insert answer here)\".",
-            q.context.trim(),
-            q.question.trim(),
-            q.choices[0].trim(),
-            q.choices[1].trim(),
-            q.choices[2].trim(),
-            q.choices[3].trim(),
-        )
-    };
+    let make_prompt = prompt;
 
     // Build just the question portion (for chunked variants where context is separate).
     let make_question_only = |q: &Query| -> String {
