@@ -371,16 +371,16 @@ template <typename T>
 // One thread per lane walks the seven positions (sampling.metal draft_select_dflash): the score
 // of a candidate is its unary score plus the edge from the previously chosen candidate, read from
 // the table draft_select_edges left in the partial-values scratch. It writes the lane's confidence
-// at each position as it walks.
+// at each position as it walks. A sampling lane draws its proposal at position p with its step's
+// uniform DRAFT_UNIFORM_PROPOSALS + p (`draft_uniform`).
 [[kernel]] void draft_select_dflash(device const uint *candidates [[buffer(0)]],
                                     device const float *unary [[buffer(1)]],
                                     device const float *partial_values [[buffer(2)]],
-                                    device const float *uniforms [[buffer(3)]],
-                                    device uint *tokens [[buffer(4)]],
-                                    device float *q_probs [[buffer(5)]],
-                                    device float *confidence [[buffer(6)]],
-                                    device const DraftLaneParams *lane_params [[buffer(7)]],
-                                    device const uint *num_tokens [[buffer(8)]],
+                                    device uint *tokens [[buffer(3)]],
+                                    device float *q_probs [[buffer(4)]],
+                                    device float *confidence [[buffer(5)]],
+                                    device const DraftLaneParams *lane_params [[buffer(6)]],
+                                    device const uint *num_tokens [[buffer(7)]],
                                     uint batch [[thread_position_in_grid]]) {
   constexpr ulong Positions = SELECT_POSITIONS, Shards = SELECT_SHARDS, Candidates = K;
   const uint lanes = num_tokens[0] / SELECT_ROWS;
@@ -390,7 +390,6 @@ template <typename T>
   unary += batch * Positions * Candidates;
   device const float *tables =
       partial_values + lanes * Positions * Shards * Candidates + batch * Positions * Candidates * Candidates;
-  uniforms += batch * DRAFT_SAMPLING_UNIFORMS;
   tokens += batch * Positions;
   q_probs += batch * Positions * Candidates;
   confidence += batch * Positions;
@@ -423,13 +422,15 @@ template <typename T>
         q_probs[position * Candidates + i] = probability;
         sum += probability;
       }
+      const float uniform =
+          draft_uniform(lp.seed_lo, lp.seed_hi, lp.position, DRAFT_UNIFORM_PROPOSALS + position);
       float cumulative = 0.0f;
       selected = Candidates - 1;
       for (uint i = 0; i < Candidates; ++i) {
         float probability = q_probs[position * Candidates + i] / sum;
         q_probs[position * Candidates + i] = probability;
         cumulative += probability;
-        if (selected == Candidates - 1 && cumulative > uniforms[DRAFT_UNIFORM_PROPOSALS + position]) {
+        if (selected == Candidates - 1 && cumulative > uniform) {
           selected = i;
         }
       }

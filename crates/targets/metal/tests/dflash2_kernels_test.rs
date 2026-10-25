@@ -15,8 +15,9 @@ use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
 use scratchy_target_metal::dflash2::{
-    ATTENTION_SPLITS, BUDGET_LANES, CANDIDATES, DraftLaneParams, EDGE_THREADS, PROPOSALS,
-    SAMPLING_SHARDS, SAMPLING_UNIFORMS, VERIFY_COST_SEED, VerifyCost, VerifyLane, VerifyRows,
+    ATTENTION_SPLITS, BUDGET_LANES, CANDIDATES, DraftLaneParams, DraftSeed, EDGE_THREADS,
+    PROPOSALS, SAMPLING_SHARDS, UNIFORM_ACCEPTANCE, UNIFORM_PROPOSALS, VERIFY_COST_SEED,
+    VerifyCost, VerifyLane, VerifyRows, draft_uniform,
 };
 use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
 use scratchy_target_metal::specialized_pipeline_cache::{
@@ -953,7 +954,6 @@ struct Selector {
     successor: Buffer,
     input_ids: Buffer,
     num_tokens: Buffer,
-    uniforms: Buffer,
     tokens: Buffer,
     q_probs: Buffer,
     confidence: Buffer,
@@ -1012,12 +1012,11 @@ impl Selector {
                 (&self.candidates, 0),
                 (&self.unary, 1),
                 (&self.partial_values, 2),
-                (&self.uniforms, 3),
-                (&self.tokens, 4),
-                (&self.q_probs, 5),
-                (&self.confidence, 6),
-                (&self.lane_params, 7),
-                (&self.num_tokens, 8),
+                (&self.tokens, 3),
+                (&self.q_probs, 4),
+                (&self.confidence, 5),
+                (&self.lane_params, 6),
+                (&self.num_tokens, 7),
             ],
             &[],
             &[],
@@ -1052,7 +1051,6 @@ fn selector_buffers(
     hidden: &[u16],
     codebooks: &Codebooks,
     anchors: &[u32],
-    uniforms: &[f32],
     params: &[DraftLaneParams],
 ) -> Selector {
     let lanes = anchors.len();
@@ -1073,7 +1071,6 @@ fn selector_buffers(
         successor: gpu.buffer(&codebooks.successor),
         input_ids: gpu.buffer(&input_ids),
         num_tokens: gpu.buffer(&[rows as u32]),
-        uniforms: gpu.buffer(uniforms),
         tokens: gpu.buffer(&vec![0u32; lanes * P]),
         q_probs: gpu.buffer(&vec![0.0f32; candidates]),
         confidence: gpu.buffer(&vec![0.0f32; lanes * P]),
@@ -1103,9 +1100,6 @@ fn select_case(gpu: &Gpu, codebooks: &Codebooks, vocab: u32, lanes: u32, samplin
         fill_row(chunk, pattern, &mut random);
     }
     let hidden = random.bf16s(rows * RANK as usize, 0.1);
-    let uniforms: Vec<f32> = (0..lanes as usize * SAMPLING_UNIFORMS as usize)
-        .map(|_| (random.unit() + 1.0) * 0.5)
-        .collect();
     let anchors: Vec<u32> = (0..lanes).map(|_| random.next() % vocab).collect();
     let temperature = 0.8f32;
     let params: Vec<DraftLaneParams> = (0..lanes)
@@ -1114,11 +1108,11 @@ fn select_case(gpu: &Gpu, codebooks: &Codebooks, vocab: u32, lanes: u32, samplin
             sampling: u32::from(sampling),
             maximum: ROWS,
             remaining: ROWS,
+            seed: DraftSeed::of(u64::from(random.next()) << 32 | u64::from(random.next())),
+            position: random.next() % 100_000,
         })
         .collect();
-    let s = selector_buffers(
-        gpu, &logits, &hidden, codebooks, &anchors, &uniforms, &params,
-    );
+    let s = selector_buffers(gpu, &logits, &hidden, codebooks, &anchors, &params);
     s.run(gpu, vocab, lanes);
 
     let n = lanes as usize * P * K;
@@ -1177,7 +1171,8 @@ fn select_case(gpu: &Gpu, codebooks: &Codebooks, vocab: u32, lanes: u32, samplin
                     .map(|s| ((s - maximum) / f64::from(temperature)).exp())
                     .collect();
                 let sum: f64 = reference.iter().sum();
-                let uniform = uniforms[lane * SAMPLING_UNIFORMS as usize + 1 + position];
+                let draw = UNIFORM_PROPOSALS + position as u32;
+                let uniform = draft_uniform(params[lane].seed, params[lane].position, draw);
                 let mut cumulative = [0.0f64; K];
                 let mut expected_selection = K - 1;
                 for r in 0..K {
@@ -1239,10 +1234,10 @@ fn draft_selector_matches_reference() {
     }
 }
 
-/// `confidenceIgnoresDraws`: runs differing only in one position's proposal uniform write the same
-/// confidences up to that position and the same proposals before it, while (over flat candidate
-/// scores) drawing different proposals there — so whether a row is verified never depends on its
-/// own draw.
+/// `confidenceIgnoresDraws`: runs of other seeds — their proposals' uniforms all others
+/// (`draft_uniform`) — that drew the same proposals before a position write the same confidences up
+/// to it, while (over flat candidate scores) drawing different proposals — so whether a row is
+/// verified never depends on its own draw. And one seed draws what it drew.
 #[test]
 fn draft_confidence_ignores_draws() {
     let Some(gpu) = Gpu::new() else { return };
@@ -1254,36 +1249,44 @@ fn draft_confidence_ignores_draws() {
     }
     let hidden = random.bf16s(ROWS as usize * RANK as usize, 0.1);
     let codebooks = Codebooks::new(vocab);
-    let params = [DraftLaneParams {
-        temperature: 1.0,
-        sampling: 1,
-        maximum: ROWS,
-        remaining: ROWS,
-    }];
-    let run = |position: usize, uniform: f32| {
-        let mut uniforms = vec![0.5f32; SAMPLING_UNIFORMS as usize];
-        uniforms[1 + position] = uniform;
-        let s = selector_buffers(&gpu, &logits, &hidden, &codebooks, &[7], &uniforms, &params);
+    let run = |seed: u64| {
+        let params = [DraftLaneParams {
+            temperature: 1.0,
+            sampling: 1,
+            maximum: ROWS,
+            remaining: ROWS,
+            seed: DraftSeed::of(seed),
+            position: 4096,
+        }];
+        let s = selector_buffers(&gpu, &logits, &hidden, &codebooks, &[7], &params);
         s.run(&gpu, vocab, 1);
         (read::<u32>(&s.tokens, P), read::<f32>(&s.confidence, P))
     };
+    let runs: Vec<_> = (0..12u64)
+        .map(|seed| run(seed * 0x5851_f42d_4c95_7f2d))
+        .collect();
+    assert_eq!(
+        run(0),
+        runs[0],
+        "a seed drew other proposals at the same position"
+    );
     let mut redrawn = 0;
-    for position in 0..P {
-        let (low_tokens, low_confidence) = run(position, 0.05);
-        let (high_tokens, high_confidence) = run(position, 0.95);
-        assert_eq!(
-            low_confidence[..=position],
-            high_confidence[..=position],
-            "a draw changed the confidence at or before its position"
-        );
-        assert_eq!(
-            low_tokens[..position],
-            high_tokens[..position],
-            "a draw changed the proposals before its position"
-        );
-        redrawn += usize::from(low_tokens[position] != high_tokens[position]);
+    for (a, (a_tokens, a_confidence)) in runs.iter().enumerate() {
+        for (b_tokens, b_confidence) in &runs[a + 1..] {
+            let agree = (0..P).find(|&p| a_tokens[p] != b_tokens[p]);
+            let through = agree.map_or(P, |p| p + 1);
+            assert_eq!(
+                a_confidence[..through],
+                b_confidence[..through],
+                "a draw changed the confidence at or before its position"
+            );
+            redrawn += usize::from(agree.is_some());
+        }
     }
-    assert!(redrawn >= 5, "the uniforms redrew only {redrawn} proposals");
+    assert!(
+        redrawn >= 30,
+        "other seeds redrew only {redrawn} of 66 pairs' proposals"
+    );
 }
 
 /// `verifyRowsChoice`: for random confidences (with exact 0 and 1), acceptance models, costs
@@ -1323,10 +1326,9 @@ fn draft_verify_rows_choose_the_best_assignment() {
             let maxima: Vec<u32> = (0..lanes).map(|_| 1 + random.next() % ROWS).collect();
             let params: Vec<DraftLaneParams> = (maxima.iter())
                 .map(|&maximum| DraftLaneParams {
-                    temperature: 0.0,
-                    sampling: 0,
                     maximum,
                     remaining: ROWS,
+                    ..DraftLaneParams::default()
                 })
                 .collect();
             let (b_q, b_params) = (gpu.buffer(&q), gpu.buffer(&params));
@@ -1408,7 +1410,7 @@ const STOP: u32 = 248_044;
 
 /// One acceptance's buffers: each lane's `VerifyLane`, its drafts (`[lanes, proposals]`), the
 /// step's target tokens, and a sampled lane's candidates, their probabilities, its verify rows'
-/// target probabilities of their drafts (`TargetVocabularyRow`'s last word) and its uniforms.
+/// target probabilities of their drafts (`TargetVocabularyRow`'s last word).
 struct Acceptance {
     lanes: Vec<VerifyLane>,
     drafted: Vec<u32>,
@@ -1416,7 +1418,6 @@ struct Acceptance {
     draft_ids: Vec<u32>,
     draft_probs: Vec<f32>,
     target_rows: Vec<[u32; 4]>,
-    uniforms: Vec<f32>,
 }
 
 /// What an acceptance left: each lane's retained rows and accepted drafts, its next block's ids
@@ -1439,7 +1440,6 @@ impl Acceptance {
             draft_ids: vec![u32::MAX; candidates],
             draft_probs: vec![0.0; candidates],
             target_rows: vec![[0; 4]; lanes * ROWS as usize],
-            uniforms: vec![0.0; lanes * SAMPLING_UNIFORMS as usize],
         }
     }
 
@@ -1462,7 +1462,7 @@ impl Acceptance {
         let (b_ids, b_positions) = (gpu.buffer(&block), gpu.buffer(&block));
         let (b_draft_ids, b_draft_probs) =
             (gpu.buffer(&self.draft_ids), gpu.buffer(&self.draft_probs));
-        let (b_rows, b_uniforms) = (gpu.buffer(&self.target_rows), gpu.buffer(&self.uniforms));
+        let b_rows = gpu.buffer(&self.target_rows);
         let mut batch = gpu.batch();
         batch.encode(
             &pso,
@@ -1477,7 +1477,6 @@ impl Acceptance {
                 (&b_draft_ids, 7),
                 (&b_draft_probs, 8),
                 (&b_rows, 9),
-                (&b_uniforms, 10),
             ],
             &[],
             &[],
@@ -1614,28 +1613,35 @@ fn draft_acceptance_retains_what_splash_retains() {
 /// row's target probability of it, keeps its target's draws past the accepted rows, and retains the
 /// correction: a lane rejecting its fourth draft, one rejecting its first, one whose draft is not
 /// among its candidates (accepted whenever its target gives it any probability), one accepting
-/// every draft and keeping the bonus draw, and a greedy lane beside them.
+/// every draft and keeping the bonus draw, and a greedy lane beside them. Draft `j`'s uniform is
+/// its step's draw `UNIFORM_ACCEPTANCE + j` of its seed and position (`draft_uniform`), and each
+/// target probability sits a float either side of that uniform times the draft's probability: a
+/// uniform other than Splash's draw flips verdicts.
 #[test]
 fn sampled_acceptance_tests_each_draft_against_its_target_probability() {
     let Some(gpu) = Gpu::new() else { return };
-    // Per sampled lane, per draft: (q, p, u), accepted iff u · q < p.
-    let lanes: [&[(f32, f32, f32)]; 4] = [
-        &[
-            (0.5, 0.4, 0.7),
-            (0.9, 0.2, 0.1),
-            (0.3, 0.3, 0.9),
-            (0.6, 0.1, 0.5),
-        ],
-        &[(0.8, 0.1, 0.5), (0.5, 0.5, 0.0)],
-        &[(0.0, 0.2, 0.9), (0.4, 0.0, 0.1)],
-        &[(0.2, 0.3, 0.9), (0.7, 0.6, 0.8), (0.1, 0.2, 0.0)],
+    // Per sampled lane, per draft: (q, accepted).
+    let lanes: [&[(f32, bool)]; 4] = [
+        &[(0.5, true), (0.9, true), (0.3, true), (0.6, false)],
+        &[(0.8, false), (0.5, true)],
+        &[(0.0, true), (0.4, false)],
+        &[(0.2, true), (0.7, true), (0.1, true)],
     ];
     let want_accepted = [3u32, 0, 1, 3];
     let mut a = Acceptance::of(lanes.len() + 1);
     for (lane, draws) in lanes.iter().enumerate() {
         let first = a.tokens.len() as u32;
-        let uniforms = lane * SAMPLING_UNIFORMS as usize;
-        for (j, &(q, p, u)) in draws.iter().enumerate() {
+        let (seed, position) = (
+            DraftSeed::of(0x9e37 + 77 * lane as u64),
+            300 * lane as u32 + 11,
+        );
+        for (j, &(q, accept)) in draws.iter().enumerate() {
+            let u = draft_uniform(seed, position, UNIFORM_ACCEPTANCE + j as u32);
+            // The least target probability above u · q accepts; u · q itself rejects.
+            let p = match accept {
+                true => f32::from_bits((u * q).to_bits() + 1).max(f32::MIN_POSITIVE),
+                false => u * q,
+            };
             let draft = 2000 + 100 * lane as u32 + j as u32;
             a.drafted[lane * P + j] = draft;
             let candidates = (lane * P + j) * CANDIDATES as usize;
@@ -1649,20 +1655,19 @@ fn sampled_acceptance_tests_each_draft_against_its_target_probability() {
                 a.draft_probs[at] = q;
             }
             a.target_rows[lane * ROWS as usize + j][3] = p.to_bits();
-            // DRAFT_UNIFORM_ACCEPTANCE + j.
-            a.uniforms[uniforms + 1 + P + j] = u;
             a.tokens.push(7000 + 100 * lane as u32 + j as u32);
         }
         a.tokens.push(7000 + 100 * lane as u32 + draws.len() as u32);
         a.lanes.push(VerifyLane {
             sampled: first,
             drafts: draws.len() as u32,
-            position: 300 * lane as u32 + 11,
+            position,
             remaining: 8,
             stop: [STOP, 248_046],
             sampling: 1,
             temperature: 1.0,
             top_p: 1.0,
+            seed,
             ..VerifyLane::default()
         });
     }
