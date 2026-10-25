@@ -141,8 +141,10 @@ impl Weights {
         }
     }
 
-    /// Splash's tile-major image (metal/abi/QuantFormat.h): a 64-column tile's group of 32 is its columns' 16
-    /// code bytes side by side, and its 64-group meta unit their (scale, bias) pairs.
+    /// Splash's af4g64 image (metal/abi/QuantFormat.h): a 64-column tile's group of 32 is its columns' 16 code
+    /// bytes side by side, word c holding chunk c's pairs (pair p: elements e0 = 16 (p >> 1) + 4c + 2 (p & 1) and
+    /// e0 + 1, at bits 4p and 16 + 4p), and its 64-group meta unit their (scale, bias) pairs. The codes as they are,
+    /// not offset-8.
     fn planes(&self, n: usize, k: usize) -> (Vec<u32>, Vec<u32>) {
         let (steps, kg) = (k / 32, k / GROUP);
         let mut codes = vec![0u32; n * k / 8];
@@ -151,7 +153,13 @@ impl Weights {
             let (tile, col) = (c / TILE, c % TILE);
             for g in 0..steps {
                 let at = ((tile * steps + g) * TILE + col) * 4;
-                codes[at..at + 4].copy_from_slice(&self.packed[c * k / 8 + g * 4..][..4]);
+                let group = &self.codes[c * k + g * 32..][..32];
+                for (chunk, word) in codes[at..at + 4].iter_mut().enumerate() {
+                    *word = (0..4).fold(0u32, |w, p| {
+                        let e0 = 16 * (p >> 1) + 4 * chunk + 2 * (p & 1);
+                        w | (group[e0] as u32) << (4 * p) | (group[e0 + 1] as u32) << (16 + 4 * p)
+                    });
+                }
             }
             for u in 0..kg {
                 meta[(tile * kg + u) * TILE + col] =
@@ -666,6 +674,529 @@ fn staged_tiles_on_a_chip_emulated_by_width() {
             println!(
                 "    {:<10} {:8.1} {:8.1} {:8.1}",
                 cell.tag,
+                s[0],
+                s[s.len() / 2],
+                s[s.len() - 1]
+            );
+        }
+    }
+}
+
+/// Splash's documented 40-core wins, reproduced by the port on a chip emulated by width (LinearGguf.cpp:79):
+/// - one-pass gate/up against Splash's two passes (a gate pass, a barrier, an up pass), on the 27B's pair
+///   (17408 x 5120, "8-9% less time in MLX 4-bit", :370-378) and the pairs this model runs;
+/// - spread on against off (gguf_staged_tile.h:45-54; "4-10% faster end to end on a 40-core M5 Max", :361-369),
+///   per projection.
+///
+/// All on Splash's planes, the 40-core plan's splits, µs a dispatch (min / median / max). NAX only.
+#[test]
+#[ignore = "measurement probe, not an assertion: run with --ignored --nocapture"]
+fn staged_fidelity_on_a_chip_emulated_by_width() {
+    let Some((device, cache)) = nax() else {
+        return;
+    };
+    let cores = scratchy_target_metal::device::gpu_cores(&device)
+        .expect("the device's GPU cores")
+        .get() as usize;
+    let width = EMULATED / cores;
+    let bucket = 8;
+    println!(
+        "µs a dispatch, min/median/max of {ROUNDS} rounds, bucket {bucket}, Splash's planes, a {EMULATED}-core \
+         chip emulated by width on {cores} cores (columns / {width})"
+    );
+    let mut rng = Rng(11);
+    let x = shared(&device, &bf16_rows(&mut rng, 16 * 17408));
+    let measure =
+        |cells: &[(String, Vec<Dispatch>, usize)], weights: &[Vec<[Buffer; 3]>], n: usize| {
+            let copies = weights.len();
+            let outs = [
+                shared(&device, &vec![0u16; 16 * n]),
+                shared(&device, &vec![0u16; 16 * n]),
+            ];
+            let partials = shared(&device, &vec![0f32; 2 * 8 * 16 * n]);
+            let counters = shared(&device, &vec![0u32; 2 * n / PAIR_TILE]);
+            let time = |dispatches: &[Dispatch], iters: usize| {
+                let mut batch = Mtl4DispatchBatch::begin(&device).expect("mtl4 batch");
+                for i in 0..iters {
+                    let copy = &weights[i % copies];
+                    for (d, dispatch) in dispatches.iter().enumerate() {
+                        let Dispatch {
+                            pso,
+                            grid,
+                            threads,
+                            binds,
+                        } = dispatch;
+                        let (grid, threads) = (size(grid.0, grid.1), size(threads.0, threads.1));
+                        match *binds {
+                            Binds::Planes(t) | Binds::Mlx(t) => {
+                                let [w, s, b] = &copy[t];
+                                let binds = [
+                                    (w, 0),
+                                    (s, 1),
+                                    (b, 2),
+                                    (&x, 3),
+                                    (&outs[t], 4),
+                                    (&partials, 5),
+                                    (&counters, 6),
+                                ];
+                                batch.encode(pso, &binds, &[], &[], &[], grid, threads);
+                            }
+                            Binds::PairPlanes | Binds::PairMlx => {
+                                let ([gw, gs, gb], [uw, us, ub]) = (&copy[0], &copy[1]);
+                                let binds = [
+                                    (gw, 0),
+                                    (gs, 1),
+                                    (gb, 2),
+                                    (uw, 3),
+                                    (us, 4),
+                                    (ub, 5),
+                                    (&x, 6),
+                                    (&outs[0], 7),
+                                    (&partials, 8),
+                                    (&counters, 9),
+                                ];
+                                batch.encode(pso, &binds, &[], &[], &[], grid, threads);
+                            }
+                        }
+                        // Splash's serial encoder: every dispatch waits for the one before.
+                        if d + 1 < dispatches.len() {
+                            batch.barrier();
+                        }
+                    }
+                    batch.barrier();
+                }
+                let t0 = std::time::Instant::now();
+                batch.commit(true);
+                t0.elapsed().as_secs_f64() * 1e6 / iters as f64
+            };
+            let mut samples = vec![Vec::new(); cells.len()];
+            for round in 0..=ROUNDS {
+                for (s, (_, dispatches, iters)) in samples.iter_mut().zip(cells) {
+                    let us = time(dispatches, *iters);
+                    if round > 0 {
+                        s.push(us);
+                    }
+                }
+            }
+            for ((tag, _, _), s) in cells.iter().zip(&mut samples) {
+                s.sort_by(f64::total_cmp);
+                println!(
+                    "    {tag:<22} {:8.1} {:8.1} {:8.1}",
+                    s[0],
+                    s[s.len() / 2],
+                    s[s.len() - 1]
+                );
+            }
+        };
+    // One-pass against two passes.
+    for (name, full_n, k) in [
+        ("27B gate|up", 17408usize, 5120usize),
+        ("shared gate|up", 512, 2048),
+        ("drafter gate|up", 6144, 2048),
+    ] {
+        let n = full_n / width;
+        let bytes = 2 * n * k / 2;
+        let copies = ROTATED_BYTES / bytes + 1;
+        let iters = (BATCH_BYTES / bytes).clamp(*ITERS.start(), *ITERS.end());
+        let weights: Vec<Vec<[Buffer; 3]>> = (0..copies)
+            .map(|_| {
+                (0..2)
+                    .map(|_| Weights::random(&mut rng, n, k).bind(&device, n, k, true))
+                    .collect()
+            })
+            .collect();
+        let pair_splits = decode_splits(2 * full_n, k, EMULATED);
+        let one_splits = decode_splits(full_n, k, EMULATED);
+        let gate_up = staged(&cache, "gate_up", (k, n), bucket, true, true);
+        let decode = staged(&cache, "decode", (k, n), bucket, true, true);
+        let pass = |t| Dispatch {
+            pso: decode.clone(),
+            grid: (n / TILE, one_splits),
+            threads: (64, 1),
+            binds: Binds::Planes(t),
+        };
+        let cells = vec![
+            (
+                format!("one pass /{pair_splits}"),
+                vec![Dispatch {
+                    pso: gate_up,
+                    grid: (n / PAIR_TILE, pair_splits),
+                    threads: (32, 1),
+                    binds: Binds::PairPlanes,
+                }],
+                iters,
+            ),
+            (
+                format!("two passes /{one_splits}"),
+                vec![pass(0), pass(1)],
+                iters,
+            ),
+        ];
+        println!("{name} ({full_n} x {k}, emulated {n} x {k}):");
+        measure(&cells, &weights, n);
+    }
+    // Spread on against off.
+    for (name, full_n, k) in [
+        ("lm_head", 248320usize, 2048usize),
+        ("gdn qkv / attn q", 8192, 2048),
+        ("gdn z", 4096, 2048),
+        ("drafter qkv", 6144, 2048),
+        ("27B gate", 17408, 5120),
+        ("27B down", 5120, 17408),
+    ] {
+        let n = full_n / width;
+        let bytes = n * k / 2;
+        let copies = ROTATED_BYTES / bytes + 1;
+        let iters = (BATCH_BYTES / bytes).clamp(*ITERS.start(), *ITERS.end());
+        let weights: Vec<Vec<[Buffer; 3]>> = (0..copies)
+            .map(|_| vec![Weights::random(&mut rng, n, k).bind(&device, n, k, true)])
+            .collect();
+        let splits = decode_splits(full_n, k, EMULATED);
+        let cell = |spread: bool| {
+            (
+                format!("spread {} /{splits}", if spread { "on" } else { "off" }),
+                vec![Dispatch {
+                    pso: staged(&cache, "decode", (k, n), bucket, true, spread),
+                    grid: (n / TILE, splits),
+                    threads: (64, 1),
+                    binds: Binds::Planes(0),
+                }],
+                iters,
+            )
+        };
+        println!("{name} ({full_n} x {k}, emulated {n} x {k}):");
+        measure(&[cell(true), cell(false)], &weights, n);
+    }
+}
+
+/// The register tile's pipelines (`affine_register.metal`) at `rows` step rows: the Table16 prepare and the decode of
+/// `lanes` eight-row lanes, its result added into the residual its output holds when `residual`.
+fn register(
+    cache: &SpecializedPipelineCache,
+    (k, n): (usize, usize),
+    rows: usize,
+    residual: bool,
+) -> (Pipeline, Pipeline) {
+    let consts = |residual: bool| {
+        vec![
+            ConstantValue::int(0, k as i32),
+            ConstantValue::int(1, n as i32),
+            ConstantValue::int(2, rows as i32),
+            ConstantValue::boolean(3, residual),
+        ]
+    };
+    let lanes = rows.div_ceil(8);
+    let decode: &'static str = format!("affine_register_decode_bf16_l_{lanes}").leak();
+    let prepare = "affine_register_prepare_bf16";
+    (
+        baked_build(
+            cache,
+            &PipelineKey::new("affine_register", prepare, consts(false)),
+        )
+        .expect(prepare),
+        baked_build(
+            cache,
+            &PipelineKey::new("affine_register", decode, consts(residual)),
+        )
+        .expect(decode),
+    )
+}
+
+/// Table16's bytes for `lanes` eight-row lanes of `k` inputs: the table, then the sums (gguf_sgmatrix.h).
+fn table16_bytes(k: usize, lanes: usize) -> (usize, usize) {
+    let sums_per_tile = k / 16 * 8 + k / 32 * 8;
+    (lanes * k * 8 * 2, lanes * sums_per_tile * 4)
+}
+
+#[test]
+fn register_tile_matches_the_reference_at_every_split() {
+    let Some((device, cache)) = nax() else {
+        return;
+    };
+    for (n, k, rows) in [
+        (128, 2048, 3),
+        (256, 4096, 8),
+        (64, 1024, 11),
+        (192, 2048, 1),
+    ] {
+        let mut rng = Rng(0x7e9 ^ (n * 31 + k) as u64);
+        let w = Weights::random(&mut rng, n, k);
+        let x = bf16_rows(&mut rng, rows * k);
+        let want = w.reference(&x, rows, n, k);
+        let residual: Vec<u16> = bf16_rows(&mut rng, rows * n);
+        let xb = shared(&device, &x);
+        let (codes, meta) = w.planes(n, k);
+        let (cb, mb) = (shared(&device, &codes), shared(&device, &meta));
+        let lanes = rows.div_ceil(8);
+        let (table_bytes, sums_bytes) = table16_bytes(k, lanes);
+        let table = shared(&device, &vec![0u8; table_bytes]);
+        let sums = shared(&device, &vec![0u8; sums_bytes]);
+        for residual_end in [false, true] {
+            let (prepare, decode) = register(&cache, (k, n), rows, residual_end);
+            for splits in [1usize, 2, 4, 8] {
+                if (k / 256) % splits != 0 {
+                    continue;
+                }
+                let y = shared(&device, &residual);
+                let partials = shared(&device, &vec![0f32; lanes * splits * 8 * n]);
+                let counters = shared(&device, &vec![0u32; n / TILE]);
+                let mut batch = Mtl4DispatchBatch::begin(&device).expect("mtl4");
+                batch.encode(
+                    &prepare,
+                    &[(&xb, 0), (&table, 1), (&sums, 2)],
+                    &[],
+                    &[],
+                    &[],
+                    size(k / 32, lanes),
+                    size(128, 1),
+                );
+                batch.barrier();
+                let binds = [
+                    (&table, 0),
+                    (&sums, 1),
+                    (&cb, 2),
+                    (&mb, 3),
+                    (&y, 4),
+                    (&partials, 5),
+                    (&counters, 6),
+                ];
+                batch.encode(
+                    &decode,
+                    &binds,
+                    &[],
+                    &[],
+                    &[],
+                    size(n / TILE, splits),
+                    size(128, 1),
+                );
+                batch.commit(true);
+                let want: Vec<f32> = match residual_end {
+                    false => want.clone(),
+                    true => (want.iter().zip(&residual))
+                        .map(|(&v, &r)| v + bf16::from_bits(r).to_f32())
+                        .collect(),
+                };
+                let worst = worst(&read_bf16(&y, rows * n), &want);
+                assert!(
+                    worst < 1.0 / 64.0,
+                    "n {n} k {k} rows {rows} splits {splits} residual {residual_end}: worst relative \
+                     error {worst}"
+                );
+                assert!(counters_zero(&counters, n / TILE), "a counter left nonzero");
+            }
+        }
+    }
+}
+
+/// Splash's K split rule with its register tile's tiers (LinearGguf.cpp:56-72 `kRegisterTiers`): four threadgroups
+/// a core with 256 inputs a partition, 32 with 1024, and sixteen partitions while three a core keep 512.
+fn register_splits(n: usize, k: usize, cores: usize) -> usize {
+    let tiers = [(4, 256, 8), (32, 1024, 8), (3, 512, 16)];
+    let grid = n / TILE;
+    let mut splits = 1;
+    let asks = |splits: usize| {
+        tiers.iter().any(|&(tgs, inputs, cap)| {
+            splits < cap && grid * splits < tgs * cores && k / (2 * splits) >= inputs
+        })
+    };
+    while (k / 32).is_multiple_of(2 * splits) && asks(splits) {
+        splits *= 2;
+    }
+    splits
+}
+
+/// µs a dispatch (min / median / max over `ROUNDS` alternating rounds), DRAM-cold, at bucket 8 on a chip of
+/// `EMULATED` cores emulated by width, for the projections Splash's 40-core plan runs on the register tile
+/// (`apple10Registers`): the wide matvec (w) and the small-M twin (t) against the register tile's decode at the
+/// emulated chip's split (r), and with its Table16 prepare a barrier before it (r+p; in the cycle the norm before a
+/// projection writes the table). NAX only.
+#[test]
+#[ignore = "measurement probe, not an assertion: run with --ignored --nocapture"]
+fn register_tile_on_a_chip_emulated_by_width() {
+    use scratchy_target_metal::quantized::{
+        DequantDtype, SMALL_M_SIMDGROUPS, SMALL_M_TILE_COLS, ScaleDtype, SmallMTile,
+        small_m_kernel_static_name,
+    };
+    use scratchy_target_metal::tape::ids::{KDimI32, MDimI32, NDimI32};
+    use scratchy_target_metal::tape::kernel_constants::{
+        AffineCodes, AffineQmmTConstants, AffineQmvWideConstants,
+    };
+    use scratchy_target_metal::tape::quantized::{
+        pick_qmv_kernel_wide, qmv_dispatch_shape, qmv_kernel_static_name,
+    };
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    if !is_nax_capable(di.profile.generation) {
+        eprintln!("skipping: no NAX matrix unit");
+        return;
+    }
+    let device = di.device.clone();
+    let cores = scratchy_target_metal::device::gpu_cores(&device)
+        .expect("the device's GPU cores")
+        .get() as usize;
+    let width = EMULATED / cores;
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
+    let codes = AffineCodes::of(Some(&di.profile), 4);
+    let bucket = 8u32;
+    println!(
+        "µs a dispatch, min/median/max of {ROUNDS} rounds, bucket {bucket}, a {EMULATED}-core chip emulated by \
+         width on {cores} cores (columns / {width})"
+    );
+    let mut rng = Rng(13);
+    for (name, full_n, k) in [
+        ("out_proj", 2048usize, 4096usize),
+        ("shared down", 2048, 512),
+        ("drafter down", 2048, 6144),
+        ("drafter conv proj", 512, 2048),
+        ("shared gate (each of the pair)", 512, 2048),
+        ("drafter o", 2048, 4096),
+    ] {
+        let n = full_n / width;
+        let bytes = n * k / 2;
+        let copies = ROTATED_BYTES / bytes + 1;
+        let iters = (BATCH_BYTES / bytes).clamp(*ITERS.start(), *ITERS.end());
+        // Per copy: MLX planes (offset-8 codes, as the tape stores them) and Splash's af4g64 planes.
+        let weights: Vec<([Buffer; 3], [Buffer; 3])> = (0..copies)
+            .map(|_| {
+                let w = Weights::random(&mut rng, n, k);
+                (w.bind(&device, n, k, false), w.bind(&device, n, k, true))
+            })
+            .collect();
+        let x = shared(&device, &bf16_rows(&mut rng, 16 * k));
+        let y = shared(&device, &vec![0u16; 16 * n]);
+        let lanes = 1;
+        let (table_bytes, sums_bytes) = table16_bytes(k, lanes);
+        let table = shared(&device, &vec![0u8; table_bytes]);
+        let sums = shared(&device, &vec![0u8; sums_bytes]);
+        let splits = register_splits(full_n, k, EMULATED);
+        let partials = shared(&device, &vec![0f32; lanes * 16 * 8 * n]);
+        let counters = shared(&device, &vec![0u32; n / TILE]);
+        let kernel = pick_qmv_kernel_wide(n as u32, k as u32, 4, bucket, true);
+        let wide_name = qmv_kernel_static_name(
+            kernel,
+            DequantDtype::Bf16,
+            ScaleDtype::Bf16,
+            4,
+            GROUP as u32,
+        );
+        let mn = (KDimI32(k as i32), NDimI32(n as i32), MDimI32(bucket as i32));
+        let wide_constants: Vec<ConstantValue> = AffineQmvWideConstants {
+            k: mn.0,
+            n: mn.1,
+            m: mn.2,
+            codes,
+        }
+        .into();
+        let wide = baked_build(
+            &cache,
+            &PipelineKey::new("quantized_qmv", wide_name, wide_constants),
+        )
+        .expect(wide_name);
+        let ((wgx, wgy, _), (wtx, wty, _)) = qmv_dispatch_shape(kernel, bucket, n as u32, 1);
+        let tile = SmallMTile::for_bucket(bucket).expect("a small-M bucket");
+        let twin_name =
+            small_m_kernel_static_name(DequantDtype::Bf16, ScaleDtype::Bf16, GROUP as u32, tile);
+        let twin_constants: Vec<ConstantValue> = AffineQmmTConstants {
+            k: mn.0,
+            n: mn.1,
+            m: mn.2,
+            codes,
+        }
+        .into();
+        let twin = baked_build(
+            &cache,
+            &PipelineKey::new("quantized_qmm_nax", twin_name, twin_constants),
+        )
+        .expect(twin_name);
+        let (prepare, decode) = register(&cache, (k, n), bucket as usize, false);
+        // 0 wide, 1 twin, 2 register, 3 register with its prepare.
+        let time = |cell: usize| {
+            let mut batch = Mtl4DispatchBatch::begin(&device).expect("mtl4 batch");
+            for i in 0..iters {
+                let (mlx, planes) = &weights[i % copies];
+                match cell {
+                    0 | 1 => {
+                        let [w, s, b] = mlx;
+                        let binds = [(w, 0), (s, 1), (b, 2), (&x, 3), (&y, 4)];
+                        let (pso, grid, threads) = match cell {
+                            0 => (
+                                &wide,
+                                size(wgx as usize, wgy as usize),
+                                size(wtx as usize, wty as usize),
+                            ),
+                            _ => (
+                                &twin,
+                                size(n / SMALL_M_TILE_COLS as usize, 1),
+                                size(32 * SMALL_M_SIMDGROUPS as usize, 1),
+                            ),
+                        };
+                        batch.encode(pso, &binds, &[], &[], &[], grid, threads);
+                    }
+                    _ => {
+                        if cell == 3 {
+                            batch.encode(
+                                &prepare,
+                                &[(&x, 0), (&table, 1), (&sums, 2)],
+                                &[],
+                                &[],
+                                &[],
+                                size(k / 32, lanes),
+                                size(128, 1),
+                            );
+                            batch.barrier();
+                        }
+                        let [w0, meta, _] = planes;
+                        let binds = [
+                            (&table, 0),
+                            (&sums, 1),
+                            (w0, 2),
+                            (meta, 3),
+                            (&y, 4),
+                            (&partials, 5),
+                            (&counters, 6),
+                        ];
+                        batch.encode(
+                            &decode,
+                            &binds,
+                            &[],
+                            &[],
+                            &[],
+                            size(n / TILE, splits),
+                            size(128, 1),
+                        );
+                    }
+                }
+                batch.barrier();
+            }
+            let t0 = std::time::Instant::now();
+            batch.commit(true);
+            t0.elapsed().as_secs_f64() * 1e6 / iters as f64
+        };
+        let tags = [
+            "8w".to_string(),
+            "8t".to_string(),
+            format!("8r/{splits}"),
+            format!("8r+p/{splits}"),
+        ];
+        let mut samples = vec![Vec::new(); tags.len()];
+        for round in 0..=ROUNDS {
+            for (cell, s) in samples.iter_mut().enumerate() {
+                let us = time(cell);
+                if round > 0 {
+                    s.push(us);
+                }
+            }
+        }
+        println!(
+            "{name} ({full_n} x {k}, emulated {n} x {k}, {:.2} MB):",
+            bytes as f64 / 1e6
+        );
+        for (tag, s) in tags.iter().zip(&mut samples) {
+            s.sort_by(f64::total_cmp);
+            println!(
+                "    {tag:<10} {:8.1} {:8.1} {:8.1}",
                 s[0],
                 s[s.len() / 2],
                 s[s.len() - 1]
