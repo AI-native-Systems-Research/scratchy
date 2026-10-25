@@ -5,11 +5,11 @@
 // `gguf_staged_steps`, `StagedColumn`, `gguf_staged_pair_steps`; kernels/common/split_reduce.h), over MLX-affine
 // 4-bit weights. With these changes, and no other:
 //
-//   - The weights are read either as MLX keeps them (codes `[N][K/8]` u32, scales and biases `[N][K/G]`) or, with
-//     PLANES, as Splash's tile-major image (metal/abi/QuantFormat.h): a 64-column tile's group of 32 is its columns'
-//     16 code bytes side by side, and its meta unit their (scale, bias) bf16 pairs. A group decodes as Splash's
-//     af4g64 (`FmtAffine<4, 2>`) does, value s * code + z in fp32 rounded once to half; codes stored offset-8
-//     (`AffineCodes::Offset8`) are XORed back first.
+//   - The weights are read either as MLX keeps them (codes `[N][K/8]` u32, scales and biases `[N][K/G]`, the codes
+//     offset-8 where `AffineCodes::Offset8` stores them so, XORed back first) or, with PLANES, as Splash's af4g64
+//     image, byte for byte (metal/abi/QuantFormat.h): a 64-column tile's group of 32 is its columns' 16 code bytes
+//     side by side, in lane-owned chunk order, and its meta unit their (scale, bias) bf16 pairs. Either decodes as
+//     Splash's `FmtAffine<4, 2>` does, value s * code + z in fp32 rounded once to half.
 //   - The rows the tile reads are the bucket's (`QMM_M`), bounds-checked by the matmul's dynamic extent: a bucket's
 //     arena holds its own rows, not a tile's (Splash's `LinearPlan::storageRows`).
 //   - The K partitions are the grid's height: the dispatch sets them from the device's GPU cores (Splash's
@@ -85,6 +85,24 @@ inline void affine_dequant32(uint4 packed, float2 meta, threadgroup half *dst) {
   }
 }
 
+// Splash's af4g64 group as its planes hold it (`dequant32` over `FmtQ4K`'s chunks, kernels/common/gguf_staged.h,
+// quant_formats.h `quant_nibble_pairs`): word c holds chunk c's pairs, pair p's e0 at bits 4p and e1 at 16 + 4p;
+// pairs 0, 1 are elements 4c..4c+3 and pairs 2, 3 elements 16+4c..16+4c+3.
+inline void splash_dequant32(uint4 packed, float2 meta, threadgroup half *dst) {
+#pragma unroll
+  for (ushort c = 0; c < 4; ++c) {
+    const uint4 pairs = (uint4(packed[c]) >> uint4(0, 4, 8, 12)) & 0x000F000Fu;
+    half2 v[4];
+#pragma unroll
+    for (ushort p = 0; p < 4; ++p) {
+      const float2 code = float2(as_type<half2>(pairs[p] | 0x64006400u) - half2(1024.0h));
+      v[p] = half2(fma(code, float2(meta.x), float2(meta.y)));
+    }
+    *((threadgroup half4 *)(dst + 4 * c)) = half4(v[0], v[1]);
+    *((threadgroup half4 *)(dst + 16 + 4 * c)) = half4(v[2], v[3]);
+  }
+}
+
 // One column of a tensor as a lane stages it (Splash's `StagedColumn`): where its codes and meta are, the payload of
 // the step it stages next and that step's (scale, bias).
 template <typename S, int G, bool PLANES> struct StagedColumn {
@@ -122,7 +140,10 @@ template <typename S, int G, bool PLANES> struct StagedColumn {
     meta = coefficients(first / kStepsPerGroup);
   }
   // Dequantizes the staged step into the lane's row of `stage`.
-  void stage(threadgroup half *stage, uint lane) thread { affine_dequant32(packed, meta, stage + lane * kStagedStep); }
+  void stage(threadgroup half *stage, uint lane) thread {
+    if (PLANES) splash_dequant32(packed, meta, stage + lane * kStagedStep);
+    else affine_dequant32(packed, meta, stage + lane * kStagedStep);
+  }
   // After `step` is staged: loads `next`'s payload, and its coefficients when it enters a new group.
   void load(uint step, uint next) thread {
     packed = codes(next);
