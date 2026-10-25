@@ -25,7 +25,7 @@ fn embed_request(input: EmbeddingInput) -> EmbeddingRequest {
 }
 
 // ===========================================================================
-// SmolLM-135M-4bit — Tier 1 embedding tests
+// SmolLM2-135M — Tier 1 embedding tests
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread")]
