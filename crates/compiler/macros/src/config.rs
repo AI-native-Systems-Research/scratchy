@@ -602,7 +602,8 @@ fn load_dir_mode(
     // What the heads compiled beside a target config bake into it: the most drafts one of them
     // carries a sequence (its verify steps hold that many), and the layers whose outputs one reads
     // (`target_capture_layers`, its arch.json: a path into its own config), which the target
-    // captures.
+    // captures. A head that does not compile in this build ([`arch_compiled`]: a metal-only
+    // drafter under cuda) bakes nothing into it.
     let head_facts = |stem: &str, json: &serde_json::Value| -> Result<HeadFacts, ConfigError> {
         let mut facts = HeadFacts::default();
         if !mtp_heads || !spec.hf_architectures.is_empty() {
@@ -610,6 +611,10 @@ fn load_dir_mode(
         }
         let this = format!("{arch_name}/{stem}");
         for arch_dir in arch_dirs(configs_root)? {
+            let head_arch = (arch_dir.file_name()).and_then(|n| n.to_str());
+            if !head_arch.is_some_and(arch_compiled) {
+                continue;
+            }
             let head = load_arch_json(&arch_dir)?;
             let configs: Vec<String> = (compiled_head_targets(&head, mtp))
                 .filter(|(_, t)| *t == this)
@@ -1000,6 +1005,55 @@ fn model_configs(dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
 }
 
 /// Every arch dir under `configs/`.
+/// Arches whose emit compiles only under cuda (no metal surface).
+const CUDA_ONLY_ARCHES: &[&str] = &[
+    "deepseek-v2",
+    "deepseek-v3",
+    "deepseek-v3-flat",
+    "gemma3-mm",
+];
+/// Arches whose emit compiles only under metal: no cuda ISel claims for their ops, so under a cuda
+/// build the solver would find tile claims missing and panic.
+const METAL_ONLY_ARCHES: &[&str] = &[
+    "dflash2",
+    "gemma4-assistant",
+    "glm4-moe",
+    "gpt-oss",
+    "nemotron-h",
+    "nemotron-h-latent",
+    "nemotron-h-mtp",
+];
+/// Arches that also compile for spyre (KTIR). Must agree with the arches `scratchy-models`'
+/// `spyre` feature enables.
+const SPYRE_CAPABLE_ARCHES: &[&str] = &["llama", "granite", "gemma4", "gemma4-moe"];
+
+/// Whether `arch` compiles in this build: its `arch-<name>` feature is on, and so is a backend it
+/// compiles for. `scratchy-models`' build script runs an arch's pipeline only then (its
+/// `src/lib.rs` gates each arch's `pub mod` the same way), and a target bakes in the facts of the
+/// heads that compile beside it alone. Read from Cargo's `CARGO_FEATURE_*`, in the build script's
+/// process.
+pub fn arch_compiled(arch: &str) -> bool {
+    arch_compiled_with(arch, |feature| {
+        let var = format!("CARGO_FEATURE_{}", feature.to_uppercase().replace('-', "_"));
+        std::env::var(var).is_ok()
+    })
+}
+
+/// [`arch_compiled`] under the features `on` reports.
+fn arch_compiled_with(arch: &str, on: impl Fn(&str) -> bool) -> bool {
+    let (cuda, metal, spyre) = (on("cuda"), on("metal"), on("spyre"));
+    let backend = if CUDA_ONLY_ARCHES.contains(&arch) {
+        cuda
+    } else if METAL_ONLY_ARCHES.contains(&arch) {
+        metal
+    } else if SPYRE_CAPABLE_ARCHES.contains(&arch) {
+        cuda || metal || spyre
+    } else {
+        cuda || metal
+    };
+    on(&format!("arch-{arch}")) && backend
+}
+
 fn arch_dirs(configs_root: &Path) -> Result<Vec<PathBuf>, ConfigError> {
     let io = |source| ConfigError::Io {
         path: configs_root.to_path_buf(),
@@ -3563,6 +3617,39 @@ mod tests {
         let mp = model_params_from_json(&json, "s", &path, Vec::new(), &spec).expect("parse");
         assert_eq!(mp.bounds["mamba_conv_dim"], 10240);
         assert_eq!(mp.bounds["mamba_in_proj_dim"], 18560);
+    }
+
+    /// An arch compiles under its `arch-<name>` feature and a backend it compiles for — so the
+    /// metal-only DFlash2 drafter does not under cuda, and bakes no capture into its target there,
+    /// whatever `all` and `mtp` turn on.
+    #[test]
+    fn an_arch_compiles_with_its_feature_and_a_backend_of_its_own() {
+        let build = |features: &'static [&'static str]| move |f: &str| features.contains(&f);
+        let cuda = build(&[
+            "cuda",
+            "arch-dflash2",
+            "arch-qwen3-5-moe",
+            "arch-deepseek-v3",
+        ]);
+        assert!(!arch_compiled_with("dflash2", cuda));
+        assert!(arch_compiled_with("qwen3-5-moe", cuda));
+        assert!(arch_compiled_with("deepseek-v3", cuda));
+        let metal = build(&[
+            "metal",
+            "arch-dflash2",
+            "arch-qwen3-5-moe",
+            "arch-deepseek-v3",
+        ]);
+        assert!(arch_compiled_with("dflash2", metal));
+        assert!(arch_compiled_with("qwen3-5-moe", metal));
+        assert!(!arch_compiled_with("deepseek-v3", metal));
+        let spyre = build(&["spyre", "arch-llama", "arch-qwen3"]);
+        assert!(arch_compiled_with("llama", spyre));
+        assert!(!arch_compiled_with("qwen3", spyre));
+        assert!(
+            !arch_compiled_with("qwen3", build(&["metal"])),
+            "its arch feature is off"
+        );
     }
 
     /// Qwen3.6's MTP head compiles on its target's config verbatim, whose block schedule names the

@@ -66,19 +66,6 @@ fn reroot_crate(ts: TokenStream, mod_name: &str) -> TokenStream {
     out.into_iter().collect()
 }
 
-/// Lossy FORWARD-only feature/env name mangle: non-alphanumeric → `_`, upper.
-fn envify(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
 /// The quant presets enabled for one arch: its `quantizations.json`
 /// ∩ the enabled preset features (no `quant-` prefix on scratchy-quantizations,
 /// same reasoning as `<stem>` having no `model-` prefix on this crate).
@@ -194,32 +181,6 @@ fn write_if_changed(out: &Path, text: &str) {
     }
 }
 
-/// Arches whose emit only compiles under cuda (no metal surface). Under a pure
-/// `--features metal` build we must NOT run their pipeline (it would emit metal
-/// code for ops metal doesn't implement). Kept in sync with src/lib.rs gates.
-const CUDA_ONLY: &[&str] = &[
-    "deepseek-v2",
-    "deepseek-v3",
-    "deepseek-v3-flat",
-    "gemma3-mm",
-];
-/// Arches whose emit only compiles under metal (no cuda surface — no ISel
-/// claims for their ops). Under a cuda build we must NOT run their pipeline
-/// (the solver would find tile claims missing and panic). Kept in sync with
-/// src/lib.rs gates.
-const METAL_ONLY: &[&str] = &[
-    "gemma4-assistant",
-    "glm4-moe",
-    "gpt-oss",
-    "nemotron-h",
-    "nemotron-h-latent",
-    "nemotron-h-mtp",
-];
-/// Arches that additionally support the spyre (KTIR) backend.
-///
-/// Must agree with the arches `Cargo.toml`'s `spyre` feature enables; an arch listed there but not here
-/// is dropped by the `supported` gate below before its configs are read.
-const SPYRE_CAPABLE: &[&str] = &["llama", "granite", "gemma4", "gemma4-moe"];
 
 /// A checkpoint config's identity for matching: its architecture and shape (hidden size, layers,
 /// vocab size; the text decoder's when `text_config` nests it).
@@ -342,9 +303,6 @@ fn main() {
     ] {
         println!("cargo:rerun-if-env-changed={name}");
     }
-    let cuda = std::env::var("CARGO_FEATURE_CUDA").is_ok();
-    let metal = std::env::var("CARGO_FEATURE_METAL").is_ok();
-    let spyre = std::env::var("CARGO_FEATURE_SPYRE").is_ok();
 
     // Each arch is a `dsl/<arch>.py` DSL carrier paired with a
     // `configs/<arch>/` dir; emit the ones whose `arch-<name>` feature is on AND
@@ -388,22 +346,9 @@ fn main() {
                 .and_then(|n| n.to_str())
                 .and_then(|n| n.strip_suffix(".py"))?
                 .to_string();
-            // Feature gate: `arch-<name>` → CARGO_FEATURE_ARCH_<ENVIFY(name)>.
-            if std::env::var(format!("CARGO_FEATURE_ARCH_{}", envify(&arch))).is_err() {
-                return None;
-            }
-            // Backend gate: mirror the `pub mod <name>` cfg in src/lib.rs, so we
-            // never run the pipeline for an arch whose mod won't be compiled.
-            let supported = if CUDA_ONLY.contains(&arch.as_str()) {
-                cuda
-            } else if METAL_ONLY.contains(&arch.as_str()) {
-                metal
-            } else if SPYRE_CAPABLE.contains(&arch.as_str()) {
-                cuda || metal || spyre
-            } else {
-                cuda || metal
-            };
-            if !supported {
+            // Its `arch-<name>` feature and a backend it compiles for, as the `pub mod <name>`
+            // cfg in src/lib.rs has it: never the pipeline of an arch whose mod won't compile.
+            if !scratchy_forward_compiler_macro::arch_compiled(&arch) {
                 return None;
             }
             let mod_name = arch.replace('-', "_");
