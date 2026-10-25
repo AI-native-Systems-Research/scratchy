@@ -40,7 +40,9 @@ fn has_word(hay: &str, needle: &str) -> bool {
 }
 
 /// A source line that gates on a `cuda`/`metal` cfg (covers `feature = "cuda"`,
-/// bare `cfg(cuda)`, and `any(...)`/`all(...)`/`not(...)` wrappers).
+/// bare `cfg(cuda)`, and `any(...)`/`all(...)`/`not(...)` wrappers). A `#[cfg(...)]`
+/// or `#![cfg(...)]` attribute that rustfmt wrapped over several lines reaches this
+/// joined into one line ([`gates_in`]), so its target is seen beside its `cfg(`.
 fn line_gates_on_target(line: &str) -> bool {
     let mut rest = line;
     while let Some(i) = rest.find("cfg(") {
@@ -71,9 +73,70 @@ fn is_test_path(p: &Path) -> bool {
             .is_some_and(|f| f.ends_with("_tests.rs"))
 }
 
+/// Every `cuda`/`metal` cfg gate in one file's `text`, as `(line, content)` with
+/// 1-based lines. A line starting a `#[cfg(` or `#![cfg(` attribute is read with the
+/// lines after it up to the `]` that closes the attribute's `#[`, so a gate rustfmt
+/// wrapped is one gate, reported at its first line with its whitespace collapsed; the
+/// lines it spans are not read again. Every other line is read alone. Brackets in
+/// string literals inside a `cfg` are not told apart from the attribute's own (none
+/// exist in the zones).
+fn gates_in(text: &str) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim_start();
+        let end = if trimmed.starts_with("#[cfg(") || trimmed.starts_with("#![cfg(") {
+            attribute_end(&lines, i)
+        } else {
+            i
+        };
+        let content = if end == i {
+            line.trim().to_string()
+        } else {
+            let joined: Vec<&str> = (lines[i..=end].iter())
+                .flat_map(|l| l.split_whitespace())
+                .collect();
+            joined.join(" ")
+        };
+        if line_gates_on_target(&content) {
+            out.push((i + 1, content));
+        }
+        i = end + 1;
+    }
+    out
+}
+
+/// The line on which the attribute starting on line `start` closes: where the `]`
+/// matching its `#[` falls, or the last line if it never does.
+fn attribute_end(lines: &[&str], start: usize) -> usize {
+    let mut depth = 0i32;
+    for (n, line) in lines.iter().enumerate().skip(start) {
+        let from = if n == start {
+            line.find('#').unwrap_or(0)
+        } else {
+            0
+        };
+        for c in line[from..].chars() {
+            match c {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return n;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    lines.len() - 1
+}
+
 /// All `cuda`/`metal` cfg-gate violations under `rel` (a path relative to the
 /// workspace root), as `"relpath:line: content"`, skipping `target/` build
-/// output and any test code.
+/// output and any test code. Each file is read by [`gates_in`], attributes whole.
 fn target_cfg_violations(rel: &str) -> Vec<String> {
     let root = workspace_root();
     let base = root.join(rel);
@@ -104,10 +167,8 @@ fn target_cfg_violations(rel: &str) -> Vec<String> {
                 .unwrap_or(&path)
                 .display()
                 .to_string();
-            for (n, line) in txt.lines().enumerate() {
-                if line_gates_on_target(line) {
-                    out.push(format!("{relp}:{}: {}", n + 1, line.trim()));
-                }
+            for (n, content) in gates_in(&txt) {
+                out.push(format!("{relp}:{n}: {content}"));
             }
         }
     }
@@ -162,6 +223,62 @@ fn no_target_cfg_in_layers() {
 #[test]
 fn no_target_cfg_in_tensors() {
     assert_zone_clean("crates/tensors");
+}
+
+// ---- The guard reads an attribute whole, however rustfmt wrapped it ----------
+
+/// The lines [`gates_in`] reports a gate at.
+fn gate_lines(text: &str) -> Vec<usize> {
+    gates_in(text).into_iter().map(|(n, _)| n).collect()
+}
+
+/// #885's gemma4-moe module gate as rustfmt wrapped it (101 characters on one line):
+/// its `cfg(` is on line 1 and its targets on line 3, which a line-at-a-time read missed.
+#[test]
+fn a_wrapped_gate_is_one_gate_at_its_first_line() {
+    let wrapped = "#[cfg(all(\n    feature = \"arch-gemma4-moe\",\n    any(feature = \"metal\", \
+                   feature = \"spyre\", feature = \"cuda\")\n))]\npub mod gemma4_moe;";
+    assert_eq!(gate_lines(wrapped), [1]);
+    let (_, content) = &gates_in(wrapped)[0];
+    assert_eq!(
+        content,
+        "#[cfg(all( feature = \"arch-gemma4-moe\", any(feature = \"metal\", feature = \"spyre\", \
+         feature = \"cuda\") ))]"
+    );
+}
+
+#[test]
+fn the_same_gate_on_one_line_is_one_gate() {
+    let one = "#[cfg(all(feature = \"arch-gemma4-moe\", any(feature = \"metal\", feature = \
+               \"spyre\", feature = \"cuda\")))]\npub mod gemma4_moe;";
+    assert_eq!(gate_lines(one), [1]);
+}
+
+/// #885's workaround (`f8a6ec4a`): two one-line attributes, only the second naming a target.
+#[test]
+fn stacked_attributes_count_the_one_naming_a_target() {
+    let stacked = "#[cfg(feature = \"arch-gemma4-moe\")]\n#[cfg(any(feature = \"metal\", \
+                   feature = \"spyre\", feature = \"cuda\"))]\npub mod gemma4_moe;";
+    assert_eq!(gate_lines(stacked), [2]);
+}
+
+#[test]
+fn a_wrapped_gate_naming_no_target_is_none() {
+    let wrapped = "#[cfg(all(feature = \"x\",\n    feature = \"y\"))]\nfn f() {}";
+    assert_eq!(gate_lines(wrapped), Vec::<usize>::new());
+}
+
+/// An attribute ends at its own `]`: a target named in the item after it is not the gate's.
+#[test]
+fn a_target_in_the_gated_item_is_not_the_gate() {
+    let after = "#[cfg(feature = \"x\")]\nfn metal() {}";
+    assert_eq!(gate_lines(after), Vec::<usize>::new());
+}
+
+#[test]
+fn a_wrapped_inner_attribute_is_one_gate() {
+    let inner = "#![cfg(any(\n    feature = \"metal\",\n    feature = \"spyre\"\n))]\nuse x;";
+    assert_eq!(gate_lines(inner), [1]);
 }
 
 // NOTE: `crates/targets/{metal,spyre}` are split per-target — they ARE a
