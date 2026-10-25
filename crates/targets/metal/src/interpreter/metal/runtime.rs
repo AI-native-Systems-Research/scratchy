@@ -54,7 +54,6 @@ pub struct DraftRuntimeBuffers {
     pub ring_slots: Buffer,
     pub retained: Buffer,
     pub lane_params: Buffer,
-    pub uniforms: Buffer,
     /// One buffer per [`crate::dflash2::DraftOutput`] region, in [`DraftOutput::ALL`]'s order.
     ///
     /// [`DraftOutput::ALL`]: crate::dflash2::DraftOutput::ALL
@@ -430,7 +429,6 @@ impl RuntimeBindings {
             RuntimeBindingKind::DraftRingSlots => &self.draft().ring_slots,
             RuntimeBindingKind::DraftRetained => &self.draft().retained,
             RuntimeBindingKind::DraftLaneParams => &self.draft().lane_params,
-            RuntimeBindingKind::DraftUniforms => &self.draft().uniforms,
             RuntimeBindingKind::DraftOutputs(region) => self.draft().output(region),
         }
     }
