@@ -304,6 +304,18 @@ These favour one side or the other and must travel with any published number.
   ollama's own MLX builds (`gemma4:26b-mlx` is NVFP4, not 4-bit affine); llama.cpp
   and mistral.rs run a Q4_K_M GGUF. The run records each engine's quantization
   and file revision, and the page names them on its row.
+- **Not every engine answers to length.** `bench serve` asks every engine to
+  ignore EOS (`ignore_eos: true`), so each request decodes its full
+  `--output-len`. scratchy does.
+  - oMLX's HTTP API takes no `ignore_eos`. Its own flag of that name, added in
+    oMLX 2026-10-21 (#4687 there), is internal to its admin benchmark. Its answers
+    stop at EOS: on the M1 Max run in #479, qwen3.6-35b-a3b's oMLX cells delivered
+    62–64% of the tokens asked for.
+  - ollama ignores `ignore_eos` too, and mlx-lm sometimes stops short.
+  - Such a cell measures less decode than its label says, over shorter answers
+    with smaller KV, which flatters tok/s. So the page marks every number from a
+    live cell under 99% of its asked-for answer tokens with §, and says what
+    share it delivered.
 - **Prefix caching differs by engine and model**, so `bench serve` warms up
   and checks connectivity with prompts outside the measured set: replaying a
   measured prompt let an engine with a prefix cache serve it as a full hit

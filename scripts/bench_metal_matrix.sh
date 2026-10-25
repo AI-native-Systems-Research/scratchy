@@ -70,7 +70,8 @@
 #   oMLX        `omlx serve` over the downloaded MLX checkpoint, twice:
 #               as installed (FP16 KV), and with its TurboQuant KV turned on
 #               (4-bit), so scratchy's TurboQuant default meets a like-for-like
-#               rival as well as oMLX's own default
+#               rival as well as oMLX's own default. Its HTTP API takes no
+#               ignore_eos, so its answers stop at EOS (§ on the page, #479)
 #   mistral.rs  `mistralrs serve`, the same Q4_K_M GGUF as llama.cpp; a Rust
 #               control: is scratchy fast because of its compiler, or Rust?
 # Every engine but mlx-lm is restarted per axis, sized for that axis (concurrent

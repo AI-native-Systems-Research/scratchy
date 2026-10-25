@@ -31,8 +31,8 @@ use crate::charts::{
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab};
 use data::{At, Bytes, Cell, Model, Run, Scenario};
 use numbers::{
-    BELOW_WEIGHTS, DASH, Engine, FAILED, Metric, NO_STREAM, NOISE, Startup, cfmt, failed_note, fmt,
-    lfmt, marks, marks_note, med, peak_rss, rss_fmt, served, timing,
+    BELOW_WEIGHTS, DASH, Engine, FAILED, Metric, NO_STREAM, NOISE, SHORT, Startup, cfmt,
+    failed_note, fmt, lfmt, marks, marks_note, med, peak_rss, rss_fmt, served, timing,
 };
 
 /// The run files, relative to site/; copied to the same place under _site/,
@@ -91,6 +91,7 @@ fn load(site: &Site) -> Result<Vec<Run>, String> {
             ));
         }
         run.mark_dead();
+        run.mark_short();
         run.mark_mem_below_weights();
         run.file = f;
         runs.push(run);
@@ -617,8 +618,11 @@ fn timing_info() -> Element {
             strong { "no stream" } ": the answer arrived in one piece, so TTFT and TPOT could not be timed. "
             strong { "†" } ": some answers did; the timing comes from the rest (the table views say how many). "
             strong { "{FAILED}" } ": some requests failed (an error or a timeout, usually the engine running out of \
-                       memory), so every number in that cell covers only the rest. mlx-lm and ollama can stop \
-                       answers early, which flatters tok/s."
+                       memory), so every number in that cell covers only the rest. "
+            strong { "{SHORT}" } ": the answers came back short of the tokens asked for. Every request asks the \
+                       engine to ignore EOS and answer to length; oMLX, ollama and sometimes mlx-lm stop at EOS \
+                       anyway, so the cell measured less decode than its label says, which flatters tok/s (the \
+                       table views say what share)."
         },
     )
 }
@@ -3132,6 +3136,53 @@ mod tests {
         assert_eq!(dense.model(32, lineup.large_from_gb), "granite-4.2-8b");
         assert_eq!(dense.model(36, lineup.large_from_gb), "granite-4.2-8b");
         assert_eq!(dense.model(64, lineup.large_from_gb), "granite-4.2-30b");
+    }
+
+    /// Over every published run: a cell whose answers came back short of the tokens asked for
+    /// carries § and says what share it delivered, and a dead cell never does (#479). Whether
+    /// scratchy answers to length is the matrix script's to judge as it measures (`run_cell`);
+    /// the page marks whatever it is given.
+    #[test]
+    fn published_cells_that_stopped_answers_early_are_marked_short() {
+        use super::numbers::{Engine, Metric, SHORT, cfmt, marks_note, short};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut by_engine = std::collections::BTreeMap::<&str, usize>::new();
+        let mut files: Vec<_> = (std::fs::read_dir(root.join(DATA)).expect(DATA))
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .collect();
+        files.sort();
+        for f in files {
+            let mut run: Run = serde_json::from_str(&std::fs::read_to_string(&f).unwrap())
+                .unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+            run.mark_dead();
+            run.mark_short();
+            for m in &run.models {
+                for e in Engine::ALL {
+                    for c in e.cells(m) {
+                        let Some(share) = short(Some(c)) else {
+                            assert!(!cfmt(Some(c), Metric::Tpot).contains(SHORT));
+                            continue;
+                        };
+                        assert!(!c.dead, "a dead cell is never also short");
+                        assert!(share < 0.99, "{share}");
+                        assert!(
+                            cfmt(Some(c), Metric::Tpot).contains(SHORT)
+                                || c.median_tpot_ms.is_none()
+                        );
+                        assert!(
+                            marks_note(Some(c), Metric::Tpot).contains("% of the answer tokens")
+                        );
+                        *by_engine.entry(e.key()).or_default() += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("short cells by engine: {by_engine:?}");
+        assert!(
+            by_engine.get("omlx").is_some_and(|&n| n > 0),
+            "#479's oMLX cells stop short: {by_engine:?}"
+        );
     }
 
     /// The published runs' cells a dead server measured (#413) are marked, and no other: the
