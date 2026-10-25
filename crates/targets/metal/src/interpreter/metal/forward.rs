@@ -321,8 +321,24 @@ pub enum DeviceInputInto {
 /// and no wait consumes it, so every wait on the command buffer, and only on it, sees the same.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Delivered {
-    Ok,
+    /// It ran, for its GPU span.
+    Ok(GpuSpan),
     Err(String),
+}
+
+/// A command buffer's span on the GPU: its commit feedback's `GPUEndTime - GPUStartTime`, the time
+/// the GPU spent on it, apart from the host's encoding and waiting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GpuSpan(pub std::time::Duration);
+
+/// The GPU span of the command buffer last waited for (f64 seconds' bits), for the worker's forward
+/// clock: a forward waits for its command buffer before it returns.
+static LAST_GPU_SPAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The GPU span of the command buffer last waited for in this process.
+pub fn last_gpu_span() -> GpuSpan {
+    let seconds = f64::from_bits(LAST_GPU_SPAN.load(std::sync::atomic::Ordering::Relaxed));
+    GpuSpan(std::time::Duration::from_secs_f64(seconds.max(0.0)))
 }
 
 /// One command buffer's commit feedback, which its handler delivers on a thread of Metal's own,
@@ -397,9 +413,15 @@ impl InFlight {
     /// outputs silently.
     pub fn wait(&self) -> Result<(), ForwardError> {
         crate::mtl4_dispatch::wait_drained(&self.event, self.value);
-        if let Delivered::Err(msg) = self.error.wait() {
-            eprintln!("[scratchy-target-metal] GPU commit error surfaced: {msg}");
-            return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
+        match self.error.wait() {
+            Delivered::Err(msg) => {
+                eprintln!("[scratchy-target-metal] GPU commit error surfaced: {msg}");
+                return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
+            }
+            Delivered::Ok(GpuSpan(span)) => LAST_GPU_SPAN.store(
+                span.as_secs_f64().to_bits(),
+                std::sync::atomic::Ordering::Relaxed,
+            ),
         }
         if !self.kernel_time.is_empty() {
             let cb = KERNEL_TIME_CB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

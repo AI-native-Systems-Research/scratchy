@@ -1959,7 +1959,10 @@ fn commit_options(
                 }
                 err_slot.deliver(Delivered::Err(msg));
             } else {
-                err_slot.deliver(Delivered::Ok);
+                let seconds = (fb.GPUEndTime() - fb.GPUStartTime()).max(0.0);
+                err_slot.deliver(Delivered::Ok(super::forward::GpuSpan(
+                    std::time::Duration::from_secs_f64(seconds),
+                )));
             }
         },
     );

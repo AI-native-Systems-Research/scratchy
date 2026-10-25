@@ -311,3 +311,181 @@ fn qmv_wide_against_small_m_twin_by_bucket() {
         println!("{line}   ({:.1} MB of codes)", bytes as f64 / 1e6);
     }
 }
+
+/// What folding a layer's RMSNorm into the projections reading it buys on a 40-core chip emulated by
+/// width (columns / 4 on a 10-core base M5): µs a group, min / median / max of `ROUNDS`, at the bucket's
+/// rows, DRAM-cold. Each consumer set runs as the tape runs it, every member between the same barriers:
+/// - `norm + plain`: the RMSNorm, a barrier, then the plain wide matvecs;
+/// - `normed`: the wide matvecs normalizing their input as they load it (`QmvEnds::norm`), no norm.
+///
+/// The sets are Qwen3.6-35B-A3B's: the GDN input norm's readers (qkv, z, a, b) and the post-attention
+/// norm's weight-carrying readers (shared gate, up). NAX devices only.
+#[test]
+#[ignore = "measurement probe, not an assertion: run with --ignored --nocapture"]
+fn norm_folded_into_its_readers_on_a_chip_emulated_by_width() {
+    use scratchy_target_metal::tape::ids::{BucketM, QSize, RmsNormEps};
+    use scratchy_target_metal::tape::kernel_constants::RmsNormConstants;
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    if !scratchy_target_metal::targets::is_nax_capable(di.profile.generation) {
+        eprintln!("skipping: no NAX matrix unit");
+        return;
+    }
+    let device = di.device.clone();
+    let cores = scratchy_target_metal::device::gpu_cores(&device)
+        .expect("the device's GPU cores")
+        .get() as usize;
+    let width = 40 / cores;
+    let cache = SpecializedPipelineCache::new(device.clone(), &[]).expect("pipeline cache");
+    let codes = AffineCodes::of(Some(&di.profile), 4);
+    let hidden = 2048u32;
+    let normed = QmvEnds {
+        norm: Some(RowNorm {
+            layer: LayerId(0),
+            eps: Eps(1e-6),
+            offset: GainOffset(0.0),
+        }),
+        ..QmvEnds::default()
+    };
+    println!(
+        "µs a group, min/median/max of {ROUNDS} rounds, a 40-core chip emulated by width on {cores} cores \
+         (columns / {width})"
+    );
+    let sets: &[(&str, &[u32])] = &[
+        ("gdn input norm: qkv | z | a | b", &[8192, 4096, 32, 32]),
+        ("post-attention norm: shared gate | up", &[512, 512]),
+    ];
+    for &(name, columns) in sets {
+        for rows in [3u32, 4] {
+            // Each member at the emulated width (a narrow one at its own).
+            let ns: Vec<u32> = columns
+                .iter()
+                .map(|&n| {
+                    if n / width as u32 >= 32 {
+                        n / width as u32
+                    } else {
+                        n
+                    }
+                })
+                .collect();
+            let bytes: usize = ns.iter().map(|&n| (n * hidden / 2) as usize).sum();
+            let copies = ROTATED_BYTES / bytes + 1;
+            let iters = ((1usize << 30) / bytes).clamp(48, 4096);
+            let weights: Vec<Vec<_>> = (0..copies)
+                .map(|c| {
+                    ns.iter()
+                        .map(|&n| {
+                            let words = (n * hidden / 8) as usize;
+                            let codes: Vec<u32> = (0..words as u32)
+                                .map(|i| i.wrapping_mul(2654435761).wrapping_add(c as u32))
+                                .collect();
+                            let groups = (n * hidden / GROUP) as usize;
+                            (
+                                shared_slice(&device, &codes),
+                                shared_slice(&device, &bf16_row(groups, 0.002)),
+                                shared_slice(&device, &bf16_row(groups, -0.015)),
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+            let x = shared_slice(&device, &bf16_row(4 * hidden as usize, 0.5));
+            let xn = shared_zeroed(&device, 4 * hidden as usize * 2);
+            let gain = shared_slice(&device, &bf16_row(hidden as usize, 0.1));
+            let ys: Vec<_> = ns
+                .iter()
+                .map(|&n| shared_zeroed(&device, 4 * n as usize * 2))
+                .collect();
+            let matvec = |n: u32, ends: QmvEnds| {
+                let kernel = pick_qmv_kernel_wide(n, hidden, 4, rows, true);
+                let name =
+                    qmv_kernel_static_name(kernel, DequantDtype::Bf16, ScaleDtype::Bf16, 4, GROUP);
+                let mut constants: Vec<ConstantValue> = AffineQmvWideConstants {
+                    k: KDimI32(hidden as i32),
+                    n: NDimI32(n as i32),
+                    m: MDimI32(rows as i32),
+                    codes,
+                }
+                .into();
+                constants.extend(Vec::<ConstantValue>::from(ends));
+                let pso = baked_build(&cache, &PipelineKey::new("quantized_qmv", name, constants))
+                    .expect(name);
+                (pso, qmv_dispatch_shape(kernel, rows, n, 1))
+            };
+            let plain: Vec<_> = ns.iter().map(|&n| matvec(n, QmvEnds::default())).collect();
+            let folded: Vec<_> = ns.iter().map(|&n| matvec(n, normed)).collect();
+            let norm_constants: Vec<ConstantValue> = RmsNormConstants {
+                bucket_m: BucketM(rows),
+                q_size: QSize(hidden),
+                rms_norm_eps: RmsNormEps(1e-6),
+                weight_offset: 0.0,
+            }
+            .into();
+            let norm_name = "rmsnorm_bf16_s_bf16_specialized";
+            let norm = baked_build(
+                &cache,
+                &PipelineKey::new("rmsnorm", norm_name, norm_constants),
+            )
+            .expect(norm_name);
+            // 0: the norm, a barrier, the plain readers; 1: the readers normalizing on load.
+            let time = |cell: usize| {
+                let mut batch = Mtl4DispatchBatch::begin(&device).expect("mtl4 batch");
+                for i in 0..iters {
+                    let copy = &weights[i % copies];
+                    if cell == 0 {
+                        batch.encode(
+                            &norm,
+                            &[(&xn, 0), (&x, 1), (&gain, 2)],
+                            &[],
+                            &[],
+                            &[],
+                            size((rows, 1, 1)),
+                            size((1024, 1, 1)),
+                        );
+                        batch.barrier();
+                    }
+                    let readers = if cell == 0 { &plain } else { &folded };
+                    for (((pso, (grid, threads)), (w, scales, biases)), y) in
+                        readers.iter().zip(copy).zip(&ys)
+                    {
+                        let input = if cell == 0 { &xn } else { &x };
+                        let binds = [
+                            (w, 0),
+                            (scales, 1),
+                            (biases, 2),
+                            (input, 3),
+                            (y, 4),
+                            (&gain, 15),
+                        ];
+                        batch.encode(pso, &binds, &[], &[], &[], size(*grid), size(*threads));
+                    }
+                    batch.barrier();
+                }
+                let t0 = std::time::Instant::now();
+                batch.commit(true);
+                t0.elapsed().as_secs_f64() * 1e6 / iters as f64
+            };
+            let mut samples = [Vec::new(), Vec::new()];
+            for round in 0..=ROUNDS {
+                for (cell, s) in samples.iter_mut().enumerate() {
+                    let us = time(cell);
+                    if round > 0 {
+                        s.push(us);
+                    }
+                }
+            }
+            println!("{name}, {rows} rows (columns {ns:?}):");
+            for (tag, s) in ["norm + plain", "normed"].iter().zip(&mut samples) {
+                s.sort_by(f64::total_cmp);
+                println!(
+                    "    {tag:<14} {:8.1} {:8.1} {:8.1}",
+                    s[0],
+                    s[s.len() / 2],
+                    s[s.len() - 1]
+                );
+            }
+        }
+    }
+}
