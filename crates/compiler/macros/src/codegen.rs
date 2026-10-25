@@ -16390,11 +16390,6 @@ pub fn emit_model(
                                                 ::scratchy_target_metal::dflash2::DraftLaneParams,
                                             >() as u64,
                                     ),
-                                    uniforms: alloc(
-                                        lanes
-                                            * u64::from(::scratchy_target_metal::dflash2::SAMPLING_UNIFORMS)
-                                            * 4,
-                                    ),
                                     outputs: ::scratchy_target_metal::dflash2::DraftOutput::ALL
                                         .map(|r| alloc(r.bytes(lanes))),
                                 }

@@ -1068,7 +1068,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             }
             pin(draft_capture);
             if let Some(d) = draft {
-                for b in [&d.ring_slots, &d.retained, &d.lane_params, &d.uniforms] {
+                for b in [&d.ring_slots, &d.retained, &d.lane_params] {
                     pin(b);
                 }
                 for b in &d.outputs {

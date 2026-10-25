@@ -177,8 +177,6 @@ pub struct DraftInputs<'a> {
     pub ring_slots: &'a [u32],
     /// `[num_seqs]` — each lane's policy for the cycle (a block draft's selection reads it).
     pub lane_params: &'a [crate::dflash2::DraftLaneParams],
-    /// `[num_seqs * SAMPLING_UNIFORMS]` f32 — the uniforms each lane draws its cycle with.
-    pub uniforms: &'a [f32],
     /// The forward is a cycle's context commit over its lanes' verify blocks: the rows each
     /// retained are a device input (`DeviceInputInto::DraftRetained`), its target's acceptance's.
     pub cycle: bool,

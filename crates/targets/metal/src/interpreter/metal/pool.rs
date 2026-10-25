@@ -2085,8 +2085,8 @@ fn begin_step<W: CanonicalParams>(
     Ok(writes)
 }
 
-/// A drafter's per-forward inputs into its runtime buffers: each lane's ring slot, policy and
-/// uniforms. A lane past them reads zeros: ring slot 0, a greedy policy.
+/// A drafter's per-forward inputs into its runtime buffers: each lane's ring slot and policy. A
+/// lane past them reads zeros: ring slot 0, a greedy policy.
 fn write_draft_inputs(
     runtime: &RuntimeBindings,
     draft: super::DraftInputs<'_>,
@@ -2098,15 +2098,12 @@ fn write_draft_inputs(
         bytes_available: 0,
     })?;
     let as_bytes = |words: &[u32]| bytemuck_words(words).to_vec();
-    let floats: Vec<u8> = draft
-        .uniforms
-        .iter()
-        .flat_map(|f| f.to_le_bytes())
-        .collect();
     let lanes: Vec<u8> = (draft.lane_params.iter())
         .flat_map(|p| {
-            [p.temperature.to_bits(), p.sampling, p.maximum, p.remaining]
-                .into_iter()
+            let [seed_lo, seed_hi] = p.seed.words();
+            let words = [p.temperature.to_bits(), p.sampling, p.maximum, p.remaining];
+            (words.into_iter())
+                .chain([seed_lo, seed_hi, p.position])
                 .flat_map(u32::to_le_bytes)
         })
         .collect();
@@ -2117,7 +2114,6 @@ fn write_draft_inputs(
             as_bytes(draft.ring_slots),
         ),
         ("draft lane params", &buffers.lane_params, lanes),
-        ("draft uniforms", &buffers.uniforms, floats),
     ] {
         (runtime.written)
             .write(to, &bytes, Padding::Zero, writes)
