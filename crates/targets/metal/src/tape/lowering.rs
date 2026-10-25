@@ -81,6 +81,8 @@ pub struct BakePoint<'a> {
     /// [`ConstantType::KvCap`]: super::constants::ConstantType::KvCap
     pub block_cap: u32,
     pub profile: Option<&'a crate::targets::MetalTargetProfile>,
+    /// The chip class the tape serves (`GenClass::for_device` picks it at load).
+    pub class: crate::tape::lowered::GenClass,
 }
 
 /// The weights a row can bind: its site's sources and the model's class rotary tables.
@@ -1021,6 +1023,7 @@ fn route_small_m(
     bucket_m: u32,
     w: RowSources<'_>,
     profile: Option<&crate::targets::MetalTargetProfile>,
+    class: crate::tape::lowered::GenClass,
 ) -> Result<Vec<GatedCommand>, LoweringError> {
     use crate::tape::lowered::RuntimeGate::{OnlyIfSmallMTokens, UnlessSmallMTokens};
     // A sample-rows step lowered its matmul, twin included.
@@ -1066,10 +1069,23 @@ fn route_small_m(
     // µs base M5 / M5 Max, wide vs twin: lm_head 2182 / 540 vs 2333 / 604, gdn out_proj
     // 70.8 / 31.8 vs 71.1 / 90.1; its 8-row bucket streams them twice, lm_head 4368 / 1049 vs
     // 2369 / 572).
-    if cmds
+    let wide = cmds
         .iter()
-        .any(|c| c.command.kernel == KernelId::AffineQmvWide)
-        && pick_qmv_kernel_wide(n, k, 4, bucket_m, true).weight_streams(bucket_m) == 1
+        .any(|c| c.command.kernel == KernelId::AffineQmvWide);
+    if wide && pick_qmv_kernel_wide(n, k, 4, bucket_m, true).weight_streams(bucket_m) == 1 {
+        return Ok(cmds);
+    }
+    // On a chip of the wide class, a twin of at most one threadgroup a core (of the fewest the class
+    // holds) leaves most of them idle, and the bucket's own matvec, of twice its threadgroups, each
+    // streaming less, runs the projection sooner: its weights are too few for the second stream to
+    // cost what the latency does. A 40-core chip emulated by width at bucket 8, wide against twin µs
+    // (`affine_staged_test`): drafter conv proj and each of the shared expert's gate and up 512 x 2048
+    // 6.3 / 8.1, GDN a, b 32 x 2048 5.9 / 8.1; at 128 threadgroups the twin is as fast (shared down
+    // 2048 x 512, 4.6 / 4.7) and past them faster (out_proj 2048 x 4096, 23.8 / 18.7). A 10-core
+    // base M5 at full width runs the twin faster (shared down 22.9 / 16.6), and its class keeps it.
+    if wide
+        && class == crate::tape::lowered::GenClass::M5Wide
+        && n / SMALL_M_TILE_COLS <= crate::tape::lowered::M5_WIDE_MIN_CORES
     {
         return Ok(cmds);
     }
@@ -1586,6 +1602,7 @@ fn lower(
         num_arena_slots,
         block_cap,
         profile,
+        class,
         ..
     } = *at;
     let mut commands: Vec<GatedCommand> = Vec::with_capacity(rows.len());
@@ -1707,7 +1724,7 @@ fn lower(
                     m_divisor,
                 )?;
                 let own = own.into_iter().map(GatedCommand::ungated).collect();
-                let cmds = route_small_m(p, step, own, bucket_m, w, profile)?;
+                let cmds = route_small_m(p, step, own, bucket_m, w, profile, class)?;
                 let cmds = route_gdn(p, step, cmds, bucket_m);
                 let cmds = route_draft_commit(step, cmds);
                 let cmds = decode_attention_per_kv_head(
@@ -9358,6 +9375,9 @@ mod tests {
             rotary: Some(TEST_ROTARY),
             block_cap: 128,
             profile,
+            class: profile.map_or(crate::tape::lowered::GenClass::M1, |t| {
+                crate::tape::lowered::GenClass::of(t.generation)
+            }),
         }
     }
 
@@ -11482,6 +11502,47 @@ mod tests {
                 constants.iter().any(|c| c.index == 8) && constants.iter().any(|c| c.index == 10),
                 "bucket {bucket_m}: the matvec takes its norm (8) and residual add (10)"
             );
+        }
+    }
+
+    /// On the wide class, a projection whose twin is at most one threadgroup a core of the class's
+    /// fewest runs its own matvec at a small-M bucket; a wider one, and every projection on the M5
+    /// class, takes the twin.
+    #[test]
+    fn a_narrow_projection_keeps_its_matvec_on_the_wide_class() {
+        use crate::tape::lowered::GenClass;
+        use crate::tape::lowered::RuntimeGate::{OnlyIfSmallMTokens, UnlessSmallMTokens};
+        let gemm = |n: u32| {
+            MetalStep::AffineQmm(AffineMatmul {
+                input: Slot(0),
+                output: Slot(1),
+                layer: LayerId(0),
+                n: NDim(n),
+                k: KDim(2048),
+                bits: AffineBits(4),
+                vector_limit: QmvBatchLimit(10),
+                ..q_proj()
+            })
+        };
+        let widest = SMALL_M_TILE_COLS * crate::tape::lowered::M5_WIDE_MIN_CORES;
+        let twin = vec![
+            (KernelId::AffineQmvWide, Some(UnlessSmallMTokens)),
+            (KernelId::AffineQmmSmallM, Some(OnlyIfSmallMTokens)),
+        ];
+        let own = vec![(KernelId::AffineQmvWide, None)];
+        for (class, n, want) in [
+            (GenClass::M5Wide, widest, &own),
+            (GenClass::M5Wide, 2 * widest, &twin),
+            (GenClass::M5, widest, &twin),
+            (GenClass::M5, 2 * widest, &twin),
+        ] {
+            let at = BakePoint {
+                class,
+                ..bake_point(8, Some(&crate::targets::M5_10CORE))
+            };
+            let tape = lower_subtile_tape_to_metal(&row_tape(plain(&[gemm(n)])), &tp(), at)
+                .expect("lowers");
+            assert_eq!(&gated_steps(&tape), want, "{class:?}, n {n}");
         }
     }
 
