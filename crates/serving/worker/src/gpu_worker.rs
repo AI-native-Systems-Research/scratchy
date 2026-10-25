@@ -1719,7 +1719,6 @@ impl MetalWorker {
             rings,
             slots: RingSlots::new(slots as u32),
             cycles: HashMap::new(),
-            counts: HashMap::new(),
             captured_row_bytes: taps * target.hidden_size() as usize * elem_bytes,
             cycle_buffer: None,
         })
@@ -5124,27 +5123,22 @@ struct BlockStep {
     commit_slots: Vec<u32>,
     /// The ring slot of each lane of the block.
     block_slots: Vec<u32>,
-    /// Each lane's verify of the block it drafted last ([`Cycle`]): its policy, that block's
-    /// candidates and their probabilities, and the cycle's uniforms.
+    /// Each lane's verify of the block it drafted last ([`Cycle`]): its policy, and that block's
+    /// candidates and their probabilities.
     verify: Vec<scratchy_target_metal::dflash2::VerifyLane>,
     candidates: Vec<u32>,
     q_probs: Vec<f32>,
-    verify_uniforms: Vec<f32>,
-    /// Each lane's policy for its next block's selection, and the next cycle's uniforms it draws
-    /// its proposals with.
+    /// Each lane's policy for its next block's selection.
     lane_params: Vec<scratchy_target_metal::dflash2::DraftLaneParams>,
-    uniforms: Vec<f32>,
 }
 
 /// A lane's cycle between the step that drafts its block and the one that verifies it (Splash's
 /// one command a cycle, split across two steps here): the block's candidates and their
-/// probabilities — what a sampled lane's acceptance and correction read — and the uniforms the
-/// cycle draws with.
+/// probabilities, what a sampled lane's acceptance and correction read.
 #[cfg(feature = "metal")]
 struct Cycle {
     candidates: Vec<u32>,
     q_probs: Vec<f32>,
-    uniforms: Vec<f32>,
 }
 
 /// A ring slot a request (Splash's `DFlashDraftRing` a lane): taken at its first step, given back
@@ -5193,8 +5187,6 @@ struct Dflash2 {
     slots: RingSlots,
     /// Each request's cycle: drafted by one step, verified by the next.
     cycles: HashMap<String, Cycle>,
-    /// Each request's cycles so far, which seed its uniforms.
-    counts: HashMap<String, u32>,
     /// A captured row's bytes: the target's hidden state at each layer the drafter reads.
     captured_row_bytes: usize,
     /// The cycle's buffer ([`CycleLayout`](scratchy_target_metal::dflash2::CycleLayout)), grown to
@@ -5204,25 +5196,21 @@ struct Dflash2 {
 
 #[cfg(feature = "metal")]
 impl Dflash2 {
-    /// The uniforms request `req_id`'s next cycle draws with (Splash's per-lane sampling uniforms),
-    /// from its count of cycles.
-    fn next_uniforms(&mut self, req_id: &str) -> Vec<f32> {
-        let count = self.counts.entry(req_id.to_owned()).or_insert(0);
-        let base = *count * scratchy_target_metal::dflash2::SAMPLING_UNIFORMS;
-        *count += 1;
-        (0..scratchy_target_metal::dflash2::SAMPLING_UNIFORMS)
-            .map(|i| {
-                let seed = scratchy_core_common::fnv_seed(req_id, base + i);
-                scratchy_core_common::seed_to_uniform(seed)
-            })
-            .collect()
+    /// The seed request `req_id`'s kernels draw its uniforms from (`dflash2::draft_uniform`): the
+    /// request's own (Splash's `SamplingConfig::seed`), or one of its id when it sets none.
+    fn seed(
+        req_id: &str,
+        params: Option<&scratchy_core_common::SamplingParams>,
+    ) -> scratchy_target_metal::dflash2::DraftSeed {
+        let unseeded = || u64::from(scratchy_core_common::fnv_seed(req_id, 0));
+        let seed = params.and_then(|p| p.seed).unwrap_or_else(unseeded);
+        scratchy_target_metal::dflash2::DraftSeed::of(seed)
     }
 
     /// What `req_id` holds of the worker's: its ring slot and its cycle.
     fn release(&mut self, req_id: &str) {
         self.slots.release(req_id);
         self.cycles.remove(req_id);
-        self.counts.remove(req_id);
     }
 }
 
@@ -5297,7 +5285,6 @@ impl<'a> BlockPassesEncoder<'a> {
                 write(layout.drafted, as_bytes(&block.drafted));
                 write(layout.draft_ids, as_bytes(&step.candidates));
                 write(layout.draft_probs, as_bytes(&step.q_probs));
-                write(layout.uniforms, as_bytes(&step.verify_uniforms));
             }
             if (step.verify.iter()).any(|l| l.sampling != 0 && l.drafts > 0) {
                 let logits = outputs.logits.gpuAddress();
@@ -5339,7 +5326,6 @@ impl<'a> BlockPassesEncoder<'a> {
         let draft = DraftInputs {
             ring_slots: &step.commit_slots,
             lane_params: &[],
-            uniforms: &[],
             cycle: commit.cycle,
         };
         let mut ctx = head_ctx(self.kv_cache, &req, &inputs, Reads::CacheWrites);
@@ -5375,7 +5361,6 @@ impl<'a> BlockPassesEncoder<'a> {
             let draft = DraftInputs {
                 ring_slots: &step.block_slots,
                 lane_params: &step.lane_params,
-                uniforms: &step.uniforms,
                 cycle: false,
             };
             let mut ctx = head_ctx(self.kv_cache, &req, &inputs, Reads::Result);
@@ -8015,8 +8000,8 @@ impl Worker for MetalWorker {
             _ => None,
         };
         // A block drafter's passes over the step, with each request's ring slot, each lane's verify
-        // of the block it drafted last — its policy, that block's selection, the cycle's uniforms —
-        // and its next block's policy and uniforms.
+        // of the block it drafted last — its policy and that block's selection — and its next
+        // block's policy.
         let block_step = match self.dflash2.as_mut() {
             Some(d) if !scheduler_output.draft_req_ids.is_empty() => {
                 match d
@@ -8036,8 +8021,6 @@ impl Worker for MetalWorker {
                         let rows = d.drafter.budget.drafts as u32 + 1;
                         let candidates_a_lane = d.drafter.budget.drafts
                             * scratchy_target_metal::dflash2::CANDIDATES as usize;
-                        let uniforms_a_lane =
-                            scratchy_target_metal::dflash2::SAMPLING_UNIFORMS as usize;
                         let mut step = BlockStep {
                             passes: ::scratchy_serving_engine::spec_decode::BlockPasses {
                                 commit: passes.commit,
@@ -8048,9 +8031,7 @@ impl Worker for MetalWorker {
                             verify: Vec::new(),
                             candidates: Vec::new(),
                             q_probs: Vec::new(),
-                            verify_uniforms: Vec::new(),
                             lane_params: Vec::new(),
-                            uniforms: Vec::new(),
                         };
                         for lane in lanes {
                             let req_id = &req_ids_in_order[lane.step];
@@ -8086,15 +8067,13 @@ impl Worker for MetalWorker {
                             let Cycle {
                                 candidates,
                                 q_probs,
-                                uniforms,
                             } = cycle.unwrap_or(Cycle {
                                 candidates: vec![u32::MAX; candidates_a_lane],
                                 q_probs: vec![0.0; candidates_a_lane],
-                                uniforms: vec![0.0; uniforms_a_lane],
                             });
                             step.candidates.extend(candidates);
                             step.q_probs.extend(q_probs);
-                            step.verify_uniforms.extend(uniforms);
+                            let seed = Dflash2::seed(req_id, params);
                             step.verify
                                 .push(scratchy_target_metal::dflash2::VerifyLane {
                                     sampled: lane.sampled,
@@ -8108,6 +8087,7 @@ impl Worker for MetalWorker {
                                     top_p: params.map_or(1.0, |p| p.top_p as f32),
                                     min_p: params.map_or(0.0, |p| p.min_p as f32),
                                     exclude_stop: u32::from(params.is_some_and(|p| p.ignore_eos)),
+                                    seed,
                                 });
                             step.lane_params.push(
                                 scratchy_target_metal::dflash2::DraftLaneParams {
@@ -8115,9 +8095,10 @@ impl Worker for MetalWorker {
                                     sampling,
                                     maximum: rows,
                                     remaining,
+                                    seed,
+                                    position: lane.position,
                                 },
                             );
-                            step.uniforms.extend(d.next_uniforms(req_id));
                         }
                         step.passes.block = passes.block;
                         Some(step)
@@ -8963,13 +8944,11 @@ impl Worker for MetalWorker {
                     let drafts = block.map(|b| {
                         let candidates = d.drafter.budget.drafts
                             * scratchy_target_metal::dflash2::CANDIDATES as usize;
-                        let uniforms = scratchy_target_metal::dflash2::SAMPLING_UNIFORMS as usize;
                         for (lane, l) in b.lanes.iter().enumerate() {
                             let span = |n: usize| lane * n..(lane + 1) * n;
                             let cycle = Cycle {
                                 candidates: head_outcome.candidates[span(candidates)].to_vec(),
                                 q_probs: head_outcome.q_probs[span(candidates)].to_vec(),
-                                uniforms: step.uniforms[span(uniforms)].to_vec(),
                             };
                             d.cycles.insert(req_ids_in_order[l.step].clone(), cycle);
                         }

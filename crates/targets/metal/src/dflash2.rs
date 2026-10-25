@@ -16,9 +16,48 @@ pub const ATTENTION_SPLITS: u32 = 4;
 pub const SAMPLING_SHARDS: u32 = 8;
 /// The candidates the selector keeps per proposal position (SPLASH_DRAFT_CANDIDATES).
 pub const CANDIDATES: u32 = 16;
-/// The uniforms one lane draws a cycle with (SPLASH_SAMPLING_UNIFORMS: the initial draw, a draw
-/// per proposal, an acceptance test per proposal, the correction): `dflash2_cycle.h`.
+/// The uniforms one lane draws a step with (SPLASH_SAMPLING_UNIFORMS: the initial draw, a draw
+/// per proposal, an acceptance test per proposal, the correction), the stride of their counters
+/// ([`draft_uniform`]): `dflash2_cycle.h`.
 pub const SAMPLING_UNIFORMS: u32 = 1 + 2 * PROPOSALS + 1;
+/// The first of a step's draws for its proposals, its acceptance tests and its correction
+/// (`DRAFT_UNIFORM_*`).
+pub const UNIFORM_PROPOSALS: u32 = 1;
+pub const UNIFORM_ACCEPTANCE: u32 = UNIFORM_PROPOSALS + PROPOSALS;
+pub const UNIFORM_CORRECTION: u32 = UNIFORM_ACCEPTANCE + PROPOSALS;
+
+/// A request's seed as a lane's kernels draw its uniforms from (`dflash2_cycle.h` `seed_lo`,
+/// `seed_hi`; Splash's `SamplingConfig::seed`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DraftSeed([u32; 2]);
+
+impl DraftSeed {
+    pub fn of(seed: u64) -> Self {
+        Self([seed as u32, (seed >> 32) as u32])
+    }
+
+    /// Its low and high words, as the lane structs carry them.
+    pub fn words(self) -> [u32; 2] {
+        self.0
+    }
+
+    pub fn get(self) -> u64 {
+        u64::from(self.0[0]) | (u64::from(self.0[1]) << 32)
+    }
+}
+
+/// Draw `draw` of a lane's step at verify position `position`: `dflash2_cycle.h` `draft_uniform`,
+/// Splash's sampling uniform (runtime/model/Runtime.cpp:834-840 `nextUniform`) of the counter
+/// `position · SAMPLING_UNIFORMS + draw`.
+pub fn draft_uniform(seed: DraftSeed, position: u32, draw: u32) -> f32 {
+    let counter = u64::from(position) * u64::from(SAMPLING_UNIFORMS) + u64::from(draw);
+    let mut value = (seed.get()).wrapping_add(counter.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    (value >> 40) as f32 / (1u64 << 24) as f32
+}
 /// A block's proposals (SPLASH_DRAFT_PROPOSAL_TOKENS) — its rows less the anchor.
 pub const PROPOSALS: u32 = 7;
 /// A verify-rows threadgroup: the walk and the verify rows run one thread.
@@ -101,7 +140,8 @@ impl VerifyRows {
     }
 }
 
-/// One lane's policy for a cycle (`dflash2_cycle.h` `DraftLaneParams`).
+/// One lane's policy for a cycle (`dflash2_cycle.h` `DraftLaneParams`), and the request's seed
+/// and the step's verify position its proposals draw their uniforms from ([`draft_uniform`]).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DraftLaneParams {
@@ -109,6 +149,8 @@ pub struct DraftLaneParams {
     pub sampling: u32,
     pub maximum: u32,
     pub remaining: u32,
+    pub seed: DraftSeed,
+    pub position: u32,
 }
 
 /// The shards a sampled verify row's softmax denominator is summed over
@@ -126,7 +168,8 @@ pub const VOCABULARY_RANGES: u32 = VOCABULARY_GROUPS * (VOCABULARY_THREADS / 32)
 /// drafts its verify carried (0 for a lane that decoded without), that row's position, the tokens
 /// it may still emit (at least one) and its stop tokens; whether it samples, its distribution's
 /// cuts — top-k (0: every token), temperature, top-p and min-p — and whether it ignores
-/// end-of-sequence.
+/// end-of-sequence; and the request's seed, its acceptance's and correction's uniforms drawn from
+/// it and `position` ([`draft_uniform`]).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct VerifyLane {
@@ -141,6 +184,7 @@ pub struct VerifyLane {
     pub top_p: f32,
     pub min_p: f32,
     pub exclude_stop: u32,
+    pub seed: DraftSeed,
 }
 
 /// Splash's acceptance of a cycle's verify, and its drafter's next block's inputs, picked on the
@@ -165,19 +209,18 @@ pub struct TargetSamplingKernels {
 /// Where one step's cycle reads and writes, in one buffer for `lanes` lanes of `rows`-row blocks,
 /// each section 256-aligned. The host writes each lane's [`VerifyLane`], the drafts its verify
 /// carried (`[lanes][rows - 1]` u32), their candidates and candidate probabilities
-/// (`[lanes][rows - 1][CANDIDATES]`, u32 and f32: the drafter's selection) and its uniforms
-/// (`[lanes][SAMPLING_UNIFORMS]` f32). The device writes the rows each lane retained and the
-/// drafts it accepted (`[lanes]` u32), its next block's input ids and positions
-/// (`[lanes][rows]` u32), and the target policy's scratch: each sampled row's
+/// (`[lanes][rows - 1][CANDIDATES]`, u32 and f32: the drafter's selection). The device writes the
+/// rows each lane retained and the drafts it accepted (`[lanes]` u32), its next block's input ids
+/// and positions (`[lanes][rows]` u32), and the target policy's scratch: each sampled row's
 /// `TargetVocabularyRow` (16 bytes), shard masses (12 bytes a shard), draw ranges (8 bytes a
-/// range) and arrival counter (`u32`, zero between dispatches).
+/// range) and arrival counter (`u32`, zero between dispatches). A cycle's uniforms are its
+/// kernels' own ([`draft_uniform`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CycleLayout {
     pub lanes: u64,
     pub drafted: u64,
     pub draft_ids: u64,
     pub draft_probs: u64,
-    pub uniforms: u64,
     pub retained: u64,
     pub accepted: u64,
     pub block_ids: u64,
@@ -206,7 +249,6 @@ impl CycleLayout {
             drafted: section(lanes * proposals * 4),
             draft_ids: section(candidates * 4),
             draft_probs: section(candidates * 4),
-            uniforms: section(lanes * u64::from(SAMPLING_UNIFORMS) * 4),
             retained: section(lanes * 4),
             accepted: section(lanes * 4),
             block_ids: section(lanes * rows * 4),
@@ -221,7 +263,7 @@ impl CycleLayout {
 
     /// The acceptance's bindings in a buffer at `base`, the target's tokens (one a sampled row) at
     /// `tokens`.
-    pub fn accept(self, base: u64, tokens: u64) -> [u64; 11] {
+    pub fn accept(self, base: u64, tokens: u64) -> [u64; 10] {
         [
             base + self.lanes,
             base + self.drafted,
@@ -233,7 +275,6 @@ impl CycleLayout {
             base + self.draft_ids,
             base + self.draft_probs,
             base + self.vocabulary_rows,
-            base + self.uniforms,
         ]
     }
 
@@ -256,7 +297,6 @@ impl CycleLayout {
                 at(self.drafted),
                 at(self.draft_ids),
                 at(self.draft_probs),
-                at(self.uniforms),
                 tokens,
                 at(self.ranges),
                 at(self.arrivals),

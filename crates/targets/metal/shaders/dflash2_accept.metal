@@ -63,13 +63,13 @@ inline void finish_acceptance(device const uint *tokens, uint accepted, VerifyLa
 // A sampled lane's verify rows carry their draft tokens' target probabilities
 // (TargetVocabularyRow), and its output tokens their draws: the correction a rejection takes or,
 // for the last row, the bonus token. Acceptance overwrites the accepted rows with the draft
-// tokens, so row `accepted` keeps its draw.
+// tokens, so row `accepted` keeps its draw. Draft token p is tested against the step's uniform
+// DRAFT_UNIFORM_ACCEPTANCE + p (`draft_uniform`).
 inline void accept_sampled_lane(device const uint *draft_tokens, device const uint *draft_ids,
                                 device const float *draft_probs,
                                 device const TargetVocabularyRow *target_rows,
-                                device const float *uniforms, device uint *output_tokens,
-                                VerifyLane params, device uint &retained,
-                                device uint &accepted_count) {
+                                device uint *output_tokens, VerifyLane params,
+                                device uint &retained, device uint &accepted_count) {
   uint accepted = 0;
   while (accepted < params.drafts) {
     const uint token = draft_tokens[accepted];
@@ -77,7 +77,9 @@ inline void accept_sampled_lane(device const uint *draft_tokens, device const ui
                                   draft_probs + accepted * kDraftCandidates, kDraftCandidates,
                                   token);
     const float p = target_rows[accepted].draft_probability;
-    if (!(uniforms[DRAFT_UNIFORM_ACCEPTANCE + accepted] * q < p))
+    const float uniform = draft_uniform(params.seed_lo, params.seed_hi, params.position,
+                                        DRAFT_UNIFORM_ACCEPTANCE + accepted);
+    if (!(uniform * q < p))
       break;
     output_tokens[accepted] = token;
     ++accepted;
@@ -104,7 +106,6 @@ inline void accept_greedy_lane(device const uint *draft_tokens, device uint *tar
                                device const uint *draft_ids [[buffer(7)]],
                                device const float *draft_probs [[buffer(8)]],
                                device const TargetVocabularyRow *target_rows [[buffer(9)]],
-                               device const float *uniforms [[buffer(10)]],
                                uint lane [[threadgroup_position_in_grid]]) {
   const VerifyLane params = lanes[lane];
   device const uint *draft = drafted + lane * ACCEPT_PROPOSALS;
@@ -112,8 +113,8 @@ inline void accept_greedy_lane(device const uint *draft_tokens, device uint *tar
   if (params.sampling != 0) {
     const ulong candidates = ulong(lane) * ACCEPT_PROPOSALS * kDraftCandidates;
     accept_sampled_lane(draft, draft_ids + candidates, draft_probs + candidates,
-                        target_rows + lane * ACCEPT_ROWS, uniforms + lane * DRAFT_SAMPLING_UNIFORMS,
-                        target, params, retained[lane], accepted_count[lane]);
+                        target_rows + lane * ACCEPT_ROWS, target, params, retained[lane],
+                        accepted_count[lane]);
   } else {
     accept_greedy_lane(draft, target, params, retained[lane], accepted_count[lane]);
   }
