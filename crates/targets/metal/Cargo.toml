@@ -76,6 +76,8 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     "MTL4CommandEncoder",
     "MTL4CommandQueue",
     "MTL4CommitFeedback",
+    # The commit feedback's GPU start and end times (CFTimeInterval): a forward's GPU span.
+    "objc2-core-foundation",
     "MTL4Compiler",
     "MTL4ComputeCommandEncoder",
     "MTL4ComputePipeline",

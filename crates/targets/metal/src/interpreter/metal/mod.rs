@@ -42,7 +42,7 @@ pub use pipelines::{GEMV_ROWS, PipelineLookupError, SpecializedPipelines};
 pub use crate::BLOCKS_PER_CHUNK;
 pub use forward::{
     Deferral, DeviceInput, DeviceInputInto, DraftInputs, ForwardError, ForwardInputs, ForwardReads,
-    InFlight, build_mrope_cos_sin_override,
+    GpuSpan, InFlight, build_mrope_cos_sin_override, last_gpu_span,
 };
 pub use pool::{
     FoldBand, MetalBucketSpec, MetalRungs, MetalWorkerPool, Onto, PickedRung, PoolBuildError,

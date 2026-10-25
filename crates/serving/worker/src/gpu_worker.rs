@@ -4511,10 +4511,12 @@ impl MetalWorker {
                 .last_forward_end
                 .replace(end)
                 .map(|last| ms(forward_start - last));
+            let gpu = scratchy_target_metal::interpreter::metal::last_gpu_span();
             tracing::debug!(
-                "forward of {} rows: {:.2} ms, host {:.2} ms since the last",
+                "forward of {} rows: {:.2} ms, gpu {:.3} ms, host {:.2} ms since the last",
                 req.num_tokens,
                 ms(end - forward_start),
+                ms(gpu.0),
                 host.unwrap_or(f64::NAN),
             );
         }
