@@ -2730,70 +2730,104 @@ fn expected_correction(
     token as u32
 }
 
-/// Splash's `speculativeExactness` (its penalties wait for their port): acceptance over the
-/// policy's rows must accept and correct as a sequential decode would. Lane 0 drafts its first
-/// wrong token at position 3, lane 1 every token right, taking the bonus row.
+/// Splash's `speculativeExactness` (its penalties wait for their port), over every sampling mask
+/// of its two lanes as Splash's main loop runs it (target_sampling_metal_test.mm:2636):
+/// acceptance over the policy's rows must accept and correct as a sequential decode would. Lane 0
+/// drafts its first wrong token at position 3, lane 1 every token right, taking the bonus row. A
+/// greedy lane's rows are scratchy's argmax, which writes every row's token before the policy
+/// overwrites the sampled lanes': here each row's reference argmax.
 #[test]
 fn target_policy_and_acceptance_decode_as_a_sequential_decode_does() {
     let Some(gpu) = Gpu::new() else { return };
+    for mask in 0..4u32 {
+        exactness_over(&gpu, mask);
+    }
+}
+
+fn exactness_over(gpu: &Gpu, mask: u32) {
     let vocabulary = 1003;
     let wrong_at = [3usize, P];
-    let policy = Policy::new(32, 0.9, 0.9);
-    let mut random = Random(0x7370_6563);
-    let mut t = Targets::of(vocabulary, &[policy, policy], STOPS, 11);
+    let sampled = |lane: usize| mask >> lane & 1 == 1;
+    let policies: Vec<Policy> = (0..2)
+        .map(|lane| match sampled(lane) {
+            true => Policy::new(32, 0.9, 0.9),
+            false => Policy::new(1, 0.0, 0.9),
+        })
+        .collect();
+    let mut random = Random(0x7370_6563 + u64::from(mask));
+    let mut t = Targets::of(vocabulary, &policies, STOPS, 11 + u64::from(mask));
     let mut expected = [[0u32; ROWS as usize]; 2];
-    for lane in 0..2 {
+    let mut argmax = vec![0u32; t.rows()];
+    for (lane, expected) in expected.iter_mut().enumerate() {
         let mut base = vec![0.0f32; vocabulary];
         spiked_row(&mut base, &mut random);
         let mut targets = Vec::new();
         for row in 0..ROWS as usize {
+            let index = lane * ROWS as usize + row;
             let values: Vec<f32> = base.iter().map(|&b| b + 0.01 * random.unit()).collect();
-            t.set_row(lane * ROWS as usize + row, &values);
-            let logits = t.row(lane * ROWS as usize + row);
+            t.set_row(index, &values);
+            let logits = t.row(index);
             let order = reference_best(&logits, 8, Admission::default());
             assert!(
                 logits[order[0] as usize] - logits[order[1] as usize] > 1e-4,
                 "test data is ambiguous at a greedy selection"
             );
-            targets.push(reference_distribution(
-                &logits,
-                policy,
-                Admission::default(),
-            ));
+            argmax[index] = order[0];
+            targets.push(match sampled(lane) {
+                true => reference_distribution(&logits, policies[lane], Admission::default()),
+                false => Distribution::default(),
+            });
             if row == P {
                 break;
             }
             // The best token until the wrong position, then the eighth best.
             let right = row < wrong_at[lane];
             let draft = if right { order[0] } else { order[7] };
-            let p = targets[row].probability(draft);
-            assert!(
-                !right || p > 1e-4,
-                "a sampled lane drafted a token its target cannot accept"
-            );
-            t.set_tested_draft(lane, row, draft, p, right);
+            match sampled(lane) {
+                true => {
+                    let p = targets[row].probability(draft);
+                    let label = format!("mask {mask:02b}");
+                    assert!(
+                        !right || p > 1e-4,
+                        "{label}: a sampled lane drafted a token its target cannot accept"
+                    );
+                    t.set_tested_draft(lane, row, draft, p, right);
+                }
+                false => t.set_one_hot_draft(lane, row, draft, 1.0),
+            }
         }
         let accepted = wrong_at[lane];
-        expected[lane][..accepted].copy_from_slice(&t.drafted[lane * P..lane * P + accepted]);
-        let draft = (accepted < P).then(|| t.drafted[lane * P + accepted]);
-        let uniform = f64::from(t.correction_uniform(lane));
-        expected[lane][accepted] =
-            expected_correction(&targets[accepted], draft, uniform, &format!("lane {lane}"));
+        expected[..accepted].copy_from_slice(&t.drafted[lane * P..lane * P + accepted]);
+        expected[accepted] = match sampled(lane) {
+            true => {
+                let draft = (accepted < P).then(|| t.drafted[lane * P + accepted]);
+                let uniform = f64::from(t.correction_uniform(lane));
+                let label = format!("mask {mask:02b} lane {lane}");
+                expected_correction(&targets[accepted], draft, uniform, &label)
+            }
+            false => argmax[lane * ROWS as usize + accepted],
+        };
     }
-    let drawn = t.run(&gpu);
-    let got = t.accept(&gpu, &drawn);
-    for lane in 0..2 {
+    let mut drawn = t.run(gpu);
+    for (index, &token) in argmax.iter().enumerate() {
+        if !sampled(index / ROWS as usize) {
+            drawn.tokens[index] = token;
+        }
+    }
+    let got = t.accept(gpu, &drawn);
+    for (lane, expected) in expected.iter().enumerate() {
         let accepted = wrong_at[lane];
+        let label = format!("mask {mask:02b} lane {lane}");
         assert_eq!(
             (got.accepted[lane], got.retained[lane]),
             (accepted as u32, accepted as u32 + 1),
-            "lane {lane} accepted"
+            "{label} accepted"
         );
         let first = lane * ROWS as usize;
         assert_eq!(
             got.tokens[first..=first + accepted],
-            expected[lane][..=accepted],
-            "lane {lane}: output differs from a sequential decode"
+            expected[..=accepted],
+            "{label}: output differs from a sequential decode"
         );
     }
 }
