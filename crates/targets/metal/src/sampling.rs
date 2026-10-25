@@ -353,6 +353,8 @@ pub struct SamplerArena {
     reps_buf: Buffer, // [max_rows] f32 each
     freqs_buf: Buffer,
     press_buf: Buffer,
+    // Penalty history counts, [max_rows, vocab]; all zero between steps.
+    penalty_counts_buf: Buffer,
     row_state_buf: Buffer, // [max_rows, ROW_STATE_LEN]
     partials_buf: Buffer,  // [sliced_max, 3]
     hist_buf: Buffer,      // [max_rows, DESCENT_HIST_LEN]
@@ -446,9 +448,10 @@ impl SamplerArena {
     pub fn bytes_per_row(vocab: u32, max_hist: u32) -> usize {
         let n = 1usize; // per-row terms only
         let h = max_hist.max(1) as usize;
-        // `mk(n * vocab * 4, "scratch")` + row_idx/reps/freqs/press (4·n)
-        // + out_ids + prompt_ids (2·n·h) + row_state (16·n) + hist.
-        n * (vocab as usize * 4 + 4 * 3 + 2 * h * 4 + 16 * 4 + DESCENT_HIST_LEN * 4)
+        // `mk(n * vocab * 4, "scratch")` + penalty counts (the same) +
+        // row_idx/reps/freqs/press (4·n) + out_ids + prompt_ids (2·n·h) +
+        // row_state (16·n) + hist.
+        n * (2 * vocab as usize * 4 + 4 * 3 + 2 * h * 4 + 16 * 4 + DESCENT_HIST_LEN * 4)
             // The sliced buffers scale with `sliced_max(nrows)` — the slice
             // target while rows are interior, `nrows` once they alone fill
             // the machine. Their per-row slope at small `n` is the slice
@@ -508,6 +511,7 @@ impl SamplerArena {
         let row_state_buf = mk(n * ROW_STATE_LEN * 4, "row_state");
         let partials_buf = mk(sliced_max * 3 * 4, "partials");
         let hist_buf = mk(n * DESCENT_HIST_LEN * 4, "hist");
+        let penalty_counts_buf = mk(n * vocab as usize * 4, "penalty_counts");
         let counts_buf = mk(sliced_max * 4 * 4, "counts");
         let staging_buf = mk(sliced_max * 4 * 1024 * 4, "staging");
         let consts_buf = mk(4 * 4, "consts");
@@ -532,7 +536,7 @@ impl SamplerArena {
                 .newArgumentTableWithDescriptor_error(&desc)
                 .expect("sampler arg table alloc")
         };
-        let softmax_reduce_at = mk_table(12);
+        let softmax_reduce_at = mk_table(13);
         let softmax_materialize_at = mk_table(5);
         let descent_at = mk_table(4);
         let count_compact_at = mk_table(6);
@@ -558,6 +562,7 @@ impl SamplerArena {
             row_state_buf,
             partials_buf,
             hist_buf,
+            penalty_counts_buf,
             counts_buf,
             staging_buf,
             consts_buf,
@@ -613,6 +618,7 @@ impl SamplerArena {
             partials,
             consts,
             hist,
+            a(&self.penalty_counts_buf),
         ];
         let finalize = [
             staging, counts, row_state, scratch, row_idx, forward, consts,
@@ -1418,31 +1424,44 @@ mod tests {
         njobs: u32,
         vocab: u32,
     ) -> Option<Vec<f32>> {
-        use objc2_metal::MTLBuffer as _;
         let kernels = baked(device, vocab as usize, CastDtype::F32);
+        let set = MetalResidencySet::new(device);
+        let max_hist = params.max_output_len.max(params.max_prompt_len).max(1);
+        let arena = SamplerArena::new(device, &set, njobs, &kernels, max_hist);
+        set.commit();
+        reduce_step(device, &kernels, &arena, &set, params, logits, njobs)
+    }
+
+    /// One step's reduce stage on `arena` (resident through `set`, as a
+    /// worker's is through its own): the scratch it writes (the post-penalty
+    /// f32 logits) for every row. The rest of the pipeline would rewrite the
+    /// scratch, so stop after the reduce.
+    fn reduce_step(
+        device: &Device,
+        kernels: &SamplerKernels,
+        arena: &std::sync::Arc<SamplerArena>,
+        set: &MetalResidencySet,
+        params: &scratchy_core_common::GpuSampleParams,
+        logits: &[f32],
+        njobs: u32,
+    ) -> Option<Vec<f32>> {
+        use objc2_metal::{MTL4ArgumentTable as _, MTLBuffer as _};
         let logits_buf = shared_slice(device, logits);
         let batch = Mtl4DispatchBatch::begin(device)?;
-        let (pending, arena, _logits_pin) = {
-            let res = batch.residency();
-            let max_hist = params.max_output_len.max(params.max_prompt_len).max(1);
-            let arena = SamplerArena::new(device, res, njobs, &kernels, max_hist);
-            let pending = arena.prepare_step(params, njobs, None);
-            (pending, arena, res.pin(logits_buf.clone()))
-        };
-        let enc = batch.encoder();
-        // The reduce stage writes the penalized f32 logits to the scratch; the
-        // rest would rewrite it, so stop after it. Bind the logits into its
-        // table first (the arena's tables are already fully bound otherwise).
-        use objc2_metal::MTL4ArgumentTable as _;
+        batch.declare(set);
+        let _logits_pin = batch.residency().pin(logits_buf.clone());
+        let pending = arena.prepare_step(params, njobs, None);
+        // Bind the logits into the reduce's table (the arena's tables are
+        // already fully bound otherwise).
         unsafe {
             (arena.softmax_reduce_at).setAddress_atIndex(logits_buf.gpuAddress(), 1);
         }
         let sliced = njobs * pending.nslices;
         let reduce = kernels.stage(SamplerStage::SoftmaxReduce);
-        encode_sampler_stage_into_mtl4(enc, reduce, &arena.softmax_reduce_at, sliced);
+        encode_sampler_stage_into_mtl4(batch.encoder(), reduce, &arena.softmax_reduce_at, sliced);
         batch.commit(true);
-        let scratch = &arena.scratch_f32;
-        Some(read_slice::<f32>(scratch, njobs as usize * vocab as usize))
+        let rows = njobs as usize * arena.vocab as usize;
+        Some(read_slice::<f32>(&arena.scratch_f32, rows))
     }
 
     #[test]
@@ -1621,6 +1640,96 @@ mod tests {
                 "row0 penalty mismatch at {i}: got {} golden {}",
                 got[i],
                 golden0[i]
+            );
+        }
+    }
+
+    /// The reduce counts a row's histories into the arena's penalty counts and
+    /// zeroes every count it reads, so a step is penalized by its own histories
+    /// alone: on an arena that already ran a penalized step, a step's logits
+    /// are bit for bit a fresh arena's. The first step's penalties must move
+    /// its logits, or a count it left behind could go unseen.
+    #[test]
+    fn penalty_counts_do_not_carry_into_the_next_step() {
+        let Some(device) = crate::device::detect_device() else {
+            eprintln!("skipping: no metal device");
+            return;
+        };
+        let device = device.device.clone();
+        if Mtl4DispatchBatch::begin(&device).is_none() {
+            eprintln!("skipping: no MTL4 queue");
+            return;
+        }
+
+        let (vocab, njobs) = (1024usize, 2u32);
+        let mut rng = Rng(0x5EED_0FC0_DE00);
+        let logits: Vec<f32> = (0..2 * vocab).map(|_| rng.range(-5.0, 5.0)).collect();
+        // Two rows' histories, padded with `vocab` to 8 ids a row; the ids
+        // spread over the row so several slices count.
+        let step = |out: [&[i32]; 2], prompt: [&[i32]; 2]| {
+            let max = 8usize;
+            let pad = |rows: [&[i32]; 2]| -> Vec<i32> {
+                let mut flat = vec![vocab as i32; 2 * max];
+                for (r, ids) in rows.iter().enumerate() {
+                    flat[r * max..r * max + ids.len()].copy_from_slice(ids);
+                }
+                flat
+            };
+            scratchy_core_common::GpuSampleParams {
+                row_indices: vec![0, 1],
+                rep_penalties: vec![1.3, 1.1],
+                freq_penalties: vec![0.7, 0.2],
+                pres_penalties: vec![0.4, 0.3],
+                output_token_ids: pad(out),
+                prompt_token_ids: pad(prompt),
+                max_output_len: max as u32,
+                max_prompt_len: max as u32,
+                any_penalty: true,
+                temperatures: vec![1.0; 2],
+                top_ks: vec![0; 2],
+                top_ps: vec![1.0; 2],
+                min_ps: vec![0.0; 2],
+                uniforms: vec![0.5; 2],
+            }
+        };
+        let first = step([&[5, 5, 300], &[900]], [&[5, 640], &[17, 900, 1023]]);
+        let second = step([&[77], &[5, 5]], [&[512, 77], &[]]);
+
+        let kernels = baked(&device, vocab, CastDtype::F32);
+        let arena = |set: &MetalResidencySet| {
+            let arena = SamplerArena::new(&device, set, njobs, &kernels, 8);
+            set.commit();
+            arena
+        };
+        let (used_set, fresh_set) = (
+            MetalResidencySet::new(&device),
+            MetalResidencySet::new(&device),
+        );
+        let (used, fresh) = (arena(&used_set), arena(&fresh_set));
+        let run = |arena, set, params| {
+            reduce_step(&device, &kernels, arena, set, params, &logits, njobs).expect("MTL4 queue")
+        };
+
+        let penalized = run(&used, &used_set, &first);
+        let moved = (0..2 * vocab)
+            .filter(|&i| penalized[i].to_bits() != logits[i].to_bits())
+            .count();
+        assert_eq!(
+            moved, 6,
+            "the first step penalizes its 6 distinct (row, token) pairs"
+        );
+
+        let got = run(&used, &used_set, &second);
+        let want = run(&fresh, &fresh_set, &second);
+        for i in 0..2 * vocab {
+            assert_eq!(
+                got[i].to_bits(),
+                want[i].to_bits(),
+                "row {} token {}: {} after a penalized step, {} on a fresh arena",
+                i / vocab,
+                i % vocab,
+                got[i],
+                want[i]
             );
         }
     }
@@ -2164,9 +2273,9 @@ mod tests {
 
     /// Times the full pipeline on gemma-4-26b-shaped bf16 logits (vocab
     /// 262144) — the exact sizes `scr chat`'s decode pays — at the default
-    /// sampling settings, top_k=0, and a 4-job batch. Median commit-wait of
-    /// `run_pipeline` — an upper bound on the GPU time (includes the host
-    /// event wait).
+    /// sampling settings, top_k=0, a 4-job batch, and a repetition penalty
+    /// over prompts of 1k to 16k tokens. Median commit-wait of `run_pipeline`
+    /// — an upper bound on the GPU time (includes the host event wait).
     ///
     /// Run:
     ///   cargo test --release -p scratchy-target-metal --lib time_sampler_stages -- --nocapture
@@ -2192,12 +2301,20 @@ mod tests {
             .collect();
         let kernels = baked(&device, vocab as usize, CastDtype::Bf16);
 
-        for (label, njobs, top_k, top_p) in [
-            ("top_k=64, top_p=0.95, 1 row", 1u32, 64, 0.95),
-            ("top_k=0 → 1024 cap, 1 row", 1, 0, 1.0),
-            ("top_k=64, top_p=0.95, 4 rows", 4, 64, 0.95),
+        // `prompt`: the length of each row's prompt, whose distinct tokens a
+        // repetition penalty of 1.05 reshapes; 0 = no penalty.
+        for (label, njobs, top_k, top_p, prompt) in [
+            ("top_k=64, top_p=0.95, 1 row", 1u32, 64, 0.95, 0usize),
+            ("top_k=0 → 1024 cap, 1 row", 1, 0, 1.0, 0),
+            ("top_k=64, top_p=0.95, 4 rows", 4, 64, 0.95, 0),
+            ("top_k=20, top_p=0.8, rep 1.05 × 1k", 1, 20, 0.8, 1024),
+            ("top_k=20, top_p=0.8, rep 1.05 × 4k", 1, 20, 0.8, 4096),
+            ("top_k=20, top_p=0.8, rep 1.05 × 16k", 1, 20, 0.8, 16384),
         ] {
             let n = njobs as usize;
+            let prompt_ids: Vec<i32> = (0..n * prompt)
+                .map(|i| ((i % prompt.max(1)) * 7919 % vocab as usize) as i32)
+                .collect();
             let params = scratchy_core_common::GpuSampleParams {
                 row_indices: (0..njobs).collect(),
                 temperatures: vec![1.0; n],
@@ -2205,6 +2322,12 @@ mod tests {
                 top_ps: vec![top_p; n],
                 min_ps: vec![0.0; n],
                 uniforms: vec![0.5; n],
+                rep_penalties: vec![1.05; n],
+                freq_penalties: vec![0.0; n],
+                pres_penalties: vec![0.0; n],
+                any_penalty: prompt > 0,
+                prompt_token_ids: prompt_ids,
+                max_prompt_len: prompt as u32,
                 ..Default::default()
             };
             let logits = row.repeat(n);

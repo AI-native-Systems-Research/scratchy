@@ -68,6 +68,7 @@
 //   tokens                    [total_n] uint     (the step's argmax; each
 //                                                 job's draw overwrites its row)
 //   consts                    (nslices, nrows, max_out, max_prompt)
+//   penalty_counts            [nrows, vocab] uint (the reduce; zero between steps)
 //   telemetry spill           (sampler-telemetry only)
 //
 // row_state[row] layout (u32 words; host writes 0..8, GPU the rest):
@@ -309,13 +310,33 @@ inline uint2 descent_pick(device const uint* h, uint round, uint k, uint2 prior,
 // the row sum equals the single-threadgroup value up to reduction order (the
 // parity harness's robustness margins exist for exactly this class of
 // few-ULP difference). It also zeroes the row's descent histograms.
-// Penalties, unchanged from cuda:
+// Penalties, the cuda arithmetic:
 //   count = occurrences in output_token_ids[row] + prompt_token_ids[row]
 //   if count > 0: logit = logit > 0 ? logit / rep : logit * rep;
 //                 logit -= freq * count + pres
 // Token id == vocab_size is padding (never matches a real vocab index); a
 // step without penalties has empty histories (consts[2], consts[3] = 0).
+// The counts come from ONE walk of the histories per slice
+// (`count_slice_history`) into the row's `penalty_counts`, not a walk per vocab
+// entry: O(vocab + slices * history) a row, where cuda's per-entry scan is
+// O(vocab * history). The thread that reads a count resets it, so the counts
+// are all zero between steps (and from the arena's zeroed allocation before
+// the first).
 // ---------------------------------------------------------------------------
+
+// Count each of `ids[0..len]` that falls in the slice `b` into `counts` (the
+// row's, indexed by token id). An id outside the slice is another slice's;
+// padding (== vocab) is no slice's.
+inline void count_slice_history(device const int* ids, uint len, device uint* counts,
+                                uint2 b, uint tid) {
+    for (uint j = tid; j < len; j += SAMPLING_BLOCK_SIZE) {
+        uint t = (uint)ids[j];
+        if (t >= b.x && t < b.y) {
+            atomic_fetch_add_explicit((device atomic_uint*)(counts + t), 1u,
+                                      memory_order_relaxed);
+        }
+    }
+}
 
 template <typename T>
 [[kernel]] void sample_softmax_reduce(
@@ -331,6 +352,7 @@ template <typename T>
     device       uint*  partials          [[buffer(9)]],
     constant     uint*  consts            [[buffer(10)]],
     device       uint*  hist              [[buffer(11)]],
+    device       uint*  penalty_counts    [[buffer(12)]],
     uint tgp [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]])
 {
@@ -345,6 +367,7 @@ template <typename T>
     device float* rowp = scratch + (size_t)row * vocab;
     device const int* out_ids    = output_token_ids + (size_t)row * max_output_len;
     device const int* prompt_ids = prompt_token_ids + (size_t)row * max_prompt_len;
+    device uint* counts = penalty_counts + (size_t)row * vocab;
     float rep_pen  = rep_penalties[row];
     float freq_pen = freq_penalties[row];
     float pres_pen = pres_penalties[row];
@@ -358,25 +381,31 @@ template <typename T>
     float inv_temp = 1.0f / as_type<float>(state[0]);
 
     float local_max = -INFINITY;
-    for (uint v = b.x + tid; v < b.y; v += SAMPLING_BLOCK_SIZE) {
-        float logit = float(in[v]);
-        int count = 0;
-        for (uint j = 0; j < max_output_len; j++) {
-            if (out_ids[j] == (int)v) count++;
+    if (max_output_len + max_prompt_len == 0) {
+        for (uint v = b.x + tid; v < b.y; v += SAMPLING_BLOCK_SIZE) {
+            float logit = float(in[v]);
+            rowp[v] = logit;
+            local_max = max(local_max, logit * inv_temp);
         }
-        for (uint j = 0; j < max_prompt_len; j++) {
-            if (prompt_ids[j] == (int)v) count++;
-        }
-        if (count > 0) {
-            if (logit > 0.0f) {
-                logit /= rep_pen;
-            } else {
-                logit *= rep_pen;
+    } else {
+        count_slice_history(out_ids, max_output_len, counts, b, tid);
+        count_slice_history(prompt_ids, max_prompt_len, counts, b, tid);
+        threadgroup_barrier(mem_flags::mem_device);
+        for (uint v = b.x + tid; v < b.y; v += SAMPLING_BLOCK_SIZE) {
+            float logit = float(in[v]);
+            uint count = counts[v];
+            if (count > 0) {
+                counts[v] = 0;
+                if (logit > 0.0f) {
+                    logit /= rep_pen;
+                } else {
+                    logit *= rep_pen;
+                }
+                logit -= freq_pen * (float)count + pres_pen;
             }
-            logit -= freq_pen * (float)count + pres_pen;
+            rowp[v] = logit;
+            local_max = max(local_max, logit * inv_temp);
         }
-        rowp[v] = logit;
-        local_max = max(local_max, logit * inv_temp);
     }
     float slice_max = block_reduce_max(local_max, s_warp_buf, tid);
 
