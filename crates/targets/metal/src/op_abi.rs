@@ -357,13 +357,10 @@ pub const METAL_SORTED_PAIRS: u32 = 64;
 pub const METAL_GROUPED_PAIRS_PER_EXPERT: f32 = 4.0;
 
 /// The pairs per expert at which a bake sorts the per-pair matvecs' rows by expert, so an expert
-/// two rows pick is read once: Splash's rule for its expert tiles (~/git/splash
-/// runtime/ops/MoE.hpp:208-221 `moeGgufPrefillTile`), 8-row tiles of an expert's routes while
-/// they average at most one row per expert (`rows * topK <= experts`), which every decode plan
-/// runs (`MoeConfig::expertTile`). Exactly one per expert keeps the gathered matvecs it had
-/// (gpt-oss at bucket 32, unmeasured sorted). Thicker, the sorted matvecs lose to the gathered
-/// ones on a short prompt (Qwen3.6, 2 per expert: 161 ms vs 98 ms).
-pub const METAL_SORTED_PAIRS_PER_EXPERT: std::ops::Range<f32> = 0.0..1.0;
+/// two rows pick is read once: where it was measured to win (#232: Gemma-4's 128 experts at
+/// bucket 8, the full conc-8 decode step). Thicker, the sorted matvecs lose to the gathered ones on
+/// a short prompt (Qwen3.6, 2 per expert: 161 ms vs 98 ms).
+pub const METAL_SORTED_PAIRS_PER_EXPERT: std::ops::Range<f32> = 0.5..1.0;
 
 /// The bucket rows from which a gathered bake's gate/up command runs the pairs that share an
 /// expert in the expert's first pair (`SharedExperts::InFirstPair`, up to [`METAL_VERIFY_ROWS`]):
