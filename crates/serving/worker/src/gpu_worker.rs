@@ -7614,14 +7614,15 @@ impl Worker for MetalWorker {
         // ── Constrained / guided decoding: gather this step's grammar
         // allow-masks ───────────────────────────────────────────────────
         // For every request with an active grammar FSM that will sample a
-        // real token this step, build a dense vocab bitset of its allowed
-        // tokens and record the logits row to mask (`sampled_rows.last_of(i)`).
-        // The mask is dispatched before argmax in `forward_argmax_blocking`
-        // (it `.take()`s `grammar_pending`), and the FSM is advanced with the
-        // sampled token after readback. Skipped (no overhead) when no request
-        // is constrained. Speculative-verify rows are excluded: grammar needs
-        // a host `advance()` between every token, which the K-row verify can't
-        // provide, so a grammar request must not also carry spec drafts.
+        // real token this step, build a dense vocab bitset of each sampled
+        // row's allowed tokens and record the logits row to mask. A verify's
+        // rows take the allow-sets along its drafts (`verify_masks`, Splash's
+        // per-row constraint masks), any other request's one row its current
+        // set. The mask is dispatched before argmax and every sampler, the
+        // block drafter's target policy and acceptance among them (it
+        // `.take()`s `grammar_pending`), and the FSM is advanced with the
+        // committed tokens after readback. Skipped (no overhead) when no
+        // request is constrained.
         #[cfg(feature = "guided-decoding")]
         {
             self.grammar_pending = None;
@@ -7635,23 +7636,23 @@ impl Worker for MetalWorker {
                         if !prepared.req_inputs[i].emits_token {
                             continue;
                         }
-                        // Speculative verify batch → unsupported with grammar.
-                        if !prepared.req_inputs[i].spec_token_ids.is_empty() {
-                            continue;
-                        }
                         let Some(guide) = self.grammar_states.get_mut(req_id) else {
                             continue;
                         };
-                        // `None` => grammar terminated; leave the row unmasked.
-                        let Some(allowed) = guide.allowed_tokens() else {
-                            continue;
-                        };
-                        rows.push(sampled_rows.last_of(i) as u32);
-                        scratchy_target_metal::grammar_mask::push_allow_bitset_row(
-                            &mut allow_bits,
-                            &allowed,
-                            vocab,
-                        );
+                        let masks = guide.verify_masks(&prepared.req_inputs[i].spec_token_ids);
+                        for (row, allowed) in sampled_rows.of_seq(i).zip(masks) {
+                            // `None` => no mask applies (terminated, or thinking); leave the row
+                            // unmasked.
+                            let Some(allowed) = allowed else {
+                                continue;
+                            };
+                            rows.push(row as u32);
+                            scratchy_target_metal::grammar_mask::push_allow_bitset_row(
+                                &mut allow_bits,
+                                &allowed,
+                                vocab,
+                            );
+                        }
                     }
                     if !rows.is_empty() {
                         self.grammar_pending = Some(GrammarMaskHost { rows, allow_bits });
@@ -8669,20 +8670,19 @@ impl Worker for MetalWorker {
         self.sampler_logits = None;
 
         // ── 6.65. Constrained / guided decoding: advance grammar FSMs ──
-        // Feed each grammar request its just-sampled (masked) token so the
-        // next step's allow-set reflects it. Only the masked path (non-spec,
-        // single emitted token) is advanced; speculative-verify rows are not
-        // grammar-masked and are left untouched. `advance` returning false
-        // means the sampled token wasn't in the grammar's allow-set — a
-        // mask/FSM desync that should never happen, surfaced as a warning.
+        // Feed each grammar request the tokens it just committed, in order —
+        // a verify's accepted drafts and its correction, any other request's
+        // one token, each from a masked row — so the next step's allow-sets
+        // reflect them. `advance` returning false means a token wasn't in the
+        // grammar's allow-set — a mask/FSM desync that should never happen,
+        // surfaced as a warning.
         #[cfg(feature = "guided-decoding")]
         if !self.grammar_states.is_empty() {
             for (i, req_id) in req_ids_in_order.iter().enumerate() {
-                if was_spec_decode[i] || sampled_token_ids[i].len() != 1 {
+                let Some(guide) = self.grammar_states.get_mut(req_id) else {
                     continue;
-                }
-                if let Some(guide) = self.grammar_states.get_mut(req_id) {
-                    let tok = sampled_token_ids[i][0];
+                };
+                for &tok in &sampled_token_ids[i] {
                     if !guide.advance(tok) {
                         tracing::warn!(
                             "guided-decoding: req {req_id} sampled token {tok} rejected by \

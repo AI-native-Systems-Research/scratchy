@@ -374,18 +374,50 @@ impl GrammarGuide {
     /// thinking starts the grammar from the next token. At a reply's first token, the one that
     /// opens thinking starts it; any other is the grammar's first.
     pub fn advance(&mut self, token_id: TokenId) -> bool {
+        self.step(token_id).is_some()
+    }
+
+    /// The tokens each row of a verify of `drafts` may take: row `j`'s after `drafts[..j]`, through
+    /// the row of the first draft the grammar refuses — its acceptance stops there, so no row past
+    /// it is kept. `None` where no mask applies. Splash's constraint masks, which a constrained
+    /// cycle's verify rows read, one a row (~/git/splash runtime/model/Runtime.cpp:1032-1051,
+    /// 2935-2941). The guide is left as it was.
+    pub fn verify_masks(&mut self, drafts: &[TokenId]) -> Vec<Option<Vec<TokenId>>> {
+        let (think, terminated) = (self.think, self.terminated);
+        let mut consumed = 0;
+        let mut masks = vec![self.allowed_tokens()];
+        for &draft in drafts {
+            let refused =
+                (masks.last().and_then(Option::as_ref)).is_some_and(|a| !a.contains(&draft));
+            match refused {
+                true => break,
+                false => match self.step(draft) {
+                    Some(n) => consumed += n,
+                    None => break,
+                },
+            }
+            masks.push(self.allowed_tokens());
+        }
+        // Every token `step` consumed it consumed validly, so the matcher holds them to give back.
+        let _ = self.matcher.rollback(consumed);
+        (self.think, self.terminated) = (think, terminated);
+        masks
+    }
+
+    /// [`Self::advance`]: the tokens its matcher consumed (0 or 1), `None` on an invalid one.
+    fn step(&mut self, token_id: TokenId) -> Option<usize> {
         match self.think {
             Some(ThinkFirst::Thinking { close }) => {
                 if token_id == close {
                     self.think = None;
                 }
-                return true;
+                return Some(0);
             }
             Some(ThinkFirst::MayOpen(tokens)) if token_id == tokens.open => {
                 self.think = Some(ThinkFirst::Thinking {
                     close: tokens.close,
                 });
-                return true;
+                return Some(0);
             }
             Some(ThinkFirst::MayOpen(_)) => self.think = None,
             None => {}
@@ -394,9 +426,9 @@ impl GrammarGuide {
             // Grammar already stopped — this token is EOS (or garbage after
             // stopped). Mark terminated so `allowed_tokens()` returns None.
             self.terminated = true;
-            return true;
+            return Some(0);
         }
-        self.matcher.consume_token(token_id).is_ok()
+        self.matcher.consume_token(token_id).ok().map(|()| 1)
     }
 
     /// Check if the parser is in a finished/stopped state.
@@ -560,6 +592,43 @@ mod tests {
             }
         }"#;
         build_parser_factory(tokenizer_json.as_bytes(), stop_token_ids).unwrap()
+    }
+
+    /// A verify's rows take the allow-sets along its drafts: row `j`'s after the first `j`, through
+    /// the first draft the grammar refuses, and the guide is where it was after.
+    #[test]
+    fn verify_masks_follow_the_drafts_and_leave_the_guide() {
+        let factory = make_test_factory();
+        let mut guide = GrammarGuide::from_regex("ab[0-9]", &factory).unwrap();
+        let start = guide.allowed_tokens();
+        assert_eq!(start.as_deref(), Some(&[11][..]), "only `a` starts it");
+
+        // `a`, `b`, `1`: each row the next character's set, then the end.
+        let masks = guide.verify_masks(&[11, 12, 8]);
+        assert_eq!(masks.len(), 4);
+        assert_eq!(masks[0].as_deref(), Some(&[11][..]));
+        assert_eq!(masks[1].as_deref(), Some(&[12][..]));
+        let digits = masks[2].clone().unwrap();
+        assert!(
+            [7, 8, 9, 10, 25].iter().all(|d| digits.contains(d)),
+            "{digits:?}"
+        );
+        assert!(!digits.contains(&11), "no `a` after `ab`");
+        assert!(
+            masks[3].as_ref().is_some_and(|m| !m.contains(&7)),
+            "nothing past one digit"
+        );
+        assert_eq!(guide.allowed_tokens(), start, "the guide is where it was");
+
+        // `a`, `a`: the second is refused, so no row past it gets a mask.
+        let masks = guide.verify_masks(&[11, 11, 12]);
+        assert_eq!(masks.len(), 2);
+        assert_eq!(masks[1].as_deref(), Some(&[12][..]));
+        assert_eq!(guide.allowed_tokens(), start);
+
+        // Committing the tokens walks it as the masks said.
+        assert!(guide.advance(11) && guide.advance(12));
+        assert_eq!(guide.allowed_tokens(), Some(digits));
     }
 
     #[test]
