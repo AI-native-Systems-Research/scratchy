@@ -282,6 +282,9 @@ fn a_target_in_the_gated_item_is_not_the_gate() {
 fn an_unclosed_attribute_does_not_hide_the_gates_after_it() {
     let unclosed = "#[cfg(all(feature = \"x\",\nfn f() {}\n#[cfg(feature = \"metal\")]\nfn g() {}";
     assert_eq!(gate_lines(unclosed), [3]);
+    let then_wrapped = "#[cfg(all(feature = \"x\",\nfn f() {}\n#[cfg(any(\n    feature = \"metal\",\n    \
+                        feature = \"spyre\"\n))]\nfn g() {}";
+    assert_eq!(gate_lines(then_wrapped), [3]);
 }
 
 #[test]
