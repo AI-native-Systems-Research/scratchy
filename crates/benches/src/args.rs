@@ -449,6 +449,13 @@ pub struct BenchServeArgs {
     #[arg(long)]
     pub save_result: bool,
 
+    /// Also keep every request's own figures in the results JSON, in vLLM's `--save-detailed`
+    /// layout: `input_lens`, `output_lens`, `ttfts`, `itls`, `latencies`, `start_times`,
+    /// `generated_texts`, `errors` (seconds; parallel arrays in request order), plus `chunks`,
+    /// the text chunks each stream carried. Single-turn runs only.
+    #[arg(long)]
+    pub save_detailed: bool,
+
     /// Directory to save results in (used with --save-result).
     #[arg(long)]
     pub result_dir: Option<String>,
