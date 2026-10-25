@@ -9874,6 +9874,41 @@ mod tests {
             .collect()
     }
 
+    /// A split runs on decode steps alone where its gate requires a decode step: the gate itself,
+    /// one member of an `All`, every member of an `Any`. Any other gate — none, one that never
+    /// names decode steps, an `Any` one of whose members admits other steps — sizes it for every
+    /// step: too large at worst, never short of the rows it writes (#475).
+    #[test]
+    fn a_split_runs_on_decode_steps_alone_only_where_its_gate_requires_one() {
+        use crate::tape::lowered::RuntimeGate::{
+            All, Any, OnlyIfDecodeStep, OnlyIfPlainGdn, UnlessDecodeStep, UnlessOneSequence,
+        };
+        let decode = [
+            Some(OnlyIfDecodeStep),
+            Some(All(&[OnlyIfDecodeStep, OnlyIfPlainGdn])),
+            Some(All(&[UnlessOneSequence, OnlyIfDecodeStep])),
+            Some(All(&[Any(&[OnlyIfDecodeStep])])),
+            Some(Any(&[
+                OnlyIfDecodeStep,
+                All(&[OnlyIfPlainGdn, OnlyIfDecodeStep]),
+            ])),
+        ];
+        let every = [
+            None,
+            Some(UnlessDecodeStep),
+            Some(OnlyIfPlainGdn),
+            Some(All(&[UnlessOneSequence, OnlyIfPlainGdn])),
+            Some(Any(&[OnlyIfDecodeStep, OnlyIfPlainGdn])),
+            Some(All(&[Any(&[OnlyIfDecodeStep, UnlessDecodeStep])])),
+        ];
+        for gate in decode {
+            assert_eq!(SplitSteps::of(gate), SplitSteps::Decode, "{gate:?}");
+        }
+        for gate in every {
+            assert_eq!(SplitSteps::of(gate), SplitSteps::Every, "{gate:?}");
+        }
+    }
+
     /// A one-row bucket's TurboQuant decode at `attention_decode_gqa_tq`'s geometry (8 query
     /// heads a KV head, head_dim 256) serves each KV head's heads together: the packed twin's
     /// command becomes the per-KV-head kernel — its bindings and the partials at the op scratch's
