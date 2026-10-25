@@ -5180,7 +5180,7 @@ fn lower_one(
             // The scan's constants (0-4), the conv width (5), the norm's eps (6), then `extra`;
             // `gdn_decode`'s bindings (0-13), then — a model that drafts, at `gdn_verify` — its
             // draft lanes (14, 15).
-            let fused = |library, function, extra: &[ConstantValue], lanes: bool| {
+            let fused = |library, function, extra: &[ConstantValue], lanes: bool, tgs_y: u32| {
                 let mut constants = scan_constants();
                 constants.extend([
                     ConstantValue::uint(5, kernel),
@@ -5215,7 +5215,7 @@ fn lower_one(
                     function,
                     constants: baked(constants),
                     dispatch: DispatchShape {
-                        threadgroups: (1, nk, 1),
+                        threadgroups: (1, tgs_y, 1),
                         threads_per_threadgroup: (1024, 1, 1),
                         m_scaling: Some(MScaling {
                             axis: MScaleAxis::Z,
@@ -5240,7 +5240,7 @@ fn lower_one(
                 && hv.is_multiple_of(32)
                 && hv <= 256
                 && kernel <= 8)
-                .then(|| fused("gdn_decode", gdn_decode_static_name(dtype), &[], false));
+                .then(|| fused("gdn_decode", gdn_decode_static_name(dtype), &[], false, nk));
             if let Some(decode) = decode
                 && GdnStepsKnown::at(p, bucket_m).run(|d, q| d && q) == GuardRun::Gated(None)
             {
@@ -5252,19 +5252,20 @@ fn lower_one(
             // plain chunk — is one command (`gdn_verify`), each row's conv, norms and gates
             // computed once for its threadgroup and handed to the scan and the norm in
             // threadgroup memory, where the three commands below pass them through device
-            // scratch a barrier apart. Its shader's static asserts are these bounds.
+            // scratch a barrier apart. Its shader's static asserts are these bounds. A
+            // threadgroup a (sequence, key head, VALUE head) — `tgid.y` over `nv`, 2× the key
+            // heads' fill on a model whose value heads outnumber them.
             let verify = (simd_scan
                 && nv.is_multiple_of(nk)
-                && 2 * hk + per_key * hv <= 1024
-                && (per_key * hv).is_multiple_of(32 * 4)
+                && 2 * hk + hv <= 1024
                 && hv == 128
                 && kernel <= 8
                 && (2..=GDN_VERIFY_ROWS).contains(&bucket_m)
-                && bucket_m * per_key <= 32
+                && bucket_m <= 32
                 && p.spec_drafts < GDN_VERIFY_ROWS
                 && bucket_m + p.spec_drafts < 32
-                && bucket_m * (2 * hk + 2 * per_key * hv) * 4
-                    + (2 * bucket_m + p.spec_drafts + 1 + 3 * bucket_m * per_key) * 4
+                && bucket_m * (2 * hk + 2 * hv) * 4
+                    + (2 * bucket_m + p.spec_drafts + 1 + 3 * bucket_m) * 4
                     <= 32768)
                 .then(|| {
                     let rows = [
@@ -5276,6 +5277,7 @@ fn lower_one(
                         gdn_verify_static_name(dtype),
                         &rows,
                         p.spec_drafts > 0,
+                        nv,
                     )
                 });
             if let Some(verify) = verify {
