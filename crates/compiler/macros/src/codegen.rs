@@ -18309,18 +18309,30 @@ mod fingerprint_tests {
         );
     }
 
-    /// The front end up to the storage-annotated FUF, for one model of one arch — what
-    /// `expert_input_probe` reads in a build.
-    fn fuf_of(arch: &str, model: &crate::config::ModelParams) -> (Program, Fuf) {
+    /// One arch's DSL, as written.
+    fn dsl_of(arch: &str) -> crate::ast::Ast {
         let dsl = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../models/arch/dsl")
             .join(format!("{arch}.py"));
-        let carrier =
-            crate::parse_python::parse_python_file(&std::fs::read_to_string(dsl).unwrap())
-                .expect("carrier parses");
-        let mut program =
-            crate::classify::classify_with(&carrier.ast, crate::classified::Prelude::Decoder)
-                .expect("classify");
+        crate::parse_python::parse_python_file(&std::fs::read_to_string(dsl).unwrap())
+            .expect("carrier parses")
+            .ast
+    }
+
+    /// The front end up to the storage-annotated FUF, for one model of one arch — what
+    /// `expert_input_probe` reads in a build: its DSL with the drafter capture the compiler
+    /// inserts (`draft_capture`).
+    fn fuf_of(arch: &str, model: &crate::config::ModelParams) -> (Program, Fuf) {
+        fuf_of_ast(arch, model, &crate::draft_capture::insert(&dsl_of(arch)))
+    }
+
+    fn fuf_of_ast(
+        arch: &str,
+        model: &crate::config::ModelParams,
+        ast: &crate::ast::Ast,
+    ) -> (Program, Fuf) {
+        let mut program = crate::classify::classify_with(ast, crate::classified::Prelude::Decoder)
+            .expect("classify");
         program.weight_leaf_renames = model.arch.weight_leaf_renames.clone();
         let manifest =
             crate::weights_manifest::load_or_empty(&arch_configs(arch)).expect("manifest");
@@ -18339,6 +18351,56 @@ mod fingerprint_tests {
         let mut fuf = crate::fuf::unroll(&cfg, &inferred).expect("unroll");
         fuf.annotate_storage_formats(&program, model);
         (program, fuf)
+    }
+
+    /// A drafter's capture is the compiler's (`draft_capture`), not an arch's, so every decoder
+    /// arch hosts one: a target with no drafter beside it unrolls to the tiles its DSL alone does,
+    /// and one whose drafter reads layer 1 captures that layer and no other.
+    #[test]
+    fn every_decoder_arch_hosts_a_drafter_capture() {
+        use crate::config::{DRAFT_CAPTURE_LAYERS, LayerSet};
+        for (arch, stem) in [
+            ("commandr", "c4ai-command-r-v01"),
+            ("deepseek-v2", "deepseek-v2-lite"),
+            ("deepseek-v3", "deepseek-v3-academic-9b-fp8-block"),
+            ("deepseek-v3-flat", "moonlight-16b-a3b-instruct-fp8-block"),
+            ("gemma2", "gemma2-27b"),
+            ("gemma3", "gemma-3-12b-it"),
+            ("gemma4", "gemma-4-12b-it"),
+            ("gemma4-moe", "gemma-4-26b-a4b-it"),
+            ("glm4-moe", "glm-4.5-air"),
+            ("gpt-oss", "gpt-oss-20b"),
+            ("granite", "granite-3.0-2b-base"),
+            ("llama", "llama-3.2-1b"),
+            ("mistral", "mistral-7b-instruct-v0.3"),
+            ("mixtral", "mixtral-8x7b-instruct-v0.1"),
+            ("nemotron-h", "nemotron-3-nano-30b-a3b"),
+            ("nemotron-h-latent", "nemotron-3-super-120b-a12b"),
+            ("phi3", "phi-3-5-mini-instruct"),
+            ("qwen2", "qwen2.5-0.5b"),
+            ("qwen2-moe", "slimed-qwen-3"),
+            ("qwen3", "qwen3-0.6b"),
+            ("qwen3-5", "qwen3.5-0.8b"),
+            ("qwen3-5-moe", "qwen3.6-35b-a3b"),
+            ("qwen3-moe", "qwen3-30b-a3b-instruct-2507"),
+        ] {
+            let path = arch_configs(arch).join(format!("{stem}.json"));
+            let mut model = crate::config::load_file_declared(&path).expect("load");
+            let (_, written) = fuf_of_ast(arch, &model, &dsl_of(arch));
+            let (_, compiled) = fuf_of(arch, &model);
+            assert_eq!(
+                format!("{:?}", written.nodes),
+                format!("{:?}", compiled.nodes),
+                "{arch}: a target with no drafter must unroll as its DSL does",
+            );
+            let set = LayerSet::of([1]);
+            model.layer_sets.insert(DRAFT_CAPTURE_LAYERS.to_string(), set);
+            let (_, captured) = fuf_of(arch, &model);
+            let captures = (captured.nodes.iter())
+                .filter(|n| n.op == OpKind::CaptureHidden)
+                .count();
+            assert_eq!(captures, 1, "{arch}: a drafter reading layer 1 captures it alone");
+        }
     }
 
     /// ⛔ THE REGRESSION THIS GATE EXISTS FOR: the emu's ONE baked prefill width
