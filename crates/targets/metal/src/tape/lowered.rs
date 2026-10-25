@@ -1401,8 +1401,6 @@ pub enum RuntimeBindingKind {
     DraftRetained,
     /// `[num_seqs]` [`crate::dflash2::DraftLaneParams`] — each lane's policy for the cycle.
     DraftLaneParams,
-    /// `[num_seqs, SAMPLING_UNIFORMS]` f32 — the uniforms each lane draws its cycle with.
-    DraftUniforms,
     /// A region of a drafter's outputs: what its selection writes, its target's acceptance and
     /// the host read.
     DraftOutputs(crate::dflash2::DraftOutput),
@@ -1799,7 +1797,6 @@ impl RuntimeBindingKind {
             | Self::DraftRingSlots
             | Self::DraftRetained
             | Self::DraftLaneParams
-            | Self::DraftUniforms
             | Self::DraftOutputs(_)
             | Self::InputIds
             | Self::Positions
