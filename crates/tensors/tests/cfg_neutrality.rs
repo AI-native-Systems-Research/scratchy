@@ -109,7 +109,8 @@ fn gates_in(text: &str) -> Vec<(usize, String)> {
 }
 
 /// The line on which the attribute starting on line `start` closes: where the `]`
-/// matching its `#[` falls, or the last line if it never does.
+/// matching its `#[` falls. One that never closes is read as its own line alone, as
+/// any line was before, so it cannot swallow the gates after it.
 fn attribute_end(lines: &[&str], start: usize) -> usize {
     let mut depth = 0i32;
     for (n, line) in lines.iter().enumerate().skip(start) {
@@ -131,7 +132,7 @@ fn attribute_end(lines: &[&str], start: usize) -> usize {
             }
         }
     }
-    lines.len() - 1
+    start
 }
 
 /// All `cuda`/`metal` cfg-gate violations under `rel` (a path relative to the
@@ -273,6 +274,14 @@ fn a_wrapped_gate_naming_no_target_is_none() {
 fn a_target_in_the_gated_item_is_not_the_gate() {
     let after = "#[cfg(feature = \"x\")]\nfn metal() {}";
     assert_eq!(gate_lines(after), Vec::<usize>::new());
+}
+
+/// An attribute whose brackets never close is its own line alone: the gates after it
+/// still count where they are.
+#[test]
+fn an_unclosed_attribute_does_not_hide_the_gates_after_it() {
+    let unclosed = "#[cfg(all(feature = \"x\",\nfn f() {}\n#[cfg(feature = \"metal\")]\nfn g() {}";
+    assert_eq!(gate_lines(unclosed), [3]);
 }
 
 #[test]
