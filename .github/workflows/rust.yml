@@ -552,6 +552,17 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy (spyre triton)
         run: cargo clippy -p scratchy-target-spyre --features spyre-emu --all-targets -- -D warnings
+      # The card surface: what `src/lib.rs` gates on `spyre-hw` (superdsc_exec and the device
+      # runtime) compiles under no other step — the one above lints `spyre-emu`, and the
+      # linux-cuda workspace clippy builds the target featureless — so it rotted between card
+      # runs, and #299's E0277s reached main green (#553). Lib only: the examples need a card
+      # host. Check-only, so the SDK's C++ shim is skipped as in the linux-cuda job; flex-rs,
+      # the shim's Rust side, is linted with it. The worker's hw surface can't join: its
+      # scratchy-models build script links flex-rs, which needs the SDK's libsenlib.
+      - name: Clippy (spyre-hw card surface)
+        env:
+          SCRATCHY_SKIP_SENDNN_CXX: "1"
+        run: cargo clippy -p scratchy-target-spyre -p flex-rs --features scratchy-target-spyre/spyre-hw -- -D warnings
       - name: Test (spyre triton golden + emu execution)
         run: cargo test -p scratchy-target-spyre --features spyre-emu --lib --tests
       # The worker's spyre modules compile under no other CI job (the linux-cuda
