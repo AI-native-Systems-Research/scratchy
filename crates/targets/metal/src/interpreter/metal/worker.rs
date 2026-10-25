@@ -1412,7 +1412,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // the tape position; the pool prints deltas after the
                 // host wait.
                 if let Some(heap) = &self.kernel_time_heap {
-                    heap.write_timestamp(enc, step.kernel, tg_scaled);
+                    heap.write_timestamp(enc, step.kernel, tg_scaled, *tpt, need_barrier);
                 }
                 #[cfg(feature = "forward-telemetry")]
                 if tape_enabled {
