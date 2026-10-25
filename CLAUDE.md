@@ -20,7 +20,8 @@
 - **No instruction selection** for spyre or metal — the tape comes straight
   from the fused forward. ISel (`solver`, `cost`, the `impl Implementation`
   blocks) is cuda-gated and stays that way.
-- No new env-var behavior toggles; no `#[allow]`; no weakening tests.
+- No new env-var behavior toggles; no `#[allow]`; no weakening tests
+  ([`docs/TESTING.md`](docs/TESTING.md) says which tests stay tests, and what weakening one means).
 
 ## The model crate
 All model architectures compile into ONE crate, **`scratchy-models`**
