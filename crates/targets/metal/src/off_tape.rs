@@ -284,9 +284,11 @@ impl OffTapePipeline {
         let function = library
             .newFunctionWithName(&NSString::from_str(kernel.entry))
             .ok_or_else(|| fail("function missing"))?;
+        let turn = crate::specialized_pipeline_cache::pipeline_build_turn();
         let pipeline = device
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|e| fail(&format!("pipeline: {e:?}")))?;
+        drop(turn);
         Ok(Self {
             pipeline,
             _library: library,
