@@ -13,9 +13,16 @@ cd "$(git rev-parse --show-toplevel)"
 # scratchy-target-spyre's build reaches flex-rs's C++ shim, which needs the Spyre SDK; a proof
 # links none of it.
 export SCRATCHY_SKIP_SENDNN_CXX=1
+# Fails closed: a name that matches no harness must not pass as a proof, whatever Kani's exit code,
+# so each run must report exactly one harness verified.
 proof() {
     echo "== $1: $2"
-    cargo kani -p "$1" --harness "$2" --exact
+    local out
+    out=$(cargo kani -p "$1" --harness "$2" --exact 2>&1 | tee /dev/stderr)
+    if ! grep -q "Complete - 1 successfully verified harnesses, 0 failures, 1 total" <<<"$out"; then
+        echo "kani_roster: $1 $2 did not verify exactly one harness" >&2
+        exit 1
+    fi
 }
 proof ktir-superdsc work::kani_proofs::the_one_row_fill_partitions_both_axes
 proof scratchy-target-spyre fold_plan::cursor_proofs::every_row_of_a_batch_reads_its_own_cursor
