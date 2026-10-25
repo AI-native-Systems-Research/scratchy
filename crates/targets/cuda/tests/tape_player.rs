@@ -14,6 +14,7 @@ pub mod common {
     pub mod attn_layer;
     pub mod chains;
     pub mod gdn_layer;
+    pub mod gemma_moe;
     pub mod mlp;
     pub mod moe_block;
     pub mod numerics;
@@ -2923,4 +2924,66 @@ fn moe_block_invariants_hold() {
     );
     assert!(pass, "a MoE block invariant does not hold");
     assert_eq!(allocations, 0, "a MoE forward allocated");
+}
+
+// ── Gemma 4's steps are not launched yet (#885, 13a) ───────────────
+
+use common::gemma_moe::{GEMMA_MOE_FACTS, gemma_moe};
+
+/// The Gemma MoE block at m = 512, as CUDA's compiler lowers it: one bucket.
+fn gemma_moe_buckets() -> &'static [CudaTape] {
+    static TAPES: std::sync::OnceLock<Vec<CudaTape>> = std::sync::OnceLock::new();
+    TAPES.get_or_init(|| {
+        let at = CanonicalAt {
+            stem: "gemma_moe",
+            m: 512,
+        };
+        let c = lower_canonical(&gemma_moe(512), GEMMA_MOE_FACTS, at)
+            .unwrap_or_else(|e| panic!("the Gemma MoE block lowers at m=512: {e}"));
+        vec![static_tape(&c)]
+    })
+}
+
+/// A Gemma tape is refused with `NotLaunched` at its first new step (the router norm, step 0),
+/// before anything is uploaded or enqueued: the result colour keeps every byte it had, and the
+/// host result buffer is untouched. Synthetic zero weights of the declared sizes.
+#[test]
+fn a_gemma_tape_is_refused_not_launched_before_anything_is_enqueued() {
+    let device = h100();
+    let tapes = gemma_moe_buckets();
+    let tape = &tapes[0];
+    assert!(
+        matches!(tape.steps[0], CudaStep::RouterNorm(_)),
+        "the first step is the router norm: {:?}",
+        tape.steps[0]
+    );
+    let table: Vec<DeviceBuffer> = (tape.weight_bytes.iter())
+        .map(|&b| match b {
+            0 => DeviceBuffer::empty(),
+            b => DeviceBuffer::upload_bytes(&device, &vec![0u8; b as usize]).expect("upload"),
+        })
+        .collect();
+    let table: &'static [DeviceBuffer] = Box::leak(table.into_boxed_slice());
+    let mut worker = CudaWorker::new(&device, tapes, table, None, None).expect("worker");
+    let m = tape.bucket_m as usize;
+    let x = vec![0x3F80u16; m * common::gemma_moe::H as usize];
+    let result = colour(tape, tape.arena.colour_offsets.len() - 1);
+    let mut y = vec![0xBEEFu16; tape.result.bytes as usize / 2];
+    let before = read(&mut worker, result);
+    let e = worker
+        .forward(0, Input::Hidden(&x), &[], None, None, &mut y)
+        .expect_err("a Gemma step is not launched");
+    eprintln!("gemma m=512: {e}");
+    assert!(
+        matches!(
+            e,
+            ForwardError::NotLaunched {
+                step: 0,
+                op: "RouterNorm"
+            }
+        ),
+        "{e:?}"
+    );
+    assert!(y.iter().all(|&v| v == 0xBEEF), "the result is untouched");
+    assert_eq!(read(&mut worker, result), before, "nothing was enqueued");
 }

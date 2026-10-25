@@ -1247,3 +1247,62 @@ fn a_weight_no_step_reads_is_refused() {
         "{e}"
     );
 }
+
+// ── Bundle tensors in the weight table (#885) ──────────────────────
+
+/// [`tied_model`] with the norm's gain (source 1) one tensor of a weight bundle, as Gemma's
+/// router scale is, and the handoff's `bundle_tensor_names` its full name when `named`.
+fn bundle_gain_model(named: bool) -> TargetModelInput {
+    use scratchy_subtile::handoff::{BundleTensor, UnrollIndex};
+    let mut input = tied_model(&[128], "lm_head", 256);
+    let binding = SourceBinding::BundleTensor {
+        id: 7,
+        index: Some(UnrollIndex(0)),
+        tensor: BundleTensor::RouterScale,
+    };
+    for b in &mut input.buckets {
+        b.lowered.bindings[1] = binding.clone();
+    }
+    if named {
+        input.bundle_tensor_names.push((
+            7,
+            Some(UnrollIndex(0)),
+            BundleTensor::RouterScale,
+            "model.layers.0.router.scale".to_string(),
+        ));
+    }
+    input
+}
+
+/// A bundle tensor read as a gain is one bf16 weight, named in full by the handoff, with no
+/// `.weight` added.
+#[test]
+fn a_bundle_tensor_is_named_by_the_handoff() {
+    let model = lower_model(&bundle_gain_model(true)).expect("lowers");
+    assert_eq!(
+        model.weights[1],
+        Some(CudaWeight::Bf16 {
+            tensor: "model.layers.0.router.scale",
+            shape: &[512],
+        })
+    );
+}
+
+/// A bundle tensor the handoff names no checkpoint tensor for is refused naming its binding.
+#[test]
+fn a_bundle_tensor_with_no_name_is_refused() {
+    let e = lower_model(&bundle_gain_model(false)).expect_err("refused");
+    assert!(e.to_string().contains("RouterScale"), "{e}");
+    assert!(matches!(e, ModelRefusal::NoPrefix { ix: 1, .. }), "{e:?}");
+}
+
+/// The 64-column GEMM is the archs `op_abi::CUDA_GEMM_COL64_ARCHS` names: gemma4-moe's, no
+/// other's.
+#[test]
+fn the_gemm_column_tile_is_the_archs() {
+    use scratchy_target_cuda_compiler::emit::gemm_col_tile;
+    assert_eq!(gemm_col_tile("gemma4-moe"), GemmColTile::Col64);
+    for arch in ["qwen3-5", "qwen3-5-moe", "fixture"] {
+        assert_eq!(gemm_col_tile(arch), GemmColTile::Tile256Only, "{arch}");
+    }
+}

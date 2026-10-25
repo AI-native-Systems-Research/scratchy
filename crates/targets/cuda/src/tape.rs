@@ -3660,4 +3660,263 @@ mod tests {
             })
         );
     }
+
+    // ── Gemma 4's KV classes, second rotary table and router norm (#885) ──
+
+    /// [`KV`] with two classes: class 0 its own (2 × 256), class 1 one KV head of 512 lanes (the
+    /// same pool row) with no window, and its one layer of `layer_class`.
+    const fn two_classes(layer_class: &'static [u8]) -> KvTape {
+        KvTape {
+            classes: &[
+                KvClass {
+                    kv_heads: 2,
+                    head_dim: 256,
+                    window: None,
+                },
+                KvClass {
+                    kv_heads: 1,
+                    head_dim: 512,
+                    window: None,
+                },
+            ],
+            layer_class,
+            ..KV
+        }
+    }
+
+    /// Each class of the KV tape is a geometry the kernels take, and each layer names one: no
+    /// class, a layer naming a class the tape lacks, a class count off the layers, a head dim off
+    /// [`ATTN_BF16_HEAD_DIMS`], a window off [`ATTN_WINDOW_MULTIPLE`] or of 0, and a class whose
+    /// row is wider than the pool's are each `KvClasses`.
+    #[test]
+    fn kv_classes() {
+        assert_eq!(kv_tape(two_classes(&[1]), &[]).validate(), Ok(()));
+        let class = |kv_heads, head_dim, window| KvClass {
+            kv_heads,
+            head_dim,
+            window,
+        };
+        let one = |c: KvClass| -> &'static [KvClass] { Box::leak(Box::new([c])) };
+        for (what, kv) in [
+            ("no class", KvTape { classes: &[], ..KV }),
+            ("a missing class", two_classes(&[2])),
+            (
+                "no layer's class",
+                KvTape {
+                    layer_class: &[],
+                    ..KV
+                },
+            ),
+            (
+                "head dim 128",
+                KvTape {
+                    classes: one(class(4, 128, None)),
+                    ..KV
+                },
+            ),
+            (
+                "a window of 1000",
+                KvTape {
+                    classes: one(class(2, 256, Some(1000))),
+                    ..KV
+                },
+            ),
+            (
+                "a window of 0",
+                KvTape {
+                    classes: one(class(2, 256, Some(0))),
+                    ..KV
+                },
+            ),
+            (
+                "a row wider than the pool's",
+                KvTape {
+                    classes: Box::leak(Box::new([class(2, 256, None), class(2, 512, None)])),
+                    layer_class: &[0],
+                    ..KV
+                },
+            ),
+            (
+                "no heads",
+                KvTape {
+                    classes: one(class(0, 256, None)),
+                    ..KV
+                },
+            ),
+        ] {
+            assert_eq!(
+                kv_tape(kv, &[]).validate(),
+                Err(TapeError::KvClasses),
+                "{what}"
+            );
+        }
+    }
+
+    /// A KV step's geometry is its layer's class: a class-1 layer's append and attention of one
+    /// 512-lane head validate; the class-0 geometry on that layer, or a window its class lacks, is
+    /// `KvStepGeometry`.
+    #[test]
+    fn a_kv_step_has_its_layers_class() {
+        let append = |cols, head_dim| match rope_append(0, KV_SLOTS) {
+            CudaStep::RopeAppend(r) => CudaStep::RopeAppend(RopeAppendBf16 {
+                cols,
+                head_dim,
+                ..r
+            }),
+            _ => unreachable!(),
+        };
+        let attend = |kv_heads, head_dim, window| match attn(KV_TABLE, KV_SEQ, kv_heads) {
+            CudaStep::AttnPrefill(a) => CudaStep::AttnPrefill(AttnPrefillBf16 {
+                head_dim,
+                window,
+                q_heads: 2,
+                ..a
+            }),
+            _ => unreachable!(),
+        };
+        let global = two_classes(&[1]);
+        assert_eq!(
+            kv_tape(global, &[append(512, 512), attend(1, 512, None)]).validate(),
+            Ok(())
+        );
+        for (what, step) in [
+            ("the class-0 append", append(512, 256)),
+            ("the class-0 attention", attend(2, 256, None)),
+            ("a window", attend(1, 512, Some(1024))),
+        ] {
+            assert_eq!(
+                kv_tape(global, &[step]).validate(),
+                Err(TapeError::KvStepGeometry { step: 0 }),
+                "{what}"
+            );
+        }
+    }
+
+    /// The local rotary table: one beside the global table validates and a rope may read it; one
+    /// without a global table is `KvClasses`; one over the global table, or outside the arena, is
+    /// `RotaryOutside`.
+    #[test]
+    fn the_local_rotary_table() {
+        let local = |offset| RotaryTable {
+            span: span(offset, TABLE),
+            rot_dim: 64,
+            theta_bits: 1e4f64.to_bits(),
+        };
+        let at = TABLE_AT + TABLE;
+        let grown = |t: CudaTape| CudaTape {
+            arena: ArenaLayout {
+                total_bytes: ROTARY_TOTAL + TABLE,
+                ..t.arena
+            },
+            ..t
+        };
+        let two = CudaTape {
+            rotary_local: Some(local(at)),
+            steps: Box::leak(Box::new([rope(at)])),
+            ..grown(with_rotary(TABLE_AT, TABLE))
+        };
+        assert_eq!(two.validate(), Ok(()));
+        let alone = CudaTape {
+            rotary: None,
+            ..two
+        };
+        assert_eq!(alone.validate(), Err(TapeError::KvClasses));
+        let over = CudaTape {
+            rotary_local: Some(local(TABLE_AT)),
+            steps: &[],
+            ..two
+        };
+        assert_eq!(
+            over.validate(),
+            Err(TapeError::RotaryOutside {
+                span: span(TABLE_AT, TABLE),
+                total: ROTARY_TOTAL + TABLE
+            })
+        );
+        let outside = CudaTape {
+            rotary_local: Some(local(ROTARY_TOTAL + TABLE)),
+            steps: &[],
+            ..two
+        };
+        assert!(
+            matches!(outside.validate(), Err(TapeError::RotaryOutside { .. })),
+            "{:?}",
+            outside.validate()
+        );
+    }
+
+    /// [`MOE`] with Gemma's router-norm rows (`[1, hidden]` bf16, 128 bytes at 2304) after its down.
+    const MOE_ROUTER_NORM: MoeTape = MoeTape {
+        router_norm: Some(span(2304, 128)),
+        ..MOE
+    };
+
+    /// The router norm into the scratch's router-norm rows validates; the rows sized off
+    /// `[m, hidden]` are `MoeRegionShape`; a router norm writing elsewhere, or with no rows in
+    /// the scratch, is `MoeRegionMismatch`, and on a tape with no scratch `MoeStepGeometry`.
+    #[test]
+    fn the_router_norm_writes_its_rows() {
+        let norm = |y| {
+            CudaStep::RouterNorm(RmsNormBf16 {
+                x: ArenaOffset(0),
+                gain: WeightIx(0),
+                y: ArenaOffset(y),
+                rows: 1,
+                cols: 64,
+                eps_bits: 1e-6f32.to_bits(),
+                convention: GainConvention::Scale,
+            })
+        };
+        let tape = |moe, steps: &[CudaStep]| CudaTape {
+            arena: ArenaLayout {
+                total_bytes: MOE_TOTAL + 256,
+                ..moe_tape(None, &[]).arena
+            },
+            weight_bytes: &[128],
+            ..moe_tape(moe, steps)
+        };
+        assert_eq!(
+            tape(Some(MOE_ROUTER_NORM), &[norm(2304)]).validate(),
+            Ok(())
+        );
+        let wide = MoeTape {
+            router_norm: Some(span(2304, 256)),
+            ..MOE
+        };
+        assert_eq!(
+            tape(Some(wide), &[]).validate(),
+            Err(TapeError::MoeRegionShape {
+                region: Region::MoeRouterNorm,
+                span: span(2304, 256),
+                want: 128
+            })
+        );
+        assert!(
+            matches!(
+                tape(Some(MOE_ROUTER_NORM), &[norm(512)]).validate(),
+                Err(TapeError::MoeRegionMismatch {
+                    step: 0,
+                    region: Region::MoeRouterNorm,
+                    ..
+                })
+            ),
+            "{:?}",
+            tape(Some(MOE_ROUTER_NORM), &[norm(512)]).validate()
+        );
+        assert!(
+            matches!(
+                tape(Some(MOE), &[norm(2304)]).validate(),
+                Err(TapeError::MoeRegionMismatch {
+                    region: Region::MoeRouterNorm,
+                    ..
+                }) | Err(TapeError::StepOutside { .. })
+            ),
+            "{:?}",
+            tape(Some(MOE), &[norm(2304)]).validate()
+        );
+        assert_eq!(
+            tape(None, &[norm(2304)]).validate(),
+            Err(TapeError::MoeStepGeometry { step: 0 })
+        );
+    }
 }
