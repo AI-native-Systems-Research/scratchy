@@ -2634,3 +2634,146 @@ fn a_global_layer_of_another_head_dim_is_refused() {
         "{e:?}"
     );
 }
+
+// ── Gemma 4's expert bank in the weight table (#885's amendment) ────
+
+/// [`gemma_moe`] at m = 512 as the macro hands it over: arch `gemma4-moe`, a 256-row embedding
+/// table, and each bundle tensor named in full. The down source is a tensor of bundle `down_bank`,
+/// whose names are `down_names`; the router and the gate and up are bundle `BANK`'s.
+fn gemma_moe_model(
+    down_bank: u32,
+    down_names: (&str, &str),
+) -> scratchy_subtile::handoff::TargetModelInput {
+    use common::gemma_moe::{BANK, LAYER, ROUTER};
+    use scratchy_subtile::handoff::{
+        BundleTensor as T, TargetBucket, TargetModelFacts, TargetModelInput, TargetPoint,
+    };
+    let mut lowered = gemma_moe(512);
+    let index = Some(UnrollIndex(LAYER));
+    lowered.bindings[6] = SourceBinding::BundleTensor {
+        id: down_bank,
+        index,
+        tensor: T::ExpertDownW,
+    };
+    let name = |id, tensor, n: &str| (id, index, tensor, n.to_string());
+    let mut names = vec![
+        name(ROUTER, T::RouterScale, "m.layers.0.router.scale"),
+        name(ROUTER, T::RouterGate, "m.layers.0.router.proj.weight"),
+        name(
+            ROUTER,
+            T::RouterPerExpertScale,
+            "m.layers.0.router.per_expert_scale",
+        ),
+        name(BANK, T::ExpertGateW, "m.layers.0.experts.gate_up_proj"),
+        name(BANK, T::ExpertUpW, "m.layers.0.experts.gate_up_proj"),
+        name(BANK, T::ExpertDownW, "m.layers.0.experts.down_proj"),
+    ];
+    if down_bank != BANK {
+        names.push(name(down_bank, T::ExpertGateW, down_names.0));
+        names.push(name(down_bank, T::ExpertDownW, down_names.1));
+    }
+    TargetModelInput {
+        stem: "gemma_moe".to_string(),
+        arch: "gemma4-moe".to_string(),
+        buckets: vec![TargetBucket {
+            point: TargetPoint { m: 512, sk: 1 },
+            lowered,
+        }],
+        unlowered: Vec::new(),
+        facts: TargetModelFacts {
+            head_dim: 0,
+            rot_dim: 0,
+            rope_theta: None,
+            rms_norm_eps: 1e-6,
+            vocab_size: 256,
+            gdn: None,
+            dsl_shared_expert_bases: Vec::new(),
+            attn_classes: Vec::new(),
+        },
+        weight_prefixes: Vec::new(),
+        embed_prefix: Some("m.embed_tokens".to_string()),
+        bundle_tensor_names: names,
+    }
+}
+
+/// The gate, up and down sources of one bank are one expert bank: the table names it once, and
+/// the down's index reads the gate's buffer.
+#[test]
+fn a_gemma_expert_bank_is_one_buffer() {
+    use scratchy_target_cuda::weights::CudaWeight;
+    use scratchy_target_cuda_compiler::emit::lower_model;
+    let model = lower_model(&gemma_moe_model(common::gemma_moe::BANK, ("", "")))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let banks: Vec<_> = (model.weights.iter().enumerate())
+        .filter(|(_, w)| matches!(w, Some(CudaWeight::ExpertBank { .. })))
+        .map(|(ix, _)| ix)
+        .collect();
+    assert_eq!(banks, [4], "one bank, at the gate's index");
+}
+
+/// An expert bank whose three sources name different checkpoint tensors (the down a bank of the
+/// same fused gate and up but another down) cannot be one buffer: refused as `SharedTensor`,
+/// naming the fused tensor and both indices.
+#[test]
+fn an_expert_bank_naming_different_tensors_is_refused() {
+    use scratchy_target_cuda_compiler::emit::{ModelRefusal, lower_model};
+    let input = gemma_moe_model(
+        22,
+        (
+            "m.layers.0.experts.gate_up_proj",
+            "m.layers.1.experts.down_proj",
+        ),
+    );
+    let e = lower_model(&input).expect_err("refused");
+    assert!(
+        e.to_string().contains("m.layers.0.experts.gate_up_proj"),
+        "{e}"
+    );
+    assert!(
+        matches!(
+            e,
+            ModelRefusal::SharedTensor {
+                ix: 6,
+                first: 4,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// An affine bank (its gate binding an `ExpertGateS` scale as operand 3) is refused at its first
+/// expert matmul: CUDA's expert steps take dense bf16 only.
+#[test]
+fn an_affine_expert_bank_is_refused() {
+    use scratchy_subtile::handoff::BundleTensor;
+    use scratchy_subtile::lower::{ExpertQuant, ExpertWeight};
+    let mut l = gemma_moe(512);
+    l.input.sources.push(SourceShape {
+        rows: common::gemma_moe::EXPERTS * common::gemma_moe::I,
+        cols: 1,
+    });
+    l.bindings.push(SourceBinding::BundleTensor {
+        id: common::gemma_moe::BANK,
+        index: Some(UnrollIndex(common::gemma_moe::LAYER)),
+        tensor: BundleTensor::ExpertGateS,
+    });
+    let scale = l.input.sources.len() - 1;
+    let SubOp::ExpertMatmul { weight, .. } = &mut l.input.ops[9].op else {
+        panic!("op 9 is the gate matmul");
+    };
+    *weight = ExpertWeight::Affine(ExpertQuant::declared(64, 4));
+    l.input.ops[9].inputs.push(InputRef::Ext(scale));
+    let e = refused_with(&l, GEMMA_MOE_FACTS, &["ExpertMatmul", "affine"]);
+    assert!(
+        matches!(
+            e,
+            CanonicalRefusal::MoeShape {
+                step: 9,
+                rule: MoeShapeRule::Affine,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
