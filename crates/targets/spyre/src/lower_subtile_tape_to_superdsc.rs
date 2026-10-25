@@ -7566,6 +7566,7 @@ pub fn ktir_groups(
             kv: bundle::KvShifts::default(),
             programs: std::borrow::Cow::Owned(vec![bundle::LaunchProgram {
                 func: k.func,
+                program: k.program,
                 args: std::borrow::Cow::Owned(args),
             }]),
             init_binary: std::borrow::Cow::Borrowed(&[]),

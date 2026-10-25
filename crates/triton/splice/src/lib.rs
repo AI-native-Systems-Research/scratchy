@@ -2933,10 +2933,20 @@ pub fn operand_dfs<F: scratchy_subtile::subtile_ir::RopeForm>(
         let bindings = default_bindings(node);
         let dfs = match &node.op {
             // `[s_stick, l_stick, weight, out]`: the two index sticks are
-            // SENUINT32; the weight and the `[1, hidden]` row are fp16.
+            // SENUINT32; the weight and the `[1, hidden]` row are fp16. ⭐ The
+            // list is the COMPLETE operand census in `default_bindings` order,
+            // the output LAST — the ktir consumers (`node_output_on_f16_stick`,
+            // `result_dtype_of_ir`) read it as the node's full parameter list
+            // and refuse a node whose own output is absent (the check-8
+            // pre-scan catch: the u32-only partial list panicked the reference
+            // legs' stick walk at the gather). The Fp16 entries are inert for
+            // the placement census by its own skip law (`df != Df::Fp16`), so
+            // completion changes no sizing.
             SubOp::EmbedRowGather { .. } if bindings.len() == 4 => vec![
                 (bindings[0].get(), Df::SenUint32),
                 (bindings[1].get(), Df::SenUint32),
+                (bindings[2].get(), Df::Fp16),
+                (bindings[3].get(), Df::Fp16),
             ],
             // `[pick, s_stick, l_stick, s_tab, l_tab, out]`: every operand is
             // a u32 stick or a u32 table — all SENUINT32.

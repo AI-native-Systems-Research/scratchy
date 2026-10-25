@@ -60,6 +60,7 @@ fn build_spec(programs: &[bundle::LaunchProgram<'static>], results: &[u64]) -> P
         }
         nodes.push(NodeSpec {
             func: p.func.name.to_string(),
+            program: p.program,
             bindings,
         });
     }
@@ -477,6 +478,11 @@ mod tests {
             kv: Default::default(),
             programs: std::borrow::Cow::Owned(vec![bundle::LaunchProgram {
                 func,
+                // The fixture's body is an ArithAddf of two [1, 4] rows — the kind its own ops
+                // state (the KtirNode test precedent: body-derived, never a guess).
+                program: ktir_superdsc::ktir_node::Program::Elementwise(
+                    ktir_superdsc::ktir_node::Elementwise::Add,
+                ),
                 args: std::borrow::Cow::Owned(vec![
                     (scores_p, bundle::PlaceId::Act(SCORES as u32)),
                     (mask_p, bundle::PlaceId::Act(MASK as u32)),

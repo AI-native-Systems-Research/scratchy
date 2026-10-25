@@ -587,6 +587,7 @@ fn execute_one_spliced_matmul(m: u32, k: u32, n: u32) {
         kv: Default::default(),
         programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
             func: k_node.func,
+            program: k_node.program,
             args: Cow::Owned(args),
         }]),
         init_binary: Cow::Borrowed(&[]),
@@ -691,6 +692,7 @@ fn execute_one_spliced_elementwise(m: u32, c: u32, kind: EwKind) {
         kv: Default::default(),
         programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
             func: k_node.func,
+            program: k_node.program,
             args: Cow::Owned(args),
         }]),
         init_binary: Cow::Borrowed(&[]),
@@ -783,6 +785,7 @@ fn execute_one_spliced_gelu(m: u32, c: u32) {
         kv: Default::default(),
         programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
             func: k_node.func,
+            program: k_node.program,
             args: Cow::Owned(args),
         }]),
         init_binary: Cow::Borrowed(&[]),
@@ -1066,6 +1069,7 @@ fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
         kv: Default::default(),
         programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
             func: k_node.func,
+            program: k_node.program,
             args: Cow::Owned(args),
         }]),
         init_binary: Cow::Borrowed(&[]),
@@ -1415,6 +1419,7 @@ fn execute_fp8_program(
         kv: Default::default(),
         programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
             func: k_node.func,
+            program: k_node.program,
             args: Cow::Owned(args),
         }]),
         init_binary: Cow::Borrowed(&[]),

@@ -129,6 +129,11 @@ pub const NUM_SEGMENTS: usize = 7;
 /// `audit_layout_addresses`.
 pub const MAX_SEGMENT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
+/// WHAT A LAUNCH'S PROGRAM COMPUTES, and the pointwise kinds it names — re-exported for the same
+/// reason as [`PlaceId`]: [`LaunchProgram::program`] carries the kind, so the token emitter
+/// (`ktir_tokens`) renders it through THIS crate's path into the generated source, and the macro
+/// crate depends on the target crate, never on `ktir-superdsc` directly.
+pub use ktir_superdsc::ktir_node::{Elementwise, Program};
 /// ⭐ THE OPERAND IDENTITY — declared in the lowering's own scratchy-free leaf and re-exported here,
 /// so every `bundle::PlaceId` / `bundle::SynthRole` path in the tree resolves unchanged. See
 /// [`ktir_superdsc::place`] for both types and for why a [`SynthRole`] belongs to the lowering that
@@ -408,6 +413,12 @@ impl KvShifts {
 pub struct LaunchProgram<'a> {
     /// The constructed program.
     pub func: ktir_core::ir::IRFunction<'a>,
+    /// WHAT THE PROGRAM COMPUTES — the node kind, carried from the minting KtirNode's own
+    /// non-optional `program` (the one statement of the fact, paired with the payload at
+    /// construction), so a consumer that dispatches on the kind reads a TYPE, never a name.
+    /// Pure carry: the hw runtime never reads it — `into_code`'s hw arm serializes no
+    /// `programs` — so it changes no emitted byte.
+    pub program: ktir_superdsc::ktir_node::Program,
     /// Parameter -> the tensor it carries, in parameter order. Carried from the construction that
     /// minted the parameter, never re-derived from a name.
     pub args: Cow<'a, [(ktir_core::ir::Ssa, PlaceId)]>,
@@ -804,12 +815,17 @@ mod tests {
         grid: (2, 1, 1),
         return_type: None,
     };
+    // The kind is inert at these two consts (ordering fixtures over EMPTY functions — no ops, so
+    // the enum's own "only program with no compute op at all" class); the field's readers are the
+    // door discriminators, and no fixture here is a door.
     const PROGS_A: &[LaunchProgram<'static>] = &[LaunchProgram {
         func: F_A,
+        program: ktir_superdsc::ktir_node::Program::LmLast,
         args: Cow::Borrowed(&[]),
     }];
     const PROGS_B: &[LaunchProgram<'static>] = &[LaunchProgram {
         func: F_B,
+        program: ktir_superdsc::ktir_node::Program::LmLast,
         args: Cow::Borrowed(&[]),
     }];
 

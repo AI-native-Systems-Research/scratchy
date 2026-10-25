@@ -54,6 +54,7 @@ use crate::ir::{Attr, IRFunction, IRModule, Operation, Ssa, Value};
 use crate::memory::{STICK_BYTES, SpyreMemoryHierarchy};
 use crate::opkind::OpKind;
 use ktir_optimizer::fusion::{NodeSpec, ProgramSpec, Segment, plan_segments_budgeted};
+use ktir_superdsc::ktir_node::Program;
 use std::collections::HashMap;
 
 /// One planned program before it becomes a [`ResidentProgram`]: the (rewritten)
@@ -587,6 +588,271 @@ impl ResidentExecutor {
         Ok(())
     }
 
+    /// ONE STICK VALUE of a door's persistent index stick — element 0
+    /// decoded at the MODEL dtype, the encoding the gate's own staging used.
+    /// The gate stages every non-weight source as f16-encoded probe values
+    /// (`dbg_synth_val` f32s handed in as `Arg::Tensor { dtype: F16 }`), and
+    /// the doors' Shape-only views leave `view_dtype` with no entry, so
+    /// `self.dtype` IS the staging encoding — the same read pattern
+    /// `run_fused_decode_attention` uses. The u32 SENUINT32 wire is the
+    /// CARD's format, not the gate's model; restaging the real seed (a
+    /// `LoadConst` carrying the token id, u32 words) is future work for the
+    /// chain's real-seed leg, never silently approximated here.
+    fn read_door_lane0(&self, tid: u64) -> Result<f32, String> {
+        let s = *self
+            .stick
+            .get(&tid)
+            .ok_or_else(|| format!("door: t{tid} has no resident stick"))?;
+        let bytes = self
+            .mem
+            .hbm
+            .borrow()
+            .read_bytes(s * STICK_BYTES, self.dtype.bytes_per_elem());
+        Ok(crate::codec::decode(&bytes, 1, self.dtype)[0])
+    }
+
+    /// LANE VALUES INTO a door's persistent index stick — the pattern
+    /// encoded at the MODEL dtype, the same staging class `read_door_lane0`
+    /// reads back, so a later forward reads the door's own words coherently.
+    /// These sticks are placements the doors own across steps, never gate
+    /// results. f16-exact at the classes the door laws name: lane patterns
+    /// (< 32), ramps (< 2048), the sentinel mark (`hidden` itself); lanes
+    /// past the mark ride the f16 grid, and no door read answers them (the
+    /// row door reads word 0 only).
+    fn write_door_lanes(&self, tid: u64, vals: &[f32]) -> Result<(), String> {
+        let s = *self
+            .stick
+            .get(&tid)
+            .ok_or_else(|| format!("door: t{tid} has no resident stick"))?;
+        let bytes = crate::codec::encode(vals, self.dtype);
+        self.mem
+            .hbm
+            .borrow_mut()
+            .write_bytes(s * STICK_BYTES, &bytes);
+        Ok(())
+    }
+
+    /// THE ROW DOOR, HOST FORM — the chained head's embedding-row production
+    /// (#603), the golden's own law (`subtile_ir`'s EmbedRowGather eval arm)
+    /// restated against resident HBM, on `run_fused_decode_attention`'s
+    /// mechanics. FOUR parameters in mint order: the persistent s stick, the
+    /// persistent l stick, the tied weight, the `[1, hidden]` row out.
+    ///
+    /// The two index sticks' first values re-join into the pick: word 0 of the s
+    /// stick is the LANE PATTERN's first lane `k·s + 0`, so `s = word0/k` EXACT;
+    /// word 0 of the l stick is the LANE RAMP's first lane, `l` itself; then
+    /// `t = s·64 + l` — the CARD's real-seed law. In the GATE'S MODEL the sticks
+    /// are f16-staged probe values (≈ 0), so the walk answers t = 0 and gathers
+    /// `W[:, 0]` — the same row the golden's own eval gathers off the same
+    /// staged values, its `as usize` saturating the probe to 0 exactly as this
+    /// walk does. Both sentinel legs stay: the sentinel ramp's word 0 is
+    /// `hidden` (the zero row), and every pick past the matrix's widened width
+    /// clamps to the zero row, while a pick in `[vocab, pad)` reads the pad
+    /// columns' own zeros.
+    ///
+    /// ⭐ THE WEIGHT WALK IS OFF THE GEMM-STAGED TRANSPOSE. The tied weight is
+    /// gemm-classified (`stage_synth_weights` collects matmul weight inputs
+    /// unconditionally), so its stick is `[cols, rows]` row-major —
+    /// `stick[j·rows + l] = W[l, j]` — and the token's column `W[:, t]` is the
+    /// CONTIGUOUS slice at `t·rows .. t·rows+rows`. Stated off the tensor's own
+    /// dims and the pick, both sentinel legs and the widened-width clamp exactly
+    /// as the eval arm states them (the clamp's extent is the weight view's own
+    /// cols — the region's statement, arriving here as the resident's widest
+    /// shape for the tid; a widest cols past the staged extent reads the memory
+    /// sim's zero-fill, the same zeros the clamp names). LOAD-BEARING AND
+    /// NON-OBVIOUS: that widest shape is `collect_view_shapes`' — widest
+    /// strictly-greater-wins, TIES KEEP THE FIRST — and the door's entry view
+    /// (logical `[hidden, vocab]`) walks before the lm-head matmul's view, so
+    /// the tie between the two `[hidden, vocab]` views lands on the door's
+    /// own: `rows = hidden`, the walk's own law.
+    fn run_embed_row_gather(&self, node: &NodeSpec, k: u32) -> Result<(), String> {
+        let tids: Vec<u64> = node.bindings.iter().map(|b| b.tensor).collect();
+        if tids.len() != 4 {
+            return Err(format!(
+                "embed_row_gather: the mint states FOUR parameters (s stick, l stick, weight, \
+                 row out); this node binds {}",
+                tids.len()
+            ));
+        }
+        if k == 0 {
+            return Err(
+                "embed_row_gather: the payload states k = 0 — the slab entry count the mint \
+                 derived is empty, so the lane pattern s = word0/k has no statement"
+                    .to_string(),
+            );
+        }
+        let (s_tid, l_tid, w_tid, o_tid) = (tids[0], tids[1], tids[2], tids[3]);
+        let s_val = self.read_door_lane0(s_tid)?;
+        let l_val = self.read_door_lane0(l_tid)?;
+        // The weight at its OWN view dtype (an fp8-packed view reads one byte per
+        // element — the same per-tid law the pointer binding and the readback
+        // use), full extent.
+        let shape = self.shapes.get(&w_tid).ok_or_else(|| {
+            format!("embed_row_gather: the weight t{w_tid} has no derived shape")
+        })?;
+        if shape.len() != 2 {
+            return Err(format!(
+                "embed_row_gather: the weight t{w_tid} states a {}-dim shape; the walk needs \
+                 the matrix's own [rows, cols]",
+                shape.len()
+            ));
+        }
+        let (rows, cols) = (shape[0], shape[1]);
+        let w_stick = *self
+            .stick
+            .get(&w_tid)
+            .ok_or_else(|| format!("embed_row_gather: the weight t{w_tid} has no resident stick"))?;
+        let w_dt = self.view_dtype.get(&w_tid).copied().unwrap_or(self.dtype);
+        let nbytes = rows * cols * w_dt.bytes_per_elem();
+        let wbytes = self.mem.hbm.borrow().read_bytes(w_stick * STICK_BYTES, nbytes);
+        let w = crate::codec::decode(&wbytes, rows * cols, w_dt);
+        // The golden's own saturating float→int arithmetic (`as usize` in the
+        // eval arm, cast BEFORE the divide): a staged probe value ≈ 0.02
+        // answers 0, a negative saturates to 0, and u64 carries the walk to
+        // the clamp without overflow (the gate runs in debug builds where it
+        // would panic).
+        let s = (s_val as u64) / k as u64;
+        let l = l_val as u64;
+        let t = s * 64 + l;
+        let mut out = vec![0.0f32; rows];
+        if l != rows as u64 && t < cols as u64 {
+            let base = (t as usize) * rows;
+            out.copy_from_slice(&w[base..base + rows]);
+        }
+        // The row out decodes at the MODEL dtype on readback (the doors' views are
+        // Shape-only, so `meta_for`'s per-tid lookup falls to `self.dtype`).
+        let obytes = crate::codec::encode(&out, self.dtype);
+        let o_stick = *self
+            .stick
+            .get(&o_tid)
+            .ok_or_else(|| format!("embed_row_gather: the row out t{o_tid} has no resident stick"))?;
+        self.mem
+            .hbm
+            .borrow_mut()
+            .write_bytes(o_stick * STICK_BYTES, &obytes);
+        Ok(())
+    }
+
+    /// THE DECOMPOSE DOOR, HOST FORM — the chained head's pick decompose (#603),
+    /// the golden's own law (`subtile_ir`'s ChainStage eval arm) restated against
+    /// resident HBM. SIX bound tensors in mint order (the skeleton's operand
+    /// list — the node's inputs, then the output): the pick stick, the
+    /// persistent s stick, the persistent l stick, the two decompose tables,
+    /// and the fresh s-value stick out. The tables are UNREAD here — the
+    /// golden's own law ("the table operands are unread by the reference: the
+    /// reference states the decompose's RESULT, never its walk"), staged once
+    /// at load for the card's gather doors and carried by the node's bindings
+    /// like every other operand.
+    ///
+    /// The pick is an IN-GRAPH tensor at its OWN view dtype — the argmax's i32
+    /// idx stick (I32; the readback's own per-tid law), read as ONE entry: the
+    /// value is below 2^24, exact as decoded. The ruled table's law: `s = t >> 6`
+    /// clamped to 0 past `pad_vocab`, stated as the LANE PATTERN `k·s + (i mod
+    /// k)` over the stick's lanes — the clamp keeps even the sentinel read on
+    /// slab 0's pattern, and the sentinel ramp's lanes name the transposed
+    /// placement's unwritten zero tail (word 0 = `hidden`, the mark a real pick's
+    /// word 0 ≤ 63 never collides with). `table_rows` rides the payload for the
+    /// card's staged tables and is unread here by the same law that leaves the
+    /// table operands unread. `hidden` is the payload's own statement (the
+    /// paired gather's width, the same single source the staged tables carry) —
+    /// the lane ramp's modulus `64·(i mod (hidden/64)) + l` and the sentinel
+    /// mark's own value, NEVER derived from the stick's lane count (`lanes·64`
+    /// is one model's hidden by coincidence).
+    fn run_chain_stage(
+        &self,
+        node: &NodeSpec,
+        pad_vocab: u32,
+        hidden: u32,
+        k: u32,
+    ) -> Result<(), String> {
+        let tids: Vec<u64> = node.bindings.iter().map(|b| b.tensor).collect();
+        if tids.len() != 6 {
+            return Err(format!(
+                "chain_stage: the mint states SIX bound tensors (pick, s stick, l stick, the \
+                 two decompose tables, s-value out); this node binds {}",
+                tids.len()
+            ));
+        }
+        if k == 0 {
+            return Err(
+                "chain_stage: the payload states k = 0 — the slab entry count the mint derived \
+                 is empty, so the lane pattern has no modulus"
+                    .to_string(),
+            );
+        }
+        // The skeleton's operand law: the node's inputs in order, then the
+        // output — (pick, s stick, l stick, s table, l table, out). The two
+        // decompose tables at [3]/[4] are UNREAD here (the golden's own law:
+        // the reference states the decompose's result, never its walk); the
+        // fresh s-value out is [5], not [3].
+        let (pick_tid, s_tid, l_tid, o_tid) = (tids[0], tids[1], tids[2], tids[5]);
+        let p_stick = *self
+            .stick
+            .get(&pick_tid)
+            .ok_or_else(|| format!("chain_stage: the pick t{pick_tid} has no resident stick"))?;
+        let p_dt = self.view_dtype.get(&pick_tid).copied().unwrap_or(self.dtype);
+        let pbytes = self
+            .mem
+            .hbm
+            .borrow()
+            .read_bytes(p_stick * STICK_BYTES, p_dt.bytes_per_elem());
+        let t = crate::codec::decode(&pbytes, 1, p_dt)[0] as u64;
+        let s = if t < pad_vocab as u64 { (t >> 6) as u32 } else { 0 };
+        // The stick's own lane count is the pattern's EXTENT — `[1,
+        // CHAIN_IDX_BLOCK]` (32) for every model; the ramp's MODULUS is the
+        // payload's own hidden, never derived from this count.
+        let lanes = *self.numel.get(&l_tid).unwrap_or(&0);
+        if lanes == 0 {
+            return Err(format!(
+                "chain_stage: the l stick t{l_tid} has no derived extent — the lane ramp has \
+                 no lane count to state"
+            ));
+        }
+        if !hidden.is_multiple_of(64) {
+            return Err(format!(
+                "chain_stage: the payload states hidden = {hidden} — the lane ramp's modulus \
+                 hidden/64 is not whole, so the ramp has no statement (every chained hidden \
+                 is a multiple of 64; a graph the mint never made)"
+            ));
+        }
+        let l = t as u32 & 63;
+        let (s_pat, l_ramp): (Vec<f32>, Vec<f32>) = if t < pad_vocab as u64 {
+            (
+                (0..lanes as u32).map(|i| (k * s + i % k) as f32).collect(),
+                (0..lanes as u32)
+                    .map(|i| (64 * (i % (hidden / 64)) + l) as f32)
+                    .collect(),
+            )
+        } else {
+            // The sentinel leg: slab-0 pattern (bus safety) + the sentinel ramp.
+            (
+                (0..lanes as u32).map(|i| (i % k) as f32).collect(),
+                (0..lanes as u32).map(|i| (hidden + i) as f32).collect(),
+            )
+        };
+        self.write_door_lanes(s_tid, &s_pat)?;
+        self.write_door_lanes(l_tid, &l_ramp)?;
+        // The fresh s-value stick is the node's ONE compared output; its
+        // Shape-only view reads back at the MODEL dtype (`meta_for`'s law), so
+        // it is encoded there. The gate's compare is RELATIVE
+        // (`rel = dsum/gsum.max(1e-6)`), and f16's universal relative error
+        // ≤ 2⁻¹¹ ≈ 4.9e-4 is under CLEAN_TOL 5e-3 at ANY magnitude; s_out is
+        // not ir.result (the exact-0 index law binds only
+        // `tid == ir.result.index()`), so it takes the clean tolerance — the
+        // emulator's modelling of the card's u32 stick, stated, not hidden.
+        let out = s_pat;
+        let obytes = crate::codec::encode(&out, self.dtype);
+        let o_stick = *self
+            .stick
+            .get(&o_tid)
+            .ok_or_else(|| format!("chain_stage: the s-value out t{o_tid} has no resident stick"))?;
+        self.mem
+            .hbm
+            .borrow_mut()
+            .write_bytes(o_stick * STICK_BYTES, &obytes);
+        Ok(())
+    }
+
     /// Enable/disable LAST-TOKEN-ONLY mode. When ON, the final result-producing
     /// projection (the segment whose store writes a program RESULT tensor — e.g. a
     /// transformer's `lm_head`) computes ONLY the last output row (`m-1`) instead
@@ -986,6 +1252,30 @@ impl ResidentExecutor {
                 }
                 Segment::Native(node) => {
                     let func = self.programs[idx].module.get_function(&node.func)?;
+                    // THE CHAINED HEAD'S DOORS (#603): a door node's KTIR body is a
+                    // STRUCTURAL SKELETON minted for the card-side door assembly (a
+                    // load of the first operand's view, a store to the last), not
+                    // door semantics — so the resident substitutes the HOST door,
+                    // keyed on the node's carried `program` kind (the mint's one
+                    // typed statement, never the func name). No env opt-out, unlike
+                    // attention's oracle below: the door's decomposed path is the
+                    // missing-Strides refusal, not a fallback.
+                    let door_ran = match node.program {
+                        Program::EmbedRowGather { k } => {
+                            self.run_embed_row_gather(node, k)?;
+                            true
+                        }
+                        Program::ChainStage {
+                            pad_vocab,
+                            hidden,
+                            k,
+                            ..
+                        } => {
+                            self.run_chain_stage(node, pad_vocab, hidden, k)?;
+                            true
+                        }
+                        _ => false,
+                    };
                     // FUSED CPU m=1 ATTENTION (default ON; opt out via
                     // KTIR_NO_FUSE_ATTN): when the native segment recognizes as the
                     // decode (m=1) attention island, compute it directly with
@@ -997,7 +1287,7 @@ impl ResidentExecutor {
                     // recognition here is the steady-state path for an isolated m=1
                     // attention node. If recognition fails (a non-decode native
                     // node), fall through to the decomposed grid run below.
-                    let fused = if self.fuse_attn {
+                    let fused = if !door_ran && self.fuse_attn {
                         if let Some(island) =
                             ktir_optimizer::head_rewrite::recognize_head_attention_decode(func)
                         {
@@ -1012,8 +1302,8 @@ impl ResidentExecutor {
                     if seg_prof {
                         native_ops = op_type_histogram(func.operations);
                     }
-                    if fused {
-                        // computed in fused path; outputs already resident in HBM.
+                    if fused || door_ran {
+                        // computed in the fused/door path; outputs already resident in HBM.
                     } else {
                         let grid = func.grid;
                         let mut input_ptrs: Vec<(Ssa, Value)> =
