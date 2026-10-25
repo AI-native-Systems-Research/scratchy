@@ -445,6 +445,16 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
              host routing, or its own by-name refusal); reaching the splice means the \
              routing changed, and the fix is a family function plus a kernel",
         ),
+        // A DFlash2 drafter's ops and its target's capture: Splash's kernels, ported as
+        // Metal opcode lowerings alone.
+        SubOp::CaptureHidden { .. }
+        | SubOp::DraftConv { .. }
+        | SubOp::DraftAttention { .. }
+        | SubOp::DraftContextKv { .. }
+        | SubOp::DraftSelect => TritonKernelRow::Refused(
+            "a DFlash2 drafter's op (or its target's capture): its kernels are Splash's, \
+             lowered on Metal alone — a spyre drafter needs its kernels first",
+        ),
     }
 }
 
