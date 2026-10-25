@@ -281,6 +281,16 @@ pub enum OpKind {
     /// (normed, roped) and values written into the layer's ring at the row's position. Identity: it
     /// returns `kv`.
     DraftContextKv,
+    /// `draft_window_store(context, positions)`: a DFlash2 drafter's commit of its context rows
+    /// into the lane's context window at their positions, 4-bit (Splash `DFlashContextWindow`,
+    /// `DraftAttention::addWindowStore`, runtime/model/DFlashDraft.cpp:118-180), from which a
+    /// prefix-cache hit rebuilds the lane's rings. Identity: it returns `context`.
+    DraftWindowStore,
+    /// `draft_window_load(context, positions)`: the context rows of the forward's positions, out
+    /// of the lane's context window, written over `context` (Splash `addWindowLoad`, in
+    /// `DFlashDraft::addContextRebuild`, DFlashDraft.cpp:184-198). Only a forward rebuilding the
+    /// lane's rings plays it: a commit's layers read the rows its store took, exact.
+    DraftWindowLoad,
     /// `draft_conv(x, dynamic, base)` / `draft_conv(x, dynamic, base, residual)`: one stage of a
     /// DFlash2 drafter's dynamic convolution (Splash `draft_conv`): each channel of a block row
     /// and of the row before it, weighted by the stage's base kernel plus the channel group's
@@ -623,6 +633,8 @@ impl OpKind {
             "export_hidden" => Some(Self::ExportHidden),
             "capture_hidden" => Some(Self::CaptureHidden),
             "draft_context_kv" => Some(Self::DraftContextKv),
+            "draft_window_store" => Some(Self::DraftWindowStore),
+            "draft_window_load" => Some(Self::DraftWindowLoad),
             "draft_conv" => Some(Self::DraftConv),
             "draft_attention" => Some(Self::DraftAttention),
             "draft_select" => Some(Self::DraftSelect),
@@ -689,6 +701,8 @@ impl OpKind {
             Self::ExportHidden => "export_hidden",
             Self::CaptureHidden => "capture_hidden",
             Self::DraftContextKv => "draft_context_kv",
+            Self::DraftWindowStore => "draft_window_store",
+            Self::DraftWindowLoad => "draft_window_load",
             Self::DraftConv => "draft_conv",
             Self::DraftAttention => "draft_attention",
             Self::DraftSelect => "draft_select",

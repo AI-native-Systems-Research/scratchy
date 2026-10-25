@@ -602,6 +602,9 @@ mod tests {
                 | KernelId::DraftAttentionReorder
                 | KernelId::DraftContextCommit
                 | KernelId::DraftContextPrefill
+                | KernelId::DraftWindowStoreCommit
+                | KernelId::DraftWindowStorePrefill
+                | KernelId::DraftWindowLoad
                 | KernelId::DraftSelectTop16
                 | KernelId::DraftSelectEdges
                 | KernelId::DraftSelectWalk
@@ -797,6 +800,9 @@ mod tests {
             | KernelId::DraftAttentionReorder
             | KernelId::DraftContextCommit
             | KernelId::DraftContextPrefill
+            | KernelId::DraftWindowStoreCommit
+            | KernelId::DraftWindowStorePrefill
+            | KernelId::DraftWindowLoad
             | KernelId::DraftSelectTop16
             | KernelId::DraftSelectEdges
             | KernelId::DraftSelectWalk

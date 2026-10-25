@@ -431,6 +431,7 @@ pub fn apply_signature_with_geometry(
             })
         }
         OpKind::DraftContextKv => sig_draft_context_kv(solver, inputs),
+        OpKind::DraftWindowStore | OpKind::DraftWindowLoad => sig_draft_window(op, solver, inputs),
         OpKind::DraftConv => sig_draft_conv(solver, inputs),
         OpKind::DraftAttention => sig_draft_attention(solver, inputs),
         OpKind::DraftSelect => sig_draft_select(solver, inputs),
@@ -743,6 +744,26 @@ fn sig_draft_context_kv(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, 
     expect_args(op, inputs, 4)?;
     draft_last(solver, op, "kv", &inputs[0], &draft_bound("draft_kv_size"))?;
     draft_rank1(solver, op, "k_norm", &inputs[1], &draft_bound("head_dim"))?;
+    Ok(OpSig {
+        output: inputs[0].clone(),
+    })
+}
+
+/// `draft_window_store` / `draft_window_load(context: [.., hidden_size], positions)` →
+/// `context`'s shape: the drafter's context window (Splash `DFlashContextWindow`).
+fn sig_draft_window(
+    op: OpKind,
+    solver: &mut Solver,
+    inputs: &[Shape],
+) -> Result<OpSig, ShapeError> {
+    expect_args(op, inputs, 2)?;
+    draft_last(
+        solver,
+        op,
+        "context",
+        &inputs[0],
+        &draft_bound("hidden_size"),
+    )?;
     Ok(OpSig {
         output: inputs[0].clone(),
     })
@@ -1355,6 +1376,7 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::CaptureHidden => &[],
         // The key norm `[head_dim]`.
         OpKind::DraftContextKv => &[(1, 1)],
+        OpKind::DraftWindowStore | OpKind::DraftWindowLoad => &[],
         // The stages' base kernel, flat `[2 · taps · hidden]`.
         OpKind::DraftConv => &[(2, 1)],
         // The query and key norms `[head_dim]`.

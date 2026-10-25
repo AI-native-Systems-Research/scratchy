@@ -196,6 +196,10 @@ pub enum ForwardReads {
     /// left as the forward found it (a DFlash2 drafter's block draft reads its rings and leaves
     /// their commit to the play of its cache writes after its target's verify).
     Result,
+    /// A DFlash2 drafter's rings rebuilt from its context window, which a prefix-cache hit
+    /// restored (Splash `DFlashDraft::addContextRebuild`): its tape plays only the window's load
+    /// and the ring writers after it, over the window's rows.
+    Rebuild,
 }
 
 /// A forward the host commits without waiting for it, so the next one is queued while it runs. Its
