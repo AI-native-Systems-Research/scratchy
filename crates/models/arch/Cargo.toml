@@ -837,6 +837,13 @@ required-features = ["cuda", "qwen3.5-9b-text-only"]
 name = "cuda_tapes_35b"
 required-features = ["cuda", "qwen3.6-35b-a3b"]
 
+# Gemma 4 26B-A4B's emitted CUDA tapes (#885): its two attention classes, two rotary tables,
+# Gemma routing, 64-column GEMMs and weight table, checked with no toolchain. Its new steps have
+# no kernels yet (#885's 13b and 13c).
+[[test]]
+name = "cuda_tapes_gemma4"
+required-features = ["cuda", "gemma-4-26b-a4b-it"]
+
 [[test]]
 name = "cuda_prefill_9b"
 required-features = ["nvcc", "qwen3.5-9b-text-only"]
