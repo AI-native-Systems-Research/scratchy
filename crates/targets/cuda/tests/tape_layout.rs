@@ -18,6 +18,7 @@ use common::attn_gate::{ATTN_GATE_M128, ATTN_GATE_M256, attn_gate, attn_gate_inp
 use common::attn_layer::{
     ATTN_LAYER_M128, ATTN_LAYER_M256, LAYER, PREFIX_CAPACITY, attn_layer, attn_layer_input,
 };
+use common::chains::GEMMA4_FACTS;
 use common::chains::{
     QWEN3_5_FACTS, QWEN3_5_GDN_FACTS, THREE_GEMM_M256, TWO_GEMM_M128, TWO_GEMM_M256,
     assert_tape_is_lowered, assert_tape_is_lowered_with, chain_input, three_gemm, two_gemm,
@@ -2184,4 +2185,116 @@ fn a_gdn_op_is_checked_against_the_scratchs_geometry_not_its_bytes() {
         matches!(other, Err(CanonicalRefusal::GdnPool { step: 5 })),
         "{other:?}"
     );
+}
+
+// ── The 64-column GEMM (Gemma 4) ───────────────────────────────────
+
+/// The one GEMM step `chain_input(m, k, &[n])` lowers to under `facts`.
+fn one_gemm(m: u32, k: u32, n: u32, facts: CudaModelFacts) -> CudaStep {
+    let c = lower_with(&with_hidden(chain_input(m, k, &[n])), facts)
+        .unwrap_or_else(|e| panic!("m={m} k={k} n={n}: {e}"));
+    let [step] = c.steps.as_slice() else {
+        panic!("expected one step, got {:?}", c.steps);
+    };
+    *step
+}
+
+/// Under Gemma 4's facts, Gemma's router (128), expert (704) and dense MLP (2112) widths, each a
+/// multiple of 64 and not of 256, lower to the 64-column GEMM at m = 256 (#885).
+#[test]
+fn a_gemma_gemm_off_the_256_tile_lowers_to_the_64_column_gemm() {
+    for n in [128, 704, 2112] {
+        let step = one_gemm(256, 2816, n, GEMMA4_FACTS);
+        let CudaStep::GemmCol64(g) = step else {
+            panic!("n = {n}: expected GemmCol64, got {step:?}");
+        };
+        assert_eq!((g.m, g.n, g.k), (256, n, 2816), "n = {n}");
+    }
+}
+
+/// Under Gemma 4's facts, an `n` that is a multiple of 64 and not of 256 but whose `k` is off the
+/// 64-column GEMM's 64 is refused under its own rule, naming the 64-column GEMM; an `n` off 64
+/// (200) or a multiple of 32 only (96) keeps today's tiled refusal, since it is not the 64-column
+/// GEMM's.
+#[test]
+fn a_gemma_gemm_off_the_64_column_tile_is_refused_by_its_rule() {
+    let e = refused_with(
+        &with_hidden(chain_input(256, 100, &[128])),
+        GEMMA4_FACTS,
+        &["k = 100", "multiple of 64 (the 64-column GEMM)"],
+    );
+    assert!(matches!(
+        e,
+        CanonicalRefusal::GemmShape {
+            step: 0,
+            k: 100,
+            rule: GemmShapeRule::Col64OffTile {
+                dim: "k",
+                value: 100,
+                tile: 64
+            },
+            ..
+        }
+    ));
+    let e = refused_with(
+        &with_hidden(chain_input(192, 1024, &[128])),
+        GEMMA4_FACTS,
+        &["m = 192", "multiple of 128 (the 64-column GEMM)"],
+    );
+    assert!(matches!(
+        e,
+        CanonicalRefusal::GemmShape {
+            rule: GemmShapeRule::Col64OffTile {
+                dim: "m",
+                value: 192,
+                tile: 128
+            },
+            ..
+        }
+    ));
+    for n in [200, 96] {
+        let e = refused_with(
+            &with_hidden(chain_input(256, 1024, &[n])),
+            GEMMA4_FACTS,
+            &[&format!("n = {n}"), "multiple of 256"],
+        );
+        assert!(
+            matches!(
+                e,
+                CanonicalRefusal::GemmShape {
+                    rule: GemmShapeRule::OffTile { dim: "n", .. },
+                    ..
+                }
+            ),
+            "n = {n}: {e:?}"
+        );
+    }
+}
+
+/// Under Gemma 4's facts the 64-column GEMM takes only m ≥ 2: one row is still the GEMV, and an
+/// `n` that is a multiple of 256 is still the tiled GEMM.
+#[test]
+fn a_gemma_gemm_of_one_row_or_on_the_256_tile_keeps_its_kernel() {
+    let step = one_gemm(1, 2816, 128, GEMMA4_FACTS);
+    assert!(matches!(step, CudaStep::Gemv(_)), "{step:?}");
+    let step = one_gemm(256, 2816, 1024, GEMMA4_FACTS);
+    assert!(matches!(step, CudaStep::Gemm(_)), "{step:?}");
+}
+
+/// The 64-column GEMM is Gemma 4's alone: under Qwen's facts, n = 128 is still refused as off the
+/// 256-column tile, beside the Gemma fixture that lowers it.
+#[test]
+fn the_64_column_gemm_is_off_under_qwen_facts() {
+    let l = with_hidden(chain_input(256, 1024, &[128]));
+    let e = refused_with(&l, QWEN3_5_FACTS, &["n = 128", "multiple of 256"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::GemmShape {
+            n: 128,
+            rule: GemmShapeRule::OffTile { dim: "n", .. },
+            ..
+        }
+    ));
+    let step = one_gemm(256, 1024, 128, GEMMA4_FACTS);
+    assert!(matches!(step, CudaStep::GemmCol64(_)), "{step:?}");
 }

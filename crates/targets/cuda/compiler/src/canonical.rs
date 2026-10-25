@@ -68,6 +68,20 @@ pub struct CudaModelFacts {
     /// the handoff's `attn_classes`. `None` for a uniform model, whose one class is `head_dim`,
     /// `rot_dim` and `rope_theta`, with no window and the half-rotated pairing.
     pub classes: Option<CudaAttnClasses>,
+    /// Which column tiles the model's GEMMs take: the 256-column tile only, or the 64-column tile
+    /// too (`op_abi::CUDA_GEMM_COL64_ARCHS`).
+    pub gemm_col_tile: GemmColTile,
+}
+
+/// Which column tiles a model's GEMMs take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GemmColTile {
+    /// The tiled GEMM's 256 columns only (every Qwen model).
+    Tile256Only,
+    /// Also the 64-column GEMM: an `n` above the narrow GEMM's that is a multiple of 64 and not of
+    /// 256 lowers to `CudaStep::GemmCol64`, and an expert GEMM's `n_tile` is 64 when `n` is not a
+    /// multiple of 256 (Gemma 4).
+    Col64,
 }
 
 /// A two-class model's attention classes. `base` is `head_dim`, `rot_dim` and `rope_theta`'s, and
@@ -504,10 +518,9 @@ pub enum MoeShapeRule {
     /// The op's rows are not the bucket's tokens.
     Rows,
     /// A dimension the expert GEMMs tile is off their tile: `hidden` or `inter` not a multiple of
-    /// 256, or of 64 as `k`.
+    /// 256 (or, for a 64-column-tile model, of 64), or of 64 as `k`.
     OffTile { dim: &'static str, value: u32 },
-    /// The router's experts are not the 256 the routing kernel's warp holds (8 per lane), or the
-    /// top-k is above 32.
+    /// The router's experts are not one of `op_abi::MOE_EXPERT_COUNTS`, or the top-k is above 32.
     Experts { experts: u32, top_k: u32 },
 }
 
@@ -671,6 +684,13 @@ pub enum GemmShapeRule {
     /// `m = 1` and `n` is not the narrow GEMM's, and the GEMV's `k` is zero or not a multiple of
     /// its `multiple`.
     GemvOffVector { value: u32, multiple: u32 },
+    /// A 64-column-tile model's `n` is a multiple of 64 and not of 256 (the 64-column GEMM's), and
+    /// `dim` is zero or not a multiple of its `tile`.
+    Col64OffTile {
+        dim: &'static str,
+        value: u32,
+        tile: u32,
+    },
 }
 
 /// Why an operand cannot be bound.
@@ -1010,8 +1030,9 @@ impl std::fmt::Display for MoeShapeRule {
             ),
             Self::Experts { experts, top_k } => write!(
                 f,
-                "{experts} experts, top-{top_k}: the routing kernel takes 256 experts (8 per \
-                 lane of a warp) and a top-k of 1 to 32"
+                "{experts} experts, top-{top_k}: the MoE steps take {:?} experts and a top-k of \
+                 1 to 32",
+                scratchy_target_cuda::op_abi::MOE_EXPERT_COUNTS
             ),
         }
     }
@@ -1257,6 +1278,10 @@ impl std::fmt::Display for GemmShapeRule {
                 f,
                 "k = {value} must be a non-zero multiple of {multiple}, the bf16 GEMV's 16-byte \
                  vector"
+            ),
+            Self::Col64OffTile { dim, value, tile } => write!(
+                f,
+                "{dim} = {value} must be a non-zero multiple of {tile} (the 64-column GEMM)"
             ),
         }
     }

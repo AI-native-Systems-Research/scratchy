@@ -26,6 +26,7 @@ use scratchy_target_cuda::step::{CudaStep, EmbedBf16, GemmBf16};
 use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, TapeInput, WeightIx};
 use scratchy_target_cuda::weights::CudaWeight;
 use scratchy_target_cuda_compiler::canonical::AttnShapeRule;
+use scratchy_target_cuda_compiler::canonical::GemmColTile;
 use scratchy_target_cuda_compiler::canonical::{
     ArenaRefusal, CanonicalAt, CanonicalRefusal, CudaEmbedFacts, CudaModelFacts, CudaPlan,
     EmbedShapeRule, GateShapeRule, GemmShapeRule, OperandRefusal, RopeShapeRule, SharedExpertOwner,
@@ -54,6 +55,7 @@ const FACTS: CudaModelFacts = CudaModelFacts {
     embed: None,
     shared_expert: SharedExpertOwner::Undeclared,
     classes: None,
+    gemm_col_tile: GemmColTile::Tile256Only,
 };
 
 fn fixtures() -> Vec<(&'static str, LoweringInput)> {
@@ -222,6 +224,7 @@ fn a_rope_on_the_hidden_with_the_global_table_lowers_to_one_rope() {
         embed: None,
         shared_expert: SharedExpertOwner::Undeclared,
         classes: None,
+        gemm_col_tile: GemmColTile::Tile256Only,
     };
     let c = lower_canonical(&l, facts, AT).expect("the rope lowers");
     let [CudaStep::Rope(rope)] = c.steps.as_slice() else {
@@ -1030,6 +1033,7 @@ fn tied_head(m: u32) -> LoweredDecode {
 fn tied_model(ms: &[u32], head: &str, vocab: u32) -> TargetModelInput {
     TargetModelInput {
         stem: "fixture".to_string(),
+        arch: "fixture".to_string(),
         buckets: (ms.iter())
             .map(|&m| TargetBucket {
                 point: TargetPoint { m, sk: 1 },

@@ -608,7 +608,9 @@ fn not_launched(tape: &CudaTape, s: &CudaStep) -> Option<&'static str> {
             Some("MoeRoute")
         }
         CudaStep::RouterLogits(r)
-            if r.experts != MOE_ROUTE_EXPERTS || r.weight != MoeWeight::Bundle =>
+            if r.experts != MOE_ROUTE_EXPERTS
+                || r.weight != MoeWeight::Bundle
+                || r.kernel == MatmulKernel::Col64 =>
         {
             Some("RouterLogits")
         }
@@ -1409,6 +1411,12 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     kernel,
                     ..
                 }) => {
+                    // Gemma's 64-column router GEMM: refused above, before anything was enqueued
+                    // (`not_launched`).
+                    if kernel == MatmulKernel::Col64 {
+                        let op = not_launched(tape, s).unwrap_or("RouterLogits");
+                        return Err(ForwardError::NotLaunched { step, op });
+                    }
                     // The router is the bundle's first tensor, at byte 0 (`moe_bundle`).
                     let b = weights[bundle.0 as usize].ptr();
                     // SAFETY: as above, for `x` (`m*hidden`), the router (`experts*hidden`, the
@@ -1431,6 +1439,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 (experts, hidden),
                                 stream.0,
                             ),
+                            MatmulKernel::Col64 => unreachable!("returned NotLaunched above"),
                         }
                     }
                 }

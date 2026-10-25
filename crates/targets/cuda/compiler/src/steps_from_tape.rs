@@ -22,16 +22,16 @@ use scratchy_subtile::subtile_ir::{TensorRegion, TensorShape};
 use scratchy_subtile::subtile_tape::{ComputeInput, ComputeInputs, SlotId};
 use scratchy_subtile::tape_colouring::{Colour, TapeColouring};
 use scratchy_subtile::tape_folding::{FusedShape, Fusion};
-use scratchy_target_cuda::op_abi::{CUDA_GROUPED_EXPERTS, CudaFusion};
+use scratchy_target_cuda::op_abi::{CUDA_GROUPED_EXPERTS, CudaFusion, MOE_EXPERT_COUNTS};
 use scratchy_target_cuda::step::{
     ADD_BF16_COLS, ATTN_BF16_HEAD_DIMS, ATTN_DECODE_BF16_MAX_GROUP, ATTN_PREFILL_BF16_ROWS,
     ATTN_WINDOW_MULTIPLE, AddBf16, AttnPrefillBf16, CudaStep, EMBED_BF16_COLS, EmbedBf16,
     ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16, ExpertProjection, ExpertSortBf16,
     GATE_APPLY_BF16_COLS, GATE_SCALE_BF16_COLS, GATE_SPLIT_BF16_HEAD_DIM,
     GATE_SPLIT_BF16_HEAD_MULTIPLE, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX,
-    GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_NARROW_BF16_MAX_N, GEMM_NARROW_BF16_MULTIPLE,
-    GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE, GateApplyBf16, GateScaleBf16, GateSplitBf16,
-    GatedDeltaNetBf16, GemmBf16, LayerScaleBf16, MOE_ROUTE_EXPERTS, MOE_ROUTE_MAX_TOP_K,
+    GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_COL64_TILE, GEMM_NARROW_BF16_MAX_N,
+    GEMM_NARROW_BF16_MULTIPLE, GEMM_NARROW_BF16_ONE, GEMV_BF16_MULTIPLE, GateApplyBf16,
+    GateScaleBf16, GateSplitBf16, GatedDeltaNetBf16, GemmBf16, LayerScaleBf16, MOE_ROUTE_MAX_TOP_K,
     MatmulKernel, MoeRouteBf16, MoeWeight, PairRows, RMS_NORM_BF16_COLS, ROPE_BF16_HEAD_MULTIPLE,
     ROPE_BF16_ROT_MULTIPLE, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram,
     RouterLogitsBf16, SCALE_BF16_COLS, SILU_MUL_BF16_COLS, SOFT_CAP_BF16_COLS, ScaleBf16,
@@ -41,8 +41,8 @@ use scratchy_target_cuda::tape::{ArenaOffset, MoeTape, WeightIx};
 
 use crate::canonical::{
     ArenaRefusal, AttnShapeRule, CanonicalRefusal, CudaAttnClass, CudaModelFacts, EmbedShapeRule,
-    GateShapeRule, GdnRegions, GdnShapeRule, GdnWidths, GemmShapeRule, KvCacheRefusal, KvPool,
-    KvRegions, MoeShapeRule, OperandRefusal, ProducerRefusal, RopeShapeRule, RowShapeRule,
+    GateShapeRule, GdnRegions, GdnShapeRule, GdnWidths, GemmColTile, GemmShapeRule, KvCacheRefusal,
+    KvPool, KvRegions, MoeShapeRule, OperandRefusal, ProducerRefusal, RopeShapeRule, RowShapeRule,
     SharedExpertOwner, ViewRefusal,
 };
 
@@ -274,12 +274,14 @@ fn gemm(
     };
     let m = cx.graph.shape(node.output.tensor).rows;
     let k = cx.graph.shape(wt.tensor).rows;
-    let kernel = gemm_kernel(m, n, k).map_err(|rule| CanonicalRefusal::GemmShape {
-        step,
-        m,
-        n,
-        k,
-        rule,
+    let kernel = gemm_kernel(m, n, k, cx.facts.gemm_col_tile).map_err(|rule| {
+        CanonicalRefusal::GemmShape {
+            step,
+            m,
+            n,
+            k,
+            rule,
+        }
     })?;
     if !matches!(weight, GemmWeight::Dense) {
         return Err(CanonicalRefusal::GemmWeight {
@@ -1242,7 +1244,7 @@ fn moe_counts(
     moe: &MoeTape,
     (experts, top_k): (u32, u32),
 ) -> Result<(), CanonicalRefusal> {
-    if experts != MOE_ROUTE_EXPERTS || top_k == 0 || top_k > MOE_ROUTE_MAX_TOP_K {
+    if !MOE_EXPERT_COUNTS.contains(&experts) || top_k == 0 || top_k > MOE_ROUTE_MAX_TOP_K {
         return Err(moe_refusal(s, MoeShapeRule::Experts { experts, top_k }));
     }
     if (experts, top_k) != (moe.experts, moe.top_k) {
@@ -1301,8 +1303,11 @@ fn router_logits(
     if weight == MoeWeight::Own {
         same_shape(cx, s, 1, w, hidden, experts)?;
     }
+    let col64 =
+        cx.facts.gemm_col_tile == GemmColTile::Col64 && !experts.is_multiple_of(GEMM_BF16_TILE.1);
     let kernel = match m {
         1 => gemv_shape(experts, hidden).map(|()| MatmulKernel::Gemv),
+        _ if col64 => gemm_col64_shape(m, experts, hidden).map(|()| MatmulKernel::Col64),
         _ => gemm_shape(m, experts, hidden).map(|()| MatmulKernel::Tiled),
     }
     .map_err(|rule| CanonicalRefusal::GemmShape {
@@ -1616,6 +1621,11 @@ fn expert_matmul(
         }));
     };
     let (_, tn, tk) = GEMM_BF16_TILE;
+    // A 64-column-tile model's expert GEMM takes 64-column tiles when `n` is off the 256 one.
+    let tn = match cx.facts.gemm_col_tile {
+        GemmColTile::Col64 if !n.is_multiple_of(tn) => GEMM_COL64_TILE.1,
+        _ => tn,
+    };
     for (dim, value, tile) in [("n", n, tn), ("k", k, tk)] {
         if !value.is_multiple_of(tile) {
             return Err(moe_refusal(s, MoeShapeRule::OffTile { dim, value }));
@@ -1850,12 +1860,28 @@ fn gate_shape(rows: u32, half_cols: u32, head_dim: u32) -> Result<(), GateShapeR
 /// Which bf16 GEMM takes `(m, n, k)`, as the step constructor: an `n` of at most
 /// [`GEMM_NARROW_BF16_MAX_N`] that is not a multiple of the tile's goes to the narrow GEMM under
 /// its rule ([`gemm_narrow_shape`]) at every `m`, one row included, since its bits for a row do
-/// not depend on where the row sits; otherwise `m = 1` goes to the GEMV under its rule
+/// not depend on where the row sits; then, for a [`GemmColTile::Col64`] model, an `m` of 2 or
+/// more and an `n` that is a multiple of 64 and not of 256 goes to the 64-column GEMM under its
+/// rule ([`gemm_col64_shape`]); otherwise `m = 1` goes to the GEMV under its rule
 /// ([`gemv_shape`]), and any other `m` to the tiled GEMM under its rule ([`gemm_shape`]).
-fn gemm_kernel(m: u32, n: u32, k: u32) -> Result<fn(GemmBf16) -> CudaStep, GemmShapeRule> {
+fn gemm_kernel(
+    m: u32,
+    n: u32,
+    k: u32,
+    col_tile: GemmColTile,
+) -> Result<fn(GemmBf16) -> CudaStep, GemmShapeRule> {
     if n != 0 && n <= GEMM_NARROW_BF16_MAX_N && !n.is_multiple_of(GEMM_BF16_TILE.1) {
         gemm_narrow_shape(m, n, k)?;
         return Ok(CudaStep::GemmNarrow);
+    }
+    if col_tile == GemmColTile::Col64
+        && m >= 2
+        && n > GEMM_NARROW_BF16_MAX_N
+        && n.is_multiple_of(GEMM_COL64_TILE.1)
+        && !n.is_multiple_of(GEMM_BF16_TILE.1)
+    {
+        gemm_col64_shape(m, n, k)?;
+        return Ok(CudaStep::GemmCol64);
     }
     if m == 1 {
         gemv_shape(n, k)?;
@@ -1928,6 +1954,23 @@ fn gemm_shape(m: u32, n: u32, k: u32) -> Result<(), GemmShapeRule> {
     for (dim, value, tile) in [("m", m, tm), ("n", n, tn), ("k", k, tk)] {
         if value == 0 || !value.is_multiple_of(tile) {
             return Err(GemmShapeRule::OffTile { dim, value, tile });
+        }
+    }
+    for (dim, value) in [("m", m), ("n", n), ("k", k)] {
+        if i32::try_from(value).is_err() {
+            return Err(GemmShapeRule::AboveIntMax { dim, value });
+        }
+    }
+    Ok(())
+}
+
+/// The 64-column bf16 GEMM's shape rule: `m`, `n` and `k` non-zero multiples of
+/// [`GEMM_COL64_TILE`], and each at most `i32::MAX`.
+fn gemm_col64_shape(m: u32, n: u32, k: u32) -> Result<(), GemmShapeRule> {
+    let (tm, tn, tk) = GEMM_COL64_TILE;
+    for (dim, value, tile) in [("m", m, tm), ("n", n, tn), ("k", k, tk)] {
+        if value == 0 || !value.is_multiple_of(tile) {
+            return Err(GemmShapeRule::Col64OffTile { dim, value, tile });
         }
     }
     for (dim, value) in [("m", m), ("n", n), ("k", k)] {

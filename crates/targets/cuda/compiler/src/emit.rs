@@ -46,6 +46,7 @@ use scratchy_const_tokens::{ModuleRow, ModuleTable, const_tokens};
 use scratchy_subtile::handoff::{
     SourceBinding, TargetAttnClass, TargetModelFacts, TargetModelInput, TargetPoint, UnrollIndex,
 };
+use scratchy_target_cuda::op_abi::CUDA_GEMM_COL64_ARCHS;
 use scratchy_target_cuda::step::{
     CudaStep, EmbedBf16, ExpertGemmBf16, ExpertGemvBf16, GatedDeltaNetBf16, GemmBf16,
     LayerScaleBf16, MoeRouteBf16, MoeWeight, RmsNormBf16, RouterLogitsBf16, gdn_conv_dim,
@@ -55,8 +56,8 @@ use scratchy_target_cuda::weights::CudaWeight;
 
 use crate::canonical::{
     CanonicalAt, CanonicalGdn, CanonicalKv, CanonicalRefusal, CudaAttnClass, CudaAttnClasses,
-    CudaCanonical, CudaEmbedFacts, CudaGdnFacts, CudaModelFacts, GemmShapeRule, SharedExpertOwner,
-    lower_canonical,
+    CudaCanonical, CudaEmbedFacts, CudaGdnFacts, CudaModelFacts, GemmColTile, GemmShapeRule,
+    SharedExpertOwner, lower_canonical,
 };
 
 /// The modules of the CUDA tape types, and the aliases the emitted tapes name them by: the one
@@ -132,7 +133,8 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
 /// table is then refused ([`ModelRefusal::NoRopeTheta`]), and a tape with none reads no theta. A
 /// model's input is its token ids, embedded from a table of `vocab_size` rows; a config that
 /// declares none gets no embedding table here, and [`lower_model`] refuses it
-/// ([`ModelRefusal::NoVocab`]). The shared expert's owner is [`shared_expert_owner`]'s.
+/// ([`ModelRefusal::NoVocab`]). The shared expert's owner is [`shared_expert_owner`]'s. The GEMM
+/// column tile is the 256-column one here; [`lower_model`] sets the arch's ([`gemm_col_tile`]).
 pub fn model_facts(f: &TargetModelFacts) -> CudaModelFacts {
     CudaModelFacts {
         shared_expert: shared_expert_owner(f),
@@ -155,6 +157,7 @@ pub fn model_facts(f: &TargetModelFacts) -> CudaModelFacts {
             }),
             _ => None,
         },
+        gemm_col_tile: GemmColTile::Tile256Only,
     }
 }
 
@@ -180,6 +183,14 @@ pub fn shared_expert_owner(f: &TargetModelFacts) -> SharedExpertOwner {
     match f.dsl_shared_expert_bases.is_empty() {
         true => SharedExpertOwner::Undeclared,
         false => SharedExpertOwner::Dsl,
+    }
+}
+
+/// The column tiles `arch`'s GEMMs take: `op_abi::CUDA_GEMM_COL64_ARCHS` names it, or not.
+pub fn gemm_col_tile(arch: &str) -> GemmColTile {
+    match CUDA_GEMM_COL64_ARCHS.contains(&arch) {
+        true => GemmColTile::Col64,
+        false => GemmColTile::Tile256Only,
     }
 }
 
@@ -353,7 +364,10 @@ pub fn lower_model(input: &TargetModelInput) -> Result<CudaModel, ModelRefusal> 
     if input.facts.vocab_size == 0 {
         return Err(ModelRefusal::NoVocab);
     }
-    let facts = model_facts(&input.facts);
+    let facts = CudaModelFacts {
+        gemm_col_tile: gemm_col_tile(&input.arch),
+        ..model_facts(&input.facts)
+    };
     let mut by_m: BTreeMap<u32, Vec<(u32, Lowered)>> = BTreeMap::new();
     for b in &input.buckets {
         let at = CanonicalAt {

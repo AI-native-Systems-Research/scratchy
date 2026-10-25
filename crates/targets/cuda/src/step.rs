@@ -739,6 +739,8 @@ impl GatedDeltaNetBf16 {
 pub enum MatmulKernel {
     Tiled,
     Gemv,
+    /// The 64-column GEMM ([`GEMM_COL64_TILE`]): Gemma's 128-expert router at m ≥ 2. #885's 13b.
+    Col64,
 }
 
 /// Which buffer a MoE step's weight index names.

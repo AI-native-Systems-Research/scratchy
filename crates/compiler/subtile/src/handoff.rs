@@ -331,6 +331,9 @@ pub struct LoweredDecode {
 pub struct TargetModelInput {
     /// The config stem (`qwen3.5-0.8b`), for the target's diagnostics.
     pub stem: String,
+    /// The arch the config is of: its config directory's name (`qwen3-5`, `gemma4-moe`), a fact
+    /// of the model like `stem`. A target's per-arch tables are keyed by it.
+    pub arch: String,
     /// One per workload point the shared front end lowered, in the macro's `(m, sk)` order.
     pub buckets: Vec<TargetBucket>,
     /// A workload point the shared front end refused, with its refusal; a target decides what

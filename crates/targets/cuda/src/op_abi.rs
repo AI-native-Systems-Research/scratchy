@@ -291,6 +291,12 @@ const _: () = assert!(CUDA_EXPERT_TILE_ROWS == crate::step::GEMM_BF16_TILE.0);
 
 // ── Tiling ──────────────────────────────────────────────────────────
 
+/// The archs whose tapes CUDA lowers with the 64-column GEMM tile (`step::GEMM_COL64_TILE`):
+/// Gemma 4 26B-A4B, whose router (128), expert (704) and dense MLP (2112) widths are multiples of
+/// 64 and not of 256. Every other arch's GEMMs take the 256-column tile only, so their rules and
+/// refusals are the tiled GEMM's.
+pub const CUDA_GEMM_COL64_ARCHS: &[&str] = &["gemma4-moe"];
+
 /// How many columns one graph node covers: all of them. Tiling is a target fact; spyre tiles to
 /// 128-column pages because its substrate requires it, while CUDA's kernels — like metal's — take
 /// a whole `RmsNorm` or a whole matmul, so the graph is built from whole ops.
@@ -361,6 +367,12 @@ mod tests {
             ]
         );
         assert_eq!(*kernel, CudaFusion::MoeRoute);
+    }
+
+    /// The 64-column GEMM is Gemma 4's alone.
+    #[test]
+    fn the_64_column_gemm_archs() {
+        assert_eq!(CUDA_GEMM_COL64_ARCHS, ["gemma4-moe"]);
     }
 
     /// The MoE facts: two dense bundles with a grouped GEMM, at 128 or 256 experts, sorted from

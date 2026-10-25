@@ -13,6 +13,7 @@ use scratchy_target_cuda::step::{CudaStep, GemmBf16};
 use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, KvTape, TapeInput, WeightIx,
 };
+use scratchy_target_cuda_compiler::canonical::GemmColTile;
 use scratchy_target_cuda_compiler::canonical::{
     CanonicalAt, CanonicalGdn, CanonicalKv, CudaCanonical, CudaGdnFacts, CudaModelFacts,
     SharedExpertOwner, lower_canonical,
@@ -29,6 +30,7 @@ pub const QWEN3_5_FACTS: CudaModelFacts = CudaModelFacts {
     embed: None,
     shared_expert: SharedExpertOwner::Undeclared,
     classes: None,
+    gemm_col_tile: GemmColTile::Tile256Only,
 };
 
 /// [`QWEN3_5_FACTS`] with qwen3.5-0.8b's linear attention: 16 key heads of 128, a 4-tap conv,
@@ -40,6 +42,13 @@ pub const QWEN3_5_GDN_FACTS: CudaModelFacts = CudaModelFacts {
         conv_kernel: 4,
         eps: 1e-6,
     }),
+    ..QWEN3_5_FACTS
+};
+
+/// [`QWEN3_5_FACTS`] under Gemma 4's GEMM column tiles (`op_abi::CUDA_GEMM_COL64_ARCHS`): its
+/// GEMMs also take the 64-column tile. The fixtures that exercise that rule lower with them.
+pub const GEMMA4_FACTS: CudaModelFacts = CudaModelFacts {
+    gemm_col_tile: GemmColTile::Col64,
     ..QWEN3_5_FACTS
 };
 
