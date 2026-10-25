@@ -110,6 +110,11 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
         | SubOp::GatedDeltaNet
         | SubOp::Mamba2 { .. }
         | SubOp::KvAppend { .. }
+        | SubOp::CaptureHidden { .. }
+        | SubOp::DraftConv { .. }
+        | SubOp::DraftAttention { .. }
+        | SubOp::DraftContextKv { .. }
+        | SubOp::DraftSelect
         | scratchy_subtile::expansion_ops!()
         | SubOp::Mean => Err(format!("{:?} is not a spyre standard tile op", n.op)),
         // The token draw is NOT one standard tile either: its body is whole-row

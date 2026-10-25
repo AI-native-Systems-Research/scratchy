@@ -8221,7 +8221,12 @@ fn kv_offset_of(fuf: &Fuf, tile: TileId) -> scratchy_forward_compiler::KvOffset 
         | OpKind::EmbeddingGather
         | OpKind::AvgPool2d
         | OpKind::StripCls
-        | OpKind::PosEmbed => panic!(
+        | OpKind::PosEmbed
+        | OpKind::CaptureHidden
+        | OpKind::DraftContextKv
+        | OpKind::DraftConv
+        | OpKind::DraftAttention
+        | OpKind::DraftSelect => panic!(
             "a KV operand produced by {:?} has no additive-offset rule — classify it in \
              `kv_offset_of` before a KV writer consumes it",
             node.op
