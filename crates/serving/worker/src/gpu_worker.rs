@@ -1648,18 +1648,38 @@ impl MetalWorker {
 
     /// Whether the loaded draft is a multi-token-prediction head: it reads the target's hidden
     /// states, so it runs after the target, never beside it.
-    /// Splash's DFlash2 drafter's runtime pieces: its planner over `budget`, its acceptance kernel
+    /// Splash's DFlash2 drafter's runtime pieces: its planner over its `budget`, its cycle's cost
+    /// line (its target's verify's and its `model`'s weight bytes), its acceptance kernel
     /// (`kernels`, its bake) and its rings — every layer's keys and values of a sequence's last
     /// window of positions, a slot for each sequence the worker holds — sized from its `config`.
     fn load_dflash2(
         &self,
-        budget: DraftBudget,
+        (budget, model): (DraftBudget, &dyn scratchy_forward_compiler::ScratchyWeights),
         kernels: &scratchy_target_metal::off_tape::OffTapeKernels,
         config: &HfModelConfig,
     ) -> ExecutorResult<Dflash2> {
         let init = |what: &str| ExecutorError::WorkerInit(format!("DFlash2 drafter: {what}"));
         let gpu_device = (self.gpu_device.as_ref()).ok_or_else(|| init("no gpu_device"))?;
         let target = (self.model.as_deref()).ok_or_else(|| init("its target must load first"))?;
+        // The weight bytes of a model's forward at the bucket that holds a cycle's verify rows.
+        let rows = budget.verify_rows as u32;
+        let weight_bytes = |m: &dyn scratchy_forward_compiler::ScratchyWeights| {
+            let rungs = scratchy_target_metal::interpreter::metal::MetalRungs::of(m.metal_rungs())
+                .map_err(|e| init(&format!("its buckets: {e}")))?;
+            (rungs.buckets.iter())
+                .filter(|b| b.bucket_m >= rows)
+                .min_by_key(|b| b.bucket_m)
+                .map(|b| b.weight_bytes)
+                .ok_or_else(|| init(&format!("no bucket holds {rows} verify rows")))
+        };
+        let cost = scratchy_target_metal::dflash2::VerifyLine::of(
+            weight_bytes(target)?,
+            weight_bytes(model)?,
+        );
+        info!(
+            "ScratchyWorker(metal): DFlash2 cycle reads {:.2} GiB of weights and {:.3} GiB a verify row",
+            cost.fixed, cost.per_row
+        );
         let accept =
             scratchy_target_metal::dflash2::DraftAcceptKernel::new(&gpu_device.device, kernels)
                 .map_err(|e| init(&format!("acceptance compile: {e:?}")))?
@@ -1721,6 +1741,7 @@ impl MetalWorker {
             cycles: HashMap::new(),
             captured_row_bytes: taps * target.hidden_size() as usize * elem_bytes,
             cycle_buffer: None,
+            cost,
         })
     }
 
@@ -2143,7 +2164,8 @@ impl MetalWorker {
         };
         // Splash's DFlash2 drafter: its acceptance and its rings, a slot a sequence.
         if let Some(budget) = block_budget {
-            self.dflash2 = Some(self.load_dflash2(budget, draft_off_tape, &draft_hf_config)?);
+            let drafter = (budget, &*draft_model);
+            self.dflash2 = Some(self.load_dflash2(drafter, draft_off_tape, &draft_hf_config)?);
         }
         self.draft_model = Some(draft_model);
         // Spec-decode runs the chunked-addressing tape rung: the direct (BPC=0) path has an
@@ -5192,6 +5214,8 @@ struct Dflash2 {
     /// The cycle's buffer ([`CycleLayout`](scratchy_target_metal::dflash2::CycleLayout)), grown to
     /// the widest step.
     cycle_buffer: Option<scratchy_target_metal::residency::Pinned>,
+    /// What a cycle costs by the rows it verifies, which its verify budget prices rows by.
+    cost: scratchy_target_metal::dflash2::VerifyLine,
 }
 
 #[cfg(feature = "metal")]
@@ -5423,6 +5447,12 @@ impl<'a> BlockPassesEncoder<'a> {
             .into_iter()
             .map(f32::from_bits);
         let verify_rows = read(selection.verify_rows, block.lanes.len());
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let confidence = read(selection.confidence, proposals)
+                .into_iter()
+                .map(f32::from_bits);
+            tracing::debug!("DFlash2 confidence {:?}", confidence.collect::<Vec<f32>>());
+        }
         Some(Selection {
             drafts: read(selection.tokens, proposals),
             candidates: read(selection.candidates, candidates),
@@ -8097,6 +8127,7 @@ impl Worker for MetalWorker {
                                     remaining,
                                     seed,
                                     position: lane.position,
+                                    cost: d.cost,
                                 },
                             );
                         }

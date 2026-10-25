@@ -15587,6 +15587,22 @@ pub fn emit_model(
         };
         #[cfg(not(feature = "metal"))]
         let tapes_static_toks = quote! { &[] };
+        // The weight bytes a forward of the bucket reads (`MetalStepTape::weight_bytes`).
+        #[cfg(feature = "metal")]
+        let (fixed, per_row) = (metal_steps.get(&canonical))
+            .map(|classed| classed.narrow.steps.weight_bytes())
+            .map_or((0, 0), |b| (b.fixed, b.per_row));
+        #[cfg(not(feature = "metal"))]
+        let (fixed, per_row) = (0u64, 0u64);
+        let weight_bytes_toks = {
+            let (fixed, per_row) = (
+                proc_macro2::Literal::u64_unsuffixed(fixed),
+                proc_macro2::Literal::u64_unsuffixed(per_row),
+            );
+            quote! {
+                ::scratchy_target_metal::tape::step::WeightBytes { fixed: #fixed, per_row: #per_row }
+            }
+        };
         // The model's baked kernels (`CommandPool::into_tokens`).
         let kernels_toks = match cfg!(feature = "metal") {
             true => quote! { METAL_KERNELS },
@@ -15633,6 +15649,7 @@ pub fn emit_model(
                     tapes: #tapes_static_toks,
                     kernels: #kernels_toks,
                     plays_result: #plays_result,
+                    weight_bytes: #weight_bytes_toks,
                 },
             });
         }
@@ -16920,6 +16937,7 @@ pub fn emit_model(
                             tokens: d.output(O::Tokens),
                             candidates: d.output(O::Candidates),
                             q_probs: d.output(O::QProbs),
+                            confidence: d.output(O::Confidence),
                             verify_rows: d.output(O::VerifyRows),
                         }
                     })

@@ -516,14 +516,16 @@ pub trait MetalForwardOnto {
 
 /// A DFlash2 drafter's selection (`scratchy_target_metal::dflash2::DraftOutput`): its proposals,
 /// `[lanes, proposals]` u32; each position's candidates, `[lanes, proposals, candidates]` u32; and
-/// a sampling lane's candidate probabilities, `[lanes, proposals, candidates]` f32; and the rows
-/// of its block each lane's next verify checks, `[lanes]` u32.
+/// a sampling lane's candidate probabilities, `[lanes, proposals, candidates]` f32; each proposal's
+/// confidence, `[lanes, proposals]` f32; and the rows of its block each lane's next verify checks,
+/// `[lanes]` u32.
 #[cfg(feature = "metal")]
 #[derive(Clone, Copy)]
 pub struct DraftSelection<'a> {
     pub tokens: &'a ::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
     pub candidates: &'a ::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
     pub q_probs: &'a ::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
+    pub confidence: &'a ::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
     pub verify_rows: &'a ::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
 }
 
