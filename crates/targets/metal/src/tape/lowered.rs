@@ -519,6 +519,13 @@ pub enum KernelId {
     DraftContextCommit,
     /// A prompt's context commit: `prefill_draft_context_kv_<dtype>_rope_<r>`.
     DraftContextPrefill,
+    /// A cycle's commit of its retained rows into its lanes' context windows:
+    /// `draft_window_store_commit_<dtype>`.
+    DraftWindowStoreCommit,
+    /// A prompt's commit into its sequences' context windows: `prefill_draft_window_store_<dtype>`.
+    DraftWindowStorePrefill,
+    /// A ring rebuild's rows out of its sequences' context windows: `draft_window_load_<dtype>`.
+    DraftWindowLoad,
     /// A proposal row's sharded top-16: `draft_select_top16_sharded_<dtype>`.
     DraftSelectTop16,
     /// The candidates' edge tables: `draft_select_edges_<dtype>`.
@@ -645,6 +652,9 @@ impl KernelId {
             | Self::DraftAttentionReorder
             | Self::DraftContextCommit
             | Self::DraftContextPrefill
+            | Self::DraftWindowStoreCommit
+            | Self::DraftWindowStorePrefill
+            | Self::DraftWindowLoad
             | Self::DraftSelectTop16
             | Self::DraftSelectEdges
             | Self::DraftSelectWalk
@@ -1396,6 +1406,9 @@ pub enum RuntimeBindingKind {
     },
     /// `[num_seqs]` u32 — each lane's ring slot, written per forward by the worker.
     DraftRingSlots,
+    /// A drafter's context windows: one a ring slot, each its slot's 4-bit context rows
+    /// (`dflash2.metal` `DRAFT_WINDOW_BYTES`), kept across forwards.
+    DraftWindow,
     /// `[num_seqs]` u32 — the rows of its verify each lane retained (a cycle's acceptance), what
     /// its context commit writes.
     DraftRetained,
@@ -1795,6 +1808,7 @@ impl RuntimeBindingKind {
             },
             Self::DraftCapture
             | Self::DraftRingSlots
+            | Self::DraftWindow
             | Self::DraftRetained
             | Self::DraftLaneParams
             | Self::DraftOutputs(_)
@@ -2345,6 +2359,10 @@ pub struct PlayLive {
     pub cache_writes: bool,
     /// What the forward's result needs (`ForwardReads::Result`).
     pub result: bool,
+    /// What rebuilding a DFlash2 drafter's rings from its context window needs
+    /// (`ForwardReads::Rebuild`): the window's load and the ring writers after it, never the
+    /// commit's rows before its window.
+    pub rebuild: bool,
 }
 
 impl PlayLive {
@@ -2352,15 +2370,19 @@ impl PlayLive {
     pub const EVERY: Self = Self {
         cache_writes: true,
         result: true,
+        rebuild: true,
     };
 
     /// Whether a forward its caller reads `reads` of plays the command.
     pub fn plays(self, reads: crate::interpreter::metal::ForwardReads) -> bool {
         use crate::interpreter::metal::ForwardReads as R;
         match reads {
-            R::Outputs => true,
+            // Every command but a rebuild's own: the window's load, which a whole forward's
+            // commit has the exact rows of.
+            R::Outputs => self.cache_writes || self.result || !self.rebuild,
             R::CacheWrites => self.cache_writes,
             R::Result => self.result,
+            R::Rebuild => self.rebuild,
         }
     }
 
@@ -2369,6 +2391,7 @@ impl PlayLive {
         Self {
             cache_writes: self.cache_writes || other.cache_writes,
             result: self.result || other.result,
+            rebuild: self.rebuild || other.rebuild,
         }
     }
 }

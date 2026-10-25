@@ -575,6 +575,9 @@ impl DraftOutput {
 pub struct DraftRingPool {
     keys: Vec<crate::PoolMem>,
     values: Vec<crate::PoolMem>,
+    /// Every slot's context window (`dflash2.metal` `DRAFT_WINDOW_BYTES` a slot): what a
+    /// prefix-cache hit rebuilds the slot's rings from (Splash `DFlashContextWindow`).
+    windows: crate::PoolMem,
     pub num_slots: usize,
 }
 
@@ -585,12 +588,22 @@ impl DraftRingPool {
         kv_heads * window * head_dim * elem_bytes
     }
 
-    /// Allocate `num_layers` layers' keys and values of `num_slots` slots, each `slot_bytes`, by
-    /// `alloc_buffer` (the device's pool allocator, which pins what it hands out).
+    /// One slot's context window, in bytes: its `window` positions' context rows of `hidden`
+    /// values, 4-bit over 64-value groups with each group's fp16 scale and minimum (Splash
+    /// abi/DraftAttention.h:88-100 `draft_context_window_bytes`; `dflash2.metal`
+    /// `DRAFT_WINDOW_BYTES`).
+    pub fn window_bytes(window: usize, hidden: usize) -> usize {
+        window * (hidden / 2) + window * hidden.div_ceil(64) * 4
+    }
+
+    /// Allocate `num_layers` layers' keys and values of `num_slots` slots, each `slot_bytes`, and
+    /// their context windows, each `window_bytes`, by `alloc_buffer` (the device's pool
+    /// allocator, which pins what it hands out).
     pub fn new(
         num_layers: usize,
         num_slots: usize,
         slot_bytes: usize,
+        window_bytes: usize,
         mut alloc_buffer: impl FnMut(usize) -> anyhow::Result<crate::PoolMem>,
     ) -> anyhow::Result<Self> {
         let bytes = num_slots * slot_bytes;
@@ -599,11 +612,18 @@ impl DraftRingPool {
         };
         let keys = alloc()?;
         let values = alloc()?;
+        let windows = alloc_buffer(num_slots * window_bytes)?;
         Ok(Self {
             keys,
             values,
+            windows,
             num_slots,
         })
+    }
+
+    /// Every slot's context window.
+    pub fn windows(&self) -> &crate::PoolMem {
+        &self.windows
     }
 
     /// Layer `layer`'s keys and values.

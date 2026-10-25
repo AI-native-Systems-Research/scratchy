@@ -114,6 +114,8 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
         | SubOp::DraftConv { .. }
         | SubOp::DraftAttention { .. }
         | SubOp::DraftContextKv { .. }
+        | SubOp::DraftWindowStore
+        | SubOp::DraftWindowLoad
         | SubOp::DraftSelect
         | scratchy_subtile::expansion_ops!()
         | SubOp::Mean => Err(format!("{:?} is not a spyre standard tile op", n.op)),
