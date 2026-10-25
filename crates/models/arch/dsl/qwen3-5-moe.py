@@ -54,14 +54,6 @@ def qwen3_5_moe():
         g = gemm(normed2, mlp.shared_expert_gate[layer])
         mlp_out = gate_scale(routed, shared_y, g)
         hidden_states = add(mlp_out, hidden_states)
-
-        # A drafter compiled beside this model reads these layers' output rows (a DFlash2
-        # drafter's `target_layer_ids`): each is copied into its column block of the rows the
-        # drafter reads, as Splash's target captures them. Empty without such a drafter.
-        if layer in draft_capture_layers:
-            captured = capture_hidden(hidden_states)
-        else:
-            captured = hidden_states
     normed = rmsnorm(hidden_states, norm)
     logits = gemm(normed, lm_head)
     return logits

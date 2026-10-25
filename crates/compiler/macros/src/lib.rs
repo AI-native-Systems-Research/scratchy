@@ -47,6 +47,7 @@ mod codegen;
 #[cfg(feature = "cuda")]
 mod concurrency;
 mod config;
+mod draft_capture;
 /// The baked program, as const tokens — see its own header.
 #[cfg(feature = "spyre")]
 mod ktir_tokens;
@@ -591,6 +592,12 @@ pub fn compile_carrier(
     // (SigLIP raster, etc.). Decoder mode ignores the arg if set.
 
     // ── Front end: classify ────────────────────────────────────────
+    // A decoder's layer loop captures what a drafter compiled beside it reads (`draft_capture`):
+    // the compiler's, whatever the arch's DSL says.
+    let ast = match mode.prelude {
+        classified::Prelude::Decoder => draft_capture::insert(&ast),
+        classified::Prelude::Vision => ast,
+    };
     let classified = classify::classify_with(&ast, mode.prelude)
         .map_err(|e| syn::Error::new(args.span, format!("classify: {e}")))?;
 
