@@ -1509,7 +1509,6 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::SplitKReduceSum => KernelKind::Gemm,
         K::MoeWeightedSum
         | K::MoeGroupOffsets
-        | K::MoeGroupInit
         | K::MoeGroupScatter
         | K::MoeGroupScatterQ8
         | K::MoePerExpertScale

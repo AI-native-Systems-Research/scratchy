@@ -406,22 +406,13 @@ fn sorted_gathered_moe_matches_the_token_order_chain() {
             vec![
                 int(0, pairs as i32),
                 int(1, experts as i32),
+                int(2, pairs as i32), // MG_BM=1 ⇒ mpad_max = MG_M.
                 int(3, TOP_K as i32),
                 int(6, 1), // MG_BM = 1: no padding — a sorted bake.
+                int(7, 0), // MG_SENTINEL = 0: the gather matvecs have no skip guard.
             ],
         )
         .expect("offsets");
-        let init_pso = baked_pipeline(
-            &device,
-            "moe_group",
-            "moe_group_init",
-            vec![
-                int(1, experts as i32),
-                int(2, pairs as i32), // MG_BM=1 ⇒ mpad_max = MG_M.
-                int(7, 0),            // MG_SENTINEL = 0: the gather matvecs have no skip guard.
-            ],
-        )
-        .expect("init");
         let scatter_pso = baked_pipeline(
             &device,
             "moe_group",
@@ -493,14 +484,10 @@ fn sorted_gathered_moe_matches_the_token_order_chain() {
                         (&offset, 2),
                         (&total, 3),
                         (&num_tokens, 4),
+                        (&indices_pad, 5),
+                        (&fill, 6),
                     ],
-                    groups: size(1, 1, 1),
-                    threads: size(256, 1, 1),
-                },
-                Dispatch {
-                    pso: &init_pso,
-                    buffers: vec![(&indices_pad, 0), (&fill, 1)],
-                    groups: size(pairs.div_ceil(256), 1, 1),
+                    groups: size(pairs.max(experts).div_ceil(256), 1, 1),
                     threads: size(256, 1, 1),
                 },
                 Dispatch {
@@ -785,6 +772,7 @@ fn moe_group_offsets_count_every_expert_at_256() {
     const BM: usize = 64;
     const BUCKET: usize = 4096;
     let pairs = BUCKET * TOP_K;
+    let mpad = pairs + (BM - 1) * QWEN_EXPERTS;
     // Skewed: expert e takes a share growing with e, so the high experts carry the most rows.
     let mut rng = Lcg(7);
     let inds: Vec<u32> = (0..pairs)
@@ -800,8 +788,10 @@ fn moe_group_offsets_count_every_expert_at_256() {
         vec![
             int(0, pairs as i32),
             int(1, QWEN_EXPERTS as i32),
+            int(2, mpad as i32),
             int(3, TOP_K as i32),
             int(6, BM as i32),
+            int(7, QWEN_EXPERTS as i32),
         ],
     )
     .expect("offsets");
@@ -820,6 +810,9 @@ fn moe_group_offsets_count_every_expert_at_256() {
         }
         let (count, offset, total) = (u32_buf(QWEN_EXPERTS), u32_buf(QWEN_EXPERTS), u32_buf(1));
         let num_tokens = common::shared_slice(&device, &[tokens as u32]);
+        // The padding a previous step left: the command refills it.
+        let indices_pad = common::shared_slice(&device, &vec![7u32; mpad]);
+        let fill = common::shared_slice(&device, &vec![9u32; QWEN_EXPERTS]);
         run(&device, 1, 1, |_| {
             vec![Dispatch {
                 pso: &offsets_pso,
@@ -829,12 +822,26 @@ fn moe_group_offsets_count_every_expert_at_256() {
                     (&offset, 2),
                     (&total, 3),
                     (&num_tokens, 4),
+                    (&indices_pad, 5),
+                    (&fill, 6),
                 ],
-                groups: size(1, 1, 1),
+                groups: size(mpad.div_ceil(256), 1, 1),
                 threads: size(256, 1, 1),
             }]
         });
         let what = format!("{tokens} of {BUCKET} rows");
+        assert!(
+            common::read_slice::<u32>(&indices_pad, mpad)
+                .iter()
+                .all(|&e| e == QWEN_EXPERTS as u32),
+            "{what}: the padding is the sentinel"
+        );
+        assert!(
+            common::read_slice::<u32>(&fill, QWEN_EXPERTS)
+                .iter()
+                .all(|&f| f == 0),
+            "{what}: the fill counters are zero"
+        );
         let got_count = common::read_slice::<u32>(&count, QWEN_EXPERTS);
         assert_eq!(got_count, want_count, "{what}: counts");
         let got_offset = common::read_slice::<u32>(&offset, QWEN_EXPERTS);
