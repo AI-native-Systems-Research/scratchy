@@ -7380,6 +7380,33 @@ fn target_model_input(
             (id, index, prefix)
         })
         .collect();
+    // Every bundle tensor a canonical binds that has a checkpoint leaf, named in full: the
+    // bundle's own prefix, its suffix rewritten as the shared table says, then the leaf.
+    let bundle_tensors: std::collections::BTreeMap<_, _> = (buckets.iter())
+        .flat_map(|b| b.lowered.bindings.iter())
+        .filter_map(|b| match *b {
+            scratchy_subtile::handoff::SourceBinding::BundleTensor { id, index, tensor } => {
+                Some(((id, index, tensor.name()), tensor))
+            }
+            _ => None,
+        })
+        .collect();
+    let bundle_tensor_names = (bundle_tensors.into_iter())
+        .filter_map(|((id, index, _), tensor)| {
+            use scratchy_subtile::handoff::{BUNDLE_PREFIX_REWRITES, BUNDLE_TENSOR_LEAVES};
+            let leaf =
+                (BUNDLE_TENSOR_LEAVES.iter()).find_map(|&(t, l)| (t == tensor).then_some(l))?;
+            let prefix =
+                safetensors_prefix(program.weight_naming(), &model.arch, WeightId(id), index);
+            let prefix = (BUNDLE_PREFIX_REWRITES.iter())
+                .find_map(|&(from, to)| {
+                    let base = prefix.strip_suffix(from)?;
+                    (base.is_empty() || base.ends_with('.')).then(|| format!("{base}{to}"))
+                })
+                .unwrap_or(prefix);
+            Some((id, index, tensor, format!("{prefix}.{leaf}")))
+        })
+        .collect();
     let sliding = (fuf.nodes.iter()).any(|n| {
         matches!(
             n.op,
@@ -7401,6 +7428,7 @@ fn target_model_input(
         unlowered,
         weight_prefixes,
         embed_prefix: lent_weight_prefix(program, fuf, model, LentWeight::EmbedTokens),
+        bundle_tensor_names,
         facts: TargetModelFacts {
             head_dim,
             rot_dim: rot_dim(model, head_dim),

@@ -68,6 +68,28 @@ pub enum BundleTensor {
     ExpertDownS,
 }
 
+/// Each bundle tensor's leaf in the HF checkpoint, after its bundle's checkpoint prefix
+/// (`…layers.N.router`, `…layers.N.experts`): the dense names the HF checkpoint ships, which a
+/// target that loads each bundle tensor as a weight of its own reads them by. Gemma 4's router
+/// (`router.proj.weight`, `router.scale`, `router.per_expert_scale`) and its fused experts
+/// (`experts.gate_up_proj`, the gate's rows then the up's per expert, and `experts.down_proj`). An
+/// affine bank's scales have no row: a dense checkpoint ships none.
+pub const BUNDLE_TENSOR_LEAVES: &[(BundleTensor, &str)] = &[
+    (BundleTensor::RouterGate, "proj.weight"),
+    (BundleTensor::RouterScale, "scale"),
+    (BundleTensor::RouterPerExpertScale, "per_expert_scale"),
+    (BundleTensor::ExpertGateW, "gate_up_proj"),
+    (BundleTensor::ExpertUpW, "gate_up_proj"),
+    (BundleTensor::ExpertDownW, "down_proj"),
+];
+
+/// Whole-segment suffix rewrites of a bundle's checkpoint prefix, before its tensor's leaf
+/// ([`BUNDLE_TENSOR_LEAVES`]): the DSL's `experts.switch_glu` is MLX's layout, and the HF
+/// checkpoint keeps the experts at `experts`. Read only by the bundle-tensor names of the
+/// target-emitter handoff ([`TargetModelInput::bundle_tensor_names`]), never by a weight's own
+/// prefix, which every target's loader reads as it is.
+pub const BUNDLE_PREFIX_REWRITES: &[(&str, &str)] = &[("experts.switch_glu", "experts")];
+
 impl BundleTensor {
     /// The tensor's registry name — for dumps and the manifest, so no consumer keeps a
     /// parallel string table. Lowercase snake, matching the on-disk leaf it loads.
@@ -347,6 +369,10 @@ pub struct TargetModelInput {
     /// The token-embedding table's prefix, which `SourceBinding::EmbeddedHidden` reads; `None`
     /// when the model has no embedding table.
     pub embed_prefix: Option<String>,
+    /// Each bundle tensor a canonical binds (`SourceBinding::BundleTensor { id, index, tensor }`)
+    /// that [`BUNDLE_TENSOR_LEAVES`] names, and its full checkpoint tensor name: the bundle's
+    /// prefix, rewritten by [`BUNDLE_PREFIX_REWRITES`], then the tensor's leaf.
+    pub bundle_tensor_names: Vec<(u32, Option<UnrollIndex>, BundleTensor, String)>,
 }
 
 /// One workload point: `m` token rows, `sk` the KV-length bucket.

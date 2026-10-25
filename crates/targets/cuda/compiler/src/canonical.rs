@@ -1486,13 +1486,15 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
         .collect();
     let weight_bytes = (plan.lowered.bindings.iter().enumerate())
         .map(|(t, binding)| match binding {
-            SourceBinding::Weight { .. } => match bundles.get(&(t as u32)) {
-                Some(&bytes) => Ok(bytes),
-                None => {
-                    let shape = plan.graph.tensors[t];
-                    elements_bytes(shape.rows, shape.cols).ok_or(ArenaRefusal::TooLarge)
+            SourceBinding::Weight { .. } | SourceBinding::BundleTensor { .. } => {
+                match bundles.get(&(t as u32)) {
+                    Some(&bytes) => Ok(bytes),
+                    None => {
+                        let shape = plan.graph.tensors[t];
+                        elements_bytes(shape.rows, shape.cols).ok_or(ArenaRefusal::TooLarge)
+                    }
                 }
-            },
+            }
             // The embedded hidden's source holds the embedding table the head gathers from.
             SourceBinding::EmbeddedHidden => match head {
                 Some((e, _, vocab, hidden)) if e == t => {

@@ -21,7 +21,7 @@ use scratchy_layers::weights::GpuWeights;
 use scratchy_tensors::{DType, DeviceAllocator, PoolMemory};
 use serde::Serialize;
 
-use crate::step::{gdn_bundle, moe_bundle};
+use crate::step::{expert_bank, gdn_bundle, moe_bundle};
 use crate::tape::CudaTape;
 
 /// How one weight index is filled from the checkpoint.
@@ -60,6 +60,18 @@ pub enum CudaWeight {
         hidden: u32,
         inter: u32,
     },
+    /// Gemma's dense bf16 expert bank (`step::expert_bank`): [`Self::MoeBundle`] with no router,
+    /// its two checkpoint tensors back to back, each uploaded byte for byte: `gate_up` `[experts,
+    /// 2·inter, hidden]` (`{prefix}.gate_up_proj`; per expert the first `inter` rows gate, the next
+    /// up) and `down` `[experts, hidden, inter]` (`{prefix}.down_proj`). The router's tensors are
+    /// [`Self::Bf16`] entries of their own.
+    ExpertBank {
+        gate_up: &'static str,
+        down: &'static str,
+        experts: u32,
+        hidden: u32,
+        inter: u32,
+    },
 }
 
 /// The dtypes a dense tensor may have on disk: bf16 only, never converted.
@@ -81,6 +93,7 @@ impl CudaWeight {
             Self::Bf16 { tensor, .. } => tensor,
             Self::GdnBundle { conv1d, .. } => conv1d,
             Self::MoeBundle { router, .. } => router,
+            Self::ExpertBank { gate_up, .. } => gate_up,
         }
     }
 
@@ -133,6 +146,23 @@ impl CudaWeight {
                     read(down, &[experts, hidden, inter]),
                 ]
             }
+            Self::ExpertBank {
+                gate_up,
+                down,
+                experts,
+                hidden,
+                inter,
+            } => {
+                let read = |tensor, shape: &[u32]| Read {
+                    tensor,
+                    accepted: DENSE_DTYPES,
+                    shape: shape.iter().map(|&d| u64::from(d)).collect(),
+                };
+                vec![
+                    read(gate_up, &[experts, 2 * inter, hidden]),
+                    read(down, &[experts, hidden, inter]),
+                ]
+            }
         }
     }
 
@@ -153,6 +183,12 @@ impl CudaWeight {
                 inter,
                 ..
             } => moe_bundle(experts, hidden, inter).map(|b| b.bytes),
+            Self::ExpertBank {
+                experts,
+                hidden,
+                inter,
+                ..
+            } => expert_bank(experts, hidden, inter).map(|b| b.bytes),
         }
     }
 }
@@ -498,6 +534,16 @@ pub fn stage<A: DeviceAllocator>(
             // bundle's regions in order, back to back with no gap (`step::moe_bundle`).
             let mut packed = Vec::new();
             for tensor in [router, gate_up, down] {
+                let (bytes, ..) =
+                    (weights.take_to_cpu_bytes(tensor)).map_err(|_| missing(tensor))?;
+                packed.extend_from_slice(&bytes);
+            }
+            Ok(packed)
+        }
+        CudaWeight::ExpertBank { gate_up, down, .. } => {
+            // As the bundle's, with no router: `step::expert_bank`'s two regions back to back.
+            let mut packed = Vec::new();
+            for tensor in [gate_up, down] {
                 let (bytes, ..) =
                     (weights.take_to_cpu_bytes(tensor)).map_err(|_| missing(tensor))?;
                 packed.extend_from_slice(&bytes);

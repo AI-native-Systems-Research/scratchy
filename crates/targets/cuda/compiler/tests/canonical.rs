@@ -1056,6 +1056,7 @@ fn tied_model(ms: &[u32], head: &str, vocab: u32) -> TargetModelInput {
             (2, None, head.to_string()),
         ],
         embed_prefix: Some("model.embed_tokens".to_string()),
+        bundle_tensor_names: Vec::new(),
     }
 }
 

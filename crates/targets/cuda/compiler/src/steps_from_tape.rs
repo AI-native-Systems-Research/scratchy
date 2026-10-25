@@ -2098,7 +2098,8 @@ fn activation(
     }
 }
 
-/// A weight operand: operand `k` of `s`, a source bound to a model weight (its index).
+/// A weight operand: operand `k` of `s`, a source bound to a model weight or to one tensor of a
+/// weight bundle (its index): a bundle tensor is one tensor, so one CUDA weight, as a weight is.
 fn weight_operand(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
@@ -2113,7 +2114,9 @@ fn weight_operand(
                 return Err(operand(s, k, OperandRefusal::PerLayer));
             }
             match &cx.bindings[tensor.index()] {
-                SourceBinding::Weight { .. } => Ok(WeightIx(tensor.index() as u32)),
+                SourceBinding::Weight { .. } | SourceBinding::BundleTensor { .. } => {
+                    Ok(WeightIx(tensor.index() as u32))
+                }
                 binding => Err(operand(
                     s,
                     k,

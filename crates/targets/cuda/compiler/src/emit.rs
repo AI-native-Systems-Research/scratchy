@@ -44,7 +44,8 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use scratchy_const_tokens::{ModuleRow, ModuleTable, const_tokens};
 use scratchy_subtile::handoff::{
-    SourceBinding, TargetAttnClass, TargetModelFacts, TargetModelInput, TargetPoint, UnrollIndex,
+    BundleTensor, SourceBinding, TargetAttnClass, TargetModelFacts, TargetModelInput, TargetPoint,
+    UnrollIndex,
 };
 use scratchy_target_cuda::op_abi::CUDA_GEMM_COL64_ARCHS;
 use scratchy_target_cuda::step::{
@@ -448,17 +449,22 @@ pub fn lower_model(input: &TargetModelInput) -> Result<CudaModel, ModelRefusal> 
 enum Role {
     /// One bf16 tensor of this shape.
     Bf16([u64; 2], usize),
+    /// One bf16 bare parameter of this shape: a tensor the checkpoint names by its prefix alone,
+    /// with no `.weight` leaf (Gemma's `layer_scalar`, an `nn.Parameter`).
+    Param([u64; 2], usize),
     /// One GDN layer's packed bundle of this geometry: `conv_dim`, `conv_kernel`, `nv`, `head_v`.
     Bundle([u32; 4]),
     /// One MoE layer's dense bundle of this geometry: `experts`, `hidden`, `inter`.
     MoeBundle([u32; 3]),
+    /// One Gemma layer's dense expert bank of this geometry: `experts`, `hidden`, `inter`.
+    ExpertBank([u32; 3]),
 }
 
 impl Role {
     fn shape(&self) -> &[u64] {
         match self {
-            Self::Bf16(dims, rank) => &dims[..*rank],
-            Self::Bundle(_) | Self::MoeBundle(_) => &[],
+            Self::Bf16(dims, rank) | Self::Param(dims, rank) => &dims[..*rank],
+            Self::Bundle(_) | Self::MoeBundle(_) | Self::ExpertBank(_) => &[],
         }
     }
 }
@@ -482,7 +488,7 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         | CudaStep::RouterNorm(RmsNormBf16 { gain, cols, .. }) => {
             Some((gain, Role::Bf16([u64::from(cols), 0], 1)))
         }
-        CudaStep::LayerScale(LayerScaleBf16 { scale, .. }) => Some((scale, Role::Bf16([1, 0], 1))),
+        CudaStep::LayerScale(LayerScaleBf16 { scale, .. }) => Some((scale, Role::Param([1, 0], 1))),
         CudaStep::MoeRoute(MoeRouteBf16 {
             expert_scale: Some(ix),
             experts,
@@ -541,15 +547,23 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
             bundle,
             Role::Bf16([u64::from(experts), u64::from(hidden)], 2),
         )),
-        // Gemma's expert bank: its role is item 5's (`CudaWeight::ExpertBank`).
+        // Gemma's expert bank: its gate, up and down sources name one bank.
         CudaStep::ExpertGemm(ExpertGemmBf16 {
+            bundle,
             weight: MoeWeight::Own,
+            experts,
+            hidden,
+            inter,
             ..
         })
         | CudaStep::ExpertGemv(ExpertGemvBf16 {
+            bundle,
             weight: MoeWeight::Own,
+            experts,
+            hidden,
+            inter,
             ..
-        }) => None,
+        }) => Some((bundle, Role::ExpertBank([experts, hidden, inter]))),
         CudaStep::Add(_)
         | CudaStep::SiluMul(_)
         | CudaStep::Rope(_)
@@ -638,6 +652,10 @@ pub fn weight_table(
     let prefixes: HashMap<(u32, Option<UnrollIndex>), &str> = (input.weight_prefixes.iter())
         .map(|(id, index, prefix)| ((*id, *index), prefix.as_str()))
         .collect();
+    let bundle_names: HashMap<(u32, Option<UnrollIndex>, BundleTensor), &str> =
+        (input.bundle_tensor_names.iter())
+            .map(|(id, index, tensor, name)| ((*id, *index, *tensor), name.as_str()))
+            .collect();
     let mut table: Vec<Option<CudaWeight>> = vec![None; n];
     for ix in 0..n {
         let Some(role) = roles[ix] else {
@@ -648,6 +666,31 @@ pub fn weight_table(
             continue;
         };
         let binding = &bindings[ix];
+        // A bundle tensor is named in full by the handoff, its leaf included.
+        if let SourceBinding::BundleTensor { id, index, tensor } = *binding {
+            let name = (bundle_names.get(&(id, index, tensor)).copied()).ok_or_else(|| {
+                ModelRefusal::NoPrefix {
+                    ix,
+                    binding: binding.clone(),
+                }
+            })?;
+            let entry = bundle_entry(role, name, input, (id, index)).ok_or_else(|| {
+                ModelRefusal::NoPrefix {
+                    ix,
+                    binding: binding.clone(),
+                }
+            })?;
+            let (packed, declared) = (entry.packed_bytes().unwrap_or(u64::MAX), declared(ix));
+            if packed != declared {
+                return Err(ModelRefusal::WeightBytes {
+                    ix,
+                    packed,
+                    declared,
+                });
+            }
+            table[ix] = Some(entry);
+            continue;
+        }
         let prefix = match *binding {
             SourceBinding::Weight { id, index } => prefixes.get(&(id, index)).copied(),
             SourceBinding::EmbeddedHidden => input.embed_prefix.as_deref(),
@@ -660,6 +703,10 @@ pub fn weight_table(
         let entry = match role {
             Role::Bf16(..) => CudaWeight::Bf16 {
                 tensor: baked_str(format!("{prefix}.weight")),
+                shape: baked(role.shape()),
+            },
+            Role::Param(..) => CudaWeight::Bf16 {
+                tensor: baked_str(prefix.to_string()),
                 shape: baked(role.shape()),
             },
             Role::Bundle([conv_dim, conv_kernel, nv, head_v]) => CudaWeight::GdnBundle {
@@ -680,6 +727,13 @@ pub fn weight_table(
                 hidden,
                 inter,
             },
+            // An expert bank is read only through bundle tensors, named above.
+            Role::ExpertBank(_) => {
+                return Err(ModelRefusal::NoPrefix {
+                    ix,
+                    binding: binding.clone(),
+                });
+            }
         };
         let (packed, declared) = (entry.packed_bytes().unwrap_or(u64::MAX), declared(ix));
         if packed != declared {
@@ -727,6 +781,37 @@ pub fn weight_table(
         }
     }
     Ok(table)
+}
+
+/// The entry of a bundle tensor read as `role`, named `name` (the handoff's full checkpoint name):
+/// a bf16 tensor, or (an expert step's) the expert bank whose `gate_up` and `down` are the
+/// bundle's `ExpertGateW` and `ExpertDownW` names. `None` when the bank's two names are not both
+/// in the handoff.
+fn bundle_entry(
+    role: Role,
+    name: &str,
+    input: &TargetModelInput,
+    (id, index): (u32, Option<UnrollIndex>),
+) -> Option<CudaWeight> {
+    let named = |want: BundleTensor| {
+        (input.bundle_tensor_names.iter()).find_map(|(i, x, t, n)| {
+            ((*i, *x, *t) == (id, index, want)).then(|| baked_str(n.clone()))
+        })
+    };
+    Some(match role {
+        Role::Bf16(..) | Role::Param(..) => CudaWeight::Bf16 {
+            tensor: baked_str(name.to_string()),
+            shape: baked(role.shape()),
+        },
+        Role::ExpertBank([experts, hidden, inter]) => CudaWeight::ExpertBank {
+            gate_up: named(BundleTensor::ExpertGateW)?,
+            down: named(BundleTensor::ExpertDownW)?,
+            experts,
+            hidden,
+            inter,
+        },
+        Role::Bundle(_) | Role::MoeBundle(_) => return None,
+    })
 }
 
 /// `v` as a `'static` slice, for a `CudaTape` built at expansion time only to be rendered as

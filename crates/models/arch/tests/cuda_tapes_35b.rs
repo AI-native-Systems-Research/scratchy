@@ -429,6 +429,7 @@ fn the_weight_table_names_the_checkpoints_tensors() {
                 down,
                 ..
             } => vec![router, gate_up, down],
+            CudaWeight::ExpertBank { gate_up, down, .. } => vec![gate_up, down],
         };
         for t in tensors {
             assert!(names.insert(t), "weight {ix}: {t} named twice");
@@ -471,6 +472,7 @@ fn the_weight_table_names_the_checkpoints_tensors() {
     let shape = |w: CudaWeight| match w {
         CudaWeight::Bf16 { shape, .. } => shape,
         CudaWeight::GdnBundle { .. } | CudaWeight::MoeBundle { .. } => panic!("a bundle"),
+        CudaWeight::ExpertBank { .. } => panic!("an expert bank"),
     };
     let (e, embed) = by_name("language_model.model.embed_tokens.weight");
     assert_eq!(e, 0, "the embedding table is the embedded hidden's index");
