@@ -1404,6 +1404,18 @@ pub fn argmax_groups(pad_vocab: u32) -> u32 {
     pad_vocab / (ARGMAX_BLOCK * ARGMAX_GROUP_BLOCKS)
 }
 
+/// The greedy token pick's answer for an ALL-NaN row: the one-hot falls on the
+/// pad lanes, whose tables stage the group index `G`, [`ARGMAX_GROUP_BLOCKS`]
+/// and [`ARGMAX_BLOCK`], so idx = `G·4096 + 64·64 + 64` — past the last real
+/// lane at every vocab (#666). ONE derivation, for the host reference's test
+/// and the worker's reading of the pick.
+pub fn argmax_sentinel(vocab: u32) -> u32 {
+    let group = ARGMAX_BLOCK * ARGMAX_GROUP_BLOCKS;
+    argmax_groups(argmax_pad_vocab(vocab)) * group
+        + ARGMAX_GROUP_BLOCKS * ARGMAX_BLOCK
+        + ARGMAX_BLOCK
+}
+
 // ── Nodes & graph ──────────────────────────────────────────────────
 
 /// One unit of work: reads `inputs` (regions of tensors), computes its
@@ -4316,11 +4328,7 @@ mod tests {
         );
         assert_eq!(
             eval(&[f32::NAN; 5]),
-            stick(
-                (argmax_groups(argmax_pad_vocab(5)) * (ARGMAX_BLOCK * ARGMAX_GROUP_BLOCKS)
-                    + ARGMAX_GROUP_BLOCKS * ARGMAX_BLOCK
-                    + ARGMAX_BLOCK) as f32
-            ),
+            stick(argmax_sentinel(5) as f32),
             "an all-NaN row answers the sentinel, the two-level ramp's pad \
              arithmetic (G·4096 + 64·64 + 64 — at vocab 5, G = 0, so 4160; \
              PAD_V + 4160 at every admitted production shape)"

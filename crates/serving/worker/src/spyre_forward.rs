@@ -1783,17 +1783,23 @@ fn read_picked_token(session: &mut SuperDscSession, b: &BundleMeta) -> ExecutorR
     checked_picked_token(idx, b.wiring.geometry.vocab)
 }
 
-/// ⛔ THE PICKED TOKEN'S OWN GUARD — #666's law, its only class: an idx at or
-/// past the vocab is not a token. The kernel answers an all-NaN row with the
-/// sentinel (one past the padded row), which every real vocab is below, so
-/// this refusal catches exactly that row and nothing else — a legitimate
-/// argmax can never reach it, because the lm-head's own width IS the vocab.
+/// ⛔ THE PICKED TOKEN'S OWN GUARD — #666's law. The kernel answers an all-NaN row
+/// with its sentinel (`argmax_sentinel`, past the padded row), and that row is
+/// token 0, as the host argmax answers it (`manifest::argmax`: no NaN beats its
+/// floor, so its index stays 0). A degenerate model then gives one wrong token
+/// and no crash on every path, card, emulator and host pick alike, rather than
+/// failing the step on the device paths only. Any OTHER idx at or past the
+/// vocab is no answer the kernel gives, so it still refuses.
 fn checked_picked_token(idx: u32, vocab: u32) -> ExecutorResult<u32> {
+    if idx == scratchy_subtile::subtile_ir::argmax_sentinel(vocab) {
+        return Ok(0);
+    }
     if idx >= vocab {
         return Err(werr(format!(
-            "decode: the device picked token {idx}, at or past the vocab {vocab} — the #666 \
-             all-NaN sentinel (the kernel's own answer for a row that is NaN in every lane). \
-             Refusing rather than serving a token that does not exist."
+            "decode: the device picked token {idx}, at or past the vocab {vocab} and not the \
+             all-NaN sentinel {} — no answer the kernel gives. Refusing rather than serving a \
+             token that does not exist.",
+            scratchy_subtile::subtile_ir::argmax_sentinel(vocab)
         )));
     }
     Ok(idx)
@@ -2484,5 +2490,32 @@ pub(crate) fn run_request_step(
         Ok(Some(tok))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod picked_token_tests {
+    use super::checked_picked_token;
+    use scratchy_subtile::subtile_ir::argmax_sentinel;
+    use scratchy_target_spyre::manifest::argmax;
+
+    /// An all-NaN row picks the same token on the device and on the host (#666): the kernel's
+    /// sentinel reads as the host argmax's answer over that row, at a small vocab, granite's and
+    /// gemma-4's (whose power-of-two vocab pads to the next one).
+    #[test]
+    fn an_all_nan_row_picks_the_host_argmaxs_token() {
+        for vocab in [5u32, 49155, 262144] {
+            let host = argmax(&vec![f32::NAN; vocab as usize]) as u32;
+            let device = checked_picked_token(argmax_sentinel(vocab), vocab).expect("the sentinel");
+            assert_eq!(device, host, "vocab {vocab}");
+        }
+    }
+
+    /// A real pick passes through; anything else at or past the vocab still refuses.
+    #[test]
+    fn only_the_sentinel_is_read_past_the_vocab() {
+        assert_eq!(checked_picked_token(4, 5).ok(), Some(4));
+        assert!(checked_picked_token(5, 5).is_err());
+        assert!(checked_picked_token(argmax_sentinel(5) + 1, 5).is_err());
     }
 }
