@@ -126,13 +126,14 @@ fn enabled_quants(
 /// of its own, so the file must always exist. Rewrites only on a real change,
 /// so an unchanged registry doesn't touch the mtime and retrigger downstream
 /// crates.
-fn write_hf_registry_file(out_dir: &Path, ids: &BTreeSet<String>) {
+fn write_hf_registry_file(out_dir: &Path, ids: &[String]) {
     let lits: Vec<String> = ids.iter().map(|s| format!("{s:?}")).collect();
     let rendered = format!(
         "/// Real HF org/repo ids matching an architecture (AND, when a quant\n\
          /// preset is enabled, a quant family) this binary compiled in support\n\
          /// for, resolved once against huggingface.co at BUILD time (see\n\
-         /// `hf_registry_build.rs`). `scr model names` completes from this.\n\
+         /// `hf_registry_build.rs`). `scr model names` completes from this,\n\
+         /// in this order: the Hub's, most downloaded first.\n\
          ///\n\
          /// Empty when this build resolved no registry — resolving it needs the\n\
          /// network, which an air-gapped build deliberately skips. `scr` then\n\
@@ -469,7 +470,7 @@ fn main() {
         hf_registry_build::resolve_hf_registry(&hf_registry_targets, &quant_union, &repo_root)
     };
     #[cfg(not(feature = "hf-completions"))]
-    let hf_ids = BTreeSet::<String>::new();
+    let hf_ids = Vec::<String>::new();
     write_hf_registry_file(&out_dir, &hf_ids);
 
     // Every arch's configs/ dir has now been walked, so every

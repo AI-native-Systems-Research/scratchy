@@ -164,20 +164,25 @@ pub async fn run_model_names(args: crate::args::NamesArgs) -> anyhow::Result<()>
     use crate::args::NamesSource;
     use std::collections::BTreeSet;
 
-    // BTreeSet: sorted and deduped.
-    let names: BTreeSet<String> = match args.source {
+    let names: Vec<String> = match args.source {
         // Baked in at BUILD time by `crates/models/arch/hf_registry_build.rs`,
         // scoped to exactly what `-Fmodel/<stem>` / `-Fquant/<preset>` compiled.
-        // Empty when this build resolved no registry. No runtime network.
-        NamesSource::Compiled => model::compiled_hf_registry()
-            .iter()
+        // Empty when this build resolved no registry. No runtime network. Kept
+        // in the registry's order, the Hub's most downloaded first, so the
+        // canonical checkpoint leads the list.
+        NamesSource::Compiled => (model::compiled_hf_registry().iter())
             .map(|s| s.to_string())
             .collect(),
-        NamesSource::Cached => cached_models(&hf_cache_dir())
-            .into_iter()
+        // Sorted and deduped.
+        NamesSource::Cached => (cached_models(&hf_cache_dir()).into_iter())
             .map(|(id, _)| id)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect(),
-        NamesSource::Stems => compiled_variant_stems().into_iter().collect(),
+        NamesSource::Stems => (compiled_variant_stems().into_iter())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
     };
 
     for name in names.iter().filter(|n| n.starts_with(&args.prefix)) {

@@ -311,9 +311,16 @@ scr model names --source compiled      # what this build resolved to
   a `-Fmodel/<stem>` is named; building `-p scratchy-models` directly does not
   turn it on (its own `default` stays empty, which is what keeps CI's
   `--workspace` and `metal,all` runs network-free).
+- **The names come most downloaded first**, the Hub's own ranking, so the
+  canonical checkpoint leads its fine-tunes. `scr model names --source compiled`
+  prints them in that order. zsh shows them in that order too. bash ≥ 4.4 does
+  as well (`compopt -o nosort`), but bash 3.2, the one macOS ships, has no
+  `compopt` and sorts them alphabetically.
 - **`HF_TOKEN` at BUILD time widens the list.** Gated repos (`meta-llama/*`)
-  return 401 without it and are dropped, so the same model scope resolves
-  differently with and without a token.
+  return 401 without it. Their shape can't be verified, so they are left out,
+  and the same model scope resolves differently with and without a token. The
+  build says so: a `cargo:warning` counts the gated repos left out and names a
+  few.
 - Results are cached under `<target-dir>/hf-registry-cache/` with a 7-day TTL,
   so repeat builds don't re-hit the Hub. `cargo clean` discards it.
 
