@@ -11,11 +11,14 @@
 // expert ids form a tiny key space.
 //
 // Pipeline (per MoE layer — grouped prefill and sorted decode both):
-//   1. moe_group_offsets : histogram counts + padded exclusive-scan
-//                          offsets (1 threadgroup; tiny key space).
-//   2. moe_group_init    : sentinel-fill indices_pad + zero the fill
-//                          counters (so trailing unused tiles skip).
-//   3. moe_group_scatter : place each real (token,expert) row at
+//   1. moe_group_offsets : sentinel-fill indices_pad + zero the fill
+//                          counters (so trailing unused tiles skip), and
+//                          in its first threadgroup the histogram counts +
+//                          padded exclusive-scan offsets (tiny key space).
+//                          One command, as Splash groups a layer's routes
+//                          in one (Splash @1482f6bb runtime/ops/MoE.cpp
+//                          `group_routes`): the two halves are independent.
+//   2. moe_group_scatter : place each real (token,expert) row at
 //                          offset[e]+running, recording pos[i],
 //                          indices_pad[pos], and the gathered x_pad row.
 //   ... the grouped GEMMs (gate/up/down) over the padded layout, or the
@@ -32,9 +35,11 @@
 using namespace metal;
 
 // ── moe_group_offsets ──────────────────────────────────────────────
-// Single threadgroup. Histograms `topk_inds[MG_M]` into threadgroup
-// memory (no cross-tg device atomics → device `count` needs no prior
-// zeroing), then thread 0 runs the padded exclusive scan:
+// Every threadgroup sentinel-fills its rows of `indices_pad[MG_MPAD_MAX]` with
+// MG_SENTINEL and zeroes its entries of `fill[E]`; the first also histograms
+// `topk_inds[MG_M]` into threadgroup memory (no cross-tg device atomics →
+// device `count` needs no prior zeroing), then thread 0 runs the padded
+// exclusive scan:
 //   offset[e] = Σ_{e'<e} ceil(count[e']/BM)*BM ,  total = Σ ceil(..)*BM
 // `count`/`offset` are [MG_NUM_EXPERTS] u32; `total` is [1] u32 (the
 // padded row count Mpad, ≤ MG_M + (BM-1)*MG_NUM_EXPERTS).
@@ -47,13 +52,16 @@ SCRATCHY_CONSTANT_OPTIONAL(int, MG_NUM_EXPERTS, 1);
 // gathered matvec path reads sorted (same-expert pairs adjacent, so their
 // repeat slab reads hit cache).
 SCRATCHY_CONSTANT_OPTIONAL(int, MG_BM, 6);
-// What `moe_group_init` sentinel-fills the dead rows of `indices_pad` with:
+// What `moe_group_offsets` sentinel-fills the dead rows of `indices_pad` with:
 // the grouped GEMMs skip a tile whose expert is `MG_NUM_EXPERTS`; the
 // gathered matvecs have no such guard, so their bake fills 0 (a real
 // expert's slab — garbage compute on rows nothing reads).
 SCRATCHY_CONSTANT_OPTIONAL(int, MG_SENTINEL, 7);
 // The picks of a row: pair i is row i / MG_TOP_K's.
 SCRATCHY_CONSTANT_OPTIONAL(int, MG_TOP_K, 3);
+// `MG_MPAD_MAX` = MG_M + (BM-1)*MG_NUM_EXPERTS: worst-case padded rows, the
+// rows `indices_pad` holds and the threads of the offsets' grid.
+SCRATCHY_CONSTANT_OPTIONAL(int, MG_MPAD_MAX, 2);
 
 // The live pairs are the step's rows' (`num_tokens` of them, MG_TOP_K picks each): a bucket's rows
 // past them hold picks no step made, which Splash's grouping leaves out of its tiles as it does a
@@ -66,8 +74,21 @@ kernel void moe_group_offsets(
     device uint*       offset    [[buffer(2)]],
     device uint*       total     [[buffer(3)]],
     const device uint* num_tokens [[buffer(4)]],
+    device uint*       indices_pad [[buffer(5)]],
+    device uint*       fill      [[buffer(6)]],
     uint tid     [[thread_position_in_threadgroup]],
-    uint tgsize  [[threads_per_threadgroup]]) {
+    uint tgsize  [[threads_per_threadgroup]],
+    uint gid     [[thread_position_in_grid]],
+    uint tg      [[threadgroup_position_in_grid]]) {
+  if (gid < uint(MG_MPAD_MAX)) {
+    indices_pad[gid] = uint(MG_SENTINEL);
+  }
+  if (gid < uint(MG_NUM_EXPERTS)) {
+    fill[gid] = 0u;
+  }
+  if (tg != 0) {
+    return;
+  }
   // One bin per expert: the bake compiles this kernel at its block's expert count.
   threadgroup atomic_uint local[MG_NUM_EXPERTS];
   const uint E = uint(MG_NUM_EXPERTS);
@@ -95,27 +116,6 @@ kernel void moe_group_offsets(
       acc += ((c + uint(MG_BM) - 1u) / uint(MG_BM)) * uint(MG_BM);
     }
     total[0] = acc;
-  }
-}
-#endif
-
-// ── moe_group_init ─────────────────────────────────────────────────
-// Sentinel-fills `indices_pad[Mpad_max]` with MG_NUM_EXPERTS (an
-// invalid expert → the GEMM skips that tile) and zeroes `fill[E]`.
-// `MG_MPAD_MAX` = MG_M + (BM-1)*MG_NUM_EXPERTS (worst-case padded rows;
-// the static dispatch upper bound). One thread per padded row.
-SCRATCHY_CONSTANT_OPTIONAL(int, MG_MPAD_MAX, 2);
-
-#if SCRATCHY_COMPILES(moe_group_init)
-kernel void moe_group_init(
-    device uint* indices_pad [[buffer(0)]],
-    device uint* fill        [[buffer(1)]],
-    uint gid [[thread_position_in_grid]]) {
-  if (gid < uint(MG_MPAD_MAX)) {
-    indices_pad[gid] = uint(MG_SENTINEL);
-  }
-  if (gid < uint(MG_NUM_EXPERTS)) {
-    fill[gid] = 0u;
   }
 }
 #endif
