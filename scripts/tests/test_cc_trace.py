@@ -519,10 +519,13 @@ def conversation():
              "tools": [{"name": "Bash"}], "messages": _cached(m)} for m in (m1, side, m2, m3, m4)]
 
 
-def write_corpus(root, recorded_output_tokens=5, recorded_input_tokens=100, concurrent=True):
+def write_corpus(root, recorded_output_tokens=5, recorded_input_tokens=100, concurrent=True,
+                 unsaved=()):
     """A corpus as `record` lays it out, with a GET and a count_tokens call mixed in.
 
     With `concurrent`, the side request (seq 4) was recorded while another was open.
+    The turns whose seq is in `unsaved` have no saved response, so nothing records
+    their lengths.
     """
     root = Path(root)
     (root / "requests").mkdir(parents=True)
@@ -544,7 +547,7 @@ def write_corpus(root, recorded_output_tokens=5, recorded_input_tokens=100, conc
                  "headers": [["x-api-key", "<redacted>"], ["anthropic-version", "2023-06-01"],
                              ["Accept-Encoding", "gzip"], ["Content-Type", "application/json"]],
                  "t_start": 0.0, "body": body}))
-        if path == "/v1/messages":
+        if path == "/v1/messages" and seq not in unsaved:
             (root / "responses" / f"{seq:06d}.body").write_bytes(recorded)
         rows.append({"seq": seq, "method": method, "path": path, "status": 200, "t_start": 0.0,
                      "t_end": 0.0, "in_flight": int(concurrent and seq == 4), "req_bytes": 0,
@@ -779,6 +782,23 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(run["status"], "published", run.get("void"))
         self.assertEqual(run["provenance"]["trace_corpus"]["replay"]["max_tokens_turns"], 5)
 
+    def test_a_max_tokens_turn_with_no_recorded_reply_is_counted_unverified(self):
+        # Every reply stops at max_tokens after 3 tokens. The recording stopped at 2
+        # where it saved a response, so those turns were not cut; seqs 5 and 6 have
+        # none, so nothing can say whether theirs were.
+        FakeAnthropic.reply = staticmethod(lambda body: _stream(output_tokens=3,
+                                                                stop_reason="max_tokens"))
+        corpus = self._corpus("unsaved", recorded_output_tokens=2, unsaved={5, 6})
+        run, detail = self._replay(corpus, repeat=2)
+        self.assertEqual(run["status"], "published", run.get("void"))
+        replay = run["provenance"]["trace_corpus"]["replay"]
+        self.assertEqual((replay["max_tokens_turns"], replay["max_tokens_turns_unverified"]),
+                         (10, 4))
+        # A full recording leaves nothing unverified.
+        run, detail = self._replay(self._corpus("saved", recorded_output_tokens=2))
+        self.assertEqual(run["provenance"]["trace_corpus"]["replay"]
+                         ["max_tokens_turns_unverified"], 0)
+
     def test_a_prompt_that_comes_back_shorter_voids_the_run(self):
         # The recording's prompts were 100 tokens; this engine counts 10.
         FakeAnthropic.reply = staticmethod(lambda body: _stream(input_tokens=10))
@@ -813,7 +833,37 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(run["status"], "void")
         self.assertIn("does not fit", run["void"])
         self.assertEqual((FakeAnthropic.seen, FakeAnthropic.resets, detail["sent"]), ([], 0, 0))
-        self.assertEqual(run["provenance"]["trace_corpus"]["max_recorded_prompt_tokens"], 40000)
+        tc = run["provenance"]["trace_corpus"]
+        self.assertEqual(tc["max_recorded_prompt_tokens"], 40000)
+        # The window came from the endpoint's own /v1/models.
+        self.assertEqual(tc["context_length_source"], "/v1/models")
+
+    def test_a_session_with_no_room_for_its_reply_voids_before_sending(self):
+        # Every prompt fits the 32768-token window, but not with its 100-token reply.
+        run, detail = self._replay(self._corpus("no-room", recorded_input_tokens=32700,
+                                                recorded_output_tokens=100))
+        self.assertEqual(run["status"], "void")
+        self.assertIn("takes 32800 tokens", run["void"])
+        self.assertIn("does not fit", run["void"])
+        self.assertEqual(detail["sent"], 0)
+        # With room for the reply, it runs (the engine counting the recorded prompt).
+        FakeAnthropic.reply = staticmethod(lambda body: _stream(input_tokens=32600))
+        run, detail = self._replay(self._corpus("room", recorded_input_tokens=32600,
+                                                recorded_output_tokens=100))
+        self.assertEqual(run["status"], "published", run.get("void"))
+
+    def test_turns_with_no_recorded_prompt_are_counted_and_a_corpus_of_them_voids(self):
+        # Two of five turns saved no response: their prompts are counted as unknown.
+        run, detail = self._replay(self._corpus("some", unsaved={5, 6}))
+        self.assertEqual(run["status"], "published", run.get("void"))
+        self.assertEqual(run["provenance"]["trace_corpus"]["turns_without_recorded_prompt"], 2)
+        # No turn saved one: nothing shows the session fits, so nothing is sent.
+        FakeAnthropic.seen = []
+        run, detail = self._replay(self._corpus("none", unsaved={1, 4, 5, 6, 7}))
+        self.assertEqual(run["status"], "void")
+        self.assertIn("no prompt length for any turn", run["void"])
+        self.assertEqual((detail["sent"], FakeAnthropic.seen), (0, []))
+        self.assertEqual(run["provenance"]["trace_corpus"]["turns_without_recorded_prompt"], 5)
 
     def test_wrong_engine_and_missing_provenance_fail_before_sending(self):
         with self.assertRaises(SystemExit):
@@ -927,6 +977,10 @@ class OllamaReplayTest(unittest.TestCase):
     def test_every_pass_starts_cold_after_a_reload(self):
         run, detail = self._replay()
         self.assertEqual(run["status"], "published", run.get("void"))
+        # ollama reports no window: the one checked against is the flag's, and says so.
+        tc = run["provenance"]["trace_corpus"]
+        self.assertEqual((run["provenance"]["context_length_tokens"],
+                          tc["context_length_source"]), (32768, "--context-length"))
         # A reload before the warm-up and before each of the 3 measured passes.
         self.assertEqual(FakeOllama.reloads, 4)
         self.assertEqual(FakeOllama.loaded, {"gemma"})

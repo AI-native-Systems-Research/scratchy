@@ -358,12 +358,21 @@ the leaderboard's validator will not publish it.
 **No truncation, on either side** (#161 fairness rule 3). The engine's own
 `usage` block is checked against the recording, turn by turn:
 
-- **The session fits.** If the largest prompt in the recording (input + cache
-  read + cache creation tokens) is longer than the context window `/v1/models`
-  reports, the run is void before anything is sent. This catches #322 up front
+- **The session fits.** If any recorded turn's prompt (input + cache read +
+  cache creation tokens) plus its recorded reply is longer than the context
+  window, the run is void before anything is sent. This catches #322 up front
   rather than as a 400 halfway through.
+  - A turn with no recorded prompt length (no saved response, or no usage in it)
+    can't be checked. Such turns are counted in
+    `provenance.trace_corpus.turns_without_recorded_prompt`, and a corpus where
+    no turn has one is void.
+  - The window is the one `/v1/models` reports. ollama reports none, so there
+    it is `--context-length`, taken on trust;
+    `provenance.trace_corpus.context_length_source` says which.
 - **The reply was not cut short.** A turn that stops at `max_tokens` with a
-  shorter reply than the recording produced voids the run.
+  shorter reply than the recording produced voids the run. A turn that stops at
+  `max_tokens` where the recording has no reply length can't be judged, so it is
+  counted in `provenance.trace_corpus.replay.max_tokens_turns_unverified`.
 - **The prompt was not cut short.** A turn whose prompt comes back shorter than
   the recording's by more than the tolerance voids the run. The tolerance is the
   larger of 64 tokens and 5% of the recorded prompt, which leaves room for two
