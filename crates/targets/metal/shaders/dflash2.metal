@@ -653,12 +653,144 @@ template <typename T, typename R>
                          simd_group, reductions, normalized);
 }
 
+// ── The context window (prefill/draft_context.metal, abi/DraftAttention.h:88-100) ─────────────
+//
+// A lane's window holds, per ring slot, its drafter's context row at the slot's position, 4-bit:
+// codes over groups of DRAFT_CONTEXT_GROUP values, every slot's codes first, then each group's fp16
+// scale and minimum. A lane's window is DRAFT_WINDOW_BYTES on from the one before. One simdgroup
+// per row and group, lane l holding the group's values 2l and 2l + 1, which share a byte of codes;
+// the code of x is round((x - minimum) / scale) with the scale and minimum as stored, so a load
+// reads back minimum + code * scale.
+#define DRAFT_CONTEXT_GROUP 64u
+#define DRAFT_CONTEXT_SIMDGROUPS 8u
+#define DRAFT_WINDOW_CODES (ulong(DRAFT_WINDOW) * (DRAFT_HIDDEN / 2))
+#define DRAFT_WINDOW_BYTES (DRAFT_WINDOW_CODES + ulong(DRAFT_WINDOW) * (DRAFT_HIDDEN / DRAFT_CONTEXT_GROUP) * 4)
+
+// Group `group` of a context row at `position` into a lane's `window`.
+template <typename T>
+inline void draft_window_store_group(device const T *row, device uchar *window, uint position,
+                                     uint group, uint lane) {
+  constexpr uint Groups = DRAFT_HIDDEN / DRAFT_CONTEXT_GROUP;
+  const uint slot = position % DRAFT_WINDOW;
+  device const T *values = row + group * DRAFT_CONTEXT_GROUP + 2 * lane;
+  const float2 x = float2(float(values[0]), float(values[1]));
+  const float low = simd_min(min(x.x, x.y));
+  const float high = simd_max(max(x.x, x.y));
+  const half scale = half(precise::divide(high - low, 15.0f));
+  const half minimum = half(low);
+  uint2 code = uint2(0);
+  if (scale > half(0)) {
+    const float2 steps = float2(precise::divide(x.x - float(minimum), float(scale)),
+                                precise::divide(x.y - float(minimum), float(scale)));
+    code = uint2(clamp(rint(steps), 0.0f, 15.0f));
+  }
+  window[ulong(slot) * (DRAFT_HIDDEN / 2) + group * (DRAFT_CONTEXT_GROUP / 2) + lane] =
+      uchar(code.x | (code.y << 4));
+  if (lane == 0) {
+    device half2 *groups = reinterpret_cast<device half2 *>(window + DRAFT_WINDOW_CODES);
+    groups[ulong(slot) * Groups + group] = half2(scale, minimum);
+  }
+}
+
+// A step row's (row, group) task, and its sequence by `cu_seqlens`; false past the step's rows.
+inline bool draft_window_task(uint threadgroup_index, uint simd_group, device const uint *cu_seqlens,
+                              device const uint *num_tokens, thread uint &row, thread uint &group,
+                              thread uint &sequence) {
+  constexpr uint Groups = DRAFT_HIDDEN / DRAFT_CONTEXT_GROUP;
+  const uint task = threadgroup_index * DRAFT_CONTEXT_SIMDGROUPS + simd_group;
+  row = task / Groups;
+  group = task % Groups;
+  if (row >= num_tokens[0])
+    return false;
+  sequence = 0;
+  while (cu_seqlens[sequence + 1] <= row)
+    ++sequence;
+  return true;
+}
+
+// A cycle's commit into its lanes' windows: each lane's verify rows up to the ones it retained, at
+// their positions (as `draft_context_kv_commit` writes its rings).
+template <typename T>
+[[kernel]] void draft_window_store_commit(device const T *context [[buffer(0)]],
+                                          device uchar *windows [[buffer(1)]],
+                                          device const uint *positions [[buffer(2)]],
+                                          device const uint *ring_slots [[buffer(3)]],
+                                          device const uint *retained [[buffer(4)]],
+                                          device const uint *cu_seqlens [[buffer(5)]],
+                                          device const uint *num_tokens [[buffer(6)]],
+                                          uint threadgroup_index [[threadgroup_position_in_grid]],
+                                          uint lane [[thread_index_in_simdgroup]],
+                                          uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  uint r, group, batch;
+  if (!draft_window_task(threadgroup_index, simd_group, cu_seqlens, num_tokens, r, group, batch))
+    return;
+  const uint row = r - cu_seqlens[batch];
+  if (row >= retained[batch])
+    return;
+  draft_window_store_group(context + ulong(r) * DRAFT_HIDDEN,
+                           windows + ulong(ring_slots[batch]) * DRAFT_WINDOW_BYTES,
+                           positions[cu_seqlens[batch]] + row, group, lane);
+}
+
+// A prompt's commit into its sequences' windows (draft_context.metal prefill_draft_context_store):
+// every row of the step at its position.
+template <typename T>
+[[kernel]] void prefill_draft_window_store(device const T *context [[buffer(0)]],
+                                           device uchar *windows [[buffer(1)]],
+                                           device const uint *positions [[buffer(2)]],
+                                           device const uint *ring_slots [[buffer(3)]],
+                                           device const uint *cu_seqlens [[buffer(4)]],
+                                           device const uint *num_tokens [[buffer(5)]],
+                                           uint threadgroup_index [[threadgroup_position_in_grid]],
+                                           uint lane [[thread_index_in_simdgroup]],
+                                           uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  uint row, group, sequence;
+  if (!draft_window_task(threadgroup_index, simd_group, cu_seqlens, num_tokens, row, group,
+                         sequence))
+    return;
+  draft_window_store_group(context + ulong(row) * DRAFT_HIDDEN,
+                           windows + ulong(ring_slots[sequence]) * DRAFT_WINDOW_BYTES,
+                           positions[row], group, lane);
+}
+
+// A rebuild's rows out of their sequences' windows (draft_context.metal
+// prefill_draft_context_load): every row of the step, the context row of its position.
+template <typename T>
+[[kernel]] void draft_window_load(device T *context [[buffer(0)]],
+                                  device const uchar *windows [[buffer(1)]],
+                                  device const uint *positions [[buffer(2)]],
+                                  device const uint *ring_slots [[buffer(3)]],
+                                  device const uint *cu_seqlens [[buffer(4)]],
+                                  device const uint *num_tokens [[buffer(5)]],
+                                  uint threadgroup_index [[threadgroup_position_in_grid]],
+                                  uint lane [[thread_index_in_simdgroup]],
+                                  uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint Groups = DRAFT_HIDDEN / DRAFT_CONTEXT_GROUP;
+  uint row, group, sequence;
+  if (!draft_window_task(threadgroup_index, simd_group, cu_seqlens, num_tokens, row, group,
+                         sequence))
+    return;
+  device const uchar *window = windows + ulong(ring_slots[sequence]) * DRAFT_WINDOW_BYTES;
+  const uint slot = positions[row] % DRAFT_WINDOW;
+  device const half2 *groups = reinterpret_cast<device const half2 *>(window + DRAFT_WINDOW_CODES);
+  const half2 g = groups[ulong(slot) * Groups + group];
+  const uchar byte =
+      window[ulong(slot) * (DRAFT_HIDDEN / 2) + group * (DRAFT_CONTEXT_GROUP / 2) + lane];
+  const float scale = float(g.x), minimum = float(g.y);
+  device T *values = context + ulong(row) * DRAFT_HIDDEN + group * DRAFT_CONTEXT_GROUP + 2 * lane;
+  values[0] = T(fma(float(byte & 15), scale, minimum));
+  values[1] = T(fma(float(byte >> 4), scale, minimum));
+}
+
 #define INST_DRAFT(tag, T, rtag, R)                                                           \
   SCRATCHY_KERNEL(draft_attention_qkv_##tag##_rope_##rtag, draft_attention_qkv<T, R>)        \
   SCRATCHY_KERNEL(draft_context_kv_commit_##tag##_rope_##rtag, draft_context_kv_commit<T, R>) \
   SCRATCHY_KERNEL(prefill_draft_context_kv_##tag##_rope_##rtag, prefill_draft_context_kv<T, R>)
 
 #define INST_DRAFT_ACT(tag, T)                                                     \
+  SCRATCHY_KERNEL(draft_window_store_commit_##tag, draft_window_store_commit<T>)   \
+  SCRATCHY_KERNEL(prefill_draft_window_store_##tag, prefill_draft_window_store<T>) \
+  SCRATCHY_KERNEL(draft_window_load_##tag, draft_window_load<T>)                   \
   SCRATCHY_KERNEL(draft_conv_##tag, draft_conv<T>)                                 \
   SCRATCHY_KERNEL(draft_attention_split_##tag, draft_attention_split<T>)           \
   SCRATCHY_KERNEL(draft_attention_reduce_##tag, draft_attention_reduce<T>)         \

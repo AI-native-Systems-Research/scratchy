@@ -7,7 +7,11 @@
 # (`target_hidden`, the target's `target_layer_ids` outputs side by side) through `fc` and
 # `hidden_norm`, then each layer's key and value rows of its fused QKV projection, normed, roped and
 # written into the layer's ring at the row's position (`draft_context_kv`). A row is in the ring
-# once its target row is: every key a block attends is a committed context row.
+# once its target row is: every key a block attends is a committed context row. The context rows
+# go into the lane's context window too (`draft_window_store`, Splash `DFlashContextWindow`), 4-bit:
+# a prefix-cache state keeps the window, and a hit rebuilds the lane's rings from it
+# (`DFlashDraft::addContextRebuild`), a play of the window's load (`draft_window_load`) and the
+# layers' commits alone.
 #
 # The block draft (`DFlashDraft::addDecode`): eight rows a lane, its anchor and seven mask tokens,
 # embedded by the target's table. Each layer runs Splash's dynamic convolutions around its attention
@@ -24,6 +28,8 @@ import torch.nn.functional as F
 @forward
 def dflash2():
     context = rmsnorm(gemm(target_hidden, fc), hidden_norm)
+    stored = draft_window_store(context, positions)
+    context = draft_window_load(stored, positions)
     for layer in range(num_hidden_layers):
         context_kv = gemm(context, self_attn.kv_proj[layer])
         committed = draft_context_kv(context_kv, self_attn.k_norm[layer], positions, rotary)

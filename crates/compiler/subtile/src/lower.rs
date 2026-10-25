@@ -219,6 +219,8 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | O::DraftConv { .. }
             | O::DraftAttention { .. }
             | O::DraftContextKv { .. }
+            | O::DraftWindowStore
+            | O::DraftWindowLoad
             | O::DraftSelect
             | expansion_ops!()
             | O::ScalarMul { .. }

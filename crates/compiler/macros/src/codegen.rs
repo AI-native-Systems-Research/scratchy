@@ -15784,13 +15784,15 @@ pub fn emit_model(
                 let __draft_rings: ::core::option::Option<(
                     ::std::vec::Vec<Buffer>,
                     ::std::vec::Vec<Buffer>,
+                    Buffer,
                 )> = ctx.draft_ring.map(|pool| {
-                    (0..pool.num_layers())
+                    let (keys, values) = (0..pool.num_layers())
                         .map(|l| {
                             let (k, v) = pool.layer(l);
                             (k.buffer().clone(), v.buffer().clone())
                         })
-                        .unzip()
+                        .unzip();
+                    (keys, values, pool.windows().buffer().clone())
                 });
                 // TurboQuant: captured (Copy) so the 'static factory closure can
                 // provision the packed stores + scratch per worker for a model
@@ -15993,12 +15995,13 @@ pub fn emit_model(
                             // A DFlash2 drafter's buffers: its rings, the pool `ctx` lends (kept
                             // across forwards, pinned by it), and a cycle's per-lane inputs and
                             // outputs, sized for the largest bucket's lanes.
-                            draft: __draft_rings.as_ref().map(|(keys, values)| {
+                            draft: __draft_rings.as_ref().map(|(keys, values, windows)| {
                                 let lanes = max_m / METAL_DRAFT_ROWS.max(1);
                                 ::scratchy_target_metal::interpreter::metal::DraftRuntimeBuffers {
                                     ring_keys: keys.clone(),
                                     ring_values: values.clone(),
                                     ring_slots: alloc(lanes * 4),
+                                    windows: windows.clone(),
                                     retained: alloc(lanes * 4),
                                     lane_params: alloc(
                                         lanes

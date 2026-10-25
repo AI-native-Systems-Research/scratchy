@@ -129,9 +129,11 @@ pub fn metal_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRul
         // commit writes the ring and a selection the drafter's runtime outputs, each publishing
         // its operand 0 as it found it.
         L::DraftConv { .. } | L::DraftAttention { .. } => FRESH.reads_across(),
-        L::CaptureHidden { .. } | L::DraftContextKv { .. } | L::DraftSelect => {
-            FRESH.output(A::Operand(OperandIx(0)))
-        }
+        L::CaptureHidden { .. }
+        | L::DraftContextKv { .. }
+        | L::DraftWindowStore
+        | L::DraftWindowLoad
+        | L::DraftSelect => FRESH.output(A::Operand(OperandIx(0))),
         // Two-output ops bind a SECOND buffer (VisionRope's k', GateSplit's gate).
         L::VisionRope => FRESH.reads_across().two_outputs(),
         L::GateSplit { .. } => FRESH.two_outputs(),

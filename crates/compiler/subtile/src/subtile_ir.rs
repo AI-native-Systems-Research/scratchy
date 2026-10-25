@@ -948,7 +948,10 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             SubOp::DraftConv { stage } => stage.hash(h),
             // `layer` is per-layer identity, not class.
             SubOp::DraftAttention { width, .. } => width.hash(h),
-            SubOp::DraftContextKv { .. } | SubOp::DraftSelect => {}
+            SubOp::DraftContextKv { .. }
+            | SubOp::DraftWindowStore
+            | SubOp::DraftWindowLoad
+            | SubOp::DraftSelect => {}
             SubOp::LoadRows { source, width } => {
                 source.hash(h);
                 width.hash(h);
@@ -1317,6 +1320,14 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// the layer's ring at the row's position. `inputs` = `[kv, k_norm, cos, sin]`; the output is
     /// `kv`.
     DraftContextKv { layer: u32 },
+    /// A DFlash2 drafter's commit of its context rows into the lane's context window at their
+    /// positions, 4-bit (Splash `DFlashContextWindow`, `addWindowStore`). `inputs` = `[context]`;
+    /// the output is `context`.
+    DraftWindowStore,
+    /// The context rows of the forward's positions out of the lane's context window, written
+    /// over `context` (Splash `addWindowLoad`): a ring rebuild's alone. `inputs` = `[context]`;
+    /// the output is `context`, loaded.
+    DraftWindowLoad,
     /// A DFlash2 drafter's proposals (Splash `draft_select_top16_sharded`, `draft_select_edges`,
     /// `draft_select_dflash`, `draft_verify_rows`). `inputs` =
     /// `[logits, selector, predecessor_codebook, successor_codebook]`; the output is `logits`.
@@ -2298,7 +2309,10 @@ pub fn eval_node<F: RopeForm>(
              single node's output is not a function of its operands alone",
             node.op.name()
         ),
-        SubOp::DraftAttention { .. } | SubOp::DraftContextKv { .. } => panic!(
+        SubOp::DraftAttention { .. }
+        | SubOp::DraftContextKv { .. }
+        | SubOp::DraftWindowStore
+        | SubOp::DraftWindowLoad => panic!(
             "{} has no host reference: the drafter's ring is runtime-ambient per layer and its \
              rows' positions a runtime input, so a node's output is not a function of its \
              operands alone",
@@ -2933,6 +2947,8 @@ pub fn lower_region(
             SubOp::DraftConv { stage } => SubOp::DraftConv { stage },
             SubOp::DraftAttention { layer, width } => SubOp::DraftAttention { layer, width },
             SubOp::DraftContextKv { layer } => SubOp::DraftContextKv { layer },
+            SubOp::DraftWindowStore => SubOp::DraftWindowStore,
+            SubOp::DraftWindowLoad => SubOp::DraftWindowLoad,
             SubOp::DraftSelect => SubOp::DraftSelect,
             SubOp::LoadRows { source, width } => SubOp::LoadRows { source, width },
             SubOp::EmbeddingGather { indices_kind } => SubOp::EmbeddingGather { indices_kind },

@@ -3470,6 +3470,68 @@ fn lower_one(
                 },
             ]);
         }
+        I::DraftWindowStore(Slot(context)) | I::DraftWindowLoad(Slot(context)) => {
+            let dtype = dequant_dtype_for(p);
+            let constants = draft_constants(p, true);
+            let runtime = |kind, binding_index| Binding::Runtime {
+                kind,
+                binding_index,
+            };
+            // One simdgroup per row and 64-value group, eight to a threadgroup (Splash's
+            // SPLASH_DRAFT_CONTEXT_SIMDGROUPS).
+            let groups = (p.hidden_size as u32).div_ceil(64);
+            let dispatch = draft_tasks((eff_m * groups).div_ceil(8), bucket_m);
+            let head = [
+                Binding::ArenaSlot {
+                    slot: *context,
+                    binding_index: 0,
+                },
+                runtime(RuntimeBindingKind::DraftWindow, 1),
+                runtime(RuntimeBindingKind::Positions, 2),
+                runtime(RuntimeBindingKind::DraftRingSlots, 3),
+            ];
+            let command =
+                |kernel, f16: &'static str, bf16: &'static str, tail: &[Binding]| LoweredCommand {
+                    kernel,
+                    library: "dflash2",
+                    function: draft_pick(dtype, f16, bf16),
+                    constants,
+                    dispatch,
+                    bindings: baked(head.iter().chain(tail).copied().collect()),
+                    gemm_dims: None,
+                };
+            let rows = [
+                runtime(RuntimeBindingKind::CuSeqlensQ, 4),
+                runtime(RuntimeBindingKind::NumTokensU32, 5),
+            ];
+            return Ok(match inst {
+                // A cycle's commit, then a prompt's: `route_draft_commit` gates them apart.
+                I::DraftWindowStore(_) => vec![
+                    command(
+                        KernelId::DraftWindowStoreCommit,
+                        "draft_window_store_commit_f16",
+                        "draft_window_store_commit_bf16",
+                        &[
+                            runtime(RuntimeBindingKind::DraftRetained, 4),
+                            runtime(RuntimeBindingKind::CuSeqlensQ, 5),
+                            runtime(RuntimeBindingKind::NumTokensU32, 6),
+                        ],
+                    ),
+                    command(
+                        KernelId::DraftWindowStorePrefill,
+                        "prefill_draft_window_store_f16",
+                        "prefill_draft_window_store_bf16",
+                        &rows,
+                    ),
+                ],
+                _ => vec![command(
+                    KernelId::DraftWindowLoad,
+                    "draft_window_load_f16",
+                    "draft_window_load_bf16",
+                    &rows,
+                )],
+            });
+        }
         I::DraftSelect(Slot(logits), Slot(selector)) => {
             let dtype = dequant_dtype_for(p);
             let g = draft_geometry(p);
@@ -6465,16 +6527,20 @@ fn draft_rows_1d(n: u32, bucket_m: u32) -> DispatchShape {
 }
 
 /// A drafter's context commit runs Splash's two writers apart (`lower_one`): a cycle's commit of
-/// its lanes' retained verify rows, else a prompt's rows.
+/// its lanes' retained verify rows, else a prompt's rows — into its rings and into its windows
+/// alike.
 fn route_draft_commit(step: &MetalStep, cmds: Vec<GatedCommand>) -> Vec<GatedCommand> {
     use crate::tape::lowered::RuntimeGate::{self, OnlyIfDraftCycle, UnlessDraftCycle};
-    if !matches!(step, MetalStep::DraftContextKv(..)) {
+    if !matches!(
+        step,
+        MetalStep::DraftContextKv(..) | MetalStep::DraftWindowStore(..)
+    ) {
         return cmds;
     }
     cmds.into_iter()
         .map(|GatedCommand { command, gate }| {
             let by = match command.kernel {
-                KernelId::DraftContextCommit => OnlyIfDraftCycle,
+                KernelId::DraftContextCommit | KernelId::DraftWindowStoreCommit => OnlyIfDraftCycle,
                 _ => UnlessDraftCycle,
             };
             let gate = Some(RuntimeGate::and(gate, baked(vec![by])));
@@ -9329,6 +9395,7 @@ mod tests {
             .map(|&cache_writes| PlayLive {
                 cache_writes,
                 result: true,
+                rebuild: false,
             })
             .collect()
     }

@@ -139,6 +139,11 @@ macro_rules! for_each_subop {
             // `[kv, k_norm, cos, sin]`.
             DraftContextKv [SubOp::DraftContextKv { .. }] arity = (|n| n == 4), cols = [in0],
                 rows = [in0], gemm_w = [none];
+            // `[context]`: its window is runtime-ambient per lane, its positions the forward's.
+            DraftWindowStore [SubOp::DraftWindowStore] arity = (|n| n == 1), cols = [in0],
+                rows = [in0], gemm_w = [none];
+            DraftWindowLoad [SubOp::DraftWindowLoad] arity = (|n| n == 1), cols = [in0],
+                rows = [in0], gemm_w = [none];
             // `[logits, selector, predecessor_codebook, successor_codebook]`.
             DraftSelect [SubOp::DraftSelect] arity = (|n| n == 4), cols = [in0], rows = [in0],
                 gemm_w = [none];

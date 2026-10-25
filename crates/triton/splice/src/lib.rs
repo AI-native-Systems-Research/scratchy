@@ -442,6 +442,8 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         | SubOp::DraftConv { .. }
         | SubOp::DraftAttention { .. }
         | SubOp::DraftContextKv { .. }
+        | SubOp::DraftWindowStore
+        | SubOp::DraftWindowLoad
         | SubOp::DraftSelect => TritonKernelRow::Refused(
             "a DFlash2 drafter's op (or its target's capture): its kernels are Splash's, \
              lowered on Metal alone — a spyre drafter needs its kernels first",

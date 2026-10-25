@@ -52,6 +52,9 @@ pub struct DraftRuntimeBuffers {
     pub ring_keys: Vec<Buffer>,
     pub ring_values: Vec<Buffer>,
     pub ring_slots: Buffer,
+    /// Every ring slot's context window (`RuntimeBindingKind::DraftWindow`), kept across
+    /// forwards with the rings.
+    pub windows: Buffer,
     pub retained: Buffer,
     pub lane_params: Buffer,
     /// One buffer per [`crate::dflash2::DraftOutput`] region, in [`DraftOutput::ALL`]'s order.
@@ -427,6 +430,7 @@ impl RuntimeBindings {
                 &self.draft().ring_values[layer.get() as usize]
             }
             RuntimeBindingKind::DraftRingSlots => &self.draft().ring_slots,
+            RuntimeBindingKind::DraftWindow => &self.draft().windows,
             RuntimeBindingKind::DraftRetained => &self.draft().retained,
             RuntimeBindingKind::DraftLaneParams => &self.draft().lane_params,
             RuntimeBindingKind::DraftOutputs(region) => self.draft().output(region),
