@@ -1985,7 +1985,8 @@ fn gdn_verify_is_the_conv_scan_norm() {
             &conv_lanes,
             &ssm_lanes,
         ];
-        if !common::dispatch_threadgroups(&device, &verify, &bufs, size(1, nk, 2), size(1024, 1, 1))
+        // A threadgroup a (sequence, key head, value head): `tgid.y` runs over the value heads.
+        if !common::dispatch_threadgroups(&device, &verify, &bufs, size(1, nv, 2), size(1024, 1, 1))
         {
             return;
         }
@@ -3643,7 +3644,8 @@ fn gdn_verify_saves_and_restores_snapshots() {
             &out, &qkv, &z, &a, &b, &conv_w, &conv, &ssm, &cu, &si, &code, &a_log, &dt_bias,
             &norm_w, &unread, &unread,
         ];
-        let (grid, threads) = (dims(1, nk, 2), dims(1024, 1, 1));
+        // A threadgroup a (sequence, key head, value head): `tgid.y` runs over the value heads.
+        let (grid, threads) = (dims(1, nv, 2), dims(1024, 1, 1));
         common::dispatch_threadgroups(&device, &pipeline, &bufs, grid, threads).then(|| {
             let after = vec![
                 read_f32(&conv, pools[0].len()),
