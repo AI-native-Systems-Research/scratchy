@@ -3,8 +3,8 @@
 //!
 //! Each `BindingSet` struct captures the per-call-variable bindings
 //! (`ArenaSlotIdx`, `LayerId`, weight thunks) for one kernel family.
-//! The runtime-fixed bindings (`CuSeqlensQ`, `SeqUsedK`, `BlockTable`,
-//! `NumTokensU32`) are baked into the `From<Self> for Vec<Binding<W>>`
+//! The runtime-fixed bindings (`CuSeqlensQ`, `SeqUsedK`, `BlockTable`)
+//! are baked into the `From<Self> for Vec<Binding<W>>`
 //! conversion — they live at the same per-kernel binding index every
 //! time so the lowering arm doesn't restate them.
 //!

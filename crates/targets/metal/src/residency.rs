@@ -172,6 +172,19 @@ impl MetalResidencySet {
         }
     }
 
+    /// Whether the set holds `buffer` (`containsAllocation:`): what a command buffer declaring the
+    /// set has resident.
+    #[cfg(test)]
+    pub(crate) fn holds<A: Message>(&self, buffer: &A) -> bool {
+        let inner = self.inner.lock().expect("residency set mutex");
+        if inner.set_ptr.is_null() {
+            return false;
+        }
+        let buf_ptr: *mut AnyObject = buffer as *const A as *const AnyObject as *mut AnyObject;
+        let held: Bool = unsafe { msg_send![inner.set_ptr, containsAllocation: buf_ptr] };
+        held.as_bool()
+    }
+
     pub fn commit(&self) {
         let inner = self.inner.lock().expect("residency set mutex");
         if inner.set_ptr.is_null() {
