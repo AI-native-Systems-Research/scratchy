@@ -369,6 +369,14 @@ pub const METAL_GROUPED_PAIRS_PER_EXPERT: f32 = 4.0;
 /// a short prompt (Qwen3.6, 2 per expert: 161 ms vs 98 ms).
 pub const METAL_SORTED_PAIRS_PER_EXPERT: std::ops::Range<f32> = 0.5..1.0;
 
+/// The bucket at which a bake sorts the per-pair matvecs' rows by expert whatever their density:
+/// a lane's verify, Splash's one decode plan (~/git/splash runtime/ops/MoE.cpp:290 `decodePlan`,
+/// lanes × SPLASH_TARGET_VERIFY_ROWS rows), which groups every route by expert on 8-row tiles
+/// (ops/MoE.hpp `MoeConfig::expertTile`, M8 for every decode plan; `moeGgufPrefillTile` picks only a
+/// prefill plan's tile height). Above `METAL_SORTED_PAIRS` pairs alone: below it the sort is mlx's
+/// to refuse (gpt-oss's 32 at bucket 8 gather).
+pub const METAL_DECODE_GROUPED_ROWS: u32 = METAL_VERIFY_ROWS;
+
 /// The bucket rows from which a gathered bake's gate/up command runs the pairs that share an
 /// expert in the expert's first pair (`SharedExperts::InFirstPair`, up to [`METAL_VERIFY_ROWS`]):
 /// one row's picks are distinct experts. A bake whose gate/up command routes its tokens
@@ -653,6 +661,7 @@ const F_ROUTED_WIDE: FoldPattern<MetalFusion> = FoldPattern::RoutedExperts {
         grouped_bundles: METAL_GROUPED_EXPERTS,
         sorted_per_expert: METAL_SORTED_PAIRS_PER_EXPERT,
         grouped_per_expert: METAL_GROUPED_PAIRS_PER_EXPERT,
+        decode_rows: METAL_DECODE_GROUPED_ROWS,
     },
     kernel: MetalFusion::MoeRouted,
 };
@@ -667,6 +676,7 @@ const F_ROUTED_NARROW: FoldPattern<MetalFusion> = FoldPattern::RoutedExperts {
         grouped_bundles: METAL_GROUPED_EXPERTS,
         sorted_per_expert: METAL_SORTED_PAIRS_PER_EXPERT,
         grouped_per_expert: METAL_GROUPED_PAIRS_PER_EXPERT,
+        decode_rows: METAL_DECODE_GROUPED_ROWS,
     },
     kernel: MetalFusion::MoeRouted,
 };
