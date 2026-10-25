@@ -2766,6 +2766,7 @@ mod tests {
             tapes: &[],
             kernels: &[],
             plays_result: true,
+            weight_bytes: crate::tape::step::WeightBytes::default(),
         };
         hidden.iter().map(bucket).collect()
     }
