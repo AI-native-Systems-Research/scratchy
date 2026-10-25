@@ -7932,7 +7932,7 @@ impl MoeScratch {
         // Grouped from 4 per expert (mlx's gate): the batched per-expert GEMM's 64-row tiles are
         // full enough to win — the prefill-speed path; thinner, each expert's padding outweighs its
         // rows (Qwen3.6's 256 experts at bucket 64, 2 per expert: a short prompt 7.5% slower).
-        // Sorted at 0.25–1 per expert: the per-pair matvecs stay, sorted by expert so an expert two
+        // Sorted at 0.5–1 per expert: the per-pair matvecs stay, sorted by expert so an expert two
         // rows pick is read once from DRAM (Gemma-4 at bucket 8 × top-8: ~52 distinct experts hold
         // 64 pairs, a quarter of the slab reads repeats — 17% of the base-M5 conc-8 step). Anything
         // else gathers. Either runs the step's live pairs alone.
@@ -12795,11 +12795,11 @@ mod tests {
         }
     }
 
-    /// A bake groups its experts from 4 pairs per expert (mlx's gate) and sorts them at 0.25–1
-    /// (where the sort was measured winning); anything else gathers. On the bucket ladder at top
+    /// A bake groups its experts from 4 pairs per expert (mlx's gate) and sorts them at 0.5–1
+    /// (where #232 measured the sort winning); anything else gathers. On the bucket ladder at top
     /// 8: Gemma-4's 128 experts keep the choices they were measured at (sorted at 8, grouped from
-    /// 64). Qwen3.6's 256 sort at bucket 8 (`METAL_SORTED_PAIRS_PER_EXPERT`) and gather at 64,
-    /// where a short prompt prefilled in 98 ms gathered, 105 ms grouped, 161 ms sorted.
+    /// 64). Qwen3.6's 256 gather below 512, as they did before they could group: at bucket 64 (2
+    /// per expert) a short prompt prefilled in 98 ms gathered, 105 ms grouped, 161 ms sorted.
     #[test]
     fn a_bake_groups_and_sorts_where_measured_to_win() {
         let p = tp();
@@ -12814,7 +12814,7 @@ mod tests {
             ),
             (
                 256,
-                [Gathered, Gathered, Gathered, Sorted, Gathered, Grouped],
+                [Gathered, Gathered, Gathered, Gathered, Gathered, Grouped],
             ),
         ] {
             let got = [1, 2, 4, 8, 64, 512].map(|bucket_m| grouping(experts, bucket_m));

@@ -1124,6 +1124,20 @@ pub fn load_file_with_preset(
     model_params_from_json(&merged, &variant_stem, config_path, tracked, &spec)
 }
 
+/// One dense base as the macro's directory walk loads it: its `<stem>.overrides.json` and its
+/// arch's declarations (the `arch.json` beside it) applied, which [`load_file`] leaves out.
+#[cfg(test)]
+pub fn load_file_declared(config_path: &Path) -> Result<ModelParams, ConfigError> {
+    let stem = stem_of(config_path)?;
+    let dir = config_path
+        .parent()
+        .ok_or_else(|| ConfigError::NotADirectory(config_path.to_path_buf()))?;
+    let (_, mut json) = read_json_file(config_path)?;
+    let mut tracked: Vec<PathBuf> = Vec::new();
+    apply_overrides_file(dir, &stem, &mut json, &mut tracked)?;
+    model_params_from_json(&json, &stem, config_path, tracked, &load_arch_json(dir)?)
+}
+
 /// Load one in-checkpoint head base — its TARGET's config through the head arch's own spec
 /// and drift tier — the sequence `load_dir_mode`'s base loop performs for an `in_checkpoint`
 /// head, reachable one pair at a time.
@@ -1749,14 +1763,18 @@ fn model_params_from_json(
         })?;
     // A schema that replaces the layer count leaves the block schedule another model's: an MTP
     // head's config is its target's verbatim, so its sets name the target's layers, not the head's.
-    let mut layer_sets = match bounds.get("num_hidden_layers").copied() == scheduled_layers {
+    let own_layers = bounds.get("num_hidden_layers").copied() == scheduled_layers;
+    let mut layer_sets = match own_layers {
         true => layer_sets,
         false => BTreeMap::new(),
     };
-    let captured: Vec<u64> = (json.get(DRAFT_CAPTURE_LAYERS).and_then(|v| v.as_array()))
-        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+    // Every decoder's layer loop tests the layers a drafter beside it captures (`draft_capture`),
+    // so every model has the set: empty without a drafter, and empty on another model's layers.
+    let captured = (json.get(DRAFT_CAPTURE_LAYERS).and_then(|v| v.as_array()))
+        .filter(|_| own_layers)
+        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect::<Vec<_>>())
         .unwrap_or_default();
-    layer_sets.insert(DRAFT_CAPTURE_LAYERS.to_string(), LayerSet(captured));
+    layer_sets.insert(DRAFT_CAPTURE_LAYERS.to_string(), LayerSet::of(captured));
     let mut scalars = extract_scalars(json);
     // Arch-declared scalar defaults (`SCALAR_DEFAULTS`): arch-constant
     // floats the checkpoint omits (Gemma-4's `attention_multiplier`).
@@ -2750,6 +2768,14 @@ impl HybridBlock {
 pub struct LayerSet(Vec<u64>);
 
 impl LayerSet {
+    /// The set of `members`, sorted and deduplicated.
+    pub fn of(members: impl IntoIterator<Item = u64>) -> Self {
+        let mut v: Vec<u64> = members.into_iter().collect();
+        v.sort_unstable();
+        v.dedup();
+        Self(v)
+    }
+
     pub fn members(&self) -> &[u64] {
         &self.0
     }
@@ -3540,12 +3566,16 @@ mod tests {
 
     /// Qwen3.6's MTP head compiles on its target's config verbatim, whose block schedule names the
     /// target's 40 layers; the head's schema makes it 1. The target keeps its sets; the head gets
-    /// none (a set naming layer 39 would have its fingerprint probe a layer it does not have).
+    /// none (a set naming layer 39 would have its fingerprint probe a layer it does not have) but
+    /// the capture set every decoder's layer loop tests, empty: its target's drafter captures the
+    /// target's layers, not the head's.
     #[test]
     fn a_schema_replacing_the_layer_count_leaves_no_layer_sets() {
         let target_path = repo_model_archs("qwen3-5-moe").join("qwen3.6-35b-a3b.json");
-        let json: serde_json::Value =
+        let mut json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&target_path).expect("read")).expect("json");
+        // What the directory walk writes into a target's config with a drafter beside it.
+        json[DRAFT_CAPTURE_LAYERS] = serde_json::json!([1, 10, 19, 28, 37]);
         let parse = |arch: &str| {
             let spec = load_arch_json(&repo_model_archs(arch)).expect("arch.json");
             model_params_from_json(&json, "qwen3.6-35b-a3b", &target_path, Vec::new(), &spec)
@@ -3555,9 +3585,12 @@ mod tests {
         assert_eq!(target.bounds["num_hidden_layers"], 40);
         let attention = target.layer_sets["attention_layers"].members();
         assert_eq!(attention.last(), Some(&39));
+        let captured = target.layer_sets[DRAFT_CAPTURE_LAYERS].members();
+        assert_eq!(captured, [1, 10, 19, 28, 37]);
         let head = parse("qwen3-5-mtp");
         assert_eq!(head.bounds["num_hidden_layers"], 1);
-        assert!(head.layer_sets.is_empty(), "{:?}", head.layer_sets);
+        let none = BTreeMap::from([(DRAFT_CAPTURE_LAYERS.to_string(), LayerSet::default())]);
+        assert_eq!(head.layer_sets, none);
         assert_eq!(
             head.checkpoint_prefix.as_deref(),
             Some("language_model.mtp")
