@@ -407,15 +407,12 @@ pub enum KernelId {
     MoeWeightedSum,
     /// MoE grouped-GEMM prefill: histogram `topk_inds` + padded
     /// exclusive-scan offsets. Single threadgroup. Function constants
-    /// `MG_M` (0) / `MG_NUM_EXPERTS` (1). Bindings `(topk_inds @ 0,
-    /// count @ 1, offset @ 2, total @ 3)`. Symbol `moe_group_offsets`
-    /// in `moe_group.metallib`.
+    /// `MG_M` (0) / `MG_NUM_EXPERTS` (1), and the init's `MG_MPAD_MAX` (2) /
+    /// `MG_SENTINEL` (7): every threadgroup also sentinel-fills its rows of
+    /// `indices_pad` and zeroes its `fill` counters. Bindings `(topk_inds @ 0,
+    /// count @ 1, offset @ 2, total @ 3, num_tokens @ 4, indices_pad @ 5,
+    /// fill @ 6)`. Symbol `moe_group_offsets` in `moe_group.metallib`.
     MoeGroupOffsets,
-    /// MoE grouped-GEMM prefill: sentinel-fill `indices_pad` + zero the
-    /// `fill` counters. Function constants `MG_NUM_EXPERTS` (1) /
-    /// `MG_MPAD_MAX` (2). Bindings `(indices_pad @ 0, fill @ 1)`.
-    /// Symbol `moe_group_init`.
-    MoeGroupInit,
     /// MoE grouped-GEMM prefill: scatter each (token,expert) row to its
     /// padded slot, recording `pos`, `indices_pad`, and the gathered
     /// `x_pad` row. Function constants `MG_M`(0)/`MG_NUM_EXPERTS`(1)/
@@ -624,7 +621,6 @@ impl KernelId {
             | Self::MoeRoute
             | Self::MoeWeightedSum
             | Self::MoeGroupOffsets
-            | Self::MoeGroupInit
             | Self::MoeGroupScatter
             | Self::MoeGroupScatterQ8
             | Self::MoePerExpertScale

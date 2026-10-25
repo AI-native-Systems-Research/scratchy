@@ -633,7 +633,6 @@ mod tests {
             | KernelId::AffineGatherQmmT
             | KernelId::AffineGatherQmmTNax
             | KernelId::MoeGroupOffsets
-            | KernelId::MoeGroupInit
             | KernelId::MoeGroupScatter
             | KernelId::MoeGroupScatterQ8
             | KernelId::MoeWeightedSum
@@ -834,7 +833,6 @@ mod tests {
             | KernelId::AffineGatherQmmT
             | KernelId::AffineGatherQmmTNax
             | KernelId::MoeGroupOffsets
-            | KernelId::MoeGroupInit
             | KernelId::MoeGroupScatter
             | KernelId::MoeGroupScatterQ8
             | KernelId::MoeWeightedSum
