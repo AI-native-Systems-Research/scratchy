@@ -1247,8 +1247,9 @@ fn report(what: &str, step: usize, got: &Snapshot, want: &Snapshot) -> f64 {
 /// GDN layer's conv ring and recurrent state, and the logits. The one-shot of 301 + i tokens is
 /// checked bit-identical, on its last row, to row 300 + i of one 308-token forward, so it is the
 /// one-shot trajectory (k) compares against. Asserted: every value finite, the references
-/// bit-identical, and every teacher-forced decode's logits at cosine ≥ 0.999 (one step's
-/// difference, which is (k)'s criterion for one step); the chain's numbers are printed.
+/// bit-identical, and every teacher-forced decode's logits at cosine ≥ the model's
+/// `TEACHER_FORCED_DECODE_COSINE` (one step's difference, which is (k)'s criterion for one step);
+/// the chain's numbers are printed.
 #[test]
 fn k_diag_decode_drift_against_one_shot() {
     let r = rig();
@@ -1287,11 +1288,11 @@ fn k_diag_decode_drift_against_one_shot() {
         refs_identical &= want.logits[..] == one_shot[p * VOCAB..][..VOCAB];
         forced_cos.push(report("teacher-forced", i, &got, &want));
     }
-    let forced_ok = forced_cos.iter().all(|&c| c >= 0.999);
+    let forced_ok = forced_cos.iter().all(|&c| c >= TEACHER_FORCED_DECODE_COSINE);
     eprintln!(
         "(k-diag) logits cosine per step: chain {chain_cos:.6?} teacher-forced {forced_cos:.6?}; \
          references bit-identical to the 308-token forward's rows={refs_identical} \
-         teacher-forced all >= 0.999={forced_ok} {}",
+         teacher-forced all >= {TEACHER_FORCED_DECODE_COSINE}={forced_ok} {}",
         verdict(pass && refs_identical && forced_ok)
     );
     assert!(
@@ -1301,6 +1302,6 @@ fn k_diag_decode_drift_against_one_shot() {
     assert!(pass, "a decode gave a non-finite logit");
     assert!(
         forced_ok,
-        "a teacher-forced decode is below cosine 0.999: one step is wrong"
+        "a teacher-forced decode is below cosine {TEACHER_FORCED_DECODE_COSINE}: one step is wrong"
     );
 }
