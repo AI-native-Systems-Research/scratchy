@@ -1011,9 +1011,17 @@ run_scale_cells() { # prefix restart-function full-length [axes]
 # One comparison engine on one model: a warm-up start (so a download never lands
 # inside a measurement, and to learn the name it serves the model under), the
 # startup ladder, then one server per scaling axis, sized for that axis.
-served_name() { # the first model the running server lists
-    curl -fsS -m 10 "http://127.0.0.1:${PORT}/v1/models" \
-        | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print(d[0]["id"] if d else "")' 2>/dev/null
+# The name the running server lists MODEL under: its repo name, or the repo id with / as --
+# (oMLX lists its --model-dir entries by repo name, and every Hugging Face cache model besides,
+# by id). Never just the first listed: oMLX's list starts with whatever cache model sorts first,
+# and requests to that name failed every gpt-oss-20b and granite-4.2-3b cell on the base M5.
+served_name() { # MODEL
+    curl -fsS -m 10 "http://127.0.0.1:${PORT}/v1/models" | python3 -c '
+import json, sys
+model = sys.argv[1]
+ids = [m["id"] for m in json.load(sys.stdin)["data"]]
+want = [model.rsplit("/", 1)[-1], model.replace("/", "--"), model]
+print(next((w for w in want if w in ids), ""))' "$1" 2>/dev/null
 }
 prepare_failed() { serve_down; rm -rf "${RAW}/omlx-home-probe"; return 1; }
 engine_prepare() { # key label model -> prints the name requests carry; fails if it cannot serve
@@ -1048,8 +1056,9 @@ import json,sys; t=sys.argv[1]; t=t if ":" in t else t+":latest"
 print(next((m["digest"] for m in json.load(sys.stdin)["models"] if m["name"]==t), ""))' "${model}" 2>/dev/null || echo
             } >"${RAW}/served-ollama-${stem}"
             name="${model}" ;;
-        *)  name="$(served_name)" ;;
+        *)  name="$(served_name "${model}")" ;;
     esac
+    [[ -n "${name}" ]] || { echo "    ${label} does not list ${model} — not serving it" >&2; prepare_failed; return 1; }
     if [[ "${key}" == omlx || "${key}" == omlx_tq ]]; then
         # /v1/models naming the model proves nothing: oMLX loads lazily, so its
         # memory guard has not been asked yet. One tiny request makes it try,
