@@ -282,8 +282,6 @@ SCALE_GRID_OUTPUT="64"         # --full: 64,512,2048, the 1-user decode-vs-answe
 # SCALE_GRID_CONC, the grid's users dimension (empty: 1 and the base count),
 # defaults by this Mac's memory once it is read, below.
 SCALE_GRID_USERS_OUTPUT="64"   # the answer lengths above 1 user; empty: every --scale-grid-output
-# SCALE_GRID_USERS_MAX_INPUT, the longest prompt above 1 user (0: every --scale-grid-input),
-# defaults by this Mac's memory with SCALE_GRID_CONC, below.
 SCALE_BASE_INPUT=1024
 SCALE_BASE_OUTPUT=64
 SCALE_BASE_CONC=8
@@ -328,7 +326,6 @@ while [[ $# -gt 0 ]]; do
         --scale-grid-output) SCALE_GRID_OUTPUT="$2"; shift 2 ;;
         --scale-grid-conc)   SCALE_GRID_CONC="$2"; shift 2 ;;
         --scale-grid-users-output) SCALE_GRID_USERS_OUTPUT="$2"; shift 2 ;;
-        --scale-grid-users-max-input) SCALE_GRID_USERS_MAX_INPUT="$2"; shift 2 ;;
         --scale-num-prompts) SCALE_NUM_PROMPTS="$2"; shift 2 ;;
         --scale-rounds)      SCALE_ROUNDS="$2"; shift 2 ;;
         --scale-warmups)     SCALE_WARMUPS="$2"; shift 2 ;;
@@ -1004,10 +1001,6 @@ run_scale_cells() { # prefix restart-function full-length [axes]
         # prompt x answer slice the sparklines read.
         for c in "${cs[@]}"; do for x in "${xs[@]}"; do for o in "${os[@]}"; do
             if (( c > 1 )) && [[ "${uos}" != *",${o},"* ]]; then
-                continue
-            fi
-            # Above 1 user, prompts up to --scale-grid-users-max-input.
-            if (( c > 1 && SCALE_GRID_USERS_MAX_INPUT && x > SCALE_GRID_USERS_MAX_INPUT )); then
                 continue
             fi
             if (( gmax && x + o + 256 > gmax )); then
