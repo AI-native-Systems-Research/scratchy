@@ -166,6 +166,30 @@ mod tests {
         assert!(differ * 10 > real.len() * 9, "{differ} of {}", real.len());
     }
 
+    /// Gemma 4's sliding layers' table: a full rope on a 256-lane head (`rot_dim` 256) at theta
+    /// 1e4, within the bf16 bound of the f64 angle at positions {0, 1, 1023, 1024, 8191} (the
+    /// window's edge, and the last position of the prefix capacity).
+    #[test]
+    fn a_256_wide_table_at_theta_1e4_is_within_the_bound_of_the_f64_angle() {
+        const R256: u32 = 256;
+        const THETA_LOCAL: f64 = 1e4;
+        let positions = [0, 1, 1023, 1024, 8191];
+        let rows = rotary_rows(&positions, R256, THETA_LOCAL);
+        let (rows, rest) = rows.as_chunks::<{ R256 as usize }>();
+        assert!(rest.is_empty(), "the table is whole rows");
+        for (row, &p) in rows.iter().zip(&positions) {
+            let angles: Vec<f64> = (0..R256 as usize / 2)
+                .map(|i| f64::from(p) * inv_freq(i, R256, THETA_LOCAL))
+                .collect();
+            let exact = (angles.iter().map(|a| a.cos())).chain(angles.iter().map(|a| a.sin()));
+            let missed = (row.iter().zip(exact))
+                .filter(|&(&b, r)| (widen(b) - r).abs() > bound(r))
+                .count();
+            eprintln!("rot_dim {R256} theta {THETA_LOCAL} position {p}: {missed} entries miss");
+            assert_eq!(missed, 0, "position {p}");
+        }
+    }
+
     /// bf16, not f16: 1.0 is `0x3F80` in bf16 and `0x3C00` in f16.
     #[test]
     fn the_table_is_bf16() {

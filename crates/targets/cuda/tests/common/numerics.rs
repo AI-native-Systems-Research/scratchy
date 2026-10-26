@@ -422,6 +422,7 @@ pub const ATTN_SCORE_MAX: f64 = 64.0;
 
 /// One attention's inputs as the reference reads them: `q [rows, q_heads · hd]` and the keys and
 /// values `[kv_len, kv_heads · hd]`, all bf16 bits; `P` and `L`.
+/// And the sliding window, when the attention has one.
 pub struct AttnCase<'a> {
     pub q: &'a [u16],
     pub k: &'a [u16],
@@ -432,6 +433,9 @@ pub struct AttnCase<'a> {
     pub prefix_len: usize,
     pub q_len: usize,
     pub scale: f64,
+    /// A row at position `q` also drops the keys `j ≤ q − window` (`q − j < window` is allowed:
+    /// HF's mask, metal's `attention.metal`); `None` for full causal attention.
+    pub window: Option<usize>,
 }
 
 /// `(ref, Σ p |v|)` for every element of the first `q_len` rows of the output `[q_len, q_heads ·
@@ -445,11 +449,21 @@ pub fn attention_reference(c: &AttnCase<'_>) -> (Vec<(f64, f64)>, f64) {
     let mut score_max = 0.0f64;
     for i in 0..c.q_len {
         let allowed = (c.prefix_len + i + 1).min(kv_len);
+        // The window's first key for the row at `P + i`; 0 without a window.
+        let first = c
+            .window
+            .map_or(0, |w| (c.prefix_len + i + 1).saturating_sub(w));
         for g in 0..qh {
             let kh = g / hr;
             let qi = &q[(i * qh + g) * hd..][..hd];
             let mut s = Vec::with_capacity(allowed);
             for j in 0..allowed {
+                // Below the window: a score of −inf, so its p is exactly 0 and it adds exactly
+                // +0 to `ref` and `Σ p |v|`, as a key never visited would.
+                if j < first {
+                    s.push(f64::NEG_INFINITY);
+                    continue;
+                }
                 let kj = &k[(j * kvh + kh) * hd..][..hd];
                 let (mut dot, mut abs) = (0.0, 0.0);
                 for (a, b) in qi.iter().zip(kj) {

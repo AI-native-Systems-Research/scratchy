@@ -658,3 +658,121 @@ fn rope_bf16_outputs_are_dumped_for_a_base_comparison() {
         );
     }
 }
+
+// ── The full rope at rot_dim 256 (Gemma 4's sliding layers, #922) ──
+
+/// Gemma 4's sliding heads: a full rope on all 256 lanes, at the sliding layers' `rope_theta`.
+const FULL: u32 = 256;
+const THETA_LOCAL: f64 = 1e4;
+
+/// The full 256-lane rope over `(rows, cols)` at head dim 256: every lane rotated (lane `d < 128`
+/// with `d + 128`) within its bound, every position-0 row bit-exact (c = 1, s = 0), the tail
+/// intact, over positions `0 ..` spread to 8191 (the codegen capacity). The self-check: a
+/// pairing at `d + 64` instead of `d + 128` misses the bound on at least 90% of the rotated lanes
+/// of the rows past position 0. `rot_dim` 128 and 192 are refused with the output untouched.
+#[test]
+fn rope_bf16_full_256_matches_the_cpu_reference() {
+    let device = h100();
+    let mut pass = true;
+    for (rows, cols) in [(1usize, 4096usize), (512, 4096), (7, 2048)] {
+        // Row 0 at position 0, the last row at 8191, the rest spread between.
+        let positions: Vec<u32> = (0..rows as u32)
+            .map(|t| {
+                if rows == 1 {
+                    0
+                } else {
+                    t * 8191 / (rows as u32 - 1)
+                }
+            })
+            .collect();
+        let seed = 0x0922_0E0E ^ ((rows as u64) << 32 | cols as u64);
+        let x = bf16_inputs(rows * cols, seed);
+        let table = rotary_rows(&positions, FULL, THETA_LOCAL);
+        let (xb, tb) = (
+            DeviceBuffer::upload(&device, &x).expect("upload x"),
+            DeviceBuffer::upload(&device, &table).expect("upload the table"),
+        );
+        let out = output(&device, x.len());
+        // SAFETY: as `run_rope`'s, with the table rows·FULL.
+        unsafe {
+            rope_bf16(
+                xb.ptr(),
+                tb.ptr(),
+                out.ptr(),
+                (rows as u32, cols as u32),
+                (HD, FULL),
+                std::ptr::null_mut(),
+            )
+        }
+        .expect("rope_bf16 launch at rot_dim 256");
+        let (gpu, tail) = result(&out, x.len());
+        let shape = (HD as usize, FULL as usize);
+        let refs = rope_reference(&x, &table, (rows, cols), shape, FULL as usize / 2);
+        let cmp = compare_rope(&gpu, &x, &refs, cols);
+        let zero_mismatched: usize = (0..rows)
+            .filter(|&r| positions[r] == 0)
+            .map(|r| mismatched_bits(&gpu[r * cols..][..cols], &x[r * cols..][..cols]))
+            .sum();
+        // The self-check over the rows past position 0: `d` paired with `d + 64`.
+        let (mut missed, mut rotated) = (0, 0);
+        for r in (0..rows).filter(|&r| positions[r] != 0) {
+            let at = r * cols..(r + 1) * cols;
+            let row_table = &table[r * FULL as usize..][..FULL as usize];
+            let wrong = rope_reference(&x[at.clone()], row_table, (1, cols), shape, 64);
+            let (m, n) = rope_misses(&gpu[at], &wrong);
+            missed += m;
+            rotated += n;
+        }
+        let distinguishes = rotated == 0 || missed * 10 >= rotated * 9;
+        let ok = cmp.rotated.pass()
+            && cmp.pass_through_mismatched == 0
+            && zero_mismatched == 0
+            && tail
+            && distinguishes;
+        eprintln!(
+            "rope_bf16 full rows={rows} cols={cols} head_dim={HD} rot_dim={FULL} \
+             theta={THETA_LOCAL}: {} pass_through_mismatched_bits={} \
+             position0_mismatched_bits={zero_mismatched} tail_intact={tail} \
+             pairing_d_plus_64_self_check_misses={missed}/{rotated} (≥ 90%) {}",
+            cmp.rotated.line(),
+            cmp.pass_through_mismatched,
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    let (rows, cols) = (7u32, 2048u32);
+    let len = (rows * cols) as usize;
+    let input = DeviceBuffer::upload(&device, &vec![0; len]).expect("upload x");
+    let table = DeviceBuffer::upload(&device, &vec![0; len]).expect("upload the table");
+    for rot_dim in [128u32, 192] {
+        let out = refused_out(&device, len);
+        // SAFETY: the launcher refuses these widths before it touches any pointer.
+        let got = unsafe {
+            rope_bf16(
+                input.ptr(),
+                table.ptr(),
+                out.ptr(),
+                (rows, cols),
+                (HD, rot_dim),
+                std::ptr::null_mut(),
+            )
+        };
+        let want = Err(KernelError::RopeShape {
+            rows,
+            cols,
+            head_dim: HD,
+            rot_dim,
+        });
+        let kept = unchanged(&out);
+        let ok = got == want && kept;
+        eprintln!(
+            "rope_bf16 full refusal rot_dim={rot_dim}: {got:?} out_unchanged={kept} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(
+        pass,
+        "the full 256-lane rope is out of bound, or a refusal wrote"
+    );
+}

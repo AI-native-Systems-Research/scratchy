@@ -67,8 +67,8 @@
 //     each stage's semaphore phase from it, so every tile the consumers wait for is one the
 //     producer loaded. A later warp's first tile can still be wholly below its own rows' floors
 //     (they sit up to 112 rows past the CTA's first): its scores are all −inf, `row_max` gives
-//     −inf, and `sub_row` would form `−inf − (−inf) = NaN`. So a windowed launch maps the scaled
-//     max through `neg_inf_to_zero` (`scratchy_ops.cuh`) first: such a tile's p is
+//     −inf, and `sub_row` would form `−inf − (−inf) = NaN`. So a windowed launch maps the max
+//     through `neg_inf_to_zero` (`scratchy_ops.cuh`) before scaling it: such a tile's p is
 //     `exp2(−inf − 0) = 0` exactly, `rescale_exact1(−inf, −inf)` is exactly 1, and its `o`, `l`
 //     and `m` stay 0, 0 and −inf, until the warp's first allowed tile rescales them by
 //     `exp2(−inf) = 0`. A padding row at least W − 1 rows past the last key sees no key at all,
@@ -274,12 +274,16 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_prefill_bf16_ker(
 
             warp::row_max(max_vec, att_block, max_vec);
             warp::mul(att_block, att_block, g.scale_log2);
-            warp::mul(max_vec_scaled, max_vec, g.scale_log2);
-            // A tile wholly outside a row's window leaves its max −inf: subtract 0 instead, so
-            // its p is exactly 0, never `exp2(−inf − (−inf)) = NaN`. A register vector, so
-            // `unary_op`, not the tile map `unary_map`.
             if constexpr (WINDOWED) {
-                warp::unary_op<scratchy::ops::neg_inf_to_zero>(max_vec_scaled, max_vec_scaled);
+                // A tile wholly outside a row's window leaves its max −inf: subtract 0 instead, so
+                // its p is exactly 0, never `exp2(−inf − (−inf)) = NaN`. The select is on the
+                // unscaled max, before its own `mul`, so the subtraction below still reads that
+                // product, as the unwindowed kernel's does. A register vector, so `unary_op`, not
+                // the tile map `unary_map`.
+                warp::unary_op<scratchy::ops::neg_inf_to_zero>(max_vec_scaled, max_vec);
+                warp::mul(max_vec_scaled, max_vec_scaled, g.scale_log2);
+            } else {
+                warp::mul(max_vec_scaled, max_vec, g.scale_log2);
             }
             warp::sub_row(att_block, att_block, max_vec_scaled);
             warp::exp2(att_block, att_block);

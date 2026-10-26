@@ -982,6 +982,7 @@ fn check_attention(
         prefix_len,
         q_len,
         scale: f64::from(common::attn_layer::SCALE),
+        window: None,
     });
     let cmp = compare_attention(attn, &refs, AL_Q);
     let ok = cmp.pass() && score_max <= ATTN_SCORE_MAX;

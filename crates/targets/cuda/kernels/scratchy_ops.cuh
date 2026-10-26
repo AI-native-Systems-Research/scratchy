@@ -264,11 +264,11 @@ __device__ inline float2 nan_to_neg_inf::op<float2>(const float2& x) {
     return float2{nan_to_neg_inf::op<float>(x.x), nan_to_neg_inf::op<float>(x.y)};
 }
 
-// The windowed online softmax's scaled running max: −inf as +0, every other value as it is. With a
-// window, a warp's first KV tile can lie wholly below every one of its rows' windows, so its row
-// max is −inf and `sub_row` would form `−inf − (−inf) = NaN`. Through this op the tile's
-// `p = exp2(−inf − 0)` is exactly 0 instead, and a finite max is unchanged. The `float2` form
-// serves the packed column vector of a row-layout tile (see `rescale_exact1`).
+// The windowed online softmax's running max, before it is scaled: −inf as +0, every other value as
+// it is. With a window, a warp's first KV tile can lie wholly below every one of its rows'
+// windows, so its row max is −inf and `sub_row` would form `−inf − (−inf) = NaN`. Through this op
+// the tile's `p = exp2(−inf − 0)` is exactly 0 instead, and a finite max is unchanged. The
+// `float2` form serves the packed column vector of a row-layout tile (see `rescale_exact1`).
 struct neg_inf_to_zero {
     template <typename T>
     static __device__ inline T op(const T& x) {

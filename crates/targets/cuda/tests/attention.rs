@@ -23,6 +23,10 @@ use scratchy_target_cuda::kernels::{
     KernelError, attn_decode_bf16, attn_prefill_bf16, kv_append_bf16,
 };
 use scratchy_target_cuda::runtime::{CudaDevice, DeviceBuffer};
+// The sliding window's launches and inputs (#922), apart from the qwen tests' imports above.
+use common::numerics::centred_gains;
+use scratchy_target_cuda::kernels::{attn_decode_windowed_bf16, attn_prefill_windowed_bf16};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// qwen3.5's head dim, and the KV block size.
 const HD: usize = 256;
@@ -313,6 +317,7 @@ fn the_attention_is_within_the_f64_bound() {
             prefix_len: p,
             q_len: len,
             scale: f64::from(SCALE),
+            window: None,
         });
         let cmp = compare_attention(&out, &refs, qh * HD);
         let padding_finite =
@@ -751,6 +756,7 @@ fn the_decode_attention_is_within_the_f64_bound() {
                 prefix_len: kv_len - 1,
                 q_len: 1,
                 scale: f64::from(SCALE),
+                window: None,
             });
             let cmp = compare_attention(&out, &refs, qh * HD);
             let nonfinite = (out.iter())
@@ -959,6 +965,7 @@ fn the_decode_attention_is_within_two_bounds_of_the_prefill_row() {
             prefix_len: kv_len - 1,
             q_len: 1,
             scale: f64::from(SCALE),
+            window: None,
         });
         let (mut bad, mut worst, mut ulps) = (0usize, 0.0f64, 0u16);
         for ((&d, &f), &(r, pv)) in decode.iter().zip(prefill).zip(&refs) {
@@ -1061,6 +1068,7 @@ fn the_decode_attention_against_the_prefill_row_at_16_by_2() {
             prefix_len: kv_len - 1,
             q_len: 1,
             scale: f64::from(SCALE),
+            window: None,
         });
         let (mut bad, mut worst, mut ulps) = (0usize, 0.0f64, 0u32);
         for ((&d, &f), &(r, pv)) in decode.iter().zip(prefill).zip(&refs) {
@@ -1329,4 +1337,701 @@ fn the_decode_attention_outputs_are_dumped_for_a_base_comparison() {
             eprintln!("case={name} elems={} fnv1a={fnv:016x}", out.len());
         }
     }
+}
+
+// ── The sliding window (Gemma 4's sliding layers, #922) ────────────
+
+/// Gemma 4 26B-A4B's sliding attention: 16 query heads over 8 kv heads (a GQA group of 2) at head
+/// dim 256, a window of 1024 keys, and a softmax scale of 1 (its q and k norms size the scores).
+const GQH: usize = 16;
+const GKVH: usize = 8;
+const WINDOW: usize = 1024;
+const GSCALE: f32 = 1.0;
+/// The bf16 NaN the skipped-tile test fills the blocks below every row's window with.
+const SKIPPED: u16 = 0x7FC0;
+
+/// The windowed prefill attention of `q` (`[rows, GQH · HD]`) over the decode pool's caches of
+/// `GKVH` heads, `[P, L]`, `table` and `window` (0: full causal); the output, downloaded.
+fn attend_windowed(
+    device: &CudaDevice,
+    q: &[u16],
+    caches: (&DeviceBuffer, &DeviceBuffer),
+    table: &[u32],
+    (prefix_len, q_len, rows): (usize, usize, usize),
+    window: u32,
+) -> Result<Vec<u16>, KernelError> {
+    let qb = up(device, q);
+    let out = up(device, &vec![SENTINEL; rows * GQH * HD]);
+    let tb = up_u32(device, table);
+    let sb = up_u32(device, &[prefix_len as u32, q_len as u32]);
+    // SAFETY: cudaMalloc pointers are 256-byte aligned; `q` and `out` hold rows·GQH·HD bf16, `out`
+    // its own allocation; the caches DEC_BLOCKS·GKVH·BS·HD each; `table` covers the ceil((P+L)/64)
+    // blocks the keys need, each below DEC_BLOCKS; null is the default stream.
+    unsafe {
+        attn_prefill_windowed_bf16(
+            (qb.ptr(), out.ptr()),
+            (caches.0.ptr(), caches.1.ptr()),
+            (tb.ptr(), sb.ptr()),
+            (rows as u32, GQH as u32, GKVH as u32, HD as u32),
+            (BS as u32, DEC_BLOCKS as u32),
+            (GSCALE, window),
+            std::ptr::null_mut(),
+        )
+    }?;
+    Ok(out.download().expect("download the output"))
+}
+
+/// The windowed decode attention of one query row `q` (`[1, GQH · HD]`) at position `kv_len − 1`
+/// over the decode pool's caches of `GKVH` heads, `table` and `window` (0: every key); the
+/// output, downloaded.
+fn attend_decode_windowed(
+    device: &CudaDevice,
+    q: &[u16],
+    caches: (&DeviceBuffer, &DeviceBuffer),
+    table: &[u32],
+    kv_len: usize,
+    window: u32,
+) -> Result<Vec<u16>, KernelError> {
+    let qb = up(device, q);
+    let out = up(device, &vec![SENTINEL; GQH * HD]);
+    let tb = up_u32(device, table);
+    let sb = up_u32(device, &[kv_len as u32 - 1, 1]);
+    // SAFETY: as `attend_decode`'s, at GQH q heads over GKVH kv heads.
+    unsafe {
+        attn_decode_windowed_bf16(
+            (qb.ptr(), out.ptr()),
+            (caches.0.ptr(), caches.1.ptr()),
+            (tb.ptr(), sb.ptr()),
+            (GQH as u32, GKVH as u32, HD as u32),
+            (BS as u32, DEC_BLOCKS as u32),
+            (GSCALE, window),
+            std::ptr::null_mut(),
+        )
+    }?;
+    Ok(out.download().expect("download the output"))
+}
+
+/// One windowed case's inputs over `tokens` keys: `q_rows` query rows in [−1/4, 1/4] (so
+/// `scale · Σ_d |q k| ≤ 256 / 4 = 64 = ATTN_SCORE_MAX` at scale 1), and keys and values in
+/// [−1, 1].
+fn windowed_inputs(q_rows: usize, tokens: usize, seed: u64) -> [Vec<u16>; 3] {
+    [
+        centred_gains(q_rows * GQH * HD, seed),
+        bf16_inputs(tokens * GKVH * HD, seed ^ 0x100),
+        bf16_inputs(tokens * GKVH * HD, seed ^ 0x200),
+    ]
+}
+
+/// One chunk's `attention_reference`: its `(ref, Σ p |v|)` and score maximum.
+type Reference = (Vec<(f64, f64)>, f64);
+
+/// The f64 reference of rows `0 .. q_len` of a windowed attention of `q` (`[≥ q_len, GQH · HD]`,
+/// its row `i` at position `P + i`) over the keys and values `[P + L, GKVH · HD]`, in 128-row
+/// chunks across the host's threads. A chunk passes `attention_reference` only the keys from its
+/// first row's window floor on, at the prefix shifted by as much, with the same window: each row
+/// sees the same keys, and the reference reads a window's worth, not the whole sequence.
+fn windowed_reference(
+    q: &[u16],
+    (k, v): (&[u16], &[u16]),
+    (prefix_len, q_len): (usize, usize),
+    window: usize,
+) -> Reference {
+    const CHUNK: usize = 128;
+    let (width, kv_width) = (GQH * HD, GKVH * HD);
+    let chunks = q_len.div_ceil(CHUNK);
+    let threads = (std::thread::available_parallelism()).map_or(1, |n| n.get().min(chunks));
+    let next = &AtomicUsize::new(0);
+    let mut parts: Vec<Option<Reference>> = vec![None; chunks];
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(move || {
+                    let mut mine = Vec::new();
+                    loop {
+                        let c = next.fetch_add(1, Ordering::Relaxed);
+                        if c >= chunks {
+                            break mine;
+                        }
+                        let (r0, r1) = (c * CHUNK, ((c + 1) * CHUNK).min(q_len));
+                        let first = (prefix_len + r0 + 1).saturating_sub(window);
+                        let end = prefix_len + r1;
+                        let part = attention_reference(&AttnCase {
+                            q: &q[r0 * width..r1 * width],
+                            k: &k[first * kv_width..end * kv_width],
+                            v: &v[first * kv_width..end * kv_width],
+                            q_heads: GQH,
+                            kv_heads: GKVH,
+                            head_dim: HD,
+                            prefix_len: prefix_len + r0 - first,
+                            q_len: r1 - r0,
+                            scale: f64::from(GSCALE),
+                            window: Some(window),
+                        });
+                        mine.push((c, part));
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            for (c, part) in worker.join().expect("a reference thread") {
+                parts[c] = Some(part);
+            }
+        }
+    });
+    let mut refs = Vec::with_capacity(q_len * width);
+    let mut score_max = 0.0f64;
+    for (part, max) in parts.into_iter().map(|p| p.expect("every chunk")) {
+        refs.extend(part);
+        score_max = score_max.max(max);
+    }
+    (refs, score_max)
+}
+
+/// Each output of a windowed run is finite.
+fn all_finite(out: &[u16]) -> bool {
+    out.iter().all(|&b| bf16::from_bits(b).to_f32().is_finite())
+}
+
+/// The prefill cases of the windowed tests, `(P, L, rows)`: every one runs past 1024 keys, inside
+/// one chunk (P = 0, L = 2048 and 4096) or across a chunk's prefix. (0, 100) in a 2048-row bucket
+/// has padding rows more than 1023 rows past the last key: they see no key at all and must stay
+/// finite.
+const WINDOW_PREFILLS: [(usize, usize, usize); 6] = [
+    (0, 2048, 2048),
+    (0, 4096, 4096),
+    (1000, 512, 512),
+    (1500, 300, 384),
+    (3000, 1024, 1024),
+    (0, 100, 2048),
+];
+/// The decode `kv_len`s of the windowed tests: one key, one tile, the full window, each side of
+/// its first bite (1025: the floor 1 mid-tile; 1088: the floor 64 at a tile boundary), and long
+/// sequences up to the codegen capacity.
+const WINDOW_DECODES: [usize; 8] = [1, 64, 1024, 1025, 1088, 2049, 4096, 8192];
+
+/// Every windowed prefill and decode case within the f64 bound, `out_of_bound=0`, its score
+/// maximum at most `ATTN_SCORE_MAX` (printed), and every output finite (a prefill's padding rows
+/// included), over a shuffled block table whose unwritten slots are NaN. K and V are read back from
+/// the cache, so the reference uses exactly the bits the kernel read.
+#[test]
+fn the_windowed_attention_is_within_the_f64_bound() {
+    let device = h100();
+    let w = WINDOW as u32;
+    let mut pass = true;
+    for (case, &(p, len, rows)) in WINDOW_PREFILLS.iter().enumerate() {
+        let tokens = p + len;
+        let seed = 0x0922_0000 + case as u64;
+        let [q, k, v] = windowed_inputs(rows, tokens, seed);
+        let table = shuffled_blocks(seed);
+        let need = tokens.div_ceil(BS);
+        let (kc, vc) = dec_caches(&device, (&k, &v), (tokens, GKVH), &table, POISON);
+        let (kr, vr) = (
+            gather_paged(&kc.download().expect("K"), &table, tokens, (GKVH, BS, HD)),
+            gather_paged(&vc.download().expect("V"), &table, tokens, (GKVH, BS, HD)),
+        );
+        let out = attend_windowed(&device, &q, (&kc, &vc), &table[..need], (p, len, rows), w)
+            .expect("attn_prefill_windowed_bf16");
+        let (refs, score_max) = windowed_reference(&q, (&kr, &vr), (p, len), WINDOW);
+        let cmp = compare_attention(&out, &refs, GQH * HD);
+        let finite = all_finite(&out);
+        let ok = cmp.pass() && score_max <= ATTN_SCORE_MAX && finite;
+        eprintln!(
+            "windowed attention heads={GQH}/{GKVH} W={WINDOW} rows={rows} P={p} L={len}: {} \
+             score_max={score_max:.4} (≤ {ATTN_SCORE_MAX}) all_finite={finite} {}",
+            cmp.line(),
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    for (case, &kv_len) in WINDOW_DECODES.iter().enumerate() {
+        let seed = 0x0922_1000 + case as u64;
+        let [q, k, v] = windowed_inputs(1, kv_len, seed);
+        let table = shuffled_blocks(seed);
+        let need = kv_len.div_ceil(BS);
+        let (kc, vc) = dec_caches(&device, (&k, &v), (kv_len, GKVH), &table, POISON);
+        let (kr, vr) = (
+            gather_paged(&kc.download().expect("K"), &table, kv_len, (GKVH, BS, HD)),
+            gather_paged(&vc.download().expect("V"), &table, kv_len, (GKVH, BS, HD)),
+        );
+        let out = attend_decode_windowed(&device, &q, (&kc, &vc), &table[..need], kv_len, w)
+            .expect("attn_decode_windowed_bf16");
+        let (refs, score_max) = windowed_reference(&q, (&kr, &vr), (kv_len - 1, 1), WINDOW);
+        let cmp = compare_attention(&out, &refs, GQH * HD);
+        let finite = all_finite(&out);
+        let ok = cmp.pass() && score_max <= ATTN_SCORE_MAX && finite;
+        eprintln!(
+            "windowed decode attention heads={GQH}/{GKVH} W={WINDOW} kv_len={kv_len}: {} \
+             score_max={score_max:.4} (≤ {ATTN_SCORE_MAX}) all_finite={finite} {}",
+            cmp.line(),
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(pass, "a windowed attention case is out of bound");
+}
+
+/// The probe's V over `tokens` keys: key `j` in the band `[band, band + 256)` one-hot at lane
+/// `j mod 256` (both kv heads of its group, every kv head), every other key 0.
+fn band_values(tokens: usize, band: usize) -> Vec<u16> {
+    let mut v = vec![0u16; tokens * GKVH * HD];
+    for j in band..(band + HD).min(tokens) {
+        for h in 0..GKVH {
+            v[(j * GKVH + h) * HD + j % HD] = bits(1.0);
+        }
+    }
+    v
+}
+
+/// The probe's verdict on output row `out_row` (`[GQH · HD]`) of the query at position `q`: with
+/// K = 0 every score is 0 and every p is 1, so with V from [`band_values`] lane `d` is `1/n` (n
+/// the window's keys, `min(q + 1, W)`) when the band's key at lane `d` is in the window
+/// (`q − W < j ≤ q`), and exactly `+0.0` when it is not. Returns `(one_over_n_lanes_off,
+/// nonzero_in_zero_lanes)`; `1/n` passes within one bf16 step, as the causal probe's.
+fn band_misses(out_row: &[u16], q: usize, band: usize) -> (usize, usize) {
+    let n = (q + 1).min(WINDOW);
+    let want = bits(1.0 / n as f32);
+    let (mut off, mut nonzero) = (0usize, 0usize);
+    for g in 0..GQH {
+        for d in 0..HD {
+            // The band's one key at lane `d`.
+            let j = band + (d + HD - band % HD) % HD;
+            let got = out_row[g * HD + d];
+            if j + WINDOW > q && j <= q {
+                off += usize::from(got.abs_diff(want) > 1);
+            } else {
+                nonzero += usize::from(got != 0);
+            }
+        }
+    }
+    (off, nonzero)
+}
+
+/// The window's edge, exactly. K = 0 and V one-hot in a 256-key band ([`band_values`]) that the
+/// rows' window floors `q − 1023` sweep through, so each output lane is `1/n` or `+0.0` and says
+/// whether one key is in the row's window: `q − 1023` seen, `q − 1024` not, at a tile boundary
+/// and mid-tile (both counted, and required). The prefill at (P = 1000, L = 512) has CTAs whose
+/// later warps' first KV tile is wholly below their window (their rows sit up to 112 rows past
+/// the CTA's floor), the tile the NaN fix is for; (P = 0, L = 2048) also crosses the causal edge.
+/// The decode at kv_len 1025, 1088, 1100, 2049 and 4096 puts its floor 1, 64, 76, 1025 and 3072:
+/// mid-tile and on a tile boundary. Every unwritten slot's V is NaN.
+#[test]
+fn the_window_probe_is_exact() {
+    let device = h100();
+    let w = WINDOW as u32;
+    let mut pass = true;
+    for (p, len, rows, band) in [
+        (1000usize, 512usize, 512usize, 128usize),
+        (0, 2048, 2048, 512),
+    ] {
+        let tokens = p + len;
+        let table = shuffled_blocks(0x0922_2000 + p as u64);
+        let need = tokens.div_ceil(BS);
+        let k = vec![0u16; tokens * GKVH * HD];
+        let v = band_values(tokens, band);
+        let (kc, vc) = dec_caches(&device, (&k, &v), (tokens, GKVH), &table, POISON);
+        let q = centred_gains(rows * GQH * HD, 0x0922_2100 + p as u64);
+        let out = attend_windowed(&device, &q, (&kc, &vc), &table[..need], (p, len, rows), w)
+            .expect("attn_prefill_windowed_bf16");
+        let (mut off, mut nonzero, mut at_boundary, mut mid_tile) = (0, 0, 0, 0);
+        for i in 0..len {
+            let q_pos = p + i;
+            let (o, z) = band_misses(&out[i * GQH * HD..][..GQH * HD], q_pos, band);
+            off += o;
+            nonzero += z;
+            // A row whose floor falls inside the band (its edge is probed), by where in a tile.
+            if let Some(floor) = (q_pos + 1).checked_sub(WINDOW)
+                && (band + 1..band + HD).contains(&floor)
+            {
+                if floor.is_multiple_of(BS) {
+                    at_boundary += 1;
+                } else {
+                    mid_tile += 1;
+                }
+            }
+        }
+        let finite = all_finite(&out);
+        let ok = off == 0 && nonzero == 0 && finite && at_boundary > 0 && mid_tile > 0;
+        eprintln!(
+            "window probe prefill P={p} L={len} rows={rows} band={band}..{}: \
+             one_over_n_lanes_off={off} nonzero_in_zero_lanes={nonzero} all_finite={finite} \
+             edge_rows_at_tile_boundary={at_boundary} edge_rows_mid_tile={mid_tile} {}",
+            band + HD,
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    for kv_len in [1025usize, 1088, 1100, 2049, 4096] {
+        let floor = kv_len - WINDOW;
+        let band = floor.saturating_sub(100);
+        let table = shuffled_blocks(0x0922_3000 + kv_len as u64);
+        let need = kv_len.div_ceil(BS);
+        let k = vec![0u16; kv_len * GKVH * HD];
+        let v = band_values(kv_len, band);
+        let (kc, vc) = dec_caches(&device, (&k, &v), (kv_len, GKVH), &table, POISON);
+        let q = centred_gains(GQH * HD, 0x0922_3100 + kv_len as u64);
+        let out = attend_decode_windowed(&device, &q, (&kc, &vc), &table[..need], kv_len, w)
+            .expect("attn_decode_windowed_bf16");
+        let (off, nonzero) = band_misses(&out, kv_len - 1, band);
+        let finite = all_finite(&out);
+        let ok = off == 0 && nonzero == 0 && finite;
+        eprintln!(
+            "window probe decode kv_len={kv_len} floor={floor} ({}) band={band}..{}: \
+             one_over_n_lanes_off={off} nonzero_in_zero_lanes={nonzero} all_finite={finite} {}",
+            if floor.is_multiple_of(BS) {
+                "tile boundary"
+            } else {
+                "mid-tile"
+            },
+            band + HD,
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(pass, "a window probe is not exact: see the lines above");
+}
+
+/// With `kv_len ≤ 1024` no key is outside any row's window, so the windowed launch (no tile
+/// skipped, the window's mask dropping nothing) equals the `window = 0` launch bit for bit, for
+/// the prefill and the decode. With kv_len 2048 it does not: at least 90% of the prefill rows past
+/// position 1023, and of the decode's query heads, differ (the self-check that the window bites).
+#[test]
+fn a_window_of_full_length_is_the_causal_attention() {
+    let device = h100();
+    let w = WINDOW as u32;
+    let mut pass = true;
+    for (case, &(p, len, rows)) in [
+        (0usize, 1024usize, 1024usize),
+        (200, 512, 512),
+        (0, 2048, 2048),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let tokens = p + len;
+        let seed = 0x0922_4000 + case as u64;
+        let [q, k, v] = windowed_inputs(rows, tokens, seed);
+        let table = shuffled_blocks(seed);
+        let need = tokens.div_ceil(BS);
+        let (kc, vc) = dec_caches(&device, (&k, &v), (tokens, GKVH), &table, POISON);
+        let shape = (p, len, rows);
+        let windowed = attend_windowed(&device, &q, (&kc, &vc), &table[..need], shape, w)
+            .expect("attn_prefill_windowed_bf16");
+        let causal = attend_windowed(&device, &q, (&kc, &vc), &table[..need], shape, 0)
+            .expect("attn_prefill_windowed_bf16, window 0");
+        let width = GQH * HD;
+        let ok = if tokens <= WINDOW {
+            let mismatched = mismatched_bits(&windowed, &causal);
+            eprintln!(
+                "window {WINDOW} vs window 0, prefill P={p} L={len}: mismatched_bits={mismatched} \
+                 {}",
+                verdict(mismatched == 0)
+            );
+            mismatched == 0
+        } else {
+            let past: Vec<usize> = (0..len).filter(|&i| p + i >= WINDOW).collect();
+            let differ = (past.iter())
+                .filter(|&&i| {
+                    let row = i * width..(i + 1) * width;
+                    windowed[row.clone()] != causal[row]
+                })
+                .count();
+            let ok = differ * 10 >= past.len() * 9;
+            eprintln!(
+                "window {WINDOW} vs window 0, prefill P={p} L={len} (self-check): {differ} of {} \
+                 rows past position {} differ (≥ 90%) {}",
+                past.len(),
+                WINDOW - 1,
+                verdict(ok)
+            );
+            ok
+        };
+        pass &= ok;
+    }
+    for (case, &kv_len) in [1usize, 64, 1000, 1024, 2048].iter().enumerate() {
+        let seed = 0x0922_4100 + case as u64;
+        let [q, k, v] = windowed_inputs(1, kv_len, seed);
+        let table = shuffled_blocks(seed);
+        let need = kv_len.div_ceil(BS);
+        let (kc, vc) = dec_caches(&device, (&k, &v), (kv_len, GKVH), &table, POISON);
+        let windowed = attend_decode_windowed(&device, &q, (&kc, &vc), &table[..need], kv_len, w)
+            .expect("attn_decode_windowed_bf16");
+        let causal = attend_decode_windowed(&device, &q, (&kc, &vc), &table[..need], kv_len, 0)
+            .expect("attn_decode_windowed_bf16, window 0");
+        let ok = if kv_len <= WINDOW {
+            let mismatched = mismatched_bits(&windowed, &causal);
+            eprintln!(
+                "window {WINDOW} vs window 0, decode kv_len={kv_len}: mismatched_bits={mismatched} \
+                 {}",
+                verdict(mismatched == 0)
+            );
+            mismatched == 0
+        } else {
+            let differ = (0..GQH)
+                .filter(|&g| windowed[g * HD..][..HD] != causal[g * HD..][..HD])
+                .count();
+            let ok = differ * 10 >= GQH * 9;
+            eprintln!(
+                "window {WINDOW} vs window 0, decode kv_len={kv_len} (self-check): {differ} of \
+                 {GQH} query heads differ (≥ 90%) {}",
+                verdict(ok)
+            );
+            ok
+        };
+        pass &= ok;
+    }
+    assert!(
+        pass,
+        "a full-length window is not the causal attention, or a long one is"
+    );
+}
+
+/// `cache` (one layer's decode pool, `GKVH` heads) with every element of the physical blocks
+/// `blocks` set to `fill`.
+fn with_blocks(cache: &[u16], blocks: &[u32], fill: u16) -> Vec<u16> {
+    let stride = dec_layout(GKVH).kv_blk_stride();
+    let mut out = cache.to_vec();
+    for &b in blocks {
+        out[b as usize * stride..][..stride].fill(fill);
+    }
+    out
+}
+
+/// The KV tiles wholly below every row's window are never read: the blocks the block table names
+/// for them hold bf16 NaN in K and V (a read of a NaN V tile reaches the output even through
+/// p = 0), and the output is finite and bit-identical to the same case with those blocks zeroed.
+/// The prefill's first CTA has the lowest window floor, `P − 1023`, so the blocks below it are
+/// below every row's; the decode's floor is `kv_len − 1024`.
+#[test]
+fn the_window_skips_tiles_below_it() {
+    let device = h100();
+    let w = WINDOW as u32;
+    let mut pass = true;
+    let cases = [
+        (1500usize, 300usize, 384usize, false),
+        (3000, 1024, 1024, false),
+        (2048, 1, 1, true),
+        (4095, 1, 1, true),
+        (8191, 1, 1, true),
+    ];
+    for (case, &(p, len, rows, decode)) in cases.iter().enumerate() {
+        let tokens = p + len;
+        let seed = 0x0922_5000 + case as u64;
+        let [q, k, v] = windowed_inputs(rows, tokens, seed);
+        let table = shuffled_blocks(seed);
+        let need = tokens.div_ceil(BS);
+        let (kc, vc) = dec_caches(&device, (&k, &v), (tokens, GKVH), &table, POISON);
+        let skipped = (p + 1).saturating_sub(WINDOW) / BS;
+        let (kh, vh) = (kc.download().expect("K"), vc.download().expect("V"));
+        let run = |fill: u16| {
+            let below = &table[..skipped];
+            let (kf, vf) = (
+                up(&device, &with_blocks(&kh, below, fill)),
+                up(&device, &with_blocks(&vh, below, fill)),
+            );
+            if decode {
+                attend_decode_windowed(&device, &q, (&kf, &vf), &table[..need], tokens, w)
+            } else {
+                attend_windowed(&device, &q, (&kf, &vf), &table[..need], (p, len, rows), w)
+            }
+            .expect("a windowed attention")
+        };
+        let (poisoned, zeroed) = (run(SKIPPED), run(0));
+        let finite = all_finite(&poisoned);
+        let mismatched = mismatched_bits(&poisoned, &zeroed);
+        let ok = finite && mismatched == 0 && skipped > 0;
+        eprintln!(
+            "window skips tiles {} P={p} L={len}: {skipped} blocks below the window NaN, \
+             all_finite={finite} mismatched_bits={mismatched} (vs the blocks zeroed) {}",
+            if decode { "decode" } else { "prefill" },
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(
+        pass,
+        "a skipped tile below the window was read: see the lines above"
+    );
+}
+
+/// A windowed launch twice, and over another shuffled block table holding the same keys, gives
+/// the same bits: the reduction order is a function of `(P, L, window)` alone, not of the blocks.
+#[test]
+fn the_windowed_attention_is_deterministic() {
+    let device = h100();
+    let w = WINDOW as u32;
+    let mut pass = true;
+    for &(p, len, rows, decode) in &[(1500usize, 300usize, 384usize, false), (2048, 1, 1, true)] {
+        let tokens = p + len;
+        let [q, k, v] = windowed_inputs(rows, tokens, 0x0922_6000 + tokens as u64);
+        let need = tokens.div_ceil(BS);
+        let run = |table: &[u32]| {
+            let (kc, vc) = dec_caches(&device, (&k, &v), (tokens, GKVH), table, POISON);
+            if decode {
+                attend_decode_windowed(&device, &q, (&kc, &vc), &table[..need], tokens, w)
+            } else {
+                attend_windowed(&device, &q, (&kc, &vc), &table[..need], (p, len, rows), w)
+            }
+            .expect("a windowed attention")
+        };
+        let (a_table, b_table) = (shuffled_blocks(0x0922_6100), shuffled_blocks(0x0922_6200));
+        let (a, again, b) = (run(&a_table), run(&a_table), run(&b_table));
+        let (re, sh) = (mismatched_bits(&a, &again), mismatched_bits(&a, &b));
+        let ok = re == 0 && sh == 0;
+        eprintln!(
+            "windowed attention {} P={p} L={len}: repeat_mismatched_bits={re} \
+             shuffled_table_mismatched_bits={sh} {}",
+            if decode { "decode" } else { "prefill" },
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(pass, "a windowed attention is not deterministic");
+}
+
+/// Both windowed launchers refuse a window that is not a multiple of 64 (1000 and 32) with their
+/// shape code, and leave `out` untouched.
+#[test]
+fn the_windowed_launchers_refuse_a_window_off_the_block() {
+    let device = h100();
+    let elems = dec_layout(GKVH).buffer_elems();
+    let (kc, vc) = (
+        up(&device, &vec![0u16; elems]),
+        up(&device, &vec![0u16; elems]),
+    );
+    let rows = 128u32;
+    let q = up(&device, &vec![0u16; rows as usize * GQH * HD]);
+    let out = up(&device, &vec![SENTINEL; rows as usize * GQH * HD]);
+    let tb = up_u32(&device, &shuffled_blocks(0x0922_7000));
+    let sb = up_u32(&device, &[0, 128]);
+    let (qh, kvh, hd) = (GQH as u32, GKVH as u32, HD as u32);
+    let (block_size, num_blocks) = (BS as u32, DEC_BLOCKS as u32);
+    let untouched = || {
+        (out.download().expect("out"))
+            .iter()
+            .all(|&b| b == SENTINEL)
+    };
+    let mut pass = true;
+    for window in [1000u32, 32] {
+        // SAFETY: refused before any pointer is touched.
+        let got = unsafe {
+            attn_prefill_windowed_bf16(
+                (q.ptr(), out.ptr()),
+                (kc.ptr(), vc.ptr()),
+                (tb.ptr(), sb.ptr()),
+                (rows, qh, kvh, hd),
+                (block_size, num_blocks),
+                (GSCALE, window),
+                std::ptr::null_mut(),
+            )
+        };
+        let want = Err(KernelError::AttnShape {
+            rows,
+            q_heads: qh,
+            kv_heads: kvh,
+            head_dim: hd,
+            block_size,
+            num_blocks,
+        });
+        let kept = untouched();
+        eprintln!(
+            "windowed prefill refusal (window {window}): {got:?} out_untouched={kept} {}",
+            verdict(got == want && kept)
+        );
+        pass &= got == want && kept;
+        // SAFETY: refused before any pointer is touched.
+        let got = unsafe {
+            attn_decode_windowed_bf16(
+                (q.ptr(), out.ptr()),
+                (kc.ptr(), vc.ptr()),
+                (tb.ptr(), sb.ptr()),
+                (qh, kvh, hd),
+                (block_size, num_blocks),
+                (GSCALE, window),
+                std::ptr::null_mut(),
+            )
+        };
+        let want = Err(KernelError::AttnDecodeShape {
+            q_heads: qh,
+            kv_heads: kvh,
+            head_dim: hd,
+            block_size,
+            num_blocks,
+        });
+        let kept = untouched();
+        eprintln!(
+            "windowed decode refusal (window {window}): {got:?} out_untouched={kept} {}",
+            verdict(got == want && kept)
+        );
+        pass &= got == want && kept;
+    }
+    assert!(pass, "a window off the block launched or wrote");
+}
+
+/// The windowed decode against the windowed prefill's row for the same query at the same position
+/// over the same cache (the prefill at 128 rows, `L = 128`, `P = kv_len − 128`, its row 127), at
+/// kv_len 1025 … 4096. PRINTED, NOT GATED (#859, the user's open decision): the decode's two
+/// warpgroups add the tiles in another order than the prefill's one pass from the second tile on,
+/// so the two need not agree bit for bit. Printed: the mismatched bits, the max `ulps_apart` and
+/// the worst |decode − prefill| over the sum of their two bounds. Gated: each of the two within
+/// `attention_bound` of the f64 reference.
+#[test]
+fn the_windowed_decode_against_the_prefill_row_is_printed() {
+    let device = h100();
+    let w = WINDOW as u32;
+    let rows = 128usize;
+    let mut pass = true;
+    for kv_len in [1025usize, 1088, 2049, 4096] {
+        let seed = 0x0922_8000 + kv_len as u64;
+        let (len, p) = (rows, kv_len - rows);
+        let [q_rows, k, v] = windowed_inputs(rows, kv_len, seed);
+        let q = &q_rows[(len - 1) * GQH * HD..][..GQH * HD];
+        let table = shuffled_blocks(seed);
+        let need = kv_len.div_ceil(BS);
+        let (kc, vc) = dec_caches(&device, (&k, &v), (kv_len, GKVH), &table, POISON);
+        let decode = attend_decode_windowed(&device, q, (&kc, &vc), &table[..need], kv_len, w)
+            .expect("attn_decode_windowed_bf16");
+        let prefill = attend_windowed(
+            &device,
+            &q_rows,
+            (&kc, &vc),
+            &table[..need],
+            (p, len, rows),
+            w,
+        )
+        .expect("attn_prefill_windowed_bf16");
+        let prefill = &prefill[(len - 1) * GQH * HD..][..GQH * HD];
+        let (kr, vr) = (
+            gather_paged(&kc.download().expect("K"), &table, kv_len, (GKVH, BS, HD)),
+            gather_paged(&vc.download().expect("V"), &table, kv_len, (GKVH, BS, HD)),
+        );
+        let (refs, score_max) = windowed_reference(q, (&kr, &vr), (kv_len - 1, 1), WINDOW);
+        let (dc, pc) = (
+            compare_attention(&decode, &refs, GQH * HD),
+            compare_attention(prefill, &refs, GQH * HD),
+        );
+        let (mut worst, mut ulps) = (0.0f64, 0u32);
+        for ((&d, &f), &(r, pv)) in decode.iter().zip(prefill).zip(&refs) {
+            let diff = f64::from((bf16::from_bits(d).to_f32() - bf16::from_bits(f).to_f32()).abs());
+            worst = worst.max(diff / (2.0 * attention_bound(r, pv)));
+            ulps = ulps.max(ulps_apart(d, f));
+        }
+        let mismatched = mismatched_bits(&decode, prefill);
+        let ok = dc.pass() && pc.pass() && score_max <= ATTN_SCORE_MAX;
+        eprintln!(
+            "windowed decode vs prefill row {} (P={p}, L={len}) kv_len={kv_len} W={WINDOW}: \
+             mismatched_bits={mismatched}/{} max_ulps={ulps} worst_ratio_to_2x_bound={worst:.4} \
+             (printed, not gated: #859) decode_vs_f64: {} prefill_row_vs_f64: {} \
+             score_max={score_max:.4} {}",
+            len - 1,
+            decode.len(),
+            dc.line(),
+            pc.line(),
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(
+        pass,
+        "a windowed decode or its prefill row is out of the f64 bound"
+    );
 }
