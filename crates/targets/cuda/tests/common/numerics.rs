@@ -912,3 +912,105 @@ pub fn bf16_in(len: usize, seed: u64, (lo, hi): (f64, f64)) -> Vec<u16> {
         .map(|v| bf16::from_f32(v).to_bits())
         .collect()
 }
+
+// ── Gemma 4's row maps (soft-cap, GeGLU) ───────────────────────────
+//
+// Each reference is f64 from the same bf16 inputs. Under `--use_fast_math` (build.rs) the CUDA
+// programming guide's table of functions `--use_fast_math` affects maps `tanhf` to `__tanhf`
+// (maximum relative error 2⁻¹¹), so the bounds are #921's `tanh.approx` ones: the soft-cap
+// `(2⁻⁸ + 2⁻¹⁰)·|r| + 2⁻²⁴`, the GeGLU `2⁻⁸·|r| + 2⁻¹⁰·|g·u| + 2⁻²⁴` (the middle term is the tanh
+// error, carried by `0.5·g·u`). The GKE SASS (`MUFU.TANH`) confirms which tanh ran.
+
+/// The soft-cap's relative bound, `2⁻⁸ + 2⁻¹⁰`.
+pub const SOFT_CAP_REL: f64 = 1.0 / 256.0 + 1.0 / 1024.0;
+/// The GeGLU's tanh term, `2⁻¹⁰` of `|g·u|`.
+pub const GELU_TANH: f64 = 1.0 / 1024.0;
+
+/// `cap · tanh(x / cap)` per element, in f64.
+pub fn soft_cap_reference(x: &[u16], cap: f64) -> Vec<f64> {
+    widen(x).iter().map(|v| cap * (v / cap).tanh()).collect()
+}
+
+/// The soft-cap's bound on an element whose reference is `r`.
+pub fn soft_cap_bound(r: f64) -> f64 {
+    r.abs() * SOFT_CAP_REL + ROW_ABS
+}
+
+/// `0.5·g·(1 + tanh(√(2/π)·(g + 0.044715·g³)))·u` per element, in f64.
+pub fn gelu_mul_reference(gate: &[u16], up: &[u16]) -> Vec<f64> {
+    let c = (2.0 / std::f64::consts::PI).sqrt();
+    widen(gate)
+        .iter()
+        .zip(widen(up))
+        .map(|(g, u)| 0.5 * g * (1.0 + (c * (g + 0.044715 * g * g * g)).tanh()) * u)
+        .collect()
+}
+
+/// The GeGLU's bound on an element whose reference is `r`, from inputs `g` and `u`.
+pub fn gelu_mul_bound(r: f64, g: f64, u: f64) -> f64 {
+    r.abs() * ROW_REL + (g * u).abs() * GELU_TANH + ROW_ABS
+}
+
+/// Compare `gpu` (`[rows, cols]` bf16 bits) with `refs` under `bound(index, ref)`. A NaN or Inf in
+/// the GPU output fails.
+pub fn compare_rows_with(
+    gpu: &[u16],
+    refs: &[f64],
+    cols: usize,
+    bound: impl Fn(usize, f64) -> f64,
+) -> Comparison {
+    assert_eq!(
+        gpu.len(),
+        refs.len(),
+        "the GPU output and the reference differ in length"
+    );
+    let (mut max_err, mut sum_err, mut bad) = (0.0f64, 0.0f64, 0usize);
+    let (mut worst, mut worst_ratio) = ((0, 0, 0.0f64, 0.0f64, 0.0f64), -1.0f64);
+    for (idx, (&bits, &r)) in gpu.iter().zip(refs).enumerate() {
+        let g = f64::from(bf16::from_bits(bits).to_f32());
+        let b = bound(idx, r);
+        let err = (g - r).abs();
+        if !(g.is_finite() && err <= b) {
+            bad += 1;
+        }
+        let ratio = if g.is_finite() {
+            err / b
+        } else {
+            f64::INFINITY
+        };
+        if ratio > worst_ratio {
+            worst_ratio = ratio;
+            worst = (idx / cols, idx % cols, g, r, b);
+        }
+        if g.is_finite() {
+            max_err = max_err.max(err);
+            sum_err += err;
+        }
+    }
+    Comparison {
+        max_abs_err: max_err,
+        mean_abs_err: sum_err / gpu.len().max(1) as f64,
+        worst,
+        out_of_bound: bad,
+    }
+}
+
+/// A self-check's fraction: of the elements whose bf16 rounding `wrong` changes from `right`'s,
+/// the share `gpu` is out of `bound` against `wrong`. `(fraction, changed)`.
+pub fn out_of_bound_fraction(
+    gpu: &[u16],
+    (right, wrong): (&[f64], &[f64]),
+    bound: impl Fn(usize, f64) -> f64,
+) -> (f64, usize) {
+    let (mut changed, mut out) = (0usize, 0usize);
+    for (i, ((&g, &r), &w)) in gpu.iter().zip(right).zip(wrong).enumerate() {
+        if bf16::from_f64(r).to_bits() == bf16::from_f64(w).to_bits() {
+            continue;
+        }
+        changed += 1;
+        let g = f64::from(bf16::from_bits(g).to_f32());
+        let err = (g - w).abs();
+        out += usize::from(err.is_nan() || err > bound(i, w));
+    }
+    (out as f64 / changed.max(1) as f64, changed)
+}
