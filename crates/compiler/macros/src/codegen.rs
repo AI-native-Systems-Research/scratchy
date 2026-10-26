@@ -7564,6 +7564,7 @@ fn metal_off_tape_tokens(
         argmax,
         argmax_dual_write,
         grammar_mask,
+        ban_after,
         sampler,
         chain_advance,
         mtp_chain,
@@ -7638,6 +7639,7 @@ fn metal_off_tape_tokens(
                 argmax: #argmax,
                 argmax_dual_write: #argmax_dual_write,
                 grammar_mask: #grammar_mask,
+                ban_after: #ban_after,
                 sampler: [#(#sampler),*],
                 chain_advance: #chain_advance,
                 mtp_chain: #mtp_chain,
@@ -16011,9 +16013,9 @@ pub fn emit_model(
             // ownership of the worker's arena.
             with_forward_inputs(ctx, num_tokens, |inputs| {
                 let rows = #terminal_rows;
-                // Adapter: pool's tail receives `(encoder, worker, bucket_idx)`
-                // and returns `Result<(), ForwardError>`. The public hook
-                // is `(encoder, logits_buf, total_n, vocab) -> Result<(), String>`.
+                // Adapter: pool's tail receives `(encoder, worker, runtime, bucket_idx)`
+                // and returns `Result<(), ForwardError>`. The public hook is
+                // `(encoder, logits_buf, hidden_buf, input_ids, total_n, vocab) -> Result<(), String>`.
                 // Resolve logits + dims from the worker's arena and the
                 // canonical's compile-time vocab; map error variants.
                 let tail_adapter = followup.map(|f| {
@@ -16021,6 +16023,7 @@ pub fn emit_model(
                               dyn ::scratchy_forward_compiler::metal_followup_reexports::MTL4ComputeCommandEncoder,
                           >,
                           worker: &::scratchy_target_metal::interpreter::metal::MetalWorker<Weights>,
+                          runtime: &::scratchy_target_metal::interpreter::metal::RuntimeBindings,
                           bucket_idx: usize|
                           -> ::core::result::Result<
                         (),
@@ -16030,7 +16033,7 @@ pub fn emit_model(
                         let logits_buf = &worker.arena[spec.terminal_slot as usize];
                         let hidden_buf = &worker.arena[spec.backbone_slot as usize];
                         let vocab = METAL_VOCAB_SIZE as u32;
-                        f(enc, logits_buf, hidden_buf, rows as u32, vocab).map_err(
+                        f(enc, logits_buf, hidden_buf, &runtime.input_ids, rows as u32, vocab).map_err(
                             ::scratchy_target_metal::interpreter::metal::ForwardError::Followup,
                         )
                     }

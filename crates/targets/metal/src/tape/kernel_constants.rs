@@ -1396,6 +1396,17 @@ impl From<GrammarMaskConstants> for Vec<ConstantValue> {
     }
 }
 
+/// `ban_after.metal` slot 0: the logits per row.
+pub struct BanAfterConstants {
+    pub vocab: crate::tape::ids::LogitsWidth,
+}
+
+impl From<BanAfterConstants> for Vec<ConstantValue> {
+    fn from(c: BanAfterConstants) -> Self {
+        vec![ConstantValue::uint(ConstSlot(0), c.vocab.get())]
+    }
+}
+
 /// `sampling.metal`: slot 0 the logits per row, slot 1 whether the telemetry spill is compiled
 /// in (`sample_softmax_materialize` / `sample_finalize` only).
 pub struct SamplerConstants {

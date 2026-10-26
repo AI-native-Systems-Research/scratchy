@@ -225,6 +225,7 @@ pub mod steel_paged {
 
 pub mod allocator;
 pub mod argmax;
+pub mod ban_after;
 pub mod chain_advance;
 pub mod cpu_reference;
 pub mod device;

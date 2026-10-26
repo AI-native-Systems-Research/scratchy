@@ -458,6 +458,8 @@ impl std::error::Error for GpuExecutionFailed {}
 ///     step samples, at its front, in order;
 ///   - the final (post-norm) hidden states, `[num_tokens, hidden]` (the
 ///     bucket's backbone slot);
+///   - the forward's `input_ids`, `[num_tokens]` u32: what it read, an earlier
+///     step's tokens included where the device wrote them in;
 ///   - `total_n` (the sampled rows: the logits row count) and `vocab` (column count).
 ///
 /// MTL4 only.
@@ -465,6 +467,7 @@ impl std::error::Error for GpuExecutionFailed {}
 pub type MetalForwardFollowup<'a> = Box<
     dyn FnOnce(
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+            &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
             u32,

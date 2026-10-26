@@ -1140,6 +1140,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     fn run_bucket_mtl4_with_tail<F>(
         &self,
         worker: &MetalWorker<W>,
+        runtime: &RuntimeBindings,
         bucket_idx: usize,
         num_tokens: usize,
         num_seqs: u32,
@@ -1153,6 +1154,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         F: FnOnce(
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
             &MetalWorker<W>,
+            &RuntimeBindings,
             usize,
         ) -> Result<(), ForwardError>,
     {
@@ -1219,7 +1221,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             // runs on the SAME MTL4 compute encoder as the forward —
             // forward + tail share one CB, one commit, one host wait.
             if let Some(t) = tail {
-                t(enc, worker, bucket_idx)?;
+                t(enc, worker, runtime, bucket_idx)?;
             }
             Ok(())
         };
@@ -1471,6 +1473,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         self.forward_with_tail::<R, fn(
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
             &MetalWorker<W>,
+            &RuntimeBindings,
             usize,
         ) -> Result<(), ForwardError>>(inputs, with_output, None)
     }
@@ -1480,7 +1483,9 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     /// AFTER the bucket's dispatches and BEFORE `endEncoding`. Lets
     /// callers append additional dispatches (e.g. argmax sampling)
     /// onto the same CB so the whole step lives in one command
-    /// buffer with one commit and one host wait.
+    /// buffer with one commit and one host wait. The hook gets the
+    /// worker's runtime inputs too: what the forward read (its
+    /// `input_ids`, an earlier step's tokens written in on the device).
     pub fn forward_with_tail<R, F>(
         &self,
         inputs: &ForwardInputs<'_>,
@@ -1491,6 +1496,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         F: FnOnce(
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
             &MetalWorker<W>,
+            &RuntimeBindings,
             usize,
         ) -> Result<(), ForwardError>,
     {
@@ -1516,6 +1522,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         );
         self.run_bucket_mtl4_with_tail(
             &guard.worker,
+            &guard.runtime,
             bucket_idx,
             inputs.num_tokens as usize,
             num_seqs,

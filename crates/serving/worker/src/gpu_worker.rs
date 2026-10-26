@@ -299,6 +299,12 @@ pub struct MetalWorker {
     argmax_kernels: Option<scratchy_target_metal::argmax::ArgmaxKernels>,
     /// The argmax baked for the draft model's logits (its forwards and chain).
     draft_argmax_kernels: Option<scratchy_target_metal::argmax::ArgmaxKernels>,
+    /// A bad word's ban, read off the forward's input tokens on the device. Built with
+    /// `argmax_kernels`.
+    ban_after_kernel: Option<scratchy_target_metal::ban_after::BanAfterKernel>,
+    /// This step's bans ([`MetalWorker::step_bans`]), built in `execute_model` and taken by the
+    /// target's forward, which writes them into its argmax slot and runs them before argmax.
+    pending_bans: Vec<scratchy_target_metal::ban_after::BanJob>,
     /// A multi-token-prediction head drafting over a prefix of its target's vocabulary: the rest
     /// of the target's lm_head, for the steps that draft over all of it ([`vocab_suffix_draft`]).
     draft_vocab_suffix: Option<
@@ -1084,6 +1090,8 @@ impl MetalWorker {
             draft_kv_cache: None,
             argmax_kernels: None,
             draft_argmax_kernels: None,
+            ban_after_kernel: None,
+            pending_bans: Vec::new(),
             draft_vocab_suffix: None,
             mtp_drafter: None,
             sampler_kernels: None,
@@ -1145,6 +1153,19 @@ impl MetalWorker {
     /// Expose the model directory after load_model.
     pub fn model_dir(&self) -> Option<&Path> {
         self.model_dir.as_deref()
+    }
+
+    /// This step's bad-word bans ([`step_bans`]), from each request's sampling and history.
+    fn step_bans(
+        &self,
+        prepared: &crate::input_batch::PreparedInputs,
+        sampled_rows: &::scratchy_serving_engine::spec_decode::SampledRows,
+    ) -> Vec<scratchy_target_metal::ban_after::BanJob> {
+        step_bans(prepared, sampled_rows, |req_id| {
+            let params = self.sampling_params_map.get(req_id)?;
+            let generated = self.input_batch.history(req_id).1;
+            Some((params, generated, self.input_batch.num_in_flight(req_id)))
+        })
     }
 
     /// Lazily build the shared llguidance parser factory from the model's
@@ -2066,18 +2087,19 @@ impl MetalWorker {
     /// Whether this step can be committed without waiting for it: its rows
     /// pick their tokens on the GPU from the logits alone, so nothing on the
     /// host needs its tokens before the next step is queued. Penalties (the
-    /// token history), grammar, a bad word banned after the tokens before it,
-    /// speculative decoding, pooling, multimodal input, a draft model and live
-    /// sampler telemetry all do.
+    /// token history), grammar, a bad word that reads back past a row's input
+    /// token, speculative decoding, pooling, multimodal input, a draft model
+    /// and live sampler telemetry all do. A one- or two-token bad word does not:
+    /// its ban reads the row's input token on the device (`step_bans`).
     fn deferrable(&self, sched: &SchedulerOutput) -> bool {
-        #[cfg(feature = "guided-decoding")]
-        let constrained = |req_id: &String| {
-            self.grammar_states.contains_key(req_id)
-                || (self.sampling_params_map.get(req_id))
-                    .is_some_and(SamplingParams::bans_after_tokens)
+        let bans_on_host = |req_id: &String| {
+            (self.sampling_params_map.get(req_id)).is_some_and(SamplingParams::bans_on_host)
         };
+        #[cfg(feature = "guided-decoding")]
+        let constrained =
+            |req_id: &String| self.grammar_states.contains_key(req_id) || bans_on_host(req_id);
         #[cfg(not(feature = "guided-decoding"))]
-        let constrained = |_: &String| false;
+        let constrained = bans_on_host;
         #[cfg(feature = "sampler-telemetry")]
         let telemetry =
             scratchy_core_common::sampler_telemetry::SamplerTelemetry::global().is_enabled();
@@ -3982,14 +4004,49 @@ impl MetalWorker {
         // one host wait. Pre-6a took the unfused path (separate dispatch
         // + commit + wait + readback) for 5.2a simplicity; this re-folds
         // it. Per call: 2 commit+waits → 1.
+        // The target's bans ride its forward; a draft's forward bans nothing.
+        let bans = match model {
+            ModelHandle::TARGET => std::mem::take(&mut self.pending_bans),
+            _ => Vec::new(),
+        };
         let argmax = free_argmax_slot(
             &mut self.argmax_slots,
             &mtl_device,
             &residency,
             req.num_tokens,
+            bans.len(),
         );
         let argmax_out = (*argmax.out).clone();
         let consts_buf = (*argmax.consts).clone();
+        // Written now, while no command buffer reads this slot: a free slot is one no step in
+        // flight holds.
+        let ban_ctx = (self.ban_after_kernel.as_ref())
+            .filter(|_| !bans.is_empty())
+            .map(|kernel| {
+                use ::objc2_metal::{MTL4ArgumentTableDescriptor, MTLBuffer, MTLDevice};
+                let words: Vec<u32> = std::iter::once(bans.len() as u32)
+                    .chain(bans.iter().flat_map(|job| job.words()))
+                    .collect();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        words.as_ptr(),
+                        argmax.bans.contents().as_ptr() as *mut u32,
+                        words.len(),
+                    );
+                }
+                let desc = MTL4ArgumentTableDescriptor::new();
+                desc.setMaxBufferBindCount(3);
+                let table = mtl_device
+                    .newArgumentTableWithDescriptor_error(&desc)
+                    .expect("ban_after arg_table alloc returned nil");
+                let kernel = kernel as *const scratchy_target_metal::ban_after::BanAfterKernel;
+                (
+                    table,
+                    (*argmax.bans).clone(),
+                    bans.len() as u32,
+                    kernel as usize,
+                )
+            });
         let head = match (then, head_device) {
             (Some(passes), Some(device)) => {
                 let model = (self.draft_model.as_deref())
@@ -4148,6 +4205,7 @@ impl MetalWorker {
             move |enc,
                   logits_buf,
                   hidden_buf,
+                  input_ids_buf,
                   total_n_actual,
                   vocab_actual|
                   -> Result<(), String> {
@@ -4168,6 +4226,26 @@ impl MetalWorker {
                     arg_table_for_closure.setAddress_atIndex(logits_addr, 0);
                     arg_table_for_closure.setAddress_atIndex(out_addr, 1);
                     arg_table_for_closure.setAddress_atIndex(consts_addr, 2);
+                }
+                // ── Bad-word bans ─────────────────────────────────────────
+                // Before argmax and the sampler, as the grammar mask: each
+                // job reads its row's input token in the forward's own
+                // `input_ids`, where an earlier step's token is by now.
+                if let Some((ref table, ref jobs, count, kernel_addr)) = ban_ctx {
+                    unsafe {
+                        table.setAddress_atIndex(logits_addr, 0);
+                        table.setAddress_atIndex(input_ids_buf.gpuAddress(), 1);
+                        table.setAddress_atIndex(jobs.gpuAddress(), 2);
+                    }
+                    // SAFETY: as `argmax_kernels_addr`: borrowed from `self`, which outlives the
+                    // synchronous forward call the closure runs in.
+                    let kernel = unsafe {
+                        &*(kernel_addr as *const scratchy_target_metal::ban_after::BanAfterKernel)
+                    };
+                    scratchy_target_metal::ban_after::encode_ban_after_into_mtl4(
+                        kernel, enc, table, count,
+                    )
+                    .map_err(|e| format!("encode_ban_after: {e:?}"))?;
                 }
                 // ── Grammar mask (constrained / guided decoding) ─────────
                 // Runs on THIS encoder before argmax: forces every token
@@ -5053,6 +5131,10 @@ impl Drop for ResidencyPanicGuard {
 struct ArgmaxSlot {
     out: scratchy_target_metal::residency::Pinned,
     consts: scratchy_target_metal::residency::Pinned,
+    /// The step's bad-word bans ([`scratchy_target_metal::ban_after`]): their count, then each
+    /// job's words. The slot's, so a step still on the device keeps reading its own while the next
+    /// is staged — a buffer every step shared would be rewritten under it.
+    bans: scratchy_target_metal::residency::Pinned,
 }
 
 // SAFETY: as for `MetalWorker`, the markers objc2's buffers lack. The host reads `out` only once the
@@ -5062,17 +5144,21 @@ unsafe impl Send for ArgmaxSlot {}
 #[cfg(feature = "metal")]
 unsafe impl Sync for ArgmaxSlot {}
 
-/// One of `slots` nothing else holds, with room for `rows` tokens — grown, or added, if none has.
+/// One of `slots` nothing else holds, with room for `rows` tokens and `bans` ban jobs — grown, or
+/// added, if none has.
 #[cfg(feature = "metal")]
 fn free_argmax_slot(
     slots: &mut Vec<Arc<ArgmaxSlot>>,
     device: &scratchy_target_metal::mtl4_dispatch::Device,
     residency: &scratchy_target_metal::residency::MetalResidencySet,
     rows: usize,
+    bans: usize,
 ) -> Arc<ArgmaxSlot> {
     let bytes = rows.max(1) * size_of::<u32>();
+    let ban_bytes = (1 + bans * scratchy_target_metal::ban_after::JOB_WORDS) * size_of::<u32>();
     let free = slots.iter().position(|s| Arc::strong_count(s) == 1);
-    if let Some(i) = free.filter(|&i| slots[i].out.length() >= bytes) {
+    let fits = |s: &ArgmaxSlot| s.out.length() >= bytes && s.bans.length() >= ban_bytes;
+    if let Some(i) = free.filter(|&i| fits(&slots[i])) {
         return Arc::clone(&slots[i]);
     }
     let pin = |bytes| {
@@ -5083,6 +5169,7 @@ fn free_argmax_slot(
     let slot = Arc::new(ArgmaxSlot {
         out: pin(bytes),
         consts: pin(size_of::<u32>()),
+        bans: pin(ban_bytes),
     });
     match free {
         Some(i) => slots[i] = Arc::clone(&slot),
@@ -5267,6 +5354,55 @@ fn sampled(
         argmax.out.length() / size_of::<u32>(),
     );
     Ok(rows.map(|row| out[row]).collect())
+}
+
+/// A step's bad-word bans, one job a sampled row and bad word ([`SamplingParams::bans`]): its
+/// logits row, its step row in `input_ids` — the row's own input token, a decode row's last token
+/// or a verify row's draft before it — and what that token must be for the ban to fire. The device
+/// reads that token, so a step whose tokens are still on the device bans as one the host waited
+/// for. A chunk that samples nothing bans nothing; a prompt's last chunk reads the prompt for no
+/// two-token word, as vLLM bans after generated tokens alone. A longer word reads back past the
+/// input token on the host, which then holds every token ([`SamplingParams::bans_on_host`],
+/// `deferrable`). `request` gives a request's sampling, its generated tokens on the host, and how
+/// many more are still on the device.
+#[cfg(feature = "metal")]
+fn step_bans<'r>(
+    prepared: &crate::input_batch::PreparedInputs,
+    sampled_rows: &::scratchy_serving_engine::spec_decode::SampledRows,
+    request: impl Fn(&str) -> Option<(&'r SamplingParams, &'r [u32], usize)>,
+) -> Vec<scratchy_target_metal::ban_after::BanJob> {
+    use scratchy_core_common::sampling::Ban;
+    use scratchy_target_metal::ban_after::{ALWAYS, BanJob};
+    let mut jobs = Vec::new();
+    for (i, slice) in prepared.req_inputs.iter().enumerate() {
+        let Some((params, generated, in_flight)) = (request(&slice.req_id))
+            .filter(|(p, ..)| p.bad_words_token_ids.is_some() && slice.emits_token)
+        else {
+            continue;
+        };
+        let drafts = &slice.spec_token_ids;
+        // Sampled row `r` of the sequence is step row `first + r`: its input token there is the
+        // token just before the one it samples.
+        let first = slice.token_start + slice.token_count - sampled_rows.of_seq(i).len();
+        for (r, row) in sampled_rows.of_seq(i).enumerate() {
+            // Whether the token before the row is generated: a draft, or the last generated one
+            // (on the host or still on the device), not the prompt's last.
+            let input_generated = r > 0 || !generated.is_empty() || in_flight > 0;
+            for ban in params.bans(generated, &drafts[..r], input_generated) {
+                let (after, banned) = match ban {
+                    Ban::Always(banned) => (ALWAYS, banned),
+                    Ban::After { after, banned } => (after, banned),
+                };
+                jobs.push(BanJob {
+                    row: row as u32,
+                    input: (first + r) as u32,
+                    after,
+                    banned,
+                });
+            }
+        }
+    }
+    jobs
 }
 
 /// Grow `slot` to a pinned, zeroed buffer of at least `bytes`, replacing (and
@@ -5706,6 +5842,10 @@ impl Worker for MetalWorker {
         self.select_rows_kernel =
             scratchy_target_metal::select_rows::SelectRowsKernel::new(&gpu_device.device, off_tape)
                 .map_err(|e| ExecutorError::WorkerInit(format!("select_rows compile: {e:?}")))?;
+        self.ban_after_kernel = Some(
+            scratchy_target_metal::ban_after::BanAfterKernel::new(&gpu_device.device, off_tape)
+                .map_err(|e| ExecutorError::WorkerInit(format!("ban_after compile: {e:?}")))?,
+        );
 
         self.gpu_device = Some(gpu_device);
         self.model = Some(model);
@@ -7018,6 +7158,7 @@ impl Worker for MetalWorker {
         .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
         let req_ids_in_order: Vec<String> = attn.req_ids.clone();
         let q_lens: Vec<usize> = attn.q_lens.clone();
+        self.pending_bans = self.step_bans(&prepared, &sampled_rows);
 
         // ── Constrained / guided decoding: gather this step's grammar
         // allow-masks ───────────────────────────────────────────────────
@@ -7030,22 +7171,10 @@ impl Worker for MetalWorker {
         // is constrained. Speculative-verify rows are excluded: grammar needs
         // a host `advance()` between every token, which the K-row verify can't
         // provide, so a grammar request must not also carry spec drafts.
-        //
-        // ⭐ A BAD WORD'S BAN RIDES THE SAME MASK (#429): a request whose bad word's other tokens
-        // end what it has generated may not sample that word's last token. Its row's bitset is
-        // every token but those (or the grammar's allow-set without them). The ban needs the
-        // tokens before it on the host, so such a request's steps are never deferred
-        // (`deferrable`) nor pipelined (the engine's `mark_pipeline`). A verify step's row `r`
-        // reads its drafts before `r` after the generated tokens, so each row has a ban of its
-        // own; a grammar still leaves verify rows unmasked.
         #[cfg(feature = "guided-decoding")]
         {
             self.grammar_pending = None;
-            let bans = |req_id: &String| {
-                (self.sampling_params_map.get(req_id))
-                    .is_some_and(|p| p.bad_words_token_ids.is_some())
-            };
-            if !self.grammar_states.is_empty() || req_ids_in_order.iter().any(bans) {
+            if !self.grammar_states.is_empty() {
                 let vocab = self.model.as_deref().map(|m| m.vocab_size()).unwrap_or(0) as u32;
                 if vocab > 0 {
                     let mut rows: Vec<u32> = Vec::new();
@@ -7056,42 +7185,15 @@ impl Worker for MetalWorker {
                             continue;
                         }
                         // Speculative verify batch → unsupported with grammar.
-                        let drafts = &prepared.req_inputs[i].spec_token_ids;
-                        if !drafts.is_empty() {
-                            let Some(params) = self.sampling_params_map.get(req_id.as_str()) else {
-                                continue;
-                            };
-                            let generated = self.input_batch.history(req_id).1;
-                            for (r, row) in sampled_rows.of_seq(i).enumerate() {
-                                let before = [generated, &drafts[..r]].concat();
-                                let banned = params.banned_after(&before);
-                                if banned.is_empty() {
-                                    continue;
-                                }
-                                let allowed: Vec<u32> =
-                                    (0..vocab).filter(|t| !banned.contains(t)).collect();
-                                rows.push(row as u32);
-                                scratchy_target_metal::grammar_mask::push_allow_bitset_row(
-                                    &mut allow_bits,
-                                    &allowed,
-                                    vocab,
-                                );
-                            }
+                        if !prepared.req_inputs[i].spec_token_ids.is_empty() {
                             continue;
                         }
-                        let banned = (self.sampling_params_map.get(req_id.as_str()))
-                            .map(|p| p.banned_after(self.input_batch.history(req_id).1))
-                            .unwrap_or_default();
-                        // `None` => no grammar, or a terminated one: every token is allowed.
-                        let allowed = (self.grammar_states.get_mut(req_id))
-                            .and_then(|guide| guide.allowed_tokens());
-                        let allowed = match (allowed, banned.is_empty()) {
-                            (None, true) => continue,
-                            (Some(allowed), true) => allowed,
-                            (allowed, false) => (allowed.unwrap_or_else(|| (0..vocab).collect()))
-                                .into_iter()
-                                .filter(|t| !banned.contains(t))
-                                .collect(),
+                        let Some(guide) = self.grammar_states.get_mut(req_id) else {
+                            continue;
+                        };
+                        // `None` => grammar terminated; leave the row unmasked.
+                        let Some(allowed) = guide.allowed_tokens() else {
+                            continue;
                         };
                         rows.push(sampled_rows.last_of(i) as u32);
                         scratchy_target_metal::grammar_mask::push_allow_bitset_row(
@@ -8150,6 +8252,8 @@ impl Worker for MetalWorker {
         self.kv_cache = None; // drops the file-backed store(s) → Drop msyncs their codes
         self.model = None;
         self.argmax_kernels = None;
+        self.ban_after_kernel = None;
+        self.pending_bans.clear();
         self.draft_vocab_suffix = None;
         self.argmax_slots.clear();
         #[cfg(feature = "guided-decoding")]
@@ -8310,6 +8414,100 @@ inventory::submit!(&MetalWorkerFactory as &dyn crate::worker_factory::WorkerFact
 #[cfg(all(test, feature = "metal"))]
 mod tests {
     use super::StepSlotMapping;
+
+    /// A step of four requests: a decode (step row 0), a verify of two drafts (rows 1..=3), a
+    /// prompt's last chunk (rows 4..=6) and a chunk that samples nothing (rows 7..=8), each with the
+    /// bad words `[7]` and `[101, 100]`. The decode's and the verify's rows ban 7 always and 100
+    /// after their own input token is 101; the prompt's last chunk bans 7 alone, its input being
+    /// the prompt's last token; the chunk that samples nothing bans nothing. Each job names its
+    /// logits row and the step row of its input token.
+    #[test]
+    fn a_step_bans_each_sampled_row_after_its_own_input_token() {
+        use crate::input_batch::{PreparedInputs, ReqSlice};
+        use scratchy_core_common::SamplingParams;
+        use scratchy_target_metal::ban_after::{ALWAYS, BanJob};
+        let params = SamplingParams {
+            bad_words_token_ids: Some(vec![vec![7], vec![101, 100]]),
+            ..Default::default()
+        };
+        let slice =
+            |req_id: &str, token_start, token_count, drafts: Vec<u32>, emits_token| ReqSlice {
+                req_id: req_id.to_string(),
+                token_start,
+                token_count,
+                spec_token_ids: drafts,
+                emits_token,
+            };
+        let req_inputs = vec![
+            slice("decode", 0, 1, vec![], true),
+            slice("verify", 1, 3, vec![101, 5], true),
+            slice("prompt", 4, 3, vec![], true),
+            slice("chunk", 7, 2, vec![], false),
+        ];
+        let cu = [0u32, 1, 4, 7, 9];
+        let sampled = ::scratchy_serving_engine::spec_decode::SampledRows::of(&cu, |i| i == 1)
+            .expect("no empty sequence");
+        let attn = scratchy_core_model::attention_metadata::AttentionMetadata::new(
+            4,
+            9,
+            cu.iter().map(|&c| c as usize).collect(),
+            vec![1, 3, 3, 2],
+            vec![9, 12, 3, 2],
+            vec![vec![]; 4],
+            vec![8, 9, 0, 0],
+            vec![false, false, true, true],
+            ["decode", "verify", "prompt", "chunk"]
+                .map(String::from)
+                .to_vec(),
+        );
+        let prepared = PreparedInputs {
+            req_inputs,
+            flat_token_ids: vec![0; 9],
+            flat_positions: vec![0; 9],
+            attn_meta: attn,
+            pending: Vec::new(),
+        };
+        // The decode's last generated token is still on the device; the verify's are on the
+        // host; the prompt has generated nothing.
+        let generated: [(&str, &[u32], usize); 4] = [
+            ("decode", &[], 1),
+            ("verify", &[3, 4], 0),
+            ("prompt", &[], 0),
+            ("chunk", &[], 0),
+        ];
+        let jobs = super::step_bans(&prepared, &sampled, |req_id| {
+            let &(_, tokens, in_flight) = generated.iter().find(|(id, ..)| *id == req_id)?;
+            Some((&params, tokens, in_flight))
+        });
+        let both = |row, input| {
+            [
+                BanJob {
+                    row,
+                    input,
+                    after: ALWAYS,
+                    banned: 7,
+                },
+                BanJob {
+                    row,
+                    input,
+                    after: 101,
+                    banned: 100,
+                },
+            ]
+        };
+        // Sampled rows: the decode's 0, the verify's 1..=3, the prompt's 4. The prompt's last
+        // chunk ends at step row 6, its input the prompt's last token: the always-ban alone.
+        let mut want: Vec<BanJob> = Vec::new();
+        want.extend(both(0, 0));
+        (1..=3).for_each(|r| want.extend(both(r, r)));
+        want.push(BanJob {
+            row: 4,
+            input: 6,
+            after: ALWAYS,
+            banned: 7,
+        });
+        assert_eq!(jobs, want);
+    }
 
     /// A slot two sequences write in one step keeps its first writer; the later
     /// write becomes the skip sentinel. A span (unrotated) write of the same

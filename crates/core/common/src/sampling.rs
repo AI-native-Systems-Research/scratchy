@@ -375,22 +375,31 @@ impl SamplingParams {
         !penalty_free
     }
 
-    /// Whether which tokens a step may sample depends on the tokens before it: a bad word of
-    /// more than one token bans its last only after the rest ([`Self::banned_after`]). The host
-    /// reads those tokens to build the ban, so such a request's steps are neither deferred nor
-    /// pipelined, leaving their tokens on the device.
-    pub fn bans_after_tokens(&self) -> bool {
-        (self.bad_words_token_ids.iter().flatten()).any(|word| word.len() > 1)
+    /// Whether a bad word's ban needs the host to read the tokens before a row: a bad word longer
+    /// than two tokens. A one-token word bans everywhere, and a two-token word's first token is
+    /// the row's own input token, which a device reads where it is ([`Ban::After`]); a longer word
+    /// reads further back, so a worker must have every token on the host — it neither defers nor
+    /// pipelines such a request's steps.
+    pub fn bans_on_host(&self) -> bool {
+        (self.bad_words_token_ids.iter().flatten()).any(|word| word.len() > 2)
     }
 
-    /// The tokens the next sampled token must not be, after `generated` (the tokens the request
-    /// has generated so far): the last token of each bad word whose other tokens end `generated`
-    /// — a one-token bad word always. vLLM's `bad_words`, read against the generated tokens alone.
-    pub fn banned_after(&self, generated: &[u32]) -> Vec<u32> {
+    /// The bans of the next token after `generated` then `drafts` (the tokens a request has
+    /// generated, then the drafts a verify row reads before it), vLLM's `bad_words` read against
+    /// the generated tokens alone: a bad word's last token is banned where its other tokens end
+    /// them. `input_generated` says whether the row's own input token — the one just before it — is
+    /// a generated token or draft, not the prompt's last: a two-token word's ban is then the
+    /// device's to read ([`Ban::After`]), since that token may not be on the host yet. A longer
+    /// word is read here, so `generated` must hold every generated token ([`Self::bans_on_host`]).
+    pub fn bans(&self, generated: &[u32], drafts: &[u32], input_generated: bool) -> Vec<Ban> {
         (self.bad_words_token_ids.iter().flatten())
-            .filter_map(|word| {
-                let (&last, prefix) = word.split_last()?;
-                generated.ends_with(prefix).then_some(last)
+            .filter_map(|word| match word.as_slice() {
+                [] => None,
+                &[banned] => Some(Ban::Always(banned)),
+                &[after, banned] => input_generated.then_some(Ban::After { after, banned }),
+                [prefix @ .., banned] => {
+                    ends_with(generated, drafts, prefix).then_some(Ban::Always(*banned))
+                }
             })
             .collect()
     }
@@ -503,6 +512,27 @@ impl SamplingParams {
     }
 }
 
+/// One ban of a sampled row's next token ([`SamplingParams::bans`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ban {
+    /// `banned`, whatever the token before it.
+    Always(u32),
+    /// `banned`, where the row's own input token is `after`.
+    After { after: u32, banned: u32 },
+}
+
+/// Whether `a` then `b`, as one sequence, ends with `suffix`.
+fn ends_with(a: &[u32], b: &[u32], suffix: &[u32]) -> bool {
+    match suffix.len().checked_sub(b.len()) {
+        // The suffix reaches back past `b` into `a`.
+        Some(in_a) => {
+            let (from_a, from_b) = suffix.split_at(in_a);
+            a.ends_with(from_a) && b == from_b
+        }
+        None => b.ends_with(suffix),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Logprobs types
 // ---------------------------------------------------------------------------
@@ -537,38 +567,62 @@ pub struct LogprobsOutput {
 mod tests {
     use super::*;
 
-    /// A bad word bans its last token where its other tokens end what the request has generated;
-    /// a one-token bad word bans its token everywhere, an empty one nothing.
+    /// A bad word bans its last token where its other tokens end what the request has generated,
+    /// drafts before the row included: a one-token word everywhere, a two-token word on the device
+    /// (where the row's input token is generated), a longer one on the host. An empty one bans
+    /// nothing; only a longer one needs the host's tokens.
     #[test]
     fn a_bad_word_bans_its_last_token_after_the_rest() {
         let params = SamplingParams {
-            bad_words_token_ids: Some(vec![vec![101, 100], vec![7], vec![]]),
+            bad_words_token_ids: Some(vec![vec![7], vec![101, 100], vec![1, 2, 3], vec![]]),
             ..Default::default()
         };
-        assert_eq!(params.banned_after(&[]), [7], "no prefix generated yet");
-        assert_eq!(params.banned_after(&[5, 101]), [100, 7], "after the prefix");
+        let (always, after) = (
+            Ban::Always(7),
+            Ban::After {
+                after: 101,
+                banned: 100,
+            },
+        );
+        assert_eq!(params.bans(&[], &[], false), [always], "the prompt's last");
+        assert_eq!(params.bans(&[5], &[], true), [always, after]);
         assert_eq!(
-            params.banned_after(&[101, 5]),
-            [7],
+            params.bans(&[9, 1, 2], &[], true),
+            [always, after, Ban::Always(3)],
+            "a longer word, all generated"
+        );
+        assert_eq!(
+            params.bans(&[9, 1], &[2], true),
+            [always, after, Ban::Always(3)],
+            "across the generated tokens and a draft"
+        );
+        assert_eq!(
+            params.bans(&[1, 9], &[2], true),
+            [always, after],
             "the prefix is not last"
         );
-        assert!(SamplingParams::default().banned_after(&[101]).is_empty());
-        assert!(
-            params.bans_after_tokens(),
-            "a two-token bad word waits on the token before"
-        );
-        assert!(
-            !params.reads_history(),
-            "a ban is no penalty: the sampler reads no history"
-        );
-        let one_token = SamplingParams {
-            bad_words_token_ids: Some(vec![vec![7]]),
+        assert!(params.bans_on_host(), "a three-token word reads back");
+        assert!(!params.reads_history(), "a ban is no penalty");
+        let device_only = SamplingParams {
+            bad_words_token_ids: Some(vec![vec![7], vec![101, 100]]),
             ..Default::default()
         };
         assert!(
-            !one_token.bans_after_tokens(),
-            "a one-token bad word bans everywhere"
+            !device_only.bans_on_host(),
+            "a device reads a two-token word"
         );
+        assert!(SamplingParams::default().bans(&[101], &[], true).is_empty());
+    }
+
+    /// One sequence, two slices: a suffix wholly in either, across both, or longer than both.
+    #[test]
+    fn a_suffix_reads_across_two_slices() {
+        assert!(ends_with(&[1, 2], &[3, 4], &[2, 3, 4]));
+        assert!(ends_with(&[1, 2], &[3, 4], &[4]));
+        assert!(ends_with(&[1, 2], &[], &[1, 2]));
+        assert!(ends_with(&[1, 2], &[3], &[]));
+        assert!(!ends_with(&[1, 2], &[3, 4], &[1, 3, 4]));
+        assert!(!ends_with(&[2], &[3], &[1, 2, 3]));
     }
 
     /// A prompt opens thinking where its last `<think>` has no `</think>` after it, and closes it

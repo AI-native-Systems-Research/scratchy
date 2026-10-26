@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The kernels a model runs outside its tape — greedy argmax, the grammar mask and the sampler on
-//! the logits its forward leaves, the spec-decode chain advance, and a multi-token-prediction
+//! The kernels a model runs outside its tape — greedy argmax, the grammar mask, a bad word's ban
+//! and the sampler on the logits its forward leaves, the spec-decode chain advance, and a multi-token-prediction
 //! head's chain between its passes — baked like the tape's kernels ([`crate::aot::bake`]) with the
 //! model's logits width, dtype, KV block size and hidden width compiled in. The `#[forward]` macro emits one [`OffTapeKernels`] per model
 //! (`ScratchyWeights::metal_off_tape`); the worker builds
 //! [`ArgmaxKernels`](crate::argmax::ArgmaxKernels),
 //! [`GrammarMaskKernels`](crate::grammar_mask::GrammarMaskKernels),
+//! [`BanAfterKernel`](crate::ban_after::BanAfterKernel),
 //! [`SamplerKernels`](crate::sampling::SamplerKernels),
 //! [`ChainAdvanceKernel`](crate::chain_advance::ChainAdvanceKernel),
 //! [`MtpChainKernel`](crate::mtp_chain::MtpChainKernel) and
@@ -20,7 +21,7 @@ use crate::specialized_pipeline_cache::{ConstantValue, PipelineKey};
 use crate::stream::MetalStreamError;
 use crate::tape::ids::{BitsetWords, BlockSize, KDimI32, LogitsWidth, MDimI32, NDimI32};
 use crate::tape::kernel_constants::{
-    AffineCodes, AffineQmvConstants, AffineQmvWideConstants, ArgmaxConstants,
+    AffineCodes, AffineQmvConstants, AffineQmvWideConstants, ArgmaxConstants, BanAfterConstants,
     ChainAdvanceConstants, GrammarMaskConstants, MtpChainConstants,
 };
 use crate::tape::lowered::{BakedKernel, MetalDtype};
@@ -155,6 +156,8 @@ pub struct OffTape<K, L> {
     pub argmax: K,
     pub argmax_dual_write: K,
     pub grammar_mask: K,
+    /// A two-token bad word's ban, read off the input tokens on the device.
+    pub ban_after: K,
     /// Every sampler stage, `[telemetry spill compiled in][stage]`; the `sampler-telemetry`
     /// feature picks the row ([`OffTapeKernels::sampler`]).
     pub sampler: [[K; SamplerStage::COUNT]; 2],
@@ -184,17 +187,19 @@ impl OffTape<PipelineKey, Vec<PipelineKey>> {
         drafts: bool,
         vocab_suffix: Option<VocabSuffix>,
     ) -> Self {
-        let (argmax, dual_write, grammar_mask, cast) = match dtype {
+        let (argmax, dual_write, grammar_mask, ban_after, cast) = match dtype {
             MetalDtype::F16 => (
                 "argmax_f16",
                 "argmax_f16_dual_write",
                 "grammar_mask_f16",
+                "ban_after_f16",
                 CastDtype::F16,
             ),
             MetalDtype::Bf16 => (
                 "argmax_bf16",
                 "argmax_bf16_dual_write",
                 "grammar_mask_bf16",
+                "ban_after_bf16",
                 CastDtype::Bf16,
             ),
             MetalDtype::Int4 => panic!("off-tape kernels: int4 logits have no kernel"),
@@ -218,6 +223,7 @@ impl OffTape<PipelineKey, Vec<PipelineKey>> {
             argmax: argmax_key(argmax),
             argmax_dual_write: argmax_key(dual_write),
             grammar_mask: PipelineKey::new("grammar_mask", grammar_mask, grammar.into()),
+            ban_after: PipelineKey::new("ban_after", ban_after, BanAfterConstants { vocab }.into()),
             sampler: [false, true].map(|t| SamplerStage::ALL.map(|s| s.key(vocab, cast, t))),
             chain_advance: PipelineKey::new(
                 "chain_advance",
@@ -238,6 +244,7 @@ impl<K> OffTape<K, Vec<K>> {
             argmax: f(self.argmax),
             argmax_dual_write: f(self.argmax_dual_write),
             grammar_mask: f(self.grammar_mask),
+            ban_after: f(self.ban_after),
             sampler: self.sampler.map(|row| row.map(&mut f)),
             chain_advance: f(self.chain_advance),
             mtp_chain: self.mtp_chain.map(&mut f),
