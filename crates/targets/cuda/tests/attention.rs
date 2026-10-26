@@ -1039,3 +1039,182 @@ fn the_decode_attention_launcher_refuses_each_bad_shape() {
     }
     assert!(pass, "a decode refusal launched or wrote");
 }
+
+/// The KV append is instantiated for head_dim 256 only (#853), so head_dim 128 (a multiple of 8)
+/// is refused and leaves the cache untouched; and the same append twice, over the same poisoned
+/// caches, gives the same bits.
+#[test]
+fn kv_append_refuses_head_dim_128_and_repeats() {
+    let device = h100();
+    let Appended {
+        caches: (kc, vc),
+        kv: (kb, vb),
+        slots: sb,
+        after: (kh, vh),
+        pass,
+    } = append_bit_exact(&device, 2);
+    let (r, h, d, block_size) = (256u32, 2u32, 128u32, BS as u32);
+    // SAFETY: refused before any pointer is touched.
+    let got = unsafe {
+        kv_append_bf16(
+            (kb.ptr(), vb.ptr()),
+            sb.ptr(),
+            (kc.ptr(), vc.ptr()),
+            (r, h, d),
+            (block_size, BLOCKS as u32),
+            std::ptr::null_mut(),
+        )
+    };
+    let want = Err(KernelError::KvAppendShape {
+        rows: r,
+        kv_heads: h,
+        head_dim: d,
+        block_size,
+    });
+    let untouched = kc.download().expect("K") == kh && vc.download().expect("V") == vh;
+    let refused = got == want && untouched;
+    eprintln!(
+        "kv_append refusal (head_dim 128): {got:?} cache_untouched={untouched} {}",
+        verdict(refused)
+    );
+    let again = append_bit_exact(&device, 2);
+    let mismatched = mismatched_bits(&again.after.0, &kh) + mismatched_bits(&again.after.1, &vh);
+    eprintln!(
+        "kv_append rows=256 kv_heads=2 repeat mismatched_bits={mismatched} {}",
+        verdict(mismatched == 0)
+    );
+    assert!(
+        pass && again.pass && refused && mismatched == 0,
+        "the KV append did not refuse head_dim 128, or did not repeat bit for bit"
+    );
+}
+
+/// The decode attention merges and stores the 16 rows of each consumer warpgroup's warp 0, so a GQA
+/// group above 16 (#854) is refused: 34 query heads over 2 kv heads (`hr` 17), every other
+/// dimension one the kernel takes, leaves `out` untouched.
+#[test]
+fn the_decode_attention_launcher_refuses_a_group_above_16() {
+    let device = h100();
+    let elems = dec_layout(2).buffer_elems();
+    let (kc, vc) = (
+        up(&device, &vec![0u16; elems]),
+        up(&device, &vec![0u16; elems]),
+    );
+    let (qh, kvh, hd, block_size, num_blocks) = (34u32, 2u32, HD as u32, BS as u32, 16u32);
+    let q = up(&device, &vec![0u16; qh as usize * HD]);
+    let out = up(&device, &vec![SENTINEL; qh as usize * HD]);
+    let tb = up_u32(&device, &[0, 1]);
+    let sb = up_u32(&device, &[99, 1]);
+    // SAFETY: refused before any pointer is touched.
+    let got = unsafe {
+        attn_decode_bf16(
+            (q.ptr(), out.ptr()),
+            (kc.ptr(), vc.ptr()),
+            (tb.ptr(), sb.ptr()),
+            (qh, kvh, hd),
+            (block_size, num_blocks),
+            SCALE,
+            std::ptr::null_mut(),
+        )
+    };
+    let want = Err(KernelError::AttnDecodeShape {
+        q_heads: qh,
+        kv_heads: kvh,
+        head_dim: hd,
+        block_size,
+        num_blocks,
+    });
+    let untouched = (out.download().expect("out"))
+        .iter()
+        .all(|&b| b == SENTINEL);
+    let ok = got == want && untouched;
+    eprintln!(
+        "decode attention refusal (q_heads / kv_heads = 17): {got:?} out_untouched={untouched} {}",
+        verdict(ok)
+    );
+    assert!(ok, "the decode attention did not refuse a group of 17");
+}
+
+/// The decode attention's time per launch at kv_len 300 and 8192, at qwen3.5-0.8b's heads (8 / 2)
+/// and qwen3.5-9b's (16 / 4): 50 launches on the default stream after one warm-up, timed to the
+/// download that waits for them. Recorded for the base-against-change comparison, not asserted.
+#[test]
+fn the_decode_attention_time_is_recorded() {
+    const LAUNCHES: u32 = 50;
+    let device = h100();
+    for (qh, kvh) in [(8usize, 2usize), (16, 4)] {
+        for kv_len in [300usize, 8192] {
+            let seed = 0x0DEC_9000 + kv_len as u64;
+            let [q, k, v] = decode_inputs(kv_len, (qh, kvh), seed);
+            let table = shuffled_blocks(seed);
+            let need = kv_len.div_ceil(BS);
+            let (kc, vc) = dec_caches(&device, (&k, &v), (kv_len, kvh), &table, POISON);
+            let qb = up(&device, &q);
+            let out = up(&device, &vec![SENTINEL; qh * HD]);
+            let tb = up_u32(&device, &table[..need]);
+            let sb = up_u32(&device, &[kv_len as u32 - 1, 1]);
+            let launch = || {
+                // SAFETY: as `attend_decode`'s.
+                unsafe {
+                    attn_decode_bf16(
+                        (qb.ptr(), out.ptr()),
+                        (kc.ptr(), vc.ptr()),
+                        (tb.ptr(), sb.ptr()),
+                        (qh as u32, kvh as u32, HD as u32),
+                        (BS as u32, DEC_BLOCKS as u32),
+                        SCALE,
+                        std::ptr::null_mut(),
+                    )
+                }
+                .expect("attn_decode_bf16");
+            };
+            launch();
+            out.download().expect("wait for the warm-up");
+            let start = std::time::Instant::now();
+            for _ in 0..LAUNCHES {
+                launch();
+            }
+            out.download().expect("wait for the launches");
+            let us = start.elapsed().as_secs_f64() * 1e6 / f64::from(LAUNCHES);
+            eprintln!("decode attention time heads={qh}/{kvh} kv_len={kv_len}: {us:.1} us/launch");
+        }
+    }
+}
+
+/// For the base-against-change comparison (#854): the decode output at every `DEC_KV_LENS` case
+/// of `the_decode_attention_is_within_the_f64_bound` (its inputs, its shuffled table, its poisoned
+/// pool), at both head counts, written as raw little-endian bf16 to
+/// `<CARGO_TARGET_TMPDIR>/attn_decode_dump/<case>.bin`, with `case= elems= fnv1a=` printed. The
+/// same file run at two commits gives the `base_vs_pr mismatched_bits=` per case; this test
+/// asserts only that each launch ran.
+#[test]
+fn the_decode_attention_outputs_are_dumped_for_a_base_comparison() {
+    let device = h100();
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("attn_decode_dump");
+    std::fs::create_dir_all(&dir).expect("create the dump directory");
+    for (qh, kvh) in [(8usize, 2usize), (16, 4)] {
+        for (case, &kv_len) in DEC_KV_LENS.iter().enumerate() {
+            let seed = 0x0DEC_0000 + case as u64;
+            let [q, k, v] = decode_inputs(kv_len, (qh, kvh), seed);
+            let shuffled = shuffled_blocks(seed);
+            let need = kv_len.div_ceil(BS);
+            let (kc, vc) = dec_caches(&device, (&k, &v), (kv_len, kvh), &shuffled, POISON);
+            let out = attend_decode(
+                &device,
+                &q,
+                (&kc, &vc),
+                &shuffled[..need],
+                (kv_len - 1, 1),
+                (qh, kvh),
+            )
+            .expect("attn_decode_bf16");
+            let bytes: Vec<u8> = out.iter().flat_map(|e| e.to_le_bytes()).collect();
+            let name = format!("attn_decode_h{qh}_{kvh}_kv{kv_len}");
+            std::fs::write(dir.join(format!("{name}.bin")), &bytes).expect("write a dump");
+            let fnv = (bytes.iter()).fold(0xCBF2_9CE4_8422_2325u64, |h, &b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3)
+            });
+            eprintln!("case={name} elems={} fnv1a={fnv:016x}", out.len());
+        }
+    }
+}

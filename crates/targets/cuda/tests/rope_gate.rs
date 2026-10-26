@@ -445,3 +445,216 @@ fn every_launcher_refuses_a_shape_it_cannot_run() {
     }
     assert!(pass, "a launcher did not refuse a shape it cannot run");
 }
+
+/// `(7, 1000)`: 1000 is a multiple of 8 but not of 256, so the gate apply's last column tile is
+/// partial (`kernels/gate_apply_bf16.cu`: a plain ThunderKittens tile reads zeros past `cols` and
+/// stores nothing there), and 7 rows leave its 16-row block partial. Under the existing bound, the
+/// output's tail intact; then a repeat on `(256, 2048)` gives the same bits.
+#[test]
+fn gate_apply_bf16_takes_a_partial_last_column_tile_and_repeats() {
+    let device = h100();
+    let (rows, cols) = (7usize, 1000usize);
+    let attn = bf16_inputs(rows * cols, 0x6A77_1000);
+    let gate: Vec<u16> = bf16_inputs(rows * cols, 0x6A77_1001)
+        .into_iter()
+        .map(|b| bits(half::bf16::from_bits(b).to_f32() * 8.0))
+        .collect();
+    let (gpu, tail) = run_apply(&device, &attn, &gate, (rows, cols));
+    let cmp = compare_rows(&gpu, &gate_apply_reference(&attn, &gate), cols);
+    let mut pass = cmp.pass() && tail;
+    eprintln!(
+        "gate_apply_bf16 rows={rows} cols={cols} (partial last column tile): {} tail_intact={tail} {}",
+        cmp.line(),
+        verdict(pass)
+    );
+    let (rows, cols) = (256usize, 2048usize);
+    let attn = bf16_inputs(rows * cols, 0x6A77_2000);
+    let gate = bf16_inputs(rows * cols, 0x6A77_2001);
+    let run = || run_apply(&device, &attn, &gate, (rows, cols)).0;
+    let mismatched = mismatched_bits(&run(), &run());
+    eprintln!(
+        "gate_apply_bf16 rows={rows} cols={cols} repeat mismatched_bits={mismatched} {}",
+        verdict(mismatched == 0)
+    );
+    pass &= mismatched == 0;
+    assert!(pass, "the gate apply's partial tile or repeat failed");
+}
+
+/// For the base-against-change comparison (#850): the gate apply's output at each of its test
+/// shapes (the seeds of `gate_apply_bf16_matches_the_cpu_reference`, without its extreme row,
+/// then `(7, 1000)`), written as raw little-endian bf16 to
+/// `<CARGO_TARGET_TMPDIR>/row_ops_dump/<case>.bin`, with `case= elems= fnv1a=` printed. The same
+/// file run at two commits gives the `base_vs_pr mismatched_bits=` per case; this test asserts
+/// only that each launch ran.
+#[test]
+fn gate_apply_bf16_outputs_are_dumped_for_a_base_comparison() {
+    let device = h100();
+    for (rows, cols) in [(1usize, 4096usize), (7, 4096), (256, 2048), (7, 1000)] {
+        let seed = (rows as u64) << 32 | cols as u64;
+        let attn = bf16_inputs(rows * cols, 0x6A77_0000 ^ seed);
+        let gate: Vec<u16> = bf16_inputs(rows * cols, 0x6A77_FFFF ^ seed)
+            .into_iter()
+            .map(|b| bits(half::bf16::from_bits(b).to_f32() * 8.0))
+            .collect();
+        let (gpu, _) = run_apply(&device, &attn, &gate, (rows, cols));
+        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("row_ops_dump");
+        std::fs::create_dir_all(&dir).expect("create the dump directory");
+        let bytes: Vec<u8> = gpu.iter().flat_map(|e| e.to_le_bytes()).collect();
+        let case = format!("gate_apply_bf16_r{rows}_c{cols}");
+        std::fs::write(dir.join(format!("{case}.bin")), &bytes).expect("write a dump");
+        let fnv = (bytes.iter()).fold(0xCBF2_9CE4_8422_2325u64, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3)
+        });
+        eprintln!("case={case} elems={} fnv1a={fnv:016x}", gpu.len());
+    }
+}
+
+/// The kernel-side tightenings (#853): the gate split is instantiated for head_dim 256 only, so
+/// head_dim 128 (a multiple of 8, whole heads of `half_cols` 2048) is refused; the rope for
+/// rot_dim 64 only, so rot_dim 48 (a multiple of 16 but not of 32) is refused. Each refusal leaves
+/// its output unchanged.
+#[test]
+fn the_tightened_launchers_refuse_a_shape_off_their_instantiation() {
+    let device = h100();
+    let null = std::ptr::null_mut();
+    let mut pass = true;
+
+    let (rows, half_cols, head_dim) = (7u32, 2048u32, 128u32);
+    let len = refused_len(u64::from(rows) * 2 * u64::from(half_cols));
+    let qg = DeviceBuffer::upload(&device, &vec![0; len]).expect("upload qg");
+    let (q, gate) = (refused_out(&device, len), refused_out(&device, len));
+    // SAFETY: the launcher refuses this shape before it touches any pointer.
+    let got = unsafe {
+        gate_split_bf16(
+            qg.ptr(),
+            q.ptr(),
+            gate.ptr(),
+            (rows, half_cols),
+            head_dim,
+            null,
+        )
+    };
+    let want = Err(KernelError::GateShape {
+        rows,
+        half_cols,
+        head_dim,
+    });
+    let kept = unchanged(&q) && unchanged(&gate);
+    let ok = got == want && kept;
+    eprintln!(
+        "gate_split_bf16 rows={rows} half_cols={half_cols} head_dim={head_dim}: {got:?} \
+         out_unchanged={kept} {}",
+        verdict(ok)
+    );
+    pass &= ok;
+
+    let (rows, cols, head_dim, rot_dim) = (7u32, 1024u32, 256u32, 48u32);
+    let len = refused_len(u64::from(rows) * u64::from(cols));
+    let input = DeviceBuffer::upload(&device, &vec![0; len]).expect("upload x");
+    let table = DeviceBuffer::upload(&device, &vec![0; len]).expect("upload the table");
+    let out = refused_out(&device, len);
+    // SAFETY: the launcher refuses this shape before it touches any pointer.
+    let got = unsafe {
+        rope_bf16(
+            input.ptr(),
+            table.ptr(),
+            out.ptr(),
+            (rows, cols),
+            (head_dim, rot_dim),
+            null,
+        )
+    };
+    let want = Err(KernelError::RopeShape {
+        rows,
+        cols,
+        head_dim,
+        rot_dim,
+    });
+    let kept = unchanged(&out);
+    let ok = got == want && kept;
+    eprintln!(
+        "rope_bf16 rows={rows} cols={cols} head_dim={head_dim} rot_dim={rot_dim}: {got:?} \
+         out_unchanged={kept} {}",
+        verdict(ok)
+    );
+    pass &= ok;
+    assert!(
+        pass,
+        "a tightened launcher did not refuse a shape off its instantiation"
+    );
+}
+
+/// The same input twice gives the same bits: the rope at `(256, 2048)` and the gate split at
+/// `(256, 4096)`, both with their tails intact.
+#[test]
+fn rope_bf16_and_gate_split_bf16_repeat() {
+    let device = h100();
+    let (rows, cols) = (256usize, 2048usize);
+    let x = bf16_inputs(rows * cols, 0x0E0E_2000);
+    let pos = positions(rows);
+    let (a, a_tail, _) = run_rope(&device, &x, &pos, (rows, cols));
+    let (b, b_tail, _) = run_rope(&device, &x, &pos, (rows, cols));
+    let mismatched = mismatched_bits(&a, &b);
+    let ok = mismatched == 0 && a_tail && b_tail;
+    eprintln!(
+        "rope_bf16 rows={rows} cols={cols} repeat mismatched_bits={mismatched} \
+         tail_intact={} {}",
+        a_tail && b_tail,
+        verdict(ok)
+    );
+    let mut pass = ok;
+    let (rows, half_cols) = (256usize, 4096usize);
+    let qg = bf16_inputs(rows * 2 * half_cols, 0x6A7E_2000);
+    let (q0, g0, t0) = run_split(&device, &qg, (rows, half_cols));
+    let (q1, g1, t1) = run_split(&device, &qg, (rows, half_cols));
+    let mismatched = mismatched_bits(&q0, &q1) + mismatched_bits(&g0, &g1);
+    let ok = mismatched == 0 && t0 && t1;
+    eprintln!(
+        "gate_split_bf16 rows={rows} half_cols={half_cols} repeat mismatched_bits={mismatched} \
+         tail_intact={} {}",
+        t0 && t1,
+        verdict(ok)
+    );
+    pass &= ok;
+    assert!(
+        pass,
+        "the rope or the gate split did not repeat bit for bit"
+    );
+}
+
+/// For the base-against-change comparison (#853): the rope's output at each of its test shapes
+/// (the inputs of `rope_bf16_matches_the_cpu_reference`, then the positions fixture `(7, 1024)`),
+/// written as raw little-endian bf16 to `<CARGO_TARGET_TMPDIR>/row_ops_dump/<case>.bin`, with
+/// `case= elems= head_dim= rot_dim= fnv1a=` printed. Within each `head_dim` lanes of a row, the
+/// first `rot_dim` are rotated and the rest pass through, so the same file run at two commits gives
+/// the `base_vs_pr mismatched_bits=` per case for each kind of lane; this test asserts only that
+/// each launch ran.
+#[test]
+fn rope_bf16_outputs_are_dumped_for_a_base_comparison() {
+    const POSITIONS: [u32; 7] = [0, 1, 2, 1000, 65535, 200000, 262143];
+    let device = h100();
+    let cases: [((usize, usize), Vec<u32>); 5] = [
+        ((1, 4096), positions(1)),
+        ((256, 2048), positions(256)),
+        ((256, 512), positions(256)),
+        ((128, 4096), positions(128)),
+        ((7, 1024), POSITIONS.to_vec()),
+    ];
+    for ((rows, cols), pos) in cases {
+        let seed = (rows as u64) << 32 | cols as u64;
+        let x = bf16_inputs(rows * cols, 0x0E0E_0000 ^ seed);
+        let (gpu, _, _) = run_rope(&device, &x, &pos, (rows, cols));
+        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("row_ops_dump");
+        std::fs::create_dir_all(&dir).expect("create the dump directory");
+        let bytes: Vec<u8> = gpu.iter().flat_map(|e| e.to_le_bytes()).collect();
+        let case = format!("rope_bf16_r{rows}_c{cols}");
+        std::fs::write(dir.join(format!("{case}.bin")), &bytes).expect("write a dump");
+        let fnv = (bytes.iter()).fold(0xCBF2_9CE4_8422_2325u64, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3)
+        });
+        eprintln!(
+            "case={case} elems={} head_dim={HD} rot_dim={R} fnv1a={fnv:016x}",
+            gpu.len()
+        );
+    }
+}

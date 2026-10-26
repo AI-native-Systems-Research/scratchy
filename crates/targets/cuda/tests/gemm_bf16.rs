@@ -660,3 +660,74 @@ fn the_narrow_gemm_at_one_row_is_its_row_at_128() {
         "the narrow GEMM's one-row output differs from its row at m = 128"
     );
 }
+
+/// Recorded, not required (PLAN-tk100 §8, R6): whether the GEMV's row is bit-identical to row 0
+/// of the tiled GEMM on the same inputs. Both run WGMMA over 64-wide K steps in the same order,
+/// with N tiles of 64 and 256; the printed count says whether that gives the same bits. No
+/// assertion: `the_gemv_is_within_two_bounds_of_the_tiled_gemms_row` gates.
+#[test]
+fn the_gemv_row_against_the_tiled_gemms_row_0_is_recorded() {
+    let device = h100();
+    for (n, k) in [(4096u32, 1024u32), (1024, 3584), (6144, 1024), (2048, 1024)] {
+        let (nu, ku, m) = (n as usize, k as usize, 128usize);
+        let b_bits = bf16_inputs(nu * ku, 0x6E77_0000 ^ u64::from(n));
+        let row = bf16_inputs(ku, 0x6E78_0000 ^ u64::from(k));
+        let mut a_bits = bf16_inputs(m * ku, 0x6E79_0000 ^ u64::from(k));
+        a_bits[..ku].copy_from_slice(&row);
+        let b = DeviceBuffer::upload(&device, &b_bits).expect("upload B");
+        let a = DeviceBuffer::upload(&device, &a_bits).expect("upload A");
+        let x = DeviceBuffer::upload(&device, &row).expect("upload a");
+        let c = DeviceBuffer::upload(&device, &vec![SENTINEL; m * nu]).expect("upload C");
+        let g = DeviceBuffer::upload(&device, &vec![SENTINEL; nu]).expect("upload c");
+        // SAFETY: the buffers hold m*k, n*k, m*n, k and n bf16; cudaMalloc pointers are 256-byte
+        // aligned; neither output overlaps an input; `h100` ran `prepare_all`.
+        unsafe { launch_and_wait(&a, &b, &c, (m as u32, n, k)) }.expect("the tiled GEMM");
+        // SAFETY: as above.
+        unsafe { gemv_and_wait(&x, &b, &g, (n, k)) }.expect("the GEMV");
+        let tiled = c.download().expect("download C")[..nu].to_vec();
+        let gemv = g.download().expect("download c");
+        eprintln!(
+            "gemv vs gemm_bf16_abt row 0 of m=128, n={n} k={k}: mismatched_bits={}/{nu} \
+             (recorded, not asserted)",
+            mismatched_bits(&gemv, &tiled)
+        );
+    }
+}
+
+/// The narrow GEMM's time per launch at the GDN `a`/`b` projections' shapes, printed and not
+/// asserted: it records the choice of two consumer warpgroups (`kernels/gemm_narrow_bf16.cu`). The
+/// median of 20 launches after 3 warm-ups, each timed from the host to its completion.
+#[test]
+fn the_narrow_gemm_time_is_recorded() {
+    let device = h100();
+    for (m, n, k) in [
+        (1u32, 16u32, 1024u32),
+        (512, 16, 1024),
+        (4096, 16, 1024),
+        (1, 32, 4096),
+        (512, 32, 4096),
+        (4096, 32, 4096),
+    ] {
+        let (mu, nu, ku) = (m as usize, n as usize, k as usize);
+        let a = DeviceBuffer::upload(&device, &bf16_inputs(mu * ku, 0x7151)).expect("upload A");
+        let b = DeviceBuffer::upload(&device, &bf16_inputs(nu * ku, 0x7152)).expect("upload B");
+        let c = DeviceBuffer::upload(&device, &vec![SENTINEL; mu * nu]).expect("upload C");
+        let mut times = Vec::new();
+        for i in 0..23 {
+            let start = std::time::Instant::now();
+            // SAFETY: as `run_narrow`'s.
+            unsafe { narrow_and_wait(&a, &b, &c, (m, n, k)) }.expect("launch");
+            if i >= 3 {
+                times.push(start.elapsed().as_secs_f64() * 1e6);
+            }
+        }
+        times.sort_by(f64::total_cmp);
+        eprintln!(
+            "gemm_narrow_bf16_abt time m={m} n={n} k={k}: median={:.1}us min={:.1}us over {} \
+             launches, host-timed including the download (recorded, not asserted)",
+            times[times.len() / 2],
+            times[0],
+            times.len()
+        );
+    }
+}

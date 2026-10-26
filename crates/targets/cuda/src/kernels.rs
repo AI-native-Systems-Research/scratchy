@@ -39,6 +39,7 @@ unsafe extern "C" {
         k: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_rms_norm_bf16_prepare() -> i32;
     fn scratchy_cuda_rms_norm_bf16(
         x: *const c_void,
         gain: *const c_void,
@@ -49,6 +50,7 @@ unsafe extern "C" {
         gain_offset: f32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_add_bf16_prepare() -> i32;
     fn scratchy_cuda_add_bf16(
         a: *const c_void,
         b: *const c_void,
@@ -57,6 +59,7 @@ unsafe extern "C" {
         cols: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_silu_mul_bf16_prepare() -> i32;
     fn scratchy_cuda_silu_mul_bf16(
         gate: *const c_void,
         up: *const c_void,
@@ -84,6 +87,7 @@ unsafe extern "C" {
         head_dim: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_gate_apply_bf16_prepare() -> i32;
     fn scratchy_cuda_gate_apply_bf16(
         attn: *const c_void,
         gate: *const c_void,
@@ -122,6 +126,7 @@ unsafe extern "C" {
         scale: f32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_gemm_narrow_bf16_abt_prepare() -> i32;
     fn scratchy_cuda_gemm_narrow_bf16_abt(
         a: *const c_void,
         b: *const c_void,
@@ -131,6 +136,7 @@ unsafe extern "C" {
         k: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_gemv_bf16_abt_prepare() -> i32;
     fn scratchy_cuda_gemv_bf16_abt(
         a: *const c_void,
         b: *const c_void,
@@ -139,6 +145,28 @@ unsafe extern "C" {
         k: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_tma_box_probe_load(
+        src: *const c_void,
+        poison: *const c_void,
+        dump: *mut c_void,
+        rows: u32,
+        cols: u32,
+        tile_row: u32,
+        tile_col: u32,
+        swizzled: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_tma_box_probe_store(
+        pattern: *const c_void,
+        dst: *mut c_void,
+        rows: u32,
+        cols: u32,
+        tile_row: u32,
+        tile_col: u32,
+        swizzled: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_attn_decode_bf16_prepare() -> i32;
     fn scratchy_cuda_attn_decode_bf16(
         q: *const c_void,
         k_cache: *const c_void,
@@ -192,6 +220,13 @@ unsafe extern "C" {
         head_k: u32,
         head_v: u32,
         scale: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gdn_rank_one_probe(
+        s: *const c_void,
+        t: *const c_void,
+        u: *const c_void,
+        out: *mut c_void,
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_gdn_rms_norm_gated(
@@ -393,6 +428,16 @@ impl std::error::Error for KernelError {}
 const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("gemm_bf16_abt", scratchy_cuda_gemm_bf16_abt_prepare),
     ("attn_prefill_bf16", scratchy_cuda_attn_prefill_bf16_prepare),
+    (
+        "gemm_narrow_bf16_abt",
+        scratchy_cuda_gemm_narrow_bf16_abt_prepare,
+    ),
+    ("gemv_bf16_abt", scratchy_cuda_gemv_bf16_abt_prepare),
+    ("rms_norm_bf16", scratchy_cuda_rms_norm_bf16_prepare),
+    ("add_bf16", scratchy_cuda_add_bf16_prepare),
+    ("silu_mul_bf16", scratchy_cuda_silu_mul_bf16_prepare),
+    ("gate_apply_bf16", scratchy_cuda_gate_apply_bf16_prepare),
+    ("attn_decode_bf16", scratchy_cuda_attn_decode_bf16_prepare),
 ];
 
 /// Run every kernel's one-time setup on the current device, stopping at the first failure, which
@@ -490,8 +535,10 @@ pub unsafe fn gemm_bf16_abt(
 // shape rule: `rows` and `cols` non-zero, `cols` a multiple of 8 (one 16-byte vector of bf16:
 // `step::RMS_NORM_BF16_COLS`, `ADD_BF16_COLS`, `SILU_MUL_BF16_COLS`), and `rows · cols` at most
 // `i32::MAX`. Any other shape returns `KernelError::RowShape` before any pointer is touched, and
-// launches nothing. A failed launch returns the launch's own `cudaError_t`. None needs a one-time
-// setup (each uses under 48 KiB of shared memory), so none is in `PREPARE`.
+// launches nothing. A failed launch returns the launch's own `cudaError_t`; a C++ exception from
+// ThunderKittens' host code (a tensor-map encode), `KernelError::HostException`. Each is a
+// ThunderKittens 16-row tile kernel whose dynamic shared memory is over the default 48 KiB, so
+// each is in `PREPARE`, which must have run on the current device first.
 
 /// Launch the bf16 RMSNorm: `y[r, c] = x[r, c] / sqrt(mean(x[r, :]²) + eps) · (gain_offset +
 /// gain[c])`, `x` and `y` `[rows, cols]`, `gain` `[cols]`, in f32 with one bf16 rounding per
@@ -565,11 +612,11 @@ pub unsafe fn silu_mul_bf16(
 /// with one bf16 rounding per output; the lanes `rot_dim..head_dim` copied bit for bit.
 /// Asynchronous.
 ///
-/// Refused with [`KernelError::RopeShape`], before any pointer is touched, unless `rows`, `cols`,
-/// `head_dim` and `rot_dim` are non-zero, `rot_dim` is a multiple of 16
-/// (`step::ROPE_BF16_ROT_MULTIPLE`) and at most `head_dim`, `head_dim` a multiple of 8, `cols` a
-/// multiple of `head_dim`, and `rows · cols` at most `i32::MAX`. A failed launch returns the
-/// launch's own `cudaError_t`.
+/// Refused with [`KernelError::RopeShape`], before any pointer is touched, unless `rows`, `cols`
+/// and `head_dim` are non-zero, `rot_dim` is 64 (`step::ROPE_BF16_KERNEL_ROT_DIM`, the one width
+/// the kernel is instantiated for), `head_dim` a multiple of 64
+/// (`step::ROPE_BF16_KERNEL_HEAD_MULTIPLE`), `cols` a multiple of `head_dim`, and `rows · cols`
+/// at most `i32::MAX`. A failed launch returns the launch's own `cudaError_t`.
 ///
 /// # Safety
 ///
@@ -603,9 +650,9 @@ pub unsafe fn rope_bf16(
 /// qg[r, 2h·hd + d]` and `gate[r, h·hd + d] = qg[r, 2h·hd + hd + d]`, `qg` `[rows, 2·half_cols]`
 /// and `q`, `gate` `[rows, half_cols]`. Copies, so bit-exact. Asynchronous.
 ///
-/// Refused with [`KernelError::GateShape`], before any pointer is touched, unless `rows`,
-/// `half_cols` and `head_dim` are non-zero, `head_dim` a multiple of 8
-/// (`step::GATE_SPLIT_BF16_HEAD_MULTIPLE`), `half_cols` a multiple of `head_dim`, and
+/// Refused with [`KernelError::GateShape`], before any pointer is touched, unless `rows` and
+/// `half_cols` are non-zero, `head_dim` is 256 (`step::GATE_SPLIT_BF16_HEAD_DIM`, the one head dim
+/// the kernel is instantiated for), `half_cols` a multiple of `head_dim`, and
 /// `rows · 2·half_cols` at most `i32::MAX`. A failed launch returns the launch's own
 /// `cudaError_t`.
 ///
@@ -662,9 +709,11 @@ pub unsafe fn gate_apply_bf16(
 /// `k_cache` and `v_cache` (`[num_blocks, kv_heads, 64, head_dim]`) at that slot. A slot whose
 /// block is at or past `num_blocks` writes nothing. Asynchronous.
 ///
-/// Refused with [`KernelError::KvAppendShape`], before any pointer is touched, unless `rows`,
-/// `kv_heads` and `head_dim` are non-zero, `head_dim` a multiple of 8, `block_size` 64
-/// (`step::CUDA_KV_BLOCK_SIZE`), and `rows · kv_heads · head_dim` at most `i32::MAX`. A failed
+/// Refused with [`KernelError::KvAppendShape`], before any pointer is touched, unless `rows` and
+/// `kv_heads` are non-zero, `head_dim` is 256 (`step::KV_APPEND_BF16_HEAD_DIM`, the one head dim
+/// the kernel is instantiated for), `block_size` 64 (`step::CUDA_KV_BLOCK_SIZE`), and
+/// `rows · kv_heads · head_dim` at most `i32::MAX`. A `num_blocks` of 0 writes nothing and
+/// launches nothing. A failed
 /// launch returns the launch's own `cudaError_t`.
 ///
 /// # Safety
@@ -772,8 +821,10 @@ pub unsafe fn attn_prefill_bf16(
 }
 
 /// Launch the narrow bf16 GEMM `C = A · Bᵀ` for at most 64 output columns: `A` is `[m, k]`, `B`
-/// `[n, k]` and `C` `[m, n]`, row-major bf16, accumulated in f32 and rounded once. One warp per
-/// row of `C`, a fixed reduction order, so the bits do not depend on the launch. Asynchronous.
+/// `[n, k]` and `C` `[m, n]`, row-major bf16, accumulated in f32 and rounded once. ThunderKittens'
+/// WGMMA over 64-row tiles of `A` against all of `B`'s rows, in a fixed K order, so an output
+/// row's bits depend only on its own row of `A` and on `B`, not on the launch or on `m`.
+/// Asynchronous.
 ///
 /// Refused with [`KernelError::NarrowShape`], before any pointer is touched, unless `m` is
 /// non-zero, `n` a non-zero multiple of 8 and at most 64 (`step::GEMM_NARROW_BF16_MULTIPLE`,
@@ -781,9 +832,10 @@ pub unsafe fn attn_prefill_bf16(
 ///
 /// # Safety
 ///
-/// `a`, `b` and `c` must be 16-byte-aligned device pointers to at least `m*k`, `n*k` and `m*n`
-/// bf16, valid for the whole kernel, with `c` overlapping neither input. `stream` must be a live
-/// `cudaStream_t` of the current device, or null for the default stream.
+/// [`prepare_all`] must have succeeded on the current device. `a`, `b` and `c` must be
+/// 16-byte-aligned device pointers to at least `m*k`, `n*k` and `m*n` bf16, valid for the whole
+/// kernel, with `c` overlapping neither input. `stream` must be a live `cudaStream_t` of the
+/// current device, or null for the default stream.
 pub unsafe fn gemm_narrow_bf16_abt(
     a: *const c_void,
     b: *const c_void,
@@ -792,14 +844,15 @@ pub unsafe fn gemm_narrow_bf16_abt(
     stream: *mut c_void,
 ) -> Result<(), KernelError> {
     // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
-    // shape before it touches a pointer.
+    // shape before it touches a pointer and catches every C++ exception.
     let code = unsafe { scratchy_cuda_gemm_narrow_bf16_abt(a, b, c, m, n, k, stream) };
     check(code, KernelError::NarrowShape { m, n, k })
 }
 
 /// Launch the bf16 GEMV `c = a · Bᵀ`, the one-row GEMM: `a` is `[1, k]`, `B` `[n, k]` and `c`
-/// `[1, n]`, row-major bf16, accumulated in f32 and rounded once. One warp per column of `c`, a
-/// fixed reduction order, so the bits do not depend on the launch. Asynchronous.
+/// `[1, n]`, row-major bf16, accumulated in f32 and rounded once. ThunderKittens' WGMMA over 64
+/// columns of `c` per CTA, in a fixed K order, so the bits do not depend on the launch; only the
+/// `n` elements of `c` are written. Asynchronous.
 ///
 /// Refused with [`KernelError::GemvShape`], before any pointer is touched, unless `n` is
 /// non-zero, `k` a non-zero multiple of 8 (`step::GEMV_BF16_MULTIPLE`), and both at most
@@ -807,9 +860,10 @@ pub unsafe fn gemm_narrow_bf16_abt(
 ///
 /// # Safety
 ///
-/// `a`, `b` and `c` must be 16-byte-aligned device pointers to at least `k`, `n*k` and `n` bf16,
-/// valid for the whole kernel, with `c` overlapping neither input. `stream` must be a live
-/// `cudaStream_t` of the current device, or null for the default stream.
+/// [`prepare_all`] must have succeeded on the current device. `a`, `b` and `c` must be
+/// 16-byte-aligned device pointers to at least `k`, `n*k` and `n` bf16, valid for the whole
+/// kernel, with `c` overlapping neither input. `stream` must be a live `cudaStream_t` of the
+/// current device, or null for the default stream.
 pub unsafe fn gemv_bf16_abt(
     a: *const c_void,
     b: *const c_void,
@@ -818,25 +872,109 @@ pub unsafe fn gemv_bf16_abt(
     stream: *mut c_void,
 ) -> Result<(), KernelError> {
     // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
-    // shape before it touches a pointer.
+    // shape before it touches a pointer and catches every C++ exception.
     let code = unsafe { scratchy_cuda_gemv_bf16_abt(a, b, c, n, k, stream) };
     check(code, KernelError::GemvShape { n, k })
+}
+
+// THE TMA BOX PROBE (`kernels/tma_box_probe.cu`): test support, for `tests/tma_bounds.rs` only.
+// No `CudaStep` and no lowering use it. It records what a ThunderKittens TMA tile load and store
+// do with a 64×64 bf16 box that runs past its array's edge, swizzled or plain: the facts the GEMV's
+// and the narrow GEMM's choice of tiles rests on. Its shared memory is under 48 KiB, so it is not
+// in `PREPARE`.
+
+/// Test support for `tests/tma_bounds.rs` only. TMA-load the 64×64 box at tile `(tile_row,
+/// tile_col)` of `src` (`[rows, cols]` bf16) into a swizzled (`swizzled`) or plain shared tile,
+/// over the tile first loaded from `poison` (`[64, 64]` bf16), then TMA-store the tile into `dump`
+/// (`[64, 64]` bf16). Refused with [`KernelError::RowShape`] when `rows` or `cols` is zero, `cols`
+/// is not a multiple of 8, or a dimension or tile coordinate is at or above `i32::MAX / 64`.
+/// Asynchronous.
+///
+/// # Safety
+///
+/// `src`, `poison` and `dump` must be 16-byte-aligned device pointers to `rows · cols`, 4096 and
+/// 4096 bf16, valid for the whole kernel; `dump` overlaps neither input. A swizzled load may read
+/// past `src`'s `rows · cols` elements, up to the next 64-element boundary of its last row (that
+/// is what it records), so `src` must be readable that far. `stream` must be a live
+/// `cudaStream_t` of the current device, or null for the default stream.
+#[doc(hidden)]
+pub unsafe fn tma_box_probe_load(
+    (src, poison, dump): (*const c_void, *const c_void, *mut c_void),
+    (rows, cols): (u32, u32),
+    (tile_row, tile_col): (u32, u32),
+    swizzled: bool,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape before it touches a pointer and catches every C++ exception.
+    let code = unsafe {
+        scratchy_cuda_tma_box_probe_load(
+            src,
+            poison,
+            dump,
+            rows,
+            cols,
+            tile_row,
+            tile_col,
+            u32::from(swizzled),
+            stream,
+        )
+    };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
+/// Test support for `tests/tma_bounds.rs` only. TMA-load `pattern` (`[64, 64]` bf16) into a
+/// swizzled (`swizzled`) or plain shared tile, then TMA-store it at tile `(tile_row, tile_col)` of
+/// `dst` (`[rows, cols]` bf16). Refused as [`tma_box_probe_load`]. Asynchronous.
+///
+/// # Safety
+///
+/// `pattern` and `dst` must be 16-byte-aligned device pointers to 4096 and `rows · cols` bf16,
+/// valid for the whole kernel, not overlapping. A swizzled store may write past `dst`'s
+/// `rows · cols` elements, up to the next 64-element boundary of its last row (that is what it
+/// records), so `dst` must be writable that far. `stream` must be a live `cudaStream_t` of the
+/// current device, or null for the default stream.
+#[doc(hidden)]
+pub unsafe fn tma_box_probe_store(
+    (pattern, dst): (*const c_void, *mut c_void),
+    (rows, cols): (u32, u32),
+    (tile_row, tile_col): (u32, u32),
+    swizzled: bool,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
+    // shape before it touches a pointer and catches every C++ exception.
+    let code = unsafe {
+        scratchy_cuda_tma_box_probe_store(
+            pattern,
+            dst,
+            rows,
+            cols,
+            tile_row,
+            tile_col,
+            u32::from(swizzled),
+            stream,
+        )
+    };
+    check(code, KernelError::RowShape { rows, cols })
 }
 
 /// Launch the GQA decode attention of one query row `q` (`[1, q_heads · 256]`) over one layer's
 /// paged `k_cache` and `v_cache` (`[num_blocks, kv_heads, 64, 256]`) into `out`, the keys
 /// `0 .. P + L` read through `block_table`, `P` and `L` read from `sequence`; query head `g` reads
-/// kv head `g / (q_heads / kv_heads)`, the softmax scaled by `scale`. No key at or past `P + L` is
-/// loaded. Asynchronous.
+/// kv head `g / (q_heads / kv_heads)`, the softmax scaled by `scale`. Whole 64-slot blocks are
+/// loaded; the slots at or past `P + L` are neutralised before use (their scores set to −inf,
+/// their V rows zeroed), so no unwritten slot reaches the output. Asynchronous.
 ///
 /// Refused with [`KernelError::AttnDecodeShape`], before any pointer is touched, unless
 /// `head_dim` is 256 (`step::ATTN_DECODE_BF16_HEAD_DIM`), `q_heads` and `kv_heads` non-zero with
-/// `q_heads` a multiple of `kv_heads`, `block_size` 64, `num_blocks` non-zero, and `scale` finite
-/// and above 0. Returns the launch's own `cudaError_t` if it fails.
+/// `q_heads` a multiple of `kv_heads` by at most 16 (`step::ATTN_DECODE_BF16_MAX_GROUP`),
+/// `block_size` 64, `num_blocks` non-zero, and `scale` finite and above 0. Returns the launch's
+/// own `cudaError_t` if it fails.
 ///
 /// # Safety
 ///
-/// `q` and `out` must be 16-byte-aligned device pointers to `q_heads · 256` bf16, `out`
+/// [`prepare_all`] must have succeeded on the current device. `q` and `out` must be 16-byte-aligned device pointers to `q_heads · 256` bf16, `out`
 /// overlapping no input; `k_cache`, `v_cache` to `num_blocks · kv_heads · 64 · 256` bf16 each;
 /// `sequence` to `[P, L]` u32 with `L ≥ 1`; `block_table` to at least `ceil((P + L) / 64)` u32
 /// block ids, each below `num_blocks`. All valid for the whole kernel. `stream` must be a live
@@ -883,17 +1021,19 @@ pub unsafe fn attn_decode_bf16(
 
 // THE GDN KERNELS. Four launches make one `GatedDeltaNet` step, in this order on one stream, each
 // reading `[slot, q_len, start, 0]` u32 from `sequence` (`start` 1 on a sequence's first chunk, 0
-// to continue from its slot) and touching only the `q_len` real rows. Each is plain CUDA with
-// under 48 KiB of static shared memory, so none is in `PREPARE`.
+// to continue from its slot) and touching only the `q_len` real rows. Each is a ThunderKittens
+// kernel with under 48 KiB of static shared memory, so none is in `PREPARE`.
 
 /// Launch the GDN causal depthwise conv1d, then SiLU: `conv_out[t, c]` (f32) for the real rows of
 /// `x [rows, conv_dim]` (bf16) under the taps `w [conv_dim, kernel]` (f32), the rows before 0 the
 /// slot's conv ring (zero, never read, on a fresh start); then the ring updated to the last
-/// `kernel − 1` inputs. Asynchronous.
+/// `kernel − 1` inputs. One warp per 128 channels and 64 tokens, the channels a ThunderKittens
+/// warp vector, each tap one `fmaf` in ascending order (`kernels/gdn_conv1d.cu`). Asynchronous.
 ///
 /// Refused with [`KernelError::GdnConvShape`], before any pointer is touched, unless `rows` and
-/// `conv_dim` are non-zero, `kernel` in `step::GDN_CONV_KERNEL_RANGE`, `rows · conv_dim` at most
-/// `i32::MAX`, and `slot_elems` exactly `conv_dim · (kernel − 1)`.
+/// `conv_dim` are non-zero, `conv_dim` a multiple of 128 (`step::GDN_CONV_CHANNEL_GROUP`),
+/// `kernel` in `step::GDN_CONV_KERNEL_RANGE`, `rows · conv_dim` at most `i32::MAX`, and
+/// `slot_elems` exactly `conv_dim · (kernel − 1)`.
 ///
 /// # Safety
 ///
@@ -927,10 +1067,12 @@ pub unsafe fn gdn_conv1d(
 }
 
 /// Launch the GDN gating: for the real rows of `a` and `b` (`[rows, nv]` bf16), `g = −exp(a_log)
-/// · softplus(a + dt_bias)` and `beta = sigmoid(b)`, f32 `[rows, nv]` each. Asynchronous.
+/// · softplus(a + dt_bias)` and `beta = sigmoid(b)`, f32 `[rows, nv]` each. One warp per real
+/// row, the row a ThunderKittens warp vector (`kernels/gdn_gating.cu`). Asynchronous.
 ///
 /// Refused with [`KernelError::GdnGatingShape`], before any pointer is touched, unless `rows` and
-/// `nv` are non-zero and `rows · nv` at most `i32::MAX`.
+/// `nv` are non-zero, `nv` 16 or 32 (a multiple of `step::GDN_GATING_NV_MULTIPLE`, the widths the
+/// kernel is instantiated for), and `rows · nv` at most `i32::MAX`.
 ///
 /// # Safety
 ///
@@ -956,7 +1098,9 @@ pub unsafe fn gdn_gating(
 /// Launch the GDN recurrent gated delta-rule scan: per value head, the slot's f32 state (zero,
 /// never read, on a fresh start) through the real tokens of `conv_out` (`q | k | v`), `g` and
 /// `beta`, each token's output into `o [rows, nv·head_v]` (f32); the state written back once.
-/// Value head `h` reads key head `h / (nv / nk)`. Asynchronous.
+/// Value head `h` reads key head `h / (nv / nk)`. Each warp holds 16 state rows as one
+/// ThunderKittens `rt_fl<16, 128>`: the matrix-vector products are `mul_col` then `row_sum`, the
+/// rank-1 update `row_map<fma_AxCtB>` (`kernels/gdn_scan.cu`). Asynchronous.
 ///
 /// Refused with [`KernelError::GdnScanShape`], before any pointer is touched, unless `head_k` is
 /// 128 (`step::GDN_HEAD_K`), `head_v` a non-zero multiple of 32 and at most 256, `nk` and `nv`
@@ -968,8 +1112,8 @@ pub unsafe fn gdn_gating(
 ///
 /// `conv_out` must be a device pointer to `rows·conv_dim` f32, `g` and `beta` to `rows·nv` f32,
 /// `o` to `rows·nv·head_v` f32, `sequence` to 4 u32 with `1 ≤ q_len ≤ rows` and `slot` a slot of
-/// `ssm_state`, which must hold `(slot + 1) · slot_elems` f32. All 16-byte aligned and valid for
-/// the whole kernel; `o` and `ssm_state` overlap nothing else. `stream` must be a live
+/// `ssm_state`, which must hold `(slot + 1) · slot_elems` f32. All 16-byte aligned (`conv_out`'s
+/// q, k and v rows are staged by bulk copy) and valid for the whole kernel; `o` and `ssm_state` overlap nothing else. `stream` must be a live
 /// `cudaStream_t` of the current device, or null for the default stream.
 pub unsafe fn gdn_scan(
     (conv_out, g, beta): (*const c_void, *const c_void, *const c_void),
@@ -999,9 +1143,39 @@ pub unsafe fn gdn_scan(
     )
 }
 
+/// Test support for `tests/gdn.rs` only (R8): `out = T · u + S` by the GDN scan's own rank-1
+/// update, `warp::row_map<base_ops::fma_AxCtB>(S, T, S, u)` on its `rt_fl<16, 128>` state tile
+/// (`kernels/gdn_scan.cu`), `u` one value per row. No `CudaStep` uses it. Never refused: a failed
+/// launch returns its `cudaError_t`. Asynchronous.
+///
+/// # Safety
+///
+/// `s`, `t` and `out` must be 16-byte-aligned device pointers to 16 · 128 f32 and `u` to 16 f32,
+/// valid for the whole kernel, `out` overlapping no input. `stream` must be a live `cudaStream_t`
+/// of the current device, or null for the default stream.
+#[doc(hidden)]
+pub unsafe fn gdn_rank_one_probe(
+    (s, t, u): (*const c_void, *const c_void, *const c_void),
+    out: *mut c_void,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the pointer and stream contract above; the launcher catches
+    // every C++ exception.
+    let code = unsafe { scratchy_cuda_gdn_rank_one_probe(s, t, u, out, stream) };
+    check(
+        code,
+        KernelError::RowShape {
+            rows: 16,
+            cols: 128,
+        },
+    )
+}
+
 /// Launch the GDN gated RMSNorm: per real row and value head, `o / sqrt(mean(o²) + eps) · w ·
 /// SiLU(z)` over the head's `head_v` lanes, rounded once to bf16 into `out`; every padding row of
-/// `out` written `+0.0` without reading `o` or `z`. Asynchronous.
+/// `out` written `+0.0` without reading `o` or `z`. One warp per row, the row a ThunderKittens
+/// warp vector, its sum of squares by `warp::mul` then `warp::sum` (`kernels/gdn_rms_norm_gated.cu`).
+/// Asynchronous.
 ///
 /// Refused with [`KernelError::GdnNormShape`], before any pointer is touched, unless `rows` and
 /// `nv` are non-zero, `head_v` a non-zero multiple of 32 and at most 256, `rows · nv · head_v` at

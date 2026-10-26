@@ -56,6 +56,13 @@ safetensors = { workspace = true }
 name = "gemm_bf16"
 required-features = ["nvcc"]
 
+# What a ThunderKittens TMA tile load and store do with a box past its array's edge, swizzled and
+# plain (`kernels/tma_box_probe.cu`): the GKE probe's R1 cases, the GEMV's and the narrow GEMM's
+# first gate, on the GPU. Not built without `nvcc`.
+[[test]]
+name = "tma_bounds"
+required-features = ["nvcc"]
+
 # The row kernels (RMSNorm, add, SiluMul) against a CPU reference, on the GPU. Not built without
 # `nvcc`.
 [[test]]

@@ -21,8 +21,9 @@ use scratchy_subtile::tape_colouring::{Colour, TapeColouring};
 use scratchy_subtile::tape_folding::{FusedShape, Fusion};
 use scratchy_target_cuda::op_abi::CudaFusion;
 use scratchy_target_cuda::step::{
-    ADD_BF16_COLS, ATTN_DECODE_BF16_HEAD_DIM, ATTN_PREFILL_BF16_HEAD_DIM, ATTN_PREFILL_BF16_ROWS,
-    AddBf16, AttnPrefillBf16, CudaStep, EMBED_BF16_COLS, EmbedBf16, GATE_APPLY_BF16_COLS,
+    ADD_BF16_COLS, ATTN_DECODE_BF16_HEAD_DIM, ATTN_DECODE_BF16_MAX_GROUP,
+    ATTN_PREFILL_BF16_HEAD_DIM, ATTN_PREFILL_BF16_ROWS, AddBf16, AttnPrefillBf16, CudaStep,
+    EMBED_BF16_COLS, EmbedBf16, GATE_APPLY_BF16_COLS, GATE_SPLIT_BF16_HEAD_DIM,
     GATE_SPLIT_BF16_HEAD_MULTIPLE, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX,
     GDN_HEAD_V_MULTIPLE, GEMM_BF16_TILE, GEMM_NARROW_BF16_MAX_N, GEMM_NARROW_BF16_MULTIPLE,
     GEMV_BF16_MULTIPLE, GateApplyBf16, GateSplitBf16, GatedDeltaNetBf16, GemmBf16,
@@ -648,7 +649,8 @@ fn rope_append(
 
 /// `AttnDecode` as attention over the paged KV cache: the bf16 decode attention for a one-row
 /// bucket, the bf16 causal prefill attention for a bucket of a multiple of
-/// [`ATTN_PREFILL_BF16_ROWS`] rows, chosen here at expansion; any other row count is refused.
+/// [`ATTN_PREFILL_BF16_ROWS`] rows, chosen here at expansion; any other row count is refused, and
+/// so, last, is a one-row bucket whose GQA group is above [`ATTN_DECODE_BF16_MAX_GROUP`].
 /// `q` (operand 0) is a computed slot `[rows, q_heads · head_dim]`; operands 1 and 2 the layer's
 /// `PrefixK` and `PrefixV`; operand 3 that layer's `RopeAppend` and operand 4 the V it read. Both
 /// kernels read K and V from the cache the `RopeAppend` wrote, not from operands 3 and 4, which
@@ -754,6 +756,18 @@ fn attention(
             op,
             kv_heads,
             cols: geom.kv_width(),
+        });
+    }
+    let group = geom.gqa().get();
+    if rows == 1 && group > ATTN_DECODE_BF16_MAX_GROUP {
+        return Err(CanonicalRefusal::AttnShape {
+            step,
+            rows,
+            head_dim,
+            rule: AttnShapeRule::GroupAboveMax {
+                group,
+                max: ATTN_DECODE_BF16_MAX_GROUP,
+            },
         });
     }
     let at = arena(cx)?;
@@ -1014,7 +1028,8 @@ fn rope_shape(
 
 /// The bf16 gate split's shape rule, the one its launcher applies: `rows`, `half_cols` and
 /// `head_dim` non-zero; `head_dim` a multiple of [`GATE_SPLIT_BF16_HEAD_MULTIPLE`]; `half_cols` a
-/// whole number of heads; `rows · 2·half_cols` at most `i32::MAX`.
+/// whole number of heads; `rows · 2·half_cols` at most `i32::MAX`; and, last, `head_dim`
+/// [`GATE_SPLIT_BF16_HEAD_DIM`], the one the kernel is instantiated for.
 fn gate_shape(rows: u32, half_cols: u32, head_dim: u32) -> Result<(), GateShapeRule> {
     for (dim, value) in [
         ("rows", rows),
@@ -1036,6 +1051,11 @@ fn gate_shape(rows: u32, half_cols: u32, head_dim: u32) -> Result<(), GateShapeR
     let elements = u64::from(rows) * 2 * u64::from(half_cols);
     if elements > i32::MAX as u64 {
         return Err(GateShapeRule::TooManyElements { elements });
+    }
+    if head_dim != GATE_SPLIT_BF16_HEAD_DIM {
+        return Err(GateShapeRule::HeadNotInstantiated {
+            want: GATE_SPLIT_BF16_HEAD_DIM,
+        });
     }
     Ok(())
 }
