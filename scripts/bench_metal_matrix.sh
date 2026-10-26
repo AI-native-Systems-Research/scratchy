@@ -1243,7 +1243,9 @@ PY
 
     # Every per-model file an earlier run into this directory left, a declined
     # engine's included: a decline is this run's finding, not a sticky one.
-    rm -f "${RAW}"/exec*-"${stem}".json "${RAW}"/scale*-"${stem}".*.json "${RAW}/serve-${stem}.json" "${RAW}"/served-*-"${stem}" "${RAW}"/declined-*-"${stem}"
+    # --resume keeps the scaling cells, the ones it is there to keep (run_cell).
+    rm -f "${RAW}"/exec*-"${stem}".json "${RAW}/serve-${stem}.json" "${RAW}"/served-*-"${stem}" "${RAW}"/declined-*-"${stem}"
+    (( RESUME )) || rm -f "${RAW}"/scale*-"${stem}".*.json
     cell_model=""; cell_tok=""
     for row in "${ENGINE_ROWS[@]}"; do IFS='|' read -r key _ _ <<<"${row}"; unset "M_${key}" "Q_${key}" "R_${key}"; done
 
