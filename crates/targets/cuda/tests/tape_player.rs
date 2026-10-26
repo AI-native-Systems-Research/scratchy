@@ -14,6 +14,7 @@ pub mod common {
     pub mod attn_layer;
     pub mod chains;
     pub mod gdn_layer;
+    pub mod gemma_attn;
     pub mod gemma_mlp;
     pub mod gemma_moe;
     pub mod gemma_rows;
@@ -3368,4 +3369,476 @@ fn a_qwen_routing_at_128_experts_is_refused_before_anything_is_enqueued() {
     );
     assert!(y.iter().all(|&v| v == 0xBEEF), "the result is untouched");
     assert_eq!(read(&mut worker, result), before, "nothing was enqueued");
+}
+
+// ── Gemma 4's sliding attention layer, played (#922) ───────────────
+
+use common::gemma_attn::{GEMMA_ATTN_FACTS, gemma_attn};
+use scratchy_target_cuda::step::AttnPrefillBf16;
+use scratchy_target_cuda::tape::KvClass;
+
+const GA_H: usize = common::gemma_attn::H as usize;
+const GA_HD: usize = common::gemma_attn::HD as usize;
+const GA_Q: usize = common::gemma_attn::Q as usize;
+const GA_KV: usize = common::gemma_attn::KV as usize;
+const GA_W: usize = common::gemma_attn::WINDOW as usize;
+/// The pool's blocks: room for the 2012-token sequences and blocks to poison beside them.
+const GA_BLOCKS: u32 = 48;
+const GA_POOL: Option<KvPoolConfig> = Some(KvPoolConfig {
+    num_blocks: GA_BLOCKS,
+});
+/// The sequence's block table: a permutation of the pool (7 is coprime with 48).
+fn ga_table() -> Vec<u32> {
+    (0..GA_BLOCKS).map(|b| (b * 7 + 5) % GA_BLOCKS).collect()
+}
+
+/// `t` with every attention step and KV class unwindowed: the same layer's full causal twin.
+fn unwindowed(t: &CudaTape) -> CudaTape {
+    let steps: Vec<CudaStep> = (t.steps.iter())
+        .map(|s| match *s {
+            CudaStep::AttnPrefill(a) => {
+                CudaStep::AttnPrefill(AttnPrefillBf16 { window: None, ..a })
+            }
+            CudaStep::AttnDecode(a) => CudaStep::AttnDecode(AttnPrefillBf16 { window: None, ..a }),
+            s => s,
+        })
+        .collect();
+    let kv = t.kv.map(|kv| {
+        let classes: Vec<KvClass> = (kv.classes.iter())
+            .map(|c| KvClass { window: None, ..*c })
+            .collect();
+        KvTape {
+            classes: Box::leak(classes.into_boxed_slice()),
+            ..kv
+        }
+    });
+    CudaTape {
+        steps: Box::leak(steps.into_boxed_slice()),
+        kv,
+        ..*t
+    }
+}
+
+/// The layer at m = 1 and 512 as CUDA's compiler lowers it, their unwindowed twins, then
+/// [`whole_arena_tape`] over the largest arena: buckets 0, 1 (windowed), 2, 3 (twins), 4 (fill).
+fn gemma_attn_buckets() -> &'static [CudaTape] {
+    static TAPES: std::sync::OnceLock<Vec<CudaTape>> = std::sync::OnceLock::new();
+    TAPES.get_or_init(|| {
+        let lowered: Vec<CudaTape> = [1u32, 512]
+            .iter()
+            .map(|&m| {
+                let at = CanonicalAt {
+                    stem: "gemma_attn",
+                    m: u64::from(m),
+                };
+                let c = lower_canonical(&gemma_attn(m), GEMMA_ATTN_FACTS, at)
+                    .unwrap_or_else(|e| panic!("the Gemma sliding layer lowers at m={m}: {e}"));
+                static_tape(&c)
+            })
+            .collect();
+        let mut t = lowered.clone();
+        t.extend(lowered.iter().map(unwindowed));
+        let bytes = (t.iter().map(|t| t.arena.total_bytes))
+            .max()
+            .expect("tapes");
+        t.push(whole_arena_tape(bytes));
+        t
+    })
+}
+
+/// One position's `(q, k, v)` in f64.
+type GaToken = [Vec<f64>; 3];
+
+/// The layer's weights as bits, and widened once for the host references.
+struct GaWeights {
+    bits: [Vec<u16>; 7],
+    wide: [Vec<f64>; 7],
+}
+
+/// `g_in`, `Wq`, `q_norm`, `Wk`, `k_norm`, `Wv`, `Wo`: gains near 1 (the norms' near 1/4, so the
+/// scores at scale 1 stay near unit size) and projections in [−1/16, 1/16].
+fn ga_weights() -> GaWeights {
+    let around = |len, seed, c: f32| -> Vec<u16> {
+        (bf16_inputs(len, seed).into_iter())
+            .map(|b| common::numerics::bits(c * (1.0 + half::bf16::from_bits(b).to_f32() / 8.0)))
+            .collect()
+    };
+    let small = |len, seed| -> Vec<u16> {
+        (bf16_inputs(len, seed).into_iter())
+            .map(|b| common::numerics::bits(half::bf16::from_bits(b).to_f32() / 16.0))
+            .collect()
+    };
+    let bits = [
+        around(GA_H, 0x0922_A001, 1.0),
+        small(GA_Q * GA_H, 0x0922_A002),
+        around(GA_HD, 0x0922_A003, 0.25),
+        small(GA_KV * GA_H, 0x0922_A004),
+        around(GA_HD, 0x0922_A005, 0.25),
+        small(GA_KV * GA_H, 0x0922_A006),
+        small(GA_H * GA_Q, 0x0922_A007),
+    ];
+    let wide = bits.clone().map(|b| widen(&b));
+    GaWeights { bits, wide }
+}
+
+/// The worker's weight table: the sources' order, `x`, the rotary pairs, the caches and the
+/// unread global table empty.
+fn ga_table_buffers(device: &CudaDevice, w: &GaWeights) -> &'static [DeviceBuffer] {
+    let up = |b: &[u16]| DeviceBuffer::upload(device, b).expect("upload a weight");
+    let e = DeviceBuffer::empty;
+    let [g, wq, qn, wk, kn, wv, wo] = &w.bits;
+    let table = vec![
+        e(),
+        up(g),
+        up(wq),
+        up(qn),
+        up(wk),
+        up(kn),
+        up(wv),
+        e(),
+        e(),
+        e(),
+        e(),
+        e(),
+        e(),
+        up(wo),
+        e(),
+    ];
+    Box::leak(table.into_boxed_slice())
+}
+
+/// The input row of position `p`: the same at every forward that holds it.
+fn ga_x(p: usize) -> Vec<u16> {
+    bf16_inputs(GA_H, 0x0922_B000 + p as u64)
+}
+
+/// `[n] = x · Wᵀ`, `W` `[n, k]` widened, each output through `rnd`.
+fn ga_gemv(x: &[f64], w: &[f64], n: usize, rnd: fn(f64) -> f64) -> Vec<f64> {
+    let k = x.len();
+    (0..n)
+        .map(|j| rnd(x.iter().zip(&w[j * k..][..k]).map(|(a, b)| a * b).sum()))
+        .collect()
+}
+
+/// Each `cols`-wide row of `x` RMS-normed (eps 1e-6) by `gain` (`None`: the unit norm).
+fn ga_norm(x: &[f64], cols: usize, gain: Option<&[f64]>, rnd: fn(f64) -> f64) -> Vec<f64> {
+    let eps = f64::from(common::gemma_attn::EPS);
+    (x.chunks_exact(cols))
+        .flat_map(|row| {
+            let inv = 1.0 / (row.iter().map(|v| v * v).sum::<f64>() / cols as f64 + eps).sqrt();
+            (row.iter().enumerate()).map(move |(d, v)| rnd(v * inv * gain.map_or(1.0, |g| g[d])))
+        })
+        .collect()
+}
+
+/// Each 256-lane head of `x` rotated in full at position `p`: the f64 angle's cos and sin for the
+/// reference, the bf16 table's for the emulation.
+fn ga_rope(x: &[f64], p: u32, emulate: bool, rnd: fn(f64) -> f64) -> Vec<f64> {
+    let half = GA_HD / 2;
+    let (c, s): (Vec<f64>, Vec<f64>) = if emulate {
+        let t = widen(&rotary_rows(&[p], GA_HD as u32, common::gemma_attn::THETA));
+        (t[..half].to_vec(), t[half..].to_vec())
+    } else {
+        (0..half)
+            .map(|i| {
+                let a =
+                    f64::from(p) / common::gemma_attn::THETA.powf(2.0 * i as f64 / GA_HD as f64);
+                (a.cos(), a.sin())
+            })
+            .unzip()
+    };
+    let mut out = x.to_vec();
+    for head in out.as_chunks_mut::<GA_HD>().0 {
+        let src = head.to_vec();
+        for d in 0..half {
+            head[d] = rnd(src[d] * c[d] - src[d + half] * s[d]);
+            head[d + half] = rnd(src[d + half] * c[d] + src[d] * s[d]);
+        }
+    }
+    out
+}
+
+/// Position `p`'s `(q, k, v)` through `rnd`: q and k projected, per-head normed and rotated, v
+/// projected and unit-normed per head. q only when `with_q`.
+fn ga_token(p: usize, w: &GaWeights, emulate: bool, with_q: bool) -> GaToken {
+    let rnd: fn(f64) -> f64 = if emulate { round_bf16 } else { |v| v };
+    let [g, wq, qn, wk, kn, wv, _] = &w.wide;
+    let n = ga_norm(&widen(&ga_x(p)), GA_H, Some(g), rnd);
+    let q = if with_q {
+        let q = ga_norm(&ga_gemv(&n, wq, GA_Q, rnd), GA_HD, Some(qn), rnd);
+        ga_rope(&q, p as u32, emulate, rnd)
+    } else {
+        Vec::new()
+    };
+    let k = ga_norm(&ga_gemv(&n, wk, GA_KV, rnd), GA_HD, Some(kn), rnd);
+    let k = ga_rope(&k, p as u32, emulate, rnd);
+    let v = ga_norm(&ga_gemv(&n, wv, GA_KV, rnd), GA_HD, None, rnd);
+    [q, k, v]
+}
+
+/// The k and v of positions `0 .. tokens` (both flavours), across the host's threads.
+fn ga_keys(w: &GaWeights, tokens: usize, emulate: bool) -> Vec<GaToken> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let per = tokens.div_ceil(threads);
+    std::thread::scope(|scope| {
+        let parts: Vec<_> = (0..threads)
+            .map(|t| {
+                scope.spawn(move || {
+                    (t * per..((t + 1) * per).min(tokens))
+                        .map(|p| ga_token(p, w, emulate, false))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        (parts.into_iter())
+            .flat_map(|h| h.join().expect("a reference thread"))
+            .collect()
+    })
+}
+
+/// The layer's output row at position `p` (16 heads over 8 kv heads, the window's keys), every
+/// stored value through `rnd`; the emulation also rounds each unnormalised `p` to bf16 before
+/// P·V, as the kernel does.
+fn ga_row(p: usize, keys: &[GaToken], w: &GaWeights, emulate: bool) -> Vec<f64> {
+    let rnd: fn(f64) -> f64 = if emulate { round_bf16 } else { |v| v };
+    let [q, ..] = ga_token(p, w, emulate, true);
+    let heads = GA_Q / GA_HD;
+    let first = (p + 1).saturating_sub(GA_W);
+    let mut attn = vec![0.0; GA_Q];
+    for h in 0..heads {
+        let kh = h / (heads / (GA_KV / GA_HD));
+        let qh = &q[h * GA_HD..][..GA_HD];
+        let s: Vec<f64> = (first..=p)
+            .map(|j| {
+                let kj = &keys[j][1][kh * GA_HD..][..GA_HD];
+                f64::from(common::gemma_attn::SCALE)
+                    * qh.iter().zip(kj).map(|(a, b)| a * b).sum::<f64>()
+            })
+            .collect();
+        let m = s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let e: Vec<f64> = s.iter().map(|x| (x - m).exp()).collect();
+        let l: f64 = e.iter().sum();
+        for d in 0..GA_HD {
+            let o: f64 = (first..=p)
+                .zip(&e)
+                .map(|(j, &ej)| rnd(ej) * keys[j][2][kh * GA_HD + d])
+                .sum();
+            attn[h * GA_HD + d] = rnd(o / l);
+        }
+    }
+    ga_gemv(&attn, &w.wide[6], GA_H, rnd)
+}
+
+/// One forward of bucket `b` over positions `p .. p + len`, the sequence's blocks `table`; the
+/// output's real rows. Each row's input is [`ga_x`] of its position (or `x` when given).
+fn ga_forward(
+    worker: &mut CudaWorker<'_>,
+    b: usize,
+    (p, len): (usize, usize),
+    table: &[u32],
+    x: Option<u16>,
+) -> Vec<u16> {
+    let m = gemma_attn_buckets()[b].bucket_m as usize;
+    let mut input = vec![0u16; m * GA_H];
+    for i in 0..len {
+        let row = match x {
+            Some(v) => vec![v; GA_H],
+            None => ga_x(p + i),
+        };
+        input[i * GA_H..][..GA_H].copy_from_slice(&row);
+    }
+    let seq = KvSequence {
+        block_table: &table[..(p + len).div_ceil(64)],
+        prefix_len: p as u32,
+        q_len: len as u32,
+    };
+    let mut y = vec![0u16; m * GA_H];
+    (worker.forward(
+        b,
+        Input::Hidden(&input),
+        &seq_positions(m, p as u32),
+        Some(&seq),
+        None,
+        &mut y,
+    ))
+    .expect("a Gemma sliding layer forward");
+    y.truncate(len * GA_H);
+    y
+}
+
+/// Prefill positions `0 .. tokens` in 512-row chunks through bucket 1.
+fn ga_prefill(worker: &mut CudaWorker<'_>, tokens: usize, table: &[u32]) {
+    for p in (0..tokens).step_by(512) {
+        ga_forward(worker, 1, (p, 512.min(tokens - p)), table, None);
+    }
+}
+
+/// CUDA's rows at `positions` (row `i` of `y` is position `positions[i]`) against the f64 layer,
+/// RMS and max error each at most 2× the bf16 emulation's.
+fn ga_check(
+    what: &str,
+    y: &[(usize, &[u16])],
+    (keys, emu_keys): (&[GaToken], &[GaToken]),
+    w: &GaWeights,
+) -> bool {
+    let (mut gpu, mut refs, mut emu) = (Vec::new(), Vec::new(), Vec::new());
+    std::thread::scope(|scope| {
+        let rows: Vec<_> = (y.iter())
+            .map(|&(p, _)| {
+                scope.spawn(move || (ga_row(p, keys, w, false), ga_row(p, emu_keys, w, true)))
+            })
+            .collect();
+        for (&(_, row), h) in y.iter().zip(rows) {
+            let (r, e) = h.join().expect("a reference thread");
+            gpu.extend(widen(row));
+            refs.extend(r);
+            emu.extend(e);
+        }
+    });
+    let finite = gpu.iter().all(|v| v.is_finite());
+    let (cuda_rms, cuda_max) = rms_max(&gpu, &refs);
+    let (emu_rms, emu_max) = rms_max(&emu, &refs);
+    let ok = finite && cuda_rms <= 2.0 * emu_rms && cuda_max <= 2.0 * emu_max;
+    eprintln!(
+        "gemma sliding layer {what} ({} rows): cuda_rms={cuda_rms:.4e} cuda_max={cuda_max:.4e} \
+         emulation_rms={emu_rms:.4e} emulation_max={emu_max:.4e} rms_ratio={:.4} max_ratio={:.4} \
+         finite={finite} {}",
+        y.len(),
+        cuda_rms / (2.0 * emu_rms),
+        cuda_max / (2.0 * emu_max),
+        verdict(ok)
+    );
+    ok
+}
+
+/// Gemma 4's sliding attention layer at the real geometry (H 2816, 16 q heads over 8 kv heads of
+/// 256, window 1024), at m = 512 and m = 1, against the f64 layer (CUDA's RMS and max error each at
+/// most 2× a host emulation's that rounds to bf16 where the tape stores): a fresh 512-row prefill
+/// (P = 0, no key outside any window), bit-identical to the same layer unwindowed; a chunk at
+/// P = 1500, L = 512 (the window drops keys); a decode chain from P = 1020 to 1030 across the
+/// window's first bite. Every eighth row of a prefill is checked.
+#[test]
+fn gemma_attn_sliding_layer_matches_the_f64_layer() {
+    let device = h100();
+    let tapes = gemma_attn_buckets();
+    for (b, t) in tapes[..2].iter().enumerate() {
+        let kinds: Vec<String> = (t.steps.iter())
+            .map(|s| format!("{s:?}").split('(').next().unwrap_or("").to_owned())
+            .collect();
+        eprintln!("gemma sliding layer bucket {b} m={}: {kinds:?}", t.bucket_m);
+    }
+    let w = ga_weights();
+    let weights = ga_table_buffers(&device, &w);
+    let mut worker = CudaWorker::new(&device, tapes, weights, GA_POOL, None).expect("worker");
+    let table = ga_table();
+    let tokens = 1500 + 512;
+    let (keys, emu_keys) = (ga_keys(&w, tokens, false), ga_keys(&w, tokens, true));
+    let kv = (&keys[..], &emu_keys[..]);
+    let rows_of = |y: &[u16], p: usize, len: usize| -> Vec<(usize, Vec<u16>)> {
+        (0..len)
+            .step_by(8)
+            .map(|i| (p + i, y[i * GA_H..][..GA_H].to_vec()))
+            .collect()
+    };
+    let check = |what: &str, rows: &[(usize, Vec<u16>)]| {
+        let y: Vec<(usize, &[u16])> = rows.iter().map(|(p, r)| (*p, &r[..])).collect();
+        ga_check(what, &y, kv, &w)
+    };
+    let mut pass = true;
+
+    let fresh = ga_forward(&mut worker, 1, (0, 512), &table, None);
+    pass &= check("fresh prefill P=0 L=512", &rows_of(&fresh, 0, 512));
+    let causal = ga_forward(&mut worker, 3, (0, 512), &table, None);
+    let mismatched = mismatched_bits(&fresh, &causal);
+    eprintln!(
+        "gemma sliding layer fresh prefill vs the unwindowed layer: mismatched_bits={mismatched} {}",
+        verdict(mismatched == 0)
+    );
+    pass &= mismatched == 0;
+
+    ga_prefill(&mut worker, 1500, &table);
+    let chunk = ga_forward(&mut worker, 1, (1500, 512), &table, None);
+    pass &= check("chunk P=1500 L=512", &rows_of(&chunk, 1500, 512));
+
+    ga_prefill(&mut worker, 1020, &table);
+    for p in 1020..=1030 {
+        let y = ga_forward(&mut worker, 0, (p, 1), &table, None);
+        pass &= check(&format!("decode P={p}"), &[(p, y)]);
+    }
+    assert!(
+        pass,
+        "the Gemma sliding layer is out of bound: see the lines above"
+    );
+}
+
+/// The layer's invariants: a forward after the arena was poisoned with bf16 NaN and the pool's
+/// blocks wholly below the window were overwritten with NaN K and V (a forward of NaN rows over
+/// them) is finite and bit-identical to one after a zero-filled arena, at m = 512 (P = 1500) and
+/// m = 1 (P = 1100); five forwards allocate nothing; repeats are bit-identical.
+#[test]
+fn gemma_attn_sliding_layer_invariants() {
+    let device = h100();
+    let tapes = gemma_attn_buckets();
+    let w = ga_weights();
+    let weights = ga_table_buffers(&device, &w);
+    let mut worker = CudaWorker::new(&device, tapes, weights, GA_POOL, None).expect("worker");
+    let table = ga_table();
+    let fill = tapes.len() - 1;
+    let bytes = tapes[fill].arena.total_bytes;
+    let mut pass = true;
+    for (b, p, len) in [(1usize, 1500usize, 512usize), (0, 1100, 1)] {
+        ga_prefill(&mut worker, p, &table);
+        fill_arena(&mut worker, fill, bytes, 0);
+        let clean = ga_forward(&mut worker, b, (p, len), &table, None);
+        // The blocks wholly below the lowest window floor of the forward.
+        let below = (p + 1).saturating_sub(GA_W) / 64;
+        ga_forward(&mut worker, 1, (0, below * 64), &table, Some(0x7FC0));
+        fill_arena(&mut worker, fill, bytes, 0x7FC0);
+        let poisoned = ga_forward(&mut worker, b, (p, len), &table, None);
+        let repeat = ga_forward(&mut worker, b, (p, len), &table, None);
+        let finite = all_finite_bf16(&poisoned);
+        let (poison, rep) = (
+            mismatched_bits(&poisoned, &clean),
+            mismatched_bits(&repeat, &poisoned),
+        );
+        let ok = finite && poison == 0 && rep == 0 && below > 0;
+        eprintln!(
+            "gemma sliding layer m={} P={p} L={len}: {below} blocks below the window NaN, arena NaN: \
+             nan_poison_vs_zero_mismatched_bits={poison} finite={finite} \
+             repeat_mismatched_bits={rep} {}",
+            tapes[b].bucket_m,
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    let at = device.allocations();
+    let first = [
+        ga_forward(&mut worker, 1, (1500, 512), &table, None),
+        ga_forward(&mut worker, 0, (1100, 1), &table, None),
+    ];
+    let mut identical = true;
+    for b in [1usize, 0, 1, 0, 1] {
+        let y = match b {
+            1 => ga_forward(&mut worker, 1, (1500, 512), &table, None),
+            _ => ga_forward(&mut worker, 0, (1100, 1), &table, None),
+        };
+        identical &= y == first[usize::from(b == 0)];
+    }
+    let during = device.allocations() - at;
+    eprintln!(
+        "gemma sliding layer five forwards (512, 1, 512, 1, 512): allocations={during} (expect 0) \
+         results_bit_identical={identical} {}",
+        verdict(during == 0 && identical)
+    );
+    pass &= during == 0 && identical;
+    assert!(
+        pass,
+        "a Gemma sliding layer invariant failed: see the lines above"
+    );
+}
+
+/// Each bf16 of `y` is finite.
+fn all_finite_bf16(y: &[u16]) -> bool {
+    y.iter()
+        .all(|&b| half::bf16::from_bits(b).to_f32().is_finite())
 }
