@@ -218,15 +218,17 @@ pub(crate) struct DecodeRung {
 }
 
 #[cfg(feature = "spyre-hw")]
-pub(crate) enum LogitsWanted<'a> {
-    /// Nothing — every prompt chunk but the last, which launches no suffix and reads nothing back.
+pub(crate) enum LogitsWanted {
+    /// Nothing — every prompt chunk but the final one, which launches no suffix and reads
+    /// nothing back.
     None,
-    /// The FOLDED `[1, vocab]` tail: one row at placement offset 0, whatever `m` the bundle ran at.
-    /// This is a prompt's tail, where only the last row's logits are ever sampled.
+    /// The FINAL prompt chunk: its suffix runs, the rung's own minted sampler picks the
+    /// first generated token on the card from the folded lm-head row, and the idx stick
+    /// is read back exactly like a decode launch's.
     LastRow,
-    /// One row PER REQUEST: the tail ran unfolded at `m = geom.rows`, so every row is a different
-    /// request's next-token distribution and all of them are sampled.
-    PerRequest(&'a LogitsGeom),
+    /// A DECODE BATCH: one row per request, every row a different request. The rung's
+    /// sampler picks every token on the card; the caller reads the idx stick back.
+    PerRequest,
 }
 
 /// The sendnn run backend selected from the baked bundle shape. DEFAULT-mode

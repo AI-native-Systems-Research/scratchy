@@ -101,6 +101,17 @@ pub enum Elementwise {
     Maximum,
     /// `min(a, b)`. Live on card already via the fp8 quantiser's clamp (`ktir_matmul_fp8.rs`).
     Minimum,
+    /// `a == b` as 0/1 fp16. `OpFunc::Equal`, dxp `"equal"` — the vendor realizes it as `EQUAL`
+    /// into a BOOL state reg then `SELECT(plus1, zero)` (`broadcast_ops.ddl:41`), so the
+    /// wire-level result IS fp16 0.0/1.0, the same arity-2 broadcast-op shape as
+    /// `maximum`/`minimum`. NaN compares FALSE, matching the emulator's ordered `cmpf oeq`.
+    ///
+    /// ⭐ IT IS BACK FOR THE SAMPLER (#813 carried it for the argmax; #926's revert took it
+    /// with the rest). The Gumbel-max body is an EQUALITY SELECTION — `score == max` is the
+    /// one-hot the staged ramps and index tables read the draw back out through — and no
+    /// other elementwise op expresses it: `maximum` answers the larger operand, not the
+    /// compare, and a subtract-then-sign trick rounds near-ties into false zeros in f16.
+    Equal,
 }
 
 impl Elementwise {
@@ -128,6 +139,7 @@ impl Elementwise {
         Elementwise::RealDiv,
         Elementwise::Maximum,
         Elementwise::Minimum,
+        Elementwise::Equal,
     ];
 }
 
@@ -197,6 +209,23 @@ pub enum Program {
     Reshape,
     ScalarMul,
     Matmul,
+    /// The token draw — `kernels/sample_fwd.py`: the FIRST-maximum index of
+    /// `logits·inv_T + g` over each row's `[1, PAD_V]` padded span, as that
+    /// row's `[1, 64]` i32 idx stick. THIRTEEN tensor parameters — the row,
+    /// its NOISE row and its temperature reciprocal (the three PER-ROW
+    /// operands: `[B, PAD_V]`, `[B, PAD_V]`, `[B, 1]`), the nine staged
+    /// tables that are functions of the vocab alone (the pad law's offset
+    /// row, the two-level ramp's three decreasing tables, the three
+    /// increasing index tables, the ones and sixtyfour widen tables), and
+    /// the output stick. The body is whole-row `tt.reduce` maxima, equality
+    /// compares and staged-table multiplies over generic ops, with the whole
+    /// selection IN F32 (the score is a sum; f16's 10-bit mantissa would
+    /// round near-ties into ties the reference never sees) and one fp32
+    /// island for the wide combine. The door reads NO fact off this program
+    /// — no epsilon, no scale, no geometry: the tables and the per-row
+    /// operands ride as ordinary tensor operands — so its arm is the plain
+    /// `whole_function::lower_function` route, exactly ArgMax's (#813).
+    Sample,
     /// The last-row extraction half of an lm-head tail — see [`KtirNode::node_out_tid`].
     LmLast,
     Rope,

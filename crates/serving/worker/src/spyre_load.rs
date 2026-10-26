@@ -320,36 +320,6 @@ pub(crate) fn gpu_tensor_bytes(t: &scratchy_tensors::GpuTensor) -> &[u8] {
 ///
 /// What remains is staging: orientation, device-width padding, K-splitting and
 /// the bf16→f16 narrow — h2d work, which is spyre's to do.
-#[allow(clippy::type_complexity)]
-/// The prefix-KV source ids of a wiring — placed, inside `0..num_sources`, and DEVICE-RESIDENT.
-///
-/// ⛔ THEY ARE NOT BOUND PER STEP. The cache lives in seg2 and is filled by the pool and by the
-/// device's own cachewr, so `Executor::require_sources_filled` must know to skip them or it
-/// refuses every launch. Derived from the wiring rather than listed by hand, so a model with a
-/// different layer count cannot desync it.
-#[cfg(feature = "spyre-hw")]
-fn resident_source_ids(
-    w: &scratchy_target_spyre::wiring::Wiring,
-    // ⛔ THE SPILLED WEIGHT TAIL BELONGS HERE, and leaving it out is a REFUSED LAUNCH, not a silent
-    // wrong answer — `require_sources_filled` classifies it `SourceFiller::Nobody` and stops.
-    //
-    // 🛑 MEASURED: `superdsc prefill run_step (mq=21, start=0): predict: 1 caller-filled source(s)
-    // were never written this step — t446`. A borrowing session binds NOTHING (that is the point:
-    // one stage+H2D for the whole ladder), so a weight normally classifies as
-    // `SourceFiller::SegmentOwner` — its segment is ALIASED and the owner filled it. A spilled tail
-    // cannot be aliased (its slot also holds an intermediate color, whose extent is m-dependent, so
-    // no two bundles agree on the segment's size), so it is handed over as a COPY into this session's
-    // own region instead — `adopt_from_owner`. Nothing binds it and nothing aliases it, so the only
-    // accurate answer left is that the LOADER declared it resident, which is what this list says.
-    spilled_weight_tail: &[u32],
-) -> Vec<u32> {
-    w.layers
-        .iter()
-        .flat_map(|l| [l.prefix_k, l.prefix_v])
-        .chain(spilled_weight_tail.iter().copied())
-        .collect()
-}
-
 /// The tensor ids of the spilled weight tail — the companion of [`spilled_weight_spans`], which
 /// carries the same decision as byte ranges. Both key on the bake's verdict, `layout.weight_tail`:
 /// a bound weight is in the tail exactly when it is placed in the slot that verdict names.
@@ -1989,38 +1959,33 @@ impl SpyreWorker {
                         // the BORROWING form — identical to every ladder rung: placeholders here,
                         // `adopt_from_owner` onto decode's regions after the owner is built — when
                         // it does not. What that costs is the placement effect, never the run.
+                        // ⭐ THE PREFILL WIRING'S OWN STAGED CONSTANTS — the general mint puts
+                        // the sampler's nine tables in every prefill rung, and they sit in each
+                        // session's own seg3 (never aliased), so every prefill session stages
+                        // its own copy through the same load-time channel the decode rungs use.
+                        let prefill_consts = wirings
+                            .prefill
+                            .as_ref()
+                            .unwrap_or(&wirings.decode)
+                            .load_consts;
                         let pss = if anchor_reserves {
                             SuperDscSession::new_reserving(
                                 pcode,
                                 vocab,
                                 kv_dim,
                                 num_blocks,
-                                wirings
-                                    .prefill
-                                    .as_ref()
-                                    .unwrap_or(&wirings.decode)
-                                    .num_sources,
-                                &resident_source_ids(
-                                    wirings.prefill.as_ref().unwrap_or(&wirings.decode),
-                                    &spill_tids,
-                                ),
+                                prefill_consts,
+                                &spill_tids,
                             )
                         } else {
-                            SuperDscSession::new_borrowing(
+                            SuperDscSession::new_borrowing_with_consts(
                                 pcode,
                                 vocab,
                                 kv_dim,
                                 num_blocks,
-                                wirings
-                                    .prefill
-                                    .as_ref()
-                                    .unwrap_or(&wirings.decode)
-                                    .num_sources,
-                                &resident_source_ids(
-                                    wirings.prefill.as_ref().unwrap_or(&wirings.decode),
-                                    &spill_tids,
-                                ),
                                 &RESIDENT_SEGS.map(|(seg, _)| seg),
+                                prefill_consts,
+                                &spill_tids,
                             )
                         }
                         .map_err(|e| werr(format!("build SuperDSC PREFILL dxp session: {e}")))?;
@@ -2110,6 +2075,13 @@ impl SpyreWorker {
                 // ⛔ THE LADDER STILL BUILDS IN PARALLEL. This reorders WHO ALLOCATES FIRST; it does not
                 // serialize startup, and the aliasing after the join is unchanged.
                 let ladder_join = {
+                    // The prefill wiring's staged constants, staged by every rung through its own
+                    // seg3 (the general mint's nine tables — see the anchor's own `prefill_consts`).
+                    let prefill_consts = wirings
+                        .prefill
+                        .as_ref()
+                        .unwrap_or(&wirings.decode)
+                        .load_consts;
                     let nthreads = std::thread::available_parallelism()
                         .map(|n| n.get())
                         .unwrap_or(4)
@@ -2133,17 +2105,18 @@ impl SpyreWorker {
                             .into_iter()
                             .map(|part| {
                                 let rung_spill = ladder_spill.clone();
+                                let rung_consts = prefill_consts;
                                 std::thread::spawn(move || {
                                     part.into_iter()
                                         .map(|(rm, rcode)| {
-                                            let r = SuperDscSession::new_borrowing(
+                                            let r = SuperDscSession::new_borrowing_with_consts(
                                                 rcode,
                                                 vocab,
                                                 kv_dim,
                                                 num_blocks,
-                                                wirings.decode.num_sources,
-                                                &resident_source_ids(&wirings.decode, &rung_spill),
                                                 &[1, 2],
+                                                rung_consts,
+                                                &rung_spill,
                                             );
                                             (rm, r)
                                         })
@@ -2168,9 +2141,9 @@ impl SpyreWorker {
                     vocab,
                     kv_dim,
                     num_blocks,
-                    wirings.decode.num_sources,
-                    &resident_source_ids(&wirings.decode, &spill_tids),
                     weights,
+                    wirings.decode.load_consts,
+                    &spill_tids,
                 )
                 .map_err(|e| werr(format!("build SuperDSC dxp session: {e}")))?;
                 // ⭐ THE SPILLED WEIGHT TAIL'S DEVICE IMAGE, read back from the OWNER once its
@@ -2347,21 +2320,19 @@ impl SpyreWorker {
                         .strip_prefix(SUPERDSC_SENTINEL)
                         .and_then(scratchy_target_spyre::bundle_code::bundle)
                     {
-                        Some(pcode2) => match SuperDscSession::new_borrowing(
+                        Some(pcode2) => match SuperDscSession::new_borrowing_with_consts(
                             pcode2,
                             vocab,
                             kv_dim,
                             num_blocks,
+                            &[1, 2],
+                            // The general mint's nine tables, this bundle's own seg3 copy.
                             wirings
                                 .prefill
                                 .as_ref()
                                 .unwrap_or(&wirings.decode)
-                                .num_sources,
-                            &resident_source_ids(
-                                wirings.prefill.as_ref().unwrap_or(&wirings.decode),
-                                &spill_tids,
-                            ),
-                            &[1, 2],
+                                .load_consts,
+                            &spill_tids,
                         ) {
                             Ok(mut ps) => match adopt_from_owner(&mut ps, &ss, &spill_images) {
                                 Ok(()) => {
@@ -2548,14 +2519,14 @@ impl SpyreWorker {
                         );
                         continue;
                     };
-                    match SuperDscSession::new_borrowing(
+                    match SuperDscSession::new_borrowing_with_consts(
                         rcode,
                         vocab,
                         kv_dim,
                         num_blocks,
-                        wirings.decode.num_sources,
-                        &resident_source_ids(&wirings.decode, &spill_tids),
                         &[1, 2],
+                        wirings.decode.load_consts,
+                        &spill_tids,
                     ) {
                         Ok(mut rs) => {
                             let mut ok = true;

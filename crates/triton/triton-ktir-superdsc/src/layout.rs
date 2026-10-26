@@ -146,7 +146,7 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     // contract agrees independently (`semantic.py`'s `descriptor_gather` asserts an int16/int32
     // index vector; `embedding.py` declares `desc_ids` as `*i32` for exactly this reason).
     for g in &gathers {
-        let idx_dtype = index_view_dtype(node, g.index_tid);
+        let idx_dtype = param_view_dtype(node, g.index_tid);
         if idx_dtype != Some(ktir_core::dtypes::DType::I32) {
             return Err(Error {
                 stage: "layout",
@@ -224,25 +224,51 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // element product is the buffer's; `Region`'s own doc is explicit that the view shape is
         // not always the tensor's shape (rope views `x` as `[rows·heads, hd]`), and it is the
         // shape every descriptor here addresses through.
-        // ⭐⭐⭐ A GATHER'S INDEX BUFFER IS FOUR BYTES AN ELEMENT, AND THE FOOTPRINT GUARD IS WHY THIS
-        // CANNOT BE LEFT AT THE fp16 DEFAULT. `Region` states a view's fp8-ness and nothing else, so an
-        // `*i32` parameter was sized as if it were fp16 — 512 B for `embedding.py`'s `[256]` id vector
-        // against the 1024 B it really is. `resolve_seg_base`'s guard then compares the descriptor's
-        // 1024 B access against that 512 B placement and refuses the CORRECT descriptor:
-        //   `t0: access offset 0B + 1024B exceeds its placement footprint 512B (seg3)`
-        // — measured, and the reason this arm exists. Had the numbers happened to fit, the other
-        // direction would have been worse: the guard would have waved through an access reaching into
-        // whatever is packed next.
+        // ⭐⭐⭐ THE FORMAT IS THE PARAMETER'S OWN VIEW DTYPE, READ PER PARAMETER — not an fp16
+        // default with two carved exceptions. `Region` states a view's fp8-ness and nothing else,
+        // so this used to size every other parameter as if it were fp16 — which was measured to
+        // refuse the CORRECT descriptor the moment a kernel carries a non-fp16 parameter:
+        //   `t6: access window end 256B (offset 0B, operand 256B) exceeds its placement
+        //    footprint 128B (seg3)`
+        // for argmax's `[1,64]` f32 `sixtyfour` table — the f32 mulf accesses 256 B (64 × 4 B)
+        // against a 128 B (64 × 2 B) placement. Had the numbers happened to fit, the other
+        // direction would have been worse: the guard would have waved through an access reaching
+        // into whatever is packed next.
         //
-        // The format is [`Df::Uint32`], which is the format the DESCRIPTOR declares for that operand
-        // (`Role::KernelIdx` ⇒ SENUINT32, `wordLength` 4) — so the placement and the access are sized in
-        // ONE format rather than in two that have to agree.
-        let df = if index_tids.contains(&reg.tid) {
-            Df::SenUint32
-        } else if reg.is_fp8 {
-            Df::Fp8
-        } else {
-            Df::Fp16
+        // The dtype is the `ktdp.construct_memory_view`'s own `Dtype` — the only statement of that
+        // buffer's element width anywhere in the program — read by [`param_view_dtype`] through
+        // the SAME tid→parameter join [`regions`] itself uses. The mapping is one-to-one onto the
+        // formats the device has: F16→Fp16, F32→Fp32 (4 B / 32-stick), Fp8E4m3→Fp8 (which is what
+        // `Region::is_fp8` states, so the two readers agree by construction), I32→SenUint32 (4 B —
+        // the gather-index law below, now reached by the view's own dtype rather than by tid, and
+        // covering an `*i32` OUTPUT like argmax's `idx_ptr` exactly as it always covered the index).
+        // A view that states NO dtype is placed at fp16: that is the behavior-preserving reading
+        // (every parameter of every config that baked before states F16, Fp8E4m3 or the gather's
+        // I32, so this arm changes no existing placement), and "not stated" still cannot hide an
+        // over-run — the footprint guard compares the descriptor's access, sized by the OPS' own
+        // result types, against this placement, so an unstated-dtype parameter read at 4 B/elem is
+        // refused loudly rather than waved through. Every OTHER stated dtype (i1, i64) has no
+        // device format at all and is refused BY NAME — sizing it at fp16 would over-reserve and
+        // turn the guard into a rubber stamp for exactly the access it exists to catch.
+        let df = match param_view_dtype(node, reg.tid) {
+            Some(ktir_core::dtypes::DType::F16) => Df::Fp16,
+            Some(ktir_core::dtypes::DType::F32) => Df::Fp32,
+            Some(ktir_core::dtypes::DType::Fp8E4m3) => Df::Fp8,
+            Some(ktir_core::dtypes::DType::I32) => Df::SenUint32,
+            None => Df::Fp16,
+            Some(other) => {
+                return Err(Error {
+                    stage: "layout",
+                    message: format!(
+                        "{name}: the parameter t{} states element type {other:?}, which has no \
+                         device format — the placement would have to be sized at some other \
+                         format's bytes and the footprint guard would then be comparing an access \
+                         against a fiction. Give the buffer a dtype the device has (f16, f32, \
+                         f8E4M3FN, i32) or lower it through a view that states one.",
+                        reg.tid,
+                    ),
+                });
+            }
         };
         // ⛔⛔⛔ A RUNG-3 BOUND SCALE — a `[1,1]` PARAMETER — IS 2 B, NOT ITS STICK-PADDED
         // FOOTPRINT. `synth_footprint_bytes(&[1,1], Fp16)` pads the inner axis to the
@@ -501,6 +527,21 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
             .collect::<std::collections::BTreeMap<_, _>>(),
     );
 
+    // ⭐ THE GRAPH'S OWN SOURCE BOUND — the kernel's own tensor parameters: every Activation-role
+    // placement that is not a reserved const (P, the scale consts and the fp8 bounds are
+    // producer-staged, not caller-filled). The exclusive bound of those tids, the same fact
+    // `bundle_run`'s launch-time `declare_sources` derives from the bound inputs — stated here so
+    // the bundle carries it, per the `SegRole::Logits` law that a session reads a bundle's facts
+    // off the bundle. Computed BEFORE the literal, which moves `placements`.
+    let num_sources = placements
+        .values()
+        .filter(|p| {
+            p.role == SegRole::Activation && !ktir_superdsc::reserved_tids::is_reserved(p.tid)
+        })
+        .map(|p| p.tid + 1)
+        .max()
+        .unwrap_or(0);
+
     Ok(BundleLayout {
         placements,
         ids,
@@ -547,6 +588,12 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // No paged KV in a single Triton kernel's parameter list; 0 is the documented "no paged KV"
         // value, not a placeholder.
         kv_request_stride_bytes: 0,
+        // ⭐ THE GRAPH'S OWN SOURCE BOUND — computed above the literal (which moves `placements`).
+        num_sources,
+        // No source is resident: a single Triton kernel has no prefix-KV cache for the device to
+        // fill and no load-time constant tables for an owner session to bind — the consts above
+        // are staged by the runner, not excused from the bind walk.
+        resident_source_tids: Vec::new(),
     })
 }
 
@@ -556,10 +603,17 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
 ///
 /// The tid→parameter join is [`regions`]' own (`bindings[i]` is the tensor `arguments[i]` points at), so
 /// this reaches the same parameter that walk does rather than keeping a second copy of the mapping.
+/// It is read for EVERY parameter now, not just a gather's index: the placement's `Df` — and so its
+/// byte footprint — is derived from it (see the `df` arm in [`for_regions`]), because sizing an
+/// `*i32` or `*f32` parameter at fp16 bytes is measured to refuse the correct descriptor.
 ///
-/// `None` when nothing is bound to `tid` or its view carries no dtype. The caller turns that into a
-/// refusal rather than a default: "not stated" and "stated as i32" are different facts.
-fn index_view_dtype(node: &KtirNode, tid: u32) -> Option<ktir_core::dtypes::DType> {
+/// `None` when nothing is bound to `tid` or its view carries no dtype. The gather-index check turns
+/// that into a refusal rather than a default: "not stated" and "stated as i32" are different facts.
+/// For the placement itself `None` reads as fp16 — the behavior-preserving choice, since every
+/// parameter of every config that baked before states F16, Fp8E4m3 or the gather's I32 — and the
+/// footprint guard still catches an access the placement under-sized, so the default cannot hide an
+/// over-run.
+fn param_view_dtype(node: &KtirNode, tid: u32) -> Option<ktir_core::dtypes::DType> {
     use ktir_core::attrkey::AttrKey;
     use ktir_core::ir::Attr;
     use ktir_core::opkind::OpKind;
@@ -633,7 +687,11 @@ fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
         | Program::SiluMul
         | Program::LmLast
         | Program::Transpose
-        | Program::Matmul => None,
+        | Program::Matmul
+        // The sampler's tables (and its per-row noise and temperature operands) ride as
+        // ORDINARY tensor operands (the node's own inputs, placed like every staged
+        // buffer) — no reserved tid names one.
+        | Program::Sample => None,
         // ⭐ NO ENTRY POINT ON THIS LADDER, SO NO CONSTANTS TO NAME. None of these programs has a
         // body this crate's door can reach — the splice's registry produces none of them (its
         // by-name refusals stop their SubOps at the producer), and the door itself refuses them by
@@ -864,7 +922,10 @@ fn scales_for(p: Program, f: &IRFunction<'static>) -> Vec<f32> {
         | Program::LmLast
         | Program::Transpose
         | Program::Matmul
-        | Program::Rope => Vec::new(),
+        | Program::Rope
+        // The sampler's tables are tensor operands, never `scalarmul_scales` lookups —
+        // a value registered for it would occupy a slot nothing asks for.
+        | Program::Sample => Vec::new(),
         // ⭐ EMPTY FOR THE SAME REASON, ONE STEP EARLIER: none of these programs has a body on
         // this ladder (the splice produces none of them and the door refuses them by name), so
         // there is no body to ask which values it looks up. A value registered for a program that

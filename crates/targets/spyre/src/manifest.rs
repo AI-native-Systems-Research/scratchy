@@ -419,78 +419,12 @@ pub fn rope_cos_sin_kind(pos: u32, kind: crate::wiring::RotaryKind) -> (Vec<f32>
     (cos, sin)
 }
 
-/// argmax of a logits row — the FIRST maximum, NaN-skipping, floored at 0.
-///
-/// The device's law, pinned from the vendor's own soft model (the senulator's
-/// `minMaxOps`/`selectOp`: the running max starts at the fp16 floor and an
-/// element's index replaces the winner only on STRICT improvement) and matched
-/// by every other device path we ship — metal's argmax kernels scan with
-/// strict `>` (`sampling.metal`'s fallback is the in-tree witness). The old
-/// host form, `max_by(partial_cmp().unwrap())`, diverged from all of them
-/// twice: Rust's `max_by` returns the LAST of equal maxima, and any NaN in
-/// the row panicked the closure's `unwrap` mid-serving. Here the running max
-/// starts at the most-negative finite fp16 (the device's `0xFFFE` init, as
-/// f32) and an element wins only on strict `>` — ties keep the earliest
-/// index, and a NaN operand (like anything at or below the floor) never wins
-/// and never panics. A row where nothing strictly beats the floor (all-NaN,
-/// or every element ≤ −65504) leaves the device's index register at its −1
-/// init, which the loop-closure group's `FMAX(idx, 0)` floor reads as token
-/// 0; this form returns 0 directly, so host and device agree before that
-/// group exists. An empty row returns 0, as before.
-pub fn argmax(logits: &[f32]) -> usize {
-    let mut best = -65504.0f32;
-    let mut best_i = 0usize;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best {
-            best = v;
-            best_i = i;
-        }
-    }
-    best_i
-}
-
-#[cfg(test)]
-mod argmax_tests {
-    use super::argmax;
-
-    /// Ties keep the EARLIEST index — the old `max_by` form returned 3 here.
-    #[test]
-    fn ties_take_the_first_maximum() {
-        assert_eq!(argmax(&[1.0, 3.0, 2.0, 3.0, 0.5]), 1);
-    }
-
-    /// A NaN never wins and never panics: it is skipped like any
-    /// non-improving element, and the first real maximum still lands.
-    #[test]
-    fn nan_rows_are_skipped_not_fatal() {
-        assert_eq!(argmax(&[1.0, f32::NAN, 3.0, f32::NAN, 3.0]), 2);
-        assert_eq!(argmax(&[f32::NAN, 5.0, 5.0]), 1);
-    }
-
-    /// A row where nothing strictly beats the fp16 floor: the device's index
-    /// register stays at its −1 init (read as token 0 once floored), so the
-    /// host returns 0 — never a wild index.
-    #[test]
-    fn rows_that_beat_nothing_floor_to_zero() {
-        assert_eq!(argmax(&[f32::NAN; 7]), 0);
-        assert_eq!(argmax(&[-65504.0; 9]), 0);
-        assert_eq!(argmax(&[-70000.0, -70000.0]), 0);
-    }
-
-    /// Elements below the fp16 floor do not beat the floor, but a later
-    /// in-range element still wins its index — the senulator's exact state
-    /// transition.
-    #[test]
-    fn below_floor_rows_still_admit_a_later_winner() {
-        assert_eq!(argmax(&[-70000.0, -60000.0]), 1);
-    }
-
-    #[test]
-    fn degenerate_rows() {
-        assert_eq!(argmax(&[42.0]), 0);
-        assert_eq!(argmax(&[]), 0);
-    }
-}
+// ⛔ THE HOST ARGMAX IS DELETED, AND ITS DOC IS KEPT AS THE LAW IT PINNED: the
+// device's draw is the FIRST maximum, NaN-skipping, floored at 0 — the running
+// max starts at the most-negative finite fp16 (the senulator's `0xFFFE` init)
+// and an element's index replaces the winner only on STRICT improvement, so
+// ties keep the earliest index. That law now lives in the minted sampler's
+// on-card kernel (sample_fwd.py); no host form of it may come back.
 
 #[cfg(test)]
 mod rope_tests {

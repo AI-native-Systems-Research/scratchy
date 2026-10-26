@@ -185,6 +185,11 @@ pub fn lower(
         Program::SiluMul => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
         Program::RmsNorm => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
         Program::ScalarMul => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
+        // ⭐ THE TOKEN DRAW — the whole-function walk, like every pointwise kind:
+        // a straight-line body of whole-row reduces, equality compares and staged-table
+        // multiplies over generic ops, whole-tensor at corner 0 (the splice's own
+        // region guard refuses a windowed one). No door fact is read off the program.
+        Program::Sample => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
         Program::RmsNormUnit => {
             windowed(name, &r, lk::rmsnorm_unit(name, k, &r, sym_id_base, layout))
         }

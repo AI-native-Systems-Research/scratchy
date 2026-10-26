@@ -58,6 +58,10 @@ pub mod addr;
 /// and `ir::bridge::tiled_op_sdsc_op::attn` — which its doc always said could not — now really
 /// cannot.
 pub mod emit;
+/// ⭐ THE `dl16tofp32` LANE STAGGER as TARGET-ABI CONST TABLES — `ElementArrangement`, the
+/// 64-entry permutation, the opcode→arrangement table the bake-side propagation takes as input,
+/// and the one staging derivation every stager calls. See the module header for the measurement.
+pub mod element_arrangement;
 /// THE TileIR PIPELINE — the assemblers' INPUT type (`TileOp`/`TileOpKind`/`TiledOp`) and the tiler
 /// between them, plus the span-overflow refusal. Came in as an audit correction: the extraction filed
 /// the lowering's input as `KtirNode`, but every assembler under it takes a `&TileOp`.

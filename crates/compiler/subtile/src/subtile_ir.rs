@@ -855,6 +855,11 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | SubOp::RouteGatherScores
             | SubOp::RouteRenorm
             | SubOp::ExpertUnsort => {}
+            // The vocab and the row count are class: two vocab widths are
+            // different programs (every staged table and the whole row's tile
+            // shape key off it), and so are two batch widths (the grid and
+            // every per-row operand's shape key off it).
+            SubOp::Sample { vocab, rows } => (vocab, rows).hash(h),
             SubOp::Mamba2 { inner } => inner.hash(h),
             SubOp::RouterNorm { eps, router } => (eps.to_bits(), router).hash(h),
             SubOp::RouterLogits { experts, router } => (experts, router).hash(h),
@@ -1342,6 +1347,75 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// `inputs` = `[rows, over, weight…]`: the gathered activation, the output it replaces, and
     /// the matmul's weight operands.
     AllRowsMatmul,
+
+    // ── The token draw (see `kernels/sample_fwd.py`) ─────────────────
+    /// The FIRST-maximum Gumbel-max draw over a `[rows, PAD_V]` logits block,
+    /// as the `[rows, BLOCK]` i32 idx stick the device's index ingestion
+    /// reads — one program per row, at EVERY decode rung (the solo m=1 rung
+    /// and every batched rung alike; a batched rung without the sampler does
+    /// not build). `inputs` = `[logits, noise, invt, bramp, lramp, binc,
+    /// linc, ones, sixtyfour, padoff, gramp, ginc]`: the `[rows, PAD_V]`
+    /// fp16 block (whose pad bytes are NOT this op's contract — the
+    /// lm-head's zero-pad columns write 0.0 there every step), the two
+    /// PER-ROW, PER-STEP staged operands (the `[rows, PAD_V]` f32 noise
+    /// block — the host's SplitMix64 Gumbel draws, 0.0 on the pads (the
+    /// pads are ruled by `padoff` alone), zeros
+    /// at the greedy temperature 0 — and the `[rows, 1]` f32 temperature
+    /// reciprocals), then the nine staged tables, functions of `vocab`
+    /// alone, constant across decode steps — the two decreasing ramps that
+    /// make the maxima first-max by monotonicity, the two increasing index
+    /// tables that read the selection back out, the two widen tables that
+    /// keep every broadcast a two-tensor multiply, the OFFSET row that
+    /// carries the pad law (0.0 on the real lanes, f32::MIN (−FLT_MAX,
+    /// 0xFF7FFFFF) on the pads — the fp32 reduce template's own "negInf",
+    /// NEVER IEEE −inf, which the card reads as NaN; the kernel adds it
+    /// LAST, after the score's two roundings, so a pad lane can never win
+    /// and an all-−FLT_MAX row still answers lane 0), and the two-level
+    /// ramp's GROUP pair. An all-NaN row answers past the last real lane (the
+    /// sentinel); the consumer refuses `idx > vocab` loudly rather than feed
+    /// a NaN-born index to the detokenizer.
+    Sample { vocab: u32, rows: u32 },
+}
+
+/// The token draw's padded row: the vocab rounded up to a power-of-two whole
+/// row, STRICTLY ABOVE the vocab — the descriptor block's own law (the block
+/// must be a power of two) AND the sentinel law's (a power-of-two vocab still
+/// needs pad lanes to land its all-NaN one-hot on, so a vocab that is already
+/// a power of two rounds to the NEXT one up: gemma-4's 262144 pads to
+/// 524288). ONE derivation, read by the host reference, the splice's
+/// constexpr flow, and the load-time table staging, so no two of them can
+/// disagree.
+pub fn sample_pad_vocab(vocab: u32) -> u32 {
+    let pad = vocab.max(1).next_power_of_two();
+    if pad == vocab {
+        pad * 2
+    } else {
+        pad
+    }
+}
+
+/// The token draw's stick width — the idx stick's own lane count and the
+/// per-lane tables' (`ones`, `sixtyfour`) width. ONE derivation for every
+/// reader: the registry's `[stick]` out-cols class, the splice's `NB`/`BLOCK`
+/// constexprs, the host reference's sentinel arithmetic, and the mint's
+/// output tensor — four sites that must all move together if the stick ever
+/// widens.
+pub const SAMPLE_BLOCK: u32 = 64;
+
+/// The token draw's GROUP width — the number of 64-lane blocks per group in
+/// the two-level ramp. The staged block ramp is PERIODIC with this period
+/// (strictly decreasing within each group, restarting per group), so its lane
+/// values top out at 64 — exact at ANY vocab — while the group ramp above it
+/// tops out at the group count, which the admission gate keeps ≤ 2048 (exact
+/// in the f32 selection). ONE derivation shared by the staged tables, the
+/// admission gate, and the sentinel arithmetic.
+pub const SAMPLE_GROUP_BLOCKS: u32 = 64;
+
+/// The token draw's group count — `pad_vocab` split into
+/// [`SAMPLE_GROUP_BLOCKS`]-block groups. The two-level ramp's outer level and
+/// the group index table's ceiling.
+pub fn sample_groups(pad_vocab: u32) -> u32 {
+    pad_vocab / (SAMPLE_BLOCK * SAMPLE_GROUP_BLOCKS)
 }
 
 // ── Nodes & graph ──────────────────────────────────────────────────
@@ -1400,6 +1474,255 @@ impl<F: RopeForm> SubtileIR<F> {
     /// construction (the const generic guarantees it).
     pub const fn rope_form(&self) -> RopeFormTag {
         F::TAG
+    }
+}
+
+// ── The token draw's mint (see `kernels/sample_fwd.py`) ───────────
+
+/// What [`mint_sample`] inserted, for the caller's bake log and the wiring.
+#[derive(Clone, Copy, Debug)]
+pub struct SampleMint {
+    /// The EMITTED vocab — the result row's own width, the sentinel threshold
+    /// the consumer refuses past. Never the model config's word for it.
+    pub vocab: u32,
+    /// `sample_pad_vocab(vocab)` — the width the result row was widened to
+    /// and the whole-row tables share.
+    pub pad_vocab: u32,
+    /// The row count the rung serves — the node's grid width and every
+    /// per-row operand's row count. The rung's OWN rows, read off its result
+    /// tensor: the solo m=1 rung mints at 1, every batched rung at its own
+    /// width.
+    pub rows: u32,
+    /// The minted NOISE source's tid — the `[rows, pad_vocab]` f32 block the
+    /// worker stages EVERY STEP (the host's SplitMix64 Gumbel draws). The
+    /// wiring names it to the worker through the mint's facts; it is never a
+    /// load-time const.
+    pub noise: TensorId,
+    /// The minted INVT source's tid — the `[rows, 1]` f32 temperature
+    /// reciprocals, staged every step with the noise.
+    pub invt: TensorId,
+}
+
+/// The rows the suffix's lm-head computes — the FOLD LAW the splice already
+/// states (`is_prefill_lm_head_tail`), handed to the mint by the caller and
+/// never re-derived here. A DECODE graph computes every result row (the solo
+/// rung's one, a batch rung's one per request); a PREFILL graph's lm-head tail
+/// is FOLDED to one row (the emitter re-lowers the matmul at m=1 over the last
+/// prompt row, `lower_prefill_lm_head_fold`), so the draw serves that one row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SampleRows {
+    /// Every result row is computed and drawn — the decode rungs.
+    All,
+    /// The folded lm-head row alone — the prefill rungs. The Sample node reads
+    /// the region the fold writes (the tail matmul's own one-row output region,
+    /// the same `one_row` law the emitter's re-lowering keeps), and the seat,
+    /// the idx stick and every per-row operand sit at rows = 1 — the proven
+    /// solo-decode shape.
+    Folded,
+}
+
+/// Append the token draw to a graph — every rung's own row count, the solo m=1
+/// decode rung, every batched rung, and every prefill rung alike: two per-row
+/// per-step staged sources (noise, invt), nine staged-table sources, the
+/// result tail chain's tensors widened to `[rows, PAD_V]`, the `Sample` node
+/// reading the widened block (every row on a decode rung; the folded row alone
+/// on a prefill rung — [`SampleRows`]), and the graph's RESULT re-pointed to
+/// the node's idx stick. Pure graph surgery — the GATE (which rungs mint, and
+/// which rows their suffix computes) is the caller's fact; this fn states only
+/// its own invariants and panics on their violation, which at expansion time
+/// is a build error, never a runtime one.
+///
+/// ⭐ THE ANSWER RE-POINT: `result` names the idx stick, so every seat keyed
+/// on the result — the wiring's `result` tid, the placement pass's
+/// `SegRole::Logits` classification, the worker's readback — addresses the
+/// picked tokens, and the dtype the kernel's own signature states for that
+/// output (`i32`) rides the wiring as the fact that tells the consumer to
+/// read it RAW instead of through the f16 convert. The ROW is NOT deleted:
+/// it stays exactly where the mint put it, a placed op output readable by
+/// tid — the re-point is the draw's redirect of the ANSWER, never a removal
+/// of the row it was drawn from (the test oracle's logits readback is that
+/// row's own reader, and it is why the row must survive the mint).
+///
+/// ⭐ THE ELEVEN SOURCES ARE INSERTED AT `[num_sources, num_sources+11)`, NOT
+/// APPENDED: sources must hold `tensors[0..num_sources]`, so the insert
+/// renumbers every op-output `TensorId` up by eleven — nodes' input/output
+/// regions, `op_output`, and `result` (validate demands the result is an op
+/// output, so it always moves). Source ids below the old `num_sources` are
+/// UNTOUCHED, which is what keeps the caller's `weight_ids` and the wiring's
+/// binding scan valid against the minted graph. The nine tables carry NO
+/// `SourceBinding` and stage at LOAD through the wiring's `load_consts` (the
+/// rope tables' law); the noise and invt sources carry none either but stage
+/// EVERY STEP through the worker's sampler seat (the mint's facts name their
+/// tids) — they are minted below the `LoweredDecode` layer like the tables
+/// (the `embed_src` law: the answer, not the data to compute it from).
+///
+/// ⭐ THE WHOLE TAIL CHAIN IS WIDENED, NOT THE RESULT ALONE: the tail's
+/// writers are column-CHUNKED at production `nb` (granite's vocab 49155 is
+/// seven chunks), and a chunked pointwise node's window law demands every
+/// operand's TENSOR hold the same width — widening only the result made the
+/// epilogue's chunks disagree (output a PAD_V-wide storage, input a
+/// vocab-wide one) and the splice refused the node. The walk is the
+/// admission's own tail walk (single-input `ScalarMul`/`TanhSoftCap`
+/// epilogues back to the lm-head `MatmulTile`; anything else panics — the
+/// admission gate already refused it, so the mint was called outside its
+/// gate). Every writer keeps its own region — `[0, vocab)` exactly as before
+/// — so the pad tail `[vocab, PAD_V)` is written by no node below, and no
+/// staging covers it either: the pad law rides the OFFSET row (a staged
+/// table), which the kernel adds to the row before its first max, so the
+/// tail's raw bytes (the lm-head's zero-pad 0.0 columns) never reach a max.
+///
+/// ⭐ THE WIDENING IS THIS RUNG'S OWN: every decode rung mints at its own row
+/// count (the solo rung at 1, a batched rung at its baked width), so each
+/// graph (and its bundle's seg4) carries its own padded block — the mint
+/// reads the row count off the result tensor and never assumes one. A prefill
+/// rung mints at the FOLDED row's 1 whatever its `mq` (the suffix computes one
+/// logits row; a draw at `mq` would read rows nobody wrote and break the
+/// kernel's grid law).
+pub fn mint_sample<F: RopeForm>(
+    graph: &mut SubtileIR<F>,
+    suffix: SampleRows,
+) -> SampleMint {
+    let result_rows = graph.tensors[graph.result.index()].rows;
+    let vocab = graph.tensors[graph.result.index()].cols;
+    let pad_vocab = sample_pad_vocab(vocab);
+    let rows = match suffix {
+        SampleRows::All => result_rows,
+        SampleRows::Folded => 1,
+    };
+    assert!(
+        rows >= 1,
+        "the sampler serves at least one row; this graph's result tensor has {result_rows} rows"
+    );
+    // The eleven staged sources, in the kernel's operand order after the row:
+    // the per-row per-step pair first (the noise block and the temperature
+    // reciprocals), then the nine load-time tables — the two decreasing ramps
+    // and the two increasing index tables (whole-row `[1, PAD_V]`, shared by
+    // every row), the two per-lane widen tables (`[1, BLOCK]`), the pad law's
+    // offset row, then the two-level ramp's group pair. The array's LENGTH is
+    // the single derivation of the renumber shift below.
+    let tables = [
+        // noise — [rows, PAD_V] f32, staged EVERY STEP by the worker.
+        TensorShape { rows, cols: pad_vocab },
+        // invt — [rows, 1] f32, staged every step with the noise.
+        TensorShape { rows, cols: 1 },
+        // bramp, lramp — the periodic decreasing ramps.
+        TensorShape { rows: 1, cols: pad_vocab },
+        TensorShape { rows: 1, cols: pad_vocab },
+        // binc, linc — the periodic increasing index tables.
+        TensorShape { rows: 1, cols: pad_vocab },
+        TensorShape { rows: 1, cols: pad_vocab },
+        // ones, sixtyfour — the [1, BLOCK] widen tables.
+        TensorShape { rows: 1, cols: SAMPLE_BLOCK },
+        TensorShape { rows: 1, cols: SAMPLE_BLOCK },
+        // padoff — the pad law's offset row.
+        TensorShape { rows: 1, cols: pad_vocab },
+        // gramp, ginc — the two-level ramp's group pair.
+        TensorShape { rows: 1, cols: pad_vocab },
+        TensorShape { rows: 1, cols: pad_vocab },
+    ];
+    let shift = tables.len() as u32;
+    let n_src = graph.num_sources;
+    // 1) Renumber every op-output tid up by `shift`, so the insert below
+    //    leaves sources at [0, num_sources+shift) and op outputs above them.
+    let bump = |tr: &mut TensorRegion| {
+        if tr.tensor.0 >= n_src {
+            tr.tensor.0 += shift;
+        }
+    };
+    for node in &mut graph.nodes {
+        for inp in &mut node.inputs {
+            bump(inp);
+        }
+        bump(&mut node.output);
+    }
+    for t in &mut graph.op_output {
+        if t.0 >= n_src {
+            t.0 += shift;
+        }
+    }
+    if graph.result.0 >= n_src {
+        graph.result.0 += shift;
+    }
+    // 2) Insert the eleven sources and widen the RESULT TAIL CHAIN to the
+    //    padded width — the whole chain, per the mint's own law above. The
+    //    ROWS are untouched: the rung keeps its own row count.
+    graph.tensors.splice(n_src as usize..n_src as usize, tables);
+    graph.num_sources += shift;
+    let noise = TensorId(n_src);
+    let invt = TensorId(n_src + 1);
+    let mut t = graph.result;
+    // Widen the RESULT TAIL CHAIN to the padded width — the whole chain, per
+    // the mint's own law above. The ROWS are untouched: the rung keeps its own
+    // row count, and the fold (the emitter's own `lower_prefill_lm_head_fold`)
+    // is the one that states the one-row tail on a prefill rung.
+    loop {
+        graph.tensors[t.index()].cols = pad_vocab;
+        let node = graph
+            .nodes
+            .iter()
+            .find(|n| n.output.tensor == t)
+            .expect("the result tail's writer");
+        match &node.op {
+            SubOp::ScalarMul { .. } | SubOp::TanhSoftCap { .. } if node.inputs.len() == 1 => {
+                t = node.inputs[0].tensor;
+            }
+            SubOp::MatmulTile { .. } => break,
+            other => panic!(
+                "the device sampling mint walked a {other:?} result tail — the admission \
+                 gate (an arity-2 Dense lm-head under single-input ScalarMul/TanhSoftCap) \
+                 refuses this graph, so the mint was called outside it"
+            ),
+        }
+    }
+    // 3) The idx stick's op-output tensor, then the node reading the whole
+    //    widened block, the per-row pair, and the nine whole tables.
+    let idx = TensorId(graph.tensors.len() as u32);
+    graph.tensors.push(TensorShape {
+        rows,
+        cols: SAMPLE_BLOCK,
+    });
+    let whole = |t: TensorId| TensorRegion {
+        tensor: t,
+        region: Region {
+            rows: Range::new(0, graph.tensors[t.index()].rows),
+            cols: Range::new(0, graph.tensors[t.index()].cols),
+        },
+    };
+    let mut inputs = Vec::with_capacity(12);
+    // The logits the draw reads: the whole result block on an All graph, and
+    // the ONE row the folded tail writes on a Folded graph — row 0, the row
+    // `lower_prefill_lm_head_fold`'s m=1 matmul writes (the result tensor's
+    // DECLARED shape stays [mq, vocab]; only this region states the fold).
+    inputs.push(match suffix {
+        SampleRows::All => whole(graph.result),
+        SampleRows::Folded => TensorRegion {
+            tensor: graph.result,
+            region: Region {
+                rows: Range::new(0, 1),
+                cols: Range::new(0, pad_vocab),
+            },
+        },
+    });
+    for s in n_src..graph.num_sources {
+        inputs.push(whole(TensorId(s)));
+    }
+    graph.nodes.push(SubtileNode {
+        id: SubtileId(graph.nodes.len() as u32),
+        op: SubOp::Sample { vocab, rows },
+        inputs,
+        output: whole(idx),
+    });
+    // 4) The answer re-point: the rung's result IS the stick. validate
+    //    demands the result is an op output — the Sample node's output
+    //    qualifies, and the row keeps its own placement and its own readers
+    //    either way.
+    graph.result = idx;
+    SampleMint {
+        vocab,
+        pad_vocab,
+        rows,
+        noise,
+        invt,
     }
 }
 
@@ -1530,6 +1853,75 @@ pub fn eval_node<F: RopeForm>(
                 for (o, v) in out.iter_mut().zip(&b) {
                     *o += *v;
                 }
+            }
+            out
+        }
+        SubOp::Sample { vocab, rows: _ } => {
+            // The HOST reference states the KERNEL'S OWN LAW, never a
+            // backend's argmax tie promise: per row, FIRST-maximum over
+            // `score_i = (x_i·inv_t + g_i) + padoff_i` in f32 (padoff is
+            // 0.0 on the real lanes and f32::MIN on the pads — never IEEE
+            // −inf, which the card reads as NaN — and the noise row's pads
+            // are 0.0, so `padoff` alone keeps the pad lanes lost and the
+            // scan over `[0, vocab)` is the whole contest; a NaN score never
+            // wins the ordered max and never satisfies the equality, so an
+            // all-NaN row answers the sentinel past the last real lane — the
+            // consumer's `idx > vocab` refusal, #666's recorded divergence
+            // from host-argmax-over-NaN). The output is the `[rows, 64]`
+            // idx stick with every lane equal (the store is a whole stick
+            // per row); the values are whole numbers below 2^24, exact in
+            // f32. The greedy row (zeros noise, inv_t 1) is the plain
+            // first-max — never a separate law.
+            let (block, _, cols) = gather(&node.inputs[0], graph, bufs);
+            let (noise, _, ncols) = gather(&node.inputs[1], graph, bufs);
+            let (invt, _, _) = gather(&node.inputs[2], graph, bufs);
+            assert!(
+                cols == ncols,
+                "the sample row is {cols} wide but its noise block is {ncols}"
+            );
+            let vocab = vocab as usize;
+            assert!(
+                cols as usize >= vocab,
+                "the sample row is {cols} wide, narrower than the vocab {vocab}"
+            );
+            let cols = cols as usize;
+            let mut out = Vec::with_capacity((out_rows * out_cols) as usize);
+            for r in 0..out_rows as usize {
+                let inv_t = invt[r];
+                let base = r * cols;
+                // `+ 0.0` is the pad law's own offset, applied LAST — the
+                // kernel adds the staged `padoff` after the score's two
+                // roundings, and the eval states the kernel's sequence
+                // exactly (adding 0.0 to a finite f32 changes nothing).
+                let score = |i: usize| (block[base + i] * inv_t + noise[base + i]) + 0.0;
+                let mut m = f32::NEG_INFINITY;
+                for i in 0..vocab {
+                    let s = score(i);
+                    if s > m {
+                        m = s;
+                    }
+                }
+                let idx = match (0..vocab).position(|i| score(i) == m) {
+                    // A NaN score never wins the `>` scan and never
+                    // satisfies `==`, so the first lane equal to the running
+                    // max is the first-max; an all-−inf row ties every lane
+                    // at m = −inf and answers lane 0.
+                    Some(first) => first as u32,
+                    // The all-NaN sentinel: the pad lanes stage ginc = G,
+                    // binc = GROUP_BLOCKS and linc = BLOCK, so the combine
+                    // answers G·4096 + 64·64 + 64 — at every admitted
+                    // production shape (PAD_V a whole number of 4096-lane
+                    // groups) that is PAD_V + 4160, far past the last real
+                    // lane. The kernel's own arithmetic, not the flat
+                    // ramp's PAD_V + BLOCK.
+                    None => {
+                        sample_groups(sample_pad_vocab(vocab as u32))
+                            * (SAMPLE_BLOCK * SAMPLE_GROUP_BLOCKS)
+                            + SAMPLE_GROUP_BLOCKS * SAMPLE_BLOCK
+                            + SAMPLE_BLOCK
+                    }
+                };
+                out.extend(std::iter::repeat(idx as f32).take(out_cols as usize));
             }
             out
         }
@@ -2376,6 +2768,7 @@ pub fn lower_region(
         // prefix-K input (desc.inputs[1] in the fused decode shape).
         let subop: SubOp<NeoX> = match desc.op {
             SubOp::MatmulTile { n, weight } => SubOp::MatmulTile { n, weight },
+            SubOp::Sample { vocab, rows } => SubOp::Sample { vocab, rows },
             SubOp::SumReduce { minted }
             | SubOp::RmsNormReduce { minted, .. }
             | SubOp::RmsNormApply { minted, .. } => match minted {},

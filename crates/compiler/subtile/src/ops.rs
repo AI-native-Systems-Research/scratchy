@@ -144,6 +144,15 @@ macro_rules! for_each_subop {
             Mamba2 [SubOp::Mamba2 { .. }] arity = (|n| n == 2), cols = [field inner],
                 rows = [in0], gemm_w = [none];
             Mean [SubOp::Mean] arity = (|n| n == 1), cols = [one], rows = [in0], gemm_w = [none];
+            // The token draw: one `[rows, PAD_V]` logits block, its per-row noise block
+            // and per-row temperature reciprocals, plus the nine staged tables
+            // (functions of the vocab alone — the periodic block pair, the lane pair,
+            // the two widen tables, the pad law's offset row, and the two-level ramp's
+            // group pair), out ONE `[rows, 64]` idx stick — the output width is the
+            // device's own stick, never a shape read (the whole row is one tile in,
+            // one stick out, every lane equal).
+            Sample [SubOp::Sample { .. }] arity = (|n| n == 12), cols = [stick],
+                rows = [in0], gemm_w = [none];
             // The ops one construct expands to (a MoE block, a KV codec's steps, sampled rows) —
             // also generating `expansion_ops!()`, the pattern a target without them refuses by.
             @expansion
@@ -241,6 +250,9 @@ macro_rules! __out_cols_body {
     };
     ($w:ident, [one]) => {
         1u32
+    };
+    ($w:ident, [stick]) => {
+        crate::subtile_ir::SAMPLE_BLOCK
     };
     ($w:ident, [field $f:ident]) => {
         *$f

@@ -9306,9 +9306,74 @@ fn emit_superdsc_wiring(
         // ── every caller-filled source is covered by exactly one filler ──
         let cos_ids: std::collections::HashSet<u32> = cos_v.iter().map(|&(i, ..)| i).collect();
         let sin_ids: std::collections::HashSet<u32> = sin_v.iter().map(|&(i, ..)| i).collect();
+        // ⭐ THE SAMPLER'S PER-STEP SEAT — ITS OWN CLASS AT THIS GATE. The seat's two
+        // tids are minted below the `LoweredDecode` binding layer (the mint's own law),
+        // so they carry no `SourceBinding`, and the CLASS declares their filler: the
+        // worker binds both FRESH EVERY DECODE STEP, and the runtime launch gate refuses
+        // a decode without a fresh bind of both — the PrefixMask precedent, never a held
+        // default, because a held noise row is a held TOKEN. This block is the class's
+        // declaration at the expansion gate (the loop below counts the seat's tids as
+        // covered BY CLASS); the per-step enforcement is the runtime gate's own arm.
+        // Everything else about the seat is typed here, where the wiring is in hand:
+        if let Some(seat) = &gk.sample_seat {
+            for (name, tid) in [("noise", seat.noise), ("invt", seat.invt)] {
+                if tid >= gk.num_sources {
+                    fail.push(format!(
+                        "the sample seat's {name} source t{tid} is not inside `num_sources` \
+                         ({}) — nothing can ever bind it",
+                        gk.num_sources
+                    ));
+                }
+                if gk.load_consts.iter().any(|&(ltid, _)| ltid == tid) {
+                    fail.push(format!(
+                        "the sample seat's {name} source t{tid} is ALSO a load-time const — a \
+                         tensor cannot both stage once at load and be the step's own randomness"
+                    ));
+                }
+            }
+            if seat.noise == seat.invt {
+                fail.push(
+                    "the sample seat names one tid as both the noise and the inv_t — the mint \
+                     mints two sources, so a shared tid means two mints disagree"
+                        .to_string(),
+                );
+            }
+            if !matches!(
+                gk.result_dtype,
+                scratchy_target_spyre::DType::I32 | scratchy_target_spyre::DType::U32
+            ) {
+                fail.push(format!(
+                    "the rung carries the sample seat but its result dtype is {:?}, not an \
+                     index — the mint re-points the result to the idx stick, so a non-integer \
+                     result means the wiring and the mint disagree",
+                    gk.result_dtype
+                ));
+            }
+        }
         let mut embeds = 0usize;
         for id in 0..gk.num_sources {
             let Some(b) = lwd.bindings.get(id as usize) else {
+                // ⭐ A LOAD-CONST SOURCE — minted below the `LoweredDecode`
+                // binding layer, so it carries NO `SourceBinding`: the wiring's
+                // `load_consts` list names it (BY MEMBERSHIP in the generic
+                // list, never by the op that minted it), and the worker stages
+                // its bytes once at load through the kind's builder — the rope
+                // tables' own law. This arm is that list's declaration; every
+                // other binding-less source is still the
+                // hang-or-silent-wrong refusal below.
+                if gk.load_consts.iter().any(|&(tid, _)| tid == id) {
+                    continue;
+                }
+                // ⭐ THE SEAT'S OWN ARM — the per-step class the block above declares:
+                // covered BY CLASS (the worker's fresh-every-step bind), which is why
+                // this is a `continue` and not a refusal. The loud refusal lives at the
+                // RUNTIME gate, per launch, where "this step" is a fact — an expansion
+                // cannot know it.
+                if let Some(seat) = &gk.sample_seat {
+                    if seat.noise == id || seat.invt == id {
+                        continue;
+                    }
+                }
                 fail.push(format!(
                     "source t{id} is inside `num_sources` but has NO binding — nothing fills it"
                 ));
@@ -9464,6 +9529,30 @@ fn emit_superdsc_wiring(
     // (Moved above the rotary-source emission: `hd` and `theta` are the base
     // class's facts, and each cos/sin source's `RotaryKind` reads them.)
     let result = u32l(gk.result_tensor);
+    // ⭐ THE RESULT'S OWN DTYPE — straight off the bake's one derivation
+    // (`result_dtype_of_ir`, the result producer's own kernel signature), never
+    // recomputed here: it is the fact that tells the worker whether the rung's
+    // answer is the f16 row (convert and sample on the host) or the i32 idx
+    // stick (read raw — the device already drew the token).
+    // `scratchy-tensors` is only a dev-dependency where this expands (the
+    // models crate), so the literal rides the spyre crate's own root re-export
+    // — the same `::scratchy_target_spyre::` prefix every other wiring type
+    // in this emission uses.
+    let result_dtype = match gk.result_dtype {
+        scratchy_target_spyre::DType::F16 => quote! { ::scratchy_target_spyre::DType::F16 },
+        scratchy_target_spyre::DType::BF16 => quote! { ::scratchy_target_spyre::DType::BF16 },
+        scratchy_target_spyre::DType::F32 => quote! { ::scratchy_target_spyre::DType::F32 },
+        scratchy_target_spyre::DType::U32 => quote! { ::scratchy_target_spyre::DType::U32 },
+        scratchy_target_spyre::DType::I32 => quote! { ::scratchy_target_spyre::DType::I32 },
+        // `result_dtype_of_ir` refuses every dtype the readback cannot name, so
+        // this arm is unreachable by construction — spelled out so a new DType
+        // variant fails HERE rather than silently lower in the wiring.
+        other => panic!(
+            "[superdsc-wiring] {}: the result's dtype {other:?} has no wiring literal — the \
+             readback cannot read it back",
+            model.source_stem
+        ),
+    };
     let num_sources = u32l(gk.num_sources);
     let dp = u32l(decode_position);
     let mask = match gk.attn_mask {
@@ -9578,9 +9667,99 @@ fn emit_superdsc_wiring(
             quote! { (#id, #k) }
         })
         .collect::<Vec<_>>();
+    // ⭐ THE LOAD-TIME CONSTANTS — straight off the bake's own one derivation
+    // (`load_consts_of_ir`, the same list the numeric gate stages), never
+    // recomputed here: each entry is `(tid, kind)` and the KIND names the
+    // shared builder that makes the bytes, so the worker and the gate stage
+    // identical bytes by construction. The sampler's NINE staged tables ride
+    // this list (all f32, the selection's own dtype); its noise and inv_t do
+    // NOT — they are per-step seats the worker binds fresh every decode, and a
+    // load-time constant staged over them would freeze one noise row into
+    // every draw.
+    let load_const_toks = gk
+        .load_consts
+        .iter()
+        .map(|&(tid, kind)| {
+            let tid = u32l(tid);
+            let kind = match kind {
+                scratchy_target_spyre::wiring::LoadConst::SampleTable {
+                    vocab,
+                    operand,
+                    arrangement,
+                } => {
+                    let arrangement = match arrangement {
+                        scratchy_target_spyre::wiring::ElementArrangement::Standard => {
+                            quote! {
+                                ::scratchy_target_spyre::wiring::ElementArrangement::Standard
+                            }
+                        }
+                        scratchy_target_spyre::wiring::ElementArrangement::Dl16ToFp32 => {
+                            quote! {
+                                ::scratchy_target_spyre::wiring::ElementArrangement::Dl16ToFp32
+                            }
+                        }
+                    };
+                    quote! {
+                        ::scratchy_target_spyre::wiring::LoadConst::SampleTable {
+                            vocab: #vocab,
+                            operand: #operand,
+                            arrangement: #arrangement,
+                        }
+                    }
+                }
+            };
+            quote! { (#tid, #kind) }
+        })
+        .collect::<Vec<_>>();
+    // ⭐ THE SAMPLER'S PER-STEP SEAT — the named class of the two sources the
+    // token draw binds FRESH EVERY DECODE STEP, straight off the bake's one
+    // derivation (`sample_seat_of_ir`, the mint's own facts), never
+    // recomputed here. `None` on every rung that mints no draw; `Some` names
+    // the noise/inv_t tids the worker must bind before EVERY decode launch —
+    // the class the source gate counts as filled only when bound THIS step.
+    let sample_seat_tok = match &gk.sample_seat {
+        Some(seat) => {
+            let row = u32l(seat.row);
+            let noise = u32l(seat.noise);
+            let invt = u32l(seat.invt);
+            let rows = u32l(seat.rows);
+            let vocab = u32l(seat.vocab);
+            let pad_vocab = u32l(seat.pad_vocab);
+            // The noise row's arrangement — a baked CONST the worker indexes (it writes lane i
+            // at the baked permutation's index and never derives), straight off the bake's one
+            // propagation, never recomputed here.
+            let noise_arrangement = match seat.noise_arrangement {
+                scratchy_target_spyre::wiring::ElementArrangement::Standard => {
+                    quote! {
+                        ::scratchy_target_spyre::wiring::ElementArrangement::Standard
+                    }
+                }
+                scratchy_target_spyre::wiring::ElementArrangement::Dl16ToFp32 => {
+                    quote! {
+                        ::scratchy_target_spyre::wiring::ElementArrangement::Dl16ToFp32
+                    }
+                }
+            };
+            quote! {
+                ::core::option::Option::Some(
+                    ::scratchy_target_spyre::wiring::SampleSeat {
+                        row: #row,
+                        noise: #noise,
+                        invt: #invt,
+                        rows: #rows,
+                        vocab: #vocab,
+                        pad_vocab: #pad_vocab,
+                        noise_arrangement: #noise_arrangement,
+                    }
+                )
+            }
+        }
+        None => quote! { ::core::option::Option::None },
+    };
     quote! {
         ::scratchy_target_spyre::wiring::Wiring {
             result: #result,
+            result_dtype: #result_dtype,
             num_sources: #num_sources,
             attn_mask: #mask,
             decode_position: #dp,
@@ -9605,6 +9784,8 @@ fn emit_superdsc_wiring(
             weight_scale_folds: &[#(#weight_scale_fold_lits),*],
             weight_copies: &[#(#weight_copy_lits),*],
             fp8_k_pads: &[#(#fp8_k_pad_toks),*],
+            load_consts: &[#(#load_const_toks),*],
+            sample_seat: #sample_seat_tok,
         }
     }
 }
@@ -10024,6 +10205,8 @@ fn layout_tokens(
         kv_request_stride_bytes,
         lx_op_local_bytes,
         lx_prob_pin_bytes,
+        num_sources,
+        resident_source_tids,
     } = l;
     let segs = segment_bytes
         .iter()
@@ -10058,6 +10241,13 @@ fn layout_tokens(
     // budget, summed beside the gathers at the bake's `lx_form` admission. 0 for a bundle whose
     // chunk form mints none.
     let lxpp = proc_macro2::Literal::u64_unsuffixed(*lx_prob_pin_bytes);
+    // The graph's own wiring facts — the source count and the resident ids, so every session
+    // reads them off the bundle it runs rather than off another graph's wiring (the mint's
+    // renumbering makes the two differ; see the layout field's own doc).
+    let nsrc = proc_macro2::Literal::u32_unsuffixed(*num_sources);
+    let res = resident_source_tids
+        .iter()
+        .map(|t| proc_macro2::Literal::u32_unsuffixed(*t));
     // The segment budget's verdict, as a variant: every reader matches on it.
     let tail = match weight_tail {
         scratchy_target_spyre::bundle_code::WeightTail::InPlace => {
@@ -10087,6 +10277,8 @@ fn layout_tokens(
             kv_request_stride_bytes: #krs,
             lx_op_local_bytes: #lxol,
             lx_prob_pin_bytes: #lxpp,
+            num_sources: #nsrc,
+            resident_source_tids: ::std::borrow::Cow::Borrowed(&[#(#res),*]),
         }
     }
 }
@@ -10975,7 +11167,49 @@ fn dump_wavefront_mega(
                 // never wrong: the rung contract's own fallback).
                 let mut prefill_fp_stamped = false;
                 let fused = scratchy_subtile::lower::fuse_silu_mul(&lwd.input);
-                let krg = scratchy_subtile::subtile_ir::lower_region(&fused, knb);
+                let mut krg = scratchy_subtile::subtile_ir::lower_region(&fused, knb);
+                // ⭐⭐⭐ THE TOKEN DRAW'S MINT — EVERY rung this closure bakes: the
+                // solo m=1 bake, every emulator cap bucket, every batch-ladder rung,
+                // AND every prefill rung (the general mint — no prefill-specific
+                // copy, no `one_request` gate, no lm-head admission walk here: #813
+                // minted only the one-request rung whose lm-head admitted, and what
+                // survived that front is the LAW, not the gate — a rung without the
+                // draw is a rung whose answer must still come back as logits for a
+                // host argmax, which is exactly the readback this front deletes).
+                // The splice is the kernel's ONLY entry — the mint appends the node,
+                // its per-row per-step pair (noise, inv_t) and its nine staged-table
+                // sources to the graph, and everything downstream (the splice's row,
+                // the door's whole-function walk, the placement pass, the wiring's
+                // sampler facts) is the same machinery every other Triton kernel
+                // takes. The mint's own tail walk IS the admission: a graph whose
+                // result tail is not the lm-head chain it knows PANICS at expansion —
+                // a build error naming the op, never a silent fall back to the host
+                // readback. A prefill rung's result is the FOLDED lm-head row (the
+                // emitter folds the tail to the last baked row): its prompt-final
+                // chunk's pick is the idx stick, read back exactly like decode's;
+                // a middle chunk's suffix never runs, so its draw is never taken.
+                {
+                    let mint = scratchy_subtile::subtile_ir::mint_sample(
+                        &mut krg,
+                        if is_prefill {
+                            scratchy_subtile::subtile_ir::SampleRows::Folded
+                        } else {
+                            scratchy_subtile::subtile_ir::SampleRows::All
+                        },
+                    );
+                    eprintln!(
+                        "[spyre-superdsc] {base}: the token draw minted — vocab {} (padded row \
+                         {}), rows {}, the per-row pair (noise t{}, inv_t t{}) + nine staged \
+                         tables appended, and the rung's RESULT re-pointed to the idx stick (the \
+                         row stays placed and readable by tid){}",
+                        mint.vocab,
+                        mint.pad_vocab,
+                        mint.rows,
+                        mint.noise.index(),
+                        mint.invt.index(),
+                        if is_prefill { " (prefill rung)" } else { "" },
+                    );
+                }
                 if let Err(e) = scratchy_subtile::subtile_ir::ValidatedGraph::new(&krg) {
                     eprintln!("[spyre-ktir] {stem}: SubtileIR rejected by validate() — {e:?}");
                     return ((String::new(), Vec::new(), String::new(), Vec::new()), fx);

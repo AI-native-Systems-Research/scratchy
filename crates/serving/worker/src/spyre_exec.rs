@@ -18,8 +18,6 @@ use scratchy_subtile::sdsc_abstract::PagedKvPool;
 #[cfg(feature = "spyre-hw")]
 use scratchy_subtile::sdsc_abstract::{RowPages, SlotCount, SlotMap, SlotMapError};
 #[cfg(feature = "spyre-hw")]
-use scratchy_target_spyre::manifest::argmax;
-#[cfg(feature = "spyre-hw")]
 use scratchy_target_spyre::sdsc_runner::{IntRepStride, MaskRepStride};
 
 #[cfg(feature = "spyre-hw")]
@@ -798,7 +796,9 @@ impl Worker for SpyreWorker {
                     mask_cap,
                     fold_rows,
                     sess,
-                    logits,
+                    // The rung's own logits geometry — a bake fact, no longer read: the
+                    // sampler picks on the card and the idx stick is the only readback.
+                    logits: _,
                 } = &mut sb.decode_rungs[ri];
                 let seqs = *seqs;
                 let fold_rows = *fold_rows;
@@ -862,7 +862,6 @@ impl Worker for SpyreWorker {
                         }
                     }
                 }
-                let logits = &*logits;
                 // THE MASK'S PER-FOLD-PASS STRIDE. A pass reads one request's page, so the mask is
                 // one `[nqh*seqs, page_slots]` block per pass and the runtime steps it by a whole
                 // block. Declared here because this is where the row count and the head count are
@@ -1483,12 +1482,12 @@ impl Worker for SpyreWorker {
                     // the meta above is borrowed for tensor ids and describes neither.
                     gathers_kv,
                     launch_pos,
-                    // Every row is a different request and every row is sampled — the tail runs
-                    // unfolded, so the logits come back de-interleaved, one contiguous row each.
-                    LogitsWanted::PerRequest(logits),
-                )?;
-                let logits = rows
-                    .ok_or_else(|| werr("decode batch: the rung produced no logits".to_string()))?;
+                    // Every row is a different request and every row is sampled — ON THE
+                    // CARD, by the rung's minted sampler. The idx stick comes back raw,
+                    // one token per launch slot; no logits are ever read.
+                    LogitsWanted::PerRequest,
+                )?
+                .ok_or_else(|| werr("decode batch: the rung picked no tokens".to_string()))?;
                 // ── KCACHE PROBE (SCRATCHY_KCACHE_PROBE), BATCHED STEP ── the batched counterpart of the
                 // solo `[kcache]` probe: after the fold's forward (cache write included), read back the
                 // layer-0 resident Kᵀ plane and print, per live request row, its launch slot, its pool
@@ -1501,11 +1500,11 @@ impl Worker for SpyreWorker {
                 // converts exactly the baked placement, which covers PHYSICAL PAGE 0 of the pool — pages
                 // past it are named in the output as unreadable rather than silently skipped, so a run
                 // states what it could not see. Costs one whole-segment D2H per step; env-gated off.
-                let vocab = model.vocab;
-                // A REQUEST'S LOGITS COME BACK IN THE SLOT THE LAUNCH PUT IT IN. Ask the same `SlotMap`
+                // A REQUEST'S TOKEN COMES BACK IN THE SLOT THE LAUNCH PUT IT IN. Ask the same `SlotMap`
                 // that bound the page maps rather than recomputing the position here — one value decides
-                // where a request's KV is written and where its distribution is read, so the two cannot
-                // drift apart.
+                // where a request's KV is written and where its token is picked, so the two cannot
+                // drift apart. The sentinel check already happened at the readback
+                // (`read_sampled_tokens`); this guard is the slice's own bound.
                 for (di, (id, start)) in decode_ids.iter().enumerate() {
                     let slot = slots
                         .slot_of(di)
@@ -1516,28 +1515,14 @@ impl Worker for SpyreWorker {
                             ))
                         })?
                         .index();
-                    let row = logits
-                        .get(slot * vocab..(slot + 1) * vocab)
-                        .ok_or_else(|| werr(format!(
-                            "decode batch: {} logit(s) for {} request(s) x {vocab} vocab — the rung's \
-                             lm-head tail does not produce one per request",
-                            logits.len(),
+                    let tok = rows.get(slot).copied().ok_or_else(|| {
+                        werr(format!(
+                            "decode batch: {} token(s) for {} request(s) — the rung's sampler did \
+                             not pick one per launch slot",
+                            rows.len(),
                             decode_ids.len()
-                        )))?;
-                    let tok = argmax(row) as u32;
-                    // ⭐⭐ THE TOP-2 GAP, PER REQUEST, PER STEP — the instrument this path has been missing.
-                    //
-                    // Batched output is not reproducible run to run at an IDENTICAL chunk count (measured:
-                    // one probe gave 'Tokyo','Tokyoto','Tokyoto' on three identical runs, chunks=32 each,
-                    // while SOLO is bit-stable), and the divergence enters at DECODE STEP 2 — the first step
-                    // whose mask must cover a hole. A SAMPLED TOKEN cannot tell a 1e-4 perturbation on a
-                    // near-tied argmax from a request reading another's keys: both look like one wrong word.
-                    // The GAP can. Two runs of the same input, diffed:
-                    //   * same argmax, gap identical to the last digit  => that step is reproducible
-                    //   * same argmax, gap differs by ~1e-3            => numeric noise, and the flip is a
-                    //     coin toss on a near-tie (report the gap, not the word)
-                    //   * different argmax with a LARGE gap            => a real KV/mask fault, not noise
-                    // Print-only and env-gated: it changes nothing the card computes.
+                        ))
+                    })?;
                     let req = requests.get_mut(id).expect("bound above");
                     input_batch.push_generated(id, tok);
                     input_batch.set_tokens_in_pool(id, start + 1);

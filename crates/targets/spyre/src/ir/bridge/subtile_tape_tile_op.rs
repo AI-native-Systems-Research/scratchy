@@ -112,6 +112,16 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
         | SubOp::KvAppend { .. }
         | scratchy_subtile::expansion_ops!()
         | SubOp::Mean => Err(format!("{:?} is not a spyre standard tile op", n.op)),
+        // The token draw is NOT one standard tile either: its body is whole-row
+        // reduces over a PAD_V-wide row plus a [1, 64] pointwise tail — a MIXED-WIDTH
+        // body the [mb, out_active, y] declaration cannot state (out_active would have
+        // to be both PAD_V and 64). The splice's whole-function walk is its lowering;
+        // this declaration law does not describe it.
+        SubOp::Sample { .. } => Err(format!(
+            "{:?} is a mixed-width whole-function body (a PAD_V-wide reduce chain into a \
+             [1, 64] stick), not a spyre standard tile op",
+            n.op
+        )),
         crate::op_abi::spyre_standard_tile_pat!() => {
             let n_operands = match crate::op_abi::spyre_standard_operands(&n.op)
                 .expect("spyre_standard_tile_pat member without an operand row")

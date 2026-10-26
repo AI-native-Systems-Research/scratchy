@@ -113,7 +113,10 @@ pub struct Lowered {
 
 /// `.py` SOURCE to their `IRFunction`. Every leg is a value; nothing reads a golden.
 pub fn lower(config: &str) -> Result<Lowered> {
-    let (spec, grid, _program) = cases::case(config).ok_or_else(|| {
+    // The door kind is ignored on PURPOSE here: this is the numeric ladder (`.py` → TTIR → KTIR
+    // → executor), which stops above the SuperDSC door. A `None` door row (a kernel stated in
+    // generic ops whose descriptor lowering is the open rung) runs this far and no further.
+    let (spec, grid, _door) = cases::case(config).ok_or_else(|| {
         refuse(
             "case",
             format!("`{config}` is not one of: {}", cases::ALL.join(" ")),

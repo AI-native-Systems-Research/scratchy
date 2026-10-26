@@ -284,7 +284,26 @@ impl ResidentExecutor {
     pub fn new_multi(
         programs: Vec<(&[IRFunction<'static>], &ProgramSpec)>,
     ) -> Result<Self, String> {
-        Self::build(programs, false)
+        Self::build(programs, false, None)
+    }
+
+    /// ⭐ [`new_multi`](Self::new_multi) WITH A SHAPE FLOOR — the TAPE's own
+    /// tensor-shape statement, threaded by a caller that holds it (the numeric
+    /// gate holds the minted krg; the worker holds the wiring). Every stick is
+    /// allocated for at least the floored element count, so a tensor whose
+    /// widest view the shape walk cannot see — an INTERIOR edge of a fused
+    /// function, where no arg→tid mapping reaches the reader's view (measured:
+    /// the argmax mint's PAD_V-wide logits row over the lm-head matmul's
+    /// narrower device-width out view, t1136 staged `[1, 51200]` while the krg
+    /// states `[1, 65536]`) — still fits its stick. The view walk stays the
+    /// only law for standalone runs ([`new_multi`](Self::new_multi)); the
+    /// floor is a MAX, so it can only ever RAISE an allocation, never shrink
+    /// one the views already sized.
+    pub fn new_multi_floored(
+        programs: Vec<(&[IRFunction<'static>], &ProgramSpec)>,
+        shape_floor: &HashMap<u64, usize>,
+    ) -> Result<Self, String> {
+        Self::build(programs, false, Some(shape_floor))
     }
 
     /// Like [`new`](Self::new), but plan EVERY node as a [`Segment::Native`] run at
@@ -299,12 +318,13 @@ impl ResidentExecutor {
     /// (`metal_gemm_or_blas` / fused map windows) ride along — this is the resident
     /// executor's Native arm, just applied to every node.
     pub fn new_native(funcs: &[IRFunction<'static>], spec: &ProgramSpec) -> Result<Self, String> {
-        Self::build(vec![(funcs, spec)], true)
+        Self::build(vec![(funcs, spec)], true, None)
     }
 
     fn build(
         programs: Vec<(&[IRFunction<'static>], &ProgramSpec)>,
         force_native: bool,
+        shape_floor: Option<&HashMap<u64, usize>>,
     ) -> Result<Self, String> {
         // A new resident HBM: every borrowed weight view minted over a previous one is
         // now stale (see `metal::RESIDENT_GEN`), and is discarded rather than dispatched.
@@ -430,8 +450,28 @@ impl ResidentExecutor {
                     .get(&tid)
                     .cloned()
                     .ok_or_else(|| format!("no shape derivable for tensor t{tid}"))?;
-                let n: usize = shape.iter().product();
-                let s = hbm.allocate((n * bpe).max(bpe) as i64);
+                let mut n: usize = shape.iter().product();
+                // ⭐ THE TAPE'S OWN SHAPE STATEMENT IS A FLOOR, where the caller
+                // holds it: the view walk derives a tid's extent only from views
+                // its arg→tid mappings reach, and a widened reader's view can sit
+                // past that reach (an interior edge of a fused function). An
+                // allocation must hold EVERY view that addresses the tensor, and
+                // the krg's tensor shape is the tape's own statement of it — so
+                // the floor takes the max and can only ever RAISE the allocation.
+                if let Some(floor) = shape_floor.and_then(|f| f.get(&tid)) {
+                    n = n.max(*floor);
+                }
+                // ⭐ AND THE STICK IS SIZED AT THE TID'S OWN VIEW DTYPE, not the
+                // model dtype: an fp8 weight binds 1-byte elements, an f32 table
+                // or i32 stick 4-byte ones, and the uniform model-dtype bpe
+                // under-allocated those by half (measured: the argmax's fp32
+                // scale table — 64 elements staged at 128 bytes against a
+                // 256-byte view). Every reader already keys this same per-tid
+                // view dtype (`ptr_for`, the readback decode, the verbatim
+                // source staging); the allocation now agrees with them.
+                let dt = view_dtypes.get(&tid).copied().unwrap_or(dtype);
+                let dt_bpe = dt.bytes_per_elem();
+                let s = hbm.allocate((n * dt_bpe).max(dt_bpe) as i64);
                 stick.insert(tid, s);
                 numel.insert(tid, n);
             }
@@ -1417,7 +1457,6 @@ impl ResidentExecutor {
     /// Cheap: these are activations (kB) not weights (GB).
     fn zero_non_sources(&mut self) {
         let hbm = self.mem.hbm.borrow_mut();
-        let bpe = self.dtype.bytes_per_elem();
         for (&tid, &s) in &self.stick {
             if self.sources.contains(&tid) {
                 continue;
@@ -1426,6 +1465,15 @@ impl ResidentExecutor {
             if n == 0 {
                 continue;
             }
+            // The stick's OWN view dtype, the same per-tid law the allocation
+            // sizes by — a 4-byte-element stick zeroed at the model dtype's 2
+            // would leave its upper half stale across passes.
+            let bpe = self
+                .view_dtype
+                .get(&tid)
+                .copied()
+                .unwrap_or(self.dtype)
+                .bytes_per_elem();
             // Zero the existing backing bytes IN PLACE — every non-source stick is
             // already allocated (the stick base is its exact allocation base), so
             // fill its bytes rather than allocating a fresh zero `Vec` +
@@ -1487,7 +1535,12 @@ impl ResidentExecutor {
             .ok_or_else(|| format!("t{tid} has no resident stick"))?;
         let n = *self.numel.get(&tid).unwrap_or(&0);
         let shape = self.shapes.get(&tid).cloned().unwrap_or_else(|| vec![n]);
-        Ok((tid, s, n, shape, self.dtype))
+        // The tid's OWN view dtype — the same per-tid law the allocation sizes
+        // by. The model dtype here mis-decoded the first non-f16 result stick
+        // (measured: the argmax's i32 idx answer, i32 bytes read as f16 pairs
+        // — 12360 came back as [0.1338, 0, ...]).
+        let dt = self.view_dtype.get(&tid).copied().unwrap_or(self.dtype);
+        Ok((tid, s, n, shape, dt))
     }
 }
 

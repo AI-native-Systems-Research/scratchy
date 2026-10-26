@@ -62,8 +62,8 @@ const PASS: &str = "from-ttir";
 /// `OpKind::from_spelling` would happily turn into an `Other`, because "we do not model
 /// this" and "we model this as Other on purpose" must not look the same.
 ///
-/// THE FIVE DELIBERATE `Other`s: `arith.negf`, `math.rsqrt`, `arith.cmpf`,
-/// `arith.sitofp`, and `arith.fptosi` have no `OpKind` variant.
+/// THE SIX DELIBERATE `Other`s: `arith.negf`, `math.rsqrt`, `arith.cmpf`,
+/// `arith.sitofp`, `arith.fptosi`, and `arith.uitofp` have no `OpKind` variant.
 /// They are listed here so the choice is visible, and it is safe because a consumer keys
 /// on `OpKind::spelling()` for exactly these -- `triton-superdsc-lower`'s op map reads
 /// `arith.negf` (its SiLU recogniser's head) and `math.rsqrt` through the spelling, and
@@ -109,6 +109,15 @@ pub const OP_SET: &[&str] = &[
     "arith.select",
     "arith.sitofp", // Other, on purpose
     "arith.fptosi", // Other, on purpose
+    // THE MASK-WIDENING CAST (the sampler's ladder extension): `(x == m).to(tl.float32)` --
+    // a 0/1 compare mask widened to the float domain for the ramp multiply -- lowers to
+    // `arith.uitofp` (i1 -> f32), a spelling no golden carries because the router rows
+    // select their way around casts of the mask itself (`tl.where(mask, 1.0, 0.0)` is a
+    // select, not a cast). The emulator has served `ArithUitofp` all along
+    // (`ktir-emulator:src/dialects/arith.rs:100`), and like the five above it rides `Other`
+    // with `to_ktir_emit`'s Other arm naming its `KOpKind`. The executed proof is
+    // `triton-numeric:tests/argmax_first_max.rs`, whose kernel widens a live mask.
+    "arith.uitofp", // Other, on purpose
     // math
     "math.exp",
     "math.exp2",
@@ -555,14 +564,30 @@ fn attr_value(m: &ttir::Module, op_name: &str, key: &str, v: &ttir::Attr) -> Res
             ttir::Attr::Float(bits, et) => {
                 Attr::SplatFloat(float_bits(bits.get(), et, op_name, key)?)
             }
-            // AN INTEGER DENSE SPLAT HAS NO MODELLED FORM, and the reader agrees: for
-            // `tt.divisibility = dense<64> : tensor<1xi32>` -- the one in tree, on
-            // `attention_flash_causal`'s `arith.muli` -- `parse_attr_value` falls through
-            // every arm and returns `Attr::Verbatim("dense<64> : tensor<1xi32>")`. So this
-            // reproduces that string EXACTLY rather than inventing a `SplatInt`, because
-            // the diff compares the two and a better representation on one side is a
-            // reported difference.
-            ttir::Attr::Int(i, _) => Attr::Verbatim(format!("dense<{i}> : {t}")),
+            // AN INTEGER DENSE SPLAT IS PATH-DEPENDENT IN THE READER, and this arm matches
+            // it per path. `text::parse`'s `parse_constant` -- the `arith.constant`
+            // payload path -- reads a dense int splat as `SplatFloat(parse_float(...))`:
+            // the integer text float-parsed at the result type's width (a [1,64] i32
+            // `dense<49155>` becomes the f32 bits of 49155.0). Every OTHER path
+            // (`parse_attr_value`, the attribute dictionaries) falls through to
+            // `Attr::Verbatim` -- for `tt.divisibility = dense<64> : tensor<1xi32>`, the
+            // one in tree, on `attention_flash_causal`'s `arith.muli`. The golden diff
+            // compares this adapter against the reader, so the split is reproduced
+            // exactly: constant payloads model the splat (the sampler's `V` and `j`-init
+            // constants are int dense splats, the first in tree), attribute dictionaries
+            // keep the verbatim string.
+            ttir::Attr::Int(i, _) => {
+                if op_name == "arith.constant" && key == "value" {
+                    // `parse_float`'s width rule: f16 at 16 bits, everything else 32.
+                    let v = *i as f64;
+                    Attr::SplatFloat(match t.scalar() {
+                        ttir::Type::Float(FloatKind::F16) => FloatBits::f16_from_f32(v as f32),
+                        _ => FloatBits::f32(v as f32),
+                    })
+                } else {
+                    Attr::Verbatim(format!("dense<{i}> : {t}"))
+                }
+            }
             other => {
                 return Err(Refusal::new(
                     PASS,

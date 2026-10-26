@@ -21,6 +21,9 @@
 //! role breaks every match that must learn it, at build time, in one place.
 
 use crate::bundle_code as bundle;
+pub use ktir_superdsc::element_arrangement::{
+    ElementArrangement, dl16tofp32_stagger, DL16TOFP32_PERMUTATION,
+};
 use scratchy_tensors::GpuTensor;
 
 // ⭐ `act_name` MOVED TO `ktir_superdsc::place`, BESIDE THE `PlaceId` WHOSE `Display` IT CALLS. Its
@@ -239,6 +242,20 @@ impl BakeFacts {
 }
 
 impl Wiring {
+    /// ⭐ IS THE RUNG'S RESULT THE PICKED TOKEN ITSELF? — the one question the
+    /// worker asks of [`Self::result_dtype`]. An integer result (the device
+    /// argmax's `i32` idx stick today) states the device already picked: the
+    /// step leaves the result on the device, reads the stick's raw bytes at
+    /// this dtype, and the host's row-argmax is replaced by the stick's first
+    /// word. Keyed on the DTYPE the result's own producer stated, never on the
+    /// op's name — a second kernel with an index result rides the same branch.
+    pub const fn result_is_index(&self) -> bool {
+        matches!(
+            self.result_dtype,
+            scratchy_tensors::DType::I32 | scratchy_tensors::DType::U32
+        )
+    }
+
     /// ⛔ THE CLASS SETS, CHECKED AGAINST THE PLACEMENTS — ONCE, AT LOAD.
     ///
     /// The bake used to emit the identity and rope-P tables as f32 LITERALS staged at the BASE head
@@ -765,6 +782,19 @@ impl RotaryKind {
 pub struct Wiring {
     /// Tensor id of the logits.
     pub result: u32,
+    /// ⭐ THE RESULT'S OWN DTYPE — the fact that decides how the worker reads the
+    /// rung's answer back ([`Self::result_is_index`] is the one question asked of
+    /// it). Stated by the result producer's own kernel signature when a spliced
+    /// kernel produced the result, and the f16 row every native lm-head tail
+    /// emits otherwise.
+    ///
+    /// ⛔ THE ROW REMAINS A PLACED TENSOR, READABLE BY TID, when the result is an
+    /// index stick: the answer re-point is the greedy contract's redirect of the
+    /// ANSWER (the host reads the picked token, not the row it was picked from),
+    /// never a deletion of the row. Any consumer that needs the row can still
+    /// name its tid and read it; the mint widens it, places it, and leaves every
+    /// writer exactly where it was.
+    pub result_dtype: scratchy_tensors::DType,
     /// Tensor ids `0..num_sources` are caller-filled.
     pub num_sources: u32,
     /// The AttnDecode runtime length mask, if the model has a maskable decode.
@@ -857,6 +887,292 @@ pub struct Wiring {
     /// alone. Empty for every 128-aligned model — granite, g8b
     /// and g12b stage byte-identically.
     pub fp8_k_pads: &'static [(u32, u32)],
+    /// ⭐ THE LOAD-TIME CONSTANTS — `(tid, kind)` for every resident buffer the
+    /// graph's own producer minted below the `SourceBinding` layer: staged ONCE
+    /// at load through the kind's builder ([`LoadConst::build`]), never a
+    /// per-step source, never baked as literals. The rope tables' own law,
+    /// stated as a LIST: a second spliced kernel with staged tables adds one
+    /// [`LoadConst`] kind and rides this same field — no new wiring surface, no
+    /// per-op field, no consumer that names the op. The ids are the graph's own
+    /// tensor ids (the same ids the placement pass places).
+    pub load_consts: &'static [(u32, LoadConst)],
+    /// ⭐ THE SAMPLER'S PER-STEP SEAT — `Some` exactly when the rung carries the
+    /// token draw (the minted `Sample` node), naming the TWO sources the draw
+    /// reads FRESH EVERY DECODE STEP. A NAMED CLASS, never a bare tid pair
+    /// riding an arithmetic: the mint inserts the pair at the graph's source
+    /// ceiling, and a consumer that recomputed those tids would be a second
+    /// derivation free to disagree with the mint (the `weight_copies` one-mint
+    /// law). The class is the source gate's own spelling too: the seat's tids
+    /// count as filled ONLY when bound THIS STEP — a decode launch without a
+    /// fresh noise/inv_t bind REFUSES LOUDLY (the PrefixMask precedent), never
+    /// a held default, because a held noise row is a held TOKEN — every
+    /// subsequent draw would repeat the same pick wherever temperature was
+    /// live. `None` on every rung that mints no draw (prefill rungs, host-sampled
+    /// emulators), and a `None` on a rung the worker samples through is a
+    /// wiring/consumer mismatch the launch gate names.
+    pub sample_seat: Option<SampleSeat>,
+}
+
+/// ⭐ A LOAD-TIME CONSTANT'S KIND — the shared builder that makes its bytes.
+/// A kind names a BUILDER ([`Self::build`]), never a consumer: this enum is
+/// the producer's statement of its host contract, translated once into the
+/// generic [`Wiring::load_consts`] list, and everything downstream (the bake's
+/// numeric gate, the worker's load staging) iterates the list op-blind,
+/// choosing fp32-verbatim vs fp16-convert off the ENTRY'S OWN dtype.
+#[derive(Clone, Copy, Debug)]
+pub enum LoadConst {
+    /// One of the sampler's nine operand tables, by the kernel's operand order
+    /// (the table's own position among the node's table inputs — the row, the
+    /// noise and the temperature precede them and are never load constants).
+    /// Bytes from [`sample_staged_tables`] — the one derivation every stager
+    /// reads, so a table defect cannot hide on one leg only. `arrangement` is
+    /// the BAKE'S OWN propagation fact (the propagation pass `ktir_superdsc::emit::whole_function::staggered_sources`): the table the
+    /// sampler's staggered pointwise island reads lane-for-lane is staged
+    /// ALREADY IN ITS ARRANGEMENT ([`dl16tofp32_stagger`]) — `build()` is pure
+    /// in this field, so the worker stages what the bake states and decides
+    /// nothing.
+    SampleTable {
+        vocab: u32,
+        operand: u8,
+        arrangement: ElementArrangement,
+    },
+}
+
+impl LoadConst {
+    /// The const's bytes, true dtype, and `[rows, cols]` shape — ONE
+    /// derivation per kind, shared by every stager (the bake's numeric gate
+    /// and the worker's load staging both call here, so a defect cannot hide
+    /// on one leg only). PURE IN THE ARRANGEMENT: a `Dl16ToFp32` entry's bytes
+    /// come out already permuted into the stagger the consuming island reads,
+    /// so every leg that calls here stages identical bytes by construction.
+    pub fn build(&self) -> (Vec<u8>, scratchy_tensors::DType, [usize; 2]) {
+        match *self {
+            LoadConst::SampleTable {
+                vocab,
+                operand,
+                arrangement,
+            } => {
+                let (bytes, dt, shape) = sample_staged_tables(vocab)
+                    .into_iter()
+                    .nth((operand - 1) as usize)
+                    .expect("the mint emits operand 1..=9 — the registry's own row");
+                let bytes = match (dt, arrangement) {
+                    // The stagger is an f32-word-stream fact; an f16 table never carries it.
+                    (scratchy_tensors::DType::F32, ElementArrangement::Dl16ToFp32) => {
+                        let words: Vec<f32> = bytes
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|p| f32::from_le_bytes(*p))
+                            .collect();
+                        dl16tofp32_stagger(&words)
+                            .into_iter()
+                            .flat_map(|w| w.to_le_bytes())
+                            .collect()
+                    }
+                    _ => bytes,
+                };
+                (bytes, dt, shape)
+            }
+        }
+    }
+}
+
+/// ⭐ THE SAMPLER'S PER-STEP SEAT — the named class of the two sources the
+/// token draw reads FRESH EVERY DECODE STEP. Derived ONCE off the minted
+/// `Sample` node ([`lower_subtile_tape_to_ktir::sample_seat_of_ir`], the same
+/// one-derivation law [`LoadConst`] rides) and carried on
+/// [`Wiring::sample_seat`]; the mint's own facts, never recomputed.
+///
+/// ⛔ COUNTED AS FILLED ONLY WHEN BOUND THIS STEP. The source gate treats the
+/// seat's tids as a class apart from every other source: a weight is staged
+/// once at load, a load-const once at load, and an activation is bound before
+/// the launch that reads it — but the noise and inv_t go STALE the moment a
+/// step completes, because they are the step's own randomness. A decode
+/// launch without a fresh bind of BOTH REFUSES LOUDLY, the PrefixMask
+/// precedent, never a held default: a held noise row is a held TOKEN (every
+/// subsequent draw repeats the same pick wherever temperature is live), which
+/// is the silent-wrong-answer class the whole wiring exists to refuse.
+#[derive(Clone, Copy, Debug)]
+pub struct SampleSeat {
+    /// The logits row's tid — the Sample node's inputs[0], placed by the rung
+    /// and readable by tid after the step (probe: is the sampler's input live?).
+    pub row: u32,
+    /// The noise source's tid — the rung's `[rows, PAD_V]` f32 Gumbel block,
+    /// staged EVERY STEP by the worker.
+    pub noise: u32,
+    /// The temperature reciprocal's tid — the rung's `[rows, 1]` f32 inv_t
+    /// column, staged every step with the noise.
+    pub invt: u32,
+    /// The rung's OWN row count — the mint's own `rows` fact (the solo rung at
+    /// 1, every batched rung at its baked width), the row count of both
+    /// per-row operands and of the draw's grid.
+    pub rows: u32,
+    /// The EMITTED vocab — the row's own width, the sentinel threshold the
+    /// consumer refuses past.
+    pub vocab: u32,
+    /// `sample_pad_vocab(vocab)` — the width both per-row operands share.
+    pub pad_vocab: u32,
+    /// ⭐ THE NOISE ROW'S ARRANGEMENT — the bake's own propagation fact
+    /// (the propagation pass `ktir_superdsc::emit::whole_function::staggered_sources`), stated as a CONST on the seat: the sampler's
+    /// staggered pointwise island reads the noise lane-for-lane, so the
+    /// per-step stager writes lane `i` at [`DL16TOFP32_PERMUTATION`]'s baked
+    /// index — the 64-entry const table, never a derivation. The worker
+    /// indexes the baked facts; it decides nothing. The inv_t is a `[rows, 1]`
+    /// column broadcast — one scalar per row, order-free — so it carries no
+    /// arrangement of its own.
+    pub noise_arrangement: ElementArrangement,
+}
+
+/// ⭐ THE SAMPLER'S NINE STAGED TABLES — the kernel's own host contract
+/// (`kernels/sample_fwd.py`'s docstring), stated ONCE for every stager: the
+/// bake-time numeric gate and the worker's load-time staging read this same
+/// fn, so a table defect cannot hide on one leg only (the synth weights' own
+/// law). The tables are functions of the vocab alone, constant across decode
+/// steps, staged ONCE.
+///
+/// ⭐ EVERY TABLE IS F32 — the selection's own dtype. The score is a sum
+/// `x·inv_t + g`; comparing it in f16 would round near-ties into ties the
+/// host reference never sees, so the whole selection runs f32 and the tables
+/// state the SAME numbers the f16 argmax tables carried (#813's own values),
+/// re-stated in the wider dtype — exact integers either way.
+///
+/// In the kernel's OPERAND ORDER — `bramp, lramp, binc, linc, ones, sixtyfour,
+/// padoff, gramp, ginc` — each entry is `(bytes, dtype, [rows, cols])`:
+///
+/// * `bramp` — strictly DECREASING in the block index WITHIN EACH GROUP and
+///   PERIODIC across groups (`GROUP_BLOCKS - (b % GROUP_BLOCKS)`), so the
+///   second `max` lands on the FIRST block holding the row's maximum inside
+///   the first maximal group; its lane values top out at 64, exact at
+///   ANY vocab. 0 on the pad lanes, which can never win a max the real lanes
+///   contest.
+/// * `lramp` — strictly decreasing within each block, PERIODIC (`BLOCK - l`),
+///   so the third `max` lands on the first lane of that block.
+/// * `binc` / `linc` — the INCREASING 0-based block-within-group / lane index
+///   tables the one-hot reads the selected numbers back out through
+///   (`binc` periodic, `GROUP_BLOCKS` wide); on the pad lanes they stage
+///   `GROUP_BLOCKS` / `BLOCK` — the SENTINEL's own values.
+/// * `ones` / `sixtyfour` — the `[1, BLOCK]` widen tables: the ones broadcast
+///   the selected numbers out to the output stick, the scale row carries the
+///   `·64` of the wide integer combine (used twice: once for the block term,
+///   once squared for the group term's `·4096`; exact in f32 below 2^24).
+/// * `padoff` — THE PAD LAW: 0.0 on `[0, vocab)`, f32::MIN (−FLT_MAX,
+///   0xFF7FFFFF) on the pads — the fp32 reduce template's own "negInf"
+///   (`summeanmaxexx2_fp32.ddl:71`), NEVER IEEE −inf (an exponent-all-ones
+///   lane reads as NaN on the card and poisons the max). The kernel adds it
+///   to the score LAST, so a pad lane can never win whatever the row's pad
+///   bytes hold (the lm-head's zero-pad columns write 0.0 there every step;
+///   NaN rides through, keeping the all-NaN sentinel intact). Carried as a
+///   staged table — the same host contract as every other constant — never
+///   a V-constexpr mask.
+/// * `gramp` — the TWO-LEVEL RAMP's outer level: strictly DECREASING in the
+///   group index (`G - g`), constant across each group's 4096 lanes, 0 on the
+///   pad lanes. Its ceiling is the group count, which the admission gate
+///   keeps ≤ 2048, so the FIRST maximal GROUP wins the first `max` at any
+///   vocab the gate admits (a single flat block ramp would need NB = 8192 at
+///   gemma-4's PAD_V 524288, past fp16's exact range: that is why the ramp is
+///   two-level).
+/// * `ginc` — the INCREASING 0-based group index table; `G` on the pad lanes
+///   (the sentinel's group half).
+///
+/// The SENTINEL (all-NaN row, #666): the one-hot falls on the pad lanes,
+/// where the tables stage `ginc = G`, `binc = GROUP_BLOCKS`, `linc = BLOCK`,
+/// so idx = `G·4096 + GROUP_BLOCKS·64 + BLOCK = PAD_V + 4160`, past the last
+/// real lane.
+///
+/// Every value is a small exact integer (`G ≤ 2048` by the admission gate;
+/// `padoff` stages only 0.0 and f32::MIN), so the staging round trips
+/// bit-exactly.
+pub fn sample_staged_tables(vocab: u32) -> Vec<(Vec<u8>, scratchy_tensors::DType, [usize; 2])> {
+    let pad_v = scratchy_subtile::subtile_ir::sample_pad_vocab(vocab) as usize;
+    let block = scratchy_subtile::subtile_ir::SAMPLE_BLOCK as usize;
+    let group_blocks = scratchy_subtile::subtile_ir::SAMPLE_GROUP_BLOCKS as usize;
+    let groups = scratchy_subtile::subtile_ir::sample_groups(pad_v as u32) as usize;
+    let v = vocab as usize;
+    // A whole-row f32 table under a per-lane rule: lane `i < vocab` takes
+    // `real(i)`, a pad lane takes `pad`.
+    let f32_row = |real: &dyn Fn(usize) -> usize, pad: usize| -> Vec<u8> {
+        (0..pad_v)
+            .flat_map(|i| {
+                let x = if i < v { real(i) } else { pad };
+                (x as f32).to_le_bytes()
+            })
+            .collect()
+    };
+    vec![
+        // bramp: GROUP_BLOCKS - (b % GROUP_BLOCKS), periodic, pads 0.
+        (
+            f32_row(&|i| group_blocks - (i / block) % group_blocks, 0),
+            scratchy_tensors::DType::F32,
+            [1, pad_v],
+        ),
+        // lramp: BLOCK - l, periodic, pads 0.
+        (
+            f32_row(&|i| block - i % block, 0),
+            scratchy_tensors::DType::F32,
+            [1, pad_v],
+        ),
+        // binc: the block-within-group index, periodic, pads GROUP_BLOCKS.
+        (
+            f32_row(&|i| (i / block) % group_blocks, group_blocks),
+            scratchy_tensors::DType::F32,
+            [1, pad_v],
+        ),
+        // linc: the lane index, pads BLOCK.
+        (
+            f32_row(&|i| i % block, block),
+            scratchy_tensors::DType::F32,
+            [1, pad_v],
+        ),
+        // ones: [1, BLOCK] of 1.0.
+        (
+            (0..block)
+                .flat_map(|_| 1.0f32.to_le_bytes())
+                .collect(),
+            scratchy_tensors::DType::F32,
+            [1, block],
+        ),
+        // sixtyfour: [1, BLOCK] of 64.0.
+        (
+            (0..block).flat_map(|_| 64.0f32.to_le_bytes()).collect(),
+            scratchy_tensors::DType::F32,
+            [1, block],
+        ),
+        // padoff: THE PAD LAW — 0.0 on the real lanes, f32::MIN (−FLT_MAX,
+        // 0xFF7FFFFF) on the pads. Not an `f32_row` operand: the pad value is
+        // −FLT_MAX, not a small integer. ⭐ NEVER IEEE −inf: the hardware's
+        // fp32 domain does not use IEEE inf — the fp32 reduce template's own
+        // "negInf" seed is 0xFF7FFFFF, a FINITE number
+        // (`summeanmaxexx2_fp32.ddl:71`), and an exponent-all-ones lane reads
+        // as NaN on the card, so an IEEE −inf staged verbatim poisons the max
+        // into NaN. −FLT_MAX loses every max a real lane contests exactly the
+        // way −inf does (both are below every finite score), with no NaN to
+        // ride through. (#813's f16 pads never hit this: `ieee_to_sen`
+        // saturates −inf to SEN's finite minimum on that path.)
+        (
+            (0..pad_v)
+                .flat_map(|i| {
+                    let x = if i < v { 0.0 } else { f32::MIN };
+                    x.to_le_bytes()
+                })
+                .collect(),
+            scratchy_tensors::DType::F32,
+            [1, pad_v],
+        ),
+        // gramp: G - g, constant per group, pads 0 — the two-level ramp's
+        // outer level.
+        (
+            f32_row(&|i| groups - i / (block * group_blocks), 0),
+            scratchy_tensors::DType::F32,
+            [1, pad_v],
+        ),
+        // ginc: the group index, pads G — the sentinel's group half.
+        (
+            f32_row(&|i| i / (block * group_blocks), groups),
+            scratchy_tensors::DType::F32,
+            [1, pad_v],
+        ),
+    ]
 }
 
 /// The per-model wiring set: one [`Wiring`] per baked PROGRAM.
@@ -1748,6 +2064,7 @@ mod constant_tape_tests {
     fn uniform_wiring() -> Wiring {
         Wiring {
             result: 0,
+            result_dtype: scratchy_tensors::DType::F16,
             num_sources: 0,
             attn_mask: None,
             decode_position: 0,
@@ -1772,6 +2089,8 @@ mod constant_tape_tests {
             fp8_k_pads: &[],
             weight_scale_folds: &[],
             weight_copies: &[],
+            load_consts: &[],
+            sample_seat: None,
         }
     }
 
