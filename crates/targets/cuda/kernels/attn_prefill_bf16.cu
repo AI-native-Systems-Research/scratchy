@@ -45,6 +45,8 @@
 //   - K and V come from the paged cache: KV tile j is block `block_table[j]`, one TMA box of
 //     `[64, 256]` at `{block, kv_head, 0, 0}` (block_size = kv_height = 64, so one box fills the
 //     tile). The producer reads the block id from global memory before each load.
+//   - The index regions (`block_table`, `sequence`) are TK `gl<int>` views, read element by
+//     element; the online softmax's rescale is the `rescale_exact1` op of `scratchy_ops.cuh`.
 //   - Q and O are token-major `[1, rows, heads, 256]`: their `gl`s use TMA `axis = 1`, so a tile's
 //     64 rows run along the token dimension at a fixed head (`types/global/tma.cuh`,
 //     `coord::unit_coord`), and no transpose is needed.
@@ -61,6 +63,7 @@
 // K, V and compute-done per stage) are static shared memory, in what is left of 227 KiB.
 
 #include "kittens.cuh"
+#include "scratchy_ops.cuh"
 
 #include <climits>
 #include <cmath>
@@ -95,6 +98,8 @@ using consumers = kittens::group<CONSUMER_WARPGROUPS * kittens::WARPGROUP_WARPS>
 // Token slots per KV block (`step::CUDA_KV_BLOCK_SIZE`): one block is one K (or V) tile.
 constexpr uint32_t BLOCK_SIZE = 64;
 static_assert(KV_HEIGHT == int(BLOCK_SIZE), "one paged (block, kv head) tile is one TMA box");
+// Entries of a sequence's block table (`step::CUDA_MAX_BLOCKS_PER_SEQ`): the columns of its view.
+constexpr uint32_t MAX_BLOCKS_PER_SEQ = 128;
 
 using q_tile = st_bf<QO_HEIGHT, HEAD_DIM>;
 using k_tile = st_bf<KV_HEIGHT, HEAD_DIM>;
@@ -105,15 +110,20 @@ using o_tile = st_bf<QO_HEIGHT, HEAD_DIM>;
 // `[1, rows, heads, 256]` view.
 using qo_gl = gl<bf16, 1, -1, -1, HEAD_DIM, tma::descriptor<q_tile, 1>>;
 using kv_gl = gl<bf16, -1, -1, KV_HEIGHT, HEAD_DIM, k_tile>;
+// An index region, `[1, entries]` int with no TMA type: read element by element. Its u32 values
+// are all below 2^31 (block ids below `num_blocks` ≤ INT_MAX, and `P + L` ≤ 8192), so they read
+// as the same ints.
+using index_gl = gl<int, 1, 1, -1, -1>;
 
 struct attn_globals {
     qo_gl q;
     kv_gl k;
     kv_gl v;
     qo_gl o;
-    const uint32_t* block_table;
-    // `[P, L]`.
-    const uint32_t* sequence;
+    // `[1, MAX_BLOCKS_PER_SEQ]`.
+    index_gl block_table;
+    // `[1, 2]`: `[P, L]`.
+    index_gl sequence;
     // `scale · log2(e)`.
     float scale_log2;
     // `q_heads / kv_heads`.
@@ -126,36 +136,6 @@ static_assert(SMEM_TILES == 196608, "2 q + 2 K + 2 V tiles of [64, 256] bf16");
 // The tiles plus the slack `tma_swizzle_allocator` may spend aligning the first to 1024 bytes.
 constexpr int ATTN_SMEM_BYTES = int(SMEM_TILES) + 1024;
 static_assert(ATTN_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "fits the H100's 227 KiB");
-
-// The online softmax's rescale of one tile, per row: `exp2((m_old − m_new) · c)`, or exactly 1
-// when `m_new == m_old` (the tile raised no score above the running max, as for a tile masked out
-// for the row). `(m_old − m_new) · c` has no product feeding a sum, so nothing contracts into an
-// FMA; the select makes the unchanged case exact without relying on `exp2(0)`'s rounding.
-// `m_old = −inf` (the first tile) gives `exp2(−inf) = 0`.
-//
-// The vectors are `col_vec<rt_fl<16, 64>>`: a row-layout tile's column vector, whose layout is
-// `ortho` (`rt_base::col_vec_layout`), so `inner_dim` is 1 and `dtype` is the packed `float2`
-// (`rv::dtype`: `is_naive` is false). Each `[i][0]` holds two rows of subtile `i`: `.x` the top
-// row and `.y` the bottom one, as `row_reduce` writes them (`accum_packed.x` from the top row,
-// `.y` from the bottom) and `row_map` reads them (`row_values[i][0].x` scales the top row, `.y`
-// the bottom). So the select and the exp2 run on `.x` and `.y` separately. The loops are TK's own
-// vector `bin_op`'s (`ops/group/register/vec/maps.cuh`): `i < outer_dim`, `j < inner_dim`.
-__device__ inline float rescale_one(float o, float n, float c) {
-    return o == n ? 1.0f : exp2f((o - n) * c);
-}
-
-template <typename V>
-__device__ inline void rescale(V& dst, const V& m_old, const V& m_new, float c) {
-    static_assert(std::is_same_v<typename V::dtype, float2>, "a packed f32 column vector");
-#pragma unroll
-    for (int i = 0; i < V::outer_dim; i++) {
-#pragma unroll
-        for (int j = 0; j < V::inner_dim; j++) {
-            dst[i][j].x = rescale_one(m_old[i][j].x, m_new[i][j].x, c);
-            dst[i][j].y = rescale_one(m_old[i][j].y, m_new[i][j].y, c);
-        }
-    }
-}
 
 __global__ __launch_bounds__(NUM_THREADS, 1) void attn_prefill_bf16_ker(
     const __grid_constant__ attn_globals g) {
@@ -172,8 +152,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_prefill_bf16_ker(
     const int kv_head = q_head / g.hr;
     // The CTA's first query-row tile, in units of QO_HEIGHT rows.
     const int row_tile0 = blockIdx.x * CONSUMER_WARPGROUPS;
-    const int prefix_len = int(g.sequence[0]);
-    const int kv_len = prefix_len + int(g.sequence[1]);
+    const int prefix_len = g.sequence[{0, 0, 0, 0}];
+    const int kv_len = prefix_len + g.sequence[{0, 0, 0, 1}];
     // The last key any of this CTA's rows may attend to, and so the tiles the loop reads: key 0
     // is allowed for every row, so this is at least one tile.
     const int row_last = blockIdx.x * CTA_ROWS + CTA_ROWS - 1;
@@ -208,7 +188,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_prefill_bf16_ker(
                 if (j >= STAGES) {
                     wait(compute_done[stage], ((j - STAGES) / STAGES) % 2);
                 }
-                const int block = int(g.block_table[j]);
+                const int block = g.block_table[{0, 0, 0, j}];
                 coord<k_tile> at = {block, kv_head, 0, 0};
                 warp::tma::expect_bytes(k_smem_arrived[stage], sizeof(k_tile));
                 warp::tma::load_async(k_smem[stage], g.k, at, k_smem_arrived[stage]);
@@ -222,7 +202,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_prefill_bf16_ker(
         rt_fl<16, KV_HEIGHT> att_block;
         rt_bf<16, KV_HEIGHT> att_block_mma;
         rt_fl<16, HEAD_DIM> o_reg;
-        // `max_vec_last` holds the max before a tile, then (after `rescale`) the tile's rescale.
+        // `max_vec_last` holds the max before a tile, then (after the rescale) the tile's rescale.
         col_vec<rt_fl<16, KV_HEIGHT>> max_vec, norm_vec, max_vec_last, max_vec_scaled;
 
         warp::neg_infty(max_vec);
@@ -266,7 +246,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_prefill_bf16_ker(
             // it. Upstream's `exp2(m_old·c − m_new·c)` is not exactly 1 there: nvcc contracts the
             // product and the difference into `fma(m_old, c, −round(m_new·c))`, which is the
             // rounding error of `m·c`, not 0, so each masked tile scaled the row by 1 ± an f32 ulp.
-            rescale(max_vec_last, max_vec_last, max_vec, g.scale_log2);
+            scratchy::ops::rv_ternary_map<scratchy::ops::rescale_exact1>(
+                max_vec_last, max_vec_last, max_vec, g.scale_log2);
             warp::mul(norm_vec, norm_vec, max_vec_last);
             warp::row_sum(norm_vec, att_block, norm_vec);
             warp::copy(att_block_mma, att_block);
@@ -360,14 +341,13 @@ extern "C" int scratchy_cuda_attn_prefill_bf16(const void* q, const void* k_cach
         qo_gl og{op, nullptr, size_t(rows), size_t(q_heads), nullptr};
         kv_gl kg{kp, size_t(num_blocks), size_t(kv_heads), nullptr, nullptr};
         kv_gl vg{vp, size_t(num_blocks), size_t(kv_heads), nullptr, nullptr};
-        attn_globals G{qg,
-                       kg,
-                       vg,
-                       og,
-                       static_cast<const uint32_t*>(block_table),
-                       static_cast<const uint32_t*>(sequence),
-                       scale * 1.44269504089f,
-                       int(q_heads / kv_heads)};
+        // The index regions as `[1, entries]` int views: the block table's `MAX_BLOCKS_PER_SEQ`
+        // entries, the sequence's two.
+        index_gl tg{static_cast<int*>(const_cast<void*>(block_table)), nullptr, nullptr, size_t(1),
+                    size_t(MAX_BLOCKS_PER_SEQ)};
+        index_gl sg{static_cast<int*>(const_cast<void*>(sequence)), nullptr, nullptr, size_t(1),
+                    size_t(2)};
+        attn_globals G{qg, kg, vg, og, tg, sg, scale * 1.44269504089f, int(q_heads / kv_heads)};
         void* args[] = {&G};
         const dim3 grid(rows / uint32_t(CTA_ROWS), q_heads, 1), block(NUM_THREADS);
         return static_cast<int>(cudaLaunchKernel(attn_prefill_bf16_ker, grid, block, args,

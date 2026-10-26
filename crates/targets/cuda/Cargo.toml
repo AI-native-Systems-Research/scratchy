@@ -90,6 +90,17 @@ name = "tape_layout"
 [[test]]
 name = "weight_table"
 
+# Every kernel is written with ThunderKittens: a check of the kernels' source text (rules T1-T10),
+# with kernels not yet rewritten on its `NOT_YET_PORTED` list. No toolchain needed.
+[[test]]
+name = "kernels_use_thunderkittens"
+
+# The prefill attention's full output per case, dumped for a bit-identity comparison across two
+# commits (#845), on the GPU. Not built without `nvcc`.
+[[test]]
+name = "attn_prefill_dump"
+required-features = ["nvcc"]
+
 # The embed row gather against an exact reference over a NaN-poisoned output, and its launcher's
 # refusals, on the GPU. Not built without `nvcc`.
 [[test]]
