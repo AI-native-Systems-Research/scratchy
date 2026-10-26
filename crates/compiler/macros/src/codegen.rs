@@ -10526,9 +10526,8 @@ const PREFILL_LX_SAFE: u32 = 31;
 /// tape is CONCRETE (`seq_sym` is forced to `None` below), so `symbolicize_seq` never runs on
 /// it. That is why 128 may equal granite-8b's head_dim here.
 ///
-/// Rungs that fail to lower for a given model are logged and SKIPPED, so this list is an upper
-/// bound on the ladder, not a promise — a model whose FFN blows the LX budget at a wide rung
-/// simply gets a shorter ladder.
+/// Rungs that fail to lower for a given model FAIL THE BUILD, so this list is a promise:
+/// every admitted rung bakes or nothing does.
 /// DENSER AT THE LOW END on purpose: padding cost is `(rung − real) × slope`, so what hurts is
 /// the PROPORTION of the chunk that is padding, and that is worst for short prompts. A measured
 /// 19-token prompt landed on rung 31 and spent 12 of its 31 rows (39%) computing nothing — about
@@ -11148,9 +11147,9 @@ fn dump_wavefront_mega(
                     && active_cap
                         == scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL;
                 // ⛔ THE WIRING MUST NOT DESCRIBE A PROGRAM THAT DID NOT SHIP. A prefill
-                // rung whose reroll fails is SKIPPED per the rung contract ("a narrower
-                // rung still covers this width"), but this closure's KTIR emission and
-                // wiring stamp run AFTER the reroll and OUTLIVE its failure — so an
+                // rung whose reroll fails PANICS (no rung may fail to lower), but this
+                // closure's KTIR emission and wiring stamp run AFTER the reroll and
+                // OUTLIVE its failure — so an
                 // unqualified `slot.1 = Some(w)` shipped a wiring promising an m=31
                 // batched prefill no bundle carried. The worker keys `prefill_prog` on
                 // the wiring alone (`spyre_load.rs`, `pparsed.is_some() ⇒ Some(0)`) and
@@ -11162,9 +11161,9 @@ fn dump_wavefront_mega(
                 // whose m=31 rung DID bake, staged clean). This flag is the per-call
                 // record of "this prefill bundle actually baked", set at the only two
                 // sites that stamp a prefill fp and read at the wiring stamp below — a
-                // skipped rung leaves the wiring unstamped, `pparsed` parses nothing,
-                // and the worker falls to its sequential per-token prefill (slower,
-                // never wrong: the rung contract's own fallback).
+                // rung that did not bake leaves the wiring unstamped, `pparsed` parses
+                // nothing, and the worker falls to its sequential per-token prefill
+                // (slower, never wrong).
                 let mut prefill_fp_stamped = false;
                 let fused = scratchy_subtile::lower::fuse_silu_mul(&lwd.input);
                 let mut krg = scratchy_subtile::subtile_ir::lower_region(&fused, knb);
@@ -11500,25 +11499,16 @@ fn dump_wavefront_mega(
                                     // nobody emitted: the worker's body selector finds no bundle and
                                     // the first signal is a launch-time refusal with none of this
                                     // context. This is the site the oversized-dxp-group guard
-                                    // (`DxGroupCeiling`) reaches on a PRIMARY body bundle — a body
-                                    // is not a ladder rung, there is no narrower rung to fall back
-                                    // to, and log-and-skip here is exactly the swallow that would
-                                    // have turned the guard into an eprintln. A decode BATCH rung
-                                    // (`decode_rows > 1`) is the documented exception: "a rung that
-                                    // fails to lower is logged and SKIPPED; that batch runs on a
-                                    // narrower rung, in more than one forward, which is slower and
-                                    // never wrong" — the mq=32 gemma-4 rung is exactly that case
-                                    // (its gathered fold is 8,300 descriptors, over the ceiling;
-                                    // mq=16's 4,172 is not).
-                                    // `None` = errors are fatal (the primary body); on a batch rung
-                                    // (`decode_rows > 1`) they are skipped per the rung contract.
+                                    // (`DxGroupCeiling`) reaches — log-and-skip here is exactly the
+                                    // swallow that would have turned the guard into an eprintln, so
+                                    // an emit failure is FATAL for every rung alike: primary body,
+                                    // decode batch rung, prefill rung.
                                     // ONE BUNDLE PER CLASS, class 0 first — class 0 is the ANCHOR
                                     // (`RerollMeta::bodies[0]` names THIS bundle), and every other
                                     // class becomes a sibling fingerprint. The emulator's single
                                     // unrolled bundle stays ONE bundle: `unroll_layers` already
                                     // walks the launch sequence across classes.
                                     let mut body_fps: Vec<String> = Vec::new();
-                                    let mut body_err: Option<std::io::Error> = None;
                                     for (ci, b) in rolled.bodies.iter().enumerate() {
                                         let r = superdsc::emit_bundle(
                                             if card { &b.ops } else { &unrolled },
@@ -11532,21 +11522,17 @@ fn dump_wavefront_mega(
                                         );
                                         match r {
                                             Ok(fp) => body_fps.push(fp),
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "[spyre-superdsc] {base}: body class {ci} emit \
-                                                     failed: {e}"
-                                                );
-                                                if decode_rows <= 1 {
-                                                    body_err = body_err.or(Some(e));
-                                                }
-                                            }
+                                            Err(e) => panic!(
+                                                "[spyre-superdsc] {base}: body class {ci} emit \
+                                                 failed at decode_rows={decode_rows} \
+                                                 prefill_mq={prefill_mq:?} — {e}. A rung the bake \
+                                                 was asked for must ship its bundle; a skip here \
+                                                 ships a binary whose batch silently runs elsewhere"
+                                            ),
                                         }
                                     }
                                     let bod: Result<String, std::io::Error> =
-                                        body_err.map(Err).unwrap_or_else(|| {
-                                            Ok(body_fps.first().cloned().unwrap_or_default())
-                                        });
+                                        Ok(body_fps.first().cloned().unwrap_or_default());
                                     // The SAME body, with the per-page fold fused back into the
                                     // surrounding work instead of standing alone. Splitting the fold
                                     // costs one extra launch per layer (measured: 5 groups vs the
@@ -12374,18 +12360,18 @@ fn dump_wavefront_mega(
                                             fx.push(BakeEffect::PrefillFp(bfp));
                                             prefill_fp_stamped = true;
                                         } else {
-                                            // ⛔ AN EMPTY fp IS A SKIPPED RUNG, NOT A REGISTERED
-                                            // ONE: the batch-ladder contract is that a rung whose
-                                            // emit failed simply does not appear, so the worker
-                                            // falls to the next narrower rung. Registering it
-                                            // with `""` would hand the selector a bundle nobody
-                                            // emitted.
+                                            // ⛔ AN EMPTY fp IS A FAILED RUNG, NOT AN UNREGISTERED
+                                            // ONE: the batch ladder's contract is that every rung
+                                            // the bake was asked for SHIPS — an emit that failed
+                                            // above already panicked, and an empty fp reaching
+                                            // here means a bundle nobody emitted would otherwise be
+                                            // silently absent from the ladder.
                                             if bfp.is_empty() {
-                                                eprintln!(
+                                                panic!(
                                                     "[spyre-superdsc] {base}: decode batch rung \
-                                                     seqs={decode_rows} NOT BAKED (emit failed \
-                                                     above) — SKIPPED; that batch runs on a \
-                                                     narrower rung, in more than one forward"
+                                                     seqs={decode_rows} NOT BAKED (no body \
+                                                     fingerprint) — every rung the bake was asked \
+                                                     for must ship"
                                                 );
                                             } else {
                                                 // `cap` IS this body's swept extent: `bfp` is the
@@ -12437,36 +12423,19 @@ fn dump_wavefront_mega(
                                     }
                                 }
                                 Err(e) => {
-                                    // ⭐ THE RUNG CONTRACT: "a rung that fails to lower is logged and
-                                    // SKIPPED; that batch runs on a narrower rung, in more than one
-                                    // forward, which is slower and never wrong" (the decode batch
-                                    // ladder's own law, and the prefill rung handler's own promise
-                                    // at the wavefront level — `prefill ladder rung m={pl} NOT
-                                    // LOWERED … (SKIPPED; a narrower rung still covers this width)`).
-                                    // A BATCH rung (`decode_rows > 1`) or a PREFILL rung
-                                    // (`prefill_mq.is_some()`) is exactly that case: its callers
-                                    // already treat a missing rung as a fall-to-narrower, never as
-                                    // a build stop. Only the PRIMARY bodies (`decode_rows <= 1`,
-                                    // decode) have no narrower rung to fall to — for them the panic
-                                    // stands (a failed primary bake left `superdsc_fp` unset and
-                                    // shipped a ZERO-group bundle that only crashed at pod load —
-                                    // the swallow this panic replaced).
-                                    if decode_rows > 1 || prefill_mq.is_some() {
-                                        eprintln!(
-                                            "[spyre-superdsc] {base}: RE-ROLL NOT LOWERABLE at \
-                                             decode_rows={decode_rows} prefill_mq={prefill_mq:?} — \
-                                             {e} (SKIPPED per the rung contract; a narrower rung \
-                                             still covers this width)"
-                                        );
-                                    } else {
-                                        panic!(
-                                            "[spyre-superdsc] {base}: RE-ROLL NOT YET LOWERABLE — \
-                                         {e}. (Next worklist item for the re-rolled SuperDSC emitter — \
-                                         this failure was previously swallowed by an eprintln, leaving \
-                                         superdsc_fp unset and shipping a ZERO-group bundle that only \
-                                         crashed at pod load.)"
-                                        );
-                                    }
+                                    // ⛔ NO RUNG MAY FAIL TO LOWER. The old "rung contract" — a
+                                    // failed rung is skipped and the batch falls to a narrower one —
+                                    // shipped binaries whose batch decode silently ran elsewhere
+                                    // (measured: the sampler's grid defect skipped EVERY decode
+                                    // batch rung and nothing said so). A rung the bake was asked
+                                    // for is a build obligation: failure is a build failure, naming
+                                    // the rung and the error.
+                                    panic!(
+                                        "[spyre-superdsc] {base}: RE-ROLL NOT LOWERABLE at \
+                                         decode_rows={decode_rows} prefill_mq={prefill_mq:?} — {e}. \
+                                         Every rung the bake was asked for must lower; a skip ships \
+                                         a binary whose batch silently runs elsewhere"
+                                    );
                                 }
                             }
                         }
@@ -12708,8 +12677,8 @@ fn dump_wavefront_mega(
                     // at B rows and is addressed by FINGERPRINT, not through this wiring.
                     // ⛔ AND A PREFILL WIRING SHIPS ONLY FOR A PREFILL THAT BAKED. The
                     // prefill walk's KTIR emission and wiring stamp survive their own
-                    // reroll's failure (the rung contract skips the rung, not the walk),
-                    // so `is_prefill` alone would promise a batched prefill no bundle
+                    // reroll's failure (a failed reroll panics after the walk has already
+                    // emitted), so `is_prefill` alone would promise a batched prefill no bundle
                     // carries — see the `prefill_fp_stamped` declaration above for the
                     // measured consequence. A rung that did not bake stamps NEITHER
                     // slot: falling through to the decode arm would ship the m=31
@@ -12921,9 +12890,8 @@ fn dump_wavefront_mega(
         // being requests: one page map per request, and one prefix-validity row per request.
         //
         // Rungs share ONE resident weights+KV — no term in either placement depends on the row count,
-        // the same property that licenses the prefill ladder. A rung that fails to lower is logged
-        // and SKIPPED: the batch runs on a narrower rung, in more than one forward, which is slower
-        // and never wrong.
+        // the same property that licenses the prefill ladder. A rung that fails to lower FAILS THE
+        // BUILD, naming the rung and the error.
         // ⛔ CARD-ONLY, same reason as the prefill ladder below: the worker reaches a batch rung
         // through `superdsc_decode_rungs` / `BatchSlot`, which it consults under `spyre-hw` alone —
         // an emulator build sets `batched_prefill: None` (`spyre_load.rs:1713`) and never runs one.
@@ -12934,7 +12902,7 @@ fn dump_wavefront_mega(
             // +16 per further request — plus one launch per request. Measured 36 ms fixed + ~2 ms per
             // request, so the fixed part is what the ladder amortizes and wider rungs are close to
             // free: 8 requests reach ~2.4x the weight stream's worth of work, 32 should reach ~4x.
-            // A rung that fails to lower is logged and skipped, so adding them cannot break a build.
+            // A rung that fails to lower fails the build, so adding one cannot ship silently.
             //
             // THE LADDER COMES FROM THE POOL, not from a literal here. A page holds exactly
             // `PagedKvPool::ROWS` requests, and a rung wider than that would bake a launch whose
@@ -12972,9 +12940,10 @@ fn dump_wavefront_mega(
                             seqs,
                         );
                     }
-                    Err(e) => eprintln!(
-                        "[spyre-superdsc] {stem}: decode batch rung seqs={seqs} NOT LOWERED — {e} \
-                         (SKIPPED; that batch runs on a narrower rung, in more than one forward)"
+                    Err(e) => panic!(
+                        "[spyre-superdsc] {stem}: decode batch rung seqs={seqs} NOT LOWERED — {e}. \
+                         Every rung the bake was asked for must lower; a skip ships a binary whose \
+                         batch silently runs elsewhere"
                     ),
                 }
             }
@@ -13178,9 +13147,8 @@ fn dump_wavefront_mega(
         // rung by rung, ascending, exactly as the serial loop did (the last rung that lowered is still
         // the ceiling).
         //
-        // A rung that does not lower comes back as its `(width, reason)` instead, collected in the same
-        // ascending order at commit — what the window guard below names when the baked ladder stops
-        // short.
+        // A rung that does not lower PANICS inside its own bake — every entry that reaches
+        // the commit below is `Ok`, so the committed ladder is every rung asked for.
         type RungBake = (to_wavefront::LoweredDecode, PrefillPick, Vec<BakeEffect>);
         let per_rung: Vec<Result<RungBake, (u32, String)>> = {
             use rayon::prelude::*;
@@ -13249,24 +13217,27 @@ fn dump_wavefront_mega(
                     Ok((lwd_p, r, fx))
                 }
                 Err(e) if sendnn_superdsc => {
-                    eprintln!(
-                        "[spyre-superdsc] {stem}: prefill ladder rung m={pl} NOT LOWERED — {e} \
-                         (SKIPPED; a narrower rung still covers this width)"
-                    );
-                    Err((pl, e.to_string()))
+                    panic!(
+                        "[spyre-superdsc] {stem}: prefill ladder rung m={pl} NOT LOWERED — {e}. \
+                         Every rung the bake was asked for must lower; a skip ships a binary whose \
+                         chunks silently run elsewhere"
+                    )
                 }
                 Err(e) => panic!("[wavefront] {stem}: prefill (m={pl}) NOT LOWERED — {e}"),
             }
             }).collect()
         };
-        let mut refused_rungs: Vec<(u32, String)> = Vec::new();
+        // A rung that fails to lower panics inside the parallel bake above, so every
+        // entry here is `Ok` — the window guard below still runs, over what baked.
         for rung in per_rung {
             match rung {
                 Ok((lwd_p, r, fx)) => {
                     commit_bake(&lwd_p, fx);
                     prefill = Some(r);
                 }
-                Err(refused) => refused_rungs.push(refused),
+                Err((pl, e)) => panic!(
+                    "[spyre-superdsc] {stem}: prefill ladder rung m={pl} NOT LOWERED — {e}"
+                ),
             }
         }
         // ⛔⛔⛔ AND THE LADDER THAT LOWERED MUST REACH THE POOL'S WINDOW, for a model that admits it — on
@@ -13284,7 +13255,7 @@ fn dump_wavefront_mega(
                     rung_admitted(window),
                     prefill_m,
                     &baked,
-                    &refused_rungs,
+                    &[],
                 )
             {
                 panic!("[spyre-superdsc] {stem}: {e}");
@@ -13313,7 +13284,6 @@ fn dump_wavefront_mega(
                 .map(|(m, _)| *m)
                 .collect();
             let asked = scratchy_subtile::sdsc_abstract::PagedKvPool::prefix_rungs(&baked);
-            let mut refused_prefix: Vec<(u32, String)> = Vec::new();
             for &m in &asked {
                 match crate::to_wavefront::lower_decode_to_wavefront(
                     fuf,
@@ -13335,7 +13305,10 @@ fn dump_wavefront_mega(
                             1, // a prompt chunk is one request
                         );
                     }
-                    Err(e) => refused_prefix.push((m, e.to_string())),
+                    Err(e) => panic!(
+                        "[spyre-superdsc] {stem}: prefix-capable prefill rung m={m} NOT LOWERED — \
+                         {e}. Every rung the bake was asked for must lower"
+                    ),
                 }
             }
             // ⛔⛔⛔ THE PREFIX LADDER MUST TOP OUT AT THE PREFIX-FREE LADDER's TOP. A mid-prompt continuation
@@ -13360,7 +13333,7 @@ fn dump_wavefront_mega(
                 scratchy_subtile::sdsc_abstract::PagedKvPool::prefix_ladder_bakes_every_rung(
                     &asked,
                     &prefix,
-                    &refused_prefix,
+                    &[],
                 )
             {
                 panic!("[spyre-superdsc] {stem}: {e}");

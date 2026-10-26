@@ -1420,9 +1420,9 @@ impl SpyreWorker {
                 // (2026-10-09, wall 9). The anchor's LIVE segments are charged unconditionally — its
                 // build is fatal, so they are mandatory — and its SPARE only under the policy below.
                 // The optional ladders (prefill rungs past the anchor, decode rungs, the prefix-capable
-                // prefill) stay UNCHARGED on purpose: each is built soft — a failed build is a WARN and
-                // a narrower rung, never a dead run — so charging them would refuse configs that run
-                // fine degraded.
+                // prefill) stay UNCHARGED on purpose — the charging policy predates the
+                // every-rung-must-load law and is unchanged here: their builds are FATAL now, so a
+                // config whose ladders do not fit dies at build rather than running degraded.
                 let (anchor_live_bytes, anchor_spare_bytes) = match prefill_code {
                     Some(pc) => {
                         let weight = scratchy_target_spyre::superdsc_exec::SEG_WEIGHT.get();
@@ -2269,22 +2269,18 @@ impl SpyreWorker {
                 for (rm, built) in ladder_join.join().unwrap_or_default() {
                     match built {
                         Ok(mut rs) => {
-                            let mut ok = true;
                             if let Err(e) = adopt_from_owner(&mut rs, &ss, &spill_images) {
-                                warn!(
-                                    "[spyre-worker] sendnn: prefill ladder rung m={rm}: {e} — \
-                                     SKIPPED (a wider rung covers this width)"
+                                panic!(
+                                    "prefill ladder rung m={rm}: {e} — every rung the bake \
+                                     shipped must load"
                                 );
-                                ok = false;
                             }
-                            if ok {
-                                _n_ladder += 1;
-                                prefill_ladder.push((rm, rs));
-                            }
+                            _n_ladder += 1;
+                            prefill_ladder.push((rm, rs));
                         }
-                        Err(e) => warn!(
-                            "[spyre-worker] sendnn: prefill ladder rung m={rm}: create failed: {e} \
-                             — SKIPPED (a wider rung covers this width)"
+                        Err(e) => panic!(
+                            "prefill ladder rung m={rm}: create failed: {e} — every rung the \
+                             bake shipped must load"
                         ),
                     }
                 }
@@ -2309,55 +2305,54 @@ impl SpyreWorker {
                 // ── PREFIX-CAPABLE PREFILL LADDER ── the bundles a continuation chunk (start>0) runs
                 // on. Every ladder rung above is prefix-FREE, so these are the ONLY prefill bundles
                 // that can attend resident KV. Borrows seg1+seg2 like the rungs, and is built AFTER
-                // the decode session so it cannot affect decode's weight-region placement. A rung that
-                // fails to build is logged and skipped: its chunks run on a wider rung, more padded.
+                // the decode session so it cannot affect decode's weight-region placement. A rung
+                // that fails to load is a LOAD ERROR — every rung the bake shipped must load.
                 let mut prefix_built: Vec<(usize, SuperDscSession)> = Vec::new();
                 for &(pmq, psent) in g0.prefill_prefix {
                     if pmq <= 1 || psent.is_empty() {
                         continue;
                     }
-                    match psent
+                    let pcode2 = psent
                         .strip_prefix(SUPERDSC_SENTINEL)
                         .and_then(scratchy_target_spyre::bundle_code::bundle)
-                    {
-                        Some(pcode2) => match SuperDscSession::new_borrowing_with_consts(
-                            pcode2,
-                            vocab,
-                            kv_dim,
-                            num_blocks,
-                            &[1, 2],
-                            // The general mint's nine tables, this bundle's own seg3 copy.
-                            wirings
-                                .prefill
-                                .as_ref()
-                                .unwrap_or(&wirings.decode)
-                                .load_consts,
-                            &spill_tids,
-                        ) {
-                            Ok(mut ps) => match adopt_from_owner(&mut ps, &ss, &spill_images) {
-                                Ok(()) => {
-                                    info!(
-                                        "[spyre-worker] sendnn: prefix-capable prefill session \
-                                         ready (m={pmq}, bundle {}) — used for start>0 chunks",
-                                        pcode2.fp
-                                    );
-                                    prefix_built.push((pmq as usize, ps));
-                                }
-                                Err(e) => warn!(
-                                    "[spyre-worker] sendnn: prefix-capable prefill m={pmq}: {e} — \
-                                     SKIPPED"
-                                ),
-                            },
-                            Err(e) => warn!(
-                                "[spyre-worker] sendnn: prefix-capable prefill m={pmq} session \
-                                 build failed: {e} — SKIPPED"
-                            ),
-                        },
-                        None => warn!(
-                            "[spyre-worker] sendnn: prefix-capable prefill m={pmq} sentinel did \
-                             not resolve — SKIPPED"
-                        ),
-                    }
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "prefix-capable prefill m={pmq}: sentinel did not resolve — \
+                                 every rung the bake shipped must load"
+                            )
+                        });
+                    let mut ps = SuperDscSession::new_borrowing_with_consts(
+                        pcode2,
+                        vocab,
+                        kv_dim,
+                        num_blocks,
+                        &[1, 2],
+                        // The general mint's nine tables, this bundle's own seg3 copy.
+                        wirings
+                            .prefill
+                            .as_ref()
+                            .unwrap_or(&wirings.decode)
+                            .load_consts,
+                        &spill_tids,
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "prefix-capable prefill m={pmq} session build failed: {e} — every \
+                             rung the bake shipped must load"
+                        )
+                    });
+                    adopt_from_owner(&mut ps, &ss, &spill_images).unwrap_or_else(|e| {
+                        panic!(
+                            "prefix-capable prefill m={pmq}: {e} — every rung the bake shipped \
+                             must load"
+                        )
+                    });
+                    info!(
+                        "[spyre-worker] sendnn: prefix-capable prefill session ready (m={pmq}, \
+                         bundle {}) — used for start>0 chunks",
+                        pcode2.fp
+                    );
+                    prefix_built.push((pmq as usize, ps));
                 }
                 let mut prefill_prefix = PrefixLadder::of_built(prefix_built);
                 if prefill_prefix.is_empty() {
@@ -2373,11 +2368,11 @@ impl SpyreWorker {
                     );
                 }
                 // ── DECODE BATCH LADDER: one session per baked request count ──
-                // Same construction and the same failure rule as the prefill ladder: each rung
-                // aliases the decode session's weights and page pool, so a rung costs its programs
-                // and its activations, never another copy of the model. A rung that fails to build
-                // is logged and SKIPPED — that batch runs on a narrower rung, in more than one
-                // forward, which is slower and never wrong.
+                // Same construction as the prefill ladder: each rung aliases the decode session's
+                // weights and page pool, so a rung costs its programs and its activations, never
+                // another copy of the model. A rung that fails to load is a LOAD ERROR — every
+                // rung the bake shipped must load, so a binary whose batch decode silently runs
+                // elsewhere can never serve.
                 let mut decode_ladder: Vec<DecodeRung> = Vec::new();
                 // ⛔ THE MANIFEST'S `SweptCols` IS DELIBERATELY NOT BOUND. It is the CEILING body's sweep —
                 // one number per BATCH WIDTH — and the two host decisions that used to read it are
@@ -2401,22 +2396,21 @@ impl SpyreWorker {
                     else {
                         continue;
                     };
-                    let Some(rcode) = sentinel
+                    let rcode = sentinel
                         .as_str()
                         .strip_prefix(SUPERDSC_SENTINEL)
                         .and_then(scratchy_target_spyre::bundle_code::bundle)
-                    else {
-                        warn!(
-                            "[spyre-worker] sendnn: decode batch rung seqs={rn}: sentinel names no \
-                             bundle compiled into this binary — SKIPPED"
-                        );
-                        continue;
-                    };
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "decode batch rung seqs={rn}: sentinel names no bundle compiled \
+                                 into this binary — every rung the bake shipped must load"
+                            )
+                        });
                     // The rung's own logits placement, read from the bundle it actually runs. Derived,
                     // never assumed: the width is stick-PADDED above the vocab, and the row count is
                     // this rung's `seqs`, so both differ per rung. A rung whose placement does not
-                    // describe `rn` whole rows is SKIPPED rather than gathered from — that batch runs
-                    // on a narrower rung, which is slower and never wrong.
+                    // describe `rn` whole rows is a LOAD ERROR — a gathered-from guess would read
+                    // rows nobody wrote.
                     // ⭐ THE PREFIX MASK'S REAL CAPACITY, FROM THIS RUNG'S OWN BUNDLE.
                     //
                     // `pmask = [nqh*mq, cap]` (`lower_subtile_tape_to_superdsc.rs:2567`), so the fold's
@@ -2486,9 +2480,8 @@ impl SpyreWorker {
                     }
                     // THE FOLD-ROW REGIME, from the bundle it will actually run: the launch derives its
                     // intermediate-segment stride from it (`set_int_stride`). A rung whose fold groups
-                    // DISAGREE is SKIPPED like any other rung that fails to load — that batch runs on a
-                    // narrower rung, slower and never wrong, whereas guessing a stride is the
-                    // silent-wrong-history arm this field exists to close.
+                    // DISAGREE is a PANIC like any other rung that fails to load — guessing a
+                    // stride is the silent-wrong-history arm this field exists to close.
                     let fold_rows = match rcode.fold_rows() {
                         Ok(scratchy_target_spyre::bundle_code::FoldRows::PerRequest) => {
                             scratchy_subtile::sdsc_abstract::FoldRowRegime::PerRequest
@@ -2496,13 +2489,10 @@ impl SpyreWorker {
                         Ok(scratchy_target_spyre::bundle_code::FoldRows::WholeBatch) => {
                             scratchy_subtile::sdsc_abstract::FoldRowRegime::WholeBatch
                         }
-                        Err(e) => {
-                            warn!(
-                                "[spyre-worker] sendnn: decode batch rung seqs={rn}: {e} — SKIPPED; \
-                                 that batch runs on a narrower rung"
-                            );
-                            continue;
-                        }
+                        Err(e) => panic!(
+                            "decode batch rung seqs={rn}: {e} — every rung the bake shipped must \
+                             load"
+                        ),
                     };
                     let logits = rcode
                         .layout
@@ -2510,16 +2500,15 @@ impl SpyreWorker {
                         .and_then(|p| {
                             LogitsGeom::from_placement(p.size, rung_width, vocab as usize)
                         });
-                    let Some(logits) = logits else {
-                        warn!(
-                            "[spyre-worker] sendnn: decode batch rung seqs={rn}: its baked logits \
-                             placement (t{}) is missing or is not {rn} whole rows of >= {vocab} — \
-                             SKIPPED",
+                    let logits = logits.unwrap_or_else(|| {
+                        panic!(
+                            "decode batch rung seqs={rn}: its baked logits placement (t{}) is \
+                             missing or is not {rn} whole rows of >= {vocab} — every rung the \
+                             bake shipped must load",
                             dparsed.result_id
-                        );
-                        continue;
-                    };
-                    match SuperDscSession::new_borrowing_with_consts(
+                        )
+                    });
+                    let mut rs = SuperDscSession::new_borrowing_with_consts(
                         rcode,
                         vocab,
                         kv_dim,
@@ -2527,39 +2516,31 @@ impl SpyreWorker {
                         &[1, 2],
                         wirings.decode.load_consts,
                         &spill_tids,
-                    ) {
-                        Ok(mut rs) => {
-                            let mut ok = true;
-                            if let Err(e) = adopt_from_owner(&mut rs, &ss, &spill_images) {
-                                warn!(
-                                    "[spyre-worker] sendnn: decode batch rung seqs={rn}: {e} — \
-                                     SKIPPED"
-                                );
-                                ok = false;
-                            }
-                            if ok {
-                                info!(
-                                    "[spyre-worker] sendnn: decode batch rung seqs={rn} ready \
-                                     (logits [{}, {}])",
-                                    logits.rows, logits.width
-                                );
-                                decode_ladder.push(DecodeRung {
-                                    seqs: rung_width,
-                                    mask_cap: rung_mask_cap,
-                                    fold_rows,
-                                    // ⛔ NO `swept` AND NO `gathers_kv` HERE ANY MORE — both are
-                                    // per-BODY and this is per-bundle; see `DecodeRung`. The launch
-                                    // asks `sess.step_body(start)`, which is the selector itself.
-                                    sess: rs,
-                                    logits,
-                                });
-                            }
-                        }
-                        Err(e) => warn!(
-                            "[spyre-worker] sendnn: decode batch rung seqs={rn} FAILED to build \
-                             ({e}) — SKIPPED; that batch runs on a narrower rung"
-                        ),
-                    }
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "decode batch rung seqs={rn} FAILED to build ({e}) — every rung the \
+                             bake shipped must load"
+                        )
+                    });
+                    adopt_from_owner(&mut rs, &ss, &spill_images).unwrap_or_else(|e| {
+                        panic!("decode batch rung seqs={rn}: {e} — every rung the bake shipped must load")
+                    });
+                    info!(
+                        "[spyre-worker] sendnn: decode batch rung seqs={rn} ready \
+                         (logits [{}, {}])",
+                        logits.rows, logits.width
+                    );
+                    decode_ladder.push(DecodeRung {
+                        seqs: rung_width,
+                        mask_cap: rung_mask_cap,
+                        fold_rows,
+                        // ⛔ NO `swept` AND NO `gathers_kv` HERE ANY MORE — both are
+                        // per-BODY and this is per-bundle; see `DecodeRung`. The launch
+                        // asks `sess.step_body(start)`, which is the selector itself.
+                        sess: rs,
+                        logits,
+                    });
                 }
                 decode_ladder.sort_by_key(|r| r.seqs);
                 // ── STAGE EVERY CHUNK SESSION'S FULL-CHUNK CAUSAL MASK, ONCE, HERE ── so no request's
