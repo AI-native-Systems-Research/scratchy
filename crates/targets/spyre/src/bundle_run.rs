@@ -166,8 +166,8 @@ fn split_stick(s: &str) -> Result<(u32, u64)> {
 /// values and rewrites both mantissas, so row 37 does not become "roughly 37" — it becomes a
 /// different, VALID, arbitrary row. The output is then a fluent embedding of the wrong tokens, with
 /// no fault, no shape error, and nothing downstream that compares the two.
-/// [`crate::superdsc_exec::Executor::bind_input_raw`] is the door production's own KV block table
-/// already goes through; this is the spelling that reaches it from a bundle directory.
+/// [`crate::superdsc_exec::Executor::bind_input_raw`] is the door; this is the spelling that
+/// reaches it from a bundle directory.
 ///
 /// ⛔ IT IS A MARKER, NOT A BINDING. The bytes still come from this tensor's own `t<id>=<path>`
 /// entry — `raw:` only says how to stage them — so it carries no `=`, and a spelling that has one is

@@ -10015,14 +10015,6 @@ fn synth_role_tokens(
             let i = proc_macro2::Literal::u32_unsuffixed(*i);
             quote! { #b::LAcc(#i) }
         }
-        R::GatherKtLx(i) => {
-            let i = proc_macro2::Literal::u32_unsuffixed(*i);
-            quote! { #b::GatherKtLx(#i) }
-        }
-        R::GatherVLx(h) => {
-            let h = proc_macro2::Literal::u32_unsuffixed(*h);
-            quote! { #b::GatherVLx(#h) }
-        }
     }
 }
 

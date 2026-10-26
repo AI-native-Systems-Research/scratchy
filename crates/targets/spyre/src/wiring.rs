@@ -153,9 +153,7 @@ pub struct BakeFacts {
     /// handoff read ONE list.
     pub scalarmul_scales_stage: &'static [bundle::ScaleStage],
     /// ⭐⭐⭐⭐⭐ The bundle's launch groups carry a gathered KV read — the body's own ops said
-    /// `kv_gathered` (per-group, [`bundle::KvShifts::gathered`]), so the forward tape carries a
-    /// [`ForwardKernel::KvBlockIndex`](crate::forward_tape::ForwardKernel::KvBlockIndex) step and
-    /// the launch must stage a block table.
+    /// `kv_gathered` (per-group, [`bundle::KvShifts::gathered`]).
     ///
     /// ⛔ THE GROUPS ARE THE AUTHORITY, NOT THE LAYOUT'S `KV_BLOCK_INDEX_TID` PLACEMENT. The two
     /// answered the same question through different code — the placement says the emission
@@ -452,16 +450,9 @@ impl Wiring {
         // bundle's capacity: see [`Self::baked_row_capacity`], which this is checked against.
         rows: StagedRows,
         owns_prefix: bool,
-        gathers: GathersKv,
         n_consts: usize,
     ) -> crate::forward_tape::ForwardShape {
-        self.forward_shape_within(
-            self.baked_row_capacity(),
-            rows,
-            owns_prefix,
-            gathers,
-            n_consts,
-        )
+        self.forward_shape_within(self.baked_row_capacity(), rows, owns_prefix, n_consts)
     }
 
     /// [`Self::forward_shape`] with the capacity supplied by the CALLER rather than read off this
@@ -488,9 +479,6 @@ impl Wiring {
         // ⛔ THE ROWS THIS LAUNCH FILLS — 1 for a decode step, `mq` for a prompt chunk.
         rows: StagedRows,
         owns_prefix: bool,
-        // ⛔ A WITNESS, NOT A `bool` — mintable only from a [`BakeFacts`] read off the bundle's own
-        // layout. See [`GathersKv`].
-        gathers: GathersKv,
         n_consts: usize,
     ) -> crate::forward_tape::ForwardShape {
         assert!(
@@ -506,7 +494,6 @@ impl Wiring {
             cos_srcs: self.cos_srcs,
             sin_srcs: self.sin_srcs,
             prefix_mask: owns_prefix,
-            kv_block_index: gathers.get(),
             n_consts,
         }
     }
@@ -1777,7 +1764,6 @@ mod constant_tape_tests {
                     RowCapacity::of_baked_rung(width),
                     StagedRows::of_launch(rows as usize).expect("rows > 0"),
                     false,
-                    GathersKv::of(&BakeFacts::NONE),
                     0,
                 );
                 let step = shape
@@ -1800,7 +1786,6 @@ mod constant_tape_tests {
                     consts: &[],
                     mask_neg: scratchy_subtile::sdsc_abstract::ATTN_MASK_NEG,
                     stick_major: true,
-                    kv_blocks: None,
                 };
                 let launched = match kernel_values(&step, &shape, &inp).expect("a causal mask") {
                     Staged::F32(v) => v.into_owned(),

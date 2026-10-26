@@ -81,7 +81,7 @@ pub fn gather_copy_opspec(
              `out` must be exactly one {stick}-element stick of the value format. Wider than one \
              stick, the operand classifies stick-major and each gathered block is scattered \
              `rows*{stick}` apart instead of contiguous — which bakes clean and hands the consumer \
-             another entry's rows. Declare the block as one-stick sub-rows (`GatherScratch::sub_rows`) \
+             another entry's rows. Declare the block as one-stick sub-rows \
              with the entry `page` covering them.",
             stick = df.elems_per_stick(),
         ));
@@ -91,8 +91,9 @@ pub fn gather_copy_opspec(
     // whole number of pages by construction — so this can only fire on a caller that built its own.
     let page = gather.page.get();
     // ⛔⛔⛔ THE INDEX MUST FIT **ONE STICK**, AND THIS IS THE RAW DOOR'S HALF OF THAT LAW.
-    // `GatherScratch::copies` cannot mint a longer run (that is the point of the type), but this
-    // function also takes hand-built extents — and above one stick of entries the card does not fault
+    // The deleted scratch's mint could not state a longer run (that was the point of the type), but
+    // this function also takes hand-built extents — and above one stick of entries the card does not
+    // fault
     // and does not refuse: the IBR is loaded one stick at a time and each core's read offset inside it
     // is taken modulo that stick, so the cores past the wrap silently read another core's page
     // addresses. That is rung 8's corruption, and a build-time `Err` is the only honest answer to it.
@@ -105,7 +106,7 @@ pub fn gather_copy_opspec(
                  stick — dxp loads the IBR in a single stick transfer and takes each core's read \
                  offset inside it modulo that stick, so entries past the first {cap} WRAP and those \
                  cores gather another core's pages with a clean bake. Cut the pass into one op per \
-                 stick (`GatherScratch::copies`)."
+                 stick of the run."
             ));
         }
     }
@@ -239,7 +240,7 @@ pub fn gather_copy_opspec(
         //
         // ⛔⛔⛔ AND IT IS `page * out` PER ENTRY, NOT `out`. This read `first_entry * cols`, and `cols`
         // here is the op's `out` EXTENT — ONE STICK — not the scratch row's width. A scratch row is
-        // `page` one-stick SUB-ROWS (`GatherScratch::sub_rows`, which is the whole reason `mb` is counted
+        // `page` one-stick SUB-ROWS (which is the whole reason `mb` is counted
         // in sub-rows), so `cols` alone is short by exactly `page` = `hd` = 64×. MEASURED on the card
         // before this line was right: every run's base landed inside run 0's rows, so rows past the
         // first run were never written and were read as keys — one run `solo=EXACT`, two runs the first
@@ -311,116 +312,10 @@ fn gather_copy_cores(
     splits
 }
 
-/// [`gather_copy_opspec`] + `emit_sdsc_tiled` — the ONE assembler for the gather's copy, so the op the
-/// fold launches and the descriptor the tests read are the same construction.
-pub fn assemble_gather_copy(
-    op_name: &str,
-    src: &str,
-    dst: &str,
-    // ⛔ ONE RUN OF THE PASS, NOT THE PASS. It was the whole [`crate::sdsc_abstract::GatherScratch`], so
-    // the op it built declared an index as long as the pass had rows — which above one stick of entries
-    // is the rung-8 corruption (`GatherScratch::copies`). A [`crate::sdsc_abstract::GatherCopy`] carries
-    // the run's extents AND its two bases together, so an op cannot be built for a run longer than dxp
-    // loads or at a base that disagrees with its index.
-    copy: crate::sdsc_abstract::GatherCopy,
-    index: &str,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> EmittedOp {
-    // ⛔ ALL THREE EXTENTS FROM THE SCRATCH, AS ONE VALUE, NOT THREE REACHES. `mb` is the copy's own
-    // extent, the index's live entry count and the scratch's row count; `out` is the pool's stick; the
-    // `page` the walk pins is the `page` the index declares. They were three separate calls here
-    // (`sub_rows()`, `POOL_STICK`, `of_positions(entry_page())`) — so a reservation could be sized
-    // against a different count than the descriptor declares (the "512 reserved against 2048 declared"
-    // defect, whose overrun is another page's keys read as block numbers) and the two pins could drift
-    // apart with nothing refusing it. See `sdsc_abstract::CopyDims`.
-    let d = copy.dims();
-    // ⭐⭐⭐⭐⭐ THE PLACEMENT DOOR — the raw door inside `gather_copy_opspec` bounds the run's window
-    // against the extent the copy carries; this half resolves the destination's NAME against the
-    // layout, the same two-door mint every family since #734 takes. For an HBM scratch that is
-    // `mint_full_window` with the layout at hand: the handle states the pair the copy carries (the
-    // scratch's own `footprint_dims`, the pair its synth declared), and the layout answers for the
-    // bytes behind the name — a reservation smaller than the window is the "512 reserved against
-    // 2048 declared" class, whose overrun is another page's keys read as block numbers.
-    //
-    // ⭐ AND THE CORE-LOCAL FORM'S OWN KIND RIDES HERE TOO: a copy that states a CORE-LOCAL
-    // destination must find that name held core-local by the layout — the minted law and the
-    // layout are two authorities for one fact, and their disagreement is a build failure rather
-    // than a copy that addresses LX bytes as HBM (or HBM bytes as a pin). The per-core slice
-    // itself is the read law's bound, checked against the pin at emit.
-    let entry_elems = d.page().get().saturating_mul(d.out()) as u64;
-    let dest_base = entry_elems * copy.dest_entry() as u64;
-    match copy.dest() {
-        crate::sdsc_abstract::GatherDest::Scratch {
-            rows: d_rows,
-            cols: d_cols,
-        } => {
-            crate::emit::mint_full_window(
-                &format!("assemble_gather_copy {op_name}: the destination"),
-                &crate::emit::rb_df(
-                    dst,
-                    crate::sdsc_abstract::RowCount::of_token_rows(d_rows),
-                    crate::sdsc_abstract::BlockCols::of_feature_cols(d_cols),
-                    Df::Fp16,
-                ),
-                dest_base,
-                d.mb(),
-                d.out(),
-                layout,
-            )
-            .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"));
-        }
-        crate::sdsc_abstract::GatherDest::CoreLocalLx => {
-            if let Some(l) = layout
-                && !l.lx_core_local(dst)
-            {
-                panic!(
-                    "assemble_gather_copy {op_name}: the copy states a CORE-LOCAL destination but \
-                     the layout does not hold '{dst}' as core-local LX — the minted law and the \
-                     layout disagree about where this run lands, so it addresses bytes neither \
-                     authority stands behind"
-                );
-            }
-        }
-    }
-    let mut op = gather_copy_opspec(
-        src,
-        dst,
-        crate::superdsc_opspec::GatherIndex::of_scratch_rows(
-            index.to_string(),
-            d.page(),
-            // THE INDEX's base, in whole index STICKS — dxp loads the IBR one stick at a time.
-            copy.index_base(),
-        ),
-        crate::sdsc_abstract::GatherCopySpec {
-            rows: d.mb(),
-            cols: d.out(),
-            // Every gathered fold to date copies fp16 KV planes — the MoE expert-slab copy is the
-            // first fp8 caller and states its own df at its own door.
-            df: Df::Fp16,
-            // ⛔ AND THE DESTINATION's base SEPARATELY, with the source's own base at its ZERO law. It
-            // used to be derived from the index base above; see `GatherCopy::dest_entry` for the
-            // measurement that separated them (a page-granular op names one entry at stick `r` but
-            // writes run `r`, so the two advance at different rates). Both come from `copies()`, which
-            // mints them from one request index. The KV pool's entries are GLOBAL block numbers — no
-            // source base (the `GatherCopy` law).
-            run: crate::superdsc_opspec::GatherRun::split(
-                crate::superdsc_opspec::DestEntry::of_entries(copy.dest_entry()),
-                0,
-            ),
-            // The destination's own law, carried by the copy from the scratch it lands in.
-            dest: copy.dest(),
-        },
-    )
-    .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"));
-    // ⭐ THE DESTINATION MAY BE CORE-LOCAL LX — the chunk's V, landing in the scratchpad of the core whose
-    // PV contracts it (`ChunkScratch::lx_form`). The copy keeps its own one-entry-per-core division; the
-    // read law holds the PV to it. No-op for an HBM scratch.
-    crate::emit::apply_lx_residency(&mut op, layout);
-    let folds = SdscFoldSet::new(op.iter.cores_used());
-    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"))
-}
+/// [`gather_copy_opspec`] + `emit_sdsc_tiled` — deleted with the copy-gather family: its only
+/// callers were the deleted scratch-minted gathers' tests, and the live doors
+/// (`batched_gathered::copy_opspecs`, the MoE expert-slab copy) assemble their own ops from
+/// [`crate::sdsc_abstract::GatherCopySpec`] at `gather_copy_opspec`.
 
 /// `layout` decides only the work division ([`EwDivision`]), exactly as for
 /// [`pointwise_broadcast_opspec_from_tile`]: `None` has no core-local pins.

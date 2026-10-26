@@ -1307,8 +1307,6 @@ mod place_id_tests {
             Acc(0),
             LBlk(0),
             LAcc(0),
-            GatherKtLx(0),
-            GatherVLx(0),
             GatherKt,
             GatherV,
             ChunkSc,

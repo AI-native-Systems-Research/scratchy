@@ -1095,44 +1095,6 @@ impl Worker for SpyreWorker {
                     ))
                 })?;
                 let swept = step.swept();
-                let gathers_kv = step.gathers();
-                let bake_gathers_kv = gathers_kv.get();
-                // ⭐⭐⭐ WHEN THE BODY IS A BATCH CHUNK, ITS LAW — read off the selected body's own swept
-                // extent (`J` pages per request) at this rung's width, the inverse of what the bake
-                // keyed the rung by (`ChunkScratch::swept_per_request`). Both the index table and the
-                // per-row mask below come from it, so neither can describe another chunk.
-                let batch_chunk: Option<scratchy_subtile::sdsc_abstract::BatchChunk> = if step
-                    .chunk()
-                {
-                    let law = scratchy_subtile::sdsc_abstract::ChunkScratch::of_batch(
-                        pool,
-                        seqs.get(),
-                        swept.get(),
-                    )
-                    .and_then(|c| {
-                        scratchy_subtile::sdsc_abstract::BatchChunk::of(
-                            c,
-                            seqs.get(),
-                            // The GQA ratio off the SAME pool the chunk law above read — the bake
-                            // keyed the batch chunk's row blocks on the program's own `nqh / nkvh`,
-                            // and `pool` is the one spelling of `nkvh` this function holds (the
-                            // model's own two numbers).
-                            nqh as u32 / pool.nkvh().max(1),
-                        )
-                    })
-                    .ok_or_else(|| {
-                        werr(format!(
-                            "decode batch: the selected body is a split-KV chunk sweeping {} slot(s) \
-                             per request at {} row(s), which is no batch chunk this pool admits — the \
-                             bake and the host disagree about the chunk",
-                            swept.get(),
-                            seqs.get()
-                        ))
-                    })?;
-                    Some(law)
-                } else {
-                    None
-                };
                 // THE LIVE ROWS ONLY, built by the slot map's own walk — one token and one
                 // `BatchRow` per LIVE slot, in slot order, and nothing invented for the padding
                 // slots. `run_prefill_batch` widens this to the rung (`LaunchRows`), where a padding
@@ -1200,15 +1162,27 @@ impl Worker for SpyreWorker {
                     ),
                 )
                 .ok_or_else(|| werr("decode batch: a row holds no pages".to_string()))?;
-                // ⭐⭐⭐ AND WHAT ONE BLOCK DESCRIBES — a BAKE fact, from the same `gathers_kv` the index
-                // table below is built for. A gathered bundle's fold pass IS a page and serves every row
-                // (`MaskBlockForm::PerPage`), so the block count, the fill's block index and
-                // `fold_plan::reps` are one decision reaching all three. Staging the wrong form is silent
-                // both ways: `PerRowPage` against a collapsed fold leaves `mq-1` of every `mq` rows at −∞,
-                // and `PerPage` against an uncollapsed one gives every pass row 0's validity.
+                // ⭐⭐⭐ AND WHAT ONE BLOCK DESCRIBES — the FOLD's own collapsed-vs-per-row fact, keyed
+                // on the RUNNING body's own gather bit (`step.gathers()`), never the bundle's: a
+                // gathered fold's pass IS a page and serves every row (`MaskBlockForm::PerPage`), so the
+                // block count, the fill's block index and `fold_plan::reps` are one decision reaching all
+                // three. Staging the wrong form is silent both ways: `PerRowPage` against a collapsed
+                // fold leaves `mq-1` of every `mq` rows at −∞, and `PerPage` against an uncollapsed one
+                // gives every pass row 0's validity.
+                //
+                // 📌 THE FORM'S CONSUMER SET, PINNED (the solo twin's own law, spyre_forward's solo
+                // decode): the form rides `MaskPassGrid` into `MaskBlocks::of` and `declare_to`, which
+                // records it on the session (`set_mask_blocks` + `set_fold_pages`). Those two records
+                // are read ONLY by the fold launch path — `fold_plan::reps`'s walk-vs-declaration
+                // guard, per `page_fold` group, and the fold's prefix-mask staging — and a ONE-SHOT
+                // step launches no fold group, so neither consumer runs: the one-shot body's own mask
+                // is fill-staged by `fill_attn_step_inputs`, which reads the discovery table's
+                // extents, not this declaration. A fold step IS collapsed and gathered, so `PerPage`
+                // is the correct form there — this is NOT the composer's gate (`page_list()`), which
+                // is false for every region-form body including the gathered folds.
                 let fold_grid = fold_pages.grid(
                     width,
-                    if bake_gathers_kv {
+                    if step.gathers().get() {
                         scratchy_subtile::sdsc_abstract::MaskBlockForm::PerPage
                     } else {
                         scratchy_subtile::sdsc_abstract::MaskBlockForm::PerRowPage
@@ -1303,180 +1277,21 @@ impl Worker for SpyreWorker {
                         missed.get()
                     )));
                 }
-                // ⭐⭐⭐⭐⭐ THE INDEX TABLE, BUILT ONLY IF THE BODY THIS STEP RUNS GATHERS — and the entry
-                // factor is the SESSION's, not a constant.
-                //
-                // ⛔ THE ENTRY IS NOT A PAGE NUMBER. dxp computes `addr = idx * skip_addr + base` with
-                // `skip_addr` one stick block (`hd * 64` elements — 4096 at hd=64, 8192 at hd=128), while
-                // a PAGE spans every layer. So the factor is `page_stride_bytes / stick_block_bytes`,
-                // read off this session's own `page_stride_bytes` — the very number
-                // `fold_plan::page_base_bytes` multiplies — which makes the two addressings an identity
-                // rather than two derivations to keep in step
-                // (`zz_the_gather_index_reproduces_the_host_page_address`).
-                //
-                // ⛔ AND A REFUSAL, NEVER A ZERO TABLE, when the factor does not exist: an entry of 0 is
-                // block 0, a REAL address (row 0's first page), so a fallback would give the whole batch
-                // row 0's keys — fluent and wrong, which is the corruption this path exists to remove.
-                let kv_blocks: Option<Vec<scratchy_subtile::sdsc_abstract::GatherEntry>> =
-                    if bake_gathers_kv && batch_chunk.is_none() {
-                        let ceiling = sess.gather_entry_ceiling(pool).ok_or_else(|| {
-                        werr(
-                            "decode batch: this bundle emits a GATHERED KV read, but a physical page \
-                             is not a whole number of STICK BLOCKS — no integer index can name a page \
-                             boundary, so every row would gather from inside the previous page"
-                                .to_string(),
-                        )
-                    })?;
-                        // ⭐⭐⭐ THE SCRATCH'S OWN SHAPE — and at page granularity it takes ONE extent, the
-                        // rung's width, because a row is a REQUEST.
-                        //
-                        // ⛔ THE WINDOW COUNT IS GONE FROM THIS CALL, WHICH IS THE POINT. It used to be
-                        // `SlotWindow::count_in(swept)` here and the EMITTER's own body rung there — two
-                        // different numbers by construction (the host reads the CEILING body's `swept`, the
-                        // emitter its interior rung), and a table built for a different `nb` wrote real block
-                        // numbers into rows the copy does not read while leaving the rows it does read at
-                        // zero: block 0, a REAL address. With `mq` alone both sides read the same rung.
-                        let scratch = scratchy_subtile::sdsc_abstract::PageScratch::of_pass(
-                        pool,
-                        scratchy_subtile::sdsc_abstract::QueryRowCount::of_mq(seqs.get()),
-                    )
-                    .ok_or_else(|| {
-                        werr(
-                            "decode batch: this bundle emits a GATHERED KV read, but its geometry \
-                             admits no page-granular copy — the head dim is not a whole number of \
-                             sticks, the rung is wider than one index stick, or the plane's footprint \
-                             does not fit the descriptor's u32 extents. The bake and the host disagree \
-                             about whether this bundle gathers."
-                                .to_string(),
-                        )
-                    })?;
-                        // ⭐⭐⭐ THE PASS PITCH IS THE MASK'S BLOCK STRIDE, and it is the same `mask_shape` the
-                        // launch already declared to the session (`set_mask_stride`). The index is an
-                        // ACTIVATION, so it lives in the segment the fold shifts for the MASK — one shift, two
-                        // tensors, therefore one pitch. Re-deriving it here from a page count is exactly the
-                        // "same number, two derivations" defect the mask's own grid types exist to close.
-                        // ⭐ THE MASK'S OWN NUMBER, ASKED OF THE MASK. This was
-                        // `usize::try_from(mask_shape.rep_stride_bytes() / 4)` — the `/ 4` spelled at the
-                        // launch, i.e. the second derivation `PassStride` exists to remove.
-                        let pass_stride = mask_shape.pass_stride();
-                        // ⛔ THE PASS PITCH IS NOT THE SUSPECT IT LOOKED LIKE, AND THAT IS MEASURED.
-                        // Pinning every pass's entries to logical page 0 CHANGED the card's answer
-                        // (granite-3.1-2b fp8, width 8), so pass `p >= 1` demonstrably reads its OWN
-                        // index block: the index does ride the mask's per-pass segment shift, and the
-                        // page-crossing failure was never here. It was the launch GROUPING — see
-                        // `GroupKind::run_may_be_chunked`.
-                        let table = scratchy_subtile::sdsc_abstract::page_gather_index_table(
-                            scratch,
-                            &page_maps,
-                            max_pages,
-                            ceiling,
-                            pass_stride,
-                        )
-                        .ok_or_else(|| {
-                            werr(format!(
-                                "decode batch: could not build the gather's index table from {} \
-                             installed page map(s) at {max_pages} page(s) — a launch row holds \
-                             fewer pages than the fold sweeps, an entry overflows int32, or the \
-                             pass block ({} entries) is smaller than one pass needs \
-                             ({} entries)",
-                                page_maps.len(),
-                                pass_stride.get(),
-                                scratch.rows(),
-                            ))
-                        })?;
-                        // ── GATHER DIAG (`SCRATCHY_GATHER_DIAG`) ── the index table is the one operand the
-                        // fence could name and does not: `RAS::PCI::BusFence` (0xa35e) carries NO `vars` in
-                        // `aiuras.json`, so the card states no address. Print the table's own extremes and the
-                        // pool they must land inside, as ONE string (a per-line `eprintln!` comes back shredded
-                        // mid-number), so an out-of-pool entry is a host-side fact before the launch.
-                        if std::env::var_os("SCRATCHY_GATHER_DIAG").is_some() {
-                            let (lo, hi) = table.iter().fold((i32::MAX, i32::MIN), |(l, h), e| {
-                                (l.min(e.as_i32()), h.max(e.as_i32()))
-                            });
-                            let max_phys = page_maps.iter().flatten().copied().max().unwrap_or(-1);
-                            // ⛔ THE UNIT IS THE STICK BLOCK, AND IT IS THE POOL'S OWN NUMBER. `per_page`
-                            // is `page_stride_bytes / stick_block_bytes` and `skip_addr` is one stick
-                            // block, so `entry * stick_block_bytes` IS the byte the card computes —
-                            // read through the ceiling's own `per_page()` door, never re-derived here —
-                            // converting with any other unit would mis-report the reach by `nkvh *
-                            // PAGE_SLOTS / POOL_STICK` (32× at the shipped 2b geometry). A diagnostic
-                            // that mis-reports an address is worse than none: this is the one print that
-                            // says whether an entry lands inside the pool.
-                            let stick = pool.stick_block_bytes() as i64;
-                            eprint!(
-                                "{}",
-                                format_args!(
-                                    "[gather] mq={} entries={} per_row={} pass_stride={} max_pages={} \
-                                 per_page={} scratch_rows={} idx_lo={lo} idx_hi={hi} \
-                                 max_phys={max_phys} stick_block_bytes={stick} \
-                                 reach_bytes={} page_stride_bytes={} page_maps={} \
-                                 mask_rep_stride={} table_bytes={}\n",
-                                    seqs.get(),
-                                    table.len(),
-                                    scratch.entries_per_row(),
-                                    pass_stride.get(),
-                                    max_pages,
-                                    ceiling.per_page().get(),
-                                    scratch.rows(),
-                                    hi as i64 * stick,
-                                    ceiling.per_page().get() * stick,
-                                    page_maps.len(),
-                                    mask_shape.rep_stride_bytes(),
-                                    table.len() * 4,
-                                )
-                            );
-                        }
-                        Some(table)
-                    } else {
-                        None
-                    };
-                // ⭐⭐⭐ A BATCH CHUNK BODY's TABLE: every row's page map laid end to end at the chunk's
-                // `J` pages each — the same law its mask is staged by. The entry factor is the
-                // session's, exactly as for the fold's table above.
-                let kv_blocks = match batch_chunk {
-                    Some(bc) => {
-                        let ceiling = sess.gather_entry_ceiling(pool).ok_or_else(|| {
-                            werr(
-                                "decode batch: this body gathers its chunk, but a physical page is not \
-                                 a whole number of STICK BLOCKS — no integer index can name a page \
-                                 boundary"
-                                    .to_string(),
-                            )
-                        })?;
-                        Some(
-                            scratchy_subtile::sdsc_abstract::batch_chunk_index_table(
-                                bc, &page_maps, ceiling, step.lx_op_local_bytes(),
-                                step.lx_prob_pin_bytes(),
-                            )
-                            .ok_or_else(|| {
-                                werr(format!(
-                                    "decode batch: could not build the batch chunk's index table from \
-                                     {} installed page map(s) — not one map per row of the {}-row rung, \
-                                     a map past the chunk's {} page(s) per request, an empty map, or an \
-                                     entry past int32",
-                                    page_maps.len(),
-                                    bc.requests(),
-                                    bc.pages_per_request(),
-                                ))
-                            })?,
-                        )
-                    }
-                    None => kv_blocks,
-                };
-                // ⭐ THE PREFIX LAYOUT THE SELECTED BODY READS: the batch chunk's one row block, or the
-                // gathered fold's declared pass grid.
-                let prefix = match batch_chunk {
-                    Some(bc) => scratchy_subtile::sdsc_abstract::BatchPrefix::Chunk(bc),
-                    None => scratchy_subtile::sdsc_abstract::BatchPrefix::Fold(fold),
-                };
+                // ⭐ THE PREFIX LAYOUT THIS BODY READS — the gathered fold's declared pass grid,
+                // one mask block per pass. (The batch-chunk body and its one-row-block prefix are
+                // deleted with the copy-gather family; a batched rung on this branch is always the
+                // region-form fold, whose mask the fill below stages through the splice's own
+                // step inputs.)
+                let prefix = scratchy_subtile::sdsc_abstract::BatchPrefix::Fold(fold);
                 // ⭐⭐⭐⭐⭐ THE SPLICE'S OWN STEP INPUTS — the batched decode kernel's block-entry
                 // tables, repetition table and pre-replicated mask, staged through the ONE fill
                 // helper (the same call the prompt chunk and the solo decode make). The rows are
                 // the LAUNCH's — padding rows replicate live 0's map and history, the same law the
                 // door-era tables stage by — and `write_slot` is the batch's one shared write slot,
-                // where every row's new key lands. The dead `KV_BLOCK_INDEX_TID` tables above stay
-                // on purpose until the card proves the fill; deleting them is the no-host-fallback
-                // proof, its own commit.
+                // where every row's new key lands. This fill is the ONE staging: the copy-gather
+                // family and its `KV_BLOCK_INDEX_TID` channel are deleted, so a body that reads a
+                // gathered KV has no second path to reach it through — only these slots, whose
+                // extent the bundle's own placement declares.
                 let attn_rows = rows_in.launch_rows(&toks, seqs).ok_or_else(|| {
                     werr(format!(
                         "decode batch: {} live row(s) and {} token(s) do not lay into the \
@@ -1499,7 +1314,6 @@ impl Worker for SpyreWorker {
                 )?;
                 let rows = run_prefill_batch(
                     Some((&rows_in, prefix)),
-                    kv_blocks.as_deref(),
                     &sh,
                     sess,
                     // A batched rung sweeps the whole pool, so it runs on the widest decode
@@ -1509,7 +1323,6 @@ impl Worker for SpyreWorker {
                     seqs,
                     // ⭐ THE RUNG'S OWN ANSWER, riding with the rung's own `seqs` for the same reason:
                     // the meta above is borrowed for tensor ids and describes neither.
-                    gathers_kv,
                     launch_pos,
                     // Every row is a different request and every row is sampled — the tail runs
                     // unfolded, so the logits come back de-interleaved, one contiguous row each.

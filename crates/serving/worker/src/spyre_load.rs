@@ -1838,14 +1838,6 @@ impl SpyreWorker {
                     .forward_shape(
                         scratchy_target_spyre::wiring::StagedRows::ONE,
                         true,
-                        // ⭐ AND THE GATHER'S ANSWER IS THIS BUNDLE'S OWN, from the code being checked
-                        // — its launch groups' own `kv.gathered` bits, not `true` like the mask above.
-                        // The mask's `true` asks for the WIDEST tensor set because a launch may or
-                        // may not stage a mask; a gather is not optional that way. The index step
-                        // exists iff this bake's own ops carry the gather, so asking `true` here
-                        // would report `KV_BLOCK_INDEX_TID` unplaced for every non-gathering bundle
-                        // and refuse to serve every model.
-                        scratchy_target_spyre::wiring::GathersKv::of_code(code),
                         n_consts,
                     )
                     .unplaced(&code.layout);

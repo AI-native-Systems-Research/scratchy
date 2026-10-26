@@ -482,8 +482,9 @@ fn assemble_from_opspec(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
-    // ⭐ A KERNEL MAY LIVE IN LX — the split-KV chunk's gathered Kᵗ and V (`ChunkScratch::lx_form`), read by
-    // the core that gathered it. The residency is the tensor's (decided where its name is pinned), so the
+    // ⭐ A KERNEL MAY LIVE IN LX — a gathered operand read by the core that gathered it (the
+    // split-KV chunk's LX form, `ChunkScratch::lx_form`, deleted with the copy-gather family). The
+    // residency is the tensor's (decided where its name is pinned), so the
     // matmul door consults it by name exactly as the pointwise door does; `emit`'s core-local read law
     // then proves this op hands each core the slice its producer wrote. No-op for every unpinned operand.
     crate::emit::apply_lx_residency(&mut op, layout);

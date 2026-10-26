@@ -33,8 +33,8 @@
 
 use ktir_superdsc::addr::Gqa;
 use ktir_superdsc::sdsc_abstract::{
-    FeatIdx, GatherScratch, KvCoord, KvHead, KvPlane, KvSlot, POOL_STICK, PagedKvPool, QueryHead,
-    QueryRowCount, SlotCount, SlotWindow,
+    FeatIdx, KvCoord, KvHead, KvPlane, KvSlot, POOL_STICK, PagedKvPool, QueryHead, QueryRowCount,
+    SlotCount, SlotWindow,
 };
 use std::num::NonZeroU32;
 
@@ -268,46 +268,3 @@ fn the_two_planes_block_numbering_coincides_exactly_at_one_slab() {
     }
 }
 
-/// ⭐ AND THE SHIPPED hd=64 EMISSION IS EXACTLY THE `POOL_STICK * POOL_STICK` UNIT ALREADY — so
-/// adopting the finer entry costs the proven geometry NOTHING.
-///
-/// `GatherScratch::entry_page` is `cols / POOL_STICK` = `hd` sub-rows today; at hd=64 that IS
-/// `POOL_STICK` sub-rows, and `stick_block_elems` IS `POOL_STICK * POOL_STICK`. Stated as a test so the
-/// claim "hd=64 is byte-identical under the finer unit" is checked rather than argued.
-#[test]
-fn the_shipped_entry_unit_at_hd_64_is_already_one_slab_window() {
-    let pool = PagedKvPool::new(NKVH as u32, HD_2B as u32);
-    assert_eq!(pool.stick_block_elems() as u32, SLAB_WINDOW_ELEMS);
-    let scratch = GatherScratch::of_fold_pass(
-        pool,
-        SlotWindow::count_in(SlotCount::new(PagedKvPool::PAGE_SLOTS as u32)),
-        QueryRowCount::of_mq(8),
-    )
-    .expect("hd=64 admits the flat copy");
-    assert_eq!(
-        scratch.entry_page(),
-        POOL_STICK,
-        "at hd=64 the shipped pin is already ONE STICK of sub-rows"
-    );
-    assert_eq!(
-        scratch.cols(),
-        SLAB_WINDOW_ELEMS,
-        "and a scratch row is already exactly one slab window"
-    );
-    // `block_in_page` is the shipped law, and it is both planes' law at one slab.
-    for kvh in 0..NKVH as u32 {
-        for b in 0..(PagedKvPool::PAGE_SLOTS as u32 / POOL_STICK) {
-            let want = corner(&pool, KvPlane::Kt, kvh, b, 0) / SLAB_WINDOW_ELEMS;
-            assert_eq!(
-                scratch.block_in_page(kvh, b),
-                Some(want),
-                "the shipped `block_in_page` must be the pool's own Kᵗ block number"
-            );
-            assert_eq!(
-                corner(&pool, KvPlane::V, kvh, b, 0) / SLAB_WINDOW_ELEMS,
-                want,
-                "and V's at one slab, which is why one table serves both copies today"
-            );
-        }
-    }
-}

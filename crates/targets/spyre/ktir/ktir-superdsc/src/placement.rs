@@ -576,13 +576,14 @@ pub struct LxAlloc {
     /// meet — so a chunk pin landing later in walk order can never eat a slot reserved earlier.
     pub next_down: u64,
     /// Sum of the op-local slot footprints reserved so far — the [`lx_window_fits`] term the
-    /// allocator guard and the `lx_form` witness both read (one number, two consults).
+    /// allocator guard reads and the deleted `lx_form` witness read (one number, two consults).
     pub op_local_bytes: u64,
-    /// The probability-part pins the chunk form mints BESIDE its gathers — the other
-    /// core-local term of the `lx_form` witness's budget, recorded at the chunk's admission
-    /// ([`BundleLayout::note_chunk_prob_pin_bytes`]) so the baked artifact carries it to the
-    /// host's own `chunk_gather_index_table` read. RECORDED, not bumped: the mint itself bumps
-    /// `next`; this is the number the ADMISSION budgeted, noted so the two arms cannot drift.
+    /// The probability-part pins the chunk form minted BESIDE its gathers — the other
+    /// core-local term of the deleted `lx_form` witness's budget, recorded at the chunk's
+    /// admission ([`BundleLayout::note_chunk_prob_pin_bytes`]) so the baked artifact carried it
+    /// to the host's own index-table read (also deleted with the copy-gather family). RECORDED,
+    /// not bumped: the mint itself bumps `next`; this is the number the ADMISSION budgeted,
+    /// noted so the two arms cannot drift.
     pub prob_pin_bytes: u64,
     /// The shared slot's start address per footprint class (bytes) — one slot per class,
     /// every op-local pin of that class resolving to the same address ([`LxAlloc::next_down`]).
@@ -624,9 +625,9 @@ impl Default for LxAlloc {
 /// regions of the pin window are summed here and nowhere else: core-local chunk pins bump
 /// UP from [`LX_PIN_BASE`], op-local shared slots bump DOWN from [`LX_PIN_END`], and the
 /// window holds exactly when the two never meet. Every guard consults THIS function — the
-/// allocator's per-declaration asserts (below) with the live cursor state, and the
-/// `ChunkScratch::lx_form` admission witness with the chunk's would-be bytes — so the
-/// witness can never admit a form the allocator would refuse: one law, two readers,
+/// allocator's per-declaration asserts (below) with the live cursor state, and the deleted
+/// `ChunkScratch::lx_form` admission witness did with the chunk's would-be bytes — so a
+/// witness could never admit a form the allocator would refuse: one law, two readers,
 /// zero drift (#645's ruling 4).
 pub const fn lx_window_fits(core_local_bytes: u64, op_local_slot_bytes: u64) -> bool {
     LX_PIN_BASE + core_local_bytes + op_local_slot_bytes <= LX_PIN_END
@@ -1003,7 +1004,7 @@ impl BundleLayout {
     /// are compared is [`lx_window_fits`].
     ///
     /// ⛔ PANICS when the two regions would meet — computed by [`lx_window_fits`], the same
-    /// one-function budget the `lx_form` admission witness reads — so this runs at
+    /// one-function budget the deleted `lx_form` admission witness read — so this runs at
     /// `#[forward]` expansion AS the cargo-build guard: a bundle whose pins do not fit the
     /// frontend's LX window is unbuildable, not silently overlapping dxp's own LX allocations.
     pub fn synth_lx_op_local(&self, id: PlaceId, dims: &[u32]) {
@@ -1025,8 +1026,8 @@ impl BundleLayout {
              {} B of op-local slots against the {LX_PIN_END} boundary. The op-local classes are \
              per-FOOTPRINT, so this is one class too many at this geometry — either the norm \
              rows shrank a class away, or a chunk form this bundle also declares leaves no room \
-             for it. The `lx_form` witness reads the same budget (`lx_window_fits`), so it \
-             refusing a chunk form here is the designed alternative, not this panic.",
+             for it. The deleted `lx_form` witness read the same budget (`lx_window_fits`), so \
+             a chunk form being refused there was the designed alternative, not this panic.",
             a.next,
             a.op_local_bytes + added
         );
@@ -1065,9 +1066,9 @@ impl BundleLayout {
             "a core-local LX intermediate overflows the frontend's LX window: '{name}' pins at {o} \
              with a {fp}-byte per-core slice, meeting the {} B of op-local slots already reserved \
              against the {LX_PIN_END} boundary. Cut the op into smaller parts so one core's slice \
-             fits, or keep the tensor in HBM (`BundleLayout::synth`). The `lx_form` witness reads \
-             the same budget (`lx_window_fits`), so this chunk form being refused there instead is \
-             the designed alternative, not this panic.",
+             fits, or keep the tensor in HBM (`BundleLayout::synth`). The deleted `lx_form` \
+             witness read the same budget (`lx_window_fits`), so a chunk form being refused there \
+             instead was the designed alternative, not this panic.",
             a.op_local_bytes
         );
         a.next = o + fp;
@@ -1077,22 +1078,22 @@ impl BundleLayout {
     }
 
     /// The op-local slot bytes reserved so far — one slot per footprint class
-    /// ([`Self::synth_lx_op_local`]). THE `lx_form` witness's op-local term: by the time the
-    /// consumer pass runs, the declare pass has already declared every op-local pin of the
-    /// rung, so this number is final and the witness and the allocator's guard read the same
-    /// quantity through [`lx_window_fits`].
+    /// ([`Self::synth_lx_op_local`]). The deleted `lx_form` witness's op-local term: by the
+    /// time the consumer pass runs, the declare pass has already declared every op-local pin
+    /// of the rung, so this number is final and the witness and the allocator's guard read the
+    /// same quantity through [`lx_window_fits`].
     pub fn lx_op_local_slot_bytes(&self) -> u64 {
         self.lx.borrow().op_local_bytes
     }
 
-    /// Record the probability-part pins the chunk form mints beside its gathers
+    /// Record the probability-part pins the chunk form minted beside its gathers
     /// (summed by the deleted old emitter's `chunk_prob_pins`) — the second core-local
-    /// term of the `lx_form` witness's budget, summed with the gather pins at the chunk's
-    /// admission. Noted so the baked artifact carries the term to the host's own
-    /// `chunk_gather_index_table` read — the bake/host agreement law: the host must refuse
-    /// exactly what the bake refused. REPLACEMENT, not a sum: one bundle mints one attention
-    /// op's probability parts, so re-emitting the same chunk (the declare pass, then the real
-    /// one) notes the same number.
+    /// term of the deleted `lx_form` witness's budget, summed with the gather pins at the
+    /// chunk's admission. Noted so the baked artifact carried the term to the host's own
+    /// index-table read (also deleted with the copy-gather family) — the bake/host agreement
+    /// law: the host refused exactly what the bake refused. REPLACEMENT, not a sum: one bundle
+    /// mints one attention op's probability parts, so re-emitting the same chunk (the declare
+    /// pass, then the real one) notes the same number.
     pub fn note_chunk_prob_pin_bytes(&self, bytes: u64) {
         self.lx.borrow_mut().prob_pin_bytes = bytes;
     }

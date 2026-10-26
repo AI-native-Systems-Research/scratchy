@@ -884,13 +884,15 @@ pub struct Executor {
     /// ⭐⭐⭐⭐⭐ IDS WHOSE BYTES ARE **NOT** IEEE-fp16 — copied into the shadow verbatim instead of
     /// going through [`sen_convert::ieee_to_sen_bytes`].
     ///
-    /// ⛔ WITHOUT THIS, A GATHER'S INDEX TABLE IS DESTROYED BY THE BIND LOOP. Every staging path in
+    /// ⛔ WITHOUT THIS, A RAW TENSOR IS DESTROYED BY THE BIND LOOP. Every staging path in
     /// this file ends in `ieee_to_sen_bytes(src, dst)` — unconditionally, for weights at prepare and
-    /// for activations at every predict — because until now every bound tensor genuinely WAS a
-    /// magnitude the card holds in SEN169 fp16. The KV block index is int32 addresses-in-waiting
-    /// (`Staged::I32`): running them through an fp16 re-encoding reads each 4-byte entry as two fp16
+    /// for activations at every predict — because every ORDINARY bound tensor genuinely IS a
+    /// magnitude the card holds in SEN169 fp16. A raw bind is not: it is int32 entries in-waiting,
+    /// and running them through an fp16 re-encoding reads each 4-byte entry as two fp16
     /// values and rewrites both mantissas. Block 37 does not become "roughly 37"; it becomes a
     /// different, valid, arbitrary block — fluent output from another request's keys, with no fault.
+    /// (The door's first consumer was the door-era gather's KV block index, deleted with the
+    /// copy-gather family; the `raw:t<id>` bundle-run spelling still reaches it.)
     ///
     /// ⛔ NOT A FLAG ON THE BIND CALL, A SET KEYED BY ID, because there are TWO convert loops
     /// (`stage_weights`, `predict`) and a per-call flag would have to be remembered by both anyway.
@@ -6017,18 +6019,18 @@ impl StepBody {
 
     /// ⭐ THE RUNG'S OP-LOCAL LX PIN SLOTS, in bytes — read off the selected body's own baked
     /// layout (`bundle::BundleLayout::lx_op_local_bytes`), the host's term of the one
-    /// `lx_window_fits` budget. The host's chunk-table arm threads this into
-    /// `chunk_gather_index_table`, so the host refuses exactly the chunks the bake's `lx_form`
-    /// witness refused — neither arm budgets against another rung's pins.
+    /// `lx_window_fits` budget. (The chunk-table arm that threaded it into the deleted
+    /// `chunk_gather_index_table` is gone with the copy-gather family; the recorded number
+    /// stays part of the baked artifact's own budget law.)
     pub const fn lx_op_local_bytes(self) -> u64 {
         self.lx_op_local_bytes
     }
 
     /// ⭐ THE CHUNK FORM'S PROBABILITY-PART LX PINS, in bytes — read off the selected body's own
     /// baked layout (`bundle::BundleLayout::lx_prob_pin_bytes`), the host's SECOND core-local
-    /// term of the same budget: the bake's `lx_form` admission summed it beside the gather pins,
-    /// and the host's chunk-table arm threads it in beside [`Self::lx_op_local_bytes`], so the
-    /// host refuses exactly what the bake refused.
+    /// term of the same budget: the bake's `lx_form` admission summed it beside the gather pins.
+    /// (Its chunk-table reader is deleted with the copy-gather family; the recorded number stays
+    /// part of the baked artifact's own budget law.)
     pub const fn lx_prob_pin_bytes(self) -> u64 {
         self.lx_prob_pin_bytes
     }

@@ -202,7 +202,7 @@ fn encode(what: &str, plane: sd::KvPlane, t: &[sd::GatherEntry]) -> Result<Vec<u
             if e.plane() != plane {
                 return Err(format!(
                     "{what}: an id table staged for the {plane:?} plane names a block of the \
-                     {} plane — the two gathered planes number a page's slab blocks differently, \
+                     {:?} plane — the two gathered planes number a page's slab blocks differently, \
                      so this is a table built for the other slot, never a rounding",
                     e.plane()
                 ));

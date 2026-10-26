@@ -513,7 +513,7 @@ impl SuperDscSession {
         activations: &[crate::wiring::Bind],
     ) -> Result<Vec<f32>> {
         Ok(self
-            .run_step_inner(n_new, seq_pos, activations, &[], &[], StepLogits::ReadBack)?
+            .run_step_inner(n_new, seq_pos, activations, &[], StepLogits::ReadBack)?
             .unwrap_or_default())
     }
 
@@ -525,14 +525,7 @@ impl SuperDscSession {
         seq_pos: usize,
         activations: &[crate::wiring::Bind],
     ) -> Result<()> {
-        self.run_step_inner(
-            n_new,
-            seq_pos,
-            activations,
-            &[],
-            &[],
-            StepLogits::LeftOnDevice,
-        )?;
+        self.run_step_inner(n_new, seq_pos, activations, &[], StepLogits::LeftOnDevice)?;
         Ok(())
     }
 
@@ -558,7 +551,6 @@ impl SuperDscSession {
             seq_pos,
             activations,
             activations_f16,
-            &[],
             StepLogits::LeftOnDevice,
         )?;
         Ok(())
@@ -578,35 +570,25 @@ impl SuperDscSession {
                 seq_pos,
                 activations,
                 activations_f16,
-                &[],
                 StepLogits::ReadBack,
             )?
             .unwrap_or_default())
     }
 
-    /// ⭐⭐⭐ [`run_step_f16`](Self::run_step_f16) plus the INT32 channel — a gather's index table.
-    ///
-    /// ⛔ A THIRD LIST, NOT A THIRD ENTRY IN THE f16 ONE. `activations_f16` means "bytes that are
-    /// already fp16", and every one of them still passes through `ieee_to_sen_bytes` in the shadow
-    /// write; int32 entries must NOT (see `Executor::raw_ids`). Two lists that both mean "device
-    /// bytes" but need different shadow writes is exactly the collapse this keeps apart.
-    pub fn run_step_i32(
+    /// ⭐⭐⭐ [`run_step_f16`](Self::run_step_f16) with the logits policy stated by the caller —
+    /// the batched family's door. A prompt chunk's final step reads one row back
+    /// (`StepLogits::ReadBack`), a decode batch leaves its whole `[rows, vocab]` result on the
+    /// device (`LeftOnDevice`) for the caller's own read, and every non-final chunk discards
+    /// (`Discarded`), so the returned `Option` is the policy's own shape.
+    pub fn run_step_f16_logits(
         &mut self,
         n_new: usize,
         seq_pos: usize,
         activations: &[crate::wiring::Bind],
         activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
-        activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
         logits: StepLogits,
     ) -> Result<Option<Vec<f32>>> {
-        self.run_step_inner(
-            n_new,
-            seq_pos,
-            activations,
-            activations_f16,
-            activations_i32,
-            logits,
-        )
+        self.run_step_inner(n_new, seq_pos, activations, activations_f16, logits)
     }
 
     /// The [`CausalKey`] this session's staged activation `id` was last bound under, if it was
@@ -649,15 +631,14 @@ impl SuperDscSession {
         self.exec.stage_keyed(id, key, f32_to_f16_le(vals))
     }
 
-    /// The bind loop every step runs before its forward — the three channels
-    /// (`run_step_inner`'s own): f32 narrowed to f16 at the boundary, already-f16
-    /// bytes as-is, and RAW LE int32 through `bind_input_raw`. One body, so a new
-    /// channel or a new guard cannot land on one step shape and skip the other.
+    /// The bind loop every step runs before its forward — the two channels
+    /// (`run_step_inner`'s own): f32 narrowed to f16 at the boundary, and already-f16
+    /// bytes as-is. One body, so a new channel or a new guard cannot land on one
+    /// step shape and skip the other.
     fn bind_activations(
         &mut self,
         activations: &[crate::wiring::Bind],
         activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
-        activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
     ) -> Result<()> {
         // BIND-LOOP TIMING (SCRATCHY_SDSC_PHASE_TIME, the same flag as the executor's phase
         // breakdown): this loop runs BEFORE predict, so it is invisible to the
@@ -678,28 +659,6 @@ impl SuperDscSession {
             bind_f16_bytes += bytes.len();
             self.exec.bind_input(*id, bytes.clone())?;
         }
-        // ⛔ `bind_input_raw`, NOT `bind_input`. See `Executor::raw_ids`: the shadow write applies
-        // `ieee_to_sen_bytes` to every ordinary bind, which reads each 4-byte index entry as two fp16
-        // values and rewrites both — turning block 37 into a different, valid, arbitrary block.
-        // ⛔ AND THE PAYLOAD ARRIVES PAIRED WITH ITS PLACEMENT. `place_raw` is the only constructor of
-        // the value `bind_input_raw` takes, so the three ways a raw bind used to go wrong — a byte
-        // count that is not whole int32 entries, a payload longer than its own placement, and a name
-        // this bundle never placed (silently SKIPPED, and a skipped index reads as entry 0, a real
-        // address) — are one refusal at one door instead of a check here, a `bail!` in the refill loop
-        // and a `continue` nobody could see.
-        for (id, bytes) in activations_i32 {
-            let bind = self.exec.place_raw(*id, bytes.clone()).ok_or_else(|| {
-                anyhow!(
-                    "bind: raw tensor '{id}' ({} B) has no placement in this bundle, does not fit \
-                     the one it has, or is not a whole number of int32 entries — a partial trailing \
-                     entry is a truncated address, an over-long bind overwrites the next tensor, and \
-                     an unplaced one would be skipped in silence (entry 0 is page 0's first block, a \
-                     REAL address)",
-                    bytes.len()
-                )
-            })?;
-            self.exec.bind_input_raw(bind);
-        }
         if std::env::var_os("SCRATCHY_SDSC_PHASE_TIME").is_some() {
             eprintln!(
                 "[sdsc-host] bind_loop={:.2} ms  ({} acts, {bind_elems} f32->sen, {} f16 acts, \
@@ -719,12 +678,9 @@ impl SuperDscSession {
         activations: &[crate::wiring::Bind],
         // Already in the device's format — bound as-is, never re-narrowed.
         activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
-        // ⭐ RAW LE int32 bytes — bound through `bind_input_raw`, so the shadow write COPIES them
-        // instead of re-encoding them as fp16. A gather's index table, and nothing else today.
-        activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
         logits: StepLogits,
     ) -> Result<Option<Vec<f32>>> {
-        self.bind_activations(activations, activations_f16, activations_i32)?;
+        self.bind_activations(activations, activations_f16)?;
         let (n_new, seq_pos) = (NewTokens(n_new as i64), SeqPos(seq_pos as i64));
         match logits {
             StepLogits::ReadBack => {

@@ -1594,10 +1594,11 @@ pub fn compute_bundle_layout<F: RopeForm>(
             }
             // ⭐⭐⭐⭐⭐ THE GATHER REACH — the POOL a gathered read of these planes names, stated
             // where the slice is placed so the two are ONE fact at one site. The placement above
-            // covers this layer's slice of ONE page; a gathered read's index names stick-blocks
+            // covers this layer's slice of ONE page; a gathered read's index names slab-blocks
             // RELATIVE TO THE PLANE'S OWN BASE across the whole pool — every page, in the
-            // uniform `hd · 64`-element block grid `GatherEntry::of_page_block` counts in — so
-            // the gather door checks the read's entry stride against THIS reach instead of the
+            // uniform `POOL_STICK²`-element slab-block grid `GatherEntry::of_slab_block` counts
+            // in — so the
+            // gather door checks the read's entry stride against THIS reach instead of the
             // slice footprint. The reach is the TYPED pair
             // (`GatherReach::of_plane` — the entry ceiling and the entry unit), minted from the
             // SAME page ceiling the mask's pass grid derives in the first node's block below
