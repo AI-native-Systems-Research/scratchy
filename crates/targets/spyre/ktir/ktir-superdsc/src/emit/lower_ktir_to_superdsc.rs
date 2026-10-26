@@ -150,6 +150,50 @@ pub struct Region {
     /// ⭐ THE fp8-NESS IS A VIEW FACT, not an arity guess: the fp8 matmul builds its weight
     /// through `view_fp8`, which writes `Dtype = Fp8E4m3` on the `ktdp.construct_memory_view`.
     pub is_fp8: bool,
+    /// ⭐⭐⭐ THE FLUSH ROW BAND a per-core uniform row corner states — `None` for every
+    /// ordinary region. See [`RowBand`]: the launch's own tiles tile this region's rows
+    /// flush, so a swept op over it must hold the BAND's height, not one core's tile —
+    /// and the band is typed (constructed only by the whole-function door's uniform-row
+    /// arm) precisely so that no other site can claim it.
+    pub band: Option<RowBand>,
+}
+
+/// ⭐⭐⭐ THE FLUSH ROW BAND — `positions` cores each computing `stride` rows, flush.
+///
+/// A per-core uniform row corner (`stride·core_id + base`, the form
+/// `uniform_corners` recognizes) resolves its region as the BAND
+/// `[base, base + positions·stride)`: the launch's own tiles tile it flush, and the
+/// WORK DIVISION carries each core's rows, so the corner is redundant with the
+/// division. The band can therefore EQUAL THE WHOLE VIEW (`base 0`, band == view)
+/// and still be a band — shape-identical to a whole-view read, which is exactly why
+/// it is a TYPED fact and not a shape test: the mint of an op whose per-row operand
+/// is a `[1, ·]` tile cornered at `pid` must mint at the BAND's height (`[B, ·]`), and
+/// no extent comparison can tell that `[1, ·]`-per-core from an ordinary one-tile read.
+///
+/// ⛔ CONSTRUCTED ONLY BY [`crate::emit::whole_function::windowed_region`]'s uniform
+/// row arm — private fields, one `pub(crate)` constructor named for that arm — so no
+/// other code in any crate can state a band a program did not. Rope is the
+/// card-proven instance (32 positions × 32-row tiles over 1024 rows); the batched
+/// sampler is the flush band (`pid`-cornered `[1, ·]` tiles over `B` rows).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RowBand {
+    /// Rows per core — the tile's own row height (the arm requires stride == `tr`).
+    stride: u32,
+    /// The launch's position count (`grid.x · grid.y · grid.z`).
+    positions: u32,
+}
+
+impl RowBand {
+    /// The band a launch's own tiles tile flush: `positions` tiles of `stride` rows.
+    /// `pub(crate)`: only the whole-function door's uniform-row arm may state one.
+    pub(crate) fn flush(stride: u32, positions: u32) -> Self {
+        Self { stride, positions }
+    }
+
+    /// The band's height — `positions · stride`, the rows a swept op over it must hold.
+    pub fn height(&self) -> u32 {
+        self.stride * self.positions
+    }
 }
 
 impl Region {
@@ -727,6 +771,7 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
             c_cover,
             is_out,
             is_fp8,
+            band: None,
         });
     }
     Ok(out)
@@ -5903,6 +5948,7 @@ mod elementwise_tests {
             c_cover: (0, cols),
             is_out,
             is_fp8: false,
+            band: None,
         }
     }
 
@@ -6603,6 +6649,7 @@ mod elementwise_tests {
             c_cover: (c_start, c_start + c_len),
             is_out,
             is_fp8: false,
+            band: None,
         }
     }
 
@@ -7052,6 +7099,7 @@ mod proofs {
             c_cover: (0, cols),
             is_out,
             is_fp8: false,
+            band: None,
         }
     }
 
