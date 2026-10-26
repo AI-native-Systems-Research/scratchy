@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// bf16 SwiGLU activation for the H100: out = gate / (1 + e^(−gate)) · up over [rows, cols], `gate`, `up` and `out` row-major bf16 of the
+// The two bf16 gated activations for the H100, one kernel template over the op struct:
+//   - SwiGLU (`scratchy_cuda_silu_mul_bf16`, `silu_mul_bf16_ker<scratchy::ops::silu_mul>`), below;
+//   - GeGLU (`scratchy_cuda_gelu_mul_bf16`, `<scratchy::ops::gelu_tanh_mul>`, Gemma's dense MLP and
+//     experts): out = 0.5 · gate · (1 + tanh(√(2/π) · (gate + 0.044715 · gate³))) · up, HF's
+//     `gelu_pytorch_tanh` and Metal's `gelu_tanh` (`shaders/activation.metal`). Same arguments,
+//     shape rule, tiles and setup; only the map differs.
+//
+// SwiGLU: out = gate / (1 + e^(−gate)) · up over [rows, cols], `gate`, `up` and `out` row-major bf16 of the
 // same shape (no broadcast). Each element is widened to f32 (exact), computed in f32 and rounded
 // once to bf16 (round-to-nearest-even). The expression is the plain-CUDA kernel's, `g / (1.0f + __expf(-g)) * u`, now the op struct `scratchy::ops::silu_mul`: for `g ≤ −88`, `__expf(−g)` overflows to +inf and the result is a signed zero, never NaN.
 //
@@ -62,6 +69,7 @@ static_assert(SMEM_TILES == 131072, "4 warps x 2 stages x 2 operands x 8 KiB");
 constexpr int EW_SMEM_BYTES = int(SMEM_TILES) + 1024;
 static_assert(EW_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "fits the H100's 227 KiB");
 
+template <typename OP>
 __global__ __launch_bounds__(NUM_THREADS, 1) void silu_mul_bf16_ker(const __grid_constant__ ew_globals g) {
     extern __shared__ int __shm[];
     tma_swizzle_allocator al((int*)&__shm[0]);
@@ -103,7 +111,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void silu_mul_bf16_ker(const __grid
         rt_fl<ROWS, COLS> x, y;
         warp::load(x, a_smem[w][stage]);
         warp::load(y, b_smem[w][stage]);
-        warp::bin_map<scratchy::ops::silu_mul>(x, x, y);
+        warp::bin_map<OP>(x, x, y);
         warp::store(a_smem[w][stage], x);
         __syncwarp();
         coord<tile> at = {0, 0, row_block, w + i * WARPS};
@@ -112,16 +120,48 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void silu_mul_bf16_ker(const __grid
     warp::tma::store_async_wait();
 }
 
+// Build the views and launch `silu_mul_bf16_ker<OP>`. Can throw (a tensor-map encode); the caller
+// catches.
+template <typename OP>
+int launch(const void* gate, const void* up, void* out, uint32_t rows, uint32_t cols,
+           cudaStream_t stream) {
+    bf16* ap = static_cast<bf16*>(const_cast<void*>(gate));
+    bf16* bp = static_cast<bf16*>(const_cast<void*>(up));
+    bf16* op = static_cast<bf16*>(out);
+    // Building each `gl` encodes its tensor map into host memory; nothing is allocated on the
+    // device. Every row stride is `2·cols` bytes, a multiple of 16.
+    row_gl ag{ap, nullptr, nullptr, size_t(rows), size_t(cols)};
+    row_gl bg{bp, nullptr, nullptr, size_t(rows), size_t(cols)};
+    row_gl og{op, nullptr, nullptr, size_t(rows), size_t(cols)};
+    ew_globals G{ag, bg, og, int((cols + uint32_t(COLS) - 1) / uint32_t(COLS))};
+    void* args[] = {&G};
+    const dim3 grid((rows + uint32_t(ROWS) - 1) / uint32_t(ROWS)), block(NUM_THREADS);
+    return static_cast<int>(
+        cudaLaunchKernel(silu_mul_bf16_ker<OP>, grid, block, args, EW_SMEM_BYTES, stream));
+}
+
+bool refused(uint32_t rows, uint32_t cols) {
+    return rows == 0 || cols == 0 || cols % VEC != 0 ||
+           uint64_t(rows) * uint64_t(cols) > uint64_t(INT_MAX);
+}
+
 }  // namespace
 
-// The kernel's one-time setup: allow it `EW_SMEM_BYTES` of dynamic shared memory on the current
-// device (the default limit is 48 KB). Run once per device before any launch
+// The kernel's one-time setup: allow both instantiations `EW_SMEM_BYTES` of dynamic shared memory
+// on the current device (the default limit is 48 KB). Run once per device before any launch
 // (`kernels::prepare_all`, called by `CudaDevice::open`), never per launch.
 //
-// 0 = done; any other value = the cudaError_t of setting the attribute.
+// 0 = done; any other value = the first cudaError_t of setting the attribute.
 extern "C" int scratchy_cuda_silu_mul_bf16_prepare(void) {
-    return static_cast<int>(cudaFuncSetAttribute(
-        silu_mul_bf16_ker, cudaFuncAttributeMaxDynamicSharedMemorySize, EW_SMEM_BYTES));
+    for (auto ker : {silu_mul_bf16_ker<scratchy::ops::silu_mul>,
+                     silu_mul_bf16_ker<scratchy::ops::gelu_tanh_mul>}) {
+        const cudaError_t e =
+            cudaFuncSetAttribute(ker, cudaFuncAttributeMaxDynamicSharedMemorySize, EW_SMEM_BYTES);
+        if (e != cudaSuccess) {
+            return static_cast<int>(e);
+        }
+    }
+    return 0;
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
@@ -137,25 +177,30 @@ extern "C" int scratchy_cuda_silu_mul_bf16_prepare(void) {
 extern "C" int scratchy_cuda_silu_mul_bf16(const void* gate, const void* up, void* out,
                                            uint32_t rows, uint32_t cols,
                                            void* stream /* cudaStream_t; null = default stream */) {
-    if (rows == 0 || cols == 0 || cols % VEC != 0 ||
-        uint64_t(rows) * uint64_t(cols) > uint64_t(INT_MAX)) {
+    if (refused(rows, cols)) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
     try {
-        bf16* ap = static_cast<bf16*>(const_cast<void*>(gate));
-        bf16* bp = static_cast<bf16*>(const_cast<void*>(up));
-        bf16* op = static_cast<bf16*>(out);
-        // Building each `gl` encodes its tensor map into host memory; nothing is allocated on
-        // the device. Every row stride is `2·cols` bytes, a multiple of 16.
-        row_gl ag{ap, nullptr, nullptr, size_t(rows), size_t(cols)};
-        row_gl bg{bp, nullptr, nullptr, size_t(rows), size_t(cols)};
-        row_gl og{op, nullptr, nullptr, size_t(rows), size_t(cols)};
-        ew_globals G{ag, bg, og, int((cols + uint32_t(COLS) - 1) / uint32_t(COLS))};
-        void* args[] = {&G};
-        const dim3 grid((rows + uint32_t(ROWS) - 1) / uint32_t(ROWS)), block(NUM_THREADS);
-        return static_cast<int>(cudaLaunchKernel(silu_mul_bf16_ker, grid, block, args, EW_SMEM_BYTES,
-                                                 static_cast<cudaStream_t>(stream)));
+        return launch<scratchy::ops::silu_mul>(gate, up, out, rows, cols,
+                                               static_cast<cudaStream_t>(stream));
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
+}
+
+// `out = 0.5 · gate · (1 + tanh(√(2/π) · (gate + 0.044715 · gate³))) · up`: return codes, shape
+// rule, pointer contract and setup as `scratchy_cuda_silu_mul_bf16`'s.
+extern "C" int scratchy_cuda_gelu_mul_bf16(const void* gate, const void* up, void* out,
+                                           uint32_t rows, uint32_t cols,
+                                           void* stream /* cudaStream_t; null = default stream */) {
+    if (refused(rows, cols)) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        return launch<scratchy::ops::gelu_tanh_mul>(gate, up, out, rows, cols,
+                                                    static_cast<cudaStream_t>(stream));
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }

@@ -87,25 +87,25 @@ pub enum CudaStep {
     /// `SubOp::GateScale` (`kernels/gate_scale_bf16.cu`).
     GateScale(GateScaleBf16),
     /// `x · scale`, a compile-time scalar (Gemma's embedding scale), lowered from
-    /// `SubOp::ScalarMul`. Its kernel is #885's 13b.
+    /// `SubOp::ScalarMul` (`kernels/pointwise_bf16.cu`, `scratchy_cuda_scale_bf16`).
     Scale(ScaleBf16),
-    /// The RMSNorm with no gain (Gemma's `v_norm`), lowered from `SubOp::RmsNormUnit`. Its kernel
-    /// is #885's 13b.
+    /// The RMSNorm with no gain (Gemma's `v_norm`), lowered from `SubOp::RmsNormUnit`
+    /// (`kernels/rms_norm_bf16.cu`'s unit instantiation, `scratchy_cuda_rms_norm_unit_bf16`).
     RmsNormUnit(RmsNormUnitBf16),
     /// `gelu_tanh(gate) · up` in one launch, lowered from the `GeluMul` fold of an
     /// `Elementwise(Gelu)` into the `Elementwise(Mul)` it gates, and from Gemma's
-    /// `ExpertGatedAct { act: Gelu }`: the operands of [`Self::SiluMul`], another kernel (#885's
-    /// 13b).
+    /// `ExpertGatedAct { act: Gelu }`: the operands of [`Self::SiluMul`]
+    /// (`kernels/silu_mul_bf16.cu`'s GELU instantiation, `scratchy_cuda_gelu_mul_bf16`).
     GeluMul(SiluMulBf16),
     /// `x · w[0]`, `w` a `[1]` bf16 weight (Gemma's `layer_scalar`), lowered from
-    /// `SubOp::ScalarWeightMul`. Its kernel is #885's 13b.
+    /// `SubOp::ScalarWeightMul` (`kernels/pointwise_bf16.cu`, `scratchy_cuda_layer_scale_bf16`).
     LayerScale(LayerScaleBf16),
-    /// `cap · tanh(x / cap)` (Gemma's final logits), lowered from `SubOp::TanhSoftCap`. Its
-    /// kernel is #885's 13b.
+    /// `cap · tanh(x / cap)` (Gemma's final logits), lowered from `SubOp::TanhSoftCap`
+    /// (`kernels/pointwise_bf16.cu`, `scratchy_cuda_soft_cap_bf16`).
     SoftCap(SoftCapBf16),
     /// Gemma's router pre-norm, `x̂ · router.scale` into the MoE scratch's router-norm region,
     /// lowered from `SubOp::RouterNorm`: the operands of [`Self::RmsNorm`], its gain the bundle's
-    /// `router.scale` (`kernels/rms_norm_bf16.cu`'s structure; #885's 13b).
+    /// `router.scale` (`kernels/rms_norm_bf16.cu`, `scratchy_cuda_rms_norm_bf16`).
     RouterNorm(RmsNormBf16),
     /// The bf16 GEMM on 64-column tiles, lowered from `SubOp::MatmulTile` when `n` is a multiple
     /// of [`GEMM_COL64_TILE`]'s and not of [`GEMM_BF16_TILE`]'s, above
@@ -794,8 +794,9 @@ pub struct RouterLogitsBf16 {
     pub kernel: MatmulKernel,
 }
 
-/// The one expert count the routing kernel takes: one warp per token row, 8 logits per lane
-/// (`kernels/moe_route_bf16.cu`).
+/// The one expert count the routing kernel's Qwen program takes: one warp per token row, 8 logits
+/// per lane (`kernels/moe_route_bf16.cu`). Its Gemma program takes each of
+/// `op_abi::MOE_EXPERT_COUNTS`.
 pub const MOE_ROUTE_EXPERTS: u32 = 256;
 /// The routing kernel's largest top-k: one pick per round of its warp reductions
 /// (`kernels/moe_route_bf16.cu`).
@@ -829,7 +830,7 @@ pub enum RouteProgram {
     /// Qwen: a softmax over every expert, the top-k, renormalised when `renorm`.
     QwenSoftmax,
     /// Gemma: the top-k of the raw logits, each scaled by `scale` (`hidden^-0.5`), a softmax over
-    /// the picks, then the per-expert scale. #885's 13b.
+    /// the picks, then the per-expert scale (`kernels/moe_route_bf16.cu`'s Gemma program).
     GemmaScaledSoftmax {
         /// `scale` as its bits (`f32::to_bits`).
         scale_bits: u32,

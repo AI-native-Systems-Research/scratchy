@@ -50,6 +50,39 @@ unsafe extern "C" {
         gain_offset: f32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_rms_norm_unit_bf16(
+        x: *const c_void,
+        y: *mut c_void,
+        rows: u32,
+        cols: u32,
+        eps: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_pointwise_bf16_prepare() -> i32;
+    fn scratchy_cuda_scale_bf16(
+        x: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        cols: u32,
+        scale: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_layer_scale_bf16(
+        x: *const c_void,
+        w: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        cols: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_soft_cap_bf16(
+        x: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        cols: u32,
+        cap: f32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_add_bf16_prepare() -> i32;
     fn scratchy_cuda_add_bf16(
         a: *const c_void,
@@ -61,6 +94,14 @@ unsafe extern "C" {
     ) -> i32;
     fn scratchy_cuda_silu_mul_bf16_prepare() -> i32;
     fn scratchy_cuda_silu_mul_bf16(
+        gate: *const c_void,
+        up: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        cols: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_gelu_mul_bf16(
         gate: *const c_void,
         up: *const c_void,
         out: *mut c_void,
@@ -241,12 +282,15 @@ unsafe extern "C" {
     ) -> i32;
     fn scratchy_cuda_moe_route_bf16(
         logits: *const c_void,
+        expert_scale: *const c_void,
         topk_idx: *mut c_void,
         scores: *mut c_void,
         m: u32,
         experts: u32,
         top_k: u32,
         renorm: u32,
+        program: u32,
+        scale: f32,
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_moe_combine_bf16(
@@ -327,8 +371,8 @@ pub enum KernelError {
     EmbedShape { rows: u32, hidden: u32, vocab: u32 },
     /// The GEMM does not take this shape; nothing was launched.
     Shape { m: u32, n: u32, k: u32 },
-    /// A row kernel (RMSNorm, add, SiluMul, GateApply) does not take this shape; nothing was
-    /// launched.
+    /// A row kernel (RMSNorm, add, SiluMul, GateApply, and Gemma's unit RMSNorm, GeluMul, scale,
+    /// layer scale and soft-cap) does not take this shape; nothing was launched.
     RowShape { rows: u32, cols: u32 },
     /// The rope does not take this shape; nothing was launched.
     RopeShape {
@@ -522,6 +566,7 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("rms_norm_bf16", scratchy_cuda_rms_norm_bf16_prepare),
     ("add_bf16", scratchy_cuda_add_bf16_prepare),
     ("silu_mul_bf16", scratchy_cuda_silu_mul_bf16_prepare),
+    ("pointwise_bf16", scratchy_cuda_pointwise_bf16_prepare),
     ("gate_apply_bf16", scratchy_cuda_gate_apply_bf16_prepare),
     ("gate_scale_bf16", scratchy_cuda_gate_scale_bf16_prepare),
     ("attn_decode_bf16", scratchy_cuda_attn_decode_bf16_prepare),
@@ -692,6 +737,107 @@ pub unsafe fn silu_mul_bf16(
 ) -> Result<(), KernelError> {
     // SAFETY: as `rms_norm_bf16`'s.
     let code = unsafe { scratchy_cuda_silu_mul_bf16(gate, up, out, rows, cols, stream) };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
+/// Launch the bf16 RMSNorm with no gain (Gemma's `v_norm`, `kernels/rms_norm_bf16.cu`'s unit
+/// instantiation): `y[r, c] = x[r, c] / sqrt(mean(x[r, :]²) + eps)`, `x` and `y` `[rows, cols]`,
+/// the bits of [`rms_norm_bf16`] with a gain of all ones and offset 0. Asynchronous; the shape rule
+/// is the row kernels'.
+///
+/// # Safety
+///
+/// `x` and `y` must be 16-byte-aligned device pointers to at least `rows·cols` bf16 elements,
+/// valid for the whole kernel, with `y` not overlapping `x`. `stream` must be a live
+/// `cudaStream_t` of the current device, or null for the default stream.
+pub unsafe fn rms_norm_unit_bf16(
+    x: *const c_void,
+    y: *mut c_void,
+    (rows, cols): (u32, u32),
+    eps: f32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe { scratchy_cuda_rms_norm_unit_bf16(x, y, rows, cols, eps, stream) };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
+/// Launch the bf16 `out = 0.5 · gate · (1 + tanh(√(2/π) · (gate + 0.044715 · gate³))) · up` (GeGLU,
+/// `kernels/silu_mul_bf16.cu`'s GELU instantiation) over `[rows, cols]`, in f32 with one bf16
+/// rounding per element. Asynchronous; the shape rule is the row kernels'.
+///
+/// # Safety
+///
+/// As [`silu_mul_bf16`]'s.
+pub unsafe fn gelu_mul_bf16(
+    gate: *const c_void,
+    up: *const c_void,
+    out: *mut c_void,
+    (rows, cols): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe { scratchy_cuda_gelu_mul_bf16(gate, up, out, rows, cols, stream) };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
+// GEMMA'S ONE-OPERAND ROW MAPS (`kernels/pointwise_bf16.cu`): the row kernels' shape rule
+// (`step::SCALE_BF16_COLS`, `SOFT_CAP_BF16_COLS`), one setup in `PREPARE`. `out` may equal `x`
+// exactly (the same bits as out of place), and may overlap it in no other way.
+
+/// Launch the bf16 `out = x · scale` over `[rows, cols]` (Gemma's embedding scale): one f32
+/// multiply of the exact input, one bf16 rounding. Asynchronous.
+///
+/// # Safety
+///
+/// `x` and `out` must be 16-byte-aligned device pointers to at least `rows·cols` bf16 elements,
+/// valid for the whole kernel, `out` equal to `x` or overlapping it nowhere. `stream` must be a
+/// live `cudaStream_t` of the current device, or null for the default stream.
+pub unsafe fn scale_bf16(
+    x: *const c_void,
+    out: *mut c_void,
+    (rows, cols): (u32, u32),
+    scale: f32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe { scratchy_cuda_scale_bf16(x, out, rows, cols, scale, stream) };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
+/// Launch the bf16 `out = x · w[0]` over `[rows, cols]`, `w` a `[1]` bf16 weight (Gemma's
+/// `layer_scalar`) widened exactly: one f32 multiply, one bf16 rounding. Asynchronous.
+///
+/// # Safety
+///
+/// As [`scale_bf16`]'s, and `w` a device pointer to one bf16, overlapping neither `x` nor `out`.
+pub unsafe fn layer_scale_bf16(
+    x: *const c_void,
+    w: *const c_void,
+    out: *mut c_void,
+    (rows, cols): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe { scratchy_cuda_layer_scale_bf16(x, w, out, rows, cols, stream) };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
+/// Launch the bf16 `out = cap · tanh(x / cap)` over `[rows, cols]` (Gemma's final-logit
+/// soft-cap), in f32 with one bf16 rounding. Asynchronous.
+///
+/// # Safety
+///
+/// As [`scale_bf16`]'s.
+pub unsafe fn soft_cap_bf16(
+    x: *const c_void,
+    out: *mut c_void,
+    (rows, cols): (u32, u32),
+    cap: f32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe { scratchy_cuda_soft_cap_bf16(x, out, rows, cols, cap, stream) };
     check(code, KernelError::RowShape { rows, cols })
 }
 
@@ -1344,16 +1490,19 @@ pub unsafe fn moe_route_bf16(
     renorm: bool,
     stream: *mut c_void,
 ) -> Result<(), KernelError> {
-    // SAFETY: as `rms_norm_bf16`'s.
+    // SAFETY: as `rms_norm_bf16`'s; the Qwen program reads no per-expert scale.
     let code = unsafe {
         scratchy_cuda_moe_route_bf16(
             logits,
+            std::ptr::null(),
             topk_idx,
             scores,
             m,
             experts,
             top_k,
             u32::from(renorm),
+            ROUTE_QWEN,
+            0.0,
             stream,
         )
     };
@@ -1361,7 +1510,62 @@ pub unsafe fn moe_route_bf16(
         code,
         KernelError::MoeShape {
             kernel: "moe_route_bf16",
-            dims: [m, experts, top_k, 0],
+            dims: [m, experts, top_k, ROUTE_QWEN],
+        },
+    )
+}
+
+/// `kernels/moe_route_bf16.cu`'s `program`: the Qwen routing.
+const ROUTE_QWEN: u32 = 0;
+/// `kernels/moe_route_bf16.cu`'s `program`: the Gemma routing.
+const ROUTE_GEMMA: u32 = 1;
+
+/// Launch Gemma's MoE routing (`kernels/moe_route_bf16.cu`'s Gemma program): per token row of
+/// `logits` (`[m, experts]` bf16), the `top_k` largest RAW logits picked (equal logits by the
+/// higher expert index, a NaN lowest; always `top_k` distinct indices in `0..experts`), each
+/// scaled by `scale` (`hidden^-0.5`), a softmax over the picks in f32, then each times its
+/// expert's `expert_scale` entry; stored ascending (slot `top_k − 1` the best) as i32 into
+/// `topk_idx` and f32 into `scores` (`[m, top_k]` each). Asynchronous.
+///
+/// Refused with [`KernelError::MoeShape`] `{ kernel: "moe_route_bf16", dims: [m, experts, top_k,
+/// 1] }`, before any pointer is touched, unless `m` is non-zero and at most `i32::MAX`, `experts`
+/// one of `op_abi::MOE_EXPERT_COUNTS` (128, 256), `top_k` in `1..=32`
+/// (`step::MOE_ROUTE_MAX_TOP_K`), and `expert_scale` non-null.
+///
+/// # Safety
+///
+/// `logits` must be a device pointer to `m · experts` bf16, `expert_scale` to `experts` bf16,
+/// `topk_idx` to `m · top_k` i32 and `scores` to `m · top_k` f32, 16-byte aligned and valid for
+/// the whole kernel, the outputs overlapping nothing. `stream` must be a live `cudaStream_t` of the
+/// current device, or null for the default stream.
+pub unsafe fn gemma_route_bf16(
+    (logits, expert_scale): (*const c_void, *const c_void),
+    (topk_idx, scores): (*mut c_void, *mut c_void),
+    (m, experts, top_k): (u32, u32, u32),
+    scale: f32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_moe_route_bf16(
+            logits,
+            expert_scale,
+            topk_idx,
+            scores,
+            m,
+            experts,
+            top_k,
+            0,
+            ROUTE_GEMMA,
+            scale,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::MoeShape {
+            kernel: "moe_route_bf16",
+            dims: [m, experts, top_k, ROUTE_GEMMA],
         },
     )
 }

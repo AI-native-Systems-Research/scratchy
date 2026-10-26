@@ -47,6 +47,7 @@ use scratchy_target_cuda::runtime::{
     CudaDevice, CudaWorker, DeviceBuffer, ForwardError, GdnPoolConfig, GdnSequence, Input, KvHalf,
     KvPoolConfig, KvSequence, WorkerError,
 };
+use scratchy_target_cuda::step::MatmulKernel;
 use scratchy_target_cuda::step::{CudaStep, gdn_bundle, gdn_scratch};
 use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, KvTape, RotaryTable, TapeError,
@@ -2944,7 +2945,7 @@ fn gemma_moe_buckets() -> &'static [CudaTape] {
     })
 }
 
-/// A Gemma tape is refused with `NotLaunched` at its first new step (the router norm, step 0),
+/// A Gemma tape is refused with `NotLaunched` at its first new step (the 64-column router GEMM, step 1),
 /// before anything is uploaded or enqueued: the result colour keeps every byte it had, and the
 /// host result buffer is untouched. Synthetic zero weights of the declared sizes.
 #[test]
@@ -2952,10 +2953,14 @@ fn a_gemma_tape_is_refused_not_launched_before_anything_is_enqueued() {
     let device = h100();
     let tapes = gemma_moe_buckets();
     let tape = &tapes[0];
+    let kinds: Vec<String> = (tape.steps.iter())
+        .map(|s| format!("{s:?}").split('(').next().unwrap_or("").to_owned())
+        .collect();
+    eprintln!("gemma m=512 step kinds: {kinds:?}");
     assert!(
-        matches!(tape.steps[0], CudaStep::RouterNorm(_)),
-        "the first step is the router norm: {:?}",
-        tape.steps[0]
+        matches!(tape.steps[1], CudaStep::RouterLogits(r) if r.kernel == MatmulKernel::Col64),
+        "the first unlaunched step is the 64-column router GEMM: {:?}",
+        tape.steps[1]
     );
     let table: Vec<DeviceBuffer> = (tape.weight_bytes.iter())
         .map(|&b| match b {
@@ -2978,8 +2983,8 @@ fn a_gemma_tape_is_refused_not_launched_before_anything_is_enqueued() {
         matches!(
             e,
             ForwardError::NotLaunched {
-                step: 0,
-                op: "RouterNorm"
+                step: 1,
+                op: "RouterLogits"
             }
         ),
         "{e:?}"

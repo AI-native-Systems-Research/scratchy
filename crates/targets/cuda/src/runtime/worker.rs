@@ -40,9 +40,9 @@ use crate::rotary::fill_rotary_rows;
 use crate::step::{
     AddBf16, AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16,
     ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16,
-    GatedDeltaNetBf16, GemmBf16, KV_APPEND_BF16_HEAD_DIM, MOE_ROUTE_EXPERTS, MatmulKernel,
-    MoeRouteBf16, MoeWeight, PairRows, RmsNormBf16, RopeAppendBf16, RopeBf16, RouterLogitsBf16,
-    SiluMulBf16,
+    GatedDeltaNetBf16, GemmBf16, KV_APPEND_BF16_HEAD_DIM, LayerScaleBf16, MOE_ROUTE_EXPERTS,
+    MatmulKernel, MoeRouteBf16, MoeWeight, PairRows, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16,
+    RopeBf16, RouteProgram, RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape, TapeError,
@@ -566,23 +566,17 @@ fn gdn_pool_layout(layout: &GdnStateLayout, layers: usize) -> Option<(Vec<(u64, 
     Some((offsets, per_layer.checked_mul(layers as u64)?))
 }
 
-/// The name of `s` when it is a step the lowering emits and no kernel launches yet: every Gemma
-/// step (#885's 13b and 13c), a rope or attention of a class with a window or a head dim not 256
-/// or a half-head pairing, a Gemma routing, an expert step at another count than 256 or on
-/// 64-column tiles, and a router or expert step reading Gemma's own tensors. `None` for every step a Qwen tape holds.
+/// The name of `s` when it is a step the lowering emits and no kernel launches yet (#885's 13b-2
+/// to 13b-4): the 64-column GEMM, the router GEMM on it, a rope or attention of a class with a
+/// window or a head dim not 256 or a half-head pairing, and an expert step at another count than
+/// 256, on 64-column tiles or reading Gemma's own tensors. `None` for every step a Qwen tape holds.
 fn not_launched(tape: &CudaTape, s: &CudaStep) -> Option<&'static str> {
-    use crate::step::{RopePairing, RouteProgram};
+    use crate::step::RopePairing;
     let qwen_class = |layer: u32| {
         tape.kv_class(layer)
             .is_some_and(|c| c.window.is_none() && c.head_dim == KV_APPEND_BF16_HEAD_DIM)
     };
     match *s {
-        CudaStep::Scale(_) => Some("Scale"),
-        CudaStep::RmsNormUnit(_) => Some("RmsNormUnit"),
-        CudaStep::GeluMul(_) => Some("GeluMul"),
-        CudaStep::LayerScale(_) => Some("LayerScale"),
-        CudaStep::SoftCap(_) => Some("SoftCap"),
-        CudaStep::RouterNorm(_) => Some("RouterNorm"),
         CudaStep::GemmCol64(_) => Some("GemmCol64"),
         CudaStep::Rope(RopeBf16 { pairing, .. }) if pairing != RopePairing::HalfRotated => {
             Some("Rope")
@@ -602,18 +596,7 @@ fn not_launched(tape: &CudaTape, s: &CudaStep) -> Option<&'static str> {
         {
             Some("AttnDecode")
         }
-        CudaStep::MoeRoute(MoeRouteBf16 {
-            program, experts, ..
-        }) if program != RouteProgram::QwenSoftmax || experts != MOE_ROUTE_EXPERTS => {
-            Some("MoeRoute")
-        }
-        CudaStep::RouterLogits(r)
-            if r.experts != MOE_ROUTE_EXPERTS
-                || r.weight != MoeWeight::Bundle
-                || r.kernel == MatmulKernel::Col64 =>
-        {
-            Some("RouterLogits")
-        }
+        CudaStep::RouterLogits(r) if r.kernel == MatmulKernel::Col64 => Some("RouterLogits"),
         CudaStep::ExpertSort(e) if e.experts != MOE_ROUTE_EXPERTS => Some("ExpertSort"),
         CudaStep::ExpertGemm(e)
             if e.experts != MOE_ROUTE_EXPERTS
@@ -1351,15 +1334,95 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         for (step, s) in tape.steps.iter().enumerate() {
             let launched = match *s {
                 // Refused above, before anything was enqueued (`not_launched`).
-                CudaStep::Scale(_)
-                | CudaStep::RmsNormUnit(_)
-                | CudaStep::GeluMul(_)
-                | CudaStep::LayerScale(_)
-                | CudaStep::SoftCap(_)
-                | CudaStep::RouterNorm(_)
-                | CudaStep::GemmCol64(_) => {
+                CudaStep::GemmCol64(_) => {
                     let op = not_launched(tape, s).unwrap_or("a Gemma step");
                     return Err(ForwardError::NotLaunched { step, op });
+                }
+                CudaStep::Scale(ScaleBf16 {
+                    x,
+                    out,
+                    rows,
+                    cols,
+                    scale_bits,
+                }) => {
+                    // SAFETY: as above, for `x` and `out` (`rows*cols` each).
+                    unsafe {
+                        kernels::scale_bf16(
+                            slot(x),
+                            slot(out),
+                            (rows, cols),
+                            f32::from_bits(scale_bits),
+                            stream.0,
+                        )
+                    }
+                }
+                CudaStep::LayerScale(LayerScaleBf16 {
+                    x,
+                    scale,
+                    out,
+                    rows,
+                    cols,
+                }) => {
+                    let w = weights[scale.0 as usize].ptr();
+                    // SAFETY: as above, for `x` and `out` (`rows*cols` each) and `scale` (one
+                    // bf16).
+                    unsafe {
+                        kernels::layer_scale_bf16(slot(x), w, slot(out), (rows, cols), stream.0)
+                    }
+                }
+                CudaStep::SoftCap(SoftCapBf16 {
+                    x,
+                    out,
+                    rows,
+                    cols,
+                    cap_bits,
+                }) => {
+                    // SAFETY: as above, for `x` and `out` (`rows*cols` each).
+                    unsafe {
+                        kernels::soft_cap_bf16(
+                            slot(x),
+                            slot(out),
+                            (rows, cols),
+                            f32::from_bits(cap_bits),
+                            stream.0,
+                        )
+                    }
+                }
+                CudaStep::RmsNormUnit(RmsNormUnitBf16 {
+                    x,
+                    y,
+                    rows,
+                    cols,
+                    eps_bits,
+                }) => {
+                    // SAFETY: as above, for `x` and `y` (`rows*cols` each).
+                    unsafe {
+                        kernels::rms_norm_unit_bf16(
+                            slot(x),
+                            slot(y),
+                            (rows, cols),
+                            f32::from_bits(eps_bits),
+                            stream.0,
+                        )
+                    }
+                }
+                CudaStep::GeluMul(SiluMulBf16 {
+                    gate,
+                    up,
+                    out,
+                    rows,
+                    cols,
+                }) => {
+                    // SAFETY: as above, for `gate`, `up` and `out` (`rows*cols` each).
+                    unsafe {
+                        kernels::gelu_mul_bf16(
+                            slot(gate),
+                            slot(up),
+                            slot(out),
+                            (rows, cols),
+                            stream.0,
+                        )
+                    }
                 }
                 CudaStep::Embed(EmbedBf16 {
                     tokens,
@@ -1417,7 +1480,8 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         let op = not_launched(tape, s).unwrap_or("RouterLogits");
                         return Err(ForwardError::NotLaunched { step, op });
                     }
-                    // The router is the bundle's first tensor, at byte 0 (`moe_bundle`).
+                    // The router is the bundle's first tensor, at byte 0 (`moe_bundle`), or Gemma's
+                    // own projection, whole (`MoeWeight::router_bytes`).
                     let b = weights[bundle.0 as usize].ptr();
                     // SAFETY: as above, for `x` (`m*hidden`), the router (`experts*hidden`, the
                     // bundle's first bytes) and `logits` (`m*experts`).
@@ -1451,11 +1515,12 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     experts,
                     top_k,
                     renorm,
-                    ..
-                }) => {
+                    program,
+                    expert_scale,
+                }) => match (program, expert_scale) {
                     // SAFETY: as above, for `logits` (`m*experts`), `topk_idx` and `scores`
                     // (`m*top_k` each).
-                    unsafe {
+                    (RouteProgram::QwenSoftmax, _) => unsafe {
                         kernels::moe_route_bf16(
                             slot(logits),
                             (slot(topk_idx), slot(scores)),
@@ -1463,8 +1528,23 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             renorm,
                             stream.0,
                         )
+                    },
+                    (RouteProgram::GemmaScaledSoftmax { scale_bits }, pes) => {
+                        // A Gemma routing with no per-expert scale is the launcher's refusal (a
+                        // null pointer), before it touches any pointer.
+                        let pes = pes.map_or(std::ptr::null(), |w| weights[w.0 as usize].ptr());
+                        // SAFETY: as above, and `expert_scale` (`experts`).
+                        unsafe {
+                            kernels::gemma_route_bf16(
+                                (slot(logits), pes),
+                                (slot(topk_idx), slot(scores)),
+                                (m, experts, top_k),
+                                f32::from_bits(scale_bits),
+                                stream.0,
+                            )
+                        }
                     }
-                }
+                },
                 CudaStep::ExpertSort(sort) => Self::expert_sort(&sort, slot, stream),
                 CudaStep::ExpertGemm(g) => Self::expert_gemm(&g, slot, weights, stream),
                 CudaStep::ExpertGemv(g) => Self::expert_gemv(&g, slot, weights, stream),
@@ -1513,6 +1593,17 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     Self::gated_delta_net(&g, pool, slot, weights, stream)
                 }
                 CudaStep::RmsNorm(
+                    norm @ RmsNormBf16 {
+                        x,
+                        gain,
+                        y,
+                        rows,
+                        cols,
+                        convention,
+                        ..
+                    },
+                )
+                | CudaStep::RouterNorm(
                     norm @ RmsNormBf16 {
                         x,
                         gain,

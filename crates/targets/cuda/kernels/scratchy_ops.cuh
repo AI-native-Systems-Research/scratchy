@@ -82,6 +82,48 @@ __device__ inline float2 silu_mul::op<float2>(const float2& g, const float2& u) 
     return float2{silu_mul::op<float>(g.x, u.x), silu_mul::op<float>(g.y, u.y)};
 }
 
+// Gemma's GeGLU activation: `0.5 · g · (1 + tanh(√(2/π) · (g + 0.044715 · g³))) · u`, HF's
+// `gelu_pytorch_tanh` of the gate times `up` (TK's `flux_gelu.cu` uses the same two constants).
+// Under `--use_fast_math` (build.rs) `tanhf` is the intrinsic `__tanhf` (the CUDA programming
+// guide's table of functions `--use_fast_math` affects), whose maximum relative error is 2⁻¹¹.
+// No clamp: `tanh(±inf) = ±1`, so a finite gate whose cube overflows still gives a finite
+// result; `g = −inf` gives NaN, as HF does.
+struct gelu_tanh_mul {
+    static constexpr float SQRT_2_OVER_PI = 0.7978845608f;
+    static constexpr float CUBIC = 0.044715f;
+    template <typename T>
+    static __device__ inline T op(const T& g, const T& u) {
+        return 0.5f * g * (1.0f + tanhf(SQRT_2_OVER_PI * (g + CUBIC * g * g * g))) * u;
+    }
+};
+template <>
+__device__ inline float gelu_tanh_mul::op<float>(const float& g, const float& u) {
+    return 0.5f * g * (1.0f + tanhf(SQRT_2_OVER_PI * (g + CUBIC * g * g * g))) * u;
+}
+template <>
+__device__ inline float2 gelu_tanh_mul::op<float2>(const float2& g, const float2& u) {
+    return float2{gelu_tanh_mul::op<float>(g.x, u.x), gelu_tanh_mul::op<float>(g.y, u.y)};
+}
+
+// Gemma's final-logit soft-cap: `c · tanh(x / c)`, `c` the cap (30). `x / c` is the fast division
+// and `tanhf` the intrinsic `__tanhf` under `--use_fast_math` (see `gelu_tanh_mul`). `±0 → ±0`,
+// `±inf → ±c`, NaN → NaN. The `float2` form is the one TK's tile-and-scalar `bin_map` runs: it
+// packs `c` into both halves of a `float2`.
+struct soft_cap {
+    template <typename T>
+    static __device__ inline T op(const T& x, const T& c) {
+        return c * tanhf(x / c);
+    }
+};
+template <>
+__device__ inline float soft_cap::op<float>(const float& x, const float& c) {
+    return c * tanhf(x / c);
+}
+template <>
+__device__ inline float2 soft_cap::op<float2>(const float2& x, const float2& c) {
+    return float2{soft_cap::op<float>(x.x, c.x), soft_cap::op<float>(x.y, c.y)};
+}
+
 // The attention output gate: `a / (1 + e^(−g))`, the expression the plain-CUDA kernel computed.
 struct gate_apply {
     template <typename T>
