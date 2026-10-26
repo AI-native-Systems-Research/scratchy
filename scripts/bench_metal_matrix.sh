@@ -93,6 +93,10 @@
 # --fail-fast stops at the first scratchy build or parity-gate failure instead
 # of going on to the next model. Either way, a model with no scratchy numbers
 # fails the run (exit 1).
+# --resume, with the same --out-dir and flags as a run that died (a full disk, a
+# crash, a kill), keeps every scaling cell that run finished cleanly and measures
+# only the rest; the build, parity gate and startup ladder run again (minutes).
+# Without it a rerun measures, and overwrites, every cell. The JSON records it.
 set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -244,6 +248,7 @@ WARM_REQUESTS=20
 OFFLINE=0
 SKIP_BUILD=0
 FAIL_FAST=0
+RESUME=0
 PARITY_GIVEN=0          # --parity: force the mlx-lm parity gate in a scratchy-only run
 OUT_DIR=""
 KV_CACHE_DTYPE=""
@@ -329,6 +334,7 @@ while [[ $# -gt 0 ]]; do
         --offline)           OFFLINE=1; shift ;;
         --skip-build)        SKIP_BUILD=1; shift ;;
         --fail-fast)         FAIL_FAST=1; shift ;;
+        --resume)            RESUME=1; shift ;;
         --parity)            PARITY_GIVEN=1; shift ;;
         --full)              shift ;;   # read before the defaults above
         --out-dir)           OUT_DIR="$2"; shift 2 ;;
@@ -562,7 +568,7 @@ CLASS_TABLE="$(printf '%s\n' "${CLASSES[@]}")"
 export ENGINE_INFO PIN_PROBLEMS UNPINNED CLASS_TABLE LARGE_GB
 export STARTED_UTC PRIME_LAUNCHES INPUT_LEN OUTPUT_LEN WARM_REQUESTS SCENARIOS SCALING SCALE_AXES SCALE_CONC SCALE_INPUT SCALE_OUTPUT SCALE_GRID_INPUT \
        SCALE_GRID_OUTPUT SCALE_GRID_CONC SCALE_GRID_USERS_OUTPUT SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS SCALE_ROUNDS \
-       MLX_PYTHON OLLAMA_BIN KV_CACHE_DTYPE SERVE_ARGS CELL_TIMEOUT_S MODELS_FULL
+       MLX_PYTHON OLLAMA_BIN KV_CACHE_DTYPE SERVE_ARGS CELL_TIMEOUT_S RESUME MODELS_FULL
 python3 - "${JSON}" "${chip}" <<'PY'
 import json, os, subprocess, sys
 out, chip = sys.argv[1:3]
@@ -609,6 +615,8 @@ json.dump({
              "kv_cache_dtype": e["KV_CACHE_DTYPE"] or "default (TurboQuant)",
              "scratchy_serve_args": e["SERVE_ARGS"] or None,
              "cell_timeout_s": int(e["CELL_TIMEOUT_S"]),
+             # --resume: cells an earlier run of this output finished are kept, not remeasured.
+             "resumed": e["RESUME"] == "1",
              # bench serve counts a request whose stream ended aborted or errored
              # as failed (#510), so the page takes each cell's `failed` as recorded.
              "failures_counted": True,
@@ -670,7 +678,11 @@ serve_down() {
     srv=""
 }
 kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "${c}"; done; kill -TERM "$1" 2>/dev/null || true; }
+# Out to /dev/null first, and write to it: a line the full disk refused stays in bash's output
+# buffer and otherwise comes back out of every $(pgrep ...) below, where its words became pids,
+# pgrep printed its usage on each and the exit never finished.
 cleanup() {
+    exec >/dev/null; echo
     serve_down
     local c; for c in $(pgrep -P $$); do kill_tree "${c}"; done
     # A killed subshell orphans its children, so also stop whatever is on this run's port.
@@ -814,6 +826,7 @@ footprint_bytes() { # pid -> bytes, or nothing if it has gone
 }
 mem_sampler() { # pid out
     local p b s
+    exec >/dev/null; echo   # a refused log line in the forked buffer must not reach tree_pids (cleanup)
     while kill -0 "$1" 2>/dev/null; do
         s=0
         for p in $(tree_pids "$1"); do b=$(footprint_bytes "${p}"); s=$(( s + ${b:-0} )); done
@@ -860,6 +873,13 @@ run_cell() { # prefix axis rung input output conc
     local n=$(( $6 * SCALE_ROUNDS > SCALE_NUM_PROMPTS ? $6 * SCALE_ROUNDS : SCALE_NUM_PROMPTS ))
     seed=$(printf '%s' "${SCALE_SEED_BASE}:${stem}:$2:$3" | cksum | cut -d' ' -f1)
     printf '    %-16s in %-5s out %-5s conc %-3s ' "$2=$3" "$4" "$5" "$6"
+    # --resume: a cell an earlier run of this output finished cleanly is kept, not measured again.
+    if (( RESUME )) && python3 -c 'import json, sys; j = json.load(open(sys.argv[1]))
+sys.exit(not j.get("completed") or any(j.get(k) for k in ("failed", "timed_out", "dead_server")))' \
+            "${out_json}" 2>/dev/null; then
+        echo "$(numbers "${out_json}") · kept (--resume)"
+        return 0
+    fi
     local mem="${out_json%.json}.mem" sampler=""
     rm -f "${mem}"
     [[ -n "${srv}" ]] && { mem_sampler "${srv}" "${mem}" & sampler=$!; }
@@ -1403,6 +1423,7 @@ def load(name):
     return json.load(open(p)) if os.path.exists(p) else None
 def metrics(j):
     return {k: j[k] for k in KEEP if k in j} if j else None
+grid_users = {int(x) for x in env["GRID_CONC_LIST"].split(",")}
 def scaling(engine):
     cells = []
     for p in sorted(glob.glob(os.path.join(raw, f"scale{engine}-{stem}.*.json"))):
@@ -1410,6 +1431,10 @@ def scaling(engine):
         if not m or not (j := load(os.path.basename(p))):
             continue
         axis, a, b, users = m.groups()
+        # The output is shared across runs, so a cell at a users count this run did not ask for
+        # (an earlier run's, at another --scale-grid-conc) is not this run's.
+        if axis == "grid" and int(users or env["BASE_CONC"]) not in grid_users:
+            continue
         where = ({"rung": f"{a}x{b}", "input_len": int(a), "output_len": int(b),
                   "conc": int(users or env["BASE_CONC"])}
                  if axis == "grid" else {"rung": int(a)})
