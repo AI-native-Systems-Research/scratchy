@@ -264,6 +264,47 @@ __device__ inline float2 nan_to_neg_inf::op<float2>(const float2& x) {
     return float2{nan_to_neg_inf::op<float>(x.x), nan_to_neg_inf::op<float>(x.y)};
 }
 
+// The windowed online softmax's scaled running max: −inf as +0, every other value as it is. With a
+// window, a warp's first KV tile can lie wholly below every one of its rows' windows, so its row
+// max is −inf and `sub_row` would form `−inf − (−inf) = NaN`. Through this op the tile's
+// `p = exp2(−inf − 0)` is exactly 0 instead, and a finite max is unchanged. The `float2` form
+// serves the packed column vector of a row-layout tile (see `rescale_exact1`).
+struct neg_inf_to_zero {
+    template <typename T>
+    static __device__ inline T op(const T& x) {
+        return x == kittens::base_types::constants<T>::neg_infty() ? T(0.0f) : x;
+    }
+};
+template <>
+__device__ inline float neg_inf_to_zero::op<float>(const float& x) {
+    return x == kittens::base_types::constants<float>::neg_infty() ? 0.0f : x;
+}
+template <>
+__device__ inline float2 neg_inf_to_zero::op<float2>(const float2& x) {
+    return float2{neg_inf_to_zero::op<float>(x.x), neg_inf_to_zero::op<float>(x.y)};
+}
+
+// The windowed attention's softmax sum before the final division: 0 as 1, every other value as it
+// is. A padding row of a prefill bucket at least `window − 1` rows past the sequence's last key has
+// no key in its window, so its sum and its output are both 0 and `div_row` would form
+// `0 / 0 = NaN`; through this op it gives `0 / 1 = +0`, finite as the causal kernel's padding rows
+// are. A row with any allowed key has a sum of at least 1 (its max key's `p` is exactly 1), so this
+// is the identity there. The `float2` form as `neg_inf_to_zero`'s.
+struct zero_to_one {
+    template <typename T>
+    static __device__ inline T op(const T& x) {
+        return x == T(0.0f) ? T(1.0f) : x;
+    }
+};
+template <>
+__device__ inline float zero_to_one::op<float>(const float& x) {
+    return x == 0.0f ? 1.0f : x;
+}
+template <>
+__device__ inline float2 zero_to_one::op<float2>(const float2& x) {
+    return float2{zero_to_one::op<float>(x.x), zero_to_one::op<float>(x.y)};
+}
+
 // The MoE sort's run length: an expert's pair count rounded up to whole 128-row tiles of the
 // grouped GEMM (`op_abi::CUDA_EXPERT_TILE_ROWS`), so a tile belongs to one expert. Integer, exact.
 struct tile_pad {

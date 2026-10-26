@@ -45,8 +45,8 @@ use crate::step::{
     RopeBf16, RouteProgram, RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16,
 };
 use crate::tape::{
-    ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape, TapeError,
-    TapeInput, WeightIx,
+    ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape,
+    RotaryTable, TapeError, TapeInput, WeightIx,
 };
 
 /// A forward's input, of the kind its tape takes ([`TapeInput`]).
@@ -566,18 +566,24 @@ fn gdn_pool_layout(layout: &GdnStateLayout, layers: usize) -> Option<(Vec<(u64, 
     Some((offsets, per_layer.checked_mul(layers as u64)?))
 }
 
-/// The name of `s` when it is a step the lowering emits and no kernel launches yet (#885's 13b-2
-/// to 13b-4): the 64-column GEMM, the router GEMM on it, a rope or attention of a class with a
-/// window or a head dim not 256 or a half-head pairing, and an expert step at another count than
-/// 256, on 64-column tiles or reading Gemma's own tensors. Also the Qwen routing at another count
+/// The name of `s` when it is a step the lowering emits and no kernel launches yet (#885's 13b-3
+/// and 13b-4): the 64-column GEMM, the router GEMM on it, a rope with a half-head pairing, a rope
+/// append or attention of a class that is not the KV pool's own at head dim 256 (Gemma's global
+/// layers, head dim 512, a class the pool does not hold yet), and an expert step at another count
+/// than 256, on 64-column tiles or reading Gemma's own tensors. A class of the pool's geometry at
+/// head dim 256 launches with its window or without one (every Qwen layer, Gemma's sliding ones). Also the Qwen routing at another count
 /// than [`MOE_ROUTE_EXPERTS`]: the routing kernel's Qwen program is instantiated at 256 only (its
 /// launcher refuses any other count), so such a tape is refused here, before anything is enqueued,
 /// rather than at its routing step. `None` for every step a Qwen tape holds.
 fn not_launched(tape: &CudaTape, s: &CudaStep) -> Option<&'static str> {
     use crate::step::RopePairing;
-    let qwen_class = |layer: u32| {
-        tape.kv_class(layer)
-            .is_some_and(|c| c.window.is_none() && c.head_dim == KV_APPEND_BF16_HEAD_DIM)
+    // The pool is laid out at the tape's `kv_heads` and `head_dim` (class 0's), so only a class
+    // of that geometry is one its layers' K and V fit.
+    let pool_class = |layer: u32| {
+        tape.kv.zip(tape.kv_class(layer)).is_some_and(|(kv, c)| {
+            c.head_dim == KV_APPEND_BF16_HEAD_DIM
+                && (c.kv_heads, c.head_dim) == (kv.kv_heads, kv.head_dim)
+        })
     };
     match *s {
         CudaStep::GemmCol64(_) => Some("GemmCol64"),
@@ -585,18 +591,14 @@ fn not_launched(tape: &CudaTape, s: &CudaStep) -> Option<&'static str> {
             Some("Rope")
         }
         CudaStep::RopeAppend(RopeAppendBf16 { layer, pairing, .. })
-            if pairing != RopePairing::HalfRotated || !qwen_class(layer) =>
+            if pairing != RopePairing::HalfRotated || !pool_class(layer) =>
         {
             Some("RopeAppend")
         }
-        CudaStep::AttnPrefill(AttnPrefillBf16 { layer, window, .. })
-            if window.is_some() || !qwen_class(layer) =>
-        {
+        CudaStep::AttnPrefill(AttnPrefillBf16 { layer, .. }) if !pool_class(layer) => {
             Some("AttnPrefill")
         }
-        CudaStep::AttnDecode(AttnPrefillBf16 { layer, window, .. })
-            if window.is_some() || !qwen_class(layer) =>
-        {
+        CudaStep::AttnDecode(AttnPrefillBf16 { layer, .. }) if !pool_class(layer) => {
             Some("AttnDecode")
         }
         CudaStep::RouterLogits(r) if r.kernel == MatmulKernel::Col64 => Some("RouterLogits"),
@@ -685,8 +687,9 @@ pub struct CudaWorker<'a, W: AsRef<[DeviceBuffer]> = &'a [DeviceBuffer]> {
     borrow: PhantomData<&'a [DeviceBuffer]>,
     stream: Stream,
     arena: DeviceBuffer,
-    /// The host side of the rotary table, sized once for the largest tape's: each forward with a
-    /// table fills its rows from the positions and uploads them, so a forward allocates nothing.
+    /// The host side of the rotary tables, sized once for the largest tape's two: each forward
+    /// fills each of its tables' rows from the positions (the global table first, then the local
+    /// one after it) and uploads them, so a forward allocates nothing.
     rotary_host: Vec<u16>,
     /// The KV pool, when a tape has a KV cache.
     kv: Option<KvPool>,
@@ -838,10 +841,14 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         };
         let arena_bytes =
             (tapes.iter().map(|t| t.arena.total_bytes).max()).ok_or(WorkerError::NoTapes)?;
-        // Each table's span lies inside its arena (`validate`), so its byte count fits a usize.
+        // Each table's span lies inside its arena (`validate`), so its byte count fits a usize; a
+        // tape's two tables are filled side by side.
         let rotary_elements = (tapes.iter())
-            .filter_map(|t| t.rotary)
-            .map(|r| r.span.bytes as usize / std::mem::size_of::<u16>())
+            .map(|t| {
+                (t.rotary.iter().chain(&t.rotary_local))
+                    .map(|r| r.span.bytes as usize / std::mem::size_of::<u16>())
+                    .sum::<usize>()
+            })
             .max()
             .unwrap_or(0);
         let stream = Stream::new().map_err(WorkerError::Cuda)?;
@@ -1090,14 +1097,17 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             (None, Some(_)) => return Err(ForwardError::GdnUnexpected),
             (None, None) => None,
         };
-        let table = match tape.rotary {
-            Some(r) => {
-                let rows = &mut self.rotary_host[..positions.len() * r.rot_dim as usize];
-                fill_rotary_rows(positions, r.rot_dim, r.theta(), rows);
-                Some((r.span, &*rows))
-            }
-            None => None,
-        };
+        // The global table's rows, then the local table's after them; each table is a plain rope
+        // at its own `rot_dim` and theta (the local table's `rot_dim` is its head dim, a full
+        // rope). `validate` refuses a local table without a global one.
+        let (global_host, local_host) = self.rotary_host.split_at_mut(
+            tape.rotary
+                .map_or(0, |r| positions.len() * r.rot_dim as usize),
+        );
+        let tables = [
+            fill_table(tape.rotary, positions, global_host),
+            fill_table(tape.rotary_local, positions, local_host),
+        ];
         let kv_upload = match (&sequence, &self.kv) {
             (Some((kv_tape, data)), Some(pool)) => Some(KvUpload {
                 tape: *kv_tape,
@@ -1119,7 +1129,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             tape,
             Uploads {
                 input,
-                table,
+                tables,
                 kv: kv_upload,
                 gdn: gdn_upload,
             },
@@ -1230,7 +1240,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
     ) -> Result<(), ForwardError> {
         let Uploads {
             input,
-            table,
+            tables,
             kv: kv_upload,
             gdn: gdn_upload,
         } = uploads;
@@ -1251,7 +1261,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             "cudaMemcpyAsync(host to device)",
         )
         .map_err(ForwardError::Cuda)?;
-        if let Some((span, rows)) = table {
+        for (span, rows) in tables.into_iter().flatten() {
             debug_assert_eq!(std::mem::size_of_val(rows) as u64, span.bytes);
             // SAFETY: the rotary span lies inside the tape's arena (`new` validated it), which is
             // at most `arena_bytes`; `rows` is `bucket_m · rot_dim` elements (`forward` checked
@@ -1781,6 +1791,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         q_heads,
                         kv_heads,
                         head_dim,
+                        window,
                         ..
                     },
                 ) => {
@@ -1792,13 +1803,13 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     // block the keys `0 .. P + L` need is a table entry inside the pool, and
                     // `1 ≤ L ≤ rows`. The cache halves are layer `l`'s.
                     unsafe {
-                        kernels::attn_prefill_bf16(
+                        kernels::attn_prefill_windowed_bf16(
                             (slot(q), slot(out)),
                             (pool.half_ptr(l, KvHalf::K), pool.half_ptr(l, KvHalf::V)),
                             (slot(block_table), slot(sequence)),
                             (rows, q_heads, kv_heads, head_dim),
                             (layout.block_size, layout.num_blocks),
-                            attn.scale(),
+                            (attn.scale(), window.unwrap_or(0)),
                             stream.0,
                         )
                     }
@@ -1813,6 +1824,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         q_heads,
                         kv_heads,
                         head_dim,
+                        window,
                         ..
                     },
                 ) => {
@@ -1824,13 +1836,13 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     // above, which `forward` checked: every block the keys `0 .. P + L` need is a
                     // table entry inside the pool, and `L ≥ 1`. The cache halves are layer `l`'s.
                     unsafe {
-                        kernels::attn_decode_bf16(
+                        kernels::attn_decode_windowed_bf16(
                             (slot(q), slot(out)),
                             (pool.half_ptr(l, KvHalf::K), pool.half_ptr(l, KvHalf::V)),
                             (slot(block_table), slot(sequence)),
                             (q_heads, kv_heads, head_dim),
                             (layout.block_size, layout.num_blocks),
-                            attn.scale(),
+                            (attn.scale(), window.unwrap_or(0)),
                             stream.0,
                         )
                     }
@@ -2080,9 +2092,24 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
 /// when it has GDN layers.
 struct Uploads<'h> {
     input: Input<'h>,
-    table: Option<(ArenaSpan, &'h [u16])>,
+    /// The global rotary table's rows, then the local one's.
+    tables: [Option<(ArenaSpan, &'h [u16])>; 2],
     kv: Option<KvUpload<'h>>,
     gdn: Option<(ArenaSpan, &'h [u32; 4])>,
+}
+
+/// `table`'s rows for `positions` filled into the front of `host`, with its span: what the forward
+/// uploads for it. `None` for a tape without that table.
+fn fill_table<'h>(
+    table: Option<RotaryTable>,
+    positions: &[u32],
+    host: &'h mut [u16],
+) -> Option<(ArenaSpan, &'h [u16])> {
+    table.map(|r| {
+        let rows = &mut host[..positions.len() * r.rot_dim as usize];
+        fill_rotary_rows(positions, r.rot_dim, r.theta(), rows);
+        (r.span, &*rows)
+    })
 }
 
 /// One forward's KV regions, filled on the host: the tape's spans and the bytes for each.

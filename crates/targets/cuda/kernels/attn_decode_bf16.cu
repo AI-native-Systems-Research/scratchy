@@ -9,7 +9,10 @@
 //
 // with `kv_len = P + L` read from the tape's `sequence` region `[P, L]` (L = 1 for a decode, the
 // new token's key already appended by its layer's `RopeAppend`), and `hr = q_heads / kv_heads` the
-// GQA group: query head h reads kv head h / hr.
+// GQA group: query head h reads kv head h / hr. A sliding window `W` (Gemma 4's sliding layers,
+// W = 1024; 0 for every key, every qwen layer) keeps only `j ≥ lo = max(0, kv_len − W)`: the one
+// query, at `kv_len − 1`, sees its own key and the W − 1 before it (metal's `window_lo`,
+// `attention.metal`).
 //
 // ThunderKittens' paged-KV tile attention (PLAN-tk100 §2 S5, §3.11): the machinery of
 // `attn_prefill_bf16.cu` (adapted from TK's `mha_h100.cu` at 67845f5f, MIT), with the GQA group
@@ -57,10 +60,22 @@
 //     heads in `out` (a plain tile's rows are contiguous). No tensor map is built over `out`, and
 //     rows `hr .. 15` are never written.
 //
-// The order of every addition is a function of kv_len alone: tile j always goes to warpgroup
-// `j % 2`, each warpgroup takes its tiles in ascending j, and the merge is in warpgroup order. It
-// does not depend on which physical blocks the table names, so a shuffled block table gives the
-// same bits, and so does a repeat. No atomics.
+// The window: the loop starts at `j0 = lo / 64`, the tile holding `lo`; the tiles below it are
+// never loaded, so a block there may hold anything. The kernel is instantiated twice, `WINDOWED`
+// false and true, and the launcher picks by `W != 0`: `lo`, `j0` and the `left_fill` are
+// `if constexpr (WINDOWED)`, so the `W = 0` instantiation (every qwen launch) is today's kernel. Tile j goes to warpgroup `(j − j0) % 2` (with
+// W = 0, `j0 = 0`: tile j to warpgroup `j % 2`, as without a window), and `warp::left_fill` drops
+// the keys below `lo` of tile j0, the only tile holding any (`lo − k0 ≤ 0` on every later tile, so
+// `left_fill` returns at once there; an unwindowed launch does not call it). Warpgroup 0's first
+// tile is j0, which holds key `lo`, allowed, so its `M` is finite and the merge's `r₁ = +0`
+// argument below holds as without a window; warpgroup 1's tiles are all above `lo`, so none is
+// wholly masked, and a warpgroup 1 with no tile at all has `m = −inf`, `l = 0`, `o = 0`, as below.
+// No `neg_inf_to_zero` is needed, unlike the windowed prefill.
+//
+// The order of every addition is a function of `(kv_len, W)` alone: tile j always goes to
+// warpgroup `(j − j0) % 2`, each warpgroup takes its tiles in ascending j, and the merge is in
+// warpgroup order. It does not depend on which physical blocks the table names, so a shuffled block
+// table gives the same bits, and so does a repeat. No atomics.
 //
 // What changes in the guarantee: the plain-CUDA kernel never loaded a slot at or past kv_len.
 // This one loads whole 64-slot blocks and neutralises the unwritten part before use, scores by
@@ -152,6 +167,8 @@ struct decode_globals {
     float scale_log2;
     // `q_heads / kv_heads`, at most `MAX_GROUP`.
     int hr;
+    // The sliding window `W`, a multiple of 64; 0 for every key.
+    int window;
 };
 
 constexpr size_t SMEM_TILES = sizeof(q_tile) + CONSUMER_WARPGROUPS * sizeof(k_tile) +
@@ -161,6 +178,7 @@ static_assert(SMEM_TILES == 172032, "q + 2 K + 2 V tiles of [64, 256] bf16, and 
 constexpr int DECODE_SMEM_BYTES = int(SMEM_TILES) + 1024;
 static_assert(DECODE_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "fits the H100's 227 KiB");
 
+template <bool WINDOWED>
 __global__ __launch_bounds__(NUM_THREADS, 1) void attn_decode_bf16_ker(
     const __grid_constant__ decode_globals g) {
     extern __shared__ int __shm[];
@@ -183,6 +201,13 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_decode_bf16_ker(
     const int kv_head = blockIdx.x;
     const int kv_len = g.sequence[{0, 0, 0, 0}] + g.sequence[{0, 0, 0, 1}];
     const int kv_iters = (kv_len + KV_HEIGHT - 1) / KV_HEIGHT;
+    // The window's first key and the tile holding it: 0 and 0 without a window.
+    [[maybe_unused]] int key_first = 0;
+    int kv_first = 0;
+    if constexpr (WINDOWED) {
+        key_first = max(0, kv_len - g.window);
+        kv_first = key_first / KV_HEIGHT;
+    }
 
     __shared__ kittens::semaphore q_arrived, k_smem_arrived[CONSUMER_WARPGROUPS],
         v_smem_arrived[CONSUMER_WARPGROUPS], compute_done[CONSUMER_WARPGROUPS];
@@ -201,14 +226,15 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_decode_bf16_ker(
     __syncthreads();
 
     if (warpgroupid == NUM_WARPGROUPS - 1) {
-        // The producer: one warp loads KV tile `j` into warpgroup `j % 2`'s buffer, after that
-        // warpgroup released its previous tile `j - 2`.
+        // The producer: one warp loads KV tile `j`, the loop's `t`-th, into warpgroup `t % 2`'s
+        // buffer, after that warpgroup released its previous tile, the loop's `t - 2`-th.
         warpgroup::decrease_registers<24>();
         if (warpid == NUM_WARPS - 4) {
-            for (int j = 0; j < kv_iters; j++) {
-                const int w = j % CONSUMER_WARPGROUPS;
-                if (j >= CONSUMER_WARPGROUPS) {
-                    wait(compute_done[w], ((j - CONSUMER_WARPGROUPS) / CONSUMER_WARPGROUPS) % 2);
+            for (int j = kv_first; j < kv_iters; j++) {
+                const int t = j - kv_first;
+                const int w = t % CONSUMER_WARPGROUPS;
+                if (t >= CONSUMER_WARPGROUPS) {
+                    wait(compute_done[w], ((t - CONSUMER_WARPGROUPS) / CONSUMER_WARPGROUPS) % 2);
                 }
                 const int block = g.block_table[{0, 0, 0, j}];
                 coord<k_tile> at = {block, kv_head, 0, 0};
@@ -235,8 +261,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_decode_bf16_ker(
         wait(q_arrived, 0);
 
         const int w = warpgroupid;
-        for (int j = w; j < kv_iters; j += CONSUMER_WARPGROUPS) {
-            const int phase = (j / CONSUMER_WARPGROUPS) % 2;
+        for (int j = kv_first + w; j < kv_iters; j += CONSUMER_WARPGROUPS) {
+            // The loop's `t`-th tile, in the phase the producer loaded it with.
+            const int t = j - kv_first;
+            const int phase = (t / CONSUMER_WARPGROUPS) % 2;
             wait(k_smem_arrived[w], phase);
             warpgroup::mm_ABt(att_block, q_smem[0], k_smem[w]);
 
@@ -247,9 +275,13 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_decode_bf16_ker(
             warpgroup::mma_async_wait();
 
             // Keys k0 .. k0 + 64 of tile j: drop key ≥ kv_len. No causal mask, as the one query
-            // is the last key's position.
+            // is the last key's position. Window: drop key < lo (`left_fill` returns at once for
+            // `lo − k0 ≤ 0`, every tile but j0).
             const int k0 = j * KV_HEIGHT;
             warp::right_fill(att_block, att_block, kv_len - k0, NEG_INF);
+            if constexpr (WINDOWED) {
+                warp::left_fill(att_block, att_block, key_first - k0, NEG_INF);
+            }
 
             warp::row_max(max_vec, att_block, max_vec);
             warp::mul(att_block, att_block, g.scale_log2);
@@ -343,14 +375,19 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_decode_bf16_ker(
 
 }  // namespace
 
-// The kernel's one-time setup: allow it `DECODE_SMEM_BYTES` of dynamic shared memory on the
-// current device (the default limit is 48 KB). Run once per device before any launch
+// The kernel's one-time setup: allow both instantiations `DECODE_SMEM_BYTES` of dynamic shared
+// memory on the current device (the default limit is 48 KB). Run once per device before any launch
 // (`kernels::prepare_all`, called by `CudaDevice::open`), never per launch.
 //
-// 0 = done; any other value = the cudaError_t of setting the attribute.
+// 0 = done; any other value = the cudaError_t of setting the attribute, the unwindowed one's first.
 extern "C" int scratchy_cuda_attn_decode_bf16_prepare(void) {
+    const cudaError_t full = cudaFuncSetAttribute(
+        attn_decode_bf16_ker<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, DECODE_SMEM_BYTES);
+    if (full != cudaSuccess) {
+        return static_cast<int>(full);
+    }
     return static_cast<int>(cudaFuncSetAttribute(
-        attn_decode_bf16_ker, cudaFuncAttributeMaxDynamicSharedMemorySize, DECODE_SMEM_BYTES));
+        attn_decode_bf16_ker<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, DECODE_SMEM_BYTES));
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
@@ -361,7 +398,8 @@ extern "C" int scratchy_cuda_attn_decode_bf16_prepare(void) {
 // Refused before any pointer is touched: `head_dim` not 256; `q_heads` or `kv_heads` zero, or
 // `q_heads` not a multiple of `kv_heads`; `q_heads / kv_heads` above 16
 // (`step::ATTN_DECODE_BF16_MAX_GROUP`); `block_size` not 64; `num_blocks` zero; `scale` not finite
-// or not above 0; a dimension above INT_MAX.
+// or not above 0; `window` not a multiple of 64 (`step::ATTN_WINDOW_MULTIPLE`; 0, every key, is
+// one); a dimension or the window above INT_MAX.
 //
 // `q` and `out` must be 16-byte-aligned device pointers to `q_heads · 256` bf16 (one row), `out`
 // overlapping no input; `k_cache` and `v_cache` to one layer's `num_blocks · kv_heads · 64 · 256`
@@ -374,12 +412,13 @@ extern "C" int scratchy_cuda_attn_decode_bf16(const void* q, const void* k_cache
                                               const void* sequence, void* out, uint32_t q_heads,
                                               uint32_t kv_heads, uint32_t head_dim,
                                               uint32_t block_size, uint32_t num_blocks,
-                                              float scale,
+                                              float scale, uint32_t window,
                                               void* stream /* cudaStream_t; null = default */) {
     if (head_dim != uint32_t(HEAD_DIM) || q_heads == 0 || kv_heads == 0 ||
         q_heads % kv_heads != 0 || q_heads / kv_heads > uint32_t(MAX_GROUP) ||
         block_size != BLOCK_SIZE || num_blocks == 0 || !std::isfinite(scale) || !(scale > 0.0f) ||
-        q_heads > uint32_t(INT_MAX) || num_blocks > uint32_t(INT_MAX)) {
+        window % BLOCK_SIZE != 0 || q_heads > uint32_t(INT_MAX) || num_blocks > uint32_t(INT_MAX) ||
+        window > uint32_t(INT_MAX)) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
@@ -402,10 +441,12 @@ extern "C" int scratchy_cuda_attn_decode_bf16(const void* q, const void* k_cache
                     size_t(MAX_BLOCKS_PER_SEQ)};
         index_gl sg{static_cast<int*>(const_cast<void*>(sequence)), nullptr, nullptr, size_t(1),
                     size_t(2)};
-        decode_globals G{qg, kg, vg, og, tg, sg, scale * LOG2E, int(q_heads / kv_heads)};
+        decode_globals G{qg, kg, vg, og, tg, sg, scale * LOG2E, int(q_heads / kv_heads),
+                         int(window)};
         void* args[] = {&G};
         const dim3 grid(kv_heads), block(NUM_THREADS);
-        return static_cast<int>(cudaLaunchKernel(attn_decode_bf16_ker, grid, block, args,
+        auto* ker = window == 0 ? attn_decode_bf16_ker<false> : attn_decode_bf16_ker<true>;
+        return static_cast<int>(cudaLaunchKernel(ker, grid, block, args,
                                                  DECODE_SMEM_BYTES,
                                                  static_cast<cudaStream_t>(stream)));
     } catch (...) {

@@ -175,6 +175,7 @@ unsafe extern "C" {
         block_size: u32,
         num_blocks: u32,
         scale: f32,
+        window: u32,
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_gemm_narrow_bf16_abt_prepare() -> i32;
@@ -231,6 +232,7 @@ unsafe extern "C" {
         block_size: u32,
         num_blocks: u32,
         scale: f32,
+        window: u32,
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_gdn_conv1d(
@@ -394,7 +396,7 @@ pub enum KernelError {
         head_dim: u32,
         block_size: u32,
     },
-    /// The prefill attention does not take this shape or scale; nothing was launched.
+    /// The prefill attention does not take this shape, scale or window; nothing was launched.
     AttnShape {
         rows: u32,
         q_heads: u32,
@@ -407,7 +409,7 @@ pub enum KernelError {
     NarrowShape { m: u32, n: u32, k: u32 },
     /// The GEMV does not take this shape; nothing was launched.
     GemvShape { n: u32, k: u32 },
-    /// The decode attention does not take this shape or scale; nothing was launched.
+    /// The decode attention does not take this shape, scale or window; nothing was launched.
     AttnDecodeShape {
         q_heads: u32,
         kv_heads: u32,
@@ -498,7 +500,7 @@ impl fmt::Display for KernelError {
                 f,
                 "prefill attention refused shape rows={rows} q_heads={q_heads} \
                  kv_heads={kv_heads} head_dim={head_dim} block_size={block_size} \
-                 num_blocks={num_blocks}, or its scale"
+                 num_blocks={num_blocks}, or its scale or window"
             ),
             KernelError::NarrowShape { m, n, k } => {
                 write!(f, "narrow GEMM refused shape m={m} n={n} k={k}")
@@ -513,7 +515,8 @@ impl fmt::Display for KernelError {
             } => write!(
                 f,
                 "decode attention refused shape q_heads={q_heads} kv_heads={kv_heads} \
-                 head_dim={head_dim} block_size={block_size} num_blocks={num_blocks}, or its scale"
+                 head_dim={head_dim} block_size={block_size} num_blocks={num_blocks}, or its scale \
+                 or window"
             ),
             KernelError::GdnConvShape {
                 rows,
@@ -848,10 +851,10 @@ pub unsafe fn soft_cap_bf16(
 /// Asynchronous.
 ///
 /// Refused with [`KernelError::RopeShape`], before any pointer is touched, unless `rows`, `cols`
-/// and `head_dim` are non-zero, `rot_dim` is 64 (`step::ROPE_BF16_KERNEL_ROT_DIM`, the one width
-/// the kernel is instantiated for), `head_dim` a multiple of 64
-/// (`step::ROPE_BF16_KERNEL_HEAD_MULTIPLE`), `cols` a multiple of `head_dim`, and `rows · cols`
-/// at most `i32::MAX`. A failed launch returns the launch's own `cudaError_t`.
+/// and `head_dim` are non-zero, `rot_dim` is 64 or 256 (`step::ROPE_BF16_KERNEL_ROT_DIMS`, the
+/// widths the kernel is instantiated for), `head_dim` a multiple of 64
+/// (`step::ROPE_BF16_KERNEL_HEAD_MULTIPLE`) and of `rot_dim`, `cols` a multiple of `head_dim`, and
+/// `rows · cols` at most `i32::MAX`. A failed launch returns the launch's own `cudaError_t`.
 ///
 /// # Safety
 ///
@@ -1018,7 +1021,8 @@ pub unsafe fn kv_append_bf16(
 /// paged `k_cache` and `v_cache` (`[num_blocks, kv_heads, 64, 256]`) into `out`, the keys read
 /// through `block_table`, `P` and `L` read from `sequence`: query row `i` attends to keys `0 ..=
 /// P + i` below `P + L`, query head `g` to kv head `g / (q_heads / kv_heads)`, the softmax scaled
-/// by `scale`. Asynchronous.
+/// by `scale`. Asynchronous. The full causal attention: [`attn_prefill_windowed_bf16`] at a
+/// window of 0, with its contract.
 ///
 /// Refused with [`KernelError::AttnShape`], before any pointer is touched, unless `head_dim` is
 /// 256 (`step::ATTN_PREFILL_BF16_HEAD_DIM`), `rows` a non-zero multiple of 128
@@ -1044,8 +1048,44 @@ pub unsafe fn attn_prefill_bf16(
     scale: f32,
     stream: *mut c_void,
 ) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the contract above, which is the windowed launch's.
+    unsafe {
+        attn_prefill_windowed_bf16(
+            (q, out),
+            (k_cache, v_cache),
+            (block_table, sequence),
+            (rows, q_heads, kv_heads, head_dim),
+            (block_size, num_blocks),
+            (scale, 0),
+            stream,
+        )
+    }
+}
+
+/// [`attn_prefill_bf16`] under a sliding window: query row `i` also drops the keys `j ≤ P + i −
+/// window`, so it sees its own key and the `window − 1` before it (Gemma 4's sliding layers,
+/// `window` 1024); `window` 0 is the full causal attention, the same launch. The KV tiles wholly
+/// below every row's window in a CTA are never read, so the blocks there may hold anything.
+/// Asynchronous.
+///
+/// Refused with [`KernelError::AttnShape`] as [`attn_prefill_bf16`], and also unless `window` is
+/// a multiple of 64 (`step::ATTN_WINDOW_MULTIPLE`).
+///
+/// # Safety
+///
+/// As [`attn_prefill_bf16`]'s, but `block_table` need only name valid blocks from the window's
+/// first tile on: an entry below it is never read.
+pub unsafe fn attn_prefill_windowed_bf16(
+    (q, out): (*const c_void, *mut c_void),
+    (k_cache, v_cache): (*const c_void, *const c_void),
+    (block_table, sequence): (*const c_void, *const c_void),
+    (rows, q_heads, kv_heads, head_dim): (u32, u32, u32, u32),
+    (block_size, num_blocks): (u32, u32),
+    (scale, window): (f32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
     // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
-    // shape and scale before it touches a pointer and catches every C++ exception.
+    // shape, scale and window before it touches a pointer and catches every C++ exception.
     let code = unsafe {
         scratchy_cuda_attn_prefill_bf16(
             q,
@@ -1061,6 +1101,7 @@ pub unsafe fn attn_prefill_bf16(
             block_size,
             num_blocks,
             scale,
+            window,
             stream,
         )
     };
@@ -1226,7 +1267,8 @@ pub unsafe fn tma_box_probe_store(
 /// `0 .. P + L` read through `block_table`, `P` and `L` read from `sequence`; query head `g` reads
 /// kv head `g / (q_heads / kv_heads)`, the softmax scaled by `scale`. Whole 64-slot blocks are
 /// loaded; the slots at or past `P + L` are neutralised before use (their scores set to −inf,
-/// their V rows zeroed), so no unwritten slot reaches the output. Asynchronous.
+/// their V rows zeroed), so no unwritten slot reaches the output. Asynchronous. Every key:
+/// [`attn_decode_windowed_bf16`] at a window of 0, with its contract.
 ///
 /// Refused with [`KernelError::AttnDecodeShape`], before any pointer is touched, unless
 /// `head_dim` is 256 (`step::ATTN_DECODE_BF16_HEAD_DIM`), `q_heads` and `kv_heads` non-zero with
@@ -1250,8 +1292,43 @@ pub unsafe fn attn_decode_bf16(
     scale: f32,
     stream: *mut c_void,
 ) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the contract above, which is the windowed launch's.
+    unsafe {
+        attn_decode_windowed_bf16(
+            (q, out),
+            (k_cache, v_cache),
+            (block_table, sequence),
+            (q_heads, kv_heads, head_dim),
+            (block_size, num_blocks),
+            (scale, 0),
+            stream,
+        )
+    }
+}
+
+/// [`attn_decode_bf16`] under a sliding window: the one query, at `P + L − 1`, sees only the keys
+/// from `max(0, P + L − window)` on (Gemma 4's sliding layers, `window` 1024); `window` 0 is every
+/// key, the same launch. The KV tiles wholly below the window are never read, so the blocks there
+/// may hold anything. Asynchronous.
+///
+/// Refused with [`KernelError::AttnDecodeShape`] as [`attn_decode_bf16`], and also unless
+/// `window` is a multiple of 64 (`step::ATTN_WINDOW_MULTIPLE`).
+///
+/// # Safety
+///
+/// As [`attn_decode_bf16`]'s, but `block_table` need only name valid blocks from the window's
+/// first tile on: an entry below it is never read.
+pub unsafe fn attn_decode_windowed_bf16(
+    (q, out): (*const c_void, *mut c_void),
+    (k_cache, v_cache): (*const c_void, *const c_void),
+    (block_table, sequence): (*const c_void, *const c_void),
+    (q_heads, kv_heads, head_dim): (u32, u32, u32),
+    (block_size, num_blocks): (u32, u32),
+    (scale, window): (f32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
     // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
-    // shape and scale before it touches a pointer.
+    // shape, scale and window before it touches a pointer.
     let code = unsafe {
         scratchy_cuda_attn_decode_bf16(
             q,
@@ -1266,6 +1343,7 @@ pub unsafe fn attn_decode_bf16(
             block_size,
             num_blocks,
             scale,
+            window,
             stream,
         )
     };

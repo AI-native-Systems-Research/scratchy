@@ -9,7 +9,10 @@
 //
 // over the allowed keys j ≤ P + i and j < kv_len = P + L, where `P` (the cached prefix length)
 // and `L` (this forward's real rows) are read from the `sequence` region, and `hr = q_heads /
-// kv_heads` is the GQA group: query head h reads kv head h / hr.
+// kv_heads` is the GQA group: query head h reads kv head h / hr. A sliding window `W` (Gemma 4's
+// sliding layers, W = 1024; 0 for full causal attention, every qwen layer) also drops the keys
+// j ≤ P + i − W: query row i sees its own key and the W − 1 before it (HF's `q − k < W`, metal's
+// `attention.metal`).
 //
 // Adapted from ThunderKittens `kernels/attention/mha_h100/mha_h100.cu` `fwd_attend_ker` at
 // 67845f5f (MIT, see `thunderkittens/LICENSE`). Kept from upstream: the producer/consumer
@@ -56,6 +59,25 @@
 //     loop.
 //   - Upstream's harness, causal template flag and the backward kernels are dropped, and so is
 //     its `warp::add(att_block, att_block, 0.f)` before the bf16 copy, which changes no value.
+//   - The sliding window (none upstream): a windowed launch also masks each warp tile with
+//     `warp::triu`, which keeps key ≥ P + row − (W − 1) per element, and starts the KV loop at
+//     the tile holding the CTA's lowest window floor, `max(0, P + row_first − (W − 1)) / 64`: the
+//     tiles below it are wholly outside every row's window, so they are never loaded, and a block
+//     there may hold anything. The producer and the consumers both start at that tile and count
+//     each stage's semaphore phase from it, so every tile the consumers wait for is one the
+//     producer loaded. A later warp's first tile can still be wholly below its own rows' floors
+//     (they sit up to 112 rows past the CTA's first): its scores are all −inf, `row_max` gives
+//     −inf, and `sub_row` would form `−inf − (−inf) = NaN`. So a windowed launch maps the scaled
+//     max through `neg_inf_to_zero` (`scratchy_ops.cuh`) first: such a tile's p is
+//     `exp2(−inf − 0) = 0` exactly, `rescale_exact1(−inf, −inf)` is exactly 1, and its `o`, `l`
+//     and `m` stay 0, 0 and −inf, until the warp's first allowed tile rescales them by
+//     `exp2(−inf) = 0`. A padding row at least W − 1 rows past the last key sees no key at all,
+//     so its sum is 0; a windowed launch maps it through `zero_to_one` before `div_row`, so the
+//     row is `0 / 1 = +0`, finite as a causal padding row is. The kernel is instantiated twice,
+//     `WINDOWED` false and true, and the launcher picks by `W != 0`: the three windowed steps and
+//     the loop's start are `if constexpr (WINDOWED)`, so the `W = 0` instantiation (every qwen
+//     launch) is today's kernel, its loop starting at tile 0 with today's operations in today's
+//     order, and its bits are unchanged.
 //
 // Shared memory: 196,608 bytes of tiles plus 1,024 bytes of alignment slack (the swizzled TMA
 // tiles need 1024-byte alignment) = 197,632 bytes of dynamic shared memory, set once by
@@ -128,6 +150,8 @@ struct attn_globals {
     float scale_log2;
     // `q_heads / kv_heads`.
     int hr;
+    // The sliding window `W`, a multiple of 64; 0 for full causal attention.
+    int window;
 };
 
 constexpr size_t SMEM_TILES =
@@ -137,6 +161,7 @@ static_assert(SMEM_TILES == 196608, "2 q + 2 K + 2 V tiles of [64, 256] bf16");
 constexpr int ATTN_SMEM_BYTES = int(SMEM_TILES) + 1024;
 static_assert(ATTN_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "fits the H100's 227 KiB");
 
+template <bool WINDOWED>
 __global__ __launch_bounds__(NUM_THREADS, 1) void attn_prefill_bf16_ker(
     const __grid_constant__ attn_globals g) {
     extern __shared__ int __shm[];
@@ -159,6 +184,14 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_prefill_bf16_ker(
     const int row_last = blockIdx.x * CTA_ROWS + CTA_ROWS - 1;
     const int key_last = min(prefix_len + row_last, kv_len - 1);
     const int kv_iters = key_last / KV_HEIGHT + 1;
+    // The first tile the loop reads: 0 for full causal attention; with a window, the tile of the
+    // CTA's lowest window floor (its first row's). It may be at or past `kv_iters` for a CTA of
+    // padding rows far past the last key, whose loop is then empty.
+    int kv_first = 0;
+    if constexpr (WINDOWED) {
+        const int row_first = blockIdx.x * CTA_ROWS;
+        kv_first = max(0, prefix_len + row_first - (g.window - 1)) / KV_HEIGHT;
+    }
 
     __shared__ kittens::semaphore q_arrived, k_smem_arrived[STAGES], v_smem_arrived[STAGES],
         compute_done[STAGES];
@@ -179,14 +212,15 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_prefill_bf16_ker(
     __syncthreads();
 
     if (warpgroupid == NUM_WARPGROUPS - 1) {
-        // The producer: one warp loads KV tile `j` into stage `j % STAGES`, after the consumers
-        // released that stage's previous tile `j - STAGES`.
+        // The producer: one warp loads KV tile `j`, the loop's `t`-th, into stage `t % STAGES`,
+        // after the consumers released that stage's previous tile, the loop's `t - STAGES`-th.
         warpgroup::decrease_registers<24>();
         if (warpid == NUM_WARPS - 4) {
-            for (int j = 0; j < kv_iters; j++) {
-                const int stage = j % STAGES;
-                if (j >= STAGES) {
-                    wait(compute_done[stage], ((j - STAGES) / STAGES) % 2);
+            for (int j = kv_first; j < kv_iters; j++) {
+                const int t = j - kv_first;
+                const int stage = t % STAGES;
+                if (t >= STAGES) {
+                    wait(compute_done[stage], ((t - STAGES) / STAGES) % 2);
                 }
                 const int block = g.block_table[{0, 0, 0, j}];
                 coord<k_tile> at = {block, kv_head, 0, 0};
@@ -215,8 +249,10 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_prefill_bf16_ker(
 
         wait(q_arrived, 0);
 
-        for (int j = 0; j < kv_iters; j++) {
-            const int stage = j % STAGES, phase = (j / STAGES) % 2;
+        for (int j = kv_first; j < kv_iters; j++) {
+            // The loop's `t`-th tile, in the stage and phase the producer loaded it with.
+            const int t = j - kv_first;
+            const int stage = t % STAGES, phase = (t / STAGES) % 2;
             wait(k_smem_arrived[stage], phase);
             warpgroup::mm_ABt(att_block, q_smem[warpgroupid], k_smem[stage]);
 
@@ -231,10 +267,20 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_prefill_bf16_ker(
             const int k0 = j * KV_HEIGHT;
             warp::tril(att_block, att_block, prefix_len + row0 - k0, NEG_INF);
             warp::right_fill(att_block, att_block, kv_len - k0, NEG_INF);
+            // Window: keep key ≥ P + row − (W − 1) (`triu` keeps col ≥ row + diagonal).
+            if constexpr (WINDOWED) {
+                warp::triu(att_block, att_block, prefix_len + row0 - k0 - (g.window - 1), NEG_INF);
+            }
 
             warp::row_max(max_vec, att_block, max_vec);
             warp::mul(att_block, att_block, g.scale_log2);
             warp::mul(max_vec_scaled, max_vec, g.scale_log2);
+            // A tile wholly outside a row's window leaves its max −inf: subtract 0 instead, so
+            // its p is exactly 0, never `exp2(−inf − (−inf)) = NaN`. A register vector, so
+            // `unary_op`, not the tile map `unary_map`.
+            if constexpr (WINDOWED) {
+                warp::unary_op<scratchy::ops::neg_inf_to_zero>(max_vec_scaled, max_vec_scaled);
+            }
             warp::sub_row(att_block, att_block, max_vec_scaled);
             warp::exp2(att_block, att_block);
             // The rescale of the running sum and output, before this tile is accumulated into
@@ -276,6 +322,11 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_prefill_bf16_ker(
             }
         }
 
+        // A windowed padding row with no key in its window has a sum of 0 and an output of 0:
+        // divide it by 1, not 0.
+        if constexpr (WINDOWED) {
+            warp::unary_op<scratchy::ops::zero_to_one>(norm_vec, norm_vec);
+        }
         warp::div_row(o_reg, o_reg, norm_vec);
         // O over this warpgroup's own q tile, which no later load reuses.
         warpgroup::store(o_smem[warpgroupid], o_reg);
@@ -290,14 +341,19 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void attn_prefill_bf16_ker(
 
 }  // namespace
 
-// The kernel's one-time setup: allow it `ATTN_SMEM_BYTES` of dynamic shared memory on the current
-// device (the default limit is 48 KB). Run once per device before any launch
+// The kernel's one-time setup: allow both instantiations `ATTN_SMEM_BYTES` of dynamic shared
+// memory on the current device (the default limit is 48 KB). Run once per device before any launch
 // (`kernels::prepare_all`, called by `CudaDevice::open`), never per launch.
 //
-// 0 = done; any other value = the cudaError_t of setting the attribute.
+// 0 = done; any other value = the cudaError_t of setting the attribute, the unwindowed one's first.
 extern "C" int scratchy_cuda_attn_prefill_bf16_prepare(void) {
+    const cudaError_t causal = cudaFuncSetAttribute(
+        attn_prefill_bf16_ker<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, ATTN_SMEM_BYTES);
+    if (causal != cudaSuccess) {
+        return static_cast<int>(causal);
+    }
     return static_cast<int>(cudaFuncSetAttribute(
-        attn_prefill_bf16_ker, cudaFuncAttributeMaxDynamicSharedMemorySize, ATTN_SMEM_BYTES));
+        attn_prefill_bf16_ker<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, ATTN_SMEM_BYTES));
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
@@ -307,7 +363,9 @@ extern "C" int scratchy_cuda_attn_prefill_bf16_prepare(void) {
 //
 // Refused before any pointer is touched: `head_dim` not 256; `rows` zero or not a multiple of 128;
 // `q_heads` or `kv_heads` zero, or `q_heads` not a multiple of `kv_heads`; `block_size` not 64;
-// `num_blocks` zero; `scale` not finite or not above 0; a dimension above INT_MAX.
+// `num_blocks` zero; `scale` not finite or not above 0; `window` not a multiple of 64
+// (`step::ATTN_WINDOW_MULTIPLE`; 0, full causal attention, is one); a dimension or the window
+// above INT_MAX.
 //
 // `q` and `out` must be 16-byte-aligned device pointers to `rows · q_heads · 256` bf16, `out`
 // overlapping no input; `k_cache` and `v_cache` to one layer's `num_blocks · kv_heads · 64 · 256`
@@ -320,12 +378,13 @@ extern "C" int scratchy_cuda_attn_prefill_bf16(const void* q, const void* k_cach
                                                const void* sequence, void* out, uint32_t rows,
                                                uint32_t q_heads, uint32_t kv_heads,
                                                uint32_t head_dim, uint32_t block_size,
-                                               uint32_t num_blocks, float scale,
+                                               uint32_t num_blocks, float scale, uint32_t window,
                                                void* stream /* cudaStream_t; null = default */) {
     if (head_dim != uint32_t(HEAD_DIM) || rows == 0 || rows % uint32_t(CTA_ROWS) != 0 ||
         q_heads == 0 || kv_heads == 0 || q_heads % kv_heads != 0 || block_size != BLOCK_SIZE ||
         num_blocks == 0 || !std::isfinite(scale) || !(scale > 0.0f) ||
-        rows > uint32_t(INT_MAX) || q_heads > uint32_t(INT_MAX) || num_blocks > uint32_t(INT_MAX)) {
+        window % BLOCK_SIZE != 0 || rows > uint32_t(INT_MAX) || q_heads > uint32_t(INT_MAX) ||
+        num_blocks > uint32_t(INT_MAX) || window > uint32_t(INT_MAX)) {
         return SCRATCHY_CUDA_ERR_SHAPE;
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
@@ -347,10 +406,12 @@ extern "C" int scratchy_cuda_attn_prefill_bf16(const void* q, const void* k_cach
                     size_t(MAX_BLOCKS_PER_SEQ)};
         index_gl sg{static_cast<int*>(const_cast<void*>(sequence)), nullptr, nullptr, size_t(1),
                     size_t(2)};
-        attn_globals G{qg, kg, vg, og, tg, sg, scale * 1.44269504089f, int(q_heads / kv_heads)};
+        attn_globals G{qg, kg, vg, og, tg, sg, scale * 1.44269504089f, int(q_heads / kv_heads),
+                       int(window)};
         void* args[] = {&G};
         const dim3 grid(rows / uint32_t(CTA_ROWS), q_heads, 1), block(NUM_THREADS);
-        return static_cast<int>(cudaLaunchKernel(attn_prefill_bf16_ker, grid, block, args,
+        auto* ker = window == 0 ? attn_prefill_bf16_ker<false> : attn_prefill_bf16_ker<true>;
+        return static_cast<int>(cudaLaunchKernel(ker, grid, block, args,
                                                  ATTN_SMEM_BYTES,
                                                  static_cast<cudaStream_t>(stream)));
     } catch (...) {

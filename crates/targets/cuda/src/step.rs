@@ -339,11 +339,12 @@ pub const ROPE_BF16_ROT_MULTIPLE: u32 = 16;
 /// vectors), and its `cols` a multiple of `head_dim`. `rows` is non-zero and `rows · cols` at most
 /// `i32::MAX`.
 pub const ROPE_BF16_HEAD_MULTIPLE: u32 = 8;
-/// The one `rot_dim` the rope kernel is instantiated for (`kernels/rope_bf16.cu`): one plain
-/// `st_bf<16, 64>` box, each half two 16-column base tiles. Its launcher refuses any other, so the
-/// kernel's rule is tighter than the lowering's [`ROPE_BF16_ROT_MULTIPLE`]; every lowered tape of
-/// the target models has `rot_dim` 64.
-pub const ROPE_BF16_KERNEL_ROT_DIM: u32 = 64;
+/// The `rot_dim`s the rope kernel is instantiated for (`kernels/rope_bf16.cu`): 64, one plain
+/// `st_bf<16, 64>` box, each half two 16-column base tiles (qwen3.5's partial rope); and 256, four
+/// boxes, each half two whole boxes (Gemma 4's sliding layers, a full rope on a 256-lane head). Its
+/// launcher refuses any other, so the kernel's rule is tighter than the lowering's
+/// [`ROPE_BF16_ROT_MULTIPLE`]; Gemma 4's global layers' 128 is #885's 13b-3.
+pub const ROPE_BF16_KERNEL_ROT_DIMS: &[u32] = &[64, 256];
 /// The rope kernel's `head_dim` is a non-zero multiple of this: whole 64-column boxes, so every
 /// head starts at a box (`kernels/rope_bf16.cu`). Tighter than the lowering's
 /// [`ROPE_BF16_HEAD_MULTIPLE`], and checked by the launcher only.
@@ -365,8 +366,8 @@ pub struct RopeBf16 {
     pub cols: u32,
     pub head_dim: u32,
     pub rot_dim: u32,
-    /// Which lane a rotated lane pairs with: `HalfRotated` (the kernel's today), or `HalfHead`
-    /// (Gemma's proportional rope, #885's 13c). `table` is the tape's table of the step's class.
+    /// Which lane a rotated lane pairs with: `HalfRotated` (the kernel's), or `HalfHead`
+    /// (Gemma's proportional rope, #885's 13b-3). `table` is the tape's table of the step's class.
     #[serde(serialize_with = "serialize_rope_pairing")]
     pub pairing: RopePairing,
 }
@@ -479,8 +480,8 @@ pub struct AttnPrefillBf16 {
     /// The kernel folds it into `log2(e)`.
     pub scale_bits: u32,
     /// The keys a query row sees, its last `window` positions (a non-zero multiple of
-    /// [`ATTN_WINDOW_MULTIPLE`]); `None` for full causal attention. The windowed kernels are
-    /// #885's 13c.
+    /// [`ATTN_WINDOW_MULTIPLE`]); `None` for full causal attention. The head-dim-256 kernels take
+    /// it as a launch argument (0 for `None`); the head-dim-512 kernels are #885's 13b-3.
     pub window: Option<u32>,
 }
 
