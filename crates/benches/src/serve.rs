@@ -1819,6 +1819,12 @@ fn task_metrics(
     let thought = (ok.iter())
         .filter(|(r, _)| opens_as_thought(&r.generated_text))
         .count();
+    // Answers that ran to their cap rather than ending on their own. A cell all of whose answers
+    // did is no reading of its accuracy: on one server the same RAG tasks that end at 4 to 162
+    // tokens elsewhere all ran to 256 and scored 0%.
+    let capped = (ok.iter())
+        .filter(|(r, t)| answer_tokens(r) >= t.max_tokens)
+        .count();
     let cached: Vec<f64> = (ok.iter())
         .filter_map(|(r, _)| r.cached_tokens.map(|c| c as f64))
         .collect();
@@ -1849,6 +1855,7 @@ fn task_metrics(
         "mean_cached_tokens": mean(&cached),
         "accuracy": accuracy,
         "thinking_answers": thought,
+        "capped_answers": capped,
     })
 }
 
@@ -2203,6 +2210,7 @@ mod tests {
         assert_eq!(j["task_seed"], 7);
         assert_eq!(j["empty_answers"], 0);
         assert_eq!(j["thinking_answers"], 0);
+        assert_eq!(j["capped_answers"], 0);
         let thinking = vec![answered("We need to answer: what is the capital?", 9, None)];
         let j = task_metrics(&thinking, &tasks[..1], tokenizer, 1.0, "musique", 7);
         assert_eq!(j["thinking_answers"], 1);

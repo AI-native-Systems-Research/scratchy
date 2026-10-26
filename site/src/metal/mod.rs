@@ -11,6 +11,7 @@
 
 mod data;
 mod numbers;
+mod tasks;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -3605,6 +3606,7 @@ fn machine_section(chip: &str, mr: &MachineRuns) -> Element {
                                         } }
                                     }
                                     {summary_table(m, run, prev)}
+                                    {tasks::tasks_table(m)}
                                     {sweep_part(m, run, prev, Sweep::Users)}
                                     {grid_maps(m, &mid, run)}
                                     {request_plots(m, &mid, run)}
