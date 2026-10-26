@@ -415,6 +415,31 @@ A run whose validity checks fail prints them and exits non-zero. That is
 intentional: a FROZEN rep that faulted no more than COLD did not measure a frozen
 start, and reporting it would be worse than reporting nothing.
 
+### Dataset cells and the grid: what each sends
+
+The matrix's real-dataset cells (`--scale-axes tasks`, its default sweep) and its diagnostic grid
+(`--random`) send their requests stacked: each users count's users send the next request the
+moment their last answer returns (`--max-concurrency N`), as every cell always has.
+
+- **The grid's prompts are natural text, not random token IDs.** Each prompt is a slice of exactly
+  its length of real text (`bench serve --dataset-name natural`: the ShareGPT file's human turns,
+  cut at seeded offsets, the same prompts on every engine). Random token IDs route a
+  mixture-of-experts model's experts unlike any real prompt, and three of the small set's four
+  models are MoE. A slice that comes out short is extended from the corpus, never padded with
+  random IDs.
+- **Comparable answers.** A timed dataset cell forces every answer to its task's length
+  (`bench serve --timed-answers`: `ignore_eos`), the same on every engine: a RAG task's 64
+  tokens, a conversation turn's recorded reply, a shared-prefix question's 32. Answers ending on
+  their own are each engine's own length, so their total time is not like for like. Accuracy is
+  therefore not scored on timed cells; `--full`'s `rag-accuracy` cell scores it, its answers
+  running free. A span query (`rag-spans`, scratchy's own row) cannot be forced: its answers end on
+  their own, so its total time is scratchy's alone and is not compared.
+- **Recorded:** per request, its send time (`start_times` for a dataset cell, `start_s` for a grid
+  request, seconds from the cell's start), TTFT and end-to-end time. Stacked users fall into
+  lockstep: an engine that batches finishes its users together and gets them back as a burst
+  every round. The send times show it, so an arrival's effect can be told from an engine's from
+  the run file alone.
+
 ### Multi-turn prefix-reuse cells
 
 `scr bench serve --dataset-name multi-turn` runs closed-loop conversations: each
