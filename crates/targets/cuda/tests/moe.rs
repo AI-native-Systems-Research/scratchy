@@ -13,6 +13,7 @@ pub mod common {
 
 use common::numerics::{bf16_inputs, bits, mismatched_bits};
 use half::bf16;
+use scratchy_target_cuda::kernels::gemma_route_bf16;
 use scratchy_target_cuda::kernels::{
     KernelError, SortRegions, expert_gemm_bf16, expert_gemv_bf16, gate_scale_bf16, gemm_bf16_abt,
     gemv_bf16_abt, moe_combine_bf16, moe_route_bf16, moe_sort,
@@ -1160,6 +1161,365 @@ fn the_moe_kernel_times_are_recorded() {
         eprintln!(
             "expert_gemm_bf16 time m={m} n={INTER} k={HIDDEN}: median={med:.1}us min={min:.1}us \
              (not asserted)"
+        );
+    }
+}
+
+// ── Gemma 4's routing (#921): top-8 of the raw logits at 128 experts ───
+
+/// Gemma 4 26B-A4B's expert count and its hidden size, whose `^-0.5` scales the picks.
+const GEMMA_EXPERTS: usize = 128;
+const GEMMA_HIDDEN: f32 = 2816.0;
+
+fn gemma_scale() -> f32 {
+    GEMMA_HIDDEN.powf(-0.5)
+}
+
+/// Run Gemma's routing of `logits` (`[m, 128]` bf16) with the per-expert scale `pes` (`[128]`
+/// bf16); its indices and scores, `[m, TOP_K]` each.
+fn run_gemma_route(
+    device: &CudaDevice,
+    logits: &[u16],
+    pes: &[u16],
+    m: usize,
+    scale: f32,
+) -> (Vec<u32>, Vec<f32>) {
+    let (lb, pb) = (up(device, logits), up(device, pes));
+    let idx = up_u32(device, &vec![u32::MAX; m * TOP_K]);
+    let sc = up_u32(device, &vec![u32::MAX; m * TOP_K]);
+    // SAFETY: cudaMalloc pointers are 256-byte aligned; `logits` holds m·128 bf16, `pes` 128,
+    // `idx` and `sc` m·TOP_K 4-byte values each, both their own allocations; null is the default
+    // stream, which the downloads below wait for.
+    unsafe {
+        gemma_route_bf16(
+            (lb.ptr(), pb.ptr()),
+            (idx.ptr(), sc.ptr()),
+            (m as u32, GEMMA_EXPERTS as u32, TOP_K as u32),
+            scale,
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("gemma route launch");
+    let scores = down_u32(&sc).into_iter().map(f32::from_bits).collect();
+    (down_u32(&idx), scores)
+}
+
+/// Which factors a Gemma routing reference applies: the `× scale` and the `× pes`, each switched
+/// off by a self-check.
+#[derive(Clone, Copy)]
+struct GemmaRef {
+    scaled: bool,
+    expert_scaled: bool,
+}
+
+const GEMMA_FULL: GemmaRef = GemmaRef {
+    scaled: true,
+    expert_scaled: true,
+};
+
+/// One row's f64 Gemma routing: the top-8 of the raw logits (the higher index first on a tie),
+/// stored ascending, and their scores `softmax(scale · logit)` over the 8 times `pes[e]`.
+fn gemma_route_reference(
+    row: &[u16],
+    pes: &[u16],
+    scale: f64,
+    r: GemmaRef,
+) -> (Vec<u32>, Vec<f64>) {
+    let x: Vec<f64> = row.iter().map(|&b| f(b)).collect();
+    let mut order: Vec<usize> = (0..GEMMA_EXPERTS).collect();
+    order.sort_by(|&a, &b| x[b].total_cmp(&x[a]).then(b.cmp(&a)));
+    let picks = &order[..TOP_K];
+    let s: Vec<f64> = (picks.iter())
+        .map(|&i| x[i] * if r.scaled { scale } else { 1.0 })
+        .collect();
+    let mx = s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let e: Vec<f64> = s.iter().map(|v| (v - mx).exp()).collect();
+    let total: f64 = e.iter().sum();
+    let sc: Vec<f64> = (picks.iter().zip(&e))
+        .map(|(&i, v)| v / total * if r.expert_scaled { f(pes[i]) } else { 1.0 })
+        .collect();
+    (
+        picks.iter().rev().map(|&i| i as u32).collect(),
+        sc.into_iter().rev().collect(),
+    )
+}
+
+/// The Gemma routing's f32 yardstick on the host: the same formula in f32, its worst absolute
+/// score error against f64 over every row.
+fn gemma_route_yardstick(logits: &[u16], pes: &[u16], m: usize, scale: f32) -> f64 {
+    let mut worst = 0.0f64;
+    for t in 0..m {
+        let row = &logits[t * GEMMA_EXPERTS..][..GEMMA_EXPERTS];
+        let (idx, want) = gemma_route_reference(row, pes, f64::from(scale), GEMMA_FULL);
+        let s: Vec<f32> = (idx.iter())
+            .map(|&i| bf16::from_bits(row[i as usize]).to_f32() * scale)
+            .collect();
+        let mx = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let e: Vec<f32> = s.iter().map(|v| (v - mx).exp()).collect();
+        let total: f32 = e.iter().sum();
+        for (k, &i) in idx.iter().enumerate() {
+            let got = e[k] / total * bf16::from_bits(pes[i as usize]).to_f32();
+            worst = worst.max((f64::from(got) - want[k]).abs());
+        }
+    }
+    worst
+}
+
+/// Random positive per-expert scales in [0.5, 2].
+fn gemma_pes(seed: u64) -> Vec<u16> {
+    (bf16_inputs(GEMMA_EXPERTS, seed).into_iter())
+        .map(|b| bits(1.25 + 0.75 * bf16::from_bits(b).to_f32()))
+        .collect()
+}
+
+/// Rows of `[m, 128]` whose scores leave `r`'s bound: the self-checks' count.
+fn gemma_rows_out_of_bound(
+    logits: &[u16],
+    pes: &[u16],
+    (idx, sc): (&[u32], &[f32]),
+    (m, scale, bound): (usize, f64, f64),
+    r: GemmaRef,
+) -> (usize, usize) {
+    let (mut idx_off, mut sc_off) = (0usize, 0usize);
+    for t in 0..m {
+        let (want_i, want_s) =
+            gemma_route_reference(&logits[t * GEMMA_EXPERTS..][..GEMMA_EXPERTS], pes, scale, r);
+        idx_off += usize::from(idx[t * TOP_K..][..TOP_K] != want_i[..]);
+        sc_off += usize::from((0..TOP_K).any(|k| {
+            let err = (f64::from(sc[t * TOP_K + k]) - want_s[k]).abs();
+            err.is_nan() || err > bound
+        }));
+    }
+    (idx_off, sc_off)
+}
+
+/// Gemma's routing at m ∈ {1, 512, 4096} on random logits in [-4, 4] and per-expert scales in
+/// [0.5, 2]: indices equal to the f64 routing's on every row (the picks see exact inputs: no
+/// near-tie exemption), scores within `4 × yardstick + 2⁻³⁰`; a repeat bit-identical. The
+/// self-checks: the reference without `× scale`, and the one without `× pes`, each out of bound on
+/// at least 90% of rows.
+#[test]
+fn gemma_route_bf16_matches_the_f64_routing() {
+    let device = h100();
+    let mut pass = true;
+    let scale = gemma_scale();
+    for m in [1usize, 512, 4096] {
+        let logits: Vec<u16> = (bf16_inputs(m * GEMMA_EXPERTS, 0x6E3A_0000 ^ m as u64).into_iter())
+            .map(|b| bits(bf16::from_bits(b).to_f32() * 4.0))
+            .collect();
+        let pes = gemma_pes(0x6E3A_FFFF ^ m as u64);
+        let yard = gemma_route_yardstick(&logits, &pes, m, scale);
+        let bound = 4.0 * yard + 2f64.powi(-30);
+        let (idx, sc) = run_gemma_route(&device, &logits, &pes, m, scale);
+        let s64 = f64::from(scale);
+        let (idx_off, sc_off) =
+            gemma_rows_out_of_bound(&logits, &pes, (&idx, &sc), (m, s64, bound), GEMMA_FULL);
+        let again = run_gemma_route(&device, &logits, &pes, m, scale);
+        let rep = usize::from(again.0 != idx)
+            + usize::from((again.1.iter().map(|x| x.to_bits())).ne(sc.iter().map(|x| x.to_bits())));
+        let ok = idx_off == 0 && sc_off == 0 && rep == 0;
+        eprintln!(
+            "gemma moe_route_bf16 m={m}: rows_with_other_picks={idx_off} \
+             rows_scores_out_of_bound={sc_off} yardstick_max_err={yard:.3e} \
+             repeat_differing={rep} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+        if m == 512 {
+            for (what, r) in [
+                (
+                    "no × scale",
+                    GemmaRef {
+                        scaled: false,
+                        expert_scaled: true,
+                    },
+                ),
+                (
+                    "no × pes",
+                    GemmaRef {
+                        scaled: true,
+                        expert_scaled: false,
+                    },
+                ),
+            ] {
+                let (_, off) =
+                    gemma_rows_out_of_bound(&logits, &pes, (&idx, &sc), (m, s64, bound), r);
+                let frac = off as f64 / m as f64;
+                let ok = frac >= 0.9;
+                eprintln!(
+                    "gemma moe_route self-check {what}: rows_out_of_bound_fraction={frac:.4} {}",
+                    verdict(ok)
+                );
+                pass &= ok;
+            }
+        }
+    }
+    assert!(
+        pass,
+        "Gemma's routing differs from the f64 routing: see the lines above"
+    );
+}
+
+/// Gemma's routing's exact cases, one row each: (a) exact ties at the 8/9 boundary, experts 10,
+/// 20, 30, 40 at one logit and 100..=106 at a higher one: picks 100..=106 and the highest of the
+/// tied, 40; (b) all-equal logits: picks 120..=127, every score `pes[e] / 8`; (c) all-NaN logits:
+/// 8 distinct indices in `0..128`, every score NaN; (d) a per-expert scale of exactly 1.0 gives
+/// the bits of the softmax alone (host f32). Then the refusals: an expert count not 128 or 256,
+/// top_k 0 or 33, m 0, a null per-expert scale; nothing written.
+#[test]
+fn gemma_route_bf16_ties_nan_and_unit_scale() {
+    let device = h100();
+    let scale = gemma_scale();
+    let row = |set: &dyn Fn(usize) -> f32| -> Vec<u16> {
+        (0..GEMMA_EXPERTS).map(|e| bits(set(e))).collect()
+    };
+    let pes = gemma_pes(0x6E3A_07E5);
+    let mut pass = true;
+    let ties = row(&|e| match e {
+        100..=106 => 2.0,
+        10 | 20 | 30 | 40 => 1.0,
+        _ => -3.0,
+    });
+    let (i, _) = run_gemma_route(&device, &ties, &pes, 1, scale);
+    let want: Vec<u32> = vec![40, 100, 101, 102, 103, 104, 105, 106];
+    let ok = i == want;
+    eprintln!(
+        "gemma moe_route exact ties: picks={i:?} want={want:?} {}",
+        verdict(ok)
+    );
+    pass &= ok;
+    let (i, s) = run_gemma_route(&device, &row(&|_| 0.5), &pes, 1, scale);
+    let picks_ok = i == (120..128).collect::<Vec<u32>>();
+    let scores_ok =
+        (i.iter().zip(&s)).all(|(&e, &x)| x == bf16::from_bits(pes[e as usize]).to_f32() / 8.0);
+    let ok = picks_ok && scores_ok;
+    eprintln!(
+        "gemma moe_route all equal: picks={i:?} scores={s:?} pes_over_8={scores_ok} {}",
+        verdict(ok)
+    );
+    pass &= ok;
+    let (i, s) = run_gemma_route(&device, &vec![0x7FC0; GEMMA_EXPERTS], &pes, 1, scale);
+    let distinct: std::collections::BTreeSet<u32> = i.iter().copied().collect();
+    let in_range = distinct.len() == TOP_K && i.iter().all(|&x| x < GEMMA_EXPERTS as u32);
+    let ok = in_range && s.iter().all(|x| x.is_nan());
+    eprintln!(
+        "gemma moe_route all NaN: picks={i:?} distinct_in_range={in_range} scores_nan={} {}",
+        s.iter().all(|x| x.is_nan()),
+        verdict(ok)
+    );
+    pass &= ok;
+    // (d) unit per-expert scale: the bits of the host f32 softmax over the scaled picks, with the
+    // kernel's order (subtract the max, exp, sum ascending by expert index, divide).
+    let logits: Vec<u16> = (bf16_inputs(GEMMA_EXPERTS, 0x6E3A_000D).into_iter())
+        .map(|b| bits(bf16::from_bits(b).to_f32() * 4.0))
+        .collect();
+    let ones = vec![bits(1.0); GEMMA_EXPERTS];
+    let (i, s) = run_gemma_route(&device, &logits, &ones, 1, scale);
+    let (want_i, _) = gemma_route_reference(&logits, &ones, f64::from(scale), GEMMA_FULL);
+    let mut asc = want_i.clone();
+    asc.sort_unstable();
+    let z: Vec<f32> = (asc.iter())
+        .map(|&e| bf16::from_bits(logits[e as usize]).to_f32() * scale)
+        .collect();
+    let mx = z.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let e: Vec<f32> = z.iter().map(|v| (v - mx).exp()).collect();
+    let total: f32 = e.iter().sum();
+    let host: Vec<f32> = (want_i.iter())
+        .map(|w| e[asc.iter().position(|a| a == w).expect("a pick")] / total)
+        .collect();
+    let close = (s.iter().zip(&host)).all(|(a, b)| (a - b).abs() <= 4.0 * f32::EPSILON);
+    // Bit-exact: a scale of 2.0 doubles every score exactly, so halving it gives the unit run's
+    // bits, which are the softmax's alone (a multiply by exactly 1.0 changes nothing).
+    let twos = vec![bits(2.0); GEMMA_EXPERTS];
+    let (_, s2) = run_gemma_route(&device, &logits, &twos, 1, scale);
+    let halved_equal = (s2.iter().map(|x| (x / 2.0).to_bits())).eq(s.iter().map(|x| x.to_bits()));
+    eprintln!(
+        "gemma moe_route unit pes: pes=2 halved mismatched_bits={} {}",
+        usize::from(!halved_equal),
+        verdict(halved_equal)
+    );
+    pass &= halved_equal;
+    let ok = i == want_i && close;
+    eprintln!(
+        "gemma moe_route unit pes: picks_equal={} gpu={s:?} host_f32={host:?} within_4_ulp={close} \
+         bits_equal={} {}",
+        i == want_i,
+        s.iter()
+            .map(|x| x.to_bits())
+            .eq(host.iter().map(|x| x.to_bits())),
+        verdict(ok)
+    );
+    pass &= ok;
+    for (m, e, k, null_pes) in [
+        (4u32, 64u32, 8u32, false),
+        (4, 128, 0, false),
+        (4, 128, 33, false),
+        (0, 128, 8, false),
+        (4, 128, 8, true),
+    ] {
+        let lb = up(&device, &vec![0; 4 * 256]);
+        let pb = up(&device, &vec![0; 256]);
+        let out = up_u32(&device, &vec![u32::MAX; 4 * 33]);
+        let pes_ptr = if null_pes {
+            std::ptr::null()
+        } else {
+            pb.ptr().cast_const()
+        };
+        // SAFETY: the launcher refuses these shapes before it touches any pointer.
+        let got = unsafe {
+            gemma_route_bf16(
+                (lb.ptr(), pes_ptr),
+                (out.ptr(), out.ptr()),
+                (m, e, k),
+                scale,
+                std::ptr::null_mut(),
+            )
+        };
+        let kept = down_u32(&out).iter().all(|&x| x == u32::MAX);
+        let want = Err(KernelError::MoeShape {
+            kernel: "moe_route_bf16",
+            dims: [m, e, k, 1],
+        });
+        let ok = got == want && kept;
+        eprintln!(
+            "gemma moe_route refusal m={m} experts={e} top_k={k} null_pes={null_pes}: {got:?} \
+             out_unchanged={kept} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(
+        pass,
+        "a Gemma routing exact case failed: see the lines above"
+    );
+}
+
+#[test]
+fn gemma_route_kernel_times_are_recorded() {
+    let device = h100();
+    let pes = up(&device, &gemma_pes(0x6E3A_0071));
+    for m in [1usize, 4096] {
+        let logits = up(&device, &bf16_inputs(m * GEMMA_EXPERTS, 0x6E3A_0072));
+        let idx = up_u32(&device, &vec![0; m * TOP_K]);
+        let sc = up_u32(&device, &vec![0; m * TOP_K]);
+        let (med, min) = median_us(
+            // SAFETY: as `run_gemma_route`'s.
+            || {
+                unsafe {
+                    gemma_route_bf16(
+                        (logits.ptr(), pes.ptr()),
+                        (idx.ptr(), sc.ptr()),
+                        (m as u32, GEMMA_EXPERTS as u32, TOP_K as u32),
+                        gemma_scale(),
+                        std::ptr::null_mut(),
+                    )
+                }
+                .expect("gemma route")
+            },
+            || drop(sc.download()),
+        );
+        eprintln!(
+            "gemma moe_route_bf16 time m={m}: median={med:.1}us min={min:.1}us (not asserted)"
         );
     }
 }
