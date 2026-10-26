@@ -3066,6 +3066,7 @@ mod production_ktir_dump {
     const RMSNORM: &str = include_str!("../../../targets/spyre/kernels/rmsnorm.py");
     const RMSNORMUNIT: &str = include_str!("../../../targets/spyre/kernels/rmsnormunit.py");
     const ROPE: &str = include_str!("../../../targets/spyre/kernels/rope.py");
+    const SAMPLE: &str = include_str!("../../../targets/spyre/kernels/sample_fwd.py");
     const SCALARMUL: &str = include_str!("../../../targets/spyre/kernels/scalarmul.py");
     const SCALARWMUL: &str = include_str!("../../../targets/spyre/kernels/scalarwmul.py");
     const SILUMUL: &str = include_str!("../../../targets/spyre/kernels/silumul.py");
@@ -3537,7 +3538,216 @@ mod production_ktir_dump {
             ),
             vec![1],
         ));
+        // ── sample_fwd.py: the token draw at solo and batched grids — the sampler this
+        // proof guards, and the ONE kernel the grid-[B] fix is allowed to move. The
+        // spec mirrors the `SubOp::Sample` arm of `kernel_spec`'s registry row: the
+        // logits row, its per-row noise and temperature reciprocal, the nine staged
+        // tables, and the `[B, 64]` idx stick out. ──
+        {
+            let sample_ptrs: &[(&str, &str)] = &[
+                ("logits_ptr", "*fp16"),
+                ("noise_ptr", "*fp32"),
+                ("invt_ptr", "*fp32"),
+                ("bramp_ptr", "*fp32"),
+                ("lramp_ptr", "*fp32"),
+                ("binc_ptr", "*fp32"),
+                ("linc_ptr", "*fp32"),
+                ("ones_ptr", "*fp32"),
+                ("sixtyfour_ptr", "*fp32"),
+                ("padoff_ptr", "*fp32"),
+                ("gramp_ptr", "*fp32"),
+                ("ginc_ptr", "*fp32"),
+                ("idx_ptr", "*i32"),
+            ];
+            for (name, b, grid) in [
+                ("sample_fwd_b1", 1i128, vec![1i64]),
+                ("sample_fwd_b2", 2, vec![2]),
+                ("sample_fwd_b32", 32, vec![32]),
+            ] {
+                v.push((
+                    name,
+                    SAMPLE,
+                    spec(
+                        "sample_fwd.py",
+                        "sample_fwd",
+                        sample_ptrs,
+                        &[
+                            ("V", Val::Int(49155)),
+                            ("PAD_V", Val::Int(65536)),
+                            ("NB", Val::Int(1024)),
+                            ("BLOCK", Val::Int(64)),
+                            ("B", Val::Int(b)),
+                        ],
+                    ),
+                    grid,
+                ));
+            }
+        }
         v
+    }
+
+    /// The `Program` each dumped kernel's registry row states — the same fact
+    /// `TritonKernelRow::Spliced { program }` (or the attention/MoE producers) carries,
+    /// restated here because the entries table is keyed by kernel name.
+    /// ⛔ NO `_` ARM: a new entry without a program here is a panic naming it, never a
+    /// silent skip — the no-silent-skip law, applied to the dump driver itself.
+    fn program_of(name: &str) -> Program {
+        match name {
+            "rmsnorm_fwd" | "rmsnorm_oneplus_fwd" => Program::RmsNorm,
+            "matmul_fwd" | "matmul_fp8_fwd" => Program::Matmul,
+            "add_fwd" => Program::Elementwise(Elementwise::Add),
+            "mul_fwd" => Program::Elementwise(Elementwise::Mul),
+            "sub_fwd" => Program::Elementwise(Elementwise::Sub),
+            "silu_fwd" => Program::Elementwise(Elementwise::Silu),
+            "gelu_fwd" => Program::Elementwise(Elementwise::Gelu),
+            "silumul_fwd" => Program::SiluMul,
+            "scalarmul_fwd" => Program::ScalarMul,
+            "tanhsoftcap_fwd" => Program::TanhSoftCap,
+            "rmsnormunit_fwd" => Program::RmsNormUnit,
+            "scalarwmul_fwd" => Program::ScalarWeightMul,
+            "reshape_fwd" => Program::Reshape,
+            "lmlast_fwd" => Program::LmLast,
+            "windowedrmsnorm_gained_fwd" | "windowedrmsnorm_oneplus_fwd" => {
+                Program::WindowedRmsNorm { unit: false }
+            }
+            "windowedrmsnorm_unit_fwd" => Program::WindowedRmsNorm { unit: true },
+            "sample_fwd_b1" | "sample_fwd_b2" | "sample_fwd_b32" => Program::Sample,
+            other => panic!(
+                "`{other}` is in the dump table but `program_of` states no Program for it — \
+                 a dumped kernel with no program is a silent skip of the SDSC leg, which the \
+                 no-silent-skip law refuses. Add the row."
+            ),
+        }
+    }
+
+    /// The kernels whose SDSC this driver CANNOT emit, each for a stated reason — a
+    /// NAMED skip, never a silent one. Everything else must lower or the dump fails.
+    fn sdsc_skip_of(name: &str) -> Option<&'static str> {
+        match name {
+            // The geometry const door: `rope_at::<HD>` / `attn_at::<NQH, NKVH, HD>`
+            // monomorphise on head geometry the driver would have to state from the
+            // fixture's constexprs (`bake_py`'s rope arm) plus the bundle attention
+            // facts no single-kernel driver holds. The KTIR-text leg still covers them.
+            "rope_fwd" => Some("the model-geometry const door (rope_at::<HD>)"),
+            "attn_decode" | "attn_one_pass" | "attn_continuation" => {
+                Some("the model-geometry const door (attn_at::<NQH, NKVH, HD>)")
+            }
+            // No `Program` variant exists and none is inventable here: the MoE lowers
+            // only from `kernels/moe.py` through KTIR, and no per-op row names a
+            // program for it. Stating one in a dump driver would be routing invented
+            // outside the registry.
+            "moe_fwd" | "moe_prefill_fwd" => Some("no Program variant — the MoE has no door row"),
+            _ => None,
+        }
+    }
+
+    /// One emitted op as STABLE TEXT for the byte-identity diff: `wire::SdscOp` derives
+    /// `Serialize` (the wire format's own serializer — deterministic maps, no Debug
+    /// float spelling), and every non-serializable field rides as its `Debug` string.
+    /// `ktir` is dropped on purpose: it is the program the op CARRIES, not bytes the
+    /// device consumes, and the `.ktir` file beside this one already pins it.
+    fn sdsc_line(op: &ktir_superdsc::emit::EmittedOp) -> String {
+        let mut obj = serde_json::Map::new();
+        obj.insert("op_name".into(), serde_json::json!(op.op_name));
+        obj.insert(
+            "op".into(),
+            match &op.op {
+                Some(o) => serde_json::to_value(o)
+                    .unwrap_or_else(|e| panic!("serialize {}: {e}", op.op_name)),
+                // `None` is the answer for a KTIR op, not an empty descriptor.
+                None => serde_json::Value::Null,
+            },
+        );
+        obj.insert("arg_bindings".into(), serde_json::json!(format!("{:?}", op.arg_bindings)));
+        obj.insert("time".into(), serde_json::json!(op.time));
+        obj.insert(
+            "affine_strides".into(),
+            serde_json::json!(format!("{:?}", op.affine_strides)),
+        );
+        obj.insert("slot_stride_bytes".into(), serde_json::json!(op.slot_stride_bytes));
+        obj.insert("slab_write".into(), serde_json::json!(op.slab_write));
+        obj.insert(
+            "slab_stride_bytes".into(),
+            serde_json::json!(op.slab_stride_bytes),
+        );
+        serde_json::Value::Object(obj).to_string()
+    }
+
+    /// Emit one dumped kernel's SDSC through the SAME dispatch the production door
+    /// (`scratchy-target-spyre`'s `ktir_superdsc_door::lower`) states, arm for arm:
+    /// the pointwise kinds, the matmuls, the sampler and LmLast through
+    /// `whole_function::lower_function`; the leaf kinds through their own
+    /// `lower_ktir_to_superdsc` bodies; the column-window guard on exactly the kinds
+    /// the door wraps it around. This crate cannot call that door (the dependency runs
+    /// the other way — the target crate depends on the splice), so the arms are
+    /// mirrored here and the mirror is the dump's own cited limitation.
+    fn emit_sdsc(name: &str, node: &KtirNode) -> Result<Vec<String>, String> {
+        use ktir_superdsc::emit::lower_ktir_to_superdsc as lk;
+        use ktir_superdsc::emit::whole_function::lower_function;
+
+        let lk_name = node.func.name;
+        let regions =
+            lk::regions(node).map_err(|e| format!("{name}: regions: {e:?}"))?;
+        let layout = triton_ktir_superdsc::layout::for_regions(node, &regions)
+            .map_err(|e| format!("{name}: layout: {e}"))?;
+        let windowed = |ops: Result<Vec<ktir_superdsc::emit::EmittedOp>, lk::Error>| {
+            let ops = ops.map_err(|e| format!("{name}: {e:?}"))?;
+            lk::column_windows_are_honoured(lk_name, &regions, &ops)
+                .map_err(|e| format!("{name}: {e:?}"))?;
+            Ok::<_, String>(ops)
+        };
+        let mut sym = 0i64;
+        let ops = match program_of(name) {
+            // The door's `windowed(...)`-wrapped whole-function kinds.
+            Program::Elementwise(_)
+            | Program::SiluMul
+            | Program::RmsNorm
+            | Program::ScalarMul
+            | Program::Sample => windowed(lower_function(node, Some(&layout), &mut sym, None)),
+            // The door's unwrapped whole-function kinds.
+            Program::Matmul | Program::LmLast => Ok(lower_function(
+                node,
+                Some(&layout),
+                &mut sym,
+                None,
+            )
+            .map_err(|e| format!("{name}: {e:?}"))?),
+            Program::RmsNormUnit => {
+                windowed(lk::rmsnorm_unit(lk_name, node, &regions, &mut sym, Some(&layout)))
+            }
+            Program::TanhSoftCap => {
+                windowed(lk::tanhsoftcap(lk_name, node, &regions, &mut sym, Some(&layout)))
+            }
+            Program::ScalarWeightMul => {
+                windowed(lk::scalarweightmul(lk_name, &regions, &mut sym, Some(&layout)))
+            }
+            Program::Reshape => Ok(lk::reshape(lk_name, &regions, &mut sym, Some(&layout))
+                .map_err(|e| format!("{name}: {e:?}"))?),
+            Program::WindowedRmsNorm { .. } => Ok(lk::windowed_rmsnorm(
+                lk_name,
+                node,
+                &regions,
+                &mut sym,
+                Some(&layout),
+            )
+            .map_err(|e| format!("{name}: {e:?}"))?),
+            // `program_of` states none of these and `sdsc_skip_of` names the ones that
+            // reach this far — a geometry-door or MoE name here means the two tables
+            // disagree, which is a defect in the driver, not a skip.
+            other => {
+                return Err(format!(
+                    "`{name}` states {other:?}, which the dump's door mirror has no arm for — \
+                     `sdsc_skip_of` must name it or `program_of` must not state it"
+                ));
+            }
+        }?;
+        if ops.is_empty() {
+            return Err(format!(
+                "`{name}` emitted ZERO ops — a dump of nothing proves nothing (the \
+                 no-silent-skip law, applied to the SDSC leg)"
+            ));
+        }
+        Ok(ops.iter().map(sdsc_line).collect())
     }
 
     #[test]
@@ -3560,6 +3770,31 @@ mod production_ktir_dump {
             std::fs::write(&path, &text)
                 .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
             eprintln!("dumped {name} -> {} ({} lines)", path.display(), text.lines().count());
+
+            // THE SDSC LEG — the emitted-descriptor half of the same proof: the grid-[B]
+            // fix changes `Region`/`windowed_region`/the mint, so the byte-identity bar
+            // applies to what the doors EMIT, not only to the module text. Same law:
+            // the diff of two runs is the proof; a named skip (`sdsc_skip_of`) is the
+            // only kernel without an `.sdsc.jsonl`, and every other kernel must lower.
+            match sdsc_skip_of(name) {
+                Some(reason) => {
+                    eprintln!("SDSC-SKIP {name}: {reason}");
+                }
+                None => {
+                    let node = triton_ktir_superdsc::node_for(&module, program_of(name))
+                        .unwrap_or_else(|e| panic!("`{name}` did not mint a node: {e}"));
+                    let lines = emit_sdsc(name, &node)
+                        .unwrap_or_else(|e| panic!("`{name}` did not emit SDSC: {e}"));
+                    let sdsc_path = dir.join(format!("{name}.sdsc.jsonl"));
+                    std::fs::write(&sdsc_path, format!("{}\n", lines.join("\n")))
+                        .unwrap_or_else(|e| panic!("write {}: {e}", sdsc_path.display()));
+                    eprintln!(
+                        "dumped {name} -> {} ({} ops)",
+                        sdsc_path.display(),
+                        lines.len()
+                    );
+                }
+            }
         }
     }
 }
