@@ -229,17 +229,23 @@ bimodal ITL distribution in this repo for a week
    the question. For them no prompt choice helps, so where the two answers'
    text differs the gate asks the reference to judge (`--parity-score-cmd`,
    `scripts/parity_ties.py`): mlx-lm runs one forward over the prompt and
-   scratchy's own answer token ids, teacher-forced, and at each token takes
-   its logit gap from its own top to the token scratchy picked. A prompt
-   passes as a near-tie when every such gap is at most `TIE_LOGITS` (1.0) and
-   at most `MAX_TIES` (4) tokens differ. Teacher-forcing goes on comparing past
-   a split instead of ending at it, so a defect after a tie is still caught.
-   On the M3 Pro the measured ties sit at 0.0–0.75, every other token is the
-   reference's top, and the same answer with its ids shifted by one is 28.1
-   logits behind on 34 of its 35 later tokens. The gap is the reference's,
-   not scratchy's: it says whether a correct model is undecided at that
-   token, which is the question a tie asks. The run records each tie's gaps
-   as `parity_ties`, and the page says the model matched up to near-ties.
+   scratchy's own answer token ids, teacher-forced, and scores the whole
+   answer as its mean log-probability per token, next to mlx-lm's own greedy
+   answer of the same length. A prompt passes when scratchy's answer scores
+   within `SCORE_NATS` (0.5) nats a token of the reference's. A correct
+   stack that broke a near-tie differently writes text the reference finds
+   about as likely as its own; a wrong computation writes text it finds far
+   less likely at nearly every token. On granite-4.2-3b's count answer (base
+   M5) the reference's own answer scores -0.079 a token, scratchy's under
+   TurboQuant 4-bit KV -0.141 — 0.06 below, though one of its thought
+   tokens sits 1.5 logits behind the reference's top, which the earlier
+   per-token bar (1.0 logits, at most 4 such tokens) failed although a
+   no-TurboQuant build matches mlx-lm byte for byte — and the same answer
+   with its ids shifted by one -12.17, 12.1 below. Judging the whole answer
+   keeps one drifted near-tie from failing an exact load path, and still
+   fails a defect by a factor of twenty. Each token where the two part is
+   still printed, with its logit gap, and the run records them as
+   `parity_ties`; the page says the model matched up to near-ties.
    Where no token differs at all, scratchy's answer is the reference's own
    greedy answer and the prompt passes as `OK`: the text differs only in how
    the two print it (mlx_lm.generate shows gpt-oss's `<|channel|>` tokens,
