@@ -102,23 +102,6 @@ impl Session {
         Ok(Self { exec })
     }
 
-    /// ⭐ [`new_multi`](Self::new_multi) WITH A SHAPE FLOOR — the tape's own
-    /// tensor-shape statement (element counts keyed by tensor id), which the
-    /// executor's sticks allocate at LEAST. For callers that hold the graph the
-    /// programs were lowered from: a widened reader whose view sits on an
-    /// interior edge of a fused function is invisible to the view walk, and the
-    /// floor is what keeps its tensor's stick large enough. Callers without the
-    /// graph keep [`new_multi`](Self::new_multi) and the view walk unchanged.
-    pub fn new_multi_floored(
-        programs: Vec<(&[IRFunction<'static>], &ProgramSpec)>,
-        weights: Vec<(u64, Arg)>,
-        shape_floor: &std::collections::HashMap<u64, usize>,
-    ) -> Result<Self, String> {
-        let mut exec = crate::resident::ResidentExecutor::new_multi_floored(programs, shape_floor)?;
-        exec.set_sources_owned(weights)?;
-        Ok(Self { exec })
-    }
-
     /// Overwrite source tensors in resident HBM (the per-pass input / mask).
     /// Sources you don't pass keep their resident bytes — so weights stay put.
     pub fn set_sources(&mut self, args: &[(u64, Arg)]) -> Result<(), String> {

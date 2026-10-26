@@ -12,9 +12,7 @@
 #[cfg(feature = "spyre-hw")]
 use scratchy_subtile::sdsc_abstract::{PoolPartition, SlotCount};
 // The KTIR-emulator twin below (mask/rope pad-row clamping) — the card's twin shares the laws
-// through `ChunkRows` already. Emu-only: under `spyre-hw` no host pick exists, so the host
-// argmax has no caller.
-#[cfg(not(feature = "spyre-hw"))]
+// through `ChunkRows` already.
 use scratchy_target_spyre::manifest::argmax;
 #[cfg(not(feature = "spyre-hw"))]
 use std::num::NonZeroU32;
@@ -385,13 +383,8 @@ pub(crate) fn run_prefill_batch(
     // A decode batch rung is the same tape baked at `B` rows, addressed by FINGERPRINT rather than
     // through a wiring, so `Wirings.decode` describes every rung's tensor ids but only the
     // single-request graph's ROW COUNT. The batched caller passes the rung's own `seqs` as `prefill_m`
-    // and `model.decode.last()`'s wiring for the ids — correct ONLY BELOW THE MINT BOUNDARY: ids
-    // under the original `num_sources` are shared facts of the tape, but ids at or above it are
-    // GRAPH-LOCAL, and the argmax mint's spliced tables shift every one-request op output up past
-    // that line — so on a minted model the wiring's `result_id` (the re-pointed argmax stick)
-    // names nothing in an unminted rung's layout, and the PerRequest logits read takes its tid
-    // from the rung's own `SegRole::Logits` stamp (`LogitsGeom::place`), never from this wiring.
-    // For the ROW COUNT the wiring then answers 1 for a launch that is legitimately `B` rows wide.
+    // and `model.decode.last()`'s wiring for the ids — correct, because it is the same tape — and the
+    // wiring then answers 1 for a launch that is legitimately `B` rows wide.
     //
     // Before the KTIR unification the wiring slot was last-write-wins and, because rungs bake
     // ASCENDING, it happened to hold the WIDEST rung's wiring — so this check passed by accident.
@@ -556,13 +549,7 @@ pub(crate) fn run_prefill_batch(
             //
             // Gated because a per-step D2H of this buffer is not free. `read_tensor` yields f32 from the
             // device's f16, so compare against the staged bytes reinterpreted the same way.
-            // ⭐ THE RUNG'S OWN STAMPED TID, never `b.result_id`: on a minted model the borrowed
-            // meta's result is the ONE-REQUEST graph's re-pointed argmax stick, which this
-            // unminted rung's layout does not place — "unknown tensor t…", every batched step
-            // (the #813 sweep regression). The stamp rides WITH the geometry (`LogitsGeom::place`)
-            // so the read and the de-interleave below address one tensor by one authority —
-            // see `StampedLogits` for the mint boundary.
-            let name = geom.place.0;
+            let name = scratchy_target_spyre::bundle_code::PlaceId::Act((b.result_id) as u32);
             // TIMED, because `predict`'s own phase timer CANNOT see this. Moving the logits readback
             // out of `predict` (the shim converts one row, so it cannot serve a batch) also moved it
             // outside `logits_d2h`, which is why that column reads 0.00 for a batched decode while
@@ -938,22 +925,12 @@ fn chunk_index_table(
     })
 }
 
-/// ⭐ WHAT ONE CHUNK'S FORWARD PRODUCED — either the per-row logits the host
-/// sampler reads, or the already-picked token. One enum (not a bare
-/// `Vec<Vec<f32>>`) because the shape is a fact of the
+/// ⭐ WHAT ONE CHUNK'S FORWARD PRODUCED — the per-row logits the host sampler
+/// reads. One enum (not a bare `Vec<Vec<f32>>`) because the shape is a fact of the
 /// step the caller must not be able to confuse with the model's other outs.
 pub(crate) enum ChunkOut {
     /// Per-row logits, the last row last — the host sampler's input.
     Rows(Vec<Vec<f32>>),
-    /// ⭐ THE DEVICE ALREADY PICKED — the rung's result is an INDEX stick (its
-    /// wiring's `result_dtype` is an integer; the device argmax's `[1, 64]` idx
-    /// today): the step left the result on the device, read it back RAW at its
-    /// own dtype, and the host's row-argmax is replaced by the stick's first
-    /// word. Keyed on the result's dtype, never on the op's name — a second
-    /// kernel with an index result rides the same branch. The row it was
-    /// picked from stays placed and readable by tid (the wiring doc's greedy
-    /// contract); only the ANSWER moved.
-    Picked(u32),
 }
 
 #[cfg(feature = "spyre-hw")]
@@ -1328,26 +1305,12 @@ pub(crate) fn superdsc_forward_chunk(
                     // page), and its `KV_BLOCK_INDEX` placement is the chunk ceiling's.
                     step.gathers(),
                     chunk_start,
-                    // ⛔ NO LOGITS READBACK UNDER HW: the folded tail's row used to
-                    // come back for the HOST to argmax (token 1 of every request).
-                    // Under hw the pick is the re-pick rung step
-                    // (`run_request_step`'s completion arm), so every chunk — final
-                    // included — discards its logits. EMU keeps the final chunk's
-                    // LastRow: its sampler still picks on the host, and an empty
-                    // hand at completion would argmax nothing.
-                    {
-                        #[cfg(not(feature = "spyre-hw"))]
-                        {
-                            if is_prompt_final_chunk {
-                                LogitsWanted::LastRow
-                            } else {
-                                LogitsWanted::None
-                            }
-                        }
-                        #[cfg(feature = "spyre-hw")]
-                        {
-                            LogitsWanted::None
-                        }
+                    // A prompt's tail is FOLDED to one row by the emitter, so there is one row to
+                    // read however many rows this chunk ran at.
+                    if is_prompt_final_chunk {
+                        LogitsWanted::LastRow
+                    } else {
+                        LogitsWanted::None
                     },
                 )?;
                 // UNCONDITIONAL truth-signal per chunk: `chunk_len` prompt tokens went through ONE
@@ -1435,18 +1398,12 @@ pub(crate) fn superdsc_forward_chunk(
             // straight to the sampler. A mid-prompt wave asks for no logits (see
             // `is_prompt_final_chunk`), so an empty hand with the prompt unfinished is the
             // expected shape — `run_request_step`'s sample guard returns before reading it.
-            // ⛔ UNDER HW AN EMPTY HAND AT COMPLETION IS ALSO THE EXPECTED SHAPE: no readback
-            // exists, so the pick is the re-pick rung step's (`run_request_step`'s completion
-            // arm), not a row this loop owes anyone. EMU still reads its LastRow back, so an
-            // empty hand at completion there means the loop never ran — impossible under
-            // `n > 1`, but refuse loudly rather than fall through to a decode path that would
-            // now re-forward zero tokens.
+            // `None` with the prompt DONE means the loop never ran — impossible under `n > 1`,
+            // but refuse loudly rather than fall through to a decode path that would now
+            // re-forward zero tokens.
             let row = match prefill_logits {
                 Some(row) => row,
                 None if tok_end < tokens.prompt_len(id) => return Ok(ChunkOut::Rows(Vec::new())),
-                #[cfg(feature = "spyre-hw")]
-                None => return Ok(ChunkOut::Rows(Vec::new())),
-                #[cfg(not(feature = "spyre-hw"))]
                 None => {
                     return Err(werr(format!(
                         "superdsc batched prefill: covered {real_total} tokens but produced no \
@@ -1503,11 +1460,7 @@ pub(crate) fn superdsc_forward_chunk(
     // synthetic F32 selftest can't catch). Match ⇒ conversion magnitude OK → bug is op/perm.
     // Per-position rotary row tiled across heads to a `[1, width]` source.
 
-    // The device-picked token, when this rung's result is an index stick — the
-    // answer re-point's readback seat (see `ChunkOut::Picked`). There is no
-    // other product under hw: a rung whose result is not an index stick is a
-    // defect below, never a row read back for the host to pick.
-    let mut picked: Option<u32> = None;
+    let mut logits_rows: Vec<Vec<f32>> = Vec::with_capacity(n);
     // The step's own timing line, shared by every readback so the step is visible in
     // the same instrument — print-only (`flags().timing`), changes nothing computed.
     let step_timing = |pos: usize, t: std::time::Instant| {
@@ -1703,30 +1656,30 @@ pub(crate) fn superdsc_forward_chunk(
         // INCREMENTAL: write 1 new token at absolute slot `p`; KV stays device-resident.
         let _t_fwd = std::time::Instant::now();
         log_binds(&format!("decode pos={p}"), b.wiring, &acts, &acts_f16);
-        if b.wiring.result_is_index() {
-            // ⭐ THE DEVICE ALREADY PICKED — this rung's result is an index stick
-            // (the device argmax's, admitted by the mint at bake). The step runs
-            // its suffix and leaves the stick on the device — the ~100 KB logits
-            // row D2H the ReadBack path pays every token is replaced by the
-            // stick's own bytes — then the raw read decodes them at the dtype the
-            // kernel's own signature stated. The row stays placed and readable
-            // by tid; only the ANSWER moved.
-            session
-                .run_step_i32(1, p, &acts, &acts_f16, &acts_i32, StepLogits::LeftOnDevice)
-                .map_err(|e| werr(format!("superdsc run_step (pos {p}): {e}")))?;
+        {
+            let logits = session
+                .run_step_i32(1, p, &acts, &acts_f16, &acts_i32, StepLogits::ReadBack)
+                .map_err(|e| werr(format!("superdsc run_step (pos {p}): {e}")))?
+                .unwrap_or_default();
             step_timing(p, _t_fwd);
-            picked = Some(read_picked_token(session, b)?);
-        } else {
-            // ⛔ NO READBACK, NO HOST PICK. This arm used to `StepLogits::ReadBack`
-            // the logits row and hand it to the host sampler — the non-hardware
-            // argmax this codebase no longer contains. A rung reaching here is
-            // unminted: an internal defect (every loaded model's decode rung is
-            // minted), stated loudly, never worked around on the host.
-            return Err(werr(format!(
-                "decode pos {p}: the rung's result is a logits row, not a device pick — an \
-                 unminted decode rung on a loaded model is a bake/loader defect, and the host \
-                 may not pick"
-            )));
+            let row = logits.get(..vocab).unwrap_or(&logits).to_vec();
+            // ── KCACHE PROBE (SCRATCHY_KCACHE_PROBE): read the layer-0 K cache t9 (resident, Kᵀ [nqh,hd,cap])
+            //    and print per-slot K-vector norms for head 0 around the 64-slot STICK BOUNDARY. If slot 64
+            //    (start of stick 1) shows a discontinuity vs 62/63/65, the K WRITE/VALUE at the boundary is
+            //    wrong (the pos-64 divergence); if smooth, the residue is the device READ or fp16 accumulation.
+            // HOST lm_head ORACLE: recompute logits = t787 @ embed.T on the HOST from the
+            // ON-CARD final-norm output (t787) and the tied embedding (= the lm_head weight).
+            //   host_argmax == oncard t788 argmax ⇒ the on-card lm_head is FAITHFUL to t787,
+            //     so the bug is t787 (the residual DIRECTION the body produced);
+            //   host_argmax != oncard ⇒ the on-card (tiled) lm_head matmul itself is wrong.
+            // Also reveals what token the on-card t787 SHOULD produce under a correct lm_head.
+            // ATTENTION HOST ORACLE: verify layer-0 attention VALUES (the per-head fix made it
+            // finite + context-reading but never proved correct). After this step the K/V cache
+            // (t9/t10, natural [nqh,cap,hd], GQA-replicated) holds slots [0..=p] incl. the just-
+            // written new token, so host attention = softmax(q·kᵀ·scale)·v over [0..=p] — no
+            // separate new-token/GQA handling. cos(host, on-card t343)<1 ⇒ attention compute wrong
+            // (restickify/scores/softmax); cos≈1 ⇒ attention right → bug is MLP/accumulation.
+            logits_rows.push(row);
         }
     }
     tokens.set_tokens_in_pool(id, start + n);
@@ -1745,58 +1698,7 @@ pub(crate) fn superdsc_forward_chunk(
     // per-slot L2 norms for the first few slots. Compare BATCHED vs SEQUENTIAL (same prompt): the
     // sequential t9 is the golden KV. If the batched slot-0..(prompt-1) norms differ, the mq>1
     // prefill computed the wrong KV (H3); if they match, the KV is right and the bug is elsewhere.
-    match picked {
-        Some(tok) => Ok(ChunkOut::Picked(tok)),
-        None => Err(werr(
-            "decode: the index-result rung ran no step — the n=0 entry refusal was bypassed"
-                .to_string(),
-        )),
-    }
-}
-
-/// ⭐ READ THE RUNG'S PICKED TOKEN off the result stick — the answer re-point's
-/// readback seat. The stick's bytes come back RAW (no f16 convert: the dtype is
-/// the kernel's own `i32`), sized by the wiring's own shape table at the
-/// result tid, and its FIRST WORD is the picked token. The host `argmax` this
-/// replaces is gone only because the device already ran it — the row it picked
-/// from stays readable by tid.
-#[cfg(feature = "spyre-hw")]
-fn read_picked_token(session: &mut SuperDscSession, b: &BundleMeta) -> ExecutorResult<u32> {
-    let id = scratchy_target_spyre::bundle_code::PlaceId::Act(b.result_id as u32);
-    // The stick's own extent, off the wiring's shape table — the same table the
-    // placement was sized from, so the cap can never disagree with the bake.
-    let (rows, cols) = b.wiring.tensor_shapes[b.result_id];
-    let cap = rows as usize * cols as usize * b.wiring.result_dtype.size_bytes();
-    let bytes = session
-        .read_tensor_raw(id, cap)
-        .map_err(|e| werr(format!("decode: read the picked token {id}: {e}")))?;
-    let word = bytes.get(..4).ok_or_else(|| {
-        werr(format!(
-            "decode: the picked token's stick (t{}) read back {} B — shorter than one \
-             {:?} entry, so there is no token to read",
-            b.result_id,
-            bytes.len(),
-            b.wiring.result_dtype
-        ))
-    })?;
-    let idx = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
-    checked_picked_token(idx, b.wiring.geometry.vocab)
-}
-
-/// ⛔ THE PICKED TOKEN'S OWN GUARD — #666's law, its only class: an idx at or
-/// past the vocab is not a token. The kernel answers an all-NaN row with the
-/// sentinel (one past the padded row), which every real vocab is below, so
-/// this refusal catches exactly that row and nothing else — a legitimate
-/// argmax can never reach it, because the lm-head's own width IS the vocab.
-fn checked_picked_token(idx: u32, vocab: u32) -> ExecutorResult<u32> {
-    if idx >= vocab {
-        return Err(werr(format!(
-            "decode: the device picked token {idx}, at or past the vocab {vocab} — the #666 \
-             all-NaN sentinel (the kernel's own answer for a row that is NaN in every lane). \
-             Refusing rather than serving a token that does not exist."
-        )));
-    }
-    Ok(idx)
+    Ok(ChunkOut::Rows(logits_rows))
 }
 
 /// What a [`forward_chunk`] runs: one request's chunk, the tokens `toks` at absolute positions
@@ -2101,14 +2003,8 @@ pub(crate) fn forward_chunk(
         // one-row decode step had its outputs decoded at the prefill's `m`. The counts are the ones
         // the reads below already slice to — `vocab` of the result, `n * kv_width` of each layer's
         // new K/V (per LAYER: a hybrid arch's layers differ in width).
-        // The result's own readback extent: `vocab` elems of the logits row, or
-        // the stick's own element count when the rung's result is an index (the
-        // answer re-point) — asking the stick for `vocab` elems would claim a
-        // width the bundle never made. A copy out of the wiring (the emulator
-        // path's BundleMeta carries no `wiring` to re-ask).
-        let result_want = b.result_want;
         let wanted: std::collections::HashMap<u64, usize> =
-            std::iter::once((b.result_id as u64, result_want))
+            std::iter::once((b.result_id as u64, vocab))
                 .chain(b.layers.iter().flat_map(|lw| {
                     [
                         (lw.new_k_id as u64, n * lw.kv_width),
@@ -2146,24 +2042,7 @@ pub(crate) fn forward_chunk(
         // chose. It coincided with row 0 only at n == 1, which is why decode looked correct and a
         // prompt that fit ONE chunk looked correct. MEASURED: the result tensor comes back with
         // ~one row of `vocab` nonzeros and every argmax below `vocab`, i.e. in row 0.
-        if b.result_is_index {
-            // The answer re-point's emulator seat: the result tid IS the stick,
-            // decoded by the emulator at its own view dtype — the first word is
-            // the picked token, guarded by the same #666 law the card path
-            // takes (`checked_picked_token`).
-            let Some(&idx) = res.first() else {
-                return Err(werr(format!(
-                    "run_step: the result stick (t{}) read back empty — no picked token",
-                    b.result_id
-                )));
-            };
-            Ok(ChunkOut::Picked(checked_picked_token(
-                idx as u32,
-                vocab as u32,
-            )?))
-        } else {
-            Ok(ChunkOut::Rows(vec![res[..vocab].to_vec()]))
-        }
+        Ok(ChunkOut::Rows(vec![res[..vocab].to_vec()]))
     }
 }
 
@@ -2351,13 +2230,7 @@ pub(crate) fn run_request_step(
     // baseline path while batched mq=N prefill (task #33) is brought up in parallel. Decode (n==1) and
     // non-SuperDSC paths are unaffected; a batched prefill session (prefill.is_some) still takes the
     // fast prefill_m+1 chunk above.
-    #[cfg(not(feature = "spyre-hw"))]
     let mut last: Vec<f32> = Vec::new();
-    // The device-picked token, when the chunk's rung already picked (the answer
-    // re-point): the LAST chunk's pick is the answer, exactly as the emulator's
-    // `last` below holds the last chunk's row. Under `spyre-hw` there is no
-    // other answer: no chunk's row is ever read back for picking.
-    let mut picked: Option<u32> = None;
     let mut pos = start;
     for chunk in toks.chunks(chunk_w) {
         match forward_chunk(
@@ -2377,103 +2250,14 @@ pub(crate) fn run_request_step(
             #[cfg(feature = "spyre-hw")]
             pool,
         )? {
-            ChunkOut::Rows(rows) => {
-                #[cfg(not(feature = "spyre-hw"))]
-                {
-                    last = rows.into_iter().next_back().unwrap_or_default();
-                }
-                #[cfg(feature = "spyre-hw")]
-                let _ = rows;
-            }
-            ChunkOut::Picked(tok) => picked = Some(tok),
+            ChunkOut::Rows(rows) => last = rows.into_iter().next_back().unwrap_or_default(),
         }
         pos += chunk.len();
     }
     let p_last = start + n - 1;
     if p_last + 1 >= tokens.prompt_len(id) {
-        // ⭐ THE PICKED TOKEN — and under `spyre-hw` NOTHING ELSE IS POSSIBLE.
-        // The host argmax that used to sit in this arm is deleted: a chunk that
-        // completes a prompt without a device pick gets ONE more chance, below,
-        // through the minted rung itself — never a host pick.
-        let tok = match picked {
-            Some(tok) => tok,
-            None => {
-                #[cfg(not(feature = "spyre-hw"))]
-                {
-                    argmax(&last) as u32
-                }
-                #[cfg(feature = "spyre-hw")]
-                {
-                    // ⭐ THE LAST PROMPT POSITION, PICKED ON THE DEVICE. The
-                    // batched prefill folds its lm-head tail over the final row
-                    // and used to read that row back for the host to argmax —
-                    // token 1 of every request was a HOST pick. Instead, re-run
-                    // that ONE position as a decode step through the minted m=1
-                    // rung, with the history windowed back one slot: the write
-                    // then lands ON `p_last` (overwriting the prefill's key for
-                    // the same token at the same slot — same slot, same token,
-                    // no double append) and the mask covers exactly [0, p_last).
-                    // Every derivation — write slot, mask validity, the
-                    // post-step record — follows the one windowed number.
-                    if p_last + 1 != tokens.prompt_len(id) {
-                        return Err(werr(
-                            "a decode step completed without a device pick — the rung is \
-                             unminted and the host may not pick"
-                                .to_string(),
-                        ));
-                    }
-                    if req.kv_hist.end().get() != p_last as u32 + 1 {
-                        return Err(werr(format!(
-                            "the re-pick step at position {p_last} needs a history ending \
-                             exactly one past it (ends at {}) — the window law requires the \
-                             contiguous prompt history",
-                            req.kv_hist.end().get()
-                        )));
-                    }
-                    let tok_last = tokens.token_at(id, p_last).ok_or_else(|| {
-                        werr(format!(
-                            "token index {p_last} out of range (have {})",
-                            tokens.token_count(id)
-                        ))
-                    })? as usize;
-                    // THE WINDOW, one slot back: the step below sees [0, p_last)
-                    // as its resident prefix and writes at p_last. The pool
-                    // bookkeeping steps back WITH the window — the step's
-                    // idempotent slot rewrite (same token, same slot) then
-                    // re-appends p_last and restores the count, keeping the
-                    // decode path's "holds exactly `start` positions" law true
-                    // at the call.
-                    req.kv_hist = scratchy_subtile::sdsc_abstract::KvHistory::contiguous(p_last);
-                    tokens.set_tokens_in_pool(id, p_last);
-                    let b_step = select_decode(&model.decode, p_last + 1);
-                    match forward_chunk(
-                        &sh,
-                        &mut model.session,
-                        b_step,
-                        model.batched_prefill.as_ref(),
-                        Chunk {
-                            state: req,
-                            id,
-                            tokens,
-                            start: p_last,
-                            toks: &[tok_last],
-                        },
-                        ctx,
-                        pool,
-                    )? {
-                        ChunkOut::Picked(tok) => tok,
-                        ChunkOut::Rows(_) => {
-                            return Err(werr(
-                                "the re-pick step returned rows, not a device pick — the \
-                                 decode rung's lm-head does not admit the argmax mint and the \
-                                 host may not pick"
-                                    .to_string(),
-                            ));
-                        }
-                    }
-                }
-            }
-        };
+        // The host `argmax` is the sampler.
+        let tok = argmax(&last) as u32;
         // ⭐ THE SAME TOP-2 GAP AS THE BATCHED PATH, so a mixed run's steps are all visible in one log.
         //
         // Without this, `SCRATCHY_TOP2` covered only the batched sampling site — and a step with ONE live

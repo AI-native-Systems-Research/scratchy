@@ -606,18 +606,6 @@ fn opkind(k: &OpKind) -> Result<KOpKind> {
             "arith.cmpf" => KOpKind::ArithCmpf,
             "arith.sitofp" => KOpKind::ArithSitofp,
             "arith.fptosi" => KOpKind::ArithFptosi,
-            "arith.uitofp" => KOpKind::ArithUitofp,
-            // ⭐ RESTORED (#813 review). ab6f7ccc2d cut this arm with the v5 integer-combine
-            // residue because no fixture emitted `arith.subi` any more -- but this arm is not
-            // only the fixture set's: `text::parse` hands the C++'s OWN text through as
-            // `Other`, so any parsed module carrying an integer subtract (index arithmetic is
-            // the common case) reached this table and was REFUSED at emit for no reason the
-            // graph stated. Their `OpKind::ArithSubi` exists and the emulator has served it
-            // since #50's typed-SSA port; the arm comes back so the refusal that remains is
-            // the fail-closed edge the table's own doc demands, never a spelled op their type
-            // names. The frontend bridge (`from_ttir`'s OP_SET) still refuses `arith.subi` by
-            // name -- that is the loud-by-design edge for a KERNEL; this arm is the parsed-
-            // text and future-kernel surface.
             "arith.subi" => KOpKind::ArithSubi,
             "arith.extsi" => KOpKind::ArithExtsi,
             "arith.trunci" => KOpKind::ArithTrunci,

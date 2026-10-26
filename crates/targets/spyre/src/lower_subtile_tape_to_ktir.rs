@@ -969,14 +969,6 @@ pub(crate) fn lower_one_node<F: RopeForm>(
                 Err(reason) => Unhandled(reason),
             }
         }
-        // ⭐ THE GREEDY TOKEN PICK — one kernel, spliced like every other: the row, the
-        // six vocab-derived tables, the [1, 64] idx stick out. The tables are tape
-        // sources the expansion stages at load (functions of the vocab alone); the
-        // splice binds them positionally, exactly as it binds silumul's gate and up.
-        SubOp::ArgMax { .. } => match scratchy_triton_splice::lower(node, ir, rows_are_requests) {
-            Ok(e) => Ops(vec![e]),
-            Err(reason) => Unhandled(reason),
-        },
         // ⭐ BOTH GAIN CONVENTIONS ARE ROWS NOW. The (1 + w) convention had its own
         // refusal here (the Scale kernel over a zero-centred gain scales every
         // normalized activation by roughly nothing — a model that loads, runs, and
@@ -1230,16 +1222,6 @@ pub struct BundleWiring {
     pub nodes: Vec<NodeArgs>,
     pub num_sources: u32,
     pub result_tensor: u32,
-    /// ⭐ THE RESULT'S OWN DTYPE — the fact that decides how the consumer reads
-    /// the rung's answer back, stated by the RESULT PRODUCER'S OWN KERNEL
-    /// SIGNATURE when the result is a spliced kernel's output
-    /// ([`result_dtype_of_ir`]) and the f16 row every native tail emits
-    /// otherwise. An INTEGER dtype states the result IS the picked token (the
-    /// device argmax's idx stick): the consumer reads the raw bytes at this
-    /// dtype instead of converting a `[1, vocab]` f16 row, and the row it was
-    /// picked from stays readable by tid either way — the answer re-point's
-    /// own contract, recorded on [`crate::wiring::Wiring::result_dtype`].
-    pub result_dtype: scratchy_tensors::DType,
     /// `tensor_shapes[id] = (rows, cols)` for every tensor. When `attn_mask` is set, the LAST entry
     /// is the synthetic mask tensor `[1, capacity]`.
     pub tensor_shapes: Vec<(u32, u32)>,
@@ -1301,13 +1283,6 @@ pub struct BundleWiring {
     /// attention classes states its set here the day it lands (the registry row already exists).
     pub rope_class_hds: Vec<u32>,
     pub attn_class_hds: Vec<u32>,
-    /// ⭐ THE LOAD-TIME CONSTANTS — `(tid, kind)` for every resident buffer this
-    /// graph's own producer minted below the `SourceBinding` layer, derived by
-    /// [`load_consts_of_ir`] (the one derivation; the bake's numeric gate reads
-    /// the same list). The worker stages each entry ONCE at load through the
-    /// kind's builder — the rope tables' own law. The tables carry no
-    /// `SourceBinding`; this list is the worker's only naming of them.
-    pub load_consts: Vec<(u32, crate::wiring::LoadConst)>,
 }
 
 /// One program's parameter order: `args[i]` is the tensor the i-th parameter addresses.
@@ -1332,7 +1307,6 @@ pub(crate) struct WiringRegistries {
     pub weight_copies: Vec<(u32, u32)>,
     pub rope_class_hds: Vec<u32>,
     pub attn_class_hds: Vec<u32>,
-    pub load_consts: Vec<(u32, crate::wiring::LoadConst)>,
 }
 
 /// Lower `ir` for its WIRING alone — the same per-node arms a bake runs, read for the parameter
@@ -1386,12 +1360,6 @@ pub fn graph_wiring<F: RopeForm>(
                 _ => None,
             },
         )),
-        // ⭐ THE LOAD-CONST LIST, off the minted node itself — the one node this
-        // graph either carries or does not. [`load_consts_of_ir`] is the one
-        // derivation (the bake's numeric gate reads the same list), so the
-        // wiring's ids and the layout's placements cannot disagree — the
-        // `weight_copies` one-mint law.
-        load_consts: load_consts_of_ir(ir)?,
     };
     // ⭐ EVERY NODE IS LOWERED ON ITS OWN, so they are lowered IN PARALLEL and folded IN ORDER. Each
     // node's arm is a pure function of the node and the graph (the kernel memos it reaches are
@@ -1502,7 +1470,6 @@ pub fn graph_wiring<F: RopeForm>(
         nodes,
         num_sources: ir.num_sources,
         result_tensor: ir.result.index() as u32,
-        result_dtype: result_dtype_of_ir(ir)?,
         tensor_shapes,
         attn_mask,
         scalarmul_scales: registries.scalarmul_scales,
@@ -1513,7 +1480,6 @@ pub fn graph_wiring<F: RopeForm>(
         // the emitter's class tids agree by construction (see the field's doc).
         rope_class_hds: registries.rope_class_hds,
         attn_class_hds: registries.attn_class_hds,
-        load_consts: registries.load_consts,
     })
 }
 
@@ -1532,231 +1498,6 @@ pub struct RungFacts {
     /// The split-KV chunk this rung bakes — see `BundleAttnParams::chunk_pages` (a
     /// one-request or prompt-chunk rung; `None` for the whole-cap rungs).
     pub chunk_pages: Option<u32>,
-}
-
-/// ⭐⭐⭐⭐⭐ CAN THE DEVICE ARGMAX SERVE THIS RESULT TAIL? — the mint-site gate,
-/// keyed on the STRUCTURE the graph itself states, never on a quant preset's NAME
-/// (so a future preset cannot slip past a name list). ONE fact, read off the result
-/// tail's lm-head matmul:
-///
-/// * ARITY-2 DENSE — fp8 W8A8 stages the per-channel scale as the matmul's THIRD
-///   operand and MLX-affine packs the table; the device argmax reads the result ROW
-///   the dense tail produces, and the ruling's admission keeps the mint to the tail
-///   forms the deleted #698 composite was card-proven on (the tie conjunct is
-///   DROPPED — no gather link exists to demand it). The boundary is the STAGING,
-///   never the preset's PRESENCE: granite's own fp8-dynamic-per-channel IGNORES the
-///   lm_head, so the dense tail persists under it and the mint survives the preset.
-///
-/// * THE TABLE RANGE LAW — the staged tables carry SMALL integers as fp16, and
-///   fp16's exact-integer range ENDS AT 2048: above it the spacing is 2, two
-///   adjacent values round together, and a ramp's equality selects the LATER
-///   entry — a WRONG TOKEN, silently. The two-level ramp keeps every table
-///   inside that range at ANY admitted vocab: the periodic block ramp tops out
-///   at 64, the lane tables at 64, and only the GROUP ramp grows with the
-///   vocab — so the gate bounds the GROUP COUNT (`G = NB / 64 ≤ 2048`, i.e.
-///   `NB ≤ 131072`, `PAD_V ≤ 2^23`). Gemma-4 and nemotron at vocab 262144 bake
-///   PAD_V 524288 (the strict round-up), NB 8192, G 128 — ADMITTED (a single
-///   flat block ramp would need 8192 in a lane, past fp16's exact range: that
-///   is why the ramp is two-level).
-///
-/// * THE PAD-LANE LAW — the sentinel (all-NaN row ⇒ idx past V) lives in
-///   padoff's `−inf` lanes; `argmax_pad_vocab` rounds a power-of-two vocab
-///   STRICTLY UP (262144 → 524288), so pad lanes always exist and the law
-///   holds. `PAD_V == V` stays as a conjunct anyway — the invariant stated,
-///   not assumed, so a future round-up change that breaks it fails HERE
-///   instead of on the card.
-///
-/// An unrecognizable tail (no lm-head matmul under the single-input post-op
-/// chain) simply does not mint — under hw that rung then reaches the worker's
-/// stated unminted-rung defect at its first pick (no host pick exists to fall
-/// back to); under emu the model keeps the host argmax exactly as a staged
-/// tail does. Unlike #698's composite, the kernel demands NOTHING from the
-/// lm-head, so absence of the recognized form is a quiet boundary, not an
-/// inconsistency.
-pub fn lm_head_admits_the_argmax<F: RopeForm>(ir: &SubtileIR<F>) -> bool {
-    let Some(node) = result_tail_lm_head(ir) else {
-        return false;
-    };
-    let SubOp::MatmulTile { weight, .. } = &node.op else {
-        unreachable!("the tail walk breaks only on a MatmulTile");
-    };
-    if !(node.inputs.len() == 2 && matches!(weight, scratchy_subtile::lower::GemmWeight::Dense)) {
-        return false;
-    }
-    // Both range laws read the RESULT ROW's own width — the emitted vocab, the same
-    // number the mint and the staged tables derive from — never the config's word.
-    let vocab = ir.tensors[ir.result.index()].cols;
-    let pad_vocab = scratchy_subtile::subtile_ir::argmax_pad_vocab(vocab);
-    let groups = scratchy_subtile::subtile_ir::argmax_groups(pad_vocab);
-    groups <= 2048 && pad_vocab != vocab
-}
-
-/// The result tail's lm-head matmul, when the result ends in one: back through the
-/// single-input column-preserving tail ops (granite's logits-scaling ScalarMul,
-/// gemma's TanhSoftCap — the argmax reads THROUGH them, so they stay exactly where
-/// they are) to the MatmulTile that produces the logits. `None` for any other tail.
-///
-/// The vocab matmul is N-block TILED — many subtiles write the result tensor in
-/// column slices — and every subtile of one source op states the same structure, so
-/// the FIRST writer is the representative one (the gate's own law; #698 walked the
-/// same first-writer on the card-proven cells).
-fn result_tail_lm_head<F: RopeForm>(ir: &SubtileIR<F>) -> Option<&SubtileNode<F>> {
-    let mut t = ir.result;
-    loop {
-        let node = ir.nodes.iter().find(|n| n.output.tensor == t)?;
-        match &node.op {
-            SubOp::ScalarMul { .. } | SubOp::TanhSoftCap { .. } if node.inputs.len() == 1 => {
-                t = node.inputs[0].tensor;
-            }
-            SubOp::MatmulTile { .. } => return Some(node),
-            _ => return None,
-        }
-    }
-}
-
-/// ⭐⭐⭐ THE LOAD-TIME CONSTANTS A GRAPH CARRIES — `(tid, kind)` for every
-/// resident buffer the graph's own producer minted below the `SourceBinding`
-/// layer. THE ONE DERIVATION: [`graph_wiring`](self)'s registry and the bake's
-/// numeric gate both read this list, so the wiring's ids and the gate's staged
-/// bytes cannot disagree (the `weight_copies` one-mint law).
-///
-/// This fn is the PRODUCER'S TRANSLATION POINT — the one place a minted op
-/// states its host contract as generic [`LoadConst`] kinds. Everything
-/// downstream of it is op-blind: the kinds name shared builders
-/// ([`crate::wiring::LoadConst::build`]), the consumers iterate the list, and
-/// a second spliced kernel with staged tables adds its arm HERE and rides the
-/// same list with zero new wiring surface.
-///
-/// A second minted node of one kind is a build error, not a last-write-wins:
-/// two scans would stage two sticks and the worker could read either.
-pub fn load_consts_of_ir<F: RopeForm>(
-    ir: &SubtileIR<F>,
-) -> Result<Vec<(u32, crate::wiring::LoadConst)>, SuperDscError> {
-    // ⭐ THE DEVICE ARGMAX'S MINT — the seven operand tables (functions of the
-    // vocab alone, built by the shared `argmax_staged_tables` derivation the
-    // kind names; the seventh is the pad law's offset row, which the kernel
-    // adds to the logits row before its first max — the row's own pad bytes
-    // are never its contract).
-    let mut mints = ir
-        .nodes
-        .iter()
-        .filter(|n| matches!(n.op, SubOp::ArgMax { .. }));
-    match (mints.next(), mints.next()) {
-        (None, _) => Ok(Vec::new()),
-        (Some(_), Some(_)) => Err(SuperDscError(
-            "two ArgMax nodes in one graph — the mint appends exactly one to the one-request \
-             rung; a second means two mints ran over one graph"
-                .to_string(),
-        )),
-        (Some(node), None) => {
-            let SubOp::ArgMax { vocab } = node.op else {
-                unreachable!("the filter matched an ArgMax")
-            };
-            assert_eq!(
-                node.inputs.len(),
-                10,
-                "the ArgMax node's arity is the registry's own row (logits + nine tables)"
-            );
-            Ok(node.inputs[1..]
-                .iter()
-                .enumerate()
-                .map(|(i, tr)| {
-                    (
-                        tr.tensor.index() as u32,
-                        crate::wiring::LoadConst::ArgMaxTable {
-                            vocab,
-                            operand: (i + 1) as u8,
-                        },
-                    )
-                })
-                .collect())
-        }
-    }
-}
-
-/// ⭐ THE RESULT'S OWN DTYPE, from the RESULT PRODUCER'S OWN KERNEL SIGNATURE —
-/// the same `operand_dfs` authority the placement widths already read (the
-/// registry's operand-order contract zips the kernel's buffer parameters with
-/// the node's bindings, output LAST), asked here for the one binding that
-/// names the result. A result no spliced kernel produces is the f16 row every
-/// native lm-head tail emits; a spliced result carries whatever dtype its
-/// kernel's own parameter states — the device argmax's `idx_ptr: *i32` makes
-/// the minted rung's answer an INDEX, and the consumer's raw-read branch keys
-/// on exactly that fact, never on the op's name.
-pub fn result_dtype_of_ir<F: RopeForm>(
-    ir: &SubtileIR<F>,
-) -> Result<scratchy_tensors::DType, SuperDscError> {
-    let node = ir
-        .nodes
-        .iter()
-        .find(|n| n.output.tensor == ir.result)
-        .expect("validate demands the result is an op output, so it has a writer");
-    let dfs = scratchy_triton_splice::operand_dfs(node, ir)
-        .map_err(|e| SuperDscError(format!("the result's dtype: {e}")))?;
-    let Some(dfs) = dfs else {
-        return Ok(scratchy_tensors::DType::F16);
-    };
-    dfs.iter()
-        .find(|(tid, _)| *tid == ir.result.index() as u32)
-        .ok_or_else(|| {
-            SuperDscError(
-                "the result's producer binds no parameter for the result tensor — the \
-                 registry's operand-order contract (output LAST) is violated"
-                    .to_string(),
-            )
-        })
-        .and_then(|(_, df)| match df {
-            ktir_superdsc::superdsc_opspec::Df::Fp16 => Ok(scratchy_tensors::DType::F16),
-            ktir_superdsc::superdsc_opspec::Df::Bf16 => Ok(scratchy_tensors::DType::BF16),
-            ktir_superdsc::superdsc_opspec::Df::Fp32 => Ok(scratchy_tensors::DType::F32),
-            ktir_superdsc::superdsc_opspec::Df::Fp8 => Ok(scratchy_tensors::DType::Fp8E4m3),
-            // The door's own mapping law states an i32 buffer as SenUint32; the
-            // consumer reads raw LE int32 words either way.
-            ktir_superdsc::superdsc_opspec::Df::SenUint32 => Ok(scratchy_tensors::DType::I32),
-            ktir_superdsc::superdsc_opspec::Df::SenInt8 => Err(SuperDscError(
-                "the result's kernel states an int8 output, which no consumer reads back \
-                 today — state a dtype the readback knows (f16, bf16, f32, fp8, i32)"
-                    .to_string(),
-            )),
-        })
-}
-
-/// ⭐ ONE NODE'S OUTPUT STICK, BY THE SAME SIGNATURE AUTHORITY — `true` for
-/// every native op (the f16 stick the reference legs' hop-by-hop rounding
-/// law states) and for a spliced kernel whose own parameter states an f16
-/// output; `false` when the signature states another stick, because the f16
-/// rounding hop is the F16 STICK's law, never the value's. Measured on the
-/// argmax mint: the idx stick is the kernel's own `*i32` buffer, and the
-/// blanket f16 rounding certified idx 12358 as 12360 (the f16 grid's spacing
-/// at [8192, 16384) is 8) against a faithful emulator answer of 12358 — a
-/// WRONG TOKEN as the reference law, surfaced the moment the gate began
-/// comparing the stick exactly. An integer stick holds whole f32 numbers
-/// EXACTLY; the rounding hop is a corruption there, not a grid statement.
-pub fn node_output_on_f16_stick<F: RopeForm>(
-    node: &scratchy_subtile::subtile_ir::SubtileNode<F>,
-    ir: &SubtileIR<F>,
-) -> bool {
-    let dfs = match scratchy_triton_splice::operand_dfs(node, ir) {
-        Ok(Some(dfs)) => dfs,
-        // A native op, or a spliced ROW without a kernel signature (attention,
-        // whose widths are the door's statement): the f16 stick.
-        Ok(None) => return true,
-        Err(e) => panic!(
-            "a spliced node's own output stick is unreadable — the reference legs refuse to \
-             guess the grid it rounds through: {e}"
-        ),
-    };
-    let Some((_, df)) = dfs
-        .iter()
-        .find(|(tid, _)| *tid == node.output.tensor.index() as u32)
-    else {
-        panic!(
-            "the spliced kernel for {:?} binds no parameter for its own output — the \
-             registry's operand-order contract (output LAST) is violated",
-            node.op
-        )
-    };
-    matches!(df, ktir_superdsc::superdsc_opspec::Df::Fp16)
 }
 
 /// RE-ROLLED tape-driven SuperDSC lowering — the mirror of `lower_subtile_tape_to_tk_tape`

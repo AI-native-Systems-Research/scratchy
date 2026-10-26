@@ -222,8 +222,7 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | O::RopeRotate { .. }
             | O::RopeAppend { .. }
             | O::KvAppend { .. }
-            | O::AttnDecode { .. }
-            | O::ArgMax { .. } => None,
+            | O::AttnDecode { .. } => None,
         }
     }
 }

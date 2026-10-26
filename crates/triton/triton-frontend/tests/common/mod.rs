@@ -234,52 +234,6 @@ pub fn expert_slab() -> Case {
     )
 }
 
-/// `argmax_first_max.py`'s signature: the solo greedy decode step's vocab scan. The idx
-/// output is `*i32` (the gather ingestion dtype); `PAD_V` is the vocab padded to a whole
-/// power-of-two row whose pads hold 0.0 (the production shape — the lm-head's zero-pad
-/// columns) with SIX fp16 index tables staged (the three decreasing ramps pick
-/// first-group/first-block/first-lane; the three increasing 0-based tables read the
-/// numbers back out), the [1, BLOCK] ones row (f16) and 64.0 row (f32) the widen and
-/// the island's scale read, and the fp16 OFFSET row that carries the pad law (0.0 on
-/// the real lanes, -inf on the pads; the kernel adds it before its first max) -- HOST
-/// obligations the fixture's docstring states.
-const ARGMAX: &[(&str, &str)] = &[
-    ("logits_ptr", "*fp16"),
-    ("bramp_ptr", "*fp16"),
-    ("lramp_ptr", "*fp16"),
-    ("binc_ptr", "*fp16"),
-    ("linc_ptr", "*fp16"),
-    ("ones_ptr", "*fp16"),
-    ("sixtyfour_ptr", "*fp32"),
-    ("padoff_ptr", "*fp16"),
-    ("gramp_ptr", "*fp16"),
-    ("ginc_ptr", "*fp16"),
-    ("idx_ptr", "*i32"),
-    ("V", "constexpr"),
-    ("PAD_V", "constexpr"),
-    ("NB", "constexpr"),
-    ("BLOCK", "constexpr"),
-];
-
-/// The one argmax configuration, matching `cases.rs`' `argmax_first_max` row: granite-3.1's
-/// vocab 49155 (deliberately NOT a multiple of 64, so the pad lanes are real), the
-/// power-of-two padded row (the descriptor block's law), and the two-level split's block
-/// count NB = PAD_V / BLOCK.
-pub fn argmax_first_max() -> Case {
-    build(
-        "argmax_first_max",
-        "argmax_first_max",
-        "argmax_first_max_kernel",
-        ARGMAX,
-        &[
-            ("V", Val::Int(49155)),
-            ("PAD_V", Val::Int(65536)),
-            ("NB", Val::Int(1024)),
-            ("BLOCK", Val::Int(64)),
-        ],
-    )
-}
-
 /// `kernels/moe.py`'s signature: the router's input, gain, projection and per-expert scale;
 /// the experts' input; the three fp8 banks and their scales; the output; the scratch.
 const MOE: &[(&str, &str)] = &[

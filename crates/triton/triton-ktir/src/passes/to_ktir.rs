@@ -868,48 +868,48 @@ fn convert_all(
 /// ONLY COMBINERS WHOSE IDENTITY IS KNOWN are supported. The alternative is seeding an
 /// accumulator with a fabricated value, which produces a WRONG ANSWER SILENTLY rather
 /// than a diagnostic.
-fn combiner_identity(kind: &OpKind, elem: DType) -> Option<Attr> {
+fn combiner_identity(kind: &OpKind, elem: DType) -> Option<FloatBits> {
     let f16 = elem == DType::F16;
     Some(match kind {
         OpKind::ArithAddf => {
             if f16 {
-                Attr::Float(FloatBits {
+                FloatBits {
                     bits: 0x0000,
                     width: 16,
-                })
+                }
             } else {
-                Attr::Float(FloatBits::f32(0.0))
+                FloatBits::f32(0.0)
             }
         }
         OpKind::ArithMulf => {
             if f16 {
-                Attr::Float(FloatBits {
+                FloatBits {
                     bits: 0x3c00,
                     width: 16,
-                })
+                }
             } else {
-                Attr::Float(FloatBits::f32(1.0))
+                FloatBits::f32(1.0)
             }
         }
         // -inf for a max, +inf for a min.
         OpKind::ArithMaxnumf => {
             if f16 {
-                Attr::Float(FloatBits {
+                FloatBits {
                     bits: 0xFC00,
                     width: 16,
-                })
+                }
             } else {
-                Attr::Float(FloatBits::f32(f32::NEG_INFINITY))
+                FloatBits::f32(f32::NEG_INFINITY)
             }
         }
         OpKind::ArithMinnumf => {
             if f16 {
-                Attr::Float(FloatBits {
+                FloatBits {
                     bits: 0x7C00,
                     width: 16,
-                })
+                }
             } else {
-                Attr::Float(FloatBits::f32(f32::INFINITY))
+                FloatBits::f32(f32::INFINITY)
             }
         }
         _ => return None,
@@ -1013,7 +1013,7 @@ fn convert_reduce(module: &mut Module, index: &DefIndex, path: &OpPath) -> Resul
     }
     let ident = combiner_identity(&combine.kind, elem).ok_or_else(|| {
         refuse(format!(
-            "tt.reduce combiner `{}` has no known identity element at {elem:?}, so its \
+            "tt.reduce combiner `{}` has no known identity element, so its \
              linalg.generic accumulator cannot be seeded; refusing rather than \
              fabricating a seed",
             combine.kind.spelling()
@@ -1026,7 +1026,7 @@ fn convert_reduce(module: &mut Module, index: &DefIndex, path: &OpPath) -> Resul
     let init = module.fresh_named(&hint);
     let ident_op = Op::new(OpKind::ArithConstant)
         .with_result(ident_scalar, IrType::Scalar(elem))
-        .with_attr(AttrKey::Value, ident);
+        .with_attr(AttrKey::Value, Attr::Float(ident));
     let init_op = Op::new(OpKind::TensorSplat)
         .with_result(init, res_ty.clone())
         .with_operands([ident_scalar]);
