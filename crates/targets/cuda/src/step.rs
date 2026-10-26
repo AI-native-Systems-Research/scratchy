@@ -1084,6 +1084,8 @@ pub struct StepExtents {
     pub weight: Option<WeightRead>,
     pub kv: Option<(u32, KvUse)>,
     pub gdn: Option<u32>,
+    /// The write may equal read 0 exactly, the kernel's `out == x` contract.
+    pub in_place: bool,
 }
 
 impl CudaStep {
@@ -1114,6 +1116,7 @@ impl CudaStep {
                     }),
                     kv: None,
                     gdn: None,
+                    in_place: false,
                 })
             }
             Self::Gemm(GemmBf16 { a, b, c, m, n, k })
@@ -1132,6 +1135,7 @@ impl CudaStep {
                     weight: Some(WeightRead { ix: b, bytes: bb }),
                     kv: None,
                     gdn: None,
+                    in_place: false,
                 })
             }
             Self::RmsNorm(RmsNormBf16 {
@@ -1163,6 +1167,7 @@ impl CudaStep {
                     }),
                     kv: None,
                     gdn: None,
+                    in_place: false,
                 })
             }
             Self::Add(AddBf16 {
@@ -1203,6 +1208,7 @@ impl CudaStep {
                     weight: None,
                     kv: None,
                     gdn: None,
+                    in_place: false,
                 })
             }
             Self::Rope(RopeBf16 {
@@ -1225,6 +1231,7 @@ impl CudaStep {
                     weight: None,
                     kv: None,
                     gdn: None,
+                    in_place: false,
                 })
             }
             Self::GateSplit(GateSplitBf16 {
@@ -1248,6 +1255,7 @@ impl CudaStep {
                     weight: None,
                     kv: None,
                     gdn: None,
+                    in_place: false,
                 })
             }
             Self::RopeAppend(RopeAppendBf16 {
@@ -1278,6 +1286,7 @@ impl CudaStep {
                     weight: None,
                     kv: Some((layer, KvUse::Write)),
                     gdn: None,
+                    in_place: false,
                 })
             }
             Self::AttnPrefill(AttnPrefillBf16 {
@@ -1320,6 +1329,7 @@ impl CudaStep {
                     weight: None,
                     kv: Some((layer, KvUse::Read)),
                     gdn: None,
+                    in_place: false,
                 })
             }
             Self::GatedDeltaNet(
@@ -1365,6 +1375,7 @@ impl CudaStep {
                     }),
                     kv: None,
                     gdn: Some(layer),
+                    in_place: false,
                 })
             }
             Self::RouterLogits(RouterLogitsBf16 {
@@ -1395,6 +1406,7 @@ impl CudaStep {
                     }),
                     kv: None,
                     gdn: None,
+                    in_place: false,
                 })
             }
             Self::MoeRoute(MoeRouteBf16 {
@@ -1424,6 +1436,7 @@ impl CudaStep {
                     weight,
                     kv: None,
                     gdn: None,
+                    in_place: false,
                 })
             }
             Self::ExpertSort(s) => {
@@ -1447,6 +1460,7 @@ impl CudaStep {
                     weight: None,
                     kv: None,
                     gdn: None,
+                    in_place: false,
                 })
             }
             Self::ExpertGemm(g) => {
@@ -1474,6 +1488,7 @@ impl CudaStep {
                     }),
                     kv: None,
                     gdn: None,
+                    in_place: false,
                 })
             }
             Self::ExpertGemv(g) => {
@@ -1507,6 +1522,7 @@ impl CudaStep {
                     }),
                     kv: None,
                     gdn: None,
+                    in_place: false,
                 })
             }
             Self::ExpertCombine(ExpertCombineBf16 {
@@ -1541,6 +1557,7 @@ impl CudaStep {
                     weight: None,
                     kv: None,
                     gdn: None,
+                    in_place: false,
                 })
             }
             Self::GateScale(GateScaleBf16 {
@@ -1566,12 +1583,10 @@ impl CudaStep {
                     weight: None,
                     kv: None,
                     gdn: None,
+                    in_place: false,
                 })
             }
             Self::Scale(ScaleBf16 {
-                x, out, rows, cols, ..
-            })
-            | Self::SoftCap(SoftCapBf16 {
                 x, out, rows, cols, ..
             })
             | Self::RmsNormUnit(RmsNormUnitBf16 {
@@ -1591,6 +1606,25 @@ impl CudaStep {
                     weight: None,
                     kv: None,
                     gdn: None,
+                    in_place: false,
+                })
+            }
+            // `pointwise_bf16.cu` reads each element before the same thread writes it, so the
+            // soft-cap may write over its input.
+            Self::SoftCap(SoftCapBf16 {
+                x, out, rows, cols, ..
+            }) => {
+                let Some(bytes) = bf16_bytes(rows, cols) else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [Some(span(x, bytes)), None, None, None],
+                    writes: span(out, bytes),
+                    second_write: None,
+                    weight: None,
+                    kv: None,
+                    gdn: None,
+                    in_place: true,
                 })
             }
             Self::LayerScale(LayerScaleBf16 {
@@ -1613,6 +1647,7 @@ impl CudaStep {
                     }),
                     kv: None,
                     gdn: None,
+                    in_place: false,
                 })
             }
         }
