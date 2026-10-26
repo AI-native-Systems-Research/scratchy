@@ -500,6 +500,31 @@ const GAP_ACCEPTED_2: &[(&str, &str)] = &[
     ("align_attribute", "__align__(16) float pad[4] = {};"),
 ];
 
+/// A source of two kernels, each with its own `extern __shared__` buffer and TK allocator, as
+/// upstream's `mha_h100.cu` has three; `{}` is a statement put after the second's allocator.
+const TWO_SHM_KERNELS: &str = r##"#include "kittens.cuh"
+using namespace kittens;
+namespace {
+using row_gl = gl<float, 1, 1, -1, -1>;
+struct two_globals {
+    row_gl x;
+};
+__global__ void first_ker(const __grid_constant__ two_globals g) {
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    rv_fl<256> row;
+    warp::load(row, g.x, {0, 0, 0, 0});
+}
+__global__ void second_ker(const __grid_constant__ two_globals g) {
+    extern __shared__ int __shm[];
+    tma_swizzle_allocator al((int*)&__shm[0]);
+    {}
+    rv_fl<256> row;
+    warp::load(row, g.x, {0, 0, 0, 0});
+}
+}  // namespace
+"##;
+
 /// T10's second-review fixtures: whole sources that must pass.
 const GAP_ACCEPTED_SOURCES_2: &[(&str, &str)] = &[
     (
@@ -2027,9 +2052,13 @@ fn t6_shared(src: &Source) -> Vec<Violation> {
         }
     }
     let alloc = allocator_spans(&src.bare);
-    for (name, declared) in &buffers {
+    // Every declaration of a buffer is its own, not a use: a file with several kernels declares
+    // one per kernel, as upstream's `mha_h100.cu` does three times.
+    let declarations: BTreeSet<usize> = buffers.iter().map(|&(_, at)| at).collect();
+    let names: BTreeSet<&str> = buffers.iter().map(|(n, _)| n.as_str()).collect();
+    for name in names {
         for at in words(&src.bare, name) {
-            if at != *declared && !within(&alloc, at) {
+            if !declarations.contains(&at) && !within(&alloc, at) {
                 out.push(violation(
                     line_of(&src.bare, at),
                     "T6",
@@ -2407,6 +2436,16 @@ fn the_checker_accepts_tk_scopes_and_refuses_the_second_reviews_constructs() {
     for (name, text) in GAP_ACCEPTED_SOURCES_2 {
         pass &= self_test(&format!("gap2_{name}.cu"), text, &[]);
     }
+    pass &= self_test(
+        "gap2_two_kernels_two_shm.cu",
+        &TWO_SHM_KERNELS.replace("{}", ""),
+        &[],
+    );
+    pass &= self_test(
+        "gap2_two_kernels_stray_shm_write.cu",
+        &TWO_SHM_KERNELS.replace("{}", "__shm[1] = 0;"),
+        &["T6"],
+    );
     for (name, stmt, rule) in GAP_STATEMENTS_2 {
         let text = GAP_KERNEL.replace("{}", stmt);
         pass &= self_test(&format!("gap2_{name}.cu"), &text, &[rule]);
