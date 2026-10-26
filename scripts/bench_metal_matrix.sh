@@ -112,6 +112,7 @@ MODELS_ALL=(
   "nemotron-3-super-120b-a12b=mlx-community/NVIDIA-Nemotron-3-Super-120B-A12B-OptiQ-2bit:mlx-affine-b4-g64-qembed" # 47.5 GB, latent MoE, Mamba-2 hybrid, OptiQ 2-bit
   "qwen3.6-35b-a3b=mlx-community/Qwen3.6-35B-A3B-4bit:mlx-affine-b4-g64-qembed"        # 20.4 GB, MoE, GDN hybrid
   "qwen3.5-122b-a10b=scratchery/Qwen3.5-122B-A10B-OptiQ-2bit-mtp:mlx-affine-b4-g64-qembed" # 48.3 GB, MoE, GDN hybrid, OptiQ 2-bit, MTP head
+  "granite-4.2-3b=ibm-granite/granite-4.2-3b-q4-mlx:mlx-affine-b4-g64-qembed"             # 2.1 GB, dense
   "granite-4.2-8b=ibm-granite/granite-4.2-8b-q4-mlx:mlx-affine-b4-g64-qembed"             # 4.9 GB, dense
   "granite-4.2-30b=ibm-granite/granite-4.2-30b-q4-mlx:mlx-affine-b4-g64-qembed"           # 16.5 GB, dense
   # By name only (--models <stem>): the earlier rounds' models.
@@ -133,7 +134,7 @@ CLASSES=(
   "sliding window|gpt-oss-20b|gpt-oss-120b-3bit"
   "Mamba-2|nemotron-3-nano-30b-a3b|nemotron-3-super-120b-a12b"
   "Gated DeltaNet|qwen3.6-35b-a3b|qwen3.5-122b-a10b"
-  "dense|granite-4.2-8b|granite-4.2-30b"
+  "dense|granite-4.2-3b|granite-4.2-30b"
 )
 MODELS_SMALL="$(for c in "${CLASSES[@]}"; do IFS='|' read -r _ s _ <<<"${c}"; echo "${s}"; done | paste -sd, -)"
 MODELS_LARGE="$(for c in "${CLASSES[@]}"; do IFS='|' read -r _ _ l <<<"${c}"; echo "${l}"; done | paste -sd, -)"

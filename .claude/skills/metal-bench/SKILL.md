@@ -45,7 +45,7 @@ runs everything else.
 **The rounds:** one model per class, a small one for 36 GB and a large one
 for 64 GB. Sliding window: gpt-oss-20b / gpt-oss-120b-3bit. Mamba-2:
 nemotron-3-nano-30b-a3b / nemotron-3-super-120b-a12b. Gated DeltaNet:
-qwen3.6-35b-a3b / qwen3.5-122b-a10b. Dense: granite-4.2-8b / granite-4.2-30b. The large set is 2- and 3-bit (OptiQ or 3-bit), since no 4-bit 120B fits 64 GB: its numbers aren't comparable with the 4-bit small set on quality.
+qwen3.6-35b-a3b / qwen3.5-122b-a10b. Dense: granite-4.2-3b / granite-4.2-30b. The large set is 2- and 3-bit (OptiQ or 3-bit), since no 4-bit 120B fits 64 GB: its numbers aren't comparable with the 4-bit small set on quality.
 `--models small`, `large` or `full` picks a set; glm-4.5-air and the gemma
 and qwen3.6-27b models run by name. The run file records the class table
 (`config.classes`), and the page's overview reads its columns from it.
