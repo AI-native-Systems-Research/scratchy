@@ -38,7 +38,7 @@ use scratchy_subtile::paged_kv_layout::PagedKvLayout;
 use crate::kernels::{self, KernelError};
 use crate::rotary::fill_rotary_rows_with_freq_dim;
 use crate::step::{
-    ATTN_PREFILL_BF16_HEAD_DIM, AddBf16, AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16,
+    ATTN_D512_BF16_HEAD_DIM, AddBf16, AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16,
     ExpertGemmBf16, ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16,
     GateSplitBf16, GatedDeltaNetBf16, GemmBf16, LayerScaleBf16, MOE_ROUTE_EXPERTS, MatmulKernel,
     MoeRouteBf16, MoeWeight, PairRows, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16,
@@ -485,8 +485,13 @@ impl Drop for Stream {
 /// of the forward's KV regions.
 struct KvPool {
     buffer: DeviceBuffer,
-    /// One layer's K (or V) buffer's layout; every layer's is the same.
+    /// Class 0's K (or V) buffer's layout: the tapes' `kv_heads` and `head_dim`, and the pool's
+    /// block size and count, which every class shares.
     layout: PagedKvLayout,
+    /// Per KV layer, in [`KvTape::layers`] order: its class's layout and the element offset of
+    /// its K buffer in `buffer`, its V buffer right after. Computed once by [`KvTape::pool_layout`]
+    /// from the tapes' compile-time `classes` and `layer_class`.
+    per_layer: Vec<(PagedKvLayout, usize)>,
     /// The KV layers, as the tapes' [`KvTape::layers`].
     layers: usize,
     /// The host side of the block table, sized once: `max_blocks_per_seq` entries.
@@ -496,13 +501,19 @@ struct KvPool {
 }
 
 impl KvPool {
-    /// Element offset of layer index `layer`'s `half` buffer in the pool.
+    /// Element offset of layer index `layer`'s `half` buffer in the pool. For a tape of one class
+    /// (every Qwen tape) this is `(2 · layer + half) · buffer_elems`, as before the classes.
     fn half_elems(&self, layer: usize, half: KvHalf) -> usize {
-        let second = match half {
-            KvHalf::K => 0,
-            KvHalf::V => 1,
-        };
-        (2 * layer + second) * self.layout.buffer_elems()
+        let (layout, at) = self.per_layer[layer];
+        match half {
+            KvHalf::K => at,
+            KvHalf::V => at + layout.buffer_elems(),
+        }
+    }
+
+    /// Layer index `layer`'s layout: its class's `kv_heads` and `head_dim`.
+    fn layer_layout(&self, layer: usize) -> PagedKvLayout {
+        self.per_layer[layer].0
     }
 
     /// The device address of layer index `layer`'s `half` buffer. Computed, not dereferenced.
@@ -566,41 +577,17 @@ fn gdn_pool_layout(layout: &GdnStateLayout, layers: usize) -> Option<(Vec<(u64, 
     Some((offsets, per_layer.checked_mul(layers as u64)?))
 }
 
-/// The name of `s` when it is a step the lowering emits and no kernel launches yet (#885's 13b-3
-/// and 13b-4): the 64-column GEMM, the router GEMM on it, a rope with a half-head pairing, a rope
-/// append or attention of a class that is not the KV pool's own at head dim 256 (Gemma's global
-/// layers, head dim 512, a class the pool does not hold yet), and an expert step at another count
-/// than 256, on 64-column tiles or reading Gemma's own tensors. A class of the pool's geometry at
-/// head dim 256 launches with its window or without one (every Qwen layer, Gemma's sliding ones). Also the Qwen routing at another count
-/// than [`MOE_ROUTE_EXPERTS`]: the routing kernel's Qwen program is instantiated at 256 only (its
-/// launcher refuses any other count), so such a tape is refused here, before anything is enqueued,
-/// rather than at its routing step. `None` for every step a Qwen tape holds.
-fn not_launched(tape: &CudaTape, s: &CudaStep) -> Option<&'static str> {
-    use crate::step::RopePairing;
-    // The pool is laid out at the tape's `kv_heads` and `head_dim` (class 0's), so only a class
-    // of that geometry is one its layers' K and V fit.
-    let pool_class = |layer: u32| {
-        tape.kv.zip(tape.kv_class(layer)).is_some_and(|(kv, c)| {
-            c.head_dim == ATTN_PREFILL_BF16_HEAD_DIM
-                && (c.kv_heads, c.head_dim) == (kv.kv_heads, kv.head_dim)
-        })
-    };
+/// The name of `s` when it is a step the lowering emits and no kernel launches yet (#885's
+/// 13b-4): the 64-column GEMM, the router GEMM on it, and an expert step at another count than
+/// 256, on 64-column tiles or reading Gemma's own tensors. Every rope, rope append and attention
+/// launches: the pool holds each layer at its class's layout, and the head-dim-512 class runs the
+/// column-split kernels. Also the Qwen routing at another count than [`MOE_ROUTE_EXPERTS`]: the
+/// routing kernel's Qwen program is instantiated at 256 only (its launcher refuses any other
+/// count), so such a tape is refused here, before anything is enqueued, rather than at its routing
+/// step. `None` for every step a Qwen tape holds.
+fn not_launched(s: &CudaStep) -> Option<&'static str> {
     match *s {
         CudaStep::GemmCol64(_) => Some("GemmCol64"),
-        CudaStep::Rope(RopeBf16 { pairing, .. }) if pairing != RopePairing::HalfRotated => {
-            Some("Rope")
-        }
-        CudaStep::RopeAppend(RopeAppendBf16 { layer, pairing, .. })
-            if pairing != RopePairing::HalfRotated || !pool_class(layer) =>
-        {
-            Some("RopeAppend")
-        }
-        CudaStep::AttnPrefill(AttnPrefillBf16 { layer, .. }) if !pool_class(layer) => {
-            Some("AttnPrefill")
-        }
-        CudaStep::AttnDecode(AttnPrefillBf16 { layer, .. }) if !pool_class(layer) => {
-            Some("AttnDecode")
-        }
         CudaStep::RouterLogits(r) if r.kernel == MatmulKernel::Col64 => Some("RouterLogits"),
         CudaStep::MoeRoute(MoeRouteBf16 {
             program: RouteProgram::QwenSoftmax,
@@ -622,23 +609,6 @@ fn not_launched(tape: &CudaTape, s: &CudaStep) -> Option<&'static str> {
         }
         _ => None,
     }
-}
-
-/// The KV pool's bytes: `layers` layers of a K and a V buffer of `num_blocks` blocks of `kv_heads ·
-/// block_size · head_dim` bf16 each, or `None` when the count overflows `u64`. Every factor is
-/// widened and multiplied checked, so no step wraps.
-fn kv_pool_bytes(layers: usize, layout: &PagedKvLayout) -> Option<u64> {
-    [
-        layout.num_blocks,
-        layout.num_kv_heads,
-        layout.block_size,
-        layout.head_dim,
-    ]
-    .into_iter()
-    .try_fold(u64::try_from(layers).ok()?.checked_mul(2)?, |acc, f| {
-        acc.checked_mul(u64::from(f))
-    })?
-    .checked_mul(std::mem::size_of::<u16>() as u64)
 }
 
 /// The one GDN geometry of `tapes`: the first GDN tape's, which every other GDN tape must share.
@@ -711,12 +681,16 @@ fn kv_geometry(tapes: &[CudaTape]) -> Result<Option<KvTape>, WorkerError> {
                     f.head_dim,
                     f.block_size,
                     f.max_blocks_per_seq,
+                    f.classes,
+                    f.layer_class,
                 ) != (
                     kv.layers,
                     kv.kv_heads,
                     kv.head_dim,
                     kv.block_size,
                     kv.max_blocks_per_seq,
+                    kv.classes,
+                    kv.layer_class,
                 ) {
                     return Err(WorkerError::KvGeometry { bucket });
                 }
@@ -813,9 +787,10 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     block_size: kv.block_size,
                     head_dim: kv.head_dim,
                 };
-                let bytes = kv_pool_bytes(kv.layers.len(), &layout)
+                let (per_layer, bytes) = kv
+                    .pool_layout(num_blocks)
                     .ok_or(WorkerError::KvPoolTooLarge { num_blocks })?;
-                Some((kv, layout, bytes))
+                Some((kv, layout, per_layer, bytes))
             }
             (Some(_), _) => return Err(WorkerError::KvPoolMissing),
             (None, Some(_)) => return Err(WorkerError::KvPoolUnused),
@@ -854,7 +829,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         let stream = Stream::new().map_err(WorkerError::Cuda)?;
         let arena = DeviceBuffer::alloc(device, arena_bytes).map_err(WorkerError::Cuda)?;
         let kv = match pool {
-            Some((kv, layout, bytes)) => {
+            Some((kv, layout, per_layer, bytes)) => {
                 let buffer = DeviceBuffer::alloc(device, bytes).map_err(WorkerError::Cuda)?;
                 let slots = (tapes.iter())
                     .filter(|t| t.kv.is_some())
@@ -862,6 +837,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 Some(KvPool {
                     buffer,
                     layout,
+                    per_layer,
                     layers: kv.layers.len(),
                     block_table_host: vec![NO_SLOT; kv.max_blocks_per_seq as usize],
                     slot_mapping_host: vec![NO_SLOT; slots.max().unwrap_or(0) as usize],
@@ -1012,7 +988,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             buckets: self.tapes.len(),
         })?;
         if let Some((step, op)) = (tape.steps.iter().enumerate())
-            .find_map(|(step, s)| not_launched(tape, s).map(|op| (step, op)))
+            .find_map(|(step, s)| not_launched(s).map(|op| (step, op)))
         {
             return Err(ForwardError::NotLaunched { step, op });
         }
@@ -1197,11 +1173,15 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         let Some(pool) = &self.kv else {
             return Err(refuse(0));
         };
-        let block_elems = pool.layout.kv_blk_stride();
-        if layer >= pool.layers || block >= pool.layout.num_blocks || out.len() != block_elems {
+        if layer >= pool.layers {
+            return Err(refuse(pool.layout.kv_blk_stride()));
+        }
+        let layout = pool.layer_layout(layer);
+        let block_elems = layout.kv_blk_stride();
+        if block >= layout.num_blocks || out.len() != block_elems {
             return Err(refuse(block_elems));
         }
-        let at = pool.half_elems(layer, half) + pool.layout.elem_offset(block, 0, 0);
+        let at = pool.half_elems(layer, half) + layout.elem_offset(block, 0, 0);
         let src = pool
             .buffer
             .ptr()
@@ -1353,7 +1333,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             let launched = match *s {
                 // Refused above, before anything was enqueued (`not_launched`).
                 CudaStep::GemmCol64(_) => {
-                    let op = not_launched(tape, s).unwrap_or("a Gemma step");
+                    let op = not_launched(s).unwrap_or("a Gemma step");
                     return Err(ForwardError::NotLaunched { step, op });
                 }
                 CudaStep::Scale(ScaleBf16 {
@@ -1495,7 +1475,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     // Gemma's 64-column router GEMM: refused above, before anything was enqueued
                     // (`not_launched`).
                     if kernel == MatmulKernel::Col64 {
-                        let op = not_launched(tape, s).unwrap_or("RouterLogits");
+                        let op = not_launched(s).unwrap_or("RouterLogits");
                         return Err(ForwardError::NotLaunched { step, op });
                     }
                     // The router is the bundle's first tensor, at byte 0 (`moe_bundle`), or Gemma's
@@ -1684,17 +1664,17 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     cols,
                     head_dim,
                     rot_dim,
-                    ..
+                    pairing,
                 }) => {
                     // SAFETY: as above, for `x` and `out` (`rows*cols`) and `table`
                     // (`rows*rot_dim`), whose rows this forward uploaded above.
                     unsafe {
-                        kernels::rope_bf16(
+                        kernels::rope_paired_bf16(
                             slot(x),
                             slot(table),
                             slot(out),
                             (rows, cols),
-                            (head_dim, rot_dim),
+                            (head_dim, rot_dim, pairing),
                             stream.0,
                         )
                     }
@@ -1750,22 +1730,24 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     cols,
                     head_dim,
                     rot_dim,
-                    ..
+                    pairing,
                 }) => {
                     let pool = kv.expect("`new` made a pool for a KV tape");
                     let l = layer as usize;
-                    let layout = pool.layout;
+                    // Layer `l`'s class layout: its `kv_heads` and `head_dim` (`validate`
+                    // checked the step's are its class's).
+                    let layout = pool.layer_layout(l);
                     // SAFETY: as above, for `k`, `v` and `k_out` (`rows*cols`), `table`
                     // (`rows*rot_dim`) and `slot_mapping` (`rows` u32), uploaded above; the cache
-                    // halves are layer `l`'s, `num_blocks · kv_heads · 64 · head_dim` each, and
-                    // every slot uploaded is in a checked block or `u32::MAX`.
+                    // halves are layer `l`'s, `num_blocks · kv_heads · 64 · head_dim` of its
+                    // class each, and every slot uploaded is in a checked block or `u32::MAX`.
                     unsafe {
-                        kernels::rope_bf16(
+                        kernels::rope_paired_bf16(
                             slot(k),
                             slot(table),
                             slot(k_out),
                             (rows, cols),
-                            (head_dim, rot_dim),
+                            (head_dim, rot_dim, pairing),
                             stream.0,
                         )
                         .and_then(|()| {
@@ -1797,13 +1779,19 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 ) => {
                     let pool = kv.expect("`new` made a pool for a KV tape");
                     let l = layer as usize;
-                    let layout = pool.layout;
+                    let layout = pool.layer_layout(l);
+                    // The column-split kernel at head dim 512, the head-dim-256 one otherwise
+                    // (whose launcher refuses any other head dim).
+                    let launch = match head_dim {
+                        ATTN_D512_BF16_HEAD_DIM => kernels::attn_prefill_d512_bf16,
+                        _ => kernels::attn_prefill_windowed_bf16,
+                    };
                     // SAFETY: as above, for `q` and `out` (`rows*q_heads*head_dim`), and the
                     // block table and sequence uploaded above, which `forward` checked: every
                     // block the keys `0 .. P + L` need is a table entry inside the pool, and
-                    // `1 ≤ L ≤ rows`. The cache halves are layer `l`'s.
+                    // `1 ≤ L ≤ rows`. The cache halves are layer `l`'s, of its class's layout.
                     unsafe {
-                        kernels::attn_prefill_windowed_bf16(
+                        launch(
                             (slot(q), slot(out)),
                             (pool.half_ptr(l, KvHalf::K), pool.half_ptr(l, KvHalf::V)),
                             (slot(block_table), slot(sequence)),
@@ -1830,13 +1818,18 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 ) => {
                     let pool = kv.expect("`new` made a pool for a KV tape");
                     let l = layer as usize;
-                    let layout = pool.layout;
+                    let layout = pool.layer_layout(l);
+                    let launch = match head_dim {
+                        ATTN_D512_BF16_HEAD_DIM => kernels::attn_decode_d512_bf16,
+                        _ => kernels::attn_decode_windowed_bf16,
+                    };
                     // SAFETY: as the prefill attention's, for `q` and `out` (`q_heads*head_dim`,
                     // its rows are 1: `validate`), and the block table and sequence uploaded
                     // above, which `forward` checked: every block the keys `0 .. P + L` need is a
-                    // table entry inside the pool, and `L ≥ 1`. The cache halves are layer `l`'s.
+                    // table entry inside the pool, and `L ≥ 1`. The cache halves are layer `l`'s,
+                    // of its class's layout.
                     unsafe {
-                        kernels::attn_decode_windowed_bf16(
+                        launch(
                             (slot(q), slot(out)),
                             (pool.half_ptr(l, KvHalf::K), pool.half_ptr(l, KvHalf::V)),
                             (slot(block_table), slot(sequence)),

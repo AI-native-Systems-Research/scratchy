@@ -191,6 +191,24 @@ unsafe extern "C" {
         window: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_attn_prefill_d512_bf16_prepare() -> i32;
+    fn scratchy_cuda_attn_prefill_d512_bf16(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        block_table: *const c_void,
+        sequence: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        num_blocks: u32,
+        scale: f32,
+        window: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_gemm_narrow_bf16_abt_prepare() -> i32;
     fn scratchy_cuda_gemm_narrow_bf16_abt(
         a: *const c_void,
@@ -233,6 +251,23 @@ unsafe extern "C" {
     ) -> i32;
     fn scratchy_cuda_attn_decode_bf16_prepare() -> i32;
     fn scratchy_cuda_attn_decode_bf16(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        block_table: *const c_void,
+        sequence: *const c_void,
+        out: *mut c_void,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        num_blocks: u32,
+        scale: f32,
+        window: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_attn_decode_d512_bf16_prepare() -> i32;
+    fn scratchy_cuda_attn_decode_d512_bf16(
         q: *const c_void,
         k_cache: *const c_void,
         v_cache: *const c_void,
@@ -586,6 +621,14 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("gate_apply_bf16", scratchy_cuda_gate_apply_bf16_prepare),
     ("gate_scale_bf16", scratchy_cuda_gate_scale_bf16_prepare),
     ("attn_decode_bf16", scratchy_cuda_attn_decode_bf16_prepare),
+    (
+        "attn_prefill_d512_bf16",
+        scratchy_cuda_attn_prefill_d512_bf16_prepare,
+    ),
+    (
+        "attn_decode_d512_bf16",
+        scratchy_cuda_attn_decode_d512_bf16_prepare,
+    ),
     ("expert_gemm_bf16", scratchy_cuda_expert_gemm_bf16_prepare),
     ("expert_gemv_bf16", scratchy_cuda_expert_gemv_bf16_prepare),
 ];
@@ -1170,6 +1213,60 @@ pub unsafe fn attn_prefill_windowed_bf16(
     )
 }
 
+/// [`attn_prefill_windowed_bf16`] at head dim 512 (Gemma 4's global layers,
+/// `kernels/attn_prefill_d512_bf16.cu`): `q` and `out` are `[rows, q_heads · 512]`, the caches
+/// `[num_blocks, kv_heads, 64, 512]`. Each of a CTA's two consumer warpgroups keeps one
+/// 256-column half of the output over the same 64 query rows; the masks and the online softmax are
+/// the head-dim-256 kernel's. Asynchronous.
+///
+/// Refused with [`KernelError::AttnShape`] as [`attn_prefill_windowed_bf16`], except that
+/// `head_dim` must be 512 (`step::ATTN_D512_BF16_HEAD_DIM`).
+///
+/// # Safety
+///
+/// As [`attn_prefill_windowed_bf16`]'s, with 512 for 256 in every size.
+pub unsafe fn attn_prefill_d512_bf16(
+    (q, out): (*const c_void, *mut c_void),
+    (k_cache, v_cache): (*const c_void, *const c_void),
+    (block_table, sequence): (*const c_void, *const c_void),
+    (rows, q_heads, kv_heads, head_dim): (u32, u32, u32, u32),
+    (block_size, num_blocks): (u32, u32),
+    (scale, window): (f32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `attn_prefill_windowed_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_attn_prefill_d512_bf16(
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            sequence,
+            out,
+            rows,
+            q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+            scale,
+            window,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::AttnShape {
+            rows,
+            q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+        },
+    )
+}
+
 /// Launch the narrow bf16 GEMM `C = A · Bᵀ` for at most 64 output columns: `A` is `[m, k]`, `B`
 /// `[n, k]` and `C` `[m, n]`, row-major bf16, accumulated in f32 and rounded once. ThunderKittens'
 /// WGMMA over 64-row tiles of `A` against all of `B`'s rows, in a fixed K order, so an output
@@ -1383,6 +1480,57 @@ pub unsafe fn attn_decode_windowed_bf16(
     // shape, scale and window before it touches a pointer.
     let code = unsafe {
         scratchy_cuda_attn_decode_bf16(
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            sequence,
+            out,
+            q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+            scale,
+            window,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::AttnDecodeShape {
+            q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+        },
+    )
+}
+
+/// [`attn_decode_windowed_bf16`] at head dim 512 (Gemma 4's global layers,
+/// `kernels/attn_decode_d512_bf16.cu`): `q` and `out` are `[1, q_heads · 512]`, the caches
+/// `[num_blocks, kv_heads, 64, 512]`. Both consumer warpgroups walk every KV tile in ascending
+/// order, each keeping one 256-column half of the output, so there is no merge. Asynchronous.
+///
+/// Refused with [`KernelError::AttnDecodeShape`] as [`attn_decode_windowed_bf16`], except that
+/// `head_dim` must be 512 (`step::ATTN_D512_BF16_HEAD_DIM`).
+///
+/// # Safety
+///
+/// As [`attn_decode_windowed_bf16`]'s, with 512 for 256 in every size.
+pub unsafe fn attn_decode_d512_bf16(
+    (q, out): (*const c_void, *mut c_void),
+    (k_cache, v_cache): (*const c_void, *const c_void),
+    (block_table, sequence): (*const c_void, *const c_void),
+    (q_heads, kv_heads, head_dim): (u32, u32, u32),
+    (block_size, num_blocks): (u32, u32),
+    (scale, window): (f32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `attn_decode_windowed_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_attn_decode_d512_bf16(
             q,
             k_cache,
             v_cache,

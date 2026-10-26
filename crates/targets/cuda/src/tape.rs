@@ -8,6 +8,7 @@
 //! analyses nothing. Plain `Copy` data with no pointer, so it builds in a `const` context and on a
 //! host with no CUDA toolchain.
 
+use scratchy_subtile::paged_kv_layout::PagedKvLayout;
 use serde::Serialize;
 
 use crate::op_abi::CUDA_EXPERT_TILE_ROWS;
@@ -110,6 +111,43 @@ pub struct KvTape {
     pub classes: &'static [KvClass],
     /// Per entry of `layers`, its class: an index into `classes`.
     pub layer_class: &'static [u8],
+}
+
+impl KvTape {
+    /// The KV pool of this tape's layers at `num_blocks` blocks: per layer, in [`Self::layers`] order,
+    /// its class's layout (`classes[layer_class[l]]`'s `kv_heads` and `head_dim`) and the
+    /// element offset of its K buffer, then its V buffer, back to back; and the pool's bytes. `None`
+    /// when a count overflows `u64` or the host's `usize`. For one class every layer's buffer is
+    /// `buffer_elems` and layer `l`'s K buffer is at `2 · l · buffer_elems`, the pool's layout before
+    /// the classes.
+    pub fn pool_layout(&self, num_blocks: u32) -> Option<(Vec<(PagedKvLayout, usize)>, u64)> {
+        let mut at = 0u64;
+        let mut per_layer = Vec::with_capacity(self.layers.len());
+        for &c in self.layer_class {
+            let class = self.classes.get(usize::from(c))?;
+            let layout = PagedKvLayout {
+                num_blocks,
+                num_kv_heads: class.kv_heads,
+                block_size: self.block_size,
+                head_dim: class.head_dim,
+            };
+            per_layer.push((layout, usize::try_from(at).ok()?));
+            at = at.checked_add(kv_buffer_elems(&layout)?.checked_mul(2)?)?;
+        }
+        let bytes = at.checked_mul(std::mem::size_of::<u16>() as u64)?;
+        usize::try_from(bytes).ok()?;
+        Some((per_layer, bytes))
+    }
+}
+
+/// One layer's K (or V) buffer's elements: `num_blocks · kv_heads · block_size · head_dim`, or
+/// `None` when the count overflows `u64`. Every factor is widened and multiplied checked.
+fn kv_buffer_elems(layout: &PagedKvLayout) -> Option<u64> {
+    [layout.num_kv_heads, layout.block_size, layout.head_dim]
+        .into_iter()
+        .try_fold(u64::from(layout.num_blocks), |acc, f| {
+            acc.checked_mul(u64::from(f))
+        })
 }
 
 /// One attention class's KV geometry: each layer of it caches `kv_heads` heads of `head_dim`,
@@ -4048,5 +4086,120 @@ mod tests {
             tape(None, &[norm(2304)]).validate(),
             Err(TapeError::MoeStepGeometry { step: 0 })
         );
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    const NO_SPAN: ArenaSpan = ArenaSpan {
+        offset: ArenaOffset(0),
+        bytes: 0,
+    };
+
+    /// A KV tape of `layer_class` over `classes`, one layer per entry; its regions are not read.
+    fn kv(classes: &'static [KvClass], layer_class: &'static [u8]) -> KvTape {
+        KvTape {
+            layers: Box::leak((0..layer_class.len() as u32).collect::<Vec<_>>().into()),
+            kv_heads: classes[0].kv_heads,
+            head_dim: classes[0].head_dim,
+            block_size: crate::step::CUDA_KV_BLOCK_SIZE,
+            max_blocks_per_seq: crate::step::CUDA_MAX_BLOCKS_PER_SEQ,
+            block_table: NO_SPAN,
+            slot_mapping: NO_SPAN,
+            sequence: NO_SPAN,
+            classes,
+            layer_class,
+        }
+    }
+
+    /// Gemma 4's 30 layers: sliding (8 × 256, window 1024) but every sixth, global (2 × 512). The
+    /// pool is 225,280 bytes a token (25 · 8 · 256 · 2 · 2 + 5 · 2 · 512 · 2 · 2, #885's 204,800 +
+    /// 20,480), each layer's K buffer right after the previous layer's V, at its class's size.
+    #[test]
+    fn the_per_class_pool_holds_gemmas_30_layers_back_to_back() {
+        const CLASSES: [KvClass; 2] = [
+            KvClass {
+                kv_heads: 8,
+                head_dim: 256,
+                window: Some(1024),
+            },
+            KvClass {
+                kv_heads: 2,
+                head_dim: 512,
+                window: None,
+            },
+        ];
+        let layer_class: Vec<u8> = (0..30).map(|l| u8::from(l % 6 == 5)).collect();
+        let kv = kv(&CLASSES, Box::leak(layer_class.clone().into()));
+        let num_blocks = 160;
+        let (per_layer, bytes) = kv.pool_layout(num_blocks).expect("the pool fits");
+        let tokens = u64::from(num_blocks) * 64;
+        eprintln!(
+            "gemma pool: {bytes} bytes at {num_blocks} blocks, {} a token",
+            bytes / tokens
+        );
+        assert_eq!(bytes, 225_280 * tokens);
+        let mut at = 0usize;
+        for (l, ((layout, offset), &c)) in per_layer.iter().zip(&layer_class).enumerate() {
+            let class = CLASSES[usize::from(c)];
+            assert_eq!(
+                (
+                    layout.num_kv_heads,
+                    layout.head_dim,
+                    layout.num_blocks,
+                    layout.block_size
+                ),
+                (class.kv_heads, class.head_dim, num_blocks, 64),
+                "layer {l}"
+            );
+            assert_eq!(
+                *offset, at,
+                "layer {l}: K right after the previous layer's V"
+            );
+            at += 2 * layout.buffer_elems();
+        }
+        assert_eq!(at * 2, bytes as usize, "the last V ends the pool");
+    }
+
+    /// One class (every Qwen tape): layer `l`'s K buffer is at `2 · l · buffer_elems`, and the
+    /// pool's bytes are `layers · 2 · buffer_elems · 2`, the pool before the classes.
+    #[test]
+    fn a_uniform_pool_is_the_pool_before_the_classes() {
+        const ONE: [KvClass; 1] = [KvClass {
+            kv_heads: 2,
+            head_dim: 256,
+            window: None,
+        }];
+        let kv = kv(&ONE, &[0; 6]);
+        let (per_layer, bytes) = kv.pool_layout(37).expect("the pool fits");
+        let buffer = PagedKvLayout {
+            num_blocks: 37,
+            num_kv_heads: 2,
+            block_size: 64,
+            head_dim: 256,
+        }
+        .buffer_elems();
+        let offsets: Vec<usize> = per_layer.iter().map(|&(_, at)| at).collect();
+        assert_eq!(offsets, (0..6).map(|l| 2 * l * buffer).collect::<Vec<_>>());
+        assert_eq!(bytes, (6 * 2 * buffer * 2) as u64);
+    }
+
+    /// A class index past `classes`, or a pool past `u64`, is `None`.
+    #[test]
+    fn a_pool_with_a_missing_class_or_too_many_bytes_is_refused() {
+        const ONE: [KvClass; 1] = [KvClass {
+            kv_heads: 2,
+            head_dim: 256,
+            window: None,
+        }];
+        assert_eq!(kv(&ONE, &[0, 1]).pool_layout(4), None);
+        const HUGE: [KvClass; 1] = [KvClass {
+            kv_heads: u32::MAX,
+            head_dim: u32::MAX,
+            window: None,
+        }];
+        assert_eq!(kv(&HUGE, &[0]).pool_layout(u32::MAX), None);
     }
 }
