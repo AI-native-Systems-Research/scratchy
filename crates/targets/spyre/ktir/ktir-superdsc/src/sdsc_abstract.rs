@@ -800,6 +800,78 @@ impl<const NQH: u32, const NKVH: u32, const HD: u32> AttnGeometry<NQH, NKVH, HD>
     pub const fn per_request_rows(self) -> PerRequestRows {
         Self::PER_REQUEST_ROWS
     }
+
+    /// ⭐ THE ID-STICK WIDTH — `NKVH * GQA`: every kv head's window block, named once per query
+    /// head of its group, is what one page-window trip of the block-entry tables consumes. By
+    /// [`GQA`](Self::GQA)'s exact division the product IS `NQH` — one fact, two spellings — but
+    /// the LAW is the product, because that is the count the tables state per trip and the
+    /// kernels' one-stick-per-trip contract (`NKVH * GQA == 32`) is named against. The
+    /// value-side twin is [`SplicedAttnRegion::ktb`](SplicedAttnRegion::ktb), which carries the
+    /// same product where only the pool and the group are in hand.
+    pub const KTB: u32 = NKVH * Self::GQA;
+
+    /// [`KTB`](Self::KTB), spent as a value.
+    pub const fn ktb(self) -> u32 {
+        Self::KTB
+    }
+
+    /// ⭐ THE 64-LANE SLABS ONE HEAD'S WINDOW SPANS — `HD / POOL_STICK`, the per-(window, slab)
+    /// gather's trip count. THE V PLANE'S LAW ([`PagedKvPool::addr`]): V is feature-slab-major —
+    /// `(feat/64) * (PLANE_SLOTS*64) + slot*64 + feat%64` — so a `[64, HD]` V window is `slabs`
+    /// runs of 4096 elements, never one `HD*64` run; one gather entry per (window, slab) is the
+    /// only truthful spelling at every head dim, and at `slabs == 1` it is the
+    /// one-entry-per-window form byte for byte. Kᵗ's window is contiguous at every head dim
+    /// (its own addr law), but the kernels state BOTH planes' gathers in the same `[64, 64]`
+    /// block shape, so both tables carry `slabs` entries per window.
+    ///
+    /// ⛔ THE STICK-MULTIPLE LAW, SPENT WHERE A SLAB-WITNESSED FACT IS DERIVED: the head dim
+    /// must be a whole number of 64-lane sticks. This is a `const fn` and NOT an asserted
+    /// associated const ON PURPOSE: the geometry door instantiates every arm the configs
+    /// declare — including the arms whose head dim is not a stick multiple — so an asserted
+    /// const would refuse the DOOR and with it every model, when the law is the MODEL's own.
+    /// Evaluated at the splice, this assert is the declaring model's build failure: a geometry
+    /// that cannot lower is a compile error for exactly the model that states it.
+    pub const fn slabs(self) -> u32 {
+        assert!(
+            HD.is_multiple_of(POOL_STICK),
+            "AttnGeometry: the head dim is not a whole number of 64-lane sticks — the paged \
+             pool's planes are stick-blocked, so a sub-stick head has no per-(window, slab) \
+             gather. The fix is a pool layout for sub-stick heads, never a rounding here"
+        );
+        HD / POOL_STICK
+    }
+
+    /// The id table's own row — [`KTB`](Self::KTB) index entries at 4 bytes each, the block-entry
+    /// tables' natural per-(window, query-row) width.
+    pub const fn id_row_bytes(self) -> u32 {
+        Self::KTB * 4
+    }
+
+    /// The mask's own row — one 64-lane fp16 stick, the additive validity mask's lane width.
+    pub const MASK_ROW_BYTES: u32 = POOL_STICK * 2;
+
+    /// ⭐ THE COMMON PITCH — the per-(window, query-row) byte pitch the id tables and the mask
+    /// are BOTH padded to, the one number the fold's single per-pass Activation shift advances.
+    ///
+    /// The two tables' natural rows disagree wherever [`KTB`](Self::KTB) is not 32:
+    /// [`id_row_bytes`](Self::id_row_bytes) of entries against [`MASK_ROW_BYTES`](Self::MASK_ROW_BYTES)
+    /// of mask lanes. The pitch is their LEAST COMMON MULTIPLE, so each table's real row leads a
+    /// pad the shift walks past unread — the existing padding law (one id stick per mask row,
+    /// `[REGION_PAGES * W4 * MQ * KTB]` entries) IS this pitch at `KTB == 32`, where the two rows
+    /// coincide and the pad is empty. The pitch is a whole number of 128 B sticks by construction
+    /// (a multiple of 4 and of 128 has 128 as a divisor of their lcm), which the SenUint32 copy's
+    /// stick granularity requires.
+    pub const fn table_pitch(self) -> u32 {
+        // The Euclidean walk for the gcd — spelled here so the law is one expression, not a
+        // trait-method provenance question.
+        let (mut a, mut b) = (self.id_row_bytes(), Self::MASK_ROW_BYTES);
+        while b != 0 {
+            let r = a % b;
+            a = b;
+            b = r;
+        }
+        self.id_row_bytes() / a * Self::MASK_ROW_BYTES
+    }
 }
 
 /// ⭐ WHAT A DECODE DISPATCH ARM RUNS with the const width it named — the consumer side of
@@ -6676,6 +6748,14 @@ impl PagedKvPool {
     /// be absorbed without widening anything the attention actually sweeps.
     pub const PLANE_SLOTS: usize = Self::PAGE_SLOTS + Self::WRITE_SLACK;
 
+    /// ⭐ THE 64-SLOT WINDOWS ONE KV HEAD'S PAGE HOLDS — `PLANE_SLOTS / POOL_STICK`, the `W4`
+    /// every spliced attention kernel's window loop walks. A const, not a method's division,
+    /// because it divides two consts of this pool: the head dim cancels (`hd * PLANE_SLOTS`
+    /// over `hd * POOL_STICK`), so it is the same number at every geometry — the ONE
+    /// derivation the index entry's block term and the fillers' extent arithmetic share, and
+    /// the value [`PagedKvPool::windows_per_page`] hands to callers that hold only the value.
+    pub const WINDOWS_PER_PAGE: u32 = (Self::PLANE_SLOTS / STK) as u32;
+
     // REQUESTS ONE PAGE HOLDS — the extent of the pool's request dimension, and the widest batch any
     // launch can express.
     //
@@ -7002,12 +7082,45 @@ impl PagedKvPool {
         Self::PAGE_SLOTS / STK
     }
 
-    /// ⭐⭐⭐ THE GATHER'S QUANTUM — the ELEMENTS in one 64-slot Kᵗ block, `hd * POOL_STICK`.
+    /// ⭐⭐⭐ THE GATHER'S QUANTUM — the ELEMENTS in one `[STK, STK]` SLAB BLOCK, `POOL_STICK²`,
+    /// FIXED at every head dim.
     ///
-    /// This is the unit an index entry names. The whole pool is a uniform array of these: every stride
-    /// it defines ([`plane_block_elems`](Self::plane_block_elems) `= 4 *` this, the plane, layer and
-    /// page strides above it) is an exact multiple, so ONE integer reaches any cell and
-    /// `addr = idx * skip_addr + base` is exact whenever `skip_addr` divides this.
+    /// This is the unit an index entry names. Both planes' windows divide into it at EVERY head
+    /// dim — Kᵗ's (window, slab) sub-runs are contiguous `STK²` runs by its own addr law
+    /// (`feat·STK + slot`), and the V plane's slab runs are `STK²` by the feature-slab-major law
+    /// (`slot·STK + feat%STK`) — so ONE integer reaches any cell and `addr = idx·skip_addr +
+    /// base` is exact with `skip_addr` equal to this. At `hd == 64` (`slabs == 1`) a slab block
+    /// IS the stick block, so every value composed in this unit is identical to the old
+    /// stick-unit one.
+    ///
+    /// ⛔ NOT [`Self::stick_block_elems`], WHICH IS HEAD-DIM-PROPORTIONAL (`hd · STK`): at
+    /// `hd == 128` a stick block is TWO slab blocks, and a gathered read striding at the stick
+    /// width while the host composes its values at the slab width reads every entry at the
+    /// wrong address from a clean bake — the exact disagreement the gather door's entry-unit
+    /// check exists to refuse. The stick block remains the COPY-gather family's pin
+    /// ([`PagePlaneExtent::entry_elems`]); the INDEXED gather's unit is this one.
+    pub fn slab_block_elems(&self) -> usize {
+        STK * STK
+    }
+
+    /// ⭐ THE SLAB ENTRY IN **BYTES** — what one index step of a pooled gathered read advances
+    /// the address by. [`Self::slab_block_elems`] times the pool's word length; stated here so
+    /// the `* 2` is not respelled at every caller.
+    pub fn slab_block_bytes(&self) -> u64 {
+        self.slab_block_elems() as u64
+            * <crate::superdsc_opspec::Fp16 as crate::superdsc_opspec::DataFormat>::WORD_LENGTH
+                as u64
+    }
+
+    /// ⭐⭐⭐ THE STICK BLOCK — the ELEMENTS in one 64-slot Kᵗ block at the head's own width,
+    /// `hd * POOL_STICK`. HEAD-DIM-PROPORTIONAL, and NO LONGER the indexed gather's entry unit
+    /// (that is [`Self::slab_block_elems`], FIXED at every hd); this is the COPY-gather
+    /// family's pin ([`PagePlaneExtent::entry_elems`]) — the op's unit of work division over
+    /// cores — and the quantum the pool's own strides are multiples of.
+    ///
+    /// The whole pool is a uniform array of these: every stride it defines
+    /// ([`plane_block_elems`](Self::plane_block_elems) `= 4 *` this, the plane, layer and page
+    /// strides above it) is an exact multiple, so ONE integer reaches any cell.
     ///
     /// ⛔ NOT `plane_block_elems`, WHICH IS FOUR OF THESE. That is the distance to the next KV HEAD; a
     /// gather stepping by it would skip three quarters of every head's keys and still bake.
@@ -7217,15 +7330,18 @@ impl PagedKvPool {
 /// host today (fold_plan::page_base_bytes):   addr = phys * page_stride_bytes
 /// card with a gather (ConvertData_gather_idx): addr = idx  * skip_addr      + base
 /// ```
-/// so `idx = phys * (page_stride_bytes / skip_addr_bytes)`, and `skip_addr_bytes` is ONE STICK BLOCK
-/// because that is what the emitter declares (`PageExtent::of_one_stick()` pinned on the slot axis).
-/// Both inputs are read off the SAME live session, which is what makes this an identity rather than a
+/// so `idx = phys * (page_stride_bytes / skip_addr_bytes)`, and `skip_addr_bytes` is ONE SLAB
+/// BLOCK because that is what the indexed gathers declare (both planes' windows divide into
+/// `[STK, STK]` slab blocks at every head dim — the per-(window, slab) gather form). Both
+/// inputs are read off the SAME live session, which is what makes this an identity rather than a
 /// second derivation that has to be kept in agreement with the first.
 ///
-/// ⛔ THE FACTOR IS NOT A CONSTANT AND IT IS NOT 4096. It carries `hd` (a stick block is `hd * 64`
-/// elements — 4096 at head_dim 64, **8192 at head_dim 128**) and it carries `iters`, because a page
-/// spans every LAYER (`page_stride_bytes = iters * kv_stride`). So it is a fact about the BUNDLE, and
-/// every comment in this tree that says "global 4096-element block number" is implicitly hd=64.
+/// ⛔ THE FACTOR IS NOT A CONSTANT AND IT IS NOT `iters * 3 * nkvh * 4`. It carries `SLABS`
+/// (a page's one-plane slab-block run is `nkvh * W4 * SLABS` blocks — 32 at head_dim 64,
+/// **64 at head_dim 128**) and it carries `iters`, because a page spans every LAYER
+/// (`page_stride_bytes = iters * kv_stride`). So it is a fact about the BUNDLE: at
+/// `SLABS == 1` it is the old stick-block factor exactly (a slab block IS the stick block),
+/// which is what the granite-2b byte-equal law pins.
 ///
 /// ⛔ `None` RATHER THAN A ROUNDED ANSWER when a page is not a whole number of entries: no integer
 /// index can then name a page boundary, so every entry would land somewhere inside the previous page.
@@ -7236,7 +7352,7 @@ pub fn gather_entries_per_page(
     page_stride_bytes: u64,
     pool: PagedKvPool,
 ) -> Option<EntriesPerPage> {
-    let entry = pool.stick_block_bytes();
+    let entry = pool.slab_block_bytes();
     if page_stride_bytes == 0 || entry == 0 || !page_stride_bytes.is_multiple_of(entry) {
         return None;
     }
@@ -7246,15 +7362,16 @@ pub fn gather_entries_per_page(
 }
 
 /// ⭐⭐⭐⭐⭐ INDEX ENTRIES PER PHYSICAL PAGE — the factor that converts the host's page number into the
-/// card's stick-block number, and it has exactly ONE door: [`gather_entries_per_page`].
+/// card's slab-block number, and it has exactly ONE door: [`gather_entries_per_page`].
 ///
 /// ⛔⛔⛔ THE WHOLE POINT IS THAT IT CANNOT BE WRITTEN DOWN. It was an `i64` parameter, so any caller
-/// could supply a literal or its own `page_stride / 4096` — and the true factor carries `hd` (a stick
-/// block is `hd * POOL_STICK` elements: 4096 at head_dim 64, **8192 at head_dim 128**) and carries
-/// `iters`, because a page spans every layer. Every comment in this tree that says "global
-/// 4096-element block" is implicitly hd=64, which is exactly the hand-spelled constant this type
-/// makes unspellable. The only constructor divides the SESSION's own `page_stride_bytes` by the
-/// POOL's own `stick_block_bytes()`, so both halves of the identity come from the artifact.
+/// could supply a literal or its own `page_stride / 4096` — and the true factor carries `SLABS` (a
+/// page's one-plane slab-block run is `nkvh * W4 * SLABS`: 32 at head_dim 64, **64 at head_dim
+/// 128`) and carries `iters`, because a page spans every layer. Every comment in this tree that
+/// says "global 4096-element block" is implicitly `SLABS == 1`, which is exactly the hand-spelled
+/// constant this type makes unspellable. The only constructor divides the SESSION's own
+/// `page_stride_bytes` by the POOL's own `slab_block_bytes()`, so both halves of the identity come
+/// from the artifact.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, serde::Serialize)]
 pub struct EntriesPerPage(i64);
 
@@ -7265,9 +7382,9 @@ impl EntriesPerPage {
     }
 }
 
-/// ⭐⭐⭐⭐⭐ ONE INDEX ENTRY — a GLOBAL STICK-BLOCK NUMBER that dxp turns into an address as
-/// `addr = idx * skip_addr + base` (`ConvertData_gather_idx`). It is an ADDRESS IN WAITING, and it has
-/// exactly one door: [`Self::of_page_block`].
+/// ⭐⭐⭐⭐⭐ ONE INDEX ENTRY — a GLOBAL SLAB-BLOCK NUMBER that dxp turns into an address as
+/// `addr = idx * skip_addr + base` (`ConvertData_gather_idx`). It is an ADDRESS IN WAITING, it
+/// CARRIES ITS PLANE, and it has exactly one door: [`Self::of_slab_block`].
 ///
 /// ⛔⛔⛔ IT WAS A BARE `i32` IN A `Vec<i32>`, WHICH IS THE ONE SHAPE THAT LETS THE COMPOSITION BE
 /// SPELLED WRONG. The entry is `phys * entries_per_page + block_in_page`, and each of those three
@@ -7278,10 +7395,21 @@ impl EntriesPerPage {
 /// constructor that takes an [`EntriesPerPage`] (which itself cannot be hand-written) leaves no
 /// arithmetic for a caller to get wrong.
 ///
+/// ⛔ AND THE PLANE IS PART OF THE VALUE, NOT A COMMENT. The two planes number a page's slab
+/// blocks DIFFERENTLY at `SLABS > 1` (Kᵗ window-major with slab sub-runs, V feature-slab-major —
+/// the [`PagedKvPool::addr`] law), so the same integer is a DIFFERENT block per plane: a Kᵗ
+/// number staged into the V table is a clean-bake wrong address, and the only thing that can
+/// catch it is the value knowing which plane it was minted for. The one encoding site
+/// ([`attn_step_staging`]'s LE-byte writer) refuses a table whose entries disagree with the
+/// plane it is staging.
+///
 /// ⛔ NO `From<i32>`, NO `Default`, AND NO ARITHMETIC OPERATORS, deliberately: a `+` on this type is
-/// how a caller would re-add a page term that `of_page_block` already added.
+/// how a caller would re-add a page term that `of_slab_block` already added.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub struct GatherEntry(i32);
+pub struct GatherEntry {
+    plane: KvPlane,
+    value: i32,
+}
 
 /// ⭐⭐⭐⭐⭐ THE ENTRY CEILING — the EXCLUSIVE upper bound on index values a gathered read of ONE
 /// pooled plane may hold, and the bound is on the **VALUE**, not the run: the values are runtime
@@ -7379,8 +7507,8 @@ impl GatherEntryCeiling {
 /// ceiling cannot disagree with either.
 ///
 /// `None` for exactly the reasons [`gather_entries_per_page`] refuses (an unpaged bundle, a page
-/// that is not a whole number of stick blocks), plus a plane that is not itself a whole number of
-/// stick blocks — which no legal pool is, but a ceiling minted from one would be a lie, so the
+/// that is not a whole number of slab blocks), plus a plane that is not itself a whole number of
+/// slab blocks — which no legal pool is, but a ceiling minted from one would be a lie, so the
 /// door refuses rather than rounds.
 pub fn gather_entry_ceiling(
     page_ceiling: u64,
@@ -7388,7 +7516,7 @@ pub fn gather_entry_ceiling(
     pool: PagedKvPool,
 ) -> Option<GatherEntryCeiling> {
     let per_page = gather_entries_per_page(page_stride_bytes, pool)?;
-    let entry = pool.stick_block_elems();
+    let entry = pool.slab_block_elems();
     let plane_blocks = pool.plane_stride().checked_div(entry)?;
     GatherEntryCeiling::of_pool(page_ceiling, per_page, plane_blocks as u64)
 }
@@ -7416,7 +7544,7 @@ impl GatherReach {
     pub fn of_plane(page_ceiling: u64, page_stride_bytes: u64, pool: PagedKvPool) -> Option<Self> {
         Some(GatherReach {
             max_entry: gather_entry_ceiling(page_ceiling, page_stride_bytes, pool)?,
-            entry_elems: pool.stick_block_elems() as u64,
+            entry_elems: pool.slab_block_elems() as u64,
         })
     }
 
@@ -7430,7 +7558,7 @@ impl GatherReach {
     /// times). The reach is the SOURCE'S OWN EXTENT — ceiling = the source's row count, unit =
     /// its row width — the trivial bound a bare `min(swept, placement)` assumed silently: now
     /// STATED, typed, and checked at the door. This is the second family of this one type; the
-    /// pool mint ([`Self::of_plane`]) keeps its own semantics (entries name stick-blocks
+    /// pool mint ([`Self::of_plane`]) keeps its own semantics (entries name slab-blocks
     /// across a paged pool the runtime re-bases), and the gather door tells the families apart
     /// by the PLACEMENT: a placement holding the whole reach is a source extent, a placement
     /// holding a slice of it is a pool. `None` on a zero row count or row width.
@@ -7444,9 +7572,9 @@ impl GatherReach {
         })
     }
 
-    /// The entry unit the host's index values address at — the pool's stick block, `hd · 64`
-    /// elements, the width [`GatherEntry::of_page_block`] counts in and the descriptor's
-    /// `skip_addr` must equal.
+    /// The entry unit the host's index values address at — the pool's SLAB block, `POOL_STICK²`
+    /// elements at every head dim, the width [`GatherEntry::of_slab_block`] counts in and the
+    /// descriptor's `skip_addr` must equal.
     pub const fn entry_elems(self) -> u64 {
         self.entry_elems
     }
@@ -7460,34 +7588,72 @@ impl GatherReach {
 }
 
 impl GatherEntry {
-    /// THE ONE COMPOSITION: physical page `phys`, times this bundle's entries-per-page, plus the
-    /// block that `(kv head, slot window)` occupies inside a page ([`GatherScratch::block_in_page`]).
+    /// ⭐⭐⭐⭐⭐ THE ONE COMPOSITION — physical page `phys`, times this bundle's entries-per-page,
+    /// plus the slab block that `(kv head, window, slab)` occupies inside a page **of the plane the
+    /// entry names**, through the pool's own addr law. The two planes number a page's slab blocks
+    /// differently at `SLABS > 1`, and BOTH spellings are derived here from the one law — never
+    /// composed by a caller:
     ///
-    /// `None` on a negative page, when the product or sum leaves `i32` — the width the descriptor
-    /// declares (`SENUINT32`) — or when the composed value is AT OR ABOVE the pool's ceiling: the
-    /// values are runtime data, and the ceiling is the one bound on them a compile can make
-    /// unconstructible rather than check after the fact. A wrapped entry is an address, so it
-    /// cannot be allowed to round.
-    pub fn of_page_block(
+    /// ```text
+    /// Kᵗ:  block = kvh · W4·SLABS + window · SLABS + slab   (feat-major: slab sub-runs contiguous)
+    /// V:   block = kvh · W4·SLABS + slab · W4 + window      (feature-slab-major)
+    /// ```
+    ///
+    /// Both reduce to `kvh · W4 + window` at `SLABS == 1`, where a slab block IS the stick block
+    /// and every composed value is identical to the old stick-unit composition — the granite-2b
+    /// byte-equal law's own premise.
+    ///
+    /// `None` on a negative page, a plane that is not Kᵗ or V (natural K has no gathered
+    /// reader), a `(kvh, window, slab)` outside the pool's own geometry, when the product or sum
+    /// leaves `i32` — the width the descriptor declares (`SENUINT32`) — or when the composed
+    /// value is AT OR ABOVE the pool's ceiling: the values are runtime data, and the ceiling is
+    /// the one bound on them a compile can make unconstructible rather than check after the
+    /// fact. A wrapped entry is an address, so it cannot be allowed to round.
+    pub fn of_slab_block(
+        plane: KvPlane,
+        pool: PagedKvPool,
         ceiling: GatherEntryCeiling,
         phys: i64,
-        block_in_page: u32,
+        kvh: u32,
+        window: u32,
+        slab: u32,
     ) -> Option<Self> {
         if phys < 0 {
             return None;
         }
+        let w4 = pool.windows_per_page();
+        let slabs = pool.window_slabs()?;
+        if kvh >= pool.nkvh() || window >= w4 || slab >= slabs {
+            return None;
+        }
+        let block = match plane {
+            // Kᵗ is FEAT-MAJOR (`feat·STK + slot`): a window is W4·… no — a window's slabs are
+            // CONTIGUOUS sub-runs, so window strides SLABS blocks and slab strides one.
+            KvPlane::Kt => (kvh * w4 * slabs) + window * slabs + slab,
+            // V is FEATURE-SLAB-MAJOR (`slot·STK + feat%STK`): a window's slab run sits inside
+            // slab s's plane-wide band, so slab strides W4 blocks and window strides one.
+            KvPlane::V => (kvh * w4 * slabs) + slab * w4 + window,
+            // Natural K is the cache WRITE's input plane; no gathered reader names it.
+            KvPlane::Knat => return None,
+        };
         let e = phys
             .checked_mul(ceiling.per_page().get())?
-            .checked_add(i64::from(block_in_page))?;
+            .checked_add(i64::from(block))?;
         if e >= ceiling.get() {
             return None;
         }
-        i32::try_from(e).ok().map(GatherEntry)
+        i32::try_from(e).ok().map(|value| GatherEntry { plane, value })
+    }
+
+    /// The plane this entry names blocks of — the value's own fact, checked at the one encoding
+    /// site so a Kᵗ number cannot be staged into the V table.
+    pub const fn plane(self) -> KvPlane {
+        self.plane
     }
 
     /// The wire value, for the one site that encodes the table into LE bytes.
     pub const fn as_i32(self) -> i32 {
-        self.0
+        self.value
     }
 }
 
@@ -12167,23 +12333,30 @@ pub mod attn_step_slots {
 
 impl PagedKvPool {
     /// ⭐ THE 64-SLOT WINDOWS ONE KV HEAD'S PAGE HOLDS — the pool's own stick geometry, the `W4`
-    /// every spliced attention kernel's window loop walks. Read off the plane's own two sizes,
-    /// never spelled as 4: the ONE derivation the index entry's block term and the fillers'
-    /// extent arithmetic share.
-    pub fn windows_per_page(&self) -> Option<u32> {
-        u32::try_from(self.plane_block_elems() / self.stick_block_elems().max(1)).ok()
+    /// every spliced attention kernel's window loop walks.
+    /// [`WINDOWS_PER_PAGE`](Self::WINDOWS_PER_PAGE) spent as a value: the division it states is
+    /// between two consts, so it can no longer refuse — there is no geometry at which the
+    /// plane's stick count does not divide.
+    pub const fn windows_per_page(&self) -> u32 {
+        Self::WINDOWS_PER_PAGE
     }
 
-    /// ⭐ WHICH 64-SLOT STICK BLOCK OF A PAGE'S PLANE a (kv head, window) is — the term that rides
-    /// in the gather INDEX ENTRY rather than in any base offset, because one entry serves every
-    /// head and window of a trip.
-    ///
-    /// Kᵗ and V agree on this number: Kᵗ's window `b` of head `kvh` is at
-    /// `kvh*hd*PLANE_SLOTS + b*hd*64` and V's at `kvh*hd*PLANE_SLOTS + b*64*hd` — the same block,
-    /// which is why one index value serves both planes' tables. `None` when the head or window is
-    /// outside the page's own geometry — a block the pool does not hold.
+    /// ⭐ THE 64-LANE SLABS ONE WINDOW SPANS — `hd / POOL_STICK`, the per-(window, slab)
+    /// gather's trip count, spent as a value. `None` on a head dim that is not a whole number
+    /// of 64-lane sticks: the pool's planes are stick-blocked, so a sub-stick head has no
+    /// slab-block grid at all (the same law [`AttnGeometry::slabs`] asserts at the splice,
+    /// refused here at the value side — the declaring model's own build failure either way).
+    pub fn window_slabs(&self) -> Option<u32> {
+        self.hd().checked_div(POOL_STICK).filter(|&s| s > 0 && (s * POOL_STICK == self.hd()))
+    }
+
+    /// ⭐ WHICH 64-SLOT STICK BLOCK OF A PAGE'S PLANE a (kv head, window) is — the STICK-block
+    /// number, the term the COPY-gather family's index entries carry. The SLAB-block tables
+    /// do NOT use this: at `slabs > 1` the two gathered planes number a page's slab blocks
+    /// DIFFERENTLY, and that per-plane composition lives in [`GatherEntry::of_slab_block`]
+    /// alone. `None` when the head or window is outside the page's own geometry.
     pub fn block_in_page(&self, kvh: u32, window: u32) -> Option<u32> {
-        let per_plane = self.windows_per_page()?;
+        let per_plane = self.windows_per_page();
         (kvh < self.nkvh && window < per_plane).then_some(kvh * per_plane + window)
     }
 }
@@ -12204,6 +12377,23 @@ impl PagedKvPool {
 /// one), and a region re-derived from the live context is a second derivation of a bake fact. A
 /// non-divisor refuses: a mask extent that is not a whole number of `W4·mq`-row page blocks is a
 /// bake/stage disagreement, not a rounding decision.
+/// ⭐ THE COMMON PITCH AT AN ID-STICK WIDTH — `lcm(KTB·4, POOL_STICK·2)` — the value-side twin
+/// of [`AttnGeometry::table_pitch`](AttnGeometry::table_pitch)'s own law, stated where only the
+/// pool and the group are in hand. A whole number of 128 B sticks by construction (a multiple
+/// of 4 and of 128 has 128 as a divisor of their lcm), which the SenUint32 copy's stick
+/// granularity requires.
+fn pitch_at(ktb: u32) -> u32 {
+    // The Euclidean walk for the gcd — spelled here so the law is one expression, not a
+    // trait-method provenance question.
+    let (mut a, mut b) = (ktb * 4, POOL_STICK * 2);
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    ktb * 4 / a * (POOL_STICK * 2)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SplicedAttnRegion {
     pages: u32,
@@ -12222,9 +12412,13 @@ impl SplicedAttnRegion {
         gqa: NonZeroU32,
         mq: RungWidth,
     ) -> Option<Self> {
-        let w4 = pool.windows_per_page()?;
-        // One page block of the mask: `W4 * mq` rows of 64 f16 lanes.
-        let block = u64::from(w4) * mq.count() as u64 * 64 * 2;
+        let w4 = pool.windows_per_page();
+        // One page block of the mask: `W4 * mq` rows, each `SLABS·PITCH` bytes wide — the
+        // mask's own row stride, the ONE per-(window, query-row) advance the ids tables and
+        // the mask share, so the fold's single per-pass Activation shift walks both by one
+        // number.
+        let pitch = pool.window_slabs()? as u64 * u64::from(pitch_at(pool.nkvh().checked_mul(gqa.get())?));
+        let block = u64::from(w4) * mq.count() as u64 * pitch;
         if block == 0 || !extent_bytes.is_multiple_of(block) {
             return None;
         }
@@ -12249,15 +12443,36 @@ impl SplicedAttnRegion {
 
     /// The 64-slot windows one kv head's page holds.
     pub fn w4(self) -> u32 {
-        self.pool.windows_per_page().unwrap_or(0)
+        self.pool.windows_per_page()
     }
 
     /// The id stick's width — every kv head's block in one window, named once per GQA group.
+    /// The value-side twin of [`AttnGeometry::KTB`](AttnGeometry::KTB): the same product
+    /// (`nkvh * gqa`), carried where only the pool and the group are in hand — the geometry
+    /// witness states it as a const, and the two cannot disagree without a door-arm mismatch
+    /// the staging would have to survive.
     pub fn ktb(self) -> Option<u32> {
         self.pool.nkvh().checked_mul(self.gqa.get())
     }
 
-    /// The id sticks one page block of the table states — one per mask row, the padded pitch law.
+    /// The 64-lane slabs one window spans — [`PagedKvPool::window_slabs`], the region's own
+    /// spelling of the pool's slab grid. `None` on a sub-stick head, exactly the pool's own
+    /// refusal (the declaring model's build failure either way).
+    pub fn slabs(self) -> Option<u32> {
+        self.pool.window_slabs()
+    }
+
+    /// ⭐ THE COMMON PITCH — the per-(window, query-row) byte pitch the id tables and the mask
+    /// are BOTH padded to ([`pitch_at`] at the region's own [`KTB`](Self::ktb)), the one number
+    /// the fold's single per-pass Activation shift advances. The value-side twin of
+    /// [`AttnGeometry::table_pitch`](AttnGeometry::table_pitch).
+    pub fn table_pitch(self) -> Option<u32> {
+        Some(pitch_at(self.ktb()?))
+    }
+
+    /// The trip slots one page block of the table states — one per mask row, each
+    /// `SLABS·PITCH/4` index entries wide: the trip's `SLABS·KTB` entries at its head, the
+    /// pitch pad unread.
     pub fn sticks_per_page(self) -> u32 {
         self.w4() * self.mq.get()
     }
@@ -12279,8 +12494,8 @@ impl SplicedAttnRegion {
         ceiling: GatherEntryCeiling,
     ) -> Option<AttnStepInputs> {
         Some(AttnStepInputs {
-            kt: spliced_attn_ids_table(self, map, ceiling)?,
-            v: spliced_attn_ids_table(self, map, ceiling)?,
+            kt: spliced_attn_ids_table(KvPlane::Kt, self, map, ceiling)?,
+            v: spliced_attn_ids_table(KvPlane::V, self, map, ceiling)?,
             mask: spliced_attn_mask_f16(self, rows, start, real)?,
         })
     }
@@ -12421,23 +12636,32 @@ impl AttnStepInputs {
     }
 }
 
-/// ⭐⭐⭐⭐⭐ THE ONE-SEQUENCE BLOCK-ENTRY TABLE — the index values in the KERNEL'S OWN READ
-/// ORDER: page-major over the region at the MASK'S OWN PITCH (one id stick per mask row —
-/// `W4·mq` sticks per page block, the first `W4` meaningful, the tail unread padding),
-/// window-major within a page, (kv head, group)-major within a window, the GQA replication
-/// riding the VALUES. Every value is minted through [`GatherEntry::of_page_block`] with the
-/// block the POOL's own door names — the same composition the door-era tables use, so the bake's
-/// entry ceiling bounds these values too.
+/// ⭐⭐⭐⭐⭐ THE ONE-SEQUENCE BLOCK-ENTRY TABLE — the index values in the KERNELS' OWN READ
+/// ORDER, at the COMMON PITCH: a flat `[REGION_PAGES·W4·mq·SLABS·PITCH/4]` stick of i32
+/// entries, page-major over the region, one TRIP SLOT per mask row (`W4·mq` slots per page
+/// block, the first `W4` meaningful, the tail unread padding), each slot `SLABS·PITCH/4`
+/// entries wide — the trip's `SLABS·KTB` entries at its head (slab-major: slab `s`'s `KTB`
+/// entries at `s·KTB`), the pitch pad unread. Window-major within a page, (kv head, group)-major
+/// within a window, the GQA replication riding the VALUES.
+///
+/// ⭐ EVERY VALUE IS A SLAB BLOCK OF ONE PLANE, minted through
+/// [`GatherEntry::of_slab_block`] with the per-(window, slab) composition the POOL's own addr
+/// law names — Kᵗ and V number a page's slab blocks DIFFERENTLY at `slabs > 1`, so the two
+/// tables are this one builder walked with two planes, never one table staged twice. At
+/// `slabs == 1` and `KTB == 32` the pitch pad is empty and the layout is the one-stick-per-row
+/// form byte for byte.
 ///
 /// `map` is the sequence's logical→physical page map — the very map the launch installed, so the
 /// table the card reads and the map the cache write used are one derivation. A region longer
 /// than the map repeats the map's OWN last page (never 0, which is a real address, and never
-/// another sequence's); the mask silences the repeat. The PAD sticks past each page's first `W4`
-/// carry the page's last window's entries, so every staged entry names a written, in-pool block.
+/// another sequence's); the mask silences the repeat. The PAD slots past each page's first `W4`
+/// carry the page's last window's entries, and the PAD ENTRIES past each trip's `SLABS·KTB`
+/// repeat its last entry, so every staged entry names a written, in-pool block.
 ///
 /// `None` on an empty map (no page to name) or an entry the ceiling refuses — never a zero
 /// table, because zero is block 0, a REAL address.
 pub fn spliced_attn_ids_table(
+    plane: KvPlane,
     region: SplicedAttnRegion,
     map: &[i64],
     ceiling: GatherEntryCeiling,
@@ -12445,27 +12669,41 @@ pub fn spliced_attn_ids_table(
     let last = *map.last()?;
     let ktb = region.ktb()?;
     let w4 = region.w4();
+    let slabs = region.slabs()?;
+    let per_trip = slabs as usize * pitch_at(ktb) as usize / 4;
     let mut out = Vec::with_capacity(
-        region.pages() as usize * region.sticks_per_page() as usize * ktb as usize,
+        region.pages() as usize * region.sticks_per_page() as usize * per_trip,
     );
     for s in 0..region.pages() {
         let phys = map.get(s as usize).copied().unwrap_or(last);
         for k in 0..region.sticks_per_page() {
-            // The first W4 sticks are the page's own windows; the pad tail repeats the last one,
+            // The first W4 slots are the page's own windows; the pad tail repeats the last one,
             // so a pad entry is an in-pool written block rather than a hole the geometry left.
             let window = k.min(w4 - 1);
-            for b in 0..ktb {
-                let kvh = b / region.gqa.get();
-                let block = region.pool.block_in_page(kvh, window)?;
-                out.push(GatherEntry::of_page_block(ceiling, phys, block)?);
+            for slab in 0..slabs {
+                for b in 0..ktb {
+                    let kvh = b / region.gqa.get();
+                    out.push(GatherEntry::of_slab_block(
+                        plane, region.pool, ceiling, phys, kvh, window, slab,
+                    )?);
+                }
+            }
+            // The pitch pad past the trip's `SLABS·KTB` entries — unread, and repeating the
+            // trip's last entry so every staged entry names a written, in-pool block.
+            let last_entry = *out.last()?;
+            for _ in (ktb as usize * slabs as usize)..per_trip {
+                out.push(last_entry);
             }
         }
     }
     Some(out)
 }
 
-/// ⭐⭐⭐⭐⭐ THE ONE-SEQUENCE ADDITIVE VALIDITY MASK — `[REGION_PAGES·W4·mq, 64]` f16,
-/// window-major within each page, row `(s·W4 + w)·mq + t`: `0.0` where slot
+/// ⭐⭐⭐⭐⭐ THE ONE-SEQUENCE ADDITIVE VALIDITY MASK — `[REGION_PAGES·W4·mq, 64]` f16 rows at
+/// the COMMON PITCH: row `(s·W4 + w)·mq + t`'s 64 lanes sit at byte `r·SLABS·PITCH` of the flat
+/// buffer (128 B meaningful, the gap unread pad) — the SAME per-(window, query-row) advance the
+/// ids tables' trip slots take, so the fold's single per-pass Activation shift walks both by one
+/// number. `0.0` where slot
 /// `s·PAGE_SLOTS + w·64 + c` is visible to query row `t`, and the f16 floor
 /// [`ATTN_SEED_FLOOR`] (the finite sentinel the carry's max seeds at — the format's own max, the
 /// kernels' clamp trick — a masked-everywhere row still normalizes with weight 0, never NaN)
@@ -12488,15 +12726,14 @@ pub fn spliced_attn_mask_f16(
     }
     let real = real.get() as usize;
     let w4 = region.w4() as usize;
-    if w4 == 0 {
-        return None;
-    }
     let mq = region.mq.get() as usize;
     let page_slots = PagedKvPool::PAGE_SLOTS;
     let total = region.pages() as usize * w4 * mq;
+    let pitch = region.slabs()? as usize * pitch_at(region.ktb()?) as usize;
+    let row_bytes = POOL_STICK as usize * 2;
     let neg = ATTN_SEED_FLOOR.to_le_bytes();
     let zero = half::f16::from_f32(0.0).to_le_bytes();
-    let mut m = Vec::with_capacity(total * 64 * 2);
+    let mut m = Vec::with_capacity(total * pitch);
     let mut valid = Vec::with_capacity(total);
     for r in 0..total {
         // Row r is `(s·W4 + w)·mq + t` — the kernel's own load corner, decomposed once here.
@@ -12519,6 +12756,10 @@ pub fn spliced_attn_mask_f16(
             let bytes = if slot_base + c <= pos { &zero } else { &neg };
             m.extend_from_slice(bytes);
         }
+        // The pitch gap past the row's 128 B — unread by the kernel, zero-filled so every
+        // staged byte is deterministic, and exactly empty at `SLABS·PITCH == 128` (the
+        // `KTB == 32`, `slabs == 1` geometry where the tables' row and the mask's coincide).
+        m.extend(std::iter::repeat_n(0u8, pitch - row_bytes));
     }
     // One 64-lane window per row — this family's rows ARE windows, the pitch the counts above
     // were minted at.
@@ -12558,9 +12799,14 @@ impl SplicedDecodeBatch {
         if !entries.is_multiple_of(num_seqs.get()) {
             return None;
         }
-        let w4 = pool.windows_per_page()?;
+        let w4 = pool.windows_per_page();
         let ktb = entries.checked_mul(pool.nkvh())?;
-        let per_chunk = u64::from(w4) * u64::from(ktb) * 4;
+        // One chunk's table: every (window, slab) trip's `KTB` entries, slab-major — the
+        // kernel's own `[NUM_CHUNKS·W4·SLABS·KTB]` stick.
+        let per_chunk = u64::from(w4)
+            * u64::from(pool.window_slabs()?)
+            * u64::from(ktb)
+            * 4;
         if per_chunk == 0 || !extent_bytes.is_multiple_of(per_chunk) {
             return None;
         }
@@ -12612,21 +12858,26 @@ impl SplicedDecodeBatch {
     }
 
     fn w4(self) -> u32 {
-        self.pool.windows_per_page().unwrap_or(0)
+        self.pool.windows_per_page()
     }
 }
 
 /// ⭐⭐⭐⭐⭐ THE BATCHED-DECODE BLOCK-ENTRY TABLE — the index values in `batched_decode_hm`'s
-/// own read order: `[NUM_CHUNKS·W4·ENTRIES·NKVH]`, chunk-major, window-major within a chunk,
-/// entry-major within a window (entry `j·B + s`, then kv head). Stick `(c·W4 + w)`'s entry
+/// own read order: `[NUM_CHUNKS·W4·SLABS·KTB]`, chunk-major, window-major within a chunk,
+/// SLAB-MAJOR within a window (slab `s`'s `KTB` entries at `((c·W4 + w)·SLABS + s)·KTB`),
+/// entry-major within a slab (entry `j·B + s`, then kv head). Stick `(c·W4 + w)`'s entry
 /// `(e, kvh)` names sequence `s`'s logical page `c·BLOCKS_PER_CHUNK + j` at the kv head's own
-/// block of that window.
+/// slab block of that window — ⭐ EVERY VALUE IS A SLAB BLOCK OF ONE PLANE, minted through
+/// [`GatherEntry::of_slab_block`] with the per-plane composition the pool's addr law names: Kᵗ
+/// and V number a page's slab blocks DIFFERENTLY at `slabs > 1`, so the two tables are this one
+/// builder walked with two planes, never one table staged twice.
 ///
 /// `maps` is one page map per LAUNCH ROW in slot order — padding rows carry live 0's, the same
 /// maps the launch installed. A row's map shorter than the chunk count repeats its own last page
 /// (masked; never 0, which is a real address). `None` on a map count that is not the launch's
 /// row count, an empty map, or an entry the ceiling refuses.
 pub fn spliced_decode_ids_table(
+    plane: KvPlane,
     batch: SplicedDecodeBatch,
     maps: &[Vec<i64>],
     ceiling: GatherEntryCeiling,
@@ -12635,22 +12886,27 @@ pub fn spliced_decode_ids_table(
         return None;
     }
     let (w4, ktb, bpc) = (batch.w4(), batch.ktb(), batch.blocks_per_chunk());
+    let slabs = batch.pool.window_slabs()?;
     let nkvh = batch.pool.nkvh();
     let seqs = batch.num_seqs.get();
-    let mut out = Vec::with_capacity(batch.chunks() as usize * w4 as usize * ktb as usize);
+    let mut out =
+        Vec::with_capacity(batch.chunks() as usize * w4 as usize * slabs as usize * ktb as usize);
     for c in 0..batch.chunks() {
         for w in 0..w4 {
-            for b in 0..ktb {
-                // Entry b is (entry e, kv head) — entry-major, then kv head, the stick's own order.
-                let (e, kvh) = (b / nkvh, b % nkvh);
-                let (j, s) = (e / seqs, e % seqs);
-                let map = maps.get(s as usize)?;
-                let phys = map
-                    .get((c * bpc + j) as usize)
-                    .copied()
-                    .or_else(|| map.last().copied())?;
-                let block = batch.pool.block_in_page(kvh, w)?;
-                out.push(GatherEntry::of_page_block(ceiling, phys, block)?);
+            for slab in 0..slabs {
+                for b in 0..ktb {
+                    // Entry b is (entry e, kv head) — entry-major, then kv head, the stick's own order.
+                    let (e, kvh) = (b / nkvh, b % nkvh);
+                    let (j, s) = (e / seqs, e % seqs);
+                    let map = maps.get(s as usize)?;
+                    let phys = map
+                        .get((c * bpc + j) as usize)
+                        .copied()
+                        .or_else(|| map.last().copied())?;
+                    out.push(GatherEntry::of_slab_block(
+                        plane, batch.pool, ceiling, phys, kvh, w, slab,
+                    )?);
+                }
             }
         }
     }
@@ -12698,9 +12954,6 @@ pub fn spliced_decode_mask_f16(
         return None;
     }
     let (w4, ktb, bpc) = (batch.w4(), batch.ktb(), batch.blocks_per_chunk());
-    if w4 == 0 {
-        return None;
-    }
     let (gqa, nkvh, seqs) = (batch.gqa.get(), batch.pool.nkvh(), batch.num_seqs.get());
     let page_slots = PagedKvPool::PAGE_SLOTS;
     let neg = ATTN_SEED_FLOOR.to_le_bytes();

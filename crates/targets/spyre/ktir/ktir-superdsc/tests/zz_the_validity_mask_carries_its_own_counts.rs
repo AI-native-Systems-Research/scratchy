@@ -32,9 +32,7 @@ fn pool() -> PagedKvPool {
 /// states for it (`W4 · mq` rows of 64 f16 lanes per page block, the padded pitch law).
 fn region(pages: u32, mq: u32) -> SplicedAttnRegion {
     let mq = RungWidth::of_baked_rows(mq).expect("a test rung is nonzero");
-    let w4 = pool()
-        .windows_per_page()
-        .expect("hd 64 divides a page into whole windows");
+    let w4 = pool().windows_per_page();
     let block = u64::from(w4) * mq.count() as u64 * 64 * 2;
     SplicedAttnRegion::of_mask_extent(
         block * pages as u64,
@@ -146,9 +144,7 @@ fn a_chunk_rows_count_is_its_own_prefix_of_zero_lanes() {
 fn the_batch_family_counts_its_pre_replicated_rows() {
     let pool = pool();
     let (nkvh, gqa, seqs) = (8u32, 4u32, 4u32);
-    let w4 = pool
-        .windows_per_page()
-        .expect("hd 64 divides a page into whole windows");
+    let w4 = pool.windows_per_page();
     assert!(
         w4 >= 4,
         "this geometry must state the window holding a mid-page write slot"

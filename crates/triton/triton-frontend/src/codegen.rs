@@ -997,6 +997,71 @@ impl<'a> CodeGen<'a> {
                 self.scope.insert(id, v);
                 Ok(())
             }
+            AssignTarget::Subscript { base, index, pos } => {
+                // ⭐ A SEQUENCE SLOT ASSIGNMENT IS A REBIND, never a scatter. The index
+                // must lower to a compile-time constant (the `tl.static_range` unroller
+                // binds its variable as one), and the base must resolve to a `Val::Seq`,
+                // so this rebuilds the whole sequence with one slot replaced and rebinds
+                // the name — the value-level twin of the list-accumulator idiom upstream
+                // Triton's Python frontend traces for free. A TENSOR base is refused by
+                // name: Triton has no tensor item assignment, and a silent
+                // reinterpretation of one here would be exactly the wrong-answer-no-
+                // diagnostic class the slice census guards against.
+                let idx = self.visit_expr(index)?;
+                let i = match idx {
+                    Val::Int(i) => i,
+                    other => {
+                        return Err(Error::new(
+                            format!(
+                                "a subscript assignment's index must be a compile-time \
+                                 integer, got a {}",
+                                other.kind_name()
+                            ),
+                            pos.line,
+                            pos.col,
+                        ));
+                    }
+                };
+                let name = match base.as_ref() {
+                    AssignTarget::Name { id, .. } => id.clone(),
+                    _ => {
+                        return Err(Error::new(
+                            "a subscript assignment's base must be a plain name",
+                            pos.line,
+                            pos.col,
+                        ));
+                    }
+                };
+                let seq = self.deref_name(&name, *pos)?;
+                let mut items = match seq {
+                    Val::Seq(items) => items,
+                    other => {
+                        return Err(Error::new(
+                            format!(
+                                "subscript assignment targets a compile-time sequence \
+                                 slot; {} holds a {} (a tensor is not assignable through \
+                                 a subscript — Triton has no tensor item assignment)",
+                                name,
+                                other.kind_name()
+                            ),
+                            pos.line,
+                            pos.col,
+                        ));
+                    }
+                };
+                let n = items.len() as i128;
+                let k = if i < 0 { n + i } else { i };
+                if !(0..n).contains(&k) {
+                    return Err(Error::new(
+                        format!("index {i} is out of range for a sequence of {n}"),
+                        pos.line,
+                        pos.col,
+                    ));
+                }
+                items[k as usize] = v;
+                self.scope.insert(&name, Val::Seq(items));
+                Ok(())
+            }
             AssignTarget::Tuple { elts, pos } => match v {
                 Val::Seq(vals) if vals.len() == elts.len() => {
                     for (t, x) in elts.iter().zip(vals) {
@@ -1218,6 +1283,39 @@ impl<'a> CodeGen<'a> {
             && let Some(v) = fold_binary(op, &l, &r)
         {
             return Ok(v);
+        }
+        // ⭐ A COMPILE-TIME SEQUENCE REPEAT — Python's own `(x,) * N`, the tuple-spelling
+        // of "N slots of this" that upstream Triton kernels use to build split
+        // accumulators. Both operands are values the unroller already holds, so the
+        // repeat never reaches the builder; Python's own edge semantics hold (a negative
+        // count is the empty sequence), and a count whose product overflows `usize` is
+        // refused rather than wrapped — a wrapped repeat would silently build the wrong
+        // number of accumulator slots.
+        if op == BinOpKind::Mult
+            && let (Val::Seq(items), Val::Int(n)) | (Val::Int(n), Val::Seq(items)) = (&l, &r)
+        {
+            // Python: `seq * -1` is `()`, not an error.
+            let out = match usize::try_from(*n) {
+                Err(_) => Vec::new(),
+                Ok(count) => {
+                    // A count whose product overflows `usize` is refused rather than
+                    // wrapped — a wrapped repeat would silently build the wrong number
+                    // of accumulator slots.
+                    let total = count.checked_mul(items.len()).ok_or_else(|| {
+                        Error::new(
+                            "a sequence repeat's count overflows the sequence space",
+                            pos.line,
+                            pos.col,
+                        )
+                    })?;
+                    let mut out = Vec::with_capacity(total);
+                    for _ in 0..count {
+                        out.extend(items.iter().cloned());
+                    }
+                    out
+                }
+            };
+            return Ok(Val::Seq(out));
         }
         let out = match op {
             BinOpKind::Add => self.sem.add(&l, &r, true),

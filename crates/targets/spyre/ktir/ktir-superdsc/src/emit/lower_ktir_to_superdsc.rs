@@ -3808,13 +3808,40 @@ pub fn program_score_scale(f: &IRFunction<'static>) -> Option<f32> {
         .filter(|o| matches!(o.op_type, OpKind::LinalgMatmul | OpKind::LinalgBatchMatmul))
         .filter_map(|o| o.result)
         .collect();
+    // ⭐ THE SCORE TILE MAY BE A SUM OF PARTIAL DOTS — the per-slab family's
+    // spelling (one dot per slab, `score = Σ_s dot(q_s, kt_s)`, the scale on
+    // the SUM: `static_range(1, SLABS)` is empty at one slab, so the single-
+    // slab program is the direct `mulf(matmul, splat)` form and the split one
+    // multiplies an addf chain). The mulf's matmul-side operand may therefore
+    // be the matmul result itself OR an addf chain whose EVERY leaf is a
+    // matmul result — the same "two spellings, one fact" admission as the
+    // rank-2/rank-3 one above. A sum mixing in anything else (a mask add, a
+    // carry) is not a score tile: the chain walk refuses the first non-
+    // matmul, non-addf operand it reaches, so a program stating its scale
+    // only over such a sum is still read as stating none.
+    let is_score_tile = |start: Ssa| -> bool {
+        let mut work = vec![start];
+        while let Some(s) = work.pop() {
+            if is_matmul.contains(&s) {
+                continue;
+            }
+            let Some(def) = f.operations.iter().find(|o| o.result == Some(s)) else {
+                return false;
+            };
+            if def.op_type != OpKind::ArithAddf {
+                return false;
+            }
+            work.extend(def.operands.iter().copied());
+        }
+        true
+    };
     f.operations
         .iter()
         .filter(|o| o.op_type == OpKind::ArithMulf)
         .find_map(|o| {
             let l = o.operands.first()?;
             let rr = o.operands.get(1)?;
-            if !is_matmul.contains(l) {
+            if !is_score_tile(*l) {
                 return None;
             }
             Some(*splat_of.get(rr)? as f32)

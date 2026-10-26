@@ -40,15 +40,15 @@ pub enum Staged {
     /// visibly, it would silently gather a DIFFERENT ROW'S KEYS and read as fluent text.
     /// ⭐ AND THEY ARE [`GatherEntry`]s, NOT `i32`s. The comment above already called them
     /// "ADDRESSES-IN-WAITING"; the type now says so, so the only way to put one in this buffer is
-    /// [`GatherEntry::of_page_block`] and a hand-written page number does not compile.
+    /// [`GatherEntry::of_slab_block`] and a hand-written page number does not compile.
     ///
     /// ⛔ ONE ENTRY TYPE, BECAUSE THERE IS ONE PIN. A second type (`PageEntry`, counting whole page
     /// PLANES) existed while the page-granular copy pinned a plane; that pin is refused on card
-    /// (`PagePlaneExtent::entry_elems`), so the unit is one STICK BLOCK for every gather and a second
+    /// (`PagePlaneExtent::entry_elems`), so the unit is one SLAB BLOCK for every gather and a second
     /// type would only be a second derivation of the same factor.
     ///
     /// [`GatherEntry`]: scratchy_subtile::sdsc_abstract::GatherEntry
-    /// [`GatherEntry::of_page_block`]: scratchy_subtile::sdsc_abstract::GatherEntry::of_page_block
+    /// [`GatherEntry::of_slab_block`]: scratchy_subtile::sdsc_abstract::GatherEntry::of_slab_block
     I32(std::borrow::Cow<'static, [scratchy_subtile::sdsc_abstract::GatherEntry]>),
 }
 
@@ -863,10 +863,11 @@ mod tests {
         // UNDER f16's 2048 — so the old literal would have left this test passing while testing nothing.
         // The assert is what caught it; do not lower it to match a factor.
         //
-        // ⭐ AND THE FACTOR IS BACK AT THE STICK BLOCK, which only makes the entries LARGER — the pin the
-        // plane factor served is refused at bake (`PagePlaneExtent::entry_elems`). The assert below is
-        // what keeps this test honest across either factor: it checks the VALUE exceeds f16's exact
-        // range, not which factor produced it.
+        // ⭐ AND THE FACTOR IS AT THE SLAB BLOCK (fixed at every head dim; the stick block at hd=64
+        // IS the slab block), which only makes the entries LARGER — the pin the plane factor served is
+        // refused at bake (`PagePlaneExtent::entry_elems`). The assert below is what keeps this test
+        // honest across either factor: it checks the VALUE exceeds f16's exact range, not which factor
+        // produced it.
         let pool = scratchy_subtile::sdsc_abstract::PagedKvPool::new(8, 64);
         let plane = scratchy_subtile::sdsc_abstract::PagePlaneExtent::of_pool(pool)
             .expect("a stick head dim");
@@ -877,11 +878,21 @@ mod tests {
             40 * 3 * plane.bytes(),
             pool,
         )
-        .expect("a page that is a whole number of stick blocks");
+        .expect("a page that is a whole number of slab blocks");
         let per_page = ceiling.per_page();
         let mint = |phys: i64| {
-            scratchy_subtile::sdsc_abstract::GatherEntry::of_page_block(ceiling, phys, 0)
-                .expect("an in-range entry")
+            // Head 0, window 0, slab 0 of the Kᵗ plane — the first block of the page, the same
+            // entry the old `of_page_block(ceiling, phys, 0)` composed at this hd=64 pool.
+            scratchy_subtile::sdsc_abstract::GatherEntry::of_slab_block(
+                scratchy_subtile::sdsc_abstract::KvPlane::Kt,
+                pool,
+                ceiling,
+                phys,
+                0,
+                0,
+                0,
+            )
+            .expect("an in-range entry")
         };
         let blocks = [mint(0), mint(1), mint(2), mint(100)];
         assert!(

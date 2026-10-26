@@ -2151,42 +2151,22 @@ fn spliced_attn_lowers_through_the_door() {
                 // program states the whole scale.
                 Some(ktir_superdsc::score_scale::ScoreScaleLaw::StatedByProgram),
             );
-            // ⛔ THE HD-64 KERNEL LIMIT — the kernels' own designed refusal, EXPECTED and
-            // PINNED here, never skipped. All three spliced attention kernels refuse
-            // HD != 64 at compile time BY DESIGN — the same static_assert at
-            // batched_prefill.py:133, batched_decode.py:106 and paged_fold.py:144: the
-            // V plane's [64, HD] block is one contiguous stick block only at HD 64, "a
-            // wider head needs the per-(window, slab) V gather this kernel does not
-            // state yet". 8b (hd 128) is a DECLARED UNSUPPORTED GEOMETRY of this
-            // Triton path — the judgment model is granite-3.1-2b (hidden 2048 / 32
-            // heads = hd 64) — not a defect of the slice. The hd-128 cells STAY in the
-            // table: each must REFUSE with the kernels' own message, and a splice that
-            // COMPILES one fails by name (the limit lifted silently).
-            let spliced_ops = if s.geom.2 != 64 {
-                let Err(e) = spliced_result else {
-                    panic!(
-                        "the splice COMPILED geom={:?} mq={} rung={} r_ar={rows_are_requests} \
-                         — the HD-64 kernel limit lifted silently",
-                        s.geom, s.mq, s.rung
-                    );
-                };
-                assert!(
-                    e.contains("one contiguous stick block only at HD 64"),
-                    "geom={:?} mq={} rung={} r_ar={rows_are_requests}: the refusal must be \
-                     the kernels' HD-64 limit, not some other defect: {e}",
-                    s.geom,
-                    s.mq,
-                    s.rung
-                );
-                continue;
-            } else {
-                spliced_result.unwrap_or_else(|e| {
-                    panic!(
-                        "splice compiled geom={:?} mq={} rung={} r_ar={rows_are_requests}: {e}",
-                        s.geom, s.mq, s.rung
-                    )
-                })
-            };
+            // ⛔ ALL-SHAPE KERNELS — the STEP B law, pinned here, never skipped.
+            // The kernels' geometry is CONST-GENERIC: SLABS is bound from
+            // `AttnGeometry::slabs()` (hd 128 = 2 slabs), KTB from the geometry's
+            // own stick width, PITCH from `AttnGeometry::table_pitch()` — so every
+            // geometry in the table LOWERS, and a splice that REFUSES one fails by
+            // name. (These cells used to pin the kernels' own HD-64 static_assert —
+            // "the V plane's [64, HD] block is one contiguous stick block only at HD
+            // 64" — a designed refusal this branch deleted when the per-slab V
+            // gather landed; a rung that cannot lower is a compile error now, never
+            // a runtime skip.)
+            let spliced_ops = spliced_result.unwrap_or_else(|e| {
+                panic!(
+                    "splice compiled geom={:?} mq={} rung={} r_ar={rows_are_requests}: {e}",
+                    s.geom, s.mq, s.rung
+                )
+            });
             assert_eq!(
                 spliced_ops.len(),
                 1,

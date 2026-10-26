@@ -14,78 +14,128 @@ torch's algorithm, cited:
   * the online softmax carry (max, rescale, sum, output) — `:97-105`;
   * one normalize, then the head-major store — `:123-129`.
 
-The contract (the module doc of `batched_decode.py` states the shared laws; this
-file follows them):
+The contract (the module doc of `batched_decode.py` states the shared laws;
+this file follows them):
 
   * ONE program, grid `[1, 1]` — the whole chunk in one kernel. All
     descriptor corners are compile-time constants (the page and window loops
     are `tl.static_range`, unrolled), so nothing materializes per grid
     position.
-  * THE POOL IS GATHERED ONE STICK BLOCK PER INDEX ENTRY. A block is the
-    pool's own own unit — `HD * 64` elements: the K^T block `[HD, 64]` and the
-    V block `[64, HD]`. The index values are the host's `GatherEntry` bytes —
-    page-relative stick-block numbers composed on the host through the pool's
-    ONE door — so this kernel never spells a page stride, a block-in-page
-    offset, or a layer term: the descriptor's base is the plane's own
-    placement, and every (page, kv head, window) fact rides the index VALUE
-    the host staged.
-  * ONE FULL ID STICK PER (PAGE, WINDOW) TRIP: a trip's id stick is
-    `NKVH * GQA` block-ids — every kv head's block in this window, named once
-    per GQA group (the group replication rides the index VALUES, the pool's
-    own door, never a kernel-side spray) — which must fill the SenUint32 stick
-    exactly. The gather is forced to stick width twice over: Triton refuses a
-    gather with fewer than 8 indices, and the door's work division spends its
-    cores on the entry axis (`mb`) alone — a gather with fewer entries than
-    cores splits `out`, which dxp's `skip_addr` cannot address.
-  * K and V ride their OWN ids tables — the two planes' block numberings
-    differ, so each names its own blocks.
-  * ONE WINDOW PER TRIP: the walk is a page loop over a window loop, and each
-    (page, window) trip dots its gathered blocks against q at the batch the
-    g-replicated stick states — `(kvh, g)`, q's own row order — and folds the
-    trip into the running softmax IMMEDIATELY. The online merge is
-    associative, so a window needs no state axis of its own and no spray of q
-    over one. Every operand of every dot is then a load or a gather result at
-    its natural shape: no permute, no relayout, no broadcast feeding a dot.
-  * q is loaded ONCE as one window and reused by every trip's dot — the
-    one-program form pays the page transfer over every query row, which is
-    torch's own stated trade (`page_attn_head_major_prefill.py:17-20`).
+  * ⭐ THE GEOMETRY AND POOL FACTS ARE BOUND, NEVER DERIVED: `SLABS` is
+    `AttnGeometry::slabs()`, `STK` the pool's own stick lane count, `W4` its
+    windows per page, `KTB` the geometry's own id-stick width — each a
+    `tl.constexpr` PARAMETER the splice binds from the typed const, exactly
+    as it binds `HD`/`NKVH`/`GQA`. The batch axis is the same number as the
+    id stick (`BATCH = KTB`: the g-replicated stick states the dot's (kvh, g)
+    rows), derived from the bound const, never recomputed from the head
+    counts. A value the kernel recomputes is a value it can disagree with
+    the type that sized the tables, so there is none (the stick-multiple law
+    fires at the SPLICE, where `geom.slabs()` is spent — a sub-stick head is
+    the declaring model's own build failure, never a kernel assert).
+  * THE POOL IS GATHERED ONE SLAB BLOCK PER INDEX ENTRY. A block is the
+    FIXED `[STK, STK]` fp16 unit — STK*STK elements at EVERY head dim: the
+    unit both planes' windows divide into (Kᵀ's (window, slab) sub-runs are
+    contiguous STK*STK at every hd; the V plane is feature-slab-major, its
+    slab runs STK*STK by the plane's own stick law). At `SLABS == 1` the
+    slab block IS the old stick block (`HD == STK`, one slab the whole
+    head), so a stick-width head is byte-identical by construction. The
+    index values are the host's `GatherEntry` bytes — page-relative
+    slab-block numbers composed on the host through the pool's ONE door —
+    so this kernel never spells a page stride, a block-in-page offset, or a
+    layer term: the descriptor's base is the plane's own placement, and
+    every (page, kv head, window, slab) fact rides the index VALUE the host
+    staged.
+  * ONE WINDOW PER TRIP: the walk is a page loop over a window loop, and
+    each (page, window) trip dots its gathered blocks against q at the
+    batch the g-replicated stick states — `(kvh, g)`, q's own row order —
+    and folds the trip into the running softmax IMMEDIATELY. The online
+    merge is associative, so a window needs no state axis of its own and no
+    spray of q over one. The two tables number their trips the SAME way —
+    SLAB-MAJOR, slab `s`'s `KTB` entries at `s*KTB` within the trip's
+    contiguous `SLABS*KTB` entries, one `[KTB]` load per (trip, slab) —
+    because BOTH sides dot per slab: the score's partial dots pair q's
+    slab-s column window with that slab's gathered blocks, summing `SLABS`
+    partials into the one whole-HD score tile, and the V side's PV partials
+    land per slab the same way. The two tables differ only in their VALUES
+    — each plane's own slab-block numbering, composed on the host through
+    the pool's ONE door.
+  * ⭐ THE TABLES AND THE MASK STATE ONE COMMON PITCH —
+    `AttnGeometry::table_pitch()`, the least common multiple of the id
+    table's own row (`KTB` entries) and the mask's own row (one `STK`-lane
+    stick). The id tables are ONE FLAT 1D REGION per plane whose load
+    offsets carry the pitch — the per-trip stride is `SLABS*PITCH` bytes
+    (the trip's `SLABS*KTB` entries contiguous at its head, the pad
+    unread), the per-page block `W4*MQ*SLABS*PITCH` bytes with the first
+    `W4` trip-blocks meaningful and the tail padding — and the mask's rows
+    sit `SLABS * PITCH` apart (its own `STK` lanes meaningful, the gap
+    padding) — so both tensors' per-page blocks are the SAME byte count at
+    every geometry, which is what the per-page fold's ONE per-pass
+    Activation shift walks them by (`paged_fold.py` states the shift side;
+    every rung of a chunked ladder stages this same region,
+    `ladder_stages_one_layout`). The 1D form is not a preference: the
+    gather's index vector must be 1D (Triton's own assert) and the KTDP
+    trace recovers an indirect read's view only from a RAW descriptor
+    load, so the ids are loaded at exactly the shape the gather consumes.
+    At `KTB == 32` the two natural rows coincide, the pad is empty, and
+    the layout is byte-identical to the natural unpadded one.
+  * ⭐ THE ACCUMULATORS ARE ONE TUPLE, ONE SLOT PER SLAB — `[BATCH, MQ,
+    STK]` each, `(zeros,) * SLABS` — because the V plane's blocks are
+    per-slab and no transpose, gather order or reshape can fold them into
+    one `[B, MQ, HD]` tensor (the V plane's block is [slot, feat']
+    row-major, so a per-trip V gather's flat order is (slab, slot, feat')
+    while `[B, MQ, HD]` wants (slot, slab, feat') — slot is INSIDE the
+    block, so no id ordering fixes it). Each trip's PV partial for slab s
+    updates ITS OWN tuple slot — `accs[s] = accs[s] * rescale + pv`, a
+    compile-time sequence-slot assignment over the static unroll — and the
+    tail stores each slot through its own column window of `o` at
+    `s*STK`. At `SLABS == 1` this is the old single `[BATCH, MQ, HD]`
+    accumulator and single whole-row store exactly.
+  * q is loaded ONCE — one column window per slab, before the trip loop —
+    and reused by every trip's partial dots, the one-program form paying
+    the page transfer over every query row, which is torch's own stated
+    trade (`page_attn_head_major_prefill.py:17-20`).
   * The scale rides log2(e) as an immediate multiply on the dot's result, so
     the softmax is `exp2` end to end (the flash fixtures' own law).
   * The causal mask is host-staged at a compile-time-constant shape
-    (torch's `mask_stack` law at `:51`, re-ordered window-major) and added at
-    the score tile as a leading stride-0 broadcast — the row-split operand
-    mode the door admits, unamplified over the batch.
+    (torch's `mask_stack` law at `:51`, re-ordered window-major) and added
+    at the score tile as a leading stride-0 broadcast — the row-split
+    operand mode the door admits, unamplified over the batch.
 
 Staged by the host, per chunk:
 
   * `desc_q`       — the chunk's q in torch's own layout: row
                      `(kvh*GQA + g)*MQ + t` = `Q[q_start + t, kvh*GQA + g, :]`,
                      padded rows repeated from row 0 and masked.
-  * `desc_kt`      — the resident K^T plane; this kernel reads it as
-                     `[PAGES*NKVH*W4, HD*64]` — one stick block a row.
-  * `desc_v`       — the resident V plane; read as `[PAGES*NKVH*W4, 64*HD]`.
-  * `desc_ids_kt`  — the K^T plane's block-entry table, `[REGION_PAGES * W4
-                     * MQ * NKVH*GQA]` i32, page-major at the MASK'S OWN
-                     PITCH (one id stick per mask row: the per-page block
-                     is `W4 * MQ` sticks, the first `W4` meaningful, the
-                     tail padding — the pitch the per-page fold's ONE
-                     per-pass Activation shift walks both tensors by, so
-                     the two must state one number; at MQ == 1 the padded
-                     form is byte-identical to the natural one),
-                     window-major within a page, (kv head, group)-major
-                     within a window — the group replication rides the
-                     values. Every value is a `GatherEntry` the host
-                     minted for the K^T plane's own block numbering.
-  * `desc_ids_v`   — the V plane's own block-entry table, same shape and
-                     order, the V plane's own block numbering.
-  * `desc_mask`    — additive fp16 mask `[REGION_PAGES * W4*MQ, 64]`, window-major:
-                     row `(s*W4 + w)*MQ + t`, `0.0` where the slot is visible
-                     to that query row (within the sequence and causally),
-                     `-65504.0` where it is not, or where the query row is
-                     padding. The finite sentinel is torch's own clamp trick:
-                     a masked-everywhere row still normalizes with weight 0,
-                     never NaN.
   * `desc_o`       — output, the chunk's attention at the same row law as q.
+  * `desc_kt`      — the resident Kᵀ plane; this kernel reads it as
+                     `[PAGES*NKVH*W4*SLABS, STK*STK]` — one slab block a
+                     row, the plane's whole slab-block space.
+  * `desc_v`       — the resident V plane; read the same way —
+                     `[PAGES*NKVH*W4*SLABS, STK*STK]`, the V plane's own
+                     slab-block numbering.
+  * `desc_ids_kt`  — the Kᵀ plane's slab-block table, ONE FLAT 1D region
+                     of `[REGION_PAGES * W4 * MQ * SLABS * PITCH // 4]`
+                     i32 entries: page-major, the per-trip stride
+                     `SLABS*PITCH//4` (the first `W4` trip-blocks of each
+                     page's block meaningful, the tail padding),
+                     ENTRY-MAJOR, SLAB-MINOR within a trip (the trip's
+                     `SLABS*KTB` entries contiguous, in the gather's own
+                     consumption order) — the group replication rides the
+                     values. Every value is a `GatherEntry` the host
+                     minted for the Kᵀ plane's own slab-block numbering.
+  * `desc_ids_v`   — the V plane's own slab-block table, the same 1D
+                     extent and pitch, SLAB-MAJOR within a trip (slab s's
+                     `KTB` entries at `s*KTB`), the V plane's own
+                     slab-block numbering.
+  * `desc_mask`    — additive fp16 mask, `[REGION_PAGES * W4*MQ, STK]` at
+                     row stride `SLABS * PITCH` bytes (the common-pitch
+                     law above), window-major: row `(p*W4 + w)*MQ + t`,
+                     `0.0` where the slot is visible to that query row
+                     (within the sequence and causally), `-65504.0` where
+                     it is not, or where the query row is padding. The
+                     finite sentinel is torch's own clamp trick: a
+                     masked-everywhere row still normalizes with weight 0,
+                     never NaN.
 """
 
 
@@ -94,96 +144,102 @@ def batched_prefill_hm(desc_q, desc_o,  #
                        desc_kt, desc_v, desc_ids_kt, desc_ids_v, desc_mask,  #
                        MQ: tl.constexpr, NKVH: tl.constexpr,  #
                        GQA: tl.constexpr, HD: tl.constexpr,  #
-                       PAGE_SLOTS: tl.constexpr, PAGES: tl.constexpr,  #
+                       SLABS: tl.constexpr, STK: tl.constexpr, W4: tl.constexpr,  #
+                       KTB: tl.constexpr, PITCH: tl.constexpr,  #
+                       PAGES: tl.constexpr,  #
                        REGION_PAGES: tl.constexpr,  #
                        SCALE: tl.constexpr):
     """One prefill chunk for the whole sequence: a per-(page, window) walk
     over the cached pages through the pool's own index unit, an online
-    softmax folded per trip, one store.
+    softmax folded per trip, one store per slab.
 
-    `REGION_PAGES` is the extent the two id tables and the mask STATE — the
-    page-major region the host stages and a fold's per-pass segment shift
-    walks — and it is NOT this kernel's walk count (`PAGES` is). On a
-    chunked ladder every rung states the SAME region so their step-input
-    placements agree (`ladder_stages_one_layout`), and the per-page fold
-    body the ladder also bakes reads the same region one page per launch;
-    an unchunked bundle passes `REGION_PAGES = PAGES`, which leaves every
-    descriptor byte for byte what a region-less statement would say."""
+    ⭐ THE GEOMETRY AND POOL CONSTEXPRS ARE BOUND, NEVER DERIVED: SLABS is
+    AttnGeometry::slabs() (the splice spends the stick-multiple law there —
+    a sub-stick head is the declaring model's build failure, not this
+    kernel's), STK is the pool's own stick lane count, W4 its windows per
+    page, KTB the geometry's own id-stick width, PITCH its common table
+    pitch. A value this kernel recomputes is a value it can disagree with
+    the type that sized the tables, so there is none."""
     # torch's own batch: the KV heads AND the GQA group ride the score dot's
-    # batch axis (the g-replicated id stick states it); M is the chunk's
-    # query rows.
-    BATCH: tl.constexpr = NKVH * GQA
-    # 64-slot windows per kv head's page — the pool's own stick geometry.
-    W4: tl.constexpr = PAGE_SLOTS // 64
+    # batch axis — the g-replicated id stick states it — and that stick IS
+    # the bound KTB, so the batch axis derives from it, never from the head
+    # counts again. M is the chunk's query rows.
+    BATCH: tl.constexpr = KTB
     LOG2E: tl.constexpr = 1.44269504
-    # The id stick's width is the door's own (one SenUint32 stick = 32
-    # entries), so one (page, window) trip's g-replicated blocks must fill it
-    # exactly. A geometry with NKVH*GQA != 32 refuses HERE, at compile time,
-    # instead of silently reading a partial stick; the pending
-    # PAGES_PER_TRIP/WINDOWS_PER_TRIP generalization lifts this.
-    ID_STICK: tl.constexpr = 32
-    tl.static_assert(
-        NKVH * GQA == ID_STICK,
-        "batched_prefill_hm: one full id stick per page-window trip requires NKVH * GQA == 32; other geometries need the PAGES_PER_TRIP generalization (the pending worklist item)")
-    # ⛔ THE V BLOCK IS ONE CONTIGUOUS STICK BLOCK ONLY AT HD == 64. The V
-    # plane lays a head out slab-major in 64-feature sticks, so a wider head's
-    # [64, HD] window is several runs apart and the V side must gather per
-    # (window, slab) — a form this kernel does not state yet. Refused HERE,
-    # loudly, by the kernel's own contract — never silently misaddressed.
-    tl.static_assert(HD == 64, "batched_prefill_hm: the V plane's [64, HD] block is one contiguous stick block only at HD 64; a wider head needs the per-(window, slab) V gather this kernel does not state yet")
-    tl.static_assert(PAGE_SLOTS % 64 == 0, "batched_prefill_hm: a page must be a whole number of 64-slot windows")
 
-    # The chunk's q, in torch's [kvh, g, qlen, hd] layout, ONE window at base
-    # reused by every trip's dot — the dot's own A operand, at its natural
-    # shape.
+    # The chunk's q, in torch's [kvh, g, qlen, hd] layout, ONE COLUMN WINDOW
+    # PER SLAB — the score dot is per slab (the door's batched gathered
+    # contraction frame: one gathered row per batch row), so each slab's
+    # partial dot pairs the slab's own STK features of q with that slab's
+    # gathered blocks. The windows are loaded ONCE, before the trip loop,
+    # into one tuple slot per slab — q does not vary per trip. The output is
+    # the same column-window form, stored per slab at `s*STK`.
     q_desc = tl.make_tensor_descriptor(
         desc_q, shape=[BATCH * MQ, HD], strides=[HD, 1],
-        block_shape=[BATCH * MQ, HD])
+        block_shape=[BATCH * MQ, STK])
     o_desc = tl.make_tensor_descriptor(
         desc_o, shape=[BATCH * MQ, HD], strides=[HD, 1],
-        block_shape=[BATCH * MQ, HD])
-    # The pool planes at BLOCK granularity: ONE row = ONE stick block
-    # (`HD * 64` elements), the row an index entry names. The row count is the
-    # plane's own block space; the runtime re-bases the plane per launch, and
-    # the pool a value can reach is bounded where the value is BORN (the
-    # host's GatherEntry door), never re-derived here.
+        block_shape=[BATCH * MQ, STK])
+    # The pool planes at SLAB-BLOCK granularity: ONE row = ONE [STK, STK]
+    # fp16 block (STK*STK elements), FIXED at every head dim — the unit both
+    # planes' windows divide into (Kᵗ's (window, slab) sub-runs are
+    # contiguous STK*STK at every hd; V's slab runs are STK*STK by the
+    # plane's own stick law). The row count is the plane's own slab-block
+    # space; the runtime re-bases the plane per launch, and the pool a value
+    # can reach is bounded where the value is BORN (the host's GatherEntry
+    # door), never re-derived here. At SLABS == 1 the slab block IS the
+    # stick block, so this is the old descriptor byte for byte.
     kt_blk_desc = tl.make_tensor_descriptor(
-        desc_kt, shape=[PAGES * NKVH * W4, HD * 64],
-        strides=[HD * 64, 1], block_shape=[1, HD * 64])
+        desc_kt, shape=[PAGES * NKVH * W4 * SLABS, STK * STK],
+        strides=[STK * STK, 1], block_shape=[1, STK * STK])
     v_blk_desc = tl.make_tensor_descriptor(
-        desc_v, shape=[PAGES * NKVH * W4, 64 * HD],
-        strides=[64 * HD, 1], block_shape=[1, 64 * HD])
+        desc_v, shape=[PAGES * NKVH * W4 * SLABS, STK * STK],
+        strides=[STK * STK, 1], block_shape=[1, STK * STK])
     # The memory-resident block-entry tables (the host's GatherEntry bytes),
-    # one whole stick of ids per (page, window) trip. ⛔ STATED AT THE
-    # REGION **AND AT THE MASK'S OWN PITCH**, NOT THE WALK'S: the extent the
-    # host stages is the ladder's own region (every rung of a chunked ladder
-    # states the same one, and a fold's per-pass shift walks it), and the
-    # per-page block is padded to ONE ID STICK PER MASK ROW (`W4 * MQ`
-    # sticks, the first `W4` meaningful, the tail unread) so the table and
-    # the mask state ONE pitch — the fold's per-pass shift is a single
-    # Activation delta and cannot move them by two different numbers. At
-    # MQ == 1 the padded form is byte-identical to the natural one. The
-    # loads below stay inside this kernel's own `PAGES`-page walk.
-    KTB: tl.constexpr = NKVH * GQA
-    tl.static_assert(
-        KTB * 4 == 64 * 2,
-        "batched_prefill_hm: one id stick per mask row requires KTB * 4 bytes of entries per 64-lane fp16 mask row — the geometry broke the pitch convergence the fold's one per-pass shift needs")
+    # ONE FLAT 1D REGION PER PLANE, STATED AT THE REGION **AND AT THE COMMON
+    # PITCH**: the extent the host stages is the ladder's own region (every
+    # rung of a chunked ladder states the same one, and a fold's per-pass
+    # shift walks it), and the pitch rides the LOAD OFFSETS — the per-trip
+    # stride is `SLABS*PITCH//4` entries and the per-page block is
+    # `W4*MQ*SLABS*PITCH` bytes, the same byte count the mask's own per-page
+    # block states (the common-pitch law), with the first `W4` trip-blocks of
+    # each page's block meaningful (the trip's `SLABS*KTB` entries contiguous
+    # at its head, the pad unread) and the tail padding. ⛔ THE LOADS ARE 1D
+    # AT THE GATHER'S OWN CONSUMED SHAPE — no reshape between the ids load and
+    # the gather: the KTDP trace recovers an indirect read's memory view only
+    # from a RAW descriptor load, and the gather's index vector must be 1D
+    # (Triton's own `descriptor_gather` asserts), so a pitched 2D stick view
+    # cannot feed one. Both tables number a trip's blocks SLAB-MAJOR — slab
+    # s's `KTB` entries at `s*KTB`, one `[KTB]` load per (trip, slab), the
+    # door's own one-gathered-row-per-batch-row frame — because BOTH sides
+    # dot per slab (the score's partial dots and the V side's PV partials);
+    # the two tables differ only in their VALUES (each plane's own
+    # slab-block numbering).
     kt_ids_desc = tl.make_tensor_descriptor(
-        desc_ids_kt, shape=[REGION_PAGES * W4 * MQ * KTB], strides=[1],
-        block_shape=[KTB])
+        desc_ids_kt, shape=[REGION_PAGES * W4 * MQ * SLABS * PITCH // 4],
+        strides=[1], block_shape=[KTB])
     v_ids_desc = tl.make_tensor_descriptor(
-        desc_ids_v, shape=[REGION_PAGES * W4 * MQ * KTB], strides=[1],
-        block_shape=[KTB])
+        desc_ids_v, shape=[REGION_PAGES * W4 * MQ * SLABS * PITCH // 4],
+        strides=[1], block_shape=[KTB])
     # The causal mask, window-major within each page, added at the score tile
-    # as a leading stride-0 broadcast — stated at the same region for the
-    # same reason the tables are.
+    # as a leading stride-0 broadcast — stated at the same region and the
+    # same common pitch (each row's STK lanes meaningful, the SLABS*PITCH
+    # row stride the padding the one per-pass shift walks past unread).
     mask_desc = tl.make_tensor_descriptor(
-        desc_mask, shape=[REGION_PAGES * W4 * MQ, 64],
-        strides=[64, 1], block_shape=[MQ, 64])
+        desc_mask, shape=[REGION_PAGES * W4 * MQ, STK],
+        strides=[SLABS * PITCH // 2, 1], block_shape=[MQ, STK])
 
     # The running softmax across the walk, per (kv head, group, query row):
     # torch's carry, folded once per (page, window) trip.
-    q = tl.reshape(q_desc.load([0, 0]), [BATCH, MQ, HD])
+    # ⭐ Q IS ONE TUPLE, ONE COLUMN WINDOW PER SLAB — `[BATCH, MQ, STK]`
+    # each, loaded once before the trip loop — because the score dot is per
+    # slab (the door's batched gathered contraction frame: one gathered row
+    # per batch row), each partial pairing the slab's own STK features of q
+    # with that slab's gathered blocks. At `SLABS == 1` the one window at
+    # column 0 IS the old whole-row load exactly.
+    qs = (tl.zeros([BATCH, MQ, STK], tl.float16),) * SLABS
+    for s in tl.static_range(SLABS):
+        qs[s] = tl.reshape(q_desc.load([0, s * STK]), [BATCH, MQ, STK])
     m = tl.full([BATCH, MQ], -65504.0, tl.float32)
     # ⭐ THE DENOMINATOR IS f32, LIKE THE MAX IT PAIRS WITH (wall 13): `m` and `l`
     # are one online-softmax carry — the same per-trip recurrence updates both —
@@ -192,43 +248,95 @@ def batched_prefill_hm(desc_q, desc_o,  #
     # coarser-graded one. `o`'s landing stays f16 (the store's own dtype); only
     # the carry widens.
     l = tl.zeros([BATCH, MQ], tl.float32)
-    acc = tl.zeros([BATCH, MQ, HD], tl.float16)
+    # ⭐ THE ACCUMULATORS ARE ONE TUPLE, ONE SLOT PER SLAB — [BATCH, MQ, STK]
+    # each, `(zeros,) * SLABS` — because the V plane's blocks are per-slab and
+    # no transpose, gather order or reshape can fold them into one [B, MQ, HD]
+    # tensor (the V plane's block is [slot, feat'] row-major, so a per-trip V
+    # gather's flat order is (slab, slot, feat') while [B, MQ, HD] wants
+    # (slot, slab, feat') — slot is INSIDE the block, so no id ordering fixes
+    # it). Each trip's PV partial for slab s updates ITS OWN tuple slot
+    # (`accs[s] = accs[s] * rescale + pv`, a compile-time sequence-slot
+    # assignment over the static unroll — one [B, MQ, STK] read-modify-write
+    # per slab, never a where-select over a slabbled accumulator), and the
+    # tail below stores each slot through its own column window of the
+    # output. At SLABS == 1 this is the old [BATCH, MQ, HD] accumulator
+    # exactly (the tuple is compile-time; its one slot IS the old register).
+    accs = (tl.zeros([BATCH, MQ, STK], tl.float16),) * SLABS
 
-    for s in tl.static_range(PAGES):
+    for p in tl.static_range(PAGES):
         for w in tl.static_range(W4):
-            # The block gathers: one stick block per index entry, both
-            # planes, this trip's own g-replicated id stick, the ids loaded
-            # from the memory-resident tables (never computed in-register).
-            kt_ids = kt_ids_desc.load([(s * W4 * MQ + w) * KTB])  # [KTB] i32
-            v_ids = v_ids_desc.load([(s * W4 * MQ + w) * KTB])    # [KTB] i32
-            kt_blk = tl.reshape(kt_blk_desc.gather(kt_ids, 0),
-                                [BATCH, HD, 64])
-            v_blk = tl.reshape(v_blk_desc.gather(v_ids, 0),
-                               [BATCH, 64, HD])
-            # The score dot at the g-replicated stick's own rows: q natural on
-            # the A side (its row order IS (kvh, g)), the gathered blocks on
-            # the B side, the chunk's query rows the dot's M axis — never a
-            # new descriptor, never a permute, never a spray.
-            qk = tl.dot(q, kt_blk, out_dtype=tl.float16)      # [B, MQ, 64]
+            # The trip's base in the flat 1D table: page p's block plus w
+            # trip-blocks — the per-trip stride SLABS*PITCH//4 entries is the
+            # common pitch riding the offset, its pad unread.
+            trip = (p * W4 * MQ + w) * (SLABS * PITCH // 4)
+            # ⭐ THE SCORE DOT IS PER SLAB, THE PARTIALS SUMMED — the door's
+            # own batched gathered contraction frame (one gathered row per
+            # batch row: each slab's [KTB] stick is its own gather, its
+            # partial dot contracting that slab's STK features). By the
+            # pool's own layout law (`PagedKvPool::addr`, sdsc_abstract.rs
+            # `KvPlane::Kt` arm): a Kᵗ window is FEAT-MAJOR — element
+            # (feat, slot) of window w at `w*hd*STK + feat*STK + slot` — so
+            # slab s's contiguous STK*STK sub-run is a row-major
+            # [STK feat, STK slot] block, and the per-slab id set (slab s's
+            # KTB entries at `trip + s*KTB` in the slab-major table) gathers
+            # to a [BATCH, STK, STK] block in the plane's own (feat, slot)
+            # order, the partial contracting q's slab-s features against it.
+            # SLABS partial dots summing to the one [B, MQ, STK] score tile
+            # the whole-HD contraction states; `static_range(1, SLABS)` is
+            # EMPTY at `SLABS == 1`, so slab 0's dot IS the old single score
+            # dot exactly. The scatter (`kv_cache_write`) addresses the same
+            # window through the same `addr` law, so the write and this
+            # gather cannot disagree about where a slab lives.
+            kt_blk = tl.reshape(
+                kt_blk_desc.gather(kt_ids_desc.load([trip]), 0),
+                [BATCH, STK, STK])
+            qk = tl.dot(qs[0], kt_blk, out_dtype=tl.float16)  # [B, MQ, STK]
+            for s in tl.static_range(1, SLABS):
+                kt_blk = tl.reshape(
+                    kt_blk_desc.gather(kt_ids_desc.load([trip + s * KTB]), 0),
+                    [BATCH, STK, STK])
+                qk = qk + tl.dot(qs[s], kt_blk, out_dtype=tl.float16)
             qk = qk * (SCALE * LOG2E)
             # The causal mask, host-staged window-major, added at the score
             # tile as a leading stride-0 broadcast — the row-split operand
             # mode, every batch row reading the same mask row.
-            qk = qk + tl.reshape(mask_desc.load([(s * W4 + w) * MQ, 0]),
-                                 [1, MQ, 64])
-            # The online update, folded per trip: running max over the 64
+            qk = qk + tl.reshape(mask_desc.load([(p * W4 + w) * MQ, 0]),
+                                 [1, MQ, STK])
+            # The online update, folded per trip: running max over the STK
             # score lanes (a LAST-axis reduction), rescaled sum, rescaled
             # accumulator — the max spray over the lanes is a per-row scalar,
             # the one broadcast mode a pointwise kernel states natively.
             m_new = tl.maximum(m, tl.max(qk, 2))              # [B, MQ] f32
             rescale = tl.math.exp2(m - m_new).to(tl.float16)
-            p = tl.math.exp2(qk - m_new[:, :, None]).to(tl.float16)
-            l = l * rescale + tl.sum(p, 2)
-            pv = tl.dot(p, v_blk, out_dtype=tl.float16)       # [B, MQ, HD]
-            acc = acc * rescale[:, :, None] + pv
+            p_tile = tl.math.exp2(qk - m_new[:, :, None]).to(tl.float16)
+            l = l * rescale + tl.sum(p_tile, 2)
+            # The V gather and PV dot, PER SLAB: the V table's slab-major
+            # slice is one [KTB] 1D load at `s*KTB` — the gather's own
+            # consumed shape, no reshape between load and gather — and, by
+            # the pool's own layout law (`PagedKvPool::addr`, `KvPlane::V` arm: a V window is
+            # FEATURE-SLAB-MAJOR, `(feat/STK)*(PLANE_SLOTS*STK) + slot*STK +
+            # feat%STK`, so slab s's run is a row-major [STK slot, STK feat]
+            # block) — the gathered block is [BATCH, STK, STK] in the
+            # plane's own (slot, lane) order, and the partial product updates
+            # ITS OWN tuple slot. The contraction is unchanged: `p`'s STK
+            # slots against each slab's STK lanes, the rescale applied once
+            # per trip per slot (the slab loop covers every slot), SLABS
+            # partial dots summing to the one [B, MQ, HD] product.
+            for s in tl.static_range(SLABS):
+                v_ids = v_ids_desc.load([trip + s * KTB])
+                v_blk = tl.reshape(v_blk_desc.gather(v_ids, 0),
+                                   [BATCH, STK, STK])
+                pv = tl.dot(p_tile, v_blk, out_dtype=tl.float16)  # [B, MQ, STK]
+                accs[s] = accs[s] * rescale[:, :, None] + pv
             m = m_new
 
     # ⭐ THE LANDING IS f16 (the store's dtype); the division itself rides the
-    # f32 carry above.
-    o = (acc / l[:, :, None]).to(tl.float16)                 # [B, MQ, HD]
-    o_desc.store([0, 0], tl.reshape(o, [BATCH * MQ, HD]))
+    # f32 carry above. The merge weights are slab-free (m and l carry no
+    # feature axis), so the normalize is stated ONCE and every accumulator
+    # slot lands through its own column window of the output — the flat
+    # (slab, lane) pair IS the natural feature order, slab s storing at
+    # column s*STK. At SLABS == 1 this is the old single normalize and single
+    # whole-row store exactly (the one column window IS the whole row).
+    for s in tl.static_range(SLABS):
+        o = (accs[s] / l[:, :, None]).to(tl.float16)          # [B, MQ, STK]
+        o_desc.store([0, s * STK], tl.reshape(o, [BATCH * MQ, STK]))

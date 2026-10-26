@@ -1986,7 +1986,6 @@ fn lower_attn_at<
                 geom,
                 num_seqs,
                 pages: cap,
-                page_slots,
                 blocks_per_chunk,
                 num_chunks,
                 scale,
@@ -2014,8 +2013,8 @@ fn lower_attn_at<
         }
         // THE PAGES THE CHUNK ATTENDS: the prefix segment's rows plus the new block's —
         // the graph's own regions, the same reading the old one-shot attention splice took — padded
-        // to whole pages. The kernel's own static_assert carries the rest of the contract
-        // (one full id stick per page-window trip: `NKVH*GQA == 32`).
+        // to whole pages. The kernel's id-stick and pitch laws are its own bound constexprs
+        // (`KTB`, `PITCH`), stated at the typed consts.
         let prefix_len = node.inputs[1].region.rows.len;
         let new_len = node.inputs[3].region.rows.len;
         let pages = (prefix_len + new_len).div_ceil(page_slots);
@@ -2032,7 +2031,6 @@ fn lower_attn_at<
                 geom,
                 mq,
                 pages,
-                page_slots,
                 region_pages,
                 scale,
             })?,
@@ -2114,7 +2112,6 @@ struct BatchedDecodeFacts<const NQH: u32, const NKVH: u32, const HD: u32> {
     geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
     num_seqs: u32,
     pages: u32,
-    page_slots: u32,
     blocks_per_chunk: u32,
     num_chunks: u32,
     scale: f32,
@@ -2123,8 +2120,8 @@ struct BatchedDecodeFacts<const NQH: u32, const NKVH: u32, const HD: u32> {
 /// THE BATCHED DECODE KERNEL'S LAUNCH CONTRACT — the kernel's own parameter order
 /// (`batched_decode_hm`: q, out, the two pool planes, Q's row-repetition table, the two
 /// block-entry tables, the mask), plus every extent as a constexpr: the geometry
-/// (`NUM_SEQS/NKVH/GQA/HD`), the pool (`PAGES`, `PAGE_SLOTS`), the batching
-/// (`BLOCKS_PER_CHUNK`, `NUM_CHUNKS`), and the scale.
+/// (`NUM_SEQS/NKVH/GQA/HD`), the pool (`PAGES`), the batching (`BLOCKS_PER_CHUNK`,
+/// `NUM_CHUNKS`), and the scale.
 ///
 /// The ids tables are `*i32` — the kernel gathers pages through them and the door sizes an
 /// index buffer `SenUint32` by its own gather law; `desc_rep_ids` is the same `*i32` form
@@ -2134,7 +2131,12 @@ struct BatchedDecodeFacts<const NQH: u32, const NKVH: u32, const HD: u32> {
 ///
 /// ⭐ THE GEOMETRY CONSTEXPRS ARE THE CONSTS, not copies of values: `NKVH`/`HD` are this
 /// function's own const generics and `GQA` is the witness's associated const, so a
-/// constexpr and the door's arm can never disagree about a head count.
+/// constexpr and the door's arm can never disagree about a head count. ⭐ THE POOL'S OWN
+/// DERIVED FACTS RIDE THE SAME LAW: `SLABS` is spent as `geom.slabs()` — the call itself
+/// is the stick-multiple law's firing point, so a sub-stick head is the declaring model's
+/// build failure HERE, at the mint — and `STK`/`W4` are the pool's own consts
+/// (`POOL_STICK`, `WINDOWS_PER_PAGE`), never values the mint recomputed. The kernel takes
+/// no `PAGE_SLOTS`: nothing it states derives from it any more.
 fn batched_decode_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
     f: &BatchedDecodeFacts<NQH, NKVH, HD>,
 ) -> Result<KernelSpec, String> {
@@ -2142,7 +2144,6 @@ fn batched_decode_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
         geom,
         num_seqs,
         pages,
-        page_slots,
         blocks_per_chunk,
         num_chunks,
         scale,
@@ -2180,7 +2181,20 @@ fn batched_decode_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
     ce("NKVH", Val::Int(i128::from(NKVH)))?;
     ce("GQA", Val::Int(i128::from(geom.gqa())))?;
     ce("HD", Val::Int(i128::from(HD)))?;
-    ce("PAGE_SLOTS", Val::Int(i128::from(page_slots)))?;
+    // SLABS is spent as `geom.slabs()` — the call is the stick-multiple law's firing point —
+    // and STK/W4 are the pool's own consts, read at the same names the kernel's docstring
+    // cites. The mint recomputes none of them.
+    ce("SLABS", Val::Int(i128::from(geom.slabs())))?;
+    ce(
+        "STK",
+        Val::Int(i128::from(ktir_superdsc::sdsc_abstract::POOL_STICK)),
+    )?;
+    ce(
+        "W4",
+        Val::Int(i128::from(
+            ktir_superdsc::sdsc_abstract::PagedKvPool::WINDOWS_PER_PAGE,
+        )),
+    )?;
     ce("PAGES", Val::Int(i128::from(pages)))?;
     ce("BLOCKS_PER_CHUNK", Val::Int(i128::from(blocks_per_chunk)))?;
     ce("NUM_CHUNKS", Val::Int(i128::from(num_chunks)))?;
@@ -2202,7 +2216,6 @@ struct BatchedPrefillFacts<const NQH: u32, const NKVH: u32, const HD: u32> {
     geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
     mq: u32,
     pages: u32,
-    page_slots: u32,
     /// The page ceiling of the region the tables and mask STATE, when this rung sits on a
     /// chunked ladder (the census's ONE `max_pages` derivation, threaded by the walk). `None`
     /// states the region at the walk's own extent — byte for byte the region-less statement.
@@ -2212,16 +2225,21 @@ struct BatchedPrefillFacts<const NQH: u32, const NKVH: u32, const HD: u32> {
 
 /// THE BATCHED PREFILL KERNEL'S LAUNCH CONTRACT — the same parameter order as the decode
 /// kernel's (`batched_prefill_hm`: q, out, the two pool planes, the TWO block-entry tables,
-/// the mask), plus every extent as a constexpr: the geometry (`MQ/NKVH/GQA/HD`), the pool
-/// walk (`PAGES`, `PAGE_SLOTS`), and the scale.
+/// the mask), plus every extent as a constexpr: the geometry (`MQ/NKVH/GQA/HD`), the pool's
+/// own derived facts (`SLABS/STK/W4/KTB/PITCH`), the pool walk (`PAGES`), and the scale.
 ///
 /// THE BLOCK-ENTRY CONTRACT, under the same laws as the decode spec: the kernel gathers the
-/// pool ONE STICK BLOCK per index entry, through TWO tables — each plane's own block
+/// pool ONE SLAB BLOCK per index entry, through TWO tables — each plane's own block
 /// numbering — whose values are the host's `GatherEntry` bytes. No page stride or block
 /// offset is a constexpr here: those live in the values, composed at the pool's one door on
-/// the host. The ids table is `*i32` and the mask always consumed. The kernel's own
-/// `static_assert` carries the one-stick-per-trip law (`NKVH*GQA == 32`), so
-/// a model class the form does not cover refuses at compile, in the kernel's own terms.
+/// the host. The ids table is `*i32` and the mask always consumed. ⭐ THE GEOMETRY
+/// CONSTEXPRS ARE THE CONSTS, not copies of values: `KTB` is `AttnGeometry::KTB` (the
+/// id-stick width — the kernel's batch axis derives from it, never from the head counts),
+/// `SLABS` is spent as `geom.slabs()` — the call itself is the stick-multiple law's firing
+/// point, so a sub-stick head is the declaring model's build failure HERE, at the mint —
+/// `STK`/`W4` are the pool's own consts (`POOL_STICK`, `WINDOWS_PER_PAGE`), and `PITCH` is
+/// `AttnGeometry::table_pitch()`, the ONE typed item the tables, the mask and the fold's
+/// per-pass shift all read. The kernel takes no `PAGE_SLOTS`.
 fn batched_prefill_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
     f: &BatchedPrefillFacts<NQH, NKVH, HD>,
 ) -> Result<KernelSpec, String> {
@@ -2229,7 +2247,6 @@ fn batched_prefill_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
         geom,
         mq,
         pages,
-        page_slots,
         region_pages,
         scale,
     } = *f;
@@ -2264,7 +2281,23 @@ fn batched_prefill_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
     ce("NKVH", Val::Int(i128::from(NKVH)))?;
     ce("GQA", Val::Int(i128::from(geom.gqa())))?;
     ce("HD", Val::Int(i128::from(HD)))?;
-    ce("PAGE_SLOTS", Val::Int(i128::from(page_slots)))?;
+    // The geometry's own id-stick width, the pool's own consts, and the common pitch —
+    // each spent at the typed const, exactly like SLABS below: `geom.slabs()` is the call
+    // that fires the stick-multiple law (a sub-stick head refuses HERE), and `table_pitch`
+    // is the one item the tables, the mask and the fold's per-pass shift all read.
+    ce("KTB", Val::Int(i128::from(geom.ktb())))?;
+    ce("SLABS", Val::Int(i128::from(geom.slabs())))?;
+    ce(
+        "STK",
+        Val::Int(i128::from(ktir_superdsc::sdsc_abstract::POOL_STICK)),
+    )?;
+    ce(
+        "W4",
+        Val::Int(i128::from(
+            ktir_superdsc::sdsc_abstract::PagedKvPool::WINDOWS_PER_PAGE,
+        )),
+    )?;
+    ce("PITCH", Val::Int(i128::from(geom.table_pitch())))?;
     ce("PAGES", Val::Int(i128::from(pages)))?;
     ce("REGION_PAGES", Val::Int(i128::from(region_pages)))?;
     ce("SCALE", Val::Float(f64::from(scale)))?;
@@ -2299,7 +2332,6 @@ struct PagedFoldFamilyFacts<const NQH: u32, const NKVH: u32, const HD: u32> {
     /// The head geometry as consts — the door's witness.
     geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
     mq: u32,
-    page_slots: u32,
     region_pages: u32,
     scale: f32,
 }
@@ -2333,6 +2365,11 @@ fn paged_fold_seed_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
     ce("NKVH", Val::Int(i128::from(NKVH)))?;
     ce("GQA", Val::Int(i128::from(geom.gqa())))?;
     ce("HD", Val::Int(i128::from(HD)))?;
+    ce("KTB", Val::Int(i128::from(geom.ktb())))?;
+    ce(
+        "STK",
+        Val::Int(i128::from(ktir_superdsc::sdsc_abstract::POOL_STICK)),
+    )?;
     Ok(KernelSpec {
         kernel: "paged_fold_seed_hm".to_string(),
         signature,
@@ -2343,10 +2380,12 @@ fn paged_fold_seed_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
 
 /// THE FOLD BODY'S LAUNCH CONTRACT — `paged_fold_hm`'s own parameter order (q, the carried
 /// max/sum/accumulator, the two pool planes, the two block-entry tables, the mask), plus every
-/// extent as a constexpr: the geometry (`MQ/NKVH/GQA/HD`), the pool (`PAGE_SLOTS`), the region
-/// the tables and mask state (`REGION_PAGES`), and the scale. The block-entry contract is the
-/// prefill kernel's own — global stick-block entries, one per table row — and the per-pass
-/// shift the runtime applies rides the ACTIVATION segment, page-major, which is why the tables
+/// extent as a constexpr: the geometry (`MQ/NKVH/GQA/HD`), the pool's own derived facts
+/// (`SLABS/STK/W4/KTB/PITCH`), the region the tables and mask state (`REGION_PAGES`), and
+/// the scale. The block-entry contract is the prefill kernel's own — global slab-block
+/// entries, one per table row, at the COMMON PITCH (`AttnGeometry::table_pitch()`, the one
+/// typed item the tables, the mask and the per-pass shift read) — and the per-pass shift
+/// the runtime applies rides the ACTIVATION segment, page-major, which is why the tables
 /// and the mask state the REGION and not the page.
 fn paged_fold_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
     f: &PagedFoldFamilyFacts<NQH, NKVH, HD>,
@@ -2354,7 +2393,6 @@ fn paged_fold_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
     let PagedFoldFamilyFacts {
         geom,
         mq,
-        page_slots,
         region_pages,
         scale,
     } = *f;
@@ -2385,7 +2423,21 @@ fn paged_fold_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
     ce("NKVH", Val::Int(i128::from(NKVH)))?;
     ce("GQA", Val::Int(i128::from(geom.gqa())))?;
     ce("HD", Val::Int(i128::from(HD)))?;
-    ce("PAGE_SLOTS", Val::Int(i128::from(page_slots)))?;
+    // The geometry's own id-stick width, the pool's own consts, and the common pitch —
+    // spent at the typed consts under the same law as the prefill spec's.
+    ce("KTB", Val::Int(i128::from(geom.ktb())))?;
+    ce("SLABS", Val::Int(i128::from(geom.slabs())))?;
+    ce(
+        "STK",
+        Val::Int(i128::from(ktir_superdsc::sdsc_abstract::POOL_STICK)),
+    )?;
+    ce(
+        "W4",
+        Val::Int(i128::from(
+            ktir_superdsc::sdsc_abstract::PagedKvPool::WINDOWS_PER_PAGE,
+        )),
+    )?;
+    ce("PITCH", Val::Int(i128::from(geom.table_pitch())))?;
     ce("REGION_PAGES", Val::Int(i128::from(region_pages)))?;
     ce("SCALE", Val::Float(f64::from(scale)))?;
     Ok(KernelSpec {
@@ -2426,6 +2478,12 @@ fn paged_fold_finalize_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
     ce("NKVH", Val::Int(i128::from(NKVH)))?;
     ce("GQA", Val::Int(i128::from(geom.gqa())))?;
     ce("HD", Val::Int(i128::from(HD)))?;
+    ce("KTB", Val::Int(i128::from(geom.ktb())))?;
+    ce("SLABS", Val::Int(i128::from(geom.slabs())))?;
+    ce(
+        "STK",
+        Val::Int(i128::from(ktir_superdsc::sdsc_abstract::POOL_STICK)),
+    )?;
     Ok(KernelSpec {
         kernel: "paged_fold_finalize_hm".to_string(),
         signature,
@@ -2464,11 +2522,9 @@ fn mint_paged_fold<
         );
     };
     let mq = node.output.region.rows.len;
-    let page_slots = ktir_superdsc::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
     let facts = PagedFoldFamilyFacts {
         geom,
         mq,
-        page_slots,
         region_pages,
         scale,
     };
@@ -2609,7 +2665,7 @@ fn mint_paged_fold<
             gathered: true,
             batched_requests: false,
             fold_rows: ktir_superdsc::sdsc_abstract::FoldRowRegime::WholeBatch,
-            page_slots,
+            page_slots: ktir_superdsc::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32,
         },
     );
     body.ktir = Some(fold);

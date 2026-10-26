@@ -192,11 +192,24 @@ pub fn gather_entry_ceiling_for(
     sd::gather_entry_ceiling(page_ceiling, page_stride_bytes, pool)
 }
 
-/// One id table's bytes, LE u32 per entry — the RawU32 channel's own wire form.
-fn encode(t: &[sd::GatherEntry]) -> Vec<u8> {
+/// One id table's bytes, LE u32 per entry — the RawU32 channel's own wire form. The PLANE is
+/// checked against every entry's own: [`sd::GatherEntry`] carries the plane it was minted for,
+/// and a table staged into one plane's slot while naming the other plane's blocks is a
+/// bake/host disagreement about which buffer the kernel reads — refused by name, never staged.
+fn encode(what: &str, plane: sd::KvPlane, t: &[sd::GatherEntry]) -> Result<Vec<u8>, String> {
     t.iter()
-        .flat_map(|e| e.as_i32().to_le_bytes())
-        .collect::<Vec<u8>>()
+        .try_fold(Vec::with_capacity(t.len() * 4), |mut out, e| {
+            if e.plane() != plane {
+                return Err(format!(
+                    "{what}: an id table staged for the {plane:?} plane names a block of the \
+                     {} plane — the two gathered planes number a page's slab blocks differently, \
+                     so this is a table built for the other slot, never a rounding",
+                    e.plane()
+                ));
+            }
+            out.extend_from_slice(&e.as_i32().to_le_bytes());
+            Ok(out)
+        })
 }
 
 /// ⭐⭐⭐⭐⭐ BUILD THE ATTENTION FAMILY'S STEP INPUTS — the pure construction both runtimes
@@ -236,7 +249,7 @@ pub fn build_attn_step_inputs<const NQH: u32, const NKVH: u32, const HD: u32>(
             let ceiling = ceiling.ok_or_else(|| {
                 format!(
                     "{what}: this bundle's attention gathers, but a physical page is not a whole \
-                     number of STICK BLOCKS — no integer index can name a page boundary"
+                     number of SLAB BLOCKS — no integer index can name a page boundary"
                 )
             })?;
             // ⭐ THE THREE STEP INPUTS, MINTED BY ONE WALK of the region — id tables and validity
@@ -258,8 +271,8 @@ pub fn build_attn_step_inputs<const NQH: u32, const NKVH: u32, const HD: u32>(
                     )
                 })?;
             Ok(AttnStepPayload {
-                kt: encode(inputs.kt_entries()),
-                v: encode(inputs.v_entries()),
+                kt: encode(what, sd::KvPlane::Kt, inputs.kt_entries())?,
+                v: encode(what, sd::KvPlane::V, inputs.v_entries())?,
                 rep: None,
                 mask: inputs.mask().wire_bytes().to_vec(),
             })
@@ -281,23 +294,24 @@ pub fn build_attn_step_inputs<const NQH: u32, const NKVH: u32, const HD: u32>(
             let ceiling = ceiling.ok_or_else(|| {
                 format!(
                     "{what}: this bundle's attention gathers, but a physical page is not a whole \
-                     number of STICK BLOCKS — no integer index can name a page boundary"
+                     number of SLAB BLOCKS — no integer index can name a page boundary"
                 )
             })?;
-            let kt = sd::spliced_decode_ids_table(batch, maps, ceiling).ok_or_else(|| {
-                format!(
-                    "{what}: could not build the batch's block-entry table from {} installed \
-                     page map(s) — not one map per launch row, an empty map, or an entry past \
-                     int32 (never a zero table: zero is block 0, a REAL address)",
-                    maps.len()
-                )
-            })?;
-            let v = sd::spliced_decode_ids_table(batch, maps, ceiling).ok_or_else(|| {
-                format!(
-                    "{what}: could not build the batch's V-plane block-entry table — same law, \
-                     same refusal, the V plane's own slot"
-                )
-            })?;
+            let kt = sd::spliced_decode_ids_table(sd::KvPlane::Kt, batch, maps, ceiling)
+                .ok_or_else(|| {
+                    format!(
+                        "{what}: could not build the batch's block-entry table from {} installed \
+                         page map(s) — not one map per launch row, an empty map, or an entry past \
+                         int32 (never a zero table: zero is block 0, a REAL address)",
+                        maps.len()
+                    )
+                })?;
+            let v = sd::spliced_decode_ids_table(sd::KvPlane::V, batch, maps, ceiling).ok_or_else(|| {
+                    format!(
+                        "{what}: could not build the batch's V-plane block-entry table — same law, \
+                         same refusal, the V plane's own slot"
+                    )
+                })?;
             let rep = sd::spliced_decode_rep_ids(batch);
             let mask = sd::spliced_decode_mask_f16(batch, &rows.mask_histories(), write)
                 .ok_or_else(|| {
@@ -307,8 +321,8 @@ pub fn build_attn_step_inputs<const NQH: u32, const NKVH: u32, const HD: u32>(
                     )
                 })?;
             Ok(AttnStepPayload {
-                kt: encode(&kt),
-                v: encode(&v),
+                kt: encode(what, sd::KvPlane::Kt, &kt)?,
+                v: encode(what, sd::KvPlane::V, &v)?,
                 rep: Some(rep.iter().flat_map(|&r| r.to_le_bytes()).collect()),
                 mask: mask.wire_bytes().to_vec(),
             })

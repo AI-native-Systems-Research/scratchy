@@ -1247,7 +1247,7 @@ pub struct PointwiseGather<'a, O: KindTag> {
 ///
 /// THE ENTRY UNIT. dxp turns an entry value into an address as `idx * skip_addr + base`, and a
 /// gathered read of this pool strides one entry at `entry_elems` elements — while the reach's
-/// entries are `entry_elems`-element stick blocks, the unit the host's `GatherEntry::of_page_block`
+/// entries are `entry_elems`-element SLAB blocks, the unit the host's `GatherEntry::of_slab_block`
 /// composes its runtime values in. Two units for one address is two authorities for the same
 /// bytes: a descriptor striding at any other width reads every entry at the wrong address, from a
 /// clean bake — refused here, by name, with both numbers.
@@ -1255,7 +1255,7 @@ pub struct PointwiseGather<'a, O: KindTag> {
 /// ⛔ THE VALUES' BOUND IS NOT A CHECK HERE, because it cannot be one: the values are runtime data
 /// and any run-shaped inequality against the reach compares two different tensors' coordinates.
 /// The honest bound is the ceiling the reach carries, enforced where a value is BORN (the
-/// host-side `gather_entry_ceiling` → `GatherEntry::of_page_block` composition); the extent law
+/// host-side `gather_entry_ceiling` → `GatherEntry::of_slab_block` composition); the extent law
 /// holds by TYPE (`skip_addr` equal to `entry_elems` satisfies the reach's derived element extent
 /// exactly). A table with NO declared reach returns `None` and takes none of this — its gather
 /// keeps the swept-window law byte for byte.
@@ -1281,9 +1281,9 @@ pub(crate) fn pooled_reach_of(
         return Err(SuperDscError(format!(
             "{what}: this gathered read of '{table}' (t{tid}) strides one index entry at \
              {entry_elems} elements, but the bundle declares that pool's entries as {}-element \
-             stick blocks (a ceiling of {} entry values, {} elements of reach). dxp turns a value \
+             slab blocks (a ceiling of {} entry values, {} elements of reach). dxp turns a value \
              into an address as `idx * skip_addr + base`, and the host composes those values in \
-             the pool's own unit (`GatherEntry::of_page_block`), so a descriptor striding at any \
+             the pool's own unit (`GatherEntry::of_slab_block`), so a descriptor striding at any \
              other width reads every entry at the wrong address — from a clean bake. State the \
              read at the pool's entry width, or declare the reach for the pool this read really \
              strides (`BundleLayout::gather_reach`).",
@@ -1429,7 +1429,7 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
     //
     // THE ENTRY UNIT. dxp turns an entry value into an address as `idx * skip_addr + base`,
     // and this descriptor strides one entry at `cols` elements — while the reach's entries are
-    // `entry_elems`-element stick blocks, the unit the host's `GatherEntry::of_page_block`
+    // `entry_elems`-element SLAB blocks, the unit the host's `GatherEntry::of_slab_block`
     // composes its runtime values in. Two units for one address is two authorities for the
     // same bytes: a descriptor striding at any other width reads every entry at the wrong
     // address, from a clean bake — refused here, by name, with both numbers.
@@ -1440,7 +1440,7 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
     // tensors' coordinates and is vacuous on every real bundle. The honest bound on the
     // VALUES is the ceiling the reach carries — `(page_ceiling − 1) · per_page + plane_blocks`
     // — and it is enforced where a value is BORN: the host-side composition
-    // (`gather_entry_ceiling` → `GatherEntry::of_page_block`) refuses every value at or above
+    // (`gather_entry_ceiling` → `GatherEntry::of_slab_block`) refuses every value at or above
     // it, and the same door minted the reach the producer declared, so the bake-time and
     // stage-time halves are one number by construction. The extent law — the descriptor's
     // `skip_addr` times the ceiling stays inside the reach — holds by TYPE: the reach's
