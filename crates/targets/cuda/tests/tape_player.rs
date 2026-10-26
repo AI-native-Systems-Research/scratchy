@@ -14,7 +14,9 @@ pub mod common {
     pub mod attn_layer;
     pub mod chains;
     pub mod gdn_layer;
+    pub mod gemma_mlp;
     pub mod gemma_moe;
+    pub mod gemma_rows;
     pub mod mlp;
     pub mod moe_block;
     pub mod numerics;
@@ -42,6 +44,9 @@ use common::numerics::{
 use scratchy_subtile::gdn_state_layout::GdnStateLayout;
 use scratchy_subtile::subtile_ir::GainConvention;
 use scratchy_target_cuda::kernels::{gemm_bf16_abt, rms_norm_bf16, rope_bf16};
+use scratchy_target_cuda::kernels::{
+    layer_scale_bf16, rms_norm_unit_bf16, scale_bf16, soft_cap_bf16,
+};
 use scratchy_target_cuda::rotary::rotary_rows;
 use scratchy_target_cuda::runtime::{
     CudaDevice, CudaWorker, DeviceBuffer, ForwardError, GdnPoolConfig, GdnSequence, Input, KvHalf,
@@ -2991,4 +2996,295 @@ fn a_gemma_tape_is_refused_not_launched_before_anything_is_enqueued() {
     );
     assert!(y.iter().all(|&v| v == 0xBEEF), "the result is untouched");
     assert_eq!(read(&mut worker, result), before, "nothing was enqueued");
+}
+
+// ── Gemma 4's row steps, played (#921) ─────────────────────────────
+
+use common::gemma_mlp::{GEMMA_MLP_FACTS, gemma_mlp};
+use common::gemma_rows::{GEMMA_ROWS_FACTS, gemma_rows};
+
+/// The Gemma row chain at m = 1 and 512, as CUDA's compiler lowers it, then
+/// [`whole_arena_tape`] over the larger arena.
+fn gemma_rows_buckets() -> &'static [CudaTape] {
+    static TAPES: std::sync::OnceLock<Vec<CudaTape>> = std::sync::OnceLock::new();
+    TAPES.get_or_init(|| {
+        let mut t: Vec<CudaTape> = [1u32, 512]
+            .into_iter()
+            .map(|m| {
+                let at = CanonicalAt {
+                    stem: "gemma_rows",
+                    m: u64::from(m),
+                };
+                let c = lower_canonical(&gemma_rows(m), GEMMA_ROWS_FACTS, at)
+                    .unwrap_or_else(|e| panic!("the Gemma row chain lowers at m={m}: {e}"));
+                static_tape(&c)
+            })
+            .collect();
+        let bytes = (t.iter().map(|t| t.arena.total_bytes))
+            .max()
+            .expect("tapes");
+        t.push(whole_arena_tape(bytes));
+        t
+    })
+}
+
+/// Play one row step of `tape` by its standalone launcher on a host copy of the arena: its input
+/// region uploaded, the launch, its output region downloaded back into `arena`. `w` is the layer
+/// scale's weight.
+fn play_row_step(device: &CudaDevice, s: &CudaStep, arena: &mut [u16], w: &DeviceBuffer) {
+    let region = |at: ArenaOffset, rows: u32, cols: u32| {
+        let at = at.0 as usize / 2;
+        at..at + rows as usize * cols as usize
+    };
+    let (x, out, rows, cols) = match *s {
+        CudaStep::Scale(st) => (st.x, st.out, st.rows, st.cols),
+        CudaStep::RmsNormUnit(st) => (st.x, st.y, st.rows, st.cols),
+        CudaStep::LayerScale(st) => (st.x, st.out, st.rows, st.cols),
+        CudaStep::SoftCap(st) => (st.x, st.out, st.rows, st.cols),
+        ref other => panic!("the Gemma row chain holds only row maps: {other:?}"),
+    };
+    let xb = DeviceBuffer::upload(device, &arena[region(x, rows, cols)]).expect("upload x");
+    let ob = DeviceBuffer::upload(device, &vec![0; rows as usize * cols as usize]).expect("out");
+    let (dims, null) = ((rows, cols), std::ptr::null_mut());
+    // SAFETY: cudaMalloc pointers are 256-byte aligned; `x` and `out` hold rows·cols bf16, `w`
+    // one; `out` is its own allocation; null is the default stream, which the download waits for.
+    unsafe {
+        match *s {
+            CudaStep::Scale(st) => scale_bf16(
+                xb.ptr(),
+                ob.ptr(),
+                dims,
+                f32::from_bits(st.scale_bits),
+                null,
+            ),
+            CudaStep::RmsNormUnit(st) => {
+                rms_norm_unit_bf16(xb.ptr(), ob.ptr(), dims, f32::from_bits(st.eps_bits), null)
+            }
+            CudaStep::LayerScale(_) => layer_scale_bf16(xb.ptr(), w.ptr(), ob.ptr(), dims, null),
+            CudaStep::SoftCap(st) => {
+                soft_cap_bf16(xb.ptr(), ob.ptr(), dims, f32::from_bits(st.cap_bits), null)
+            }
+            _ => unreachable!("matched above"),
+        }
+    }
+    .expect("a standalone row launch");
+    let got = ob.download().expect("download out");
+    arena[region(out, rows, cols)].copy_from_slice(&got);
+}
+
+/// Gemma's row chain (`ScalarMul(√2816) → RmsNormUnit → ScalarWeightMul(w) → TanhSoftCap(30)`) at
+/// m = 1 and 512: every colour of the arena after the forward equals what the standalone launchers
+/// write when each plays its step on the previous one's downloaded output, bit for bit (so each
+/// step is its kernel); the arena poisoned with bf16 NaN before the forward gives the bits of a
+/// zero-filled one; a repeat is bit-identical; five forwards allocate nothing.
+#[test]
+fn gemma_row_chain_plays_each_step_as_its_kernel() {
+    let device = h100();
+    let tapes = gemma_rows_buckets();
+    let w0 = bf16_inputs(1, 0x6E1D_3001)[0];
+    let wb = DeviceBuffer::upload(&device, &[w0]).expect("upload w");
+    let table = [DeviceBuffer::empty(), wb];
+    let table: &'static [DeviceBuffer] = Box::leak(Box::new(table));
+    let mut worker = CudaWorker::new(&device, tapes, table, None, None).expect("worker");
+    let h = common::gemma_rows::H as usize;
+    let fill = tapes.len() - 1;
+    let bytes = tapes[fill].arena.total_bytes;
+    let mut pass = true;
+    for (b, tape) in tapes[..2].iter().enumerate() {
+        let m = tape.bucket_m as usize;
+        let kinds: Vec<String> = (tape.steps.iter())
+            .map(|s| format!("{s:?}").split('(').next().unwrap_or("").to_owned())
+            .collect();
+        eprintln!("gemma_rows m={m} steps: {kinds:?}");
+        let x = bf16_inputs(m * h, 0x6E1D_3000 ^ m as u64);
+        let forward = |worker: &mut CudaWorker<'_>| {
+            let mut y = vec![0u16; m * h];
+            (worker.forward(b, Input::Hidden(&x), &[], None, None, &mut y)).expect("forward");
+            y
+        };
+        fill_arena(&mut worker, fill, bytes, 0);
+        let after_zero = forward(&mut worker);
+        let colours: Vec<Vec<u16>> = (0..tape.arena.colour_offsets.len())
+            .map(|c| read(&mut worker, colour(tape, c)))
+            .collect();
+        let mut host = vec![0u16; tape.arena.total_bytes as usize / 2];
+        host[..m * h].copy_from_slice(&x);
+        for s in tape.steps {
+            play_row_step(&device, s, &mut host, &table[1]);
+        }
+        for (c, got) in colours.iter().enumerate() {
+            let at = tape.arena.colour_offsets[c] as usize / 2;
+            let want = &host[at..at + got.len()];
+            let mismatched = mismatched_bits(got, want);
+            eprintln!(
+                "gemma_rows m={m} colour {c}: vs standalone launchers mismatched_bits={mismatched} \
+                 {}",
+                verdict(mismatched == 0)
+            );
+            pass &= mismatched == 0;
+        }
+        fill_arena(&mut worker, fill, bytes, 0x7FC0);
+        let after_nan = forward(&mut worker);
+        let repeat = forward(&mut worker);
+        let poison = mismatched_bits(&after_nan, &after_zero);
+        let rep = mismatched_bits(&repeat, &after_nan);
+        let ok = poison == 0 && rep == 0;
+        eprintln!(
+            "gemma_rows m={m}: nan_poison_vs_zero_mismatched_bits={poison} \
+             repeat_mismatched_bits={rep} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    let at_forwards = device.allocations();
+    let x = bf16_inputs(512 * h, 0x6E1D_3005);
+    for _ in 0..5 {
+        let mut y = vec![0u16; 512 * h];
+        (worker.forward(1, Input::Hidden(&x), &[], None, None, &mut y)).expect("forward");
+    }
+    let during = device.allocations() - at_forwards;
+    eprintln!(
+        "gemma_rows five forwards: allocations={during} (expect 0) {}",
+        verdict(during == 0)
+    );
+    pass &= during == 0;
+    assert!(
+        pass,
+        "a Gemma row step is not its kernel, or an invariant failed"
+    );
+}
+
+/// The dense Gemma MLP at m = 1, as CUDA's compiler lowers it.
+fn gemma_mlp_buckets() -> &'static [CudaTape] {
+    static TAPES: std::sync::OnceLock<Vec<CudaTape>> = std::sync::OnceLock::new();
+    TAPES.get_or_init(|| {
+        let at = CanonicalAt {
+            stem: "gemma_mlp",
+            m: 1,
+        };
+        let c = lower_canonical(&gemma_mlp(1), GEMMA_MLP_FACTS, at)
+            .unwrap_or_else(|e| panic!("the Gemma MLP lowers at m=1: {e}"));
+        vec![static_tape(&c)]
+    })
+}
+
+/// `bf16(v)` as f64: a value rounded where the tape stores it.
+fn round_bf16(v: f64) -> f64 {
+    f64::from(half::bf16::from_f64(v).to_f32())
+}
+
+/// One row of `x · Wᵀ`, `W` `[n, k]` row-major bf16 bits, in f64, each output through `rnd`.
+fn gemv_f64(x: &[f64], w: &[u16], n: usize, rnd: fn(f64) -> f64) -> Vec<f64> {
+    let k = x.len();
+    let w = widen(w);
+    (0..n)
+        .map(|j| rnd(x.iter().zip(&w[j * k..][..k]).map(|(a, b)| a * b).sum()))
+        .collect()
+}
+
+/// The dense MLP of one row in f64, `act` its activation, every stored value through `rnd` (the
+/// identity for the reference, [`round_bf16`] for the emulation).
+fn gemma_mlp_row(
+    x: &[u16],
+    (g, wg, wu, wd): (&[u16], &[u16], &[u16], &[u16]),
+    act: fn(f64) -> f64,
+    rnd: fn(f64) -> f64,
+) -> Vec<f64> {
+    let (h, i) = (common::gemma_mlp::H as usize, common::gemma_mlp::I as usize);
+    let (xf, gf) = (widen(x), widen(g));
+    let mean = xf.iter().map(|v| v * v).sum::<f64>() / h as f64;
+    let inv = 1.0 / (mean + f64::from(common::gemma_mlp::EPS)).sqrt();
+    let n: Vec<f64> = (xf.iter().zip(&gf))
+        .map(|(v, w)| rnd(v * inv * w))
+        .collect();
+    let gate = gemv_f64(&n, wg, i, rnd);
+    let up = gemv_f64(&n, wu, i, rnd);
+    let a: Vec<f64> = (gate.iter().zip(&up))
+        .map(|(g, u)| rnd(act(*g) * u))
+        .collect();
+    let d = gemv_f64(&a, wd, h, rnd);
+    (d.iter().zip(&xf)).map(|(d, x)| rnd(d + x)).collect()
+}
+
+fn gelu_tanh(g: f64) -> f64 {
+    let c = (2.0 / std::f64::consts::PI).sqrt();
+    0.5 * g * (1.0 + (c * (g + 0.044715 * g * g * g)).tanh())
+}
+
+fn silu(g: f64) -> f64 {
+    g / (1.0 + (-g).exp())
+}
+
+/// `(rms, max)` of `gpu − refs`.
+fn rms_max(gpu: &[f64], refs: &[f64]) -> (f64, f64) {
+    let (mut sq, mut mx) = (0.0f64, 0.0f64);
+    for (g, r) in gpu.iter().zip(refs) {
+        let e = (g - r).abs();
+        sq += e * e;
+        mx = mx.max(e);
+    }
+    ((sq / gpu.len() as f64).sqrt(), mx)
+}
+
+/// Gemma's dense MLP at the real geometry (H 2816, I 2112), m = 1 (its GEMMs are GEMVs): CUDA's
+/// RMS and max error against the f64 block each at most 2× a host emulation's that rounds to bf16
+/// where the tape stores. Self-check: the block with SiLU instead of GELU is out of that bound.
+#[test]
+fn gemma_dense_mlp_decode_block() {
+    let device = h100();
+    let tapes = gemma_mlp_buckets();
+    let (h, i) = (common::gemma_mlp::H as usize, common::gemma_mlp::I as usize);
+    // Weights scaled by 1/16, so the gates sit where GELU and SiLU differ.
+    let small = |len, seed| -> Vec<u16> {
+        (bf16_inputs(len, seed).into_iter())
+            .map(|b| common::numerics::bits(half::bf16::from_bits(b).to_f32() / 16.0))
+            .collect()
+    };
+    let g = bf16_inputs(h, 0x6E1D_4001);
+    let (wg, wu, wd) = (
+        small(i * h, 0x6E1D_4002),
+        small(i * h, 0x6E1D_4003),
+        small(h * i, 0x6E1D_4004),
+    );
+    let table = [
+        DeviceBuffer::empty(),
+        DeviceBuffer::upload(&device, &g).expect("upload g"),
+        DeviceBuffer::upload(&device, &wg).expect("upload Wg"),
+        DeviceBuffer::upload(&device, &wu).expect("upload Wu"),
+        DeviceBuffer::upload(&device, &wd).expect("upload Wd"),
+    ];
+    let table: &'static [DeviceBuffer] = Box::leak(Box::new(table));
+    let mut worker = CudaWorker::new(&device, tapes, table, None, None).expect("worker");
+    let x = bf16_inputs(h, 0x6E1D_4000);
+    let mut y = vec![0u16; h];
+    (worker.forward(0, Input::Hidden(&x), &[], None, None, &mut y)).expect("forward");
+    let gpu = widen(&y);
+    let w = (&g[..], &wg[..], &wu[..], &wd[..]);
+    let reference = gemma_mlp_row(&x, w, gelu_tanh, |v| v);
+    let emulation = gemma_mlp_row(&x, w, gelu_tanh, round_bf16);
+    let (cuda_rms, cuda_max) = rms_max(&gpu, &reference);
+    let (emu_rms, emu_max) = rms_max(&emulation, &reference);
+    let ok = cuda_rms <= 2.0 * emu_rms && cuda_max <= 2.0 * emu_max;
+    eprintln!(
+        "gemma dense mlp m=1: cuda_rms={cuda_rms:.4e} cuda_max={cuda_max:.4e} \
+         emulation_rms={emu_rms:.4e} emulation_max={emu_max:.4e} rms_ratio={:.4} \
+         max_ratio={:.4} {}",
+        cuda_rms / (2.0 * emu_rms),
+        cuda_max / (2.0 * emu_max),
+        verdict(ok)
+    );
+    let mut pass = ok;
+    let wrong = gemma_mlp_row(&x, w, silu, |v| v);
+    let (silu_rms, silu_max) = rms_max(&gpu, &wrong);
+    let caught = silu_rms > 2.0 * emu_rms || silu_max > 2.0 * emu_max;
+    eprintln!(
+        "gemma dense mlp self-check SiLU: rms={silu_rms:.4e} max={silu_max:.4e} out_of_bound={caught} \
+         {}",
+        verdict(caught)
+    );
+    pass &= caught;
+    assert!(
+        pass,
+        "the Gemma dense MLP is out of bound, or the self-check fell short"
+    );
 }
