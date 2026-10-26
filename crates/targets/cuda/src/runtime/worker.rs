@@ -36,7 +36,7 @@ use scratchy_subtile::gdn_state_layout::GdnStateLayout;
 use scratchy_subtile::paged_kv_layout::PagedKvLayout;
 
 use crate::kernels::{self, KernelError};
-use crate::rotary::fill_rotary_rows;
+use crate::rotary::fill_rotary_rows_with_freq_dim;
 use crate::step::{
     AddBf16, AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16,
     ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16,
@@ -2107,7 +2107,7 @@ fn fill_table<'h>(
 ) -> Option<(ArenaSpan, &'h [u16])> {
     table.map(|r| {
         let rows = &mut host[..positions.len() * r.rot_dim as usize];
-        fill_rotary_rows(positions, r.rot_dim, r.theta(), rows);
+        fill_rotary_rows_with_freq_dim(positions, r.rot_dim, r.freq_dim, r.theta(), rows);
         (r.span, &*rows)
     })
 }

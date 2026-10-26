@@ -104,6 +104,17 @@ pub struct CudaAttnClass {
     pub window: Option<u32>,
 }
 
+impl CudaAttnClass {
+    /// The class's table's frequency denominator ([`RotaryTable::freq_dim`]): the rotated width
+    /// for the half-rotated pairing, the head dim for the half-head (proportional) one.
+    pub const fn freq_dim(&self) -> u32 {
+        match self.pairing {
+            RopePairing::HalfRotated => self.rot_dim,
+            RopePairing::HalfHead => self.head_dim,
+        }
+    }
+}
+
 impl CudaModelFacts {
     /// The class whose rotary table is the `Cos { local }` one: the global table is a uniform
     /// model's one class, or a two-class model's global class; the local table is a two-class
@@ -1538,12 +1549,14 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
             .map(|(span, c)| RotaryTable {
                 span,
                 rot_dim: c.rot_dim,
+                freq_dim: c.freq_dim(),
                 theta_bits: c.rope_theta.to_bits(),
             }),
         rotary_local: (arena.rotary_local.zip(plan.facts.table_class(true))).map(|(span, c)| {
             RotaryTable {
                 span,
                 rot_dim: c.rot_dim,
+                freq_dim: c.freq_dim(),
                 theta_bits: c.rope_theta.to_bits(),
             }
         }),

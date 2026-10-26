@@ -54,7 +54,7 @@ pub struct ArenaLayout {
 }
 
 /// The forward's rotary table: one row per token, `[bucket_m, rot_dim]` bf16, row `t` laid out
-/// `[cos θ_t,0..R/2 | sin θ_t,0..R/2]` with `θ_t,i = p_t · theta^(−2i/R)`.
+/// `[cos θ_t,0..R/2 | sin θ_t,0..R/2]` with `θ_t,i = p_t · theta^(−2i/F)`, `F` its `freq_dim`.
 ///
 /// Its place, size and constants are fixed at expansion; its contents are the forward's runtime
 /// data, built on the host from the token positions (`crate::rotary::rotary_rows`) and uploaded
@@ -66,6 +66,9 @@ pub struct RotaryTable {
     pub span: ArenaSpan,
     /// `R`, the rotated width of each head.
     pub rot_dim: u32,
+    /// `F`, the frequency exponent's denominator: `rot_dim` for a half-rotated class, the head dim
+    /// for a half-head (proportional) one, Gemma 4's global layers' 512. At least `rot_dim`.
+    pub freq_dim: u32,
     /// `rope_theta` as its bits (`f64::to_bits`), so the table is `Eq`; [`Self::theta`] reads it.
     pub theta_bits: u64,
 }
@@ -504,6 +507,8 @@ pub enum TapeError {
         bucket_m: u32,
         rot_dim: u32,
     },
+    /// A rotary table's `freq_dim` is below its `rot_dim`: its frequencies would pass 1 / theta.
+    RotaryFreqDim { rot_dim: u32, freq_dim: u32 },
     /// The `step`-th step reads weight `ix`, and the tape declares `weights` weights.
     WeightIndex {
         step: usize,
@@ -763,6 +768,10 @@ impl std::fmt::Display for TapeError {
                  non-zero even width) are {}",
                 span.bytes,
                 u64::from(*bucket_m) * u64::from(*rot_dim) * CUDA_ACT_BYTES
+            ),
+            Self::RotaryFreqDim { rot_dim, freq_dim } => write!(
+                f,
+                "a rotary table's freq_dim = {freq_dim} is below its rot_dim = {rot_dim}"
             ),
             Self::WeightIndex { step, ix, weights } => write!(
                 f,
@@ -1055,6 +1064,12 @@ impl CudaTape {
                     span: t.span,
                     bucket_m: self.bucket_m,
                     rot_dim: t.rot_dim,
+                });
+            }
+            if t.freq_dim < t.rot_dim {
+                return Err(TapeError::RotaryFreqDim {
+                    rot_dim: t.rot_dim,
+                    freq_dim: t.freq_dim,
                 });
             }
         }
@@ -2377,6 +2392,7 @@ mod tests {
             rotary: Some(RotaryTable {
                 span: span(offset, bytes),
                 rot_dim: 64,
+                freq_dim: 64,
                 theta_bits: 1e7f64.to_bits(),
             }),
             ..GOOD
@@ -2573,6 +2589,7 @@ mod tests {
             rotary: Some(RotaryTable {
                 span: span(KV_ROTARY, TABLE),
                 rot_dim: 64,
+                freq_dim: 64,
                 theta_bits: 1e7f64.to_bits(),
             }),
             kv: Some(kv),
@@ -3244,6 +3261,10 @@ mod tests {
                 bucket_m: 1,
                 rot_dim: 64,
             },
+            TapeError::RotaryFreqDim {
+                rot_dim: 128,
+                freq_dim: 64,
+            },
             TapeError::WeightIndex {
                 step: 1,
                 ix: 9,
@@ -3374,6 +3395,7 @@ mod tests {
                 | TapeError::WritesOverlap { .. }
                 | TapeError::RotaryOutside { .. }
                 | TapeError::RotaryShape { .. }
+                | TapeError::RotaryFreqDim { .. }
                 | TapeError::WeightIndex { .. }
                 | TapeError::WeightShort { .. }
                 | TapeError::KvRegionOutside { .. }
@@ -3874,6 +3896,31 @@ mod tests {
         }
     }
 
+    /// A rotary table whose `freq_dim` is below its `rot_dim` is `RotaryFreqDim`; equal to it, or
+    /// above (Gemma 4's proportional 512 over 128), it validates.
+    #[test]
+    fn a_rotary_table_with_freq_dim_below_rot_dim_is_refused() {
+        let with = |freq_dim| {
+            let t = with_rotary(TABLE_AT, TABLE);
+            CudaTape {
+                rotary: t.rotary.map(|r| RotaryTable { freq_dim, ..r }),
+                ..t
+            }
+        };
+        assert_eq!(with(64).validate(), Ok(()));
+        assert_eq!(with(512).validate(), Ok(()));
+        for freq_dim in [0, 2, 63] {
+            assert_eq!(
+                with(freq_dim).validate(),
+                Err(TapeError::RotaryFreqDim {
+                    rot_dim: 64,
+                    freq_dim
+                }),
+                "freq_dim {freq_dim}"
+            );
+        }
+    }
+
     /// The local rotary table: one beside the global table validates and a rope may read it; one
     /// without a global table is `KvClasses`; one over the global table, or outside the arena, is
     /// `RotaryOutside`.
@@ -3882,6 +3929,7 @@ mod tests {
         let local = |offset| RotaryTable {
             span: span(offset, TABLE),
             rot_dim: 64,
+            freq_dim: 64,
             theta_bits: 1e4f64.to_bits(),
         };
         let at = TABLE_AT + TABLE;

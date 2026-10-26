@@ -408,6 +408,11 @@ fn the_attention_classes_and_rotary_tables_are_the_models() {
             "m={m}: global"
         );
         assert_eq!((local.rot_dim, local.theta()), (256, 1e4), "m={m}: local");
+        assert_eq!(
+            (global.freq_dim, local.freq_dim),
+            (512, 256),
+            "m={m}: the global table's frequencies over the head dim, the local's over its width"
+        );
         for step in tape.steps {
             let (table, head_dim, rot_dim, pairing) = match *step {
                 CudaStep::Rope(r) => (r.table, r.head_dim, r.rot_dim, r.pairing),

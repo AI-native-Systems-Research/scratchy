@@ -201,6 +201,7 @@ const fn rotary(offset: u64, bytes: u64) -> Option<RotaryTable> {
     Some(RotaryTable {
         span: span(offset, bytes),
         rot_dim: R,
+        freq_dim: R,
         theta_bits: THETA.to_bits(),
     })
 }

@@ -842,6 +842,7 @@ static BAD_ROTARY: [CudaTape; 1] = [CudaTape {
             bytes: 32768,
         },
         rot_dim: 64,
+        freq_dim: 64,
         theta_bits: 0x416312D000000000,
     }),
     ..ATTN_GATE_M256
