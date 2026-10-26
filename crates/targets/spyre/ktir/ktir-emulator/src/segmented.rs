@@ -57,13 +57,9 @@ fn view_shape_of(op: &Operation) -> Option<Vec<usize>> {
 /// touches, by scanning each node's `ktdp.construct_memory_view` ops (whose
 /// `sizes:` attribute is the tensor's full shape) and mapping the view's pointer
 /// operand to a tensor id via that node's bindings. A tensor may be viewed in
-/// several nodes; views of one tensor agree in every graph whose producers state
-/// the storage they write, and where they legitimately disagree (a producer
-/// stating its own device window over a wider storage — the device argmax's
-/// widening mint) the WIDEST view stages the tid, because an allocation must
-/// hold every view that addresses it. This lets the driver size the intermediate
-/// / result / scratch buffers with NO external manifest — the shapes live in the
-/// IR.
+/// several nodes; any one view's shape is authoritative (they agree). This lets
+/// the driver size the intermediate / result / scratch buffers with NO external
+/// manifest — the shapes live in the IR.
 pub(crate) fn derive_shapes(
     module: &IRModule,
     spec: &ProgramSpec,
@@ -150,26 +146,7 @@ pub(crate) fn collect_view_shapes(
             && let Some(&tid) = arg_to_tensor.get(ptr)
             && let Some(shape) = view_shape_of(op)
         {
-            // ⭐ THE WIDEST VIEW STAGES THE TID — the resident run's own cross-program
-            // law ("the WIDEST program's shape stages the tid"), applied within a
-            // program too. Views of one tensor agree in every graph whose producers
-            // state the storage they write, so this is first-wins unchanged there; the
-            // device argmax's widening mint is the first legitimate disagreement — the
-            // lm-head matmul's out view states its own DEVICE width (`n_dev`, 51200 at
-            // granite's vocab) over the PAD_V-wide storage (65536) its widened
-            // consumers address — and a first-wins pass staged the tid at the
-            // matmul's narrower window, refusing the consumer's view at run (view
-            // `[1, 65536]` spans 131072 bytes but the tensor holds only 102400). An
-            // allocation must hold EVERY view that addresses it; the widest is the
-            // safe stage, and over-allocation is never wrong.
-            shapes
-                .entry(tid)
-                .and_modify(|old| {
-                    if shape.iter().product::<usize>() > old.iter().product::<usize>() {
-                        *old = shape.clone();
-                    }
-                })
-                .or_insert(shape);
+            shapes.entry(tid).or_insert(shape);
         }
         for rg in op.regions {
             collect_view_shapes(rg, arg_to_tensor, shapes);

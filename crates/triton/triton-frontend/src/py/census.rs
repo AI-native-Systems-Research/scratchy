@@ -53,15 +53,6 @@ pub const TL_FUNCTIONS: &[&str] = &[
     "arange",
     "dot",
     "exp",
-    // Not in the five-fixture census: the sampler's [1] -> [1, 1] seam (`argmax_first_max.py`).
-    // A rank-2 tile reduced over its stick axis yields a [1] the tile domain cannot meet
-    // without a rank match (Triton has no implicit rank promotion), so the kernel expands
-    // the reduce's answer by one unit dim and lets `tl.maximum`'s own unit-dim broadcast
-    // fill the row. The whole chain below this gate already existed when the construct was
-    // first needed: `semantic::expand_dims` -> `tt.expand_dims` (in `from_ttir`'s OP_SET,
-    // `axis` in ATTR_KEYS) -> `to_ktir`'s `convert_expand_dims` -> `tensor.expand_shape`,
-    // which the emulator has served all along.
-    "expand_dims",
     "fdiv",
     "full",
     // Not in the five-fixture census: the routed expert id of a mixture-of-experts kernel,

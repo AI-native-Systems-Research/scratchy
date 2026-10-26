@@ -163,26 +163,6 @@ impl SpyreSession {
         programs: &[(&[bundle::LaunchGroup<'static>], &[u64])],
         weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
     ) -> Result<Self> {
-        // An empty floor matches no tid, so every stick keeps its view-derived
-        // size — today's behavior, stated once instead of duplicated.
-        Self::new_multi_floored(programs, weights, &std::collections::HashMap::new())
-    }
-
-    /// ⭐ [`new_multi`](Self::new_multi) WITH A SHAPE FLOOR — the tape's own
-    /// tensor-shape statement (element counts keyed by tensor id), which the
-    /// resident sticks allocate at LEAST. For callers that hold the graph the
-    /// programs were lowered from — the bake-time numeric gate holds the
-    /// minted krg, the worker holds the wiring — because a widened reader
-    /// whose view sits on an interior edge of a fused function is invisible
-    /// to the emulator's view walk, and the krg's shape is the tape's own
-    /// statement of the tensor's extent (the same authority the bundle
-    /// layout reserves from). The floor is a MAX: it can only raise an
-    /// allocation, never shrink one the views already sized.
-    pub fn new_multi_floored(
-        programs: &[(&[bundle::LaunchGroup<'static>], &[u64])],
-        weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
-        shape_floor: &std::collections::HashMap<u64, usize>,
-    ) -> Result<Self> {
         let mut funcs: Vec<Vec<ktir_core::ir::IRFunction<'static>>> =
             Vec::with_capacity(programs.len());
         let mut specs: Vec<ProgramSpec> = Vec::with_capacity(programs.len());
@@ -207,8 +187,8 @@ impl SpyreSession {
             .map(|f| f.as_slice())
             .zip(specs.iter())
             .collect();
-        let session = Session::new_multi_floored(prog_refs, args, shape_floor)
-            .map_err(|e| anyhow!("Session::new_multi: {e}"))?;
+        let session =
+            Session::new_multi(prog_refs, args).map_err(|e| anyhow!("Session::new_multi: {e}"))?;
         Ok(Self { session })
     }
 

@@ -43,18 +43,8 @@ fn main() {
         std::process::exit(2);
     }
     let (config, out_dir) = (&args[0], PathBuf::from(&args[1]));
-    let Some((kspec, grid, door)) = cases::case(config) else {
+    let Some((kspec, grid, program)) = cases::case(config) else {
         eprintln!("no case for `{config}`");
-        std::process::exit(2);
-    };
-    // A `None` door kind is a named stage, not an oversight: the configuration's kernel is
-    // stated in generic ops whose SuperDSC lowering does not exist yet (see the `case` arm),
-    // and this driver is THE door driver -- guessing a kind here would bake the wrong body.
-    let Some(program) = door else {
-        eprintln!(
-            "`{config}` has no KTIR→SuperDSC door yet -- its kernel is stated in generic ops \
-             (see the case row). Numeric legs: triton-numeric."
-        );
         std::process::exit(2);
     };
 

@@ -2554,11 +2554,8 @@ mod tests {
         // The mean lands DLF16-partialed and unrounded (the reduce's landing
         // arm holds it as decoded f32); the eps splat is the f16 constant the
         // mirror states — f16(1e-6) = 17·2⁻²⁴ exactly.
-        // f32 has 24 mantissa bits; both literals below sit on exact f32 values, so the
-        // shorter spelling IS the same bits (clippy's excessive_precision demands exactly
-        // that equivalence).
         let mean = 1.11e-6_f32;
-        let eps_f16 = 1.013279e-6_f32; // f16(1e-6) = 17·2⁻²⁴, exact in f32
+        let eps_f16 = 1.0132789611816406e-6_f32; // f16(1e-6), exactly representable in f32
 
         let mut ctx = single_core_context();
         ctx.set_value(

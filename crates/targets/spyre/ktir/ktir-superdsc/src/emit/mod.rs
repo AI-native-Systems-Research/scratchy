@@ -6508,25 +6508,10 @@ pub(crate) fn check_pointwise_cols(
     what: &str,
     out_id: u32,
 ) -> Result<(), SuperDscError> {
-    check_pointwise_cols_df(cols, what, out_id, Df::Fp16)
-}
-
-/// [`check_pointwise_cols`] at a stated [`Df`] — the stick basis is the ACTUAL dtype's (fp32 =
-/// 32-element stick), the same law [`pointwise_broadcast_opspec_df`] states for the tile: a
-/// per-row fp32 lane is cols=32, valid fp32 but NOT a 64-multiple, so an Fp16 extent would
-/// wrongly reject it — and a 64-multiple that is not a whole fp32 stick cannot exist (64 is a
-/// 32-multiple), so every form the fp16 check admitted stays admitted.
-pub(crate) fn check_pointwise_cols_df(
-    cols: u32,
-    what: &str,
-    out_id: u32,
-    df: Df,
-) -> Result<(), SuperDscError> {
-    let stick = df.elems_per_stick();
-    if !cols.is_multiple_of(stick) {
+    if !cols.is_multiple_of(FP16_ELEMS_PER_STICK) {
         return Err(SuperDscError(format!(
-            "{what} t{out_id}: cols={cols} not a multiple of the {stick}-element {df:?} stick \
-             (assemble_pointwise emits no coordinateMasking_) — pad cols"
+            "{what} t{out_id}: cols={cols} not a multiple of the {FP16_ELEMS_PER_STICK}-fp16 \
+             stick (assemble_pointwise emits no coordinateMasking_) — pad cols"
         )));
     }
     Ok(())

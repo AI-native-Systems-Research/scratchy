@@ -144,27 +144,15 @@ pub struct SuperDscSession {
 impl SuperDscSession {
     /// Load the bundle, bind the weights, and prepare (allocate + upload the resident program,
     /// weights and KV pool).
-    ///
-    /// ⭐ THE GRAPH'S OWN SOURCE FACTS ARE READ OFF `code`, NEVER ARGUED: the
-    /// source count and the resident source ids are stamped on the bundle's
-    /// layout at the bake, so a session built here walks exactly the source
-    /// range of the graph it runs — a caller cannot hand it another graph's
-    /// numbers. Only the spilled weight tail is an argument (a load-time copy
-    /// decision the layout cannot make for the caller).
-    ///
-    /// `load_consts` is the wiring's OWN staged-constant list — the tables a
-    /// spliced kernel declares as sources. They are bound ONCE here, before
-    /// prepare, resident like a weight (each is a function of the graph
-    /// alone); a session that binds none passes an empty slice, and every
-    /// borrowing session gets the owner's copy through the seg1 alias.
+    #[allow(clippy::type_complexity)]
     pub fn new(
         code: &'static crate::bundle_code::BundleCode<'static>,
         vocab: usize,
         kv_dim: usize,
         num_blocks: usize,
+        num_sources: u32,
+        resident_sources: &[u32],
         weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
-        load_consts: &[(u32, crate::wiring::LoadConst)],
-        spilled_tail: &[u32],
     ) -> Result<Self> {
         Self::new_inner(
             code,
@@ -173,10 +161,10 @@ impl SuperDscSession {
                 kv_dim,
                 num_blocks,
             },
+            num_sources,
+            resident_sources,
             weights,
-            load_consts,
             &[],
-            spilled_tail,
         )
     }
 
@@ -194,8 +182,9 @@ impl SuperDscSession {
         vocab: usize,
         kv_dim: usize,
         num_blocks: usize,
+        num_sources: u32,
+        resident_sources: &[u32],
         borrowed: &[i64],
-        spilled_tail: &[u32],
     ) -> Result<Self> {
         Self::new_inner(
             code,
@@ -204,10 +193,10 @@ impl SuperDscSession {
                 kv_dim,
                 num_blocks,
             },
+            num_sources,
+            resident_sources,
             Vec::new(),
-            &[],
             borrowed,
-            spilled_tail,
         )
     }
 
@@ -224,7 +213,11 @@ impl SuperDscSession {
         vocab: usize,
         kv_dim: usize,
         num_blocks: usize,
-        spilled_tail: &[u32],
+        // ⛔ REQUIRED, from the generated wiring. Ids `0..num_sources` are host-filled every
+        // forward; the executor refuses to launch with one unwritten. Passing it as an ARGUMENT
+        // rather than a setter is the lock: a new session site cannot forget it.
+        num_sources: u32,
+        resident_sources: &[u32],
     ) -> Result<Self> {
         Self::new_inner(
             code,
@@ -233,29 +226,22 @@ impl SuperDscSession {
                 kv_dim,
                 num_blocks,
             },
+            num_sources,
+            resident_sources,
             Vec::new(),
             &[],
-            &[],
-            spilled_tail,
         )
     }
 
     fn new_inner(
         code: &'static crate::bundle_code::BundleCode<'static>,
         dims: SessionDims,
+        num_sources: u32,
+        // The prefix-KV source ids — placed and inside `0..num_sources`, but device-resident, so
+        // no per-step bind names them.
+        resident_sources: &[u32],
         weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
-        // The wiring's staged-constant list — bound once before prepare by the
-        // OWNER only (see [`Self::new`]); borrowers pass none and read the
-        // owner's bytes through the alias.
-        load_consts: &[(u32, crate::wiring::LoadConst)],
         borrowed: &[i64],
-        // The spilled weight tail's tids — the ONE resident slice the layout cannot state: the
-        // spill is a load-time copy decision (a weight whose slot also holds an m-dependent
-        // intermediate color cannot be aliased, so `adopt_from_owner` copies it into this
-        // session's own region), so the LOADER declares it resident here, exactly as it hands it
-        // over. Leaving it out is a REFUSED LAUNCH, not a silent wrong answer — the completeness
-        // check classifies the un-copied tail `SourceFiller::Nobody` and stops.
-        spilled_tail: &[u32],
     ) -> Result<Self> {
         let SessionDims {
             vocab,
@@ -269,18 +255,7 @@ impl SuperDscSession {
             KvDim(kv_dim),
             PoolPages(num_blocks as i64),
         )?;
-        // ⭐ THE GRAPH'S OWN SOURCE FACTS — the count and the resident ids are stamped on the
-        // layout this session's `code` carries, so the completeness walk covers exactly the
-        // source range of the graph being run: prefix-KV caches and load-const tables excused
-        // by the bundle's own list, the spilled tail by the caller's, and nothing else.
-        exec.declare_sources(
-            code.layout.num_sources,
-            code.layout
-                .resident_source_tids
-                .iter()
-                .copied()
-                .chain(spilled_tail.iter().copied()),
-        );
+        exec.declare_sources(num_sources, resident_sources.iter().copied());
         // BORROWED segments must be declared BEFORE prepare — afterwards the full region is already
         // allocated and transferred, so the flag would be a silent no-op (the executor refuses).
         for &seg in borrowed {
@@ -301,15 +276,6 @@ impl SuperDscSession {
             };
             exec.bind_weight(crate::bundle_code::PlaceId::Act(id as u32), bytes);
         }
-        // ⭐ THE STAGED CONSTANTS ride the same law: bound once, before
-        // prepare, into the same weight channel `stage_weights` converts and
-        // uploads — a table the owner never binds reads as ZEROS on card, and
-        // the kernel composes its answer from zeros (measured: the argmax
-        // mint's first card run answered token 0 — EOS — on every decode
-        // step, while the build's own numeric gate passed, because the gate's
-        // emulator binds its own sources and never crosses this seat).
-        exec.bind_load_consts(load_consts)?;
-        let n_staged = n_bound + load_consts.len();
         debug!(
             "[timing] bind weights loop took {:.2}s",
             t_bind.elapsed().as_secs_f64()
@@ -322,7 +288,7 @@ impl SuperDscSession {
         //
         // NOTHING BOUND is the same situation as BORROWED: with no weights this call only zero-fills
         // a host shadow of a segment that is about to be replaced by an alias.
-        if !borrowed.is_empty() || n_staged == 0 {
+        if !borrowed.is_empty() || n_bound == 0 {
             debug!(
                 "[timing] weight bind + stage SKIPPED ({})",
                 if borrowed.is_empty() {
@@ -757,19 +723,6 @@ impl SuperDscSession {
     /// Read back a tensor (up to `cap` elems) from its resident segment.
     pub fn read_tensor(&mut self, id: crate::bundle_code::PlaceId, cap: usize) -> Result<Vec<f32>> {
         Ok(f16_le_to_f32(&self.exec.read_tensor(id, cap)?))
-    }
-
-    /// ⭐ THE GENERIC RAW-READ VARIANT of [`Self::read_tensor`] — the tensor's
-    /// own bytes, VERBATIM, no f16 decode. A step whose rung's result is not
-    /// the f16 row runs `StepLogits::LeftOnDevice` and reads the result here:
-    /// the CALLER decodes at the dtype the wiring's `result_dtype` states (an
-    /// index stick's raw LE int32 words), because only the wiring knows it.
-    pub fn read_tensor_raw(
-        &mut self,
-        id: crate::bundle_code::PlaceId,
-        cap_bytes: usize,
-    ) -> Result<Vec<u8>> {
-        self.exec.read_tensor_raw(id, cap_bytes)
     }
 
     /// Zero a whole tensor segment ON THE DEVICE, without a host mirror of it.

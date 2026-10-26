@@ -101,11 +101,6 @@ pub enum Elementwise {
     Maximum,
     /// `min(a, b)`. Live on card already via the fp8 quantiser's clamp (`ktir_matmul_fp8.rs`).
     Minimum,
-    /// `a == b` as 0/1 fp16. `OpFunc::Equal`, dxp `"equal"` — the vendor realizes it as `EQUAL`
-    /// into a BOOL state reg then `SELECT(plus1, zero)` (`broadcast_ops.ddl:41`), so the
-    /// wire-level result IS fp16 0.0/1.0, the same arity-2 broadcast-op shape as
-    /// `maximum`/`minimum`. NaN compares FALSE, matching the emulator's ordered `cmpf oeq`.
-    Equal,
 }
 
 impl Elementwise {
@@ -133,7 +128,6 @@ impl Elementwise {
         Elementwise::RealDiv,
         Elementwise::Maximum,
         Elementwise::Minimum,
-        Elementwise::Equal,
     ];
 }
 
@@ -203,17 +197,6 @@ pub enum Program {
     Reshape,
     ScalarMul,
     Matmul,
-    /// The greedy vocab scan — `kernels/argmax.py`: the FIRST-maximum index of one
-    /// `[1, PAD_V]` logits row, as the `[1, 64]` i32 idx stick. ELEVEN tensor
-    /// parameters (the row, the nine staged tables that are functions of the vocab
-    /// alone — the seventh carries the pad law's offset row, the eighth and ninth
-    /// are the two-level ramp's group pair — and the output stick);
-    /// the body is whole-row `tt.reduce` maxima,
-    /// equality compares and staged-table multiplies over generic ops, with one
-    /// fp32 island for the wide combine. The door reads NO fact off this program —
-    /// no epsilon, no scale, no geometry: the tables ride as ordinary tensor
-    /// operands — so its arm is the plain `whole_function::lower_function` route.
-    ArgMax,
     /// The last-row extraction half of an lm-head tail — see [`KtirNode::node_out_tid`].
     LmLast,
     Rope,

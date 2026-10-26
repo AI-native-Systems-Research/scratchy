@@ -251,21 +251,6 @@ pub struct BundleLayout<'a> {
     /// pins, and `chunk_gather_index_table` passes it beside [`Self::lx_op_local_bytes`] so the
     /// host refuses exactly what the bake refused. 0 for a bundle whose chunk form mints none.
     pub lx_prob_pin_bytes: u64,
-    /// ⭐ THE GRAPH'S OWN CALLER-FILLED SOURCE COUNT — ids `0..num_sources` are host-filled every
-    /// forward, and the runtime's completeness check walks exactly that range. Stamped by the
-    /// bake (the same `ir.num_sources` the placement pass packed from) because the count is
-    /// GRAPH-LOCAL: the argmax mint's seven tables live at `[num_sources, num_sources+7)` of the
-    /// one-request graph, so the minted wiring's count does not name an unminted rung's sources.
-    /// Every session — owner, ladder rung, batch rung — reads the count off the bundle it
-    /// actually runs, the `SegRole::Logits` law: a bundle-stated fact survives renumbering
-    /// because each bundle states its own.
-    pub num_sources: u32,
-    /// ⭐ THE SOURCES NO PER-STEP BIND FILLS — prefix-KV caches and load-time constant tables,
-    /// the ids the completeness check excuses. The bake derives them from the same nodes the
-    /// wiring's `layers`/`load_consts` lists derive from, and asserts each is a real source of
-    /// THIS graph (`< num_sources`). The worker chains the spilled weight tail on at load (a
-    /// copy decision the layout cannot make for it) and hands the union to the session.
-    pub resident_source_tids: Cow<'a, [u32]>,
 }
 
 impl<'a> BundleLayout<'a> {

@@ -1596,15 +1596,7 @@ pub enum OpFunc {
     /// broadcast.
     Where3,
     /// ⭐⭐⭐ `topkindex` / `topkvalue` — the vendor's fused top-k PAIR (`topk.ddl`), the k largest
-    /// with slots DESCENDING (slot 0 = the max), ties keeping the LAST index among equals — the
-    /// ripple's compare is `state = GREATERTHAN(running, candidate)` with
-    /// `val = SELECT(state, running, candidate)` (`topk.ddl:180-181`), so a candidate EQUAL to the
-    /// running max makes `state` false and DISPLACES it: the later scan position wins. (An earlier
-    /// revision of this comment claimed the FIRST index — a doc-only claim the fixture tests never
-    /// executed, since a fixture JSON carries descriptors, not values; `moe.py`'s own ripple note
-    /// — "among equal values the later scan position first" — was the correct reading all along.
-    /// ⛔ CONSEQUENCE FOR THE SAMPLER: `topkindex` at k=1 is LAST-max argmax, which violates
-    /// #631's first-max law — the greedy decode door rung may NOT lower first-max to this pair.)
+    /// with slots DESCENDING (slot 0 = the max), ties keeping the FIRST index among equals.
     /// `topkindex` emits the `[.., k]` indices, `topkvalue` the `[.., k]` values at those indices —
     /// the pair the graph compiler's fission produces (`nodeFissionFusion.cpp:6542+` fissures a
     /// "TopK" into "TopKValue"+"TopKIndex"), and the optimizer's own decomposition law
