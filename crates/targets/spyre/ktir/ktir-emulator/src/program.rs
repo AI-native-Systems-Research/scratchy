@@ -122,6 +122,25 @@ impl Session {
         self.exec.scale_stage_dtype(tid)
     }
 
+    /// Write one tensor's already-typed bytes into its resident HBM stick — the raw staging
+    /// channel the numeric gate uses for the attention family's step inputs (id tables as
+    /// I32, the validity mask as F16 wire bytes), verbatim under the same law
+    /// [`crate::resident::ResidentExecutor::set_source_bytes_owned`] always states.
+    pub fn set_source_bytes(
+        &mut self,
+        tensor: u64,
+        bytes: Vec<u8>,
+        dtype: DType,
+    ) -> Result<(), String> {
+        self.exec.set_source_bytes_owned(tensor, bytes, dtype)
+    }
+
+    /// The staged byte extent of one tensor at its own view dtype — see
+    /// [`crate::resident::ResidentExecutor::source_extent_bytes`].
+    pub fn source_extent_bytes(&self, tensor: u64) -> Option<u64> {
+        self.exec.source_extent_bytes(tensor)
+    }
+
     /// Run one forward pass of program 0 and read back `outputs` (empty = results).
     pub fn run(&mut self, outputs: &[u64]) -> Result<HashMap<u64, Output>, String> {
         self.exec.run(outputs)

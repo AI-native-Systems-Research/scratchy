@@ -336,6 +336,24 @@ impl ResidentExecutor {
         self.scale_stages.get(&tid).copied()
     }
 
+    /// The staged byte extent of one tensor — `numel` priced at the tensor's OWN view dtype
+    /// (Wall 13's law: the same basis the stick was allocated at), `None` for a tid no program
+    /// of this session binds. This is the emulator's answer to the card session's
+    /// `step_input_extent`: the discovery table's own number, asked of the session, never
+    /// re-derived from a spelling — the numeric gate queries it for the attention family's
+    /// step-input slots before it stages them, so the staging is checked against the placement
+    /// the programs actually declare.
+    pub fn source_extent_bytes(&self, tensor: u64) -> Option<u64> {
+        let n = self.numel.get(&tensor)?;
+        let bpe = self
+            .view_dtype
+            .get(&tensor)
+            .copied()
+            .unwrap_or(self.dtype)
+            .bytes_per_elem();
+        Some(*n as u64 * bpe as u64)
+    }
+
     /// Like [`new`](Self::new), but plan EVERY node as a [`Segment::Native`] run at
     /// its OWN grid (no fusion to `[1,1]`). This is the faithful way to run a
     /// hand-written SPMD-tiled example kernel — whose multi-tile grid (`[2,16]`

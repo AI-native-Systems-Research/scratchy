@@ -133,8 +133,8 @@ use crate::worker::Worker;
 /// `MatY::of_requests`, which puts the BATCH on `y` (measured: `mq=8` gives `y=8, mb=1`), while shipped
 /// attention uses `MatY::of_gqa_group` — `y` is the GQA GROUP (4 here) and `mb` carries the batch. The
 /// improvised harness therefore measured a different op and was deleted rather than kept as a
-/// misleading green test. Reproduce `assemble_attn`'s own construction (`of_gqa_group` plus the
-/// `OperandPlacement` the shipped legs pass) and vary only `mq`.
+/// misleading green test. Reproduce the shipped score legs' own construction (`of_gqa_group` plus
+/// the `OperandPlacement` they pass) and vary only `mq`.
 ///
 /// ⭐ WHY CAPPING COSTS NOTHING MEASURABLE. Width 8 is already the throughput peak — see the wall-clock
 /// comparison above, where width 16 is slower in aggregate as well as wrong. The widths this forbids were
@@ -180,7 +180,7 @@ use crate::worker::Worker;
 /// forward): rungs 2/4/8 matched solo, rung 16 put 8 of 16 rows wrong at ITL 71.1 ms and rung 32 put 24
 /// of 32 wrong at 297.2 ms. The crisp boundary is the PER-CORE ROW FOLD: `mq * GQA` is 32 row-slots at
 /// mq=8 — exactly the core count, one slot each — and 64 at mq=16, where each core must walk TWO
-/// (`zz_diff_the_rung_descriptors::doubling_the_rung_doubles_the_per_core_row_fold` measures the factor
+/// (a deleted descriptor test, `zz_diff_the_rung_descriptors`, measured the factor
 /// going 1 → 2 at precisely that width). That is the next thing to distrust, and it is a different
 /// mechanism from anything the gather touches.
 ///

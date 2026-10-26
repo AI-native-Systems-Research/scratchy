@@ -12,6 +12,12 @@
 //! toolchain pulled in.
 
 pub mod allocator;
+/// ⭐⭐⭐⭐⭐ THE ATTENTION FAMILY'S HOST-STAGED STEP INPUTS — ONE BUILDER, TWO CALLERS: the
+/// worker's card session (which fills the slots before every launch) and the bake-time numeric
+/// gate (which stages the same bytes before its one judging run) both stage what this module
+/// builds, so the gate judges what the card runs — not a staging of its own making. No SDK
+/// dependency and no feature gate: it is pure construction over the sdsc_abstract laws.
+pub mod attn_step_staging;
 /// The KTIR types the emitted programs are made of. Re-exported because the `#[forward]` macro
 /// renders those programs as const tokens naming THIS crate's path — the same reason `bundle_code`
 /// is re-exported, so a consumer needs no direct dependency on the IR crate to hold a program.

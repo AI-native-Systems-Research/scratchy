@@ -14,8 +14,8 @@ torch's algorithm, cited:
   * the online softmax carry (max, rescale, sum, output) — `:97-105`;
   * one normalize, then the head-major store — `:123-129`.
 
-The contract (the module doc of `attn.py` states the shared laws; this file
-follows them):
+The contract (the module doc of `batched_decode.py` states the shared laws; this
+file follows them):
 
   * ONE program, grid `[1, 1]` — the whole chunk in one kernel. All
     descriptor corners are compile-time constants (the page and window loops

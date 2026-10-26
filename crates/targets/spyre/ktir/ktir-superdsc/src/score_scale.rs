@@ -98,8 +98,9 @@ pub enum PoolKLaw {
 ///
 /// ⛔ THE WALL THIS CLOSES. The recipe ([`crate::emit::kv_cache_write`]) was given
 /// `new_k: &str` and its own doc admitted the hole: "The recipe writes whatever it is given;
-/// the scale law belongs to the caller." The two callers hold opposite laws — the attention
-/// door multiplies both sides by √s and stores `K·√s` ("future steps' prefix scores need no
+/// the scale law belongs to the caller." The two callers held opposite laws — the attention
+/// door (deleted with the hand-written emitter) multiplied both sides by √s and stored `K·√s`
+/// ("future steps' prefix scores need no
 /// further K scaling"), while the rope append on the spliced path stores PLAIN rotated K
 /// (the fp8 k_proj's fold is refused there, so the readers own the scale). Both correct in
 /// isolation, both spelled identically at the signature, and nothing between them and a
@@ -110,10 +111,8 @@ pub enum PoolKLaw {
 ///     for a unit-scale model, whose raw K IS its scaled K).
 ///   * [`NewK::born_scaled_by_fold`] — K from a GEMM whose weights the fold proved carry √s.
 ///     Demands the bundle's [`ScoreScaleLaw::CommutedIntoWeights`] receipt; the name is the
-///     contract.
-///   * [`NewK::sqrt_scaled_by_multiply`] — K that an EMITTED multiply just scaled (`qs`'s twin
-///     on the K side). Door-private: only the attention door's multiply arm can honestly claim
-///     it, because only that arm emits the multiply.
+///     contract. (A third spelling — K scaled by an emitted multiply, the old attention door's
+///     `new_k_scaled` arm — went with that door: nothing now emits the multiply it named.)
 ///
 /// There is no `From<&str>` and no public field access to the law's setter: a caller cannot
 /// spell a law it does not hold, and the recipe cannot write a K whose law it was not told.
@@ -138,17 +137,6 @@ impl<'a> NewK<'a> {
     /// leaves the k_proj GEMM already carrying √s, so the pool stores it and future prefix
     /// scores state no multiplier of their own.
     pub fn born_scaled_by_fold(name: &'a str) -> Self {
-        NewK {
-            law: PoolKLaw::SqrtScaled,
-            name,
-        }
-    }
-
-    /// K SCALED BY AN EMITTED MULTIPLY — `new_k_scaled`, the twin of the door's `qs`. Private to
-    /// this crate because only the attention door's multiply arm emits that multiply; claiming
-    /// this law without emitting the op would write a pool the score legs trust for a √s no
-    /// bytes carry.
-    pub(crate) fn sqrt_scaled_by_multiply(name: &'a str) -> Self {
         NewK {
             law: PoolKLaw::SqrtScaled,
             name,

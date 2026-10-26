@@ -211,8 +211,8 @@ impl BakeFacts {
         }
     }
 
-    /// ⛔ REFUSE a decode bundle with no identity. Every model with attention references `ident`
-    /// unconditionally (`assemble_attn`'s GQA new_k/new_v replication), so a bundle that did not
+    /// ⛔ REFUSE a decode bundle with no identity. The KV cache write's identity-contracted
+    /// copies reference `ident` unconditionally for every rope append, so a bundle that did not
     /// place it runs those matmuls against an UNINITIALISED buffer — silently wrong attention at
     /// every layer of every step, the "stable but incoherent" class. Not zero-safe, so not a
     /// default.
@@ -221,8 +221,8 @@ impl BakeFacts {
             return Ok(());
         }
         Err(format!(
-            "superdsc decode bundle {what} did NOT place IDENTITY_TID, but assemble_attn's GQA \
-             new_k/new_v replication references it unconditionally for every AttnDecode node — \
+            "superdsc decode bundle {what} did NOT place IDENTITY_TID, but the KV cache write's \
+             identity-contracted copies reference it unconditionally for every rope append — \
              decode would run with an unfilled identity buffer. Refusing to serve: \
              compute_bundle_layout's has_attn placement gate and this lookup have desynced."
         ))

@@ -31,9 +31,9 @@
 //!
 //! ⛔ THE ONE DOOR THE CALLER CROSSES IS MONOMORPHISATION. Head counts and head dim parameterise the
 //! device layout (GQA grouping, slabs, head strides), so they must be `const`, not values:
-//! [`emit::lower_ktir_to_superdsc::attn_at`]`::<NQH, NKVH, HD>` and
-//! [`emit::lower_ktir_to_superdsc::rope_at`]`::<HD>` are generic entry points and the CALLER
-//! instantiates them from its own model configs. That arm set is the consumer's model inventory, so a
+//! [`emit::lower_ktir_to_superdsc::rope_at`]`::<HD>` is a generic entry point and the CALLER
+//! instantiates it from its own model configs (the attention crosses the same door upstream, at the
+//! splice's geometry-value→const boundary). That arm set is the consumer's model inventory, so a
 //! leaf crate must not own it, and it cannot be received as data either.
 //!
 //! ⚠️ NOT YET LEAF-CLEAN: [`emit::EmittedOp`], this crate's own output type, still carries a

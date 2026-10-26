@@ -13,7 +13,7 @@
 //!                                              |
 //!                                              +--> KtirNode { func, program, bindings, ... }
 //!                                                        |
-//!                                                        +--> emit::{rmsnorm, attn_at, ...}
+//!                                                        +--> emit::{rmsnorm, ...}
 //! ```
 //!
 //! # THE FIVE FIELDS, AND WHICH ARE HARD
@@ -297,8 +297,8 @@ fn emit_regions(
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 //  THE MODEL-GEOMETRY CONST DOOR
 //
-//  `rope_at::<HD>` and `attn_at::<NQH, NKVH, HD>` are const-generic because the head geometry
-//  parameterises the DEVICE layout — GQA grouping, slabs, head strides — so a branch on it is a
+//  `rope_at::<HD>` is const-generic because the head geometry parameterises the DEVICE layout
+//  — GQA grouping, slabs, head strides — so a branch on it is a
 //  branch on a const the compiler can hold onto (`rope_at`'s own doc: "the collapsed RoPE form and
 //  the slab RoPE form become TWO INSTANTIATIONS rather than two arms of one function"). A runtime
 //  `Program` cannot reach them; something has to name the triple.
@@ -521,8 +521,8 @@ pub fn drive_rope(
 // `attn_at::<NQH, NKVH, HD>` instantiation, and emit scratchy's prebuilt attention fragment
 // assembly — substituting a hand-rolled implementation for the given Triton code. Attention
 // goes through the whole-function door (`bake_py` `KTIR_WHOLE=1`): the compiled fixture's ops,
-// lowered one at a time. `attn_at` itself stays in the vendored `ktir-superdsc` crate (scratchy
-// still uses it); it is simply no longer reachable from our layer. Do not re-add this door.
+// lowered one at a time. `attn_at` itself has since been deleted from the vendored
+// `ktir-superdsc` crate with the hand-written attention. Do not re-add this door.
 
 /// THE HANDED-OFF FUNCTION AS THEIR MATCHERS READ IT, one line per op.
 ///

@@ -1047,5 +1047,5 @@ mod out_width_caps {
 // The collapsed fold now emits one op per (request, kv head) through
 // `assemble_matmul_off_phys_m_with_epilogue` — the SHIPPED shared-2-D-kernel form, `y` on the GQA group —
 // and reaches request `r`'s block by a baked offset (`GatherScratch::kernel_row_off`). Nothing in
-// attention declares a 3-D kernel any more, which is asserted on the emitted descriptors by
-// `zz_the_declared_y_of_every_gathered_op`.
+// attention declares a 3-D kernel any more (a descriptor test that pinned this on the old
+// emission, `zz_the_declared_y_of_every_gathered_op`, went with it).

@@ -1636,7 +1636,8 @@ fn program_broadcast_chains(
                      row vector (`In::mb`, one row addressed once); neither states an address that \
                      advances every k rows, and no descriptor in this door's vocabulary does, so \
                      this is named rather than half-addressed. The door-proven statement of the \
-                     same math is `attn.py`'s own mask law: the host stages the mask at the score \
+                     same math is the paged-decode kernel's own mask law (`batched_decode.py`):
+                     the host stages the mask at the score \
                      tile's own rows and the kernel adds it at base — no broadcast at all",
                     f.name
                 ));
@@ -5606,8 +5607,9 @@ mod broadcast_chain_tests {
     /// Row-major, spraying the middle axis repeats each of the source's flat rows down the
     /// merged row axis (`result[b, g, j] = source[b, 0, j]`: flat row `b·4 + g` reads flat row
     /// `b` — the row index ADVANCES every G rows), and no operand mode in this door's vocabulary
-    /// addresses that. The refusal must NAME the shape and `attn.py`'s door-proven restatement —
-    /// the host stages the mask at the score tile's own rows and the kernel adds it at base —
+    /// addresses that. The refusal must NAME the shape and the paged-decode kernel's restatement
+    /// (`batched_decode.py`: the host stages the mask at the score tile's own rows and the kernel
+    /// adds it at base) —
     /// because that restatement is the kernel's move, not a lowering fix.
     #[test]
     fn the_rank3_middle_axis_is_row_replication_and_refused() {
@@ -5627,7 +5629,7 @@ mod broadcast_chain_tests {
             "names the data movement the device cannot address: {m}"
         );
         assert!(
-            m.contains("attn.py"),
+            m.contains("batched_decode.py"),
             "names the door-proven restatement so the kernel side knows the move: {m}"
         );
     }

@@ -300,6 +300,27 @@ impl SpyreSession {
     pub fn observable_tids(&self, prog: usize) -> Vec<u64> {
         self.session.observable_tids(prog)
     }
+
+    /// The staged byte extent of one tensor, at its own view dtype — the gate's stand-in for
+    /// the card session's `step_input_extent`: the discovery table's own number, asked of the
+    /// session (see [`ktir_emulator::program::Session::source_extent_bytes`]). `None` for a
+    /// tid no program of this session binds.
+    pub fn source_extent_bytes(&self, tid: u64) -> Option<u64> {
+        self.session.source_extent_bytes(tid)
+    }
+
+    /// ⭐⭐⭐⭐⭐ STAGE ONE TENSOR'S ALREADY-TYPED BYTES — the gate's stand-in for the card
+    /// session's `fill_step_input`, so the gate stages the attention family's step inputs
+    /// through the SAME builder the worker fills from (see
+    /// [`crate::attn_step_staging`]): the id tables land as I32, the validity mask as F16
+    /// wire bytes, each verbatim under the resident executor's own law
+    /// (`set_source_bytes`: bytes matching the view land unchanged). A tid this session's
+    /// programs do not bind refuses — the card's fill door refuses the same way.
+    pub fn set_source_bytes(&mut self, tid: u64, bytes: Vec<u8>, dtype: DType) -> Result<()> {
+        self.session
+            .set_source_bytes(tid, bytes, dtype)
+            .map_err(|e| anyhow!("set_source_bytes t{tid}: {e}"))
+    }
 }
 
 #[cfg(test)]

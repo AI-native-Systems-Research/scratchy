@@ -28,12 +28,11 @@
 //! Information flowed producer → sidecar → SuperDSC, straight past the IR — so a producer that did
 //! not have that graph could not fill it (making this crate's attention path unusable to it), and the
 //! interpreter (which executes the ops) and the CARD (which read the sidecar) were not obliged to
-//! compute the same thing. Seven of the eleven are read out of the program by
-//! [`attn_operands`](crate::emit::lower_ktir_to_superdsc::attn_operands); of the four that remained,
-//! the multiplier and the swept KV extent have since been read off the program too, leaving the ones
-//! that are facts of the MODEL and the BUNDLE as ordinary arguments of
-//! [`AttnAt`](crate::emit::lower_ktir_to_superdsc::AttnAt) —
-//! `ibm/main`'s own `LowerAttn` fields — from the caller that crosses the geometry door.
+//! compute the same thing. Seven of the eleven were then read out of the program by `attn_operands`,
+//! and the whole sidecar — reader, carrier and the hand-written emitter it fed — is since deleted
+//! with the old attention: the live Triton-spliced kernels state every fact in the program itself,
+//! and the facts of the MODEL and the BUNDLE ride as ordinary arguments of the door
+//! (`BundleAttnParams`), from the caller that crosses it.
 //!
 //! [`ActiveCap`] stays here because it is that door's own vocabulary: the swept KV extent is a fact
 //! of the BUNDLE the caller is told and the bake never sees, and the lowering's argument pack names
@@ -156,8 +155,7 @@ impl Elementwise {
 /// label is currently UNCHECKED: `elementwise` emits its op-func string from the kind alone and never
 /// inspects the ops, so a mislabelled program lowers to the wrong descriptor silently. The crate already
 /// has the antidote pattern three times over (`program_rmsnorm_eps`, `program_scalarmul_scale`,
-/// `program_score_scale`, the last of which `attn_at` uses to PROVE a caller's value matches the
-/// program's). Applying it here — deriving the kind and refusing a disagreement — is the outstanding work,
+/// `program_score_scale`, which proved a caller's value matched the program's). Applying it here — deriving the kind and refusing a disagreement — is the outstanding work,
 /// and until then a producer that could state the fact from its own ops is being asked to classify by hand.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Program {
@@ -329,7 +327,7 @@ impl ActiveCap {
     ///
     /// Correct because the new-token block is already the `first` block: with `first` it writes
     /// `run_m`/`run_l`/`run_o` directly rather than folding, and the finalize is `out = run_o / run_l`
-    /// — which for a single block is exactly `exp(s - max) / sum`. (`assemble_attn`'s note that the
+    /// — which for a single block is exactly `exp(s - max) / sum`. (the old hand-written emitter's note that the
     /// seed "is still followed by at least one prefix-block combine" describes the numerical ORDERING
     /// argument for seeding from the new block, not a correctness requirement for a combine to exist.)
     ///

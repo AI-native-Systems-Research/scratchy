@@ -66,8 +66,8 @@
 //! address (`control_block_wire.rs:239`, `scheduler.rs:2996`). The gather puts two 256 KB synths at the
 //! top of seg0, which is the first time that segment has had anything there.
 //!
-//! ⛔ **BUT seg0 IS NEVER SHIFTED.** `assemble_attn` sets `let per_req = false` UNCONDITIONALLY, so
-//! `block_rows` is always `BlockRows::WholeBatch`, so the manifest declares
+//! ⛔ **BUT seg0 IS NEVER SHIFTED.** The hand-written emitter (deleted) set `per_req = false`
+//! UNCONDITIONALLY, and no live path declares a per-request fold — so the manifest declares
 //! `FoldRowRegime::WholeBatch`, whose `int_rep_stride_bytes` is **0 by derivation** — and
 //! `fold_plan::fold_delta`'s intermediate term is `req * int_rep_stride_bytes`. Every bundle in the
 //! tree, gathered or not, shifts seg0 by zero. The two gather scratches are therefore read and written

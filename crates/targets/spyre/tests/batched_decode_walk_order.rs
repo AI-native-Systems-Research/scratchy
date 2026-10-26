@@ -16,14 +16,11 @@
 //! the proven emit out of its blast radius.
 
 use ktir_superdsc::emit;
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{
-    AttnFacts, SharedKernelBmmForm, assemble_attn, assemble_matmul_off,
-};
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{SharedKernelBmmForm, assemble_matmul_off};
 use scratchy_subtile::addr::DevOff;
 use scratchy_subtile::sdsc_abstract::{
-    BlockCols, KernelTag, KvExtent, MaskRows, MatK, MatM, MatN, MatY, OperandPlacement,
-    PerRequestRows, QueryRowCount, RowBlockedTag, RungWidth, SlotCount, SlotWindow, StickLayout,
-    Stk,
+    BlockCols, KernelTag, MaskRows, MatK, MatM, MatN, MatY, OperandPlacement, PerRequestRows,
+    QueryRowCount, RowBlockedTag, RungWidth, SlotWindow, StickLayout, Stk,
 };
 
 const HD: u32 = 64; // the g-form exists only where a head is one stick
@@ -103,8 +100,8 @@ fn per_core_by_slice(
     offs
 }
 
-/// The g-form score op exactly as `assemble_attn_block` emits it for one kv-head group, with the
-/// form the given row kind + count thread through the emitter's boundary.
+/// The g-form score op for one kv-head group, with the form the given row kind + count thread
+/// through `SharedKernelBmmForm::of_attn_rows`'s boundary.
 fn score_op(mq: u32, rows_are_requests: bool) -> emit::EmittedOp {
     let mut s = 0i64;
     assemble_matmul_off(
@@ -214,7 +211,7 @@ fn the_mq1_proven_bundle_keeps_the_batch_inner_reconstructed_walk() {
 
 /// AND A NON-REQUEST ROW KIND CANNOT TAKE THE CORRECTED WALK: the boundary hands a prompt-shaped
 /// caller the proven form whatever its width. (The live prefill never emits the g-form at all —
-/// `assemble_attn`'s gate keeps mq>1 prompts on the per-head path — so this is the boundary's own
+/// the old emitter's gate kept mq>1 prompts on the per-head path — so this is the boundary's own
 /// pin, not a claim about a shipped prompt bundle.)
 /// ⭐ STILL AT `mq = 8`, WHICH IS THE ONLY WIDTH WHERE THIS CLAIM HAS TEETH — the two walks coincide at
 /// `mq == 1`, so pinning the order there asserts almost nothing.
@@ -223,8 +220,8 @@ fn the_mq1_proven_bundle_keeps_the_batch_inner_reconstructed_walk() {
 /// strides and the builder refuses a walk that strides `y` by neither, so a token-stream activation
 /// (heads `mq*hd` apart) can no longer be paired with the batch-inner walk (`y` one stick) at `mq > 1`
 /// — it refused this very call: "strides `y` by 64 elems … but this operand's placement law puts
-/// adjacent heads 512 elems apart". That pairing was always wrong and the live emitter never built it
-/// (`assemble_attn` keeps `mq>1` prompts on the per-head path); only this test did.
+/// adjacent heads 512 elems apart". That pairing was always wrong and no live path ever built it
+/// (the old emitter kept `mq>1` prompts on the per-head path); only this test did.
 ///
 /// So the op gets operands the batch-inner walk DOES fit — the request-major law, where adjacent heads
 /// are ONE ROW apart and a row is one stick. The subject here is which FORM the boundary hands back for
@@ -262,73 +259,4 @@ fn a_prompt_row_kind_is_refused_the_corrected_walk() {
     );
     assert_eq!(layout_dim_order(&e, "sc_pin", 0), vec!["mb", "y", "in"]);
     assert_eq!(layout_dim_order(&e, "sc_pin", 2), vec!["mb", "y", "out"]);
-}
-
-/// THE WHOLE THREAD, through the real emitter: `assemble_attn` names the form once from
-/// `(rows_are_requests, mq)` and every g-form score/value op of a batch rung comes out
-/// batch-outermost while the mq==1 bundle's come out batch-inner. A prompt chunk emits no g-form op
-/// at all.
-#[test]
-fn assemble_attn_threads_the_form_to_every_gform_op() {
-    let cap = 256u32;
-    let emit = |mq: u32, rar: bool| {
-        let mut sym = 0i64;
-        // The width crosses the same parse boundary the emitter's own entry uses: a request-kind
-        // width must be a baked ladder rung, a prompt width takes the runtime law.
-        let geom =
-            scratchy_subtile::sdsc_abstract::AttnGeometry::<NQH, { NQH / GQA }, HD>::minted();
-        let width = scratchy_subtile::sdsc_abstract::attn_bundle_rows(geom, mq, rar)
-            .expect("a width the emitter can bake");
-        assemble_attn(
-            AttnFacts {
-                t: 7,
-                geom,
-                bundle_rows: width,
-                // The storage/sweep pair on the boundary's one carrier — the sweep is the full cap
-                // (no rung).
-                extent: KvExtent::new(SlotCount::new(cap), SlotCount::new(cap)),
-                qs: "qs",
-                new_k_scaled: "nks",
-                new_v: "nvr",
-                kct: "kct",
-                vc: "vc",
-                pmask: "pmask",
-                cmask: "cmask",
-                kv_block_index: None,
-                chunk: None,
-                out_id: scratchy_target_spyre::bundle_code::PlaceId::Act(7),
-                rows_are_requests: rar,
-                headmajor_handoff: false,
-            },
-            &mut sym,
-            None,
-        )
-        .expect("attention must emit")
-    };
-    for (mq, rar, want) in [
-        (4u32, true, vec!["y", "mb", "in"]),
-        (8, true, vec!["y", "mb", "in"]),
-        (1, true, vec!["mb", "y", "in"]),
-    ] {
-        let ops = emit(mq, rar);
-        let gform: Vec<_> = ops.iter().filter(|e| e.op_name.contains("sc_g")).collect();
-        assert!(
-            !gform.is_empty(),
-            "mq={mq}: the batched g-form must be live at hd=64"
-        );
-        for e in gform {
-            assert_eq!(
-                layout_dim_order(e, &e.op_name, 0),
-                want,
-                "mq={mq} rows_are_requests={rar}: {}",
-                e.op_name
-            );
-        }
-    }
-    // A prompt chunk keeps the per-head path — no g-form op exists for the form to matter to.
-    let prompt = emit(31, false);
-    assert!(
-        prompt.iter().all(|e| !e.op_name.contains("sc_g")),
-        "an mq>1 prompt must not emit the batched g-form"
-    );
 }

@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! ⭐⭐⭐⭐⭐ THE GATHER IS `hd == 64`-ONLY, AND **NOTHING SAID SO EXCEPT A DOC COMMENT.**
 //!
-//! [`GatherScratch::of_fold_pass`] returns `None` for `hd > POOL_STICK`, and `assemble_attn`'s
-//! `kv_block_index.zip(of_fold_pass(..))` turns that `None` into "emit EXACTLY the bundle that
-//! shipped, byte for byte". So on any model with a head dim above one stick the whole HBM-gather
-//! campaign is **silently absent**: no copy ops, no index staged, no collapse — and the run is
-//! `rc=0`, the output is clean, and every number looks like a batching result.
+//! [`GatherScratch::of_fold_pass`] returns `None` for `hd > POOL_STICK`, and the deleted
+//! hand-written emitter's `kv_block_index.zip(of_fold_pass(..))` turned that `None` into "emit
+//! EXACTLY the bundle that shipped, byte for byte". So on any model with a head dim above one stick
+//! the whole HBM-gather campaign was **silently absent**: no copy ops, no index staged, no collapse
+//! — and the run was `rc=0`, the output clean, and every number looked like a batching result.
 //!
 //! ⛔⛔⛔ THAT SILENCE IS WHAT THIS FILE EXISTS FOR. Measured on the card, pod
 //! `nickm-7db9667cdd-z2jc6`, this tree, `RedHatAI/granite-3.1-8b-instruct-FP8-dynamic`
@@ -114,10 +114,10 @@ fn a_head_dim_above_one_stick_gets_no_gather_at_any_rung_or_width() {
     // `nb` a fold pass can sweep. Widths are the baked decode rungs the 8b run reported ready.
     for cap in [64u32, 128, 256] {
         for mq in [1u32, 2, 4, 8, 16, 32] {
-            // ⛔⛔⛔⛔⛔ THE **LIVE** DOOR, ASKED IN THE SAME LOOP. `assemble_attn` stopped calling
-            // `GatherScratch::of_fold_pass` when the gather went page-granular; every assertion in this
-            // file below is about a door the shipped emitter no longer reads, which is how a green suite
-            // certified hd=128 for a whole round. `PageScratch::of_pass` IS the shipped door, and it
+            // ⛔⛔⛔⛔⛔ THE **LIVE** DOOR, ASKED IN THE SAME LOOP. The deleted hand-written emitter
+            // stopped calling `GatherScratch::of_fold_pass` when the gather went page-granular; every
+            // assertion in this file below is about a door no shipped path reads, which is how a green
+            // suite certified hd=128 for a whole round. `PageScratch::of_pass` IS the live door, and it
             // refuses two slabs on CARD EVIDENCE (its own note carries the table and the `origin/main`
             // control). A widening must move THIS assertion, not the dead one.
             let pool = PagedKvPool::new(NKVH as u32, HD_2B as u32);

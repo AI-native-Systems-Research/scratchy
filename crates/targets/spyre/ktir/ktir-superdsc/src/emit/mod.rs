@@ -53,9 +53,9 @@ pub mod batched_gathered;
 /// main's `lower_matmul_node` arity-3 branch — the W8A8 fp8 matmul descriptors, reached from the
 /// facts the KTIR states. See its own header.
 pub mod ktir_matmul_fp8;
-/// KTIR → SuperDSC: `ibm/main`'s eight `lower_*_node` bodies with their input door changed. The two
-/// that cross a model-geometry const door ([`lower_ktir_to_superdsc::attn_at`],
-/// [`lower_ktir_to_superdsc::rope_at`]) are public generic entry points the CALLER instantiates.
+/// KTIR → SuperDSC: `ibm/main`'s eight `lower_*_node` bodies with their input door changed. The one
+/// that crosses a model-geometry const door ([`lower_ktir_to_superdsc::rope_at`]) is a public
+/// generic entry point the CALLER instantiates.
 pub mod lower_ktir_to_superdsc;
 pub mod whole_function;
 
@@ -2668,7 +2668,8 @@ pub fn touched_blocks(v: &crate::superdsc_opspec::ArgView, iter: &WorkPlan) -> T
 /// value, because they are ONE fact: a single emission whose program order is the call order into
 /// the ONE sink, whose sym ids are minted only through the ONE counter, and whose placement
 /// questions have exactly one authority. Minted once at the door that owns the sink —
-/// `assemble_attn` for the attention path, `lower_function` for the whole-function walk — and
+/// `lower_function` for the whole-function walk (the attention rides it since the hand-written
+/// emitter's deletion) — and
 /// threaded as ONE `&mut EmitCtx` through every emitter that pushes into it, never split into
 /// per-field borrows at a call site, which would let two spellings of "the" emission disagree
 /// about order, ids or placement. The one-op assemblers (`matmul`, `reduce`, `pointwise`) keep

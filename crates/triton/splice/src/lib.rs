@@ -285,7 +285,7 @@ pub fn lmlast_row() -> TritonKernelRow {
 }
 
 /// THE ATTENTION FAMILY — one row, one kernel: `batched_decode.py`'s own batched paged-decode
-/// kernel, the Spyre-native `batched_decode_hm`. The old `attn.py` row (the three
+/// kernel, the Spyre-native `batched_decode_hm`. The old attention row (the three
 /// constexpr-selected arms over the flat cache) is deleted, not left beside it; the prefill
 /// shapes it served are the prefill kernel's to serve.
 pub fn attn_decode_row() -> TritonKernelRow {
@@ -574,7 +574,30 @@ pub fn lower_all<F: scratchy_subtile::subtile_ir::RopeForm>(
             return Ok(Vec::new());
         }
         if let Some(sandwich) = sandwich_at_split(node, ir) {
-            return lower_sandwich_node(&sandwich);
+            // ⭐ THE FUSED FORM COMPILES AT THE MODEL'S OWN CONST HEAD DIM: the emit site
+            // crosses the config-declared head-dim door — the ONLY crossing, the same
+            // door every head-width reader crosses — so the mint's `D`/`HEADS`/`INV_D`
+            // bind the const generic, never the node's value. The sandwich fuses or not
+            // by the graph's own structure alone; `None` is a head width no config in
+            // this workspace declares, refused loudly here — the fix is the
+            // `config.json` that names this model, never an edit to the door.
+            return match scratchy_subtile::model_geometry::with_config_head_dim(
+                scratchy_subtile::model_geometry::HeadDim::new(sandwich.head_dim),
+                SandwichAtTheDoor {
+                    sandwich: &sandwich,
+                },
+            ) {
+                Some(out) => out,
+                None => Err(format!(
+                    "triton splice: rmsnorm_s{} (head-norm sandwich) states head dim {} — \
+                     no config declares that head width ({}); the model's head dims are const \
+                     generics crossed at this door, so the fix is the config that names this \
+                     model, never an edit here",
+                    sandwich.split.id.index(),
+                    sandwich.head_dim,
+                    scratchy_subtile::model_geometry::geometry_sources(),
+                )),
+            };
         }
     }
     if matches!(&node.op, SubOp::RmsNorm { .. } | SubOp::RmsNormUnit { .. })
@@ -654,8 +677,8 @@ fn node_at_one_row<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// 2. THE CARRIER — `rope.py`'s `rope_append_fwd` minted as [`Program::RopeAppend`], the
 ///    arity-6 contract statement `[K, cos, sin, V, K_cache, V_cache]`. Its body is NEVER
 ///    WALKED (rope_fwd's own precedent): the door's `Program::RopeAppend` arm lowers the
-///    node's write contract through `kv_cache_write` — main's recipe, re-homed from
-///    `attn_at` to the rope arm — which self-stamps every op it mints (the paged latch's
+///    node's write contract through `kv_cache_write` — main's recipe, re-homed from the
+///    deleted attention door to the rope arm — which self-stamps every op it mints (the paged latch's
 ///    own source). The carrier carries NO stamps and states its node's output tensor on
 ///    [`KtirNode::node_out_tid`] (the two-halves law: the rotation writes it, the carrier
 ///    names it).
@@ -671,10 +694,57 @@ pub fn lower_rope_append<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
 ) -> Result<Vec<EmittedOp>, String> {
-    let SubOp::RopeAppend {
-        head_dim, layout, ..
-    } = &node.op
-    else {
+    let SubOp::RopeAppend { head_dim, .. } = &node.op else {
+        return Err(
+            "triton splice: lower_rope_append called on a node that is not a RopeAppend"
+                .to_string(),
+        );
+    };
+    // ⭐ THE HEAD DIM IS A CONST: the append's head width crosses the config-declared
+    // head-dim door — the same door the rotation's own spec crosses — and the const body
+    // binds every head-width fact (`HEAD_DIM`/`HALF`, the head count) off the const
+    // generic it hands down. `None` is a head width no config declares: refused loudly,
+    // naming the configs read; the fix is the `config.json` that names this model, never
+    // an edit here.
+    match scratchy_subtile::model_geometry::with_config_head_dim(
+        *head_dim,
+        RopeAppendAtTheDoor { node, ir },
+    ) {
+        Some(out) => out,
+        None => Err(format!(
+            "triton splice: rope_append t{} states head dim {} — no config declares that \
+             head width ({}); the model's head dims are const generics crossed at this \
+             door, so the fix is the config that names this model, never an edit here",
+            node.output.tensor.index(),
+            head_dim.get(),
+            scratchy_subtile::model_geometry::geometry_sources(),
+        )),
+    }
+}
+
+/// The consumer that carries [`lower_rope_append`]'s body across the head-dim door.
+struct RopeAppendAtTheDoor<'a, F: scratchy_subtile::subtile_ir::RopeForm> {
+    node: &'a SubtileNode<F>,
+    ir: &'a SubtileIR<F>,
+}
+
+impl<F: scratchy_subtile::subtile_ir::RopeForm> scratchy_subtile::model_geometry::OnHeadDim
+    for RopeAppendAtTheDoor<'_, F>
+{
+    type Out = Result<Vec<EmittedOp>, String>;
+
+    fn on_head_dim<const HD: u32>(self) -> Self::Out {
+        lower_rope_append_at::<F, HD>(self.node, self.ir)
+    }
+}
+
+/// The append lowering at a CONFIG-DECLARED head dim — the two-halves body the entry's
+/// doc header states, with every head-width fact read off the const generic.
+fn lower_rope_append_at<F: scratchy_subtile::subtile_ir::RopeForm, const HD: u32>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+) -> Result<Vec<EmittedOp>, String> {
+    let SubOp::RopeAppend { layout, .. } = &node.op else {
         return Err(
             "triton splice: lower_rope_append called on a node that is not a RopeAppend"
                 .to_string(),
@@ -711,18 +781,17 @@ pub fn lower_rope_append<F: scratchy_subtile::subtile_ir::RopeForm>(
         }
     }
     // The door's contract, stated from the node's own facts — the same derivation the
-    // `rope_fwd` arm makes: total = the output's declared width (`heads * hd`), and the
+    // `rope_fwd` spec makes: total = the output's declared width (`heads * hd`), and the
     // builder's own refusal (`total` not a whole number of `hd`-wide heads) is mirrored.
-    let hd = head_dim.get();
     let total = node.output.region.cols.len;
-    if hd == 0 || !total.is_multiple_of(hd) {
+    if HD == 0 || !total.is_multiple_of(HD) {
         return Err(format!(
             "triton splice: rope_append t{}: {total} cols is not a whole number of \
-             {hd}-wide heads",
+             {HD}-wide heads",
             node.output.tensor.index()
         ));
     }
-    let heads = total / hd;
+    let heads = total / HD;
     // ⛔ THE WINDOWING LAW, the `rope_fwd` arm's own, minus the dead `out`: x, cos, sin
     // and V share ONE row window, take WHOLE columns of `total`, and sit over tensors of
     // ONE height (the head-replicated cos/sin reinterpretation is same-bytes only at that
@@ -765,10 +834,11 @@ pub fn lower_rope_append<F: scratchy_subtile::subtile_ir::RopeForm>(
     };
 
     // ── HALF 1: THE ROTATION — `rope_fwd` minted as `Program::Rope`, the `RopeRotate`
-    // row's own op. `kernel_spec`'s rope arm derives the same constexprs off THIS node
-    // (it matches `RopeAppend` too), and the door's `fn rope` lowers the program through
-    // `rope_at` — the card-proven P-table matmul, no kernel body, no halves.
-    let spec = kernel_spec(node, ir, "rope.py", "rope_fwd")?;
+    // row's own op. Its spec is derived at the SAME const head dim the door handed this
+    // body ([`rope_spec_at`] — no second crossing, no second spelling), and the door's
+    // `fn rope` lowers the program through `rope_at` — the card-proven P-table matmul,
+    // no kernel body, no halves.
+    let spec = rope_spec_at::<F, HD>(node, ir)?;
     let module = compile_kernel(src, &spec, &[1])?;
     let rotation = mint(
         node,
@@ -805,8 +875,8 @@ pub fn lower_rope_append<F: scratchy_subtile::subtile_ir::RopeForm>(
         Ok(())
     };
     ce("H", Val::Int(i128::from(heads)))?;
-    ce("HEAD_DIM", Val::Int(i128::from(hd)))?;
-    ce("HALF", Val::Int(i128::from(hd / 2)))?;
+    ce("HEAD_DIM", Val::Int(i128::from(HD)))?;
+    ce("HALF", Val::Int(i128::from(HD / 2)))?;
     ce("X_ROWS", Val::Int(i128::from(y_rows)))?;
     ce("ROW_START", Val::Int(i128::from(window.0)))?;
     ce("PART_ROWS", Val::Int(i128::from(window.1)))?;
@@ -889,7 +959,9 @@ struct HeadNormSandwich<'a, F: scratchy_subtile::subtile_ir::RopeForm> {
     flatten: &'a SubtileNode<F>,
     /// The per-head width `D` (the split's output columns). The head COUNT is not
     /// carried: it is `full / D` of the split input's own extents, re-derived by the
-    /// spec and the door alike, so no second spelling can disagree.
+    /// spec and the door alike, so no second spelling can disagree. The width itself is
+    /// the door's input, never the mint's: the emit site crosses the head-dim door, and
+    /// the kernel's `D` binds the const generic it hands down.
     head_dim: u32,
     /// The norm's epsilon, read once here so the mint states one value.
     eps: f32,
@@ -1065,37 +1137,54 @@ fn is_sandwich_flatten<F: scratchy_subtile::subtile_ir::RopeForm>(
     producer_of(ir, x.tensor).is_some_and(|norm| is_sandwich_norm(norm, ir))
 }
 
+/// The consumer that carries the head-norm sandwich's mint across the head-dim door.
+struct SandwichAtTheDoor<'a, F: scratchy_subtile::subtile_ir::RopeForm> {
+    sandwich: &'a HeadNormSandwich<'a, F>,
+}
+
+impl<F: scratchy_subtile::subtile_ir::RopeForm> scratchy_subtile::model_geometry::OnHeadDim
+    for SandwichAtTheDoor<'_, F>
+{
+    type Out = Result<Vec<EmittedOp>, String>;
+
+    fn on_head_dim<const HD: u32>(self) -> Self::Out {
+        lower_sandwich_node_at::<F, HD>(self.sandwich)
+    }
+}
+
 /// Lower the per-head norm SANDWICH to ONE program — the norm applied to head windows
 /// of the ORIGINAL tensor, both reshapes deleted. [`HeadNormSandwich`]'s docs carry
-/// the proof; this mints the kernel: `windowedrmsnorm.py`'s gained, oneplus, or unit
+/// the proof; this mints the kernel at the CONFIG-DECLARED head dim the door handed
+/// down (`D`/`INV_D` bind the const generic, never the node's value):
+/// `windowedrmsnorm.py`'s gained, oneplus, or unit
 /// entry, compiled at the sandwich's own geometry, bound to the split's SOURCE `x`, the
 /// gamma row (gained form only) and the flatten's OUTPUT — the same
 /// synthetic-node-and-mint shape the prefill lm-head fold uses for `lmlast.py`.
-fn lower_sandwich_node<F: scratchy_subtile::subtile_ir::RopeForm>(
+fn lower_sandwich_node_at<F: scratchy_subtile::subtile_ir::RopeForm, const HD: u32>(
     sandwich: &HeadNormSandwich<'_, F>,
 ) -> Result<Vec<EmittedOp>, String> {
     let HeadNormSandwich {
         split,
         norm,
         flatten,
-        head_dim,
         eps,
         gained,
         oneplus,
+        ..
     } = sandwich;
     let x_r = &split.inputs[0];
     let out_r = &flatten.output;
     let (m, full) = (out_r.region.rows.len, out_r.region.cols.len);
-    if *head_dim == 0 || full % head_dim != 0 {
+    if HD == 0 || !full.is_multiple_of(HD) {
         return Err(format!(
             "triton splice: rmsnorm_s{} (head-norm sandwich): the output t{} is [{m}, {full}] \
-             over head dim {head_dim}, which does not divide — a per-head window must tile the \
+             over head dim {HD}, which does not divide — a per-head window must tile the \
              width exactly",
             split.id.index(),
             out_r.tensor.index()
         ));
     }
-    let heads = full / head_dim;
+    let heads = full / HD;
     let src = include_str!("../../../targets/spyre/kernels/windowedrmsnorm.py");
     // THREE entries, one body: the matcher's own convention triple, stated as the
     // entry name only — the bindings are identical across the gained forms, and the
@@ -1124,10 +1213,10 @@ fn lower_sandwich_node<F: scratchy_subtile::subtile_ir::RopeForm>(
         Ok(())
     };
     ce("M", Val::Int(i128::from(m)))?;
-    ce("D", Val::Int(i128::from(*head_dim)))?;
+    ce("D", Val::Int(i128::from(HD)))?;
     ce("HEADS", Val::Int(i128::from(heads)))?;
     ce("EPS", Val::Float(f64::from(*eps)))?;
-    ce("INV_D", Val::Float(1.0 / f64::from(*head_dim)))?;
+    ce("INV_D", Val::Float(1.0 / f64::from(HD)))?;
     if *oneplus {
         // The convention's own `offset()` (1.0), the same value the census
         // collects and the door resolves — one constant, three readers, one
@@ -1586,7 +1675,7 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
 //
 //  * the KERNEL is `batched_decode.py`'s `batched_decode_hm` — the Spyre-native batched
 //    paged-decode kernel, ONE program for the whole decode batch, the pool swept through
-//    the device-resident page-id table (the old `attn.py` row is deleted; the prefill
+//    the device-resident page-id table (the old attention row is deleted; the prefill
 //    shapes it served are the prefill kernel's to serve, refused by name until that row
 //    lands);
 //  * the DOOR's parameter order is q, out, kt, v, ids, mask — the output is SECOND, the
@@ -1638,6 +1727,92 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     // `None` is a walk/splice desync and refuses below.
     scale_law: Option<ktir_superdsc::score_scale::ScoreScaleLaw>,
 ) -> Result<Vec<EmittedOp>, String> {
+    let SubOp::AttnDecode { geom, .. } = &node.op else {
+        return Err(
+            "triton splice: lower_attn called on a node that is not an AttnDecode".to_string(),
+        );
+    };
+    // ⭐⭐⭐⭐⭐ THE VALUE→CONST DOOR FOR THE ATTENTION GEOMETRY — the same door main's
+    // attention arm crossed (`with_config_attn_geometry`), at the same boundary: the
+    // attention lowering runs at head geometry as CONST GENERICS, and this is the only
+    // place the node's geometry value becomes them. The arms are generated from the model
+    // configs by scratchy-subtile's build script, so a `None` is a geometry no config in
+    // this workspace declares — a build refusal naming it, answered by a `config.json`,
+    // never by an edit to the door. Past the door ([`lower_attn_at`]) there is no bare
+    // head-count value anywhere on the attention path: NKVH/HD are const generics, GQA is
+    // the witness's own const-backed associated const, and every extent derived from them
+    // is the compiler's arithmetic.
+    match scratchy_subtile::model_geometry::with_config_attn_geometry(
+        *geom,
+        AttnAtTheDoor {
+            node,
+            ir,
+            cap,
+            rows_are_requests,
+            paged_fold,
+            scale_law,
+        },
+    ) {
+        Some(out) => out,
+        None => Err(format!(
+            "triton splice: AttnDecode t{} carries a geometry no model config declares \
+             ({geom}; the configs in scope: {}). The attention lowering runs at head geometry \
+             as const generics, instantiated per config by the build script, so a geometry \
+             outside that set has no compiled arm — the fix is a `config.json`, never an \
+             edit to the door",
+            node.output.tensor.index(),
+            scratchy_subtile::model_geometry::geometry_sources(),
+        )),
+    }
+}
+
+/// The consumer [`lower_attn`] hands the geometry door: the ENTIRE attention lowering runs
+/// inside `on_geometry::<NQH, NKVH, HD>`, so nothing past the door can hold a bare
+/// head-count value. The same discipline as `ktir_superdsc_door`'s rope arm (`OnHeadDim`
+/// over `with_config_head_dim`) — the door's witness spends the GQA divisibility proof, so
+/// the body's every derived extent is the compiler's arithmetic.
+struct AttnAtTheDoor<'a, F: scratchy_subtile::subtile_ir::RopeForm> {
+    node: &'a SubtileNode<F>,
+    ir: &'a SubtileIR<F>,
+    cap: u32,
+    rows_are_requests: bool,
+    paged_fold: Option<&'a PagedFoldRung>,
+    scale_law: Option<ktir_superdsc::score_scale::ScoreScaleLaw>,
+}
+
+impl<F: scratchy_subtile::subtile_ir::RopeForm> scratchy_subtile::model_geometry::OnAttnGeometry
+    for AttnAtTheDoor<'_, F>
+{
+    type Out = Result<Vec<EmittedOp>, String>;
+    fn on_geometry<const NQH: u32, const NKVH: u32, const HD: u32>(
+        self,
+        geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    ) -> Self::Out {
+        lower_attn_at(geom, self)
+    }
+}
+
+/// [`lower_attn`]'s body at the geometry the door chose — head counts are CONSTS here
+/// (`NKVH`/`HD` as const generics, GQA off the witness), so every extent derived from them
+/// below is the compiler's arithmetic, and a geometry the kernels cannot state refuses at
+/// THEIR compile-time asserts, in the kernel's own terms.
+fn lower_attn_at<
+    F: scratchy_subtile::subtile_ir::RopeForm,
+    const NQH: u32,
+    const NKVH: u32,
+    const HD: u32,
+>(
+    geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    at: AttnAtTheDoor<F>,
+) -> Result<Vec<EmittedOp>, String> {
+    let AttnAtTheDoor {
+        node,
+        ir,
+        cap,
+        rows_are_requests,
+        paged_fold,
+        scale_law,
+    } = at;
     let row = if rows_are_requests {
         attn_decode_row()
     } else {
@@ -1648,7 +1823,6 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         TritonKernelRow::Refused(why) => return Err(why.to_string()),
     };
     let SubOp::AttnDecode {
-        geom,
         scale,
         valid_len,
         layout: kv,
@@ -1661,8 +1835,6 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
                 .to_string(),
         );
     };
-    let (nkvh, hd) = (geom.nkvh().get(), geom.hd().get());
-    let gqa = geom.gqa().get();
     // ⭐⭐⭐⭐⭐ THE SCALE, DERIVED BY EXHAUSTIVE MATCH OVER THE LAW — never a naked read off
     // the node. The node handed in may be a REWRITE (the walk rewrites `scale = 1.0` under the
     // fold's receipt, and only then); the ORIGINAL IR payload is the arch's own statement (the
@@ -1768,7 +1940,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
                 cap
             ));
         }
-        return mint_paged_fold(node, ir, nkvh, gqa, hd, scale, pf.region_pages);
+        return mint_paged_fold(geom, node, ir, scale, pf.region_pages);
     }
     // ⛔ A RUNG ON A CHUNKED LADDER THAT IS NOT THE FOLD BODY still states the region: every
     // rung of the ladder places its step inputs identically (`ladder_stages_one_layout`), so
@@ -1811,10 +1983,8 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         let num_chunks = pages_per_seq.div_ceil(blocks_per_chunk);
         (
             batched_decode_spec(&BatchedDecodeFacts {
+                geom,
                 num_seqs,
-                nkvh,
-                gqa,
-                hd,
                 pages: cap,
                 page_slots,
                 blocks_per_chunk,
@@ -1843,7 +2013,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
             ));
         }
         // THE PAGES THE CHUNK ATTENDS: the prefix segment's rows plus the new block's —
-        // the graph's own regions, the same reading the old attn.py splice took — padded
+        // the graph's own regions, the same reading the old one-shot attention splice took — padded
         // to whole pages. The kernel's own static_assert carries the rest of the contract
         // (one full id stick per page-window trip: `NKVH*GQA == 32`).
         let prefix_len = node.inputs[1].region.rows.len;
@@ -1859,10 +2029,8 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         }
         (
             batched_prefill_spec(&BatchedPrefillFacts {
+                geom,
                 mq,
-                nkvh,
-                gqa,
-                hd,
                 pages,
                 page_slots,
                 region_pages,
@@ -1938,12 +2106,13 @@ fn attn_positional(
 
 /// The batched paged-decode kernel's facts — every one the node's own or a shared law,
 /// minted by [`lower_attn`] beside the law that derives each member, so this struct holds
-/// no derivation of its own.
-struct BatchedDecodeFacts {
+/// no derivation of its own. The geometry rides as the DOOR'S WITNESS (`AttnGeometry`
+/// const-generic over the head counts), never as bare `u32` head counts: the facts a
+/// kernel's constexprs state are the compiler's arithmetic past the geometry door.
+struct BatchedDecodeFacts<const NQH: u32, const NKVH: u32, const HD: u32> {
+    /// The head geometry as consts — the door's witness.
+    geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
     num_seqs: u32,
-    nkvh: u32,
-    gqa: u32,
-    hd: u32,
     pages: u32,
     page_slots: u32,
     blocks_per_chunk: u32,
@@ -1962,12 +2131,16 @@ struct BatchedDecodeFacts {
 /// stating Q's entry-order row repetition. The mask is ALWAYS consumed (the kernel
 /// loads it unconditionally in the chunk loop — the additive -65504 sentinel is what makes
 /// a padded page merge with weight zero), so the parameter is always in the signature.
-fn batched_decode_spec(f: &BatchedDecodeFacts) -> Result<KernelSpec, String> {
+///
+/// ⭐ THE GEOMETRY CONSTEXPRS ARE THE CONSTS, not copies of values: `NKVH`/`HD` are this
+/// function's own const generics and `GQA` is the witness's associated const, so a
+/// constexpr and the door's arm can never disagree about a head count.
+fn batched_decode_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
+    f: &BatchedDecodeFacts<NQH, NKVH, HD>,
+) -> Result<KernelSpec, String> {
     let BatchedDecodeFacts {
+        geom,
         num_seqs,
-        nkvh,
-        gqa,
-        hd,
         pages,
         page_slots,
         blocks_per_chunk,
@@ -2004,9 +2177,9 @@ fn batched_decode_spec(f: &BatchedDecodeFacts) -> Result<KernelSpec, String> {
         Ok(())
     };
     ce("NUM_SEQS", Val::Int(i128::from(num_seqs)))?;
-    ce("NKVH", Val::Int(i128::from(nkvh)))?;
-    ce("GQA", Val::Int(i128::from(gqa)))?;
-    ce("HD", Val::Int(i128::from(hd)))?;
+    ce("NKVH", Val::Int(i128::from(NKVH)))?;
+    ce("GQA", Val::Int(i128::from(geom.gqa())))?;
+    ce("HD", Val::Int(i128::from(HD)))?;
     ce("PAGE_SLOTS", Val::Int(i128::from(page_slots)))?;
     ce("PAGES", Val::Int(i128::from(pages)))?;
     ce("BLOCKS_PER_CHUNK", Val::Int(i128::from(blocks_per_chunk)))?;
@@ -2022,12 +2195,12 @@ fn batched_decode_spec(f: &BatchedDecodeFacts) -> Result<KernelSpec, String> {
 
 /// The batched prefill kernel's facts — every one the node's own or a shared law, minted by
 /// [`lower_attn`] beside the law that derives each member, so this struct holds no
-/// derivation of its own.
-struct BatchedPrefillFacts {
+/// derivation of its own. The geometry rides as the door's witness, never as bare `u32`
+/// head counts (the decode facts' own law).
+struct BatchedPrefillFacts<const NQH: u32, const NKVH: u32, const HD: u32> {
+    /// The head geometry as consts — the door's witness.
+    geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
     mq: u32,
-    nkvh: u32,
-    gqa: u32,
-    hd: u32,
     pages: u32,
     page_slots: u32,
     /// The page ceiling of the region the tables and mask STATE, when this rung sits on a
@@ -2049,12 +2222,12 @@ struct BatchedPrefillFacts {
 /// the host. The ids table is `*i32` and the mask always consumed. The kernel's own
 /// `static_assert` carries the one-stick-per-trip law (`NKVH*GQA == 32`), so
 /// a model class the form does not cover refuses at compile, in the kernel's own terms.
-fn batched_prefill_spec(f: &BatchedPrefillFacts) -> Result<KernelSpec, String> {
+fn batched_prefill_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
+    f: &BatchedPrefillFacts<NQH, NKVH, HD>,
+) -> Result<KernelSpec, String> {
     let BatchedPrefillFacts {
+        geom,
         mq,
-        nkvh,
-        gqa,
-        hd,
         pages,
         page_slots,
         region_pages,
@@ -2088,9 +2261,9 @@ fn batched_prefill_spec(f: &BatchedPrefillFacts) -> Result<KernelSpec, String> {
         Ok(())
     };
     ce("MQ", Val::Int(i128::from(mq)))?;
-    ce("NKVH", Val::Int(i128::from(nkvh)))?;
-    ce("GQA", Val::Int(i128::from(gqa)))?;
-    ce("HD", Val::Int(i128::from(hd)))?;
+    ce("NKVH", Val::Int(i128::from(NKVH)))?;
+    ce("GQA", Val::Int(i128::from(geom.gqa())))?;
+    ce("HD", Val::Int(i128::from(HD)))?;
     ce("PAGE_SLOTS", Val::Int(i128::from(page_slots)))?;
     ce("PAGES", Val::Int(i128::from(pages)))?;
     ce("REGION_PAGES", Val::Int(i128::from(region_pages)))?;
@@ -2120,12 +2293,12 @@ pub struct PagedFoldRung {
 
 /// The paged-fold family's facts — the fold body's own geometry, minted by
 /// [`mint_paged_fold`] beside the law that derives each member. The seed and finalize
-/// programs read the SUBSET of these their signatures state.
-struct PagedFoldFamilyFacts {
+/// programs read the SUBSET of these their signatures state. The geometry rides as the
+/// door's witness, never as bare `u32` head counts (the decode facts' own law).
+struct PagedFoldFamilyFacts<const NQH: u32, const NKVH: u32, const HD: u32> {
+    /// The head geometry as consts — the door's witness.
+    geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
     mq: u32,
-    nkvh: u32,
-    gqa: u32,
-    hd: u32,
     page_slots: u32,
     region_pages: u32,
     scale: f32,
@@ -2135,10 +2308,10 @@ struct PagedFoldFamilyFacts {
 /// carry's max, sum, accumulator), plus the geometry as constexprs. The carry's memory image
 /// is f16 throughout — the one-shot kernel's own legalized grading (the kernel's module doc
 /// states the law), so the fold is numerically identical to the body it replaces.
-fn paged_fold_seed_spec(f: &PagedFoldFamilyFacts) -> Result<KernelSpec, String> {
-    let PagedFoldFamilyFacts {
-        mq, nkvh, gqa, hd, ..
-    } = *f;
+fn paged_fold_seed_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
+    f: &PagedFoldFamilyFacts<NQH, NKVH, HD>,
+) -> Result<KernelSpec, String> {
+    let PagedFoldFamilyFacts { geom, mq, .. } = *f;
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
     for (p, ty) in [
@@ -2157,9 +2330,9 @@ fn paged_fold_seed_spec(f: &PagedFoldFamilyFacts) -> Result<KernelSpec, String> 
         Ok(())
     };
     ce("MQ", Val::Int(i128::from(mq)))?;
-    ce("NKVH", Val::Int(i128::from(nkvh)))?;
-    ce("GQA", Val::Int(i128::from(gqa)))?;
-    ce("HD", Val::Int(i128::from(hd)))?;
+    ce("NKVH", Val::Int(i128::from(NKVH)))?;
+    ce("GQA", Val::Int(i128::from(geom.gqa())))?;
+    ce("HD", Val::Int(i128::from(HD)))?;
     Ok(KernelSpec {
         kernel: "paged_fold_seed_hm".to_string(),
         signature,
@@ -2175,12 +2348,12 @@ fn paged_fold_seed_spec(f: &PagedFoldFamilyFacts) -> Result<KernelSpec, String> 
 /// prefill kernel's own — global stick-block entries, one per table row — and the per-pass
 /// shift the runtime applies rides the ACTIVATION segment, page-major, which is why the tables
 /// and the mask state the REGION and not the page.
-fn paged_fold_spec(f: &PagedFoldFamilyFacts) -> Result<KernelSpec, String> {
+fn paged_fold_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
+    f: &PagedFoldFamilyFacts<NQH, NKVH, HD>,
+) -> Result<KernelSpec, String> {
     let PagedFoldFamilyFacts {
+        geom,
         mq,
-        nkvh,
-        gqa,
-        hd,
         page_slots,
         region_pages,
         scale,
@@ -2209,9 +2382,9 @@ fn paged_fold_spec(f: &PagedFoldFamilyFacts) -> Result<KernelSpec, String> {
         Ok(())
     };
     ce("MQ", Val::Int(i128::from(mq)))?;
-    ce("NKVH", Val::Int(i128::from(nkvh)))?;
-    ce("GQA", Val::Int(i128::from(gqa)))?;
-    ce("HD", Val::Int(i128::from(hd)))?;
+    ce("NKVH", Val::Int(i128::from(NKVH)))?;
+    ce("GQA", Val::Int(i128::from(geom.gqa())))?;
+    ce("HD", Val::Int(i128::from(HD)))?;
     ce("PAGE_SLOTS", Val::Int(i128::from(page_slots)))?;
     ce("REGION_PAGES", Val::Int(i128::from(region_pages)))?;
     ce("SCALE", Val::Float(f64::from(scale)))?;
@@ -2228,10 +2401,10 @@ fn paged_fold_spec(f: &PagedFoldFamilyFacts) -> Result<KernelSpec, String> {
 /// so nothing reads it here — the signature states no `desc_m`, and an unused parameter is
 /// not merely dead weight: Triton may drop it from the compiled signature and break the
 /// parameter-count guard below.
-fn paged_fold_finalize_spec(f: &PagedFoldFamilyFacts) -> Result<KernelSpec, String> {
-    let PagedFoldFamilyFacts {
-        mq, nkvh, gqa, hd, ..
-    } = *f;
+fn paged_fold_finalize_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
+    f: &PagedFoldFamilyFacts<NQH, NKVH, HD>,
+) -> Result<KernelSpec, String> {
+    let PagedFoldFamilyFacts { geom, mq, .. } = *f;
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
     for (p, ty) in [
@@ -2250,9 +2423,9 @@ fn paged_fold_finalize_spec(f: &PagedFoldFamilyFacts) -> Result<KernelSpec, Stri
         Ok(())
     };
     ce("MQ", Val::Int(i128::from(mq)))?;
-    ce("NKVH", Val::Int(i128::from(nkvh)))?;
-    ce("GQA", Val::Int(i128::from(gqa)))?;
-    ce("HD", Val::Int(i128::from(hd)))?;
+    ce("NKVH", Val::Int(i128::from(NKVH)))?;
+    ce("GQA", Val::Int(i128::from(geom.gqa())))?;
+    ce("HD", Val::Int(i128::from(HD)))?;
     Ok(KernelSpec {
         kernel: "paged_fold_finalize_hm".to_string(),
         signature,
@@ -2273,12 +2446,15 @@ fn paged_fold_finalize_spec(f: &PagedFoldFamilyFacts) -> Result<KernelSpec, Stri
 /// seed and the finalize launch once per step, not once per page, so stamping a fold onto
 /// them would re-launch a seeding pass mid-accumulation and a normalize per page — the two
 /// defects the three-program split exists to prevent.
-fn mint_paged_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
+fn mint_paged_fold<
+    F: scratchy_subtile::subtile_ir::RopeForm,
+    const NQH: u32,
+    const NKVH: u32,
+    const HD: u32,
+>(
+    geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
-    nkvh: u32,
-    gqa: u32,
-    hd: u32,
     scale: f32,
     region_pages: u32,
 ) -> Result<Vec<EmittedOp>, String> {
@@ -2290,10 +2466,8 @@ fn mint_paged_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
     let mq = node.output.region.rows.len;
     let page_slots = ktir_superdsc::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
     let facts = PagedFoldFamilyFacts {
+        geom,
         mq,
-        nkvh,
-        gqa,
-        hd,
         page_slots,
         region_pages,
         scale,
@@ -2563,6 +2737,121 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// descriptor per operand plus the output), the constexprs (the node's facts as
 /// `tl.constexpr`s, the monomorphisation key), all in the case-table's own shape
 /// (`cases::spec`).
+/// The consumer that carries a rope node's `rope_fwd` spec across the head-dim door.
+struct RopeSpecAtTheDoor<'a, F: scratchy_subtile::subtile_ir::RopeForm> {
+    node: &'a SubtileNode<F>,
+    ir: &'a SubtileIR<F>,
+}
+
+impl<F: scratchy_subtile::subtile_ir::RopeForm> scratchy_subtile::model_geometry::OnHeadDim
+    for RopeSpecAtTheDoor<'_, F>
+{
+    type Out = Result<KernelSpec, String>;
+
+    fn on_head_dim<const HD: u32>(self) -> Self::Out {
+        rope_spec_at::<F, HD>(self.node, self.ir)
+    }
+}
+
+/// `rope.py`'s `rope_fwd` spec at a CONFIG-DECLARED head dim — the head width crosses
+/// [`scratchy_subtile::model_geometry::with_config_head_dim`] at the call site (the
+/// `kernel_spec` rope arm for a standalone `RopeRotate` row, or `lower_rope_append_at`
+/// directly for the append's rotation half), and `HEAD_DIM`/`HALF` bind the const generic
+/// the door hands down instead of the node's `head_dim` value: the model's head dim is a
+/// const, and this spec is one of its readers.
+fn rope_spec_at<F: scratchy_subtile::subtile_ir::RopeForm, const HD: u32>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+) -> Result<KernelSpec, String> {
+    let out = &node.output;
+    let total = out.region.cols.len;
+    // The door's contract, stated from the node's own facts: total = the output's
+    // declared width (`heads * hd`), heads = total / hd, mq = the output's rows —
+    // the same derivation `KtirFunc::rope`'s views state. The builder's own
+    // refusal (`total` not a whole number of `hd`-wide heads) is mirrored here
+    // as an `Err`: the node is malformed, and no kernel can state it.
+    if HD == 0 || !total.is_multiple_of(HD) {
+        return Err(format!(
+            "triton splice: rope t{}: {total} cols is not a whole number of \
+             {HD}-wide heads",
+            node.output.tensor.index()
+        ));
+    }
+    let heads = total / HD;
+    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+    let mut constexprs: HashMap<String, Val> = HashMap::new();
+    for p in ["desc_x", "desc_cos", "desc_sin", "desc_o"] {
+        signature.insert(
+            p.to_string(),
+            ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+        );
+    }
+    let mut ce = |k: &str, v: Val| -> Result<(), String> {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), v);
+        Ok(())
+    };
+    // ⭐ THE ROW WINDOW, THE PER-ROW ROPE LAW. The real front end's
+    // per-position decomposition mints rope nodes whose regions are ONE
+    // row's slice of the shared q plane — a row slice expressed by the
+    // ACCESS TILE's row corner (`R_START`), never by a taller view. The
+    // kernel therefore states `Y_TOTAL` (the x TENSOR's full re-tiled
+    // height `rows·H`, so the tile corners stay in bounds) and `R_START`
+    // (the window's row corner `ri·H`, baked into every load/store row);
+    // `MQ` is then the REGION's row count. A whole-region node states
+    // `R_START = 0`, `Y_TOTAL = MQ·H` — byte-identical to the one form
+    // this kernel used to state. ⛔ THE WINDOWING LAW, stated here because
+    // only this body reads the facts: all four regions share ONE row
+    // window, take WHOLE columns of `total`, and sit over tensors of ONE
+    // height (the single `Y_TOTAL` names all four views, and the
+    // head-replicated cos/sin reinterpretation is same-bytes only at that
+    // width).
+    let x = &node.inputs[0];
+    let window = (x.region.rows.start, x.region.rows.len);
+    let y_rows = ir.tensors[x.tensor.index()].rows;
+    for (tr, role) in [
+        (x, "the `x` view"),
+        (&node.inputs[1], "the `cos` view"),
+        (&node.inputs[2], "the `sin` view"),
+        (out, "the `out` view"),
+    ] {
+        let t_rows = ir.tensors[tr.tensor.index()].rows;
+        let shared = (tr.region.rows.start, tr.region.rows.len) == window;
+        let cols_whole = tr.region.cols.start == 0 && tr.region.cols.len == total;
+        if !shared || !cols_whole || t_rows != y_rows {
+            return Err(format!(
+                "triton splice: rope t{}: {role} states rows [{}, {}] × cols [{}, \
+                 {}] of a [{t_rows}, {}] tensor, but `x` states rows [{}, {}] over a \
+                 [{y_rows}, {total}] one — a rope's four regions must share ONE row \
+                 window and whole `total` columns over tensors of one height (the \
+                 single `Y_TOTAL` names all four views)",
+                node.output.tensor.index(),
+                tr.region.rows.start,
+                tr.region.rows.len,
+                tr.region.cols.start,
+                tr.region.cols.len,
+                ir.tensors[tr.tensor.index()].cols,
+                window.0,
+                window.1,
+            ));
+        }
+    }
+    let (r_start, mq_rows) = (window.0 * heads, window.1);
+    let y_total = y_rows * heads;
+    ce("H", Val::Int(i128::from(heads)))?;
+    ce("MQ", Val::Int(i128::from(mq_rows)))?;
+    ce("HEAD_DIM", Val::Int(i128::from(HD)))?;
+    ce("HALF", Val::Int(i128::from(HD / 2)))?;
+    ce("Y_TOTAL", Val::Int(i128::from(y_total)))?;
+    ce("R_START", Val::Int(i128::from(r_start)))?;
+    Ok(KernelSpec {
+        kernel: "rope_fwd".to_string(),
+        signature,
+        constexprs,
+        file: "rope.py".to_string(),
+    })
+}
+
 fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
@@ -2886,85 +3175,29 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             ce("SCALE", Val::Float(f64::from(*scale)))?;
         }
         (SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. }, "rope_fwd") => {
-            // The door's contract, stated from the node's own facts: total = the output's
-            // declared width (`heads * hd`), heads = total / hd, mq = the output's rows —
-            // the same derivation `KtirFunc::rope`'s views state. The builder's own
-            // refusal (`total` not a whole number of `hd`-wide heads) is mirrored here
-            // as an `Err`: the node is malformed, and no kernel can state it.
-            let hd = head_dim.get();
-            let total = c;
-            if hd == 0 || total % hd != 0 {
-                return Err(format!(
-                    "triton splice: rope t{}: {total} cols is not a whole number of \
-                     {hd}-wide heads",
-                    node.output.tensor.index()
-                ));
-            }
-            let heads = total / hd;
-            for p in ["desc_x", "desc_cos", "desc_sin", "desc_o"] {
-                signature.insert(
-                    p.to_string(),
-                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
-                );
-            }
-            let mut ce = |k: &str, v: Val| -> Result<(), String> {
-                signature.insert(k.to_string(), ArgSpec::Constexpr);
-                constexprs.insert(k.to_string(), v);
-                Ok(())
-            };
-            // ⭐ THE ROW WINDOW, THE PER-ROW ROPE LAW. The real front end's
-            // per-position decomposition mints rope nodes whose regions are ONE
-            // row's slice of the shared q plane — a row slice expressed by the
-            // ACCESS TILE's row corner (`R_START`), never by a taller view. The
-            // kernel therefore states `Y_TOTAL` (the x TENSOR's full re-tiled
-            // height `rows·H`, so the tile corners stay in bounds) and `R_START`
-            // (the window's row corner `ri·H`, baked into every load/store row);
-            // `MQ` is then the REGION's row count. A whole-region node states
-            // `R_START = 0`, `Y_TOTAL = MQ·H` — byte-identical to the one form
-            // this kernel used to state. ⛔ THE WINDOWING LAW, stated here because
-            // only this arm reads the facts: all four regions share ONE row
-            // window, take WHOLE columns of `total`, and sit over tensors of ONE
-            // height (the single `Y_TOTAL` names all four views, and the
-            // head-replicated cos/sin reinterpretation is same-bytes only at that
-            // width).
-            let x = &node.inputs[0];
-            let window = (x.region.rows.start, x.region.rows.len);
-            let y_rows = ir.tensors[x.tensor.index()].rows;
-            for (tr, role) in [
-                (x, "the `x` view"),
-                (&node.inputs[1], "the `cos` view"),
-                (&node.inputs[2], "the `sin` view"),
-                (out, "the `out` view"),
-            ] {
-                let t_rows = ir.tensors[tr.tensor.index()].rows;
-                let shared = (tr.region.rows.start, tr.region.rows.len) == window;
-                let cols_whole = tr.region.cols.start == 0 && tr.region.cols.len == total;
-                if !shared || !cols_whole || t_rows != y_rows {
+            // ⭐ THE HEAD DIM IS A CONST: the arm crosses the config-declared head-dim door
+            // — the same door `lower_rope_append_at` crosses for the whole node — and
+            // [`rope_spec_at`] binds `HEAD_DIM`/`HALF` off the const generic it hands
+            // down. `None` is a head width no config declares: refused loudly, naming the
+            // configs read; the fix is the `config.json` that names this model, never an
+            // edit here.
+            match scratchy_subtile::model_geometry::with_config_head_dim(
+                *head_dim,
+                RopeSpecAtTheDoor { node, ir },
+            ) {
+                Some(spec) => return spec,
+                None => {
                     return Err(format!(
-                        "triton splice: rope t{}: {role} states rows [{}, {}] × cols [{}, \
-                         {}] of a [{t_rows}, {}] tensor, but `x` states rows [{}, {}] over a \
-                         [{y_rows}, {total}] one — a rope's four regions must share ONE row \
-                         window and whole `total` columns over tensors of one height (the \
-                         single `Y_TOTAL` names all four views)",
+                        "triton splice: rope t{} states head dim {} — no config declares that \
+                         head width ({}); the model's head dims are const generics crossed at \
+                         this door, so the fix is the config that names this model, never an \
+                         edit here",
                         node.output.tensor.index(),
-                        tr.region.rows.start,
-                        tr.region.rows.len,
-                        tr.region.cols.start,
-                        tr.region.cols.len,
-                        ir.tensors[tr.tensor.index()].cols,
-                        window.0,
-                        window.1,
+                        head_dim.get(),
+                        scratchy_subtile::model_geometry::geometry_sources(),
                     ));
                 }
             }
-            let (r_start, mq_rows) = (window.0 * heads, window.1);
-            let y_total = y_rows * heads;
-            ce("H", Val::Int(i128::from(heads)))?;
-            ce("MQ", Val::Int(i128::from(mq_rows)))?;
-            ce("HEAD_DIM", Val::Int(i128::from(hd)))?;
-            ce("HALF", Val::Int(i128::from(hd / 2)))?;
-            ce("Y_TOTAL", Val::Int(i128::from(y_total)))?;
-            ce("R_START", Val::Int(i128::from(r_start)))?;
         }
         (SubOp::TanhSoftCap { cap }, "tanhsoftcap_fwd") => {
             // The kernel's own parameter spellings: desc_x, desc_o, then the constexprs

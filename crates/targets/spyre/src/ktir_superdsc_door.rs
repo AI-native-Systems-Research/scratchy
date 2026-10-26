@@ -20,17 +20,17 @@
 //! whole-function walk (`lower_function`) — the same per-op path `Program::Matmul` and the
 //! pointwise kinds take, and the card-proven path for the batched attention kernels (what the
 //! drivers and `bake_py` reach through `emit_whole`). The hand-built `attn()` door this module
-//! once carried minted `AttnGeometry` off the views attn.py writes, so any attention program with
-//! different views was misread through them (granite-2b's build stop: the page-slot axis read as
-//! kv heads) — it is deleted, with its `AttnAt` carrier.
+//! once carried minted `AttnGeometry` off the views the old hand-written attention kernel wrote,
+//! so any attention program with different views was misread through them (granite-2b's build
+//! stop: the page-slot axis read as kv heads) — it is deleted, with its `AttnAt` carrier.
 //!
 //! ⭐⭐ AND THAT IS ALSO WHY THE MODEL'S AND THE BUNDLE'S OWN FACTS LIVE HERE. [`BundleAttnParams`] is
 //! `ibm/main`'s `lower_one_node` parameter set for the attention path — the head geometry and the
 //! attention multiplier off `SubOp::AttnDecode`, the swept rung and the row kind off the walk — and it
-//! is an ARGUMENT of [`lower`], not a record on the program. `AttnFacts` was that record, and it let
-//! the emulator (which executes the ops) and the card (which read the record) compute different
-//! attention; the leaf crate now reads the six operand identities and the resident capacity out of the
-//! program itself (`attn_operands`) and takes these four from whoever crossed the door.
+//! is an ARGUMENT of [`lower`], not a record on the program. A sidecar record (`AttnFacts`, deleted
+//! with the hand-written attention) was that record, and it let the emulator (which executes the ops)
+//! and the card (which read the record) compute different attention; the live kernels state every
+//! fact in the program itself, and these four come from whoever crossed the door.
 //!
 //! ⛔ THE NEWTYPE BELOW IS THE ORPHAN RULE, NOT A DESIGN. `OnHeadDim` is
 //! `scratchy-subtile`'s trait and `RopeAt` is `ktir-superdsc`'s struct — neither is
@@ -62,8 +62,9 @@ use ktir_superdsc::score_scale::{NewK, PoolKLaw, ScoreScaleLaw};
 /// ⛔ THIS IS NOT A RECORD ON THE PROGRAM, AND THE DIFFERENCE IS THE WHOLE POINT. `AttnFacts` hung
 /// eleven fields off [`KtirNode`], so information flowed `SubtileIR → AttnFacts → SuperDSC` past the
 /// IR: a third-party producer could not fill it, and the emulator (which runs the ops) and the card
-/// (which read the record) were not obliged to agree. Seven of those eleven are now read out of the
-/// program by `attn_operands`; these four are ARGUMENTS of the call, one value per bundle, supplied by
+/// (which read the record) were not obliged to agree. Seven of those eleven were read out of the
+/// program by `attn_operands` (deleted with the hand-written attention); these four are ARGUMENTS of
+/// the call, one value per bundle, supplied by
 /// the caller on THIS side of the geometry door — which is where model and bundle facts legitimately
 /// live (see the module header). A Triton producer's caller states its own, from its own configs.
 ///
@@ -244,7 +245,7 @@ pub fn lower(
         Program::LmLast => lower_function(k, layout, sym_id_base, None),
         Program::Rope => rope(name, &r, sym_id_base, layout, attn_params),
         // ⭐ THE APPEND FORM'S WRITE HALF — the recipe, main's mechanism wholesale
-        // ([`lk::kv_cache_write`], re-homed from `attn_at` to the rope's arm — the node
+        // ([`lk::kv_cache_write`], re-homed from the deleted attention door to the rope's arm — the node
         // whose contract carries the cache destinations). Keyed on the TYPED contract
         // ([`Program::RopeAppend`] — the arity-6 cache-writing carrier), never on
         // recognising a rope's op chain. The rotation half is the `Program::Rope` arm
@@ -254,9 +255,10 @@ pub fn lower(
         // attention kernels is the same per-op walk `Program::Matmul`/`Program::Elementwise` take
         // (`whole_function::lower_function` — exactly what the drivers and bake_py reach through
         // `emit_whole`): the walk reads the program's own ops, so a kernel whose views are not
-        // attn.py's lowers by what it states instead of being misread through attn.py's geometry.
-        // The hand-built `attn()` door this arm used to call minted `AttnGeometry` off the views
-        // attn.py writes, so any other attention program was misread (granite-2b's build stop:
+        // the old hand-written kernel's lowers by what it states instead of being misread through
+        // its geometry. The hand-built `attn()` door this arm used to call minted `AttnGeometry`
+        // off the views that kernel wrote, so any other attention program was misread (granite-2b's
+        // build stop:
         // the page-slot axis read as kv heads) — deleted with its `AttnAt` carrier.
         //
         // ⭐⭐⭐ AND THE SCORE-SCALE LAW IS CROSS-CHECKED HERE — the read side of the pool law the
@@ -476,7 +478,7 @@ fn rope(
 /// The ruling (wall 22): the rotation is `Program::Rope`'s own door (`fn rope` → `rope_at`,
 /// the card-proven P-table matmul — minted as the node's FIRST program by the splice), and
 /// THIS arm lowers the node's WRITE half through [`lk::kv_cache_write`] — main's own
-/// recipe, re-homed from the attention's door arm (`attn_at`, deleted when attention became
+/// recipe, re-homed from the attention's door arm (deleted when attention became
 /// a kernel) to the rope arm, the node whose contract carries the cache destinations.
 ///
 /// ⛔ THE RECIPE CALL LIVES IN THE WALK, NEVER IN THE SPLICE — the wall-21 rejection stands
@@ -492,10 +494,10 @@ fn rope(
 /// `kv_request`, `kv_part`, the slot stride), which is what latches the bundle
 /// paged — the carrier program carries NO stamps.
 ///
-/// HONESTY NOTE, the re-home's own: main's call site was `attn_at` (the attention's door
-/// arm); the branch re-homes it here because the rope node is now the only legal owner of
+/// HONESTY NOTE, the re-home's own: main's call site was the attention's door arm (deleted);
+/// the branch re-homes it here because the rope node is now the only legal owner of
 /// the write — the attention is a kernel and cannot lower another node's cache contract.
-/// `assemble_attn`'s live call stays byte-identical (it passes `row_start: 0`, main's own
+/// The recipe call stays byte-identical (it passes `row_start: 0`, main's own
 /// whole-plane form).
 fn rope_append(
     name: &str,
@@ -565,7 +567,7 @@ fn rope_append(
         ));
     }
     // ⭐ THE WINDOW, off the program's own x view — the recipe's request geometry, fed from
-    // the ROPE node's rows (the same facts `attn_at` passed main): the cover states the
+    // the ROPE node's rows (the same facts main's attention door passed): the cover states the
     // window the node owns, `(row_start, row_start + mq)`.
     let (row_start, row_end) = r[0].r_cover;
     let mq = row_end.saturating_sub(row_start);
@@ -601,7 +603,7 @@ fn rope_append(
         ),
     })?;
     let t = node_out.get();
-    // ⭐ THE IDENTITY CLASS TID — the same registry read `assemble_attn` makes (refusing a
+    // ⭐ THE IDENTITY CLASS TID — the same registry read the old attention door made (refusing a
     // desync by name, its own law): the cachewr copies contract against the `[64, 64]`
     // identity of this head dim's attention class.
     let ident = layout

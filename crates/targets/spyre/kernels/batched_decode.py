@@ -6,8 +6,8 @@ attention/ops/batched_decode_head_major.py`), stated in Triton over the access
 forms this ladder lowers: descriptor windows and index-table block gathers.
 NO masked pointer loads anywhere.
 
-The contract (the module doc of `attn.py` states the shared laws; this file
-follows them):
+The contract (the shared paged-pool laws, stated here and followed by
+`batched_prefill.py`):
 
   * ONE program, grid `[1, 1]` — every sequence in one kernel. All descriptor
     corners are compile-time constants (the chunk and window loops are
@@ -34,7 +34,7 @@ follows them):
   * The scale rides log2(e) as an immediate multiply on the dot's result, so
     the softmax is `exp2` end to end (the flash fixtures' own law).
   * The mask is staged at the SCORE TILE'S OWN ROWS — pre-replicated xGQA on
-    the host (attn.py's own law), one row per (entry, kv head, gqa) group of
+    the host, one row per (entry, kv head, gqa) group of
     64 lanes per window trip — so the add is a pure flat reshape and an
     elementwise add. No broadcast.
 

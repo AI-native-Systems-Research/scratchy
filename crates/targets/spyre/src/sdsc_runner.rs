@@ -420,16 +420,11 @@ impl SuperDscSession {
         &self,
         pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
     ) -> Option<scratchy_subtile::sdsc_abstract::GatherEntryCeiling> {
-        let page_bytes = self.exec.kv_page_stride_bytes();
-        // The DEVICE page ceiling — the most pages one flex region of KV holds, the same ceiling
-        // the bake's prefix mask reserves blocks for. A page stride of 0 is an unpaged bundle;
-        // the 0 page ceiling hands it to the door, which refuses it.
-        let page_ceiling = if page_bytes == 0 {
-            0
-        } else {
-            scratchy_spyre_bundle::MAX_SEGMENT_BYTES / page_bytes
-        };
-        scratchy_subtile::sdsc_abstract::gather_entry_ceiling(page_ceiling, page_bytes, pool)
+        // ⭐ ONE LAW, TWO SESSIONS: this hands the session's own `page_stride_bytes` to the
+        // shared spelling in `attn_step_staging` — the same function the numeric gate passes
+        // the rolled layout's stride through — so the card's stage-time bound and the gate's
+        // are one function, not two derivations kept in agreement.
+        crate::attn_step_staging::gather_entry_ceiling_for(self.exec.kv_page_stride_bytes(), pool)
     }
 
     // ⛔ THERE IS NO SECOND FACTOR HERE ANY MORE. `gather_planes_per_page` returned a page-per-PLANE

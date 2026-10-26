@@ -252,7 +252,7 @@ pub(crate) fn run_prefill_batch(
         }
     };
     // Triu causal cmask [mq, mq_pad]: additive 0 where col ≤ row (valid), mask_neg else. ALWAYS
-    // flat/row-major (element (i,j) at i*mq_pad+j): the emitter (attn.rs, assemble_attn_block) reads
+    // flat/row-major (element (i,j) at i*mq_pad+j): the deleted hand-written emitter read
     // this via In::sliced on a Stk<FlatTag> handle, and FlatTag's addressing is row-major
     // (sdsc_abstract.rs: StickKind::Flat => Addressing::RowMajor), never stick-scattered. The old
     // stick-major staging here was byte-identical to row-major ONLY because mq_pad<=64 (one stick) in
@@ -929,54 +929,39 @@ fn chunk_index_table(
     })
 }
 
-/// ⭐⭐⭐ WHOSE ROWS THE LAUNCH RUNS — the one fact that picks the staged FORM of the attention
-/// family's step inputs, because the form is the KERNEL's, and `rows_are_requests` (the routing
-/// bit that chose the kernel at the splice) is exactly this. A partial overlap is not
-/// expressible: a chunk's rows are token rows and a batch's are request rows, and staging one
-/// kernel's layout for the other reads real block numbers from the wrong form — silently.
+/// ⭐⭐⭐ WHOSE ROWS THE LAUNCH RUNS — re-exported from the shared staging law
+/// ([`scratchy_target_spyre::attn_step_staging`]): the enum is part of the ONE builder both
+/// runtimes stage through, so it lives where the builder does, not beside the card's fill.
 #[cfg(feature = "spyre-hw")]
-pub(crate) enum AttnStepRows<'a> {
-    /// Consecutive positions of ONE sequence: a prompt chunk (the one-shot kernel, or the
-    /// chunked ladder's fold), or the solo decode's single row (the fold at `mq == 1`). Both
-    /// bodies read the SAME region form — the padded pitch convergence law — so one arm stages
-    /// both. `start`/`real` are the chunk's own facts (`real == 1` is the decode row), and `map`
-    /// is the sequence's logical→physical page map, the very map the launch installed. `real`
-    /// is [`std::num::NonZeroU32`] because the fold's seed-safety law — window (0, 0) always
-    /// holds a
-    /// valid lane for every query row, so the carry's −65504 seed never meets an all-masked
-    /// first window — is a THEOREM of `real ≥ 1` and `start ≥ 0`, not a runtime check (see
-    /// `ValidityMask`'s law in sdsc_abstract).
-    Chunk {
-        rows: scratchy_subtile::sdsc_abstract::ChunkRows,
-        mq: scratchy_subtile::sdsc_abstract::RungWidth,
-        start: usize,
-        real: std::num::NonZeroU32,
-        map: Vec<i64>,
-    },
-    /// Separate requests: a decode batch (`batched_decode_hm`), whose rows are the rung's launch
-    /// slots — padding rows replicate live 0, maps and histories included. `maps` is the slot map's
-    /// own per-row map list; `write` is the batch's ONE shared write slot, where every row's new
-    /// key lands this step.
-    Batch {
-        rows: scratchy_subtile::sdsc_abstract::LaunchRows<'a>,
-        maps: &'a [Vec<i64>],
-        write: scratchy_subtile::sdsc_abstract::BatchSlot,
-    },
-}
+pub(crate) use scratchy_target_spyre::attn_step_staging::AttnStepRows;
 
 #[cfg(feature = "spyre-hw")]
 /// ⭐⭐⭐⭐⭐ FILL THE ATTENTION FAMILY'S HOST-STAGED STEP INPUTS — the worker's half of the
 /// contract `attn_step_slots` spells. ONE helper, ONE spelling: the prompt chunk, the solo
 /// decode and the decode batch all stage through the session's `fill_step_input` door, slots
-/// named from the contract's table, content computed by the shared builders in the KERNELS'
-/// read orders — never re-laid at a site.
+/// named from the contract's table, CONTENT computed by the shared builder in
+/// [`scratchy_target_spyre::attn_step_staging`] — the same function the bake-time numeric
+/// gate stages through, so the gate judges byte-identically what the card runs. This side is
+/// the SESSION half only: query the discovery table, hand the extents and the ceiling to the
+/// builder, fill what it returns, in the same order the card always filled.
+///
+/// ⭐ THE GEOMETRY CROSSES THE MODEL-GEOMETRY DOOR. The builder is const-generic over the
+/// witness, so this fill mints the [`ModelAttnGeometry`] from the facts it holds — the wiring's
+/// head count over the pool's kv geometry — and crosses `with_config_attn_geometry` into the
+/// const arm. The mint is the pipeline's ONE evaluation of the GQA division (a `None` is the
+/// wiring/pool disagreement the old inline division refused, same text); the door's `None` is
+/// the generated contract (no config in scope declares this triple). The pool the builder
+/// derives comes from the witness, so the value and the consts cannot disagree. ⚠ The mint's
+/// INPUTS are the worker-side re-derivations item 1 replaces next (bake-emitted geometry
+/// facts); the mint itself stays — it is the value side of the door, not a second division.
 ///
 /// ⭐ QUERY, THEN FILL. The bundle's own baked discovery table says which slots exist; this
 /// asks it (through `step_input_extent`, the artifact's own answer) and fills exactly what it
-/// declares. A bundle that declares NONE is a bundle no spliced program stated inputs for, so
-/// the fill is a quiet no-op — but a PARTIAL declaration is a bake/host disagreement and
-/// refuses, because an unstaged id table reads as block 0 (a REAL address) and an unstaged mask
-/// reads as zero (NO masking), both fluently wrong.
+/// declares — all of them, or a refusal: on this branch every attention program is one of the
+/// three spliced kernels and all of them declare the step inputs, so a bundle that runs
+/// attention while declaring NONE (or a PARTIAL set) is a bake/host disagreement the builder
+/// refuses, because an unstaged id table reads as block 0 (a REAL address) and an unstaged
+/// mask reads as zero (NO masking), both fluently wrong.
 ///
 /// ⛔ THE DEAD `KV_BLOCK_INDEX_TID` BIND IS KEPT ON PURPOSE in this commit: the door-era index
 /// tables still flow to it while the spliced fills prove themselves on card. Deleting that bind
@@ -988,218 +973,88 @@ pub(crate) fn fill_attn_step_inputs(
     nqh: u32,
     rows: AttnStepRows<'_>,
 ) -> ExecutorResult<()> {
-    use scratchy_subtile::sdsc_abstract as sd;
-    use scratchy_subtile::sdsc_abstract::attn_step_slots;
-    // ⭐ THE GEOMETRY'S ONE DERIVATION ON THIS SIDE: `gqa = nqh / nkvh` — the wiring's head count
-    // over the pool's, the fact `PagedKvPool` cannot state alone. A quotient of zero or a
-    // non-divisor is a wiring/pool disagreement about the model, not a default to spell.
-    let nkvh = pool.nkvh().max(1);
-    let gqa = std::num::NonZeroU32::new(nqh / nkvh)
-        .filter(|_| nqh % nkvh == 0)
-        .ok_or_else(|| {
-            werr(format!(
-                "{what}: nqh {nqh} does not cover the pool's {nkvh} kv head(s) in whole GQA \
-                 groups — the wiring and the pool disagree about the model's geometry"
-            ))
-        })?;
-    // Query the discovery table first: extents are the artifact's own answers, and the door's
-    // `==` law re-measures every one of them at fill time.
-    let mask_ext = session.step_input_extent(attn_step_slots::MASK);
-    let kt_ext = session.step_input_extent(attn_step_slots::KT_BLOCK_IDS);
-    let v_ext = session.step_input_extent(attn_step_slots::V_BLOCK_IDS);
-    let rep_ext = session.step_input_extent(attn_step_slots::REP_ROW_IDS);
-    let fill = |session: &mut SuperDscSession, slot: u32, bytes: Vec<u8>| {
-        session
-            .fill_step_input(slot, bytes)
-            .map_err(|e| werr(format!("{what}: fill step input slot {slot}: {e}")))
-    };
-    // One id table's bytes, LE u32 per entry — the RawU32 channel's own wire form.
-    let encode = |t: &[sd::GatherEntry]| {
-        t.iter()
-            .flat_map(|e| e.as_i32().to_le_bytes())
-            .collect::<Vec<u8>>()
-    };
-    match rows {
-        AttnStepRows::Chunk {
+    use scratchy_subtile::model_geometry::{self, HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
+    // THE MINT — the one evaluation of the GQA division, from the facts this fill holds.
+    let geometry = ModelAttnGeometry::mint(
+        QueryHeads::new(nqh),
+        KvHeads::new(pool.nkvh()),
+        HeadDim::new(pool.hd()),
+    )
+    .ok_or_else(|| {
+        werr(format!(
+            "{what}: nqh {nqh} does not cover the pool's {} kv head(s) in whole GQA groups — \
+             the wiring and the pool disagree about the model's geometry",
+            pool.nkvh()
+        ))
+    })?;
+    model_geometry::with_config_attn_geometry(
+        geometry,
+        FillAtTheGeometry {
+            what,
+            session,
             rows,
-            mq,
-            start,
-            real,
-            map,
-        } => {
-            match (mask_ext, kt_ext, v_ext, rep_ext) {
-                (None, None, None, None) => return Ok(()),
-                (Some(_), Some(_), Some(_), None) => {}
-                (_, _, _, Some(_)) => {
-                    return Err(werr(format!(
-                        "{what}: this bundle declares a REPETITION table (slot {}) but the \
-                         launch's rows are consecutive positions of ONE sequence — the bake and \
-                         the host disagree about which body runs",
-                        attn_step_slots::REP_ROW_IDS
-                    )));
-                }
-                _ => {
-                    return Err(werr(format!(
-                        "{what}: this bundle declares a PARTIAL set of attention step inputs — \
-                         the three-slot form is all-or-nothing, and an unstaged one reads as \
-                         block 0 (ids) or no mask (mask), both fluently wrong"
-                    )));
-                }
-            }
-            let region =
-                sd::SplicedAttnRegion::of_mask_extent(mask_ext.unwrap_or(0), pool, gqa, mq)
-                    .ok_or_else(|| {
-                        werr(format!(
-                            "{what}: the mask slot's placement extent {} B is not a whole number \
-                             of page blocks at this geometry (mq {}, pool nkvh {} hd {}) — the \
-                             bake and the host disagree about the region",
-                            mask_ext.unwrap_or(0),
-                            mq.count(),
-                            pool.nkvh(),
-                            pool.hd()
-                        ))
-                    })?;
-            let ceiling = session.gather_entry_ceiling(pool).ok_or_else(|| {
-                werr(format!(
-                    "{what}: this bundle's attention gathers, but a physical page is not a whole \
-                     number of STICK BLOCKS — no integer index can name a page boundary"
-                ))
-            })?;
-            // ⭐ THE THREE STEP INPUTS, MINTED BY ONE WALK of the region — id tables and validity
-            // mask as fields of ONE value (`chunk_step_inputs`), so a staging that wanted the
-            // tables of one region and the mask of another has no spelling. The refusal is one
-            // door naming the whole family's failure classes.
-            let inputs = region
-                .chunk_step_inputs(&map, rows, start, real, ceiling)
-                .ok_or_else(|| {
-                    werr(format!(
-                        "{what}: could not build the chunk family's step inputs from this \
-                         sequence's page map and chunk — an empty map, an entry past the pool's \
-                         ceiling (never a zero table: zero is block 0, a REAL address), or real \
-                         {} row(s) against the rung's {} row(s) is not a chunk this region states",
-                        real.get(),
-                        mq.count()
-                    ))
-                })?;
-            // ⭐ THE SEED-SAFETY READING, AT THE DOOR THAT HOLDS THE MINTED COUNTS. The mask's
-            // valid-lane counts were minted by the same loop that wrote the bytes staged below,
-            // and the chunk family's law — window (0, 0) holds a valid lane for every query row,
-            // a theorem of `real ≥ 1` and `start ≥ 0` — is READ here rather than trusted,
-            // because the failure it names is silent and later than any check: an all-masked
-            // first window read while the carry's max still sits at the −65504 seed gives
-            // `p = e^0 = 1` per lane — `l += 64`, the mask doing nothing. The refusal is a
-            // desync guard (this chunk's rows/start/real against the region), not a check a
-            // legal launch can trip, and it fires before any slot is staged.
-            inputs
-                .mask()
-                .first_window_valid_keys(mq.rows())
-                .filter(|v| v.get() > 0)
-                .ok_or_else(|| {
-                    werr(format!(
-                        "{what}: the chunk's first window holds no valid lane for every query \
-                         row — the seed-safety theorem (real ≥ 1, start ≥ 0 ⇒ slot 0 valid) is \
-                         broken by this chunk's rows/start/real against the region, and staging \
-                         the mask would let the fold's l count lanes the mask meant to silence"
-                    ))
-                })?;
-            fill(
-                session,
-                attn_step_slots::KT_BLOCK_IDS,
-                encode(inputs.kt_entries()),
-            )?;
-            fill(
-                session,
-                attn_step_slots::V_BLOCK_IDS,
-                encode(inputs.v_entries()),
-            )?;
-            fill(
-                session,
-                attn_step_slots::MASK,
-                inputs.mask().wire_bytes().to_vec(),
-            )?;
+        },
+    )
+    .ok_or_else(|| {
+        werr(format!(
+            "{what}: geometry {geometry} is declared by no model config in scope ({}) — the fix \
+             is the config naming this model, never an edit to the fill",
+            model_geometry::geometry_sources()
+        ))
+    })?
+}
+
+/// The fill's body at the geometry the configs declare — the consumer side of the door.
+#[cfg(feature = "spyre-hw")]
+struct FillAtTheGeometry<'a, 'b> {
+    what: &'a str,
+    session: &'a mut SuperDscSession,
+    rows: AttnStepRows<'b>,
+}
+
+#[cfg(feature = "spyre-hw")]
+impl scratchy_subtile::model_geometry::OnAttnGeometry for FillAtTheGeometry<'_, '_> {
+    type Out = ExecutorResult<()>;
+
+    fn on_geometry<const NQH: u32, const NKVH: u32, const HD: u32>(
+        self,
+        geom: scratchy_subtile::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    ) -> Self::Out {
+        use scratchy_subtile::sdsc_abstract::attn_step_slots;
+        use scratchy_target_spyre::attn_step_staging::{self, AttnStepExtents};
+        // The pool the witness states — the same facts the mint read, now as the consts' own.
+        let pool = scratchy_subtile::sdsc_abstract::PagedKvPool::of_geometry(geom);
+        let what = self.what;
+        // Query the discovery table first: extents are the artifact's own answers, and the
+        // door's `==` law re-measures every one of them at fill time.
+        let extents = AttnStepExtents {
+            mask: self.session.step_input_extent(attn_step_slots::MASK),
+            kt: self
+                .session
+                .step_input_extent(attn_step_slots::KT_BLOCK_IDS),
+            v: self.session.step_input_extent(attn_step_slots::V_BLOCK_IDS),
+            rep: self.session.step_input_extent(attn_step_slots::REP_ROW_IDS),
+        };
+        // The ceiling from the session's own page stride — the ONE law, handed the card's
+        // number (`gather_entry_ceiling` delegates to the same shared spelling the gate uses).
+        let ceiling = self.session.gather_entry_ceiling(pool);
+        // The pure construction — every refusal is the builder's own text, unchanged.
+        let p = attn_step_staging::build_attn_step_inputs(geom, what, &extents, ceiling, self.rows)
+            .map_err(werr)?;
+        let fill = |session: &mut SuperDscSession, slot: u32, bytes: Vec<u8>| {
+            session
+                .fill_step_input(slot, bytes)
+                .map_err(|e| werr(format!("{what}: fill step input slot {slot}: {e}")))
+        };
+        let session = self.session;
+        fill(&mut *session, attn_step_slots::KT_BLOCK_IDS, p.kt)?;
+        fill(&mut *session, attn_step_slots::V_BLOCK_IDS, p.v)?;
+        if let Some(rep) = p.rep {
+            fill(&mut *session, attn_step_slots::REP_ROW_IDS, rep)?;
         }
-        AttnStepRows::Batch { rows, maps, write } => {
-            if let (None, None, None, None) = (mask_ext, kt_ext, v_ext, rep_ext) {
-                return Ok(());
-            }
-            if mask_ext.is_none() || kt_ext.is_none() || v_ext.is_none() || rep_ext.is_none() {
-                return Err(werr(format!(
-                    "{what}: this bundle declares a PARTIAL set of attention step inputs — the \
-                     four-slot batch form is all-or-nothing, and an unstaged one reads as block 0 \
-                     (ids), a gathered Q row 0 (repetition), or no mask (mask)"
-                )));
-            }
-            let num_seqs = rows.width().rows();
-            let batch =
-                sd::SplicedDecodeBatch::of_ids_extent(kt_ext.unwrap_or(0), pool, gqa, num_seqs)
-                    .ok_or_else(|| {
-                        werr(format!(
-                            "{what}: the ids slot's placement extent {} B is not a whole number \
-                             of chunk tables at {} launch row(s) — the bake and the host disagree \
-                             about the batch chunking",
-                            kt_ext.unwrap_or(0),
-                            num_seqs.get()
-                        ))
-                    })?;
-            let ceiling = session.gather_entry_ceiling(pool).ok_or_else(|| {
-                werr(format!(
-                    "{what}: this bundle's attention gathers, but a physical page is not a whole \
-                     number of STICK BLOCKS — no integer index can name a page boundary"
-                ))
-            })?;
-            let kt = sd::spliced_decode_ids_table(batch, maps, ceiling).ok_or_else(|| {
-                werr(format!(
-                    "{what}: could not build the batch's block-entry table from {} installed \
-                     page map(s) — not one map per launch row, an empty map, or an entry past \
-                     int32 (never a zero table: zero is block 0, a REAL address)",
-                    maps.len()
-                ))
-            })?;
-            let v = sd::spliced_decode_ids_table(batch, maps, ceiling).ok_or_else(|| {
-                werr(format!(
-                    "{what}: could not build the batch's V-plane block-entry table — same law, \
-                     same refusal, the V plane's own slot"
-                ))
-            })?;
-            let rep = sd::spliced_decode_rep_ids(batch);
-            let mask = sd::spliced_decode_mask_f16(batch, &rows.mask_histories(), write)
-                .ok_or_else(|| {
-                    werr(format!(
-                        "{what}: could not build the batch's pre-replicated validity mask — not \
-                         one history per launch row"
-                    ))
-                })?;
-            // ⭐ THE SAME READING, IN THE BATCH FAMILY'S OWN SHAPE. The pre-replicated mask's
-            // first `ktb · gqa` rows are chunk 0, window 0 — EVERY sequence's first folded
-            // window — and a decode sequence's history owns its first token at logical slot 0,
-            // so the least count there is ≥ 1 for every legal batch. An empty first window for
-            // ANY sequence is an upstream desync (a request that never prefilled), refused
-            // here before any slot is staged: staged, it would silently add `e^0 = 1` per
-            // masked lane of that sequence's rows to their l while the carry's max still sits
-            // at the −65504 seed.
-            mask.first_window_valid_keys(batch.first_window_rows())
-                .filter(|v| v.get() > 0)
-                .ok_or_else(|| {
-                    werr(format!(
-                        "{what}: a sequence of this batch holds no valid lane in its first \
-                         folded window — every decode sequence's history owns logical slot 0, so \
-                         an empty first window is a request that never prefilled, and staging the \
-                         mask would let that sequence's l count lanes the mask meant to silence"
-                    ))
-                })?;
-            fill(session, attn_step_slots::KT_BLOCK_IDS, encode(&kt))?;
-            fill(session, attn_step_slots::V_BLOCK_IDS, encode(&v))?;
-            fill(
-                session,
-                attn_step_slots::REP_ROW_IDS,
-                rep.iter()
-                    .flat_map(|&r| r.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-            )?;
-            fill(session, attn_step_slots::MASK, mask.wire_bytes().to_vec())?;
-        }
+        fill(&mut *session, attn_step_slots::MASK, p.mask)?;
+        Ok(())
     }
-    Ok(())
 }
 
 /// ⭐ WHAT ONE CHUNK'S FORWARD PRODUCED — the per-row logits the host sampler

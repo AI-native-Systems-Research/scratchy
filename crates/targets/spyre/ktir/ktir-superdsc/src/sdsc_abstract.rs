@@ -702,7 +702,7 @@ impl PaddedMq {
 ///
 /// [`crate::addr::Shape`] is the ADDRESS-side face of the same facts (it hands out nests; its
 /// fourth parameter is the KV capacity, which today still reaches the emitter as a value); this
-/// type is the EMITTER-side carrier that travels through `assemble_attn`'s signature.
+/// type is the EMITTER-side carrier that crosses the door with the model's head geometry.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct AttnGeometry<const NQH: u32, const NKVH: u32, const HD: u32>(());
 
@@ -763,6 +763,18 @@ impl<const NQH: u32, const NKVH: u32, const HD: u32> AttnGeometry<NQH, NKVH, HD>
     /// [`NQH_NZ`](Self::NQH_NZ) as a method, for call sites holding the value.
     pub const fn nqh_nz(self) -> NonZeroU32 {
         Self::NQH_NZ
+    }
+
+    /// [`GQA`](Self::GQA) as a `NonZeroU32` — nonzero by [`GQA`](Self::GQA)'s own evaluation
+    /// (`NQH ≥ NKVH ≥ 1` and the division is exact, so the quotient is at least 1), for the
+    /// region/staging laws that take the group size as a nonzero count. Same shape as
+    /// [`NQH_NZ`](Self::NQH_NZ): the `panic!` arm is a compile-time impossibility, not a
+    /// runtime assertion.
+    pub const fn gqa_nz(self) -> NonZeroU32 {
+        match NonZeroU32::new(Self::GQA) {
+            Some(n) => n,
+            None => panic!("AttnGeometry: GQA == 0 is already refused by GQA's evaluation"),
+        }
     }
 
     /// The kv-head count as the `NonZeroU32` the head iterators take — nonzero by
@@ -939,8 +951,8 @@ impl<const NQH: u32, const MQ: u32> RungRowLaws<NQH, MQ> {
 /// argument says WHICH width fills it (the same discipline as [`POOL_STICK`]).
 pub const PAGE_MASK_COLS: u32 = PagedKvPool::PAGE_SLOTS as u32;
 
-/// ⭐⭐ THE BUNDLE'S WIDTH AND THE ROW LAWS IT IS FRAMED WITH, ONE VALUE — what `assemble_attn`
-/// draws every shared-buffer synth extent, mask nest and row sweep from, minted beside the
+/// ⭐⭐ THE BUNDLE'S WIDTH AND THE ROW LAWS IT IS FRAMED WITH, ONE VALUE — what the bundle's
+/// emission draws every shared-buffer synth extent, mask nest and row sweep from, minted beside the
 /// [`PaddedMq`] it belongs to so a width cannot be paired with another bundle's row frame.
 ///
 /// The two mints mirror [`PaddedMq::of_bundle`]'s wall:
@@ -951,7 +963,7 @@ pub const PAGE_MASK_COLS: u32 = PagedKvPool::PAGE_SLOTS as u32;
 ///   is no [`Rung`] for it to present.
 ///
 /// `NQH` rides the type so a carrier minted for one geometry cannot be spent emitting another's
-/// bundle — `assemble_attn` demands `AttnBundleRows<NQH>` at ITS `NQH`.
+/// bundle — the door demands `AttnBundleRows<NQH>` at ITS `NQH`.
 #[derive(Clone, Copy, Debug)]
 pub struct AttnBundleRows<const NQH: u32> {
     width: PaddedMq,
@@ -6247,7 +6259,7 @@ impl DxGroupCeiling {
 
 /// ⭐ THE CACHE WRITE'S WINDOW-FIRST-ROW, cursor-relative — which row of the window-own tensor
 /// the write starts at, carried as the type. Two mints, and each is a door: the WHOLE-PLANE
-/// call ([`Self::at_cursor`] — main's `attn_at` arm always wrote the window starting at the
+/// call ([`Self::at_cursor`] — main's attention door arm always wrote the window starting at the
 /// cursor's row 0) and a PER-ROW NODE's own window ([`Self::of_node_window`] — the rope
 /// append arm, whose rows share one output tensor and whose request is the row itself).
 ///
@@ -6290,7 +6302,7 @@ impl WriteRowStart {
 /// part NEVER crosses a page boundary.
 ///
 /// The consumer is the recipe ([`crate::emit::kv_cache_write`], re-homed from main's
-/// `attn_at` arm to the rope's own door arm): the walk's `Program::RopeAppend` arm cuts the
+/// attention door arm to the rope's own door arm): the walk's `Program::RopeAppend` arm cuts the
 /// node's window through [`PagedKvPool::write_parts`] and emits one copy family per part,
 /// each part self-stamping its request and its first row past the write cursor — the
 /// (b1) discipline's facts, stated by the ONE implementation of the cutting.
@@ -6747,7 +6759,7 @@ impl PagedKvPool {
     }
 
     /// ⭐ THE EMITTER'S DOOR — the pool FOR the class the bundle was instantiated at, the same
-    /// carrier `assemble_attn` and the seed/fold blocks take. A pool minted here cannot disagree
+    /// carrier the class's scratch, gather and chunk mints take. A pool minted here cannot disagree
     /// with the bundle's head counts: the pair comes from the geometry's own consts, spent as
     /// values — so a scratch, a gather or a chunk minted from THIS pool carries the class's
     /// `nkvh` by construction, and the emitter's cross-checks against it are provably dead.
@@ -7697,7 +7709,7 @@ pub fn page_gather_index_table(
 /// it is the buffer's own row.
 ///
 /// ## The shape, and why `windows` is in it
-/// ⛔ ONE FOLD PASS IS `nb` WINDOWS, NOT ONE. `assemble_attn`'s prefix loop is
+/// ⛔ ONE FOLD PASS IS `nb` WINDOWS, NOT ONE. The prefix loop is
 /// `for w in SlotWindow::sweep(SlotCount::new(active_cap))` and `SlotWindow::count_in(swept)` is
 /// `swept/64`, so a pass emits `nb = active_cap / 64` blocks, each reading a DIFFERENT 64-slot stick
 /// block of the SAME page. A paged bundle's `active_cap` is a `ActiveCap::decode_ladder` rung below or
@@ -8371,7 +8383,7 @@ impl PageScratch {
     }
 }
 
-/// ⭐⭐⭐ HOW A LAUNCH'S CAUSAL NEW-TOKEN BLOCK IS EMITTED — one law, read by the emitter (`assemble_attn`)
+/// ⭐⭐⭐ HOW A LAUNCH'S CAUSAL NEW-TOKEN BLOCK IS EMITTED — one law, read by the emitter
 /// and by the host that tiles the causal mask (`forward_tape::causal_tiled`), so the mask's layout and the
 /// ops that read it cannot disagree.
 ///
@@ -8761,7 +8773,7 @@ impl ChunkScratch {
     ///     from [`crate::placement::LX_PIN_BASE`] up to [`crate::superdsc_opspec::FRONTEND_LX_END`]),
     ///     TOGETHER WITH the op-local pin slots the rung already placed above the window's top
     ///     (`op_local_bytes`) and the probability-part pins the form mints beside its gathers
-    ///     (`prob_pin_bytes`, summed by [`crate::ir::bridge::tiled_op_sdsc_op::attn::chunk_prob_pins`])
+    ///     (`prob_pin_bytes`, summed by the deleted old emitter's `chunk_prob_pins`)
     ///     — one budget, [`crate::placement::lx_window_fits`], the same function the allocator's own
     ///     guard asserts. At granite-8b that refuses the 48-, 56- and 64-page rungs (1.5–2 MiB of
     ///     pins), which keep the HBM scratch. The 12-page rung has neither a whole V part nor whole
@@ -9960,7 +9972,7 @@ impl GatherScratch {
     /// load-bearing padding and this door did not break anything — the recorded clean sweep simply does not
     /// reproduce from the commit that records it. Full table and the order of work at that call site. This
     /// door is therefore used only where it costs no addresses (the emitter names the index tensor under
-    /// it, which `assemble_attn` already ignores at hd=128), and the three-door split stays OPEN and
+    /// it, which the old emitter already ignored at hd=128), and the three-door split stays OPEN and
     /// documented rather than closed by a change nothing can currently measure.
     ///
     /// ⛔ AND IT IS `of_fold_pass`, NOT A COPY OF ITS CONDITIONS. The window count is the ONE input a

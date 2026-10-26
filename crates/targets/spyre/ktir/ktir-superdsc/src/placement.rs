@@ -1086,7 +1086,7 @@ impl BundleLayout {
     }
 
     /// Record the probability-part pins the chunk form mints beside its gathers
-    /// ([`crate::ir::bridge::tiled_op_sdsc_op::attn::chunk_prob_pins`]) — the second core-local
+    /// (summed by the deleted old emitter's `chunk_prob_pins`) — the second core-local
     /// term of the `lx_form` witness's budget, summed with the gather pins at the chunk's
     /// admission. Noted so the baked artifact carries the term to the host's own
     /// `chunk_gather_index_table` read — the bake/host agreement law: the host must refuse

@@ -100,8 +100,9 @@ fn main() {
     }
 
     // THE MODEL-GEOMETRY CONST DOOR. `emit_node` refuses `Program::{Rope, Attn}` ON PURPOSE: their
-    // bodies are monomorphised on the head geometry (`rope_at::<HD>`, `attn_at::<NQH, NKVH, HD>`),
-    // which is a CONST parameter, so no runtime `Program` can reach them and defaulting the geometry
+    // bodies are monomorphised on the head geometry (`rope_at::<HD>`; the attention's geometry door
+    // lives upstream in the splice), which is a CONST parameter, so no runtime `Program` can reach
+    // them and defaulting the geometry
     // would make a wrong head count a silently wrong grouping. `drive_rope` takes it explicitly.
     //
     // The values come from the fixture's OWN `tl.constexpr`s -- the same numbers the kernel was

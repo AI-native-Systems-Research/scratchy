@@ -1724,7 +1724,7 @@ fn rope_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
 // THE ATTENTION GOLDEN
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// One attention shape the golden compares: everything the spliced `attn.py` derives its program
+/// One attention shape the golden compares: everything the spliced attention kernel derives its program
 /// from — geometry, rung, cache producer — so a shape here is one (arm × geometry × rung ×
 /// producer) cell of the delivery scope.
 #[derive(Clone, Copy)]
@@ -2135,7 +2135,7 @@ fn spliced_attn_lowers_through_the_door() {
             let node = ir.nodes.last().unwrap();
             let cap = ir.tensors[node.inputs[1].tensor.index()].rows;
 
-            // The splice — `lower_attn` compiles attn.py for this node's geometry and rung.
+            // The splice — `lower_attn` compiles the attention kernel for this node's geometry and rung.
             // No fold statement on these fixtures (`None`): the one-shot form, ONE program —
             // the paged-fold family is the chunked-ladder rung's own statement, pinned by its
             // own fixtures.
@@ -2322,7 +2322,7 @@ fn spliced_attn_lowers_through_the_door() {
 
             // The program lowers through the production door under the walk's own
             // layout, with the bundle facts stated exactly as the tape walk states
-            // them (`attn_at` reads the swept extent, the scale, the span guard and
+            // them (the door reads the swept extent, the scale, the span guard and
             // the row laws off the program).
             let attn_params = scratchy_target_spyre::ktir_superdsc_door::BundleAttnParams {
                 rows_are_requests,
@@ -2608,13 +2608,6 @@ fn a_continuation_programs_size_does_not_grow_with_its_rows() {
             .clone()
             .expect("spliced op carries its program");
         assert!(k.mask.is_some(), "mq={mq}: the continuation binds its mask");
-        ktir_superdsc::emit::lower_ktir_to_superdsc::attn_program_is_flat_in_rows(
-            "continuation",
-            &k.func,
-            mq,
-            32,
-        )
-        .unwrap_or_else(|e| panic!("mq={mq}: {}", e.message));
         k.func.ops_deep().len()
     };
     // ⛔ FLAT IN ROWS AT A FIXED PAGE COUNT — the fixture's rope-appended prefix is
@@ -2640,10 +2633,8 @@ fn a_continuation_programs_size_does_not_grow_with_its_rows() {
         "pages 1 → 2 must grow the program by exactly one per-page quantum (measured \
          {PER_PAGE_OPS} ops on this tree): 1 page {small} ops, 2 pages {two_pages} ops"
     );
-    // The door's flat-in-rows guard has one production caller, `attn_at` — the dead
-    // hand-written attention, slated for removal with G7. The live kernels read q once
-    // by construction (batched_decode.py:156, one `q_desc.gather`; batched_prefill.py's
-    // one `q_desc` load), so the guard admits every live program — pinned by `ops_at`'s
-    // own calls above — and its refusal path is unexercised by any live program; it is
-    // G7's to delete or re-home with the dead path.
+    // The live kernels read q once by construction (batched_decode.py's one `q_desc.gather`;
+    // batched_prefill.py's one `q_desc` load), so every live program is flat in rows by
+    // construction — pinned by `ops_at`'s own numbers above. The door's old flat-in-rows
+    // guard went with the dead hand-written attention that was its one production caller.
 }

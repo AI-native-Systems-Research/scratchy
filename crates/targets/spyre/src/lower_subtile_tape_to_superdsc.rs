@@ -44,8 +44,7 @@ pub use crate::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off;
 // bytes against torch-spyre, i.e. exactly the machinery under suspicion for the composite-m
 // garble. Nothing caught it because CI never builds this crate with `--features superdsc`.
 pub use crate::ir::bridge::tiled_op_sdsc_op::{
-    assemble_attn, assemble_matmul, assemble_matmul_off, assemble_matmul_seeded,
-    assemble_matmul_split,
+    assemble_matmul, assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_split,
 };
 use ktir_core::attrkey::AttrKey;
 use ktir_core::ir::Attr;
@@ -695,7 +694,7 @@ pub(crate) fn scalar_registry<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<f32> {
 /// registers is staged here; a variant it does not is left exact. Two omissions
 /// are the census's own: the OnePlusScale offset is 1.0 (f16-exact — staging it is
 /// the identity), and the attention `√scale` is not a node field — it is a
-/// DERIVED registry slot the door reads: the decode door (`attn_at`) multiplies
+/// DERIVED registry slot the old decode door read: it multiplied
 /// BOTH Q and the roped new-K by it, so the card's effective decode score scale
 /// is `f16(√s)²` — two f16-slot multiplies — while the emulator's program
 /// (`qk · SCALE` on the f16 dot) and this golden both apply `f16(s)`. That
@@ -1135,9 +1134,9 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // row-major identity (single stick) ⇒ NO RetileDescriptor (like the all-ones). The mq>1 cachewr
     // becomes matmul(kh[mqu,hd], I[hd,hd]) = kh, replacing the mqu·nqh·2 SlotSolo copies.
     //
-    // BUG #1 (found via a real pod trace, 20cf993a): `assemble_attn`'s GQA new_k/new_v replication
-    // (ir::bridge::tiled_op_sdsc_op::attn.rs, `attn_krep{h}`/`attn_vrep{h}`) references this SAME
-    // `ident` tensor UNCONDITIONALLY — every model with attention, every mq, no env-var check at
+    // BUG #1 (found via a real pod trace, 20cf993a): the attention's identity-contracted copies
+    // (the old emitter's GQA new_k/new_v replication, `attn_krep{h}`/`attn_vrep{h}`, now the KV
+    // cache write's cachewr matmuls) reference this SAME `ident` tensor UNCONDITIONALLY — every model with attention, every mq, no env-var check at
     // all (the on-card multi-row plain copy is proven broken, so this IS the copy mechanism, not
     // an optional #3 optimization for it). But this placement was gated ONLY on the opt-in
     // SCRATCHY_SUPERDSC_KV_MATMUL env var — unset in a normal build, IDENTITY_TID was never placed
@@ -1151,7 +1150,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // ran for decode's own bundle at all. Confirmed by the worker's own hard-fail: decode's baked
     // bundle_layout.json genuinely never had IDENTITY_TID, exactly as this predicts. Moved OUTSIDE that
     // mq>1 guard so it runs for ANY AttnDecode node regardless of mq, matching the consumer's real,
-    // unconditional need (assemble_attn_head references `ident` at every mq, decode included).
+    // unconditional need (the KV cache write's copies reference `ident` at every mq, decode included).
     // ⭐⭐ ONE IDENTITY PER DISTINCT ATTENTION HEAD DIM, NOT ONE AT THE MAX. The max-fold this
     // replaced sized the placement at the widest `AttnDecode` head dim while the VALUE was staged at
     // the base head dim — so on gemma-4 tiny-allglobal a `[64,64]` identity sat in a `[128,128]`
@@ -1767,7 +1766,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 // pages, 3 blocks instead of 24.
                 //
                 // ⛔ WHICH FORM THIS BUNDLE USES IS THE SAME `rows_are_requests` CONDITION THE INDEX
-                // PLACEMENT AND `assemble_attn`'s gather are gated on — one predicate, three consumers.
+                // PLACEMENT AND the attention gather are gated on — one predicate, three consumers.
                 // Getting it wrong is silent in the dangerous direction: too few blocks against the fold
                 // is a fold reading mask bytes nobody staged, which read as ZERO and therefore VALID.
                 let (pm_rows, pm_blocks) = if rows_are_requests {
@@ -1846,7 +1845,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 // have had to be re-derived somewhere else.
                 //
                 // ⭐⭐⭐ `gathers_kv` is that condition, and it is the SAME fact
-                // `lower_ktir_to_superdsc` passes `assemble_attn`'s `kv_block_index` from. The
+                // the attention lowering's gather admission keys on. The
                 // reference gathers its pages on EVERY decode — batched and one-request alike — so
                 // both rungs place the index; prefill's rows are consecutive positions of one
                 // sequence sharing ONE resident history, so there is nothing for an index to
@@ -1856,7 +1855,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 // OBVIOUS FIX, BECAUSE THE 8b BATCHED PATH **READS THESE BYTES** — MEASURED, TWICE, ON
                 // THE CARD.
                 //
-                // The split is real and it is stated on [`GatherScratch::admits`]: `assemble_attn` may
+                // The split is real and it is stated on [`GatherScratch::admits`]: the old emitter could
                 // DECLINE the gather on the geometry (`of_fold_pass` refuses a head dim its flat copy
                 // cannot express) and this placement does not ask, so an hd=128 bundle reserves this
                 // activation, `BakeFacts::gathers_kv` answers `true` and the forward tape stages a table
@@ -1918,7 +1917,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 // oracle first (find why the same source rebuilt is not the same numerics), then narrow
                 // this, then measure. Until then only the emitter-side half of the one rule lands:
                 // `lower_ktir_to_superdsc` gates the tensor's NAME on `admits`, which is provably
-                // non-observable (`assemble_attn`'s `kv_block_index.zip(of_fold_pass(..))` is already `None`
+                // non-observable (the old emitter's `kv_block_index.zip(of_fold_pass(..))` was already `None`
                 // at hd=128 whichever way the name goes), so the coupling is stated where it costs no
                 // addresses and this placement keeps every byte it had.
                 if gathers_kv {
@@ -4002,6 +4001,199 @@ pub struct GateRung<'a> {
     /// The rung's KV capacity — the decode length mask's width, and the dump's
     /// directory half.
     pub cap: u32,
+    /// The rung's KV PAGE STRIDE, in bytes — `RolledSuperDsc::kv_page_stride`, the
+    /// same number the card session's `gather_entry_ceiling` reads off its own
+    /// executor. The gate's attention step-input staging derives its gather
+    /// ceiling from it through the ONE shared law
+    /// (`attn_step_staging::gather_entry_ceiling_for`), so the gate's entry bound
+    /// and the card's are one function of one number, not two derivations.
+    pub page_stride_bytes: u64,
+}
+
+/// The leg the gate is staging rows for — the rung's own query-row facts, which
+/// pick the chunk family's `mq`/`start`/`real`.
+#[cfg(feature = "spyre-emu")]
+enum GateAttnLeg {
+    /// A prefill chunk: `mq` real rows at position 0, every row its own causal
+    /// bound (the rung the `PrefillGate` states).
+    Prefill { mq: u32 },
+    /// The solo decode row: one real row at `start` — the prefix the reference's
+    /// own key set states (`valid_prefix`, the max rope-append region length).
+    Decode { start: usize },
+}
+
+/// ⭐⭐⭐⭐⭐ STAGE THE ATTENTION FAMILY'S STEP INPUTS ON THE GATE'S SESSION — the gate's half
+/// of the contract `attn_step_slots` spells, and the fix for the m=1 fp16 refusal: the gate
+/// used to stage NONE of the four slots (an unstaged id table reads as block 0, a REAL
+/// address; an unstaged mask reads as zero, NO masking), so it judged the branch's paged
+/// attention against a sweep that never left block 0's windows. This stages byte-identically
+/// what the card stages, because the CONTENT is the SAME builder the worker's fill calls
+/// ([`crate::attn_step_staging::build_attn_step_inputs`]) — only the session half differs
+/// (the emulator's raw byte channel, not the card's fill door).
+///
+/// ⭐ THE IDENTITY PAGE MAP — logical page p is physical page p, `0..region.pages()` in
+/// order: the reference reads the cache as ONE logical sequence, which IS this map, so the
+/// pages the gate's tables name are exactly the rows the golden's regions hold.
+///
+/// `Ok(())` with nothing staged only when the tape carries no `AttnDecode` at all (nothing to
+/// stage); a tape that DOES run attention while its placement declares no step inputs is a
+/// desync and refuses — there is no fallback mask law, because there is no second producer:
+/// on this branch every attention program is one of the three spliced kernels and all of them
+/// declare the step inputs.
+#[cfg(feature = "spyre-emu")]
+fn stage_attn_step_inputs<F: RopeForm>(
+    session: &mut crate::runner::SpyreSession,
+    fp: &str,
+    ir: &SubtileIR<F>,
+    page_stride_bytes: u64,
+    leg: GateAttnLeg,
+) -> Result<(), String> {
+    // The geometry the tape carries — every AttnDecode of this graph holds the model's own
+    // value, minted once at the parse boundary with its GQA proof spent there.
+    let Some(geometry) = ir.nodes.iter().find_map(|n| match &n.op {
+        SubOp::AttnDecode { geom, .. } => Some(*geom),
+        _ => None,
+    }) else {
+        // No attention in this tape: nothing to stage, and no mask law to fall back to —
+        // a tape with no AttnDecode never binds the mask tid at all.
+        return Ok(());
+    };
+    let what = format!("numeric gate {fp}");
+    scratchy_subtile::model_geometry::with_config_attn_geometry(
+        geometry,
+        GateStageAtTheGeometry {
+            session,
+            what: &what,
+            n_graph_tensors: ir.tensors.len() as u32,
+            page_stride_bytes,
+            leg,
+        },
+    )
+    .ok_or_else(|| {
+        format!(
+            "{what}: geometry {geometry} is declared by no model config in scope ({}) — the fix \
+             is the config naming this model, never an edit to the gate",
+            scratchy_subtile::model_geometry::geometry_sources()
+        )
+    })?
+}
+
+/// The gate's staging at the geometry the configs declare — the consumer side of the door.
+#[cfg(feature = "spyre-emu")]
+struct GateStageAtTheGeometry<'a> {
+    session: &'a mut crate::runner::SpyreSession,
+    what: &'a str,
+    n_graph_tensors: u32,
+    page_stride_bytes: u64,
+    leg: GateAttnLeg,
+}
+
+#[cfg(feature = "spyre-emu")]
+impl scratchy_subtile::model_geometry::OnAttnGeometry for GateStageAtTheGeometry<'_> {
+    type Out = Result<(), String>;
+
+    fn on_geometry<const NQH: u32, const NKVH: u32, const HD: u32>(
+        self,
+        geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    ) -> Self::Out {
+        use crate::attn_step_staging::{self, AttnStepExtents, AttnStepRows};
+        use ktir_emulator::dtypes::DType;
+        use ktir_superdsc::ktir_node::step_input_tid;
+        use ktir_superdsc::sdsc_abstract as sd;
+        use ktir_superdsc::sdsc_abstract::attn_step_slots;
+        let GateStageAtTheGeometry {
+            session,
+            what,
+            n_graph_tensors,
+            page_stride_bytes,
+            leg,
+        } = self;
+        let pool = sd::PagedKvPool::of_geometry(geom);
+        // The four slots' extents, asked of the session at the numbering law's own tids —
+        // `None` for a slot this bundle's programs never bound.
+        let extent = |slot: u32| {
+            session.source_extent_bytes(u64::from(step_input_tid(n_graph_tensors, slot)))
+        };
+        let extents = AttnStepExtents {
+            mask: extent(attn_step_slots::MASK),
+            kt: extent(attn_step_slots::KT_BLOCK_IDS),
+            v: extent(attn_step_slots::V_BLOCK_IDS),
+            rep: extent(attn_step_slots::REP_ROW_IDS),
+        };
+        // The pattern check — the region's derivation below needs the mask extent, and the
+        // check itself is the ONE spelling (the builder runs it again; same function).
+        attn_step_staging::chunk_slot_pattern(what, &extents)?;
+        // The ceiling from the rolled layout's own page stride — the card session's number,
+        // through the ONE shared law.
+        let ceiling = attn_step_staging::gather_entry_ceiling_for(page_stride_bytes, pool);
+        // The rung's own query-row facts, per leg — the same facts the worker's fill stages
+        // for the body that runs (a prefill chunk at position 0, the solo decode row at the
+        // prefix bound).
+        let (mq, chunk_rows, start, real) = match leg {
+            GateAttnLeg::Prefill { mq } => {
+                let nz = std::num::NonZeroU32::new(mq).expect("a prefill rung bakes mq > 1");
+                let w = sd::RungWidth::of_emitted_rows(mq).expect("a prefill rung bakes mq > 1");
+                (w, sd::ChunkRows::chunk(nz), 0usize, nz)
+            }
+            GateAttnLeg::Decode { start } => (
+                sd::RungWidth::of_emitted_rows(1).expect("1 is a rung width"),
+                sd::ChunkRows::single(),
+                start,
+                std::num::NonZeroU32::new(1).expect("1 is nonzero"),
+            ),
+        };
+        // The region — the ladder's own declared region, from the mask slot's placement
+        // extent, so the map below covers exactly the pages the tables state.
+        let region = attn_step_staging::chunk_region(
+            what,
+            extents.mask.unwrap_or(0),
+            pool,
+            geom.gqa_nz(),
+            mq,
+        )?;
+        // ⭐ THE IDENTITY PAGE MAP — pages `0..region.pages()` in order. The ids-table law
+        // repeats the map's LAST page for a region longer than the map, so the map is minted
+        // at the region's own page count: the one number the region states, never a second
+        // derivation of it.
+        let map: Vec<i64> = (0..region.pages()).map(i64::from).collect();
+        let rows = AttnStepRows::Chunk {
+            rows: chunk_rows,
+            mq,
+            start,
+            real,
+            map,
+        };
+        let p = attn_step_staging::build_attn_step_inputs(geom, what, &extents, ceiling, rows)?;
+        // Stage each slot at the wire dtype the card's fill channel states — ids and the
+        // repetition table as I32 (the RawU32 channel), the mask as F16 (the IeeeF16
+        // channel) — with the minted length checked against the session's own stick extent
+        // first: the fill door's `==` law, on the gate's session.
+        let mut stage = |slot: u32, dtype: DType, bytes: Vec<u8>| -> Result<(), String> {
+            let tid = u64::from(step_input_tid(n_graph_tensors, slot));
+            let declared = session.source_extent_bytes(tid);
+            if declared != Some(bytes.len() as u64) {
+                return Err(format!(
+                    "{what}: the minted step input for slot {slot} is {} B but the session's \
+                     placement declares {} — the staged table and the bundle's own slot \
+                     disagree about what runs at this rung",
+                    bytes.len(),
+                    declared
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "no such slot".to_string())
+                ));
+            }
+            session
+                .set_source_bytes(tid, bytes, dtype)
+                .map_err(|e| format!("{what}: stage step input slot {slot}: {e}"))
+        };
+        stage(attn_step_slots::KT_BLOCK_IDS, DType::I32, p.kt)?;
+        stage(attn_step_slots::V_BLOCK_IDS, DType::I32, p.v)?;
+        if let Some(rep) = p.rep {
+            stage(attn_step_slots::REP_ROW_IDS, DType::I32, rep)?;
+        }
+        stage(attn_step_slots::MASK, DType::F16, p.mask)?;
+        Ok(())
+    }
 }
 
 #[cfg(feature = "spyre-emu")]
@@ -4251,63 +4443,13 @@ pub fn numeric_gate<F: RopeForm>(
     for (i, v) in sm.iter().enumerate() {
         sources.push((u64::from(scalarmul_scale_tid(i)), vec![*v], vec![1, 1]));
     }
-    // The length mask: the synthetic one-past-the-graph tid (`BundleWiring`'s
-    // own placement law). ⭐ NOT ALL-VALID — the append slot must stay masked.
-    // A rope-append prefix's IR region is sliced to `valid_len - 1` rows (the
-    // keys BEFORE this token) while the spliced program sweeps the rung and
-    // lets THIS mask bound it; all-valid unmasks the append slot itself and
-    // hands the program one extra key the reference does not attend (its
-    // v-cache row is never written — the fresh v rides the new-v segment —
-    // measured: granite decode diverged at every AttnDecode output by exactly
-    // one synth row's v-mix term at weight 1/257). The reference's own key set
-    // is the region, so the mask keeps exactly its rows valid. Pre-populated
-    // prefixes read their region directly (the mask parameter is truncated
-    // away for them), so a tape with no rope-append prefix keeps the
-    // all-valid default — the bind is then simply unused.
-    if let Some(pg) = prefill {
-        // ⭐ THE PREFILL MASK, BY THE RUNTIME'S OWN LAW: the forward's emu
-        // staging binds a `[mq, mq]` clamped causal triangle — the same two
-        // calls the worker's `forward_chunk` composes (`ChunkRows::row_logical_pos`
-        // over `prefill_causal_col_valid`, the SSOT the one-pass kernel's own
-        // `[MQ, MQ]` mask descriptor states) — at a FULL chunk: every row
-        // real, so the clamp is the identity and the golden, which has no
-        // pad-row law, sees exactly the rows the program reads. ⛔ NOT
-        // `CausalKey::mask`: that is the card's `[mq, mq_pad]` stick-padded
-        // layout — a different tensor than the one-pass kernel consumes.
-        let mq = pg.mq as usize;
-        let chunk = scratchy_subtile::sdsc_abstract::ChunkRows::chunk(
-            std::num::NonZeroU32::new(pg.mq).expect("a prefill rung bakes mq > 1"),
-        );
-        let mut m = vec![0.0f32; mq * mq];
-        for r in 0..mq {
-            let pos = chunk.row_logical_pos(r, mq);
-            for c in 0..mq {
-                if !scratchy_subtile::sdsc_abstract::prefill_causal_col_valid(c, pos) {
-                    m[r * mq + c] = -1.0e38;
-                }
-            }
-        }
-        sources.push((u64::from(ir.tensors.len() as u32), m, vec![mq, mq]));
-    } else {
-        let valid_prefix = ir
-            .nodes
-            .iter()
-            .filter_map(|n| match &n.op {
-                SubOp::AttnDecode {
-                    producer:
-                        scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend { .. },
-                    ..
-                } if n.inputs.len() >= 5 => Some(n.inputs[1].region.rows.len as usize),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(cap as usize);
-        sources.push((
-            u64::from(ir.tensors.len() as u32),
-            crate::manifest::attn_mask_fill(cap as usize, valid_prefix),
-            vec![1, cap as usize],
-        ));
-    }
+    // ── The attention family's step inputs are staged BELOW, on the session ──
+    // through the ONE builder the card's fill stages through (`stage_attn_step_inputs`),
+    // at slot 0's own numbering: `step_input_tid` at slot `MASK` is `ir.tensors.len()`,
+    // the synthetic one-past-the-graph placement `BundleWiring` always stated. There is
+    // NO fallback length-mask law and no second producer: on this branch every attention
+    // program is one of the three spliced kernels and all of them declare the step
+    // inputs, so a bundle that runs attention while declaring none refuses, loud.
     // ── Run the bundle on the emulator ──
     // The golden tids, in the writer's own first-seen order — each with the
     // registry name of the op that first produces it (`SubOp::name`, so no
@@ -4388,6 +4530,66 @@ pub fn numeric_gate<F: RopeForm>(
             golden_tids.len(),
             observables.len()
         ));
+    }
+    // ── The attention family's step inputs, staged on the session ──
+    // ⭐ THE GATE'S HALF OF THE `attn_step_slots` CONTRACT. The CONTENT is the
+    // same builder the worker's fill calls, so the gate stages byte-identically
+    // what the card stages: the id tables name the identity page map's pages
+    // (logical page p = physical page p — the reference reads ONE logical
+    // sequence, which IS that map), and the mask is the region's own validity
+    // law (decode: slots `<= start`; prefill: the chunk's causal bound) — the
+    // same law the golden's key set states. A tape with no AttnDecode stages
+    // nothing (the bind is unused); a tape that runs attention while its
+    // placement declares no step inputs refuses — no fallback, no second
+    // producer.
+    // `Option`: `None` = no AttnDecode in this tape at all — nothing to stage,
+    // no leg to state. No meaningless `cap` placeholder exists.
+    let leg = match prefill {
+        Some(pg) => Some(GateAttnLeg::Prefill { mq: pg.mq }),
+        None => {
+            // The reference's own key set: the max rope-append prefix region
+            // length — the prefix rows the golden concatenates, which is the
+            // `start` the solo decode row runs at. ⛔ NO DEFAULT and NO MIXING:
+            // every attention on this branch reads a rope-appended pool, so an
+            // AttnDecode with no SameForwardRopeAppend prefix is a tape this
+            // branch never bakes — a refusal naming the node, whether or not
+            // other AttnDecodes in the same tape carry a prefix.
+            let mut start: Option<usize> = None;
+            let mut first_unprefixed: Option<usize> = None;
+            for n in &ir.nodes {
+                let SubOp::AttnDecode { producer, .. } = &n.op else {
+                    continue;
+                };
+                match producer {
+                    scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend {
+                        ..
+                    } if n.inputs.len() >= 5 => {
+                        let len = n.inputs[1].region.rows.len as usize;
+                        if start.is_none_or(|s| len > s) {
+                            start = Some(len);
+                        }
+                    }
+                    _ => {
+                        first_unprefixed.get_or_insert(n.output.tensor.index());
+                    }
+                }
+            }
+            match (start, first_unprefixed) {
+                (_, Some(tid)) => {
+                    return Err(format!(
+                        "numeric gate {fp}: this decode rung's AttnDecode at output tid {tid} \
+                         carries no SameForwardRopeAppend prefix — every attention on this \
+                         branch reads a rope-appended pool, so this tape is not one this \
+                         branch bakes"
+                    ));
+                }
+                (Some(s), None) => Some(GateAttnLeg::Decode { start: s }),
+                (None, None) => None,
+            }
+        }
+    };
+    if let Some(leg) = leg {
+        stage_attn_step_inputs(&mut session, fp, ir, rung.page_stride_bytes, leg)?;
     }
     let out = session
         .run_step(0, sources, &compare)
@@ -4864,8 +5066,8 @@ pub enum GroupKind {
     /// its stride (STICK_BYTES·stick = 8192) ≠ the cachewr's `slot_stride_bytes` (128), so fusing the two
     /// would trip the per-group uniform-stride assert (mixed-stride group → wrong base shift).
     Slab,
-    /// A GATHERED read outside any fold — the split-KV chunk's copies (`attn.rs`'s
-    /// `assemble_attn_chunk`), which pull every resident page through the index ONCE per launch.
+    /// A GATHERED read outside any fold — the split-KV chunk's copies (the deleted old emitter's
+    /// `assemble_attn_chunk`), which pulled every resident page through the index ONCE per launch.
     /// Consecutive `Gathered` trips FUSE, but never with anything else: the group's `KvShifts::gathered`
     /// is what zeroes its KV page shift (the entries are absolute) and what tells the host this body
     /// needs its index staged, so a `Pure` op swept in would lose its page base, and a copy swept into
@@ -7241,8 +7443,9 @@ pub struct RolledSuperDsc {
     /// there, where a second derivation would be free to disagree. `None` when the graph has no
     /// attention node. See [`crate::ktir_superdsc_door::BundleAttnParams`].
     ///
-    /// ⛔ NOT A RECORD ON THE PROGRAM. `AttnFacts` was that, and it let the emulator and the card
-    /// compute different attention; these are arguments of [`emit_bundle`], stated once per bundle.
+    /// ⛔ NOT A RECORD ON THE PROGRAM. A sidecar record (`AttnFacts`, deleted) was that, and it let
+    /// the emulator and the card compute different attention; these are arguments of
+    /// [`emit_bundle`], stated once per bundle.
     pub attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
 }
 

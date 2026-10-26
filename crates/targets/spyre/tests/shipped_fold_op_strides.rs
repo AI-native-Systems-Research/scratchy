@@ -134,7 +134,8 @@ impl PerCore {
 #[test]
 fn print_what_the_shipped_fold_score_op_addresses() {
     let mut s = 0i64;
-    // Offsets exactly as `assemble_attn_block` builds them for kv-head 0 (query heads 0..3), and
+    // Offsets exactly as the shared-kernel score builder builds them for kv-head 0 (query heads
+    // 0..3), and
     // the same FORM a bs=8 bundle threads: rows are requests at mq>1, so this op carries the
     // corrected head-outermost walk. The per-core START addresses asserted below are identical
     // under both forms — the strict-subset fact that let the swapped walk hide — so the

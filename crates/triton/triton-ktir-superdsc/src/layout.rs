@@ -91,9 +91,9 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     //
     // ⭐ AND THE REFUSAL IS ABOUT THE **BODY THAT WILL RUN**, WHICH IS WHY IT IS GATED ON
     // [`is_per_program_node`]. The reserved constants below are named by the per-`Program` entry
-    // points — `attn_at`'s `ATTN_MASK_TID`/`IDENTITY_TID`/the reserved Kᵀ name
-    // (`KctResident::of(k).wire_tid()`) are that hand-written
-    // body's device state, and it is the body that looks them up. The WHOLE-FUNCTION door never
+    // points — the deleted hand-written attention body's `ATTN_MASK_TID`/`IDENTITY_TID`/the
+    // reserved Kᵀ name (`KctResident::of(k).wire_tid()`) were that
+    // body's device state, and it was the body that looked them up. The WHOLE-FUNCTION door never
     // calls it: it walks the function's own ops, every operand of which is a parameter or an
     // in-function value, so nothing in that emission can reach a name this module did not place.
     //
@@ -629,8 +629,9 @@ fn index_view_dtype(node: &KtirNode, tid: u32) -> Option<ktir_core::dtypes::DTyp
 /// `None` when it names none.
 ///
 /// ⛔ READ OFF THE BODIES, one by one. `rope_at` opens with `crate::place::act_name(ROPE_P_TID)`
-/// (the rotate matrix) and `attn_at` names `ATTN_MASK_TID`, `ATTN_CAUSAL_TID`, `IDENTITY_TID` and
-/// the reserved Kᵀ name (`KctResident::of(k_id).wire_tid()`). None of those is a buffer a Triton kernel declares. Every other body
+/// (the rotate matrix) and the deleted hand-written attention body named `ATTN_MASK_TID`,
+/// `ATTN_CAUSAL_TID`, `IDENTITY_TID` and the reserved Kᵀ name (`KctResident::of(k_id).wire_tid()`).
+/// None of those is a buffer a Triton kernel declares. Every other body
 /// names only its parameters and its own declared synthetics.
 ///
 /// ⭐ THE LINE IS NOT "IS IT A PARAMETER", IT IS "DOES THE PROGRAM STATE ITS EXTENT" — and that is
@@ -640,7 +641,8 @@ fn index_view_dtype(node: &KtirNode, tid: u32) -> Option<ktir_core::dtypes::DTyp
 /// is the rope output view's own column count (see [`for_regions`]'s P placement), so it is read.
 /// Attention's are not, and none of them is close: `ATTN_MASK_TID` is `[nqh·mq, cap]` over a prefix
 /// CAPACITY the worker chooses per step, `ATTN_CAUSAL_TID` the same, `IDENTITY_TID` is `[hd, hd]` at
-/// the head dim of a GQA geometry that reaches `attn_at` as a const generic and not as a view, and
+/// the head dim of a GQA geometry that reached the hand-written attention as a const generic and
+/// not as a view, and
 /// the reserved Kᵀ name (`KctResident::wire_tid`) is resident scratch whose extent is the K cache's. So `Attn` stays refused BY
 /// NAME, which is the whole point of this function: `resolve_seg_base` PANICS on a name in neither
 /// `ids` nor the synth map, so the choice is a diagnostic here or a build crash there.
@@ -921,7 +923,7 @@ fn scales_for(p: Program, f: &IRFunction<'static>) -> Vec<f32> {
         Program::RmsNorm => L::program_rmsnorm_eps(f).into_iter().collect(),
         // `scalarmul` resolves ONE value: `scale_slot(layout, program_scalarmul_scale(&k.func))`.
         Program::ScalarMul => L::program_scalarmul_scale(f).into_iter().collect(),
-        // `attn_at` resolves TWO — the score scale AND its square root, in that order:
+        // `Program::Attn` resolves TWO — the score scale AND its square root, in that order:
         // `scale_idx` on `scale_val`, then `sqrt_scale_idx` on `scale_val.sqrt()`, because
         // "torch-spyre splits into sqrt_scale on both Q and K". `compute_bundle_layout` pushes the
         // same pair for `SubOp::AttnDecode` (`push_scale(*scale)` then `push_scale(scale.sqrt())`).
@@ -933,7 +935,7 @@ fn scales_for(p: Program, f: &IRFunction<'static>) -> Vec<f32> {
         },
         // ⭐ EMPTY, AND THAT IS THE ANSWER FOR THESE. None of these bodies calls `scale_slot` or
         // indexes `scalarmul_scales` — grep over the file: the only readers are `rmsnorm`,
-        // `scalarmul`, `attn_at` and `scale_idx_of` (which only recognises a RESERVED tid among the
+        // `scalarmul` and `scale_idx_of` (which only recognises a RESERVED tid among the
         // parameters and finds none when the registry is empty). A value registered for them would
         // occupy a slot nothing asks for.
         Program::Elementwise(_)

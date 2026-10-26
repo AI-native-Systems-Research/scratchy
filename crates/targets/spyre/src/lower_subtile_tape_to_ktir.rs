@@ -1074,7 +1074,7 @@ pub(crate) fn lower_one_node<F: RopeForm>(
             // same read main's builder control makes (`ir.tensors[kv.cache_tensor()].rows`),
             // and the swept rung rides the walk's own `active_cap`. Everything else main's
             // `lower_attn_node` threaded is either read off the program by the
-            // door (`attn_at`: the swept extent, the scale, the span guard, the row laws)
+            // door (the swept extent, the scale, the span guard, the row laws)
             // or is a constexpr the kernel states from the node's own payload.
             let cap = ir.tensors[kv.cache_tensor().index() as u32 as usize].rows;
             // ⭐⭐⭐ THE SCALE, REWRITTEN TO 1.0 WHEN ITS FOLD APPLIES. The program is the ONE
@@ -1558,7 +1558,7 @@ pub fn graph_wiring<F: RopeForm>(
                         // decode; a multi-row continuation binds one `[mq, capacity + mq]` tile (the
                         // prefix's length mask beside the new block's row mask), whose columns are not
                         // the capacity. The resident K is the program's third parameter in every arm
-                        // (q, out, kc, kd, vc, vd — `attn_operands`'s order).
+                        // (q, out, kc, kd, vc, vd — the program's parameter order).
                         Some(mid) => {
                             let regs = ktir_superdsc::emit::lower_ktir_to_superdsc::regions(&k)
                                 .map_err(|e| SuperDscError(e.message))?;
@@ -4375,36 +4375,37 @@ mod attn_scale_weight_fold_tests {
 
     /// The UNIFORM twin of [`two_class_fp8_oproj_graph`]: ONE attention class, multi-slab
     /// (hd 128 > `POOL_STICK`), fp8 W8A8 o projection closed by exactly one matmul —
-    /// granite-8b's geometry at fixture size, and the exact shape every term of
+    /// granite-8b's own geometry (32 q / 8 kv / hd 128, a config-declared triple the
+    /// geometry door arms) at fixture size, and the exact shape every term of
     /// [`OprojEdges::geometry_applies`] demands.
     fn uniform_fp8_oproj_graph() -> SubtileIR {
         let geom = scratchy_subtile::model_geometry::ModelAttnGeometry::mint(
-            scratchy_subtile::model_geometry::QueryHeads::new(2),
-            scratchy_subtile::model_geometry::KvHeads::new(1),
+            scratchy_subtile::model_geometry::QueryHeads::new(32),
+            scratchy_subtile::model_geometry::KvHeads::new(8),
             scratchy_subtile::model_geometry::HeadDim::new(128),
         )
-        .expect("2 query heads over 1 kv head, head_dim 128, mints");
+        .expect("granite-8b's 32 query heads over 8 kv heads, head_dim 128, mints");
         let hd = scratchy_subtile::model_geometry::HeadDim::new(128);
         let shape = |rows: u32, cols: u32| scratchy_subtile::subtile_ir::SourceShape { rows, cols };
         let sources = vec![
-            shape(1, 8),    // 0: x (hidden 8)
-            shape(8, 256),  // 1: W_q — q width 2·128
-            shape(8, 128),  // 2: W_k — kv width 1·128
-            shape(1, 128),  // 3: v
-            shape(32, 128), // 4: prefix_k cache
-            shape(32, 128), // 5: prefix_v cache
-            shape(1, 256),  // 6: cos (q side — one per q head pair)
-            shape(1, 256),  // 7: sin (q side)
-            shape(256, 16), // 8: W_o — fp8, k = 2·128
-            shape(1, 16),   // 9: o_scale
-            shape(1, 128),  // 10: cos (k side — kv width 1·128)
-            shape(1, 128),  // 11: sin (k side)
+            shape(1, 8),     // 0: x (hidden 8)
+            shape(8, 4096),  // 1: W_q — q width 32·128
+            shape(8, 1024),  // 2: W_k — kv width 8·128
+            shape(1, 1024),  // 3: v
+            shape(32, 1024), // 4: prefix_k cache
+            shape(32, 1024), // 5: prefix_v cache
+            shape(1, 4096),  // 6: cos (q side — one per q head pair)
+            shape(1, 4096),  // 7: sin (q side)
+            shape(4096, 16), // 8: W_o — fp8, k = 32·128
+            shape(1, 16),    // 9: o_scale
+            shape(1, 1024),  // 10: cos (k side — kv width 8·128)
+            shape(1, 1024),  // 11: sin (k side)
         ];
         let ops = vec![
             // 0: q = x · W_q; 1: q_rot = rope_rotate(q, cos, sin)
             OpDesc {
                 op: SubOp::MatmulTile {
-                    n: 256,
+                    n: 4096,
                     weight: GemmWeight::Dense,
                 },
                 m: 1,
@@ -4418,7 +4419,7 @@ mod attn_scale_weight_fold_tests {
             // 2: k = x · W_k; 3: k_rot = rope_append(k, cos_k, sin_k, v, caches)
             OpDesc {
                 op: SubOp::MatmulTile {
-                    n: 128,
+                    n: 1024,
                     weight: GemmWeight::Dense,
                 },
                 m: 1,
@@ -4445,7 +4446,8 @@ mod attn_scale_weight_fold_tests {
             OpDesc {
                 op: SubOp::attn_decode(
                     geom,
-                    0.015625,
+                    // granite-8b's config-declared attention multiplier (1/128).
+                    0.0078125,
                     33,
                     scratchy_subtile::subtile_ir::AttnMask::Causal,
                 ),

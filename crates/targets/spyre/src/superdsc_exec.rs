@@ -997,8 +997,9 @@ unsafe impl Send for Executor {}
 ///   no fault, another page's keys.
 /// * **Not placed at all.** `continue` — the bind was SKIPPED, in silence. An index table nobody
 ///   staged reads as entry 0 on every row, which is page 0's first block: a real address, so the whole
-///   batch answers fluently from row 0's history. `assemble_attn` states this exact hazard ("a name no
-///   placement matches is a bind the launcher skips in silence") and had nothing to enforce it with.
+///   batch answers fluently from row 0's history. The deleted hand-written emitter stated this
+///   exact hazard ("a name no placement matches is a bind the launcher skips in silence") and had
+///   nothing to enforce it with.
 ///
 /// ⛔ THERE IS NO PUBLIC CONSTRUCTOR AND NO PUBLIC FIELD. [`Executor::place_raw`] is the only way to
 /// make one, it consults the session's own placement table, and it returns `None` for either case
@@ -3367,11 +3368,7 @@ impl Executor {
             // composes the base exactly ONCE (`off = byte_off; off[seg] += delta.kv`). Adding
             // `kv_page_base` on top double-counted it and printed page 2 for a page-1 write —
             // chatG's pg1/pg2 windows caught the instrument, not the launch (pg2 never written).
-            let pg = if stride > 0 {
-                (abs / stride) as i64
-            } else {
-                -1
-            };
+            let pg = abs.checked_div(stride).map_or(-1, |q| q as i64);
             if !pages.contains(&pg) {
                 pages.push(pg);
             }
@@ -3419,13 +3416,12 @@ impl Executor {
         // walk calls, never a re-derivation: the page each slot-write lands in is
         // `(byte_off_kv + delta.kv) / page_stride` — the caller's page base arrives ONCE, inside
         // the delta (`nonfold_page_delta` returns it), never as a separate addend.
-        if d.segaddr {
-            if let Some((key, text)) = self.cachewr_aim_line(ops, &where_, byte_off, n_fold_pages) {
-                if self.cachewr_seen.as_ref() != Some(&key) {
-                    self.cachewr_seen = Some(key);
-                    eprintln!("{text}");
-                }
-            }
+        if d.segaddr
+            && let Some((key, text)) = self.cachewr_aim_line(ops, &where_, byte_off, n_fold_pages)
+            && self.cachewr_seen.as_ref() != Some(&key)
+        {
+            self.cachewr_seen = Some(key);
+            eprintln!("{text}");
         }
         // 🛑 THE DRAIN AT THE START IS WHAT MAKES THE LADDER MEAN ANYTHING. A launch is async and
         // the stream is in-order, so at any moment the device is a whole layer behind the host.
@@ -4234,71 +4230,71 @@ impl Executor {
         // decomposition is the only mechanism any op's addresses run under — and attempting the
         // read kills the run. The window set therefore stops at the pool's own pages.
         let stride = self.fold.page_stride_bytes.0;
-        if stride > 0 {
-            if let Some(pool) = self.seg_addr[SEG_KV.get()].clone() {
-                const WIN: u64 = 1 << 20;
-                let wants: [(&str, Option<DevAddr>); 2] = [
-                    ("pg1", pool.window(ByteOffset(stride), ByteSize(WIN))),
-                    ("pg2", pool.window(ByteOffset(2 * stride), ByteSize(WIN))),
-                ];
-                // Read every window BEFORE touching `dump` (the stream borrow and the dump borrow
-                // are disjoint phases, the same split `d2h_seg_clamped` makes).
-                let mut bufs: [Option<Vec<u8>>; 2] = [None, None];
-                for (bi, (_, waddr)) in wants.iter().enumerate() {
-                    let Some(waddr) = waddr else {
-                        continue; // a window past the pool's end — not addressable, nothing to read
-                    };
-                    let mut buf = vec![0u8; WIN as usize];
-                    let stream = self.stream_ref()?;
-                    match stream
-                        .d2h(&mut buf, waddr)
-                        .and_then(|_| stream.synchronize())
-                    {
-                        Ok(()) => bufs[bi] = Some(buf),
-                        Err(e) => {
-                            use std::io::Write as _;
-                            if let Ok(mut f) = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(dir.join("windows.txt"))
-                            {
-                                let _ = writeln!(
-                                    f,
-                                    "op{opno} prog{prog} {}: window read FAILED: {e}",
-                                    wants[bi].0
-                                );
-                            }
+        if stride > 0
+            && let Some(pool) = self.seg_addr[SEG_KV.get()].clone()
+        {
+            const WIN: u64 = 1 << 20;
+            let wants: [(&str, Option<DevAddr>); 2] = [
+                ("pg1", pool.window(ByteOffset(stride), ByteSize(WIN))),
+                ("pg2", pool.window(ByteOffset(2 * stride), ByteSize(WIN))),
+            ];
+            // Read every window BEFORE touching `dump` (the stream borrow and the dump borrow
+            // are disjoint phases, the same split `d2h_seg_clamped` makes).
+            let mut bufs: [Option<Vec<u8>>; 2] = [None, None];
+            for (bi, (_, waddr)) in wants.iter().enumerate() {
+                let Some(waddr) = waddr else {
+                    continue; // a window past the pool's end — not addressable, nothing to read
+                };
+                let mut buf = vec![0u8; WIN as usize];
+                let stream = self.stream_ref()?;
+                match stream
+                    .d2h(&mut buf, waddr)
+                    .and_then(|_| stream.synchronize())
+                {
+                    Ok(()) => bufs[bi] = Some(buf),
+                    Err(e) => {
+                        use std::io::Write as _;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(dir.join("windows.txt"))
+                        {
+                            let _ = writeln!(
+                                f,
+                                "op{opno} prog{prog} {}: window read FAILED: {e}",
+                                wants[bi].0
+                            );
                         }
                     }
                 }
-                for (bi, (name, _)) in wants.iter().enumerate() {
-                    let Some(cur) = bufs[bi].as_ref() else {
-                        continue;
-                    };
-                    let dump = self.dump.as_mut().expect("initialized above");
-                    let moved = match dump.wins[bi].as_ref() {
-                        Some(prev) => prev != cur,
-                        None => cur.iter().any(|b| *b != 0),
-                    };
-                    if !moved {
-                        continue;
-                    }
-                    dump.wins[bi] = Some(cur.clone());
-                    let elems = WIN as usize / 2; // the KV planes are SEN169_FP16
-                    let mut vals = Vec::with_capacity(elems);
-                    for c in cur.as_chunks::<2>().0 {
-                        vals.push(sen_convert::sen_to_f32(sen_convert::SenF16(
-                            u16::from_le_bytes(*c),
-                        )));
-                    }
-                    let raw_bytes: Vec<u8> = vals.iter().flat_map(|x| x.to_le_bytes()).collect();
-                    let stem = format!("prog{prog}_seg2win_{name}");
-                    let tl = format!("op{opno}_prog{prog}_seg2win_{name}");
-                    let _ = std::fs::write(dir.join(format!("{stem}.bin")), &raw_bytes);
-                    let _ = std::fs::write(dir.join(format!("{stem}.n")), format!("{elems}\n"));
-                    let _ = std::fs::write(dir.join(format!("{tl}.bin")), &raw_bytes);
-                    let _ = std::fs::write(dir.join(format!("{tl}.n")), format!("{elems}\n"));
+            }
+            for (bi, (name, _)) in wants.iter().enumerate() {
+                let Some(cur) = bufs[bi].as_ref() else {
+                    continue;
+                };
+                let dump = self.dump.as_mut().expect("initialized above");
+                let moved = match dump.wins[bi].as_ref() {
+                    Some(prev) => prev != cur,
+                    None => cur.iter().any(|b| *b != 0),
+                };
+                if !moved {
+                    continue;
                 }
+                dump.wins[bi] = Some(cur.clone());
+                let elems = WIN as usize / 2; // the KV planes are SEN169_FP16
+                let mut vals = Vec::with_capacity(elems);
+                for c in cur.as_chunks::<2>().0 {
+                    vals.push(sen_convert::sen_to_f32(sen_convert::SenF16(
+                        u16::from_le_bytes(*c),
+                    )));
+                }
+                let raw_bytes: Vec<u8> = vals.iter().flat_map(|x| x.to_le_bytes()).collect();
+                let stem = format!("prog{prog}_seg2win_{name}");
+                let tl = format!("op{opno}_prog{prog}_seg2win_{name}");
+                let _ = std::fs::write(dir.join(format!("{stem}.bin")), &raw_bytes);
+                let _ = std::fs::write(dir.join(format!("{stem}.n")), format!("{elems}\n"));
+                let _ = std::fs::write(dir.join(format!("{tl}.bin")), &raw_bytes);
+                let _ = std::fs::write(dir.join(format!("{tl}.n")), format!("{elems}\n"));
             }
         }
         if !skipped.is_empty() {

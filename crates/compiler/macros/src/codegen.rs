@@ -7951,6 +7951,57 @@ fn kv_codec_for(
     }
 }
 
+/// ⭐ EVERY f32 MODEL-VALUE SCALAR THE EMISSION MINTS, RENDERED BIT-IDENTICALLY AND LINT-PROOF —
+/// the one law behind every `f32_suffixed` site below that emits a VALUE (the scale tables, the
+/// weight-scale folds, the norm offsets and epsilons), never a width or a count.
+///
+/// ⛔ THE WALL THIS CLOSES: the values are the bake's own — the exp2→exp base change rides into
+/// the scalarmul registry as ln 2 (`ExpBase::LN2`, `to_ktir_emit.rs`) — and a proc-macro literal
+/// renders them exactly. But `0.6931472f32` in the GENERATED code is, to clippy's
+/// deny-by-default `approx_constant`, a hand-typed ln 2: it fires by the thousand at the
+/// worker-hw scope, a scope no CI line ever linted (the workspace line clippys the worker
+/// featureless; the cardless spyre job clippys it at `spyre-emu`/llama). The value is DATA — the
+/// fix is the RENDERING, never an `#[allow]` on the models crate and never a rounded digit:
+/// when the value's bits are EXACTLY a named `core::f32::consts` constant, the constant's path
+/// is rendered (`::core::f32::consts::LN_2`), which carries the same bits and satisfies the
+/// lint; every other value keeps its literal. The comparison is `to_bits()` equality — an
+/// approximate match would silently rewrite a model's own constant that only NEARLY equals one
+/// of these (the lint tolerates near-misses on purpose; this rendering must not).
+fn f32_value_tokens(v: f32) -> proc_macro2::TokenStream {
+    /// clippy's `approx_constant` known-constant list — every named f32 constant of `core` the
+    /// lint recognizes, so a value equal to ANY of them renders as its path, not a literal.
+    const NAMED: [(&str, f32); 19] = [
+        ("E", core::f32::consts::E),
+        ("PI", core::f32::consts::PI),
+        ("TAU", core::f32::consts::TAU),
+        ("SQRT_2", core::f32::consts::SQRT_2),
+        ("FRAC_1_PI", core::f32::consts::FRAC_1_PI),
+        ("FRAC_1_SQRT_2", core::f32::consts::FRAC_1_SQRT_2),
+        ("FRAC_2_PI", core::f32::consts::FRAC_2_PI),
+        ("FRAC_2_SQRT_PI", core::f32::consts::FRAC_2_SQRT_PI),
+        ("FRAC_PI_2", core::f32::consts::FRAC_PI_2),
+        ("FRAC_PI_3", core::f32::consts::FRAC_PI_3),
+        ("FRAC_PI_4", core::f32::consts::FRAC_PI_4),
+        ("FRAC_PI_6", core::f32::consts::FRAC_PI_6),
+        ("FRAC_PI_8", core::f32::consts::FRAC_PI_8),
+        ("LN_10", core::f32::consts::LN_10),
+        ("LN_2", core::f32::consts::LN_2),
+        ("LOG10_2", core::f32::consts::LOG10_2),
+        ("LOG10_E", core::f32::consts::LOG10_E),
+        ("LOG2_10", core::f32::consts::LOG2_10),
+        ("LOG2_E", core::f32::consts::LOG2_E),
+    ];
+    match NAMED.iter().find(|(_, c)| c.to_bits() == v.to_bits()) {
+        Some((name, _)) => format!("::core::f32::consts::{name}")
+            .parse::<proc_macro2::TokenStream>()
+            .expect("a core::f32::consts path parses"),
+        None => {
+            let lit = proc_macro2::Literal::f32_suffixed(v);
+            quote! { #lit }
+        }
+    }
+}
+
 fn emit_canonical_params_impl(
     model: &ModelParams,
     tp_world_size: u8,
@@ -8161,13 +8212,12 @@ fn emit_canonical_params_impl(
     let gdn_conv_kernel_lit = proc_macro2::Literal::u32_unsuffixed(gdn_conv_kernel);
     let gdn_conv_dim_lit = proc_macro2::Literal::usize_unsuffixed(gdn_conv_dim);
     let spec_drafts_lit = proc_macro2::Literal::u32_unsuffixed(spec_drafts);
-    let norm_weight_offset_lit =
-        proc_macro2::Literal::f32_suffixed(norm_weight_runtime_offset(model));
+    let norm_weight_offset_lit = f32_value_tokens(norm_weight_runtime_offset(model));
     // RMSNorm eps from config (Qwen3.5: 1e-6). Without this the metal
     // `RmsNorm`/`FusedAddRmsNorm`/`gdn_rms_norm_gated` kernels fall back to
     // the trait default 1e-5, which visibly drifts on outlier-dominated
     // (massive-activation) residual streams where mean(x^2) ~ eps.
-    let rms_norm_eps_lit = proc_macro2::Literal::f32_suffixed(rms_norm_eps(model));
+    let rms_norm_eps_lit = f32_value_tokens(rms_norm_eps(model));
     // Rotary dim for the metal rope kernel's `ROT_DIM` fn-const. Mirrors
     // the rope-cache builder (codegen.rs ~2758): `partial_rotary_factor
     // * head_dim` for partial-rope arches (Qwen3.5: 0.25*256 = 64), else
@@ -9564,19 +9614,17 @@ fn emit_superdsc_wiring(
         .map(|v| proc_macro2::Literal::u32_unsuffixed(*v))
         .collect();
     // `1/hidden` over one stick — the mq>1 sum-based amax pre-scale.
-    let rms_invcols_lits: Vec<proc_macro2::Literal> = {
+    let rms_invcols_lits: Vec<proc_macro2::TokenStream> = {
         let inv = 1.0f32 / (b("hidden_size").max(1) as f32);
-        (0..64)
-            .map(|_| proc_macro2::Literal::f32_suffixed(inv))
-            .collect()
+        (0..64).map(|_| f32_value_tokens(inv)).collect()
     };
     // ⭐ EVERY COMPILE-TIME SCALAR THE KTIR READS, from the bake's own registry — not recomputed
     // here from the config. The programs bake the INDEX into themselves, so the list
     // the worker binds has to be the same list, in the same order, that the lowering indexed.
-    let scalarmul_scale_lits: Vec<proc_macro2::Literal> = gk
+    let scalarmul_scale_lits: Vec<proc_macro2::TokenStream> = gk
         .scalarmul_scales
         .iter()
-        .map(|v| proc_macro2::Literal::f32_suffixed(*v))
+        .map(|v| f32_value_tokens(*v))
         .collect();
     // Each slot's staging channel, off the bake's own df column through the ONE shared
     // projection (`wiring::scale_stage_of`) — the same mapping `bake_layout` runs, so the
@@ -9609,7 +9657,7 @@ fn emit_superdsc_wiring(
         .iter()
         .map(|(tid, scale)| {
             let tid = proc_macro2::Literal::u32_suffixed(*tid);
-            let scale = proc_macro2::Literal::f32_suffixed(*scale);
+            let scale = f32_value_tokens(*scale);
             quote! { (#tid, #scale) }
         })
         .collect();
@@ -10150,11 +10198,10 @@ fn layout_tokens(
         .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
     let places = places_interner.ident(places);
     let kws = kernel_weights.iter().map(kernel_weight_tokens);
-    // f32 literals: `Literal::f32_suffixed` round-trips the exact value, which matters — these are
-    // the granite ScalarMul multipliers, and a rounded one is a quietly wrong model.
-    let scales = scalarmul_scales
-        .iter()
-        .map(|s| proc_macro2::Literal::f32_suffixed(*s));
+    // f32 literals: `f32_value_tokens` round-trips the exact value (a literal, or the PATH of a
+    // named constant whose bits are exactly the value) — these are the granite ScalarMul
+    // multipliers, and a rounded one is a quietly wrong model.
+    let scales = scalarmul_scales.iter().map(|s| f32_value_tokens(*s));
     // Each scale slot's staging channel, off the baked stage column. The match has NO wildcard
     // on purpose — the same law the step-input stage match below states: a new channel is a new
     // variant, and this failing to compile is what forces the emission to learn it in the same
@@ -10170,7 +10217,7 @@ fn layout_tokens(
     // The fold list, same exact-value rule: a rounded multiplier is a quietly wrong weight scale.
     let folds = weight_scale_folds.iter().map(|(tid, scale)| {
         let tid = proc_macro2::Literal::u32_unsuffixed(*tid);
-        let scale = proc_macro2::Literal::f32_suffixed(*scale);
+        let scale = f32_value_tokens(*scale);
         quote! { (#tid, #scale) }
     });
     let copies = weight_copies.iter().map(|(from, to)| {
@@ -11057,7 +11104,11 @@ fn dump_wavefront_mega(
             },
             Wiring {
                 slot: Option<WiringSlot>,
-                gk: scratchy_target_spyre::lower_subtile_tape_to_superdsc::BundleWiring,
+                // Boxed: the wiring is the enum's one heavyweight payload (261 of its
+                // 264 bytes), and it crosses threads between the deferred bake and
+                // `commit_bake` — indirection keeps every `BakeEffect` one pointer wide
+                // instead of padding the ledger's vec.
+                gk: Box<scratchy_target_spyre::lower_subtile_tape_to_superdsc::BundleWiring>,
                 decode_position: u32,
                 man: String,
             },
@@ -11342,7 +11393,9 @@ fn dump_wavefront_mega(
                                     // family is the m>1 follow-up the splice refuses.
                                     paged_fold: (chunk_ceiling.is_some()
                                         && (one_request || prompt_chunk_prefix))
-                                        .then(|| superdsc::PagedFoldStatement { fold_body: false }),
+                                        .then_some(superdsc::PagedFoldStatement {
+                                            fold_body: false,
+                                        }),
                                 },
                             ) {
                                 Ok(rolled) => {
@@ -11505,9 +11558,9 @@ fn dump_wavefront_mega(
                                     // baseline's cost.
                                     // ⛔⛔⛔ AND THE FOLD PASS DOES HAVE A KTIR COUNTERPART — this
                                     // read "NO FUSED TWIN … a fold pass with no KTIR counterpart",
-                                    // which is false. `assemble_attn` still stamps
-                                    // `kv_page_fold = true` on its prefix-fold ops (one file, shared
-                                    // by both paths), so `trip_kinds_for` still has `PageFold` trips
+                                    // which is false. The fold stamps
+                                    // `kv_page_fold = true` on its prefix-fold ops (the shared
+                                    // stamp both paths mint), so `trip_kinds_for` still has `PageFold` trips
                                     // to reclassify. MEASURED, smollm2-135m under `-Fspyre-hw`: the
                                     // ladder rungs — whose twin was never removed — report `5
                                     // group(s)` split against `3 group(s)` fused for the same 75
@@ -12246,8 +12299,11 @@ fn dump_wavefront_mega(
                                                 );
                                                 // The rung under test, one fact — see
                                                 // `superdsc::GateRung`.
-                                                let gate_rung =
-                                                    superdsc::GateRung { fp: &bfp, cap };
+                                                let gate_rung = superdsc::GateRung {
+                                                    fp: &bfp,
+                                                    cap,
+                                                    page_stride_bytes: rolled.kv_page_stride,
+                                                };
                                                 let run_gate =
                                                     |prefill: Option<&superdsc::PrefillGate>| {
                                                         // The twin's own groups, fresh from the
@@ -12718,7 +12774,7 @@ fn dump_wavefront_mega(
                     };
                     fx.push(BakeEffect::Wiring {
                         slot,
-                        gk,
+                        gk: Box::new(gk),
                         decode_position: cap.saturating_sub(1),
                         man: man.clone(),
                     });
@@ -12788,7 +12844,8 @@ fn dump_wavefront_mega(
                         decode_position,
                         man,
                     } => {
-                        let w = emit_superdsc_wiring(&gk, lwd, model, decode_position, &man);
+                        let w =
+                            emit_superdsc_wiring(gk.as_ref(), lwd, model, decode_position, &man);
                         let mut s = wiring_tokens.borrow_mut();
                         match slot {
                             Some(WiringSlot::Prefill) => s.1 = Some(w),
