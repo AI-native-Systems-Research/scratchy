@@ -307,7 +307,7 @@ pub enum ForwardError {
     /// The `step`-th launch failed; nothing after it was enqueued, and the stream was drained.
     Launch { step: usize, error: KernelError },
     /// The `step`-th step is `op`, a step the lowering emits for Gemma 4 26B-A4B and no kernel
-    /// launches yet (#885's 13b and 13c remove this piece by piece; 13c deletes it). Checked over
+    /// launches yet (#885's 13b-1 to 13b-4 remove this piece by piece; 13b-4 deletes it). Checked over
     /// the whole tape before anything is uploaded or enqueued.
     NotLaunched { step: usize, op: &'static str },
     /// A copy or the stream wait failed; the stream was drained.
