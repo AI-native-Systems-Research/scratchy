@@ -339,12 +339,21 @@ pub const ROPE_BF16_ROT_MULTIPLE: u32 = 16;
 /// vectors), and its `cols` a multiple of `head_dim`. `rows` is non-zero and `rows · cols` at most
 /// `i32::MAX`.
 pub const ROPE_BF16_HEAD_MULTIPLE: u32 = 8;
-/// The `rot_dim`s the rope kernel is instantiated for (`kernels/rope_bf16.cu`): 64, one plain
-/// `st_bf<16, 64>` box, each half two 16-column base tiles (qwen3.5's partial rope); and 256, four
-/// boxes, each half two whole boxes (Gemma 4's sliding layers, a full rope on a 256-lane head). Its
-/// launcher refuses any other, so the kernel's rule is tighter than the lowering's
-/// [`ROPE_BF16_ROT_MULTIPLE`]; Gemma 4's global layers' 128 is #885's 13b-3.
-pub const ROPE_BF16_KERNEL_ROT_DIMS: &[u32] = &[64, 256];
+/// The `(rot_dim, pairing)`s the rope kernel is instantiated for (`kernels/rope_bf16.cu`): 64
+/// half-rotated, one plain `st_bf<16, 64>` box, each half two 16-column base tiles (qwen3.5's
+/// partial rope); 256 half-rotated, four boxes, each half two whole boxes (Gemma 4's sliding
+/// layers, a full rope on a 256-lane head); and 128 half-head on a 512-lane head
+/// ([`ROPE_BF16_HALF_HEAD_DIM`]), box 0 paired with box 4 (Gemma 4's global layers, proportional).
+/// Its launcher refuses any other, so the kernel's rule is tighter than the lowering's
+/// [`ROPE_BF16_ROT_MULTIPLE`].
+pub const ROPE_BF16_KERNEL_SHAPES: &[(u32, RopePairing)] = &[
+    (64, RopePairing::HalfRotated),
+    (256, RopePairing::HalfRotated),
+    (128, RopePairing::HalfHead),
+];
+/// The one head dim of the rope kernel's half-head instantiation: a whole 512-lane head is one
+/// unit of 8 boxes (`kernels/rope_bf16.cu`).
+pub const ROPE_BF16_HALF_HEAD_DIM: u32 = 512;
 /// The rope kernel's `head_dim` is a non-zero multiple of this: whole 64-column boxes, so every
 /// head starts at a box (`kernels/rope_bf16.cu`). Tighter than the lowering's
 /// [`ROPE_BF16_HEAD_MULTIPLE`], and checked by the launcher only.
@@ -418,6 +427,11 @@ pub const CUDA_MAX_BLOCKS_PER_SEQ: u32 = 128;
 pub const ATTN_PREFILL_BF16_ROWS: u32 = 128;
 /// The one head dim the attention kernel is instantiated for.
 pub const ATTN_PREFILL_BF16_HEAD_DIM: u32 = 256;
+/// The head dim of the column-split attention kernels (`kernels/attn_prefill_d512_bf16.cu`,
+/// `kernels/attn_decode_d512_bf16.cu`): Gemma 4's global layers. Each of a CTA's two consumer
+/// warpgroups keeps one 256-column half of the output; the prefill takes [`ATTN_PREFILL_BF16_ROWS`]
+/// and the decode [`ATTN_DECODE_BF16_MAX_GROUP`] as the head-dim-256 kernels do.
+pub const ATTN_D512_BF16_HEAD_DIM: u32 = 512;
 /// The one head dim the decode attention kernel is instantiated for: its query, K and V tiles are
 /// `st_bf<64, 256>`, the prefill's (`kernels/attn_decode_bf16.cu`). It takes one query row,
 /// `q_heads` a non-zero multiple of `kv_heads` by at most [`ATTN_DECODE_BF16_MAX_GROUP`], and
@@ -427,10 +441,11 @@ pub const ATTN_DECODE_BF16_HEAD_DIM: u32 = 256;
 /// stacked as the rows of one query tile, and only the 16 rows of each consumer warpgroup's warp 0
 /// are merged and stored (`kernels/attn_decode_bf16.cu`). The target models' groups are 2 to 12.
 pub const ATTN_DECODE_BF16_MAX_GROUP: u32 = 16;
-/// The one head dim the KV append is instantiated for (`kernels/kv_append_bf16.cu`): a head's row
-/// is one `sv_bf<256>`, one 512-byte box of the cache's vector tensor map. The lowering already
-/// refuses any other head dim for a `RopeAppend` (`CanonicalRefusal::KvHeadDim`).
-pub const KV_APPEND_BF16_HEAD_DIM: u32 = 256;
+/// The head dims the KV append is instantiated for (`kernels/kv_append_bf16.cu`): a head's row is
+/// one `sv_bf<256>`, one 512-byte box of the cache's vector tensor map, or one `sv_bf<512>`, two
+/// such boxes (Gemma 4's global layers). The lowering already refuses any other head dim for a
+/// `RopeAppend` (`CanonicalRefusal::KvHeadDim`).
+pub const KV_APPEND_BF16_HEAD_DIMS: &[u32] = &[256, 512];
 
 /// K's partial rope, then the paged-cache write of the rotated K and the unrotated V.
 ///
@@ -438,7 +453,7 @@ pub const KV_APPEND_BF16_HEAD_DIM: u32 = 256;
 /// `k_out`, `cols = kv_heads · head_dim`. Launch 2 copies, for each token row `t` whose
 /// `slot_mapping[t]` is not `u32::MAX`, row `t` of `k_out` and of `v` into layer `layer`'s K and
 /// V cache at that slot, bit for bit (`kernels/kv_append_bf16.cu`); its `head_dim` is
-/// [`KV_APPEND_BF16_HEAD_DIM`]. `slot_mapping` is the tape's
+/// one of [`KV_APPEND_BF16_HEAD_DIMS`]. `slot_mapping` is the tape's
 /// region ([`crate::tape::KvTape::slot_mapping`], `rows` u32); `layer` is an index into
 /// [`crate::tape::KvTape::layers`]. `k_out` overlaps no input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

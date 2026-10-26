@@ -2035,3 +2035,109 @@ fn the_windowed_decode_against_the_prefill_row_is_printed() {
         "a windowed decode or its prefill row is out of the f64 bound"
     );
 }
+
+// ── Head dim 512: Gemma 4's global layers (#923) ───────────────────
+
+/// Gemma 4's global geometry: 2 kv heads of head dim 512.
+const D512: usize = 512;
+const D512_KVH: usize = 2;
+
+/// One global layer's pool: `blocks` blocks of 2 heads of 512.
+fn d512_layout(blocks: usize) -> PagedKvLayout {
+    PagedKvLayout {
+        num_blocks: blocks as u32,
+        num_kv_heads: D512_KVH as u32,
+        block_size: BS as u32,
+        head_dim: D512 as u32,
+    }
+}
+
+/// 256 rows of 2 kv heads of 512 appended over a permuted table, rows 200..256 padding: the cache
+/// at each real row's slot is the row bit for bit, in both 256-element halves (the two TMA boxes),
+/// and every other element keeps its poison. Head dim 384 is refused with the cache untouched.
+#[test]
+fn kv_append_d512_writes_rows_bit_exactly() {
+    let device = h100();
+    let (rows, real) = (256usize, 200usize);
+    let l = d512_layout(BLOCKS);
+    let k = bf16_inputs(rows * D512_KVH * D512, 0x0923_CA01);
+    let v = bf16_inputs(rows * D512_KVH * D512, 0x0923_CA02);
+    let (kb, vb) = (up(&device, &k), up(&device, &v));
+    let poison = vec![POISON; l.buffer_elems()];
+    let (kc, vc) = (up(&device, &poison), up(&device, &poison));
+    let slot_map = slots(&TABLE[..4], 0, real, rows);
+    let sb = up_u32(&device, &slot_map);
+    // SAFETY: cudaMalloc pointers are 256-byte aligned; `k` and `v` hold rows·2·512 bf16, the
+    // slots rows u32, the caches BLOCKS·2·64·512 bf16 each, every slot in a block below BLOCKS or
+    // u32::MAX; null is the default stream, which the downloads below wait for.
+    unsafe {
+        kv_append_bf16(
+            (kb.ptr(), vb.ptr()),
+            sb.ptr(),
+            (kc.ptr(), vc.ptr()),
+            (rows as u32, D512_KVH as u32, D512 as u32),
+            (BS as u32, BLOCKS as u32),
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("kv_append_bf16 at head dim 512");
+    let (kh, vh) = (kc.download().expect("K"), vc.download().expect("V"));
+    let (mut want_k, mut want_v) = (poison.clone(), poison);
+    for (t, &slot) in slot_map.iter().enumerate().take(real) {
+        for h in 0..D512_KVH {
+            let at = l.elem_offset_for_global_slot(slot, h as u32);
+            let row = (t * D512_KVH + h) * D512;
+            want_k[at..][..D512].copy_from_slice(&k[row..][..D512]);
+            want_v[at..][..D512].copy_from_slice(&v[row..][..D512]);
+        }
+    }
+    // Each half on its own, so a box written at the wrong column shows as its own count.
+    let half = |got: &[u16], want: &[u16], c: usize| -> usize {
+        (got.as_chunks::<D512>()
+            .0
+            .iter()
+            .zip(want.as_chunks::<D512>().0))
+        .map(|(g, w)| mismatched_bits(&g[c * 256..][..256], &w[c * 256..][..256]))
+        .sum()
+    };
+    let (lo, hi) = (
+        half(&kh, &want_k, 0) + half(&vh, &want_v, 0),
+        half(&kh, &want_k, 1) + half(&vh, &want_v, 1),
+    );
+    let mut pass = lo == 0 && hi == 0;
+    eprintln!(
+        "kv_append d512 rows={rows} real={real} kv_heads={D512_KVH} table={:?}: \
+         mismatched_bits={} (cols 0..256: {lo}, 256..512: {hi}) {}",
+        &TABLE[..4],
+        lo + hi,
+        verdict(pass)
+    );
+    // SAFETY: refused before any pointer is touched.
+    let got = unsafe {
+        kv_append_bf16(
+            (kb.ptr(), vb.ptr()),
+            sb.ptr(),
+            (kc.ptr(), vc.ptr()),
+            (rows as u32, D512_KVH as u32, 384),
+            (BS as u32, BLOCKS as u32),
+            std::ptr::null_mut(),
+        )
+    };
+    let want = Err(KernelError::KvAppendShape {
+        rows: rows as u32,
+        kv_heads: D512_KVH as u32,
+        head_dim: 384,
+        block_size: BS as u32,
+    });
+    let untouched = kc.download().expect("K") == kh && vc.download().expect("V") == vh;
+    let ok = got == want && untouched;
+    eprintln!(
+        "kv_append d512 refusal (head_dim 384): {got:?} cache_untouched={untouched} {}",
+        verdict(ok)
+    );
+    pass &= ok;
+    assert!(
+        pass,
+        "the 512-wide KV append is not bit-exact, or a refusal wrote"
+    );
+}

@@ -776,3 +776,154 @@ fn rope_bf16_full_256_matches_the_cpu_reference() {
         "the full 256-lane rope is out of bound, or a refusal wrote"
     );
 }
+
+// ── The proportional rope (Gemma 4's global layers, #923) ──────────
+
+/// Gemma 4's global heads: 128 of each 512-lane head rotated, lane `d < 64` paired with lane
+/// `d + 256` (`RopePairing::HalfHead`), the frequencies over the head dim, at `rope_theta` 1e6.
+const G_HD: u32 = 512;
+const G_ROT: u32 = 128;
+const THETA_GLOBAL: f64 = 1e6;
+
+/// The proportional rope over `(rows, cols)` at head dim 512: the rotated lanes within the RoPE
+/// bound against `rope_reference` with `pair = 256`, the pass-through lanes (boxes 1..3 and
+/// 5..7 of each head) bit-exact, every position-0 row bit-exact, the tail intact, over positions
+/// `0 ..` spread to 8191. Self-checks on the rows past position 0: pairing at `d + 64` (the
+/// half-rotated pairing) misses the bound on at least 90% of the rotated lanes; and a table built
+/// with `freq_dim = rot_dim` misses on at least 90% at position 1000. A half-head launch at head
+/// dim 256, at rot_dim 64, and a half-rotated launch at rot_dim 128 are refused with the output
+/// untouched.
+#[test]
+fn rope_bf16_proportional_matches_the_cpu_reference() {
+    use scratchy_target_cuda::kernels::rope_paired_bf16;
+    use scratchy_target_cuda::rotary::rotary_rows_with_freq_dim;
+    use scratchy_target_cuda::step::RopePairing;
+    let device = h100();
+    let mut pass = true;
+    let run = |x: &[u16], table: &[u16], (rows, cols): (usize, usize)| {
+        let (xb, tb) = (
+            DeviceBuffer::upload(&device, x).expect("upload x"),
+            DeviceBuffer::upload(&device, table).expect("upload the table"),
+        );
+        let out = output(&device, x.len());
+        // SAFETY: x and out are rows·cols bf16, the table rows·G_ROT, none overlapping, all live
+        // until `result` downloads `out`, which waits for the launch.
+        unsafe {
+            rope_paired_bf16(
+                xb.ptr(),
+                tb.ptr(),
+                out.ptr(),
+                (rows as u32, cols as u32),
+                (G_HD, G_ROT, RopePairing::HalfHead),
+                std::ptr::null_mut(),
+            )
+        }
+        .expect("rope_paired_bf16 launch, half-head");
+        result(&out, x.len())
+    };
+    let shape = (G_HD as usize, G_ROT as usize);
+    for (rows, cols) in [(1usize, 8192usize), (512, 8192), (7, 1024)] {
+        let positions: Vec<u32> = (0..rows as u32)
+            .map(|t| {
+                if rows == 1 {
+                    0
+                } else {
+                    t * 8191 / (rows as u32 - 1)
+                }
+            })
+            .collect();
+        let seed = 0x0923_0E0E ^ ((rows as u64) << 32 | cols as u64);
+        let x = bf16_inputs(rows * cols, seed);
+        let table = rotary_rows_with_freq_dim(&positions, G_ROT, G_HD, THETA_GLOBAL);
+        let (gpu, tail) = run(&x, &table, (rows, cols));
+        let refs = rope_reference(&x, &table, (rows, cols), shape, G_HD as usize / 2);
+        let cmp = compare_rope(&gpu, &x, &refs, cols);
+        let zero_mismatched: usize = (0..rows)
+            .filter(|&r| positions[r] == 0)
+            .map(|r| mismatched_bits(&gpu[r * cols..][..cols], &x[r * cols..][..cols]))
+            .sum();
+        let (mut missed, mut rotated) = (0, 0);
+        for r in (0..rows).filter(|&r| positions[r] != 0) {
+            let at = r * cols..(r + 1) * cols;
+            let row_table = &table[r * G_ROT as usize..][..G_ROT as usize];
+            let wrong = rope_reference(&x[at.clone()], row_table, (1, cols), shape, 64);
+            let (m, n) = rope_misses(&gpu[at], &wrong);
+            missed += m;
+            rotated += n;
+        }
+        let distinguishes = rotated == 0 || missed * 10 >= rotated * 9;
+        let ok = cmp.rotated.pass()
+            && cmp.pass_through_mismatched == 0
+            && zero_mismatched == 0
+            && tail
+            && distinguishes;
+        eprintln!(
+            "rope_bf16 proportional rows={rows} cols={cols} head_dim={G_HD} rot_dim={G_ROT} \
+             theta={THETA_GLOBAL}: {} pass_through_mismatched={} \
+             position0_mismatched_bits={zero_mismatched} tail_intact={tail} \
+             pairing_d_plus_64_self_check_misses={missed}/{rotated} (≥ 90%) {}",
+            cmp.rotated.line(),
+            cmp.pass_through_mismatched,
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    // The frequency self-check: the table with `freq_dim = rot_dim` at position 1000, against the
+    // kernel run on the right table.
+    {
+        let (rows, cols) = (1usize, 8192usize);
+        let x = bf16_inputs(rows * cols, 0x0923_F0F0);
+        let table = rotary_rows_with_freq_dim(&[1000], G_ROT, G_HD, THETA_GLOBAL);
+        let wrong_table = rotary_rows_with_freq_dim(&[1000], G_ROT, G_ROT, THETA_GLOBAL);
+        let (gpu, _) = run(&x, &table, (rows, cols));
+        let wrong = rope_reference(&x, &wrong_table, (rows, cols), shape, G_HD as usize / 2);
+        let (missed, rotated) = rope_misses(&gpu, &wrong);
+        let ok = missed * 10 >= rotated * 9;
+        eprintln!(
+            "rope_bf16 proportional freq_dim_rot_dim_self_check position=1000: \
+             misses={missed}/{rotated} (≥ 90%) {}",
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    let (rows, cols) = (7u32, 1024u32);
+    let len = (rows * cols) as usize;
+    let input = DeviceBuffer::upload(&device, &vec![0; len]).expect("upload x");
+    let table = DeviceBuffer::upload(&device, &vec![0; len]).expect("upload the table");
+    for (head_dim, rot_dim, pairing) in [
+        (256u32, 128u32, RopePairing::HalfHead),
+        (G_HD, 64, RopePairing::HalfHead),
+        (G_HD, G_ROT, RopePairing::HalfRotated),
+    ] {
+        let out = refused_out(&device, len);
+        // SAFETY: the launcher refuses these shapes before it touches any pointer.
+        let got = unsafe {
+            rope_paired_bf16(
+                input.ptr(),
+                table.ptr(),
+                out.ptr(),
+                (rows, cols),
+                (head_dim, rot_dim, pairing),
+                std::ptr::null_mut(),
+            )
+        };
+        let want = Err(KernelError::RopeShape {
+            rows,
+            cols,
+            head_dim,
+            rot_dim,
+        });
+        let kept = unchanged(&out);
+        let ok = got == want && kept;
+        eprintln!(
+            "rope_bf16 proportional refusal head_dim={head_dim} rot_dim={rot_dim} \
+             pairing={pairing:?}: {got:?} out_unchanged={kept} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(
+        pass,
+        "the proportional rope is out of bound, a pass-through lane moved, or a refusal wrote"
+    );
+}

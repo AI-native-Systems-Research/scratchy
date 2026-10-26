@@ -55,6 +55,17 @@
 // alignment slack = 11,264 bytes; at rot_dim 256, 2 stages × 8 KiB and the table's 8 KiB, plus the
 // slack = 25,600 bytes. Both are dynamic shared memory under the 48 KiB default, so no one-time
 // setup.
+//
+// Gemma 4's global layers (#885's 13b-3) rotate 128 of each 512-lane head in the half-head
+// pairing (HF `_compute_proportional_rope_parameters`, metal's `ROPE_PAIR_OFF = HEAD_DIM/2`):
+// lane d < 64 pairs with lane d + 256, and lanes 64..255 and 320..511 pass through. That is the
+// `<128, true>` instantiation (`HALF_HEAD`): its unit is a whole head, 8 boxes, box 0 rotated with
+// box 4 by the table's box 0 (cos) and box 1 (sin), the rot_dim-256 path's maps on one box pair,
+// and boxes 1..3 and 5..7 stored as loaded. The table is `[rows, 128]`, two boxes, its frequencies
+// over the head dim (`RotaryTable::freq_dim`, the host's business). Shared memory: 2 stages × 16
+// KiB and the table's 4 KiB, plus the slack = 37,888 bytes, under the default too. The `<64,
+// false>` and `<256, false>` instantiations are the code above, unchanged: `HALF_HEAD` only picks
+// the unit's and the pair's box counts, which are those instantiations' own constants.
 
 #include "kittens.cuh"
 
@@ -83,39 +94,51 @@ using half_rt = rt_fl<ROWS, BOX_COLS / 2>;
 static_assert(half_rt::width == 2 && box_rt::width == 4,
               "each half of a 64-lane rotated width is two 16-column base tiles");
 
-// One instantiation per rotated width (`step::ROPE_BF16_KERNEL_ROT_DIMS`): `BOXES` boxes per unit
-// of `ROT` lanes, and the ring's `STAGES` units.
-template <int ROT>
+// The half-head instantiation's one head dim: 8 boxes, a whole head per unit.
+constexpr int HALF_HEAD_DIM = 512;
+// One instantiation per rotated width and pairing (`step::ROPE_BF16_KERNEL_SHAPES`): `BOXES` boxes
+// per unit (`ROT` lanes, or a whole head for the half-head pairing), the table's `TABLE_BOXES`,
+// the box offset `PAIR_OFF` of a rotated box's partner, and the ring's `STAGES` units.
+template <int ROT, bool HALF_HEAD>
 struct rope_shape {
-    static_assert(ROT == 64 || ROT == 256, "the instantiated rotated widths");
-    static constexpr int BOXES = ROT / BOX_COLS;
+    static_assert((ROT == 64 || ROT == 256) != HALF_HEAD && (!HALF_HEAD || ROT == 128),
+                  "the instantiated rotated widths and pairings");
+    static constexpr int TABLE_BOXES = ROT / BOX_COLS;
+    static constexpr int BOXES = HALF_HEAD ? HALF_HEAD_DIM / BOX_COLS : TABLE_BOXES;
+    static constexpr int PAIR_OFF = HALF_HEAD ? BOXES / 2 : TABLE_BOXES / 2;
     static constexpr int STAGES = ROT == 64 ? 4 : 2;
-    static constexpr size_t SMEM_BOXES = (STAGES + 1) * BOXES * sizeof(box);
+    static constexpr size_t SMEM_BOXES = (STAGES * BOXES + TABLE_BOXES) * sizeof(box);
     // The boxes plus the slack `tma_swizzle_allocator` may spend aligning the first to 1024 bytes.
     static constexpr int SMEM_BYTES = int(SMEM_BOXES) + 1024;
 };
-static_assert(rope_shape<64>::SMEM_BOXES == 10240, "4 stages x 2 KiB, plus the table's box");
-static_assert(rope_shape<256>::SMEM_BOXES == 24576, "2 stages x 8 KiB, plus the table's 8 KiB");
-static_assert(rope_shape<64>::SMEM_BYTES <= 48 * 1024 && rope_shape<256>::SMEM_BYTES <= 48 * 1024,
+static_assert(rope_shape<64, false>::SMEM_BOXES == 10240, "4 stages x 2 KiB, plus the table's box");
+static_assert(rope_shape<256, false>::SMEM_BOXES == 24576,
+              "2 stages x 8 KiB, plus the table's 8 KiB");
+static_assert(rope_shape<128, true>::SMEM_BOXES == 36864,
+              "2 stages x 16 KiB (a 512-lane head), plus the table's 4 KiB");
+static_assert(rope_shape<64, false>::SMEM_BYTES <= 48 * 1024 &&
+                  rope_shape<256, false>::SMEM_BYTES <= 48 * 1024 &&
+                  rope_shape<128, true>::SMEM_BYTES <= 48 * 1024,
               "under the default dynamic shared memory limit");
 
 struct rope_globals {
     box_gl x;
     box_gl table;
     box_gl out;
-    // The `rot_dim`-lane units of a row, and of a head.
+    // The units of a row, and of a head (one unit is `rot_dim` lanes, or a half-head head).
     int row_units;
     int head_units;
 };
 
-template <int ROT>
+template <int ROT, bool HALF_HEAD>
 __global__ __launch_bounds__(NUM_THREADS, 1) void rope_bf16_ker(const __grid_constant__ rope_globals g) {
-    constexpr int BOXES = rope_shape<ROT>::BOXES;
-    constexpr int STAGES = rope_shape<ROT>::STAGES;
+    constexpr int BOXES = rope_shape<ROT, HALF_HEAD>::BOXES;
+    constexpr int TABLE_BOXES = rope_shape<ROT, HALF_HEAD>::TABLE_BOXES;
+    constexpr int STAGES = rope_shape<ROT, HALF_HEAD>::STAGES;
     extern __shared__ int __shm[];
     tma_swizzle_allocator al((int*)&__shm[0]);
     box(&x_smem)[STAGES][BOXES] = al.allocate<box, STAGES, BOXES>();
-    box(&t_smem)[BOXES] = al.allocate<box, BOXES>();
+    box(&t_smem)[TABLE_BOXES] = al.allocate<box, TABLE_BOXES>();
     __shared__ kittens::semaphore arrived[STAGES];
     __shared__ kittens::semaphore table_arrived;
 
@@ -128,8 +151,8 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rope_bf16_ker(const __grid_con
     }
     __syncwarp();
 
-    warp::tma::expect_bytes(table_arrived, BOXES * sizeof(box));
-    for (int b = 0; b < BOXES; b++) {
+    warp::tma::expect_bytes(table_arrived, TABLE_BOXES * sizeof(box));
+    for (int b = 0; b < TABLE_BOXES; b++) {
         warp::tma::load_async(t_smem[b], g.table, coord<box>{0, 0, row_block, b}, table_arrived);
     }
     // Unit `i` of the row block (boxes `i · BOXES ..`) into stage `i % STAGES`.
@@ -192,15 +215,17 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rope_bf16_ker(const __grid_con
                 x.tiles[0][3] = b.tiles[0][1];
                 warp::store(x_smem[stage][0], x);
             } else {
-                // Box b < BOXES/2 (lanes 64b .. 64b + 63) pairs with box b + BOXES/2, by the
-                // table's box b (cos) and b + BOXES/2 (sin). The rot_dim-64 path's products,
+                // Box b < PAIR (lanes 64b .. 64b + 63) pairs with box b + PAIR_OFF, by the
+                // table's box b (cos) and b + PAIR (sin): at rot_dim 256 PAIR = PAIR_OFF = 2; in
+                // the half-head pairing PAIR = 1 and PAIR_OFF = 4. The rot_dim-64 path's products,
                 // difference and sum, each its own map, ordered so the cos box is dead before the
                 // sin box is loaded into the same registers: five `rt_fl<16, 64>` live at most.
-                constexpr int PAIR = BOXES / 2;
+                constexpr int PAIR = TABLE_BOXES / 2;
+                constexpr int PAIR_OFF = rope_shape<ROT, HALF_HEAD>::PAIR_OFF;
                 for (int b = 0; b < PAIR; b++) {
                     box_rt x0, x1, t, y0, y1;
                     warp::load(x0, x_smem[stage][b]);
-                    warp::load(x1, x_smem[stage][b + PAIR]);
+                    warp::load(x1, x_smem[stage][b + PAIR_OFF]);
                     warp::load(t, t_smem[b]);
                     warp::mul(y0, x0, t);
                     warp::mul(y1, x1, t);
@@ -212,7 +237,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rope_bf16_ker(const __grid_con
                     warp::mul(x0, x0, t);
                     warp::add(y1, y1, x0);
                     warp::store(x_smem[stage][b], y0);
-                    warp::store(x_smem[stage][b + PAIR], y1);
+                    warp::store(x_smem[stage][b + PAIR_OFF], y1);
                 }
             }
             __syncwarp();
@@ -224,42 +249,53 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rope_bf16_ker(const __grid_con
     warp::tma::store_async_wait();
 }
 
-// Launch the `ROT` instantiation over the launcher's checked shape.
-template <int ROT>
+// Launch the `<ROT, HALF_HEAD>` instantiation over the launcher's checked shape.
+template <int ROT, bool HALF_HEAD>
 int launch_rope(bf16* xp, bf16* tp, bf16* op, uint32_t rows, uint32_t cols, uint32_t head_dim,
                 cudaStream_t stream) {
+    // The lanes of one unit: `ROT`, or a whole half-head head.
+    constexpr uint32_t UNIT = uint32_t(rope_shape<ROT, HALF_HEAD>::BOXES * BOX_COLS);
     // Building each `gl` encodes its tensor map into host memory; nothing is allocated on the
     // device. Every row stride is a multiple of 128 bytes.
     box_gl xg{xp, nullptr, nullptr, size_t(rows), size_t(cols)};
     box_gl tg{tp, nullptr, nullptr, size_t(rows), size_t(ROT)};
     box_gl og{op, nullptr, nullptr, size_t(rows), size_t(cols)};
-    rope_globals G{xg, tg, og, int(cols / uint32_t(ROT)), int(head_dim / uint32_t(ROT))};
+    rope_globals G{xg, tg, og, int(cols / UNIT), int(head_dim / UNIT)};
     void* args[] = {&G};
     const dim3 grid((rows + uint32_t(ROWS) - 1) / uint32_t(ROWS)), block(NUM_THREADS);
-    return static_cast<int>(cudaLaunchKernel(rope_bf16_ker<ROT>, grid, block, args,
-                                             rope_shape<ROT>::SMEM_BYTES, stream));
+    return static_cast<int>(cudaLaunchKernel(rope_bf16_ker<ROT, HALF_HEAD>, grid, block, args,
+                                             rope_shape<ROT, HALF_HEAD>::SMEM_BYTES, stream));
 }
 
 }  // namespace
+
+// The pairings (`step::RopePairing`, in its declaration order): lane d pairs with d + rot_dim/2,
+// or with d + head_dim/2.
+constexpr uint32_t PAIRING_HALF_ROTATED = 0;
+constexpr uint32_t PAIRING_HALF_HEAD = 1;
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
 // SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode); any other value =
 // the cudaError_t cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the
 // runtime's last-error state.
 //
-// Refused before any pointer is touched: `rows`, `cols` or `head_dim` zero; `rot_dim` not 64 or
-// 256 (`step::ROPE_BF16_KERNEL_ROT_DIMS`, the rotated widths the kernel is instantiated for);
-// `head_dim` not a multiple of 64 (`step::ROPE_BF16_KERNEL_HEAD_MULTIPLE`, whole boxes), or not a
-// multiple of `rot_dim` (whole units, which at rot_dim 64 the 64 rule already is);
-// `cols` not a multiple of `head_dim`;
-// `rows · cols` above INT_MAX. `x`, `table` and `out` must be 16-byte-aligned device pointers to
-// `rows·cols`, `rows·rot_dim` and `rows·cols` bf16, `out` overlapping neither input. Its dynamic
-// shared memory is under the 48 KiB default, so no one-time setup. The launch is asynchronous on
-// `stream`; the caller owns it and synchronizes.
-extern "C" int scratchy_cuda_rope_bf16(const void* x, const void* table, void* out, uint32_t rows,
-                                       uint32_t cols, uint32_t head_dim, uint32_t rot_dim,
-                                       void* stream /* cudaStream_t; null = default stream */) {
-    if (rows == 0 || cols == 0 || head_dim == 0 || (rot_dim != 64 && rot_dim != 256) ||
+// Refused before any pointer is touched: `rows`, `cols` or `head_dim` zero; `(rot_dim, pairing)`
+// not (64, half-rotated), (256, half-rotated) or (128, half-head) (`step::ROPE_BF16_KERNEL_SHAPES`,
+// the instantiations); `head_dim` not a multiple of 64 (`step::ROPE_BF16_KERNEL_HEAD_MULTIPLE`,
+// whole boxes), or not a multiple of `rot_dim` (whole units, which at rot_dim 64 the 64 rule
+// already is); a half-head `head_dim` not 512, the instantiation's head; `cols` not a multiple of
+// `head_dim`; `rows · cols` above INT_MAX. `x`, `table` and `out` must be 16-byte-aligned device
+// pointers to `rows·cols`, `rows·rot_dim` and `rows·cols` bf16, `out` overlapping neither input.
+// Its dynamic shared memory is under the 48 KiB default, so no one-time setup. The launch is
+// asynchronous on `stream`; the caller owns it and synchronizes.
+extern "C" int scratchy_cuda_rope_paired_bf16(const void* x, const void* table, void* out,
+                                              uint32_t rows, uint32_t cols, uint32_t head_dim,
+                                              uint32_t rot_dim, uint32_t pairing,
+                                              void* stream /* cudaStream_t; null = default */) {
+    const bool half_rotated = pairing == PAIRING_HALF_ROTATED && (rot_dim == 64 || rot_dim == 256);
+    const bool half_head =
+        pairing == PAIRING_HALF_HEAD && rot_dim == 128 && head_dim == uint32_t(HALF_HEAD_DIM);
+    if (rows == 0 || cols == 0 || head_dim == 0 || !(half_rotated || half_head) ||
         head_dim % HEAD_MULTIPLE != 0 || head_dim % rot_dim != 0 || cols % head_dim != 0 ||
         uint64_t(rows) * uint64_t(cols) > uint64_t(INT_MAX)) {
         return SCRATCHY_CUDA_ERR_SHAPE;
@@ -270,9 +306,21 @@ extern "C" int scratchy_cuda_rope_bf16(const void* x, const void* table, void* o
         bf16* tp = static_cast<bf16*>(const_cast<void*>(table));
         bf16* op = static_cast<bf16*>(out);
         const cudaStream_t s = static_cast<cudaStream_t>(stream);
-        return rot_dim == 64 ? launch_rope<64>(xp, tp, op, rows, cols, head_dim, s)
-                             : launch_rope<256>(xp, tp, op, rows, cols, head_dim, s);
+        if (half_head) {
+            return launch_rope<128, true>(xp, tp, op, rows, cols, head_dim, s);
+        }
+        return rot_dim == 64 ? launch_rope<64, false>(xp, tp, op, rows, cols, head_dim, s)
+                             : launch_rope<256, false>(xp, tp, op, rows, cols, head_dim, s);
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }
+}
+
+// The half-rotated rope, `scratchy_cuda_rope_paired_bf16` with `pairing` half-rotated: its codes
+// and refusals, so `rot_dim` not 64 or 256 is refused (`step::ROPE_BF16_KERNEL_ROT_DIMS`).
+extern "C" int scratchy_cuda_rope_bf16(const void* x, const void* table, void* out, uint32_t rows,
+                                       uint32_t cols, uint32_t head_dim, uint32_t rot_dim,
+                                       void* stream /* cudaStream_t; null = default stream */) {
+    return scratchy_cuda_rope_paired_bf16(x, table, out, rows, cols, head_dim, rot_dim,
+                                          PAIRING_HALF_ROTATED, stream);
 }

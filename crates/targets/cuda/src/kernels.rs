@@ -13,6 +13,8 @@
 use std::ffi::c_void;
 use std::fmt;
 
+use crate::step::RopePairing;
+
 /// `SCRATCHY_CUDA_ERR_SHAPE` in the `.cu` launchers: the shape was refused, nothing launched.
 const ERR_SHAPE: i32 = -1;
 /// `SCRATCHY_CUDA_ERR_HOST` in the `.cu` launchers: a C++ exception was caught on the host side
@@ -117,6 +119,17 @@ unsafe extern "C" {
         cols: u32,
         head_dim: u32,
         rot_dim: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_rope_paired_bf16(
+        x: *const c_void,
+        table: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        cols: u32,
+        head_dim: u32,
+        rot_dim: u32,
+        pairing: u32,
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_gate_split_bf16(
@@ -851,8 +864,8 @@ pub unsafe fn soft_cap_bf16(
 /// Asynchronous.
 ///
 /// Refused with [`KernelError::RopeShape`], before any pointer is touched, unless `rows`, `cols`
-/// and `head_dim` are non-zero, `rot_dim` is 64 or 256 (`step::ROPE_BF16_KERNEL_ROT_DIMS`, the
-/// widths the kernel is instantiated for), `head_dim` a multiple of 64
+/// and `head_dim` are non-zero, `rot_dim` is 64 or 256 (the half-rotated entries of
+/// `step::ROPE_BF16_KERNEL_SHAPES`, the widths the kernel is instantiated for), `head_dim` a multiple of 64
 /// (`step::ROPE_BF16_KERNEL_HEAD_MULTIPLE`) and of `rot_dim`, `cols` a multiple of `head_dim`, and
 /// `rows · cols` at most `i32::MAX`. A failed launch returns the launch's own `cudaError_t`.
 ///
@@ -873,6 +886,45 @@ pub unsafe fn rope_bf16(
     // SAFETY: as `rms_norm_bf16`'s.
     let code =
         unsafe { scratchy_cuda_rope_bf16(x, table, out, rows, cols, head_dim, rot_dim, stream) };
+    check(
+        code,
+        KernelError::RopeShape {
+            rows,
+            cols,
+            head_dim,
+            rot_dim,
+        },
+    )
+}
+
+/// [`rope_bf16`] in either pairing: `HalfRotated` is [`rope_bf16`] itself, the same launch; in
+/// `HalfHead` (Gemma 4's proportional rope) lane `d < rot_dim/2` pairs with lane `d + head_dim/2`,
+/// and every other lane is copied bit for bit. Asynchronous.
+///
+/// Refused with [`KernelError::RopeShape`] as [`rope_bf16`], except that `(rot_dim, pairing)` must
+/// be an entry of `step::ROPE_BF16_KERNEL_SHAPES`, and a `HalfHead` `head_dim` must be 512
+/// (`step::ROPE_BF16_HALF_HEAD_DIM`).
+///
+/// # Safety
+///
+/// As [`rope_bf16`]'s.
+pub unsafe fn rope_paired_bf16(
+    x: *const c_void,
+    table: *const c_void,
+    out: *mut c_void,
+    (rows, cols): (u32, u32),
+    (head_dim, rot_dim, pairing): (u32, u32, RopePairing),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // The launcher's pairing codes, `kernels/rope_bf16.cu`'s `PAIRING_*`.
+    let code = match pairing {
+        RopePairing::HalfRotated => 0,
+        RopePairing::HalfHead => 1,
+    };
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_rope_paired_bf16(x, table, out, rows, cols, head_dim, rot_dim, code, stream)
+    };
     check(
         code,
         KernelError::RopeShape {
@@ -970,8 +1022,8 @@ pub unsafe fn gate_scale_bf16(
 /// block is at or past `num_blocks` writes nothing. Asynchronous.
 ///
 /// Refused with [`KernelError::KvAppendShape`], before any pointer is touched, unless `rows` and
-/// `kv_heads` are non-zero, `head_dim` is 256 (`step::KV_APPEND_BF16_HEAD_DIM`, the one head dim
-/// the kernel is instantiated for), `block_size` 64 (`step::CUDA_KV_BLOCK_SIZE`), and
+/// `kv_heads` are non-zero, `head_dim` is 256 or 512 (`step::KV_APPEND_BF16_HEAD_DIMS`, the head
+/// dims the kernel is instantiated for), `block_size` 64 (`step::CUDA_KV_BLOCK_SIZE`), and
 /// `rows · kv_heads · head_dim` at most `i32::MAX`. A `num_blocks` of 0 writes nothing and
 /// launches nothing. A failed
 /// launch returns the launch's own `cudaError_t`.

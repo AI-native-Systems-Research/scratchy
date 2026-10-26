@@ -38,11 +38,11 @@ use scratchy_subtile::paged_kv_layout::PagedKvLayout;
 use crate::kernels::{self, KernelError};
 use crate::rotary::fill_rotary_rows_with_freq_dim;
 use crate::step::{
-    AddBf16, AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16,
-    ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16,
-    GatedDeltaNetBf16, GemmBf16, KV_APPEND_BF16_HEAD_DIM, LayerScaleBf16, MOE_ROUTE_EXPERTS,
-    MatmulKernel, MoeRouteBf16, MoeWeight, PairRows, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16,
-    RopeBf16, RouteProgram, RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16,
+    ATTN_PREFILL_BF16_HEAD_DIM, AddBf16, AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16,
+    ExpertGemmBf16, ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16,
+    GateSplitBf16, GatedDeltaNetBf16, GemmBf16, LayerScaleBf16, MOE_ROUTE_EXPERTS, MatmulKernel,
+    MoeRouteBf16, MoeWeight, PairRows, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16,
+    RouteProgram, RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape,
@@ -581,7 +581,7 @@ fn not_launched(tape: &CudaTape, s: &CudaStep) -> Option<&'static str> {
     // of that geometry is one its layers' K and V fit.
     let pool_class = |layer: u32| {
         tape.kv.zip(tape.kv_class(layer)).is_some_and(|(kv, c)| {
-            c.head_dim == KV_APPEND_BF16_HEAD_DIM
+            c.head_dim == ATTN_PREFILL_BF16_HEAD_DIM
                 && (c.kv_heads, c.head_dim) == (kv.kv_heads, kv.head_dim)
         })
     };
