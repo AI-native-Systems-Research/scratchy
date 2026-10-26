@@ -24,7 +24,8 @@ runs everything else.
   **Quick run** below. The script with no flags but `--unpinned`: this Mac's
   four models (the small set below 64 GB, the large set at 64 GB), scratchy
   alone, cold and warm, one rep, the users × prompt grid at 1, 4, 8 and 16
-  users at 64 GB (1, 2 and 4 below it) and 64-token answers, two rounds of each users count a cell.
+  users at 64 GB (1, 2 and 4 below it, with prompts above 1 user up to
+  4096 tokens there) and 64-token answers, two rounds of each users count a cell.
   scratchy runs at its defaults on every Mac, and every cell runs: one
   that runs out of memory is recorded as failed. The page keeps every
   other engine's numbers, and scratchy's frozen launches, from the last full
