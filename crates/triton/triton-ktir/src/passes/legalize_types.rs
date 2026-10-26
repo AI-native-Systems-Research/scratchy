@@ -32,11 +32,21 @@
 //!
 //! RED-STOP, and it is real rather than comment-only: after the walk, any op result
 //! still typed compute-domain f32 is GENUINE f32 that this pass did not, and must
-//! not silently, legalize. Silent precision degradation is forbidden; legalizing
-//! genuine f32 is an owner decision. (A PROTECTED result -- one that reaches an
-//! `arith.fptosi` -- is exempt: it is legal f32 by construction, and a value that
-//! leaks OFF the island into an unprotected consumer is refused here BY NAME rather
-//! than degraded.)
+//! not silently, legalize. Silent precision degradation is forbidden. (A PROTECTED
+//! result -- one that reaches an `arith.fptosi` -- is exempt: it is legal f32 by
+//! construction, and a value that leaks OFF the island into an unprotected consumer
+//! is refused here BY NAME rather than degraded.)
+//!
+//! ⭐ THE FP32-BINDING GATE (auditor ruling 2026-10-26): the pass exists to refuse
+//! SILENT f32→f16 narrowing. An op the CARD BINDS AT FP32 lowers AS f32 -- nothing
+//! narrows, so there is nothing to refuse: the RED-stop consults [`FP32_CARD_BINDS`]
+//! and lets a bound op's f32 result stand. An op with NO fp32 bind (`math.log` --
+//! the vendor templates bind it to fp16 alone) keeps today's refusal by name:
+//! emitting it would mean silently degrading it to f16, or failing at dxp. The
+//! bindings are TARGET-ABI FACTS -- a const table the pass takes as input, each row
+//! cited to the vendor DDL template and line it was read from -- never match arms,
+//! never an inference: an opcode absent from the table is UNBOUND at fp32, and the
+//! refusal stands (fail-closed).
 
 use crate::ir::*;
 use crate::passes::walk::{self, OpPath};
@@ -455,7 +465,21 @@ fn step_3_remove_truncf(module: &mut Module) {
 }
 
 /// --- RED-stop: refuse to leave genuine f32 in the compute domain.
+///
+/// ⭐ THE FP32-BINDING GATE (auditor ruling 2026-10-26): the pass exists to refuse
+/// SILENT f32→f16 narrowing. An op the CARD BINDS AT FP32 lowers AS f32 -- nothing
+/// narrows, so there is nothing to refuse: the RED-stop consults [`FP32_CARD_BINDS`]
+/// and lets a bound op's f32 result stand. An op with NO fp32 bind (`math.log` --
+/// the vendor templates bind it to fp16 alone) keeps today's refusal by name:
+/// emitting it would mean silently degrading it to f16, or failing at dxp. The
+/// bindings are TARGET-ABI FACTS -- a const table the pass takes as input, each row
+/// cited to the vendor DDL template and line it was read from -- never match arms,
+/// never an inference: an opcode absent from the table is UNBOUND at fp32, and the
+/// refusal stands (fail-closed).
 fn red_stop_on_genuine_f32(module: &Module, protected: &HashSet<Ssa>) -> Result<()> {
+    // The operand-element-type half of the binding key: `type_of` covers every
+    // def and block arg, so the gate can ask what an f32 result was fed.
+    let index = module.def_index();
     for op in module.ops_deep() {
         if is_descriptor_or_ktdp_op(op) {
             continue;
@@ -471,14 +495,36 @@ fn red_stop_on_genuine_f32(module: &Module, protected: &HashSet<Ssa>) -> Result<
                 continue;
             }
             if t.is_compute_f32() {
+                // ⭐ THE FP32-BINDING GATE: an op the card binds at fp32 lowers
+                // AS f32 — nothing narrows, so there is nothing to refuse. The
+                // binding is the const table's own measured fact, cited to the
+                // vendor DDL template and line, and keyed on the FULL
+                // (opcode, operand element type, result element type) triple —
+                // `arith.sitofp` from an i1 is NOT the DDL's int32tofp32
+                // (IEEE_INT32 input), so a same-spelling different-source op is
+                // UNBOUND and the refusal below stands (fail-closed).
+                let in_elems: Vec<DType> = op
+                    .operands
+                    .iter()
+                    .filter_map(|u| index.type_of(*u).and_then(|ty| ty.elem()))
+                    .collect();
+                if FP32_CARD_BINDS.iter().any(|(opcode, din, dout, _)| {
+                    *opcode == op.kind.spelling()
+                        && in_elems.contains(din)
+                        && Some(*dout) == t.elem()
+                }) {
+                    continue;
+                }
                 return Err(Refusal::new(
                     PASS,
                     format!(
                         "genuine f32 compute remains after collapsing the \
                          stability-widening island -- this op's f32 result is not a \
-                         transient extf/truncf artifact. Refusing to silently degrade it \
-                         to f16 (SP-E2-03 RED-stop: f32->f16 of genuine compute is an \
-                         owner decision, not a pass code-around). The op is '{}'.",
+                         transient extf/truncf artifact, and the card binds it to no \
+                         fp32 op (see FP32_CARD_BINDS; math.log is fp16-only in the \
+                         vendor templates). Refusing to silently degrade it to f16 \
+                         (SP-E2-03 RED-stop: f32 of an fp32-unbound op is an owner \
+                         decision, not a pass code-around). The op is '{}'.",
                         op.kind.spelling()
                     ),
                 ));
@@ -487,6 +533,52 @@ fn red_stop_on_genuine_f32(module: &Module, protected: &HashSet<Ssa>) -> Result<
     }
     Ok(())
 }
+
+/// ⭐ THE CARD'S OWN FP32 BINDINGS — the vendor DDLs' op-to-dtype binds, stated
+/// ONCE as a const table the RED-stop takes as input (the auditor ruling named
+/// above): an op bound at fp32 lowers AS f32 — no narrowing happens, nothing to
+/// refuse — while an op with NO row here keeps the refusal, because emitting it
+/// would silently degrade it to f16 or fail at dxp.
+///
+/// ⛔ EVERY ROW IS A MEASURED FACT, read directly from the vendor templates on
+/// the card pod (2026-10-26): the row's citation names the template and line.
+/// Nothing here is inferred from a composition or from another op's bind, and an
+/// opcode absent from the table is treated as UNBOUND at fp32 — fail-closed, the
+/// refusal stands. The opcodes are the KTIR spellings `from_ttir`'s census
+/// admits; only opcodes that can carry an f32 RESULT at RED-stop time need rows
+/// (an unprotected `arith.extf` is already gone by step 1, an `arith.truncf`
+/// result is f16, an `arith.fptosi` result is i32 — none of them consult this
+/// table).
+///
+/// ⛔ THE KEY IS THE FULL (opcode, OPERAND element type, RESULT element type)
+/// TRIPLE, never the spelling alone: the DDL binds `int32tofp32` from an
+/// IEEE_INT32 input, so an `arith.sitofp` reading an i1 is a DIFFERENT op with
+/// the SAME spelling — unbound, refused. A row matches only when the op's result
+/// element type is the row's and one of its operands carries the row's input
+/// element type.
+const FP32_CARD_BINDS: &[(&str, DType, DType, &str)] = &[
+    // broadcast_ops.ddl — the two-tensor pointwise family, instantiated fp32.
+    ("arith.addf", DType::F32, DType::F32, "broadcast_ops.ddl:25 add [%type_fp16, %type_fp32]"),
+    ("arith.subf", DType::F32, DType::F32, "broadcast_ops.ddl:26 sub [%type_fp16, %type_fp32]"),
+    ("arith.mulf", DType::F32, DType::F32, "broadcast_ops.ddl:27 mul [%type_fp16, %type_fp32]"),
+    ("arith.divf", DType::F32, DType::F32, "broadcast_ops.ddl:44 realdiv [%type_fp16, %type_fp32]"),
+    ("arith.maxnumf", DType::F32, DType::F32, "broadcast_ops.ddl:45 maximum [%type_fp16, %type_fp32]"),
+    ("arith.minnumf", DType::F32, DType::F32, "broadcast_ops.ddl:46 minimum [%type_fp16, %type_fp32]"),
+    // unary_parallel.ddl — the one-input family and the integer convert.
+    ("math.absf", DType::F32, DType::F32, "unary_parallel.ddl:36 abs [%type_fp16, %type_fp32]"),
+    ("arith.negf", DType::F32, DType::F32, "unary_parallel.ddl:37 neg [%type_fp16, %type_fp32]"),
+    ("arith.sitofp", DType::I32, DType::F32, "unary_parallel.ddl:49 int32tofp32 [%type_fp32]"),
+    ("math.exp", DType::F32, DType::F32, "unary_parallel.ddl:39 exp [%type_fp32]"),
+    ("math.tanh", DType::F32, DType::F32, "unary_parallel.ddl:35 tanhfp32 [%type_fp32]"),
+    ("math.rsqrt", DType::F32, DType::F32, "unary_parallel.ddl:43 rsqrt [%type_fp16, %type_fp32]"),
+    // `tt.broadcast` MOVES DATA, so it is dtype-free: its result is its input's
+    // dtype verbatim (no DDL op, no opfunc — the emitter copies the lanes), and
+    // an f32 result is an f32 input arriving intact. It is the one non-DDL row:
+    // the general table's MOVES-DATA class (auditor ruling 2026-10-26).
+    ("tt.broadcast", DType::F32, DType::F32, "moves data — dtype-free, no DDL op"),
+    // NOTE, deliberately NO row for math.log: unary_pipeline.ddl:22 binds it to
+    // [%type_fp16] ALONE — the one bind this gate exists to keep refusing.
+];
 
 #[cfg(test)]
 mod tests {
@@ -561,14 +653,14 @@ module {
 
     #[test]
     fn genuine_f32_compute_red_stops_by_name() {
-        // No extf anywhere, so there is no island: this f32 add is GENUINE and must
-        // be refused rather than silently degraded.
+        // No extf anywhere, so there is no island, and math.log has NO fp32 card
+        // binding (unary_pipeline.ddl:22 binds it to fp16 alone): this f32 log is
+        // GENUINE and UNBOUND, and must be refused rather than silently degraded.
+        // (An fp32-BOUND op in the same position stays -- the fold test below.)
         let src = "\
 module {
-  tt.func public @k(%q: !tt.ptr<f16>) attributes {noinline = false} {
-    %a = arith.constant dense<1.000000e+00> : tensor<64xf32>
-    %b = arith.constant dense<2.000000e+00> : tensor<64xf32>
-    %c = arith.addf %a, %b : tensor<64xf32>
+  tt.func public @k(%q: tensor<64xf32>) attributes {noinline = false} {
+    %l = math.log %q : tensor<64xf32>
     tt.return
   }
 }
@@ -577,6 +669,89 @@ module {
         let e = run(&mut m).unwrap_err();
         assert!(e.message.contains("genuine f32 compute remains"), "got {e}");
         assert!(e.message.contains("owner decision"), "got {e}");
+        assert!(e.message.contains("math.log"), "the refusal names the op: {e}");
+    }
+
+    /// The auditor's fp32-binding gate (ruling 2026-10-26), reduced to the
+    /// sampler's own fold shape: an integer convert headed f32 chain (sitofp,
+    /// absf, mulf, subf, minnumf, maxnumf, addf) terminating at an EXPLICIT
+    /// author-written truncf. Every op in the chain is fp32-bound on the card
+    /// (broadcast_ops.ddl:25-27/45-46, unary_parallel.ddl:36/49), so nothing
+    /// narrows and the RED-stop lets every f32 result stand.
+    #[test]
+    fn an_f32_op_the_card_binds_at_fp32_stays_f32() {
+        let src = "\
+module {
+  tt.func public @k(%r: tensor<64xi32>, %fm8: tensor<64xf32>, %ftop: tensor<64xf32>, %fzero: tensor<64xf32>, %fhalf: tensor<64xf32>, %fm22: tensor<64xf32>) attributes {noinline = false} {
+    %rf = arith.sitofp %r : tensor<64xi32> to tensor<64xf32>
+    %a = math.absf %rf : tensor<64xf32>
+    %n = arith.mulf %a, %fm8 : tensor<64xf32>
+    %t = arith.subf %ftop, %n : tensor<64xf32>
+    %nm = arith.minnumf %n, %t : tensor<64xf32>
+    %np = arith.maxnumf %nm, %fzero : tensor<64xf32>
+    %s = arith.addf %np, %fhalf : tensor<64xf32>
+    %u = arith.mulf %s, %fm22 : tensor<64xf32>
+    %u16 = arith.truncf %u : tensor<64xf32> to tensor<64xf16>
+    tt.return
+  }
+}
+";
+        let mut m = parse::parse(src).unwrap();
+        run(&mut m).expect("every op in the fold is fp32-bound on the card");
+        let c = m.census();
+        let get = |n: &str| c.iter().find(|(k, _)| k == n).map(|(_, v)| *v).unwrap_or(0);
+        // The whole fold stands at f32 -- no op was retyped, collapsed, or refused.
+        assert_eq!(get("arith.sitofp"), 1, "the integer convert stays f32");
+        assert_eq!(get("math.absf"), 1);
+        assert_eq!(get("arith.mulf"), 2);
+        assert_eq!(get("arith.subf"), 1);
+        assert_eq!(get("arith.minnumf"), 1);
+        assert_eq!(get("arith.maxnumf"), 1);
+        assert_eq!(get("arith.addf"), 1);
+        // The author's explicit narrowing SURVIVES: it is f32 -> f16, not the
+        // f16 -> f16 no-op step 3 removes.
+        assert_eq!(get("arith.truncf"), 1, "the explicit truncf survives");
+        for op in m.ops_deep() {
+            for t in &op.result_types {
+                if op.kind.spelling() == "arith.truncf" {
+                    assert_eq!(t.elem(), Some(DType::F16), "the truncf narrows to f16");
+                } else if !matches!(op.kind, OpKind::ArithConstant) {
+                    assert_eq!(
+                        t.elem(),
+                        Some(DType::F32),
+                        "{} kept its f32 result",
+                        op.kind.spelling()
+                    );
+                }
+            }
+        }
+    }
+
+    /// `tt.broadcast` MOVES DATA (dtype-free): an f32 broadcast result is the f32
+    /// input arriving intact — the sampler's per-row operand alignment shape — so
+    /// the RED-stop lets it stand rather than refusing it as genuine compute.
+    #[test]
+    fn an_f32_tt_broadcast_moves_data_and_stands() {
+        let src = "\
+module {
+  tt.func public @k(%q: tensor<1x1xf32>) attributes {noinline = false} {
+    %b = tt.broadcast %q : tensor<1x1xf32> -> tensor<1x64xf32>
+    tt.return
+  }
+}
+";
+        let mut m = parse::parse(src).unwrap();
+        run(&mut m).expect("tt.broadcast moves data — nothing narrows, nothing to refuse");
+        let b = m
+            .ops_deep()
+            .into_iter()
+            .find(|o| o.kind.spelling() == "tt.broadcast")
+            .unwrap();
+        assert_eq!(
+            b.result_type().and_then(|t| t.elem()),
+            Some(DType::F32),
+            "the broadcast keeps its f32 result"
+        );
     }
 
     #[test]
@@ -714,16 +889,19 @@ module {
     /// reach the fptosi. Retyping that consumer would silently degrade a value the
     /// kernel stated as exactness-f32; skipping the retype leaves it genuine-f32
     /// for the RED-stop to refuse BY NAME -- fail-closed through the existing gate.
+    /// The leaking consumer is math.log, an op with NO fp32 card binding
+    /// (unary_pipeline.ddl:22): under the auditor's fp32-binding gate a leak onto
+    /// a BOUND op is legal (it lowers as f32 -- the fold test above), so the leak
+    /// this test guards is the one onto an op the card cannot run at f32.
     #[test]
     fn a_leak_off_the_fptosi_island_red_stops_rather_than_degrading() {
         let src = "\
 module {
   tt.func public @k(%q: !tt.ptr<f16>) attributes {noinline = false} {
     %b = arith.constant dense<6.25e+02> : tensor<1x64xf16>
-    %h = arith.constant dense<1.000000e+00> : tensor<1x64xf16>
     %bf = arith.extf %b : tensor<1x64xf16> to tensor<1x64xf32>
     %i = arith.fptosi %bf : tensor<1x64xf32> to tensor<1x64xi32>
-    %leak = arith.addf %bf, %h : tensor<1x64xf32>
+    %leak = math.log %bf : tensor<1x64xf32>
     tt.return
   }
 }
@@ -732,7 +910,7 @@ module {
         let e = run(&mut m).unwrap_err();
         assert!(e.message.contains("genuine f32 compute remains"), "got {e}");
         assert!(
-            e.message.contains("arith.addf"),
+            e.message.contains("math.log"),
             "the refusal names the leaking op: {e}"
         );
     }
