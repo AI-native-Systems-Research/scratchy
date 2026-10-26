@@ -2038,9 +2038,11 @@ fn the_windowed_decode_against_the_prefill_row_is_printed() {
 
 // ── Head dim 512: Gemma 4's global layers (#923) ───────────────────
 
-/// Gemma 4's global geometry: 2 kv heads of head dim 512.
+/// Gemma 4's global geometry: 16 query heads over 2 kv heads of head dim 512, scale 1.
 const D512: usize = 512;
+const D512_QH: usize = 16;
 const D512_KVH: usize = 2;
+const D512_SCALE: f32 = 1.0;
 
 /// One global layer's pool: `blocks` blocks of 2 heads of 512.
 fn d512_layout(blocks: usize) -> PagedKvLayout {
@@ -2139,5 +2141,752 @@ fn kv_append_d512_writes_rows_bit_exactly() {
     assert!(
         pass,
         "the 512-wide KV append is not bit-exact, or a refusal wrote"
+    );
+}
+
+/// The D = 512 launches' imports, beside the qwen and windowed tests' above.
+use scratchy_target_cuda::kernels::{attn_decode_d512_bf16, attn_prefill_d512_bf16};
+
+/// Fresh D = 512 caches of `DEC_BLOCKS` blocks, every element `fill` (K) and `v_fill` (V), then
+/// the `tokens` keys and values written over `table` with the 512-wide append.
+fn d512_caches(
+    device: &CudaDevice,
+    (k, v): (&[u16], &[u16]),
+    tokens: usize,
+    table: &[u32],
+    (fill, v_fill): (&[u16], &[u16]),
+) -> (DeviceBuffer, DeviceBuffer) {
+    let (kc, vc) = (up(device, fill), up(device, v_fill));
+    let sb = up_u32(device, &slots(table, 0, tokens, tokens));
+    let (kb, vb) = (up(device, k), up(device, v));
+    // SAFETY: cudaMalloc pointers are 256-byte aligned; `k` and `v` hold tokens·2·512 bf16, the
+    // slots tokens u32, the caches DEC_BLOCKS·2·64·512 bf16 each, every slot in a block below
+    // DEC_BLOCKS; null is the default stream, which the download below waits for.
+    unsafe {
+        kv_append_bf16(
+            (kb.ptr(), vb.ptr()),
+            sb.ptr(),
+            (kc.ptr(), vc.ptr()),
+            (tokens as u32, D512_KVH as u32, D512 as u32),
+            (BS as u32, DEC_BLOCKS as u32),
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("kv_append_bf16 at head dim 512");
+    sb.download().expect("wait for the append");
+    (kc, vc)
+}
+
+/// The elements of one D = 512 cache of `DEC_BLOCKS` blocks.
+fn d512_elems() -> usize {
+    d512_layout(DEC_BLOCKS).buffer_elems()
+}
+
+/// The D = 512 prefill of `q` (`[rows, 16 · 512]`) over the caches, `[P, L]` and `table`; the
+/// output, downloaded.
+fn d512_prefill(
+    device: &CudaDevice,
+    q: &[u16],
+    caches: (&DeviceBuffer, &DeviceBuffer),
+    table: &[u32],
+    (prefix_len, q_len, rows): (usize, usize, usize),
+) -> Result<Vec<u16>, KernelError> {
+    let qb = up(device, q);
+    let out = up(device, &vec![SENTINEL; rows * D512_QH * D512]);
+    let tb = up_u32(device, table);
+    let sb = up_u32(device, &[prefix_len as u32, q_len as u32]);
+    // SAFETY: cudaMalloc pointers are 256-byte aligned; `q` and `out` hold rows·16·512 bf16, `out`
+    // its own allocation; the caches DEC_BLOCKS·2·64·512 each; `table` covers the ceil((P+L)/64)
+    // blocks the keys need, each below DEC_BLOCKS; null is the default stream.
+    unsafe {
+        attn_prefill_d512_bf16(
+            (qb.ptr(), out.ptr()),
+            (caches.0.ptr(), caches.1.ptr()),
+            (tb.ptr(), sb.ptr()),
+            (rows as u32, D512_QH as u32, D512_KVH as u32, D512 as u32),
+            (BS as u32, DEC_BLOCKS as u32),
+            (D512_SCALE, 0),
+            std::ptr::null_mut(),
+        )
+    }?;
+    Ok(out.download().expect("download the output"))
+}
+
+/// The D = 512 decode of one query row `q` (`[1, 16 · 512]`) at position `kv_len − 1`; the
+/// output, downloaded.
+fn d512_decode(
+    device: &CudaDevice,
+    q: &[u16],
+    caches: (&DeviceBuffer, &DeviceBuffer),
+    table: &[u32],
+    kv_len: usize,
+) -> Result<Vec<u16>, KernelError> {
+    let qb = up(device, q);
+    let out = up(device, &vec![SENTINEL; D512_QH * D512]);
+    let tb = up_u32(device, table);
+    let sb = up_u32(device, &[kv_len as u32 - 1, 1]);
+    // SAFETY: as `d512_prefill`'s, for one query row.
+    unsafe {
+        attn_decode_d512_bf16(
+            (qb.ptr(), out.ptr()),
+            (caches.0.ptr(), caches.1.ptr()),
+            (tb.ptr(), sb.ptr()),
+            (D512_QH as u32, D512_KVH as u32, D512 as u32),
+            (BS as u32, DEC_BLOCKS as u32),
+            (D512_SCALE, 0),
+            std::ptr::null_mut(),
+        )
+    }?;
+    Ok(out.download().expect("download the output"))
+}
+
+/// One D = 512 case's inputs over `tokens` keys: `q_rows` query rows in [−1/8, 1/8] (so
+/// `scale · Σ_d |q k| ≤ 512 / 8 = 64 = ATTN_SCORE_MAX` at scale 1), and keys and values in
+/// [−1, 1].
+fn d512_inputs(q_rows: usize, tokens: usize, seed: u64) -> [Vec<u16>; 3] {
+    let q = (centred_gains(q_rows * D512_QH * D512, seed).into_iter())
+        .map(|b| bits(bf16::from_bits(b).to_f32() / 2.0))
+        .collect();
+    [
+        q,
+        bf16_inputs(tokens * D512_KVH * D512, seed ^ 0x100),
+        bf16_inputs(tokens * D512_KVH * D512, seed ^ 0x200),
+    ]
+}
+
+/// The f64 reference of rows `0 .. q_len` of a full causal D = 512 attention of `q` (its row `i`
+/// at position `P + i`) over `[P + L, 2 · 512]` keys and values, in 128-row chunks across the
+/// host's threads: a chunk passes `attention_reference` the keys up to its last row's.
+fn d512_reference(
+    q: &[u16],
+    (k, v): (&[u16], &[u16]),
+    (prefix_len, q_len): (usize, usize),
+) -> Reference {
+    const CHUNK: usize = 128;
+    let (width, kv_width) = (D512_QH * D512, D512_KVH * D512);
+    let chunks = q_len.div_ceil(CHUNK);
+    let threads = (std::thread::available_parallelism()).map_or(1, |n| n.get().min(chunks));
+    let next = &AtomicUsize::new(0);
+    let mut parts: Vec<Option<Reference>> = vec![None; chunks];
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(move || {
+                    let mut mine = Vec::new();
+                    loop {
+                        let c = next.fetch_add(1, Ordering::Relaxed);
+                        if c >= chunks {
+                            break mine;
+                        }
+                        let (r0, r1) = (c * CHUNK, ((c + 1) * CHUNK).min(q_len));
+                        let end = prefix_len + r1;
+                        let part = attention_reference(&AttnCase {
+                            q: &q[r0 * width..r1 * width],
+                            k: &k[..end * kv_width],
+                            v: &v[..end * kv_width],
+                            q_heads: D512_QH,
+                            kv_heads: D512_KVH,
+                            head_dim: D512,
+                            prefix_len: prefix_len + r0,
+                            q_len: r1 - r0,
+                            scale: f64::from(D512_SCALE),
+                            window: None,
+                        });
+                        mine.push((c, part));
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            for (c, part) in worker.join().expect("a reference thread") {
+                parts[c] = Some(part);
+            }
+        }
+    });
+    let mut refs = Vec::with_capacity(q_len * width);
+    let mut score_max = 0.0f64;
+    for (part, max) in parts.into_iter().map(|p| p.expect("every chunk")) {
+        refs.extend(part);
+        score_max = score_max.max(max);
+    }
+    (refs, score_max)
+}
+
+/// The D = 512 prefill cases, `(P, L)`: one 512-row bucket, the 4096-row one, a 300-key prefix,
+/// and a 96-row chunk at 4000 (a partial last tile).
+const D512_PREFILLS: [(usize, usize); 4] = [(0, 512), (0, 4096), (300, 512), (4000, 96)];
+/// The D = 512 decode lengths: one key, each side of the first and fifth tile boundary, and up to
+/// the codegen capacity.
+const D512_DECODES: [usize; 7] = [1, 64, 65, 320, 321, 4096, 8192];
+
+/// Every D = 512 prefill and decode case within #791's f64 bound, over a shuffled block table
+/// whose unused slots are NaN, with the largest `scale · Σ|qk|` printed and at most
+/// `ATTN_SCORE_MAX`, and no output non-finite.
+#[test]
+fn the_d512_attention_is_within_the_f64_bound() {
+    let device = h100();
+    let nan = vec![POISON; d512_elems()];
+    let mut pass = true;
+    for (p, len) in D512_PREFILLS {
+        let rows = len.div_ceil(128) * 128;
+        let tokens = p + len;
+        let seed = 0x0D51_2000 ^ (tokens as u64) << 16 ^ p as u64;
+        let [q, k, v] = d512_inputs(rows, tokens, seed);
+        let table = shuffled_blocks(seed);
+        let caches = d512_caches(&device, (&k, &v), tokens, &table, (&nan, &nan));
+        let need = tokens.div_ceil(BS);
+        let out = d512_prefill(
+            &device,
+            &q,
+            (&caches.0, &caches.1),
+            &table[..need],
+            (p, len, rows),
+        )
+        .expect("attn_prefill_d512_bf16");
+        let (refs, score_max) = d512_reference(&q, (&k, &v), (p, len));
+        let cmp = compare_attention(&out[..len * D512_QH * D512], &refs, D512_QH * D512);
+        let ok = cmp.pass() && score_max <= ATTN_SCORE_MAX && all_finite(&out[..refs.len()]);
+        eprintln!(
+            "d512 prefill P={p} L={len} rows={rows}: {} score_max={score_max:.3} (≤ {ATTN_SCORE_MAX}) {}",
+            cmp.line(),
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    for kv_len in D512_DECODES {
+        let seed = 0x0D51_2DEC ^ kv_len as u64;
+        let [q, k, v] = d512_inputs(1, kv_len, seed);
+        let table = shuffled_blocks(seed);
+        let caches = d512_caches(&device, (&k, &v), kv_len, &table, (&nan, &nan));
+        let need = kv_len.div_ceil(BS);
+        let out = d512_decode(&device, &q, (&caches.0, &caches.1), &table[..need], kv_len)
+            .expect("attn_decode_d512_bf16");
+        let (refs, score_max) = d512_reference(&q, (&k, &v), (kv_len - 1, 1));
+        let cmp = compare_attention(&out, &refs, D512_QH * D512);
+        let ok = cmp.pass() && score_max <= ATTN_SCORE_MAX && all_finite(&out);
+        eprintln!(
+            "d512 decode kv_len={kv_len}: {} score_max={score_max:.3} (≤ {ATTN_SCORE_MAX}) {}",
+            cmp.line(),
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(pass, "a D = 512 attention is out of its f64 bound");
+}
+
+/// The exact probes at D = 512, prefill and decode.
+///
+/// Mask and block table: K = 0, so every allowed p is 1, and V of key j is one-hot at lane j, in
+/// the low half for j < 256 and the high half from 256 on; every unwritten slot's V holds the
+/// poison (one-hot at `slot % 512`, or NaN). Row i's output is `1/(P+i+1)` (one bf16 rounding) in
+/// lanes `0 ..= P+i` and exactly `+0.0` elsewhere, in both halves.
+///
+/// GQA and halves: K = 0, and kv head h's V is `h + 1` in lanes 0..256 and `h + 3` in 256..512,
+/// so query head g's output is exactly `g/hr + 1` in its low half and `g/hr + 3` in its high half:
+/// a warpgroup that stored the other half, or read the other kv head, shows.
+#[test]
+fn the_d512_mask_block_table_and_gqa_probes_are_exact() {
+    let device = h100();
+    let l = d512_layout(DEC_BLOCKS);
+    let zero = vec![0u16; d512_elems()];
+    let mut pass = true;
+    let one_hot = |n: usize| -> Vec<u16> {
+        let mut v = vec![0u16; n * D512_KVH * D512];
+        for j in 0..n {
+            for h in 0..D512_KVH {
+                v[(j * D512_KVH + h) * D512 + j] = bits(1.0);
+            }
+        }
+        v
+    };
+    // The probe's output check: `1/n` (within one bf16 rounding) in lanes `< n`, `+0` past them.
+    let check = |out: &[u16], n: usize| -> (usize, usize) {
+        let want = bits(1.0 / n as f32);
+        let (mut nonzero, mut off) = (0, 0);
+        for (d, &got) in out.iter().enumerate().map(|(e, g)| (e % D512, g)) {
+            if d < n {
+                off += usize::from(got.abs_diff(want) > 1);
+            } else {
+                nonzero += usize::from(got != 0);
+            }
+        }
+        (nonzero, off)
+    };
+    for poison in [VPoison::OneHot, VPoison::Nan] {
+        let vpool = match poison {
+            VPoison::OneHot => {
+                let mut v = zero.clone();
+                for slot in 0..DEC_BLOCKS * BS {
+                    for h in 0..D512_KVH {
+                        v[l.elem_offset_for_global_slot(slot as u32, h as u32) + slot % D512] =
+                            bits(64.0);
+                    }
+                }
+                v
+            }
+            VPoison::Nan => vec![POISON; d512_elems()],
+        };
+        for (rows, p, len) in [
+            (128usize, 0usize, 128usize),
+            (128, 37, 100),
+            (256, 0, 256),
+            (128, 300, 100),
+            (512, 0, 400),
+        ] {
+            let tokens = p + len;
+            let k = vec![0u16; tokens * D512_KVH * D512];
+            let caches = d512_caches(
+                &device,
+                (&k, &one_hot(tokens)),
+                tokens,
+                &TABLE,
+                (&zero, &vpool),
+            );
+            let q = bf16_inputs(rows * D512_QH * D512, 0x0D51_2A77 + (rows + p) as u64);
+            let out = d512_prefill(&device, &q, (&caches.0, &caches.1), &TABLE, (p, len, rows))
+                .expect("attn_prefill_d512_bf16");
+            let width = D512_QH * D512;
+            let (mut nonzero, mut off) = (0, 0);
+            for i in 0..len {
+                let (z, o) = check(&out[i * width..][..width], p + i + 1);
+                nonzero += z;
+                off += o;
+            }
+            let ok = nonzero == 0 && off == 0;
+            eprintln!(
+                "d512 mask/table probe poison={poison:?} rows={rows} P={p} L={len}: \
+                 nonzero_in_zero_lanes={nonzero} one_over_n_lanes_off={off} {}",
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+        for kv_len in [1usize, 65, 300, 400] {
+            let k = vec![0u16; kv_len * D512_KVH * D512];
+            let caches = d512_caches(
+                &device,
+                (&k, &one_hot(kv_len)),
+                kv_len,
+                &TABLE,
+                (&zero, &vpool),
+            );
+            let q = bf16_inputs(D512_QH * D512, 0x0D51_2D77 + kv_len as u64);
+            let out = d512_decode(&device, &q, (&caches.0, &caches.1), &TABLE, kv_len)
+                .expect("attn_decode_d512_bf16");
+            let (nonzero, off) = check(&out, kv_len);
+            let ok = nonzero == 0 && off == 0;
+            eprintln!(
+                "d512 decode mask/table probe poison={poison:?} kv_len={kv_len}: \
+                 nonzero_in_zero_lanes={nonzero} one_over_n_lanes_off={off} {}",
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    let hr = D512_QH / D512_KVH;
+    let tokens = 130;
+    let k = vec![0u16; tokens * D512_KVH * D512];
+    let v: Vec<u16> = (0..tokens * D512_KVH * D512)
+        .map(|e| bits(((e / D512) % D512_KVH + 1 + 2 * usize::from(e % D512 >= 256)) as f32))
+        .collect();
+    let caches = d512_caches(&device, (&k, &v), tokens, &TABLE, (&zero, &zero));
+    let want = |heads: usize| -> Vec<u16> {
+        (0..heads * D512)
+            .map(|e| {
+                bits(((e / D512) % D512_QH / hr + 1 + 2 * usize::from(e % D512 >= 256)) as f32)
+            })
+            .collect()
+    };
+    let q = bf16_inputs(256 * D512_QH * D512, 0x0D51_2600);
+    let out = d512_prefill(
+        &device,
+        &q,
+        (&caches.0, &caches.1),
+        &TABLE,
+        (0, tokens, 256),
+    )
+    .expect("attn_prefill_d512_bf16");
+    let prefill = mismatched_bits(&out[..tokens * D512_QH * D512], &want(tokens * D512_QH));
+    let out = d512_decode(
+        &device,
+        &q[..D512_QH * D512],
+        (&caches.0, &caches.1),
+        &TABLE,
+        tokens,
+    )
+    .expect("attn_decode_d512_bf16");
+    let decode = mismatched_bits(&out, &want(D512_QH));
+    let ok = prefill == 0 && decode == 0;
+    eprintln!(
+        "d512 GQA and halves probe heads={D512_QH}/{D512_KVH}: prefill mismatched_bits={prefill} \
+         decode mismatched_bits={decode} {}",
+        verdict(ok)
+    );
+    pass &= ok;
+    assert!(pass, "a D = 512 probe is not exact");
+}
+
+/// The two warpgroups' scores, row max and row sum are the same bits. Not dumped from the kernel
+/// (it has no debug output): instead V's high half is a copy of its low half, so each warpgroup
+/// runs its P·V on the same values, and the two output halves are bit-identical exactly when the
+/// two warpgroups' `P` tiles and sums are. Prefill at (0, 4096) and (300, 512), decode at 65 and
+/// 4096; random Q and K.
+#[test]
+fn the_d512_halves_agree() {
+    let device = h100();
+    let nan = vec![POISON; d512_elems()];
+    let mirror = |v: &mut Vec<u16>| {
+        for row in v.as_chunks_mut::<D512>().0 {
+            let (lo, hi) = row.split_at_mut(256);
+            hi.copy_from_slice(lo);
+        }
+    };
+    let halves = |out: &[u16]| -> usize {
+        (out.as_chunks::<D512>().0.iter())
+            .map(|row| mismatched_bits(&row[..256], &row[256..]))
+            .sum()
+    };
+    let mut pass = true;
+    for (p, len) in [(0usize, 4096usize), (300, 512)] {
+        let rows = len.div_ceil(128) * 128;
+        let tokens = p + len;
+        let [q, k, mut v] = d512_inputs(rows, tokens, 0x0D51_2AA0 + p as u64);
+        mirror(&mut v);
+        let table = shuffled_blocks(0x0D51_2AA0);
+        let caches = d512_caches(&device, (&k, &v), tokens, &table, (&nan, &nan));
+        let out = d512_prefill(&device, &q, (&caches.0, &caches.1), &table, (p, len, rows))
+            .expect("attn_prefill_d512_bf16");
+        let mismatched = halves(&out[..len * D512_QH * D512]);
+        eprintln!(
+            "d512 halves prefill P={p} L={len}: mismatched_bits={mismatched} {}",
+            verdict(mismatched == 0)
+        );
+        pass &= mismatched == 0;
+    }
+    for kv_len in [65usize, 4096] {
+        let [q, k, mut v] = d512_inputs(1, kv_len, 0x0D51_2AD0 + kv_len as u64);
+        mirror(&mut v);
+        let table = shuffled_blocks(0x0D51_2AD0);
+        let caches = d512_caches(&device, (&k, &v), kv_len, &table, (&nan, &nan));
+        let out = d512_decode(&device, &q, (&caches.0, &caches.1), &table, kv_len)
+            .expect("attn_decode_d512_bf16");
+        let mismatched = halves(&out);
+        eprintln!(
+            "d512 halves decode kv_len={kv_len}: mismatched_bits={mismatched} {}",
+            verdict(mismatched == 0)
+        );
+        pass &= mismatched == 0;
+    }
+    assert!(pass, "the two warpgroups' row statistics differ");
+}
+
+/// A repeat, and the same sequence over a different (shuffled) block table, give the same bits,
+/// prefill and decode.
+#[test]
+fn the_d512_attention_is_deterministic() {
+    let device = h100();
+    let nan = vec![POISON; d512_elems()];
+    let (p, len, rows) = (300usize, 512usize, 512usize);
+    let tokens = p + len;
+    let [q, k, v] = d512_inputs(rows, tokens, 0x0D51_2DE7);
+    let mut pass = true;
+    let (ta, tb) = (shuffled_blocks(1), shuffled_blocks(2));
+    let a = d512_caches(&device, (&k, &v), tokens, &ta, (&nan, &nan));
+    let b = d512_caches(&device, (&k, &v), tokens, &tb, (&nan, &nan));
+    let run = |c: &(DeviceBuffer, DeviceBuffer), t: &[u32]| {
+        d512_prefill(&device, &q, (&c.0, &c.1), t, (p, len, rows)).expect("attn_prefill_d512_bf16")
+    };
+    let first = run(&a, &ta);
+    let (repeat, shuffled) = (
+        mismatched_bits(&first, &run(&a, &ta)),
+        mismatched_bits(&first, &run(&b, &tb)),
+    );
+    let dec = |c: &(DeviceBuffer, DeviceBuffer), t: &[u32]| {
+        d512_decode(&device, &q[..D512_QH * D512], (&c.0, &c.1), t, tokens).expect("decode")
+    };
+    let d0 = dec(&a, &ta);
+    let (drepeat, dshuffled) = (
+        mismatched_bits(&d0, &dec(&a, &ta)),
+        mismatched_bits(&d0, &dec(&b, &tb)),
+    );
+    let ok = repeat == 0 && shuffled == 0 && drepeat == 0 && dshuffled == 0;
+    eprintln!(
+        "d512 determinism: prefill repeat mismatched_bits={repeat} shuffled_table \
+         mismatched_bits={shuffled}; decode repeat mismatched_bits={drepeat} shuffled_table \
+         mismatched_bits={dshuffled} {}",
+        verdict(ok)
+    );
+    pass &= ok;
+    assert!(pass, "a D = 512 attention is not deterministic");
+}
+
+/// Rows of a chunk (a prefill at prefix P) are bit-identical to the same rows of one forward over
+/// the whole sequence: chunks at P = 256 (on a tile boundary) and P = 100 (off one), against one
+/// 512-row forward.
+#[test]
+fn a_d512_chunk_is_bit_identical_to_the_same_rows_of_one_forward() {
+    let device = h100();
+    let nan = vec![POISON; d512_elems()];
+    let tokens = 512;
+    let [q, k, v] = d512_inputs(tokens, tokens, 0x0D51_2C40);
+    let table = shuffled_blocks(0x0D51_2C40);
+    let caches = d512_caches(&device, (&k, &v), tokens, &table, (&nan, &nan));
+    let need = tokens.div_ceil(BS);
+    let whole = d512_prefill(
+        &device,
+        &q,
+        (&caches.0, &caches.1),
+        &table[..need],
+        (0, tokens, tokens),
+    )
+    .expect("attn_prefill_d512_bf16");
+    let width = D512_QH * D512;
+    let mut pass = true;
+    for (p, len, rows) in [(256usize, 256usize, 256usize), (100, 128, 128)] {
+        let chunk_q = &q[p * width..(p + len) * width];
+        let mut padded = chunk_q.to_vec();
+        padded.resize(rows * width, 0);
+        // The chunk sees keys up to P + len; the cache holds all 512, the rest never read.
+        let out = d512_prefill(
+            &device,
+            &padded,
+            (&caches.0, &caches.1),
+            &table[..need],
+            (p, len, rows),
+        )
+        .expect("attn_prefill_d512_bf16");
+        let mismatched = mismatched_bits(&out[..len * width], &whole[p * width..(p + len) * width]);
+        eprintln!(
+            "d512 chunk P={p} L={len} vs one forward: mismatched_bits={mismatched} {}",
+            verdict(mismatched == 0)
+        );
+        pass &= mismatched == 0;
+    }
+    assert!(
+        pass,
+        "a D = 512 chunk differs from the same rows of one forward"
+    );
+}
+
+/// The decode row against the prefill row at the same position, kv_len 1 … 1024 (64, 65, 128,
+/// 129 included). Printed, not gated (#859's open decision): the mismatched bits, the max ulps
+/// and the worst |decode − prefill| over the #791 bound of the prefill's f64 reference. Expected
+/// 0. Asserted: only that each launch ran and its output is finite.
+#[test]
+fn the_d512_decode_against_the_prefill_row() {
+    let device = h100();
+    let nan = vec![POISON; d512_elems()];
+    let width = D512_QH * D512;
+    let mut finite = true;
+    for kv_len in [1usize, 2, 63, 64, 65, 128, 129, 300, 512, 1000, 1024] {
+        let rows = kv_len.div_ceil(128) * 128;
+        let [q, k, v] = d512_inputs(rows, kv_len, 0x0D51_2DF0 + kv_len as u64);
+        let table = shuffled_blocks(0x0D51_2DF0 + kv_len as u64);
+        let caches = d512_caches(&device, (&k, &v), kv_len, &table, (&nan, &nan));
+        let need = kv_len.div_ceil(BS);
+        let pre = d512_prefill(
+            &device,
+            &q,
+            (&caches.0, &caches.1),
+            &table[..need],
+            (0, kv_len, rows),
+        )
+        .expect("attn_prefill_d512_bf16");
+        let row = &q[(kv_len - 1) * width..kv_len * width];
+        let dec = d512_decode(&device, row, (&caches.0, &caches.1), &table[..need], kv_len)
+            .expect("attn_decode_d512_bf16");
+        let pre_row = &pre[(kv_len - 1) * width..kv_len * width];
+        let (refs, _) = d512_reference(row, (&k, &v), (kv_len - 1, 1));
+        let ulps = (dec.iter().zip(pre_row))
+            .map(|(&a, &b)| ulps_apart(a, b))
+            .max()
+            .unwrap_or(0);
+        let worst = (dec.iter().zip(pre_row).zip(&refs))
+            .map(|((&a, &b), &(r, pv))| {
+                let (a, b) = (
+                    f64::from(bf16::from_bits(a).to_f32()),
+                    f64::from(bf16::from_bits(b).to_f32()),
+                );
+                (a - b).abs() / attention_bound(r, pv)
+            })
+            .fold(0.0f64, f64::max);
+        finite &= all_finite(&dec);
+        eprintln!(
+            "d512 decode vs prefill row kv_len={kv_len}: mismatched_bits={} ulps_apart={ulps} \
+             worst_to_bound={worst:.4} (printed, not gated)",
+            mismatched_bits(&dec, pre_row)
+        );
+    }
+    assert!(finite, "a D = 512 decode output is not finite");
+}
+
+/// Each launcher refuses each bad shape with its output untouched: head dim 256 to the D = 512
+/// launchers and 512 to the D = 256 ones, a group above 16 (decode), block size 16, rows not a
+/// multiple of 128 (prefill), and a NaN scale.
+#[test]
+fn the_d512_launchers_refuse_each_bad_shape() {
+    let device = h100();
+    let dummy = up(&device, &vec![0u16; 64 * 1024]);
+    let table = up_u32(&device, &[0; 8]);
+    let seq = up_u32(&device, &[0, 1]);
+    let mut pass = true;
+    // (rows, q_heads, kv_heads, head_dim, block_size, scale, what)
+    let prefill: [(u32, u32, u32, u32, u32, f32, &str); 5] = [
+        (128, 16, 2, 256, 64, 1.0, "head_dim 256 to D = 512"),
+        (128, 16, 2, 512, 16, 1.0, "block_size 16"),
+        (64, 16, 2, 512, 64, 1.0, "rows 64"),
+        (128, 16, 2, 512, 64, f32::NAN, "scale NaN"),
+        (128, 15, 2, 512, 64, 1.0, "q_heads 15 over 2"),
+    ];
+    for (rows, qh, kvh, hd, bs, scale, what) in prefill {
+        let out = up(&device, &[SENTINEL; 64]);
+        // SAFETY: refused before any pointer is touched.
+        let got = unsafe {
+            attn_prefill_d512_bf16(
+                (dummy.ptr(), out.ptr()),
+                (dummy.ptr(), dummy.ptr()),
+                (table.ptr(), seq.ptr()),
+                (rows, qh, kvh, hd),
+                (bs, DEC_BLOCKS as u32),
+                (scale, 0),
+                std::ptr::null_mut(),
+            )
+        };
+        let want = Err(KernelError::AttnShape {
+            rows,
+            q_heads: qh,
+            kv_heads: kvh,
+            head_dim: hd,
+            block_size: bs,
+            num_blocks: DEC_BLOCKS as u32,
+        });
+        let kept = out.download().expect("out").iter().all(|&b| b == SENTINEL);
+        let ok = got == want && kept;
+        eprintln!(
+            "d512 prefill refusal ({what}): {got:?} out_unchanged={kept} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    let decode: [(u32, u32, u32, u32, f32, &str); 4] = [
+        (16, 2, 256, 64, 1.0, "head_dim 256 to D = 512"),
+        (34, 2, 512, 64, 1.0, "a group of 17"),
+        (16, 2, 512, 16, 1.0, "block_size 16"),
+        (16, 2, 512, 64, f32::NAN, "scale NaN"),
+    ];
+    for (qh, kvh, hd, bs, scale, what) in decode {
+        let out = up(&device, &[SENTINEL; 64]);
+        // SAFETY: refused before any pointer is touched.
+        let got = unsafe {
+            attn_decode_d512_bf16(
+                (dummy.ptr(), out.ptr()),
+                (dummy.ptr(), dummy.ptr()),
+                (table.ptr(), seq.ptr()),
+                (qh, kvh, hd),
+                (bs, DEC_BLOCKS as u32),
+                (scale, 0),
+                std::ptr::null_mut(),
+            )
+        };
+        let want = Err(KernelError::AttnDecodeShape {
+            q_heads: qh,
+            kv_heads: kvh,
+            head_dim: hd,
+            block_size: bs,
+            num_blocks: DEC_BLOCKS as u32,
+        });
+        let kept = out.download().expect("out").iter().all(|&b| b == SENTINEL);
+        let ok = got == want && kept;
+        eprintln!(
+            "d512 decode refusal ({what}): {got:?} out_unchanged={kept} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    // 512 to the D = 256 launchers.
+    let out = up(&device, &[SENTINEL; 64]);
+    // SAFETY: refused before any pointer is touched.
+    let pre256 = unsafe {
+        attn_prefill_windowed_bf16(
+            (dummy.ptr(), out.ptr()),
+            (dummy.ptr(), dummy.ptr()),
+            (table.ptr(), seq.ptr()),
+            (128, 16, 2, 512),
+            (64, DEC_BLOCKS as u32),
+            (1.0, 0),
+            std::ptr::null_mut(),
+        )
+    };
+    // SAFETY: refused before any pointer is touched.
+    let dec256 = unsafe {
+        attn_decode_windowed_bf16(
+            (dummy.ptr(), out.ptr()),
+            (dummy.ptr(), dummy.ptr()),
+            (table.ptr(), seq.ptr()),
+            (16, 2, 512),
+            (64, DEC_BLOCKS as u32),
+            (1.0, 0),
+            std::ptr::null_mut(),
+        )
+    };
+    let kept = out.download().expect("out").iter().all(|&b| b == SENTINEL);
+    let ok = matches!(pre256, Err(KernelError::AttnShape { head_dim: 512, .. }))
+        && matches!(
+            dec256,
+            Err(KernelError::AttnDecodeShape { head_dim: 512, .. })
+        )
+        && kept;
+    eprintln!(
+        "d512 to the D = 256 launchers: prefill {pre256:?} decode {dec256:?} out_unchanged={kept} {}",
+        verdict(ok)
+    );
+    pass &= ok;
+    assert!(
+        pass,
+        "a D = 512 launcher took a bad shape, or a refusal wrote"
+    );
+}
+
+/// The D = 512 launches' median time: prefill at m = 512 and 4096, decode at kv_len 4096.
+/// Printed.
+#[test]
+fn the_d512_attention_times_are_recorded() {
+    const LAUNCHES: usize = 21;
+    let device = h100();
+    let nan = vec![POISON; d512_elems()];
+    let median = |mut t: Vec<f64>| {
+        t.sort_by(f64::total_cmp);
+        t[t.len() / 2]
+    };
+    for m in [512usize, 4096] {
+        let [q, k, v] = d512_inputs(m, m, 0x0D51_271E + m as u64);
+        let table = shuffled_blocks(7);
+        let caches = d512_caches(&device, (&k, &v), m, &table, (&nan, &nan));
+        let times: Vec<f64> = (0..LAUNCHES)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                d512_prefill(&device, &q, (&caches.0, &caches.1), &table, (0, m, m))
+                    .expect("prefill");
+                start.elapsed().as_secs_f64() * 1e6
+            })
+            .collect();
+        eprintln!(
+            "d512 prefill time m={m}: median {:.1} us/launch (with its upload and download)",
+            median(times)
+        );
+    }
+    let kv_len = 4096;
+    let [q, k, v] = d512_inputs(1, kv_len, 0x0D51_271D);
+    let table = shuffled_blocks(8);
+    let caches = d512_caches(&device, (&k, &v), kv_len, &table, (&nan, &nan));
+    let times: Vec<f64> = (0..LAUNCHES)
+        .map(|_| {
+            let start = std::time::Instant::now();
+            d512_decode(&device, &q, (&caches.0, &caches.1), &table, kv_len).expect("decode");
+            start.elapsed().as_secs_f64() * 1e6
+        })
+        .collect();
+    eprintln!(
+        "d512 decode time kv_len={kv_len}: median {:.1} us/launch (with its upload and download)",
+        median(times)
     );
 }
