@@ -37,7 +37,7 @@
 # sweep is the grid: prompt x answer x users, at --scale-grid-conc's user
 # counts (1, 4, 8 and 16 by default at 64 GB and above; 1, 2 and 4 below,
 # where one 32k-prompt cell at 16 users takes half an hour), so neither the separate users sweep
-# (conc) nor the prompt sweep (input) is needed: the grid's prompts reach 32k
+# (conc) nor the prompt sweep (input) is needed: the grid's prompts reach 32k (8k below 64 GB)
 # and its 1-user row is the prompt sweep. One user at a time is what most Macs
 # see (#349). --scale-axes conc,grid,input adds the other sweeps back. A cell
 # sends --scale-rounds rounds of its users count (4; a quick run, 2), and at least
@@ -275,14 +275,12 @@ SCALE_AXES="grid"
 SCALE_CONC="1,4,16"
 SCALE_INPUT="128,512,2048,8192"
 SCALE_OUTPUT="16,64,256,1024"
-SCALE_GRID_INPUT="128,1024,4096,32768"
+# SCALE_GRID_INPUT, the grid's prompt lengths, defaults by this Mac's memory below.
 SCALE_GRID_OUTPUT="64"         # --full: 64,512,2048, the 1-user decode-vs-answer-length curve
 (( FULL )) && SCALE_GRID_OUTPUT="64,512,2048"
 # SCALE_GRID_CONC, the grid's users dimension (empty: 1 and the base count),
 # defaults by this Mac's memory once it is read, below.
 SCALE_GRID_USERS_OUTPUT="64"   # the answer lengths above 1 user; empty: every --scale-grid-output
-# SCALE_GRID_USERS_MAX_INPUT, the longest prompt above 1 user (0: every --scale-grid-input),
-# defaults by this Mac's memory with SCALE_GRID_CONC, below.
 SCALE_BASE_INPUT=1024
 SCALE_BASE_OUTPUT=64
 SCALE_BASE_CONC=8
@@ -324,7 +322,6 @@ while [[ $# -gt 0 ]]; do
         --scale-grid-output) SCALE_GRID_OUTPUT="$2"; shift 2 ;;
         --scale-grid-conc)   SCALE_GRID_CONC="$2"; shift 2 ;;
         --scale-grid-users-output) SCALE_GRID_USERS_OUTPUT="$2"; shift 2 ;;
-        --scale-grid-users-max-input) SCALE_GRID_USERS_MAX_INPUT="$2"; shift 2 ;;
         --scale-num-prompts) SCALE_NUM_PROMPTS="$2"; shift 2 ;;
         --scale-rounds)      SCALE_ROUNDS="$2"; shift 2 ;;
         --scale-warmups)     SCALE_WARMUPS="$2"; shift 2 ;;
@@ -353,11 +350,11 @@ if (( MEM_GB >= LARGE_GB )); then MODELS_DEFAULT="${MODELS_LARGE}"; else MODELS_
 if [[ -z "${SCALE_GRID_CONC+set}" ]]; then
     if (( MEM_GB >= LARGE_GB )); then SCALE_GRID_CONC="1,4,8,16"; else SCALE_GRID_CONC="1,2,4"; fi
 fi
-# And the prompts above 1 user: on a 32 GB base M5 a 32k prompt alone prefills in 25 s, but
-# two at once did not finish 12 requests in --cell-timeout-s (1200 s), so each such cell is
-# twenty minutes that records only a timeout. 32k keeps its 1-user row there.
-if [[ -z "${SCALE_GRID_USERS_MAX_INPUT+set}" ]]; then
-    if (( MEM_GB >= LARGE_GB )); then SCALE_GRID_USERS_MAX_INPUT=0; else SCALE_GRID_USERS_MAX_INPUT=4096; fi
+# And its prompts: on a 32 GB base M5 a 32k prompt alone prefills in 25 s, but two at once did not
+# finish 12 requests in --cell-timeout-s (1200 s), so each 32k cell above 1 user was twenty
+# minutes that recorded only a timeout. Below the cut the longest prompt is 8k.
+if [[ -z "${SCALE_GRID_INPUT+set}" ]]; then
+    if (( MEM_GB >= LARGE_GB )); then SCALE_GRID_INPUT="128,1024,4096,32768"; else SCALE_GRID_INPUT="128,1024,4096,8192"; fi
 fi
 [[ ${#MODELS[@]} -eq 0 ]] && IFS=',' read -r -a MODELS <<<"${MODELS_DEFAULT}"
 case "${MODELS[*]}" in
@@ -576,7 +573,7 @@ PIN_PROBLEMS="$(printf '%s\n' ${pin_problems[@]+"${pin_problems[@]}"})"
 CLASS_TABLE="$(printf '%s\n' "${CLASSES[@]}")"
 export ENGINE_INFO PIN_PROBLEMS UNPINNED CLASS_TABLE LARGE_GB
 export STARTED_UTC PRIME_LAUNCHES INPUT_LEN OUTPUT_LEN WARM_REQUESTS SCENARIOS SCALING SCALE_AXES SCALE_CONC SCALE_INPUT SCALE_OUTPUT SCALE_GRID_INPUT \
-       SCALE_GRID_OUTPUT SCALE_GRID_CONC SCALE_GRID_USERS_OUTPUT SCALE_GRID_USERS_MAX_INPUT SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS SCALE_ROUNDS \
+       SCALE_GRID_OUTPUT SCALE_GRID_CONC SCALE_GRID_USERS_OUTPUT SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS SCALE_ROUNDS \
        MLX_PYTHON OLLAMA_BIN KV_CACHE_DTYPE SERVE_ARGS CELL_TIMEOUT_S RESUME MODELS_FULL
 python3 - "${JSON}" "${chip}" <<'PY'
 import json, os, subprocess, sys
@@ -635,7 +632,6 @@ json.dump({
                  "grid_input": ints("SCALE_GRID_INPUT"), "grid_output": ints("SCALE_GRID_OUTPUT"),
                  "grid_conc": ints("SCALE_GRID_CONC") or sorted({1, int(e["SCALE_BASE_CONC"])}),
                  "grid_users_output": ints("SCALE_GRID_USERS_OUTPUT") or ints("SCALE_GRID_OUTPUT"),
-                 "grid_users_max_input": int(e["SCALE_GRID_USERS_MAX_INPUT"]) or None,
                  "base": {"input": int(e["SCALE_BASE_INPUT"]), "output": int(e["SCALE_BASE_OUTPUT"]),
                           "conc": int(e["SCALE_BASE_CONC"])},
                  "min_prompts_per_cell": int(e["SCALE_NUM_PROMPTS"]),
@@ -1000,10 +996,6 @@ run_scale_cells() { # prefix restart-function full-length [axes]
         # prompt x answer slice the sparklines read.
         for c in "${cs[@]}"; do for x in "${xs[@]}"; do for o in "${os[@]}"; do
             if (( c > 1 )) && [[ "${uos}" != *",${o},"* ]]; then
-                continue
-            fi
-            # Above 1 user, prompts up to --scale-grid-users-max-input.
-            if (( c > 1 && SCALE_GRID_USERS_MAX_INPUT && x > SCALE_GRID_USERS_MAX_INPUT )); then
                 continue
             fi
             if (( gmax && x + o + 256 > gmax )); then
@@ -1440,6 +1432,7 @@ def load(name):
 def metrics(j):
     return {k: j[k] for k in KEEP if k in j} if j else None
 grid_users = {int(x) for x in env["GRID_CONC_LIST"].split(",")}
+grid_inputs = {int(x) for x in env["SCALE_GRID_INPUT"].split(",") if x}
 def scaling(engine):
     cells = []
     for p in sorted(glob.glob(os.path.join(raw, f"scale{engine}-{stem}.*.json"))):
@@ -1447,9 +1440,10 @@ def scaling(engine):
         if not m or not (j := load(os.path.basename(p))):
             continue
         axis, a, b, users = m.groups()
-        # The output is shared across runs, so a cell at a users count this run did not ask for
-        # (an earlier run's, at another --scale-grid-conc) is not this run's.
-        if axis == "grid" and int(users or env["BASE_CONC"]) not in grid_users:
+        # The output is shared across runs, so a cell at a users count or prompt this run did not
+        # ask for (an earlier run's, at another --scale-grid-conc or -input) is not this run's.
+        if axis == "grid" and (int(users or env["BASE_CONC"]) not in grid_users
+                               or int(a) not in grid_inputs):
             continue
         where = ({"rung": f"{a}x{b}", "input_len": int(a), "output_len": int(b),
                   "conc": int(users or env["BASE_CONC"])}
