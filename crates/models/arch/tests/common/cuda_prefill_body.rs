@@ -4,7 +4,8 @@
 // with `include!` at the binary's root, not as a module, so every test keeps its name. The
 // including binary supplies the model: its `CUDA_TAPES`, the `numerics` module
 // (`targets/cuda/tests/common/numerics.rs`), and the constants `HIDDEN`, `WEIGHTS` (the weight
-// buffers the rig uploads), `ARENA` (the largest tape's arena bytes) and
+// buffers the rig uploads), `ARENA` (the largest tape's arena bytes),
+// `TEACHER_FORCED_DECODE_COSINE` ((k) teacher-forced's cosine floor) and
 // `BOUNDARY_DECODE_COSINE` ((n)'s cosine floor).
 // qwen3.6-35b-a3b's `cuda_prefill_35b.rs` includes it too (AI-native-Systems-Research/
 // scratchy#859): its MoE bundles are filled as the GEMMs that read them.
@@ -915,7 +916,8 @@ fn k_chained_decodes_pick_the_one_shot_tokens() {
 /// then one decode at 300 + i, against row 300 + i of one 308-token forward in disjoint blocks and
 /// slot. Each decode is one step off the one-shot trajectory, so the difference is one step's (the
 /// GEMV and the decode attention against the tiled GEMM and the prefill attention): every logit
-/// finite and cosine ≥ 0.999 at every step, the max |difference| printed. (k)'s chain compounds
+/// finite and cosine ≥ the model's `TEACHER_FORCED_DECODE_COSINE` at every step, the max
+/// |difference| printed. (k)'s chain compounds
 /// those steps through the cache and GDN state; this isolates one.
 #[test]
 fn k_teacher_forced_decodes_agree_with_one_shot_rows() {
@@ -930,10 +932,11 @@ fn k_teacher_forced_decodes_agree_with_one_shot_rows() {
         let row = forward(&mut worker, 1, &[rows[p]], p as u32, SEAT_A).expect("the decode");
         let want = &one_shot[p * VOCAB..][..VOCAB];
         let (cos, diff, finite) = (cosine(&row, want), max_diff(&row, want), all_finite(&row));
-        let ok = finite && cos >= 0.999;
+        let ok = finite && cos >= TEACHER_FORCED_DECODE_COSINE;
         eprintln!(
             "(k teacher-forced) {p} tokens prefilled, decode at {p}, against row {p} of one \
-             308-token forward: finite={finite} cosine={cos:.6} (need >= 0.999) \
+             308-token forward: finite={finite} cosine={cos:.6} (need >= \
+             {TEACHER_FORCED_DECODE_COSINE}) \
              max|diff|={diff:e} {}",
             verdict(ok)
         );
@@ -1014,24 +1017,9 @@ fn n_decodes_at_a_block_boundary() {
             at + 1,
             verdict(ok)
         );
-        if !boundary_floor_gates() {
-            eprintln!(
-                "(n) decode at P={at}: a MoE model's (n) floor is the user's, set from this \
-                 run's cosine={cos:.6} (#859): printed, not gated; finite={finite} gated {}",
-                verdict(finite)
-            );
-        }
-        let ok = ok || (!boundary_floor_gates() && finite);
         pass &= ok;
     }
     assert!(pass, "a decode at the block boundary is out of agreement");
-}
-
-/// Whether (n)'s cosine floor gates: for every dense model (`BOUNDARY_DECODE_COSINE`, the 0.8b's
-/// and 9b's measured floors). A MoE model's (qwen3.6-35b-a3b's, #859) is set by the user from its
-/// first run's printed cosines, so until then (n) prints the cosine and gates only finiteness.
-fn boundary_floor_gates() -> bool {
-    CUDA_TAPES.iter().all(|t| t.moe.is_none())
 }
 
 /// (o): at m=1, a position other than `prefix_len`, a block table too short for `P + 1`, a GDN

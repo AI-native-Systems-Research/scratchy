@@ -66,3 +66,5 @@ const WEIGHTS: u64 = 266;
 const ARENA: u64 = 2_585_035_776;
 /// (n)'s floor: each decode at the block boundary against the same row of one forward.
 const BOUNDARY_DECODE_COSINE: f64 = 0.999;
+/// (k) teacher-forced's floor, #830.
+const TEACHER_FORCED_DECODE_COSINE: f64 = 0.999;

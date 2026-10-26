@@ -17,14 +17,15 @@
 //!   `lm_head.weight` rows 0 and 248319, layer 0's GDN bundle, and layers 0 and 39's MoE bundles
 //!   (the router, experts 0 and 255's first `gate_up` and `down` rows, the shared-expert gate)
 //!   equal the checkpoint's; the load time.
-//! - P1 cosine: printed, not gated. The rule is min cosine(CUDA, f32) ≥ min cosine(HF-bf16, f32)
-//!   − δ, δ the user's; each prompt prints both and their difference beside the 0.999 floor, which
-//!   came from 0.8b runs. A flipped expert pick moves a token by a whole expert, so HF-bf16 itself
-//!   may sit below 0.999 here: that line is expected, not a failure.
+//! - P1 cosine, gated: on each prompt, min cosine(CUDA, f32) ≥ min cosine(HF-bf16, f32) − 0.005
+//!   (the user's 2026-10-26 rule, #859). The 0.8b's fixed 0.999 floor does not apply: HF's own
+//!   bf16 forward is at 0.983–0.997 against f32 here, since a flipped expert pick moves a token by
+//!   a whole expert.
 //! - P2, P3, P4, P6: the 9b's rules, gated.
-//! - P5, P7: every first divergence a near-tie, at most `near_tie_cap()` prompts.
-//! - P8: the decode row's error, top-1 and top-5 gated; its two cosines (against HF-f32, and
-//!   against CUDA's own one-shot row, the 35B's (n) floor) printed until the user sets them.
+//! - P5, P7: every first divergence a near-tie.
+//! - P8, gated: the decode row against HF-f32 at cosine ≥ HF-bf16's last-row cosine − 0.005 (P1's
+//!   rule), with the 9b's error, top-1 and top-5 terms; against CUDA's own one-shot row at cosine
+//!   ≥ 0.999, as every model (its prompts sit inside one 64-key tile).
 //!
 //! The expert picks (P9) are `cuda_route_parity_35b.rs`'s. One rig holds about 68.5 GiB of the
 //! H100's 79.6 GiB (69.3 GB of weights, the 3.6 GB m=4096 arena, the pools), so run this binary
@@ -48,3 +49,6 @@ const UNTIED_LM_HEAD: Option<&str> = Some("lm_head.weight");
 const MODEL: &str = "qwen3.6-35b-a3b";
 const CHECKPOINT: &str = "Qwen3.6-35B-A3B";
 const GOLDENS: &str = "tests/goldens/qwen3-5-moe-qwen3.6-35b-a3b-hf";
+/// P1's rule (#859, the user's 2026-10-26 decision): min cosine(CUDA, f32) at most 0.005 below
+/// HF-bf16's own min cosine on the same prompt.
+const P1: P1Rule = P1Rule::BelowHfBf16(0.005);
