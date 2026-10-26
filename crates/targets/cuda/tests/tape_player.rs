@@ -3288,3 +3288,83 @@ fn gemma_dense_mlp_decode_block() {
         "the Gemma dense MLP is out of bound, or the self-check fell short"
     );
 }
+
+// ── The Qwen routing at 128 experts is refused up front (#921) ────
+
+/// [`gemma_moe`]'s block at m = 1 with its routing step rewritten to Qwen's program at its 128
+/// experts (no per-expert scale): a tape the lowering accepts, since `op_abi::MOE_EXPERT_COUNTS`
+/// holds 128 for either program, but whose routing the kernel has no instance for.
+fn qwen_route_at_128() -> &'static [CudaTape] {
+    static TAPES: std::sync::OnceLock<Vec<CudaTape>> = std::sync::OnceLock::new();
+    TAPES.get_or_init(|| {
+        let at = CanonicalAt {
+            stem: "gemma_moe",
+            m: 1,
+        };
+        let c = lower_canonical(&gemma_moe(1), GEMMA_MOE_FACTS, at)
+            .unwrap_or_else(|e| panic!("the Gemma MoE block lowers at m=1: {e}"));
+        let tape = static_tape(&c);
+        let steps: Vec<CudaStep> = (tape.steps.iter())
+            .map(|&s| match s {
+                CudaStep::MoeRoute(r) => {
+                    CudaStep::MoeRoute(scratchy_target_cuda::step::MoeRouteBf16 {
+                        program: scratchy_target_cuda::step::RouteProgram::QwenSoftmax,
+                        renorm: true,
+                        expert_scale: None,
+                        ..r
+                    })
+                }
+                other => other,
+            })
+            .collect();
+        vec![CudaTape {
+            steps: Box::leak(steps.into_boxed_slice()),
+            ..tape
+        }]
+    })
+}
+
+/// A Qwen routing at 128 experts (`step::MOE_ROUTE_EXPERTS` is 256, the Qwen program's one
+/// instance) is refused with `NotLaunched` at that step before anything is uploaded or enqueued,
+/// although the router norm and the one-row router GEMV before it now launch: the result colour
+/// keeps every byte it had, and the host result is untouched.
+#[test]
+fn a_qwen_routing_at_128_experts_is_refused_before_anything_is_enqueued() {
+    let device = h100();
+    let tapes = qwen_route_at_128();
+    let tape = &tapes[0];
+    let route = (tape.steps.iter())
+        .position(|s| matches!(s, CudaStep::MoeRoute(_)))
+        .expect("the block routes");
+    assert!(
+        matches!(
+            tape.steps[route],
+            CudaStep::MoeRoute(r) if r.experts == 128
+                && r.program == scratchy_target_cuda::step::RouteProgram::QwenSoftmax
+        ),
+        "{:?}",
+        tape.steps[route]
+    );
+    let table: Vec<DeviceBuffer> = (tape.weight_bytes.iter())
+        .map(|&b| match b {
+            0 => DeviceBuffer::empty(),
+            b => DeviceBuffer::upload_bytes(&device, &vec![0u8; b as usize]).expect("upload"),
+        })
+        .collect();
+    let table: &'static [DeviceBuffer] = Box::leak(table.into_boxed_slice());
+    let mut worker = CudaWorker::new(&device, tapes, table, None, None).expect("worker");
+    let x = vec![0x3F80u16; common::gemma_moe::H as usize];
+    let result = colour(tape, tape.arena.colour_offsets.len() - 1);
+    let mut y = vec![0xBEEFu16; tape.result.bytes as usize / 2];
+    let before = read(&mut worker, result);
+    let e = worker
+        .forward(0, Input::Hidden(&x), &[], None, None, &mut y)
+        .expect_err("a Qwen routing at 128 experts is not launched");
+    eprintln!("qwen route at 128, step {route}: {e}");
+    assert!(
+        matches!(e, ForwardError::NotLaunched { step, op: "MoeRoute" } if step == route),
+        "{e:?}"
+    );
+    assert!(y.iter().all(|&v| v == 0xBEEF), "the result is untouched");
+    assert_eq!(read(&mut worker, result), before, "nothing was enqueued");
+}

@@ -2777,3 +2777,78 @@ fn an_affine_expert_bank_is_refused() {
         "{e:?}"
     );
 }
+
+// ── Gemma 4's v_norm, per KV head (#921) ───────────────────────────
+
+/// Gemma 4 26B-A4B's two classes as its v_norm sees them: sliding 8 kv heads of 256, global 2 of
+/// 512.
+fn gemma_vnorm_facts() -> CudaModelFacts {
+    let class = |head_dim, kv_heads| CudaAttnClass {
+        head_dim,
+        kv_heads,
+        rot_dim: 64,
+        rope_theta: 1e4,
+        pairing: RopePairing::HalfRotated,
+        window: None,
+    };
+    CudaModelFacts {
+        classes: Some(CudaAttnClasses {
+            base: class(256, 8),
+            global: class(512, 2),
+        }),
+        ..GEMMA4_FACTS
+    }
+}
+
+/// `y = RmsNormUnit(x)` over `x [m, cols]`, the embedded hidden.
+fn vnorm(m: u32, cols: u32) -> LoweredDecode {
+    with_hidden(LoweringInput {
+        exported: None,
+        sources: vec![SourceShape { rows: m, cols }],
+        ops: vec![OpDesc {
+            op: SubOp::RmsNormUnit { eps: 1e-6 },
+            m,
+            inputs: vec![InputRef::Ext(0)],
+        }],
+        result: 0,
+    })
+}
+
+/// The v_norm's `(rows, cols)` as lowered.
+fn vnorm_shape(l: &LoweredDecode, facts: CudaModelFacts) -> (u32, u32) {
+    let at = CanonicalAt {
+        stem: "vnorm",
+        m: 1,
+    };
+    let c = lower_canonical(l, facts, at).unwrap_or_else(|e| panic!("the v_norm lowers: {e}"));
+    match static_tape(&c).steps {
+        [CudaStep::RmsNormUnit(n)] => (n.rows, n.cols),
+        other => panic!("one RmsNormUnit step: {other:?}"),
+    }
+}
+
+/// HF's `v_norm` is one RMS per KV head (`RMSNormNoScale(head_dim)`), as Metal's
+/// (`RmsNormUnitImpl::fan_out`) and the repo's reference (`golden_gen_carrier.py`'s
+/// `rmsnorm_unit`). A row that is one class's `kv_heads · head_dim` lowers to one launch row per
+/// head: Gemma's sliding `[m, 8 · 256]` to `(8m, 256)`, a global `[m, 2 · 512]` to `(2m, 512)`.
+/// A row already one head wide, or of a uniform model (no classes), stays whole.
+#[test]
+fn a_gemma_v_norm_lowers_one_row_per_kv_head() {
+    let facts = gemma_vnorm_facts();
+    for (m, cols, want) in [
+        (1, 2048, (8, 256)),
+        (512, 2048, (4096, 256)),
+        (1, 1024, (2, 512)),
+        (512, 1024, (1024, 512)),
+        (1024, 512, (1024, 512)),
+        (8, 256, (8, 256)),
+    ] {
+        let got = vnorm_shape(&vnorm(m, cols), facts);
+        assert_eq!(got, want, "a [{m}, {cols}] v_norm");
+    }
+    assert_eq!(
+        vnorm_shape(&vnorm(4, 2048), GEMMA4_FACTS),
+        (4, 2048),
+        "a uniform model's unit norm stays whole"
+    );
+}

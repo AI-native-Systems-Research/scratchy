@@ -725,12 +725,11 @@ fn gemma_soft_cap_bf16_in_place_is_bit_identical() {
 fn gemma_rms_norm_unit_bf16_is_the_unit_gain_norm() {
     let device = h100();
     let mut pass = true;
-    // cols 256 and 512 (one KV head), and 2048, the sliding layers' v_norm as the tape runs it
-    // (`(m, 2048)`, every KV head of a row at once; the global layers' is `(2m, 512)`).
+    // One KV head per row, as the tape runs Gemma's v_norm: the sliding layers' `(8m, 256)` and
+    // the global layers' `(2m, 512)`, up to m = 4096.
     for (cols, rows_set) in [
-        (256usize, [1usize, 16, 4096 * 8]),
-        (512, [1, 16, 4096 * 8]),
-        (2048, [1, 16, 4096]),
+        (256usize, [1usize, 16, 8, 4096 * 8]),
+        (512, [1, 16, 2, 4096 * 2]),
     ] {
         for rows in rows_set {
             let x = bf16_inputs(rows * cols, 0x0A11_0000 ^ (rows as u64) << 32 ^ cols as u64);

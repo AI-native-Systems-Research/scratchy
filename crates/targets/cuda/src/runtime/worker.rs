@@ -569,7 +569,10 @@ fn gdn_pool_layout(layout: &GdnStateLayout, layers: usize) -> Option<(Vec<(u64, 
 /// The name of `s` when it is a step the lowering emits and no kernel launches yet (#885's 13b-2
 /// to 13b-4): the 64-column GEMM, the router GEMM on it, a rope or attention of a class with a
 /// window or a head dim not 256 or a half-head pairing, and an expert step at another count than
-/// 256, on 64-column tiles or reading Gemma's own tensors. `None` for every step a Qwen tape holds.
+/// 256, on 64-column tiles or reading Gemma's own tensors. Also the Qwen routing at another count
+/// than [`MOE_ROUTE_EXPERTS`]: the routing kernel's Qwen program is instantiated at 256 only (its
+/// launcher refuses any other count), so such a tape is refused here, before anything is enqueued,
+/// rather than at its routing step. `None` for every step a Qwen tape holds.
 fn not_launched(tape: &CudaTape, s: &CudaStep) -> Option<&'static str> {
     use crate::step::RopePairing;
     let qwen_class = |layer: u32| {
@@ -597,6 +600,11 @@ fn not_launched(tape: &CudaTape, s: &CudaStep) -> Option<&'static str> {
             Some("AttnDecode")
         }
         CudaStep::RouterLogits(r) if r.kernel == MatmulKernel::Col64 => Some("RouterLogits"),
+        CudaStep::MoeRoute(MoeRouteBf16 {
+            program: RouteProgram::QwenSoftmax,
+            experts,
+            ..
+        }) if experts != MOE_ROUTE_EXPERTS => Some("MoeRoute"),
         CudaStep::ExpertSort(e) if e.experts != MOE_ROUTE_EXPERTS => Some("ExpertSort"),
         CudaStep::ExpertGemm(e)
             if e.experts != MOE_ROUTE_EXPERTS

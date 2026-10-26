@@ -1138,7 +1138,13 @@ fn scalar_mul(
 }
 
 /// `RmsNormUnit { eps }` as the bf16 RMSNorm with no gain (Gemma's `v_norm`): `x` (operand 0) a
-/// computed slot or the embedded hidden, `rows` and `cols` the output's.
+/// computed slot or the embedded hidden. The norm is per KV head: when the row is one attention
+/// class's `kv_heads · head_dim` columns, the step normalises each `head_dim`-wide head on its own,
+/// as `[rows · kv_heads, head_dim]` (the row-major `[rows, kv_heads · head_dim]` buffer viewed with
+/// one head per row). Gemma's sliding v is 8 heads of 256, `(8m, 256)`; its global v reaches the
+/// op already viewed per head (one head of 512, the `k_eq_v` reshape), `(2m, 512)`. Any other row
+/// is normalised whole. The same rule as Metal's (`RmsNormUnitImpl::fan_out`: sliding 256 × 8,
+/// global 512 × 1) and the repo's HF reference (`golden_gen_carrier.py`'s `rmsnorm_unit`).
 fn rms_norm_unit(
     cx: &StepCx<'_>,
     s: &TapeStep<'_>,
@@ -1148,6 +1154,7 @@ fn rms_norm_unit(
     if !(eps.is_finite() && eps > 0.0) {
         return Err(CanonicalRefusal::NormEps { step: s.step, eps });
     }
+    let (rows, cols) = per_head_rows(cx, rows, cols);
     let at = arena(cx)?;
     Ok(RmsNormUnitBf16 {
         x: at(xc),
@@ -1156,6 +1163,24 @@ fn rms_norm_unit(
         cols,
         eps_bits: eps.to_bits(),
     })
+}
+
+/// `(rows, cols)` as one row per KV head, `(rows · kv_heads, head_dim)`, when `cols` is one of the
+/// model's attention classes' `kv_heads · head_dim` with more than one head; else as it is. A
+/// uniform model has no classes, so its rows stay whole. The two classes' widths differ (Gemma's
+/// 2048 and 1024), so a row matches at most one. `rows · cols` is unchanged, within `unary_row`'s
+/// bound.
+fn per_head_rows(cx: &StepCx<'_>, rows: u32, cols: u32) -> (u32, u32) {
+    let Some(classes) = cx.facts.classes else {
+        return (rows, cols);
+    };
+    for class in [classes.base, classes.global] {
+        let heads = class.kv_heads;
+        if heads > 1 && class.head_dim.checked_mul(heads) == Some(cols) {
+            return (rows * heads, class.head_dim);
+        }
+    }
+    (rows, cols)
 }
 
 /// `ScalarWeightMul` as the bf16 layer scale (Gemma's `layer_scalar`): `x` (operand 0) a computed

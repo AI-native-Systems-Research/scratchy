@@ -1408,8 +1408,12 @@ fn gemma_route_bf16_ties_nan_and_unit_scale() {
         verdict(ok)
     );
     pass &= ok;
-    // (d) unit per-expert scale: the bits of the host f32 softmax over the scaled picks, with the
-    // kernel's order (subtract the max, exp, sum ascending by expert index, divide).
+    // (d) unit per-expert scale. #921 asks for the bits of the host f32 softmax; under
+    // `--use_fast_math` the kernel's `exp` is `__expf` and its division the fast one, a few ulp
+    // from the host's `f32::exp` and `/`, so host bits are printed, not asserted. What is asserted
+    // bit for bit is that `× pes` is exact: a scale of 2.0 doubles every score exactly, so halving
+    // it must give the unit run's bits (a multiply by exactly 1.0 changes nothing). The host f32
+    // softmax is asserted within an absolute 4·f32::EPSILON (every score is at most 1).
     let logits: Vec<u16> = (bf16_inputs(GEMMA_EXPERTS, 0x6E3A_000D).into_iter())
         .map(|b| bits(bf16::from_bits(b).to_f32() * 4.0))
         .collect();
@@ -1428,8 +1432,6 @@ fn gemma_route_bf16_ties_nan_and_unit_scale() {
         .map(|w| e[asc.iter().position(|a| a == w).expect("a pick")] / total)
         .collect();
     let close = (s.iter().zip(&host)).all(|(a, b)| (a - b).abs() <= 4.0 * f32::EPSILON);
-    // Bit-exact: a scale of 2.0 doubles every score exactly, so halving it gives the unit run's
-    // bits, which are the softmax's alone (a multiply by exactly 1.0 changes nothing).
     let twos = vec![bits(2.0); GEMMA_EXPERTS];
     let (_, s2) = run_gemma_route(&device, &logits, &twos, 1, scale);
     let halved_equal = (s2.iter().map(|x| (x / 2.0).to_bits())).eq(s.iter().map(|x| x.to_bits()));
@@ -1441,8 +1443,8 @@ fn gemma_route_bf16_ties_nan_and_unit_scale() {
     pass &= halved_equal;
     let ok = i == want_i && close;
     eprintln!(
-        "gemma moe_route unit pes: picks_equal={} gpu={s:?} host_f32={host:?} within_4_ulp={close} \
-         bits_equal={} {}",
+        "gemma moe_route unit pes: picks_equal={} gpu={s:?} host_f32={host:?} \
+         abs_err_within_4_eps={close} host_bits_equal={} (not asserted) {}",
         i == want_i,
         s.iter()
             .map(|x| x.to_bits())
