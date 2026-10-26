@@ -35,7 +35,8 @@
 # later cell, shared across engines so all see the same prompts. Concurrency is
 # offered (--max-concurrency), not the effective decode batch. The default
 # sweep is the grid: prompt x answer x users, at --scale-grid-conc's user
-# counts (1, 4, 8 and 16 by default), so neither the separate users sweep
+# counts (1, 4, 8 and 16 by default at 64 GB and above; 1, 2 and 4 below,
+# where one 32k-prompt cell at 16 users takes half an hour), so neither the separate users sweep
 # (conc) nor the prompt sweep (input) is needed: the grid's prompts reach 32k
 # and its 1-user row is the prompt sweep. One user at a time is what most Macs
 # see (#349). --scale-axes conc,grid,input adds the other sweeps back. A cell
@@ -272,7 +273,8 @@ SCALE_OUTPUT="16,64,256,1024"
 SCALE_GRID_INPUT="128,1024,4096,32768"
 SCALE_GRID_OUTPUT="64"         # --full: 64,512,2048, the 1-user decode-vs-answer-length curve
 (( FULL )) && SCALE_GRID_OUTPUT="64,512,2048"
-SCALE_GRID_CONC="1,4,8,16"     # the grid's users dimension; empty: 1 and the base count
+# SCALE_GRID_CONC, the grid's users dimension (empty: 1 and the base count),
+# defaults by this Mac's memory once it is read, below.
 SCALE_GRID_USERS_OUTPUT="64"   # the answer lengths above 1 user; empty: every --scale-grid-output
 SCALE_BASE_INPUT=1024
 SCALE_BASE_OUTPUT=64
@@ -337,6 +339,11 @@ done
 # This Mac's set: the large models need 64 GB, the small ones are the round below that.
 MEM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 if (( MEM_GB >= LARGE_GB )); then MODELS_DEFAULT="${MODELS_LARGE}"; else MODELS_DEFAULT="${MODELS_SMALL}"; fi
+# The same cut sizes the users dimension: a Mac below it reads a 32k prompt in
+# about half a minute, so 8 and 16 users there are mostly prefill queueing.
+if [[ -z "${SCALE_GRID_CONC+set}" ]]; then
+    if (( MEM_GB >= LARGE_GB )); then SCALE_GRID_CONC="1,4,8,16"; else SCALE_GRID_CONC="1,2,4"; fi
+fi
 [[ ${#MODELS[@]} -eq 0 ]] && IFS=',' read -r -a MODELS <<<"${MODELS_DEFAULT}"
 case "${MODELS[*]}" in
     all)   MODELS=("${MODELS_ALL[@]}") ;;
