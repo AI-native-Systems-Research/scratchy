@@ -532,6 +532,11 @@ pub struct TaskCell {
     pub num_tasks: Option<u32>,
     #[serde(default)]
     pub timed_out: bool,
+    /// When the run this cell was borrowed from was made: a quick run's rival numbers, from the
+    /// newest earlier run that measured the same workload at the same users count and task cap.
+    /// None for a cell this run measured itself.
+    #[serde(skip)]
+    pub borrowed_from: Option<Utc>,
 }
 
 impl TaskCell {

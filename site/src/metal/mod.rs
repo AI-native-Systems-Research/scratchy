@@ -176,6 +176,10 @@ fn borrow_earlier(runs: &mut [Run]) {
     );
     let mut engines: BTreeMap<(String, String, &str), Measured> = BTreeMap::new();
     let mut frozen: BTreeMap<(String, String), (Vec<data::Rep>, data::Utc)> = BTreeMap::new();
+    // Per (machine, model, engine): its dataset cells as last measured, each tagged with when,
+    // and the task cap they were measured under.
+    type Tasked = (Vec<data::TaskCell>, Option<u32>);
+    let mut task_cells: BTreeMap<(String, String, &str), Tasked> = BTreeMap::new();
     for i in order {
         let run = &mut runs[i];
         let (chip, when) = (
@@ -199,6 +203,34 @@ fn borrow_earlier(runs: &mut [Run]) {
                     m.borrowed.insert(e.key().to_string(), from.clone());
                 }
             }
+            // A rival's dataset cells, workload by workload: one this run left out comes from the
+            // newest earlier run that measured that workload at that users count under the same
+            // task cap. The tasks are seeded by model, workload and users count, so the same three
+            // mean the same tasks. Only engines this run did not time at all are filled, so a
+            // run's own measurements are never mixed with another's.
+            let cap = run_task_cap(&run.config);
+            for e in Engine::RIVALS {
+                let Some(slot) = e.tasks_mut(m) else { continue };
+                let key = (at.0.clone(), at.1.clone(), e.key());
+                match slot.as_ref().filter(|c| !c.is_empty()) {
+                    Some(cells) => {
+                        // Kept tagged with when, for a later run that borrows them; this run's
+                        // own cells stay untagged.
+                        let lent: Vec<data::TaskCell> = (cells.iter())
+                            .map(|c| data::TaskCell {
+                                borrowed_from: Some(when.clone()),
+                                ..c.clone()
+                            })
+                            .collect();
+                        task_cells.insert(key, (lent, cap));
+                    }
+                    None => {
+                        if let Some((cells, _)) = task_cells.get(&key).filter(|(_, c)| *c == cap) {
+                            *slot = Some(cells.clone());
+                        }
+                    }
+                }
+            }
             let own: Vec<data::Rep> = (Engine::Scratchy.ladder(m).iter())
                 .filter(|r| r.scenario == Scenario::Frozen)
                 .cloned()
@@ -211,6 +243,20 @@ fn borrow_earlier(runs: &mut [Run]) {
                     .insert(data::BORROWED_FROZEN.to_string(), from.clone());
             }
         }
+    }
+}
+
+/// The longest dataset prompt a run sent (`config.scaling.task_max_prompt`): two runs' tasks are
+/// the same tasks only under the same cap.
+fn run_task_cap(config: &data::Config) -> Option<u32> {
+    config.scaling.as_ref().and_then(|s| s.task_max_prompt)
+}
+
+/// A dataset map's axes before there is anything to show: a place of the right shape.
+fn empty_task_axes() -> TableAxes<'static> {
+    TableAxes {
+        across: ("workload", vec![]),
+        down: ("users at once", vec![]),
     }
 }
 
@@ -2449,6 +2495,67 @@ fn model_timelines(entries: &[Entry]) -> Vec<(&'static str, Element)> {
         .collect()
 }
 
+/// The dataset workloads a model's timeline follows, each at 1 user: speed on chat, and on a
+/// retrieval question over its passages.
+const TASK_TIMELINES: [(&str, &str); 2] = [
+    ("sharegpt", "ShareGPT TTFT ms, 1 user"),
+    ("rag", "RAG TTFT ms, 1 user"),
+];
+
+/// A model's dataset timelines over its runs on a machine, oldest first: for each of
+/// [`TASK_TIMELINES`], the runs that ran that workload at 1 user, scratchy's time to its first token
+/// and the first rival any of them measured, each a run's own (a borrowed cell is no point of its
+/// own, and its line goes dotted there, as the grid's does). Labelled at the first run with both
+/// and the newest, as [`model_timelines`] is. Empty with fewer than two such runs.
+fn task_timelines(entries: &[Entry]) -> Vec<(&'static str, Element)> {
+    let own = |e: &Entry, engine: Engine, w: &str| -> Option<f64> {
+        (engine.tasks(e.m).iter())
+            .find(|c| c.workload == w && c.conc == 1 && c.measured() && c.borrowed_from.is_none())
+            .and_then(|c| c.median_ttft_ms)
+    };
+    let mut charts = Vec::new();
+    for (w, value) in TASK_TIMELINES {
+        let kept: Vec<&Entry> = (entries.iter())
+            .filter(|e| own(e, Engine::Scratchy, w).is_some())
+            .collect();
+        if kept.len() < 2 {
+            continue;
+        }
+        let rival = Engine::RIVALS
+            .into_iter()
+            .find(|&r| kept.iter().any(|e| own(e, r, w).is_some()));
+        let mut steps: Vec<Step> = (kept.iter().enumerate())
+            .map(|(i, e)| Step {
+                x: 2f64.powi(i as i32),
+                scratchy: own(e, Engine::Scratchy, w),
+                rival: rival.and_then(|r| own(e, r, w)),
+                highlight: false,
+            })
+            .collect();
+        timeline_highlights(&mut steps);
+        let names: Vec<String> = (kept.iter())
+            .map(|e| e.run.generated_utc.month_day().to_string())
+            .collect();
+        let against = rival.map_or("alone".to_string(), |r| format!("against {}", r.label()));
+        let chart = sparkline(
+            &steps,
+            SparkAxes {
+                better: Metric::Ttft.better(),
+                along: "run",
+                value,
+                carry: true,
+            },
+            Engine::Scratchy.side(),
+            rival.unwrap_or(Engine::Scratchy).side(),
+            Some(names),
+            "5rem",
+            &format!("{value} over its runs, scratchy {against}"),
+        );
+        charts.push((value, chart));
+    }
+    charts
+}
+
 /// The Over time section's charts, titled: none until some model of the current lineup has two
 /// runs of one shape on one machine. Only the current lineup, as in the overview ([`lineup`]): a
 /// model an older round ran keeps its runs in its machine's own section.
@@ -2460,7 +2567,10 @@ fn over_time_charts(machines: &BTreeMap<&str, MachineRuns>, chip: &str) -> Vec<(
         return charts;
     };
     for (stem, entries) in mr.models.iter().filter(|(s, _)| current(s)) {
-        for (value, chart) in model_timelines(entries) {
+        for (value, chart) in model_timelines(entries)
+            .into_iter()
+            .chain(task_timelines(entries))
+        {
             charts.push((format!("{stem} · {value}"), chart));
         }
     }
@@ -2959,6 +3069,78 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             }
         }
     };
+    // The dataset maps: one a machine and model, at its newest run, users down the side and the
+    // workloads across, a square how many times faster scratchy is to its first token. Shown, and
+    // chosen first, when some machine's newest run times a rival on its dataset workloads.
+    let task_map = |chip: &str, stem: &str| -> Element {
+        let about = format!("{stem} on {chip}");
+        let Some(Entry { m, .. }) = machines[chip].latest(stem) else {
+            return glance_mini(
+                empty_task_axes(),
+                vec![],
+                "scratchy".into(),
+                "TTFT",
+                "not run",
+                &about,
+            );
+        };
+        let Some((rival, squares)) = tasks::glance_squares(m) else {
+            let why = if Engine::Scratchy.tasks(m).is_empty() {
+                "no dataset runs"
+            } else {
+                "scratchy alone so far"
+            };
+            return glance_mini(
+                empty_task_axes(),
+                vec![],
+                "scratchy".into(),
+                "TTFT",
+                why,
+                &about,
+            );
+        };
+        let mut users: Vec<u32> = squares.iter().map(|(u, _, _)| *u).collect();
+        users.dedup();
+        let ws = tasks::workloads(m);
+        let axes = TableAxes {
+            across: (
+                "workload",
+                ws.iter()
+                    .map(|w| tasks::workload_label(w).0.to_string())
+                    .collect(),
+            ),
+            down: ("users at once", users.iter().map(u32::to_string).collect()),
+        };
+        let squares = squares
+            .into_iter()
+            .map(|(u, w, ratio)| RatioSquare {
+                across: tasks::workload_label(&w).0.to_string(),
+                down: u.to_string(),
+                ratio,
+                highlight: false,
+            })
+            .collect();
+        glance_mini(
+            axes,
+            squares,
+            format!("scratchy/{}", rival.label()),
+            "TTFT",
+            "no ratios",
+            &about,
+        )
+    };
+    let tasks_shown = chips.iter().any(|chip| {
+        classes.iter().any(|class| {
+            model_of(chip, class)
+                .and_then(|stem| machines[chip].latest(stem))
+                .is_some_and(|Entry { m, .. }| tasks::glance_squares(m).is_some())
+        })
+    });
+    let first = if tasks_shown {
+        slug(REAL_TASKS)
+    } else {
+        slug(HEAT_MAPS)
+    };
     rsx! {
         Section { id: "glance", level: 2,
             Stack { gap: 4,
@@ -2973,8 +3155,11 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                 // stack right under them; every other panel starts a step down.
                 Tile { style: "width: fit-content; max-width: 100%",
                     div {
-                        Tabs { selected: slug(HEAT_MAPS), kind: TabsKind::Contained,
-                            TabItem { value: slug(HEAT_MAPS), target: Some(slug(HEAT_MAPS)), selected: true, "{HEAT_MAPS}" }
+                        Tabs { selected: first.clone(), kind: TabsKind::Contained,
+                            if tasks_shown {
+                                TabItem { value: slug(REAL_TASKS), target: Some(slug(REAL_TASKS)), selected: true, "{REAL_TASKS}" }
+                            }
+                            TabItem { value: slug(HEAT_MAPS), target: Some(slug(HEAT_MAPS)), selected: !tasks_shown, "{HEAT_MAPS}" }
                             TabItem { value: slug(LATENCY), target: Some(slug(LATENCY)), selected: false, "{LATENCY}" }
                             for (title, _, _) in SCALING {
                                 TabItem { value: slug(title), target: Some(slug(title)), selected: false, "{title}" }
@@ -2982,7 +3167,35 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                             TabItem { value: slug(STARTUP), target: Some(slug(STARTUP)), selected: false, "{STARTUP}" }
                         }
                         div {
-                            ContentPanel { id: slug(HEAT_MAPS), shown: true,
+                            if tasks_shown {
+                                ContentPanel { id: slug(REAL_TASKS), shown: true,
+                                div { style: "padding-top: var(--cds-spacing-05)",
+                                Stack { gap: 5,
+                                    p { style: "contain: inline-size",
+                                        "A row per machine, a tile per model: its real dataset tasks, the same tasks to every \
+                                         engine, the load down (open loop: requests a second, a fraction of scratchy's own \
+                                         one-user rate) and the workloads across. Colour is how many times faster scratchy is \
+                                         to its first token than the engine named under the map: blue faster, red slower, grey \
+                                         within noise. A striped square has no ratio: the passage-reuse column is scratchy's \
+                                         own, and an engine that did not run a workload has none. Each model's section below \
+                                         has its tokens and cache. Hover a square for its ratio."
+                                    }
+                                    {glance_maps(&rows, &classes, "minmax(0, 1fr)", true, |chip: &str, class: &str| {
+                                        let Some(stem) = model_of(chip, class) else { return rsx! {} };
+                                        rsx! {
+                                            div { style: "flex: 1 1 0; min-width: 0",
+                                                Stack { gap: 1,
+                                                    {task_map(chip, stem)}
+                                                    div { style: "text-align: center; font-size: 0.75rem; overflow-wrap: anywhere", "{stem}" }
+                                                }
+                                            }
+                                        }
+                                    })}
+                                }
+                                }
+                                }
+                            }
+                            ContentPanel { id: slug(HEAT_MAPS), shown: !tasks_shown,
                                 div { style: "padding-top: var(--cds-spacing-05)",
                                 Stack { gap: 5,
                                     p { style: "contain: inline-size",
@@ -3511,6 +3724,8 @@ fn startup_panel(machines: &BTreeMap<&str, MachineRuns>, columns: usize) -> Elem
 
 /// The glance's first panel's name.
 const HEAT_MAPS: &str = "Heat maps";
+/// The overview's dataset panel: users × workload, each machine on its set's models.
+const REAL_TASKS: &str = "Real tasks";
 
 /// The sparkline panels: a dimension, what runs along it, and its prefill and
 /// decode trends.
@@ -3898,6 +4113,81 @@ mod tests {
     /// A quick run after a full run borrows the full run's engines: the quick run's 64-token
     /// answers are the full run's users × prompt map, and the full run's 512- and 2048-token
     /// answers ran at 1 user only, so they are not cells the quick run compares.
+    #[test]
+    fn a_quick_runs_dataset_cells_borrow_the_rival_under_the_same_task_cap() {
+        use super::data::Run;
+        use super::numbers::Engine;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/metal/apple-m3-pro-2026-10-25T150928Z-1bf86114.json"
+        );
+        let text = std::fs::read_to_string(path).expect("the dataset quick run");
+        // An earlier run that timed oMLX TurboQuant on the same workloads (its cells stand in for
+        // a full run's: the rule does not look at the numbers).
+        let mut full: serde_json::Value = serde_json::from_str(&text).unwrap();
+        full["generated_utc"] = "2026-10-24T12:00:00Z".into();
+        let ours = full["models"][0]["tasks"].clone();
+        full["models"][0]["tasks_omlx_tq"] = ours;
+        let quick: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut other_cap = quick.clone();
+        other_cap["config"]["scaling"]["task_max_prompt"] = 4096.into();
+        let load = |v: &serde_json::Value| -> Run { serde_json::from_value(v.clone()).unwrap() };
+
+        let mut runs = vec![load(&quick), load(&full)];
+        super::borrow_earlier(&mut runs);
+        let lent = Engine::OmlxTq.tasks(&runs[0].models[0]);
+        assert!(
+            !lent.is_empty(),
+            "the quick run takes the full run's oMLX cells"
+        );
+        assert!(
+            lent.iter()
+                .all(|c| c.borrowed_from.as_ref().unwrap().month_day() == "10-24")
+        );
+        assert!(
+            Engine::OmlxTq
+                .tasks(&runs[1].models[0])
+                .iter()
+                .all(|c| c.borrowed_from.is_none()),
+            "the full run's own cells are not tagged"
+        );
+
+        let mut runs = vec![load(&other_cap), load(&full)];
+        super::borrow_earlier(&mut runs);
+        assert!(
+            Engine::OmlxTq.tasks(&runs[0].models[0]).is_empty(),
+            "another task cap means other tasks"
+        );
+    }
+
+    /// Two runs that ran a workload at 1 user give it a timeline; the random grid's timelines are
+    /// built as before, beside it.
+    #[test]
+    fn dataset_runs_give_their_workloads_a_timeline() {
+        use super::data::Run;
+        let read = |name: &str| -> Run {
+            let p = format!("{}/testdata/metal/{name}", env!("CARGO_MANIFEST_DIR"));
+            serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+        };
+        let runs = vec![
+            read("apple-m3-pro-2026-10-25T150928Z-1bf86114.json"),
+            read("apple-m3-pro-2026-10-26T043309Z-2a9661c3.json"),
+        ];
+        let machines = super::index(&runs);
+        let (_, entries) = (machines["Apple M3 Pro"].models.iter())
+            .find(|(s, _)| *s == "granite-4.2-8b")
+            .expect("granite ran");
+        let titles: Vec<&str> = super::task_timelines(entries)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert_eq!(titles, ["ShareGPT TTFT ms, 1 user", "RAG TTFT ms, 1 user"]);
+        assert!(
+            super::task_timelines(&entries[..1]).is_empty(),
+            "one run is no line"
+        );
+    }
+
     #[test]
     fn a_quick_run_after_a_full_run_borrows_its_engines() {
         use super::data::Run;

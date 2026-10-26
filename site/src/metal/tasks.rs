@@ -172,7 +172,14 @@ pub fn tasks_table(m: &Model) -> Element {
                     let them = rival(m, &c.workload, c.conc);
                     let ttft = them.and_then(|(_, r)| times(c.median_ttft_ms, r.median_ttft_ms, true));
                     let total = them.and_then(|(_, r)| total_times(c, r));
-                    let vs = them.map_or_else(|| "—".to_string(), |(e, _)| e.label().to_string());
+                    // A borrowed rival says which run it is from, as the grid's borrowed engines do.
+                    let vs = them.map_or_else(
+                        || "—".to_string(),
+                        |(e, r)| match &r.borrowed_from {
+                            Some(when) => format!("{} (from {})", e.label(), when.month_day()),
+                            None => e.label().to_string(),
+                        },
+                    );
                     rsx! {
                         TableRow {
                             TableCell { "{name}" }
@@ -204,6 +211,52 @@ pub fn tasks_table(m: &Model) -> Element {
              about one length."
         }
     }
+}
+
+/// One dataset overview square: the users count, the workload, and how many times faster
+/// scratchy is to its first token (None where either side has no number).
+pub type GlanceSquare = (u32, String, Option<f64>);
+
+/// The workloads a model's dataset cells cover, in the page's order: the overview's columns.
+pub fn workloads(m: &Model) -> Vec<&str> {
+    let mut ws: Vec<&str> = Engine::Scratchy
+        .tasks(m)
+        .iter()
+        .map(|c| c.workload.as_str())
+        .collect();
+    ws.sort_by_key(|w| ORDER.iter().position(|o| o == w).unwrap_or(ORDER.len()));
+    ws.dedup();
+    ws
+}
+
+/// One model's dataset overview map: a square a (users, workload), how many times faster
+/// scratchy is to its first token than the rival, None where either side has no number, and the
+/// rival it is set against (the first that ran any of these cells). The map is shown only with a
+/// rival: scratchy alone has nothing to be faster than.
+pub fn glance_squares(m: &Model) -> Option<(Engine, Vec<GlanceSquare>)> {
+    let ours = Engine::Scratchy.tasks(m);
+    let ws = workloads(m);
+    let mut users: Vec<u32> = ours.iter().map(|c| c.conc).collect();
+    users.sort_unstable();
+    users.dedup();
+    let rival = Engine::RIVALS
+        .into_iter()
+        .find(|&e| e.tasks(m).iter().any(TaskCell::measured))?;
+    let squares = (users.iter())
+        .flat_map(|&u| ws.iter().map(move |&w| (u, w)))
+        .map(|(u, w)| {
+            let mine = ours
+                .iter()
+                .find(|c| c.workload == w && c.conc == u && c.measured());
+            let theirs =
+                (rival.tasks(m).iter()).find(|c| c.workload == w && c.conc == u && c.measured());
+            let r = mine
+                .zip(theirs)
+                .and_then(|(a, b)| times(a.median_ttft_ms, b.median_ttft_ms, true));
+            (u, w.to_string(), r)
+        })
+        .collect();
+    Some((rival, squares))
 }
 
 #[cfg(test)]
@@ -244,6 +297,7 @@ mod tests {
             capped_answers: Some(capped),
             num_tasks: Some(8),
             timed_out: false,
+            borrowed_from: None,
         };
         assert_eq!(total_times(&cell(100.0, 0), &cell(105.0, 0)), Some(1.0));
         assert_eq!(total_times(&cell(100.0, 0), &cell(150.0, 0)), None, "longer");
@@ -251,6 +305,37 @@ mod tests {
         let mut unknown = cell(100.0, 0);
         unknown.mean_output_tokens = None;
         assert_eq!(total_times(&cell(100.0, 0), &unknown), None, "no length");
+    }
+
+    /// The overview's map of a run that timed scratchy and oMLX TurboQuant on the same tasks: a
+    /// square a users count and workload, how many times faster scratchy is to its first token;
+    /// rag-spans, scratchy's own, has no rival and so no ratio.
+    #[test]
+    fn the_overview_sets_scratchy_against_the_rival_on_each_workload() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/metal/apple-m3-pro-2026-10-26T043309Z-2a9661c3.json"
+        );
+        let run: super::super::data::Run =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("the oMLX run")).unwrap();
+        let m = &run.models[0];
+        assert_eq!(
+            workloads(m),
+            ["sharegpt", "rag", "rag-spans", "sharegpt-multi-turn"]
+        );
+        let (rival, squares) = glance_squares(m).expect("a rival ran");
+        assert_eq!(rival.key(), "omlx_tq");
+        let at = |u: u32, w: &str| {
+            squares
+                .iter()
+                .find(|(su, sw, _)| *su == u && sw == w)
+                .unwrap()
+                .2
+        };
+        // ShareGPT at 1 user: 167 ms against 280 ms.
+        assert!((at(1, "sharegpt").unwrap() - 280.0 / 167.0).abs() < 0.05);
+        assert!(at(1, "rag-spans").is_none(), "scratchy's own: no rival");
+        assert_eq!(squares.len(), 2 * 4, "two users counts by four workloads");
     }
 
     #[test]
@@ -288,6 +373,7 @@ mod tests {
             capped_answers: Some(0),
             num_tasks: Some(4),
             timed_out: false,
+            borrowed_from: None,
         };
         assert_eq!(accuracy(&cell(0)), Some(0.5));
         assert_eq!(accuracy(&cell(4)), None);

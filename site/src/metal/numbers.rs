@@ -194,6 +194,19 @@ impl Engine {
         .unwrap_or_default()
     }
 
+    /// [`Engine::tasks`], to fill from an earlier run ([`super::borrow_earlier`]). None for an
+    /// engine the tasks axis does not record.
+    pub fn tasks_mut(self, m: &mut Model) -> Option<&mut Option<Vec<super::data::TaskCell>>> {
+        match self {
+            Engine::Scratchy => Some(&mut m.tasks),
+            Engine::OmlxTq => Some(&mut m.tasks_omlx_tq),
+            Engine::Omlx => Some(&mut m.tasks_omlx),
+            Engine::MlxLm => Some(&mut m.tasks_mlx_lm),
+            Engine::Splash => Some(&mut m.tasks_splash),
+            Engine::VllmMetal | Engine::Ollama | Engine::LlamaCpp | Engine::Mistralrs => None,
+        }
+    }
+
     pub fn cells(self, m: &Model) -> &[Cell] {
         self.fields(m).1.as_deref().unwrap_or_default()
     }
