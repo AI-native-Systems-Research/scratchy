@@ -21,7 +21,7 @@
 use ktir_superdsc::emit::{assemble_convert, rb};
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off;
-use scratchy_subtile::sdsc_abstract::{MatK, MatM, MatN, MatY, QueryRowCount};
+use scratchy_subtile::sdsc_abstract::{BlockCols, MatK, MatM, MatN, MatY, QueryRowCount, RowCount};
 use scratchy_subtile::superdsc_opspec::{Df, Fp8, Fp16, Role};
 
 /// These probes emit decode-shaped projections: one token row, projection feature widths, no batch.
@@ -236,8 +236,16 @@ fn qfp8ch_convert_splits_on_128_fp8_output() {
             "qfp8ch",
             1,
             cols,
-            &rb("act", 1, cols),
-            &rb("afp8", 1, cols),
+            &rb(
+                "act",
+                RowCount::of_token_rows(1),
+                BlockCols::of_feature_cols(cols),
+            ),
+            &rb(
+                "afp8",
+                RowCount::of_token_rows(1),
+                BlockCols::of_feature_cols(cols),
+            ),
             &mut sym,
             None,
         );

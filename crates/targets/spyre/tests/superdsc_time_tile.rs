@@ -31,8 +31,10 @@
 //! which do not build on a plain `cargo test` here.
 
 use ktir_superdsc::emit;
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{assemble_reduce, assemble_rmsnorm};
-use scratchy_subtile::sdsc_abstract::{KernelTag, Stk};
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{
+    RmsnormFacts, assemble_reduce, assemble_rmsnorm,
+};
+use scratchy_subtile::sdsc_abstract::{BlockCols, KernelTag, RowCount, Stk};
 use scratchy_subtile::superdsc_opspec::{
     Allocation, DataFormat, Df, FP16_BYTES, Fp16, ItDim, MAX_CORES, MaxCores, OpFunc, Role, Scale,
     TensorArg, USABLE_LX_BYTES, WorkPlan,
@@ -202,8 +204,16 @@ fn reduce_and_multiop_invariants() {
         "mean",
         64,
         576,
-        &emit::rb("r_x", 64, 576),
-        &emit::rb("r_acc", 64, 1),
+        &emit::rb(
+            "r_x",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(576),
+        ),
+        &emit::rb(
+            "r_acc",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(1),
+        ),
         None,
     );
     let j: serde_json::Value =
@@ -245,14 +255,16 @@ fn reduce_and_multiop_invariants() {
     // rmsnorm.rs's module doc): the former `rmsq`+`rmmean` pair is ONE op, 6 → 5.
     let mut sym = 0i64;
     let ops = assemble_rmsnorm(
-        "g",
-        64,
-        576,
-        "x",
-        "w",
-        scratchy_target_spyre::bundle_code::PlaceId::Act(7),
-        "eps",
-        None,
+        RmsnormFacts {
+            prefix: "g",
+            rows: 64,
+            cols: 576,
+            x: "x",
+            gamma: "w",
+            out_id: scratchy_target_spyre::bundle_code::PlaceId::Act(7),
+            eps_const: "eps",
+            ones_const: None,
+        },
         &mut sym,
         None,
     );
@@ -373,6 +385,7 @@ fn rmsnorm_rinv_is_pinned_lx() {
                     bank: 0,
                     offset: 0,
                     size,
+                    cover: ktir_superdsc::placement::BindCover::Full,
                 },
             );
         };
@@ -387,17 +400,19 @@ fn rmsnorm_rinv_is_pinned_lx() {
         let l = layout_for(rows, 576);
         let mut sym = 0i64;
         assemble_rmsnorm(
-            "g",
-            rows,
-            576,
-            "t1",
-            "t2",
-            PlaceId::Act(7),
-            "t3",
-            // The Scale convention — no `γ+1` row, byte-identical to the emission before
-            // the OnePlusScale row existed. The oneplus law has its own golden
-            // (triton-numeric's `rmsnorm_oneplus`).
-            None,
+            RmsnormFacts {
+                prefix: "g",
+                rows,
+                cols: 576,
+                x: "t1",
+                gamma: "t2",
+                out_id: PlaceId::Act(7),
+                eps_const: "t3",
+                // The Scale convention — no `γ+1` row, byte-identical to the emission before
+                // the OnePlusScale row existed. The oneplus law has its own golden
+                // (triton-numeric's `rmsnorm_oneplus`).
+                ones_const: None,
+            },
             &mut sym,
             Some(&l),
         )
@@ -540,6 +555,7 @@ fn two_norm_layout() -> ktir_superdsc::placement::BundleLayout {
                 bank: 0,
                 offset: 0,
                 size,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
     };
@@ -563,14 +579,16 @@ fn norm(
     sym: &mut i64,
 ) -> Vec<emit::EmittedOp> {
     assemble_rmsnorm(
-        prefix,
-        64,
-        576,
-        "t1",
-        "t2",
-        scratchy_target_spyre::bundle_code::PlaceId::Act(out),
-        "t3",
-        None,
+        RmsnormFacts {
+            prefix,
+            rows: 64,
+            cols: 576,
+            x: "t1",
+            gamma: "t2",
+            out_id: scratchy_target_spyre::bundle_code::PlaceId::Act(out),
+            eps_const: "t3",
+            ones_const: None,
+        },
         sym,
         Some(l),
     )
@@ -883,10 +901,12 @@ fn the_walk_leaves_a_pin_this_bundle_never_touches_alone() {
 //    `zz_the_hd128_chunk_in_lx.rs` (`a_trailing_norms_slot_still_bounds_the_chunk_that_precedes_it`).
 #[test]
 fn the_walk_accepts_a_chunk_program_followed_by_its_trailing_norm() {
-    use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
+    use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{AttnFacts, assemble_attn};
     use ktir_superdsc::place::{PlaceId, SynthRole};
     use ktir_superdsc::placement::{SegRole, TensorPlacement};
-    use ktir_superdsc::sdsc_abstract::{AttnGeometry, ChunkScratch, PagedKvPool, attn_bundle_rows};
+    use ktir_superdsc::sdsc_abstract::{
+        AttnGeometry, ChunkScratch, KvExtent, PagedKvPool, SlotCount, attn_bundle_rows,
+    };
 
     const NQH: u32 = 32;
     const NKVH: u32 = 8;
@@ -915,6 +935,7 @@ fn the_walk_accepts_a_chunk_program_followed_by_its_trailing_norm() {
                 bank: 0,
                 offset: (i as u64) << 30,
                 size: 1 << 30,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
     }
@@ -931,6 +952,7 @@ fn the_walk_accepts_a_chunk_program_followed_by_its_trailing_norm() {
                 bank: 0,
                 offset: 40 << 30,
                 size,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
     };
@@ -941,41 +963,45 @@ fn the_walk_accepts_a_chunk_program_followed_by_its_trailing_norm() {
     //    so its rinv pin is in the table before the chunk's admission consults the slot sum.
     let mut declare_syms = 0i64;
     let _ = assemble_rmsnorm(
-        "tail",
-        64,
-        576,
-        &names[0],
-        &names[1],
-        PlaceId::Act(901),
-        "t902",
-        None,
+        RmsnormFacts {
+            prefix: "tail",
+            rows: 64,
+            cols: 576,
+            x: &names[0],
+            gamma: &names[1],
+            out_id: PlaceId::Act(901),
+            eps_const: "t902",
+            ones_const: None,
+        },
         &mut declare_syms,
         Some(&layout),
     );
     // The chunk: 40 pages, the widest rung the hd128 one-request form admits.
     let geom = AttnGeometry::<NQH, NKVH, HD>::minted();
     let rows = attn_bundle_rows(geom, 1, true).expect("the one-request decode rung");
-    let chunk =
-        ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, HD as usize), 40).expect("a chunk");
+    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH, HD), 40).expect("a chunk");
     let mut sym = 0i64;
     let attn_ops = assemble_attn(
-        0,
-        geom,
-        rows,
-        256,
-        256,
-        &names[0],
-        &names[1],
-        &names[2],
-        &names[3],
-        &names[4],
-        &names[5],
-        &names[6],
-        Some(&names[7]),
-        Some(chunk),
-        PlaceId::Act(900),
-        false,
-        false,
+        AttnFacts {
+            t: 0,
+            geom,
+            bundle_rows: rows,
+            // The storage/sweep pair on the boundary's one carrier — the sweep is the full 256-slot
+            // cap (no rung).
+            extent: KvExtent::new(SlotCount::new(256), SlotCount::new(256)),
+            qs: &names[0],
+            new_k_scaled: &names[1],
+            new_v: &names[2],
+            kct: &names[3],
+            vc: &names[4],
+            pmask: &names[5],
+            cmask: &names[6],
+            kv_block_index: Some(&names[7]),
+            chunk: Some(chunk),
+            out_id: PlaceId::Act(900),
+            rows_are_requests: false,
+            headmajor_handoff: false,
+        },
         &mut sym,
         Some(&layout),
     )
@@ -986,14 +1012,16 @@ fn the_walk_accepts_a_chunk_program_followed_by_its_trailing_norm() {
     );
     // The trailing norm's REAL pass: the same public lowering, its pin already declared.
     let tail = assemble_rmsnorm(
-        "tail",
-        64,
-        576,
-        &names[0],
-        &names[1],
-        PlaceId::Act(901),
-        "t902",
-        None,
+        RmsnormFacts {
+            prefix: "tail",
+            rows: 64,
+            cols: 576,
+            x: &names[0],
+            gamma: &names[1],
+            out_id: PlaceId::Act(901),
+            eps_const: "t902",
+            ones_const: None,
+        },
         &mut sym,
         Some(&layout),
     );
@@ -1101,9 +1129,17 @@ fn per_core_addresses_use_distinct_segments_and_disjoint_cores() {
         384,
         64,
         16,
-        &emit::rb("a", 384, 64),
+        &emit::rb(
+            "a",
+            RowCount::of_token_rows(384),
+            BlockCols::of_feature_cols(64),
+        ),
         &Stk::<KernelTag>::kernel(64_usize, 384_usize, "w"),
-        &emit::rb("o", 384, 384),
+        &emit::rb(
+            "o",
+            RowCount::of_token_rows(384),
+            BlockCols::of_feature_cols(384),
+        ),
         None,
     );
     assert_eq!(e.time, 1, "bmm fits LX in one trip");
@@ -1214,9 +1250,17 @@ fn batched_lx_overflowing_matmul() -> emit::EmittedOp {
         n,
         k,
         batch,
-        &emit::rb("a", m, k),
+        &emit::rb(
+            "a",
+            RowCount::of_token_rows(m),
+            BlockCols::of_feature_cols(k),
+        ),
         &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
-        &emit::rb("o", m, n),
+        &emit::rb(
+            "o",
+            RowCount::of_token_rows(m),
+            BlockCols::of_feature_cols(n),
+        ),
         None,
     )
 }
@@ -1231,9 +1275,17 @@ fn assert_the_multi_stick_batched_matmul_is_refused() {
         16384,
         2048,
         2,
-        &emit::rb("a", 64, 2048),
+        &emit::rb(
+            "a",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(2048),
+        ),
         &Stk::<KernelTag>::kernel(2048_usize, 16384_usize, "w"),
-        &emit::rb("o", 64, 16384),
+        &emit::rb(
+            "o",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(16384),
+        ),
         &mut 0,
         None,
     )
@@ -1492,9 +1544,17 @@ fn time1_bundle_mlir_is_byte_identical_to_flat() {
         384,
         64,
         16,
-        &emit::rb("act", 384, 64),
+        &emit::rb(
+            "act",
+            RowCount::of_token_rows(384),
+            BlockCols::of_feature_cols(64),
+        ),
         &Stk::<KernelTag>::kernel(64_usize, 384_usize, "wt"),
-        &emit::rb("out", 384, 384),
+        &emit::rb(
+            "out",
+            RowCount::of_token_rows(384),
+            BlockCols::of_feature_cols(384),
+        ),
         None,
     );
     assert_eq!(emitted.time, 1, "bmm must NOT time-tile");
@@ -1524,9 +1584,17 @@ fn dump_gate_bundles() {
         64,
         64,
         1,
-        &emit::rb("g1_a", 64, 64),
+        &emit::rb(
+            "g1_a",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(64),
+        ),
         &Stk::<KernelTag>::kernel(64_usize, 64_usize, "g1_w"),
-        &emit::rb("g1_o", 64, 64),
+        &emit::rb(
+            "g1_o",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(64),
+        ),
         None,
     );
     assert_eq!(fit.time, 1, "64^3 must fit LX in one trip");
@@ -1559,9 +1627,17 @@ fn dump_gate_bundles() {
                 n,
                 k,
                 b,
-                &emit::rb("gb_a", m, k),
+                &emit::rb(
+                    "gb_a",
+                    RowCount::of_token_rows(m),
+                    BlockCols::of_feature_cols(k),
+                ),
                 &Stk::<KernelTag>::kernel(k as usize, n as usize, "gb_w"),
-                &emit::rb("gb_o", m, n),
+                &emit::rb(
+                    "gb_o",
+                    RowCount::of_token_rows(m),
+                    BlockCols::of_feature_cols(n),
+                ),
                 None,
             );
             assert!(ov.time > 1, "{label} must time-tile");
@@ -1594,14 +1670,16 @@ fn dump_gate_bundles() {
     //     multi-op + broadcast chain (exx2-reduce→add(eps)→rsqrt→broadcast-mul) on-card.
     let mut sym = 0i64;
     let rms = assemble_rmsnorm(
-        "gate",
-        64,
-        576,
-        "rms_x",
-        "rms_w",
-        scratchy_target_spyre::bundle_code::PlaceId::Act(7),
-        "eps",
-        None,
+        RmsnormFacts {
+            prefix: "gate",
+            rows: 64,
+            cols: 576,
+            x: "rms_x",
+            gamma: "rms_w",
+            out_id: scratchy_target_spyre::bundle_code::PlaceId::Act(7),
+            eps_const: "eps",
+            ones_const: None,
+        },
         &mut sym,
         None,
     );

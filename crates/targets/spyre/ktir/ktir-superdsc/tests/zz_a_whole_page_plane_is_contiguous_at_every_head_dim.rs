@@ -46,6 +46,7 @@
 use ktir_superdsc::sdsc_abstract::{
     CopyDims, FeatIdx, GatherEntry, GatherScratch, KvCoord, KvHead, KvPlane, KvSlot, POOL_STICK,
     PagePlaneExtent, PageScratch, PagedKvPool, QueryRowCount, gather_entries_per_page,
+    gather_entry_ceiling,
 };
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
@@ -62,12 +63,12 @@ const HD_SWEEP: [usize; 3] = [64, 128, 256];
 
 /// Every address of one page's plane, over every kv head, slot and feature.
 fn plane_addrs(pool: &PagedKvPool, plane: KvPlane) -> Vec<u32> {
-    let nkvh = NonZeroU32::new(pool.nkvh as u32).expect("nkvh > 0");
+    let nkvh = NonZeroU32::new(pool.nkvh()).expect("nkvh > 0");
     let mut out = Vec::new();
-    for h in 0..pool.nkvh as u32 {
+    for h in 0..pool.nkvh() {
         let kvh = KvHead::new(h, nkvh).expect("kv head in range");
         for slot in 0..PagedKvPool::PAGE_SLOTS as u32 {
-            for feat in 0..pool.hd as u32 {
+            for feat in 0..pool.hd() {
                 out.push(
                     pool.addr(
                         KvCoord::block(plane, kvh)
@@ -85,7 +86,7 @@ fn plane_addrs(pool: &PagedKvPool, plane: KvPlane) -> Vec<u32> {
 #[test]
 fn a_whole_page_plane_is_a_hole_free_bijection_for_every_plane_at_both_head_dims() {
     for hd in [64usize, 128] {
-        let pool = PagedKvPool::new(8, hd);
+        let pool = PagedKvPool::new(8, hd as u32);
         let want = 8u64 * hd as u64 * PagedKvPool::PAGE_SLOTS as u64;
 
         let extent = PagePlaneExtent::of_pool(pool).expect("a stick-multiple head dim is admitted");
@@ -135,7 +136,8 @@ fn a_whole_page_plane_is_a_hole_free_bijection_for_every_plane_at_both_head_dims
 fn the_pin_is_one_stick_block_at_every_head_dim_and_kv_head_count() {
     for nkvh in NKVH_SWEEP {
         for hd in HD_SWEEP {
-            let extent = PagePlaneExtent::of_pool(PagedKvPool::new(nkvh, hd)).expect("admitted");
+            let pool = PagedKvPool::new(nkvh as u32, hd as u32);
+            let extent = PagePlaneExtent::of_pool(pool).expect("admitted");
             assert_eq!(
                 extent.entry_sub_rows(),
                 extent.entry_elems() / POOL_STICK as u64,
@@ -188,7 +190,8 @@ fn the_four_coinciding_thirty_twos_are_four_different_quantities() {
     assert_eq!(PageScratch::ENTRIES_PER_PASS_MAX, 32);
     for nkvh in NKVH_SWEEP {
         for hd in HD_SWEEP {
-            let plane = PagePlaneExtent::of_pool(PagedKvPool::new(nkvh, hd)).expect("admitted");
+            let pool = PagedKvPool::new(nkvh as u32, hd as u32);
+            let plane = PagePlaneExtent::of_pool(pool).expect("admitted");
             // `blocks` moves with `nkvh` ONLY — `hd` cancels.
             assert_eq!(
                 plane.blocks(),
@@ -239,7 +242,7 @@ fn the_four_coinciding_thirty_twos_are_four_different_quantities() {
 fn a_sixty_four_slot_window_is_contiguous_only_at_one_stick_which_is_why_the_old_door_refused() {
     let nkvh = NonZeroU32::new(8).unwrap();
     for hd in [64usize, 128] {
-        let pool = PagedKvPool::new(8, hd);
+        let pool = PagedKvPool::new(8, hd as u32);
         let kvh = KvHead::new(0, nkvh).unwrap();
         // One 64-slot window of V, every feature: the run the OLD gather tried to name with one entry.
         let mut addrs: Vec<u32> = Vec::new();
@@ -277,7 +280,7 @@ fn a_sixty_four_slot_window_is_contiguous_only_at_one_stick_which_is_why_the_old
 fn the_scratch_head_corner_is_the_pools_own_addr_for_every_plane_and_head_dim() {
     for nkvh_n in NKVH_SWEEP {
         for hd in HD_SWEEP {
-            let pool = PagedKvPool::new(nkvh_n, hd);
+            let pool = PagedKvPool::new(nkvh_n as u32, hd as u32);
             let nkvh = NonZeroU32::new(nkvh_n as u32).unwrap();
             let scratch = PageScratch::of_pass(pool, QueryRowCount::of_mq(8)).expect("admitted");
             assert_eq!(
@@ -336,7 +339,7 @@ fn the_scratch_head_corner_is_the_pools_own_addr_for_every_plane_and_head_dim() 
 fn the_plane_head_corner_is_the_pools_own_addr_at_both_head_dims() {
     let nkvh = NonZeroU32::new(8).unwrap();
     for hd in [64usize, 128] {
-        let pool = PagedKvPool::new(8, hd);
+        let pool = PagedKvPool::new(8, hd as u32);
         let plane_extent = PagePlaneExtent::of_pool(pool).expect("a stick-multiple head dim");
         assert_eq!(
             plane_extent.slabs(),
@@ -375,7 +378,7 @@ fn every_copy_op_names_at_most_one_index_stick_at_every_geometry() {
     for nkvh in NKVH_SWEEP {
         for hd in HD_SWEEP {
             for mq in [1u32, 2, 4, 8, 16, 32] {
-                let pool = PagedKvPool::new(nkvh, hd);
+                let pool = PagedKvPool::new(nkvh as u32, hd as u32);
                 let scratch = PageScratch::of_pass(pool, QueryRowCount::of_mq(mq))
                     .unwrap_or_else(|| panic!("nkvh={nkvh} hd={hd} mq={mq} must be admitted"));
                 let at = format!("nkvh={nkvh} hd={hd} mq={mq}");
@@ -452,8 +455,9 @@ fn every_copy_op_names_at_most_one_index_stick_at_every_geometry() {
                     "{at}: the pass's ops must tile destination entries [0, mq*blocks) in order, once"
                 );
             }
+            let pool = PagedKvPool::new(nkvh as u32, hd as u32);
             assert_eq!(
-                PageScratch::of_pass(PagedKvPool::new(nkvh, hd), QueryRowCount::of_mq(33)),
+                PageScratch::of_pass(pool, QueryRowCount::of_mq(33)),
                 None,
                 "nkvh={nkvh} hd={hd}: a rung wider than the ladder must refuse here"
             );
@@ -479,7 +483,7 @@ fn the_page_granular_door_admits_every_stick_multiple_head_dim() {
     let mq = QueryRowCount::of_mq(8);
     for nkvh in NKVH_SWEEP {
         for hd in HD_SWEEP {
-            let pool = PagedKvPool::new(nkvh, hd);
+            let pool = PagedKvPool::new(nkvh as u32, hd as u32);
             assert!(
                 PageScratch::of_pass(pool, mq).is_some(),
                 "nkvh={nkvh} hd={hd}: the page-granular door must admit every geometry a model can \
@@ -513,8 +517,8 @@ fn the_page_granular_door_admits_every_stick_multiple_head_dim() {
 fn the_entry_count_cancels_the_head_dim_but_the_entry_size_does_not() {
     for nkvh in NKVH_SWEEP {
         for hd in HD_SWEEP {
-            let plane =
-                PagePlaneExtent::of_pool(PagedKvPool::new(nkvh, hd)).expect("stick multiple");
+            let pool = PagedKvPool::new(nkvh as u32, hd as u32);
+            let plane = PagePlaneExtent::of_pool(pool).expect("stick multiple");
             assert_eq!(
                 plane.blocks(),
                 nkvh as u64 * PagedKvPool::PAGE_SLOTS as u64 / POOL_STICK as u64,
@@ -552,13 +556,15 @@ fn the_page_entry_reproduces_the_hosts_page_address() {
     const LAYERS: u64 = 40;
     const PLANES: u64 = 3;
     for hd in [64usize, 128] {
-        let pool = PagedKvPool::new(8, hd);
+        let pool = PagedKvPool::new(8, hd as u32);
         let plane = PagePlaneExtent::of_pool(pool).expect("admitted");
         let page_stride = LAYERS * PLANES * plane.bytes();
         let block_bytes = pool.stick_block_bytes();
 
-        let per_page =
-            gather_entries_per_page(page_stride, pool).expect("a whole number of stick blocks");
+        // The pool's own ceiling — 256 pages of budget, past every page the sweep below names.
+        let ceiling =
+            gather_entry_ceiling(256, page_stride, pool).expect("a whole number of stick blocks");
+        let per_page = ceiling.per_page();
         assert_eq!(
             per_page.get() as u64,
             page_stride / block_bytes,
@@ -567,7 +573,7 @@ fn the_page_entry_reproduces_the_hosts_page_address() {
 
         for phys in [0i64, 1, 7, 128] {
             for i in [0u32, 1, 31] {
-                let e = GatherEntry::of_page_block(per_page, phys, i).expect("in range");
+                let e = GatherEntry::of_page_block(ceiling, phys, i).expect("in range");
                 assert_eq!(
                     e.as_i32() as u64 * block_bytes,
                     phys as u64 * page_stride + i as u64 * block_bytes,
@@ -576,9 +582,14 @@ fn the_page_entry_reproduces_the_hosts_page_address() {
             }
         }
         assert_eq!(
-            GatherEntry::of_page_block(per_page, -1, 0),
+            GatherEntry::of_page_block(ceiling, -1, 0),
             None,
             "hd={hd}: a negative page must refuse"
+        );
+        assert_eq!(
+            GatherEntry::of_page_block(ceiling, 256, 0),
+            None,
+            "hd={hd}: a page the pool's budget does not hold must be unconstructible"
         );
         assert_eq!(
             gather_entries_per_page(block_bytes + 1, pool),
@@ -600,7 +611,7 @@ fn a_plane_unit_entry_would_reach_only_one_thirty_second_of_the_pool() {
     const LAYERS: u64 = 40;
     const PLANES: u64 = 3;
     for hd in [64usize, 128] {
-        let pool = PagedKvPool::new(8, hd);
+        let pool = PagedKvPool::new(8, hd as u32);
         let plane = PagePlaneExtent::of_pool(pool).expect("admitted");
         let page_stride = LAYERS * PLANES * plane.bytes();
 

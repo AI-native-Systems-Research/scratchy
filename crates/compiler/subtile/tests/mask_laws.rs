@@ -11,8 +11,8 @@ const PER_PAGE: u32 = scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS a
 use scratchy_subtile::sdsc_abstract::{
     BatchSlot, DeclaredFold, FoldPages, FoldWalker, HeadRequestRow, KvHistory, KvSlot,
     MaskBlockForm, MaskBlocks, MaskPassGrid, PrefixMaskShape, RungWidth, SlotCount, SlotRun,
-    decode_batch_causal_col_valid, decode_batch_prefix_mask_f16, decode_prefix_col_valid,
-    prefill_causal_col_valid,
+    decode_batch_causal_col_valid, decode_batch_empty_sweep_row, decode_batch_prefix_mask_f16,
+    decode_prefix_col_valid, prefill_causal_col_valid,
 };
 
 /// THE RUNTIME SIDE OF A FOLD DECLARATION, as a test can hold it: it KEEPS what it was told, because the
@@ -202,13 +202,18 @@ fn the_collapsed_form_blocks_by_page_and_holds_every_rows_own_history() {
     let declared = per_page
         .declare_to(&mut Walker::default())
         .expect("a test walker never refuses a declaration");
-    let bytes = decode_batch_prefix_mask_f16::<COLS>(sh, declared, &hs, f32::NEG_INFINITY);
+    let mask = decode_batch_prefix_mask_f16::<COLS>(sh, declared, &hs, f32::NEG_INFINITY);
+    let bytes = mask.wire_bytes();
     let zero = half::f16::from_f32(0.0).to_le_bytes();
     assert_eq!(
         bytes.len(),
         sh.elems(MaskBlocks::of(per_page)) * 2,
         "the buffer is exactly the collapsed block count"
     );
+    // ⭐ THE TALLIES ARE THE BYTES' OWN VALIDITY — this test derives them independently of the
+    // minter's loop and every (block, row, slab) count must agree, at the minter's own pitch.
+    let (rows, slabs) = (sh.rows().get() as usize, sh.slabs_per_block() as usize);
+    let mut tallies = vec![0u32; MaskBlocks::of(per_page).get() as usize * rows * slabs];
     for (r, h) in hs.iter().enumerate() {
         for p in 0..pages {
             for head in 0..nqh as u32 {
@@ -224,9 +229,21 @@ fn the_collapsed_form_blocks_by_page_and_holds_every_rows_own_history() {
                          a PerPage block must hold EVERY row's own history, so this cell is valid \
                          exactly when request {r} holds that slot"
                     );
+                    if h.contains(slot) {
+                        tallies[(p as usize * rows + row as usize) * slabs + (c as usize / 64)] +=
+                            1;
+                    }
                 }
             }
         }
+    }
+    for (flat, &t) in tallies.iter().enumerate() {
+        assert_eq!(
+            mask.window_valid(flat / slabs, flat % slabs).get(),
+            t,
+            "flat window-row {flat}: the count must be the bytes' own validity, minted by the \
+             same loop that wrote them"
+        );
     }
 }
 
@@ -288,7 +305,8 @@ fn identical<const COLS: u32>(cases: &[(usize, usize, Vec<usize>, usize)]) {
                 declared::<COLS>(cap, hists.len()),
                 &hists,
                 mask_neg
-            ),
+            )
+            .into_wire_bytes(),
             reference_f32_then_narrow::<COLS>(nqh, cap, &hists, mask_neg),
             "nqh={nqh} COLS={COLS} cap={cap} lens={lens:?} steps={steps}"
         );
@@ -336,7 +354,8 @@ fn a_length_would_mark_the_shared_slot_hole_valid() {
         declared::<COLS>(cap, hists.len()),
         &hists,
         mask_neg,
-    );
+    )
+    .into_wire_bytes();
     let zero = half::f16::from_f32(0.0).to_le_bytes();
     let (mq, rows) = (hists.len(), nqh * hists.len());
     // ⭐ THE BLOCK IS THE PASS: `(row, page)`, index `r * pages + p`. Request 1's page 0 is block
@@ -394,7 +413,8 @@ fn a_fold_pass_carries_every_request_masked_to_its_own_history() {
         declared::<COLS>(cap, hists.len()),
         &hists,
         mask_neg,
-    );
+    )
+    .into_wire_bytes();
     let zero = half::f16::from_f32(0.0).to_le_bytes();
     // ONE BLOCK PER PASS: `pages * mq` of them, each `(nqh*mq)` rows deep.
     assert_eq!(
@@ -425,6 +445,43 @@ fn a_fold_pass_carries_every_request_masked_to_its_own_history() {
             }
         }
     }
+}
+
+/// ⭐⭐⭐ THE SWEEP READING — the seed-safety law's real shape. An all-masked WINDOW is harmless
+/// only because a LATER max-rise expunges it (the fold rescales `l` and `acc` by
+/// `e^(m_old − m_new)` — base e, the device's one exponential — which underflows to zero once
+/// a valid lane raises `m` past the −65504
+/// sentinel); a row whose WHOLE sweep is empty never raises `m`, and its phantom `l` survives
+/// into the finalize's division. The reading names the first such row — a request that never
+/// prefilled — while a healthy batch, even one whose requests carry holes and shared slots,
+/// sweeps one on every row.
+#[test]
+fn an_empty_sweep_is_named_and_a_healthy_batch_sweeps_one_everywhere() {
+    let mask_neg = -(half::f16::MAX.to_f32() / 2.0);
+    const COLS: u32 = 64;
+    let (nqh, cap) = (4usize, 128usize);
+    // Ragged, hole-carrying, shared-slot batch: every request still holds its own slots.
+    let healthy = batch(&[70usize, 5, 0, 64], 3);
+    let sh = shape::<COLS>(nqh, healthy.len());
+    let m =
+        decode_batch_prefix_mask_f16(sh, declared::<COLS>(cap, healthy.len()), &healthy, mask_neg);
+    assert_eq!(
+        decode_batch_empty_sweep_row(&m, sh),
+        None,
+        "a batch whose every request holds a slot must sweep one on every row"
+    );
+    // The same batch WITHOUT the shared-slot appends: request 2's history is EMPTY — the
+    // never-prefilled desync — and the reading names its first row, `head 0`'s `0·mq + 2`.
+    let starved = batch(&[70usize, 5, 0, 64], 0);
+    let sh = shape::<COLS>(nqh, starved.len());
+    let m =
+        decode_batch_prefix_mask_f16(sh, declared::<COLS>(cap, starved.len()), &starved, mask_neg);
+    let row = decode_batch_empty_sweep_row(&m, sh).expect("request 2's rows sweep nothing");
+    assert_eq!(
+        row as usize % starved.len(),
+        2,
+        "the named row {row} must be request 2's (row = head·mq + request)"
+    );
 }
 
 /// A prefill chunk's rows are consecutive positions of ONE prompt, so row `r` attends every column
@@ -629,7 +686,8 @@ fn padding_row_replicates_live_0(real: usize) {
     // entries in block `(r, p)` against live 0's in block `(0, p)`, over every head and column.
     let sh = shape::<COLS>(nqh, mq);
     let gr = declared::<COLS>(cap, mq);
-    let m = decode_batch_prefix_mask_f16(sh, gr, &rows.mask_histories(), mask_neg);
+    let m =
+        decode_batch_prefix_mask_f16(sh, gr, &rows.mask_histories(), mask_neg).into_wire_bytes();
     let pages = (cap as u32).div_ceil(COLS);
     let zero = half::f16::from_f32(0.0).to_le_bytes();
     let mut valid_seen = 0usize;
@@ -731,7 +789,8 @@ fn report_fully_masked_rows_per_block() {
     let sh = shape::<COLS>(nqh, hs.len());
     let deepest = hs.iter().map(|h| h.end().get()).max().unwrap_or(0) as usize;
     let g = declared::<COLS>(deepest + 1, hs.len());
-    let bytes = decode_batch_prefix_mask_f16::<COLS>(sh, g, &hs, f32::NEG_INFINITY);
+    let bytes =
+        decode_batch_prefix_mask_f16::<COLS>(sh, g, &hs, f32::NEG_INFINITY).into_wire_bytes();
     let zero = half::f16::from_f32(0.0).to_le_bytes();
     let rows = sh.nqh() * sh.mq();
     let blocks = MaskBlocks::of(g.grid()).get();
@@ -959,7 +1018,7 @@ fn the_mask_is_blocked_by_the_passes_the_fold_was_declared_to_walk() {
     let fold = from_live
         .declare_to(&mut walker)
         .expect("the walker accepts");
-    let bytes = decode_batch_prefix_mask_f16::<COLS>(sh, fold, &rows, mask_neg);
+    let bytes = decode_batch_prefix_mask_f16::<COLS>(sh, fold, &rows, mask_neg).into_wire_bytes();
 
     assert_eq!(
         walker.pages(),
@@ -1011,7 +1070,8 @@ fn the_mask_is_blocked_by_the_passes_the_fold_was_declared_to_walk() {
     let mismatched = from_rows
         .declare_to(&mut elsewhere)
         .expect("the walker accepts");
-    let short = decode_batch_prefix_mask_f16::<COLS>(sh, mismatched, &rows, mask_neg);
+    let short =
+        decode_batch_prefix_mask_f16::<COLS>(sh, mismatched, &rows, mask_neg).into_wire_bytes();
     assert!(
         short.len() < bytes.len(),
         "the smaller population stages fewer blocks than the fold steps — the tail passes read bytes \

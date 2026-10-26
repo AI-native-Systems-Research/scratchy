@@ -10,8 +10,8 @@
 //! Without it the value lives twice — `per_req` in the emitter and a constant in the worker — with a
 //! comment as the only tie.
 
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
-use scratchy_subtile::sdsc_abstract::FoldRowRegime;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{AttnFacts, assemble_attn};
+use scratchy_subtile::sdsc_abstract::{FoldRowRegime, KvExtent, SlotCount};
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{
     FoldGrouping, bundle, bundle_fingerprint, launch_index,
 };
@@ -24,23 +24,26 @@ fn batch_decode_ops() -> Vec<ktir_superdsc::emit::EmittedOp> {
     let width = scratchy_subtile::sdsc_abstract::attn_bundle_rows(geom, 4, true)
         .expect("4 is a baked decode rung");
     assemble_attn(
-        7,
-        geom,
-        width,
-        256,
-        256,
-        "qs",
-        "nks",
-        "nvr",
-        "kct",
-        "vc",
-        "pmask",
-        "cmask",
-        None,
-        None,
-        scratchy_target_spyre::bundle_code::PlaceId::Act(7),
-        true, // rows_are_requests: a decode batch
-        false,
+        AttnFacts {
+            t: 7,
+            geom,
+            bundle_rows: width,
+            // The storage/sweep pair on the boundary's one carrier — the sweep is the full 256-slot
+            // cap (no rung).
+            extent: KvExtent::new(SlotCount::new(256), SlotCount::new(256)),
+            qs: "qs",
+            new_k_scaled: "nks",
+            new_v: "nvr",
+            kct: "kct",
+            vc: "vc",
+            pmask: "pmask",
+            cmask: "cmask",
+            kv_block_index: None,
+            chunk: None,
+            out_id: scratchy_target_spyre::bundle_code::PlaceId::Act(7),
+            rows_are_requests: true, // rows_are_requests: a decode batch
+            headmajor_handoff: false,
+        },
         &mut sym,
         None,
     )

@@ -130,10 +130,11 @@ fn construct_memory_view(
         let need = (last_elem + 1) * dtype.bytes_per_elem() as i64;
         if need > len as i64 {
             return Err(format!(
-                "construct_memory_view: view {shape:?} strides {strides:?} spans {need} \
-                 bytes but the tensor allocated at byte {byte_addr} holds only {len} — the \
-                 hardware addresses the declared extent, so this view is out of bounds \
-                 there even though HBM zero-pads it here"
+                "construct_memory_view: view {shape:?} of {dtype:?} over pointer %{} strides \
+                 {strides:?} spans {need} bytes but the tensor allocated at byte {byte_addr} \
+                 holds only {len} — the hardware addresses the declared extent, so this view is \
+                 out of bounds there even though HBM zero-pads it here",
+                op.operands[0].0
             ));
         }
     }

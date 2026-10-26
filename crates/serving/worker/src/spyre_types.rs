@@ -513,8 +513,9 @@ pub(crate) struct Shared<'a> {
     pub(crate) embed_tokens: &'a [f32],
     pub(crate) hidden: usize,
     pub(crate) vocab: usize,
-    // ⛔ NO `rope_theta` HERE — same law as `kv_dim` below on `Loaded`. A hybrid-
-    // attention arch has no single θ: each cos/sin source carries its own
+    // ⛔ NO `rope_theta` HERE — same law as the pool below on `Loaded` (the one
+    // lawful model-wide use of the kv width; the raw `kv_dim` field is deleted).
+    // A hybrid-attention arch has no single θ: each cos/sin source carries its own
     // `RotaryKind` (θ as bits) in the wiring, and the rotary tables are built
     // from that. A model-wide θ here built the WRONG class's table silently.
 }
@@ -530,16 +531,21 @@ pub(crate) struct Loaded {
     /// `embed_tokens.weight` `[vocab, hidden]` kept for the per-token gather.
     pub(crate) embed_tokens: Vec<f32>,
     pub(crate) hidden: usize,
-    /// spyre-hw ONLY (pool-entry sizing and the sendnn prefill/batch paths). The
-    /// KTIR path reads no model-wide head dim: rotary classes are per cos/sin
-    /// source (`RotaryKind`) and KV widths per layer (`LayerWiring::kv_width`).
+    /// ⭐ THE PAGED-KV POOL'S GEOMETRY — the model's own two numbers (the per-head
+    /// group count `kv_dim / head_dim`, and the head dim that sizes each entry,
+    /// `hd * 64` elements) minted ONCE at load and stored AS THE POOL. The raw
+    /// usize pair this replaces had no other lawful reader: the KTIR path reads no
+    /// model-wide head dim (rotary classes are per cos/sin source (`RotaryKind`)
+    /// and KV widths per layer (`LayerWiring::kv_width`)), and the pool is the ONE
+    /// lawful model-wide use of `kv_dim` — a hybrid-attention arch has no single
+    /// kv width — so this is not interchangeable with any other pool value.
+    ///
+    /// Stored, not re-derived per call: a field read is a DISJOINT borrow path
+    /// from the session's `&mut`, so it spends legally under a live session
+    /// borrow — the `&self` door it replaced shared the WHOLE model and could not
+    /// (the diff-28 E0502).
     #[cfg(feature = "spyre-hw")]
-    pub(crate) head_dim: usize,
-    /// spyre-hw ONLY: the paged-KV pool's per-head group count comes off it. The
-    /// KTIR path reads each layer's own `LayerWiring::kv_width` instead (a hybrid
-    /// arch has no single kv width), so it is unread there.
-    #[cfg(feature = "spyre-hw")]
-    pub(crate) kv_dim: usize,
+    pub(crate) pool: PagedKvPool,
     pub(crate) vocab: usize,
     // ⛔ NO `rope_theta` FIELD. The KTIR path builds every rotary table from the
     // per-source `RotaryKind` the wiring carries; the info! at load time prints

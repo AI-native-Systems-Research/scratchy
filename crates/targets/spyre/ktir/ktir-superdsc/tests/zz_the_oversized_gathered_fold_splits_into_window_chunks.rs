@@ -22,12 +22,14 @@
 //!    law demands (a chunk whose copies lived in another group would read that group's last page);
 //! 4. the chunks COVER the window sweep exactly once — no window dropped, none double-folded.
 
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{AttnFacts, assemble_attn};
 use ktir_superdsc::sdsc_abstract::{
-    AttnGeometry, DxGroupCeiling, POOL_STICK, PagedKvPool, attn_bundle_rows,
+    AttnGeometry, DxGroupCeiling, KvExtent, POOL_STICK, PagedKvPool, SlotCount, attn_bundle_rows,
 };
 
 const CAP: u32 = PagedKvPool::PAGE_SLOTS as u32;
+/// The storage/sweep pair on the boundary's one carrier — the sweep is the full cap (no rung).
+const EXTENT: KvExtent = KvExtent::new(SlotCount::new(CAP), SlotCount::new(CAP));
 
 /// One emitted op, reduced to what this file asserts: its name, its fold flags and its request tag.
 struct Op {
@@ -43,26 +45,27 @@ fn emit_at<const NQH: u32, const NKVH: u32, const HD: u32>(mq: u32) -> Vec<Op> {
         attn_bundle_rows(geom, mq, true).unwrap_or_else(|| panic!("mq={mq} is not a baked rung"));
     let mut sym = 0i64;
     assemble_attn(
-        0,
-        geom,
-        bundle_rows,
-        CAP,
-        CAP,
-        "t_qs",
-        "t_new_k",
-        "t_new_v",
-        "t_kct",
-        "t_vc",
-        "t_pmask",
-        "t_cmask",
-        Some("t_kv_idx"),
-        // The batched per-page gathered fold this file measures, not the split-KV chunk.
-        None,
-        ktir_superdsc::place::PlaceId::Act(900),
-        true,
-        // A batch rung (`rows_are_requests`) keeps the shipped token-stream finalize; the
-        // head-major handoff is a one-request fact.
-        false,
+        AttnFacts {
+            t: 0,
+            geom,
+            bundle_rows,
+            extent: EXTENT,
+            qs: "t_qs",
+            new_k_scaled: "t_new_k",
+            new_v: "t_new_v",
+            kct: "t_kct",
+            vc: "t_vc",
+            pmask: "t_pmask",
+            cmask: "t_cmask",
+            kv_block_index: Some("t_kv_idx"),
+            // The batched per-page gathered fold this file measures, not the split-KV chunk.
+            chunk: None,
+            out_id: ktir_superdsc::place::PlaceId::Act(900),
+            rows_are_requests: true,
+            // A batch rung (`rows_are_requests`) keeps the shipped token-stream finalize; the
+            // head-major handoff is a one-request fact.
+            headmajor_handoff: false,
+        },
         &mut sym,
         None,
     )

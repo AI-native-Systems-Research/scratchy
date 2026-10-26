@@ -144,7 +144,12 @@ pub fn gather_copy_opspec(
         } => {
             crate::emit::mint_full_window(
                 &format!("gather_copy_opspec('{src}' -> '{dst}'): the destination"),
-                &crate::emit::rb_df(dst, d_rows, d_cols, df),
+                &crate::emit::rb_df(
+                    dst,
+                    crate::sdsc_abstract::RowCount::of_token_rows(d_rows),
+                    crate::sdsc_abstract::BlockCols::of_feature_cols(d_cols),
+                    df,
+                ),
                 dest_base as u64,
                 rows,
                 cols,
@@ -352,7 +357,12 @@ pub fn assemble_gather_copy(
         } => {
             crate::emit::mint_full_window(
                 &format!("assemble_gather_copy {op_name}: the destination"),
-                &crate::emit::rb_df(dst, d_rows, d_cols, Df::Fp16),
+                &crate::emit::rb_df(
+                    dst,
+                    crate::sdsc_abstract::RowCount::of_token_rows(d_rows),
+                    crate::sdsc_abstract::BlockCols::of_feature_cols(d_cols),
+                    Df::Fp16,
+                ),
                 dest_base,
                 d.mb(),
                 d.out(),
@@ -432,13 +442,17 @@ pub fn pointwise_opspec_from_tile(
     let stick_major = !head_major && rows > 1;
     let core_local = layout
         .is_some_and(|l| l.lx_core_local(o_name) || in_names.iter().any(|n| l.lx_core_local(n)));
+    // ⭐ `false` for the spray fact: this builder takes no `EwOperand`, so no operand can state the
+    // row-split (y-broadcast) mode — the only presentation whose division the fact selects.
     pointwise_opspec_from_tile_split(
         tile_op,
         op,
         in_names,
         o_name,
         head_major,
-        EwDivision::Law.resolve(stick_major, core_local).splitter(),
+        EwDivision::Law
+            .resolve(stick_major, core_local, false)
+            .splitter(),
         // Whole-tensor output — every caller but the gather copy, whose runs land at a base.
         0,
     )
@@ -586,7 +600,8 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // bytes and the output's `(y·mb, out)` bytes are the same stick-blocked bytes the mints
     // reserved. Everything below is cross-checks; the addressing itself is the ordinary
     // scale-driven rule (`build_coordinates`/`per_core_addr`), which is why the form needs no
-    // new addressing code — only the layout order and the operand scales stated honestly.
+    // new addressing code — only the layout order and the operand scales stated honestly, and
+    // the wire order REVERSED to the way dxp reads it (see the flag at the operand build).
     let stated_ys: Vec<u32> = inputs
         .iter()
         .map(|i| i.y_broadcast())
@@ -638,6 +653,31 @@ pub fn pointwise_broadcast_opspec_from_tile(
         && inputs.iter().all(|i| {
             i.out_broadcast() || i.is_stick_major_window_for(rows) || block_aligned(i.col_offset())
         });
+    // ⭐⭐⭐ THE ROW-SPLIT MODE'S OWN DIVISION, AS A LAW AT THE DOOR — a y-major op's tensors walk
+    // `["y", "mb", "out"]`, so `y` is the outermost dim of the flat layout and a core's slab is
+    // CONTIGUOUS exactly when the split is over `y` ([`EwDivision::SpraysFirst`]'s doc holds the
+    // card measurement: the prefill mask add split `mb` 21 ways instead, every core's base advanced
+    // ONE STICK while its slab was 32 sticks, and the 21 cores covered sticks 0..51 of the
+    // 672-stick score tile — 29 of 32 heads' scores destroyed, 620 sticks never written). The LAW
+    // resolves to the spray split on this same fact; a caller that STATED another division (or a
+    // gathered split, which is `mb`-only by [`crate::work::GatherSplit`]'s own law) spelled an op
+    // this door cannot address, and the refusal names it rather than emitting the strided slab.
+    if ymajor
+        && !matches!(
+            division,
+            CoreDivision::Ew(EwDivision::Law | EwDivision::SpraysFirst)
+        )
+    {
+        return Err(format!(
+            "{o_name}: a row-split (y-major) op whose stated division is not the spray split — the \
+             op's tensors present [\"y\", \"mb\", \"out\"] with `y` the outermost flat dim, so only a \
+             split over the leading `y` gives a core a CONTIGUOUS slab; the stated division splits an \
+             inner dim and hands every core a strided stick set the per-core addressing walks at the \
+             wrong stride (MEASURED: the prefill mask add, sticks 0..51 of 672 covered, 620 never \
+             written). State [`EwDivision::SpraysFirst`] or the [`EwDivision::Law`], which resolves \
+             to it in this mode"
+        ));
+    }
     // ⭐ THE DIVISION FOLLOWS THE LAYOUT JUST DECIDED for an ungathered op — the same
     // `stickmajor`, so the operands' rank and the cores' cut are one decision. See `EwDivision`.
     let core_local = layout.is_some_and(|l| {
@@ -656,7 +696,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
         CoreDivision::Ew(d) => tile_op
             .tile(
                 MaxCores::<MAX_CORES>,
-                d.resolve(stickmajor, core_local).splitter(),
+                d.resolve(stickmajor, core_local, ymajor).splitter(),
                 "out",
             )
             .map_err(|e| e.0)?,
@@ -735,26 +775,45 @@ pub fn pointwise_broadcast_opspec_from_tile(
                     .with_row_blocked(matches!(df, Df::Fp32)),
                 ))
             } else {
-                Ok(AnyTensorArg::R3(
-                    TensorArg::<3>::new(
-                        is_input,
-                        name.to_string(),
-                        Role::Output,
-                        scale,
-                        device_dims,
-                        if ymajor {
-                            ["y", "mb", "out"]
-                        } else {
-                            ["mb", "out", "y"]
-                        },
-                        "out",
-                        Allocation::Hbm,
-                    )
-                    .map_err(|e| e.0)?
-                    .with_offset(off)
-                    .with_df(df)
-                    .with_row_blocked(matches!(df, Df::Fp32)),
-                ))
+                let t = TensorArg::<3>::new(
+                    is_input,
+                    name.to_string(),
+                    Role::Output,
+                    scale,
+                    device_dims,
+                    if ymajor {
+                        ["y", "mb", "out"]
+                    } else {
+                        ["mb", "out", "y"]
+                    },
+                    "out",
+                    Allocation::Hbm,
+                )
+                .map_err(|e| e.0)?
+                .with_offset(off)
+                .with_df(df)
+                .with_row_blocked(matches!(df, Df::Fp32));
+                // ⭐⭐⭐ THE ROW-SPLIT ORDER IS HEAD-OUTERMOST IN THE ADDRESS MODEL, SO THE WIRE
+                // CARRIES IT REVERSED. dxp reads `layoutDimOrder_` idx 0 as INNERMOST
+                // (`perfdsc/perfLdsInfo.h:29`, `dsc/dataOpDsc.h:347`); this crate's `layout` is
+                // OUTERMOST-first row-major. A y-major operand serialized verbatim therefore hands
+                // dxp the stick as the OUTERMOST dim and — because a rank-3 stick-on-last view
+                // classifies `Flat` and pins its actual extents — a pinned `maxDimSizes_` "read at
+                // the opposite end first" (the hazard `emit`'s own wire-order note states). MEASURED
+                // on the prefill mask add (`11_add_o1417`, y:32 spray split): the verbatim
+                // serialization emitted `layoutDimOrder_ ["y","mb","out"]` + `maxDimSizes_
+                // [32,21,64]`, and the card walked the op torn — 310 of 672 output sticks never
+                // written, the mask operand read at a TWO-STICK row stride (applied token row
+                // `2t mod 21`), while the SAME bytes' producer (the score matmul's output, stick
+                // innermost + `-1`) and every `mb`-split sibling walk correctly. The flag reverses
+                // the wire fields to `["out","mb","y"]` — the stick INNERMOST, the matmul output's
+                // own spelling — and forces the reconstruct walk; the address model reads `layout`
+                // unchanged, so the per-core starts (one 21-stick spray per core) are untouched.
+                if ymajor {
+                    Ok(AnyTensorArg::R3(t.with_dxp_innermost_first()))
+                } else {
+                    Ok(AnyTensorArg::R3(t))
+                }
             }
         };
     let mut args = Vec::with_capacity(inputs.len() + 1);

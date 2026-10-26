@@ -221,7 +221,7 @@ pub(crate) struct Parsed {
 pub(crate) fn wiring_to_parsed(
     w: &'static scratchy_target_spyre::wiring::Wiring,
 ) -> ExecutorResult<Parsed> {
-    // (The kernel-table check moved to where the LAYOUT is in hand: `BakeFacts::of` is followed by
+    // (The kernel-table check moved to where the CODE is in hand: `BakeFacts::of_code` is followed by
     // `Wiring::verify_class_placements(&code.layout)` once per baked bundle, which cross-checks the
     // class sets against the placements — the fact that actually failed on gemma-4, where a fresh
     // re-staging at the same base head dim agreed with a wrong table.)
@@ -1039,7 +1039,7 @@ impl SpyreWorker {
         // here, assigned ~350 lines below inside a `#[cfg(feature = "spyre-hw")]` branch, and read
         // ~600 lines below that. Each needed `#[allow(unused_mut, unused_assignments)]` to
         // compile, and that allow is what let one of them go on being derived for a bind that had
-        // stopped existing. `BakeFacts::of` asks the layout once.
+        // stopped existing. `BakeFacts::of_code` asks the bundle once.
         //
         // ⚠️ ONE `allow` SURVIVES, DOWN FROM SIX, and it is a cfg artifact rather than a silenced
         // problem: a value computed inside `cfg(sendnn)` and consumed outside it must be declared
@@ -1786,7 +1786,7 @@ impl SpyreWorker {
                     );
                 }
                 // What the DECODE bake placed — one call, and its own refusal.
-                let df = scratchy_target_spyre::wiring::BakeFacts::of(&code.layout);
+                let df = scratchy_target_spyre::wiring::BakeFacts::of_code(code);
                 df.require_identity(&code.fp).map_err(werr)?;
                 // ⭐ THE CLASS SETS vs THE PLACEMENTS — the load-time cross-check that closes the
                 // "emu green, card garbage" gap for the kernel-table class: the emulator executes
@@ -1838,13 +1838,14 @@ impl SpyreWorker {
                     .forward_shape(
                         scratchy_target_spyre::wiring::StagedRows::ONE,
                         true,
-                        // ⭐ AND THE GATHER'S ANSWER IS THIS BUNDLE'S OWN, from the layout being checked
-                        // — not `true` like the mask above. The mask's `true` asks for the WIDEST tensor
-                        // set because a launch may or may not stage a mask; a gather is not optional
-                        // that way. The index step exists iff this bake PLACED the index tensor, so
-                        // asking `true` here would report `KV_BLOCK_INDEX_TID` unplaced for every
-                        // non-gathering bundle and refuse to serve every model.
-                        scratchy_target_spyre::wiring::GathersKv::of_layout(&code.layout),
+                        // ⭐ AND THE GATHER'S ANSWER IS THIS BUNDLE'S OWN, from the code being checked
+                        // — its launch groups' own `kv.gathered` bits, not `true` like the mask above.
+                        // The mask's `true` asks for the WIDEST tensor set because a launch may or
+                        // may not stage a mask; a gather is not optional that way. The index step
+                        // exists iff this bake's own ops carry the gather, so asking `true` here
+                        // would report `KV_BLOCK_INDEX_TID` unplaced for every non-gathering bundle
+                        // and refuse to serve every model.
+                        scratchy_target_spyre::wiring::GathersKv::of_code(code),
                         n_consts,
                     )
                     .unplaced(&code.layout);
@@ -1929,7 +1930,7 @@ impl SpyreWorker {
                         // What the PREFILL bake placed. From the bundle, never from
                         // `SCRATCHY_RMS_MATMUL_REDUCE`, so a bundle-vs-env mismatch cannot leave a
                         // matmul reading an unbound (zero) seg0.
-                        prefill_facts = scratchy_target_spyre::wiring::BakeFacts::of(pl);
+                        prefill_facts = scratchy_target_spyre::wiring::BakeFacts::of_code(pcode);
                         // The prefill bake's class sets against ITS placements — the same
                         // cross-check the decode bake just passed, for the same reason.
                         wirings
@@ -2749,7 +2750,7 @@ impl SpyreWorker {
         let head_dim = hf_config
             .head_dim()
             .ok_or_else(|| werr("config missing head_dim / num_attention_heads"))?;
-        let kv_dim = dparsed.kv_dim; // the info! below prints it on BOTH paths; the Loaded field is spyre-hw-only
+        let kv_dim = dparsed.kv_dim; // the pool mint (spyre-hw) + the info! below (both paths)
         let vocab = dparsed.vocab;
         // ⭐ ROPE θ FROM THE BAKE.
         //
@@ -2815,10 +2816,13 @@ impl SpyreWorker {
             hf_config,
             embed_tokens,
             hidden,
+            // ⭐ THE POOL MINTED ONCE, at the only site the model's own two numbers
+            // arrive — the sanctioned seam (`PagedKvPool::new`, "the seam, u32"):
+            // the per-head group count and the head dim that sizes each entry.
+            // Stored as the pool; the raw pair has no other lawful reader (see
+            // the field).
             #[cfg(feature = "spyre-hw")]
-            head_dim,
-            #[cfg(feature = "spyre-hw")]
-            kv_dim,
+            pool: PagedKvPool::new((kv_dim / head_dim) as u32, head_dim as u32),
             vocab,
             session,
             decode,

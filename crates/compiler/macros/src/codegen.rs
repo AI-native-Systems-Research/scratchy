@@ -8802,7 +8802,8 @@ pub fn emit_per_layer_kv_token_elems_arm_body(
 fn refuse_if_wiring_disagrees_with_manifest(
     stem: &str,
     manifest_json: &str,
-    emitted_layers: &[(u64, u32, u32, u32, u32)],
+    // (layer, prefix_k, prefix_v) — the projection of the typed rows built at the one call.
+    emitted_layers: &[(u64, u32, u32)],
     emitted_embed: u32,
     emitted_cos: &[(u32, u32, proc_macro2::TokenStream)],
     emitted_sin: &[(u32, u32, proc_macro2::TokenStream)],
@@ -8901,16 +8902,15 @@ fn refuse_if_wiring_disagrees_with_manifest(
     }
     // ⛔ POSITION BY POSITION. The worker indexes `layers[i]` for layer `i`, so "same set, other
     // order" is exactly as wrong as a missing entry.
-    for (i, (&(mlayer, mk), &(wlayer, wk, wv, _, _))) in pk.iter().zip(emitted_layers).enumerate() {
+    for (i, (&(mlayer, mk), &(wlayer, wk, _))) in pk.iter().zip(emitted_layers).enumerate() {
         if mlayer != wlayer || mk != wk as usize {
             fail.push(format!(
                 "layers[{i}]: manifest says layer {mlayer} prefix_k t{mk}, wiring says layer \
                  {wlayer} prefix_k t{wk}"
             ));
         }
-        let _ = wv;
     }
-    for (i, (&(mlayer, mv), &(_, _, wv, _, _))) in pv.iter().zip(emitted_layers).enumerate() {
+    for (i, (&(mlayer, mv), &(_, _, wv))) in pv.iter().zip(emitted_layers).enumerate() {
         if mv != wv as usize {
             fail.push(format!(
                 "layers[{i}] (layer {mlayer}): manifest says prefix_v t{mv}, wiring says t{wv}"
@@ -9196,10 +9196,27 @@ fn emit_superdsc_wiring(
     });
 
     // ── Per-layer AttnDecode wiring ──
-    // The worker's own walk, run here: find each node that reads the mask, and
-    // take the prefix-K/V args plus the argument positionally after each as the
-    // new-K/new-V outputs.
-    let mut layers: Vec<(u64, u32, u32, u32, u32)> = Vec::new();
+    // THE FACTS COME FROM THE NODES, THE LAW FROM THE PROGRAMS. `gk.attn` carries each
+    // AttnDecode node's own facts — the sealed cache pair and the new-K/new-V inputs, read
+    // where the door and the placement pass read them — so this scan no longer re-derives
+    // roles from the programs' parameter lists. (The positional read it replaces — "the
+    // argument after the prefix-K argument is the new-K output" — matched the OLD kernel
+    // order `q, out, kc, kd, vc, vd` and nothing else: the paged fold binds
+    // `[q, m, l, acc, Kᵀ, V, kt_ids, v_ids, mask]`, no new-K/new-V parameter at all, so it
+    // handed out the V cache tensor as "new K" and an id table as "new V", silently.)
+    //
+    // ⭐ THE ONE THING ONLY THE PROGRAM CAN STATE IS THE NAMING LAW, and the scan states it
+    // as a refusal: an attention program's score side is the RESERVED Kᵀ plane —
+    // `KctResident::of(k).wire_tid()` keyed on the layer's K source, the SAME expression the
+    // fold mint, the one-shot mint and the door's write tail spell — never the natural plane
+    // the cachewr copies fill (same size, wrong plane, invisible to every extent law). A
+    // mask-mentioning program that binds no reserved Kᵀ name is a build failure naming the
+    // layer. The join to the row is the reserved name's OWN source key — by value, never by
+    // position.
+    let mut layers: Vec<(
+        u64,
+        &scratchy_target_spyre::lower_subtile_tape_to_superdsc::AttnWiring,
+    )> = Vec::new();
     if let Some(mask) = gk.attn_mask {
         let pk: std::collections::HashMap<u32, u64> = lwd
             .bindings
@@ -9210,37 +9227,64 @@ fn emit_superdsc_wiring(
                 _ => None,
             })
             .collect();
-        let pv: std::collections::HashSet<u32> = lwd
-            .bindings
-            .iter()
-            .enumerate()
-            .filter_map(|(i, b)| match b {
-                SourceBinding::PrefixV { .. } => Some(i as u32),
-                _ => None,
-            })
-            .collect();
+        let row_of: std::collections::HashMap<u32, _> =
+            gk.attn.iter().map(|r| (r.prefix_k, r)).collect();
         for node in &gk.nodes {
             if !node.args.iter().any(|a| *a as u32 == mask) {
                 continue;
             }
-            let (mut layer, mut k_src, mut new_k) = (None, None, None);
-            let (mut v_src, mut new_v) = (None, None);
-            for (i, a) in node.args.iter().map(|a| *a as u32).enumerate() {
-                if let Some(&l) = pk.get(&a) {
-                    layer = Some(l);
-                    k_src = Some(a);
-                    new_k = node.args.get(i + 1).map(|x| *x as u32);
-                }
-                if pv.contains(&a) {
-                    v_src = Some(a);
-                    new_v = node.args.get(i + 1).map(|x| *x as u32);
-                }
+            // ⭐ THE NAMING LAW, BY VALUE: the program must bind its layer's reserved Kᵀ plane.
+            let Some(kct) = node
+                .args
+                .iter()
+                .filter_map(|a| {
+                    scratchy_target_spyre::ktir_superdsc::reserved_tids::KctResident::of_wire(
+                        *a as u32,
+                    )
+                })
+                .next()
+            else {
+                panic!(
+                    "[superdsc-wiring] {}: an attention program binds no reserved Kᵀ plane, so \
+                     its score side would read the natural K plane the cachewr copies fill — \
+                     same size, wrong plane, invisible to every extent law. The fold and \
+                     one-shot mints bind KctResident::of(k).wire_tid(); a program that does \
+                     not is a regression of that naming law",
+                    model.source_stem
+                );
+            };
+            let src = kct.source_k();
+            let Some(&row) = row_of.get(&src) else {
+                panic!(
+                    "[superdsc-wiring] {}: an attention program's Kᵀ plane names source t{src}, \
+                     which no AttnDecode node's sealed cache pair claims — the program and the \
+                     graph disagree about which layer it serves",
+                    model.source_stem
+                );
+            };
+            // ⭐ THE LAYER OFF THE SOURCE KEY — the one seat that holds both the registry's
+            // layer and the program's reserved name. `prefix_k` stays the SOURCE tid the
+            // host/pool binds (the wiring's own fact); the plane half of the join lives only
+            // in the naming law above.
+            let Some(&layer) = pk.get(&src) else {
+                panic!(
+                    "[superdsc-wiring] {}: the Kᵀ plane's source t{src} is not a PrefixK source \
+                     — the layer's cache would never be bound",
+                    model.source_stem
+                );
+            };
+            // THE PAIRING, CARRIED AND CHECKED: the program must also bind the sealed pair's V
+            // tensor, the same fact the fold's mint spells. A mint that bound some other V is
+            // a second implementation of the pairing — refused here, not discovered on the card.
+            if !node.args.iter().any(|a| *a as u32 == row.prefix_v) {
+                panic!(
+                    "[superdsc-wiring] {}: layer {layer}'s attention program binds its Kᵀ plane \
+                     but not the sealed pair's V tensor t{} — the program and the node's \
+                     KvCacheLayout disagree about the pairing",
+                    model.source_stem, row.prefix_v
+                );
             }
-            if let (Some(l), Some(ks), Some(nk), Some(vs), Some(nv)) =
-                (layer, k_src, new_k, v_src, new_v)
-            {
-                layers.push((l, ks, vs, nk, nv));
-            }
+            layers.push((layer, row));
         }
         layers.sort_by_key(|x| x.0);
     }
@@ -9287,9 +9331,19 @@ fn emit_superdsc_wiring(
         // ── every layer's prefix KV is wired ──
         if layers.len() != n_layers_expected {
             fail.push(format!(
-                "{} of {n_layers_expected} layers have prefix-KV wiring. The rest were dropped by \
-                 the positional arg scan; their K/V cache would never be bound",
+                "{} of {n_layers_expected} layers have prefix-KV wiring. The rest have no \
+                 attention program joining their sealed cache pair — their K/V cache would \
+                 never be bound",
                 layers.len(),
+            ));
+        }
+        if layers.len() != gk.attn.len() {
+            fail.push(format!(
+                "the attention programs and the graph's AttnDecode nodes do not join one-to-one \
+                 ({} joined, {} rows) — a row whose program lost its reserved Kᵀ binding has no \
+                 cache gather, and a row joined twice is a double bind",
+                layers.len(),
+                gk.attn.len()
             ));
         }
         let mut seen_layers: Vec<u64> = layers.iter().map(|x| x.0).collect();
@@ -9435,23 +9489,34 @@ fn emit_superdsc_wiring(
         })
         .map(|(i, _)| i as u32)
         .collect();
+    // What the manifest check reads of a layer: its index and its sealed cache pair — the
+    // projection of the typed rows, built once at this call.
+    let emitted_layers: Vec<(u64, u32, u32)> = layers
+        .iter()
+        .map(|(l, r)| (*l, r.prefix_k, r.prefix_v))
+        .collect();
     refuse_if_wiring_disagrees_with_manifest(
         &model.source_stem,
         manifest_json,
-        &layers,
+        &emitted_layers,
         embed_src,
         &cos_v,
         &sin_v,
         &emitted_weight_ids,
     );
 
-    let layer_toks = layers.iter().map(|(_, ks, vs, nk, nv)| {
+    let layer_toks = layers.iter().map(|(_, row)| {
         // ⭐ THE LAYER'S OWN KV WIDTH, off the prefix-K source's baked shape. A hybrid-attention
         // arch (gemma-4) gives sliding and global layers DIFFERENT kv_heads×head_dim, so the
         // model-wide `Geometry::kv_dim` cannot size a per-layer host buffer or readback — the
         // prefix-K source's column count IS the width this layer's K/V rows carry.
-        let kvw = u32l(gk.tensor_shapes[*ks as usize].1);
-        let (ks, vs, nk, nv) = (u32l(*ks), u32l(*vs), u32l(*nk), u32l(*nv));
+        let kvw = u32l(gk.tensor_shapes[row.prefix_k as usize].1);
+        let (ks, vs, nk, nv) = (
+            u32l(row.prefix_k),
+            u32l(row.prefix_v),
+            u32l(row.new_k),
+            u32l(row.new_v),
+        );
         quote! {
             ::scratchy_target_spyre::wiring::LayerWiring {
                 prefix_k: #ks, prefix_v: #vs, new_k: #nk, new_v: #nv,
@@ -9512,6 +9577,30 @@ fn emit_superdsc_wiring(
         .scalarmul_scales
         .iter()
         .map(|v| proc_macro2::Literal::f32_suffixed(*v))
+        .collect();
+    // Each slot's staging channel, off the bake's own df column through the ONE shared
+    // projection (`wiring::scale_stage_of`) — the same mapping `bake_layout` runs, so the
+    // wiring's channel list and the layout's stage column cannot disagree. The match has NO
+    // wildcard: a new channel is a new variant, and this failing to compile is what forces the
+    // emission to learn it in the same commit.
+    let scalarmul_stage_lits: Vec<proc_macro2::TokenStream> = gk
+        .scalarmul_scales_df
+        .iter()
+        .enumerate()
+        .map(|(i, df)| {
+            let stage = scratchy_target_spyre::wiring::scale_stage_of(
+                *df,
+                &format!("wiring scale slot {i}"),
+            );
+            match stage {
+                scratchy_target_spyre::bundle_code::ScaleStage::IeeeF16 => {
+                    quote! { ::scratchy_target_spyre::bundle_code::ScaleStage::IeeeF16 }
+                }
+                scratchy_target_spyre::bundle_code::ScaleStage::IeeeF32 => {
+                    quote! { ::scratchy_target_spyre::bundle_code::ScaleStage::IeeeF32 }
+                }
+            }
+        })
         .collect();
     // The ScalarMul weight folds, straight off the bake's recognition — the worker scales these
     // staged weights at load, so the list it reads has to be the one the lowering recognized.
@@ -9602,6 +9691,7 @@ fn emit_superdsc_wiring(
             attn_class_hds: &[#(#attn_class_hds),*],
             rms_invcols: &[#(#rms_invcols_lits),*],
             scalarmul_scales: &[#(#scalarmul_scale_lits),*],
+            scalarmul_scales_stage: &[#(#scalarmul_stage_lits),*],
             weight_scale_folds: &[#(#weight_scale_fold_lits),*],
             weight_copies: &[#(#weight_copy_lits),*],
             fp8_k_pads: &[#(#fp8_k_pad_toks),*],
@@ -9919,6 +10009,7 @@ fn placement_tokens(
         bank,
         offset,
         size,
+        cover,
         is_logits,
     } = p;
     let id = place_id_tokens(id);
@@ -9928,10 +10019,34 @@ fn placement_tokens(
         proc_macro2::Literal::u64_unsuffixed(*offset),
         proc_macro2::Literal::u64_unsuffixed(*size),
     );
+    let cover = bind_cover_tokens(cover);
     quote! {
         ::scratchy_target_spyre::bundle_code::Placement {
             id: #id, segment: #segment, bank: #bank, offset: #offset, size: #size,
-            is_logits: #is_logits,
+            cover: #cover, is_logits: #is_logits,
+        }
+    }
+}
+
+/// One [`bundle::BindCover`], spelled for the emitted code. The class is a baked constant of
+/// the placement, so it renders exactly as the bake minted it — `Full` for every whole-bound
+/// tensor, `FoldBlocks { block_bytes }` for the paged-fold pass grid.
+#[cfg(feature = "spyre")]
+fn bind_cover_tokens(
+    c: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::BindCover,
+) -> proc_macro2::TokenStream {
+    use scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::BindCover;
+    match c {
+        BindCover::Full => quote! {
+            ::scratchy_target_spyre::bundle_code::BindCover::Full
+        },
+        BindCover::FoldBlocks { block_bytes } => {
+            let block_bytes = proc_macro2::Literal::u64_unsuffixed(*block_bytes);
+            quote! {
+                ::scratchy_target_spyre::bundle_code::BindCover::FoldBlocks {
+                    block_bytes: #block_bytes,
+                }
+            }
         }
     }
 }
@@ -10019,11 +10134,13 @@ fn layout_tokens(
         places,
         kernel_weights,
         scalarmul_scales,
+        scalarmul_scales_stage,
         weight_scale_folds,
         weight_copies,
         kv_request_stride_bytes,
         lx_op_local_bytes,
         lx_prob_pin_bytes,
+        step_inputs,
     } = l;
     let segs = segment_bytes
         .iter()
@@ -10038,6 +10155,18 @@ fn layout_tokens(
     let scales = scalarmul_scales
         .iter()
         .map(|s| proc_macro2::Literal::f32_suffixed(*s));
+    // Each scale slot's staging channel, off the baked stage column. The match has NO wildcard
+    // on purpose — the same law the step-input stage match below states: a new channel is a new
+    // variant, and this failing to compile is what forces the emission to learn it in the same
+    // commit.
+    let scale_stages = scalarmul_scales_stage.iter().map(|stage| match stage {
+        scratchy_target_spyre::bundle_code::ScaleStage::IeeeF16 => {
+            quote! { ::scratchy_target_spyre::bundle_code::ScaleStage::IeeeF16 }
+        }
+        scratchy_target_spyre::bundle_code::ScaleStage::IeeeF32 => {
+            quote! { ::scratchy_target_spyre::bundle_code::ScaleStage::IeeeF32 }
+        }
+    });
     // The fold list, same exact-value rule: a rounded multiplier is a quietly wrong weight scale.
     let folds = weight_scale_folds.iter().map(|(tid, scale)| {
         let tid = proc_macro2::Literal::u32_unsuffixed(*tid);
@@ -10058,6 +10187,29 @@ fn layout_tokens(
     // budget, summed beside the gathers at the bake's `lx_form` admission. 0 for a bundle whose
     // chunk form mints none.
     let lxpp = proc_macro2::Literal::u64_unsuffixed(*lx_prob_pin_bytes);
+    // The host-staged step inputs' discovery table — which tid each slot took, and which staging
+    // channel narrows its bytes. The stage match has NO wildcard on purpose: a new channel is a
+    // new variant, and this match failing to compile is what forces the emission to learn it in
+    // the same commit (the same law the exhaustive destructure above enforces for fields).
+    let sis = step_inputs.iter().map(|si| {
+        let tid = proc_macro2::Literal::u32_unsuffixed(si.tid);
+        let slot = proc_macro2::Literal::u32_unsuffixed(si.slot);
+        let stage = match si.stage {
+            scratchy_target_spyre::bundle_code::StepInputStage::IeeeF16 => {
+                quote! { ::scratchy_target_spyre::bundle_code::StepInputStage::IeeeF16 }
+            }
+            scratchy_target_spyre::bundle_code::StepInputStage::RawU32 => {
+                quote! { ::scratchy_target_spyre::bundle_code::StepInputStage::RawU32 }
+            }
+        };
+        quote! {
+            ::scratchy_target_spyre::bundle_code::StepInput {
+                tid: #tid,
+                slot: #slot,
+                stage: #stage,
+            }
+        }
+    });
     // The segment budget's verdict, as a variant: every reader matches on it.
     let tail = match weight_tail {
         scratchy_target_spyre::bundle_code::WeightTail::InPlace => {
@@ -10082,11 +10234,13 @@ fn layout_tokens(
             places: ::std::borrow::Cow::Borrowed(&#places),
             kernel_weights: ::std::borrow::Cow::Borrowed(&[#(#kws),*]),
             scalarmul_scales: ::std::borrow::Cow::Borrowed(&[#(#scales),*]),
+            scalarmul_scales_stage: ::std::borrow::Cow::Borrowed(&[#(#scale_stages),*]),
             weight_scale_folds: ::std::borrow::Cow::Borrowed(&[#(#folds),*]),
             weight_copies: ::std::borrow::Cow::Borrowed(&[#(#copies),*]),
             kv_request_stride_bytes: #krs,
             lx_op_local_bytes: #lxol,
             lx_prob_pin_bytes: #lxpp,
+            step_inputs: ::std::borrow::Cow::Borrowed(&[#(#sis),*]),
         }
     }
 }
@@ -10115,18 +10269,22 @@ fn launch_tokens(
         slab_stride_bytes,
         page_slots,
         request,
-        slot_offset,
+        part,
         page_fold,
         batched_requests,
         gathered,
+        region_form,
         fold_rows,
     } = kv;
+    // The group's `PagePart` relays through `at_slots(Slots::of(n))` — the one mint that can
+    // rebuild a cut part inside a generated literal (a token stream carries a number, not a
+    // private field). The number is the bake's own, off the launch index's single derivation.
     let [slot, slab, slots, req, slot_off] = [
         *slot_stride_bytes,
         *slab_stride_bytes,
         *page_slots,
         *request,
-        *slot_offset,
+        part.slots().get(),
     ]
     .map(proc_macro2::Literal::u32_unsuffixed);
     let fold_rows = match fold_rows {
@@ -10159,10 +10317,13 @@ fn launch_tokens(
                 slab_stride_bytes: #slab,
                 page_slots: #slots,
                 request: #req,
-                slot_offset: #slot_off,
+                part: ::scratchy_target_spyre::bundle_code::PagePart::at_slots(
+                    ::scratchy_target_spyre::bundle_code::Slots::of(#slot_off),
+                ),
                 page_fold: #page_fold,
                 batched_requests: #batched_requests,
                 gathered: #gathered,
+                region_form: #region_form,
                 fold_rows: #fold_rows,
             },
             programs: ::std::borrow::Cow::Borrowed(&[#(#progs),*]),
@@ -10388,7 +10549,7 @@ const PREFILL_LX_SAFE: u32 = 31;
 /// causal block stays sub-blocked (the gemma bakes, hd ≥ 256) keeps its 128-row ladder byte for byte.
 ///
 /// ⭐ 384 AND 512 SPAN TWO PAGES. Their cache write is cut into page parts at emission (each part
-/// aimed at its own page through the block table — `EmittedOp::kv_slot_offset`), which is what
+/// aimed at its own page through the block table — `EmittedOp::kv_part`), which is what
 /// lets a chunk outgrow the page: the weights are re-streamed once per chunk, so a 10k prompt's
 /// 40 chunks of 256 become 20 of 512.
 const PREFILL_RUNGS: [u32; 27] = [
@@ -11104,8 +11265,13 @@ fn dump_wavefront_mega(
                     // ⭐⭐⭐ AND A DECODE BATCH RUNG ATTENDS EVERY REQUEST's CONTEXT IN ONE PASS TOO: one
                     // chunk holding the requests' pages end to end, each row masked to its own run
                     // (`BatchChunk`). Its ladder is `B × J` pages (`ChunkScratch::ladder_for`), so its
-                    // ceiling is the widest `B × J` within `PAGES_MAX` — and past it the per-page fold
-                    // keeps serving, as the fallback proof below requires.
+                    // ceiling is the widest `B × J` within `PAGES_MAX`. ⛔ PAST THAT CEILING NOTHING
+                    // SERVES, AND THE BAKE SAYS SO: a batched rung keeps no paged-fold statement (its
+                    // rows are separate requests — the m>1 fold family the splice refuses), so
+                    // `the_fallback_serves_any_length` finds no FOLDS rung, falls to the ladder's top,
+                    // and REFUSES the bake when that top is a chunk. Loud and pending, by design: the
+                    // batched fold family is the follow-up, and until it lands a batched decode past
+                    // the widest `B × J` chunk is a build failure, never a silent wrong answer.
                     let batch_rows = !is_prefill && decode_rows > 1 && seq_sym.is_none();
                     // The requests a chunk's rows are: the batch width, or ONE for a body whose rows
                     // share a history (the one-request decode, a prompt chunk's positions).
@@ -11161,6 +11327,22 @@ fn dump_wavefront_mega(
                                 superdsc::RungFacts {
                                     one_request,
                                     chunk_pages: chunk_ceiling,
+                                    // ⭐ THE CEILING'S PAGED-FOLD STATEMENT — a chunked ladder
+                                    // whose rows are ONE REQUEST'S HISTORY (the one-request
+                                    // decode rung, or a prompt chunk's positions — the same
+                                    // fact `chunk_requests` reads below) threads the fold
+                                    // region into every rung's step-input extents (the
+                                    // one-layout guard compares them across rungs), and the
+                                    // ceiling is one of those rungs. The ceiling itself is a
+                                    // CHUNK (its `chunk_pages` is the widest chunk), so it is
+                                    // NOT the fold body: `fold_body: false` states the region
+                                    // without minting a family. The `(FULL, None)` rung below
+                                    // the ceiling is the body. A BATCHED decode rung keeps no
+                                    // statement: its rows are separate requests and the fold
+                                    // family is the m>1 follow-up the splice refuses.
+                                    paged_fold: (chunk_ceiling.is_some()
+                                        && (one_request || prompt_chunk_prefix))
+                                        .then(|| superdsc::PagedFoldStatement { fold_body: false }),
                                 },
                             ) {
                                 Ok(rolled) => {
@@ -11552,6 +11734,29 @@ fn dump_wavefront_mega(
                                                         superdsc::RungFacts {
                                                             one_request,
                                                             chunk_pages: rung_chunk,
+                                                            // ⭐ THE RUNG'S PAGED-FOLD STATEMENT — every
+                                                            // rung of a chunked one-request-history
+                                                            // ladder (the one-request decode rung, a
+                                                            // prompt chunk's positions) states the
+                                                            // region (`fold_body: false`), and exactly
+                                                            // the `(FULL, None)` rung — the per-page
+                                                            // body the widest chunk's contexts fall
+                                                            // back to — is the fold itself: its
+                                                            // one-shot attention program is REPLACED
+                                                            // by the three-program family (seed,
+                                                            // per-page body, finalize), which the
+                                                            // proof reads off the emitted fold groups.
+                                                            paged_fold: (chunk_ceiling.is_some()
+                                                                && (one_request
+                                                                    || prompt_chunk_prefix))
+                                                                .then(|| {
+                                                                    superdsc::PagedFoldStatement {
+                                                                        fold_body: matches!(
+                                                                            rung,
+                                                                            scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL
+                                                                        ) && rung_chunk.is_none(),
+                                                                    }
+                                                                }),
                                                         },
                                                     ) {
                                                         // Same device split as the ceiling rung above: the
@@ -11769,7 +11974,21 @@ fn dump_wavefront_mega(
                                                     &reach,
                                                 ) {
                                                     Ok(at) => at as u32,
-                                                    Err(e) => panic!("[spyre-superdsc] {base}: {e}"),
+                                                    Err(e) => panic!(
+                                                        "[spyre-superdsc] {base}: {e}\n  the ladder as baked (index: swept cols / folds / chunk / fused twin): {}",
+                                                        rung_reach
+                                                            .iter()
+                                                            .enumerate()
+                                                            .map(|(i, (cap, r))| format!(
+                                                                "#{i} {}{}{}{}",
+                                                                cap.get(),
+                                                                if r.folds { " FOLDS" } else { "" },
+                                                                if r.chunk { " CHUNK" } else { "" },
+                                                                if r.fused_twin { " FUSED" } else { "" },
+                                                            ))
+                                                            .collect::<Vec<_>>()
+                                                            .join(" | ")
+                                                    ),
                                                 };
                                             // ⛔ AND NO CHUNK RUNG BAKES A FOLD-FUSED TWIN: the
                                             // selector's one-pass arm would run it for a prompt chunk
@@ -12895,7 +13114,7 @@ fn dump_wavefront_mega(
                 //
                 // ⛔ NOT BY THE RESIDENT CACHE (`prefix_len`, 256 by default). That cap dates from the
                 // unpaged cache, where a chunk's keys had to fit the baked prefix rows. A paged chunk
-                // writes the POOL, one page part per page (`EmittedOp::kv_slot_offset`), so its width is
+                // writes the POOL, one page part per page (`EmittedOp::kv_part`), so its width is
                 // the pool's law (`PagedKvPool::PREFILL_CHUNK_SLOTS`, asserted equal to the ladder
                 // ceiling above) and not the cache's. MEASURED: with the cap, the 512-row ladder baked
                 // to 256 in silence — `PREFILL ladder = [..., 192, 256]` at load, and every TTFT cell

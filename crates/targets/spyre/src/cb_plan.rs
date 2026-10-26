@@ -170,7 +170,7 @@ impl LaunchSite {
     }
 }
 
-/// `Ok(None)` = THIS (op, pass) DOES NOT LAUNCH — a page part ([`OpKv::slot_offset`]) whose
+/// `Ok(None)` = THIS (op, pass) DOES NOT LAUNCH — a page part ([`OpKv::part`]) whose
 /// page the request does not hold, a short last chunk's padding rows past the request's pages
 /// (#620). Its rows are never read, and the only base left to aim it at is the cursor's own
 /// page, which is part 0's keys. Every caller — the submit walk, `walk_items`, the render —
@@ -197,12 +197,20 @@ pub(crate) fn launch_site(
             where_.n_fold_pages
         );
     };
+    // ⭐ THE AGREED PAGE GEOMETRY IS MINTED HERE, beside the sweep witness — the op's
+    // baked `kv_page_slots` and the session's installed size must AGREE, or the launch
+    // refuses naming both spellings. The old law was the comment "they agree in every
+    // bundle" (the deltas each read their own side) plus a canary in the patch gate
+    // below; `PageGeometry::agree` is now the one door both deltas decompose behind.
+    let geo = fold_plan::PageGeometry::agree(&op.kv, fold)
+        .map_err(|why| anyhow!("fold_plan refused op {oi} (rep {rep}): {why}"))?;
     // WHERE THIS OP READS AND WRITES KV — resolved in `fold_plan`. It composes, in this
     // order: the fold pass's page and validity row, the write slot within its page, the
     // page a non-fold op works in, and the current slab.
     let aim = fold_plan::seg_deltas(
         &op.kv,
         fold,
+        geo,
         rep,
         per,
         SlotPos::of_launch(where_.slot_pos.0),
@@ -275,16 +283,19 @@ pub(crate) fn launch_site(
     let next_is_slot_write = op.kv.slot_write
         && ops.get(oi + 1).is_some_and(|n| {
             n.kv.slot_write
-                && fold_plan::seg_deltas(
-                    &n.kv,
-                    fold,
-                    0,
-                    per,
-                    SlotPos::of_launch(where_.slot_pos.0),
-                    where_.kv_page_base,
-                )
-                .deltas()
-                .is_some()
+                && fold_plan::PageGeometry::agree(&n.kv, fold).is_ok_and(|geo_n| {
+                    fold_plan::seg_deltas(
+                        &n.kv,
+                        fold,
+                        geo_n,
+                        0,
+                        per,
+                        SlotPos::of_launch(where_.slot_pos.0),
+                        where_.kv_page_base,
+                    )
+                    .deltas()
+                    .is_some()
+                })
         });
     let barrier = !next_is_slot_write;
     // #2814: the bootstrap argument is the OFFSET, not the full VA (flex bounds the
@@ -400,9 +411,21 @@ impl CbPlan {
         let mut items = Vec::with_capacity(self.entries.len());
         let mut barrier = false;
         for e in &self.entries {
+            // ⭐ THE GEOMETRY IS MINTED PER ENTRY — each entry carries its own op's baked
+            // modulus, and the render refuses (naming the entry) exactly as the walk's
+            // `launch_site` would refuse naming the op: the twin's refusals track the
+            // walk's at every step, not only its addresses.
+            let geo = fold_plan::PageGeometry::agree(&e.kv, fold).map_err(|why| {
+                anyhow!(
+                    "cb_plan render: entry {} (slot {}): {why}",
+                    e.label,
+                    where_.slot_pos.0
+                )
+            })?;
             let aim = fold_plan::seg_deltas(
                 &e.kv,
                 fold,
+                geo,
                 e.rep,
                 per,
                 SlotPos::of_launch(where_.slot_pos.0),
@@ -477,16 +500,19 @@ pub(crate) fn build_cb_plan(
         let next_is_slot_write = op.kv.slot_write
             && ops.get(oi + 1).is_some_and(|n| {
                 n.kv.slot_write
-                    && fold_plan::seg_deltas(
-                        &n.kv,
-                        fold,
-                        0,
-                        per,
-                        SlotPos::of_launch(where_.slot_pos.0),
-                        where_.kv_page_base,
-                    )
-                    .deltas()
-                    .is_some()
+                    && fold_plan::PageGeometry::agree(&n.kv, fold).is_ok_and(|geo_n| {
+                        fold_plan::seg_deltas(
+                            &n.kv,
+                            fold,
+                            geo_n,
+                            0,
+                            per,
+                            SlotPos::of_launch(where_.slot_pos.0),
+                            where_.kv_page_base,
+                        )
+                        .deltas()
+                        .is_some()
+                    })
             });
         for rep in 0..reps {
             let mut bases = Vec::with_capacity(NUM_SEGMENTS);
@@ -598,7 +624,8 @@ pub(crate) fn parity_check(
 /// * `slot_in_page` — `slot_write_delta`'s term: the write cursor's slot
 ///   within its page (`pos % page_slots`; the ABSOLUTE position for an
 ///   unpaged bundle, whose ops carry `page_slots == 0` and never wrap);
-/// * `slab` — `slab_delta`'s index, `pos / SLAB_SLOTS`.
+/// * `slab` — `slab_delta`'s index, `SlotPos::slab()` (`pos / SLAB_SLOTS`,
+///   minted once in `fold_plan`, consumed here and by the delta).
 ///
 /// The write PAGE is deliberately not one of them. Every step an image
 /// replays writes the page its canvas was rendered on; the one step that
@@ -619,7 +646,7 @@ pub(crate) fn parity_check(
 #[derive(Clone, Copy)]
 pub(crate) struct StepScalars {
     pub(crate) slot_in_page: u64,
-    pub(crate) slab: u64,
+    pub(crate) slab: fold_plan::SlabIdx,
 }
 
 /// The scalar rule the player runs per step — ONE implementation shared by
@@ -627,11 +654,11 @@ pub(crate) struct StepScalars {
 /// applied there cannot disagree about what "slot" and "slab" mean.
 ///
 /// The slot term divides by the SESSION's page count here and by the OP's in
-/// `slot_write_delta`; they agree in every bundle, and [`build_patch_plan`]
-/// checks that DIRECTLY — every slot-writing op's `page_slots` against the
-/// session's — because an op that wrapped at a different modulus would put a
-/// wrap inside an image's replayed span, where the patch model would replay
-/// linearly across it. Refused by name, never probed for.
+/// `slot_write_delta` — and the two can no longer disagree silently:
+/// [`fold_plan::PageGeometry::agree`] refuses a slot-writing op whose baked
+/// modulus differs from the session's before any delta or scalar is derived,
+/// so the agreement this function always relied on is a checked fact, never
+/// a comment.
 pub(crate) fn step_scalars(paged: bool, per: i64, pos: i64) -> StepScalars {
     StepScalars {
         slot_in_page: (if paged {
@@ -639,7 +666,7 @@ pub(crate) fn step_scalars(paged: bool, per: i64, pos: i64) -> StepScalars {
         } else {
             pos
         }) as u64,
-        slab: (pos / fold_plan::SLAB_SLOTS) as u64,
+        slab: fold_plan::SlotPos::of_launch(pos).slab(),
     }
 }
 
@@ -726,7 +753,7 @@ impl PatchPlan {
     /// is two's-complement addition.
     pub(crate) fn apply(&self, image: &mut [ControlBlockWire], s: &StepScalars) {
         let d_slot = s.slot_in_page as i128 - self.reference.slot_in_page as i128;
-        let d_slab = s.slab as i128 - self.reference.slab as i128;
+        let d_slab = s.slab.get() as i128 - self.reference.slab.get() as i128;
         for p in &self.patches {
             let addend = (p.a_slot as i128 * d_slot + p.b_slab as i128 * d_slab) as u64;
             let b = image[p.cb].bytes_mut();
@@ -771,7 +798,7 @@ pub(crate) fn build_patch_plan(
 ) -> Result<(Vec<ControlBlockWire>, PatchPlan)> {
     let per = fold.page_slots.get().max(1);
     let pos = where_.slot_pos.0;
-    if pos % fold_plan::SLAB_SLOTS >= fold_plan::SLAB_SLOTS - 1 {
+    if fold_plan::SlotPos::of_launch(pos).is_last_slot_of_its_slab() {
         bail!(
             "cb_plan patch: canvas position {pos} sits on a slab boundary — the +1 differential \
              cannot isolate the slot term from the slab term"
@@ -783,25 +810,20 @@ pub(crate) fn build_patch_plan(
              cannot isolate the slot term from the page wrap"
         );
     }
-    // The op-vs-session page-modulus law, checked DIRECTLY (this is the canary
-    // the boundary sample used to carry): the slot scalar wraps at the
-    // SESSION's modulus, `slot_write_delta` at the OP'S, and an op that
-    // disagreed would wrap INSIDE an image's replayed span — steps the patch
-    // model would replay linearly across the wrap. The bake emits the
-    // session's page size into every op, so this agrees in every bundle; a
-    // bundle that broke it refuses here, by name.
-    let session_modulus = if fold.paged { per } else { 0 };
+    // ⭐ THE OP-VS-SESSION PAGE-MODULUS LAW, AS A MINT — this loop was the canary the
+    // boundary sample used to carry; `PageGeometry::agree` is now the ONE spelling of
+    // the law, and every launch (`launch_site`), every render (`CbPlan::render`) and
+    // this gate mint it, so a bundle whose ops disagreed with the session about the
+    // page refuses at its FIRST launch, by name — not only when a CB image is cut.
+    // An op that wrapped at a different modulus would put a page wrap INSIDE an
+    // image's replayed span, which the patch model would replay linearly across.
     for o in ops {
-        if o.kv.slot_write && o.kv.page_slots as i64 != session_modulus {
-            bail!(
-                "cb_plan patch: a slot-writing op wraps at {} slots but the session wraps at {} — \
-                 the two moduli disagree, so a page wrap could fall inside an image's replayed \
-                 span and the patch model would replay straight across it. Refusing to patch a \
-                 bundle whose ops disagree with the session about the page.",
-                o.kv.page_slots,
-                session_modulus
-            );
-        }
+        fold_plan::PageGeometry::agree(&o.kv, fold).map_err(|why| {
+            anyhow!(
+                "cb_plan patch: {why}. Refusing to patch a bundle whose ops disagree with \
+                 the session about the page."
+            )
+        })?;
     }
 
     let plan = build_cb_plan(ops, fold, seg, banks, where_)?;

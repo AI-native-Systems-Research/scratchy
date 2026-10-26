@@ -24,8 +24,10 @@
 //! never asked for.
 
 use ktir_superdsc::emit as superdsc;
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
-use ktir_superdsc::sdsc_abstract::{AttnGeometry, PagedKvPool, attn_bundle_rows};
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{AttnFacts, assemble_attn};
+use ktir_superdsc::sdsc_abstract::{
+    AttnGeometry, KvExtent, PagedKvPool, SlotCount, attn_bundle_rows,
+};
 use ktir_superdsc::superdsc_opspec::{GatherIndex, KernelAxis, PageExtent, SdscFoldSet};
 
 const NQH: u32 = 32;
@@ -35,6 +37,8 @@ const HD: u32 = 64;
 /// a wider `active_cap` is refused at build, which is the guard that caught the first draft of this file.
 const CAP: u32 = PagedKvPool::PAGE_SLOTS as u32;
 const ACTIVE_CAP: u32 = PagedKvPool::PAGE_SLOTS as u32;
+/// The storage/sweep pair on the boundary's one carrier — one page, storage and sweep alike.
+const EXTENT: KvExtent = KvExtent::new(SlotCount::new(CAP), SlotCount::new(ACTIVE_CAP));
 // ⛔ `SCORE_WINDOW` IS GONE — it was the KV columns one op sweeps (one page), and it sized the copy
 // harness's `mb` as `HD * SCORE_WINDOW / POOL_STICK`. A gather copy's width is no longer a sweep: it is
 // ONE INDEX STICK of entries (`CopyDims::ENTRIES_PER_OP`), because that is all dxp loads. The harness
@@ -132,23 +136,24 @@ fn prefix_score_op(rung: u32, kv_block_index: Option<&str>) -> serde_json::Value
     let rows = attn_bundle_rows(geom, rung, true).expect("a baked rung");
     let mut sym = 0i64;
     assemble_attn(
-        0,
-        geom,
-        rows,
-        CAP,
-        ACTIVE_CAP,
-        "t_qs",
-        "t_new_k",
-        "t_new_v",
-        "t_kct",
-        "t_vc",
-        "t_pmask",
-        "t_cmask",
-        kv_block_index,
-        None,
-        ktir_superdsc::place::PlaceId::Act(900),
-        true,
-        false,
+        AttnFacts {
+            t: 0,
+            geom,
+            bundle_rows: rows,
+            extent: EXTENT,
+            qs: "t_qs",
+            new_k_scaled: "t_new_k",
+            new_v: "t_new_v",
+            kct: "t_kct",
+            vc: "t_vc",
+            pmask: "t_pmask",
+            cmask: "t_cmask",
+            kv_block_index,
+            chunk: None,
+            out_id: ktir_superdsc::place::PlaceId::Act(900),
+            rows_are_requests: true,
+            headmajor_handoff: false,
+        },
         &mut sym,
         None,
     )
@@ -367,7 +372,7 @@ fn gathered_score_shaped_op(axis: KernelAxis, page: PageExtent) -> serde_json::V
     )
     .expect("the gather-copy op builds at the score leg's extents");
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    let e = superdsc::emit_sdsc("score_gathered", &op, &folds, None).expect("emits");
+    let (e, _) = superdsc::emit_sdsc("score_gathered", &op, &folds, None).expect("emits");
     serde_json::to_value(&e).expect("serializes")
 }
 
@@ -403,7 +408,7 @@ fn ungathered_score_shaped_op() -> serde_json::Value {
     op.args.remove(idx);
     op.indirect = None;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    let e = superdsc::emit_sdsc("score_ungathered", &op, &folds, None).expect("emits");
+    let (e, _) = superdsc::emit_sdsc("score_ungathered", &op, &folds, None).expect("emits");
     serde_json::to_value(&e).expect("serializes")
 }
 
@@ -448,7 +453,7 @@ fn the_gathered_kv_operand_capacity_divides_the_pool_block() {
     // base EXACTLY: `addr = idx*skip + base`, block `B` sits at `4096*B`, so `skip` must divide 4096.
     // Anything else and no integer index reaches a block boundary — every step lands inside a block,
     // which is a clean bake reading a fraction of another row's keys.
-    let block = PagedKvPool::new(NKVH as usize, HD as usize).stick_block_elems() as i64;
+    let block = PagedKvPool::new(NKVH, HD).stick_block_elems() as i64;
     assert_eq!(
         block, 4096,
         "the pool's uniform block, from the pool itself"
@@ -489,7 +494,7 @@ fn the_score_kernels_walk_has_no_page_axis_today() {
         "the score kernel is a 2-D [feature, slot] operand; a page axis would be a THIRD dim"
     );
     // Every dim is one window's own extent, so the product is one window — not a multi-page span.
-    let block = PagedKvPool::new(NKVH as usize, HD as usize).stick_block_elems() as i64;
+    let block = PagedKvPool::new(NKVH, HD).stick_block_elems() as i64;
     let window: i64 = cap.dims.iter().map(|(_, e, _)| e).product();
     assert!(
         window <= block,
@@ -506,7 +511,7 @@ fn the_score_kernels_walk_has_no_page_axis_today() {
 /// being expressible and this fails at `cargo test` instead of on the card.
 #[test]
 fn the_pool_is_a_uniform_array_of_stick_blocks() {
-    let p = PagedKvPool::new(NKVH as usize, HD as usize);
+    let p = PagedKvPool::new(NKVH, HD);
     let block = p.stick_block_elems();
     assert!(block > 0, "a zero block makes every index step a no-op");
     // ⛔ THE ONE THAT HAS ALREADY BEEN CONFUSED FOR THE BLOCK: the distance to the next KV head is
@@ -542,7 +547,7 @@ fn the_pool_is_a_uniform_array_of_stick_blocks() {
 /// caller fills in: the row of this table that the KV pool's layout actually supports is the second.
 #[test]
 fn the_axis_and_page_together_decide_the_stride() {
-    let block = PagedKvPool::new(NKVH as usize, HD as usize).stick_block_elems() as i64;
+    let block = PagedKvPool::new(NKVH, HD).stick_block_elems() as i64;
     let mut table = Vec::new();
     // ⛔ `Batch` ("mb") REPLACES `Feature` ("in"): the harness is the KERNEL-less gather-copy op now,
     // whose dims are `[mb, out, y]`. `in` belongs to a matmul, which cannot carry a gather at all, and

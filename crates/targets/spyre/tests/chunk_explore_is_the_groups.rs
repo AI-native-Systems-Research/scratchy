@@ -17,7 +17,7 @@ use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::matmul::{
     SharedKernelBmmForm, matmul_opspec_off_operands_phys_gathered,
 };
-use ktir_superdsc::sdsc_abstract::{MatK, MatM, MatN, MatY, QueryRowCount};
+use ktir_superdsc::sdsc_abstract::{BlockCols, MatK, MatM, MatN, MatY, QueryRowCount, RowCount};
 use ktir_superdsc::superdsc_opspec::{
     DataFormat, Df, EntryBase, Fp8, Fp16, GatherIndex, GatherRun, KernelAxis, PageExtent, Role,
     SdscFoldSet,
@@ -35,9 +35,17 @@ fn dense_matmul() -> emit::EmittedOp {
         2048,
         2048,
         1,
-        &emit::rb("a", 256, 2048),
+        &emit::rb(
+            "a",
+            RowCount::of_token_rows(256),
+            BlockCols::of_feature_cols(2048),
+        ),
         &Stk::<KernelTag>::kernel(2048_usize, 2048_usize, "w"),
-        &emit::rb("o", 256, 2048),
+        &emit::rb(
+            "o",
+            RowCount::of_token_rows(256),
+            BlockCols::of_feature_cols(2048),
+        ),
         None,
     )
 }

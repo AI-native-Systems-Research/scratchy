@@ -92,7 +92,7 @@ pub const TL_FUNCTIONS: &[&str] = &[
 ///
 /// `gather` is the one entry NOT in the original five-fixture census: it is
 /// `embedding.py`'s indirect read (`tt.descriptor_gather`), added with that fixture.
-pub const VALUE_METHODS: &[&str] = &["load", "store", "to", "gather"];
+pub const VALUE_METHODS: &[&str] = &["load", "store", "to", "gather", "scatter"];
 
 /// Python builtins the kernels call. `float(x)` is a constexpr cast in
 /// `attention_flash.py`'s `sm_scale` handling.

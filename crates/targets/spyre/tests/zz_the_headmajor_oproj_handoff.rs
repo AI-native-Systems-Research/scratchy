@@ -269,6 +269,8 @@ fn walk_at_8b() -> (RolledSuperDsc, SubtileIR<NeoX>, HashSet<u32>) {
         RungFacts {
             one_request: true,
             chunk_pages: None,
+            // No chunked ladder here: no fold statement, no region threading.
+            paged_fold: None,
         },
     )
     .expect("the 8b-shaped two-layer graph lowers with the head-major handoff");

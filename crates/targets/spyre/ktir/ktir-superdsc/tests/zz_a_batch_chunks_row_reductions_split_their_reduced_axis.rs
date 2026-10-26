@@ -6,14 +6,18 @@
 //! Emitted from the shipped `assemble_attn` against a real layout, at granite-3.1-2b's geometry (hd 64) and
 //! granite-3.1-8b's (hd 128, the batch's query-group blocks), on every rung of every batch width.
 
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{AttnFacts, assemble_attn};
 use ktir_superdsc::place::PlaceId;
 use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
-use ktir_superdsc::sdsc_abstract::{AttnGeometry, ChunkScratch, PagedKvPool, attn_bundle_rows};
+use ktir_superdsc::sdsc_abstract::{
+    AttnGeometry, ChunkScratch, KvExtent, PagedKvPool, SlotCount, attn_bundle_rows,
+};
 
 const NQH: u32 = 32;
 const NKVH: u32 = 8;
 const CAP: u32 = 256;
+/// The storage/sweep pair on the boundary's one carrier — the sweep is the full cap (no rung).
+const EXTENT: KvExtent = KvExtent::new(SlotCount::new(CAP), SlotCount::new(CAP));
 
 #[derive(Clone, Copy, Debug)]
 enum Rows {
@@ -45,6 +49,7 @@ fn emit<const HD: u32>(pages: u32, rows: Rows) -> Vec<(String, serde_json::Value
                 bank: 0,
                 offset: (i as u64) << 30,
                 size: 1 << 30,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
     }
@@ -55,27 +60,28 @@ fn emit<const HD: u32>(pages: u32, rows: Rows) -> Vec<(String, serde_json::Value
         Rows::Prompt(n) => (attn_bundle_rows(geom, n, false), false),
     };
     let bundle_rows = bundle_rows.unwrap_or_else(|| panic!("{rows:?}: no rung"));
-    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, HD as usize), pages)
-        .expect("a chunk granite admits");
+    let chunk =
+        ChunkScratch::of_chunk(PagedKvPool::new(NKVH, HD), pages).expect("a chunk granite admits");
     let mut sym = 0i64;
     assemble_attn(
-        0,
-        geom,
-        bundle_rows,
-        CAP,
-        CAP,
-        &names[0],
-        &names[1],
-        &names[2],
-        &names[3],
-        &names[4],
-        &names[5],
-        &names[6],
-        Some(&names[7]),
-        Some(chunk),
-        PlaceId::Act(900),
-        requests,
-        false,
+        AttnFacts {
+            t: 0,
+            geom,
+            bundle_rows,
+            extent: EXTENT,
+            qs: &names[0],
+            new_k_scaled: &names[1],
+            new_v: &names[2],
+            kct: &names[3],
+            vc: &names[4],
+            pmask: &names[5],
+            cmask: &names[6],
+            kv_block_index: Some(&names[7]),
+            chunk: Some(chunk),
+            out_id: PlaceId::Act(900),
+            rows_are_requests: requests,
+            headmajor_handoff: false,
+        },
         &mut sym,
         Some(&layout),
     )
@@ -129,7 +135,7 @@ fn most(sticks: u64) -> u64 {
 #[test]
 fn every_batch_rung_splits_its_row_reductions_reduced_axis() {
     fn check<const HD: u32>() {
-        let pool = PagedKvPool::new(NKVH as usize, HD as usize);
+        let pool = PagedKvPool::new(NKVH, HD);
         let mut cases = 0usize;
         for seqs in PagedKvPool::BATCH_RUNGS {
             for pages in ChunkScratch::ladder_for(pool, seqs) {

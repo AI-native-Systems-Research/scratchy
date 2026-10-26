@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The split-KV chunk body at head dim 128 (granite-3.1-8b's geometry), from the shipped `assemble_attn`.
 
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{AttnFacts, assemble_attn};
 use ktir_superdsc::sdsc_abstract::{
-    AttnGeometry, ChunkRowKind, ChunkScratch, PagedKvPool, attn_bundle_rows,
+    AttnGeometry, ChunkRowKind, ChunkScratch, KvExtent, PagedKvPool, SlotCount, attn_bundle_rows,
 };
 
 const NQH: u32 = 32;
 const NKVH: u32 = 8;
 const HD: u32 = 128;
 const CAP: u32 = 256;
+/// The storage/sweep pair on the boundary's one carrier — the sweep is the full cap (no rung).
+const EXTENT: KvExtent = KvExtent::new(SlotCount::new(CAP), SlotCount::new(CAP));
 const NSLAB: u32 = 2;
 
 /// The slots of each score part and each value part a `pages`-page chunk at `mq` rows emits: one whole
@@ -21,8 +23,7 @@ fn part_slots(pages: u32, mq: u32) -> (Vec<u32>, Vec<u32>) {
     } else {
         ChunkRowKind::Prompt
     };
-    let chunk =
-        ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, HD as usize), pages).unwrap();
+    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH, HD), pages).unwrap();
     let cut = |per: u32| -> Vec<u32> {
         (0..pages.div_ceil(per))
             .map(|i| per.min(pages - i * per) * 256)
@@ -44,27 +45,28 @@ fn emit(pages: u32, mq: u32) -> Vec<(String, serde_json::Value)> {
     } else {
         attn_bundle_rows(geom, mq, false).expect("a prompt chunk's rows")
     };
-    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, HD as usize), pages)
+    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH, HD), pages)
         .expect("a chunk granite-8b admits");
     let mut sym = 0i64;
     assemble_attn(
-        0,
-        geom,
-        rows,
-        CAP,
-        CAP,
-        "t_qs",
-        "t_new_k",
-        "t_new_v",
-        "t_kct",
-        "t_vc",
-        "t_pmask",
-        "t_cmask",
-        Some("t_kvbi"),
-        Some(chunk),
-        ktir_superdsc::place::PlaceId::Act(900),
-        false,
-        false,
+        AttnFacts {
+            t: 0,
+            geom,
+            bundle_rows: rows,
+            extent: EXTENT,
+            qs: "t_qs",
+            new_k_scaled: "t_new_k",
+            new_v: "t_new_v",
+            kct: "t_kct",
+            vc: "t_vc",
+            pmask: "t_pmask",
+            cmask: "t_cmask",
+            kv_block_index: Some("t_kvbi"),
+            chunk: Some(chunk),
+            out_id: ktir_superdsc::place::PlaceId::Act(900),
+            rows_are_requests: false,
+            headmajor_handoff: false,
+        },
         &mut sym,
         None,
     )
@@ -203,7 +205,7 @@ fn an_hd128_chunk_scores_per_head_and_values_per_head_slab() {
 /// gathers stay one copy per stick.
 #[test]
 fn the_hd128_value_gather_reads_its_own_index_sticks() {
-    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, HD as usize), 8).unwrap();
+    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH, HD), 8).unwrap();
     let ops = emit(8, 1);
     let sticks = |stem: &str| -> Vec<u32> {
         ops.iter()

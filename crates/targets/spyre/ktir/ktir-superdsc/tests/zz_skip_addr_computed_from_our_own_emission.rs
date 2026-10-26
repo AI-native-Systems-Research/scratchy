@@ -84,7 +84,7 @@ fn dsc_and_node<'a>(
 fn the_instrument_reproduces_a_known_product() {
     let op = matmul_opspec(384, 384, 64, 16, "Tensor0", "Tensor1", "Tensor2").expect("a matmul");
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    let e = superdsc::emit_sdsc("MatMul_0", &op, &folds, None).expect("emits");
+    let (e, _) = superdsc::emit_sdsc("MatMul_0", &op, &folds, None).expect("emits");
     let j = serde_json::to_value(&e).unwrap();
     let (dsc, node) = dsc_and_node(&j, "MatMul_0", 0);
 
@@ -135,7 +135,7 @@ fn the_shipped_gather_copys_skip_addr_is_one_pool_stick_block() {
     use ktir_superdsc::sdsc_abstract::{
         GatherScratch, PagedKvPool, QueryRowCount, SlotCount, SlotWindow,
     };
-    let pool = PagedKvPool::new(NKVH as usize, HD as usize);
+    let pool = PagedKvPool::new(NKVH as u32, HD as u32);
     for mq in [2u32, 8] {
         for swept in [64u32, 128, 256] {
             let scratch = GatherScratch::of_fold_pass(
@@ -177,7 +177,7 @@ fn the_shipped_gather_copys_skip_addr_is_one_pool_stick_block() {
             .expect("the gather-copy op builds");
             let value_idx = op.indirect.expect("a declared gather").value;
             let folds = SdscFoldSet::new(op.iter.cores_used());
-            let e = superdsc::emit_sdsc("Gather_0", &op, &folds, None).expect("emits");
+            let (e, _) = superdsc::emit_sdsc("Gather_0", &op, &folds, None).expect("emits");
             let j = serde_json::to_value(&e).unwrap();
             let (dsc, node) = dsc_and_node(&j, "Gather_0", value_idx);
             let got = skip_addr_elems(dsc, node).expect("derivable");
@@ -232,7 +232,7 @@ fn the_shipped_page_gather_copys_skip_addr_is_one_pool_stick_block() {
         (16, 128),
         (32, 64),
     ] {
-        let pool = PagedKvPool::new(nkvh as usize, hd as usize);
+        let pool = PagedKvPool::new(nkvh as u32, hd as u32);
         for mq in [2u32, 8] {
             let scratch = PageScratch::of_pass(pool, QueryRowCount::of_mq(mq))
                 .expect("granite's geometry admits the page copy");
@@ -264,7 +264,7 @@ fn the_shipped_page_gather_copys_skip_addr_is_one_pool_stick_block() {
                 let value_idx = op.indirect.expect("a declared gather").value;
                 let cores = op.iter.cores_used().get();
                 let folds = SdscFoldSet::new(op.iter.cores_used());
-                let e = superdsc::emit_sdsc("PageGather_0", &op, &folds, None).expect("emits");
+                let (e, _) = superdsc::emit_sdsc("PageGather_0", &op, &folds, None).expect("emits");
                 let j = serde_json::to_value(&e).unwrap();
                 let (dsc, node) = dsc_and_node(&j, "PageGather_0", value_idx);
                 let got = skip_addr_elems(dsc, node).expect("derivable");
@@ -363,7 +363,7 @@ fn pinning_the_entry_dim_makes_skip_addr_one_entrys_size() {
     .expect("the gather-copy op builds");
     let value_idx = op.indirect.expect("a declared gather").value;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    let e = superdsc::emit_sdsc("Gather_0", &op, &folds, None).expect("emits");
+    let (e, _) = superdsc::emit_sdsc("Gather_0", &op, &folds, None).expect("emits");
     let j = serde_json::to_value(&e).unwrap();
     let (dsc, node) = dsc_and_node(&j, "Gather_0", value_idx);
 
@@ -455,7 +455,7 @@ fn the_two_pins_hd_128_needs_derive_the_two_window_strides_the_pool_has() {
     use ktir_superdsc::superdsc_opspec::{EntryBase, GatherIndex};
 
     const HD_8B: i64 = 128;
-    let pool = PagedKvPool::new(NKVH as usize, HD_8B as usize);
+    let pool = PagedKvPool::new(NKVH as u32, HD_8B as u32);
     // The two strides, from the pool — not spelled as 8192/4096.
     let kt_window = pool.stick_block_elems() as i64;
     let v_window = (POOL_STICK * POOL_STICK) as i64;
@@ -499,7 +499,7 @@ fn the_two_pins_hd_128_needs_derive_the_two_window_strides_the_pool_has() {
         .expect("the gather-copy op builds at both pins");
         let value_idx = op.indirect.expect("a declared gather").value;
         let folds = SdscFoldSet::new(op.iter.cores_used());
-        let e = superdsc::emit_sdsc("Gather_0", &op, &folds, None).expect("emits");
+        let (e, _) = superdsc::emit_sdsc("Gather_0", &op, &folds, None).expect("emits");
         let j = serde_json::to_value(&e).unwrap();
         let (dsc, node) = dsc_and_node(&j, "Gather_0", value_idx);
         let got = skip_addr_elems(dsc, node).expect("derivable");

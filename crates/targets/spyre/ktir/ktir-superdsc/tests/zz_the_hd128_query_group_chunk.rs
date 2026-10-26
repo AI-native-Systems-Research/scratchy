@@ -11,11 +11,11 @@
 //! The per-query-head form (32 scores, 64 value ops) is what every chunk without the registry, or with more
 //! than one row per head, still emits — pinned by `zz_the_hd128_chunk_emission`.
 
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{AttnFacts, assemble_attn};
 use ktir_superdsc::place::PlaceId;
 use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
 use ktir_superdsc::sdsc_abstract::{
-    AttnGeometry, ChunkRowKind, ChunkScratch, PagedKvPool, attn_bundle_rows,
+    AttnGeometry, ChunkRowKind, ChunkScratch, KvExtent, PagedKvPool, SlotCount, attn_bundle_rows,
 };
 
 const NQH: u32 = 32;
@@ -24,6 +24,8 @@ const GQA: u32 = NQH / NKVH;
 const HD: u32 = 128;
 const NSLAB: u32 = 2;
 const CAP: u32 = 256;
+/// The storage/sweep pair on the boundary's one carrier — the sweep is the full cap (no rung).
+const EXTENT: KvExtent = KvExtent::new(SlotCount::new(CAP), SlotCount::new(CAP));
 
 fn emit(pages: u32, mq: u32, classes: &[u32]) -> Vec<(String, serde_json::Value)> {
     emit_rows(pages, mq, classes, false)
@@ -63,6 +65,7 @@ fn emit_rows(
                 bank: 0,
                 offset: (i as u64) << 30,
                 size: 1 << 30,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
     }
@@ -74,27 +77,28 @@ fn emit_rows(
     } else {
         attn_bundle_rows(geom, mq, false).expect("a prompt chunk's rows")
     };
-    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, HD as usize), pages)
+    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH, HD), pages)
         .expect("a chunk granite-8b admits");
     let mut sym = 0i64;
     assemble_attn(
-        0,
-        geom,
-        rows,
-        CAP,
-        CAP,
-        &names[0],
-        &names[1],
-        &names[2],
-        &names[3],
-        &names[4],
-        &names[5],
-        &names[6],
-        Some(&names[7]),
-        Some(chunk),
-        PlaceId::Act(900),
-        requests,
-        false,
+        AttnFacts {
+            t: 0,
+            geom,
+            bundle_rows: rows,
+            extent: EXTENT,
+            qs: &names[0],
+            new_k_scaled: &names[1],
+            new_v: &names[2],
+            kct: &names[3],
+            vc: &names[4],
+            pmask: &names[5],
+            cmask: &names[6],
+            kv_block_index: Some(&names[7]),
+            chunk: Some(chunk),
+            out_id: PlaceId::Act(900),
+            rows_are_requests: requests,
+            headmajor_handoff: false,
+        },
         &mut sym,
         Some(&layout),
     )
@@ -124,8 +128,7 @@ fn part_slots(pages: u32) -> (Vec<u32>, Vec<u32>) {
 
 /// [`part_slots`] for a chunk whose rows are `rows`.
 fn part_slots_of(pages: u32, rows: ChunkRowKind) -> (Vec<u32>, Vec<u32>) {
-    let chunk =
-        ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, HD as usize), pages).unwrap();
+    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH, HD), pages).unwrap();
     let cut = |per: u32| -> Vec<u32> {
         (0..pages.div_ceil(per))
             .map(|i| per.min(pages - i * per) * 256)
@@ -315,7 +318,7 @@ fn the_group_form_needs_the_registry_and_a_decode() {
 /// over a contraction wider than one stick.
 #[test]
 fn a_decode_batch_attends_each_kv_heads_whole_group() {
-    let pool = PagedKvPool::new(NKVH as usize, HD as usize);
+    let pool = PagedKvPool::new(NKVH, HD);
     for seqs in PagedKvPool::BATCH_RUNGS {
         for t in ChunkScratch::ladder_for(pool, seqs) {
             let ops = emit_batch(t, seqs);
@@ -394,7 +397,7 @@ fn a_decode_batch_attends_each_kv_heads_whole_group() {
 #[test]
 fn the_batch_mask_rows_are_the_relaid_group_rows() {
     use ktir_superdsc::sdsc_abstract::BatchChunk;
-    let pool = PagedKvPool::new(NKVH as usize, HD as usize);
+    let pool = PagedKvPool::new(NKVH, HD);
     for seqs in PagedKvPool::BATCH_RUNGS {
         let t = ChunkScratch::ladder_for(pool, seqs)[0];
         let bc = BatchChunk::of(ChunkScratch::of_chunk(pool, t).unwrap(), seqs, GQA).unwrap();

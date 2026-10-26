@@ -9,14 +9,18 @@
 //! all is the build-time proof that each `exp` reads exactly the slice its `esub` wrote: the emitter's
 //! core-local read law refuses any op that divides a core-local tensor differently from its first op.
 
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{AttnFacts, assemble_attn};
 use ktir_superdsc::place::PlaceId;
 use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
-use ktir_superdsc::sdsc_abstract::{AttnGeometry, ChunkScratch, PagedKvPool, attn_bundle_rows};
+use ktir_superdsc::sdsc_abstract::{
+    AttnGeometry, ChunkScratch, KvExtent, PagedKvPool, SlotCount, attn_bundle_rows,
+};
 
 const NQH: u32 = 32;
 const NKVH: u32 = 8;
 const CAP: u32 = 256;
+/// The storage/sweep pair on the boundary's one carrier — the sweep is the full cap (no rung).
+const EXTENT: KvExtent = KvExtent::new(SlotCount::new(CAP), SlotCount::new(CAP));
 
 /// The rows a chunk's rows are: one request's decode, a decode batch of `n`, or a prompt chunk of `n`.
 #[derive(Clone, Copy, Debug)]
@@ -51,6 +55,7 @@ fn emit<const HD: u32>(pages: u32, rows: Rows) -> Vec<(String, serde_json::Value
                 bank: 0,
                 offset: (i as u64) << 30,
                 size: 1 << 30,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
     }
@@ -61,27 +66,28 @@ fn emit<const HD: u32>(pages: u32, rows: Rows) -> Vec<(String, serde_json::Value
         Rows::Prompt(n) => (attn_bundle_rows(geom, n, false), false),
     };
     let bundle_rows = bundle_rows.unwrap_or_else(|| panic!("{rows:?}: no rung"));
-    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, HD as usize), pages)
-        .expect("a chunk granite admits");
+    let chunk =
+        ChunkScratch::of_chunk(PagedKvPool::new(NKVH, HD), pages).expect("a chunk granite admits");
     let mut sym = 0i64;
     assemble_attn(
-        0,
-        geom,
-        bundle_rows,
-        CAP,
-        CAP,
-        &names[0],
-        &names[1],
-        &names[2],
-        &names[3],
-        &names[4],
-        &names[5],
-        &names[6],
-        Some(&names[7]),
-        Some(chunk),
-        PlaceId::Act(900),
-        requests,
-        false,
+        AttnFacts {
+            t: 0,
+            geom,
+            bundle_rows,
+            extent: EXTENT,
+            qs: &names[0],
+            new_k_scaled: &names[1],
+            new_v: &names[2],
+            kct: &names[3],
+            vc: &names[4],
+            pmask: &names[5],
+            cmask: &names[6],
+            kv_block_index: Some(&names[7]),
+            chunk: Some(chunk),
+            out_id: PlaceId::Act(900),
+            rows_are_requests: requests,
+            headmajor_handoff: false,
+        },
         &mut sym,
         Some(&layout),
     )
@@ -163,7 +169,7 @@ fn probs(ops: &[(String, serde_json::Value)]) -> Vec<&(String, serde_json::Value
 #[test]
 fn every_batch_rung_divides_its_probabilities_sticks_first() {
     fn check<const HD: u32>() {
-        let pool = PagedKvPool::new(NKVH as usize, HD as usize);
+        let pool = PagedKvPool::new(NKVH, HD);
         let mut cases = 0usize;
         for seqs in PagedKvPool::BATCH_RUNGS {
             for pages in ChunkScratch::ladder_for(pool, seqs) {

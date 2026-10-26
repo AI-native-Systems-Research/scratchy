@@ -388,7 +388,7 @@ fn the_same_op_without_a_gather_declares_none() {
         "no declaration without a call to the door"
     );
     let folds = ktir_superdsc::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
-    let e = superdsc::emit_sdsc("scalarmul_o2", &op, &folds, None).expect("emits");
+    let (e, _) = superdsc::emit_sdsc("scalarmul_o2", &op, &folds, None).expect("emits");
     let j = serde_json::to_value(&e).unwrap();
     for i in 0..op.args.len() {
         assert_eq!(

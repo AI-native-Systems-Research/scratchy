@@ -169,8 +169,18 @@ fn no_kind_fuses_across_requests() {
     }
     // `Slot` carries its request in the kind as well; both paths must agree.
     let trips = vec![
-        Trip::new(GroupKind::Slot { req: 0 }, TripRequest(0)),
-        Trip::new(GroupKind::Slot { req: 1 }, TripRequest(1)),
+        Trip::new(
+            GroupKind::Slot {
+                req: TripRequest(0),
+            },
+            TripRequest(0),
+        ),
+        Trip::new(
+            GroupKind::Slot {
+                req: TripRequest(1),
+            },
+            TripRequest(1),
+        ),
     ];
     assert_eq!(group_ranges(&trips, 512).len(), 2);
 }
@@ -196,8 +206,12 @@ fn unbatched_partition_is_unchanged() {
     let kinds = [
         GroupKind::Pure,
         GroupKind::Pure,
-        GroupKind::Slot { req: 0 },
-        GroupKind::Slot { req: 0 },
+        GroupKind::Slot {
+            req: TripRequest(0),
+        },
+        GroupKind::Slot {
+            req: TripRequest(0),
+        },
         GroupKind::SlotSolo,
         GroupKind::Slab,
         GroupKind::Slab,
@@ -234,8 +248,18 @@ fn partition_still_covers_exactly_with_mixed_requests() {
     let trips = vec![
         pure(0),
         pure(1),
-        Trip::new(GroupKind::Slot { req: 1 }, TripRequest(1)),
-        Trip::new(GroupKind::Slot { req: 2 }, TripRequest(2)),
+        Trip::new(
+            GroupKind::Slot {
+                req: TripRequest(1),
+            },
+            TripRequest(1),
+        ),
+        Trip::new(
+            GroupKind::Slot {
+                req: TripRequest(2),
+            },
+            TripRequest(2),
+        ),
         Trip::new(GroupKind::SlotSolo, TripRequest(2)),
         Trip::new(GroupKind::HostKv { skip: 1 }, TripRequest(2)),
         pure(2),

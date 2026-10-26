@@ -33,7 +33,7 @@ fn source_of(
 #[test]
 fn each_kv_head_gathers_whole_chunk_kernels_at_every_admitted_head_dim() {
     for hd in [64u64, 128, 256] {
-        let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH, hd as usize), 2)
+        let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH as u32, hd as u32), 2)
             .unwrap_or_else(|| panic!("hd {hd}: a two-page chunk is admitted"));
         let slots = chunk.slots() as u64;
         let hbe = chunk.plane().head_block_elems();
@@ -69,7 +69,8 @@ fn each_kv_head_gathers_whole_chunk_kernels_at_every_admitted_head_dim() {
 /// one-slab form; above it V reads its own run after K's, and the host stages both.
 #[test]
 fn v_reads_its_own_index_run_only_above_one_slab() {
-    let at = |hd: usize| ChunkScratch::of_chunk(PagedKvPool::new(NKVH, hd), 4).unwrap();
+    let at =
+        |hd: usize| ChunkScratch::of_chunk(PagedKvPool::new(NKVH as u32, hd as u32), 4).unwrap();
     let one = at(64);
     assert_eq!(one.value_index_base(), 0);
     assert_eq!(one.table_sticks(), one.index_sticks());
@@ -88,5 +89,5 @@ fn v_reads_its_own_index_run_only_above_one_slab() {
 /// the model keeps the per-page fold, as a build-time fact.
 #[test]
 fn a_head_dim_past_the_page_is_refused() {
-    assert!(ChunkScratch::of_chunk(PagedKvPool::new(NKVH, 512), 2).is_none());
+    assert!(ChunkScratch::of_chunk(PagedKvPool::new(NKVH as u32, 512), 2).is_none());
 }

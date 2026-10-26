@@ -24,7 +24,7 @@ fn head(i: u32, nkvh: u32) -> KvHead {
 #[test]
 fn the_kt_write_offset_is_the_same_address_the_fold_reads() {
     for (nkvh, hd) in [(8usize, 64usize), (8, 128), (4, 128)] {
-        let p = PagedKvPool::new(nkvh, hd);
+        let p = PagedKvPool::new(nkvh as u32, hd as u32);
         for kvh in 0..nkvh {
             // Slots spanning several prefill chunks (96 rows each) and several 64-slot fold blocks.
             for slot in [0usize, 1, 63, 64, 95, 96, 128, 191, 192, 255] {
@@ -49,7 +49,7 @@ fn the_kt_write_offset_is_the_same_address_the_fold_reads() {
 #[test]
 fn the_v_write_offset_is_the_same_address_the_fold_reads() {
     for (nkvh, hd) in [(8usize, 64usize), (8, 128), (4, 128)] {
-        let p = PagedKvPool::new(nkvh, hd);
+        let p = PagedKvPool::new(nkvh as u32, hd as u32);
         for kvh in 0..nkvh {
             for slot in [0usize, 1, 63, 64, 95, 96, 128, 191, 192, 255] {
                 for d in [0usize, 1, 63, hd - 1] {

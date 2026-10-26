@@ -200,6 +200,15 @@ pub enum Program {
     /// The last-row extraction half of an lm-head tail — see [`KtirNode::node_out_tid`].
     LmLast,
     Rope,
+    /// ⭐ THE APPEND FORM — `RopeAppend`'s OWN contract, stated on the type and never sniffed
+    /// out of a region shape: the front end's arity-6 `[K, cos, sin, V, K_cache, V_cache]`
+    /// whose STORES ARE THE CACHE WRITES (there is no rotated intermediate — nothing on the
+    /// device path reads one). The kernel (`rope.py`'s `rope_append_fwd`) writes the rotated
+    /// K and the pass-through V into the paged pool planes; the lowering (`Program::RopeAppend`'s
+    /// door arm) lowers the program through the whole-function walk and then re-transposes the
+    /// Kᵀ plane after it — the pool layout's three-plane law, keyed on this contract, never on
+    /// recognising a rope. `Rope` above stays the q stream's rotation (no cache).
+    RopeAppend,
     Attn,
     /// A 2-D BLOCK TRANSPOSE of a whole tensor — `[mb, out]` → `[out, mb]`, one
     /// `interslicetranspose_fp16` on the PT unit. See
@@ -399,6 +408,47 @@ impl ActiveCap {
     }
 }
 
+/// One host-staged per-step input a program binds: the binding, and the SLOT it took.
+///
+/// See [`KtirNode::step_inputs`] for why this carries bindings and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StepInput {
+    pub buffer: BufferId,
+    /// The index the numbering law maps to this input's tid. Small, dense from 0, and assigned by
+    /// the producer that states the binding — a splice keeps one slot table so two programs of one
+    /// graph that share a slot share the buffer, and the placement pass refuses two programs that
+    /// state different views for one slot's tid.
+    pub slot: u32,
+}
+
+/// ⭐⭐⭐ THE ONE NUMBERING LAW for host-staged per-step inputs — the tid of `slot` in a graph with
+/// `n_graph_tensors` of its own tensors: `n_graph_tensors + slot`.
+///
+/// BOTH HALVES OF THE MECHANISM CALL THIS, AND THE CONSUMER REFUSES DISAGREEMENT. The producer that
+/// states a step input numbers its binding through this law; the placement pass recomputes the law
+/// for the stated slot and refuses a binding numbered any other way — so the two can never drift
+/// apart, and a hand-picked tid is a build failure naming the op, never a silently-aliased buffer.
+/// This is the same shape as `gather_entry_ceiling`: one door both halves mint through, and
+/// disagreement is refused, never repaired.
+///
+/// ⛔ PURE NUMBERING, NOTHING ELSE. The law knows a graph's tensor count and a slot index; it has no
+/// vocabulary for what any input IS. Which slot a meaning takes is the stating producer's own table,
+/// and what the runtime writes into a placed tid travels as data in the bundle artifact — never as a
+/// branch in this crate.
+///
+/// Slots count up from the graph's own tensor count, so a step input can never collide with a graph
+/// tensor's tid (graph tids are `0..n_graph_tensors` by construction — a graph tensor's tid IS its
+/// index into the producer's tensor list). Two programs of one graph numbering the same slot agree
+/// on the tid by construction; the placement pass is what refuses them disagreeing about the view.
+pub const fn step_input_tid(n_graph_tensors: u32, slot: u32) -> u32 {
+    // ⛔ THE LAW IS UNCHECKED ADD, AND THE PLACEMENT PASS GUARDS THE CORNER. A graph whose tensor
+    // count reached `u32::MAX - slot` would wrap the slot onto a tid the graph already owns, and no
+    // real graph is within six orders of magnitude of that; the pass still refuses a wrapped tid
+    // (it would fail the law check or the reserved check), so the corner is loud if it is ever
+    // reachable at all.
+    n_graph_tensors + slot
+}
+
 /// One node's KTIR: the function, and which tensor each of its parameters carries.
 pub struct KtirNode {
     pub func: ktir_core::ir::IRFunction<'static>,
@@ -425,6 +475,23 @@ pub struct KtirNode {
     /// was never absent from the IR anyway: the mask parameter's own view states `[1, capacity]`, so a
     /// caller that wants it reads it from [`regions`](crate::emit::lower_ktir_to_superdsc::regions).
     pub mask: Option<BufferId>,
+    /// ⭐ THE HOST-STAGED PER-STEP INPUTS this program binds — buffers no graph tensor names, staged
+    /// by the runtime every step.
+    ///
+    /// ⛔ A LIST OF BINDINGS, LIKE [`Self::bindings`] AND [`Self::mask`], AND FOR THE SAME REASON: a
+    /// per-step input is SYNTHETIC — no graph tensor names it, so the producer numbers it itself and
+    /// no reading of the IR recovers which parameter it is. Each entry pairs the binding with its
+    /// SLOT — the index the ONE numbering law ([`step_input_tid`]) maps to a tid — so the placement
+    /// pass can CHECK that the producer numbered the binding through the law rather than hand-picking
+    /// a tid, and refuse the disagreement instead of trusting it.
+    ///
+    /// ⛔ ZERO SEMANTICS HERE, BY LAW. This field says THAT a parameter is host-staged and WHICH slot
+    /// it took; it says nothing about WHAT the runtime writes into it. The staging law travels as
+    /// DATA through the bundle artifact (the `weight_copies`/`scalarmul_scales` channel), because it
+    /// is a runtime fact, and this crate never branches on it — a placement mint that needed to know
+    /// a buffer's meaning would be a recognizer, and the whole point of the slot indirection is that
+    /// it does not.
+    pub step_inputs: Vec<StepInput>,
     /// The output tensor of the NODE this program is HALF OF, when that is not the program's own
     /// output. `None` for every program that writes its node's output itself, which is all but one.
     ///
@@ -480,6 +547,7 @@ impl Clone for KtirNode {
             program: self.program,
             bindings: self.bindings.clone(),
             mask: self.mask,
+            step_inputs: self.step_inputs.clone(),
             node_out_tid: self.node_out_tid,
             minted: std::sync::Mutex::new(
                 self.minted
@@ -521,5 +589,50 @@ impl ReduceKind {
             ReduceKind::Sum => "sum",
             ReduceKind::Max => "max",
         }
+    }
+
+    /// ⭐ WALL 12 — the NONSTICK twin of [`Self::op_func`]: the wire name the leading-prefix arm
+    /// emits. `summeanmaxexx2.ddl` binds the nonstick family as its own `opFuncName`s
+    /// (`:39` `sumnonstick`, `:45` `maxnonstick`), and matchDdl2Dsc compares the string EXACTLY
+    /// (ddl_conversion.cpp:2117-2122) — a reduce whose reduced axis is a leading dim lowers under
+    /// these names, never under the stick forms'. `sfp` unit for both.
+    pub const fn nonstick_op_func(self) -> &'static str {
+        match self {
+            ReduceKind::Sum => "sumnonstick",
+            ReduceKind::Max => "maxnonstick",
+        }
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ WALL 12 — a `linalg.reduce`'s OWN axis facts, as the op states them: the
+/// `Dimensions` it reduces, and the rank it states them against (its result `Shape`'s rank plus
+/// the reduced count). These are the op's own statement, not the walk's 2D frame — the door
+/// reads the block off them ([`crate::emit::lower_ktir_to_superdsc::reduce_axis_block`]) and
+/// never re-derives the axes from a frame that has already merged the leading dims into rows
+/// (which is exactly why a trailing reduce and a row reduce were indistinguishable before).
+///
+/// `dims` is padded to FOUR because the template's own dimension vocabulary is four reduce
+/// symbols (`summeanmaxexx2.ddl:9`, `%reduce_dim:4`) — a reduce stating more reduced dims than
+/// that has no bind to match and is refused where the facts are read, naming the template's own
+/// count. `Copy` so [`Lowering`](crate::emit::whole_function) keeps its `Copy` derive.
+#[derive(Clone, Copy, Debug)]
+pub struct ReduceAxes {
+    /// The `Dimensions` attr verbatim (i64, the IR's int list), zero-padded past `n_dims`.
+    pub dims: [i64; 4],
+    /// How many entries of `dims` the op states.
+    pub n_dims: u8,
+    /// The rank the dims are stated against: the result `Shape`'s rank plus the reduced count.
+    pub in_rank: u8,
+}
+
+impl ReduceAxes {
+    /// The stated `Dimensions`, as a slice.
+    pub fn dims(&self) -> &[i64] {
+        &self.dims[..self.n_dims as usize]
+    }
+
+    /// The rank the dims are stated against.
+    pub fn in_rank(&self) -> u32 {
+        self.in_rank as u32
     }
 }

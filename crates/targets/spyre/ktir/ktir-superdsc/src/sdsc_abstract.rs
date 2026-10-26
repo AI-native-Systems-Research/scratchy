@@ -211,11 +211,14 @@ impl SlotExtent {
 /// THE Kᵀ SCORE KERNEL'S DECLARED PHYSICAL COLUMN COUNT (`Stk::kernel`'s `n_out`) — the pitch that
 /// separates one slot-stick group of the kernel from the next.
 ///
-/// Exactly two tensors are ever the score kernel, and each is a door: the NEW block's own Kᵗ scratch
-/// ([`SlotExtent::kernel_row_pitch`] — its slot extent, `mq_pad` by the new-block identity) and the
-/// paged pool's resident Kᵀ plane ([`PagedKvPool::KT_KERNEL_PITCH`] — a page's slots). Both answers
-/// are SLOT quantities; a row count (`mq_pad` as rows, `nqh*mq`, a mask extent) has no door, so it
-/// cannot fill the kernel-pitch slot even where the values coincide.
+/// Every tensor that is ever the score kernel mints its pitch through its own door: the NEW block's
+/// own Kᵗ scratch ([`SlotExtent::kernel_row_pitch`] — its slot extent, `mq_pad` by the new-block
+/// identity), the paged pool's resident Kᵀ plane ([`PagedKvPool::KT_KERNEL_PITCH`] — a page's
+/// slots), the whole-chunk gathered Kᵗ scratch ([`Self::of_chunk_scratch`] — the chunk's slots), a
+/// core-local Kᵗ part ([`Self::of_chunk_part`] — the part's slots), and the gathered window
+/// ([`Self::of_gather_window`] — one 64-slot window). Every answer is a SLOT quantity; a row count
+/// (`mq_pad` as rows, `nqh*mq`, a mask extent) has no door, so it cannot fill the kernel-pitch slot
+/// even where the values coincide.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct KtKernelPitch(u32);
 
@@ -230,6 +233,129 @@ impl KtKernelPitch {
     /// values (64, 256, and the new block's padded slots) are all plausible column counts here.
     pub const fn of_gather_window(slots: WindowSlots) -> KtKernelPitch {
         KtKernelPitch(slots.n())
+    }
+
+    /// ⭐ THE WHOLE-CHUNK GATHERED Kᵗ SCRATCH'S PITCH — the chunk's own slots
+    /// ([`ChunkScratch::slots`]), demanded by the scratch itself: the chunk's score reads its
+    /// gathered Kᵗ whole, one row block at a time, so the pitch that separates one slot-stick
+    /// group from the next is the CHUNK's extent — not a page's ([`PagedKvPool::KT_KERNEL_PITCH`])
+    /// and not a window's ([`Self::of_gather_window`]).
+    pub const fn of_chunk_scratch(chunk: ChunkScratch) -> KtKernelPitch {
+        KtKernelPitch(chunk.slots())
+    }
+
+    /// ⭐ A CORE-LOCAL Kᵗ PART'S PITCH — the part's own slots (its contraction extent), demanded
+    /// by the part itself ([`ChunkPart`]): where Kᵗ stays in LX, each part lands in its own
+    /// core-local tensor and the score op that owns it reads it whole, so the part's extent is
+    /// the pitch — never the chunk's and never a page's.
+    pub const fn of_chunk_part(part: ChunkPart) -> KtKernelPitch {
+        KtKernelPitch(part.slots())
+    }
+
+    /// `Stk::kernel`'s `n_out` slot — the kernel's declared physical column extent.
+    pub const fn n_out_cols(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// THE V VALUE KERNEL'S DECLARED ROW EXTENT (`Stk::kernel`'s `k_in`) — WHICH V plane the value
+/// leg's shared kernel reads, carried as the type. Every plane is a door:
+///
+/// - [`VKernelRows::Page`] — the resident V page plane `[PAGE_SLOTS, hd]`, and the gathered
+///   scratch's byte-for-byte copy of it (a scratch row IS a page row — the copy is the gather's
+///   own contract — so the scratch's row extent is the pool's own page slots on both the gathered
+///   and ungathered paths).
+/// - the NEW block's wide stream, in both its forms: the sub-block value leg's per-head slice
+///   ([`VKernelRows::of_new_block_stream`] — never restickified, so the slice is declared `hd`
+///   rows) and the chunk form's whole-block contraction ([`VKernelRows::of_new_block_chunk`] —
+///   `new_v`'s kv-head block is `[mq_pad, hd]`, so the value leg contracts it whole).
+/// - a chunk part's V region ([`VKernelRows::of_chunk_part`] — the part's own slots, in the
+///   CHUNK's gathered V scratch — a `[rows, chunk slots]` block, not the page-plane copy above).
+///
+/// ⭐ THE GATHERED VALUE LEG REFUSES EVERY PLANE BUT THE PAGE. Its scratch rows are page rows, so
+/// a window's, a stream's, a block's, or a part's extent there would declare a stick-group stride
+/// the buffer does not have — the exact defect that once made the gathered geometry differ from
+/// the pool's (the gathered arms "used to declare ONE WINDOW … where the pool declares a whole
+/// page"). The refusal sits at the arm's door; the ungathered arms take any plane. A bare `u32`
+/// in that slot — as this was, fed the head dim at the new-block call — pairs any number with
+/// any plane, and the pairing is invisible exactly where the two agree.
+/// ```
+/// use ktir_superdsc::sdsc_abstract::{PagedKvPool, VKernelRows};
+/// // The page plane's rows are the pool's own page slots — and nothing else's number.
+/// assert_eq!(VKernelRows::Page.rows(), PagedKvPool::PAGE_SLOTS as u32);
+/// // A new-block stream of the SAME row count is still not the page plane: the pairing the
+/// // gathered value leg refuses was inexpressible as a bare `u32`, where 256 == 256.
+/// assert_ne!(VKernelRows::Page, VKernelRows::of_new_block_stream(PagedKvPool::PAGE_SLOTS as u32));
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VKernelRows {
+    /// The resident V page plane — and the gathered scratch's byte-for-byte copy of it.
+    Page,
+    /// The new-token block's unrestickified wide stream, its per-head slice declared `hd` rows.
+    NewBlockStream(u32),
+    /// The new-token block's CHUNK form — `new_v`'s kv-head block `[mq_pad, hd]`, contracted whole.
+    NewBlockChunk(u32),
+    /// A chunk part's V region in the chunk's gathered V scratch — the part's own slots.
+    ChunkPart(u32),
+}
+
+impl VKernelRows {
+    /// The NEW block's door: its V operand keeps the wide `[*, nkvh·hd]` stream (never
+    /// restickified — unlike its Kᵗ twin, which compacts into `[nkvh, hd, mq_pad]`), and the
+    /// sub-block value leg declares the per-head slice's rows as the head dim.
+    pub const fn of_new_block_stream(hd: u32) -> VKernelRows {
+        VKernelRows::NewBlockStream(hd)
+    }
+
+    /// The NEW block's CHUNK-form door: `new_v`'s kv-head block is `[mq_pad, hd]` (RoPE packs it
+    /// `[nkvh][mq][hd]`, and the block's rows ARE its slots — the [`MqPad`] identity), so the
+    /// value leg contracts the whole block. Demands the block's own [`SlotExtent`], minted only
+    /// by [`MqPad::slots`], so no other plane's number can fill the slot.
+    pub const fn of_new_block_chunk(ext: SlotExtent) -> VKernelRows {
+        VKernelRows::NewBlockChunk(ext.slot_axis_extent())
+    }
+
+    /// A chunk part's V region — the part's own slots, demanded by the part itself
+    /// ([`ChunkPart`]): the chunk's gathered V scratch is read at a part's rows, so the
+    /// kernel's rows are the part's extent — never the chunk's and never a page's.
+    pub const fn of_chunk_part(part: ChunkPart) -> VKernelRows {
+        VKernelRows::ChunkPart(part.slots())
+    }
+
+    /// The plane's own row extent — `Stk::kernel`'s `k_in` slot.
+    pub const fn rows(self) -> u32 {
+        match self {
+            VKernelRows::Page => PagedKvPool::PAGE_SLOTS as u32,
+            VKernelRows::NewBlockStream(n)
+            | VKernelRows::NewBlockChunk(n)
+            | VKernelRows::ChunkPart(n) => n,
+        }
+    }
+}
+
+/// THE V VALUE KERNEL'S DECLARED PHYSICAL COLUMN COUNT (`Stk::kernel`'s `n_out`) — the feature
+/// width of the V plane the value leg contracts, the twin of [`KtKernelPitch`] on the value side.
+///
+/// Two widths ever fill this slot, and each is a door: the WHOLE head dim (the one-slab form's
+/// single op, `out = hd`) and ONE STICK of features (the per-slab form above one slab, one stick
+/// of `out` each — the fold's card-proven hd=128 width). Every answer is a FEATURE quantity; a
+/// slot count (a page's, a chunk's, a window's 64) has no door, so it cannot fill the value
+/// kernel's column slot even where the values coincide — the pairing that was invisible when
+/// `v_cols` traveled as a bare `u32` beside `n`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct VKernelPitch(u32);
+
+impl VKernelPitch {
+    /// The whole-head door — the one-slab value leg's single op contracts the whole head dim.
+    pub const fn of_head_dim(hd: u32) -> VKernelPitch {
+        VKernelPitch(hd)
+    }
+
+    /// The one-stick door — above one slab each op is one stick of `out`, one stick of V above
+    /// it. Demands the lane-count witness ([`Lanes`]), so a row count — or any of the other
+    /// three 64s — cannot stand in for it.
+    pub const fn of_one_stick(lanes: Lanes) -> VKernelPitch {
+        VKernelPitch(lanes.n())
     }
 
     /// `Stk::kernel`'s `n_out` slot — the kernel's declared physical column extent.
@@ -637,6 +763,17 @@ impl<const NQH: u32, const NKVH: u32, const HD: u32> AttnGeometry<NQH, NKVH, HD>
     /// [`NQH_NZ`](Self::NQH_NZ) as a method, for call sites holding the value.
     pub const fn nqh_nz(self) -> NonZeroU32 {
         Self::NQH_NZ
+    }
+
+    /// The kv-head count as the `NonZeroU32` the head iterators take — nonzero by
+    /// [`GQA`](Self::GQA)'s evaluation, so the `panic!` arm is a compile-time impossibility, not a
+    /// runtime assertion. The mirror of [`nqh_nz`](Self::nqh_nz): a call site iterating kv heads
+    /// holds the geometry, so it has no `NonZeroU32::new(..)` refusal to write.
+    pub const fn nkvh_nz(self) -> NonZeroU32 {
+        match NonZeroU32::new(NKVH) {
+            Some(n) => n,
+            None => panic!("AttnGeometry: NKVH == 0 is already refused by GQA's evaluation"),
+        }
     }
 
     /// ONE REQUEST'S ROW EXTENT of a per-request attention pass — its `nqh` head rows. The law's
@@ -2949,6 +3086,35 @@ impl Stk<KernelTag> {
             _p: std::marker::PhantomData,
         }
     }
+
+    /// ⭐ THE SQUARE PER-HEAD KERNEL — the RoPE rotation `P` and the replication identities,
+    /// `[hd, hd]`, minted from ONE argument: the two bare `usize` slots this replaces were
+    /// independent casts, so either could hold any of the coincident 64s (the head dim, one
+    /// fp16 stick, the block's padded rows — [`MqPad`]'s own law) without saying which, and a
+    /// drift between them compiled clean. Where `hd` is one stick this square and
+    /// [`Self::one_stick_identity`] agree; above it they do not, and the mint could not say
+    /// which of the two facts it stated.
+    pub fn head_dim_square(hd: u32, name: impl Into<String>) -> Self {
+        Self::kernel(hd as usize, hd as usize, name)
+    }
+
+    /// ⭐ THE SHARED 2-D KERNEL AN IDENTITY COPY DEMANDS — one fp16 stick in both slots
+    /// (`I[64,64]`), whatever the head dim: a `y`-batched copy shares one kernel across slabs,
+    /// and one slab of an identity is its diagonal stick block. NOT [`Self::head_dim_square`]:
+    /// the two agree exactly while `hd` is one stick and drift apart above it, where this stays
+    /// the stick and that follows the head dim.
+    pub fn one_stick_identity(name: impl Into<String>) -> Self {
+        Self::kernel(POOL_STICK as usize, POOL_STICK as usize, name)
+    }
+
+    /// ⭐ THE RESIDENT PLANE A CACHE WRITE LANDS IN — `[PLANE_SLOTS, hd]`: the PHYSICAL slot
+    /// extent that separates one kv head's block from the next, at the head dim's features. The
+    /// `k_in` slot spends the pool's own [`PagedKvPool::PLANE_SLOTS`] so the page's
+    /// addressable slots — the same number today, a proven head-dim-128 breaker when
+    /// they differed — cannot stand in (see [`PlaneExtent`]).
+    pub fn resident_kv_plane(hd: u32, name: impl Into<String>) -> Self {
+        Self::kernel(PagedKvPool::PLANE_SLOTS, hd as usize, name)
+    }
 }
 
 /// THE K-CACHE PRODUCER OFFSET — the device element offset (WITHIN one head) at which the
@@ -3266,8 +3432,9 @@ impl KvSlot {
     }
 }
 
-/// A NUMBER OF SLOTS — a prefill chunk's width, or 1 for a decode token. Distinct from [`KvSlot`]
-/// because a count added to a count is a count while a slot added to a slot is nothing at all.
+/// A NUMBER OF SLOTS — a prefill chunk's width, 1 for a decode token, or the resident cache's
+/// capacity. Distinct from [`KvSlot`] because a count added to a count is a count while a slot
+/// added to a slot is nothing at all.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub struct SlotCount(u32);
 
@@ -3284,6 +3451,47 @@ impl SlotCount {
 
     pub const fn is_zero(self) -> bool {
         self.0 == 0
+    }
+}
+
+/// ⭐ THE KV EXTENT PAIR — the resident cache's STORAGE extent and the sweep this bundle takes of
+/// it, minted together because the two are one fact at the boundary: the cache's own view states
+/// the storage and the program's own access tile states the sweep, and the caller that reads both
+/// is the one place the agreement is checked (a sweep past the storage addresses bytes nothing
+/// wrote — refused there, where the node ids are, not here).
+///
+/// ⛔ THIS EXISTS BECAUSE THE PAIR TRAVELED AS TWO ADJACENT BARE `u32`s (`cap`, `active_cap`) —
+/// a call site could hand the storage extent in the sweep slot or the reverse, which is exactly
+/// the confusion [`crate::ktir_node::ActiveCap`]'s own doc says that type exists to prevent,
+/// undone at the emitter's boundary where the rung has already resolved to a concrete extent and
+/// the rung type no longer protects it. As one carrier the order is fixed at ONE mint; as two
+/// same-typed parameters it would still be swappable, which is why the fields do not travel as
+/// parameters at all.
+///
+/// Both extents are RESOLVED (the rung's `ActiveCap::resolve` has run) and slot-counted: the
+/// sweep feeds `SlotWindow::sweep`/`count_in` and the mask's `sweep_fits` directly, with no
+/// `SlotCount::new` re-mint between the carrier and its consumers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct KvExtent {
+    cap: SlotCount,
+    active: SlotCount,
+}
+
+impl KvExtent {
+    /// The one mint: storage and sweep, in that order. The caller owns the agreement
+    /// (`active ≤ cap`) — it is the party that can name the node and the buffer in the refusal.
+    pub const fn new(cap: SlotCount, active: SlotCount) -> KvExtent {
+        KvExtent { cap, active }
+    }
+
+    /// The resident cache's storage extent.
+    pub const fn cap(self) -> SlotCount {
+        self.cap
+    }
+
+    /// The swept extent — O(active) attention over the same resident cache.
+    pub const fn active(self) -> SlotCount {
+        self.active
     }
 }
 
@@ -4454,6 +4662,103 @@ impl FoldRowRegime {
     }
 }
 
+/// ⭐⭐⭐⭐⭐ THE PAGED FOLD A SPLICED PROGRAM STATES — the attribute the fold's whole chain of
+/// custody runs on.
+///
+/// A chunked decode ladder's `(FULL, no-chunk)` rung lowers its attention as the THREE-PROGRAM
+/// fold family (`kernels/paged_fold.py`: seed, one-page body, finalize), and the family's BODY
+/// is a fold: the runtime re-launches it once per resident page, shifting the activation
+/// segment's base one page's worth of bytes per pass. That fact — and the four launch-ABI
+/// facts `fold_plan` derives the pass count and the shifts from — cannot be read off a KTIR
+/// program (what a kernel steps over is not visible from a session), so the splice STATES them
+/// here, the carrier [`EmittedOp`](crate::emit::EmittedOp) CARRIES them through its ONE
+/// constructor, the walk (`ktir_groups_via_superdsc`) STAMPS them onto every op it lowers from
+/// that carrier's program, and the bake's fallback proof CHECKS the stamped groups
+/// (`emitted_bundle_folds`). One constructor, one attribute, one reader per stage — a stage
+/// deriving any of these facts from anything but the attribute is the desync this type exists
+/// to make impossible.
+///
+/// Every member is a LAW OF THE FAMILY the splice minted, not a per-model fact: the spliced
+/// fold gathers its pages through the host-staged index tables (global stick-block entries,
+/// so a pass takes NO KV-segment shift), its batch axis walks KV heads × GQA groups rather
+/// than requests, and its carry holds every row of the one request it serves.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PagedFold {
+    /// The fold gathers its pages through the host-staged block-entry tables — the entries are
+    /// GLOBAL stick-block numbers (`addr = idx * skip_addr + base`), so the pool's segment base
+    /// never moves per pass. This is `kv_gathered`.
+    pub gathered: bool,
+    /// The fold's batch axis walks KV heads × GQA groups, NOT requests: one request is served
+    /// by the whole pass sequence, so the pass count carries no `× requests` term. This is
+    /// `kv_batched_requests`.
+    pub batched_requests: bool,
+    /// The carry's row regime — whole-batch: the carry holds every `nqh*mq` row of the one
+    /// request, unshifted per pass. This is `kv_fold_rows`.
+    pub fold_rows: FoldRowRegime,
+    /// The pool's page width, for `kv_page_slots`. This is the shared device law
+    /// ([`PagedKvPool::PAGE_SLOTS`]), restated so the stamp never re-derives it.
+    pub page_slots: u32,
+}
+
+/// ⭐⭐⭐⭐⭐ THE FILL-STAGED REGION A ONE-SHOT ATTENTION CARRIER GATHERS — the attribute the
+/// one-shot chain of custody runs on, the same shape as [`PagedFold`]'s.
+///
+/// Every one-shot attention program (the batched paged kernels the splice mints) gathers the
+/// paged pool through the absolute-entry tables the host fill stages, whether or not its ladder
+/// stated a fold region — a PREFIX-FREE rung states none (its bake is `ActiveCap::NONE`: a
+/// start==0 chunk has nothing resident to attend) yet its kernel gathers the same way. The
+/// splice therefore states the region UNCONDITIONALLY at the mint, and the walk
+/// (`ktir_groups_via_superdsc`) stamps the addressing fact (`kv_gathered` — the entries are
+/// ABSOLUTE stick-blocks, the op takes the ZERO KV shift) onto every op it lowers from that
+/// carrier's program.
+///
+/// ⛔ THE POOL TIDS RIDE WITH THE REGION so the stamp can CHECK its own premise instead of
+/// assuming it: "the entries are absolute" is a fact of a POOL the layout placed a
+/// [`GatherReach`] for, not of the carrier, so the stamp site refuses the build when the
+/// layout carries no reach for [`Self::reach_tids`] — a future non-paged attention form that
+/// reaches the one-shot arm fails the bake rather than silently zeroing the KV shift over an
+/// unpaged read. [`pool_reach_tids`] is the ONE spelling of that tid set: the placement pass's
+/// reach insertion and the stamp site's guard both derive through it, so the set the stamp
+/// checks and the set the placement covers cannot disagree.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PagedRegion {
+    /// The region's page count — the table region the host fill stages. The prefill arm's value
+    /// is its spec's own default (`region_pages.unwrap_or(pages)`, the walk's own extent); the
+    /// decode arm's is the pool capacity its spec received as `pages`.
+    ///
+    /// READER STATEMENT: this field is the minted derivation record, not a behavior gate. The
+    /// arm's spec consumed it pre-lowering (through the id-table extents' region law); post-mint
+    /// nothing at bake or runtime reads it — the walk's stamp consumes only [`Self::reach_tids`],
+    /// the emit side only constructs and copies, and the only field readers are the two pins
+    /// (`triton_splice_golden`'s carrier half and the walk-stamp half) — so a later reader does
+    /// not mistake it for a value the card path branches on.
+    pub region_pages: u32,
+    /// The pool's K cache tensor — the AttnDecode's own `layout.cache_tensor()`.
+    pub k_tid: u32,
+    /// The pool's V cache tensor — `layout.v_cache_tensor()`.
+    pub v_tid: u32,
+}
+
+impl PagedRegion {
+    /// The tids a gathered read of this pool addresses — derived through [`pool_reach_tids`],
+    /// the one spelling shared with the placement's reach insertion.
+    pub fn reach_tids(&self) -> [u32; 3] {
+        pool_reach_tids(self.k_tid, self.v_tid)
+    }
+}
+
+/// The pool tids a gathered read of a paged KV pool addresses: the two cache tensors plus the
+/// Kᵀ-resident wire tid derived from the K one. ONE derivation, shared by the placement pass's
+/// `gather_reach` insertion and the region stamp's premise guard, so the two can never cover
+/// different pools.
+pub fn pool_reach_tids(k_tid: u32, v_tid: u32) -> [u32; 3] {
+    [
+        k_tid,
+        v_tid,
+        crate::reserved_tids::KctResident::of(k_tid).wire_tid(),
+    ]
+}
+
 /// THE COUNT OF REAL QUERY ROWS — `mq`: the decode batch size, or a prefill chunk's token rows.
 /// Kind-erased (see [`QueryRows`] for the chunk-vs-batch KIND); this is the pure COUNT, typed so it
 /// cannot stand in for the stick-padded row count ([`MqPad`]), the shared-buffer row extent
@@ -4518,7 +4823,9 @@ impl ElemCount {
     }
 }
 
-/// THE COLUMN EXTENT ONE REDUCE/POINTWISE OP SWEEPS — a score-block width. Constructed only through
+/// THE COLUMN EXTENT AN OP SWEEPS OR AN OPERAND DECLARES — the reduce/pointwise mints and the
+/// RowBlocked matmul-operand mint (`rb`/`rb_df`) both take this type — a score-block width or a
+/// feature extent. Constructed only through
 /// doors that NAME which width it is: one stick ([`Self::of_one_stick`]), one slot window
 /// ([`Self::of_slot_window`]), one row window ([`Self::of_row_window`]), the head dim
 /// ([`Self::of_head_dim`]) / one head slab ([`Self::of_head_slab`]), or a residual feature extent
@@ -4582,8 +4889,10 @@ impl BlockCols {
     }
 }
 
-/// THE ROW EXTENT ONE REDUCE/POINTWISE OP SWEEPS. Constructed only through doors that NAME which
-/// row quantity fills the slot — the batched shared-buffer extent (`nqh*mq`, [`Self::of_mask_rows`]),
+/// THE ROW EXTENT AN OP SWEEPS OR AN OPERAND DECLARES — the reduce/pointwise mints and the
+/// RowBlocked matmul-operand mint (`rb`/`rb_df`) both take this type, so a row count crosses every
+/// emit boundary as the quantity it is. Constructed only through doors that NAME which row
+/// quantity fills the slot — the batched shared-buffer extent (`nqh*mq`, [`Self::of_mask_rows`]),
 /// the real query rows ([`Self::of_query_rows`]), the stick-padded rows ([`Self::of_padded_chunk_rows`]),
 /// the zero-fill remainder ([`Self::of_zero_pad_rows`]) or residual token rows ([`Self::of_token_rows`]).
 /// At nqh=32 the first equals `mq_pad` exactly up to mq=2 and separates at mq=4 — the first broken width.
@@ -4622,6 +4931,13 @@ impl RowCount {
     /// collapse's sweep.
     pub const fn of_head_major_rows(rows: u32) -> RowCount {
         RowCount(rows)
+    }
+    /// The one-row stub a broadcast operand's handle declares — the row axis carries nothing. A
+    /// gamma/eps/cap row vector, a weight-scale row, or a buffer declared flat as one row (the Kᵗ
+    /// scratch's whole extent): the `1` is structural, not a count of anything, which is why this
+    /// is a door of its own rather than [`Self::of_token_rows`]`(1)` misnaming a weight as a token.
+    pub const fn of_broadcast_row() -> RowCount {
+        RowCount(1)
     }
     pub const fn get(self) -> u32 {
         self.0
@@ -5162,7 +5478,8 @@ impl SeqPos {
 ///
 /// Lives here, beside [`decode_prefix_col_valid`], because it is a LAYOUT LAW the emitter and the
 /// worker must agree on, not worker bookkeeping — and because the worker crate has no test target to
-/// pin it from.
+/// pin it from. Returns a [`ValidityMask`]: the bytes TOGETHER with one [`ValidKeys`] tally per
+/// (block, row, 64-lane slab), minted by the same loop, at the slab pitch the fold's `l` sums over.
 pub fn decode_batch_prefix_mask_f16<const COLS: u32>(
     // THE SHAPE THE EMITTER WILL READ, not a set of loose extents to re-derive. This is the whole
     // point of `PrefixMaskShape`: the buffer's size, its block stride and its element law all come
@@ -5179,7 +5496,7 @@ pub fn decode_batch_prefix_mask_f16<const COLS: u32>(
     // said. `len()` is the batch's row count `mq`.
     hists: &[KvHistory],
     mask_neg: f32,
-) -> Vec<u8> {
+) -> ValidityMask {
     // FROM THE SHAPE, not re-derived: `rows / hists.len()` was a third derivation of `nqh`, and it is
     // silently wrong whenever the histories and the shape were built with different `mq`.
     let grid = fold.grid();
@@ -5188,7 +5505,19 @@ pub fn decode_batch_prefix_mask_f16<const COLS: u32>(
     let per_page = shape.cols().get();
     let neg = half::f16::from_f32(mask_neg).to_le_bytes();
     let zero = half::f16::from_f32(0.0).to_le_bytes();
-    let mut m: Vec<u8> = neg.repeat(shape.elems(MaskBlocks::of(grid)));
+    let blocks = MaskBlocks::of(grid);
+    let mut m: Vec<u8> = neg.repeat(shape.elems(blocks));
+    // ⭐ THE COUNTS, AT THE SLAB PITCH THE FOLD READS — one lane tally per (block, row, 64-lane
+    // slab) of the buffer, minted by the same loop and the same `contains` test that write the
+    // bytes below: a tally a second derivation produced could disagree with the bytes it claims
+    // to count, which is the one-fact law [`ValidityMask`] exists to state. The tallies' index
+    // law is their OWN — `(block·rows + row)·slabs + col/STICK`, block-major, then row, then the
+    // slab the column reads in — deliberately NOT the bytes' stick-blocked [`PrefixMaskShape::elem`]
+    // flat order (whose `/STICK` projection counts slabs outermost); the counts' order is the one
+    // [`ValidityMask::window_valid`] states.
+    let rows = shape.rows().get() as usize;
+    let slabs = shape.slabs_per_block() as usize;
+    let mut lanes = vec![0u32; blocks.get() as usize * rows * slabs];
     // ⭐ ONE BLOCK PER FOLD PASS, IN THE PASS'S OWN ORDER — and that order is ROW-MAJOR.
     //
     // `fold_plan::fold_pass` maps pass `rep` to `(row, page)` as `rep = r * pages + p`, and
@@ -5221,12 +5550,67 @@ pub fn decode_batch_prefix_mask_f16<const COLS: u32>(
                     if h_r.contains((p * per_page + col) as usize) {
                         let e = shape.elem(block, row, col);
                         m[e * 2..e * 2 + 2].copy_from_slice(&zero);
+                        lanes[(block as usize * rows + row as usize) * slabs
+                            + (col as usize / POOL_STICK as usize)] += 1;
                     }
                 }
             }
         }
     }
-    m
+    let valid = lanes
+        .into_iter()
+        .map(ValidKeys::of)
+        .collect::<Option<Vec<_>>>()
+        .expect("a slab is 64 lanes, so a tally cannot exceed 64");
+    ValidityMask {
+        bytes: m,
+        valid,
+        windows_per_row: NonZeroU32::new(slabs as u32)
+            .expect("COLS is a whole number of sticks, so a row spans at least one slab"),
+    }
+}
+
+/// ⭐⭐⭐ THE FOLD FAMILY'S SWEEP READING, OFF THE MINTED COUNTS — the first row whose WHOLE
+/// sweep (that row's tallies in EVERY block, both grid forms) holds no valid lane, or `None`
+/// when every row sweeps one.
+///
+/// THE INVARIANT IS PER ROW-SWEEP, NOT PER WINDOW, because the carry's rescale is what makes an
+/// all-masked window harmless: a window read while `m` still sits at the −65504 seed gives
+/// `p = e^0 = 1` per lane, and only a LATER max-rise expunges it — the fold scales `l` and `acc`
+/// by `e^(m_old − m_new)`, which underflows to zero once a valid lane raises `m` past the
+/// sentinel. (The base is e — the device's one exponential, `ExpBase::E`; the emitted recurrence
+/// is `expb = exp(sc − run_m)` and `corr = exp(run_m − newm)`, never an exp2.) A row whose
+/// whole sweep is empty never raises `m`, so the phantom `l` survives
+/// into the finalize's division: that row is a request that never prefilled (or histories
+/// staged against another shape), and this reading names it instead of letting the fold
+/// normalize lanes the mask meant to silence.
+///
+/// Row `row` here is [`PrefixMaskShape::row_of`]'s — `head·mq + request` — so the offending
+/// request is `row % mq`. The block grouping is the counts' own mint law
+/// (`(block·rows + row)·slabs`, [`ValidityMask::window_valid`]): summing a row's tallies over
+/// EVERY block is correct under both grid forms, because a block holds another row's lanes only
+/// where that row's own blocks hold them. The mask and the shape are the mint's own pair — the
+/// block count is their quotient, a theorem of "this mask was minted by this shape", not a
+/// check a caller can fail.
+pub fn decode_batch_empty_sweep_row<const COLS: u32>(
+    mask: &ValidityMask,
+    shape: PrefixMaskShape<POOL_STICK, COLS>,
+) -> Option<u32> {
+    let rows = shape.rows().get() as usize;
+    let wpr = mask.windows_per_row().get() as usize;
+    let blocks = mask.rows() / rows;
+    for row in 0..rows {
+        let mut swept = 0u32;
+        for block in 0..blocks {
+            for window in 0..wpr {
+                swept += mask.window_valid(block * rows + row, window).get();
+            }
+        }
+        if swept == 0 {
+            return Some(row as u32);
+        }
+    }
+    None
 }
 
 /// THE PREFILL CAUSAL-MASK EXTENT (mq>1 new-token self-attention block): in a batched prefill of `mq`
@@ -5266,6 +5650,36 @@ pub fn decode_batch_causal_col_valid(col: usize, row: usize) -> bool {
 /// constant because [`CausalKey::mask`] has no other input: the value the mask carries can no more
 /// come from a caller than its rows can.
 pub const ATTN_MASK_NEG: f32 = -(half::f16::MAX.to_f32_const() / 2.0);
+
+/// ⭐⭐⭐⭐⭐ THE F16 FLOOR THE CARRY SEEDS AT AND THE VALIDITY LANES CARRY — ONE value in two
+/// roles, spelled by TWO independent producers, which is why it is a const and why the walk
+/// cross-checks the pair.
+///
+/// Role one — THE SEED. The paged fold's seed program (`paged_fold.py`'s `paged_fold_seed_hm`)
+/// writes the online-softmax carry's initial max as `tl.full([BATCH * MQ, 1], -65504.0,
+/// tl.float16)`: the FINITE f16 limit, never `-inf` — `float("-inf")` mis-encodes through
+/// `FloatToFp16Bin` as a NaN bit pattern and `max(x, NaN) == NaN` poisons the reduction (the
+/// torch-spyre root-cause this crate's reduce identity shares, `superdsc_opspec`'s SAMV note).
+/// f16-exact — the format's own max — so the narrowing stores it exactly.
+///
+/// Role two — THE LANES. The validity-mask builders' masked-lane bytes ([`spliced_attn_mask_f16`],
+/// [`spliced_decode_mask_f16`]). A masked lane's score is `qk + floor`, which SATURATES at the
+/// floor in f16 (never `-inf`), so a masked lane's `p` is exactly `e^0 = 1` while `m` sits at the
+/// seed and exactly `0` once any valid lane raises `m` past it — the expunge the `l`-invariant
+/// states, whose edge (a row whose whole sweep is empty never raises `m`) is the row-sweep
+/// readings' refusal law.
+///
+/// ⛔ THE PAIR IS LOAD-BEARING. The seed and the lanes are stated by different producers — the
+/// kernel's `tl.full` and these builders — and a value that drifted on one side only would change
+/// the expunge margins in the dangerous direction: fluent output, never a fault. The
+/// whole-function walk therefore cross-checks the program's stated fill of the max carry
+/// ([`crate::reserved_tids::PagedFoldCarry::Max`]) against this const and refuses the desync,
+/// naming both values.
+///
+/// NOT [`ATTN_MASK_NEG`] — that is the OTHER sentinel: the ADDITIVE mask value for masks whose
+/// `score + mask` sum must stay finite (the causal block and the broadcast prefix row). This one
+/// is the floor itself. A mask family carries one of the two, never a caller-stated third value.
+pub const ATTN_SEED_FLOOR: half::f16 = half::f16::MIN;
 
 /// ⭐⭐⭐ EVERY FACT A LAUNCH'S NEW-BLOCK CAUSAL MASK IS A FUNCTION OF, AS ONE VALUE — and
 /// [`Self::mask`] takes nothing else, so the mask cannot depend on a fact this key leaves out.
@@ -5601,10 +6015,10 @@ pub struct PhysPage(pub u32);
 /// memory rather than a constant.
 ///
 /// ```text
-///   pool : [page][layer][Kᵀ | V | Knat][kvh][request][ ... ]
-///            Kᵀ   : [kvh][hd][PAGE_SLOTS]         stick-major on slots — the score kernel
-///            V    : [kvh][PAGE_SLOTS][hd]         sticked on hd       — the value kernel
+///   pool : [page][layer][Knat | V | Kᵀ][kvh][ ... ]
 ///            Knat : [kvh][PAGE_SLOTS][hd]         natural K           — the Kᵀ re-transpose source
+///            V    : [kvh][PAGE_SLOTS][hd]         sticked on hd       — the value kernel
+///            Kᵀ   : [kvh][hd][PAGE_SLOTS]         stick-major on slots — the score kernel
 /// ```
 ///
 /// ⛔ **THE REQUEST IS NOT A DIMENSION HERE AT ALL — IT IS A CHOICE OF PAGES.**
@@ -5641,8 +6055,15 @@ pub struct PhysPage(pub u32);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PagedKvPool {
     /// DISTINCT kv heads — a query head reads its group's plane via [`gqa_kv_head`].
-    pub nkvh: usize,
-    pub hd: usize,
+    // ⛔ PRIVATE, AND NOT `usize` ANY MORE. The pair was two pub `usize` fields minted through
+    // `new(nkvh: usize, hd: usize)`, so every caller re-widened its `u32`s (or its literals) into
+    // the storage width at the call — seven production spellings of `nkvh as usize, hd as usize`,
+    // each a place a wrong pair could enter unnoticed. The doors are `new` (the seam, `u32` — the
+    // width every geometry's spend doors speak) and `of_geometry` (the class the bundle was
+    // instantiated at, provably); the placement arithmetic below spends the fields as `usize` at
+    // its own unit, explicitly.
+    nkvh: u32,
+    hd: u32,
 }
 
 // ⛔⛔⛔ THE LADDER MUST SERVE EVERY BATCH THE POOL WILL ADMIT — OR THE HOST SILENTLY DECODES GARBAGE.
@@ -5757,7 +6178,7 @@ const _: () = {
 // here. This one is not generic, so it belongs at module level where the forcing cannot be forgotten.
 //
 // ⭐ A WINDOW WIDER THAN A PAGE IS A WHOLE NUMBER OF PAGES. Its cache write is cut into page parts, each
-// resolving its OWN page through the request's block table (`EmittedOp::kv_slot_offset`), so a window of
+// resolving its OWN page through the request's block table (`EmittedOp::kv_part`), so a window of
 // `PREFILL_WINDOW_PAGES` pages starting at a page boundary is as safe as one page was. A window that is not
 // a whole number of pages would leave a part straddling a page, which no part can address.
 const _: () = assert!(
@@ -5822,6 +6243,153 @@ impl DxGroupCeiling {
     /// numerics one: the 12b's greedy output must be identical across the move (same garbage in,
     /// same garbage out — the numerics are untouched), verified on the rebuild that lands with it.
     pub const SPLIT_TARGET: usize = 512;
+}
+
+/// ⭐ THE CACHE WRITE'S WINDOW-FIRST-ROW, cursor-relative — which row of the window-own tensor
+/// the write starts at, carried as the type. Two mints, and each is a door: the WHOLE-PLANE
+/// call ([`Self::at_cursor`] — main's `attn_at` arm always wrote the window starting at the
+/// cursor's row 0) and a PER-ROW NODE's own window ([`Self::of_node_window`] — the rope
+/// append arm, whose rows share one output tensor and whose request is the row itself).
+///
+/// A slot offset ([`KvSlot`]), a page number, or a placed tensor's identity has no door, so
+/// none of them can fill this slot even where the values coincide — the adjacency that made
+/// the field's bare `u32` hazardous: it sat beside a tensor identity ([`PlaceId`]), where a
+/// cursor and a name were interchangeable numbers.
+///
+/// [`PlaceId`]: crate::place::PlaceId
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteRowStart(u32);
+
+impl WriteRowStart {
+    /// The whole-plane call — the window starts at the cursor's row 0, so the write covers the
+    /// activation plane from its first row.
+    pub const fn at_cursor() -> WriteRowStart {
+        WriteRowStart(0)
+    }
+
+    /// A per-row node's own window — the node's `[start, end)` row cover of the tensor its rows
+    /// share, so the write starts at the node's first row past the cursor.
+    pub const fn of_node_window(cover: (u32, u32)) -> WriteRowStart {
+        WriteRowStart(cover.0)
+    }
+
+    /// Whether the window starts past the cursor — a per-row node's window does, the
+    /// whole-plane call does not. The request-tag question the recipe asks of this value.
+    pub const fn starts_past_cursor(self) -> bool {
+        self.0 > 0
+    }
+
+    /// The row itself — the cutting law's own binding ([`PagedKvPool::write_parts`] spends
+    /// it at its door, inside the module).
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// ⭐ ONE PART OF A KV WRITE WINDOW — the shape every cache-write lowering cuts a window into, so a
+/// part NEVER crosses a page boundary.
+///
+/// The consumer is the recipe ([`crate::emit::kv_cache_write`], re-homed from main's
+/// `attn_at` arm to the rope's own door arm): the walk's `Program::RopeAppend` arm cuts the
+/// node's window through [`PagedKvPool::write_parts`] and emits one copy family per part,
+/// each part self-stamping its request and its first row past the write cursor — the
+/// (b1) discipline's facts, stated by the ONE implementation of the cutting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvWritePart {
+    /// The part's first row — the WINDOW-OWN TENSOR's row index (a prefill window's
+    /// position, a request-major window's batch row).
+    pub row0: u32,
+    /// Rows this part covers (`>= 1`; `row0 + rows` stays inside one page).
+    pub rows: u32,
+    /// The request this part's KV belongs to — the `kv_request` stamp (`0` unless the
+    /// window's rows are requests).
+    pub request: u32,
+    /// ⭐ THE PART'S OWN [`PagePart`](crate::page_part::PagePart) — which page of the window this
+    /// part addresses, minted HERE by the same cut that computed its rows. The consumers
+    /// ([`crate::emit::kv_cache_write`]'s op stamps, and through them the fusion walk and the
+    /// launch's shift) copy this value; none re-derives it. Before it existed each stamp
+    /// respelled `if rows_are_requests { 0 } else { part.row0 }`, and the offset a group's
+    /// ops carried was a second derivation the launch index had to `assert!` agreement with.
+    pub page: crate::page_part::PagePart,
+}
+
+/// ⭐⭐⭐⭐⭐ ONE POOL PLANE, AS A TYPE — which plane of a page+layer an address names, stated by
+/// the pool that owns the layout and derivable from nothing else.
+///
+/// ⛔⛔⛔ THE DEFECT THIS TYPE EXISTS TO MAKE UNWRITABLE: a reserved plane's NAME
+/// ([`crate::reserved_tids::KctResident`]) and its SOURCE TENSOR were both bare `u32`s, so a
+/// consumer needing "the Kᵀ plane" could resolve the name through the K cache source's own
+/// placement and bake a score gather over the NATURAL-K plane — same size, wrong plane,
+/// invisible to every extent law, because both planes are `plane_stride` per kv head. The
+/// handles below are the only derivation of a plane's base, and a `KctResident` binding
+/// resolves to [`KtPlane`] and to nothing else.
+pub struct PoolPlane<'p, P: PlaneKind> {
+    pool: &'p PagedKvPool,
+    _kind: std::marker::PhantomData<P>,
+}
+
+/// Which plane of a page+layer a [`PoolPlane`] names — the pool's own taxonomy, one type per
+/// resident plane, each carrying its OWN base derivation so no consumer can spell a sibling
+/// arithmetic. Sealed through the file's ONE seal module (the `Stk<K>` kind tags'): only
+/// crate-level constructors mint plane kinds, so the variant set is the pool's, not a caller's.
+pub trait PlaneKind: sealed::Sealed {
+    /// This plane's element offset within a page+layer — the ONE base derivation.
+    fn base_elems(pool: &PagedKvPool) -> usize;
+}
+
+/// The natural-K plane — FIRST in a page+layer, where the pre-paged `kc` was. The cache write
+/// fills it; the re-transpose reads it.
+pub struct KnatPlane;
+/// The V plane — SECOND, where `vc` was.
+pub struct VPlane;
+/// The transposed-K plane — LAST, where `kct` was. The re-transpose writes it; the score
+/// gather reads it, and ONLY through [`crate::reserved_tids::KctResident`].
+pub struct KtPlane;
+
+impl sealed::Sealed for KnatPlane {}
+impl sealed::Sealed for VPlane {}
+impl sealed::Sealed for KtPlane {}
+
+impl PlaneKind for KnatPlane {
+    fn base_elems(_pool: &PagedKvPool) -> usize {
+        0
+    }
+}
+impl PlaneKind for VPlane {
+    fn base_elems(pool: &PagedKvPool) -> usize {
+        pool.plane_stride()
+    }
+}
+impl PlaneKind for KtPlane {
+    fn base_elems(pool: &PagedKvPool) -> usize {
+        2 * pool.plane_stride()
+    }
+}
+
+impl PagedKvPool {
+    /// ⭐ THE ONE DOOR to a plane — typed by the plane it names, so every base that comes back is
+    /// the pool's own law and never a tensor's placement.
+    pub const fn plane<P: PlaneKind>(&self) -> PoolPlane<'_, P> {
+        PoolPlane {
+            pool: self,
+            _kind: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<P: PlaneKind> PoolPlane<'_, P> {
+    /// This plane's element offset within a page+layer — [`PlaneKind::base_elems`], read back.
+    pub fn base_elems(&self) -> usize {
+        P::base_elems(self.pool)
+    }
+
+    /// This plane's byte offset within a page+layer — the placement's own unit, derived so the
+    /// element fact and the byte fact cannot disagree.
+    pub fn base_bytes(&self) -> u64 {
+        self.base_elems() as u64
+            * <crate::superdsc_opspec::Fp16 as crate::superdsc_opspec::DataFormat>::WORD_LENGTH
+                as u64
+    }
 }
 
 impl PagedKvPool {
@@ -6169,8 +6737,27 @@ impl PagedKvPool {
     // a host allocation question and not a baked one — and the depth a row may reach is the
     // artifact-derived pmask ceiling, enforced per launch.
 
-    pub fn new(nkvh: usize, hd: usize) -> PagedKvPool {
+    /// ⭐ THE INTAKE SEAM — `u32`, the width every geometry's spend doors speak, so no caller
+    /// widens into the storage width at its own call site. The pair a pool carries is the model's
+    /// KV geometry as a RUNTIME value: the KTIR side reads it off the program's shapes, the host
+    /// off the baked artifact, so it cannot be a const — but it can refuse to be spelled in two
+    /// widths. The class-provable mint is [`of_geometry`](Self::of_geometry).
+    pub fn new(nkvh: u32, hd: u32) -> PagedKvPool {
         PagedKvPool { nkvh, hd }
+    }
+
+    /// ⭐ THE EMITTER'S DOOR — the pool FOR the class the bundle was instantiated at, the same
+    /// carrier `assemble_attn` and the seed/fold blocks take. A pool minted here cannot disagree
+    /// with the bundle's head counts: the pair comes from the geometry's own consts, spent as
+    /// values — so a scratch, a gather or a chunk minted from THIS pool carries the class's
+    /// `nkvh` by construction, and the emitter's cross-checks against it are provably dead.
+    pub fn of_geometry<const NQH: u32, const NKVH: u32, const HD: u32>(
+        geom: AttnGeometry<NQH, NKVH, HD>,
+    ) -> PagedKvPool {
+        PagedKvPool {
+            nkvh: geom.nkvh(),
+            hd: geom.hd(),
+        }
     }
 
     /// ELEMENTS BETWEEN TWO REQUESTS' KV, in any plane of any page+layer — the stride a batched
@@ -6205,7 +6792,7 @@ impl PagedKvPool {
         // `plane_extent()`, not `PLANE_SLOTS`: this is the PHYSICAL stride, and the addressable count is a
         // different quantity with the same value. The type is what stops the substitution.
         let (stk, pls) = (STK as u32, Self::plane_extent().get());
-        let hd = self.hd as u32;
+        let hd = self.hd;
         // ⚠️ PLANE-RELATIVE, deliberately. The emitter addresses each plane as its OWN NAMED TENSOR
         // (`kc`, `kct`, `vc`), so every offset a caller wants is WITHIN a plane — the plane base is
         // implicit in which tensor it names. An absolute address would be right only for a caller that
@@ -6246,7 +6833,7 @@ impl PagedKvPool {
     /// ⭐ HOW MANY SLOTS A PREFILL CHUNK STARTING AT `start` MAY CLAIM — the room left in its window.
     ///
     /// A chunk's cache write is cut into one part per PAGE, each part resolving its own page through the
-    /// request's block table (`EmittedOp::kv_slot_offset`) — so a chunk starting at a page boundary may
+    /// request's block table (`EmittedOp::kv_part`) — so a chunk starting at a page boundary may
     /// fill all [`PREFILL_WINDOW_PAGES`](Self::PREFILL_WINDOW_PAGES) pages of its window, and part `p`
     /// lands at the start of the window's page `p`.
     ///
@@ -6318,6 +6905,61 @@ impl PagedKvPool {
         ChunkStart(KvSlot::new(want.get() - off + (page - padded.get())))
     }
 
+    /// ⭐⭐⭐ THE PAGE PARTS OF A WRITE WINDOW — the ONE cutting law.
+    ///
+    /// A request-major window (decode: every row is one request's token) is ONE PART PER
+    /// ROW: the request's page comes from ITS block table (`kv_request = row0`) and its
+    /// slot from the launch's `seq_pos` shift, so the part states no offset. A
+    /// position-major window (prefill: consecutive positions of one sequence) is cut at
+    /// page boundaries, so every part carries its first row past the write cursor as the
+    /// offset — at a page-aligned window start (`chunk_write_start`'s law for multi-page
+    /// windows) that is exactly main's `p·PAGE_SLOTS`, so a whole-cursor window cuts
+    /// byte-identically to main's `parts = mq.div_ceil(page)` loop.
+    ///
+    /// The window's two facts arrive as their types — where it starts
+    /// ([`WriteRowStart`]) and how many rows it covers ([`QueryRowCount`]) — so the
+    /// cut cannot be handed a slot offset or a feature width where a row count belongs.
+    pub fn write_parts(
+        &self,
+        start: WriteRowStart,
+        len: QueryRowCount,
+        rows_are_requests: bool,
+    ) -> Vec<KvWritePart> {
+        // The cut's arithmetic reads numbers; the doors are spent here, at the binding.
+        let (start, len) = (start.get(), len.get());
+        if rows_are_requests {
+            return (start..start + len)
+                .map(|row0| KvWritePart {
+                    row0,
+                    rows: 1,
+                    request: row0,
+                    // A request-major part states no offset: its page is the request's own
+                    // block-table entry and its slot the launch's `seq_pos` shift.
+                    page: crate::page_part::PagePart::at_cursor(),
+                })
+                .collect();
+        }
+        let page = Self::PAGE_SLOTS as u32;
+        let mut parts = Vec::new();
+        let mut row0 = start;
+        while row0 < start + len {
+            let slot_start = row0 % page;
+            let room = page - slot_start;
+            let rows = (start + len - row0).min(room);
+            parts.push(KvWritePart {
+                row0,
+                rows,
+                request: 0,
+                // ⭐ THE PART'S OWN PAGE, minted by the same cut that computed the rows: the
+                // part's first row past the write cursor, as the `Slots` newtype. The op stamps
+                // copy this value; none re-derives it.
+                page: crate::page_part::PagePart::at_slots(crate::page_part::Slots::of(row0)),
+            });
+            row0 += rows;
+        }
+        parts
+    }
+
     /// ⭐ THE PHYSICAL EXTENT, TYPED — the only way the address law can obtain it, so the ADDRESSABLE count cannot
     /// be substituted for it in a stride.
     pub const fn plane_extent() -> PlaneExtent {
@@ -6330,7 +6972,7 @@ impl PagedKvPool {
         // that overrun on top of the next head's keys.
         // Physical, for the same reason: this is the distance to the NEXT KV HEAD, which is exactly what a padded
         // chunk write overruns.
-        self.hd * Self::plane_extent().get() as usize
+        self.hd as usize * Self::plane_extent().get() as usize
     }
 
     /// ⭐ THE BLOCK A `(kv head, request)` PAIR IS — for a caller addressing through a `Nest`'s
@@ -6359,7 +7001,7 @@ impl PagedKvPool {
     /// gather stepping by it would skip three quarters of every head's keys and still bake.
     /// `the_pool_is_a_uniform_array_of_stick_blocks` holds the two apart.
     pub fn stick_block_elems(&self) -> usize {
-        self.hd * STK
+        self.hd as usize * STK
     }
 
     /// ⭐ THE ENTRY IN **BYTES** — what one index step advances the address by. `stick_block_elems`
@@ -6420,7 +7062,7 @@ impl PagedKvPool {
     /// [`layer_stride`](Self::layer_stride), and the runtime's page stride is derived from those same
     /// placement deltas — so this is the one number that sizes the pool.
     pub fn plane_stride(&self) -> usize {
-        self.nkvh * self.plane_block_elems()
+        self.nkvh as usize * self.plane_block_elems()
     }
 
     /// Elements in one page+layer: Kᵀ, then V, then natural K.
@@ -6437,17 +7079,17 @@ impl PagedKvPool {
 
     /// Element offset of the natural-K plane within a page+layer — FIRST, where `kc` was.
     pub fn knat_plane_base(&self) -> usize {
-        0
+        self.plane::<KnatPlane>().base_elems()
     }
 
     /// Element offset of the V plane — SECOND, where `vc` was. Applied by the PLACEMENT, never an op.
     pub fn v_plane_base(&self) -> usize {
-        self.plane_stride()
+        self.plane::<VPlane>().base_elems()
     }
 
     /// Element offset of the transposed-K plane — LAST, where `kct` was.
     pub fn kt_plane_base(&self) -> usize {
-        2 * self.plane_stride()
+        self.plane::<KtPlane>().base_elems()
     }
 
     #[allow(dead_code)]
@@ -6460,7 +7102,8 @@ impl PagedKvPool {
         // had run. At head_dim 128 block 0 was exact and every later block read one plane too far, so
         // attention was right over the first 64 cached slots and drifted from the 65th. The comment above
         // described this bug; it is now fixed rather than described.
-        (gqa_kv_head(qh, gqa) * Self::PAGE_SLOTS * self.hd) as u32 + b * STK as u32 * self.hd as u32
+        (gqa_kv_head(qh, gqa) * Self::PAGE_SLOTS * self.hd as usize) as u32
+            + b * STK as u32 * self.hd
     }
 
     /// Kᵀ WRITE offset of `K[slot][d]` within a page+layer — the consumer's own read model, so
@@ -6477,8 +7120,8 @@ impl PagedKvPool {
     /// ```
     pub fn kt_write_off(&self, kvh: usize, slot: usize, d: usize) -> usize {
         // The head's own block — no `ROWS` factor, because a page holds slots and not requests.
-        kvh * self.hd * Self::PAGE_SLOTS
-            + kcache_kt_write_offset(slot, d, self.hd, Self::PAGE_SLOTS, STK)
+        kvh * self.hd as usize * Self::PAGE_SLOTS
+            + kcache_kt_write_offset(slot, d, self.hd as usize, Self::PAGE_SLOTS, STK)
     }
 
     /// V WRITE offset of `V[slot][d]` within a page+layer. A `[1, hd]` row is CONTIGUOUS here, which
@@ -6493,8 +7136,8 @@ impl PagedKvPool {
     /// ```
     pub fn v_write_off(&self, kvh: usize, slot: usize, d: usize) -> usize {
         // The head's own block — no `ROWS` factor; a page holds slots, not requests.
-        kvh * Self::PAGE_SLOTS * self.hd
-            + vcache_write_offset(slot, d, self.hd, Self::PAGE_SLOTS, STK)
+        kvh * Self::PAGE_SLOTS * self.hd as usize
+            + vcache_write_offset(slot, d, self.hd as usize, Self::PAGE_SLOTS, STK)
     }
 
     /// THE INVARIANTS THE RUNTIME DEPENDS ON: every access of a page+layer stays inside one plane,
@@ -6505,7 +7148,7 @@ impl PagedKvPool {
     /// use ktir_superdsc::addr::Gqa;
     /// use std::num::NonZeroU32;
     /// for &(nkvh, hd, gqa) in &[(8usize, 64usize, 4usize), (8, 128, 3), (1, 256, 1)] {
-    ///     let p = PagedKvPool::new(nkvh, hd);
+    ///     let p = PagedKvPool::new(nkvh as u32, hd as u32);
     ///     let plane = hd * PagedKvPool::PAGE_SLOTS;
     ///     for qh in 0..nkvh * gqa {
     ///         let head = QueryHead::all(NonZeroU32::new((nkvh * gqa) as u32).unwrap()).nth(qh).unwrap();
@@ -6527,7 +7170,7 @@ impl PagedKvPool {
     ///     // THE HEADS TILE THE PLANE EXACTLY. One head's block is its whole page — `hd * PAGE_SLOTS`
     ///     // — so head `k` ends precisely where head `k+1` begins and there is no request axis in
     ///     // between for a launch to step off the end of.
-    ///     assert_eq!(p.plane_block_elems(), p.hd() * PagedKvPool::PAGE_SLOTS);
+    ///     assert_eq!(p.plane_block_elems(), p.hd() as usize * PagedKvPool::PAGE_SLOTS);
     ///     assert_eq!(nkvh * p.plane_block_elems(), p.plane_stride());
     /// }
     /// ```
@@ -6537,11 +7180,19 @@ impl PagedKvPool {
             // THE PLANE IS ITS HEADS AND NOTHING ELSE. Stated as an equation because the two sides are
             // written in different places (a nest's `.block()` count against a matmul's declared kernel
             // extent) and drifting apart would put one head's slots on top of the next head's.
-            && self.plane_stride() == self.nkvh * self.plane_block_elems()
+            && self.plane_stride() == self.nkvh as usize * self.plane_block_elems()
     }
 
-    /// Head width this pool laid itself out for.
-    pub fn hd(&self) -> usize {
+    /// DISTINCT kv heads, as a value — the same door every pool-carrying sibling exposes
+    /// (`PagePlaneExtent::nkvh`, `PageScratch::nkvh`, `ChunkScratch::nkvh`), so a reader narrows
+    /// nowhere: the `as u32` the pub-`usize` field forced at six read sites is deleted.
+    pub const fn nkvh(self) -> u32 {
+        self.nkvh
+    }
+
+    /// Head width this pool laid itself out for — `u32`, the sibling vocabulary
+    /// (`PagePlaneExtent::hd`, `QGroupBlock::hd`).
+    pub const fn hd(self) -> u32 {
         self.hd
     }
 }
@@ -6592,7 +7243,7 @@ pub fn gather_entries_per_page(
 /// 4096-element block" is implicitly hd=64, which is exactly the hand-spelled constant this type
 /// makes unspellable. The only constructor divides the SESSION's own `page_stride_bytes` by the
 /// POOL's own `stick_block_bytes()`, so both halves of the identity come from the artifact.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, serde::Serialize)]
 pub struct EntriesPerPage(i64);
 
 impl EntriesPerPage {
@@ -6620,19 +7271,205 @@ impl EntriesPerPage {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct GatherEntry(i32);
 
+/// ⭐⭐⭐⭐⭐ THE ENTRY CEILING — the EXCLUSIVE upper bound on index values a gathered read of ONE
+/// pooled plane may hold, and the bound is on the **VALUE**, not the run: the values are runtime
+/// data (the host's `GatherEntry` composition), so no compile can read them — what a compile CAN
+/// do is make every value above the ceiling UNCONSTRUCTIBLE, which is this type's whole job.
+///
+/// ## The arithmetic, and why it is exact for EVERY plane
+/// An entry is composed RELATIVE TO THE PLANE it reads (`of_page_block`'s `phys * per_page +
+/// block_in_page`, where `block_in_page` is a block of THAT plane — the layer and plane offsets
+/// cancel because the base the descriptor adds is the plane's own placement). So the largest
+/// legal value names the LAST block of the LAST page the pool budget admits, inside the plane's
+/// own extent:
+///
+/// ```text
+/// ceiling = (page_ceiling − 1) · EntriesPerPage + (entries one plane spans)
+/// ```
+///
+/// — the same number for every plane of the pool, which is why one `GatherReach` serves all
+/// three. `page_ceiling` is the DEVICE-derived page budget (`MAX_SEGMENT_BYTES / page_bytes`,
+/// the same ceiling the prefix mask's block count reserves), and "entries one plane spans" is
+/// `plane_stride / stick_block_elems` — `nkvh * 4`, never a hand-written 32.
+///
+/// ⛔⛔⛔ NOT A RAW `u64` OF ELEMENTS. A reach stated as an element count invites the wrong
+/// comparison — an index-buffer POSITION times a row width, say — which type-checks, passes a
+/// fixture whose ids happen to make position equal value, and is vacuous on every real bundle.
+/// The ceiling is a bound on ENTRY VALUES, and the element extent it implies
+/// ([`GatherReach::reach_elems`]) is DERIVED from it, never stored beside it, so the two halves
+/// of the law cannot disagree.
+///
+/// ⛔ NO `From`, NO `Default`: the only constructor is [`Self::of_pool`], and the only public
+/// mint is [`gather_entry_ceiling`], which derives all three inputs from the pool and the page
+/// stride so no caller can spell a sibling arithmetic.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+pub struct GatherEntryCeiling {
+    per_page: EntriesPerPage,
+    /// EXCLUSIVE: the first value an index may NOT hold.
+    limit: i64,
+}
+
+impl GatherEntryCeiling {
+    /// ONE door — the pool's page ceiling, the page's entry count, and the plane's block count.
+    /// `None` on a zero page ceiling (an unpaged pool has no pages to name), a plane wider than
+    /// its own page, or a product that leaves `i64`.
+    pub(crate) fn of_pool(
+        page_ceiling: u64,
+        per_page: EntriesPerPage,
+        plane_blocks: u64,
+    ) -> Option<Self> {
+        let per = per_page.get();
+        if page_ceiling == 0 || per <= 0 || plane_blocks > per as u64 {
+            return None;
+        }
+        let limit = (page_ceiling - 1)
+            .checked_mul(per as u64)?
+            .checked_add(plane_blocks)?;
+        let limit = i64::try_from(limit).ok()?;
+        if limit <= 0 {
+            return None;
+        }
+        Some(GatherEntryCeiling { per_page, limit })
+    }
+
+    /// The page factor this ceiling composes with — [`GatherEntry::of_page_block`]'s own input,
+    /// read back rather than re-derived, so the bound and the composition share one number.
+    pub const fn per_page(self) -> EntriesPerPage {
+        self.per_page
+    }
+
+    /// The SOURCE-EXTENT family's mint — a table placed WHOLE whose index values name its rows
+    /// directly (a repeat gather: one row read many entries' worth of times). There are no
+    /// pages, so the source is ONE page of `rows` entries and the exclusive limit is the row
+    /// count itself: `GatherEntry::of_page_block(0, row)` composes every legal value
+    /// (`0 · rows + row == row < rows`), and any page ≥ 1 composes at or above the limit —
+    /// refused, the same fail-closed posture the pool's ceiling keeps. `None` on a zero row
+    /// count (no row to name) or a count that leaves `i64`.
+    pub(crate) fn of_source_extent(rows: u64) -> Option<Self> {
+        let limit = i64::try_from(rows).ok()?;
+        if limit <= 0 {
+            return None;
+        }
+        Some(GatherEntryCeiling {
+            per_page: EntriesPerPage(limit),
+            limit,
+        })
+    }
+
+    /// The EXCLUSIVE bound on entry values: the first value an index may not hold.
+    pub const fn get(self) -> i64 {
+        self.limit
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ THE ENTRY CEILING'S ONE PUBLIC MINT — page ceiling, page stride and pool, the same
+/// three numbers [`gather_entries_per_page`] and the prefix mask's block count come from, so the
+/// ceiling cannot disagree with either.
+///
+/// `None` for exactly the reasons [`gather_entries_per_page`] refuses (an unpaged bundle, a page
+/// that is not a whole number of stick blocks), plus a plane that is not itself a whole number of
+/// stick blocks — which no legal pool is, but a ceiling minted from one would be a lie, so the
+/// door refuses rather than rounds.
+pub fn gather_entry_ceiling(
+    page_ceiling: u64,
+    page_stride_bytes: u64,
+    pool: PagedKvPool,
+) -> Option<GatherEntryCeiling> {
+    let per_page = gather_entries_per_page(page_stride_bytes, pool)?;
+    let entry = pool.stick_block_elems();
+    let plane_blocks = pool.plane_stride().checked_div(entry)?;
+    GatherEntryCeiling::of_pool(page_ceiling, per_page, plane_blocks as u64)
+}
+
+/// ⭐⭐⭐⭐⭐ THE GATHER REACH OF ONE POOLED PLANE — the ceiling on its index values and the entry
+/// unit those values address at, as ONE value. The producer states it per pooled source tid in
+/// `BundleLayout::gather_reach`; the gather door checks the descriptor's own entry stride
+/// against it; the host's index composition mints through the same ceiling — so the bake-time
+/// bound and the stage-time composition cannot disagree, because both are this type.
+///
+/// ## The element extent is DERIVED, never stored
+/// `reach_elems() = ceiling · entry_elems` — `(page_ceiling − 1) · page_elems + plane_stride`,
+/// the extent from the plane's OWN placement base that legal entries address. It is a reading of
+/// the pair, not a second field: a reach stored as a raw element count beside a ceiling is two
+/// authorities for one bound, and the disagreement would be exactly the silent kind.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+pub struct GatherReach {
+    max_entry: GatherEntryCeiling,
+    entry_elems: u64,
+}
+
+impl GatherReach {
+    /// ONE door — the same three numbers [`gather_entry_ceiling`] takes, plus the pool's own
+    /// entry width. `None` for the same reasons.
+    pub fn of_plane(page_ceiling: u64, page_stride_bytes: u64, pool: PagedKvPool) -> Option<Self> {
+        Some(GatherReach {
+            max_entry: gather_entry_ceiling(page_ceiling, page_stride_bytes, pool)?,
+            entry_elems: pool.stick_block_elems() as u64,
+        })
+    }
+
+    /// The ceiling on entry values this reach admits (see [`GatherEntryCeiling`]).
+    pub const fn max_entry(self) -> GatherEntryCeiling {
+        self.max_entry
+    }
+
+    /// ⭐⭐⭐⭐ THE SOURCE-EXTENT FAMILY'S MINT — a table placed WHOLE, whose index values name
+    /// rows of the placement itself (a repeat gather: one row read many entries' worth of
+    /// times). The reach is the SOURCE'S OWN EXTENT — ceiling = the source's row count, unit =
+    /// its row width — the trivial bound a bare `min(swept, placement)` assumed silently: now
+    /// STATED, typed, and checked at the door. This is the second family of this one type; the
+    /// pool mint ([`Self::of_plane`]) keeps its own semantics (entries name stick-blocks
+    /// across a paged pool the runtime re-bases), and the gather door tells the families apart
+    /// by the PLACEMENT: a placement holding the whole reach is a source extent, a placement
+    /// holding a slice of it is a pool. `None` on a zero row count or row width.
+    pub fn of_source_extent(rows: u64, row_elems: u64) -> Option<Self> {
+        if row_elems == 0 {
+            return None;
+        }
+        Some(GatherReach {
+            max_entry: GatherEntryCeiling::of_source_extent(rows)?,
+            entry_elems: row_elems,
+        })
+    }
+
+    /// The entry unit the host's index values address at — the pool's stick block, `hd · 64`
+    /// elements, the width [`GatherEntry::of_page_block`] counts in and the descriptor's
+    /// `skip_addr` must equal.
+    pub const fn entry_elems(self) -> u64 {
+        self.entry_elems
+    }
+
+    /// The extent, in elements, from the plane's OWN placement base that legal entries address:
+    /// `ceiling · entry_elems` = `(page_ceiling − 1) · page_elems + plane_stride`. Derived, never
+    /// stored — see the type's doc.
+    pub fn reach_elems(self) -> u64 {
+        self.max_entry.get() as u64 * self.entry_elems
+    }
+}
+
 impl GatherEntry {
     /// THE ONE COMPOSITION: physical page `phys`, times this bundle's entries-per-page, plus the
     /// block that `(kv head, slot window)` occupies inside a page ([`GatherScratch::block_in_page`]).
     ///
-    /// `None` on a negative page, or when the product or sum leaves `i32` — the width the descriptor
-    /// declares (`SENUINT32`). A wrapped entry is an address, so it cannot be allowed to round.
-    pub fn of_page_block(per_page: EntriesPerPage, phys: i64, block_in_page: u32) -> Option<Self> {
+    /// `None` on a negative page, when the product or sum leaves `i32` — the width the descriptor
+    /// declares (`SENUINT32`) — or when the composed value is AT OR ABOVE the pool's ceiling: the
+    /// values are runtime data, and the ceiling is the one bound on them a compile can make
+    /// unconstructible rather than check after the fact. A wrapped entry is an address, so it
+    /// cannot be allowed to round.
+    pub fn of_page_block(
+        ceiling: GatherEntryCeiling,
+        phys: i64,
+        block_in_page: u32,
+    ) -> Option<Self> {
         if phys < 0 {
             return None;
         }
         let e = phys
-            .checked_mul(per_page.get())?
+            .checked_mul(ceiling.per_page().get())?
             .checked_add(i64::from(block_in_page))?;
+        if e >= ceiling.get() {
+            return None;
+        }
         i32::try_from(e).ok().map(GatherEntry)
     }
 
@@ -6700,15 +7537,17 @@ pub fn gather_index_table(
     block_tables: &[Vec<i64>],
     // Fold passes this step walks — the PAGES, since a gathered fold's pass IS a page.
     pages: usize,
-    // [`gather_entries_per_page`], off the same session `fold_plan::page_base_bytes` reads. It is an
-    // [`EntriesPerPage`] and not an `i64` so that the hd-carrying factor cannot be hand-written here.
-    entries_per_page: EntriesPerPage,
+    // [`gather_entry_ceiling`] — the pool's own ceiling (the hd-carrying page factor and the page
+    // budget in ONE type), so the entries composed here are bounded by the same law the bake
+    // stated and no factor can be hand-written at this call site.
+    ceiling: GatherEntryCeiling,
     // The MASK's own per-pass shift ([`PrefixMaskShape::pass_stride`]) — a [`PassStride`] rather than a
     // `usize` because the index rides that shift and one shift cannot have two pitches.
     pass_stride: PassStride,
 ) -> Option<Vec<GatherEntry>> {
     let rows = scratch.rows() as usize;
     let stride = pass_stride.get();
+    let entries_per_page = ceiling.per_page();
     if block_tables.is_empty()
         || pages == 0
         || entries_per_page.get() <= 0
@@ -6725,7 +7564,7 @@ pub fn gather_index_table(
     // entry this loop does not reach will gather. It is sound only because the gather-copy op reads
     // `rows` of them and the mask invalidates the rest; it is NOT a safe default for a missing row,
     // which is why every failure above refuses instead of leaving one here.
-    let pad = GatherEntry::of_page_block(entries_per_page, 0, 0)?;
+    let pad = GatherEntry::of_page_block(ceiling, 0, 0)?;
     let mut out = vec![pad; pages * stride];
     for p in 0..pages {
         for r in 0..scratch.mq() {
@@ -6741,13 +7580,10 @@ pub fn gather_index_table(
                 for b in 0..scratch.windows() {
                     // ⭐ ONE COMPOSITION, INSIDE THE TYPE. The `phys * per_page + block` arithmetic that
                     // used to be spelled here — and whose three terms all have plausible wrong siblings
-                    // — is now [`GatherEntry::of_page_block`]'s and nothing else's.
+                    // — is now [`GatherEntry::of_page_block`]'s and nothing else's, and the ceiling it
+                    // takes is the pool's own bound on the value.
                     out[p * stride + scratch.row_of(kvh, b, r)? as usize] =
-                        GatherEntry::of_page_block(
-                            entries_per_page,
-                            phys,
-                            scratch.block_in_page(kvh, b)?,
-                        )?;
+                        GatherEntry::of_page_block(ceiling, phys, scratch.block_in_page(kvh, b)?)?;
                 }
             }
         }
@@ -6779,8 +7615,8 @@ pub fn page_gather_index_table(
     block_tables: &[Vec<i64>],
     // Fold passes this step walks — the PAGES, since a gathered fold's pass IS a page.
     pages: usize,
-    // [`gather_entries_per_page`], off the same session `fold_plan::page_base_bytes` reads.
-    planes: EntriesPerPage,
+    // [`gather_entry_ceiling`] — the pool's own page factor and page budget in one type.
+    ceiling: GatherEntryCeiling,
     // The MASK's own per-pass shift ([`PrefixMaskShape::pass_stride`]).
     pass_stride: PassStride,
 ) -> Option<Vec<GatherEntry>> {
@@ -6794,6 +7630,7 @@ pub fn page_gather_index_table(
         scratch.entries_per_op() as usize,
         scratch.ops_per_row() as usize,
     );
+    let planes = ceiling.per_page();
     if block_tables.is_empty()
         || pages == 0
         || planes.get() <= 0
@@ -6812,7 +7649,7 @@ pub fn page_gather_index_table(
     // ⛔ THE PAD IS PAGE 0's FIRST PLANE AND THAT IS A REAL ADDRESS — stated, because it is what any entry
     // this loop does not reach would gather. Sound only because the copy reads `rows` of them and the mask
     // invalidates the rest; NOT a safe default for a missing row, which is why the checks above refuse.
-    let pad = GatherEntry::of_page_block(planes, 0, 0)?;
+    let pad = GatherEntry::of_page_block(ceiling, 0, 0)?;
     let mut out = vec![pad; pages * stride];
     for p in 0..pages {
         for r in 0..scratch.mq() {
@@ -6838,7 +7675,7 @@ pub fn page_gather_index_table(
                 let first = j * cut;
                 for i in 0..(per_row - first).min(cut) {
                     *out.get_mut(base + i)? =
-                        GatherEntry::of_page_block(planes, phys, u32::try_from(first + i).ok()?)?;
+                        GatherEntry::of_page_block(ceiling, phys, u32::try_from(first + i).ok()?)?;
                 }
             }
         }
@@ -7008,7 +7845,7 @@ impl PagePlaneExtent {
     /// The extent of one `(request, page)` plane, or `None` on a degenerate geometry or an `hd` that is
     /// not a whole number of sticks (a part-stick head dim has no stick-block entry at all).
     pub const fn of_pool(pool: PagedKvPool) -> Option<Self> {
-        let (nkvh, hd) = (pool.nkvh as u32, pool.hd as u32);
+        let (nkvh, hd) = (pool.nkvh(), pool.hd());
         if nkvh == 0 || hd == 0 || !hd.is_multiple_of(POOL_STICK) {
             return None;
         }
@@ -8679,14 +9516,14 @@ pub fn chunk_gather_index_table(
     scratch: ChunkScratch,
     rows: ChunkRowKind,
     pages: &[i64],
-    per_page: EntriesPerPage,
+    ceiling: GatherEntryCeiling,
     op_local_bytes: u64,
     prob_pin_bytes: u64,
 ) -> Option<Vec<GatherEntry>> {
     let last = *pages.last()?;
     let entry = |(kvh, page, q): (u32, u32, u32)| {
         let phys = *pages.get(page as usize).unwrap_or(&last);
-        GatherEntry::of_page_block(per_page, phys, scratch.source_block(kvh, q)?)
+        GatherEntry::of_page_block(ceiling, phys, scratch.source_block(kvh, q)?)
     };
     if let Some(lx) = scratch.lx_form(rows, op_local_bytes, prob_pin_bytes) {
         let values = (0..scratch.entries()).map(|e| entry(lx.entry_coord(e)));
@@ -8945,8 +9782,14 @@ pub enum BatchPrefix {
 /// whose request-local slot its history holds, and `mask_neg` everywhere else — every other request's
 /// run, the request's own padded tail, and the hole a shared write slot leaves. `hists` is one history
 /// per request row (padding rows carry live 0's, from the launch's own rows) in row order. `None` on a
-/// history count that is not the batch width.
-pub fn batch_chunk_mask_f16(bc: BatchChunk, hists: &[KvHistory], mask_neg: f32) -> Option<Vec<u8>> {
+/// history count that is not the batch width. Returns a [`ValidityMask`]: the bytes TOGETHER with one
+/// [`ValidKeys`] tally per (row, 64-lane slab), minted by the same runs walk, at the slab pitch the
+/// body's `l` sums over.
+pub fn batch_chunk_mask_f16(
+    bc: BatchChunk,
+    hists: &[KvHistory],
+    mask_neg: f32,
+) -> Option<ValidityMask> {
     if hists.len() != bc.requests() as usize {
         return None;
     }
@@ -8954,6 +9797,15 @@ pub fn batch_chunk_mask_f16(bc: BatchChunk, hists: &[KvHistory], mask_neg: f32) 
     let zero = half::f16::from_f32(0.0).to_le_bytes();
     let mut m: Vec<u8> = neg.repeat(bc.mask_elems());
     let per = bc.slots_per_request();
+    // ⭐ THE COUNTS, AT THE SLAB PITCH THE BODY READS — one lane tally per (row, 64-lane slab)
+    // of the ONE block, minted by the same runs walk that writes the bytes below (the one-fact
+    // law: a tally a second derivation produced could disagree with the bytes it counts). The
+    // tallies' index law is their OWN — `row·slabs + slot/STICK`, row-major then the slab (NOT
+    // the bytes' stick-blocked [`BatchChunk::mask_elem`] flat order; [`ValidityMask::window_valid`]
+    // states the counts' order) — and it is per SLAB, not per run, because a run can straddle a
+    // slab boundary, which is exactly the straddle the count must not lose.
+    let slabs = bc.mask_cols() as usize / POOL_STICK as usize;
+    let mut lanes = vec![0u32; bc.mask_rows() as usize * slabs];
     for row in 0..bc.mask_rows() {
         let r = bc.row_request(row);
         let hist = &hists[r as usize];
@@ -8962,10 +9814,43 @@ pub fn batch_chunk_mask_f16(bc: BatchChunk, hists: &[KvHistory], mask_neg: f32) 
             for local in lo..hi {
                 let e = bc.mask_elem(row, r * per + local)?;
                 m[e * 2..e * 2 + 2].copy_from_slice(&zero);
+                lanes[row as usize * slabs + ((r * per + local) as usize / POOL_STICK as usize)] +=
+                    1;
             }
         }
     }
-    Some(m)
+    let valid = lanes
+        .into_iter()
+        .map(ValidKeys::of)
+        .collect::<Option<Vec<_>>>()
+        .expect("a slab is 64 lanes, so a tally cannot exceed 64");
+    Some(ValidityMask {
+        bytes: m,
+        valid,
+        windows_per_row: NonZeroU32::new(slabs as u32)
+            .expect("the chunk's slots are whole pages, so a row spans at least one slab"),
+    })
+}
+
+/// ⭐⭐⭐ THE BATCH CHUNK'S SWEEP READING, OFF THE MINTED COUNTS — the first row whose whole slab
+/// sweep holds no valid lane, or `None` when every row sweeps one. The same row-sweep invariant
+/// as [`decode_batch_empty_sweep_row`] at this family's own single-block layout: the mask is
+/// ONE block every row block reads, so a row's sweep is its own `slabs` tallies and no block
+/// grouping is needed. Row `i` is request `i % B`'s ([`BatchChunk::row_request`]); an empty
+/// sweep is a request whose history holds none of its own run's slots — the never-prefilled
+/// desync, which the rescale cannot expunge because the row's `m` never rises.
+pub fn batch_chunk_empty_sweep_row(mask: &ValidityMask) -> Option<u32> {
+    let wpr = mask.windows_per_row().get() as usize;
+    for row in 0..mask.rows() {
+        let mut swept = 0u32;
+        for window in 0..wpr {
+            swept += mask.window_valid(row, window).get();
+        }
+        if swept == 0 {
+            return Some(row as u32);
+        }
+    }
+    None
 }
 
 /// ⭐⭐⭐ THE BATCH CHUNK's INDEX TABLE — [`chunk_gather_index_table`] over [`BatchChunk::page_list`],
@@ -8977,7 +9862,7 @@ pub fn batch_chunk_mask_f16(bc: BatchChunk, hists: &[KvHistory], mask_neg: f32) 
 pub fn batch_chunk_index_table(
     bc: BatchChunk,
     maps: &[Vec<i64>],
-    per_page: EntriesPerPage,
+    ceiling: GatherEntryCeiling,
     op_local_bytes: u64,
     prob_pin_bytes: u64,
 ) -> Option<Vec<GatherEntry>> {
@@ -8985,7 +9870,7 @@ pub fn batch_chunk_index_table(
         bc.chunk(),
         ChunkRowKind::Batch,
         &bc.page_list(maps)?,
-        per_page,
+        ceiling,
         op_local_bytes,
         prob_pin_bytes,
     )
@@ -9021,7 +9906,10 @@ pub struct GatherScratch {
     /// The row law — see [`GatherRows`] for why the window count is not part of it.
     rows: GatherRows,
     windows: u32,
-    hd: u32,
+    /// ⭐ THE POOL THE SCRATCH WAS MINTED FROM — the geometry every door below reads through the
+    /// pool's own doors (the head dim through [`PagedKvPool::hd`], the block numbering through
+    /// [`PagedKvPool::block_in_page`]), never re-minted from destructured numbers.
+    pool: PagedKvPool,
 }
 
 impl GatherScratch {
@@ -9035,24 +9923,25 @@ impl GatherScratch {
         windows: WindowCount,
         mq: QueryRowCount,
     ) -> Option<GatherScratch> {
-        let (nkvh, hd) = (pool.nkvh as u32, pool.hd() as u32);
+        let (nkvh, hd) = (pool.nkvh(), pool.hd());
         if nkvh == 0 || hd == 0 || hd > POOL_STICK || windows.get() == 0 || mq.get() == 0 {
             return None;
         }
         Some(GatherScratch {
             rows: GatherRows { nkvh, mq: mq.get() },
             windows: windows.get(),
-            hd,
+            pool,
         })
     }
 
     /// ⭐⭐⭐⭐⭐ "COULD ANY BODY OF THIS BUNDLE GATHER" — [`Self::of_fold_pass`] ITSELF, asked without a
     /// window count, and the ONE rule the three bundle-level places that must agree now read.
     ///
-    /// ⛔⛔⛔ THE DEFECT THIS CLOSES, AND IT WAS INVISIBLE AT hd=64. Three constructors answer "does this
-    /// bundle gather" ([`crate::…::GathersKv`] in the target crate: `of(BakeFacts)`, `of_layout()`,
+    /// ⛔⛔⛔ THE DEFECT THIS CLOSES, AND IT WAS INVISIBLE AT hd=64. Three constructors used to answer
+    /// "does this bundle gather" ([`crate::…::GathersKv`] in the target crate: `of(BakeFacts)`,
+    /// `of_layout()` — since RETIRED and replaced by `of_code()`, which reads the groups — and
     /// `of_launch_groups()`). The first two read the `KV_BLOCK_INDEX_TID` PLACEMENT, which was reserved
-    /// on `rows_are_requests` ALONE; the third reads the emitted fold groups, which additionally require
+    /// on `rows_are_requests` ALONE; the third read the emitted fold groups, which additionally require
     /// `of_fold_pass` to have returned a scratch. At hd=64 `of_fold_pass` never refuses, so all three
     /// agreed and the split could not be seen. At hd=128 it always refuses: the bundle reserves an index
     /// activation and the forward tape carries a `KvBlockIndex` step for a gather that is in no
@@ -9108,7 +9997,7 @@ impl GatherScratch {
     /// `mb` contributes 1 and `out` the whole row), the copy's `cols`, and the matmuls' `y` step, and
     /// those being one value is what makes the entry a plain global block number.
     pub const fn cols(self) -> u32 {
-        self.hd * POOL_STICK
+        self.pool.hd() * POOL_STICK
     }
 
     /// The whole footprint, in elements — what the synthetic allocator reserves.
@@ -9302,11 +10191,12 @@ impl GatherScratch {
     /// `kvh*hd*PLANE_SLOTS + b*hd*64` and V's at `kvh*hd*PLANE_SLOTS + b*64*hd` — the same block, which
     /// is why one index serves both copies.
     pub fn block_in_page(self, kvh: u32, window: u32) -> Option<u32> {
-        let pool = PagedKvPool::new(self.nkvh() as usize, self.hd as usize);
-        let per_plane =
-            u32::try_from(pool.plane_block_elems() / pool.stick_block_elems().max(1)).ok()?;
-        (kvh < self.nkvh() && window < self.windows && window < per_plane)
-            .then_some(kvh * per_plane + window)
+        // The POOL's own door names the block (one derivation, shared with the spliced fillers);
+        // this adds only the scratch's own window bound — how far THIS pass sweeps, the one fact
+        // the pool cannot state.
+        (kvh < self.nkvh() && window < self.windows)
+            .then(|| self.pool.block_in_page(kvh, window))
+            .flatten()
     }
 }
 
@@ -11221,6 +12111,625 @@ mod kv_cache_write_pitch_proofs {
             "nslab planes are one head"
         );
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  The spliced attention family's step inputs — the two-party contract, and the FILLER's half
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ⭐⭐⭐⭐⭐ THE ATTENTION FAMILY'S HOST-STAGED STEP-INPUT SLOTS — the two-party contract's
+/// spelling, in the one vocabulary crate both parties link.
+///
+/// The triton splice is the STATER: it numbers the synthetic bindings one past the graph's own
+/// tensors through the ONE shared law (`step_input_tid`), states them on the node, and the
+/// producer's placement pass places exactly those tids. The worker is the FILLER: it asks the
+/// bundle's own baked discovery table which of these slots this bundle declared, computes the
+/// content — a page table, a validity mask — in the KERNEL'S read order, and hands the bytes to
+/// the session's fill door by slot. Neither party may spell the other's numbering: the splice
+/// never derives a tid beyond the one law, and the worker never recomputes `tensors.len() + k`.
+/// This table is where the two agree, which is why it lives HERE and not in the splice: a
+/// contract between two crates belongs to the vocabulary crate both link, never to a party.
+///
+/// ⛔ A FIXED TARGET ABI, NOT WIRING DATA. The slot a meaning is pinned to is a constant of the
+/// family — the discovery table deliberately carries no meanings (a format cannot tell the two
+/// `RawU32` id tables apart), so the meanings must live somewhere both parties can name, and a
+/// bake-time table would be a second thing to keep in step with the splice's own constants.
+///
+/// Every attention program of a bundle — the one-shot kernels and the paged-fold family's body —
+/// states the SAME slots, so the placement pass and the runtime's staging treat them alike. Slot
+/// 0 keeps the mask on the tid the wiring's own one-past-the-graph law already assigns it, so
+/// nothing pre-existing moves.
+pub mod attn_step_slots {
+    /// The additive validity mask at the score tile's own rows.
+    pub const MASK: u32 = 0;
+    /// The Kᵀ plane's block-entry table — one `GatherEntry` per stick block the score gather
+    /// reads, in the Kᵀ plane's own block numbering.
+    pub const KT_BLOCK_IDS: u32 = 1;
+    /// The V plane's block-entry table — the V plane's own block numbering.
+    pub const V_BLOCK_IDS: u32 = 2;
+    /// Q's row-repetition table — torch's `rep_row_ids` values, one Q row index per
+    /// `[BATCH, GQA]` entry of the pre-repeated frame the decode kernel's score dot pairs
+    /// with the gathered blocks.
+    pub const REP_ROW_IDS: u32 = 3;
+}
+
+impl PagedKvPool {
+    /// ⭐ THE 64-SLOT WINDOWS ONE KV HEAD'S PAGE HOLDS — the pool's own stick geometry, the `W4`
+    /// every spliced attention kernel's window loop walks. Read off the plane's own two sizes,
+    /// never spelled as 4: the ONE derivation the index entry's block term and the fillers'
+    /// extent arithmetic share.
+    pub fn windows_per_page(&self) -> Option<u32> {
+        u32::try_from(self.plane_block_elems() / self.stick_block_elems().max(1)).ok()
+    }
+
+    /// ⭐ WHICH 64-SLOT STICK BLOCK OF A PAGE'S PLANE a (kv head, window) is — the term that rides
+    /// in the gather INDEX ENTRY rather than in any base offset, because one entry serves every
+    /// head and window of a trip.
+    ///
+    /// Kᵗ and V agree on this number: Kᵗ's window `b` of head `kvh` is at
+    /// `kvh*hd*PLANE_SLOTS + b*hd*64` and V's at `kvh*hd*PLANE_SLOTS + b*64*hd` — the same block,
+    /// which is why one index value serves both planes' tables. `None` when the head or window is
+    /// outside the page's own geometry — a block the pool does not hold.
+    pub fn block_in_page(&self, kvh: u32, window: u32) -> Option<u32> {
+        let per_plane = self.windows_per_page()?;
+        (kvh < self.nkvh && window < per_plane).then_some(kvh * per_plane + window)
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ THE REGION THE ONE-SEQUENCE STEP INPUTS STATE — the page-major extent the one-shot
+/// prefill kernel walks and the paged-fold family's per-pass shift crosses, as ONE value minted
+/// from the placement's own byte extent.
+///
+/// The one-shot kernel (`batched_prefill_hm`) and the fold family (`paged_fold`) state the SAME
+/// region and the SAME pitch — one id stick per mask row, the padded form that lets the fold's
+/// single per-pass Activation delta walk the tables and the mask by one number — so ONE staged
+/// buffer serves whichever body the selector runs, and this type IS that agreement. `mq` is the
+/// rung's own query-row width ([`RungWidth`]); `gqa` comes from the wiring's geometry
+/// (`nqh / nkvh`), the one fact [`PagedKvPool`] does not carry.
+///
+/// ⛔ MINTED FROM THE MASK SLOT'S OWN EXTENT, never from a page count a caller computed: the
+/// placement states the ladder's declared region (every rung of a chunked ladder states the same
+/// one), and a region re-derived from the live context is a second derivation of a bake fact. A
+/// non-divisor refuses: a mask extent that is not a whole number of `W4·mq`-row page blocks is a
+/// bake/stage disagreement, not a rounding decision.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SplicedAttnRegion {
+    pages: u32,
+    mq: NonZeroU32,
+    gqa: NonZeroU32,
+    pool: PagedKvPool,
+}
+
+impl SplicedAttnRegion {
+    /// ONE door — the MASK slot's placement extent in bytes, the pool, the GQA group, and the
+    /// rung's query-row width. `None` when the extent is not a whole number of page blocks at
+    /// this geometry, or the pool's stick geometry does not divide.
+    pub fn of_mask_extent(
+        extent_bytes: u64,
+        pool: PagedKvPool,
+        gqa: NonZeroU32,
+        mq: RungWidth,
+    ) -> Option<Self> {
+        let w4 = pool.windows_per_page()?;
+        // One page block of the mask: `W4 * mq` rows of 64 f16 lanes.
+        let block = u64::from(w4) * mq.count() as u64 * 64 * 2;
+        if block == 0 || !extent_bytes.is_multiple_of(block) {
+            return None;
+        }
+        let pages = u32::try_from(extent_bytes / block).ok()?;
+        (pages > 0).then_some(SplicedAttnRegion {
+            pages,
+            mq: mq.rows(),
+            gqa,
+            pool,
+        })
+    }
+
+    /// The region's page count — the extent both id tables and the mask state.
+    pub const fn pages(self) -> u32 {
+        self.pages
+    }
+
+    /// The rung's query-row width the region is padded to.
+    pub const fn mq(self) -> NonZeroU32 {
+        self.mq
+    }
+
+    /// The 64-slot windows one kv head's page holds.
+    pub fn w4(self) -> u32 {
+        self.pool.windows_per_page().unwrap_or(0)
+    }
+
+    /// The id stick's width — every kv head's block in one window, named once per GQA group.
+    pub fn ktb(self) -> Option<u32> {
+        self.pool.nkvh().checked_mul(self.gqa.get())
+    }
+
+    /// The id sticks one page block of the table states — one per mask row, the padded pitch law.
+    pub fn sticks_per_page(self) -> u32 {
+        self.w4() * self.mq.get()
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE CHUNK FAMILY'S STEP INPUTS, MINTED BY ONE WALK — both id tables and the
+    /// validity mask, as ONE value. The tables and the mask already derive their coverage from
+    /// this ONE region (the same `pages`, the same pitch); this constructor is the binding made
+    /// structural: a staging that wanted the tables of one region and the mask of another has no
+    /// spelling, because there is no longer a site that names them separately. The mask's rows
+    /// carry their own [`ValidKeys`] counts (the `l`-invariant, as a type), and `real` is
+    /// [`NonZeroU32`] because the seed-safety law is a THEOREM of `real ≥ 1` — see
+    /// [`ValidityMask`].
+    pub fn chunk_step_inputs(
+        self,
+        map: &[i64],
+        rows: ChunkRows,
+        start: usize,
+        real: NonZeroU32,
+        ceiling: GatherEntryCeiling,
+    ) -> Option<AttnStepInputs> {
+        Some(AttnStepInputs {
+            kt: spliced_attn_ids_table(self, map, ceiling)?,
+            v: spliced_attn_ids_table(self, map, ceiling)?,
+            mask: spliced_attn_mask_f16(self, rows, start, real)?,
+        })
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ HOW MANY LANES OF ONE MASK ROW ARE VALID — the count the fold's `l` may sum over.
+///
+/// The fold's online-softmax denominator is a STRICT running sum: validity enters at exactly
+/// one point (the additive mask the body adds to its score tile), so every lane the mask did
+/// not validate enters `l` forever. The count is minted by the same loop that writes the row's
+/// bytes, so the bytes and the count are one fact, not two that agree.
+///
+/// ⛔ NO CONSTRUCTOR FROM A STAGED BUFFER. The count exists only where the row was WRITTEN — a
+/// mask read back off a device segment has no count, and re-deriving one from the bytes would
+/// be a second derivation of the same fact (the class [`MaskPassGrid`]'s doc names: three
+/// readings of one decision that must all move together).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct ValidKeys(u32);
+
+impl ValidKeys {
+    /// The only constructor: a count of valid lanes in ONE 64-lane row. `None` past 64 — a row
+    /// has 64 lanes, so a larger count is some other buffer's number wearing this one's type.
+    pub fn of(lanes: u32) -> Option<ValidKeys> {
+        (lanes <= 64).then_some(ValidKeys(lanes))
+    }
+
+    /// The valid-lane count, ≤ 64.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ AN ADDITIVE VALIDITY MASK TOGETHER WITH ITS OWN VALID-LANE COUNTS — the fold's
+/// `l`-invariant, as a type.
+///
+/// THE INVARIANT: `l ≡ Σ over windows of Σ over the lanes each row marks valid of
+/// e^(score − m_final)` — base e, the device's one exponential (`ExpBase::E`; the emitted
+/// recurrence is `expb = exp(sc − run_m)`, never an exp2). A lane the mask does not validate
+/// contributes EXACTLY zero to `l`
+/// and to `acc` — in the kernel's arithmetic, because a masked lane's score plus the −65504
+/// sentinel underflows the exponential to zero (the finite-sentinel clamp trick), and in the
+/// staging, because the row's [`ValidKeys`] count is minted by the loop that wrote those very
+/// bytes.
+///
+/// ⛔ THE SENTINEL PAIR IS LOAD-BEARING, AND ITS EDGE IS THE SEED-SAFETY LAW. The carry's seed
+/// `m` is the SAME finite floor ([`ATTN_SEED_FLOOR`]) the invalid lanes carry, so a masked lane's
+/// `p` is exactly zero only because some VALID lane in the same or an earlier window raised `m`
+/// past the sentinel (`e^(floor − m)` underflows). An ALL-masked window read while `m` still sits
+/// at the seed would give `p = e^0 = 1` per lane — `l += 64`, `acc += ΣV`, the mask doing
+/// nothing. The chunk family's first window CANNOT be that window: with `real ≥ 1` (the
+/// builder takes [`NonZeroU32`]) and `start ≥ 0` (a `usize`), `row_logical_pos(t, real) ≥ 0`,
+/// so slot 0 is valid for every query row of window (0, 0) and
+/// [`ValidityMask::first_window_valid_keys`] answers ≥ 1 there — a theorem of the builder's
+/// own input types, not a check at runtime.
+#[derive(Clone, Debug)]
+pub struct ValidityMask {
+    bytes: Vec<u8>,
+    valid: Vec<ValidKeys>,
+    /// ⭐ THE COUNT'S OWN ROW PITCH — how many 64-lane windows one mask row spans. `1` for the
+    /// families whose rows ARE one 64-lane window (the spliced chunk and batch masks); the
+    /// block's slab count for the fold families, whose rows span whole pages. The counts are
+    /// minted at this pitch because it is the pitch the fold's `l` sums over: the emitter reads
+    /// the mask one 64-lane slab at a time, so a count wider than a slab would be a number the
+    /// softmax never adds, and a count narrower would split one reading's lanes across counts.
+    windows_per_row: NonZeroU32,
+}
+
+impl ValidityMask {
+    /// The row bytes in the kernel's own read order — the f16 additive lanes, LE.
+    pub fn wire_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The same bytes, BY VALUE — the staging exit for a mask whose counts will not be read
+    /// again on this path. The counts drop with the value, so a staging that consumes the bytes
+    /// through this door says so at the call site rather than silently discarding counts a
+    /// later rung of this contract threads onward.
+    pub fn into_wire_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// The count's row pitch — the 64-lane windows one mask row spans.
+    pub fn windows_per_row(&self) -> NonZeroU32 {
+        self.windows_per_row
+    }
+
+    /// How many rows the mask states — `pages·W4·mq` for the chunk family, the pre-replicated
+    /// score-tile row count for the batch family — blocks folded in, at the family's own row
+    /// order, each row spanning [`Self::windows_per_row`] counts.
+    pub fn rows(&self) -> usize {
+        self.valid.len() / self.windows_per_row.get() as usize
+    }
+
+    /// One (row, 64-lane window) pair's valid-lane count — the counts' own index law,
+    /// `valid[row · windows_per_row + window]`, in the same row order [`Self::rows`] counts.
+    pub fn window_valid(&self, row: usize, window: usize) -> ValidKeys {
+        self.valid[row * self.windows_per_row.get() as usize + window]
+    }
+
+    /// ⭐ THE SEED-SAFETY LAW, READ OFF THE MINTED COUNTS: the least valid-lane count over the
+    /// FIRST window's query rows (`0..mq` in the kernel's row order) — ≥ 1 for every mask the
+    /// chunk family's builder mints, by the theorem its input types state. The batch family's
+    /// rows carry their counts so the same reading answers for them too.
+    pub fn first_window_valid_keys(&self, mq: NonZeroU32) -> Option<ValidKeys> {
+        let wpr = self.windows_per_row.get() as usize;
+        let mq = (mq.get() as usize).min(self.valid.len() / wpr);
+        (0..mq).map(|r| self.valid[r * wpr]).min()
+    }
+}
+
+/// THE CHUNK FAMILY'S THREE STAGED STEP INPUTS AS ONE VALUE — minted solely by
+/// [`SplicedAttnRegion::chunk_step_inputs`], staged through the session's fill door slot by
+/// slot. The ids and the mask are fields of one value because they are one coverage: a bundle
+/// that declared one without the other is the partial-set refusal the fill already makes, and
+/// a staging that built them from two regions has no spelling left.
+#[derive(Clone, Debug)]
+pub struct AttnStepInputs {
+    kt: Vec<GatherEntry>,
+    v: Vec<GatherEntry>,
+    mask: ValidityMask,
+}
+
+impl AttnStepInputs {
+    /// The Kᵀ plane's block-entry table — LE u32 per entry on the wire (see `encode` at the
+    /// fill).
+    pub fn kt_entries(&self) -> &[GatherEntry] {
+        &self.kt
+    }
+
+    /// The V plane's block-entry table — same law, same coverage, the V plane's own entries.
+    pub fn v_entries(&self) -> &[GatherEntry] {
+        &self.v
+    }
+
+    /// The validity mask, with its own valid-lane counts.
+    pub fn mask(&self) -> &ValidityMask {
+        &self.mask
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ THE ONE-SEQUENCE BLOCK-ENTRY TABLE — the index values in the KERNEL'S OWN READ
+/// ORDER: page-major over the region at the MASK'S OWN PITCH (one id stick per mask row —
+/// `W4·mq` sticks per page block, the first `W4` meaningful, the tail unread padding),
+/// window-major within a page, (kv head, group)-major within a window, the GQA replication
+/// riding the VALUES. Every value is minted through [`GatherEntry::of_page_block`] with the
+/// block the POOL's own door names — the same composition the door-era tables use, so the bake's
+/// entry ceiling bounds these values too.
+///
+/// `map` is the sequence's logical→physical page map — the very map the launch installed, so the
+/// table the card reads and the map the cache write used are one derivation. A region longer
+/// than the map repeats the map's OWN last page (never 0, which is a real address, and never
+/// another sequence's); the mask silences the repeat. The PAD sticks past each page's first `W4`
+/// carry the page's last window's entries, so every staged entry names a written, in-pool block.
+///
+/// `None` on an empty map (no page to name) or an entry the ceiling refuses — never a zero
+/// table, because zero is block 0, a REAL address.
+pub fn spliced_attn_ids_table(
+    region: SplicedAttnRegion,
+    map: &[i64],
+    ceiling: GatherEntryCeiling,
+) -> Option<Vec<GatherEntry>> {
+    let last = *map.last()?;
+    let ktb = region.ktb()?;
+    let w4 = region.w4();
+    let mut out = Vec::with_capacity(
+        region.pages() as usize * region.sticks_per_page() as usize * ktb as usize,
+    );
+    for s in 0..region.pages() {
+        let phys = map.get(s as usize).copied().unwrap_or(last);
+        for k in 0..region.sticks_per_page() {
+            // The first W4 sticks are the page's own windows; the pad tail repeats the last one,
+            // so a pad entry is an in-pool written block rather than a hole the geometry left.
+            let window = k.min(w4 - 1);
+            for b in 0..ktb {
+                let kvh = b / region.gqa.get();
+                let block = region.pool.block_in_page(kvh, window)?;
+                out.push(GatherEntry::of_page_block(ceiling, phys, block)?);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// ⭐⭐⭐⭐⭐ THE ONE-SEQUENCE ADDITIVE VALIDITY MASK — `[REGION_PAGES·W4·mq, 64]` f16,
+/// window-major within each page, row `(s·W4 + w)·mq + t`: `0.0` where slot
+/// `s·PAGE_SLOTS + w·64 + c` is visible to query row `t`, and the f16 floor
+/// [`ATTN_SEED_FLOOR`] (the finite sentinel the carry's max seeds at — the format's own max, the
+/// kernels' clamp trick — a masked-everywhere row still normalizes with weight 0, never NaN)
+/// where it is not.
+///
+/// The validity law is the CHUNK's own ([`ChunkRows::row_logical_pos`]): row `t` of a chunk whose
+/// `real` genuine tokens sit at absolute positions `[start, start+real)` attends exactly the
+/// slots `≤ start + row_logical_pos(t, real)` — the causal triangle with the pad-row clamp. At
+/// `real == 1` (the fold's single decode row, `start` the write position) that is the decode law
+/// `slot ≤ start`, with the new token's own key VALID: the spliced bodies gather the whole
+/// history through the table, so unlike the door-era chunk there is no separately-read new block.
+pub fn spliced_attn_mask_f16(
+    region: SplicedAttnRegion,
+    rows: ChunkRows,
+    start: usize,
+    real: NonZeroU32,
+) -> Option<ValidityMask> {
+    if real.get() > region.mq.get() {
+        return None;
+    }
+    let real = real.get() as usize;
+    let w4 = region.w4() as usize;
+    if w4 == 0 {
+        return None;
+    }
+    let mq = region.mq.get() as usize;
+    let page_slots = PagedKvPool::PAGE_SLOTS;
+    let total = region.pages() as usize * w4 * mq;
+    let neg = ATTN_SEED_FLOOR.to_le_bytes();
+    let zero = half::f16::from_f32(0.0).to_le_bytes();
+    let mut m = Vec::with_capacity(total * 64 * 2);
+    let mut valid = Vec::with_capacity(total);
+    for r in 0..total {
+        // Row r is `(s·W4 + w)·mq + t` — the kernel's own load corner, decomposed once here.
+        let s = r / (w4 * mq);
+        let rem = r % (w4 * mq);
+        let (w, t) = (rem / mq, rem % mq);
+        let pos = start + rows.row_logical_pos(t, real);
+        let slot_base = s * page_slots + w * 64;
+        // The count is minted by the same loop that writes the bytes: the lanes `c` with
+        // `slot_base + c ≤ pos` are `0..=pos−slot_base`, so the count is that difference plus
+        // one, clamped to the row's 64 lanes — `ValidKeys` carries it out (the `l`-invariant's
+        // own number). Zero when the whole window is past `pos`.
+        let lanes = if pos < slot_base {
+            0
+        } else {
+            (pos - slot_base + 1).min(64)
+        };
+        valid.push(ValidKeys::of(lanes as u32)?);
+        for c in 0..64 {
+            let bytes = if slot_base + c <= pos { &zero } else { &neg };
+            m.extend_from_slice(bytes);
+        }
+    }
+    // One 64-lane window per row — this family's rows ARE windows, the pitch the counts above
+    // were minted at.
+    Some(ValidityMask {
+        bytes: m,
+        valid,
+        windows_per_row: NonZeroU32::MIN,
+    })
+}
+
+/// ⭐⭐⭐⭐⭐ THE BATCHED-DECODE FAMILY'S STEP-INPUT FACTS — what `batched_decode_hm` stated, as
+/// ONE value minted from the placements' own extents. The entry count is the vendor's index
+/// stick ([`CopyDims::ENTRIES_PER_OP`], the SenUint32 law), split into `BLOCKS_PER_CHUNK`
+/// chunk-slots per sequence; the chunk count is the KT ids slot's own extent divided by one
+/// chunk's table, so a bake/host disagreement about the chunking refuses here rather than
+/// staging real block numbers from the wrong layout.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SplicedDecodeBatch {
+    pool: PagedKvPool,
+    gqa: NonZeroU32,
+    num_seqs: NonZeroU32,
+    chunks: u32,
+}
+
+impl SplicedDecodeBatch {
+    /// ONE door — the KT ids slot's placement extent in bytes, the pool, the GQA group, and the
+    /// launch's row count. `None` when the entry stick does not split evenly over the sequences
+    /// (a batch width this family does not state), or the extent is not a whole number of chunk
+    /// tables.
+    pub fn of_ids_extent(
+        extent_bytes: u64,
+        pool: PagedKvPool,
+        gqa: NonZeroU32,
+        num_seqs: NonZeroU32,
+    ) -> Option<Self> {
+        let entries = CopyDims::ENTRIES_PER_OP;
+        if !entries.is_multiple_of(num_seqs.get()) {
+            return None;
+        }
+        let w4 = pool.windows_per_page()?;
+        let ktb = entries.checked_mul(pool.nkvh())?;
+        let per_chunk = u64::from(w4) * u64::from(ktb) * 4;
+        if per_chunk == 0 || !extent_bytes.is_multiple_of(per_chunk) {
+            return None;
+        }
+        let chunks = u32::try_from(extent_bytes / per_chunk).ok()?;
+        (chunks > 0).then_some(SplicedDecodeBatch {
+            pool,
+            gqa,
+            num_seqs,
+            chunks,
+        })
+    }
+
+    /// The chunk count the ids tables state.
+    pub const fn chunks(self) -> u32 {
+        self.chunks
+    }
+
+    /// The launch's row count — every sequence of the rung, padding rows included.
+    pub const fn num_seqs(self) -> NonZeroU32 {
+        self.num_seqs
+    }
+
+    fn entries(self) -> u32 {
+        CopyDims::ENTRIES_PER_OP
+    }
+
+    /// The chunk-slots one sequence holds per chunk — `ENTRIES / num_seqs`.
+    pub fn blocks_per_chunk(self) -> u32 {
+        self.entries() / self.num_seqs.get()
+    }
+
+    /// ⭐ THE FIRST WINDOW'S ROW COUNT, IN THE MASK'S OWN ROW ORDER — `ktb · gqa`, the rows of
+    /// chunk 0, window 0: every (sequence, kv head, group replica) exactly once, contiguous and
+    /// leading, which is what makes [`ValidityMask::first_window_valid_keys`]'s slice this
+    /// family's seed-safety reading. Stated as ONE door because the parts are the batch's own
+    /// private arithmetic — a caller re-deriving `ktb · gqa` from the pool and the group would be
+    /// a second spelling of this fact, free to disagree with the mask's row order. A product of
+    /// two non-zeros (`of_ids_extent` refuses a zero `per_chunk`, so `ktb ≥ 1`; `gqa` is
+    /// `NonZeroU32`), per the `QueryRows::total_rows` precedent.
+    pub fn first_window_rows(self) -> NonZeroU32 {
+        match NonZeroU32::new(self.ktb() * self.gqa.get()) {
+            Some(n) => n,
+            None => self.gqa, // unreachable: a product of two non-zeros
+        }
+    }
+
+    fn ktb(self) -> u32 {
+        self.entries() * self.pool.nkvh()
+    }
+
+    fn w4(self) -> u32 {
+        self.pool.windows_per_page().unwrap_or(0)
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ THE BATCHED-DECODE BLOCK-ENTRY TABLE — the index values in `batched_decode_hm`'s
+/// own read order: `[NUM_CHUNKS·W4·ENTRIES·NKVH]`, chunk-major, window-major within a chunk,
+/// entry-major within a window (entry `j·B + s`, then kv head). Stick `(c·W4 + w)`'s entry
+/// `(e, kvh)` names sequence `s`'s logical page `c·BLOCKS_PER_CHUNK + j` at the kv head's own
+/// block of that window.
+///
+/// `maps` is one page map per LAUNCH ROW in slot order — padding rows carry live 0's, the same
+/// maps the launch installed. A row's map shorter than the chunk count repeats its own last page
+/// (masked; never 0, which is a real address). `None` on a map count that is not the launch's
+/// row count, an empty map, or an entry the ceiling refuses.
+pub fn spliced_decode_ids_table(
+    batch: SplicedDecodeBatch,
+    maps: &[Vec<i64>],
+    ceiling: GatherEntryCeiling,
+) -> Option<Vec<GatherEntry>> {
+    if maps.len() != batch.num_seqs.get() as usize {
+        return None;
+    }
+    let (w4, ktb, bpc) = (batch.w4(), batch.ktb(), batch.blocks_per_chunk());
+    let nkvh = batch.pool.nkvh();
+    let seqs = batch.num_seqs.get();
+    let mut out = Vec::with_capacity(batch.chunks() as usize * w4 as usize * ktb as usize);
+    for c in 0..batch.chunks() {
+        for w in 0..w4 {
+            for b in 0..ktb {
+                // Entry b is (entry e, kv head) — entry-major, then kv head, the stick's own order.
+                let (e, kvh) = (b / nkvh, b % nkvh);
+                let (j, s) = (e / seqs, e % seqs);
+                let map = maps.get(s as usize)?;
+                let phys = map
+                    .get((c * bpc + j) as usize)
+                    .copied()
+                    .or_else(|| map.last().copied())?;
+                let block = batch.pool.block_in_page(kvh, w)?;
+                out.push(GatherEntry::of_page_block(ceiling, phys, block)?);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// ⭐⭐⭐⭐⭐ THE BATCHED-DECODE REPETITION TABLE — torch's own `rep_row_ids` values at the
+/// kernel's wire width: entry `(b, g)` of the `[BATCH·GQA]` frame names the Q row the
+/// pre-repeated buffer's row held, `(j·B+s)·NKVH·GQA + kvh·GQA + g → s·NKVH·GQA + kvh·GQA + g`.
+/// The entry order is the score tile's own — (chunk slot, sequence, kv head, group) — so the
+/// gather the kernel states pairs each score row with its request's query row.
+pub fn spliced_decode_rep_ids(batch: SplicedDecodeBatch) -> Vec<i32> {
+    let (ktb, gqa) = (batch.ktb(), batch.gqa.get());
+    let (nkvh, seqs) = (batch.pool.nkvh(), batch.num_seqs.get());
+    let mut out = Vec::with_capacity(ktb as usize * gqa as usize);
+    for b in 0..ktb {
+        let (e, kvh) = (b / nkvh, b % nkvh);
+        let (_, s) = (e / seqs, e % seqs);
+        for g in 0..gqa {
+            let row = (s * nkvh + kvh) * gqa + g;
+            out.push(row as i32);
+        }
+    }
+    out
+}
+
+/// ⭐⭐⭐⭐⭐ THE BATCHED-DECODE ADDITIVE MASK — `[NUM_CHUNKS·W4·BATCH·GQA, 64]` f16,
+/// PRE-REPLICATED xGQA to the score tile's own rows (the kernel adds it as a pure flat reshape,
+/// no broadcast): row `(c·W4 + w)·BATCH·GQA + b·GQA + g`, lane `cc`, is `0.0` where logical slot
+/// `(c·BPC + j)·PAGE_SLOTS + w·64 + cc` holds row `s`'s own key, the f16 floor
+/// [`ATTN_SEED_FLOOR`] elsewhere.
+///
+/// `hists` is one history per LAUNCH ROW in slot order (padding rows carry live 0's), and
+/// `write` is the batch's ONE shared write slot — every row's new key lands there this step, in
+/// its own page, so the slot is valid for every row that reads it back. `None` on a history
+/// count that is not the launch's row count. The rows carry their [`ValidKeys`] counts with the
+/// bytes (minted by the same loop) — this family's coverage is a placement fact, checked at
+/// mint, not a theorem of the constructor's own types like the chunk family's seed-safety law.
+pub fn spliced_decode_mask_f16(
+    batch: SplicedDecodeBatch,
+    hists: &[KvHistory],
+    write: BatchSlot,
+) -> Option<ValidityMask> {
+    if hists.len() != batch.num_seqs.get() as usize {
+        return None;
+    }
+    let (w4, ktb, bpc) = (batch.w4(), batch.ktb(), batch.blocks_per_chunk());
+    if w4 == 0 {
+        return None;
+    }
+    let (gqa, nkvh, seqs) = (batch.gqa.get(), batch.pool.nkvh(), batch.num_seqs.get());
+    let page_slots = PagedKvPool::PAGE_SLOTS;
+    let neg = ATTN_SEED_FLOOR.to_le_bytes();
+    let zero = half::f16::from_f32(0.0).to_le_bytes();
+    let rows = batch.chunks() as usize * w4 as usize * ktb as usize * gqa as usize;
+    let mut m = Vec::with_capacity(rows * 64 * 2);
+    let mut valid = Vec::with_capacity(rows);
+    for c in 0..batch.chunks() {
+        for w in 0..w4 {
+            for b in 0..ktb {
+                // Entry b is (entry e, kv head); entry e is (chunk slot j, sequence s) — the
+                // stick's own order, decomposed once for the history and the logical page both.
+                let (e, _) = (b / nkvh, b % nkvh);
+                let (j, s) = (e / seqs, e % seqs);
+                let hist = &hists[s as usize];
+                // The g-lanes are pre-replicated — identical bytes per group — so the loop
+                // states the tile's own row count, not new facts.
+                for _g in 0..gqa {
+                    let slot_base = (c * bpc + j) as usize * page_slots + w as usize * 64;
+                    let mut lanes = 0u32;
+                    for cc in 0..64 {
+                        let slot = slot_base + cc;
+                        if hist.contains(slot) || slot == write.get() as usize {
+                            lanes += 1;
+                            m.extend_from_slice(&zero);
+                        } else {
+                            m.extend_from_slice(&neg);
+                        }
+                    }
+                    valid.push(ValidKeys::of(lanes)?);
+                }
+            }
+        }
+    }
+    // One 64-lane window per row — the pre-replicated rows ARE windows, the pitch the counts
+    // above were minted at.
+    Some(ValidityMask {
+        bytes: m,
+        valid,
+        windows_per_row: NonZeroU32::MIN,
+    })
 }
 
 #[cfg(kani)]

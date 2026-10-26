@@ -15,11 +15,14 @@
 //! frontend's share of LX (`FRONTEND_LX_END`), which refuses the 48-, 56- and 64-page rungs.
 
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::attn::chunk_prob_pins;
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{assemble_attn, assemble_rmsnorm};
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{
+    AttnFacts, RmsnormFacts, assemble_attn, assemble_rmsnorm,
+};
 use ktir_superdsc::place::{PlaceId, SynthRole};
 use ktir_superdsc::placement::{BundleLayout, LX_PIN_BASE, LX_PIN_END, SegRole, TensorPlacement};
 use ktir_superdsc::sdsc_abstract::{
-    AttnGeometry, ChunkRowKind, ChunkScratch, PagedKvPool, QGroupBlock, attn_bundle_rows,
+    AttnGeometry, ChunkRowKind, ChunkScratch, KvExtent, PagedKvPool, QGroupBlock, SlotCount,
+    attn_bundle_rows,
 };
 
 const NQH: u32 = 32;
@@ -27,10 +30,12 @@ const NKVH: u32 = 8;
 const HD: u32 = 128;
 const NSLAB: u32 = 2;
 const CAP: u32 = 256;
+/// The storage/sweep pair on the boundary's one carrier — the sweep is the full cap (no rung).
+const EXTENT: KvExtent = KvExtent::new(SlotCount::new(CAP), SlotCount::new(CAP));
 const ENTRY_BYTES: u64 = HD as u64 * 64 * 2;
 
 fn pool() -> PagedKvPool {
-    PagedKvPool::new(NKVH as usize, HD as usize)
+    PagedKvPool::new(NKVH, HD)
 }
 
 /// The names-and-placements half of [`emit`]: the layout every hd128 emission in this file
@@ -60,6 +65,7 @@ fn hd_layout() -> (BundleLayout, Vec<String>) {
                 bank: 0,
                 offset: (i as u64) << 30,
                 size: 1 << 30,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
     }
@@ -80,23 +86,24 @@ fn emit_chunk(
     let chunk = ChunkScratch::of_chunk(pool(), pages).expect("a chunk granite-8b admits");
     let mut sym = 0i64;
     assemble_attn(
-        0,
-        geom,
-        rows,
-        CAP,
-        CAP,
-        &names[0],
-        &names[1],
-        &names[2],
-        &names[3],
-        &names[4],
-        &names[5],
-        &names[6],
-        Some(&names[7]),
-        Some(chunk),
-        PlaceId::Act(900),
-        false,
-        false,
+        AttnFacts {
+            t: 0,
+            geom,
+            bundle_rows: rows,
+            extent: EXTENT,
+            qs: &names[0],
+            new_k_scaled: &names[1],
+            new_v: &names[2],
+            kct: &names[3],
+            vc: &names[4],
+            pmask: &names[5],
+            cmask: &names[6],
+            kv_block_index: Some(&names[7]),
+            chunk: Some(chunk),
+            out_id: PlaceId::Act(900),
+            rows_are_requests: false,
+            headmajor_handoff: false,
+        },
         &mut sym,
         Some(layout),
     )
@@ -338,19 +345,22 @@ fn a_trailing_norms_slot_still_bounds_the_chunk_that_precedes_it() {
                     bank: 0,
                     offset: 40 << 30,
                     size,
+                    cover: ktir_superdsc::placement::BindCover::Full,
                 },
             );
         }
         let mut declare_syms = 0i64;
         let _ = assemble_rmsnorm(
-            "tail",
-            rows,
-            576,
-            &names[0],
-            &names[1],
-            PlaceId::Act(901),
-            "t902",
-            None,
+            RmsnormFacts {
+                prefix: "tail",
+                rows,
+                cols: 576,
+                x: &names[0],
+                gamma: &names[1],
+                out_id: PlaceId::Act(901),
+                eps_const: "t902",
+                ones_const: None,
+            },
             &mut declare_syms,
             Some(&l),
         );
@@ -379,14 +389,16 @@ fn a_trailing_norms_slot_still_bounds_the_chunk_that_precedes_it() {
     let pins_before = l_at.lx_op_local_pins();
     let mut real_syms = 0i64;
     let tail = assemble_rmsnorm(
-        "tail",
-        2438,
-        576,
-        &names_at[0],
-        &names_at[1],
-        PlaceId::Act(901),
-        "t902",
-        None,
+        RmsnormFacts {
+            prefix: "tail",
+            rows: 2438,
+            cols: 576,
+            x: &names_at[0],
+            gamma: &names_at[1],
+            out_id: PlaceId::Act(901),
+            eps_const: "t902",
+            ones_const: None,
+        },
         &mut real_syms,
         Some(&l_at),
     );
@@ -540,7 +552,10 @@ fn every_hd128_lx_copy_and_its_consumer_meet_at_one_pin() {
 /// head, page, block) exactly once, and each copy reads its own stick of the table.
 #[test]
 fn the_hd128_lx_table_is_each_legs_part_major_run() {
-    let per_page = ktir_superdsc::sdsc_abstract::gather_entries_per_page(
+    // The pool's own ceiling — 64 pages of budget, the ladder's own top (PAGES_MAX), so every
+    // rung below names only pages it holds.
+    let ceiling = ktir_superdsc::sdsc_abstract::gather_entry_ceiling(
+        64,
         32 * pool().stick_block_bytes(),
         pool(),
     )
@@ -617,7 +632,7 @@ fn the_hd128_lx_table_is_each_legs_part_major_run() {
             chunk,
             ChunkRowKind::OneRequest,
             &pages,
-            per_page,
+            ceiling,
             0,
             0,
         )
@@ -625,7 +640,7 @@ fn the_hd128_lx_table_is_each_legs_part_major_run() {
         assert_eq!(table.len() as u32, 2 * n, "{j} page(s)");
         let word = |(kvh, page, block): (u32, u32, u32)| {
             ktir_superdsc::sdsc_abstract::GatherEntry::of_page_block(
-                per_page,
+                ceiling,
                 i64::from(page),
                 chunk.source_block(kvh, block).unwrap(),
             )

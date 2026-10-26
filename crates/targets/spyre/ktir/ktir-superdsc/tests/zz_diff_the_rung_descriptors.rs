@@ -35,8 +35,10 @@
 //! measured a different op. This one calls `assemble_attn` itself, so whatever it reports is what the
 //! bundle actually contains.
 
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
-use ktir_superdsc::sdsc_abstract::{AttnGeometry, DxGroupCeiling, attn_bundle_rows};
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{AttnFacts, assemble_attn};
+use ktir_superdsc::sdsc_abstract::{
+    AttnGeometry, DxGroupCeiling, KvExtent, SlotCount, attn_bundle_rows,
+};
 
 /// granite-3.1-2b: 32 query heads, 8 kv heads, head dim 64 — the model every card number above is from.
 const NQH: u32 = 32;
@@ -45,6 +47,8 @@ const HD: u32 = 64;
 /// The resident context the decode bundles are baked for, and the swept extent per fold pass.
 const CAP: u32 = 256;
 const ACTIVE_CAP: u32 = 256;
+/// The storage/sweep pair on the boundary's one carrier — the rung this file's bodies sweep.
+const EXTENT: KvExtent = KvExtent::new(SlotCount::new(CAP), SlotCount::new(ACTIVE_CAP));
 
 /// One emitted op's identity plus the three fields `attn.rs` says to diff, per operand.
 #[derive(Debug, PartialEq, Eq)]
@@ -84,23 +88,24 @@ fn emit_at(mq: u32) -> Vec<OpFields> {
         attn_bundle_rows(geom, mq, true).unwrap_or_else(|| panic!("mq={mq} is not a baked rung"));
     let mut sym = 0i64;
     let ops = assemble_attn(
-        0,
-        geom,
-        bundle_rows,
-        CAP,
-        ACTIVE_CAP,
-        "t_qs",
-        "t_new_k",
-        "t_new_v",
-        "t_kct",
-        "t_vc",
-        "t_pmask",
-        "t_cmask",
-        None,
-        None,
-        ktir_superdsc::place::PlaceId::Act(900),
-        true,
-        false,
+        AttnFacts {
+            t: 0,
+            geom,
+            bundle_rows,
+            extent: EXTENT,
+            qs: "t_qs",
+            new_k_scaled: "t_new_k",
+            new_v: "t_new_v",
+            kct: "t_kct",
+            vc: "t_vc",
+            pmask: "t_pmask",
+            cmask: "t_cmask",
+            kv_block_index: None,
+            chunk: None,
+            out_id: ktir_superdsc::place::PlaceId::Act(900),
+            rows_are_requests: true,
+            headmajor_handoff: false,
+        },
         &mut sym,
         None,
     )
@@ -225,23 +230,24 @@ fn the_start_address_extractor_sees_real_values() {
     let bundle_rows = attn_bundle_rows(geom, 8, true).expect("rung 8");
     let mut sym = 0i64;
     let ops = assemble_attn(
-        0,
-        geom,
-        bundle_rows,
-        CAP,
-        ACTIVE_CAP,
-        "t_qs",
-        "t_new_k",
-        "t_new_v",
-        "t_kct",
-        "t_vc",
-        "t_pmask",
-        "t_cmask",
-        None,
-        None,
-        ktir_superdsc::place::PlaceId::Act(900),
-        true,
-        false,
+        AttnFacts {
+            t: 0,
+            geom,
+            bundle_rows,
+            extent: EXTENT,
+            qs: "t_qs",
+            new_k_scaled: "t_new_k",
+            new_v: "t_new_v",
+            kct: "t_kct",
+            vc: "t_vc",
+            pmask: "t_pmask",
+            cmask: "t_cmask",
+            kv_block_index: None,
+            chunk: None,
+            out_id: ktir_superdsc::place::PlaceId::Act(900),
+            rows_are_requests: true,
+            headmajor_handoff: false,
+        },
         &mut sym,
         None,
     )
@@ -279,23 +285,24 @@ fn dump_the_score_node_for_stride_comparison() {
         let bundle_rows = attn_bundle_rows(geom, mq, true).expect("a baked rung");
         let mut sym = 0i64;
         let ops = assemble_attn(
-            0,
-            geom,
-            bundle_rows,
-            CAP,
-            ACTIVE_CAP,
-            "t_qs",
-            "t_new_k",
-            "t_new_v",
-            "t_kct",
-            "t_vc",
-            "t_pmask",
-            "t_cmask",
-            None,
-            None,
-            ktir_superdsc::place::PlaceId::Act(900),
-            true,
-            false,
+            AttnFacts {
+                t: 0,
+                geom,
+                bundle_rows,
+                extent: EXTENT,
+                qs: "t_qs",
+                new_k_scaled: "t_new_k",
+                new_v: "t_new_v",
+                kct: "t_kct",
+                vc: "t_vc",
+                pmask: "t_pmask",
+                cmask: "t_cmask",
+                kv_block_index: None,
+                chunk: None,
+                out_id: ktir_superdsc::place::PlaceId::Act(900),
+                rows_are_requests: true,
+                headmajor_handoff: false,
+            },
             &mut sym,
             None,
         )
@@ -339,23 +346,24 @@ fn what_skip_addr_the_gathered_score_leg_would_get() {
     let bundle_rows = attn_bundle_rows(geom, 8, true).expect("rung 8");
     let mut sym = 0i64;
     let ops = assemble_attn(
-        0,
-        geom,
-        bundle_rows,
-        CAP,
-        ACTIVE_CAP,
-        "t_qs",
-        "t_new_k",
-        "t_new_v",
-        "t_kct",
-        "t_vc",
-        "t_pmask",
-        "t_cmask",
-        None,
-        None,
-        ktir_superdsc::place::PlaceId::Act(900),
-        true,
-        false,
+        AttnFacts {
+            t: 0,
+            geom,
+            bundle_rows,
+            extent: EXTENT,
+            qs: "t_qs",
+            new_k_scaled: "t_new_k",
+            new_v: "t_new_v",
+            kct: "t_kct",
+            vc: "t_vc",
+            pmask: "t_pmask",
+            cmask: "t_cmask",
+            kv_block_index: None,
+            chunk: None,
+            out_id: ktir_superdsc::place::PlaceId::Act(900),
+            rows_are_requests: true,
+            headmajor_handoff: false,
+        },
         &mut sym,
         None,
     )
@@ -568,23 +576,24 @@ fn doubling_the_rung_doubles_the_per_core_row_fold() {
         let bundle_rows = attn_bundle_rows(geom, mq, true).expect("a baked rung");
         let mut sym = 0i64;
         let ops = assemble_attn(
-            0,
-            geom,
-            bundle_rows,
-            CAP,
-            ACTIVE_CAP,
-            "t_qs",
-            "t_new_k",
-            "t_new_v",
-            "t_kct",
-            "t_vc",
-            "t_pmask",
-            "t_cmask",
-            None,
-            None,
-            ktir_superdsc::place::PlaceId::Act(900),
-            true,
-            false,
+            AttnFacts {
+                t: 0,
+                geom,
+                bundle_rows,
+                extent: EXTENT,
+                qs: "t_qs",
+                new_k_scaled: "t_new_k",
+                new_v: "t_new_v",
+                kct: "t_kct",
+                vc: "t_vc",
+                pmask: "t_pmask",
+                cmask: "t_cmask",
+                kv_block_index: None,
+                chunk: None,
+                out_id: ktir_superdsc::place::PlaceId::Act(900),
+                rows_are_requests: true,
+                headmajor_handoff: false,
+            },
             &mut sym,
             None,
         )
@@ -651,24 +660,25 @@ fn the_shipped_gathered_fold_carries_the_gather_only_on_the_kernel_less_copies()
     let bundle_rows = attn_bundle_rows(geom, 8, true).expect("rung 8");
     let mut sym = 0i64;
     let ops = assemble_attn(
-        0,
-        geom,
-        bundle_rows,
-        CAP,
-        ACTIVE_CAP,
-        "t_qs",
-        "t_new_k",
-        "t_new_v",
-        "t_kct",
-        "t_vc",
-        "t_pmask",
-        "t_cmask",
-        // The name the caller passes — the reserved tid's own spelling.
-        Some("t4294967175"),
-        None,
-        ktir_superdsc::place::PlaceId::Act(900),
-        true,
-        false,
+        AttnFacts {
+            t: 0,
+            geom,
+            bundle_rows,
+            extent: EXTENT,
+            qs: "t_qs",
+            new_k_scaled: "t_new_k",
+            new_v: "t_new_v",
+            kct: "t_kct",
+            vc: "t_vc",
+            pmask: "t_pmask",
+            cmask: "t_cmask",
+            // The name the caller passes — the reserved tid's own spelling.
+            kv_block_index: Some("t4294967175"),
+            chunk: None,
+            out_id: ktir_superdsc::place::PlaceId::Act(900),
+            rows_are_requests: true,
+            headmajor_handoff: false,
+        },
         &mut sym,
         None,
     )
@@ -777,7 +787,7 @@ fn the_shipped_gathered_fold_carries_the_gather_only_on_the_kernel_less_copies()
     // index stick at any rung the ladder admits, which is why the `rows / 32` split that used to produce
     // 16 ops here is gone rather than merely satisfied. Still derived from the geometry, not written down.
     let scratch = ktir_superdsc::sdsc_abstract::PageScratch::of_pass(
-        ktir_superdsc::sdsc_abstract::PagedKvPool::new(NKVH as usize, HD as usize),
+        ktir_superdsc::sdsc_abstract::PagedKvPool::new(NKVH, HD),
         ktir_superdsc::sdsc_abstract::QueryRowCount::of_mq(8),
     )
     .expect("this geometry admits the page gather");
@@ -870,23 +880,25 @@ fn every_run_of_the_cut_pass_addresses_its_own_entries_and_rows() {
     let bundle_rows = attn_bundle_rows(geom, 8, true).expect("rung 8");
     let mut sym = 0i64;
     let ops = assemble_attn(
-        0,
-        geom,
-        bundle_rows,
-        CAP,
-        128,
-        "t_qs",
-        "t_new_k",
-        "t_new_v",
-        "t_kct",
-        "t_vc",
-        "t_pmask",
-        "t_cmask",
-        Some("t4294967175"),
-        None,
-        ktir_superdsc::place::PlaceId::Act(900),
-        true,
-        false,
+        AttnFacts {
+            t: 0,
+            geom,
+            bundle_rows,
+            // The rung-8 body: the sweep is 128, not this file's `ACTIVE_CAP` rung.
+            extent: KvExtent::new(SlotCount::new(CAP), SlotCount::new(128)),
+            qs: "t_qs",
+            new_k_scaled: "t_new_k",
+            new_v: "t_new_v",
+            kct: "t_kct",
+            vc: "t_vc",
+            pmask: "t_pmask",
+            cmask: "t_cmask",
+            kv_block_index: Some("t4294967175"),
+            chunk: None,
+            out_id: ktir_superdsc::place::PlaceId::Act(900),
+            rows_are_requests: true,
+            headmajor_handoff: false,
+        },
         &mut sym,
         None,
     )
@@ -995,23 +1007,24 @@ fn the_ungathered_shipped_prefix_fold_still_emits() {
     let bundle_rows = attn_bundle_rows(geom, 8, true).expect("rung 8");
     let mut sym = 0i64;
     let ops = assemble_attn(
-        0,
-        geom,
-        bundle_rows,
-        CAP,
-        ACTIVE_CAP,
-        "t_qs",
-        "t_new_k",
-        "t_new_v",
-        "t_kct",
-        "t_vc",
-        "t_pmask",
-        "t_cmask",
-        None,
-        None,
-        ktir_superdsc::place::PlaceId::Act(900),
-        true,
-        false,
+        AttnFacts {
+            t: 0,
+            geom,
+            bundle_rows,
+            extent: EXTENT,
+            qs: "t_qs",
+            new_k_scaled: "t_new_k",
+            new_v: "t_new_v",
+            kct: "t_kct",
+            vc: "t_vc",
+            pmask: "t_pmask",
+            cmask: "t_cmask",
+            kv_block_index: None,
+            chunk: None,
+            out_id: ktir_superdsc::place::PlaceId::Act(900),
+            rows_are_requests: true,
+            headmajor_handoff: false,
+        },
         &mut sym,
         None,
     )

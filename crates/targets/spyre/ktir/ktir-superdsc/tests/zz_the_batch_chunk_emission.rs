@@ -2,13 +2,15 @@
 //! The split-KV chunk over a decode BATCH (`BatchChunk`): the emission from the shipped `assemble_attn`
 //! at granite-3.1-2b's and granite-3.1-8b's geometries, and the host law its mask and index are staged by.
 
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{AttnFacts, assemble_attn};
 use ktir_superdsc::sdsc_abstract::{
-    AttnGeometry, BatchChunk, ChunkScratch, KvHistory, PagedKvPool, StickLayout, attn_bundle_rows,
-    batch_chunk_mask_f16,
+    AttnGeometry, BatchChunk, ChunkScratch, KvExtent, KvHistory, PagedKvPool, SlotCount,
+    StickLayout, attn_bundle_rows, batch_chunk_empty_sweep_row, batch_chunk_mask_f16,
 };
 
 const CAP: u32 = 256;
+/// The storage/sweep pair on the boundary's one carrier — the sweep is the full cap (no rung).
+const EXTENT: KvExtent = KvExtent::new(SlotCount::new(CAP), SlotCount::new(CAP));
 
 fn named(ops: Vec<ktir_superdsc::emit::EmittedOp>) -> Vec<(String, serde_json::Value)> {
     ops.iter()
@@ -30,27 +32,28 @@ fn emit_batch<const NQH: u32, const NKVH: u32, const HD: u32>(
 ) -> Vec<ktir_superdsc::emit::EmittedOp> {
     let geom = AttnGeometry::<NQH, NKVH, HD>::minted();
     let rows = attn_bundle_rows(geom, seqs, true).expect("a decode batch rung");
-    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, HD as usize), pages)
+    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH, HD), pages)
         .expect("a chunk the geometry admits");
     let mut sym = 0i64;
     assemble_attn(
-        0,
-        geom,
-        rows,
-        CAP,
-        CAP,
-        "t_qs",
-        "t_new_k",
-        "t_new_v",
-        "t_kct",
-        "t_vc",
-        "t_pmask",
-        "t_cmask",
-        Some("t_kvbi"),
-        Some(chunk),
-        ktir_superdsc::place::PlaceId::Act(900),
-        true,
-        false,
+        AttnFacts {
+            t: 0,
+            geom,
+            bundle_rows: rows,
+            extent: EXTENT,
+            qs: "t_qs",
+            new_k_scaled: "t_new_k",
+            new_v: "t_new_v",
+            kct: "t_kct",
+            vc: "t_vc",
+            pmask: "t_pmask",
+            cmask: "t_cmask",
+            kv_block_index: Some("t_kvbi"),
+            chunk: Some(chunk),
+            out_id: ktir_superdsc::place::PlaceId::Act(900),
+            rows_are_requests: true,
+            headmajor_handoff: false,
+        },
         &mut sym,
         None,
     )
@@ -229,23 +232,24 @@ fn the_one_request_chunk_keeps_its_broadcast_mask_row() {
     let mut sym = 0i64;
     let ops = named(
         assemble_attn(
-            0,
-            geom,
-            rows,
-            CAP,
-            CAP,
-            "t_qs",
-            "t_new_k",
-            "t_new_v",
-            "t_kct",
-            "t_vc",
-            "t_pmask",
-            "t_cmask",
-            Some("t_kvbi"),
-            Some(chunk),
-            ktir_superdsc::place::PlaceId::Act(900),
-            false,
-            false,
+            AttnFacts {
+                t: 0,
+                geom,
+                bundle_rows: rows,
+                extent: EXTENT,
+                qs: "t_qs",
+                new_k_scaled: "t_new_k",
+                new_v: "t_new_v",
+                kct: "t_kct",
+                vc: "t_vc",
+                pmask: "t_pmask",
+                cmask: "t_cmask",
+                kv_block_index: Some("t_kvbi"),
+                chunk: Some(chunk),
+                out_id: ktir_superdsc::place::PlaceId::Act(900),
+                rows_are_requests: false,
+                headmajor_handoff: false,
+            },
             &mut sym,
             None,
         )
@@ -347,13 +351,18 @@ fn the_batch_mask_validates_each_row_on_its_own_requests_history_alone() {
         },
         KvHistory::contiguous(10),
     ];
-    let m = batch_chunk_mask_f16(bc, &hists, -100.0).expect("one history per request row");
+    let mask = batch_chunk_mask_f16(bc, &hists, -100.0).expect("one history per request row");
+    let m = mask.wire_bytes();
     assert_eq!(m.len(), bc.mask_elems() * 2);
     let valid = |row: u32, slot: u32| {
         let e = bc.mask_elem(row, slot).expect("in the block");
         half::f16::from_le_bytes([m[e * 2], m[e * 2 + 1]]).to_f32() == 0.0
     };
     let per = j * 256;
+    // ⭐ THE TALLIES ARE THE BYTES' OWN VALIDITY — derived independently of the minter's runs
+    // walk, at the minter's own (row, 64-lane slab) pitch; every count must agree.
+    let slabs = bc.mask_cols() as usize / 64;
+    let mut tallies = vec![0u32; bc.mask_rows() as usize * slabs];
     for row in 0..bc.mask_rows() {
         let r = row % seqs;
         for slot in 0..bc.mask_cols() {
@@ -365,9 +374,59 @@ fn the_batch_mask_validates_each_row_on_its_own_requests_history_alone() {
                 "row {row} (request {r}) at slot {slot} (request {owner}, local {local})"
             );
             assert!(local < per);
+            if want {
+                tallies[row as usize * slabs + slot as usize / 64] += 1;
+            }
         }
     }
+    for (flat, &t) in tallies.iter().enumerate() {
+        assert_eq!(
+            mask.window_valid(flat / slabs, flat % slabs).get(),
+            t,
+            "flat window-row {flat}: the count must be the bytes' own validity, minted by the \
+             same runs walk that wrote them"
+        );
+    }
     assert!(batch_chunk_mask_f16(bc, &hists[..3], -100.0).is_none());
+}
+
+/// ⭐⭐⭐ THE SWEEP READING at the chunk family's own door: a row whose whole slab sweep is empty
+/// is a request that holds none of its own run's slots — the never-prefilled desync the fold's
+/// `l` would normalize, because the row's `m` never rises past the sentinel seed to expunge it.
+/// A healthy batch sweeps one on every row; the named row maps to its request by the chunk's
+/// own law door.
+#[test]
+fn the_chunk_family_names_an_empty_sweep_row() {
+    let (seqs, j) = (4u32, 3u32);
+    let chunk = ChunkScratch::of_chunk(pool_2b(), seqs * j).expect("admitted");
+    let bc = BatchChunk::of(chunk, seqs, 4).expect("a whole number of pages per request");
+    let healthy = vec![
+        KvHistory::contiguous(10),
+        KvHistory::contiguous(256),
+        KvHistory::contiguous(5),
+        KvHistory::contiguous(10),
+    ];
+    let m = batch_chunk_mask_f16(bc, &healthy, -100.0).expect("one history per request row");
+    assert_eq!(
+        batch_chunk_empty_sweep_row(&m),
+        None,
+        "a batch whose every request holds a slot must sweep one on every row"
+    );
+    // Request 1's history is EMPTY — no run, no shared slot — so every row `i % B == 1`
+    // sweeps nothing, and the first of them is named.
+    let starved = vec![
+        KvHistory::contiguous(10),
+        KvHistory::contiguous(0),
+        KvHistory::contiguous(5),
+        KvHistory::contiguous(10),
+    ];
+    let m = batch_chunk_mask_f16(bc, &starved, -100.0).expect("one history per request row");
+    let row = batch_chunk_empty_sweep_row(&m).expect("request 1's rows sweep nothing");
+    assert_eq!(
+        bc.row_request(row),
+        1,
+        "the named row {row} must be request 1's"
+    );
 }
 
 /// ⭐ THE PAGE LIST LAYS EACH REQUEST's OWN MAP AT `J` PAGES, padding a short map with ITS OWN last page
@@ -423,6 +482,7 @@ fn a_batch_chunk_mask_past_its_placement_is_refused_at_bake() {
                     offset: (i as u64) << 30,
                     // tid 6 is the prefix mask (`names[5]` below).
                     size: if tid == 6 { mask_bytes } else { 1 << 30 },
+                    cover: ktir_superdsc::placement::BindCover::Full,
                 },
             );
         }
@@ -430,23 +490,24 @@ fn a_batch_chunk_mask_past_its_placement_is_refused_at_bake() {
         let rows = attn_bundle_rows(geom, seqs, true).expect("a decode batch rung");
         let mut sym = 0i64;
         assemble_attn(
-            0,
-            geom,
-            rows,
-            CAP,
-            CAP,
-            &names[0],
-            &names[1],
-            &names[2],
-            &names[3],
-            &names[4],
-            &names[5],
-            &names[6],
-            Some(&names[7]),
-            Some(chunk),
-            PlaceId::Act(900),
-            true,
-            false,
+            AttnFacts {
+                t: 0,
+                geom,
+                bundle_rows: rows,
+                extent: EXTENT,
+                qs: &names[0],
+                new_k_scaled: &names[1],
+                new_v: &names[2],
+                kct: &names[3],
+                vc: &names[4],
+                pmask: &names[5],
+                cmask: &names[6],
+                kv_block_index: Some(&names[7]),
+                chunk: Some(chunk),
+                out_id: PlaceId::Act(900),
+                rows_are_requests: true,
+                headmajor_handoff: false,
+            },
             &mut sym,
             Some(&layout),
         )

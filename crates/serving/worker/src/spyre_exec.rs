@@ -789,6 +789,11 @@ impl Worker for SpyreWorker {
                     hidden: model.hidden,
                     vocab: model.vocab,
                 };
+                // The pool geometry the entry factor needs — the model's own stored pool
+                // (its field doc carries why no other pool value can stand in). A FIELD
+                // read, a disjoint path from the session's `&mut` below — the `&self` door
+                // this replaced shared the whole model and could not live under it.
+                let pool = model.pool;
                 let SendnnSession::SuperDsc(sb) = &mut model.session;
                 // The pool's owner split, once for this launch — the same derivation the host's block
                 // count came from, so a derived page map cannot name a block the host may also hand out.
@@ -814,12 +819,6 @@ impl Worker for SpyreWorker {
                 // live context length. So it is asked BELOW — once, of the session, after the page maps
                 // are installed (the selector reads `fold_requests` off them) and from the same write
                 // slot the launch is given. See `SuperDscSession::step_body`.
-                // The pool geometry the entry factor needs. `head_dim` decides the entry SIZE
-                // (`hd * 64` elements), so this is not interchangeable with any other pool value.
-                let pool = scratchy_subtile::sdsc_abstract::PagedKvPool::new(
-                    model.kv_dim / model.head_dim,
-                    model.head_dim,
-                );
                 // WHICH RUNG IS ACTUALLY RUNNING, and how much of it is padding. A rung that failed
                 // to build at startup is logged and skipped, and the selection then lands on the next
                 // WIDER one — 8 live requests running the 16-row bundle is twice the rows for the
@@ -1118,7 +1117,7 @@ impl Worker for SpyreWorker {
                             // keyed the batch chunk's row blocks on the program's own `nqh / nkvh`,
                             // and `pool` is the one spelling of `nkvh` this function holds (the
                             // model's own two numbers).
-                            (nqh / pool.nkvh.max(1)) as u32,
+                            nqh as u32 / pool.nkvh().max(1),
                         )
                     })
                     .ok_or_else(|| {
@@ -1320,7 +1319,7 @@ impl Worker for SpyreWorker {
                 // row 0's keys — fluent and wrong, which is the corruption this path exists to remove.
                 let kv_blocks: Option<Vec<scratchy_subtile::sdsc_abstract::GatherEntry>> =
                     if bake_gathers_kv && batch_chunk.is_none() {
-                        let per_page = sess.gather_entries_per_page(pool).ok_or_else(|| {
+                        let ceiling = sess.gather_entry_ceiling(pool).ok_or_else(|| {
                         werr(
                             "decode batch: this bundle emits a GATHERED KV read, but a physical page \
                              is not a whole number of STICK BLOCKS — no integer index can name a page \
@@ -1370,7 +1369,7 @@ impl Worker for SpyreWorker {
                             scratch,
                             &page_maps,
                             max_pages,
-                            per_page,
+                            ceiling,
                             pass_stride,
                         )
                         .ok_or_else(|| {
@@ -1398,6 +1397,7 @@ impl Worker for SpyreWorker {
                             // ⛔ THE UNIT IS THE STICK BLOCK, AND IT IS THE POOL'S OWN NUMBER. `per_page`
                             // is `page_stride_bytes / stick_block_bytes` and `skip_addr` is one stick
                             // block, so `entry * stick_block_bytes` IS the byte the card computes —
+                            // read through the ceiling's own `per_page()` door, never re-derived here —
                             // converting with any other unit would mis-report the reach by `nkvh *
                             // PAGE_SLOTS / POOL_STICK` (32× at the shipped 2b geometry). A diagnostic
                             // that mis-reports an address is worse than none: this is the one print that
@@ -1416,10 +1416,10 @@ impl Worker for SpyreWorker {
                                     scratch.entries_per_row(),
                                     pass_stride.get(),
                                     max_pages,
-                                    per_page.get(),
+                                    ceiling.per_page().get(),
                                     scratch.rows(),
                                     hi as i64 * stick,
-                                    per_page.get() * stick,
+                                    ceiling.per_page().get() * stick,
                                     page_maps.len(),
                                     mask_shape.rep_stride_bytes(),
                                     table.len() * 4,
@@ -1435,7 +1435,7 @@ impl Worker for SpyreWorker {
                 // session's, exactly as for the fold's table above.
                 let kv_blocks = match batch_chunk {
                     Some(bc) => {
-                        let per_page = sess.gather_entries_per_page(pool).ok_or_else(|| {
+                        let ceiling = sess.gather_entry_ceiling(pool).ok_or_else(|| {
                             werr(
                                 "decode batch: this body gathers its chunk, but a physical page is not \
                                  a whole number of STICK BLOCKS — no integer index can name a page \
@@ -1445,7 +1445,7 @@ impl Worker for SpyreWorker {
                         })?;
                         Some(
                             scratchy_subtile::sdsc_abstract::batch_chunk_index_table(
-                                bc, &page_maps, per_page, step.lx_op_local_bytes(),
+                                bc, &page_maps, ceiling, step.lx_op_local_bytes(),
                                 step.lx_prob_pin_bytes(),
                             )
                             .ok_or_else(|| {
@@ -1469,6 +1469,34 @@ impl Worker for SpyreWorker {
                     Some(bc) => scratchy_subtile::sdsc_abstract::BatchPrefix::Chunk(bc),
                     None => scratchy_subtile::sdsc_abstract::BatchPrefix::Fold(fold),
                 };
+                // ⭐⭐⭐⭐⭐ THE SPLICE'S OWN STEP INPUTS — the batched decode kernel's block-entry
+                // tables, repetition table and pre-replicated mask, staged through the ONE fill
+                // helper (the same call the prompt chunk and the solo decode make). The rows are
+                // the LAUNCH's — padding rows replicate live 0's map and history, the same law the
+                // door-era tables stage by — and `write_slot` is the batch's one shared write slot,
+                // where every row's new key lands. The dead `KV_BLOCK_INDEX_TID` tables above stay
+                // on purpose until the card proves the fill; deleting them is the no-host-fallback
+                // proof, its own commit.
+                let attn_rows = rows_in.launch_rows(&toks, seqs).ok_or_else(|| {
+                    werr(format!(
+                        "decode batch: {} live row(s) and {} token(s) do not lay into the \
+                         {}-row rung the spliced step inputs stage for",
+                        rows_in.live(),
+                        toks.len(),
+                        seqs.count()
+                    ))
+                })?;
+                fill_attn_step_inputs(
+                    "decode batch",
+                    sess,
+                    pool,
+                    nqh as u32,
+                    AttnStepRows::Batch {
+                        rows: attn_rows,
+                        maps: &page_maps,
+                        write: write_slot,
+                    },
+                )?;
                 let rows = run_prefill_batch(
                     Some((&rows_in, prefix)),
                     kv_blocks.as_deref(),

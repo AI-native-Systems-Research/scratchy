@@ -1554,6 +1554,69 @@ impl Semantic {
         ))
     }
 
+    /// `desc.scatter(value, x_offsets, y_offset)` -> `tt.descriptor_scatter`: the store twin of
+    /// [`Self::descriptor_gather`], held to the same descriptor laws (2-D, one-row block, an
+    /// int16/int32 1-D index of at least 8 rows) plus the value's own shape, `[len(x), cols]`.
+    pub fn descriptor_scatter(
+        &mut self,
+        desc: ValueId,
+        value: ValueId,
+        x_offsets: ValueId,
+        y_offset: ValueId,
+    ) -> Result<()> {
+        let dty = self.ty(desc).clone();
+        let (block, elem) = match &dty {
+            Type::TensorDesc(s, e) => (s.clone(), (**e).clone()),
+            other => {
+                return Err(Error::new(
+                    format!("`.scatter` needs a tensor descriptor, got {other}"),
+                    0,
+                    0,
+                ));
+            }
+        };
+        if block.len() != 2 || block[0] != 1 {
+            return Err(Error::new(
+                format!(
+                    "`.scatter`'s descriptor block must be [1, cols], got [{}]",
+                    join(&block)
+                ),
+                0,
+                0,
+            ));
+        }
+        let xshape = self.ty(x_offsets).shape().to_vec();
+        if xshape.len() != 1 || xshape[0] < 8 {
+            return Err(Error::new(
+                format!(
+                    "`.scatter`'s index vector must be 1D with at least 8 rows, got [{}]",
+                    join(&xshape)
+                ),
+                0,
+                0,
+            ));
+        }
+        let want = vec![xshape[0], block[1]];
+        if self.ty(value).shape() != want.as_slice() {
+            return Err(Error::new(
+                format!(
+                    "`.scatter` value shape [{}] must be [{}] (index rows x block cols)",
+                    join(self.ty(value).shape()),
+                    join(&want)
+                ),
+                0,
+                0,
+            ));
+        }
+        let v = self.cast(value, &elem)?;
+        self.emit0(
+            "tt.descriptor_scatter",
+            &[desc, v, x_offsets, y_offset],
+            &[],
+        );
+        Ok(())
+    }
+
     /// `desc.store(offsets, value)` -> `tt.descriptor_store`.
     pub fn descriptor_store(
         &mut self,

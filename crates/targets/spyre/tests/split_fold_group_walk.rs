@@ -12,13 +12,17 @@
 //! `group_ranges` at `group_size()`), reached through its public entry rather than a copy, so a
 //! drift between the test and the bake is impossible by construction.
 
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
-use scratchy_subtile::sdsc_abstract::{AttnGeometry, DxGroupCeiling, POOL_STICK, attn_bundle_rows};
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{AttnFacts, assemble_attn};
+use scratchy_subtile::sdsc_abstract::{
+    AttnGeometry, DxGroupCeiling, KvExtent, POOL_STICK, SlotCount, attn_bundle_rows,
+};
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{
     FoldGrouping, bundle::FoldRows, launch_index,
 };
 
 const CAP: u32 = 256;
+/// The storage/sweep pair on the boundary's one carrier — the sweep is the full cap (no rung).
+const EXTENT: KvExtent = KvExtent::new(SlotCount::new(CAP), SlotCount::new(CAP));
 
 /// gemma-4-12b's sliding attention class: nqh=16, nkvh=8, hd=256 — the geometry whose mq=32 fold
 /// was the measured 8,300-descriptor bake explosion.
@@ -56,27 +60,28 @@ fn ops_at(mq: u32) -> Vec<ktir_superdsc::emit::EmittedOp> {
     let width = attn_bundle_rows(geom, mq, true)
         .unwrap_or_else(|| panic!("mq={mq} is not a baked decode rung"));
     assemble_attn(
-        7,
-        geom,
-        width,
-        CAP,
-        CAP,
-        "qs",
-        "nks",
-        "nvr",
-        "kct",
-        "vc",
-        "pmask",
-        "cmask",
-        Some("kv_idx"),
-        // The batched per-page gather, not the one-request split-KV chunk.
-        None,
-        scratchy_target_spyre::bundle_code::PlaceId::Act(7),
-        true,
-        // mq=32 is a whole-batch gathered regime, not the single-row body — the
-        // head-major handoff is a one-request fact, and this walk keeps the
-        // shipped finalize.
-        false,
+        AttnFacts {
+            t: 7,
+            geom,
+            bundle_rows: width,
+            extent: EXTENT,
+            qs: "qs",
+            new_k_scaled: "nks",
+            new_v: "nvr",
+            kct: "kct",
+            vc: "vc",
+            pmask: "pmask",
+            cmask: "cmask",
+            kv_block_index: Some("kv_idx"),
+            // The batched per-page gather, not the one-request split-KV chunk.
+            chunk: None,
+            out_id: scratchy_target_spyre::bundle_code::PlaceId::Act(7),
+            rows_are_requests: true,
+            // mq=32 is a whole-batch gathered regime, not the single-row body — the
+            // head-major handoff is a one-request fact, and this walk keeps the
+            // shipped finalize.
+            headmajor_handoff: false,
+        },
         &mut sym,
         None,
     )

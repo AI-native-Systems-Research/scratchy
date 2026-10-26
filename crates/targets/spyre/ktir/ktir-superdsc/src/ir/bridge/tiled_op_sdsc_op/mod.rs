@@ -33,7 +33,7 @@ pub mod pointwise;
 pub mod reduce;
 pub mod rmsnorm;
 
-pub use attn::assemble_attn;
+pub use attn::{AttnFacts, assemble_attn};
 pub use matmul::{
     SharedKernelBmmForm, assemble_matmul, assemble_matmul_batched_off,
     assemble_matmul_batched_seeded, assemble_matmul_off, assemble_matmul_off_phys_m,
@@ -52,4 +52,7 @@ pub use reduce::{
     reduce_opspec_df, reduce_opspec_off, reduce_opspec_off_divided, win_reduce_accum,
     win_reduce_data,
 };
-pub use rmsnorm::{assemble_rmsnorm, assemble_rmsnorm_unit, assemble_tanhsoftcap};
+pub use rmsnorm::{
+    RmsnormFacts, RmsnormUnitFacts, TanhsoftcapFacts, assemble_rmsnorm, assemble_rmsnorm_unit,
+    assemble_tanhsoftcap,
+};

@@ -36,26 +36,46 @@ use crate::superdsc_opspec::{DataFormat, Fp16};
 /// Assemble torch-spyre's `spyre_rms_norm` decomposition for one node: `x[rows,cols]`,
 /// `gamma[1,cols]`, `eps_const` a bound `[1,stick]` config constant → `out[rows,cols]`.
 ///
-/// `ones_const` (a bound `[1,stick]` constant holding 1.0) states the
-/// OnePlusScale convention's gain offset: when present, ONE `add` ahead of the
-/// gain multiply fills the `[1,cols]` `Gw` row with `gamma + 1`, and the multiply
-/// reads THAT row — the same formula the spliced program states
-/// (`rmsnorm_oneplus_fwd`'s `w = load + GAIN_OFFSET`), never the algebraic
-/// `xn + xn·w` rewrite. `None` is the Scale convention: no add, the multiply
-/// reads the stored gamma, byte-identical to the form before the row existed.
-#[allow(clippy::too_many_arguments)]
+/// ⭐ THE GAINED NORM'S WHOLE FACT SET, ON ONE CARRIER — the eight facts the decomposition reads,
+/// grouped exactly as its own doc frames them, deleting the positional run where a name, a gain
+/// or a bound const transposes silently (the arrangement this file shares with every sibling the
+/// carrier family has already closed). The sink pair (`sym_id_base`/`layout`) stays in the
+/// signature BESIDE the carrier, as it does at every door of this family.
+pub struct RmsnormFacts<'a> {
+    pub prefix: &'a str,
+    pub rows: u32,
+    pub cols: u32,
+    pub x: &'a str,
+    pub gamma: &'a str,
+    pub out_id: crate::place::PlaceId,
+    pub eps_const: &'a str,
+    /// A bound `[1,stick]` constant holding 1.0, stating the OnePlusScale convention's gain
+    /// offset: when present, ONE `add` ahead of the gain multiply fills the `[1,cols]` `Gw` row
+    /// with `gamma + 1`, and the multiply reads THAT row — the same formula the spliced program
+    /// states (`rmsnorm_oneplus_fwd`'s `w = load + GAIN_OFFSET`), never the algebraic
+    /// `xn + xn·w` rewrite. `None` is the Scale convention: no add, the multiply reads the
+    /// stored gamma, byte-identical to the form before the row existed.
+    pub ones_const: Option<&'a str>,
+}
+
 pub fn assemble_rmsnorm(
-    prefix: &str,
-    rows: u32,
-    cols: u32,
-    x: &str,
-    gamma: &str,
-    out_id: crate::place::PlaceId,
-    eps_const: &str,
-    ones_const: Option<&str>,
+    facts: RmsnormFacts<'_>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Vec<EmittedOp> {
+    // ⭐ THE NORM'S FACTS, DESTRUCTURED ONCE AT THE DOOR — every field restates the local the
+    // body below already reads (the same names the parameter list spelled), so the emission is
+    // the same op stream on the same values. The sink pair stays in the signature.
+    let RmsnormFacts {
+        prefix,
+        rows,
+        cols,
+        x,
+        gamma,
+        out_id,
+        eps_const,
+        ones_const,
+    } = facts;
     use crate::place::SynthRole as R;
     let stk = Fp16::ELEMS_PER_STICK; // 64 — the per-row reduce/scalar lane (one fp16 stick)
     let mut ops: Vec<EmittedOp> = Vec::new();
@@ -111,19 +131,19 @@ pub fn assemble_rmsnorm(
     // rows>1 && cols>64 and walks `x` in the layout it was actually written in. At rows==1 (decode)
     // `stickmajor` is false in the reduce, so the emission is byte-identical to the flat form — decode
     // is provably unaffected.
-    let x = rb(x, rows, cols);
-    let gamma = rb(gamma, 1, cols);
-    let out = rb(out, rows, cols);
-    let mean = rb(&mean, rows, stk);
-    let meps = rb(&meps, rows, stk);
-    let eps = rb(eps_const, 1, stk);
-    let rinv = rb(&rinv, rows, stk);
-    let xn = rb(&xn, rows, cols);
     // The norm's typed extents: `rows` is the residual stream's token rows, `cols` its feature
     // width, and the per-row mean/rsqrt scalars live in ONE-STICK-wide tensors.
     let t_rows = RowCount::of_token_rows(rows);
     let f_cols = BlockCols::of_feature_cols(cols);
     let s_cols = BlockCols::of_one_stick(Lanes::FP16);
+    let x = rb(x, t_rows, f_cols);
+    let gamma = rb(gamma, RowCount::of_broadcast_row(), f_cols);
+    let out = rb(out, t_rows, f_cols);
+    let mean = rb(&mean, t_rows, s_cols);
+    let meps = rb(&meps, t_rows, s_cols);
+    let eps = rb(eps_const, RowCount::of_broadcast_row(), s_cols);
+    let rinv = rb(&rinv, t_rows, s_cols);
+    let xn = rb(&xn, t_rows, f_cols);
     // The `spyre_rms_norm` formula with the vendor's own LAYER-norm head (their
     // `spyre_layer_norm`, decompositions.py:1020, opens with exactly this reduce):
     //   exx2(1/cols)  →  rsqrt(E[x²]+eps)  →  x·r  →  ·γ
@@ -201,7 +221,20 @@ pub fn assemble_rmsnorm(
     //    `Gw` row the gain multiply reads. The stored gamma is never rewritten.
     //    The handles are hoisted OUT of the arm because `In::mb` borrows: the
     //    multiply's operand must outlive the `match` that minted it.
-    let gw_ones_h = ones_const.map(|c| (rb(&gw, 1, cols), rb(c, 1, stk)));
+    let gw_ones_h = ones_const.map(|c| {
+        (
+            rb(
+                &gw,
+                RowCount::of_broadcast_row(),
+                BlockCols::of_feature_cols(cols),
+            ),
+            rb(
+                c,
+                RowCount::of_broadcast_row(),
+                BlockCols::of_one_stick(Lanes::FP16),
+            ),
+        )
+    });
     let gamma_operand = match &gw_ones_h {
         Some((gw_handle, ones)) => {
             ops.push(pw2(
@@ -246,17 +279,34 @@ pub fn assemble_rmsnorm(
 /// The synthetic roles are the SHARED ones (`Sq16`/`Mean`/`Meps`/`Rinv`): the unit
 /// form mints no `Xn`, because the normalising multiply's result is the output
 /// buffer, not a synthetic intermediate.
-#[allow(clippy::too_many_arguments)]
+///
+/// ⭐ THE UNIT NORM'S FACT SET, ON ONE CARRIER — the gained form's carrier minus the gain facts
+/// (`gamma`/`ones_const`), because a unit-gain norm has none to state. The sink pair stays in
+/// the signature BESIDE the carrier.
+pub struct RmsnormUnitFacts<'a> {
+    pub prefix: &'a str,
+    pub rows: u32,
+    pub cols: u32,
+    pub x: &'a str,
+    pub out_id: crate::place::PlaceId,
+    pub eps_const: &'a str,
+}
+
 pub fn assemble_rmsnorm_unit(
-    prefix: &str,
-    rows: u32,
-    cols: u32,
-    x: &str,
-    out_id: crate::place::PlaceId,
-    eps_const: &str,
+    facts: RmsnormUnitFacts<'_>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Vec<EmittedOp> {
+    // ⭐ THE UNIT NORM'S FACTS, DESTRUCTURED ONCE AT THE DOOR — the same names the parameter
+    // list spelled, so the body below is unchanged arithmetic on the same values.
+    let RmsnormUnitFacts {
+        prefix,
+        rows,
+        cols,
+        x,
+        out_id,
+        eps_const,
+    } = facts;
     use crate::place::SynthRole as R;
     let stk = Fp16::ELEMS_PER_STICK; // 64 — the per-row reduce/scalar lane (one fp16 stick)
     let mut ops: Vec<EmittedOp> = Vec::new();
@@ -279,16 +329,16 @@ pub fn assemble_rmsnorm_unit(
     }
     // Same handle kinds as `assemble_rmsnorm`'s — see its comment for why `x` is
     // RowBlocked, not Flat.
-    let x = rb(x, rows, cols);
-    let out = rb(out, rows, cols);
-    let sq16 = rb(&sq16, rows, cols);
-    let mean = rb(&mean, rows, stk);
-    let meps = rb(&meps, rows, stk);
-    let eps = rb(eps_const, 1, stk);
-    let rinv = rb(&rinv, rows, stk);
     let t_rows = RowCount::of_token_rows(rows);
     let f_cols = BlockCols::of_feature_cols(cols);
     let s_cols = BlockCols::of_one_stick(Lanes::FP16);
+    let x = rb(x, t_rows, f_cols);
+    let out = rb(out, t_rows, f_cols);
+    let sq16 = rb(&sq16, t_rows, f_cols);
+    let mean = rb(&mean, t_rows, s_cols);
+    let meps = rb(&meps, t_rows, s_cols);
+    let eps = rb(eps_const, RowCount::of_broadcast_row(), s_cols);
+    let rinv = rb(&rinv, t_rows, s_cols);
     // Steps 1–4 are `assemble_rmsnorm` verbatim — the same formula up to the
     // normalising multiply, because a unit-gain norm is the same norm.
     ops.push(pw2(
@@ -364,17 +414,35 @@ pub fn assemble_rmsnorm_unit(
 /// like its producer and consumer, but it is a fresh buffer this lowering
 /// mints, so it takes a `SynthRole` (`Tanhc`) and is reserved through the
 /// layout exactly as `Sq16` is — placed, never aliased.
-#[allow(clippy::too_many_arguments)]
+///
+/// ⭐ THE SOFTCAP'S FACT SET, ON ONE CARRIER — the unit form's frame with the bound const
+/// renamed to what it IS here (the cap, not an epsilon): the names are the safety, so the
+/// semantic rename travels with the carrier rather than living in a positional slot. The sink
+/// pair stays in the signature BESIDE the carrier.
+pub struct TanhsoftcapFacts<'a> {
+    pub prefix: &'a str,
+    pub rows: u32,
+    pub cols: u32,
+    pub x: &'a str,
+    pub out_id: crate::place::PlaceId,
+    pub cap_const: &'a str,
+}
+
 pub fn assemble_tanhsoftcap(
-    prefix: &str,
-    rows: u32,
-    cols: u32,
-    x: &str,
-    out_id: crate::place::PlaceId,
-    cap_const: &str,
+    facts: TanhsoftcapFacts<'_>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Vec<EmittedOp> {
+    // ⭐ THE SOFTCAP'S FACTS, DESTRUCTURED ONCE AT THE DOOR — the same names the parameter list
+    // spelled, so the body below is unchanged arithmetic on the same values.
+    let TanhsoftcapFacts {
+        prefix,
+        rows,
+        cols,
+        x,
+        out_id,
+        cap_const,
+    } = facts;
     use crate::place::SynthRole as R;
     let mut ops: Vec<EmittedOp> = Vec::new();
     let out_s = out_id.to_string();
@@ -383,12 +451,16 @@ pub fn assemble_tanhsoftcap(
     if let Some(l) = layout {
         l.synth(out_id.synth(R::Tanhc), &[rows, cols]);
     }
-    let x = rb(x, rows, cols);
-    let out = rb(out, rows, cols);
-    let tanhc = rb(&tanhc, rows, cols);
-    let cap = rb(cap_const, 1, Fp16::ELEMS_PER_STICK);
     let t_rows = RowCount::of_token_rows(rows);
     let f_cols = BlockCols::of_feature_cols(cols);
+    let x = rb(x, t_rows, f_cols);
+    let out = rb(out, t_rows, f_cols);
+    let tanhc = rb(&tanhc, t_rows, f_cols);
+    let cap = rb(
+        cap_const,
+        RowCount::of_broadcast_row(),
+        BlockCols::of_one_stick(Lanes::FP16),
+    );
     // 1. scaled = x / cap (the cap `[1,1]` const, out-broadcast — the rmsnorm's
     //    `eps` operand mode).
     ops.push(pw2(

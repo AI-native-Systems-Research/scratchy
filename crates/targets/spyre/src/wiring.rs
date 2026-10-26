@@ -148,9 +148,23 @@ pub struct BakeFacts {
     pub uses_identity: bool,
     /// granite ScalarMul multipliers; index `i` is const tid `scalarmul_scale_tid(i)`.
     pub scalarmul_scales: &'static [f32],
-    /// ⭐⭐⭐⭐⭐ The bundle placed `KV_BLOCK_INDEX_TID` — it emitted a GATHERED KV read, so the forward
-    /// tape carries a [`ForwardKernel::KvBlockIndex`](crate::forward_tape::ForwardKernel::KvBlockIndex)
-    /// step and the launch must stage a block table.
+    /// Each slot's staging channel, parallel to [`Self::scalarmul_scales`] — off the generated
+    /// layout's own `scalarmul_scales_stage` column, so the sendnn fill and the KTIR worker
+    /// handoff read ONE list.
+    pub scalarmul_scales_stage: &'static [bundle::ScaleStage],
+    /// ⭐⭐⭐⭐⭐ The bundle's launch groups carry a gathered KV read — the body's own ops said
+    /// `kv_gathered` (per-group, [`bundle::KvShifts::gathered`]), so the forward tape carries a
+    /// [`ForwardKernel::KvBlockIndex`](crate::forward_tape::ForwardKernel::KvBlockIndex) step and
+    /// the launch must stage a block table.
+    ///
+    /// ⛔ THE GROUPS ARE THE AUTHORITY, NOT THE LAYOUT'S `KV_BLOCK_INDEX_TID` PLACEMENT. The two
+    /// answered the same question through different code — the placement says the emission
+    /// reserved an index tensor, the groups say the emitted ops carry the gather bit — and defect
+    /// C was exactly those two halves disagreeing (legs minted `kv_gathered = false` under a placed
+    /// index). With the family-tagged stamp on the legs they agree on every buildable bundle, but
+    /// this field is now READ FROM THE GROUPS so the two halves cannot be asked of different
+    /// artifacts again: `BakeFacts::of_code` asks [`GathersKv::of_code`], the same per-body door
+    /// `step_body` asks.
     ///
     /// Same mechanism and the same reason as [`Self::uses_identity`]: the descriptor half and the
     /// staging half of a feature must be decided by ONE artifact-derived question, because they fail
@@ -168,22 +182,30 @@ impl BakeFacts {
         ones_reduce_len: 0,
         uses_identity: false,
         scalarmul_scales: &[],
+        scalarmul_scales_stage: &[],
         gathers_kv: false,
     };
 
-    /// Read them off the generated layout.
-    pub fn of(layout: &'static bundle::BundleLayout<'static>) -> Self {
+    /// Read them off the generated CODE — the layout for the placements, the LAUNCH GROUPS for the
+    /// gather fact (see [`Self::gathers_kv`]: the ops, not the placement, are the authority). Both
+    /// call sites hold the `BundleCode`, so this takes the code and never a bare layout.
+    pub fn of_code(code: &'static bundle::BundleCode<'static>) -> Self {
         use crate::lower_subtile_tape_to_superdsc as sd;
+        let layout = &code.layout;
         let ones = layout.place_of_tid(sd::ONES_REDUCE_TID);
         BakeFacts {
             uses_ones_reduce: ones.is_some(),
             ones_reduce_len: ones.map_or(0, |p| (p.size / 2) as usize),
             uses_identity: layout.place_of_tid(sd::IDENTITY_TID).is_some(),
-            gathers_kv: layout.place_of_tid(sd::KV_BLOCK_INDEX_TID).is_some(),
+            gathers_kv: GathersKv::of_code(code).get(),
             scalarmul_scales: match &layout.scalarmul_scales {
                 std::borrow::Cow::Borrowed(v) => v,
                 // A generated layout is always `Cow::Borrowed`; the owned arm exists for the
                 // emit-side type and cannot outlive this call, so it is not a case to serve.
+                std::borrow::Cow::Owned(_) => &[],
+            },
+            scalarmul_scales_stage: match &layout.scalarmul_scales_stage {
+                std::borrow::Cow::Borrowed(v) => v,
                 std::borrow::Cow::Owned(_) => &[],
             },
         }
@@ -231,6 +253,7 @@ impl BakeFacts {
             uses_identity: self.uses_identity,
             rows: rows.get(),
             scalarmul_scales: self.scalarmul_scales,
+            scalarmul_scales_stage: self.scalarmul_scales_stage,
             rope_class_hds: w.rope_class_hds,
             attn_class_hds: w.attn_class_hds,
             rms_invcols: w.rms_invcols,
@@ -510,25 +533,42 @@ impl GathersKv {
         GathersKv(facts.gathers_kv)
     }
 
-    /// The same answer straight off a LAYOUT, for callers that hold one but no [`BakeFacts`] — the
-    /// load-time placement check. It is the same lookup [`BakeFacts::of`] performs, spelled once here
-    /// rather than duplicated at the call site, and it takes a plain reference so a non-`'static`
-    /// layout can be asked.
-    pub fn of_layout(layout: &bundle::BundleLayout<'_>) -> Self {
-        GathersKv(
-            layout
-                .place_of_tid(crate::lower_subtile_tape_to_superdsc::KV_BLOCK_INDEX_TID)
-                .is_some(),
-        )
+    /// The same answer straight off a CODE — the load-time check for callers that hold the code but
+    /// no [`BakeFacts`] (the worker's preflight holds both a decode and a prefill code). It is
+    /// [`Self::of_launch_groups`] over the code's own groups, spelled once here rather than
+    /// duplicated at the call site, and it takes a plain reference so a non-`'static` code can be
+    /// asked.
+    ///
+    /// ⛔ RETIRES `of_layout`, which answered the same question from the layout's
+    /// `KV_BLOCK_INDEX_TID` placement — the OTHER half of the artifact from the one the per-body
+    /// doors ask. Defect C was those halves disagreeing; the walk's chain-of-custody stamp now
+    /// mints `kv_gathered` on every op lowered from a one-shot attention carrier UNCONDITIONALLY
+    /// (the `paged_region` door's own totality law — an attention body arriving with NO region
+    /// attribute is a walk/splice desync, `emit/mod.rs`), so on a PREFIX-FREE top the two halves
+    /// DISCLOSEDLY DISAGREE: the groups gather (this door answers true) while the index placement
+    /// does not exist (the reservation keys at LAYOUT time on `rows_are_requests ||
+    /// chunk_pages.is_some()`, before any stamp — nothing refuses the divergence). The
+    /// disagreement is inert by construction: the consumers that can ask the placement half are
+    /// the DECODE-side load check (`spyre_load`'s unplaced refusal — decode-only, and unchanged:
+    /// every decode bundle places the index via `rows_are_requests`) and the launch-time pairing
+    /// check (`kernel_values`, which demands a table only when a step mints — the re-keyed
+    /// `page_list` param mints no step for a region-form body, and every batch- or chunk-launched
+    /// bundle that mints places the index); the prefill side runs no unplaced check, and the
+    /// prefill facts' `gathers_kv` flip has no reader. Zero bundle bytes move; the ANSWER moves
+    /// on prefix-free tops (false → true, unread). The re-point's value is closing the desync
+    /// class — the two halves of the gather fact can no longer be asked of different artifacts —
+    /// with the one disagreement that remains STATED here rather than assumed away.
+    pub fn of_code(code: &bundle::BundleCode<'_>) -> Self {
+        Self::of_launch_groups(code.groups.iter().map(|g| g.kv.gathered))
     }
 
     /// ⭐⭐⭐ THE **PER-BODY** ANSWER, off the body's own LAUNCH GROUPS — each group's
     /// `bundle::KvShifts::gathered`, which the emitter stamps on the fold group it built the gather into.
     ///
-    /// ⛔ WHY A THIRD DOOR RATHER THAN REUSING THE LAYOUT ONE. [`Self::of_layout`] answers about a
-    /// BUNDLE: `KV_BLOCK_INDEX_TID` is placed if ANY body of it gathers. A decode bundle holds a whole
+    /// ⛔ WHY A SEPARATE DOOR FROM THE BUNDLE-LEVEL ONE ([`Self::of_code`]). A bundle-level answer
+    /// says "ANY body of this code gathers": a decode bundle holds a whole
     /// sk_bucket ladder of bodies plus their fold-fused twins, and which one a step runs is the
-    /// selector's answer from the live context length — so the bundle's placement cannot answer "does
+    /// selector's answer from the live context length — so a bundle-level fact cannot answer "does
     /// the body I am about to launch gather", and answering it from the bundle is exactly the mistake
     /// this file has now recorded three times (see `superdsc_exec::Executor::step_body`).
     ///
@@ -544,6 +584,15 @@ impl GathersKv {
     /// appears in a grep for who claims a bundle does not gather.
     pub const fn no_layout_to_ask() -> Self {
         GathersKv(false)
+    }
+
+    /// ⭐ THE STAGING CHANNEL'S ANSWER, as the forward's `gathers` parameter: the body gathers
+    /// AND its table is the composer's page-list form (not the fill-staged region form). This
+    /// is the door the host's index-step ask keys on — spelled as its own name, like
+    /// [`Self::no_layout_to_ask`], so a grep for who claims a body needs a staged table finds
+    /// exactly the staging-side callers.
+    pub const fn of_page_list(page_list: bool) -> Self {
+        GathersKv(page_list)
     }
 
     pub const fn get(self) -> bool {
@@ -847,6 +896,12 @@ pub struct Wiring {
     /// `BundleLayout`; this is the copy the emulator path has, on a program it resolved by fingerprint
     /// rather than through a layout it never asks for.
     pub scalarmul_scales: &'static [f32],
+    /// ⭐ EACH SCALE SLOT'S STAGING CHANNEL, parallel to [`Self::scalarmul_scales`]: how the
+    /// worker stages entry `i` at `scalarmul_scale_tid(i)` — the f16 `[1,1]` const fill or the
+    /// raw f32 word. Emitted by the macro off the SAME registry column the bake projected
+    /// (`BundleLayout::scalarmul_scales_stage`), so the wiring's channel and the layout's can
+    /// never disagree; the worker's session handoff and the sendnn constant fill both read it.
+    pub scalarmul_scales_stage: &'static [bundle::ScaleStage],
     /// ⭐ THE DENSE fp8 K-PADS — for every arity-3 MatmulTile weight whose contraction k is not a
     /// whole 128-elem SEN143_FP8 stick: `(source id, k_pad)`. The FIRST fp8 model with a
     /// non-legal K is gemma-4-26b (dense GeGLU DOWN, k=2112 → 2176): the quantize chain and the
@@ -888,6 +943,23 @@ impl Wiring {
 
 // ── SYNTHETIC CONSTANTS ─────────────────────────────────────────────────────
 
+/// ⭐ THE ONE df→CHANNEL PROJECTION — the registry's format column onto the runtime's staging
+/// channels, stated ONCE so the bake (`bake_layout`) and the macro's Wiring literal cannot
+/// disagree about what a slot's df means. A format with no channel is a PANIC naming the slot
+/// (`slot` is the caller's own context — the reserved tid at the bake, the wiring index in the
+/// macro): fail closed, never a nearest-neighbor staging.
+pub fn scale_stage_of(df: ktir_superdsc::superdsc_opspec::Df, slot: &str) -> bundle::ScaleStage {
+    match df {
+        ktir_superdsc::superdsc_opspec::Df::Fp16 => bundle::ScaleStage::IeeeF16,
+        ktir_superdsc::superdsc_opspec::Df::Fp32 => bundle::ScaleStage::IeeeF32,
+        other => panic!(
+            "{slot} states {other:?}, which has no staging channel — the runtime stages scale \
+             consts through the f16 [1,1] fill or the raw f32 word, and nothing else. REFUSING \
+             to bake a const the worker could not write."
+        ),
+    }
+}
+
 /// What the synthetic-constant set depends on. Everything here is either model
 /// geometry or a fact read off the BAKED bundle's own placements — never an
 /// environment variable, and never a phase label.
@@ -928,6 +1000,10 @@ pub struct ConstantEnv {
     /// as a subslice rather than copied into a fresh `vec![sc]` per scale per forward. The array
     /// is already a `static` the macro emitted onto the layout, so the borrow is real.
     pub scalarmul_scales: &'static [f32],
+    /// Each slot's staging channel, parallel to [`Self::scalarmul_scales`] — the sendnn fill
+    /// reads it to REFUSE a slot it cannot stage (below), and the KTIR worker's session handoff
+    /// reads the wiring's own copy of the same column.
+    pub scalarmul_scales_stage: &'static [bundle::ScaleStage],
 }
 
 // ── THE CONSTANTS THAT ARE LITERALLY CONSTANT ───────────────────────────────
@@ -1133,6 +1209,23 @@ pub fn synthetic_constants(env: &ConstantEnv) -> Vec<(u32, ConstValues)> {
     // granite ScalarMul multipliers: `t{scalarmul_scale_tid(i)} = [scale_i]`, a
     // [1,1] fp16 the on-device pointwise `mul` reads. Unbound = 0 = wrong output.
     for i in 0..env.scalarmul_scales.len() {
+        // ⛔ THE SENDNN CONSTANT CHANNEL STAGES ONLY f16 SLOTS. This chain's upload narrows the
+        // f32 value to its f16 image — the staging-twin law, the ONE channel it has — so a slot
+        // the bundle stated at f32 would be silently narrowed to wrong bits here. The KTIR
+        // worker path stages the raw word through the session's declared channel (seat (i));
+        // this path REFUSES BY NAME instead, and the f32 registry is a KTIR-path fact today.
+        // A model needing f32 scales on sendnn is a new channel, not a silent narrow.
+        if let Some(stage) = env.scalarmul_scales_stage.get(i)
+            && *stage != bundle::ScaleStage::IeeeF16
+        {
+            panic!(
+                "scale slot {} is stated at {:?}, and the sendnn constant channel stages only \
+                 f16 scale consts (one narrowed f16 word per bind) — the raw f32 word is the \
+                 KTIR session's channel. REFUSING to narrow a bundle-stated format.",
+                sd::scalarmul_scale_tid(i),
+                stage
+            );
+        }
         // A SUBSLICE of the emitted scales, not a copy of one: the layout already carries this
         // array as a `static`, and a `[1,1]` const is one element of it.
         out.push((
@@ -1347,6 +1440,9 @@ mod constant_tape_tests {
             uses_identity: true,
             rows,
             scalarmul_scales: &[1.5, 2.5],
+            // The slots above are all stated at the incumbent f16 stage — the payload-census
+            // half's law — so this env is the byte-identical control, not an f32 case.
+            scalarmul_scales_stage: &[bundle::ScaleStage::IeeeF16, bundle::ScaleStage::IeeeF16],
             // A uniform-model class set: one rope class, one attention class, both the base 64 —
             // which resolves to the class-0 sentinels `ROPE_P_TID`/`IDENTITY_TID`, exactly what a
             // single-class model's bind must still name.
@@ -1571,6 +1667,7 @@ mod constant_tape_tests {
             bank: 0,
             offset: 0,
             size: placed_bytes,
+            cover: bundle::BindCover::Full,
             is_logits: false,
         });
         // The BAKED count's staging covers the placement — the pair agrees.
@@ -1578,9 +1675,10 @@ mod constant_tape_tests {
             .verify_causal_placement(&lay, mq, width)
             .expect("the bake's own nqh stages exactly its placement");
         // THE DEFECT'S SHAPE: a staging at the QUOTIENT covers only `2·mq` of the `4·mq` rows.
-        // The quotient staging itself is silent at bind time (under-binding is allowed), so the
-        // CHECK is what must fire — its `want` comes from the bake's `nqh`, never from host
-        // arithmetic, and the two counts disagree on exactly this geometry.
+        // The quotient staging is refused at the bind door since the write-cover law (a `Full`
+        // placement demands its whole extent), but the CHECK still fires first — at bake, from
+        // the bake's own `nqh`, never from host arithmetic, and the two counts disagree on
+        // exactly this geometry.
         let quotient = wiring.geometry.hidden / wiring.geometry.head_dim;
         assert_ne!(
             quotient, wiring.geometry.nqh,
@@ -1603,6 +1701,7 @@ mod constant_tape_tests {
             bank: 0,
             offset: 0,
             size: quotient_bytes,
+            cover: bundle::BindCover::Full,
             is_logits: false,
         });
         let why = wiring
@@ -1718,6 +1817,7 @@ mod constant_tape_tests {
                     bank: 0,
                     offset: 0,
                     size: staged.len() as u64 * 2,
+                    cover: bundle::BindCover::Full,
                     is_logits: false,
                 });
                 w.verify_causal_placement(&lay, rows, mq_pad as u32)
@@ -1769,6 +1869,7 @@ mod constant_tape_tests {
             attn_class_hds: &[],
             rms_invcols: &[],
             scalarmul_scales: &[],
+            scalarmul_scales_stage: &[],
             fp8_k_pads: &[],
             weight_scale_folds: &[],
             weight_copies: &[],
@@ -1787,6 +1888,7 @@ mod constant_tape_tests {
                         bank: 0,
                         offset: 0,
                         size: hd as u64 * hd as u64 * 2,
+                        cover: bundle::BindCover::Full,
                         is_logits: false,
                     })
                     .collect(),

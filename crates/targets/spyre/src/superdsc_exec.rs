@@ -29,7 +29,8 @@ use tracing::{debug, info};
 use crate::bundle_code::{self as bundle, KernelWeight, NUM_SEGMENTS, Placement, SweptCols};
 use crate::cb_plan;
 use crate::fold_plan::{
-    self, Bytes, OpKv, PerClass, RowCursors, RowIdx, RowPage, SessionKv, SlotPos, fused_rungs,
+    self, Bytes, OpKv, PageOrd, PerClass, RowCursors, RowIdx, RowPage, SessionKv, SlabStride,
+    SlotPos, SlotStride, fused_rungs,
 };
 use crate::runtime::{
     BatchedCompute, ByteOffset, ByteSize, ComputeWireBatch, ControlBlockWire, DevAddr, HwError,
@@ -612,17 +613,28 @@ impl OpProg {
             addr: None,
             kv: OpKv {
                 request: kv.request as u64,
-                slot_offset: kv.slot_offset as u64,
+                // The group's own part, off the launch index's single derivation — the typed value
+                // the fusion walk compared, not a re-read number.
+                part: kv.part,
                 page_fold: kv.page_fold,
                 slot_write: kv.slot_write(),
                 page_slots: kv.page_slots as u64,
-                slot_stride_bytes: kv.slot_stride_bytes as u64,
+                // ⭐ THE PORT MINTS — the manifest's raw `kv_*_stride_bytes` become typed
+                // strides exactly once, here where the launch index is read; the values
+                // leave the types only through `PlaneSlot::shifted_by` /
+                // `SlabIdx::shifted_by`, so a slot stride multiplying a slab index (the
+                // mixed-stride group's wrong base shift) has no spelling past this point.
+                slot_stride: SlotStride::of_bytes(Bytes(kv.slot_stride_bytes as u64)),
                 slab_write: kv.slab_write(),
-                slab_stride_bytes: kv.slab_stride_bytes as u64,
+                slab_stride: SlabStride::of_bytes(Bytes(kv.slab_stride_bytes as u64)),
                 batched_requests: kv.batched_requests,
                 // ⭐ THE OTHER HALF OF `fold_plan::collapsed`, and what sends the fold's KV shift to
                 // zero — a bake fact, carried on the group exactly like the axis itself.
                 gathered: kv.gathered,
+                // The staging channel's own mirror — the ruled custody chain's first link
+                // (`OpKv → KvShifts → StepBody`), minted off the same group value as
+                // `gathered` so the two bits cannot come from different derivations.
+                region_form: kv.region_form,
             },
         }
     }
@@ -919,6 +931,10 @@ pub struct Executor {
     fold: SessionKv,
     /// Has a caller installed a REAL page map (vs the create-time identity default)?
     block_table_set: bool,
+    /// LEG-1(c) under `segaddr`: the last `[cachewr]` line this session printed, as its dedupe
+    /// key (write slot + distinct target pages). The rolled body launches once per LAYER, so an
+    /// undeduped line would print 40× per forward; the page targeting is a per-STEP fact.
+    cachewr_seen: Option<(i64, Vec<i64>)>,
 
     prepared: bool,
     staged_host: bool,
@@ -944,6 +960,9 @@ struct TensorDump {
     op: usize,
     /// Last-seen device bytes per placement (sen format, exactly what D2H brought back).
     snap: std::collections::HashMap<bundle::PlaceId, Vec<u8>>,
+    /// Last-seen bytes per POOL WINDOW (see the LEG-2 watch in [`Executor::tensordump`]), in the
+    /// fixed order the watch builds them: pg1, pg2. `None` until first read.
+    wins: Vec<Option<Vec<u8>>>,
 }
 
 /// The process-global fingerprint → program-index registry for the tensordump, in first-dumped
@@ -1104,6 +1123,7 @@ impl Executor {
             kv: KvGeometry::default(),
             fold: SessionKv::default(),
             block_table_set: false,
+            cachewr_seen: None,
             prepared: false,
             staged_host: false,
             n_weights_staged: 0,
@@ -1393,6 +1413,22 @@ impl Executor {
         let ident: Vec<i64> = (0..self.kv.pool_pages.0).collect();
         self.install_page_map(RowIdx::from_launch_row(0), SeqPos(0), &ident);
         self.block_table_set = false;
+        // LEG-1(b) under `segaddr`: this session's POOL placements — every seg2 offset the bundle
+        // baked, one line, one write (the tensordump only watches the ones its one-page shadow
+        // covers, so which page the rest sit on is exactly what this line settles). Once per
+        // session by construction: the identity install above is the create-time path.
+        if Diag::get().segaddr {
+            use std::fmt::Write as _;
+            let mut ps = String::new();
+            let mut n = 0u32;
+            for (id, p) in &self.places {
+                if p.segment as usize == SEG_KV.get() && p.bank == 0 && p.size > 0 {
+                    let _ = write!(ps, " {id}@{}+{}", p.offset, p.size);
+                    n += 1;
+                }
+            }
+            eprintln!("[poolplaces] fp={} n={n} placements:{ps}", self.code.fp);
+        }
         debug!(
             "[sdsc-superdsc] PAGED KV: page={} slots, page_stride={} B, pool={} pages ({:.1} MB) \
              => {} positions of context available to one request",
@@ -1545,7 +1581,29 @@ impl Executor {
 
     /// Bind an ACTIVATION by name (IEEE-fp16 bytes) — re-bound every step. A name bound before
     /// prepare is recorded as a weight instead, matching the C++ contract.
-    pub fn bind_input(&mut self, id: bundle::PlaceId, bytes: Vec<u8>) {
+    ///
+    /// ⛔ THE BIND COVERS ITS PLACEMENT'S WRITE-COVER OR REFUSES. A `Full` placement demands its
+    /// whole extent; a `FoldBlocks` one admits a whole number of its blocks and nothing else
+    /// ([`bundle::BindCover`], minted where the placement was sized). A short bind against a
+    /// `Full` placement leaves a tail of whatever the device had there — for an ADDITIVE mask
+    /// that tail reads as ZERO, i.e. as "no mask" — and the door is where that stops. A name
+    /// this bundle never placed still binds (the refill skips it, as it always has); the cover
+    /// law speaks only for tensors the bake placed.
+    pub fn bind_input(&mut self, id: bundle::PlaceId, bytes: Vec<u8>) -> Result<()> {
+        if let Some(p) = self.places.get(&id) {
+            let len = bytes.len() as u64;
+            if !p.cover.admits(len, p.size) {
+                bail!(
+                    "bind_input('{id}'): {len} B against a {} B placement (seg{} off {}) whose \
+                     write-cover is {:?} — REFUSING, a bind that misses its cover leaves the \
+                     untaken bytes holding whatever the device had there",
+                    p.size,
+                    p.segment,
+                    p.offset,
+                    p.cover
+                );
+            }
+        }
         if !self.prepared {
             self.weight_ids.insert(id);
         }
@@ -1557,6 +1615,7 @@ impl Executor {
         self.keyed.remove(&id);
         self.staged.remove(&id);
         self.bound.insert(id, bytes);
+        Ok(())
     }
 
     /// ⭐ Bind an f32 ACTIVATION by converting it STRAIGHT INTO ITS SLOT OF THE SHADOW — f32 →
@@ -1568,7 +1627,7 @@ impl Executor {
     ///
     /// The placement checks the refill makes for a `bound` activation are made here instead, where
     /// the write happens: a name this bundle never placed is skipped (as the refill skips it), and a
-    /// bind longer than its own placement, or past its segment's shadow, is refused.
+    /// bind that misses its placement's write-cover, or lands past its segment's shadow, is refused.
     pub fn bind_input_f32(&mut self, id: bundle::PlaceId, vals: &[f32]) -> Result<()> {
         if !self.prepared {
             bail!("bind_input_f32('{id}') before prepare — the shadow is sized at prepare");
@@ -1585,13 +1644,15 @@ impl Executor {
             return Ok(());
         };
         let len = vals.len() as u64 * 2;
-        if len > p.size {
+        if !p.cover.admits(len, p.size) {
             bail!(
-                "bind: activation '{id}' binds {len} B into a {} B placement (seg{} off {}) — \
-                 REFUSING, this would corrupt the following tensors",
+                "bind_input_f32('{id}'): {len} B against a {} B placement (seg{} off {}) whose \
+                 write-cover is {:?} — REFUSING, a bind that misses its cover leaves the untaken \
+                 bytes holding whatever the device had there",
                 p.size,
                 p.segment,
-                p.offset
+                p.offset,
+                p.cover
             );
         }
         let dst = self.seg_host[seg.get()]
@@ -1631,6 +1692,20 @@ impl Executor {
             bail!(
                 "bind_input_keyed('{id}') before prepare — a keyed activation is a per-step bind"
             );
+        }
+        if let Some(p) = self.places.get(&id) {
+            let len = bytes.len() as u64;
+            if !p.cover.admits(len, p.size) {
+                bail!(
+                    "bind_input_keyed('{id}'): {len} B against a {} B placement (seg{} off {}) \
+                     whose write-cover is {:?} — REFUSING, a bind that misses its cover leaves \
+                     the untaken bytes holding whatever the device had there",
+                    p.size,
+                    p.segment,
+                    p.offset,
+                    p.cover
+                );
+            }
         }
         self.raw_ids.remove(&id);
         self.staged.remove(&id);
@@ -1715,13 +1790,16 @@ impl Executor {
     /// bytes are read as block numbers), or a byte count that is not a whole number of int32
     /// entries (a partial trailing entry is a truncated address).
     ///
-    /// ⛔ SHORT IS LEGITIMATE AND LONG IS NOT, which is why this is `>` and not `!=` — several
-    /// activations bind less than their placement on purpose (pmask reserves `[nqh*mq, cap]` and
-    /// binds one broadcast row; the index table's own pass block is the MASK's stride, of which one
-    /// pass fills the head).
+    /// ⛔ SHORT IS LEGAL EXACTLY ON THE CLASSES THE BAKE DECLARED — the write-cover law
+    /// ([`bundle::BindCover`]): a `Full` placement demands its whole extent, and a `FoldBlocks`
+    /// placement admits a whole number of its blocks and nothing else. The short binds the old
+    /// `<=` served are the fold's per-pass family — the index table that rides the mask's shift,
+    /// whose block stride is the one number its mint shares with the mask's own — and those
+    /// mints state `FoldBlocks` where they are sized. A short bind against any other placement
+    /// now has no value to arrive in.
     pub fn place_raw(&self, id: bundle::PlaceId, bytes: Vec<u8>) -> Option<RawBind> {
         let p = self.places.get(&id)?;
-        (bytes.len().is_multiple_of(4) && bytes.len() as u64 <= p.size)
+        (bytes.len().is_multiple_of(4) && p.cover.admits(bytes.len() as u64, p.size))
             .then_some(RawBind { id, bytes })
     }
 
@@ -1746,6 +1824,78 @@ impl Executor {
         self.raw_ids.insert(b.id);
         self.staged.remove(&b.id);
         self.bound.insert(b.id, b.bytes);
+    }
+
+    /// ⭐ THE PLACEMENT EXTENT of step-input `slot`, in bytes — the QUERY half of the fill
+    /// contract. The caller sizes its bytes against the artifact's own answer (the discovery
+    /// table's tid, resolved through the placement the placement pass sized from the program's
+    /// own view), and [`Self::fill_step_input`]'s `==` law re-measures the same number at the
+    /// door — so a derivation that disagrees with the bake refuses twice, at both ends.
+    ///
+    /// `None` when this bundle DECLARES no such slot — the caller's query-then-fill gate, so an
+    /// undeclared slot is a quiet skip and not a refusal the caller re-derives around — or when
+    /// the table names a tid this bundle never placed (a bake desync, which the fill would
+    /// refuse anyway; seeing it here names it earlier).
+    pub fn step_input_extent(&self, slot: u32) -> Option<u64> {
+        let si = self
+            .code
+            .layout
+            .step_inputs
+            .iter()
+            .find(|s| s.slot == slot)?;
+        Some(self.code.layout.place_of_tid(si.tid)?.size)
+    }
+
+    /// ⭐⭐⭐⭐⭐ FILL ONE HOST-STAGED STEP INPUT — the runtime's staging half of the per-step
+    /// inputs a spliced program binds past the graph.
+    ///
+    /// The SLOT is the caller's whole handle. This resolves it through the bundle's own baked
+    /// discovery table (data — the runtime never recomputes the producer's `tensors.len()+k`
+    /// numbering), measures the bytes against the placement's extent (the program's own
+    /// `construct_memory_view` statement, sized by the placement pass from that same view), and
+    /// routes them through the channel the bake's staging law states — the f16 narrowing or the
+    /// raw copy, both of which are the guarded channels above. Every disagreement refuses naming
+    /// the slot and the tid (see [`bundle::BundleLayout::step_input_fill`], where the law lives).
+    ///
+    /// ⛔ ZERO KERNEL VOCABULARY, AND THAT IS THE WHOLE DESIGN: this asks WHICH slot, HOW MANY
+    /// bytes, and WHICH channel — nothing about what the input IS. The caller that knows the
+    /// content (a page table, a validity mask) computes it and hands over bytes; a second kernel
+    /// family stating per-step inputs flows through here unchanged.
+    ///
+    /// ⛔ REFUSED BEFORE `prepare`, unlike the channels it routes to: a bind that arrives before
+    /// prepare is latched as a RESIDENT weight and never re-sent, and a per-step input that stops
+    /// being re-sent is every later launch reading the first launch's bytes — silently, fluently
+    /// wrong. The refusal is the cheapest place that cannot happen.
+    pub fn fill_step_input(&mut self, slot: u32, bytes: Vec<u8>) -> Result<()> {
+        if !self.prepared {
+            bail!(
+                "fill_step_input(slot {slot}): session NOT YET PREPARED — a bind before prepare is \
+                 latched as a resident weight and never re-sent, so a per-step input staged now \
+                 would freeze the first launch's bytes into every later one"
+            );
+        }
+        let fill = self
+            .code
+            .layout
+            .step_input_fill(slot, bytes.len())
+            .map_err(|e| anyhow!("{e} (bundle {})", self.code.fp))?;
+        match fill.stage {
+            bundle::StepInputStage::IeeeF16 => self.bind_input(fill.place, bytes)?,
+            bundle::StepInputStage::RawU32 => {
+                // `place_raw` is the ONLY constructor of the value `bind_input_raw` accepts; its
+                // own guards (whole u32 entries, no over-bind) are subsumed by the fill's `==`
+                // law but re-deriving nothing — it re-measures against the same placement.
+                let rb = self.place_raw(fill.place, bytes).ok_or_else(|| {
+                    anyhow!(
+                        "fill_step_input(slot {slot}): the bytes passed the fill's extent law but \
+                         not the raw channel's own entry law — a u32 staging whose length is not a \
+                         whole number of entries"
+                    )
+                })?;
+                self.bind_input_raw(rb);
+            }
+        }
+        Ok(())
     }
 
     /// ⭐⭐⭐⭐⭐ Bind a RESIDENT FP32 CONSTANT at load — staged VERBATIM, once, never re-bound.
@@ -2528,7 +2678,7 @@ impl Executor {
         // the slot a fold writes are different addresses; the write base is request 0's page 2 —
         // a real block-table walk, not a zero.
         let slot = SeqPos(2 * per + 5);
-        let kv_page_base = RowPage::of(&fold, RowIdx::from_launch_row(0), 2)
+        let kv_page_base = RowPage::of(&fold, RowIdx::from_launch_row(0), PageOrd::of_index(2))
             .map(|rp| fold_plan::page_base_bytes(&fold, rp))
             .unwrap_or(Bytes(0));
         let mk = |bank: usize, off: [u64; NUM_SEGMENTS]| LaunchWhere {
@@ -2922,6 +3072,13 @@ impl Executor {
         // `page_fold` its own launch groups carry (what `fold_plan::reps` multiplies by) — any
         // class's fold makes the step a fold, not a chunk.
         let mut folds_any = false;
+        // ⭐ THE STAGING CHANNEL, folded from the same launch groups: whether this body's
+        // gathered table is the FILL-STAGED REGION FORM. A region-form body answers
+        // `gathers` YES (absolute entries, zero shift) but its table is already staged by
+        // the host fill — the composer must not drive it as a chunk body, and no
+        // KV-block-index step is minted for it. Folded strongest-claim like `gathers_any`:
+        // any class's region-form group makes the step's page-list answer false.
+        let mut region_form_any = false;
         for c in 0..self.n_classes() {
             let ls = self.list_sel_for(sel, c);
             gathers_any |= crate::wiring::GathersKv::of_launch_groups(
@@ -2929,12 +3086,14 @@ impl Executor {
             )
             .get();
             folds_any |= self.list(ls).iter().any(|o| o.kv.page_fold);
+            region_form_any |= self.list(ls).iter().any(|o| o.kv.region_form);
         }
         Ok(StepBody {
             sel,
             swept: self.body_swept(sel),
             gathers: crate::wiring::GathersKv::of_launch_groups([gathers_any]),
             folds: folds_any,
+            region_form: gathers_any && region_form_any,
             // The rung's op-local pin slots, the same layout's baked sum — every bundle of the
             // rung carries the same number, so the body's own artifact is as good a seat as any.
             lx_op_local_bytes: self.code.layout.lx_op_local_bytes,
@@ -3172,6 +3331,80 @@ impl Executor {
         r
     }
 
+    /// LEG-1(c): the `[cachewr]` line — the first slot-write op's aim ingredients plus the
+    /// DISTINCT target pages of every slot-write in the rung, with the write-request's own
+    /// block-table row. `None` when the rung has no cache write or its page sweep is refused
+    /// (the walk's own refusal follows). The aim is the SAME `fold_plan::seg_deltas` the walk
+    /// calls, never a re-derivation.
+    fn cachewr_aim_line(
+        &self,
+        ops: &Ops,
+        where_: &LaunchWhere,
+        byte_off: [u64; NUM_SEGMENTS],
+        n_fold_pages: i64,
+    ) -> Option<((i64, Vec<i64>), String)> {
+        let op0 = ops.iter().find(|o| o.kv.slot_write)?;
+        let per = fold_plan::UniformPages::sweeping(n_fold_pages, &self.fold)?;
+        let launch = SlotPos::of_launch(where_.slot_pos.0);
+        let stride = self.fold.page_stride_bytes.0;
+        let mut pages: Vec<i64> = Vec::new();
+        let mut first = String::new();
+        for op in ops.iter().filter(|o| o.kv.slot_write) {
+            // The geometry mint, per op — each op carries its own baked modulus. A
+            // disagreement yields no line (the walk's own refusal follows, naming the op).
+            let Ok(geo) = fold_plan::PageGeometry::agree(&op.kv, &self.fold) else {
+                return None;
+            };
+            let Some(delta) =
+                fold_plan::seg_deltas(&op.kv, &self.fold, geo, 0, per, launch, where_.kv_page_base)
+                    .deltas()
+            else {
+                continue;
+            };
+            let abs = byte_off[SEG_KV.get()] + delta.kv.0;
+            // ⛔ NOT `+ where_.kv_page_base`: `nonfold_page_delta` already RETURNS the caller's
+            // base as the delta (fold_plan.rs `Some(caller_base)` — the solo arm), so the walk
+            // composes the base exactly ONCE (`off = byte_off; off[seg] += delta.kv`). Adding
+            // `kv_page_base` on top double-counted it and printed page 2 for a page-1 write —
+            // chatG's pg1/pg2 windows caught the instrument, not the launch (pg2 never written).
+            let pg = if stride > 0 {
+                (abs / stride) as i64
+            } else {
+                -1
+            };
+            if !pages.contains(&pg) {
+                pages.push(pg);
+            }
+            if first.is_empty() {
+                use std::fmt::Write as _;
+                let _ = write!(
+                    first,
+                    "op {} ({}): delta_kv={} byte_off_kv={} abs_in_seg={} page={pg}",
+                    op.index,
+                    op.label(),
+                    delta.kv.0,
+                    byte_off[SEG_KV.get()],
+                    abs
+                );
+            }
+        }
+        if first.is_empty() {
+            return None;
+        }
+        let row = self
+            .fold
+            .block_tables
+            .get(op0.kv.request as usize)
+            .cloned()
+            .unwrap_or_default();
+        let text = format!(
+            "[cachewr] slot_pos={} kv_page_base={} page_stride={} row_pages={row:?} \
+             distinct_target_pages={pages:?} first: {first}",
+            where_.slot_pos.0, where_.kv_page_base.0, stride
+        );
+        Some(((where_.slot_pos.0, pages), text))
+    }
+
     fn launch_ops_inner(&mut self, ops: &Ops, where_: LaunchWhere, d: &Diag) -> Result<()> {
         // `slot_pos`/`kv_page_base`/`weight_bank` are read only inside
         // `cb_plan::launch_site`, through `where_` — nothing else in the walk uses them.
@@ -3180,6 +3413,20 @@ impl Executor {
             n_fold_pages,
             ..
         } = where_;
+        // LEG-1(c) under `segaddr`: where this rung's cache writes AIM — one line per step (the
+        // rolled body re-launches per layer, so the line is keyed on the write slot + the DISTINCT
+        // target pages and only prints when that key moves). The aim is the SAME `seg_deltas` the
+        // walk calls, never a re-derivation: the page each slot-write lands in is
+        // `(byte_off_kv + delta.kv) / page_stride` — the caller's page base arrives ONCE, inside
+        // the delta (`nonfold_page_delta` returns it), never as a separate addend.
+        if d.segaddr {
+            if let Some((key, text)) = self.cachewr_aim_line(ops, &where_, byte_off, n_fold_pages) {
+                if self.cachewr_seen.as_ref() != Some(&key) {
+                    self.cachewr_seen = Some(key);
+                    eprintln!("{text}");
+                }
+            }
+        }
         // 🛑 THE DRAIN AT THE START IS WHAT MAKES THE LADDER MEAN ANYTHING. A launch is async and
         // the stream is in-order, so at any moment the device is a whole layer behind the host.
         // Timing from an un-drained start measures `backlog + ops[0..j]`, and the backlog shrinks by
@@ -3448,7 +3695,10 @@ impl Executor {
             }
 
             if d.optrace {
-                self.optrace(oi)?;
+                // ⭐ THE OP'S OWN NAME, on the line that reports it — the label the group-time and
+                // launch-mark paths already print (:3659/:3511), so a trace names its ops without a
+                // harvest pull. Passed in (not re-derived) because the op is the loop's own local.
+                self.optrace(oi, &op.label())?;
             }
             if d.tensordump.is_some() {
                 self.tensordump(oi, op)?;
@@ -3783,9 +4033,9 @@ impl Executor {
     /// print nonzero-count + max|.|. One prefill run then shows the signal flow op-by-op; the op
     /// index where nz collapses to 0 (or max → inf) IS the divergence. seg1 (weights, ~2.6 GB) is
     /// deliberately SKIPPED: static across the pass and already ruled out.
-    fn optrace(&mut self, oi: usize) -> Result<()> {
+    fn optrace(&mut self, oi: usize, label: &str) -> Result<()> {
         let _ = self.stream_ref()?.synchronize();
-        let mut line = format!("[optrace] op[{oi}]");
+        let mut line = format!("[optrace] op[{oi}] {label}");
         for i in [0usize, 2, 3, 4, 5, 6] {
             let seg = SegIdx::checked(i as i64).expect("literal < NUM_SEGMENTS");
             let got = self.d2h_seg_clamped(seg);
@@ -3880,6 +4130,7 @@ impl Executor {
                 prog,
                 op: 0,
                 snap: std::collections::HashMap::new(),
+                wins: vec![None; 2],
             });
         }
         let _ = self.stream_ref()?.synchronize();
@@ -3965,6 +4216,90 @@ impl Executor {
             let _ = std::fs::write(dir.join(format!("{stem}.n")), format!("{elems}\n"));
             let _ = std::fs::write(dir.join(format!("{tl}.bin")), &raw_bytes);
             let _ = std::fs::write(dir.join(format!("{tl}.n")), format!("{elems}\n"));
+        }
+        // ── LEG-2: the pool windows NO PLACEMENT NAMES. The placement watch above covers page 0 of
+        // seg2 only (the one-page host shadow), but the paged KV path lives at page 1 (the
+        // request's block — the gather's read target) and page 2 (the doubled base the LEG-1 aim
+        // line pinned as the cachewr target). Two fixed 1 MiB windows (layer 0's K/V/Kt planes =
+        // 3 × 256 KiB, plus margin), same first-writer/change detection and file naming as the
+        // placements: a window whose content appears, moves or stays empty is a FACT about where
+        // the chunk KV landed, not an inference from page 0's leftovers.
+        //
+        // ⛔ NO BAKED-ABSOLUTE WINDOW, BY MEASUREMENT (chatG, 10-23): the emitter's own plan
+        // addresses seg2 at SEGMENT_OFFSETS[2] = 0x8_0000_0000, a 16 GiB region no runtime
+        // allocation holds — and the runtime CANNOT even address it: a D2H minted over that
+        // region is rejected by the DeviceAddressResolver ("could not resolve region"), and the
+        // rejection leaves a DEFERRED ERROR on the stream that refuses the next real launch. So
+        // baked absolutes are unrepresentable at runtime — the symbolic bundle's segbase + off
+        // decomposition is the only mechanism any op's addresses run under — and attempting the
+        // read kills the run. The window set therefore stops at the pool's own pages.
+        let stride = self.fold.page_stride_bytes.0;
+        if stride > 0 {
+            if let Some(pool) = self.seg_addr[SEG_KV.get()].clone() {
+                const WIN: u64 = 1 << 20;
+                let wants: [(&str, Option<DevAddr>); 2] = [
+                    ("pg1", pool.window(ByteOffset(stride), ByteSize(WIN))),
+                    ("pg2", pool.window(ByteOffset(2 * stride), ByteSize(WIN))),
+                ];
+                // Read every window BEFORE touching `dump` (the stream borrow and the dump borrow
+                // are disjoint phases, the same split `d2h_seg_clamped` makes).
+                let mut bufs: [Option<Vec<u8>>; 2] = [None, None];
+                for (bi, (_, waddr)) in wants.iter().enumerate() {
+                    let Some(waddr) = waddr else {
+                        continue; // a window past the pool's end — not addressable, nothing to read
+                    };
+                    let mut buf = vec![0u8; WIN as usize];
+                    let stream = self.stream_ref()?;
+                    match stream
+                        .d2h(&mut buf, waddr)
+                        .and_then(|_| stream.synchronize())
+                    {
+                        Ok(()) => bufs[bi] = Some(buf),
+                        Err(e) => {
+                            use std::io::Write as _;
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(dir.join("windows.txt"))
+                            {
+                                let _ = writeln!(
+                                    f,
+                                    "op{opno} prog{prog} {}: window read FAILED: {e}",
+                                    wants[bi].0
+                                );
+                            }
+                        }
+                    }
+                }
+                for (bi, (name, _)) in wants.iter().enumerate() {
+                    let Some(cur) = bufs[bi].as_ref() else {
+                        continue;
+                    };
+                    let dump = self.dump.as_mut().expect("initialized above");
+                    let moved = match dump.wins[bi].as_ref() {
+                        Some(prev) => prev != cur,
+                        None => cur.iter().any(|b| *b != 0),
+                    };
+                    if !moved {
+                        continue;
+                    }
+                    dump.wins[bi] = Some(cur.clone());
+                    let elems = WIN as usize / 2; // the KV planes are SEN169_FP16
+                    let mut vals = Vec::with_capacity(elems);
+                    for c in cur.as_chunks::<2>().0 {
+                        vals.push(sen_convert::sen_to_f32(sen_convert::SenF16(
+                            u16::from_le_bytes(*c),
+                        )));
+                    }
+                    let raw_bytes: Vec<u8> = vals.iter().flat_map(|x| x.to_le_bytes()).collect();
+                    let stem = format!("prog{prog}_seg2win_{name}");
+                    let tl = format!("op{opno}_prog{prog}_seg2win_{name}");
+                    let _ = std::fs::write(dir.join(format!("{stem}.bin")), &raw_bytes);
+                    let _ = std::fs::write(dir.join(format!("{stem}.n")), format!("{elems}\n"));
+                    let _ = std::fs::write(dir.join(format!("{tl}.bin")), &raw_bytes);
+                    let _ = std::fs::write(dir.join(format!("{tl}.n")), format!("{elems}\n"));
+                }
+            }
         }
         if !skipped.is_empty() {
             use std::io::Write as _;
@@ -5019,8 +5354,12 @@ impl Executor {
             return Bytes(0);
         }
         let lp = seq_pos.0 / self.kv.page_slots.0.max(1);
-        RowPage::of(&self.fold, RowIdx::from_launch_row(0), lp)
-            .map_or(Bytes(0), |rp| fold_plan::page_base_bytes(&self.fold, rp))
+        RowPage::of(
+            &self.fold,
+            RowIdx::from_launch_row(0),
+            PageOrd::of_index(lp),
+        )
+        .map_or(Bytes(0), |rp| fold_plan::page_base_bytes(&self.fold, rp))
     }
 
     // ──────────────────────────────────────────────────────────────────────────────────────────
@@ -5502,6 +5841,27 @@ impl Executor {
     /// The RULE (slot 0 retires the last forward's rows, so the inferred fold width is this
     /// forward's and not a high-water mark) lives on [`SessionKv`], which owns the state.
     fn install_page_map(&mut self, req: RowIdx, pos: SeqPos, pages: &[i64]) {
+        // LEG-1(a) under `segaddr`: the page assignment each request actually runs with — one
+        // line, one write. `real` separates a `set_block_table` install from the create-time
+        // identity default (which is every page, so long lists print as a range, not 545 numbers).
+        if Diag::get().segaddr {
+            let shown = if pages.len() > 16 {
+                format!(
+                    "n={} [{:?}..{}]",
+                    pages.len(),
+                    &pages[..4],
+                    pages[pages.len() - 1]
+                )
+            } else {
+                format!("{pages:?}")
+            };
+            eprintln!(
+                "[pageassign] req={} pos={} real={} pages={shown}",
+                req.get(),
+                pos.0,
+                self.block_table_set
+            );
+        }
         self.fold.install_row(req, SlotPos::of_launch(pos.0), pages);
     }
 
@@ -5610,6 +5970,7 @@ pub struct StepBody {
     swept: SweptCols,
     gathers: crate::wiring::GathersKv,
     folds: bool,
+    region_form: bool,
     lx_op_local_bytes: u64,
     lx_prob_pin_bytes: u64,
 }
@@ -5631,13 +5992,31 @@ impl StepBody {
         self.gathers
     }
 
+    /// ⭐ WHETHER **THIS** BODY'S GATHERED TABLE IS THE FILL-STAGED REGION FORM — the staging
+    /// channel, off the same launch groups (`bundle::KvShifts::region_form`). The body still
+    /// `gathers` (absolute entries, zero shift); its table is staged by the host fill
+    /// (`fill_attn_step_inputs`), so the composer's page-list answer for it is FALSE —
+    /// see [`Self::page_list`].
+    pub const fn region_form(self) -> bool {
+        self.region_form
+    }
+
+    /// ⭐ THE PAGE-LIST ANSWER — whether the HOST must stage this body's index table through
+    /// the composer and mint a KV-block-index step for it: it gathers AND its table is not
+    /// the fill-staged region form. The ONE expression every staging-side consumer keys on
+    /// (the composer's gate and the forward's `gathers` parameter), so the two cannot drift.
+    pub const fn page_list(self) -> bool {
+        self.gathers.get() && !self.region_form
+    }
+
     /// ⭐ WHETHER **THIS** BODY IS A SPLIT-KV CHUNK — it gathers and carries no page fold, so it attends
     /// exactly its own chunk in one launch and the host stages the CHUNK's index and mask, not the
     /// fold's. On a decode batch this is what separates a chunk rung from the gathered fold below and
     /// past it — both gather, and staging one's table for the other reads real block numbers from the
-    /// wrong layout.
+    /// wrong layout. Keyed on [`Self::page_list`]: a region-form body's staging is the fill's, not
+    /// the chunk table's.
     pub const fn chunk(self) -> bool {
-        self.gathers.get() && !self.folds
+        self.page_list() && !self.folds
     }
 
     /// ⭐ THE RUNG'S OP-LOCAL LX PIN SLOTS, in bytes — read off the selected body's own baked

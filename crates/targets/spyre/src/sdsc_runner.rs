@@ -394,14 +394,42 @@ impl SuperDscSession {
     /// session knows.
     ///
     /// [`gather_entries_per_page`]: scratchy_subtile::sdsc_abstract::gather_entries_per_page
-    pub fn gather_entries_per_page(
+    /// ⭐⭐⭐⭐⭐ THE GATHER'S ENTRY CEILING FOR THIS SESSION — the page factor (`phys → entry`) and the
+    /// page budget (the most pages one region of KV holds) in ONE type, minted from the session's own
+    /// `page_stride_bytes` and the device's own `MAX_SEGMENT_BYTES`, the same two numbers the bake's
+    /// prefix-mask block count and `BundleLayout::gather_reach` derive from. Every index table the
+    /// host stages composes its entries through it, so a value above the pool's bound is
+    /// UNCONSTRUCTIBLE here rather than checked after the fact — and because the bake states the same
+    /// reach through the same door, the stage-time bound and the bake-time bound are one number, not
+    /// two derivations kept in agreement.
+    ///
+    /// ⛔ DERIVED FROM THE SESSION'S OWN `page_stride_bytes`, WHICH IS THE NUMBER `page_base_bytes`
+    /// MULTIPLIES. That is the whole point: the host's page address is `phys * page_stride_bytes` and
+    /// the card's is `idx * skip_addr + base`, so `idx = phys * (page_stride_bytes / skip_addr_bytes)` is an
+    /// identity between two quantities read off the same session — not two derivations that must be kept
+    /// in agreement. `zz_the_gather_index_reproduces_the_host_page_address` pins it.
+    ///
+    /// `None` when the bundle is unpaged, or when a page is not a whole number of entries — in which case
+    /// no integer index can name a page boundary and the caller must refuse rather than round.
+    ///
+    /// The arithmetic itself is [`gather_entry_ceiling`]; this hands it the ONE number only the
+    /// session knows.
+    ///
+    /// [`gather_entry_ceiling`]: scratchy_subtile::sdsc_abstract::gather_entry_ceiling
+    pub fn gather_entry_ceiling(
         &self,
         pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
-    ) -> Option<scratchy_subtile::sdsc_abstract::EntriesPerPage> {
-        scratchy_subtile::sdsc_abstract::gather_entries_per_page(
-            self.exec.kv_page_stride_bytes(),
-            pool,
-        )
+    ) -> Option<scratchy_subtile::sdsc_abstract::GatherEntryCeiling> {
+        let page_bytes = self.exec.kv_page_stride_bytes();
+        // The DEVICE page ceiling — the most pages one flex region of KV holds, the same ceiling
+        // the bake's prefix mask reserves blocks for. A page stride of 0 is an unpaged bundle;
+        // the 0 page ceiling hands it to the door, which refuses it.
+        let page_ceiling = if page_bytes == 0 {
+            0
+        } else {
+            scratchy_spyre_bundle::MAX_SEGMENT_BYTES / page_bytes
+        };
+        scratchy_subtile::sdsc_abstract::gather_entry_ceiling(page_ceiling, page_bytes, pool)
     }
 
     // ⛔ THERE IS NO SECOND FACTOR HERE ANY MORE. `gather_planes_per_page` returned a page-per-PLANE
@@ -455,6 +483,27 @@ impl SuperDscSession {
                     self.pool_pages
                 )
             })
+    }
+
+    /// ⭐ THE PLACEMENT EXTENT of step-input `slot`, in bytes — the session's forward of the
+    /// executor's own query ([`Executor::step_input_extent`]). The FILLER's sizing door: the
+    /// caller stages exactly this many bytes, and `fill_step_input`'s `==` law re-measures them
+    /// against the same placement. `None` when this bundle declares no such slot.
+    ///
+    /// [`Executor::step_input_extent`]: crate::superdsc_exec::Executor::step_input_extent
+    pub fn step_input_extent(&self, slot: u32) -> Option<u64> {
+        self.exec.step_input_extent(slot)
+    }
+
+    /// ⭐⭐⭐ FILL ONE HOST-STAGED STEP INPUT by its SLOT — the session's forward of the executor's
+    /// own door ([`Executor::fill_step_input`]). The slot is the caller's whole handle: the
+    /// discovery, the extent law and the staging channel are the bundle's own baked answers, and
+    /// every disagreement refuses naming the slot. See the executor's doc for why the refusal set
+    /// is what it is (absent slot, unplaced tid, partial bytes, pre-prepare bind).
+    ///
+    /// [`Executor::fill_step_input`]: crate::superdsc_exec::Executor::fill_step_input
+    pub fn fill_step_input(&mut self, slot: u32, bytes: Vec<u8>) -> Result<()> {
+        self.exec.fill_step_input(slot, bytes)
     }
 
     /// Run ONE INCREMENTAL forward over `n_new` NEW positions at `[seq_pos..seq_pos+n_new)`.
@@ -632,7 +681,7 @@ impl SuperDscSession {
         let mut bind_f16_bytes = 0usize;
         for (id, bytes) in activations_f16 {
             bind_f16_bytes += bytes.len();
-            self.exec.bind_input(*id, bytes.clone());
+            self.exec.bind_input(*id, bytes.clone())?;
         }
         // ⛔ `bind_input_raw`, NOT `bind_input`. See `Executor::raw_ids`: the shadow write applies
         // `ieee_to_sen_bytes` to every ordinary bind, which reads each 4-byte index entry as two fp16
@@ -704,7 +753,7 @@ impl SuperDscSession {
 
     /// Bind an activation source (f32 → f16) before a prefix run.
     pub fn bind(&mut self, id: crate::bundle_code::PlaceId, vals: &[f32]) -> Result<()> {
-        self.exec.bind_input(id, f32_to_f16_le(vals));
+        self.exec.bind_input(id, f32_to_f16_le(vals))?;
         Ok(())
     }
 

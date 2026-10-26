@@ -162,6 +162,7 @@ fn scale_program(view: ScaleView) -> KtirNode {
         program: Program::ScalarMul,
         bindings: vec![BufferId::new(301), BufferId::new(302), BufferId::new(303)],
         mask: None,
+        step_inputs: Vec::new(),
         node_out_tid: None,
         minted: Default::default(),
     }
@@ -191,6 +192,7 @@ fn layout_for(k: &KtirNode) -> BundleLayout {
                 bank: 0,
                 offset: (i as u64) * 0x10000,
                 size: bytes,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
     }
@@ -409,6 +411,7 @@ fn a_baked_scale_does_not_read_the_scale_parameter() {
                 bank: 0,
                 offset: 0,
                 size: 2,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
         lower_function(&k, Some(&layout), &mut sid, None)

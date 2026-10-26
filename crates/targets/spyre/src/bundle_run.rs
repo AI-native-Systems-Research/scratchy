@@ -37,6 +37,14 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+/// The `cover` default speaks ONLY for a placements.json written before the field existed. It
+/// picks the STRICTER class on purpose: a stale row read as `Full` refuses a short bind loudly,
+/// it can never silently admit one. The current bake always writes the field; the default never
+/// speaks for a fresh file.
+fn full_cover() -> crate::bundle_code::BindCover {
+    crate::bundle_code::BindCover::Full
+}
+
 /// One `placements.json` entry.
 #[derive(Debug, serde::Deserialize)]
 struct PlaceRow {
@@ -46,6 +54,8 @@ struct PlaceRow {
     bank: u32,
     offset: u64,
     size: u64,
+    #[serde(default = "full_cover")]
+    cover: crate::bundle_code::BindCover,
 }
 
 /// One `synth` entry: an intermediate the lowering minted, with the segment and offset it was
@@ -398,6 +408,9 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
             bank: p.bank,
             offset: p.offset,
             size: p.size,
+            // The bake minted the cover at the placement's own construction site; the door
+            // reads it back here, exactly as it reads the extent.
+            cover: p.cover,
             // ⛔ READ OFF THE PRODUCER'S ROLE, NOT GUESSED FROM THE SEGMENT. The read-back tensor is
             // whichever the producer marked `Logits`; a launcher that picked "the last place" or "the
             // highest segment" would read the wrong buffer on any bundle whose output is not last.
@@ -422,6 +435,10 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         // scalarmul multiplier; a bundle whose ops read none states an empty one, and an empty one is
         // what every current Triton-derived bundle states.
         scalarmul_scales: std::borrow::Cow::Owned(Vec::new()),
+        // Parallel-empty by the layout's own law: the stage list is one length with
+        // `scalarmul_scales`, and this runner's registry (`layout::for_regions`) states no
+        // scales at all — so it stages no f32 slots either.
+        scalarmul_scales_stage: std::borrow::Cow::Owned(Vec::new()),
         // No weight folds: the ScalarMul fold multiplies the WORKER's staged weight bytes at load,
         // and this runner stages inputs from files, not through the worker's binding. An empty list
         // is also what every Triton-derived bundle's layout states (`layout::for_regions`).
@@ -436,6 +453,10 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         lx_op_local_bytes: 0,
         // No chunk form either, so no probability-part pins beside absent gathers.
         lx_prob_pin_bytes: 0,
+        // No host-staged step inputs: this runner's layouts come from `layout::for_regions`, which
+        // serves one kernel minted positionally and states none. A stated input's discovery table
+        // is baked by `bake_layout` on the consumer ladder, whose bundles these are not.
+        step_inputs: std::borrow::Cow::Owned(Vec::new()),
     };
 
     println!("  parsed segment_bytes {:?}", segment_bytes);
@@ -805,7 +826,7 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
             Some((rows, cols)) => restick(&bytes, rows, cols, true),
             None => bytes,
         };
-        exec.bind_input(ktir_superdsc::place::PlaceId::Act(*tid), bytes);
+        exec.bind_input(ktir_superdsc::place::PlaceId::Act(*tid), bytes)?;
     }
 
     // ⛔ BEFORE `prepare`, AND NOT OPTIONAL EVEN WITH NO WEIGHTS. `stage_weights` is where the HOST

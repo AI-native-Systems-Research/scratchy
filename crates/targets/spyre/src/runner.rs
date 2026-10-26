@@ -162,6 +162,7 @@ impl SpyreSession {
     pub fn new_multi(
         programs: &[(&[bundle::LaunchGroup<'static>], &[u64])],
         weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
+        scale_stages: &[(u32, DType)],
     ) -> Result<Self> {
         let mut funcs: Vec<Vec<ktir_core::ir::IRFunction<'static>>> =
             Vec::with_capacity(programs.len());
@@ -187,8 +188,17 @@ impl SpyreSession {
             .map(|f| f.as_slice())
             .zip(specs.iter())
             .collect();
-        let session =
+        let mut session =
             Session::new_multi(prog_refs, args).map_err(|e| anyhow!("Session::new_multi: {e}"))?;
+        // ⭐ SEAT (i): the bundle-stated df of each scale slot, declared to the session AS DATA
+        // (the bake's registry column — `tid → channel`, never a code path keyed on tid
+        // identity). The declaration is the write law's own: it gives the slot a VIEW DTYPE, so
+        // the verbatim arm of `set_source_bytes` fires on an f32 slot UNCHANGED (no new arm, no
+        // changed arm), and it answers the per-source dispatch in `run_step` below. An empty
+        // table — every f16-slot model — declares nothing and stays byte-identical.
+        session
+            .declare_scale_stages(scale_stages)
+            .map_err(|e| anyhow!("declare_scale_stages: {e}"))?;
         Ok(Self { session })
     }
 
@@ -207,6 +217,13 @@ impl SpyreSession {
     /// `&[..]` here meant a `data.clone()` per source: granite's decode binds its whole prefix KV
     /// every step — 40 layers x (K, V) x `[cap, kv_dim]` — so that was ~42 MB memcpy'd per forward
     /// to hand over buffers the caller builds fresh and drops immediately.
+    ///
+    /// ⭐ SEAT (i) — THE PER-SOURCE DISPATCH, ASKING THE SESSION'S STAGED MAP. A source whose slot
+    /// the bundle stated at f32 (the f32 m-merge's constants) lands its RAW little-endian IEEE
+    /// word through `Arg::TensorBytes`, and the resident's UNTOUCHED verbatim law
+    /// (`view_dt == F32`) writes those 4 bytes exactly — the same law that lands fp8 weights
+    /// byte-for-byte. Every other source keeps the incumbent `Arg::Tensor` f16 fill,
+    /// byte-identical to before the df column existed: an all-f16 registry changes nothing here.
     pub fn run_step(
         &mut self,
         prog: usize,
@@ -219,14 +236,19 @@ impl SpyreSession {
         let args: Vec<(u64, Arg)> = sources
             .into_iter()
             .map(|(id, data, shape)| {
-                (
-                    id,
-                    Arg::Tensor {
+                let arg = match self.session.scale_stage_dtype(id) {
+                    Some(DType::F32) => Arg::TensorBytes {
+                        data: data.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                        shape,
+                        dtype: DType::F32,
+                    },
+                    _ => Arg::Tensor {
                         data,
                         shape,
                         dtype: DType::F16,
                     },
-                )
+                };
+                (id, arg)
             })
             .collect();
         // A forward is THREE phases and only one of them is the program; `KTIR_SEG_PROF` reports
@@ -444,7 +466,7 @@ mod tests {
 
         let mask = attn_mask_fill(4, 2);
         assert_eq!(mask, vec![0.0, 0.0, -1.0e38, -1.0e38]);
-        let mut session = SpyreSession::new_multi(&[(&[group], &[OUT])], Vec::new())
+        let mut session = SpyreSession::new_multi(&[(&[group], &[OUT])], Vec::new(), &[])
             .expect("build the one-program session");
         let out = session
             .run_step(

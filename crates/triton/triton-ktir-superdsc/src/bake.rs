@@ -277,15 +277,26 @@ pub fn write_placements(
     }
     s.push_str("],\n  \"places\": [\n");
     for (i, (tid, p)) in layout.placements.iter().enumerate() {
+        // The cover, in serde's own externally-tagged shape, so `bundle_run`'s `PlaceRow` reads it
+        // back through its derived `Deserialize`. A bake that omits it would leave the CLI's
+        // conservative `Full` default to speak for the fold's per-pass tensors — the bake's own
+        // statement is the one the door must read.
+        let cover = match &p.cover {
+            ktir_superdsc::placement::BindCover::Full => "\"Full\"".to_string(),
+            ktir_superdsc::placement::BindCover::FoldBlocks { block_bytes } => {
+                format!("{{\"FoldBlocks\":{{\"block_bytes\":{block_bytes}}}}}")
+            }
+        };
         let _ = writeln!(
             s,
-            "    {{\"tid\": {}, \"role\": \"{:?}\", \"segment\": {}, \"bank\": {}, \"offset\": {}, \"size\": {}}}{}",
+            "    {{\"tid\": {}, \"role\": \"{:?}\", \"segment\": {}, \"bank\": {}, \"offset\": {}, \"size\": {}, \"cover\": {}}}{}",
             tid,
             p.role,
             p.segment,
             p.bank,
             p.offset,
             p.size,
+            cover,
             if i + 1 == layout.placements.len() {
                 ""
             } else {

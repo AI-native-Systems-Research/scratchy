@@ -33,7 +33,7 @@ fn kvh(i: u32) -> KvHead {
 #[test]
 fn a_slot_costs_a_lane_on_kt_and_a_stick_on_v() {
     for hd in [64usize, 80, 128, 256] {
-        let p = PagedKvPool::new(NKVH, hd);
+        let p = PagedKvPool::new(NKVH as u32, hd as u32);
         let stick = 64u32;
         for h in [0u32, 3, 7] {
             let kt = KvCoord::block(KvPlane::Kt, kvh(h));
@@ -87,7 +87,7 @@ fn a_slot_costs_a_lane_on_kt_and_a_stick_on_v() {
 #[test]
 fn only_kt_spans_its_whole_plane_with_slots_at_any_head_dim() {
     for hd in [64usize, 128, 256] {
-        let p = PagedKvPool::new(NKVH, hd);
+        let p = PagedKvPool::new(NKVH as u32, hd as u32);
         let footprint = p.plane_block_elems() as u32;
         for plane in [KvPlane::Kt, KvPlane::V, KvPlane::Knat] {
             let base = KvCoord::block(plane, kvh(0));
@@ -131,7 +131,7 @@ fn only_kt_spans_its_whole_plane_with_slots_at_any_head_dim() {
 #[test]
 fn no_two_slots_of_a_plane_can_alias() {
     for hd in [64usize, 80, 128, 256] {
-        let p = PagedKvPool::new(NKVH, hd);
+        let p = PagedKvPool::new(NKVH as u32, hd as u32);
         let footprint = p.plane_block_elems() as u32;
         for plane in [KvPlane::Kt, KvPlane::V, KvPlane::Knat] {
             for h in [0u32, 5, 7] {
@@ -168,7 +168,7 @@ fn no_two_slots_of_a_plane_can_alias() {
 #[test]
 fn no_two_slot_feature_pairs_can_alias() {
     for hd in [64usize, 128, 256] {
-        let p = PagedKvPool::new(NKVH, hd);
+        let p = PagedKvPool::new(NKVH as u32, hd as u32);
         for plane in [KvPlane::Kt, KvPlane::V, KvPlane::Knat] {
             let base = KvCoord::block(plane, kvh(2));
             let mut seen: std::collections::BTreeMap<u32, (u32, u32)> = Default::default();

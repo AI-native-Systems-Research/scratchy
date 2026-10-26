@@ -166,6 +166,7 @@ fn add_family(view: (i64, i64), blocks: &[(i64, i64, i64, i64)]) -> KtirNode {
         program: Program::Elementwise(Elementwise::Add),
         bindings: vec![BufferId::new(401), BufferId::new(402), BufferId::new(403)],
         mask: None,
+        step_inputs: Vec::new(),
         node_out_tid: None,
         minted: Default::default(),
     }
@@ -300,6 +301,7 @@ fn silu_family(view: (i64, i64), blocks: &[(i64, i64, i64, i64)]) -> KtirNode {
         program: Program::Elementwise(Elementwise::Silu),
         bindings: vec![BufferId::new(401), BufferId::new(402)],
         mask: None,
+        step_inputs: Vec::new(),
         node_out_tid: None,
         minted: Default::default(),
     }
@@ -323,6 +325,7 @@ fn layout_for(k: &KtirNode, view: (i64, i64)) -> BundleLayout {
                 bank: 0,
                 offset: (i as u64) * 0x10000,
                 size: (view.0 * view.1 * 2) as u64,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
     }
@@ -546,5 +549,206 @@ fn row_blocks_of_a_bare_silu_fold_into_one_whole_view_descriptor() {
         (d.N_.mb_, d.N_.out_),
         (64, 128),
         "the folded descriptor spans the WHOLE view, exactly as the binary family's does"
+    );
+}
+
+/// One SUBTRACTION-BY-CONSTANT program over parameters `a`, `out` — each viewed
+/// `[view.0, view.1]` — stating one load/subtract/store family per block in `blocks`. A block
+/// is `(r_start, r_len, c_start, c_len, const_first)`: the `const_first` flag states WHICH
+/// input the one shared splatted constant occupies in that block's `arith.subf` — the ORDER
+/// fact, non-commutative, carried per block so the mixing test can state two functions under
+/// one family's stores.
+fn sub_family(view: (i64, i64), blocks: &[(i64, i64, i64, i64, bool)]) -> KtirNode {
+    let a: &'static Arena = Arena::global();
+    let shape = |op: Operation<'static>, r: i64, c: i64| {
+        op.with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![r, c])))
+            .with_attr(a, AttrKey::Dtype, Attr::Dtype(DType::F16))
+    };
+
+    let (p_a, p_out) = (Ssa(0), Ssa(1));
+    let mut next = 2u32;
+    let mut ssa = || {
+        let s = Ssa(next);
+        next += 1;
+        s
+    };
+
+    let (v_a, v_o) = (ssa(), ssa());
+    let mut ops = vec![
+        shape(
+            Operation::new(a, Some(v_a), OpKind::KtdpConstructMemoryView, &[p_a]),
+            view.0,
+            view.1,
+        ),
+        shape(
+            Operation::new(a, Some(v_o), OpKind::KtdpConstructMemoryView, &[p_out]),
+            view.0,
+            view.1,
+        ),
+    ];
+
+    // ONE shared constant, splatted once — the family's stated subtrahend (the f16 floor, the
+    // online softmax's running-max initial, a constant no graph payload names).
+    let (cst, splat) = (ssa(), ssa());
+    ops.push(
+        Operation::new(a, Some(cst), OpKind::ArithConstant, &[]).with_attr(
+            a,
+            AttrKey::Value,
+            Attr::Float(-65504.0),
+        ),
+    );
+    ops.push(shape(
+        Operation::new(a, Some(splat), OpKind::TensorSplat, &[cst]),
+        1,
+        1,
+    ));
+
+    for &(r_start, r_len, c_start, c_len, const_first) in blocks {
+        let (c_rs, c_cs) = (ssa(), ssa());
+        ops.push(
+            Operation::new(a, Some(c_rs), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Int(r_start),
+            ),
+        );
+        ops.push(
+            Operation::new(a, Some(c_cs), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Int(c_start),
+            ),
+        );
+        let (t_a, l_a) = (ssa(), ssa());
+        ops.push(shape(
+            Operation::new(
+                a,
+                Some(t_a),
+                OpKind::KtdpConstructAccessTile,
+                &[v_a, c_rs, c_cs],
+            ),
+            r_len,
+            c_len,
+        ));
+        ops.push(shape(
+            Operation::new(a, Some(l_a), OpKind::KtdpLoad, &[t_a]),
+            r_len,
+            c_len,
+        ));
+        let sub = ssa();
+        let operands = if const_first {
+            &[splat, l_a]
+        } else {
+            &[l_a, splat]
+        };
+        ops.push(shape(
+            Operation::new(a, Some(sub), OpKind::ArithSubf, operands),
+            r_len,
+            c_len,
+        ));
+        let t_o = ssa();
+        ops.push(shape(
+            Operation::new(
+                a,
+                Some(t_o),
+                OpKind::KtdpConstructAccessTile,
+                &[v_o, c_rs, c_cs],
+            ),
+            r_len,
+            c_len,
+        ));
+        ops.push(Operation::new(a, None, OpKind::KtdpStore, &[sub, t_o]));
+    }
+
+    KtirNode {
+        func: IRFunction {
+            name: "row_fold_sub",
+            arguments: a.args(vec![(p_a, IrType::Index), (p_out, IrType::Index)]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        },
+        program: Program::Elementwise(Elementwise::Sub),
+        bindings: vec![BufferId::new(401), BufferId::new(402)],
+        mask: None,
+        step_inputs: Vec::new(),
+        node_out_tid: None,
+        minted: Default::default(),
+    }
+}
+
+/// The subtraction family's layout: `layout_for`'s placements plus the scale registry the
+/// subtraction's own scalar form resolves through — the door looks the stated constant up BY
+/// VALUE, so the layout that baked the program must carry it (and its `[1,1]` slot placement).
+fn sub_lowered(
+    k: &KtirNode,
+    view: (i64, i64),
+) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> {
+    let mut layout = layout_for(k, view);
+    layout.scalarmul_scales = vec![-65504.0];
+    layout.synth(
+        ktir_superdsc::place::PlaceId::Act(ktir_superdsc::reserved_tids::scalarmul_scale_tid(0)),
+        &[1, 1],
+    );
+    let mut sid = 0i64;
+    lower_function(k, Some(&layout), &mut sid, None).map_err(|e| e.message)
+}
+
+/// ⭐ THE SUBTRACTION FAMILY FOLDS TOO — one ORDER throughout. Two `tile − C` blocks that tile
+/// the view fold to ONE whole-view descriptor, exactly the binary family's fold: the kind is
+/// `RowFoldKind::ScalarSub`, one input per block (the tile — the constant rides the op), and
+/// the leader lowers through the subtraction's own scalar form.
+#[test]
+fn row_blocks_of_a_subtraction_fold_into_one_whole_view_descriptor() {
+    let view = (64, 128);
+    let k = sub_family(view, &[(0, 32, 0, 128, false), (32, 32, 0, 128, false)]);
+    let ops = sub_lowered(&k, view).expect("a tiling subtraction family folds");
+    let [op] = &ops[..] else {
+        panic!(
+            "two row blocks of one subtraction are ONE folded op, got {:?}",
+            ops.iter().map(|o| o.op_name.clone()).collect::<Vec<_>>()
+        );
+    };
+    assert_eq!(
+        op.op_name, "scalarmul_o402",
+        "the folded op is the family's one subtraction"
+    );
+    assert_eq!(
+        op.time, 1,
+        "the fold emits no tiling of its own — time factor 1"
+    );
+    let d = dsc(op);
+    assert_eq!(
+        (d.N_.mb_, d.N_.out_),
+        (64, 128),
+        "the folded descriptor spans the WHOLE view, exactly as the binary family's does"
+    );
+}
+
+/// ⛔ A FAMILY MIXING THE TWO ORDERS OF A SUBTRACTION IS REFUSED. `C − tile` and `tile − C`
+/// are DIFFERENT functions, so the ORDER rides `RowFoldKind::ScalarSub` itself: one block
+/// stating each order is two kinds under one family's stores, and the fold refuses rather
+/// than merge blocks that compute different functions per block — the same law that refuses
+/// a family whose blocks clamped at different bounds.
+#[test]
+fn a_family_mixing_the_two_orders_of_a_subtraction_is_refused() {
+    let view = (64, 128);
+    let k = sub_family(view, &[(0, 32, 0, 128, false), (32, 32, 0, 128, true)]);
+    let e = match sub_lowered(&k, view) {
+        Err(e) => e,
+        Ok(ops) => panic!(
+            "a family mixing `tile − C` and `C − tile` must refuse, not fold {} op(s) over two \
+             different functions",
+            ops.len()
+        ),
+    };
+    assert!(
+        e.contains("not one op family"),
+        "the refusal names the kind mismatch, got: {e}"
+    );
+    assert!(
+        e.contains("const_first"),
+        "the refusal's kinds carry the ORDER fact, so the two sides are named as the different \
+         functions they are, got: {e}"
     );
 }

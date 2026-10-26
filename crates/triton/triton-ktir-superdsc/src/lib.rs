@@ -99,6 +99,10 @@ pub fn node_for(m: &triton_ktir::ir::Module, program: Program) -> Result<KtirNod
         program,
         bindings,
         mask: None,
+        // The adapter is POSITIONAL — it knows the module's parameters and nothing about
+        // the tape that will re-bind them, so it states no host-staged inputs. A node
+        // with per-step inputs states them in its own re-state (the splice's `mint`s).
+        step_inputs: Vec::new(),
         node_out_tid: None,
         minted: Default::default(),
     })
@@ -264,13 +268,15 @@ fn emit_regions(
         // selected by geometry match) is REMOVED — attention is lowered from its compiled ops
         // through the whole-function door, and a per-`Program` dispatch would be a second,
         // hand-rolled path. Do not re-add one.
-        Program::Attn | Program::Rope => {
+        Program::Attn | Program::Rope | Program::RopeAppend => {
             return Err(Error {
                 stage: "program",
                 message: format!(
-                    "{:?} crosses the model-geometry const door (`rope_at::<HD>`), so it cannot \
-                     be dispatched from a runtime `Program`. Call the generic entry with the \
-                     fixture's own tl.constexpr values",
+                    "{:?} crosses a door this ladder does not hold (`rope_at::<HD>`'s \
+                     model-geometry consts for Rope; the spyre target's whole-function walk \
+                     plus the Kᵀ tail for Attn and the append), so it cannot be dispatched \
+                     from a runtime `Program`. Call the entry the fixture's own tl.constexpr \
+                     values name",
                     node.program
                 ),
             });

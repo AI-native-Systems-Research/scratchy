@@ -14,7 +14,7 @@
 //!
 //! [`distribute_cores`]: ktir_superdsc::work::distribute_cores
 
-use ktir_superdsc::emit::{In, assemble_pointwise_broadcast_off};
+use ktir_superdsc::emit::{In, PointwiseFacts, assemble_pointwise_broadcast_off};
 use ktir_superdsc::sdsc_abstract::{BlockCols, RowBlockedTag, RowCount, StickLayout, Stk};
 use ktir_superdsc::superdsc_opspec::{Df, ItDim, MAX_CORES, MaxCores, WorkPlan};
 use ktir_superdsc::work::{
@@ -165,28 +165,54 @@ fn the_measured_shapes_split_their_sticks_first() {
     );
 }
 
-/// The law's resolution: sticks first only for a stick-major op touching no core-local pin, and a
-/// concrete division is its own answer.
+/// The law's resolution: sticks first only for a stick-major op touching no core-local pin, sprays
+/// first for a row-split (y-major) op, and a concrete division is its own answer.
 #[test]
 fn the_law_resolves_on_the_layout_and_the_pins() {
     assert_eq!(
-        EwDivision::Law.resolve(true, false),
+        EwDivision::Law.resolve(true, false, false),
         EwDivision::SticksFirst
     );
-    assert_eq!(EwDivision::Law.resolve(true, true), EwDivision::RowsFirst);
-    assert_eq!(EwDivision::Law.resolve(false, false), EwDivision::RowsFirst);
     assert_eq!(
-        EwDivision::RowsFirst.resolve(true, false),
+        EwDivision::Law.resolve(true, true, false),
         EwDivision::RowsFirst
     );
     assert_eq!(
-        EwDivision::SticksFirst.resolve(false, true),
+        EwDivision::Law.resolve(false, false, false),
+        EwDivision::RowsFirst
+    );
+    assert_eq!(
+        EwDivision::RowsFirst.resolve(true, false, false),
+        EwDivision::RowsFirst
+    );
+    assert_eq!(
+        EwDivision::SticksFirst.resolve(false, true, false),
         EwDivision::SticksFirst
+    );
+    // ⭐ THE ROW-SPLIT FACT OUTRANKS THE OTHERS: a y-major op's tensors walk ["y", "mb", "out"],
+    // so only a split over the leading `y` gives a core a contiguous slab — the prefill mask add
+    // measured 620 of 672 sticks never written under the rows-first split (see
+    // `distribute_cores_sprays_first`'s doc).
+    assert_eq!(
+        EwDivision::Law.resolve(false, false, true),
+        EwDivision::SpraysFirst
+    );
+    assert_eq!(
+        EwDivision::Law.resolve(true, false, true),
+        EwDivision::SpraysFirst
+    );
+    assert_eq!(
+        EwDivision::SpraysFirst.resolve(false, false, true),
+        EwDivision::SpraysFirst
     );
 }
 
-fn rb(name: &str, rows: u32, cols: u32) -> Stk<RowBlockedTag> {
-    Stk::<RowBlockedTag>::new(name, StickLayout::row_blocked(rows as usize, cols as usize)).unwrap()
+fn rb(name: &str, rows: RowCount, cols: BlockCols) -> Stk<RowBlockedTag> {
+    Stk::<RowBlockedTag>::new(
+        name,
+        StickLayout::row_blocked(rows.get() as usize, cols.get() as usize),
+    )
+    .unwrap()
 }
 
 /// `(mb, out)` splits of the descriptor the shipped pointwise door emits for a `[rows, cols]` multiply
@@ -198,18 +224,32 @@ fn rb(name: &str, rows: u32, cols: u32) -> Stk<RowBlockedTag> {
 /// operand mint refuses (#731's law: the column-chunk bodies declare the region's storage width
 /// too, never the piece's).
 fn emitted_split(rows: u32, cols: u32, full_cols: u32, c_start: u32) -> (u64, u64) {
-    let a = rb("t_a", rows, full_cols);
-    let b = rb("t_b", rows, full_cols);
-    let o = rb("t_o", rows, full_cols);
+    let a = rb(
+        "t_a",
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(full_cols),
+    );
+    let b = rb(
+        "t_b",
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(full_cols),
+    );
+    let o = rb(
+        "t_o",
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(full_cols),
+    );
     let mut sid = 0i64;
     let op = assemble_pointwise_broadcast_off(
-        "mul",
-        "multiply",
-        RowCount::of_token_rows(rows),
-        BlockCols::of_feature_cols(cols),
-        &[In::full(&a).ew(), In::full(&b).ew()],
-        &o,
-        ktir_superdsc::addr::col_of(rows, full_cols, c_start, Df::Fp16),
+        PointwiseFacts {
+            op_name: "mul",
+            op_func: "multiply",
+            rows: RowCount::of_token_rows(rows),
+            cols: BlockCols::of_feature_cols(cols),
+            inputs: &[In::full(&a).ew(), In::full(&b).ew()],
+            o: &o,
+            out_offset: ktir_superdsc::addr::col_of(rows, full_cols, c_start, Df::Fp16).into(),
+        },
         &mut sid,
         None,
     );
@@ -231,20 +271,34 @@ fn emitted_window_split(
     full_cols: u32,
     c_start: u32,
 ) -> ((u64, u64), serde_json::Value) {
-    let a = rb("t_a", rows, full_cols);
-    let b = rb("t_b", rows, full_cols);
-    let o = rb("t_o", rows, full_cols);
+    let a = rb(
+        "t_a",
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(full_cols),
+    );
+    let b = rb(
+        "t_b",
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(full_cols),
+    );
+    let o = rb(
+        "t_o",
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(full_cols),
+    );
     let w = ktir_superdsc::addr::col_window_of(rows, full_cols, c_start, Df::Fp16)
         .expect("a whole-stick corner");
     let mut sid = 0i64;
     let op = assemble_pointwise_broadcast_off(
-        "mul",
-        "multiply",
-        RowCount::of_token_rows(rows),
-        BlockCols::of_feature_cols(cols),
-        &[In::col_window(&a, w).ew(), In::col_window(&b, w).ew()],
-        &o,
-        w,
+        PointwiseFacts {
+            op_name: "mul",
+            op_func: "multiply",
+            rows: RowCount::of_token_rows(rows),
+            cols: BlockCols::of_feature_cols(cols),
+            inputs: &[In::col_window(&a, w).ew(), In::col_window(&b, w).ew()],
+            o: &o,
+            out_offset: w.into(),
+        },
         &mut sid,
         None,
     );

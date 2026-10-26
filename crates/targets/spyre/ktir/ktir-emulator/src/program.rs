@@ -30,6 +30,7 @@
 
 use std::collections::HashMap;
 
+use crate::dtypes::DType;
 use crate::interpreter::{Arg, Output};
 use crate::ir::IRFunction;
 use ktir_optimizer::fusion::ProgramSpec;
@@ -106,6 +107,19 @@ impl Session {
     /// Sources you don't pass keep their resident bytes — so weights stay put.
     pub fn set_sources(&mut self, args: &[(u64, Arg)]) -> Result<(), String> {
         self.exec.set_sources(args)
+    }
+
+    /// The bundle-stated scale-slot stages, declared as DATA — see
+    /// [`crate::resident::ResidentExecutor::declare_scale_stages`] (seat (i): the bake's
+    /// registry column handed over by the worker, both halves of the write law).
+    pub fn declare_scale_stages(&mut self, stages: &[(u32, DType)]) -> Result<(), String> {
+        self.exec.declare_scale_stages(stages)
+    }
+
+    /// The bundle-stated stage of one scale slot — the runner's per-source dispatch query
+    /// (`Some(F32)` stages the raw IEEE word; `None` keeps the incumbent f16 fill).
+    pub fn scale_stage_dtype(&self, tid: u64) -> Option<DType> {
+        self.exec.scale_stage_dtype(tid)
     }
 
     /// Run one forward pass of program 0 and read back `outputs` (empty = results).

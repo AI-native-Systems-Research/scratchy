@@ -384,7 +384,7 @@ fn the_index_declares_entries_and_every_core_reads_the_same_table() {
     .expect("the shipped gather-copy builds");
     let idx_pos = op.indirect.expect("a declaration").index;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    let e = superdsc::emit_sdsc("attn_gkt", &op, &folds, None).expect("it emits");
+    let (e, _) = superdsc::emit_sdsc("attn_gkt", &op, &folds, None).expect("it emits");
     let j = serde_json::to_value(&e).unwrap();
     let tree = &j["dscs_"][0]["attn_gkt"]["scheduleTree_"];
     let idx = &tree[idx_pos];

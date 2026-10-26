@@ -210,7 +210,7 @@ pub struct RowPage {
 impl RowPage {
     /// `None` when this launch row does not hold that page — the caller's cue to skip the pass or refuse the
     /// launch, which is a decision that belongs at the call site and nowhere else.
-    pub fn of(s: &SessionKv, row: RowIdx, i: i64) -> Option<RowPage> {
+    pub fn of(s: &SessionKv, row: RowIdx, i: PageOrd) -> Option<RowPage> {
         let table = s.block_tables.get(row.get() as usize)?;
         Some(RowPage {
             row,
@@ -237,7 +237,10 @@ impl LogicalPage {
     ///
     /// Takes the row's OWN table rather than an index into a table, because "which row" and "which page of that
     /// row" are the pair that was being confused: with the table in hand there is nothing left to disagree about.
-    pub fn of_row(table: &[i64], i: i64) -> Option<LogicalPage> {
+    /// The index arrives as a [`PageOrd`] — the page-axis half of a position's decomposition —
+    /// so a slot count or a byte offset cannot be mistaken for a page.
+    pub fn of_row(table: &[i64], i: PageOrd) -> Option<LogicalPage> {
+        let i = i.get();
         (i >= 0 && (i as usize) < table.len()).then_some(LogicalPage(i))
     }
 
@@ -265,6 +268,105 @@ impl SlotPos {
         SlotPos(pos)
     }
 
+    /// ⭐ ADVANCE A POSITION BY A PART'S SLOT COUNT — the ONE arithmetic that combines the two,
+    /// so no caller adds a bare number to a position. A page part is whole pages past the write
+    /// cursor ([`OpKv::part`]), and the sum is exactly a cursor that had advanced that far: the
+    /// part's write slot within its page and its page past the cursor both follow from the one
+    /// position.
+    pub fn advanced_by(self, slots: ktir_superdsc::page_part::Slots) -> SlotPos {
+        SlotPos(self.0 + slots.get() as i64)
+    }
+
+    /// ⭐ THE ONE (page, slot-in-page) DECOMPOSITION — every consumer of "which page" or "which
+    /// slot within the page" reads this split, never its own `/` or `%`. The two spellings it
+    /// replaces (the OP'S modulus in [`slot_write_delta`], the SESSION'S in
+    /// [`nonfold_page_delta`]) agreed only by comment; both now decompose by the ONE value a
+    /// [`PageGeometry`] carries, and a disagreement refuses at that type's mint, naming both.
+    ///
+    /// An unpaged geometry (`per == 0`) has no page axis: the page half is `PageOrd(0)` and the
+    /// slot half is the whole position — exactly the unpaged arms the two deltas and the CB
+    /// patch model each spelled separately before.
+    pub fn split_by(self, per: PageSlots) -> (PageOrd, PlaneSlot) {
+        if per.get() <= 0 {
+            (PageOrd(0), PlaneSlot(self.0))
+        } else {
+            (PageOrd(self.0 / per.get()), PlaneSlot(self.0 % per.get()))
+        }
+    }
+
+    /// ⭐ THE ONE SLAB DERIVATION — `pos / SLAB_SLOTS`, minted here and nowhere else. The
+    /// restickify's segment shift and the CB patch model's step scalar both read this method;
+    /// before it existed the division was spelled in three places that could drift.
+    pub fn slab(self) -> SlabIdx {
+        SlabIdx(self.0 / SLAB_SLOTS)
+    }
+
+    /// Whether this position is the LAST slot of its slab — where a +1 step crosses into the
+    /// next slab, so the CB patch model's slot differential can no longer isolate the slot term
+    /// from the slab term (its canvas refuses there, by name).
+    pub fn is_last_slot_of_its_slab(self) -> bool {
+        self.0 % SLAB_SLOTS >= SLAB_SLOTS - 1
+    }
+
+    pub fn get(self) -> i64 {
+        self.0
+    }
+}
+
+/// The PAGE-AXIS half of a position's decomposition — which page a position falls in, as an
+/// index into a row's own block table.
+///
+/// ⛔ NOT A [`LogicalPage`]: that type is minted only from a row that actually holds the page
+/// ([`LogicalPage::of_row`]), and the split happens before any table is consulted — a page the
+/// row does not hold is the caller's `None` to handle ([`OpAim::UnheldPage`]), never a wrong
+/// address. This is the candidate the table lookup validates.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PageOrd(i64);
+
+impl PageOrd {
+    /// A page index as the fold's pass arithmetic names one (`rep % per` — a pass IS a page).
+    pub fn of_index(i: i64) -> PageOrd {
+        PageOrd(i)
+    }
+
+    /// The index, for the table lookup that validates it into a [`LogicalPage`].
+    pub fn get(self) -> i64 {
+        self.0
+    }
+}
+
+/// The SLOT-AXIS half — the position's slot within its page. NOT the position: an unpaged
+/// session has no modulus, so its "slot within the page" is the whole position, verbatim (the
+/// write shift is then `pos · slot_stride`, which is what the C++ did for unpaged bundles).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PlaneSlot(i64);
+
+impl PlaneSlot {
+    /// ⭐ THE ONLY MULTIPLY OF A SLOT INDEX BY A SLOT STRIDE. A slab index shifted by a slot
+    /// stride — the mixed-stride group's wrong base shift — has no spelling: there is no `Mul`,
+    /// the field is private, and the only other `shifted_by` lives on [`SlabIdx`] and takes a
+    /// [`SlabStride`].
+    pub fn shifted_by(self, stride: SlotStride) -> Bytes {
+        Bytes((self.0 as u64).wrapping_mul(stride.0.0))
+    }
+}
+
+/// The SLAB-AXIS half — which 64-slot slab a position falls in, for the incremental Kᵀ
+/// restickify that re-transposes only the current slab. Minted ONLY by [`SlotPos::slab`], so
+/// `pos / SLAB_SLOTS` is spelled once (it was three: the delta, the CB patch model's step
+/// scalar, and its boundary predicate).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SlabIdx(i64);
+
+impl SlabIdx {
+    /// ⭐ THE ONLY MULTIPLY OF A SLAB INDEX BY A SLAB STRIDE — see [`PlaneSlot::shifted_by`] for
+    /// why the multiply is a method and not an operator.
+    pub fn shifted_by(self, stride: SlabStride) -> Bytes {
+        Bytes((self.0 as u64).wrapping_mul(stride.0.0))
+    }
+
+    /// The index, for the patch model's coefficient arithmetic (`cb_plan::PatchPlan::apply`)
+    /// and the zero-slab early-out.
     pub fn get(self) -> i64 {
         self.0
     }
@@ -297,28 +399,63 @@ impl std::ops::Add for Bytes {
     }
 }
 
+/// Bytes between consecutive WRITE SLOTS — a SLOT-AXIS stride, as the bake states it
+/// (`head_dim · 2`). A distinct type from [`SlabStride`] because the two name different axes
+/// of one pool, and the file's own hazard is their mixture: a `Slot` group's base moves by
+/// `slot_pos · slot_stride` while a `Slab` group's moves by `(slot_pos/64) · slab_stride`, and
+/// keeping them apart was prose plus a per-group uniform-stride assert (the `Slab` kind's
+/// doc). With the strides typed, the wrong multiply has no spelling at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct SlotStride(Bytes);
+
+impl SlotStride {
+    /// The port mint — the manifest's raw `kv_slot_stride_bytes` becomes a typed stride exactly
+    /// once, where the launch index is read (`superdsc_exec::OpProg::new`). The field is
+    /// private: the value leaves this type only through [`PlaneSlot::shifted_by`].
+    pub fn of_bytes(b: Bytes) -> SlotStride {
+        SlotStride(b)
+    }
+}
+
+/// Bytes between consecutive SLABS of the incremental Kᵀ restickify (`STICK_BYTES · stick`).
+/// A distinct type from [`SlotStride`] — see that type's doc for the mixture hazard.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct SlabStride(Bytes);
+
+impl SlabStride {
+    /// The port mint — the manifest's raw `kv_slab_stride_bytes`, typed where the launch index
+    /// is read. The field is private: the value leaves this type only through
+    /// [`SlabIdx::shifted_by`].
+    pub fn of_bytes(b: Bytes) -> SlabStride {
+        SlabStride(b)
+    }
+}
+
 /// The per-op manifest fields the launch arithmetic reads.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OpKv {
     /// `kv_request`: whose KV this op touches. 0 for every op of an unbatched bundle.
     pub request: u64,
-    /// `kv_slot_offset`: slots past the write cursor where this op's KV starts — a whole number of pages,
-    /// non-zero only for a later PAGE PART of a prefill window wider than one page. Added to the cursor
-    /// by [`op_slot_pos`], so the part's page is resolved from the block table like any other; a page the
-    /// request does not hold makes the launch skip the group ([`OpAim::UnheldPage`]).
-    pub slot_offset: u64,
+    /// ⭐ `kv_part`: which page of a multi-page window this op addresses — a
+    /// [`PagePart`](ktir_superdsc::page_part::PagePart) carried off the launch index's own trip,
+    /// never a number re-read from the op. Added to the cursor by [`op_slot_pos`], so the part's
+    /// page is resolved from the block table like any other; a page the request does not hold
+    /// makes the launch skip the group ([`OpAim::UnheldPage`]).
+    pub part: ktir_superdsc::page_part::PagePart,
     /// `kv_page_fold`: this group folds ONE page of resident prefix and is re-launched per page.
     pub page_fold: bool,
     /// `slot_write`: this op appends the new token's KV at the write cursor.
     pub slot_write: bool,
     /// `kv_page_slots`: the write-slot modulus, and the signal that the bundle is paged.
     pub page_slots: u64,
-    /// Bytes between consecutive write slots.
-    pub slot_stride_bytes: u64,
+    /// Bytes between consecutive write slots — TYPED, so the only multiply of a slot index by
+    /// this stride is [`PlaneSlot::shifted_by`]; a slab index shifted by it does not compile.
+    pub slot_stride: SlotStride,
     /// `slab_write`: the incremental Kᵀ restickify, which re-transposes the current slab.
     pub slab_write: bool,
-    /// Bytes between consecutive slabs.
-    pub slab_stride_bytes: u64,
+    /// Bytes between consecutive slabs — TYPED, so the only multiply of a slab index by this
+    /// stride is [`SlabIdx::shifted_by`]; a slot index shifted by it does not compile.
+    pub slab_stride: SlabStride,
     /// THIS OP WAS BAKED WITH A REQUEST AXIS — its kernel steps one request per unit of that axis, so
     /// ONE launch computes every row of the batch and the fold no longer needs a pass per request.
     ///
@@ -345,14 +482,81 @@ pub struct OpKv {
     /// `addr = idx * skip_addr + base` from whatever base the launch installed, so a per-pass page shift
     /// on top of an absolute entry composes two bases and lands inside neither: fluent, no fault.
     pub gathered: bool,
+    /// ⭐ THE STAGING CHANNEL — the per-op mirror of the group's
+    /// `kv_region_form` ([`bundle::KvShifts::region_form`]): this op's gathered table is the
+    /// FILL-STAGED REGION FORM, not the composer's page-list table. `gathered` carries the
+    /// addressing consequence (the zero KV shift) for BOTH channels; this bit carries the
+    /// staging one — a region-form body's table is already staged by the host fill, so the
+    /// composer must not drive it as a chunk body and no KV-block-index step is minted for
+    /// it. The page-list answer is `gathered && !region_form`. Meaningful only when
+    /// [`Self::gathered`].
+    pub region_form: bool,
+}
+
+/// ⭐⭐⭐⭐ THE PAGE GEOMETRY ONE OP'S ARITHMETIC RUNS UNDER — paged or not, and the page size —
+/// as ONE value the op's baked modulus and the session's installed modulus AGREED on.
+///
+/// ⛔ WHAT THIS REPLACES: [`slot_write_delta`] divided by the OP'S `kv_page_slots` ("the op is
+/// what the C++ reads") while [`nonfold_page_delta`] divided by the SESSION'S, and the only
+/// thing holding the two together was the comment "they agree in every bundle" plus a canary
+/// in `cb_plan`'s patch gate. A comment invariant is a defect by this file's own law: an op
+/// that wrapped at a different modulus would put a page wrap inside a span the CB patch model
+/// replays linearly across. The mint refuses that disagreement, NAMING BOTH SPELLINGS, and
+/// both deltas then take the geometry — one value, no second derivation to drift.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PageGeometry {
+    paged: bool,
+    slots: PageSlots,
+}
+
+impl PageGeometry {
+    /// The agreement mint. `Err` names the op's baked modulus and the session's — the two
+    /// spellings — so a refusal says which is wrong, not merely that one is.
+    ///
+    /// The law is the patch gate's old canary, verbatim: a SLOT-WRITING op must wrap at the
+    /// session's modulus (0 when the session is unpaged). Non-slot-writing ops never read the
+    /// modulus — their write shift is the fold/page/slab terms — so they constrain nothing;
+    /// refusing on them would newly refuse bundles that are correct.
+    pub fn agree(op: &OpKv, s: &SessionKv) -> Result<PageGeometry, String> {
+        let session_modulus = if s.paged {
+            s.page_slots.get().max(1)
+        } else {
+            0
+        };
+        if op.slot_write && op.page_slots as i64 != session_modulus {
+            return Err(format!(
+                "a slot-writing op was baked at {} slots per page but the session wraps at {} \
+                 — the bake emits the session's page size into every op, so one of the two is \
+                 wrong; a launch under disagreeing moduli would wrap inside a span the CB \
+                 patch model replays linearly across",
+                op.page_slots, session_modulus
+            ));
+        }
+        Ok(PageGeometry {
+            paged: s.paged,
+            slots: PageSlots::per_page(if s.paged { s.page_slots.get() } else { 0 }),
+        })
+    }
+
+    /// Whether the session pages at all — the non-fold page term's gate.
+    pub fn paged(self) -> bool {
+        self.paged
+    }
+
+    /// The agreed page size — the ONE value both deltas decompose by.
+    pub fn slots(self) -> PageSlots {
+        self.slots
+    }
 }
 
 /// The session state the arithmetic reads.
 #[derive(Clone, Debug, Default)]
 pub struct SessionKv {
     pub paged: bool,
-    /// Positions per page (the session's, which is NOT always the one an op divides by — see
-    /// [`nonfold_page_delta`]).
+    /// Positions per page — the session's installed size. An op's baked size must AGREE with
+    /// it ([`PageGeometry::agree`]) before any delta decomposes; before that mint existed,
+    /// [`slot_write_delta`] read the op's and [`nonfold_page_delta`] read this one, agreeing
+    /// only by comment.
     pub page_slots: PageSlots,
     /// Bytes per page = all layers of one page.
     pub page_stride_bytes: Bytes,
@@ -503,23 +707,8 @@ impl RequestSlot {
     ///
     /// The `Option` is HERE and not inside the resolver: this is where "which page of which row" is first
     /// asserted, so it is where the answer can be absent. Inward of the mint there is nothing to fail.
-    pub fn page_base(&self, s: &SessionKv, i: i64) -> Option<Bytes> {
+    pub fn page_base(&self, s: &SessionKv, i: PageOrd) -> Option<Bytes> {
         RowPage::of(s, self.req, i).map(|rp| page_base_bytes(s, rp))
-    }
-
-    /// The logical page this request's NEXT write lands in.
-    pub fn writing_page(&self, s: &SessionKv) -> LogicalPage {
-        let per = s.page_slots.get().max(1);
-        LogicalPage(self.pos.get() / per)
-    }
-
-    /// The slot WITHIN its page that the next write lands at. The absolute position would run past it.
-    pub fn slot_in_page(&self, page_slots: u64) -> i64 {
-        if page_slots > 0 {
-            self.pos.get() % (page_slots as i64)
-        } else {
-            self.pos.get()
-        }
     }
 
     /// TWO SLOTS ARE FUSABLE ONLY IF THEY ARE THE SAME SLOT.
@@ -729,14 +918,14 @@ impl LaunchPages {
 }
 
 /// The write cursor an op uses — [`RequestSlot::resolve`], reached from an op instead of from a
-/// request index, plus the op's own [`OpKv::slot_offset`]. One arithmetic, so the two cannot drift.
+/// request index, plus the op's own [`OpKv::part`]. One arithmetic, so the two cannot drift.
 ///
 /// ⭐ THE OFFSET IS ADDED HERE, ONCE, and every term below reads the sum: a page part's write slot
 /// within its page (the offset is whole pages, so it is the cursor's own) and its page (`p` pages past
 /// the cursor's) both follow from the one position, exactly as a cursor that had advanced that far.
 pub fn op_slot_pos(op: &OpKv, s: &SessionKv, launch: SlotPos) -> SlotPos {
     let at = RequestSlot::resolve(s, RowIdx::from_launch_row(op.request), launch).pos();
-    SlotPos::of_launch(at.get() + op.slot_offset as i64)
+    at.advanced_by(op.part.slots())
 }
 
 /// Whether this op's group is the prefix fold — re-launched once per resident page.
@@ -1041,12 +1230,12 @@ pub fn fold_pass(
     if collapsed(op, s) || fold_requests(s) <= 1 {
         // A collapsed pass IS a page and serves every row, so row 0 names it — and it is still MINTED, so a
         // context that sweeps past what row 0 holds yields `None` rather than an address.
-        return RowPage::of(s, RowIdx::from_launch_row(0), rep);
+        return RowPage::of(s, RowIdx::from_launch_row(0), PageOrd::of_index(rep));
     }
     RowPage::of(
         s,
         RowIdx::from_launch_row((rep / per).max(0) as u64),
-        rep % per,
+        PageOrd::of_index(rep % per),
     )
 }
 
@@ -1119,18 +1308,18 @@ pub fn fold_delta(
 /// The new token's KV lands at the write cursor's slot WITHIN its page; the page itself comes from
 /// the block table. Using the absolute position here would write straight past the page.
 ///
-/// Divides by the OP's `page_slots`, not the session's — they agree in every bundle, but the op is
-/// what the C++ reads, so the port reads it too.
-pub fn slot_write_delta(op: &OpKv, pos: SlotPos) -> Bytes {
+/// ⭐ THE MODULUS IS THE GEOMETRY'S — the op's baked `kv_page_slots` and the session's installed
+/// size AGREED at [`PageGeometry::agree`] before this ran, so the old division-by-the-op's ("they
+/// agree in every bundle, but the op is what the C++ reads") is now a checked fact: a
+/// disagreement refuses at the mint, naming both, instead of this delta silently wrapping at
+/// whichever modulus it happened to read. The slot half of the split is shifted by the op's
+/// [`SlotStride`] — the only multiply of the two.
+pub fn slot_write_delta(op: &OpKv, geo: PageGeometry, pos: SlotPos) -> Bytes {
     if !op.slot_write || pos.get() <= 0 {
         return Bytes(0);
     }
-    let slot_in_page = if op.page_slots > 0 {
-        pos.get() % op.page_slots as i64
-    } else {
-        pos.get()
-    };
-    Bytes((slot_in_page as u64).wrapping_mul(op.slot_stride_bytes))
+    let (_, slot) = pos.split_by(geo.slots());
+    slot.shifted_by(op.slot_stride)
 }
 
 /// The page a NON-fold op works in — the one holding its write cursor.
@@ -1143,26 +1332,23 @@ pub fn slot_write_delta(op: &OpKv, pos: SlotPos) -> Bytes {
 /// composes two bases and gathers another page's keys with a clean bake.
 ///
 /// ⭐ `None` IS "THIS PAGE PART HAS NO PAGE" — and only a page part can say it. An op with an
-/// [`OpKv::slot_offset`] addresses the page `pos` (cursor + offset) falls in, which is NOT the caller's
+/// [`OpKv::part`] addresses the page `pos` (cursor + part) falls in, which is NOT the caller's
 /// base: that is the cursor's own page, i.e. part 0's, so falling back to it would write the part's rows
 /// over part 0's keys. A part whose page the row does not hold is a short last chunk's padding past the
 /// request's pages; nothing reads it, so the launch skips the group ([`OpAim::UnheldPage`]).
 pub fn nonfold_page_delta(
     op: &OpKv,
     s: &SessionKv,
+    geo: PageGeometry,
     pos: SlotPos,
     caller_base: Bytes,
 ) -> Option<Bytes> {
-    if !s.paged || is_paged_fold(op, s) || op.gathered {
+    if !geo.paged() || is_paged_fold(op, s) || op.gathered {
         return Some(Bytes(0));
     }
-    let lp = if s.page_slots.get() != 0 {
-        pos.get() / s.page_slots.get()
-    } else {
-        0
-    };
+    let (lp, _) = pos.split_by(geo.slots());
     let page = RowPage::of(s, RowIdx::from_launch_row(op.request), lp);
-    if op.slot_offset > 0 {
+    if !op.part.is_cursor() {
         return page.map(|rp| page_base_bytes(s, rp));
     }
     if op.request > 0 {
@@ -1187,11 +1373,11 @@ pub fn slab_delta(op: &OpKv, pos: SlotPos) -> Bytes {
     if !op.slab_write {
         return Bytes(0);
     }
-    let slab = pos.get() / SLAB_SLOTS;
-    if slab <= 0 {
+    let slab = pos.slab();
+    if slab.get() <= 0 {
         return Bytes(0);
     }
-    Bytes((slab as u64).wrapping_mul(op.slab_stride_bytes))
+    slab.shifted_by(op.slab_stride)
 }
 
 /// Everything the launch loop adds to the segment bases for one op on one pass, in the C++'s order.
@@ -1213,7 +1399,7 @@ pub struct SegDeltas {
 pub enum OpAim {
     /// Launch with these segment shifts.
     At(SegDeltas),
-    /// ⛔ SKIP THIS GROUP: a page part ([`OpKv::slot_offset`]) whose page the request does not hold — a
+    /// ⛔ SKIP THIS GROUP: a page part ([`OpKv::part`]) whose page the request does not hold — a
     /// short last chunk's padding rows past the request's pages, which nothing will read.
     UnheldPage,
 }
@@ -1232,6 +1418,11 @@ impl OpAim {
 pub fn seg_deltas(
     op: &OpKv,
     s: &SessionKv,
+    // ⭐ THE AGREED GEOMETRY — minted once per (op, session) by [`PageGeometry::agree`] at the
+    // caller (which has the error path to refuse in, naming the op and both moduli); every
+    // decomposition below reads it, so the op's baked modulus and the session's installed one
+    // cannot be read differently by different terms.
+    geo: PageGeometry,
     rep: i64,
     // ⭐ THE WITNESS ENTERS HERE, at the port's own entry point — which is the right boundary for it. The FFI
     // below receives a bare `i64` from the shim (C++ has no way to hold a Rust proof), so the conversion from
@@ -1242,7 +1433,7 @@ pub fn seg_deltas(
     caller_page_base: Bytes,
 ) -> OpAim {
     let pos = op_slot_pos(op, s, launch);
-    let Some(page) = nonfold_page_delta(op, s, pos, caller_page_base) else {
+    let Some(page) = nonfold_page_delta(op, s, geo, pos, caller_page_base) else {
         return OpAim::UnheldPage;
     };
     let mut kv = Bytes(0);
@@ -1256,7 +1447,7 @@ pub fn seg_deltas(
         mask = mask + m;
         intermediate = intermediate + i;
     }
-    kv = kv + slot_write_delta(op, pos);
+    kv = kv + slot_write_delta(op, geo, pos);
     kv = kv + page;
     kv = kv + slab_delta(op, pos);
     OpAim::At(SegDeltas {
@@ -1425,7 +1616,8 @@ mod tests {
     fn a_page_base_is_the_physical_page_times_the_page_stride() {
         let s = sess();
         let base = |row: u64, i: i64| {
-            RowPage::of(&s, RowIdx::from_launch_row(row), i).map(|rp| page_base_bytes(&s, rp))
+            RowPage::of(&s, RowIdx::from_launch_row(row), PageOrd::of_index(i))
+                .map(|rp| page_base_bytes(&s, rp))
         };
         assert_eq!(base(0, 0), Some(Bytes(5000)));
         assert_eq!(base(0, 1), Some(Bytes(6000)));
@@ -1447,20 +1639,20 @@ mod tests {
     fn an_out_of_range_page_or_row_cannot_be_minted_at_all() {
         let s = sess();
         assert!(
-            RowPage::of(&s, RowIdx::from_launch_row(0), 7).is_none(),
+            RowPage::of(&s, RowIdx::from_launch_row(0), PageOrd::of_index(7)).is_none(),
             "page past the end of the row's map"
         );
         assert!(
-            RowPage::of(&s, RowIdx::from_launch_row(0), -1).is_none(),
+            RowPage::of(&s, RowIdx::from_launch_row(0), PageOrd::of_index(-1)).is_none(),
             "negative page"
         );
         assert!(
-            RowPage::of(&s, RowIdx::from_launch_row(9), 0).is_none(),
+            RowPage::of(&s, RowIdx::from_launch_row(9), PageOrd::of_index(0)).is_none(),
             "row with no installed table"
         );
         // And the pairs that DO exist still resolve, so the constructor is not merely refusing everything.
-        assert!(RowPage::of(&s, RowIdx::from_launch_row(0), 0).is_some());
-        assert!(RowPage::of(&s, RowIdx::from_launch_row(1), 1).is_some());
+        assert!(RowPage::of(&s, RowIdx::from_launch_row(0), PageOrd::of_index(0)).is_some());
+        assert!(RowPage::of(&s, RowIdx::from_launch_row(1), PageOrd::of_index(1)).is_some());
     }
 
     /// EVERY ROW OF A BATCH READS ITS OWN CURSOR, row 0 included. Exhaustively proved over symbolic
@@ -1760,20 +1952,23 @@ mod tests {
             OpKv {
                 slot_write: true,
                 page_slots: 256,
-                slot_stride_bytes: 128,
+                slot_stride: SlotStride::of_bytes(Bytes(128)),
                 request: 1,
                 ..Default::default()
             },
             OpKv {
                 slab_write: true,
-                slab_stride_bytes: 64,
+                slab_stride: SlabStride::of_bytes(Bytes(64)),
                 ..Default::default()
             },
             OpKv::default(),
         ] {
+            let geo =
+                PageGeometry::agree(&op, &s).expect("the fixture's ops agree with its session");
             let d = launched(seg_deltas(
                 &op,
                 &s,
+                geo,
                 1,
                 UniformPages::of(&s).expect("fixture rows agree"),
                 SlotPos::of_launch(300),
@@ -1832,28 +2027,45 @@ mod tests {
 
     #[test]
     fn a_write_lands_at_its_slot_within_the_page_never_the_absolute_position() {
+        let s = sess();
         let op = OpKv {
             slot_write: true,
             page_slots: 256,
-            slot_stride_bytes: 128,
+            slot_stride: SlotStride::of_bytes(Bytes(128)),
             ..Default::default()
         };
+        let geo = PageGeometry::agree(&op, &s).expect("the fixture wraps at the op's 256");
         // Position 300 is slot 44 of page 1 — 300*128 would be a page and a half past the page.
         assert_eq!(
-            slot_write_delta(&op, SlotPos::of_launch(300)),
+            slot_write_delta(&op, geo, SlotPos::of_launch(300)),
             Bytes(44 * 128)
         );
         assert_eq!(
-            slot_write_delta(&op, SlotPos::of_launch(0)),
+            slot_write_delta(&op, geo, SlotPos::of_launch(0)),
             Bytes(0),
             "slot 0 is the baked base"
         );
+        // An op baked UNPAGED agrees with an UNPAGED session only — and against this paged
+        // one the mint REFUSES, which is the rung's own law pinned: the old code would have
+        // divided by the op's 0 and silently written at the absolute position inside a
+        // session that wraps at 256; now the disagreement has no arithmetic to reach.
         let unpaged = OpKv {
             page_slots: 0,
             ..op
         };
+        let Err(why) = PageGeometry::agree(&unpaged, &s) else {
+            panic!("an op baked at 0 slots per page must refuse a session that wraps at 256");
+        };
+        assert!(
+            why.contains("0 slots per page") && why.contains("wraps at 256"),
+            "the refusal NAMES both spellings — the op's and the session's — not merely that \
+             one is wrong: {why}"
+        );
+        let unpaged_session = SessionKv { paged: false, ..s };
+        let flat_geo = PageGeometry::agree(&unpaged, &unpaged_session)
+            .expect("an unpaged op agrees with an unpaged session");
         assert_eq!(
-            slot_write_delta(&unpaged, SlotPos::of_launch(300)),
+            slot_write_delta(&unpaged, flat_geo, SlotPos::of_launch(300)),
             Bytes(300 * 128)
         );
         let not_a_write = OpKv {
@@ -1861,7 +2073,7 @@ mod tests {
             ..op
         };
         assert_eq!(
-            slot_write_delta(&not_a_write, SlotPos::of_launch(300)),
+            slot_write_delta(&not_a_write, geo, SlotPos::of_launch(300)),
             Bytes(0)
         );
     }
@@ -1898,10 +2110,14 @@ mod tests {
             ..chunk0
         };
         let per = UniformPages::of(&s).expect("fixture rows agree");
+        // The tag is not a modulus: one geometry serves both chunks (and `agree` never reads
+        // the request — the tag's inertness is the very thing this test pins).
+        let geo = PageGeometry::agree(&chunk0, &s).expect("the gathered fold writes no slots");
         for rep in 0..4 {
             let d0 = launched(seg_deltas(
                 &chunk0,
                 &s,
+                geo,
                 rep,
                 per,
                 SlotPos::of_launch(100),
@@ -1910,6 +2126,7 @@ mod tests {
             let d1 = launched(seg_deltas(
                 &chunk1,
                 &s,
+                geo,
                 rep,
                 per,
                 SlotPos::of_launch(100),
@@ -1934,9 +2151,12 @@ mod tests {
             request: 1,
             ..Default::default()
         };
+        // None of these ops write slots, so the geometry is unconstrained by any of them —
+        // one mint states the session's own page fact for every call below.
+        let geo = PageGeometry::agree(&tagged, &s).expect("no slot-writing op constrains the page");
         // position 300 is page 1 of request 1 => physical 10.
         assert_eq!(
-            nonfold_page_delta(&tagged, &s, SlotPos::of_launch(300), Bytes(4242)),
+            nonfold_page_delta(&tagged, &s, geo, SlotPos::of_launch(300), Bytes(4242)),
             Some(Bytes(10000))
         );
         let untagged = OpKv {
@@ -1944,7 +2164,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            nonfold_page_delta(&untagged, &s, SlotPos::of_launch(300), Bytes(4242)),
+            nonfold_page_delta(&untagged, &s, geo, SlotPos::of_launch(300), Bytes(4242)),
             Some(Bytes(4242))
         );
         let fold = OpKv {
@@ -1953,7 +2173,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            nonfold_page_delta(&fold, &s, SlotPos::of_launch(300), Bytes(4242)),
+            nonfold_page_delta(&fold, &s, geo, SlotPos::of_launch(300), Bytes(4242)),
             Some(Bytes(0)),
             "a fold op takes its page from the fold pass, not from here"
         );
@@ -1962,7 +2182,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            nonfold_page_delta(&gathered, &s, SlotPos::of_launch(300), Bytes(4242)),
+            nonfold_page_delta(&gathered, &s, geo, SlotPos::of_launch(300), Bytes(4242)),
             Some(Bytes(0)),
             "a gathered op's entries are absolute — the write page's base on top lands in neither"
         );
@@ -1987,18 +2207,27 @@ mod tests {
             &[3, 7, 9],
         );
         let per = UniformPages::of(&s).expect("one row");
-        let part = |p: u64| OpKv {
+        // The parts the ONE cutting law mints for a 512-row window — offsets 0 and 256. Taken from
+        // `write_parts`, never spelled as numbers here: a part is what the cut says it is.
+        let cut = ktir_superdsc::sdsc_abstract::PagedKvPool::new(1, 64).write_parts(
+            ktir_superdsc::sdsc_abstract::WriteRowStart::at_cursor(),
+            ktir_superdsc::sdsc_abstract::QueryRowCount::of_mq(512),
+            false,
+        );
+        let part = |p: usize| OpKv {
             slot_write: true,
             page_slots: 256,
-            slot_stride_bytes: 128,
-            slot_offset: p * 256,
+            slot_stride: SlotStride::of_bytes(Bytes(128)),
+            part: cut[p].page,
             ..Default::default()
         };
         let caller = Bytes(7000); // the launch's own page: page 1, physical 7
         let at = |p| {
+            let geo = PageGeometry::agree(&part(p), &s).expect("the parts bake the session's 256");
             launched(seg_deltas(
                 &part(p),
                 &s,
+                geo,
                 0,
                 per,
                 SlotPos::of_launch(256),
@@ -2022,11 +2251,21 @@ mod tests {
         );
         // The Kᵀ re-transpose's part is no slot write but takes the same page.
         let kt = OpKv {
-            slot_offset: 256,
+            part: cut[1].page,
             ..Default::default()
         };
+        let kt_geo = PageGeometry::agree(&kt, &s).expect("the re-transpose writes no slots");
         assert_eq!(
-            launched(seg_deltas(&kt, &s, 0, per, SlotPos::of_launch(256), caller)).kv,
+            launched(seg_deltas(
+                &kt,
+                &s,
+                kt_geo,
+                0,
+                per,
+                SlotPos::of_launch(256),
+                caller
+            ))
+            .kv,
             Bytes(9000)
         );
     }
@@ -2050,30 +2289,45 @@ mod tests {
             &[3, 7, 9],
         );
         let per = UniformPages::of(&s).expect("one row");
+        let cut = ktir_superdsc::sdsc_abstract::PagedKvPool::new(1, 64).write_parts(
+            ktir_superdsc::sdsc_abstract::WriteRowStart::at_cursor(),
+            ktir_superdsc::sdsc_abstract::QueryRowCount::of_mq(512),
+            false,
+        );
         let part1 = OpKv {
             slot_write: true,
             page_slots: 256,
-            slot_stride_bytes: 128,
-            slot_offset: 256,
+            slot_stride: SlotStride::of_bytes(Bytes(128)),
+            part: cut[1].page,
             ..Default::default()
         };
+        let geo = PageGeometry::agree(&part1, &s).expect("the part bakes the session's 256");
         assert_eq!(
-            seg_deltas(&part1, &s, 0, per, SlotPos::of_launch(512), Bytes(9000)),
+            seg_deltas(
+                &part1,
+                &s,
+                geo,
+                0,
+                per,
+                SlotPos::of_launch(512),
+                Bytes(9000)
+            ),
             OpAim::UnheldPage
         );
         assert_eq!(
-            nonfold_page_delta(&part1, &s, SlotPos::of_launch(768), Bytes(9000)),
+            nonfold_page_delta(&part1, &s, geo, SlotPos::of_launch(768), Bytes(9000)),
             None
         );
         // Part 0 of the same chunk still launches, on the caller's page.
         let part0 = OpKv {
-            slot_offset: 0,
+            part: cut[0].page,
             ..part1
         };
         assert_eq!(
             launched(seg_deltas(
                 &part0,
                 &s,
+                geo,
                 0,
                 per,
                 SlotPos::of_launch(512),
@@ -2100,7 +2354,7 @@ mod tests {
         let s = sess();
         let op = OpKv {
             slab_write: true,
-            slab_stride_bytes: 8192,
+            slab_stride: SlabStride::of_bytes(Bytes(8192)),
             request: 1,
             ..Default::default()
         };
@@ -2121,9 +2375,11 @@ mod tests {
         // And the composite the shim actually calls agrees. Stated as its parts rather than a literal,
         // because a non-fold op also carries its request's page base and hard-coding the sum hides
         // which term moved: the point is that the slab term is request 1's slab 4, not the launch's 1.
+        let geo = PageGeometry::agree(&op, &s).expect("a slab write constrains no modulus");
         let d = launched(seg_deltas(
             &op,
             &s,
+            geo,
             0,
             UniformPages::of(&s).expect("fixture rows agree"),
             SlotPos::of_launch(100),
@@ -2133,7 +2389,7 @@ mod tests {
         assert_eq!(
             d.kv,
             slab_delta(&op, own)
-                + nonfold_page_delta(&op, &s, own, Bytes(0)).expect("no page part, so a page"),
+                + nonfold_page_delta(&op, &s, geo, own, Bytes(0)).expect("no page part, so a page"),
             "the launch's slab would contribute 8192 here instead of {}",
             4 * 8192
         );
@@ -2147,7 +2403,7 @@ mod tests {
         let cachewr = OpKv {
             slot_write: true,
             page_slots: 256,
-            slot_stride_bytes: 128,
+            slot_stride: SlotStride::of_bytes(Bytes(128)),
             ..Default::default()
         };
         // ONE MAP INSTALLED — that is what makes it unbatched, and what makes the launch position the
@@ -2159,9 +2415,11 @@ mod tests {
             fold_requests: 1,
             ..s.clone()
         };
+        let geo = PageGeometry::agree(&cachewr, &solo).expect("the write bakes the session's 256");
         let d = launched(seg_deltas(
             &cachewr,
             &solo,
+            geo,
             0,
             UniformPages::of(&s).expect("fixture rows agree"),
             SlotPos::of_launch(300),
@@ -2175,9 +2433,11 @@ mod tests {
             request: 1,
             ..cachewr
         };
+        let geo = PageGeometry::agree(&batched, &s).expect("the request is not a modulus");
         let d = launched(seg_deltas(
             &batched,
             &s,
+            geo,
             0,
             UniformPages::of(&s).expect("fixture rows agree"),
             SlotPos::of_launch(0),
@@ -2214,12 +2474,14 @@ mod tests {
             request: 1,
             slot_write: true,
             page_slots: 256,
-            slot_stride_bytes: 128,
+            slot_stride: SlotStride::of_bytes(Bytes(128)),
             ..Default::default()
         };
+        let geo = PageGeometry::agree(&w, &s).expect("the write bakes the session's 256");
         let d = launched(seg_deltas(
             &w,
             &s,
+            geo,
             0,
             per,
             SlotPos::of_launch(0),
@@ -2234,7 +2496,16 @@ mod tests {
             ..Default::default()
         };
         let per2 = UniformPages::sweeping(2, &s).expect("a two-page sweep fits");
-        let d = launched(seg_deltas(&f, &s, 1, per2, SlotPos::of_launch(0), Bytes(0)));
+        let f_geo = PageGeometry::agree(&f, &s).expect("a fold constrains no modulus");
+        let d = launched(seg_deltas(
+            &f,
+            &s,
+            f_geo,
+            1,
+            per2,
+            SlotPos::of_launch(0),
+            Bytes(0),
+        ));
         assert_eq!(d.kv, Bytes(6000));
         assert_eq!(d.mask, Bytes(256 * 2));
 
@@ -2268,14 +2539,76 @@ mod tests {
             request: 3,
             slot_write: true,
             page_slots: 256,
-            slot_stride_bytes: 128,
+            slot_stride: SlotStride::of_bytes(Bytes(128)),
             ..Default::default()
         };
-        let d = launched(seg_deltas(&w, &s, 0, per, SlotPos::of_launch(0), Bytes(0)));
+        let geo = PageGeometry::agree(&w, &s).expect("the write bakes the session's 256");
+        let d = launched(seg_deltas(
+            &w,
+            &s,
+            geo,
+            0,
+            per,
+            SlotPos::of_launch(0),
+            Bytes(0),
+        ));
         // Position 900 is slot 132 of page 3; request 3 holds ONE page, so page 3 is outside its map
         // and falls back to the pool base, leaving just the slot term.
         assert_eq!(d.kv, Bytes(132 * 128));
     }
+
+    /// ⭐ THE ONE (page, slot) DECOMPOSITION, both arms — every consumer of "which page" or "which
+    /// slot within the page" reads `split_by`, never its own `/` or `%`, so its arms are the
+    /// address chain's own division. The unpaged arm IS the whole position, verbatim — what the
+    /// two deltas and the CB patch model each spelled separately before.
+    #[test]
+    fn the_one_page_slot_decomposition_and_its_unpaged_arm() {
+        let per = PageSlots::per_page(256);
+        assert_eq!(
+            SlotPos::of_launch(300).split_by(per),
+            (PageOrd::of_index(1), PlaneSlot(44))
+        );
+        assert_eq!(
+            SlotPos::of_launch(255).split_by(per),
+            (PageOrd::of_index(0), PlaneSlot(255))
+        );
+        assert_eq!(
+            SlotPos::of_launch(300).split_by(PageSlots::per_page(0)),
+            (PageOrd::of_index(0), PlaneSlot(300)),
+            "no page axis: the slot half is the whole position"
+        );
+        // The ONE slab derivation — 300/64 = slab 4 — and the boundary predicate the CB patch
+        // gate refuses on (a +1 step crossing into the next slab).
+        assert_eq!(SlotPos::of_launch(300).slab(), SlabIdx(4));
+        assert_eq!(SlotPos::of_launch(63).slab(), SlabIdx(0));
+        assert!(!SlotPos::of_launch(62).is_last_slot_of_its_slab());
+        assert!(SlotPos::of_launch(63).is_last_slot_of_its_slab());
+        assert!(SlotPos::of_launch(127).is_last_slot_of_its_slab());
+        // And each half multiplies only its own stride — the slot half by the SLOT stride, the
+        // slab half by the SLAB stride — pinned as VALUES here because the mixed multiplies no
+        // longer parse at all (see the tombstone below).
+        assert_eq!(
+            SlotPos::of_launch(300)
+                .split_by(per)
+                .1
+                .shifted_by(SlotStride::of_bytes(Bytes(128))),
+            Bytes(44 * 128)
+        );
+        assert_eq!(
+            SlotPos::of_launch(300)
+                .slab()
+                .shifted_by(SlabStride::of_bytes(Bytes(8192))),
+            Bytes(4 * 8192)
+        );
+    }
+
+    // ⛔ A TEST WAS HERE AND THE TYPES REPLACED IT, for the mixed-stride group: the hazard the
+    // `Slab` kind's doc stated in prose ("its stride (STICK_BYTES·stick = 8192) ≠ the cachewr's
+    // slot_stride_bytes (128), so fusing the two would trip the per-group uniform-stride assert —
+    // a mixed-stride group shifts every base wrong"). `SlotStride` and `SlabStride` are distinct
+    // types with private fields and NO operators, and each `shifted_by` lives on exactly one
+    // index type, so `slab_index · slot_stride` — the wrong base shift — no longer parses. There
+    // is no runtime behavior left to assert, which is the point.
     // ⛔ A TEST WAS HERE AND THE TYPE REPLACED IT. It built a ragged pool (`[1,3,5,8]`), called `fold_pass` with
     // the max divisor, and asserted the decomposition named pages rows do not own — `#[should_panic]`, i.e. a
     // RUNTIME statement of an invariant. `UniformPages` now makes that call unexpressible: the witness cannot be

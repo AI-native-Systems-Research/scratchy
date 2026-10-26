@@ -401,7 +401,7 @@ pub fn rope_p_class_hds(hds: impl Iterator<Item = u32>) -> Vec<u32> {
 }
 
 /// Every reserved region, in one place. Order is high tid → low.
-pub const RESERVED_REGIONS: [TidRegion; 7] = [
+pub const RESERVED_REGIONS: [TidRegion; 8] = [
     // The single sentinels (`ROPE_P_TID` .. `IDENTITY_TID`) occupy MAX-1 .. MAX-19.
     TidRegion {
         name: "sentinels",
@@ -459,6 +459,18 @@ pub const RESERVED_REGIONS: [TidRegion; 7] = [
         name: "kct_resident",
         base: u32::MAX - 1_000_171,
         slots: 1_000_000,
+    },
+    // ⭐ THE PAGED-FOLD CARRY — the online-softmax state (max, sum, accumulator) the per-page
+    // fold body reads and writes in the INTERMEDIATE segment, one placement per family. It is
+    // NOT worker-staged (the seed program writes it on-card once per step, before the first
+    // pass), so unlike a step input it needs a placement the walk cannot mint from a program
+    // view — the census places these tids, gated on the ladder's fold statement. Three slots:
+    // the max row, the sum row, the accumulator. Sits BELOW `kct_resident`'s floor, the next
+    // rung of free space above the real tensor ids (~thousands), addressed by name.
+    TidRegion {
+        name: "paged_fold_carry",
+        base: u32::MAX - 2_000_171,
+        slots: 8,
     },
 ];
 
@@ -539,6 +551,7 @@ pub const EVERY_NAMED_REGION_RESOLVES: () = {
     assert!(reserved_region("rope_p_class").base == ROPE_P_CLASS_BASE);
     assert!(reserved_region("identity_class").base == IDENTITY_CLASS_BASE);
     assert!(reserved_region("kct_resident").slots > 0);
+    assert!(reserved_region("paged_fold_carry").slots >= 3);
 };
 
 pub const SENTINELS_ARE_INSIDE_THEIR_REGION: () = {
@@ -601,10 +614,74 @@ pub fn scalarmul_scale_tid(idx: usize) -> u32 {
 ///
 /// ⛔ ADDRESSED BY NAME. This was `RESERVED_REGIONS[2]`, and inserting the one-slot `kv_block_index`
 /// region above it made `kct_resident_tid(0)` return `KV_BLOCK_INDEX_TID` — see [`reserved_region`].
+/// The free function is DELETED: the reserved Kᵀ plane's name is minted only through
+/// [`KctResident::wire_tid`], so no consumer can hold it as a bare `u32` and resolve it through
+/// the K-cache source's placement.
 pub const KCT_RESIDENT_BASE: u32 = reserved_region("kct_resident").base;
-/// Reserved tid for the resident per-layer Kᵀ kernel of the K-cache source tid `k_id`.
-pub fn kct_resident_tid(k_id: u32) -> u32 {
-    reserved_region("kct_resident").at(k_id)
+
+/// ⭐⭐⭐⭐⭐ THE RESERVED Kᵀ PLANE'S NAME — A BINDING, NOT A TENSOR.
+///
+/// The fold's score gather binds the Kᵀ plane by naming this reserved tid, keyed on the sealed
+/// pair's K-cache source. The defect this type exists to make unwritable: the plane's NAME and its
+/// SOURCE TENSOR were the same type — a bare `u32` — so "resolve the Kᵀ plane back to its PrefixK
+/// source", a conversion the wiring completeness scan legitimately needs, was a conversion ANY
+/// consumer could silently perform. One did: a score gather minted against the source tensor's own
+/// placement read the NATURAL-K plane instead of Kᵀ — same size, wrong plane, invisible to every
+/// extent law, because both planes are `plane_stride` per kv head.
+///
+/// ⛔⛔⛔ THE LOCK IS WHAT THE TYPE CAN DO, NOT HIDING THE NUMBER. The wire still carries a u32 —
+/// naming the plane on the wire is legal everywhere ([`Self::wire_tid`]). What no consumer can do
+/// anymore is turn this name into the SOURCE TENSOR and inherit its dataspace: the only doors are
+/// the wire name, the source tid FOR SCANS, and the reconstruction from a wire tid — and none of
+/// them yields a tensor, a placement, or a dataspace. The plane's placement comes from the pool's
+/// own typed plane law ([`crate::sdsc_abstract::PagedKvPool`]), matched by KIND at the one
+/// gather-mint door — never by resolving this name through anything.
+///
+/// ⛔ NO `From<u32>` FOR REAL TIDS, no `Default`, no arithmetic: the one constructor is
+/// [`Self::of`], keyed on the pair's K tid, the same key every sayer already shared.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct KctResident {
+    /// The sealed pair's K-cache SOURCE tensor tid — the KEY, never the dataspace.
+    source_k: u32,
+}
+
+impl KctResident {
+    /// ONE door — keyed on the sealed pair's K-cache source tid, the same key the splice's mint,
+    /// the door's write tail and the emitter's scratch naming all share.
+    pub const fn of(source_k: u32) -> Self {
+        KctResident { source_k }
+    }
+
+    /// The plane's name ON THE WIRE — for writing a binding or placing the plane at the write
+    /// tail. A serialized name is the ONE place a bare number is the wire format, which is the
+    /// only reason this door exists (the same shape as `PagePart::at_slots`); it is a NAME, and
+    /// nothing downstream may resolve it to a tensor. ⛔ THE ONLY u32 DOOR on this type.
+    pub const fn wire_tid(self) -> u32 {
+        reserved_region("kct_resident").at(self.source_k)
+    }
+
+    /// The PrefixK SOURCE TENSOR this plane is keyed on — the wiring completeness scan's marker
+    /// ("0 of 40 layers have prefix-KV wiring" is the refusal this door exists to answer). ⛔ FOR
+    /// SCANS ONLY: a gather minting a value dataspace from this tid is exactly the silent
+    /// plane→source conversion this type exists to refuse, and the gather-mint door does not take
+    /// this value.
+    pub const fn source_k(self) -> u32 {
+        self.source_k
+    }
+
+    /// Reconstruct the binding from a wire tid — the RESOLUTION side of
+    /// [`Self::wire_tid`], for the one place a bound tid must be classified by kind.
+    /// `None` for every tid outside the `kct_resident` region.
+    pub const fn of_wire(tid: u32) -> Option<Self> {
+        let region = reserved_region("kct_resident");
+        if region.floor() <= tid && tid <= region.base {
+            Some(KctResident {
+                source_k: region.base - tid,
+            })
+        } else {
+            None
+        }
+    }
 }
 
 /// Base of the RESERVED tid block for the HEAD-MAJOR o_proj weight copy (the "kill the 64-op
@@ -613,7 +690,7 @@ pub fn kct_resident_tid(k_id: u32) -> u32 {
 /// head-major ONLY if the o matmul's B
 /// operand is k-axis-block-shuffled to match — a SECOND, permuted copy of each layer's o_proj
 /// weight, resident in seg1 next to its source. KEYED ON THE o_proj WEIGHT SOURCE TID `w_id`
-/// (like [`kct_resident_tid`]) so the emitter (which has the matmul's `w.tid`) and the
+/// (like [`KctResident::wire_tid`]) so the emitter (which has the matmul's `w.tid`) and the
 /// layout/guard (which iterate every layer's `w_id`) compute the SAME copy tid with no
 /// layer-index handoff. A 1M region keeps it disjoint from `kct_resident` below and from real
 /// source tids (~thousands) — and unlike the kct region, only ~40 slots (one per layer) are ever
@@ -622,6 +699,45 @@ pub const OPROJ_HEADMAJOR_BASE: u32 = reserved_region("oproj_headmajor").base;
 /// Reserved tid for the head-major permuted copy of the o_proj weight with source tid `w_id`.
 pub fn oproj_headmajor_tid(w_id: u32) -> u32 {
     reserved_region("oproj_headmajor").at(w_id)
+}
+
+/// ONE PART OF THE PAGED FOLD'S CARRY — which tensor of the (max, sum, accumulator) triple a
+/// placement or a binding names. The fold body loads all three at the top of a pass and stores
+/// them back at the bottom; the seed program writes all three; the finalize reads the sum and
+/// the accumulator. Numbered as a region and not named as three sentinels because nothing but
+/// the splice's mint and the census's placement ever spell them, and both hold this enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PagedFoldCarry {
+    /// The running max, `[BATCH, MQ]` f16 (one value per stick — the frame the body reads
+    /// with no reshape; `paged_fold.py`'s module doc states the law) — the f16 floor
+    /// [`crate::sdsc_abstract::ATTN_SEED_FLOOR`] at the seed, cross-checked against the
+    /// kernel's stated fill by the whole-function walk's fill arm. The carry's memory image is
+    /// the one-shot kernel's own legalized grading — see `paged_fold.py`'s module doc for the
+    /// law and the f32-graded follow-up.
+    Max,
+    /// The running softmax denominator, `[BATCH, MQ]` f16.
+    Sum,
+    /// The running weighted accumulator, `[BATCH*MQ, HD]` f16.
+    Acc,
+}
+
+impl PagedFoldCarry {
+    /// This part's reserved tid — the one placement the census mints for it.
+    pub fn tid(self) -> u32 {
+        reserved_region("paged_fold_carry").at(match self {
+            PagedFoldCarry::Max => 0,
+            PagedFoldCarry::Sum => 1,
+            PagedFoldCarry::Acc => 2,
+        })
+    }
+}
+
+/// Whether `tid` is one of the paged fold's three carry tensors — the placement pass's own
+/// question, answered by the region so no caller spells a sentinel. Everything outside the
+/// region — graph tensors, step inputs, other reserved regions — answers `false`.
+pub const fn is_paged_fold_carry(tid: u32) -> bool {
+    let region = reserved_region("paged_fold_carry");
+    region.floor() <= tid && tid <= region.base
 }
 
 /// ⛔⛔⛔ THE REGRESSION THAT ADDING A REGION CAUSED, PINNED — a resident Kᵗ kernel and the gather's
@@ -639,7 +755,7 @@ pub fn oproj_headmajor_tid(w_id: u32) -> u32 {
 #[test]
 fn a_named_region_survives_an_insertion_above_it() {
     assert_ne!(
-        kct_resident_tid(0),
+        KctResident::of(0).wire_tid(),
         KV_BLOCK_INDEX_TID,
         "layer 0's resident Kᵗ kernel resolves to the gather's INDEX tid — the region lookup is \
          positional again, so the tensor a gather reads through the index IS the index"
@@ -647,7 +763,7 @@ fn a_named_region_survives_an_insertion_above_it() {
     assert_eq!(
         KCT_RESIDENT_BASE,
         reserved_region("kct_resident").base,
-        "KCT_RESIDENT_BASE names a different region than kct_resident_tid does"
+        "KCT_RESIDENT_BASE names a different region than KctResident::wire_tid does"
     );
     assert_eq!(
         SCALARMUL_SCALE_BASE,
@@ -657,8 +773,8 @@ fn a_named_region_survives_an_insertion_above_it() {
     // Every region this module has a door for, resolved by name and asserted to hold the tid that
     // door hands out — so a rename shows up here rather than as a neighbouring region's base.
     assert!(
-        reserved_region("kct_resident").floor() <= kct_resident_tid(999),
-        "kct_resident_tid walked below its own region"
+        reserved_region("kct_resident").floor() <= KctResident::of(999).wire_tid(),
+        "KctResident::wire_tid walked below its own region"
     );
     assert_eq!(
         reserved_region("kv_block_index").at(0),

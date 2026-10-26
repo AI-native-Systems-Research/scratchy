@@ -155,8 +155,10 @@
 //! row (the model's own answers, never the textbook ones — an expected-answer detector reports ~9 phantom
 //! failures at bs=1).
 
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
-use ktir_superdsc::sdsc_abstract::{AttnGeometry, PagedKvPool, attn_bundle_rows};
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{AttnFacts, assemble_attn};
+use ktir_superdsc::sdsc_abstract::{
+    AttnGeometry, KvExtent, PagedKvPool, SlotCount, attn_bundle_rows,
+};
 
 /// granite-3.1-2b — the model every card number is from.
 const NQH: u32 = 32;
@@ -164,6 +166,8 @@ const NKVH: u32 = 8;
 const HD: u32 = 64;
 const CAP: u32 = PagedKvPool::PAGE_SLOTS as u32;
 const ACTIVE_CAP: u32 = PagedKvPool::PAGE_SLOTS as u32;
+/// The storage/sweep pair on the boundary's one carrier — the sweep is the full page here.
+const EXTENT: KvExtent = KvExtent::new(SlotCount::new(CAP), SlotCount::new(ACTIVE_CAP));
 
 /// One op's whole declaration, projected.
 #[derive(Debug, Clone)]
@@ -246,23 +250,24 @@ fn emit_at(mq: u32, gather: bool) -> Vec<OpPicture> {
         attn_bundle_rows(geom, mq, true).unwrap_or_else(|| panic!("mq={mq} is not a baked rung"));
     let mut sym = 0i64;
     let ops = assemble_attn(
-        0,
-        geom,
-        bundle_rows,
-        CAP,
-        ACTIVE_CAP,
-        "t_qs",
-        "t_new_k",
-        "t_new_v",
-        "t_kct",
-        "t_vc",
-        "t_pmask",
-        "t_cmask",
-        gather.then_some("t_kv_idx"),
-        None,
-        ktir_superdsc::place::PlaceId::Act(900),
-        true,
-        false,
+        AttnFacts {
+            t: 0,
+            geom,
+            bundle_rows,
+            extent: EXTENT,
+            qs: "t_qs",
+            new_k_scaled: "t_new_k",
+            new_v: "t_new_v",
+            kct: "t_kct",
+            vc: "t_vc",
+            pmask: "t_pmask",
+            cmask: "t_cmask",
+            kv_block_index: gather.then_some("t_kv_idx"),
+            chunk: None,
+            out_id: ktir_superdsc::place::PlaceId::Act(900),
+            rows_are_requests: true,
+            headmajor_handoff: false,
+        },
         &mut sym,
         None,
     )

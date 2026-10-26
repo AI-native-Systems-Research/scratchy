@@ -163,7 +163,7 @@ fn no_declaration_emits_no_indirection_anywhere() {
     let op = plain_matmul();
     assert!(op.indirect.is_none(), "the default is no gather");
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    let e = superdsc::emit_sdsc("MatMul_0", &op, &folds, None).expect("emits");
+    let (e, _) = superdsc::emit_sdsc("MatMul_0", &op, &folds, None).expect("emits");
     let j = serde_json::to_value(&e).unwrap();
 
     // Over the op's ACTUAL operands — the KERNEL-less copy op has two, a matmul had three, and a
@@ -223,7 +223,7 @@ fn a_declared_gather_matches_the_vendor_field_set() {
     // test reads (`0` = value, `1` = index) already assumed.
     let op = gather_copy_declared();
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    let e = superdsc::emit_sdsc("MatMul_0", &op, &folds, None).expect("a gather emits");
+    let (e, _) = superdsc::emit_sdsc("MatMul_0", &op, &folds, None).expect("a gather emits");
     let j = serde_json::to_value(&e).unwrap();
 
     let idx = node(&j, "MatMul_0", 1);
@@ -358,7 +358,7 @@ fn attach_gather_index_wires_the_operand_and_the_declaration_as_one() {
 
     // And it emits the vendor's shape.
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    let e = superdsc::emit_sdsc("MatMul_0", &op, &folds, None).expect("a gather emits");
+    let (e, _) = superdsc::emit_sdsc("MatMul_0", &op, &folds, None).expect("a gather emits");
     let j = serde_json::to_value(&e).unwrap();
     assert_eq!(
         node(&j, "MatMul_0", value_idx)["indirectAllocType_"],
@@ -550,7 +550,8 @@ fn deeptools_only_schedules_a_gather_on_a_kernel_less_op() {
     // verifies-nothing`). The op that is refused is the one that must be measured.
     let mm = matmul_opspec(384, 384, 64, 16, "Tensor0", "Tensor1", "Tensor2").expect("a matmul");
     let folds = SdscFoldSet::new(mm.iter.cores_used());
-    let e = superdsc::emit_sdsc("MatMul_0", &mm, &folds, None).expect("an UNGATHERED matmul emits");
+    let (e, _) =
+        superdsc::emit_sdsc("MatMul_0", &mm, &folds, None).expect("an UNGATHERED matmul emits");
     let j = serde_json::to_value(&e).unwrap();
     let ours = &j["dscs_"][0]["MatMul_0"]["primaryDsInfo_"];
     assert!(
@@ -563,7 +564,7 @@ fn deeptools_only_schedules_a_gather_on_a_kernel_less_op() {
     // this test about a DIFFERENCE rather than about one op.
     let copy = plain_matmul();
     let cfolds = SdscFoldSet::new(copy.iter.cores_used());
-    let ce = superdsc::emit_sdsc("Gather_0", &copy, &cfolds, None).expect("the copy op emits");
+    let (ce, _) = superdsc::emit_sdsc("Gather_0", &copy, &cfolds, None).expect("the copy op emits");
     let cj = serde_json::to_value(&ce).unwrap();
     let theirs = &cj["dscs_"][0]["Gather_0"]["primaryDsInfo_"];
     assert!(
@@ -650,7 +651,7 @@ fn the_index_operand_carries_the_vendors_own_dtype_and_its_own_layout() {
         .attach_gather_index(vendor_index("BlockTable"), 0)
         .expect("a valid pair");
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    let e = superdsc::emit_sdsc("MatMul_0", &op, &folds, None).expect("a gather emits");
+    let (e, _) = superdsc::emit_sdsc("MatMul_0", &op, &folds, None).expect("a gather emits");
     let j = serde_json::to_value(&e).unwrap();
     let dsc = &j["dscs_"][0]["MatMul_0"];
     let labeled = dsc["labeledDs_"].as_array().expect("our labeledDs_");

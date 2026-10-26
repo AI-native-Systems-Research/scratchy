@@ -70,9 +70,10 @@ use super::reduce::{
 };
 use crate::addr::{Head, Idx, Nest};
 use crate::emit::{
-    EmittedOp, In, PointwiseDivided, assemble_pointwise_broadcast_divided,
+    EmitCtx, EmittedOp, In, PointwiseDivided, PointwiseFacts, assemble_pointwise_broadcast_divided,
     assemble_pointwise_broadcast_off, assemble_restickify_kt_2d, fl, rb,
 };
+use crate::exp_base::ExpBase;
 use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{
     BlockCols, DxGroupCeiling, FeatIdx, FlatTag, KernelTag, KtTileFeats, KtTileSlots, Lanes,
@@ -140,6 +141,10 @@ pub(crate) const HEAD_WIDE_BUFS: [crate::place::SynthRole; 2] = {
 pub(crate) const LADDER_OPS_PER_WINDOW: usize = 11;
 
 /// The shared, batched-over-heads online-softmax scratch/state buffer NAMES for one AttnDecode node.
+/// The recurrence's OWN three (`run_m`/`run_l`/`run_o`) are NOT here — they live on
+/// [`StateNames`], the one carrier the seed→fold→finalize chain threads; a scratch holder and the
+/// recurrence's state are different facts, and diff 06's two-holders note (one derivation, one
+/// frozen copy) is closed by there being only the carrier.
 struct BlockBufs {
     sc: String,
     bmax: String,
@@ -151,9 +156,6 @@ struct BlockBufs {
     bsum: String,
     otmp: String,
     ltmp: String,
-    run_m: String,
-    run_l: String,
-    run_o: String,
 }
 
 /// One block's contribution, folded into the shared online-softmax state via the correction
@@ -163,7 +165,6 @@ struct BlockBufs {
 /// `kt_stride` is the tensor's TRUE stride, never `width` (a per-block column slice must not lie about
 /// the tensor's real row stride, or every row past the first addresses the wrong location once
 /// `cap>width`). `kt_off_fn`/`v_off_fn` compute each head's own base offset into that operand.
-#[allow(clippy::too_many_arguments)]
 /// GQA-GROUP batching for a block's two matmul legs: one op per KV-head with `batch=gqa`, instead
 /// of one op per QUERY head. `nqh` ops become `nkvh`.
 ///
@@ -180,13 +181,17 @@ struct BlockBufs {
 /// prefix-block comment below). There is no window and no gap to express.
 /// The nests this block addresses through. Every extent an offset below is allowed to use comes from
 /// here, so a stride cannot be written at a call site — the caller names a coordinate and the nest
-/// supplies the arithmetic. `slabs` answers through the one `hd / lanes` law (`Shape::slabs_of`).
+/// supplies the arithmetic. `slabs` answers through the one `hd / lanes` law (`Shape::<HD>::slabs`).
+///
+/// ⭐ THE HEAD COUNT AND HEAD DIM ARE CONSTS, NOT FIELDS. Both were runtime re-spellings of the
+/// assembler's own geometry — `heads: nqh` at every construction this struct has ever had, `hd`
+/// the `HD` the assembler is instantiated at — the two-derivations defect: the count a nest framed
+/// its buffers with and the count the geometry states could drift apart, or be any model's. The
+/// struct carries them as const generics instead, so a nest cannot exist at a geometry its
+/// assembler was not instantiated at, and [`Self::slabs`] closes the file's last `slabs_of`
+/// runtime hatch by reading the const.
 #[derive(Clone, Copy)]
-struct BlockNests {
-    /// The head count this stream is WIDE in — nqh for the query side, nkvh for the kv side. Kept
-    /// explicitly rather than derived from `rows/mq`, because the two are independent quantities.
-    heads: u32,
-    hd: u32,
+struct BlockNests<const NQH: u32, const HD: u32> {
     /// The chunk's REAL query rows. Typed apart from `rows`, which it equals at nqh=1.
     mq: crate::sdsc_abstract::QueryRowCount,
     /// The ROW REGIME these nests frame the shared buffers with, carrying the extent that regime
@@ -252,7 +257,7 @@ impl BlockRows {
         }
     }
 }
-impl BlockNests {
+impl<const NQH: u32, const HD: u32> BlockNests<NQH, HD> {
     /// The ROW head `h` starts at, for the head-major buffer offsets — decided by the named row
     /// laws (`RequestHeadRow` / `HeadRequestRow`), the same laws `score_rows` mints its placements
     /// from, so neither order has a second spelling anywhere.
@@ -273,7 +278,7 @@ impl BlockNests {
             // Request-major: the pass is already rebased onto one request's block, so THAT request's
             // `nqh` rows are the contiguous ones — which is what makes `mb = gqa` legal here.
             BlockRows::PerRequest(_) => {
-                crate::sdsc_abstract::RequestHeadRow::of(self.req, h, self.heads).get()
+                crate::sdsc_abstract::RequestHeadRow::of(self.req, h, NQH).get()
             }
             // THE ONE ROW LAW, shared with the mask that says which of these rows are valid. Restating
             // `h * self.mq` here is what let the two drift.
@@ -289,7 +294,7 @@ impl BlockNests {
         Idx::<crate::addr::Row>::n(row)
     }
     fn slabs(&self) -> u32 {
-        crate::addr::Shape::<0, 0, 0, 0>::slabs_of(self.hd, crate::superdsc_opspec::Df::Fp16).get()
+        crate::addr::Shape::<HD, 0, 0, 0>::slabs(crate::superdsc_opspec::Df::Fp16).get()
     }
     /// ⭐⭐⭐⭐⭐ THESE NESTS RE-BASED ONTO **ONE REQUEST** — the collapsed fold's per-request legs, in one
     /// coordinate change.
@@ -299,7 +304,7 @@ impl BlockNests {
     /// four laws asked for a different row. That is what makes a per-request OFFSET a substitute for a
     /// per-request kernel DIM — the shape the card refused — and what keeps the emitter's rows the same
     /// rows the mask's validity is staged into.
-    fn at_request(&self, r: u32) -> BlockNests {
+    fn at_request(&self, r: u32) -> BlockNests<NQH, HD> {
         BlockNests { req: r, ..*self }
     }
     /// Head-major `[nqh*mq, hd]` — the online-softmax buffers. Head `h`, slab `s`.
@@ -310,7 +315,7 @@ impl BlockNests {
     fn head_major(&self, h: u32, s: u32) -> crate::addr::DevOff {
         crate::addr::Nest::new(
             &["row", "feat"],
-            &[self.rows.extent(), self.hd],
+            &[self.rows.extent(), HD],
             crate::superdsc_opspec::Df::Fp16,
         )
         .view()
@@ -351,9 +356,7 @@ impl BlockNests {
     /// plane pitch (`mq` rows) with the offset. Head `h`'s slab `s` is the COLUMN `h*hd + s*stick`,
     /// and the stick plane it lands in is the law's business, not the caller's.
     fn token_stream(&self, h: u32, s: u32) -> crate::sdsc_abstract::OperandPlacement {
-        crate::sdsc_abstract::OperandPlacement::of_token_stream(
-            self.mq, self.heads, self.hd, h, self.req, s,
-        )
+        crate::sdsc_abstract::OperandPlacement::of_token_stream(self.mq, NQH, HD, h, self.req, s)
     }
     /// The same stream, for a walk that contracts ONE STICK per op — see
     /// [`OperandPlacement::of_token_stream_by_slab`]. The pitch differs; the offset and the head
@@ -361,8 +364,8 @@ impl BlockNests {
     fn token_stream_by_slab(&self, h: u32, s: u32) -> crate::sdsc_abstract::OperandPlacement {
         crate::sdsc_abstract::OperandPlacement::of_token_stream_by_slab(
             self.mq,
-            self.heads,
-            self.hd,
+            NQH,
+            HD,
             h,
             self.req,
             s,
@@ -470,9 +473,13 @@ impl GatheredFold {
     }
 }
 
+/// ⭐ THE KV-HEAD COUNT IS NOT A FIELD. It was `nkvh: u32` — a runtime re-spelling of `NKVH`, the
+/// geometry const this assembler is instantiated at, carried in a struct so the batched arms could
+/// read it back as a local. That is the two-derivations defect: the count the arms classified on
+/// and the count the geometry states could drift apart, or be any model's. The arms now read the
+/// const through `assemble_attn_block`'s const generics, so there is nothing here to disagree with.
 #[derive(Clone, Copy)]
 struct BatchedKv {
-    nkvh: u32,
     /// The score leg batches only when its CONTRACTION is one stick — see [`OneStickContraction`].
     score: Option<OneStickContraction>,
     value: Option<()>,
@@ -490,23 +497,15 @@ struct BatchedKv {
 ///
 /// `matmul_opspec_off`'s own doc pins the dxp-validated shared-kernel shape as the one where `in`/`out`
 /// ARE the stick, and states the consequence as `y-stride = 64 = hd` — an hd=64 identity written into
-/// the justification of the form. This type is that identity made checkable: the only mint takes the
-/// contraction's [`MatK`], so a leg cannot claim the property without naming the extent it contracts.
+/// the justification of the form. This type is that identity made checkable, and its ONE door claims
+/// it BY CONSTRUCTION ([`Self::by_slab_split`]): a slab-split leg contracts one stick per op at every
+/// head dim, so there is no extent left to inspect and no call site that could hand the witness to a
+/// leg that did not earn it. The extent-inspecting mint this type used to carry is deleted with the
+/// per-head score arm it served — a leg that has not been split has NO witness to claim.
 #[derive(Clone, Copy)]
 struct OneStickContraction(());
 
 impl OneStickContraction {
-    /// The ONE door. `Some` exactly when the contraction is a single stick at this operand format.
-    ///
-    /// ⏭ The score leg's contraction becomes one stick at every head dim once it is SPLIT BY SLAB
-    /// (`nslab` ops of one stick each, accumulating), at which point this witness is always available
-    /// and the per-head score arm can go. It is not a head-dim gate: it is the precondition the split
-    /// would satisfy.
-    #[allow(dead_code)]
-    fn of_contraction(k: MatK, df: Df) -> Option<OneStickContraction> {
-        (k.get() == df.elems_per_stick()).then_some(OneStickContraction(()))
-    }
-
     /// ⭐⭐⭐ THE SPLIT SATISFIES THE PRECONDITION BY CONSTRUCTION, AT EVERY HEAD DIM. A slab IS one
     /// stick ([`MatK::of_head_slab`]), so a leg that contracts one slab per op has a one-stick
     /// contraction whatever `hd` is — there is nothing left to test, which is why this door takes no
@@ -567,10 +566,22 @@ impl ScoreArm {
     /// which is the tell: less work, done wrong). So the slab split is REQUIRED, not optional.
     ///
     /// Which leaves `nslab > 1` as a pure COST question: `nkvh*nslab` against `nqh`.
-    fn choose(nqh: u32, nkvh: u32, nslab: u32) -> ScoreArm {
+    ///
+    /// ⭐⭐⭐⭐⭐ THE GEOMETRY'S OWN CONSTS, NOT THREE `u32` ARGUMENTS. `nqh`, `nkvh` and `nslab` are
+    /// all compile-time facts of the lowering's instantiation — the model's head counts and
+    /// `head_dim / lanes` — so the arm is a const fn over the const generics and is chosen AT
+    /// INSTANTIATION. The old signature took `(nqh, nkvh, nslab)` as three bare `u32`s read from
+    /// whatever locals the call site had in scope: the count-transposition slot `AttnGeometry`'s
+    /// own doc names, and the classification-on-raw-head-counts spelling — a descriptor form
+    /// picked from numbers rather than from the geometry the descriptor is minted for. `nslab`
+    /// comes from `Shape::<HD>::slabs`, the const-generic form of the one `hd / lanes` law, so
+    /// this site no longer widens a runtime `hd` through `Shape::<0,0,0,0>::slabs_of` to
+    /// re-derive what the type already states.
+    const fn of_geometry<const NQH: u32, const NKVH: u32, const HD: u32>() -> ScoreArm {
         // The slab split satisfies dxp's one-stick contraction limit and, now that each operand
         // declares its own pitch, both stride relations too — at every head dim. So this is cost only.
-        if nkvh.saturating_mul(nslab) <= nqh {
+        let nslab = crate::addr::Shape::<HD, 0, 0, 0>::slabs(Df::Fp16).get();
+        if NKVH.saturating_mul(nslab) <= NQH {
             ScoreArm::SlabSplitBatched
         } else {
             ScoreArm::PerHead
@@ -578,7 +589,6 @@ impl ScoreArm {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 /// ⭐⭐⭐⭐⭐ WHETHER THIS ATTENTION BLOCK **SEEDS** THE ONLINE SOFTMAX OR **FOLDS ONTO** AN EXISTING SEED.
 ///
 /// ⛔ THIS WAS A `bool` NAMED `first`, eleven arguments into a twenty-argument call. The two states are not
@@ -591,6 +601,12 @@ impl ScoreArm {
 /// role type the claim is carried by the call: the fold site passes [`Self::FoldsOntoSeed`] and there is no
 /// way for it to seed by getting a boolean backwards. That matters most for the DEEPEST row, which has the
 /// most passes to lose, and losing them looks exactly like the card's remaining failure.
+///
+/// ⭐⭐ AND SINCE THE DOORS, THE SEQUENCE IS TYPED TOO. The core below is reachable only through
+/// [`assemble_attn_seed_block`] / [`assemble_attn_fold_block`]: the seed door is the only minter of
+/// [`SeededCarry`] and the fold door requires one, so a fold emitted before any seed — the per-CALL
+/// role this enum fixes, silently wrong per-SEQUENCE — does not compile. This enum survives as the
+/// core's private branch selector; the doors own the law.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BlockSeed {
     /// This block writes `run_m`/`run_l`/`run_o` directly — the batched-decode new-token block, whose
@@ -604,6 +620,210 @@ impl BlockSeed {
     /// The one predicate the emission body asks. Named so `if seed.seeds()` reads as the question it is.
     pub const fn seeds(self) -> bool {
         matches!(self, BlockSeed::SeedsState)
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ THE RECURRENCE STATE'S NAMES — the ALLOCATION, not the proof. The names must exist
+/// before the block that first writes them is emitted (the layout declares them, the seed role
+/// writes them), so they are minted once beside `BlockBufs`'s own fields — the same `syn`, the
+/// same roles — and frozen after, the same one-derivation discipline. [`SeededCarry`] wraps this
+/// as the proof the state was seeded; the two are deliberately different types, because a bare
+/// `StateNames` must not be handable to a fold door.
+#[derive(Clone, Debug)]
+struct StateNames {
+    m: String,
+    l: String,
+    o: String,
+}
+
+impl StateNames {
+    /// The recurrence's running max — the folds' own internal, consumed by the correction
+    /// recurrence, never read at the hand-off.
+    fn m(&self) -> &str {
+        &self.m
+    }
+
+    /// The recurrence's running denominator.
+    fn l(&self) -> &str {
+        &self.l
+    }
+
+    /// The recurrence's running accumulator.
+    fn o(&self) -> &str {
+        &self.o
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ PROOF THE ONLINE-SOFTMAX STATE WAS SEEDED — the seed→body→finalize chain's own token,
+/// wrapping the state's names (all three: the folds read the max too).
+///
+/// The carry round-trips through device memory BETWEEN launches: the new-token block seeds
+/// `run_m`/`run_l`/`run_o`, every prefix/window fold and the chunk body fold onto it, and the finalize
+/// divides by `run_l`. Program order = call order is law, but nothing typed the ORDER — the
+/// producer/consumer lock (`check_internal_buffers_are_read_where_written`) proves every internal
+/// read lies inside some WRITTEN interval over the whole op list, which a seed emitted AFTER the fold
+/// it should precede still passes. This token is that sequence, as a type: [`assemble_attn_seed_block`]
+/// and `assemble_new_block_chunk` are the only minters, [`assemble_attn_fold_block`], the chunk body
+/// and the LX probability walk require the token, and the finalize's `realdiv` reads its operands off
+/// the [`FinalizeCarry`] the one-way `handoff` below returns — a fold or divide emitted before any
+/// seed does not compile.
+///
+/// **The max crosses to the folds, and stops there.** The correction recurrence reads `m` at every
+/// fold, so the proof carries it; the finalize does not — `handoff` CONSUMES the proof and returns
+/// exactly the two operands the divide reads, so a finalize dividing by the running MAX (the
+/// same-typed-swap class) has no spelling: [`FinalizeCarry`] does not carry it. (The seed-safety
+/// theorem that makes `l` non-zero — the first window's valid-lane count ≥ 1 over
+/// `real: NonZeroU32` — is stated on `ValidityMask` in `sdsc_abstract`.)
+#[derive(Clone, Debug)]
+struct SeededCarry {
+    state: StateNames,
+}
+
+impl SeededCarry {
+    /// The one mint: a frozen copy of the allocation, taken at a seed door after the seed ops are
+    /// emitted. `StateNames` is frozen after its own mint, so the copy cannot drift from the names
+    /// the seed ops wrote; one derivation, one frozen holder — the two-holders fact diff 06 stated
+    /// openly is closed here, because `BlockBufs` no longer carries these names at all.
+    fn mint(state: &StateNames) -> SeededCarry {
+        SeededCarry {
+            state: state.clone(),
+        }
+    }
+
+    /// The recurrence's running max — the folds' own internal.
+    fn m(&self) -> &str {
+        self.state.m()
+    }
+
+    /// The recurrence's running denominator.
+    fn l(&self) -> &str {
+        self.state.l()
+    }
+
+    /// The recurrence's running accumulator.
+    fn o(&self) -> &str {
+        self.state.o()
+    }
+
+    /// ⭐ THE ONE-WAY DOOR TO THE FINALIZE — consumes the proof and drops the max. The divide's
+    /// operands are exactly the denominator and the accumulator; after this call the recurrence
+    /// carry is gone, and there is no spelling that reads `m` at the hand-off.
+    fn handoff(self) -> FinalizeCarry {
+        FinalizeCarry {
+            l: self.state.l,
+            o: self.state.o,
+        }
+    }
+}
+
+/// The finalize's two operands — what the `realdiv` reads, and nothing else.
+#[derive(Clone, Debug)]
+struct FinalizeCarry {
+    l: String,
+    o: String,
+}
+
+impl FinalizeCarry {
+    /// The finalize's denominator — the seed-written `l`.
+    fn l(&self) -> &str {
+        &self.l
+    }
+
+    /// The finalize's numerator — the seed-written accumulator.
+    fn o(&self) -> &str {
+        &self.o
+    }
+}
+
+/// The prefix mask's shape, at the constants the bundle's own carrier ([`AttnBundleRows`])
+/// mints it with — the type the sweep-law token holds.
+///
+/// [`AttnBundleRows`]: crate::sdsc_abstract::AttnBundleRows
+type PrefixMaskShapeBaked = crate::sdsc_abstract::PrefixMaskShape<
+    { crate::sdsc_abstract::POOL_STICK },
+    { crate::sdsc_abstract::PAGE_MASK_COLS },
+>;
+
+/// ⭐⭐⭐⭐⭐ THE SWEEP-LAW TOKEN — the mask door's declaration, crossed to the fold emissions as a
+/// TYPE. It carries the prefix mask's validated shape: the shape whose block a pass's sweep was
+/// proved to fit ([`PrefixMaskShape::sweep_fits`], the door's own `Err`), and whose STAGING the
+/// sweep readings guard — every row's whole sweep holds a valid lane or the staging door refuses,
+/// because the fold's rescale expunges an all-masked window only when a later max-rise raises `m`
+/// past the −65504 sentinel, so a row that sweeps nothing normalizes phantom lanes into the `l`
+/// the finalize divides by.
+///
+/// The ONE mint is [`assemble_attn`]'s mask door, immediately after the sweep-fits check. The
+/// token exists so the per-row prefix fold cannot be ADDRESSED without it: the corner that fold
+/// reads at is the token's own door ([`Self::slab_corner`]), never a shape a call site holds —
+/// the mask door consumes the shape's name, and `rows` crosses once, read off the token.
+///
+/// [`PrefixMaskShape::sweep_fits`]: crate::sdsc_abstract::PrefixMaskShape::sweep_fits
+#[derive(Clone, Copy)]
+struct SweepLaw {
+    shape: PrefixMaskShapeBaked,
+}
+
+impl SweepLaw {
+    /// The ONE mint — the mask door, immediately after `sweep_fits` accepts the sweep. Private:
+    /// no other spelling produces a law, so a fold that needs one can only be emitted in a node
+    /// whose mask shape was validated.
+    fn mint(shape: PrefixMaskShapeBaked) -> SweepLaw {
+        SweepLaw { shape }
+    }
+
+    /// The shape's rows — the door's own one read, the shared-buffer extent every op sweeps.
+    fn rows(&self) -> crate::sdsc_abstract::MaskRows {
+        self.shape.rows()
+    }
+
+    /// ⭐ THE PREFIX FOLD'S BAKED MASK CORNER at `slab` — BLOCK 0's, because the runtime's
+    /// `fold_delta` steps the mask one block per pass, so the bake names only where the FIRST
+    /// pass's window reads. The only corner door for this mask.
+    fn slab_corner(&self, slab: u32) -> crate::sdsc_abstract::MaskCorner {
+        self.shape.slab_elems(0, slab)
+    }
+}
+
+/// ⭐⭐⭐ THE FOLD'S MASK READ — which mask a pass silences lanes with, and where its read
+/// starts, as ONE value. The per-row prefix block's corner is not a number a caller composes:
+/// it is the [`SweepLaw`] token's own door, so reading that mask REQUIRES the mask door's
+/// declaration — a fold onto the per-row prefix mask cannot be emitted in a node whose shape
+/// was never validated. The nest arm is the other family — the causal block's own block-major
+/// corner, and the broadcast prefix row — whose seed-safety is the causal diagonal, not the
+/// histories.
+enum FoldMaskRead {
+    /// The per-row prefix mask, at `slab` of the block the pass reads — the corner from the law.
+    PrefixSlab { law: SweepLaw, slab: u32 },
+    /// A corner the mask's own nest states.
+    Nest(crate::addr::DevOff),
+}
+
+/// ⭐⭐⭐⭐⭐ THE PRE-UPDATE READ, AS ONE FACT — not two. `ocorr` (the OLD `run_o` times `corr`,
+/// staged in `otmp`) and the value matmuls' `stridedadd` addend are the SAME decision: a fold
+/// block makes both, a seed block neither. They used to be coupled by two separate
+/// `seed.seeds()` tests with a comment between them — either could be flipped alone, silently
+/// dropping the correction (a matmul writing `run_o` with no `ocorr` first) or folding an
+/// unwritten buffer (`otmp` as an addend with no producer). The addend handle's ONLY mint is
+/// the arm that pushes the `ocorr` op, so the ORDER law — every `ocorr` precedes every value
+/// matmul of its block, because the matmul's fused epilogue overwrites `run_o` — is the
+/// token's scope: a value leg that folds through `otmp` cannot be emitted before the op that
+/// wrote `otmp`.
+enum FoldAddend {
+    /// A seed block writes its own result — no pre-update value exists to correct.
+    Seed,
+    /// `otmp` holds `run_o · corr` because the `ocorr` pushed in the minting arm wrote it.
+    PreUpdate(Stk<FlatTag>),
+}
+
+impl FoldAddend {
+    /// The `stridedadd` pair the value arms fold through — `None` on the seed arm, where the
+    /// matmul writes its own result with no epilogue. A projection: reading cannot violate the
+    /// minting law, only minting can.
+    fn stridedadd(&self, at: crate::addr::DevOff) -> Option<(&Stk<FlatTag>, crate::addr::DevOff)> {
+        match self {
+            FoldAddend::Seed => None,
+            FoldAddend::PreUpdate(a) => Some((a, at)),
+        }
     }
 }
 
@@ -679,6 +899,9 @@ fn per_core_blocks(e: &EmittedOp) -> Vec<(String, bool, u64, u64)> {
 fn check_internal_buffers_are_read_where_written(
     ops: &[EmittedOp],
     bufs: &BlockBufs,
+    // The recurrence's three names — the same strings the carry threads, sourced from the one
+    // allocation so the lock and the emission cannot disagree about what the state is called.
+    state: &StateNames,
 ) -> Result<(), SuperDscError> {
     // The buffers this node both WRITES and READS. `out` is the hand-off (written, never read here) and
     // `qs`/`kct`/`vc`/the masks are inputs (read, never written), so neither has a pairing to check.
@@ -693,9 +916,9 @@ fn check_internal_buffers_are_read_where_written(
         &bufs.bsum,
         &bufs.otmp,
         &bufs.ltmp,
-        &bufs.run_m,
-        &bufs.run_l,
-        &bufs.run_o,
+        state.m(),
+        state.l(),
+        state.o(),
     ];
     // Per buffer: the byte intervals WRITTEN, and each READ interval with the op that made it.
     let mut written: std::collections::BTreeMap<&str, Vec<(u64, u64)>> = Default::default();
@@ -749,100 +972,239 @@ fn check_internal_buffers_are_read_where_written(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn assemble_attn_block(
-    ops: &mut Vec<EmittedOp>,
-    t: u32,
-    tag: &str,
-    nqh: u32,
-    hd: u32,
-    // The chunk's REAL query rows and the shared-buffer row extent, typed apart: `mq` and `rows`
-    // sat side by side as two `u32`s while `rows == nqh*mq` equals `mq_pad` exactly up to mq=2.
-    // `rows` also carries the ROW REGIME (see `BlockRows`): the whole-batch and per-request forms
-    // demand their own extents, so this one parameter replaces the extent + `per_request` pair that
-    // could be mismatched.
-    mq: crate::sdsc_abstract::QueryRowCount,
-    rows: BlockRows,
-    qs: &str,
-    // ⭐ THE SCORE LEG'S OWN FORM: its slab-split contraction needs the head-OUTERMOST order, the only
-    // one whose `y` stride uses the operand's declared pitch. See `of_score_leg`.
-    score_form: crate::ir::bridge::tiled_op_sdsc_op::matmul::SharedKernelBmmForm,
-    kt_kernel: &str,
-    // The score kernel's declared physical column count. `KtKernelPitch` has exactly two doors — the
-    // new block's slot extent and the pool page's slots — so a row count cannot reach this slot.
-    kt_stride: crate::sdsc_abstract::KtKernelPitch,
-    // Takes (query head, head-dim SLAB), symmetric with `v_off_fn` below and for the same reason:
-    // the score leg splits its CONTRACTION by slab so that it is one stick at every head dim, and the
-    // slab is a coordinate on the Kᵀ operand's own nest — applied inside the law, never added to a
-    // finished address by the caller.
-    kt_off_fn: impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
-    v_kernel: &str,
-    v_stride: u32,
-    // Takes (query head, head-dim slab): the slab is a coordinate on the V operand's own nest,
-    // so it is applied INSIDE the law rather than added to a finished address by the caller. That
-    // addition was the last place in this file where a stride was composed by hand.
-    v_off_fn: impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
-    // This block's score column count, with its door naming WHICH width (one stick for every live
-    // caller; `mq_pad` and the head dim are the other 64s it must not silently become).
-    width: crate::sdsc_abstract::BlockCols,
-    mask: &str,
-    mask_off: crate::addr::DevOff,
-    mask_bcast: bool,
-    // ⛔⛔⛔ A ROLE, NOT A `bool`. See `BlockSeed`: the two states are "this block SEEDS the online
-    // softmax" and "this block FOLDS onto an existing seed", and they were `true`/`false` on a parameter
-    // eleven positions into a twenty-argument call. Inverting it does not fail to compile as a bool, and
-    // the failure it produces is not a fault: a fold pass that seeds RESETS `run_m`/`run_l`/`run_o`
-    // mid-accumulation, discarding every page folded before it — so the row with the MOST passes loses the
-    // most, which is the deepest-row signature the card shows.
-    seed: BlockSeed,
+/// ⭐⭐⭐⭐⭐ THE SCORE LEG'S Kᵀ OPERAND — kernel, TRUE pitch and per-head offset law as ONE fact,
+/// because the three only ever move together and a run of adjacent parameters is where they drift:
+/// the pitch is the score kernel's declared physical column count (`KtKernelPitch` has exactly two
+/// doors — the new block's slot extent and the pool page's slots — so a row count cannot reach this
+/// slot), the tensor's TRUE row stride, never a block's column `width` (a per-block column slice
+/// must not lie about the tensor's real row stride, or every row past the first addresses the wrong
+/// location once `cap>width`); and the offset law takes (query head, head-dim SLAB) because the
+/// score leg splits its CONTRACTION by slab so that it is one stick at every head dim, the slab a
+/// coordinate on the Kᵀ operand's own nest — applied inside the law, never added to a finished
+/// address by the caller.
+struct KtLeg<'a, F: Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff> {
+    kernel: &'a str,
+    stride: crate::sdsc_abstract::KtKernelPitch,
+    off_fn: F,
+}
+
+/// ⭐ THE VALUE LEG'S TWIN — same triple, its own plane law: `VKernelRows` is WHICH plane the value
+/// legs read, with the gathered arm refusing every plane but the page (the K-side twin is a slot
+/// count; this sat as a bare `u32` fed the head dim at the new-block call — a head-dim fact
+/// standing in a plane-rows slot, coincident only where `hd` is one stick). The offset law is
+/// symmetric with the K-side's for the same reason: the slab is a coordinate on the V operand's
+/// own nest, applied INSIDE the law rather than added to a finished address by the caller — that
+/// addition was the last place in this file where a stride was composed by hand.
+struct VLeg<'a, F: Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff> {
+    kernel: &'a str,
+    stride: crate::sdsc_abstract::VKernelRows,
+    off_fn: F,
+}
+
+/// ⭐ THE MASK READ'S OWN FACTS — which mask tensor, which corner, whether the row axis is
+/// broadcast — one fact because the three name ONE read: `bcast` is what decides whether the
+/// corner stays UNCHANGED (pmask: head/query-row independent, no per-head shift) or takes the
+/// per-head `nests.score_rows` step added on (cmask: the one-row law that shares `sc`'s own row
+/// addressing 1:1).
+struct MaskFacts<'a> {
+    mask: &'a str,
+    off: crate::addr::DevOff,
+    bcast: bool,
+}
+
+/// ⭐ THE BLOCK'S BATCHED-FORM SET — the three declarations that decide whether this block's
+/// score/value matmuls walk batched, and HOW. All three move together.
+struct BlockForms {
     batched: Option<BatchedKv>,
-    // WHICH shared-kernel bmm form this bundle's batched score/value matmuls declare — named ONCE
-    // at `assemble_attn`'s boundary (`SharedKernelBmmForm::of_attn_rows`) and threaded here, so a
-    // block cannot pick a walk law its own bundle did not.
-    bmm_form: SharedKernelBmmForm,
-    // WHICH request, when the row regime is per-request. 0 for the fold — the runtime rebases each
-    // pass, so naming one here would count it twice. The new-token block passes its own `r`.
-    req: u32,
-    // ⭐⭐⭐⭐⭐ ONE PASS FOR THE WHOLE BATCH: give the score and value legs a REQUEST axis over the
-    // GATHERED SCRATCH, so row `h*mq+r` reads request `r`'s own page in the same launch. `Some` only for
-    // the prefix fold of a gathered batched decode; `None` everywhere else, which emits exactly what
-    // shipped.
-    //
-    // This is what turns the fold's `pages × requests` launches into `pages`. The runtime half is gated
-    // on `OpKv::batched_requests`, and the mask's shape (`MaskBlockForm::PerPage` — one block per page,
-    // every row valid on its own request's history) is the same decision seen from the host side. All
-    // three move together, and the gather is the precondition for any of them: without it the axis walks
-    // an operand with no uniform per-request pitch, which is the fluent-garbage mechanism three earlier
-    // attempts hit.
-    //
-    // ⛔ THE VALUE CARRIES THE STRIDES, NOT A COUNT. It used to be `Option<u32>` — the request count —
-    // and the strides were left to be derived from whatever extents were in scope. `RequestAxis` carries
-    // each of the three `y` steps differenced out of the buffer that has it, and the builder refuses a
-    // walk that would step differently.
+    /// WHICH shared-kernel bmm form this bundle's batched score/value matmuls declare — named ONCE
+    /// at `assemble_attn`'s boundary (`SharedKernelBmmForm::of_attn_rows`) and threaded here, so a
+    /// block cannot pick a walk law its own bundle did not.
+    bmm: SharedKernelBmmForm,
+    /// ⭐⭐⭐⭐⭐ ONE PASS FOR THE WHOLE BATCH: give the score and value legs a REQUEST axis over the
+    /// GATHERED SCRATCH, so row `h*mq+r` reads request `r`'s own page in the same launch. `Some` only for
+    /// the prefix fold of a gathered batched decode; `None` everywhere else, which emits exactly what
+    /// shipped.
+    ///
+    /// This is what turns the fold's `pages × requests` launches into `pages`. The runtime half is gated
+    /// on `OpKv::batched_requests`, and the mask's shape (`MaskBlockForm::PerPage` — one block per page,
+    /// every row valid on its own request's history) is the same decision seen from the host side. All
+    /// three move together, and the gather is the precondition for any of them: without it the axis walks
+    /// an operand with no uniform per-request pitch, which is the fluent-garbage mechanism three earlier
+    /// attempts hit.
+    ///
+    /// ⛔ THE VALUE CARRIES THE STRIDES, NOT A COUNT. It used to be `Option<u32>` — the request count —
+    /// and the strides were left to be derived from whatever extents were in scope. `RequestAxis` carries
+    /// each of the three `y` steps differenced out of the buffer that has it, and the builder refuses a
+    /// walk that would step differently.
     request_axis: Option<GatheredFold>,
-    bufs: &BlockBufs,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
+}
+
+/// ⭐⭐⭐⭐⭐ ONE ATTENTION BLOCK'S WHOLE FACT SET — the emission context's single counterpart at the
+/// core the two doors own. Every field is a fact the block's emission reads, grouped exactly as
+/// the doors frame them: the block's identity, its bundle's geometry, its row framing
+/// ([`BlockNests`], minted by the doors), the query operand, the two matmul-leg operands
+/// ([`KtLeg`]/[`VLeg`]), the mask read ([`MaskFacts`]), the seed/fold role, the batched-form set
+/// ([`BlockForms`]), and the recurrence state's names beside the scratch. The doors —
+/// `assemble_attn_seed_block` / `assemble_attn_fold_block` — are the ONLY minters, so a block
+/// cannot be assembled from a partially-matched run of adjacent arguments: the
+/// twenty-five-parameter spelling this type deletes was exactly that hazard.
+struct BlockFacts<'a, const NQH: u32, const NKVH: u32, const HD: u32, FK, FV>
+where
+    FK: Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+    FV: Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+{
+    t: u32,
+    tag: &'a str,
+    /// ⛔⛔⛔ THE HEAD GEOMETRY IS NOT TWO BARE `u32` PARAMETERS ANY MORE. This assembler takes the
+    /// SAME `AttnGeometry` its caller was instantiated at, so `nqh`/`nkvh`/`hd` are CONST GENERICS
+    /// here — a block cannot be assembled for a geometry its bundle was not: an nqh/nkvh
+    /// transposition, or a head dim paired with another model's head counts, is a type that does
+    /// not exist rather than two adjacent `u32` slots in a twenty-six-argument call. The score arm
+    /// (`ScoreArm::of_geometry`) and the kernel mints below read the consts; the value the body's
+    /// arithmetic uses is destructured ONCE at the door, exactly as `assemble_attn` does.
+    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    /// The row framing — `mq`, `rows` and `req` as the one nest the body's own placement laws read
+    /// (see [`BlockNests`]'s field docs for the typed-apart extents and the row regime).
+    nests: BlockNests<NQH, HD>,
+    qs: &'a str,
+    /// ⭐ THE SCORE LEG'S OWN FORM: its slab-split contraction needs the head-OUTERMOST order, the only
+    /// one whose `y` stride uses the operand's declared pitch. See `of_score_leg`.
+    score_form: crate::ir::bridge::tiled_op_sdsc_op::matmul::SharedKernelBmmForm,
+    /// This block's score column count, with its door naming WHICH width (one stick for every live
+    /// caller; `mq_pad` and the head dim are the other 64s it must not silently become).
+    width: crate::sdsc_abstract::BlockCols,
+    kt: KtLeg<'a, FK>,
+    v: VLeg<'a, FV>,
+    mask: MaskFacts<'a>,
+    /// ⛔⛔⛔ A ROLE, NOT A `bool`. See `BlockSeed`: the two states are "this block SEEDS the online
+    /// softmax" and "this block FOLDS onto an existing seed", and they were `true`/`false` on a parameter
+    /// eleven positions into a twenty-argument call. Inverting it does not fail to compile as a bool, and
+    /// the failure it produces is not a fault: a fold pass that seeds RESETS `run_m`/`run_l`/`run_o`
+    /// mid-accumulation, discarding every page folded before it — so the row with the MOST passes loses the
+    /// most, which is the deepest-row signature the card shows.
+    ///
+    /// DOOR-PRIVATE: callers reach this core only through `assemble_attn_seed_block` /
+    /// `assemble_attn_fold_block`, which fix the role AND carry the sequence proof (`SeededCarry`) — the
+    /// role value below is the doors' decision restated for the branch sites, never a caller's choice.
+    seed: BlockSeed,
+    forms: BlockForms,
+    /// The recurrence state's names — the allocation the doors carry (a seed door is handed it, a
+    /// fold door derives it from the proof it requires). `BlockBufs` holds the scratch only; these
+    /// three belong to the carry chain.
+    state: &'a StateNames,
+    bufs: &'a BlockBufs,
+}
+
+/// ⭐⭐⭐⭐⭐ THE FACTS BOTH DOORS FRAME IDENTICALLY — the block's whole fact set minus the three
+/// slots the doors own: the ROLE (the door IS the role — which door a caller names fixes `seed`,
+/// so the carrier does not carry it), the STATE NAMES (the seed door is HANDED them to wrap and
+/// mint; the fold door derives them from the [`SeededCarry`] proof it requires), and the mask
+/// CORNER (the seed door is handed it; the fold door derives it from the [`FoldMaskRead`] it
+/// requires — the derivation is that door's own law). This type deletes the run of adjacent
+/// parameters the two doors each spelled — the SAME run twice, drifting independently, which is
+/// how a door grows a parameter its twin does not: a caller states the run once and hands the
+/// same value to either door, so the doors cannot disagree about what a block is.
+struct DoorFacts<'a, const NQH: u32, const NKVH: u32, const HD: u32, FK, FV>
+where
+    FK: Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+    FV: Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+{
+    t: u32,
+    tag: &'a str,
+    /// ⛔⛔⛔ THE HEAD GEOMETRY IS NOT TWO BARE `u32` PARAMETERS ANY MORE — see the twin law on
+    /// [`BlockFacts`]'s `geom` field: the doors take the SAME `AttnGeometry` their caller was
+    /// instantiated at, so a block cannot be assembled for a geometry its bundle was not.
+    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    /// The row framing — `mq`, `rows` and `req` as the one nest (see [`BlockNests`]'s field docs).
+    nests: BlockNests<NQH, HD>,
+    qs: &'a str,
+    /// ⭐ THE SCORE LEG'S OWN FORM: its slab-split contraction needs the head-OUTERMOST order — see
+    /// `of_score_leg`.
+    score_form: crate::ir::bridge::tiled_op_sdsc_op::matmul::SharedKernelBmmForm,
+    /// This block's score column count, with its door naming WHICH width.
+    width: crate::sdsc_abstract::BlockCols,
+    kt: KtLeg<'a, FK>,
+    v: VLeg<'a, FV>,
+    /// The mask read's name and row-axis law; the CORNER is door-own (see the type doc) — the
+    /// seed door is handed it, the fold door derives it from the read it requires.
+    mask: &'a str,
+    mask_bcast: bool,
+    forms: BlockForms,
+    bufs: &'a BlockBufs,
+}
+
+fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
+    ctx: &mut EmitCtx<'_>,
+    facts: BlockFacts<
+        '_,
+        NQH,
+        NKVH,
+        HD,
+        impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+        impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+    >,
 ) -> Result<(), SuperDscError> {
+    // ⭐ THE FACT SET, DESTRUCTURED ONCE AT THE DOOR — every field restates the local the body
+    // below already reads (the same names the parameter list spelled), so the emission is the
+    // same op stream on the same values. `nests` copies out its extents below and stays whole
+    // for the body's own placement-law calls.
+    let BlockFacts {
+        t,
+        tag,
+        geom,
+        nests,
+        qs,
+        score_form,
+        width,
+        kt:
+            KtLeg {
+                kernel: kt_kernel,
+                stride: kt_stride,
+                off_fn: kt_off_fn,
+            },
+        v:
+            VLeg {
+                kernel: v_kernel,
+                stride: v_stride,
+                off_fn: v_off_fn,
+            },
+        mask:
+            MaskFacts {
+                mask,
+                off: mask_off,
+                bcast: mask_bcast,
+            },
+        seed,
+        forms:
+            BlockForms {
+                batched,
+                bmm: bmm_form,
+                request_axis,
+            },
+        state,
+        bufs,
+    } = facts;
+    // Destructured ONCE, at the door — the boundary is where the swap lived (two `u32`s in a run
+    // of twenty-six); the body below is unchanged arithmetic on the same numbers, now each
+    // geometry's own consts. `nkvh` no longer joins them: its last reads were the seed/fold
+    // divisions, which the geometry's own `nkvh_nz()`/`gqa()` replaced.
+    let (nqh, hd) = (geom.nqh(), geom.hd());
     // THE MODEL'S QUERY HEADS AS TYPES. `QueryHead::all` is the only door, so a head handed to an
     // off-closure is in range by construction — not by a bounds check, and not by an `expect`.
     let nqh_nz = std::num::NonZeroU32::new(nqh)
         .ok_or_else(|| SuperDscError("attention needs at least one query head".into()))?;
 
-    let nests = BlockNests {
-        heads: nqh,
-        hd,
-        mq,
-        rows,
-        req,
-    };
+    // The nest's extents, copied out for the arithmetic below (the carrier is `Copy` and stays
+    // whole for its own placement-law calls); `req` is read only through `nests` itself.
+    let BlockNests { mq, rows, .. } = nests;
     // The one predicate the two matmul legs branch on — derived FROM the row regime, so the
     // per-request forms and the per-request extent cannot disagree.
     let per_request = rows.per_request();
-    // Bare extents for the `rb` shape slots only — `rb` is a name-wrapper whose dims stay `u32`
-    // (outside this lock). The matmul dim run and the reduce/pointwise row-and-width run below take
-    // the TYPED values.
-    let (mq_n, rows_n, width_n) = (mq.get(), rows.extent(), width.get());
+    // Bare extents for the `fl` shape slots only — the Flat mint is the LAST name-wrapper whose
+    // dims stay `u32` (its own rung; the `rb` slots crossed into the typed lock). The matmul dim
+    // run and the reduce/pointwise row-and-width run below take the TYPED values, as do the `rb`
+    // mints.
+    let (rows_n, width_n) = (rows.extent(), width.get());
     let BlockBufs {
         sc,
         bmax,
@@ -854,10 +1216,11 @@ fn assemble_attn_block(
         bsum,
         otmp,
         ltmp,
-        run_m,
-        run_l,
-        run_o,
     } = bufs;
+    // The recurrence state's names, from the one allocation — the same three strings every fold
+    // reads off the carry and the finalize reads off its hand-off, so the core's own locals are
+    // the carrier's locals.
+    let (run_m, run_l, run_o) = (state.m(), state.l(), state.o());
 
     // Per-head score + value matmuls — unavoidably separate (each head reads its own K/V slice) —
     // each writing its `[mq,*]` block into ROWS `h*mq..h*mq+mq` of the shared buffers.
@@ -976,11 +1339,22 @@ fn assemble_attn_block(
     // whose two components share one differenced step — garbage on the 8b at hd=128, 10/10 runs. Here `y`
     // carries the group ALONE, exactly as it ships, and the request is not on an axis at all.
     if let Some(gf) = request_axis {
-        // THE KV HEADS FROM THE SCRATCH ITSELF — the same count the index table was staged for, so the
-        // kernel row an op reads and the entry the host filled cannot come from two numbers.
-        let nkvh_nz = std::num::NonZeroU32::new(gf.scratch.nkvh())
-            .ok_or_else(|| SuperDscError("a gathered fold needs at least one kv head".into()))?;
-        let gqa = nqh / nkvh_nz.get();
+        // ⭐ THE SCRATCH'S HEAD COUNT, CROSSED WITH THE CLASS'S. The scratch is staged by the host from
+        // the pool, a runtime value, so its count is a bake fact — but it must BE the class's, or the
+        // kernel row an op reads and the entry the host filled come from two numbers. Refused here
+        // rather than divided against: `gqa` is the geometry's own proof-carrying const, and the old
+        // `nqh / scratch.nkvh()` derivation silently produced a WRONG group size for a disagreeing
+        // scratch instead of refusing.
+        if gf.scratch.nkvh() != geom.nkvh() {
+            return Err(SuperDscError(format!(
+                "attention o{t}: the gathered fold's scratch carries {} kv heads, not the \
+                 class's {}",
+                gf.scratch.nkvh(),
+                geom.nkvh()
+            )));
+        }
+        let nkvh_nz = geom.nkvh_nz();
+        let gqa = geom.gqa();
         // ⭐⭐⭐⭐⭐ THE CONTRACTION IS SPLIT BY SLAB — `nslab` ops of ONE STICK each, accumulating in `sc`.
         //
         // ⛔⛔⛔ IT WAS `MatK::of_head_dim(hd)` IN ONE OP, JUSTIFIED BY A COMMENT THAT SAID "the gather's
@@ -988,7 +1362,7 @@ fn assemble_attn_block(
         // accumulate". The precondition was `PageScratch::of_pass`'s `slabs() != 1` refusal, so the prose
         // was true only while the door was shut — and the whole point of the door coming off is that at
         // hd=128 there ARE two slabs. An UNSPLIT `y`-batched contraction of two sticks is the shape
-        // `ScoreArm::choose` records as MEASURED-TWICE incoherent inside dxp ("degenerate output at a
+        // `ScoreArm::of_geometry` records as MEASURED-TWICE incoherent inside dxp ("degenerate output at a
         // FASTER ITL, which is the tell: less work, done wrong"), and it is what the 8b's
         // wrong-from-the-first-token runs were emitting.
         //
@@ -1036,7 +1410,7 @@ fn assemble_attn_block(
                     } else {
                         format!("attn_{tag}sc_g{}s{s}_r{r}_o{t}", kvh.get())
                     };
-                    ops.push(assemble_matmul_off_phys_m_with_epilogue(
+                    ctx.ops.push(assemble_matmul_off_phys_m_with_epilogue(
                         // THE KV HEAD AND THE REQUEST AS SEPARATE NAME SEGMENTS, so the descriptor
                         // projections that collapse `g{n}` / `r{n}` to one reported row keep working.
                         &name,
@@ -1056,38 +1430,42 @@ fn assemble_attn_block(
                             rn.score_rows(h0, width),
                         ),
                         score_form,
-                        &rb(qs, mq_n, hd),
+                        &rb(qs, RowCount::of_query_rows(mq), BlockCols::of_head_dim(hd)),
                         rn.token_stream_by_slab(h0, s),
                         // ⭐ THE GATHERED SCRATCH AS THE KERNEL, AT ITS FULL DECLARED `hd` ROWS with the
                         // slab selected purely by OFFSET — the same discipline the ungathered arm uses.
                         // Declaring `stick` rows instead would re-derive the stick-GROUP stride as
                         // `stick*stk` where the tensor's is `hd*stk`.
-                        &Stk::<KernelTag>::kernel(hd as usize, kt_stride.n_out_cols(), kt_kernel),
+                        &Stk::<KernelTag>::kernel(HD as usize, kt_stride.n_out_cols(), kt_kernel),
                         gf.kernel_off(kvh, r, crate::sdsc_abstract::KvPlane::Kt, s)?,
-                        &rb(sc, rows_n, width_n),
+                        &rb(sc, rows.swept(), width),
                         rn.score_rows(h0, width).off(),
                         epi_h,
                         epi_off,
                         crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                         &[],
                         false,
-                        sym_id_base,
-                        layout,
+                        ctx.sym_id_base,
+                        ctx.layout,
                     ));
                 }
             }
         }
     }
     // TWO SEPARATE QUESTIONS, ASKED SEPARATELY: `b.score` is the LEGALITY witness (now unconditional —
-    // the contraction is slab-split), and `ScoreArm::cheaper` is the COST choice on top of it. Folding
-    // the cost into the witness would have made a hd=512 op-count REGRESSION look like a legality fact.
-    else if let Some(nkvh_b) = batched
-        .and_then(|b| b.score.map(|_| b.nkvh))
-        .filter(|&nkvh_b| ScoreArm::choose(nqh, nkvh_b, nslab) == ScoreArm::SlabSplitBatched)
+    // the contraction is slab-split), and `ScoreArm::of_geometry` is the COST choice on top of it.
+    // Folding the cost into the witness would have made a hd=512 op-count REGRESSION look like a
+    // legality fact. The arm reads the block's own const generics — the kv-head count is no longer
+    // a `BatchedKv` field re-spelling `NKVH` at runtime.
+    else if batched
+        .and_then(|b| b.score)
+        .is_some_and(|_| ScoreArm::of_geometry::<NQH, NKVH, HD>() == ScoreArm::SlabSplitBatched)
     {
-        let gqa = nqh / nkvh_b.max(1);
-        let nkvh_nz = std::num::NonZeroU32::new(nkvh_b)
-            .ok_or_else(|| SuperDscError("a batched score needs at least one kv head".into()))?;
+        // The class's own count and group — the geometry's proof-carrying consts, spent as values:
+        // `NKVH >= 1` is proven by `GQA`'s evaluation, so there is no nonzero refusal to write, and
+        // `gqa` is the division performed ONCE at the mint, never re-derived here.
+        let nkvh_nz = geom.nkvh_nz();
+        let gqa = geom.gqa();
         for kvh in crate::sdsc_abstract::KvHead::all(nkvh_nz) {
             // THE GROUP'S FIRST QUERY HEAD, FROM THE TYPE — not `kvh * gqa` spelled here.
             //
@@ -1163,7 +1541,7 @@ fn assemble_attn_block(
                 } else {
                     format!("attn_{tag}sc_g{}s{s}_o{t}", kvh.get())
                 };
-                ops.push(if per_request {
+                ctx.ops.push(if per_request {
                     assemble_matmul_off_phys_m_with_epilogue(
                         &name,
                         MatM::single_row(),
@@ -1178,19 +1556,19 @@ fn assemble_attn_block(
                             nests.score_rows(h0, width),
                         ),
                         bmm_form,
-                        &rb(qs, mq_n, hd),
+                        &rb(qs, RowCount::of_query_rows(mq), BlockCols::of_head_dim(hd)),
                         nests.token_stream_by_slab(h0, s),
-                        &Stk::<KernelTag>::kernel(hd as usize, kt_stride.n_out_cols(), kt_kernel),
+                        &Stk::<KernelTag>::kernel(HD as usize, kt_stride.n_out_cols(), kt_kernel),
                         kt_off_fn(qh0, s),
-                        &rb(sc, rows_n, width_n),
+                        &rb(sc, rows.swept(), width),
                         nests.score_rows(h0, width).off(),
                         epi_h,
                         epi_off,
                         crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                         epi_bd,
                         epi_bc,
-                        sym_id_base,
-                        layout,
+                        ctx.sym_id_base,
+                        ctx.layout,
                     )
                 } else {
                     // ⛔ THE PITCH-DECLARING FORM, NOT THE PLAIN ONE. A one-stick `in` derives its
@@ -1216,19 +1594,19 @@ fn assemble_attn_block(
                             nests.score_rows(h0, width),
                         ),
                         score_form,
-                        &rb(qs, mq_n, hd),
+                        &rb(qs, RowCount::of_query_rows(mq), BlockCols::of_head_dim(hd)),
                         nests.token_stream_by_slab(h0, s),
-                        &Stk::<KernelTag>::kernel(hd as usize, kt_stride.n_out_cols(), kt_kernel),
+                        &Stk::<KernelTag>::kernel(HD as usize, kt_stride.n_out_cols(), kt_kernel),
                         kt_off_fn(qh0, s),
-                        &rb(sc, rows_n, width_n),
+                        &rb(sc, rows.swept(), width),
                         nests.score_rows(h0, width).off(),
                         epi_h,
                         epi_off,
                         crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                         epi_bd,
                         epi_bc,
-                        sym_id_base,
-                        layout,
+                        ctx.sym_id_base,
+                        ctx.layout,
                     )
                 });
             }
@@ -1242,28 +1620,28 @@ fn assemble_attn_block(
             } else {
                 mask_off + nests.score_rows(hi, width).off()
             };
-            ops.push(assemble_matmul_off_with_epilogue(
+            ctx.ops.push(assemble_matmul_off_with_epilogue(
                 &format!("attn_{tag}sc_h{hi}_o{t}"),
                 MatM::of_query_rows(mq),
                 MatN::of_kv_window(width),
                 MatK::of_head_dim(hd),
                 MatY::unbatched(),
                 bmm_form,
-                &rb(qs, mq_n, hd),
+                &rb(qs, RowCount::of_query_rows(mq), BlockCols::of_head_dim(hd)),
                 qs_off,
                 // Slab 0: this arm contracts the WHOLE head dim in one op (`MatY::unbatched()`), so
                 // there is no split and the kernel's base is the head's own feature origin.
-                &Stk::<KernelTag>::kernel(hd as usize, kt_stride.n_out_cols(), kt_kernel),
+                &Stk::<KernelTag>::kernel(HD as usize, kt_stride.n_out_cols(), kt_kernel),
                 kt_off_fn(h, 0),
-                &rb(sc, rows_n, width_n),
+                &rb(sc, rows.swept(), width),
                 nests.score_rows(hi, width).off(),
                 &mask_h,
                 head_mask_off,
                 crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                 broadcast_dims,
                 false,
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
         }
     }
@@ -1280,13 +1658,13 @@ fn assemble_attn_block(
     // based on a misapplied reading of that doc and is not needed -- confirmed harmless-but-pointless
     // (real hardware test showed zero behavioral change either way). Restored to the plain batched form.
     let bmax_op = format!("attn_{tag}bmax_o{t}");
-    ops.push(assemble_reduce_off(
+    ctx.ops.push(assemble_reduce_off(
         &bmax_op,
         "max",
         rows.swept(),
         width,
         win_reduce_data(
-            layout,
+            ctx.layout,
             // The score buffer's true `[rows_n, width_n]` — the same dims the score matmul's own
             // output handle declares. `hm(sc)`'s `1×64` annotation was never the buffer's shape.
             &fl(sc, rows_n, width_n),
@@ -1297,112 +1675,124 @@ fn assemble_attn_block(
         )
         .map_err(SuperDscError)?,
         win_reduce_accum(
-            layout,
+            ctx.layout,
             &hm_rows(if seed.seeds() { run_m } else { bmax }, rows_n),
             crate::addr::DevOff::ZERO,
             rows.swept(),
             &format!("{bmax_op}: accum"),
         )
         .map_err(SuperDscError)?,
-        sym_id_base,
-        layout,
+        ctx.sym_id_base,
+        ctx.layout,
     ));
     if seed.seeds() {
         // Seed already written directly above — nothing more to do here.
     } else {
-        ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_{tag}newm_o{t}"),
-            "maximum",
-            rows.swept(),
-            BlockCols::of_one_stick(Lanes::FP16),
-            &[
-                In::full(&hm_rows(run_m, rows_n)).ew(),
-                In::full(&hm_rows(bmax, rows_n)).ew(),
-            ],
-            &hm_rows(newm, rows_n),
-            crate::addr::DevOff::ZERO,
-            sym_id_base,
-            layout,
+        ctx.ops.push(assemble_pointwise_broadcast_off(
+            PointwiseFacts {
+                op_name: &format!("attn_{tag}newm_o{t}"),
+                op_func: "maximum",
+                rows: rows.swept(),
+                cols: BlockCols::of_one_stick(Lanes::FP16),
+                inputs: &[
+                    In::full(&hm_rows(run_m, rows_n)).ew(),
+                    In::full(&hm_rows(bmax, rows_n)).ew(),
+                ],
+                o: &hm_rows(newm, rows_n),
+                out_offset: crate::addr::DevOff::ZERO.into(),
+            },
+            ctx.sym_id_base,
+            ctx.layout,
         ));
         // Separate subtract-output (corrsubt) from exp-output (corr) — an exp op must never read
         // and write the SAME buffer (a real hardware in-place-aliasing hazard, not a style choice;
         // see the old proven flash decode's fcsub->fcorr, always two distinct buffers).
-        ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_{tag}corrsub_o{t}"),
-            "subtract",
-            rows.swept(),
-            BlockCols::of_one_stick(Lanes::FP16),
-            &[
-                In::full(&hm_rows(run_m, rows_n)).ew(),
-                In::full(&hm_rows(newm, rows_n)).ew(),
-            ],
-            &hm_rows(corrsubt, rows_n),
-            crate::addr::DevOff::ZERO,
-            sym_id_base,
-            layout,
+        ctx.ops.push(assemble_pointwise_broadcast_off(
+            PointwiseFacts {
+                op_name: &format!("attn_{tag}corrsub_o{t}"),
+                op_func: "subtract",
+                rows: rows.swept(),
+                cols: BlockCols::of_one_stick(Lanes::FP16),
+                inputs: &[
+                    In::full(&hm_rows(run_m, rows_n)).ew(),
+                    In::full(&hm_rows(newm, rows_n)).ew(),
+                ],
+                o: &hm_rows(corrsubt, rows_n),
+                out_offset: crate::addr::DevOff::ZERO.into(),
+            },
+            ctx.sym_id_base,
+            ctx.layout,
         ));
-        ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_{tag}corre_o{t}"),
-            "exp",
-            rows.swept(),
-            BlockCols::of_one_stick(Lanes::FP16),
-            &[In::full(&hm_rows(corrsubt, rows_n)).ew()],
-            &hm_rows(corr, rows_n),
-            crate::addr::DevOff::ZERO,
-            sym_id_base,
-            layout,
+        ctx.ops.push(assemble_pointwise_broadcast_off(
+            PointwiseFacts {
+                op_name: &format!("attn_{tag}corre_o{t}"),
+                op_func: ExpBase::E.op_func(),
+                rows: rows.swept(),
+                cols: BlockCols::of_one_stick(Lanes::FP16),
+                inputs: &[In::full(&hm_rows(corrsubt, rows_n)).ew()],
+                o: &hm_rows(corr, rows_n),
+                out_offset: crate::addr::DevOff::ZERO.into(),
+            },
+            ctx.sym_id_base,
+            ctx.layout,
         ));
-        ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_{tag}mset_o{t}"),
-            "identity",
-            rows.swept(),
-            BlockCols::of_one_stick(Lanes::FP16),
-            &[In::full(&hm_rows(newm, rows_n)).ew()],
-            &hm_rows(run_m, rows_n),
-            crate::addr::DevOff::ZERO,
-            sym_id_base,
-            layout,
+        ctx.ops.push(assemble_pointwise_broadcast_off(
+            PointwiseFacts {
+                op_name: &format!("attn_{tag}mset_o{t}"),
+                op_func: "identity",
+                rows: rows.swept(),
+                cols: BlockCols::of_one_stick(Lanes::FP16),
+                inputs: &[In::full(&hm_rows(newm, rows_n)).ew()],
+                o: &hm_rows(run_m, rows_n),
+                out_offset: crate::addr::DevOff::ZERO.into(),
+            },
+            ctx.sym_id_base,
+            ctx.layout,
         ));
     }
     // expb = exp(sc - run_m) (post-update run_m). `esubt`/`expb` are distinct buffers — same
     // in-place-aliasing rule as above.
-    ops.push(assemble_pointwise_broadcast_off(
-        &format!("attn_{tag}esub_o{t}"),
-        "subtract",
-        rows.swept(),
-        width,
-        &[
-            // `sc`/`esubt` at the swept `[rows_n, width_n]` — the same dims the score matmul's
-            // own output handle declares, not `hm`'s `1×64` annotation.
-            In::full(&fl(sc, rows_n, width_n)).ew(),
-            In::col(&hm_rows(run_m, rows_n)).ew(),
-        ],
-        &fl(esubt, rows_n, width_n),
-        crate::addr::DevOff::ZERO,
-        sym_id_base,
-        layout,
+    ctx.ops.push(assemble_pointwise_broadcast_off(
+        PointwiseFacts {
+            op_name: &format!("attn_{tag}esub_o{t}"),
+            op_func: "subtract",
+            rows: rows.swept(),
+            cols: width,
+            inputs: &[
+                // `sc`/`esubt` at the swept `[rows_n, width_n]` — the same dims the score matmul's
+                // own output handle declares, not `hm`'s `1×64` annotation.
+                In::full(&fl(sc, rows_n, width_n)).ew(),
+                In::col(&hm_rows(run_m, rows_n)).ew(),
+            ],
+            o: &fl(esubt, rows_n, width_n),
+            out_offset: crate::addr::DevOff::ZERO.into(),
+        },
+        ctx.sym_id_base,
+        ctx.layout,
     ));
-    ops.push(assemble_pointwise_broadcast_off(
-        &format!("attn_{tag}ee_o{t}"),
-        "exp",
-        rows.swept(),
-        width,
-        &[In::full(&fl(esubt, rows_n, width_n)).ew()],
-        &fl(expb, rows_n, width_n),
-        crate::addr::DevOff::ZERO,
-        sym_id_base,
-        layout,
+    ctx.ops.push(assemble_pointwise_broadcast_off(
+        PointwiseFacts {
+            op_name: &format!("attn_{tag}ee_o{t}"),
+            op_func: ExpBase::E.op_func(),
+            rows: rows.swept(),
+            cols: width,
+            inputs: &[In::full(&fl(esubt, rows_n, width_n)).ew()],
+            o: &fl(expb, rows_n, width_n),
+            out_offset: crate::addr::DevOff::ZERO.into(),
+        },
+        ctx.sym_id_base,
+        ctx.layout,
     ));
     // FIRST block: write bsum/ov straight into run_l/run_o (no lset/oset copy needed — same reasoning
     // as run_m above). Saves 2 more "identity" ops per attention node.
     let bsum_op = format!("attn_{tag}bsum_o{t}");
-    ops.push(assemble_reduce_off(
+    ctx.ops.push(assemble_reduce_off(
         &bsum_op,
         "sum",
         rows.swept(),
         width,
         win_reduce_data(
-            layout,
+            ctx.layout,
             // `expb` at the same `[rows_n, width_n]` the `exp` pointwise above sweeps it at.
             &fl(expb, rows_n, width_n),
             crate::addr::DevOff::ZERO,
@@ -1412,15 +1802,15 @@ fn assemble_attn_block(
         )
         .map_err(SuperDscError)?,
         win_reduce_accum(
-            layout,
+            ctx.layout,
             &hm_rows(if seed.seeds() { run_l } else { bsum }, rows_n),
             crate::addr::DevOff::ZERO,
             rows.swept(),
             &format!("{bsum_op}: accum"),
         )
         .map_err(SuperDscError)?,
-        sym_id_base,
-        layout,
+        ctx.sym_id_base,
+        ctx.layout,
     ));
     // ⭐⭐⭐ THE `oadd` IS THE VALUE MATMUL'S OWN EPILOGUE — `run_o = (expb @ V) + otmp` in ONE launch.
     //
@@ -1433,10 +1823,11 @@ fn assemble_attn_block(
     // matmul's destination becomes `run_o` instead of `ov`, and `oadd` disappears — along with the `ov`
     // buffer and its store. `nslab` ops per fold block become zero: 8 at hd=128, 16 at 256, 32 at 512.
     //
-    // ⛔ ORDER IS LOAD-BEARING. `ocorr` reads `run_o` and the fused matmul writes it, so every `ocorr`
-    // must precede every value matmul of this block — which is why they are emitted here rather than
-    // left where `oadd` used to live. The read is of the OLD value by construction, the same dependency
-    // the separate `oadd` already had.
+    // ⛔ ORDER IS LOAD-BEARING, and now typed. `ocorr` reads `run_o` and the fused matmul writes
+    // it, so every `ocorr` must precede every value matmul of this block — the [`FoldAddend`]
+    // mint below is that law: the addend handle exists only on the arm that pushed `ocorr`, so
+    // no value matmul can fold through `otmp` before its producer ran. The read is of the OLD
+    // value by construction, the same dependency the separate `oadd` already had.
     // ⭐⭐⭐ AND IT IS **ONE** OP AT EVERY HEAD DIM — no slab loop, because there is no permutation to
     // undo here. `ocorr` reads head-major `run_o` and writes head-major `otmp`: the SAME shape, so the
     // whole `[nqh*mq, hd]` buffer is one contiguous rectangle and `hd` columns wide is just its width.
@@ -1450,28 +1841,34 @@ fn assemble_attn_block(
     // col-broadcast output is proven emission, not a new shape.
     //
     // The name is unchanged at `nslab == 1`, so granite-3.1-2b's emit does not move.
-    if !seed.seeds() {
-        ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_{tag}ocorr_o{t}"),
-            "multiply",
-            rows.swept(),
-            BlockCols::of_head_dim(hd),
-            &[
-                // `run_o`/`otmp` at their true head-wide `[rows_n, hd]` — the HEAD_WIDE_BUFS synth
-                // dimensions, not `hm`'s `1×64` annotation.
-                In::sliced(&fl(run_o, rows_n, hd), nests.head_major(0, 0)).ew(),
-                In::col(&hm_rows(corr, rows_n)).ew(),
-            ],
-            &fl(otmp, rows_n, hd),
-            nests.head_major(0, 0),
-            sym_id_base,
-            layout,
-        ));
-    }
     // `Some(otmp)` = fold this block in via `stridedadd`; `None` = the seed block writes its own
-    // result. The HANDLE is minted once here so the three value-matmul arms below cannot each decide
-    // separately whether this block folds — they only choose WHERE in `otmp` their own slab sits.
-    let fold_addend = (!seed.seeds()).then_some(otmp).map(|b| fl(b, rows_n, hd));
+    // result. The HANDLE and the `ocorr` that produces it are minted in ONE arm — the
+    // [`FoldAddend`] law — so the three value-matmul arms below cannot each decide separately
+    // whether this block folds (nor fold through an `otmp` nothing wrote): they only choose
+    // WHERE in `otmp` their own slab sits.
+    let fold_addend = if seed.seeds() {
+        FoldAddend::Seed
+    } else {
+        ctx.ops.push(assemble_pointwise_broadcast_off(
+            PointwiseFacts {
+                op_name: &format!("attn_{tag}ocorr_o{t}"),
+                op_func: "multiply",
+                rows: rows.swept(),
+                cols: BlockCols::of_head_dim(hd),
+                inputs: &[
+                    // `run_o`/`otmp` at their true head-wide `[rows_n, hd]` — the HEAD_WIDE_BUFS synth
+                    // dimensions, not `hm`'s `1×64` annotation.
+                    In::sliced(&fl(run_o, rows_n, hd), nests.head_major(0, 0)).ew(),
+                    In::col(&hm_rows(corr, rows_n)).ew(),
+                ],
+                o: &fl(otmp, rows_n, hd),
+                out_offset: nests.head_major(0, 0).into(),
+            },
+            ctx.sym_id_base,
+            ctx.layout,
+        ));
+        FoldAddend::PreUpdate(fl(otmp, rows_n, hd))
+    };
     // KV-head-BATCHED value bmm — the mirror of the score leg above (same y-stride argument:
     // expb's is mb·in = gqa·mq·width, ov's is mb·out = gqa·mq·hd, kernel's is declared).
     // REQUEST-AXIS VALUE — the mirror of the score leg. V is `[PAGE_SLOTS, hd]` per request and this
@@ -1489,9 +1886,44 @@ fn assemble_attn_block(
     // per-kv-head op, one per request, `y` on the GQA group, the V scratch row reached by a baked OFFSET.
     // See the score arm above for why the per-`y` kernel DIM is refuted and what the gather buys instead.
     if let Some(gf) = request_axis {
-        let nkvh_nz = std::num::NonZeroU32::new(gf.scratch.nkvh())
-            .ok_or_else(|| SuperDscError("a gathered fold needs at least one kv head".into()))?;
-        let gqa = nqh / nkvh_nz.get();
+        // The scratch's head count, crossed with the class's — same law as the score arm's door:
+        // refused rather than divided against, and `gqa` is the geometry's own const.
+        if gf.scratch.nkvh() != geom.nkvh() {
+            return Err(SuperDscError(format!(
+                "attention o{t}: the gathered fold's scratch carries {} kv heads, not the \
+                 class's {}",
+                gf.scratch.nkvh(),
+                geom.nkvh()
+            )));
+        }
+        let nkvh_nz = geom.nkvh_nz();
+        let gqa = geom.gqa();
+        // ⭐ THE GATHERED SCRATCH IS THE PAGE PLANE, BYTE FOR BYTE — so its kernel rows are the
+        // pool's own page slots and no other plane's extent. The type refuses the pairing here, at
+        // the arm's door, rather than trusting the caller to have passed the page fact: a window
+        // or a stream extent here once declared a stick-group stride the scratch does not have.
+        let v_rows = match v_stride {
+            crate::sdsc_abstract::VKernelRows::Page => {
+                crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS
+            }
+            crate::sdsc_abstract::VKernelRows::NewBlockStream(n) => {
+                return Err(SuperDscError(format!(
+                    "the gathered value leg reads the V scratch — a byte-for-byte copy of the \
+                     page plane — so its kernel rows are the pool's own page slots; a new-block \
+                     stream of {n} row(s) is not a plane any gathered op addresses"
+                )));
+            }
+            // The chunk form's two new planes are refused by the same law: neither a block's
+            // whole contraction extent nor a part's region is a plane this gathered leg addresses.
+            crate::sdsc_abstract::VKernelRows::NewBlockChunk(n)
+            | crate::sdsc_abstract::VKernelRows::ChunkPart(n) => {
+                return Err(SuperDscError(format!(
+                    "the gathered value leg reads the V scratch — a byte-for-byte copy of the \
+                     page plane — so its kernel rows are the pool's own page slots; a block or \
+                     part extent of {n} row(s) is not a plane any gathered op addresses"
+                )));
+            }
+        };
         // ⭐⭐⭐⭐⭐ ONE STICK OF `out` PER OP, SO ONE OP PER (KV HEAD, REQUEST, **SLAB**) — the same cut
         // the ungathered batched arm below already makes, for the same reason.
         //
@@ -1524,7 +1956,7 @@ fn assemble_attn_block(
                     } else {
                         format!("attn_{tag}ov_g{}s{s}_r{r}_o{t}", kvh.get())
                     };
-                    ops.push(assemble_matmul_off_phys_m_maybe_epilogue(
+                    ctx.ops.push(assemble_matmul_off_phys_m_maybe_epilogue(
                         &name,
                         MatM::single_row(),
                         n,
@@ -1545,35 +1977,41 @@ fn assemble_attn_block(
                             ),
                         ),
                         bmm_form,
-                        &rb(expb, rows_n, width_n),
+                        &rb(expb, rows.swept(), width),
                         rn.score_rows(h0, width),
-                        // ⭐ THE V SCRATCH AS THE KERNEL, AND ITS ROW COUNT IS NOW THE PAGE — the scratch
-                        // row is a byte-for-byte copy of the V page plane, so `v_stride` is the pool's own
-                        // `PAGE_SLOTS` on both the gathered and ungathered paths. It used to be ONE
-                        // WINDOW, which is what made the gathered geometry differ from the pool's at all.
-                        &Stk::<KernelTag>::kernel(v_stride as usize, hd as usize, v_kernel),
+                        // ⭐ THE V SCRATCH AS THE KERNEL, AND ITS ROW COUNT IS THE PAGE — the scratch
+                        // row is a byte-for-byte copy of the V page plane, so `v_rows` (the page
+                        // rows the match above refused everything else to obtain) is the pool's own
+                        // `PAGE_SLOTS`. It used to be ONE WINDOW, which is what made the gathered
+                        // geometry differ from the pool's at all.
+                        &Stk::<KernelTag>::kernel(
+                            v_rows,
+                            crate::sdsc_abstract::VKernelPitch::of_head_dim(HD).n_out_cols(),
+                            v_kernel,
+                        ),
                         gf.kernel_off(kvh, r, crate::sdsc_abstract::KvPlane::V, s)?,
-                        &rb(run_o, rows_n, hd),
+                        &rb(run_o, rows.swept(), BlockCols::of_head_dim(hd)),
                         rn.head_major(h0, s),
                         // The addend is THIS op's own output slice of `otmp` — same buffer geometry, same
                         // offset, so `attach_fused_epilogue` clones the output's shape onto it verbatim.
-                        fold_addend.as_ref().map(|a| (a, rn.head_major(h0, s))),
+                        fold_addend.stridedadd(rn.head_major(h0, s)),
                         crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                         &[],
                         false,
-                        sym_id_base,
-                        layout,
+                        ctx.sym_id_base,
+                        ctx.layout,
                     ));
                 }
             }
         }
     }
-    // The value leg's mirror: plain 2-D, one per (request, query head), nothing declared.
-    else if let Some(nkvh_b) = batched.and_then(|b| b.value.map(|_| b.nkvh)) {
-        let gqa = nqh / nkvh_b.max(1);
-        let nkvh_nz = std::num::NonZeroU32::new(nkvh_b).ok_or_else(|| {
-            SuperDscError("a batched value matmul needs at least one kv head".into())
-        })?;
+    // The value leg's mirror: plain 2-D, one per (request, query head), nothing declared. The
+    // kv-head count is the geometry's own `NKVH` const, not a `BatchedKv` field.
+    else if batched.and_then(|b| b.value).is_some() {
+        // The class's own count and group — the geometry's proof-carrying consts, spent as values,
+        // exactly as the comment above already stated the law.
+        let nkvh_nz = geom.nkvh_nz();
+        let gqa = geom.gqa();
         for kvh in crate::sdsc_abstract::KvHead::all(nkvh_nz) {
             // Same total conversion as the score side above — the two must agree about which query head
             // owns a kv head's kernel, and they agree because there is only one function that says so.
@@ -1606,7 +2044,7 @@ fn assemble_attn_block(
                     }
                 };
                 // Same split as the score leg: one request's row per head under `per_request`.
-                ops.push(if per_request {
+                ctx.ops.push(if per_request {
                     assemble_matmul_off_phys_m_maybe_epilogue(
                         &format!("attn_{tag}ov_{}_o{t}", gs(kvh.get())),
                         MatM::single_row(),
@@ -1636,25 +2074,29 @@ fn assemble_attn_block(
                         // into `expb` — a pairing the placement leaves nowhere to write, since the
                         // pitch rides the same law that mints the offset. Pinned by
                         // `fold_request_axis_strides.rs` off the emitted per-core addresses.
-                        &rb(expb, rows_n, width_n),
+                        &rb(expb, rows.swept(), width),
                         nests.score_rows(h0, width),
-                        &Stk::<KernelTag>::kernel(v_stride as usize, hd as usize, v_kernel),
+                        &Stk::<KernelTag>::kernel(
+                            v_stride.rows() as usize,
+                            crate::sdsc_abstract::VKernelPitch::of_head_dim(HD).n_out_cols(),
+                            v_kernel,
+                        ),
                         v_off_fn(qh0, s),
                         // ⛔ THE SAME PLACEMENT THE PER-HEAD ARM BELOW WRITES. Both arms produce this
                         // buffer, and they used to answer "where does head `h` live" differently — this
                         // one through `token_stream` (`h*mq*hd`), the other through `head_major` (row
                         // `h*mq` of a stick-blocked `[nqh*mq, hd]`, i.e. `h*mq*stick`). Equal iff `hd`
                         // is one stick, which is the only geometry that had ever taken both.
-                        &rb(run_o, rows_n, hd),
+                        &rb(run_o, rows.swept(), BlockCols::of_head_dim(hd)),
                         nests.head_major(h0, s),
                         // The addend is THIS op's own output slice of `otmp` — same buffer geometry, same
                         // offset, so `attach_fused_epilogue` clones the output's shape onto it verbatim.
-                        fold_addend.as_ref().map(|a| (a, nests.head_major(h0, s))),
+                        fold_addend.stridedadd(nests.head_major(h0, s)),
                         crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                         &[],
                         false,
-                        sym_id_base,
-                        layout,
+                        ctx.sym_id_base,
+                        ctx.layout,
                     )
                 } else {
                     assemble_matmul_off_maybe_epilogue(
@@ -1677,18 +2119,22 @@ fn assemble_attn_block(
                             ),
                         ),
                         bmm_form,
-                        &rb(expb, rows_n, width_n),
+                        &rb(expb, rows.swept(), width),
                         nests.score_rows(h0, width).off(),
-                        &Stk::<KernelTag>::kernel(v_stride as usize, hd as usize, v_kernel),
+                        &Stk::<KernelTag>::kernel(
+                            v_stride.rows() as usize,
+                            crate::sdsc_abstract::VKernelPitch::of_head_dim(HD).n_out_cols(),
+                            v_kernel,
+                        ),
                         v_off_fn(qh0, s),
-                        &rb(run_o, rows_n, hd),
+                        &rb(run_o, rows.swept(), BlockCols::of_head_dim(hd)),
                         nests.head_major(h0, s),
-                        fold_addend.as_ref().map(|a| (a, nests.head_major(h0, s))),
+                        fold_addend.stridedadd(nests.head_major(h0, s)),
                         crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                         &[],
                         false,
-                        sym_id_base,
-                        layout,
+                        ctx.sym_id_base,
+                        ctx.layout,
                     )
                 });
             }
@@ -1743,7 +2189,7 @@ fn assemble_attn_block(
         for h in crate::sdsc_abstract::QueryHead::all(nqh_nz) {
             let hi = h.get();
             for s in 0..nests.slabs() {
-                ops.push(assemble_matmul_off_maybe_epilogue(
+                ctx.ops.push(assemble_matmul_off_maybe_epilogue(
                     &if nests.slabs() == 1 {
                         format!("attn_{tag}ov_h{hi}_o{t}")
                     } else {
@@ -1754,18 +2200,22 @@ fn assemble_attn_block(
                     MatK::of_kv_window(width),
                     MatY::unbatched(),
                     bmm_form,
-                    &rb(expb, rows_n, width_n),
+                    &rb(expb, rows.swept(), width),
                     nests.score_rows(hi, width).off(),
-                    &Stk::<KernelTag>::kernel(v_stride as usize, hd as usize, v_kernel),
+                    &Stk::<KernelTag>::kernel(
+                        v_stride.rows() as usize,
+                        crate::sdsc_abstract::VKernelPitch::of_head_dim(HD).n_out_cols(),
+                        v_kernel,
+                    ),
                     v_off_fn(h, s),
-                    &rb(run_o, rows_n, hd),
+                    &rb(run_o, rows.swept(), BlockCols::of_head_dim(hd)),
                     nests.head_major(hi, s),
-                    fold_addend.as_ref().map(|a| (a, nests.head_major(hi, s))),
+                    fold_addend.stridedadd(nests.head_major(hi, s)),
                     crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                     &[],
                     false,
-                    sym_id_base,
-                    layout,
+                    ctx.sym_id_base,
+                    ctx.layout,
                 ));
             }
         }
@@ -1775,33 +2225,37 @@ fn assemble_attn_block(
     } else {
         // run_l = run_l*corr + bsum ; run_o = run_o*corr + ov. `ltmp`/`otmp` break the in-place
         // read/write alias in the multiply (mirrors the old proven flash decode's `fdtmp`).
-        ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_{tag}lcorr_o{t}"),
-            "multiply",
-            rows.swept(),
-            BlockCols::of_one_stick(Lanes::FP16),
-            &[
-                In::full(&hm_rows(run_l, rows_n)).ew(),
-                In::full(&hm_rows(corr, rows_n)).ew(),
-            ],
-            &hm_rows(ltmp, rows_n),
-            crate::addr::DevOff::ZERO,
-            sym_id_base,
-            layout,
+        ctx.ops.push(assemble_pointwise_broadcast_off(
+            PointwiseFacts {
+                op_name: &format!("attn_{tag}lcorr_o{t}"),
+                op_func: "multiply",
+                rows: rows.swept(),
+                cols: BlockCols::of_one_stick(Lanes::FP16),
+                inputs: &[
+                    In::full(&hm_rows(run_l, rows_n)).ew(),
+                    In::full(&hm_rows(corr, rows_n)).ew(),
+                ],
+                o: &hm_rows(ltmp, rows_n),
+                out_offset: crate::addr::DevOff::ZERO.into(),
+            },
+            ctx.sym_id_base,
+            ctx.layout,
         ));
-        ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_{tag}ladd_o{t}"),
-            "add",
-            rows.swept(),
-            BlockCols::of_one_stick(Lanes::FP16),
-            &[
-                In::full(&hm_rows(ltmp, rows_n)).ew(),
-                In::full(&hm_rows(bsum, rows_n)).ew(),
-            ],
-            &hm_rows(run_l, rows_n),
-            crate::addr::DevOff::ZERO,
-            sym_id_base,
-            layout,
+        ctx.ops.push(assemble_pointwise_broadcast_off(
+            PointwiseFacts {
+                op_name: &format!("attn_{tag}ladd_o{t}"),
+                op_func: "add",
+                rows: rows.swept(),
+                cols: BlockCols::of_one_stick(Lanes::FP16),
+                inputs: &[
+                    In::full(&hm_rows(ltmp, rows_n)).ew(),
+                    In::full(&hm_rows(bsum, rows_n)).ew(),
+                ],
+                o: &hm_rows(run_l, rows_n),
+                out_offset: crate::addr::DevOff::ZERO.into(),
+            },
+            ctx.sym_id_base,
+            ctx.layout,
         ));
         // ⭐ THE OUTPUT ACCUMULATOR IS DONE ALREADY. `ocorr` ran BEFORE the value leg (it needs the
         // pre-update `run_o`) and `oadd` is now that matmul's own `stridedadd` epilogue, so the
@@ -1910,6 +2364,145 @@ impl ChunkBufs {
     }
 }
 
+/// ⭐⭐⭐⭐⭐ THE SEED DOOR — the block emitter's seed role, and the ONLY spelling (with
+/// `assemble_new_block_chunk`) that mints a [`SeededCarry`]. The core's fact set arrives as the
+/// ONE [`DoorFacts`] carrier — the role is fixed by the door itself, never a field the caller
+/// picks — plus the two facts this door owns: the allocation it wraps (the door is HANDED the
+/// state's names, the seed ops write them, and the mint — a frozen copy of the same names —
+/// happens after the core returns) and the mask corner, handed as the read's own corner.
+fn assemble_attn_seed_block<const NQH: u32, const NKVH: u32, const HD: u32>(
+    ctx: &mut EmitCtx<'_>,
+    state: &StateNames,
+    mask_off: crate::addr::DevOff,
+    facts: DoorFacts<
+        '_,
+        NQH,
+        NKVH,
+        HD,
+        impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+        impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+    >,
+) -> Result<SeededCarry, SuperDscError> {
+    // ⭐ THE DOOR'S FACTS, DESTRUCTURED ONCE — every field restates the local the BlockFacts
+    // build below reads, so the emission is the same op stream on the same values.
+    let DoorFacts {
+        t,
+        tag,
+        geom,
+        nests,
+        qs,
+        score_form,
+        width,
+        kt,
+        v,
+        mask,
+        mask_bcast,
+        forms,
+        bufs,
+    } = facts;
+    assemble_attn_block(
+        ctx,
+        BlockFacts {
+            t,
+            tag,
+            geom,
+            nests,
+            qs,
+            score_form,
+            width,
+            kt,
+            v,
+            mask: MaskFacts {
+                mask,
+                off: mask_off,
+                bcast: mask_bcast,
+            },
+            seed: BlockSeed::SeedsState,
+            forms,
+            state,
+            bufs,
+        },
+    )?;
+    Ok(SeededCarry::mint(state))
+}
+
+/// ⭐⭐⭐⭐⭐ THE FOLD DOOR — the block emitter's fold role, REQUIRING the proof the seed door mints.
+/// The `carry` parameter is the door's first own fact: the slot that decides what this block does
+/// to the running state carries the evidence the state exists. A fold emitted before
+/// any seed does not compile — there is no `SeededCarry` in scope to hand it. The token is returned
+/// unchanged (the names it carries are the buffers' own, reused in place by every fold); the chain
+/// continues to the next fold or the finalize. The core's state names come FROM the proof — a fold
+/// door needs no separate allocation fact — and the core's fact set arrives as the ONE
+/// [`DoorFacts`] carrier, the role fixed by the door itself.
+///
+/// ⭐ AND THE MASK READ CROSSES AS ONE VALUE ([`FoldMaskRead`]): the per-row prefix arm's corner is
+/// the sweep-law token's own door, so a fold onto that mask requires the MASK DOOR's declaration
+/// too — the shape was validated, and its staging is the sweep-readings' subject.
+fn assemble_attn_fold_block<const NQH: u32, const NKVH: u32, const HD: u32>(
+    ctx: &mut EmitCtx<'_>,
+    carry: SeededCarry,
+    mask_read: FoldMaskRead,
+    facts: DoorFacts<
+        '_,
+        NQH,
+        NKVH,
+        HD,
+        impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+        impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+    >,
+) -> Result<SeededCarry, SuperDscError> {
+    // ⭐ THE MASK CORNER, DERIVED FROM THE READ — the per-row prefix arm's corner is the LAW's own
+    // door (that fold cannot be emitted without the mask door's declaration); the nest arm's
+    // corner is the value the mask's own layout already stated.
+    let mask_off = match mask_read {
+        FoldMaskRead::PrefixSlab { law, slab } => {
+            crate::addr::DevOff::of_mask_corner(law.slab_corner(slab))
+        }
+        FoldMaskRead::Nest(off) => off,
+    };
+    // ⭐ THE DOOR'S FACTS, DESTRUCTURED ONCE — every field restates the local the BlockFacts
+    // build below reads, so the emission is the same op stream on the same values.
+    let DoorFacts {
+        t,
+        tag,
+        geom,
+        nests,
+        qs,
+        score_form,
+        width,
+        kt,
+        v,
+        mask,
+        mask_bcast,
+        forms,
+        bufs,
+    } = facts;
+    assemble_attn_block(
+        ctx,
+        BlockFacts {
+            t,
+            tag,
+            geom,
+            nests,
+            qs,
+            score_form,
+            width,
+            kt,
+            v,
+            mask: MaskFacts {
+                mask,
+                off: mask_off,
+                bcast: mask_bcast,
+            },
+            seed: BlockSeed::FoldsOntoSeed,
+            forms,
+            state: &carry.state,
+            bufs,
+        },
+    )?;
+    Ok(carry)
+}
+
 /// The re-laid query block and the `[hd, hd]` identity its stick copies read.
 struct QGroupBufs {
     block: String,
@@ -1934,11 +2527,13 @@ enum ChunkHistory {
 
 /// What one layer's split-KV chunk attends with: its geometry, the pool planes and index it gathers
 /// through, the query and mask it scores, and the buffers it writes.
-struct ChunkAttn<'a> {
+struct ChunkAttn<'a, const NQH: u32, const NKVH: u32, const HD: u32> {
     t: u32,
-    nqh: u32,
-    hd: u32,
-    gqa: u32,
+    // ⛔ THE HEAD GEOMETRY IS NOT THREE FIELDS ANY MORE — `nqh`, `hd` and the `gqa` the construction
+    // site spelled as `nqh / nkvh` are the class's consts now, carried by the geometry the bundle was
+    // instantiated at, so a chunk body built for another model's head counts is a type that does not
+    // exist. `gqa` rides the geometry's own proof-carrying const, not a division spelled here.
+    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
     // Query rows per head: 1 at decode, the prompt chunk's width at prefill, the batch width for a
     // batched decode.
     mq: u32,
@@ -1960,12 +2555,11 @@ struct ChunkAttn<'a> {
 /// token stream — the fold's per-head score form (`ScoreArm::PerHead`): the WHOLE head dim contracted in
 /// one UNBATCHED op. (A two-stick contraction under a `y`-batch is the measured-incoherent shape;
 /// unbatched it is gemma-4's full-attention score.)
-fn row_block_query(
+fn row_block_query<const NQH: u32, const NKVH: u32, const HD: u32>(
     blocks: crate::sdsc_abstract::ChunkRowBlocks,
     b: u32,
     mq: u32,
-    nqh: u32,
-    hd: u32,
+    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
     qs: &str,
 ) -> Result<
     (
@@ -1976,10 +2570,15 @@ fn row_block_query(
     SuperDscError,
 > {
     use crate::sdsc_abstract::{ChunkRowForm, OperandPlacement, QueryRowCount};
+    let (nqh, hd) = (geom.nqh(), geom.hd());
     Ok(match blocks.form() {
         ChunkRowForm::OneSlabGroup => (
             MatM::of_head_major_rows(blocks.rows()),
-            rb(qs, nqh * mq, hd),
+            rb(
+                qs,
+                RowCount::of_head_major_rows(nqh * mq),
+                BlockCols::of_head_dim(hd),
+            ),
             crate::addr::DevOff::from_view_step(
                 blocks.first_head(b) * mq * BlockCols::of_one_stick(Lanes::FP16).get(),
             ),
@@ -1988,7 +2587,11 @@ fn row_block_query(
             let rows = QueryRowCount::of_mq(mq);
             (
                 MatM::of_query_rows(rows),
-                rb(qs, mq, hd),
+                rb(
+                    qs,
+                    RowCount::of_query_rows(rows),
+                    BlockCols::of_head_dim(hd),
+                ),
                 OperandPlacement::of_token_stream(rows, nqh, hd, blocks.first_head(b), 0, 0).off(),
             )
         }
@@ -1997,7 +2600,11 @@ fn row_block_query(
         // `qs` here is the re-laid buffer's name (the caller hands it in place of the stream's).
         ChunkRowForm::QueryGroup(q) => (
             MatM::of_head_major_rows(q.rows()),
-            rb(qs, q.rows(), hd),
+            rb(
+                qs,
+                RowCount::of_head_major_rows(q.rows()),
+                BlockCols::of_head_dim(hd),
+            ),
             q.block_off(blocks.kv_head(b)).ok_or_else(|| {
                 SuperDscError(format!(
                     "row block {b}: kv head {} is past the re-laid query's {} groups",
@@ -2019,16 +2626,21 @@ fn row_block_query(
 struct RowBlockValue {
     m: MatM,
     n: MatN,
-    /// The V kernel's columns: the whole head dim at one slab, one stick above it.
-    v_cols: u32,
+    /// The V kernel's columns ([`VKernelPitch`](crate::sdsc_abstract::VKernelPitch)): the whole
+    /// head dim at one slab, one stick above it.
+    v_cols: crate::sdsc_abstract::VKernelPitch,
     /// The block's rows of the output, in slab `s`'s plane above one slab.
     out_off: crate::addr::DevOff,
 }
 
 impl RowBlockValue {
     /// The value ops per row block: one at one slab, one per slab above it.
-    fn slabs(blocks: crate::sdsc_abstract::ChunkRowBlocks, hd: u32) -> u32 {
+    fn slabs<const NQH: u32, const NKVH: u32, const HD: u32>(
+        blocks: crate::sdsc_abstract::ChunkRowBlocks,
+        geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    ) -> u32 {
         use crate::sdsc_abstract::ChunkRowForm;
+        let hd = geom.hd();
         match blocks.form() {
             ChunkRowForm::OneSlabGroup => 1,
             ChunkRowForm::QueryHead | ChunkRowForm::QueryGroup(_) => {
@@ -2037,15 +2649,16 @@ impl RowBlockValue {
         }
     }
 
-    fn of(
+    fn of<const NQH: u32, const NKVH: u32, const HD: u32>(
         blocks: crate::sdsc_abstract::ChunkRowBlocks,
         b: u32,
         s: u32,
         mq: u32,
         q_rows: u32,
-        hd: u32,
+        geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
     ) -> RowBlockValue {
         use crate::sdsc_abstract::ChunkRowForm;
+        let hd = geom.hd();
         let stick = BlockCols::of_one_stick(Lanes::FP16).get();
         let h0 = blocks.first_head(b) * mq;
         // Slab `s`'s plane of the `[q_rows, hd]` output at the block's first row — every row of a
@@ -2060,13 +2673,13 @@ impl RowBlockValue {
             ChunkRowForm::OneSlabGroup => RowBlockValue {
                 m: MatM::of_head_major_rows(blocks.rows()),
                 n: MatN::of_head_dim(hd),
-                v_cols: hd,
+                v_cols: crate::sdsc_abstract::VKernelPitch::of_head_dim(hd),
                 out_off: crate::addr::DevOff::from_view_step(h0 * stick),
             },
             ChunkRowForm::QueryHead => RowBlockValue {
                 m: MatM::of_query_rows(crate::sdsc_abstract::QueryRowCount::of_mq(mq)),
                 n: MatN::of_head_slab(FeatIdx::SLAB_FEATS),
-                v_cols: stick,
+                v_cols: crate::sdsc_abstract::VKernelPitch::of_one_stick(Lanes::FP16),
                 out_off: slab_rows,
             },
             // ⭐ THE GROUP's `gqa` ROWS of slab `s` in ONE op — one stick of `out`, the fold's card-proven
@@ -2074,7 +2687,7 @@ impl RowBlockValue {
             ChunkRowForm::QueryGroup(q) => RowBlockValue {
                 m: MatM::of_head_major_rows(q.rows()),
                 n: MatN::of_head_slab(FeatIdx::SLAB_FEATS),
-                v_cols: stick,
+                v_cols: crate::sdsc_abstract::VKernelPitch::of_one_stick(Lanes::FP16),
                 out_off: slab_rows,
             },
         }
@@ -2096,11 +2709,12 @@ fn row_block_name(blocks: crate::sdsc_abstract::ChunkRowBlocks, b: u32) -> Strin
 /// [`assemble_new_block_chunk`].
 ///
 /// [`NewBlockForm::Chunk`]: crate::sdsc_abstract::NewBlockForm::Chunk
-struct NewChunkAttn<'a> {
+struct NewChunkAttn<'a, const NQH: u32, const NKVH: u32, const HD: u32> {
     t: u32,
-    nqh: u32,
-    nkvh: u32,
-    hd: u32,
+    // ⛔ THE HEAD GEOMETRY IS NOT THREE FIELDS ANY MORE — the new-token block is emitted for the
+    // class the bundle was instantiated at, the same carrier the seed and fold blocks take, so a
+    // block seeded for another model's head counts is a type that does not exist.
+    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
     /// The row blocks the block is cut into ([`ChunkRowBlocks`]): a kv head at one slab, a query head above.
     ///
     /// [`ChunkRowBlocks`]: crate::sdsc_abstract::ChunkRowBlocks
@@ -2110,12 +2724,30 @@ struct NewChunkAttn<'a> {
     /// [`NewBlockForm::of`]: crate::sdsc_abstract::NewBlockForm::of
     mq: u32,
     cols: BlockCols,
+    /// The new block's own Kᵗ scratch's kernel pitch — minted from the pad's slot extent
+    /// ([`MqPad::slots`]'s [`SlotExtent::kernel_row_pitch`]), the door for exactly the score
+    /// kernel's `n_out` slot below. The value `cols` also carries is the SCORE WIDTH — a different
+    /// question, with no door into the kernel-pitch slot.
+    ///
+    /// [`MqPad::slots`]: crate::sdsc_abstract::MqPad::slots
+    /// [`SlotExtent::kernel_row_pitch`]: crate::sdsc_abstract::SlotExtent::kernel_row_pitch
+    kt_pitch: crate::sdsc_abstract::KtKernelPitch,
+    /// The value kernel's rows for the same block — [`VKernelRows::of_new_block_chunk`], the
+    /// chunk form's whole-block contraction of `new_v`'s `[mq_pad, hd]` kv-head blocks. The seed
+    /// and fold emitters take their `v_stride` the same way.
+    ///
+    /// [`VKernelRows::of_new_block_chunk`]: crate::sdsc_abstract::VKernelRows::of_new_block_chunk
+    v_rows: crate::sdsc_abstract::VKernelRows,
     qs: &'a str,
     new_kt: &'a str,
     new_v: &'a str,
     cmask: &'a str,
     bmm_form: crate::ir::bridge::tiled_op_sdsc_op::matmul::SharedKernelBmmForm,
-    bufs: &'a BlockBufs,
+    /// The recurrence state's names — this emitter SEEDS, so it is handed the allocation it
+    /// writes and returns it wrapped as the proof. (It reads no other shared buffer: its `sc`/
+    /// `esub`/`exp` scratch rides the dedicated fields above, which is why `BlockBufs` is not
+    /// here at all.)
+    state: &'a StateNames,
     sc: &'a str,
     esub: &'a str,
     exp: &'a str,
@@ -2147,30 +2779,30 @@ struct NewChunkAttn<'a> {
 /// [`NewBlockForm`]: crate::sdsc_abstract::NewBlockForm
 /// [`NewBlockForm::mask_heads_per_block`]: crate::sdsc_abstract::NewBlockForm::mask_heads_per_block
 /// [`ChunkScratch::rows_corner`]: crate::sdsc_abstract::ChunkScratch::rows_corner
-fn assemble_new_block_chunk(
-    ops: &mut Vec<EmittedOp>,
-    a: NewChunkAttn<'_>,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> Result<(), SuperDscError> {
+fn assemble_new_block_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
+    ctx: &mut EmitCtx<'_>,
+    a: NewChunkAttn<'_, NQH, NKVH, HD>,
+) -> Result<SeededCarry, SuperDscError> {
     let NewChunkAttn {
         t,
-        nqh,
-        nkvh,
-        hd,
+        geom,
         blocks,
         mq,
         cols,
+        kt_pitch,
+        v_rows,
         qs,
         new_kt,
         new_v,
         cmask,
         bmm_form,
-        bufs,
+        state,
         sc,
         esub,
         exp,
     } = a;
+    // Destructured ONCE, at the door — the class's consts, spent as values.
+    let (nqh, nkvh, hd) = (geom.nqh(), geom.nkvh(), geom.hd());
     use crate::addr::DevOff;
     use crate::superdsc_opspec::EpilogueOpFunc;
     let stick = BlockCols::of_one_stick(Lanes::FP16);
@@ -2184,7 +2816,7 @@ fn assemble_new_block_chunk(
     let wide = crate::addr::Nest::new(&["row", "slot"], &[g_rows, slots], Df::Fp16);
     let kt = crate::addr::Nest::new(&["feat", "slot"], &[hd, slots], Df::Fp16);
     let vv = crate::addr::Nest::new(&["row", "head", "feat"], &[mq, nkvh, hd], Df::Fp16);
-    let first_op = ops.len();
+    let first_op = ctx.ops.len();
     for b in 0..blocks.count() {
         let (kvh, h0, bn) = (
             blocks.kv_head(b),
@@ -2197,8 +2829,8 @@ fn assemble_new_block_chunk(
         // block's ROWS alone, the score too (`MatN::of_new_block_scores`), so core `c` reads exactly the
         // rows core `c` wrote; `emit`'s core-local read law compares each op's slice at build.
         let at_pin = DevOff::ZERO;
-        let (m, q, q_off) = row_block_query(blocks, b, mq, nqh, hd, qs)?;
-        ops.push(assemble_matmul_off_with_epilogue(
+        let (m, q, q_off) = row_block_query(blocks, b, mq, geom, qs)?;
+        ctx.ops.push(assemble_matmul_off_with_epilogue(
             &format!("attn_ncsc_{bn}_o{t}"),
             m,
             MatN::of_new_block_scores(cols),
@@ -2207,27 +2839,27 @@ fn assemble_new_block_chunk(
             bmm_form,
             &q,
             q_off,
-            &Stk::<KernelTag>::kernel(hd as usize, slots as usize, new_kt),
+            &Stk::<KernelTag>::kernel(hd as usize, kt_pitch.n_out_cols(), new_kt),
             kt.block(kvh).dev(),
-            &rb(sc, g_rows, slots),
+            &rb(sc, grp_rows, cols),
             at_pin,
-            &rb(cmask, g_rows, slots),
+            &rb(cmask, grp_rows, cols),
             wide.block(b).dev(),
             EpilogueOpFunc::StridedAdd,
             &[],
             false,
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
         let ncbmax_op = format!("attn_ncbmax_{bn}_o{t}");
-        ops.push(assemble_reduce_off(
+        ctx.ops.push(assemble_reduce_off(
             &ncbmax_op,
             "max",
             grp_rows,
             cols,
             win_reduce_data(
-                layout,
-                &rb(sc, g_rows, slots),
+                ctx.layout,
+                &rb(sc, grp_rows, cols),
                 at_pin,
                 grp_rows,
                 cols,
@@ -2235,50 +2867,54 @@ fn assemble_new_block_chunk(
             )
             .map_err(SuperDscError)?,
             win_reduce_accum(
-                layout,
-                &hm_rows(&bufs.run_m, q_rows),
+                ctx.layout,
+                &hm_rows(state.m(), q_rows),
                 row_step(h0),
                 grp_rows,
                 &format!("{ncbmax_op}: accum"),
             )
             .map_err(SuperDscError)?,
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
-        ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_ncesub_{bn}_o{t}"),
-            "subtract",
-            grp_rows,
-            cols,
-            &[
-                In::sliced(&rb(sc, g_rows, slots), at_pin).ew(),
-                In::col_at(&hm_rows(&bufs.run_m, q_rows), row_step(h0)).ew(),
-            ],
-            &rb(esub, g_rows, slots),
-            at_pin,
-            sym_id_base,
-            layout,
+        ctx.ops.push(assemble_pointwise_broadcast_off(
+            PointwiseFacts {
+                op_name: &format!("attn_ncesub_{bn}_o{t}"),
+                op_func: "subtract",
+                rows: grp_rows,
+                cols,
+                inputs: &[
+                    In::sliced(&rb(sc, grp_rows, cols), at_pin).ew(),
+                    In::col_at(&hm_rows(state.m(), q_rows), row_step(h0)).ew(),
+                ],
+                o: &rb(esub, grp_rows, cols),
+                out_offset: at_pin.into(),
+            },
+            ctx.sym_id_base,
+            ctx.layout,
         ));
-        ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_ncexp_{bn}_o{t}"),
-            "exp",
-            grp_rows,
-            cols,
-            &[In::sliced(&rb(esub, g_rows, slots), at_pin).ew()],
-            &rb(exp, g_rows, slots),
-            at_pin,
-            sym_id_base,
-            layout,
+        ctx.ops.push(assemble_pointwise_broadcast_off(
+            PointwiseFacts {
+                op_name: &format!("attn_ncexp_{bn}_o{t}"),
+                op_func: ExpBase::E.op_func(),
+                rows: grp_rows,
+                cols,
+                inputs: &[In::sliced(&rb(esub, grp_rows, cols), at_pin).ew()],
+                o: &rb(exp, grp_rows, cols),
+                out_offset: at_pin.into(),
+            },
+            ctx.sym_id_base,
+            ctx.layout,
         ));
         let ncbsum_op = format!("attn_ncbsum_{bn}_o{t}");
-        ops.push(assemble_reduce_off(
+        ctx.ops.push(assemble_reduce_off(
             &ncbsum_op,
             "sum",
             grp_rows,
             cols,
             win_reduce_data(
-                layout,
-                &rb(exp, g_rows, slots),
+                ctx.layout,
+                &rb(exp, grp_rows, cols),
                 at_pin,
                 grp_rows,
                 cols,
@@ -2286,20 +2922,20 @@ fn assemble_new_block_chunk(
             )
             .map_err(SuperDscError)?,
             win_reduce_accum(
-                layout,
-                &hm_rows(&bufs.run_l, q_rows),
+                ctx.layout,
+                &hm_rows(state.l(), q_rows),
                 row_step(h0),
                 grp_rows,
                 &format!("{ncbsum_op}: accum"),
             )
             .map_err(SuperDscError)?,
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
         // The seed: no prior output to fold, so no epilogue. Above one slab, one op per slab of V.
-        let n_slabs = RowBlockValue::slabs(blocks, hd);
+        let n_slabs = RowBlockValue::slabs(blocks, geom);
         for s in 0..n_slabs {
-            let v = RowBlockValue::of(blocks, b, s, mq, q_rows, hd);
+            let v = RowBlockValue::of(blocks, b, s, mq, q_rows, geom);
             let v_off = if n_slabs == 1 {
                 vv.view().at(Idx::<Head>::n(kvh)).dev()
             } else {
@@ -2310,25 +2946,33 @@ fn assemble_new_block_chunk(
             } else {
                 format!("s{s}")
             };
-            ops.push(assemble_matmul_off(
+            ctx.ops.push(assemble_matmul_off(
                 &format!("attn_ncov_{bn}{slab}_o{t}"),
                 v.m,
                 v.n,
                 MatK::of_kv_window(cols),
                 MatY::unbatched(),
                 bmm_form,
-                &rb(exp, g_rows, slots),
+                &rb(exp, grp_rows, cols),
                 at_pin,
-                &Stk::<KernelTag>::kernel(slots as usize, v.v_cols as usize, new_v),
+                &Stk::<KernelTag>::kernel(v_rows.rows() as usize, v.v_cols.n_out_cols(), new_v),
                 v_off,
-                &rb(&bufs.run_o, q_rows, hd),
+                &rb(
+                    state.o(),
+                    RowCount::of_head_major_rows(q_rows),
+                    BlockCols::of_head_dim(hd),
+                ),
                 v.out_off,
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
         }
     }
-    no_chunk_op_is_time_tiled(&ops[first_op..], t)
+    no_chunk_op_is_time_tiled(&ctx.ops[first_op..], t)?;
+    // The seed mint — one of the two spellings that produce a `SeededCarry`: this function's
+    // `ncbmax`/`ncbsum` and value matmuls wrote the carry on every path (no early return precedes
+    // them), so the folds and the finalize below can require the proof.
+    Ok(SeededCarry::mint(state))
 }
 
 /// The per-core LX a prompt chunk's two core-local probability scratches (`cesub`, `cexp`) may pin together:
@@ -2486,17 +3130,16 @@ pub fn chunk_prob_pins(
 ///
 /// The row max is the stick-major `[gqa, slots]` reduce, the same form as the row sum (see the
 /// `attn_cbmax_g*` ops for why it must be per row and why not a page-axis reduce).
-fn assemble_attn_chunk(
-    ops: &mut Vec<EmittedOp>,
-    a: ChunkAttn<'_>,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> Result<(), SuperDscError> {
+fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
+    ctx: &mut EmitCtx<'_>,
+    a: ChunkAttn<'_, NQH, NKVH, HD>,
+    // The proof the new-block chunk seeded the carry this body folds onto — required, returned: the
+    // chain continues to the finalize.
+    carry: SeededCarry,
+) -> Result<SeededCarry, SuperDscError> {
     let ChunkAttn {
         t,
-        nqh,
-        hd,
-        gqa,
+        geom,
         mq,
         chunk,
         history,
@@ -2509,12 +3152,18 @@ fn assemble_attn_chunk(
         bufs,
         cb,
     } = a;
+    // Destructured ONCE, at the door — the class's consts, spent as values. `gqa` is the geometry's
+    // own proof-carrying const, so the body below cannot re-derive it from two numbers that might
+    // disagree.
+    let (nqh, hd, gqa) = (geom.nqh(), geom.hd(), geom.gqa());
     use crate::addr::DevOff;
     use crate::superdsc_opspec::{EpilogueOpFunc, Scale};
-    let first_op = ops.len();
+    let first_op = ctx.ops.len();
     let stick = BlockCols::of_one_stick(Lanes::FP16);
     let width = BlockCols::of_chunk(chunk);
-    let slots = width.get();
+    // The gathered Kᵗ scratch's own pitch — the chunk's slots through the scratch's door, spent at
+    // the score kernel's `n_out` slot below (the same quantity `width` carries, as the score width).
+    let kt_pitch = crate::sdsc_abstract::KtKernelPitch::of_chunk_scratch(chunk);
     // ⭐ ROWS, NOT HEADS. A head's rows are `mq` consecutive positions of the head-major token stream
     // (row `h·mq + r`): one at decode, the prompt chunk's width at prefill. So kv head `kvh`'s query rows
     // are the contiguous `[kvh·gqa·mq, (kvh+1)·gqa·mq)`, and every per-head block, base and extent below
@@ -2522,10 +3171,14 @@ fn assemble_attn_chunk(
     let q_rows = nqh * mq;
     let all_rows = RowCount::of_head_major_rows(q_rows);
     let nkvh = chunk.nkvh();
-    if nkvh * gqa != nqh {
+    // ⭐ THE ONLY TWO NUMBERS LEFT THAT CAN DISAGREE. `nqh`, `gqa` and `hd` are the class's consts now,
+    // carried by the geometry, so the old `nkvh * gqa != nqh` triple-check is dead by the type — what
+    // remains is the SCRATCH's head count against the class's, a bake fact (the scratch is minted from
+    // the runtime pool), refused here rather than folded wrong.
+    if nkvh != geom.nkvh() {
         return Err(SuperDscError(format!(
-            "attention chunk o{t}: {nkvh} kv heads × {gqa} query heads per group is not the {nqh} \
-             query heads the bundle carries"
+            "attention chunk o{t}: the chunk scratch carries {nkvh} kv heads, not the class's {}",
+            geom.nkvh()
         )));
     }
     // ⭐ THE ROW BLOCKS every wide op below is cut into: one per KV HEAD at one feature slab (a GQA
@@ -2624,13 +3277,13 @@ fn assemble_attn_chunk(
                 dst,
                 cp,
                 index,
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             );
             // ⭐ DECLARED ON THE COPY ITSELF: it groups as `GroupKind::Gathered`, whose launch takes no
             // KV page shift (the entries are absolute) and whose body the host stages the index for.
             op.kv_gathered = true;
-            ops.push(op);
+            ctx.ops.push(op);
         }
     }
 
@@ -2648,27 +3301,31 @@ fn assemble_attn_chunk(
                     };
                     let src = q.copy_src(kvh, s).ok_or_else(missing)?;
                     let dst = q.copy_dest(kvh, s).ok_or_else(missing)?;
-                    ops.push(super::matmul::assemble_matmul_placed(
+                    ctx.ops.push(super::matmul::assemble_matmul_placed(
                         &format!("attn_cqg_g{kvh}s{s}_o{t}"),
                         MatM::of_query_rows(crate::sdsc_abstract::QueryRowCount::of_mq(mq)),
                         MatN::one_stick(Lanes::FP16),
                         MatK::one_stick(Lanes::FP16),
                         MatY::of_gqa_group(q.gqa(), src, dst),
                         SharedKernelBmmForm::of_query_group_copy(),
-                        &rb(qs, mq, nqh * hd),
+                        &rb(
+                            qs,
+                            RowCount::of_query_rows(crate::sdsc_abstract::QueryRowCount::of_mq(mq)),
+                            BlockCols::of_feature_cols(nqh * hd),
+                        ),
                         src,
                         // I[64,64] — the class identity's first diagonal block, for every slab: an
                         // identity copy needs exactly the shared 2-D kernel a `y` batch demands.
-                        &Stk::<KernelTag>::kernel(
-                            stick.get() as usize,
-                            stick.get() as usize,
-                            &qb.ident,
-                        ),
+                        &Stk::<KernelTag>::one_stick_identity(&qb.ident),
                         DevOff::ZERO,
-                        &rb(&qb.block, q.nkvh() * q.rows(), hd),
+                        &rb(
+                            &qb.block,
+                            RowCount::of_head_major_rows(q.nkvh() * q.rows()),
+                            BlockCols::of_head_dim(hd),
+                        ),
                         dst,
-                        sym_id_base,
-                        layout,
+                        ctx.sym_id_base,
+                        ctx.layout,
                     ));
                 }
             }
@@ -2701,9 +3358,9 @@ fn assemble_attn_chunk(
         // logical slots (head-independent, so `mb` collapses), added in the matmul's own epilogue; for a
         // batch chunk, the per-row block (`mask_dims` above). Q is the row block's own operand
         // (`row_block_query`) — the re-laid group block where the query was re-laid above.
-        let (m, a, a_off) = row_block_query(blocks, b, mq, nqh, hd, q_name)?;
+        let (m, a, a_off) = row_block_query(blocks, b, mq, geom, q_name)?;
         let Some((keys, kt)) = cb.lx.as_ref().and_then(|lx| lx.keys.as_ref()) else {
-            ops.push(assemble_matmul_off_with_epilogue(
+            ctx.ops.push(assemble_matmul_off_with_epilogue(
                 &format!("attn_csc_{}_o{t}", blk_name(b)),
                 m,
                 MatN::of_kv_window(width),
@@ -2712,17 +3369,17 @@ fn assemble_attn_chunk(
                 bmm_form,
                 &a,
                 a_off,
-                &Stk::<KernelTag>::kernel(hd as usize, slots as usize, &cb.gkt),
+                &Stk::<KernelTag>::kernel(hd as usize, kt_pitch.n_out_cols(), &cb.gkt),
                 kc,
-                &rb(&cb.csc, b_rows, slots),
+                &rb(&cb.csc, blk_rows, width),
                 rc,
                 &mask_h,
                 DevOff::ZERO,
                 EpilogueOpFunc::StridedAdd,
                 mask_dims,
                 true,
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
             continue;
         };
@@ -2733,6 +3390,8 @@ fn assemble_attn_chunk(
         // in LX only with its witness (`ChunkLx::keys`, a chunk with no Kᵗ tail), so every part is whole.
         for (p, part) in chunk.slot_parts(keys.part_pages()).enumerate() {
             let k_name = kt[keys.tensor(p as u32, kvh) as usize].as_str();
+            // The part's own pitch, through the part's door — the score kernel's `n_out` slot.
+            let part_pitch = crate::sdsc_abstract::KtKernelPitch::of_chunk_part(part);
             let pc = corner(part.probs_corner(blocks, b), "a row block's score part")?;
             // The part's columns of the mask. A shared history is one broadcast row, so they start
             // `first_slot` in. A batch's per-row block is RowBlocked `[rows, slots]` like the score block it
@@ -2743,7 +3402,7 @@ fn assemble_attn_chunk(
                     corner(part.probs_corner(blocks, 0), "the batch mask's score part")?
                 }
             };
-            ops.push(assemble_matmul_off_with_epilogue(
+            ctx.ops.push(assemble_matmul_off_with_epilogue(
                 &format!("attn_csc_{}_k{p}_o{t}", blk_name(b)),
                 m,
                 // Its COLUMNS divided across the cores, rows whole (`OutputSplit` says why): core `c`
@@ -2754,17 +3413,17 @@ fn assemble_attn_chunk(
                 bmm_form,
                 &a,
                 a_off,
-                &Stk::<KernelTag>::kernel(hd as usize, part.slots() as usize, k_name),
+                &Stk::<KernelTag>::kernel(hd as usize, part_pitch.n_out_cols(), k_name),
                 DevOff::ZERO,
-                &rb(&cb.csc, b_rows, slots),
+                &rb(&cb.csc, blk_rows, width),
                 pc,
                 &mask_h,
                 mask_off,
                 EpilogueOpFunc::StridedAdd,
                 mask_dims,
                 true,
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
         }
     }
@@ -2791,8 +3450,7 @@ fn assemble_attn_chunk(
     let red_parts: Vec<crate::sdsc_abstract::ChunkPart> = chunk
         .slot_parts(reduction_part_pages(chunk, b_rows))
         .collect();
-    let reduce_in_parts = |ops: &mut Vec<EmittedOp>,
-                           sym_id_base: &mut i64,
+    let reduce_in_parts = |ctx: &mut EmitCtx<'_>,
                            stem: &str,
                            func: &'static str,
                            combine: &'static str,
@@ -2806,18 +3464,18 @@ fn assemble_attn_chunk(
             for b in 0..blocks.count() {
                 let pc = corner(part.probs_corner(blocks, b), "a row block's reduction part")?;
                 let part_op = format!("attn_c{stem}_{}_s{p}_o{t}", blk_name(b));
-                ops.push(assemble_reduce_off(
+                ctx.ops.push(assemble_reduce_off(
                     &part_op,
                     func,
                     blk_rows,
                     BlockCols::of_chunk_part(*part),
                     win_reduce_data(
-                        layout,
+                        ctx.layout,
                         // The FULL `[q_rows, slots]` score buffer — `pc` is the part's corner in
                         // the whole buffer (ChunkPart::probs_corner's law), and the block's own
                         // `b_rows` rows are a slice of it, so the part-sized and block-sized
                         // annotations the raw form carried were never the window's bound.
-                        &rb(src, q_rows, slots),
+                        &rb(src, all_rows, width),
                         pc,
                         blk_rows,
                         BlockCols::of_chunk_part(*part),
@@ -2825,15 +3483,15 @@ fn assemble_attn_chunk(
                     )
                     .map_err(SuperDscError)?,
                     win_reduce_accum(
-                        layout,
+                        ctx.layout,
                         &hm_rows(into, q_rows),
                         row_step(blocks.first_head(b) * mq),
                         blk_rows,
                         &format!("{part_op}: partial"),
                     )
                     .map_err(SuperDscError)?,
-                    sym_id_base,
-                    layout,
+                    ctx.sym_id_base,
+                    ctx.layout,
                 ));
             }
             if p > 0 {
@@ -2844,19 +3502,21 @@ fn assemble_attn_chunk(
                 } else {
                     temps[2]
                 };
-                ops.push(assemble_pointwise_broadcast_off(
-                    &format!("attn_c{stem}_k{p}_o{t}"),
-                    combine,
-                    all_rows,
-                    stick,
-                    &[
-                        In::full(&hm_rows(acc, q_rows)).ew(),
-                        In::full(&hm_rows(temps[1], q_rows)).ew(),
-                    ],
-                    &hm_rows(out, q_rows),
-                    DevOff::ZERO,
-                    sym_id_base,
-                    layout,
+                ctx.ops.push(assemble_pointwise_broadcast_off(
+                    PointwiseFacts {
+                        op_name: &format!("attn_c{stem}_k{p}_o{t}"),
+                        op_func: combine,
+                        rows: all_rows,
+                        cols: stick,
+                        inputs: &[
+                            In::full(&hm_rows(acc, q_rows)).ew(),
+                            In::full(&hm_rows(temps[1], q_rows)).ew(),
+                        ],
+                        o: &hm_rows(out, q_rows),
+                        out_offset: DevOff::ZERO.into(),
+                    },
+                    ctx.sym_id_base,
+                    ctx.layout,
                 ));
                 acc = out;
             }
@@ -2869,18 +3529,18 @@ fn assemble_attn_chunk(
             let rc = corner(blocks.corner(b), "a row block's score block")?;
             // The chunk's own division (`ChunkBufs::red_division_of`): the reduced axis across the
             // cores for a decode batch, rows first for every other chunk, byte for byte.
-            ops.push(assemble_reduce_off_divided(
+            ctx.ops.push(assemble_reduce_off_divided(
                 ReduceDivided {
                     op_name: &format!("attn_cbmax_{}_o{t}", blk_name(b)),
                     op_func: "max",
                     rows: blk_rows,
                     cols: width,
                     data: win_reduce_data(
-                        layout,
+                        ctx.layout,
                         // The FULL `[q_rows, slots]` chunk score buffer — the block's `rc` is a
                         // corner in it, so the block-sized `b_rows` annotation the raw form
                         // carried was never the window's bound.
-                        &rb(&cb.csc, q_rows, slots),
+                        &rb(&cb.csc, all_rows, width),
                         rc,
                         blk_rows,
                         width,
@@ -2888,7 +3548,7 @@ fn assemble_attn_chunk(
                     )
                     .map_err(SuperDscError)?,
                     accum: win_reduce_accum(
-                        layout,
+                        ctx.layout,
                         &hm_rows(&bufs.bmax, q_rows),
                         row_step(h0),
                         blk_rows,
@@ -2897,72 +3557,80 @@ fn assemble_attn_chunk(
                     .map_err(SuperDscError)?,
                     division: cb.red_division,
                 },
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
         }
     } else {
-        reduce_in_parts(
-            ops,
-            sym_id_base,
-            "bmax",
-            "max",
-            "maximum",
-            &cb.csc,
-            &bufs.bmax,
-        )?;
+        reduce_in_parts(ctx, "bmax", "max", "maximum", &cb.csc, &bufs.bmax)?;
     }
 
     // ── (3) THE ONLINE MERGE ONTO THE SEED — the fold block's own four ops, in its order ──
+    // The state's names come off the carry (the proof this body was handed); the scratch stays on
+    // `bufs` — spelled `.as_str()` so the table's rows are one type.
     for (op_name, func, ins, out) in [
-        ("newm", "maximum", [&bufs.run_m, &bufs.bmax], &bufs.newm),
+        (
+            "newm",
+            "maximum",
+            [carry.m(), bufs.bmax.as_str()],
+            bufs.newm.as_str(),
+        ),
         (
             "corrsub",
             "subtract",
-            [&bufs.run_m, &bufs.newm],
-            &bufs.corrsubt,
+            [carry.m(), bufs.newm.as_str()],
+            bufs.corrsubt.as_str(),
         ),
     ] {
-        ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_c{op_name}_o{t}"),
-            func,
-            all_rows,
-            stick,
-            &[
-                In::full(&hm_rows(ins[0], q_rows)).ew(),
-                In::full(&hm_rows(ins[1], q_rows)).ew(),
-            ],
-            &hm_rows(out, q_rows),
-            DevOff::ZERO,
-            sym_id_base,
-            layout,
+        ctx.ops.push(assemble_pointwise_broadcast_off(
+            PointwiseFacts {
+                op_name: &format!("attn_c{op_name}_o{t}"),
+                op_func: func,
+                rows: all_rows,
+                cols: stick,
+                inputs: &[
+                    In::full(&hm_rows(ins[0], q_rows)).ew(),
+                    In::full(&hm_rows(ins[1], q_rows)).ew(),
+                ],
+                o: &hm_rows(out, q_rows),
+                out_offset: DevOff::ZERO.into(),
+            },
+            ctx.sym_id_base,
+            ctx.layout,
         ));
     }
     for (op_name, func, inp, out) in [
-        ("corre", "exp", &bufs.corrsubt, &bufs.corr),
-        ("mset", "identity", &bufs.newm, &bufs.run_m),
+        (
+            "corre",
+            ExpBase::E.op_func(),
+            bufs.corrsubt.as_str(),
+            bufs.corr.as_str(),
+        ),
+        ("mset", "identity", bufs.newm.as_str(), carry.m()),
     ] {
-        ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_c{op_name}_o{t}"),
-            func,
-            all_rows,
-            stick,
-            &[In::full(&hm_rows(inp, q_rows)).ew()],
-            &hm_rows(out, q_rows),
-            DevOff::ZERO,
-            sym_id_base,
-            layout,
+        ctx.ops.push(assemble_pointwise_broadcast_off(
+            PointwiseFacts {
+                op_name: &format!("attn_c{op_name}_o{t}"),
+                op_func: func,
+                rows: all_rows,
+                cols: stick,
+                inputs: &[In::full(&hm_rows(inp, q_rows)).ew()],
+                o: &hm_rows(out, q_rows),
+                out_offset: DevOff::ZERO.into(),
+            },
+            ctx.sym_id_base,
+            ctx.layout,
         ));
     }
 
     // A prompt chunk keeps its probabilities in LX (the caller pins `cexp` by the same condition); decode —
     // one request, or a batch chunk whose `mq` rows are separate requests — keeps the form below.
     if mq > 1 && matches!(history, ChunkHistory::Shared) {
-        prompt_probabilities_in_lx(
-            ops,
+        let carry = prompt_probabilities_in_lx(
+            ctx,
             PromptProbs {
                 t,
-                hd,
+                geom,
                 mq,
                 blocks,
                 q_rows,
@@ -2971,10 +3639,10 @@ fn assemble_attn_chunk(
                 bufs,
                 cb,
             },
-            sym_id_base,
-            layout,
+            carry,
         )?;
-        return no_chunk_op_is_time_tiled(&ops[first_op..], t);
+        no_chunk_op_is_time_tiled(&ctx.ops[first_op..], t)?;
+        return Ok(carry);
     }
     // ── (4) PROBABILITIES and each row's DENOMINATOR, per kv head ──
     //
@@ -3003,7 +3671,7 @@ fn assemble_attn_chunk(
         let rc = corner(blocks.corner(b), "a row block's score block")?;
         for (p, part) in sm_parts.iter().enumerate() {
             let pc = corner(part.probs_corner(blocks, b), "a row block's score part")?;
-            let (pw, ps) = (BlockCols::of_chunk_part(*part), part.slots());
+            let pw = BlockCols::of_chunk_part(*part);
             let suffix = if sm_parts.len() == 1 {
                 String::new()
             } else {
@@ -3014,52 +3682,52 @@ fn assemble_attn_chunk(
             // probability blocks are read/written at CHUNK-FRAME corners (`pc`), so their handles
             // declare the FULL `[q_rows, slots]` buffers — the block-shaped `b_rows` annotation the
             // raw form carried was never the window's bound.
-            ops.push(assemble_pointwise_broadcast_divided(
+            ctx.ops.push(assemble_pointwise_broadcast_divided(
                 PointwiseDivided {
                     op_name: &format!("attn_cesub_{bn}{suffix}_o{t}"),
                     op_func: "subtract",
                     rows: blk_rows,
                     cols: pw,
                     inputs: &[
-                        In::sliced(&rb(&cb.csc, q_rows, slots), pc).ew(),
-                        In::col_at(&hm_rows(&bufs.run_m, q_rows), row_step(h0)).ew(),
+                        In::sliced(&rb(&cb.csc, all_rows, width), pc).ew(),
+                        In::col_at(&hm_rows(carry.m(), q_rows), row_step(h0)).ew(),
                     ],
-                    o: &rb(&cb.cesub, b_rows, ps),
+                    o: &rb(&cb.cesub, blk_rows, pw),
                     out_offset: DevOff::ZERO.into(),
                     division: cb.sm_division,
                 },
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
-            ops.push(assemble_pointwise_broadcast_divided(
+            ctx.ops.push(assemble_pointwise_broadcast_divided(
                 PointwiseDivided {
                     op_name: &format!("attn_cexp_{bn}{suffix}_o{t}"),
-                    op_func: "exp",
+                    op_func: ExpBase::E.op_func(),
                     rows: blk_rows,
                     cols: pw,
-                    inputs: &[In::sliced(&rb(&cb.cesub, b_rows, ps), DevOff::ZERO).ew()],
-                    o: &rb(&cb.cexp, q_rows, slots),
+                    inputs: &[In::sliced(&rb(&cb.cesub, blk_rows, pw), DevOff::ZERO).ew()],
+                    o: &rb(&cb.cexp, all_rows, width),
                     out_offset: pc.into(),
                     division: cb.sm_division,
                 },
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
         }
         // ⭐ EACH ROW's SUM OVER THE WHOLE CHUNK, straight into `bsum` — the stick-major `sum` over
         // `rows > 1 × cols > one stick`, the cell `Sum` combines correctly (prefill's RMS sums run it).
         // In parts below instead, after every block's probabilities, when one trip cannot hold it.
         if red_parts.len() == 1 {
-            ops.push(assemble_reduce_off_divided(
+            ctx.ops.push(assemble_reduce_off_divided(
                 ReduceDivided {
                     op_name: &format!("attn_cbsum_{bn}_o{t}"),
                     op_func: "sum",
                     rows: blk_rows,
                     cols: width,
                     data: win_reduce_data(
-                        layout,
+                        ctx.layout,
                         // The FULL `[q_rows, slots]` probability buffer (the bsum twin above).
-                        &rb(&cb.cexp, q_rows, slots),
+                        &rb(&cb.cexp, all_rows, width),
                         rc,
                         blk_rows,
                         width,
@@ -3067,7 +3735,7 @@ fn assemble_attn_chunk(
                     )
                     .map_err(SuperDscError)?,
                     accum: win_reduce_accum(
-                        layout,
+                        ctx.layout,
                         &hm_rows(&bufs.bsum, q_rows),
                         row_step(h0),
                         blk_rows,
@@ -3076,32 +3744,19 @@ fn assemble_attn_chunk(
                     .map_err(SuperDscError)?,
                     division: cb.red_division,
                 },
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
         }
     }
     if red_parts.len() > 1 {
-        reduce_in_parts(ops, sym_id_base, "bsum", "sum", "add", &cb.cexp, &bufs.bsum)?;
+        reduce_in_parts(ctx, "bsum", "sum", "add", &cb.cexp, &bufs.bsum)?;
     }
 
     // ── (5) RESCALE THE SEED'S OUTPUT, THEN THE VALUE LEG FOLDS ONTO IT ──
-    // `ocorr` reads the PRE-update `run_o`, so it precedes every value matmul (the fold block's order).
-    ops.push(assemble_pointwise_broadcast_off(
-        &format!("attn_cocorr_o{t}"),
-        "multiply",
-        all_rows,
-        BlockCols::of_head_dim(hd),
-        &[
-            In::full(&fl(&bufs.run_o, q_rows, hd)).ew(),
-            In::col(&hm_rows(&bufs.corr, q_rows)).ew(),
-        ],
-        &fl(&bufs.otmp, q_rows, hd),
-        DevOff::ZERO,
-        sym_id_base,
-        layout,
-    ));
-    let (otmp_h, run_o_h) = (fl(&bufs.otmp, q_rows, hd), fl(&bufs.run_o, q_rows, hd));
+    // The pre-update correction and the ping-pong pair it hands the value parts, minted by the
+    // one emitter that pushes the op ([`emit_pre_update_correction`] — the ORDER law).
+    let (otmp_h, run_o_h) = emit_pre_update_correction(ctx, t, q_rows, geom, &carry, bufs);
     // ⭐ THE VALUE LEG, IN K-PARTS (`ChunkScratch::value_parts`): ONE part at decode, 16 pages a part
     // for a prompt chunk, whose whole-chunk PV dxp refuses to verify. Each part folds onto the last
     // through the same `stridedadd` epilogue, PING-PONGING between `run_o` and `otmp` so no matmul reads
@@ -3129,11 +3784,11 @@ fn assemble_attn_chunk(
     // ⭐ ABOVE ONE SLAB THE VALUE LEG IS ONE OP PER (QUERY HEAD, SLAB) (`RowBlockValue`): each op contracts
     // its head's probabilities against slab `s` of the slab-major V scratch and lands in slab `s`'s plane of
     // `run_o` at the head's rows. At one slab the op is the per-kv-head one, unchanged.
-    let out_slabs = RowBlockValue::slabs(blocks, hd);
+    let out_slabs = RowBlockValue::slabs(blocks, geom);
     for b in 0..blocks.count() {
         let (kvh, bn) = (blocks.kv_head(b), blk_name(b));
         for s in 0..out_slabs {
-            let v = RowBlockValue::of(blocks, b, s, mq, q_rows, hd);
+            let v = RowBlockValue::of(blocks, b, s, mq, q_rows, geom);
             let o_off = v.out_off;
             for (p, part) in parts.iter().enumerate() {
                 // An LX-resident part is its (part, kv head, slab) core-local tensor, read at its pin (no
@@ -3157,9 +3812,9 @@ fn assemble_attn_chunk(
                     "a row block's probability block",
                 )?;
                 let (out, addend) = if p % 2 == 0 {
-                    (&bufs.run_o, &otmp_h)
+                    (carry.o(), &otmp_h)
                 } else {
-                    (&bufs.otmp, &run_o_h)
+                    (bufs.otmp.as_str(), &run_o_h)
                 };
                 let slab = if out_slabs == 1 {
                     String::new()
@@ -3178,84 +3833,96 @@ fn assemble_attn_chunk(
                 // `gqa·mq` rows to divide and keeps the planned split. A BATCH chunk's `gqa·B` rows are
                 // still a few dozen, against a contraction `B` requests deep — the decode form.
                 let k_part = BlockCols::of_chunk_part(*part);
+                // The value kernel's rows over the part — the gathered V scratch is read at the
+                // part's own rows, so the kernel's rows are the part's extent.
+                let v_rows = crate::sdsc_abstract::VKernelRows::of_chunk_part(*part);
                 let k = if decode_values {
                     MatK::of_chunk_decode_values(k_part)
                 } else {
                     MatK::of_kv_window(k_part)
                 };
                 // `run_o_b = P_b · V_kvh + otmp_b` — the `stridedadd` epilogue is the online-softmax update.
-                ops.push(assemble_matmul_off_maybe_epilogue(
+                ctx.ops.push(assemble_matmul_off_maybe_epilogue(
                     &name,
                     m,
                     n,
                     k,
                     MatY::unbatched(),
                     bmm_form,
-                    &rb(&cb.cexp, b_rows, slots),
+                    &rb(&cb.cexp, blk_rows, width),
                     rc,
-                    &Stk::<KernelTag>::kernel(part.slots() as usize, v_cols as usize, v_name),
+                    &Stk::<KernelTag>::kernel(v_rows.rows() as usize, v_cols.n_out_cols(), v_name),
                     kc,
-                    &rb(out, q_rows, hd),
+                    &rb(out, all_rows, BlockCols::of_head_dim(hd)),
                     o_off,
                     Some((addend, o_off)),
                     EpilogueOpFunc::StridedAdd,
                     &[],
                     false,
-                    sym_id_base,
-                    layout,
+                    ctx.sym_id_base,
+                    ctx.layout,
                 ));
             }
         }
     }
     if parts.len().is_multiple_of(2) {
-        ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_covsum_o{t}"),
-            "identity",
-            all_rows,
-            BlockCols::of_head_dim(hd),
-            &[In::full(&otmp_h).ew()],
-            &run_o_h,
-            DevOff::ZERO,
-            sym_id_base,
-            layout,
+        ctx.ops.push(assemble_pointwise_broadcast_off(
+            PointwiseFacts {
+                op_name: &format!("attn_covsum_o{t}"),
+                op_func: "identity",
+                rows: all_rows,
+                cols: BlockCols::of_head_dim(hd),
+                inputs: &[In::full(&otmp_h).ew()],
+                o: &run_o_h,
+                out_offset: DevOff::ZERO.into(),
+            },
+            ctx.sym_id_base,
+            ctx.layout,
         ));
     }
     // run_l = run_l*corr + bsum — the fold block's own pair.
-    ops.push(assemble_pointwise_broadcast_off(
-        &format!("attn_clcorr_o{t}"),
-        "multiply",
-        all_rows,
-        stick,
-        &[
-            In::full(&hm_rows(&bufs.run_l, q_rows)).ew(),
-            In::full(&hm_rows(&bufs.corr, q_rows)).ew(),
-        ],
-        &hm_rows(&bufs.ltmp, q_rows),
-        DevOff::ZERO,
-        sym_id_base,
-        layout,
+    ctx.ops.push(assemble_pointwise_broadcast_off(
+        PointwiseFacts {
+            op_name: &format!("attn_clcorr_o{t}"),
+            op_func: "multiply",
+            rows: all_rows,
+            cols: stick,
+            inputs: &[
+                In::full(&hm_rows(carry.l(), q_rows)).ew(),
+                In::full(&hm_rows(&bufs.corr, q_rows)).ew(),
+            ],
+            o: &hm_rows(&bufs.ltmp, q_rows),
+            out_offset: DevOff::ZERO.into(),
+        },
+        ctx.sym_id_base,
+        ctx.layout,
     ));
-    ops.push(assemble_pointwise_broadcast_off(
-        &format!("attn_cladd_o{t}"),
-        "add",
-        all_rows,
-        stick,
-        &[
-            In::full(&hm_rows(&bufs.ltmp, q_rows)).ew(),
-            In::full(&hm_rows(&bufs.bsum, q_rows)).ew(),
-        ],
-        &hm_rows(&bufs.run_l, q_rows),
-        DevOff::ZERO,
-        sym_id_base,
-        layout,
+    ctx.ops.push(assemble_pointwise_broadcast_off(
+        PointwiseFacts {
+            op_name: &format!("attn_cladd_o{t}"),
+            op_func: "add",
+            rows: all_rows,
+            cols: stick,
+            inputs: &[
+                In::full(&hm_rows(&bufs.ltmp, q_rows)).ew(),
+                In::full(&hm_rows(&bufs.bsum, q_rows)).ew(),
+            ],
+            o: &hm_rows(carry.l(), q_rows),
+            out_offset: DevOff::ZERO.into(),
+        },
+        ctx.sym_id_base,
+        ctx.layout,
     ));
-    no_chunk_op_is_time_tiled(&ops[first_op..], t)
+    no_chunk_op_is_time_tiled(&ctx.ops[first_op..], t)?;
+    Ok(carry)
 }
 
 /// A prompt chunk's probability phase's operands — see [`prompt_probabilities_in_lx`].
-struct PromptProbs<'a> {
+struct PromptProbs<'a, const NQH: u32, const NKVH: u32, const HD: u32> {
     t: u32,
-    hd: u32,
+    // ⛔ THE HEAD DIM IS NOT A FIELD ANY MORE — the probability phase runs at the class the bundle
+    // was instantiated at, the same carrier the chunk body and the new-token block take.
+    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
     mq: u32,
     /// The chunk's row blocks: a kv head at one slab, a query head above it.
     blocks: crate::sdsc_abstract::ChunkRowBlocks,
@@ -3264,6 +3931,43 @@ struct PromptProbs<'a> {
     bmm_form: crate::ir::bridge::tiled_op_sdsc_op::matmul::SharedKernelBmmForm,
     bufs: &'a BlockBufs,
     cb: &'a ChunkBufs,
+}
+
+/// ⭐ THE CHUNK'S PRE-UPDATE CORRECTION, EMITTED — and with it, the ping-pong pair the value
+/// parts fold through. `ocorr` multiplies the PRE-update `run_o` (read off the proof — this is
+/// a body op of the chain, never a seed) by `corr` and stages the product in `otmp`, which
+/// value part 0 then folds on; the odd parts fold the pre-update accumulator back the other
+/// way. The pair's ONLY mint is here, AFTER the push, so a value part's addend cannot exist
+/// without the op that wrote it having been pushed first — the ORDER law (every `ocorr`
+/// precedes every value matmul) is the handles' scope.
+fn emit_pre_update_correction<const NQH: u32, const NKVH: u32, const HD: u32>(
+    ctx: &mut EmitCtx<'_>,
+    t: u32,
+    q_rows: u32,
+    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    carry: &SeededCarry,
+    bufs: &BlockBufs,
+) -> (Stk<FlatTag>, Stk<FlatTag>) {
+    use crate::addr::DevOff;
+    let hd = geom.hd();
+    let (otmp_h, run_o_h) = (fl(&bufs.otmp, q_rows, hd), fl(carry.o(), q_rows, hd));
+    ctx.ops.push(assemble_pointwise_broadcast_off(
+        PointwiseFacts {
+            op_name: &format!("attn_cocorr_o{t}"),
+            op_func: "multiply",
+            rows: RowCount::of_head_major_rows(q_rows),
+            cols: BlockCols::of_head_dim(hd),
+            inputs: &[
+                In::full(&run_o_h).ew(),
+                In::col(&hm_rows(&bufs.corr, q_rows)).ew(),
+            ],
+            o: &otmp_h,
+            out_offset: DevOff::ZERO.into(),
+        },
+        ctx.sym_id_base,
+        ctx.layout,
+    ));
+    (otmp_h, run_o_h)
 }
 
 /// ⭐⭐⭐ A PROMPT CHUNK'S PROBABILITIES NEVER LEAVE LX — THREE HBM PASSES OVER THE SCORE BLOCK, NOT SIX.
@@ -3283,15 +3987,16 @@ struct PromptProbs<'a> {
 /// emitter's core-local read law proves at build that each core reads exactly the slice it wrote. The
 /// partials then add into the denominator. MEASURED before this (granite-2b fp16, 256 rows, ~10k tokens): the
 /// chunk's attention group was 59% of prefill, HBM-bound at ~135 GB/s over six passes.
-fn prompt_probabilities_in_lx(
-    ops: &mut Vec<EmittedOp>,
-    a: PromptProbs<'_>,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> Result<(), SuperDscError> {
+fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
+    ctx: &mut EmitCtx<'_>,
+    a: PromptProbs<'_, NQH, NKVH, HD>,
+    // The proof the carry is seeded — this walk's `ocorr` reads the PRE-update `run_o`, so it is a
+    // body program of the chain, not a seed.
+    carry: SeededCarry,
+) -> Result<SeededCarry, SuperDscError> {
     let PromptProbs {
         t,
-        hd,
+        geom,
         mq,
         blocks,
         q_rows,
@@ -3300,6 +4005,8 @@ fn prompt_probabilities_in_lx(
         bufs,
         cb,
     } = a;
+    // Destructured ONCE, at the door — the class's head dim, spent as a value.
+    let hd = geom.hd();
     use crate::addr::DevOff;
     use crate::superdsc_opspec::EpilogueOpFunc;
     // A row block's rows: a kv head's `gqa·mq` at one slab, a query head's `mq` above it.
@@ -3316,27 +4023,14 @@ fn prompt_probabilities_in_lx(
             ))
         })
     };
-    // `ocorr` reads the PRE-update `run_o`, so it precedes every value matmul (the fold block's order).
-    ops.push(assemble_pointwise_broadcast_off(
-        &format!("attn_cocorr_o{t}"),
-        "multiply",
-        all_rows,
-        BlockCols::of_head_dim(hd),
-        &[
-            In::full(&fl(&bufs.run_o, q_rows, hd)).ew(),
-            In::col(&hm_rows(&bufs.corr, q_rows)).ew(),
-        ],
-        &fl(&bufs.otmp, q_rows, hd),
-        DevOff::ZERO,
-        sym_id_base,
-        layout,
-    ));
-    let (otmp_h, run_o_h) = (fl(&bufs.otmp, q_rows, hd), fl(&bufs.run_o, q_rows, hd));
+    // The pre-update correction and the ping-pong pair it hands the value parts, minted by the
+    // one emitter that pushes the op ([`emit_pre_update_correction`] — the ORDER law).
+    let (otmp_h, run_o_h) = emit_pre_update_correction(ctx, t, q_rows, geom, &carry, bufs);
     let parts: Vec<crate::sdsc_abstract::ChunkPart> = chunk
         .slot_parts(prompt_lx_part_pages(chunk, g_rows))
         .collect();
     let n = parts.len();
-    let n_slabs = RowBlockValue::slabs(blocks, hd);
+    let n_slabs = RowBlockValue::slabs(blocks, geom);
     for b in 0..blocks.count() {
         // Block `b`'s rows are the `first_head(b)·mq`-th on of the head-major stream.
         let (kvh, h0, bn) = (
@@ -3346,46 +4040,55 @@ fn prompt_probabilities_in_lx(
         );
         for (p, part) in parts.iter().enumerate() {
             let pc = corner(part.probs_corner(blocks, b), "a row block's score part")?;
-            let (pw, ps) = (BlockCols::of_chunk_part(*part), part.slots());
-            ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_cesub_{bn}_s{p}_o{t}"),
-                "subtract",
-                grp_rows,
-                pw,
-                &[
-                    // The score block at its CHUNK-FRAME part corner — the FULL `[q_rows, slots]`
-                    // buffer, not the block-shaped `g_rows` annotation. `cesub` below is core-local
-                    // LX, addressed at its pin (offset 0), so ITS handle stays block-shaped.
-                    In::sliced(&rb(&cb.csc, q_rows, chunk.slots()), pc).ew(),
-                    In::col_at(&hm_rows(&bufs.run_m, q_rows), row_step(h0)).ew(),
-                ],
-                &rb(&cb.cesub, g_rows, ps),
-                DevOff::ZERO,
-                sym_id_base,
-                layout,
+            // The value kernel's rows over the part — the gathered V scratch is read at the part's
+            // own rows (the same door the HBM-gather value leg takes).
+            let (pw, v_rows) = (
+                BlockCols::of_chunk_part(*part),
+                crate::sdsc_abstract::VKernelRows::of_chunk_part(*part),
+            );
+            ctx.ops.push(assemble_pointwise_broadcast_off(
+                PointwiseFacts {
+                    op_name: &format!("attn_cesub_{bn}_s{p}_o{t}"),
+                    op_func: "subtract",
+                    rows: grp_rows,
+                    cols: pw,
+                    inputs: &[
+                        // The score block at its CHUNK-FRAME part corner — the FULL `[q_rows, slots]`
+                        // buffer, not the block-shaped `g_rows` annotation. `cesub` below is core-local
+                        // LX, addressed at its pin (offset 0), so ITS handle stays block-shaped.
+                        In::sliced(&rb(&cb.csc, all_rows, BlockCols::of_chunk(chunk)), pc).ew(),
+                        In::col_at(&hm_rows(carry.m(), q_rows), row_step(h0)).ew(),
+                    ],
+                    o: &rb(&cb.cesub, grp_rows, pw),
+                    out_offset: DevOff::ZERO.into(),
+                },
+                ctx.sym_id_base,
+                ctx.layout,
             ));
-            ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_cexp_{bn}_s{p}_o{t}"),
-                "exp",
-                grp_rows,
-                pw,
-                &[In::sliced(&rb(&cb.cesub, g_rows, ps), DevOff::ZERO).ew()],
-                &rb(&cb.cexp, g_rows, ps),
-                DevOff::ZERO,
-                sym_id_base,
-                layout,
+            ctx.ops.push(assemble_pointwise_broadcast_off(
+                PointwiseFacts {
+                    op_name: &format!("attn_cexp_{bn}_s{p}_o{t}"),
+                    op_func: ExpBase::E.op_func(),
+                    rows: grp_rows,
+                    cols: pw,
+                    inputs: &[In::sliced(&rb(&cb.cesub, grp_rows, pw), DevOff::ZERO).ew()],
+                    o: &rb(&cb.cexp, grp_rows, pw),
+                    out_offset: DevOff::ZERO.into(),
+                },
+                ctx.sym_id_base,
+                ctx.layout,
             ));
             // One part: the whole chunk's sum, straight into the denominator.
             let sum_into = if n == 1 { &bufs.bsum } else { &cb.red[p] };
             let cbsum_op = format!("attn_cbsum_{bn}_s{p}_o{t}");
-            ops.push(assemble_reduce_off(
+            ctx.ops.push(assemble_reduce_off(
                 &cbsum_op,
                 "sum",
                 grp_rows,
                 pw,
                 win_reduce_data(
-                    layout,
-                    &rb(&cb.cexp, g_rows, ps),
+                    ctx.layout,
+                    &rb(&cb.cexp, grp_rows, pw),
                     DevOff::ZERO,
                     grp_rows,
                     pw,
@@ -3393,65 +4096,71 @@ fn prompt_probabilities_in_lx(
                 )
                 .map_err(SuperDscError)?,
                 win_reduce_accum(
-                    layout,
+                    ctx.layout,
                     &hm_rows(sum_into, q_rows),
                     row_step(h0),
                     grp_rows,
                     &format!("{cbsum_op}: denominator"),
                 )
                 .map_err(SuperDscError)?,
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
             let (out, addend) = if p % 2 == 0 {
-                (&bufs.run_o, &otmp_h)
+                (carry.o(), &otmp_h)
             } else {
-                (&bufs.otmp, &run_o_h)
+                (bufs.otmp.as_str(), &run_o_h)
             };
             // `run_o_b = P_b · V_kvh + otmp_b` — the `stridedadd` epilogue is the online-softmax update. One
             // op per slab above one slab, each reading the same core-local `cexp`.
             for s in 0..n_slabs {
-                let v = RowBlockValue::of(blocks, b, s, mq, q_rows, hd);
+                let v = RowBlockValue::of(blocks, b, s, mq, q_rows, geom);
                 let kc = corner(part.value_corner(kvh, s), "a kv head's value part")?;
                 let slab = if n_slabs == 1 {
                     String::new()
                 } else {
                     format!("s{s}")
                 };
-                ops.push(assemble_matmul_off_maybe_epilogue(
+                ctx.ops.push(assemble_matmul_off_maybe_epilogue(
                     &format!("attn_cov_{bn}{slab}_k{p}_o{t}"),
                     v.m,
                     v.n,
                     MatK::of_kv_window(pw),
                     MatY::unbatched(),
                     bmm_form,
-                    &rb(&cb.cexp, g_rows, ps),
+                    &rb(&cb.cexp, grp_rows, pw),
                     DevOff::ZERO,
-                    &Stk::<KernelTag>::kernel(ps as usize, v.v_cols as usize, &cb.gv),
+                    &Stk::<KernelTag>::kernel(
+                        v_rows.rows() as usize,
+                        v.v_cols.n_out_cols(),
+                        &cb.gv,
+                    ),
                     kc,
-                    &rb(out, q_rows, hd),
+                    &rb(out, all_rows, BlockCols::of_head_dim(hd)),
                     v.out_off,
                     Some((addend, v.out_off)),
                     EpilogueOpFunc::StridedAdd,
                     &[],
                     false,
-                    sym_id_base,
-                    layout,
+                    ctx.sym_id_base,
+                    ctx.layout,
                 ));
             }
         }
     }
     if n.is_multiple_of(2) {
-        ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_covsum_o{t}"),
-            "identity",
-            all_rows,
-            BlockCols::of_head_dim(hd),
-            &[In::full(&otmp_h).ew()],
-            &run_o_h,
-            DevOff::ZERO,
-            sym_id_base,
-            layout,
+        ctx.ops.push(assemble_pointwise_broadcast_off(
+            PointwiseFacts {
+                op_name: &format!("attn_covsum_o{t}"),
+                op_func: "identity",
+                rows: all_rows,
+                cols: BlockCols::of_head_dim(hd),
+                inputs: &[In::full(&otmp_h).ew()],
+                o: &run_o_h,
+                out_offset: DevOff::ZERO.into(),
+            },
+            ctx.sym_id_base,
+            ctx.layout,
         ));
     }
     // The partials add into the denominator, never in place: alternating between the two accumulators
@@ -3465,52 +4174,58 @@ fn prompt_probabilities_in_lx(
         } else {
             cb.red[n + 1].as_str()
         };
-        ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_cbsum_k{p}_o{t}"),
-            "add",
-            all_rows,
-            stick,
-            &[
-                In::full(&hm_rows(acc, q_rows)).ew(),
-                In::full(&hm_rows(&cb.red[p], q_rows)).ew(),
-            ],
-            &hm_rows(out, q_rows),
-            DevOff::ZERO,
-            sym_id_base,
-            layout,
+        ctx.ops.push(assemble_pointwise_broadcast_off(
+            PointwiseFacts {
+                op_name: &format!("attn_cbsum_k{p}_o{t}"),
+                op_func: "add",
+                rows: all_rows,
+                cols: stick,
+                inputs: &[
+                    In::full(&hm_rows(acc, q_rows)).ew(),
+                    In::full(&hm_rows(&cb.red[p], q_rows)).ew(),
+                ],
+                o: &hm_rows(out, q_rows),
+                out_offset: DevOff::ZERO.into(),
+            },
+            ctx.sym_id_base,
+            ctx.layout,
         ));
         acc = out;
     }
     // run_l = run_l*corr + bsum — the fold block's own pair.
-    ops.push(assemble_pointwise_broadcast_off(
-        &format!("attn_clcorr_o{t}"),
-        "multiply",
-        all_rows,
-        stick,
-        &[
-            In::full(&hm_rows(&bufs.run_l, q_rows)).ew(),
-            In::full(&hm_rows(&bufs.corr, q_rows)).ew(),
-        ],
-        &hm_rows(&bufs.ltmp, q_rows),
-        DevOff::ZERO,
-        sym_id_base,
-        layout,
+    ctx.ops.push(assemble_pointwise_broadcast_off(
+        PointwiseFacts {
+            op_name: &format!("attn_clcorr_o{t}"),
+            op_func: "multiply",
+            rows: all_rows,
+            cols: stick,
+            inputs: &[
+                In::full(&hm_rows(carry.l(), q_rows)).ew(),
+                In::full(&hm_rows(&bufs.corr, q_rows)).ew(),
+            ],
+            o: &hm_rows(&bufs.ltmp, q_rows),
+            out_offset: DevOff::ZERO.into(),
+        },
+        ctx.sym_id_base,
+        ctx.layout,
     ));
-    ops.push(assemble_pointwise_broadcast_off(
-        &format!("attn_cladd_o{t}"),
-        "add",
-        all_rows,
-        stick,
-        &[
-            In::full(&hm_rows(&bufs.ltmp, q_rows)).ew(),
-            In::full(&hm_rows(&bufs.bsum, q_rows)).ew(),
-        ],
-        &hm_rows(&bufs.run_l, q_rows),
-        DevOff::ZERO,
-        sym_id_base,
-        layout,
+    ctx.ops.push(assemble_pointwise_broadcast_off(
+        PointwiseFacts {
+            op_name: &format!("attn_cladd_o{t}"),
+            op_func: "add",
+            rows: all_rows,
+            cols: stick,
+            inputs: &[
+                In::full(&hm_rows(&bufs.ltmp, q_rows)).ew(),
+                In::full(&hm_rows(&bufs.bsum, q_rows)).ew(),
+            ],
+            o: &hm_rows(carry.l(), q_rows),
+            out_offset: DevOff::ZERO.into(),
+        },
+        ctx.sym_id_base,
+        ctx.layout,
     ));
-    Ok(())
+    Ok(carry)
 }
 
 /// ⛔⛔⛔ NO SPLIT-KV CHUNK OP IS TIME-TILED — a bake refusal naming each op that is, never a card run.
@@ -3540,6 +4255,76 @@ fn no_chunk_op_is_time_tiled(ops: &[EmittedOp], t: u32) -> Result<(), SuperDscEr
     }
 }
 
+/// ⭐⭐⭐⭐⭐ THE BUNDLE'S WHOLE FACT SET — the top door's single counterpart to the doors'
+/// [`DoorFacts`]: every field is a fact the bundle's attention emission reads, grouped exactly as
+/// the boundary frames them — the op's identity, the geometry/row/extent carriers their own laws
+/// already type, the eight operand names, the gather's coupling, the split-KV chunk, the output's
+/// placement, and the two regime facts. This deletes the sixteen-parameter positional run every
+/// caller spelled — the arrangement where a name, a mask or a regime flag transposes silently —
+/// and the sink pair (`sym_id_base`/`layout`) stays in the signature BESIDE the carrier, not in
+/// it: the `EmitCtx` mint inside this door owns the sink, and a sink is not a bundle fact.
+pub struct AttnFacts<'a, const NQH: u32, const NKVH: u32, const HD: u32> {
+    pub t: u32,
+    /// ⛔⛔⛔ THE HEAD GEOMETRY IS NOT THREE BARE `u32` PARAMETERS ANY MORE. `nqh`/`nkvh`/`hd` arrive
+    /// as ONE `AttnGeometry`, whose consts the model's parsed `config.json` reached through
+    /// `model_geometry::with_config_attn_geometry` — so an nqh/nkvh transposition, or a head dim paired
+    /// with another model's head counts, is a type that does not exist rather than a slot
+    /// swap. The GQA divisibility proof rides on the type: a non-dividing pair fails the BUILD.
+    pub geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    /// ⛔⛔⛔ NEITHER `mq` NOR `mq_pad` IS A BARE `u32` PARAMETER ANY MORE — and neither is the
+    /// shared-buffer row count derived HERE any more. The width, its pad AND the row laws arrive
+    /// FUSED in one `AttnBundleRows<NQH>`, minted at the bundle's parse boundary
+    /// (`attn_bundle_rows`): a decode width is a ladder CONST there (`Rung<MQ>`), so its pad and
+    /// every row extent — `MaskRows = NQH*MQ`, the mask shape's row count — are the COMPILER's
+    /// arithmetic (`RungRowLaws`); a prefill width is the runtime law through the same doors. So
+    /// this fact set has no pair of row-count integers left to swap — the arrangement the `mq_pad`
+    /// parameter swap lived in — no way to pair a width with a pad computed from some other width,
+    /// and no second `nqh * mq` multiplication in this function for the mask staging to drift from.
+    /// The `NQH` on the carrier ties it to THIS geometry: a frame minted for another model's head
+    /// count is a type error at this slot. (Historically: `mq_pad` was a second `u32` two positions
+    /// from `mq` in a run of seven, reconciled only by a `debug_assert_eq!` the release bake
+    /// compiles out; `mq_pad` and `nqh*mq` are EQUAL at nqh=32/mq=2 and diverge from mq=4 up —
+    /// exactly the width boundary where the card's batch decode started failing.)
+    pub bundle_rows: crate::sdsc_abstract::AttnBundleRows<NQH>,
+    /// ⭐ THE STORAGE/SWEEP PAIR, ON ONE CARRIER — `cap` (what the resident cache holds) and the
+    /// sweep this bundle takes of it traveled as two adjacent bare `u32`s, swappable at every call
+    /// site exactly where `ActiveCap`'s own doc says the confusion lives. The carrier fixes the
+    /// order at one mint; the door below reads the fields once, typed.
+    pub extent: crate::sdsc_abstract::KvExtent,
+    pub qs: &'a str,
+    pub new_k_scaled: &'a str,
+    pub new_v: &'a str,
+    pub kct: &'a str,
+    pub vc: &'a str,
+    pub pmask: &'a str,
+    pub cmask: &'a str,
+    /// ⭐⭐⭐⭐⭐ THE KV BLOCK INDEX TENSOR'S NAME — `Some` makes the PREFIX score leg's KV read a
+    /// HARDWARE GATHER; `None` emits exactly what this bundle emitted before the gather existed.
+    ///
+    /// ⛔ THE `Option` IS THE COUPLING, NOT A SWITCH. A gathered read takes its base from this tensor's
+    /// entries, so an emission that gathers without a host staging them addresses block 0 for every
+    /// row — every request reading row 0's keys, fluent and wrong. Making the NAME the condition means
+    /// the emitter cannot gather unless a caller has a tensor to name, which is the same caller that
+    /// must fill it. There is no arrangement in which one is present and the other is not.
+    pub kv_block_index: Option<&'a str>,
+    /// ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK — `Some` attends every resident page in ONE pass through a kv-head-major
+    /// gather ([`assemble_attn_chunk`]) instead of the per-page fold; the index tensor above is then the
+    /// CHUNK's table. `None` emits exactly the per-page fold this bundle emitted before.
+    pub chunk: Option<crate::sdsc_abstract::ChunkScratch>,
+    pub out_id: crate::place::PlaceId,
+    /// TRUE when these rows are separate requests. Only the prefix mask cares: a prompt's rows share
+    /// one resident history, requests each have their own.
+    pub rows_are_requests: bool,
+    /// ⭐⭐⭐ WHETHER THE FINALIZE HANDS `out` TO o_proj IN THE SLAB-MAJOR ORDER — the caller-side
+    /// statement of the head-major restructure, minted where the bundle's facts are (the spyre door's
+    /// `BundleAttnParams::headmajor_handoff`; a triton producer's caller states its own). TRUE only
+    /// for the single-row (mq == 1) body of a model whose head dim spans more than one feature slab
+    /// and whose o matmul is fp8 W8A8 — the conditions the permuted o_proj copy is staged for. The
+    /// matmul half of the contract (the B-operand swap to that copy) keys on the SAME fact at the
+    /// matmul door, so neither half can be emitted without the other.
+    pub headmajor_handoff: bool,
+}
+
 /// Assemble the full AttnDecode node: ONE algorithm for any `mq`. `qs` is Q ALREADY multiplied by
 /// sqrt_scale (the caller resolves that constant from the BundleLayout registry before calling
 /// this). `new_k_scaled` is this step's roped new-K, ALSO already ·sqrt_scale (torch-spyre's
@@ -3550,71 +4335,41 @@ fn no_chunk_op_is_time_tiled(ops: &[EmittedOp], t: u32) -> Result<(), SuperDscEr
 /// (prefix validity) and `cmask` (new-block causal) are the worker-staged masks (see the module doc's
 /// STAGE 1/2 note — `cmask` is only numerically exact at `mq==1`, STAGE 2 closes the mq>1 gap).
 /// Returns the ops in emission order; the caller still runs the cache-write + post-restickify steps.
-#[allow(clippy::too_many_arguments)]
 pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
-    t: u32,
-    // ⛔⛔⛔ THE HEAD GEOMETRY IS NOT THREE BARE `u32` PARAMETERS ANY MORE. `nqh`/`nkvh`/`hd` arrive
-    // as ONE `AttnGeometry`, whose consts the model's parsed `config.json` reached through
-    // `model_geometry::with_config_attn_geometry` — so an nqh/nkvh transposition, or a head dim paired
-    // with another model's head counts, is a type that does not exist rather than a signature slot
-    // swap. The GQA divisibility proof rides on the type: a non-dividing pair fails the BUILD.
-    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
-    // ⛔⛔⛔ NEITHER `mq` NOR `mq_pad` IS A BARE `u32` PARAMETER ANY MORE — and neither is the
-    // shared-buffer row count derived HERE any more. The width, its pad AND the row laws arrive
-    // FUSED in one `AttnBundleRows<NQH>`, minted at the bundle's parse boundary
-    // (`attn_bundle_rows`): a decode width is a ladder CONST there (`Rung<MQ>`), so its pad and
-    // every row extent — `MaskRows = NQH*MQ`, the mask shape's row count — are the COMPILER's
-    // arithmetic (`RungRowLaws`); a prefill width is the runtime law through the same doors. So
-    // this signature has no pair of row-count integers left to swap — the arrangement the `mq_pad`
-    // parameter swap lived in — no way to pair a width with a pad computed from some other width,
-    // and no second `nqh * mq` multiplication in this function for the mask staging to drift from.
-    // The `NQH` on the carrier ties it to THIS geometry: a frame minted for another model's head
-    // count is a type error at this slot. (Historically: `mq_pad` was a second `u32` two positions
-    // from `mq` in a run of seven, reconciled only by a `debug_assert_eq!` the release bake
-    // compiles out; `mq_pad` and `nqh*mq` are EQUAL at nqh=32/mq=2 and diverge from mq=4 up —
-    // exactly the width boundary where the card's batch decode started failing.)
-    bundle_rows: crate::sdsc_abstract::AttnBundleRows<NQH>,
-    cap: u32,
-    active_cap: u32,
-    qs: &str,
-    new_k_scaled: &str,
-    new_v: &str,
-    kct: &str,
-    vc: &str,
-    pmask: &str,
-    cmask: &str,
-    // ⭐⭐⭐⭐⭐ THE KV BLOCK INDEX TENSOR'S NAME — `Some` makes the PREFIX score leg's KV read a
-    // HARDWARE GATHER; `None` emits exactly what this bundle emitted before the gather existed.
-    //
-    // ⛔ THE `Option` IS THE COUPLING, NOT A SWITCH. A gathered read takes its base from this tensor's
-    // entries, so an emission that gathers without a host staging them addresses block 0 for every
-    // row — every request reading row 0's keys, fluent and wrong. Making the NAME the condition means
-    // the emitter cannot gather unless a caller has a tensor to name, which is the same caller that
-    // must fill it. There is no arrangement in which one is present and the other is not.
-    kv_block_index: Option<&str>,
-    // ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK — `Some` attends every resident page in ONE pass through a kv-head-major
-    // gather ([`assemble_attn_chunk`]) instead of the per-page fold; the index tensor above is then the
-    // CHUNK's table. `None` emits exactly the per-page fold this bundle emitted before.
-    chunk: Option<crate::sdsc_abstract::ChunkScratch>,
-    out_id: crate::place::PlaceId,
-    // TRUE when these rows are separate requests. Only the prefix mask cares: a prompt's rows share
-    // one resident history, requests each have their own.
-    rows_are_requests: bool,
-    // ⭐⭐⭐ WHETHER THE FINALIZE HANDS `out` TO o_proj IN THE SLAB-MAJOR ORDER — the caller-side
-    // statement of the head-major restructure, minted where the bundle's facts are (the spyre door's
-    // `BundleAttnParams::headmajor_handoff`; a triton producer's caller states its own). TRUE only
-    // for the single-row (mq == 1) body of a model whose head dim spans more than one feature slab
-    // and whose o matmul is fp8 W8A8 — the conditions the permuted o_proj copy is staged for. The
-    // matmul half of the contract (the B-operand swap to that copy) keys on the SAME fact at the
-    // matmul door, so neither half can be emitted without the other.
-    headmajor_handoff: bool,
+    facts: AttnFacts<'_, NQH, NKVH, HD>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, SuperDscError> {
+    // ⭐ THE BUNDLE'S FACTS, DESTRUCTURED ONCE AT THE DOOR — every field restates the local the
+    // body below already reads (the same names the parameter list spelled), so the emission is
+    // the same op stream on the same values. The sink pair stays in the signature: the EmitCtx
+    // mint below owns it.
+    let AttnFacts {
+        t,
+        geom,
+        bundle_rows,
+        extent,
+        qs,
+        new_k_scaled,
+        new_v,
+        kct,
+        vc,
+        pmask,
+        cmask,
+        kv_block_index,
+        chunk,
+        out_id,
+        rows_are_requests,
+        headmajor_handoff,
+    } = facts;
     // Destructured ONCE, at the door. The boundary is where the swap happened (two `u32`s in a row of
     // seven); the body below is unchanged arithmetic on the same numbers.
     let (nqh, nkvh, hd) = (geom.nqh(), geom.nkvh(), geom.hd());
     let width = bundle_rows.width();
+    // The extent pair, read once at the door as the slot counts they are — the sweep feeds the
+    // window and mask laws directly below, so no `SlotCount::new` re-mint sits between the
+    // carrier and its consumers.
+    let (cap, active_cap) = (extent.cap(), extent.active());
 
     // This function's own typed head count — same reason as the block assembler's: `QueryHead::all` is
     // the only door, so a head reaching an offset is in range by construction. Nonzero is the
@@ -3645,6 +4400,17 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     let nsub = mq_pad_t.sub_blocks();
     let mut ops: Vec<EmittedOp> = Vec::new();
 
+    // ⭐ THE EMITTER CONTEXT, MINTED ONCE AT THIS DOOR — the sink this function owns, with its
+    // pair parameters as the counter and the placement authority (the mint-once-at-door pattern).
+    // Every emitter below threads the ONE `&mut ctx`; the three references inside are the same
+    // three references that traveled as parameters, so the op stream, the ids and the placements
+    // are identical.
+    let mut ctx = EmitCtx {
+        ops: &mut ops,
+        sym_id_base,
+        layout,
+    };
+
     // The group size comes from the geometry's proof-carrying const — there is no `.max(1)` fudge
     // left, because a pair it would have fudged cannot instantiate this function.
     let gqa = geom.gqa();
@@ -3658,8 +4424,8 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // The op's operand SPELLING, rendered from the identity the layout is keyed by.
     let out_s = out_id.to_string();
     let out = out_s.as_str();
-    let new_kt = crate::placement::syn(layout, out_id.synth(R::NewKt));
-    if let Some(l) = layout {
+    let new_kt = crate::placement::syn(ctx.layout, out_id.synth(R::NewKt));
+    if let Some(l) = ctx.layout {
         // `slots()`, not the bare number: this axis is the block's SLOT extent, which happens to equal its
         // padded row count because each new token occupies exactly one slot.
         l.synth(
@@ -3682,13 +4448,12 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // THE SLAB COUNT IS THE ONLY QUESTION THIS LOOP ASKS, so it is answered by the `hd / lanes` law
     // directly — there is no kv-side `BlockNests` to hold row/width slots the kv stream cannot
     // truthfully fill (its rows are the chunk's `mq`, not the shared-buffer extent a nest frames).
-    let nslab =
-        crate::addr::Shape::<0, 0, 0, 0>::slabs_of(hd, crate::superdsc_opspec::Df::Fp16).get();
+    let nslab = crate::addr::Shape::<HD, 0, 0, 0>::slabs(crate::superdsc_opspec::Df::Fp16).get();
     for kvh in 0..nkvh {
         for rw in mq_pad_t.row_windows() {
             let j = rw.index();
             for sl in 0..nslab {
-                ops.push(assemble_restickify_kt_2d(
+                ctx.ops.push(assemble_restickify_kt_2d(
                     // Keep the pre-sub-blocking name at nsub==1 so those bundles stay BYTE-IDENTICAL (op
                     // names are bundle content): decode and every <=64-row chunk need no re-validation.
                     &if nsub.is_single() && nslab == 1 {
@@ -3708,7 +4473,11 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     // law, still INSIDE this tensor). The mint bounds every (kvh, slab, sub-block) tile's
                     // flat run against THAT, so a corner arithmetic that walks past the last head's last
                     // slab is a build failure here rather than a clean bake reading the next tensor.
-                    &rb(new_k_scaled, mq_pad_t.rows().row_axis_extent(), nkvh * hd),
+                    &rb(
+                        new_k_scaled,
+                        RowCount::of_padded_chunk_rows(mq_pad_t.rows()),
+                        BlockCols::of_feature_cols(nkvh * hd),
+                    ),
                     // PER-KV-HEAD BASE = `kvh * mq * hd` (2026-07-28, CORRECTED from a briefly-committed
                     // `mq_pad` version that regressed decode). `new_k_scaled` inherits its kv-head stride from
                     // RoPE, this tensor family's producer, which writes head h row r at
@@ -3735,7 +4504,11 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     // laid end to end (the synth above reserves exactly `[nkvh, hd, mq_pad]`), so the
                     // handle states the whole flat run. The LAST sub-block's tile ends exactly at the
                     // scratch's last element — fits with equality, which is what the mint checks.
-                    &rb(&new_kt, 1, nkvh * hd * mq_pad_t.slots().slot_axis_extent()),
+                    &rb(
+                        &new_kt,
+                        RowCount::of_broadcast_row(),
+                        BlockCols::of_feature_cols(nkvh * hd * mq_pad_t.slots().slot_axis_extent()),
+                    ),
                     // DEST: `[nkvh, hd, mq_pad]` with the stick on the SLOT axis, so kv head `kvh` and
                     // feature `sl*stick` are coordinates and the `j`-th sub-block is slot window `j*stick`.
                     // The law places the plane; the previous `sl*mq_pad*stick` guessed it and was wrong above
@@ -3752,8 +4525,8 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     .at(Idx::<crate::addr::Feat>::n(FeatIdx::of_slab(sl).get()))
                     .slab(rw.index())
                     .dev(),
-                    sym_id_base,
-                    layout,
+                    ctx.sym_id_base,
+                    ctx.layout,
                 ));
             }
         }
@@ -3771,20 +4544,25 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // the runtime law — this function derives no row extent of its own either way. COLS is a
     // const generic, so a block that is not whole sticks cannot be NAMED; the zero-head and
     // zero-row refusals live at the boundary's mint, not here.
-    let mask_shape = {
-        use crate::sdsc_abstract::SlotCount;
+    //
+    // ⭐ AND IT LEAVES THE DOOR AS THE SWEEP-LAW TOKEN ([`SweepLaw`]) — the declaration every
+    // per-row prefix fold's mask corner derives from. The door consumes the shape's name: below
+    // it, `rows` crosses once (read off the token) and no call site holds a shape to derive a
+    // corner from.
+    let law = {
         let shape = bundle_rows.mask_shape();
         let per_page = shape.cols().get();
-        if !shape.sweep_fits(SlotCount::new(active_cap)) {
+        if !shape.sweep_fits(active_cap) {
             return Err(SuperDscError(format!(
-                "prefix mask: one fold pass sweeps active_cap={active_cap} columns but a mask block \
+                "prefix mask: one fold pass sweeps active_cap={} columns but a mask block \
                  holds only {per_page} — the pass would read the NEXT block's validity rows, i.e. \
-                 another pass's history. Block the mask by active_cap, or cap the sweep at a page."
+                 another pass's history. Block the mask by active_cap, or cap the sweep at a page.",
+                active_cap.get()
             )));
         }
-        shape
+        SweepLaw::mint(shape)
     };
-    let pool = crate::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize);
+    let pool = crate::sdsc_abstract::PagedKvPool::of_geometry(geom);
     // ⭐ ONE LAW FOR THE PRODUCT, AND ONE EXIT FOR ITS VALUE. The shape's `MaskRows` is what the
     // HOST stages the mask with, what `PrefixMaskShape` blocks by, and what every reduce and
     // pointwise op here sweeps — read off the boundary's one carrier, so this function holds no
@@ -3792,16 +4570,23 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // (`RungRowLaws::MASK_ROWS`), a prefill chunk's was the runtime law's, both upstream.
     // TYPED from here down: the value stays `MaskRows` and only the synth extents (a bare-`u32` API)
     // unwrap it.
-    let rows = mask_shape.rows();
+    let rows = law.rows();
 
     // Every buffer's spelling is a rendering of `out_id.synth(role)` — the SAME value the layout
     // allocator is keyed by, so an op's operand and its reservation have one preimage.
-    let syn = |r: R| crate::placement::syn(layout, out_id.synth(r));
-    // ⛔⛔⛔ EVERY FIELD OF `BlockBufs` MUST BE DECLARED TO THE LAYOUT BELOW. A buffer that is
-    // NAMED here but never passed to `synth` is not merely undeclared — `resolve_seg_base`
-    // bump-allocates it on first reference at THAT ACCESS's size, so a per-head window reserves one
-    // head where `heads` are written and the tensor aliases its neighbour. `RunM`/`RunL` were
-    // dropped from that list once, and the symptom was a device that stopped responding.
+    //
+    // ⛔ THE CLOSURE TAKES THE LAYOUT BY COPY, not by borrowing `ctx.layout`: `syn` outlives the
+    // emitter calls below that re-borrow the whole `&mut ctx`, and a closure-held shared borrow of
+    // the field would refuse them (the E0502 class). A copy is exact — `Option<&BundleLayout>` is
+    // `Copy`, and this is a read-only view of the one authority.
+    let syn_layout = ctx.layout;
+    let syn = |r: R| crate::placement::syn(syn_layout, out_id.synth(r));
+    // ⛔⛔⛔ EVERY BUFFER NAMED HERE — `BlockBufs`'s ten fields and `StateNames`'s three — MUST BE
+    // DECLARED TO THE LAYOUT BELOW. A buffer that is NAMED here but never passed to `synth` is
+    // not merely undeclared — `resolve_seg_base` bump-allocates it on first reference at THAT
+    // ACCESS's size, so a per-head window reserves one head where `heads` are written and the
+    // tensor aliases its neighbour. `RunM`/`RunL` were dropped from that list once, and the
+    // symptom was a device that stopped responding.
     let bufs = BlockBufs {
         sc: syn(R::Sc),
         bmax: syn(R::BMax),
@@ -3813,16 +4598,22 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         bsum: syn(R::BSum),
         otmp: syn(R::OTmp),
         ltmp: syn(R::LTmp),
-        run_m: syn(R::RunM),
-        run_l: syn(R::RunL),
-        run_o: syn(R::RunO),
     };
-    if let Some(l) = layout {
+    // ⭐ THE RECURRENCE STATE'S NAMES — the ONE allocation (the same `syn`, the same roles the
+    // layout declares through `STICK_WIDE_BUFS`/`HEAD_WIDE_BUFS`), held by the carrier the chain
+    // threads: a seed door wraps it into a [`SeededCarry`], the folds and the chunk body read it
+    // off the proof, the finalize reads the hand-off's two — and `BlockBufs` does not carry these
+    // names at all. `syn` is a pure function of `(layout, out_id, role)`, so the strings are the
+    // same ones the `BlockBufs` literal used to mint inline.
+    let state = StateNames {
+        m: syn(R::RunM),
+        l: syn(R::RunL),
+        o: syn(R::RunO),
+    };
+    if let Some(l) = ctx.layout {
         // The shared buffers' extents: MaskRows rows throughout; the state buffers are ONE STICK
         // wide and the output accumulators HEAD-DIM wide — the same value only at hd == 64.
         for tnm in [
-            &bufs.run_m,
-            &bufs.run_l,
             &bufs.bmax,
             &bufs.newm,
             &bufs.corr,
@@ -3924,7 +4715,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     let score_form = SharedKernelBmmForm::of_score_leg(
         rows_are_requests,
         width.mq(),
-        crate::addr::Shape::<0, 0, 0, 0>::slabs_of(hd, Df::Fp16),
+        crate::addr::Shape::<HD, 0, 0, 0>::slabs(Df::Fp16),
     );
     let bmm_form = SharedKernelBmmForm::of_attn_rows(rows_are_requests, width.mq());
     // ⭐⭐⭐ NO HEAD-DIM GATE. This arm required `hd == one stick`, and the reason was ONE stride: the
@@ -3966,10 +4757,10 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // written, the score leg takes the per-head arm — a gate on "is the contraction one stick", which
     // is the form's REAL precondition, not on the head dim.
     let batched_kv = batched.map(|()| BatchedKv {
-        nkvh,
         // ⭐ UNCONDITIONAL NOW: the score leg contracts ONE SLAB per op, so its contraction is one
         // stick at every head dim and the witness needs no extent to inspect. The head-dim gate this
-        // replaces is gone, not widened — `of_contraction` remains for legs that have not been split.
+        // replaces is gone, not widened — and the extent-inspecting mint is deleted with it, so a leg
+        // that has not been split has no witness to hand.
         score: Some(OneStickContraction::by_slab_split()),
         // The value leg contracts the kv WINDOW, one stick by construction, so it always batches.
         value: Some(()),
@@ -4093,7 +4884,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     //   forcing `ScoreArm::PerHead` emits 4x the ops (32 of `y=1` instead of 8 of `y=gqa`) at IDENTICAL
     //   launch count (1082), trips and rows, and bs=8 compute went 51.0 → 63.3 ms — +12.3 ms over +8640
     //   op executions = **1.42 µs per op**, against ~28 µs for a fold pass. Op count is ~20x cheaper
-    //   than a pass. (Corollary, unrelated but measured here: `ScoreArm::choose` picks correctly at
+    //   than a pass. (Corollary, unrelated but measured here: `ScoreArm::of_geometry` picks correctly at
     //   hd=64 — the batched arm really is faster on the card, 51.0 vs 63.3, so that cost model needs no
     //   revisit.)
     //
@@ -4144,7 +4935,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // shape declared smaller than the ops write aliases whatever the allocator handed out next.
     let (gkt, gv) = (syn(R::GatherKt), syn(R::GatherV));
     if let Some((_, scratch)) = gather
-        && let Some(l) = layout
+        && let Some(l) = ctx.layout
     {
         for r in [R::GatherKt, R::GatherV] {
             // ⛔ ONE VALUE, NOT A SLICE THE CALLER ASSEMBLES. `&[scratch.rows(), scratch.cols()]` is two
@@ -4159,7 +4950,12 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // other launch keeps the sub-blocks below, byte for byte. The same law (`NewBlockForm::of`) tells the
     // host how to lay out the causal mask this reads.
     let new_form = crate::sdsc_abstract::NewBlockForm::of(mq, hd, rows_are_requests);
-    if new_form == crate::sdsc_abstract::NewBlockForm::Chunk {
+    // ⭐⭐⭐⭐⭐ THE CHAIN'S FIRST LINK, AS A VALUE: whichever form seeds the new-token block mints the
+    // `SeededCarry` every fold below and the finalize at the end require — the chunk form in its own
+    // emitter, the sub-block form at window 0 of each pass. A fold emitted before this line does not
+    // compile; the sequence law this file used to state in prose ("never `first` now") is the
+    // threading.
+    let mut carry: SeededCarry = if new_form == crate::sdsc_abstract::NewBlockForm::Chunk {
         let (sc, esub, exp) = (
             syn(R::NewChunkSc),
             syn(R::NewChunkESub),
@@ -4176,7 +4972,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             cols.get(),
         );
         let g_rows = blocks.rows();
-        if let Some(l) = layout {
+        if let Some(l) = ctx.layout {
             // ⭐⭐ THE WHOLE BLOCK NEVER LEAVES LX — score, `esub` and `exp` are each one core's slice of one
             // row block, reused block after block, exactly as the chunk's `cesub`/`cexp`. Every op over them
             // divides the block's rows alone, so one rows-first slice sizes all three; the read law holds each
@@ -4204,64 +5000,50 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             }
         }
         assemble_new_block_chunk(
-            &mut ops,
+            &mut ctx,
             NewChunkAttn {
                 t,
-                nqh,
-                nkvh,
-                hd,
+                geom,
                 blocks,
                 mq,
                 cols,
+                // The new block's own Kᵗ scratch's pitch, from the pad's own door — the same mint
+                // the seed/fold emitters below take as their `kt_stride` argument.
+                kt_pitch: mq_pad_t.slots().kernel_row_pitch(),
+                // The value kernel's rows over the same block — new_v's kv-head blocks are
+                // [mq_pad, hd], so the chunk form contracts the whole block.
+                v_rows: crate::sdsc_abstract::VKernelRows::of_new_block_chunk(mq_pad_t.slots()),
                 qs,
                 new_kt: &new_kt,
                 new_v,
                 cmask,
                 bmm_form,
-                bufs: &bufs,
+                state: &state,
                 sc: &sc,
                 esub: &esub,
                 exp: &exp,
             },
-            sym_id_base,
-            layout,
-        )?;
-    }
-    // The sub-blocked passes: none when the chunk form above emitted the block.
-    let sub_block_passes = if new_form == crate::sdsc_abstract::NewBlockForm::Chunk {
-        0
-    } else if per_req {
-        mq
+        )?
     } else {
-        1
-    };
-    for r in 0..sub_block_passes {
-        for rw in mq_pad_t.row_windows() {
-            let j = rw.index();
-            assemble_attn_block(
-                &mut ops,
-                t,
-                &{
+        // The sub-blocked passes: the chunk form emitted its block (and minted the carry) in the arm
+        // above; every other launch runs one pass per request row, or one, and window 0 of each pass
+        // seeds.
+        let sub_block_passes = if per_req { mq } else { 1 };
+        let mut seeded: Option<SeededCarry> = None;
+        for r in 0..sub_block_passes {
+            for rw in mq_pad_t.row_windows() {
+                let j = rw.index();
+                // The tag, the two off-closures and the mask corner are hoisted so the seed and fold
+                // doors below share them — the same values one statement earlier, no emission change.
+                let tag = {
                     let b = if nsub.is_single() {
                         "n".to_string()
                     } else {
                         format!("n{j}")
                     };
                     if per_req { format!("{b}_r{r}") } else { b }
-                },
-                nqh,
-                hd,
-                width.mq(),
-                block_rows,
-                qs,
-                score_form,
-                // Sub-block `j` is the 64-column window at plane `j*hd*stick` — the same read the prefix blocks
-                // do into `kct` (`b*hd*stick`), with the Kᵗ scratch's SLOT extent as the full kernel width: this
-                // slot is the kernel's physical pitch (the resident block's value here is `cap`), a SLOT question
-                // — the row count answered it only through the new-block identity `rows == slots`.
-                &new_kt,
-                mq_pad_t.slots().kernel_row_pitch(),
-                |h, sl| {
+                };
+                let kt_off = |h: crate::sdsc_abstract::QueryHead, sl: u32| {
                     let hi = h.get();
                     // `new_kt` is nkvh separate `[hd, mq_pad]` blocks — a block index over the block's own
                     // footprint, plus this row window's slot-stick plane inside it (the MqPad rows/slots
@@ -4280,19 +5062,8 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                         .slab(rw.index())
                         .slab_of::<crate::addr::Feat>(sl)
                         .dev()
-                },
-                // new_v is nkvh-wide now too (dedup, symmetric to new_kt above) — same gqa_kv_head mapping.
-                // PER-KV-HEAD BASE = `kvh * mq * hd` (2026-07-28, CORRECTED from a briefly-committed `mq_pad`
-                // version that regressed decode). Unlike `new_kt` (restickified into a COMPACT
-                // `[nkvh,hd,mq_pad]` layout, where `kvh*hd*mq_pad` IS the right compact per-head base),
-                // `new_v_rep` is never restickified: it keeps the wide `[*, nkvh*hd]` shape whose kv-head
-                // stride RoPE sets to `mq` (`rope_prefill_block_offset`), not `mq_pad`. Decode (mq=1) reduces
-                // to the original `kvh*hd`; prefill (mq=31) gets the `kvh*31*hd` the original bare `kvh*hd`
-                // was missing for kvh>=1.
-                // V rows `[j*stick, (j+1)*stick)` on top of the kv-head base — the prefix side's `b*stick*hd`.
-                new_v,
-                hd,
-                |h, sl| {
+                };
+                let v_off = |h: crate::sdsc_abstract::QueryHead, sl: u32| {
                     let hi = h.get();
                     // `new_v_rep` keeps the wide `[mq, nkvh*hd]` shape RoPE packed, so the kv head is a
                     // COLUMN there, not a block; the row window `j` rides on top.
@@ -4305,21 +5076,10 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                         .at(Idx::<Head>::n(kvh))
                         .slab(sl)
                         .dev()
-                },
-                // This block's score WIDTH: one row window's columns — quantity (3) as columns (each padded
-                // row is one score column), NOT the lane count it shares a value with. The full `mq_pad`
-                // width lives on the kernel's stride, never in this slot.
-                BlockCols::of_row_window(RowWindow::ROWS),
-                // cmask is staged BLOCK-MAJOR: `nsub` blocks of `[rows, stick]`, block `j` holding columns
-                // `[j*stick, (j+1)*stick)`. Required because the mask is read through a FLAT view whose row
-                // stride IS `width` (`In::sliced`), so a `[rows, mq_pad]` row-major staging would step 64 where
-                // the row pitch is `mq_pad`. At nsub==1 this offset is 0 and the staging is unchanged.
-                // cmask is staged BLOCK-MAJOR (see above): `nsub` blocks of `[rows, stick]`. The outer axis
-                // of this nest IS that block index; `feat == stick`, so the corner is `j*rows*stick`.
-                cmask,
+                };
                 // The staging's row axis is the shared-buffer extent — the same MaskRows the ops sweep; its
                 // block width is one row window's SCORE columns, the same quantity the width slot carries.
-                Nest::new(
+                let mask_off = Nest::new(
                     &["row", "head", "feat"],
                     &[
                         rows.get(),
@@ -4330,32 +5090,113 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 )
                 .view()
                 .at(Idx::<Head>::n(j))
-                .dev(),
-                false, // cmask: varies per query row, needs the real per-row read (worker pre-tiles it)
-                // Sub-block 0 SEEDS the online softmax; later sub-blocks fold, exactly like the prefix blocks.
-                // The new-token block SEEDS, but only on its first sub-block: later sub-blocks of the same block
-                // fold onto that seed. `j == 0` was the boolean; the role says which of the two it means.
-                if j == 0 {
-                    BlockSeed::SeedsState
-                } else {
-                    BlockSeed::FoldsOntoSeed
-                },
-                batched_new,
-                bmm_form,
-                r,
+                .dev();
+                // The shared-arg laws, stated once for both doors (the seed arm and the fold arm take
+                // exactly these values):
+                //
+                // new_v is nkvh-wide now too (dedup, symmetric to new_kt above) — same gqa_kv_head mapping.
+                // PER-KV-HEAD BASE = `kvh * mq * hd` (2026-07-28, CORRECTED from a briefly-committed `mq_pad`
+                // version that regressed decode). Unlike `new_kt` (restickified into a COMPACT
+                // `[nkvh,hd,mq_pad]` layout, where `kvh*hd*mq_pad` IS the right compact per-head base),
+                // `new_v_rep` is never restickified: it keeps the wide `[*, nkvh*hd]` shape whose kv-head
+                // stride RoPE sets to `mq` (`rope_prefill_block_offset`), not `mq_pad`. Decode (mq=1) reduces
+                // to the original `kvh*hd`; prefill (mq=31) gets the `kvh*31*hd` the original bare `kvh*hd`
+                // was missing for kvh>=1.
+                // V rows `[j*stick, (j+1)*stick)` on top of the kv-head base — the prefix side's `b*stick*hd`.
+                //
+                // The wide stream's own per-head slice, declared `HD` rows — the door that names
+                // this fact, where a bare `u32` let the head dim stand in a plane-rows slot. The
+                // const, not the runtime `hd`: this call sits inside `assemble_attn`'s own
+                // geometry threading, so the door takes the same const the ladder carries.
+                //
+                // This block's score WIDTH: one row window's columns — quantity (3) as columns (each padded
+                // row is one score column), NOT the lane count it shares a value with. The full `mq_pad`
+                // width lives on the kernel's stride, never in this slot.
+                //
+                // cmask is staged BLOCK-MAJOR: `nsub` blocks of `[rows, stick]`, block `j` holding columns
+                // `[j*stick, (j+1)*stick)`. Required because the mask is read through a FLAT view whose row
+                // stride IS `width` (`In::sliced`), so a `[rows, mq_pad]` row-major staging would step 64 where
+                // the row pitch is `mq_pad`. At nsub==1 this offset is 0 and the staging is unchanged.
+                // cmask is staged BLOCK-MAJOR (see above): `nsub` blocks of `[rows, stick]`. The outer axis
+                // of this nest IS that block index; `feat == stick`, so the corner is `j*rows*stick`.
+                //
                 // THE NEW-TOKEN BLOCK IS NOT FOLDED, so there is nothing to collapse: it runs once inside the
                 // body's own launch and its K/V come from this step's `new_kt`/`new_v`, which are indexed by
                 // row, not by pool block. A request axis here would step a page stride through a buffer that
                 // has none.
-                None,
-                &bufs,
-                sym_id_base,
-                layout,
-            )?;
+                //
+                // ⭐⭐⭐⭐⭐ SUB-BLOCK 0 SEEDS THE ONLINE SOFTMAX; later sub-blocks fold, exactly like the
+                // prefix blocks — and the doors carry that as the chain: the seed door MINTS the
+                // [`SeededCarry`], the fold door REQUIRES it. `j == 0` was once a boolean, then a
+                // `BlockSeed` value the call site chose; now it is WHICH DOOR the call goes through,
+                // and a fold emitted before any seed does not compile. `row_windows()` starts at 0
+                // by its own law, so the seed arm always fires first and the fold arm's refusal is
+                // the desync guard, not a path.
+                // ⭐ THE DOOR FACTS, STATED ONCE FOR BOTH ARMS — the seed arm and the fold arm take
+                // exactly these values (the law block above); each arm hands the door only the
+                // facts that door owns, so the two doors cannot disagree about what a block is.
+                let facts = DoorFacts {
+                    t,
+                    tag: &tag,
+                    geom,
+                    nests: BlockNests::<NQH, HD> {
+                        mq: width.mq(),
+                        rows: block_rows,
+                        req: r,
+                    },
+                    qs,
+                    score_form,
+                    width: BlockCols::of_row_window(RowWindow::ROWS),
+                    kt: KtLeg {
+                        kernel: &new_kt,
+                        stride: mq_pad_t.slots().kernel_row_pitch(),
+                        off_fn: kt_off,
+                    },
+                    v: VLeg {
+                        kernel: new_v,
+                        stride: crate::sdsc_abstract::VKernelRows::of_new_block_stream(HD),
+                        off_fn: v_off,
+                    },
+                    mask: cmask,
+                    // cmask: varies per query row, needs the real per-row read (worker pre-tiles it)
+                    mask_bcast: false,
+                    forms: BlockForms {
+                        batched: batched_new,
+                        bmm: bmm_form,
+                        request_axis: None,
+                    },
+                    bufs: &bufs,
+                };
+                let block_carry = if j == 0 {
+                    assemble_attn_seed_block(&mut ctx, &state, mask_off, facts)?
+                } else {
+                    assemble_attn_fold_block(
+                        &mut ctx,
+                        seeded.take().ok_or_else(|| {
+                            SuperDscError(format!(
+                                "attention o{t}: sub-block {j} folds before any window seeded the \
+                                 carry — row windows must start at 0"
+                            ))
+                        })?,
+                        // The causal block's own nest corner — this mask's seed-safety is the
+                        // causal diagonal, not the histories, so it is not a sweep-law read.
+                        FoldMaskRead::Nest(mask_off),
+                        facts,
+                    )?
+                };
+                seeded = Some(block_carry);
+            }
         }
-    }
+        seeded.ok_or_else(|| {
+            SuperDscError(format!(
+                "attention o{t}: the new-token block emitted no seed (sub_block_passes=\
+                 {sub_block_passes}) — the finalize would divide by an unwritten l"
+            ))
+        })?
+    };
     // ── PREFIX blocks: nb stick-wide blocks over the resident cache, pmask sliced per block, folded
-    //    on top of the new-block seed above (never `first` now). `vc` read maps query head h to its
+    //    on top of the new-block seed above — through the fold door, which cannot be called without
+    //    the carry that seed minted (the old prose "never `first` now", as the type). `vc` read maps query head h to its
     //    REPRESENTATIVE query head qh=kvh*gqa (V dedup — `vc` stays nqh-SIZED, unlike `kct`'s compact
     //    nkvh storage, so this is qh*cap*hd, NOT the kct-style compact kvh*hd*cap
     //    `gqa_dedup_kv_kernel_base` gives). Matches cachewr_v's own now-representative-slot-only
@@ -4388,11 +5229,11 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         // `M = B` re-lays each kv head's `gqa·B` rows into one block, rows `g·B + r` — the batch mask's own
         // `row % B` law. A prompt chunk keeps the stream's row blocks.
         let qgroup = if rows_are_requests {
-            crate::sdsc_abstract::QGroupBlock::of_batch(nkvh, nqh / nkvh, hd, mq)
+            crate::sdsc_abstract::QGroupBlock::of_batch(nkvh, geom.gqa(), hd, mq)
         } else {
-            crate::sdsc_abstract::QGroupBlock::of_decode(nkvh, nqh / nkvh, hd, mq)
+            crate::sdsc_abstract::QGroupBlock::of_decode(nkvh, geom.gqa(), hd, mq)
         }
-        .zip(layout.and_then(|l| l.identity_tid_of_class(hd)));
+        .zip(ctx.layout.and_then(|l| l.identity_tid_of_class(hd)));
         // The row blocks the body cuts every wide op into (`ChunkRowBlocks`): a kv head's `gqa·mq` rows at
         // one slab, a query head's `mq` above it, a kv head's re-laid group where the query is re-laid.
         let blocks = match qgroup {
@@ -4403,7 +5244,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     chunk.nkvh()
                 ))
             })?,
-            None => chunk.row_blocks(nqh / nkvh, mq),
+            None => chunk.row_blocks(geom.gqa(), mq),
         };
         let b_rows = blocks.rows();
         // A PROMPT chunk keeps its probabilities in LX from `esub` through the PV (the body's step 4′);
@@ -4432,7 +5273,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         // pass has already walked prefix, every body and the suffix against THIS layout before any real
         // pass ran, so the slot map is complete — the FINAL sum, never a mid-walk projection. `0` when
         // no layout is in scope (a layout-less emission mints no pins at all).
-        let op_local_bytes = layout.map(|l| l.lx_op_local_slot_bytes()).unwrap_or(0);
+        let op_local_bytes = ctx.layout.map(|l| l.lx_op_local_slot_bytes()).unwrap_or(0);
         // ⭐ AND THE PROBABILITY-PART TERM, from the ONE enumeration the mint below also declares
         // (`chunk_prob_pins`): the witness's core-local sum is the gathers PLUS these pins — the sum
         // the allocator bumps — so a geometry the window cannot hold falls to HBM HERE instead of
@@ -4447,7 +5288,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             .as_ref()
             .map(|pins| pins.iter().map(|&(_, _, bytes)| bytes).sum())
             .unwrap_or(0);
-        if let Some(l) = layout {
+        if let Some(l) = ctx.layout {
             l.note_chunk_prob_pin_bytes(prob_pin_bytes);
         }
         let lx = chunk
@@ -4477,10 +5318,10 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 ident: crate::place::act_name(ident_tid),
             }),
         };
-        if let (Some(l), Some((q, _))) = (layout, qgroup) {
+        if let (Some(l), Some((q, _))) = (ctx.layout, qgroup) {
             l.synth(out_id.synth(R::ChunkQGroup), &q.footprint_dims());
         }
-        if let Some(l) = layout {
+        if let Some(l) = ctx.layout {
             match &cb.lx {
                 None => {
                     for r in [R::GatherKt, R::GatherV] {
@@ -4572,7 +5413,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             // offset 0, so a block past the placement reads the next activation's bytes as validity — an
             // additive mask, where an unstaged zero is VALID. The placement is the bundle's, so this is a
             // bake fact; refused here it is a build failure, never a row attending another's keys.
-            if let Some(l) = layout
+            if let Some(l) = ctx.layout
                 && let Some(crate::place::PlaceId::Act(tid)) = l.id_of(pmask)
                 && let Some(p) = l.placements.get(&tid)
                 && p.size < bc.mask_elems() as u64 * 2
@@ -4589,13 +5430,13 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         } else {
             ChunkHistory::Shared
         };
-        assemble_attn_chunk(
-            &mut ops,
+        // The carry goes IN and comes back: the chunk body folds onto the seed the new-block
+        // half minted, and the chain continues to the finalize.
+        carry = assemble_attn_chunk(
+            &mut ctx,
             ChunkAttn {
                 t,
-                nqh,
-                hd,
-                gqa: nqh / nkvh,
+                geom,
                 mq,
                 chunk,
                 history,
@@ -4608,12 +5449,15 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 bufs: &bufs,
                 cb: &cb,
             },
-            sym_id_base,
-            layout,
+            carry,
         )?;
     }
-    let sweep_cap = if chunk.is_some() { 0 } else { active_cap };
-    let fold_from = ops.len();
+    let sweep_cap = if chunk.is_some() {
+        crate::sdsc_abstract::SlotCount::new(0)
+    } else {
+        active_cap
+    };
+    let fold_from = ctx.ops.len();
     // ⭐⭐⭐⭐⭐ THE WINDOW-CHUNK SPLIT — the gathered fold's own answer to the dxp group ceiling.
     //
     // A gathered PageFold run is UNCHUNKABLE by the group walk (`GroupKind::run_may_be_chunked ==
@@ -4654,9 +5498,8 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // (the compile-cost target, ≤ the bake-side guard's `MAX_DESCRIPTORS` ceiling, so a split that
     // fires here always lands under what the guard would refuse): the emitter aims BELOW what the
     // guard forbids, and the two consts cannot disagree about legality.
-    let nslab =
-        crate::addr::Shape::<0, 0, 0, 0>::slabs_of(hd, crate::superdsc_opspec::Df::Fp16).get();
-    let nb = SlotWindow::count_in(crate::sdsc_abstract::SlotCount::new(active_cap)).get();
+    let nslab = crate::addr::Shape::<HD, 0, 0, 0>::slabs(crate::superdsc_opspec::Df::Fp16).get();
+    let nb = SlotWindow::count_in(active_cap).get();
     let chunking = gather.map(|(_, scratch)| {
         // ONE CHUNK'S FIXED COST (its own copies) and PER-WINDOW COST (both legs + the 11-op
         // ladder), straight off the scratch's own extents — the quantities `copies()` and the two
@@ -4738,22 +5581,23 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // unconditionally, before any window existed to interleave them with, so an `active_cap` under
     // one window (nb == 0) keeps its (dead but shipped) copies and the bundle does not move.
     if nb == 0 && gather.is_some() {
-        chunk_starts.push((ops.len() - fold_from, 0));
+        chunk_starts.push((ctx.ops.len() - fold_from, 0));
         if let Some((idx, scratch)) = gather {
             for (name, src, dst) in [
                 (format!("attn_gkt_o{t}"), kct, gkt.as_str()),
                 (format!("attn_gv_o{t}"), vc, gv.as_str()),
             ] {
                 for cp in scratch.copies() {
-                    ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_gather_copy(
-                        &format!("{name}_s{}", cp.stick()),
-                        src,
-                        dst,
-                        cp,
-                        idx,
-                        sym_id_base,
-                        layout,
-                    ));
+                    ctx.ops
+                        .push(crate::ir::bridge::tiled_op_sdsc_op::assemble_gather_copy(
+                            &format!("{name}_s{}", cp.stick()),
+                            src,
+                            dst,
+                            cp,
+                            idx,
+                            ctx.sym_id_base,
+                            ctx.layout,
+                        ));
                 }
             }
         }
@@ -4784,13 +5628,16 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         Some(_) => gv.as_str(),
         None => vc,
     };
-    let v_pitch = crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
+    // The resident plane's own row extent, NAMED as the page fact it is — the same door the
+    // Kᵗ side takes through `KT_KERNEL_PITCH`, so a window's or a stream's extent cannot reach
+    // this slot even where the number coincides.
+    let v_pitch = crate::sdsc_abstract::VKernelRows::Page;
     // Windows ONE launch folds. `active_cap` is the sk_bucket rung as before, and the page equals the
     // pre-paged capacity, so this is bit-for-bit the baseline's fold; contexts past one page cost
     // additional LAUNCHES of this same group, never a wider sweep. The `active_cap / 64` lives in
     // `SlotWindow::count_in`, where the 64 is the window's SLOT count — quantity (2), the reduce's
     // one-stick column budget — not the lane count it used to be spelled as.
-    for w in SlotWindow::sweep(crate::sdsc_abstract::SlotCount::new(sweep_cap)) {
+    for w in SlotWindow::sweep(sweep_cap) {
         let b = w.index();
         // ⭐ A NEW CHUNK STARTS HERE — its own copies first (the self-containment the group-major
         // law demands; see the split note above). `emitted_chunk_copies` is `None` before the first
@@ -4801,7 +5648,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         if emitted_chunk_copies != Some(chunk)
             && let Some((idx, scratch)) = gather
         {
-            chunk_starts.push((ops.len() - fold_from, chunk));
+            chunk_starts.push((ctx.ops.len() - fold_from, chunk));
             for (name, src, dst) in [
                 (format!("attn_gkt_o{t}"), kct, gkt.as_str()),
                 (format!("attn_gv_o{t}"), vc, gv.as_str()),
@@ -4822,15 +5669,16 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     } else {
                         format!("{name}_c{chunk}_s{}", cp.stick())
                     };
-                    ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_gather_copy(
-                        &op_name,
-                        src,
-                        dst,
-                        cp,
-                        idx,
-                        sym_id_base,
-                        layout,
-                    ));
+                    ctx.ops
+                        .push(crate::ir::bridge::tiled_op_sdsc_op::assemble_gather_copy(
+                            &op_name,
+                            src,
+                            dst,
+                            cp,
+                            idx,
+                            ctx.sym_id_base,
+                            ctx.layout,
+                        ));
                 }
             }
             emitted_chunk_copies = Some(chunk);
@@ -4851,105 +5699,27 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 ),
             );
             let at = |win: SlotWindow| -> u32 { pool.addr(kt_block.at_slot(win.first_slot())) };
-            let nb = SlotWindow::count_in(crate::sdsc_abstract::SlotCount::new(active_cap)).get();
+            let nb = SlotWindow::count_in(active_cap).get();
             eprintln!(
-                "[fold-block] b={b}/{nb} cap={active_cap} stick={} hd={hd} mq={mq} rows={} | kt_off={} delta_b0={} | mask_slab={} slab_step={}",
+                "[fold-block] b={b}/{nb} cap={} stick={} hd={hd} mq={mq} rows={} | kt_off={} delta_b0={} | mask_slab={} slab_step={}",
+                active_cap.get(),
                 BlockCols::of_one_stick(Lanes::FP16).get(),
                 block_rows.extent(),
                 at(w),
                 at(w).wrapping_sub(pool.addr(kt_block)),
-                mask_shape.slab_elems(0, w.mask_slab()).elems(),
-                mask_shape.slab_elems(0, 1).elems(),
+                law.slab_corner(w.mask_slab()).elems(),
+                law.slab_corner(1).elems(),
             );
         }
-        assemble_attn_block(
-            &mut ops,
-            t,
-            &format!("p{b}"),
-            nqh,
-            hd,
-            width.mq(),
-            block_rows,
-            qs,
-            score_form,
-            // BLOCK STRIDE = `b * hd * stick`, NOT `b * stick` (2026-07-28). `kct` is `[hd, cap]` per
-            // kv-head, STICK-MAJOR on `cap` (the last dim), so slot `s` sits at
-            // `(s/64)*(hd*64) + d*64 + (s%64)` -- one whole `hd*64` PLANE per 64-slot block, not 64
-            // elements. The score matmul reads a `[k=hd, n=stick]` kernel window whose own internal
-            // addressing is `off + d*64 + j`, so `off` must be the block's plane base `b*hd*stick`.
-            // With the old `b*stick`, block 0 was correct (offset 0 either way) but every later block
-            // read `hd`x too low -- i.e. attention was exact for the first 64 KV slots and read garbage
-            // from slot 64 onward. That is precisely the observed decode cliff (coherent to ~64 tokens,
-            // then progressive degradation as more blocks fill) and prefill's immediate garbage (a
-            // multi-block prompt is wrong from the first token). Matches the old proven flash decode
-            // verbatim: `let k_blk = b * hd * stick;` (worktree superdsc-batch-perf). The V side below
-            // is `b*stick*hd`, which is already correct and matches that same reference (`vblk`).
-            kt_src,
-            kt_pitch,
-            // THE POOL COMPOSES THE REQUEST TERM, not this call site. `kt_block_base_of` is the same
-            // `block_index(kvh) + r` the cache write bakes, so the fold's kernel and the write that
-            // fills it cannot disagree about where request `r` lives — and no stride is spelled here.
-            //
-            // ⛔ AND THIS IS THE UNGATHERED READ ONLY. A gathered bundle's score and value legs take the
-            // collapsed per-request arm, whose kernel base is the SCRATCH's own row
-            // (`GatherScratch::kernel_row_off`, reached through `GatheredFold`) — a request coordinate this
-            // closure has no parameter for. A `gather` arm here would be a base no op reads.
-            |h, sl| {
-                use crate::sdsc_abstract::{KvCoord, KvPlane};
-                let kvh = crate::sdsc_abstract::KvHead::of_query(h, crate::addr::Gqa::new(gqa));
-                crate::addr::DevOff::from_view_step(
-                    pool.addr(
-                        KvCoord::block(KvPlane::Kt, kvh)
-                            .at_slot(w.first_slot())
-                            // The contraction's head-dim slab, through the pool's OWN model — the same
-                            // `at_feat` door the V plane below uses, so the two planes cannot disagree
-                            // about where a feature slab is.
-                            .at_feat(FeatIdx::of_slab(sl)),
-                    ),
-                )
-            },
-            // The closure takes the head-dim SLAB as well as the head, so the slab rides inside the
-            // pool's own model instead of being added to a finished address. The V operand's row count
-            // is the PAGE, not `cap`, and it reaches the address only through that model — there is no
-            // separate row-count argument to disagree with the kernel's declared `in` extent.
-            v_src,
-            // ⭐ `PAGE_SLOTS`, NOT `hd` — the V plane's ROW axis is SLOTS, symmetric with `kt_stride` above.
-            //
-            // `Stk::kernel(k_in, n_out)` becomes `StickLayout { rows: k_in, cols: n_out }`, and a stick-blocked
-            // kernel addresses `(r, c)` as `(c/stk)*(rows*stk) + r*stk + c%stk`. With `k_in = hd` the
-            // stick-GROUP stride was declared `hd*stk` where this plane's is `PAGE_SLOTS*stk`.
-            //
-            // ⚠️ INERT AT head_dim 64 AND ONLY THERE: one feature stick means `c/stk == 0` always, so the
-            // wrong `rows` factor multiplies zero and NO EXISTING TEST CAN SEE THIS CHANGE. At hd=128 there
-            // are two sticks and the upper one landed at `hd*stk` instead of `PAGE_SLOTS*stk`, i.e. every
-            // feature above 63 read the wrong slot. That is why this is verifiable ONLY on a real hd=128
-            // model through `scr batch` — the emission at hd=64 must be byte-identical, and that is the
-            // safety check for this edit.
-            v_pitch,
-            // NAMED, NOT COMPOSED: `w` is a slot window and `sl` a feature slab, so both are
-            // COORDINATES. The hand-added `sl * PAGE_SLOTS * stick` was the V plane's own feature-stick
-            // stride restated at the call site.
-            //
-            // ⛔ UNGATHERED ONLY, for the same reason as the Kᵗ closure above: a gathered bundle's value
-            // leg reads the V scratch through `GatheredFold::kernel_off`, which needs a request.
-            |h, sl| {
-                use crate::sdsc_abstract::{KvCoord, KvPlane};
-                let kvh = crate::sdsc_abstract::KvHead::of_query(h, crate::addr::Gqa::new(gqa));
-                crate::addr::DevOff::from_view_step(
-                    pool.addr(
-                        KvCoord::block(KvPlane::V, kvh)
-                            .at_slot(w.first_slot())
-                            .at_feat(FeatIdx::of_slab(sl)),
-                    ),
-                )
-            },
-            // This block's score WIDTH: the slots one fold window holds — quantity (2), the reduce's
-            // one-stick column budget, NOT the lane count it shares a value with.
-            BlockCols::of_slot_window(SlotWindow::SLOTS),
-            // pmask is read mb-BROADCAST, so it materialises ONE row: block b is the slab-b corner
-            // of a `[1, cap]` nest. Stating the MATERIALISED extent is what keeps the stick-group
-            // term honest for a broadcast operand.
-            pmask,
+        // ⭐ THE PREFIX FOLD FOLDS THROUGH THE DOOR — the carry the new-block half minted goes in
+        // and comes back, so the sequence law ("never `first` now") is the type, not the prose: a
+        // seeding fold pass would reset the running state mid-accumulation and cost the deepest row
+        // every page it had already folded.
+        carry = assemble_attn_fold_block(
+            &mut ctx,
+            // The proof the state was seeded — the token the new-block half minted. This call site
+            // no longer chooses a role at all: the door IS the fold.
+            carry,
             // ONE VALIDITY ROW, OR ONE PER QUERY ROW.
             //
             // Prefix validity is head-independent, so a single broadcast row is exact while every row
@@ -4964,49 +5734,148 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             // At a decode batch of 8 it is a few MB, which is affordable — the blow-up is prefill's
             // problem and prefill does not need this.
             if rows_are_requests {
-                // ⭐ FROM THE SHARED SHAPE, not from a nest built here out of `rows` and `cap`. The
-                // worker stages this buffer from the SAME value, so the read and the write cannot
-                // describe different bytes — which they could when each side derived its own extents,
-                // and an additive mask fails silently in the dangerous direction (unstaged bytes read
-                // as 0, and 0 is VALID).
-                // The corner crosses as the typed `MaskCorner` it is, through its own `DevOff`
-                // door — a slab corner is `slab * rows * 64`, a plane term, not the single-stick
-                // view step `from_view_step` is contracted for.
-                crate::addr::DevOff::of_mask_corner(mask_shape.slab_elems(0, w.mask_slab()))
+                // ⭐ FROM THE LAW, not from a shape this call site holds — the sweep-law token is
+                // the mask door's declaration, and the per-row prefix fold's corner is its own
+                // door: this fold cannot be emitted in a node whose mask shape was never
+                // validated. The worker stages this buffer from the SAME shape, so the read and
+                // the write cannot describe different bytes — which they could when each side
+                // derived its own extents, and an additive mask fails silently in the dangerous
+                // direction (unstaged bytes read as 0, and 0 is VALID).
+                FoldMaskRead::PrefixSlab {
+                    law,
+                    slab: w.mask_slab(),
+                }
             } else {
-                Nest::new(&["row", "feat"], &[1, cap], <Fp16 as DataFormat>::DF)
-                    .view()
-                    .slab(w.mask_slab())
-                    .dev()
+                // The broadcast prefix row's own nest corner — the prompt chunk's f32 family,
+                // whose first block is legally all-masked (the causal block beside it carries
+                // the row's lanes), so it is not a sweep-law read.
+                FoldMaskRead::Nest(
+                    Nest::new(&["row", "feat"], &[1, cap.get()], <Fp16 as DataFormat>::DF)
+                        .view()
+                        .slab(w.mask_slab())
+                        .dev(),
+                )
             },
-            !rows_are_requests, // broadcast for a prompt; per-row when the rows are requests
-            // ⭐ THE FOLD NEVER SEEDS — the claim this file made in prose ("never `first` now"), now carried
-            // by the call. A seeding fold pass would reset the running state mid-accumulation and cost the
-            // deepest row every page it had already folded.
-            BlockSeed::FoldsOntoSeed,
-            batched_prefix,
-            bmm_form,
-            0,
-            // ⭐ THE PREFIX FOLD GOES PER-REQUEST INSIDE ONE PASS when the bundle gathers. That is what
-            // makes one pass serve the whole batch, so the runtime can drop the `× requests` factor from
-            // `reps` — see `fold_plan::reps`, gated on the `batched_requests` this sets below.
-            //
-            // ⛔ THE **WINDOW** IS PART OF IT, and it is why this value is built here rather than once
-            // above the loop: the kernel base an op reads is the scratch row for (kv head, THIS window,
-            // request), the same window whose mask slab and block name this call already carries. A value
-            // hoisted out of the loop would give every window window 0's kernel rows.
-            gather.map(|(_, scratch)| GatheredFold {
-                scratch,
-                pool,
-                window: w,
-            }),
-            &bufs,
-            sym_id_base,
-            layout,
+            DoorFacts {
+                t,
+                tag: &format!("p{b}"),
+                geom,
+                nests: BlockNests::<NQH, HD> {
+                    mq: width.mq(),
+                    rows: block_rows,
+                    req: 0,
+                },
+                qs,
+                score_form,
+                // This block's score WIDTH: the slots one fold window holds — quantity (2), the reduce's
+                // one-stick column budget, NOT the lane count it shares a value with.
+                width: BlockCols::of_slot_window(SlotWindow::SLOTS),
+                kt: KtLeg {
+                    // BLOCK STRIDE = `b * hd * stick`, NOT `b * stick` (2026-07-28). `kct` is `[hd, cap]` per
+                    // kv-head, STICK-MAJOR on `cap` (the last dim), so slot `s` sits at
+                    // `(s/64)*(hd*64) + d*64 + (s%64)` -- one whole `hd*64` PLANE per 64-slot block, not 64
+                    // elements. The score matmul reads a `[k=hd, n=stick]` kernel window whose own internal
+                    // addressing is `off + d*64 + j`, so `off` must be the block's plane base `b*hd*stick`.
+                    // With the old `b*stick`, block 0 was correct (offset 0 either way) but every later block
+                    // read `hd`x too low -- i.e. attention was exact for the first 64 KV slots and read garbage
+                    // from slot 64 onward. That is precisely the observed decode cliff (coherent to ~64 tokens,
+                    // then progressive degradation as more blocks fill) and prefill's immediate garbage (a
+                    // multi-block prompt is wrong from the first token). Matches the old proven flash decode
+                    // verbatim: `let k_blk = b * hd * stick;` (worktree superdsc-batch-perf). The V side below
+                    // is `b*stick*hd`, which is already correct and matches that same reference (`vblk`).
+                    kernel: kt_src,
+                    stride: kt_pitch,
+                    // THE POOL COMPOSES THE REQUEST TERM, not this call site. `kt_block_base_of` is the same
+                    // `block_index(kvh) + r` the cache write bakes, so the fold's kernel and the write that
+                    // fills it cannot disagree about where request `r` lives — and no stride is spelled here.
+                    //
+                    // ⛔ AND THIS IS THE UNGATHERED READ ONLY. A gathered bundle's score and value legs take the
+                    // collapsed per-request arm, whose kernel base is the SCRATCH's own row
+                    // (`GatherScratch::kernel_row_off`, reached through `GatheredFold`) — a request coordinate this
+                    // closure has no parameter for. A `gather` arm here would be a base no op reads.
+                    off_fn: |h, sl| {
+                        use crate::sdsc_abstract::{KvCoord, KvPlane};
+                        let kvh =
+                            crate::sdsc_abstract::KvHead::of_query(h, crate::addr::Gqa::new(gqa));
+                        crate::addr::DevOff::from_view_step(
+                            pool.addr(
+                                KvCoord::block(KvPlane::Kt, kvh)
+                                    .at_slot(w.first_slot())
+                                    // The contraction's head-dim slab, through the pool's OWN model — the same
+                                    // `at_feat` door the V plane below uses, so the two planes cannot disagree
+                                    // about where a feature slab is.
+                                    .at_feat(FeatIdx::of_slab(sl)),
+                            ),
+                        )
+                    },
+                },
+                v: VLeg {
+                    // The closure takes the head-dim SLAB as well as the head, so the slab rides inside the
+                    // pool's own model instead of being added to a finished address. The V operand's row count
+                    // is the PAGE, not `cap`, and it reaches the address only through that model — there is no
+                    // separate row-count argument to disagree with the kernel's declared `in` extent.
+                    kernel: v_src,
+                    // ⭐ `PAGE_SLOTS`, NOT `hd` — the V plane's ROW axis is SLOTS, symmetric with `kt_stride` above.
+                    //
+                    // `Stk::kernel(k_in, n_out)` becomes `StickLayout { rows: k_in, cols: n_out }`, and a stick-blocked
+                    // kernel addresses `(r, c)` as `(c/stk)*(rows*stk) + r*stk + c%stk`. With `k_in = hd` the
+                    // stick-GROUP stride was declared `hd*stk` where this plane's is `PAGE_SLOTS*stk`.
+                    //
+                    // ⚠️ INERT AT head_dim 64 AND ONLY THERE: one feature stick means `c/stk == 0` always, so the
+                    // wrong `rows` factor multiplies zero and NO EXISTING TEST CAN SEE THIS CHANGE. At hd=128 there
+                    // are two sticks and the upper one landed at `hd*stk` instead of `PAGE_SLOTS*stk`, i.e. every
+                    // feature above 63 read the wrong slot. That is why this is verifiable ONLY on a real hd=128
+                    // model through `scr batch` — the emission at hd=64 must be byte-identical, and that is the
+                    // safety check for this edit.
+                    stride: v_pitch,
+                    // NAMED, NOT COMPOSED: `w` is a slot window and `sl` a feature slab, so both are
+                    // COORDINATES. The hand-added `sl * PAGE_SLOTS * stick` was the V plane's own feature-stick
+                    // stride restated at the call site.
+                    //
+                    // ⛔ UNGATHERED ONLY, for the same reason as the Kᵗ closure above: a gathered bundle's value
+                    // leg reads the V scratch through `GatheredFold::kernel_off`, which needs a request.
+                    off_fn: |h, sl| {
+                        use crate::sdsc_abstract::{KvCoord, KvPlane};
+                        let kvh =
+                            crate::sdsc_abstract::KvHead::of_query(h, crate::addr::Gqa::new(gqa));
+                        crate::addr::DevOff::from_view_step(
+                            pool.addr(
+                                KvCoord::block(KvPlane::V, kvh)
+                                    .at_slot(w.first_slot())
+                                    .at_feat(FeatIdx::of_slab(sl)),
+                            ),
+                        )
+                    },
+                },
+                // pmask is read mb-BROADCAST, so it materialises ONE row: block b is the slab-b corner
+                // of a `[1, cap]` nest. Stating the MATERIALISED extent is what keeps the stick-group
+                // term honest for a broadcast operand.
+                mask: pmask,
+                // broadcast for a prompt; per-row when the rows are requests
+                mask_bcast: !rows_are_requests,
+                forms: BlockForms {
+                    batched: batched_prefix,
+                    bmm: bmm_form,
+                    // ⭐ THE PREFIX FOLD GOES PER-REQUEST INSIDE ONE PASS when the bundle gathers. That is what
+                    // makes one pass serve the whole batch, so the runtime can drop the `× requests` factor from
+                    // `reps` — see `fold_plan::reps`, gated on the `batched_requests` this sets below.
+                    //
+                    // ⛔ THE **WINDOW** IS PART OF IT, and it is why this value is built here rather than once
+                    // above the loop: the kernel base an op reads is the scratch row for (kv head, THIS window,
+                    // request), the same window whose mask slab and block name this call already carries. A value
+                    // hoisted out of the loop would give every window window 0's kernel rows.
+                    request_axis: gather.map(|(_, scratch)| GatheredFold {
+                        scratch,
+                        pool,
+                        window: w,
+                    }),
+                },
+                bufs: &bufs,
+            },
         )?;
     }
 
-    for (i, op) in ops[fold_from..].iter_mut().enumerate() {
+    for (i, op) in ctx.ops[fold_from..].iter_mut().enumerate() {
         op.kv_page_fold = true;
         // ⭐⭐⭐⭐⭐ THE CHUNK TAG — the fold's run-break between window chunks, from the chunk_starts
         // the sweep itself recorded. `kv_request` is the ONE field `Trip::fusable_with` already breaks
@@ -5041,6 +5910,10 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         // `kv_batched_requests` above — a bake fact the session cannot see, so it rides the manifest.
         op.kv_fold_rows = block_rows.regime();
     }
+    // ⭐ THE CHAIN'S LAST LINK: the proof crosses its one-way door. The recurrence carry (max
+    // included — the folds read it) is CONSUMED here, and what reaches the finalize is exactly
+    // the two operands the divide reads; there is no spelling that reads `m` past this line.
+    let carry = carry.handoff();
     // Finalize: out = run_o / run_l via ONE native `realdiv` op — no separate reciprocal step at all.
     // Earlier this session a single realdiv was reverted for reading-and-WRITING the SAME buffer
     // (run_o) in one op, a real in-place-aliasing hazard; that bug was the aliasing, not `realdiv`
@@ -5068,9 +5941,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // The finalize nests address `token_stream`/`head_major` only. There is no score block here, so
     // there is no width to state: `score_rows` takes its width as a parameter, and a nest without a
     // score buffer simply cannot be asked that question.
-    let nests = BlockNests {
-        heads: nqh,
-        hd,
+    let nests = BlockNests::<NQH, HD> {
         mq: width.mq(),
         rows: BlockRows::WholeBatch(rows),
         req: 0,
@@ -5099,47 +5970,57 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         //
         // Scoped to a decode batch; prefill's bundles are proven on hardware and stay byte-identical.
         if mq == 1 || rows_are_requests {
-            ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_o_o{t}"),
-                "realdiv",
-                // The batched finalize: ALL `nqh*mq` head-major rows in one op, head-dim wide.
-                RowCount::of_mask_rows(rows),
-                BlockCols::of_head_dim(hd),
-                &[
-                    // The accumulators at their true extents — `run_o` head-wide `[rows, hd]`,
-                    // `run_l` one-stick `[rows, 64]` — and `out` at the flat-equal `[rows, hd]`
-                    // view of its `[mq, nqh·hd]` token-stream buffer (same element count; the
-                    // mint's bound is flat).
-                    In::full(&fl(&bufs.run_o, rows.get(), hd)).ew(),
-                    In::col(&hm_rows(&bufs.run_l, rows.get())).ew(),
-                ],
-                &fl(out, rows.get(), hd),
-                crate::addr::DevOff::ZERO,
-                sym_id_base,
-                layout,
+            ctx.ops.push(assemble_pointwise_broadcast_off(
+                PointwiseFacts {
+                    op_name: &format!("attn_o_o{t}"),
+                    op_func: "realdiv",
+                    // The batched finalize: ALL `nqh*mq` head-major rows in one op, head-dim wide.
+                    rows: RowCount::of_mask_rows(rows),
+                    cols: BlockCols::of_head_dim(hd),
+                    inputs: &[
+                        // The accumulators at their true extents — `run_o` head-wide `[rows, hd]`,
+                        // `run_l` one-stick `[rows, 64]` — and `out` at the flat-equal `[rows, hd]`
+                        // view of its `[mq, nqh·hd]` token-stream buffer (same element count; the
+                        // mint's bound is flat). ⭐ AND THE OPERANDS COME FROM THE CARRY TOKEN — the
+                        // chain the seed door minted ends here, at the divide it exists for.
+                        In::full(&fl(carry.o(), rows.get(), hd)).ew(),
+                        In::col(&hm_rows(carry.l(), rows.get())).ew(),
+                    ],
+                    o: &fl(out, rows.get(), hd),
+                    out_offset: crate::addr::DevOff::ZERO.into(),
+                },
+                ctx.sym_id_base,
+                ctx.layout,
             ));
         } else {
             for h in crate::sdsc_abstract::QueryHead::all(nqh_nz) {
                 let hi = h.get();
-                ops.push(assemble_pointwise_broadcast_off(
-                    &format!("attn_o_h{hi}_o{t}"),
-                    "realdiv",
-                    // The per-head finalize: ONE head's `mq` rows per op — the rows slot genuinely
-                    // carries the chunk's rows here, not the shared-buffer extent.
-                    RowCount::of_query_rows(width.mq()),
-                    BlockCols::of_head_dim(hd),
-                    &[
-                        In::sliced(
-                            &fl(&bufs.run_o, rows.get(), hd),
-                            nests.token_stream(hi, 0).off(),
-                        )
-                        .ew(),
-                        In::col_at(&hm_rows(&bufs.run_l, rows.get()), nests.head_major(hi, 0)).ew(),
-                    ],
-                    &rb(out, mq, nqh * hd),
-                    nests.token_stream(hi, 0).off(),
-                    sym_id_base,
-                    layout,
+                ctx.ops.push(assemble_pointwise_broadcast_off(
+                    PointwiseFacts {
+                        op_name: &format!("attn_o_h{hi}_o{t}"),
+                        op_func: "realdiv",
+                        // The per-head finalize: ONE head's `mq` rows per op — the rows slot genuinely
+                        // carries the chunk's rows here, not the shared-buffer extent.
+                        rows: RowCount::of_query_rows(width.mq()),
+                        cols: BlockCols::of_head_dim(hd),
+                        inputs: &[
+                            In::sliced(
+                                &fl(carry.o(), rows.get(), hd),
+                                nests.token_stream(hi, 0).off(),
+                            )
+                            .ew(),
+                            In::col_at(&hm_rows(carry.l(), rows.get()), nests.head_major(hi, 0))
+                                .ew(),
+                        ],
+                        o: &rb(
+                            out,
+                            RowCount::of_query_rows(width.mq()),
+                            BlockCols::of_feature_cols(nqh * hd),
+                        ),
+                        out_offset: nests.token_stream(hi, 0).off().into(),
+                    },
+                    ctx.sym_id_base,
+                    ctx.layout,
                 ));
             }
         }
@@ -5162,20 +6043,22 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         // same bundle fact swaps in at the matmul door: the copy's staging walk enumerates its
         // k-axis in exactly this order (`s`, then `h`, then `d`).
         for s in 0..nslab {
-            ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_o_s{s}_o{t}"),
-                "realdiv",
-                // ALL `nqh` head-major rows at once — at `mq == 1` the mask rows ARE the heads.
-                RowCount::of_mask_rows(rows),
-                BlockCols::of_head_slab(FeatIdx::SLAB_FEATS),
-                &[
-                    In::sliced(&fl(&bufs.run_o, rows.get(), hd), nests.head_major(0, s)).ew(),
-                    In::col(&hm_rows(&bufs.run_l, rows.get())).ew(),
-                ],
-                &fl(out, rows.get(), hd),
-                nests.head_major(0, s),
-                sym_id_base,
-                layout,
+            ctx.ops.push(assemble_pointwise_broadcast_off(
+                PointwiseFacts {
+                    op_name: &format!("attn_o_s{s}_o{t}"),
+                    op_func: "realdiv",
+                    // ALL `nqh` head-major rows at once — at `mq == 1` the mask rows ARE the heads.
+                    rows: RowCount::of_mask_rows(rows),
+                    cols: BlockCols::of_head_slab(FeatIdx::SLAB_FEATS),
+                    inputs: &[
+                        In::sliced(&fl(carry.o(), rows.get(), hd), nests.head_major(0, s)).ew(),
+                        In::col(&hm_rows(carry.l(), rows.get())).ew(),
+                    ],
+                    o: &fl(out, rows.get(), hd),
+                    out_offset: nests.head_major(0, s).into(),
+                },
+                ctx.sym_id_base,
+                ctx.layout,
             ));
         }
     } else {
@@ -5225,20 +6108,28 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         for h in crate::sdsc_abstract::QueryHead::all(nqh_nz) {
             let hi = h.get();
             for s in 0..nslab {
-                ops.push(assemble_pointwise_broadcast_off(
-                    &format!("attn_o_h{hi}s{s}_o{t}"),
-                    "realdiv",
-                    // Per (head, slab): one head's `mq` rows, one head-dim SLAB of features.
-                    RowCount::of_query_rows(width.mq()),
-                    BlockCols::of_head_slab(FeatIdx::SLAB_FEATS),
-                    &[
-                        In::sliced(&fl(&bufs.run_o, rows.get(), hd), nests.head_major(hi, s)).ew(),
-                        In::col_at(&hm_rows(&bufs.run_l, rows.get()), nests.head_major(hi, 0)).ew(),
-                    ],
-                    &rb(out, mq, nqh * hd),
-                    nests.token_stream(hi, s).off(),
-                    sym_id_base,
-                    layout,
+                ctx.ops.push(assemble_pointwise_broadcast_off(
+                    PointwiseFacts {
+                        op_name: &format!("attn_o_h{hi}s{s}_o{t}"),
+                        op_func: "realdiv",
+                        // Per (head, slab): one head's `mq` rows, one head-dim SLAB of features.
+                        rows: RowCount::of_query_rows(width.mq()),
+                        cols: BlockCols::of_head_slab(FeatIdx::SLAB_FEATS),
+                        inputs: &[
+                            In::sliced(&fl(carry.o(), rows.get(), hd), nests.head_major(hi, s))
+                                .ew(),
+                            In::col_at(&hm_rows(carry.l(), rows.get()), nests.head_major(hi, 0))
+                                .ew(),
+                        ],
+                        o: &rb(
+                            out,
+                            RowCount::of_query_rows(width.mq()),
+                            BlockCols::of_feature_cols(nqh * hd),
+                        ),
+                        out_offset: nests.token_stream(hi, s).off().into(),
+                    },
+                    ctx.sym_id_base,
+                    ctx.layout,
                 ));
             }
         }
@@ -5262,7 +6153,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // producer writing slab 1 where the consumer reads slab 0. Deliberately a SPAN test and not
     // set-equality: producer and consumer legitimately split their work across cores differently, so
     // their per-core bases need not coincide — but a read outside everything written cannot be right.
-    check_internal_buffers_are_read_where_written(&ops, &bufs)?;
+    check_internal_buffers_are_read_where_written(ctx.ops, &bufs, &state)?;
     Ok(ops)
 }
 
@@ -5302,8 +6193,8 @@ mod buf_decl_tests {
         assert_eq!(HEAD_WIDE_BUFS, [R::RunO, R::OTmp]);
     }
 
-    /// Every role `BlockBufs` names is declared by one of the two lists — none may be minted and
-    /// then left to the lazy allocator.
+    /// Every role `BlockBufs` and `StateNames` name is declared by one of the two lists — none may
+    /// be minted and then left to the lazy allocator.
     #[test]
     fn every_block_buffer_role_is_declared_to_the_layout() {
         let declared: std::collections::BTreeSet<R> = STICK_WIDE_BUFS

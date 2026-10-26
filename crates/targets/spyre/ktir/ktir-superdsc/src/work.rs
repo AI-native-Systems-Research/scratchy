@@ -451,8 +451,8 @@ pub fn distribute_cores_reduced_axis(
 /// the `out:32` line, so it is the stick axis taking its share first that matters, not `mb` going unsplit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EwDivision {
-    /// THE LAW: whichever of the two below the op's operands call for ([`Self::resolve`]). Every
-    /// elementwise door passes this, except for the two ops below that state their division outright.
+    /// THE LAW: whichever of the three below the op's operands call for ([`Self::resolve`]). Every
+    /// elementwise door passes this, except for the ops below that state their division outright.
     Law,
     /// [`distribute_cores`]: `mb` first, then the other output dims largest-first. Stated outright only by
     /// an op whose own addressing is keyed on `mb` being the split axis (the gathered-row leg, whose index
@@ -462,19 +462,34 @@ pub enum EwDivision {
     /// outright by a decode batch chunk's `esub` and `exp`. Their shared core-local `cesub` is sized under
     /// it, so both ops keep it (`attn`'s `ChunkBufs::sm_division_of`).
     SticksFirst,
+    /// ⭐⭐⭐ [`distribute_cores_sprays_first`]: the LEADING `y` (the spray axis) first, then the ordinary
+    /// law over the cores it leaves. The ROW-SPLIT (y-major) mode's own — its tensors present
+    /// `["y", "mb", "out"]`, so `y` is the outermost dim of the flat layout and a core's slab is
+    /// CONTIGUOUS exactly when the split is over `y`. Stated by the y-major emission itself
+    /// ([`crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile`]'s row-split arm),
+    /// which refuses every other division for that mode by name — see the splitter's own doc for the
+    /// card measurement that made this a law rather than a preference.
+    SpraysFirst,
 }
 
 impl EwDivision {
     /// The concrete division. [`Self::Law`] resolves on the operands: `stick_major` is the builder's own
     /// rank-2 stick-major presentation decision — the SAME value that picks the operands' layout, so the
-    /// layout and the division cannot disagree — and `core_local` is whether any operand is a core-local
-    /// LX pin. Such a tensor's division is its PRODUCER's, held by `emit_sdsc_tiled`'s read law and sized
+    /// layout and the division cannot disagree — `core_local` is whether any operand is a core-local
+    /// LX pin (such a tensor's division is its PRODUCER's, held by `emit_sdsc_tiled`'s read law and sized
     /// by [`crate::emit::pointwise_untiled_slice_bytes`], so an op touching one under the law keeps the
-    /// rows-first division those were laid out under. A pin laid out under a stated division is sized
-    /// under that division instead ([`crate::emit::pointwise_untiled_slice_bytes_divided`]), and its ops
-    /// state it. The two concrete divisions resolve to themselves.
-    pub const fn resolve(self, stick_major: bool, core_local: bool) -> EwDivision {
+    /// rows-first division those were laid out under; a pin laid out under a stated division is sized
+    /// under that division instead, [`crate::emit::pointwise_untiled_slice_bytes_divided`], and its ops
+    /// state it), and `sprays` is the row-split (y-major) presentation decision, the same kind of fact:
+    /// the op's tensors walk `["y", "mb", "out"]`, and only a split over the leading `y` gives a core a
+    /// contiguous slab in that layout. The concrete divisions resolve to themselves.
+    ///
+    /// ⭐ `sprays` outranks `stick_major` by construction, not by choice: the row-split frame law holds
+    /// the op to ONE stick of `out` while the stick-major presentation requires wider than one, so the
+    /// two facts are disjoint and their order in the match cannot matter.
+    pub const fn resolve(self, stick_major: bool, core_local: bool, sprays: bool) -> EwDivision {
         match self {
+            EwDivision::Law if sprays => EwDivision::SpraysFirst,
             EwDivision::Law if stick_major && !core_local => EwDivision::SticksFirst,
             EwDivision::Law => EwDivision::RowsFirst,
             concrete => concrete,
@@ -488,6 +503,7 @@ impl EwDivision {
         match self {
             EwDivision::Law | EwDivision::RowsFirst => distribute_cores,
             EwDivision::SticksFirst => distribute_cores_sticks_first,
+            EwDivision::SpraysFirst => distribute_cores_sprays_first,
         }
     }
 }
@@ -774,6 +790,60 @@ pub fn distribute_cores_sticks_first(
             remaining /= split;
         }
     }
+    splits
+}
+
+/// ⭐⭐⭐⭐⭐ THE ROW-SPLIT (Y-MAJOR) OP'S OWN SPLITTER — the leading `y` (spray) axis first, then the
+/// ordinary law over the cores it leaves.
+///
+/// ## Why this is a correctness law, not a preference (MEASURED on card, granite-3.1-2b prefill)
+/// A row-split op presents its tensors `["y", "mb", "out"]` — `y` is the OUTERMOST dim of the flat
+/// layout, so a core's slab is CONTIGUOUS exactly when the split is over `y`: core `y0` owns
+/// `[mb, out]` at flat stick `y0·mb`, and the stride every level of the addressing derives (the
+/// per-core start `per_core_addr`, the on-card walk `build_coordinates`) is computed from the
+/// PER-CORE extents — which are the FULL extents for every dim the split does not touch.
+///
+/// Splitting any INNER dim instead hands every core a STRIDED stick set, and the per-core-extent
+/// stride derivation then mis-walks it. MEASURED on the prefill mask add (`11_add_o1417`, the
+/// `[y=32 qh, mb=21 t, out=64]` add of the causal mask): the rows-first law split `mb` 21 ways, so
+/// each core's per-core `mb` extent was 1 row — its within-slab `y` stride came out ONE STICK
+/// instead of 21, and its start address (the flat corner of `mb=c`) was one stick past the last.
+/// Read straight off the emitted descriptor's `startAddressCoreCorelet_`: every core's base advanced
+/// 128 B (ONE stick) while each core's slab was 32 sticks — the 21 cores covered sticks 0..51 of the
+/// 672-stick score tile (identity reads, `t=20` stuttering onto `t=19`), and 620 sticks were NEVER
+/// WRITTEN, read downstream as pure zero. That destroyed 29 of 32 heads' scores outright and
+/// mis-cut the causal mask for the rest — the attention-dilution defect this splitter exists to
+/// make unconstructible.
+///
+/// This is the y-major TWIN of [`distribute_cores`]' own mb-first note ("splitting `mb` first makes
+/// each core own WHOLE rows … so the flat start alone places the row and there is no mb-stride to
+/// mis-walk"): splitting `y` first makes each core own WHOLE SPRAYS, so the start alone places the
+/// spray and there is no y-stride to mis-walk.
+///
+/// The remainder is spent by the ordinary law over the dims the spray axis leaves (an `mb` split
+/// WITHIN one spray is contiguous — `mb` is the slab's own outer dim — so a short spray count loses
+/// no cores: the J-slot merge at `y=4, mb=64` divides `{y:4, mb:8}` over 32 cores).
+pub fn distribute_cores_sprays_first(
+    dims: &[ItDim],
+    max_cores: u32,
+) -> BTreeMap<&'static str, u32> {
+    let mut splits: BTreeMap<&'static str, u32> = BTreeMap::new();
+    let mut remaining = max_cores;
+    if let Some(y) = dims
+        .iter()
+        .find(|d| d.name == "y" && !d.is_reduction && !d.is_stick)
+    {
+        let split = core_split(y.size, remaining);
+        if split > 1 {
+            splits.insert(y.name, split);
+            remaining /= split;
+        }
+    }
+    // The cores the spray axis leaves, spent by the ordinary law over the dims it leaves — one
+    // budget, one call, so the spray split and the remainder can never disagree about the count.
+    let rest: Vec<ItDim> = dims.iter().filter(|d| d.name != "y").cloned().collect();
+    let mut remainder = distribute_cores(&rest, remaining);
+    splits.append(&mut remainder);
     splits
 }
 

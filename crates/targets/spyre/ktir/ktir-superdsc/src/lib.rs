@@ -58,6 +58,29 @@ pub mod addr;
 /// and `ir::bridge::tiled_op_sdsc_op::attn` — which its doc always said could not — now really
 /// cannot.
 pub mod emit;
+
+/// THE SCORE-SCALE LAW, AS TYPES — [`ScoreScaleLaw`] (where one bundle's attention multiplier
+/// lives, minted only where its proof exists), [`NewK`] (the K a KV-pool write carries, typed by
+/// its scale law), and the wall→type table for every way a score scale can go missing,
+/// mis-placed, or double-applied. Replaces `scale_in_weights: bool` and the recipe's bare
+/// `new_k: &str`.
+pub mod score_scale;
+
+/// THE EXP-BASE LAW, AS A TYPE — [`exp_base::ExpBase`] (the softmax recurrence's exponential
+/// step, carrying its base): the device's one exponential is e^x, so the op-func key the
+/// ladder's exp emissions use and the LOG2E restatement the door's identity guard checks are
+/// DERIVED from one law, not spelled at six sites and a guard. Deletes the bare `"exp"` strings
+/// in the attention ladder and the inline `LOG2_E` at the door — the two-spellings class, dead
+/// by type.
+pub mod exp_base;
+
+/// THE PAGE-PART LAW, AS A TYPE — [`page_part::PagePart`] (which page of a multi-page window an op
+/// addresses), minted only by the cutting law (`PagedKvPool::write_parts`), compared as an opaque
+/// type in the fusion walk, and carried to the launch from the walk's own trip. Deletes the
+/// `EmittedOp::kv_slot_offset`/`Trip::slot_offset` bare numbers and the per-group assert that
+/// guarded them: "a page part never shares a group" is unconstructible now, not checked.
+pub mod page_part;
+
 /// THE TileIR PIPELINE — the assemblers' INPUT type (`TileOp`/`TileOpKind`/`TiledOp`) and the tiler
 /// between them, plus the span-overflow refusal. Came in as an audit correction: the extraction filed
 /// the lowering's input as `KtirNode`, but every assembler under it takes a `&TileOp`.
