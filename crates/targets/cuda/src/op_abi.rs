@@ -12,7 +12,7 @@
 //! later issue writes: every op writes a fresh buffer and reads its inputs across the step, no row
 //! is sampled, and the folds are the `SiluMul` and `MoeRoute` folds, whose kernels exist. That
 //! costs arena space and launches; an opcode issue wins them back one row at a time, by changing
-//! only its own op's row.
+//! only its own op's row. The soft-cap has: its kernel writes over its input.
 
 use std::num::NonZeroU32;
 
@@ -38,7 +38,8 @@ pub const CUDA_COLOUR_FACTS: ColourFacts = ColourFacts {
 /// The match is exhaustive: a new `SubOp` (or `EwKind`) fails to compile here (E0004) until its
 /// author states which case it is, rather than silently defaulting to one.
 ///
-/// No row is in place: no CUDA kernel writes over an operand. The routed half of a MoE block is
+/// One row is in place: the soft-cap writes over its operand (`pointwise_bf16.cu`'s `out == x`
+/// contract); no other CUDA kernel writes over an operand. The routed half of a MoE block is
 /// off the arena: its values live in the tape's MoE scratch ([`cuda_moe_write`] says which
 /// region), not in a colour, because they are not bf16 `[m, cols]` (indices are i32, scores f32,
 /// the sorted rows padded to [`CUDA_EXPERT_TILE_ROWS`]), which the colourer's `rows × cols × 2`
@@ -55,6 +56,9 @@ pub fn cuda_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRule
         // Two-output ops bind a SECOND buffer (VisionRope's k', GateSplit's gate). A fact about the
         // op, not the kernel: without it the second buffer gets no colour.
         L::GateSplit { .. } | L::VisionRope => FRESH.reads_across().two_outputs(),
+        // The soft-cap writes over operand 0: `pointwise_bf16.cu` allows `out == x` exactly (each
+        // element is read and written by the same thread). Metal's row, with pointwise reads.
+        L::TanhSoftCap { .. } => FRESH.output(A::Operand(OperandIx(0))),
         // A fresh buffer, its inputs live through the step: an output never shares a colour with
         // one of its own inputs, whatever the kernel does.
         L::MatmulTile { .. }
@@ -79,7 +83,6 @@ pub fn cuda_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRule
         | L::RopeAppend { .. }
         | L::KvAppend { .. }
         | L::AttnDecode { .. }
-        | L::TanhSoftCap { .. }
         | L::RmsNormUnit { .. }
         | L::ScalarWeightMul
         | L::GateApply
@@ -588,7 +591,13 @@ mod tests {
             (SubOp::ScalarMul { scale: 53.0 }, fresh_across(Outputs::One)),
             (SubOp::RmsNormUnit { eps: 1e-6 }, fresh_across(Outputs::One)),
             (SubOp::ScalarWeightMul, fresh_across(Outputs::One)),
-            (SubOp::TanhSoftCap { cap: 30.0 }, fresh_across(Outputs::One)),
+            (
+                SubOp::TanhSoftCap { cap: 30.0 },
+                ColourRule {
+                    output: OutputAlias::Operand(OperandIx(0)),
+                    ..ColourRule::FRESH
+                },
+            ),
             (SubOp::Elementwise(EwKind::Gelu), fresh_across(Outputs::One)),
             (
                 SubOp::RouterNorm {

@@ -24,9 +24,9 @@
 //! - the router's 128-column GEMM at m ≥ 512 is the `RouterLogits` step on the 64-column kernel
 //!   (`MatmulKernel::Col64`), not a `GemmCol64` step, so `GemmCol64` counts the 60 dense gate and
 //!   up GEMMs only;
-//! - the m = 4096 arena is 5,660,823,040 bytes, not about 3.3 GB: the soft-cap writes a colour of
-//!   its own (`op_abi`'s fresh rule), so the lm_head's logits and the capped logits are two
-//!   `[4096, 262144]` bf16 buffers, 2,147,483,648 bytes each.
+//! - the soft-cap runs in place (`op_abi`'s in-place row, the user's decision of 2026-10-26), so
+//!   the lm_head's logits are the one `[m, 262144]` bf16 buffer: the m = 4096 arena is
+//!   3,513,339,392 bytes.
 
 #[path = "../../../targets/cuda/tests/common/chains.rs"]
 pub mod chains;
@@ -108,16 +108,16 @@ const PREFILL_STEPS: [(&str, usize); 5] = [
 ];
 const DECODE_STEP_COUNT: usize = 990;
 const PREFILL_STEP_COUNT: usize = 1020;
-const COLOURS: usize = 24;
+const COLOURS: usize = 23;
 
 /// Per bucket: the arena's `total_bytes` (with the token ids), the MoE scratch's offset and bytes
 /// (from `logits` to the end of the router-norm rows), and its max tiles.
 const ARENAS: [(u32, u64, u64, u64, u32); 5] = [
-    (1, 1_277_696, 1_192_192, 85_248, 0),
-    (512, 927_906_560, 609_618_688, 318_285_824, 159),
-    (1024, 1_604_037_376, 1_219_236_608, 384_796_672, 191),
-    (2048, 2_956_299_264, 2_438_472_448, 517_818_624, 255),
-    (4096, 5_660_823_040, 4_876_944_128, 783_862_528, 383),
+    (1, 753_408, 667_904, 85_248, 0),
+    (512, 659_471_104, 341_183_232, 318_285_824, 159),
+    (1024, 1_067_166_464, 682_365_696, 384_796_672, 191),
+    (2048, 1_882_557_440, 1_364_730_624, 517_818_624, 255),
+    (4096, 3_513_339_392, 2_729_460_480, 783_862_528, 383),
 ];
 
 /// The weight table: 627 entries naming the checkpoint's 657 text tensors (each expert bank names
@@ -491,12 +491,13 @@ fn the_moe_scratch_and_arena_are_the_measured_layout() {
         assert_eq!(moe.act.bytes, rows * u64::from(INTER) * 2, "m={m}: act");
     }
     // #885's m = 4096 numbers: 383 tiles (R = 49,024 rows), the down rows 276,103,168 bytes, and
-    // the logits (twice: the lm_head's and the soft-cap's) 2,147,483,648 bytes each.
+    // the logits 2,147,483,648 bytes, once: the soft-cap writes over the lm_head's logits, which
+    // saves a second 2,147,483,648-byte buffer at m = 4096.
     let tape = tape_of(4096);
     let moe = tape.moe.expect("a MoE scratch");
     assert_eq!((moe.max_tiles, moe.down.bytes), (383, 276_103_168));
     let logits = (tape.arena.colour_bytes.iter()).filter(|&&b| b == 2_147_483_648);
-    assert_eq!(logits.count(), 2, "the lm_head's and the soft-cap's logits");
+    assert_eq!(logits.count(), 1, "the lm_head's logits, capped in place");
 }
 
 /// The weight table: 627 entries, 30 expert banks, 657 distinct checkpoint tensors none named
@@ -579,6 +580,14 @@ fn the_weight_table_names_the_checkpoints_tensors() {
         assert!(
             matches!(tape.steps.last(), Some(CudaStep::SoftCap(_))),
             "m={m}: the tape ends with the soft-cap"
+        );
+        let Some(CudaStep::SoftCap(cap)) = tape.steps.last().copied() else {
+            panic!("m={m}: no soft-cap last");
+        };
+        assert_eq!(cap.x, cap.out, "m={m}: the soft-cap writes over its input");
+        assert_eq!(
+            cap.out, tape.result.offset,
+            "m={m}: the capped logits are the result"
         );
     }
 }

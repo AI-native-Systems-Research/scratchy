@@ -1080,8 +1080,11 @@ impl CudaTape {
                     return Err(TapeError::StepOutside { step, span, total });
                 }
             }
+            // An in-place kernel's write may be its read 0 exactly; any other overlap is refused.
+            let read0 = e.reads[0].filter(|_| e.in_place);
             for &write in writes {
-                if let Some(&read) = reads.clone().find(|&&r| overlap(r, write)) {
+                let clashes = |r: &&ArenaSpan| overlap(**r, write) && read0 != Some(write);
+                if let Some(&read) = reads.clone().find(clashes) {
                     return Err(TapeError::WriteOverlapsRead { step, write, read });
                 }
             }
@@ -2254,6 +2257,85 @@ mod tests {
                 write: span(524288, 524288),
                 read: span(262144, 524288)
             })
+        );
+    }
+
+    /// A soft-cap over `[256, 1024]` at colour 1 (`[262144, 786432)`), writing at `out`.
+    fn soft_cap(out: u64) -> CudaStep {
+        CudaStep::SoftCap(crate::step::SoftCapBf16 {
+            x: ArenaOffset(262144),
+            out: ArenaOffset(out),
+            rows: 256,
+            cols: 1024,
+            cap_bits: 30.0f32.to_bits(),
+        })
+    }
+
+    #[test]
+    fn a_soft_cap_may_write_over_its_input_exactly() {
+        assert_eq!(with_step(soft_cap(262144)).validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_soft_cap_partly_over_its_input_is_refused() {
+        // One alignment step past `x`, and one before it: each overlaps `x` without equalling it.
+        for out in [262144 + 256, 262144 - 256] {
+            assert_eq!(
+                with_step(soft_cap(out)).validate(),
+                Err(TapeError::WriteOverlapsRead {
+                    step: 0,
+                    write: span(out, 524288),
+                    read: span(262144, 524288)
+                }),
+                "out at {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_soft_cap_may_write_over_its_input() {
+        // A `Scale` and a unit norm share the soft-cap's operand shape but not its contract.
+        let scale = CudaStep::Scale(crate::step::ScaleBf16 {
+            x: ArenaOffset(262144),
+            out: ArenaOffset(262144),
+            rows: 256,
+            cols: 1024,
+            scale_bits: 2.0f32.to_bits(),
+        });
+        let unit = CudaStep::RmsNormUnit(crate::step::RmsNormUnitBf16 {
+            x: ArenaOffset(262144),
+            y: ArenaOffset(262144),
+            rows: 256,
+            cols: 1024,
+            eps_bits: 1e-6f32.to_bits(),
+        });
+        let add = CudaStep::Add(AddBf16 {
+            a: ArenaOffset(262144),
+            b: ArenaOffset(786432),
+            out: ArenaOffset(262144),
+            rows: 256,
+            cols: 1024,
+        });
+        for step in [scale, unit, add] {
+            assert_eq!(
+                with_step(step).validate(),
+                Err(TapeError::WriteOverlapsRead {
+                    step: 0,
+                    write: span(262144, 524288),
+                    read: span(262144, 524288)
+                }),
+                "{step:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_soft_cap_is_the_one_in_place_step_with_one_read() {
+        // The in-place fact names read 0 only: the soft-cap has no other read and one write.
+        let e = soft_cap(262144).extents();
+        assert_eq!(
+            e.map(|e| (e.reads, e.second_write, e.in_place)),
+            Some(([Some(span(262144, 524288)), None, None, None], None, true))
         );
     }
 
