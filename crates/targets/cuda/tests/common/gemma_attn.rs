@@ -219,3 +219,148 @@ pub fn gemma_attn(m: u32) -> LoweredDecode {
     }
     l
 }
+
+// ── One global attention layer (#923) ──────────────────────────────
+//
+// Gemma 4's global branch (`crates/models/arch/dsl/gemma4-moe.py:22-30`, HF's `attention_k_eq_v`):
+// q `[M, 8192]` normed per 512-lane head with its gain; ONE k projection `[M, 1024]` that is both
+// k (normed per head with its gain) and, unit-normed per head, v; both ropes proportional (128 of
+// 512 lanes, lane d < 64 paired with d + 256, theta 1e6, the global table); full causal attention
+// at scale 1; `o` `[M, 2816]` of an 8192 `K`. Every GEMM is on the 256-column tile (8192, 1024 and
+// 2816 = 11 · 256) or a GEMV, so the layer launches completely.
+//
+// Its 12 sources after `x`, in order: `g_in`, `Wq`, `q_norm`, `Wk`, `k_norm`, `cos_q`, `sin_q`,
+// `cos_k`, `sin_k` (the global table), `pk`, `pv` (`PrefixK`/`PrefixV` of its layer, `[8192,
+// 1024]`), `Wo`. Its 14 ops: `n`, `q`, `qh`, `qn`, `qf`, `kv`, `kh`, `kn`, `kf`, `vn =
+// RmsNormUnit(kv)`, `qr`, `kr = RopeAppend(kf, cos, sin, vn, pk, pv)`, `attn`, `o`.
+
+/// The global class's head dim and kv heads (`global_head_dim`, `num_global_key_value_heads`).
+pub const HD_GLOBAL: u32 = 512;
+pub const KV_HEADS_GLOBAL: u32 = 2;
+pub const Q_GLOBAL: u32 = HEADS * HD_GLOBAL;
+pub const KV_GLOBAL: u32 = KV_HEADS_GLOBAL * HD_GLOBAL;
+/// Model layer 5, Gemma's first global layer.
+pub const LAYER_GLOBAL: u32 = 5;
+/// The global layer's sources, after `x`.
+pub const GLOBAL_SOURCES: usize = 12;
+/// The global layer's ops.
+pub const GLOBAL_OPS: usize = 14;
+
+/// The global layer's sources and ops at `m` rows, reading its input `x`, its sources from index
+/// `src` on and numbering its ops from `op0`.
+fn global_layer(m: u32, x: InputRef, src: usize, op0: usize) -> (Vec<SourceShape>, Vec<OpDesc>) {
+    use InputRef::{Ext, Op};
+    let norm = SubOp::RmsNorm {
+        eps: EPS,
+        gain: GainConvention::Scale,
+    };
+    let matmul = |n| SubOp::MatmulTile {
+        n,
+        weight: GemmWeight::Dense,
+    };
+    let op = |op, inputs| OpDesc { op, m, inputs };
+    let shape = |rows, cols| SourceShape { rows, cols };
+    let view = |heads: u32, cols| SubOp::Reshape {
+        rows: RowScale::Times(NonZeroU32::new(heads).expect("a non-zero head count")),
+        cols,
+    };
+    let geom = ModelAttnGeometry::mint(
+        QueryHeads::new(HEADS),
+        KvHeads::new(KV_HEADS_GLOBAL),
+        HeadDim::new(HD_GLOBAL),
+    )
+    .expect("16 query heads over 2 kv heads");
+    let (e, o) = (|i: usize| Ext(src + i), |i: usize| Op(op0 + i));
+    let sources = vec![
+        shape(1, H),
+        shape(H, Q_GLOBAL),
+        shape(1, HD_GLOBAL),
+        shape(H, KV_GLOBAL),
+        shape(1, HD_GLOBAL),
+        shape(m, Q_GLOBAL),
+        shape(m, Q_GLOBAL),
+        shape(m, KV_GLOBAL),
+        shape(m, KV_GLOBAL),
+        shape(PREFIX_CAPACITY, KV_GLOBAL),
+        shape(PREFIX_CAPACITY, KV_GLOBAL),
+        shape(Q_GLOBAL, H),
+    ];
+    let ops = vec![
+        op(norm, vec![x, e(0)]),
+        op(matmul(Q_GLOBAL), vec![o(0), e(1)]),
+        op(view(HEADS, HD_GLOBAL), vec![o(1)]),
+        op(norm, vec![o(2), e(2)]),
+        op(view(1, Q_GLOBAL), vec![o(3)]),
+        op(matmul(KV_GLOBAL), vec![o(0), e(3)]),
+        op(view(KV_HEADS_GLOBAL, HD_GLOBAL), vec![o(5)]),
+        op(norm, vec![o(6), e(4)]),
+        op(view(1, KV_GLOBAL), vec![o(7)]),
+        // v is the unit-normed k projection, per kv head (`attention_k_eq_v`).
+        op(SubOp::RmsNormUnit { eps: EPS }, vec![o(5)]),
+        op(
+            SubOp::rope_rotate(HeadDim::new(HD_GLOBAL)),
+            vec![o(4), e(5), e(6)],
+        ),
+        op(
+            SubOp::rope_append(
+                HeadDim::new(HD_GLOBAL),
+                LAYER_GLOBAL,
+                AttnMask::Causal,
+                RopeFormTag::NeoX,
+            ),
+            vec![o(8), e(7), e(8), o(9), e(9), e(10)],
+        ),
+        op(
+            SubOp::attn_decode(geom, SCALE, PREFIX_CAPACITY, AttnMask::Causal),
+            vec![o(10), e(9), e(10), o(11), o(9)],
+        ),
+        op(matmul(H), vec![o(12), e(11)]),
+    ];
+    (sources, ops)
+}
+
+/// The global layer's bindings from source index `src` on: its ropes the global table, its
+/// caches layer [`LAYER_GLOBAL`]'s.
+fn bind_global(l: &mut LoweredDecode, src: usize) {
+    let layer = u64::from(LAYER_GLOBAL);
+    for (i, binding) in [
+        (5, SourceBinding::Cos { local: false }),
+        (6, SourceBinding::Sin { local: false }),
+        (7, SourceBinding::Cos { local: false }),
+        (8, SourceBinding::Sin { local: false }),
+        (9, SourceBinding::PrefixK { layer }),
+        (10, SourceBinding::PrefixV { layer }),
+    ] {
+        l.bindings[src + i] = binding;
+    }
+}
+
+/// The global layer alone at `m` rows: source 0 `x` (the embedded hidden), then its 12.
+pub fn gemma_attn_global(m: u32) -> LoweredDecode {
+    let (mut sources, ops) = global_layer(m, InputRef::Ext(0), 1, 0);
+    sources.insert(0, SourceShape { rows: m, cols: H });
+    let mut l = with_hidden(LoweringInput {
+        exported: None,
+        sources,
+        ops,
+        result: GLOBAL_OPS - 1,
+    });
+    bind_global(&mut l, 1);
+    l
+}
+
+/// The sliding layer ([`gemma_attn`], KV layer 0), then the global layer reading its output (KV
+/// layer [`LAYER_GLOBAL`]), in one tape: its 15 sources, then the global layer's 12.
+pub fn gemma_attn_two_classes(m: u32) -> LoweredDecode {
+    let mut input = gemma_attn_input(m);
+    let (src, op0) = (input.sources.len(), input.ops.len());
+    let (sources, ops) = global_layer(m, InputRef::Op(input.result), src, op0);
+    input.sources.extend(sources);
+    input.ops.extend(ops);
+    input.result = op0 + GLOBAL_OPS - 1;
+    let sliding = gemma_attn(m);
+    let mut l = with_hidden(input);
+    l.bindings[..sliding.bindings.len()].clone_from_slice(&sliding.bindings);
+    bind_global(&mut l, src);
+    l
+}

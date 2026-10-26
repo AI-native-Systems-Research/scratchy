@@ -3843,3 +3843,497 @@ fn all_finite_bf16(y: &[u16]) -> bool {
     y.iter()
         .all(|&b| half::bf16::from_bits(b).to_f32().is_finite())
 }
+
+// ── Gemma 4's global attention layer, and both classes in one pool (#923) ──
+
+use common::gemma_attn::{
+    GLOBAL_SOURCES, HD_GLOBAL, KV_GLOBAL, KV_HEADS_GLOBAL, Q_GLOBAL, gemma_attn_global,
+    gemma_attn_two_classes,
+};
+use scratchy_target_cuda::rotary::rotary_rows_with_freq_dim;
+
+const GG_HD: usize = HD_GLOBAL as usize;
+const GG_Q: usize = Q_GLOBAL as usize;
+const GG_KV: usize = KV_GLOBAL as usize;
+const GG_KVH: usize = KV_HEADS_GLOBAL as usize;
+const GG_ROT: usize = common::gemma_attn::R_GLOBAL as usize;
+
+/// `lower(m)` at m = 1 and 512 as CUDA's compiler lowers it, then [`whole_arena_tape`] over the
+/// largest arena: buckets 0, 1, 2 (fill).
+fn gg_buckets(
+    name: &str,
+    lower: fn(u32) -> scratchy_subtile::handoff::LoweredDecode,
+) -> Vec<CudaTape> {
+    let mut t: Vec<CudaTape> = [1u32, 512]
+        .iter()
+        .map(|&m| {
+            let at = CanonicalAt {
+                stem: "gemma_attn_global",
+                m: u64::from(m),
+            };
+            let c = lower_canonical(&lower(m), GEMMA_ATTN_FACTS, at)
+                .unwrap_or_else(|e| panic!("the Gemma {name} lowers at m={m}: {e}"));
+            static_tape(&c)
+        })
+        .collect();
+    let bytes = (t.iter().map(|t| t.arena.total_bytes))
+        .max()
+        .expect("tapes");
+    t.push(whole_arena_tape(bytes));
+    t
+}
+
+fn gg_global_buckets() -> &'static [CudaTape] {
+    static TAPES: std::sync::OnceLock<Vec<CudaTape>> = std::sync::OnceLock::new();
+    TAPES.get_or_init(|| gg_buckets("global layer", gemma_attn_global))
+}
+
+fn gg_two_buckets() -> &'static [CudaTape] {
+    static TAPES: std::sync::OnceLock<Vec<CudaTape>> = std::sync::OnceLock::new();
+    TAPES.get_or_init(|| gg_buckets("two-class chain", gemma_attn_two_classes))
+}
+
+/// The global layer's weights as bits and widened: `g_in`, `Wq`, `q_norm`, `Wk`, `k_norm`, `Wo`.
+struct GgWeights {
+    bits: [Vec<u16>; 6],
+    wide: [Vec<f64>; 6],
+}
+
+/// As [`ga_weights`]: gains near 1 (the q and k norms' near 1/4) and projections in [−1/16, 1/16].
+fn gg_weights() -> GgWeights {
+    let around = |len, seed, c: f32| -> Vec<u16> {
+        (bf16_inputs(len, seed).into_iter())
+            .map(|b| common::numerics::bits(c * (1.0 + half::bf16::from_bits(b).to_f32() / 8.0)))
+            .collect()
+    };
+    let small = |len, seed| -> Vec<u16> {
+        (bf16_inputs(len, seed).into_iter())
+            .map(|b| common::numerics::bits(half::bf16::from_bits(b).to_f32() / 16.0))
+            .collect()
+    };
+    let bits = [
+        around(GA_H, 0x0923_A001, 1.0),
+        small(GG_Q * GA_H, 0x0923_A002),
+        around(GG_HD, 0x0923_A003, 0.25),
+        small(GG_KV * GA_H, 0x0923_A004),
+        around(GG_HD, 0x0923_A005, 0.25),
+        small(GA_H * GG_Q, 0x0923_A006),
+    ];
+    let wide = bits.clone().map(|b| widen(&b));
+    GgWeights { bits, wide }
+}
+
+/// The global layer's 12 weight-table entries after `x`, in its sources' order (the rotary
+/// pairs and the caches empty).
+fn gg_entries(device: &CudaDevice, w: &GgWeights) -> Vec<DeviceBuffer> {
+    let up = |b: &[u16]| DeviceBuffer::upload(device, b).expect("upload a weight");
+    let e = DeviceBuffer::empty;
+    let [g, wq, qn, wk, kn, wo] = &w.bits;
+    let t = vec![
+        up(g),
+        up(wq),
+        up(qn),
+        up(wk),
+        up(kn),
+        e(),
+        e(),
+        e(),
+        e(),
+        e(),
+        e(),
+        up(wo),
+    ];
+    assert_eq!(t.len(), GLOBAL_SOURCES);
+    t
+}
+
+/// Each 512-lane head of `x` rotated proportionally at position `p`: lane `d < 64` with
+/// `d + 256` by `1 / 1e6^(2d / 512)`, the f64 angle's cos and sin for the reference, the bf16
+/// table's for the emulation; every other lane passes through.
+fn gg_rope(x: &[f64], p: u32, emulate: bool, rnd: fn(f64) -> f64) -> Vec<f64> {
+    let half = GG_ROT / 2;
+    let theta = common::gemma_attn::THETA_GLOBAL;
+    let (c, s): (Vec<f64>, Vec<f64>) = if emulate {
+        let t = widen(&rotary_rows_with_freq_dim(
+            &[p],
+            GG_ROT as u32,
+            HD_GLOBAL,
+            theta,
+        ));
+        (t[..half].to_vec(), t[half..].to_vec())
+    } else {
+        (0..half)
+            .map(|i| {
+                let a = f64::from(p) / theta.powf(2.0 * i as f64 / GG_HD as f64);
+                (a.cos(), a.sin())
+            })
+            .unzip()
+    };
+    let pair = GG_HD / 2;
+    let mut out = x.to_vec();
+    for head in out.as_chunks_mut::<GG_HD>().0 {
+        let src = head.to_vec();
+        for d in 0..half {
+            head[d] = rnd(src[d] * c[d] - src[d + pair] * s[d]);
+            head[d + pair] = rnd(src[d + pair] * c[d] + src[d] * s[d]);
+        }
+    }
+    out
+}
+
+/// The global layer's `(q, k, v)` for an input row `x` at position `p`: q and k projected,
+/// per-head normed and rotated; v the unit-normed k projection, per head.
+fn gg_token(x: &[f64], p: usize, w: &GgWeights, emulate: bool, with_q: bool) -> GaToken {
+    let rnd: fn(f64) -> f64 = if emulate { round_bf16 } else { |v| v };
+    let [g, wq, qn, wk, kn, _] = &w.wide;
+    let n = ga_norm(x, GA_H, Some(g), rnd);
+    let q = if with_q {
+        let q = ga_norm(&ga_gemv(&n, wq, GG_Q, rnd), GG_HD, Some(qn), rnd);
+        gg_rope(&q, p as u32, emulate, rnd)
+    } else {
+        Vec::new()
+    };
+    let kv = ga_gemv(&n, wk, GG_KV, rnd);
+    let k = gg_rope(&ga_norm(&kv, GG_HD, Some(kn), rnd), p as u32, emulate, rnd);
+    let v = ga_norm(&kv, GG_HD, None, rnd);
+    [q, k, v]
+}
+
+/// The global layer's output for input `x` at position `p` over the keys `0 ..= p` (16 heads
+/// over 2 kv heads, full causal, scale 1), every stored value through `rnd`; the emulation rounds
+/// each unnormalised `p` to bf16 before P·V, as the kernel does.
+fn gg_row(x: &[f64], p: usize, keys: &[GaToken], w: &GgWeights, emulate: bool) -> Vec<f64> {
+    let rnd: fn(f64) -> f64 = if emulate { round_bf16 } else { |v| v };
+    let [q, ..] = gg_token(x, p, w, emulate, true);
+    let heads = GG_Q / GG_HD;
+    let mut attn = vec![0.0; GG_Q];
+    for h in 0..heads {
+        let kh = h / (heads / GG_KVH);
+        let qh = &q[h * GG_HD..][..GG_HD];
+        let s: Vec<f64> = (0..=p)
+            .map(|j| {
+                let kj = &keys[j][1][kh * GG_HD..][..GG_HD];
+                f64::from(common::gemma_attn::SCALE)
+                    * qh.iter().zip(kj).map(|(a, b)| a * b).sum::<f64>()
+            })
+            .collect();
+        let m = s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let e: Vec<f64> = s.iter().map(|x| (x - m).exp()).collect();
+        let l: f64 = e.iter().sum();
+        for d in 0..GG_HD {
+            let o: f64 = (0..=p)
+                .zip(&e)
+                .map(|(j, &ej)| rnd(ej) * keys[j][2][kh * GG_HD + d])
+                .sum();
+            attn[h * GG_HD + d] = rnd(o / l);
+        }
+    }
+    ga_gemv(&attn, &w.wide[5], GA_H, rnd)
+}
+
+/// `f(p)` for `p` in `0 .. n`, across the host's threads.
+fn gg_par<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let threads = std::thread::available_parallelism().map_or(1, |t| t.get());
+    let per = n.div_ceil(threads).max(1);
+    let f = &f;
+    std::thread::scope(|scope| {
+        let parts: Vec<_> = (0..threads)
+            .map(|t| {
+                scope.spawn(move || (t * per..((t + 1) * per).min(n)).map(f).collect::<Vec<_>>())
+            })
+            .collect();
+        (parts.into_iter())
+            .flat_map(|h| h.join().expect("a reference thread"))
+            .collect()
+    })
+}
+
+/// One forward of bucket `b` of `tapes` over positions `p .. p + len` with `input(p + i)` as row
+/// `i`; the output's real rows.
+fn gg_forward(
+    worker: &mut CudaWorker<'_>,
+    (tapes, b): (&[CudaTape], usize),
+    (p, len): (usize, usize),
+    table: &[u32],
+    input: &dyn Fn(usize) -> Vec<u16>,
+) -> Vec<u16> {
+    let m = tapes[b].bucket_m as usize;
+    let mut x = vec![0u16; m * GA_H];
+    for i in 0..len {
+        x[i * GA_H..][..GA_H].copy_from_slice(&input(p + i));
+    }
+    let seq = KvSequence {
+        block_table: &table[..(p + len).div_ceil(64)],
+        prefix_len: p as u32,
+        q_len: len as u32,
+    };
+    let mut y = vec![0u16; m * GA_H];
+    (worker.forward(
+        b,
+        Input::Hidden(&x),
+        &seq_positions(m, p as u32),
+        Some(&seq),
+        None,
+        &mut y,
+    ))
+    .expect("a Gemma global layer forward");
+    y.truncate(len * GA_H);
+    y
+}
+
+/// One checked row: its position, its input for the reference and for the emulation, and CUDA's
+/// output.
+type GgRow = (usize, Vec<f64>, Vec<f64>, Vec<u16>);
+
+/// CUDA's rows (each its input at its position) against the f64 global layer, RMS and max error
+/// each at most 2× the bf16 emulation's.
+fn gg_check(
+    what: &str,
+    rows: &[GgRow],
+    (keys, emu_keys): (&[GaToken], &[GaToken]),
+    w: &GgWeights,
+) -> bool {
+    let refs = gg_par(rows.len(), |i| {
+        let (p, x, ex, _) = &rows[i];
+        (
+            gg_row(x, *p, keys, w, false),
+            gg_row(ex, *p, emu_keys, w, true),
+        )
+    });
+    let gpu: Vec<f64> = rows.iter().flat_map(|r| widen(&r.3)).collect();
+    let r: Vec<f64> = refs.iter().flat_map(|(r, _)| r.clone()).collect();
+    let e: Vec<f64> = refs.iter().flat_map(|(_, e)| e.clone()).collect();
+    let finite = gpu.iter().all(|v| v.is_finite());
+    let (cuda_rms, cuda_max) = rms_max(&gpu, &r);
+    let (emu_rms, emu_max) = rms_max(&e, &r);
+    let ok = finite && cuda_rms <= 2.0 * emu_rms && cuda_max <= 2.0 * emu_max;
+    eprintln!(
+        "gemma global layer {what} ({} rows): cuda_rms={cuda_rms:.4e} cuda_max={cuda_max:.4e} \
+         emulation_rms={emu_rms:.4e} emulation_max={emu_max:.4e} rms_ratio={:.4} max_ratio={:.4} \
+         finite={finite} {}",
+        rows.len(),
+        cuda_rms / (2.0 * emu_rms),
+        cuda_max / (2.0 * emu_max),
+        verdict(ok)
+    );
+    ok
+}
+
+/// Gemma 4's global attention layer alone at the real geometry (H 2816, 16 q heads over 2 kv
+/// heads of 512, proportional rope, `attention_k_eq_v`, full causal), against the f64 layer
+/// (CUDA's RMS and max error each at most 2× a host emulation's that rounds to bf16 where the tape
+/// stores): a fresh 512-row prefill (every eighth row checked), then a chunk at P = 512, L = 300,
+/// then decodes from P = 812 to 820. Also: the arena poisoned with NaN gives finite, bit-identical
+/// output; five forwards allocate nothing; repeats are bit-identical.
+#[test]
+fn gemma_attn_global_layer_matches_the_f64_layer() {
+    let device = h100();
+    let tapes = gg_global_buckets();
+    for (b, t) in tapes[..2].iter().enumerate() {
+        let kinds: Vec<String> = (t.steps.iter())
+            .map(|s| format!("{s:?}").split('(').next().unwrap_or("").to_owned())
+            .collect();
+        eprintln!("gemma global layer bucket {b} m={}: {kinds:?}", t.bucket_m);
+    }
+    let w = gg_weights();
+    let mut entries = vec![DeviceBuffer::empty()];
+    entries.extend(gg_entries(&device, &w));
+    let weights: &'static [DeviceBuffer] = Box::leak(entries.into_boxed_slice());
+    let mut worker = CudaWorker::new(&device, tapes, weights, GA_POOL, None).expect("worker");
+    let table = ga_table();
+    let tokens = 821;
+    let xs: Vec<Vec<f64>> = (0..tokens).map(|p| widen(&ga_x(p))).collect();
+    let keys = gg_par(tokens, |p| gg_token(&xs[p], p, &w, false, false));
+    let emu_keys = gg_par(tokens, |p| gg_token(&xs[p], p, &w, true, false));
+    let kv = (&keys[..], &emu_keys[..]);
+    let input = |p: usize| ga_x(p);
+    let rows = |y: &[u16], p: usize, len: usize, step: usize| {
+        (0..len)
+            .step_by(step)
+            .map(|i| {
+                (
+                    p + i,
+                    xs[p + i].clone(),
+                    xs[p + i].clone(),
+                    y[i * GA_H..][..GA_H].to_vec(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut pass = true;
+    let fresh = gg_forward(&mut worker, (tapes, 1), (0, 512), &table, &input);
+    pass &= gg_check("fresh prefill P=0 L=512", &rows(&fresh, 0, 512, 8), kv, &w);
+    let chunk = gg_forward(&mut worker, (tapes, 1), (512, 300), &table, &input);
+    pass &= gg_check("chunk P=512 L=300", &rows(&chunk, 512, 300, 4), kv, &w);
+    for p in 812..=820 {
+        let y = gg_forward(&mut worker, (tapes, 0), (p, 1), &table, &input);
+        pass &= gg_check(&format!("decode P={p}"), &rows(&y, p, 1, 1), kv, &w);
+    }
+    // The invariants, over the 812-token sequence the forwards above wrote.
+    let fill = tapes.len() - 1;
+    let bytes = tapes[fill].arena.total_bytes;
+    for (b, p, len) in [(1usize, 512usize, 300usize), (0, 812, 1)] {
+        fill_arena(&mut worker, fill, bytes, 0);
+        let clean = gg_forward(&mut worker, (tapes, b), (p, len), &table, &input);
+        fill_arena(&mut worker, fill, bytes, 0x7FC0);
+        let poisoned = gg_forward(&mut worker, (tapes, b), (p, len), &table, &input);
+        let repeat = gg_forward(&mut worker, (tapes, b), (p, len), &table, &input);
+        let finite = all_finite_bf16(&poisoned);
+        let (poison, rep) = (
+            mismatched_bits(&poisoned, &clean),
+            mismatched_bits(&repeat, &poisoned),
+        );
+        let ok = finite && poison == 0 && rep == 0;
+        eprintln!(
+            "gemma global layer m={} P={p} L={len}: arena NaN: \
+             nan_poison_vs_zero_mismatched_bits={poison} finite={finite} \
+             repeat_mismatched_bits={rep} {}",
+            tapes[b].bucket_m,
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    let at = device.allocations();
+    for b in [1usize, 0, 1, 0, 1] {
+        let (p, len) = if b == 1 { (512, 300) } else { (812, 1) };
+        gg_forward(&mut worker, (tapes, b), (p, len), &table, &input);
+    }
+    let during = device.allocations() - at;
+    eprintln!(
+        "gemma global layer five forwards: allocations={during} (expect 0) {}",
+        verdict(during == 0)
+    );
+    pass &= during == 0;
+    assert!(
+        pass,
+        "the Gemma global layer is out of bound: see the lines above"
+    );
+}
+
+/// A sliding layer (KV layer 0, 8 × 256, window 1024) then a global layer (KV layer 5, 2 × 512)
+/// in one tape, so the worker's pool holds both classes: a prefill of 300 then decodes to 310,
+/// the global layer's output against the f64 chain (its input the sliding layer's f64 output for
+/// the reference, its bf16 emulation's for the emulation). The pool is each class's K and V a
+/// token, (8 · 256 + 2 · 512) · 2 · 2 = 12,288 bytes, times the blocks' 64 slots. The two classes
+/// do not overlap: a forward of NaN rows over the blocks the sequence does not use writes NaN K
+/// and V into both layers' other blocks, and leaves both layers' blocks of the sequence (read back)
+/// and the last decode's output bit-identical, which a layer at the other class's offset or
+/// stride would not.
+#[test]
+fn gemma_attn_two_classes_share_the_pool() {
+    let device = h100();
+    let tapes = gg_two_buckets();
+    let sw = ga_weights();
+    let gw = gg_weights();
+    let mut entries: Vec<DeviceBuffer> = ga_table_buffers(&device, &sw)
+        .iter()
+        .map(|b| match b.bytes() {
+            0 => DeviceBuffer::empty(),
+            _ => DeviceBuffer::upload(&device, &b.download().expect("a weight")).expect("upload"),
+        })
+        .collect();
+    entries.extend(gg_entries(&device, &gw));
+    let weights: &'static [DeviceBuffer] = Box::leak(entries.into_boxed_slice());
+    let mut worker = CudaWorker::new(&device, tapes, weights, GA_POOL, None).expect("worker");
+    // The pool: the sliding class's 8 · 256 and the global class's 2 · 512, K and V, per token.
+    let per_token = (8 * 256 + 2 * 512) * 2 * 2;
+    let want = per_token * u64::from(GA_BLOCKS) * 64;
+    let pool = worker.kv_pool_bytes();
+    eprintln!("gemma two classes: pool {pool:?} bytes, {per_token} a token at {GA_BLOCKS} blocks");
+    let mut pass = pool == Some(want);
+    let table = ga_table();
+    let tokens = 311;
+    // The sliding layer's keys (both flavours) and its output rows, the global layer's inputs.
+    let (skeys, semu) = (ga_keys(&sw, tokens, false), ga_keys(&sw, tokens, true));
+    let xs: Vec<Vec<f64>> = gg_par(tokens, |p| ga_row(p, &skeys, &sw, false));
+    let exs: Vec<Vec<f64>> = gg_par(tokens, |p| ga_row(p, &semu, &sw, true));
+    let keys = gg_par(tokens, |p| gg_token(&xs[p], p, &gw, false, false));
+    let emu_keys = gg_par(tokens, |p| gg_token(&exs[p], p, &gw, true, false));
+    let kv = (&keys[..], &emu_keys[..]);
+    let input = |p: usize| ga_x(p);
+    let mut outs = Vec::new();
+    let prefill = gg_forward(&mut worker, (tapes, 1), (0, 300), &table, &input);
+    let rows: Vec<_> = (0..300)
+        .step_by(6)
+        .map(|i| {
+            (
+                i,
+                xs[i].clone(),
+                exs[i].clone(),
+                prefill[i * GA_H..][..GA_H].to_vec(),
+            )
+        })
+        .collect();
+    pass &= gg_check("two classes prefill P=0 L=300", &rows, kv, &gw);
+    outs.push(prefill);
+    for p in 300..=310 {
+        let y = gg_forward(&mut worker, (tapes, 0), (p, 1), &table, &input);
+        pass &= gg_check(
+            &format!("two classes decode P={p}"),
+            &[(p, xs[p].clone(), exs[p].clone(), y.clone())],
+            kv,
+            &gw,
+        );
+        outs.push(y);
+    }
+    // Non-overlap: read back each layer's cache blocks of the sequence, then write NaN rows over
+    // the blocks the sequence does not use, of both layers at once (a forward of NaN rows at the
+    // unused blocks' table), and re-run the last decode: each layer reads only its own buffer at
+    // its own class's layout, so its blocks are untouched and the output is bit-identical.
+    let used = (tokens).div_ceil(64);
+    let mut before = Vec::new();
+    for layer in 0..2 {
+        for &block in &table[..used] {
+            let elems = if layer == 0 {
+                8 * 64 * 256
+            } else {
+                GG_KVH * 64 * GG_HD
+            };
+            let mut k = vec![0u16; elems];
+            worker
+                .read_kv(layer, KvHalf::K, block, &mut k)
+                .expect("read a cache block");
+            before.push(k);
+        }
+    }
+    let unused: Vec<u32> = table[used..].to_vec();
+    let nan_rows = unused.len() * 64;
+    for start in (0..nan_rows).step_by(512) {
+        let len = 512.min(nan_rows - start);
+        // The unused blocks as a sequence of their own, at positions `start ..`.
+        let t = unused[..(start + len).div_ceil(64)].to_vec();
+        gg_forward(&mut worker, (tapes, 1), (start, len), &t, &|_| {
+            vec![0x7FC0; GA_H]
+        });
+    }
+    let mut after = Vec::new();
+    for layer in 0..2 {
+        for &block in &table[..used] {
+            let elems = if layer == 0 {
+                8 * 64 * 256
+            } else {
+                GG_KVH * 64 * GG_HD
+            };
+            let mut k = vec![0u16; elems];
+            worker
+                .read_kv(layer, KvHalf::K, block, &mut k)
+                .expect("read a cache block");
+            after.push(k);
+        }
+    }
+    let untouched = before == after;
+    let again = gg_forward(&mut worker, (tapes, 0), (310, 1), &table, &input);
+    let mismatched = mismatched_bits(&again, outs.last().expect("a decode"));
+    let ok = untouched && mismatched == 0;
+    eprintln!(
+        "gemma two classes non-overlap: the sequence's blocks untouched={untouched} after NaN \
+         rows over {} unused blocks of both layers; decode P=310 again mismatched_bits={mismatched} {}",
+        unused.len(),
+        verdict(ok)
+    );
+    pass &= ok;
+    assert!(
+        pass,
+        "the two-class chain is out of bound, or the classes overlap in the pool"
+    );
+}
