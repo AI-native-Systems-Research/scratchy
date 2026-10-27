@@ -94,6 +94,14 @@ fn accuracy(c: &TaskCell) -> Option<f64> {
         .filter(|_| c.thinking_answers.unwrap_or(0) == 0 && !mostly_capped(c))
 }
 
+/// How many times faster scratchy is to its first token than the rival: none where either mostly
+/// ran its answers to their cap, whose requests were not the tasks' answers.
+fn ttft_times(c: &TaskCell, r: &TaskCell) -> Option<f64> {
+    (!mostly_capped(c) && !mostly_capped(r))
+        .then(|| times(c.median_ttft_ms, r.median_ttft_ms, true))
+        .flatten()
+}
+
 /// How far apart two cells' mean answers may be, as a share of the longer, for their whole
 /// answers' times to be compared: an engine that stops at EOS where the other runs on (oMLX does,
 /// despite `ignore_eos`) answers in fewer tokens, and its time is no faster for it.
@@ -170,7 +178,7 @@ pub fn tasks_table(m: &Model) -> Element {
                 {
                     let (name, _) = workload_label(&c.workload);
                     let them = rival(m, &c.workload, c.conc);
-                    let ttft = them.and_then(|(_, r)| times(c.median_ttft_ms, r.median_ttft_ms, true));
+                    let ttft = them.and_then(|(_, r)| ttft_times(c, r));
                     let total = them.and_then(|(_, r)| total_times(c, r));
                     // A borrowed rival says which run it is from, as the grid's borrowed engines do.
                     let vs = them.map_or_else(
@@ -258,7 +266,7 @@ pub fn glance_squares(m: &Model) -> Option<(Engine, Vec<GlanceSquare>)> {
                 (rival.tasks(m).iter()).find(|c| c.workload == w && c.conc == u && c.measured());
             let r = mine
                 .zip(theirs)
-                .and_then(|(a, b)| times(a.median_ttft_ms, b.median_ttft_ms, true));
+                .and_then(|(a, b)| ttft_times(a, b));
             (u, w.to_string(), r)
         })
         .collect();
@@ -308,6 +316,8 @@ mod tests {
         assert_eq!(total_times(&cell(100.0, 0), &cell(105.0, 0)), Some(1.0));
         assert_eq!(total_times(&cell(100.0, 0), &cell(150.0, 0)), None, "longer");
         assert_eq!(total_times(&cell(100.0, 0), &cell(100.0, 5)), None, "capped");
+        assert_eq!(ttft_times(&cell(100.0, 0), &cell(50.0, 0)), Some(1.0), "any length");
+        assert_eq!(ttft_times(&cell(100.0, 0), &cell(100.0, 5)), None, "a capped rival");
         let mut unknown = cell(100.0, 0);
         unknown.mean_output_tokens = None;
         assert_eq!(total_times(&cell(100.0, 0), &unknown), None, "no length");

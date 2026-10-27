@@ -178,8 +178,9 @@ fn borrow_earlier(runs: &mut [Run]) {
     let mut engines: BTreeMap<(String, String, &str), Measured> = BTreeMap::new();
     let mut frozen: BTreeMap<(String, String), (Vec<data::Rep>, data::Utc)> = BTreeMap::new();
     // Per (machine, model, engine): its dataset cells as last measured, each tagged with when,
-    // and the task cap they were measured under.
-    type Tasked = (Vec<data::TaskCell>, Option<u32>);
+    // with the task cap and the scaling they were measured under (whose rounds say how many tasks
+    // each cell sent).
+    type Tasked = (Vec<data::TaskCell>, Option<u32>, Option<data::TaskSizing>);
     let mut task_cells: BTreeMap<(String, String, &str), Tasked> = BTreeMap::new();
     for i in order {
         let run = &mut runs[i];
@@ -205,11 +206,14 @@ fn borrow_earlier(runs: &mut [Run]) {
                 }
             }
             // A rival's dataset cells, workload by workload: one this run left out comes from the
-            // newest earlier run that measured that workload at that users count under the same
-            // task cap. The tasks are seeded by model, workload and users count, so the same three
-            // mean the same tasks. Only engines this run did not time at all are filled, so a
-            // run's own measurements are never mixed with another's.
+            // newest earlier run that measured that workload at that users count, under the same
+            // task cap and with as many tasks. The tasks are sampled by a seed of model, workload
+            // and users count, so with the same cap and count they are the same tasks; a full
+            // run's cell at 4 users sends 16 where a quick run's sends 8. Only engines this run
+            // did not time at all are filled, so a run's own measurements are never mixed with
+            // another's.
             let cap = run_task_cap(&run.config);
+            let sizing = (run.config.scaling.as_ref()).and_then(data::Scaling::task_sizing);
             for e in Engine::RIVALS {
                 let Some(slot) = e.tasks_mut(m) else { continue };
                 let key = (at.0.clone(), at.1.clone(), e.key());
@@ -223,11 +227,24 @@ fn borrow_earlier(runs: &mut [Run]) {
                                 ..c.clone()
                             })
                             .collect();
-                        task_cells.insert(key, (lent, cap));
+                        task_cells.insert(key, (lent, cap, sizing));
                     }
                     None => {
-                        if let Some((cells, _)) = task_cells.get(&key).filter(|(_, c)| *c == cap) {
-                            *slot = Some(cells.clone());
+                        let Some((cells, _, theirs)) =
+                            task_cells.get(&key).filter(|(_, c, _)| *c == cap)
+                        else {
+                            continue;
+                        };
+                        let same_tasks = |c: &data::TaskCell| match (sizing, *theirs) {
+                            (Some(a), Some(b)) => {
+                                a.count(&c.workload, c.conc) == b.count(&c.workload, c.conc)
+                            }
+                            _ => false,
+                        };
+                        let kept: Vec<data::TaskCell> =
+                            cells.iter().filter(|c| same_tasks(c)).cloned().collect();
+                        if !kept.is_empty() {
+                            *slot = Some(kept);
                         }
                     }
                 }
@@ -4448,6 +4465,47 @@ mod tests {
             Engine::OmlxTq.tasks(&runs[0].models[0]).is_empty(),
             "another task cap means other tasks"
         );
+
+        // A run of more rounds sends more tasks at more users: at 8 rounds a 2-user cell sends 16
+        // where the quick run's sends 8, so only the 1-user cells (8 both ways) are the same.
+        let mut more_rounds = full.clone();
+        more_rounds["config"]["scaling"]["min_rounds_per_cell"] = 8.into();
+        let mut runs = vec![load(&quick), load(&more_rounds)];
+        super::borrow_earlier(&mut runs);
+        let users: std::collections::BTreeSet<u32> = (Engine::OmlxTq.tasks(&runs[0].models[0]))
+            .iter()
+            .map(|c| c.conc)
+            .collect();
+        assert_eq!(users, [1].into(), "only the cells of as many tasks");
+
+        // A run that does not say how it sized its cells lends none.
+        let mut unsized_run = full.clone();
+        unsized_run["config"]["scaling"]
+            .as_object_mut()
+            .unwrap()
+            .remove("min_rounds_per_cell");
+        let mut runs = vec![load(&quick), load(&unsized_run)];
+        super::borrow_earlier(&mut runs);
+        assert!(Engine::OmlxTq.tasks(&runs[0].models[0]).is_empty());
+    }
+
+    /// A cell's task count, as the matrix sizes it: users × rounds, at least the fewest; a quarter
+    /// in conversations of four turns, at least 2.
+    #[test]
+    fn a_cells_task_count_is_the_matrix_s() {
+        let quick = super::data::TaskSizing {
+            rounds: 2,
+            min_tasks: 8,
+        };
+        let full = super::data::TaskSizing {
+            rounds: 4,
+            min_tasks: 8,
+        };
+        assert_eq!(quick.count("rag", 1), 8);
+        assert_eq!(quick.count("rag", 4), 8);
+        assert_eq!(full.count("rag", 4), 16, "Nick's case: 16 against 8");
+        assert_eq!(quick.count("sharegpt-multi-turn", 2), 2);
+        assert_eq!(full.count("sharegpt-multi-turn", 16), 16);
     }
 
     /// Two runs that ran a workload at 1 user give it a timeline; the random grid's timelines are

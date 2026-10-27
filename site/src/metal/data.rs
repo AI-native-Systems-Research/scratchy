@@ -344,6 +344,44 @@ pub struct Scaling {
     /// A dataset task's longest prompt, in tokens: a longer one was left out, on every engine.
     #[serde(default)]
     pub task_max_prompt: Option<u32>,
+    /// The rounds of its users count a cell ran at least: with `task_min_prompts`, how many tasks
+    /// a dataset cell sent, in runs from before each cell recorded it.
+    #[serde(default)]
+    pub min_rounds_per_cell: Option<u32>,
+    #[serde(default)]
+    pub task_min_prompts: Option<u32>,
+}
+
+impl Scaling {
+    /// How a run sized its dataset cells: its rounds and its fewest tasks a cell, where it says.
+    pub fn task_sizing(&self) -> Option<TaskSizing> {
+        Some(TaskSizing {
+            rounds: self.min_rounds_per_cell?,
+            min_tasks: self.task_min_prompts?,
+        })
+    }
+}
+
+/// How a run sized its dataset cells (`run_task_cell`): `users` × `rounds` tasks, at least
+/// `min_tasks`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct TaskSizing {
+    pub rounds: u32,
+    pub min_tasks: u32,
+}
+
+impl TaskSizing {
+    /// How many tasks (conversations, for `sharegpt-multi-turn`) a cell of this workload at
+    /// `users` sent: `users` × the rounds, at least the fewest; a quarter of that in conversations
+    /// of four turns, at least 2.
+    pub fn count(self, workload: &str, users: u32) -> u32 {
+        let n = (users * self.rounds).max(self.min_tasks);
+        if workload == "sharegpt-multi-turn" {
+            (n / 4).max(2)
+        } else {
+            n
+        }
+    }
 }
 
 /// What a model ran at when a limit lowered it (GLM-4.5-Air: 4 users).
@@ -532,7 +570,8 @@ pub struct TaskCell {
     /// Answers that ran to their cap rather than ending on their own.
     #[serde(default)]
     pub capped_answers: Option<u32>,
-    /// Tasks sent, the denominator of accuracy. None in runs from before it was recorded.
+    /// Tasks sent, the denominator of accuracy (turns, for a conversation workload). None in runs
+    /// from before it was recorded.
     #[serde(default)]
     pub num_tasks: Option<u32>,
     #[serde(default)]
