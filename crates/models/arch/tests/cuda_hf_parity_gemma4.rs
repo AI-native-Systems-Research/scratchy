@@ -546,3 +546,66 @@ fn diag_p1_prompt_6_rows_and_p3_prompt_3_row_9() {
         cosine(&b, &f)
     );
 }
+
+// ── #933's diagnosis prints, part 2: decode at the bad rows ────────
+
+/// The (prompt, row) pairs the decode diagnosis runs a second way: prompt 6's rows whose CUDA
+/// error is furthest above HF-bf16's (`/tmp/v933-diag2.md`), and prompt 3's row 9.
+const DIAG_DECODE_ROWS: [(usize, usize); 7] = [
+    (DIAG_P1_PROMPT, 25),
+    (DIAG_P1_PROMPT, 30),
+    (DIAG_P1_PROMPT, 37),
+    (DIAG_P1_PROMPT, 41),
+    (DIAG_P1_PROMPT, 71),
+    (DIAG_P1_PROMPT, 148),
+    (DIAG_P3_PROMPT, DIAG_P3_ROW),
+];
+
+/// #933's diagnosis, part 2, test A (`/tmp/v933-diag2.md`), printed only, nothing gated: each row
+/// `r` of [`DIAG_DECODE_ROWS`] as a decode (a fresh prefill of the prompt's rows `0..r` in m=512,
+/// then one decode of token `r` at P = `r`), beside CUDA's one-shot row `r` (one fresh m=512
+/// forward of the whole prompt) and the goldens' row `r`. Per row: cosine, RMS and max |·| of
+/// decode − HF-f32, one-shot − HF-f32 and HF-bf16 − HF-f32; cosine and max |·| of decode −
+/// one-shot; each side's argmax; and the first layer whose decode picks differ from the
+/// one-shot's, and how many do. The decode runs the decode attention and the gathered expert
+/// GEMV; the one-shot the prefill attention, the sort and the grouped GEMM.
+#[test]
+fn diag_decode_at_the_bad_rows() {
+    let r = rig();
+    for prompt in [DIAG_P1_PROMPT, DIAG_P3_PROMPT] {
+        let p = (prompts().iter().find(|p| p.p == prompt))
+            .unwrap_or_else(|| panic!("prompt {prompt} in meta.json"));
+        let mut c = DecodeCheck::new(&r, M, &p.ids);
+        for &(_, row) in DIAG_DECODE_ROWS.iter().filter(|(q, _)| *q == prompt) {
+            assert!(
+                row > 0 && row < p.ids.len(),
+                "prompt {prompt} has row {row} after a prefix"
+            );
+            c.prefill(M, &p.ids[..row]);
+            let (first, count, decode) = c.decode(p.ids[row], row);
+            let at = |v: &[f32]| v[row * VOCAB..][..VOCAB].to_vec();
+            let (one_shot, f, b) = (at(&c.one_shot), at(&p.f32), at(&p.bf16));
+            let ((drms, dmax), (orms, omax), (brms, bmax)) =
+                (error(&decode, &f), error(&one_shot, &f), error(&b, &f));
+            let (_, dvo) = error(&decode, &one_shot);
+            let argmax = |v: &[f32]| top_k(v, 1)[0];
+            eprintln!(
+                "diag decode prompt {prompt} row {row} (token {}): decode vs HF-f32 cosine={:.6} \
+                 RMS={drms:.4e} max={dmax:.4e}; one-shot vs HF-f32 cosine={:.6} RMS={orms:.4e} \
+                 max={omax:.4e}; HF-bf16 vs HF-f32 cosine={:.6} RMS={brms:.4e} max={bmax:.4e}; \
+                 decode vs one-shot cosine={:.6} max={dvo:.4e}; argmax decode {} one-shot {} \
+                 HF-f32 {} HF-bf16 {}; first layer whose decode picks differ from the \
+                 one-shot's={first:?}, layers that differ={count} of {LAYERS} (information only)",
+                p.ids[row],
+                cosine(&decode, &f),
+                cosine(&one_shot, &f),
+                cosine(&b, &f),
+                cosine(&decode, &one_shot),
+                argmax(&decode),
+                argmax(&one_shot),
+                argmax(&f),
+                argmax(&b)
+            );
+        }
+    }
+}

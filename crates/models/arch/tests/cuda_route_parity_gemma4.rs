@@ -45,3 +45,59 @@ const TOP_K: usize = 8;
 const EXPERTS: i32 = 128;
 /// No GDN layer: no GDN pool, and no `GdnSequence` in a forward.
 const GDN_POOL: Option<GdnPoolConfig> = None;
+
+/// The prompt and row #933's diagnosis, part 2, test B reads (`/tmp/v933-diag2.md`): prompt 3's
+/// row 9, 6 logits off HF-f32 on CUDA.
+const DIAG_PROMPT: usize = 3;
+const DIAG_ROW: usize = 9;
+
+/// #933's diagnosis, part 2, test B, printed only, nothing gated: at every layer, prompt 3 row 9's
+/// CUDA pick against HF-f32's (and HF-bf16's), from one fresh m=512 forward cut after each layer's
+/// routing, as `p9_expert_picks_match_hf_f32` reads them. Per layer: whether it is a router tie
+/// (P9's τ), the f32 rank-8 minus rank-9 margin, both picks, the experts CUDA has and f32 lacks and
+/// the reverse (so a flip inside a tie shows too), and HF-bf16's own. Then the layers whose CUDA
+/// pick differs, inside and outside a tie.
+#[test]
+fn diag_prompt_3_row_9_picks_per_layer() {
+    let (device, weights) = rig();
+    let mut w = CudaWorker::new(&device, cut_tapes(), &weights, Some(KV_POOL), GDN_POOL)
+        .unwrap_or_else(|e| panic!("CudaWorker::new over the {LAYERS} cut tapes: {e}"));
+    let p = (prompts().into_iter().find(|p| p.p == DIAG_PROMPT))
+        .unwrap_or_else(|| panic!("prompt {DIAG_PROMPT} in meta.json"));
+    let n = p.ids.len();
+    assert!(DIAG_ROW < n, "prompt {} has row {DIAG_ROW}", p.p);
+    let route = read_route(&format!("route_{}.bin", p.p), n);
+    let (mut inside, mut outside) = (Vec::new(), Vec::new());
+    for layer in 0..LAYERS {
+        let got = &cuda_picks(&mut w, layer, &p.ids)[DIAG_ROW];
+        let want = route.f32.set(n, layer, DIAG_ROW);
+        let bf16 = route.bf16.set(n, layer, DIAG_ROW);
+        let tau = route.tau(layer);
+        let (tie, margin) = route.tie(layer, DIAG_ROW, tau);
+        let only_cuda: Vec<i32> = got.difference(&want).copied().collect();
+        let only_f32: Vec<i32> = want.difference(got).copied().collect();
+        if *got != want {
+            match tie {
+                true => inside.push(layer),
+                false => outside.push(layer),
+            }
+        }
+        eprintln!(
+            "diag P9 prompt {} row {DIAG_ROW} (id {}) layer {layer}: router tie={tie} (f32 rank-8 \
+             minus rank-9 {margin:.4e} vs tau {tau:.4e}) CUDA={got:?} HF-f32={want:?} same={} \
+             CUDA-only={only_cuda:?} f32-only={only_f32:?} HF-bf16={bf16:?} HF-bf16 same as \
+             f32={} (information only)",
+            p.p,
+            p.ids[DIAG_ROW],
+            *got == want,
+            bf16 == want
+        );
+    }
+    eprintln!(
+        "diag P9 prompt {} row {DIAG_ROW}: CUDA's pick differs from HF-f32's at {} layers inside \
+         a router tie {inside:?} and {} outside {outside:?} (information only)",
+        p.p,
+        inside.len(),
+        outside.len()
+    );
+}
