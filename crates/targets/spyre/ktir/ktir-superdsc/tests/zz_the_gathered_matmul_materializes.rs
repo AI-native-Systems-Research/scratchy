@@ -90,7 +90,7 @@ enum GatheredSlot {
 // `arith.constant`, `ktdp.load`, `linalg.matmul`, `ktdp.store` — so the door sees a real program
 // and not a stub. The ONLY difference between the two cases is which matmul slot consumes the
 // gathered load.
-fn paged_program(slot: GatheredSlot) -> KtirNode {
+fn paged_program_w(slot: GatheredSlot, row: i64) -> KtirNode {
     let a: &'static Arena = Arena::global();
     let shape = |op: Operation<'static>, r: i64, c: i64| {
         op.with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![r, c])))
@@ -112,12 +112,12 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
 
     // Which matmul slot consumes the gathered load — the one variable. The B case is the
     // fixture's own `[8, 64] · [64, 64] -> [8, 64]`; the A case keeps every extent square at K
-    // (`[64, 64] · [64, 64] -> [64, 64]`), because the gathered load `[K, HEAD]` is the
+    // (`[64, 64] · [64, 64] -> [64, 64]`), because the gathered load `[K, row]` is the
     // contraction's A there and the plain operand must carry K = 64 as its own K extent — the
     // first draft left P at `[8, 64]` and the control died at the matmul's own K-extent check,
     // which pins nothing about the gather.
     let (p_rows, p_cols, out_rows, out_cols) = match slot {
-        GatheredSlot::B => (M, K, M, HEAD),
+        GatheredSlot::B => (M, K, M, row),
         GatheredSlot::A => (K, K, K, K),
     };
 
@@ -168,7 +168,7 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
         shape(
             Operation::new(a, Some(v_v), OpKind::KtdpConstructMemoryView, &[p_v]),
             V,
-            HEAD,
+            row,
         ),
         shape(
             Operation::new(
@@ -178,12 +178,12 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
                 &[v_v, zero, zero],
             ),
             V,
-            HEAD,
+            row,
         ),
         shape(
             Operation::new(a, Some(val_v), OpKind::KtdpLoad, &[t_v]),
             V,
-            HEAD,
+            row,
         ),
         // ids: [64] i32 — the index vector.
         Operation::new(a, Some(v_i), OpKind::KtdpConstructMemoryView, &[p_ids])
@@ -219,7 +219,7 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
                 &[v_v, v_i],
             ),
             K,
-            HEAD,
+            row,
         )
         .with_attr(
             a,
@@ -255,10 +255,10 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
             let mut op = shape(
                 Operation::new(a, Some(prod), OpKind::KtdpLoad, &[ind]),
                 K,
-                HEAD,
+                row,
             );
             op.result_type = Some(IrType::Tensor {
-                dims: a.ints(vec![K, HEAD]),
+                dims: a.ints(vec![K, row]),
                 elem: DType::F16,
             });
             op
@@ -326,6 +326,11 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
     }
 }
 
+/// [`paged_program_w`] at the fixture's own 64-element row — every non-pooled cell.
+fn paged_program(slot: GatheredSlot) -> KtirNode {
+    paged_program_w(slot, HEAD)
+}
+
 /// A fully-placed layout for the four parameters — `resolve_seg_base` panics on a name that is in
 /// neither `ids` nor the synth map, so every operand the emission names must be placed.
 ///
@@ -333,7 +338,7 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
 /// device address (`SEGMENT_OFFSETS[3] + 0x8000`) is shared by no other operand in the test, and
 /// an assertion on that number is an assertion on WHICH buffer an op reads, not on a coincidence
 /// of two zero offsets.
-fn layout_for(k: &KtirNode, slot: GatheredSlot) -> BundleLayout {
+fn layout_for_w(k: &KtirNode, slot: GatheredSlot, row: i64) -> BundleLayout {
     let mut l = BundleLayout::default();
     for (i, b) in k.bindings.iter().enumerate() {
         let tid = b.get();
@@ -341,13 +346,13 @@ fn layout_for(k: &KtirNode, slot: GatheredSlot) -> BundleLayout {
         // Bytes per parameter: P (the plain operand, slot-shaped), V [128,64] f16, ids [64] i32,
         // OUT (the result, slot-shaped).
         let bytes: u64 = match (slot, i) {
-            (_, 1) => (V as u64) * (HEAD as u64) * 2,
+            (_, 1) => (V as u64) * (row as u64) * 2,
             (_, 2) => (K as u64) * 4,
             // P: [8, 64] in the B case, [64, 64] in the A case.
             (GatheredSlot::B, 0) => (M as u64) * (K as u64) * 2,
             (GatheredSlot::A, 0) => (K as u64) * (K as u64) * 2,
             // OUT: [8, 64] in the B case, [64, 64] in the A case.
-            (GatheredSlot::B, _) => (M as u64) * (HEAD as u64) * 2,
+            (GatheredSlot::B, _) => (M as u64) * (row as u64) * 2,
             (GatheredSlot::A, _) => (K as u64) * (K as u64) * 2,
         };
         l.placements.insert(
@@ -365,6 +370,11 @@ fn layout_for(k: &KtirNode, slot: GatheredSlot) -> BundleLayout {
         );
     }
     l
+}
+
+/// [`layout_for_w`] at the fixture's own 64-element row.
+fn layout_for(k: &KtirNode, slot: GatheredSlot) -> BundleLayout {
+    layout_for_w(k, slot, HEAD)
 }
 
 /// The emitted ops, descriptors and all — asserted on the TYPED structs rather than re-parsed
@@ -1158,20 +1168,26 @@ fn a_repeat_gather_over_a_whole_placed_source_admits_under_a_declared_source_ext
 //
 //   * the SWEPT window is 64 × 64 = 4096 elements = 8192 B — 64× the one-entry placement, which
 //     the swept-window law (the placement footprint) refuses;
-//   * the reach's entry unit must be the width the read itself strides at (HEAD = 64), which a
-//     pool at hd=1 states (a stick block is `hd · 64`) and a pool at hd=2 does not — that
-//     disagreement is the door's refusal, and the test that pins it FAILS WITHOUT the check.
+//   * the reach's entry unit must be the width the read itself strides at. A pool entry is ONE
+//     SLAB BLOCK (`POOL_STICK²` = 4096 elements at every head dim), so the pooled cells gather
+//     4096-element rows (`paged_program_w(.., SLAB_BLOCK)`), and the refusal cell reads the
+//     fixture's own 64-element rows against that pool — the disagreement the door refuses, and
+//     the test that pins it FAILS WITHOUT the check.
 
-/// The pool the fixture's table models, at head dim `hd`: one reach minted through the pool's
-/// own door (`GatherReach::of_plane`), with a 4-page budget over a 128-entry page (four whole
-/// planes — a page smaller than one of its own planes is not a pool, and the door refuses it).
-/// At `hd = 1` the pool's stick block IS the fixture's HEAD (64 elements); at `hd = 2` it is
-/// twice that, which is exactly the disagreement the door must refuse.
-fn fixture_reach(hd: usize) -> Option<ktir_superdsc::sdsc_abstract::GatherReach> {
-    let pool = ktir_superdsc::sdsc_abstract::PagedKvPool::new(8, hd as u32);
-    let page_stride = 128 * pool.stick_block_bytes();
+/// The pool the fixture's table models: one reach minted through the pool's own door
+/// (`GatherReach::of_plane`), with a 4-page budget over a page of 128 slab blocks (whole planes —
+/// a page smaller than one of its own planes is not a pool, and the door refuses it). A pool
+/// entry is ONE SLAB BLOCK, `POOL_STICK²` = 4096 elements at every head dim — the unit the host's
+/// `GatherEntry::of_slab_block` values count in and a pooled gather must stride at.
+fn fixture_reach() -> Option<ktir_superdsc::sdsc_abstract::GatherReach> {
+    let pool = ktir_superdsc::sdsc_abstract::PagedKvPool::new(8, 64);
+    let page_stride = 128 * pool.slab_block_bytes();
     ktir_superdsc::sdsc_abstract::GatherReach::of_plane(4, page_stride, pool)
 }
+
+/// The pool's entry unit in elements — one slab block (`POOL_STICK²`).
+const SLAB_BLOCK: u64 = (ktir_superdsc::sdsc_abstract::POOL_STICK as u64)
+    * (ktir_superdsc::sdsc_abstract::POOL_STICK as u64);
 
 /// [`layout_for`] with the table (t202) placed at ONE ENTRY's footprint and a declared
 /// `gather_reach` — the pooled-table statement: a slice placement plus the typed bound on the
@@ -1179,13 +1195,14 @@ fn fixture_reach(hd: usize) -> Option<ktir_superdsc::sdsc_abstract::GatherReach>
 fn pooled_layout_for(
     k: &KtirNode,
     reach: ktir_superdsc::sdsc_abstract::GatherReach,
+    row: i64,
 ) -> BundleLayout {
-    let mut l = layout_for(k, GatheredSlot::B);
+    let mut l = layout_for_w(k, GatheredSlot::B, row);
     let tid = k.bindings[1].get();
     l.placements
         .get_mut(&tid)
         .expect("the table is placed")
-        .size = HEAD as u64 * 2;
+        .size = row as u64 * 2;
     l.gather_reach.insert(tid, reach);
     l
 }
@@ -1207,14 +1224,14 @@ fn emitted_with(
 /// gathering FROM the table's own address (the slice placement's base — the pool's base).
 #[test]
 fn a_pooled_table_gathers_past_its_one_slice_placement() {
-    let k = paged_program(GatheredSlot::B);
-    let reach = fixture_reach(1).expect("hd=1 states the fixture's own entry unit");
+    let k = paged_program_w(GatheredSlot::B, SLAB_BLOCK as i64);
+    let reach = fixture_reach().expect("the pool states its slab-block entry unit");
     assert_eq!(
         reach.entry_elems(),
-        HEAD as u64,
-        "the hd=1 pool's stick block is the fixture's HEAD — the unit the read strides at"
+        SLAB_BLOCK,
+        "the pool's entry is one slab block — the unit this read strides at"
     );
-    let ops = emitted_with(&k, &pooled_layout_for(&k, reach))
+    let ops = emitted_with(&k, &pooled_layout_for(&k, reach, SLAB_BLOCK as i64))
         .expect("a pooled table's gather is bounded by its reach, not its slice placement");
     assert_eq!(
         ops.len(),
@@ -1245,16 +1262,17 @@ fn a_pooled_table_gathers_past_its_one_slice_placement() {
 #[test]
 fn a_pooled_gather_whose_entry_unit_disagrees_with_the_pool_is_refused_by_name() {
     let k = paged_program(GatheredSlot::B);
-    let reach = fixture_reach(2).expect("hd=2 states a wider entry unit");
+    let reach = fixture_reach().expect("the pool states its slab-block entry unit");
     assert_eq!(
         reach.entry_elems(),
-        2 * HEAD as u64,
-        "the hd=2 pool's stick block is twice the fixture's HEAD -- the disagreement under test"
+        SLAB_BLOCK,
+        "the pool's entry is one slab block, 64x the fixture's 64-element row -- the \
+         disagreement under test"
     );
-    let e = match emitted_with(&k, &pooled_layout_for(&k, reach)) {
+    let e = match emitted_with(&k, &pooled_layout_for(&k, reach, HEAD)) {
         Err(e) => e,
         Ok(_) => panic!(
-            "a read striding 64-element entries over a pool of 128-element stick blocks must \
+            "a read striding 64-element entries over a pool of 4096-element slab blocks must \
              refuse -- two units for one address"
         ),
     };
@@ -1263,7 +1281,7 @@ fn a_pooled_gather_whose_entry_unit_disagrees_with_the_pool_is_refused_by_name()
         "the refusal names the read's own unit -- got {e}"
     );
     assert!(
-        e.contains("128-element stick blocks"),
+        e.contains("4096-element slab blocks"),
         "the refusal names the pool's own unit -- got {e}"
     );
 }
@@ -1273,9 +1291,9 @@ fn a_pooled_gather_whose_entry_unit_disagrees_with_the_pool_is_refused_by_name()
 /// positive above proves nothing — a door that stopped checking placements would pass it too.
 #[test]
 fn a_one_slice_table_without_a_reach_still_refuses_at_the_placement() {
-    let k = paged_program(GatheredSlot::B);
-    let reach = fixture_reach(1).expect("hd=1 states the fixture's own entry unit");
-    let mut l = pooled_layout_for(&k, reach);
+    let k = paged_program_w(GatheredSlot::B, SLAB_BLOCK as i64);
+    let reach = fixture_reach().expect("the pool states its slab-block entry unit");
+    let mut l = pooled_layout_for(&k, reach, SLAB_BLOCK as i64);
     let tid = k.bindings[1].get();
     l.gather_reach.remove(&tid);
     let e = match emitted_with(&k, &l) {
@@ -1315,9 +1333,9 @@ fn the_leg_reach_law_three_cases() {
     // under an `of_plane` reach), and the door must NOT stamp it — the carrier mint is the one
     // writer. A `true` here would be a second stamping site for the addressing fact, the desync
     // the one-door law exists to prevent.
-    let k = paged_program(GatheredSlot::B);
-    let reach = fixture_reach(1).expect("hd=1 states the fixture's own entry unit");
-    let ops = emitted_with(&k, &pooled_layout_for(&k, reach))
+    let k = paged_program_w(GatheredSlot::B, SLAB_BLOCK as i64);
+    let reach = fixture_reach().expect("the pool states its slab-block entry unit");
+    let ops = emitted_with(&k, &pooled_layout_for(&k, reach, SLAB_BLOCK as i64))
         .expect("a pooled table's gather is bounded by its reach, not its slice placement");
     assert_eq!(
         ops.len(),
@@ -1336,6 +1354,7 @@ fn the_leg_reach_law_three_cases() {
 
     // ⛔ CASE 2 — NO REACH: the whole-placed table whose sweep fits, the embedding's own
     // card-proven shape. Nothing here addresses a pool, so every op must carry `false`.
+    let k = paged_program(GatheredSlot::B);
     let ops = emitted_with(&k, &layout_for(&k, GatheredSlot::B))
         .expect("a fitting sweep keeps the swept-window law, byte for byte");
     assert_eq!(

@@ -252,17 +252,6 @@ pub struct StickWindow<'a> {
     pub stick: u32,
 }
 
-impl<'a> StickWindow<'a> {
-    /// A whole buffer: the window starts at column stick 0.
-    pub fn whole(name: &'a str, rows: u32) -> Self {
-        StickWindow {
-            name,
-            rows,
-            stick: 0,
-        }
-    }
-}
-
 /// ⭐ THE DOT — one per-batch bmm per (contraction stick, output stick), in emission order
 /// (`ns` outer, `ks` inner, so each output block's accumulation chain is contiguous). See the
 /// module doc for the frame law each operand's offset states.
@@ -467,6 +456,16 @@ mod byte_gate {
     use super::*;
     use crate::superdsc_opspec::{AnyTensorArg, Role, Scale, WorkPlan};
 
+    /// A whole buffer as a dot operand: the window starts at column stick 0. Test-only — the
+    /// production caller (`emit_dot`) states each operand's window from its region.
+    fn whole(name: &str, rows: u32) -> StickWindow<'_> {
+        StickWindow {
+            name,
+            rows,
+            stick: 0,
+        }
+    }
+
     /// A paged-attention geometry: one pool block (4096 elements) per entry, 32 entries, the
     /// g-replicated batch over them.
     fn pooled() -> BatchedGathered {
@@ -583,13 +582,7 @@ mod byte_gate {
             )
             .unwrap();
             let rows = bg.batch * bg.m;
-            let dots = dot_opspecs(
-                &bg,
-                StickWindow::whole("a", rows),
-                "w",
-                StickWindow::whole("o", rows),
-            )
-            .unwrap();
+            let dots = dot_opspecs(&bg, whole("a", rows), "w", whole("o", rows)).unwrap();
             let mut checked = 0u64;
             for (i, op) in dots.iter().enumerate() {
                 let (ns, ks) = (i as u32 / (bg.k / STK), i as u32 % (bg.k / STK));
@@ -634,13 +627,7 @@ mod byte_gate {
     fn the_dot_reads_a_and_writes_out_in_the_stick_major_flat_frame() {
         for bg in [pooled(), grouped(), moe_per_token(), wide_k()] {
             let rows = bg.batch * bg.m;
-            let dots = dot_opspecs(
-                &bg,
-                StickWindow::whole("a", rows),
-                "w",
-                StickWindow::whole("o", rows),
-            )
-            .unwrap();
+            let dots = dot_opspecs(&bg, whole("a", rows), "w", whole("o", rows)).unwrap();
             let m_probe: Vec<u32> = [0, 1, bg.m / 2, bg.m - 1].into_iter().collect();
             let b_probe: Vec<u32> = [0, 1, bg.page, bg.batch / 2, bg.batch - 1]
                 .into_iter()
@@ -734,9 +721,9 @@ mod byte_gate {
         // The emitted (ks=0, ns=0) dot op — WITH its physical extents — reads it there.
         let dots = dot_opspecs(
             &bg,
-            StickWindow::whole("a", bg.batch * bg.m),
+            whole("a", bg.batch * bg.m),
             "w",
-            StickWindow::whole("o", bg.batch * bg.m),
+            whole("o", bg.batch * bg.m),
         )
         .unwrap();
         let op = &dots[0];
@@ -791,13 +778,7 @@ mod byte_gate {
             (wide_k(), 2),
         ] {
             let rows = bg.batch * bg.m;
-            let dots = dot_opspecs(
-                &bg,
-                StickWindow::whole("a", rows),
-                "w",
-                StickWindow::whole("o", rows),
-            )
-            .unwrap();
+            let dots = dot_opspecs(&bg, whole("a", rows), "w", whole("o", rows)).unwrap();
             assert_eq!(dots.len(), want, "{bg:?}");
             assert_eq!(bg.dot_ops() as usize, want);
             let copies = copy_opspecs(
@@ -825,13 +806,7 @@ mod byte_gate {
     fn the_dot_serializes_innermost_first_with_back_gaps() {
         let bg = pooled();
         let rows = bg.batch * bg.m;
-        let dots = dot_opspecs(
-            &bg,
-            StickWindow::whole("a", rows),
-            "w",
-            StickWindow::whole("o", rows),
-        )
-        .unwrap();
+        let dots = dot_opspecs(&bg, whole("a", rows), "w", whole("o", rows)).unwrap();
         for op in &dots {
             for arg in &op.args {
                 let v = arg.view();
@@ -898,20 +873,147 @@ mod byte_gate {
         assert!(
             dot_opspecs(
                 &bg,
-                StickWindow::whole("a", bg.batch * bg.m),
+                whole("a", bg.batch * bg.m),
                 "w",
-                StickWindow::whole("o", bg.batch * bg.m)
+                whole("o", bg.batch * bg.m)
             )
             .is_ok()
         );
         let Err(m) = dot_opspecs(
             &bg,
-            StickWindow::whole("a", bg.batch * bg.m + 64),
+            whole("a", bg.batch * bg.m + 64),
             "w",
-            StickWindow::whole("o", bg.batch * bg.m),
+            whole("o", bg.batch * bg.m),
         ) else {
             panic!("an A wider than batch·m must refuse");
         };
         assert!(m.contains("flat frame"), "{m}");
+    }
+
+    /// A layout holding `name` as a placed activation of `bytes` — the placement half a copy leg's
+    /// destination is held against.
+    fn layout_placing(name: &str, tid: u32, bytes: u64) -> crate::placement::BundleLayout {
+        let mut l = crate::placement::BundleLayout::default();
+        l.ids
+            .borrow_mut()
+            .insert(name.to_string(), crate::place::PlaceId::Act(tid));
+        l.placements.insert(
+            tid,
+            crate::placement::TensorPlacement {
+                tid,
+                role: crate::placement::SegRole::Activation,
+                segment: 3,
+                bank: 0,
+                offset: 0,
+                size: bytes,
+                cover: crate::placement::BindCover::Full,
+            },
+        );
+        l
+    }
+
+    /// The destination check the walk runs on every shipped copy leg (`gathered_matmul_materializes`'
+    /// placement half): the leg's `mb × STK` window at its own output base, against the scratch's
+    /// placement — read off the BUILT op, exactly as the walk reads it.
+    fn leg_dest_check(
+        bg: &BatchedGathered,
+        leg: &OpSpec,
+        dst: &str,
+        layout: &crate::placement::BundleLayout,
+    ) -> Result<(), String> {
+        let rows = leg.iter.extent("mb");
+        let base = leg.args.last().map_or(0, |a| a.view().offset_elems) as u64;
+        crate::emit::mint_full_window(
+            "leg",
+            &crate::emit::rb(
+                dst,
+                crate::sdsc_abstract::RowCount::of_token_rows(bg.copy_rows()),
+                crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16),
+            ),
+            base,
+            rows,
+            STK,
+            Some(layout),
+        )
+    }
+
+    /// ⭐ THE PLACEMENT DOOR — the copy states its scratch truthfully and the placement does not. A
+    /// multi-leg copy (64 entries = two index sticks) lands its second leg at entry 32, and a
+    /// placement holding only half the scratch puts that leg past the end — the "512 reserved
+    /// against 2048 declared" class, a clean bake whose overrun is another tensor's bytes. The control
+    /// is the placement the copy's own scratch states: every leg fits.
+    #[test]
+    fn a_copy_leg_past_its_destination_placement_refuses() {
+        let bg = BatchedGathered::of(&[64, 4, 64], &[64, 64, 64], 64, 4096)
+            .expect("a two-stick slab-block gathered dot");
+        let legs = copy_opspecs(
+            &bg,
+            "KtPool",
+            "BlockTable",
+            "t7",
+            crate::superdsc_opspec::EntryBase::ZERO,
+        )
+        .expect("the shipped copy builds");
+        assert_eq!(legs.len(), 2, "64 entries are two index sticks — two legs");
+        let scratch_bytes = u64::from(bg.copy_rows()) * u64::from(STK) * 2;
+
+        let half = layout_placing("t7", 7, scratch_bytes / 2);
+        // Leg 1 lands at entry 32 — past the half-size placement's end.
+        let err = leg_dest_check(&bg, &legs[1], "t7", &half)
+            .expect_err("leg 1 lands past a half-size placement");
+        assert!(
+            err.contains("exceeds its placement footprint"),
+            "the refusal names the placement it would overrun: {err}"
+        );
+        // Leg 0's window fits the half, but the handle declares the whole scratch: a placement
+        // smaller than the tensor's own declared shape is the same disagreement, refused by name.
+        let err = leg_dest_check(&bg, &legs[0], "t7", &half)
+            .expect_err("a placement smaller than the declared scratch refuses every leg");
+        assert!(
+            err.contains("smaller than the tensor's own declared shape"),
+            "the refusal names the placement/handle disagreement: {err}"
+        );
+
+        let full = layout_placing("t7", 7, scratch_bytes);
+        for (i, leg) in legs.iter().enumerate() {
+            leg_dest_check(&bg, leg, "t7", &full)
+                .unwrap_or_else(|e| panic!("leg {i} fits the scratch its own copy states: {e}"));
+        }
+    }
+
+    /// ⭐ THE TWO-AUTHORITY LAW — a copy leg whose destination the layout holds as a CORE-LOCAL LX
+    /// tensor. Each core's slice sits at the pin, so a leg landing at a nonzero entry (every leg past
+    /// the first) has no offset to take: the layout and the copy disagree about where the bytes are,
+    /// and the destination check refuses rather than addressing LX bytes as HBM. Leg 0 (entry 0) is
+    /// the control.
+    #[test]
+    fn a_copy_leg_into_a_core_local_destination_has_no_offset_to_take() {
+        let bg = BatchedGathered::of(&[64, 4, 64], &[64, 64, 64], 64, 4096)
+            .expect("a two-stick slab-block gathered dot");
+        let core_id = crate::place::PlaceId::Synth {
+            of: 7,
+            role: crate::place::SynthRole::VRep,
+        };
+        let name = core_id.to_string();
+        let legs_named = copy_opspecs(
+            &bg,
+            "KtPool",
+            "BlockTable",
+            &name,
+            crate::superdsc_opspec::EntryBase::ZERO,
+        )
+        .expect("the shipped copy builds");
+        let l = crate::placement::BundleLayout::default();
+        l.synth_lx_core_local(core_id, u64::from(bg.copy_rows()) * u64::from(STK) * 2);
+        assert!(
+            leg_dest_check(&bg, &legs_named[0], &name, &l).is_ok(),
+            "leg 0 lands at entry 0 — the core-local slice's own pin"
+        );
+        let err = leg_dest_check(&bg, &legs_named[1], &name, &l)
+            .expect_err("leg 1 lands at entry 32 — no offset to take in a core-local tensor");
+        assert!(
+            err.contains("core-local LX tensor") && err.contains("no offset to take"),
+            "the refusal states the core-local law, not a size: {err}"
+        );
     }
 }

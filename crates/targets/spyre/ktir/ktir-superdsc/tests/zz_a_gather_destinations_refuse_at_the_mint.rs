@@ -11,8 +11,11 @@
 //! Both doors below bound the window where it lands:
 //! 1. THE RAW DOOR ([`gather_copy_opspec`]) — the element bound against the destination's own
 //!    declared `[rows, cols]`, layout-free, at the copy's own df;
-//! 2. THE PLACEMENT DOOR ([`assemble_gather_copy`]) — the same window resolved by NAME against the
-//!    layout's placement footprint, the "512 reserved against 2048 declared" class.
+//! 2. THE PLACEMENT DOOR — the same window resolved by NAME against the layout's placement
+//!    footprint, the "512 reserved against 2048 declared" class. It runs inside the crate, on the
+//!    shipped copy legs (`batched_gathered::copy_opspecs`), so its pins live in that module's own
+//!    tests (`a_copy_leg_past_its_destination_placement_refuses`,
+//!    `a_copy_leg_into_a_core_local_destination_has_no_offset_to_take`).
 //!
 //! ⭐ AND THE CORE-LOCAL LX FORMS ARE THEIR OWN WINDOW KIND, NOT AN EXEMPTION. A copy that lands in
 //! a core-local LX tensor states [`GatherDest::CoreLocalLx`]: each core's slice sits at the pin, so
@@ -22,20 +25,13 @@
 //! addresses LX bytes as HBM. The per-core slice itself is the read law's bound, checked against
 //! the pin at emit (`core_local_reads_agree`).
 //!
-//! ⛔ THE fp8 LAYOUT HALF RIDES WITH THE MoE CALLER: [`assemble_gather_copy`] is the fp16 KV door
-//! (every gathered fold to date copies fp16 KV planes); the fp8 expert-slab copy states its own df
-//! at the raw door, pinned green in `zz_the_gather_op_is_kernel_less` at the fp8 stick.
+//! ⛔ THE fp8 LAYOUT HALF RIDES WITH THE MoE CALLER: the fp8 expert-slab copy states its own df at
+//! the raw door, pinned green in `zz_the_gather_op_is_kernel_less` at the fp8 stick.
 //!
 //! Every refusal below has a control one variable away, and each control BUILDS.
 
-use ktir_superdsc::emit::EmittedOp;
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{assemble_gather_copy, gather_copy_opspec};
-use ktir_superdsc::place::{PlaceId, SynthRole};
-use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
-use ktir_superdsc::sdsc_abstract::{
-    ChunkLx, ChunkRowKind, ChunkScratch, GatherCopy, GatherDest, LxDest, PageScratch, PagedKvPool,
-    QueryRowCount,
-};
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec;
+use ktir_superdsc::sdsc_abstract::GatherDest;
 use ktir_superdsc::superdsc_opspec::{
     DestEntry, Df, EntryBase, GatherIndex, GatherRun, KernelAxis, OpSpec, PageExtent,
 };
@@ -63,46 +59,6 @@ fn copy_opspec(mb: u32, run: GatherRun, dest: GatherDest) -> Result<OpSpec, Stri
             dest,
         },
     )
-}
-
-/// A layout placing `t{tid}` as an activation of `size` bytes — the same rig the pointwise,
-/// reduce and restickify/convert refusal tests drive their placement doors with.
-fn layout_placing(tid: u32, size: u64) -> BundleLayout {
-    let mut layout = BundleLayout::default();
-    let name = PlaceId::Act(tid).to_string();
-    layout
-        .ids
-        .borrow_mut()
-        .insert(name.clone(), PlaceId::Act(tid));
-    layout.placements.insert(
-        tid,
-        TensorPlacement {
-            tid,
-            role: SegRole::Activation,
-            segment: 3,
-            bank: 0,
-            offset: 0,
-            size,
-            cover: ktir_superdsc::placement::BindCover::Full,
-        },
-    );
-    layout
-}
-
-/// The panic text out of a refused build — the assemblers panic with `format!`ed refusal messages,
-/// so the refusal is observable as the payload.
-fn refused(r: Result<EmittedOp, Box<dyn std::any::Any + Send>>) -> String {
-    let payload = match r {
-        Ok(_) => panic!("the build was accepted — the refusal under test did not fire"),
-        Err(p) => p,
-    };
-    if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else {
-        panic!("a panic payload that is not a string")
-    }
 }
 
 /// ⭐ THE RAW DOOR — a run whose `mb × out` window crosses the scratch it states. The control is the
@@ -186,141 +142,5 @@ fn a_core_local_destination_has_no_offset_to_take() {
     assert!(
         err.contains("CORE-LOCAL LX tensor") && err.contains("no offset to take"),
         "the refusal states the core-local law, not a size: {err}"
-    );
-}
-
-/// The rig's other two operands — the pool the copy reads and the table it reads it through —
-/// declared to the layout as synthetics at the copy's own extents, so the destination's doors are
-/// the only variables the legs below leave. Returns the two names to build the copy with.
-fn declare_gather_rig(layout: &BundleLayout, cp: GatherCopy) -> (String, String) {
-    let src_id = PlaceId::Synth {
-        of: 5,
-        role: SynthRole::Rot,
-    };
-    let idx_id = PlaceId::Synth {
-        of: 6,
-        role: SynthRole::Xc,
-    };
-    // The pool's window for one run is the run's own `mb × out` elements (an index step advances
-    // `skip_addr = page × out`, and the run covers `mb / page` of them); the table's is the run's
-    // entries from the copy's own index base.
-    layout.synth(src_id, &[cp.dims().mb(), cp.dims().out()]);
-    let idx_entries = cp.index_base().entries()
-        + cp.dims()
-            .entries()
-            .expect("the page divides `mb` by construction");
-    layout.synth_df(idx_id, &[idx_entries, 1], Df::SenUint32);
-    (src_id.to_string(), idx_id.to_string())
-}
-
-/// ⭐ THE PLACEMENT DOOR — the handle states the truth and the placement does not. The run is the
-/// shipped decode door's own first copy ([`PageScratch::of_pass`]), whose carried law fits its
-/// declared scratch exactly; the LAYOUT holds a placement half the run's bytes, which is the "512
-/// reserved against 2048 declared" class: a clean bake whose overrun is another tensor's bytes. The
-/// control is the placement the copy's own law states: it builds.
-#[test]
-fn a_destination_past_its_placement_refuses() {
-    let pool = PagedKvPool::new(8, 64);
-    let scratch = PageScratch::of_pass(pool, QueryRowCount::of_mq(8))
-        .expect("granite's geometry admits the page copy");
-    let cp = scratch
-        .copies()
-        .next()
-        .expect("a pass has at least one run");
-    let GatherDest::Scratch { rows, cols } = cp.dest() else {
-        panic!("the page scratch's first run lands in the HBM scratch")
-    };
-    let window_bytes = u64::from(cp.dims().mb()) * u64::from(cp.dims().out()) * 2;
-
-    let small = layout_placing(7, window_bytes / 2);
-    let (src, index) = declare_gather_rig(&small, cp);
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut sym = 0i64;
-        assemble_gather_copy("gdst_small", &src, "t7", cp, &index, &mut sym, Some(&small))
-    }));
-    let msg = refused(r);
-    assert!(
-        msg.contains("assemble_gather_copy gdst_small: the destination")
-            && msg.contains("exceeds its placement footprint"),
-        "the refusal names the copy and the placement it would overrun: {msg}"
-    );
-
-    let true_layout = layout_placing(7, u64::from(rows) * u64::from(cols) * 2);
-    let (src, index) = declare_gather_rig(&true_layout, cp);
-    let mut sym = 0i64;
-    let built = assemble_gather_copy(
-        "gdst_true",
-        &src,
-        "t7",
-        cp,
-        &index,
-        &mut sym,
-        Some(&true_layout),
-    );
-    assert!(
-        built.op.is_some(),
-        "the placement the copy's own law states builds — the control"
-    );
-}
-
-/// The first ladder width whose value leg stays in LX, with one of its core-local copies — the
-/// shipped chunk form past 8 pages, minted by the same `lx_form` the emission calls.
-fn an_lx_form() -> (ChunkLx, GatherCopy) {
-    let pool = PagedKvPool::new(8, 64);
-    for &pages in &ChunkScratch::LADDER {
-        let Some(lx) = ChunkScratch::of_chunk(pool, pages)
-            .and_then(|c| c.lx_form(ChunkRowKind::OneRequest, 0, 0))
-        else {
-            continue;
-        };
-        if let Some((_, cp)) = lx.copies().find(|(d, _)| matches!(d, LxDest::Lx(_))) {
-            return (lx, cp);
-        }
-    }
-    panic!("no ladder width mints an LX-resident value copy")
-}
-
-/// ⭐ THE TWO-AUTHORITY LAW — the copy states a CORE-LOCAL destination and the layout does not hold
-/// the name core-local. The disagreement leg holds the very same name as a plain HBM activation:
-/// two authorities, one fact, opposite answers, and the copy would address HBM bytes as a pin (or
-/// LX bytes as HBM). The control is the layout the shipped chunk emission synth's — the same name,
-/// core-local, at the pin size the chunk's own law states — and it builds.
-#[test]
-fn a_core_local_destination_the_layout_does_not_hold_refuses() {
-    let (lx, cp) = an_lx_form();
-
-    let hbm = layout_placing(7, 1 << 20);
-    let (src, index) = declare_gather_rig(&hbm, cp);
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut sym = 0i64;
-        assemble_gather_copy("glx_hbm", &src, "t7", cp, &index, &mut sym, Some(&hbm))
-    }));
-    let msg = refused(r);
-    assert!(
-        msg.contains("assemble_gather_copy glx_hbm")
-            && msg.contains("does not hold 't7' as core-local LX"),
-        "the refusal names the name the two authorities disagree about: {msg}"
-    );
-
-    let core_id = PlaceId::Synth {
-        of: 7,
-        role: SynthRole::VRep,
-    };
-    let lx_layout = BundleLayout::default();
-    lx_layout.synth_lx_core_local(core_id, lx.per_core_bytes());
-    let (src, index) = declare_gather_rig(&lx_layout, cp);
-    let mut sym = 0i64;
-    let built = assemble_gather_copy(
-        "glx_true",
-        &src,
-        &core_id.to_string(),
-        cp,
-        &index,
-        &mut sym,
-        Some(&lx_layout),
-    );
-    assert!(
-        built.op.is_some(),
-        "the core-local destination the chunk's own law pins builds — the control"
     );
 }

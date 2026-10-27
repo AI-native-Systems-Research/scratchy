@@ -599,15 +599,19 @@ fn the_page_entry_reproduces_the_hosts_page_address() {
     }
 }
 
-/// ⛔⛔⛔ THE FACTOR A PLANE-SIZED PIN WOULD HAVE NEEDED IS 32× SMALLER THAN THE ONE THE CARD USES, and
-/// both are plain counts — so this is the substitution that has to stay unrepresentable.
+/// ⛔⛔⛔ THE FACTOR A PLANE-SIZED PIN WOULD HAVE NEEDED IS `nkvh · W4 · SLABS`× SMALLER THAN THE ONE THE
+/// CARD USES, and both are plain counts — so this is the substitution that has to stay unrepresentable.
 ///
 /// The plane factor type (`PlanesPerPage`) and its entry (`PageEntry`) are DELETED, because the pin they
 /// existed for is refused at bake. This test is what stops them coming back by accident: it states the
 /// ratio, and therefore states that an entry built in plane units against the real `skip_addr` reaches
 /// only `1/ratio` of the pool — i.e. page `phys/ratio`, a real address, clean bake, wrong keys.
+///
+/// ⭐ THE ENTRY IS ONE SLAB BLOCK (`POOL_STICK²` at every head dim — `GatherEntry::of_slab_block`'s
+/// unit), so `hd` does NOT cancel: one page plane is `nkvh · W4 · SLABS` entries — 32 at hd 64, **64 at
+/// hd 128** — which is exactly why the entries-per-page factor is a bundle fact and never a constant.
 #[test]
-fn a_plane_unit_entry_would_reach_only_one_thirty_second_of_the_pool() {
+fn a_plane_unit_entry_would_reach_only_a_slab_fraction_of_the_pool() {
     const LAYERS: u64 = 40;
     const PLANES: u64 = 3;
     for hd in [64usize, 128] {
@@ -615,18 +619,19 @@ fn a_plane_unit_entry_would_reach_only_one_thirty_second_of_the_pool() {
         let plane = PagePlaneExtent::of_pool(pool).expect("admitted");
         let page_stride = LAYERS * PLANES * plane.bytes();
 
-        let sticks = gather_entries_per_page(page_stride, pool).expect("whole stick blocks");
+        let entries = gather_entries_per_page(page_stride, pool).expect("whole slab blocks");
         let planes = page_stride / plane.bytes();
-        let ratio = plane.blocks();
+        let ratio = plane.elems() / pool.slab_block_elems() as u64;
+        let slabs = pool.window_slabs().expect("a stick-multiple head dim") as u64;
         assert_eq!(
             ratio,
-            8 * PagedKvPool::PAGE_SLOTS as u64 / POOL_STICK as u64,
-            "hd={hd}: the ratio is nkvh*PAGE_SLOTS/POOL_STICK, and `hd` cancels out of it"
+            8 * PagedKvPool::WINDOWS_PER_PAGE as u64 * slabs,
+            "hd={hd}: one page plane is nkvh·W4·SLABS slab blocks — `hd` rides SLABS"
         );
         assert_eq!(
-            sticks.get() as u64,
+            entries.get() as u64,
             planes * ratio,
-            "hd={hd}: the stick-block factor is exactly `ratio` times the plane factor"
+            "hd={hd}: the slab-block factor is exactly `ratio` times the plane factor"
         );
         assert!(
             ratio > 1,

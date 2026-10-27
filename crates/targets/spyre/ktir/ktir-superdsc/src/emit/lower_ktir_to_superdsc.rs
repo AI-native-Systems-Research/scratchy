@@ -6348,59 +6348,80 @@ mod elementwise_tests {
         );
     }
 
-    /// ⛔ A COLUMN CORNER ON A DENSE OPERAND IS STILL REFUSED — the corner the Mb arm carries is
-    /// a fact of the Mb OPERAND MODE (one row of values at a corner); a dense operand at a
-    /// column corner is the column-blocked chunk, and that is DENSE elementwise — the dense
-    /// arm's own `ColWindow` presentation, not a broadcast mode. Refused by name.
+    /// ⭐ A WHOLE-STICK COLUMN CORNER ON A DENSE OPERAND IS PLACED — the per-slab normalize at
+    /// every head dim (the fold's finalize loads its accumulator slab by slab at `s·64`). The
+    /// broadcast arm reads the dense operand through its own [`crate::addr::ColWindow`], so the
+    /// binding's offset is the window's corner in the operand's own storage — held by
+    /// [`column_windows_are_honoured`], the class law on what was EMITTED.
     #[test]
-    fn a_column_corner_on_a_dense_operand_is_still_refused() {
+    fn a_column_corner_on_a_dense_operand_is_placed() {
         let r = node(
             chunked(5, 32, 64, 64, 256, false),
             reg(6, 1, 64, false),
             reg(7, 32, 64, true),
         );
         let mut sym = 0i64;
-        let Err(e) = elementwise(
+        let ops = elementwise(
             "add_m3",
             Elementwise::Add,
             &r,
             &[None, Some(BcastAxis::Mb)],
             &mut sym,
             None,
-        ) else {
-            panic!("a cornered DENSE operand is the column-blocked chunk — the dense arm's shape")
-        };
-        assert!(
-            e.message.contains("t5") && e.message.contains("column corner"),
-            "names the operand and the corner KIND: {}",
-            e.message
-        );
+        )
+        .expect("a whole-stick column corner on a dense operand is the per-slab window");
+        column_windows_are_honoured("add_m3", &r, &ops)
+            .expect("the dense operand is read at its own window's corner");
     }
 
-    /// ⛔ AND THE OUTPUT'S CORNER IS STILL REFUSED — the corner rides the OPERAND; a windowed
-    /// output under a broadcast flag is a producer shape no arm here places (the dense arm
-    /// carries it, this one does not). Refused by name.
+    /// ⭐ AND THE OUTPUT'S WHOLE-STICK COLUMN CORNER IS PLACED — the per-slab normalize's
+    /// store, slab `s` at column `s·64` of the `[rows, hd]` output: the write lands at the
+    /// window's corner ([`crate::addr::OutCorner`]), held by [`column_windows_are_honoured`].
     #[test]
-    fn an_output_column_corner_is_still_refused() {
+    fn an_output_column_corner_is_placed() {
         let r = node(
             reg(5, 32, 64, false),
             reg(6, 1, 64, false),
             chunked(7, 32, 64, 64, 256, true),
         );
         let mut sym = 0i64;
-        let Err(e) = elementwise(
+        let ops = elementwise(
             "add_m4",
             Elementwise::Add,
             &r,
             &[None, Some(BcastAxis::Mb)],
             &mut sym,
             None,
+        )
+        .expect("a whole-stick column corner on the output is the per-slab store");
+        column_windows_are_honoured("add_m4", &r, &ops)
+            .expect("the output is written at its own window's corner");
+    }
+
+    /// ⛔ A SUB-STICK COLUMN CORNER IS STILL REFUSED, BY NAME — a corner that is not a whole
+    /// stick sits mid-plane, so the window is not a stick-major tensor of its own and no
+    /// presentation reaches its bytes.
+    #[test]
+    fn a_sub_stick_column_corner_is_still_refused() {
+        let r = node(
+            reg(5, 32, 64, false),
+            reg(6, 1, 64, false),
+            chunked(7, 32, 32, 64, 256, true),
+        );
+        let mut sym = 0i64;
+        let Err(e) = elementwise(
+            "add_m5",
+            Elementwise::Add,
+            &r,
+            &[None, Some(BcastAxis::Mb)],
+            &mut sym,
+            None,
         ) else {
-            panic!("a windowed output under a broadcast flag is not a shape this arm places")
+            panic!("a sub-stick corner has no stick-major window")
         };
         assert!(
-            e.message.contains("the output t7") && e.message.contains("column corner"),
-            "names the output and the corner KIND: {}",
+            e.message.contains("t7") && e.message.contains("whole"),
+            "names the output and the stick law: {}",
             e.message
         );
     }

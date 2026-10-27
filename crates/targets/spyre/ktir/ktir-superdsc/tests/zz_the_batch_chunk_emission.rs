@@ -7,10 +7,7 @@
 //! when the live spliced kernels need the same pins, mint them from the splice, not from a copy of
 //! the old emitter.)
 
-use ktir_superdsc::sdsc_abstract::{
-    BatchChunk, ChunkScratch, KvHistory, PagedKvPool, StickLayout, batch_chunk_empty_sweep_row,
-    batch_chunk_mask_f16,
-};
+use ktir_superdsc::sdsc_abstract::{BatchChunk, ChunkScratch, KvHistory, PagedKvPool};
 
 fn pool_2b() -> PagedKvPool {
     PagedKvPool::new(8, 64)
@@ -55,24 +52,29 @@ fn the_batch_ladder_round_trips_through_its_swept_key() {
     assert!(ChunkScratch::ladder_for(pool, 8).contains(&48));
 }
 
+/// ⭐⭐⭐ EACH ROW VALIDATES ON ITS OWN REQUEST'S HISTORY ALONE — the live batched mask
+/// (`spliced_batched_mask_f16`, the bytes `batched_decode_hm` and the batched fold add at the score
+/// tile). Row `(p·W4 + w)·PG + (b·GQA + g)` belongs to request `b / NKVH`; lane `cc` is valid exactly
+/// where that request's own history holds slot `p·PAGE_SLOTS + w·64 + cc`, or the batch's one shared
+/// write slot. A row reading a batch-mate's keys is the cross-request leak this pins shut.
 #[test]
 fn the_batch_mask_validates_each_row_on_its_own_requests_history_alone() {
-    let (seqs, j) = (4u32, 3u32);
-    let chunk = ChunkScratch::of_chunk(pool_2b(), seqs * j).expect("admitted");
-    let bc = BatchChunk::of(chunk, seqs, 4).expect("a whole number of pages per request");
-    assert_eq!(bc.mask_rows(), 4 * seqs);
-    assert_eq!(bc.mask_cols(), seqs * j * 256);
-    let layout = StickLayout::row_blocked(bc.mask_rows() as usize, bc.mask_cols() as usize);
-    for row in [0, 1, 5, 15] {
-        for slot in [0, 63, 64, 700, bc.mask_cols() - 1] {
-            assert_eq!(
-                bc.mask_elem(row, slot),
-                Some(layout.dev_off(row as usize, slot as usize)),
-                "({row}, {slot})"
-            );
-        }
-    }
-    assert_eq!(bc.mask_elem(bc.mask_rows(), 0), None);
+    use ktir_superdsc::sdsc_abstract::{BatchSlot, SplicedBatchRegion, spliced_batched_mask_f16};
+    use std::num::NonZeroU32;
+    let pool = pool_2b();
+    let (seqs, gqa) = (4u32, 4u32);
+    let ktb = seqs * pool.nkvh();
+    let pg = ktb * gqa;
+    let w4 = pool.windows_per_page();
+    let pages = 2u32;
+    let block = u64::from(w4) * u64::from(pg) * 64 * 2;
+    let region = SplicedBatchRegion::of_mask_extent(
+        block * u64::from(pages),
+        pool,
+        NonZeroU32::new(gqa).expect("gqa is nonzero"),
+        NonZeroU32::new(seqs).expect("a batch is nonzero"),
+    )
+    .expect("two whole page blocks is a region this family states");
     // Request 0: 10 keys. Request 1: a whole page. Request 2: 5 keys, a hole, then one key a batch
     // appended at its shared write slot (300, past a 300-key batch-mate). Request 3: the padding row,
     // live 0's history.
@@ -83,7 +85,7 @@ fn the_batch_mask_validates_each_row_on_its_own_requests_history_alone() {
             let mut h = KvHistory::contiguous(5);
             let deep = [KvHistory::contiguous(300)];
             h.record(
-                ktir_superdsc::sdsc_abstract::BatchSlot::of(deep.iter()),
+                BatchSlot::of(deep.iter()),
                 ktir_superdsc::sdsc_abstract::SlotCount::new(1),
             );
             assert!(h.contains(300) && !h.contains(5) && !h.contains(299));
@@ -91,79 +93,96 @@ fn the_batch_mask_validates_each_row_on_its_own_requests_history_alone() {
         },
         KvHistory::contiguous(10),
     ];
-    let mask = batch_chunk_mask_f16(bc, &hists, -100.0).expect("one history per request row");
+    let write = BatchSlot::of(hists.iter());
+    let mask = spliced_batched_mask_f16(region, &hists, write).expect("one history per launch row");
+    let rows = (pages * w4 * pg) as usize;
+    assert_eq!(mask.rows(), rows);
     let m = mask.wire_bytes();
-    assert_eq!(m.len(), bc.mask_elems() * 2);
-    let valid = |row: u32, slot: u32| {
-        let e = bc.mask_elem(row, slot).expect("in the block");
-        half::f16::from_le_bytes([m[e * 2], m[e * 2 + 1]]).to_f32() == 0.0
-    };
-    let per = j * 256;
-    // ⭐ THE TALLIES ARE THE BYTES' OWN VALIDITY — derived independently of the minter's runs
-    // walk, at the minter's own (row, 64-lane slab) pitch; every count must agree.
-    let slabs = bc.mask_cols() as usize / 64;
-    let mut tallies = vec![0u32; bc.mask_rows() as usize * slabs];
-    for row in 0..bc.mask_rows() {
-        let r = row % seqs;
-        for slot in 0..bc.mask_cols() {
-            let (owner, local) = bc.slot_of(slot).expect("inside the chunk");
-            let want = owner == r && hists[r as usize].contains(local as usize);
+    assert_eq!(m.len(), rows * 64 * 2);
+    for r in 0..rows {
+        let p = r / (w4 * pg) as usize;
+        let rem = r % (w4 * pg) as usize;
+        let (w, flat) = (rem / pg as usize, rem % pg as usize);
+        let request = flat / gqa as usize / pool.nkvh() as usize;
+        let mut lanes = 0u32;
+        for cc in 0..64usize {
+            let slot = p * PagedKvPool::PAGE_SLOTS + w * 64 + cc;
+            let e = (r * 64 + cc) * 2;
+            let valid = half::f16::from_le_bytes([m[e], m[e + 1]]).to_f32() == 0.0;
+            let want = hists[request].contains(slot) || slot == write.get() as usize;
             assert_eq!(
-                valid(row, slot),
-                want,
-                "row {row} (request {r}) at slot {slot} (request {owner}, local {local})"
+                valid, want,
+                "row {r} (request {request}) at slot {slot}: validity is its OWN history's"
             );
-            assert!(local < per);
-            if want {
-                tallies[row as usize * slabs + slot as usize / 64] += 1;
-            }
+            lanes += u32::from(want);
         }
-    }
-    for (flat, &t) in tallies.iter().enumerate() {
         assert_eq!(
-            mask.window_valid(flat / slabs, flat % slabs).get(),
-            t,
-            "flat window-row {flat}: the count must be the bytes' own validity, minted by the \
-             same runs walk that wrote them"
+            mask.window_valid(r, 0).get(),
+            lanes,
+            "row {r}: the count must be the bytes' own validity, minted by the loop that wrote them"
         );
     }
-    assert!(batch_chunk_mask_f16(bc, &hists[..3], -100.0).is_none());
+    assert!(
+        spliced_batched_mask_f16(region, &hists[..3], write).is_none(),
+        "a history count that is not the launch's row count refuses"
+    );
 }
 
-/// ⭐⭐⭐ THE SWEEP READING at the chunk family's own door: a row whose whole slab sweep is empty
-/// is a request that holds none of its own run's slots — the never-prefilled desync the fold's
-/// `l` would normalize, because the row's `m` never rises past the sentinel seed to expunge it.
-/// A healthy batch sweeps one on every row; the named row maps to its request by the chunk's
-/// own law door.
+/// ⭐⭐⭐ THE SWEEP READING over the live batched mask: a row whose whole sweep is empty is a request
+/// that holds none of its own slots — the never-prefilled desync the fold's `l` would normalize,
+/// because the row's `m` never rises past the sentinel seed to expunge it. A healthy batch sweeps one
+/// on every row; a starved request's rows are named.
 #[test]
-fn the_chunk_family_names_an_empty_sweep_row() {
-    let (seqs, j) = (4u32, 3u32);
-    let chunk = ChunkScratch::of_chunk(pool_2b(), seqs * j).expect("admitted");
-    let bc = BatchChunk::of(chunk, seqs, 4).expect("a whole number of pages per request");
+fn the_batch_mask_names_an_empty_sweep_row() {
+    use ktir_superdsc::sdsc_abstract::{BatchSlot, SplicedBatchRegion, spliced_batched_mask_f16};
+    use std::num::NonZeroU32;
+    let pool = pool_2b();
+    let (seqs, gqa) = (4u32, 4u32);
+    let pg = seqs * pool.nkvh() * gqa;
+    let w4 = pool.windows_per_page();
+    let block = u64::from(w4) * u64::from(pg) * 64 * 2;
+    let region = SplicedBatchRegion::of_mask_extent(
+        block,
+        pool,
+        NonZeroU32::new(gqa).expect("gqa is nonzero"),
+        NonZeroU32::new(seqs).expect("a batch is nonzero"),
+    )
+    .expect("one whole page block is a region this family states");
+    let rows = (w4 * pg) as usize;
+    // The empty-sweep reading: a row whose every window counts zero valid lanes.
+    let empty_row = |mask: &ktir_superdsc::sdsc_abstract::ValidityMask| {
+        (0..pg as usize).find(|&row| {
+            (0..w4 as usize).all(|w| mask.window_valid(w * pg as usize + row, 0).get() == 0)
+        })
+    };
     let healthy = vec![
         KvHistory::contiguous(10),
         KvHistory::contiguous(256),
         KvHistory::contiguous(5),
         KvHistory::contiguous(10),
     ];
-    let m = batch_chunk_mask_f16(bc, &healthy, -100.0).expect("one history per request row");
+    // A write slot past the page — so the sweep law reads the histories alone.
+    let past = [KvHistory::contiguous(PagedKvPool::PAGE_SLOTS)];
+    let write = BatchSlot::of(past.iter());
+    let m = spliced_batched_mask_f16(region, &healthy, write).expect("one history per row");
+    assert_eq!(m.rows(), rows);
     assert_eq!(
-        batch_chunk_empty_sweep_row(&m),
+        empty_row(&m),
         None,
         "a batch whose every request holds a slot must sweep one on every row"
     );
-    // Request 1's history is EMPTY — no run, no shared slot — so every row `i % B == 1`
-    // sweeps nothing, and the first of them is named.
+    // Request 1's history is EMPTY, so every one of request 1's flat rows sweeps nothing, and the
+    // first of them is named.
     let starved = vec![
         KvHistory::contiguous(10),
         KvHistory::contiguous(0),
         KvHistory::contiguous(5),
         KvHistory::contiguous(10),
     ];
-    let m = batch_chunk_mask_f16(bc, &starved, -100.0).expect("one history per request row");
-    let row = batch_chunk_empty_sweep_row(&m).expect("request 1's rows sweep nothing");
+    let m = spliced_batched_mask_f16(region, &starved, write).expect("one history per row");
+    let row = empty_row(&m).expect("request 1's rows sweep nothing");
     assert_eq!(
-        bc.row_request(row),
+        row / gqa as usize / pool.nkvh() as usize,
         1,
         "the named row {row} must be request 1's"
     );
