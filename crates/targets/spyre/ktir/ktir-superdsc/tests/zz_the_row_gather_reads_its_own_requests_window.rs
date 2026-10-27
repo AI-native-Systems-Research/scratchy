@@ -138,7 +138,7 @@ fn operand_start(dsc: &serde_json::Value, i: usize) -> Option<i64> {
         .iter()
         .filter(|n| n.get("nodeType_").and_then(|v| v.as_str()) == Some("allocate"))
         .find(|n| n.get("ldsIdx_").and_then(|v| v.as_u64()) == Some(lds))
-        .and_then(|n| min_start(n))
+        .and_then(min_start)
 }
 
 /// Every `(name, dsc)` the emitted ops carry.
