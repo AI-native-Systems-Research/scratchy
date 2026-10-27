@@ -132,7 +132,7 @@ pub struct Published {
 pub struct Head<'a> {
     pub title: &'a str,
     pub assets: &'a Published,
-    pub description: Option<&'static str>,
+    pub description: Option<&'a str>,
     pub og: Option<OpenGraph>,
     pub root: Root,
     pub libraries: &'a [Library],

@@ -44,7 +44,7 @@
     ],
     "classes": [
       {
-        "class": "sliding window",
+        "class": "Sliding window",
         "small": "gpt-oss-20b",
         "large": "gpt-oss-120b-3bit"
       },
@@ -59,7 +59,7 @@
         "large": "qwen3.5-122b-a10b"
       },
       {
-        "class": "dense",
+        "class": "Dense",
         "small": "granite-4.2-3b",
         "large": "granite-4.2-30b"
       }

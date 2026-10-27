@@ -664,6 +664,13 @@ fn opt(v: Option<u32>) -> String {
     v.map_or("?".to_string(), |v| v.to_string())
 }
 
+/// Counts written as a list: `1, 2, 4`.
+fn counts(v: &[u32]) -> String {
+    (v.iter().map(u32::to_string))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn headers<const N: usize>(names: [&str; N]) -> Vec<String> {
     names.map(String::from).to_vec()
 }
@@ -2017,16 +2024,60 @@ impl GlanceGrid {
     }
 }
 
+/// The overview's two sets of Macs, by memory ([`Lineup`]): each runs its own models and its own
+/// users × prompt grid, so each gets heat maps of its own.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Set {
+    Small,
+    Large,
+}
+
+impl Set {
+    const ALL: [Set; 2] = [Set::Small, Set::Large];
+
+    fn of(memory_gb: u32, large_from_gb: u32) -> Set {
+        if memory_gb >= large_from_gb {
+            Set::Large
+        } else {
+            Set::Small
+        }
+    }
+
+    fn title(self, large_from_gb: u32) -> String {
+        match self {
+            Set::Small => format!("Below {large_from_gb} GB"),
+            Set::Large => format!("{large_from_gb} GB and up"),
+        }
+    }
+}
+
+/// A set's heat map shape: users at once down the side, prompt tokens across.
+#[derive(Default)]
+struct Shape {
+    users: Vec<u32>,
+    prompts: Vec<u32>,
+}
+
+impl Shape {
+    /// A run's users × prompt grid (`grid_conc`, `grid_input`), None for a run without one (a
+    /// `--no-scaling` run, or one from before the grid had its own users counts).
+    fn of(run: &Run) -> Option<Shape> {
+        let sc = run.config.scaling.as_ref()?;
+        Some(Shape {
+            users: sc.grid_conc.clone()?,
+            prompts: sc.grid_input.clone()?,
+        })
+    }
+}
+
 /// The overview's shape: a column per class of the lineup (`config.classes`), each Mac on the
-/// class's small model or, from `large_from_gb`, its large one, and each map a users count by a
-/// prompt length (`grid_conc`, `grid_input`), one shape for every model on every machine: users at
-/// once down the side, prompt tokens across. A square its run did not measure (a run of another
-/// shape, or a prompt the Mac's memory did not hold) is blank.
+/// class's small model or, from `large_from_gb`, its large one, and each [`Set`] its own map
+/// shape. A square its run did not measure (a run of an older shape, or a prompt the Mac's memory
+/// did not hold) is blank.
 struct Lineup<'a> {
     classes: &'a [data::Class],
     large_from_gb: u32,
-    users: Vec<u32>,
-    prompts: Vec<u32>,
+    shapes: BTreeMap<Set, Shape>,
 }
 
 impl Lineup<'_> {
@@ -2035,33 +2086,40 @@ impl Lineup<'_> {
             .find(|c| c.class == class)
             .map(|c| c.model(memory_gb, self.large_from_gb))
     }
+
+    fn set(&self, memory_gb: u32) -> Set {
+        Set::of(memory_gb, self.large_from_gb)
+    }
 }
 
 /// The overview's [`Lineup`]: the classes and cut-off of the newest run that records a lineup, and
-/// every users count and prompt any of those runs measured, so a `--no-scaling` run (no grid) does
-/// not empty every map. None before any run records a lineup.
+/// per set the grid of the set's newest run that records a lineup too, else of its newest run with
+/// a grid at all, so a `--no-scaling` run does not empty the set's maps. None before any run
+/// records a lineup.
 fn lineup<'a>(machines: &BTreeMap<&str, MachineRuns<'a>>) -> Option<Lineup<'a>> {
-    let mut with_lineup: Vec<&Run> = (machines.values())
+    let mut runs: Vec<&Run> = (machines.values())
         .flat_map(|mr| mr.runs.iter().copied())
-        .filter(|r| r.config.classes.is_some())
         .collect();
-    with_lineup.sort_by(|a, b| b.generated_utc.cmp(&a.generated_utc));
-    let newest = with_lineup.first()?;
-    // Every run's users counts and prompts: a Mac below `large_from_gb` runs fewer users than one
-    // above it, and neither's rows may drop off the other's map.
-    let (mut users, mut prompts) = (BTreeSet::new(), BTreeSet::new());
-    for sc in with_lineup.iter().filter_map(|r| r.config.scaling.as_ref()) {
-        if let (Some(c), Some(i)) = (&sc.grid_conc, &sc.grid_input) {
-            users.extend(c.iter().copied());
-            prompts.extend(i.iter().copied());
-        }
-    }
+    runs.sort_by(|a, b| b.generated_utc.cmp(&a.generated_utc));
+    let newest = runs.iter().find(|r| r.config.classes.is_some())?;
+    // Runs from before `large_from_gb` split the sets at 64 GB.
+    let large_from_gb = newest.config.large_from_gb.unwrap_or(64);
+    let shapes = (Set::ALL.into_iter())
+        .map(|set| {
+            let mine = || {
+                (runs.iter()).filter(move |r| Set::of(r.machine.memory_gb, large_from_gb) == set)
+            };
+            let shape = (mine().filter(|r| r.config.classes.is_some()))
+                .find_map(|r| Shape::of(r))
+                .or_else(|| mine().find_map(|r| Shape::of(r)))
+                .unwrap_or_default();
+            (set, shape)
+        })
+        .collect();
     Some(Lineup {
         classes: newest.config.classes.as_deref()?,
-        // Runs from before `large_from_gb` split the sets at 64 GB.
-        large_from_gb: newest.config.large_from_gb.unwrap_or(64),
-        users: users.into_iter().collect(),
-        prompts: prompts.into_iter().collect(),
+        large_from_gb,
+        shapes,
     })
 }
 
@@ -2100,7 +2158,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
         }
     }
     let metrics = [(Metric::Ttft, "Prefill"), (Metric::Throughput, "Decode")];
-    let users: Vec<u32> = lineup.users.clone();
+    let shape = |chip: &str| &lineup.shapes[&lineup.set(memory(chip))];
     // The answer lengths the maps are at: one, unless machines are on runs of different shapes.
     let answers: BTreeSet<u32> = (shown.iter())
         .filter_map(|&(chip, stem)| machines[chip].latest(stem))
@@ -2121,8 +2179,8 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                     &machines[chip],
                     stem,
                     metric,
-                    &lineup.users,
-                    &lineup.prompts,
+                    &shape(chip).users,
+                    &shape(chip).prompts,
                 ),
             );
         }
@@ -2213,11 +2271,11 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
         let at = SparkAt { chip, stem, trend };
         trend_spark(at, &sparks[&at], "4.5rem")
     };
-    // Every prompt length any shown grid has: a grid with none of its own
-    // (the model not run on that machine, say) keeps its place as a map of
-    // blank squares this wide, over why it has nothing to show.
-    let prompts: Vec<u32> = lineup.prompts.clone();
+    // A grid with nothing of its own (the model not run on that machine, say)
+    // keeps its place as a map of blank squares its set's shape, over why it
+    // has nothing to show.
     let mini = |chip: &str, stem: &str, name: &str| -> Element {
+        let Shape { users, prompts } = shape(chip);
         let (ins, cells, total_label, none) = match &grids[&(chip, stem, name)] {
             Ok(g) => (
                 &g.prompts,
@@ -2226,7 +2284,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                 "no ratios",
             ),
             Err(why) => (
-                &prompts,
+                prompts,
                 users
                     .iter()
                     .flat_map(|&u| prompts.iter().map(move |&i| (u, i, None)))
@@ -2251,7 +2309,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             })
             .collect();
         glance_mini(
-            Slice::Answer(0).axes(&users, ins),
+            Slice::Answer(0).axes(users, ins),
             squares,
             total_label,
             name,
@@ -2260,6 +2318,33 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
         )
     };
     let chips: Vec<&str> = in_order(machines);
+    // The heat maps a matrix per set, each in its own shape: machines read up within it.
+    let sets: Vec<(Set, Vec<&str>)> = (Set::ALL.into_iter())
+        .map(|set| {
+            let rows = (chips.iter().copied())
+                .filter(|&chip| lineup.set(memory(chip)) == set)
+                .collect();
+            (set, rows)
+        })
+        .filter(|(_, rows): &(Set, Vec<&str>)| !rows.is_empty())
+        .collect();
+    let cell = |chip: &str, class: &str| -> Element {
+        let Some(stem) = model_of(chip, class) else {
+            return rsx! {};
+        };
+        // The whole column's width, not its model name's: the maps fill it, so every map on the
+        // page is one size, and a name wider than the column wraps under them.
+        rsx! {
+            div { style: "flex: 1 1 0; min-width: 0",
+                Stack { gap: 1,
+                    div { style: "display: flex; gap: 0.5rem; align-items: flex-start",
+                        for (_, name) in metrics { {mini(chip, stem, name)} }
+                    }
+                    div { style: "text-align: center; font-size: 0.75rem; overflow-wrap: anywhere", "{stem}" }
+                }
+            }
+        }
+    };
     rsx! {
         Section { id: "glance", level: 2,
             Stack { gap: 4,
@@ -2294,17 +2379,16 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                          llama.cpp, mistral.rs. Blue faster, red slower, the middle step within noise. \
                                          Hover a square for its ratio."
                                     }
-                                    {glance_maps(&chips, &classes, |chip, class| {
-                                        let Some(stem) = model_of(chip, class) else { return rsx! {} };
-                                        rsx! {
-                                            Stack { gap: 1,
-                                                div { style: "display: flex; gap: 0.5rem; align-items: flex-start",
-                                                    for (_, name) in metrics { {mini(chip, stem, name)} }
-                                                }
-                                                div { style: "text-align: center; font-size: 0.75rem", "{stem}" }
+                                    for (set, rows) in &sets {
+                                        Stack { gap: 3,
+                                            div {
+                                                strong { "{set.title(lineup.large_from_gb)}" }
+                                                ": {counts(&lineup.shapes[set].users)} users at once by \
+                                                 {counts(&lineup.shapes[set].prompts)}-token prompts"
                                             }
+                                            {glance_maps(rows, &classes, cell)}
                                         }
-                                    })}
+                                    }
                                 }
                             }
                             // Each a machine × model matrix, every cell its prefill
@@ -2797,6 +2881,30 @@ fn machine_section(chip: &str, mr: &MachineRuns) -> Element {
     }
 }
 
+/// The engines the page compares scratchy with, in [`Engine::RIVALS`] order: those any machine's
+/// shown models measured (oMLX TurboQuant under oMLX), written as a list, or None for none.
+fn rivals_named(machines: &BTreeMap<&str, MachineRuns>) -> Option<String> {
+    let shown: Vec<&Model> = (machines.values())
+        .flat_map(|mr| mr.models.iter().filter_map(|(_, es)| es.last()))
+        .map(|e| e.m)
+        .collect();
+    let mut names: Vec<&str> = Vec::new();
+    for e in Engine::RIVALS {
+        let name = match e {
+            Engine::OmlxTq => Engine::Omlx.label(),
+            _ => e.label(),
+        };
+        if shown.iter().any(|m| e.ran(m)) && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    match names.as_slice() {
+        [] => None,
+        [one] => Some(one.to_string()),
+        [rest @ .., last] => Some(format!("{} and {last}", rest.join(", "))),
+    }
+}
+
 pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     let runs = load(site)?;
     let machines = index(&runs);
@@ -2824,6 +2932,8 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
         }
     };
     let (count, n_machines) = (runs.len(), machines.len());
+    let against =
+        rivals_named(&machines).map_or("scratchy".to_string(), |r| format!("scratchy against {r}"));
     let page = rsx! {
         {chrome::header(Root(0), Some(Tab::Performance))}
         {chrome::perf_side_nav("metal.html", &sections)}
@@ -2833,7 +2943,7 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
                 Stack { gap: 4,
                     Heading { "Metal performance" }
                     p {
-                        "scratchy against oMLX, mlx-lm, vllm-metal, ollama, llama.cpp and mistral.rs on Apple \
+                        "{against} on Apple \
                          silicon: how long each takes to start, how fast it answers one user, and how it holds up as \
                          prompts, answers and users grow. \
                          {count} runs on {n_machines} machines, every number measured by "
@@ -2848,13 +2958,14 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
         }
         script { dangerous_inner_html: crate::charts::CHARTS_JS }
     };
+    let description = format!(
+        "{against} on Apple silicon: startup, single-user speed, and scaling, per machine."
+    );
     let html = chrome::document(
         Head {
             assets,
             title: "Metal performance — scratchy",
-            description: Some(
-                "scratchy against oMLX, mlx-lm, vllm-metal, ollama, llama.cpp and mistral.rs on Apple silicon: startup, single-user speed, and scaling, per machine.",
-            ),
+            description: Some(&description),
             og: None,
             root: Root(0),
             libraries: &[Library::CarbonCharts],
@@ -3119,6 +3230,7 @@ mod tests {
         base["machine"]["memory_gb"] = 32.into();
         // Below 64 GB the grid runs 1, 2 and 4 users; the 36 GB M3 Pro's run is from before that.
         base["config"]["scaling"]["grid_conc"] = serde_json::json!([1, 2, 4]);
+        base["generated_utc"] = "2026-10-26T20:05:50Z".into();
         let runs: Vec<Run> = [
             base,
             read("apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"),
@@ -3133,12 +3245,22 @@ mod tests {
             super::in_order(&machines),
             ["Apple M5", "Apple M3 Pro", "Apple M4 Max", "Apple M5 Max"]
         );
-        // The overview's columns are the full run's recorded lineup, each Mac on its set, and its
-        // rows every users count any Mac ran.
+        // The overview's columns are the full run's recorded lineup, each Mac on its set, and each
+        // set's maps the grid of its own newest run: the small set the M5's, not the older M3
+        // Pro's, and the large set, with no lineup run of its own, the M5 Max's.
         let lineup = super::lineup(&machines).expect("the M3 Pro's run records its lineup");
-        assert_eq!(lineup.users, [1, 2, 4, 8, 16]);
-        assert_eq!(lineup.prompts, [128, 1024, 4096, 32768]);
-        let dense = lineup.classes.iter().find(|c| c.class == "dense").unwrap();
+        let small = &lineup.shapes[&super::Set::Small];
+        assert_eq!(
+            (&small.users[..], &small.prompts[..]),
+            (&[1, 2, 4][..], &[128, 1024, 4096, 32768][..])
+        );
+        let large = &lineup.shapes[&super::Set::Large];
+        assert_eq!(
+            (&large.users[..], &large.prompts[..]),
+            (&[1, 2, 4, 8, 16][..], &[128, 1024, 4096][..])
+        );
+        assert!(lineup.set(36) == super::Set::Small && lineup.set(64) == super::Set::Large);
+        let dense = lineup.classes.iter().find(|c| c.class == "Dense").unwrap();
         assert_eq!(dense.model(32, lineup.large_from_gb), "granite-4.2-8b");
         assert_eq!(dense.model(36, lineup.large_from_gb), "granite-4.2-8b");
         assert_eq!(dense.model(64, lineup.large_from_gb), "granite-4.2-30b");
