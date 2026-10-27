@@ -7966,14 +7966,18 @@ mod embed_row_gather_tests {
         );
     }
 
-    /// ⛔ THE ROW GATHER'S OWN CEILING, REFUSED BY NAME — hidden 4096 at the payload's
-    /// lawful k = 8 (512·512 = 262,144 B, inside the budget; 8 entries inside the IBR
-    /// cap) is a SLAB side this door accepts, but the row gather would need hidden/64 =
-    /// 64 one-stick entries — past the 32-entry IBR stick cap — and a row wider than
-    /// one index stick cannot be named at all: the chain's own geometry, refused here
-    /// by name rather than half-gathered on the card.
+    /// ⛔ THE LANE INDEX CARRIES EVERY ENTRY OF EVERY REQUEST — hidden 4096 at the
+    /// payload's lawful k = 8 (512·512 = 262,144 B, inside the budget) is a geometry
+    /// this door ACCEPTS since the per-stick cut landed (the rung-8 remedy: the row
+    /// gather's 64 one-stick entries run ONE OP PER INDEX STICK against an IBR loaded
+    /// 32 words per stick, so the old 32-entry ceiling became a SHAPE law) — and the
+    /// lane index must therefore state `[width·l_sticks, 32]`: row r's 2 sticks then
+    /// row r+1's. The ONE-ROW spelling `[1, 32]` (the era this test module was written
+    /// in) is a stale payload at this hidden — refused by name, never half-gathered on
+    /// the card — and the LAWFUL two-stick spelling bakes, which is the proof the cut
+    /// handles the row width the ceiling used to refuse.
     #[test]
-    fn embed_row_gather_refuses_a_row_past_the_ibr_entry_cap() {
+    fn embed_row_gather_refuses_a_stale_one_stick_lane_index() {
         let e = refusal(&embed_row_gather_program(
             IDX,
             IDX,
@@ -7983,16 +7987,46 @@ mod embed_row_gather_tests {
             8,
         ));
         assert!(
-            e.contains("the row gather runs 64 one-stick entries"),
-            "names the leg and its entry count, got: {e}"
+            e.contains("the lane index t302 states [1, 32]"),
+            "names the lane index and its stale shape, got: {e}"
         );
         assert!(
-            e.contains("32-entry cap"),
-            "names the IBR cap, got: {e}"
+            e.contains("the row gather runs 64 one-stick entries per request"),
+            "names the leg and its per-request entry count, got: {e}"
         );
         assert!(
-            e.contains("never a half-gathered row"),
+            e.contains("the lane index is [2, 32]"),
+            "names the lawful two-stick spelling, got: {e}"
+        );
+        assert!(
+            e.contains("never half-gathered on the card"),
             "states the law, got: {e}"
+        );
+        // The lawful spelling bakes: the same geometry with the lane index
+        // stating every entry (`[width·l_sticks, 32]` = [2, 32] at width 1)
+        // lowers the three legs — the per-stick cut's own answer to the row
+        // the old ceiling refused.
+        let ops = lower(&embed_row_gather_program(
+            IDX,
+            (2, 32),
+            (4096, VOCAB),
+            (1, 4096),
+            0,
+            8,
+        ))
+        .expect("the two-stick lane index is the lawful spelling at hidden 4096");
+        let names: Vec<&str> = ops.iter().map(|o| o.op_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "embed_row_gather_s0_slabg",
+                "embed_row_gather_s0_xpose",
+                "embed_row_gather_s0_rowg0",
+                "embed_row_gather_s0_rowg1",
+            ],
+            "the cut runs the slab gather and the transpose, then ONE ROW-GATHER OP PER \
+             INDEX STICK — two at the two-stick lane index, the per-stick cut's own \
+             signature (the single `rowg` the one-stick spellings bake)"
         );
     }
 
@@ -8482,8 +8516,10 @@ mod chain_stage_tests {
         );
     }
 
-    /// ⛔ THE PICK-STICK CLASS — the argmax idx stick's own shape is `[1, 64]`; a pick off
-    /// that class is a producer the chain never minted, refused by name.
+    /// ⛔ THE PICK-STICK CLASS — the sampler idx stick's own shape is `[width, 64]`
+    /// (i32 lanes, every lane of row r equal to row r's pick, splatted by the kernel
+    /// that wrote it); a pick off that class is a producer the chain never minted,
+    /// refused by name.
     #[test]
     fn a_pick_stick_off_the_argmax_class_is_refused() {
         let e = refusal(&chain_stage_program(
@@ -8502,7 +8538,7 @@ mod chain_stage_tests {
             "names the pick stick and its shape, got: {e}"
         );
         assert!(
-            e.contains("the argmax idx-stick class"),
+            e.contains("the sampler idx-stick class, [width, 64]"),
             "names the class the pick must carry, got: {e}"
         );
     }
