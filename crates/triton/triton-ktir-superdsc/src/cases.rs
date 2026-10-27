@@ -911,6 +911,24 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
             vec![2],
             Program::Sample,
         ),
+        // ⭐ THE REDUCE-CHAIN TWIN (wall-9, auditor order after the wide leg
+        // failed identically): the sampler's own `max → expand_dims → add`
+        // chain at production width — the reduce's [2,1] output is DEVICE-
+        // written and consumed as the add's Col operand, the exact form of
+        // `max_o17` → `equal_o18` in the batched greedy bundle. Decides whether
+        // the device-written Col read is self-consistent (the greedy's safety)
+        // or row-blind like the host-staged twin (the equality passes by luck —
+        // urgent). NOT a production configuration: delete with the probe.
+        "intmr_f32maxadd" => (
+            spec(
+                "intmr_probe",
+                "intmr_f32maxadd_probe",
+                &[("a_ptr", "*fp32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(65536)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
         _ => return None,
     })
 }

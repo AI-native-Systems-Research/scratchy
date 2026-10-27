@@ -138,3 +138,39 @@ def intmr_f32col_add_probe(a_ptr, b_ptr, o_ptr,  #
     o_d = tl.make_tensor_descriptor(o_ptr, shape=[B, PAD_V], strides=[PAD_V, 1],
                                     block_shape=[1, PAD_V])
     o_d.store([pid, 0], o)
+
+
+@triton.jit
+def intmr_f32maxadd_probe(a_ptr, o_ptr,  #
+                          PAD_V: tl.constexpr, B: tl.constexpr):
+    # THE REDUCE-CHAIN TWIN (auditor order, wall 9): the sampler's own max
+    # spelling verbatim — `m = tl.max(a, axis=1)`; `mm = tl.expand_dims(m, 1)`
+    # — with the result consumed as the add's Col operand, the EXACT chain of
+    # `max_o17` → `equal_o18` in the batched greedy bundle. The wide twin
+    # proved the HOST-staged [B,1] Col read is row-blind (stick s reads word
+    # (s mod rows) for every row); this cell measures the DEVICE-written
+    # side: the reduce's [B,1] output is written by the card, and the question
+    # is whether the same Col read picks each row's own max (self-consistent,
+    # the greedy's safety) or the same row-blind word (the equality passes by
+    # luck — urgent). The bake's max-op output TensorArg against the add-op's
+    # Col input TensorArg is the write-layout vs read-layout statement,
+    # readable from the emission alone.
+    #
+    # THE FPTOSI SINK: the sampler's own f32 selection survives LegalizeTypes'
+    # RED-stop only inside the exactness island terminating at `arith.fptosi`
+    # (`fp32toint32_o12` in the bundle); a bare f32 `tt.reduce` is refused
+    # (FP32_CARD_BINDS carries no reduce row). So the probe stores the sum as
+    # i32 through the same `.to(tl.int32)` the sampler's tail spells — the
+    # island then protects the reduce and its combiner exactly as in
+    # production. All staged words and sums are exact integers < 2^24, so the
+    # conversion is exact and the i32 compare stays a pure addressing test.
+    pid = tl.program_id(0)
+    a_d = tl.make_tensor_descriptor(a_ptr, shape=[B, PAD_V], strides=[PAD_V, 1],
+                                    block_shape=[1, PAD_V])
+    a = a_d.load([pid, 0])
+    m = tl.max(a, axis=1)
+    mm = tl.expand_dims(m, 1)
+    o = a + mm
+    o_d = tl.make_tensor_descriptor(o_ptr, shape=[B, PAD_V], strides=[PAD_V, 1],
+                                    block_shape=[1, PAD_V])
+    o_d.store([pid, 0], o.to(tl.int32))

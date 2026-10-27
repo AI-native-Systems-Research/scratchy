@@ -133,6 +133,11 @@ def tables() -> list[tuple[str, np.ndarray]]:
     out.append(("intmr_f32col_add_t01_b", b_f32col()))
     out.append(("intmr_f32wide_add_t00_a", a_f32wide()))
     out.append(("intmr_f32wide_add_t01_b", b_f32col()))
+    # The reduce-chain twin: the same wide tile (row maxima 65535 / 296605 —
+    # DISTINCT, exact), fed to `max → expand_dims → add` — the addend the card
+    # delivers per (row, stick) names the buffer word the Col read picked, and
+    # the pass/fail names whether the device-written pair is self-consistent.
+    out.append(("intmr_f32maxadd_t00_a", a_f32wide()))
     return out
 
 
