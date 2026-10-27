@@ -1733,7 +1733,11 @@ fn run_tasks(
         std::fs::write(path, serde_json::to_string_pretty(&rows)?)?;
     }
     let count = |t: &str| datasets::token_count(tokenizer, t).unwrap_or(0);
-    let json = task_metrics(&results, &tasks, &count, total_time, &dataset, args.seed);
+    let pcts: Vec<f64> = (args.metric_percentiles.split(','))
+        .filter_map(|p| p.trim().parse().ok())
+        .collect();
+    let mut json = task_metrics(&results, &tasks, &count, total_time, &dataset, args.seed);
+    add_task_percentiles(&mut json, &results, &tasks, &count, &pcts);
     print_task_summary(&dataset, &json);
     write_results(args, model, &json)
 }
@@ -1844,6 +1848,8 @@ fn task_metrics(
     serde_json::json!({
         "dataset": dataset,
         "task_seed": seed,
+        // Tasks sent, the denominator of accuracy: at 8 a task is 12.5 points of it.
+        "num_tasks": results.len(),
         "duration": total_time,
         "completed": ok.len(),
         "failed": results.len() - ok.len(),
@@ -1867,6 +1873,52 @@ fn task_metrics(
         "thinking_answers": thought,
         "capped_answers": capped,
     })
+}
+
+/// Every `--metric-percentiles` percentile of a dataset workload's TTFT, TPOT and end-to-end
+/// latency, over the requests that answered, as `p<N>_<metric>_ms`, the keys the random and
+/// ShareGPT workloads write: the spread across requests, not only the middle and the tail.
+fn add_task_percentiles(
+    json: &mut serde_json::Value,
+    results: &[RequestResult],
+    tasks: &[crate::workloads::Task],
+    count_tokens: &dyn Fn(&str) -> usize,
+    pcts: &[f64],
+) {
+    let ok: Vec<&RequestResult> = (results.iter().zip(tasks))
+        .filter(|(r, _)| r.success)
+        .map(|(r, _)| r)
+        .collect();
+    let answer_tokens = |r: &RequestResult| {
+        if r.output_tokens > 0 {
+            r.output_tokens
+        } else {
+            count_tokens(&r.generated_text)
+        }
+    };
+    let sorted = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v
+    };
+    let series = [
+        ("ttft", sorted(ok.iter().map(|r| r.ttft).collect())),
+        (
+            "tpot",
+            sorted(
+                (ok.iter())
+                    .filter(|r| answer_tokens(r) > 1)
+                    .map(|r| (r.e2el - r.ttft) / (answer_tokens(r) - 1) as f64)
+                    .collect(),
+            ),
+        ),
+        ("e2el", sorted(ok.iter().map(|r| r.e2el).collect())),
+    ];
+    for (name, v) in &series {
+        for &p in pcts {
+            let at = (!v.is_empty()).then(|| percentile(v, p) * 1000.0);
+            json[format!("p{}_{name}_ms", p_word(p))] = serde_json::json!(at);
+        }
+    }
 }
 
 /// Whether an answer opens as reasoning rather than the answer: a think tag, or the openings the
@@ -2210,9 +2262,17 @@ mod tests {
             RequestResult::failed(0.0, 1.0, "timed out".into()),
         ];
         let tasks = vec![rag("Paris"), rag("Paris"), rag("Paris")];
-        let j = task_metrics(&results, &tasks, tokenizer, 1.0, "musique", 7);
+        let mut j = task_metrics(&results, &tasks, tokenizer, 1.0, "musique", 7);
+        add_task_percentiles(&mut j, &results, &tasks, tokenizer, &[25.0, 50.0, 99.5]);
+        assert_eq!(
+            j["p25_ttft_ms"], 100.0,
+            "every requested percentile, as the others write it"
+        );
+        assert_eq!(j["p50_e2el_ms"], 500.0);
+        assert!(j.get("p99.5_tpot_ms").is_some());
         assert_eq!(j["completed"], 2);
         assert_eq!(j["failed"], 1);
+        assert_eq!(j["num_tasks"], 3);
         assert_eq!(j["accuracy"], 1.0 / 3.0, "the failed request scores wrong");
         assert_eq!(j["mean_cached_tokens"], 60.0);
         assert_eq!(j["mean_prompt_tokens"], 100.0);
