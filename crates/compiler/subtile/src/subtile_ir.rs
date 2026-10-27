@@ -5431,8 +5431,9 @@ mod tests {
         let mint = mint_embed_chain(&mut g, TensorId(0), TensorId(3), FIXTURE_VOCAB);
         assert_eq!(
             (g.tensors[mint.l_stick.index()].rows, g.tensors[mint.l_stick.index()].cols),
-            (2, 64),
-            "the l stick is [width, CHAIN_IDX_BLOCK · l_sticks] — two sticks per row"
+            (4, 32),
+            "the l stick is ONE STICK WIDE — [width·l_sticks, 32]: row r's l_sticks sticks \
+             contiguous (stick r·l_sticks + b), never a stick-scattered [width, 64]"
         );
         let l_tab = TensorId(mint.s_stick.0 + 3);
         assert_eq!(
