@@ -12,6 +12,10 @@ over runs that did not happen):
      in-process `scr chat` greedy equals the server's.
   5. 200 seeded single-token draws at temp 1.0  -> each top-10 token's
      frequency vs softmax(main's host logits), within 3 sigma (binomial).
+  5c. the SAME 200 seeds fired 2-CONCURRENT (auditor order 2026-10-27:
+     "plus a 2-concurrent P5") -> each concurrent draw equals its own SOLO
+     draw's token (the rows=2 decode rung reproduces the solo noise), and
+     the same top-10 distribution verdict over the concurrent draws.
 
 Plus the ORDERED LOG EVIDENCE: the server log must SHOW the seat binding the
 seeds (SEAT_BIND lines) and the batched rung launching (PREFILL_PATH=batched /
@@ -152,7 +156,7 @@ def main() -> int:
                 "main": main_text[max(0, i - 20):i + 20]}
     ok = ok and p4_srv and p4_chat and p4_self
 
-    # ── part 5: the distribution ──
+    # ── parts 5 + 5c: the distributions (solo, and 2-concurrent) ──
     logits = np.fromfile(REF / "logits-0000.bin", dtype="<f4")
     p = softmax(logits.astype(np.float64))
     top10 = np.argsort(p)[::-1][:10]
@@ -166,32 +170,64 @@ def main() -> int:
         if s in text2id:
             ambiguous.append(s)
         text2id[s] = int(tid)
-    draws = [json.loads(l) for l in (HERE / "chat-p5-draws.txt").read_text().splitlines()]
-    assert len(draws) == DRAWS, f"expected {DRAWS} draws, read {len(draws)}"
-    counts = Counter(draws)
-    rows = []
-    for tid in top10:
-        s = tok.decode([int(tid)], skip_special_tokens=True)
-        obs = counts.get(s, 0) if s not in ambiguous else None
-        exp = DRAWS * p[tid]
-        sig = math.sqrt(DRAWS * p[tid] * (1 - p[tid]))
-        z = (obs - exp) / max(sig, 0.5) if obs is not None else None
-        rows.append({"id": int(tid), "text": s, "p": float(p[tid]),
-                     "expected": exp, "observed": obs, "sigma": sig, "z": z,
-                     "ambiguous_text": s in ambiguous})
-    p5 = all(r["z"] is not None and abs(r["z"]) <= Z_MAX for r in rows)
-    mapped = {text2id[t] for t in counts if t in text2id}
-    in_top1000 = sum(n for t, n in counts.items() if t in text2id)
-    exp_top1000 = DRAWS * float(p[top1000].sum())
-    outside = {t: n for t, n in counts.items() if t not in text2id}
+
+    def distribution(draws: list) -> dict:
+        """The top-10 frequency verdict over one list of draws (solo or
+        concurrent — the same reference, the same 3-sigma bar)."""
+        counts = Counter(draws)
+        rows = []
+        for tid in top10:
+            s = tok.decode([int(tid)], skip_special_tokens=True)
+            obs = counts.get(s, 0) if s not in ambiguous else None
+            exp = DRAWS * p[tid]
+            sig = math.sqrt(DRAWS * p[tid] * (1 - p[tid]))
+            z = (obs - exp) / max(sig, 0.5) if obs is not None else None
+            rows.append({"id": int(tid), "text": s, "p": float(p[tid]),
+                         "expected": exp, "observed": obs, "sigma": sig, "z": z,
+                         "ambiguous_text": s in ambiguous})
+        in_top1000 = sum(n for t, n in counts.items() if t in text2id)
+        exp_top1000 = DRAWS * float(p[top1000].sum())
+        outside = {t: n for t, n in counts.items() if t not in text2id}
+        return {
+            "top10": rows,
+            "pass_within_3sigma": all(
+                r["z"] is not None and abs(r["z"]) <= Z_MAX for r in rows
+            ),
+            "draws_in_ref_top1000": in_top1000,
+            "expected_in_ref_top1000": exp_top1000,
+            "draws_outside_top1000": {t: n for t, n in list(outside.items())[:10]},
+            "n_outside": sum(outside.values()),
+        }
+
+    solo_draws = [json.loads(l) for l in (HERE / "chat-p5-draws.txt").read_text().splitlines()]
+    assert len(solo_draws) == DRAWS, f"expected {DRAWS} draws, read {len(solo_draws)}"
     report["p5_distribution"] = {
         "draws": DRAWS, "seeds": "100000..100199", "temperature": 1.0,
-        "top10": rows, "pass_within_3sigma": p5,
-        "draws_in_ref_top1000": in_top1000, "expected_in_ref_top1000": exp_top1000,
-        "draws_outside_top1000": {t: n for t, n in list(outside.items())[:10]},
-        "n_outside": sum(outside.values()), "ambiguous_texts": ambiguous,
+        "ambiguous_texts": ambiguous,
+        **distribution(solo_draws),
     }
+    p5 = report["p5_distribution"]["pass_within_3sigma"]
     ok = ok and p5
+
+    # ── part 5c: the same seeds, 2-concurrent — each draw equals its own
+    #    solo draw (the rows=2 rung must reproduce the solo noise), and the
+    #    same distribution verdict over the concurrent draws. HARD GATES. ──
+    conc_draws = [json.loads(l) for l in (HERE / "chat-p5c-draws.txt").read_text().splitlines()]
+    assert len(conc_draws) == DRAWS, f"expected {DRAWS} draws, read {len(conc_draws)}"
+    mism = [i for i, (s, c) in enumerate(zip(solo_draws, conc_draws)) if s != c]
+    p5c = {
+        "draws": DRAWS, "temperature": 1.0,
+        "pairing": "seeds 100000..100199, concurrent pairs (2k, 2k+1)",
+        "each_equals_solo": not mism,
+        **distribution(conc_draws),
+    }
+    if mism:
+        i = mism[0]
+        p5c["first_mismatch"] = {
+            "seed": 100000 + i, "solo": solo_draws[i], "concurrent": conc_draws[i],
+        }
+    report["p5c_concurrent"] = p5c
+    ok = ok and p5c["each_equals_solo"] and p5c["pass_within_3sigma"]
 
     # ── the ordered log evidence ──
     log = SRVLOG.read_text(errors="replace")
@@ -238,7 +274,7 @@ def main() -> int:
     if not ok:
         print("CHAT-VERDICT-FAILED (see report above)")
         return 1
-    print(f"CHAT-VERDICT-PASS (all five parts + log evidence)")
+    print(f"CHAT-VERDICT-PASS (all five parts + the concurrent P5 + log evidence)")
     return 0
 
 

@@ -11,6 +11,10 @@
 #   5. 200 seeded single-token draws at temp 1.0     -> each token's frequency
 #      vs softmax(main's host logits) — top-10 within sampling error
 #      (chat_stats.py reads main's logits-0000.bin).
+#  5c. the SAME 200 seeds, fired 2-CONCURRENT (auditor order 2026-10-27:
+#      "plus a 2-concurrent P5") -> each concurrent draw equals its own SOLO
+#      draw's token (the rows=2 decode rung must reproduce the solo noise,
+#      per-row seed words and all), and the same top-10 distribution verdict.
 # The server runs at --log-level debug so SEAT_BIND (the seat binding the
 # seeds) and the PREFILL_PATH=batched / decode-batch rung lines are in the
 # log. Tree: /work/front-b-noise (this branch). Build: ON THE POD, release,
@@ -137,6 +141,28 @@ while [ "$i" -lt "$DRAWS" ]; do
   i=$((i + 1))
 done
 echo "==== CHAT-P5-DONE ($DRAWS draws, $(date -u +%FT%TZ)) ===="
+
+# ── part 5c: the SAME 200 seeds, 2-CONCURRENT — the rows=2 rung must
+#    reproduce every solo draw. Pairs are DIFFERENT seeds ((0,1), (2,3), …)
+#    so both rows carry their own seed words, the Finding-1 geometry. ──
+echo "==== CHAT-P5C-START $(date -u +%FT%TZ) ===="
+rm -f "$PROBE/chat-p5c-draws.txt" "$PROBE"/chat-p5c-draw-*.json
+i=0
+while [ "$i" -lt "$DRAWS" ]; do
+  SA=$((SEED0 + i)); SB=$((SEED0 + i + 1))
+  ask "$SA" 1.0 1 "$PROBE/chat-p5c-draw-$SA.json" &
+  PA=$!
+  ask "$SB" 1.0 1 "$PROBE/chat-p5c-draw-$SB.json" &
+  PB=$!
+  wait $PA $PB
+  for S in "$SA" "$SB"; do
+    [ -s "$PROBE/chat-p5c-draw-$S.json" ] || { echo "CHAT-P5C-FAILED (seed $S: empty reply)"; echo CHAT-FAILED; exit 1; }
+    python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(json.dumps(r["choices"][0]["message"]["content"]))' \
+      "$PROBE/chat-p5c-draw-$S.json" >> "$PROBE/chat-p5c-draws.txt" || { echo "CHAT-P5C-PARSE-FAILED (seed $S)"; cat "$PROBE/chat-p5c-draw-$S.json"; echo CHAT-FAILED; exit 1; }
+  done
+  i=$((i + 2))
+done
+echo "==== CHAT-P5C-DONE ($DRAWS draws in $((DRAWS / 2)) concurrent pairs, $(date -u +%FT%TZ)) ===="
 
 cleanup
 trap - EXIT
