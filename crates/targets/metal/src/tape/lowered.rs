@@ -1519,9 +1519,10 @@ pub enum RuntimeBindingKind {
         layer: LayerId,
     },
     /// TurboQuant codebook buffers (shared across layers): the random ±1 sign
-    /// vector, the Lloyd-Max boundaries, and the N(0,1) centroids.
+    /// vector, the encoders' table (the Lloyd-Max boundaries, then the centroids), and the
+    /// N(0,1) centroids.
     TqSigns,
-    TqBoundaries,
+    TqEncodeTable,
     TqCentroids,
 }
 
@@ -2048,7 +2049,7 @@ impl RuntimeBindingKind {
             | Self::VisionReverseIndices
             | Self::VisionPositionIds
             | Self::TqSigns
-            | Self::TqBoundaries
+            | Self::TqEncodeTable
             | Self::TqCentroids => self,
         }
     }

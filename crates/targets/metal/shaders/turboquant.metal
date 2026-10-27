@@ -63,7 +63,7 @@ template <typename T>
     device const uint64_t* chunk_table [[buffer(0)]],  // per-(tensor) chunk-addr table
     device const uint*  slots        [[buffer(1)]],    // [n_slots] physical KV slots written this fwd
     device const float* signs        [[buffer(2)]],    // [TQ_DIM]
-    device const float* boundaries   [[buffer(3)]],    // [TQ_CENTROIDS-1]
+    device const float* table        [[buffer(3)]],    // [2 * TQ_CENTROIDS - 1]: boundaries, levels
     device const float* centroids    [[buffer(4)]],    // [TQ_CENTROIDS]
     device       uint*  packed_store [[buffer(5)]],    // [max_slots, TQ_NUM_KV_HEADS, TQ_PACKED_DIM]
     device       float* norms_store  [[buffer(6)]],    // [max_slots, TQ_NUM_KV_HEADS]
@@ -105,7 +105,7 @@ template <typename T>
     threadgroup uint codes[TQ_DIM];
     const uint store = logical_slot * TQ_NUM_KV_HEADS + kv_head;
     const TqEncoded e = tq_encode<1>({(float)vec[elem] - off}, elem, TQ_DIM, TQ_BITS, TQ_VALS_PER_WORD,
-                                     TQ_PACKED_DIM, TQ_CENTROIDS, signs, boundaries,
+                                     TQ_PACKED_DIM, TQ_CENTROIDS, signs, table,
                                      {packed_store + store * TQ_PACKED_DIM}, {norms_store + store},
                                      scratch, codes)[0];
 

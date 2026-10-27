@@ -353,15 +353,11 @@ fn run_coded(c: &Case, bits: u32, fused: bool) -> Option<(Encoded, Vec<u16>, Vec
     let (k, v) = (shared(&device, &k_rows), shared(&device, &v_rows));
     let slots = shared(&device, c.slots);
     let quant = PolarQuantizer::new(hd, bits, TQ_SEED);
-    let boundaries: Vec<f32> = quant
-        .centroids()
-        .windows(2)
-        .map(|w| (w[0] + w[1]) / 2.0)
-        .collect();
+    let encode_table = quant.encode_table();
     let (signs, centroids, bounds) = (
         shared(&device, quant.signs()),
         shared(&device, quant.centroids()),
-        shared(&device, &boundaries),
+        shared(&device, &encode_table),
     );
     let n_rows = c.n_blocks * c.block_size * nkv;
     let pdim = packed_dim(hd, bits);
