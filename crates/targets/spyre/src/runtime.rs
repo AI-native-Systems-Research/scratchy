@@ -383,6 +383,119 @@ impl fmt::Display for AllocError {
 }
 impl std::error::Error for AllocError {}
 
+/// ⭐ #32 — ONE DEFERRED READ'S OWN COMPLETION: armed by the D2H op's user
+/// callback (the per-op completion hook every `launch_*` has always carried and
+/// every seat door has always passed `None`), parked on by the read's finish
+/// half instead of a whole-stream synchronize.
+///
+/// NOT flex-rs's `Event`, and the difference is load-bearing: an op that FAILS
+/// never fires its user callback — the stream records a deferred error and goes
+/// sticky-shutdown instead (`make_completion_callback`'s Err arm) — so a waiter
+/// with no timeout would hang on a dead device. This latch parks on a condvar
+/// with a TIMEOUT tick whose only job is that escape: in the healthy path the
+/// callback's notify returns the park and the tick never fires; when the tick
+/// does fire it hands the wait back so the caller can surface the stream's
+/// deferred error by the same door the whole-stream wait used.
+///
+/// One signal names one transfer, and the finish half that parks on it is
+/// its only WAITER (the ring law — a slot's bytes are read exactly once, by
+/// the drain that owns the handle). The overlap probe gets its non-blocking
+/// view through a separate HANDLE TYPE ([`ReadSignal::peek_handle`]) whose
+/// whole surface is `fired` — the no-waiting law carried by the TYPE, not
+/// by a comment: a handle with no `wait` method cannot break the ring law,
+/// so the signal itself is not `Clone`.
+pub struct ReadSignal {
+    done: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+/// ⭐ #32 (E) — THE PEEK HANDLE: a read-only view of one transfer's
+/// completion latch, minted only by [`ReadSignal::peek_handle`]. Its whole
+/// surface is [`ReadPeek::fired`] — one latch read, never a park, never a
+/// byte of the slot — so the overlap probe can hold it across a step
+/// without being able to wait on it. The waiter's law stays on
+/// `ReadSignal` itself, which this type deliberately cannot become.
+pub struct ReadPeek(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+impl ReadPeek {
+    /// Has the transfer's callback fired? The card-busy answer the overlap
+    /// probe asks at each submit about the PREVIOUS step's read — "not yet
+    /// fired" is the card owing work, the overlap fraction the depth row
+    /// cannot prove (depth counts submits-outstanding, which the
+    /// pre-schedule could inflate while the card sat idle; this cannot lie
+    /// that way).
+    pub fn fired(&self) -> bool {
+        let (mtx, _cv) = &*self.0;
+        *mtx.lock().unwrap()
+    }
+}
+
+/// The timeout tick — the error-escape cadence. An order past a decode step
+/// (~24 ms measured, ~48 ms at depth 2), so it never fires on a healthy wait;
+/// it exists only to notice a dead stream (≤ this much latency on a path that
+/// is already a hard failure).
+const READ_SIGNAL_DEAD_TICK: std::time::Duration = std::time::Duration::from_millis(250);
+
+impl ReadSignal {
+    pub fn new() -> Self {
+        Self {
+            done: std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+        }
+    }
+
+    /// The closure handed to `launch_d2h` as the op's user callback: set the
+    /// flag and wake the parker. Runs on the scheduler's completion thread,
+    /// touches nothing but this latch, and cannot borrow the transfer's host
+    /// buffer — the buffer outlives the call site by the caller's own laws
+    /// (the ring slot's index, the shadow's seat ownership).
+    fn arm(&self) -> Box<dyn FnOnce() + Send> {
+        let done = self.done.clone();
+        Box::new(move || {
+            let (mtx, cv) = &*done;
+            *mtx.lock().unwrap() = true;
+            cv.notify_all();
+        })
+    }
+
+    /// ⭐ #32 (E) — MINT THE PEEK HANDLE: the overlap probe's non-blocking
+    /// view of this transfer's completion. [`ReadPeek::fired`] is the whole
+    /// of what the holder can do — by type, not by comment, the handle
+    /// cannot wait, so the drain's park on this signal stays its one waiter
+    /// no matter who holds a peek.
+    pub fn peek_handle(&self) -> ReadPeek {
+        ReadPeek(self.done.clone())
+    }
+
+    /// Park until the read's own callback fires. `dead` runs ONLY on the
+    /// timeout tick — the error escape above — and answers "can the op this
+    /// wait is for still complete at all". Returns `true` when the transfer
+    /// landed, `false` when the stream died underneath it.
+    pub fn wait_or(&self, dead: impl Fn() -> bool) -> bool {
+        let (mtx, cv) = &*self.done;
+        let mut guard = mtx.lock().unwrap();
+        loop {
+            if *guard {
+                return true;
+            }
+            let (guard_next, _timeout) = cv
+                .wait_timeout(guard, READ_SIGNAL_DEAD_TICK)
+                .unwrap();
+            guard = guard_next;
+            if *guard {
+                return true;
+            }
+            if dead() {
+                return false;
+            }
+        }
+    }
+}
+
+impl Default for ReadSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// One created `flex::RuntimeStream`. Dropping it destroys the stream, which synchronizes it and
 /// erases its scheduler bookkeeping (per-stream fence deques included — though a resolved fence
 /// now leaves its deque at completion, `SchedulerState::retire_fence`, so those hold only
@@ -501,7 +614,7 @@ impl Stream {
     /// is [`HwError::OverrunsRegion`] — a distinct variant, so a caller rendering the error cannot
     /// confuse "we refused" with "the card refused".
     pub fn h2d(&self, bytes: &[u8], addr: &DevAddr) -> Result<(), HwError> {
-        self.h2d_shaped(bytes, addr, DmaShaping::default())
+        self.h2d_shaped(bytes, addr, DmaShaping::default(), None)
     }
 
     /// ⭐ H2D ON THE COMPUTE PIPELINE — same transfer, same slice-length law, different hardware
@@ -527,12 +640,73 @@ impl Stream {
                 pipeline_shape: DmaPipelineShape::ComputePipeline,
                 ..Default::default()
             },
+            None,
         )
     }
 
-    /// The one body behind [`Self::h2d`] and [`Self::h2d_on_compute`]: the slice-length law and
-    /// the `DmaParams` construction, parameterized only by the shaping the door names.
-    fn h2d_shaped(&self, bytes: &[u8], addr: &DevAddr, shaping: DmaShaping) -> Result<(), HwError> {
+    /// ⭐ #32 — THE H2D TWIN of [`Self::d2h_on_compute_signaled`]: the same
+    /// compute-pipeline transfer with the op's completion callback armed. The
+    /// caller this exists for is the seat's own refill flush: an H2D reads the
+    /// HOST SHADOW at device-execution time (the shadow-write law), so a host
+    /// thread that overwrites the shadow must first know every in-flight H2D
+    /// has executed. The LAST H2D a submit enqueues is the one the drain waits
+    /// — FIFO retires the whole prefix behind it — which is what lets the
+    /// read-scoped drain (no whole-stream synchronize) keep the shadow-write
+    /// law intact: the drain returns when the read landed AND the shadow is
+    /// quiet, and the steps' compute behind those DMAs keeps executing.
+    pub fn h2d_on_compute_signaled(
+        &self,
+        bytes: &[u8],
+        addr: &DevAddr,
+    ) -> Result<ReadSignal, HwError> {
+        let signal = ReadSignal::new();
+        self.h2d_shaped(
+            bytes,
+            addr,
+            DmaShaping {
+                pipeline_shape: DmaPipelineShape::ComputePipeline,
+                // ⭐ #32 (E) — THE CB BARRIER BIT, SET. ⛔ CARD-OBSERVED
+                // HARDWARE FACT (the v4/E1/E2 isolation triple, 2026-10-26,
+                // golden-pinned ×2 per arm, back-to-back on one card): a
+                // compute-pipeline H2D CB does NOT wait for the preceding
+                // compute CB to finish reading its operands — the pipelined
+                // loop queues step j+2's preamble H2D behind step j+1's
+                // RUNNING compute, and with this bit clear the H2D overwrote
+                // the fixed-placement per-step activations (rope cos/sin,
+                // masks, KV index) mid-read: byte-wrong picks, fluent
+                // garbage, deterministic within a session. The WAR edge
+                // (compute READ → H2D WRITE) needs CB bit 32 — the vendor's
+                // own SetBarrier site on CreateComputeDataTransfer
+                // (control_block_wire.rs:1113-1119). The RAW edge (compute
+                // WRITE → D2H read) held WITHOUT the bit — CARD-OBSERVED,
+                // not vendor-stated: v3's per-step D2H read fresh sticks
+                // behind running compute with the bit clear, and E2 (no
+                // overlap) pinned clean with the bit clear too. They are
+                // opposite edges; only the WAR one orders for free.
+                // Host side the bit costs nothing: the barrier drains only
+                // the DMAI/DMAO deques, which are empty once every DMA
+                // rides COMPUTE.
+                pipeline_barrier: true,
+                ..Default::default()
+            },
+            Some(&signal),
+        )?;
+        Ok(signal)
+    }
+
+    /// The one body behind [`Self::h2d`], [`Self::h2d_on_compute`], and
+    /// [`Self::h2d_on_compute_signaled`]: the slice-length law and the
+    /// `DmaParams` construction, parameterized by the shaping the door names
+    /// and the per-op completion hook (`None` leaves the op silent, the doors'
+    /// behavior before #32). One body, so a new guard cannot land on one
+    /// door's shape and skip the others.
+    fn h2d_shaped(
+        &self,
+        bytes: &[u8],
+        addr: &DevAddr,
+        shaping: DmaShaping,
+        signal: Option<&ReadSignal>,
+    ) -> Result<(), HwError> {
         let region = addr.total_size();
         if ByteSize(bytes.len() as u64) > region {
             return Err(HwError::OverrunsRegion {
@@ -556,12 +730,14 @@ impl Stream {
             shaping,
         )
         .expect("device_address is Some, constructed from an owned DevAddr");
-        stream.launch_h2d(params, None).map_err(HwError::Stream)
+        stream
+            .launch_h2d(params, signal.map(ReadSignal::arm))
+            .map_err(HwError::Stream)
     }
 
     /// Async D2H into `bytes` from the device window `addr`.
     pub fn d2h(&self, bytes: &mut [u8], addr: &DevAddr) -> Result<(), HwError> {
-        self.d2h_shaped(bytes, addr, DmaShaping::default())
+        self.d2h_shaped(bytes, addr, DmaShaping::default(), None)
     }
 
     /// ⭐ D2H ON THE COMPUTE PIPELINE — the readback twin of [`Self::h2d_on_compute`]: same
@@ -581,7 +757,51 @@ impl Stream {
                 pipeline_shape: DmaPipelineShape::ComputePipeline,
                 ..Default::default()
             },
+            None,
         )
+    }
+
+    /// ⭐ #32 — THE READ-SCOPED TWIN of [`Self::d2h_on_compute`]: the same
+    /// compute-pipeline transfer (same slice-length law, same FIFO-behind-the-
+    /// step's-compute-CBs ordering), with the op's completion callback ARMED —
+    /// the seat's first user of the hook every `launch_*` has carried and every
+    /// door until now passed `None`. The returned [`ReadSignal`] parks the
+    /// finish half on THIS transfer's own retirement, so a drain waits the one
+    /// read it asked for and not the whole stream — the whole-stream
+    /// synchronize behind it waited out the very step the pipelined loop had
+    /// just submitted for overlap, which is why depth 2 measured as queue
+    /// structure and bought nothing (fence mean = one full step).
+    ///
+    /// ⛔ THE HOST BUFFER OUTLIVES THIS CALL while the DMA is in flight — same
+    /// law the unsignaled door already rides (the caller's ring slot or shadow
+    /// window stays put until the finish half returns it), now with the
+    /// callback as the proof of landing instead of a stream synchronize.
+    pub fn d2h_on_compute_signaled(
+        &self,
+        bytes: &mut [u8],
+        addr: &DevAddr,
+    ) -> Result<ReadSignal, HwError> {
+        let signal = ReadSignal::new();
+        self.d2h_shaped(
+            bytes,
+            addr,
+            DmaShaping {
+                pipeline_shape: DmaPipelineShape::ComputePipeline,
+                ..Default::default()
+            },
+            Some(&signal),
+        )?;
+        Ok(signal)
+    }
+
+    /// The stream's sticky error state (`RuntimeStream::needs_shutdown`) — a
+    /// read-only query for a waiter that must know whether the op it is parked
+    /// on can still complete: a FAILED op never fires its user callback (the
+    /// stream records a deferred error and goes sticky-shutdown instead), so
+    /// [`ReadSignal::wait_or`]'s timeout tick asks this before waiting forever.
+    /// A gone stream is dead by definition.
+    pub fn is_dead(&self) -> bool {
+        self.live().map(|s| s.needs_shutdown()).unwrap_or(true)
     }
 
     /// ⭐ #603 PR3b — a #606-POOLED, pre-mapped copy on the COMPUTE pipeline: the decode
@@ -614,12 +834,18 @@ impl Stream {
             .map_err(HwError::PooledCopy)
     }
 
-    /// The one body behind [`Self::d2h`] and [`Self::d2h_on_compute`].
+    /// The one body behind [`Self::d2h`], [`Self::d2h_on_compute`], and
+    /// [`Self::d2h_on_compute_signaled`] — `signal` is the only difference
+    /// between the doors, and it is the per-op completion hook: `None` leaves
+    /// the op silent (the doors' behavior until #32), `Some` arms the read's
+    /// own landing signal. One body, so a new guard cannot land on one door's
+    /// shape and skip the others.
     fn d2h_shaped(
         &self,
         bytes: &mut [u8],
         addr: &DevAddr,
         shaping: DmaShaping,
+        signal: Option<&ReadSignal>,
     ) -> Result<(), HwError> {
         let stream = self.live()?;
         // See `h2d`: the slice's own length is the explicit transfer size — substituting
@@ -632,7 +858,9 @@ impl Stream {
             shaping,
         )
         .expect("device_address is Some, constructed from an owned DevAddr");
-        stream.launch_d2h(params, None).map_err(HwError::Stream)
+        stream
+            .launch_d2h(params, signal.map(ReadSignal::arm))
+            .map_err(HwError::Stream)
     }
 
     /// One ComputeOnDevice launch (async). `tensor_allocs` is POSITIONAL — entry i backs the
