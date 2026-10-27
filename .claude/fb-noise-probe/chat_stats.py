@@ -27,6 +27,7 @@ import glob
 import json
 import math
 import pathlib
+import re
 import sys
 from collections import Counter
 
@@ -38,6 +39,10 @@ SRVLOG = HERE / "chat-server.log"
 SRVLOG_B = HERE / "chatb-server.log"
 DRAWS = 200
 Z_MAX = 3.0
+# A `.run` file mixes log lines (a leading ISO timestamp) with the reply. The
+# auditor's P4 ruling: compare the REPLY, never the log header — a whole-file
+# compare "diverged" at byte 0 on a timestamp the model never wrote.
+_LOG_LINE = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}")
 
 
 def content(name: str) -> str:
@@ -46,9 +51,23 @@ def content(name: str) -> str:
 
 
 def chat_stdout(name: str) -> str:
-    """`scr chat` prints the bare reply then one newline."""
-    t = (HERE / name).read_text()
-    return t[:-1] if t.endswith("\n") else t
+    """A `.run` file in the probe dir: log lines stripped, the reply kept."""
+    return strip_run(HERE / name)
+
+
+def chat_stdout_at(dir_: pathlib.Path, name: str) -> str:
+    """A `.run` file elsewhere (main's banked reference) — the same strip."""
+    return strip_run(dir_ / name)
+
+
+def strip_run(path: pathlib.Path) -> str:
+    lines = path.read_text().splitlines()
+    keep = [l for l in lines if not _LOG_LINE.match(l)]
+    while keep and not keep[0].strip():
+        keep.pop(0)
+    while keep and not keep[-1].strip():
+        keep.pop()
+    return "\n".join(keep)
 
 
 def softmax(x: np.ndarray) -> np.ndarray:
@@ -105,8 +124,7 @@ def main() -> int:
     ok = ok and p1 and p2 and p3a and p3b
 
     # ── part 4: greedy vs main ──
-    main_text = (REF / "main-greedy.run").read_text()
-    main_text = main_text[:-1] if main_text.endswith("\n") else main_text
+    main_text = chat_stdout_at(REF, "main-greedy.run")
     srv_g = content("chat-p4-greedy.json")
     chat_g = chat_stdout("chat-p4-greedy-chat.run")
     p4_srv = srv_g == main_text
@@ -183,6 +201,7 @@ def main() -> int:
         "decode_batch_lines": sum(1 for l in log.splitlines()
                                   if "decode batch:" in l and "rung" in l),
         "two_row_rung_line": any("2 live on the 2-row rung" in l for l in log.splitlines()),
+        "seat_readback_lines": log.count("SEAT_READBACK"),
         "sample_seat_lines": [l.strip()[:200] for l in seat_lines[:6]],
     }
     report["log_evidence"] = ev

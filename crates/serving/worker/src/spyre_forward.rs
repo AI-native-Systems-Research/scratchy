@@ -640,8 +640,21 @@ pub(crate) fn run_prefill_batch(
                 .ok_or_else(|| werr("decode bundle has no sampler seat".to_string()))?;
             // The rung's own width, not the solo meta's — see the seat-bind site above.
             let mut seat = *seat;
+            // The readback reads the PLACEMENT's own rows (the rung's, which
+            // the logits block and the word tables are reserved at) — the
+            // copy below narrows only the LAUNCH's live width for the binds
+            // and the pick read, and `dev_off_stk`'s group term needs the
+            // true total or every lane past the first stick reads garbage.
+            let rung_seat = seat;
             seat.rows = mq as u32;
             let picked = read_sampled_tokens(pf, &seat, b.result_id as u32, vocab)?;
+            log_seat_readback(
+                pf,
+                &rung_seat,
+                b.wiring.load_consts,
+                &picked,
+                &format!("decode-batch mq={mq} start={start}"),
+            );
             Some(picked)
         }
         LogitsWanted::None => {
@@ -683,7 +696,15 @@ pub(crate) fn run_prefill_batch(
                 .sample_seat
                 .as_ref()
                 .ok_or_else(|| werr("prefill bundle has no sampler seat".to_string()))?;
-            Some(read_sampled_tokens(pf, seat, b.result_id as u32, vocab)?)
+            let picked = read_sampled_tokens(pf, seat, b.result_id as u32, vocab)?;
+            log_seat_readback(
+                pf,
+                seat,
+                b.wiring.load_consts,
+                &picked,
+                &format!("prefill-final mq={mq} start={start}"),
+            );
+            Some(picked)
         }
     };
     // PREFILL-ROW PROBE (SCRATCHY_KV_PROBE): read back the prefill session's EMBED input
@@ -1212,6 +1233,200 @@ fn read_sampled_tokens(
             Ok(t)
         })
         .collect()
+}
+
+/// ⭐ THE SEAT READBACK — the greedy-draw localization (auditor order
+/// 2026-10-27): after a launch that drew, read the seat's OWN staged bytes
+/// back off the card and state them beside the pick, so ONE served run names
+/// the broken stage. Three byte-groups, one debug line per launch:
+///   * THE SEAT — the five seed words and inv_t, each row at its stick head,
+///     through the same scatter law `sample_binds` staged (zeros or a greedy
+///     quintuple on a sampled row ⇒ the seat path: the worker binds greedy
+///     whatever the params);
+///   * THE HASH CHAIN'S UNIFORM TABLES — hc1/hc2/hc3/c256 (`[rows, 1]`,
+///     staged at LOAD) at row 0's and row 1's stick heads, and the lane
+///     table's first words. A noise CONSTANT across lanes is exactly the
+///     greedy signature — a per-lane constant added to every score cannot
+///     move the argmax — and the hash is the only lane-varying term in the
+///     noise (the seeds and the gate enter row-wise by design). Row 1's head
+///     reading 0 where row 0's holds the constant is the DENSE-STAGING
+///     signature: the table was staged `rows` words dense instead of one
+///     word at every row's stick head — the class law the seat's own binds
+///     follow.
+///   * THE PICK — the logits row's own argmax (host, f16, `dev_off_stk`)
+///     beside the card's pick; pick = argmax at temp 1.0 is the failure
+///     itself, and WHICH byte-group broke names the stage.
+/// The card's noise intermediate g is NOT addressable from the wiring (the
+/// draw's internals are lower-layer ktir synthetics, no tids), so the
+/// readback brackets it: the staged inputs on one side, the pick on the
+/// other. A failed read logs its tid and stops the line — the readback never
+/// gates the run.
+#[cfg(feature = "spyre-hw")]
+fn log_seat_readback(
+    session: &mut SuperDscSession,
+    seat: &scratchy_target_spyre::wiring::SampleSeat,
+    consts: &[(u32, scratchy_target_spyre::wiring::LoadConst)],
+    picked: &[u32],
+    ctx: &str,
+) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    // LE words of a placement's first `words` words — the error names the tid.
+    fn le_words(session: &mut SuperDscSession, tid: u32, words: usize) -> Result<Vec<i32>, String> {
+        session
+            .read_tensor_raw(
+                scratchy_target_spyre::bundle_code::PlaceId::Act(tid),
+                words * 4,
+            )
+            .map(|b| {
+                b.chunks_exact(4)
+                    .map(|w| i32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                    .collect()
+            })
+            .map_err(|e| format!("t{tid}: {e}"))
+    }
+    // A staged table's `(tid, rows)` by its kernel operand number (1..=20,
+    // the doc order in `sample_staged_tables`).
+    fn uniform(
+        consts: &[(u32, scratchy_target_spyre::wiring::LoadConst)],
+        operand: u8,
+    ) -> Option<(u32, usize)> {
+        consts.iter().find_map(|&(tid, k)| match k {
+            scratchy_target_spyre::wiring::LoadConst::SampleTable {
+                operand: o, rows, ..
+            } if o == operand => Some((tid, rows as usize)),
+            _ => None,
+        })
+    }
+    let rows = seat.rows as usize;
+    // The five word tables + inv_t — the full reservation, each row's word at
+    // its stick head (`sample_binds`' own law, read back through the same
+    // stride it staged).
+    let mut words: Vec<[i32; 5]> = vec![[0; 5]; rows];
+    for k in 0..5 {
+        match le_words(
+            session,
+            seat.seed_words[k],
+            rows * seat.seed_row_words as usize,
+        ) {
+            Ok(ws) => {
+                for r in 0..rows {
+                    words[r][k] = ws
+                        .get(r * seat.seed_row_words as usize)
+                        .copied()
+                        .unwrap_or(-1);
+                }
+            }
+            Err(e) => {
+                tracing::debug!("SEAT_READBACK {ctx}: seat word table read failed ({e})");
+                return;
+            }
+        }
+    }
+    let invt: Vec<f32> = match le_words(session, seat.invt, rows * 32) {
+        Ok(ws) => (0..rows)
+            .map(|r| ws.get(r * 32).copied().unwrap_or(0))
+            .map(|w| f32::from_bits(w as u32))
+            .collect(),
+        Err(e) => {
+            tracing::debug!("SEAT_READBACK {ctx}: inv_t read failed ({e})");
+            return;
+        }
+    };
+    // The hash chain's uniform tables at row 0's and row 1's stick heads.
+    let mut hash = String::new();
+    for (name, operand) in [("hc1", 10u8), ("hc2", 11), ("hc3", 12), ("c256", 13)] {
+        match uniform(consts, operand) {
+            Some((tid, trows)) => match le_words(session, tid, trows * 32) {
+                Ok(ws) => {
+                    let w0 = ws.first().copied().unwrap_or(-1);
+                    let r1 = if trows > 1 {
+                        format!("/r1=0x{:08X}", ws.get(32).copied().unwrap_or(-1))
+                    } else {
+                        String::new()
+                    };
+                    hash.push_str(&format!("{name}(t{tid})=0x{w0:08X}{r1} "));
+                }
+                Err(e) => hash.push_str(&format!("{name}: READ-FAIL({e}) ")),
+            },
+            None => hash.push_str(&format!("{name}: NOT-IN-CONSTS ")),
+        }
+    }
+    // The lane table's first words — DISTINCT values prove the hash's one
+    // per-lane input lives; a zero or constant table flattens the noise.
+    let lane = match uniform(consts, 14) {
+        Some((tid, _)) => match le_words(session, tid, 4) {
+            Ok(ws) => format!("lane(t{tid})={ws:?}"),
+            Err(e) => format!("lane: READ-FAIL({e})"),
+        },
+        None => "lane: NOT-IN-CONSTS".to_string(),
+    };
+    // The logits row's own argmax, host-side, f16 through the same stick law
+    // the idx readback uses — the REPORT rows only (every row of a wide
+    // prefill rung would be minutes of nothing).
+    let report: Vec<usize> = if rows > 5 {
+        (0..4).chain([rows - 1]).collect()
+    } else {
+        (0..rows).collect()
+    };
+    let pad_v = seat.pad_vocab as usize;
+    let vocab = seat.vocab as usize;
+    let stk = <scratchy_subtile::superdsc_opspec::Fp16 as scratchy_subtile::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+        as usize;
+    let mut argmax: Vec<(usize, u32)> = Vec::with_capacity(report.len());
+    match session.read_tensor_raw(
+        scratchy_target_spyre::bundle_code::PlaceId::Act(seat.row),
+        rows * pad_v * 2,
+    ) {
+        Ok(b) => {
+            for &r in &report {
+                let mut best = (0usize, f32::NEG_INFINITY);
+                for j in 0..vocab {
+                    let e = scratchy_subtile::sdsc_abstract::dev_off_stk(
+                        &[rows, pad_v], 1, &[r, j], stk,
+                    );
+                    let o = e * 2;
+                    if let Some(v) = b.get(o..o + 2) {
+                        let x = half::f16::from_le_bytes([v[0], v[1]]).to_f32();
+                        if x > best.1 {
+                            best = (j, x);
+                        }
+                    }
+                }
+                argmax.push((r, best.0 as u32));
+            }
+        }
+        Err(e) => {
+            tracing::debug!("SEAT_READBACK {ctx}: logits row t{} read failed: {e}", seat.row);
+        }
+    }
+    let per_row: Vec<String> = report
+        .iter()
+        .map(|&r| {
+            let pick = picked.get(r).copied();
+            let am = argmax
+                .iter()
+                .copied()
+                .find(|(ar, _)| *ar == r)
+                .map(|(_, a)| a);
+            format!(
+                "r{r}:words={:?}:invt={}:pick={:?}:argmax={:?}:eq={}",
+                words[r],
+                invt[r],
+                pick,
+                am,
+                pick == am
+            )
+        })
+        .collect();
+    tracing::debug!(
+        "SEAT_READBACK {ctx} rows={} {} {} {}",
+        rows,
+        hash,
+        lane,
+        per_row.join(" ")
+    );
 }
 
 #[cfg(feature = "spyre-hw")]
@@ -1970,6 +2185,13 @@ pub(crate) fn superdsc_forward_chunk(
             // This launch's row is 0 (one request, its own session), so its token
             // is the idx stick's first row's lane 0.
             let toks = read_sampled_tokens(session, seat, b.result_id as u32, vocab)?;
+            log_seat_readback(
+                session,
+                seat,
+                b.wiring.load_consts,
+                &toks,
+                &format!("solo pos={p}"),
+            );
             picked.push(
                 *toks
                     .first()
