@@ -147,6 +147,18 @@ impl Session {
     pub fn observable_tids(&self, idx: usize) -> Vec<u64> {
         self.exec.observable_tids(idx)
     }
+
+    /// The LX residency high-water mark over everything this session has run
+    /// (see [`crate::resident::ResidentExecutor::lx_peak_used`]).
+    pub fn lx_peak_used(&self) -> i64 {
+        self.exec.lx_peak_used()
+    }
+
+    /// The per-core LX capacity (see
+    /// [`crate::resident::ResidentExecutor::lx_capacity`]).
+    pub fn lx_capacity(&self) -> i64 {
+        self.exec.lx_capacity()
+    }
 }
 
 #[cfg(test)]

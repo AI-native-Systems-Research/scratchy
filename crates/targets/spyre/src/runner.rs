@@ -118,6 +118,18 @@ fn weight_arg(data: Vec<u8>, dt: SDType, shape: Vec<usize>) -> Arg {
             shape,
             dtype: DType::Fp8E4m3,
         },
+        // ⭐ i32 RIDES THE VERBATIM BYTE PATH TOO — the sampler's seed table
+        // is a `memref<si32>` view, so `set_source_bytes` sees `dtype ==
+        // view_dt` and `write_bytes`-copies the LE words straight into HBM
+        // (SenUint32 shares IEEE_FP32's 4-byte/32-stick geometry). Routing it
+        // through the `other` arm's F32 would label the words f32: 4× the
+        // elements, the wrong decode on any crossing path — the same
+        // mislabeling class the fp8 comment above records.
+        SDType::I32 => Arg::TensorBytes {
+            data,
+            shape,
+            dtype: DType::I32,
+        },
         _ => Arg::TensorBytes {
             data,
             shape,
@@ -297,6 +309,20 @@ impl SpyreSession {
     /// [`ktir_emulator::program::Session::observable_tids`]).
     pub fn observable_tids(&self, prog: usize) -> Vec<u64> {
         self.session.observable_tids(prog)
+    }
+
+    /// The LX residency high-water mark over everything this session has run
+    /// (see [`ktir_emulator::program::Session::lx_peak_used`]). The numeric
+    /// gate logs it so a bundle that fits states its headroom, not just its
+    /// pass.
+    pub fn lx_peak_used(&self) -> i64 {
+        self.session.lx_peak_used()
+    }
+
+    /// The per-core LX capacity (see
+    /// [`ktir_emulator::program::Session::lx_capacity`]).
+    pub fn lx_capacity(&self) -> i64 {
+        self.session.lx_capacity()
     }
 }
 

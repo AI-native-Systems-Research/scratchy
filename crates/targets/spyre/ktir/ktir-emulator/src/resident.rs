@@ -1266,6 +1266,33 @@ impl ResidentExecutor {
         v
     }
 
+    /// The maximum `lx.used` any core's LX reached since this executor was
+    /// built — the RESIDENCY HIGH-WATER MARK over every program run against
+    /// its scratchpads (see [`LXScratchpad::peak_used`]). The per-segment
+    /// clear resets `used`; the peak survives it, so this is the executor's
+    /// own headroom statement, and the bake-time numeric gate logs it: a
+    /// bundle that fits must leave headroom, not fit by zero.
+    pub fn lx_peak_used(&self) -> i64 {
+        self.mem
+            .lx_scratchpads
+            .iter()
+            .map(|p| p.borrow().peak_used)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The scratchpads' per-core capacity (every core is built the same size;
+    /// the max is stated so a heterogeneous build could never silently
+    /// overreport headroom).
+    pub fn lx_capacity(&self) -> i64 {
+        self.mem
+            .lx_scratchpads
+            .iter()
+            .map(|p| p.borrow().capacity)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// COMPUTE-TILE DATAFLOW — the general grid-parallel executor. The raw nodes
     /// are grid=[H,1]: H independent compute-tiles. Run them TILE-major instead of
     /// node-major — each tile streams through its whole per-row chain with NO

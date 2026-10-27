@@ -754,6 +754,74 @@ module {
         );
     }
 
+    /// The MOVES-DATA row exempts the BROADCAST, never its consumer: a broadcast
+    /// whose f32 result feeds an fp32-UNBOUND op is refused AT that op — the gate
+    /// stays fail-closed one hop past the exempted shape plumbing (the wall-7
+    /// form: the fold's [1,1] constants broadcast into bound mulf/subf/addf/
+    /// maxnumf; this is the negative image, the same broadcast into math.log).
+    #[test]
+    fn a_tt_broadcast_into_an_unbound_op_still_red_stops_naming_the_consumer() {
+        let src = "\
+module {
+  tt.func public @k(%q: tensor<1x1xf32>) attributes {noinline = false} {
+    %b = tt.broadcast %q : tensor<1x1xf32> -> tensor<1x64xf32>
+    %l = math.log %b : tensor<1x64xf32>
+    tt.return
+  }
+}
+";
+        let mut m = parse::parse(src).unwrap();
+        let err = run(&mut m).expect_err("math.log is fp16-only; the broadcast may not launder it");
+        assert!(
+            format!("{err}").contains("The op is 'math.log'."),
+            "the refusal names the consumer, not the broadcast: {err}"
+        );
+    }
+
+    /// The triple key's negative pin: `int32tofp32`'s bind names an i32 OPERAND
+    /// domain, so a `sitofp` off an i1 finds no row and RED-stops — keying on
+    /// the spelling alone would silently excuse it. The module states the ONLY
+    /// shape that reaches the question: the sitofp's f32 result is LOAD-BEARING
+    /// (it feeds an fp32-BOUND multiply, which cannot narrow, so the convert
+    /// cannot collapse away), and no comparison precedes it (an equal-mask
+    /// chain absorbs its retype into the Equal lowering, and a dead-end convert
+    /// is churn the collapse owns — both legal, neither this pin's subject).
+    #[test]
+    fn a_sitofp_off_an_i1_is_not_int32tofp32_and_red_stops() {
+        let src = "\
+module {
+  tt.func public @k(%b: tensor<1x64xi1>, %s: tensor<1x64xf32>) attributes {noinline = false} {
+    %f = arith.sitofp %b : tensor<1x64xi1> to tensor<1x64xf32>
+    %m = arith.mulf %f, %s : tensor<1x64xf32>
+    tt.return
+  }
+}
+";
+        let mut m = parse::parse(src).unwrap();
+        let err = run(&mut m).expect_err("sitofp off i1 has no int32tofp32 bind");
+        assert!(
+            format!("{err}").contains("The op is 'arith.sitofp'."),
+            "the refusal names the op: {err}"
+        );
+    }
+
+    /// The triple key's positive control: the SAME opcode off an i32 operand IS
+    /// the DDL's int32tofp32 and stays f32.
+    #[test]
+    fn a_sitofp_off_an_i32_is_int32tofp32_and_stays() {
+        let src = "\
+module {
+  tt.func public @k(%q: !tt.ptr<f16>) attributes {noinline = false} {
+    %i = arith.constant dense<5> : tensor<1x64xi32>
+    %f = arith.sitofp %i : tensor<1x64xi32> to tensor<1x64xf32>
+    tt.return
+  }
+}
+";
+        let mut m = parse::parse(src).unwrap();
+        run(&mut m).expect("sitofp off i32 is int32tofp32, the bind's own domain");
+    }
+
     #[test]
     fn a_memref_of_f32_is_never_retyped() {
         // The silent-misnumerics bug the island gate exists to prevent: retyping a

@@ -9306,17 +9306,26 @@ fn emit_superdsc_wiring(
         // ── every caller-filled source is covered by exactly one filler ──
         let cos_ids: std::collections::HashSet<u32> = cos_v.iter().map(|&(i, ..)| i).collect();
         let sin_ids: std::collections::HashSet<u32> = sin_v.iter().map(|&(i, ..)| i).collect();
-        // ⭐ THE SAMPLER'S PER-STEP SEAT — ITS OWN CLASS AT THIS GATE. The seat's two
-        // tids are minted below the `LoweredDecode` binding layer (the mint's own law),
-        // so they carry no `SourceBinding`, and the CLASS declares their filler: the
-        // worker binds both FRESH EVERY DECODE STEP, and the runtime launch gate refuses
-        // a decode without a fresh bind of both — the PrefixMask precedent, never a held
-        // default, because a held noise row is a held TOKEN. This block is the class's
-        // declaration at the expansion gate (the loop below counts the seat's tids as
-        // covered BY CLASS); the per-step enforcement is the runtime gate's own arm.
-        // Everything else about the seat is typed here, where the wiring is in hand:
+        // ⭐ THE SAMPLER'S PER-STEP SEAT — ITS OWN CLASS AT THIS GATE. The seat's
+        // six tids (the seed quintuple's five word tables and inv_t) are minted
+        // below the `LoweredDecode` binding layer (the mint's own law), so they
+        // carry no `SourceBinding`, and the CLASS declares their filler: the
+        // worker binds every one FRESH EVERY DECODE STEP, and the runtime launch
+        // gate refuses a decode without a fresh bind of all of them — the
+        // PrefixMask precedent, never a held default, because a held seed row is
+        // a held TOKEN. This block is the class's declaration at the expansion
+        // gate (the loop below counts the seat's tids as covered BY CLASS); the
+        // per-step enforcement is the runtime gate's own arm. Everything else
+        // about the seat is typed here, where the wiring is in hand:
         if let Some(seat) = &gk.sample_seat {
-            for (name, tid) in [("noise", seat.noise), ("invt", seat.invt)] {
+            let mut seat_tids: Vec<(String, u32)> = seat
+                .seed_words
+                .iter()
+                .enumerate()
+                .map(|(k, &tid)| (format!("seed word {k}"), tid))
+                .collect();
+            seat_tids.push(("invt".to_string(), seat.invt));
+            for (name, tid) in seat_tids {
                 if tid >= gk.num_sources {
                     fail.push(format!(
                         "the sample seat's {name} source t{tid} is not inside `num_sources` \
@@ -9327,14 +9336,20 @@ fn emit_superdsc_wiring(
                 if gk.load_consts.iter().any(|&(ltid, _)| ltid == tid) {
                     fail.push(format!(
                         "the sample seat's {name} source t{tid} is ALSO a load-time const — a \
-                         tensor cannot both stage once at load and be the step's own randomness"
+                         tensor cannot both stage once at load and be the step's own freshness"
                     ));
                 }
             }
-            if seat.noise == seat.invt {
+            let seat_all: std::collections::HashSet<u32> = seat
+                .seed_words
+                .iter()
+                .copied()
+                .chain([seat.invt])
+                .collect();
+            if seat_all.len() != 1 + seat.seed_words.len() {
                 fail.push(
-                    "the sample seat names one tid as both the noise and the inv_t — the mint \
-                     mints two sources, so a shared tid means two mints disagree"
+                    "the sample seat names one tid twice — the mint mints one source per seat \
+                     operand, so a shared tid means two mints disagree"
                         .to_string(),
                 );
             }
@@ -9406,7 +9421,7 @@ fn emit_superdsc_wiring(
                 // RUNTIME gate, per launch, where "this step" is a fact — an expansion
                 // cannot know it.
                 if let Some(seat) = &gk.sample_seat {
-                    if seat.noise == id || seat.invt == id {
+                    if seat.seed_words.contains(&(id as u32)) || seat.invt == id {
                         continue;
                     }
                 }
@@ -9731,11 +9746,12 @@ fn emit_superdsc_wiring(
     // (`load_consts_of_ir`, the same list the numeric gate stages), never
     // recomputed here: each entry is `(tid, kind)` and the KIND names the
     // shared builder that makes the bytes, so the worker and the gate stage
-    // identical bytes by construction. The sampler's NINE staged tables ride
-    // this list (all f32, the selection's own dtype); its noise and inv_t do
-    // NOT — they are per-step seats the worker binds fresh every decode, and a
-    // load-time constant staged over them would freeze one noise row into
-    // every draw.
+    // identical bytes by construction. The sampler's TWENTY staged tables
+    // ride this list (the selection's f32, the noise section's i32/f32/fp16
+    // — each entry's own dtype); its five seed word tables and inv_t do NOT —
+    // they are per-step seats the worker binds fresh every decode, and a
+    // load-time constant staged over them would freeze one draw's seed into
+    // every step.
     let load_const_toks = gk
         .load_consts
         .iter()
@@ -9786,45 +9802,35 @@ fn emit_superdsc_wiring(
             quote! { (#tid, #kind) }
         })
         .collect::<Vec<_>>();
-    // ⭐ THE SAMPLER'S PER-STEP SEAT — the named class of the two sources the
-    // token draw binds FRESH EVERY DECODE STEP, straight off the bake's one
+    // ⭐ THE SAMPLER'S PER-STEP SEAT — the named class of the six sources the
+    // token draw binds FRESH EVERY DECODE STEP (the seed quintuple's five
+    // `[rows, 1]` word tables and inv_t), straight off the bake's one
     // derivation (`sample_seat_of_ir`, the mint's own facts), never
     // recomputed here. `None` on every rung that mints no draw; `Some` names
-    // the noise/inv_t tids the worker must bind before EVERY decode launch —
-    // the class the source gate counts as filled only when bound THIS step.
+    // the seed word and inv_t tids the worker must bind before EVERY decode
+    // launch — the class the source gate counts as filled only when bound
+    // THIS step.
     let sample_seat_tok = match &gk.sample_seat {
         Some(seat) => {
-            let row = u32l(seat.row);
-            let noise = u32l(seat.noise);
+            let seed_words = seat
+                .seed_words
+                .iter()
+                .map(|&t| u32l(t))
+                .collect::<Vec<_>>();
             let invt = u32l(seat.invt);
             let rows = u32l(seat.rows);
             let vocab = u32l(seat.vocab);
             let pad_vocab = u32l(seat.pad_vocab);
-            // The noise row's arrangement — a baked CONST the worker indexes (it writes lane i
-            // at the baked permutation's index and never derives), straight off the bake's one
-            // propagation, never recomputed here.
-            let noise_arrangement = match seat.noise_arrangement {
-                scratchy_target_spyre::wiring::ElementArrangement::Standard => {
-                    quote! {
-                        ::scratchy_target_spyre::wiring::ElementArrangement::Standard
-                    }
-                }
-                scratchy_target_spyre::wiring::ElementArrangement::Dl16ToFp32 => {
-                    quote! {
-                        ::scratchy_target_spyre::wiring::ElementArrangement::Dl16ToFp32
-                    }
-                }
-            };
+            let seed_row_words = u32l(seat.seed_row_words);
             quote! {
                 ::core::option::Option::Some(
                     ::scratchy_target_spyre::wiring::SampleSeat {
-                        row: #row,
-                        noise: #noise,
+                        seed_words: [#(#seed_words),*],
                         invt: #invt,
                         rows: #rows,
                         vocab: #vocab,
                         pad_vocab: #pad_vocab,
-                        noise_arrangement: #noise_arrangement,
+                        seed_row_words: #seed_row_words,
                     }
                 )
             }
@@ -11309,7 +11315,8 @@ fn dump_wavefront_mega(
                 // draw is a rung whose answer must still come back as logits for a
                 // host argmax, which is exactly the readback this front deletes).
                 // The splice is the kernel's ONLY entry — the mint appends the node,
-                // its per-row per-step pair (noise, inv_t) and its nine staged-table
+                // its per-row per-step seat (the seed quintuple's five word tables,
+                // inv_t) and its twenty staged-table
                 // sources to the graph, and everything downstream (the splice's row,
                 // the door's whole-function walk, the placement pass, the wiring's
                 // sampler facts) is the same machinery every other Triton kernel
@@ -11331,13 +11338,14 @@ fn dump_wavefront_mega(
                     );
                     eprintln!(
                         "[spyre-superdsc] {base}: the token draw minted — vocab {} (padded row \
-                         {}), rows {}, the per-row pair (noise t{}, inv_t t{}) + nine staged \
-                         tables appended, and the rung's RESULT re-pointed to the idx stick (the \
-                         row stays placed and readable by tid){}",
+                         {}), rows {}, the per-row seat (seed words t{}..t{}, inv_t t{}) + \
+                         twenty staged tables appended, and the rung's RESULT re-pointed to the \
+                         idx stick (the row stays placed and readable by tid){}",
                         mint.vocab,
                         mint.pad_vocab,
                         mint.rows,
-                        mint.noise.index(),
+                        mint.seed_words[0].index(),
+                        mint.seed_words[4].index(),
                         mint.invt.index(),
                         if is_prefill { " (prefill rung)" } else { "" },
                     );

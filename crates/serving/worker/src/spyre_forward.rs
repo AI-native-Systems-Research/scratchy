@@ -942,64 +942,57 @@ pub(crate) enum ChunkOut {
     Tokens(Vec<u32>),
 }
 
-/// The greedy law every decode launch binds until the on-card noise kernel fills
-/// this buffer: inv_t = 1.0 (row r's value at `[r·32]` of its 128-B fp32 stick,
-/// the rest 0) and noise = 0.0 on the WHOLE padded row (the pads are ruled by
-/// the staged `padoff` table alone — f32::MIN there, never IEEE −inf) —
-/// sample_fwd.py's own law, so score = the raw logits exactly and the
-/// draw is their first max. Emitted as LE f32 bytes for the raw (`acts_i32`)
-/// channel, which binds verbatim IEEE f32 — the f32 `Bind` channel converts to
-/// SEN169 and is NOT verbatim.
-///
-/// ⭐ THE NOISE ROW IS STAGED IN ITS BAKED ARRANGEMENT — the seat's own const
-/// (`noise_arrangement`, the bake's propagation fact): the sampler's staggered
-/// pointwise island reads the noise lane-for-lane, so the stager writes lane
-/// `i` at the 64-entry const table's baked index
-/// (`scratchy_target_spyre::wiring::DL16TOFP32_PERMUTATION`, through the one
-/// staging derivation `dl16tofp32_stagger`). The stager INDEXES the baked
-/// facts; it never derives, and it decides nothing. The inv_t is a `[rows, 1]`
-/// column broadcast — one scalar per row, order-free — so it carries no
-/// arrangement and stays standard.
+/// ⭐ THE GREEDY LAW every decode launch binds — the seat's per-step
+/// operands at their baked offsets, spelled so the draw is the plain
+/// first-max: the seed quintuple `(0, 0, 0, 0, r)` — the GATE table's 0 IS
+/// the greedy law, `score = xm·inv_t + g·0 = xm·inv_t` exactly (the fold's
+/// clamps keep g FINITE for any seed bytes, so `g·0` is +0, never NaN) —
+/// and inv_t = 1.0. FIVE `[rows, 1]` i32 word tables, one per member of
+/// the quintuple (the auditor's wall-4 ruling (a)): each is `invt`'s own
+/// class — one 128-B stick per row, the word at the STICK HEAD
+/// (`r · seed_row_words`, the seat's baked stride — the Col operand mode
+/// reads the head alone, the int-bcast leg's measured law) — and the
+/// worker writes the five words of row r at the five tables' stick heads
+/// and nothing else (the sticks' zero padding is the reservation's own,
+/// exactly inv_t's bind). Emitted as LE words for the raw (`acts_i32`)
+/// channel, which binds verbatim — i32 words for the seed tables, IEEE f32
+/// for inv_t; the f32 `Bind` channel converts to SEN169 and is NOT
+/// verbatim.
 #[cfg(feature = "spyre-hw")]
 fn greedy_sample_binds(
     seat: &scratchy_target_spyre::wiring::SampleSeat,
 ) -> Vec<(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)> {
     let rows = seat.rows as usize;
-    let vocab = seat.vocab as usize;
-    let pad = seat.pad_vocab as usize;
-    let mut noise = vec![0.0f32; rows * pad];
-    // Pads are 0.0, NEVER IEEE −inf: the pads are ruled by the staged `padoff`
-    // table alone (f32::MIN there), and no IEEE inf may reach the card from
-    // any staged buffer — an exponent-all-ones lane reads as NaN on the card
-    // and poisons the max. So this loop is now a NO-OP by law, kept as the
-    // statement that the whole noise row is zeros.
-    for r in 0..rows {
-        noise[r * pad + vocab..(r + 1) * pad].fill(0.0);
-    }
-    // The baked arrangement, applied through the one staging derivation.
-    let noise = match seat.noise_arrangement {
-        scratchy_target_spyre::wiring::ElementArrangement::Standard => noise,
-        scratchy_target_spyre::wiring::ElementArrangement::Dl16ToFp32 => {
-            scratchy_target_spyre::wiring::dl16tofp32_stagger(&noise)
+    let stride = seat.seed_row_words as usize;
+    // (seed_lo, seed_hi, step, greedy_gate, row) — zeros and the row's own
+    // index; the gate word's 0 is what makes the draw greedy. One word per
+    // table, at each row's stick head.
+    let word_of = |k: usize, r: usize| -> i32 {
+        if k == 4 {
+            r as i32
+        } else {
+            0
         }
     };
-    let mut invt = vec![0.0f32; rows * 32];
-    for (i, v) in invt.iter_mut().enumerate() {
-        if i % 32 == 0 {
-            *v = 1.0;
+    let mut binds = Vec::with_capacity(1 + seat.seed_words.len());
+    for (k, &tid) in seat.seed_words.iter().enumerate() {
+        let mut table = vec![0i32; rows * stride];
+        for r in 0..rows {
+            table[r * stride] = word_of(k, r);
         }
+        let le: Vec<u8> = table.iter().flat_map(|w| w.to_le_bytes()).collect();
+        binds.push((scratchy_target_spyre::bundle_code::PlaceId::Act(tid), le));
     }
-    let le = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
-    vec![
-        (
-            scratchy_target_spyre::bundle_code::PlaceId::Act(seat.noise),
-            le(&noise),
-        ),
-        (
-            scratchy_target_spyre::bundle_code::PlaceId::Act(seat.invt),
-            le(&invt),
-        ),
-    ]
+    let mut invt = vec![0.0f32; rows * 32];
+    for v in invt.iter_mut().step_by(32) {
+        *v = 1.0;
+    }
+    let invt_le: Vec<u8> = invt.iter().flat_map(|f| f.to_le_bytes()).collect();
+    binds.push((
+        scratchy_target_spyre::bundle_code::PlaceId::Act(seat.invt),
+        invt_le,
+    ));
+    binds
 }
 
 /// Read the minted sampler's idx stick back and decode it: one i32 per row at

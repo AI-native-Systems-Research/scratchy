@@ -1999,8 +1999,8 @@ pub fn compute_bundle_layout<F: RopeForm>(
         attn_class_hds,
         // ⭐ THE GRAPH'S OWN WIRING FACTS, STAMPED WHERE THE MINT'S RENUMBERING CANNOT REACH THEM
         // (#813 review). `num_sources` and the resident source ids are GRAPH-LOCAL: the sample
-        // mint's eleven seats (the per-row noise and temperature plus the nine tables) sit at
-        // `[num_sources, num_sources+11)` of the MINTED graph, so the minted wiring's numbers
+        // mint's twenty-two seats (the per-row seed and temperature plus the twenty tables) sit
+        // at `[num_sources, num_sources+22)` of the MINTED graph, so the minted wiring's numbers
         // name different tensors — or none — in an unminted rung, and a rung handed them walks
         // ids past its own graph that its resident list happens to excuse. Each bundle states
         // its own, the `SegRole::Logits` law: the runtime reads the facts off the bundle it
@@ -2896,6 +2896,18 @@ impl StagedWeightView<'_> {
                     .iter()
                     .map(|p| f32::from_le_bytes(*p))
                     .collect(),
+                // The i32 hash/fold constants, as value images. INEXACT past
+                // 2^24 by construction (f32 cannot hold the spellings) and
+                // INERT: the host reference's Sample arm states its own
+                // constants and reads only the row, the seed and the inv_t,
+                // so nothing on a host leg consumes these images — the card
+                // leg reads the verbatim LE words through `emu_weights`.
+                scratchy_tensors::DType::I32 => bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|p| i32::from_le_bytes(*p) as f32)
+                    .collect(),
                 other => panic!(
                     "the reference legs have no f32 image for the load-const at t{tid} \
                      staged as {other:?} — extend `stage_load_consts` with that dtype's decode"
@@ -3175,11 +3187,43 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
     let staged_weight = |id: usize| {
         weights.scale_rows.contains(&(id as u32)) || weights.bytes.iter().any(|(t, ..)| *t == id)
     };
+    // ⭐ THE SEAT'S OWN STAGING — THE GREEDY LAW, stated for the golden the
+    // way `staged_rope` states the rope rows: the seed quintuple
+    // `(0, 0, step, 0, row)` — one word per `[rows, 1]` table, the GATE lane
+    // 0 and inv_t 1.0, so the reference's draw is the plain first-max
+    // (`g·0 = 0` exact) — the gate's own coverage decision, stated here
+    // where it lives: the emulator's f32 tiles cannot hold the bit-exact
+    // i32 hash (products past 2^24 lose bits), so a noise-decided draw is
+    // NOT this gate's to check — that fidelity is the card probe's verdict
+    // (FB-NOISE-DONE). The step word is a small constant (7, f16-exact), so
+    // the f16-stick rounding hop below leaves every seat image exact; the
+    // row word is the row's own index.
+    let sample_seat = crate::lower_subtile_tape_to_ktir::sample_seat_of_ir(ir)
+        .expect("the golden's seat derivation — the graph is validated, one mint at most");
+    let staged_seat: std::collections::HashMap<u32, Vec<f32>> = match &sample_seat {
+        None => Default::default(),
+        Some(seat) => {
+            let mut seat_vals = std::collections::HashMap::new();
+            // The greedy quintuple, one word per table in the quintuple's
+            // own order — the row word is the row's own index.
+            const GREEDY_QUINT: [f32; 5] = [0.0, 0.0, 7.0, 0.0, 0.0];
+            for (k, &tid) in seat.seed_words.iter().enumerate() {
+                let word: Vec<f32> = (0..seat.rows)
+                    .map(|r| if k == 4 { r as f32 } else { GREEDY_QUINT[k] })
+                    .collect();
+                seat_vals.insert(tid, word);
+            }
+            seat_vals.insert(seat.invt, vec![1.0; seat.rows as usize]);
+            seat_vals
+        }
+    };
     let mut src_vals: Vec<Vec<f32>> = (0..nsrc)
         .map(|id| {
             if staged_weight(id) || covering.is_some_and(|c| !c.contains(&(id as u64))) {
                 Vec::new()
             } else if let Some(v) = staged_rope.get(&(id as u32)) {
+                v.clone()
+            } else if let Some(v) = staged_seat.get(&(id as u32)) {
                 v.clone()
             } else {
                 let t = ir.tensors[id];
@@ -4211,6 +4255,43 @@ pub fn numeric_gate<F: RopeForm>(
         let (bytes, dt, shape) = kind.build();
         emu_weights.push((tid as usize, bytes, dt, shape.to_vec()));
     }
+    // ⭐ THE SEAT'S OWN STAGING, TYPED — the same greedy law the golden
+    // states (`eval_golden_buffers`' seat block), staged into the session at
+    // the operands' TRUE dtypes so neither rides `run_step`'s f16-only
+    // source channel: the five seed word tables as i32 LE words (each view
+    // is si32, so `set_source_bytes` lands them verbatim through
+    // `weight_arg`'s I32 arm), the inv_t as f32 bytes at [rows, 1] (verbatim
+    // at its own view — the f16 channel would encode it into half the bytes
+    // its f32 view spans, the load-consts comment's own failure mode, and
+    // the gate would compare a golden against a channel-mangled operand).
+    // The emulator is memref-faithful, so each word table stages PACKED at
+    // [rows, 1] — not at the card seat's reservation stride (the worker's
+    // own law, `seed_row_words`).
+    let sample_seat = crate::lower_subtile_tape_to_ktir::sample_seat_of_ir(ir).map_err(|e| e.0)?;
+    if let Some(seat) = &sample_seat {
+        // The greedy law's quintuple `(0, 0, 7, 0, r)` — one word per table,
+        // in the quintuple's own order (the GATE table's 0 IS the law).
+        const GREEDY_QUINT: [i32; 5] = [0, 0, 7, 0, 0];
+        for (k, &tid) in seat.seed_words.iter().enumerate() {
+            let word_bytes: Vec<u8> = (0..seat.rows)
+                .map(|r| if k == 4 { r as i32 } else { GREEDY_QUINT[k] })
+                .flat_map(i32::to_le_bytes)
+                .collect();
+            emu_weights.push((
+                tid as usize,
+                word_bytes,
+                scratchy_tensors::DType::I32,
+                vec![seat.rows as usize, 1],
+            ));
+        }
+        let invt_bytes: Vec<u8> = (0..seat.rows).flat_map(|_| 1.0f32.to_le_bytes()).collect();
+        emu_weights.push((
+            seat.invt as usize,
+            invt_bytes,
+            scratchy_tensors::DType::F32,
+            vec![seat.rows as usize, 1],
+        ));
+    }
     // ── The probe sources: synth at the IR shape, scales as ones, the mask
     //    keeping the prefix region's rows valid (the reference's own key set) ──
     // The rope cos/sin sources stage at their runtime contract — period-`half`,
@@ -4234,6 +4315,7 @@ pub fn numeric_gate<F: RopeForm>(
         // bind them exactly as the full bundle does.
         if weight_ids.contains(&tid)
             || load_const_tids.contains(&tid)
+            || sample_seat.is_some_and(|s| s.seed_words.contains(&tid) || s.invt == tid)
             || covering.is_some_and(|c| !c.contains(&(tid as u64)))
         {
             continue;
@@ -4755,11 +4837,22 @@ pub fn numeric_gate<F: RopeForm>(
             t.layers.0, t.layers.1
         ));
     }
+    // ⭐ THE RESIDENCY HIGH-WATER MARK, STATED ON EVERY PASS — a bundle that
+    // fits must leave headroom, not fit by zero (the wall-5 law), and the
+    // peak is the number that says so: the maximum live LX charge any core
+    // reached across this gate's runs, over the per-core capacity.
+    let (lx_peak, lx_cap) = (session.lx_peak_used(), session.lx_capacity());
     eprintln!(
         "[spyre-superdsc] NUMERIC GATE PASS {fp}: {} tensors at the floor (worst local \
          clean {worst_local_clean:.4}, worst local fp8-chained {worst_local_fp8:.4}; worst \
-         total clean {worst_clean:.4}, worst total fp8-chained {worst_fp8:.4}){scope}",
-        compare.len()
+         total clean {worst_clean:.4}, worst total fp8-chained {worst_fp8:.4}; LX peak \
+         {lx_peak} of {lx_cap} bytes, {:.1}% of capacity){scope}",
+        compare.len(),
+        if lx_cap > 0 {
+            lx_peak as f64 * 100.0 / lx_cap as f64
+        } else {
+            f64::NAN
+        }
     );
     Ok(())
 }
@@ -8332,6 +8425,98 @@ mod tests {
         }
     }
 
+    /// ⭐ THE BUNDLE STATES ITS OWN WIRING FACTS (#813 review) — `num_sources` and the resident
+    /// source ids are GRAPH-LOCAL, and the mint is the graph that proves it: its twenty-two
+    /// seats (the per-row seed and temperature plus the twenty tables) sit at
+    /// `[num_sources, num_sources+22)` of the ONE-REQUEST graph, so a minted bundle's stamp and
+    /// an unminted bundle's stamp differ by exactly those twenty-two. The worker used to hand
+    /// every rung the minted wiring's numbers — the rung's completeness walk then covered ids
+    /// past its own graph, excused by minted table ids that only cancelled by coincidence.
+    /// Pinned from both sides of the mint, plus the one-derivation law: the stamp's resident
+    /// list IS [`load_consts_of_ir`]'s, the same derivation the wiring's `load_consts` reads,
+    /// so the layout's list and the wiring's cannot disagree.
+    #[test]
+    fn the_bundle_states_its_own_source_facts_across_the_mint() {
+        use scratchy_subtile::lower::{GemmWeight, InputRef, OpDesc};
+        use scratchy_subtile::subtile_ir::{
+            SampleRows, SourceShape, SubOp, lower_region, mint_sample,
+        };
+        // K=1, vocab 5 — the one-request lm-head shape the mint admits, the same fixture
+        // `argmax_mint_lower` pins the splice seat with.
+        let input = scratchy_subtile::lower::LoweringInput {
+            exported: None,
+            sources: vec![
+                SourceShape { rows: 1, cols: 1 },
+                SourceShape { rows: 1, cols: 5 },
+            ],
+            ops: vec![OpDesc {
+                op: SubOp::MatmulTile {
+                    n: 5,
+                    weight: GemmWeight::Dense,
+                },
+                m: 1,
+                inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+            }],
+            result: 0,
+        };
+        let nz = std::num::NonZeroU32::new(64).unwrap();
+        let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
+        let plain = lower_region(&input, nz);
+        let mut minted = lower_region(&input, nz);
+        mint_sample(&mut minted, SampleRows::All);
+        let l_plain =
+            compute_bundle_layout(&plain, &weight_ids, false, false, &[]).expect("plain lays out");
+        let l_minted = compute_bundle_layout(&minted, &weight_ids, false, false, &[])
+            .expect("the minted graph lays out");
+
+        // Each stamp names ITS OWN graph's count — the whole point of the fix.
+        assert_eq!(l_plain.num_sources, plain.num_sources);
+        assert_eq!(l_minted.num_sources, minted.num_sources);
+        assert_eq!(
+            l_minted.num_sources,
+            l_plain.num_sources + 26,
+            "the mint's twenty-six seats (the per-row seed quintuple's five word tables, the \
+             temperature, and the twenty tables) are the whole difference between the two \
+             graphs' source counts — the ids an unminted rung was handed and did not have"
+        );
+        // The unminted graph has no resident source (no prefix-KV, no load-const tables), and
+        // the minted graph's resident list is EXACTLY the twenty tables, at
+        // `[plain's count + 6, minted's count)` — past the seat's per-row word tables and
+        // inv_t, which the worker binds fresh every step and never stages at load.
+        assert!(
+            l_plain.resident_source_tids.is_empty(),
+            "an unminted graph's layout stamps no resident source"
+        );
+        let tables: Vec<u32> = (l_plain.num_sources + 6..l_minted.num_sources).collect();
+        assert_eq!(
+            l_minted.resident_source_tids, tables,
+            "the minted graph's resident stamp is its twenty tables and nothing else"
+        );
+        // ⛔ AND EVERY STAMPED ID IS A SOURCE OF ITS OWN GRAPH — the bake asserts this where it
+        // stamps (an id at or past the count would excuse a REAL source from the runtime's
+        // per-step bind walk); pinned here so the law has a test face too.
+        assert!(
+            l_minted
+                .resident_source_tids
+                .iter()
+                .all(|&t| t < l_minted.num_sources),
+            "a resident id past the source count would excuse a real source"
+        );
+        // ⭐ THE ONE-DERIVATION LAW: the stamp's list is `load_consts_of_ir`'s — the same
+        // derivation `graph_wiring` reads for the wiring's `load_consts` — so a layout that
+        // disagrees with the wiring is a build error here, not a card incident later.
+        let wiring_tids: Vec<u32> =
+            crate::lower_subtile_tape_to_ktir::load_consts_of_ir(&minted, &Default::default())
+                .expect("the minted graph's load-const list derives")
+            .into_iter()
+            .map(|(tid, _)| tid)
+            .collect();
+        assert_eq!(
+            l_minted.resident_source_tids, wiring_tids,
+            "the layout's resident stamp and the wiring's load-const list are one derivation"
+        );
+    }
+
     /// ⭐ THE MINT'S inv_t RESERVES ITS TRUE fp32 STICK BYTES, UNPADDED — the run-7 wall's
     /// test face ("t728 has size 0 in seg3"). inv_t is the mint's second staged source, a
     /// `[rows, 1]` f32 per-row scalar: its width rounds to ONE 32-element fp32 stick, which is
@@ -8373,9 +8558,10 @@ mod tests {
         let layout = compute_bundle_layout(&minted, &weight_ids, false, false, &[])
             .expect("the minted graph lays out");
 
-        // inv_t is the mint's second staged source (noise first, at n_src), so its tid is one
-        // past the PRE-mint source count — `plain`'s, the graph the mint spliced into.
-        let invt = plain.num_sources + 1;
+        // inv_t is the mint's sixth staged source (the seed quintuple's five word
+        // tables first, at n_src), so its tid is five past the PRE-mint source
+        // count — `plain`'s, the graph the mint spliced into.
+        let invt = plain.num_sources + 5;
         let p = layout.placements[&invt];
         assert_eq!(
             p.size,
@@ -8387,6 +8573,25 @@ mod tests {
             128,
             "the reservation IS the descriptor's own row stride (the SampleSeat staging law)"
         );
+        // ⭐ AND EVERY SEED WORD TABLE RESERVES THE SAME — each is a `[rows, 1]`
+        // i32 table, invt's own class, and the stick head the Col operand mode
+        // reads is the word's only address: the auditor's wall-4 ruling (a)
+        // spelled the seed as five such tables, so each must reserve one whole
+        // 32-word u32 stick per row (128 B), the stride the worker writes at.
+        for k in 0..5u32 {
+            let word = layout.placements[&(plain.num_sources + k)];
+            assert_eq!(
+                word.size,
+                4 * 128,
+                "seed word table {k} reserves one 128 B u32 stick per row — invt's own class"
+            );
+            assert_eq!(
+                word.size / 4,
+                128,
+                "the reservation IS the seat's own row stride (`seed_row_words`), never a \
+                 padded recomputation"
+            );
+        }
     }
 
     #[test]

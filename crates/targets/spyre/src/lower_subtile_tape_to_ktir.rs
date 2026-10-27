@@ -1581,7 +1581,7 @@ pub struct BundleWiring {
     pub load_consts: Vec<(u32, crate::wiring::LoadConst)>,
     /// ⭐ THE SAMPLER'S PER-STEP SEAT — `Some` exactly when the graph carries
     /// the minted `Sample` node, derived by [`sample_seat_of_ir`] (the one
-    /// derivation, the mint's own facts). Names the two sources the draw reads
+    /// derivation, the mint's own facts). Names the sources the draw reads
     /// FRESH EVERY DECODE STEP, as a NAMED CLASS — the source gate counts them
     /// as filled only when bound THIS step, never a held default (the class's
     /// own law, on [`crate::wiring::SampleSeat`]).
@@ -1921,28 +1921,28 @@ pub fn graph_wiring<F: RopeForm>(
     // the one derivations, so the wiring's ids, arrangements and the layout's placements cannot
     // disagree (the `weight_copies` one-mint law).
     let load_consts = load_consts_of_ir(ir, &staggered)?;
-    let sample_seat = sample_seat_of_ir(ir, &staggered)?;
+    let sample_seat = sample_seat_of_ir(ir)?;
     // ⭐ THE CHAIN FACT, off the same minted nodes — after `load_consts` so
     // the one-node law's error propagates before the first-wins read.
     let chain = chain_of_ir(ir);
-    // ⛔ EVERY MARKED PARAMETER HAS A STAGER. The arrangement rides exactly two staging
-    // channels — the load-const builders (pure in the arrangement) and the seat's per-step
-    // noise bind — so a propagation mark on any OTHER parameter (a weight, an activation,
-    // another kernel's source) is a staggered buffer nothing can stage: a build error naming
-    // the tid, never a silently standard-staged operand read permuted on the card.
+    // ⛔ EVERY MARKED PARAMETER HAS A STAGER. The arrangement rides exactly one staging
+    // channel here — the load-const builders (pure in the arrangement) — and the seat's
+    // per-step staging (the seed quintuple and the inverse temperature) binds fresh words
+    // with NO arrangement of its own, so a propagation mark on any parameter other than a
+    // load-const table (a weight, an activation, another kernel's source, or one of the
+    // seat's own per-step tids) is a staggered buffer nothing can stage: a build error
+    // naming the tid, never a silently standard-staged operand read permuted on the card.
     {
-        let mut staged: std::collections::BTreeSet<u32> =
+        let staged: std::collections::BTreeSet<u32> =
             load_consts.iter().map(|&(tid, _)| tid).collect();
-        if let Some(seat) = &sample_seat {
-            staged.insert(seat.noise);
-        }
         for (&tid, _) in &staggered {
             if !staged.contains(&tid) {
                 return Err(SuperDscError(format!(
                     "the arrangement propagation marked t{tid} — a parameter outside the \
-                     sampler's own staged set (the load-const tables and the seat's noise). No \
-                     stager carries an arrangement for it, so it would be staged standard and \
-                     read permuted; keep the stagger inside the sampler's pointwise island"
+                     sampler's own staged set (the load-const tables; the seat's per-step \
+                     staging carries no arrangement). No stager carries an arrangement for \
+                     it, so it would be staged standard and read permuted; keep the stagger \
+                     inside the sampler's pointwise island"
                 )));
             }
         }
@@ -2010,15 +2010,15 @@ pub fn load_consts_of_ir<F: RopeForm>(
     ir: &SubtileIR<F>,
     staggered: &std::collections::BTreeMap<u32, ktir_superdsc::element_arrangement::ElementArrangement>,
 ) -> Result<Vec<(u32, crate::wiring::LoadConst)>, SuperDscError> {
-    // ⭐ THE SAMPLER'S MINT — the nine operand tables (functions of the vocab
-    // alone, built by the shared `sample_staged_tables` derivation the kind
-    // names; `padoff` is the pad law's offset row, which the kernel adds to
-    // the logits row before its first max — the row's own pad bytes are never
-    // its contract). The node's FIRST TWO seats after the row — the noise row
-    // and the temperature reciprocal — are PER-STEP operands the runtime
-    // binds every decode step; they are deliberately NOT in this list (a
-    // load-time constant staged over them would freeze one noise row into
-    // every draw).
+    // ⭐ THE SAMPLER'S MINT — the twenty operand tables (functions of the
+    // vocab alone, built by the shared `sample_staged_tables` derivation the
+    // kind names; `padoff` is the pad law's offset row, which the kernel adds
+    // to the score LAST, after its two roundings — the row's own pad bytes are
+    // never its contract). The node's FIRST SIX seats after the row — the
+    // seed quintuple's five `[rows, 1]` word tables and the temperature
+    // reciprocal — are PER-STEP operands the runtime binds every decode step;
+    // they are deliberately NOT in this list (a load-time constant staged
+    // over them would freeze one draw's seed into every step).
     let mut mints = ir
         .nodes
         .iter()
@@ -2038,11 +2038,11 @@ pub fn load_consts_of_ir<F: RopeForm>(
             };
             assert_eq!(
                 node.inputs.len(),
-                12,
-                "the Sample node's arity is the registry's own row (logits + noise + inv_t + \
-                 nine tables)"
+                27,
+                "the Sample node's arity is the registry's own row (logits + the five seed word \
+                 tables + inv_t + twenty tables)"
             );
-            node.inputs[3..]
+            Ok(node.inputs[7..]
                 .iter()
                 .enumerate()
                 .map(|(i, tr)| {
@@ -2192,7 +2192,7 @@ pub fn chain_of_ir<F: RopeForm>(ir: &SubtileIR<F>) -> crate::wiring::ChainFact {
 /// twin of the merged map [`graph_wiring`] collects from its own walk. The
 /// two agree BY CONSTRUCTION on every graph that builds: `graph_wiring`
 /// REFUSES a mark on any parameter outside the sampler's own staged set (the
-/// load-const tables and the seat's noise — the only stagers that carry an
+/// load-const tables — the only stagers that carry an
 /// arrangement), so a graph that wires has NO mark outside the Sample node,
 /// and lowering that one node here states the same map the wiring baked. The
 /// bake's numeric gate calls this so its staged bytes are the worker's bytes.
@@ -2240,17 +2240,27 @@ pub fn staggered_of_ir<F: RopeForm>(
 ///
 /// ⛔ THE SEAT IS A CLASS APART FROM EVERY OTHER SOURCE. A weight stages once
 /// at load; a load-const stages once at load; an activation is bound before
-/// the launch that reads it. The noise and inv_t go STALE the moment a step
-/// completes — they are the step's own randomness — so the gate counts them
-/// as filled ONLY when bound THIS STEP, and a decode launch without a fresh
-/// bind of BOTH refuses loudly (the PrefixMask precedent), never a held
-/// default: a held noise row is a held TOKEN.
+/// the launch that reads it. The seed words and inv_t go STALE the moment a
+/// step completes — the seed's step word is the step's own freshness — so the
+/// gate counts them as filled ONLY when bound THIS STEP, and a decode launch
+/// without a fresh bind of EVERY SEAT OPERAND refuses loudly (the PrefixMask
+/// precedent), never a held default: a held seed row is a held TOKEN.
+///
+/// ⭐ EACH SEED WORD TABLE'S ROW STRIDE is the placement's own law, not a
+/// restatement: `seed_row_words` = `row_footprint_bytes(1, SenUint32) / 4` —
+/// the same pub derivation the placement's reservation calls (a `[rows, 1]`
+/// i32 table reserves like every u32 tensor, 32-element sticks, one stick per
+/// row), so the worker's per-row write and the placement's per-row
+/// reservation can never drift. The word of row `r` in table `k` lands at
+/// that table's word `r · seed_row_words` — the STICK HEAD the Col operand
+/// mode reads (the int-bcast leg's measured law). The emulator is
+/// memref-faithful (each table packed `rows × 1` words); the card seat writes
+/// each word at its own table's stick head, the reservation's own stride.
 ///
 /// A second minted node is the same build error the load-const list states —
 /// two mints ran over one graph — never last-write-wins.
 pub fn sample_seat_of_ir<F: RopeForm>(
     ir: &SubtileIR<F>,
-    staggered: &std::collections::BTreeMap<u32, ktir_superdsc::element_arrangement::ElementArrangement>,
 ) -> Result<Option<crate::wiring::SampleSeat>, SuperDscError> {
     let mut mints = ir
         .nodes
@@ -2269,27 +2279,43 @@ pub fn sample_seat_of_ir<F: RopeForm>(
             };
             assert_eq!(
                 node.inputs.len(),
-                12,
-                "the Sample node's arity is the registry's own row (logits + noise + inv_t + \
-                 nine tables)"
+                27,
+                "the Sample node's arity is the registry's own row (logits + five seed word \
+                 tables + inv_t + twenty tables)"
             );
+            // ⭐ FIVE SEED WORD TABLES, each `[rows, 1]` i32 — the auditor's
+            // wall-4 ruling (a). The Col operand mode that broadcasts a
+            // per-row word reads the STICK HEAD ALONE (the int-bcast card
+            // leg's measured law: a word at stick word k would be mis-read as
+            // word 0), so the cornered `[1, 1]`-window-of-`[rows, 5]`
+            // spelling the fold first carried is unpronounceable — every word
+            // rides its own one-stick-per-row table, `invt`'s own class,
+            // loaded corner-free at `[pid, 0]`.
+            let mut seed_words = [0u32; 5];
+            for (k, tid) in seed_words.iter_mut().enumerate() {
+                let word_tid = node.inputs[1 + k].tensor;
+                let word_shape = ir.tensors[word_tid.index()];
+                assert_eq!(
+                    word_shape.cols, 1,
+                    "the seed word table t{} is {} wide, not the one word of its own \
+                     `[rows, 1]` class — the mint and the seat disagree on the seed's shape",
+                    word_tid.index(), word_shape.cols
+                );
+                *tid = word_tid.index() as u32;
+            }
+            // THE ONE LAW, shared with the placement's reservation: each word
+            // table is a `[rows, 1]` SenUint32 tensor, and its row stride is
+            // the footprint's own width. `u32` cast is lossless (the footprint
+            // is 32 words at every admitted shape — a whole 32-element stick).
+            let seed_row_words =
+                (row_footprint_bytes(1, Df::SenUint32) / 4) as u32;
             Ok(Some(crate::wiring::SampleSeat {
-                row: node.inputs[0].tensor.index() as u32,
-                noise: node.inputs[1].tensor.index() as u32,
-                invt: node.inputs[2].tensor.index() as u32,
+                seed_words,
+                invt: node.inputs[6].tensor.index() as u32,
                 rows,
                 vocab,
                 pad_vocab: scratchy_subtile::subtile_ir::sample_pad_vocab(vocab),
-                // The noise row's arrangement — the bake's own propagation fact, a CONST on the
-                // seat: the per-step stager writes lane i at the baked permutation's index and
-                // never derives. The inv_t is a `[rows, 1]` column broadcast — order-free, no
-                // arrangement of its own.
-                noise_arrangement: staggered
-                    .get(&(node.inputs[1].tensor.index() as u32))
-                    .copied()
-                    .unwrap_or(
-                        ktir_superdsc::element_arrangement::ElementArrangement::Standard,
-                    ),
+                seed_row_words,
             }))
         }
     }

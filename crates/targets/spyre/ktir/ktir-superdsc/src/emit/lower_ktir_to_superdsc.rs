@@ -55,7 +55,9 @@ use crate::reserved_tids::{
 };
 use crate::sdsc_abstract::{KernelTag, Stk};
 use crate::sdsc_abstract::{MatK, MatM, MatN};
-use crate::superdsc_opspec::{DataFormat, Df, Fp16, Fp32, ItDim, SdscFoldSet, StickExtent};
+use crate::superdsc_opspec::{
+    DataFormat, Df, Fp16, Fp32, ItDim, SdscFoldSet, SenUint32, StickExtent,
+};
 use crate::work::{CoreSplit, DeviceWidth, EwDivision, FP16_ELEMS_PER_STICK, UTIL_FLOOR_CORES};
 use ktir_core::affine::AffineExpr;
 use ktir_core::attrkey::AttrKey;
@@ -1016,9 +1018,15 @@ pub(crate) fn pointwise_tile_op_df(
         Df::Fp32 => StickExtent::<Fp32>::new(cols)
             .expect("check_pointwise_cols_df already proved cols a whole fp32 stick")
             .elems(),
+        // SENUINT32 — the integer pointwise form's own basis (4-byte / 32-element stick), the same
+        // round-at-own-stick law the fp32 arm states. Reached from [`int_binary`] only; every
+        // other pointwise caller keeps `Df::Fp16`/`Fp32` verbatim.
+        Df::SenUint32 => StickExtent::<SenUint32>::new(cols)
+            .expect("check_pointwise_cols_df already proved cols a whole SENUINT32 stick")
+            .elems(),
         // ⛔ NO OTHER FORMAT REACHES HERE: [`elementwise_df`] refuses a non-fp16/fp32 `df` by
         // name before building a tile, because the pointwise builders below state exactly these
-        // two (same branch in `pointwise_broadcast_opspec_df`). Stated rather than `_`-ed so a
+        // three (same branch in `pointwise_broadcast_opspec_df`). Stated rather than `_`-ed so a
         // new format is an E0004 here, at the seam that would have to learn it.
         other => unreachable!("elementwise_df refused the {other:?} pointwise form by name"),
     };
@@ -1099,6 +1107,8 @@ pub fn elementwise_op_func(name: &str, kind: Elementwise) -> Result<(&'static st
         // `op_func_from_str` arm before this table named it, and most are already emitted on card by
         // the attention / rmsnorm / fp8-quantiser bodies; what was missing was only the door.
         Elementwise::Exp => ("exp", 1),
+        Elementwise::Log => ("log", 1),
+        Elementwise::Neg => ("neg", 1),
         Elementwise::Rsqrt => ("rsqrt", 1),
         Elementwise::Sqrt => ("sqrt", 1),
         Elementwise::Abs => ("abs", 1),
@@ -1167,9 +1177,11 @@ pub fn elementwise_op_func(name: &str, kind: Elementwise) -> Result<(&'static st
 /// its view), and comparing its `v_rows` instead would refuse exactly the programs the band lift
 /// admits: a banded output's whole view is every core's bands, not this op's sweep. The c_len
 /// equality is unchanged — the op's width is one number every operand shares.
+/// `what` is the refusal's label — the caller's own kind spelling (`Elementwise({kind:?})`, or
+/// [`int_binary`]'s `IntBinary`), so the message names the door that refused it.
 fn pointwise_extents_agree(
     name: &str,
-    kind: Elementwise,
+    what: &str,
     ins: &[Region],
     out: &Region,
     rows: u32,
@@ -1183,7 +1195,7 @@ fn pointwise_extents_agree(
         if !row_ok || x.c_len != out.c_len {
             if x.r_cover == (0, x.v_rows) {
                 return err(format!(
-                    "Elementwise({kind:?}) {name}: input {i} t{} is `[{}, {}]` (view rows × window \
+                    "{what} {name}: input {i} t{} is `[{}, {}]` (view rows × window \
                      cols) but the output t{} is `[{}, {}]`, and this emitter addresses EVERY operand \
                      at the OUTPUT's extent — `pointwise_opspec_from_tile` computes `device_dims` once \
                      from the output tile and hands the same dims to every TensorArg, so nothing \
@@ -1207,7 +1219,7 @@ fn pointwise_extents_agree(
                 ));
             }
             return err(format!(
-                "Elementwise({kind:?}) {name}: input {i} t{}'s window is `[{}, {}]` at row {} of its \
+                "{what} {name}: input {i} t{}'s window is `[{}, {}]` at row {} of its \
                  `[{}, {}]` view, but the op sweeps `[{}, {}]` (the output t{}'s basis) — a windowed \
                  operand must hold the sweep as its OWN window (`r_len` the sweep, fitting the view), \
                  or the descriptor would read the wrong rows of this operand for the rows the output \
@@ -1374,7 +1386,8 @@ pub fn elementwise_df(
         if bcast.iter().any(Option::is_some) {
             return elementwise_broadcast(
                 name,
-                kind,
+                &format!("Elementwise({kind:?})"),
+                op_func,
                 BcastForm {
                     ins: &ins,
                     out: &out,
@@ -1400,7 +1413,7 @@ pub fn elementwise_df(
         let cols = out.c_len;
         check_pointwise_cols_df(cols, "Elementwise", out.tid, df)?;
         let rows = pointwise_rows(name, &out)?;
-        pointwise_extents_agree(name, kind, &ins, &out, rows)?;
+        pointwise_extents_agree(name, &format!("Elementwise({kind:?})"), &ins, &out, rows)?;
         let op_name = format!("{op_func}_o{}", out.tid);
         // HANDLE-FLOW, the broadcast arm's own discipline: the handles are bound once and the
         // operands borrow them, because an `EwOperand` holds a `&Stk` that must outlive the
@@ -1435,7 +1448,8 @@ pub fn elementwise_df(
         // lands in the same body with the stick basis stated at `df.elems_per_stick()`.
         return elementwise_broadcast(
             name,
-            kind,
+            &format!("Elementwise({kind:?})"),
+            op_func,
             BcastForm {
                 ins: &ins,
                 out: &out,
@@ -1468,7 +1482,7 @@ pub fn elementwise_df(
     // windowed (banded) output's sweep is its window, not its whole view, and the operands are
     // held to that basis ([`pointwise_extents_agree`]'s two-basis law below).
     let rows = pointwise_rows(name, &out)?;
-    pointwise_extents_agree(name, kind, &ins, &out, rows)?;
+    pointwise_extents_agree(name, &format!("Elementwise({kind:?})"), &ins, &out, rows)?;
     let op_name = format!("{op_func}_o{}", out.tid);
     // ⛔⛔⛔ A COLUMN-BLOCKED CHUNK IS DENSE ELEMENTWISE WITH A CORNER, AND THE CORNER MUST RIDE
     // EVERY OPERAND — the 12b gemma-4 garbage. `subtile_ir.rs`'s column-tiling set
@@ -1773,6 +1787,210 @@ fn elementwise_per_row(
     Ok(vec![op])
 }
 
+/// An elementwise WRAPPING i32 op — the noise hash's integer class. Not a [`Program`] variant:
+/// `Program` is matched exhaustively by consumers outside this crate, and a bare integer op is
+/// reachable only through the whole-function walk (a per-`Program` producer states no integer
+/// node), so the kind lives here at the emission door — the same trade [`ConvertKind`] makes.
+///
+/// ⭐ THE CARD FORM IS B1'S OWN, MEASURED: `muli32toi32`/`addi32toi32` opFuncs
+/// (`arch_enums.cpp:496/:497`, sfp unit) over `SENUINT32` labeledDs at wordLength 4 with the
+/// computeOp's `dataFormat_` marker `IEEE_FP32` — the SFP unit's fp32-mode datapath executes the
+/// wrapping i32 op, so the marker states the MODE, never the data (the same law
+/// `emit`'s ComputeAttrs arm states for the value-cast converts). Leg B1's cells bit-matched
+/// host wrapping i32 mul/add over these exact shapes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IntBinary {
+    /// `arith.muli` — `muli32toi32`.
+    Mul,
+    /// `arith.addi` — `addi32toi32`.
+    Add,
+}
+
+impl IntBinary {
+    /// The `op_func_from_str` key — a DESCRIPTOR NAME feeding the bundle fingerprint
+    /// ([`elementwise_op_func`]'s own law), so it is the exact input key, never the
+    /// `OpFunc::name()` dxp spelling.
+    pub fn op_func(self) -> &'static str {
+        match self {
+            IntBinary::Mul => "muli32toi32",
+            IntBinary::Add => "addi32toi32",
+        }
+    }
+}
+
+/// THE INTEGER POINTWISE DOOR: one wrapping i32 binary op, two tensor inputs, one output, all
+/// three `SENUINT32` — the DENSE CORNER-FREE form (B1's own measured card form) plus the
+/// ONE-ROW `Col` BROADCAST operand mode, [`elementwise_df`]'s own non-fp16 gate restated at the
+/// integer basis.
+///
+/// ⭐ THE BROADCAST ADMISSION IS MEASURED (front-b-noise, auditor order 2026-10-26; the
+/// int-bcast card leg on nickm2, 2026-10-26T22:31:15Z, the leg's `intb-verdict.json`): a
+/// single `addi32toi32` — a `[1, 512]` dense i32 row + a `[1, 1]` Col-broadcast i32, baked
+/// through THIS door's shared [`elementwise_broadcast`] body at `Df::SenUint32` — came back
+/// BIT-FOR-BIT against the host wrapping add: 512/512 lanes, 0 mismatches (b = 0x85EBCA77;
+/// a = wrapping multiples of 0x9E3779B1 with 0/1/INT_MIN/INT_MAX pinned at the head, so the
+/// wrap cases were staged on card). B1 proved the DENSE form; this leg proved the ONE-ROW
+/// `Col` operand mode — the production form, since the sampler is one program per row. The
+/// specimen is `int_bcast_probe.py` (case `int_bcast`), the runner kit
+/// `.claude/fb-noise-probe/intb-leg.sh`.
+/// The sampler's own hash needs `Col`: its per-row seed words (`slo`/`shi`/`stp`/`srow`) are
+/// `[rows, 1]` i32 windows of the seed table added against the `[rows, PAD_V]` hash tile —
+/// and the sampler is ONE PROGRAM PER ROW (one-row blocks throughout, `sample_fwd.py`'s own
+/// grid law), so the production form is always `Col` at ONE row: the probe's exact shape.
+///
+/// ⭐ THE `Mul` HALF OF THE `Col` ADMISSION IS CARD-PROVEN (int-mul-bcast leg,
+/// nickm2, verdict saved `.claude/fb-noise-probe/verdicts/intm-verdict-20261027T0002Z.json`):
+/// `muli32toi32` over a `[1, 512]` dense SENUINT32 tile plus the `[1, 1]`
+/// `Col`-broadcast i32 word 0x85EBCA77 — 512/512 lanes BIT-FOR-BIT against the
+/// host `(a[j] * b[0]) mod 2^32`, 0 mismatches, 2026-10-27T00:02:55Z. The
+/// wall-5 fold's uniform multipliers (`hc1`/`hc2`/`hc3`, the wrap-fold's
+/// `c256`) are `[1, 1]` one-word tables — broadcast OPERANDS of `muli32toi32`
+/// through this door's shared body at the same stick basis — and the leg
+/// measured exactly that production form (the specimen
+/// `int_mul_bcast_probe.py`, case `intmul_bcast`, the runner kit
+/// `.claude/fb-noise-probe/intm-leg.sh`). The `Add` leg measured the operand
+/// mode for the add; this leg measured it for the mul. The admission stands.
+///
+/// ⛔ NO `Y`, NO `Mb`, NO MULTI-ROW `Col`, NO CORNER, NO PER-ROW FORM — the row-split mode,
+/// the row-vector mode, the multi-row column-vector mode and every corner are refused by
+/// name below: none is measured, none is ordered, and this door states only what a leg has
+/// measured. A program wanting one is a producer form refused BY NAME here, not lowered as
+/// the nearest measured thing. (The auditor's go contemplated measuring the multi-row forms
+/// in the same run "if trivial"; they are not — a `[2, 512]` two-row dense SENUINT32 tile is
+/// itself unmeasured, so a failure could not be attributed to the operand mode rather than
+/// the dense operand, and no production program spells one. Order a specimen and the
+/// refusal opens.)
+pub fn int_binary(
+    name: &str,
+    kind: IntBinary,
+    r: &[Region],
+    bcast: &[Option<BcastAxis>],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let op_func = kind.op_func();
+    let (ins, out) = split_regions(name, r, layout, 2, &[])?;
+    // ⛔ NO CORNER ON ANY ROUTE — dense or broadcast: the dense arm's window offsets and the
+    // broadcast arm's at-own-extent/buffer-base addressing are alike unable to place a corner,
+    // and the corner basis itself is fp16 ([`chunk_window`]/[`band_corner`]), a shape a
+    // SENUINT32 window has not proven. The guard fires BEFORE the broadcast route for the same
+    // reason [`elementwise_df`] orders its own: a corner arriving at the broadcast arm would be
+    // silently dropped rather than refused.
+    if out.c_start != 0
+        || ins.iter().any(|x| x.c_start != 0)
+        || out.r_start != 0
+        || ins.iter().any(|x| x.r_start != 0)
+    {
+        return err(format!(
+            "IntBinary({kind:?}) {name}: a CORNERED integer op — the window corners are \
+             addressed on the fp16 element basis ([`chunk_window`]/[`band_corner`] state \
+             `Df::Fp16` offsets), and a SENUINT32 window is a shape this door has not proven. It \
+             is refused by name rather than mis-addressed"
+        ));
+    }
+    if !bcast.is_empty() && bcast.iter().any(Option::is_some) {
+        // The flags are POSITIONAL (flag `i` selects input `i`'s operand mode) — the same law
+        // [`elementwise_df`] states before its own route, and the guard the want loop below
+        // indexes against.
+        if bcast.len() != ins.len() {
+            return err(format!(
+                "IntBinary({kind:?}) {name}: {} broadcast flags for {} inputs — the flags are \
+                 POSITIONAL (flag `i` selects input `i`'s operand mode), so a length mismatch would \
+                 address some other operand as the vector",
+                bcast.len(),
+                ins.len(),
+            ));
+        }
+        // ⛔ THE ROW-SPLIT MODE IS REFUSED FOR THE INTEGER — not measured (the int-bcast card leg
+        // measures the ONE-ROW `Col` form only), not ordered, and no integer producer states it.
+        // Named rather than admitted on the fp16/fp32 form's coattails.
+        if bcast.iter().any(|b| matches!(b, Some(BcastAxis::Y(_)))) {
+            return err(format!(
+                "IntBinary({kind:?}) {name}: a row-split (`Y`) integer broadcast — the y-major \
+                 operand mode over SENUINT32 data is a card form no leg has measured (the \
+                 int-bcast leg measures the one-row `Col` form only), so this door refuses it \
+                 by name rather than emit an unproven addressing"
+            ));
+        }
+        // ⛔ THE ROW-VECTOR MODE IS REFUSED FOR THE INTEGER TOO — `Mb` (a `[1, cols]` operand
+        // sprayed down the rows) is likewise unmeasured and unstated by any integer producer.
+        if bcast.iter().any(|b| matches!(b, Some(BcastAxis::Mb))) {
+            return err(format!(
+                "IntBinary({kind:?}) {name}: a row-vector (`Mb`) integer broadcast — the \
+                 row-sprayed operand mode over SENUINT32 data is a card form no leg has \
+                 measured (the int-bcast leg measures the one-row `Col` form only), so this \
+                 door refuses it by name rather than emit an unproven addressing"
+            ));
+        }
+        // ⛔ AND `Col` IS ADMITTED AT ONE ROW ONLY — the multi-row column vector
+        // (`[rows > 1, 1]` against a `[rows > 1, cols]` tile) is unmeasured as well: measuring
+        // it needs a multi-row dense SENUINT32 tile no leg has baked, so a failure there could
+        // not be attributed to the operand mode rather than the dense operand. The want loop
+        // below makes a `Col` operand's `v_rows` the op's own row count, so checking the
+        // operand here IS checking the op.
+        if bcast
+            .iter()
+            .zip(ins.iter())
+            .any(|(b, x)| matches!(b, Some(BcastAxis::Col)) && x.v_rows > 1)
+        {
+            return err(format!(
+                "IntBinary({kind:?}) {name}: a multi-row `Col` integer broadcast (a \
+                 `[rows > 1, 1]` operand against a `[rows > 1, cols]` tile) — a card form no \
+                 leg has measured (the int-bcast leg measures the one-row `Col` form only, and \
+                 the multi-row form needs a multi-row dense SENUINT32 tile that is itself \
+                 unmeasured), so this door refuses it by name rather than emit an unproven \
+                 addressing"
+            ));
+        }
+        // ⭐ THE PROBE ADMISSION — the SAME broadcast body the fp16/fp32 doors reach, at the
+        // integer's own stick basis, with the INTEGER op_func (the descriptor name that feeds
+        // the bundle fingerprint). See the door's own doc for the measurement in flight.
+        return elementwise_broadcast(
+            name,
+            &format!("IntBinary({kind:?})"),
+            op_func,
+            BcastForm {
+                ins: &ins,
+                out: &out,
+                bcast,
+            },
+            Df::SenUint32,
+            sym_id_base,
+            layout,
+        );
+    }
+    let cols = out.c_len;
+    check_pointwise_cols_df(cols, "IntBinary", out.tid, Df::SenUint32)?;
+    let rows = pointwise_rows(name, &out)?;
+    pointwise_extents_agree(name, &format!("IntBinary({kind:?})"), &ins, &out, rows)?;
+    let op_name = format!("{op_func}_o{}", out.tid);
+    // HANDLE-FLOW, [`elementwise_df`]'s dense-arm discipline verbatim: handles bound once,
+    // operands borrow them, all-dense `In::full`, the df (SENUINT32) riding the `TileOp` into
+    // every `TensorArg` — the stick basis and `dataFormat_` are the integer dtype's own.
+    let out_h = rb(&out.name(), rows, cols);
+    let in_names: Vec<String> = ins.iter().map(|x| x.name()).collect();
+    let in_handles: Vec<_> = in_names
+        .iter()
+        .zip(ins.iter())
+        .map(|(n, x)| rb(n, x.v_rows, x.c_len))
+        .collect();
+    let ew: Vec<_> = in_handles.iter().map(|h| In::full(h).ew()).collect();
+    let tile_op = pointwise_tile_op_df(rows, cols, 1, 3, Df::SenUint32);
+    Ok(vec![assemble_pointwise_broadcast_off_from_tile(
+        &op_name,
+        &tile_op,
+        op_func,
+        rows,
+        cols,
+        &ew,
+        &out_h,
+        // WHOLE-TENSOR by the corner refusal above, not by default.
+        crate::addr::DevOff::ZERO,
+        sym_id_base,
+        layout,
+    )])
+}
+
 /// ⭐⭐⭐ [`elementwise`] WITH A BROADCAST OPERAND — the arm [`pointwise_extents_agree`] names in its
 /// own refusal, now built.
 ///
@@ -1821,24 +2039,25 @@ struct BcastForm<'a> {
 
 fn elementwise_broadcast(
     name: &str,
-    kind: Elementwise,
+    what: &str,
+    op_func: &'static str,
     form: BcastForm<'_>,
     df: Df,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
     let BcastForm { ins, out, bcast } = form;
-    // THE OP FUNC IS A FUNCTION OF THE KIND, so it is named here rather than passed. The caller holds
-    // it already, but [`elementwise_op_func`] is that one `match` and nothing else, so handing it over
-    // as well would buy a parameter and no fact — and the call already proved it Ok for this `kind`.
-    let (op_func, _) = elementwise_op_func(name, kind)?;
+    // THE OP FUNC IS THE CALLER'S OWN FACT, handed over rather than re-derived: the elementwise
+    // door holds it from [`elementwise_op_func`] already, and the INTEGER door holds the same
+    // class of fact from [`IntBinary::op_func`] — a descriptor name that feeds the bundle
+    // fingerprint, so the two doors cannot drift about which op a broadcast arm emits.
     // ⛔ A UNARY'S ONLY INPUT CANNOT BE THE BROADCAST. `f(vector) -> tile` is not a pointwise op at
     // all — it is a broadcast MATERIALIZATION with an `f` applied, and emitting it as one would put
     // the whole output's worth of work on a descriptor whose only input is one lane per row. Nothing
     // produces it, so it is named rather than given a meaning here.
     if ins.len() < 2 {
         return err(format!(
-            "Elementwise({kind:?}) {name}: the only input of a unary op is marked broadcast, so the \
+            "{what} {name}: the only input of a unary op is marked broadcast, so the \
              output would be a SPRAY of a vector rather than a function of a tile. A broadcast is an \
              operand mode of an op that also reads a dense operand; a materialization is a different \
              op and this door does not invent one"
@@ -1877,7 +2096,7 @@ fn elementwise_broadcast(
             )
             .split_rows(y as usize, (rows / y) as usize)
             .map_err(|e| Error {
-                message: format!("Elementwise({kind:?}) {name}: output t{}: {e}", out.tid),
+                message: format!("{what} {name}: output t{}: {e}", out.tid),
             })?,
         ),
         None => None,
@@ -1894,7 +2113,7 @@ fn elementwise_broadcast(
         };
         if (x.v_rows, x.c_len) != want {
             return err(format!(
-                "Elementwise({kind:?}) {name}: input {i} t{} is `[{}, {}]` but its operand mode \
+                "{what} {name}: input {i} t{} is `[{}, {}]` but its operand mode \
                  ({:?}) requires `[{}, {}]` against the `[{}, {}]` output t{}. A `Col` operand is one \
                  value per row (`[rows, 1]`), an `Mb` operand one row of values (`[1, cols]`), a `Y` \
                  operand one spray's worth of rows (`[rows/y, cols]`), and a \
@@ -1919,7 +2138,7 @@ fn elementwise_broadcast(
     } else {
         out.c_len
     };
-    check_pointwise_cols_df(cols, "Elementwise", out.tid, df)?;
+    check_pointwise_cols_df(cols, what, out.tid, df)?;
     let op_name = format!("{op_func}_o{}", out.tid);
     // The handles: `rb` is RowBlocked, which is what `head_major == false` means on the seeded path —
     // the residual token stream, not the per-head attention layout. An INPUT handle's extents are
@@ -2008,6 +2227,25 @@ pub enum ConvertKind {
     /// `arith.fptosi` f32 → i32. `OpFunc::Fp32ToInt32`, dxp `"fp32toint32"` — the island's exit,
     /// an IEEE fp32 word re-sticked as a SENUINT32 index.
     Fp32ToInt32,
+    /// `arith.sitofp` i32 → f32. `OpFunc::Int32ToFp32`, dxp `"int32tofp32"` — the island's
+    /// ENTRANCE FROM THE INTEGER SIDE: a SENUINT32 word converted to an IEEE fp32 value, the
+    /// exact reverse recipe of [`ConvertKind::Fp32ToInt32`] (both 32-element, wordLength-4
+    /// sticks, so the convert carries no slice constraint). Card-proven by leg B1's `i2f_g1`
+    /// cell (bit-matched against host `as f32` across full-range u32 patterns). The on-card
+    /// Gumbel noise's wrap-fold extraction rides it (front-b-noise): `h·2^8` keeps the low 24
+    /// bits as multiples of 2^8 with ≤24 significant bits, so the conversion is EXACT even at
+    /// magnitude ~2^31.
+    Int32ToFp32,
+    /// `arith.truncf` f32 → f16. `OpFunc::Fp32ToDl16`, dxp `"fp32todl16"` — the
+    /// NARROW-BACK convert, the exact reverse recipe of [`ConvertKind::Dl16ToFp32`].
+    /// ⭐ WHY THE DOOR NEEDS IT (front-b-noise, measured on the card leg): the card's
+    /// `log` is an FP16-ONLY bind (`unary_parallel.ddl`:
+    /// `operation_bind([%type_fp16], …) {opFuncName="log"}` — FEST-based, like fp16
+    /// `tanh`/`gelu`, and unlike them it carries NO fp32 binding), so an f32 value on
+    /// its way to a log MUST narrow first or dxp refuses the op mapping ("Scheduler
+    /// failed to find a suitable op mapping", SchedulerStages.cpp:40). The Gumbel
+    /// draw's fp16-log chain rides this convert.
+    Fp32ToDl16,
 }
 
 impl ConvertKind {
@@ -2018,6 +2256,8 @@ impl ConvertKind {
         match self {
             ConvertKind::Dl16ToFp32 => "dl16tofp32",
             ConvertKind::Fp32ToInt32 => "fp32toint32",
+            ConvertKind::Int32ToFp32 => "int32tofp32",
+            ConvertKind::Fp32ToDl16 => "fp32todl16",
         }
     }
 
@@ -2028,6 +2268,11 @@ impl ConvertKind {
         match self {
             ConvertKind::Dl16ToFp32 => Df::Fp16,
             ConvertKind::Fp32ToInt32 => Df::Fp32,
+            // SENUINT32 in, IEEE_FP32 out — both 32-element, wordLength-4 sticks.
+            ConvertKind::Int32ToFp32 => Df::Fp32,
+            // IEEE_FP32 in, fp16 out — the fp16 output's 64-elem stick is the wider
+            // basis, the same law `dl16tofp32` reads from its input side.
+            ConvertKind::Fp32ToDl16 => Df::Fp16,
         }
     }
 }
@@ -2058,7 +2303,7 @@ pub fn convert(
     // `OpFunc` through `convert_dtypes`), so the RowBlocked mint is exact for both operands.
     let in_h = rb(&ins[0].name(), rows, cols);
     let out_h = rb(&out.name(), rows, cols);
-    let emitted = assemble_convert(
+    Ok(vec![assemble_convert(
         &op_name,
         op_func,
         rows,
@@ -2067,8 +2312,7 @@ pub fn convert(
         &out_h,
         sym_id_base,
         layout,
-    );
-    Ok(vec![emitted])
+    )])
 }
 
 /// main's `lower_silumul_node` (main 8466-8604): `out = silu(gate) · up` DECOMPOSED into two
@@ -7326,6 +7570,182 @@ mod elementwise_tests {
         );
     }
 
+    // ── THE INTEGER BROADCAST ADMISSION (front-b-noise, auditor order 2026-10-26) ───────────────
+    //
+    // ⭐⭐⭐ THE PROBE'S OWN SHAPE. The sampler's hash adds its per-row seed words against the
+    // `[rows, PAD_V]` hash tile: `h = h*C2 + shi + stp + srow` spells four `Col`-broadcast
+    // `addi32toi32` ops over SENUINT32, the form this door refused until the int-bcast card leg
+    // (a single `[1, 512]` dense i32 + a `[1, 1]` Col-broadcast i32, host-compared bit for bit
+    // on nickm2) measures it. The admission routes through the SAME `elementwise_broadcast`
+    // body the fp doors reach — the want loop, the `In::col`/`In::mb` operand modes, the TileOp
+    // at the op's own df — so the probe measures the emission the door keeps. These tests pin
+    // the ROUTING and the refusals; the card leg owns the measurement.
+
+    /// ⭐ THE DENSE CONTROL, B1's own measured form: no flags, agreeing extents, one op named
+    /// `addi32toi32_o*` — the descriptor name that feeds the bundle fingerprint.
+    #[test]
+    fn an_int_dense_pair_still_lowers() {
+        let r = node(
+            reg(5, 1, 512, false),
+            reg(6, 1, 512, false),
+            reg(7, 1, 512, true),
+        );
+        let mut sym = 0i64;
+        let ops = int_binary("add_s3", IntBinary::Add, &r, &[], &mut sym, None)
+            .expect("B1's own dense form");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op_name, "addi32toi32_o7");
+    }
+
+    /// ⭐ THE ADMISSION, at the probe's exact shape: `[1, 512]` dense + `[1, 1]` Col-broadcast
+    /// under a `[1, 512]` output — one op, still named `addi32toi32_o7` (the operand mode is
+    /// addressing, not a different op).
+    #[test]
+    fn an_int_col_broadcast_now_emits_one_op() {
+        let r = node(
+            reg(5, 1, 512, false),
+            reg(6, 1, 1, false),
+            reg(7, 1, 512, true),
+        );
+        let mut sym = 0i64;
+        let ops = int_binary(
+            "add_s3",
+            IntBinary::Add,
+            &r,
+            &[None, Some(BcastAxis::Col)],
+            &mut sym,
+            None,
+        )
+        .expect("the [1, 1] per-row word IS expressible once the axis is stated");
+        assert_eq!(ops.len(), 1, "an operand mode is not a decomposition");
+        assert_eq!(
+            ops[0].op_name, "addi32toi32_o7",
+            "the descriptor NAME must not change with the operand mode — it feeds the bundle \
+             fingerprint, and the broadcast arm is the same op",
+        );
+    }
+
+    /// ⛔ THE `Mb` MODE STAYS REFUSED FOR THE INTEGER — unmeasured (the int-bcast leg measures
+    /// the one-row `Col` form only) and unstated by any integer producer. The `Col` admission
+    /// must not slide the row-vector mode in on its coattails.
+    #[test]
+    fn an_int_mb_flag_is_refused_by_name() {
+        let r = node(
+            reg(5, 1, 512, false),
+            reg(6, 1, 512, false),
+            reg(7, 1, 512, true),
+        );
+        let mut sym = 0i64;
+        let Err(e) = int_binary(
+            "add_s3",
+            IntBinary::Add,
+            &r,
+            &[None, Some(BcastAxis::Mb)],
+            &mut sym,
+            None,
+        ) else {
+            panic!("a row-vector integer broadcast was ACCEPTED — Mb is unmeasured and unordered")
+        };
+        assert!(
+            e.message.contains("row-vector") && e.message.contains("no leg has measured"),
+            "names the mode and why it stays refused: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ AND THE MULTI-ROW `Col` STAYS REFUSED TOO — the auditor's contemplated second probe
+    /// form (`[2, 512]` dense + `[2, 1]`) is this door's `Col` at TWO rows, and it is not
+    /// trivial to measure: it needs a two-row dense SENUINT32 tile that is itself unmeasured,
+    /// so a failure could not be attributed to the operand mode. The sampler is one program
+    /// per row, so no production program spells it either.
+    #[test]
+    fn an_int_multi_row_col_flag_is_refused_by_name() {
+        let r = node(
+            reg(5, 2, 512, false),
+            reg(6, 2, 1, false),
+            reg(7, 2, 512, true),
+        );
+        let mut sym = 0i64;
+        let Err(e) = int_binary(
+            "add_s3",
+            IntBinary::Add,
+            &r,
+            &[None, Some(BcastAxis::Col)],
+            &mut sym,
+            None,
+        ) else {
+            panic!(
+                "a multi-row Col integer broadcast was ACCEPTED — the two-row form is unmeasured \
+                 and unordered"
+            )
+        };
+        assert!(
+            e.message.contains("multi-row") && e.message.contains("no leg has measured"),
+            "names the mode and why it stays refused: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ THE ROW-SPLIT MODE STAYS REFUSED FOR THE INTEGER — not measured (the int-bcast leg
+    /// measures the one-row `Col` form only), not ordered, and no integer producer states it.
+    /// The `Col` admission must not slide `Y` in on its coattails.
+    #[test]
+    fn an_int_y_flag_is_refused_by_name() {
+        let r = node(
+            reg(5, 256, 128, false),
+            reg(6, 64, 128, false),
+            reg(7, 256, 128, true),
+        );
+        let mut sym = 0i64;
+        let Err(e) = int_binary(
+            "add_s3",
+            IntBinary::Add,
+            &r,
+            &[None, Some(BcastAxis::Y(4))],
+            &mut sym,
+            None,
+        ) else {
+            panic!("a row-split integer broadcast was ACCEPTED — Y is unmeasured and unordered")
+        };
+        assert!(
+            e.message.contains("row-split") && e.message.contains("no leg has measured"),
+            "names the mode and why it stays refused: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ AND THE AXIS/EXTENT AGREEMENT STILL HOLDS AT THE INTEGER DOOR — a `Col` flag over a
+    /// full `[1, 512]` tile would read one lane and spray it, the same silent wrong answer the
+    /// elementwise twin above refuses. The shared body's want loop owns it.
+    #[test]
+    fn an_int_col_flag_over_a_full_tile_is_refused_by_name() {
+        let r = node(
+            reg(5, 1, 512, false),
+            reg(6, 1, 512, false),
+            reg(7, 1, 512, true),
+        );
+        let mut sym = 0i64;
+        let Err(e) = int_binary(
+            "add_s3",
+            IntBinary::Add,
+            &r,
+            &[None, Some(BcastAxis::Col)],
+            &mut sym,
+            None,
+        ) else {
+            panic!(
+                "a Col flag over a [1, 512] operand was ACCEPTED — the descriptor now reads one \
+                 lane per row and sprays it, and nothing downstream can tell"
+            )
+        };
+        assert!(e.message.contains("t6"), "names the operand: {}", e.message);
+        assert!(
+            e.message.contains("IntBinary(Add)"),
+            "the integer door's own tag, not the elementwise one: {}",
+            e.message
+        );
+    }
+
     // ── (iii) EXHAUSTIVE DECLARED-SET ASSERTIONS ──────────────────────────────────────────────
 
     /// ⛔ NO `_` ARM: a new [`Elementwise`] variant is an E0004 HERE, which is what makes
@@ -7341,21 +7761,23 @@ mod elementwise_tests {
             Elementwise::GeluErf => 5,
             Elementwise::Sub => 6,
             Elementwise::Exp => 7,
-            Elementwise::Rsqrt => 8,
-            Elementwise::Sqrt => 9,
-            Elementwise::Abs => 10,
-            Elementwise::Reciprocal => 11,
-            Elementwise::Sigmoid => 12,
-            Elementwise::Tanh => 13,
-            Elementwise::Mish => 14,
-            Elementwise::RealDiv => 15,
-            Elementwise::Maximum => 16,
-            Elementwise::Minimum => 17,
-            Elementwise::Equal => 18,
+            Elementwise::Log => 8,
+            Elementwise::Neg => 9,
+            Elementwise::Rsqrt => 10,
+            Elementwise::Sqrt => 11,
+            Elementwise::Abs => 12,
+            Elementwise::Reciprocal => 13,
+            Elementwise::Sigmoid => 14,
+            Elementwise::Tanh => 15,
+            Elementwise::Mish => 16,
+            Elementwise::RealDiv => 17,
+            Elementwise::Maximum => 18,
+            Elementwise::Minimum => 19,
+            Elementwise::Equal => 20,
         }
     }
 
-    const DECLARED: usize = 19;
+    const DECLARED: usize = 21;
 
     #[test]
     fn all_declares_every_variant_exactly_once() {
@@ -7499,7 +7921,7 @@ mod elementwise_tests {
             for a in EXTENTS {
                 let ins = [reg(5, a.0, a.1, false)];
                 assert_eq!(
-                    pointwise_extents_agree("p", Elementwise::Silu, &ins, &out, o.0).is_ok(),
+                    pointwise_extents_agree("p", "Elementwise(Silu)", &ins, &out, o.0).is_ok(),
                     a == o,
                     "unary out={o:?} in={a:?}"
                 );
@@ -7509,7 +7931,7 @@ mod elementwise_tests {
                 for b in EXTENTS {
                     let ins = [reg(5, a.0, a.1, false), reg(6, b.0, b.1, false)];
                     assert_eq!(
-                        pointwise_extents_agree("p", Elementwise::Add, &ins, &out, o.0).is_ok(),
+                        pointwise_extents_agree("p", "Elementwise(Add)", &ins, &out, o.0).is_ok(),
                         a == o && b == o,
                         "binary out={o:?} in0={a:?} in1={b:?}"
                     );
@@ -8040,7 +8462,7 @@ mod proofs {
         // The sweep basis is the OUTPUT's own row count here (a whole-view output's
         // `pointwise_rows`), so the admission law the proof states is unchanged.
         let admitted =
-            pointwise_extents_agree("p", Elementwise::Add, &ins, &out, orow).is_ok();
+            pointwise_extents_agree("p", "Elementwise(Add)", &ins, &out, orow).is_ok();
         assert_eq!(
             admitted,
             (arow, acol) == (orow, ocol) && (brow, bcol) == (orow, ocol)
@@ -8061,7 +8483,7 @@ mod proofs {
         let ins = [reg(5, arow, acol, false)];
         // Same sweep basis as the binary proof: the whole-view output's own row count.
         let admitted =
-            pointwise_extents_agree("p", Elementwise::Silu, &ins, &out, orow).is_ok();
+            pointwise_extents_agree("p", "Elementwise(Silu)", &ins, &out, orow).is_ok();
         assert_eq!(admitted, (arow, acol) == (orow, ocol));
     }
 }
@@ -8575,7 +8997,7 @@ pub fn scalarweightmul(
     // x, the weight, and the output — the parameters `KtirFunc::scalar_weight_mul` mints.
     let (tensors, out) = split_out(name, r, layout, 2)?;
     let rows = node_rows(name, &out)?;
-    pointwise_extents_agree(name, Elementwise::Mul, &tensors[0..1], &out, rows)?;
+    pointwise_extents_agree(name, "Elementwise(Mul)", &tensors[0..1], &out, rows)?;
     check_pointwise_cols(out.c_len, "ScalarWeightMul", out.tid)?;
     let cols = out.c_len;
     let x = tensors[0].name();
@@ -9202,4 +9624,62 @@ pub fn reduce(
              than lowering at the nearest format"
         )),
     }
+}
+
+/// [`reduce`] at a stated [`Df`] — the same law [`elementwise_df`] states for the pointwise arms:
+/// a reduce whose DATA is fp32 (the fp32 island's `max`/`sum` over an f32 intermediate) must state
+/// the stick basis and `dataFormat_` at the actual dtype, and [`assemble_reduce_seeded`]'s
+/// fp16-basis descriptor over an fp32 buffer mis-sticks every read. `Df::Fp16` keeps the proven
+/// [`assemble_reduce_seeded`] path verbatim; every other format rides
+/// [`tiled_op_sdsc_op::reduce::assemble_reduce_df`] (the torch-spyre fp32-rmsnorm precedent's own
+/// body, head-major flat) and is refused there for any format it does not state.
+pub fn reduce_df(
+    name: &str,
+    kind: crate::ktir_node::ReduceKind,
+    r: &[Region],
+    df: Df,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    if df == Df::Fp16 {
+        return reduce(name, kind, df, r, sym_id_base, layout);
+    }
+    let (ins, out) = split_out(name, r, layout, 1)?;
+    let data = ins[0];
+    let (rows, cols) = (data.r_len, data.c_len);
+    if rows == 0 || cols == 0 {
+        return err(format!(
+            "{name}: reducing t{} `[{rows}, {cols}]` — a reduce needs a non-empty tile",
+            data.tid
+        ));
+    }
+    if out.c_len != 1 {
+        return err(format!(
+            "{name}: the reduce's output t{} is `[{}, {}]`, but a row reduction along the stick axis \
+             writes ONE value per row — `[{rows}, 1]`. An output wider than one column would leave \
+             every column but the first holding whatever the buffer held.",
+            out.tid, out.r_len, out.c_len
+        ));
+    }
+    if out.r_len != rows {
+        return err(format!(
+            "{name}: the reduce reads {rows} row(s) of t{} and writes {} row(s) of t{} — a row \
+             reduction writes exactly one value per row it reads",
+            data.tid, out.r_len, out.tid
+        ));
+    }
+    let op_name = format!("{}_o{}", kind.op_func(), out.tid);
+    Ok(vec![
+        crate::ir::bridge::tiled_op_sdsc_op::reduce::assemble_reduce_df(
+            &op_name,
+            kind.op_func(),
+            rows,
+            cols,
+            &data.name(),
+            &out.name(),
+            df,
+            sym_id_base,
+            layout,
+        ),
+    ])
 }

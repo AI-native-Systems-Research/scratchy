@@ -76,7 +76,6 @@ const fn dl16tofp32_permutation() -> [u8; 64] {
 /// refusal is replaced by the measured table and nothing else moves.
 pub const OP_OUTPUT_ARRANGEMENT: &[(&str, ElementArrangement)] = &[
     ("dl16tofp32", ElementArrangement::Dl16ToFp32),
-    ("fp32todl16", ElementArrangement::Dl16ToFp32),
 ];
 
 /// The arrangement an op-func's output carries, or `None` when the op-func is not in the table

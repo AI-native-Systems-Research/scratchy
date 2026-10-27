@@ -1,0 +1,1137 @@
+diff --git a/crates/targets/spyre/ktir/ktir-emulator/src/comm_sched.rs b/crates/targets/spyre/ktir/ktir-emulator/src/comm_sched.rs
+index 46611cfbca..dbd62bd83d 100644
+--- a/crates/targets/spyre/ktir/ktir-emulator/src/comm_sched.rs
++++ b/crates/targets/spyre/ktir/ktir-emulator/src/comm_sched.rs
+@@ -2554,8 +2554,11 @@ mod tests {
+         // The mean lands DLF16-partialed and unrounded (the reduce's landing
+         // arm holds it as decoded f32); the eps splat is the f16 constant the
+         // mirror states — f16(1e-6) = 17·2⁻²⁴ exactly.
++        // f32 has 24 mantissa bits; both literals below sit on exact f32 values, so the
++        // shorter spelling IS the same bits (clippy's excessive_precision demands exactly
++        // that equivalence).
+         let mean = 1.11e-6_f32;
+-        let eps_f16 = 1.0132789611816406e-6_f32; // f16(1e-6), exactly representable in f32
++        let eps_f16 = 1.013279e-6_f32; // f16(1e-6) = 17·2⁻²⁴, exact in f32
+ 
+         let mut ctx = single_core_context();
+         ctx.set_value(
+diff --git a/crates/targets/spyre/ktir/ktir-emulator/src/dialects/arith.rs b/crates/targets/spyre/ktir/ktir-emulator/src/dialects/arith.rs
+index 09b3d9c3cf..43df7d195d 100644
+--- a/crates/targets/spyre/ktir/ktir-emulator/src/dialects/arith.rs
++++ b/crates/targets/spyre/ktir/ktir-emulator/src/dialects/arith.rs
+@@ -733,12 +733,23 @@ fn uitofp(
+     ctx: &mut CoreContext,
+     _env: &ExecutionEnv,
+ ) -> Result<Option<Value>, String> {
+-    // Unsigned int -> f32.
++    // Unsigned int -> float, target dtype from result_type (default f32) — the
++    // signed sibling `sitofp`'s own law, which this handler missed. The argmax
++    // kernel's equality masks are `uitofp` i1 -> f16 in the KTIR, and the
++    // device path folds each `cmpf(oeq)` + `uitofp` pair into ONE
++    // `Elementwise(Equal)` whose wire result is the fp16 0/1 tensor — so an
++    // f32 materialization here charges LX 2x the wire width per mask, and
++    // `result_float_dtype` then keeps the indicator products in f32 too (the
++    // llama-3.2-1b decode expansion at PAD_V 131072 crossed core 0's brim
++    // exactly this way; granite's 65536 stayed under only by width luck).
++    // Values are 0/1, exact in either width — the dtype moves the charge, not
++    // a single bit of the numerics.
++    let dtype = op.result_type.and_then(IrType::elem).unwrap_or(DType::F32);
+     let v = unary_operand(op, ctx, "arith.uitofp")?;
+     match v {
+         Value::Tile(t) => {
+             let data: Vec<f32> = t.as_f32().iter().map(|&x| round_i64(x) as f32).collect();
+-            Ok(Some(Value::Tile(Tile::compute(data, DType::F32, t.shape))))
++            Ok(Some(Value::Tile(Tile::compute(data, dtype, t.shape))))
+         }
+         Value::Scalar(s) => {
+             let x = s.as_i64().ok_or("arith.uitofp: non-int scalar")? as f32;
+@@ -1971,6 +1982,35 @@ mod tests {
+         assert_eq!(expect_f32(&run(&mut ops, op, &sseed)), 9.0);
+     }
+ 
++    #[test]
++    fn uitofp_with_result_type() {
++        // The argmax masks' law: the retype DECLARES f16 (the device fold's
++        // own wire width — `Elementwise(Equal)` answers the fp16 0/1 tensor),
++        // so the materialized tile is f16 and charges LX at the wire width.
++        // An f32 materialization here over-charges 2x per mask, which crossed
++        // core 0's brim on llama-3.2-1b's decode expansion at PAD_V 131072.
++        let mut ops = Ops::new();
++        let op = ops.op(Some("%r"), OpKind::ArithUitofp, &["%a"]);
++        let op = Operation {
++            result_type: Some(IrType::Tensor {
++                dims: &[2],
++                elem: DType::F16,
++            }),
++            ..op
++        };
++        let seed = [("%a", tile(vec![1.0, 0.0], DType::I32, vec![2]))];
++        let r = run(&mut ops, op, &seed);
++        assert_eq!(expect_tile(&r).dtype, DType::F16);
++        assert_eq!(expect_tile(&r).size_bytes(), 4);
++        assert_eq!(expect_tile(&r).as_f32().to_vec(), vec![1.0, 0.0]);
++        // No declared result -> the f32 fallback (the behavior ops without a
++        // result_type have always had).
++        let op = ops.op(Some("%r"), OpKind::ArithUitofp, &["%a"]);
++        let seed = [("%a", tile(vec![1.0, 0.0], DType::I32, vec![2]))];
++        let r = run(&mut ops, op, &seed);
++        assert_eq!(expect_tile(&r).dtype, DType::F32);
++    }
++
+     #[test]
+     fn fptosi_truncates_toward_zero() {
+         let mut ops = Ops::new();
+diff --git a/crates/targets/spyre/ktir/ktir-emulator/src/program.rs b/crates/targets/spyre/ktir/ktir-emulator/src/program.rs
+index 8c01b79c33..62e948eb29 100644
+--- a/crates/targets/spyre/ktir/ktir-emulator/src/program.rs
++++ b/crates/targets/spyre/ktir/ktir-emulator/src/program.rs
+@@ -102,6 +102,23 @@ impl Session {
+         Ok(Self { exec })
+     }
+ 
++    /// ⭐ [`new_multi`](Self::new_multi) WITH A SHAPE FLOOR — the tape's own
++    /// tensor-shape statement (element counts keyed by tensor id), which the
++    /// executor's sticks allocate at LEAST. For callers that hold the graph the
++    /// programs were lowered from: a widened reader whose view sits on an
++    /// interior edge of a fused function is invisible to the view walk, and the
++    /// floor is what keeps its tensor's stick large enough. Callers without the
++    /// graph keep [`new_multi`](Self::new_multi) and the view walk unchanged.
++    pub fn new_multi_floored(
++        programs: Vec<(&[IRFunction<'static>], &ProgramSpec)>,
++        weights: Vec<(u64, Arg)>,
++        shape_floor: &std::collections::HashMap<u64, usize>,
++    ) -> Result<Self, String> {
++        let mut exec = crate::resident::ResidentExecutor::new_multi_floored(programs, shape_floor)?;
++        exec.set_sources_owned(weights)?;
++        Ok(Self { exec })
++    }
++
+     /// Overwrite source tensors in resident HBM (the per-pass input / mask).
+     /// Sources you don't pass keep their resident bytes — so weights stay put.
+     pub fn set_sources(&mut self, args: &[(u64, Arg)]) -> Result<(), String> {
+diff --git a/crates/targets/spyre/ktir/ktir-emulator/src/resident.rs b/crates/targets/spyre/ktir/ktir-emulator/src/resident.rs
+index 302f9baa42..70385e216e 100644
+--- a/crates/targets/spyre/ktir/ktir-emulator/src/resident.rs
++++ b/crates/targets/spyre/ktir/ktir-emulator/src/resident.rs
+@@ -284,7 +284,26 @@ impl ResidentExecutor {
+     pub fn new_multi(
+         programs: Vec<(&[IRFunction<'static>], &ProgramSpec)>,
+     ) -> Result<Self, String> {
+-        Self::build(programs, false)
++        Self::build(programs, false, None)
++    }
++
++    /// ⭐ [`new_multi`](Self::new_multi) WITH A SHAPE FLOOR — the TAPE's own
++    /// tensor-shape statement, threaded by a caller that holds it (the numeric
++    /// gate holds the minted krg; the worker holds the wiring). Every stick is
++    /// allocated for at least the floored element count, so a tensor whose
++    /// widest view the shape walk cannot see — an INTERIOR edge of a fused
++    /// function, where no arg→tid mapping reaches the reader's view (measured:
++    /// the argmax mint's PAD_V-wide logits row over the lm-head matmul's
++    /// narrower device-width out view, t1136 staged `[1, 51200]` while the krg
++    /// states `[1, 65536]`) — still fits its stick. The view walk stays the
++    /// only law for standalone runs ([`new_multi`](Self::new_multi)); the
++    /// floor is a MAX, so it can only ever RAISE an allocation, never shrink
++    /// one the views already sized.
++    pub fn new_multi_floored(
++        programs: Vec<(&[IRFunction<'static>], &ProgramSpec)>,
++        shape_floor: &HashMap<u64, usize>,
++    ) -> Result<Self, String> {
++        Self::build(programs, false, Some(shape_floor))
+     }
+ 
+     /// Like [`new`](Self::new), but plan EVERY node as a [`Segment::Native`] run at
+@@ -299,12 +318,13 @@ impl ResidentExecutor {
+     /// (`metal_gemm_or_blas` / fused map windows) ride along — this is the resident
+     /// executor's Native arm, just applied to every node.
+     pub fn new_native(funcs: &[IRFunction<'static>], spec: &ProgramSpec) -> Result<Self, String> {
+-        Self::build(vec![(funcs, spec)], true)
++        Self::build(vec![(funcs, spec)], true, None)
+     }
+ 
+     fn build(
+         programs: Vec<(&[IRFunction<'static>], &ProgramSpec)>,
+         force_native: bool,
++        shape_floor: Option<&HashMap<u64, usize>>,
+     ) -> Result<Self, String> {
+         // A new resident HBM: every borrowed weight view minted over a previous one is
+         // now stale (see `metal::RESIDENT_GEN`), and is discarded rather than dispatched.
+@@ -430,8 +450,28 @@ impl ResidentExecutor {
+                     .get(&tid)
+                     .cloned()
+                     .ok_or_else(|| format!("no shape derivable for tensor t{tid}"))?;
+-                let n: usize = shape.iter().product();
+-                let s = hbm.allocate((n * bpe).max(bpe) as i64);
++                let mut n: usize = shape.iter().product();
++                // ⭐ THE TAPE'S OWN SHAPE STATEMENT IS A FLOOR, where the caller
++                // holds it: the view walk derives a tid's extent only from views
++                // its arg→tid mappings reach, and a widened reader's view can sit
++                // past that reach (an interior edge of a fused function). An
++                // allocation must hold EVERY view that addresses the tensor, and
++                // the krg's tensor shape is the tape's own statement of it — so
++                // the floor takes the max and can only ever RAISE the allocation.
++                if let Some(floor) = shape_floor.and_then(|f| f.get(&tid)) {
++                    n = n.max(*floor);
++                }
++                // ⭐ AND THE STICK IS SIZED AT THE TID'S OWN VIEW DTYPE, not the
++                // model dtype: an fp8 weight binds 1-byte elements, an f32 table
++                // or i32 stick 4-byte ones, and the uniform model-dtype bpe
++                // under-allocated those by half (measured: the argmax's fp32
++                // scale table — 64 elements staged at 128 bytes against a
++                // 256-byte view). Every reader already keys this same per-tid
++                // view dtype (`ptr_for`, the readback decode, the verbatim
++                // source staging); the allocation now agrees with them.
++                let dt = view_dtypes.get(&tid).copied().unwrap_or(dtype);
++                let dt_bpe = dt.bytes_per_elem();
++                let s = hbm.allocate((n * dt_bpe).max(dt_bpe) as i64);
+                 stick.insert(tid, s);
+                 numel.insert(tid, n);
+             }
+@@ -1417,7 +1457,6 @@ impl ResidentExecutor {
+     /// Cheap: these are activations (kB) not weights (GB).
+     fn zero_non_sources(&mut self) {
+         let hbm = self.mem.hbm.borrow_mut();
+-        let bpe = self.dtype.bytes_per_elem();
+         for (&tid, &s) in &self.stick {
+             if self.sources.contains(&tid) {
+                 continue;
+@@ -1426,6 +1465,15 @@ impl ResidentExecutor {
+             if n == 0 {
+                 continue;
+             }
++            // The stick's OWN view dtype, the same per-tid law the allocation
++            // sizes by — a 4-byte-element stick zeroed at the model dtype's 2
++            // would leave its upper half stale across passes.
++            let bpe = self
++                .view_dtype
++                .get(&tid)
++                .copied()
++                .unwrap_or(self.dtype)
++                .bytes_per_elem();
+             // Zero the existing backing bytes IN PLACE — every non-source stick is
+             // already allocated (the stick base is its exact allocation base), so
+             // fill its bytes rather than allocating a fresh zero `Vec` +
+@@ -1487,7 +1535,12 @@ impl ResidentExecutor {
+             .ok_or_else(|| format!("t{tid} has no resident stick"))?;
+         let n = *self.numel.get(&tid).unwrap_or(&0);
+         let shape = self.shapes.get(&tid).cloned().unwrap_or_else(|| vec![n]);
+-        Ok((tid, s, n, shape, self.dtype))
++        // The tid's OWN view dtype — the same per-tid law the allocation sizes
++        // by. The model dtype here mis-decoded the first non-f16 result stick
++        // (measured: the argmax's i32 idx answer, i32 bytes read as f16 pairs
++        // — 12360 came back as [0.1338, 0, ...]).
++        let dt = self.view_dtype.get(&tid).copied().unwrap_or(self.dtype);
++        Ok((tid, s, n, shape, dt))
+     }
+ }
+ 
+diff --git a/crates/targets/spyre/ktir/ktir-emulator/src/segmented.rs b/crates/targets/spyre/ktir/ktir-emulator/src/segmented.rs
+index 828d5d51fa..3b09eb2c3d 100644
+--- a/crates/targets/spyre/ktir/ktir-emulator/src/segmented.rs
++++ b/crates/targets/spyre/ktir/ktir-emulator/src/segmented.rs
+@@ -57,9 +57,13 @@ fn view_shape_of(op: &Operation) -> Option<Vec<usize>> {
+ /// touches, by scanning each node's `ktdp.construct_memory_view` ops (whose
+ /// `sizes:` attribute is the tensor's full shape) and mapping the view's pointer
+ /// operand to a tensor id via that node's bindings. A tensor may be viewed in
+-/// several nodes; any one view's shape is authoritative (they agree). This lets
+-/// the driver size the intermediate / result / scratch buffers with NO external
+-/// manifest — the shapes live in the IR.
++/// several nodes; views of one tensor agree in every graph whose producers state
++/// the storage they write, and where they legitimately disagree (a producer
++/// stating its own device window over a wider storage — the device argmax's
++/// widening mint) the WIDEST view stages the tid, because an allocation must
++/// hold every view that addresses it. This lets the driver size the intermediate
++/// / result / scratch buffers with NO external manifest — the shapes live in the
++/// IR.
+ pub(crate) fn derive_shapes(
+     module: &IRModule,
+     spec: &ProgramSpec,
+@@ -146,7 +150,26 @@ pub(crate) fn collect_view_shapes(
+             && let Some(&tid) = arg_to_tensor.get(ptr)
+             && let Some(shape) = view_shape_of(op)
+         {
+-            shapes.entry(tid).or_insert(shape);
++            // ⭐ THE WIDEST VIEW STAGES THE TID — the resident run's own cross-program
++            // law ("the WIDEST program's shape stages the tid"), applied within a
++            // program too. Views of one tensor agree in every graph whose producers
++            // state the storage they write, so this is first-wins unchanged there; the
++            // device argmax's widening mint is the first legitimate disagreement — the
++            // lm-head matmul's out view states its own DEVICE width (`n_dev`, 51200 at
++            // granite's vocab) over the PAD_V-wide storage (65536) its widened
++            // consumers address — and a first-wins pass staged the tid at the
++            // matmul's narrower window, refusing the consumer's view at run (view
++            // `[1, 65536]` spans 131072 bytes but the tensor holds only 102400). An
++            // allocation must hold EVERY view that addresses it; the widest is the
++            // safe stage, and over-allocation is never wrong.
++            shapes
++                .entry(tid)
++                .and_modify(|old| {
++                    if shape.iter().product::<usize>() > old.iter().product::<usize>() {
++                        *old = shape.clone();
++                    }
++                })
++                .or_insert(shape);
+         }
+         for rg in op.regions {
+             collect_view_shapes(rg, arg_to_tensor, shapes);
+diff --git a/crates/targets/spyre/ktir/ktir-superdsc/src/emit/lower_ktir_to_superdsc.rs b/crates/targets/spyre/ktir/ktir-superdsc/src/emit/lower_ktir_to_superdsc.rs
+index f49e6b8901..3ea8adf511 100644
+--- a/crates/targets/spyre/ktir/ktir-superdsc/src/emit/lower_ktir_to_superdsc.rs
++++ b/crates/targets/spyre/ktir/ktir-superdsc/src/emit/lower_ktir_to_superdsc.rs
+@@ -34,9 +34,9 @@
+ //! branch, unchanged, reached from facts the KTIR states — and the fp8 arm below calls it.
+ 
+ use super::{
+-    EmittedOp, In, assemble_pointwise_broadcast_off, assemble_restickify_kt_2d, bmm_site,
+-    check_pointwise_cols, emit_sdsc_tiled, fl, op_func_from_str, pointwise_broadcast_opspec_df,
+-    pointwise_chunk_out_offset, pw1, pw2, rb, rbo,
++    EmittedOp, In, assemble_convert, assemble_pointwise_broadcast_off, assemble_restickify_kt_2d,
++    bmm_site, check_pointwise_cols, check_pointwise_cols_df, emit_sdsc_tiled, fl, op_func_from_str,
++    pointwise_broadcast_opspec_df, pointwise_chunk_out_offset, pw1, pw2, rb, rbo,
+ };
+ use crate::ir::bridge::tiled_op_sdsc_op::{
+     assemble_attn, assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_windowed,
+@@ -55,7 +55,7 @@ use crate::reserved_tids::{
+ };
+ use crate::sdsc_abstract::{KernelTag, Stk};
+ use crate::sdsc_abstract::{MatK, MatM, MatN};
+-use crate::superdsc_opspec::{DataFormat, Df, Fp16, ItDim, SdscFoldSet};
++use crate::superdsc_opspec::{DataFormat, Df, Fp16, Fp32, ItDim, SdscFoldSet, StickExtent};
+ use crate::work::{CoreSplit, DeviceWidth, EwDivision, FP16_ELEMS_PER_STICK, UTIL_FLOOR_CORES};
+ use ktir_core::affine::AffineExpr;
+ use ktir_core::attrkey::AttrKey;
+@@ -947,6 +947,36 @@ fn scale_idx_of(layout: Option<&BundleLayout>, tid: u32) -> Option<usize> {
+ /// `mb = rows/y` from the checked [`crate::sdsc_abstract::RowSplitFrame`]); every other caller
+ /// passes 1 and keeps the size-1 dim this doc describes.
+ pub(crate) fn pointwise_tile_op(rows: u32, cols: u32, y: u32, n_operands: u32) -> TileOp {
++    pointwise_tile_op_df(rows, cols, y, n_operands, Df::Fp16)
++}
++
++/// [`pointwise_tile_op`] at a stated [`Df`] — the torch-spyre fp32-rmsnorm precedent's own law
++/// ([`pointwise_broadcast_opspec_df`]): the stick basis is the ACTUAL dtype's (fp32 = 32-element
++/// stick), because an fp32 op's `out` dim measured on the fp16 basis would state the wrong
++/// `stickSize_`/`wordLength` for every operand the tile feeds. `Df::Fp16` keeps the proven basis
++/// verbatim (`cols.max(1)` — `cols` is already whole-stick by [`check_pointwise_cols`], and `0`
++/// passes that check, so the `StickExtent` round-trip is not imposed on it); every other format
++/// rounds at its own stick, which is a no-op for a whole-stick `cols` and the fix for a
++/// sub-fp16-stick-but-whole-own-stick one (a per-row fp32 lane is 32, valid fp32, NOT a
++/// 64-multiple — `pointwise_broadcast_opspec_df`'s own note).
++pub(crate) fn pointwise_tile_op_df(
++    rows: u32,
++    cols: u32,
++    y: u32,
++    n_operands: u32,
++    df: Df,
++) -> TileOp {
++    let out_size = match df {
++        Df::Fp16 => cols.max(1),
++        Df::Fp32 => StickExtent::<Fp32>::new(cols)
++            .expect("check_pointwise_cols_df already proved cols a whole fp32 stick")
++            .elems(),
++        // ⛔ NO OTHER FORMAT REACHES HERE: [`elementwise_df`] refuses a non-fp16/fp32 `df` by
++        // name before building a tile, because the pointwise builders below state exactly these
++        // two (same branch in `pointwise_broadcast_opspec_df`). Stated rather than `_`-ed so a
++        // new format is an E0004 here, at the seam that would have to learn it.
++        other => unreachable!("elementwise_df refused the {other:?} pointwise form by name"),
++    };
+     TileOp {
+         kind: TileOpKind::PointwiseOrReduce { n_operands },
+         dims: vec![
+@@ -955,24 +985,24 @@ pub(crate) fn pointwise_tile_op(rows: u32, cols: u32, y: u32, n_operands: u32) -
+                 size: rows,
+                 is_reduction: false,
+                 is_stick: false,
+-                df: Df::Fp16,
++                df,
+             },
+             ItDim {
+                 name: "out",
+-                size: cols.max(1),
++                size: out_size,
+                 is_reduction: false,
+                 is_stick: true,
+-                df: Df::Fp16,
++                df,
+             },
+             ItDim {
+                 name: "y",
+                 size: y.max(1),
+                 is_reduction: false,
+                 is_stick: false,
+-                df: Df::Fp16,
++                df,
+             },
+         ],
+-        df: Df::Fp16,
++        df,
+     }
+ }
+ 
+@@ -1034,6 +1064,13 @@ pub fn elementwise_op_func(name: &str, kind: Elementwise) -> Result<(&'static st
+         Elementwise::RealDiv => ("realdiv", 2),
+         Elementwise::Maximum => ("maximum", 2),
+         Elementwise::Minimum => ("minimum", 2),
++        // The equality mask. `OpFunc::Equal` realizes as `EQUAL` into a BOOL state reg then
++        // `SELECT(plus1, zero)` (`broadcast_ops.ddl:41`), so the wire-level result IS an fp16
++        // 0.0/1.0 tensor — the same shape every pointwise here already emits, NOT a bool tile
++        // needing a dtype lane of its own. NaN compares FALSE on the SFP unit, which is the
++        // emulator's ordered `cmpf oeq` verbatim, so the numeric rung and the card compute the
++        // same predicate. Used by the first-max sampler's one-hot selectors.
++        Elementwise::Equal => ("equal", 2),
+         // ⛔ THE DDL HAS NO PRIMITIVE FOR THESE TWO, AND SUBSTITUTING THE NEAREST ONE IS THE BUG.
+         // `QuickGelu` is x·σ(1.702x) and `GeluErf` is the exact-erf gelu — neither is
+         // `OpFunc::Gelu`'s tanh polynomial, so emitting "gelu" for them would run a DIFFERENT
+@@ -1179,6 +1216,38 @@ pub fn elementwise(
+     bcast: &[Option<BcastAxis>],
+     sym_id_base: &mut i64,
+     layout: Option<&BundleLayout>,
++) -> Result<Vec<EmittedOp>, Error> {
++    elementwise_df(name, kind, r, bcast, Df::Fp16, sym_id_base, layout)
++}
++
++/// [`elementwise`] at a stated [`Df`] — the torch-spyre fp32-rmsnorm precedent's own door
++/// ([`pointwise_broadcast_opspec_df`]): an op whose RESULT is fp32 (the widen island's
++/// multiply-add) states `df` on every `ItDim`, the `TileOp`, and every `TensorArg`, because the
++/// stick basis and the `dataFormat_`/`wordLength` the descriptor declares are properties of the
++/// ACTUAL dtype — an fp16-annotated descriptor over fp32 buffers mis-stripes every stick.
++///
++/// ⛔⛔ THE fp32 FORM ADMITTED HERE IS THE DENSE CORNER-FREE ONE, AND THE OTHER ARMS REFUSE IT
++/// BY NAME RATHER THAN EMIT IT UNSTATED:
++///   * the SEEDED whole-tensor path ([`assemble_pointwise_seeded_from_tile`]) cannot state `df`
++///     at all — its `TensorArg`s carry no `with_df` — so an fp32 op routed there would emit an
++///     fp16-annotated descriptor over fp32 buffers: right shape, wrong `dataFormat_`, silently.
++///     The fp32 dense form therefore rides the [`EwOperand`] builder
++///     ([`assemble_pointwise_broadcast_off_from_tile`], all-`In::full` operands — the documented
++///     degenerate case of the generalization), which threads `tile_op.df` into every arg.
++///   * a BROADCAST operand, the PER-ROW one-stick chain, and the CORNERED windows are fp16-proven
++///     forms whose offsets and widths are stated on the fp16 element basis
++///     ([`chunk_window`]/[`band_corner`] address in `Df::Fp16` elements); an fp32 op in any of
++///     those shapes is a form this door has not proven, and it is refused by name here rather
++///     than mis-addressed. `Df::Fp16` keeps every one of those paths byte-identical — the `df`
++///     only selects between them when it is not `Fp16`, which no existing caller states.
++pub fn elementwise_df(
++    name: &str,
++    kind: Elementwise,
++    r: &[Region],
++    bcast: &[Option<BcastAxis>],
++    df: Df,
++    sym_id_base: &mut i64,
++    layout: Option<&BundleLayout>,
+ ) -> Result<Vec<EmittedOp>, Error> {
+     let (op_func, arity) = elementwise_op_func(name, kind)?;
+     // ⭐ SPLIT WITHOUT THE BASE-ADDRESS GUARD: the dense arm below places row corners
+@@ -1226,6 +1295,81 @@ pub fn elementwise(
+              both corners, so give the broadcast/per-row chains whole-tensor regions.",
+         ));
+     }
++    // ⛔⛔⛔ THE NON-fp16 GATE — everything below this block is the fp16-proven machinery, and a
++    // non-fp16 op may take only the DENSE CORNER-FREE form (the module doc above states why each
++    // other arm refuses). The forms admitted: `Df::Fp32`, no broadcast flag, no per-row output,
++    // no corner on any operand — the whole-stick `[rows, cols]` fp32 multiply-add of the widen
++    // island, emitted through the df-carrying [`EwOperand`] builder at offset 0.
++    if df != Df::Fp16 {
++        if !matches!(df, Df::Fp32) {
++            return err(format!(
++                "Elementwise({kind:?}) {name}: the op's result format is {df:?}, and this door \
++                 lowers pointwise ops in Fp16 and Fp32 only — the stick basis, the operand modes \
++                 and the window offsets below are all stated on one of those two, so any other \
++                 format is a producer form this door refuses by name rather than guessing a \
++                 basis for"
++            ));
++        }
++        if bcast.iter().any(Option::is_some) {
++            return err(format!(
++                "Elementwise({kind:?}) {name}: a BROADCAST operand on an fp32 op — the operand \
++                 modes (`In::col`/`In::mb`) and their degenerate-extent proofs are fp16-proven \
++                 forms, and an fp32 broadcast is a shape this door has not proven. It is refused \
++                 by name rather than emitted on an unproven basis"
++            ));
++        }
++        if out.c_len == 1 {
++            return err(format!(
++                "Elementwise({kind:?}) {name}: a per-row one-stick fp32 output — the one-stick \
++                 chain rides lane 0 of a 64-element fp16 stick ([`elementwise_per_row`]'s own \
++                 law), and the fp32 per-row form is not one this door has proven. It is refused \
++                 by name rather than emitted on an unproven basis"
++            ));
++        }
++        if out.c_start != 0
++            || ins.iter().any(|x| x.c_start != 0)
++            || out.r_start != 0
++            || ins.iter().any(|x| x.r_start != 0)
++        {
++            return err(format!(
++                "Elementwise({kind:?}) {name}: a CORNERED fp32 op — the window corners are \
++                 addressed on the fp16 element basis ([`chunk_window`]/[`band_corner`] state \
++                 `Df::Fp16` offsets), and an fp32 window is a shape this door has not proven. It \
++                 is refused by name rather than mis-addressed"
++            ));
++        }
++        let cols = out.c_len;
++        check_pointwise_cols_df(cols, "Elementwise", out.tid, df)?;
++        let rows = pointwise_rows(name, &out)?;
++        pointwise_extents_agree(name, kind, &ins, &out, rows)?;
++        let op_name = format!("{op_func}_o{}", out.tid);
++        // HANDLE-FLOW, the broadcast arm's own discipline: the handles are bound once and the
++        // operands borrow them, because an `EwOperand` holds a `&Stk` that must outlive the
++        // builder call. All-dense `In::full` — the documented degenerate case of the
++        // generalization — with the `df` riding the `TileOp` into every `TensorArg`.
++        let out_h = rb(&out.name(), rows, cols);
++        let in_names: Vec<String> = ins.iter().map(|x| x.name()).collect();
++        let in_handles: Vec<_> = in_names
++            .iter()
++            .zip(ins.iter())
++            .map(|(n, x)| rb(n, x.v_rows, x.c_len))
++            .collect();
++        let ew: Vec<_> = in_handles.iter().map(|h| In::full(h).ew()).collect();
++        let tile_op = pointwise_tile_op_df(rows, cols, 1, arity as u32 + 1, df);
++        return Ok(vec![assemble_pointwise_broadcast_off_from_tile(
++            &op_name,
++            &tile_op,
++            op_func,
++            rows,
++            cols,
++            &ew,
++            &out_h,
++            // WHOLE-TENSOR by the corner refusal above, not by default.
++            crate::addr::DevOff::ZERO,
++            sym_id_base,
++            layout,
++        )]);
++    }
+     if bcast.iter().any(Option::is_some) {
+         return elementwise_broadcast(name, kind, &ins, &out, bcast, sym_id_base, layout);
+     }
+@@ -1751,6 +1895,83 @@ fn elementwise_broadcast(
+     )])
+ }
+ 
++/// A dtype-CONVERT's kind — the device's own convert `OpFunc`s, discriminated by the
++/// (operand, result) element pair the KTIR op states. Not a [`Program`] variant: `Program` is
++/// matched exhaustively by consumers outside this crate, and a bare convert is reachable only
++/// through the whole-function walk, so the kind lives here at the emission door — the same
++/// trade [`BcastAxis`] makes.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum ConvertKind {
++    /// `arith.extf` f16 → f32. `OpFunc::Dl16ToFp32`, dxp `"dl16tofp32"` — the WIDENING half of
++    /// the KSPLIT fp32 island: `dl16tofp32` → same-stick f32 multiply-add → `fp32toint32`.
++    /// ⛔ The fp16 operand must STAGE through this convert, never a direct fp16→u32 cast —
++    /// `Fp32ToInt32`'s own DDL slice law (`unary_parallel.ddl:59`) refuses that pairing.
++    Dl16ToFp32,
++    /// `arith.fptosi` f32 → i32. `OpFunc::Fp32ToInt32`, dxp `"fp32toint32"` — the island's exit,
++    /// an IEEE fp32 word re-sticked as a SENUINT32 index.
++    Fp32ToInt32,
++}
++
++impl ConvertKind {
++    /// The `op_func_from_str` key — a DESCRIPTOR NAME feeding the bundle fingerprint
++    /// ([`elementwise_op_func`]'s own law), so it is the exact input key, never the
++    /// `OpFunc::name()` dxp spelling.
++    pub fn op_func(self) -> &'static str {
++        match self {
++            ConvertKind::Dl16ToFp32 => "dl16tofp32",
++            ConvertKind::Fp32ToInt32 => "fp32toint32",
++        }
++    }
++
++    /// The WIDER of this convert's two formats — the work-division stick basis
++    /// [`convert_opspec`] states: `dl16tofp32` keeps the fp16 input's 64 (fp16 is wider than
++    /// fp32's 32), `fp32toint32` takes 32 (fp32 in, u32 out, both 32-element sticks).
++    fn stick_df(self) -> Df {
++        match self {
++            ConvertKind::Dl16ToFp32 => Df::Fp16,
++            ConvertKind::Fp32ToInt32 => Df::Fp32,
++        }
++    }
++}
++
++/// THE CONVERT DOOR: one dtype-convert op, ONE tensor input, ONE output, both the RowBlocked
++/// token stream — the same [`assemble_convert`] body the fp8 quantiser's tail and the KSPLIT
++/// pair's own device recipe use, so a whole-kernel producer and a per-`Program` one cannot drift
++/// about what a convert emits.
++///
++/// ⭐ THE GUARDS ARE THE ELEMENTWISE DOOR'S OWN, restated for a unary op: the output's row
++/// basis is [`pointwise_rows`]' reading, and `cols` must be a whole stick of the WIDER format —
++/// a core's slab is cut at that basis ([`convert_opspec`]'s own law), so a sub-stick width is a
++/// dxp scheduler refusal at bake, named here one rung earlier.
++pub fn convert(
++    name: &str,
++    kind: ConvertKind,
++    r: &[Region],
++    sym_id_base: &mut i64,
++    layout: Option<&BundleLayout>,
++) -> Result<Vec<EmittedOp>, Error> {
++    let (ins, out) = split_out(name, r, layout, 1)?;
++    let rows = pointwise_rows(name, &out)?;
++    let cols = out.c_len;
++    check_pointwise_cols_df(cols, "Convert", out.tid, kind.stick_df())?;
++    let op_func = kind.op_func();
++    let op_name = format!("{op_func}_o{}", out.tid);
++    // The handles are ANNOTATION-ONLY (`assemble_convert` reads `.name()`; the dtypes ride the
++    // `OpFunc` through `convert_dtypes`), so the RowBlocked mint is exact for both operands.
++    let in_h = rb(&ins[0].name(), rows, cols);
++    let out_h = rb(&out.name(), rows, cols);
++    Ok(vec![assemble_convert(
++        &op_name,
++        op_func,
++        rows,
++        cols,
++        &in_h,
++        &out_h,
++        sym_id_base,
++        layout,
++    )])
++}
++
+ /// main's `lower_silumul_node` (main 8466-8604): `out = silu(gate) · up` DECOMPOSED into two
+ /// pointwise ops — `silu(gate) → <out>_silu`, then `multiply(<out>_silu, up) → out`.
+ ///
+@@ -6141,10 +6362,11 @@ mod elementwise_tests {
+             Elementwise::RealDiv => 15,
+             Elementwise::Maximum => 16,
+             Elementwise::Minimum => 17,
++            Elementwise::Equal => 18,
+         }
+     }
+ 
+-    const DECLARED: usize = 18;
++    const DECLARED: usize = 19;
+ 
+     #[test]
+     fn all_declares_every_variant_exactly_once() {
+@@ -6325,6 +6547,7 @@ mod elementwise_tests {
+             (Elementwise::Maximum, 2),
+             (Elementwise::Minimum, 2),
+             (Elementwise::Sub, 2),
++            (Elementwise::Equal, 2),
+         ] {
+             assert_eq!(elementwise_op_func("p", k).unwrap().1, want, "{k:?} arity");
+         }
+diff --git a/crates/targets/spyre/ktir/ktir-superdsc/src/emit/mod.rs b/crates/targets/spyre/ktir/ktir-superdsc/src/emit/mod.rs
+index 9b5a86f3e8..101ce00d13 100644
+--- a/crates/targets/spyre/ktir/ktir-superdsc/src/emit/mod.rs
++++ b/crates/targets/spyre/ktir/ktir-superdsc/src/emit/mod.rs
+@@ -6508,10 +6508,25 @@ pub(crate) fn check_pointwise_cols(
+     what: &str,
+     out_id: u32,
+ ) -> Result<(), SuperDscError> {
+-    if !cols.is_multiple_of(FP16_ELEMS_PER_STICK) {
++    check_pointwise_cols_df(cols, what, out_id, Df::Fp16)
++}
++
++/// [`check_pointwise_cols`] at a stated [`Df`] — the stick basis is the ACTUAL dtype's (fp32 =
++/// 32-element stick), the same law [`pointwise_broadcast_opspec_df`] states for the tile: a
++/// per-row fp32 lane is cols=32, valid fp32 but NOT a 64-multiple, so an Fp16 extent would
++/// wrongly reject it — and a 64-multiple that is not a whole fp32 stick cannot exist (64 is a
++/// 32-multiple), so every form the fp16 check admitted stays admitted.
++pub(crate) fn check_pointwise_cols_df(
++    cols: u32,
++    what: &str,
++    out_id: u32,
++    df: Df,
++) -> Result<(), SuperDscError> {
++    let stick = df.elems_per_stick();
++    if !cols.is_multiple_of(stick) {
+         return Err(SuperDscError(format!(
+-            "{what} t{out_id}: cols={cols} not a multiple of the {FP16_ELEMS_PER_STICK}-fp16 \
+-             stick (assemble_pointwise emits no coordinateMasking_) — pad cols"
++            "{what} t{out_id}: cols={cols} not a multiple of the {stick}-element {df:?} stick \
++             (assemble_pointwise emits no coordinateMasking_) — pad cols"
+         )));
+     }
+     Ok(())
+diff --git a/crates/targets/spyre/ktir/ktir-superdsc/src/emit/whole_function.rs b/crates/targets/spyre/ktir/ktir-superdsc/src/emit/whole_function.rs
+index e3768b9c5b..cce9fb12e2 100644
+--- a/crates/targets/spyre/ktir/ktir-superdsc/src/emit/whole_function.rs
++++ b/crates/targets/spyre/ktir/ktir-superdsc/src/emit/whole_function.rs
+@@ -43,6 +43,7 @@
+ //! guessed node kind is a well-formed descriptor computing the wrong function.
+ 
+ use ktir_core::attrkey::AttrKey;
++use ktir_core::dtypes::DType;
+ use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
+ use ktir_core::opkind::OpKind;
+ 
+@@ -50,9 +51,11 @@ use super::lower_ktir_to_superdsc::{Error, Gather, Region, err, gathers_of, regi
+ use crate::ktir_node::{Elementwise, KtirNode, Program, ReduceKind};
+ // The broadcast AXIS is the emission door's own vocabulary — `elementwise` selects the `In` builder
+ // from it — so it lives beside that door and this recogniser names the same type rather than a
+-// parallel one that would have to be mapped across the boundary.
+-use super::lower_ktir_to_superdsc::BcastAxis;
++// parallel one that would have to be mapped across the boundary. The CONVERT KIND is the same
++// trade for a dtype-convert: the emission door's own vocabulary, not a `Program` variant.
++use super::lower_ktir_to_superdsc::{BcastAxis, ConvertKind};
+ use crate::placement::BundleLayout;
++use crate::superdsc_opspec::Df;
+ use crate::work::DeviceWidth;
+ 
+ /// THE SILU LONGHAND, as the ONE fused op it is — `out = silu(gate) · up`.
+@@ -968,6 +971,12 @@ enum Lowering {
+     /// for the Scale convention. See [`program_rmsnorm_chains`] for why fusing it is the fix and
+     /// filling the scale registry was not.
+     RmsNorm(f32, Option<f32>),
++    /// A dtype-CONVERT cast — `arith.extf` f16→f32 (`dl16tofp32`) or `arith.fptosi` f32→i32
++    /// (`fp32toint32`) — the vendor's own convert `OpFunc`s, 1:1 in (op kind, element pair).
++    /// Local rather than a `Program` variant for the same reason `Reduce` is: a bare convert is
++    /// reachable only through this walk, and `Program` is matched exhaustively by consumers
++    /// outside this crate. See [`convert_kind_of`] for the discriminator and what it refuses.
++    Convert(ConvertKind),
+ }
+ 
+ /// THE `Elementwise(Mul)` / `ScalarMul` TIEBREAK, read off ONE op rather than the whole function.
+@@ -1131,6 +1140,185 @@ pub fn reduce_kind_of(op: &ktir_core::ir::Operation<'static>) -> Option<ReduceKi
+     })
+ }
+ 
++/// THE CONVERT A CAST NAMES, where the naming is 1:1 in (op kind, element pair).
++///
++/// ⭐ NOT IN [`program_of`] for the same reason [`reduce_kind_of`] is not: `program_of` takes an
++/// `OpKind` alone, and `OpKind::ArithExtf` says "a widening cast happens here" without saying
++/// WHICH — `extf` f16→f32 is `dl16tofp32`, an `extf` f16→f32 over an INTEGER target is a
++/// different op with no recipe. The element pair is read off the op's own types, so nothing is
++/// stapled to the program a third party must restate.
++///
++/// The two recipes are the vendor's own convert `OpFunc`s, and they are the KSPLIT fp32 island's
++/// two ends: `dl16tofp32` widens an fp16 stick to same-stick fp32 (the multiply-add's entrance —
++/// ⛔ an fp16 value MUST stage through it on the way to an integer, because `Fp32ToInt32`'s DDL
++/// slice law refuses a direct fp16→u32 pairing), and `fp32toint32` re-sticks an IEEE fp32 word
++/// as a SENUINT32 index (the exit).
++///
++/// ⛔ EVERY OTHER PAIR IS A NAMED REFUSAL, NOT A FALLTHROUGH. An `extf`/`fptosi` that reaches
++/// this function with a pair outside the two recipes returns `Err` here — naming the op, the
++/// operand's element and the result's — rather than `Ok(None)`, because `Ok(None)` would hand it
++/// to the generic "no 1:1 `Program`" refusal whose message cannot say WHICH converts this door
++/// does lower. A producer spelling `extf` f32→f16 (the narrow-back, `fp32todl16`) is told that
++/// here; it is not lowered as the nearest convert, which would silently re-stick at the wrong
++/// width.
++fn convert_kind_of(
++    f: &IRFunction<'static>,
++    op: &ktir_core::ir::Operation<'static>,
++) -> Result<Option<ConvertKind>, Error> {
++    if !matches!(op.op_type, OpKind::ArithExtf | OpKind::ArithFptosi) {
++        return Ok(None);
++    }
++    // The operand's element type, read off its DEFINING op's result type — the same lookup
++    // `splat_scale_of`'s `def_of` makes, top-level, because a cast's operand is a value this
++    // function computed or loaded, never a region interior.
++    let elem_of = |v: Ssa| {
++        f.operations
++            .iter()
++            .find(|o| o.result == Some(v))
++            .and_then(|o| o.result_type)
++            .and_then(|t| t.elem())
++    };
++    let [operand] = op.operands[..] else {
++        return err(format!(
++            "{}: `{:?}` states {} operands — a dtype-convert reads exactly one",
++            f.name,
++            op.op_type,
++            op.operands.len()
++        ));
++    };
++    let in_elem = elem_of(operand);
++    let out_elem = op.result_type.and_then(|t| t.elem());
++    match (op.op_type, in_elem, out_elem) {
++        (OpKind::ArithExtf, Some(DType::F16), Some(DType::F32)) => {
++            Ok(Some(ConvertKind::Dl16ToFp32))
++        }
++        (OpKind::ArithFptosi, Some(DType::F32), Some(DType::I32)) => {
++            Ok(Some(ConvertKind::Fp32ToInt32))
++        }
++        _ => err(format!(
++            "{}: `{:?}` {:?} → {:?} is not one of the dtype-converts this door lowers. The \
++             device's convert OpFuncs spell exactly two recipes reachable from a Triton kernel: \
++             `arith.extf` f16 → f32 (`dl16tofp32`, the fp32 island's entrance) and \
++             `arith.fptosi` f32 → i32 (`fp32toint32`, its exit — an fp16 value must stage \
++             through the widen first; the direct fp16→u32 cast is DDL-refused). Any other pair \
++             is a producer form refused by name rather than lowered as the nearest convert",
++            f.name, op.op_type, in_elem, out_elem
++        )),
++    }
++}
++
++/// THE BUFFER FORMAT an op's result type names.
++///
++/// F16 and F32 are the fp16/fp32 sticks; I32 is SENUINT32 — the 4-byte/32-stick index format
++/// that is `fp32toint32`'s own output. A STATED type with none of those mappings (a bool, an
++/// i64, an fp8 result) is refused BY NAME: silently defaulting to fp16 would reserve HALF the
++/// bytes an f32 intermediate needs (the footprint guard refuses the first over-run, or without
++/// it the next intermediate is aliased onto it) and mis-stick every descriptor over it.
++///
++/// ⭐ AN UNSTATED type keeps the door's historical fp16 basis. `Operation::new` defaults
++/// `result_type` to `None`, and a hand-built IR (the unit tests' minimal programs) states no
++/// type at all — every op the real pipeline emits carries one, so `None` here is an omitted
++/// annotation, not a fact to refuse, and the only behavior-preserving reading is the fp16 basis
++/// every one of those programs was lowered under before the format became readable here.
++fn result_df_of(name: &str, op: &ktir_core::ir::Operation<'static>) -> Result<Df, Error> {
++    match op.result_type.and_then(|t| t.elem()) {
++        None => Ok(Df::Fp16),
++        Some(DType::F16) => Ok(Df::Fp16),
++        Some(DType::F32) => Ok(Df::Fp32),
++        Some(DType::I32) => Ok(Df::SenUint32),
++        Some(other) => err(format!(
++            "{name}: `{:?}`'s result element type is {other:?}, which has no buffer format this \
++             door mints — an intermediate of that dtype has no stick basis to reserve or address. \
++             It is refused by name rather than defaulted to fp16, which would reserve the wrong \
++             width and mis-stick every descriptor over it",
++            op.op_type
++        )),
++    }
++}
++
++/// The equality-mask folds: each retype's result → the comparison's own two operands, plus the
++/// i1 results the fold consumed (skipped at the walk's loop top, beside the chain interiors).
++struct EqualMasks {
++    by_retype: std::collections::HashMap<Ssa, (Ssa, Ssa)>,
++    consumed: std::collections::HashSet<Ssa>,
++}
++
++/// ⭐⭐⭐ THE EQUALITY MASK — `arith.cmpf(oeq)` retyped by `arith.uitofp`, folded to ONE
++/// `Elementwise(Equal)`.
++///
++/// # WHY THIS RECOGNISER EXISTS AT ALL, AND WHY IT IS NOT AN EXCEPTION TO THE MODULE HEADER
++///
++/// The device HAS the primitive: `OpFunc::Equal` (`broadcast_ops.ddl:41`) realizes `a == b` as
++/// an fp16 0.0/1.0 TENSOR — `EQUAL` into a BOOL state reg, then `SELECT(plus1, zero)` — the
++/// same arity-2 broadcast-op family as `maximum`/`minimum`. KTIR has no op for that: the
++/// comparison is `arith.cmpf` (an i1) and the 0/1 tensor is a SEPARATE `arith.uitofp` retype,
++/// because an i1 cannot ride the fp16 stick. So the two-op spelling is the only one a producer
++/// HAS — the same argument that admits the silu longhand ([`program_silu_mul_chains`]): the
++/// device's op exists and the IR cannot name it in one op, and lowering the pair op-by-op would
++/// emit a form the pointwise family does not have (a bool-typed compare with no stick) rather
++/// than a slower lowering of the same function. The fold is the 1:1 map: `cmpf(oeq)` +
++/// `uitofp`→f16 IS `Elementwise(Equal)` over the cmpf's own two operands.
++///
++/// # ⛔ WHAT IS REFUSED RATHER THAN GUESSED
++///
++/// * the predicate must be `oeq` — `OpFunc::Equal` is EQUALITY (NaN compares FALSE on the SFP
++///   unit, matching the ordered compare), and any other predicate is a DIFFERENT function this
++///   fold must not silently re-mean. An unfolded `cmpf` — any other predicate, or one whose sole
++///   reader is not the retype — is left alone and reaches the walk's by-name refusal, which
++///   names `ArithCmpf`.
++/// * the retype's target must be F16 — the device op's wire-level result IS the fp16 0/1 tensor
++///   (`SELECT(plus1, zero)`), so a `uitofp` to any other width is left alone rather than
++///   re-emitted at the wrong format.
++/// * the `cmpf`'s i1 result must have exactly ONE consumer, the retype — the fold DESTROYS the
++///   i1 value (the device op never materialises it), so a second reader would read a value
++///   nothing writes. The same seal the silu recogniser states for its longhand interior.
++///
++/// Returns the folds ([`EqualMasks`]): each `uitofp` result → the `cmpf`'s two operands, and the
++/// i1 results the fold consumed.
++fn program_equal_masks(f: &IRFunction<'static>) -> Result<EqualMasks, Error> {
++    let mut masks = EqualMasks {
++        by_retype: std::collections::HashMap::new(),
++        consumed: std::collections::HashSet::new(),
++    };
++    let deep = f.ops_deep();
++    for op in deep
++        .iter()
++        .copied()
++        .filter(|o| o.op_type == OpKind::ArithCmpf)
++    {
++        let Some(res) = op.result else { continue };
++        // THE PREDICATE IS THE FUNCTION: ordered equality is `OpFunc::Equal`'s own semantics.
++        let oeq = op
++            .attributes
++            .iter()
++            .any(|(k, v)| matches!((k, v), (AttrKey::Predicate, Attr::Str(s)) if *s == "oeq"));
++        if !oeq {
++            continue;
++        }
++        let [a, b] = op.operands[..] else { continue };
++        // ⛔ EXACTLY ONE READER, AND IT IS THE RETYPE — see the seal above.
++        let mut consumers = deep.iter().copied().filter(|o| o.operands.contains(&res));
++        let Some(u) = consumers.next() else { continue };
++        if consumers.next().is_some() || u.op_type != OpKind::ArithUitofp || u.operands != [res] {
++            continue;
++        }
++        // ⛔ THE RETYPE'S TARGET IS F16 — the device op's wire result is the fp16 0/1 tensor.
++        if !matches!(
++            u.result_type,
++            Some(ktir_core::irtype::IrType::Tensor {
++                elem: DType::F16,
++                ..
++            })
++        ) {
++            continue;
++        }
++        let Some(u_res) = u.result else { continue };
++        masks.by_retype.insert(u_res, (a, b));
++        masks.consumed.insert(res);
++    }
++    Ok(masks)
++}
++
+ /// Is this op addressing or bookkeeping rather than computation?
+ fn is_plumbing(op: OpKind) -> bool {
+     matches!(
+@@ -2579,7 +2767,11 @@ pub fn lower_function(
+     // THE BROADCAST PLUMBING, read before the walk for the same reason: these ops lower to NOTHING and
+     // the consumer carries the broadcast as an operand mode. See [`program_broadcast_chains`].
+     let (bcasts, bcast_consumed) = program_broadcast_chains(f)?;
+-    // ⭐⭐⭐ THE GATHERS THE PROGRAM STATES, read ONCE and from [`gathers_of`] — the same joins the
++    // THE EQUALITY MASKS, read before the walk for the same reason the silus are: the device's
++    // `OpFunc::Equal` is ONE op and KTIR spells it as two (`cmpf` + `uitofp`), so the comparison
++    // is chain-interior and the RETYPE is the terminal this walk lowers. See
++    // [`program_equal_masks`].
++    let equal_masks = program_equal_masks(f)?; // ⭐⭐⭐ THE GATHERS THE PROGRAM STATES, read ONCE and from [`gathers_of`] — the same joins the
+     // per-`Program` door's `gather_of` makes, so the two doors cannot disagree about which parameter
+     // is the table or which is the index. A program with ONE indirect tile reads identically to
+     // `gather_of`; a program with SEVERAL is either the unrolled-sweep shape (every tile over the
+@@ -2625,6 +2817,9 @@ pub fn lower_function(
+                 || rmsnorms.iter().any(|c| c.consumed.contains(&r))
+                 // The expand/collapse/broadcast chain itself: no descriptor, the consumer states it.
+                 || bcast_consumed.contains(&r)
++                // An equality mask's `arith.cmpf`: the fold destroyed the i1, and the `uitofp`
++                // terminal below stands for the pair.
++                || equal_masks.consumed.contains(&r)
+                 // An fp8 dot's absorbed scale mulf: it rode into the dot's emission above.
+                 || fp8_epilogue.contains(&r)
+                 // A row-folded family's non-leader block: the leader's one whole-view descriptor
+@@ -2668,6 +2863,20 @@ pub fn lower_function(
+         // An rmsnorm chain's TERMINAL gain multiply becomes the one fused program. Checked before the
+         // splat arm and before the 1:1 map, both of which would otherwise claim it.
+         let rms = rmsnorms.iter().find(|c| op.result == Some(c.out));
++        // AN EQUALITY MASK'S RETYPE is the fold's terminal: the `Elementwise(Equal)` stands for the
++        // `cmpf(oeq)`+`uitofp` pair, and its inputs are the comparison's own operands (resolved
++        // below). Checked before the 1:1 map, which has no `ArithUitofp` arm — an unfolded retype
++        // falls to the by-name refusal, correctly.
++        let equal = (op.op_type == OpKind::ArithUitofp)
++            .then(|| {
++                op.result
++                    .and_then(|r| equal_masks.by_retype.get(&r).copied())
++            })
++            .flatten();
++        // A dtype-convert cast, 1:1 in (op kind, element pair) — see [`convert_kind_of`]. `Err` for
++        // an `extf`/`fptosi` whose pair is outside the two recipes (the named refusal lives there);
++        // `None` for every other op kind, which falls through to the 1:1 map.
++        let convert = convert_kind_of(f, op)?;
+         let Some(program) = terminal
+             .map(|c| {
+                 if c.up.is_some() {
+@@ -2684,6 +2893,8 @@ pub fn lower_function(
+             .or(reduce.map(Lowering::Reduce))
+             .or(scalar.map(|(v, _)| Lowering::ScalarMul(v)))
+             .or(bound_scale.map(Lowering::BoundScalarMul))
++            .or(equal.map(|_| Lowering::Node(Program::Elementwise(Elementwise::Equal))))
++            .or(convert.map(Lowering::Convert))
+             .or_else(|| program_of(op.op_type).map(Lowering::Node))
+         else {
+             return err(format!(
+@@ -2694,6 +2905,14 @@ pub fn lower_function(
+             ));
+         };
+ 
++        // ⭐ THE OP'S OWN RESULT FORMAT, read off the result type and never assumed: every op this
++        // door had lowered before the fp32 island is fp16, and the island's multiply-add states
++        // F32. It is threaded to the MINT (the intermediate reserves the ACTUAL dtype's width —
++        // an f32 buffer at an fp16 reservation is half the bytes, aliased onto the next tensor)
++        // and to the ELEMENTWISE EMISSION (the stick basis and `dataFormat_` are the dtype's own
++        // facts). Read once here so no consumer re-derives it and drifts.
++        let op_df = result_df_of(f.name, op)?;
++
+         // THE WEIGHT'S ORIENTATION, PROVEN FROM THE MAPS before any extent is trusted. See
+         // [`BOrient`]: the extent guards downstream cannot distinguish the two framings when
+         // k == n, so a square weight would otherwise lower to a descriptor contracting the other
+@@ -2719,6 +2938,9 @@ pub fn lower_function(
+             Lowering::ScalarMul(_) | Lowering::BoundScalarMul(_) => 1,
+             // x and gamma; the epsilon, `1/cols` and the oneplus offset are the fused body's own.
+             Lowering::RmsNorm(..) => 2,
++            // A dtype-convert reads ONE tensor; the formats ride the `OpFunc`
++            // (`convert_dtypes`), never the operand list.
++            Lowering::Convert(_) => 1,
+             Lowering::Node(Program::Matmul) => 2,
+             Lowering::Node(Program::Elementwise(e)) => {
+                 match super::lower_ktir_to_superdsc::elementwise_op_func(f.name, e) {
+@@ -2738,6 +2960,13 @@ pub fn lower_function(
+                 let c = rms.expect("just matched");
+                 vec![c.x, c.gamma]
+             }
++            // THE EQUALITY MASK's inputs are the comparison's own two operands, not the retype's
++            // (the retype reads the i1 the fold destroys). The broadcast resolution below then
++            // applies to them exactly as it would to a spelled two-tensor op's.
++            _ if equal.is_some() => {
++                let (a, b) = equal.expect("just matched");
++                vec![a, b]
++            }
+             (Some(c), _, _) => match c.up {
+                 Some(up) => vec![c.gate, up],
+                 // The bare form's one input is the gate; the divide's other operand is the
+@@ -3342,7 +3571,13 @@ pub fn lower_function(
+                 }
+                 _ => dims,
+             };
+-            layout.synth(crate::place::PlaceId::Act(tid), &dev_dims);
++            // ⭐ THE MINT RESERVES THE OP'S OWN RESULT FORMAT — `synth` is `synth_df(Fp16)`, and
++            // an f32 intermediate (the widen island's multiply-add results) at an fp16
++            // reservation is HALF the bytes the emission writes: the footprint guard would
++            // refuse the first over-run, or without it the next intermediate would be aliased.
++            // `synth_df` reserves the true width, the same fact `pointwise_broadcast_opspec_df`
++            // threads into the descriptors.
++            layout.synth_df(crate::place::PlaceId::Act(tid), &dev_dims, op_df);
+             let r = Region {
+                 tid,
+                 v_rows: dims[0],
+@@ -3370,6 +3605,7 @@ pub fn lower_function(
+                     b_orient,
+                     gather: op_gather.map(|(g, _, _)| g),
+                     bcast: &bcast_axes,
++                    df: op_df,
+                 },
+             )?;
+             out.append(&mut emitted);
+@@ -3416,6 +3652,7 @@ pub fn lower_function(
+                 b_orient,
+                 gather: op_gather.map(|(g, _, _)| g),
+                 bcast: &bcast_axes,
++                df: op_df,
+             },
+         )?;
+         out.append(&mut emitted);
+@@ -3493,6 +3730,11 @@ struct WalkProof<'a> {
+     /// [`program_broadcast_chains`]) — positional with `per_op`'s inputs, empty when no operand is
+     /// broadcast.
+     bcast: &'a [Option<BcastAxis>],
++    /// THE OP'S OWN RESULT FORMAT, read off the result type ([`result_df_of`]) — `Fp16` for every
++    /// op this door lowered before the fp32 island, `Fp32` on the island's multiply-add. Read by
++    /// the `Elementwise` arm, which states it on the tile and every `TensorArg`; unread by the
++    /// arms whose formats ride other facts (the convert's ride its `OpFunc`).
++    df: Df,
+ }
+ 
+ /// Hand ONE op's regions to the body its `Program` names.
+@@ -3513,6 +3755,7 @@ fn emit_one(
+         b_orient,
+         gather,
+         bcast,
++        df,
+     } = proof;
+     // THE FUSED SILU. Reached only through [`program_silu_mul_chains`], which PROVED the five-op
+     // longhand; `per_op` is `[gate, up, out]`, which is the parameter order `silumul`'s own
+@@ -3572,6 +3815,13 @@ fn emit_one(
+                 layout,
+             );
+         }
++        // A DTYPE-CONVERT — one input, one output, both the RowBlocked token stream, the formats
++        // riding the `OpFunc` through `convert_dtypes`. The same `assemble_convert` body the fp8
++        // quantiser's tail and the KSPLIT pair's own device recipe use, so the doors cannot
++        // drift about what a convert emits.
++        Lowering::Convert(kind) => {
++            return super::lower_ktir_to_superdsc::convert(name, kind, per_op, sym_id_base, layout);
++        }
+         Lowering::Node(p) => p,
+     };
+     Ok(match program {
+@@ -3613,9 +3863,15 @@ fn emit_one(
+                 },
+             )?
+         }
+-        Program::Elementwise(e) => {
+-            super::lower_ktir_to_superdsc::elementwise(name, e, per_op, bcast, sym_id_base, layout)?
+-        }
++        Program::Elementwise(e) => super::lower_ktir_to_superdsc::elementwise_df(
++            name,
++            e,
++            per_op,
++            bcast,
++            df,
++            sym_id_base,
++            layout,
++        )?,
+         Program::Transpose => {
+             super::lower_ktir_to_superdsc::transpose(name, per_op, sym_id_base, layout)?
+         }
+diff --git a/crates/targets/spyre/ktir/ktir-superdsc/src/ktir_node.rs b/crates/targets/spyre/ktir/ktir-superdsc/src/ktir_node.rs
+index 20a251ac06..d45b952cee 100644
+--- a/crates/targets/spyre/ktir/ktir-superdsc/src/ktir_node.rs
++++ b/crates/targets/spyre/ktir/ktir-superdsc/src/ktir_node.rs
+@@ -101,6 +101,11 @@ pub enum Elementwise {
+     Maximum,
+     /// `min(a, b)`. Live on card already via the fp8 quantiser's clamp (`ktir_matmul_fp8.rs`).
+     Minimum,
++    /// `a == b` as 0/1 fp16. `OpFunc::Equal`, dxp `"equal"` — the vendor realizes it as `EQUAL`
++    /// into a BOOL state reg then `SELECT(plus1, zero)` (`broadcast_ops.ddl:41`), so the
++    /// wire-level result IS fp16 0.0/1.0, the same arity-2 broadcast-op shape as
++    /// `maximum`/`minimum`. NaN compares FALSE, matching the emulator's ordered `cmpf oeq`.
++    Equal,
+ }
+ 
+ impl Elementwise {
+@@ -128,6 +133,7 @@ impl Elementwise {
+         Elementwise::RealDiv,
+         Elementwise::Maximum,
+         Elementwise::Minimum,
++        Elementwise::Equal,
+     ];
+ }
+ 
+@@ -197,6 +203,17 @@ pub enum Program {
+     Reshape,
+     ScalarMul,
+     Matmul,
++    /// The greedy vocab scan — `kernels/argmax.py`: the FIRST-maximum index of one
++    /// `[1, PAD_V]` logits row, as the `[1, 64]` i32 idx stick. ELEVEN tensor
++    /// parameters (the row, the nine staged tables that are functions of the vocab
++    /// alone — the seventh carries the pad law's offset row, the eighth and ninth
++    /// are the two-level ramp's group pair — and the output stick);
++    /// the body is whole-row `tt.reduce` maxima,
++    /// equality compares and staged-table multiplies over generic ops, with one
++    /// fp32 island for the wide combine. The door reads NO fact off this program —
++    /// no epsilon, no scale, no geometry: the tables ride as ordinary tensor
++    /// operands — so its arm is the plain `whole_function::lower_function` route.
++    ArgMax,
+     /// The last-row extraction half of an lm-head tail — see [`KtirNode::node_out_tid`].
+     LmLast,
+     Rope,
+diff --git a/crates/targets/spyre/ktir/ktir-superdsc/src/placement.rs b/crates/targets/spyre/ktir/ktir-superdsc/src/placement.rs
+index b9df7531d2..dfcb618106 100644
+--- a/crates/targets/spyre/ktir/ktir-superdsc/src/placement.rs
++++ b/crates/targets/spyre/ktir/ktir-superdsc/src/placement.rs
+@@ -328,6 +328,26 @@ pub struct BundleLayout {
+     /// [`PagedKvPool::request_stride`]: crate::sdsc_abstract::PagedKvPool::request_stride
+     #[serde(default)]
+     pub kv_request_stride_bytes: u64,
++    /// ⭐ THE GRAPH'S OWN CALLER-FILLED SOURCE COUNT — ids `0..num_sources` are host-filled every
++    /// forward, and the runtime's completeness check (`Executor::require_sources_filled`) walks
++    /// exactly that range. Stamped on the LAYOUT because the count is GRAPH-LOCAL: the argmax
++    /// mint inserts its seven staged tables at `[num_sources, num_sources+7)` of the ONE-REQUEST
++    /// graph, so the minted wiring's count is seven higher than an unminted rung's, and a session
++    /// built on another graph's number walks ids its own bundle never defined — the seven extra
++    /// ids canceling against seven minted table ids is correctness by coincidence, the same class
++    /// as the `SegRole::Logits` re-point. Every session reads the count off the bundle it
++    /// actually runs.
++    #[serde(default)]
++    pub num_sources: u32,
++    /// ⭐ THE SOURCES NO PER-STEP BIND FILLS — the prefix-KV caches (the pool and the device's
++    /// own cachewr write them) and the load-time constant tables (the owner session binds them
++    /// once at load). The runtime's completeness check excuses exactly these ids, so the list is
++    /// stamped where the graph itself is: derived from the same nodes the wiring's `layers` and
++    /// `load_consts` lists derive from, and asserted inside `0..num_sources` at the stamp — an id
++    /// at or past the count would excuse a REAL source and turn a refused launch into a silent
++    /// read of unfilled memory.
++    #[serde(default)]
++    pub resident_source_tids: Vec<u32>,
+ }
+ 
+ /// Bump allocator for synthetic-intermediate offsets within the Intermediate
+diff --git a/crates/targets/spyre/ktir/ktir-superdsc/src/superdsc_opspec.rs b/crates/targets/spyre/ktir/ktir-superdsc/src/superdsc_opspec.rs
+index 020f7c46d2..f01807c1a9 100644
+--- a/crates/targets/spyre/ktir/ktir-superdsc/src/superdsc_opspec.rs
++++ b/crates/targets/spyre/ktir/ktir-superdsc/src/superdsc_opspec.rs
+@@ -1596,7 +1596,15 @@ pub enum OpFunc {
+     /// broadcast.
+     Where3,
+     /// ⭐⭐⭐ `topkindex` / `topkvalue` — the vendor's fused top-k PAIR (`topk.ddl`), the k largest
+-    /// with slots DESCENDING (slot 0 = the max), ties keeping the FIRST index among equals.
++    /// with slots DESCENDING (slot 0 = the max), ties keeping the LAST index among equals — the
++    /// ripple's compare is `state = GREATERTHAN(running, candidate)` with
++    /// `val = SELECT(state, running, candidate)` (`topk.ddl:180-181`), so a candidate EQUAL to the
++    /// running max makes `state` false and DISPLACES it: the later scan position wins. (An earlier
++    /// revision of this comment claimed the FIRST index — a doc-only claim the fixture tests never
++    /// executed, since a fixture JSON carries descriptors, not values; `moe.py`'s own ripple note
++    /// — "among equal values the later scan position first" — was the correct reading all along.
++    /// ⛔ CONSEQUENCE FOR THE SAMPLER: `topkindex` at k=1 is LAST-max argmax, which violates
++    /// #631's first-max law — the greedy decode door rung may NOT lower first-max to this pair.)
+     /// `topkindex` emits the `[.., k]` indices, `topkvalue` the `[.., k]` values at those indices —
+     /// the pair the graph compiler's fission produces (`nodeFissionFusion.cpp:6542+` fissures a
+     /// "TopK" into "TopKValue"+"TopKIndex"), and the optimizer's own decomposition law

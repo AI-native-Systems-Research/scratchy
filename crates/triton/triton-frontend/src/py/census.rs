@@ -69,6 +69,15 @@ pub const TL_FUNCTIONS: &[&str] = &[
     // idiom). Only the scalar form is lowered; a pointer TILE load is refused downstream
     // (`refuse_raw_tile_access`), and here at the semantic layer.
     "load",
+    // Not in the five-fixture census: the on-card Gumbel noise's `g = -log(-log(u))`
+    // (front-b-noise, auditor order 2026-10-26). Both spellings, like `rsqrt`/`tanh`:
+    // `math.py`'s `log` is re-exported into `tl` by `language/__init__.py`, so `tl.log`
+    // and `tl.math.log` reach the same `create_log`. The semantic layer routes it
+    // through `math_unary` (the f32 width gate applies, like every `math.*` unary),
+    // and the TTIR spelling is `math.log` — NOT `log2`: the card's `log` opFunc is the
+    // target and a log2·ln2 rescale is a different rounding.
+    "log",
+    "math.log",
     "make_tensor_descriptor",
     "math.exp2",
     "max",

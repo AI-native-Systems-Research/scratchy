@@ -79,6 +79,18 @@ pub enum Elementwise {
     // ── UNARY (`OpFunc` + `op_func_from_str` arm already existed for every one) ──
     /// `e^x`. Live on card already via the attention softmax (`attn.rs`).
     Exp,
+    /// `ln(x)`. The card's own `log` opFunc (`OpFuncs::LOG_FWD`, `arch_enums.cpp`) —
+    /// the on-card Gumbel noise's `g = -log(-log(u))` (front-b-noise, auditor order
+    /// 2026-10-26). Reached only from the whole-function walk over a Triton
+    /// program's `math.log`; a `Program::Elementwise(Log)` producer would state it
+    /// directly the way an `Exp` one does.
+    Log,
+    /// `-x`. The card's own `neg` opFunc (`OpFuncs::NEG`, `arch_enums.cpp`) — the
+    /// on-card Gumbel noise's `g = -log(-log(u))` negates twice around the inner
+    /// log (front-b-noise, auditor order 2026-10-26). Reached from the
+    /// whole-function walk over a Triton program's `arith.negf` once the silu
+    /// longhand recogniser stops claiming every negf as its own.
+    Neg,
     /// `1/√x`. Live on card already via the rms normalisation (`rmsnorm.rs`).
     Rsqrt,
     /// `√x`.
@@ -129,6 +141,8 @@ impl Elementwise {
         Elementwise::GeluErf,
         Elementwise::Sub,
         Elementwise::Exp,
+        Elementwise::Log,
+        Elementwise::Neg,
         Elementwise::Rsqrt,
         Elementwise::Sqrt,
         Elementwise::Abs,
@@ -210,21 +224,24 @@ pub enum Program {
     ScalarMul,
     Matmul,
     /// The token draw — `kernels/sample_fwd.py`: the FIRST-maximum index of
-    /// `logits·inv_T + g` over each row's `[1, PAD_V]` padded span, as that
-    /// row's `[1, 64]` i32 idx stick. THIRTEEN tensor parameters — the row,
-    /// its NOISE row and its temperature reciprocal (the three PER-ROW
-    /// operands: `[B, PAD_V]`, `[B, PAD_V]`, `[B, 1]`), the nine staged
-    /// tables that are functions of the vocab alone (the pad law's offset
-    /// row, the two-level ramp's three decreasing tables, the three
-    /// increasing index tables, the ones and sixtyfour widen tables), and
-    /// the output stick. The body is whole-row `tt.reduce` maxima, equality
-    /// compares and staged-table multiplies over generic ops, with the whole
-    /// selection IN F32 (the score is a sum; f16's 10-bit mantissa would
-    /// round near-ties into ties the reference never sees) and one fp32
-    /// island for the wide combine. The door reads NO fact off this program
-    /// — no epsilon, no scale, no geometry: the tables and the per-row
-    /// operands ride as ordinary tensor operands — so its arm is the plain
-    /// `whole_function::lower_function` route, exactly ArgMax's (#813).
+    /// `xm·inv_T + g·gate` over each row's `[1, PAD_V]` padded span, as that
+    /// row's `[1, 64]` i32 idx stick. TWENTY-FOUR tensor parameters — the row,
+    /// its SEED quintuple and its temperature reciprocal (the three PER-ROW
+    /// operands: `[B, PAD_V]` f32, `[B, 5]` si32, `[B, 1]` f32), the twenty
+    /// staged tables that are functions of the vocab alone (the pad law's
+    /// offset row, the two-level ramp's three decreasing tables, the three
+    /// increasing index tables, the ones and sixtyfour widen tables, then the
+    /// noise section's own eleven — the four i32 hash/fold constants, the
+    /// lane table, the fold's five f32 constants, the fp16 island's clamp),
+    /// and the output stick. The body is whole-row `tt.reduce` maxima,
+    /// equality compares and staged-table multiplies over generic ops, with
+    /// the whole selection IN F32 (the score is a sum; f16's 10-bit mantissa
+    /// would round near-ties into ties the reference never sees), the noise
+    /// a wrapping-i32 counter hash through the wrap-fold and the fp16-island
+    /// Gumbel (the card's only log is fp16). The door reads NO fact off this
+    /// program — no epsilon, no scale, no geometry: the tables and the
+    /// per-row operands ride as ordinary tensor operands — so its arm is the
+    /// plain `whole_function::lower_function` route, exactly ArgMax's (#813).
     Sample,
     /// The last-row extraction half of an lm-head tail — see [`KtirNode::node_out_tid`].
     LmLast,

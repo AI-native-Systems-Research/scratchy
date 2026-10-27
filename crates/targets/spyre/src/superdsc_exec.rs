@@ -1809,12 +1809,15 @@ impl Executor {
     /// The fp32-verbatim vs fp16-convert choice keys off the ENTRY'S OWN
     /// dtype, never off the op that minted it: a resident fp32 constant's LE
     /// bytes are the device's own (`Df::Fp32` = IEEE_FP32 —
-    /// [`Self::bind_const_fp32`]), and everything else rides the weight
-    /// channel's IEEE→SEN convert ([`Self::bind_weight`]), bit-exact for every
-    /// value a staged table states. An entry whose tid is a graph OUTPUT
-    /// simply binds that output's initial bytes into its
-    /// own placement — the ops that overwrite it per step do so over these
-    /// bytes, exactly as the card behaves.
+    /// [`Self::bind_const_fp32`]), and i32 rides the SAME verbatim channel
+    /// (`Df::SenUint32` shares IEEE_FP32's 4-byte/32-stick geometry, so the
+    /// LE words ARE the device encoding — the hash constants' own width),
+    /// while everything else rides the weight channel's IEEE→SEN convert
+    /// ([`Self::bind_weight`]), bit-exact for every value a staged table
+    /// states. An entry whose tid is a graph OUTPUT simply binds that
+    /// output's initial bytes into its own placement — the ops that
+    /// overwrite it per step do so over these bytes, exactly as the card
+    /// behaves.
     pub fn bind_load_consts(&mut self, consts: &[(u32, crate::wiring::LoadConst)]) -> Result<()> {
         if self.prepared {
             bail!(
@@ -1825,7 +1828,10 @@ impl Executor {
         for &(tid, kind) in consts {
             let (bytes, dt, _shape) = kind.build();
             let id = bundle::PlaceId::Act(tid);
-            if matches!(dt, scratchy_tensors::DType::F32) {
+            if matches!(
+                dt,
+                scratchy_tensors::DType::F32 | scratchy_tensors::DType::I32
+            ) {
                 self.bind_const_fp32(id, bytes)?;
             } else {
                 self.bind_weight(id, bytes);

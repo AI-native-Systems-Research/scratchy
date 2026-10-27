@@ -907,8 +907,8 @@ pub struct Wiring {
     /// derivation free to disagree with the mint (the `weight_copies` one-mint
     /// law). The class is the source gate's own spelling too: the seat's tids
     /// count as filled ONLY when bound THIS STEP — a decode launch without a
-    /// fresh noise/inv_t bind REFUSES LOUDLY (the PrefixMask precedent), never
-    /// a held default, because a held noise row is a held TOKEN — every
+    /// fresh seed/inv_t bind REFUSES LOUDLY (the PrefixMask precedent), never
+    /// a held default, because a held seed row is a held TOKEN — every
     /// subsequent draw would repeat the same pick wherever temperature was
     /// live. `None` on every rung that mints no draw (prefill rungs, host-sampled
     /// emulators), and a `None` on a rung the worker samples through is a
@@ -988,11 +988,12 @@ pub enum ChainFact {
 /// choosing fp32-verbatim vs fp16-convert off the ENTRY'S OWN dtype.
 #[derive(Clone, Copy, Debug)]
 pub enum LoadConst {
-    /// One of the sampler's nine operand tables, by the kernel's operand order
-    /// (the table's own position among the node's table inputs — the row, the
-    /// noise and the temperature precede them and are never load constants).
-    /// Bytes from [`sample_staged_tables`] — the one derivation every stager
-    /// reads, so a table defect cannot hide on one leg only. `arrangement` is
+    /// One of the sampler's twenty operand tables, by the kernel's operand
+    /// order (the table's own position among the node's table inputs — the
+    /// row, the seed and the temperature precede them and are never load
+    /// constants). Bytes from [`sample_staged_tables`] — the one derivation
+    /// every stager reads, so a table defect cannot hide on one leg only.
+    /// `arrangement` is
     /// the BAKE'S OWN propagation fact (the propagation pass `ktir_superdsc::emit::whole_function::staggered_sources`): the table the
     /// sampler's staggered pointwise island reads lane-for-lane is staged
     /// ALREADY IN ITS ARRANGEMENT ([`dl16tofp32_stagger`]) — `build()` is pure
@@ -1035,7 +1036,7 @@ impl LoadConst {
                 let (bytes, dt, shape) = sample_staged_tables(vocab)
                     .into_iter()
                     .nth((operand - 1) as usize)
-                    .expect("the mint emits operand 1..=9 — the registry's own row");
+                    .expect("the mint emits operand 1..=20 — the registry's own row");
                 let bytes = match (dt, arrangement) {
                     // The stagger is an f32-word-stream fact; an f16 table never carries it.
                     (scratchy_tensors::DType::F32, ElementArrangement::Dl16ToFp32) => {
@@ -1210,8 +1211,9 @@ const _: () = assert!(
      CopyDims::ENTRIES_PER_OP (the IBR ceiling) — one stick, two spellings"
 );
 
-/// ⭐ THE SAMPLER'S PER-STEP SEAT — the named class of the two sources the
-/// token draw reads FRESH EVERY DECODE STEP. Derived ONCE off the minted
+/// ⭐ THE SAMPLER'S PER-STEP SEAT — the named class of the six sources the
+/// token draw reads FRESH EVERY DECODE STEP (the seed quintuple's five word
+/// tables and inv_t). Derived ONCE off the minted
 /// `Sample` node ([`lower_subtile_tape_to_ktir::sample_seat_of_ir`], the same
 /// one-derivation law [`LoadConst`] rides) and carried on
 /// [`Wiring::sample_seat`]; the mint's own facts, never recomputed.
@@ -1219,22 +1221,27 @@ const _: () = assert!(
 /// ⛔ COUNTED AS FILLED ONLY WHEN BOUND THIS STEP. The source gate treats the
 /// seat's tids as a class apart from every other source: a weight is staged
 /// once at load, a load-const once at load, and an activation is bound before
-/// the launch that reads it — but the noise and inv_t go STALE the moment a
-/// step completes, because they are the step's own randomness. A decode
-/// launch without a fresh bind of BOTH REFUSES LOUDLY, the PrefixMask
-/// precedent, never a held default: a held noise row is a held TOKEN (every
-/// subsequent draw repeats the same pick wherever temperature is live), which
-/// is the silent-wrong-answer class the whole wiring exists to refuse.
+/// the launch that reads it — but the seed words and inv_t go STALE the
+/// moment a step completes, because the seed's step word is the step's own
+/// freshness. A decode launch without a fresh bind of EVERY SEAT OPERAND
+/// REFUSES LOUDLY, the PrefixMask precedent, never a held default: a held
+/// seed row is a held
+/// TOKEN (every subsequent draw repeats the same pick wherever temperature is
+/// live), which is the silent-wrong-answer class the whole wiring exists to
+/// refuse.
 #[derive(Clone, Copy, Debug)]
 pub struct SampleSeat {
-    /// The logits row's tid — the Sample node's inputs[0], placed by the rung
-    /// and readable by tid after the step (probe: is the sampler's input live?).
-    pub row: u32,
-    /// The noise source's tid — the rung's `[rows, PAD_V]` f32 Gumbel block,
-    /// staged EVERY STEP by the worker.
-    pub noise: u32,
+    /// The SEED WORD sources' tids — the five `[rows, 1]` i32 per-row word
+    /// tables of the quintuple `(seed_lo, seed_hi, step, greedy_gate, row)`,
+    /// in that order, each `invt`'s own class (one stick per row, the word
+    /// at the stick head), staged EVERY STEP by the worker (the noise itself
+    /// is computed on the card from them). Five tables, not one `[rows, 5]`:
+    /// the Col operand mode that broadcasts a word reads the stick head
+    /// ALONE (the int-bcast card leg's measured law), so every word rides
+    /// its own corner-free table — the auditor's wall-4 ruling (a).
+    pub seed_words: [u32; 5],
     /// The temperature reciprocal's tid — the rung's `[rows, 1]` f32 inv_t
-    /// column, staged every step with the noise.
+    /// column, staged every step with the seed words.
     pub invt: u32,
     /// The rung's OWN row count — the mint's own `rows` fact (the solo rung at
     /// 1, every batched rung at its baked width), the row count of both
@@ -1243,34 +1250,42 @@ pub struct SampleSeat {
     /// The EMITTED vocab — the row's own width, the sentinel threshold the
     /// consumer refuses past.
     pub vocab: u32,
-    /// `sample_pad_vocab(vocab)` — the width both per-row operands share.
+    /// `sample_pad_vocab(vocab)` — the width the f32 tables share.
     pub pad_vocab: u32,
-    /// ⭐ THE NOISE ROW'S ARRANGEMENT — the bake's own propagation fact
-    /// (the propagation pass `ktir_superdsc::emit::whole_function::staggered_sources`), stated as a CONST on the seat: the sampler's
-    /// staggered pointwise island reads the noise lane-for-lane, so the
-    /// per-step stager writes lane `i` at [`DL16TOFP32_PERMUTATION`]'s baked
-    /// index — the 64-entry const table, never a derivation. The worker
-    /// indexes the baked facts; it decides nothing. The inv_t is a `[rows, 1]`
-    /// column broadcast — one scalar per row, order-free — so it carries no
-    /// arrangement of its own.
-    pub noise_arrangement: ElementArrangement,
+    /// Every seed word table's ROW STRIDE in i32 words on the CARD — the
+    /// placement's own reservation law for a `[rows, 1]` SenUint32 table
+    /// (`row_footprint_bytes(1, SenUint32) / 4`, a whole 32-element u32
+    /// stick = 32 words, `invt`'s own stride), so the worker's per-row write
+    /// and the placement's per-row reservation cannot drift. The word of
+    /// row `r` in table `k` lands at word `r · seed_row_words` of that
+    /// table's region — the STICK HEAD the Col operand mode reads.
+    pub seed_row_words: u32,
 }
 
-/// ⭐ THE SAMPLER'S NINE STAGED TABLES — the kernel's own host contract
+/// ⭐ THE SAMPLER'S TWENTY STAGED TABLES — the kernel's own host contract
 /// (`kernels/sample_fwd.py`'s docstring), stated ONCE for every stager: the
 /// bake-time numeric gate and the worker's load-time staging read this same
 /// fn, so a table defect cannot hide on one leg only (the synth weights' own
 /// law). The tables are functions of the vocab alone, constant across decode
 /// steps, staged ONCE.
 ///
-/// ⭐ EVERY TABLE IS F32 — the selection's own dtype. The score is a sum
-/// `x·inv_t + g`; comparing it in f16 would round near-ties into ties the
+/// ⭐ THE SELECTION TABLES ARE F32 — the selection's own dtype. The score is a
+/// sum `x·inv_t + g`; comparing it in f16 would round near-ties into ties the
 /// host reference never sees, so the whole selection runs f32 and the tables
 /// state the SAME numbers the f16 argmax tables carried (#813's own values),
 /// re-stated in the wider dtype — exact integers either way.
 ///
+/// ⭐ THE NOISE SECTION'S ELEVEN ARE DTYPE-FAITHFUL TO THE KERNEL'S LOADS:
+/// `hc1`/`hc2`/`hc3`/`c256` are i32 (the hash's wrapping-integer class —
+/// SenUint32 shares IEEE_FP32's 4-byte geometry, so the staging is verbatim
+/// LE words), `lane` and the fold's five constants are f32, and `cmin` is
+/// fp16 (2^-14, the smallest normal — the clamp never leaves the fp16 stick;
+/// staged through the SEN convert like every fp16 weight, a REAL conversion
+/// since SEN169 ≠ IEEE binary16).
+///
 /// In the kernel's OPERAND ORDER — `bramp, lramp, binc, linc, ones, sixtyfour,
-/// padoff, gramp, ginc` — each entry is `(bytes, dtype, [rows, cols])`:
+/// padoff, gramp, ginc, hc1, hc2, hc3, c256, lane, fm8, ftop, fzero, fhalf,
+/// fm22, cmin` — each entry is `(bytes, dtype, [rows, cols])`:
 ///
 /// * `bramp` — strictly DECREASING in the block index WITHIN EACH GROUP and
 ///   PERIODIC across groups (`GROUP_BLOCKS - (b % GROUP_BLOCKS)`), so the
@@ -1306,15 +1321,40 @@ pub struct SampleSeat {
 ///   two-level).
 /// * `ginc` — the INCREASING 0-based group index table; `G` on the pad lanes
 ///   (the sentinel's group half).
+/// * `hc1` / `hc2` / `hc3` — the counter hash's multipliers, the staged
+///   spellings of `0x9E3779B1` / `0x85EBCA77` / `0xC2B2AE3D` (multiplication
+///   by an odd constant is a bijection mod 2^32; the squares between them
+///   break the linear structure an xor-shift mix would break on a richer
+///   vocabulary). ⭐ ONE WORD each at `[1, 1]` — uniform constants broadcast
+///   by their consuming multiplies (the int-bcast operand mode), never
+///   whole-row splats (the wall-5 measured law: a `[1, PAD_V]` splat burns
+///   PAD_V·4 B of local store to carry one repeated word).
+/// * `c256` — the wrap-fold's 2^8: `h·2^8 mod 2^32` extracts the low 24 bits
+///   with no compare (the device has no lane-wise integer compare). ONE WORD
+///   at `[1, 1]`, broadcast.
+/// * `lane` — the per-lane index `0..PAD_V-1` as f32 (exact below 2^24),
+///   ingested by the index-cast law — the no-arange law's own reading: a
+///   per-lane fact is host-staged, never a splatted interior value. The one
+///   GENUINELY per-lane fact of the noise section's eleven: whole-row.
+/// * `fm8` / `ftop` / `fzero` / `fhalf` / `fm22` — the fold's constants
+///     `2^-8`, `2^23 - 1`, `0`, `0.5`, `2^-22`: the abs fold's scale, the
+///   strict-interior reflect point, the floor catch, and the uniform grid's
+///   half-ulp and scale — `u = (np + 0.5)·2^-22` lands strictly inside
+///   `(0, 1)` on every attainable `np`. ONE WORD each at `[1, 1]`, broadcast
+///   by their consuming ops (invt's own class).
+/// * `cmin` — the fp16 island's clamp `2^-14`, the FEST log's domain guard on
+///   both entries (subnormal/FTZ behavior never reached). ONE WORD at
+///   `[1, 1]` — the `maximum`'s broadcast operand.
 ///
 /// The SENTINEL (all-NaN row, #666): the one-hot falls on the pad lanes,
 /// where the tables stage `ginc = G`, `binc = GROUP_BLOCKS`, `linc = BLOCK`,
 /// so idx = `G·4096 + GROUP_BLOCKS·64 + BLOCK = PAD_V + 4160`, past the last
 /// real lane.
 ///
-/// Every value is a small exact integer (`G ≤ 2048` by the admission gate;
-/// `padoff` stages only 0.0 and f32::MIN), so the staging round trips
-/// bit-exactly.
+/// Every selection value is a small exact integer (`G ≤ 2048` by the admission
+/// gate; `padoff` stages only 0.0 and −inf); every noise value is either an
+/// exact i32 constant or an exact f32/fp16 power of two, so the staging round
+/// trips bit-exactly.
 pub fn sample_staged_tables(vocab: u32) -> Vec<(Vec<u8>, scratchy_tensors::DType, [usize; 2])> {
     let pad_v = scratchy_subtile::subtile_ir::sample_pad_vocab(vocab) as usize;
     let block = scratchy_subtile::subtile_ir::SAMPLE_BLOCK as usize;
@@ -1331,6 +1371,15 @@ pub fn sample_staged_tables(vocab: u32) -> Vec<(Vec<u8>, scratchy_tensors::DType
             })
             .collect()
     };
+    // A whole-row i32 splat's ONE-WORD form — the hash constants' own value
+    // (SenUint32, the same 4-byte geometry as f32; the LE words ARE the device
+    // encoding). ⭐ THE WALL-5 MEASURED LAW: a uniform constant is staged as
+    // ONE WORD at `[1, 1]`, broadcast by its consuming op — never a whole-row
+    // splat, which burns PAD_V·4 B of local store to carry one repeated word
+    // (ten of them tip the 2 MiB LX).
+    let i32_word = |x: i32| -> Vec<u8> { x.to_le_bytes().to_vec() };
+    // A whole-row f32 splat's ONE-WORD form — the fold's constants.
+    let f32_word = |x: f32| -> Vec<u8> { x.to_le_bytes().to_vec() };
     vec![
         // bramp: GROUP_BLOCKS - (b % GROUP_BLOCKS), periodic, pads 0.
         (
@@ -1403,6 +1452,78 @@ pub fn sample_staged_tables(vocab: u32) -> Vec<(Vec<u8>, scratchy_tensors::DType
             f32_row(&|i| i / (block * group_blocks), groups),
             scratchy_tensors::DType::F32,
             [1, pad_v],
+        ),
+        // hc1 / hc2 / hc3: the counter hash's multipliers, i32 — the
+        // staged spellings of 0x9E3779B1 / 0x85EBCA77 / 0xC2B2AE3D. ONE WORD
+        // each at [1, 1]: uniform constants broadcast by their consuming
+        // multiplies (the int-bcast operand mode), never whole-row splats.
+        (
+            i32_word(-1640531535),
+            scratchy_tensors::DType::I32,
+            [1, 1],
+        ),
+        (
+            i32_word(-2048144777),
+            scratchy_tensors::DType::I32,
+            [1, 1],
+        ),
+        (
+            i32_word(-1028477379),
+            scratchy_tensors::DType::I32,
+            [1, 1],
+        ),
+        // c256: the wrap-fold's 2^8, i32 — one word, broadcast.
+        (
+            i32_word(256),
+            scratchy_tensors::DType::I32,
+            [1, 1],
+        ),
+        // lane: the per-lane index 0..PAD_V-1 as f32 (exact below 2^24) —
+        // every lane its own index, pads included (the hash runs per lane;
+        // the pad lanes lose on the pad law, never on the noise).
+        (
+            (0..pad_v)
+                .flat_map(|i| (i as f32).to_le_bytes())
+                .collect(),
+            scratchy_tensors::DType::F32,
+            [1, pad_v],
+        ),
+        // fm8 / ftop / fzero / fhalf / fm22: the fold's f32 constants —
+        // 2^-8, 2^23 - 1, 0, 0.5, 2^-22. ONE WORD each at [1, 1], broadcast
+        // by their consuming ops (invt's own class).
+        (
+            f32_word(0.00390625),
+            scratchy_tensors::DType::F32,
+            [1, 1],
+        ),
+        (
+            f32_word(8388607.0),
+            scratchy_tensors::DType::F32,
+            [1, 1],
+        ),
+        (
+            f32_word(0.0),
+            scratchy_tensors::DType::F32,
+            [1, 1],
+        ),
+        (
+            f32_word(0.5),
+            scratchy_tensors::DType::F32,
+            [1, 1],
+        ),
+        (
+            f32_word(2.384185791015625e-7),
+            scratchy_tensors::DType::F32,
+            [1, 1],
+        ),
+        // cmin: the fp16 island's clamp 2^-14 (fp16's smallest normal) —
+        // fp16, the FEST log's domain guard; staged through the SEN convert
+        // like every fp16 weight (a REAL conversion: SEN169 ≠ IEEE binary16).
+        // ONE WORD at [1, 1] — the `maximum`'s broadcast operand.
+        (
+            half::f16::from_f32(2f32.powi(-14)).to_le_bytes().to_vec(),
+            scratchy_tensors::DType::F16,
+            [1, 1],
         ),
     ]
 }

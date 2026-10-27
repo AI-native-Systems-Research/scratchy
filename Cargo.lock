@@ -3951,6 +3951,7 @@ dependencies = [
  "ktir-core",
  "ktir-superdsc",
  "scratchy-subtile",
+ "serde_json",
  "triton-frontend",
  "triton-ktir",
  "triton-ktir-superdsc",

@@ -1449,6 +1449,18 @@ pub enum OpFunc {
     Abs,
     Silu,
     Exp,
+    /// `log` — elementwise natural log (sfp unit). `arch_enums.cpp`'s `LOG_FWD`
+    /// bind (`{OpFuncs::LOG_FWD, "log"}`, the opFuncsToString row the sampler's
+    /// on-card Gumbel noise targets — front-b-noise, auditor order 2026-10-26).
+    /// The card's log is its own approximation (~90% correctly-rounded, worst
+    /// near 1 — card leg B1), so a bit-exact reference routes through the card,
+    /// never a host log.
+    Log,
+    /// `neg` — elementwise negation (sfp unit). `arch_enums.cpp`'s `NEG` bind
+    /// (`{OpFuncs::NEG, "neg"}`). The sampler's on-card Gumbel noise negates
+    /// twice around the inner log (`g = -log(-log(u))`, front-b-noise) — the
+    /// negation is the card's own opFunc, never a subtract-from-zero.
+    Neg,
     Reciprocal,
     Sqrt,
     Rsqrt,
@@ -1475,6 +1487,22 @@ pub enum OpFunc {
     /// the SAME rank-3 law as the fp16↔fp32 converts — a rank-2 collapse of a narrowing convert
     /// drops the `y` dim dxp's buffer walk needs (see [`crate::emit::convert_opspec`]).
     Fp32ToInt32,
+    /// `int32tofp32` — the REVERSE value cast, a SENUINT32 word → an IEEE fp32 value. Card-proven
+    /// by leg B1's `i2f_g1` cell (bit-matched against host `as f32` over full-range u32 patterns:
+    /// exact below 2^24, ties-up rounding above — an exactly-representable value rounds to itself).
+    /// The on-card Gumbel noise's wrap-fold extraction rides it (front-b-noise): the extracted
+    /// word is a multiple of 2^8 with ≤24 significant bits, exact even at magnitude ~2^31.
+    Int32ToFp32,
+    /// `muli32toi32` — elementwise WRAPPING i32 multiply on SENUINT32 data (`arch_enums.cpp:496`,
+    /// sfp unit). Card-proven by leg B1's `muli32toi32` cell (bit-matched against host wrapping
+    /// i32 mul): `SENUINT32` labeledDs at wordLength 4 with the computeOp's `dataFormat_` marker
+    /// `IEEE_FP32` — the integer ops ride the SFP unit's fp32-mode datapath, so the marker states
+    /// the MODE, never the data. The on-card noise hash's mixing multiplies (front-b-noise).
+    MulI32ToI32,
+    /// `addi32toi32` — elementwise WRAPPING i32 add, the `muli32toi32` cell's own twin
+    /// (`arch_enums.cpp:497`, same SENUINT32/IEEE_FP32-marker form, card leg B1). The hash's
+    /// seed and lane additions.
+    AddI32ToI32,
     Sum,
     Max,
     Mean,
@@ -1678,6 +1706,8 @@ impl OpFunc {
             OpFunc::Abs => "abs",
             OpFunc::Silu => "silu",
             OpFunc::Exp => "exp",
+            OpFunc::Log => "log",
+            OpFunc::Neg => "neg",
             OpFunc::Reciprocal => "reciprocal",
             OpFunc::Sqrt => "sqrt",
             OpFunc::Rsqrt => "rsqrt",
@@ -1689,6 +1719,9 @@ impl OpFunc {
             OpFunc::Dl16ToFp32 => "dl16tofp32",
             OpFunc::Fp32ToDl16 => "fp32todl16",
             OpFunc::Fp32ToInt32 => "fp32toint32",
+            OpFunc::Int32ToFp32 => "int32tofp32",
+            OpFunc::MulI32ToI32 => "muli32toi32",
+            OpFunc::AddI32ToI32 => "addi32toi32",
             OpFunc::Sum => "sum",
             OpFunc::Max => "max",
             OpFunc::Mean => "mean",

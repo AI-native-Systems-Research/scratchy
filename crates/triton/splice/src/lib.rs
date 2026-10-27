@@ -1214,13 +1214,19 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
         // refuses them before the splice — the MoE lowers only from
         // `kernels/moe.py` through KTIR.
         SubOp::ScalarWeightMul => 2,
-        // ⭐ THE SAMPLER'S ARITY IS 12: the logits row, its per-row noise
-        // block and its per-row temperature reciprocals, then the nine
-        // staged tables (two decreasing ramps, two increasing index tables,
-        // two widen tables, the pad law's offset row, the two-level ramp's
-        // group pair) — every kernel parameter but the output is a tape
-        // operand, per the splice's own positional law.
-        SubOp::Sample { .. } => 12,
+        // ⭐ THE SAMPLER'S ARITY IS 27: the logits row, its per-row seed
+        // quintuple's FIVE `[rows, 1]` word tables and its per-row temperature
+        // reciprocals, then the twenty staged tables (two decreasing ramps,
+        // two increasing index tables, two widen tables, the pad law's offset
+        // row, the two-level ramp's group pair, then the noise section's own
+        // eleven — the four i32 hash/fold constants, the lane table, the
+        // fold's five f32 constants, the fp16 clamp) — every kernel parameter
+        // but the output is a tape operand, per the splice's own positional
+        // law. (Five word tables, not one `[rows, 5]` table: the Col operand
+        // mode addresses the stick head alone — the int-bcast leg's measured
+        // law — so each word rides its own corner-free table, the auditor's
+        // wall-4 ruling (a).)
+        SubOp::Sample { .. } => 27,
         SubOp::TanhSoftCap { .. } | SubOp::RmsNormUnit { .. } | SubOp::Reshape { .. } => 1,
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without an arity here is
         // an unreachable — the same discipline `lower_one_node`'s match holds.
@@ -2446,11 +2452,19 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // staging), NB its block count, BLOCK the stick (the two-level
             // ramp's lane width and the output stick), B the row count this
             // rung serves (the grid's own width). The signature states every
-            // kernel parameter's dtype: the fp16 row, the two PER-ROW staged
-            // operands in f32 (the noise block, the temperature reciprocals),
-            // the nine tables in f32 (the selection is f32 — a sum the f16
-            // grid would round), and the i32 output stick (the
-            // index-ingestion law).
+            // kernel parameter's dtype: the fp16 row, the PER-ROW SEED WORD
+            // TABLES in i32 — five `[rows, 1]` tables, one per word of the
+            // quintuple (seed_lo, seed_hi, step, greedy_gate, row), each
+            // loaded corner-free at `[pid, 0]` (the Col operand mode reads
+            // the stick head alone — the int-bcast leg's measured law — so
+            // no word rides a windowed column; the auditor's wall-4 ruling
+            // (a)); the noise is computed on the card, no f32 noise staging
+            // rides — then the per-row temperature reciprocals in f32,
+            // the nine selection tables in f32 (the selection is f32 — a sum
+            // the f16 grid would round), the noise section's own tables — the
+            // hash multipliers and the wrap-fold's 2^8 in i32, the lane and the
+            // fold's five f32 constants, the FEST-domain clamp in fp16 — and
+            // the i32 output stick (the index-ingestion law).
             let pad_v = scratchy_subtile::subtile_ir::sample_pad_vocab(*vocab);
             let nb = pad_v / scratchy_subtile::subtile_ir::SAMPLE_BLOCK;
             signature.insert(
@@ -2458,7 +2472,18 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
             );
             for p in [
-                "noise_ptr",
+                "slo_ptr",
+                "shi_ptr",
+                "stp_ptr",
+                "sgate_ptr",
+                "srow_ptr",
+            ] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*i32").map_err(|e| e.to_string())?,
+                );
+            }
+            for p in [
                 "invt_ptr",
                 "bramp_ptr",
                 "lramp_ptr",
@@ -2475,6 +2500,29 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                     ArgSpec::parse("*fp32").map_err(|e| e.to_string())?,
                 );
             }
+            for p in ["hc1_ptr", "hc2_ptr", "hc3_ptr", "c256_ptr"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*i32").map_err(|e| e.to_string())?,
+                );
+            }
+            for p in [
+                "lane_ptr",
+                "fm8_ptr",
+                "ftop_ptr",
+                "fzero_ptr",
+                "fhalf_ptr",
+                "fm22_ptr",
+            ] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp32").map_err(|e| e.to_string())?,
+                );
+            }
+            signature.insert(
+                "cmin_ptr".to_string(),
+                ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+            );
             signature.insert(
                 "idx_ptr".to_string(),
                 ArgSpec::parse("*i32").map_err(|e| e.to_string())?,
@@ -3113,10 +3161,10 @@ mod production_ktir_dump {
     const MOE: &str = include_str!("../../../targets/spyre/kernels/moe.py");
     const MOE_PREFILL: &str = include_str!("../../../targets/spyre/kernels/moe_prefill.py");
     const RESHAPE: &str = include_str!("../../../targets/spyre/kernels/reshape.py");
+    const SAMPLE: &str = include_str!("../../../targets/spyre/kernels/sample_fwd.py");
     const RMSNORM: &str = include_str!("../../../targets/spyre/kernels/rmsnorm.py");
     const RMSNORMUNIT: &str = include_str!("../../../targets/spyre/kernels/rmsnormunit.py");
     const ROPE: &str = include_str!("../../../targets/spyre/kernels/rope.py");
-    const SAMPLE: &str = include_str!("../../../targets/spyre/kernels/sample_fwd.py");
     const SCALARMUL: &str = include_str!("../../../targets/spyre/kernels/scalarmul.py");
     const SCALARWMUL: &str = include_str!("../../../targets/spyre/kernels/scalarwmul.py");
     const SILUMUL: &str = include_str!("../../../targets/spyre/kernels/silumul.py");
@@ -3591,12 +3639,17 @@ mod production_ktir_dump {
         // ── sample_fwd.py: the token draw at solo and batched grids — the sampler this
         // proof guards, and the ONE kernel the grid-[B] fix is allowed to move. The
         // spec mirrors the `SubOp::Sample` arm of `kernel_spec`'s registry row: the
-        // logits row, its per-row noise and temperature reciprocal, the nine staged
-        // tables, and the `[B, 64]` idx stick out. ──
+        // logits row, its per-row seed quintuple's five word tables and temperature
+        // reciprocal, the twenty staged tables (the nine of the selection cascade and
+        // the noise section's own eleven), and the `[B, 64]` idx stick out. ──
         {
             let sample_ptrs: &[(&str, &str)] = &[
                 ("logits_ptr", "*fp16"),
-                ("noise_ptr", "*fp32"),
+                ("slo_ptr", "*i32"),
+                ("shi_ptr", "*i32"),
+                ("stp_ptr", "*i32"),
+                ("sgate_ptr", "*i32"),
+                ("srow_ptr", "*i32"),
                 ("invt_ptr", "*fp32"),
                 ("bramp_ptr", "*fp32"),
                 ("lramp_ptr", "*fp32"),
@@ -3607,6 +3660,17 @@ mod production_ktir_dump {
                 ("padoff_ptr", "*fp32"),
                 ("gramp_ptr", "*fp32"),
                 ("ginc_ptr", "*fp32"),
+                ("hc1_ptr", "*i32"),
+                ("hc2_ptr", "*i32"),
+                ("hc3_ptr", "*i32"),
+                ("c256_ptr", "*i32"),
+                ("lane_ptr", "*fp32"),
+                ("fm8_ptr", "*fp32"),
+                ("ftop_ptr", "*fp32"),
+                ("fzero_ptr", "*fp32"),
+                ("fhalf_ptr", "*fp32"),
+                ("fm22_ptr", "*fp32"),
+                ("cmin_ptr", "*fp16"),
                 ("idx_ptr", "*i32"),
             ];
             for (name, b, grid) in [

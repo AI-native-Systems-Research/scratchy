@@ -121,6 +121,13 @@ pub const OP_SET: &[&str] = &[
     // math
     "math.exp",
     "math.exp2",
+    // `tl.log` (front-b-noise, auditor order 2026-10-26): the on-card Gumbel noise's
+    // `g = -log(-log(u))`. The card's own `log` opFunc (arch_enums.cpp:423) is the target;
+    // `math.log2` was in the set all along but log2(x)·ln2 is a DIFFERENT rounding than the
+    // card's log, so the draw-for-draw reference would not match. Threaded like `math.exp`:
+    // modelled in `OpKind` (`MathLog`), mapped in `to_ktir_emit` (`KOpKind::MathLog`, which
+    // ktir-core has served all along), no attrs.
+    "math.log",
     "math.rsqrt", // Other, on purpose
     "math.tanh",
     // `tl.abs` on a float (`moe.py`'s per-token `amax(|x|)`). Rides `Other` like `rsqrt`:

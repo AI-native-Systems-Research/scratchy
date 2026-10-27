@@ -78,6 +78,22 @@ pub const ALL: &[&str] = &[
     // core, where `unroll_grid_positions` must count `n * trips` tiles to see the
     // partitioned parameters. The `to_ktir.rs` count fix's gate.
     "attention_banded_fold",
+    // ⭐ PROBE-ONLY (front-b-noise, auditor order 2026-10-26): the on-card noise
+    // hash STANDALONE — the sampler's noise section verbatim with `u` and `g`
+    // stored as outputs instead of consumed by the draw. 2^20 lanes in ONE
+    // whole row (B=1, PAD_V=2^20), the sampler's per-program whole-row width
+    // class one power up from gemma-4's 2^19. Rides `Program::Sample`'s door
+    // so the probe lowers through the production walk. NOT a production
+    // configuration: delete with the probe.
+    "hash_noise",
+    // ⭐ PROBE-ONLY (front-b-noise, auditor order 2026-10-26, ruling (b)): the
+    // INT-BCAST leg — ONE `arith.addi` of a `[1, 512]` dense i32 and a
+    // `[1, 1]` Col-broadcast i32, the exact card form the integer door's
+    // broadcast admission names as its measurement in flight (see
+    // `int_binary`'s doc). B1's probe form at the sampler's own per-row word
+    // shape; the verdict is a host bit-for-bit compare of the `[1, 512]` sum.
+    // NOT a production configuration: delete with the probe.
+    "int_bcast",
     "attention_banded_batch",
 ];
 
@@ -731,6 +747,86 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
         // production kernel rides.
         "attention_banded_fold" => (banded_attn_spec(1), vec![1, 8, 4], Program::Attn),
         "attention_banded_batch" => (banded_attn_spec(2), vec![2, 8, 4], Program::Attn),
+        // ⭐ PROBE-ONLY (front-b-noise): the noise-hash standalone — see the ALL-list
+        // comment. `Program::Sample` rides the sampler's door arm; ONE program, ONE
+        // whole row — B=1, PAD_V=2^20 (2^20 lanes in width, not in rows: a B>1 grid
+        // mismatches the band/extent laws, see the kernel's docstring). Every
+        // constant is a staged table in the kernel's own parameter order: the seed
+        // quad + hash constants (8 full-width i32 rows), the lane + fold constants
+        // (6 full-width f32 rows), the fp16 FEST-domain clamp cmin (2^-14, full-width
+        // fp16 row — the card's log is fp16-only, so the draw narrows for each log
+        // and clamps at fp16's smallest normal), then the four outs — u, g
+        // ([1,2^20] f32) and ui, gi ([1,2^20] i32, the LegalizeTypes island's
+        // fptosi exits). No selection: the walk's Reduce arm cannot lower a wide
+        // f32 reduce (the partials law), and the auditor's statistics are
+        // host-side reads of u and g.
+        "hash_noise" => (
+            spec(
+                "hash_noise_probe",
+                "hash_noise_probe",
+                &[
+                    ("slo_ptr", "*i32"),
+                    ("shi_ptr", "*i32"),
+                    ("stp_ptr", "*i32"),
+                    ("srow_ptr", "*i32"),
+                    ("c1_ptr", "*i32"),
+                    ("c2_ptr", "*i32"),
+                    ("c3_ptr", "*i32"),
+                    ("c256_ptr", "*i32"),
+                    ("lane_ptr", "*fp32"),
+                    ("fm8_ptr", "*fp32"),
+                    ("ftop_ptr", "*fp32"),
+                    ("fzero_ptr", "*fp32"),
+                    ("fhalf_ptr", "*fp32"),
+                    ("fm22_ptr", "*fp32"),
+                    ("cmin_ptr", "*fp16"),
+                    ("u_ptr", "*fp32"),
+                    ("g_ptr", "*fp32"),
+                    ("ui_ptr", "*i32"),
+                    ("gi_ptr", "*i32"),
+                ],
+                &[
+                    ("PAD_V", Val::Int(1048576)),
+                    ("B", Val::Int(1)),
+                ],
+            ),
+            vec![1],
+            Program::Sample,
+        ),
+        // ⭐ THE INT-BCAST PROBE (front-b-noise, ruling (b)): three pointers — `a` the
+        // `[1, 512]` dense i32 row, `b` the `[1, 1]` per-row word (the seed word's own
+        // shape), `o` the `[1, 512]` i32 sum — one program, one grid slot, no constants
+        // (nothing is a splat, so nothing routes to the fp16 scalar-multiply door). The
+        // kernel's single `a + b` is the Col-broadcast `addi32toi32` the door's admission
+        // measures; PAD_V=512 is the auditor's stated width, B=1 the one-row grid.
+        "int_bcast" => (
+            spec(
+                "int_bcast_probe",
+                "int_bcast_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(512)), ("B", Val::Int(1))],
+            ),
+            vec![1],
+            Program::Sample,
+        ),
+        // ⭐ THE INT-MUL-BCAST PROBE (front-b-noise, the wall-5 (B) ruling): the add
+        // leg's own shape with the multiply under measurement — `a` the `[1, 512]`
+        // dense i32 row, `b` the `[1, 1]` per-row word, `o` the `[1, 512]` i32
+        // product, one program, one grid slot, no constants. The kernel's single
+        // `a * b` is the Col-broadcast `muli32toi32` the door's `Mul` admission
+        // measures (the hash's restaged `[1, 1]` multipliers hc1/hc2/hc3/c256 ride
+        // exactly this form); PAD_V=512 the auditor's stated width, B=1 the
+        // one-row grid.
+        "intmul_bcast" => (
+            spec(
+                "intmul_bcast_probe",
+                "intmul_bcast_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(512)), ("B", Val::Int(1))],
+            ),
+            vec![1],
+            Program::Sample,
+        ),
         _ => return None,
     })
 }

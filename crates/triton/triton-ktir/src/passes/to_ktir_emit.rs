@@ -542,6 +542,7 @@ fn opkind(k: &OpKind) -> Result<KOpKind> {
         O::ArithIndexCast => KOpKind::ArithIndexCast,
         O::ArithSelect => KOpKind::ArithSelect,
         O::MathExp => KOpKind::MathExp,
+        O::MathLog => KOpKind::MathLog,
         O::MathLog2 => KOpKind::MathLog2,
         O::MathSqrt => KOpKind::MathSqrt,
         O::TensorSplat => KOpKind::TensorSplat,

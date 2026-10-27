@@ -4118,8 +4118,14 @@ pub fn emit_sdsc(
                         <Fp8 as DataFormat>::NAME
                     } else if views.get(out_idx).is_some_and(|o| matches!(o.df, Df::Bf16)) {
                         "BF16E"
-                    } else if matches!(op.op, OpFunc::Fp32ToInt32) {
-                        // The value-cast converts are bound in fp32 MODE ONLY
+                    } else if matches!(
+                        op.op,
+                        OpFunc::Fp32ToInt32
+                            | OpFunc::Int32ToFp32
+                            | OpFunc::MulI32ToI32
+                            | OpFunc::AddI32ToI32
+                    ) {
+                        // The value-cast converts and the INTEGER MATH ops are bound in fp32 MODE
                         // (unary_parallel.ddl:47-50 — int32tofp32/fp32toint32 are
                         // `operation_bind([%type_fp32], ...)`; the DDL comment:
                         // "the conversion is carried out in fp32 mode, ICVT
@@ -4130,6 +4136,17 @@ pub fn emit_sdsc(
                         // format. An SEN169_FP16 marker here is dxp's
                         // "Scheduler failed to find a suitable op mapping"
                         // (SchedulerStages.cpp:40) — no fp16-mode bind exists.
+                        // The integer mul/add carry the SAME marker on SENUINT32
+                        // data — card leg B1's passing cells state
+                        // `muli32toi32`/`addi32toi32` with SENUINT32 labeledDs
+                        // (wordLength 4) and this IEEE_FP32 computeOp marker: the
+                        // SFP unit's fp32-mode datapath executes the wrapping i32
+                        // op, so the marker states the MODE, never the data. A
+                        // first-arg lookup (`views.first()`, the torch-spyre
+                        // superdsc.py:882 law the arm below applies) would see
+                        // SENUINT32 and fall to the fp16 default — the exact
+                        // no-suitable-op-mapping refusal — so these four state
+                        // their marker themselves.
                         Df::Fp32.dataformat()
                     } else if views.first().is_some_and(|v| matches!(v.df, Df::Fp32)) {
                         // torch-spyre sets the computeOp data_format from args[0]
@@ -4501,6 +4518,10 @@ fn convert_dtypes(op: OpFunc) -> (Df, Df) {
         // through `dl16tofp32` FIRST — the widening convert carries no slice
         // constraint of its own (quantization_double_pad.ddl:58).
         OpFunc::Fp32ToInt32 => (Df::Fp32, Df::SenUint32),
+        // int32tofp32: SENUINT32 word → IEEE_FP32 value — the reverse recipe of the above,
+        // both 32-element wordLength-4 sticks (card leg B1's i2f cell). The on-card Gumbel
+        // noise's wrap-fold extraction (front-b-noise) rides it.
+        OpFunc::Int32ToFp32 => (Df::SenUint32, Df::Fp32),
         _ => (Df::Fp16, Df::Fp16),
     }
 }
@@ -6380,6 +6401,17 @@ pub fn op_func_from_str(s: &str) -> OpFunc {
         "abs" => OpFunc::Abs,
         "silu" => OpFunc::Silu,
         "exp" => OpFunc::Exp,
+        // `arch_enums.cpp`'s LOG_FWD bind — the on-card Gumbel noise's transform
+        // (front-b-noise). One spelling, `log`, matching `OpFunc::name()`.
+        "log" => OpFunc::Log,
+        // `arch_enums.cpp`'s NEG bind — the Gumbel transform's two negations.
+        "neg" => OpFunc::Neg,
+        // B1's i2f leg spelling — the reverse of `fp32toint32` above.
+        "int32tofp32" => OpFunc::Int32ToFp32,
+        // B1's integer-math leg spellings — wrapping i32 mul/add on SENUINT32 data (the noise
+        // hash's mix, front-b-noise). Same one-spelling law as `log` above.
+        "muli32toi32" => OpFunc::MulI32ToI32,
+        "addi32toi32" => OpFunc::AddI32ToI32,
         "reciprocal" => OpFunc::Reciprocal,
         "sqrt" => OpFunc::Sqrt,
         "rsqrt" => OpFunc::Rsqrt,

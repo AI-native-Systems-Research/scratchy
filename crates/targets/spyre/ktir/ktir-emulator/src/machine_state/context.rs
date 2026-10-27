@@ -69,6 +69,12 @@ pub struct CoreContext {
     /// freeing on untrack (0 for an alias). This mirrors Python's `_tile_refcount`
     /// keyed by `id(Tile)` (#118).
     lx_bytes: Vec<i64>,
+    /// `lx_shape[id]` = the shape of the tile this id last charged LX for (the
+    /// shape recorded at charge time), or `None` for pointer-blind charges
+    /// ([`Self::track_lx`]) and untracked ids. Parallel to `lx_bytes`; read only
+    /// by [`Self::lx_charge_listing`] so a capacity refusal can name what each
+    /// live charge IS, not just how much it costs.
+    lx_shape: Vec<Option<Vec<usize>>>,
     /// `tile_ptr[id]` = the backing-allocation pointer ([`Tile::data_ptr`]) of the
     /// tile this id last charged LX for, or 0 if none. Parallel to `slots`. Used to
     /// find the shared refcount entry when this id is untracked. (#118 alias dedup)
@@ -149,6 +155,7 @@ impl CoreContext {
             all_lx,
             slots: Vec::new(),
             lx_bytes: Vec::new(),
+            lx_shape: Vec::new(),
             tile_ptr: Vec::new(),
             tile_refcount: FxHashMap::default(),
             lx_options: LxOptions::default(),
@@ -173,6 +180,7 @@ impl CoreContext {
         if self.slots.len() < need {
             self.slots.resize(need, None);
             self.lx_bytes.resize(need, 0);
+            self.lx_shape.resize(need, None);
             self.tile_ptr.resize(need, 0);
             self.saved_gen.resize(need, 0);
         }
@@ -303,16 +311,26 @@ impl CoreContext {
         };
         if used + size_bytes > capacity {
             return Err(format!(
-                "LX capacity exceeded on core {}: {} + {} > {} charging %{}",
-                self.core_id, used, size_bytes, capacity, v.0
+                "LX capacity exceeded on core {}: {} + {} > {} charging %{}\n{}",
+                self.core_id,
+                used,
+                size_bytes,
+                capacity,
+                v.0,
+                self.lx_charge_listing()
             ));
         }
-        self.lx.borrow_mut().used += size_bytes;
+        {
+            let mut lx = self.lx.borrow_mut();
+            lx.used += size_bytes;
+            lx.peak_used = lx.peak_used.max(lx.used);
+        }
         self.ensure_slot(v.0);
         // Release whatever this id was previously charged with (alias-aware) and
         // record this as a fresh, ptr-less charge so untrack frees it directly.
         self.untrack_lx_id(v);
         self.lx_bytes[v.slot()] = size_bytes;
+        self.lx_shape[v.slot()] = None;
         self.tile_ptr[v.slot()] = 0;
         Ok(())
     }
@@ -325,9 +343,13 @@ impl CoreContext {
     /// bytes themselves. Overflow is checked only on the first (charging) bind.
     pub fn track_lx_tile(&mut self, v: Ssa, tile: &crate::tile::Tile) -> Result<(), String> {
         if !self.lx_options.alias_dedup {
-            return self
+            let r = self
                 .track_lx(v, tile.size_bytes() as i64)
                 .map_err(|e| format!("{e} tile {:?}", tile.shape));
+            if r.is_ok() {
+                self.lx_shape[v.slot()] = Some(tile.shape.to_vec());
+            }
+            return r;
         }
         self.ensure_slot(v.0);
         // Re-binding the same value: release its previous charge first.
@@ -344,17 +366,28 @@ impl CoreContext {
             if used + bytes > capacity {
                 // Leave the (count 0) entry; it carries no charge.
                 return Err(format!(
-                    "LX capacity exceeded on core {}: {} + {} > {} charging %{} tile {:?}",
-                    self.core_id, used, bytes, capacity, v.0, tile.shape
+                    "LX capacity exceeded on core {}: {} + {} > {} charging %{} tile {:?}\n{}",
+                    self.core_id,
+                    used,
+                    bytes,
+                    capacity,
+                    v.0,
+                    tile.shape,
+                    self.lx_charge_listing()
                 ));
             }
-            self.lx.borrow_mut().used += bytes;
+            {
+                let mut lx = self.lx.borrow_mut();
+                lx.used += bytes;
+                lx.peak_used = lx.peak_used.max(lx.used);
+            }
             entry.1 = bytes;
         }
         entry.0 += 1;
         // This id holds a reference to `ptr`; it charges no standalone bytes — the
         // bytes live on the shared refcount entry, freed when it hits 0.
         self.lx_bytes[v.slot()] = 0;
+        self.lx_shape[v.slot()] = Some(tile.shape.to_vec());
         self.tile_ptr[v.slot()] = ptr;
         Ok(())
     }
@@ -362,6 +395,75 @@ impl CoreContext {
     /// Free LX for `v`. No-op if untracked. Mirrors `untrack_lx`.
     pub fn untrack_lx(&mut self, v: Ssa) {
         self.untrack_lx_id(v);
+    }
+
+    /// The LX high-water mark of this context's core — the maximum
+    /// `lx.used` the scratchpad reached (see [`LXScratchpad::peak_used`]).
+    /// The per-core contexts are ephemeral per run, but the scratchpad they
+    /// share is not — the peak lives there and outlives both the per-segment
+    /// clear and the context itself, so this reads the RUN's number, not the
+    /// current segment's.
+    pub fn lx_peak_used(&self) -> i64 {
+        self.lx.borrow().peak_used
+    }
+
+    /// ⭐ THE LIVE LX LEDGER, one line per live charge, sorted by bytes
+    /// descending — what every capacity refusal prints so a miss can be
+    /// attributed to its tiles instead of designed around blind. One line per
+    /// PHYSICAL charge, not per SSA name: alias-deduped allocations (the
+    /// `track_lx_tile` refcount entries, the only charges that carry shapes)
+    /// print once with every live alias id named, and pointer-blind
+    /// [`Self::track_lx`] charges stand alone with no shape (their callers
+    /// charge a bare byte count). The footer cross-checks the lines' sum
+    /// against `lx.used` — a mismatch is a ledger bug, not extra headroom.
+    pub fn lx_charge_listing(&self) -> String {
+        // Live alias ids per backing allocation.
+        let mut ids_by_ptr: FxHashMap<usize, Vec<u32>> = FxHashMap::default();
+        for (i, &p) in self.tile_ptr.iter().enumerate() {
+            if p != 0 {
+                ids_by_ptr.entry(p).or_default().push(i as u32);
+            }
+        }
+        // (bytes, line) per live charge.
+        let mut charges: Vec<(i64, String)> = Vec::new();
+        for (i, &bytes) in self.lx_bytes.iter().enumerate() {
+            if bytes > 0 {
+                charges.push((bytes, format!("%{}", i as u32)));
+            }
+        }
+        for (&ptr, &(rc, bytes)) in &self.tile_refcount {
+            if rc <= 0 {
+                continue;
+            }
+            let mut ids = ids_by_ptr.remove(&ptr).unwrap_or_default();
+            ids.sort_unstable();
+            let shape = ids
+                .iter()
+                .find_map(|&id| self.lx_shape[id as usize].clone())
+                .map(|s| format!(" shape={:?}", s))
+                .unwrap_or_default();
+            let names = ids
+                .iter()
+                .map(|&id| format!("%{}", id))
+                .collect::<Vec<_>>()
+                .join(",");
+            charges.push((bytes, format!("{names}{shape} x{rc}")));
+        }
+        charges.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let mut out = format!(
+            "live LX charges on core {} (bytes desc):\n",
+            self.core_id
+        );
+        for (bytes, name) in &charges {
+            out.push_str(&format!("  {name} bytes={bytes}\n"));
+        }
+        let sum: i64 = charges.iter().map(|c| c.0).sum();
+        out.push_str(&format!(
+            "  total {sum} bytes across {} charges; lx.used={}",
+            charges.len(),
+            self.lx.borrow().used
+        ));
+        out
     }
 
     #[inline]
@@ -389,6 +491,9 @@ impl CoreContext {
         {
             self.lx.borrow_mut().used -= *sz;
             *sz = 0;
+        }
+        if let Some(shape) = self.lx_shape.get_mut(i) {
+            *shape = None;
         }
     }
 
@@ -503,6 +608,7 @@ impl CoreContext {
     pub fn clear_values(&mut self) {
         self.slots.iter_mut().for_each(|s| *s = None);
         self.lx_bytes.iter_mut().for_each(|b| *b = 0);
+        self.lx_shape.iter_mut().for_each(|s| *s = None);
         self.tile_ptr.iter_mut().for_each(|p| *p = 0);
         self.tile_refcount.clear();
         self.saved_gen.iter_mut().for_each(|g| *g = 0);
@@ -512,6 +618,8 @@ impl CoreContext {
         self.cur_gen = 0;
         self.lx_next_ptr_stack.clear();
         self.index_shape.clear();
+        // `LXScratchpad::clear` resets `used` but PRESERVES `peak_used` — the
+        // high-water mark outlives the segment (see [`Self::lx_peak_used`]).
         self.lx.borrow_mut().clear();
     }
 }
@@ -567,6 +675,75 @@ mod tests {
         let mut c = ctx();
         let cap = c.lx.borrow().capacity;
         assert!(c.track_lx(Ssa(0), cap + 1).is_err());
+    }
+
+    // The capacity refusal carries the live-charge ledger: alias-deduped
+    // allocations print ONCE with every live alias id and their shape,
+    // pointer-blind charges stand alone, lines sort by bytes descending, and
+    // the footer's total equals lx.used — so a miss can be attributed, not
+    // designed around blind.
+    #[test]
+    fn lx_overflow_lists_the_live_charges() {
+        use crate::tile::Tile;
+        let mut c = ctx();
+        let cap = c.lx.borrow().capacity;
+        // Two distinct allocations: half and a quarter of capacity.
+        let big = Tile::compute(
+            vec![0.0; cap as usize / 8],
+            DType::F32,
+            vec![cap as usize / 8],
+        );
+        let small = Tile::compute(
+            vec![0.0; cap as usize / 16],
+            DType::F32,
+            vec![cap as usize / 16],
+        );
+        // %0 and %1 alias the big allocation (charged once, refcount 2); %2
+        // holds the small one. Live total: 3/4 of capacity.
+        c.track_lx_tile(Ssa(0), &big).unwrap();
+        c.track_lx_tile(Ssa(1), &big).unwrap();
+        c.track_lx_tile(Ssa(2), &small).unwrap();
+        assert_eq!(c.lx.borrow().used, cap / 2 + cap / 4);
+        // A fresh half-capacity allocation cannot fit — the refusal must name
+        // the live charges, big before small, alias ids together.
+        let next = Tile::compute(
+            vec![1.0; cap as usize / 8],
+            DType::F32,
+            vec![cap as usize / 8],
+        );
+        let err = c
+            .track_lx_tile(Ssa(3), &next)
+            .expect_err("3/4 + 1/2 of capacity overflows");
+        let text = err.to_string();
+        assert!(text.contains("LX capacity exceeded"), "{text}");
+        let big_line = format!("%0,%1 shape=[{}] x2 bytes={}", cap / 8, cap / 2);
+        let small_line = format!("%2 shape=[{}] x1 bytes={}", cap / 16, cap / 4);
+        assert!(text.contains(&big_line), "{text}");
+        assert!(text.contains(&small_line), "{text}");
+        assert!(
+            text.lines().position(|l| l.contains("%0,%1"))
+                < text.lines().position(|l| l.contains("%2 ")),
+            "charges must sort by bytes descending:\n{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "total {} bytes across 2 charges; lx.used={}",
+                cap / 2 + cap / 4,
+                cap / 2 + cap / 4
+            )),
+            "{text}"
+        );
+        // ⭐ The high-water mark: the peak holds the live total (the refused
+        // charge added nothing) and SURVIVES the per-segment clear — the run's
+        // own headroom statement, not the current segment's.
+        assert_eq!(c.lx_peak_used(), cap / 2 + cap / 4);
+        c.clear_values();
+        assert_eq!(c.lx.borrow().used, 0, "the clear resets the segment");
+        assert_eq!(
+            c.lx_peak_used(),
+            cap / 2 + cap / 4,
+            "the peak outlives the clear"
+        );
     }
 
     // Re-binding a name many times WITHIN one scope (an scf.for accumulator) must
