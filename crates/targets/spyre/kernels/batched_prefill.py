@@ -66,9 +66,11 @@ this file follows them):
     offsets carry the pitch — the per-trip stride is `SLABS*PITCH` bytes
     (the trip's `SLABS*KTB` entries contiguous at its head, the pad
     unread), the per-page block `W4*MQ*SLABS*PITCH` bytes with the first
-    `W4` trip-blocks meaningful and the tail padding — and the mask's rows
-    sit `SLABS * PITCH` apart (its own `STK` lanes meaningful, the gap
-    padding) — so both tensors' per-page blocks are the SAME byte count at
+    `W4` trip-blocks meaningful and the tail padding — and the mask gives
+    each trip `SLABS * PITCH / (2*STK)` whole `STK`-lane rows per query row
+    (its `MQ` query rows first, the rest pad rows, the view DENSE so every
+    reader addresses it at its own row stride) — so both tensors'
+    per-page blocks are the SAME byte count at
     every geometry, which is what the per-page fold's ONE per-pass
     Activation shift walks them by (`paged_fold.py` states the shift side;
     every rung of a chunked ladder stages this same region,
@@ -127,9 +129,11 @@ Staged by the host, per chunk:
                      extent and pitch, SLAB-MAJOR within a trip (slab s's
                      `KTB` entries at `s*KTB`), the V plane's own
                      slab-block numbering.
-  * `desc_mask`    — additive fp16 mask, `[REGION_PAGES * W4*MQ, STK]` at
-                     row stride `SLABS * PITCH` bytes (the common-pitch
-                     law above), window-major: row `(p*W4 + w)*MQ + t`,
+  * `desc_mask`    — additive fp16 mask, `[REGION_PAGES * W4*MROWS*MQ,
+                     STK]` dense, `MROWS = SLABS*PITCH/(2*STK)` (the
+                     common-pitch law above: a trip's `MROWS*MQ` rows, its
+                     `MQ` query rows first, the rest whole pad rows),
+                     window-major: row `(p*W4 + w)*MROWS*MQ + t`,
                      `0.0` where the slot is visible to that query row
                      (within the sequence and causally), `-65504.0` where
                      it is not, or where the query row is padding. The
@@ -223,11 +227,14 @@ def batched_prefill_hm(desc_q, desc_o,  #
         strides=[1], block_shape=[KTB])
     # The causal mask, window-major within each page, added at the score tile
     # as a leading stride-0 broadcast — stated at the same region and the
-    # same common pitch (each row's STK lanes meaningful, the SLABS*PITCH
-    # row stride the padding the one per-pass shift walks past unread).
+    # same common pitch, DENSE: each (page, window) trip owns MROWS*MQ rows of
+    # STK lanes, its MQ query rows first and the rest whole pad rows, so one
+    # trip's mask is SLABS*PITCH*MQ bytes — the tables' own per-trip bytes —
+    # and the view's dense row stride is the one every reader addresses.
+    MROWS: tl.constexpr = SLABS * PITCH // (2 * STK)
     mask_desc = tl.make_tensor_descriptor(
-        desc_mask, shape=[REGION_PAGES * W4 * MQ, STK],
-        strides=[SLABS * PITCH // 2, 1], block_shape=[MQ, STK])
+        desc_mask, shape=[REGION_PAGES * W4 * MROWS * MQ, STK],
+        strides=[STK, 1], block_shape=[MQ, STK])
 
     # The running softmax across the walk, per (kv head, group, query row):
     # torch's carry, folded once per (page, window) trip.
@@ -300,7 +307,7 @@ def batched_prefill_hm(desc_q, desc_o,  #
             # The causal mask, host-staged window-major, added at the score
             # tile as a leading stride-0 broadcast — the row-split operand
             # mode, every batch row reading the same mask row.
-            qk = qk + tl.reshape(mask_desc.load([(p * W4 + w) * MQ, 0]),
+            qk = qk + tl.reshape(mask_desc.load([(p * W4 + w) * MROWS * MQ, 0]),
                                  [1, MQ, STK])
             # The online update, folded per trip: running max over the STK
             # score lanes (a LAST-axis reduction), rescaled sum, rescaled

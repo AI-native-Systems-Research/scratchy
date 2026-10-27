@@ -2150,6 +2150,7 @@ fn spliced_attn_lowers_through_the_door() {
                 // fold receipt, so their law is the one every real-batch model lives under: the
                 // program states the whole scale.
                 Some(ktir_superdsc::score_scale::ScoreScaleLaw::StatedByProgram),
+                false,
             );
             // ⛔ ALL-SHAPE KERNELS — the STEP B law, pinned here, never skipped.
             // The kernels' geometry is CONST-GENERIC: SLABS is bound from
@@ -2576,6 +2577,7 @@ fn a_continuation_programs_size_does_not_grow_with_its_rows() {
             None,
             // The node's 0.015625 is a real multiplier with no fold receipt — StatedByProgram.
             Some(ktir_superdsc::score_scale::ScoreScaleLaw::StatedByProgram),
+            false,
         )
         .unwrap_or_else(|e| panic!("splice compiled mq={mq}: {e}"));
         assert_eq!(

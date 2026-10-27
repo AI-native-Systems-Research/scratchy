@@ -38,8 +38,9 @@ launch-side arithmetic is single-sourced there):
     `W4*MQ*SLABS*PITCH`-byte block meaningful, the tail padding) — 1D
     because the gather's index vector must be 1D and the KTDP trace
     recovers an indirect read's view only from a RAW descriptor load — and
-    the mask is `W4*MQ` rows of `STK` lanes at `SLABS*PITCH` bytes a row
-    (its own lanes meaningful, the stride gap padding) — both
+    the mask is `W4*MROWS*MQ` dense rows of `STK` lanes, `MROWS =
+    SLABS*PITCH/(2*STK)` (each window's `MQ` query rows first, the rest
+    whole pad rows) — both
     `W4*MQ*SLABS*PITCH` bytes a page, at EVERY head count and head dim. At
     `KTB == 32` the two natural rows coincide, the pad is empty, and the
     per-page block is the old `512*MQ` bytes exactly. The descriptors below
@@ -228,14 +229,15 @@ def paged_fold_hm(desc_q, desc_m, desc_l, desc_acc,  #
     v_ids_desc = tl.make_tensor_descriptor(
         desc_ids_v, shape=[REGION_PAGES * W4 * MQ * SLABS * PITCH // 4],
         strides=[1], block_shape=[KTB])
-    # The additive validity mask, window-major within each page, one row
-    # per query row — at the same common pitch (each row's STK lanes
-    # meaningful, the SLABS*PITCH row stride the padding the one per-pass
-    # shift walks past unread), so its per-page block is the tables' own
-    # byte count.
+    # The additive validity mask, window-major within each page — at the
+    # same common pitch, DENSE: each window owns MROWS*MQ rows of STK lanes,
+    # its MQ query rows first and the rest whole pad rows, so its per-page
+    # block is the tables' own byte count and the view's dense row stride is
+    # the one every reader addresses.
+    MROWS: tl.constexpr = SLABS * PITCH // (2 * STK)
     mask_desc = tl.make_tensor_descriptor(
-        desc_mask, shape=[REGION_PAGES * W4 * MQ, STK],
-        strides=[SLABS * PITCH // 2, 1], block_shape=[MQ, STK])
+        desc_mask, shape=[REGION_PAGES * W4 * MROWS * MQ, STK],
+        strides=[STK, 1], block_shape=[MQ, STK])
 
     # ⭐ Q IS ONE TUPLE, ONE COLUMN WINDOW PER SLAB — the score dot is per
     # slab (the door's batched gathered contraction frame), each partial
@@ -287,7 +289,7 @@ def paged_fold_hm(desc_q, desc_m, desc_l, desc_acc,  #
         qk = qk * (SCALE * LOG2E)
         # The per-window mask rows, added at the score tile as a leading
         # stride-0 broadcast.
-        qk = qk + tl.reshape(mask_desc.load([w * MQ, 0]),
+        qk = qk + tl.reshape(mask_desc.load([w * MROWS * MQ, 0]),
                              [1, MQ, STK])
         # The score tile LENT to the accumulator's own frame — the module
         # doc's frame law: a flat identity ([B,MQ,STK] and [B*MQ,1,STK] both

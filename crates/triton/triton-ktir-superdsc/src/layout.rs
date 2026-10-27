@@ -700,6 +700,7 @@ fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
         | Program::TanhSoftCap
         | Program::ScalarWeightMul
         | Program::Reshape
+        | Program::BlockCopy
         | Program::WindowedRmsNorm { .. } => None,
     }
 }
@@ -955,6 +956,7 @@ fn scales_for(p: Program, f: &IRFunction<'static>) -> Vec<f32> {
         | Program::TanhSoftCap
         | Program::ScalarWeightMul
         | Program::Reshape
+        | Program::BlockCopy
         | Program::WindowedRmsNorm { .. } => Vec::new(),
     }
 }

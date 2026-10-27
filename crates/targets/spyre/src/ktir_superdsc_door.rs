@@ -209,6 +209,7 @@ pub fn lower(
             windowed(name, &r, lk::scalarweightmul(name, &r, sym_id_base, layout))
         }
         Program::Reshape => lk::reshape(name, &r, sym_id_base, layout),
+        Program::BlockCopy => lk::block_copy(name, k, &r, sym_id_base, layout),
         // ⭐ THE WALK PROVES WHAT THIS ARM HARDCODED. The per-`Program` matmul entry assumed
         // `TransposeB` and `OperandOrigin::Staged`; the walk reads the orientation off the op's own
         // `indexing_maps` (`whole_function::matmul_b_orientation`) and states the operands' origin

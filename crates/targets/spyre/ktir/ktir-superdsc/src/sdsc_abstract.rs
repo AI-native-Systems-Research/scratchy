@@ -11017,11 +11017,11 @@ pub fn spliced_attn_ids_table(
     Some(out)
 }
 
-/// ⭐⭐⭐⭐⭐ THE ONE-SEQUENCE ADDITIVE VALIDITY MASK — `[REGION_PAGES·W4·mq, 64]` f16 rows at
-/// the COMMON PITCH: row `(s·W4 + w)·mq + t`'s 64 lanes sit at byte `r·SLABS·PITCH` of the flat
-/// buffer (128 B meaningful, the gap unread pad) — the SAME per-(window, query-row) advance the
-/// ids tables' trip slots take, so the fold's single per-pass Activation shift walks both by one
-/// number. `0.0` where slot
+/// ⭐⭐⭐⭐⭐ THE ONE-SEQUENCE ADDITIVE VALIDITY MASK — DENSE `[REGION_PAGES·W4·MROWS·mq, 64]` f16
+/// rows at the COMMON PITCH, `MROWS = SLABS·PITCH/128`: trip `(s·W4 + w)` owns `MROWS·mq` rows,
+/// its query rows `t` first (row `(s·W4 + w)·MROWS·mq + t`) and the rest whole unread pad rows —
+/// the SAME per-trip bytes the ids tables' trip slots take, so the fold's single per-pass
+/// Activation shift walks both by one number, while the view stays dense for every reader. `0.0` where slot
 /// `s·PAGE_SLOTS + w·64 + c` is visible to query row `t`, and the f16 floor
 /// [`ATTN_SEED_FLOOR`] (the finite sentinel the carry's max seeds at — the format's own max, the
 /// kernels' clamp trick — a masked-everywhere row still normalizes with weight 0, never NaN)
@@ -11074,10 +11074,15 @@ pub fn spliced_attn_mask_f16(
             let bytes = if slot_base + c <= pos { &zero } else { &neg };
             m.extend_from_slice(bytes);
         }
-        // The pitch gap past the row's 128 B — unread by the kernel, zero-filled so every
-        // staged byte is deterministic, and exactly empty at `SLABS·PITCH == 128` (the
-        // `KTB == 32`, `slabs == 1` geometry where the tables' row and the mask's coincide).
-        m.extend(std::iter::repeat_n(0u8, pitch - row_bytes));
+        // The trip's pad ROWS after its last query row — whole 128 B rows, so the mask's view
+        // stays dense (every reader addresses it at its own row stride) while a trip still
+        // spans `mq·SLABS·PITCH` bytes, the tables' own per-trip bytes. Unread by the kernel,
+        // zero-filled so every staged byte is deterministic, and exactly empty at
+        // `SLABS·PITCH == 128` (the `KTB == 32`, `slabs == 1` geometry where the tables' row
+        // and the mask's coincide).
+        if t + 1 == mq {
+            m.extend(std::iter::repeat_n(0u8, mq * (pitch - row_bytes)));
+        }
     }
     // One 64-lane window per row — this family's rows ARE windows, the pitch the counts above
     // were minted at.

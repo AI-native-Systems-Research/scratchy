@@ -401,7 +401,7 @@ pub fn rope_p_class_hds(hds: impl Iterator<Item = u32>) -> Vec<u32> {
 }
 
 /// Every reserved region, in one place. Order is high tid → low.
-pub const RESERVED_REGIONS: [TidRegion; 8] = [
+pub const RESERVED_REGIONS: [TidRegion; 9] = [
     // The single sentinels (`ROPE_P_TID` .. `IDENTITY_TID`) occupy MAX-1 .. MAX-19.
     TidRegion {
         name: "sentinels",
@@ -471,6 +471,15 @@ pub const RESERVED_REGIONS: [TidRegion; 8] = [
         name: "paged_fold_carry",
         base: u32::MAX - 2_000_171,
         slots: 8,
+    },
+    // ⭐ THE HEAD-ROW BUFFERS — the attention kernels' per-head row frame (`[nqh·rows, hd]`) at a
+    // multi-slab head dim, one pair (q in, out back) per attention node, keyed on the node's own
+    // output tid ([`head_rows_tid`]). Written and read on-card by the head relayout copies the
+    // splice wraps around the attention program; sized from the copies' own views.
+    TidRegion {
+        name: "head_rows",
+        base: u32::MAX - 2_000_179,
+        slots: 2_000_000,
     },
 ];
 
@@ -730,6 +739,32 @@ impl PagedFoldCarry {
             PagedFoldCarry::Acc => 2,
         })
     }
+}
+
+/// Which half of an attention node's head-row pair a [`head_rows_tid`] names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadRows {
+    /// q in the per-head row frame — written by the to-rows copy, read by the attention program.
+    Q,
+    /// The attention output in the per-head row frame — written by the attention program, read by
+    /// the from-rows copy back to the token stream.
+    Out,
+}
+
+/// The reserved tid of attention node `out_tid`'s head-row buffer `which` — keyed on the node's
+/// output tid, so every layer's pair is its own placement.
+pub fn head_rows_tid(out_tid: u32, which: HeadRows) -> u32 {
+    reserved_region("head_rows").at(out_tid * 2
+        + match which {
+            HeadRows::Q => 0,
+            HeadRows::Out => 1,
+        })
+}
+
+/// Whether `tid` is one of the head-row buffers — the placement pass's own question.
+pub const fn is_head_rows(tid: u32) -> bool {
+    let region = reserved_region("head_rows");
+    region.floor() <= tid && tid <= region.base
 }
 
 /// Whether `tid` is one of the paged fold's three carry tensors — the placement pass's own

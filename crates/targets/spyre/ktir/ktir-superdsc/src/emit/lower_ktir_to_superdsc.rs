@@ -1499,14 +1499,29 @@ pub fn elementwise(
     // contract `base_addressed` states for a row corner on every other body). The DENSE arm
     // below carries both corners; this guard is what keeps the others from silently dropping
     // them.
+    //
+    // ⭐⭐⭐ AND THE BROADCAST ARM PLACES A WHOLE-STICK COLUMN WINDOW ON ITS OUTPUT AND ITS DENSE
+    // OPERANDS — the per-slab normalize at every head dim. A head of `hd` features is `hd/64`
+    // slabs, and a kernel that normalizes `acc / l` slab by slab stores slab `s` at column
+    // `s·64` of the `[rows, hd]` output (and the fold's finalize LOADS its accumulator the same
+    // way): a dense tile at a whole-stick column corner, the per-row `l` sprayed over its lanes.
+    // That window is plane `c/64` of the parent — the same [`crate::addr::ColWindow`] the dense
+    // arm and the Mb source already place ([`broadcast_col_window`]), carried into the
+    // descriptor as the operand's offset and the write's [`crate::addr::OutCorner`]. The corner
+    // is ANY whole stick of ANY width, so hd 64, 128, 256 and 512 are one law; a sub-stick
+    // corner is refused by that constructor, by name; a row corner and the per-row chain's
+    // one-lane output stay refused here.
+    let broadcast_arm = bcast.iter().any(Option::is_some);
+    let col_window_placeable = |x: &Region| broadcast_arm && x.r_start == 0 && x.c_len != 1;
     let corner_unplaceable = |i: usize, x: &Region| {
         (x.c_start != 0 || x.r_start != 0)
             && !(matches!(bcast.get(i), Some(Some(BcastAxis::Mb))) && x.r_start == 0)
             && !(matches!(bcast.get(i), Some(Some(BcastAxis::Y(_)))) && x.c_start == 0)
+            && !(matches!(bcast.get(i), Some(None)) && col_window_placeable(x))
     };
-    if (bcast.iter().any(Option::is_some) || out.c_len == 1)
-        && (out.c_start != 0
-            || out.r_start != 0
+    let out_unplaceable = (out.c_start != 0 || out.r_start != 0) && !col_window_placeable(&out);
+    if (broadcast_arm || out.c_len == 1)
+        && (out_unplaceable
             || ins
                 .iter()
                 .enumerate()
@@ -1533,13 +1548,13 @@ pub fn elementwise(
         return err(format!(
             "Elementwise({kind:?}) {name}: {who} states {what} corner {cs} of its view, and the \
              arm this shape routes to (a broadcast operand or the per-row one-stick chain) \
-             addresses its operands at the BUFFER BASE or at a broadcast mode — the one corner \
-             those arms can place is a COLUMN window on an Mb-broadcast source (`In::mb_at`, the \
-             per-block slice law) or a row window on a Y-broadcast source (`In::y_at`, the \
-             per-trip mask law), which this operand is not. A column-blocked chunk or a banded \
-             window is DENSE elementwise; the dense arm carries both corners, so give the \
-             broadcast/per-row chains whole-tensor regions (or an Mb source a whole-stick column \
-             window, or a Y source a row window at column 0).",
+             addresses its operands at the BUFFER BASE or at a broadcast mode — the corners \
+             those arms can place are a whole-stick COLUMN window at row 0 on the broadcast arm's \
+             output or a dense operand (`In::col_window`, the per-slab law), a COLUMN window on an \
+             Mb-broadcast source (`In::mb_at`, the per-block slice law) or a row window on a \
+             Y-broadcast source (`In::y_at`, the per-trip mask law), which this operand is not. A \
+             banded window is DENSE elementwise; the dense arm carries both corners, so give the \
+             broadcast/per-row chains whole-tensor regions or one of those windows.",
         ));
     }
     if bcast.iter().any(Option::is_some) {
@@ -2038,24 +2053,53 @@ fn elementwise_broadcast(
     // annotation-only (`In::ew` keeps the name and the two broadcast flags), and the OUTPUT's are too
     // (the builder reads `o.name()` and `O::kind()`), so the emission cannot depend on them; they are
     // stated at the operand's own shape so a reader is not misled.
-    let out_h = rb(
-        &out.name(),
-        RowCount::of_token_rows(rows),
-        BlockCols::of_feature_cols(cols),
-    );
+    //
+    // ⭐⭐⭐ A WINDOWED OUTPUT OR DENSE OPERAND IS DECLARED AT ITS FULL VIEW — the per-slab
+    // normalize's slab `s` at column `s·64` of `[rows, hd]` ([`broadcast_col_window`]). The mint
+    // checks the swept window AT the corner against the declaration, so a `[rows, cols]` handle
+    // would fail its own mint at any nonzero corner; `[v_rows, v_cols]` states the buffer the
+    // window sits in, the dense arm's own storage law. A corner-free operand keeps its handle.
+    let out_w = broadcast_col_window(name, kind, rows, out)?;
+    let out_h = match out_w {
+        Some(_) => rb_df(
+            &out.name(),
+            RowCount::of_token_rows(out.v_rows),
+            BlockCols::of_feature_cols(out.v_cols),
+            stick_df(out),
+        ),
+        None => rb(
+            &out.name(),
+            RowCount::of_token_rows(rows),
+            BlockCols::of_feature_cols(cols),
+        ),
+    };
+    let dense_w: Vec<Option<crate::addr::ColWindow>> = ins
+        .iter()
+        .zip(bcast)
+        .map(|(x, b)| match b {
+            None => broadcast_col_window(name, kind, rows, x),
+            Some(_) => Ok(None),
+        })
+        .collect::<Result<_, Error>>()?;
     let in_names: Vec<String> = ins.iter().map(Region::name).collect();
     let in_handles: Vec<_> = in_names
         .iter()
         .zip(ins)
-        .zip(bcast)
-        .map(|((n, x), b)| match b {
+        .zip(bcast.iter().zip(&dense_w))
+        .map(|((n, x), (b, w))| match (b, w) {
+            (None, Some(_)) => rb_df(
+                n,
+                RowCount::of_token_rows(x.v_rows),
+                BlockCols::of_feature_cols(x.v_cols),
+                stick_df(x),
+            ),
             // ⭐ A `Col` OPERAND'S STORAGE IS STICK-WIDE, not `[rows, 1]`: the row reduction that
             // wrote it reserved `rows × 64` (`synth_footprint_bytes` rounds the inner extent up to
             // a whole stick — the `rinv` law this arm's own header cites), and the RedStick read
             // sweeps ONE STICK PER ROW. The operand mint checks that swept window against the
             // handle's declaration, so the annotation now states the footprint the storage always
             // had — `rb(name, rows, 64)`, the same handle `rmsnorm.rs` mints for `rinv`.
-            Some(BcastAxis::Col) => rb(
+            (Some(BcastAxis::Col), _) => rb(
                 n,
                 RowCount::of_token_rows(x.v_rows),
                 BlockCols::of_one_stick(Lanes::FP16),
@@ -2067,7 +2111,7 @@ fn elementwise_broadcast(
             // states the buffer the window sits in, the same "true shapes" law `scalarmul_scaled`
             // states for its chunked tile (the walk's flat Mb frame presents the parent's whole
             // extent here, window and all).
-            Some(BcastAxis::Mb) if x.c_start != 0 => rb(
+            (Some(BcastAxis::Mb), _) if x.c_start != 0 => rb(
                 n,
                 RowCount::of_token_rows(x.v_rows),
                 BlockCols::of_feature_cols(x.v_cols),
@@ -2087,9 +2131,15 @@ fn elementwise_broadcast(
     let ew: Vec<_> = in_handles
         .iter()
         .zip(ins)
-        .zip(bcast)
-        .map(|((h, x), b)| match b {
-            None => Ok(In::full(h).ew()),
+        .zip(bcast.iter().zip(&dense_w))
+        .map(|((h, x), (b, w))| match b {
+            // ⭐ A DENSE OPERAND AT A WHOLE-STICK COLUMN CORNER — read through its window
+            // (`In::col_window`, the dense arm's own form), the fold finalize's per-slab
+            // accumulator load. Corner-free: the base `In::full`, byte-identical.
+            None => Ok(match w {
+                Some(w) => In::col_window(h, *w).ew(),
+                None => In::full(h).ew(),
+            }),
             Some(BcastAxis::Col) => Ok(In::col(h).ew()),
             // ⭐⭐⭐ THE Mb SOURCE AT A WHOLE-STICK COLUMN CORNER — the per-block slice law
             // (`In::mb_at`, the card-proven prefix-mask shape): one row of values read at the
@@ -2152,14 +2202,64 @@ fn elementwise_broadcast(
         cols,
         &ew,
         &out_h,
-        // WHOLE-TENSOR OUTPUT: [`elementwise`] refuses any corner on the OUTPUT before routing
-        // here (the one corner these arms can place — a whole-stick column window on an
-        // Mb-broadcast SOURCE — rides the operand itself as `In::mb_at`), so the output's offset
-        // is 0 by proof, not by default.
-        crate::addr::DevOff::ZERO,
+        // THE OUTPUT'S CORNER: its whole-stick column window when the program writes one (the
+        // per-slab normalize), else the buffer base — [`elementwise`] refused every other
+        // output corner before routing here, so the base is 0 by proof, not by default.
+        match out_w {
+            Some(w) => crate::addr::OutCorner::from(w),
+            None => crate::addr::OutCorner::ZERO,
+        },
         sym_id_base,
         layout,
     )])
+}
+
+/// The stick basis of a region's own data — fp8 by its view's `Dtype`, else the region's `df`.
+fn stick_df(x: &Region) -> Df {
+    if x.is_fp8 { Df::Fp8 } else { x.df }
+}
+
+/// ⭐⭐⭐ THE BROADCAST ARM'S COLUMN WINDOW — the output's or a dense operand's whole-stick column
+/// corner, as the [`crate::addr::ColWindow`] of its OWN view. `None` for a corner-free region (the
+/// whole-tensor emission, byte-identical).
+///
+/// The shape is the per-slab normalize at every head dim: a head of `hd` features is `hd/64`
+/// slabs, and slab `s` is written (and, in the fold's finalize, read) at column `s·64` of the
+/// `[rows, hd]` view. The corner is plane `c/64` of the parent at the parent's OWN plane stride
+/// (`v_rows·64`) — [`crate::addr::col_window_of`] over the view, the same corner
+/// [`column_windows_are_honoured`] holds the binding to — and it refuses a sub-stick corner by
+/// name. Any whole stick of any width is one law, so hd 64, 128, 256 and 512 need nothing more.
+///
+/// ⛔ ONE GEOMETRY IS REFUSED, AND IT IS [`band_corner`]'s. A window shorter than its view whose
+/// width spans more than one stick is not contiguous in the parent: the parent strides its
+/// planes `v_rows·64` apart, the window's own view `rows·64`. A one-stick window (every slab) is
+/// one plane's first `rows` rows — contiguous at any row count.
+fn broadcast_col_window(
+    name: &str,
+    kind: Elementwise,
+    rows: u32,
+    x: &Region,
+) -> Result<Option<crate::addr::ColWindow>, Error> {
+    if x.c_start == 0 && x.r_start == 0 {
+        return Ok(None);
+    }
+    let df = stick_df(x);
+    if x.c_len > df.elems_per_stick() && rows != x.v_rows {
+        return err(format!(
+            "Elementwise({kind:?}) {name}: t{}'s window is `[{rows}, {}]` at column {} of its              `[{}, {}]` view — a window of fewer rows than its view and wider than one {}-lane              stick is not contiguous in the parent (planes `v_rows·lanes` apart against the              window's `rows·lanes`). Keep the window one stick wide, or sweep the view's rows.",
+            x.tid,
+            x.c_len,
+            x.c_start,
+            x.v_rows,
+            x.v_cols,
+            df.elems_per_stick(),
+        ));
+    }
+    crate::addr::col_window_of(x.v_rows, x.v_cols, x.c_start, df)
+        .map(Some)
+        .map_err(|e| Error {
+            message: format!("Elementwise({kind:?}) {name}: t{}: {e}", x.tid),
+        })
 }
 
 /// main's `lower_silumul_node` (main 8466-8604): `out = silu(gate) · up` DECOMPOSED into two
@@ -8443,6 +8543,137 @@ pub fn scalarweightmul(
         sym_id_base,
         layout,
     )])
+}
+
+/// The per-`Program` door for [`crate::ktir_node::Program::BlockCopy`] — a copy program whose every
+/// store writes a value it loaded, unchanged, one whole-stick `[R, 64·w]` window per pair (the head
+/// relayout, `kernels/head_relayout.py`, between the token stream and the attention kernels'
+/// per-head rows).
+///
+/// ⭐ ONE `identity` COPY PER LOAD/STORE PAIR, EACH SIDE AT ITS OWN VIEW'S CORNER. The two corners
+/// are the program's own access tiles, read by the walk's own tile reader
+/// ([`super::whole_function::region_for_operand`] for the load, the store's tile through the same
+/// [`regions`] parameter row), and each becomes a device offset through [`rc_of`] over its OWN
+/// view's `[v_rows, v_cols]` — so the copy reads exactly the bytes the source view names and writes
+/// exactly the bytes the destination view names, whatever the two views' row counts. A pair whose
+/// windows disagree in shape is not a copy; a window that is not whole sticks has no stick-major
+/// address; a store of anything but a load is a compute op this door does not run. Each refuses
+/// by name.
+pub fn block_copy(
+    name: &str,
+    k: &KtirNode,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let f = &k.func;
+    let consts = index_constants(f);
+    let srcs: Vec<&Region> = r.iter().filter(|x| !x.is_out).collect();
+    let dsts: Vec<&Region> = r.iter().filter(|x| x.is_out).collect();
+    let ([src], [dst]) = (&srcs[..], &dsts[..]) else {
+        return err(format!(
+            "{name}: a block copy reads one tensor and writes one; this program binds {} input(s) \
+             and {} output(s)",
+            srcs.len(),
+            dsts.len()
+        ));
+    };
+    if src.df != dst.df {
+        return err(format!(
+            "{name}: the source t{} is {:?} and the destination t{} is {:?} — a copy that changes \
+             dtype is a convert, not a copy",
+            src.tid, src.df, dst.tid, dst.df
+        ));
+    }
+    let corner_of = |tile_v: Option<Ssa>, what: &str| -> Result<(u32, u32, u32, u32), Error> {
+        let tile = f
+            .operations
+            .iter()
+            .find(|o| o.op_type == OpKind::KtdpConstructAccessTile && o.result == tile_v)
+            .ok_or_else(|| Error {
+                message: format!("{name}: a {what} names no access tile"),
+            })?;
+        let (tr, tc) = shape_2d(tile).ok_or_else(|| Error {
+            message: format!("{name}: a {what}'s access tile states no 2-D shape"),
+        })?;
+        let rs = tile.operands.get(1).and_then(|v| consts.get(v).copied());
+        let cs = tile.operands.get(2).and_then(|v| consts.get(v).copied());
+        let (Some(rs), Some(cs)) = (rs, cs) else {
+            return err(format!(
+                "{name}: a {what}'s corner is not a compile-time constant — the copy's offsets are \
+                 baked, so a computed corner has no descriptor"
+            ));
+        };
+        Ok((rs as u32, cs as u32, tr, tc))
+    };
+    let stk = Fp16::ELEMS_PER_STICK;
+    let src_h = rb_df(
+        &src.name(),
+        RowCount::of_token_rows(src.v_rows),
+        BlockCols::of_feature_cols(src.v_cols),
+        src.df,
+    );
+    let dst_h = rb_df(
+        &dst.name(),
+        RowCount::of_token_rows(dst.v_rows),
+        BlockCols::of_feature_cols(dst.v_cols),
+        dst.df,
+    );
+    let mut ops = Vec::new();
+    for st in f.operations.iter().filter(|o| o.op_type == OpKind::KtdpStore) {
+        let value = st.operands.first().copied();
+        let load = f
+            .operations
+            .iter()
+            .find(|o| o.op_type == OpKind::KtdpLoad && o.result == value)
+            .ok_or_else(|| Error {
+                message: format!(
+                    "{name}: a store writes a value no `ktdp.load` produced — a block copy stores \
+                     only what it loaded"
+                ),
+            })?;
+        let (sr, sc, srl, scl) = corner_of(load.operands.first().copied(), "load")?;
+        let (dr, dc, drl, dcl) = corner_of(st.operands.get(1).copied(), "store")?;
+        if (srl, scl) != (drl, dcl) || scl == 0 || !scl.is_multiple_of(stk) {
+            return err(format!(
+                "{name}: a pair copies a `[{srl}, {scl}]` window into a `[{drl}, {dcl}]` one — the \
+                 two windows must be one shape of whole {stk}-element sticks"
+            ));
+        }
+        if !sc.is_multiple_of(stk) || !dc.is_multiple_of(stk) {
+            return err(format!(
+                "{name}: a pair's column corners ({sc}, {dc}) are not whole sticks — a sub-stick \
+                 corner sits mid-plane and has no stick-major address"
+            ));
+        }
+        // One `identity` per stick-column of the window: each `[rows, 64]` piece is one plane of
+        // each side at its own corner (a whole plane's first `rows` rows when the window is
+        // shorter than its view), so the copy is contiguous on both sides at any row count.
+        for j in 0..scl / stk {
+            let (sco, dco) = (sc + j * stk, dc + j * stk);
+            ops.push(assemble_pointwise_broadcast_off(
+                PointwiseFacts {
+                    op_name: &format!("blkcp{}_{sr}_{sco}_o{}", ops.len(), dst.tid),
+                    op_func: "identity",
+                    rows: RowCount::of_token_rows(srl),
+                    cols: BlockCols::of_one_stick(Lanes::FP16),
+                    inputs: &[In::sliced(
+                        &src_h,
+                        crate::addr::rc_of(src.v_rows, src.v_cols, sr, sco, src.df),
+                    )
+                    .ew()],
+                    o: &dst_h,
+                    out_offset: crate::addr::rc_of(dst.v_rows, dst.v_cols, dr, dco, dst.df).into(),
+                },
+                sym_id_base,
+                layout,
+            ));
+        }
+    }
+    if ops.is_empty() {
+        return err(format!("{name}: a block copy that stores nothing"));
+    }
+    Ok(ops)
 }
 
 /// The per-`Program` door for [`crate::ktir_node::Program::Reshape`] — a RE-LAYING COPY that

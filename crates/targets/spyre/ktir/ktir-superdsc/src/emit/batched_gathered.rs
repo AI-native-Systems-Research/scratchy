@@ -245,14 +245,19 @@ fn col_block(rows: u32, stick: u32) -> u32 {
 /// module doc for the frame law each operand's offset states.
 ///
 /// `a`/`w`/`o` are the operand NAMES; `a_rows`/`o_rows` the flat-frame row counts of the
-/// stick-major A and OUT buffers (`batch·m` for both, checked here).
+/// stick-major A and OUT buffers (`batch·m` for both, checked here). `a_stick`/`o_stick` are the
+/// first column stick of A's and OUT's window inside their buffers (0 for a whole buffer): in the
+/// stick-major frame column stick `s` starts at `s·rows·64`, so a whole-stick column window is a
+/// base offset and nothing else.
 pub fn dot_opspecs(
     bg: &BatchedGathered,
     a: &str,
     a_rows: u32,
+    a_stick: u32,
     w: &str,
     o: &str,
     o_rows: u32,
+    o_stick: u32,
 ) -> Result<Vec<OpSpec>, String> {
     let rows = bg.batch * bg.m;
     if a_rows != rows || o_rows != rows {
@@ -273,9 +278,9 @@ pub fn dot_opspecs(
                 a,
                 w,
                 o,
-                col_block(rows, ks),
+                col_block(rows, a_stick + ks),
                 ks * STK * bg.n + ns * STK,
-                col_block(rows, ns),
+                col_block(rows, o_stick + ns),
                 None,
             )?;
             // ⭐ THE KERNEL'S PHYSICAL `in`/`out` EXTENTS — the row-major `[batch, k, n]` buffer
@@ -309,7 +314,7 @@ pub fn dot_opspecs(
                 op.attach_fused_epilogue(EpilogueSpecs {
                     one: EpilogueSpec {
                         operand_name: o.to_string(),
-                        offset_elems: col_block(rows, ns),
+                        offset_elems: col_block(rows, o_stick + ns),
                         op_func: EpilogueOpFunc::StridedAdd,
                         broadcast_dims: &[],
                         broadcast_batch: false,
@@ -326,11 +331,12 @@ pub fn dot_opspecs(
 /// stick, output stick) through the shared fold machinery ([`emit_sdsc_tiled`]), each op
 /// LX-consulted like every op the door emits.
 ///
-/// `per_op` is `[A, B, OUT]` with B the C-order copy the materializer wrote. A and OUT must be
-/// WHOLE buffers at corner 0 — the per-stick column blocks address `[batch·m, k]` / `[batch·m, n]`
-/// stick-major at their base — and B must be the whole C-order scratch (its region's own rows are
-/// the geometry's `copy_rows`), or the door's region and the geometry disagree about which buffer
-/// the dot reads.
+/// `per_op` is `[A, B, OUT]` with B the C-order copy the materializer wrote. A and OUT must each
+/// span ALL of their buffer's rows and a whole-stick column window of it (`[batch·m, k]` /
+/// `[batch·m, n]` starting at a stick boundary) — the per-stick column blocks address that window
+/// at `c_start/64` sticks past the buffer's base — and B must be the whole C-order scratch (its
+/// region's own rows are the geometry's `copy_rows`), or the door's region and the geometry
+/// disagree about which buffer the dot reads.
 pub fn emit_dot(
     name: &str,
     bg: &BatchedGathered,
@@ -353,16 +359,29 @@ pub fn emit_dot(
     let whole = |r: &crate::emit::lower_ktir_to_superdsc::Region| {
         r.r_start == 0 && r.c_start == 0 && r.r_len == r.v_rows && r.c_len == r.v_cols
     };
-    for (what, r, cols) in [("A", a, bg.k), ("OUT", o, bg.n)] {
-        if !whole(&r) || r.c_len != cols {
+    // A whole-stick column window: every row of the buffer, `cols` columns starting at a stick
+    // boundary, inside the buffer. Its first stick is the base offset the column blocks start at.
+    let col_window = |r: &crate::emit::lower_ktir_to_superdsc::Region, cols: u32| {
+        (r.r_start == 0
+            && r.r_len == r.v_rows
+            && r.c_len == cols
+            && r.c_start.is_multiple_of(STK)
+            && r.c_start + r.c_len <= r.v_cols)
+            .then_some(r.c_start / STK)
+    };
+    let mut first_stick = [0u32; 2];
+    for (slot, (what, r, cols)) in [("A", a, bg.k), ("OUT", o, bg.n)].into_iter().enumerate() {
+        let Some(s) = col_window(&r, cols) else {
             return err(format!(
                 "{name}: the batched gathered dot's {what} t{} is the window [{}, {}] at ({}, {}) \
-                 of a [{}, {}] buffer — the per-stick column blocks address a WHOLE [batch·m, \
-                 {cols}] stick-major buffer at its base",
+                 of a [{}, {}] buffer — the per-stick column blocks address every row and a \
+                 whole-stick [batch·m, {cols}] column window of a stick-major buffer",
                 r.tid, r.r_len, r.c_len, r.r_start, r.c_start, r.v_rows, r.v_cols
             ));
-        }
+        };
+        first_stick[slot] = s;
     }
+    let [a_stick, o_stick] = first_stick;
     if !whole(&w) || w.r_len != bg.copy_rows() || w.c_len != STK {
         return err(format!(
             "{name}: the batched gathered dot's B t{} is the window [{}, {}] at ({}, {}) of a \
@@ -378,12 +397,19 @@ pub fn emit_dot(
             bg.copy_rows()
         ));
     }
-    let ops =
-        dot_opspecs(bg, &a.name(), a.v_rows, &w.name(), &o.name(), o.v_rows).map_err(|msg| {
-            Error {
-                message: format!("{name}: {msg}"),
-            }
-        })?;
+    let ops = dot_opspecs(
+        bg,
+        &a.name(),
+        a.v_rows,
+        a_stick,
+        &w.name(),
+        &o.name(),
+        o.v_rows,
+        o_stick,
+    )
+    .map_err(|msg| Error {
+        message: format!("{name}: {msg}"),
+    })?;
     let ks_count = bg.k / STK;
     let mut out = Vec::with_capacity(ops.len());
     for (i, mut op) in ops.into_iter().enumerate() {
@@ -532,7 +558,7 @@ mod byte_gate {
             )
             .unwrap();
             let rows = bg.batch * bg.m;
-            let dots = dot_opspecs(&bg, "a", rows, "w", "o", rows).unwrap();
+            let dots = dot_opspecs(&bg, "a", rows, 0, "w", "o", rows, 0).unwrap();
             let mut checked = 0u64;
             for (i, op) in dots.iter().enumerate() {
                 let (ns, ks) = (i as u32 / (bg.k / STK), i as u32 % (bg.k / STK));
@@ -577,7 +603,7 @@ mod byte_gate {
     fn the_dot_reads_a_and_writes_out_in_the_stick_major_flat_frame() {
         for bg in [pooled(), grouped(), moe_per_token(), wide_k()] {
             let rows = bg.batch * bg.m;
-            let dots = dot_opspecs(&bg, "a", rows, "w", "o", rows).unwrap();
+            let dots = dot_opspecs(&bg, "a", rows, 0, "w", "o", rows, 0).unwrap();
             let m_probe: Vec<u32> = [0, 1, bg.m / 2, bg.m - 1].into_iter().collect();
             let b_probe: Vec<u32> = [0, 1, bg.page, bg.batch / 2, bg.batch - 1]
                 .into_iter()
@@ -669,7 +695,7 @@ mod byte_gate {
             (b % bg.page * bg.k + kk) * bg.n + nn,
         );
         // The emitted (ks=0, ns=0) dot op — WITH its physical extents — reads it there.
-        let dots = dot_opspecs(&bg, "a", bg.batch * bg.m, "w", "o", bg.batch * bg.m).unwrap();
+        let dots = dot_opspecs(&bg, "a", bg.batch * bg.m, 0, "w", "o", bg.batch * bg.m, 0).unwrap();
         let op = &dots[0];
         let w = &op.args[1];
         let read = fold(
@@ -722,7 +748,7 @@ mod byte_gate {
             (wide_k(), 2),
         ] {
             let rows = bg.batch * bg.m;
-            let dots = dot_opspecs(&bg, "a", rows, "w", "o", rows).unwrap();
+            let dots = dot_opspecs(&bg, "a", rows, 0, "w", "o", rows, 0).unwrap();
             assert_eq!(dots.len(), want, "{bg:?}");
             assert_eq!(bg.dot_ops() as usize, want);
             let copies = copy_opspecs(
@@ -750,7 +776,7 @@ mod byte_gate {
     fn the_dot_serializes_innermost_first_with_back_gaps() {
         let bg = pooled();
         let rows = bg.batch * bg.m;
-        let dots = dot_opspecs(&bg, "a", rows, "w", "o", rows).unwrap();
+        let dots = dot_opspecs(&bg, "a", rows, 0, "w", "o", rows, 0).unwrap();
         for op in &dots {
             for arg in &op.args {
                 let v = arg.view();
@@ -814,8 +840,8 @@ mod byte_gate {
     #[test]
     fn the_dot_refuses_mismatched_flat_frame_rows() {
         let bg = pooled();
-        assert!(dot_opspecs(&bg, "a", bg.batch * bg.m, "w", "o", bg.batch * bg.m).is_ok());
-        let Err(m) = dot_opspecs(&bg, "a", bg.batch * bg.m + 64, "w", "o", bg.batch * bg.m) else {
+        assert!(dot_opspecs(&bg, "a", bg.batch * bg.m, 0, "w", "o", bg.batch * bg.m, 0).is_ok());
+        let Err(m) = dot_opspecs(&bg, "a", bg.batch * bg.m + 64, 0, "w", "o", bg.batch * bg.m, 0) else {
             panic!("an A wider than batch·m must refuse");
         };
         assert!(m.contains("flat frame"), "{m}");

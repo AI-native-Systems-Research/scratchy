@@ -193,6 +193,13 @@ pub enum Program {
     /// mechanism). See
     /// [`reshape`](crate::emit::lower_ktir_to_superdsc::reshape).
     Reshape,
+    /// ⭐ A WHOLE-STICK BLOCK COPY — every `ktdp.load` stored straight back, each `[R, 64]`
+    /// window copied from its source corner to its destination corner (the head relayout:
+    /// `kernels/head_relayout.py`, the token stream ↔ the attention kernels' per-head rows at
+    /// every head dim). TWO tensor parameters. The door lowers one `identity` copy per
+    /// load/store pair, each side at its own view's corner — see
+    /// [`block_copy`](crate::emit::lower_ktir_to_superdsc::block_copy).
+    BlockCopy,
     ScalarMul,
     Matmul,
     /// The last-row extraction half of an lm-head tail — see [`KtirNode::node_out_tid`].

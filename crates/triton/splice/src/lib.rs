@@ -347,6 +347,19 @@ pub fn paged_fold_finalize_row() -> TritonKernelRow {
     }
 }
 
+/// THE HEAD RELAYOUT'S TWO ROWS — `head_relayout.py`'s `to_head_rows_fwd` (the token stream's
+/// q into the attention kernels' per-head row frame) and `from_head_rows_fwd` (the attention
+/// output back). Spliced around an attention program exactly where the two frames are different
+/// bytes: a multi-slab head dim (see [`HeadRelayout`]).
+fn head_relayout_row(entry: &'static str) -> TritonKernelRow {
+    TritonKernelRow::Spliced {
+        src: include_str!("../../../targets/spyre/kernels/head_relayout.py"),
+        file: "head_relayout.py",
+        entry,
+        program: Program::BlockCopy,
+    }
+}
+
 /// THE ROW FOR A NODE — the family functions composed. Every `SubOp` that can reach the
 /// splice has a family below (attention rides its own `lower_attn` entry); the ops the
 /// spyre target has no kernel FOR (the 2b expansion kinds, the host-routed pairs, …)
@@ -1726,6 +1739,10 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     // pool write read). `None` only over a graph with no attention node; an AttnDecode under a
     // `None` is a walk/splice desync and refuses below.
     scale_law: Option<ktir_superdsc::score_scale::ScoreScaleLaw>,
+    // ⭐ WHETHER THE ATTENTION OUTPUT STAYS IN THE PER-HEAD ROW FRAME — the head-major o_proj
+    // handoff (`BundleAttnParams::headmajor_handoff`): its permuted weight copy reads exactly
+    // those bytes, so the from-rows copy is not emitted under it. See [`HeadRelayout`].
+    out_stays_head_rows: bool,
 ) -> Result<Vec<EmittedOp>, String> {
     let SubOp::AttnDecode { geom, .. } = &node.op else {
         return Err(
@@ -1751,6 +1768,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
             rows_are_requests,
             paged_fold,
             scale_law,
+            out_stays_head_rows,
         },
     ) {
         Some(out) => out,
@@ -1778,6 +1796,7 @@ struct AttnAtTheDoor<'a, F: scratchy_subtile::subtile_ir::RopeForm> {
     rows_are_requests: bool,
     paged_fold: Option<&'a PagedFoldRung>,
     scale_law: Option<ktir_superdsc::score_scale::ScoreScaleLaw>,
+    out_stays_head_rows: bool,
 }
 
 impl<F: scratchy_subtile::subtile_ir::RopeForm> scratchy_subtile::model_geometry::OnAttnGeometry
@@ -1788,7 +1807,166 @@ impl<F: scratchy_subtile::subtile_ir::RopeForm> scratchy_subtile::model_geometry
         self,
         geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
     ) -> Self::Out {
-        lower_attn_at(geom, self)
+        // ⭐ THE RELAYOUT IS DECIDED BY THE GEOMETRY, NOT BY A ROW ARM: the per-head row frame
+        // and the token stream are different bytes at every multi-slab head dim, for every
+        // attention program this door mints (prefill, solo decode, the fold family) — so the
+        // wrap is one tail over all of them.
+        let relayout = HeadRelayout::of(geom, self.node, self.out_stays_head_rows);
+        let (node, ir) = (self.node, self.ir);
+        let ops = lower_attn_at(geom, self)?;
+        match relayout {
+            Some(r) => r.wrap(node, ir, ops),
+            None => Ok(ops),
+        }
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ THE HEAD RELAYOUT — the attention kernels' per-head row frame, made the bytes their
+/// views state at every head dim.
+///
+/// The kernels read q and write their output through `[nqh·R, HD]` views (row `h·R + r`, the
+/// torch head-major layout), while the graph's q and attention output are the `[R, nqh·HD]`
+/// token stream. Stick-blocked, the token stream puts head `h` slab `s` row `r` at stick
+/// `(h·SLABS + s)·R + r` and the row frame at `s·nqh·R + h·R + r`: the SAME bytes exactly when
+/// `SLABS == 1`, a permutation of whole `[R, 64]` blocks at every wider head dim (128, 256, 512).
+/// So at `SLABS > 1` the attention program binds two reserved row-frame buffers instead of the
+/// graph tensors, and two copies (`head_relayout.py`) move the bytes: the token stream's q into
+/// the q rows before it, the output rows back into the token stream after it. `SLABS == 1` emits
+/// nothing — the bundle is byte-identical.
+///
+/// ⭐ UNDER THE HEAD-MAJOR o_proj HANDOFF THE OUTPUT STAYS IN THE ROW FRAME: the handoff's
+/// permuted o_proj copy is derived for exactly those bytes, so the from-rows copy is dropped and
+/// the attention writes the graph's output tensor directly in the row frame.
+struct HeadRelayout {
+    rows: u32,
+    heads: u32,
+    hd: u32,
+    out_stays_head_rows: bool,
+}
+
+impl HeadRelayout {
+    fn of<F: scratchy_subtile::subtile_ir::RopeForm, const NQH: u32, const NKVH: u32, const HD: u32>(
+        geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+        node: &SubtileNode<F>,
+        out_stays_head_rows: bool,
+    ) -> Option<HeadRelayout> {
+        (geom.slabs() > 1).then_some(HeadRelayout {
+            rows: node.output.region.rows.len,
+            heads: NQH,
+            hd: HD,
+            out_stays_head_rows,
+        })
+    }
+
+    fn spec(&self, entry: &str) -> Result<KernelSpec, String> {
+        let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+        let mut constexprs: HashMap<String, Val> = HashMap::new();
+        for p in ["desc_src", "desc_dst"] {
+            signature.insert(
+                p.to_string(),
+                ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+            );
+        }
+        for (k, v) in [
+            ("R", self.rows),
+            ("H", self.heads),
+            ("HD", self.hd),
+            ("STK", ktir_superdsc::sdsc_abstract::POOL_STICK),
+        ] {
+            signature.insert(k.to_string(), ArgSpec::Constexpr);
+            constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
+        }
+        Ok(KernelSpec {
+            kernel: entry.to_string(),
+            signature,
+            constexprs,
+            file: "head_relayout.py".to_string(),
+        })
+    }
+
+    /// One relayout copy program, bound `[src, dst]`.
+    fn copy(&self, entry: &'static str, name: String, src: u32, dst: u32) -> Result<EmittedOp, String> {
+        let (k_src, program) = match head_relayout_row(entry) {
+            TritonKernelRow::Spliced { src, program, .. } => (src, program),
+            TritonKernelRow::Refused(why) => return Err(why.to_string()),
+        };
+        let positional = attn_positional(k_src, &self.spec(entry)?, &[1], program)?;
+        let KtirNode { func, program, .. } = positional;
+        if func.arguments.len() != 2 {
+            return Err(format!(
+                "triton splice: {entry} compiled to {} parameters — the relayout binds [src, dst]",
+                func.arguments.len()
+            ));
+        }
+        let name = Arena::global().str(name);
+        let mut e = EmittedOp::bare(name.to_string());
+        e.ktir = Some(KtirNode {
+            func: ktir_core::ir::IRFunction { name, ..func },
+            program,
+            bindings: vec![BufferId::new(src), BufferId::new(dst)],
+            mask: None,
+            step_inputs: Vec::new(),
+            node_out_tid: None,
+            minted: Default::default(),
+        });
+        Ok(e)
+    }
+
+    /// Re-point every attention program's q / output binding at the row-frame buffers and put
+    /// the two copies around them, in program order.
+    fn wrap<F: scratchy_subtile::subtile_ir::RopeForm>(
+        &self,
+        node: &SubtileNode<F>,
+        _ir: &SubtileIR<F>,
+        mut ops: Vec<EmittedOp>,
+    ) -> Result<Vec<EmittedOp>, String> {
+        use ktir_superdsc::reserved_tids::{HeadRows, head_rows_tid};
+        let q = node.inputs[0].tensor.index() as u32;
+        let out = node.output.tensor.index() as u32;
+        let q_rows = head_rows_tid(out, HeadRows::Q);
+        let out_rows = if self.out_stays_head_rows {
+            out
+        } else {
+            head_rows_tid(out, HeadRows::Out)
+        };
+        let mut rebound = 0;
+        for e in ops.iter_mut() {
+            if let Some(k) = e.ktir.as_mut() {
+                for b in k.bindings.iter_mut() {
+                    if b.get() == q {
+                        *b = BufferId::new(q_rows);
+                        rebound += 1;
+                    } else if b.get() == out && out_rows != out {
+                        *b = BufferId::new(out_rows);
+                        rebound += 1;
+                    }
+                }
+            }
+        }
+        if rebound == 0 {
+            return Err(format!(
+                "triton splice: AttnDecode t{out}: the head relayout found no attention program \
+                 binding q t{q} or the output — nothing would read the relaid bytes"
+            ));
+        }
+        let id = node.id.index();
+        let mut wrapped = Vec::with_capacity(ops.len() + 2);
+        wrapped.push(self.copy(
+            "to_head_rows_fwd",
+            format!("blkcp_q_s{id}"),
+            q,
+            q_rows,
+        )?);
+        wrapped.extend(ops);
+        if !self.out_stays_head_rows {
+            wrapped.push(self.copy(
+                "from_head_rows_fwd",
+                format!("blkcp_o_s{id}"),
+                out_rows,
+                out,
+            )?);
+        }
+        Ok(wrapped)
     }
 }
 
@@ -1812,6 +1990,8 @@ fn lower_attn_at<
         rows_are_requests,
         paged_fold,
         scale_law,
+        // Read by the geometry door's wrap ([`HeadRelayout`]), not by this body.
+        out_stays_head_rows: _,
     } = at;
     let row = if rows_are_requests {
         attn_decode_row()
@@ -3817,6 +3997,7 @@ fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
         Program::TanhSoftCap => "tanhsoftcap",
         Program::ScalarWeightMul => "scalarwmul",
         Program::Reshape => "reshape",
+        Program::BlockCopy => "blkcp",
         _ => "triton",
     }
 }

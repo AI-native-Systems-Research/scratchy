@@ -858,6 +858,12 @@ pub(crate) fn lower_one_node<F: RopeForm>(
     // AttnDecode arm below never runs); the arm refuses a `None` arriving with an AttnDecode —
     // a law the walk did not mint over a node that needs one is a walk/splice desync.
     scale_law: Option<ScoreScaleLaw>,
+    // ⭐ THE HEAD-MAJOR o_proj HANDOFF of the bundle this node bakes into
+    // (`BundleAttnParams::headmajor_handoff`) — under it the attention output stays in the
+    // kernels' per-head row frame, the bytes the permuted o_proj copy is derived for, so the
+    // splice's head relayout drops its from-rows copy. `false` on every walk that zeroes the
+    // handoff (the unrolled body, the wiring walk).
+    out_stays_head_rows: bool,
 ) -> NodeLowering {
     use NodeLowering::{HostRouted, Ops, Unhandled};
     // ⭐⭐⭐ A FOLDED SCALARMUL'S READERS BIND THE PRODUCER'S OUTPUT. The fold takes the node
@@ -1106,6 +1112,7 @@ pub(crate) fn lower_one_node<F: RopeForm>(
                 rows_are_requests,
                 paged_fold,
                 scale_law,
+                out_stays_head_rows,
             ) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
@@ -1174,7 +1181,7 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
     // attention program's multiplier from it ([`score_scale_law`]'s one derivation).
     let scale_law = score_scale_law(ir)?;
     for node in &ir.nodes {
-        match lower_one_node(node, ir, active_cap, rows_are_requests, None, scale_law) {
+        match lower_one_node(node, ir, active_cap, rows_are_requests, None, scale_law, false) {
             NodeLowering::Ops(v) => ops.extend(v),
             NodeLowering::Unhandled(s) => {
                 // A MALFORMED matmul is an immediate hard stop (it must never bake);
@@ -1228,6 +1235,7 @@ pub fn lower_graph_to_superdsc<F: RopeForm>(
     // re-rolled walk places them ahead of its declare pass for the same reason (see
     // [`place_step_inputs`]).
     place_step_inputs(&mut bundle_layout, &[&programs], ir.tensors.len() as u32)?;
+    place_head_rows(&mut bundle_layout, &[&programs])?;
     // ⭐⭐⭐ THE KV BLOCK INDEX GOES LAST OF ALL — after `complete_program_scales` (which ran
     // inside `lower_graph_to_ktir`, before the step inputs) and after `place_step_inputs`,
     // i.e. past the last host-staged placement this walk makes. Same law as the re-rolled
@@ -1526,6 +1534,7 @@ pub fn graph_wiring<F: RopeForm>(
                     // `attn_bundle_params` runs, so the wiring's programs and the
                     // shipped bundle's state one multiplier spelling.
                     score_scale_law(ir)?,
+                    false,
                 ) {
                     NodeLowering::Ops(v) => v,
                     // A host-routed op runs off the device, so it has no program and binds nothing. It
@@ -2127,6 +2136,100 @@ pub fn place_paged_fold_carry(
     Ok(())
 }
 
+/// ⭐ THE HEAD-ROW BUFFERS' PLACEMENT — the attention kernels' per-head row frame at a multi-slab
+/// head dim ([`ktir_superdsc::reserved_tids::HeadRows`]), written and read on-card by the splice's
+/// head relayout copies and the attention programs between them. Sized from the binding
+/// programs' OWN views (every program that binds one states the same `[nqh·rows, hd]`), placed in
+/// the Intermediate segment like the fold carry, and a second sighting must agree. No head-row
+/// binding, no placement: a single-slab bundle is byte-identical.
+pub fn place_head_rows(
+    layout: &mut BundleLayout,
+    op_lists: &[&[EmittedOp]],
+) -> Result<(), SuperDscError> {
+    use ktir_superdsc::reserved_tids::is_head_rows;
+    for ops in op_lists {
+        for e in ops.iter() {
+            let Some(k) = e.ktir.as_ref() else { continue };
+            let rows: Vec<u32> = k
+                .bindings
+                .iter()
+                .map(|b| b.get())
+                .filter(|tid| is_head_rows(*tid))
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
+            let regs = ktir_superdsc::emit::lower_ktir_to_superdsc::regions(k)
+                .map_err(|err| SuperDscError(format!("{}: {}", e.op_name, err.message)))?;
+            for tid in rows {
+                let binding = k
+                    .bindings
+                    .iter()
+                    .position(|b| b.get() == tid)
+                    .ok_or_else(|| {
+                        SuperDscError(format!(
+                            "{}: the head-row buffer t{tid} is filtered from this program's own \
+                             bindings — the filter and the search disagree, which cannot happen",
+                            e.op_name
+                        ))
+                    })?;
+                let region = regs.iter().find(|r| r.tid == tid).ok_or_else(|| {
+                    SuperDscError(format!(
+                        "{}: the head-row buffer t{tid} is bound but states no view",
+                        e.op_name
+                    ))
+                })?;
+                let df = ktir_superdsc::emit::lower_ktir_to_superdsc::param_df(k, binding)
+                    .ok_or_else(|| {
+                        SuperDscError(format!(
+                            "{}: the head-row buffer t{tid}'s view states a dtype with no stick \
+                             geometry",
+                            e.op_name
+                        ))
+                    })?;
+                let size = region.v_rows as u64 * region.v_cols as u64 * df.word_length() as u64;
+                let seg = SegRole::Intermediate.segment();
+                match layout.placements.get(&tid) {
+                    Some(p) => {
+                        if p.role != SegRole::Intermediate || p.segment != seg || p.size != size {
+                            return Err(SuperDscError(format!(
+                                "{}: t{tid} is stated as a head-row buffer of {} B, but the bundle \
+                                 already places it as {} B in segment {} — two programs disagree \
+                                 about one buffer's extent",
+                                e.op_name, size, p.size, p.segment
+                            )));
+                        }
+                    }
+                    None => {
+                        let off = layout.segment_bytes[seg];
+                        layout.placements.insert(
+                            tid,
+                            TensorPlacement {
+                                tid,
+                                bank: 0,
+                                role: SegRole::Intermediate,
+                                segment: seg,
+                                offset: off,
+                                size,
+                                cover: ktir_superdsc::placement::BindCover::Full,
+                            },
+                        );
+                        layout.segment_bytes[seg] = align128(off + size);
+                        // The synth cursor rides above the buffer — the fold carry's own law.
+                        let mut synth = layout.synth.borrow_mut();
+                        synth.next = synth.next.max(layout.segment_bytes[seg]);
+                        layout.ids.borrow_mut().insert(
+                            ktir_superdsc::place::act_name(tid),
+                            ktir_superdsc::place::PlaceId::Act(tid),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// RE-ROLLED tape-driven SuperDSC lowering — the mirror of `lower_subtile_tape_to_tk_tape`
 /// for SuperDSC (the fix for the 40-min unrolled-bundle compile). Walks the rerolled
 /// `tape` (`subtile_tape::reroll_subtile_tape`): pre-loop Computes → `prefix`; the
@@ -2165,6 +2268,12 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // consumers — the index placement (`compute_bundle_layout`'s `gathers_kv`) and the door's
     // `BundleAttnParams` — so an index is reserved exactly where a chunk gathers through it.
     let chunk_pages = admitted_chunk(ir, chunk_pages);
+    // ⭐ THE HANDOFF, READ BEFORE THE BODIES LOWER — the same `attn_bundle_params` the door pass
+    // below mints (a pure function of the graph and this rung's facts), so the splice's head
+    // relayout and the door's o_proj swap read one fact.
+    let out_stays_head_rows =
+        attn_bundle_params(ir, rows_are_requests, one_request_decode, chunk_pages)?
+            .is_some_and(|p| p.headmajor_handoff);
     // ⛔ THE `set_rows_are_requests` / `RestoreRar` DANCE IS DELETED. It pushed the row KIND into a
     // thread-local for the duration of one bundle's lowering, with a `Drop` guard to restore it, purely
     // so the matmul splitter would not need the fact in its signature. That made the kind ambient: no
@@ -2632,6 +2741,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
                     rows_are_requests,
                     paged_fold.as_ref(),
                     scale_law,
+                    out_stays_head_rows,
                 ) {
                     NodeLowering::Ops(v) => {
                         if seg == 0 {
@@ -2752,6 +2862,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // the fold rung's bundle may carry it alone. Before the declare pass, for the same reason
     // the step inputs are.
     place_paged_fold_carry(&mut bundle_layout, &step_input_lists)?;
+    place_head_rows(&mut bundle_layout, &step_input_lists)?;
     // ⭐⭐⭐ THE SAME COMPLETION, over the SAME program lists the declare pass below lowers —
     // before that pass, because the door resolves a folded constant by bits. Bits-sorted
     // appends, so this walk's prefix→bodies→suffix order and `graph_wiring`'s node order

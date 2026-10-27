@@ -248,6 +248,7 @@ fn emit_regions(
         | Program::TanhSoftCap
         | Program::ScalarWeightMul
         | Program::Reshape
+        | Program::BlockCopy
         | Program::WindowedRmsNorm { .. } => {
             return Err(Error {
                 stage: "program",
