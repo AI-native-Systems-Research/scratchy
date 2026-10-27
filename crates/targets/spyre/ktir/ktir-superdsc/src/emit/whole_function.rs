@@ -53,7 +53,7 @@ use crate::ktir_node::{Elementwise, KtirNode, Program, ReduceKind};
 // from it — so it lives beside that door and this recogniser names the same type rather than a
 // parallel one that would have to be mapped across the boundary. The CONVERT KIND is the same
 // trade for a dtype-convert: the emission door's own vocabulary, not a `Program` variant.
-use super::lower_ktir_to_superdsc::{BcastAxis, ConvertKind, RowBand};
+use super::lower_ktir_to_superdsc::{BcastAxis, ConvertKind};
 use crate::placement::BundleLayout;
 use crate::superdsc_opspec::Df;
 use crate::work::DeviceWidth;
@@ -2168,52 +2168,16 @@ fn windowed_region(k: &KtirNode, mut r: Region, tile: &Operation<'_>) -> Result<
     // parameter walk's fold.
     if row.is_some_and(|s| !consts.contains_key(&s)) {
         r.r_cover = (rs, rs.saturating_add(r_len));
-        // ⭐⭐⭐ AND THE TYPED BAND RIDES THE REGION — the flush band the launch's own
-        // tiles tile. This is the ONE construction site in the crate (`RowBand::flush`
-        // is `pub(crate)` and named for this arm): the band can equal the whole view
-        // (base 0, band == rows — the batched sampler's `pid`-cornered `[1, ·]` tiles
-        // over `[B, ·]`), which no extent test can tell from an ordinary whole-view
-        // read, so the mint reads it back as a TYPE. See [`RowBand`].
-        r.band = Some(RowBand::flush(tr, positions as u32));
     }
     Ok(r)
 }
 
 /// The rows a banded op's minted intermediate must hold: a WINDOWED input's band (`r_len`), or
 /// `logical` when every input is whole-view. See the mint's own doc for the full argument.
-///
-/// ⭐⭐⭐ A FLUSH BAND COUNTS EVEN WHEN IT EQUALS THE VIEW — that is the whole reason
-/// [`RowBand`] is typed. A `pid`-cornered `[1, ·]` tile over a `[B, ·]` view resolves as
-/// the band `[0, B)` — shape-identical to a whole-view read, invisible to the
-/// `r_cover != (0, v_rows)` test above — so the typed field is the one witness, and the
-/// mint must size to the band (`[B, ·]`) exactly as rope's mint sizes to `[1024, ·]`.
 fn band_rows_of(ins: &[Region], logical: u32) -> u32 {
     ins.iter()
-        .find(|x| x.r_cover != (0, x.v_rows) || x.band.is_some())
+        .find(|x| x.r_cover != (0, x.v_rows))
         .map_or(logical, |x| x.r_len)
-}
-
-/// The ONE band a set of inputs states, refusing disagreement: an op sweeps one band,
-/// and a mint between two differently-banded inputs would size to whichever it saw
-/// first. `None` when no input is banded — the ordinary case, byte-identical to before.
-fn band_of(name: &str, ins: &[Region]) -> Result<Option<RowBand>, Error> {
-    let mut stated: Option<RowBand> = None;
-    for x in ins {
-        if let Some(b) = x.band {
-            match stated {
-                None => stated = Some(b),
-                Some(prev) if prev == b => {}
-                Some(prev) => {
-                    return err(format!(
-                        "{name}: the op reads inputs banded differently ({prev:?} vs {b:?}) — \
-                         one op sweeps one band, and a mint between them would size to whichever \
-                         it saw first"
-                    ));
-                }
-            }
-        }
-    }
-    Ok(stated)
 }
 
 /// The [`Region`] of the parameter that operand `slot` of a TILE op reinterprets — the tail both the
@@ -3904,13 +3868,6 @@ pub fn lower_function(
             // `synth_df` reserves the true width, the same fact `pointwise_broadcast_opspec_df`
             // threads into the descriptors.
             layout.synth_df(crate::place::PlaceId::Act(tid), &dev_dims, op_df);
-            // ⭐⭐⭐ THE BAND PROPAGATES THROUGH THE MINT — a banded op's intermediate is a
-            // banded operand of the NEXT op. The minted region states the band its inputs
-            // stated (`band_of` refuses a disagreement), so a chain of ops over a flush band
-            // mints every intermediate at the band's height: without this, the first mint
-            // would drop the typed fact and the second op's inputs would look whole-view
-            // again, minting `[1, ·]` while its per-row operands are `[B, ·]`.
-            let band = band_of(f.name, &per_op)?;
             let r = Region {
                 tid,
                 v_rows: dims[0],
@@ -3923,7 +3880,6 @@ pub fn lower_function(
                 c_cover: (0, dims[1]),
                 is_out: true,
                 is_fp8: false,
-                band,
             };
             inter.insert(res, r);
             per_op.push(r);
@@ -4374,7 +4330,6 @@ fn gathered_matmul_materializes(
         c_cover: (0, head),
         is_out: true,
         is_fp8: false,
-        band: None,
     };
     // ── (3) THE GATHERED IDENTITY COPY — the `test_gather_1core` shape, through the one body
     // that declares an index operand. One input (the table), `identity`, the intermediate as
@@ -4943,7 +4898,6 @@ mod presented_flat_tests {
             c_cover: (0, cols),
             is_out: false,
             is_fp8: false,
-            band: None,
         }
     }
 
