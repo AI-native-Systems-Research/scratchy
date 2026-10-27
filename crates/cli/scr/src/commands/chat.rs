@@ -325,6 +325,16 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
                 return Err(Interrupted.into());
             }
         }
+        // #32 tuning, step 1 — the pipelined step's host-segment table, at chat
+        // end, only under --bench. The gate never leaves the CLI: the worker
+        // accumulates unconditionally (a Duration add cannot cost a 24 ms step)
+        // and hands the table to whoever asks; every non-spyre backend answers
+        // None by type.
+        if args.bench
+            && let Some(table) = scratchy_serving_api::step_segment_table()
+        {
+            eprintln!("{table}");
+        }
         return Ok(());
     }
 

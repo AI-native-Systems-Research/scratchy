@@ -2659,11 +2659,53 @@ impl SpyreWorker {
                         shadow_s * 1e3,
                     );
                 }
+                // ⭐ THE OWNER'S OWN W=1 FACTS — the same two launch facts every ladder rung
+                // reads off ITS bundle (`mask_cap`, `fold_rows`), read here off the DECODE
+                // SLOT'S bundle. The loader's `rn <= 1 → continue` means the W=1 rung IS the
+                // owner session, so a single request is a batch of ONE on it through the same
+                // decode launch — and that launch reads the owner's own facts, never a
+                // hand-mirrored constant and never the CEILING rung's numbers (the owner's
+                // pmask rows are `nqh * 1`, not `nqh * rn`).
+                let owner_mask_cap = code
+                    .layout
+                    .place_of_tid(
+                        scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_MASK_TID,
+                    )
+                    .and_then(|pmask| {
+                        // The baked head count, by the same law the rung loop states: the
+                        // `hidden / head_dim` quotient is the head count only for a square Q
+                        // projection (gemma-4's is not).
+                        let nqh = wirings.decode.geometry.nqh.max(1) as u64;
+                        scratchy_subtile::sdsc_abstract::BakedMaskBlocks::of_placement(
+                            pmask.size,
+                            nqh as u32,
+                            scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1)
+                                .expect("1 is a baked width"),
+                            scratchy_subtile::sdsc_abstract::SlotCount::new(
+                                scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32,
+                            ),
+                        )
+                    });
+                let owner_fold_rows =
+                    match code.fold_rows() {
+                        Ok(scratchy_target_spyre::bundle_code::FoldRows::PerRequest) => {
+                            scratchy_subtile::sdsc_abstract::FoldRowRegime::PerRequest
+                        }
+                        Ok(scratchy_target_spyre::bundle_code::FoldRows::WholeBatch) => {
+                            scratchy_subtile::sdsc_abstract::FoldRowRegime::WholeBatch
+                        }
+                        Err(e) => panic!(
+                            "decode owner (the W=1 rung): {e} — every bundle the bake shipped \
+                             must load"
+                        ),
+                    };
                 let sb = SuperDscBundle {
                     // Every page starts free: no request holds one yet.
                     pool_pages: num_blocks,
                     pool_rows,
                     decode: ss,
+                    owner_mask_cap,
+                    owner_fold_rows,
                     decode_rungs: decode_ladder,
                     prefill_rungs: prefill_ladder,
                     prefill_prefix,

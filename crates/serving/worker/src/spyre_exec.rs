@@ -234,9 +234,9 @@ impl SpyreWorker {
     ) -> ExecutorResult<Vec<u32>> {
         let InFlightDecode { cell, sub, rung, rows } = infl;
         // Only the submitting rung's session can finish the read — each rung owns its own
-        // executor and stream.
+        // executor and stream, and the W=1 seat is the owner session itself.
         let SendnnSession::SuperDsc(sb) = &mut model.session;
-        let sess = &mut sb.decode_rungs[rung].sess;
+        let sess = sb.decode_seat(rung).sess;
         let toks = match collect_decode_tokens(sess, &sub) {
             Ok(t) => t,
             Err(e) => {
@@ -744,8 +744,9 @@ impl Worker for SpyreWorker {
         // consecutive positions and attend each other causally, a batch's rows are separate requests
         // and must attend only themselves.
         //
-        // A continuation chunk (n > 1) is not a decode step and keeps the per-request path below, as
-        // does every request when no ladder was baked or the live count exceeds the widest rung.
+        // A continuation chunk (n > 1) is not a decode step and keeps the per-request path below;
+        // a DECODE step never does — one request is the W=1 OWNER here, and a live count past the
+        // widest rung refuses below.
         #[cfg(feature = "spyre-hw")]
         let mut batched: std::collections::HashSet<String> = std::collections::HashSet::new();
         #[cfg(feature = "spyre-hw")]
@@ -795,7 +796,14 @@ impl Worker for SpyreWorker {
             // behind a batched write. The host allocates that page now, so there is no row to be consecutive,
             // no witness to construct, and no fragmented-pool case to degrade for. A batch of any composition
             // runs on one rung.
-            let rung = if decode_ids.len() > 1 {
+            // ⭐ ONE DECODE PATH: the rung is selected for EVERY decode step, one request
+            // included — a single request is a batch of 1 on the OWNER session (the W=1
+            // rung, by the loader's `rn <= 1 → continue`), through the same submit, defer,
+            // drain, seat walk and collect. `None` (live past the widest rung) refuses
+            // below: there is no one-forward-per-request decode arm.
+            let rung = if decode_ids.is_empty() {
+                None
+            } else {
                 {
                     // The count the rung is selected FROM is the LIVE one; everything the launch
                     // then binds is sized by the rung's own baked width.
@@ -804,12 +812,10 @@ impl Worker for SpyreWorker {
                         decode_ids.len(),
                     ))
                 }
-            } else {
-                None
             };
             // ⭐⭐⭐ #32 (c4b) — THE SEATING DISSOLVES whenever a decoder runs OUTSIDE the batched
-            // rung (`rung` is `None` with decoders live — the batch fell to one request, or no
-            // ladder was baked). Two things must happen, and both are the seed law's own:
+            // arm (`rung` is `None` with decoders live — the live count ran past the widest baked
+            // rung; a single request is the OWNER and always seats). Two things must happen, and both are the seed law's own:
             // the per-request path reads the token POOL (`token_at` = the previous pick), so the
             // queue drains first — the same pop, never a second path; and the stored seating is
             // DISCARDED, because a solo interlude advances a request's pick on another session
@@ -915,14 +921,12 @@ impl Worker for SpyreWorker {
                 // The pool's owner split, once for this launch — the same derivation the host's block
                 // count came from, so a derived page map cannot name a block the host may also hand out.
                 let part = pool_partition(sb)?;
-                let DecodeRung {
+                let DecodeSeat {
                     seqs,
                     mask_cap,
                     fold_rows,
                     sess,
-                } = &mut sb.decode_rungs[ri];
-                let seqs = *seqs;
-                let fold_rows = *fold_rows;
+                } = sb.decode_seat(ri);
                 // ⛔⛔⛔ "DOES THIS BUNDLE GATHER" IS NOT ASKED HERE ANY MORE, AND THAT IS THE FIX.
                 // It was `let gathers_kv = *gathers_kv` off `DecodeRung` — which was already the
                 // SECOND home for this question (the first was `model.decode.last()`, the m=1 bucket,
@@ -1360,7 +1364,7 @@ impl Worker for SpyreWorker {
                 // refusing on a number we do not have.
                 if let Some(cap) = mask_cap {
                     let need = scratchy_subtile::sdsc_abstract::MaskBlocks::of(fold_grid);
-                    if !need.fits(*cap) {
+                    if !need.fits(cap) {
                         return Err(werr(format!(
                             "decode batch: this step needs {} mask block(s) ({} page(s) x {} row(s)) but \
                              the rung's baked pmask holds {} — the fold would read mask bytes the host \
@@ -1794,6 +1798,19 @@ impl Worker for SpyreWorker {
                 .copied()
                 .unwrap_or(0);
             let start = cr.num_computed_tokens.get(i).copied().unwrap_or(0) as usize;
+            // ⛔ REAL BATCHED DECODE ONLY. A decode step reaches this per-request loop only
+            // when the batched arm could not seat it — the live count ran past the widest
+            // baked rung (the W=1 case is the OWNER and always seats). The one-forward-
+            // per-request decode arm is DELETED, so say so rather than serve unpipelined.
+            #[cfg(feature = "spyre-hw")]
+            if solo_step_is_decode(n, start, input_batch.prompt_len(req_id)) {
+                return Err(werr(format!(
+                    "decode step for {req_id} ({start} computed) fell to the per-request loop — \
+                     the live decode count ran past the widest baked rung, and the solo decode \
+                     arm is removed. Bake a wider rung or admit fewer requests. Real batched \
+                     decode only."
+                )));
+            }
             let req = requests
                 .get_mut(req_id)
                 .ok_or_else(|| werr(format!("unknown cached req {req_id}")))?;

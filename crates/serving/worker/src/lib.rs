@@ -35,6 +35,7 @@ pub mod spyre_pool;
 pub mod spyre_types;
 #[cfg(any(feature = "spyre", feature = "spyre-hw"))]
 pub mod spyre_worker;
+pub mod step_segs;
 pub mod threadpool;
 pub mod uniproc;
 pub mod worker;

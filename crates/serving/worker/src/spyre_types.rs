@@ -223,6 +223,31 @@ pub(crate) struct DecodeRung {
     // `LogitsGeom::from_placement` directly.
 }
 
+/// WHICH SESSION A DECODE STEP RUNS ON — the one-request OWNER, or one rung of the ladder.
+///
+/// The loader's `rn <= 1 → continue` means the W=1 rung IS the owner session (`decode`),
+/// not a ladder entry, so a single request is a batch of ONE on the owner — selected by the
+/// same `decode_rung_for` call every wider batch uses, never by a second branch.
+#[cfg(feature = "spyre-hw")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RungId {
+    /// The m=1 `decode` session every ladder rung aliases — the W=1 rung.
+    Owner,
+    /// Ladder rung `i` of `decode_rungs`.
+    Ladder(usize),
+}
+
+/// ONE DECODE SEAT: the launch-width facts plus the session they describe, whichever rung
+/// was chosen. The fields are exactly `DecodeRung`'s, so the launch reads one shape and
+/// never re-derives an owner fact it could get wrong — `seqs` is `1` on the owner.
+#[cfg(feature = "spyre-hw")]
+pub(crate) struct DecodeSeat<'a> {
+    pub(crate) seqs: scratchy_subtile::sdsc_abstract::RungWidth,
+    pub(crate) mask_cap: Option<scratchy_subtile::sdsc_abstract::BakedMaskBlocks>,
+    pub(crate) fold_rows: scratchy_subtile::sdsc_abstract::FoldRowRegime,
+    pub(crate) sess: &'a mut SuperDscSession,
+}
+
 #[cfg(feature = "spyre-hw")]
 pub(crate) enum LogitsWanted {
     /// Nothing — every prompt chunk but the final one, which launches no suffix and reads
@@ -280,6 +305,12 @@ pub(crate) enum SendnnSession {
 #[cfg(feature = "spyre-hw")]
 pub(crate) struct SuperDscBundle {
     pub(crate) decode: SuperDscSession,
+    /// THE OWNER'S OWN LAUNCH FACTS — the W=1 rung's `mask_cap` and `fold_rows`, read from the
+    /// decode slot's own bundle at load exactly as each ladder rung's are. A single request is a
+    /// batch of ONE on the owner, so the shared decode launch reads these through
+    /// [`Self::decode_seat`] and never re-derives them (or hand-mirrors them as constants).
+    pub(crate) owner_mask_cap: Option<scratchy_subtile::sdsc_abstract::BakedMaskBlocks>,
+    pub(crate) owner_fold_rows: scratchy_subtile::sdsc_abstract::FoldRowRegime,
     /// PREFILL WIDTH LADDER — ASCENDING by baked query-row count `mq`; the last entry is the widest.
     /// EMPTY ⇒ no batched-prefill bundle at all (multi-token prompts fall back to the sequential
     /// mq=1 decode path).
@@ -432,9 +463,10 @@ impl SuperDscBundle {
         self.prefill_rungs.last().map(|(m, _)| *m).unwrap_or(0)
     }
 
-    /// Index of the SMALLEST decode rung that holds `live` requests, or `None` when the ladder is
-    /// empty or `live` exceeds the widest rung — the caller then falls back to one forward per
-    /// request, which is slower and never wrong.
+    /// THE RUNG A DECODE STEP RUNS ON — [`RungId::Owner`] when one request is live (the W=1
+    /// rung IS the owner session, by the loader's `rn <= 1 → continue`), else the index of the
+    /// SMALLEST ladder rung that holds `live` requests. `None` when `live` exceeds the widest
+    /// rung — the caller then refuses: there is no one-forward-per-request decode arm any more.
     ///
     /// 🛑 THE LIVE COUNT IS THE ONLY INPUT, and the launch must therefore be laid out from the live
     /// count too. `SlotMap` hands out slots densely for exactly this reason: any layout that reads a
@@ -445,8 +477,41 @@ impl SuperDscBundle {
     pub(crate) fn decode_rung_for(
         &self,
         live: scratchy_subtile::sdsc_abstract::LiveRows,
-    ) -> Option<usize> {
-        self.decode_rungs.iter().position(|r| r.seqs.holds(live))
+    ) -> Option<RungId> {
+        if live.get() <= 1 {
+            // The owner ALWAYS exists — it is the session every rung aliases — so the W=1
+            // seat is never absent and a single request never falls to a second path.
+            return Some(RungId::Owner);
+        }
+        self.decode_rungs
+            .iter()
+            .position(|r| r.seqs.holds(live))
+            .map(RungId::Ladder)
+    }
+
+    /// THE SEAT A DECODE STEP LAUNCHES THROUGH — the owner's facts and session for
+    /// [`RungId::Owner`], the rung's own for a ladder entry. ONE accessor, so a launch
+    /// cannot read one rung's width off another rung's session.
+    pub(crate) fn decode_seat(&mut self, id: RungId) -> DecodeSeat<'_> {
+        match id {
+            RungId::Owner => DecodeSeat {
+                // The owner is the m=1 bake; 1 is a baked width by `RungWidth`'s own law.
+                seqs: scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1)
+                    .expect("1 is a baked width"),
+                mask_cap: self.owner_mask_cap,
+                fold_rows: self.owner_fold_rows,
+                sess: &mut self.decode,
+            },
+            RungId::Ladder(i) => {
+                let r = &mut self.decode_rungs[i];
+                DecodeSeat {
+                    seqs: r.seqs,
+                    mask_cap: r.mask_cap,
+                    fold_rows: r.fold_rows,
+                    sess: &mut r.sess,
+                }
+            }
+        }
     }
 
     /// ⭐ THE CONTEXT CEILING EVERY PMASK IN THIS MODEL BAKED — the least of the decode rungs' own

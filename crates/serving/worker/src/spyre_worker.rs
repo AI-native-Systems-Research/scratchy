@@ -53,8 +53,8 @@ pub(crate) struct InFlightDecode {
     /// The submitted step: its deferred idx-stick read and the decode law's inputs.
     pub(crate) sub: crate::spyre_forward::SubmittedDecode,
     /// Which rung's session owns this step's executor — every rung is its own session/stream,
-    /// and only the submitting session can finish the read.
-    pub(crate) rung: usize,
+    /// and only the submitting session can finish the read. `Owner` = the W=1 decode session.
+    pub(crate) rung: crate::spyre_types::RungId,
     /// Per live row, in `decode_ids` order: `(request id, pool start, launch slot)`.
     pub(crate) rows: Vec<(String, usize, usize)>,
 }
@@ -87,7 +87,7 @@ pub struct SpyreWorker {
     /// steps drain first and bind seeds from the collected picks. `None` before the first batched
     /// step (everything churns).
     #[cfg(feature = "spyre-hw")]
-    pub(crate) seating: Option<(usize, Vec<String>)>,
+    pub(crate) seating: Option<(crate::spyre_types::RungId, Vec<String>)>,
     /// ⭐ THE HOST'S PER-REQUEST BLOCK TABLE, IN THE STRUCT THE ENGINE ALREADY DEFINES FOR IT.
     ///
     /// `InputBatch` (`crates/serving/engine/src/input_batch.rs`) is backend-neutral and is what cuda and
