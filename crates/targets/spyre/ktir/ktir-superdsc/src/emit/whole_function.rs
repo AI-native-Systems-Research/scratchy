@@ -3692,15 +3692,22 @@ pub fn lower_function(
         // rows, `In::mb`'s own mode. The derivation is keyed on the TYPED band, never a
         // shape guess: it fires only when an input CARRIES a band (`RowBand`, constructed
         // only by `windowed_region`'s uniform-row arm) whose height exceeds one row, and
-        // only for the elementwise kinds whose door consumes the axis. The operand must be
+        // only for the kinds whose door consumes the axis — the elementwise door (the
+        // original admission) and, since wall 10 (auditor GO 2026-10-27, the intmb
+        // scatter-harness leg), the INTEGER door: the batched sampler's hash is an
+        // `IntBinary` mixing the whole-row `lane` table (`[1, PAD_V]` i32) with the
+        // band-typed tile (`sample_fwd.py`'s `h = lane * hc1 + slo`), the same
+        // program-invariant-table law this derivation states. The operand must be
         // whole-view single-row at row 0, un-banded, and as wide as the OUTPUT's own column
         // extent — the width check is against the op's stated result, not against a sibling
         // input, because the banded operand beside the table can be the reduce's `[B, 1]`
         // per-row scalar (mode `Col`), whose one column says nothing about the spray's width.
         // A table wider or narrower than the output is still refused by name at the extents
         // law below; every existing kernel (no banded input) is untouched.
-        if matches!(program, Lowering::Node(Program::Elementwise(_)))
-            && let Some(band) = band_of(f.name, &per_op)?
+        if matches!(
+            program,
+            Lowering::Node(Program::Elementwise(_)) | Lowering::IntBinary(_)
+        ) && let Some(band) = band_of(f.name, &per_op)?
             && band.height() > 1
         {
             let out_cols = op

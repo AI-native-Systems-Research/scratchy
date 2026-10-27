@@ -878,6 +878,108 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
             vec![2],
             Program::Sample,
         ),
+        // ⭐ THE INT MB PROBES (front-b-noise wall 10, auditor GO 2026-10-27): the
+        // ROW-VECTOR operand mode the 32-row ceiling rung's bake refusal named —
+        // the whole-row `[1, PAD_V]` i32 table (the sampler's own `lane` idiom,
+        // loaded at `[0, 0]`, program-invariant) against the band-typed
+        // `[B, PAD_V]` tile, the hash's `h = lane * hc1 + slo` shape. `Add` and
+        // `Mul` at the auditor's width, plus the production-width `[2, 65536]`
+        // twins. The Mb flag can only arrive through the band's own derivation
+        // (no `linalg.broadcast` exists in-program for a table the shapes
+        // already agree on), so these cells measure the derivation AND the door
+        // arm together — the exact production path. NOT production
+        // configurations: delete with the probe.
+        "intmb_add" => (
+            spec(
+                "intmr_probe",
+                "intmb_add_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        "intmb_mul" => (
+            spec(
+                "intmr_probe",
+                "intmb_mul_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        // ⭐ THE WIDE TWINS — production PAD_V, the per-core slice width the
+        // card-proven b2 fold states (64 sticks per core at {mb:1, out:32}),
+        // against the narrow twins' 1 stick per core: decides whether the Mb
+        // spray is slice-width-safe exactly as the Col wide twin did at wall 9.
+        // NOT production configurations: delete with the probe.
+        "intmb_wide_add" => (
+            spec(
+                "intmr_probe",
+                "intmb_add_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(65536)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        "intmb_wide_mul" => (
+            spec(
+                "intmr_probe",
+                "intmb_mul_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(65536)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        // ⭐ THE MB×COL PROBES — the PRODUCTION form of the hash's multiply:
+        // `lane * hc1` has NO dense operand (the whole-row `[1, PAD_V]` table
+        // sprays against the per-row `[B, 1]` word), so these measure the two
+        // operand modes TOGETHER on top of the dense+Mb cells that isolate
+        // the spray. Narrow and production width. NOT production
+        // configurations: delete with the probe.
+        "intmb_col_add" => (
+            spec(
+                "intmr_probe",
+                "intmb_col_add_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        "intmb_col_mul" => (
+            spec(
+                "intmr_probe",
+                "intmb_col_mul_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        "intmb_wide_col_add" => (
+            spec(
+                "intmr_probe",
+                "intmb_col_add_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(65536)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        "intmb_wide_col_mul" => (
+            spec(
+                "intmr_probe",
+                "intmb_col_mul_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(65536)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
         // ⭐ THE FP32 TWIN of `intmr_col_add` (wall-9 emission diff, auditor order
         // 2026-10-27): the same shapes and pid-cornered spelling, fp32 alone differs —
         // `invt`'s own production class, the Col addressing the auditor states is

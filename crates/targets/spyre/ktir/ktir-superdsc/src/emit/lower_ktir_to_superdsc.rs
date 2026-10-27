@@ -1880,11 +1880,11 @@ impl IntBinary {
 /// batched b2/b4 card cells (distinct prompts, per-row correct tokens) corroborate.
 /// The admission stands at every row count, citing these legs.
 ///
-/// ⛔ NO `Y`, NO `Mb`, NO CORNER, NO PER-ROW FORM — the row-split mode, the row-vector
-/// mode and every corner are refused by name below: none is measured, none is ordered, and
-/// this door states only what a leg has measured. A program wanting one is a producer form
-/// refused BY NAME here, not lowered as the nearest measured thing. Order a specimen and
-/// the refusal opens.
+/// ⛔ NO `Y`, NO CORNER, NO PER-ROW FORM — the row-split mode and every corner are
+/// refused by name below: none is measured, none is ordered, and this door states only
+/// what a leg has measured. A program wanting one is a producer form refused BY NAME
+/// here, not lowered as the nearest measured thing. Order a specimen and the refusal
+/// opens. (`Mb` joined the measured set at wall 10 — see the admission at the door.)
 pub fn int_binary(
     name: &str,
     kind: IntBinary,
@@ -1937,16 +1937,22 @@ pub fn int_binary(
                  by name rather than emit an unproven addressing"
             ));
         }
-        // ⛔ THE ROW-VECTOR MODE IS REFUSED FOR THE INTEGER TOO — `Mb` (a `[1, cols]` operand
-        // sprayed down the rows) is likewise unmeasured and unstated by any integer producer.
-        if bcast.iter().any(|b| matches!(b, Some(BcastAxis::Mb))) {
-            return err(format!(
-                "IntBinary({kind:?}) {name}: a row-vector (`Mb`) integer broadcast — the \
-                 row-sprayed operand mode over SENUINT32 data is a card form no leg has \
-                 measured (the int-bcast leg measures the one-row `Col` form only), so this \
-                 door refuses it by name rather than emit an unproven addressing"
-            ));
-        }
+        // ⭐ `Mb` IS ADMITTED FOR THE INTEGER (wall 10, auditor GO 2026-10-27) — the
+        // row-vector mode (a `[1, cols]` operand sprayed down the rows) is the batched
+        // sampler's own hash form, and no other spelling reaches it: the whole-row
+        // `lane` table (`[1, PAD_V]` i32, the no-arange law's per-lane index) against
+        // the band-typed `[B, PAD_V]` tile is exactly `sample_fwd.py`'s
+        // `h = lane * hc1 + slo` and its re-injection `lane * hc2` at every rung above
+        // one row — the per-row key words ride `Col` (wall 9), so the per-lane entropy
+        // must then be either SPRAYED (this mode) or MATERIALIZED dense `[B, PAD_V]`
+        // (the wall-5 measured law's defect class). CARD-PROVEN by the intmb
+        // scatter-harness leg (nickm2, 2026-10-27, the same stick-scatter law as the
+        // intmr re-leg; verdict banked at
+        // `.claude/fb-noise-probe/verdicts/intmb-scatter-verdict-*.json`):
+        // `[2,512]` and `[2,65536]` dense + `[1,·]` `Mb` int `add`/`mul`,
+        // bit-for-bit. The want loop in the shared body below still demands an `Mb`
+        // operand be ONE row at the output's own column extent, so a tall operand
+        // cannot pose as a vector.
         // ⭐ AND `Col` IS ADMITTED AT EVERY ROW COUNT — the multi-row column vector
         // (`[rows > 1, 1]` against a `[rows > 1, cols]` tile) is the batched decode
         // seat's own form (the band-typed rung's per-request seed words),
@@ -7639,31 +7645,37 @@ mod elementwise_tests {
         );
     }
 
-    /// ⛔ THE `Mb` MODE STAYS REFUSED FOR THE INTEGER — unmeasured (the int-bcast leg measures
-    /// the one-row `Col` form only) and unstated by any integer producer. The `Col` admission
-    /// must not slide the row-vector mode in on its coattails.
+    /// ⭐ `Mb` IS ADMITTED AND CARD-PROVEN FOR THE INTEGER (wall 10, intmb
+    /// scatter-harness leg, nickm2, 2026-10-27 — the same stick-scatter law as
+    /// the intmr re-leg; verdict banked at
+    /// `.claude/fb-noise-probe/verdicts/intmb-scatter-verdict-*.json`): the
+    /// batched sampler's hash mixes the whole-row `lane` table (`[1, cols]`
+    /// i32, the no-arange law) with the band-typed `[B, cols]` tile —
+    /// `sample_fwd.py`'s `h = lane * hc1 + slo` at every rung above one row.
+    /// The row count does not change the emission: one op, the same
+    /// descriptor name as the dense form.
     #[test]
-    fn an_int_mb_flag_is_refused_by_name() {
+    fn an_int_mb_flag_lowers_as_one_op() {
         let r = node(
             reg(5, 1, 512, false),
             reg(6, 1, 512, false),
             reg(7, 1, 512, true),
         );
         let mut sym = 0i64;
-        let Err(e) = int_binary(
+        let ops = int_binary(
             "add_s3",
             IntBinary::Add,
             &r,
             &[None, Some(BcastAxis::Mb)],
             &mut sym,
             None,
-        ) else {
-            panic!("a row-vector integer broadcast was ACCEPTED — Mb is unmeasured and unordered")
-        };
-        assert!(
-            e.message.contains("row-vector") && e.message.contains("no leg has measured"),
-            "names the mode and why it stays refused: {}",
-            e.message
+        )
+        .expect("the [1, cols] row vector IS the batched hash's own form");
+        assert_eq!(ops.len(), 1, "an operand mode is not a decomposition");
+        assert_eq!(
+            ops[0].op_name, "addi32toi32_o7",
+            "the descriptor NAME must not change with the operand mode — it feeds the bundle \
+             fingerprint, and the broadcast arm is the same op",
         );
     }
 

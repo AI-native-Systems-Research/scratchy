@@ -13,6 +13,16 @@ at `[pid, 0]` — `sample_fwd.py`'s own grid law at `B = 2`):
     `[rows, 1]` against a `[rows, cols]` tile at `rows > 1` (the granite-3.1-2b
     decode rerung's pod build, 2026-10-27T01:19Z). This cell measures the
     operand mode ON TOP of the control's staging.
+  * `intmb_add` / `intmb_mul` (WALL 10, auditor GO 2026-10-27) — `[2, 512]`
+    dense + `[1, 512]` `Mb`, the ROW-VECTOR form the 32-row ceiling rung's
+    bake refusal named: the whole-row `lane` table against the band-typed
+    tile, the hash's own `h = lane * hc1 + slo` shape. The `[2, 65536]`
+    twins run the same kernels at production width.
+  * `intmb_col_add` / `intmb_col_mul` — `[1, 512]` `Mb` + `[2, 1]` `Col`, the
+    PRODUCTION form of the hash's multiply: `lane * hc1` has NO dense operand
+    (the per-lane table sprays against the per-row word), so these cells
+    measure the two operand modes TOGETHER — on top of the dense+Mb cells
+    that isolate the spray alone.
 
 WHY THE PER-ROW WORDS DIFFER: row 0 and row 1 carry DIFFERENT words (and the
 dense control different rows), so a broadcast defect that sprays row 0's word
@@ -107,6 +117,93 @@ def intmr_col_mul_probe(a_ptr, b_ptr, o_ptr,  #
     a_d = tl.make_tensor_descriptor(a_ptr, shape=[B, PAD_V], strides=[PAD_V, 1],
                                     block_shape=[1, PAD_V])
     a = a_d.load([pid, 0])
+    b_d = tl.make_tensor_descriptor(b_ptr, shape=[B, 1], strides=[1, 1],
+                                    block_shape=[1, 1])
+    b = b_d.load([pid, 0])
+    o = a * b
+    o_d = tl.make_tensor_descriptor(o_ptr, shape=[B, PAD_V], strides=[PAD_V, 1],
+                                    block_shape=[1, PAD_V])
+    o_d.store([pid, 0], o)
+
+
+@triton.jit
+def intmb_add_probe(a_ptr, b_ptr, o_ptr,  #
+                    PAD_V: tl.constexpr, B: tl.constexpr):
+    # THE WALL-10 FORM — the whole-row `[1, PAD_V]` table against the band-typed
+    # `[B, PAD_V]` tile: `b` is the `lane` table's own idiom verbatim
+    # (`sample_fwd.py`'s `la_desc`: a `[1, PAD_V]` view read at `[0, 0]`, the
+    # same row every program reads), and `a` is the sampler's dense tile at the
+    # pid-cornered spelling. This is the exact shape of the hash's
+    # `h = lane * hc1 + slo` at every rung above one row: the per-lane entropy
+    # is a program-INVARIANT whole-row table (no `linalg.broadcast` anywhere —
+    # Triton needs none, the shapes already agree per program), so the `Mb`
+    # operand mode can only come from the band's own derivation, which is the
+    # production path this cell measures.
+    pid = tl.program_id(0)
+    a_d = tl.make_tensor_descriptor(a_ptr, shape=[B, PAD_V], strides=[PAD_V, 1],
+                                    block_shape=[1, PAD_V])
+    a = a_d.load([pid, 0])
+    b_d = tl.make_tensor_descriptor(b_ptr, shape=[1, PAD_V], strides=[PAD_V, 1],
+                                    block_shape=[1, PAD_V])
+    b = b_d.load([0, 0])
+    o = a + b
+    o_d = tl.make_tensor_descriptor(o_ptr, shape=[B, PAD_V], strides=[PAD_V, 1],
+                                    block_shape=[1, PAD_V])
+    o_d.store([pid, 0], o)
+
+
+@triton.jit
+def intmb_mul_probe(a_ptr, b_ptr, o_ptr,  #
+                    PAD_V: tl.constexpr, B: tl.constexpr):
+    # The MUL twin — the hash's own op (`lane * hc1`): the multiplication of the
+    # per-lane table by a per-lane-varying dense tile, wrapping i32, exact on
+    # both sides of the compare.
+    pid = tl.program_id(0)
+    a_d = tl.make_tensor_descriptor(a_ptr, shape=[B, PAD_V], strides=[PAD_V, 1],
+                                    block_shape=[1, PAD_V])
+    a = a_d.load([pid, 0])
+    b_d = tl.make_tensor_descriptor(b_ptr, shape=[1, PAD_V], strides=[PAD_V, 1],
+                                    block_shape=[1, PAD_V])
+    b = b_d.load([0, 0])
+    o = a * b
+    o_d = tl.make_tensor_descriptor(o_ptr, shape=[B, PAD_V], strides=[PAD_V, 1],
+                                    block_shape=[1, PAD_V])
+    o_d.store([pid, 0], o)
+
+
+@triton.jit
+def intmb_col_add_probe(a_ptr, b_ptr, o_ptr,  #
+                        PAD_V: tl.constexpr, B: tl.constexpr):
+    # THE PRODUCTION HASH FORM — `Mb × Col`, NO dense operand: `a` is the
+    # whole-row `lane` table (`[1, PAD_V]` at `[0, 0]`), `b` is a per-row word
+    # table (`[B, 1]` at `[pid, 0]`, the seed words' own idiom). This is the
+    # exact shape of `h = lane * hc1 + slo`'s multiply at every rung above one
+    # row: the per-lane table sprays down the rows (Mb) against the per-row
+    # word (Col) — the only op in the sampler whose EVERY operand is a
+    # broadcast, so it measures the two operand modes TOGETHER, on top of the
+    # dense+Mb cells that isolate the spray alone.
+    pid = tl.program_id(0)
+    a_d = tl.make_tensor_descriptor(a_ptr, shape=[1, PAD_V], strides=[PAD_V, 1],
+                                    block_shape=[1, PAD_V])
+    a = a_d.load([0, 0])
+    b_d = tl.make_tensor_descriptor(b_ptr, shape=[B, 1], strides=[1, 1],
+                                    block_shape=[1, 1])
+    b = b_d.load([pid, 0])
+    o = a + b
+    o_d = tl.make_tensor_descriptor(o_ptr, shape=[B, PAD_V], strides=[PAD_V, 1],
+                                    block_shape=[1, PAD_V])
+    o_d.store([pid, 0], o)
+
+
+@triton.jit
+def intmb_col_mul_probe(a_ptr, b_ptr, o_ptr,  #
+                        PAD_V: tl.constexpr, B: tl.constexpr):
+    # The MUL twin — the hash's own op verbatim (`lane * hc1`): the whole-row
+    # table times the per-row word, wrapping i32.
+    pid = tl.program_id(0)
+    a_d = tl.make_tensor_descriptor(a_ptr, shape=[1, PAD_V], strides=[PAD_V, 1],
+                                    block_shape=[1, PAD_V])
+    a = a_d.load([0, 0])
     b_d = tl.make_tensor_descriptor(b_ptr, shape=[B, 1], strides=[1, 1],
                                     block_shape=[1, 1])
     b = b_d.load([pid, 0])
