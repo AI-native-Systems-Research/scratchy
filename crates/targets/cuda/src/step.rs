@@ -432,6 +432,14 @@ pub const ATTN_PREFILL_BF16_HEAD_DIM: u32 = 256;
 /// warpgroups keeps one 256-column half of the output; the prefill takes [`ATTN_PREFILL_BF16_ROWS`]
 /// and the decode [`ATTN_DECODE_BF16_MAX_GROUP`] as the head-dim-256 kernels do.
 pub const ATTN_D512_BF16_HEAD_DIM: u32 = 512;
+// The worker picks the attention kernel by these names: they are exactly the head dims a KV step
+// may take.
+const _: () = assert!(
+    ATTN_BF16_HEAD_DIMS.len() == 2
+        && ATTN_BF16_HEAD_DIMS[0] == ATTN_PREFILL_BF16_HEAD_DIM
+        && ATTN_BF16_HEAD_DIMS[0] == ATTN_DECODE_BF16_HEAD_DIM
+        && ATTN_BF16_HEAD_DIMS[1] == ATTN_D512_BF16_HEAD_DIM
+);
 /// The one head dim the decode attention kernel is instantiated for: its query, K and V tiles are
 /// `st_bf<64, 256>`, the prefill's (`kernels/attn_decode_bf16.cu`). It takes one query row,
 /// `q_heads` a non-zero multiple of `kv_heads` by at most [`ATTN_DECODE_BF16_MAX_GROUP`], and

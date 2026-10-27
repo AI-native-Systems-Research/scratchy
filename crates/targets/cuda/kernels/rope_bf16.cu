@@ -317,7 +317,8 @@ extern "C" int scratchy_cuda_rope_paired_bf16(const void* x, const void* table, 
 }
 
 // The half-rotated rope, `scratchy_cuda_rope_paired_bf16` with `pairing` half-rotated: its codes
-// and refusals, so `rot_dim` not 64 or 256 is refused (`step::ROPE_BF16_KERNEL_ROT_DIMS`).
+// and refusals, so `rot_dim` not 64 or 256 is refused (the half-rotated entries of
+// `step::ROPE_BF16_KERNEL_SHAPES`).
 extern "C" int scratchy_cuda_rope_bf16(const void* x, const void* table, void* out, uint32_t rows,
                                        uint32_t cols, uint32_t head_dim, uint32_t rot_dim,
                                        void* stream /* cudaStream_t; null = default stream */) {

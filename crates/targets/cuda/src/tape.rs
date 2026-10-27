@@ -114,6 +114,30 @@ pub struct KvTape {
 }
 
 impl KvTape {
+    /// Whether a worker's one pool fits both this tape and `other`: the same layers, block size
+    /// and block-table length, the same class-0 geometry, and each layer at the same class
+    /// `(kv_heads, head_dim)`, the facts [`Self::pool_layout`] lays the pool out by. A class's
+    /// window is not one: it masks the attention, not the cache, so a tape and its unwindowed
+    /// twin share a pool. For one class this is exactly the comparison before the classes.
+    pub fn same_pool(&self, other: &KvTape) -> bool {
+        let base = |k: &KvTape| {
+            (
+                k.layers,
+                k.kv_heads,
+                k.head_dim,
+                k.block_size,
+                k.max_blocks_per_seq,
+            )
+        };
+        let shapes = |k: &KvTape| {
+            (k.layer_class.iter())
+                .map(|&c| (k.classes.get(usize::from(c))).map(|c| (c.kv_heads, c.head_dim)))
+        };
+        base(self) == base(other)
+            && self.layer_class.len() == other.layer_class.len()
+            && shapes(self).eq(shapes(other))
+    }
+
     /// The KV pool of this tape's layers at `num_blocks` blocks: per layer, in [`Self::layers`] order,
     /// its class's layout (`classes[layer_class[l]]`'s `kv_heads` and `head_dim`) and the
     /// element offset of its K buffer, then its V buffer, back to back; and the pool's bytes. `None`
@@ -1133,13 +1157,8 @@ impl CudaTape {
                     return Err(TapeError::StepOutside { step, span, total });
                 }
             }
-            // An in-place kernel's write may be its read 0 exactly; any other overlap is refused.
-            let read0 = e.reads[0].filter(|_| e.in_place);
-            for &write in writes {
-                let clashes = |r: &&ArenaSpan| overlap(**r, write) && read0 != Some(write);
-                if let Some(&read) = reads.clone().find(clashes) {
-                    return Err(TapeError::WriteOverlapsRead { step, write, read });
-                }
+            if let Some((write, read)) = write_clash(&e) {
+                return Err(TapeError::WriteOverlapsRead { step, write, read });
             }
             if e.second_write.is_some_and(|w| overlap(w, e.writes)) {
                 return Err(TapeError::WritesOverlap { step });
@@ -1905,6 +1924,25 @@ fn inside(span: ArenaSpan, total: u64) -> bool {
 }
 
 /// Whether two spans share a byte. Both lie inside the arena, so neither end overflows.
+/// The first write of `e` that overlaps one of its reads, and that read; `None` when there is
+/// none. An in-place kernel's (`e.in_place`) write may equal its read 0 exactly: only that one
+/// read is exempt, and only for that exact span. Every other overlap, with read 0 or any other
+/// read, is a clash.
+fn write_clash(e: &crate::step::StepExtents) -> Option<(ArenaSpan, ArenaSpan)> {
+    let read0 = e.reads[0].filter(|_| e.in_place);
+    let writes = [Some(e.writes), e.second_write];
+    for &write in writes.iter().flatten() {
+        for (ix, &read) in e.reads.iter().enumerate() {
+            let Some(read) = read else { continue };
+            let exempt = ix == 0 && read0 == Some(read) && read == write;
+            if overlap(read, write) && !exempt {
+                return Some((write, read));
+            }
+        }
+    }
+    None
+}
+
 fn overlap(a: ArenaSpan, b: ArenaSpan) -> bool {
     let (a0, b0) = (a.offset.0, b.offset.0);
     a.bytes > 0 && b.bytes > 0 && a0 < b0 + b.bytes && b0 < a0 + a.bytes
@@ -4201,5 +4239,130 @@ mod pool_tests {
             window: None,
         }];
         assert_eq!(kv(&HUGE, &[0]).pool_layout(u32::MAX), None);
+    }
+}
+
+#[cfg(test)]
+mod pool_and_overlap_tests {
+    use super::*;
+    use crate::step::{CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, StepExtents};
+
+    const NO_SPAN: ArenaSpan = ArenaSpan {
+        offset: ArenaOffset(0),
+        bytes: 0,
+    };
+    const SLIDING: KvClass = KvClass {
+        kv_heads: 8,
+        head_dim: 256,
+        window: Some(1024),
+    };
+
+    fn kv(classes: &'static [KvClass], layer_class: &'static [u8]) -> KvTape {
+        KvTape {
+            layers: Box::leak((0..layer_class.len() as u32).collect::<Vec<_>>().into()),
+            kv_heads: classes[0].kv_heads,
+            head_dim: classes[0].head_dim,
+            block_size: CUDA_KV_BLOCK_SIZE,
+            max_blocks_per_seq: CUDA_MAX_BLOCKS_PER_SEQ,
+            block_table: NO_SPAN,
+            slot_mapping: NO_SPAN,
+            sequence: NO_SPAN,
+            classes,
+            layer_class,
+        }
+    }
+
+    /// #923's GKE regression (`KvGeometry { bucket: 2 }` in #922's sliding-layer tests): a
+    /// windowed one-class tape and its unwindowed twin differ only in the class's window, which
+    /// lays out no cache, so they share one pool, as they did before the classes. The pool is the
+    /// same for both.
+    #[test]
+    fn a_tape_and_its_unwindowed_twin_share_one_pool() {
+        const TWIN: KvClass = KvClass {
+            window: None,
+            ..SLIDING
+        };
+        let (a, b) = (kv(&[SLIDING], &[0]), kv(&[TWIN], &[0]));
+        assert!(a.same_pool(&b) && b.same_pool(&a));
+        assert_eq!(a.pool_layout(48), b.pool_layout(48));
+    }
+
+    /// What does change the pool is refused: another class shape for a layer, another class-0
+    /// geometry, another layer count; and each of the fields compared before the classes.
+    #[test]
+    fn a_tape_of_another_pool_is_not_the_same_pool() {
+        const GLOBAL: KvClass = KvClass {
+            kv_heads: 2,
+            head_dim: 512,
+            window: None,
+        };
+        let two = kv(&[SLIDING, GLOBAL], &[0, 1]);
+        assert!(two.same_pool(&two));
+        assert!(
+            !two.same_pool(&kv(&[SLIDING, GLOBAL], &[0, 0])),
+            "a layer's class"
+        );
+        assert!(!two.same_pool(&kv(&[SLIDING], &[0])), "the layer count");
+        let one = kv(&[SLIDING], &[0]);
+        for other in [
+            KvTape { kv_heads: 4, ..one },
+            KvTape {
+                head_dim: 512,
+                ..one
+            },
+            KvTape {
+                block_size: 16,
+                ..one
+            },
+            KvTape {
+                max_blocks_per_seq: 64,
+                ..one
+            },
+            KvTape {
+                layers: &[7],
+                ..one
+            },
+        ] {
+            assert!(!one.same_pool(&other), "{other:?}");
+        }
+    }
+
+    fn extents(reads: [Option<ArenaSpan>; 4], writes: ArenaSpan, in_place: bool) -> StepExtents {
+        StepExtents {
+            reads,
+            writes,
+            second_write: None,
+            weight: None,
+            kv: None,
+            gdn: None,
+            in_place,
+        }
+    }
+
+    const fn s(offset: u64, bytes: u64) -> ArenaSpan {
+        ArenaSpan {
+            offset: ArenaOffset(offset),
+            bytes,
+        }
+    }
+
+    /// The in-place exemption is read 0's exact span only: an in-place step with two reads whose
+    /// write equals read 0 and also overlaps read 1 is refused at read 1; whose write equals read
+    /// 1 (not read 0) is refused; and an exact out == read 0 with no other overlap passes.
+    #[test]
+    fn only_the_exact_read_0_overlap_of_an_in_place_step_is_exempt() {
+        let (x, w) = (s(0, 512), s(256, 512));
+        // Write == read 0, read 1 overlapping it.
+        let e = extents([Some(x), Some(s(256, 512)), None, None], x, true);
+        assert_eq!(write_clash(&e), Some((x, s(256, 512))));
+        // Write == read 1 exactly, read 0 elsewhere.
+        let e = extents([Some(s(1024, 512)), Some(w), None, None], w, true);
+        assert_eq!(write_clash(&e), Some((w, w)));
+        // Write == read 0, read 1 apart: exempt.
+        let e = extents([Some(x), Some(s(1024, 512)), None, None], x, true);
+        assert_eq!(write_clash(&e), None);
+        // The same exact overlap on a step that is not in place.
+        let e = extents([Some(x), None, None, None], x, false);
+        assert_eq!(write_clash(&e), Some((x, x)));
     }
 }

@@ -38,11 +38,12 @@ use scratchy_subtile::paged_kv_layout::PagedKvLayout;
 use crate::kernels::{self, KernelError};
 use crate::rotary::fill_rotary_rows_with_freq_dim;
 use crate::step::{
-    ATTN_D512_BF16_HEAD_DIM, AddBf16, AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16,
-    ExpertGemmBf16, ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16,
-    GateSplitBf16, GatedDeltaNetBf16, GemmBf16, LayerScaleBf16, MOE_ROUTE_EXPERTS, MatmulKernel,
-    MoeRouteBf16, MoeWeight, PairRows, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16,
-    RouteProgram, RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16,
+    ATTN_D512_BF16_HEAD_DIM, ATTN_DECODE_BF16_HEAD_DIM, ATTN_PREFILL_BF16_HEAD_DIM, AddBf16,
+    AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16,
+    ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16,
+    GatedDeltaNetBf16, GemmBf16, LayerScaleBf16, MOE_ROUTE_EXPERTS, MatmulKernel, MoeRouteBf16,
+    MoeWeight, PairRows, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram,
+    RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16,
 };
 use crate::tape::{
     ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape,
@@ -667,6 +668,30 @@ pub struct CudaWorker<'a, W: AsRef<[DeviceBuffer]> = &'a [DeviceBuffer]> {
     gdn: Option<GdnPool>,
 }
 
+/// A prefill attention launcher: [`kernels::attn_prefill_windowed_bf16`]'s signature, which the
+/// head-dim-512 one shares.
+type PrefillLaunch = unsafe fn(
+    (*const c_void, *mut c_void),
+    (*const c_void, *const c_void),
+    (*const c_void, *const c_void),
+    (u32, u32, u32, u32),
+    (u32, u32),
+    (f32, u32),
+    *mut c_void,
+) -> Result<(), KernelError>;
+
+/// A decode attention launcher: [`kernels::attn_decode_windowed_bf16`]'s signature, which the
+/// head-dim-512 one shares.
+type DecodeLaunch = unsafe fn(
+    (*const c_void, *mut c_void),
+    (*const c_void, *const c_void),
+    (*const c_void, *const c_void),
+    (u32, u32, u32),
+    (u32, u32),
+    (f32, u32),
+    *mut c_void,
+) -> Result<(), KernelError>;
+
 /// The one KV geometry of `tapes`: the first KV tape's, which every other KV tape must share.
 fn kv_geometry(tapes: &[CudaTape]) -> Result<Option<KvTape>, WorkerError> {
     let mut first: Option<KvTape> = None;
@@ -675,23 +700,7 @@ fn kv_geometry(tapes: &[CudaTape]) -> Result<Option<KvTape>, WorkerError> {
         match first {
             None => first = Some(kv),
             Some(f) => {
-                if (
-                    f.layers,
-                    f.kv_heads,
-                    f.head_dim,
-                    f.block_size,
-                    f.max_blocks_per_seq,
-                    f.classes,
-                    f.layer_class,
-                ) != (
-                    kv.layers,
-                    kv.kv_heads,
-                    kv.head_dim,
-                    kv.block_size,
-                    kv.max_blocks_per_seq,
-                    kv.classes,
-                    kv.layer_class,
-                ) {
+                if !f.same_pool(&kv) {
                     return Err(WorkerError::KvGeometry { bucket });
                 }
             }
@@ -1782,9 +1791,22 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     let layout = pool.layer_layout(l);
                     // The column-split kernel at head dim 512, the head-dim-256 one otherwise
                     // (whose launcher refuses any other head dim).
-                    let launch = match head_dim {
+                    let launch: PrefillLaunch = match head_dim {
+                        ATTN_PREFILL_BF16_HEAD_DIM => kernels::attn_prefill_windowed_bf16,
                         ATTN_D512_BF16_HEAD_DIM => kernels::attn_prefill_d512_bf16,
-                        _ => kernels::attn_prefill_windowed_bf16,
+                        // No prefill attention kernel at another head dim: refused, nothing
+                        // launched (`validate` already refuses it: `ATTN_BF16_HEAD_DIMS`).
+                        other => {
+                            let error = KernelError::AttnShape {
+                                rows,
+                                q_heads,
+                                kv_heads,
+                                head_dim: other,
+                                block_size: layout.block_size,
+                                num_blocks: layout.num_blocks,
+                            };
+                            return Err(ForwardError::Launch { step, error });
+                        }
                     };
                     // SAFETY: as above, for `q` and `out` (`rows*q_heads*head_dim`), and the
                     // block table and sequence uploaded above, which `forward` checked: every
@@ -1819,9 +1841,21 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     let pool = kv.expect("`new` made a pool for a KV tape");
                     let l = layer as usize;
                     let layout = pool.layer_layout(l);
-                    let launch = match head_dim {
+                    let launch: DecodeLaunch = match head_dim {
+                        ATTN_DECODE_BF16_HEAD_DIM => kernels::attn_decode_windowed_bf16,
                         ATTN_D512_BF16_HEAD_DIM => kernels::attn_decode_d512_bf16,
-                        _ => kernels::attn_decode_windowed_bf16,
+                        // No decode attention kernel at another head dim: refused, nothing
+                        // launched (`validate` already refuses it: `ATTN_BF16_HEAD_DIMS`).
+                        other => {
+                            let error = KernelError::AttnDecodeShape {
+                                q_heads,
+                                kv_heads,
+                                head_dim: other,
+                                block_size: layout.block_size,
+                                num_blocks: layout.num_blocks,
+                            };
+                            return Err(ForwardError::Launch { step, error });
+                        }
                     };
                     // SAFETY: as the prefill attention's, for `q` and `out` (`q_heads*head_dim`,
                     // its rows are 1: `validate`), and the block table and sequence uploaded
