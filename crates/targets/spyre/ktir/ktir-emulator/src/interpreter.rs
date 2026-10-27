@@ -526,6 +526,11 @@ pub fn execute_function_in(
 /// them directly — so decoding each segment's outputs to host tiles every pass is
 /// pure discarded work (the caller did `let _ =` on the result). Skipping it
 /// removes ~one output-tile decode + alloc + copy per segment per pass.
+///
+/// LX model: WHOLE TILES (the legacy interpreter accounting). This is the entry
+/// for the resident's NATIVE DECOMPOSED arm and every other exec-only caller.
+/// The resident's FUSED segments — emission-lowered, intermediates HBM on the
+/// card — must call [`execute_function_in_exec_only_pinned`].
 #[cfg(feature = "optimizer")]
 pub(crate) fn execute_function_in_exec_only(
     mem: &SpyreMemoryHierarchy,
@@ -538,6 +543,35 @@ pub(crate) fn execute_function_in_exec_only(
     let dispatch = Dispatch::shared();
     crate::comm_sched::execute_with_communication(
         &grid_exec, mem, ops, input_ptrs, dispatch, None, plan_key,
+    )
+}
+
+/// [`execute_function_in_exec_only`] for the resident's FUSED segments — the
+/// card's LX placement, this function's only mode (auditor ruling 2026-10-27):
+/// intermediates charge nothing (HBM synth regions on the device), and each
+/// core pays `pin_window_bytes`, the emission's pin window read from the
+/// bundle's baked layout (op-local slot classes + core-local pins — the budget
+/// the bake's `lx_window_fits` guard proved). See
+/// [`crate::comm_sched::execute_with_communication_pinned`].
+#[cfg(feature = "optimizer")]
+pub(crate) fn execute_function_in_exec_only_pinned(
+    mem: &SpyreMemoryHierarchy,
+    ops: &[Operation<'static>],
+    grid: (usize, usize, usize),
+    input_ptrs: &[(Ssa, Value)],
+    plan_key: Option<u64>,
+    pin_window_bytes: u64,
+) -> Result<(), String> {
+    let grid_exec = GridExecutor::new(grid);
+    let dispatch = Dispatch::shared();
+    crate::comm_sched::execute_with_communication_pinned(
+        &grid_exec,
+        mem,
+        ops,
+        input_ptrs,
+        dispatch,
+        plan_key,
+        pin_window_bytes,
     )
 }
 

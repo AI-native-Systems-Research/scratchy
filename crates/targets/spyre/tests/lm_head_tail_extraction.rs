@@ -172,7 +172,11 @@ fn run_tail(
     let (ops, _layout) =
         superdsc::lower_graph_to_ktir(ir, &weight_ids, superdsc::ActiveCap::FULL, false)
             .unwrap_or_else(|e| panic!("lower the lm-head tail: {e:?}"));
-    let groups = superdsc::ktir_groups(&ops, superdsc::FoldGrouping::Split)
+    // The window is stated EXPLICITLY: this hand-lowered test graph minted no LX
+    // pins, so the budget its fused segments run under is zero (auditor ruling
+    // 2026-10-27 — a program without a stated window is refused, never silently
+    // charged).
+    let groups = superdsc::ktir_groups(&ops, superdsc::FoldGrouping::Split, Some(0))
         .expect("bind the lm-head tail's programs");
     let out_tid = ir.result.index() as u64;
     let mut results: Vec<u64> = vec![out_tid];

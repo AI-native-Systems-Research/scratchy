@@ -10335,6 +10335,7 @@ fn layout_tokens(
         kv_request_stride_bytes,
         lx_op_local_bytes,
         lx_prob_pin_bytes,
+        lx_pin_window_bytes,
         num_sources,
         resident_source_tids,
     } = l;
@@ -10371,6 +10372,16 @@ fn layout_tokens(
     // budget, summed beside the gathers at the bake's `lx_form` admission. 0 for a bundle whose
     // chunk form mints none.
     let lxpp = proc_macro2::Literal::u64_unsuffixed(*lx_prob_pin_bytes);
+    // ⭐ THE WHOLE PIN WINDOW — core-local pins + op-local slot classes, the budget the bake's
+    // `lx_window_fits` guard proved. Carried as an Option: `None` is "no window was ever proven",
+    // which the resident fused path refuses at load rather than charging a silent zero.
+    let lxpw = match lx_pin_window_bytes {
+        Some(b) => {
+            let lit = proc_macro2::Literal::u64_unsuffixed(*b);
+            quote! { ::core::option::Option::Some(#lit) }
+        }
+        None => quote! { ::core::option::Option::None },
+    };
     // The graph's own wiring facts — the source count and the resident ids, so every session
     // reads them off the bundle it runs rather than off another graph's wiring (the mint's
     // renumbering makes the two differ; see the layout field's own doc).
@@ -10407,6 +10418,7 @@ fn layout_tokens(
             kv_request_stride_bytes: #krs,
             lx_op_local_bytes: #lxol,
             lx_prob_pin_bytes: #lxpp,
+            lx_pin_window_bytes: #lxpw,
             num_sources: #nsrc,
             resident_source_tids: ::std::borrow::Cow::Borrowed(&[#(#res),*]),
         }
@@ -12497,6 +12509,20 @@ fn dump_wavefront_mega(
                                                 // `superdsc::GateRung`.
                                                 let gate_rung =
                                                     superdsc::GateRung { fp: &bfp, cap };
+                                                // ⭐ THE SHIPPED BUNDLE'S OWN PIN WINDOW — read
+                                                // from its emitted layout, so the twin's minted
+                                                // programs carry the SAME `lx_window_fits` budget
+                                                // the bake proved (auditor ruling 2026-10-27). A
+                                                // missing entry or an unstated window here is a
+                                                // defect the gate names, not a zero it charges.
+                                                let lx_pin_window = superdsc::emitted_lx_pin_window_bytes(&bfp).unwrap_or_else(|| {
+                                                    panic!(
+                                                        "[spyre-superdsc] {base}: bundle {bfp} has \
+                                                         no emitted layout stating its LX pin window \
+                                                         — the twin cannot mint programs without the \
+                                                         budget the bake proved"
+                                                    )
+                                                });
                                                 let run_gate =
                                                     |prefill: Option<&superdsc::PrefillGate>| {
                                                         // The twin's own groups, fresh from the
@@ -12504,15 +12530,17 @@ fn dump_wavefront_mega(
                                                         // programs the bundle's first K launches
                                                         // bind, so the emulator session runs
                                                         // exactly the classes under test.
-                                                        let twin =
-                                                            superdsc::covering_twin_groups(&rolled)
-                                                                .unwrap_or_else(|e| {
-                                                                    panic!(
-                                                                        "[spyre-superdsc] {base}: \
+                                                        let twin = superdsc::covering_twin_groups(
+                                                            &rolled,
+                                                            Some(lx_pin_window),
+                                                        )
+                                                        .unwrap_or_else(|e| {
+                                                            panic!(
+                                                                "[spyre-superdsc] {base}: \
                                                                          covering twin for {bfp} \
                                                                          failed to lower — {e}"
-                                                                    )
-                                                                });
+                                                            )
+                                                        });
                                                         match twin {
                                                             Some((twin_groups, trunc)) => {
                                                                 match superdsc::numeric_gate(

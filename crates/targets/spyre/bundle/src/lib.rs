@@ -256,6 +256,16 @@ pub struct BundleLayout<'a> {
     /// pins, and `chunk_gather_index_table` passes it beside [`Self::lx_op_local_bytes`] so the
     /// host refuses exactly what the bake refused. 0 for a bundle whose chunk form mints none.
     pub lx_prob_pin_bytes: u64,
+    /// ⭐ THE WHOLE PIN WINDOW, in bytes — core-local pins + op-local slot classes, the exact
+    /// budget the bake's own `lx_window_fits` guard proved for this bundle's layout. Stamped from
+    /// the placement layout's own two terms (one accessor, no recomputation) so the EMULATOR's
+    /// resident fused path can charge the same window per segment: the card holds exactly these
+    /// pins for a fused segment's run and nothing else (its intermediates are HBM synth regions),
+    /// so the emulator's LX guard and the bake's guard prove one budget. Each of this bundle's
+    /// `LaunchProgram`s carries the same number beside its func. `None` when no placement layout
+    /// was computed for this bundle — no window was ever proven, and the resident fused path
+    /// REFUSES such a program at load rather than charging nothing silently.
+    pub lx_pin_window_bytes: Option<u64>,
     /// ⭐ THE GRAPH'S OWN CALLER-FILLED SOURCE COUNT — ids `0..num_sources` are host-filled every
     /// forward, and the runtime's completeness check walks exactly that range. Stamped by the
     /// bake (the same `ir.num_sources` the placement pass packed from) because the count is
@@ -422,6 +432,17 @@ pub struct LaunchProgram<'a> {
     /// Parameter -> the tensor it carries, in parameter order. Carried from the construction that
     /// minted the parameter, never re-derived from a name.
     pub args: Cow<'a, [(ktir_core::ir::Ssa, PlaceId)]>,
+    /// ⭐ THE LX PIN WINDOW THIS PROGRAM RUNS UNDER — its bundle layout's own
+    /// `lx_window_fits` budget (core-local pins + op-local slot classes), stamped at the
+    /// construction that minted the program from that layout. The resident fused path's
+    /// ONLY LX charge (auditor ruling 2026-10-27): the card holds these pins and nothing
+    /// else for the run — intermediates are HBM — so the emulator charges this per
+    /// segment and never the tiles. Read from the bundle, never inferred from shape.
+    /// `None` = no window was ever proven for this program (minted without a placement
+    /// layout): the resident fused path REFUSES a `None` at load, naming the program —
+    /// a missing window must not pass the LX guard as a silent zero. A hand-built
+    /// program states its window explicitly, or it does not run.
+    pub lx_pin_window_bytes: Option<u64>,
 }
 
 /// ONE LAUNCH: a contiguous run of up to `group_size()` trips that dxp compiled into a single device
@@ -822,11 +843,15 @@ mod tests {
         func: F_A,
         program: ktir_superdsc::ktir_node::Program::LmLast,
         args: Cow::Borrowed(&[]),
+        // Stated EXPLICITLY (auditor ruling 2026-10-27): a hand-built const program
+        // mints no LX pins, so its window is zero — stated, not defaulted.
+        lx_pin_window_bytes: Some(0),
     }];
     const PROGS_B: &[LaunchProgram<'static>] = &[LaunchProgram {
         func: F_B,
         program: ktir_superdsc::ktir_node::Program::LmLast,
         args: Cow::Borrowed(&[]),
+        lx_pin_window_bytes: Some(0),
     }];
 
     #[test]

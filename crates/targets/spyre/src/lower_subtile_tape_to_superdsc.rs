@@ -6378,9 +6378,10 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // EMIT-ONLY, deliberately not baked AS PLACEMENTS: pinned-LX intermediates have no HBM
         // placement by construction (their `memOrg_` is lx-only and no L3 movement is generated for
         // them), so there is no address for the runtime to stage — the pin lives in the compiled
-        // sdsc allocates. The pin SUM is a different fact and IS baked (`lx_op_local_bytes` below):
-        // it is the host's term of the one `lx_window_fits` budget, and the host cannot re-derive
-        // it — the slot map is this layout's, gone when the bake returns.
+        // sdsc allocates. The pin SUMS are different facts and ARE baked (`lx_op_local_bytes` and
+        // `lx_pin_window_bytes` below): they are the host's and the emulator's terms of the one
+        // `lx_window_fits` budget, and neither can re-derive them — the slot map is this layout's,
+        // gone when the bake returns.
         lx,
         kv_request_stride_bytes,
         // ⭐ THE GRAPH'S OWN WIRING FACTS — carried verbatim: the source count and the resident
@@ -6526,6 +6527,13 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // `chunk_gather_index_table` read passes it beside `lx_op_local_bytes`, so it refuses
         // exactly what the bake refused.
         lx_prob_pin_bytes: lx.borrow().prob_pin_bytes,
+        // ⭐ THE WHOLE PIN WINDOW — the layout's own `lx_window_bytes()` (core-local pins +
+        // op-local slot classes, the two `lx_window_fits` terms via one accessor), read from
+        // the layout being baked rather than recomputed here. The emulator's resident fused
+        // path charges exactly this per segment (auditor ruling 2026-10-27), so its LX guard
+        // and the bake's guard prove one budget. `Some` by construction: this function runs
+        // only for a computed layout, and the window is that layout's own proven budget.
+        lx_pin_window_bytes: Some(l.lx_window_bytes()),
         // The graph's own wiring facts — see the destructure above.
         num_sources: *num_sources,
         resident_source_tids: std::borrow::Cow::Owned(resident_source_tids.clone()),
@@ -6931,6 +6939,19 @@ pub fn with_emitted_groups<R>(
     }
 }
 
+/// ⭐ THE LX PIN WINDOW OF THE EMITTED BUNDLE NAMED `fp` — its baked layout's
+/// `lx_pin_window_bytes`, the `lx_window_fits` budget the bake proved. The
+/// gate reads this to stamp the covering twin's minted programs with the SAME
+/// window the shipped bundle's programs carry. `None` when the fp has no
+/// bundle or its layout stated no window — the twin then mints programs the
+/// resident fused path will refuse at load, naming them, rather than passing
+/// the LX guard on a silent zero.
+pub fn emitted_lx_pin_window_bytes(fp: &str) -> Option<u64> {
+    let c = emitted().lock().ok()?;
+    let (b, _) = c.get(fp)?;
+    b.layout.lx_pin_window_bytes
+}
+
 /// EVERY BUNDLE THIS EMIT PRODUCED, by fingerprint — the channel the macro drains.
 ///
 /// ⛔ A REGISTRATION, NOT A SEARCH. A bundle is in here because [`emit_bundle`] put it here, so
@@ -7002,7 +7023,10 @@ fn emit_bundle_inner(
                 .map_err(|e| std::io::Error::other(e.0))?,
         )
     } else {
-        PendingGroups::Ready(ktir_groups(ops, fold).map_err(|e| std::io::Error::other(e.0))?)
+        PendingGroups::Ready(
+            ktir_groups(ops, fold, layout.map(|l| l.lx_window_bytes()))
+                .map_err(|e| std::io::Error::other(e.0))?,
+        )
     };
 
     Ok(EmittedBundle {
@@ -7471,8 +7495,14 @@ pub fn class_covering_depth(launches: &[(u8, u32)]) -> usize {
 /// (`ktir_tokens::ProgramInterner`), so re-unrolling K launches is K copies
 /// of the ARGS over one shared program per op — the same cost shape the bake
 /// itself pays, at K/total of the depth.
+///
+/// `lx_pin_window_bytes` is the shipped bundle's own window (read from its
+/// emitted layout, [`emitted_lx_pin_window_bytes`]) — the twin runs the SAME
+/// bundle's first K launches under the SAME budget the bake proved, stamped
+/// onto every program it mints.
 pub fn covering_twin_groups(
     rolled: &RolledSuperDsc,
+    lx_pin_window_bytes: Option<u64>,
 ) -> Result<Option<(Vec<bundle::LaunchGroup<'static>>, GateTrunc)>, SuperDscError> {
     let total = rolled.launches.len();
     let k = class_covering_depth(&rolled.launches);
@@ -7509,7 +7539,7 @@ pub fn covering_twin_groups(
     twin.launch_w.truncate(k);
     twin.launch_kv.truncate(k);
     let ops = unroll_layers(&twin);
-    let groups = ktir_groups(&ops, FoldGrouping::Split)?;
+    let groups = ktir_groups(&ops, FoldGrouping::Split, lx_pin_window_bytes)?;
     Ok(Some((groups, trunc)))
 }
 
@@ -7529,9 +7559,15 @@ pub fn covering_twin_groups(
 /// ⛔ AND NEITHER DOES THE TRIP PARTITION. `GroupKind::HostKv` exists so the shim can host-scatter
 /// and then skip the on-card copies it replaced; `GroupKind::Slot` fuses cache writes sharing one
 /// baked slot. Both describe the shim's fold machinery, not the program.
+/// `lx_pin_window_bytes` is the bundle's own LX pin window (its layout's `lx_window_fits`
+/// budget) stamped onto every program minted here — the number the resident fused path
+/// charges per segment (auditor ruling 2026-10-27). `None` when no placement layout was
+/// computed for this emission: the program then carries no window, and the resident
+/// fused path REFUSES it at load rather than passing the LX guard on a silent zero.
 pub fn ktir_groups(
     ops: &[EmittedOp],
     _fold: FoldGrouping,
+    lx_pin_window_bytes: Option<u64>,
 ) -> Result<Vec<bundle::LaunchGroup<'static>>, SuperDscError> {
     let mut out = Vec::with_capacity(ops.len());
     for e in ops {
@@ -7568,6 +7604,7 @@ pub fn ktir_groups(
                 func: k.func,
                 program: k.program,
                 args: std::borrow::Cow::Owned(args),
+                lx_pin_window_bytes,
             }]),
             init_binary: std::borrow::Cow::Borrowed(&[]),
             job_bin_ptr: 0,

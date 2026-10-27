@@ -1935,9 +1935,26 @@ pub fn rmsnorm_scalar_sticks(ops: &[Operation<'static>]) -> std::collections::Ha
     sticks
 }
 
+/// The execution inputs the two entries below share — one struct so the shared
+/// body stays under clippy's argument budget without duplicating a line of it.
+struct CommRun<'a> {
+    grid: &'a GridExecutor,
+    mem: &'a SpyreMemoryHierarchy,
+    ops: &'a [Operation<'static>],
+    input_ptrs: &'a [(Ssa, Value)],
+    dispatch: &'a Dispatch,
+}
+
 /// Drive all cores to completion, resolving cross-core recvs. Port of
 /// `GridExecutor.execute_with_communication`. Cores with no comm op simply run
 /// to completion on the first advance.
+///
+/// LX model: whole tiles — every intermediate tile the interpreter binds
+/// charges its full shape into the executing core's scratchpad. This is the
+/// legacy interpreter model and remains the law for every path that was not
+/// lowered through the superdsc emission (the per-node interpreter, the
+/// resident's native decomposed arm, tests, the Metal offload). Emission-lowered
+/// fused segments must call [`execute_with_communication_pinned`] instead.
 pub fn execute_with_communication(
     grid: &GridExecutor,
     mem: &SpyreMemoryHierarchy,
@@ -1947,6 +1964,73 @@ pub fn execute_with_communication(
     tracker: Option<&std::cell::RefCell<crate::latency::LatencyTracker>>,
     precomputed_key: Option<u64>,
 ) -> Result<(), String> {
+    execute_with_communication_impl(
+        &CommRun {
+            grid,
+            mem,
+            ops,
+            input_ptrs,
+            dispatch,
+        },
+        tracker,
+        precomputed_key,
+        None,
+    )
+}
+
+/// [`execute_with_communication`] for the resident's FUSED segments — the
+/// card's LX placement, and this function's ONLY mode (auditor ruling
+/// 2026-10-27): every intermediate the segment binds is an HBM synth region
+/// on the device (the emission minted no LX pin for it), so tiles charge
+/// nothing; each core instead pays `pin_window_bytes` — the emission's own pin
+/// window (op-local slot classes + core-local pins), the same budget the
+/// bake's `lx_window_fits` guard proved at `#[forward]` expansion. The bytes
+/// are READ FROM THE BUNDLE's baked layout by the caller, never inferred from
+/// shape. The charge is a redundant proof by design: the bake already refused
+/// a window that did not fit, so if this ever refuses, the two budgets
+/// disagree — a defect either way, and the error names it. No `tracker`: the
+/// pinned path is the resident decode/prefill hot loop, which never meters.
+pub fn execute_with_communication_pinned(
+    grid: &GridExecutor,
+    mem: &SpyreMemoryHierarchy,
+    ops: &[Operation<'static>],
+    input_ptrs: &[(Ssa, Value)],
+    dispatch: &Dispatch,
+    precomputed_key: Option<u64>,
+    pin_window_bytes: u64,
+) -> Result<(), String> {
+    execute_with_communication_impl(
+        &CommRun {
+            grid,
+            mem,
+            ops,
+            input_ptrs,
+            dispatch,
+        },
+        None,
+        precomputed_key,
+        Some(pin_window_bytes),
+    )
+}
+
+/// Shared body of the two public entries above. `pin_window` is NOT a mode
+/// flag: `None` is reachable only through [`execute_with_communication`]
+/// (whole-tile accounting) and `Some(bytes)` only through
+/// [`execute_with_communication_pinned`] (pin-window accounting) — the public
+/// functions ARE the mode, and nothing else in the crate passes this through.
+fn execute_with_communication_impl(
+    run: &CommRun,
+    tracker: Option<&std::cell::RefCell<crate::latency::LatencyTracker>>,
+    precomputed_key: Option<u64>,
+    pin_window: Option<u64>,
+) -> Result<(), String> {
+    let &CommRun {
+        grid,
+        mem,
+        ops,
+        input_ptrs,
+        dispatch,
+    } = run;
     // The rmsnorm scalar chain's DLF16 landings (see the walk's doc) — computed
     // for the very ops this run executes, so fused-segment SSA renames cannot
     // detach the set from the values it names.
@@ -1986,6 +2070,14 @@ pub fn execute_with_communication(
         // prefill), where it's pure overhead on the load/store gather hot path.
         ctx.set_track_sticks(env.tracker.is_some());
         ctx.set_use_counts(&use_counts);
+        // Pinned entries (the resident fused path): suppress per-tile LX and
+        // charge the bundle's pin window instead — the card's placement. Whole-
+        // tile callers constructed the context above with the default (tiles)
+        // and skip this arm entirely.
+        if let Some(bytes) = pin_window {
+            ctx.charge_pin_window_only();
+            ctx.charge_lx_pin_window(bytes)?;
+        }
         for (name, val) in input_ptrs {
             ctx.set_value(*name, val.clone());
         }

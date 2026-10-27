@@ -436,6 +436,9 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         lx_op_local_bytes: 0,
         // No chunk form either, so no probability-part pins beside absent gathers.
         lx_prob_pin_bytes: 0,
+        // And no pin window: no placement layout was ever computed for a Triton-lowered
+        // bundle, so there is no proven window to state — `None`, not a silent zero.
+        lx_pin_window_bytes: None,
         // The graph's own source bound, read off the parse with the same KIND split the
         // launch-time `declare_sources` below applies to the bound inputs (activation-role,
         // below the reserved-const floor): a run that binds every kernel tensor states exactly

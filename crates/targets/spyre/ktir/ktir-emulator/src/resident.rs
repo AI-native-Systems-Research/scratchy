@@ -49,7 +49,9 @@
 use crate::arena::Arena;
 use crate::attrkey::AttrKey;
 use crate::dtypes::DType;
-use crate::interpreter::{Arg, Output, execute_function_in_exec_only};
+use crate::interpreter::{
+    Arg, Output, execute_function_in_exec_only, execute_function_in_exec_only_pinned,
+};
 use crate::ir::{Attr, IRFunction, IRModule, Operation, Ssa, Value};
 use crate::memory::{STICK_BYTES, SpyreMemoryHierarchy};
 use crate::opkind::OpKind;
@@ -63,6 +65,7 @@ use std::collections::HashMap;
 type PlannedProgram = (
     IRModule<'static>,
     Vec<Segment<'static>>,
+    Option<u64>,
     std::collections::HashSet<u64>,
     Vec<NodeSpec>,
 );
@@ -160,6 +163,19 @@ struct ResidentProgram {
     /// dataflow executor runs these per-tile (the fused segments collapse the grid,
     /// so they can't be run tile-major).
     nodes: Vec<NodeSpec>,
+    /// ⭐ THE LX PIN WINDOW THIS PROGRAM'S FUSED SEGMENTS CHARGE — its bundle
+    /// layout's own `lx_window_fits` budget (core-local pins + op-local slot
+    /// classes), the ONLY LX bytes a fused segment's run charges (auditor ruling
+    /// 2026-10-27: the card holds these pins and nothing else — intermediates are
+    /// HBM — so the emulator charges this per segment and never the tiles).
+    /// `None` is stated IN THE TYPE for the two cases that have no window: a
+    /// NATIVE-ONLY program (`new_native` plans no fused segment, so nothing on
+    /// its path reads a window — it runs the decomposed arm's whole-tile
+    /// accounting), and a fused-path program whose bundle stated none — which
+    /// [`Self::build`] refuses at load, naming the program, so the Fused arm's
+    /// own resolve of this Option is a refusal that names the segment, never a
+    /// silent zero a later change could start charging.
+    lx_pin_window_bytes: Option<u64>,
     /// This program's final result tensor ids (for default readback).
     results: std::collections::HashSet<u64>,
 }
@@ -271,8 +287,12 @@ impl ResidentExecutor {
     /// allocate ONE persistent HBM stick per tensor (stable address across
     /// passes). Sources are not yet written — call [`set_source`](Self::set_source)
     /// / [`set_sources`](Self::set_sources) before [`run`](Self::run).
-    pub fn new(funcs: &[IRFunction<'static>], spec: &ProgramSpec) -> Result<Self, String> {
-        Self::new_multi(vec![(funcs, spec)])
+    pub fn new(
+        funcs: &[IRFunction<'static>],
+        spec: &ProgramSpec,
+        lx_pin_window_bytes: Option<u64>,
+    ) -> Result<Self, String> {
+        Self::new_multi(vec![(funcs, spec)], vec![lx_pin_window_bytes])
     }
 
     /// Build an executor holding MULTIPLE programs that SHARE one resident weight
@@ -282,10 +302,17 @@ impl ResidentExecutor {
     /// allocated for the UNION of all programs' tensors; the HBM is sized for the
     /// largest grid any program needs. `run_program(i, ..)` runs program `i` (in
     /// declaration order); `run(..)` runs program 0.
+    ///
+    /// `lx_pin_windows[i]` is program `i`'s bundle-stated LX pin window — its
+    /// layout's `lx_window_fits` budget, the only LX its fused segments charge
+    /// (auditor ruling 2026-10-27). `None` is REFUSED at load, naming the
+    /// program: only an emission-lowered bundle carries a window, and a program
+    /// that stated none cannot run the fused path on a silent zero.
     pub fn new_multi(
         programs: Vec<(&[IRFunction<'static>], &ProgramSpec)>,
+        lx_pin_windows: Vec<Option<u64>>,
     ) -> Result<Self, String> {
-        Self::build(programs, false, None)
+        Self::build(programs, false, None, &lx_pin_windows)
     }
 
     /// ⭐ [`new_multi`](Self::new_multi) WITH A SHAPE FLOOR — the TAPE's own
@@ -299,12 +326,14 @@ impl ResidentExecutor {
     /// states `[1, 65536]`) — still fits its stick. The view walk stays the
     /// only law for standalone runs ([`new_multi`](Self::new_multi)); the
     /// floor is a MAX, so it can only ever RAISE an allocation, never shrink
-    /// one the views already sized.
+    /// one the views already sized. `lx_pin_windows` is the per-program pin
+    /// window — see [`Self::new_multi`].
     pub fn new_multi_floored(
         programs: Vec<(&[IRFunction<'static>], &ProgramSpec)>,
         shape_floor: &HashMap<u64, usize>,
+        lx_pin_windows: Vec<Option<u64>>,
     ) -> Result<Self, String> {
-        Self::build(programs, false, Some(shape_floor))
+        Self::build(programs, false, Some(shape_floor), &lx_pin_windows)
     }
 
     /// Like [`new`](Self::new), but plan EVERY node as a [`Segment::Native`] run at
@@ -318,14 +347,18 @@ impl ResidentExecutor {
     /// (K-loop GEMM reconstruction where recognizable), and per-op Metal offloads
     /// (`metal_gemm_or_blas` / fused map windows) ride along — this is the resident
     /// executor's Native arm, just applied to every node.
+    ///
+    /// No pin window: a native-only executor plans no fused segment, so there is
+    /// nothing on this path that charges one.
     pub fn new_native(funcs: &[IRFunction<'static>], spec: &ProgramSpec) -> Result<Self, String> {
-        Self::build(vec![(funcs, spec)], true, None)
+        Self::build(vec![(funcs, spec)], true, None, &[None])
     }
 
     fn build(
         programs: Vec<(&[IRFunction<'static>], &ProgramSpec)>,
         force_native: bool,
         shape_floor: Option<&HashMap<u64, usize>>,
+        lx_pin_windows: &[Option<u64>],
     ) -> Result<Self, String> {
         // A new resident HBM: every borrowed weight view minted over a previous one is
         // now stale (see `metal::RESIDENT_GEN`), and is discarded rather than dispatched.
@@ -333,6 +366,14 @@ impl ResidentExecutor {
         crate::metal::RESIDENT_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if programs.is_empty() {
             return Err("resident: new_multi needs at least one program".into());
+        }
+        if lx_pin_windows.len() != programs.len() {
+            return Err(format!(
+                "resident: {} program(s) against {} LX pin window(s) — one window per program, \
+                 in declaration order, so the two must be the same length",
+                programs.len(),
+                lx_pin_windows.len()
+            ));
         }
         let dtype = DType::F16;
         let bpe = dtype.bytes_per_elem();
@@ -354,7 +395,25 @@ impl ResidentExecutor {
         let mut view_dtypes: HashMap<u64, DType> = HashMap::new();
 
         let arena = crate::arena::Arena::global();
-        for (funcs, spec) in programs {
+        for (pi, (funcs, spec)) in programs.into_iter().enumerate() {
+            // ⭐ THE PIN WINDOW IS RESOLVED AT LOAD (auditor ruling 2026-10-27): a program
+            // whose bundle stated no window (`None`) cannot run the fused path — charging a
+            // silent zero would pass the LX guard on a budget nobody proved. Refused HERE,
+            // naming the program, before any segment runs. A native-only executor
+            // (`new_native`) plans no fused segment and carries `None` in the type — nothing
+            // on that path reads a window.
+            let lx_pin_window_bytes = if force_native {
+                None
+            } else {
+                Some(lx_pin_windows[pi].ok_or_else(|| {
+                    format!(
+                        "resident: program {pi} ({}) stated no LX pin window — only an \
+                         emission-lowered bundle carries one (its layout's lx_window_fits \
+                         budget), and a program without one cannot run the fused path",
+                        funcs.first().map(|f| f.name).unwrap_or("?")
+                    )
+                })?)
+            };
             // Optimize at the execution entry (see
             // `crate::segmented::apply_attention_rewrites`): every resident program
             // gets the attention IR rewrites, applied ONCE here before planning.
@@ -431,13 +490,19 @@ impl ResidentExecutor {
                 ids.insert(r);
             }
             sources.extend(spec.sources.iter().copied());
-            planned.push((module, segments, spec.results.clone(), spec.nodes.clone()));
+            planned.push((
+                module,
+                segments,
+                lx_pin_window_bytes,
+                spec.results.clone(),
+                spec.nodes.clone(),
+            ));
         }
 
         // Size the HBM (LX-per-core array) for the largest grid across ALL programs.
         let grid = planned
             .iter()
-            .map(|(m, segs, _, _)| largest_grid(m, segs))
+            .map(|(m, segs, _, _, _)| largest_grid(m, segs))
             .max()
             .unwrap_or(1);
         let mem = SpyreMemoryHierarchy::new(grid);
@@ -480,12 +545,15 @@ impl ResidentExecutor {
 
         let programs = planned
             .into_iter()
-            .map(|(module, segments, results, nodes)| ResidentProgram {
-                module,
-                segments,
-                nodes,
-                results,
-            })
+            .map(
+                |(module, segments, lx_pin_window_bytes, results, nodes)| ResidentProgram {
+                    module,
+                    segments,
+                    lx_pin_window_bytes,
+                    nodes,
+                    results,
+                },
+            )
             .collect();
 
         Ok(ResidentExecutor {
@@ -588,42 +656,63 @@ impl ResidentExecutor {
         Ok(())
     }
 
-    /// ONE STICK VALUE of a door's persistent index stick — element 0
-    /// decoded at the MODEL dtype, the encoding the gate's own staging used.
-    /// The gate stages every non-weight source as f16-encoded probe values
-    /// (`dbg_synth_val` f32s handed in as `Arg::Tensor { dtype: F16 }`), and
-    /// the doors' Shape-only views leave `view_dtype` with no entry, so
-    /// `self.dtype` IS the staging encoding — the same read pattern
-    /// `run_fused_decode_attention` uses. The u32 SENUINT32 wire is the
-    /// CARD's format, not the gate's model; restaging the real seed (a
-    /// `LoadConst` carrying the token id, u32 words) is future work for the
-    /// chain's real-seed leg, never silently approximated here.
-    fn read_door_lane0(&self, tid: u64) -> Result<f32, String> {
+    /// ONE DOOR STICK'S FULL WORDS — every element, decoded at the stick's
+    /// own per-tid law: a tid with a stated view dtype reads there (the pick
+    /// is the argmax's i32 idx stick), and the doors' own Shape-only views
+    /// leave `view_dtype` with no entry, so the PERSISTENT s/l sticks decode
+    /// at the MODEL dtype — the encoding the gate's own staging used (every
+    /// non-weight source arrives as f16-encoded probe values,
+    /// `dbg_synth_val` f32s handed in as `Arg::Tensor { dtype: F16 }`). The
+    /// u32 SENUINT32 wire is the CARD's format, not the gate's model;
+    /// restaging the real seed (a `LoadConst` carrying the token id, u32
+    /// words) is future work for the chain's real-seed leg, never silently
+    /// approximated here.
+    fn read_door_stick(&self, tid: u64) -> Result<Vec<f32>, String> {
         let s = *self
             .stick
             .get(&tid)
             .ok_or_else(|| format!("door: t{tid} has no resident stick"))?;
+        let n = *self
+            .numel
+            .get(&tid)
+            .ok_or_else(|| format!("door: t{tid} has no derived extent"))?;
+        let dt = self.view_dtype.get(&tid).copied().unwrap_or(self.dtype);
         let bytes = self
             .mem
             .hbm
             .borrow()
-            .read_bytes(s * STICK_BYTES, self.dtype.bytes_per_elem());
-        Ok(crate::codec::decode(&bytes, 1, self.dtype)[0])
+            .read_bytes(s * STICK_BYTES, n * dt.bytes_per_elem());
+        Ok(crate::codec::decode(&bytes, n, dt))
     }
 
-    /// LANE VALUES INTO a door's persistent index stick — the pattern
-    /// encoded at the MODEL dtype, the same staging class `read_door_lane0`
-    /// reads back, so a later forward reads the door's own words coherently.
-    /// These sticks are placements the doors own across steps, never gate
-    /// results. f16-exact at the classes the door laws name: lane patterns
-    /// (< 32), ramps (< 2048), the sentinel mark (`hidden` itself); lanes
-    /// past the mark ride the f16 grid, and no door read answers them (the
-    /// row door reads word 0 only).
-    fn write_door_lanes(&self, tid: u64, vals: &[f32]) -> Result<(), String> {
+    /// A DOOR STICK'S FULL WORDS BACK — the whole stick encoded at the MODEL
+    /// dtype, the same staging class `read_door_stick` reads the persistent
+    /// sticks back through, so a later forward reads the door's own words
+    /// coherently. These sticks are placements the doors own across steps,
+    /// never gate results. The write refuses a count that disagrees with the
+    /// stick's own derived extent — a door that mis-sizes its per-row window
+    /// must fail loudly, not truncate. f16-exact at the classes the door
+    /// laws name: lane patterns (< 32), ramps (< 2048), the sentinel mark
+    /// (`hidden` itself); lanes past the mark ride the f16 grid, and no door
+    /// read answers them (the row door reads word 0 of each row's sticks
+    /// only).
+    fn write_door_stick(&self, tid: u64, vals: &[f32]) -> Result<(), String> {
         let s = *self
             .stick
             .get(&tid)
             .ok_or_else(|| format!("door: t{tid} has no resident stick"))?;
+        let n = *self
+            .numel
+            .get(&tid)
+            .ok_or_else(|| format!("door: t{tid} has no derived extent"))?;
+        if vals.len() != n {
+            return Err(format!(
+                "door: t{tid} states {n} elements; the door wrote {} — a per-row window that \
+                 disagrees with the stick's own extent is a mis-derived width, never a \
+                 truncation",
+                vals.len()
+            ));
+        }
         let bytes = crate::codec::encode(vals, self.dtype);
         self.mem
             .hbm
@@ -1379,12 +1468,32 @@ impl ResidentExecutor {
                     let key = self.seg_plan_key(fs.func.operations);
                     // Name the SEGMENT in any failure: a program is hundreds of segments, and the
                     // op-level error alone (an SSA and a shape) does not say which one.
-                    execute_function_in_exec_only(
+                    //
+                    // ⭐ THE PINNED ENTRY — this segment's ONLY LX charge is the program's
+                    // bundle-stated pin window (auditor ruling 2026-10-27): the card holds
+                    // those pins and nothing else for this run (intermediates are HBM synth
+                    // regions), so the emulator charges that window per segment and never
+                    // the tiles. The bytes come from the bundle's own layout — stamped on
+                    // the LaunchProgram at its mint from the placement layout's
+                    // `lx_window_bytes()`. The Option resolves HERE, naming the segment: a
+                    // fused segment in a program with no window is a bypassed load refusal,
+                    // never a silent zero.
+                    let lx_pin_window_bytes =
+                        self.programs[idx].lx_pin_window_bytes.ok_or_else(|| {
+                            format!(
+                                "seg{seg_i} fused @{}: the program stated no LX pin window — the \
+                             load-time refusal was bypassed; a fused segment cannot charge a \
+                             window nobody proved",
+                                fs.func.name
+                            )
+                        })?;
+                    execute_function_in_exec_only_pinned(
                         &self.mem,
                         fs.func.operations,
                         (1, 1, 1),
                         &input_ptrs,
                         Some(key),
+                        lx_pin_window_bytes,
                     )
                     .map_err(|e| format!("seg{seg_i} fused @{}: {e}", fs.func.name))?;
                 }
@@ -2215,14 +2324,17 @@ fn largest_grid(module: &IRModule<'static>, segments: &[Segment<'static>]) -> us
 /// the weights are uploaded exactly once across all passes.
 ///
 /// `args` and `outputs` are keyed by TENSOR ID (`outputs` empty = the program's
-/// declared results); the returned map is keyed the same way.
+/// declared results); the returned map is keyed the same way. `lx_pin_window_bytes`
+/// is the program's bundle-stated LX pin window — `None` is refused at load, naming
+/// the program (see [`ResidentExecutor::new`]).
 pub fn execute_resident(
     funcs: &[IRFunction<'static>],
     spec: &ProgramSpec,
     args: &[(u64, Arg)],
     outputs: &[u64],
+    lx_pin_window_bytes: Option<u64>,
 ) -> Result<HashMap<u64, Output>, String> {
-    let mut exec = ResidentExecutor::new(funcs, spec)?;
+    let mut exec = ResidentExecutor::new(funcs, spec, lx_pin_window_bytes)?;
     exec.set_sources(args)?;
     // PRODUCTION DEFAULT: only the last token's logits are computed — autoregressive
     // generation samples the next token from the final position, so the other rows

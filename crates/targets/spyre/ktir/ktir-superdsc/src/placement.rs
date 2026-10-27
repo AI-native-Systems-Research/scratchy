@@ -863,6 +863,20 @@ impl BundleLayout {
         self.lx.borrow().op_local_bytes
     }
 
+    /// ⭐ THE PIN WINDOW ITSELF, as one number — the exact budget the bake's own
+    /// [`lx_window_fits`] guard proved for this layout: the core-local pin bytes
+    /// ([`Self::lx_core_local_bytes`], the up-cursor's whole distance from
+    /// [`LX_PIN_BASE`]) plus the op-local slot bytes
+    /// ([`Self::lx_op_local_slot_bytes`]). This is the number the emulator's
+    /// resident fused path charges per segment (auditor ruling 2026-10-27): the
+    /// card holds exactly these pins for a fused segment's run and nothing else
+    /// (its intermediates are HBM synth regions), so the emulator's LX guard
+    /// proves the same window the bake accepted. Read from the layout — never
+    /// recomputed from shapes.
+    pub fn lx_window_bytes(&self) -> u64 {
+        self.lx_core_local_bytes() + self.lx_op_local_slot_bytes()
+    }
+
     /// Record the probability-part pins the chunk form mints beside its gathers
     /// ([`crate::ir::bridge::tiled_op_sdsc_op::attn::chunk_prob_pins`]) — the second core-local
     /// term of the `lx_form` witness's budget, summed with the gather pins at the chunk's

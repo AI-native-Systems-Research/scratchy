@@ -199,13 +199,34 @@ impl SpyreSession {
         let mut funcs: Vec<Vec<ktir_core::ir::IRFunction<'static>>> =
             Vec::with_capacity(programs.len());
         let mut specs: Vec<ProgramSpec> = Vec::with_capacity(programs.len());
-        for (groups, results) in programs {
+        // ⭐ THE PIN WINDOW, PER PROGRAM — read off the bundle's own LaunchPrograms
+        // (stamped at their mint from the placement layout's `lx_window_bytes()`),
+        // with the agreement guard: every launch flattened into ONE session program
+        // must state the SAME window, because one program runs ONE bundle's budget.
+        // A program whose launches state none (`None`) passes through as `None` and
+        // the resident refuses it at load, naming it — never a silent zero.
+        let mut pin_windows: Vec<Option<u64>> = Vec::with_capacity(programs.len());
+        for (pi, (groups, results)) in programs.iter().enumerate() {
             // A group IS a launch, and its programs run in order; the groups run in order too, so
             // the whole program is that sequence flattened.
             let progs: Vec<bundle::LaunchProgram<'static>> = groups
                 .iter()
                 .flat_map(|g| g.programs.iter().cloned())
                 .collect();
+            let mut window: Option<u64> = None;
+            for (li, p) in progs.iter().enumerate() {
+                if li == 0 {
+                    window = p.lx_pin_window_bytes;
+                } else if window != p.lx_pin_window_bytes {
+                    return Err(anyhow!(
+                        "session program {pi} mixes launches with different LX pin windows \
+                         ({window:?} vs {:?}) — one program runs ONE bundle's window, so the \
+                         launches it flattens must all come from that bundle",
+                        p.lx_pin_window_bytes
+                    ));
+                }
+            }
+            pin_windows.push(window);
             funcs.push(progs.iter().map(|p| p.func).collect());
             specs.push(build_spec(&progs, results));
         }
@@ -220,7 +241,7 @@ impl SpyreSession {
             .map(|f| f.as_slice())
             .zip(specs.iter())
             .collect();
-        let session = Session::new_multi_floored(prog_refs, args, shape_floor)
+        let session = Session::new_multi_floored(prog_refs, args, shape_floor, pin_windows)
             .map_err(|e| anyhow!("Session::new_multi: {e}"))?;
         Ok(Self { session })
     }
@@ -488,6 +509,9 @@ mod tests {
                     (mask_p, bundle::PlaceId::Act(MASK as u32)),
                     (out_p, bundle::PlaceId::Act(OUT as u32)),
                 ]),
+                // Stated EXPLICITLY (auditor ruling 2026-10-27): this hand-built
+                // fixture program mints no LX pins, so its window is zero.
+                lx_pin_window_bytes: Some(0),
             }]),
             init_binary: std::borrow::Cow::Borrowed(&[]),
             job_bin_ptr: 0,

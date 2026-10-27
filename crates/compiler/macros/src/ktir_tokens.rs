@@ -453,11 +453,23 @@ pub fn program_tokens(
         let (s, id) = (ssa(*s), place_id_tokens(*id));
         quote! { (#s, #id) }
     });
+    // ⭐ THE PIN WINDOW THIS PROGRAM RUNS UNDER — the bundle layout's own `lx_window_fits`
+    // budget, carried as `Some(bytes)` exactly as the bake stamped it. `None` (no window was
+    // ever proven) round-trips as `None`: the resident fused path refuses it at load, and the
+    // refusal must survive the bake → inventory → worker trip.
+    let lxpw = match p.lx_pin_window_bytes {
+        Some(b) => {
+            let lit = proc_macro2::Literal::u64_unsuffixed(b);
+            quote! { ::core::option::Option::Some(#lit) }
+        }
+        None => quote! { ::core::option::Option::None },
+    };
     quote! {
         __KProg {
             func: #func,
             program: #prog,
             args: __KCow(&[#(#binds),*]),
+            lx_pin_window_bytes: #lxpw,
         }
     }
 }

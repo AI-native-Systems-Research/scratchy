@@ -88,6 +88,16 @@ pub struct CoreContext {
     /// LX tracking feature flags (`alias_dedup`, `consume_last_use`). Default: both
     /// on (production behavior). Mirrors Python's `LXOptions` (#134).
     lx_options: LxOptions,
+    /// PRIVATE to the pin-window executor (`execute_with_communication_pinned`,
+    /// auditor ruling 2026-10-27): when `false`, this context charges no per-tile
+    /// LX — the pinned path models the card's placement for an emission-lowered
+    /// fused segment (intermediates are HBM synth regions, no pin), and the pin
+    /// window it charged up front via [`Self::charge_lx_pin_window`] is the whole
+    /// budget. NOT an option: no public setter exists; the only writer is
+    /// [`Self::charge_pin_window_only`], reachable only from the pinned entry
+    /// point. Every other caller goes through `execute_with_communication` and
+    /// keeps whole-tile accounting untouched.
+    lx_charge_tiles: bool,
     /// SSA-id -> total operand-use count across the whole function (incl. nested
     /// regions). Drives consume-on-last-use in [`Self::consume_if_last_use`]: a tile
     /// with use_count 1 is freed at its single use so the consuming op's result can
@@ -159,6 +169,7 @@ impl CoreContext {
             tile_ptr: Vec::new(),
             tile_refcount: FxHashMap::default(),
             lx_options: LxOptions::default(),
+            lx_charge_tiles: true,
             use_counts: Vec::new(),
             trail: Vec::new(),
             scope_marks: Vec::new(),
@@ -305,6 +316,13 @@ impl CoreContext {
     /// Tile-producing interpreter bindings go through [`Self::track_lx_tile`],
     /// which dedups aliases of the same allocation (#118).
     pub fn track_lx(&mut self, v: Ssa, size_bytes: i64) -> Result<(), String> {
+        // Pin-window mode: this execution's intermediates are HBM-resident on
+        // the card (no LX pin was minted for them), so they charge nothing —
+        // the pin window charged by [`Self::charge_lx_pin_window`] is the whole
+        // LX budget. See [`Self::lx_charge_tiles`].
+        if !self.lx_charge_tiles {
+            return Ok(());
+        }
         let (used, capacity) = {
             let lx = self.lx.borrow();
             (lx.used, lx.capacity)
@@ -342,6 +360,12 @@ impl CoreContext {
     /// `reduce` result/`outs` alias) only bump the shared refcount, charging 0
     /// bytes themselves. Overflow is checked only on the first (charging) bind.
     pub fn track_lx_tile(&mut self, v: Ssa, tile: &crate::tile::Tile) -> Result<(), String> {
+        // Pin-window mode: as `track_lx` — no pin, no charge. The value still
+        // binds (set_value is separate); only the accounting is skipped, so
+        // untrack paths find zeros and are no-ops. See [`Self::lx_charge_tiles`].
+        if !self.lx_charge_tiles {
+            return Ok(());
+        }
         if !self.lx_options.alias_dedup {
             let r = self
                 .track_lx(v, tile.size_bytes() as i64)
@@ -395,6 +419,50 @@ impl CoreContext {
     /// Free LX for `v`. No-op if untracked. Mirrors `untrack_lx`.
     pub fn untrack_lx(&mut self, v: Ssa) {
         self.untrack_lx_id(v);
+    }
+
+    /// ⭐ CHARGE THE EMISSION'S LX PIN WINDOW (auditor ruling 2026-10-27). Under
+    /// the card's placement a fused segment's intermediates are HBM synth
+    /// regions — the only bytes a core's scratchpad holds for the run are the
+    /// pins the superdsc emission minted (`synth_lx_op_local` slot classes +
+    /// `synth_lx_core_local` per-core slices), the same two terms the bake's own
+    /// `lx_window_fits` guard proved at `#[forward]` expansion. This charges
+    /// that window once, read from the bundle (never inferred from shape), so
+    /// the emulator's LX guard proves exactly the pins the card holds — a
+    /// redundant proof by design: the bake already refused a window that did
+    /// not fit, and this refusal names the same defect if the two ever
+    /// disagree. Call BEFORE the segment's ops run, after
+    /// [`Self::charge_pin_window_only`] has suppressed per-tile charges.
+    pub fn charge_lx_pin_window(&mut self, bytes: u64) -> Result<(), String> {
+        let (used, capacity) = {
+            let lx = self.lx.borrow();
+            (lx.used, lx.capacity)
+        };
+        let bytes = bytes as i64;
+        if used + bytes > capacity {
+            return Err(format!(
+                "LX pin window exceeds core {}: {} + {} > {} — the emission's pin window \
+                 (op-local slot classes + core-local pins) does not fit the scratchpad; the \
+                 bake's own lx_window_fits guard accepted it, so the two budgets disagree",
+                self.core_id, used, bytes, capacity
+            ));
+        }
+        {
+            let lx = self.lx.borrow_mut();
+            lx.used += bytes;
+            lx.peak_used = lx.peak_used.max(lx.used);
+        }
+        Ok(())
+    }
+
+    /// The pin-window executor's mode switch (auditor ruling 2026-10-27): this
+    /// context charges the emission's LX pin window
+    /// ([`Self::charge_lx_pin_window`]) and never the tiles. `pub(crate)` so the
+    /// only caller in the tree is `execute_with_communication_pinned` — the
+    /// resident fused-segment path's one and only executor entry; there is no
+    /// public way to reach this, so it is a mode of that function, not a toggle.
+    pub(crate) fn charge_pin_window_only(&mut self) {
+        self.lx_charge_tiles = false;
     }
 
     /// The LX high-water mark of this context's core — the maximum
