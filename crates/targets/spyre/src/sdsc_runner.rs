@@ -647,8 +647,9 @@ impl SuperDscSession {
     /// what waits this submission out; `predict`'s tail sync is the drain this
     /// door exists to not run. Call `stage_step_acts` first: this door submits
     /// whatever the shadow holds.
-    pub fn submit_step(&mut self, seq_pos: usize) -> Result<()> {
-        self.exec.submit_step(SeqPos(seq_pos as i64))
+    pub fn submit_step(&mut self, n_new: usize, seq_pos: usize) -> Result<()> {
+        self.exec
+            .submit_step(NewTokens(n_new as i64), SeqPos(seq_pos as i64))
     }
 
     /// ⭐ #32 (A) — ENQUEUE THE STEP'S STICK READ, no drain: the D2H rides the

@@ -226,9 +226,12 @@ pub(crate) enum LogitsWanted {
     /// first generated token on the card from the folded lm-head row, and the idx stick
     /// is read back exactly like a decode launch's.
     LastRow,
-    /// A DECODE BATCH: one row per request, every row a different request. The rung's
-    /// sampler picks every token on the card; the caller reads the idx stick back.
-    PerRequest,
+    /// A DECODE BATCH: one row per request, every row a different request. The
+    /// rung's sampler picks every token on the card; the idx stick's raw read is
+    /// deferred and comes back through the one collect door
+    /// (`collect_decode_tokens`) — in-call when the schedule cannot defer, from
+    /// the drain when it can. There is no synchronous decode arm.
+    PerRequestDeferred,
 }
 
 /// The sendnn run backend selected from the baked bundle shape. DEFAULT-mode

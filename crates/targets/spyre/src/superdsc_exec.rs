@@ -4571,9 +4571,9 @@ impl Executor {
     /// disqualifies a forward from the emitted-row regime by the seat's
     /// own `is_quiet` gate — on this path they have no reachable input.
     /// Stated here rather than silently dropped.
-    pub fn submit_step(&mut self, seq_pos: SeqPos) -> Result<()> {
+    pub fn submit_step(&mut self, n_new: NewTokens, seq_pos: SeqPos) -> Result<()> {
         let d = Diag::get();
-        let _half = self.forward_half(NewTokens(1), seq_pos, SuffixLaunch::Launched, d)?;
+        let _half = self.forward_half(n_new, seq_pos, SuffixLaunch::Launched, d)?;
         Ok(())
     }
 

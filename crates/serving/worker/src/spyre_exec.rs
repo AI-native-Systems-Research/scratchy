@@ -1484,7 +1484,12 @@ impl Worker for SpyreWorker {
                     Some(bc) => scratchy_subtile::sdsc_abstract::BatchPrefix::Chunk(bc),
                     None => scratchy_subtile::sdsc_abstract::BatchPrefix::Fold(fold),
                 };
-                let rows = run_prefill_batch(
+                // ⭐ THE ONE DECODE PATH, SUBMITTED: every row is a different request and
+                // every row is sampled ON THE CARD by the rung's minted sampler; the idx
+                // stick's raw D2H is enqueued and comes back through the SAME collect door
+                // whether this schedule defers it to the drain or collects it right here —
+                // no logits are ever read, and there is no synchronous second arm.
+                let sub = match run_prefill_batch(
                     Some((&rows_in, prefix)),
                     kv_blocks.as_deref(),
                     &sh,
@@ -1498,16 +1503,22 @@ impl Worker for SpyreWorker {
                     // the meta above is borrowed for tensor ids and describes neither.
                     gathers_kv,
                     launch_pos,
-                    // Every row is a different request and every row is sampled — ON THE
-                    // CARD, by the rung's minted sampler. The idx stick comes back raw,
-                    // one token per launch slot; no logits are ever read.
-                    LogitsWanted::PerRequest,
+                    LogitsWanted::PerRequestDeferred,
                     // ⭐ EACH LIVE ROW ITS OWN REQUEST'S DRAW, laid by the same
                     // walk that laid the rows (the staging arm pairs them by
                     // slot and gives every padding slot the greedy law).
                     SeatLaws::Batch { draws: &draws },
-                )?
-                .ok_or_else(|| werr("decode batch: the rung picked no tokens".to_string()))?;
+                )? {
+                    BatchOut::Deferred(sub) => sub,
+                    BatchOut::Done(_) => {
+                        return Err(werr(
+                            "decode batch: the rung finished in-call — the deferred arm is the \
+                             only decode path"
+                                .to_string(),
+                        ))
+                    }
+                };
+                let rows = collect_decode_tokens(sess, &sub)?;
                 // ── KCACHE PROBE (SCRATCHY_KCACHE_PROBE), BATCHED STEP ── the batched counterpart of the
                 // solo `[kcache]` probe: after the fold's forward (cache write included), read back the
                 // layer-0 resident Kᵀ plane and print, per live request row, its launch slot, its pool

@@ -28,6 +28,30 @@ use crate::spyre_pool::*;
 use crate::spyre_types::*;
 use crate::spyre_worker::*;
 
+/// ⭐ #32 (c3) — A SUBMITTED DECODE STEP: the launch is on the card, the
+/// idx-stick read is enqueued, nothing collected. Everything the collect half
+/// needs to turn the ring slot back into tokens. The RUNG INDEX travels beside
+/// it in the caller, because each rung owns its own session and only that
+/// session's executor can finish the read.
+#[cfg(feature = "spyre-hw")]
+pub(crate) struct SubmittedDecode {
+    pub(crate) read: scratchy_target_spyre::superdsc_exec::DeferredRead,
+    /// The launch's row count — the seat's `rows` the submit half set.
+    pub(crate) rows: u32,
+    pub(crate) result_id: u32,
+    pub(crate) vocab: usize,
+}
+
+/// What `run_prefill_batch` hands back: a finished step's picks, or a
+/// submitted decode step whose read is deferred. A decode batch is ALWAYS the
+/// latter — one decode path — and a schedule that cannot defer collects it
+/// in-call through the same [`collect_decode_tokens`] door.
+#[cfg(feature = "spyre-hw")]
+pub(crate) enum BatchOut {
+    Done(Option<Vec<u32>>),
+    Deferred(SubmittedDecode),
+}
+
 /// Bind the m=N batched-prefill activations + the mq>1 attention consts into `pf` and run ONE
 /// forward over prompt tokens `toks` at positions `[start..start+mq)`. This populates `pf`'s resident
 /// seg2 KV (mq slots, via the mq>1 cachewr) on-card. Mirrors the per-token decode binding but for mq
@@ -119,7 +143,7 @@ pub(crate) fn run_prefill_batch(
     // runs), so the value it passes is inert — but the arm/variant match is
     // still refused wherever the seat IS staged, never silently resolved.
     seat_laws: SeatLaws<'_>,
-) -> ExecutorResult<Option<Vec<u32>>> {
+) -> ExecutorResult<BatchOut> {
     use scratchy_subtile::sdsc_abstract::{ChunkRows, decode_prefix_col_valid};
     // ⭐ NO `hd` HERE ANY MORE. The one head-count question this function asked (`h / hd`) is now
     // the bake's own `Geometry::nqh` — the quotient was the head count only for a square Q
@@ -616,47 +640,53 @@ pub(crate) fn run_prefill_batch(
         &acts_f16,
     );
     let picked = match want_logits {
-        // The whole `[rows, vocab]` result stays on the card: the minted sampler
-        // consumed it there and left the idx stick in its place. One raw D2H of the
-        // idx — never a logits read, never a host argmax.
-        LogitsWanted::PerRequest => {
-            pf.run_step_i32(
-                mq,
-                start,
-                &acts,
-                &acts_f16,
-                &acts_i32,
-                StepLogits::LeftOnDevice,
-            )
-            .map_err(|e| {
+        // ⭐ THE ONE DECODE PATH, SUBMITTED: stage, launch, enqueue the idx-stick read,
+        // return. The minted sampler consumes the `[rows, vocab]` result on the card and
+        // leaves the idx stick in its place; this arm defers the ONE raw D2H of that
+        // stick — never a logits read, never a host argmax — and the caller collects it
+        // through `collect_decode_tokens`, in-call when the schedule cannot defer, from
+        // the drain when it can. There is no second, synchronous decode arm.
+        LogitsWanted::PerRequestDeferred => {
+            if b.wiring.sample_seat.is_none() {
+                return Err(werr("decode bundle has no sampler seat".to_string()));
+            }
+            // The rung's own width, not the solo meta's (see the seat-bind site above),
+            // is what `mq` is here — and it rides out in `SubmittedDecode::rows`.
+            pf.stage_step_acts(&acts, &acts_f16, &acts_i32)
+                .map_err(|e| {
+                    werr(format!(
+                        "superdsc decode batch stage (mq={mq}, start={start}): {e}"
+                    ))
+                })?;
+            pf.submit_step(mq, start).map_err(|e| {
                 werr(format!(
-                    "superdsc decode batch run_step (mq={mq}, start={start}): {e}"
+                    "superdsc decode batch submit (mq={mq}, start={start}): {e}"
                 ))
             })?;
-            let seat = b
-                .wiring
-                .sample_seat
-                .as_ref()
-                .ok_or_else(|| werr("decode bundle has no sampler seat".to_string()))?;
-            // The rung's own width, not the solo meta's — see the seat-bind site above.
             // ⭐ THE COPY IS THE PLACEMENT'S TRUTH on this path: a decode-batch
             // rung is the same tape baked at `mq` rows but addressed by
             // FINGERPRINT, so `b.wiring`'s seat is the single-request meta
             // (rows=1) while the launch — the logits block, the word tables,
             // the idx stick — is `mq` rows wide (`RowCapacity::of_baked_rung`
             // takes `prefill_m` for exactly this reason, one screen up). The
-            // readback must read through the SAME rows the launch laid.
-            let mut seat = *seat;
-            seat.rows = mq as u32;
-            let picked = read_sampled_tokens(pf, &seat, b.result_id as u32, vocab)?;
-            log_seat_readback(
-                pf,
-                &seat,
-                b.wiring.load_consts,
-                &picked,
-                &format!("decode-batch mq={mq} start={start}"),
-            );
-            Some(picked)
+            // readback must read through the SAME rows the launch laid — the
+            // deferred collect below carries `rows: mq` for exactly this law.
+            let read = pf
+                .defer_read_tensor_ring(
+                    scratchy_target_spyre::bundle_code::PlaceId::Act(b.result_id as u32),
+                    mq * 64 * 4,
+                )
+                .map_err(|e| {
+                    werr(format!(
+                        "superdsc decode batch idx read (mq={mq}, start={start}): {e}"
+                    ))
+                })?;
+            return Ok(BatchOut::Deferred(SubmittedDecode {
+                read,
+                rows: mq as u32,
+                result_id: b.result_id as u32,
+                vocab,
+            }));
         }
         LogitsWanted::None => {
             pf.run_step_i32(
@@ -719,7 +749,7 @@ pub(crate) fn run_prefill_batch(
     // per-position K/V norms expose POSITIONAL scrambling (positions permuted/duplicated/zeroed ⇒
     // attention attends the wrong tokens ⇒ off-topic ramble). |x|>256 flags fp16 x²-overflow risk,
     // |x|>65504 flags actual fp16 overflow, zero-count flags uninitialized/underflow.
-    Ok(picked)
+    Ok(BatchOut::Done(picked))
 }
 #[cfg(feature = "spyre-hw")]
 
@@ -1255,6 +1285,33 @@ fn read_sampled_tokens(
             rows * 64 * 4,
         )
         .map_err(|e| werr(format!("sampler idx readback (t{result_id}): {e}")))?;
+    decode_idx_stick(&bytes, rows, vocab)
+}
+
+/// ⭐ #32 (c3) — THE COLLECT HALF of a submitted decode step: park on the idx
+/// read's own completion (the loop's ONE fence — this read's D2H, then the
+/// shadow's quiet point, never a whole-stream sync), then apply the exact
+/// [`read_sampled_tokens`] decode law to the bytes the ring slot holds. The
+/// SAME door whether the caller collects in-call (a schedule that cannot
+/// defer) or from the drain — the only difference is when, never what.
+#[cfg(feature = "spyre-hw")]
+pub(crate) fn collect_decode_tokens(
+    session: &mut SuperDscSession,
+    sub: &SubmittedDecode,
+) -> ExecutorResult<Vec<u32>> {
+    let bytes = session.finish_deferred_read_raw(&sub.read).map_err(|e| {
+        werr(format!(
+            "sampler idx readback (t{}): {e}",
+            sub.result_id
+        ))
+    })?;
+    decode_idx_stick(&bytes, sub.rows as usize, sub.vocab)
+}
+
+/// The idx stick's own decode law, shared by the sync readback and the deferred
+/// collect so the two cannot drift.
+#[cfg(feature = "spyre-hw")]
+fn decode_idx_stick(bytes: &[u8], rows: usize, vocab: usize) -> ExecutorResult<Vec<u32>> {
     let words: Vec<i32> = bytes
         .chunks_exact(4)
         .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -1874,7 +1931,16 @@ pub(crate) fn superdsc_forward_chunk(
                         draw: req.draw.as_ref(),
                     },
                 )?;
-                prompt_pick = chunk_pick;
+                // A prompt chunk never defers: it asked for `LastRow`/`None`, the two arms
+                // that return `Done`.
+                prompt_pick = match chunk_pick {
+                    BatchOut::Done(p) => p,
+                    BatchOut::Deferred(_) => {
+                        return Err(werr(
+                            "a prompt chunk deferred its read — only a decode batch can".to_string(),
+                        ))
+                    }
+                };
                 // UNCONDITIONAL truth-signal per chunk: `chunk_len` prompt tokens went through ONE
                 // mq=N forward. This is the ONLY line that lets verify_prefill_real.sh print
                 // PREFILL_REAL=PASS. `prefill_m` is the rung actually RUN (not the ceiling), so the
@@ -2233,16 +2299,37 @@ pub(crate) fn superdsc_forward_chunk(
         }
         acts_i32.extend(sample_binds(seat, &solo_laws)?);
         {
-            // The whole result stays ON THE CARD: the minted sampler consumed the
-            // logits there and left the idx stick in their place. LeftOnDevice +
-            // one raw idx readback — no logits D2H, no host argmax, no oracle.
+            // ⭐ THE ONE DECODE PATH, SUBMITTED: the whole result stays ON THE CARD
+            // (the minted sampler consumed the logits there and left the idx stick in
+            // their place), the launch is submitted with no trailing drain, and the
+            // ONE raw idx readback is deferred and collected through the same door the
+            // batched path uses — no logits D2H, no host argmax, no oracle, and no
+            // second, synchronous decode arm.
             session
-                .run_step_i32(1, p, &acts, &acts_f16, &acts_i32, StepLogits::LeftOnDevice)
-                .map_err(|e| werr(format!("superdsc run_step (pos {p}): {e}")))?;
+                .stage_step_acts(&acts, &acts_f16, &acts_i32)
+                .map_err(|e| werr(format!("superdsc decode stage (pos {p}): {e}")))?;
+            session
+                .submit_step(1, p)
+                .map_err(|e| werr(format!("superdsc decode submit (pos {p}): {e}")))?;
+            let read = session
+                .defer_read_tensor_ring(
+                    scratchy_target_spyre::bundle_code::PlaceId::Act(b.result_id as u32),
+                    64 * 4,
+                )
+                .map_err(|e| werr(format!("superdsc decode idx read (pos {p}): {e}")))?;
             step_timing(p, _t_fwd);
+            let sub = SubmittedDecode {
+                read,
+                rows: 1,
+                result_id: b.result_id as u32,
+                vocab,
+            };
             // This launch's row is 0 (one request, its own session), so its token
             // is the idx stick's first row's lane 0.
-            let toks = read_sampled_tokens(session, seat, b.result_id as u32, vocab)?;
+            let toks = collect_decode_tokens(session, &sub)?;
+            // ⭐ FRONT-B'S SEAT PROBE, KEPT ON THE SOLO PATH: the collect has
+            // already paid this launch's one D2H fence, so the probe's own
+            // debug reads add no cadence — and it never gates the run.
             log_seat_readback(
                 session,
                 seat,
