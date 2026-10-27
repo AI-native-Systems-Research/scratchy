@@ -1162,7 +1162,7 @@ pub(crate) struct RowLaw<'a> {
 /// Called by every staging walk that lays pad rows (the decode batch's and
 /// the solo rung's), never spelled twice.
 #[cfg(feature = "spyre-hw")]
-fn pad_law_of(live0: &RowLaw<'_>) -> RowLaw<'_> {
+fn pad_law_of<'a>(live0: &RowLaw<'a>) -> RowLaw<'a> {
     RowLaw {
         draw: live0.draw,
         step: live0.step,
@@ -1176,7 +1176,7 @@ fn pad_law_of(live0: &RowLaw<'_>) -> RowLaw<'_> {
 #[cfg(feature = "spyre-hw")]
 fn batch_seat_laws<'a>(
     draws: &[Option<&'a SampledDraw>],
-    live: &scratchy_subtile::sdsc_abstract::LaunchRows<'_>,
+    live: &scratchy_subtile::sdsc_abstract::LiveBatch,
     seat_rows: usize,
 ) -> ExecutorResult<Vec<RowLaw<'a>>> {
     if draws.len() != live.live() {
@@ -3194,10 +3194,10 @@ mod pad_clamp_tests {
     }
 
     /// Two live rows in a 4-row rung — slots 2 and 3 are padding — with the
-    /// launch rows handed to `f` while the batch they borrow is alive.
-    fn with_two_of_four<R>(f: impl FnOnce(&scratchy_subtile::sdsc_abstract::LaunchRows<'_>) -> R) -> R {
+    /// live batch handed to `f` while the histories it borrows are alive.
+    fn with_two_of_four<R>(f: impl FnOnce(&scratchy_subtile::sdsc_abstract::LiveBatch) -> R) -> R {
         use scratchy_subtile::sdsc_abstract::{
-            BatchRow, KvHistory, RungWidth, SeedSource, SeqPos, SlotMap,
+            BatchRow, KvHistory, RungWidth, SeqPos, SlotMap,
         };
         let width = RungWidth::of_baked_rows(4).expect("a 4-row rung");
         let hists: Vec<_> = (0..2).map(|i| KvHistory::contiguous(8 + i)).collect();
@@ -3209,9 +3209,7 @@ mod pad_clamp_tests {
                     hist: hists[i].clone(),
                 })
             })
-            .expect("the builder never fails here")
-            .launch_rows(SeedSource::OnCard, width)
-            .expect("the batch lays into its rung");
+            .expect("the builder never fails here");
         f(&live)
     }
 
