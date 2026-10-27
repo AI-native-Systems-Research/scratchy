@@ -542,6 +542,7 @@ pub(crate) fn run_prefill_batch(
             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_CAUSAL_TID,
         )),
         causal_keyed: None,
+        card_owned_sticks: Vec::new(),
         launched: false,
     };
     scratchy_subtile::host_tape::play(
@@ -550,6 +551,14 @@ pub(crate) fn run_prefill_batch(
     )
     .map_err(|e| werr(format!("prefill forward tape: {e}")))?;
     debug_assert!(launcher.launched, "the tape must reach its device step");
+    // ⭐⭐⭐ THE ONCARD HAND-OFF, BEFORE THIS LAUNCH'S REFILL. The sticks the skip named are
+    // the card's from this step on: dropping them from the executor's persistent maps here —
+    // ahead of `stage_step_acts`/`submit_step` below — is what stops THIS submit's preamble
+    // H2D from re-sending the last `Host` seed over the previous step's ChainStage pick. A
+    // later churned seating re-binds its seeds from the collected picks, re-inserting them.
+    for id in &launcher.card_owned_sticks {
+        pf.hand_to_card(*id);
+    }
     acts.extend(launcher.acts);
     acts_f16.extend(launcher.acts_f16);
     acts_i32.extend(launcher.acts_i32);
@@ -873,6 +882,13 @@ pub(crate) struct ForwardLauncher<'a, V: Fn(usize) -> bool> {
         scratchy_subtile::sdsc_abstract::CausalKey,
         std::borrow::Cow<'static, [f32]>,
     )>,
+    /// ⭐⭐⭐ THE STICKS THIS LAUNCH HANDS TO THE CARD — filled by the ChainSeed skip below.
+    /// An `OnCard` launch's sticks are the CARD'S: the previous step's ChainStage writes them,
+    /// and the executor's persistent bind maps must let them go, or every later submit's
+    /// refill re-uploads the last `Host` seed over the card's own pick before the gather
+    /// reads it (the stuck-seed repetition, pinned on card 2026-10-27). The caller walks
+    /// this list through [`SuperDscSession::hand_to_card`] after the tape plays.
+    pub(crate) card_owned_sticks: Vec<scratchy_target_spyre::bundle_code::PlaceId>,
     /// Set when the tape's device step runs; the caller reads the logits from there.
     pub(crate) launched: bool,
 }
@@ -901,9 +917,37 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
         // the device's gather reads the sticks as they were left. Binding a host seed here would
         // need the PREVIOUS step's pick before this launch's submit — the drain fence the seed
         // law exists to delete.
+        //
+        // ⛔⛔⛔ AND THE SKIP MUST GO FURTHER THAN "STAGE NOTHING". A previous `Host` launch's
+        // seed bind sits in the executor's PERSISTENT maps (`bind_input_raw` lands in `bound`),
+        // and the refill re-sends every unkeyed `bound` entry on EVERY submit — so an `OnCard`
+        // launch that only skips staging would have its preamble H2D overwrite the sticks with
+        // the LAST host seed every step, erasing the card's own ChainStage pick before the
+        // gather reads it. The skip therefore NAMES the two sticks for the caller to hand to
+        // the card ([`Self::card_owned_sticks`]) — the same one-fact-per-launch spelling the
+        // held causal key takes.
         if step.kernel == scratchy_target_spyre::forward_tape::ForwardKernel::ChainSeed
             && self.inputs.chain_seeds.is_none()
         {
+            match self.shape.phase {
+                scratchy_target_spyre::forward_tape::ForwardPhase::Decode { chain } => {
+                    let s = scratchy_target_spyre::bundle_code::PlaceId::Act(chain.s_src);
+                    let l = scratchy_target_spyre::bundle_code::PlaceId::Act(chain.l_src);
+                    // THIS STEP'S OWN STICK, once — the s step and the l step each name theirs.
+                    if step.tensor == s || step.tensor == l {
+                        self.card_owned_sticks.push(step.tensor);
+                    } else {
+                        return Err(format!(
+                            "ChainSeed step on t{} — the chain names t{} (s) and t{} (l), and a \
+                             seed landing anywhere else is a stick the gather never reads",
+                            step.tensor.tid(),
+                            chain.s_src,
+                            chain.l_src
+                        ));
+                    }
+                }
+                scratchy_target_spyre::forward_tape::ForwardPhase::Prefill => {}
+            }
             self.staged = None;
             return Ok(());
         }
@@ -2372,6 +2416,7 @@ pub(crate) fn superdsc_forward_chunk(
                 scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_CAUSAL_TID,
             )),
             causal_keyed: None,
+            card_owned_sticks: Vec::new(),
             launched: false,
         };
         scratchy_subtile::host_tape::play(
@@ -2394,8 +2439,16 @@ pub(crate) fn superdsc_forward_chunk(
             mut acts_i32,
             causal_held: _,
             causal_keyed,
+            // ⛔ THE SOLO STEP SEEDS EVERY TIME (`chain_seeds: Some` above), so the skip never
+            // fires and this list is empty — asserted, not assumed, because a non-empty list
+            // here would mean the solo path stopped re-binding a seed it never collects late.
+            card_owned_sticks,
             launched,
         } = launcher;
+        debug_assert!(
+            card_owned_sticks.is_empty(),
+            "the solo step seeds from the host every time — no stick is the card's"
+        );
         debug_assert!(launched, "the tape must reach its device step");
         if let Some((id, key, vals)) = causal_keyed {
             session
@@ -3318,5 +3371,116 @@ mod pad_clamp_tests {
         // Live 1 keeps its OWN greedy law — the clamp touches pads alone.
         assert!(laws[1].draw.is_none());
         assert_pads_stage_live_0(&seat, &laws, "sampled live 0");
+    }
+
+    /// ⭐⭐⭐ THE ONCARD HAND-OFF'S OWN PIN (card-pinned 2026-10-27): an `OnCard` decode
+    /// launch must NAME its two sticks for the caller to hand to the card, because the
+    /// executor's refill re-sends every unkeyed `bound` entry on every submit — a
+    /// previous `Host` launch's seed bind left in the maps would overwrite the card's own
+    /// ChainStage pick before the gather reads it (the stuck-seed repetition: every
+    /// batched text from the third token on was the seed token re-emitted, while solo —
+    /// which re-seeds `Host` every step — stayed byte-identical). The skip is the launch's
+    /// ONE fact about the sticks, exactly as the held causal key is its one fact about
+    /// the mask.
+    #[test]
+    fn an_oncard_launch_names_its_sticks_and_a_host_launch_names_none() {
+        use scratchy_subtile::host_tape::{play, HostTape};
+        use scratchy_target_spyre::forward_tape::{
+            tape_steps, operands, ForwardInputs, ForwardShape,
+        };
+
+        let chain = scratchy_target_spyre::wiring::ChainWiring {
+            s_src: 41,
+            l_src: 43,
+            k: 3,
+            hidden: 2048,
+            replaces: 7,
+        };
+        let shape = ForwardShape {
+            rows: 1,
+            embed_src: 1,
+            cos_srcs: &[],
+            sin_srcs: &[],
+            prefix_mask: false,
+            kv_block_index: false,
+            n_consts: 0,
+            phase: scratchy_target_spyre::forward_tape::ForwardPhase::Decode { chain },
+        };
+        let steps = shape.steps();
+        let ops = operands(&steps);
+        let ftape = tape_steps(&steps, &ops);
+
+        // (the hand-off list, whether the seeds staged, and the tape's own launch flag)
+        let play_with = |chain_seeds: Option<&'static [usize]>| {
+            let inputs = ForwardInputs::<fn(usize) -> bool> {
+                hidden: 2048,
+                num_q_heads: 1,
+                mq_pad: 64,
+                causal_heads_per_block: 1,
+                embed_tokens: &[],
+                tokens: &[],
+                chain_seeds,
+                positions: &[],
+                causal: scratchy_subtile::sdsc_abstract::CausalKey::chunk(
+                    scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1).expect("a width"),
+                    1,
+                )
+                .expect("a key"),
+                prefix: None,
+                consts: &[],
+                mask_neg: scratchy_subtile::sdsc_abstract::ATTN_MASK_NEG,
+                stick_major: true,
+                kv_blocks: None,
+            };
+            let mut launcher = ForwardLauncher {
+                shape: &shape,
+                steps: &steps,
+                inputs: &inputs,
+                staged: None,
+                acts: Vec::new(),
+                acts_f16: Vec::new(),
+                acts_i32: Vec::new(),
+                causal_held: None,
+                causal_keyed: None,
+                card_owned_sticks: Vec::new(),
+                launched: false,
+            };
+            play(&HostTape { steps: &ftape }, &mut launcher)
+                .expect("the decode tape plays");
+            assert!(launcher.launched, "the tape must reach its device step");
+            (
+                launcher.card_owned_sticks,
+                launcher.acts_i32,
+            )
+        };
+
+        // OnCard: the two ChainSeed steps stage nothing and the skip names EXACTLY the
+        // chain's own sticks — the list the caller walks through `hand_to_card`.
+        let (oncard, oncard_i32) = play_with(None);
+        assert_eq!(
+            oncard,
+            vec![
+                scratchy_target_spyre::bundle_code::PlaceId::Act(chain.s_src),
+                scratchy_target_spyre::bundle_code::PlaceId::Act(chain.l_src),
+            ],
+            "the OnCard skip names the chain's own two sticks, once each"
+        );
+        assert!(
+            oncard_i32.is_empty(),
+            "an OnCard launch stages no seed words"
+        );
+
+        // Host: the seeds stage (per-row words through the raw channel) and NOTHING is
+        // handed to the card — a Host launch owns its sticks this step.
+        let (host, host_i32) = play_with(Some(&[1318]));
+        assert!(
+            host.is_empty(),
+            "a Host-seeded launch names no card-owned stick"
+        );
+        assert_eq!(
+            host_i32.len(),
+            2,
+            "the s and the l seed both stage through the raw channel"
+        );
     }
 }

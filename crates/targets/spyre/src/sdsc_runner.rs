@@ -712,6 +712,13 @@ impl SuperDscSession {
         self.exec.stage_keyed(id, key, f32_to_f16_le(vals))
     }
 
+    /// ⭐⭐⭐ THE ONCARD HAND-OFF — the sticks a stable decode seating leaves to the card's own
+    /// ChainStage writes. Ends the refill's re-send of a previous `Host` launch's seed bind
+    /// (see `Executor::hand_to_card`); a churned seating's re-bind re-inserts it.
+    pub fn hand_to_card(&mut self, id: crate::bundle_code::PlaceId) {
+        self.exec.hand_to_card(id)
+    }
+
     /// ⭐ #32 (A) — THE BIND LOOP EVERY STEP RUNS BEFORE ITS FORWARD, PUB FOR THE
     /// PIPELINED LOOP, which stages half a step at a time: it calls this with
     /// step `j+1`'s acts while the device still executes step `j` (the

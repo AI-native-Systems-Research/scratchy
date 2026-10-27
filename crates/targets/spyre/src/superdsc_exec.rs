@@ -1831,6 +1831,22 @@ impl Executor {
         self.bound.insert(b.id, b.bytes);
     }
 
+    /// ⭐⭐⭐ HAND AN ACTIVATION TO THE CARD — the sticks of a stable decode seating. The
+    /// previous step's ChainStage writes them on the device, and this step's gather reads
+    /// them there; a `Host`-seeded launch's raw seed bind sits in [`Self::bound`], and the
+    /// refill re-sends every unkeyed `bound` entry on EVERY submit — so without this door
+    /// each stable step's preamble H2D would overwrite the card's own pick with the last
+    /// host seed before the gather reads it (the stuck-seed repetition, pinned on card
+    /// 2026-10-27: every batched text from the third token on was the seed token
+    /// re-emitted). Removing the id from all three maps ends the re-send; a later `Host`
+    /// launch re-binds it (a churned seating re-seeds from the collected picks), which
+    /// re-inserts it exactly as a fresh bind would.
+    pub fn hand_to_card(&mut self, id: bundle::PlaceId) {
+        self.raw_ids.remove(&id);
+        self.staged.remove(&id);
+        self.bound.remove(&id);
+    }
+
     /// ⭐⭐⭐⭐⭐ Bind a RESIDENT FP32 CONSTANT at load — staged VERBATIM, once, never re-bound.
     /// The spliced argmax kernel's staged f32 constants (the one-request rung's
     /// exactness island), and nothing else today.
