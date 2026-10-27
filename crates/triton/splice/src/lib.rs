@@ -3783,16 +3783,32 @@ mod production_ktir_dump {
                 None => {
                     let node = triton_ktir_superdsc::node_for(&module, program_of(name))
                         .unwrap_or_else(|e| panic!("`{name}` did not mint a node: {e}"));
-                    let lines = emit_sdsc(name, &node)
-                        .unwrap_or_else(|e| panic!("`{name}` did not emit SDSC: {e}"));
                     let sdsc_path = dir.join(format!("{name}.sdsc.jsonl"));
-                    std::fs::write(&sdsc_path, format!("{}\n", lines.join("\n")))
-                        .unwrap_or_else(|e| panic!("write {}: {e}", sdsc_path.display()));
-                    eprintln!(
-                        "dumped {name} -> {} ({} ops)",
-                        sdsc_path.display(),
-                        lines.len()
-                    );
+                    match emit_sdsc(name, &node) {
+                        Ok(lines) => {
+                            std::fs::write(&sdsc_path, format!("{}\n", lines.join("\n")))
+                                .unwrap_or_else(|e| panic!("write {}: {e}", sdsc_path.display()));
+                            eprintln!(
+                                "dumped {name} -> {} ({} ops)",
+                                sdsc_path.display(),
+                                lines.len()
+                            );
+                        }
+                        // ⭐ A KERNEL THE DOOR REFUSES IS A NAMED SKIP, CARRIED AS DATA — the
+                        // driver mirrors what the production door lowers and NOTHING wider
+                        // (auditor ruling 2026-10-27: never fix the door to suit the driver).
+                        // The refusal is the door's own message, written as the kernel's one
+                        // `.sdsc.jsonl` line, so the before/after diff still sees it: a kernel
+                        // that flips refused↔emitted, or whose refusal reason moves, is a diff.
+                        Err(reason) => {
+                            std::fs::write(
+                                &sdsc_path,
+                                format!("{{\"refused\": {}}}\n", serde_json::json!(reason)),
+                            )
+                            .unwrap_or_else(|e| panic!("write {}: {e}", sdsc_path.display()));
+                            eprintln!("SDSC-REFUSED {name}: {reason}");
+                        }
+                    }
                 }
             }
         }
