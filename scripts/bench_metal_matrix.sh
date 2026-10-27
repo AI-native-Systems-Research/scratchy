@@ -289,9 +289,8 @@ UNPINNED=0
 SCALING=1
 # The default sweep is real dataset tasks (the tasks axis); --random runs the random-token grid.
 SCALE_AXES="tasks"
-# The dataset workloads, by run kind: a quick run's small set, a full run's five
-# (docs/superpowers/specs/2026-10-24-metal-real-datasets-design.md). Each runs at
-# every --scale-grid-conc users count. rag-spans, scratchy's own passage reuse,
+# The dataset workloads, by run kind: a quick run's small set, a full run's five.
+# Each runs at every --scale-grid-conc users count. rag-spans, scratchy's own passage reuse,
 # runs on scratchy only, next to rag.
 WORKLOADS="sharegpt,rag,sharegpt-multi-turn"
 (( FULL )) && WORKLOADS="sharegpt,rag,sharegpt-multi-turn,longbench,shared-prefix,shared-prefix-control"
@@ -1171,7 +1170,7 @@ run_task_cell() { # prefix workload conc
     local -a extra=() chat=()
     seed=$(printf '%s' "${SCALE_SEED_BASE}:${stem}:tasks:$2:$3" | cksum | cut -d' ' -f1)
     case "${w}" in
-        sharegpt)              extra=(--dataset-name sharegpt --dataset-path "${SHAREGPT_PATH}" --output-len 256) ;;
+        sharegpt)              extra=(--dataset-name sharegpt --dataset-path "${SHAREGPT_PATH}" --sharegpt-max-output-len 256) ;;
         sharegpt-multi-turn)   extra=(--dataset-name sharegpt-multi-turn --dataset-path "${SHAREGPT_PATH}")
                                n=$(( n / 4 > 2 ? n / 4 : 2 )) ;;   # conversations, of 4 turns each
         rag|rag-spans)         extra=(--dataset-name "${w}" --rag-source musique) ;;
@@ -1225,9 +1224,10 @@ j = json.load(open(sys.argv[1]))
 f = lambda k, spec: "-" if j.get(k) is None else format(j[k], spec)
 acc = "" if j.get("accuracy") is None else f" · {j['accuracy'] * 100:.0f}% right"
 bad = f" · {j['failed']} FAILED" if j.get("failed") else ""
+capped = f" · {j['capped_answers']} capped" if j.get("capped_answers") else ""
 print(f"TTFT p50 {f('median_ttft_ms', '.0f')} ms · E2E p50 {f('median_e2el_ms', '.0f')} ms"
       f" · {f('mean_output_tokens', '.0f')} answer tok · {f('mean_cached_tokens', '.0f')} cached tok"
-      f"{acc} · {j['completed']} ok{bad}")
+      f"{acc} · {j['completed']} ok{capped}{bad}")
 PY
 }
 run_scale_cells() { # prefix restart-function full-length [axes]

@@ -73,14 +73,33 @@ fn n(v: Option<f64>) -> String {
     v.map_or_else(|| "—".to_string(), |v| format!("{v:.0}"))
 }
 
+/// Whether most of a cell's answers ran to their cap.
+fn mostly_capped(c: &TaskCell) -> bool {
+    c.completed
+        .is_some_and(|n| n > 0 && 2 * c.capped_answers.unwrap_or(0) > n)
+}
+
 /// Accuracy, where it is like for like: none for a cell whose answers opened as reasoning, or one
-/// every answer of which ran to its cap, which reads as wrong without being an answer.
+/// most of whose answers ran to their cap, which read as wrong without being answers.
 fn accuracy(c: &TaskCell) -> Option<f64> {
-    let all_capped = c
-        .completed
-        .is_some_and(|n| n > 0 && c.capped_answers == Some(n));
     c.accuracy
-        .filter(|_| c.thinking_answers.unwrap_or(0) == 0 && !all_capped)
+        .filter(|_| c.thinking_answers.unwrap_or(0) == 0 && !mostly_capped(c))
+}
+
+/// How far apart two cells' mean answers may be, as a share of the longer, for their whole
+/// answers' times to be compared: an engine that stops at EOS where the other runs on (oMLX does,
+/// despite `ignore_eos`) answers in fewer tokens, and its time is no faster for it.
+const SAME_LENGTH: f64 = 0.10;
+
+/// How many times faster scratchy is to its whole answer than the rival: only where both answered
+/// at about the same length ([`SAME_LENGTH`]), neither mostly ran to its cap, and both say how
+/// long their answers were.
+fn total_times(c: &TaskCell, r: &TaskCell) -> Option<f64> {
+    let (a, b) = (c.answer_tokens()?, r.answer_tokens()?);
+    let close = (a - b).abs() <= SAME_LENGTH * a.max(b);
+    (close && !mostly_capped(c) && !mostly_capped(r))
+        .then(|| times(c.median_e2el_ms, r.median_e2el_ms, true))
+        .flatten()
 }
 
 /// The mark of a cell some of whose requests failed, as the random cells carry it.
@@ -131,7 +150,7 @@ pub fn tasks_table(m: &Model) -> Element {
                     let (name, _) = workload_label(&c.workload);
                     let them = rival(m, &c.workload, c.conc);
                     let ttft = them.and_then(|(_, r)| times(c.median_ttft_ms, r.median_ttft_ms, true));
-                    let total = them.and_then(|(_, r)| times(c.median_e2el_ms, r.median_e2el_ms, true));
+                    let total = them.and_then(|(_, r)| total_times(c, r));
                     let vs = them.map_or_else(|| "—".to_string(), |(e, _)| e.label().to_string());
                     rsx! {
                         TableRow {
@@ -162,6 +181,33 @@ pub fn tasks_table(m: &Model) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole answer's time is set against the rival's only at about the same answer length,
+    /// and neither mostly capped; the first token's always is.
+    #[test]
+    fn a_total_ratio_needs_answers_of_about_one_length() {
+        let cell = |tokens: f64, capped: u32| TaskCell {
+            workload: "rag".into(),
+            conc: 1,
+            completed: Some(8),
+            failed: Some(0),
+            median_ttft_ms: Some(100.0),
+            median_e2el_ms: Some(1000.0),
+            mean_output_tokens: Some(tokens),
+            total_output_tokens: None,
+            mean_cached_tokens: None,
+            accuracy: None,
+            thinking_answers: Some(0),
+            capped_answers: Some(capped),
+            timed_out: false,
+        };
+        assert_eq!(total_times(&cell(100.0, 0), &cell(105.0, 0)), Some(1.0));
+        assert_eq!(total_times(&cell(100.0, 0), &cell(150.0, 0)), None, "longer");
+        assert_eq!(total_times(&cell(100.0, 0), &cell(100.0, 5)), None, "capped");
+        let mut unknown = cell(100.0, 0);
+        unknown.mean_output_tokens = None;
+        assert_eq!(total_times(&cell(100.0, 0), &unknown), None, "no length");
+    }
 
     #[test]
     fn times_faster_is_rival_over_scratchy_for_a_time() {
@@ -204,6 +250,8 @@ mod tests {
         capped.capped_answers = Some(4);
         assert_eq!(accuracy(&capped), None, "every answer ran to its cap");
         capped.capped_answers = Some(3);
-        assert_eq!(accuracy(&capped), Some(0.5), "some ended on their own");
+        assert_eq!(accuracy(&capped), None, "most ran to their cap");
+        capped.capped_answers = Some(2);
+        assert_eq!(accuracy(&capped), Some(0.5), "half ended on their own");
     }
 }
