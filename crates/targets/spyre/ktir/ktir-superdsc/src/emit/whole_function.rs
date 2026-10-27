@@ -3313,7 +3313,7 @@ pub fn lower_function(
         // the recogniser proved is then CHECKED against that region's shape below rather than trusted:
         // two independent facts about the same operand, so a chain whose axis and extent disagree
         // cannot address a full tile as a vector.
-        let bcast_axes: Vec<Option<BcastAxis>> = in_values
+        let mut bcast_axes: Vec<Option<BcastAxis>> = in_values
             .iter()
             .map(|v| bcasts.get(v).map(|b| b.axis))
             .collect();
@@ -3453,6 +3453,38 @@ pub fn lower_function(
                      statements about the same operand and they disagree, so neither is believed.",
                     f.name, op.op_type, r.tid, r.v_rows, r.c_len,
                 ));
+            }
+        }
+
+        // ⭐⭐⭐⭐⭐ THE BAND'S OWN `Mb` DERIVATION — a shared single-row table against a banded
+        // sweep (auditor-approved with the band design, 2026-10-27). A flush band's per-row
+        // operand is `[B, n]` while the tables it combines with are functions of the vocab
+        // alone — whole-view `[1, n]` parameters the program never spells a
+        // `linalg.broadcast` for (Triton's implicit broadcast folds into the load's own tile
+        // shape), so `bcasts` states no axis and the DENSE path's extents law refuses. The
+        // device expresses it exactly: an `Mb` operand is one row of values sprayed over the
+        // rows, `In::mb`'s own mode. The derivation is keyed on the TYPED band, never a
+        // shape guess: it fires only when an input CARRIES a band (`RowBand`, constructed
+        // only by `windowed_region`'s uniform-row arm) whose height exceeds one row, and
+        // only for the elementwise kinds whose door consumes the axis. The operand must be
+        // whole-view single-row at row 0, un-banded, and column-matched to the banded input
+        // it is sprayed against — every existing kernel (no banded input) is untouched.
+        if matches!(program, Lowering::Node(Program::Elementwise(_)))
+            && let Some(band) = band_of(f.name, &per_op)?
+            && band.height() > 1
+        {
+            for (i, x) in per_op.iter().enumerate() {
+                if bcast_axes[i].is_none()
+                    && x.band.is_none()
+                    && x.r_start == 0
+                    && x.r_cover == (0, x.v_rows)
+                    && x.v_rows == 1
+                    && per_op
+                        .iter()
+                        .any(|d| d.band.is_some() && d.c_len == x.c_len)
+                {
+                    bcast_axes[i] = Some(BcastAxis::Mb);
+                }
             }
         }
 
