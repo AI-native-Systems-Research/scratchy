@@ -321,7 +321,7 @@ impl CoreContext {
             ));
         }
         {
-            let mut lx = self.lx.borrow_mut();
+            let lx = self.lx.borrow_mut();
             lx.used += size_bytes;
             lx.peak_used = lx.peak_used.max(lx.used);
         }
@@ -377,7 +377,7 @@ impl CoreContext {
                 ));
             }
             {
-                let mut lx = self.lx.borrow_mut();
+                let lx = self.lx.borrow_mut();
                 lx.used += bytes;
                 lx.peak_used = lx.peak_used.max(lx.used);
             }

@@ -1816,7 +1816,7 @@ fn program_broadcast_chains(
                                     .and_then(|t| t.dims().map(|ds| ds.to_vec()))
                             })
                     };
-                    let result_dims = dims_of(&d);
+                    let result_dims = dims_of(d);
                     let operand_dims = d
                         .operands
                         .first()
