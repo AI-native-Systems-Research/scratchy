@@ -392,6 +392,21 @@ impl DeviceWidth {
         )))
     }
 
+    /// The device width of a dtype-CONVERT's slab `[·, logical_cols]` — round up to a whole
+    /// 64-element device stick and STOP. ⭐ THE β LAW (front-b-noise, auditor ruling 2026-10-27):
+    /// a crossed convert's minted `[B, 1]` intermediate (the sampler's gate chain) sweeps the
+    /// 64-ELEMENT device width — the α cell's base bake measured our own `PlanCorelets` refusing a
+    /// 32-element tile ("innermost/stick dimension is a multiple of the 64-element stick width"),
+    /// and `convert_opspec`'s own basis is the 64-elem fp16 stick — so the ONE width the door
+    /// sweeps, the mint's reservation, and the gate table's placement all take is ceil-to-64.
+    /// A fixed point at every 64-multiple: byte-identical for every convert ever emitted (all
+    /// full-row-width). ⛔ NO splittable bump — the util floor is a matmul-OUTPUT occupancy law;
+    /// a convert's slab has no floor to meet, and `row_footprint_bytes`'s fp16 pad would bump a
+    /// one-stick sweep to 8 sticks (2048 B/row) for no device reason at all.
+    pub fn for_convert(logical_cols: u32) -> DeviceWidth {
+        DeviceWidth(logical_cols.next_multiple_of(FP16_ELEMS_PER_STICK))
+    }
+
     pub fn get(self) -> u32 {
         self.0
     }

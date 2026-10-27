@@ -9842,6 +9842,7 @@ fn emit_superdsc_wiring(
             let vocab = u32l(seat.vocab);
             let pad_vocab = u32l(seat.pad_vocab);
             let seed_row_words = u32l(seat.seed_row_words);
+            let gate_row_words = u32l(seat.gate_row_words);
             quote! {
                 ::core::option::Option::Some(
                     ::scratchy_target_spyre::wiring::SampleSeat {
@@ -9852,6 +9853,7 @@ fn emit_superdsc_wiring(
                         vocab: #vocab,
                         pad_vocab: #pad_vocab,
                         seed_row_words: #seed_row_words,
+                        gate_row_words: #gate_row_words,
                     }
                 )
             }

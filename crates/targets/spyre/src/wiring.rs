@@ -21,7 +21,7 @@
 //! role breaks every match that must learn it, at build time, in one place.
 
 use crate::bundle_code as bundle;
-use crate::lower_subtile_tape_to_superdsc::row_footprint_bytes;
+use crate::lower_subtile_tape_to_superdsc::{DeviceWidth, row_footprint_bytes};
 pub use ktir_superdsc::element_arrangement::{
     ElementArrangement, dl16tofp32_stagger, DL16TOFP32_PERMUTATION,
 };
@@ -1343,6 +1343,44 @@ const _: () = assert!(
      CopyDims::ENTRIES_PER_OP (the IBR ceiling) — one stick, two spellings"
 );
 
+/// ⭐⭐⭐ THE GATE TABLE'S β IMAGE — the ONE `[rows, 1]` table whose chain crosses the
+/// i32→f32 convert, staged at the convert's own device sweep (front-b-noise, auditor
+/// ruling 2026-10-27). The table's reservation is [`gate_row_stride_bytes`] (two u32
+/// sticks per row), and the convert's `[rows, 64]` addressing over it is STICK-BLOCKED —
+/// row r's first stick is flat stick `r`, its second flat stick `rows + r` — so the image
+/// is the one-stick head staging (row r's gate at byte `r · 128`, the SAME head
+/// [`stage_col_stick_heads`] ever wrote, the Col operand mode's own address) followed by
+/// the sweep's second sticks, ZERO: the widened words are converted and never read, and a
+/// zero-filled reservation is deterministic — no uninitialized tail for the sweep to
+/// consume. `head_stride` is the quintuple's own one-stick stride
+/// ([`col_row_stride_bytes`]); `sweep_stride` is the gate's own reservation
+/// ([`gate_row_stride_bytes`]) — both passed in so this fn stages LAWS, never
+/// recomputations.
+pub fn stage_gate_sweep<const N: usize>(
+    rows: usize,
+    head_stride: usize,
+    sweep_stride: usize,
+    elem: impl Fn(usize) -> [u8; N],
+) -> Vec<u8> {
+    assert!(
+        sweep_stride.is_multiple_of(head_stride) && sweep_stride >= head_stride,
+        "the gate's sweep stride {sweep_stride} B is not a whole multiple of the head stride \
+         {head_stride} B — the stick-blocked image requires the sweep to be whole head-sticks"
+    );
+    let mut out = stage_col_stick_heads::<N>(rows, head_stride, elem);
+    out.resize(rows * sweep_stride, 0);
+    out
+}
+
+/// ⭐ THE GATE TABLE'S OWN ROW RESERVATION — `DeviceWidth::for_convert(1)` in i32 words
+/// (64 = two u32 sticks, 256 B), the SAME one decision the convert door sweeps, the
+/// whole-function mint reserves, and the layout's `nbytes` places — stated here so the
+/// worker's per-row write and the placement's reservation cannot drift, exactly
+/// [`col_row_stride_bytes`]'s own contract for the one-stick tables.
+pub fn gate_row_stride_bytes() -> usize {
+    DeviceWidth::for_convert(1).get() as usize * 4
+}
+
 /// ⭐ THE SAMPLER'S PER-STEP SEAT — the named class of the six sources the
 /// token draw reads FRESH EVERY DECODE STEP (the seed quintuple's five word
 /// tables and inv_t). Derived ONCE off the minted
@@ -1400,6 +1438,20 @@ pub struct SampleSeat {
     /// row `r` in table `k` lands at word `r · seed_row_words` of that
     /// table's region — the STICK HEAD the Col operand mode reads.
     pub seed_row_words: u32,
+    /// ⭐⭐⭐ THE GATE TABLE'S OWN ROW STRIDE in i32 words — the ONE table of
+    /// the quintuple whose chain crosses the i32→f32 convert
+    /// (`sgate.to(tl.float32)`), so the β ruling (front-b-noise, auditor
+    /// 2026-10-27) reserves it at the convert's own device sweep:
+    /// `DeviceWidth::for_convert(1)` = 64 words = TWO u32 sticks per row,
+    /// against the other four tables' one. The GATE ITSELF still lands at
+    /// row r's stick HEAD — byte `r · 128`, the same address the one-stick
+    /// law ever stated, because the convert's `[rows, 64]` addressing is
+    /// stick-blocked (row r's first stick is flat stick `r`) — and the
+    /// widened words past the head are the sweep's own padding: converted,
+    /// never read. Staged by [`stage_gate_sweep`]; the worker checks it
+    /// against [`gate_row_stride_bytes`] the same way `seed_row_words` is
+    /// checked against [`col_row_stride_bytes`].
+    pub gate_row_words: u32,
 }
 
 /// ⭐ THE SAMPLER'S TWENTY STAGED TABLES — the kernel's own host contract

@@ -1096,7 +1096,12 @@ pub(crate) enum SeatLaws<'a> {
 /// the seat's baked stride — the Col operand mode reads the head alone, the
 /// int-bcast leg's measured law) — and the worker writes the five words of
 /// row r at the five tables' stick heads and nothing else (the sticks' zero
-/// padding is the reservation's own, exactly inv_t's bind). Emitted as LE
+/// padding is the reservation's own, exactly inv_t's bind). ⭐⭐ THE GATE
+/// TABLE ALONE (`seed_words[3]`) carries the β reservation (front-b-noise,
+/// auditor 2026-10-27): its chain crosses the i32→f32 convert, so the table
+/// reserves the convert's 64-element device sweep (two sticks per row,
+/// `gate_row_words`) — the gate still lands at row r's stick HEAD, the same
+/// byte, with the sweep's tail zero-filled by the staging. Emitted as LE
 /// words for the raw (`acts_i32`) channel, which binds verbatim — i32 words
 /// for the seed tables, IEEE f32 for inv_t; the f32 `Bind` channel converts
 /// to SEN169 and is NOT verbatim.
@@ -1176,11 +1181,36 @@ fn sample_binds(
             stride_bytes / 4
         )));
     }
+    // ⭐⭐⭐ THE GATE ALONE STAGES THE β RESERVATION (front-b-noise, auditor
+    // ruling 2026-10-27): its chain crosses the i32→f32 convert, so its table
+    // reserves the convert's 64-element device sweep — `stage_gate_sweep`
+    // writes the gate at row r's stick HEAD (the same byte the one-stick law
+    // ever stated) and zero-fills the sweep's second sticks. The same
+    // refusal-on-disagreement contract as `seed_row_words` above.
+    let gate_stride_bytes = scratchy_target_spyre::wiring::gate_row_stride_bytes();
+    if seat.gate_row_words as usize * 4 != gate_stride_bytes {
+        return Err(werr(format!(
+            "the sampler seat's gate_row_words is {} but the gate table's `[rows, 1]` device-sweep \
+             reservation derives {} — the seat and the placement's own law disagree, refusing to \
+             stage the gate",
+            seat.gate_row_words,
+            gate_stride_bytes / 4
+        )));
+    }
     let mut binds = Vec::with_capacity(1 + seat.seed_words.len());
     for (k, &tid) in seat.seed_words.iter().enumerate() {
-        let table = scratchy_target_spyre::wiring::stage_col_stick_heads::<4>(rows, stride_bytes, |r| {
-            word_of(k, r).to_le_bytes()
-        });
+        let table = if k == 3 {
+            scratchy_target_spyre::wiring::stage_gate_sweep::<4>(
+                rows,
+                stride_bytes,
+                gate_stride_bytes,
+                |r| word_of(k, r).to_le_bytes(),
+            )
+        } else {
+            scratchy_target_spyre::wiring::stage_col_stick_heads::<4>(rows, stride_bytes, |r| {
+                word_of(k, r).to_le_bytes()
+            })
+        };
         binds.push((scratchy_target_spyre::bundle_code::PlaceId::Act(tid), table));
     }
     // inv_t per row: the greedy law's 1.0, or the draw's own 1/T — at

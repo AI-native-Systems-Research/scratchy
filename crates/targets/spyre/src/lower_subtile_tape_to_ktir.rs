@@ -2263,6 +2263,11 @@ pub fn staggered_of_ir<F: RopeForm>(
 /// mode reads (the int-bcast leg's measured law). The emulator is
 /// memref-faithful (each table packed `rows × 1` words); the card seat writes
 /// each word at its own table's stick head, the reservation's own stride.
+/// ⭐⭐ THE GATE ALONE (`seed_words[3]`, the quintuple's fourth word) reserves
+/// the CONVERT's device sweep instead — `gate_row_words` = 64 words, the β
+/// ruling's own stride ([`crate::wiring::SampleSeat::gate_row_words`]) —
+/// because its chain crosses the i32→f32 convert and the sweep, not the
+/// one-stick footprint, is what the placement must hold.
 ///
 /// A second minted node is the same build error the load-const list states —
 /// two mints ran over one graph — never last-write-wins.
@@ -2316,6 +2321,14 @@ pub fn sample_seat_of_ir<F: RopeForm>(
             // is 32 words at every admitted shape — a whole 32-element stick).
             let seed_row_words =
                 (row_footprint_bytes(1, Df::SenUint32) / 4) as u32;
+            // ⭐⭐⭐ THE GATE'S OWN STRIDE — the β ruling (front-b-noise, auditor
+            // 2026-10-27): the quintuple's fourth table (inputs[4]) crosses the
+            // i32→f32 convert, so its reservation is the convert's own device
+            // sweep — `DeviceWidth::for_convert(1)` = 64 words, TWO u32 sticks
+            // per row — against the other four's one. The SAME one decision the
+            // layout's `nbytes` reserves and the door sweeps, stated here on the
+            // seat so the worker's staging and the placement cannot drift.
+            let gate_row_words = DeviceWidth::for_convert(1).get();
             Ok(Some(crate::wiring::SampleSeat {
                 seed_words,
                 invt: node.inputs[6].tensor.index() as u32,
@@ -2327,6 +2340,7 @@ pub fn sample_seat_of_ir<F: RopeForm>(
                 vocab,
                 pad_vocab: scratchy_subtile::subtile_ir::sample_pad_vocab(vocab),
                 seed_row_words,
+                gate_row_words,
             }))
         }
     }

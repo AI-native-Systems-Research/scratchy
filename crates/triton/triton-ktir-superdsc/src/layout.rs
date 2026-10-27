@@ -53,6 +53,7 @@ use ktir_superdsc::placement::{
 use ktir_superdsc::reserved_tids::{ROPE_P_TID, scalarmul_scale_tid};
 use ktir_superdsc::superdsc_opspec::Df;
 use ktir_superdsc::wire::SEGMENT_SIZE;
+use ktir_superdsc::work::DeviceWidth;
 
 use crate::Error;
 
@@ -162,6 +163,27 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         }
     }
     let index_tids: std::collections::BTreeSet<u32> = gathers.iter().map(|g| g.index_tid).collect();
+
+    // ⭐⭐⭐ THE PARAMETERS A CONVERT DOOR SWEEPS (the β ruling, front-b-noise, auditor
+    // 2026-10-27) — reserved at the DEVICE width below, not the logical footprint. The
+    // door's β admission widens a sub-device-width whole-view column window to
+    // `DeviceWidth::for_convert` (the 64-element width our own `PlanCorelets` demands of a
+    // tile — the α cell's base bake measured the 32-element refusal), and the emitter then
+    // SWEEPS that width over the placement this loop sizes: a `[rows, 1]` seed table read
+    // through a crossed convert (the sampler's gate) is swept at `rows × 64 × word` bytes
+    // while `synth_footprint_bytes` reserves `rows × 32 × word` (the SenUint32 stick) —
+    // MEASURED as `resolve_seg_base`'s refusal on the b1 dump: `t4: access window end 256B
+    // (offset 0B, operand 256B) exceeds its placement footprint 2B (seg3)`. ONE decision for
+    // the reservation and the sweep (`for_convert`, the matmul `dev_dims` precedent), so they
+    // cannot disagree. A FIXED POINT at every 64-multiple: every convert-read parameter ever
+    // placed is full-row-width (the sampler's logits at [1, 65536], the fp8 tail's
+    // activations), where `for_convert(cols) == cols` and this reservation is
+    // byte-identical to `synth_footprint_bytes` — only the sampler's `[rows, 1]` gate moves.
+    // The kind set is the DOOR'S OWN (`whole_function`'s `convert kind of` discriminates
+    // exactly `ArithExtf | ArithFptosi | ArithSitofp | ArithTruncf`), read off the same
+    // load→tile→view→argument chain `bound_scale_of` walks, so the placement and the
+    // descriptor cannot disagree about which buffer a convert reads.
+    let convert_swept = convert_swept_tids(node);
 
     let mut placements: std::collections::BTreeMap<u32, TensorPlacement> = Default::default();
     // Bytes placed per segment so far — the running high-water [`pack`] appends at.
@@ -288,7 +310,16 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // what `scalarmul_bound` passes `split_out_excluding` as a skip tid so the region
         // never counts as tensor arity.
         let is_bound_scale = reg.v_rows == 1 && reg.v_cols == 1;
-        let size = if is_bound_scale {
+        // ⭐⭐⭐ β FIRST, BEFORE THE BOUND-SCALE ARM — a `[1,1]` parameter a convert sweeps
+        // (the sampler's gate at the b1 rung) is NOT a launcher-bound fp16 const: the door
+        // addresses it at the 64-element device width, so the 2-B `SCALE_BYTES` placement is
+        // the measured over-run (256 B against 2 B). Every OTHER `[1,1]` parameter keeps the
+        // bound-scale size — its readers are broadcasts, granule-guarded at one 128-B read.
+        let size = if convert_swept.contains(&reg.tid) {
+            reg.v_rows as u64
+                * DeviceWidth::for_convert(reg.v_cols).get() as u64
+                * df.word_length() as u64
+        } else if is_bound_scale {
             SCALE_BYTES
         } else {
             synth_footprint_bytes(&[reg.v_rows, reg.v_cols], df)
@@ -627,6 +658,69 @@ fn param_view_dtype(node: &KtirNode, tid: u32) -> Option<ktir_core::dtypes::DTyp
         (AttrKey::Dtype, Attr::Dtype(d)) => Some(*d),
         _ => None,
     })
+}
+
+/// The parameters a CONVERT DOOR op reads — the buffers whose placements the β reservation
+/// widens to the device width (see [`for_regions`]' `convert_swept` block for the law and
+/// the measured refusal it answers).
+///
+/// The chain is the one every parameter-reading walk in this crate takes (`bound_scale_of`'s
+/// `splat_view`, [`param_view_dtype`]'s tid join): convert → `ktdp.load` → access tile →
+/// memory view → function argument, resolved to a tid through the node's own `bindings`. A
+/// convert whose operand is anything else (an in-function intermediate — the sampler's
+/// `sitofp` over the hash ramp) owns no placement here, so it is simply not in the set: its
+/// input is a minted intermediate, sized by the mint, not by this module.
+///
+/// The KIND SET is the door's own — `whole_function`'s convert-kind discriminant reads
+/// exactly `ArithExtf | ArithFptosi | ArithSitofp | ArithTruncf` — so a new convert kind is
+/// E0004 at the door and absent here, never widened behind the door's back. Shape
+/// preservation is NOT re-proved here: the door refuses a dims-changing or
+/// dims-never-stated convert by name, so a program whose convert is not the one-for-one hop
+/// never reaches a placement this set influenced.
+fn convert_swept_tids(node: &KtirNode) -> std::collections::BTreeSet<u32> {
+    use ktir_core::ir::Ssa;
+    use ktir_core::opkind::OpKind;
+    let f = &node.func;
+    let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
+    let mut out = std::collections::BTreeSet::new();
+    for op in f.operations.iter() {
+        if !matches!(
+            op.op_type,
+            OpKind::ArithExtf | OpKind::ArithFptosi | OpKind::ArithSitofp | OpKind::ArithTruncf
+        ) {
+            continue;
+        }
+        // load → tile → view → argument, each step proved by its op kind — a convert whose
+        // operand chain is anything else reads an intermediate and owns no placement here.
+        let Some(load) = op.operands.first().and_then(|&s| def_of(s)) else {
+            continue;
+        };
+        if load.op_type != OpKind::KtdpLoad {
+            continue;
+        }
+        let Some(tile) = load.operands.first().and_then(|&s| def_of(s)) else {
+            continue;
+        };
+        if tile.op_type != OpKind::KtdpConstructAccessTile {
+            continue;
+        }
+        let Some(view) = tile.operands.first().and_then(|&s| def_of(s)) else {
+            continue;
+        };
+        if view.op_type != OpKind::KtdpConstructMemoryView {
+            continue;
+        }
+        let Some(ptr) = view.operands.first().copied() else {
+            continue;
+        };
+        let Some(idx) = f.arguments.iter().position(|(s, _)| *s == ptr) else {
+            continue;
+        };
+        if let Some(tid) = node.bindings.get(idx).map(|b| b.get()) {
+            out.insert(tid);
+        }
+    }
+    out
 }
 
 /// The reserved device constants a `Program`'s entry point names without them being parameters, or

@@ -2310,12 +2310,17 @@ impl ConvertKind {
 /// a core's slab is cut at that basis ([`convert_opspec`]'s own law), so a sub-stick width is a
 /// dxp scheduler refusal at bake, named here one rung earlier.
 ///
-/// ⛔ A SUB-STICK COLUMN WINDOW (the minted `[B, 1]` intermediate the broadcast-chain walk now
-/// binds for a crossed convert, front-b-noise) KEEPS THIS REFUSAL for now: the [B, 1] gate
-/// table holds one 32-word stick per row, and whether the device runs a 4-byte convert at a
-/// 32-ELEMENT slab — [`convert_opspec`]'s own comment says the WIDER stick binds (32 for the
-/// i32→f32 pair) while its code hardcodes the 64-elem fp16 basis — is an open device fact
-/// (card cell α, auditor order 2026-10-27). The refusal names the shape rather than guessing.
+/// ⭐⭐⭐ THE β ADMISSION (auditor ruling 2026-10-27, front-b-noise): a SUB-DEVICE-WIDTH column
+/// window — the minted `[B, 1]` intermediate the broadcast-chain walk binds for a crossed
+/// convert, the sampler's gate chain — is admitted at WHOLE-VIEW ONLY: both operands corner-0
+/// with `c_len == v_cols` and equal column windows, and the sweep widened to
+/// [`DeviceWidth::for_convert`] (the 64-element device width; the α cell's base bake measured
+/// our own `PlanCorelets` refusing a 32-element tile, so 32 is not a width this ladder can
+/// emit). The widened words past the logical column are the reservation's own padding — the
+/// mint reserves the device width ([`DeviceWidth::for_convert`], the matmul `dev_dims`
+/// precedent) and the consumer's Col window reads row r's FIRST stick alone, so the pad the
+/// convert writes is numerically inert. A window that is not whole-view keeps the refusal: a
+/// cornered sub-stick convert reads words the caller never staged.
 pub fn convert(
     name: &str,
     kind: ConvertKind,
@@ -2325,7 +2330,21 @@ pub fn convert(
 ) -> Result<Vec<EmittedOp>, Error> {
     let (ins, out) = split_out(name, r, layout, 1)?;
     let rows = pointwise_rows(name, &out)?;
-    let cols = out.c_len;
+    let mut cols = out.c_len;
+    let dev_cols = DeviceWidth::for_convert(cols).get();
+    if cols != dev_cols {
+        let whole_view = |x: &Region| x.c_start == 0 && x.c_len == x.v_cols;
+        if !(whole_view(&out) && whole_view(&ins[0]) && ins[0].c_len == out.c_len) {
+            return err(format!(
+                "{name}: Convert t{} sweeps a {cols}-column window widened to the \
+                 {dev_cols}-element device width, but the window is not WHOLE-VIEW (corner-0, \
+                 c_len == v_cols, equal on both operands) — a cornered sub-width convert would \
+                 read words the caller never staged; the β admission is whole-view or refused",
+                out.tid
+            ));
+        }
+        cols = dev_cols;
+    }
     check_pointwise_cols_df(cols, "Convert", out.tid, kind.stick_df())?;
     let op_func = kind.op_func();
     let op_name = format!("{op_func}_o{}", out.tid);

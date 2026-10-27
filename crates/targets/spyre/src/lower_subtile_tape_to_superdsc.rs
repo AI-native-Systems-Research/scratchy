@@ -755,6 +755,29 @@ pub fn compute_bundle_layout<F: RopeForm>(
         }
         m
     };
+    // ⭐⭐⭐ THE SEAT'S GATE TABLE (the quintuple's fourth word, the `SubOp::Sample` node's
+    // `inputs[4]`) IS RESERVED AT THE CONVERT'S OWN DEVICE WIDTH — the β ruling
+    // (front-b-noise, auditor 2026-10-27). The gate's chain crosses the i32→f32 convert
+    // (`sgate.to(tl.float32)`, every sampler's own spelling), and the convert door's β
+    // admission sweeps [`DeviceWidth::for_convert`] — 64 elements — over BOTH its operands:
+    // the minted `[rows, 1]` result (reserved by the whole-function mint's own `dev_dims`
+    // arm, the matmul precedent) AND this table, so the placement must hold the sweep or
+    // `resolve_seg_base` refuses the op for addressing past its tensor. TOLERANT like the
+    // kernel-dfs census above: a graph with no `Sample` node reserves nothing wide, and a
+    // graph the seat derivation would refuse (two mints) keeps these rules — the refusal is
+    // the lowering's to raise, never the layout's. The OTHER four seed tables and `invt`
+    // keep the one-stick `[rows, 1]` reservation: their chains cross no convert, and the
+    // Col operand mode reads the stick head alone.
+    let gate_tid: Option<u32> = {
+        let mut samples = ir
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.op, SubOp::Sample { .. }));
+        match (samples.next(), samples.next()) {
+            (Some(n), None) if n.inputs.len() == 27 => Some(n.inputs[4].tensor.index() as u32),
+            _ => None,
+        }
+    };
     let nbytes = |tid: u32| -> u64 {
         let s = ir.tensors[tid as usize];
         // Reserve the DEVICE footprint: a stick-last tensor pads its innermost stick dim up to a whole
@@ -783,6 +806,16 @@ pub fn compute_bundle_layout<F: RopeForm>(
         } else {
             s.rows
         };
+        // ⭐ THE GATE TABLE'S OWN RESERVATION — the convert's device sweep in THIS table's own
+        // element width (NOT `row_footprint_bytes`: its fp16 pad bumps a one-stick sweep to
+        // 8-splittable, 2048 B/row, for no device reason — `for_convert`'s own doc). The gate
+        // lands at row r's stick HEAD, the same byte the one-stick law ever stated; the widened
+        // words are the sweep's own padding.
+        if Some(tid) == gate_tid {
+            return rows as u64
+                * DeviceWidth::for_convert(s.cols).get() as u64
+                * df.word_length() as u64;
+        }
         rows as u64 * row_footprint_bytes(s.cols, df)
     };
     // ── Liveness: first def (output of node i) and last use (input of node j). A
@@ -8578,19 +8611,35 @@ mod tests {
         // reads is the word's only address: the auditor's wall-4 ruling (a)
         // spelled the seed as five such tables, so each must reserve one whole
         // 32-word u32 stick per row (128 B), the stride the worker writes at.
+        // ⭐⭐ EXCEPT THE GATE (k=3) — the β ruling (front-b-noise, auditor
+        // 2026-10-27): its chain crosses the i32→f32 convert, whose sweep is
+        // the 64-element device width (`DeviceWidth::for_convert`), so the gate
+        // table alone reserves TWO sticks per row (256 B) — the convert's
+        // `resolve_seg_base` window — with the gate still at row r's stick
+        // HEAD, the same byte the one-stick law ever stated.
         for k in 0..5u32 {
             let word = layout.placements[&(plain.num_sources + k)];
-            assert_eq!(
-                word.size,
-                4 * 128,
-                "seed word table {k} reserves one 128 B u32 stick per row — invt's own class"
-            );
-            assert_eq!(
-                word.size / 4,
-                128,
-                "the reservation IS the seat's own row stride (`seed_row_words`), never a \
-                 padded recomputation"
-            );
+            let want = if k == 3 {
+                (4 * 256, "the gate table reserves the convert's 64-element device sweep — two u32 sticks per row")
+            } else {
+                (4 * 128, "seed word table {k} reserves one 128 B u32 stick per row — invt's own class")
+            };
+            assert_eq!(word.size, want.0, "{}", want.1);
+            if k == 3 {
+                assert_eq!(
+                    word.size / 4,
+                    256,
+                    "the gate's reservation IS the seat's own `gate_row_words` stride, never a \
+                     padded recomputation"
+                );
+            } else {
+                assert_eq!(
+                    word.size / 4,
+                    128,
+                    "the reservation IS the seat's own row stride (`seed_row_words`), never a \
+                     padded recomputation"
+                );
+            }
         }
     }
 

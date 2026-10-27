@@ -4177,7 +4177,7 @@ pub fn lower_function(
             // whole-function intermediate (the worker's weight zero-pad is the one on the
             // per-`Program` path), so it reserves what the emitter addresses.
             //
-            // ⛔ AND ONLY THE MATMUL ARM, because a POINTWISE result's bump is OPTIONAL and the
+            // ⛔ AND ONLY THE MATMUL AND CONVERT ARMS, because a POINTWISE result's bump is OPTIONAL and the
             // consumer side already yields to the layout: `pointwise_width_the_output_holds`
             // caps a pointwise emission at the width its operands' placements actually hold, so a
             // pointwise intermediate minted LOGICAL is read and written at its logical width
@@ -4208,6 +4208,22 @@ pub fn lower_function(
                         DeviceWidth::for_matmul(dims[0], dims[1], k, true).get(),
                     ]
                 }
+                // ⭐⭐⭐ A CONVERT'S INTERMEDIATE IS RESERVED AT THE **DEVICE** WIDTH TOO (the β
+                // ruling, front-b-noise, auditor 2026-10-27) — the SAME precedent, a different
+                // producer rule. The door's β admission widens a sub-device-width column window
+                // (the crossed convert's minted `[B, 1]` result, the sampler's gate chain) to
+                // `DeviceWidth::for_convert` — the 64-element device width our own PlanCorelets
+                // demands of a tile and `convert_opspec`'s own fp16-stick basis states — and the
+                // emitter then SWEEPS that width over the buffer this mint reserves: a mint at
+                // the logical `[B, 1]` (128 B/row) is half the bytes the convert addresses
+                // (256 B/row), the exact `resolve_seg_base` over-run shape the matmul arm
+                // records. ONE decision for the reservation and the sweep (`for_convert`), so
+                // they cannot disagree. A fixed point at every 64-multiple — every convert
+                // intermediate ever minted is full-row-width, so this arm is byte-identical for
+                // all of them. The REGION stays `[B, 1]`: the consumer's Col window reads row
+                // r's FIRST stick alone (the pad words the convert writes past it are never
+                // read), the same inert-pad claim the matmul arm makes.
+                Lowering::Convert(_) => [dims[0], DeviceWidth::for_convert(dims[1]).get()],
                 _ => dims,
             };
             // ⭐ THE MINT RESERVES THE OP'S OWN RESULT FORMAT — `synth` is `synth_df(Fp16)`, and
