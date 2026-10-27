@@ -2530,7 +2530,12 @@ impl SpyreWorker {
                     // would leave some rows' stick heads reading ZERO — a
                     // zero hash multiplier folds every row's noise to one
                     // value. Refuse by name, never serve.
-                    for &(tid, kind) in rung_consts {
+                    // `rung_consts` arrives DOUBLE-referenced (the rungs loop
+                    // iterates `g0.decode_rungs` by reference, so the tuple's
+                    // `&[(u32, LoadConst)]` field re-borrows) — deref through
+                    // `.iter()`, the auditor's fix for the E0277 the chat leg's
+                    // pod build measured (this arm cannot compile on mac).
+                    for &(tid, kind) in rung_consts.iter() {
                         let scratchy_target_spyre::wiring::LoadConst::SampleTable { rows, .. } =
                             kind;
                         if rows != rung_n.get() {
