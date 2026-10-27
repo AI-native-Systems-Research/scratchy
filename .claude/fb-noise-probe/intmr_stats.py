@@ -38,6 +38,15 @@ CELLS = [
     # Its verdict decides whether the measured-wrong addressing is int-specific
     # or the form's own (the emissions are field-identical besides the df).
     ("intmr_f32col_add", "add", "f32col"),
+    # The UN-FIXED TWIN (auditor GO 2026-10-27): the PRE-BAKED bundle from
+    # before the both-split law (/work/int-mr-f32col-unfixed, {mb:2, out:16}),
+    # run in the SAME leg as the fixed one. RE-LEG VERDICT (02:51:39Z): the
+    # diagnosis is REFUTED — the fixed twin measured wrong the same way
+    # (512/1024, bit-identical bytes), so the work division is not the cause
+    # and this cell's failure confirms nothing. It stays in the leg as the
+    # division-invariance control: the two twins' read-backs must stay
+    # bit-identical, whichever fold runs.
+    ("intmr_f32col_add_unfixed", "add", "f32col_unfixed"),
 ]
 
 
@@ -51,8 +60,12 @@ def main() -> int:
     report = {"probe": "intmr+f32col", "rows": G.ROWS, "lanes": G.N, "cells": {}}
     ok = True
     for cell, op, mode in CELLS:
-        if mode == "f32col":
-            b = np.fromfile(IN / f"{cell}_t01_b.bin", dtype=np.float32)
+        if mode in ("f32col", "f32col_unfixed"):
+            # The unfixed arm is the DIAGNOSIS CONTROL: its bundle was baked
+            # BEFORE the both-split law and states the {mb:2, out:16} fold, so
+            # it must MEASURE WRONG. Its pass condition is inverted.
+            expect_fail = mode == "f32col_unfixed"
+            b = np.fromfile(IN / "intmr_f32col_add_t01_b.bin", dtype=np.float32)
             # The card run's read-back, written beside this script by the leg.
             o = np.fromfile(HERE / f"out_{cell}_o.bin", dtype=np.float32).reshape(G.ROWS, G.N)
             # Each row's own word: word 0 of its own 32-word stick. All staged
@@ -62,6 +75,39 @@ def main() -> int:
             want = a32 + bm
             diff = o != want
             mismatches = int(diff.sum())
+            if expect_fail:
+                cell_report = {
+                    "form": "add, the UN-FIXED fp32 twin ({mb:2, out:16}, pre-baked "
+                    "before the both-split law) — must MEASURE WRONG",
+                    "mismatches": mismatches,
+                    "pass": mismatches > 0,
+                }
+                if mismatches == 0:
+                    cell_report["refuted"] = (
+                        "the un-fixed fold read the right rows — the both-split "
+                        "diagnosis is WRONG"
+                    )
+                else:
+                    idx = np.nonzero(diff)
+                    cell_report["first_mismatches"] = [
+                        {
+                            "row": int(r),
+                            "lane": int(j),
+                            "card": float(o[r, j]),
+                            "host": float(want[r, j]),
+                            "a": float(a32[r, j]),
+                        }
+                        for r, j in zip(idx[0][:10], idx[1][:10])
+                    ]
+                report["cells"][cell] = cell_report
+                ok = ok and mismatches > 0
+                # Neutral wording, per the auditor's correction (2026-10-27T02:5xZ): the
+                # un-fixed twin measuring wrong CONFIRMS NOTHING once the fixed twin
+                # measures wrong the same way — the re-leg refuted the both-split
+                # diagnosis, and this label must not claim it back.
+                verdict = "MEASURED WRONG (no confirmation — compare the fixed twin)"
+                print(f"{cell}: {mismatches} differing lanes of {G.ROWS * G.N} — {verdict}")
+                continue
             cell_report = {
                 "form": "add, [2,512] dense IEEE_FP32 + [2,1] Col (the intmr_col_add twin)",
                 "mismatches": mismatches,
@@ -125,6 +171,8 @@ def main() -> int:
     print(json.dumps(report, indent=2))
 
     if not ok:
+        if report["cells"].get("intmr_f32col_add_unfixed", {}).get("mismatches") == 0:
+            print("UNFIXED-TWIN-PASSED — DIAGNOSIS REFUTED (stop; report to the auditor)")
         print("INTMR-FAILED (see cells above)")
         return 1
     print(f"INTMR-DONE ({len(CELLS)} cells, bit-for-bit)")

@@ -15,7 +15,8 @@
 # Outputs read back VERBATIM through the tree's own `raw:` output spelling.
 # Verdict ON THE POD (intmr_stats.py: bit-for-bit, per row and lane, against
 # the host wrapping op — dense control vs Col, add vs mul; fp32 twin against
-# the exact-integer f32 add); the numbers land
+# the exact-integer f32 add; the UN-FIXED twin must MEASURE WRONG — its
+# passing refutes the diagnosis and fails the leg); the numbers land
 # in intmr-verdict.json. Markers: INTMR-DONE / INTMR-FAILED. Log:
 # /work/intmr-leg.log
 set -u
@@ -27,7 +28,7 @@ PROBE=/work/fb-noise-probe
 BIN=$TDIR/release/examples/bundle_run_dev
 DXP=/opt/ibm/spyre/deeptools/bin/dxp_standalone
 
-CELLS="intmr_dense_add intmr_dense_mul intmr_col_add intmr_col_mul intmr_f32col_add"
+CELLS="intmr_dense_add intmr_dense_mul intmr_col_add intmr_col_mul intmr_f32col_add intmr_f32col_add_unfixed"
 
 if [ "${BG:-0}" != "1" ]; then
   BG=1 setsid nohup bash "$0" >>"$LOG" 2>&1 &
@@ -69,15 +70,25 @@ echo "==== INTMR-BUILD-RUNNER-OK $(date -u +%FT%TZ) ===="
 echo "==== INTMR-INPUTS $(date -u +%FT%TZ) ===="
 python3 "$PROBE/intmr_inputs.py" || { echo INTMR-INPUTS-FAILED; echo INTMR-FAILED; exit 1; }
 
-# ── legs 3-5, per cell: bake → dxp → run ──
+# legs 3-5, per cell: bake → dxp → run. The UN-FIXED twin (auditor GO
+# 2026-10-27) is the exception: it runs the PRE-BAKED bundle from before the
+# both-split law (/work/int-mr-f32col-unfixed, {mb:2, out:16}) — dxp and run
+# only, never baked here — so the same leg measures the fold the law drops
+# against the fold it keeps.
 for CELL in $CELLS; do
   BAKE=/work/int-mr-$CELL
-  echo "==== INTMR-BAKE-$CELL-START $(date -u +%FT%TZ) ===="
-  rm -rf "$BAKE"
-  if ! KTIR_WHOLE=1 cargo run --offline -p triton-ktir-superdsc --example bake_py -- "$CELL" "$BAKE"; then
-    echo "INTMR-BAKE-FAILED ($CELL)"; echo INTMR-FAILED; exit 1
+  if [ "$CELL" = "intmr_f32col_add_unfixed" ]; then
+    BAKE=/work/int-mr-f32col-unfixed
+    [ -d "$BAKE" ] || { echo "no pre-baked unfixed bundle at $BAKE"; echo INTMR-FAILED; exit 1; }
+    echo "==== INTMR-PREBAKED-$CELL ($(grep -o '"numWkSlicesPerDim_":{[^}]*}' "$BAKE"/*.json | head -1)) ===="
+  else
+    echo "==== INTMR-BAKE-$CELL-START $(date -u +%FT%TZ) ===="
+    rm -rf "$BAKE"
+    if ! KTIR_WHOLE=1 cargo run --offline -p triton-ktir-superdsc --example bake_py -- "$CELL" "$BAKE"; then
+      echo "INTMR-BAKE-FAILED ($CELL)"; echo INTMR-FAILED; exit 1
+    fi
+    echo "==== INTMR-BAKE-$CELL-OK ($(grep -o '"numWkSlicesPerDim_":{[^}]*}' "$BAKE"/*.json | head -1)) ===="
   fi
-  echo "==== INTMR-BAKE-$CELL-OK $(date -u +%FT%TZ) ===="
 
   echo "==== INTMR-DXP-$CELL $(date -u +%FT%TZ) ===="
   if ! "$DXP" -d "$BAKE" -b sentient > "$BAKE/dxp.log" 2>&1; then
@@ -85,10 +96,14 @@ for CELL in $CELLS; do
   fi
   echo "INTMR-DXP-$CELL-OK ($(stat -c%s "$BAKE/spyreCodeDir/init_binary.bin") B image)"
 
+  # The un-fixed twin runs the SAME staged inputs as the fixed one (its bundle
+  # was baked from the same probe spelling); only its read-back file differs.
+  IN_CELL=$CELL
+  if [ "$CELL" = "intmr_f32col_add_unfixed" ]; then IN_CELL=intmr_f32col_add; fi
   echo "==== INTMR-RUN-$CELL-START $(date -u +%FT%TZ) ===="
   SCRATCHY_SUPERDSC_DBG=1 "$BIN" "$BAKE" \
-    t0="$PROBE/in/${CELL}_t00_a.bin" raw:t0 \
-    t1="$PROBE/in/${CELL}_t01_b.bin" raw:t1 \
+    t0="$PROBE/in/${IN_CELL}_t00_a.bin" raw:t0 \
+    t1="$PROBE/in/${IN_CELL}_t01_b.bin" raw:t1 \
     --out raw:t2="$PROBE/out_${CELL}_o.bin" \
     > "$PROBE/intmr-run-$CELL.log" 2>&1
   rc=$?
@@ -98,7 +113,7 @@ for CELL in $CELLS; do
   tail -8 "$PROBE/intmr-run-$CELL.log"
 done
 
-# ── leg 6: the verdict, on the pod — bit for bit, all four cells ──
+# ── leg 6: the verdict, on the pod — bit for bit, all six cells ──
 echo "==== INTMR-CHECK $(date -u +%FT%TZ) ===="
 python3 "$PROBE/intmr_stats.py"
 rc=$?

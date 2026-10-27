@@ -892,6 +892,25 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
             vec![2],
             Program::Sample,
         ),
+        // ⭐ THE WIDE TWIN (wall-9 width leg, auditor order 2026-10-27T02:5xZ): the
+        // same kernel at PRODUCTION WIDTH — PAD_V 65536, 2048 out-sticks, the fold
+        // the card-proven b2 equality states ({mb:1, out:32}, 64 sticks per core)
+        // against the narrow twin's 1 stick per core. The re-leg refuted the
+        // both-split diagnosis (the fold moved, the card output did not), and the
+        // field-by-field descriptor diff leaves PER-CORE SLICE WIDTH as the only
+        // variable: this cell decides whether the Col defect is narrow-slice only
+        // (production safe) or the equality passes by luck (urgent). NOT a
+        // production configuration: delete with the probe.
+        "intmr_f32wide_add" => (
+            spec(
+                "intmr_probe",
+                "intmr_f32col_add_probe",
+                &[("a_ptr", "*fp32"), ("b_ptr", "*fp32"), ("o_ptr", "*fp32")],
+                &[("PAD_V", Val::Int(65536)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
         _ => return None,
     })
 }

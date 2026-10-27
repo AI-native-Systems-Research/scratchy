@@ -102,6 +102,22 @@ def b_f32col() -> np.ndarray:
     return stick
 
 
+# The wide twin's width (auditor order 2026-10-27T02:5xZ): production PAD_V,
+# 2048 out-sticks — the per-core slice width the card-proven b2 equality
+# states (64 sticks per core at {mb:1, out:32}).
+WIDE_N = 65536
+
+
+def a_f32wide() -> np.ndarray:
+    """The wide twin's [2, 65536] dense tile: the same exact-integer patterns
+    as `a_f32` at production width (row 0 = j, row 1 = 100000 + 3j — max
+    296605, every sum with the Col word < 2^24, exact on both sides)."""
+    out = np.zeros((ROWS, WIDE_N), dtype=np.float32)
+    for r in range(ROWS):
+        out[r] = (np.arange(WIDE_N) * (1 if r == 0 else 3) + (0 if r == 0 else 100000)).astype(np.float32)
+    return out
+
+
 def tables() -> list[tuple[str, np.ndarray]]:
     a = a_tile()
     dense = b_dense()
@@ -115,6 +131,8 @@ def tables() -> list[tuple[str, np.ndarray]]:
         out.append((f"{cell}_t01_b", col))
     out.append(("intmr_f32col_add_t00_a", a_f32()))
     out.append(("intmr_f32col_add_t01_b", b_f32col()))
+    out.append(("intmr_f32wide_add_t00_a", a_f32wide()))
+    out.append(("intmr_f32wide_add_t01_b", b_f32col()))
     return out
 
 
