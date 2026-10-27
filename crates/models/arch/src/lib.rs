@@ -129,7 +129,7 @@ pub mod qwen3;
 #[path = "arch/qwen3_5.rs"]
 pub mod qwen3_5;
 
-#[cfg(all(feature = "arch-qwen3-5-moe", feature = "metal"))]
+#[cfg(all(feature = "arch-qwen3-5-moe", any(feature = "metal", feature = "cuda")))]
 #[path = "arch/qwen3_5_moe.rs"]
 pub mod qwen3_5_moe;
 

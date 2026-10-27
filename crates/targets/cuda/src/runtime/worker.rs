@@ -38,11 +38,14 @@ use scratchy_subtile::paged_kv_layout::PagedKvLayout;
 use crate::kernels::{self, KernelError};
 use crate::rotary::fill_rotary_rows;
 use crate::step::{
-    AddBf16, AttnPrefillBf16, CudaStep, EmbedBf16, GateApplyBf16, GateSplitBf16, GatedDeltaNetBf16,
-    GemmBf16, RmsNormBf16, RopeAppendBf16, RopeBf16, SiluMulBf16,
+    AddBf16, AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16,
+    ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16,
+    GatedDeltaNetBf16, GemmBf16, MatmulKernel, MoeRouteBf16, PairRows, RmsNormBf16, RopeAppendBf16,
+    RopeBf16, RouterLogitsBf16, SiluMulBf16, moe_bundle,
 };
 use crate::tape::{
-    ArenaOffset, ArenaSpan, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape, TapeError, TapeInput,
+    ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape, TapeError,
+    TapeInput, WeightIx,
 };
 
 /// A forward's input, of the kind its tape takes ([`TapeInput`]).
@@ -1309,6 +1312,105 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     // `c` (`n`).
                     unsafe { kernels::gemv_bf16_abt(slot(a), b, slot(c), (n, k), stream.0) }
                 }
+                CudaStep::RouterLogits(RouterLogitsBf16 {
+                    x,
+                    bundle,
+                    logits,
+                    m,
+                    experts,
+                    hidden,
+                    kernel,
+                    ..
+                }) => {
+                    // The router is the bundle's first tensor, at byte 0 (`moe_bundle`).
+                    let b = weights[bundle.0 as usize].ptr();
+                    // SAFETY: as above, for `x` (`m*hidden`), the router (`experts*hidden`, the
+                    // bundle's first bytes) and `logits` (`m*experts`).
+                    unsafe {
+                        match kernel {
+                            MatmulKernel::Tiled => kernels::gemm_bf16_abt(
+                                slot(x),
+                                b,
+                                slot(logits),
+                                m,
+                                experts,
+                                hidden,
+                                stream.0,
+                            ),
+                            MatmulKernel::Gemv => kernels::gemv_bf16_abt(
+                                slot(x),
+                                b,
+                                slot(logits),
+                                (experts, hidden),
+                                stream.0,
+                            ),
+                        }
+                    }
+                }
+                CudaStep::MoeRoute(MoeRouteBf16 {
+                    logits,
+                    topk_idx,
+                    scores,
+                    m,
+                    experts,
+                    top_k,
+                    renorm,
+                }) => {
+                    // SAFETY: as above, for `logits` (`m*experts`), `topk_idx` and `scores`
+                    // (`m*top_k` each).
+                    unsafe {
+                        kernels::moe_route_bf16(
+                            slot(logits),
+                            (slot(topk_idx), slot(scores)),
+                            (m, experts, top_k),
+                            renorm,
+                            stream.0,
+                        )
+                    }
+                }
+                CudaStep::ExpertSort(sort) => Self::expert_sort(&sort, slot, stream),
+                CudaStep::ExpertGemm(g) => Self::expert_gemm(&g, slot, weights, stream),
+                CudaStep::ExpertGemv(g) => Self::expert_gemv(&g, slot, weights, stream),
+                CudaStep::ExpertCombine(ExpertCombineBf16 {
+                    down,
+                    pos,
+                    scores,
+                    out,
+                    m,
+                    top_k,
+                    hidden,
+                    down_rows,
+                }) => {
+                    // SAFETY: as above, for `down` (`down_rows*hidden`), `pos` when sorted and
+                    // `scores` (`m*top_k` each), and `out` (`m*hidden`).
+                    unsafe {
+                        kernels::moe_combine_bf16(
+                            (slot(down), pos.map(|p| slot(p).cast_const()), slot(scores)),
+                            slot(out),
+                            (m, top_k, hidden, down_rows),
+                            stream.0,
+                        )
+                    }
+                }
+                CudaStep::GateScale(GateScaleBf16 {
+                    routed,
+                    shared,
+                    g,
+                    out,
+                    rows,
+                    cols,
+                }) => {
+                    // SAFETY: as above, for `routed`, `shared` and `out` (`rows*cols` each) and
+                    // `g` (`rows`).
+                    unsafe {
+                        kernels::gate_scale_bf16(
+                            (slot(routed), slot(shared), slot(g)),
+                            slot(out),
+                            (rows, cols),
+                            stream.0,
+                        )
+                    }
+                }
                 CudaStep::GatedDeltaNet(g) => {
                     let pool = gdn.expect("`new` made a pool for a GDN tape");
                     Self::gated_delta_net(&g, pool, slot, weights, stream)
@@ -1629,6 +1731,128 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 slot(g.out),
                 (g.rows, g.num_v_heads, g.head_v),
                 g.eps(),
+                stream.0,
+            )
+        }
+    }
+
+    /// Enqueue the MoE sort's three launches (`kernels::moe_sort`) on the stream, its index
+    /// regions placed by the step's own [`crate::step::SortLayout`].
+    fn expert_sort(
+        s: &ExpertSortBf16,
+        slot: impl Fn(ArenaOffset) -> *mut c_void,
+        stream: &Stream,
+    ) -> Result<(), KernelError> {
+        // `validate` checked the step's layout fits u64 (`extents`); were it to overflow, the
+        // sort refuses its shape and nothing launches.
+        let refused = KernelError::MoeShape {
+            kernel: "moe_sort",
+            dims: [s.m, s.top_k, s.hidden, s.max_tiles],
+        };
+        if s.layout().is_none() {
+            return Err(refused);
+        }
+        let regions = kernels::SortRegions {
+            chunk_hist: slot(s.chunk_hist),
+            counts: slot(s.counts),
+            offsets: slot(s.offsets),
+            tile_expert: slot(s.tile_expert),
+            pos: slot(s.pos),
+        };
+        // SAFETY: as `enqueue`'s, for `x` (`m*hidden`), `topk_idx` (`m*top_k`), `rows` (the
+        // layout's `rows_bytes`) and the index regions, each at its own offset inside the span
+        // `extents` gives from `chunk_hist` (`MoeTape::validate` checked every region's offset).
+        unsafe {
+            kernels::moe_sort(
+                (slot(s.x).cast_const(), slot(s.topk_idx).cast_const()),
+                regions,
+                slot(s.rows),
+                (s.m, s.experts, s.top_k, s.hidden, s.max_tiles),
+                stream.0,
+            )
+        }
+    }
+
+    /// Expert 0's `[n, k]` of `proj` in the MoE bundle `bundle` of `weights`, and the rows of each
+    /// expert's block (the expert stride in rows of `k`), or `None` on overflow.
+    fn expert_slab(
+        weights: &[DeviceBuffer],
+        bundle: WeightIx,
+        proj: ExpertProjection,
+        (experts, hidden, inter): (u32, u32, u32),
+    ) -> Option<(*const c_void, u32)> {
+        let layout = moe_bundle(experts, hidden, inter)?;
+        let (part, stride) = proj.slab(layout, hidden, inter)?;
+        let (_, k) = proj.n_k(hidden, inter);
+        let row_bytes = u64::from(k).checked_mul(CUDA_ACT_BYTES)?;
+        let rows = u32::try_from(stride.checked_div(row_bytes)?).ok()?;
+        let part = usize::try_from(part).ok()?;
+        let b = weights[bundle.0 as usize].ptr().wrapping_byte_add(part);
+        Some((b.cast_const(), rows))
+    }
+
+    /// Enqueue the grouped expert GEMM (`kernels::expert_gemm_bf16`) over the sorted rows, B at
+    /// [`ExpertProjection::slab`]'s part of the bundle.
+    fn expert_gemm(
+        g: &ExpertGemmBf16,
+        slot: impl Fn(ArenaOffset) -> *mut c_void,
+        weights: &[DeviceBuffer],
+        stream: &Stream,
+    ) -> Result<(), KernelError> {
+        let (n, k) = g.n_k();
+        let Some((b, expert_rows)) =
+            Self::expert_slab(weights, g.bundle, g.proj, (g.experts, g.hidden, g.inter))
+        else {
+            return Err(KernelError::MoeShape {
+                kernel: "expert_gemm_bf16",
+                dims: [g.max_tiles, n, k, 0],
+            });
+        };
+        // SAFETY: as `enqueue`'s, for `a` (`max_tiles*128*k`), `offsets` (`experts + 1`),
+        // `tile_expert` (`max_tiles`), `c` (`max_tiles*128*n`) and the bundle (`moe_bundle`'s
+        // bytes, which `new` checked the buffer holds; every expert's `[n, k]` lies inside its
+        // part).
+        unsafe {
+            kernels::expert_gemm_bf16(
+                (slot(g.a).cast_const(), b),
+                (
+                    slot(g.offsets).cast_const(),
+                    slot(g.tile_expert).cast_const(),
+                ),
+                slot(g.c),
+                (g.max_tiles, n, k, g.experts, expert_rows),
+                stream.0,
+            )
+        }
+    }
+
+    /// Enqueue the gathered expert GEMV (`kernels::expert_gemv_bf16`) over every pair, B at
+    /// [`ExpertProjection::slab`]'s part of the bundle.
+    fn expert_gemv(
+        g: &ExpertGemvBf16,
+        slot: impl Fn(ArenaOffset) -> *mut c_void,
+        weights: &[DeviceBuffer],
+        stream: &Stream,
+    ) -> Result<(), KernelError> {
+        let (n, k) = g.n_k();
+        let Some((b, expert_rows)) =
+            Self::expert_slab(weights, g.bundle, g.proj, (g.experts, g.hidden, g.inter))
+        else {
+            return Err(KernelError::MoeShape {
+                kernel: "expert_gemv_bf16",
+                dims: [g.m, g.top_k, n, k],
+            });
+        };
+        // SAFETY: as `enqueue`'s, for `a` (its `PairRows` rows of `k`), `topk_idx` (`m*top_k`),
+        // `c` (`m*top_k*n`) and the bundle (`moe_bundle`'s bytes, which `new` checked the buffer
+        // holds; every expert's `[n, k]` lies inside its part).
+        unsafe {
+            kernels::expert_gemv_bf16(
+                (slot(g.a).cast_const(), b, slot(g.topk_idx).cast_const()),
+                slot(g.c),
+                (g.m, g.top_k, n, k),
+                (g.experts, expert_rows),
+                g.rows == PairRows::Pair,
                 stream.0,
             )
         }

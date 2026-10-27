@@ -15,6 +15,7 @@ pub mod common {
     pub mod chains;
     pub mod gdn_layer;
     pub mod mlp;
+    pub mod moe_block;
     pub mod numerics;
 }
 
@@ -47,7 +48,8 @@ use scratchy_target_cuda::runtime::{
 };
 use scratchy_target_cuda::step::{CudaStep, gdn_bundle, gdn_scratch};
 use scratchy_target_cuda::tape::{
-    ArenaOffset, ArenaSpan, CudaTape, GdnTape, KvTape, RotaryTable, TapeError, WeightIx,
+    ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, KvTape, RotaryTable, TapeError,
+    TapeInput, WeightIx,
 };
 use scratchy_target_cuda_compiler::canonical::{CanonicalAt, lower_canonical};
 use scratchy_target_cuda_compiler::emit::static_tape;
@@ -2661,4 +2663,263 @@ fn a_decode_step_attends_over_the_prefilled_cache() {
         pass,
         "a decode step of the attention layer failed: see the lines above"
     );
+}
+
+// ── The qwen3-5-moe MoE block (#857) ───────────────────────────────
+
+use common::moe_block::{
+    MOE_FACTS, MUTATIONS, MoeWeights, Routing, moe_block, moe_weights, moe_x, references,
+};
+
+/// The MoE block's buckets: one gathered row, a sorted bucket, and the long run.
+const MOE_MS: [u32; 3] = [1, 512, 4096];
+/// #841(a)'s predicted MoE scratch bytes at each of [`MOE_MS`].
+const MOE_SCRATCH: [u64; 3] = [58_368, 412_683_776, 737_939_712];
+/// The tokens of an `m`-row bucket the f64 reference checks: about 64, odd and even.
+fn moe_tokens(m: usize) -> Vec<usize> {
+    (0..m).step_by((m / 64).max(1) | 1).collect()
+}
+
+/// The MoE block at each of [`MOE_MS`], as CUDA's compiler lowers it.
+fn moe_buckets() -> &'static [CudaTape] {
+    static TAPES: std::sync::OnceLock<Vec<CudaTape>> = std::sync::OnceLock::new();
+    TAPES.get_or_init(|| {
+        (MOE_MS.iter())
+            .map(|&m| {
+                let c = lower_canonical(
+                    &moe_block(m),
+                    MOE_FACTS,
+                    CanonicalAt {
+                        stem: "moe_block",
+                        m: u64::from(m),
+                    },
+                )
+                .unwrap_or_else(|e| panic!("the MoE block lowers at m={m}: {e:?}"));
+                static_tape(&c)
+            })
+            .collect()
+    })
+}
+
+fn moe_table(device: &CudaDevice, w: &MoeWeights) -> [DeviceBuffer; 7] {
+    let up = |b: &[u16]| DeviceBuffer::upload(device, b).expect("upload a weight");
+    [
+        DeviceBuffer::empty(),
+        up(&w.g),
+        up(&w.bundle),
+        up(&w.wsg),
+        up(&w.wsu),
+        up(&w.wgate),
+        up(&w.wsd),
+    ]
+}
+
+/// One forward of bucket `b`; its result.
+fn moe_forward(worker: &mut CudaWorker<'_>, b: usize, x: &[u16]) -> Vec<u16> {
+    let mut y = vec![0u16; x.len()];
+    (worker.forward(b, Input::Hidden(x), &[], None, None, &mut y)).expect("the MoE forward");
+    y
+}
+
+/// The routing's picks after a forward of bucket `b`, `[m, 8]` i32 read as u32.
+fn moe_picks(worker: &mut CudaWorker<'_>, tape: &CudaTape) -> Vec<u32> {
+    let span = tape.moe.expect("a MoE scratch").topk_idx;
+    let h = read(worker, span);
+    (h.as_chunks::<2>().0.iter())
+        .map(|p| u32::from(p[0]) | u32::from(p[1]) << 16)
+        .collect()
+}
+
+/// The lowered MoE tapes validate, and their MoE scratch is #841(a)'s prediction; the colours
+/// and the scratch are printed.
+#[test]
+fn moe_block_tapes_lower_to_the_predicted_scratch() {
+    let mut pass = true;
+    for ((tape, &m), &want) in moe_buckets().iter().zip(&MOE_MS).zip(&MOE_SCRATCH) {
+        let valid = tape.validate();
+        let moe = tape.moe.expect("a MoE scratch");
+        let bytes = moe.down.offset.0 + moe.down.bytes - moe.logits.offset.0;
+        let ok = valid.is_ok() && bytes == want;
+        eprintln!(
+            "moe_block m={m}: arena_bytes={} colour_bytes={:?} moe_scratch_bytes={bytes} \
+             (predicted {want}) max_tiles={} sorted={} validate={valid:?} {}",
+            tape.arena.total_bytes,
+            tape.arena.colour_bytes,
+            moe.max_tiles,
+            moe.sort.is_some(),
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(pass, "a MoE block tape is not the predicted one");
+}
+
+/// The MoE block at m = 1 (gathered), 512 (sorted) and 4,096 (the long run), on each routing
+/// case, against the f64 block on about 64 tokens per case: CUDA's RMS and max error each at most
+/// twice the bf16 emulation's (which rounds where the tape stores), the picks the emulation's on
+/// every token that is not a near-tie, and each of the six mutated references out of bound on at
+/// least half the tokens it changes. The near-tie and out-of-bound counts are printed.
+#[test]
+fn moe_block_matches_the_f64_block_in_each_bucket() {
+    let device = h100();
+    let w = moe_weights();
+    let table = moe_table(&device, &w);
+    let tapes = moe_buckets();
+    let mut worker = CudaWorker::new(&device, tapes, &table, None, None).expect("worker");
+    let mut pass = true;
+    for (b, tape) in tapes.iter().enumerate() {
+        let m = tape.bucket_m as usize;
+        for routing in [Routing::Random, Routing::Skewed, Routing::Half] {
+            let x = moe_x(routing, m, 0x0E_5EED ^ m as u64);
+            let y = moe_forward(&mut worker, b, &x);
+            let picks = moe_picks(&mut worker, tape);
+            let tokens = moe_tokens(m);
+            let refs = references(&w, &x, &tokens);
+            let j = common::moe_block::judge(&refs, &tokens, &y, &picks);
+            let ok = j.pass() && j.mutations_caught();
+            eprintln!(
+                "moe_block m={m} {routing:?}: tokens={} near_ties={} rms_err={:.4e} \
+                 (emulation {:.4e}) max_err={:.4e} (emulation {:.4e}) out_of_bound={} \
+                 nonfinite={} picks_differ={} {}",
+                j.tokens,
+                j.near_ties,
+                j.gpu.0,
+                j.emu.0,
+                j.gpu.1,
+                j.emu.1,
+                j.out_of_bound,
+                j.nonfinite,
+                j.picks_differ,
+                verdict(j.pass())
+            );
+            for (name, &(changed, out)) in MUTATIONS.iter().zip(&j.mutations) {
+                eprintln!(
+                    "moe_block m={m} {routing:?} self-check {name}: out_of_bound={out}/{changed} \
+                     ({:.1}%) {}",
+                    100.0 * out as f64 / changed.max(1) as f64,
+                    verdict(changed > 0 && 2 * out >= changed)
+                );
+            }
+            pass &= ok;
+        }
+    }
+    assert!(
+        pass,
+        "the MoE block is out of bound, or a self-check fell short"
+    );
+}
+
+/// A tape of no steps whose input is the whole `bytes`-byte arena: its forward fills every arena
+/// byte, the MoE scratch included, with the input's bits.
+fn whole_arena_tape(bytes: u64) -> CudaTape {
+    let whole = ArenaSpan {
+        offset: ArenaOffset(0),
+        bytes,
+    };
+    CudaTape {
+        bucket_m: 1,
+        arena: ArenaLayout {
+            colour_bytes: Box::leak(Box::new([bytes])),
+            colour_offsets: Box::leak(Box::new([0])),
+            total_bytes: bytes,
+        },
+        input: TapeInput::Hidden(whole),
+        result: ArenaSpan {
+            offset: ArenaOffset(0),
+            bytes: 2,
+        },
+        weight_bytes: &[],
+        steps: &[],
+        rotary: None,
+        kv: None,
+        gdn: None,
+        moe: None,
+    }
+}
+
+/// The MoE block's buckets, then [`whole_arena_tape`] over the largest arena.
+fn moe_buckets_and_fill() -> &'static [CudaTape] {
+    static TAPES: std::sync::OnceLock<Vec<CudaTape>> = std::sync::OnceLock::new();
+    TAPES.get_or_init(|| {
+        let mut t = moe_buckets().to_vec();
+        let bytes = (t.iter().map(|t| t.arena.total_bytes))
+            .max()
+            .expect("tapes");
+        t.push(whole_arena_tape(bytes));
+        t
+    })
+}
+
+/// Fill the whole arena with `v` (bucket `fill` of [`moe_buckets_and_fill`]).
+fn fill_arena(worker: &mut CudaWorker<'_>, fill: usize, bytes: u64, v: u16) {
+    let mut one = [0u16; 1];
+    let input = vec![v; bytes as usize / 2];
+    (worker.forward(fill, Input::Hidden(&input), &[], None, None, &mut one)).expect("the fill");
+}
+
+/// The MoE block's invariants at m = 1 and 512 (random routing): a forward after the whole arena,
+/// MoE scratch included, was poisoned with bf16 NaN (`0x7FC0`) gives finite output, bit-identical
+/// to one after a zero-filled arena; a repeat is bit-identical; at m = 512, permuting the input
+/// rows permutes the output rows bit for bit; and five forwards allocate nothing.
+#[test]
+fn moe_block_invariants_hold() {
+    let device = h100();
+    let w = moe_weights();
+    let table = moe_table(&device, &w);
+    let tapes = moe_buckets_and_fill();
+    let mut worker = CudaWorker::new(&device, tapes, &table, None, None).expect("worker");
+    let h = common::moe_block::H as usize;
+    let fill = tapes.len() - 1;
+    let bytes = tapes[fill].arena.total_bytes;
+    let mut pass = true;
+    for (b, tape) in tapes[..2].iter().enumerate() {
+        let m = tape.bucket_m as usize;
+        let x = moe_x(Routing::Random, m, 0x1A_0000 ^ m as u64);
+        fill_arena(&mut worker, fill, bytes, 0);
+        let after_zero = moe_forward(&mut worker, b, &x);
+        fill_arena(&mut worker, fill, bytes, 0x7FC0);
+        let after_nan = moe_forward(&mut worker, b, &x);
+        let repeat = moe_forward(&mut worker, b, &x);
+        let nonfinite = (after_nan.iter())
+            .filter(|&&v| !half::bf16::from_bits(v).is_finite())
+            .count();
+        let poison = mismatched_bits(&after_nan, &after_zero);
+        let rep = mismatched_bits(&repeat, &after_nan);
+        let ok = nonfinite == 0 && poison == 0 && rep == 0;
+        eprintln!(
+            "moe_block m={m}: nan_poison_vs_zero_mismatched_bits={poison} nonfinite={nonfinite} \
+             repeat_mismatched_bits={rep} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+        if m > 1 {
+            // Row t of the permuted input is row (37·t + 11) mod m of `x`: 37 is odd and m a
+            // power of two, so it is a bijection of 0..m.
+            let src = |t: usize| (37 * t + 11) % m;
+            let mut xp = vec![0u16; x.len()];
+            let mut want = vec![0u16; x.len()];
+            for t in 0..m {
+                xp[t * h..][..h].copy_from_slice(&x[src(t) * h..][..h]);
+                want[t * h..][..h].copy_from_slice(&after_nan[src(t) * h..][..h]);
+            }
+            let perm = mismatched_bits(&moe_forward(&mut worker, b, &xp), &want);
+            eprintln!(
+                "moe_block m={m}: permuted_rows_mismatched_bits={perm} {}",
+                verdict(perm == 0)
+            );
+            pass &= perm == 0;
+        }
+    }
+    let before = device.allocations();
+    let x = moe_x(Routing::Half, 512, 0x1A_0001);
+    for _ in 0..5 {
+        moe_forward(&mut worker, 1, &x);
+    }
+    let allocations = device.allocations() - before;
+    eprintln!(
+        "moe_block five forwards: allocations={allocations} (expect 0) {}",
+        verdict(allocations == 0)
+    );
+    assert!(pass, "a MoE block invariant does not hold");
+    assert_eq!(allocations, 0, "a MoE forward allocated");
 }

@@ -3451,7 +3451,9 @@ pub(crate) mod tests {
     /// router steps ahead of it do not.
     #[test]
     fn an_expanded_block_carries_its_class_to_its_last_step() {
-        use crate::lower::{ExpertQuant, GemmWeight, InputRef, LoweringInput, OpDesc};
+        use crate::lower::{
+            ExpertQuant, ExpertWeight, GemmWeight, InputRef, LoweringInput, OpDesc,
+        };
         use crate::subtile_ir::{
             ExpertBundle, ExpertProj, NumExperts, RouterBundle, SharedExpertBound, SourceShape,
             TopK, lower_region,
@@ -3468,7 +3470,7 @@ pub(crate) mod tests {
             let input = ops.len().checked_sub(1).map_or(Ext(0), Op);
             ops.push(op(SubOp::MatmulTile { n: 64, weight }, vec![input, Ext(1)]));
             let x = ops.len() - 1;
-            let quant = ExpertQuant::declared(64, bits);
+            let weight = ExpertWeight::Affine(ExpertQuant::declared(64, bits));
             let proj = ExpertProj::Gate;
             let shared = SharedExpertBound(None);
             ops.extend([
@@ -3485,7 +3487,7 @@ pub(crate) mod tests {
                         proj,
                         n: 64,
                         k,
-                        quant,
+                        weight,
                         bundle,
                     },
                     vec![Op(x + 5), Op(x + 5), Ext(2)],

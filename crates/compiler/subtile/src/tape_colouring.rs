@@ -1152,7 +1152,7 @@ mod tests {
     /// projection, the weighted sum, then a projection of it. `x` is read by the router and the
     /// sort only — off-arena steps both.
     fn moe_block(tail: bool) -> (Vec<(u32, u32)>, Vec<OpDesc>) {
-        use crate::lower::ExpertQuant;
+        use crate::lower::{ExpertQuant, ExpertWeight};
         use crate::subtile_ir::{
             ExpertBundle, ExpertProj, NumExperts, RouterBundle, SharedExpertBound, TopK,
         };
@@ -1162,7 +1162,7 @@ mod tests {
             TopK::new(nz(2)),
             ExpertBundle::Fused,
         );
-        let quant = ExpertQuant::declared(64, 4);
+        let weight = ExpertWeight::Affine(ExpertQuant::declared(64, 4));
         let proj = ExpertProj::Gate;
         let router = RouterBundle::Fused;
         let (sort, combine) = (
@@ -1188,7 +1188,7 @@ mod tests {
                     proj,
                     n: 64,
                     k,
-                    quant,
+                    weight,
                     bundle,
                 },
                 1,

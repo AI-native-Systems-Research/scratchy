@@ -89,6 +89,13 @@ fn histogram(tape: &CudaTape) -> BTreeMap<&'static str, usize> {
             CudaStep::AttnPrefill(_) => "AttnPrefill",
             CudaStep::AttnDecode(_) => "AttnDecode",
             CudaStep::GatedDeltaNet(_) => "GatedDeltaNet",
+            CudaStep::RouterLogits(_) => "RouterLogits",
+            CudaStep::MoeRoute(_) => "MoeRoute",
+            CudaStep::ExpertSort(_) => "ExpertSort",
+            CudaStep::ExpertGemm(_) => "ExpertGemm",
+            CudaStep::ExpertGemv(_) => "ExpertGemv",
+            CudaStep::ExpertCombine(_) => "ExpertCombine",
+            CudaStep::GateScale(_) => "GateScale",
         };
         *h.entry(kind).or_default() += 1;
     }
@@ -328,6 +335,12 @@ fn the_weight_table_names_the_checkpoints_tensors() {
                 norm,
                 ..
             } => vec![conv1d, a_log, dt_bias, norm],
+            CudaWeight::MoeBundle {
+                router,
+                gate_up,
+                down,
+                ..
+            } => vec![router, gate_up, down],
         };
         assert!(
             leads.insert(tensors[0]),
@@ -364,7 +377,7 @@ fn the_weight_table_names_the_checkpoints_tensors() {
     };
     let shape = |w: CudaWeight| match w {
         CudaWeight::Bf16 { shape, .. } => shape,
-        CudaWeight::GdnBundle { .. } => panic!("a bundle"),
+        CudaWeight::GdnBundle { .. } | CudaWeight::MoeBundle { .. } => panic!("a bundle"),
     };
     let (e, embed) = by_name("language_model.model.embed_tokens.weight");
     assert_eq!(e, 0, "the embedding table is the embedded hidden's index");

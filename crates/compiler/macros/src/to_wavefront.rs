@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use scratchy_subtile::handoff::{BundleTensor, Expansion, ExpansionId};
 use scratchy_subtile::lower::{
-    AffineInt4, ArchOp, ExpertQuant, GemmWeight, InputRef, LoweringInput, OpDesc,
+    AffineInt4, ArchOp, ExpertQuant, ExpertWeight, GemmWeight, InputRef, LoweringInput, OpDesc,
 };
 use scratchy_subtile::model_geometry::{HeadDim, KvHeads, ModelAttnGeometry, QueryHeads};
 use scratchy_subtile::subtile_ir::{
@@ -266,6 +266,8 @@ struct Builder<'a> {
     eps: f32,
     scale: f32,
     m: u32,
+    /// Whether a dense expert bank lowers or is refused ([`DenseExperts`]).
+    dense_experts: DenseExperts,
     /// Modeled prefix length for the KV-cache `Source` rows (structural;
     /// the host eval / GPU player binds the real length at run time).
     prefix_len: u32,
@@ -294,7 +296,7 @@ struct Experts {
     k: TopK,
     inter: u32,
     hidden: u32,
-    quant: ExpertQuant,
+    weight: ExpertWeight,
     bundle: ExpertBundle,
     body: ExpertBody,
     shared: SharedExpertBound,
@@ -335,7 +337,8 @@ impl<'a> Builder<'a> {
     /// summed by `scores`. Closes the expansion; returns the sum.
     ///
     /// `bank` resolves one projection's WEIGHT and SCALE sources — the two are separate
-    /// launch tensors (a bundle holds both), so the matmul binds them as operands 2 and 3.
+    /// launch tensors (a bundle holds both), so an affine bank's matmul binds them as operands 2
+    /// and 3. A dense bank has no scale: its matmul binds the weight alone, as operand 2.
     fn experts(
         &mut self,
         x: InputRef,
@@ -344,12 +347,12 @@ impl<'a> Builder<'a> {
         bank: &dyn Fn(ExpertProj) -> (InputRef, InputRef),
         e: Experts,
     ) -> usize {
-        let (k, quant, bundle) = (e.k, e.quant, e.bundle);
+        let (k, weight, bundle) = (e.k, e.weight, e.bundle);
         let matmul = |proj, n| SubOp::ExpertMatmul {
             proj,
             n,
             k,
-            quant,
+            weight,
             bundle,
         };
         let sort = SubOp::ExpertSort {
@@ -358,8 +361,10 @@ impl<'a> Builder<'a> {
             bundle,
         };
         let pairs = self.push_op(sort, vec![x, InputRef::Op(indices)]);
-        let rows =
-            |r: usize, w: InputRef, s: InputRef| vec![InputRef::Op(r), InputRef::Op(pairs), w, s];
+        let rows = |r: usize, w: InputRef, s: InputRef| match weight {
+            ExpertWeight::Affine(_) => vec![InputRef::Op(r), InputRef::Op(pairs), w, s],
+            ExpertWeight::Dense => vec![InputRef::Op(r), InputRef::Op(pairs), w],
+        };
         let act = match e.body {
             ExpertBody::Gated(act) => {
                 let (gw, gs) = bank(ExpertProj::Gate);
@@ -595,6 +600,21 @@ fn moe_counts(tile: TileId, experts: u32, k: u32) -> Result<(NumExperts, TopK), 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrefixCapacity(std::num::NonZeroU32);
 
+/// Whether a [`lower_decode_to_wavefront`] caller's target realizes DENSE expert banks: a fact
+/// about which banks the canonical's consumer has kernels for, never a target's name.
+///
+/// A dense MoE (its experts the checkpoint's own bf16 tensors, no affine storage) lowers to
+/// [`ExpertWeight::Dense`] expert matmuls only under [`Self::Lower`]; under [`Self::Refuse`] the
+/// bridge refuses it ([`BridgeError::NoMetalRealization`]), as it always has. Only the
+/// `moe_block` bank reads this; the Gemma and gpt-oss banks are affine-only either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenseExperts {
+    /// The caller's target has no dense expert kernels: refuse a dense bank.
+    Refuse,
+    /// The caller's target has dense expert kernels: lower a dense bank.
+    Lower,
+}
+
 impl PrefixCapacity {
     /// Wrap a proven-nonzero capacity. The caller holds the `NonZeroU32`, so
     /// there is no fallible/`unwrap` boundary here (the zero case is excluded by
@@ -614,6 +634,7 @@ impl PrefixCapacity {
 /// `prefix_len` ([`PrefixCapacity`]) models the KV-cache prefix rows for the
 /// attention `Source` segments (structural only — the real length binds at run
 /// time); the decode and prefill bundles of one model MUST share it.
+/// `experts` says whether the caller's target realizes dense expert banks ([`DenseExperts`]).
 pub fn lower_decode_to_wavefront(
     fuf: &Fuf,
     inferred: &Inferred,
@@ -621,6 +642,7 @@ pub fn lower_decode_to_wavefront(
     model: &ModelParams,
     prefix_len: PrefixCapacity,
     num_tokens: u32,
+    experts: DenseExperts,
 ) -> Result<LoweredDecode, BridgeError> {
     // Unwrap the typed capacity to the raw row count once, at the boundary; the
     // rest of the bridge keeps using a plain `u32`.
@@ -725,6 +747,7 @@ pub fn lower_decode_to_wavefront(
         eps,
         scale,
         m,
+        dense_experts: experts,
         prefix_len,
         op_expansion: Vec::new(),
         expanding: None,
@@ -1424,11 +1447,15 @@ pub fn lower_decode_to_wavefront(
                     .get("routed_scaling_factor")
                     .map(|&f| f as f32)
                     .filter(|&f| f != 1.0);
-                let (group_size, bits) = match crate::weight_vocab::weight_storage_of(node) {
-                    Some(crate::quantization::StorageFormat::Affine { group_size, bits }) => {
-                        (*group_size, *bits)
+                let weight = match (
+                    crate::weight_vocab::weight_storage_of(node),
+                    bx.dense_experts,
+                ) {
+                    (Some(crate::quantization::StorageFormat::Affine { group_size, bits }), _) => {
+                        ExpertWeight::Affine(ExpertQuant::declared(*group_size, *bits))
                     }
-                    _ => {
+                    (_, DenseExperts::Lower) => ExpertWeight::Dense,
+                    (_, DenseExperts::Refuse) => {
                         return Err(BridgeError::NoMetalRealization {
                             tile,
                             detail: "MoE without affine expert storage has no metal \
@@ -1482,7 +1509,7 @@ pub fn lower_decode_to_wavefront(
                     k,
                     inter: moe_inter,
                     hidden,
-                    quant: ExpertQuant::declared(group_size, bits),
+                    weight,
                     bundle,
                     body,
                     shared: SharedExpertBound(shared),
@@ -1685,7 +1712,7 @@ pub fn lower_decode_to_wavefront(
                     k,
                     inter: moe_inter,
                     hidden,
-                    quant: ExpertQuant::declared(group_size, bits),
+                    weight: ExpertWeight::Affine(ExpertQuant::declared(group_size, bits)),
                     bundle: ExpertBundle::SwitchGlu,
                     body: ExpertBody::Gated(GatedAct::Gelu),
                     shared: SharedExpertBound(None),
@@ -1793,7 +1820,7 @@ pub fn lower_decode_to_wavefront(
                     k,
                     inter: moe_inter,
                     hidden,
-                    quant: ExpertQuant::declared(group_size, bits),
+                    weight: ExpertWeight::Affine(ExpertQuant::declared(group_size, bits)),
                     bundle: ExpertBundle::GptOss,
                     body: ExpertBody::Gated(GatedAct::SwigluOai),
                     shared: SharedExpertBound(None),

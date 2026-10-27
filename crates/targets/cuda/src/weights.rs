@@ -21,7 +21,7 @@ use scratchy_layers::weights::GpuWeights;
 use scratchy_tensors::{DType, DeviceAllocator, PoolMemory};
 use serde::Serialize;
 
-use crate::step::gdn_bundle;
+use crate::step::{gdn_bundle, moe_bundle};
 use crate::tape::CudaTape;
 
 /// How one weight index is filled from the checkpoint.
@@ -46,6 +46,20 @@ pub enum CudaWeight {
         nv: u32,
         head_v: u32,
     },
+    /// One MoE layer's dense bf16 bundle (`step::moe_bundle`), its three checkpoint tensors back to
+    /// back, each uploaded byte for byte: `router` `[experts, hidden]` (`{prefix}.gate.weight`),
+    /// `gate_up` `[experts, 2·inter, hidden]` (`{prefix}.experts.gate_up_proj`; per expert the
+    /// first `inter` rows gate, the next up) and `down` `[experts, hidden, inter]`
+    /// (`{prefix}.experts.down_proj`). Only the fused 3-D form: a checkpoint storing each expert's
+    /// projections as tensors of their own is refused, naming the fused tensor it lacks.
+    MoeBundle {
+        router: &'static str,
+        gate_up: &'static str,
+        down: &'static str,
+        experts: u32,
+        hidden: u32,
+        inter: u32,
+    },
 }
 
 /// The dtypes a dense tensor may have on disk: bf16 only, never converted.
@@ -66,6 +80,7 @@ impl CudaWeight {
         match *self {
             Self::Bf16 { tensor, .. } => tensor,
             Self::GdnBundle { conv1d, .. } => conv1d,
+            Self::MoeBundle { router, .. } => router,
         }
     }
 
@@ -99,6 +114,25 @@ impl CudaWeight {
                     read(norm, &[head_v]),
                 ]
             }
+            Self::MoeBundle {
+                router,
+                gate_up,
+                down,
+                experts,
+                hidden,
+                inter,
+            } => {
+                let read = |tensor, shape: &[u32]| Read {
+                    tensor,
+                    accepted: DENSE_DTYPES,
+                    shape: shape.iter().map(|&d| u64::from(d)).collect(),
+                };
+                vec![
+                    read(router, &[experts, hidden]),
+                    read(gate_up, &[experts, 2 * inter, hidden]),
+                    read(down, &[experts, hidden, inter]),
+                ]
+            }
         }
     }
 
@@ -113,6 +147,12 @@ impl CudaWeight {
                 head_v,
                 ..
             } => gdn_bundle(conv_dim, conv_kernel, nv, head_v).map(|b| b.bytes),
+            Self::MoeBundle {
+                experts,
+                hidden,
+                inter,
+                ..
+            } => moe_bundle(experts, hidden, inter).map(|b| b.bytes),
         }
     }
 }
@@ -132,6 +172,11 @@ pub enum LoadError {
     },
     /// Weight `ix` reads `tensor`, which the checkpoint does not hold.
     Missing { ix: usize, tensor: &'static str },
+    /// Weight `ix`, a MoE bundle, reads the fused 3-D `tensor` (`experts.gate_up_proj` or
+    /// `experts.down_proj`), which the checkpoint does not hold: it stores each expert's
+    /// projections as tensors of their own (`experts.{e}.gate_proj.weight`), a form this loader does
+    /// not take.
+    PerExpertTensors { ix: usize, tensor: &'static str },
     /// Weight `ix` reads `tensor`, which is `got` on disk; it may be one of `accepted`.
     Dtype {
         ix: usize,
@@ -181,6 +226,11 @@ impl std::fmt::Display for LoadError {
             Self::Missing { ix, tensor } => {
                 write!(f, "weight {ix}: the checkpoint has no tensor {tensor}")
             }
+            Self::PerExpertTensors { ix, tensor } => write!(
+                f,
+                "weight {ix}: the checkpoint has no fused expert tensor {tensor}; it stores each \
+                 expert's projections as tensors of their own, which the CUDA loader does not take"
+            ),
             Self::Dtype {
                 ix,
                 tensor,
@@ -277,8 +327,18 @@ fn check_tensors<A: DeviceAllocator>(
         shape,
     } in entry.reads()
     {
-        let (got, dtype) =
-            (weights.tensor_info(tensor)).ok_or(LoadError::Missing { ix, tensor })?;
+        let missing = || match *entry {
+            CudaWeight::MoeBundle { router, .. } if tensor != router => {
+                let base = tensor.rsplit_once(".experts.").map_or(tensor, |(b, _)| b);
+                let per_expert = format!("{base}.experts.0.gate_proj.weight");
+                match weights.tensor_info(&per_expert) {
+                    Some(_) => LoadError::PerExpertTensors { ix, tensor },
+                    None => LoadError::Missing { ix, tensor },
+                }
+            }
+            _ => LoadError::Missing { ix, tensor },
+        };
+        let (got, dtype) = (weights.tensor_info(tensor)).ok_or_else(missing)?;
         if !accepted.contains(&dtype) {
             return Err(LoadError::Dtype {
                 ix,
@@ -427,6 +487,22 @@ pub fn stage<A: DeviceAllocator>(
                 packed[at as usize / 4..][..values.len()].copy_from_slice(&values);
             }
             Ok(packed.iter().flat_map(|v| v.to_le_bytes()).collect())
+        }
+        CudaWeight::MoeBundle {
+            router,
+            gate_up,
+            down,
+            ..
+        } => {
+            // `check_tensors` checked each piece is bf16 of its shape, so the three are the
+            // bundle's regions in order, back to back with no gap (`step::moe_bundle`).
+            let mut packed = Vec::new();
+            for tensor in [router, gate_up, down] {
+                let (bytes, ..) =
+                    (weights.take_to_cpu_bytes(tensor)).map_err(|_| missing(tensor))?;
+                packed.extend_from_slice(&bytes);
+            }
+            Ok(packed)
         }
     }
 }

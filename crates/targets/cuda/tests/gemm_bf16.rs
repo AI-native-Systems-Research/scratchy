@@ -731,3 +731,60 @@ fn the_narrow_gemm_time_is_recorded() {
         );
     }
 }
+
+// ── #857 M7: the narrow GEMM at n = 1 (a shared expert's gate) ─────
+
+/// The narrow GEMM's one-column path (`n = 1`, `kernels/gemm_narrow_bf16.cu`'s warp-vector kernel)
+/// at qwen3-5-moe's `k` 2048 and `m` ∈ {1, 7, 512}: every row within the GEMM bound, the tail past
+/// `c[m]` intact, and a repeat bit-identical; then its one tightening, `k` a multiple of 256,
+/// refused at `k` 2040 (a multiple of 8) with `c` unchanged.
+#[test]
+fn gemm_narrow_bf16_abt_at_one_column_matches_the_cpu_reference() {
+    let device = h100();
+    let (n, k) = (1u32, 2048u32);
+    let mut pass = true;
+    for m in [1u32, 7, 512] {
+        let (mu, ku) = (m as usize, k as usize);
+        let a_bits = bf16_inputs(mu * ku, 0xA1A1_0000 ^ u64::from(m));
+        let b_bits = bf16_inputs(ku, 0xB1B1_0000);
+        let a = DeviceBuffer::upload(&device, &a_bits).expect("upload A");
+        let b = DeviceBuffer::upload(&device, &b_bits).expect("upload B");
+        let run = || {
+            let c = DeviceBuffer::upload(&device, &vec![SENTINEL; mu + TAIL]).expect("upload C");
+            // SAFETY: the buffers hold m*k, k and m + TAIL bf16, cudaMalloc pointers are 256-byte
+            // aligned and `c` overlaps neither input.
+            unsafe { narrow_and_wait(&a, &b, &c, (m, n, k)) }.expect("launch");
+            c.download().expect("download C")
+        };
+        let (first, second) = (run(), run());
+        let tail_intact = first[mu..].iter().all(|&x| x == SENTINEL);
+        let cmp = compare(&first[..mu], &a_bits, &b_bits, mu, 1, ku);
+        let repeat = mismatched_bits(&first, &second);
+        let ok = cmp.pass() && tail_intact && repeat == 0;
+        eprintln!(
+            "gemm_narrow_bf16_abt m={m} n=1 k={k}: {} tail_intact={tail_intact} \
+             repeat_mismatched_bits={repeat} {}",
+            cmp.line(),
+            if ok { "PASS" } else { "FAIL" }
+        );
+        pass &= ok;
+    }
+    let (m, k) = (7u32, 2040u32);
+    let a = DeviceBuffer::upload(&device, &vec![0; m as usize * k as usize]).expect("upload A");
+    let b = DeviceBuffer::upload(&device, &vec![0; k as usize]).expect("upload B");
+    let c = DeviceBuffer::upload(&device, &vec![SENTINEL; m as usize + TAIL]).expect("upload C");
+    // SAFETY: the launcher refuses this shape before it touches any pointer.
+    let got = unsafe { narrow_and_wait(&a, &b, &c, (m, n, k)) };
+    let unchanged = (c.download().expect("download C").iter()).all(|&x| x == SENTINEL);
+    let want = Err(KernelError::NarrowShape { m, n, k });
+    let ok = got == want && unchanged;
+    eprintln!(
+        "gemm_narrow_bf16_abt m={m} n=1 k={k}: {got:?} c_unchanged={unchanged} {}",
+        if ok { "PASS" } else { "FAIL" }
+    );
+    pass &= ok;
+    assert!(
+        pass,
+        "the narrow GEMM's one-column path failed: see the lines above"
+    );
+}

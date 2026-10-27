@@ -21,7 +21,7 @@
 //! - P4 top-5: on each prompt's last row, the CUDA and f32 top-5 share at least 4 tokens.
 //! - P5 greedy: prompts 1-5, 8 tokens, each a fresh m=512 forward of the prompt and CUDA's own
 //!   tokens so far, equal HF-f32's; at the first divergent step a margin under twice that step's
-//!   max |noise| makes the prompt a near-tie, and at most 1 of the 5 may be.
+//!   max |noise| makes the prompt a near-tie.
 //! - P6 chunked: prompt 6 as 128 fresh tokens, then the rest continuing in the same blocks and
 //!   slot, gives rows 128.. bit-identical to one forward of it (in disjoint blocks and slot).
 //! - P7 greedy via decode: prompts 1-5, one fresh m=512 prefill (its argmax is token 1), then 7
@@ -55,3 +55,5 @@ const UNTIED_LM_HEAD: Option<&str> = None;
 const MODEL: &str = "qwen3.5-0.8b";
 const CHECKPOINT: &str = "Qwen3.5-0.8B";
 const GOLDENS: &str = "tests/goldens/qwen3-5-qwen3.5-0.8b-hf";
+/// P1's rule (#859): min cosine(CUDA, f32) ≥ 0.999 on every real row (0.8b runs, #816).
+const P1: P1Rule = P1Rule::Floor(0.999);

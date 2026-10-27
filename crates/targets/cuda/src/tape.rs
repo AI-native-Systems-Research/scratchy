@@ -10,10 +10,13 @@
 
 use serde::Serialize;
 
+use crate::op_abi::CUDA_EXPERT_TILE_ROWS;
 use crate::step::{
-    AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep, EmbedBf16, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K,
-    GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES, GatedDeltaNetBf16, GemmBf16,
-    RopeAppendBf16, RopeBf16, gdn_conv_dim, gdn_scratch,
+    AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16,
+    ExpertGemvBf16, ExpertSortBf16, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX,
+    GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES, GatedDeltaNetBf16, GemmBf16, MoeRouteBf16,
+    RopeAppendBf16, RopeBf16, RouterLogitsBf16, SiluMulBf16, gdn_conv_dim, gdn_scratch,
+    sort_index_regions,
 };
 
 /// Bytes per activation element: CUDA's activations are bf16.
@@ -137,6 +140,173 @@ impl GdnTape {
     }
 }
 
+/// The tape's MoE scratch: the regions every MoE layer's routing and experts pass their runtime
+/// data through, the geometry they are sized by, and whether the bucket's pairs are sorted by
+/// expert. Every MoE layer reuses it: the layers run in order on one stream.
+///
+/// With `P = bucket_m · top_k` pairs, `n = min(experts, P)`, `max_tiles = ⌊(P + 127·n) / 128⌋`
+/// and `R = 128 · max_tiles` (the sorted rows, each expert's run padded to 128): `logits` `[m,
+/// experts]` bf16, `topk_idx` `[m, top_k]` i32, `scores` `[m, top_k]` f32, the sort's regions
+/// ([`MoeSortTape`]) when `sort` is `Some`, then `gate`, `up` and `act` `[R, inter]` bf16 and
+/// `down` `[R, hidden]` bf16 (`P` rows each when gathered), each at a multiple of
+/// [`CUDA_ARENA_ALIGN`], in that order. Nothing in it is cleared between forwards or layers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct MoeTape {
+    pub experts: u32,
+    pub top_k: u32,
+    pub hidden: u32,
+    pub inter: u32,
+    /// [`CUDA_EXPERT_TILE_ROWS`].
+    pub tile_rows: u32,
+    /// The sorted rows' tiles, `⌊(P + 127·n) / 128⌋`; 0 when gathered.
+    pub max_tiles: u32,
+    pub logits: ArenaSpan,
+    pub topk_idx: ArenaSpan,
+    pub scores: ArenaSpan,
+    /// The sort's regions, exactly when the bucket's pairs are sorted by expert
+    /// (`op_abi::CUDA_SORTED_PAIRS` pairs or more).
+    pub sort: Option<MoeSortTape>,
+    pub gate: ArenaSpan,
+    pub up: ArenaSpan,
+    pub act: ArenaSpan,
+    pub down: ArenaSpan,
+}
+
+/// The sort's regions of a [`MoeTape`]: `chunk_hist` `[⌈P/256⌉, experts]` u32, `counts`
+/// `[experts]` u32, `offsets` `[experts + 1]` u32 (`offsets[experts]` the padded row total),
+/// `tile_expert` `[max_tiles]` i32, `pos` `[P]` u32 (pair to sorted row), contiguous from
+/// `chunk_hist` in that order, each 256-aligned, then `rows` `[R, hidden]` bf16.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct MoeSortTape {
+    pub chunk_hist: ArenaSpan,
+    pub counts: ArenaSpan,
+    pub offsets: ArenaSpan,
+    pub tile_expert: ArenaSpan,
+    pub pos: ArenaSpan,
+    pub rows: ArenaSpan,
+}
+
+/// The pairs, max tiles and padded rows of `bucket_m` tokens routed to `top_k` of `experts`:
+/// `(P, ⌊(P + 127·min(experts, P)) / 128⌋, 128 · max_tiles)`. `None` on overflow.
+pub const fn moe_tiles(bucket_m: u32, experts: u32, top_k: u32) -> Option<(u32, u32, u64)> {
+    let Some(pairs) = bucket_m.checked_mul(top_k) else {
+        return None;
+    };
+    let n = if experts < pairs { experts } else { pairs };
+    let t = CUDA_EXPERT_TILE_ROWS as u64;
+    let tiles = (pairs as u64 + (t - 1) * n as u64) / t;
+    if tiles > u32::MAX as u64 {
+        return None;
+    }
+    Some((pairs, tiles as u32, tiles * t))
+}
+
+/// The bytes of each region of a [`MoeTape`] of this geometry, in its order: `logits`,
+/// `topk_idx`, `scores`, then, when `sorted`, `chunk_hist`, `counts`, `offsets`, `tile_expert`,
+/// `pos` and `rows`, then `gate`, `up`, `act` and `down`. `None` on overflow.
+pub fn moe_region_bytes(
+    bucket_m: u32,
+    (experts, top_k, hidden, inter): (u32, u32, u32, u32),
+    sorted: bool,
+) -> Option<Vec<u64>> {
+    let (pairs, tiles, rows) = moe_tiles(bucket_m, experts, top_k)?;
+    let bf16 = |r: u64, c: u32| r.checked_mul(u64::from(c))?.checked_mul(CUDA_ACT_BYTES);
+    let m = u64::from(bucket_m);
+    let mut out = vec![
+        bf16(m, experts)?,
+        u64::from(pairs) * 4,
+        u64::from(pairs) * 4,
+    ];
+    let expert_rows = if sorted {
+        let [_, counts, offsets, tile_expert, pos, end] =
+            sort_index_regions(pairs, experts, tiles)?;
+        out.extend([
+            counts,
+            u64::from(experts) * 4,
+            (u64::from(experts) + 1) * 4,
+            u64::from(tiles) * 4,
+            u64::from(pairs) * 4,
+        ]);
+        // `sort_index_regions` aligns each region's end; the spans are the regions' own bytes.
+        debug_assert!(offsets > counts && tile_expert > offsets && pos > tile_expert && end > pos);
+        out.push(bf16(rows, hidden)?);
+        rows
+    } else {
+        u64::from(pairs)
+    };
+    out.extend([
+        bf16(expert_rows, inter)?,
+        bf16(expert_rows, inter)?,
+        bf16(expert_rows, inter)?,
+        bf16(expert_rows, hidden)?,
+    ]);
+    Some(out)
+}
+
+impl MoeTape {
+    /// Every region, in the tape's order, with its name.
+    pub fn regions(&self) -> Vec<(Region, ArenaSpan)> {
+        let mut out = vec![
+            (Region::MoeLogits, self.logits),
+            (Region::MoeTopKIdx, self.topk_idx),
+            (Region::MoeScores, self.scores),
+        ];
+        if let Some(s) = self.sort {
+            out.extend([
+                (Region::MoeChunkHist, s.chunk_hist),
+                (Region::MoeCounts, s.counts),
+                (Region::MoeOffsets, s.offsets),
+                (Region::MoeTileExpert, s.tile_expert),
+                (Region::MoePos, s.pos),
+                (Region::MoeRows, s.rows),
+            ]);
+        }
+        out.extend([
+            (Region::MoeGate, self.gate),
+            (Region::MoeUp, self.up),
+            (Region::MoeAct, self.act),
+            (Region::MoeDown, self.down),
+        ]);
+        out
+    }
+
+    /// The span from the first region's start to the last one's end. The regions are in order
+    /// (`CudaTape::validate` checks it), so it covers every one.
+    pub fn span(&self) -> ArenaSpan {
+        let start = self.logits.offset.0;
+        let end = self.down.offset.0.saturating_add(self.down.bytes);
+        ArenaSpan {
+            offset: self.logits.offset,
+            bytes: end.saturating_sub(start),
+        }
+    }
+
+    /// The regions projection `proj`'s expert step reads its rows from and writes them to: the
+    /// gate and up the sorted rows (`sorted`, when the pairs are sorted; the token rows, an arena
+    /// colour, when gathered), the down the activation rows.
+    pub fn projection_regions(
+        &self,
+        proj: crate::step::ExpertProjection,
+        sorted: Option<ArenaSpan>,
+    ) -> ((Region, ArenaSpan), (Region, ArenaSpan)) {
+        use crate::step::ExpertProjection as P;
+        let rows = (Region::MoeRows, sorted.unwrap_or(self.logits));
+        match proj {
+            P::Gate => (rows, (Region::MoeGate, self.gate)),
+            P::Up => (rows, (Region::MoeUp, self.up)),
+            P::Down => ((Region::MoeAct, self.act), (Region::MoeDown, self.down)),
+        }
+    }
+
+    /// The rows of the expert regions: `R` sorted, `P` gathered.
+    pub fn expert_rows(&self, bucket_m: u32) -> u32 {
+        match self.sort {
+            Some(_) => self.max_tiles * self.tile_rows,
+            None => bucket_m * self.top_k,
+        }
+    }
+}
+
 /// What a forward uploads as its input, and where it lands in the arena.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum TapeInput {
@@ -186,6 +356,9 @@ pub struct CudaTape {
     /// The Gated-DeltaNet layers and their regions, exactly when a step is a
     /// [`CudaStep::GatedDeltaNet`]; `None` for a tape with no linear attention.
     pub gdn: Option<GdnTape>,
+    /// The MoE scratch, exactly when a step is a MoE step (a router, a routing, a sort, an expert
+    /// projection or a combine); `None` for a tape with no mixture of experts.
+    pub moe: Option<MoeTape>,
 }
 
 /// Which of the tape's reserved regions a [`TapeError`] names.
@@ -198,6 +371,19 @@ pub enum Region {
     Sequence,
     GdnSequence,
     GdnScratch,
+    MoeLogits,
+    MoeTopKIdx,
+    MoeScores,
+    MoeChunkHist,
+    MoeCounts,
+    MoeOffsets,
+    MoeTileExpert,
+    MoePos,
+    MoeRows,
+    MoeGate,
+    MoeUp,
+    MoeAct,
+    MoeDown,
 }
 
 impl std::fmt::Display for Region {
@@ -210,6 +396,19 @@ impl std::fmt::Display for Region {
             Self::Sequence => "the sequence region",
             Self::GdnSequence => "the GDN sequence region",
             Self::GdnScratch => "the GDN scratch",
+            Self::MoeLogits => "the MoE logits",
+            Self::MoeTopKIdx => "the MoE top-k indices",
+            Self::MoeScores => "the MoE scores",
+            Self::MoeChunkHist => "the MoE chunk histogram",
+            Self::MoeCounts => "the MoE expert counts",
+            Self::MoeOffsets => "the MoE expert offsets",
+            Self::MoeTileExpert => "the MoE tile experts",
+            Self::MoePos => "the MoE sorted positions",
+            Self::MoeRows => "the MoE sorted rows",
+            Self::MoeGate => "the MoE gate rows",
+            Self::MoeUp => "the MoE up rows",
+            Self::MoeAct => "the MoE activation rows",
+            Self::MoeDown => "the MoE down rows",
         })
     }
 }
@@ -388,6 +587,35 @@ pub enum TapeError {
         head_v: u32,
         conv_kernel: u32,
     },
+    /// The tape's MoE geometry is one no MoE kernel takes, or its `tile_rows`, `max_tiles` or
+    /// sortedness is not the one its bucket has.
+    MoeGeometry,
+    /// A MoE region is not at a multiple of [`CUDA_ARENA_ALIGN`], reaches past the arena, does not
+    /// follow the previous region, or overlaps another region of the tape.
+    MoeRegionOutside {
+        region: Region,
+        span: ArenaSpan,
+        total: u64,
+    },
+    /// A MoE region is not the bytes its geometry sizes it to.
+    MoeRegionShape {
+        region: Region,
+        span: ArenaSpan,
+        want: u64,
+    },
+    /// The `step`-th step is a MoE step and the tape has no MoE scratch, or its geometry is not
+    /// the tape's MoE geometry.
+    MoeStepGeometry { step: usize },
+    /// The `step`-th step's `region` operand is not the tape's MoE region of that name.
+    MoeRegionMismatch {
+        step: usize,
+        region: Region,
+        span: ArenaSpan,
+        tape: ArenaSpan,
+    },
+    /// The `step`-th step is not a MoE step (nor the `SiluMul` over the MoE gate and up rows) and
+    /// reads or writes the MoE scratch.
+    MoeScratchTouched { step: usize, span: ArenaSpan },
 }
 
 impl std::fmt::Display for TapeError {
@@ -668,6 +896,54 @@ impl std::fmt::Display for TapeError {
                  {num_k_heads} key heads of {head_k}, conv kernel {conv_kernel}) is not one the \
                  CUDA GDN kernels take"
             ),
+            Self::MoeGeometry => write!(
+                f,
+                "the tape's MoE geometry is one the CUDA MoE kernels do not take, or its tiles or \
+                 sortedness are not its bucket's"
+            ),
+            Self::MoeRegionOutside {
+                region,
+                span,
+                total,
+            } => {
+                let (bytes, offset) = at(span);
+                write!(
+                    f,
+                    "{region} ({bytes} bytes at {offset}) is misaligned, reaches past the \
+                     {total}-byte arena, or overlaps another region"
+                )
+            }
+            Self::MoeRegionShape { region, span, want } => write!(
+                f,
+                "{region} is {} bytes; its geometry sizes it to {want}",
+                span.bytes
+            ),
+            Self::MoeStepGeometry { step } => write!(
+                f,
+                "step {step} is a MoE step whose geometry is not the tape's MoE scratch's, or the \
+                 tape has none"
+            ),
+            Self::MoeRegionMismatch {
+                step,
+                region,
+                span,
+                tape,
+            } => {
+                let ((bytes, offset), (tb, to)) = (at(span), at(tape));
+                write!(
+                    f,
+                    "step {step} uses {region} as {bytes} bytes at {offset}; the tape's is {tb} \
+                     bytes at {to}"
+                )
+            }
+            Self::MoeScratchTouched { step, span } => {
+                let (bytes, offset) = at(span);
+                write!(
+                    f,
+                    "step {step} is not a MoE step and touches {bytes} bytes at {offset} of the \
+                     MoE scratch"
+                )
+            }
         }
     }
 }
@@ -749,6 +1025,7 @@ impl CudaTape {
             regions.push((Region::TokenIds, span));
         }
         let scratch = self.gdn_regions(total, &mut regions)?;
+        let moe = self.moe_regions(total, &regions)?;
         for (step, s) in self.steps.iter().enumerate() {
             let e = s.extents().ok_or(TapeError::StepOverflow { step })?;
             let reads = e.reads.iter().flatten();
@@ -805,6 +1082,9 @@ impl CudaTape {
                         tape: Some(scratch),
                     });
                 }
+            }
+            if let Some(moe) = moe {
+                self.check_moe_scratch(step, s, &e, moe)?;
             }
             self.check_step_operands(step, s)?;
             if let Some(layer) = e.gdn {
@@ -1137,6 +1417,12 @@ impl CudaTape {
                 Ok(())
             }
             CudaStep::Gemv(_) => self.one_row(step, s),
+            CudaStep::RouterLogits(_)
+            | CudaStep::MoeRoute(_)
+            | CudaStep::ExpertSort(_)
+            | CudaStep::ExpertGemm(_)
+            | CudaStep::ExpertGemv(_)
+            | CudaStep::ExpertCombine(_) => self.check_moe_step(step, s),
             CudaStep::Embed(_)
             | CudaStep::Gemm(_)
             | CudaStep::GemmNarrow(_)
@@ -1144,7 +1430,267 @@ impl CudaTape {
             | CudaStep::Add(_)
             | CudaStep::SiluMul(_)
             | CudaStep::GateSplit(_)
-            | CudaStep::GateApply(_) => Ok(()),
+            | CudaStep::GateApply(_)
+            | CudaStep::GateScale(_) => Ok(()),
+        }
+    }
+
+    /// The MoE scratch, when the tape has one: its geometry one the kernels take and its bucket's
+    /// (`tile_rows` [`CUDA_EXPERT_TILE_ROWS`], `max_tiles` and sortedness the bucket's pairs'),
+    /// each region aligned, inside the arena, after the previous one, sized by the geometry
+    /// ([`moe_region_bytes`]), and overlapping no region the forward fills. Returns the scratch's
+    /// span.
+    fn moe_regions(
+        &self,
+        total: u64,
+        regions: &[(Region, ArenaSpan)],
+    ) -> Result<Option<ArenaSpan>, TapeError> {
+        let Some(moe) = self.moe else {
+            return Ok(None);
+        };
+        let sorted = self.bucket_m.checked_mul(moe.top_k) >= Some(crate::op_abi::CUDA_SORTED_PAIRS);
+        let tiles = moe_tiles(self.bucket_m, moe.experts, moe.top_k).map(|(_, t, _)| t);
+        let geometry = (moe.experts, moe.top_k, moe.hidden, moe.inter);
+        if moe.experts == 0
+            || moe.top_k == 0
+            || moe.top_k > moe.experts
+            || moe.tile_rows != CUDA_EXPERT_TILE_ROWS
+            || moe.sort.is_some() != sorted
+            || Some(moe.max_tiles) != if sorted { tiles } else { Some(0) }
+        {
+            return Err(TapeError::MoeGeometry);
+        }
+        let want =
+            moe_region_bytes(self.bucket_m, geometry, sorted).ok_or(TapeError::MoeGeometry)?;
+        let mut next = 0u64;
+        for (&(region, span), want) in moe.regions().iter().zip(want) {
+            let outside = TapeError::MoeRegionOutside {
+                region,
+                span,
+                total,
+            };
+            if !(span.offset.0.is_multiple_of(CUDA_ARENA_ALIGN) && inside(span, total))
+                || span.offset.0 < next
+            {
+                return Err(outside);
+            }
+            if regions.iter().any(|&(_, r)| overlap(r, span)) {
+                return Err(outside);
+            }
+            if span.bytes != want {
+                return Err(TapeError::MoeRegionShape { region, span, want });
+            }
+            next = span.offset.0 + span.bytes;
+        }
+        Ok(Some(moe.span()))
+    }
+
+    /// No step but a MoE step reads or writes the MoE scratch, except the `SiluMul` over its gate
+    /// and up rows into its activation rows; and no colour lies inside it.
+    fn check_moe_scratch(
+        &self,
+        step: usize,
+        s: &CudaStep,
+        e: &crate::step::StepExtents,
+        scratch: ArenaSpan,
+    ) -> Result<(), TapeError> {
+        let moe_step = matches!(
+            s,
+            CudaStep::RouterLogits(_)
+                | CudaStep::MoeRoute(_)
+                | CudaStep::ExpertSort(_)
+                | CudaStep::ExpertGemm(_)
+                | CudaStep::ExpertGemv(_)
+                | CudaStep::ExpertCombine(_)
+        );
+        if moe_step {
+            return Ok(());
+        }
+        let writes = [Some(e.writes), e.second_write];
+        let touched = (e.reads.iter().flatten())
+            .chain(writes.iter().flatten())
+            .find(|&&span| overlap(span, scratch));
+        let Some(&span) = touched else {
+            return Ok(());
+        };
+        if let (CudaStep::SiluMul(SiluMulBf16 { gate, up, out, .. }), Some(moe)) = (s, self.moe) {
+            let (g, u, a) = (e.reads[0], e.reads[1], e.writes);
+            if (*gate, *up, *out) == (moe.gate.offset, moe.up.offset, moe.act.offset)
+                && g == Some(moe.gate)
+                && u == Some(moe.up)
+                && a == moe.act
+            {
+                return Ok(());
+            }
+            return Err(TapeError::MoeRegionMismatch {
+                step,
+                region: Region::MoeAct,
+                span: a,
+                tape: moe.act,
+            });
+        }
+        Err(TapeError::MoeScratchTouched { step, span })
+    }
+
+    /// A MoE step's geometry is the tape's MoE geometry, and every region it names is the tape's
+    /// region of that name, whole. Its weight's bytes are checked with every other step's.
+    fn check_moe_step(&self, step: usize, s: &CudaStep) -> Result<(), TapeError> {
+        let geometry = TapeError::MoeStepGeometry { step };
+        let moe = self.moe.ok_or(geometry)?;
+        let rows = moe.expert_rows(self.bucket_m);
+        let want = |region: Region, at: ArenaOffset, tape: ArenaSpan| {
+            if at == tape.offset {
+                Ok(())
+            } else {
+                Err(TapeError::MoeRegionMismatch {
+                    step,
+                    region,
+                    span: ArenaSpan {
+                        offset: at,
+                        bytes: tape.bytes,
+                    },
+                    tape,
+                })
+            }
+        };
+        let same = |e: u32, h: u32, i: u32| (e, h, i) == (moe.experts, moe.hidden, moe.inter);
+        match *s {
+            CudaStep::RouterLogits(RouterLogitsBf16 {
+                logits,
+                m,
+                experts,
+                hidden,
+                inter,
+                ..
+            }) => {
+                if m != self.bucket_m || !same(experts, hidden, inter) {
+                    return Err(geometry);
+                }
+                want(Region::MoeLogits, logits, moe.logits)
+            }
+            CudaStep::MoeRoute(MoeRouteBf16 {
+                logits,
+                topk_idx,
+                scores,
+                m,
+                experts,
+                top_k,
+                ..
+            }) => {
+                if (m, experts, top_k) != (self.bucket_m, moe.experts, moe.top_k) {
+                    return Err(geometry);
+                }
+                want(Region::MoeLogits, logits, moe.logits)?;
+                want(Region::MoeTopKIdx, topk_idx, moe.topk_idx)?;
+                want(Region::MoeScores, scores, moe.scores)
+            }
+            CudaStep::ExpertSort(ExpertSortBf16 {
+                topk_idx,
+                chunk_hist,
+                counts,
+                offsets,
+                tile_expert,
+                pos,
+                rows: sorted_rows,
+                m,
+                experts,
+                top_k,
+                hidden,
+                max_tiles,
+                ..
+            }) => {
+                let sort = moe.sort.ok_or(geometry)?;
+                if (m, experts, top_k, hidden, max_tiles)
+                    != (
+                        self.bucket_m,
+                        moe.experts,
+                        moe.top_k,
+                        moe.hidden,
+                        moe.max_tiles,
+                    )
+                {
+                    return Err(geometry);
+                }
+                want(Region::MoeTopKIdx, topk_idx, moe.topk_idx)?;
+                want(Region::MoeChunkHist, chunk_hist, sort.chunk_hist)?;
+                want(Region::MoeCounts, counts, sort.counts)?;
+                want(Region::MoeOffsets, offsets, sort.offsets)?;
+                want(Region::MoeTileExpert, tile_expert, sort.tile_expert)?;
+                want(Region::MoePos, pos, sort.pos)?;
+                want(Region::MoeRows, sorted_rows, sort.rows)
+            }
+            CudaStep::ExpertGemm(
+                g @ ExpertGemmBf16 {
+                    a,
+                    offsets,
+                    tile_expert,
+                    c,
+                    max_tiles,
+                    experts,
+                    hidden,
+                    inter,
+                    ..
+                },
+            ) => {
+                let sort = moe.sort.ok_or(geometry)?;
+                if max_tiles != moe.max_tiles || !same(experts, hidden, inter) {
+                    return Err(geometry);
+                }
+                want(Region::MoeOffsets, offsets, sort.offsets)?;
+                want(Region::MoeTileExpert, tile_expert, sort.tile_expert)?;
+                let (input, output) = moe.projection_regions(g.proj, Some(sort.rows));
+                want(input.0, a, input.1)?;
+                want(output.0, c, output.1)
+            }
+            CudaStep::ExpertGemv(
+                g @ ExpertGemvBf16 {
+                    a,
+                    topk_idx,
+                    c,
+                    m,
+                    top_k,
+                    experts,
+                    hidden,
+                    inter,
+                    ..
+                },
+            ) => {
+                if moe.sort.is_some()
+                    || (m, top_k) != (self.bucket_m, moe.top_k)
+                    || !same(experts, hidden, inter)
+                {
+                    return Err(geometry);
+                }
+                want(Region::MoeTopKIdx, topk_idx, moe.topk_idx)?;
+                let (input, output) = moe.projection_regions(g.proj, None);
+                // The gate and up read the token rows, an arena colour the step's extents check.
+                if g.proj.reads_pairs() {
+                    want(input.0, a, input.1)?;
+                }
+                want(output.0, c, output.1)
+            }
+            CudaStep::ExpertCombine(ExpertCombineBf16 {
+                down,
+                pos,
+                scores,
+                m,
+                top_k,
+                hidden,
+                down_rows,
+                ..
+            }) => {
+                if (m, top_k, hidden, down_rows) != (self.bucket_m, moe.top_k, moe.hidden, rows) {
+                    return Err(geometry);
+                }
+                want(Region::MoeDown, down, moe.down)?;
+                want(Region::MoeScores, scores, moe.scores)?;
+                match (pos, moe.sort) {
+                    (Some(p), Some(sort)) => want(Region::MoePos, p, sort.pos),
+                    (None, None) => Ok(()),
+                    _ => Err(geometry),
+                }
+            }
+            _ => Ok(()),
         }
     }
 
@@ -1182,7 +1728,7 @@ mod tests {
     use super::*;
     use crate::step::{
         AddBf16, AttnPrefillBf16, CUDA_MAX_BLOCKS_PER_SEQ, GateSplitBf16, GatedDeltaNetBf16,
-        GemmBf16, KvUse, RmsNormBf16, RopeAppendBf16, RopeBf16, WeightRead,
+        GemmBf16, KvUse, MoeRouteBf16, RmsNormBf16, RopeAppendBf16, RopeBf16, WeightRead,
     };
 
     const fn span(offset: u64, bytes: u64) -> ArenaSpan {
@@ -1230,6 +1776,7 @@ mod tests {
         rotary: None,
         kv: None,
         gdn: None,
+        moe: None,
     };
 
     /// `GOOD` with its steps replaced by `step` alone.
@@ -2114,6 +2661,7 @@ mod tests {
             rotary: None,
             kv: None,
             gdn,
+            moe: None,
         }
     }
 
@@ -2560,6 +3108,25 @@ mod tests {
                 head_v: 128,
                 conv_kernel: 4,
             },
+            TapeError::MoeGeometry,
+            TapeError::MoeRegionOutside {
+                region: Region::MoeRows,
+                span: s,
+                total: 8,
+            },
+            TapeError::MoeRegionShape {
+                region: Region::MoeGate,
+                span: s,
+                want: 4,
+            },
+            TapeError::MoeStepGeometry { step: 1 },
+            TapeError::MoeRegionMismatch {
+                step: 1,
+                region: Region::MoePos,
+                span: s,
+                tape: s,
+            },
+            TapeError::MoeScratchTouched { step: 1, span: s },
         ];
         for e in &all {
             match e {
@@ -2596,7 +3163,13 @@ mod tests {
                 | TapeError::GdnLayer { .. }
                 | TapeError::GdnRegionMismatch { .. }
                 | TapeError::GdnStepGeometry { .. }
-                | TapeError::GdnGeometry { .. } => {}
+                | TapeError::GdnGeometry { .. }
+                | TapeError::MoeGeometry
+                | TapeError::MoeRegionOutside { .. }
+                | TapeError::MoeRegionShape { .. }
+                | TapeError::MoeStepGeometry { .. }
+                | TapeError::MoeRegionMismatch { .. }
+                | TapeError::MoeScratchTouched { .. } => {}
             }
         }
         all
@@ -2618,6 +3191,19 @@ mod tests {
             Region::Sequence,
             Region::GdnSequence,
             Region::GdnScratch,
+            Region::MoeLogits,
+            Region::MoeTopKIdx,
+            Region::MoeScores,
+            Region::MoeChunkHist,
+            Region::MoeCounts,
+            Region::MoeOffsets,
+            Region::MoeTileExpert,
+            Region::MoePos,
+            Region::MoeRows,
+            Region::MoeGate,
+            Region::MoeUp,
+            Region::MoeAct,
+            Region::MoeDown,
         ] {
             assert!(!region.to_string().contains("  "), "{region:?}");
         }
@@ -2673,6 +3259,7 @@ mod tests {
         rotary: None,
         kv: None,
         gdn: None,
+        moe: None,
     };
 
     /// A one-row GEMV tape validates; a GEMV of more than one row, or one in a bucket of more
@@ -2728,5 +3315,198 @@ mod tests {
         assert_eq!(e.reads[1], Some(span(KV_TABLE, 512)), "the block table");
         assert_eq!(e.reads[2], Some(span(KV_SEQ, 8)), "the sequence");
         assert_eq!(e.writes, span(786432, 1024), "one row of 2 · 256 bf16");
+    }
+
+    // ── The MoE scratch's refusals ─────────────────────────────────
+
+    /// A gathered MoE scratch (`bucket_m` 1, 4 experts, top-2, hidden 64, inter 32) after two
+    /// colours, `x [1, 64]` at 0 and `y [1, 64]` at 256: logits 8 bytes at 512, the picks and
+    /// scores 8 each at 768 and 1024, gate, up and act 128 each at 1280, 1536 and 1792, down 256
+    /// at 2048.
+    const MOE: MoeTape = MoeTape {
+        experts: 4,
+        top_k: 2,
+        hidden: 64,
+        inter: 32,
+        tile_rows: CUDA_EXPERT_TILE_ROWS,
+        max_tiles: 0,
+        logits: span(512, 8),
+        topk_idx: span(768, 8),
+        scores: span(1024, 8),
+        sort: None,
+        gate: span(1280, 128),
+        up: span(1536, 128),
+        act: span(1792, 128),
+        down: span(2048, 256),
+    };
+    const MOE_TOTAL: u64 = 2304;
+
+    /// The routing over [`MOE`]'s regions.
+    const MOE_ROUTE: MoeRouteBf16 = MoeRouteBf16 {
+        logits: ArenaOffset(512),
+        topk_idx: ArenaOffset(768),
+        scores: ArenaOffset(1024),
+        m: 1,
+        experts: 4,
+        top_k: 2,
+        renorm: true,
+    };
+
+    fn moe_tape(moe: Option<MoeTape>, steps: &[CudaStep]) -> CudaTape {
+        CudaTape {
+            bucket_m: 1,
+            arena: ArenaLayout {
+                colour_bytes: &[128, 128],
+                colour_offsets: &[0, 256],
+                total_bytes: MOE_TOTAL,
+            },
+            input: TapeInput::Hidden(span(0, 128)),
+            result: span(256, 128),
+            weight_bytes: &[],
+            steps: Box::leak(steps.to_vec().into_boxed_slice()),
+            rotary: None,
+            kv: None,
+            gdn: None,
+            moe,
+        }
+    }
+
+    #[test]
+    fn a_moe_tape_validates() {
+        let t = moe_tape(Some(MOE), &[CudaStep::MoeRoute(MOE_ROUTE)]);
+        assert_eq!(t.validate(), Ok(()));
+    }
+
+    #[test]
+    fn moe_geometry() {
+        for moe in [
+            MoeTape {
+                tile_rows: 64,
+                ..MOE
+            },
+            MoeTape { top_k: 5, ..MOE },
+            MoeTape {
+                max_tiles: 1,
+                ..MOE
+            },
+        ] {
+            assert_eq!(
+                moe_tape(Some(moe), &[]).validate(),
+                Err(TapeError::MoeGeometry),
+                "{moe:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn moe_region_outside() {
+        for (moe, region, at) in [
+            (
+                MoeTape {
+                    logits: span(640, 8),
+                    ..MOE
+                },
+                Region::MoeLogits,
+                span(640, 8),
+            ),
+            (
+                MoeTape {
+                    down: span(2304, 256),
+                    ..MOE
+                },
+                Region::MoeDown,
+                span(2304, 256),
+            ),
+            // Before the previous region's end: the picks over the logits.
+            (
+                MoeTape {
+                    topk_idx: span(512, 8),
+                    ..MOE
+                },
+                Region::MoeTopKIdx,
+                span(512, 8),
+            ),
+        ] {
+            let t = moe_tape(Some(moe), &[]);
+            assert_eq!(
+                t.validate(),
+                Err(TapeError::MoeRegionOutside {
+                    region,
+                    span: at,
+                    total: MOE_TOTAL
+                }),
+                "{region}"
+            );
+        }
+    }
+
+    #[test]
+    fn moe_region_shape() {
+        let t = moe_tape(
+            Some(MoeTape {
+                scores: span(1024, 16),
+                ..MOE
+            }),
+            &[],
+        );
+        assert_eq!(
+            t.validate(),
+            Err(TapeError::MoeRegionShape {
+                region: Region::MoeScores,
+                span: span(1024, 16),
+                want: 8
+            })
+        );
+    }
+
+    #[test]
+    fn moe_step_geometry() {
+        let other_k = CudaStep::MoeRoute(MoeRouteBf16 {
+            top_k: 3,
+            ..MOE_ROUTE
+        });
+        assert_eq!(
+            moe_tape(Some(MOE), &[other_k]).validate(),
+            Err(TapeError::MoeStepGeometry { step: 0 })
+        );
+        assert_eq!(
+            moe_tape(None, &[CudaStep::MoeRoute(MOE_ROUTE)]).validate(),
+            Err(TapeError::MoeStepGeometry { step: 0 })
+        );
+    }
+
+    #[test]
+    fn moe_region_mismatch() {
+        let elsewhere = CudaStep::MoeRoute(MoeRouteBf16 {
+            logits: ArenaOffset(1280),
+            ..MOE_ROUTE
+        });
+        assert_eq!(
+            moe_tape(Some(MOE), &[elsewhere]).validate(),
+            Err(TapeError::MoeRegionMismatch {
+                step: 0,
+                region: Region::MoeLogits,
+                span: span(1280, 8),
+                tape: MOE.logits
+            })
+        );
+    }
+
+    #[test]
+    fn moe_scratch_touched() {
+        let add = CudaStep::Add(AddBf16 {
+            a: ArenaOffset(2048),
+            b: ArenaOffset(0),
+            out: ArenaOffset(256),
+            rows: 1,
+            cols: 64,
+        });
+        assert_eq!(
+            moe_tape(Some(MOE), &[add]).validate(),
+            Err(TapeError::MoeScratchTouched {
+                step: 0,
+                span: span(2048, 128)
+            })
+        );
     }
 }

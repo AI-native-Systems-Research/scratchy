@@ -2163,6 +2163,7 @@ fn a_gdn_op_is_checked_against_the_scratchs_geometry_not_its_bytes() {
                 scratch: gdn.scratch,
                 geometry,
             }),
+            moe: None,
         };
         lower_step(&cx, &computes[5], &computes)
     };

@@ -13,7 +13,7 @@ use std::path::Path;
 
 use half::bf16;
 use safetensors::tensor::{Dtype, TensorView};
-use scratchy_target_cuda::step::gdn_bundle;
+use scratchy_target_cuda::step::{gdn_bundle, moe_bundle};
 use scratchy_target_cuda::tape::{ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, TapeInput};
 use scratchy_target_cuda::weights::{
     CudaWeight, HostStaging, LoadError, check, open_checkpoint, stage,
@@ -150,6 +150,7 @@ fn tape(weight_bytes: &'static [u64]) -> CudaTape {
         rotary: None,
         kv: None,
         gdn: None,
+        moe: None,
     }
 }
 
@@ -252,6 +253,126 @@ fn a_gdn_bundle_is_packed_exactly() {
             written.iter().any(|w| !w),
             "the synthetic bundle has gaps to check"
         );
+    }
+}
+
+/// The MoE geometry of the synthetic layer: 4 experts, hidden 64, expert width 32.
+const MOE_E: u32 = 4;
+const MOE_H: u32 = 64;
+const MOE_I: u32 = 32;
+
+/// The synthetic MoE layer's three bf16 tensors under `{root}.layers.0.mlp`, as (name after the
+/// root, shape, bytes): the router, the fused gate and up, and the down.
+fn moe_tensors() -> Vec<(&'static str, Vec<usize>, Vec<u8>)> {
+    let (e, h, i) = (MOE_E as usize, MOE_H as usize, MOE_I as usize);
+    let bf16s = |n: usize, seed: u16| -> Vec<u8> {
+        // Finite bf16 bit patterns that change with the element and differ between the tensors,
+        // so a misplaced or swapped region shows.
+        (0..n)
+            .flat_map(|k| (seed.wrapping_add(k as u16) & 0x3FFF | 0x0400).to_le_bytes())
+            .collect()
+    };
+    vec![
+        ("layers.0.mlp.gate.weight", vec![e, h], bf16s(e * h, 0x1000)),
+        (
+            "layers.0.mlp.experts.gate_up_proj",
+            vec![e, 2 * i, h],
+            bf16s(e * 2 * i * h, 0x2000),
+        ),
+        (
+            "layers.0.mlp.experts.down_proj",
+            vec![e, h, i],
+            bf16s(e * h * i, 0x0300),
+        ),
+    ]
+}
+
+/// The MoE layer's checkpoint in a fresh `dir`, every tensor under `root`.
+fn moe_checkpoint_dir(name: &str, root: &str) -> std::path::PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("weight_table_{name}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("make the checkpoint dir");
+    let all = moe_tensors();
+    let views: Vec<(String, TensorView<'_>)> = (all.iter())
+        .map(|(name, shape, bytes)| {
+            let view = TensorView::new(Dtype::BF16, shape.clone(), bytes).expect("a tensor view");
+            (format!("{root}.{name}"), view)
+        })
+        .collect();
+    let bytes = safetensors::serialize(views, None).expect("serialize the checkpoint");
+    std::fs::write(dir.join("model.safetensors"), bytes).expect("write the checkpoint");
+    dir
+}
+
+const MOE_BUNDLE: CudaWeight = CudaWeight::MoeBundle {
+    router: "language_model.model.layers.0.mlp.gate.weight",
+    gate_up: "language_model.model.layers.0.mlp.experts.gate_up_proj",
+    down: "language_model.model.layers.0.mlp.experts.down_proj",
+    experts: MOE_E,
+    hidden: MOE_H,
+    inter: MOE_I,
+};
+
+/// The MoE bundle (E = 4, H = 64, I = 32) staged byte for byte as the router, the fused gate and
+/// up, and the down back to back at `moe_bundle`'s offsets, in both orderings; and the router-only
+/// read, the router tensor staged on its own, is exactly the bundle's first `E·H` bf16, the bytes
+/// the router GEMM reads at the bundle's byte 0.
+#[test]
+fn a_moe_bundle_is_packed_exactly() {
+    let layout = moe_bundle(MOE_E, MOE_H, MOE_I).expect("the bundle fits");
+    let (e, h, i) = (u64::from(MOE_E), u64::from(MOE_H), u64::from(MOE_I));
+    assert_eq!(
+        (layout.router, layout.gate_up, layout.down, layout.bytes),
+        (
+            0,
+            e * h * 2,
+            e * h * 2 + e * 2 * i * h * 2,
+            e * h * 2 * (1 + 3 * i)
+        ),
+        "the synthetic bundle's regions"
+    );
+    assert_eq!(MOE_BUNDLE.packed_bytes(), Some(layout.bytes));
+    assert_eq!(
+        MOE_BUNDLE.lead(),
+        "language_model.model.layers.0.mlp.gate.weight"
+    );
+    let want: Vec<u8> = (moe_tensors().into_iter()).flat_map(|(.., b)| b).collect();
+    assert_eq!(want.len() as u64, layout.bytes, "the concatenation's bytes");
+    let router_only = CudaWeight::Bf16 {
+        tensor: "language_model.model.layers.0.mlp.gate.weight",
+        shape: &[MOE_E as u64, MOE_H as u64],
+    };
+    for root in ORDERINGS {
+        let dir = moe_checkpoint_dir(&format!("moe_bundle_{root}"), root);
+        let mut w = open_checkpoint(&dir).expect("open");
+        let staged = stage(0, &MOE_BUNDLE, &mut w).expect("stage the bundle");
+        assert_eq!(
+            staged.len() as u64,
+            layout.bytes,
+            "{root}: the bundle's bytes"
+        );
+        for (part, at, end) in [
+            ("router", layout.router, layout.gate_up),
+            ("gate_up", layout.gate_up, layout.down),
+            ("down", layout.down, layout.bytes),
+        ] {
+            let (at, end) = (at as usize, end as usize);
+            assert!(
+                staged[at..end] == want[at..end],
+                "{root}: the {part} region's bytes"
+            );
+        }
+        let mut w = open_checkpoint(&dir).expect("open");
+        let router = stage(0, &router_only, &mut w).expect("stage the router alone");
+        assert_eq!(
+            router.as_slice(),
+            &staged[..layout.gate_up as usize],
+            "{root}: the router-only read is the bundle's first region"
+        );
+        let table = [Some(MOE_BUNDLE)];
+        let bytes: &'static [u64] = Box::leak(Box::new([layout.bytes]));
+        let w = open_checkpoint(&dir).expect("open");
+        check(&table, &[tape(bytes)], &w).unwrap_or_else(|e| panic!("{root}: {e}"));
     }
 }
 

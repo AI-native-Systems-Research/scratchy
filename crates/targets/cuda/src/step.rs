@@ -62,6 +62,29 @@ pub enum CudaStep {
     /// `SubOp::GatedDeltaNet`: four stream-ordered launches, `kernels/gdn_conv1d.cu`,
     /// `kernels/gdn_gating.cu`, `kernels/gdn_scan.cu` then `kernels/gdn_rms_norm_gated.cu`.
     GatedDeltaNet(GatedDeltaNetBf16),
+    /// A MoE block's router, `[m, experts]` logits into the MoE scratch, lowered from
+    /// `SubOp::RouterLogits`: the tiled GEMM or the GEMV (`kernels/gemm_bf16.cu`,
+    /// `kernels/gemv_bf16.cu`, chosen at expansion) over the router at byte 0 of the bundle.
+    RouterLogits(RouterLogitsBf16),
+    /// A MoE block's routing, lowered from the `MoeRoute` fold driven by `SubOp::RouteTopK`:
+    /// softmax, top-k and renorm in one launch (`kernels/moe_route_bf16.cu`).
+    MoeRoute(MoeRouteBf16),
+    /// The pairs sorted by expert, lowered from `SubOp::ExpertSort` at
+    /// `op_abi::CUDA_SORTED_PAIRS` pairs or more: three launches of a stable counting sort
+    /// (`kernels/moe_sort.cu`).
+    ExpertSort(ExpertSortBf16),
+    /// One projection of every sorted pair, lowered from `SubOp::ExpertMatmul` of a sorted bucket:
+    /// one grouped GEMM over the expert-padded tiles (`kernels/expert_gemm_bf16.cu`).
+    ExpertGemm(ExpertGemmBf16),
+    /// One projection of every pair, each from its own token row, lowered from
+    /// `SubOp::ExpertMatmul` of a gathered bucket (`kernels/expert_gemv_bf16.cu`).
+    ExpertGemv(ExpertGemvBf16),
+    /// Each token's pair rows summed by its routing weights, lowered from `SubOp::ExpertCombine`
+    /// (`kernels/moe_combine_bf16.cu`).
+    ExpertCombine(ExpertCombineBf16),
+    /// `routed + shared · sigmoid(g)`, `g` broadcast across the row, lowered from
+    /// `SubOp::GateScale` (`kernels/gate_scale_bf16.cu`).
+    GateScale(GateScaleBf16),
 }
 
 /// The embed's `hidden` is a non-zero multiple of this (`kernels/embed_bf16.cu`: one 16-byte
@@ -107,9 +130,18 @@ pub struct GemmBf16 {
 /// The narrow GEMM's largest `n`: all of `B`'s rows are one 64-row ThunderKittens tile, and every
 /// column of `C` one 64-column output tile (`kernels/gemm_narrow_bf16.cu`).
 pub const GEMM_NARROW_BF16_MAX_N: u32 = 64;
-/// The narrow GEMM's `n` and `k` are non-zero multiples of this: 8 bf16 is 16 bytes, so every row
-/// stride of `A`, `B` and `C` is a multiple of 16 bytes, as their TMA tensor maps need.
+/// The narrow GEMM's `k`, and its `n` but for [`GEMM_NARROW_BF16_ONE`], are non-zero multiples of
+/// this: 8 bf16 is 16 bytes, so every row stride of `A`, `B` and `C` is a multiple of 16 bytes, as
+/// their TMA tensor maps need.
 pub const GEMM_NARROW_BF16_MULTIPLE: u32 = 8;
+/// The one `n` the narrow GEMM takes off [`GEMM_NARROW_BF16_MULTIPLE`]: a one-column projection
+/// (a shared expert's gate), stored one bf16 per row.
+pub const GEMM_NARROW_BF16_ONE: u32 = 1;
+/// At `n` = [`GEMM_NARROW_BF16_ONE`] the narrow GEMM's `k` is a non-zero multiple of this: its
+/// warp-vector kernel walks each row in chunks of one naive `rv_fl<256>`
+/// (`kernels/gemm_narrow_bf16.cu`). Checked by the launcher only; qwen3-5-moe's shared expert gate
+/// has `k` = 2048.
+pub const GEMM_NARROW_BF16_ONE_K_MULTIPLE: u32 = 256;
 
 /// The GEMV's `k` is a non-zero multiple of this: 8 bf16 is 16 bytes, so every row stride of `a`
 /// and `B` is a multiple of 16 bytes, as their TMA tensor maps need (`kernels/gemv_bf16.cu`). `n`
@@ -579,6 +611,252 @@ impl GatedDeltaNetBf16 {
     }
 }
 
+/// Which kernel a GEMM-shaped MoE step runs, chosen at expansion by the GEMM's shape rule: the
+/// tiled GEMM for a bucket of rows, the GEMV for one row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum MatmulKernel {
+    Tiled,
+    Gemv,
+}
+
+/// `logits[m, experts] = x[m, hidden] · routerᵀ`, the router `[experts, hidden]` bf16 at byte 0
+/// of the MoE bundle `bundle` ([`moe_bundle`]), into the tape's MoE logits region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct RouterLogitsBf16 {
+    pub x: ArenaOffset,
+    pub bundle: WeightIx,
+    pub logits: ArenaOffset,
+    pub m: u32,
+    pub experts: u32,
+    pub hidden: u32,
+    /// The bundle's expert width, so every step naming the bundle states its geometry.
+    pub inter: u32,
+    pub kernel: MatmulKernel,
+}
+
+/// The one expert count the routing kernel takes: one warp per token row, 8 logits per lane
+/// (`kernels/moe_route_bf16.cu`).
+pub const MOE_ROUTE_EXPERTS: u32 = 256;
+/// The routing kernel's largest top-k: one pick per round of its warp reductions
+/// (`kernels/moe_route_bf16.cu`).
+pub const MOE_ROUTE_MAX_TOP_K: u32 = 32;
+/// The combine's `hidden` is a non-zero multiple of this: one naive `rv_fl<256>` per column chunk
+/// (`kernels/moe_combine_bf16.cu`). Checked by the launcher only; qwen3-5-moe's `hidden` is 2048.
+pub const MOE_COMBINE_BF16_CHUNK: u32 = 256;
+
+/// The routing of `m` tokens over `experts` (one warp per token row, `experts` = 256): `p =
+/// softmax(logits)` in f32, its `top_k` largest picked (equal probabilities by the higher expert
+/// index; a NaN lowest), stored ascending (slot `top_k − 1` the best) as i32 into `topk_idx`, and
+/// their probabilities, divided by their sum when `renorm`, as f32 into `scores`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct MoeRouteBf16 {
+    pub logits: ArenaOffset,
+    pub topk_idx: ArenaOffset,
+    pub scores: ArenaOffset,
+    pub m: u32,
+    pub experts: u32,
+    pub top_k: u32,
+    pub renorm: bool,
+}
+
+/// The `P = m · top_k` (token, pick) pairs sorted by expert, stably: every live tile of the
+/// sorted rows written (a pair's token row, a padding row `+0.0`), and the index regions the
+/// grouped GEMM and the combine read. The regions are the tape's [`crate::tape::MoeTape`]'s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ExpertSortBf16 {
+    /// `[m, hidden]` bf16, the token rows.
+    pub x: ArenaOffset,
+    pub topk_idx: ArenaOffset,
+    pub chunk_hist: ArenaOffset,
+    pub counts: ArenaOffset,
+    pub offsets: ArenaOffset,
+    pub tile_expert: ArenaOffset,
+    pub pos: ArenaOffset,
+    pub rows: ArenaOffset,
+    pub m: u32,
+    pub experts: u32,
+    pub top_k: u32,
+    pub hidden: u32,
+    pub max_tiles: u32,
+}
+
+/// Which projection of a MoE bundle an expert step computes; its weights for expert `e` are
+/// `[n, k]` bf16 at [`ExpertProjection::slab`]'s bytes into the bundle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum ExpertProjection {
+    /// `[inter, hidden]`: the first `inter` rows of the expert's fused gate and up.
+    Gate,
+    /// `[inter, hidden]`: the next `inter` rows.
+    Up,
+    /// `[hidden, inter]`.
+    Down,
+}
+
+impl ExpertProjection {
+    /// Whether the gathered expert GEMV reads each pair's own row (the down projection, over the
+    /// activation rows) rather than its token's row (the gate and up, over the token rows).
+    pub const fn reads_pairs(self) -> bool {
+        matches!(self, Self::Down)
+    }
+
+    /// `(n, k)`: the projection's output and input widths.
+    pub const fn n_k(self, hidden: u32, inter: u32) -> (u32, u32) {
+        match self {
+            Self::Gate | Self::Up => (inter, hidden),
+            Self::Down => (hidden, inter),
+        }
+    }
+
+    /// `(part, expert_stride)`: expert `e`'s `[n, k]` starts `part + e · expert_stride` bytes into
+    /// the bundle of `bundle`'s layout. `None` on overflow.
+    pub const fn slab(self, bundle: MoeBundle, hidden: u32, inter: u32) -> Option<(u64, u64)> {
+        let (h, i) = (hidden as u64, inter as u64);
+        let Some(one) = (h * i).checked_mul(CUDA_ACT_BYTES) else {
+            return None;
+        };
+        match self {
+            Self::Gate => Some((bundle.gate_up, 2 * one)),
+            Self::Up => Some((bundle.gate_up + one, 2 * one)),
+            Self::Down => Some((bundle.down, one)),
+        }
+    }
+}
+
+/// `c[128t .. 128t + 128, :] = a[128t .. 128t + 128, :] · B_eᵀ` for every live tile `t` of the
+/// sorted rows, `e = tile_expert[t]`, `B_e` expert `e`'s `[n, k]` of the bundle's `proj`. A tile
+/// at or past `offsets[experts] / 128` is never read or written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ExpertGemmBf16 {
+    pub a: ArenaOffset,
+    pub bundle: WeightIx,
+    pub proj: ExpertProjection,
+    pub offsets: ArenaOffset,
+    pub tile_expert: ArenaOffset,
+    pub c: ArenaOffset,
+    pub max_tiles: u32,
+    pub experts: u32,
+    pub hidden: u32,
+    pub inter: u32,
+}
+
+impl ExpertGemmBf16 {
+    /// `(n, k)` of the projection.
+    pub const fn n_k(&self) -> (u32, u32) {
+        self.proj.n_k(self.hidden, self.inter)
+    }
+}
+
+/// Which row of `a` pair `p = (token t, slot j)` reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum PairRows {
+    /// Its token's row, `a[t]` (the gate and up projections).
+    Token,
+    /// Its own row, `a[p]` (the down projection).
+    Pair,
+}
+
+/// `c[p, :] = a[row(p), :] · B_eᵀ` for each of the `m · top_k` pairs, `e = topk_idx[p]`, `B_e`
+/// expert `e`'s `[n, k]` of the bundle's `proj`; `row(p)` is the pair's token row for the gate and
+/// up projections, its own row for the down ([`PairRows`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ExpertGemvBf16 {
+    pub a: ArenaOffset,
+    pub rows: PairRows,
+    pub bundle: WeightIx,
+    pub proj: ExpertProjection,
+    pub topk_idx: ArenaOffset,
+    pub c: ArenaOffset,
+    pub m: u32,
+    pub top_k: u32,
+    pub experts: u32,
+    pub hidden: u32,
+    pub inter: u32,
+}
+
+impl ExpertGemvBf16 {
+    /// `(n, k)` of the projection.
+    pub const fn n_k(&self) -> (u32, u32) {
+        self.proj.n_k(self.hidden, self.inter)
+    }
+}
+
+/// `out[t, :] = Σ_j scores[t, j] · down[row(t, j), :]` over the `top_k` slots in order, in f32,
+/// rounded once; `row(t, j)` is `pos[t · top_k + j]` when `pos` is given (sorted), else
+/// `t · top_k + j` (gathered).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ExpertCombineBf16 {
+    pub down: ArenaOffset,
+    pub pos: Option<ArenaOffset>,
+    pub scores: ArenaOffset,
+    pub out: ArenaOffset,
+    pub m: u32,
+    pub top_k: u32,
+    pub hidden: u32,
+    /// The down region's rows: `R` sorted, `P` gathered.
+    pub down_rows: u32,
+}
+
+/// The gate scale's `cols` is a non-zero multiple of this (8 bf16 is 16 bytes, so every row stride
+/// is a multiple of 16 bytes, as the ThunderKittens 16-row tile's TMA tensor maps need,
+/// `kernels/gate_scale_bf16.cu`), `rows` non-zero, and `rows · cols` at most `i32::MAX`.
+pub const GATE_SCALE_BF16_COLS: u32 = 8;
+
+/// `out = routed + shared · (1 / (1 + e^(−g)))` over `[rows, cols]`, `g` `[rows, 1]` broadcast
+/// across the row, computed in f32 and rounded once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct GateScaleBf16 {
+    pub routed: ArenaOffset,
+    pub shared: ArenaOffset,
+    pub g: ArenaOffset,
+    pub out: ArenaOffset,
+    pub rows: u32,
+    pub cols: u32,
+}
+
+/// A MoE layer's dense bf16 bundle, its three checkpoint tensors back to back: the byte offsets
+/// of the router `[experts, hidden]`, the fused gate and up `[experts, 2·inter, hidden]` (per
+/// expert the first `inter` rows gate, the next up) and the down `[experts, hidden, inter]`, and
+/// the total.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoeBundle {
+    pub router: u64,
+    pub gate_up: u64,
+    pub down: u64,
+    pub bytes: u64,
+}
+
+/// [`MoeBundle`] for one layer's geometry, or `None` when a byte count overflows `u64`.
+pub const fn moe_bundle(experts: u32, hidden: u32, inter: u32) -> Option<MoeBundle> {
+    let (e, h, i) = (experts as u64, hidden as u64, inter as u64);
+    let Some(gate_up) = (e * h).checked_mul(CUDA_ACT_BYTES) else {
+        return None;
+    };
+    let Some(gu) = (e * 2 * i).checked_mul(h) else {
+        return None;
+    };
+    let Some(gu) = gu.checked_mul(CUDA_ACT_BYTES) else {
+        return None;
+    };
+    let Some(down) = gate_up.checked_add(gu) else {
+        return None;
+    };
+    let Some(d) = (e * h).checked_mul(i) else {
+        return None;
+    };
+    let Some(d) = d.checked_mul(CUDA_ACT_BYTES) else {
+        return None;
+    };
+    let Some(bytes) = down.checked_add(d) else {
+        return None;
+    };
+    Some(MoeBundle {
+        router: 0,
+        gate_up,
+        down,
+        bytes,
+    })
+}
+
 /// How a step uses a layer's paged KV cache.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvUse {
@@ -874,7 +1152,276 @@ impl CudaStep {
                     gdn: Some(layer),
                 })
             }
+            Self::RouterLogits(RouterLogitsBf16 {
+                x,
+                bundle,
+                logits,
+                m,
+                experts,
+                hidden,
+                inter,
+                ..
+            }) => {
+                let (Some(xb), Some(lb), Some(bu)) = (
+                    bf16_bytes(m, hidden),
+                    bf16_bytes(m, experts),
+                    moe_bundle(experts, hidden, inter),
+                ) else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [Some(span(x, xb)), None, None, None],
+                    writes: span(logits, lb),
+                    second_write: None,
+                    weight: Some(WeightRead {
+                        ix: bundle,
+                        bytes: bu.bytes,
+                    }),
+                    kv: None,
+                    gdn: None,
+                })
+            }
+            Self::MoeRoute(MoeRouteBf16 {
+                logits,
+                topk_idx,
+                scores,
+                m,
+                experts,
+                top_k,
+                ..
+            }) => {
+                let (Some(lb), Some(pairs)) = (bf16_bytes(m, experts), m.checked_mul(top_k)) else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [Some(span(logits, lb)), None, None, None],
+                    writes: span(topk_idx, u32_bytes(pairs)),
+                    second_write: Some(span(scores, u32_bytes(pairs))),
+                    weight: None,
+                    kv: None,
+                    gdn: None,
+                })
+            }
+            Self::ExpertSort(s) => {
+                let Some(l) = s.layout() else {
+                    return None;
+                };
+                let Some(xb) = bf16_bytes(s.m, s.hidden) else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [
+                        Some(span(s.x, xb)),
+                        Some(span(s.topk_idx, u32_bytes(l.pairs))),
+                        None,
+                        None,
+                    ],
+                    writes: span(s.rows, l.rows_bytes),
+                    // The index regions, `chunk_hist` to the end of `pos`, one span:
+                    // `MoeTape::validate` checks each region's own offset.
+                    second_write: Some(span(s.chunk_hist, l.index_bytes)),
+                    weight: None,
+                    kv: None,
+                    gdn: None,
+                })
+            }
+            Self::ExpertGemm(g) => {
+                let rows = g.max_tiles as u64 * crate::op_abi::CUDA_EXPERT_TILE_ROWS as u64;
+                let (n, k) = g.n_k();
+                let (Some(ab), Some(cb), Some(bu)) = (
+                    (rows * k as u64).checked_mul(CUDA_ACT_BYTES),
+                    (rows * n as u64).checked_mul(CUDA_ACT_BYTES),
+                    moe_bundle(g.experts, g.hidden, g.inter),
+                ) else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [
+                        Some(span(g.a, ab)),
+                        Some(span(g.offsets, u32_bytes(g.experts + 1))),
+                        Some(span(g.tile_expert, u32_bytes(g.max_tiles))),
+                        None,
+                    ],
+                    writes: span(g.c, cb),
+                    second_write: None,
+                    weight: Some(WeightRead {
+                        ix: g.bundle,
+                        bytes: bu.bytes,
+                    }),
+                    kv: None,
+                    gdn: None,
+                })
+            }
+            Self::ExpertGemv(g) => {
+                let Some(pairs) = g.m.checked_mul(g.top_k) else {
+                    return None;
+                };
+                let a_rows = match g.rows {
+                    PairRows::Token => g.m,
+                    PairRows::Pair => pairs,
+                };
+                let (n, k) = g.n_k();
+                let (Some(ab), Some(cb), Some(bu)) = (
+                    bf16_bytes(a_rows, k),
+                    bf16_bytes(pairs, n),
+                    moe_bundle(g.experts, g.hidden, g.inter),
+                ) else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [
+                        Some(span(g.a, ab)),
+                        Some(span(g.topk_idx, u32_bytes(pairs))),
+                        None,
+                        None,
+                    ],
+                    writes: span(g.c, cb),
+                    second_write: None,
+                    weight: Some(WeightRead {
+                        ix: g.bundle,
+                        bytes: bu.bytes,
+                    }),
+                    kv: None,
+                    gdn: None,
+                })
+            }
+            Self::ExpertCombine(ExpertCombineBf16 {
+                down,
+                pos,
+                scores,
+                out,
+                m,
+                top_k,
+                hidden,
+                down_rows,
+            }) => {
+                let (Some(pairs), Some(db), Some(ob)) = (
+                    m.checked_mul(top_k),
+                    bf16_bytes(down_rows, hidden),
+                    bf16_bytes(m, hidden),
+                ) else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [
+                        Some(span(down, db)),
+                        Some(span(scores, u32_bytes(pairs))),
+                        match pos {
+                            Some(p) => Some(span(p, u32_bytes(pairs))),
+                            None => None,
+                        },
+                        None,
+                    ],
+                    writes: span(out, ob),
+                    second_write: None,
+                    weight: None,
+                    kv: None,
+                    gdn: None,
+                })
+            }
+            Self::GateScale(GateScaleBf16 {
+                routed,
+                shared,
+                g,
+                out,
+                rows,
+                cols,
+            }) => {
+                let (Some(bytes), Some(gb)) = (bf16_bytes(rows, cols), bf16_bytes(rows, 1)) else {
+                    return None;
+                };
+                Some(StepExtents {
+                    reads: [
+                        Some(span(routed, bytes)),
+                        Some(span(shared, bytes)),
+                        Some(span(g, gb)),
+                        None,
+                    ],
+                    writes: span(out, bytes),
+                    second_write: None,
+                    weight: None,
+                    kv: None,
+                    gdn: None,
+                })
+            }
         }
+    }
+}
+
+/// The sort's regions for its geometry: the pairs `P = m · top_k`, the sorted rows' bytes
+/// (`max_tiles · 128` rows of `hidden` bf16), and the index regions' bytes from `chunk_hist` to
+/// the end of `pos`, each region at a multiple of 256: `chunk_hist` `[⌈P/256⌉, experts]` u32,
+/// `counts` `[experts]` u32, `offsets` `[experts + 1]` u32, `tile_expert` `[max_tiles]` i32, `pos`
+/// `[P]` u32, in that order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SortLayout {
+    pub pairs: u32,
+    pub chunk_hist: u64,
+    pub counts: u64,
+    pub offsets: u64,
+    pub tile_expert: u64,
+    pub pos: u64,
+    pub index_bytes: u64,
+    pub rows_bytes: u64,
+}
+
+/// Pairs per `chunk_hist` row: one sort CTA's chunk (`kernels/moe_sort.cu`).
+pub const MOE_SORT_CHUNK: u32 = 256;
+
+/// The byte offsets, from `chunk_hist`, of the sort's index regions for `pairs` pairs over
+/// `experts` experts and `max_tiles` tiles, each 256-aligned, and their total: what
+/// [`SortLayout`] states. `None` on overflow.
+pub const fn sort_index_regions(pairs: u32, experts: u32, max_tiles: u32) -> Option<[u64; 6]> {
+    let chunks = pairs.div_ceil(MOE_SORT_CHUNK) as u64;
+    let Some(counts) = aligned_after(0, chunks * experts as u64 * 4) else {
+        return None;
+    };
+    let Some(offsets) = aligned_after(counts, experts as u64 * 4) else {
+        return None;
+    };
+    let Some(tile_expert) = aligned_after(offsets, (experts as u64 + 1) * 4) else {
+        return None;
+    };
+    let Some(pos) = aligned_after(tile_expert, max_tiles as u64 * 4) else {
+        return None;
+    };
+    let index_bytes = pos + pairs as u64 * 4;
+    Some([0, counts, offsets, tile_expert, pos, index_bytes])
+}
+
+/// The 256-aligned end of `bytes` placed at `at`, or `None` on overflow.
+const fn aligned_after(at: u64, bytes: u64) -> Option<u64> {
+    let Some(end) = at.checked_add(bytes) else {
+        return None;
+    };
+    end.checked_next_multiple_of(GDN_ALIGN)
+}
+
+impl ExpertSortBf16 {
+    /// The sort's region layout ([`SortLayout`]), or `None` on overflow.
+    pub const fn layout(&self) -> Option<SortLayout> {
+        let Some(pairs) = self.m.checked_mul(self.top_k) else {
+            return None;
+        };
+        let Some([chunk_hist, counts, offsets, tile_expert, pos, index_bytes]) =
+            sort_index_regions(pairs, self.experts, self.max_tiles)
+        else {
+            return None;
+        };
+        let rows = self.max_tiles as u64 * crate::op_abi::CUDA_EXPERT_TILE_ROWS as u64;
+        let Some(rows_bytes) = (rows * self.hidden as u64).checked_mul(CUDA_ACT_BYTES) else {
+            return None;
+        };
+        Some(SortLayout {
+            pairs,
+            chunk_hist,
+            counts,
+            offsets,
+            tile_expert,
+            pos,
+            index_bytes,
+            rows_bytes,
+        })
     }
 }
 
@@ -889,6 +1436,9 @@ impl CudaStep {
             | Self::Gemv(GemmBf16 { b, .. }) => Some(b),
             Self::RmsNorm(RmsNormBf16 { gain, .. }) => Some(gain),
             Self::GatedDeltaNet(GatedDeltaNetBf16 { bundle, .. }) => Some(bundle),
+            Self::RouterLogits(RouterLogitsBf16 { bundle, .. }) => Some(bundle),
+            Self::ExpertGemm(ExpertGemmBf16 { bundle, .. })
+            | Self::ExpertGemv(ExpertGemvBf16 { bundle, .. }) => Some(bundle),
             Self::Add(_)
             | Self::SiluMul(_)
             | Self::Rope(_)
@@ -896,7 +1446,11 @@ impl CudaStep {
             | Self::GateApply(_)
             | Self::RopeAppend(_)
             | Self::AttnPrefill(_)
-            | Self::AttnDecode(_) => None,
+            | Self::AttnDecode(_)
+            | Self::MoeRoute(_)
+            | Self::ExpertSort(_)
+            | Self::ExpertCombine(_)
+            | Self::GateScale(_) => None,
         }
     }
 }

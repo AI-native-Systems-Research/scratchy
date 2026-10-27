@@ -249,13 +249,15 @@ fn kv_append_writes_the_mapped_slots_bit_exactly() {
 }
 
 /// The random-input attention cases: `(q_heads, kv_heads, rows, P, L)`.
-const CASES: [(usize, usize, usize, usize, usize); 6] = [
+const CASES: [(usize, usize, usize, usize, usize); 7] = [
     (8, 2, 128, 0, 128),
     (8, 2, 256, 0, 256),
     (8, 2, 128, 300, 128),
     (8, 2, 128, 300, 1),
     (8, 2, 128, 37, 100),
     (16, 4, 256, 64, 256),
+    // Qwen3.6-35B-A3B's attention layers: 16 query heads over 2 kv heads (#857).
+    (16, 2, 256, 64, 256),
 ];
 
 /// The keys and values of a sequence of `tokens`, `[tokens, kv_heads · HD]`, written into fresh
@@ -433,7 +435,7 @@ fn the_mask_and_block_table_probe_is_exact() {
 fn the_gqa_probe_is_exact() {
     let device = h100();
     let mut pass = true;
-    for (qh, kvh) in [(8usize, 2usize), (16, 4)] {
+    for (qh, kvh) in [(8usize, 2usize), (16, 4), (16, 2)] {
         let (rows, p, len) = (128usize, 0usize, 128usize);
         let tokens = p + len;
         let k = vec![0u16; tokens * kvh * HD];
@@ -714,11 +716,12 @@ fn decode_inputs(kv_len: usize, (qh, kvh): (usize, usize), seed: u64) -> [Vec<u1
 /// same output, bit for bit, over the identity table with a clean (zero) pool, and on a repeat.
 /// K and V are read back from the cache, so the reference uses exactly the bits the kernel read.
 /// At qwen3.5-0.8b's heads (8 / 2) and qwen3.5-9b's (16 / 4).
+/// And Qwen3.6-35B-A3B's (16 / 2), a GQA group of 8 (#857).
 #[test]
 fn the_decode_attention_is_within_the_f64_bound() {
     let device = h100();
     let mut pass = true;
-    for (qh, kvh) in [(8usize, 2usize), (16, 4)] {
+    for (qh, kvh) in [(8usize, 2usize), (16, 4), (16, 2)] {
         for (case, &kv_len) in DEC_KV_LENS.iter().enumerate() {
             let seed = 0x0DEC_0000 + case as u64;
             let [q, k, v] = decode_inputs(kv_len, (qh, kvh), seed);
@@ -781,7 +784,7 @@ fn the_decode_attention_is_within_the_f64_bound() {
 fn the_decode_attention_probes_are_exact() {
     let device = h100();
     let mut pass = true;
-    for (qh, kvh) in [(8usize, 2usize), (16, 4)] {
+    for (qh, kvh) in [(8usize, 2usize), (16, 4), (16, 2)] {
         let kv_len = 300usize;
         let k = vec![0u16; kv_len * kvh * HD];
         let v: Vec<u16> = (0..kv_len * kvh * HD)
@@ -894,8 +897,10 @@ fn the_decode_attention_probes_are_exact() {
 /// Test 10: the decode attention against the prefill attention's row for the same query at the
 /// same position over the same cache: the prefill launched with 128 rows, `L = min(kv_len, 128)`
 /// and `P = kv_len − L`, so its row `L − 1` is the query at position `kv_len − 1`. Two different
-/// kernels (the prefill rounds `p` to bf16 before P·V, the decode stays in f32), so no bit
-/// requirement: their difference is within the sum of their two #791 bounds.
+/// kernels: both round `p` to bf16 before P·V, but the decode splits the KV tiles between two
+/// warpgroups (even and odd tiles) and merges their partial sums, so from the second tile on
+/// (kv_len > 64) it adds in another order than the prefill's one pass. So no bit requirement:
+/// their difference is within the sum of their two #791 bounds.
 #[test]
 fn the_decode_attention_is_within_two_bounds_of_the_prefill_row() {
     let device = h100();
@@ -979,6 +984,113 @@ fn the_decode_attention_is_within_two_bounds_of_the_prefill_row() {
     assert!(
         pass,
         "the decode attention is outside two bounds of the prefill row"
+    );
+}
+
+/// How many bf16 steps apart two values are: their bits as a signed-magnitude ladder, so `+0`
+/// and `−0` are 0 apart and a sign change counts the steps through zero.
+fn ulps_apart(a: u16, b: u16) -> u32 {
+    let ladder = |x: u16| {
+        let m = i32::from(x & 0x7FFF);
+        if x & 0x8000 != 0 { -m } else { m }
+    };
+    ladder(a).abs_diff(ladder(b))
+}
+
+/// Test 10b, a diagnostic beside test 10 (AI-native-Systems-Research/scratchy#859): the same
+/// comparison at Qwen3.6-35B-A3B's heads (16 q / 2 kv, a GQA group of 8), at kv_len 64 (one KV
+/// tile, where the decode's second warpgroup sees no key), 65 (the second tile) and 300 (five
+/// tiles), with test 10's seeds, shuffled table and NaN-poisoned pool. Printed: the mismatched
+/// bits, the max ulps (`ulps_apart`) and the worst |decode − prefill| over twice the #791 bound.
+/// Asserted: only test 10's bound, never bit identity.
+#[test]
+fn the_decode_attention_against_the_prefill_row_at_16_by_2() {
+    let device = h100();
+    let (qh, kvh, rows) = (16usize, 2usize, 128usize);
+    let mut pass = true;
+    for kv_len in [64usize, 65, 300] {
+        let seed = 0x0DEC_8000 + kv_len as u64;
+        let len = kv_len.min(rows);
+        let p = kv_len - len;
+        let q_rows = bf16_inputs(rows * qh * HD, seed);
+        let q = &q_rows[(len - 1) * qh * HD..][..qh * HD];
+        let k = bf16_inputs(kv_len * kvh * HD, seed ^ 0x100);
+        let v = bf16_inputs(kv_len * kvh * HD, seed ^ 0x200);
+        let table = shuffled_blocks(seed);
+        let need = kv_len.div_ceil(BS);
+        let (kc, vc) = dec_caches(&device, (&k, &v), (kv_len, kvh), &table, POISON);
+        let decode = attend_decode(
+            &device,
+            q,
+            (&kc, &vc),
+            &table[..need],
+            (kv_len - 1, 1),
+            (qh, kvh),
+        )
+        .expect("attn_decode_bf16");
+        let qb = up(&device, &q_rows);
+        let out = up(&device, &vec![SENTINEL; rows * qh * HD]);
+        let tb = up_u32(&device, &table[..need]);
+        let sb = up_u32(&device, &[p as u32, len as u32]);
+        // SAFETY: as `attend`'s, over the decode pool of DEC_BLOCKS blocks.
+        unsafe {
+            attn_prefill_bf16(
+                (qb.ptr(), out.ptr()),
+                (kc.ptr(), vc.ptr()),
+                (tb.ptr(), sb.ptr()),
+                (rows as u32, qh as u32, kvh as u32, HD as u32),
+                (BS as u32, DEC_BLOCKS as u32),
+                SCALE,
+                std::ptr::null_mut(),
+            )
+        }
+        .expect("attn_prefill_bf16");
+        let prefill = out.download().expect("download the prefill output");
+        let prefill = &prefill[(len - 1) * qh * HD..][..qh * HD];
+        let (kr, vr) = (
+            gather_paged(&kc.download().expect("K"), &table, kv_len, (kvh, BS, HD)),
+            gather_paged(&vc.download().expect("V"), &table, kv_len, (kvh, BS, HD)),
+        );
+        let (refs, score_max) = attention_reference(&AttnCase {
+            q,
+            k: &kr,
+            v: &vr,
+            q_heads: qh,
+            kv_heads: kvh,
+            head_dim: HD,
+            prefix_len: kv_len - 1,
+            q_len: 1,
+            scale: f64::from(SCALE),
+        });
+        let (mut bad, mut worst, mut ulps) = (0usize, 0.0f64, 0u32);
+        for ((&d, &f), &(r, pv)) in decode.iter().zip(prefill).zip(&refs) {
+            let (df, ff) = (
+                f64::from(bf16::from_bits(d).to_f32()),
+                f64::from(bf16::from_bits(f).to_f32()),
+            );
+            let bound = 2.0 * attention_bound(r, pv);
+            let diff = (df - ff).abs();
+            bad += usize::from(!(df.is_finite() && ff.is_finite() && diff <= bound));
+            worst = worst.max(diff / bound);
+            ulps = ulps.max(ulps_apart(d, f));
+        }
+        let mismatched = mismatched_bits(&decode, prefill);
+        let ok = bad == 0 && score_max <= ATTN_SCORE_MAX;
+        eprintln!(
+            "decode vs prefill row {} at 16 q / 2 kv (P={p}, L={len}) kv_len={kv_len} ({} KV \
+             tiles): mismatched_bits={mismatched}/{} max_ulps={ulps} \
+             worst_ratio_to_2x_bound={worst:.4} out_of_bound={bad} score_max={score_max:.4} \
+             (gated: the bound only) {}",
+            len - 1,
+            kv_len.div_ceil(BS),
+            decode.len(),
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(
+        pass,
+        "the decode attention is outside two bounds of the prefill row at 16 q / 2 kv"
     );
 }
 

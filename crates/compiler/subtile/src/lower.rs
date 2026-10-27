@@ -161,6 +161,18 @@ impl ExpertQuant {
     }
 }
 
+/// How a [`SubOp::ExpertMatmul`]'s expert bank is stored — [`GemmWeight`]'s counterpart for an
+/// expert bundle, AS A TYPE, so a target matches it exhaustively and never reads a dense bank as
+/// a quantized one (or the reverse).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpertWeight {
+    /// Dense bf16 experts, the checkpoint's own tensors. `inputs` = `[rows, routing, bundle]`:
+    /// no scale operand.
+    Dense,
+    /// MLX-affine packed experts, as the checkpoint declares them.
+    Affine(ExpertQuant),
+}
+
 /// An op as the front end states it: THE op vocabulary [`SubOp`] at its [`Arch`] stage, before
 /// [`crate::subtile_ir::lower_region`] binds the KV-cache witnesses.
 pub type ArchOp = SubOp<NeoX, Arch>;

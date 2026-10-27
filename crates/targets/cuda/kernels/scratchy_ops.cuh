@@ -204,6 +204,54 @@ __device__ inline float2 gdn_g::op<float2>(const float2& x, const float2& a_log)
     return float2{gdn_g::op<float>(x.x, a_log.x), gdn_g::op<float>(x.y, a_log.y)};
 }
 
+// The MoE route's top-k key: a NaN probability as −inf, every other value as it is. TK's
+// `base_ops::max` is `::max`, which returns the non-NaN operand, so a NaN key would never be the
+// round's max; as −inf it is the lowest, and the round's index pick still takes it in turn.
+struct nan_to_neg_inf {
+    template <typename T>
+    static __device__ inline T op(const T& x) {
+        return x != x ? kittens::base_types::constants<T>::neg_infty() : x;
+    }
+};
+template <>
+__device__ inline float nan_to_neg_inf::op<float>(const float& x) {
+    return x != x ? kittens::base_types::constants<float>::neg_infty() : x;
+}
+template <>
+__device__ inline float2 nan_to_neg_inf::op<float2>(const float2& x) {
+    return float2{nan_to_neg_inf::op<float>(x.x), nan_to_neg_inf::op<float>(x.y)};
+}
+
+// The MoE sort's run length: an expert's pair count rounded up to whole 128-row tiles of the
+// grouped GEMM (`op_abi::CUDA_EXPERT_TILE_ROWS`), so a tile belongs to one expert. Integer, exact.
+struct tile_pad {
+    static constexpr int ROWS = 128;
+    template <typename T>
+    static __device__ inline T op(const T& n) {
+        return (n + (ROWS - 1)) / ROWS * ROWS;
+    }
+};
+
+// TK-GAP(exclusive_scan_sv) begin
+// An exclusive prefix sum over a shared vector, in place, each element first mapped by `op`:
+// `v[i] = Σ_{j < i} op(v[j])`, returning the total `Σ_j op(v[j])`. TK has reductions to one value
+// and maps, never a scan. One lane runs it, serially in index order, so the sums are the same on
+// every run; the caller syncs its warp before (the vector's last write) and after (its next read),
+// as for any TK operation on a shared vector. Written over `sv::operator[]`, as TK's own
+// shared-vector maps (`ops/group/shared/vec/maps.cuh`) index it. The MoE sort's `offsets` go
+// through it, padded by `tile_pad`.
+template <typename op, kittens::ducks::sv::all SV>
+__device__ static inline typename SV::dtype exclusive_scan_sv(SV& v) {
+    typename SV::dtype run = kittens::base_types::constants<typename SV::dtype>::zero();
+    for (int i = 0; i < SV::length; i++) {
+        const typename SV::dtype x = v[i];
+        v[i] = run;
+        run = run + op::template op<typename SV::dtype>(x);
+    }
+    return run;
+}
+// TK-GAP(exclusive_scan_sv) end
+
 // TK-GAP(rv_fma) begin
 // A register-vector map over three vectors, `dst[i][j] = op(a[i][j], b[i][j], c[i][j])`: TK's own
 // vector `bin_op` (`ops/group/register/vec/maps.cuh`) takes one vector and a scalar, or two

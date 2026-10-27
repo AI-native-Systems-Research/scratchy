@@ -191,6 +191,53 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void gemm_narrow_bf16_ker(
     }
 }
 
+// M7 (#857): the one-column projection, `c[r] = a[r, :] · b[0, :]` (a shared expert's gate,
+// `n = 1`). C's row stride is 2 bytes, below a tensor map's 16, so this is ThunderKittens' warp
+// vector (PLAN-tk100 §2 S4), not the tile GEMM above: one warp per row, 8 rows per CTA. The row
+// of `a` and B's one row are walked in `k / 256` chunks of naive `rv_fl<256>` (`warp::load`, bf16
+// to f32, exact), each chunk's products `warp::mul` then accumulated by `warp::add` in chunk
+// order, then summed by `warp::sum` (each lane's elements in order, then a fixed shuffle tree into
+// lane 0 and a broadcast). Lane 0 stores the row's one bf16 through `gl::operator[]`, rounded once
+// (`base_types::convertor<bf16, float>`, round-to-nearest-even). A fixed order, no atomics: a row's
+// bits do not depend on where it sits in `a`.
+constexpr int ONE_WARPS = 8;
+constexpr int ONE_THREADS = ONE_WARPS * kittens::WARP_THREADS;
+// `step::GEMM_NARROW_BF16_ONE_K_MULTIPLE`: one chunk, a naive `rv_fl<256>`.
+constexpr int ONE_CHUNK = 256;
+
+using one_vec = rv_fl<ONE_CHUNK>;
+using one_in_gl = gl<bf16, 1, 1, -1, -1>;
+// `c`, `[m, 1]` bf16: written element by element.
+using one_out_gl = gl<bf16, 1, 1, -1, 1>;
+
+struct one_globals {
+    one_in_gl a;
+    one_in_gl b;
+    one_out_gl c;
+    int m;
+    int chunks;
+};
+
+__global__ __launch_bounds__(ONE_THREADS) void gemm_narrow_bf16_n1_ker(
+    const __grid_constant__ one_globals g) {
+    const int row = blockIdx.x * ONE_WARPS + kittens::warpid();
+    if (row >= g.m) {
+        return;
+    }
+    one_vec acc, x, w;
+    warp::zero(acc);
+    for (int ch = 0; ch < g.chunks; ++ch) {
+        warp::load(x, g.a, {0, 0, row, ch});
+        warp::load(w, g.b, {0, 0, 0, ch});
+        warp::mul(x, x, w);
+        warp::add(acc, acc, x);
+    }
+    const float dot = warp::sum(acc);
+    if (warp::laneid() == 0) {
+        g.c[{0, 0, row, 0}] = base_types::convertor<bf16, float>::convert(dot);
+    }
+}
+
 }  // namespace
 
 // The kernel's one-time setup: allow it `NARROW_SMEM_BYTES` of dynamic shared memory on the
@@ -208,17 +255,38 @@ extern "C" int scratchy_cuda_gemm_narrow_bf16_abt_prepare(void) {
 // = the cudaError_t cudaLaunchKernel returned for THIS launch. Nothing here reads or clears the
 // runtime's last-error state.
 //
-// `m` must be non-zero, `n` a non-zero multiple of 8 and at most 64, `k` a non-zero multiple of 8,
+// `m` must be non-zero, `n` 1 or a non-zero multiple of 8 and at most 64, `k` a non-zero multiple
+// of 8 (of 256 when `n` is 1, `step::GEMM_NARROW_BF16_ONE_K_MULTIPLE`: whole warp-vector chunks),
 // and `m` and `k` at most INT_MAX; all are checked before any pointer is touched. `a`, `b` and `c`
 // must be 16-byte-aligned device pointers to `m·k`, `n·k` and `m·n` bf16, `c` overlapping neither
-// input. `scratchy_cuda_gemm_narrow_bf16_abt_prepare` must have succeeded on the current device.
-// The launch is asynchronous on `stream`.
+// input. `n` = 1 runs the warp-vector kernel above, with no shared memory; any other `n` the tile
+// GEMM, for which `scratchy_cuda_gemm_narrow_bf16_abt_prepare` must have succeeded on the current
+// device. The launch is asynchronous on `stream`.
 extern "C" int scratchy_cuda_gemm_narrow_bf16_abt(const void* a, const void* b, void* c,
                                                   uint32_t m, uint32_t n, uint32_t k,
                                                   void* stream /* cudaStream_t; null = default */) {
-    if (m == 0 || m > uint32_t(INT_MAX) || n == 0 || n % VEC != 0 || n > MAX_N || k == 0 ||
-        k % VEC != 0 || k > uint32_t(INT_MAX)) {
+    if (m == 0 || m > uint32_t(INT_MAX) || n == 0 || (n != 1 && n % VEC != 0) || n > MAX_N ||
+        k == 0 || k % VEC != 0 || k > uint32_t(INT_MAX) || (n == 1 && k % ONE_CHUNK != 0)) {
         return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    if (n == 1) {
+        // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+        try {
+            // No view carries a TMA type, so building them encodes nothing.
+            one_in_gl ag{static_cast<bf16*>(const_cast<void*>(a)), nullptr, nullptr, size_t(m),
+                         size_t(k)};
+            one_in_gl bg{static_cast<bf16*>(const_cast<void*>(b)), nullptr, nullptr, size_t(1),
+                         size_t(k)};
+            one_out_gl cg{static_cast<bf16*>(c), nullptr, nullptr, size_t(m), nullptr};
+            one_globals G{ag, bg, cg, int(m), int(k / uint32_t(ONE_CHUNK))};
+            void* args[] = {&G};
+            const dim3 grid((m + uint32_t(ONE_WARPS) - 1) / uint32_t(ONE_WARPS)),
+                block(ONE_THREADS);
+            return static_cast<int>(cudaLaunchKernel(gemm_narrow_bf16_n1_ker, grid, block, args,
+                                                     0, static_cast<cudaStream_t>(stream)));
+        } catch (...) {
+            return SCRATCHY_CUDA_ERR_HOST;
+        }
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
     try {

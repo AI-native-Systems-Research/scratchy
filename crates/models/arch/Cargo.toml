@@ -831,6 +831,12 @@ required-features = ["nvcc", "qwen3.5-0.8b"]
 name = "cuda_tapes_9b"
 required-features = ["cuda", "qwen3.5-9b-text-only"]
 
+# Qwen3.6-35B-A3B's emitted CUDA tapes (#841): the MoE block's steps, MoE scratch and bundles,
+# checked with no toolchain. The model's MoE steps have no kernels yet (#857).
+[[test]]
+name = "cuda_tapes_35b"
+required-features = ["cuda", "qwen3.6-35b-a3b"]
+
 [[test]]
 name = "cuda_prefill_9b"
 required-features = ["nvcc", "qwen3.5-9b-text-only"]
@@ -838,4 +844,20 @@ required-features = ["nvcc", "qwen3.5-9b-text-only"]
 [[test]]
 name = "cuda_hf_parity_9b"
 required-features = ["nvcc", "qwen3.5-9b-text-only"]
+
+# Qwen3.6-35B-A3B on the H100 from its real checkpoint (#859): the memory gate and P1-P8 against
+# HF transformers (the 9b's body, tests/common/), P9 the expert picks against HF's routing dump,
+# and the synthetic-weight whole-model body. Need nvcc to build, and an H100, the 26-shard
+# checkpoint and the goldens to run.
+[[test]]
+name = "cuda_hf_parity_35b"
+required-features = ["nvcc", "qwen3.6-35b-a3b"]
+
+[[test]]
+name = "cuda_route_parity_35b"
+required-features = ["nvcc", "qwen3.6-35b-a3b"]
+
+[[test]]
+name = "cuda_prefill_35b"
+required-features = ["nvcc", "qwen3.6-35b-a3b"]
 

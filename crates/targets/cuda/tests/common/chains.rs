@@ -15,7 +15,7 @@ use scratchy_target_cuda::tape::{
 };
 use scratchy_target_cuda_compiler::canonical::{
     CanonicalAt, CanonicalGdn, CanonicalKv, CudaCanonical, CudaGdnFacts, CudaModelFacts,
-    lower_canonical,
+    SharedExpertOwner, lower_canonical,
 };
 
 /// qwen3.5's model facts: `head_dim` 256, a quarter of it rotated, `rope_theta` 1e7, no linear
@@ -27,6 +27,7 @@ pub const QWEN3_5_FACTS: CudaModelFacts = CudaModelFacts {
     rope_theta: 1e7,
     gdn: None,
     embed: None,
+    shared_expert: SharedExpertOwner::Undeclared,
 };
 
 /// [`QWEN3_5_FACTS`] with qwen3.5-0.8b's linear attention: 16 key heads of 128, a 4-tap conv,
@@ -82,6 +83,7 @@ pub fn assert_tape_is(name: &str, tape: &CudaTape, lowered: &CudaCanonical) {
         rotary,
         kv,
         gdn,
+        moe,
     } = *tape;
     let CudaCanonical {
         bucket_m: lowered_m,
@@ -95,6 +97,7 @@ pub fn assert_tape_is(name: &str, tape: &CudaTape, lowered: &CudaCanonical) {
         rotary: lowered_rotary,
         kv: lowered_kv,
         gdn: lowered_gdn,
+        moe: lowered_moe,
     } = lowered;
     assert_eq!(bucket_m, *lowered_m, "{name}: bucket_m");
     assert_eq!(colour_bytes, lowered_bytes, "{name}: colour bytes");
@@ -149,6 +152,7 @@ pub fn assert_tape_is(name: &str, tape: &CudaTape, lowered: &CudaCanonical) {
         },
     );
     assert_eq!(gdn.as_ref(), lowered_gdn.as_ref(), "{name}: gdn");
+    assert_eq!(moe, *lowered_moe, "{name}: moe");
 }
 
 /// The chains' activation width: `x` is `[M, HIDDEN]`.
@@ -237,6 +241,7 @@ pub static TWO_GEMM_M128: CudaTape = CudaTape {
     rotary: None,
     kv: None,
     gdn: None,
+    moe: None,
 };
 
 /// [`two_gemm`]`(256)`: colours x, y1, y2.
@@ -257,6 +262,7 @@ pub static TWO_GEMM_M256: CudaTape = CudaTape {
     rotary: None,
     kv: None,
     gdn: None,
+    moe: None,
 };
 
 /// [`three_gemm`]: `y1` is dead after step 1, so `y3` takes its colour, and the arena is the
@@ -279,4 +285,5 @@ pub static THREE_GEMM_M256: CudaTape = CudaTape {
     rotary: None,
     kv: None,
     gdn: None,
+    moe: None,
 };

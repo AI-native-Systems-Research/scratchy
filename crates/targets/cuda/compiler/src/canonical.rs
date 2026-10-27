@@ -24,18 +24,21 @@ use std::collections::BTreeMap;
 use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
 use scratchy_subtile::lower::GemmWeightKind;
 use scratchy_subtile::sample_rows::{SampleRowsError, expand_sample_rows};
+use scratchy_subtile::subtile_ir::ExpertProj;
 use scratchy_subtile::subtile_ir::{SubOp, SubtileIR, TensorShape, ValidatedGraph, lower_region};
 use scratchy_subtile::subtile_tape::{Instr, SubtileTape, lower_dag_to_tape};
 use scratchy_subtile::tape_colouring::{Colour, ColourError, TapeColouring, colour_tape};
 use scratchy_subtile::tape_folding::{FoldError, ModelFoldFacts, StepRole, TapeFolds, fold_tape};
 use scratchy_target_cuda::op_abi::{
-    CUDA_COLOUR_FACTS, CUDA_COLUMN_BLOCK, CUDA_FUSIONS, CUDA_SAMPLE_ROWS, CudaFusion,
+    CUDA_COLOUR_FACTS, CUDA_COLUMN_BLOCK, CUDA_EXPERT_TILE_ROWS, CUDA_FUSIONS, CUDA_SAMPLE_ROWS,
+    CUDA_SORTED_PAIRS, CudaFusion,
 };
 use scratchy_target_cuda::step::{
     CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep, GDN_SEQUENCE_BYTES, gdn_scratch,
 };
 use scratchy_target_cuda::tape::{
-    ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, RotaryTable, TapeInput, WeightIx,
+    ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, MoeSortTape, MoeTape, RotaryTable,
+    TapeInput, WeightIx, moe_region_bytes, moe_tiles,
 };
 
 use crate::steps_from_tape::{StepCx, TapeStep, embed, gdn_bundle_layer, lower_fused, lower_step};
@@ -56,6 +59,21 @@ pub struct CudaModelFacts {
     pub rope_theta: f64,
     pub gdn: Option<CudaGdnFacts>,
     pub embed: Option<CudaEmbedFacts>,
+    /// Who computes the shared expert of the model's MoE bundles: the DSL, as ops of its own, or
+    /// no one (CUDA's combine adds none). The single-owner rule metal's combine applies
+    /// (`metal/compiler/src/steps_from_tape.rs`, `shared_expert_owned`), read off the handoff's
+    /// `dsl_shared_expert_bases` by [`crate::emit::shared_expert_owner`].
+    pub shared_expert: SharedExpertOwner,
+}
+
+/// Who computes a MoE bundle's shared expert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedExpertOwner {
+    /// The DSL declares a `shared_expert` subtree under every MoE bundle's weight base, and
+    /// states the shared expert and its gate as ops of their own.
+    Dsl,
+    /// The DSL declares none (or the model has no MoE bundle).
+    Undeclared,
 }
 
 /// The token-embedding table the embedded hidden is gathered from: `vocab` rows of the hidden's
@@ -127,6 +145,8 @@ pub struct CudaCanonical {
     /// The Gated-DeltaNet layers and their regions, after the KV regions: `Some` exactly when a
     /// step is a `GatedDeltaNet`. The fields of a `scratchy_target_cuda::tape::GdnTape`.
     pub gdn: Option<CanonicalGdn>,
+    /// The MoE scratch, after the GDN regions: `Some` exactly when a step is a MoE step.
+    pub moe: Option<MoeTape>,
 }
 
 /// One canonical's Gated-DeltaNet layers: the fields of a `scratchy_target_cuda::tape::GdnTape`,
@@ -373,6 +393,28 @@ pub enum CanonicalRefusal {
     GdnPool {
         step: usize,
     },
+    /// The `step`-th `Compute` is a MoE op CUDA has no kernel for in this form: a router or bundle
+    /// other than the dense shared-fused one (`op_abi::CUDA_GROUPED_EXPERTS`), an affine bank, an
+    /// activation other than SiLU, a routing other than softmax then top-k (then renorm), or a
+    /// geometry another MoE op of the canonical does not share.
+    MoeShape {
+        step: usize,
+        op: &'static str,
+        rule: MoeShapeRule,
+    },
+    /// The `step`-th `Compute` is a MoE op whose operand `operand` is not the op the MoE dataflow
+    /// names there (`op_abi::cuda_moe_write`).
+    MoeOperand {
+        step: usize,
+        op: &'static str,
+        operand: u8,
+    },
+    /// The `step`-th `Compute` is an `ExpertCombine` of a bundle with a shared expert, and the DSL
+    /// declares no `shared_expert` subtree for it: CUDA's combine adds no shared expert, so it
+    /// would be dropped.
+    UndeclaredSharedExpert {
+        step: usize,
+    },
     /// The embedding table cannot be gathered from: the embedded hidden is `rows × hidden` and
     /// the table `vocab` rows, a shape the bf16 embed does not take.
     EmbedShape {
@@ -383,6 +425,30 @@ pub enum CanonicalRefusal {
     },
     /// The arena cannot be laid out.
     Arena(ArenaRefusal),
+}
+
+/// Which rule a MoE op breaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoeShapeRule {
+    /// The bundle is not one of `op_abi::CUDA_GROUPED_EXPERTS`.
+    Bundle,
+    /// The expert bank is affine; CUDA's expert kernels take dense bf16 only.
+    Affine,
+    /// The gated activation is not SiLU, the one `silu_mul_bf16.cu` computes.
+    Activation,
+    /// The routing is not the fold of a softmax, an argsort and a gather (and a renorm).
+    Routing,
+    /// The op's geometry (experts, top-k, hidden, expert width) is not the canonical's first MoE
+    /// op's, which the MoE scratch is sized by; or a projection is not `n` of its bundle's.
+    Geometry,
+    /// The op's rows are not the bucket's tokens.
+    Rows,
+    /// A dimension the expert GEMMs tile is off their tile: `hidden` or `inter` not a multiple of
+    /// 256, or of 64 as `k`.
+    OffTile { dim: &'static str, value: u32 },
+    /// The router's experts are not the 256 the routing kernel's warp holds (8 per lane), or the
+    /// top-k is above 32.
+    Experts { experts: u32, top_k: u32 },
 }
 
 /// Which rule an embed's shape breaks: the launcher's, stated at expansion time.
@@ -823,6 +889,20 @@ impl std::fmt::Display for CanonicalRefusal {
                  op, which the GDN scratch is sized by; one scratch and one state pool cannot hold \
                  both"
             ),
+            Self::MoeShape { step, op, rule } => write!(
+                f,
+                "step {step} ({op}) is a MoE op the cuda backend has no kernel for: {rule}"
+            ),
+            Self::MoeOperand { step, op, operand } => write!(
+                f,
+                "step {step} ({op}) operand {operand} is not the MoE op the dataflow names there"
+            ),
+            Self::UndeclaredSharedExpert { step } => write!(
+                f,
+                "step {step} (ExpertCombine) combines a bundle with a shared expert that the DSL \
+                 declares no `shared_expert` subtree for; the cuda combine adds none, so it would \
+                 be dropped"
+            ),
             Self::EmbedShape {
                 rows,
                 hidden,
@@ -834,6 +914,38 @@ impl std::fmt::Display for CanonicalRefusal {
                  refuses: {rule}"
             ),
             Self::Arena(e) => write!(f, "the arena cannot be laid out: {e}"),
+        }
+    }
+}
+
+impl std::fmt::Display for MoeShapeRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bundle => write!(
+                f,
+                "its bundle is not the dense shared-fused one, the only one CUDA has a grouped \
+                 GEMM for"
+            ),
+            Self::Affine => write!(f, "its experts are affine; CUDA's take dense bf16 only"),
+            Self::Activation => write!(f, "its gated activation is not SiLU"),
+            Self::Routing => write!(
+                f,
+                "its routing is not a softmax, then the top-k, then an optional renorm"
+            ),
+            Self::Geometry => write!(
+                f,
+                "its geometry is not the canonical's first MoE op's, which sizes the MoE scratch"
+            ),
+            Self::Rows => write!(f, "its rows are not the bucket's tokens"),
+            Self::OffTile { dim, value } => write!(
+                f,
+                "{dim} = {value} is off the expert GEMM's 256-column, 64-wide K tile"
+            ),
+            Self::Experts { experts, top_k } => write!(
+                f,
+                "{experts} experts, top-{top_k}: the routing kernel takes 256 experts (8 per \
+                 lane of a warp) and a top-k of 1 to 32"
+            ),
         }
     }
 }
@@ -1203,6 +1315,7 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
     let arena = arena_layout(&plan);
     let kv = kv_cache(&plan);
     let gdn_layers = gdn_layers(&plan);
+    let moe = arena.as_ref().ok().and_then(|a| a.moe);
     let cx = StepCx {
         graph: &plan.graph,
         bindings: &plan.lowered.bindings,
@@ -1221,6 +1334,7 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
         kv_regions: arena.as_ref().ok().and_then(|a| a.kv),
         gdn_layers: &gdn_layers,
         gdn_regions: arena.as_ref().ok().and_then(|a| a.gdn),
+        moe,
     };
     let computes: Vec<TapeStep<'_>> = tape_steps(&plan).collect();
     let mut steps = (computes.iter())
@@ -1258,11 +1372,15 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
         Some((_, span, vocab, _)) => TapeInput::TokenIds { span, vocab },
         None => TapeInput::Hidden(span(Colour::ZERO)),
     };
-    // A GDN step's bundle is a `[1, 1]` source in the IR; on the device it is the packed f32
-    // `gdn_bundle` of the step's geometry, which its extents read.
+    // A GDN or MoE step's bundle is a `[1, 1]` source in the IR; on the device it is the packed
+    // bundle of the step's geometry (`gdn_bundle`, `moe_bundle`), which its extents read.
     let bundles: BTreeMap<u32, u64> = (steps.iter())
         .filter_map(|s| match s {
             CudaStep::GatedDeltaNet(g) => Some((g.bundle.0, g.bundle_layout()?.bytes)),
+            CudaStep::RouterLogits(_) | CudaStep::ExpertGemm(_) | CudaStep::ExpertGemv(_) => {
+                let w = s.extents()?.weight?;
+                Some((w.ix.0, w.bytes))
+            }
             _ => None,
         })
         .collect();
@@ -1330,6 +1448,7 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
             sequence: r.sequence,
         }),
         gdn,
+        moe,
     })
 }
 
@@ -1409,6 +1528,7 @@ struct Arena {
     rotary: Option<ArenaSpan>,
     kv: Option<KvRegions>,
     gdn: Option<GdnRegions>,
+    moe: Option<MoeTape>,
     /// The token ids, `bucket_m` u32 after every other region: `Some` exactly when the model has
     /// an embedding table (`CudaModelFacts::embed`).
     tokens: Option<ArenaSpan>,
@@ -1452,6 +1572,95 @@ pub struct GdnWidths {
     pub conv_dim: u32,
     pub value_dim: u32,
     pub nv: u32,
+}
+
+/// A canonical's MoE geometry, read off its first `RouterLogits` and the `ExpertMatmul`s and
+/// `ExpertCombine` after it: the experts, the top-k, the hidden width and the expert width. Every
+/// MoE op of the canonical must share it (each lowering arm checks), since one scratch serves
+/// every layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoeGeometry {
+    pub experts: u32,
+    pub top_k: u32,
+    pub hidden: u32,
+    pub inter: u32,
+}
+
+/// The canonical's MoE geometry, or `None` when it has no MoE op: the experts of its first
+/// `RouterLogits`, the top-k and expert width of the first gate or up `ExpertMatmul`, and the
+/// hidden width of the first `ExpertCombine`.
+fn moe_geometry(plan: &CudaPlan) -> Option<MoeGeometry> {
+    let mut steps = tape_steps(plan);
+    let experts = steps.find_map(|s| match s.node.op {
+        SubOp::RouterLogits { experts, .. } => Some(experts.get()),
+        _ => None,
+    })?;
+    let mut rest = tape_steps(plan);
+    let (top_k, inter) = rest.find_map(|s| match s.node.op {
+        SubOp::ExpertMatmul { proj, n, k, .. } if proj != ExpertProj::Down => Some((k.get(), n)),
+        _ => None,
+    })?;
+    let hidden = tape_steps(plan).find_map(|s| match s.node.op {
+        SubOp::ExpertCombine { hidden, .. } => Some(hidden),
+        _ => None,
+    })?;
+    Some(MoeGeometry {
+        experts,
+        top_k,
+        hidden,
+        inter,
+    })
+}
+
+/// The MoE scratch of `geometry` at `bucket_m` rows, placed by `place`: its regions in
+/// `MoeTape`'s order, sorted when the bucket's pairs reach `op_abi::CUDA_SORTED_PAIRS`.
+fn moe_scratch(
+    bucket_m: u32,
+    g: MoeGeometry,
+    place: &mut dyn FnMut(u64) -> Result<u64, ArenaRefusal>,
+) -> Result<MoeTape, ArenaRefusal> {
+    let sorted = bucket_m.checked_mul(g.top_k) >= Some(CUDA_SORTED_PAIRS);
+    let geometry = (g.experts, g.top_k, g.hidden, g.inter);
+    let bytes = moe_region_bytes(bucket_m, geometry, sorted).ok_or(ArenaRefusal::TooLarge)?;
+    let (_, tiles, _) = moe_tiles(bucket_m, g.experts, g.top_k).ok_or(ArenaRefusal::TooLarge)?;
+    let mut spans = Vec::with_capacity(bytes.len());
+    for b in bytes {
+        spans.push(ArenaSpan {
+            offset: ArenaOffset(place(b)?),
+            bytes: b,
+        });
+    }
+    let (head, tail) = spans.split_at(3);
+    let (sort, experts) = if sorted {
+        let (s, e) = tail.split_at(6);
+        let sort = MoeSortTape {
+            chunk_hist: s[0],
+            counts: s[1],
+            offsets: s[2],
+            tile_expert: s[3],
+            pos: s[4],
+            rows: s[5],
+        };
+        (Some(sort), e)
+    } else {
+        (None, tail)
+    };
+    Ok(MoeTape {
+        experts: g.experts,
+        top_k: g.top_k,
+        hidden: g.hidden,
+        inter: g.inter,
+        tile_rows: CUDA_EXPERT_TILE_ROWS,
+        max_tiles: if sorted { tiles } else { 0 },
+        logits: head[0],
+        topk_idx: head[1],
+        scores: head[2],
+        sort,
+        gate: experts[0],
+        up: experts[1],
+        act: experts[2],
+        down: experts[3],
+    })
 }
 
 /// The canonical's `GatedDeltaNet` steps, in tape order.
@@ -1532,7 +1741,8 @@ fn embedded_hidden_source(plan: &CudaPlan) -> Result<(usize, TensorShape), Arena
 /// when it binds a `PrefixK`, the block table (`CUDA_MAX_BLOCKS_PER_SEQ` u32), the slot mapping
 /// (`bucket_m` u32) and the sequence (2 u32) follow, in that order, each aligned the same way;
 /// when a step is a `GatedDeltaNet`, the GDN sequence (4 u32) and the GDN scratch
-/// (`gdn_scratch(bucket_m, …)`) follow, aligned the same way; when the model has an embedding
+/// (`gdn_scratch(bucket_m, …)`) follow, aligned the same way; when it has a MoE block, the MoE
+/// scratch ([`MoeTape`]'s regions) follows, aligned the same way; when the model has an embedding
 /// table, the token ids (`bucket_m` u32) come last, aligned the same way.
 fn arena_layout(plan: &CudaPlan) -> Result<Arena, ArenaRefusal> {
     let hidden = embedded_hidden(plan)?;
@@ -1616,6 +1826,9 @@ fn arena_layout(plan: &CudaPlan) -> Result<Arena, ArenaRefusal> {
             })
         })
         .transpose()?;
+    let moe = moe_geometry(plan)
+        .map(|g| moe_scratch(hidden.rows, g, &mut place))
+        .transpose()?;
     let tokens = (plan.facts.embed)
         .map(|_| {
             let bytes = u64::from(hidden.rows) * TOKEN_ID_BYTES;
@@ -1632,6 +1845,7 @@ fn arena_layout(plan: &CudaPlan) -> Result<Arena, ArenaRefusal> {
         rotary,
         kv,
         gdn,
+        moe,
         tokens,
         total,
     })
