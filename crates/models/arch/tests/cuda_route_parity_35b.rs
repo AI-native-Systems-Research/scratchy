@@ -27,8 +27,11 @@
 //! - Gate, layers 1-39: a flip inside a router tie (the same τ as layer 0) is accepted, with no
 //!   count limit; a flip outside one is accepted only when the same token flipped at an earlier
 //!   layer (inside a tie or not), since its input then legitimately differs; a flip outside a tie
-//!   on a token with no earlier flip fails (the user's decision 2026-10-27, option (a)). Per
-//!   layer, the outside-tie flips an earlier flip excuses and those it does not are printed.
+//!   on a token with no earlier flip fails (the user's decision 2026-10-27, option (a)), unless
+//!   HF-bf16 flips at least as many tokens as CUDA in that layer (the user's decision 2026-10-27,
+//!   option (a) amended: rounding demonstrably flips picks there, and CUDA is no worse than HF's
+//!   bf16). Per layer, the outside-tie flips an earlier flip excuses, those it does not, and which
+//!   excuse applied are printed.
 //! - Attribution for P5/P7, printed: per greedy step of prompts 1-5 (HF-f32's sequence), the
 //!   first layer at which the step's last token's CUDA pick differs from HF-f32's.
 //!
@@ -315,21 +318,31 @@ fn p9_expert_picks_match_hf_f32() {
             let flips = inside + outside;
             total_cuda += flips;
             total_bf16 += bf16_flips;
+            // The excuse a layer >= 1's outside-tie flips with no earlier flip take: HF-bf16 flips
+            // at least as many tokens there as CUDA (the user's decision 2026-10-27).
+            let bf16_excuses = bf16_flips >= flips;
             let (ok, rule) = if layer == 0 {
                 (outside == 0, "0 flips outside router ties".to_string())
             } else {
                 (
-                    unexcused == 0,
-                    "0 flips outside router ties on a token with no earlier flip, those inside \
-                     not capped (the user's decision 2026-10-27, option (a))"
+                    unexcused == 0 || bf16_excuses,
+                    "0 flips outside router ties on a token with no earlier flip unless HF-bf16 \
+                     flips >= CUDA's in the layer, those inside not capped (the user's decision \
+                     2026-10-27, option (a) amended)"
                         .to_string(),
                 )
+            };
+            let excuse = match (layer, excused > 0, unexcused > 0 && bf16_excuses) {
+                (0, ..) | (_, false, false) => "none",
+                (_, true, false) => "earlier flip",
+                (_, false, true) => "HF-bf16 flips >= CUDA's",
+                (_, true, true) => "earlier flip, HF-bf16 flips >= CUDA's",
             };
             eprintln!(
                 "P9 prompt {} layer {layer}: {n} tokens, router ties={ties} (tau={tau:.4e}) \
                  CUDA flips={flips} (inside ties {inside}, outside {outside}: excused by an \
                  earlier flip {excused}, not excused {unexcused}) HF-bf16 flips={bf16_flips} \
-                 malformed CUDA picks={bad} (need {rule}) {}",
+                 malformed CUDA picks={bad} excuse applied: {excuse} (need {rule}) {}",
                 p.p,
                 verdict(ok)
             );
