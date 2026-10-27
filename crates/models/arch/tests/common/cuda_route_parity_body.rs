@@ -157,16 +157,18 @@ impl Route {
 }
 
 /// P9's rule at `layer`, for both models (#933: one function, so the two cannot drift apart):
-/// layer 0, no flip outside a router tie; layers ≥ 1, CUDA's flips ≤ 2 × HF-bf16's + 2 (#859,
-/// read not run; the user's decision on this line is open). Whether it passes, and its text.
-fn layer_rule(layer: usize, flips: usize, outside: usize, bf16_flips: usize) -> (bool, String) {
+/// layer 0, no flip outside a router tie; layers ≥ 1, no flip outside a router tie (the same τ),
+/// every flip inside one accepted with no count limit (the user's decision 2026-10-26/27).
+/// Whether it passes, and its text.
+fn layer_rule(layer: usize, outside: usize) -> (bool, String) {
     if layer == 0 {
         (outside == 0, "0 flips outside router ties".to_string())
     } else {
-        let cap = 2 * bf16_flips + 2;
         (
-            flips <= cap,
-            format!("flips <= 2 x HF-bf16's + 2 = {cap} (#859, read not run)"),
+            outside == 0,
+            "0 flips outside router ties, those inside not capped (the user's decision \
+             2026-10-26/27)"
+                .to_string(),
         )
     }
 }
@@ -289,7 +291,7 @@ fn p9_expert_picks_match_hf_f32() {
             let flips = inside + outside;
             total_cuda += flips;
             total_bf16 += bf16_flips;
-            let (ok, rule) = layer_rule(layer, flips, outside, bf16_flips);
+            let (ok, rule) = layer_rule(layer, outside);
             eprintln!(
                 "P9 prompt {} layer {layer}: {n} tokens, router ties={ties} (tau={tau:.4e}) \
                  CUDA flips={flips} (inside ties {inside}, outside {outside}) HF-bf16 \

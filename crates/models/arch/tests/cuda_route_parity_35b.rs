@@ -24,11 +24,8 @@
 //!   HF-bf16's own flips against HF-f32 (the yardstick).
 //! - Gate, layer 0: no flip outside a router tie (its input, the embedding and one GDN layer, is
 //!   the same up to rounding on both sides).
-//! - Gate, layers 1-39: CUDA's flips ≤ 2 × HF-bf16's + 2 (P2's shape: within twice the yardstick;
-//!   the +2 keeps a layer where bf16 flips nothing from failing on one rounding flip). After a
-//!   flip the next layer's input legitimately differs, so its flips outside ties are printed, not
-//!   gated. The multiplier and the +2 are read, not run: if this gate fails while every flip is
-//!   inside a router tie, stop and report the table.
+//! - Gate, layers 1-39: no flip outside a router tie (the same τ as layer 0); every flip inside
+//!   one is accepted, with no count limit (the user's decision 2026-10-26/27).
 //! - Attribution for P5/P7, printed: per greedy step of prompts 1-5 (HF-f32's sequence), the
 //!   first layer at which the step's last token's CUDA pick differs from HF-f32's.
 //!
