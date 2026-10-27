@@ -137,6 +137,10 @@ pub fn gather_copy_opspec(
             run.dest.entries()
         )
     })?;
+    // ⭐⭐⭐ THE SCATTER ARM'S OWN VIEW WIDTH — `Some(W)` only for the Scatter destination below, so
+    // the output arg's spelling is stated from the typed law that minted the destination and not by
+    // a second decision at the builder (the same one-fact-one-place discipline `dest_base` takes).
+    let mut out_scatter_interleave: Option<u32> = None;
     match dest {
         crate::sdsc_abstract::GatherDest::Scratch {
             rows: d_rows,
@@ -150,6 +154,48 @@ pub fn gather_copy_opspec(
                 cols,
                 None,
             )?;
+        }
+        // ⭐⭐⭐⭐⭐ THE SCATTER-LAW DESTINATION — entry `j` of request `r` lands at element
+        // `(j·W + r)·lanes` of the `[W, hidden]` ChainRow, the bytes `StickLayout::row_blocked(W,
+        // hidden)` places (see `GatherDest::Scatter`'s own doc for the law and its one construction
+        // site). The run's `dest_entry` carries the request's column corner (`first_entry·W + r`),
+        // and the OUTPUT ARG's physical `y` extent carries the row pitch — the two halves of one
+        // law, minted together here.
+        //
+        // ⛔ THE SCATTER'S ENTRY IS ONE STICK (`page == 1`): the stride the corner fold spells is
+        // per-ENTRY (`W·lanes` between consecutive entries), and the fold composes with the
+        // per-core `mb` cut — which `gather_copy_cores` keeps at WHOLE entries — only while one
+        // entry is one stick. A wider page is a different destination law, refused rather than
+        // silently re-derived.
+        //
+        // ⛔ AND ONE ENTRY PER CORE IS STRUCTURAL, NOT AN ASSUMPTION: the corner fold strides the
+        // CORE BASE by `W·lanes` while intra-core positions stay contiguous, so the law is exact
+        // exactly while no core owns two entries. The cap law above bounds one op to
+        // `ENTRIES_PER_OP` (32) entries and `gather_copy_cores` splits `mb` by whole entries over
+        // `MAX_CORES` (32) cores — so a core owning two entries is not a shape this arm can be
+        // handed, and the bound below is the whole of the address law.
+        crate::sdsc_abstract::GatherDest::Scatter {
+            rows: interleave,
+            ..
+        } => {
+            if page != 1 {
+                return Err(format!(
+                    "gather_copy_opspec('{src}' -> '{dst}'): a scatter destination's entries are \
+                     ONE STICK (page = 1), and this run declares a {page}-position page — the \
+                     scatter stride is per one-stick entry, so a wider entry is a different \
+                     destination law, not this one"
+                ));
+            }
+            crate::emit::mint_scatter_window(
+                &format!("gather_copy_opspec('{src}' -> '{dst}'): the destination"),
+                dst,
+                &dest,
+                df,
+                dest_base as u64,
+                rows,
+                None,
+            )?;
+            out_scatter_interleave = Some(interleave);
         }
         crate::sdsc_abstract::GatherDest::CoreLocalLx => {
             if run.dest.entries() != 0 {
@@ -248,7 +294,13 @@ pub fn gather_copy_opspec(
         // into the next intermediate's bytes. Read as keys, clean bake, no fault. (Derived and bounded
         // once above — `dest_base` — so the base the op carries and the base the mint checks are one
         // number.)
-        dest_base,
+        // The output's own view: the derived `dest_base`, and the scatter's width exactly
+        // when the destination minted Scatter above — one law, one value, read by the
+        // builder's output arg.
+        match out_scatter_interleave {
+            Some(interleave) => OutView::scattered(dest_base, interleave),
+            None => OutView::at(dest_base),
+        },
     )?;
     // ⭐ THE VALUE OPERANDS' OWN df — `pointwise_opspec_from_tile_split` builds args at fp16 (the
     // residual default), so an fp8 copy re-states BOTH value args here. The index arg does not
@@ -360,6 +412,24 @@ pub fn assemble_gather_copy(
             )
             .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"));
         }
+        // ⭐ THE SCATTER DESTINATION'S PLACEMENT HALF — the same stride-aware mint the raw door
+        // ran, now with the layout at hand so the ChainRow's reservation answers for the bytes
+        // behind the name (see `GatherDest::Scatter`). No `GatherScratch` mints this arm today —
+        // the chained head's row gather takes `gather_copy_opspec` directly — so reaching here
+        // means a scratch claimed the scatter law; the mint still states it honestly rather than
+        // refusing by silence.
+        crate::sdsc_abstract::GatherDest::Scatter { .. } => {
+            crate::emit::mint_scatter_window(
+                &format!("assemble_gather_copy {op_name}: the destination"),
+                dst,
+                &copy.dest(),
+                Df::Fp16,
+                dest_base,
+                d.mb(),
+                layout,
+            )
+            .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"));
+        }
         crate::sdsc_abstract::GatherDest::CoreLocalLx => {
             if let Some(l) = layout
                 && !l.lx_core_local(dst)
@@ -440,8 +510,44 @@ pub fn pointwise_opspec_from_tile(
         head_major,
         EwDivision::Law.resolve(stick_major, core_local).splitter(),
         // Whole-tensor output — every caller but the gather copy, whose runs land at a base.
-        0,
+        OutView::whole(),
     )
+}
+
+/// The OUTPUT arg's own view — ONE value because it is one fact: where the output's window
+/// sits (`offset`, in elements), and — for the one gather form whose destination is the
+/// ChainRow's scatter — the scatter's width, which spells the output's residency law (see
+/// [`crate::sdsc_abstract::GatherDest::Scatter`]). `OutView::whole()` is every whole-tensor
+/// caller; the gather's run landing is `OutView::at(dest_base)` and its scatter form
+/// `OutView::scattered(dest_base, W)`.
+struct OutView {
+    offset: u32,
+    scatter_interleave: Option<u32>,
+}
+
+impl OutView {
+    fn whole() -> OutView {
+        OutView {
+            offset: 0,
+            scatter_interleave: None,
+        }
+    }
+
+    /// A windowed whole-tensor output at an element base — the gather's contiguous
+    /// Scratch destinations.
+    fn at(offset: u32) -> OutView {
+        OutView {
+            offset,
+            scatter_interleave: None,
+        }
+    }
+
+    fn scattered(offset: u32, interleave: u32) -> OutView {
+        OutView {
+            offset,
+            scatter_interleave: Some(interleave),
+        }
+    }
 }
 
 /// [`pointwise_opspec_from_tile`] with the WORK DIVISION as a parameter — for the one op whose entry
@@ -457,8 +563,9 @@ fn pointwise_opspec_from_tile_split(
         &[crate::superdsc_opspec::ItDim],
         u32,
     ) -> std::collections::BTreeMap<&'static str, u32>,
-    // The OUTPUT's base, in elements — see [`gather_copy_opspec`]'s `dst_off`. 0 = whole-tensor output.
-    out_offset: u32,
+    // The OUTPUT's own view — its base in elements and, for the gather's scatter destination,
+    // the scatter's width. See [`gather_copy_opspec`]'s `dst_off` and `OutView`.
+    out_view: OutView,
 ) -> Result<OpSpec, String> {
     let rows = tile_op
         .dims
@@ -518,7 +625,29 @@ fn pointwise_opspec_from_tile_split(
     for name in in_names {
         args.push(mk(true, name, 0)?);
     }
-    args.push(mk(false, o_name, out_offset)?);
+    // The scatter-row output (see `OutView`): `["mb", "y", "out"]`, stick innermost, the
+    // physical `y` extent carrying the scatter's width W. The scales stay all-Active so the
+    // `y` dim is scale-active — the one `DeviceExtents::of_view` keys on when it lifts the
+    // view's physical extent over the plan's iterated one.
+    args.push(match out_view.scatter_interleave {
+        None => mk(false, o_name, out_view.offset)?,
+        Some(interleave) => AnyTensorArg::R3(
+            TensorArg::<3>::new(
+                false,
+                o_name.to_string(),
+                Role::Output,
+                [Scale::Active, Scale::Active, Scale::Active],
+                plan.iter_syms(["mb", "y", "out"]),
+                ["mb", "y", "out"],
+                "out",
+                Allocation::Hbm,
+            )
+            .map_err(|e| e.0)?
+            .with_offset(out_view.offset)
+            .with_device_extent("y", interleave)
+            .map_err(|e| e.0)?,
+        ),
+    });
 
     let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
     Ok(OpSpec {
@@ -715,50 +844,12 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // row-split mode — the Y-MAJOR rank-3 operand (`["y", "mb", "out"]`, the caller passing the
     // scale in the same order via [`EwOperand::scale_ymajor`]). rank-2 drops the size-1 `y` dim +
     // its scale so `for_view_df` classifies it RowBlocked (stick-major), matching the matmul I/O.
-    //
-    // ⭐⭐⭐ A FLAT-DECLARED INPUT KEEPS ITS OWN WALK in a stick-major op — the chained
-    // embedding relayout's law (the b2 defect, measured on card 2026-10-27): the operand's
-    // DECLARED layout is already the shape authority the family mint checks every swept window
-    // against, so the addressing reads the same law. Presenting a flat-declared input at the
-    // op's own rank-2 stick-major walk makes the identity a MEMCPY — both sides spell one
-    // walk, the producer's row-major bytes land in the OUT unchanged, and the body's
-    // stick-major read scrambles every row (W=1 byte-identical, which is how it hid). The
-    // flat spelling is `["mb", "y", "out"]` with `y = 1` BETWEEN the rows and the stick: the
-    // classifier stays Flat (a TRAILING `y = 1` would fold into the rank-2 stick-blocked
-    // law; a LEADING one keeps Flat but seats `mb` right before the stick), and the seating
-    // is the load-bearing half — dxp strides the dim IMMEDIATELY BEFORE the stick dim by
-    // ONE STICK (measured twice on card, 2026-10-27: the OUT's `["mb", "out", ...]` write
-    // walks mb at one stick — the scatter law itself — and a leading-y flat input read mb
-    // at one stick too, so row 1 of the chained embedding read a contiguous run one stick
-    // past row 0). With `y` on the pre-stick seat, `mb`'s stride is the row-major product
-    // `y·out` — the full row width — so the walk stays contiguous row-major, the producer's
-    // own write law, while the output keeps the RowBlocked walk the consumer reads.
-    //
-    // ⛔ AND THE WHOLE OP SPELLS ONE RANK (the `mixed` flag): dxp derives per-op structure
-    // from the args' rank — a rank-3 operand beside a rank-2 one is the mixed-rank op the
-    // bake REFUSES (`vector::_M_range_check: __n (which is 2) >= this->size() (which is 2)`,
-    // granite fp8 decode group_0, measured 2026-10-27; the same 3-axis assumption the
-    // `cols <= 64` guard below documents). So when any input takes the flat spelling, the
-    // output and every other operand present the rank-3 TRAILING-y spelling
-    // (`["mb", "out", "y"]`) — the trailing unit dim folds to the SAME RowBlocked
-    // classification the rank-2 form carries (`for_view_df`'s own rank-independence), the
-    // fp32 island's card-proven rank-3 RowBlocked shape. Homogeneous ops (no flat input)
-    // keep the rank-2 form unchanged. The row-split (`ymajor`) mode never coincides with
-    // `stickmajor` (its `cols` is one stick), so its head-outermost spelling and the flat
-    // input's `["mb", "y", "out"]` never meet in one op.
-    let mixed = stickmajor
-        && inputs.iter().any(|i| {
-            !i.out_broadcast()
-                && !i.mb_broadcast()
-                && matches!(i.declared().kind, crate::sdsc_abstract::StickKind::Flat)
-        });
     let mk = |is_input: bool,
               name: &str,
               scale: [Scale; 3],
-              off: u32,
-              flat: bool|
+              off: u32|
      -> Result<AnyTensorArg, String> {
-        if stickmajor && !flat && !mixed {
+        if stickmajor {
                 Ok(AnyTensorArg::R2(
                     TensorArg::<2>::new(
                         is_input,
@@ -767,27 +858,6 @@ pub fn pointwise_broadcast_opspec_from_tile(
                         [scale[0], scale[1]],
                         device_dims_r2,
                         ["mb", "out"],
-                        "out",
-                        Allocation::Hbm,
-                    )
-                    .map_err(|e| e.0)?
-                    .with_offset(off)
-                    .with_df(df)
-                    .with_row_blocked(matches!(df, Df::Fp32)),
-                ))
-            } else if stickmajor && flat {
-                // The flat-declared input's OWN walk, in a stick-major op: rank-3
-                // `["mb", "y", "out"]` with `y` a unit dim SEATED BEFORE the stick, so the
-                // classifier stays Flat and `mb` strides the full row width (see the
-                // comment above — the pre-stick seat is the one dxp strides by a stick).
-                Ok(AnyTensorArg::R3(
-                    TensorArg::<3>::new(
-                        is_input,
-                        name.to_string(),
-                        Role::Output,
-                        [scale[0], scale[2], scale[1]],
-                        plan.iter_syms(["mb", "y", "out"]),
-                        ["mb", "y", "out"],
                         "out",
                         Allocation::Hbm,
                     )
@@ -821,17 +891,6 @@ pub fn pointwise_broadcast_opspec_from_tile(
         };
     let mut args = Vec::with_capacity(inputs.len() + 1);
     for inp in inputs {
-        // ⭐ THE INPUT'S DECLARED KIND STATES ITS WALK (see `mk`) — for a FULL sweep only:
-        // a non-broadcast operand covers its tensor's whole `[rows, cols]`, so its declared
-        // Flat layout is the buffer's residency statement (the chained embedding's
-        // ChainRow synth, written row-major by the gather's own law). A BROADCAST operand
-        // (a per-row scalar like attention's `hm_rows`, an out-broadcast `col`/`col_at`) is
-        // framed by its PRODUCER's law — the reduce that wrote it — and its one-stick-wide
-        // window is law-independent, so it keeps the op's own rank-2 walk.
-        let flat = stickmajor
-            && !inp.out_broadcast()
-            && !inp.mb_broadcast()
-            && matches!(inp.declared().kind, crate::sdsc_abstract::StickKind::Flat);
         args.push(mk(
             true,
             inp.name(),
@@ -841,7 +900,6 @@ pub fn pointwise_broadcast_opspec_from_tile(
                 inp.scale()
             },
             inp.col_offset(),
-            flat,
         )?);
     }
     // The OUTPUT may write to a COLUMN SLICE of its tensor (`out_offset` cols in →
@@ -854,7 +912,6 @@ pub fn pointwise_broadcast_opspec_from_tile(
         o_name,
         [Scale::Active, Scale::Active, Scale::Active],
         out_offset,
-        false,
     )?);
     let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
     Ok(OpSpec {

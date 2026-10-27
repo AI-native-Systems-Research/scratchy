@@ -9445,6 +9445,21 @@ pub enum GatherDest {
     /// at the pin, so the run has no addressable offset (the destination entry must be 0) and
     /// the per-core slice is the read law's bound, checked against the pin at emit.
     CoreLocalLx,
+    /// ⭐⭐⭐ THE CHAIN'S SCATTER-LAW SCRATCH — the one dest whose entries do not land
+    /// consecutively. `rows` is the scatter's width W and `cols` the row width (hidden):
+    /// the buffer is the `[W, hidden]` ChainRow, and entry `j` of request `r` lands at
+    /// element `(j·W + r)·lanes` — the SAME bytes `StickLayout::row_blocked(W, hidden)`
+    /// places (row `r`'s stick `j` at stick `j·W + r`), which is why the consumer (the
+    /// relayout's memcpy and the body behind it) reads the buffer under that layout.
+    ///
+    /// The entry stride `W·lanes` is the dest view's OWN row pitch, stated by the door as
+    /// the view's physical `y` extent (`["mb", "y", "out"]`, stick innermost so a stick's
+    /// lanes stay contiguous) — never a per-call stride literal. Constructed at exactly
+    /// one site: the chained embedding's row gather, and only when row-major and
+    /// stick-major do NOT coincide (W > 1 and a multi-stick row) — at coincidence the
+    /// chain writes the OUT directly and this arm has no caller, so the W = 1 emission
+    /// is untouched by construction.
+    Scatter { rows: u32, cols: u32 },
 }
 
 /// ⭐⭐⭐⭐⭐ A HAND-BUILT COPY'S WHOLE DECLARED LAW AS ONE VALUE — the extents, the format, the run

@@ -753,6 +753,58 @@ pub(crate) fn mint_full_window<O: KindTag>(
     }
 }
 
+/// ⭐ THE SCATTER-WINDOW MINT — the chained head's ChainRow door ([`crate::sdsc_abstract::GatherDest::Scatter`]'s
+/// placement half): the run's `entries` ONE-STICK entries of request `r`, landing at the scatter law's
+/// own stride — entry `j` at element `(j·W + r)·lanes` of the `[W, row_width]` buffer whose residency is
+/// `StickLayout::row_blocked(W, row_width)`. The window is NOT contiguous, so [`mint_full_window`]
+/// cannot ask this question; this door states the stride-aware bound instead: the LAST element any
+/// entry touches is `base + (entries−1)·W·lanes + lanes`, and that contiguous SPAN must fit the buffer
+/// — the same two authorities (the handle's declared shape, and the placement footprint by name when a
+/// layout is at hand) pricing the same bytes the full-window mint prices, reached through a span whose
+/// end is exactly the scatter's furthest write.
+pub(crate) fn mint_scatter_window(
+    what: &str,
+    name: &str,
+    dest: &crate::sdsc_abstract::GatherDest,
+    df: Df,
+    base_elems: u64,
+    entries: u32,
+    layout: Option<&BundleLayout>,
+) -> Result<(), String> {
+    let crate::sdsc_abstract::GatherDest::Scatter {
+        rows: interleave,
+        cols: row_width,
+    } = dest
+    else {
+        return Err(format!(
+            "{what}: not a scatter destination — this mint states the scatter law and \
+             no other"
+        ));
+    };
+    let (interleave, row_width) = (*interleave, *row_width);
+    let lanes = df.elems_per_stick();
+    if interleave == 0 || !row_width.is_multiple_of(lanes) {
+        return Err(format!(
+            "{what}: the scatter buffer is [{interleave}, {row_width}] at {lanes} lanes per \
+             stick — a zero scatter width or a row width the stick does not divide is not a \
+             buffer this law can name"
+        ));
+    }
+    let span = (entries as u64)
+        .saturating_sub(1)
+        .saturating_mul(interleave as u64)
+        .saturating_mul(lanes as u64)
+        .saturating_add(lanes as u64);
+    mint_full_window(
+        &format!("{what} (scatter law: entry j of request r at (j·{interleave} + r)·{lanes})"),
+        &rb_df(name, interleave, row_width, df),
+        base_elems,
+        1,
+        u32::try_from(span).map_err(|_| format!("{what}: the scatter span {span} overflows a 32-bit window"))?,
+        layout,
+    )
+}
+
 /// Whether a `[rows, cols]` fp16 pointwise op over `n_inputs` operands runs WITHOUT time-tiling — the
 /// very tile op and tiler [`pointwise_broadcast_opspec_df`] builds, asked before the op is. A caller
 /// cuts an op this answers `false` for, because a time-tiled op with a broadcast operand is refused

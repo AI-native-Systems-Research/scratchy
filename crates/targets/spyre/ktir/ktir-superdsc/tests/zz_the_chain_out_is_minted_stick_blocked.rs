@@ -1,33 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! ⭐⭐⭐⭐⭐ THE CHAIN OUT IS MINTED STICK-BLOCKED — the relayout leg's write law,
+//! ⭐⭐⭐⭐⭐ THE CHAIN OUT IS MINTED STICK-BLOCKED — the memcpy leg's walk law,
 //! pinned at the emission against the body's read law.
 //!
-//! The chained embedding head's leg 4 (`{name}_rowflat`, a pointwise identity) is
-//! the device's own restickify: it carries the gather's FLAT `[W, hidden]` ChainRow
-//! synth into the OUT's RowBlocked placement — the layout the body's first op
-//! reads. One fact states both sides: the OUT's `StickLayout::row_blocked(W,
-//! hidden)` states the WRITE, and the body states the READ.
+//! The chained embedding head's leg 4 (`{name}_rowflat`, a pointwise identity)
+//! is the HOMOGENEOUS stick-major copy: leg 3 wrote the `[W, hidden]` ChainRow
+//! synth AT ITS OWN stick-blocked scatter (`GatherDest::Scatter` — the same
+//! bytes `StickLayout::row_blocked(W, hidden)` places), so the copy presents
+//! BOTH operands under that one walk and the OUT's RowBlocked placement is the
+//! same law the body's first op reads. One fact states all three sides.
 //!
-//! ⛔ THAT IS NOT A HYPOTHESIS — the defect it pins was measured on the card
-//! (granite-3.1-2b fp8, the b2 cell): the identity presented BOTH operands at the
-//! op's own rank-2 stick-major walk, so the copy was a MEMCPY — the gather's
-//! row-major bytes landed in the OUT unchanged (needle-exact: the full two-row
-//! row-major embedding found in BOTH the ChainRow synth and the OUT, nothing
-//! anywhere scattered), and the body's stick-major read scrambled BOTH rows'
-//! logits. W = 1 byte-identical (the laws coincide), which is how it hid.
+//! ⛔ THE DEFECT CLASS THIS PIN STANDS OVER was measured on the card
+//! (granite-3.1-2b fp8, the b2 cell): when the gather wrote the ChainRow
+//! ROW-MAJOR, the identity could not spell both walks at once — presenting the
+//! flat input at the op's own stick-major walk made it a MEMCPY of row-major
+//! bytes (the body's read scrambled both rows), and the mixed-rank/mixed-walk
+//! forms that kept the input's flat walk were unsound or unspelleable (the
+//! 10-27 ruling: the scatter moved to the WRITE side, where it is one law).
 //!
-//! What this pins, off the emitted wire of the relayout leg:
+//! What this pins, off the emitted wire of the memcpy leg:
 //!
-//! * the OUTPUT operand walks `StickLayout::row_blocked(W, hidden)`: rank-2
-//!   `["mb", "out"]`, `maxDimSizes_ = [-1, -1]` (dxp reconstructs the
-//!   stick-blocked walk), and every core's start sits at the row_blocked law of
-//!   ITS OWN corner — at W = 2 and W = 4;
-//! * the INPUT operand keeps the gather's flat law (its declared `fl` handle):
-//!   the flat walk's corner is recoverable from the input's own start, and the
-//!   output's start for THAT SAME CORE must be the row_blocked spelling of the
-//!   SAME corner — the per-core pairing a memcpy breaks;
-//! * at W = 1 the relayout mints NOTHING (the elision: the laws coincide, leg 3
+//! * BOTH operands walk rank-2 `["mb", "out"]` with `maxDimSizes_ = [-1, -1]`
+//!   (dxp reconstructs the stick-blocked walk) — the input taking rank-2 at
+//!   all is the rb declaration at work: a flat-declared input in a
+//!   stick-major op has no rank-2 spelling anymore, so a rank-2 input IS the
+//!   ChainRow's scatter being read under its own law;
+//! * every core's input and output starts PAIR — the same corner, the same
+//!   law, byte for byte: the copy moves sticks, never re-lays-out lanes;
+//! * at W = 1 the memcpy mints NOTHING (the elision: the laws coincide, leg 3
 //!   wrote the OUT's own name) — solo stays byte-identical.
 
 use ktir_core::arena::Arena;
@@ -186,19 +186,12 @@ fn the_out_is_minted_stick_blocked(w: u32) {
         panic!("W = {w}: the relayout leg exists (the laws do not coincide at W > 1)")
     });
 
-    // ⭐ THE OUTPUT'S WALK IS RANK-2 STICK-BLOCKED: `["mb", "out"]` with
-    // `maxDimSizes_ = [-1, -1]` — dxp reconstructs the stick-blocked walk.
-    let out_order = dsc
-        .get("scheduleTree_")
-        .and_then(|t| t.as_array())
-        .expect("a tree")
-        .iter()
-        .find(|n| {
-            n.get("nodeType_").and_then(|v| v.as_str()) == Some("allocate")
-                && n.get("ldsIdx_").and_then(|v| v.as_u64())
-                    == dsc["labeledDs_"][1]["ldsIdx_"].as_u64()
-        })
-        .expect("the output's allocate");
+    // ⭐ BOTH OPERANDS WALK RANK-2 STICK-BLOCKED: `["mb", "out"]` with
+    // `maxDimSizes_ = [-1, -1]` — dxp reconstructs the stick-blocked walk. The
+    // INPUT's rank-2 spelling is itself the pin's subject: a flat-declared
+    // input in a stick-major op has no rank-2 form (it would be the mixed-rank
+    // op dxp refuses), so a rank-2 input states the ChainRow's scatter being
+    // read under its own law.
     fn as_strs(v: &serde_json::Value) -> Vec<&str> {
         v.as_array()
             .expect("an array")
@@ -206,28 +199,43 @@ fn the_out_is_minted_stick_blocked(w: u32) {
             .map(|x| x.as_str().expect("a string"))
             .collect()
     }
-    assert_eq!(
-        as_strs(out_order.get("layoutDimOrder_").expect("an order")),
-        vec!["mb", "out", "y"],
-        "W = {w}: the OUT's layout is the rank-3 trailing-y spelling (one rank for the whole \
-         op — dxp refuses a mixed-rank op) whose trailing unit dim folds to the SAME \
-         RowBlocked classification the rank-2 form carries"
-    );
-    let max_dims = out_order
-        .get("maxDimSizes_")
-        .and_then(|v| v.as_array())
-        .expect("maxDimSizes_");
-    assert_eq!(max_dims.len(), 3, "W = {w}: the OUT's maxDimSizes_ is rank-3");
-    assert!(
-        max_dims.iter().all(|x| x.as_i64() == Some(-1)),
-        "W = {w}: the OUT's maxDimSizes_ is -1 per dim — dxp reconstructs the stick-blocked walk"
-    );
+    for operand in [0usize, 1usize] {
+        let order = dsc
+            .get("scheduleTree_")
+            .and_then(|t| t.as_array())
+            .expect("a tree")
+            .iter()
+            .find(|n| {
+                n.get("nodeType_").and_then(|v| v.as_str()) == Some("allocate")
+                    && n.get("ldsIdx_").and_then(|v| v.as_u64())
+                        == dsc["labeledDs_"][operand]["ldsIdx_"].as_u64()
+            })
+            .unwrap_or_else(|| panic!("operand {operand}'s allocate"));
+        assert_eq!(
+            as_strs(order.get("layoutDimOrder_").expect("an order")),
+            vec!["mb", "out"],
+            "W = {w}: operand {operand}'s layout is the rank-2 stick-major \
+             spelling — one rank and one walk for the whole op (a rank-3 operand \
+             beside a rank-2 one is the mixed-rank op dxp refuses)"
+        );
+        let max_dims = order
+            .get("maxDimSizes_")
+            .and_then(|v| v.as_array())
+            .expect("maxDimSizes_");
+        assert_eq!(max_dims.len(), 2, "W = {w}: operand {operand}'s maxDimSizes_ is rank-2");
+        assert!(
+            max_dims.iter().all(|x| x.as_i64() == Some(-1)),
+            "W = {w}: operand {operand}'s maxDimSizes_ is -1 per dim — dxp reconstructs the stick-blocked walk"
+        );
+    }
 
-    // ⭐⭐ THE PER-CORE PAIRING — the check a memcpy breaks. The input walks FLAT
-    // (the gather's own write law), and a flat start is INJECTIVE over the core
-    // grid: element offset `r · hidden + c` names the corner (r, c) outright. The
-    // output's start for THAT SAME CORE must be the row_blocked spelling of the
-    // SAME corner — `(c / 64) · (W · 64) + r · 64`, one `StickLayout::dev_off`.
+    // ⭐⭐ THE PER-CORE PAIRING — the copy moves sticks, never re-lays-out
+    // lanes. Both operands walk the SAME `StickLayout::row_blocked(W, hidden)`
+    // (the input's rank-2 spelling IS the scatter's own law — see the header),
+    // so for every core the input's start delta and the output's start delta
+    // name the SAME corner under the SAME law: byte for byte equal. A
+    // disagreement is a re-laid-out copy — the measured defect class, in
+    // which the input's walk and the output's walk spelled different laws.
     let rb = StickLayout::row_blocked(w as usize, HIDDEN as usize);
     let flat = StickLayout::flat(w as usize, HIDDEN as usize);
     assert!(
@@ -243,20 +251,22 @@ fn the_out_is_minted_stick_blocked(w: u32) {
         let o0 = *out
             .get(core)
             .unwrap_or_else(|| panic!("core {core} starts both operands"));
-        // The input's flat delta names the corner — elements, then bytes (wordLength 2).
-        let d_in = ((i0 - inp_min) / 2) as usize;
-        let (r, c) = (d_in / HIDDEN as usize, d_in % HIDDEN as usize);
-        let want_out = rb.dev_off(r, c) as i64 * 2;
-        let got_out = o0 - out_min;
+        let d_in = i0 - inp_min;
+        let d_out = o0 - out_min;
         assert_eq!(
-            got_out, want_out,
-            "W = {w}, core {core}: the OUT's start must be the row_blocked law \
-             ({rb:?}) of the corner ({r}, {c}) the input's own flat start names — \
-             got {got_out} B, want {want_out} B. A start equal to the FLAT spelling \
-             ({}) is the measured b2 defect: the identity memcpy'd the gather's \
-             row-major bytes into the OUT and the body's stick-major read scrambled \
-             both rows",
-            flat.dev_off(r, c) as i64 * 2
+            d_in, d_out,
+            "W = {w}, core {core}: the memcpy pairs the SAME corner under the SAME \
+             walk on both sides (input delta {d_in} B, output delta {d_out} B) — a \
+             disagreement is a copy that re-lays-out lanes, the defect class this \
+             leg's homogeneous form exists to make unspelleable"
+        );
+        // And the corner is a WHOLE STICK of the rb law — a core's start is
+        // always a stick boundary, never mid-stick.
+        assert_eq!(
+            d_in % (64 * 2),
+            0,
+            "W = {w}, core {core}: a stick-major walk starts every core at a stick \
+             boundary — {d_in} B is mid-stick"
         );
     }
 }

@@ -6177,8 +6177,9 @@ pub fn embed_row_gather(
     // columns — nothing to interleave); the relayout leg exists exactly when it does
     // not. A WIDTH BRANCH IS NOT PERMITTED HERE: the elision is that derived layout
     // fact, never `if width == 1`. While it holds, leg 3 writes the OUT's own name;
-    // when it does not, leg 3 writes a FLAT `[W, hidden]` ChainRow synth and a
-    // pointwise-identity relayout carries it into the out's RowBlocked placement.
+    // when it does not, leg 3 writes the `[W, hidden]` ChainRow synth AT THE SCATTER
+    // LAW (its stick-blocked residency, `GatherDest::Scatter`) and a pointwise-identity
+    // memcpy carries it into the out's RowBlocked placement.
     let rows_coincide = crate::sdsc_abstract::row_major_is_stick_major(width as usize, hidden as usize);
     let rowg_dest_name = if rows_coincide {
         out.name()
@@ -6296,7 +6297,9 @@ pub fn embed_row_gather(
     // the SOURCE STICK of the transposed row's `j`-th sub-row — the restickify writes
     // row `l`'s elements at sticks `{64·j + l}` (its slab-major output law), so entry
     // `j` reads exactly stick `64·j + l` (`skip_addr = page × out = 64` elements, one
-    // stick) and lands it as dest stick `j` of the request's `[1, hidden]` row. A FLAT
+    // stick) and lands it as dest stick `j·W + r` of the ChainRow's scatter at the
+    // non-coincident widths (`j` of the request's own `[1, hidden]` row at W = 1, where
+    // the elision writes the OUT directly). A FLAT
     // entry — the old one-entry read, `page = hidden/stk` — walks the `hidden/stk`
     // consecutive sticks `[l·(hidden/stk), …)`, a patch of raw weight bytes, not the
     // row. The per-core charge is 4 × one stick's bytes = 512 B, far under the vendor
@@ -6309,7 +6312,9 @@ pub fn embed_row_gather(
     // remedy (`GatherScratch::copies`), verbatim: op `(r, b)` runs
     // `min(cap, row_entries − cap·b)` entries, reads the index at
     // `EntryBase::of_scattered_row(r·l_sticks + b, width·l_sticks)` (row r's stick b of the
-    // one-stick-wide lane buffer, at the scatter law's own spelling), and lands at `DestEntry::of_entries(r·row_entries + cap·b)` — the
+    // one-stick-wide lane buffer, at the scatter law's own spelling) and lands at the DEST's
+    // OWN LAW — `DestEntry::of_entries(r·row_entries + cap·b)` at coincidence (the OUT, entries
+    // consecutive), `DestEntry::of_entries(cap·b·W + r)` at the ChainRow's scatter — the
     // dest entry and the index base in the WINDOW-GRANULAR LOCKSTEP, stated at both
     // sites rather than derived so their agreement is visible. The index VALUES carry no
     // source base — they are sticks RELATIVE TO THE REQUEST'S OWN slabt window, and the
@@ -6357,14 +6362,43 @@ pub fn embed_row_gather(
                         // byte-identity); at r ≥ 1 the l-ramp's window-relative
                         // sticks resolve inside request r's own window.
                         run: crate::superdsc_opspec::GatherRun::split(
+                            // ⭐ THE DEST ENTRY, IN THE DEST'S OWN LAW. At coincidence
+                            // (`rows_coincide` — the elision, W=1 and one-stick rows) the
+                            // destination is the OUT itself, entries consecutive: `r·row_entries
+                            // + first_entry`, ZERO at r=0 (the W=1 byte-identity). Otherwise the
+                            // destination is the ChainRow's SCATTER — entry `j` of request `r`
+                            // at stick `j·W + r` — so the run's first entry `first_entry` of
+                            // request `r` is `first_entry·W + r`, also ZERO at r=0 with W=1
+                            // (`first_entry·1 + 0 = first_entry`, the SAME descriptor the
+                            // elision's own arm takes — but the elision already took r=0 out of
+                            // this arm, so the W=1 emission never reaches it).
                             crate::superdsc_opspec::DestEntry::of_entries(
-                                r * row_entries + first_entry,
+                                if rows_coincide {
+                                    r * row_entries + first_entry
+                                } else {
+                                    first_entry * width + r
+                                },
                             ),
                             slabt_request_base(r, stk, hidden),
                         ),
-                        dest: crate::sdsc_abstract::GatherDest::Scratch {
-                            rows: width * hidden,
-                            cols: stk,
+                        dest: if rows_coincide {
+                            crate::sdsc_abstract::GatherDest::Scratch {
+                                rows: width * hidden,
+                                cols: stk,
+                            }
+                        } else {
+                            // ⭐⭐⭐ THE SCATTER-LAW DESTINATION — the `[W, hidden]` ChainRow at
+                            // its own stick-blocked residency: entry `j` of request `r` lands at
+                            // element `(j·W + r)·lanes`, the SAME bytes
+                            // `StickLayout::row_blocked(W, hidden)` places, which is why leg 4
+                            // reads the buffer under that layout and the body behind it needs no
+                            // relayout of its own. The row pitch `W·lanes` rides the OUTPUT
+                            // ARG's physical `y` extent (the scatter view), never a stride
+                            // literal — see `GatherDest::Scatter` and the mint it takes.
+                            crate::sdsc_abstract::GatherDest::Scatter {
+                                rows: width,
+                                cols: hidden,
+                            }
                         },
                     },
                 )
@@ -6374,20 +6408,14 @@ pub fn embed_row_gather(
             ));
         }
     }
-    // ⭐⭐⭐ LEG 4 — THE RELAYOUT, exactly when the layouts do NOT coincide (the
-    // elision's own derived fact, never a width branch): a pointwise-identity copy of
-    // the flat `[W, hidden]` ChainRow synth into the out's own name, the device's own
-    // restickifying. While they coincide this leg mints NOTHING and leg 3 wrote the
-    // out's name directly — the W=1 (and one-stick-wide) byte-identity claim rides
-    // that elision.
-    // ⭐⭐⭐ LEG 4 — THE RELAYOUT, exactly when the layouts do NOT coincide (the
-    // elision's own derived fact, never a width branch): a POINTWISE IDENTITY
-    // through the existing `pw1` door (the C1 ruling — zero new emitter
-    // surface; the dsc2.cpp per-operand walk law supports the mix), a FLAT
-    // `[W, hidden]` ChainRow handle in, the OUT's own RowBlocked handle out.
-    // While they coincide this leg mints NOTHING and leg 3 wrote the out's
-    // name directly — the W=1 (and one-stick-wide) byte-identity claim rides
-    // that elision.
+    // ⭐⭐⭐ LEG 4 — THE MEMCPY, exactly when the layouts do NOT coincide (the elision's own
+    // derived fact, never a width branch): a POINTWISE IDENTITY through the existing `pw1`
+    // door (the C1 ruling — zero new emitter surface), the ChainRow's OWN RowBlocked handle in
+    // (the scatter IS `StickLayout::row_blocked(W, hidden)`'s bytes — leg 3 wrote them at that
+    // law, so the copy presents both sides under the same walk), the OUT's own RowBlocked
+    // handle out: the homogeneous stick-major copy. While they coincide this leg mints NOTHING
+    // and leg 3 wrote the out's name directly — the W=1 (and one-stick-wide) byte-identity
+    // claim rides that elision.
     let relayout: Option<super::EmittedOp> = if rows_coincide {
         None
     } else {
@@ -6396,7 +6424,7 @@ pub fn embed_row_gather(
             "identity",
             crate::sdsc_abstract::RowCount::of_token_rows(width),
             crate::sdsc_abstract::BlockCols::of_feature_cols(hidden),
-            super::In::full(&super::fl(&rowg_dest_name, width, hidden)),
+            super::In::full(&rb(&rowg_dest_name, width, hidden)),
             &rb(&out.name(), width, hidden),
             sym_id_base,
             layout,

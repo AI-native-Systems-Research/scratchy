@@ -26,6 +26,14 @@
 //! * leg 2's transpose WRITES request 1's slabt window at the SAME delta —
 //!   the write and the read cannot disagree, because both spell the base
 //!   through the one `slabt_request_base` the door states.
+//!
+//! And the scatter law's own pin (`the_row_gather_writes_the_chain_row_scatter`):
+//! leg 3's DESTINATION starts — request `r`'s op writes its entries at the
+//! ChainRow's stick-blocked scatter, entry `j` at element `(j·W + r)·lanes`
+//! (`GatherDest::Scatter`): one request's window past request 0's per the
+//! COLUMN CORNER `r·lanes`, and consecutive entries `W·lanes` apart — never
+//! the contiguous `r·row_entries·lanes` the row-major scratch spelled (the
+//! measured b2 defect class the scatter replaced).
 
 use ktir_core::arena::Arena;
 use ktir_core::ir::IRFunction;
@@ -141,6 +149,41 @@ fn operand_start(dsc: &serde_json::Value, i: usize) -> Option<i64> {
         .and_then(min_start)
 }
 
+/// One operand's allocate node (by `labeledDs_` index) — its per-core start
+/// addresses, as a map keyed by the core coordinate the dsc spells.
+fn core_starts(dsc: &serde_json::Value, i: usize) -> std::collections::BTreeMap<String, i64> {
+    let lds = dsc
+        .get("labeledDs_")
+        .and_then(|a| a.as_array())
+        .and_then(|a| a.get(i))
+        .and_then(|v| v.get("ldsIdx_"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| panic!("operand {i} names an ldsIdx"));
+    let node = dsc
+        .get("scheduleTree_")
+        .and_then(|t| t.as_array())
+        .expect("a tree")
+        .iter()
+        .find(|n| {
+            n.get("nodeType_").and_then(|v| v.as_str()) == Some("allocate")
+                && n.get("ldsIdx_").and_then(|v| v.as_u64()) == Some(lds)
+        })
+        .unwrap_or_else(|| panic!("operand {i} has an allocate node"));
+    let mut out = std::collections::BTreeMap::new();
+    for (k, v) in node
+        .get("startAddressCoreCorelet_")
+        .and_then(|s| s.get("data_"))
+        .and_then(|d| d.as_object())
+        .expect("per-core starts")
+    {
+        let a = v.as_str().and_then(|s| s.parse::<i64>().ok()).or(v.as_i64());
+        if let Some(a) = a {
+            out.insert(k.clone(), a);
+        }
+    }
+    out
+}
+
 /// Every `(name, dsc)` the emitted ops carry.
 fn dscs_of(
     ops: &[ktir_superdsc::emit::EmittedOp],
@@ -234,4 +277,102 @@ fn the_row_gather_reads_its_own_requests_window() {
          per-request base leg 3 reads — a disagreement here is a window the \
          read names but the write never filled"
     );
+}
+
+/// ⭐⭐⭐⭐⭐ THE ROW GATHER WRITES THE CHAIN ROW'S SCATTER — the 10-27 ruling's
+/// destination law, pinned at the emission.
+///
+/// At the non-coincident widths leg 3's destination is the `[W, hidden]`
+/// ChainRow at its STICK-BLOCKED scatter (`GatherDest::Scatter`): entry `j` of
+/// request `r` lands at element `(j·W + r)·lanes` — the SAME bytes
+/// `StickLayout::row_blocked(W, hidden)` places, which is why leg 4 is a plain
+/// stick-major copy and the body behind it needs no relayout of its own.
+///
+/// Off the emitted wire, at W = 2 / `hidden` = 128 (two one-stick entries per
+/// request, one op per request, one entry per core):
+///
+/// * each op's DESTINATION starts stride `W·lanes` ELEMENTS between its
+///   consecutive entries — the scatter's row pitch, never the contiguous
+///   `lanes` the row-major scratch spelled;
+/// * request 1's op sits exactly `lanes` ELEMENTS (the column corner `r`)
+///   past request 0's per core — `first_entry·W + r` against `r = 0` — never
+///   `row_entries·lanes` past (the row-major window the measured b2 defect
+///   wrote).
+#[test]
+fn the_row_gather_writes_the_chain_row_scatter() {
+    let regions = [
+        region(301, W, 32, false),          // s stick
+        region(302, W, 32, false),          // l stick: [W·l_sticks, 32] at l_sticks = 1
+        region(303, HIDDEN, VOCAB, false),  // weight
+        region(304, W, HIDDEN, true),       // out
+    ];
+    let l = layout();
+    let mut sym = 0i64;
+    let ops = embed_row_gather("erg", &node(), &regions, &mut sym, Some(&l))
+        .expect("the two-request chained head lowers");
+
+    let rowg: Vec<(String, serde_json::Value)> = dscs_of(&ops)
+        .into_iter()
+        .filter(|(n, _)| n.contains("rowg"))
+        .collect();
+    assert_eq!(
+        rowg.len(),
+        2,
+        "W = 2 and l_sticks = 1 is one row-gather op per request, got {:?}",
+        rowg.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+    let by_req = |r: char| {
+        rowg.iter()
+            .find(|(n, _)| n.contains(&format!("rowg{r}x")))
+            .unwrap_or_else(|| panic!("no rowg op for request {r}: {rowg:?}"))
+            .1
+            .clone()
+    };
+
+    // The DESTINATION is the descriptor's operand 2 (source, index, destination).
+    // Its per-core starts, sorted: core `c` owns entry `c` (the division is by
+    // whole entries over MAX_CORES), so the sorted starts ARE the entry order.
+    let dest_starts = |r: char| -> Vec<i64> {
+        let mut v: Vec<i64> = core_starts(&by_req(r), 2).values().copied().collect();
+        assert_eq!(
+            v.len(),
+            (HIDDEN / 64) as usize,
+            "one start per one-stick entry (the entry-per-core cut)"
+        );
+        v.sort_unstable();
+        v
+    };
+    let d0 = dest_starts('0');
+    let d1 = dest_starts('1');
+
+    // ⛔ THE SCATTER STRIDE: consecutive entries of one request land `W·lanes`
+    // ELEMENTS apart — 2 · 64 elements = 256 bytes — never `lanes` (128 bytes,
+    // the contiguous row-major law the ChainRow replaced).
+    let scatter_stride: i64 = (W * 64) as i64 * 2;
+    for (i, w) in d0.windows(2).enumerate() {
+        assert_eq!(
+            w[1] - w[0],
+            scatter_stride,
+            "request 0, entry {i}: the ChainRow's entries land W·lanes apart (the \
+             stick-blocked scatter), not contiguously — a stride of {} is the \
+             row-major scratch law, which leg 4 cannot copy out stick-major",
+            w[1] - w[0]
+        );
+    }
+    assert_eq!(d1[1] - d1[0], scatter_stride, "request 1 strides the scatter too");
+
+    // ⛔ AND THE COLUMN CORNER: request 1's entries sit exactly `lanes` ELEMENTS
+    // (128 bytes) past request 0's, per entry — `(first_entry·W + r)` against
+    // `r = 0`. The row-major law would put them a whole REQUEST WINDOW
+    // (`row_entries·lanes` elements) past — the measured b2 defect.
+    let column_corner: i64 = 64 * 2;
+    for i in 0..d0.len() {
+        assert_eq!(
+            d1[i] - d0[i],
+            column_corner,
+            "entry {i}: request 1's destination sits one COLUMN CORNER (lanes \
+             elements) past request 0's — the scatter law's `r` — and never a \
+             whole request window past it (the row-major defect class)"
+        );
+    }
 }
