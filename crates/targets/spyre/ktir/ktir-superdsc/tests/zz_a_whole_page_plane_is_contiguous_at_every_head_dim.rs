@@ -44,17 +44,16 @@
 //! `blocks()` entries — the vendor's `[num_blocks, INT32_ELEMS_PER_STICK]` layout, one stick per request.
 
 use ktir_superdsc::sdsc_abstract::{
-    CopyDims, FeatIdx, GatherEntry, GatherScratch, KvCoord, KvHead, KvPlane, KvSlot, POOL_STICK,
-    PagePlaneExtent, PageScratch, PagedKvPool, QueryRowCount, gather_entries_per_page,
-    gather_entry_ceiling,
+    FeatIdx, KvCoord, KvHead, KvPlane, KvSlot, POOL_STICK, PagePlaneExtent, PagedKvPool,
+    gather_entries_per_page, gather_entry_ceiling,
 };
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 
 /// ⭐⭐⭐⭐⭐ THE KV-HEAD SWEEP THAT DID NOT EXIST. Every `of_pass` call site in this suite passed 8, and
 /// `PagePlaneExtent::blocks` is `nkvh * PAGE_SLOTS / POOL_STICK` — 32 at nkvh=8, which is ALSO
-/// `CopyDims::ENTRIES_PER_OP` and ALSO `PageScratch::ENTRIES_PER_PASS_MAX`. Three unrelated quantities
-/// with one value, never separated by a test, and the one that moves is this axis.
+/// `CopyDims::ENTRIES_PER_OP`. Two unrelated quantities with one value, never separated by a test, and
+/// the one that moves is this axis.
 const NKVH_SWEEP: [usize; 4] = [4, 8, 16, 32];
 
 /// And the head-dim sweep, which must include a dim where `hd != POOL_STICK` (the pin) and one where
@@ -126,7 +125,7 @@ fn a_whole_page_plane_is_a_hole_free_bijection_for_every_plane_at_both_head_dims
 /// The pin dxp derives `skip_addr` from, over the WHOLE `nkvh` x `hd` grid.
 ///
 /// ⭐ THE EVENNESS IS NOT HERE ANY MORE, AND ITS ABSENCE IS THE POINT. `PagePlaneExtent::pin_is_even` was
-/// a runtime `bool` that `PageScratch::of_pass` branched on, and its test sat inside an
+/// a runtime `bool` the (since-deleted) page scratch door branched on, and its test sat inside an
 /// hd-multiple-of-64 loop — so it asserted its own premise and could never fail. The pin is `hd` sticks
 /// and `of_pool` admits only whole multiples of `POOL_STICK`, so "the pin is even" is a statement about
 /// the STICK, and it now lives where a statement about a constant belongs: a module-level
@@ -170,71 +169,6 @@ fn the_pin_is_one_stick_block_at_every_head_dim_and_kv_head_count() {
     }
 }
 
-/// ⭐⭐⭐⭐⭐ THE FOUR COINCIDING 32s, SEPARATED — the test that exists because NOTHING swept `nkvh`.
-///
-/// At the one geometry every call site used (nkvh=8, hd=64) these are all 32 and all unrelated:
-///
-/// | quantity | what it is | `nkvh*hd` dependence |
-/// |---|---|---|
-/// | `CopyDims::ENTRIES_PER_OP` | the int32 IBR stick WIDTH | none — the index's dtype |
-/// | `PageScratch::ENTRIES_PER_PASS_MAX` | the widest batch rung | none — the ladder |
-/// | `PagePlaneExtent::blocks` | entries one request's plane needs | `nkvh * PAGE_SLOTS / POOL_STICK` |
-/// | `PagePlaneExtent::lx_entries_per_op` | entries whose per-core chunk fits LX | `~1/hd` |
-///
-/// Only the third and fourth move, and they move on DIFFERENT axes — which is why a sweep of `hd` alone
-/// could not have found the conflation either.
-#[test]
-fn the_four_coinciding_thirty_twos_are_four_different_quantities() {
-    // The two constants do not move at all.
-    assert_eq!(CopyDims::ENTRIES_PER_OP, 32);
-    assert_eq!(PageScratch::ENTRIES_PER_PASS_MAX, 32);
-    for nkvh in NKVH_SWEEP {
-        for hd in HD_SWEEP {
-            let pool = PagedKvPool::new(nkvh as u32, hd as u32);
-            let plane = PagePlaneExtent::of_pool(pool).expect("admitted");
-            // `blocks` moves with `nkvh` ONLY — `hd` cancels.
-            assert_eq!(
-                plane.blocks(),
-                nkvh as u64 * PagedKvPool::PAGE_SLOTS as u64 / POOL_STICK as u64,
-                "nkvh={nkvh} hd={hd}: a request's entry count is nkvh * PAGE_SLOTS / stick"
-            );
-            assert_eq!(
-                plane.blocks() == 32,
-                nkvh == 8,
-                "blocks() is 32 iff nkvh == 8"
-            );
-            // The LX ceiling moves with `hd` ONLY, and it is far above the IBR stick at every real
-            // geometry — so the CUT is the IBR stick's, which is what the emitter must be derived from.
-            assert_eq!(
-                plane.lx_entries_per_op(),
-                (ktir_superdsc::superdsc_opspec::USABLE_LX_BYTES / (4 * plane.entry_bytes()))
-                    * ktir_superdsc::superdsc_opspec::MAX_CORES as u64,
-                "nkvh={nkvh} hd={hd}: the LX ceiling is a PER-CORE budget times the cores"
-            );
-            assert!(
-                plane.lx_entries_per_op() > CopyDims::ENTRIES_PER_OP as u64,
-                "nkvh={nkvh} hd={hd}: LX admits {} entries, so the binding ceiling is the IBR stick — \
-                 if this ever fails the cut changes and `entries_per_op` already takes the min",
-                plane.lx_entries_per_op()
-            );
-        }
-    }
-    // And the LX term DOES bind somewhere, so the `min` is not decoration: one entry of a 4096-wide head
-    // is 512 KB, whose double-buffered source+destination pair is 2 MB against a 1.6 MB LX.
-    let huge = PagePlaneExtent::of_pool(PagedKvPool::new(8, 4096)).expect("stick multiple");
-    assert_eq!(
-        huge.lx_entries_per_op(),
-        0,
-        "hd=4096: one entry's own chunk does not fit LX, which `of_pass` must refuse so the emitter \
-         fails the BUILD rather than dropping the gather"
-    );
-    assert_eq!(
-        PageScratch::of_pass(PagedKvPool::new(8, 4096), QueryRowCount::of_mq(8)),
-        None,
-        "hd=4096: an inexpressible entry is a refusal here and a build-time panic at the door"
-    );
-}
-
 /// CLAIM 3, the contrast: the OLD granularity. A 64-slot WINDOW of `Knat`/`V` is one contiguous run only
 /// at `hd == POOL_STICK`. This is the refusal's actual cause, pinned so it cannot be re-derived as a
 /// property of the gather or of the hardware.
@@ -270,71 +204,9 @@ fn a_sixty_four_slot_window_is_contiguous_only_at_one_stick_which_is_why_the_old
     }
 }
 
-/// ⭐⭐⭐⭐⭐ THE SCRATCH IS THE **SAME FUNCTION** AS THE POOL, not a second derivation of it.
-///
-/// A page-granular row is a byte-for-byte copy of the page plane, so element `(request, kvh, slot, feat)`
-/// of the scratch must be `request * cols + PagedKvPool::addr(...)`. Pinning it against the real `addr` is
-/// what stops the scratch's head stride and the pool's from drifting apart — the defect class that has
-/// produced a wrong answer in this neighbourhood more than once ("one quantity computed twice").
-#[test]
-fn the_scratch_head_corner_is_the_pools_own_addr_for_every_plane_and_head_dim() {
-    for nkvh_n in NKVH_SWEEP {
-        for hd in HD_SWEEP {
-            let pool = PagedKvPool::new(nkvh_n as u32, hd as u32);
-            let nkvh = NonZeroU32::new(nkvh_n as u32).unwrap();
-            let scratch = PageScratch::of_pass(pool, QueryRowCount::of_mq(8)).expect("admitted");
-            assert_eq!(
-                scratch.cols(),
-                nkvh_n as u64 * hd as u64 * PagedKvPool::PAGE_SLOTS as u64
-            );
-
-            for plane in [KvPlane::Knat, KvPlane::V, KvPlane::Kt] {
-                for r in 0..scratch.mq() {
-                    for h in 0..nkvh_n as u32 {
-                        let kvh = KvHead::new(h, nkvh).unwrap();
-                        let pool_corner = pool.addr(KvCoord::block(plane, kvh)) as u64;
-                        assert_eq!(
-                            scratch.head_off(r, h).expect("in range"),
-                            r as u64 * scratch.cols() + pool_corner,
-                            "nkvh={nkvh_n} hd={hd} {plane:?} request {r} head {h}: the scratch's head \
-                             corner disagrees with PagedKvPool::addr — the matmul would read another \
-                             head's slots"
-                        );
-                        // ⭐ AND THE SLAB REACHES IT THROUGH THE SAME LAW. The gathered fold's legs are
-                        // one op per (head, request, SLAB), and each op's base is this corner plus the
-                        // pool's own `at_feat` — never a slab term added here.
-                        for s in 0..(hd as u32 / POOL_STICK) {
-                            let coord = KvCoord::block(plane, kvh).at_feat(FeatIdx::of_slab(s));
-                            assert_eq!(
-                                scratch.coord_off(r, &pool, coord).expect("in range"),
-                                r as u64 * scratch.cols() + pool.addr(coord) as u64,
-                                "nkvh={nkvh_n} hd={hd} {plane:?} r={r} h={h} slab={s}: the gathered \
-                                 slab base is the pool's own address plus this request's row"
-                            );
-                        }
-                    }
-                }
-            }
-            assert_eq!(
-                scratch.head_off(8, 0),
-                None,
-                "nkvh={nkvh_n} hd={hd}: past the batch must refuse"
-            );
-            assert_eq!(
-                scratch.head_off(0, nkvh_n as u32),
-                None,
-                "nkvh={nkvh_n} hd={hd}: past the head count must refuse"
-            );
-        }
-    }
-}
-
-/// ⭐⭐⭐⭐⭐ THE SAME IDENTITY AT **BOTH** HEAD DIMS, asked of the PLANE rather than the scratch — so the
-/// derivation a future widening needs survives the door's refusal instead of being deleted with it.
-///
-/// The plane's head corner is the pool's own `addr` for every plane and head at hd=128 as well as hd=64.
-/// That is what makes the page-granular COPY expressible at two slabs; what is refused
-/// ([`PageScratch::of_pass`]) is the INDEX serving both legs from one table there, on card evidence.
+/// ⭐⭐⭐⭐⭐ THE PLANE'S HEAD CORNER IS THE POOL'S OWN `addr` AT **BOTH** HEAD DIMS — for every plane and
+/// head at hd=128 as well as hd=64, which is what makes the per-slab block gather expressible at two
+/// slabs.
 #[test]
 fn the_plane_head_corner_is_the_pools_own_addr_at_both_head_dims() {
     let nkvh = NonZeroU32::new(8).unwrap();
@@ -365,152 +237,6 @@ fn the_plane_head_corner_is_the_pools_own_addr_at_both_head_dims() {
     }
 }
 
-/// THE ENTRY COUNT, which is the measured cause of the rung-8 corruption — swept over the WHOLE
-/// `nkvh` x `hd` x `mq` grid, because every part of it used to be checked at one point of that grid.
-///
-/// ⭐ AND THE CUT IS THE INVARIANT, NOT THE OP COUNT. A request's run is `blocks()` entries and an op may
-/// name `entries_per_op()` of them; the ops of one request are contiguous index STICKS and contiguous
-/// destination entries, and every op's index fits the one stick dxp loads. That holds at nkvh=32/hd=256
-/// (16 ops per request) exactly as at nkvh=8 (one), which is what the old `blocks() > ENTRIES_PER_OP`
-/// refusal replaced with "no gather at all".
-#[test]
-fn every_copy_op_names_at_most_one_index_stick_at_every_geometry() {
-    for nkvh in NKVH_SWEEP {
-        for hd in HD_SWEEP {
-            for mq in [1u32, 2, 4, 8, 16, 32] {
-                let pool = PagedKvPool::new(nkvh as u32, hd as u32);
-                let scratch = PageScratch::of_pass(pool, QueryRowCount::of_mq(mq))
-                    .unwrap_or_else(|| panic!("nkvh={nkvh} hd={hd} mq={mq} must be admitted"));
-                let at = format!("nkvh={nkvh} hd={hd} mq={mq}");
-                assert_eq!(scratch.rows(), mq, "{at}: a row is a REQUEST");
-                assert!(
-                    scratch.rows() <= PageScratch::ENTRIES_PER_PASS_MAX,
-                    "{at}: rows exceed the widest batch rung"
-                );
-                assert_eq!(scratch.entry_page(), scratch.plane().entry_sub_rows());
-                assert_eq!(scratch.sub_rows(), mq as u64 * scratch.plane().sub_rows());
-                let (cut, per_row) = (scratch.entries_per_op(), scratch.entries_per_row() as u32);
-                assert!(
-                    cut > 0 && cut <= CopyDims::ENTRIES_PER_OP,
-                    "{at}: the cut is a positive number of entries no wider than the IBR stick"
-                );
-                assert_eq!(
-                    scratch.ops_per_row(),
-                    per_row.div_ceil(cut),
-                    "{at}: ops per request is the run divided by the cut"
-                );
-                assert_eq!(
-                    scratch.ops_per_row() == 1,
-                    nkvh <= 8,
-                    "{at}: one op per request iff the run fits one IBR stick — nkvh=8 is the boundary \
-                     and `hd` has nothing to do with it"
-                );
-                let ops: Vec<_> = scratch.copies().collect();
-                assert_eq!(
-                    ops.len(),
-                    mq as usize * scratch.ops_per_row() as usize,
-                    "{at}: one copy op per (request, cut)"
-                );
-                // ⭐ EVERY OP, MEASURED FROM ITS OWN DECLARED EXTENTS (`mb / page`) — the division dxp
-                // itself performs — and not from the scratch's row count, which is what the two sides
-                // used to derive separately.
-                let mut covered: Vec<u32> = Vec::new();
-                for (i, cp) in ops.iter().enumerate() {
-                    let (r, j) = (
-                        i as u32 / scratch.ops_per_row(),
-                        i as u32 % scratch.ops_per_row(),
-                    );
-                    let entries = cp.dims().entries().expect("page divides mb");
-                    assert!(
-                        cp.dims().fits_one_index_stick(),
-                        "{at} r={r} j={j}: an op's index must fit the ONE stick dxp loads for it"
-                    );
-                    assert_eq!(
-                        entries,
-                        (per_row - j * cut).min(cut),
-                        "{at} r={r} j={j}: the declared entry count is this op's own run"
-                    );
-                    // ⛔ ONE INDEX STICK PER OP. Two ops sharing a stick would give the second a base of
-                    // `r*32 + cut` words, which is not a stick, and its 32-word load would straddle both.
-                    assert_eq!(
-                        cp.index_base().entries(),
-                        (r * scratch.ops_per_row() + j) * CopyDims::ENTRIES_PER_OP,
-                        "{at} r={r} j={j}: op (r,j)'s entries live at index stick r*ops + j"
-                    );
-                    // ⛔ AND THE DESTINATION IS **NOT** THE INDEX BASE. Entries advance one whole stick
-                    // per op while the destination advances only the entries the op covers; deriving one
-                    // from the other put every op's rows `blocks()`× off.
-                    assert_eq!(
-                        cp.dest_entry(),
-                        r * per_row + j * cut,
-                        "{at} r={r} j={j}: the destination entry is r*blocks + j*cut"
-                    );
-                    covered.extend(cp.dest_entry()..cp.dest_entry() + entries);
-                }
-                // ⭐ AND THE OPS TILE THE WHOLE SCRATCH EXACTLY ONCE — no gap (an unwritten run is read
-                // as keys) and no overlap (one op's blocks over another's rows).
-                let want: Vec<u32> = (0..mq * per_row).collect();
-                assert_eq!(
-                    covered, want,
-                    "{at}: the pass's ops must tile destination entries [0, mq*blocks) in order, once"
-                );
-            }
-            let pool = PagedKvPool::new(nkvh as u32, hd as u32);
-            assert_eq!(
-                PageScratch::of_pass(pool, QueryRowCount::of_mq(33)),
-                None,
-                "nkvh={nkvh} hd={hd}: a rung wider than the ladder must refuse here"
-            );
-        }
-    }
-}
-
-/// ⭐⭐⭐⭐⭐ **THE PAGE-GRANULAR DOOR ADMITS EVERY STICK-MULTIPLE HEAD DIM; THE WINDOW-GRANULAR ONE STILL
-/// CANNOT.** The asymmetry is the whole reason page granularity was adopted, and it is now unconditional.
-///
-/// ⛔ THIS TEST HAS BEEN BOTH WAYS ROUND, AND THE HISTORY IS THE LESSON. It first asserted that page
-/// granularity admits hd=128 (green, on the derivations above); then, after granite-3.1-8b came back
-/// wrong from its first generated token with the gather live, it asserted the REFUSAL instead — also
-/// green, and pinning as "correct" a door that did nothing at the only geometry anyone cared about. What
-/// changed is neither assertion: the two `nslab`-blind defects in the FOLD's own legs were found and
-/// fixed (a value leg that wrote only feature slab 0, a score leg that contracted two sticks under a
-/// `y`-batch). See `PageScratch::of_pass`.
-///
-/// ⭐ SO THE DOOR IS TOTAL ON THE GEOMETRY, and a refusal at the emitter is a BUILD failure rather than a
-/// silent ungathered bundle — which is what made "green at 2b, nothing at 8b" shippable.
-#[test]
-fn the_page_granular_door_admits_every_stick_multiple_head_dim() {
-    let mq = QueryRowCount::of_mq(8);
-    for nkvh in NKVH_SWEEP {
-        for hd in HD_SWEEP {
-            let pool = PagedKvPool::new(nkvh as u32, hd as u32);
-            assert!(
-                PageScratch::of_pass(pool, mq).is_some(),
-                "nkvh={nkvh} hd={hd}: the page-granular door must admit every geometry a model can \
-                 present — a refusal here is a bundle that silently drops the gather"
-            );
-            // The WINDOW-granular door is the contrast, and it is unchanged: a 64-slot window of V is
-            // `nslab` runs apart above one stick, so its flat copy genuinely cannot express hd=128.
-            assert_eq!(
-                GatherScratch::admits(pool, mq),
-                hd == POOL_STICK as usize,
-                "nkvh={nkvh} hd={hd}: the window-granular door admits iff hd is one stick"
-            );
-            assert!(
-                PagePlaneExtent::of_pool(pool).is_some(),
-                "nkvh={nkvh} hd={hd}: the PLANE is expressible at every stick-multiple head dim"
-            );
-        }
-    }
-    // A head dim that is not a whole number of sticks has no stick-block entry at all, so it is the one
-    // geometry the plane law itself refuses.
-    assert_eq!(
-        PagePlaneExtent::of_pool(PagedKvPool::new(8, 96)),
-        None,
-        "hd=96: a part-stick head dim has no stick-block entry, so the PLANE refuses it"
-    );
-}
-
 /// The `hd`-cancellation the entry law rests on, over the whole grid — and the ONE quantity that does not
 /// cancel, stated beside it so the two cannot be read as the same fact.
 #[test]
@@ -536,66 +262,6 @@ fn the_entry_count_cancels_the_head_dim_but_the_entry_size_does_not() {
                  no longer reads it at all"
             );
         }
-    }
-}
-
-/// ⭐⭐⭐⭐⭐ THE ENTRY REPRODUCES THE HOST'S PAGE ADDRESS EXACTLY — the identity, not a second derivation.
-///
-/// `host addr = phys * page_stride_bytes` and `card addr = idx * skip_addr + base`, with `skip_addr` ONE
-/// STICK BLOCK, so entry `i` of physical page `phys` must satisfy
-/// `entry * stick_block_bytes == phys * page_stride_bytes + i * stick_block_bytes`. Asserted rather than
-/// reasoned about, because an entry off by a factor is a REAL address in another page: clean bake, no
-/// fault, another request's keys.
-///
-/// ⛔ AND THE `i` TERM IS THE HALF THAT WENT MISSING. A page-granular entry with NO block term (`phys *
-/// planes_per_page`) is what the plane-sized pin needed; against the stick-block `skip_addr` the card
-/// actually derives, that entry is `nkvh * PAGE_SLOTS / POOL_STICK` = 32× SHORT — so for every physical
-/// page below 32 it lands *inside page 0*, which is "correct for one page, wrong at the second" exactly.
-#[test]
-fn the_page_entry_reproduces_the_hosts_page_address() {
-    const LAYERS: u64 = 40;
-    const PLANES: u64 = 3;
-    for hd in [64usize, 128] {
-        let pool = PagedKvPool::new(8, hd as u32);
-        let plane = PagePlaneExtent::of_pool(pool).expect("admitted");
-        let page_stride = LAYERS * PLANES * plane.bytes();
-        let block_bytes = pool.stick_block_bytes();
-
-        // The pool's own ceiling — 256 pages of budget, past every page the sweep below names.
-        let ceiling =
-            gather_entry_ceiling(256, page_stride, pool).expect("a whole number of stick blocks");
-        let per_page = ceiling.per_page();
-        assert_eq!(
-            per_page.get() as u64,
-            page_stride / block_bytes,
-            "hd={hd}: the factor is stick-blocks-per-page"
-        );
-
-        for phys in [0i64, 1, 7, 128] {
-            for i in [0u32, 1, 31] {
-                let e = GatherEntry::of_page_block(ceiling, phys, i).expect("in range");
-                assert_eq!(
-                    e.as_i32() as u64 * block_bytes,
-                    phys as u64 * page_stride + i as u64 * block_bytes,
-                    "hd={hd} phys={phys} i={i}: the entry does not reproduce the host's address"
-                );
-            }
-        }
-        assert_eq!(
-            GatherEntry::of_page_block(ceiling, -1, 0),
-            None,
-            "hd={hd}: a negative page must refuse"
-        );
-        assert_eq!(
-            GatherEntry::of_page_block(ceiling, 256, 0),
-            None,
-            "hd={hd}: a page the pool's budget does not hold must be unconstructible"
-        );
-        assert_eq!(
-            gather_entries_per_page(block_bytes + 1, pool),
-            None,
-            "hd={hd}: a page that is not a whole number of stick blocks must refuse, not round"
-        );
     }
 }
 
@@ -638,4 +304,115 @@ fn a_plane_unit_entry_would_reach_only_a_slab_fraction_of_the_pool() {
             "hd={hd}: the substitution is silent, not a no-op"
         );
     }
+}
+
+/// ⭐⭐⭐⭐⭐ THE HOST'S ENTRY REPRODUCES THE HOST'S PAGE ADDRESS — `GatherEntry::of_slab_block`, the ONE
+/// composition the id tables are built from, against `page_base_bytes`' own law (`phys ·
+/// page_stride`) plus the slab block's place inside the page through `PagedKvPool::addr`. dxp turns
+/// the value into an address as `idx · skip_addr + base` with `skip_addr` one slab block, so an entry
+/// whose value times the slab block is not the host's byte address reads another block — a clean
+/// bake, wrong keys. Swept over both planes, both head dims, and every (kv head, window, slab).
+#[test]
+fn the_slab_entry_reproduces_the_hosts_page_address() {
+    use ktir_superdsc::sdsc_abstract::GatherEntry;
+    const LAYERS: u64 = 40;
+    const PLANES: u64 = 3;
+    for hd in [64usize, 128] {
+        let pool = PagedKvPool::new(8, hd as u32);
+        let plane = PagePlaneExtent::of_pool(pool).expect("admitted");
+        let page_stride = LAYERS * PLANES * plane.bytes();
+        let block_bytes = pool.slab_block_bytes();
+        let block_elems = pool.slab_block_elems() as u64;
+        // The pool's own ceiling — 256 pages of budget, past every page the sweep below names.
+        let ceiling =
+            gather_entry_ceiling(256, page_stride, pool).expect("a whole number of slab blocks");
+        assert_eq!(
+            ceiling.per_page().get() as u64,
+            page_stride / block_bytes,
+            "hd={hd}: the factor is slab-blocks-per-page"
+        );
+        let nkvh = NonZeroU32::new(pool.nkvh()).unwrap();
+        let slabs = pool.window_slabs().expect("a stick-multiple head dim");
+        for plane in [KvPlane::Kt, KvPlane::V] {
+            for phys in [0i64, 1, 7, 128] {
+                for h in 0..pool.nkvh() {
+                    for w in 0..pool.windows_per_page() {
+                        for s in 0..slabs {
+                            let e = GatherEntry::of_slab_block(plane, pool, ceiling, phys, h, w, s)
+                                .expect("in range");
+                            // The slab block's first element inside one page plane, by the pool's
+                            // own address law — window w's first slot, slab s's first feature.
+                            let kvh = KvHead::new(h, nkvh).unwrap();
+                            let corner = pool.addr(
+                                KvCoord::block(plane, kvh)
+                                    .at_slot(KvSlot::new(w * POOL_STICK))
+                                    .at_feat(FeatIdx::new(s * POOL_STICK)),
+                            ) as u64;
+                            assert_eq!(
+                                corner % block_elems,
+                                0,
+                                "hd={hd} {plane:?} h={h} w={w} s={s}: the block corner is whole blocks"
+                            );
+                            assert_eq!(
+                                e.as_i32() as u64 * block_bytes,
+                                phys as u64 * page_stride + corner * 2,
+                                "hd={hd} {plane:?} phys={phys} h={h} w={w} s={s}: the entry does not \
+                                 reproduce the host's address"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            GatherEntry::of_slab_block(KvPlane::Kt, pool, ceiling, -1, 0, 0, 0),
+            None,
+            "hd={hd}: a negative page must refuse"
+        );
+        assert_eq!(
+            GatherEntry::of_slab_block(KvPlane::Kt, pool, ceiling, 256, 0, 0, 0),
+            None,
+            "hd={hd}: a page the pool's budget does not hold must be unconstructible"
+        );
+        assert_eq!(
+            GatherEntry::of_slab_block(KvPlane::V, pool, ceiling, 0, 0, 0, slabs),
+            None,
+            "hd={hd}: a slab past the head dim must be unconstructible"
+        );
+        assert_eq!(
+            GatherEntry::of_slab_block(KvPlane::Knat, pool, ceiling, 0, 0, 0, 0),
+            None,
+            "hd={hd}: no gathered reader names the natural-K plane"
+        );
+        assert_eq!(
+            gather_entries_per_page(block_bytes + 1, pool),
+            None,
+            "hd={hd}: a page that is not a whole number of slab blocks must refuse, not round"
+        );
+    }
+}
+
+/// ⭐ THE PLANE IS EXPRESSIBLE AT EVERY STICK-MULTIPLE HEAD DIM, and a part-stick head dim is the one
+/// geometry the plane law refuses — the admission every gathered reader of the pool rides.
+#[test]
+fn the_plane_admits_every_stick_multiple_head_dim() {
+    for nkvh in NKVH_SWEEP {
+        for hd in HD_SWEEP {
+            let pool = PagedKvPool::new(nkvh as u32, hd as u32);
+            assert!(
+                PagePlaneExtent::of_pool(pool).is_some(),
+                "nkvh={nkvh} hd={hd}: the PLANE is expressible at every stick-multiple head dim"
+            );
+            assert_eq!(
+                pool.window_slabs(),
+                Some(hd as u32 / POOL_STICK),
+                "nkvh={nkvh} hd={hd}: a window spans hd/64 slabs"
+            );
+        }
+    }
+    assert_eq!(
+        PagePlaneExtent::of_pool(PagedKvPool::new(8, 96)),
+        None,
+        "hd=96: a part-stick head dim has no slab-block entry, so the PLANE refuses it"
+    );
 }
