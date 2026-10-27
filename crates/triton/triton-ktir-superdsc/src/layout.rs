@@ -832,23 +832,31 @@ fn overlaps_none(
 fn scales_for_program_shape(p: Program, f: &IRFunction<'static>) -> Result<Vec<f32>, crate::Error> {
     use ktir_superdsc::emit::whole_function as W;
 
-    if is_per_program_node(f) {
-        return Ok(scales_for(p, f));
-    }
-
+    // ⭐⭐⭐ THE CHAINS ARE READ ONCE, FOR BOTH PATHS — the OnePlusScale gain offset is a
+    // registry lookup in BOTH doors' rmsnorm bodies (`scale_slot(layout, 1.0)` after
+    // `program_gain_offset`), and it is an `arith.addf` offset, so the splat-multiplier walk
+    // below cannot see it in either path. Reading `ones` off the same chains the emitter
+    // dispatches on is the one-statement answer for both.
     let chains = W::program_rmsnorm_chains(f).map_err(|e| crate::Error {
         stage: "layout",
         message: e.message,
     })?;
+    if is_per_program_node(f) {
+        return Ok(scales_for(p, f, &chains));
+    }
+
     let mut out: Vec<f32> = Vec::new();
     let push = |v: f32, out: &mut Vec<f32>| {
         if !out.iter().any(|x| x.to_bits() == v.to_bits()) {
             out.push(v);
         }
     };
-    // (1) the epsilons, one per chain.
+    // (1) the epsilons and gain offsets, one pair per chain.
     for c in &chains {
         push(c.eps, &mut out);
+        if let Some(ones) = c.ones {
+            push(ones, &mut out);
+        }
     }
     // (2) the splat multipliers that survive the fusions. A chain-interior multiply is not a scalar
     // multiply at all — the fused body owns its constants — so its value must not take a slot.
@@ -895,11 +903,31 @@ fn scales_for_program_shape(p: Program, f: &IRFunction<'static>) -> Result<Vec<f
 /// same call. Nothing else here can drift either — the walk (`f.operations`, not `ops_deep()`), the
 /// `arith.constant`-behind-`tensor.splat` shape, the one-root rule and the all-`mulf`-agree rule are
 /// all theirs by construction now.
-fn scales_for(p: Program, f: &IRFunction<'static>) -> Vec<f32> {
+fn scales_for(
+    p: Program,
+    f: &IRFunction<'static>,
+    chains: &[ktir_superdsc::emit::whole_function::RmsNormChain],
+) -> Vec<f32> {
     use ktir_superdsc::emit::lower_ktir_to_superdsc as L;
+    // The OnePlusScale gain offset the rmsnorm bodies resolve by value — read off the SAME
+    // chains the emitter dispatches on, deduped by bits like every push above.
+    let mut ones = Vec::new();
+    for c in chains {
+        if let Some(v) = c.ones {
+            if !ones.iter().any(|x| x.to_bits() == v.to_bits()) {
+                ones.push(v);
+            }
+        }
+    }
     match p {
-        // `rmsnorm` resolves ONE value: `scale_slot(layout, program_rmsnorm_eps(&k.func))`.
-        Program::RmsNorm => L::program_rmsnorm_eps(f).into_iter().collect(),
+        // `rmsnorm` resolves TWO values: `scale_slot(layout, program_rmsnorm_eps(..))` and,
+        // in the OnePlusScale form, `scale_slot(layout, program_gain_offset(..))` — the
+        // `[1,1]` const the gain add reads ahead of the gain multiply.
+        Program::RmsNorm => {
+            let mut out: Vec<f32> = L::program_rmsnorm_eps(f).into_iter().collect();
+            out.extend(ones);
+            out
+        }
         // `scalarmul` resolves ONE value: `scale_slot(layout, program_scalarmul_scale(&k.func))`.
         Program::ScalarMul => L::program_scalarmul_scale(f).into_iter().collect(),
         // `attn_at` resolves TWO — the score scale AND its square root, in that order:
@@ -912,6 +940,19 @@ fn scales_for(p: Program, f: &IRFunction<'static>) -> Vec<f32> {
             Some(v) => vec![v, v.sqrt()],
             None => Vec::new(),
         },
+        // `rmsnorm_unit` resolves ONE value: its epsilon (`scale_slot` after
+        // `program_rmsnorm_eps`) — no gain leg, so no offset.
+        Program::RmsNormUnit => L::program_rmsnorm_eps(f).into_iter().collect(),
+        // `windowed_rmsnorm` resolves TWO: `program_windowed_eps` and, in the gained
+        // OnePlusScale form, the gain offset.
+        Program::WindowedRmsNorm { .. } => {
+            let mut out: Vec<f32> = L::program_windowed_eps(f).into_iter().collect();
+            out.extend(ones);
+            out
+        }
+        // `tanhsoftcap` resolves ONE value: the cap (`scale_slot` after
+        // `program_tanhsoftcap_cap`).
+        Program::TanhSoftCap => L::program_tanhsoftcap_cap(f).into_iter().collect(),
         // ⭐ EMPTY, AND THAT IS THE ANSWER FOR THESE. None of these bodies calls `scale_slot` or
         // indexes `scalarmul_scales` — grep over the file: the only readers are `rmsnorm`,
         // `scalarmul`, `attn_at` and `scale_idx_of` (which only recognises a RESERVED tid among the
@@ -926,17 +967,11 @@ fn scales_for(p: Program, f: &IRFunction<'static>) -> Vec<f32> {
         // The sampler's tables are tensor operands, never `scalarmul_scales` lookups —
         // a value registered for it would occupy a slot nothing asks for.
         | Program::Sample => Vec::new(),
-        // ⭐ EMPTY FOR THE SAME REASON, ONE STEP EARLIER: none of these programs has a body on
-        // this ladder (the splice produces none of them and the door refuses them by name), so
-        // there is no body to ask which values it looks up. A value registered for a program that
-        // cannot run would occupy a slot nothing asks for — the exact registry-divergence defect
-        // this function's doc records — so empty is the answer, and enumerated (never `_`) so a
-        // new variant is E0004 rather than a silent slot decision.
-        Program::RmsNormUnit
-        | Program::TanhSoftCap
-        | Program::ScalarWeightMul
-        | Program::Reshape
-        | Program::WindowedRmsNorm { .. } => Vec::new(),
+        // ⭐ EMPTY FOR THE SAME REASON, ONE STEP EARLIER: `scalarweightmul`'s weight is a
+        // RUNTIME fp16 scalar parameter (the program's own operand, staged by the host)
+        // and `reshape` is a pure copy — neither resolves a registry value. Enumerated
+        // (never `_`) so a new variant is E0004 rather than a silent slot decision.
+        Program::ScalarWeightMul | Program::Reshape => Vec::new(),
     }
 }
 

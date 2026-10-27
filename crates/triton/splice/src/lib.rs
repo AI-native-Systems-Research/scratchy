@@ -3688,26 +3688,8 @@ mod production_ktir_dump {
         let lk_name = node.func.name;
         let regions =
             lk::regions(node).map_err(|e| format!("{name}: regions: {e:?}"))?;
-        let mut layout = triton_ktir_superdsc::layout::for_regions(node, &regions)
+        let layout = triton_ktir_superdsc::layout::for_regions(node, &regions)
             .map_err(|e| format!("{name}: layout: {e}"))?;
-        // ⭐⭐⭐ THE ONEPLUS GAIN OFFSET'S REGISTRY SLOT — the entry the bake's census stamps
-        // and `layout::for_regions`'s per-`Program` scale walk does not. `rmsnorm_oneplus_fwd`
-        // states the offset as one `arith.addf` over the loaded gain row; the door resolves
-        // its `[1,1]` const BY VALUE out of `scalarmul_scales`, so the driver stamps the value
-        // the bake would — read off the program through the door's own chain reader
-        // (`program_rmsnorm_chains`'s `ones`), never hardcoded per entry, and only when the
-        // census has not already collected it.
-        if let Ok(chains) =
-            ktir_superdsc::emit::whole_function::program_rmsnorm_chains(&node.func)
-        {
-            for c in &chains {
-                if let Some(v) = c.ones {
-                    if !layout.scalarmul_scales.iter().any(|x| x.to_bits() == v.to_bits()) {
-                        layout.scalarmul_scales.push(v);
-                    }
-                }
-            }
-        }
         let windowed = |ops: Result<Vec<ktir_superdsc::emit::EmittedOp>, lk::Error>| {
             let ops = ops.map_err(|e| format!("{name}: {e:?}"))?;
             lk::column_windows_are_honoured(lk_name, &regions, &ops)
