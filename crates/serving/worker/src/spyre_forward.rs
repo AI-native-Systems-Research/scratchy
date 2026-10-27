@@ -639,18 +639,19 @@ pub(crate) fn run_prefill_batch(
                 .as_ref()
                 .ok_or_else(|| werr("decode bundle has no sampler seat".to_string()))?;
             // The rung's own width, not the solo meta's — see the seat-bind site above.
+            // ⭐ THE COPY IS THE PLACEMENT'S TRUTH on this path: a decode-batch
+            // rung is the same tape baked at `mq` rows but addressed by
+            // FINGERPRINT, so `b.wiring`'s seat is the single-request meta
+            // (rows=1) while the launch — the logits block, the word tables,
+            // the idx stick — is `mq` rows wide (`RowCapacity::of_baked_rung`
+            // takes `prefill_m` for exactly this reason, one screen up). The
+            // readback must read through the SAME rows the launch laid.
             let mut seat = *seat;
-            // The readback reads the PLACEMENT's own rows (the rung's, which
-            // the logits block and the word tables are reserved at) — the
-            // copy below narrows only the LAUNCH's live width for the binds
-            // and the pick read, and `dev_off_stk`'s group term needs the
-            // true total or every lane past the first stick reads garbage.
-            let rung_seat = seat;
             seat.rows = mq as u32;
             let picked = read_sampled_tokens(pf, &seat, b.result_id as u32, vocab)?;
             log_seat_readback(
                 pf,
-                &rung_seat,
+                &seat,
                 b.wiring.load_consts,
                 &picked,
                 &format!("decode-batch mq={mq} start={start}"),
@@ -1338,7 +1339,16 @@ fn log_seat_readback(
     let mut hash = String::new();
     for (name, operand) in [("hc1", 10u8), ("hc2", 11), ("hc3", 12), ("c256", 13)] {
         match uniform(consts, operand) {
-            Some((tid, trows)) => match le_words(session, tid, trows * 32) {
+            Some((tid, trows)) => {
+                // ⭐ THE PLACEMENT IS THE LAUNCH'S ROWS on a batched rung: the
+                // wiring's kind carries the single-request meta (rows=1)
+                // while the rung's graph mints the table at the baked width,
+                // and the STAGING follows the kind — so reading the seat's
+                // own rows is what measures whether every stick head the
+                // launch addresses actually holds the constant (a staged
+                // one-word stream leaves rows past 0 reading ZERO).
+                let trows = trows.max(rows);
+                match le_words(session, tid, trows * 32) {
                 Ok(ws) => {
                     let w0 = ws.first().copied().unwrap_or(-1);
                     let r1 = if trows > 1 {
@@ -1349,7 +1359,8 @@ fn log_seat_readback(
                     hash.push_str(&format!("{name}(t{tid})=0x{w0:08X}{r1} "));
                 }
                 Err(e) => hash.push_str(&format!("{name}: READ-FAIL({e}) ")),
-            },
+                }
+            }
             None => hash.push_str(&format!("{name}: NOT-IN-CONSTS ")),
         }
     }

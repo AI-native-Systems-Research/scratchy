@@ -39,10 +39,12 @@ SRVLOG = HERE / "chat-server.log"
 SRVLOG_B = HERE / "chatb-server.log"
 DRAWS = 200
 Z_MAX = 3.0
-# A `.run` file mixes log lines (a leading ISO timestamp) with the reply. The
-# auditor's P4 ruling: compare the REPLY, never the log header — a whole-file
-# compare "diverged" at byte 0 on a timestamp the model never wrote.
+# A `.run` file mixes log lines (a leading ISO timestamp), a `Using model:`
+# preamble, and the reply. The auditor's P4 ruling: compare the REPLY, never
+# the wrapper — a whole-file compare "diverged" at byte 0 on a timestamp the
+# model never wrote.
 _LOG_LINE = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}")
+_PREAMBLE = re.compile(r"^Using (cached )?model:")
 
 
 def content(name: str) -> str:
@@ -62,7 +64,10 @@ def chat_stdout_at(dir_: pathlib.Path, name: str) -> str:
 
 def strip_run(path: pathlib.Path) -> str:
     lines = path.read_text().splitlines()
-    keep = [l for l in lines if not _LOG_LINE.match(l)]
+    keep = [
+        l for l in lines
+        if not _LOG_LINE.match(l) and not _PREAMBLE.match(l)
+    ]
     while keep and not keep[0].strip():
         keep.pop(0)
     while keep and not keep[-1].strip():
