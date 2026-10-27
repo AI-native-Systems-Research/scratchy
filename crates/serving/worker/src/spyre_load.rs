@@ -2536,15 +2536,21 @@ impl SpyreWorker {
                     // `.iter()`, the auditor's fix for the E0277 the chat leg's
                     // pod build measured (this arm cannot compile on mac).
                     for &(tid, kind) in rung_consts.iter() {
-                        let scratchy_target_spyre::wiring::LoadConst::SampleTable { rows, .. } =
-                            kind;
-                        if rows != rung_n.get() {
-                            panic!(
-                                "decode batch rung seqs={rn}: its staged constant t{tid} carries \
-                                 rows={rows}, not the rung's own {rn} — the kind and the rung \
-                                 disagree about the bake width, and the short side's rows would \
-                                 read ZERO at their stick heads. REFUSING"
-                            );
+                        // The rung-rows law is the SAMPLER tables' own — the
+                        // chain's decompose tables are functions of the vocab
+                        // alone (`chain_staged_tables`), never the rung's
+                        // width, so they carry no `rows` to check.
+                        if let scratchy_target_spyre::wiring::LoadConst::SampleTable { rows, .. } =
+                            kind
+                        {
+                            if rows != rung_n.get() {
+                                panic!(
+                                    "decode batch rung seqs={rn}: its staged constant t{tid} \
+                                     carries rows={rows}, not the rung's own {rn} — the kind and \
+                                     the rung disagree about the bake width, and the short side's \
+                                     rows would read ZERO at their stick heads. REFUSING"
+                                );
+                            }
                         }
                     }
                     let mut rs = SuperDscSession::new_borrowing_with_consts(
