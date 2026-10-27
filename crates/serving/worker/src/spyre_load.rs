@@ -180,9 +180,6 @@ use crate::spyre_types::*;
 use crate::spyre_worker::*;
 use crate::worker_factory::resolve_model_path;
 
-/// One staged weight: `(tensor id, bytes, dtype, shape)`.
-type StagedWeight = (usize, Vec<u8>, SDType, Vec<usize>);
-
 /// Parsed per-program metadata + the owned manifest (kept alive for the shared
 /// session) + model-level dims. No weights, no session — the caller builds those
 /// ONCE across both programs (decode + prefill share weight tensor ids).
