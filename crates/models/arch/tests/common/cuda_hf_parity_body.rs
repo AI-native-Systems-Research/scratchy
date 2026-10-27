@@ -13,7 +13,10 @@
 // `VOCAB`, its GDN pool (`GDN_POOL`, `None` for a model with no GDN layer, whose forwards then pass
 // no `GdnSequence` and whose `load_checks` has no GDN bundle to check) and its worker's allocations
 // (`WORKER_ALLOCATIONS`: the arena, the KV pool and the GDN pool when there is one), and
-// `load_checks` adds Gemma's expert banks' and routers' rows.
+// `load_checks` adds Gemma's expert banks' and routers' rows. Each binary also states
+// `P3`, a `P3Rule`: `Strict` for every model but gemma-4, whose P3 accepts one top-1
+// disagreement outside a near-tie per prompt on a route-explained row (the user's decision
+// 2026-10-27, option (a)).
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -45,19 +48,102 @@ fn verdict(pass: bool) -> &'static str {
 }
 
 /// P1's rule (#859): a fixed floor on min cosine(CUDA, HF-f32), or at most `delta` below
-/// HF-bf16's own min cosine on the same prompt.
+/// HF-bf16's own min cosine on the same prompt, or (gemma-4) at most HF-bf16's own measured
+/// scatter below it, the scatter at most `cap` ([`hf_bf16_scatter`]; the user's decision
+/// 2026-10-27, option (a)).
 enum P1Rule {
     Floor(f64),
     BelowHfBf16(f64),
+    BelowHfBf16Scatter { cap: f64 },
 }
 
 /// Whether a cosine `cos` against HF-f32 passes `rule`, `hf_bf16_cos` HF-bf16's own cosine on the
-/// same rows: P1's and P8's cosine gate.
+/// same rows: P1's and P8's cosine gate. A `BelowHfBf16Scatter` rule gates by [`p1_margin`]'s
+/// measured scatter.
 fn p1_gate(rule: &P1Rule, cos: f64, hf_bf16_cos: f64) -> bool {
     match *rule {
         P1Rule::Floor(f) => cos >= f,
         P1Rule::BelowHfBf16(d) => cos >= hf_bf16_cos - d,
+        P1Rule::BelowHfBf16Scatter { .. } => cos >= hf_bf16_cos - p1_margin(),
     }
+}
+
+/// P3's rule for a top-1 disagreement outside a near-tie (#816): every one fails, or (gemma-4) at
+/// most `per_prompt` of them pass when their rows are route-explained (the user's decision
+/// 2026-10-27, option (a)).
+enum P3Rule {
+    Strict,
+    RouteExplained { per_prompt: usize },
+}
+
+/// Whether P3 accepts one more top-1 disagreement outside a near-tie, on a row `explained` or not,
+/// with `accepted` of them already accepted on this prompt.
+fn p3_accepts(rule: &P3Rule, explained: bool, accepted: usize) -> bool {
+    match *rule {
+        P3Rule::Strict => false,
+        P3Rule::RouteExplained { per_prompt } => explained && accepted < per_prompt,
+    }
+}
+
+/// HF-bf16's own scatter on the goldens (the user's decision 2026-10-27, option (a)): over every
+/// pair of prompts where one's ids are a prefix of the other's, the largest |cosine(HF-bf16 row,
+/// HF-f32 row) of the one − the same of the other| over their shared rows. Causal attention makes
+/// those rows the same computation, and HF-f32 agrees there; HF-bf16 moves with the batch shape
+/// alone. Returns the scatter and where it is, `(value, shorter prompt, longer prompt, row)`, and
+/// the largest |HF-f32 − HF-f32| over the same rows (which says the rows are the same). `None`
+/// when no prompt is a prefix of another.
+fn hf_bf16_scatter() -> Option<((f64, usize, usize, usize), f32)> {
+    let ps = prompts();
+    let mut best: Option<(f64, usize, usize, usize)> = None;
+    let mut f32_diff = 0f32;
+    for a in ps {
+        for b in ps {
+            let n = a.ids.len();
+            if n >= b.ids.len() || b.ids[..n] != a.ids[..] {
+                continue;
+            }
+            for row in 0..n {
+                let at = |v: &[f32]| v[row * VOCAB..][..VOCAB].to_vec();
+                let (fa, fb) = (at(&a.f32), at(&b.f32));
+                let d = (cosine(&at(&a.bf16), &fa) - cosine(&at(&b.bf16), &fb)).abs();
+                f32_diff = (fa.iter().zip(&fb)).fold(f32_diff, |m, (x, y)| m.max((x - y).abs()));
+                if best.is_none_or(|(v, ..)| d > v) {
+                    best = Some((d, a.p, b.p, row));
+                }
+            }
+        }
+    }
+    best.map(|b| (b, f32_diff))
+}
+
+/// P1's margin below HF-bf16's min cosine under the binary's `P1`: its `delta`, or (a
+/// `BelowHfBf16Scatter` rule) HF-bf16's measured scatter, printed once with where it is, and
+/// asserted at most the rule's `cap` so a regenerated golden cannot widen it silently. 0 for a
+/// fixed floor.
+fn p1_margin() -> f64 {
+    static MARGIN: OnceLock<f64> = OnceLock::new();
+    *MARGIN.get_or_init(|| match P1 {
+        P1Rule::Floor(_) => 0.0,
+        P1Rule::BelowHfBf16(d) => d,
+        P1Rule::BelowHfBf16Scatter { cap } => {
+            let ((scatter, short, long, row), f32_diff) = hf_bf16_scatter()
+                .expect("P1's scatter rule needs a prompt that is a prefix of another");
+            let ok = scatter <= cap;
+            eprintln!(
+                "P1 margin: HF-bf16's own scatter {scatter:.6} at row {row}, the largest \
+                 |cosine(HF-bf16, f32)| difference between prompt {short} and prompt {long} over \
+                 their shared prefix (max |HF-f32 - HF-f32| there {f32_diff:.4e}); need <= {cap} \
+                 (the user's decision 2026-10-27, option (a)) {}",
+                verdict(ok)
+            );
+            assert!(
+                ok,
+                "HF-bf16's measured scatter {scatter} is above the approved {cap}: the goldens \
+                 changed; stop and report"
+            );
+            scatter
+        }
+    })
 }
 
 /// Both P1 rules gate as stated, on fixed numbers (no GPU, no goldens): the fixed floor on CUDA's
@@ -73,6 +159,11 @@ fn p1_rules_gate_as_stated() {
         (&below, 0.980474, 0.983452, true),
         (&below, 0.977, 0.983452, false),
     ];
+    // `BelowHfBf16Scatter` reads its margin from the goldens, so its gate is checked where they
+    // are (`p1_to_p4_one_forward_per_prompt` prints it), not on fixed numbers; only its cap is
+    // read here.
+    let scatter = P1Rule::BelowHfBf16Scatter { cap: 0.013 };
+    assert!(matches!(scatter, P1Rule::BelowHfBf16Scatter { cap } if cap == 0.013));
     let mut pass = true;
     for (rule, cos, noise, want) in cases {
         let got = p1_gate(rule, cos, noise);
@@ -80,6 +171,27 @@ fn p1_rules_gate_as_stated() {
     }
     eprintln!("P1 rules on fixed numbers {}", verdict(pass));
     assert!(pass, "a P1 rule does not gate as stated");
+}
+
+/// Both P3 rules accept as stated (no GPU, no goldens): the strict rule nothing; the
+/// route-explained rule one disagreement on a route-explained row per prompt, and none on a row
+/// that is not, nor a second. Each binary runs one of the two (`P3`).
+#[test]
+fn p3_rules_accept_as_stated() {
+    let strict = P3Rule::Strict;
+    let one = P3Rule::RouteExplained { per_prompt: 1 };
+    let cases = [
+        (&strict, true, 0, false),
+        (&strict, false, 0, false),
+        (&one, true, 0, true),
+        (&one, false, 0, false),
+        (&one, true, 1, false),
+    ];
+    let pass = (cases.iter()).all(|&(rule, explained, accepted, want)| {
+        p3_accepts(rule, explained, accepted) == want
+    });
+    eprintln!("P3 rules on fixed numbers {}", verdict(pass));
+    assert!(pass, "a P3 rule does not accept as stated");
 }
 
 /// The H100's device memory a worker over every tape may hold after its forwards: 78.0 GiB of
@@ -903,6 +1015,19 @@ fn p1_to_p4_one_forward_per_prompt() {
                 );
                 ok1
             }
+            P1Rule::BelowHfBf16Scatter { .. } => {
+                let d = p1_margin();
+                let ok1 = p1_gate(&P1, min_cos, noise_cos);
+                eprintln!(
+                    "P1 prompt {}: {n} rows, min cosine(CUDA, f32) = {min_cos:.6} HF-bf16 \
+                     {noise_cos:.6} CUDA - HF-bf16 = {:+.6} (need >= HF-bf16 - {d:.6}, HF-bf16's \
+                     measured scatter) {}",
+                    p.p,
+                    min_cos - noise_cos,
+                    verdict(ok1)
+                );
+                ok1
+            }
         };
         p1 &= ok1;
         // P2.
@@ -920,9 +1045,9 @@ fn p1_to_p4_one_forward_per_prompt() {
         // `ties`: the rows whose f32 margin is at most twice their noise, counted whether or not
         // CUDA agrees; `near`: those of them CUDA disagrees on.
         let (mut ties, mut near, mut wrong, mut last_ok) = (Vec::new(), 0usize, Vec::new(), true);
-        // Top-1 disagreements outside near-ties on route-explained rows: printed only; each is
-        // also in `wrong`, which gates.
-        let mut routed = Vec::new();
+        // Top-1 disagreements outside near-ties on route-explained rows, printed; and those P3
+        // accepts under the binary's `P3`, the rest in `wrong`, which gates.
+        let (mut routed, mut accepted) = (Vec::new(), Vec::new());
         for (row, ((c, f), b)) in rows(got).zip(rows(&p.f32)).zip(rows(&p.bf16)).enumerate() {
             let top = top_k(f, 2);
             let margin = f64::from(f[top[0]] - f[top[1]]);
@@ -941,7 +1066,13 @@ fn p1_to_p4_one_forward_per_prompt() {
                 if explained(row) {
                     routed.push(row);
                 }
-                wrong.push(row);
+                // At most the binary's `P3` per prompt, on a route-explained row (the user's
+                // decision 2026-10-27, option (a)); every other one gates.
+                if p3_accepts(&P3, explained(row), accepted.len()) {
+                    accepted.push(row);
+                } else {
+                    wrong.push(row);
+                }
             }
             if row == n - 1 && !same {
                 last_ok = tie;
@@ -959,6 +1090,14 @@ fn p1_to_p4_one_forward_per_prompt() {
             }
         }
         let ok3 = wrong.is_empty() && last_ok;
+        for &row in &accepted {
+            eprintln!(
+                "P3 prompt {}: row {row}'s top-1 disagreement outside a near-tie accepted, its row \
+                 route-explained (at most one per prompt; the user's decision 2026-10-27, option \
+                 (a))",
+                p.p
+            );
+        }
         if !route.is_empty() {
             eprintln!(
                 "P3 prompt {}: of the top-1 disagreements outside near-ties, route-explained={} \
@@ -1013,6 +1152,11 @@ fn p1_to_p4_one_forward_per_prompt() {
             P1Rule::BelowHfBf16(d) => format!(
                 "min cosine >= HF-bf16's - {d} per prompt, gated (the user's 2026-10-26 rule, \
                  #859)"
+            ),
+            P1Rule::BelowHfBf16Scatter { cap } => format!(
+                "min cosine >= HF-bf16's - its measured scatter {:.6} (<= {cap}) per prompt, \
+                 gated (the user's decision 2026-10-27, option (a))",
+                p1_margin()
             ),
         }
     );
@@ -1259,6 +1403,9 @@ fn p8_the_decode_row_matches_hf_f32() {
         let cos_need = match P1 {
             P1Rule::Floor(f) => format!("{f}"),
             P1Rule::BelowHfBf16(d) => format!("HF-bf16's {noise_cos:.6} - {d}"),
+            P1Rule::BelowHfBf16Scatter { .. } => {
+                format!("HF-bf16's {noise_cos:.6} - {:.6}", p1_margin())
+            }
         };
         let ok_hf = cos_ok
             && rms <= 2.0 * noise_rms

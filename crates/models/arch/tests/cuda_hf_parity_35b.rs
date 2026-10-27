@@ -56,3 +56,5 @@ const GOLDENS: &str = "tests/goldens/qwen3-5-moe-qwen3.6-35b-a3b-hf";
 /// P1's rule (#859, the user's 2026-10-26 decision): min cosine(CUDA, f32) at most 0.005 below
 /// HF-bf16's own min cosine on the same prompt.
 const P1: P1Rule = P1Rule::BelowHfBf16(0.005);
+/// P3 accepts no top-1 disagreement outside a near-tie (#816).
+const P3: P3Rule = P3Rule::Strict;

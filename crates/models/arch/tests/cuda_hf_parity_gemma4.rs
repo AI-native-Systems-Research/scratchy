@@ -53,9 +53,14 @@ const UNTIED_LM_HEAD: Option<&str> = None;
 const MODEL: &str = "gemma-4-26b-a4b-it";
 const CHECKPOINT: &str = "gemma-4-26B-A4B-it";
 const GOLDENS: &str = "tests/goldens/gemma4-moe-gemma-4-26b-a4b-it-hf";
-/// P1's rule (#933, the user's 2026-10-26 rule for MoE models, #859's): min cosine(CUDA, f32) at
-/// most 0.005 below HF-bf16's own min cosine on the same prompt.
-const P1: P1Rule = P1Rule::BelowHfBf16(0.005);
+/// P1's rule (#933, the user's decision 2026-10-27, option (a)): min cosine(CUDA, f32) at most
+/// HF-bf16's own measured scatter below HF-bf16's own min cosine on the same prompt, the scatter
+/// measured on the goldens (prompt 1's rows are prompt 6's rows 0-20; the verifier measured 0.0126
+/// on row 4) and asserted at most 0.013, the figure the user approved.
+const P1: P1Rule = P1Rule::BelowHfBf16Scatter { cap: 0.013 };
+/// P3 accepts at most one top-1 disagreement outside a near-tie per prompt, on a route-explained
+/// row (the user's decision 2026-10-27, option (a)).
+const P3: P3Rule = P3Rule::RouteExplained { per_prompt: 1 };
 /// No GDN layer: no GDN pool, and no `GdnSequence` in a forward. The worker's allocations are the
 /// arena and the KV pool.
 const GDN_POOL: Option<GdnPoolConfig> = None;

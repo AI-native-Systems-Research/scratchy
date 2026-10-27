@@ -61,3 +61,5 @@ const CHECKPOINT: &str = "Qwen3.5-0.8B";
 const GOLDENS: &str = "tests/goldens/qwen3-5-qwen3.5-0.8b-hf";
 /// P1's rule (#859): min cosine(CUDA, f32) ≥ 0.999 on every real row (0.8b runs, #816).
 const P1: P1Rule = P1Rule::Floor(0.999);
+/// P3 accepts no top-1 disagreement outside a near-tie (#816).
+const P3: P3Rule = P3Rule::Strict;
