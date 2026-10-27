@@ -3214,28 +3214,25 @@ mod pad_clamp_tests {
     }
 
     /// Every staged bind's pad-row words equal row 0's — the four seed tables
-    /// (the gate at its own β-reservation stride) and inv_t alike.
+    /// and inv_t alike. EVERY word sits at its row's STICK HEAD
+    /// (`col_row_stride_bytes`): the gate table's reservation is wider (the
+    /// i32→f32 convert's device sweep, two sticks per row) but the sweep's
+    /// second sticks are the reservation's own zero tail — the word the
+    /// kernel reads is still the head, at the same stride as every other
+    /// table.
     fn assert_pads_stage_live_0(
         seat: &scratchy_target_spyre::wiring::SampleSeat,
         laws: &[RowLaw<'_>],
         ctx: &str,
     ) {
         let binds = sample_binds(seat, laws).expect("the seat stages");
-        let seed_stride =
+        let head_stride =
             scratchy_target_spyre::wiring::col_row_stride_bytes(scratchy_tensors::DType::I32);
-        let gate_stride = scratchy_target_spyre::wiring::gate_row_stride_bytes();
         assert_eq!(binds.len(), 5, "{ctx}: four seed tables and inv_t");
         for (tid, bytes) in &binds {
-            let stride = if *tid
-                == scratchy_target_spyre::bundle_code::PlaceId::Act(seat.seed_words[3])
-            {
-                gate_stride
-            } else {
-                seed_stride
-            };
             for r in [2usize, 3] {
                 assert_eq!(
-                    &bytes[r * stride..r * stride + 4],
+                    &bytes[r * head_stride..r * head_stride + 4],
                     &bytes[0..4],
                     "{ctx}: bind t{tid:?} row {r} (a padding slot) staged words row 0's own \
                      are not — the pad clamp broke",
