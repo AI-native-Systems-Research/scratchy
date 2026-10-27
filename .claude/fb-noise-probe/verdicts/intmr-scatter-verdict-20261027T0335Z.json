@@ -1,0 +1,18 @@
+{
+  "probe": "intmr-scatter",
+  "rows": 2,
+  "cells": {
+    "intmr_col_add": {
+      "width": 512,
+      "op": "add",
+      "mismatches": 0,
+      "pass": true
+    },
+    "intmr_col_mul": {
+      "width": 512,
+      "op": "mul",
+      "mismatches": 0,
+      "pass": true
+    }
+  }
+}
