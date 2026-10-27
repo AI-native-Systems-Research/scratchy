@@ -1111,8 +1111,10 @@ pub(crate) fn lower_one_node<F: RopeForm>(
                 active_cap,
                 rows_are_requests,
                 paged_fold,
-                scale_law,
-                out_stays_head_rows,
+                scratchy_triton_splice::AttnBundleFacts {
+                    scale_law,
+                    out_stays_head_rows,
+                },
             ) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),

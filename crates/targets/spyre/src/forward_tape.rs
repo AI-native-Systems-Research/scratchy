@@ -643,24 +643,6 @@ mod tests {
         }
     }
 
-    /// A minimal `ForwardInputs` for the kernel tests.
-    fn inputs_without_table() -> ForwardInputs<'static, fn(usize) -> bool> {
-        ForwardInputs {
-            hidden: 64,
-            num_q_heads: 1,
-            mq_pad: 64,
-            causal_heads_per_block: 1,
-            embed_tokens: &[],
-            tokens: &[],
-            positions: &[],
-            causal: one_row_key(),
-            prefix: None,
-            consts: &[],
-            mask_neg: -1.0,
-            stick_major: false,
-        }
-    }
-
     /// The one-row, one-real-row chunk key a solo decode step binds.
     fn one_row_key() -> scratchy_subtile::sdsc_abstract::CausalKey {
         use scratchy_subtile::sdsc_abstract::{CausalKey, RungWidth};

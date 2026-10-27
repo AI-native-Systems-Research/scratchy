@@ -316,7 +316,7 @@ fn gather_copy_cores(
 /// callers were the deleted scratch-minted gathers' tests, and the live doors
 /// (`batched_gathered::copy_opspecs`, the MoE expert-slab copy) assemble their own ops from
 /// [`crate::sdsc_abstract::GatherCopySpec`] at `gather_copy_opspec`.
-
+///
 /// `layout` decides only the work division ([`EwDivision`]), exactly as for
 /// [`pointwise_broadcast_opspec_from_tile`]: `None` has no core-local pins.
 pub fn pointwise_opspec_from_tile(

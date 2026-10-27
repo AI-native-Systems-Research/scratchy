@@ -240,26 +240,46 @@ fn col_block(rows: u32, stick: u32) -> u32 {
     stick * rows * STK
 }
 
+/// ONE STICK-MAJOR OPERAND of the dot — its buffer NAME, the buffer's flat-frame ROW count, and
+/// the first column STICK of the window the dot reads or writes (0 for a whole buffer). In the
+/// stick-major frame column stick `s` starts at `s·rows·64`, so a whole-stick column window is a
+/// base offset and nothing else; the three facts travel together because the offset is their
+/// product, never one of them alone.
+#[derive(Clone, Copy, Debug)]
+pub struct StickWindow<'a> {
+    pub name: &'a str,
+    pub rows: u32,
+    pub stick: u32,
+}
+
+impl<'a> StickWindow<'a> {
+    /// A whole buffer: the window starts at column stick 0.
+    pub fn whole(name: &'a str, rows: u32) -> Self {
+        StickWindow {
+            name,
+            rows,
+            stick: 0,
+        }
+    }
+}
+
 /// ⭐ THE DOT — one per-batch bmm per (contraction stick, output stick), in emission order
 /// (`ns` outer, `ks` inner, so each output block's accumulation chain is contiguous). See the
 /// module doc for the frame law each operand's offset states.
 ///
-/// `a`/`w`/`o` are the operand NAMES; `a_rows`/`o_rows` the flat-frame row counts of the
-/// stick-major A and OUT buffers (`batch·m` for both, checked here). `a_stick`/`o_stick` are the
-/// first column stick of A's and OUT's window inside their buffers (0 for a whole buffer): in the
-/// stick-major frame column stick `s` starts at `s·rows·64`, so a whole-stick column window is a
-/// base offset and nothing else.
+/// `a` and `o` are the stick-major A and OUT operands ([`StickWindow`]: name, flat-frame rows —
+/// `batch·m` for both, checked here — and the window's first column stick); `w` is the C-order
+/// copy's NAME.
 pub fn dot_opspecs(
     bg: &BatchedGathered,
-    a: &str,
-    a_rows: u32,
-    a_stick: u32,
+    a: StickWindow<'_>,
     w: &str,
-    o: &str,
-    o_rows: u32,
-    o_stick: u32,
+    o: StickWindow<'_>,
 ) -> Result<Vec<OpSpec>, String> {
     let rows = bg.batch * bg.m;
+    let (a_rows, a_stick) = (a.rows, a.stick);
+    let (o_rows, o_stick) = (o.rows, o.stick);
+    let (a, o) = (a.name, o.name);
     if a_rows != rows || o_rows != rows {
         return Err(format!(
             "the batched gathered dot's A ({a_rows} rows) and OUT ({o_rows} rows) must both be \
@@ -397,15 +417,20 @@ pub fn emit_dot(
             bg.copy_rows()
         ));
     }
+    let (a_name, o_name) = (a.name(), o.name());
     let ops = dot_opspecs(
         bg,
-        &a.name(),
-        a.v_rows,
-        a_stick,
+        StickWindow {
+            name: &a_name,
+            rows: a.v_rows,
+            stick: a_stick,
+        },
         &w.name(),
-        &o.name(),
-        o.v_rows,
-        o_stick,
+        StickWindow {
+            name: &o_name,
+            rows: o.v_rows,
+            stick: o_stick,
+        },
     )
     .map_err(|msg| Error {
         message: format!("{name}: {msg}"),
@@ -558,7 +583,13 @@ mod byte_gate {
             )
             .unwrap();
             let rows = bg.batch * bg.m;
-            let dots = dot_opspecs(&bg, "a", rows, 0, "w", "o", rows, 0).unwrap();
+            let dots = dot_opspecs(
+                &bg,
+                StickWindow::whole("a", rows),
+                "w",
+                StickWindow::whole("o", rows),
+            )
+            .unwrap();
             let mut checked = 0u64;
             for (i, op) in dots.iter().enumerate() {
                 let (ns, ks) = (i as u32 / (bg.k / STK), i as u32 % (bg.k / STK));
@@ -603,7 +634,13 @@ mod byte_gate {
     fn the_dot_reads_a_and_writes_out_in_the_stick_major_flat_frame() {
         for bg in [pooled(), grouped(), moe_per_token(), wide_k()] {
             let rows = bg.batch * bg.m;
-            let dots = dot_opspecs(&bg, "a", rows, 0, "w", "o", rows, 0).unwrap();
+            let dots = dot_opspecs(
+                &bg,
+                StickWindow::whole("a", rows),
+                "w",
+                StickWindow::whole("o", rows),
+            )
+            .unwrap();
             let m_probe: Vec<u32> = [0, 1, bg.m / 2, bg.m - 1].into_iter().collect();
             let b_probe: Vec<u32> = [0, 1, bg.page, bg.batch / 2, bg.batch - 1]
                 .into_iter()
@@ -695,7 +732,13 @@ mod byte_gate {
             (b % bg.page * bg.k + kk) * bg.n + nn,
         );
         // The emitted (ks=0, ns=0) dot op — WITH its physical extents — reads it there.
-        let dots = dot_opspecs(&bg, "a", bg.batch * bg.m, 0, "w", "o", bg.batch * bg.m, 0).unwrap();
+        let dots = dot_opspecs(
+            &bg,
+            StickWindow::whole("a", bg.batch * bg.m),
+            "w",
+            StickWindow::whole("o", bg.batch * bg.m),
+        )
+        .unwrap();
         let op = &dots[0];
         let w = &op.args[1];
         let read = fold(
@@ -748,7 +791,13 @@ mod byte_gate {
             (wide_k(), 2),
         ] {
             let rows = bg.batch * bg.m;
-            let dots = dot_opspecs(&bg, "a", rows, 0, "w", "o", rows, 0).unwrap();
+            let dots = dot_opspecs(
+                &bg,
+                StickWindow::whole("a", rows),
+                "w",
+                StickWindow::whole("o", rows),
+            )
+            .unwrap();
             assert_eq!(dots.len(), want, "{bg:?}");
             assert_eq!(bg.dot_ops() as usize, want);
             let copies = copy_opspecs(
@@ -776,7 +825,13 @@ mod byte_gate {
     fn the_dot_serializes_innermost_first_with_back_gaps() {
         let bg = pooled();
         let rows = bg.batch * bg.m;
-        let dots = dot_opspecs(&bg, "a", rows, 0, "w", "o", rows, 0).unwrap();
+        let dots = dot_opspecs(
+            &bg,
+            StickWindow::whole("a", rows),
+            "w",
+            StickWindow::whole("o", rows),
+        )
+        .unwrap();
         for op in &dots {
             for arg in &op.args {
                 let v = arg.view();
@@ -840,16 +895,20 @@ mod byte_gate {
     #[test]
     fn the_dot_refuses_mismatched_flat_frame_rows() {
         let bg = pooled();
-        assert!(dot_opspecs(&bg, "a", bg.batch * bg.m, 0, "w", "o", bg.batch * bg.m, 0).is_ok());
+        assert!(
+            dot_opspecs(
+                &bg,
+                StickWindow::whole("a", bg.batch * bg.m),
+                "w",
+                StickWindow::whole("o", bg.batch * bg.m)
+            )
+            .is_ok()
+        );
         let Err(m) = dot_opspecs(
             &bg,
-            "a",
-            bg.batch * bg.m + 64,
-            0,
+            StickWindow::whole("a", bg.batch * bg.m + 64),
             "w",
-            "o",
-            bg.batch * bg.m,
-            0,
+            StickWindow::whole("o", bg.batch * bg.m),
         ) else {
             panic!("an A wider than batch·m must refuse");
         };

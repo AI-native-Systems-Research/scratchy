@@ -1769,6 +1769,22 @@ use ktir_superdsc::sdsc_abstract::attn_step_slots;
 /// kernels sweep the pool through the id table, not a baked rung. `rows_are_requests` is the
 /// ONE routing bit — the decode rung's rows are requests and `batched_decode_hm` serves
 /// them; a token-row shape is a chunk and `batched_prefill_hm` serves it.
+/// THE TWO BUNDLE-WIDE FACTS [`lower_attn`] reads that no program states — minted by the
+/// walk from the bundle's own `BundleAttnParams` derivation, so the splice and the door read
+/// one statement of each.
+#[derive(Clone, Copy, Debug)]
+pub struct AttnBundleFacts {
+    /// ⭐⭐⭐ THE BUNDLE'S SCORE-SCALE LAW — threaded from the walk that minted it
+    /// (`score_scale_law`'s ONE derivation, the same one the door's `BundleAttnParams` and the
+    /// pool write read). `None` only over a graph with no attention node; an AttnDecode under a
+    /// `None` is a walk/splice desync and refuses below.
+    pub scale_law: Option<ktir_superdsc::score_scale::ScoreScaleLaw>,
+    /// ⭐ WHETHER THE ATTENTION OUTPUT STAYS IN THE PER-HEAD ROW FRAME — the head-major o_proj
+    /// handoff (`BundleAttnParams::headmajor_handoff`): its permuted weight copy reads exactly
+    /// those bytes, so the from-rows copy is not emitted under it. See [`HeadRelayout`].
+    pub out_stays_head_rows: bool,
+}
+
 pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
@@ -1776,16 +1792,12 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     _active_cap: ktir_superdsc::ktir_node::ActiveCap,
     rows_are_requests: bool,
     paged_fold: Option<&PagedFoldRung>,
-    // ⭐⭐⭐ THE BUNDLE'S SCORE-SCALE LAW — threaded from the walk that minted it
-    // (`score_scale_law`'s ONE derivation, the same one the door's `BundleAttnParams` and the
-    // pool write read). `None` only over a graph with no attention node; an AttnDecode under a
-    // `None` is a walk/splice desync and refuses below.
-    scale_law: Option<ktir_superdsc::score_scale::ScoreScaleLaw>,
-    // ⭐ WHETHER THE ATTENTION OUTPUT STAYS IN THE PER-HEAD ROW FRAME — the head-major o_proj
-    // handoff (`BundleAttnParams::headmajor_handoff`): its permuted weight copy reads exactly
-    // those bytes, so the from-rows copy is not emitted under it. See [`HeadRelayout`].
-    out_stays_head_rows: bool,
+    bundle: AttnBundleFacts,
 ) -> Result<Vec<EmittedOp>, String> {
+    let AttnBundleFacts {
+        scale_law,
+        out_stays_head_rows,
+    } = bundle;
     let SubOp::AttnDecode { geom, .. } = &node.op else {
         return Err(
             "triton splice: lower_attn called on a node that is not an AttnDecode".to_string(),

@@ -2149,8 +2149,10 @@ fn spliced_attn_lowers_through_the_door() {
                 // The fixtures' nodes carry real multipliers (0.015625/0.0078125 below) and no
                 // fold receipt, so their law is the one every real-batch model lives under: the
                 // program states the whole scale.
-                Some(ktir_superdsc::score_scale::ScoreScaleLaw::StatedByProgram),
-                false,
+                scratchy_triton_splice::AttnBundleFacts {
+                    scale_law: Some(ktir_superdsc::score_scale::ScoreScaleLaw::StatedByProgram),
+                    out_stays_head_rows: false,
+                },
             );
             // ⛔ ALL-SHAPE KERNELS — the STEP B law, pinned here, never skipped.
             // The kernels' geometry is CONST-GENERIC: SLABS is bound from
@@ -2204,12 +2206,14 @@ fn spliced_attn_lowers_through_the_door() {
                     s.geom, s.mq, s.rung
                 )
             });
-            // The region's VALUE is the arm's own contract, stated above at the mint: the
-            // decode arm's spec received the pool capacity as its `pages`; the prefill arm's
-            // spec defaulted its `None` region to the walk's own extent — the pages the
-            // chunk attends, read off the node's own regions exactly as the arm reads them.
+            // The region's VALUE is the arm's own contract, stated above at the mint: BOTH
+            // arms' specs default a `None` region to the walk's own extent — the decode arm's
+            // the pages its valid length spans (`valid_len.div_ceil(PAGE_SLOTS)`, the batched
+            // family's page-major region), the prefill arm's the pages the chunk attends, read
+            // off the node's own regions exactly as the arm reads them.
             let expected_pages = if rows_are_requests {
-                cap
+                ATTN_VALID_LEN
+                    .div_ceil(ktir_superdsc::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32)
             } else {
                 let prefix_len = node.inputs[1].region.rows.len;
                 let new_len = node.inputs[3].region.rows.len;
@@ -2576,8 +2580,10 @@ fn a_continuation_programs_size_does_not_grow_with_its_rows() {
             false,
             None,
             // The node's 0.015625 is a real multiplier with no fold receipt — StatedByProgram.
-            Some(ktir_superdsc::score_scale::ScoreScaleLaw::StatedByProgram),
-            false,
+            scratchy_triton_splice::AttnBundleFacts {
+                scale_law: Some(ktir_superdsc::score_scale::ScoreScaleLaw::StatedByProgram),
+                out_stays_head_rows: false,
+            },
         )
         .unwrap_or_else(|e| panic!("splice compiled mq={mq}: {e}"));
         assert_eq!(
