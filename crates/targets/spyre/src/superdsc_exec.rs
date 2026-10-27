@@ -4553,6 +4553,30 @@ impl Executor {
         Ok(())
     }
 
+    /// ⭐ #32 (A) — THE PIPELINED DECODE STEP'S SUBMIT HALF: one one-token
+    /// forward with NO trailing drain. `predict`'s readback tail runs a
+    /// full-stream synchronize after every step — the FIRST of the two
+    /// per-step drains the pipelined loop deletes (the second is
+    /// `read_tensor_raw`'s own, split into `defer_read_tensor_raw` +
+    /// `finish_deferred_read_raw`). The loop's ONE fence per step — taken
+    /// after its prep-ahead, inside the finish half — is what waits this
+    /// submission (and the stick D2H enqueued behind it) out. Everything
+    /// else is `predict`'s own one-token path BY CONSTRUCTION, not by copy:
+    /// the same `forward_half` (the same refill, the same ONE doorbell, the
+    /// same accounting), reached through the same private body `predict`
+    /// runs for `Logits::LeftOnDevice`.
+    ///
+    /// The step's epilogue (RB attribution, the leak probe) does not ride
+    /// this door: both bodies are Diag-gated, and every Diag instrument
+    /// disqualifies a forward from the emitted-row regime by the seat's
+    /// own `is_quiet` gate — on this path they have no reachable input.
+    /// Stated here rather than silently dropped.
+    pub fn submit_step(&mut self, seq_pos: SeqPos) -> Result<()> {
+        let d = Diag::get();
+        let _half = self.forward_half(NewTokens(1), seq_pos, SuffixLaunch::Launched, d)?;
+        Ok(())
+    }
+
     /// ⭐ #32 — THE SHADOW'S QUIET POINT, TAKEN BY EVERY DOOR THAT WRITES IT.
     /// An H2D reads the host shadow at DEVICE-EXECUTION time (the CB DMAs from
     /// the shadow pointer when the card plays it), so a host write into

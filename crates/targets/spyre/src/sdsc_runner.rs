@@ -11,7 +11,9 @@
 //! caller: the worker routes every sendnn bundle to `SuperDsc`. Under `sendnn` the only bundle that
 //! runs is the dxp-compiled SuperDSC bundle.
 
-use crate::superdsc_exec::{Executor, KvDim, Logits, NewTokens, PoolPages, SegIdx, SeqPos, Vocab};
+use crate::superdsc_exec::{
+    DeferredRead, Executor, KvDim, Logits, NewTokens, PoolPages, SegIdx, SeqPos, Vocab,
+};
 use anyhow::{Result, anyhow, bail};
 use scratchy_subtile::sdsc_abstract::{
     FoldPages, FoldRowRegime, FoldWalker, MaskBlocks, PrefixMaskShape,
@@ -637,6 +639,49 @@ impl SuperDscSession {
         self.exec.keyed_holds(id)
     }
 
+    /// ⭐ #32 (A) — ONE PIPELINED STEP'S SUBMIT HALF: the same private forward
+    /// body `run_step_inner` reaches through `predict` for
+    /// `StepLogits::LeftOnDevice`, with NO trailing drain — the doorbell is rung
+    /// and the host returns (see `Executor::submit_step`). The loop's ONE fence —
+    /// the finish half of the stick read, `finish_deferred_read_raw` below — is
+    /// what waits this submission out; `predict`'s tail sync is the drain this
+    /// door exists to not run. Call `stage_step_acts` first: this door submits
+    /// whatever the shadow holds.
+    pub fn submit_step(&mut self, seq_pos: usize) -> Result<()> {
+        self.exec.submit_step(SeqPos(seq_pos as i64))
+    }
+
+    /// ⭐ #32 (A) — ENQUEUE THE STEP'S STICK READ, no drain: the D2H rides the
+    /// compute pipeline behind the step's CBs, and the host keeps working until
+    /// the loop's ONE fence (the runner spelling of
+    /// `Executor::defer_read_tensor_raw`).
+    pub fn defer_read_tensor_raw(
+        &mut self,
+        id: crate::bundle_code::PlaceId,
+        cap_bytes: usize,
+    ) -> Result<DeferredRead> {
+        self.exec.defer_read_tensor_raw(id, cap_bytes)
+    }
+
+    /// ⭐ #32 (C) — THE RING TWIN, for a pick not consumed until a later drain:
+    /// two outstanding shadow reads for the same stick race, so an in-flight
+    /// step's read lands in its own ring slot (the runner spelling of
+    /// `Executor::defer_read_tensor_ring`).
+    pub fn defer_read_tensor_ring(
+        &mut self,
+        id: crate::bundle_code::PlaceId,
+        cap_bytes: usize,
+    ) -> Result<DeferredRead> {
+        self.exec.defer_read_tensor_ring(id, cap_bytes)
+    }
+
+    /// ⭐ #32 (A) — THE LOOP'S ONE FENCE: park on this read's own completion
+    /// (and the shadow's quiet point), then return the bytes the transfer
+    /// brought back (the runner spelling of `Executor::finish_deferred_read_raw`).
+    pub fn finish_deferred_read_raw(&mut self, read: &DeferredRead) -> Result<Vec<u8>> {
+        self.exec.finish_deferred_read_raw(read)
+    }
+
     /// Bind `id` as a function of `key` alone, narrowed to f16 here. The next step uploads it, and
     /// no later step re-uploads it until another key is bound (see `Executor::bind_input_keyed`).
     pub fn bind_keyed(
@@ -666,11 +711,18 @@ impl SuperDscSession {
         self.exec.stage_keyed(id, key, f32_to_f16_le(vals))
     }
 
-    /// The bind loop every step runs before its forward — the three channels
-    /// (`run_step_inner`'s own): f32 narrowed to f16 at the boundary, already-f16
-    /// bytes as-is, and RAW LE int32 through `bind_input_raw`. One body, so a new
-    /// channel or a new guard cannot land on one step shape and skip the other.
-    fn bind_activations(
+    /// ⭐ #32 (A) — THE BIND LOOP EVERY STEP RUNS BEFORE ITS FORWARD, PUB FOR THE
+    /// PIPELINED LOOP, which stages half a step at a time: it calls this with
+    /// step `j+1`'s acts while the device still executes step `j` (the
+    /// position-pure half, pre-fence), then stages the ONE token-dependent bind
+    /// after the fence. `submit_step` is the other half — its refill uploads
+    /// whatever the shadow holds, so the split between the two calls is where
+    /// the pipelining lives. The one-shot `run_step_inner` path composes this
+    /// same body, never a second spelling of it. The three channels are its
+    /// own: f32 narrowed to f16 at the boundary, already-f16 bytes as-is, and
+    /// RAW LE int32 through `bind_input_raw`. One body, so a new channel or a
+    /// new guard cannot land on one step shape and skip the other.
+    pub fn stage_step_acts(
         &mut self,
         activations: &[crate::wiring::Bind],
         activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
@@ -741,7 +793,7 @@ impl SuperDscSession {
         activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
         logits: StepLogits,
     ) -> Result<Option<Vec<f32>>> {
-        self.bind_activations(activations, activations_f16, activations_i32)?;
+        self.stage_step_acts(activations, activations_f16, activations_i32)?;
         let (n_new, seq_pos) = (NewTokens(n_new as i64), SeqPos(seq_pos as i64));
         match logits {
             StepLogits::ReadBack => {
