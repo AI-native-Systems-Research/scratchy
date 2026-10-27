@@ -40,6 +40,10 @@ use scratchy_models::qwen3_5_moe::qwen3_6_35b_a3b::{CUDA_TAPES, CUDA_WEIGHTS};
 include!("common/cuda_hf_parity_body.rs");
 
 const HIDDEN: usize = 2048;
+const VOCAB: usize = 248_320;
+/// Two GDN slots, one per seat; the worker's allocations are the arena, the KV pool and the GDN pool.
+const GDN_POOL: Option<GdnPoolConfig> = Some(GdnPoolConfig { num_slots: 2 });
+const WORKER_ALLOCATIONS: u64 = 3;
 /// The weight buffers `load_weights` uploads: 523 (30 GDN bundles, 40 MoE bundles, the untied
 /// lm_head's among them).
 const WEIGHTS: u64 = 523;

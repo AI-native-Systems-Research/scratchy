@@ -1,0 +1,430 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Gemma 4 26B-A4B's CUDA prefill and decode, run from the real `google/gemma-4-26B-A4B-it`
+//! checkpoint on the H100, against HuggingFace transformers on the same token ids
+//! (AI-native-Systems-Research/scratchy#933, step 13c).
+//!
+//! The same checks as qwen3.6-35b-a3b's `cuda_hf_parity_35b.rs` (the tests are
+//! `common/cuda_hf_parity_body.rs`), at Gemma's constants, plus three decode checks on real
+//! weights. The reference is `tests/cuda_hf_reference.py --model gemma-4-26b-a4b-it`'s goldens
+//! (`tests/goldens/gemma4-moe-gemma-4-26b-a4b-it-hf/`), of the pinned revision
+//! `4d7ae4984b7db7de8f8457170b3f1a419ee76d52` (2 shards), its experts run as HF's per-expert
+//! `eager` loop, every prompt's ids starting with `<bos>` (2). The weights load through
+//! `load_weights` and `CUDA_WEIGHTS`; the forward is `CudaWorker` over `CUDA_TAPES`. Both sides'
+//! logits are soft-capped at ±30, and the near-tie margins are of the capped values.
+//!
+//! - memory_fits, run first and alone: `cudaMemGetInfo` and `nvidia-smi` at four points, 627 + 2
+//!   allocations (the arena and the KV pool; there is no GDN layer), all five buckets, the peak
+//!   after an m=4096 forward and a decode at most 78.0 GiB of the 79.6 GiB, with the headroom.
+//!   #933 predicts about 52.6 GiB.
+//! - load: 627 weight buffers and 2 worker allocations, each its `weight_bytes`; embed rows 0 and
+//!   262143 (the lm_head is tied), and layers 0 and 29's expert banks (experts 0 and 127's first
+//!   `gate_up` and `down` rows), routers (`router.proj`, `router.scale`,
+//!   `router.per_expert_scale`) and `layer_scalar` equal the checkpoint's; the load time.
+//! - P1 cosine, gated: on each prompt, min cosine(CUDA, f32) ≥ min cosine(HF-bf16, f32) − 0.005
+//!   (the user's 2026-10-26 rule for MoE models, #859's).
+//! - P2, P3, P4, P6: the 9b's rules, gated. P5, P7: every first divergence a near-tie.
+//! - P8, gated: the decode row against HF-f32 under P1's rule, and against CUDA's own one-shot row
+//!   at cosine ≥ 0.999.
+//! - (k), (n), (r): CUDA's decode rows against CUDA's own one-shot rows on real weights, below.
+//!
+//! The expert picks (P9) are `cuda_route_parity_gemma4.rs`'s. One rig holds about 52.6 GiB of the
+//! H100's 79.6 GiB (50.5 GB of weights, the 3.5 GB m=4096 arena, the KV pool), so run this binary
+//! with `--test-threads=1`. Built only under `nvcc` and `gemma-4-26b-a4b-it`
+//! (`required-features`). Needs an sm_90 GPU and the goldens: a missing goldens dir fails with
+//! the command that makes it, never skips. `memory_fits` and `load_checks` read only the goldens'
+//! `checkpoint`. `prompt_1_one_shot` and `prompt_1_decode` run alone for the sanitizers. Every
+//! check prints its line before a test fails.
+
+use scratchy_models::gemma4_moe::gemma_4_26b_a4b_it::{CUDA_TAPES, CUDA_WEIGHTS};
+use scratchy_target_cuda::step::CudaStep;
+use scratchy_target_cuda::tape::CudaTape;
+
+include!("common/cuda_hf_parity_body.rs");
+
+const HIDDEN: usize = 2816;
+const VOCAB: usize = 262_144;
+/// The weight buffers `load_weights` uploads: 627 (30 expert banks, each two checkpoint tensors;
+/// the tied lm_head reads the embedding table's).
+const WEIGHTS: u64 = 627;
+/// Tied (`tie_word_embeddings`): the lm_head is the embedding table, whose rows `load_checks`
+/// checks already.
+const UNTIED_LM_HEAD: Option<&str> = None;
+/// The goldens: `cuda_hf_reference.py --model`, the checkpoint, and where they are written.
+const MODEL: &str = "gemma-4-26b-a4b-it";
+const CHECKPOINT: &str = "gemma-4-26B-A4B-it";
+const GOLDENS: &str = "tests/goldens/gemma4-moe-gemma-4-26b-a4b-it-hf";
+/// P1's rule (#933, the user's 2026-10-26 rule for MoE models, #859's): min cosine(CUDA, f32) at
+/// most 0.005 below HF-bf16's own min cosine on the same prompt.
+const P1: P1Rule = P1Rule::BelowHfBf16(0.005);
+/// No GDN layer: no GDN pool, and no `GdnSequence` in a forward. The worker's allocations are the
+/// arena and the KV pool.
+const GDN_POOL: Option<GdnPoolConfig> = None;
+const WORKER_ALLOCATIONS: u64 = 2;
+
+// ── Decode on real weights: (k), (n) and (r) ───────────────────────
+
+// These are #925's decode-against-one-shot checks, which its synthetic weights could not judge
+// (their attention is nearly a hard argmax), rerun on the checkpoint. CUDA is compared with CUDA,
+// so no HF logits are needed. Per row printed: cosine, max |diff|, whether the top-1 agrees and
+// whether the one-shot row is a near-tie (its top-1 − top-2 margin at most twice the max |diff|),
+// the first layer whose expert picks differ from the one-shot's and how many do, and finiteness.
+// Gated: finiteness, and the top-1 on every row that is not a near-tie. Any cosine below
+// `STOP_BELOW` fails the test as a stop-and-report (#933). The floors that will gate the cosines
+// are the user's, proposed from this run's numbers; until then they are printed, not set.
+
+/// The layers, each with its own routing.
+const LAYERS: usize = 30;
+/// The decode input's length: prompt 6's `<bos>`, then the rest of its ids repeated.
+const DECODE_TOKENS: usize = 1100;
+/// The beginning-of-sequence id every Gemma prompt starts with.
+const BOS: u32 = 2;
+/// A cosine below this stops the run for a report (#933): a decode-path defect, not bf16 noise.
+/// Not a floor; the floors are the user's.
+const STOP_BELOW: f64 = 0.99;
+/// The decode rig's KV pool: 40 blocks, two seats of [`DECODE_SEAT_BLOCKS`] (1,088 tokens each,
+/// for (r)'s 1,028), 576,716,800 bytes.
+const DECODE_KV_POOL: KvPoolConfig = KvPoolConfig { num_blocks: 40 };
+const DECODE_SEAT_BLOCKS: usize = 17;
+
+const fn decode_seat(from: u32) -> [u32; DECODE_SEAT_BLOCKS] {
+    let mut b = [0; DECODE_SEAT_BLOCKS];
+    let mut i = 0;
+    while i < DECODE_SEAT_BLOCKS {
+        b[i] = from + i as u32;
+        i += 1;
+    }
+    b
+}
+
+/// Blocks 0..17: the prefills and decodes.
+const DECODE_SEAT_A: [u32; DECODE_SEAT_BLOCKS] = decode_seat(0);
+/// Blocks 17..34: the one-shot forwards, no block of [`DECODE_SEAT_A`]'s.
+const DECODE_SEAT_B: [u32; DECODE_SEAT_BLOCKS] = decode_seat(DECODE_SEAT_BLOCKS as u32);
+
+/// The decode input: prompt 6's ids from `meta.json` (`<bos>` then all eight prompt lines), with
+/// everything after the `<bos>` repeated until there are [`DECODE_TOKENS`]. Real text, with no
+/// tokenizer call.
+fn decode_ids() -> Vec<u32> {
+    let p6: Vec<u32> = (meta()["prompts"][5]["ids"].as_array())
+        .expect("meta.json lists prompt 6's ids")
+        .iter()
+        .map(|v| v.as_u64().expect("an id") as u32)
+        .collect();
+    assert_eq!(p6.first(), Some(&BOS), "prompt 6 starts with <bos>");
+    assert!(p6.len() > 1, "prompt 6 has text after <bos>");
+    let mut ids = vec![BOS];
+    while ids.len() < DECODE_TOKENS {
+        ids.extend_from_slice(&p6[1..]);
+    }
+    ids.truncate(DECODE_TOKENS);
+    ids
+}
+
+/// [`CUDA_TAPES`], then each of `ms`' tapes cut just after each layer's `MoeRoute` step, its
+/// result that layer's `topk_idx` (`cuda_prefill_gemma4`'s `route_cuts`): cut `l` of `ms[i]` is
+/// tape [`pick_cut`]`(i, l)`. A `'static` list for one worker; every span stays in the same
+/// arena, so each cut validates as the full tape does.
+fn with_route_cuts(ms: &[u32]) -> &'static [CudaTape] {
+    let mut list = CUDA_TAPES.to_vec();
+    for &m in ms {
+        let tape = (CUDA_TAPES.iter().find(|t| t.bucket_m == m)).expect("the bucket's tape");
+        let moe = tape.moe.expect("a MoE scratch");
+        let cuts: Vec<CudaTape> = (tape.steps.iter().enumerate())
+            .filter(|(_, s)| matches!(s, CudaStep::MoeRoute(_)))
+            .map(|(i, _)| CudaTape {
+                steps: Box::leak(tape.steps[..=i].to_vec().into_boxed_slice()),
+                result: moe.topk_idx,
+                ..*tape
+            })
+            .collect();
+        assert_eq!(cuts.len(), LAYERS, "m={m}: one MoeRoute step per layer");
+        list.extend(cuts);
+    }
+    Box::leak(list.into_boxed_slice())
+}
+
+/// The tape index of cut `layer` of the `i`-th bucket a [`with_route_cuts`] list was made for.
+fn pick_cut(i: usize, layer: usize) -> usize {
+    CUDA_TAPES.len() + i * LAYERS + layer
+}
+
+/// The tape index of the m-row bucket: [`CUDA_TAPES`] lead every list here, in order.
+fn bucket_of(m: u32) -> usize {
+    (CUDA_TAPES.iter().position(|t| t.bucket_m == m)).expect("the bucket's tape")
+}
+
+/// One forward of `ids` at `prefix_len` in `blocks`, through tape `b` of `tapes` (the worker's
+/// own list): the full result.
+fn run_on(
+    w: &mut CudaWorker<'_>,
+    (tapes, b): (&[CudaTape], usize),
+    ids: &[u32],
+    prefix_len: u32,
+    blocks: &[u32],
+) -> Vec<u16> {
+    let tape = &tapes[b];
+    let mut padded = vec![0u32; tape.bucket_m as usize];
+    padded[..ids.len()].copy_from_slice(ids);
+    let positions: Vec<u32> = (prefix_len..prefix_len + tape.bucket_m).collect();
+    let kv = KvSequence {
+        block_table: blocks,
+        prefix_len,
+        q_len: ids.len() as u32,
+    };
+    let mut out = vec![0u16; tape.result.bytes as usize / 2];
+    w.forward(
+        b,
+        Input::TokenIds(&padded),
+        &positions,
+        Some(&kv),
+        None,
+        &mut out,
+    )
+    .unwrap_or_else(|e| panic!("m={} at {prefix_len}: {e}", tape.bucket_m));
+    out
+}
+
+/// i32 words from the u16 halves a picks result holds.
+fn pick_words(halves: &[u16]) -> Vec<i32> {
+    (halves.as_chunks::<2>().0.iter())
+        .map(|&[lo, hi]| (u32::from(lo) | u32::from(hi) << 16) as i32)
+        .collect()
+}
+
+/// Row `row`'s picks, as a set, of a `[rows, top_k]` result.
+fn pick_set(idx: &[i32], row: usize, top_k: usize) -> BTreeSet<i32> {
+    idx[row * top_k..][..top_k].iter().copied().collect()
+}
+
+/// One decode check: its worker over the tapes and the route cuts of the one-shot bucket and of
+/// m=1, the one-shot rows as f32, and the one-shot's picks per layer.
+struct DecodeCheck<'r> {
+    worker: CudaWorker<'r>,
+    tapes: &'static [CudaTape],
+    one_shot: Vec<f32>,
+    picks: Vec<Vec<i32>>,
+    top_k: usize,
+}
+
+impl<'r> DecodeCheck<'r> {
+    /// `ids` fresh in one forward of the `one_shot_m` bucket, in [`DECODE_SEAT_B`]: its logits,
+    /// and its picks per layer from the route cuts (a cut forward rewrites the positions it runs
+    /// with what the full one writes there).
+    fn new(r: &'r Rig, one_shot_m: u32, ids: &[u32]) -> Self {
+        let tapes = with_route_cuts(&[one_shot_m, 1]);
+        let mut worker =
+            CudaWorker::new(&r.device, tapes, &r.weights, Some(DECODE_KV_POOL), GDN_POOL)
+                .unwrap_or_else(|e| {
+                    panic!("CudaWorker::new over the tapes and the route cuts: {e}")
+                });
+        let full = run_on(
+            &mut worker,
+            (tapes, bucket_of(one_shot_m)),
+            ids,
+            0,
+            &DECODE_SEAT_B,
+        );
+        let one_shot = (full[..ids.len() * VOCAB].iter())
+            .map(|&b| bf16::from_bits(b).to_f32())
+            .collect();
+        let picks = (0..LAYERS)
+            .map(|l| {
+                pick_words(&run_on(
+                    &mut worker,
+                    (tapes, pick_cut(0, l)),
+                    ids,
+                    0,
+                    &DECODE_SEAT_B,
+                ))
+            })
+            .collect();
+        let top_k = (CUDA_TAPES[bucket_of(1)].moe).expect("a MoE scratch").top_k as usize;
+        Self {
+            worker,
+            tapes,
+            one_shot,
+            picks,
+            top_k,
+        }
+    }
+
+    /// A fresh prefill of `ids` in the m-row bucket, in [`DECODE_SEAT_A`].
+    fn prefill(&mut self, m: u32, ids: &[u32]) {
+        run_on(
+            &mut self.worker,
+            (self.tapes, bucket_of(m)),
+            ids,
+            0,
+            &DECODE_SEAT_A,
+        );
+    }
+
+    /// A decode of `token` at `p` in [`DECODE_SEAT_A`] on the cache as it stands, first cut after
+    /// each layer's routing, then whole: the first layer whose picks are not the one-shot row
+    /// `p`'s and how many layers' are not, and the decode's logits as f32. A cut decode writes
+    /// position `p` of the layers it runs with what the full decode writes there.
+    fn decode(&mut self, token: u32, p: usize) -> (Option<usize>, usize, Vec<f32>) {
+        let (mut first, mut count) = (None, 0);
+        for l in 0..LAYERS {
+            let got = run_on(
+                &mut self.worker,
+                (self.tapes, pick_cut(1, l)),
+                &[token],
+                p as u32,
+                &DECODE_SEAT_A,
+            );
+            if pick_set(&pick_words(&got), 0, self.top_k) != pick_set(&self.picks[l], p, self.top_k)
+            {
+                first = first.or(Some(l));
+                count += 1;
+            }
+        }
+        let row = run_on(
+            &mut self.worker,
+            (self.tapes, bucket_of(1)),
+            &[token],
+            p as u32,
+            &DECODE_SEAT_A,
+        );
+        let row = (row[..VOCAB].iter())
+            .map(|&b| bf16::from_bits(b).to_f32())
+            .collect();
+        (first, count, row)
+    }
+
+    /// The decode row at `p` against the one-shot row `p`, printed: finiteness, cosine, max
+    /// |diff|, the top-1 and the near-tie, and the pick scan. Returns `(gated pass, cosine)`.
+    fn line(&self, what: &str, p: usize, scan: (Option<usize>, usize), row: &[f32]) -> (bool, f64) {
+        let want = &self.one_shot[p * VOCAB..][..VOCAB];
+        let finite = row.iter().all(|v| v.is_finite());
+        let cos = cosine(row, want);
+        let (_, diff) = error(row, want);
+        let top = top_k(want, 2);
+        let margin = f64::from(want[top[0]] - want[top[1]]);
+        let tie = margin <= 2.0 * diff;
+        let got = top_k(row, 1)[0];
+        let same = got == top[0];
+        let ok = finite && (same || tie);
+        eprintln!(
+            "{what}: finite={finite} cosine={cos:.6} max|diff|={diff:.6e} top-1 \
+             {got} one-shot {} same={same} (one-shot margin {margin:.4e}, near-tie when <= 2 x \
+             max|diff| = {:.4e}: {tie}) first layer whose picks differ={:?}, layers whose picks \
+             differ={} of {LAYERS} (gated: finite, top-1 unless near-tie) {}",
+            top[0],
+            2.0 * diff,
+            scan.0,
+            scan.1,
+            verdict(ok)
+        );
+        (ok, cos)
+    }
+}
+
+/// After a decode check's rows: the worst cosine, printed for the user's floor, and the stop rule.
+/// Fails the test on a gated row, then on a cosine below [`STOP_BELOW`].
+fn decode_verdict(what: &str, pass: bool, cosines: &[f64]) {
+    let worst = cosines.iter().copied().fold(f64::INFINITY, f64::min);
+    let stop = worst < STOP_BELOW;
+    eprintln!(
+        "{what}: {} rows, worst cosine {worst:.6} (the floor that will gate it is the user's, \
+         proposed from this run, not set; below {STOP_BELOW} stops the run for a report, #933): \
+         {}",
+        cosines.len(),
+        if stop {
+            "STOP AND REPORT"
+        } else {
+            "above the stop rule"
+        }
+    );
+    assert!(
+        pass,
+        "{what}: a decode row is non-finite or its top-1 disagrees outside a near-tie"
+    );
+    assert!(
+        !stop,
+        "{what}: a decode cosine is below {STOP_BELOW}: stop and report the table above"
+    );
+}
+
+/// (k), teacher-forced: for each P = 300 … 307, a fresh prefill of P tokens in m=512, then one
+/// decode of token P, against row P of one 308-token m=512 forward in disjoint blocks.
+#[test]
+fn k_real_weights_teacher_forced_decodes() {
+    let r = rig();
+    let ids = decode_ids();
+    let mut c = DecodeCheck::new(&r, 512, &ids[..308]);
+    let (mut pass, mut cosines) = (true, Vec::new());
+    for (p, &token) in ids.iter().enumerate().take(308).skip(300) {
+        c.prefill(512, &ids[..p]);
+        let (first, count, row) = c.decode(token, p);
+        let (ok, cos) = c.line(
+            &format!(
+                "(k) real weights, decode at P={p} after {p} tokens prefilled, against row {p} of \
+                 one 308-token forward"
+            ),
+            p,
+            (first, count),
+            &row,
+        );
+        pass &= ok;
+        cosines.push(cos);
+    }
+    decode_verdict("(k) real weights", pass, &cosines);
+}
+
+/// (n), the KV-block boundary: 319 tokens prefilled in m=512, then decodes at P = 319 (the last
+/// slot of block 4) and P = 320 (the first of block 5), against one 321-token forward.
+#[test]
+fn n_real_weights_decodes_at_a_block_boundary() {
+    let r = rig();
+    let ids = decode_ids();
+    let mut c = DecodeCheck::new(&r, 512, &ids[..321]);
+    c.prefill(512, &ids[..319]);
+    let (mut pass, mut cosines) = (true, Vec::new());
+    for (p, &token) in ids.iter().enumerate().take(321).skip(319) {
+        let (first, count, row) = c.decode(token, p);
+        let (ok, cos) = c.line(
+            &format!(
+                "(n) real weights, decode at P={p} (kv_len {}, block {} slot {}), against row {p} \
+                 of one 321-token forward",
+                p + 1,
+                p / 64,
+                p % 64
+            ),
+            p,
+            (first, count),
+            &row,
+        );
+        pass &= ok;
+        cosines.push(cos);
+    }
+    decode_verdict("(n) real weights", pass, &cosines);
+}
+
+/// (r), across the sliding window: 1,020 tokens prefilled in m=1024, then decodes at P = 1020 …
+/// 1027 in turn (the sliding layers drop key P − 1024 from P = 1024), against one 1,028-token
+/// forward on the m=2048 tape.
+#[test]
+fn r_real_weights_decodes_across_the_window() {
+    let r = rig();
+    let ids = decode_ids();
+    let mut c = DecodeCheck::new(&r, 2048, &ids[..1028]);
+    c.prefill(1024, &ids[..1020]);
+    let (mut pass, mut cosines) = (true, Vec::new());
+    for (p, &token) in ids.iter().enumerate().take(1028).skip(1020) {
+        let (first, count, row) = c.decode(token, p);
+        let (ok, cos) = c.line(
+            &format!(
+                "(r) real weights, decode at P={p} (window floor {}), against row {p} of one \
+                 1028-token forward",
+                p.saturating_sub(1023)
+            ),
+            p,
+            (first, count),
+            &row,
+        );
+        pass &= ok;
+        cosines.push(cos);
+    }
+    decode_verdict("(r) real weights", pass, &cosines);
+}

@@ -9,6 +9,11 @@
 // qwen3.6-35b-a3b's `cuda_hf_parity_35b.rs` includes it too (AI-native-Systems-Research/
 // scratchy#859): each binary states its P1 rule (`P1`, a `P1Rule`), and `load_checks` adds the
 // 35B's MoE bundles' rows.
+// gemma-4-26b-a4b-it's `cuda_hf_parity_gemma4.rs` includes it too (#933): each binary states its
+// `VOCAB`, its GDN pool (`GDN_POOL`, `None` for a model with no GDN layer, whose forwards then pass
+// no `GdnSequence` and whose `load_checks` has no GDN bundle to check) and its worker's allocations
+// (`WORKER_ALLOCATIONS`: the arena, the KV pool and the GDN pool when there is one), and
+// `load_checks` adds Gemma's expert banks' and routers' rows.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -23,12 +28,10 @@ use scratchy_target_cuda::runtime::{
 use scratchy_target_cuda::step::gdn_bundle;
 use scratchy_target_cuda::weights::{CudaWeight, open_checkpoint};
 
-const VOCAB: usize = 248_320;
 /// The smallest bucket; every prompt and greedy sequence fits it.
 const M: u32 = 512;
 /// Blocks per seat: 8 · 64 = 512 tokens.
 const KV_POOL: KvPoolConfig = KvPoolConfig { num_blocks: 16 };
-const GDN_POOL: GdnPoolConfig = GdnPoolConfig { num_slots: 2 };
 const SEAT_A: (&[u32], u32) = (&[0, 1, 2, 3, 4, 5, 6, 7], 0);
 const SEAT_B: (&[u32], u32) = (&[8, 9, 10, 11, 12, 13, 14, 15], 1);
 /// P6's first chunk.
@@ -198,7 +201,7 @@ impl Rig {
             CUDA_TAPES,
             &self.weights,
             Some(KV_POOL),
-            Some(GDN_POOL),
+            GDN_POOL,
         )
         .unwrap_or_else(|e| panic!("CudaWorker::new: {e}"))
     }
@@ -221,18 +224,18 @@ fn forward(w: &mut CudaWorker<'_>, ids: &[u32], prefix_len: u32, seat: (&[u32], 
         prefix_len,
         q_len: q,
     };
-    let gdn = GdnSequence {
+    let gdn = GDN_POOL.map(|_| GdnSequence {
         slot: seat.1,
         q_len: q,
         fresh: prefix_len == 0,
-    };
+    });
     let mut out = vec![0u16; tape.result.bytes as usize / 2];
     w.forward(
         bucket(),
         Input::TokenIds(&padded),
         &positions,
         Some(&kv),
-        Some(&gdn),
+        gdn.as_ref(),
         &mut out,
     )
     .unwrap_or_else(|e| panic!("forward: {e}"));
@@ -291,9 +294,10 @@ fn load_checks() {
     let worker = r.device.allocations() - r.before - loaded;
     drop(w);
     let nonzero = (r.weights.iter()).filter(|b| b.bytes() > 0).count();
-    let mut pass = loaded == WEIGHTS && worker == 3 && nonzero == WEIGHTS as usize;
+    let mut pass = loaded == WEIGHTS && worker == WORKER_ALLOCATIONS && nonzero == WEIGHTS as usize;
     eprintln!(
-        "load: allocations weights={loaded} (expect {WEIGHTS}) worker={worker} (expect 3) \
+        "load: allocations weights={loaded} (expect {WEIGHTS}) worker={worker} (expect \
+         {WORKER_ALLOCATIONS}) \
          nonzero_buffers={nonzero} load_time={:.2}s (from opening the checkpoint to the last \
          upload) {}",
         r.load_secs,
@@ -355,47 +359,51 @@ fn load_checks() {
             pass &= ok;
         }
     }
-    let (ix, bundle) = (CUDA_WEIGHTS.iter().enumerate())
-        .find_map(|(ix, w)| match *w {
-            Some(b @ CudaWeight::GdnBundle { .. }) => Some((ix, b)),
-            _ => None,
-        })
-        .expect("a GDN bundle");
-    let CudaWeight::GdnBundle {
-        conv1d,
-        a_log,
-        dt_bias,
-        norm,
-        conv_dim,
-        conv_kernel,
-        nv,
-        head_v,
-    } = bundle
-    else {
-        unreachable!("matched a bundle");
-    };
-    let layout = gdn_bundle(conv_dim, conv_kernel, nv, head_v).expect("the bundle fits");
-    let halves = r.weights[ix].download().expect("download the bundle");
-    let device: Vec<f32> = (halves.as_chunks::<2>().0.iter())
-        .map(|&[lo, hi]| f32::from_bits(u32::from(lo) | u32::from(hi) << 16))
-        .collect();
-    for (tensor, at) in [
-        (conv1d, layout.conv1d),
-        (a_log, layout.a_log),
-        (dt_bias, layout.dt_bias),
-        (norm, layout.norm),
-    ] {
-        let want = ck
-            .tensor_to_f32(tensor)
-            .unwrap_or_else(|| panic!("{tensor}"));
-        let got = &device[at as usize / 4..][..want.len()];
-        let ok = (got.iter().zip(&want)).all(|(g, w)| g.to_bits() == w.to_bits());
-        eprintln!(
-            "load: weight {ix} {tensor} ({} values at {at}) equals the checkpoint's widened to f32 {}",
-            want.len(),
-            verdict(ok)
-        );
-        pass &= ok;
+    // A model with GDN layers (`GDN_POOL` is `Some`): its first GDN bundle, unpacked. A model with
+    // none has no bundle to check.
+    if GDN_POOL.is_some() {
+        let (ix, bundle) = (CUDA_WEIGHTS.iter().enumerate())
+            .find_map(|(ix, w)| match *w {
+                Some(b @ CudaWeight::GdnBundle { .. }) => Some((ix, b)),
+                _ => None,
+            })
+            .expect("a GDN bundle");
+        let CudaWeight::GdnBundle {
+            conv1d,
+            a_log,
+            dt_bias,
+            norm,
+            conv_dim,
+            conv_kernel,
+            nv,
+            head_v,
+        } = bundle
+        else {
+            unreachable!("matched a bundle");
+        };
+        let layout = gdn_bundle(conv_dim, conv_kernel, nv, head_v).expect("the bundle fits");
+        let halves = r.weights[ix].download().expect("download the bundle");
+        let device: Vec<f32> = (halves.as_chunks::<2>().0.iter())
+            .map(|&[lo, hi]| f32::from_bits(u32::from(lo) | u32::from(hi) << 16))
+            .collect();
+        for (tensor, at) in [
+            (conv1d, layout.conv1d),
+            (a_log, layout.a_log),
+            (dt_bias, layout.dt_bias),
+            (norm, layout.norm),
+        ] {
+            let want = ck
+                .tensor_to_f32(tensor)
+                .unwrap_or_else(|| panic!("{tensor}"));
+            let got = &device[at as usize / 4..][..want.len()];
+            let ok = (got.iter().zip(&want)).all(|(g, w)| g.to_bits() == w.to_bits());
+            eprintln!(
+                "load: weight {ix} {tensor} ({} values at {at}) equals the checkpoint's widened to f32 {}",
+                want.len(),
+                verdict(ok)
+            );
+            pass &= ok;
+        }
     }
     // A MoE model's first and last MoE bundles (qwen3.6-35b-a3b's layers 0 and 39; none in a
     // dense model): the router whole at byte 0, experts 0 and `experts − 1`'s first `gate_up`
@@ -463,6 +471,78 @@ fn load_checks() {
         );
         pass &= ok;
     }
+    // Gemma's first and last expert banks (layers 0 and 29; none in a qwen model): experts 0 and
+    // `experts − 1`'s first `gate_up` and `down` rows, and the layer's router (`router.proj`,
+    // `router.scale`, `router.per_expert_scale`) and `layer_scalar`, each whole, against the
+    // checkpoint's bytes (#933).
+    let banks: Vec<(usize, CudaWeight)> = (CUDA_WEIGHTS.iter().enumerate())
+        .filter_map(|(ix, w)| match *w {
+            Some(b @ CudaWeight::ExpertBank { .. }) => Some((ix, b)),
+            Some(
+                CudaWeight::Bf16 { .. }
+                | CudaWeight::GdnBundle { .. }
+                | CudaWeight::MoeBundle { .. },
+            )
+            | None => None,
+        })
+        .collect();
+    let ends = (banks.iter().enumerate()).filter(|&(n, _)| n == 0 || n + 1 == banks.len());
+    for (_, &(ix, bank)) in ends {
+        let CudaWeight::ExpertBank {
+            gate_up,
+            down,
+            experts,
+            hidden,
+            inter,
+        } = bank
+        else {
+            unreachable!("matched an expert bank");
+        };
+        let layout = scratchy_target_cuda::step::expert_bank(experts, hidden, inter)
+            .expect("the expert bank fits");
+        let device = r.weights[ix].download().expect("download the expert bank");
+        let (e, h, i) = (experts as usize, hidden as usize, inter as usize);
+        for (tensor, base, per_expert, row) in [
+            (gate_up, layout.gate_up, 2 * i * h, h),
+            (down, layout.down, h * i, i),
+        ] {
+            let (want, ..) = ck.take_to_cpu_bytes(tensor).expect("an expert tensor");
+            for expert in [0, e - 1] {
+                let from = expert * per_expert;
+                let at = base as usize / 2 + from;
+                let ok = device[at..][..row] == le_halves(&want[from * 2..][..row * 2])[..];
+                eprintln!(
+                    "load: weight {ix} {tensor} expert {expert} row 0 ({row} values) equals the \
+                     checkpoint's {}",
+                    verdict(ok)
+                );
+                pass &= ok;
+            }
+        }
+        let layer = gate_up
+            .strip_suffix(".experts.gate_up_proj")
+            .unwrap_or_else(|| panic!("{gate_up} is a layer's experts.gate_up_proj"));
+        for suffix in [
+            ".router.proj.weight",
+            ".router.scale",
+            ".router.per_expert_scale",
+            ".layer_scalar",
+        ] {
+            let name = format!("{layer}{suffix}");
+            let gix = (CUDA_WEIGHTS.iter())
+                .position(|w| matches!(w, Some(CudaWeight::Bf16 { tensor, .. }) if *tensor == name))
+                .unwrap_or_else(|| panic!("no entry for {name}"));
+            let (want, ..) = ck.take_to_cpu_bytes(&name).expect("a router tensor");
+            let got = r.weights[gix].download().expect("download a router tensor");
+            let ok = got == le_halves(&want);
+            eprintln!(
+                "load: weight {gix} {name} ({} values) equals the checkpoint's {}",
+                got.len(),
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
     assert!(pass, "a load check failed");
 }
 
@@ -483,11 +563,11 @@ fn nvidia_smi() -> String {
 
 /// The memory gate (#859), run first and alone: `cudaMemGetInfo` and `nvidia-smi` after the
 /// device opens, after `load_weights`, after a worker over every tape, and after one forward of
-/// the largest bucket's every row and one decode. Pass: `WEIGHTS` + 3 allocations, every buffer
-/// its `weight_bytes`, every bucket in the worker, and a peak (total − free after the forwards) at
-/// most `PEAK_LIMIT`. The KV pool is serve's cap, one sequence's block table plus block 0
-/// (`CUDA_MAX_BLOCKS_PER_SEQ` + 1); the GDN pool is the rig's. Reads only the goldens'
-/// `checkpoint`.
+/// the largest bucket's every row and one decode. Pass: `WEIGHTS` + `WORKER_ALLOCATIONS`
+/// allocations, every buffer its `weight_bytes`, every bucket in the worker, and a peak (total −
+/// free after the forwards) at most `PEAK_LIMIT`. The KV pool is serve's cap, one sequence's
+/// block table plus block 0 (`CUDA_MAX_BLOCKS_PER_SEQ` + 1); the GDN pool is the rig's
+/// (`GDN_POOL`, none for a model with no GDN layer). Reads only the goldens' `checkpoint`.
 #[test]
 fn memory_fits() {
     let device = CudaDevice::open()
@@ -522,7 +602,7 @@ fn memory_fits() {
         CUDA_TAPES,
         &weights,
         Some(KvPoolConfig { num_blocks: blocks }),
-        Some(GDN_POOL),
+        GDN_POOL,
     )
     .unwrap_or_else(|e| panic!("CudaWorker::new: {e}"));
     let worker = device.allocations() - before - loaded;
@@ -541,18 +621,18 @@ fn memory_fits() {
         prefix_len: 0,
         q_len: rows,
     };
-    let gdn = GdnSequence {
+    let gdn = GDN_POOL.map(|_| GdnSequence {
         slot: 0,
         q_len: rows,
         fresh: true,
-    };
+    });
     let mut out = vec![0u16; tape.result.bytes as usize / 2];
     w.forward(
         b,
         Input::TokenIds(&ids),
         &positions,
         Some(&kv),
-        Some(&gdn),
+        gdn.as_ref(),
         &mut out,
     )
     .unwrap_or_else(|e| panic!("the m={rows} forward: {e}"));
@@ -563,9 +643,14 @@ fn memory_fits() {
         .count();
     let (free, total) = reading(&format!("after one m={rows} forward and one m=1 decode"));
     let peak = total - free;
-    let ok = loaded == WEIGHTS && worker == 3 && sizes_ok && buckets_ok && peak <= PEAK_LIMIT;
+    let ok = loaded == WEIGHTS
+        && worker == WORKER_ALLOCATIONS
+        && sizes_ok
+        && buckets_ok
+        && peak <= PEAK_LIMIT;
     eprintln!(
-        "memory: allocations weights={loaded} (expect {WEIGHTS}) worker={worker} (expect 3) \
+        "memory: allocations weights={loaded} (expect {WEIGHTS}) worker={worker} (expect \
+         {WORKER_ALLOCATIONS}) \
          every buffer its weight_bytes={sizes_ok} buckets {ms:?} (expect all five) arena={} KV \
          pool={:?} ({blocks} blocks) GDN pool={:?} load_time={load_secs:.2}s non-finite \
          logits={non_finite} (information only)",
@@ -837,18 +922,18 @@ fn decode(w: &mut CudaWorker<'_>, token: u32, prefix_len: u32, seat: (&[u32], u3
         prefix_len,
         q_len: 1,
     };
-    let gdn = GdnSequence {
+    let gdn = GDN_POOL.map(|_| GdnSequence {
         slot: seat.1,
         q_len: 1,
         fresh: false,
-    };
+    });
     let mut out = vec![0u16; VOCAB];
     w.forward(
         b,
         Input::TokenIds(&[token]),
         &[prefix_len],
         Some(&kv),
-        Some(&gdn),
+        gdn.as_ref(),
         &mut out,
     )
     .unwrap_or_else(|e| panic!("decode at {prefix_len}: {e}"));
