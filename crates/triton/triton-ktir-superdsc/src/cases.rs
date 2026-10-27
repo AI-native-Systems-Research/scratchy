@@ -827,6 +827,57 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
             vec![1],
             Program::Sample,
         ),
+        // ⭐ THE INT MULTI-ROW PROBES (front-b-noise, auditor GO 2026-10-27): four cells
+        // for attribution, all in the PRODUCTION PID-CORNERED SPELLING — grid `[B]` at
+        // B=2, `[1, ·]` blocks, the per-row loads at `[pid, 0]`. The DENSE cells
+        // (`[2, 512]` + `[2, 512]`) are the multi-row dense CONTROL (B1 measured
+        // `[1, 512]` alone); the COL cells (`[2, 512]` + `[2, 1]`) measure the
+        // multi-row `Col` operand mode WALL 9 named — a band-typed rung mints its
+        // per-request seed words as `[rows, 1]` against a `[rows, cols]` tile at
+        // rows > 1 — for `Add` AND `Mul`, the door's in-flight admission's own
+        // measurement. The staged rows and per-row words all DIFFER, so a sprayed
+        // word or a wrong stick is a mismatch, never a coincidental pass.
+        // NOT production configurations: delete with the probe.
+        "intmr_dense_add" => (
+            spec(
+                "intmr_probe",
+                "intmr_dense_add_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        "intmr_col_add" => (
+            spec(
+                "intmr_probe",
+                "intmr_col_add_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        "intmr_dense_mul" => (
+            spec(
+                "intmr_probe",
+                "intmr_dense_mul_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        "intmr_col_mul" => (
+            spec(
+                "intmr_probe",
+                "intmr_col_mul_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
         _ => return None,
     })
 }
