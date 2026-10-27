@@ -798,7 +798,7 @@ fn kv_writer_codec(
         16,
         [
             RB::TqSigns,
-            RB::TqBoundaries,
+            RB::TqEncodeTable,
             RB::TqPackedK { layer: li },
             RB::TqNormsK { layer: li },
             RB::TqPackedV { layer: li },
@@ -11634,7 +11634,7 @@ mod tests {
             bound_from(&writer, 16),
             [
                 rt(16, RB::TqSigns),
-                rt(17, RB::TqBoundaries),
+                rt(17, RB::TqEncodeTable),
                 rt(18, RB::TqPackedK { layer }),
                 rt(19, RB::TqNormsK { layer }),
                 rt(20, RB::TqPackedV { layer }),

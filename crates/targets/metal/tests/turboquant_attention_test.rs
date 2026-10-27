@@ -571,17 +571,13 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
     let n_q = *f.cu_seqlens.last().unwrap() as usize;
     let decode = c.seqs.iter().all(|&(_, new)| new == 1);
     let quant = PolarQuantizer::new(hd, c.bits, SEED);
-    let boundaries: Vec<f32> = quant
-        .centroids()
-        .windows(2)
-        .map(|w| (w[0] + w[1]) / 2.0)
-        .collect();
+    let encode_table = quant.encode_table();
     let pdim = packed_dim(hd, c.bits);
     let n_slots = f.n_blocks * bs;
 
     let signs = shared(&device, quant.signs());
     let centroids = shared(&device, quant.centroids());
-    let bounds = shared(&device, &boundaries);
+    let bounds = shared(&device, &encode_table);
     let block_table = shared(&device, &f.block_table);
     let seq_used = shared(
         &device,
@@ -2104,15 +2100,13 @@ fn verify_rows(c: Case, kernel: VerifyKernel) {
     let (hd, nkv) = (c.head_dim, c.num_kv_heads);
     let n_q = *f.cu_seqlens.last().unwrap() as usize;
     let quant = PolarQuantizer::new(hd, c.bits, SEED);
-    let boundaries: Vec<f32> = (quant.centroids().windows(2))
-        .map(|w| (w[0] + w[1]) / 2.0)
-        .collect();
+    let encode_table = quant.encode_table();
     let n_slots = f.n_blocks * c.block_size;
     let pdim = packed_dim(hd, c.bits);
     let (signs, centroids, bounds) = (
         shared(&device, quant.signs()),
         shared(&device, quant.centroids()),
-        shared(&device, &boundaries),
+        shared(&device, &encode_table),
     );
     let cos_sin = shared(&device, &f.cos_sin);
     let q = shared(

@@ -16,29 +16,30 @@ use crate::argmax::Buffer;
 pub const TQ_CODEBOOK_SEED: u64 = 42;
 
 /// A model's TurboQuant codebook at its GLOBAL head dim (`signs.len()`): the rotation signs, the
-/// `bits`-bit centroids, their midpoints and the packed words per head — computed at expansion
-/// ([`TqCodebook::compute`]) and emitted as a static per model.
+/// `bits`-bit centroids, the encoders' table (their midpoints, then the centroids again:
+/// [`PolarQuantizer::encode_table`](scratchy_layers::turboquant::PolarQuantizer::encode_table)) and
+/// the packed words per head — computed at expansion ([`TqCodebook::compute`]) and emitted as a
+/// static per model.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TqCodebook {
     pub bits: TqBits,
     pub packed_dim: u32,
     pub signs: &'static [f32],
     pub centroids: &'static [f32],
-    pub boundaries: &'static [f32],
+    pub encode_table: &'static [f32],
 }
 
 impl TqCodebook {
     pub fn compute(head_dim: usize, bits: TqBits) -> Self {
         use scratchy_layers::turboquant::{PolarQuantizer, packed_dim};
         let q = PolarQuantizer::new(head_dim, bits.get(), TQ_CODEBOOK_SEED);
-        let boundaries = q.centroids().windows(2).map(|w| (w[0] + w[1]) / 2.0);
         let baked = crate::tape::lowered::baked;
         Self {
             bits,
             packed_dim: packed_dim(head_dim, bits.get()) as u32,
             signs: baked(q.signs().to_vec()),
             centroids: baked(q.centroids().to_vec()),
-            boundaries: baked(boundaries.collect()),
+            encode_table: baked(q.encode_table()),
         }
     }
 }
@@ -184,7 +185,7 @@ pub fn build_tq_provision(
         norms_k,
         norms_v,
         signs: crate::argmax::upload_shared_buffer(device, codebook.signs),
-        boundaries: crate::argmax::upload_shared_buffer(device, codebook.boundaries),
+        encode_table: crate::argmax::upload_shared_buffer(device, codebook.encode_table),
         centroids: crate::argmax::upload_shared_buffer(device, codebook.centroids),
         scratch,
         mapped,
@@ -236,7 +237,7 @@ mod tests {
         bits: u32,
         pdim: usize,
         signs: Buffer,
-        boundaries: Buffer,
+        encode_table: Buffer,
         centroids: Buffer,
     }
 
@@ -246,7 +247,7 @@ mod tests {
             Self {
                 pdim: cb.packed_dim as usize,
                 signs: upload_shared_buffer(device, cb.signs),
-                boundaries: upload_shared_buffer(device, cb.boundaries),
+                encode_table: upload_shared_buffer(device, cb.encode_table),
                 centroids: upload_shared_buffer(device, cb.centroids),
                 q: PolarQuantizer::new(dim, bits, TQ_CODEBOOK_SEED),
                 dim,
@@ -302,7 +303,7 @@ mod tests {
                     (kv.table, 0),
                     (slots, 1),
                     (&cb.signs, 2),
-                    (&cb.boundaries, 3),
+                    (&cb.encode_table, 3),
                     (&cb.centroids, 4),
                     (kv.packed, 5),
                     (kv.norms, 6),
@@ -606,17 +607,25 @@ mod tests {
                 bits_of(q.centroids()),
                 "centroids {dim}/{bits}"
             );
+            // The encoders' table: the midpoints they digitize against, then the centroids whose
+            // length they correct each norm by.
+            let (boundaries, levels) = cb.encode_table.split_at(mids.len());
             assert_eq!(
-                bits_of(cb.boundaries),
+                bits_of(boundaries),
                 bits_of(&mids),
                 "boundaries {dim}/{bits}"
+            );
+            assert_eq!(
+                bits_of(levels),
+                bits_of(q.centroids()),
+                "levels {dim}/{bits}"
             );
             assert_eq!(
                 cb.packed_dim as usize,
                 packed_dim(dim, bits),
                 "packed_dim {dim}/{bits}"
             );
-            let got = digest(&[cb.signs, cb.centroids, cb.boundaries]);
+            let got = digest(&[cb.signs, cb.centroids, boundaries]);
             assert_eq!(got, want, "codebook digest {dim}/{bits}: {got:#018x}");
         }
     }

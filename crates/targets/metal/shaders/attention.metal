@@ -311,7 +311,7 @@ constant constexpr uint ATTN_MERGE_STRIDE = 33u;
 //     row in threadgroup memory, where the key loop reads the step's own key, and the threadgroup
 //     owning the KV head writes the row to the cache and, under TurboQuant, encodes it into the
 //     packed store, exactly as `rope_append_*` does. Buffers 17..22: the raw K and V rows, the
-//     positions, the codebook's boundaries, the writer's rotary table and its rotated K bias's.
+//     positions, the codebook's encode table, the writer's rotary table and its rotated K bias's.
 SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_FOLD_ROT_DIM, 19);
 SCRATCHY_CONSTANT_OPTIONAL(uint, ATTN_FOLD_PAIR_OFF, 20);
 constant constexpr bool ATTN_FOLD = ATTN_FOLD_ROT_DIM_SET;
@@ -792,7 +792,7 @@ template <typename T>
     device const T*     fold_k        [[buffer(17)]],
     device const T*     fold_v        [[buffer(18)]],
     device const uint*  positions     [[buffer(19)]],
-    device const float* tq_boundaries [[buffer(20)]],
+    device const float* tq_encode_table [[buffer(20)]],
     device const T*     fold_cos_sin  [[buffer(21)]],
     device const T*     tq_bias_cos_sin [[buffer(22)]],
     device const uint*  cu_seqlens_q  [[buffer(23)]],
@@ -916,7 +916,7 @@ template <typename T>
                                  head_dim, num_kv, kv_head_idx, fold_slot, pos, ATTN_TQ, vpw,
                                  (head_dim + vpw - 1u) / vpw, ATTN_TQ_KB ? 2u : 0u,
                                  ATTN_TQ_VB ? 1u : 0u, ATTN_FOLD_ROT_DIM, pair_off, tq_signs,
-                                 tq_boundaries, tq_packed_k, tq_norms_k, tq_packed_v, tq_norms_v,
+                                 tq_encode_table, tq_packed_k, tq_norms_k, tq_packed_v, tq_norms_v,
                                  tq_k_bias, tq_v_bias, tq_bias_cos_sin, scratch, codes);
             }
         }
@@ -1404,7 +1404,7 @@ template <typename T>
     device const T*     fold_k        [[buffer(17)]],
     device const T*     fold_v        [[buffer(18)]],
     device const uint*  positions     [[buffer(19)]],
-    device const float* tq_boundaries [[buffer(20)]],
+    device const float* tq_encode_table [[buffer(20)]],
     device const T*     fold_cos_sin  [[buffer(21)]],
     device const T*     tq_bias_cos_sin [[buffer(22)]],
     device const uint*  cu_seqlens_q  [[buffer(23)]],
@@ -1554,7 +1554,7 @@ template <typename T>
             kv_row_encode<T>(float(fold_kv[tid]), float(fold_kv[ATTN_FOLD_DIM + tid]), tid, D,
                              num_kv, kvh, slot, fold_pos, ATTN_TQ, vpw, pdim,
                              ATTN_TQ_KB ? 2u : 0u, ATTN_TQ_VB ? 1u : 0u,
-                             ATTN_FOLD_ROT_DIM, ATTN_FOLD_PAIR_OFF, tq_signs, tq_boundaries,
+                             ATTN_FOLD_ROT_DIM, ATTN_FOLD_PAIR_OFF, tq_signs, tq_encode_table,
                              tq_packed_k, tq_norms_k, tq_packed_v, tq_norms_v, tq_k_bias,
                              tq_v_bias, tq_bias_cos_sin, xs, codes);
         }

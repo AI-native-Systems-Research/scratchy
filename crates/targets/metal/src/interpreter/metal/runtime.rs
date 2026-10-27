@@ -37,7 +37,7 @@ pub struct TqRuntimeBuffers {
     pub norms_k: Vec<Buffer>,
     pub norms_v: Vec<Buffer>,
     pub signs: Buffer,
-    pub boundaries: Buffer,
+    pub encode_table: Buffer,
     pub centroids: Buffer,
     /// The reused per-layer fp16 scratch ([`TqScratch`]).
     pub scratch: TqScratch,
@@ -353,7 +353,7 @@ impl RuntimeBindings {
             RuntimeBindingKind::TqNormsK { layer } => &self.tq().norms_k[layer.get() as usize],
             RuntimeBindingKind::TqNormsV { layer } => &self.tq().norms_v[layer.get() as usize],
             RuntimeBindingKind::TqSigns => &self.tq().signs,
-            RuntimeBindingKind::TqBoundaries => &self.tq().boundaries,
+            RuntimeBindingKind::TqEncodeTable => &self.tq().encode_table,
             RuntimeBindingKind::TqCentroids => &self.tq().centroids,
             RuntimeBindingKind::NumTokensU32 => &self.num_tokens_u32,
             RuntimeBindingKind::NumSampleRowsU32 => &self.num_sample_rows_u32,
