@@ -98,8 +98,11 @@ pub fn output_arrangement_of(op_func: &str) -> Option<ElementArrangement> {
 /// block, and every buffer this tree stages staggered is a whole-block `[·, PAD_V]` row).
 pub fn dl16tofp32_stagger(words: &[f32]) -> Vec<f32> {
     let mut out = words.to_vec();
-    for block in out.as_chunks_mut::<64>().0 {
-        let logical: [f32; 64] = *block;
+    // `as_chunks_mut` (the const-sized whole-block split, remainder last): every block is a
+    // `[f32; 64]` by construction, so the permutation needs no runtime width check.
+    let (blocks, _) = out.as_chunks_mut::<64>();
+    for block in blocks {
+        let logical = *block;
         for (i, word) in logical.iter().enumerate() {
             block[DL16TOFP32_PERMUTATION[i] as usize] = *word;
         }
@@ -125,11 +128,11 @@ mod tests {
             "the measured stagger put lane 1318 at buffer 1330 — local 38 at 50"
         );
         // Lanes 0-3 (group 0) and 60-63 (group 15) are the rotation's fixed points.
-        for (i, &lane) in DL16TOFP32_PERMUTATION.iter().enumerate().take(4) {
-            assert_eq!(lane, i as u8, "lane {i} is fixed");
+        for (i, &pos) in DL16TOFP32_PERMUTATION.iter().enumerate().take(4) {
+            assert_eq!(pos, i as u8, "lane {i} is fixed");
         }
-        for (i, &lane) in DL16TOFP32_PERMUTATION.iter().enumerate().skip(60) {
-            assert_eq!(lane, i as u8, "lane {i} is fixed");
+        for (i, &pos) in DL16TOFP32_PERMUTATION.iter().enumerate().skip(60) {
+            assert_eq!(pos, i as u8, "lane {i} is fixed");
         }
         // A permutation, not a projection: every buffer position is written exactly once.
         let mut seen = [false; 64];

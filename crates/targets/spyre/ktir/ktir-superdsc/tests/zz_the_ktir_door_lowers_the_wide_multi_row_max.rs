@@ -48,10 +48,8 @@ fn lower(kind: ReduceKind, rows: u32, cols: u32) -> Vec<EmittedOp> {
     let data = region(7, rows, cols, false);
     let out = region(8, rows, 1, true);
     let mut sym = 0i64;
-    // ⭐ THE REDUCE'S OWN DF — 9fc555341a threaded the op's result type into the door so
-    // an fp32-island reduce lowers at wordLength 4. This cell is the historical fp16
-    // attention score row (the 514→576 pad below is the 64-element fp16 stick), so the
-    // control stays `Df::Fp16` — the arm the door ran before the parameter existed.
+    // `Df::Fp16` — the reduce's own proven basis (the fp16 path `reduce`'s doc names
+    // byte-identical to its pre-`df` form, the one this file's pinned numbers state).
     reduce("attn_bmax_g0", kind, Df::Fp16, &[data, out], &mut sym, None).unwrap_or_else(|e| {
         panic!(
             "{kind:?} [{rows}, {cols}]: the door must lower it: {}",

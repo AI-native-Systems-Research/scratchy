@@ -2992,7 +2992,7 @@ pub fn eval_node<F: RopeForm>(
                             + SAMPLE_BLOCK
                     }
                 };
-                out.extend(std::iter::repeat(idx as f32).take(out_cols as usize));
+                out.extend(std::iter::repeat_n(idx as f32, out_cols as usize));
             }
             out
         }

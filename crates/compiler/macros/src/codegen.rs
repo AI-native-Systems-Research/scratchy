@@ -9484,10 +9484,10 @@ fn emit_superdsc_wiring(
                 // this is a `continue` and not a refusal. The loud refusal lives at the
                 // RUNTIME gate, per launch, where "this step" is a fact — an expansion
                 // cannot know it.
-                if let Some(seat) = &gk.sample_seat {
-                    if seat.seed_words.contains(&(id as u32)) || seat.invt == id {
-                        continue;
-                    }
+                if let Some(seat) = &gk.sample_seat
+                    && (seat.seed_words.contains(&id) || seat.invt == id)
+                {
+                    continue;
                 }
                 // ⭐ THE CHAIN'S OWN ARM — the per-step class the block above
                 // declares: covered BY CLASS (the tape's ChainSeed steps bind
@@ -9819,7 +9819,7 @@ fn emit_superdsc_wiring(
     let load_const_toks = gk
         .load_consts
         .iter()
-        .map(|entry| load_const_entry_tokens(entry))
+        .map(load_const_entry_tokens)
         .collect::<Vec<_>>();
     // ⭐ THE SAMPLER'S PER-STEP SEAT — the named class of the six sources the
     // token draw binds FRESH EVERY DECODE STEP (the seed quintuple's five
@@ -11183,14 +11183,14 @@ fn dump_wavefront_mega(
         // `rows` — the ten uniform `[rows, 1]` tables' stick heads are per-width, Finding 1's
         // compounding half: the single-request wiring's rows=1 kinds staged into a rows=N rung
         // left every row past 0 reading zero).
-        let superdsc_decode_rungs: std::cell::RefCell<
-            Vec<(
-                u32,
-                u32,
-                String,
-                Vec<(u32, scratchy_target_spyre::wiring::LoadConst)>,
-            )>,
-        > = std::cell::RefCell::new(Vec::new());
+        type DecodeRungEntry = (
+            u32,
+            u32,
+            String,
+            Vec<(u32, scratchy_target_spyre::wiring::LoadConst)>,
+        );
+        let superdsc_decode_rungs: std::cell::RefCell<Vec<DecodeRungEntry>> =
+            std::cell::RefCell::new(Vec::new());
         // The PREFIX-CAPABLE ladder `[(mq, body_fp)]` — the prefill bundles baked with a full
         // resident-prefix sweep. Every prefix-free rung is baked ActiveCap::NONE because a start==0 chunk
         // has nothing resident to attend, which drops 308 of 710 ops/layer. A CONTINUATION chunk (start>0)
@@ -11240,7 +11240,11 @@ fn dump_wavefront_mega(
             },
             Wiring {
                 slot: Option<WiringSlot>,
-                gk: scratchy_target_spyre::lower_subtile_tape_to_superdsc::BundleWiring,
+                // Boxed for the enum's variant-size budget only — `BakeEffect` rides a Vec
+                // through every bake, and this one field is five sixths of the largest
+                // variant; the box changes no ownership the arm below does not already
+                // borrow (`&gk` derefs through it where the wiring is built).
+                gk: Box<scratchy_target_spyre::lower_subtile_tape_to_superdsc::BundleWiring>,
                 decode_position: u32,
                 man: String,
             },
@@ -12953,7 +12957,7 @@ fn dump_wavefront_mega(
                     };
                     fx.push(BakeEffect::Wiring {
                         slot,
-                        gk,
+                        gk: Box::new(gk),
                         decode_position: cap.saturating_sub(1),
                         man: man.clone(),
                     });
@@ -14012,7 +14016,7 @@ fn dump_wavefront_mega(
                             // wiring static itself uses, so the spellings cannot drift.
                             let consts = consts
                                 .iter()
-                                .map(|entry| load_const_entry_tokens(entry))
+                                .map(load_const_entry_tokens)
                                 .collect::<Vec<_>>();
                             quote! {
                                 (

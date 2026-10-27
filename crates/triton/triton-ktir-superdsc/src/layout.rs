@@ -922,10 +922,10 @@ fn scales_for(
     // chains the emitter dispatches on, deduped by bits like every push above.
     let mut ones: Vec<f32> = Vec::new();
     for c in chains {
-        if let Some(v) = c.ones {
-            if !ones.iter().any(|x| x.to_bits() == v.to_bits()) {
-                ones.push(v);
-            }
+        if let Some(v) = c.ones
+            && !ones.iter().any(|x| x.to_bits() == v.to_bits())
+        {
+            ones.push(v);
         }
     }
     match p {

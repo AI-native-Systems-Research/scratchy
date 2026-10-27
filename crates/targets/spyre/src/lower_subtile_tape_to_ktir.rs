@@ -1935,7 +1935,7 @@ pub fn graph_wiring<F: RopeForm>(
     {
         let staged: std::collections::BTreeSet<u32> =
             load_consts.iter().map(|&(tid, _)| tid).collect();
-        for (&tid, _) in &staggered {
+        for &tid in staggered.keys() {
             if !staged.contains(&tid) {
                 return Err(SuperDscError(format!(
                     "the arrangement propagation marked t{tid} — a parameter outside the \

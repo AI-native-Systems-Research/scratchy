@@ -1385,15 +1385,15 @@ pub fn elementwise_df(
         }
         if bcast.iter().any(Option::is_some) {
             return elementwise_broadcast(
-                name,
-                &format!("Elementwise({kind:?})"),
-                op_func,
-                BcastForm {
+                BcastReq {
+                    name,
+                    what: &format!("Elementwise({kind:?})"),
+                    op_func,
                     ins: &ins,
                     out: &out,
                     bcast,
+                    df,
                 },
-                df,
                 sym_id_base,
                 layout,
             );
@@ -1447,15 +1447,15 @@ pub fn elementwise_df(
         // the proven arm verbatim — the `df` parameter exists for the gate's fp32 route, which
         // lands in the same body with the stick basis stated at `df.elems_per_stick()`.
         return elementwise_broadcast(
-            name,
-            &format!("Elementwise({kind:?})"),
-            op_func,
-            BcastForm {
+            BcastReq {
+                name,
+                what: &format!("Elementwise({kind:?})"),
+                op_func,
                 ins: &ins,
                 out: &out,
                 bcast,
+                df,
             },
-            df,
             sym_id_base,
             layout,
         );
@@ -1968,15 +1968,15 @@ pub fn int_binary(
         // the bundle fingerprint). Measured by the intb/intm one-row legs and the intmr
         // scatter re-leg; see the door's own doc for the citations.
         return elementwise_broadcast(
-            name,
-            &format!("IntBinary({kind:?})"),
-            op_func,
-            BcastForm {
+            BcastReq {
+                name,
+                what: &format!("IntBinary({kind:?})"),
+                op_func,
                 ins: &ins,
                 out: &out,
                 bcast,
+                df: Df::SenUint32,
             },
-            Df::SenUint32,
             sym_id_base,
             layout,
         );
@@ -2049,26 +2049,27 @@ pub fn int_binary(
 /// attributes; this door proves it from the operand's REGION. The two are independent, and the
 /// emission is only correct when both hold — a `Col` flag over an operand that is really `[m, n]`
 /// would read one lane and spray it over the whole output, silently.
-/// The broadcast door's operand form — the split inputs, the output, and the positional
-/// broadcast flags, ONE value: the three are one fact about the op (which operand sprays
-/// which axis, at which output extent), and bundling them is what keeps the door's own
-/// parameter list under the arity lint without an `#[allow]`.
-struct BcastForm<'a> {
+///
+/// THE BROADCAST REQUEST, one struct for the three doors' call shape (the naming pair, the
+/// op's own descriptor fact, the operand map, the stick basis) so the shared body's signature
+/// stays inside clippy's argument budget with no `#[allow]` — the body destructures it at its
+/// head into the bare field names, so the emission code below is the audited form verbatim.
+struct BcastReq<'a> {
+    name: &'a str,
+    what: &'a str,
+    op_func: &'static str,
     ins: &'a [Region],
     out: &'a Region,
     bcast: &'a [Option<BcastAxis>],
+    df: Df,
 }
 
 fn elementwise_broadcast(
-    name: &str,
-    what: &str,
-    op_func: &'static str,
-    form: BcastForm<'_>,
-    df: Df,
+    req: BcastReq<'_>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
-    let BcastForm { ins, out, bcast } = form;
+    let BcastReq { name, what, op_func, ins, out, bcast, df } = req;
     // THE OP FUNC IS THE CALLER'S OWN FACT, handed over rather than re-derived: the elementwise
     // door holds it from [`elementwise_op_func`] already, and the INTEGER door holds the same
     // class of fact from [`IntBinary::op_func`] — a descriptor name that feeds the bundle
