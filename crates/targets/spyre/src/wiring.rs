@@ -2599,6 +2599,7 @@ mod constant_tape_tests {
                     causal_heads_per_block: w.causal_heads_per_block(causal),
                     embed_tokens: &[],
                     tokens: &[],
+                    chain_seeds: None,
                     positions: &[],
                     causal,
                     prefix: None,
