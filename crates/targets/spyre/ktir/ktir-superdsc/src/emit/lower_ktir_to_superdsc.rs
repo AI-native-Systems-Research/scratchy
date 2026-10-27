@@ -1948,9 +1948,11 @@ pub fn int_binary(
         // (the wall-5 measured law's defect class). CARD-PROVEN by the intmb
         // scatter-harness leg (nickm2, 2026-10-27, the same stick-scatter law as the
         // intmr re-leg; verdict banked at
-        // `.claude/fb-noise-probe/verdicts/intmb-scatter-verdict-*.json`):
-        // `[2,512]` and `[2,65536]` dense + `[1,·]` `Mb` int `add`/`mul`,
-        // bit-for-bit. The want loop in the shared body below still demands an `Mb`
+        // `.claude/fb-noise-probe/verdicts/intmb-scatter-verdict-20261027T042835Z.json`):
+        // `[2,512]` and `[2,65536]` dense + `[1,·]` `Mb` int `add`/`mul`, and the
+        // Mb×Col production form at both widths, bit-for-bit — with the whole intmr
+        // family re-baked under this door md5-identical to its wall-9 bytes
+        // (INTMB-BI-MD5-OK, 2026-10-27T04:27Z) and re-verdicted bit-for-bit. The want loop in the shared body below still demands an `Mb`
         // operand be ONE row at the output's own column extent, so a tall operand
         // cannot pose as a vector.
         // ⭐ AND `Col` IS ADMITTED AT EVERY ROW COUNT — the multi-row column vector
@@ -7648,7 +7650,7 @@ mod elementwise_tests {
     /// ⭐ `Mb` IS ADMITTED AND CARD-PROVEN FOR THE INTEGER (wall 10, intmb
     /// scatter-harness leg, nickm2, 2026-10-27 — the same stick-scatter law as
     /// the intmr re-leg; verdict banked at
-    /// `.claude/fb-noise-probe/verdicts/intmb-scatter-verdict-*.json`): the
+    /// `.claude/fb-noise-probe/verdicts/intmb-scatter-verdict-20261027T042835Z.json`): the
     /// batched sampler's hash mixes the whole-row `lane` table (`[1, cols]`
     /// i32, the no-arange law) with the band-typed `[B, cols]` tile —
     /// `sample_fwd.py`'s `h = lane * hc1 + slo` at every rung above one row.
