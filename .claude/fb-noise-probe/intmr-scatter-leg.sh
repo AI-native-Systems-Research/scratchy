@@ -28,12 +28,13 @@ PROBE=/work/fb-noise-probe
 BIN=$TDIR/release/examples/bundle_run_dev
 DXP=/opt/ibm/spyre/deeptools/bin/dxp_standalone
 
-# The cells this leg runs — the bakeable set by default (2-input cells: t0=a
-# t1=b out t2; the maxadd cell: t0=a out t1).
-CELLS="${CELLS:-intmr_dense_add intmr_dense_mul intmr_f32col_add intmr_f32wide_add intmr_f32maxadd}"
+# The cells this leg runs — POSITIONAL ARGS, else the bakeable set by default
+# (the int Col cells need the multi-row Col admission re-landed first; they
+# ride the same script as args). The BG re-exec passes "$@" through.
+CELLS="${*:-intmr_dense_add intmr_dense_mul intmr_f32col_add intmr_f32wide_add intmr_f32maxadd}"
 
 if [ "${BG:-0}" != "1" ]; then
-  BG=1 setsid nohup bash "$0" >>"$LOG" 2>&1 &
+  BG=1 setsid nohup bash "$0" "$@" >>"$LOG" 2>&1 &
   echo "detached pid $! ; log $LOG"
   exit 0
 fi
