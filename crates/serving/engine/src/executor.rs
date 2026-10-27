@@ -26,6 +26,70 @@ use crate::error::EngineResult;
 // ModelRunnerOutput
 // ---------------------------------------------------------------------------
 
+/// ⭐ #32 (C) — ONE DEFERRED STEP'S ANSWER CELL: filled by the drain that owns
+/// the step ([`crate::core_client::DrainDoor`]'s knock → the executor thread's
+/// `drain_until`), waited on by the resolver the deferred output carries.
+///
+/// `fill` is ONE-WAY and single-shot — the double fill is an assert, because
+/// two drains taking one step is a queue-law violation, not a load-bearing
+/// race to paper over. `wait` parks until the fill; the resolver that knocks
+/// and then waits is the deadlock fix's own order (a resolver that WAITED
+/// first would block the one thread that can fill the cell).
+#[derive(Clone)]
+pub struct DrainCell(std::sync::Arc<DrainCellInner>);
+
+struct DrainCellInner {
+    filled: std::sync::Mutex<Option<EngineResult<Vec<u32>>>>,
+    cv: std::sync::Condvar,
+}
+
+impl DrainCell {
+    pub fn new() -> Self {
+        Self(std::sync::Arc::new(DrainCellInner {
+            filled: std::sync::Mutex::new(None),
+            cv: std::sync::Condvar::new(),
+        }))
+    }
+
+    /// Fill the cell — once. The double fill panics by design: the drain's
+    /// pop is the single authority over which drain owns a step, so a second
+    /// fill means two drains took one step and one of them lied.
+    pub fn fill(&self, tokens: EngineResult<Vec<u32>>) {
+        let mut g = self.0.filled.lock().unwrap();
+        assert!(
+            g.is_none(),
+            "a deferred step's DrainCell was filled twice — two drains took one step"
+        );
+        *g = Some(tokens);
+        self.0.cv.notify_all();
+    }
+
+    /// Has this cell been filled? The knock loop's own ask — it drains only
+    /// while the step it was knocked for is unanswered.
+    pub fn is_filled(&self) -> bool {
+        self.0.filled.lock().unwrap().is_some()
+    }
+
+    /// Park until the fill, then the answer. A cell that was filled with an
+    /// error hands that error back — the resolver surfaces it as the
+    /// deferred output's own failure, never as a hang.
+    pub fn wait(&self) -> EngineResult<Vec<u32>> {
+        let mut g = self.0.filled.lock().unwrap();
+        loop {
+            if let Some(t) = g.take() {
+                return t;
+            }
+            g = self.0.cv.wait(g).unwrap();
+        }
+    }
+}
+
+impl Default for DrainCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Output from one model execution step.
 ///
 /// This is the Rust equivalent of `vllm/v1/outputs.py::ModelRunnerOutput`.
@@ -406,6 +470,21 @@ pub trait Executor: Send {
     fn wake_up(&mut self, _tags: Option<&[String]>) -> EngineResult<()> {
         Ok(())
     }
+
+    /// ⭐ #32 (C) — HAND THE WORKER THE DRAIN DOOR. The pipelined client mints
+    /// the door at `start_pipeline` (a sender clone onto its executor thread)
+    /// and hands it down through here, so a deferred output's resolver can
+    /// KNOCK — ask the thread that owns the queue to drain until the step it
+    /// is waiting on lands. Default no-op: an executor whose worker never
+    /// defers has nothing to knock on.
+    fn set_drain_door(&mut self, _door: crate::core_client::DrainDoor) {}
+
+    /// ⭐ #32 (C) — A KNOCK: drain the worker's in-flight queue until `cell`
+    /// is filled. Runs on the executor thread (the knock arrived from a
+    /// resolver on another thread); the pop inside the worker's drain is the
+    /// single authority, so the double-fill assert on [`DrainCell`] is the
+    /// loud boundary if two drains ever take one step. Default no-op.
+    fn drain_until(&mut self, _cell: &std::sync::Arc<DrainCell>) {}
 
     /// Whether the executor is currently sleeping.
     fn is_sleeping(&self) -> bool {

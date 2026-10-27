@@ -318,6 +318,18 @@ pub trait Worker: Send {
     /// Shut down the worker and release all resources.
     fn shutdown(&mut self);
 
+    /// ⭐ #32 (C) — KEEP THE DRAIN DOOR. The pipelined client hands it down at
+    /// `start_pipeline` (through the executor); a worker that defers decode
+    /// steps resolves them by knocking through it. Default no-op: a worker
+    /// that never defers has nothing to knock on.
+    fn set_drain_door(&mut self, _door: crate::core_client::DrainDoor) {}
+
+    /// ⭐ #32 (C) — A KNOCK: drain the in-flight queue until `cell` is filled.
+    /// The worker's own spelling of the executor trait's hook — the drain's
+    /// pop is the single authority over which drain owns a step. Default
+    /// no-op.
+    fn drain_until(&mut self, _cell: &std::sync::Arc<crate::executor::DrainCell>) {}
+
     /// The worker's global rank.
     fn rank(&self) -> usize;
 
