@@ -3242,6 +3242,44 @@ mod pad_clamp_tests {
     }
 
     #[test]
+    fn a_full_rung_classes_no_row_as_a_pad() {
+        // ⭐ THE FULL-OCCUPANCY LAW (auditor order 2026-10-27): with live ==
+        // rows, EVERY row runs its own request's draw — no row is classed as
+        // a pad (the non-pipelined tree seated a 4-request launch's fourth
+        // row greedy; this pin refuses that class of defect here).
+        use scratchy_subtile::sdsc_abstract::{
+            BatchRow, KvHistory, RungWidth, SeqPos, SlotMap,
+        };
+        let width = RungWidth::of_baked_rows(4).expect("a 4-row rung");
+        let hists: Vec<_> = (0..4).map(|i| KvHistory::contiguous(8 + i)).collect();
+        let live = SlotMap::of_live(4, width)
+            .expect("4 live rows fill the rung")
+            .live_rows(|i| {
+                Ok::<_, ()>(BatchRow {
+                    rope_pos: SeqPos::new(10 + i as u32),
+                    hist: hists[i].clone(),
+                })
+            })
+            .expect("the builder never fails here");
+        let owned: Vec<SampledDraw> = (0..4)
+            .map(|i| SampledDraw {
+                seed: 1000 + i as u64,
+                inv_t: 0.5,
+            })
+            .collect();
+        let draws: Vec<Option<&SampledDraw>> = owned.iter().map(Some).collect();
+        let laws = batch_seat_laws(&draws, &live, 4).expect("the full laws lay");
+        assert_eq!(laws.len(), 4);
+        for s in 0..4 {
+            let law = laws[s]
+                .draw
+                .unwrap_or_else(|| panic!("row {s} of a FULL rung staged greedy — no row is a pad"));
+            assert_eq!(law.seed, 1000 + s as u64, "row {s} runs its OWN draw");
+            assert_eq!(laws[s].step, 10 + s as u32, "row {s} keeps its own step salt");
+        }
+    }
+
+    #[test]
     fn a_greedy_live_0_clamps_its_pads_to_greedy() {
         let seat = seat_of(4);
         let draws: [Option<&SampledDraw>; 2] = [None, None];
