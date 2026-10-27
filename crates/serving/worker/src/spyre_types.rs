@@ -153,7 +153,7 @@ impl LogitsGeom {
     ) -> Option<LogitsGeom> {
         let elems = (size_bytes / 2) as usize;
         let rows = rung.count();
-        if size_bytes % 2 != 0 || elems % rows != 0 {
+        if !size_bytes.is_multiple_of(2) || !elems.is_multiple_of(rows) {
             return None;
         }
         let width = elems / rows;

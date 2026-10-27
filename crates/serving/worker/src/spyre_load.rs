@@ -238,20 +238,21 @@ pub(crate) fn wiring_to_parsed(
     let layers: Vec<LayerWiring> = w
         .layers
         .iter()
-        .map(|l| LayerWiring {
-            // Emulator-only, like every field of the struct: the card keeps the K/V cache
-            // RESIDENT and writes this step's V device-side, so no host binding names a
-            // cache source or lift id there.
+        .map(|_l| LayerWiring {
+            // Emulator-only, like every field of the struct (and the underscored binding:
+            // the card reads none of them, so `_l` is unread under spyre-hw): the card
+            // keeps the K/V cache RESIDENT and writes this step's V device-side, so no
+            // host binding names a cache source or lift id there.
             #[cfg(not(feature = "spyre-hw"))]
-            prefix_k_src: l.prefix_k as usize,
+            prefix_k_src: _l.prefix_k as usize,
             #[cfg(not(feature = "spyre-hw"))]
-            prefix_v_src: l.prefix_v as usize,
+            prefix_v_src: _l.prefix_v as usize,
             #[cfg(not(feature = "spyre-hw"))]
-            new_k_id: l.new_k as usize,
+            new_k_id: _l.new_k as usize,
             #[cfg(not(feature = "spyre-hw"))]
-            new_v_id: l.new_v as usize,
+            new_v_id: _l.new_v as usize,
             #[cfg(not(feature = "spyre-hw"))]
-            kv_width: l.kv_width as usize,
+            kv_width: _l.kv_width as usize,
         })
         .collect();
     if layers.is_empty() {
@@ -2020,7 +2021,7 @@ impl SpyreWorker {
                             pss.pmask_slots,
                             _t.elapsed().as_secs_f64()
                         );
-                        (Some(pss).filter(|_| prefill_m > 1), prefill_m)
+                        ((prefill_m > 1).then_some(pss), prefill_m)
                     }
                     None => {
                         info!(
@@ -2477,7 +2478,7 @@ impl SpyreWorker {
                         let nqh = g.nqh.max(1) as u64;
                         let bytes = pmask.size;
                         let per = nqh * rn as u64 * 2;
-                        let cap = if per > 0 { bytes / per } else { 0 };
+                        let cap = bytes.checked_div(per).unwrap_or(0);
                         let page = scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u64;
                         // The block count is the ONE fact; which law binds it is per-BODY (the
                         // launch's own `gathers` picks the fold form), so state both readings
@@ -2532,7 +2533,7 @@ impl SpyreWorker {
                         .layout
                         .place_of_tid(logits_tid)
                         .and_then(|p| {
-                            LogitsGeom::from_placement(p.size, rung_width, vocab as usize)
+                            LogitsGeom::from_placement(p.size, rung_width, vocab)
                         });
                     let logits = logits.unwrap_or_else(|| {
                         panic!(
@@ -2562,15 +2563,14 @@ impl SpyreWorker {
                         // width, so they carry no `rows` to check.
                         if let scratchy_target_spyre::wiring::LoadConst::SampleTable { rows, .. } =
                             kind
+                            && rows != rung_n.get()
                         {
-                            if rows != rung_n.get() {
-                                panic!(
-                                    "decode batch rung seqs={rn}: its staged constant t{tid} \
-                                     carries rows={rows}, not the rung's own {rn} — the kind and \
-                                     the rung disagree about the bake width, and the short side's \
-                                     rows would read ZERO at their stick heads. REFUSING"
-                                );
-                            }
+                            panic!(
+                                "decode batch rung seqs={rn}: its staged constant t{tid} \
+                                 carries rows={rows}, not the rung's own {rn} — the kind and \
+                                 the rung disagree about the bake width, and the short side's \
+                                 rows would read ZERO at their stick heads. REFUSING"
+                            );
                         }
                     }
                     let mut rs = SuperDscSession::new_borrowing_with_consts(

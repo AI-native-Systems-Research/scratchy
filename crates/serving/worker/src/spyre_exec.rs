@@ -308,7 +308,7 @@ impl Worker for SpyreWorker {
             let SendnnSession::SuperDsc(sb) = &model.session;
             let mask = sb.mask_reach()?;
             let mask_tokens = mask.get() as usize * PagedKvPool::PAGE_SLOTS;
-            return Some(model.served_context.min(mask_tokens));
+            Some(model.served_context.min(mask_tokens))
         }
         // The emulator grows its KV on the host and sizes no pool, so `served_context`
         // stays `usize::MAX` there — a cap that never binds, which the engine treats
@@ -441,12 +441,12 @@ impl Worker for SpyreWorker {
             // (`PoolPartition`) and the host must never name one — that separation is the reason a page
             // the worker writes for a masked hole can never be a page the scheduler hands to another
             // request, which is the collision a shared free list made possible.
-            return self.model.as_ref().and_then(|m| match &m.session {
+            self.model.as_ref().and_then(|m| match &m.session {
                 SendnnSession::SuperDsc(sb) if sb.decode.is_paged() => {
-                    pool_partition(&sb).ok().map(|p| p.host_blocks() as usize)
+                    pool_partition(sb).ok().map(|p| p.host_blocks() as usize)
                 }
                 _ => None,
-            });
+            })
         }
         #[cfg(not(feature = "spyre-hw"))]
         None
@@ -467,12 +467,12 @@ impl Worker for SpyreWorker {
     fn max_num_seqs_override(&self) -> Option<usize> {
         #[cfg(feature = "spyre-hw")]
         {
-            return self.model.as_ref().and_then(|m| match &m.session {
+            self.model.as_ref().and_then(|m| match &m.session {
                 SendnnSession::SuperDsc(sb) if sb.decode.is_paged() => {
                     Some((sb.pool_rows.get().get() as usize).min(CORRECT_BATCH_WIDTH))
                 }
                 _ => None,
-            });
+            })
         }
         #[cfg(not(feature = "spyre-hw"))]
         None
@@ -524,7 +524,7 @@ impl Worker for SpyreWorker {
         #[cfg(feature = "spyre-hw")]
         let part = {
             let SendnnSession::SuperDsc(sb) = &model.session;
-            pool_partition(&sb)?
+            pool_partition(sb)?
         };
 
         // ⛔⛔⛔ FINISHED FIRST, AND THE ORDER IS A CAPACITY INVARIANT, NOT TIDINESS.
@@ -635,9 +635,10 @@ impl Worker for SpyreWorker {
                 start,
                 n,
                 #[cfg(feature = "spyre-hw")]
-                host_now.as_slice(),
-                #[cfg(feature = "spyre-hw")]
-                part,
+                PageMapCtx {
+                    host: host_now.as_slice(),
+                    part,
+                },
             )?;
             order.push(nr.req_id.clone());
             sampled.push(s);
@@ -782,7 +783,6 @@ impl Worker for SpyreWorker {
             // The reason it has to change is that a per-step order makes a row a per-step position, and
             // then a request's pages move whenever another request finishes. One launch can address B
             // rows only if row r's KV base is `base + r*stride`, so the row has to be an identity.
-            let decode_ids = decode_ids;
             // ⛔⛔⛔ THE "CONSECUTIVE ROWS" REQUIREMENT IS GONE, AND WITH IT THE ONE-AT-A-TIME FALLBACK.
             //
             // This used to read every live request's pool row, prove with `AffineRows::of` that the set was
@@ -914,7 +914,7 @@ impl Worker for SpyreWorker {
                 let SendnnSession::SuperDsc(sb) = &mut model.session;
                 // The pool's owner split, once for this launch — the same derivation the host's block
                 // count came from, so a derived page map cannot name a block the host may also hand out.
-                let part = pool_partition(&sb)?;
+                let part = pool_partition(sb)?;
                 let DecodeRung {
                     seqs,
                     mask_cap,
@@ -953,8 +953,9 @@ impl Worker for SpyreWorker {
                     > = OnceLock::new();
                     let seen = SEEN
                         .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-                    if let Ok(mut g) = seen.lock() {
-                        if g.insert((decode_ids.len(), seqs.count())) {
+                    if let Ok(mut g) = seen.lock()
+                        && g.insert((decode_ids.len(), seqs.count()))
+                    {
                             // The one place the two widths are COMPARED on purpose: reporting how
                             // much of the rung is padding.
                             if seqs.count() == decode_ids.len() {
@@ -980,7 +981,6 @@ impl Worker for SpyreWorker {
                                     decode_ids.len()
                                 );
                             }
-                        }
                     }
                 }
                 // THE MASK'S PER-FOLD-PASS STRIDE. A pass reads one request's page, so the mask is
@@ -1141,10 +1141,7 @@ impl Worker for SpyreWorker {
                     // so live 0's newest key survives whichever write lands last; and the bytes are
                     // the forward's OUTPUT, so a row that matched live 0's input but read a different
                     // key set would still write different K/V from layer 1 on.
-                    let owner = match src.live() {
-                        Some(i) => i,
-                        None => 0,
-                    };
+                    let owner = src.live().unwrap_or_default();
                     let (id, _start) = &decode_ids[owner];
                     // ⭐ THE ONE BIT THE PAGE TRACE COULD NOT SAY: is this slot LIVE or PADDING, and whose
                     // request is it serving? Without it, "row 3 was bound with row 0's pages" is either the
@@ -1612,32 +1609,38 @@ impl Worker for SpyreWorker {
                 // whether this schedule defers it to the drain or collects it right here —
                 // no logits are ever read, and there is no synchronous second arm.
                 let sub = match run_prefill_batch(
-                    Some((&rows_in, prefix)),
-                    kv_blocks.as_deref(),
+                    BatchLaunch {
+                        per_request: Some((&rows_in, prefix)),
+                        kv_blocks: kv_blocks.as_deref(),
+                    },
                     &sh,
                     sess,
                     // A batched rung sweeps the whole pool, so it runs on the widest decode
                     // bucket. (The sendnn path bakes exactly one, so this is that one.)
                     model.decode.last().expect("at least one decode bucket"),
-                    // ⭐⭐⭐ THE SEED LAW AT THE CALL: a churned seating seeds from the collected
-                    // picks (`toks`, one per live row, pads clamped by `launch_rows`); a stable
-                    // seating seeds from the card — `OnCard`, no bind, no drain, submit while the
-                    // previous step is still in flight.
-                    if churned {
-                        scratchy_subtile::sdsc_abstract::SeedSource::Host(&toks)
-                    } else {
-                        scratchy_subtile::sdsc_abstract::SeedSource::OnCard
+                    RungShape {
+                        prefill_m: seqs,
+                        // ⭐ THE RUNG'S OWN ANSWER, riding with the rung's own `seqs` for the same reason:
+                        // the meta above is borrowed for tensor ids and describes neither.
+                        gathers: gathers_kv,
                     },
-                    seqs,
-                    // ⭐ THE RUNG'S OWN ANSWER, riding with the rung's own `seqs` for the same reason:
-                    // the meta above is borrowed for tensor ids and describes neither.
-                    gathers_kv,
                     launch_pos,
-                    LogitsWanted::PerRequestDeferred,
-                    // ⭐ EACH LIVE ROW ITS OWN REQUEST'S DRAW, laid by the same
-                    // walk that laid the rows (the staging arm pairs them by
-                    // slot and gives every padding slot the greedy law).
-                    SeatLaws::Batch { draws: &draws },
+                    SamplerLaws {
+                        // ⭐⭐⭐ THE SEED LAW AT THE CALL: a churned seating seeds from the collected
+                        // picks (`toks`, one per live row, pads clamped by `launch_rows`); a stable
+                        // seating seeds from the card — `OnCard`, no bind, no drain, submit while the
+                        // previous step is still in flight.
+                        seeds: if churned {
+                            scratchy_subtile::sdsc_abstract::SeedSource::Host(&toks)
+                        } else {
+                            scratchy_subtile::sdsc_abstract::SeedSource::OnCard
+                        },
+                        want_logits: LogitsWanted::PerRequestDeferred,
+                        // ⭐ EACH LIVE ROW ITS OWN REQUEST'S DRAW, laid by the same
+                        // walk that laid the rows (the staging arm pairs them by
+                        // slot and gives every padding slot the greedy law).
+                        laws: SeatLaws::Batch { draws: &draws },
+                    },
                 )? {
                     BatchOut::Deferred(sub) => sub,
                     BatchOut::Done(_) => {
@@ -1816,9 +1819,10 @@ impl Worker for SpyreWorker {
                 start,
                 n,
                 #[cfg(feature = "spyre-hw")]
-                hosts.get(req_id).map_or(&[], |v| v.as_slice()),
-                #[cfg(feature = "spyre-hw")]
-                part,
+                PageMapCtx {
+                    host: hosts.get(req_id).map_or(&[], |v| v.as_slice()),
+                    part,
+                },
             )?;
             order.push(req_id.clone());
             sampled.push(s);

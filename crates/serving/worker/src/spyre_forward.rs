@@ -10,7 +10,7 @@
 
 // The pool/slot vocabulary is CARD-ONLY, so its imports carry the cfg of the blocks that use it.
 #[cfg(feature = "spyre-hw")]
-use scratchy_subtile::sdsc_abstract::{PoolPartition, SlotCount};
+use scratchy_subtile::sdsc_abstract::SlotCount;
 // The KTIR-emulator twin below (mask/rope pad-row clamping) — the card's twin shares the laws
 // through `ChunkRows` already.
 #[cfg(not(feature = "spyre-hw"))]
@@ -65,8 +65,12 @@ pub(crate) enum BatchOut {
 /// forward instead of two, and the second one's ~29 ms weight-stream floor disappears. Every earlier
 /// chunk leaves it false and passes a NULL out-pointer, so the shim skips the ~3 MB logits D2H and the
 /// sen→IEEE convert. Returns `None` exactly when `want_logits` is false.
+/// ⭐ THE LAUNCH'S OWN FACTS, MINTED BY THE CALLER IN ONE LOOP: what the rows
+/// ARE, and the gather table those rows read through. One bundle because both
+/// describe the pool's live state at submit, which this function can neither
+/// see nor recompute.
 #[cfg(feature = "spyre-hw")]
-pub(crate) fn run_prefill_batch(
+pub(crate) struct BatchLaunch<'a> {
     // ⛔ THE NEW-BLOCK LAW IS NOT A PARAMETER ANY MORE. It was `causal_col_valid: fn(usize, usize) ->
     // bool` — the row KIND travelling as a runtime value, which is the shape `QueryRows` exists to
     // retire. The kind is now the type of `per_request` below: a decode batch has `LaunchRows` and
@@ -90,8 +94,8 @@ pub(crate) fn run_prefill_batch(
     // declares no fold, so there is no decode-shaped value for it to carry.
     // ⭐ AND WHEN THE STEP's BODY IS A BATCH CHUNK, ITS LAW INSTEAD OF THE FOLD's GRID: the mask is then
     // ONE per-row block every row block reads (`BatchPrefix::Chunk`), not a block per pass.
-    per_request: Option<(
-        &scratchy_subtile::sdsc_abstract::LiveBatch,
+    pub(crate) per_request: Option<(
+        &'a scratchy_subtile::sdsc_abstract::LiveBatch,
         scratchy_subtile::sdsc_abstract::BatchPrefix,
     )>,
     // ⭐⭐⭐⭐⭐ THE GATHER'S INDEX TABLE — global stick-block numbers, one per (launch row, logical page),
@@ -105,31 +109,20 @@ pub(crate) fn run_prefill_batch(
     // `None` for a launch that stages none — a prompt chunk, or a bundle that emitted no gather. The
     // pairing is checked at `kernel_values`, against the BUNDLE's own placement rather than against
     // this argument, so "table but no gather" is inert and "gather but no table" is a refusal.
-    kv_blocks: Option<&[scratchy_subtile::sdsc_abstract::GatherEntry]>,
-    sh: &Shared<'_>,
-    pf: &mut SuperDscSession,
-    b: &BundleMeta,
-    // ⛔ THERE IS NO `pages` PARAMETER, AND ITS ABSENCE IS THE LOCK. It was "pages this request holds", and
-    // it fed the prompt-chunk mask extent — but only through an arm that a PREFIX-FREE prefill rung never
-    // took (`page_slots == 0` ⇒ `pf.cap`, a pool number). A prompt chunk's extent is now the BAKE's own
-    // pmask reserve (`SuperDscSession::pmask_slots`) and a decode batch's is the DECLARED fold grid, so
-    // neither can be handed a page count computed at a call site. Deleting the parameter is what stops the
-    // next caller from reaching for `ctx.host.len()` or a pool size again.
-    // ⛔ THE SEED LAW, NOT A TOKEN LIST. This used to be `toks: &[usize]` — one token per live
-    // row, read from the token pool — which made every decode step's embed-head bind depend on
-    // the PREVIOUS step's collected pick and forced a drain before every submit. The device
-    // writes the seeds itself (each step's ChainStage decomposes its pick into the persistent
-    // sticks), so the host binds seeds ONLY where the card cannot have: a request's first step on
-    // a rung session, a churned or padded seat, a rung switch. `SeedSource::OnCard` is that
-    // statement — a stable seating — and binds nothing.
-    seeds: scratchy_subtile::sdsc_abstract::SeedSource<'_>,
+    pub(crate) kv_blocks: Option<&'a [scratchy_subtile::sdsc_abstract::GatherEntry]>,
+}
+
+/// ⭐ THE RUNG'S OWN ANSWER, in one bundle with the rung's own width: a decode
+/// batch rung is addressed by FINGERPRINT, so `b` is the single-request meta
+/// borrowed for its tensor IDS and describes neither this launch's row count
+/// nor its placements — both facts ride here instead.
+#[cfg(feature = "spyre-hw")]
+pub(crate) struct RungShape {
     // The width the bundle being run was BAKED at — the launch binds exactly this many rows,
     // live or padding, and every extent below (embeddings, masks, `run_step`'s m) is sized by it.
-    prefill_m: scratchy_subtile::sdsc_abstract::RungWidth,
+    pub(crate) prefill_m: scratchy_subtile::sdsc_abstract::RungWidth,
     // ⭐⭐⭐⭐⭐ WHETHER THE BUNDLE BEING RUN GATHERS — the SECOND fact `b` cannot answer, and it rides
-    // beside `prefill_m` because it has exactly `prefill_m`'s provenance: a decode batch rung is
-    // addressed by FINGERPRINT, so `b` is the single-request meta borrowed for its tensor IDS and
-    // describes neither this launch's row count nor its placements. The gather is emitted only by
+    // beside `prefill_m` because it has exactly `prefill_m`'s provenance. The gather is emitted only by
     // the collapsed `mq > 1` bodies, so `GathersKv::of(&b.facts)` answers `false` for every rung
     // that places an index — which the card reports as `0xa35e RAS::PCI::BusFence`, a fence with no
     // `vars` raised on senlib's own monitor thread, from two gather copies resolving
@@ -139,9 +132,29 @@ pub(crate) fn run_prefill_batch(
     // "caller answers from a phase or a rung width" hazard that type exists to forbid; every caller
     // mints this from an artifact — `BakeFacts` for a prompt chunk, the rung's own layout for a
     // batched step.
-    gathers: scratchy_target_spyre::wiring::GathersKv,
-    start: usize,
-    want_logits: LogitsWanted,
+    pub(crate) gathers: scratchy_target_spyre::wiring::GathersKv,
+}
+
+/// ⭐ THE SUFFIX'S MINTED SAMPLER, ONE BUNDLE: where the seeds come from, whether
+/// the lm-head tail runs, and the per-row seat laws — the three facts that
+/// describe the launch's sampling half rather than its forward body.
+#[cfg(feature = "spyre-hw")]
+pub(crate) struct SamplerLaws<'a> {
+    // ⛔ THE SEED LAW, NOT A TOKEN LIST. This used to be `toks: &[usize]` — one token per live
+    // row, read from the token pool — which made every decode step's embed-head bind depend on
+    // the PREVIOUS step's collected pick and forced a drain before every submit. The device
+    // writes the seeds themselves (each step's ChainStage decomposes its pick into the persistent
+    // sticks), so the host binds seeds ONLY where the card cannot have: a request's first step on
+    // a rung session, a churned or padded seat, a rung switch. `SeedSource::OnCard` is that
+    // statement — a stable seating — and binds nothing.
+    pub(crate) seeds: scratchy_subtile::sdsc_abstract::SeedSource<'a>,
+    // `want_logits` asks for the NEXT token's logits from the bundle's lm-head tail, which the emitter
+    // folds to m=1 over the LAST baked row (see `LAST_HIDDEN_TID`). The caller sets it on the FINAL chunk
+    // and then has no separate decode-of-the-last-token to run — that is the whole point: TTFT becomes one
+    // forward instead of two, and the second one's ~29 ms weight-stream floor disappears. Every earlier
+    // chunk leaves it false and passes a NULL out-pointer, so the shim skips the ~3 MB logits D2H and the
+    // sen→IEEE convert. Returns `None` exactly when `want_logits` is false.
+    pub(crate) want_logits: LogitsWanted,
     // ⭐ THE SEAT LAWS THIS LAUNCH'S ROWS RUN UNDER — one law per row the
     // suffix's sampler picks for, staged before anything runs. The variant must
     // match the launch's own arm: `Prompt` for a prompt-final chunk (whose rows
@@ -149,8 +162,35 @@ pub(crate) fn run_prefill_batch(
     // law per live row). A middle prompt chunk stages nothing (its suffix never
     // runs), so the value it passes is inert — but the arm/variant match is
     // still refused wherever the seat IS staged, never silently resolved.
-    seat_laws: SeatLaws<'_>,
+    pub(crate) laws: SeatLaws<'a>,
+}
+
+#[cfg(feature = "spyre-hw")]
+pub(crate) fn run_prefill_batch(
+    launch: BatchLaunch<'_>,
+    sh: &Shared<'_>,
+    pf: &mut SuperDscSession,
+    b: &BundleMeta,
+    // ⛔ THERE IS NO `pages` PARAMETER, AND ITS ABSENCE IS THE LOCK. It was "pages this request holds", and
+    // it fed the prompt-chunk mask extent — but only through an arm that a PREFIX-FREE prefill rung never
+    // took (`page_slots == 0` ⇒ `pf.cap`, a pool number). A prompt chunk's extent is now the BAKE's own
+    // pmask reserve (`SuperDscSession::pmask_slots`) and a decode batch's is the DECLARED fold grid, so
+    // neither can be handed a page count computed at a call site. Deleting the parameter is what stops the
+    // next caller from reaching for `ctx.host.len()` or a pool size again.
+    rung: RungShape,
+    start: usize,
+    sampler: SamplerLaws<'_>,
 ) -> ExecutorResult<BatchOut> {
+    let BatchLaunch {
+        per_request,
+        kv_blocks,
+    } = launch;
+    let RungShape { prefill_m, gathers } = rung;
+    let SamplerLaws {
+        seeds,
+        want_logits,
+        laws: seat_laws,
+    } = sampler;
     use scratchy_subtile::sdsc_abstract::{ChunkRows, decode_prefix_col_valid};
     // ⭐ NO `hd` HERE ANY MORE. The one head-count question this function asked (`h / hd`) is now
     // the bake's own `Geometry::nqh` — the quotient was the head count only for a square Q
@@ -798,7 +838,6 @@ pub(crate) fn run_prefill_batch(
     Ok(BatchOut::Done(picked))
 }
 #[cfg(feature = "spyre-hw")]
-
 /// Every activation a forward binds, against what the BAKE says that tensor is — one line, at
 /// `debug`, per launch.
 ///
@@ -1482,7 +1521,9 @@ pub(crate) fn collect_decode_tokens(
 #[cfg(feature = "spyre-hw")]
 fn decode_idx_stick(bytes: &[u8], rows: usize, vocab: usize) -> ExecutorResult<Vec<u32>> {
     let words: Vec<i32> = bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
     // The idx stick's own format decides the stride — the same law every device
@@ -1530,11 +1571,11 @@ fn decode_idx_stick(bytes: &[u8], rows: usize, vocab: usize) -> ExecutorResult<V
 ///   * THE PICK — the logits row's own argmax (host, f16, `dev_off_stk`)
 ///     beside the card's pick; pick = argmax at temp 1.0 is the failure
 ///     itself, and WHICH byte-group broke names the stage.
-/// The card's noise intermediate g is NOT addressable from the wiring (the
-/// draw's internals are lower-layer ktir synthetics, no tids), so the
-/// readback brackets it: the staged inputs on one side, the pick on the
-/// other. A failed read logs its tid and stops the line — the readback never
-/// gates the run.
+///     The card's noise intermediate g is NOT addressable from the wiring (the
+///     draw's internals are lower-layer ktir synthetics, no tids), so the
+///     readback brackets it: the staged inputs on one side, the pick on the
+///     other. A failed read logs its tid and stops the line — the readback never
+///     gates the run.
 #[cfg(feature = "spyre-hw")]
 fn log_seat_readback(
     session: &mut SuperDscSession,
@@ -1554,7 +1595,9 @@ fn log_seat_readback(
                 words * 4,
             )
             .map(|b| {
-                b.chunks_exact(4)
+                b.as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|w| i32::from_le_bytes([w[0], w[1], w[2], w[3]]))
                     .collect()
             })
@@ -1578,15 +1621,11 @@ fn log_seat_readback(
     // its stick head (`sample_binds`' own law, read back through the same
     // stride it staged).
     let mut words: Vec<[i32; 4]> = vec![[0; 4]; rows];
-    for k in 0..4 {
-        match le_words(
-            session,
-            seat.seed_words[k],
-            rows * seat.seed_row_words as usize,
-        ) {
+    for (k, seed_tid) in seat.seed_words.iter().enumerate() {
+        match le_words(session, *seed_tid, rows * seat.seed_row_words as usize) {
             Ok(ws) => {
-                for r in 0..rows {
-                    words[r][k] = ws
+                for (r, row) in words.iter_mut().enumerate() {
+                    row[k] = ws
                         .get(r * seat.seed_row_words as usize)
                         .copied()
                         .unwrap_or(-1);
@@ -1713,38 +1752,62 @@ fn log_seat_readback(
     );
 }
 
+/// ⭐ THE PREFILL LADDERS THE CHUNK LOOP CLIMBS, ONE BUNDLE: the prefix-free
+/// width ladder a prompt's first chunks pick from, and the prefix-capable
+/// ladder its continuation chunks pick from — both live in the bundle, both
+/// borrowed mutably because the picked rung's session is run in place.
+#[cfg(feature = "spyre-hw")]
+pub(crate) struct PrefillLadders<'a> {
+    // The prefill WIDTH LADDER, ascending by baked mq (see `SuperDscBundle::prefill_rungs`). Each
+    // chunk runs on the SMALLEST rung that holds it, so a short prompt stops paying for padding rows
+    // and a long one still gets the widest chunk. Empty ⇒ no batched prefill.
+    pub(crate) rungs: &'a mut [(usize, SuperDscSession)],
+    // The prefix-capable ladder for continuation chunks (start>0); the rungs above are prefix-free.
+    // A continuation chunk's width is chosen by `PrefixLadder::rung_for` and nowhere else.
+    pub(crate) prefix: &'a mut PrefixLadder,
+}
+
+/// ⭐ THE CHUNK PATHS' PAGING FACTS, ONE BUNDLE: the map context (the host's
+/// block list + the pool's owner split) and the pool's geometry — every bind
+/// DERIVES a request's page map and its layout from exactly this pair.
+#[cfg(feature = "spyre-hw")]
+pub(crate) struct ChunkPaging<'a> {
+    // THE HOST'S LIST + THE POOL'S OWNER SPLIT — needed because every bind DERIVES this request's page
+    // map rather than reading a stored one, and the map's fully-masked and hole pages come from the
+    // reserved range.
+    pub(crate) ctx: PageMapCtx<'a>,
+    // The pool's geometry, threaded from the model — `chunk_index_table`'s law, ONE spelling (built in
+    // `run_request_step` off `Loaded`'s own two numbers).
+    pub(crate) pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
+}
+
 #[cfg(feature = "spyre-hw")]
 pub(crate) fn superdsc_forward_chunk(
     sh: &Shared<'_>,
     session: &mut SuperDscSession,
-    // The prefill WIDTH LADDER, ascending by baked mq (see `SuperDscBundle::prefill_rungs`). Each
-    // chunk runs on the SMALLEST rung that holds it, so a short prompt stops paying for padding rows
-    // and a long one still gets the widest chunk. Empty ⇒ no batched prefill.
-    prefill_rungs: &mut Vec<(usize, SuperDscSession)>,
-    // The prefix-capable ladder for continuation chunks (start>0); the rungs above are prefix-free.
-    // A continuation chunk's width is chosen by `PrefixLadder::rung_for` and nowhere else.
-    prefill_prefix: &mut PrefixLadder,
+    ladders: PrefillLadders<'_>,
     b: &BundleMeta,
     // The prefill meta bound by `run_prefill_batch` to `prefill_session` (its tensor ids match the prefill
     // manifest, unlike `b`, which is the decode meta the generation steps below use).
     prefill_meta: Option<&BundleMeta>,
-    req: &mut ReqState,
-    // ⛔ THE STORE, LIVE AND MUTABLE — the chunk loop slices this request's tokens out of it AND advances
-    // its `tokens_in_pool`, because how far a chunked prefill got is known only here, after the loop. `id`
-    // indexes it. Passed rather than snapshotted for the reason `b4856997` records: a snapshot taken
-    // upstream of this step's writes is a stale copy, and that cost every prompt past one scheduler step.
-    id: &str,
-    tokens: &mut scratchy_serving_engine::input_batch::InputBatch,
-    start: usize,
-    toks: &[usize],
-    // THE HOST'S LIST + THE POOL'S OWNER SPLIT — needed because every bind DERIVES this request's page
-    // map rather than reading a stored one, and the map's fully-masked and hole pages come from the
-    // reserved range.
-    ctx: PageMapCtx<'_>,
-    // The pool's geometry, threaded from the model — `chunk_index_table`'s law, ONE spelling (built in
-    // `run_request_step` off `Loaded`'s own two numbers).
-    pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
+    Chunk {
+        state: req,
+        // ⛔ THE STORE, LIVE AND MUTABLE — the chunk loop slices this request's tokens out of it AND advances
+        // its `tokens_in_pool`, because how far a chunked prefill got is known only here, after the loop. `id`
+        // indexes it. Passed rather than snapshotted for the reason `b4856997` records: a snapshot taken
+        // upstream of this step's writes is a stale copy, and that cost every prompt past one scheduler step.
+        id,
+        tokens,
+        start,
+        toks,
+    }: Chunk<'_>,
+    paging: ChunkPaging<'_>,
 ) -> ExecutorResult<ChunkOut> {
+    let PrefillLadders {
+        rungs: prefill_rungs,
+        prefix: prefill_prefix,
+    } = ladders;
+    let ChunkPaging { ctx, pool } = paging;
     let n = toks.len();
     if n == 0 {
         return Err(werr("superdsc_forward_chunk: n=0".to_string()));
@@ -2061,43 +2124,50 @@ pub(crate) fn superdsc_forward_chunk(
                     // A prompt chunk: these rows are consecutive positions of one sequence, so they
                     // share both the causal triangle and one resident-prefix validity row. `None` IS
                     // that statement — there are no per-request rows, so the chunk laws are the only
-                    // ones reachable.
-                    None,
-                    // The chunk's index table — `None` for a body that gathers nothing (no prefix, or
-                    // a prefix within one page on the per-page body).
-                    kv_blocks.as_deref(),
+                    // ones reachable. The chunk's index table rides beside it — `None` for a body
+                    // that gathers nothing (no prefix, or a prefix within one page on the per-page
+                    // body).
+                    BatchLaunch {
+                        per_request: None,
+                        kv_blocks: kv_blocks.as_deref(),
+                    },
                     sh,
                     pf,
                     pmeta,
-                    // ⭐ FROM THE REQUEST, AT ABSOLUTE POSITIONS — not from this step's window. A chunk
-                    // that stepped back needs tokens an earlier step was given, and the request holds them.
-                    scratchy_subtile::sdsc_abstract::SeedSource::Host(&chunk_toks),
-                    // The LADDER entry's baked width — the rung this chunk actually runs on, of
-                    // which `chunk_len` rows carry real tokens.
-                    scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(rung_m as u32)
-                        .ok_or_else(|| {
-                            werr(
-                                "superdsc batched prefill: the selected rung has zero rows"
-                                    .to_string(),
-                            )
-                        })?,
-                    // ⛔ THE RUNNING BODY'S OWN ANSWER, not the bundle's: the prefix bundle's ladder
-                    // mixes the per-page body (gathers nothing) with split-KV chunks (gather every
-                    // page), and its `KV_BLOCK_INDEX` placement is the chunk ceiling's.
-                    step.gathers(),
-                    chunk_start,
-                    if is_prompt_final_chunk {
-                        LogitsWanted::LastRow
-                    } else {
-                        LogitsWanted::None
+                    RungShape {
+                        // The LADDER entry's baked width — the rung this chunk actually runs on, of
+                        // which `chunk_len` rows carry real tokens.
+                        prefill_m:
+                            scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(rung_m as u32)
+                                .ok_or_else(|| {
+                                    werr(
+                                        "superdsc batched prefill: the selected rung has zero rows"
+                                            .to_string(),
+                                    )
+                                })?,
+                        // ⛔ THE RUNNING BODY'S OWN ANSWER, not the bundle's: the prefix bundle's ladder
+                        // mixes the per-page body (gathers nothing) with split-KV chunks (gather every
+                        // page), and its `KV_BLOCK_INDEX` placement is the chunk ceiling's.
+                        gathers: step.gathers(),
                     },
-                    // ⭐ THE CHUNK'S SEAT LAW — this request's draw, every row of
-                    // it (the staging arm clamps pad rows to the last real
-                    // position). Only the prompt-FINAL chunk's value is ever
-                    // staged; a middle chunk's suffix never runs, so its law is
-                    // inert — but it is still THIS request's, never invented.
-                    SeatLaws::Prompt {
-                        draw: req.draw.as_ref(),
+                    chunk_start,
+                    SamplerLaws {
+                        // ⭐ FROM THE REQUEST, AT ABSOLUTE POSITIONS — not from this step's window. A chunk
+                        // that stepped back needs tokens an earlier step was given, and the request holds them.
+                        seeds: scratchy_subtile::sdsc_abstract::SeedSource::Host(&chunk_toks),
+                        want_logits: if is_prompt_final_chunk {
+                            LogitsWanted::LastRow
+                        } else {
+                            LogitsWanted::None
+                        },
+                        // ⭐ THE CHUNK'S SEAT LAW — this request's draw, every row of
+                        // it (the staging arm clamps pad rows to the last real
+                        // position). Only the prompt-FINAL chunk's value is ever
+                        // staged; a middle chunk's suffix never runs, so its law is
+                        // inert — but it is still THIS request's, never invented.
+                        laws: SeatLaws::Prompt {
+                            draw: req.draw.as_ref(),
+                        },
                     },
                 )?;
                 // A prompt chunk never defers: it asked for `LastRow`/`None`, the two arms
@@ -2582,45 +2652,44 @@ pub(crate) fn forward_chunk(
         start,
         toks,
     }: Chunk<'_>,
-    // The host's list + the pool's owner split: every bind DERIVES this request's page map, and the map's
-    // fully-masked and hole pages come from the range the host is never told about.
-    ctx: PageMapCtx<'_>,
-    // The pool's geometry, threaded from the model — one spelling, handed to
-    // `superdsc_forward_chunk`'s chunk paths (see `run_request_step`, where it is built).
-    pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
+    // The host's list + the pool's owner split, and the pool's geometry — threaded together because
+    // every bind derives this request's page map from exactly that pair (see `run_request_step`,
+    // where it is built).
+    paging: ChunkPaging<'_>,
 ) -> ExecutorResult<ChunkOut> {
-    {
-        let SendnnSession::SuperDsc(sb) = session;
-        // Split the borrow: the prompt runs through the m=N `prefill` session (if present),
-        // then the last token + all generation run through the m=1 `decode` session.
-        let SuperDscBundle {
-            decode,
-            prefill_rungs,
-            prefill_prefix,
-            // Named rather than `..` so adding a field keeps failing here until someone decides
-            // whether this path needs it. The batch ladder is not needed: this is the ONE-request
-            // path and a batched step never reaches it. The pool is not needed either: the request
-            // already holds its pages and the forward only installs their map.
-            decode_rungs: _,
-            pool_pages: _,
-            pool_rows: _,
-        } = sb;
-        return superdsc_forward_chunk(
-            sh,
-            decode,
-            prefill_rungs,
-            prefill_prefix,
-            b,
-            prefill_meta,
-            req,
+    let SendnnSession::SuperDsc(sb) = session;
+    // Split the borrow: the prompt runs through the m=N `prefill` session (if present),
+    // then the last token + all generation run through the m=1 `decode` session.
+    let SuperDscBundle {
+        decode,
+        prefill_rungs,
+        prefill_prefix,
+        // Named rather than `..` so adding a field keeps failing here until someone decides
+        // whether this path needs it. The batch ladder is not needed: this is the ONE-request
+        // path and a batched step never reaches it. The pool is not needed either: the request
+        // already holds its pages and the forward only installs their map.
+        decode_rungs: _,
+        pool_pages: _,
+        pool_rows: _,
+    } = sb;
+    superdsc_forward_chunk(
+        sh,
+        decode,
+        PrefillLadders {
+            rungs: prefill_rungs.as_mut_slice(),
+            prefix: prefill_prefix,
+        },
+        b,
+        prefill_meta,
+        Chunk {
+            state: req,
             id,
             tokens,
             start,
             toks,
-            ctx,
-            pool,
-        );
-    }
+        },
+        paging,
+    )
 }
 
 /// The KTIR-emulator twin of [`forward_chunk`]: one fused forward through the resident session,
@@ -2971,9 +3040,10 @@ pub(crate) fn run_request_step(
     start: usize,
     n: usize,
     // The host's block list for this request, read from `InputBatch` by the caller, and the pool's owner
-    // split. Passed in rather than looked up here so there is one read of the store per step.
-    #[cfg(feature = "spyre-hw")] host: &[usize],
-    #[cfg(feature = "spyre-hw")] part: PoolPartition,
+    // split, in one context. Passed in rather than looked up here so there is one read of the store per
+    // step.
+    #[cfg(feature = "spyre-hw")]
+    pages: PageMapCtx<'_>,
 ) -> ExecutorResult<Option<u32>> {
     if n == 0 {
         return Ok(None);
@@ -2981,7 +3051,7 @@ pub(crate) fn run_request_step(
     // The map context for this request's whole step: the host's list (read from `InputBatch` by the
     // caller) and the pool's owner split, derived once.
     #[cfg(feature = "spyre-hw")]
-    let ctx = PageMapCtx { host, part };
+    let ctx = pages;
     let toks: Vec<usize> = (start..start + n)
         .map(|p| {
             tokens.token_at(id, p).map(|t| t as usize).ok_or_else(|| {
@@ -3162,9 +3232,7 @@ pub(crate) fn run_request_step(
                 toks: chunk,
             },
             #[cfg(feature = "spyre-hw")]
-            ctx,
-            #[cfg(feature = "spyre-hw")]
-            pool,
+            ChunkPaging { ctx, pool },
         )? {
             prompt_pick = ts.last().copied();
         }
@@ -3201,9 +3269,7 @@ pub(crate) fn run_request_step(
                 toks: &toks[n - 1..n],
             },
             #[cfg(feature = "spyre-hw")]
-            ctx,
-            #[cfg(feature = "spyre-hw")]
-            pool,
+            ChunkPaging { ctx, pool },
         )? {
             ChunkOut::Tokens(ts) => *ts
                 .last()
