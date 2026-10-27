@@ -2417,22 +2417,36 @@ impl SpyreWorker {
                         continue;
                     }
                     // The manifest's `RungSeqs` IS a baked row count — this is the one boundary where
-                    // it becomes the launch-width vocabulary everything below runs on.
-                    let Some(rung_width) =
-                        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(rung_n.get())
-                    else {
-                        continue;
-                    };
-                    let Some(rcode) = sentinel
+                    // it becomes the launch-width vocabulary everything below runs on. A manifest
+                    // rung whose width is not a legal width is an INVENTORY DESYNC, not a rung to
+                    // skip: the bake that produced the manifest and the ladder vocabulary have
+                    // drifted, and every width past this one would address slots the pool never
+                    // seated.
+                    let rung_width =
+                        match scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(rung_n.get())
+                        {
+                            Some(w) => w,
+                            None => {
+                                return Err(werr(format!(
+                                    "decode batch rung seqs={rn}: the manifest names a row count \
+                                     no ladder width holds — inventory desync between the bake \
+                                     and the rung vocabulary, never a skip"
+                                )));
+                            }
+                        };
+                    let rcode = match sentinel
                         .as_str()
                         .strip_prefix(SUPERDSC_SENTINEL)
                         .and_then(scratchy_target_spyre::bundle_code::bundle)
-                    else {
-                        warn!(
-                            "[spyre-worker] sendnn: decode batch rung seqs={rn}: sentinel names no \
-                             bundle compiled into this binary — SKIPPED"
-                        );
-                        continue;
+                    {
+                        Some(code) => code,
+                        None => {
+                            return Err(werr(format!(
+                                "decode batch rung seqs={rn}: sentinel names no bundle compiled \
+                                 into this binary — inventory desync (the manifest and the \
+                                 binary disagree about which rungs exist), never a skip"
+                            )));
+                        }
                     };
                     // The rung's own logits placement, read from the bundle it actually runs. Derived,
                     // never assumed: the width is stick-PADDED above the vocab, and the row count is
@@ -2508,9 +2522,9 @@ impl SpyreWorker {
                     }
                     // THE FOLD-ROW REGIME, from the bundle it will actually run: the launch derives its
                     // intermediate-segment stride from it (`set_int_stride`). A rung whose fold groups
-                    // DISAGREE is SKIPPED like any other rung that fails to load — that batch runs on a
-                    // narrower rung, slower and never wrong, whereas guessing a stride is the
-                    // silent-wrong-history arm this field exists to close.
+                    // DISAGREE is a load failure, never a skip — guessing a stride is the
+                    // silent-wrong-history arm this field exists to close, and silently narrowing the
+                    // ladder is the failure shape the skip arms are being deleted for.
                     let fold_rows = match rcode.fold_rows() {
                         Ok(scratchy_target_spyre::bundle_code::FoldRows::PerRequest) => {
                             scratchy_subtile::sdsc_abstract::FoldRowRegime::PerRequest
@@ -2519,11 +2533,10 @@ impl SpyreWorker {
                             scratchy_subtile::sdsc_abstract::FoldRowRegime::WholeBatch
                         }
                         Err(e) => {
-                            warn!(
-                                "[spyre-worker] sendnn: decode batch rung seqs={rn}: {e} — SKIPPED; \
-                                 that batch runs on a narrower rung"
-                            );
-                            continue;
+                            return Err(werr(format!(
+                                "decode batch rung seqs={rn}: {e} — a rung that fails to load is \
+                                 a load error, never a skip"
+                            )));
                         }
                     };
                     let logits = rcode
@@ -2532,16 +2545,17 @@ impl SpyreWorker {
                         .and_then(|p| {
                             LogitsGeom::from_placement(p.size, rung_width, vocab as usize)
                         });
-                    let Some(logits) = logits else {
-                        warn!(
-                            "[spyre-worker] sendnn: decode batch rung seqs={rn}: its baked logits \
-                             placement (t{}) is missing or is not {rn} whole rows of >= {vocab} — \
-                             SKIPPED",
-                            dparsed.result_id
-                        );
-                        continue;
+                    let logits = match logits {
+                        Some(l) => l,
+                        None => {
+                            return Err(werr(format!(
+                                "decode batch rung seqs={rn}: its baked logits placement (t{}) is \
+                                 missing or is not {rn} whole rows of >= {vocab} — never a skip",
+                                dparsed.result_id
+                            )));
+                        }
                     };
-                    match SuperDscSession::new_borrowing(
+                    let mut rs = match SuperDscSession::new_borrowing(
                         rcode,
                         vocab,
                         kv_dim,
@@ -2550,38 +2564,35 @@ impl SpyreWorker {
                         &resident_source_ids(&wirings.decode, &spill_tids),
                         &[1, 2],
                     ) {
-                        Ok(mut rs) => {
-                            let mut ok = true;
-                            if let Err(e) = adopt_from_owner(&mut rs, &ss, &spill_images) {
-                                warn!(
-                                    "[spyre-worker] sendnn: decode batch rung seqs={rn}: {e} — \
-                                     SKIPPED"
-                                );
-                                ok = false;
-                            }
-                            if ok {
-                                info!(
-                                    "[spyre-worker] sendnn: decode batch rung seqs={rn} ready \
-                                     (logits [{}, {}])",
-                                    logits.rows, logits.width
-                                );
-                                decode_ladder.push(DecodeRung {
-                                    seqs: rung_width,
-                                    mask_cap: rung_mask_cap,
-                                    fold_rows,
-                                    // ⛔ NO `swept` AND NO `gathers_kv` HERE ANY MORE — both are
-                                    // per-BODY and this is per-bundle; see `DecodeRung`. The launch
-                                    // asks `sess.step_body(start)`, which is the selector itself.
-                                    sess: rs,
-                                    logits,
-                                });
-                            }
+                        Ok(rs) => rs,
+                        Err(e) => {
+                            return Err(werr(format!(
+                                "decode batch rung seqs={rn} FAILED to build ({e}) — a rung that \
+                                 fails to load is a load error, never a skip"
+                            )));
                         }
-                        Err(e) => warn!(
-                            "[spyre-worker] sendnn: decode batch rung seqs={rn} FAILED to build \
-                             ({e}) — SKIPPED; that batch runs on a narrower rung"
-                        ),
+                    };
+                    if let Err(e) = adopt_from_owner(&mut rs, &ss, &spill_images) {
+                        return Err(werr(format!(
+                            "decode batch rung seqs={rn}: {e} — a rung that fails to load is a \
+                             load error, never a skip"
+                        )));
                     }
+                    info!(
+                        "[spyre-worker] sendnn: decode batch rung seqs={rn} ready \
+                         (logits [{}, {}])",
+                        logits.rows, logits.width
+                    );
+                    decode_ladder.push(DecodeRung {
+                        seqs: rung_width,
+                        mask_cap: rung_mask_cap,
+                        fold_rows,
+                        // ⛔ NO `swept` AND NO `gathers_kv` HERE ANY MORE — both are
+                        // per-BODY and this is per-bundle; see `DecodeRung`. The launch
+                        // asks `sess.step_body(start)`, which is the selector itself.
+                        sess: rs,
+                        logits,
+                    });
                 }
                 decode_ladder.sort_by_key(|r| r.seqs);
                 // ── STAGE EVERY CHUNK SESSION'S FULL-CHUNK CAUSAL MASK, ONCE, HERE ── so no request's

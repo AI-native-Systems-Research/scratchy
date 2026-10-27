@@ -2180,6 +2180,20 @@ fn reshape_flat_law(f: &IRFunction<'_>, op: &Operation<'_>, src: Ssa) -> Reshape
 /// minted intermediate). Reshape-of-reshape resolves transitively — the map records the
 /// ULTIMATE source, built in definition order so a later reshape reads the earlier one's entry.
 ///
+/// ⭐⭐⭐⭐⭐ AND THE SAME LENS COVERS A `tensor.expand_shape`/`tensor.collapse_shape` NO BROADCAST
+/// CHAIN CONSUMED. The three op kinds are one class by MLIR's own semantics — a
+/// numel-preserving C-order reframe (an expand splits axes and may insert `1`s, a collapse
+/// merges them, a reshape restates them; none moves an element) — so a producer that spells a
+/// reframe WITHOUT a `linalg.broadcast` behind it (the merge tail's `merged[None, :, :]` when
+/// the inserted axis is the output's own `1`: nothing needs spraying, so no broadcast op exists)
+/// still states only a lens, and the consumer must read through it or nothing lowers the op at
+/// all. The BROADCAST-CHAIN case is unchanged and exclusive: a chain's expand is consumed by its
+/// `linalg.broadcast` ([`program_broadcast_chains`]'s `consumed` set) and never reaches a
+/// consumer as itself, so the two doors cannot both claim one op. The #741 re-row verdict below
+/// is the same law for all three kinds — it reads only the op's `result_type` and the source's
+/// own type, so a degenerate insert that keeps the flat frame (`[256, 4] -> [1, 256, 4]`) is
+/// the identity verdict and any reframe that moves bytes is refused at the consumer by name.
+///
 /// ⭐⭐⭐ AND THE LENS IS LAW-CHECKED AT THE REFRAME — [`reshape_flat_law`] runs the #741 re-row
 /// law at the forward itself, the same law [`crate::sdsc_abstract::Access::reframe`] states for
 /// a reshape over a minted access: the target's flat presentation is admitted only when every
@@ -2211,7 +2225,12 @@ fn reshape_forwards(f: &IRFunction<'_>) -> ReshapeForwards {
     let mut verdicts = std::collections::HashMap::new();
     let mut consumed = std::collections::HashSet::new();
     for op in f.ops_deep() {
-        if op.op_type != OpKind::TensorReshape {
+        // The C-order reframe class: `tensor.reshape`, and an `expand_shape`/`collapse_shape` no
+        // broadcast chain consumed (see the doc above — one lens law, three spellings).
+        if !matches!(
+            op.op_type,
+            OpKind::TensorReshape | OpKind::TensorExpandShape | OpKind::TensorCollapseShape
+        ) {
             continue;
         }
         let Some(res) = op.result else { continue };
@@ -3262,14 +3281,25 @@ pub fn lower_function(
     for op in f.operations.iter() {
         // ⭐ AN INDEXED STORE — a `ktdp.store` through a scatter tile — lowers HERE, at its own
         // program position, so a later gather of the same table reads what it wrote (dxp program
-        // order is call order).
+        // order is call order). The copied rows come from a parameter load OR from a value this
+        // walk MINTED (the compute arm declines to bind a scattered producer's window — the rows
+        // land at the index's chosen rows, not the producer's own — so the producer minted an
+        // intermediate and the copy reads it): the value reads through reshape hops exactly as
+        // the write-back copy's does, then the mint lookup is the walk's own map, never a second
+        // derivation.
         if op.op_type == OpKind::KtdpStore
             && let Some(sc) = scatters
                 .iter()
                 .find(|s| op.operands.get(1) == Some(&s.tile))
         {
-            ctx.ops
-                .push(lower_indexed_write(k, sc, ctx.sym_id_base, ctx.layout)?);
+            let mut cur = sc.value;
+            while let Some(&next) = reshape_hops.get(&cur) {
+                cur = next;
+            }
+            let minted = inter.get(&cur).copied();
+            let mut legs =
+                lower_indexed_write(k, sc, minted, ctx.sym_id_base, ctx.layout)?;
+            ctx.ops.append(&mut legs);
             continue;
         }
         // ⭐⭐⭐ A STORE OF A SPLATTED CONSTANT — a FILL, the store-side member of the
@@ -4183,6 +4213,23 @@ pub fn lower_function(
             fp8_epilogue.insert(mulf_res);
             stored = Some(mulf_store);
         }
+        // ⭐⭐⭐⭐⭐ AND NOT THROUGH AN INDEXED WRITE. A `ktdp.store` through an indirect tile (a
+        // scatter) is not this op's window: its rows land at the rows the INDEX names, not at the
+        // op's own, so binding the producer's output to the indexed table would emit the body
+        // sweeping the whole table in row order — the permutation silently undone. The value is
+        // minted as the intermediate it is (the not-stored arm below), and the indexed write
+        // itself lowers at the STORE's own program position (the `scatters` arm at the top of the
+        // walk), copying the mint's rows into the table through the index — the same
+        // mint-then-copy-at-the-store law the write-back copy below states for a result other ops
+        // still read. This runs AFTER the fp8 epilogue arm so that arm's `stored.is_none()` gate
+        // is untouched: an fp8 contraction's scale multiply stores through a plain tile today,
+        // and a producer that scatters it is a new form for THAT arm to refuse by name.
+        if op.result.is_some()
+            && let Some(s) = stored
+            && scatters.iter().any(|sc| s.operands.get(1) == Some(&sc.tile))
+        {
+            stored = None;
+        }
         let Some(store) = stored else {
             // NOT STORED => AN INTERMEDIATE. Mint a buffer for it, declare it to the layout, and
             // record it so the consuming op finds it as an input.
@@ -4494,21 +4541,30 @@ pub fn lower_function(
 }
 
 /// ⭐ ONE INDEXED WRITE — [`super::assemble_indexed_write`] over the scatter's own facts. The
-/// stored rows must be a LOAD of a parameter (a value this walk has a region for at a whole-tensor
-/// corner); the table and the index are the tile's own parameters.
+/// stored rows come from a LOAD of a parameter (a value this walk has a region for at a
+/// whole-tensor corner) or from a value the walk MINTED — the intermediate a scattered producer's
+/// result became (the compute arm's indexed-write law: the rows land at the index's chosen rows,
+/// so the producer's window is never the table's) — resolved by the caller through the walk's own
+/// reshape hops and mint map; the table and the index are the tile's own parameters. Returns the
+/// LEGS the emitter cuts (one op per index stick), in order.
 fn lower_indexed_write(
     k: &KtirNode,
     sc: &super::lower_ktir_to_superdsc::Scatter,
+    minted: Option<Region>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<super::EmittedOp, Error> {
+) -> Result<Vec<super::EmittedOp>, Error> {
     let f = &k.func;
-    let Some(src) = region_for_operand(k, sc.value)? else {
-        return err(format!(
-            "{}: the indexed store's value is not a load of a parameter — an indexed write copies \
-             rows a parameter holds",
-            f.name
-        ));
+    let src = match region_for_operand(k, sc.value)? {
+        Some(r) => r,
+        None => minted.ok_or_else(|| Error {
+            message: format!(
+                "{}: the indexed store's value is neither a load of a parameter nor a value this \
+                 walk minted — an indexed write copies rows a parameter holds or rows a minted \
+                 intermediate holds, and anything else is a producer form it cannot source",
+                f.name
+            ),
+        })?,
     };
     // ⛔ THE SOURCE IS READ FROM ITS BASE, so a row window elsewhere is refused by name rather
     // than copied from row 0.
@@ -4548,6 +4604,8 @@ fn lower_indexed_write(
             message: format!("{}: {m}", f.name),
         })?;
     let name = format!("{}_scatter_t{}", f.name, sc.value_tid);
+    // The legs carry the emitter's own `_s{k}` names and stay in cut order; the walk appends them
+    // at the store's own program position (dxp program order is call order).
     super::assemble_indexed_write(
         super::IndexedWrite {
             op_name: &name,
@@ -5831,9 +5889,13 @@ mod reshape_forward_tests {
     use ktir_core::dtypes::DType;
     use ktir_core::irtype::IrType;
 
-    /// One straight-line function: the argument `Ssa(0)` of type `src_dims` reshaped to
-    /// `target_dims`, the result `Ssa(1)`.
-    fn reshaped(src_dims: &[i64], target_dims: &[i64]) -> &'static IRFunction<'static> {
+    /// One straight-line function: the argument `Ssa(0)` of type `src_dims` reframed to
+    /// `target_dims` by `kind`, the result `Ssa(1)`.
+    fn reframed(
+        kind: OpKind,
+        src_dims: &[i64],
+        target_dims: &[i64],
+    ) -> &'static IRFunction<'static> {
         let a: &'static Arena = Arena::global();
         let f16 = |dims: &[i64]| IrType::Tensor {
             dims: a.ints(dims.to_vec()),
@@ -5841,7 +5903,7 @@ mod reshape_forward_tests {
         };
         let op = Operation {
             result: Some(Ssa(1)),
-            op_type: OpKind::TensorReshape,
+            op_type: kind,
             operands: a.ssa(vec![Ssa(0)]),
             attributes: &[],
             result_type: Some(f16(target_dims)),
@@ -5855,6 +5917,12 @@ mod reshape_forward_tests {
             return_type: None,
         };
         Box::leak(Box::new(f))
+    }
+
+    /// One straight-line function: the argument `Ssa(0)` of type `src_dims` reshaped to
+    /// `target_dims`, the result `Ssa(1)`.
+    fn reshaped(src_dims: &[i64], target_dims: &[i64]) -> &'static IRFunction<'static> {
+        reframed(OpKind::TensorReshape, src_dims, target_dims)
     }
 
     /// ⭐ EVERY FLAT RESHAPE OF THE KERNEL IS THE IDENTITY at its flat presentation — q's
@@ -5960,6 +6028,35 @@ mod reshape_forward_tests {
             panic!("an untyped reshape must be refused, not forwarded blind");
         };
         assert!(msg.contains("no result type"), "names the cause: {msg}");
+    }
+
+    /// ⭐⭐⭐ A DEGENERATE `expand_shape` NO BROADCAST CONSUMED IS THE SAME LENS — the merge tail's
+    /// `merged[None, :, :]` at the one-block batch: `[256, 4] -> [1, 256, 4]` inserts the output's
+    /// own `1`, nothing sprays, so no `linalg.broadcast` exists and the op stands alone. It
+    /// forwards to the source at the identity verdict, exactly as the reshape spelling of the same
+    /// reframe does — and the re-row law still polices the class: an expand that splits the
+    /// single-stick column (`[1024] -> [16, 64]`) is a framing that moves bytes and is refused.
+    #[test]
+    fn a_degenerate_expand_no_broadcast_consumed_is_the_same_lens() {
+        let (forwards, hops, verdicts, consumed) =
+            reshape_forwards(reframed(OpKind::TensorExpandShape, &[256, 4], &[1, 256, 4]));
+        assert_eq!(forwards.get(&Ssa(1)), Some(&Ssa(0)), "forwards to the source");
+        assert_eq!(hops.get(&Ssa(1)), Some(&Ssa(0)), "one hop to the source");
+        assert!(
+            consumed.contains(&Ssa(1)),
+            "the expand result is plumbing the walk skips"
+        );
+        assert!(
+            matches!(verdicts.get(&Ssa(1)), Some(ReshapeFlat::Admitted)),
+            "[256, 4] -> [1, 256, 4] is the identity at the flat presentation"
+        );
+
+        let (_, _, verdicts, _) =
+            reshape_forwards(reframed(OpKind::TensorExpandShape, &[1024], &[16, 64]));
+        assert!(
+            matches!(verdicts.get(&Ssa(1)), Some(ReshapeFlat::Refused(_))),
+            "a column split is not a re-row"
+        );
     }
 
     /// ⭐ A CHAIN RESOLVES TRANSITIVELY — reshape of reshape reads the earlier entry, so the

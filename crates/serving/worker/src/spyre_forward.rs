@@ -847,7 +847,7 @@ impl scratchy_subtile::model_geometry::OnAttnGeometry for FillAtTheGeometry<'_, 
                 .session
                 .step_input_extent(attn_step_slots::KT_BLOCK_IDS),
             v: self.session.step_input_extent(attn_step_slots::V_BLOCK_IDS),
-            rep: self.session.step_input_extent(attn_step_slots::REP_ROW_IDS),
+            rep: self.session.step_input_extent(attn_step_slots::REP),
         };
         // The ceiling from the session's own page stride — the ONE law, handed the card's
         // number (`gather_entry_ceiling` delegates to the same shared spelling the gate uses).
@@ -863,10 +863,21 @@ impl scratchy_subtile::model_geometry::OnAttnGeometry for FillAtTheGeometry<'_, 
         let session = self.session;
         fill(&mut *session, attn_step_slots::KT_BLOCK_IDS, p.kt)?;
         fill(&mut *session, attn_step_slots::V_BLOCK_IDS, p.v)?;
-        if let Some(rep) = p.rep {
-            fill(&mut *session, attn_step_slots::REP_ROW_IDS, rep)?;
-        }
         fill(&mut *session, attn_step_slots::MASK, p.mask)?;
+        // The decode row's own fourth slot — filled IFF DECLARED, and the builder already
+        // refused every inconsistent declaration (a batch row that declared none, a chunk
+        // row that declared one), so reaching here with the slot declared means the bytes
+        // are the bridge's own. An empty payload over a declared slot is the desync the
+        // builder's refusals exist to make impossible — refused here, never defaulted.
+        if extents.rep.is_some() {
+            if p.rep.is_empty() {
+                return Err(werr(format!(
+                    "{what}: the repetition-table slot is declared but the builder staged \
+                     no bytes — a batched decode row with no bridge is a bake/host desync"
+                )));
+            }
+            fill(&mut *session, attn_step_slots::REP, p.rep)?;
+        }
         Ok(())
     }
 }

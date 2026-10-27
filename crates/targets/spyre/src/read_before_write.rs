@@ -271,6 +271,7 @@ mod tests {
             is_input,
             footprint_bytes: bytes,
             touched: TouchedBlocks {
+                start_bytes: 0,
                 run_bytes: bytes,
                 outer: Vec::new(),
             },
@@ -310,7 +311,11 @@ mod tests {
             buffer: name.to_string(),
             is_input,
             footprint_bytes: run_bytes,
-            touched: TouchedBlocks { run_bytes, outer },
+            touched: TouchedBlocks {
+                start_bytes: 0,
+                run_bytes,
+                outer,
+            },
             offset_elems: 0,
             segment: SegRole::Intermediate.segment(),
             bank: 0,

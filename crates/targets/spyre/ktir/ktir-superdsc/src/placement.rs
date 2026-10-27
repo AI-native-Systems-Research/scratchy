@@ -312,6 +312,71 @@ pub struct KvBlockIndexReservation {
     pub block_bytes: u64,
 }
 
+/// ⭐⭐⭐ THE BATCHED REP TABLE, HELD UNPLACED — the SECOND activation a session's bodies may
+/// legitimately disagree about, which is why its offset cannot be taken where the other step
+/// inputs take theirs.
+///
+/// Only a batched decode row states the rep (`attn_step_slots::REP`: the bridge from the
+/// request-major score row to the head-major q/o row — an identity at one request, so the solo
+/// decode changes no bytes and states no slot; the paged-fold body states the same three slots
+/// the solo path does and no rep), while the host binds every step at the CEILING bundle's
+/// placements — so the rep's PRESENCE must move nothing the host stages. The KV block index's
+/// law ([`KvBlockIndexReservation`]), restated for a law-numbered tid: the reservation is
+/// carried as a VALUE, no offset is taken for it where the other step inputs take theirs (the
+/// consumer's `place_step_inputs` defers the rep slot), and the one placement door is
+/// [`BundleLayout::place_rep_table_last`], called AFTER `place_kv_block_index_last`. A
+/// reservation still pending at the bake is a `cargo build` panic, never a silently unplaced
+/// table: a batched score read with no rep reads stick 0 — which is a real address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RepTableReservation {
+    /// The numbering law's own tid for the rep slot (`step_input_tid(n_graph_tensors, REP)`) —
+    /// law-derived per graph, never a constant, which is why the reservation carries it.
+    pub tid: u32,
+    /// The staged buffer's WHOLE extent — the region's rows × cols × word length, the same
+    /// derivation `place_step_inputs` sizes every step input by. The door places exactly this
+    /// many bytes and mints the same `==`-extent cover the inline path would.
+    pub bytes: u64,
+}
+
+impl RepTableReservation {
+    /// ⭐⭐⭐⭐⭐ THE IDX2ADDR REACH — the bytes the CARD reads of an index table, WIDER than the
+    /// table the host stages whenever the table spans more than one index stick.
+    ///
+    /// dxp lowers every gather/scatter through `createIdx2AddrSdsc`
+    /// (`dbo/src/Transforms/sdsc_bundle/GatherIndexConversion.cpp:108`), whose conversion SDSC
+    /// takes its `N_` **from the gather op's own `N_`** (divided by the index's page sizes, then
+    /// rounded UP to the index's stick), and `allocateAndModifyGather`
+    /// (`dbo/src/Utils/sdsc_bundle/GatherBuffers.cpp`) reads that input as ONE CONTIGUOUS RUN of
+    /// that many entries from the MINIMUM of the index's per-core start addresses. The leg cuts
+    /// state each leg's op `N_` at the TABLE's row count (the gather cut's measured `node_rows`
+    /// law; the scatter's `N_` carry), so EVERY leg's conversion reads a table-sized run from the
+    /// LEG's own stick base: the last leg's run ends `(sticks − 1)` sticks of base plus `sticks`
+    /// sticks of run — `(2·sticks − 1)` sticks in all, and that is this number.
+    ///
+    /// The entries past the table's end are converted but never dereferenced (the work division
+    /// consumes only the leg's own rows), which is why the embedding's card-proven eight-leg
+    /// gather reads 896 B past its 1024 B ids table with byte-exact results — its table had
+    /// mapped bytes after it. A table placed at a SEGMENT TAIL has none, and the read faults
+    /// (measured, granite-3.1-2b at 2 requests: `HMI=FETCH` at the rep's second index stick, the
+    /// stream dead, the rung flush refused) — so the ONE table this reservation places, at the
+    /// activation segment's tail, is placed and staged whole at the reach, the host padding the
+    /// tail with zeros (a zero converts to the value's own base — the most benign address there
+    /// is, and an unused one).
+    ///
+    /// `view_bytes` is the table's own extent as the program's view states it (rows × cols ×
+    /// word length); `word_length` is that view's element length. A one-stick table's reach is
+    /// itself, so every one-stick width (the solo decode's identity rep) is byte-identical.
+    pub fn reach_bytes(view_bytes: u64, word_length: u64) -> u64 {
+        if view_bytes == 0 {
+            return 0;
+        }
+        let cap = u64::from(crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP);
+        let stick = cap * word_length;
+        let sticks = (view_bytes / word_length).div_ceil(cap);
+        (2 * sticks - 1) * stick
+    }
+}
+
 /// The whole-bundle memory plan: every tensor → (segment, offset, size, role),
 /// plus each segment's total packed bytes. Exported as `bundle_layout.json` for
 /// the resident executor (which allocates one region per occupied segment).
@@ -506,6 +571,13 @@ pub struct BundleLayout {
     /// the pending value.
     #[serde(skip)]
     pub kv_block_index: Option<KvBlockIndexReservation>,
+    /// ⭐ THE BATCHED REP TABLE'S PENDING RESERVATION — carried UNPLACED out of the placement
+    /// pass ([`RepTableReservation`] states why: the rep slot is the one step input whose
+    /// PRESENCE differs between a session's bodies), spent by the one door
+    /// [`BundleLayout::place_rep_table_last`] after the KV block index. Compile-time only: the
+    /// baked artifact carries the PLACEMENT the door mints, not the pending value.
+    #[serde(skip)]
+    pub rep_table: Option<RepTableReservation>,
     /// ⭐ THE PAGED-FOLD REGION'S PAGE CEILING — the ONE derivation, recorded where the prefix
     /// mask's pass grid is sized: the device's own cap over this bundle's page bytes (a pool is
     /// a single flex region) BOUNDED BY the pool this graph actually laid (its cache tensor's
@@ -1286,6 +1358,57 @@ impl BundleLayout {
                     block_bytes: res.block_bytes,
                 },
             },
+        );
+        self.segment_bytes[seg] = align128(off + res.bytes);
+    }
+
+    /// ⭐⭐⭐ THE REP TABLE'S ONE PLACEMENT DOOR — the last host-staged activation after the KV
+    /// block index.
+    ///
+    /// ⛔ WHY A DOOR, AND WHY AFTER `place_kv_block_index_last`. The rep slot
+    /// (`attn_step_slots::REP`) is the ONE step input whose presence differs between a
+    /// session's bodies: a batched decode row states it (the request-major → head-major row
+    /// bridge), while the paged-fold body and every one-request or prefill row state no rep at
+    /// all — and the host binds each step at the CEILING's placements, so
+    /// `ladder_stages_one_layout` exempts the rep from its comparison (per layout, through the
+    /// layout's own step-input rows). That exemption is sound ONLY if the rep's presence moves
+    /// nothing the guard compares. Placed inline where the other step inputs take their
+    /// offsets, it pushed every LATER host-staged tensor (the program-stated scales) down by
+    /// its extent (4,096 B on granite-3.1-2b at 32 requests), and the guard refused the fold
+    /// body — the rung that lawfully mints no rep. Called AFTER
+    /// [`Self::place_kv_block_index_last`], a batched body's rep lands past every compared
+    /// offset and a body that states none simply has none — the exemption holds by
+    /// construction, and every batched body of the session places its rep at the SAME tail
+    /// (their compared placements agree, so their tails agree), which is the offset the host
+    /// stages the table at for all of them.
+    ///
+    /// The identity row arrives HERE, with the placement, never at the deferral: a placement
+    /// without it is invisible to `resolve_seg_base`, and a row without a placement resolves to
+    /// nothing — the two halves of one address mint together or not at all.
+    pub fn place_rep_table_last(&mut self) {
+        let Some(res) = self.rep_table.take() else {
+            return;
+        };
+        let seg = SegRole::Activation.segment();
+        let off = self.segment_bytes[seg];
+        self.placements.insert(
+            res.tid,
+            TensorPlacement {
+                tid: res.tid,
+                bank: 0,
+                role: SegRole::Activation,
+                segment: seg,
+                offset: off,
+                size: res.bytes,
+                // ⭐ FULL — a spliced step input is filled through `fill_step_input`, whose
+                // extent law is `==` exactly; the same cover `place_step_inputs` mints for
+                // every slot it places inline.
+                cover: BindCover::Full,
+            },
+        );
+        self.ids.borrow_mut().insert(
+            crate::place::act_name(res.tid),
+            crate::place::PlaceId::Act(res.tid),
         );
         self.segment_bytes[seg] = align128(off + res.bytes);
     }

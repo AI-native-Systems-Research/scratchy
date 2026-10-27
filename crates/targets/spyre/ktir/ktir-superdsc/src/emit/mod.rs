@@ -1874,8 +1874,38 @@ fn one_gathered_leg(
 /// `skip_addr` is one table row; the work split is [`crate::work::GatherSplit`]'s, `mb` only, for
 /// the same `skip_addr` reason the gather leg states.
 ///
-/// ⛔ ONE INDEX STICK: a scatter of more rows than one `SenUint32` stick of entries is refused by
-/// name — the IBR loads a single stick, the gather leg's measured `ids[r mod 32]` wrap.
+/// ⭐⭐⭐ THE CUT: ONE OP PER INDEX STICK, EACH COPYING A **ROW WINDOW** OF THE SOURCE — the store
+/// twin of [`assemble_pointwise_broadcast_gather`]'s own cut, for the same measured reason: dxp
+/// fills the L3LU IBR with a single stick transfer and each core indexes it at its own work-slice
+/// word, so entries past the first `ENTRIES_PER_OP` WRAP. Leg `k` declares one stick of index
+/// (`run.leg(k)`), copies source rows `[k·cap, (k+1)·cap)` (the row window through
+/// `AnyTensorArg::set_offset_elems`, the gather leg's own law stated for the input), and writes
+/// them wherever that stick's index entries name — the table needs no window, the index IS its
+/// addressing. `N_` carries the TABLE's own row count on every leg, the gather cut's
+/// `node_rows` law: `maxDimSizes_ = -1` reconstructs the stick-blocked `device_size` from `N_`'s
+/// `mb_`, and a leg left at its own `cap` rows strides the table's stick planes by `cap` rows.
+///
+/// ⭐⭐⭐⭐⭐ THE RUN'S COVERAGE, STATED ON THE LAST LEG'S OUTPUT BINDING. The read-before-write walk
+/// models an op's writes from its bindings' own `touched` blocks, and the door stamps those from
+/// the op's ITERATION — `leg_rows` contiguous rows at the table's corner — because the entries the
+/// index names are runtime data no bake can read. That model is a LIE for an indexed write: the
+/// leg writes wherever its stick of entries names, and at `rows > cap` every leg stamps the SAME
+/// corner interval, so the walk sees one leg's worth of coverage and refuses the consumer's read
+/// of the rest of the table (measured at `decode_rows=32`: the 32 legs covered one 4096-byte
+/// corner of the 131072-byte landing and the walk refused the reshape's read of the upper half).
+/// What IS stated at bake time is the RUN's coverage law: the entries enumerate the table's rows
+/// at a UNIFORM row stride of `table_rows / rows` — the repetition table's own mint law (the
+/// staging builder contributes one entry per (slab, score-row) pair, `head_major·SLABS + slab`,
+/// bijective onto `[0, table_rows)` per slab slice, its byte size pinned to `table_rows` words by
+/// the extent check where it is staged). At `SLABS == 1` that is the dense full table; at
+/// `SLABS > 1` one slab's run writes every `SLABS`-th row and the runs tile the table. The
+/// binding is the walk's only carrier, so the LAST leg's output binding states the run's
+/// coverage — `rows` one-row blocks at `stride_rows·row_bytes`, anchored at the row the run's
+/// slice begins — and only the last leg's, because that is the op at which the run's writes are
+/// complete: a reader between the legs is refused, the conservative direction (an overstated
+/// write is the one that hides bugs, the [`TouchedBlocks`] law). A table whose row count does
+/// not divide the run's entries, or a run whose entry anchor does not divide by them, is
+/// refused here rather than stated with a pattern the mint law does not back.
 pub struct IndexedWrite<'a> {
     pub op_name: &'a str,
     pub rows: u32,
@@ -1895,7 +1925,7 @@ pub fn assemble_indexed_write(
     w: IndexedWrite<'_>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, SuperDscError> {
+) -> Result<Vec<EmittedOp>, SuperDscError> {
     let IndexedWrite {
         op_name,
         rows,
@@ -1908,69 +1938,179 @@ pub fn assemble_indexed_write(
     } = w;
     let page = crate::superdsc_opspec::PageExtent::single_position();
     let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
-    if rows > cap || run.sticks() != 1 {
-        return Err(SuperDscError(format!(
-            "{op_name}: an indexed write of {rows} rows over a run of {} stick(s) — ONE op's index is \
-             ONE {cap}-entry stick (the IBR loads a single stick transfer and entries past it wrap). \
-             Write at most {cap} rows per indexed store.",
-            run.sticks()
-        )));
-    }
-    let tile_op =
-        crate::emit::lower_ktir_to_superdsc::pointwise_tile_op(rows, cols, 1, 2, Df::Fp16);
-    let split = crate::work::GatherSplit::over_entries(
-        &tile_op.dims,
-        crate::superdsc_opspec::MAX_CORES,
-        page.get(),
-    )
-    .map_err(|e| SuperDscError(format!("{op_name}: {e}")))?;
-    // The write's rows are the scatter's entries and its cols the source row's width — the wide
-    // doors, named once at the one `rb` spend.
-    let src_h = rb(
-        src,
-        RowCount::of_token_rows(rows),
-        BlockCols::of_feature_cols(cols),
-    );
-    let inputs = [In::full(&src_h).ew()];
-    let mut op = pointwise_broadcast_opspec_from_tile(
-        &tile_op,
-        rows,
-        cols,
-        op_func_from_str("identity"),
-        &inputs,
-        table,
-        crate::addr::OutCorner::ZERO,
-        false,
-        layout,
-        crate::work::CoreDivision::Gathered(split),
-    )
-    .map_err(SuperDscError)?;
-    op.attach_scatter_index(crate::superdsc_opspec::GatherIndex {
-        name: index_name.to_string(),
-        entry_dim: crate::superdsc_opspec::KernelAxis::Batch,
-        page,
-        per_position: None,
-        first_entry: run.start(),
-    })
-    .ok_or_else(|| {
-        SuperDscError(format!(
-            "{op_name}: the scatter declaration was refused — the op's plan has no `mb` dim for the \
-             entries to enumerate"
-        ))
-    })?;
     // ⛔ A TABLE WIDER THAN ONE STICK IS REFUSED: its stick-plane stride is reconstructed from
-    // `N_`, which this op states at its own `rows` — the gather leg's measured plane-stride trap.
-    // One stick wide, there is one plane and no stride to get wrong.
+    // `N_`, which a leg states at its own `cap` rows — the gather leg's measured plane-stride
+    // trap. One stick wide, there is one plane and no stride to get wrong.
     if cols > Fp16::ELEMS_PER_STICK {
         return Err(SuperDscError(format!(
             "{op_name}: an indexed write into a {cols}-wide table ({table_rows} rows) — wider than \
              one {}-element stick, so the table's stick-plane stride would be reconstructed from \
-             this op's {rows}-row `N_` instead of the table's {table_rows}",
-            Fp16::ELEMS_PER_STICK
+             a leg's own row count instead of the table's {}",
+            Fp16::ELEMS_PER_STICK, table_rows
         )));
     }
-    let folds = SdscFoldSet::new(op.iter.cores_used());
-    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+    // The cut: `cap` rows per leg, one index stick each, the run's own leg `k` naming the stick.
+    let legs = rows.div_ceil(cap);
+    // ⛔ THE RUN'S COVERAGE — the stride pattern the entries enumerate the table at, from the
+    // repetition table's mint law (stated in the struct doc): one slab's run is `rows` one-row
+    // blocks at a row stride of `table_rows / rows`, ANCHORED at the row its slice begins,
+    // `first_entry / rows` (the table is laid out slab-major, one `rows`-entry slice per slab,
+    // and the slice's entries are `head_major·SLABS + slab`). Both divisibility facts are that
+    // law — a table or a run whose arithmetic does not state them has no coverage this door can
+    // claim for the read-before-write walk, and guessing one would stamp the write table with
+    // bytes no host mint guarantees.
+    let first = u64::from(run.start().entries());
+    if rows == 0 || table_rows % rows != 0 || first % u64::from(rows) != 0 {
+        return Err(SuperDscError(format!(
+            "{op_name}: an indexed write of {rows} rows over a run beginning at index entry \
+             {first} into a {table_rows}-row table — the run's entries enumerate the table at a \
+             uniform stride of table_rows/rows anchored at first_entry/rows, and \
+             ({table_rows} mod {rows}, {first} mod {rows}) is not (0, 0). The repetition table's \
+             mint law backs exactly that pattern; an indexed write of any other shape has no \
+             coverage this door can state for the read-before-write walk"
+        )));
+    }
+    let stride_rows = table_rows / rows;
+    let row_bytes = u64::from(cols) * Df::Fp16.word_length() as u64;
+    let coverage = TouchedBlocks {
+        start_bytes: (first / u64::from(rows)) * row_bytes,
+        run_bytes: row_bytes,
+        outer: vec![(u64::from(rows), u64::from(stride_rows) * row_bytes)],
+    };
+    let mut ops: Vec<EmittedOp> = Vec::with_capacity(legs as usize);
+    let mut first_row = 0u32;
+    for k in 0..legs {
+        // The LAST leg may be SHORT — a short index run is the vendor's own shape
+        // (`test_gather_1core` at 3 entries), the same tail law the gather cut states.
+        let leg_rows = (rows - first_row).min(cap);
+        let leg_name = format!("{op_name}_s{k}");
+        let tile_op =
+            crate::emit::lower_ktir_to_superdsc::pointwise_tile_op(leg_rows, cols, 1, 2, Df::Fp16);
+        let split = crate::work::GatherSplit::over_entries(
+            &tile_op.dims,
+            crate::superdsc_opspec::MAX_CORES,
+            page.get(),
+        )
+        .map_err(|e| SuperDscError(format!("{op_name}: leg `{leg_name}`: {e}")))?;
+        // The leg's source window: `leg_rows` rows of the same stick-major `[rows, cols]` source.
+        let src_h = rb(
+            src,
+            RowCount::of_token_rows(leg_rows),
+            BlockCols::of_feature_cols(cols),
+        );
+        let inputs = [In::full(&src_h).ew()];
+        let mut op = pointwise_broadcast_opspec_from_tile(
+            &tile_op,
+            leg_rows,
+            cols,
+            op_func_from_str("identity"),
+            &inputs,
+            table,
+            crate::addr::OutCorner::ZERO,
+            false,
+            layout,
+            crate::work::CoreDivision::Gathered(split),
+        )
+        .map_err(SuperDscError)?;
+        // ⭐⭐⭐ THE SOURCE'S ROW WINDOW — the gather leg's output-window law, stated for the
+        // input: row `r` of a stick-major `[R, C]` tensor begins at element `r · lanes`, and the
+        // offset goes through `AnyTensorArg::set_offset_elems` (NOT the builder's `out_offset`,
+        // which would drop the operand to the rank-3 flat presentation) so the leg's descriptor
+        // keeps the form the uncut op declares. Arg 0 is the source; the table is addressed by
+        // the INDEX, so it keeps the zero corner.
+        if first_row > 0 {
+            let lanes = tile_op.df.elems_per_stick();
+            let off = first_row.checked_mul(lanes).ok_or_else(|| {
+                SuperDscError(format!(
+                    "{op_name}: leg `{leg_name}`'s row base {first_row} x {lanes} lanes overflows \
+                     an element offset"
+                ))
+            })?;
+            op.args
+                .first_mut()
+                .ok_or_else(|| {
+                    SuperDscError(format!(
+                        "{op_name}: leg `{leg_name}` has no operands, so it has no source to move"
+                    ))
+                })?
+                .set_offset_elems(off);
+        }
+        let ia = op
+            .attach_scatter_index(crate::superdsc_opspec::GatherIndex {
+                name: index_name.to_string(),
+                entry_dim: crate::superdsc_opspec::KernelAxis::Batch,
+                page,
+                per_position: None,
+                // ⭐ THE RUN'S OWN LEG `k` — one stick, `k` sticks in, both facts from the run
+                // itself ([`StickRun::leg`]): leg `k` reads index words
+                // `[start + k·cap, start + k·cap + leg_rows)`, and dropping either term is every
+                // leg reading the run's first stick (the `EntryBase` type exists because the
+                // run-half of that happened, measured on the gather side).
+                first_entry: run.leg(k).map_err(SuperDscError)?.start(),
+            })
+            .ok_or_else(|| {
+                SuperDscError(format!(
+                    "{op_name}: leg `{leg_name}`: the scatter declaration was refused — the op's \
+                     plan has no `mb` dim for the entries to enumerate"
+                ))
+            })?;
+        let entry_axis = ia.entry_dim.dim();
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let mut emitted = emit_sdsc_tiled(&leg_name, &op, &folds, sym_id_base, layout)?;
+        // ⭐⭐⭐⭐⭐ `N_` CARRIES THE **TABLE'S** ROW COUNT, NOT THE LEG'S — the gather cut's
+        // `node_rows` law, stated for the scatter: the reconstruction `maxDimSizes_ = -1` names
+        // reads `N_`'s `mb_`, and a leg left at its own `cap` strides the table's stick planes
+        // by `cap` rows (the gather's measured 0.017013 trap). The work division, the per-core
+        // starts and the index's own `cap`-entry extent keep the LEG's rows — they are its work.
+        if table_rows != leg_rows
+            && let Some(dsc) = emitted.op.as_mut()
+        {
+            for dsc_map in dsc.dscs_.iter_mut() {
+                for d in dsc_map.values_mut() {
+                    set_iter_dim(&mut d.N_, entry_axis, table_rows);
+                }
+            }
+        }
+        // ⭐⭐⭐⭐⭐ AND THE LEGS' OUTPUT BINDINGS CARRY THE RUN'S COVERAGE, NOT THEIR OWN — the law
+        // the struct doc states. The scatter declares the output LAST (`[src, index, table]`, the
+        // insertion law), so the final binding is the table's; anything else there is an emission
+        // defect this cut refuses rather than stamps the run's coverage on the wrong buffer. The
+        // LAST leg states the run's coverage — the op at which the run's writes are complete — and
+        // every EARLIER leg states NONE: its writes are runtime-addressed, and the door's own
+        // `leg_rows`-contiguous-at-the-corner model would claim bytes the entries may not name
+        // (the overstatement direction the [`TouchedBlocks`] law refuses). A reader between the
+        // legs stays refused, the conservative direction.
+        {
+            let out = emitted.arg_bindings.last_mut().ok_or_else(|| {
+                SuperDscError(format!(
+                    "{op_name}: leg `{leg_name}` binds no operands, so it has no output binding to \
+                     state the run's coverage on"
+                ))
+            })?;
+            if out.buffer != table || out.is_input {
+                return Err(SuperDscError(format!(
+                    "{op_name}: leg `{leg_name}`'s last binding is '{}', not the written table \
+                     '{table}' — the scatter declares the output last ([src, index, table]), so a \
+                     different operand there is an emission defect this cut refuses rather than \
+                     stamps the run's coverage on the wrong buffer",
+                    out.buffer
+                )));
+            }
+            if k + 1 == legs {
+                out.footprint_bytes = u64::from(rows) * row_bytes;
+                out.touched = coverage.clone();
+            } else {
+                out.touched = TouchedBlocks {
+                    start_bytes: 0,
+                    run_bytes: 0,
+                    outer: Vec::new(),
+                };
+            }
+        }
+        ops.push(emitted);
+        first_row += leg_rows;
+    }
+    Ok(ops)
 }
 
 /// The per-chunk OUTPUT column offset (in elements) the emitter must apply for a
@@ -2595,6 +2735,9 @@ pub fn declared_axis_block_steps(v: &crate::superdsc_opspec::ArgView, iter: &Wor
 /// ACCEPTING real gaps. Overstating a write is the direction that hides bugs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TouchedBlocks {
+    /// The byte offset of the FIRST block — an anchored stride pattern (an indexed write whose
+    /// run starts partway into the table) begins there, not at the operand's base.
+    pub start_bytes: u64,
     /// The contiguous run at each block, in bytes.
     pub run_bytes: u64,
     /// `(count, stride_bytes)` per outer axis this op sweeps more than once.
@@ -2604,7 +2747,7 @@ pub struct TouchedBlocks {
 impl TouchedBlocks {
     /// Every block's byte offset from the operand's base.
     pub fn offsets(&self) -> Vec<u64> {
-        let mut offs = vec![0u64];
+        let mut offs = vec![self.start_bytes];
         for &(count, stride) in &self.outer {
             let mut next = Vec::with_capacity(offs.len() * count.max(1) as usize);
             for &o in &offs {
@@ -2659,6 +2802,7 @@ pub fn touched_blocks(v: &crate::superdsc_opspec::ArgView, iter: &WorkPlan) -> T
         }
     }
     TouchedBlocks {
+        start_bytes: 0,
         run_bytes: run,
         outer,
     }

@@ -447,19 +447,36 @@ fn audit_layout_addresses(
 }
 
 /// ⛔⛔⛔ ONE SESSION STAGES ONE LAYOUT — every ladder rung must place every host-staged ACTIVATION
-/// exactly where the ceiling does, the gather's own index excepted.
+/// exactly where the ceiling does, the gather's own index and the batched rep table excepted.
 ///
 /// A decode session's host binds each step at the CEILING bundle's placements, whichever rung body it
 /// then launches, while that body's descriptors were emitted against its OWN layout. A tensor the two
 /// place apart is read by the body from bytes the host never wrote there — a clean bake, no fault, a
-/// wrong constant. The one tensor allowed to differ is [`KV_BLOCK_INDEX_TID`]: only a gathering body
-/// places it, only a gathering step stages it, and [`compute_bundle_layout`] places it LAST so it moves
-/// nothing else. The macro calls this on every rung it bakes, so a disagreement is a build failure.
+/// wrong constant. Two tensors are allowed to differ. One is [`KV_BLOCK_INDEX_TID`]: only a gathering
+/// body places it, only a gathering step stages it, and [`compute_bundle_layout`] places it LAST so it
+/// moves nothing else. The other is the batched decode row's REP TABLE (`attn_step_slots::REP`, a
+/// law-numbered tid, so the exemption is looked up per layout through that layout's own step-input
+/// rows): only a batched decode row states it, only a batched decode step stages it, and
+/// [`compute_bundle_layout`] places it LAST — after the KV block index — so it moves nothing else
+/// either. The macro calls this on every rung it bakes, so a disagreement is a build failure.
 pub fn ladder_stages_one_layout(ceiling: &BundleLayout, rung: &BundleLayout) -> Result<(), String> {
     let staged = |l: &BundleLayout| -> Vec<(u32, usize, u64, u64)> {
+        // ⭐ THE REP'S OWN TID, FROM THIS LAYOUT'S OWN STEP-INPUT ROWS — the rep slot is
+        // stated by this layout's own programs or by none of them, so the lookup answers
+        // per layout and never needs a constant tid (the numbering law derives it from the
+        // graph's own tensor count).
+        let rep = l
+            .step_inputs
+            .iter()
+            .find(|(_, row)| row.slot == ktir_superdsc::sdsc_abstract::attn_step_slots::REP)
+            .map(|(tid, _)| *tid);
         l.placements
             .values()
-            .filter(|p| matches!(p.role, SegRole::Activation) && p.tid != KV_BLOCK_INDEX_TID)
+            .filter(|p| {
+                matches!(p.role, SegRole::Activation)
+                    && p.tid != KV_BLOCK_INDEX_TID
+                    && Some(p.tid) != rep
+            })
             .map(|p| (p.tid, p.segment, p.offset, p.size))
             .collect()
     };
@@ -2167,6 +2184,10 @@ pub fn compute_bundle_layout<F: RopeForm>(
         // derivation above); the walk's `place_kv_block_index_last` spends it after the last
         // host-staged placement.
         kv_block_index,
+        // ⭐ THE BATCHED REP TABLE'S PENDING RESERVATION — None here (no step input has been
+        // stated yet); `place_step_inputs` defers the rep slot onto this field, and the walk's
+        // `place_rep_table_last` spends it after the KV block index.
+        rep_table: None,
         paged_fold_region_pages,
     })
 }
@@ -4110,8 +4131,13 @@ impl scratchy_subtile::model_geometry::OnAttnGeometry for GateStageAtTheGeometry
             leg,
         } = self;
         let pool = sd::PagedKvPool::of_geometry(geom);
-        // The four slots' extents, asked of the session at the numbering law's own tids —
-        // `None` for a slot this bundle's programs never bound.
+        // The slots' extents, asked of the session at the numbering law's own tids —
+        // `None` for a slot this bundle's programs never bound. The repetition table's
+        // slot is queried for the same law the worker queries it: the gate stages only
+        // CHUNK legs, whose builder arm refuses a declared rep slot, so the query here is
+        // what makes that refusal fire on the gate's session too (a bundle that declared
+        // the batch-only slot for a chunk leg is a desync on BOTH runtimes, not just the
+        // card's).
         let extent = |slot: u32| {
             session.source_extent_bytes(u64::from(step_input_tid(n_graph_tensors, slot)))
         };
@@ -4119,11 +4145,11 @@ impl scratchy_subtile::model_geometry::OnAttnGeometry for GateStageAtTheGeometry
             mask: extent(attn_step_slots::MASK),
             kt: extent(attn_step_slots::KT_BLOCK_IDS),
             v: extent(attn_step_slots::V_BLOCK_IDS),
-            rep: extent(attn_step_slots::REP_ROW_IDS),
+            rep: extent(attn_step_slots::REP),
         };
         // The pattern check — the region's derivation below needs the mask extent, and the
         // check itself is the ONE spelling (the builder runs it again; same function).
-        attn_step_staging::chunk_slot_pattern(what, &extents)?;
+        attn_step_staging::slot_pattern(what, &extents)?;
         // The ceiling from the rolled layout's own page stride — the card session's number,
         // through the ONE shared law.
         let ceiling = attn_step_staging::gather_entry_ceiling_for(page_stride_bytes, pool);
@@ -4165,10 +4191,10 @@ impl scratchy_subtile::model_geometry::OnAttnGeometry for GateStageAtTheGeometry
             map,
         };
         let p = attn_step_staging::build_attn_step_inputs(geom, what, &extents, ceiling, rows)?;
-        // Stage each slot at the wire dtype the card's fill channel states — ids and the
-        // repetition table as I32 (the RawU32 channel), the mask as F16 (the IeeeF16
-        // channel) — with the minted length checked against the session's own stick extent
-        // first: the fill door's `==` law, on the gate's session.
+        // Stage each slot at the wire dtype the card's fill channel states — ids as I32 (the
+        // RawU32 channel), the mask as F16 (the IeeeF16 channel) — with the minted length
+        // checked against the session's own stick extent first: the fill door's `==` law, on
+        // the gate's session.
         let mut stage = |slot: u32, dtype: DType, bytes: Vec<u8>| -> Result<(), String> {
             let tid = u64::from(step_input_tid(n_graph_tensors, slot));
             let declared = session.source_extent_bytes(tid);
@@ -4189,9 +4215,6 @@ impl scratchy_subtile::model_geometry::OnAttnGeometry for GateStageAtTheGeometry
         };
         stage(attn_step_slots::KT_BLOCK_IDS, DType::I32, p.kt)?;
         stage(attn_step_slots::V_BLOCK_IDS, DType::I32, p.v)?;
-        if let Some(rep) = p.rep {
-            stage(attn_step_slots::REP_ROW_IDS, DType::I32, rep)?;
-        }
         stage(attn_step_slots::MASK, DType::F16, p.mask)?;
         Ok(())
     }
@@ -6471,6 +6494,13 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // address — so an unspent reservation is a `cargo build` panic (this runs at bake),
         // never a silent `gathers_kv: false`.
         kv_block_index,
+        // ⛔ THE PENDING REP TABLE — SPENT OR REFUSED, never silently dropped (same law as the
+        // KV block index just above). The reservation is placed (or this bundle's rows stated
+        // no rep slot) by the time any bundle bakes; a `Some` here means a walk forgot
+        // [`BundleLayout::place_rep_table_last`]. A batched score read with no table reads
+        // stick 0 — a real address — so an unspent reservation is a `cargo build` panic (this
+        // runs at bake), never a silently unplaced rep.
+        rep_table,
         // EMIT-ONLY: the paged-fold region's page ceiling is the WALK's input — the fact the
         // fold family's tables and mask state their extents against. The baked artifact carries
         // those extents themselves (the step-input placements below), and the runtime's fold
@@ -6483,6 +6513,12 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         "the KV block index reservation reached the bake unplaced — the walk forgot \
          BundleLayout::place_kv_block_index_last, and the placement's presence is \
          BakeFacts::gathers_kv: a gather with no table reads entry 0"
+    );
+    assert!(
+        rep_table.is_none(),
+        "the rep table reservation reached the bake unplaced — the walk forgot \
+         BundleLayout::place_rep_table_last, and a batched score read with no table reads \
+         stick 0"
     );
 
     let mut places: Vec<bundle::Placement> = placements

@@ -1243,6 +1243,13 @@ pub fn lower_graph_to_superdsc<F: RopeForm>(
     // session's bodies, so it must move nothing the host stages. See
     // [`BundleLayout::place_kv_block_index_last`].
     bundle_layout.place_kv_block_index_last();
+    // ⭐⭐⭐ THE REP TABLE GOES LAST OF ALL AFTER IT — the batched decode row's rep slot is the
+    // one STEP INPUT whose presence may differ (the paged-fold body and every one-request or
+    // prefill row state none), so it too must sit past every offset
+    // `ladder_stages_one_layout` compares. See [`BundleLayout::place_rep_table_last`] for the
+    // law; before the door pass below, so a batched score read resolving `t{rep}` finds its
+    // placement.
+    bundle_layout.place_rep_table_last();
     // The four facts no KTIR states, read off the graph's own `AttnDecode` nodes and this walk's own
     // parameters — the same call `lower_subtile_tape_to_ktir`'s re-rolled walk makes.
     //
@@ -1939,32 +1946,81 @@ pub fn place_step_inputs(
                         }
                     }
                     None => {
-                        let off = layout.segment_bytes[seg];
-                        layout.placements.insert(
-                            tid,
-                            TensorPlacement {
+                        // ⭐⭐⭐ THE REP SLOT DEFERS TO THE TAIL — `attn_step_slots::REP` is the
+                        // one step input whose PRESENCE differs between a session's bodies (a
+                        // batched decode row states it; the paged-fold body and every
+                        // one-request or prefill row state none), and the host binds each step
+                        // at the CEILING's placements. Placed inline it shifts every later
+                        // host-staged tensor in exactly the bodies that lack it, which the
+                        // one-layout guard refuses. Held as a reservation, spent by the ONE
+                        // door `BundleLayout::place_rep_table_last` after the KV block index —
+                        // the kv-block-index law, restated for a law-numbered tid. The
+                        // identity row mints at the door, with the placement, never here.
+                        if s.slot == ktir_superdsc::sdsc_abstract::attn_step_slots::REP {
+                            // ⭐⭐⭐ AND THE RESERVATION IS SIZED AT THE IDX2ADDR REACH, NOT THE
+                            // VIEW'S OWN BYTES — the card's index→address conversion reads a
+                            // TABLE-SIZED contiguous run of index words from each gather/scatter
+                            // leg's own stick base (dxp's `createIdx2AddrSdsc` takes its `N_`
+                            // from the OP's, which the leg cuts state at the table's row count),
+                            // so the slot must cover `(2·sticks − 1)` sticks or the last leg's
+                            // run crosses the segment's end — the rep is placed at that tail.
+                            // The law, its C++ cites, and the measured fault live on
+                            // [`RepTableReservation::reach_bytes`]; the host stages the same
+                            // number whole, padding the tail with zeros.
+                            let reach =
+                                ktir_superdsc::placement::RepTableReservation::reach_bytes(
+                                    size,
+                                    df.word_length() as u64,
+                                );
+                            match layout.rep_table {
+                                Some(prev) if prev.tid != tid || prev.bytes != reach => {
+                                    return Err(SuperDscError(format!(
+                                        "{}: t{tid} is stated as a host-staged rep table of \
+                                         {size} B (idx2addr reach {reach} B), but the bundle \
+                                         already reserves it as {} B at t{} — two programs \
+                                         disagree about one buffer's extent",
+                                        e.op_name, prev.bytes, prev.tid
+                                    )));
+                                }
+                                Some(_) => {}
+                                None => {
+                                    layout.rep_table = Some(
+                                        ktir_superdsc::placement::RepTableReservation {
+                                            tid,
+                                            bytes: reach,
+                                        },
+                                    );
+                                }
+                            }
+                        } else {
+                            let off = layout.segment_bytes[seg];
+                            layout.placements.insert(
                                 tid,
-                                bank: 0,
-                                role: SegRole::Activation,
-                                segment: seg,
-                                offset: off,
-                                size,
-                                // ⭐ FULL — a spliced step input is filled through
-                                // `fill_step_input`, whose extent law is `==` exactly; a
-                                // short fill is refused there and would be refused here.
-                                cover: ktir_superdsc::placement::BindCover::Full,
-                            },
-                        );
-                        layout.segment_bytes[seg] = align128(off + size);
-                        // THE IDENTITY ROW, the same one `compute_bundle_layout` writes for every
-                        // tensor it places: a placement without it is INVISIBLE to
-                        // `resolve_seg_base`, which would then treat the program's own parameter as
-                        // an undeclared synthetic. The numbering law already put this tid above
-                        // every graph tensor's, so the name is this buffer's alone.
-                        layout.ids.borrow_mut().insert(
-                            ktir_superdsc::place::act_name(tid),
-                            ktir_superdsc::place::PlaceId::Act(tid),
-                        );
+                                TensorPlacement {
+                                    tid,
+                                    bank: 0,
+                                    role: SegRole::Activation,
+                                    segment: seg,
+                                    offset: off,
+                                    size,
+                                    // ⭐ FULL — a spliced step input is filled through
+                                    // `fill_step_input`, whose extent law is `==` exactly; a
+                                    // short fill is refused there and would be refused here.
+                                    cover: ktir_superdsc::placement::BindCover::Full,
+                                },
+                            );
+                            layout.segment_bytes[seg] = align128(off + size);
+                            // THE IDENTITY ROW, the same one `compute_bundle_layout` writes for
+                            // every tensor it places: a placement without it is INVISIBLE to
+                            // `resolve_seg_base`, which would then treat the program's own
+                            // parameter as an undeclared synthetic. The numbering law already
+                            // put this tid above every graph tensor's, so the name is this
+                            // buffer's alone.
+                            layout.ids.borrow_mut().insert(
+                                ktir_superdsc::place::act_name(tid),
+                                ktir_superdsc::place::PlaceId::Act(tid),
+                            );
+                        }
                     }
                 }
                 match layout.step_inputs.get(&tid) {
@@ -2876,6 +2932,14 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // compares. See [`BundleLayout::place_kv_block_index_last`] for the law; before the
     // declare pass, so a gathered read resolving `t{KV_BLOCK_INDEX_TID}` finds its placement.
     bundle_layout.place_kv_block_index_last();
+    // ⭐⭐⭐ THE REP TABLE GOES LAST OF ALL AFTER IT — the same law the unrolled walk's call
+    // above states: the rep slot is the one STEP INPUT whose presence may differ between a
+    // session's bodies (the batched decode row states it; the paged-fold body minted at this
+    // ladder's `(FULL, None)` rung and every one-request or prefill row state none), so it
+    // must sit past every offset `ladder_stages_one_layout` compares. Before the declare pass,
+    // so a batched score read resolving `t{rep}` finds its placement. See
+    // [`BundleLayout::place_rep_table_last`].
+    bundle_layout.place_rep_table_last();
     // The declare pass walks prefix → EVERY body → suffix, the same order the tape walk
     // declared them in, so every synthetic's first-one-wins offset is fixed identically.
     // The lowered ops are KEPT (the pass computed them and used to drop them): they are

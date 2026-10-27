@@ -19,8 +19,8 @@
 use std::num::NonZeroU32;
 
 use ktir_superdsc::sdsc_abstract::{
-    BatchSlot, ChunkRows, CopyDims, KvHistory, PagedKvPool, RungWidth, SplicedAttnRegion,
-    SplicedDecodeBatch, ValidKeys, spliced_attn_mask_f16, spliced_decode_mask_f16,
+    BatchSlot, ChunkRows, KvHistory, PagedKvPool, RungWidth, SplicedAttnRegion, SplicedBatchRegion,
+    ValidKeys, spliced_attn_mask_f16, spliced_batched_mask_f16,
 };
 
 /// granite-3.1-2b's pool: 8 kv heads at head dim 64.
@@ -149,15 +149,18 @@ fn the_batch_family_counts_its_pre_replicated_rows() {
         w4 >= 4,
         "this geometry must state the window holding a mid-page write slot"
     );
-    let ktb = CopyDims::ENTRIES_PER_OP * nkvh;
-    let per_chunk = u64::from(w4) * u64::from(ktb) * 4;
-    let batch = SplicedDecodeBatch::of_ids_extent(
-        per_chunk * 2,
+    // The batched stick: KTB = seqs·nkvh real entries, PG = KTB·gqa flat score rows — the
+    // region's own page block is W4·PG rows of 64 f16 lanes.
+    let ktb = seqs * nkvh;
+    let pg = ktb * gqa;
+    let block = u64::from(w4) * u64::from(pg) * 64 * 2;
+    let region = SplicedBatchRegion::of_mask_extent(
+        block * 2,
         pool,
         NonZeroU32::new(gqa).expect("gqa is nonzero"),
         NonZeroU32::new(seqs).expect("a batch is nonzero"),
     )
-    .expect("two whole chunk tables at this width is a batch this family states");
+    .expect("two whole page blocks at this width is a region this family states");
     // Ends 70, 200, 9, 0 with the shared write slot at 200: a row spanning slots 192..255 holds
     // invalid-valid-invalid for the shortest history — the count is a COUNT, not a prefix.
     let hists = vec![
@@ -167,9 +170,9 @@ fn the_batch_family_counts_its_pre_replicated_rows() {
         KvHistory::contiguous(0),
     ];
     let write = BatchSlot::of(hists.iter());
-    let mask = spliced_decode_mask_f16(batch, &hists, write)
+    let mask = spliced_batched_mask_f16(region, &hists, write)
         .expect("one history per launch row is a batch this family states");
-    let rows = 2 * w4 as usize * ktb as usize * gqa as usize;
+    let rows = 2 * w4 as usize * pg as usize;
     assert_eq!(mask.rows(), rows);
     assert_eq!(mask.wire_bytes().len(), rows * 64 * 2);
     let bytes = mask.wire_bytes();

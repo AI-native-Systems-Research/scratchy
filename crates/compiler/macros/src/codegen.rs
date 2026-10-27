@@ -11373,18 +11373,20 @@ fn dump_wavefront_mega(
                                     // ⭐ THE CEILING'S PAGED-FOLD STATEMENT — a chunked ladder
                                     // whose rows are ONE REQUEST'S HISTORY (the one-request
                                     // decode rung, or a prompt chunk's positions — the same
-                                    // fact `chunk_requests` reads below) threads the fold
-                                    // region into every rung's step-input extents (the
-                                    // one-layout guard compares them across rungs), and the
-                                    // ceiling is one of those rungs. The ceiling itself is a
-                                    // CHUNK (its `chunk_pages` is the widest chunk), so it is
-                                    // NOT the fold body: `fold_body: false` states the region
-                                    // without minting a family. The `(FULL, None)` rung below
-                                    // the ceiling is the body. A BATCHED decode rung keeps no
-                                    // statement: its rows are separate requests and the fold
-                                    // family is the m>1 follow-up the splice refuses.
+                                    // fact `chunk_requests` reads below) OR A BATCHED DECODE
+                                    // LADDER (its rows are separate requests, and the batched
+                                    // fold family carries them) threads the fold region into
+                                    // every rung's step-input extents (the one-layout guard
+                                    // compares them across rungs), and the ceiling is one of
+                                    // those rungs. The ceiling itself is a CHUNK (its
+                                    // `chunk_pages` is the widest chunk), so it is NOT the
+                                    // fold body: `fold_body: false` states the region without
+                                    // minting a family. The `(FULL, None)` rung below the
+                                    // ceiling is the body — at batched rows it mints the
+                                    // BATCHED fold family, so decode past the widest chunk
+                                    // folds on its own rung.
                                     paged_fold: (chunk_ceiling.is_some()
-                                        && (one_request || prompt_chunk_prefix))
+                                        && (one_request || prompt_chunk_prefix || batch_rows))
                                         .then_some(superdsc::PagedFoldStatement {
                                             fold_body: false,
                                         }),
@@ -11782,18 +11784,24 @@ fn dump_wavefront_mega(
                                                             // ⭐ THE RUNG'S PAGED-FOLD STATEMENT — every
                                                             // rung of a chunked one-request-history
                                                             // ladder (the one-request decode rung, a
-                                                            // prompt chunk's positions) states the
-                                                            // region (`fold_body: false`), and exactly
-                                                            // the `(FULL, None)` rung — the per-page
-                                                            // body the widest chunk's contexts fall
-                                                            // back to — is the fold itself: its
-                                                            // one-shot attention program is REPLACED
-                                                            // by the three-program family (seed,
-                                                            // per-page body, finalize), which the
-                                                            // proof reads off the emitted fold groups.
+                                                            // prompt chunk's positions) or a BATCHED
+                                                            // decode ladder states the region
+                                                            // (`fold_body: false`), and exactly the
+                                                            // `(FULL, None)` rung — the per-page body
+                                                            // the widest chunk's contexts fall back to
+                                                            // — is the fold itself: its one-shot
+                                                            // attention program is REPLACED by the
+                                                            // three-program family (seed, per-page
+                                                            // body, finalize), which the proof reads
+                                                            // off the emitted fold groups. At batched
+                                                            // rows the family is the BATCHED one —
+                                                            // batched decode past the widest chunk
+                                                            // folds on its own rung, never by falling
+                                                            // back to the solo rungs.
                                                             paged_fold: (chunk_ceiling.is_some()
                                                                 && (one_request
-                                                                    || prompt_chunk_prefix))
+                                                                    || prompt_chunk_prefix
+                                                                    || batch_rows))
                                                                 .then(|| {
                                                                     superdsc::PagedFoldStatement {
                                                                         fold_body: matches!(
@@ -11823,16 +11831,20 @@ fn dump_wavefront_mega(
                                                                     p.headmajor_handoff = false;
                                                                     p
                                                                 });
-                                                            // ONE FP per body class; a failed body emit
-                                                            // leaves the rung unbaked — the runtime falls
-                                                            // back to the next rung up.
+                                                            // ⛔ A RUNG WHOSE BODY FAILS TO EMIT
+                                                            // FAILS THE BUILD — the same law as the
+                                                            // lower failure below: a silently dropped
+                                                            // body leaves the rung half-baked for
+                                                            // whatever class survived, and a context
+                                                            // that should have run here falls through
+                                                            // to whatever rung did — a wrong bake
+                                                            // wearing a green one's fingerprints.
                                                             let mut rfps: Vec<String> = Vec::new();
                                                             let mut rfused: Vec<
                                                                 superdsc::bundle::SiblingFp<
                                                                     'static,
                                                                 >,
                                                             > = Vec::new();
-                                                            let mut ok = true;
                                                             for (ci, b) in
                                                                 rr.bodies.iter().enumerate()
                                                             {
@@ -11906,58 +11918,72 @@ fn dump_wavefront_mega(
                                                                     });
                                                                     }
                                                                     Err(e) => {
-                                                                        eprintln!(
-                                                                            "[spyre-superdsc] {base}: \
-                                                                         ladder rung {} chunk={rung_chunk:?} \
-                                                                         body class {ci} emit \
-                                                                         failed: {e}",
+                                                                        // ⛔ A RUNG THAT FAILS TO
+                                                                        // EMIT FAILS THE BUILD —
+                                                                        // the panic names the rung
+                                                                        // (its active cap, chunk,
+                                                                        // and body class) and the
+                                                                        // emitter's own refusal,
+                                                                        // mirroring the lower
+                                                                        // failure below.
+                                                                        panic!(
+                                                                            "[spyre-superdsc] {base}: ladder rung \
+                                                                             active_cap={} chunk={rung_chunk:?} \
+                                                                             body class {ci} emit \
+                                                                             failed: {e}",
                                                                             rung.get()
                                                                         );
-                                                                        ok = false;
                                                                     }
                                                                 }
                                                             }
-                                                            if ok {
-                                                                eprintln!(
-                                                                    "[spyre-superdsc] {base}: ladder rung \
-                                                                 active_cap={} chunk={rung_chunk:?} baked",
-                                                                    rung.get()
-                                                                );
-                                                                let rung_folds = rfps
-                                                                    .iter()
-                                                                    .all(|fp| folds_of(fp));
-                                                                let rec = superdsc::bundle::LadderRung {
-                                                                    active_cap: superdsc::bundle::SweptCols::new(rung_swept),
-                                                                    bodies: rung_fps(&rfps),
-                                                                    bodies_fused: std::borrow::Cow::Owned(rfused),
-                                                                };
-                                                                // Read off the rung record itself: the
-                                                                // record the runtime loads — any class's
-                                                                // twin counts.
-                                                                let fused_twin =
-                                                                    rec.bodies_fused.iter().any(|f| !f.is_none());
-                                                                Some((
-                                                                    rec,
-                                                                    (
-                                                                        superdsc::bundle::SweptCols::new(rung_swept),
-                                                                        scratchy_target_spyre::fold_plan::RungReach {
-                                                                            folds: rung_folds,
-                                                                            chunk: rung_chunk.is_some(),
-                                                                            fused_twin,
-                                                                        },
-                                                                    ),
-                                                                    (rung, rung_chunk, rr.layout),
-                                                                ))
-                                                            } else {
-                                                                None
-                                                            }
-                                                        }
-                                                        Err(e) => {
                                                             eprintln!(
-                                                                "[spyre-superdsc] {base}: ladder rung {} lower failed: {e}",
+                                                                "[spyre-superdsc] {base}: ladder rung \
+                                                                 active_cap={} chunk={rung_chunk:?} baked",
                                                                 rung.get()
                                                             );
-                                                            None
+                                                            let rung_folds = rfps
+                                                                .iter()
+                                                                .all(|fp| folds_of(fp));
+                                                            let rec = superdsc::bundle::LadderRung {
+                                                                active_cap: superdsc::bundle::SweptCols::new(rung_swept),
+                                                                bodies: rung_fps(&rfps),
+                                                                bodies_fused: std::borrow::Cow::Owned(rfused),
+                                                            };
+                                                            // Read off the rung record itself: the
+                                                            // record the runtime loads — any class's
+                                                            // twin counts.
+                                                            let fused_twin =
+                                                                rec.bodies_fused.iter().any(|f| !f.is_none());
+                                                            Some((
+                                                                rec,
+                                                                (
+                                                                    superdsc::bundle::SweptCols::new(rung_swept),
+                                                                    scratchy_target_spyre::fold_plan::RungReach {
+                                                                        folds: rung_folds,
+                                                                        chunk: rung_chunk.is_some(),
+                                                                        fused_twin,
+                                                                    },
+                                                                ),
+                                                                (rung, rung_chunk, rr.layout),
+                                                            ))
+                                                        }
+                                                        Err(e) => {
+                                                            // ⛔ A RUNG THAT FAILS TO LOWER FAILS
+                                                            // THE BUILD — the old arm printed and
+                                                            // returned None, silently dropping the
+                                                            // rung from the ladder the runtime loads:
+                                                            // a context that should have run here
+                                                            // falls through to whatever rung survived,
+                                                            // which is a wrong bake wearing a green
+                                                            // one's fingerprints. The panic names the
+                                                            // rung (its active cap and chunk) and the
+                                                            // lower's own refusal.
+                                                            panic!(
+                                                                "[spyre-superdsc] {base}: ladder rung \
+                                                                 active_cap={} chunk={rung_chunk:?} \
+                                                                 failed to lower: {e}",
+                                                                rung.get()
+                                                            );
                                                         }
                                                     }
                                                         })
@@ -12407,18 +12433,21 @@ fn dump_wavefront_mega(
                                             fx.push(BakeEffect::PrefillFp(bfp));
                                             prefill_fp_stamped = true;
                                         } else {
-                                            // ⛔ AN EMPTY fp IS A SKIPPED RUNG, NOT A REGISTERED
-                                            // ONE: the batch-ladder contract is that a rung whose
-                                            // emit failed simply does not appear, so the worker
-                                            // falls to the next narrower rung. Registering it
-                                            // with `""` would hand the selector a bundle nobody
-                                            // emitted.
+                                            // ⛔ AN EMPTY fp IS A COMPILE ERROR, NOT A SKIPPED
+                                            // RUNG. The old batch-ladder contract skipped a rung
+                                            // whose emit failed ("that batch runs on a narrower
+                                            // rung") — that is the silent-narrowing this ladder
+                                            // is deleting: a model whose 32-wide rung fails to
+                                            // emit served 8-wide with no build-time signal.
+                                            // Registering it with `""` would instead hand the
+                                            // selector a bundle nobody emitted, so the failure
+                                            // panics here, at `cargo build` time.
                                             if bfp.is_empty() {
-                                                eprintln!(
+                                                panic!(
                                                     "[spyre-superdsc] {base}: decode batch rung \
                                                      seqs={decode_rows} NOT BAKED (emit failed \
-                                                     above) — SKIPPED; that batch runs on a \
-                                                     narrower rung, in more than one forward"
+                                                     above) — a rung that cannot lower is a \
+                                                     compile error, never a skip"
                                                 );
                                             } else {
                                                 // `cap` IS this body's swept extent: `bfp` is the
@@ -12470,36 +12499,22 @@ fn dump_wavefront_mega(
                                     }
                                 }
                                 Err(e) => {
-                                    // ⭐ THE RUNG CONTRACT: "a rung that fails to lower is logged and
-                                    // SKIPPED; that batch runs on a narrower rung, in more than one
-                                    // forward, which is slower and never wrong" (the decode batch
-                                    // ladder's own law, and the prefill rung handler's own promise
-                                    // at the wavefront level — `prefill ladder rung m={pl} NOT
-                                    // LOWERED … (SKIPPED; a narrower rung still covers this width)`).
-                                    // A BATCH rung (`decode_rows > 1`) or a PREFILL rung
-                                    // (`prefill_mq.is_some()`) is exactly that case: its callers
-                                    // already treat a missing rung as a fall-to-narrower, never as
-                                    // a build stop. Only the PRIMARY bodies (`decode_rows <= 1`,
-                                    // decode) have no narrower rung to fall to — for them the panic
-                                    // stands (a failed primary bake left `superdsc_fp` unset and
-                                    // shipped a ZERO-group bundle that only crashed at pod load —
-                                    // the swallow this panic replaced).
-                                    if decode_rows > 1 || prefill_mq.is_some() {
-                                        eprintln!(
-                                            "[spyre-superdsc] {base}: RE-ROLL NOT LOWERABLE at \
-                                             decode_rows={decode_rows} prefill_mq={prefill_mq:?} — \
-                                             {e} (SKIPPED per the rung contract; a narrower rung \
-                                             still covers this width)"
-                                        );
-                                    } else {
-                                        panic!(
-                                            "[spyre-superdsc] {base}: RE-ROLL NOT YET LOWERABLE — \
-                                         {e}. (Next worklist item for the re-rolled SuperDSC emitter — \
-                                         this failure was previously swallowed by an eprintln, leaving \
-                                         superdsc_fp unset and shipping a ZERO-group bundle that only \
-                                         crashed at pod load.)"
-                                        );
-                                    }
+                                    // ⭐ THE RUNG CONTRACT, REWRITTEN: "a rung that cannot lower
+                                    // is a compile error, never a skip." The old contract logged
+                                    // and SKIPPED a failed BATCH rung (`decode_rows > 1`) or
+                                    // PREFILL rung so the batch silently ran narrower, in more
+                                    // than one forward — slower with no build-time signal, which
+                                    // is the silent-narrowing the ladder is deleting. Only the
+                                    // PRIMARY bodies (`decode_rows <= 1`, decode) used to panic,
+                                    // for the same reason that now holds for every rung: a failed
+                                    // bake left `superdsc_fp` unset and shipped a ZERO-group
+                                    // bundle that only crashed at pod load.
+                                    panic!(
+                                        "[spyre-superdsc] {base}: RE-ROLL NOT LOWERABLE at \
+                                         decode_rows={decode_rows} prefill_mq={prefill_mq:?} — \
+                                         {e}. (A rung that cannot lower is a compile error, never \
+                                         a skip.)"
+                                    );
                                 }
                             }
                         }
@@ -12955,9 +12970,8 @@ fn dump_wavefront_mega(
         // being requests: one page map per request, and one prefix-validity row per request.
         //
         // Rungs share ONE resident weights+KV — no term in either placement depends on the row count,
-        // the same property that licenses the prefill ladder. A rung that fails to lower is logged
-        // and SKIPPED: the batch runs on a narrower rung, in more than one forward, which is slower
-        // and never wrong.
+        // the same property that licenses the prefill ladder. A rung that fails to lower is a
+        // COMPILE ERROR, never a skip: the batch must run at its width, not silently narrower.
         // ⛔ CARD-ONLY, same reason as the prefill ladder below: the worker reaches a batch rung
         // through `superdsc_decode_rungs` / `BatchSlot`, which it consults under `spyre-hw` alone —
         // an emulator build sets `batched_prefill: None` (`spyre_load.rs:1713`) and never runs one.
@@ -12968,7 +12982,7 @@ fn dump_wavefront_mega(
             // +16 per further request — plus one launch per request. Measured 36 ms fixed + ~2 ms per
             // request, so the fixed part is what the ladder amortizes and wider rungs are close to
             // free: 8 requests reach ~2.4x the weight stream's worth of work, 32 should reach ~4x.
-            // A rung that fails to lower is logged and skipped, so adding them cannot break a build.
+            // A rung that fails to lower is a compile error, so every rung the pool names is baked.
             //
             // THE LADDER COMES FROM THE POOL, not from a literal here. A page holds exactly
             // `PagedKvPool::ROWS` requests, and a rung wider than that would bake a launch whose
@@ -13006,9 +13020,9 @@ fn dump_wavefront_mega(
                             seqs,
                         );
                     }
-                    Err(e) => eprintln!(
+                    Err(e) => panic!(
                         "[spyre-superdsc] {stem}: decode batch rung seqs={seqs} NOT LOWERED — {e} \
-                         (SKIPPED; that batch runs on a narrower rung, in more than one forward)"
+                         (a rung that cannot lower is a compile error, never a skip)"
                     ),
                 }
             }

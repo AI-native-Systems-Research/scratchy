@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //! ⭐⭐⭐⭐⭐ THE ATTENTION FAMILY'S HOST-STAGED STEP INPUTS — ONE BUILDER, TWO CALLERS.
 //!
-//! The contract `attn_step_slots` spells says the runtime writes four step-input
-//! slots (the block-entry id tables, the repetition table, the validity mask)
-//! before any spliced attention program runs. TWO runtimes must write them:
+//! The contract `attn_step_slots` spells says the runtime writes the attention family's
+//! host-staged step-input slots — the three every program declares (the two planes'
+//! block-entry id tables and the validity mask) plus the decode row's own repetition
+//! table — before any spliced attention program runs. TWO runtimes must write them:
 //! the worker's card session (`fill_step_input`, before every launch) and the
 //! bake-time NUMERIC GATE (the emulator session, before its one judging run).
 //! Before this module existed only the worker spelled the construction, so the
@@ -38,7 +39,6 @@
 //! is a dependency of this law.
 
 use ktir_superdsc::sdsc_abstract as sd;
-use ktir_superdsc::sdsc_abstract::attn_step_slots;
 
 /// ⭐⭐⭐ WHOSE ROWS THE LAUNCH RUNS — the one fact that picks the staged FORM of the attention
 /// family's step inputs, because the form is the KERNEL's, and `rows_are_requests` (the routing
@@ -62,10 +62,10 @@ pub enum AttnStepRows<'a> {
         real: std::num::NonZeroU32,
         map: Vec<i64>,
     },
-    /// Separate requests: a decode batch (`batched_decode_hm`), whose rows are the rung's launch
-    /// slots — padding rows replicate live 0, maps and histories included. `maps` is the slot map's
-    /// own per-row map list; `write` is the batch's ONE shared write slot, where every row's new
-    /// key lands this step.
+    /// Separate requests: a decode batch (`batched_decode_hm` or the batched paged-fold family),
+    /// whose rows are the rung's launch slots — padding rows replicate live 0, maps and histories
+    /// included. `maps` is the slot map's own per-row map list; `write` is the batch's ONE shared
+    /// write slot, where every row's new key lands this step.
     Batch {
         rows: sd::LaunchRows<'a>,
         maps: &'a [Vec<i64>],
@@ -73,8 +73,10 @@ pub enum AttnStepRows<'a> {
     },
 }
 
-/// The four slot extents a session's own discovery table states — the artifact's answers, not a
-/// derivation. `None` = the bundle's placement declared no such slot.
+/// The slot extents a session's own discovery table states — the artifact's answers, not a
+/// derivation. `None` = the bundle's placement declared no such slot. The first three are the
+/// family's common contract; `rep` is the decode row's own fourth slot, declared by the batched
+/// decode row alone (the chunk-family rows need no bridge — their score rows ARE their q rows).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AttnStepExtents {
     /// The validity mask's placement extent, in bytes.
@@ -83,7 +85,7 @@ pub struct AttnStepExtents {
     pub kt: Option<u64>,
     /// The V-plane block-entry table's, in bytes.
     pub v: Option<u64>,
-    /// The repetition table's, in bytes (`None` in the three-slot chunk form).
+    /// The batched decode row's repetition table's, in bytes.
     pub rep: Option<u64>,
 }
 
@@ -95,10 +97,11 @@ pub struct AttnStepPayload {
     pub kt: Vec<u8>,
     /// The V-plane block-entry table.
     pub v: Vec<u8>,
-    /// The repetition table — `Some` only in the four-slot batch form.
-    pub rep: Option<Vec<u8>>,
     /// The validity mask (chunk form) or pre-replicated mask (batch form).
     pub mask: Vec<u8>,
+    /// The batched decode row's repetition table — empty in the chunk family, which declares
+    /// no such slot.
+    pub rep: Vec<u8>,
 }
 
 /// ⭐ THE CHUNK FAMILY'S REGION, FROM THE MASK SLOT'S OWN PLACEMENT EXTENT — the ladder's
@@ -123,27 +126,26 @@ pub fn chunk_region(
     })
 }
 
-/// ⭐ THE CHUNK FORM'S ALL-OR-NOTHING SLOT PATTERN — `Ok(())` = the three-slot form is declared;
-/// every other combination is a refusal. A PARTIAL declaration is a bake/host disagreement, and
-/// so is an EMPTY one: on this branch every attention program is one of the three spliced
-/// kernels and all of them declare the step inputs, so a bundle that runs attention while
-/// declaring none is a bake/host desync, never a form to fall back from. Pub so the numeric gate
-/// can check the pattern BEFORE it derives the region its identity page map needs — the check and
-/// the builder's own arm are this one function, never two spellings.
-pub fn chunk_slot_pattern(what: &str, extents: &AttnStepExtents) -> Result<(), String> {
-    match (extents.mask, extents.kt, extents.v, extents.rep) {
-        (Some(_), Some(_), Some(_), None) => Ok(()),
-        (None, None, None, None) => Err(format!(
+/// ⭐⭐⭐⭐⭐ THE ALL-OR-NOTHING SLOT PATTERN — `Ok(())` = the three-slot COMMON form is declared;
+/// every other combination is a refusal. A PARTIAL declaration is a bake/host disagreement, and so is
+/// an EMPTY one: on this branch every attention program is one of the spliced kernels and all of
+/// them declare the three common step inputs, so a bundle that runs attention while declaring none is a
+/// bake/host desync, never a form to fall back from. ONE law for BOTH row forms — the chunk and
+/// batch families state the same three slots. The decode row's FOURTH slot (the repetition
+/// table) is NOT checked here: it is row-form-conditional — stated by the batched decode row
+/// alone, whose request-major score rows meet head-major q/o rows only through the bridge — so
+/// its all-or-nothing law lives in the builder's own arms, where the row form is known (the
+/// batch arm refuses an undeclared slot, the chunk arm refuses a declared one). Pub so the
+/// numeric gate can check the pattern BEFORE it derives the region its identity page map
+/// needs — the check and the builder's own arm are this one function, never two spellings.
+pub fn slot_pattern(what: &str, extents: &AttnStepExtents) -> Result<(), String> {
+    match (extents.mask, extents.kt, extents.v) {
+        (Some(_), Some(_), Some(_)) => Ok(()),
+        (None, None, None) => Err(format!(
             "{what}: this bundle runs attention but declares NO attention step inputs — \
              every spliced attention kernel states all of them, so the bake and the host \
              disagree about what program this is (an unstaged id table reads as block 0, a \
              REAL address; an unstaged mask reads as zero, NO masking)"
-        )),
-        (_, _, _, Some(_)) => Err(format!(
-            "{what}: this bundle declares a REPETITION table (slot {}) but the \
-             launch's rows are consecutive positions of ONE sequence — the bake and \
-             the host disagree about which body runs",
-            attn_step_slots::REP_ROW_IDS
         )),
         _ => Err(format!(
             "{what}: this bundle declares a PARTIAL set of attention step inputs — \
@@ -153,25 +155,30 @@ pub fn chunk_slot_pattern(what: &str, extents: &AttnStepExtents) -> Result<(), S
     }
 }
 
-/// The batch form's all-or-nothing slot pattern — same law, four slots.
-pub fn batch_slot_pattern(what: &str, extents: &AttnStepExtents) -> Result<(), String> {
-    if extents.mask.is_none()
-        || extents.kt.is_none()
-        || extents.v.is_none()
-        || extents.rep.is_none()
-    {
-        return Err(format!(
-            "{what}: this bundle declares {} attention step input(s) of the four the batch \
-             form states — all-or-nothing: an empty declaration is a bake/host desync (every \
-             spliced attention kernel states all of them), a partial one reads as block 0 \
-             (ids), a gathered Q row 0 (repetition), or no mask (mask)",
-            [extents.mask, extents.kt, extents.v, extents.rep]
-                .iter()
-                .filter(|s| s.is_some())
-                .count()
-        ));
-    }
-    Ok(())
+/// ⭐ THE BATCH FAMILY'S REGION, FROM THE MASK SLOT'S OWN PLACEMENT EXTENT — the ladder's
+/// declared region at the batched fold stick, not a host guess. The batched twin of
+/// [`chunk_region`]: same door shape, same refusal class. Pub for the same reason — the numeric
+/// gate mints its identity page maps over this region's pages, through this same door, before
+/// it can name them.
+pub fn batch_region(
+    what: &str,
+    mask_extent_bytes: u64,
+    pool: sd::PagedKvPool,
+    gqa: std::num::NonZeroU32,
+    num_seqs: std::num::NonZeroU32,
+) -> Result<sd::SplicedBatchRegion, String> {
+    sd::SplicedBatchRegion::of_mask_extent(mask_extent_bytes, pool, gqa, num_seqs).ok_or_else(
+        || {
+            format!(
+                "{what}: the mask slot's placement extent {mask_extent_bytes} B is not a whole \
+                 number of page blocks at the batched stick ({} launch row(s), pool nkvh {} hd \
+                 {}) — the bake and the host disagree about the region",
+                num_seqs.get(),
+                pool.nkvh(),
+                pool.hd()
+            )
+        },
+    )
 }
 
 /// ⭐ THE GATHER'S ENTRY CEILING FROM A SESSION'S OWN PAGE STRIDE — the same two numbers the
@@ -244,7 +251,7 @@ pub fn build_attn_step_inputs<const NQH: u32, const NKVH: u32, const HD: u32>(
             real,
             map,
         } => {
-            chunk_slot_pattern(what, extents)?;
+            slot_pattern(what, extents)?;
             let region = chunk_region(what, extents.mask.unwrap_or(0), pool, gqa, mq)?;
             let ceiling = ceiling.ok_or_else(|| {
                 format!(
@@ -270,61 +277,124 @@ pub fn build_attn_step_inputs<const NQH: u32, const NKVH: u32, const HD: u32>(
                         mq.count()
                     )
                 })?;
-            Ok(AttnStepPayload {
+            let payload = AttnStepPayload {
                 kt: encode(what, sd::KvPlane::Kt, inputs.kt_entries())?,
                 v: encode(what, sd::KvPlane::V, inputs.v_entries())?,
-                rep: None,
                 mask: inputs.mask().wire_bytes().to_vec(),
-            })
+                // ⛔ THE CHUNK FAMILY DECLARES NO REPETITION TABLE — its score rows are its
+                // q rows (token rows), so a placement that declared the bridge's slot for a
+                // chunk-row bundle is a bake/host disagreement about which program this is,
+                // never a table to silently leave unstaged (an unstaged i32 slot reads as
+                // all-zero row indices — REAL rows, the wrong ones).
+                rep: {
+                    if extents.rep.is_some() {
+                        return Err(format!(
+                            "{what}: this chunk-row bundle declares a repetition-table slot — \
+                             only the batched decode row states one, so the bake and the host \
+                             disagree about which attention program this is"
+                        ));
+                    }
+                    Vec::new()
+                },
+            };
+            Ok(payload)
         }
         AttnStepRows::Batch { rows, maps, write } => {
-            batch_slot_pattern(what, extents)?;
+            slot_pattern(what, extents)?;
             let num_seqs = rows.width().rows();
-            let batch =
-                sd::SplicedDecodeBatch::of_ids_extent(extents.kt.unwrap_or(0), pool, gqa, num_seqs)
-                    .ok_or_else(|| {
-                        format!(
-                            "{what}: the ids slot's placement extent {} B is not a whole number \
-                             of chunk tables at {} launch row(s) — the bake and the host disagree \
-                             about the batch chunking",
-                            extents.kt.unwrap_or(0),
-                            num_seqs.get()
-                        )
-                    })?;
+            let region =
+                batch_region(what, extents.mask.unwrap_or(0), pool, gqa, num_seqs)?;
             let ceiling = ceiling.ok_or_else(|| {
                 format!(
                     "{what}: this bundle's attention gathers, but a physical page is not a whole \
                      number of SLAB BLOCKS — no integer index can name a page boundary"
                 )
             })?;
-            let kt = sd::spliced_decode_ids_table(sd::KvPlane::Kt, batch, maps, ceiling)
+            // ⭐ THE THREE STEP INPUTS, MINTED BY ONE WALK of the region — id tables and validity
+            // mask as fields of ONE value (`batched_step_inputs`), so a staging that wanted the
+            // tables of one region and the mask of another has no spelling. The refusal is one
+            // door naming the whole family's failure classes.
+            let inputs = region
+                .batched_step_inputs(maps, &rows.mask_histories(), write, ceiling)
                 .ok_or_else(|| {
                     format!(
-                        "{what}: could not build the batch's block-entry table from {} installed \
-                         page map(s) — not one map per launch row, an empty map, or an entry past \
-                         int32 (never a zero table: zero is block 0, a REAL address)",
-                        maps.len()
+                        "{what}: could not build the batch's step inputs from {} installed \
+                         page map(s) at {} launch row(s) — not one map and one history per \
+                         launch row, an empty map, or an entry past the pool's ceiling (never \
+                         a zero table: zero is block 0, a REAL address)",
+                        maps.len(),
+                        num_seqs.get()
                     )
                 })?;
-            let v = sd::spliced_decode_ids_table(sd::KvPlane::V, batch, maps, ceiling).ok_or_else(|| {
-                    format!(
-                        "{what}: could not build the batch's V-plane block-entry table — same law, \
-                         same refusal, the V plane's own slot"
-                    )
-                })?;
-            let rep = sd::spliced_decode_rep_ids(batch);
-            let mask = sd::spliced_decode_mask_f16(batch, &rows.mask_histories(), write)
-                .ok_or_else(|| {
-                    format!(
-                        "{what}: could not build the batch's pre-replicated validity mask — not \
-                         one history per launch row"
-                    )
-                })?;
+            // ⭐ THE DECODE ROW'S OWN REPETITION TABLE — the bridge from the batch's
+            // request-major score rows to its head-major q/o rows. ONE `[slabs · PG]` i32
+            // table, slab-major slices of `PG`: slice `σ`'s entry `r` is
+            // `σ · PG + rep[r]`, where score row `r` is `(s = r / NQH, h = r % NQH)`
+            // and `rep[r] = h · S + s` is its head-major row. The bytes the entry names are
+            // the q/o view's own STICKS, and the sticks are laid out by the frame the bytes
+            // live in: at `SLABS == 1` the view reads the token stream itself, whose
+            // stick-blocked residency puts head `h` request `s` at stick `h · S + s` — the
+            // head-major row IS the stick; at `SLABS > 1` the relayout wrap moves the bytes
+            // into its `[nqh·R, HD]` row frame first, whose own stick law (the wrap's doc,
+            // `head_relayout.py`) puts head-major row `k` slab `σ` at stick `σ · nqh·R +
+            // k`, and `nqh·R == PG` — so the entry is the slab's stick base `σ · PG` plus
+            // the head-major row in both cases (the stream at one slab is the `σ == 0`
+            // instance of the same law). ⛔ NOT `rep[r] · slabs + σ`: that spells the frame
+            // FLAT (`row·HD + slab·STK`), a different byte order than any stick-blocked
+            // residency — at `SLABS == 1` the two spellings agree (both are `rep[r]`), which
+            // is why every head-dim-64 width stayed coherent while granite-8b batched
+            // (slabs 2) answered word salad with no fault (10-27). The table is a CONSTANT
+            // of the geometry and the batch width (never of the step's contents), so it is
+            // staged here with the rest rather than recomputed per fill; at `S == 1` it is
+            // the identity, so the solo decode's bytes are the table's own `rep[r] = r`.
+            let num_seqs = num_seqs.get();
+            let slabs = geom.slabs();
+            let pg = u64::from(num_seqs) * u64::from(NQH);
+            let mut rep = Vec::with_capacity((slabs as u64 * pg * 4) as usize);
+            for sigma in 0..slabs {
+                for r in 0..pg {
+                    let s = r / u64::from(NQH);
+                    let h = r % u64::from(NQH);
+                    let head_major = h * u64::from(num_seqs) + s;
+                    let entry = u64::from(sigma) * pg + head_major;
+                    rep.extend_from_slice(&(entry as i32).to_le_bytes());
+                }
+            }
+            // ⭐⭐⭐ AND THE PAYLOAD IS STAGED WHOLE AT THE IDX2ADDR REACH — the table's own
+            // entries plus a ZERO TAIL. The card's index→address conversion reads a
+            // TABLE-SIZED contiguous run of index words from each gather/scatter leg's own
+            // stick base (dxp's `createIdx2AddrSdsc` takes its `N_` from the OP's, which the
+            // leg cuts state at the table's row count), so the slot the placement sizes — and
+            // the bytes the fill's `==` law stages — are the reach, not the table alone: the
+            // rep is placed at the activation segment's tail, and an un-padded table leaves
+            // the last leg's run crossing the segment's end (measured: `HMI=FETCH` at the
+            // second index stick, the stream dead). The tail's zeros convert to the value's
+            // own base — an address no leg's work division ever dereferences. The law and its
+            // C++ cites live on [`RepTableReservation::reach_bytes`]; a one-stick table's
+            // reach is itself, so the solo decode's bytes are unchanged.
+            let reach = ktir_superdsc::placement::RepTableReservation::reach_bytes(
+                rep.len() as u64,
+                std::mem::size_of::<i32>() as u64,
+            );
+            rep.resize(reach as usize, 0);
+            // The declared extent must BE the slot's own reach — the placement sizes the slot
+            // from the kernel's own view through the same law, so any other number is a
+            // bake/host disagreement about the bridge itself, never a truncation decision.
+            if extents.rep != Some(rep.len() as u64) {
+                return Err(format!(
+                    "{what}: the repetition table's declared extent {} B is not the \
+                     idx2addr reach of the {slabs} slab(s) x {pg} score row(s) of i32 the \
+                     bridge states ({} B) — the bake and the host disagree about the batch's \
+                     row order",
+                    extents.rep.map(|e| e.to_string()).unwrap_or_else(|| "NONE".into()),
+                    rep.len()
+                ));
+            }
             Ok(AttnStepPayload {
-                kt: encode(what, sd::KvPlane::Kt, &kt)?,
-                v: encode(what, sd::KvPlane::V, &v)?,
-                rep: Some(rep.iter().flat_map(|&r| r.to_le_bytes()).collect()),
-                mask: mask.wire_bytes().to_vec(),
+                kt: encode(what, sd::KvPlane::Kt, inputs.kt_entries())?,
+                v: encode(what, sd::KvPlane::V, inputs.v_entries())?,
+                mask: inputs.mask().wire_bytes().to_vec(),
+                rep,
             })
         }
     }

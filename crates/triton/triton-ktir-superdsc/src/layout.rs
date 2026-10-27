@@ -592,6 +592,12 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // `Attn` is refused BY NAME at this crate's doors. `None` is "this bundle never
         // gathers", which is the documented meaning, not a placeholder.
         kv_block_index: None,
+        // No rep table either: the reservation is a whole-GRAPH fact (a batched decode row's
+        // rep slot), and one Triton kernel's parameter list is not that graph — the nodes that
+        // state step inputs are placed by the consumer ladder's producer
+        // (`place_step_inputs`), whose layout this is not. `None` is "this bundle states no
+        // rep", the documented meaning.
+        rep_table: None,
         // No paged-fold region: the ceiling is a whole-GRAPH fact derived from a paged-KV pool's
         // own stride (`compute_bundle_layout` records it beside the prefix mask), and one Triton
         // kernel's parameter list places no pool — `Attn` is refused BY NAME at this crate's

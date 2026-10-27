@@ -360,6 +360,48 @@ fn head_relayout_row(entry: &'static str) -> TritonKernelRow {
     }
 }
 
+/// THE BATCHED PAGED-FOLD FAMILY'S SEED ROW — `paged_fold_batched.py`'s
+/// `paged_fold_batched_seed_hm`: the batched twin of [`paged_fold_seed_row`], seeding the carry
+/// at the batched stick's own frames (`[PG, 1]` max/sum, `[PG, HD]` accumulator). The per-page
+/// body of a BATCHED decode ladder's `(FULL, no-chunk)` rung lowers as this three-program
+/// family — every request row's pages folded by ONE launch per page-ordinal, no fallback to the
+/// solo rungs.
+pub fn paged_fold_batched_seed_row() -> TritonKernelRow {
+    TritonKernelRow::Spliced {
+        src: include_str!("../../../targets/spyre/kernels/paged_fold_batched.py"),
+        file: "paged_fold_batched.py",
+        entry: "paged_fold_batched_seed_hm",
+        program: Program::Attn,
+    }
+}
+
+/// THE BATCHED PAGED-FOLD FAMILY'S BODY ROW — `paged_fold_batched.py`'s
+/// `paged_fold_batched_hm`: ONE page-ordinal of the batched walk, folded into the carried
+/// online-softmax state at every request row at once. Repeating this launch IS the loop; the
+/// runtime re-launches it once per resident page-ordinal, shifting the activation segment's
+/// base one page block per pass (the tables and mask are page-major over the region at the
+/// batched pitch).
+pub fn paged_fold_batched_row() -> TritonKernelRow {
+    TritonKernelRow::Spliced {
+        src: include_str!("../../../targets/spyre/kernels/paged_fold_batched.py"),
+        file: "paged_fold_batched.py",
+        entry: "paged_fold_batched_hm",
+        program: Program::Attn,
+    }
+}
+
+/// THE BATCHED PAGED-FOLD FAMILY'S FINALIZE ROW — `paged_fold_batched.py`'s
+/// `paged_fold_batched_finalize_hm`: the one normalize (`out = acc / l`), once, after the last
+/// pass — the identity merge, no J-tail.
+pub fn paged_fold_batched_finalize_row() -> TritonKernelRow {
+    TritonKernelRow::Spliced {
+        src: include_str!("../../../targets/spyre/kernels/paged_fold_batched.py"),
+        file: "paged_fold_batched.py",
+        entry: "paged_fold_batched_finalize_hm",
+        program: Program::Attn,
+    }
+}
+
 /// THE ROW FOR A NODE — the family functions composed. Every `SubOp` that can reach the
 /// splice has a family below (attention rides its own `lower_attn` entry); the ops the
 /// spyre target has no kernel FOR (the 2b expansion kinds, the host-routed pairs, …)
@@ -2095,18 +2137,12 @@ fn lower_attn_at<
     // reset the running state mid-accumulation, and the finalize is separate because the
     // normalize runs ONCE, after the last pass.
     //
-    // ⛔ THE FAMILY IS THE TOKEN-ROW (MQ==1) FORM — the kernel's own law: the carry's rows and
-    // the tables' per-page blocks agree only at one query row. A batched decode rung is the
-    // m>1 follow-up; stating the fold body on one is refused here rather than baked wrong.
+    // ⭐ TWO ROW FORMS, TWO FAMILIES — the token-row (MQ==1) rung mints the solo family
+    // (`paged_fold.py`, one sequence's rows); a REQUEST-ROW rung mints the batched family
+    // (`paged_fold_batched.py`, every request row folded by ONE launch per page-ordinal, its
+    // carry, tables and mask at the batched stick's own frames). Batched decode past the
+    // widest chunk folds HERE — on its own rung, never by falling back to the solo rungs.
     if let Some(pf) = paged_fold.filter(|pf| pf.fold_body) {
-        if rows_are_requests {
-            return Err(format!(
-                "triton splice: AttnDecode t{} states the paged-fold body on a REQUEST-ROW \
-                 rung — the fold family is the MQ==1 token-row form; the batched decode fold \
-                 is the m>1 follow-up",
-                node.output.tensor.index()
-            ));
-        }
         // ⛔ THE REGION CANNOT OUT-REACH THE POOL IT GATHERS: the fold's plane descriptors
         // state the region's page count, and a region past the pool's own rows sweeps past
         // the cache tensor's placement.
@@ -2120,6 +2156,9 @@ fn lower_attn_at<
                 cap
             ));
         }
+        if rows_are_requests {
+            return mint_paged_fold_batched(geom, node, ir, scale, pf.region_pages);
+        }
         return mint_paged_fold(geom, node, ir, scale, pf.region_pages);
     }
     // ⛔ A RUNG ON A CHUNKED LADDER THAT IS NOT THE FOLD BODY still states the region: every
@@ -2127,9 +2166,8 @@ fn lower_attn_at<
     // the sweep and chunk rungs' tables and mask state the SAME region the fold reads.
     let region_pages = paged_fold.map(|pf| pf.region_pages);
     // ⭐ THE REGION VALUE IS BOUND PER ARM, from the same pages fact that arm's spec got — the
-    // spec's own law, not a second derivation: the prefill arm's spec defaults a `None` region
-    // to the walk's own extent, and the decode arm's spec receives the pool capacity as its
-    // `pages`. The mint below states it on the carrier unconditionally.
+    // spec's own law, not a second derivation: BOTH arms' specs default a `None` region to the
+    // walk's own extent. The mint below states it on the carrier unconditionally.
     let (spec, region) = if rows_are_requests {
         // ── THE DECODE ROW: the request count is the batch. ──
         let num_seqs = node.output.region.rows.len;
@@ -2140,38 +2178,30 @@ fn lower_attn_at<
                 node.output.tensor.index()
             ));
         }
-        // THE CHUNK'S ENTRY SLOTS FILL ONE WHOLE STICK: `ENTRIES = NUM_SEQS * BLOCKS_PER_CHUNK`
-        // must fill the SenUint32 stick exactly (torch's own chunking law — one entry slot per
-        // core), so the chunk depth is the stick divided by the batch, and a batch that does
-        // not divide it has no form under this kernel. The BLOCK-ENTRY tables the gathers
-        // read are wider (`ENTRIES * NKVH * windows` a chunk); the stick law governs the
-        // CHUNKING, which is what feeds the softmax merge shape.
-        let entries = ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
-        if !entries.is_multiple_of(num_seqs) {
+        // THE WALK COVERS THE NODE'S OWN VALID LENGTH: `valid_len` is the SubOp's stated
+        // logical length (prefix ++ new), the one sequence-extent fact the node carries —
+        // pages per sequence, the prefill arm's own one-param form. The tables and mask
+        // state the REGION (the value bound below), not the walk; the pool-capacity
+        // `PAGES` and the chunk-slot stick law are this family's deleted history.
+        let pages = valid_len.div_ceil(page_slots);
+        if pages == 0 {
             return Err(format!(
-                "triton splice: AttnDecode t{}: a {num_seqs}-request decode batch does not \
-                 divide the {entries}-entry id stick, so no BLOCKS_PER_CHUNK fills it exactly — \
-                 the kernel's one-stick contract has no form at this batch width",
+                "triton splice: AttnDecode t{} attends zero pages — a valid length of \
+                 {valid_len} has no page under PAGE_SLOTS = {page_slots}",
                 node.output.tensor.index()
             ));
         }
-        let blocks_per_chunk = entries / num_seqs;
-        // THE CHUNK COUNT COVERS THE NODE'S OWN VALID LENGTH: `valid_len` is the SubOp's
-        // stated logical length (prefix ++ new), the one sequence-extent fact the node
-        // carries. Pages per sequence, then chunks at this batch's own chunk depth.
-        let pages_per_seq = valid_len.div_ceil(page_slots);
-        let num_chunks = pages_per_seq.div_ceil(blocks_per_chunk);
         (
             batched_decode_spec(&BatchedDecodeFacts {
                 geom,
                 num_seqs,
-                pages: cap,
-                blocks_per_chunk,
-                num_chunks,
+                pages,
+                region_pages,
                 scale,
             })?,
-            // The value that arm's spec received as `pages`: the pool capacity.
-            cap,
+            // The spec's own default law (`batched_decode_spec`'s `region_pages.unwrap_or(pages)`):
+            // a rung whose ladder stated no fold region keeps the region at the walk's own extent.
+            region_pages.unwrap_or(pages),
         )
     } else {
         // ── THE PREFILL ROW: the chunk's query rows are M. ──
@@ -2292,22 +2322,26 @@ struct BatchedDecodeFacts<const NQH: u32, const NKVH: u32, const HD: u32> {
     geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
     num_seqs: u32,
     pages: u32,
-    blocks_per_chunk: u32,
-    num_chunks: u32,
+    /// The page ceiling of the region the tables and mask STATE, when this rung sits on a
+    /// ladder (the census's ONE `max_pages` derivation, threaded by the walk). `None`
+    /// states the region at the walk's own extent — the prefill facts' own law.
+    region_pages: Option<u32>,
     scale: f32,
 }
 
 /// THE BATCHED DECODE KERNEL'S LAUNCH CONTRACT — the kernel's own parameter order
-/// (`batched_decode_hm`: q, out, the two pool planes, Q's row-repetition table, the two
-/// block-entry tables, the mask), plus every extent as a constexpr: the geometry
-/// (`NUM_SEQS/NKVH/GQA/HD`), the pool (`PAGES`), the batching (`BLOCKS_PER_CHUNK`,
-/// `NUM_CHUNKS`), and the scale.
+/// (`batched_decode_hm`: q, out, the two pool planes, the two block-entry tables, the
+/// mask, and the repetition table — the decode row's own fourth parameter, the bridge
+/// from its request-major score rows to the head-major q/o rows the stream law states),
+/// plus every extent as a constexpr: the geometry (`NUM_SEQS/NKVH/GQA/HD`), the
+/// pool's own derived facts (`SLABS/STK/W4/PITCH`), the pool walk (`PAGES`), the region
+/// the tables and mask state (`REGION_PAGES`), and the scale.
 ///
-/// The ids tables are `*i32` — the kernel gathers pages through them and the door sizes an
-/// index buffer `SenUint32` by its own gather law; `desc_rep_ids` is the same `*i32` form
-/// stating Q's entry-order row repetition. The mask is ALWAYS consumed (the kernel
-/// loads it unconditionally in the chunk loop — the additive -65504 sentinel is what makes
-/// a padded page merge with weight zero), so the parameter is always in the signature.
+/// The ids tables and the repetition table are `*i32` — the kernel gathers pages
+/// through the former and q/o rows through the latter, and the door sizes an index
+/// buffer `SenUint32` by its own gather law. The mask is ALWAYS consumed (the kernel
+/// loads it unconditionally in the page walk — the additive -65504 sentinel is what makes a
+/// padded page merge with weight zero), so the parameter is always in the signature.
 ///
 /// ⭐ THE GEOMETRY CONSTEXPRS ARE THE CONSTS, not copies of values: `NKVH`/`HD` are this
 /// function's own const generics and `GQA` is the witness's associated const, so a
@@ -2315,8 +2349,12 @@ struct BatchedDecodeFacts<const NQH: u32, const NKVH: u32, const HD: u32> {
 /// DERIVED FACTS RIDE THE SAME LAW: `SLABS` is spent as `geom.slabs()` — the call itself
 /// is the stick-multiple law's firing point, so a sub-stick head is the declaring model's
 /// build failure HERE, at the mint — and `STK`/`W4` are the pool's own consts
-/// (`POOL_STICK`, `WINDOWS_PER_PAGE`), never values the mint recomputed. The kernel takes
-/// no `PAGE_SLOTS`: nothing it states derives from it any more.
+/// (`POOL_STICK`, `WINDOWS_PER_PAGE`), never values the mint recomputed. ⭐ `PITCH` is the
+/// BATCHED stick's own pitch (`batched_table_pitch` at `NUM_SEQS·NKVH`), and the pitch
+/// law's trip-slot count `MQ = PG·STK·2/(SLABS·PITCH)` must come out WHOLE — the kernel
+/// derives it by integer division, so a geometry the pitch cannot serve is refused HERE,
+/// at the mint, never silently floored on the card. The kernel takes no `PAGE_SLOTS`:
+/// nothing it states derives from it any more.
 fn batched_decode_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
     f: &BatchedDecodeFacts<NQH, NKVH, HD>,
 ) -> Result<KernelSpec, String> {
@@ -2324,28 +2362,58 @@ fn batched_decode_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
         geom,
         num_seqs,
         pages,
-        blocks_per_chunk,
-        num_chunks,
+        region_pages,
         scale,
     } = *f;
+    // ⛔ THE REGION IS THE LADDER'S, NOT THE WALK'S: on a ladder every rung states the SAME
+    // region so the step-input placements the placement pass mints agree across rungs
+    // (`ladder_stages_one_layout`), and the per-page fold body the ladder also bakes reads the
+    // same region one page per launch. `None` (an unladdered bundle) keeps the region at the
+    // walk's own extent, which is the byte-for-byte region-less statement.
+    let region_pages = region_pages.unwrap_or(pages);
+    // The pitch law, refused rather than floored: the per-window mask bytes (`PG·STK·2`)
+    // over the per-window table block (`SLABS·PITCH`) must be a whole trip-slot count.
+    let pitch = ktir_superdsc::sdsc_abstract::batched_table_pitch(num_seqs, NKVH).ok_or_else(
+        || {
+            format!(
+                "triton splice: batched_decode_hm at {num_seqs} sequence(s) x {NKVH} kv head(s) \
+                 overflows the table pitch — no u32 states this batched stick"
+            )
+        },
+    )?;
+    let ktb = u64::from(num_seqs) * u64::from(NKVH);
+    let pg = ktb * u64::from(geom.gqa());
+    let per_window = u64::from(geom.slabs()) * u64::from(pitch);
+    if per_window == 0 || (pg * u64::from(ktir_superdsc::sdsc_abstract::POOL_STICK) * 2)
+        % per_window
+        != 0
+    {
+        return Err(format!(
+            "triton splice: batched_decode_hm at {num_seqs} sequence(s) x {NKVH} kv head(s) x \
+             {} group replica(s) states a non-integral trip-slot count — the per-window mask \
+             bytes ({pg} rows of STK·2) are not a whole number of per-window table blocks \
+             ({per_window} B), so the pitch law has no form at this geometry",
+            geom.gqa()
+        ));
+    }
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
-    // THE BLOCK-ENTRY CONTRACT: the decode kernel gathers the pool ONE STICK BLOCK per
+    // THE BLOCK-ENTRY CONTRACT: the decode kernel gathers the pool ONE SLAB BLOCK per
     // index entry, through TWO tables — each plane's own block numbering — whose values
     // are the host's `GatherEntry` bytes. No page stride or block offset is a constexpr
     // here: those live in the values, composed at the pool's one door on the host.
-    // `desc_rep_ids` is Q's own row-repetition table (torch's `rep_row_ids` values) —
-    // the same host-staged index-data family, staging the entry-order repetition the
-    // kernel states as its Q gather.
+    // `desc_rep` is the decode row's own repetition table — the bridge from its
+    // request-major score rows to the head-major q/o rows — staged by the host at
+    // `attn_step_slots::REP`.
     for (p, ty) in [
         ("desc_q", "*fp16"),
         ("desc_o", "*fp16"),
         ("desc_kt", "*fp16"),
         ("desc_v", "*fp16"),
-        ("desc_rep_ids", "*i32"),
         ("desc_ids_kt", "*i32"),
         ("desc_ids_v", "*i32"),
         ("desc_mask", "*fp16"),
+        ("desc_rep", "*i32"),
     ] {
         signature.insert(
             p.to_string(),
@@ -2375,9 +2443,9 @@ fn batched_decode_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
             ktir_superdsc::sdsc_abstract::PagedKvPool::WINDOWS_PER_PAGE,
         )),
     )?;
+    ce("PITCH", Val::Int(i128::from(pitch)))?;
     ce("PAGES", Val::Int(i128::from(pages)))?;
-    ce("BLOCKS_PER_CHUNK", Val::Int(i128::from(blocks_per_chunk)))?;
-    ce("NUM_CHUNKS", Val::Int(i128::from(num_chunks)))?;
+    ce("REGION_PAGES", Val::Int(i128::from(region_pages)))?;
     ce("SCALE", Val::Float(f64::from(scale)))?;
     Ok(KernelSpec {
         kernel: "batched_decode_hm".to_string(),
@@ -2856,6 +2924,404 @@ fn mint_paged_fold<
     Ok(vec![seed_op, body, fin_op])
 }
 
+/// The batched paged-fold family's facts — the fold body's own geometry at the BATCHED
+/// stick, minted by [`mint_paged_fold_batched`] beside the law that derives each member.
+/// The seed and finalize programs read the SUBSET of these their signatures state. The
+/// geometry rides as the door's witness, never as bare `u32` head counts (the decode
+/// facts' own law); `num_seqs` replaces the solo family's `mq` — the batched family's
+/// rows are the launch's request slots.
+struct PagedFoldBatchedFacts<const NQH: u32, const NKVH: u32, const HD: u32> {
+    /// The head geometry as consts — the door's witness.
+    geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    num_seqs: u32,
+    region_pages: u32,
+    scale: f32,
+}
+
+/// THE BATCHED SEED PROGRAM'S LAUNCH CONTRACT — `paged_fold_batched_seed_hm`'s own parameter
+/// order (the carry's max, sum, accumulator), plus the geometry as constexprs. The carry's
+/// memory image is f16 throughout — the one-shot kernel's own legalized grading (the
+/// kernel's module doc states the law), so the fold is numerically identical to the body it
+/// replaces.
+fn paged_fold_batched_seed_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
+    f: &PagedFoldBatchedFacts<NQH, NKVH, HD>,
+) -> Result<KernelSpec, String> {
+    let PagedFoldBatchedFacts {
+        geom, num_seqs, ..
+    } = *f;
+    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+    let mut constexprs: HashMap<String, Val> = HashMap::new();
+    for (p, ty) in [
+        ("desc_m", "*fp16"),
+        ("desc_l", "*fp16"),
+        ("desc_acc", "*fp16"),
+    ] {
+        signature.insert(
+            p.to_string(),
+            ArgSpec::parse(ty).map_err(|e| e.to_string())?,
+        );
+    }
+    let mut ce = |k: &str, v: Val| -> Result<(), String> {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), v);
+        Ok(())
+    };
+    ce("NUM_SEQS", Val::Int(i128::from(num_seqs)))?;
+    ce("NKVH", Val::Int(i128::from(NKVH)))?;
+    ce("GQA", Val::Int(i128::from(geom.gqa())))?;
+    ce("HD", Val::Int(i128::from(HD)))?;
+    ce(
+        "STK",
+        Val::Int(i128::from(ktir_superdsc::sdsc_abstract::POOL_STICK)),
+    )?;
+    Ok(KernelSpec {
+        kernel: "paged_fold_batched_seed_hm".to_string(),
+        signature,
+        constexprs,
+        file: "paged_fold_batched.py".to_string(),
+    })
+}
+
+/// THE BATCHED FOLD BODY'S LAUNCH CONTRACT — `paged_fold_batched_hm`'s own parameter order
+/// (q, the carried max/sum/accumulator, the two pool planes, the two block-entry tables,
+/// the mask), plus every extent as a constexpr: the geometry
+/// (`NUM_SEQS/NKVH/GQA/HD`), the pool's own derived facts (`SLABS/STK/W4/PITCH`), the
+/// region the tables and mask state (`REGION_PAGES`), and the scale. The block-entry
+/// contract is the batched one-shot kernel's own — global slab-block entries, one per
+/// table row, at the BATCHED common pitch (`batched_table_pitch` at `NUM_SEQS·NKVH`) —
+/// and the per-pass shift the runtime applies rides the ACTIVATION segment, page-major,
+/// which is why the tables and the mask state the REGION and not the page. The pitch
+/// law's trip-slot count must come out WHOLE, refused here exactly as the one-shot spec
+/// refuses it.
+fn paged_fold_batched_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
+    f: &PagedFoldBatchedFacts<NQH, NKVH, HD>,
+) -> Result<KernelSpec, String> {
+    let PagedFoldBatchedFacts {
+        geom,
+        num_seqs,
+        region_pages,
+        scale,
+    } = *f;
+    let pitch = ktir_superdsc::sdsc_abstract::batched_table_pitch(num_seqs, NKVH).ok_or_else(
+        || {
+            format!(
+                "triton splice: paged_fold_batched_hm at {num_seqs} sequence(s) x {NKVH} kv \
+                 head(s) overflows the table pitch — no u32 states this batched stick"
+            )
+        },
+    )?;
+    let ktb = u64::from(num_seqs) * u64::from(NKVH);
+    let pg = ktb * u64::from(geom.gqa());
+    let per_window = u64::from(geom.slabs()) * u64::from(pitch);
+    if per_window == 0 || (pg * u64::from(ktir_superdsc::sdsc_abstract::POOL_STICK) * 2)
+        % per_window
+        != 0
+    {
+        return Err(format!(
+            "triton splice: paged_fold_batched_hm at {num_seqs} sequence(s) x {NKVH} kv head(s) \
+             x {} group replica(s) states a non-integral trip-slot count — the per-window mask \
+             bytes ({pg} rows of STK·2) are not a whole number of per-window table blocks \
+             ({per_window} B), so the pitch law has no form at this geometry",
+            geom.gqa()
+        ));
+    }
+    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+    let mut constexprs: HashMap<String, Val> = HashMap::new();
+    for (p, ty) in [
+        ("desc_q", "*fp16"),
+        ("desc_m", "*fp16"),
+        ("desc_l", "*fp16"),
+        ("desc_acc", "*fp16"),
+        ("desc_kt", "*fp16"),
+        ("desc_v", "*fp16"),
+        ("desc_ids_kt", "*i32"),
+        ("desc_ids_v", "*i32"),
+        ("desc_mask", "*fp16"),
+    ] {
+        signature.insert(
+            p.to_string(),
+            ArgSpec::parse(ty).map_err(|e| e.to_string())?,
+        );
+    }
+    let mut ce = |k: &str, v: Val| -> Result<(), String> {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), v);
+        Ok(())
+    };
+    ce("NUM_SEQS", Val::Int(i128::from(num_seqs)))?;
+    ce("NKVH", Val::Int(i128::from(NKVH)))?;
+    ce("GQA", Val::Int(i128::from(geom.gqa())))?;
+    ce("HD", Val::Int(i128::from(HD)))?;
+    ce("SLABS", Val::Int(i128::from(geom.slabs())))?;
+    ce(
+        "STK",
+        Val::Int(i128::from(ktir_superdsc::sdsc_abstract::POOL_STICK)),
+    )?;
+    ce(
+        "W4",
+        Val::Int(i128::from(
+            ktir_superdsc::sdsc_abstract::PagedKvPool::WINDOWS_PER_PAGE,
+        )),
+    )?;
+    ce("PITCH", Val::Int(i128::from(pitch)))?;
+    ce("REGION_PAGES", Val::Int(i128::from(region_pages)))?;
+    ce("SCALE", Val::Float(f64::from(scale)))?;
+    Ok(KernelSpec {
+        kernel: "paged_fold_batched_hm".to_string(),
+        signature,
+        constexprs,
+        file: "paged_fold_batched.py".to_string(),
+    })
+}
+
+/// THE BATCHED FINALIZE PROGRAM'S LAUNCH CONTRACT — `paged_fold_batched_finalize_hm`'s own
+/// parameter order (the output, the carried sum, the carried accumulator). The max is spent
+/// by the last pass, so nothing reads it here — the signature states no `desc_m`, and an
+/// unused parameter is not merely dead weight: Triton may drop it from the compiled
+/// signature and break the parameter-count guard below.
+fn paged_fold_batched_finalize_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
+    f: &PagedFoldBatchedFacts<NQH, NKVH, HD>,
+) -> Result<KernelSpec, String> {
+    let PagedFoldBatchedFacts {
+        geom, num_seqs, ..
+    } = *f;
+    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+    let mut constexprs: HashMap<String, Val> = HashMap::new();
+    for (p, ty) in [
+        ("desc_o", "*fp16"),
+        ("desc_l", "*fp16"),
+        ("desc_acc", "*fp16"),
+    ] {
+        signature.insert(
+            p.to_string(),
+            ArgSpec::parse(ty).map_err(|e| e.to_string())?,
+        );
+    }
+    let mut ce = |k: &str, v: Val| -> Result<(), String> {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), v);
+        Ok(())
+    };
+    ce("NUM_SEQS", Val::Int(i128::from(num_seqs)))?;
+    ce("NKVH", Val::Int(i128::from(NKVH)))?;
+    ce("GQA", Val::Int(i128::from(geom.gqa())))?;
+    ce("HD", Val::Int(i128::from(HD)))?;
+    ce("SLABS", Val::Int(i128::from(geom.slabs())))?;
+    ce(
+        "STK",
+        Val::Int(i128::from(ktir_superdsc::sdsc_abstract::POOL_STICK)),
+    )?;
+    Ok(KernelSpec {
+        kernel: "paged_fold_batched_finalize_hm".to_string(),
+        signature,
+        constexprs,
+        file: "paged_fold_batched.py".to_string(),
+    })
+}
+
+/// THE BATCHED PAGED-FOLD FAMILY'S MINT — the batched twin of [`mint_paged_fold`]: three
+/// programs in PROGRAM ORDER (seed, fold body, finalize), the bindings in the KERNEL's
+/// parameter order, the Kᵀ plane bound to the RESERVED tid keyed on the sealed pair's K
+/// tid and the V plane to the pair's own V tensor, the tables and mask as host-staged step
+/// inputs past the graph (the SAME slot law [`mint_attn`] numbers), and the carry bound to
+/// its three reserved tids — the placements the census mints, gated on the ladder's fold
+/// statement. The BODY carries the fold attribute with `batched_requests: true` — the ONE
+/// door the runtime's fold plan reads to collapse the per-pass walk to the batch's own
+/// page-ordinals (one launch per page-ordinal, every request row folded at once), never
+/// the per-request walk of the solo family.
+fn mint_paged_fold_batched<
+    F: scratchy_subtile::subtile_ir::RopeForm,
+    const NQH: u32,
+    const NKVH: u32,
+    const HD: u32,
+>(
+    geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    scale: f32,
+    region_pages: u32,
+) -> Result<Vec<EmittedOp>, String> {
+    let SubOp::AttnDecode { layout, .. } = &node.op else {
+        return Err(
+            "triton splice: mint_paged_fold_batched called on a node that is not an AttnDecode"
+                .to_string(),
+        );
+    };
+    let num_seqs = node.output.region.rows.len;
+    if num_seqs == 0 {
+        return Err(format!(
+            "triton splice: AttnDecode t{} states a zero-row decode output — the batched \
+             fold's NUM_SEQS is the request count and cannot be 0",
+            node.output.tensor.index()
+        ));
+    }
+    let facts = PagedFoldBatchedFacts {
+        geom,
+        num_seqs,
+        region_pages,
+        scale,
+    };
+    // ONE PROGRAM PER FAMILY MEMBER — grid [1, 1] is the family's own contract: every
+    // descriptor corner is a compile-time constant, the body's page loop is the RUNTIME's
+    // re-launch, not a `tl.static_range` walk.
+    let grid: Vec<i64> = vec![1, 1];
+    let row_src = |row: &TritonKernelRow| -> Result<(&str, Program), String> {
+        match row {
+            TritonKernelRow::Spliced { src, program, .. } => Ok((src, *program)),
+            TritonKernelRow::Refused(why) => Err(why.to_string()),
+        }
+    };
+    let (seed_src, seed_prog) = row_src(&paged_fold_batched_seed_row())?;
+    let (fold_src, fold_prog) = row_src(&paged_fold_batched_row())?;
+    let (fin_src, fin_prog) = row_src(&paged_fold_batched_finalize_row())?;
+    let seed_pos = attn_positional(
+        seed_src,
+        &paged_fold_batched_seed_spec(&facts)?,
+        &grid,
+        seed_prog,
+    )?;
+    let fold_pos = attn_positional(
+        fold_src,
+        &paged_fold_batched_spec(&facts)?,
+        &grid,
+        fold_prog,
+    )?;
+    let fin_pos = attn_positional(
+        fin_src,
+        &paged_fold_batched_finalize_spec(&facts)?,
+        &grid,
+        fin_prog,
+    )?;
+    // ⭐ THE TAPE'S REAL TENSOR INDICES over the adapter's positional ones — the same law
+    // `mint_attn` states: a splice that kept the positional ids would emit descriptors over
+    // `t0/t1/t2` while the tape's buffers are elsewhere.
+    let t =
+        |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
+    // The carry's three reserved tids — the census places exactly these, gated on the fold
+    // statement, so a binding and a placement can never disagree about which tensor is which.
+    let carry = |which: ktir_superdsc::reserved_tids::PagedFoldCarry| BufferId::new(which.tid());
+    let m_tid = carry(ktir_superdsc::reserved_tids::PagedFoldCarry::Max);
+    let l_tid = carry(ktir_superdsc::reserved_tids::PagedFoldCarry::Sum);
+    let acc_tid = carry(ktir_superdsc::reserved_tids::PagedFoldCarry::Acc);
+    // The step-input slot law is `mint_attn`'s own (the mask at 0, the two tables at 1 and 2)
+    // — the fold body states the SAME host-staged inputs the one-shot kernels do, at the
+    // SAME tids, so the placement pass and the runtime's staging treat every attention
+    // program of the bundle alike.
+    let n_tensors = ir.tensors.len() as u32;
+    let law = |slot: u32| BufferId::new(ktir_superdsc::ktir_node::step_input_tid(n_tensors, slot));
+    let mask_tid = law(attn_step_slots::MASK);
+    let kt_ids_tid = law(attn_step_slots::KT_BLOCK_IDS);
+    let v_ids_tid = law(attn_step_slots::V_BLOCK_IDS);
+    // The re-state: the positional node's func with THIS program's own name, bindings, mask
+    // and step inputs. The parameter-count guard is `mint_attn`'s own — the kernel's
+    // parameter list and the row's contract cannot diverge silently.
+    let restate = |positional: KtirNode,
+                   name: &'static str,
+                   bindings: Vec<BufferId>,
+                   mask: Option<BufferId>,
+                   step_inputs: Vec<ktir_superdsc::ktir_node::StepInput>|
+     -> Result<KtirNode, String> {
+        let KtirNode { func, program, .. } = positional;
+        if func.arguments.len() != bindings.len() {
+            return Err(format!(
+                "triton splice: {} compiled to {} parameters but the kernel's order states {} \
+                 bindings — the kernel's parameter list diverged from the row's contract",
+                func.name,
+                func.arguments.len(),
+                bindings.len()
+            ));
+        }
+        Ok(KtirNode {
+            func: ktir_core::ir::IRFunction { name, ..func },
+            program,
+            bindings,
+            mask,
+            step_inputs,
+            node_out_tid: None,
+            minted: Default::default(),
+        })
+    };
+    let id = node.id.index();
+    // ── THE SEED: the carry's three tensors, in the kernel's order (max, sum, accumulator).
+    // No step inputs, no mask — the program touches nothing the host stages. ──
+    let seed = restate(
+        seed_pos,
+        Arena::global().str(format!("attn_s{id}_bfseed")),
+        vec![m_tid, l_tid, acc_tid],
+        None,
+        Vec::new(),
+    )?;
+    // ── THE BODY: q, the carry, the pool planes, the tables, the mask — the kernel's own
+    // parameter order. ──
+    let fold = restate(
+        fold_pos,
+        Arena::global().str(format!("attn_s{id}_bfold")),
+        vec![
+            t(&node.inputs[0]),
+            m_tid,
+            l_tid,
+            acc_tid,
+            // ⭐ THE SCORE GATHER READS THE RESERVED Kᵀ PLANE — `KctResident` keyed on the
+            // sealed pair's K tid, the SAME expression the door's write tail and the solo
+            // fold's body state: minted through the TYPE so the binding cannot be spelled
+            // as the source tid (the gather door classifies it by kind, and a `KctResident`
+            // resolves to the reserved plane placement and nothing else).
+            BufferId::new(
+                ktir_superdsc::reserved_tids::KctResident::of(layout.cache_tensor().index() as u32)
+                    .wire_tid(),
+            ),
+            BufferId::new(layout.v_cache_tensor().index() as u32),
+            kt_ids_tid,
+            v_ids_tid,
+            mask_tid,
+        ],
+        Some(mask_tid),
+        vec![
+            ktir_superdsc::ktir_node::StepInput {
+                buffer: kt_ids_tid,
+                slot: attn_step_slots::KT_BLOCK_IDS,
+            },
+            ktir_superdsc::ktir_node::StepInput {
+                buffer: v_ids_tid,
+                slot: attn_step_slots::V_BLOCK_IDS,
+            },
+            ktir_superdsc::ktir_node::StepInput {
+                buffer: mask_tid,
+                slot: attn_step_slots::MASK,
+            },
+        ],
+    )?;
+    // ── THE FINALIZE: the output, the sum, the accumulator — in the kernel's order. ──
+    let fin = restate(
+        fin_pos,
+        Arena::global().str(format!("attn_s{id}_bffin")),
+        vec![t(&node.output), l_tid, acc_tid],
+        None,
+        Vec::new(),
+    )?;
+    // The BODY carries the fold attribute — the family's launch-ABI laws, stated at the one
+    // door the walk's stamp and the bake's proof read. `batched_requests: true` is what
+    // collapses the runtime's per-pass walk to the batch's own page-ordinals;
+    // `fold_rows: WholeBatch` is the batched carry's own regime (the whole batch's carry
+    // advances together — no per-request intermediate). `page_slots` is restated from the
+    // shared device law so the stamp never re-derives it.
+    let mut body = EmittedOp::paged_fold(
+        format!("attn_s{id}_bfold"),
+        ktir_superdsc::sdsc_abstract::PagedFold {
+            gathered: true,
+            batched_requests: true,
+            fold_rows: ktir_superdsc::sdsc_abstract::FoldRowRegime::WholeBatch,
+            page_slots: ktir_superdsc::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32,
+        },
+    );
+    body.ktir = Some(fold);
+    let mut seed_op = EmittedOp::bare(format!("attn_s{id}_bfseed"));
+    seed_op.ktir = Some(seed);
+    let mut fin_op = EmittedOp::bare(format!("attn_s{id}_bffin"));
+    fin_op.ktir = Some(fin);
+    Ok(vec![seed_op, body, fin_op])
+}
+
 /// THE ATTENTION MINT — the adapter's `node_for` compilation ([`attn_positional`]), then the
 /// attention's own re-state: the bindings in the KERNEL's parameter order (q, out, the two
 /// pool planes, the two block-entry tables, the mask), the Kᵀ plane bound to the RESERVED name
@@ -2867,6 +3333,16 @@ fn mint_paged_fold<
 /// step inputs past the graph (numbered through the one shared `step_input_tid` law and STATED
 /// on the node, so the producer's placement pass places exactly those tids and the runtime
 /// discovers them by placement), and the builder's `attn_s{id}` name.
+///
+/// ⭐ BOTH ROWS STATE THE SAME FIRST SEVEN: the two block-entry tables and the mask, the
+/// contract every attention program of a bundle declares. The decode row states ONE MORE —
+/// its OWN repetition table (`desc_rep`, slot `REP`): the batched decode's score rows are
+/// request-major while its q and o bytes ride head-major rows, and the table is the bridge
+/// between the two orders (an identity at one request). The prefill row's score rows ARE its
+/// q rows (token rows), so it declares nothing past the seven and this mint adds the eighth
+/// binding only when `rows_are_requests` — the same routing bit that chose the kernel at
+/// [`lower_attn_at`], threaded here so the binding list and the kernel's own parameter list
+/// are decided by ONE fact, never two that can disagree.
 fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
@@ -2878,15 +3354,10 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
             "triton splice: mint_attn called on a node that is not an AttnDecode".to_string(),
         );
     };
-    // ⛔ THE KERNEL'S ORDER, NOT `lower_one`'s — and the two rows state DIFFERENT contracts:
-    // the decode kernel (`batched_decode_hm`) takes q, OUT, the two pool planes, Q's
-    // row-repetition table, the two block-entry tables, the mask; the prefill kernel
-    // (`batched_prefill_hm`) states no repetition (its BATCH is Q's own rows, each used
-    // once), so its list stops at the mask. `rows_are_requests` is the same routing bit
-    // that chose the kernel, so the binding list states the contract of the kernel the
-    // router compiled. `regions()` zips `bindings[i]` against `arguments[i]`, so a swapped
-    // or extra binding is a descriptor over the wrong tensor — the parameter-count guard
-    // below refuses the divergence.
+    // ⛔ THE KERNEL'S ORDER, NOT `lower_one`'s — the shared seven-parameter contract both
+    // rows state, plus the decode row's own repetition table. `regions()` zips
+    // `bindings[i]` against `arguments[i]`, so a swapped or extra binding is a descriptor
+    // over the wrong tensor — the parameter-count guard below refuses the divergence.
     let t =
         |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
     // ⭐ THE SYNTHETIC BINDING SLOTS — the contract's own `attn_step_slots` table (the
@@ -2897,8 +3368,7 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     let mask_tid = law(attn_step_slots::MASK);
     let kt_ids_tid = law(attn_step_slots::KT_BLOCK_IDS);
     let v_ids_tid = law(attn_step_slots::V_BLOCK_IDS);
-    let rep_ids_tid = law(attn_step_slots::REP_ROW_IDS);
-    // The decode row's repetition table (slot 3); the prefill row states none.
+    let rep_tid = law(attn_step_slots::REP);
     let mut bindings = vec![
         t(&node.inputs[0]),
         t(&node.output),
@@ -2920,10 +3390,31 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         v_ids_tid,
         mask_tid,
     ];
+    // ⭐ THE DECODE ROW'S OWN EIGHTH BINDING — the repetition table, the only parameter the
+    // two kernels' contracts do not share. Pushed (never spliced mid-list) so the shared
+    // seven keep their positions verbatim, and the step-input statement follows the same
+    // condition as the binding: a declared-but-unstaged slot is the fill side's desync to
+    // refuse, never a default this mint could paper over.
+    let mut step_inputs = vec![
+        ktir_superdsc::ktir_node::StepInput {
+            buffer: kt_ids_tid,
+            slot: attn_step_slots::KT_BLOCK_IDS,
+        },
+        ktir_superdsc::ktir_node::StepInput {
+            buffer: v_ids_tid,
+            slot: attn_step_slots::V_BLOCK_IDS,
+        },
+        ktir_superdsc::ktir_node::StepInput {
+            buffer: mask_tid,
+            slot: attn_step_slots::MASK,
+        },
+    ];
     if rows_are_requests {
-        // Position 4: after the two pool planes, before the block-entry tables —
-        // the decode kernel's own parameter order (`desc_rep_ids` past `desc_v`).
-        bindings.insert(4, rep_ids_tid);
+        bindings.push(rep_tid);
+        step_inputs.push(ktir_superdsc::ktir_node::StepInput {
+            buffer: rep_tid,
+            slot: attn_step_slots::REP,
+        });
     }
     let name = Arena::global().str(format!("attn_s{}", node.id.index()));
     let KtirNode { func, program, .. } = positional;
@@ -2941,29 +3432,7 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         program,
         bindings,
         mask: Some(mask_tid),
-        step_inputs: {
-            let mut staged = vec![
-                ktir_superdsc::ktir_node::StepInput {
-                    buffer: kt_ids_tid,
-                    slot: attn_step_slots::KT_BLOCK_IDS,
-                },
-                ktir_superdsc::ktir_node::StepInput {
-                    buffer: v_ids_tid,
-                    slot: attn_step_slots::V_BLOCK_IDS,
-                },
-                ktir_superdsc::ktir_node::StepInput {
-                    buffer: mask_tid,
-                    slot: attn_step_slots::MASK,
-                },
-            ];
-            if rows_are_requests {
-                staged.push(ktir_superdsc::ktir_node::StepInput {
-                    buffer: rep_ids_tid,
-                    slot: attn_step_slots::REP_ROW_IDS,
-                });
-            }
-            staged
-        },
+        step_inputs,
         node_out_tid: None,
         minted: Default::default(),
     })

@@ -5748,7 +5748,7 @@ pub const ATTN_MASK_NEG: f32 = -(half::f16::MAX.to_f32_const() / 2.0);
 /// f16-exact — the format's own max — so the narrowing stores it exactly.
 ///
 /// Role two — THE LANES. The validity-mask builders' masked-lane bytes ([`spliced_attn_mask_f16`],
-/// [`spliced_decode_mask_f16`]). A masked lane's score is `qk + floor`, which SATURATES at the
+/// [`spliced_batched_mask_f16`]). A masked lane's score is `qk + floor`, which SATURATES at the
 /// floor in f16 (never `-inf`), so a masked lane's `p` is exactly `e^0 = 1` while `m` sits at the
 /// seed and exactly `0` once any valid lane raises `m` past it — the expunge the `l`-invariant
 /// states, whose edge (a row whose whole sweep is empty never raises `m`) is the row-sweep
@@ -10632,9 +10632,15 @@ mod kv_cache_write_pitch_proofs {
 /// bake-time table would be a second thing to keep in step with the splice's own constants.
 ///
 /// Every attention program of a bundle — the one-shot kernels and the paged-fold family's body —
-/// states the SAME slots, so the placement pass and the runtime's staging treat them alike. Slot
-/// 0 keeps the mask on the tid the wiring's own one-past-the-graph law already assigns it, so
-/// nothing pre-existing moves.
+/// states the SAME first three slots, so the placement pass and the runtime's staging treat them
+/// alike. Slot 0 keeps the mask on the tid the wiring's own one-past-the-graph law already assigns
+/// it, so nothing pre-existing moves. The fourth slot is the DECODE row's own: the batched
+/// attention's score rows are request-major while its q and o bytes ride head-major rows (the two
+/// orders meet as one identity only at one request), so the batched decode kernel states ONE more
+/// step input — the repetition table that bridges the two orders. The chunk-family rows (one
+/// sequence's token rows) and the paged-fold family's own rows need no bridge, so they declare
+/// nothing there: the fill side treats a declared-but-unstaged or staged-but-undeclared slot as
+/// the bake/host desync it is, never a default.
 pub mod attn_step_slots {
     /// The additive validity mask at the score tile's own rows.
     pub const MASK: u32 = 0;
@@ -10643,10 +10649,11 @@ pub mod attn_step_slots {
     pub const KT_BLOCK_IDS: u32 = 1;
     /// The V plane's block-entry table — the V plane's own block numbering.
     pub const V_BLOCK_IDS: u32 = 2;
-    /// Q's row-repetition table — torch's `rep_row_ids` values, one Q row index per
-    /// `[BATCH, GQA]` entry of the pre-repeated frame the decode kernel's score dot pairs
-    /// with the gathered blocks.
-    pub const REP_ROW_IDS: u32 = 3;
+    /// The batched decode row's repetition table — `[slabs · pitch rows]` i32, the bridge from
+    /// the request-major score row to the head-major q/o row (`slice σ`'s entry `r` is
+    /// `rep[r] · slabs + σ`, `rep[r] = (r % nqh) · num_seqs + (r / nqh)`). Declared by the
+    /// batched decode row only; an identity at one request, so the solo decode changes no bytes.
+    pub const REP: u32 = 3;
 }
 
 impl PagedKvPool {
@@ -10710,6 +10717,14 @@ fn pitch_at(ktb: u32) -> u32 {
         b = r;
     }
     ktb * 4 / a * (POOL_STICK * 2)
+}
+
+/// ⭐ THE COMMON PITCH AT THE BATCHED STICK — [`pitch_at`] at `num_seqs · nkvh`, the
+/// value-side twin the batched family's kernel specs read BEFORE any region is minted (the
+/// spec states `PITCH` as a constexpr; the region type states the same number once the
+/// placement's extent is in hand). `None` on a stick width no `u32` states.
+pub fn batched_table_pitch(num_seqs: u32, nkvh: u32) -> Option<u32> {
+    num_seqs.checked_mul(nkvh).map(pitch_at)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -11093,58 +11108,75 @@ pub fn spliced_attn_mask_f16(
     })
 }
 
-/// ⭐⭐⭐⭐⭐ THE BATCHED-DECODE FAMILY'S STEP-INPUT FACTS — what `batched_decode_hm` stated, as
-/// ONE value minted from the placements' own extents. The entry count is the vendor's index
-/// stick ([`CopyDims::ENTRIES_PER_OP`], the SenUint32 law), split into `BLOCKS_PER_CHUNK`
-/// chunk-slots per sequence; the chunk count is the KT ids slot's own extent divided by one
-/// chunk's table, so a bake/host disagreement about the chunking refuses here rather than
-/// staging real block numbers from the wrong layout.
+/// ⭐⭐⭐⭐⭐ THE REGION THE BATCHED-DECODE STEP INPUTS STATE — the page-major extent the
+/// batched one-shot kernel walks and the batched paged-fold family's per-pass shift crosses,
+/// as ONE value minted from the placement's own byte extent. The batched twin of
+/// [`SplicedAttnRegion`], at the BATCHED family's own stick width: `KTB = num_seqs · nkvh`
+/// (every sequence's every kv head, named once — this family's score rows are the NATURAL Q
+/// rows, so the stick names sequences, not group replicas), `PG = KTB · gqa` the flat score
+/// row count.
+///
+/// The one-shot kernel (`batched_decode_hm`) and the batched fold family
+/// (`paged_fold_batched`) state the SAME region and the SAME pitch — the per-window mask
+/// bytes (`PG·STK·2`) are exactly the per-window table block (`SLABS·PITCH`, with `MQ` trip
+/// slots per window) — so ONE staged buffer serves whichever body the selector runs, and the
+/// fold's single per-pass Activation delta walks the tables and the mask by one number.
+///
+/// ⛔ MINTED FROM THE MASK SLOT'S OWN EXTENT, never from a page count a caller computed: the
+/// placement states the ladder's declared region (every rung of the batched ladder states the
+/// same one), and a region re-derived from the live context is a second derivation of a bake
+/// fact. A non-divisor refuses: a mask extent that is not a whole number of `W4·PG`-row page
+/// blocks — or a pitch law whose trip-slot count does not come out whole — is a bake/stage
+/// disagreement, not a rounding decision.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct SplicedDecodeBatch {
-    pool: PagedKvPool,
-    gqa: NonZeroU32,
+pub struct SplicedBatchRegion {
+    pages: u32,
     num_seqs: NonZeroU32,
-    chunks: u32,
+    gqa: NonZeroU32,
+    pool: PagedKvPool,
 }
 
-impl SplicedDecodeBatch {
-    /// ONE door — the KT ids slot's placement extent in bytes, the pool, the GQA group, and the
-    /// launch's row count. `None` when the entry stick does not split evenly over the sequences
-    /// (a batch width this family does not state), or the extent is not a whole number of chunk
-    /// tables.
-    pub fn of_ids_extent(
+impl SplicedBatchRegion {
+    /// ONE door — the MASK slot's placement extent in bytes, the pool, the GQA group, and the
+    /// launch's row count. `None` when the pool's stick geometry does not divide, the pitch
+    /// law's trip-slot count is not whole, or the extent is not a whole number of page blocks
+    /// at this geometry.
+    pub fn of_mask_extent(
         extent_bytes: u64,
         pool: PagedKvPool,
         gqa: NonZeroU32,
         num_seqs: NonZeroU32,
     ) -> Option<Self> {
-        let entries = CopyDims::ENTRIES_PER_OP;
-        if !entries.is_multiple_of(num_seqs.get()) {
-            return None;
-        }
         let w4 = pool.windows_per_page();
-        let ktb = entries.checked_mul(pool.nkvh())?;
-        // One chunk's table: every (window, slab) trip's `KTB` entries, slab-major — the
-        // kernel's own `[NUM_CHUNKS·W4·SLABS·KTB]` stick.
-        let per_chunk = u64::from(w4)
-            * u64::from(pool.window_slabs()?)
-            * u64::from(ktb)
-            * 4;
-        if per_chunk == 0 || !extent_bytes.is_multiple_of(per_chunk) {
+        let slabs = pool.window_slabs()?;
+        let ktb = num_seqs.get().checked_mul(pool.nkvh())?;
+        let pg = ktb.checked_mul(gqa.get())?;
+        // The pitch law: the per-window mask bytes (PG rows of STK·2) over the per-window
+        // table block (SLABS·PITCH) must be a WHOLE count of trip slots — the agreement that
+        // lets the fold's one shift walk both tensors, refused rather than rounded.
+        let per_window = slabs as u64 * u64::from(pitch_at(ktb));
+        if per_window == 0 || !(u64::from(pg) * POOL_STICK as u64 * 2).is_multiple_of(per_window) {
             return None;
         }
-        let chunks = u32::try_from(extent_bytes / per_chunk).ok()?;
-        (chunks > 0).then_some(SplicedDecodeBatch {
-            pool,
-            gqa,
+        // One page block of the mask: `W4·PG` rows at `STK·2` bytes each — the same bytes the
+        // ids tables' `W4·MQ` trip slots take (the pitch law above is that agreement, as a
+        // count).
+        let block = u64::from(w4) * u64::from(pg) * POOL_STICK as u64 * 2;
+        if block == 0 || !extent_bytes.is_multiple_of(block) {
+            return None;
+        }
+        let pages = u32::try_from(extent_bytes / block).ok()?;
+        (pages > 0).then_some(SplicedBatchRegion {
+            pages,
             num_seqs,
-            chunks,
+            gqa,
+            pool,
         })
     }
 
-    /// The chunk count the ids tables state.
-    pub const fn chunks(self) -> u32 {
-        self.chunks
+    /// The region's page count — the extent both id tables and the mask state.
+    pub const fn pages(self) -> u32 {
+        self.pages
     }
 
     /// The launch's row count — every sequence of the rung, padding rows included.
@@ -11152,23 +11184,19 @@ impl SplicedDecodeBatch {
         self.num_seqs
     }
 
-    fn entries(self) -> u32 {
-        CopyDims::ENTRIES_PER_OP
+    /// The id stick's width — every sequence's every kv head in one window, named once:
+    /// `num_seqs · nkvh`, the batched family's OWN `KTB` (where the solo region's
+    /// [`SplicedAttnRegion::ktb`] answers `nkvh · gqa`). A product of two non-zeros.
+    pub fn ktb(self) -> u32 {
+        self.num_seqs.get() * self.pool.nkvh()
     }
 
-    /// The chunk-slots one sequence holds per chunk — `ENTRIES / num_seqs`.
-    pub fn blocks_per_chunk(self) -> u32 {
-        self.entries() / self.num_seqs.get()
-    }
-
-    /// ⭐ THE FIRST WINDOW'S ROW COUNT, IN THE MASK'S OWN ROW ORDER — `ktb · gqa`, the rows of
-    /// chunk 0, window 0: every (sequence, kv head, group replica) exactly once, contiguous and
-    /// leading, which is what makes [`ValidityMask::first_window_valid_keys`]'s slice this
-    /// family's seed-safety reading. Stated as ONE door because the parts are the batch's own
-    /// private arithmetic — a caller re-deriving `ktb · gqa` from the pool and the group would be
-    /// a second spelling of this fact, free to disagree with the mask's row order. A product of
-    /// two non-zeros (`of_ids_extent` refuses a zero `per_chunk`, so `ktb ≥ 1`; `gqa` is
-    /// `NonZeroU32`), per the `QueryRows::total_rows` precedent.
+    /// ⭐ THE FLAT SCORE-ROW COUNT — `KTB · GQA`, the Q rows the score tile owns and the
+    /// mask's per-window row count. Stated as ONE door because the parts are the batch's own
+    /// private arithmetic — a caller re-deriving `KTB · gqa` from the pool, the group, and
+    /// the row count would be a second spelling of this fact, free to disagree with the
+    /// mask's row order. A product of two non-zeros (`of_mask_extent` refuses a zero block,
+    /// so `KTB ≥ 1`; `gqa` is `NonZeroU32`), per the `QueryRows::total_rows` precedent.
     pub fn first_window_rows(self) -> NonZeroU32 {
         match NonZeroU32::new(self.ktb() * self.gqa.get()) {
             Some(n) => n,
@@ -11176,140 +11204,200 @@ impl SplicedDecodeBatch {
         }
     }
 
-    fn ktb(self) -> u32 {
-        self.entries() * self.pool.nkvh()
+    /// The 64-slot windows one kv head's page holds.
+    pub fn w4(self) -> u32 {
+        self.pool.windows_per_page()
     }
 
-    fn w4(self) -> u32 {
-        self.pool.windows_per_page()
+    /// The 64-lane slabs one window spans — [`PagedKvPool::window_slabs`], the region's own
+    /// spelling of the pool's slab grid.
+    pub fn slabs(self) -> Option<u32> {
+        self.pool.window_slabs()
+    }
+
+    /// ⭐ THE COMMON PITCH — the per-trip byte pitch the id tables and the mask are BOTH
+    /// padded to ([`pitch_at`] at the region's own [`KTB`](Self::ktb)), the one number the
+    /// fold's single per-pass Activation shift advances. The value-side twin of
+    /// [`AttnGeometry::table_pitch`](AttnGeometry::table_pitch) at the batched stick.
+    pub fn table_pitch(self) -> u32 {
+        pitch_at(self.ktb())
+    }
+
+    /// The trip slots one window's table states — `MQ`, the pitch law's own count
+    /// `PG·STK·2 / (SLABS·PITCH)`. `Some` by construction: the mint refused the region
+    /// otherwise, so this never re-refuses.
+    pub fn mq(self) -> Option<u32> {
+        let per_window = self.slabs()? as u64 * u64::from(self.table_pitch());
+        Some((u64::from(self.first_window_rows().get()) * POOL_STICK as u64 * 2 / per_window) as u32)
+    }
+
+    /// The trip slots one page block of the table states — `W4 · MQ`.
+    pub fn sticks_per_page(self) -> Option<u32> {
+        Some(self.w4() * self.mq()?)
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE BATCHED FAMILY'S STEP INPUTS, MINTED BY ONE WALK — both id tables and
+    /// the validity mask, as ONE value (the batched twin of
+    /// [`SplicedAttnRegion::chunk_step_inputs`]). `maps` and `hists` are one page map and one
+    /// history per LAUNCH ROW in slot order — padding rows carry live 0's, the same maps the
+    /// launch installed — and `write` is the batch's ONE shared write slot. `None` on a map
+    /// or history count that is not the launch's row count, an empty map, or an entry the
+    /// ceiling refuses.
+    pub fn batched_step_inputs(
+        self,
+        maps: &[Vec<i64>],
+        hists: &[KvHistory],
+        write: BatchSlot,
+        ceiling: GatherEntryCeiling,
+    ) -> Option<AttnStepInputs> {
+        Some(AttnStepInputs {
+            kt: spliced_batched_ids_table(KvPlane::Kt, self, maps, ceiling)?,
+            v: spliced_batched_ids_table(KvPlane::V, self, maps, ceiling)?,
+            mask: spliced_batched_mask_f16(self, hists, write)?,
+        })
     }
 }
 
 /// ⭐⭐⭐⭐⭐ THE BATCHED-DECODE BLOCK-ENTRY TABLE — the index values in `batched_decode_hm`'s
-/// own read order: `[NUM_CHUNKS·W4·SLABS·KTB]`, chunk-major, window-major within a chunk,
-/// SLAB-MAJOR within a window (slab `s`'s `KTB` entries at `((c·W4 + w)·SLABS + s)·KTB`),
-/// entry-major within a slab (entry `j·B + s`, then kv head). Stick `(c·W4 + w)`'s entry
-/// `(e, kvh)` names sequence `s`'s logical page `c·BLOCKS_PER_CHUNK + j` at the kv head's own
-/// slab block of that window — ⭐ EVERY VALUE IS A SLAB BLOCK OF ONE PLANE, minted through
-/// [`GatherEntry::of_slab_block`] with the per-plane composition the pool's addr law names: Kᵗ
-/// and V number a page's slab blocks DIFFERENTLY at `slabs > 1`, so the two tables are this one
-/// builder walked with two planes, never one table staged twice.
+/// own read order at the COMMON PITCH: a flat `[REGION_PAGES·W4·MQ·SLABS·PITCH/4]` stick of
+/// i32 entries, page-major over the region, one TRIP SLOT per window (`W4·MQ` slots per page
+/// block, the first `W4` meaningful, the tail unread padding), each slot `SLABS·PITCH/4`
+/// entries wide — the trip's slabs spaced `KTB_PAD` entries apart (the per-slab spacing
+/// padded to a whole `SenUint32` stick, the unit the IBR loads index runs in; always inside
+/// the slot, because `PITCH/4` is a multiple of 32 at least `KTB`), slab `s`'s `KTB` real
+/// entries at its head, the pads unread.
 ///
-/// `maps` is one page map per LAUNCH ROW in slot order — padding rows carry live 0's, the same
-/// maps the launch installed. A row's map shorter than the chunk count repeats its own last page
-/// (masked; never 0, which is a real address). `None` on a map count that is not the launch's
-/// row count, an empty map, or an entry the ceiling refuses.
-pub fn spliced_decode_ids_table(
+/// ⭐ ENTRY `b` OF THE STICK IS `(sequence, kv head)` — `b = s_seq·NKVH + kvh`, the score
+/// tile's own flat row law (the score's row `b·GQA + g` IS the natural Q row, so the J-stick
+/// and its repetition table are this family's deleted history). Every value is a SLAB BLOCK
+/// OF ONE PLANE, minted through [`GatherEntry::of_slab_block`] with the per-plane composition
+/// the pool's addr law names: Kᵗ and V number a page's slab blocks DIFFERENTLY at `slabs > 1`,
+/// so the two tables are this one builder walked with two planes, never one table staged
+/// twice.
+///
+/// `maps` is one page map per LAUNCH ROW in slot order — padding rows carry live 0's, the
+/// same maps the launch installed. Page-ordinal `s` of row `s_seq`'s map, or the map's own
+/// last page when the map is shorter (masked; never 0, which is a real address). The PAD
+/// slots past each page's first `W4` carry the page's last window's entries, and the PAD
+/// ENTRIES past each trip's `SLABS·KTB` repeat its last entry, so every staged entry names a
+/// written, in-pool block. `None` on a map count that is not the launch's row count, an
+/// empty map, or an entry the ceiling refuses — never a zero table, because zero is block 0,
+/// a REAL address.
+pub fn spliced_batched_ids_table(
     plane: KvPlane,
-    batch: SplicedDecodeBatch,
+    region: SplicedBatchRegion,
     maps: &[Vec<i64>],
     ceiling: GatherEntryCeiling,
 ) -> Option<Vec<GatherEntry>> {
-    if maps.len() != batch.num_seqs.get() as usize {
+    if maps.len() != region.num_seqs.get() as usize {
         return None;
     }
-    let (w4, ktb, bpc) = (batch.w4(), batch.ktb(), batch.blocks_per_chunk());
-    let slabs = batch.pool.window_slabs()?;
-    let nkvh = batch.pool.nkvh();
-    let seqs = batch.num_seqs.get();
+    let (nkvh, ktb) = (region.pool.nkvh(), region.ktb());
+    let w4 = region.w4();
+    let slabs = region.slabs()?;
+    let sticks = region.sticks_per_page()?;
+    let per_trip = slabs as usize * pitch_at(ktb) as usize / 4;
+    // ⭐ THE PER-SLAB SPACING IS A WHOLE `SenUint32` STICK — the gather's index runs start at
+    // `trip + slab·KTB_PAD`, and the IBR is loaded one 32-entry stick at a time, so a run
+    // start that is not a whole stick hands the core words of two different runs (a clean
+    // bake, a wrong address). `PITCH/4` is itself a multiple of 32 at least `KTB` (PITCH is
+    // the lcm of `KTB·4` and 128), so the padded spacing always fits inside the trip slot —
+    // a law of the pitch, never a check here.
+    let index_stick =
+        <crate::superdsc_opspec::SenUint32 as crate::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+            as usize;
+    let ktb_pad = ktb.next_multiple_of(index_stick as u32) as usize;
     let mut out =
-        Vec::with_capacity(batch.chunks() as usize * w4 as usize * slabs as usize * ktb as usize);
-    for c in 0..batch.chunks() {
-        for w in 0..w4 {
+        Vec::with_capacity(region.pages() as usize * sticks as usize * per_trip);
+    for s in 0..region.pages() {
+        for k in 0..sticks {
+            // The first W4 slots are the page's own windows; the pad tail repeats the last
+            // one, so a pad entry is an in-pool written block rather than a hole the
+            // geometry left.
+            let window = k.min(w4 - 1);
             for slab in 0..slabs {
                 for b in 0..ktb {
-                    // Entry b is (entry e, kv head) — entry-major, then kv head, the stick's own order.
-                    let (e, kvh) = (b / nkvh, b % nkvh);
-                    let (j, s) = (e / seqs, e % seqs);
-                    let map = maps.get(s as usize)?;
+                    // Entry b is (sequence, kv head) — the score tile's own flat row law.
+                    let (seq, kvh) = (b / nkvh, b % nkvh);
+                    let map = maps.get(seq as usize)?;
                     let phys = map
-                        .get((c * bpc + j) as usize)
+                        .get(s as usize)
                         .copied()
                         .or_else(|| map.last().copied())?;
                     out.push(GatherEntry::of_slab_block(
-                        plane, batch.pool, ceiling, phys, kvh, w, slab,
+                        plane, region.pool, ceiling, phys, kvh, window, slab,
                     )?);
                 }
+                // The per-slab pad to the whole-stick spacing — unread, and repeating the
+                // slab's last entry so every staged entry names a written, in-pool block.
+                let last_entry = *out.last()?;
+                for _ in ktb as usize..ktb_pad {
+                    out.push(last_entry);
+                }
+            }
+            // The pitch pad past the trip's last slab — unread, and repeating the trip's
+            // last entry so every staged entry names a written, in-pool block.
+            let last_entry = *out.last()?;
+            for _ in (slabs as usize * ktb_pad)..per_trip {
+                out.push(last_entry);
             }
         }
     }
     Some(out)
 }
 
-/// ⭐⭐⭐⭐⭐ THE BATCHED-DECODE REPETITION TABLE — torch's own `rep_row_ids` values at the
-/// kernel's wire width: entry `(b, g)` of the `[BATCH·GQA]` frame names the Q row the
-/// pre-repeated buffer's row held, `(j·B+s)·NKVH·GQA + kvh·GQA + g → s·NKVH·GQA + kvh·GQA + g`.
-/// The entry order is the score tile's own — (chunk slot, sequence, kv head, group) — so the
-/// gather the kernel states pairs each score row with its request's query row.
-pub fn spliced_decode_rep_ids(batch: SplicedDecodeBatch) -> Vec<i32> {
-    let (ktb, gqa) = (batch.ktb(), batch.gqa.get());
-    let (nkvh, seqs) = (batch.pool.nkvh(), batch.num_seqs.get());
-    let mut out = Vec::with_capacity(ktb as usize * gqa as usize);
-    for b in 0..ktb {
-        let (e, kvh) = (b / nkvh, b % nkvh);
-        let (_, s) = (e / seqs, e % seqs);
-        for g in 0..gqa {
-            let row = (s * nkvh + kvh) * gqa + g;
-            out.push(row as i32);
-        }
-    }
-    out
-}
-
-/// ⭐⭐⭐⭐⭐ THE BATCHED-DECODE ADDITIVE MASK — `[NUM_CHUNKS·W4·BATCH·GQA, 64]` f16,
-/// PRE-REPLICATED xGQA to the score tile's own rows (the kernel adds it as a pure flat reshape,
-/// no broadcast): row `(c·W4 + w)·BATCH·GQA + b·GQA + g`, lane `cc`, is `0.0` where logical slot
-/// `(c·BPC + j)·PAGE_SLOTS + w·64 + cc` holds row `s`'s own key, the f16 floor
-/// [`ATTN_SEED_FLOOR`] elsewhere.
+/// ⭐⭐⭐⭐⭐ THE BATCHED-DECODE ADDITIVE VALIDITY MASK — DENSE `[REGION_PAGES·W4·PG, 64]`
+/// f16 rows, PRE-REPLICATED xGQA to the score tile's own rows (the kernel adds it as a pure
+/// flat reshape, no broadcast): row `(p·W4 + w)·PG + (b·GQA + g)`, lane `cc`, is `0.0` where
+/// logical slot `p·PAGE_SLOTS + w·64 + cc` holds sequence `b / NKVH`'s own key, the f16
+/// floor [`ATTN_SEED_FLOOR`] elsewhere. Per-window rows are `PG` exactly — no pad mask rows:
+/// this family's pitch law pads the TABLES into the mask's bytes, not the mask into itself.
 ///
 /// `hists` is one history per LAUNCH ROW in slot order (padding rows carry live 0's), and
-/// `write` is the batch's ONE shared write slot — every row's new key lands there this step, in
-/// its own page, so the slot is valid for every row that reads it back. `None` on a history
-/// count that is not the launch's row count. The rows carry their [`ValidKeys`] counts with the
-/// bytes (minted by the same loop) — this family's coverage is a placement fact, checked at
-/// mint, not a theorem of the constructor's own types like the chunk family's seed-safety law.
-pub fn spliced_decode_mask_f16(
-    batch: SplicedDecodeBatch,
+/// `write` is the batch's ONE shared write slot — every row's new key lands there this step,
+/// in its own page, so the slot is valid for every row that reads it back. `None` on a
+/// history count that is not the launch's row count. The rows carry their [`ValidKeys`]
+/// counts with the bytes (minted by the same loop) — this family's coverage is a placement
+/// fact, checked at mint, not a theorem of the constructor's own types like the chunk
+/// family's seed-safety law.
+pub fn spliced_batched_mask_f16(
+    region: SplicedBatchRegion,
     hists: &[KvHistory],
     write: BatchSlot,
 ) -> Option<ValidityMask> {
-    if hists.len() != batch.num_seqs.get() as usize {
+    if hists.len() != region.num_seqs.get() as usize {
         return None;
     }
-    let (w4, ktb, bpc) = (batch.w4(), batch.ktb(), batch.blocks_per_chunk());
-    let (gqa, nkvh, seqs) = (batch.gqa.get(), batch.pool.nkvh(), batch.num_seqs.get());
-    let page_slots = PagedKvPool::PAGE_SLOTS;
+    let (gqa, nkvh) = (region.gqa.get() as usize, region.pool.nkvh() as usize);
+    let pg = region.first_window_rows().get() as usize;
+    let (w4, page_slots) = (region.w4() as usize, PagedKvPool::PAGE_SLOTS);
     let neg = ATTN_SEED_FLOOR.to_le_bytes();
     let zero = half::f16::from_f32(0.0).to_le_bytes();
-    let rows = batch.chunks() as usize * w4 as usize * ktb as usize * gqa as usize;
+    let rows = region.pages() as usize * w4 * pg;
     let mut m = Vec::with_capacity(rows * 64 * 2);
     let mut valid = Vec::with_capacity(rows);
-    for c in 0..batch.chunks() {
-        for w in 0..w4 {
-            for b in 0..ktb {
-                // Entry b is (entry e, kv head); entry e is (chunk slot j, sequence s) — the
-                // stick's own order, decomposed once for the history and the logical page both.
-                let (e, _) = (b / nkvh, b % nkvh);
-                let (j, s) = (e / seqs, e % seqs);
-                let hist = &hists[s as usize];
-                // The g-lanes are pre-replicated — identical bytes per group — so the loop
-                // states the tile's own row count, not new facts.
-                for _g in 0..gqa {
-                    let slot_base = (c * bpc + j) as usize * page_slots + w as usize * 64;
-                    let mut lanes = 0u32;
-                    for cc in 0..64 {
-                        let slot = slot_base + cc;
-                        if hist.contains(slot) || slot == write.get() as usize {
-                            lanes += 1;
-                            m.extend_from_slice(&zero);
-                        } else {
-                            m.extend_from_slice(&neg);
-                        }
-                    }
-                    valid.push(ValidKeys::of(lanes)?);
-                }
+    for r in 0..rows {
+        // Row r is `(p·W4 + w)·PG + (b·GQA + g)` — the kernel's own load corner (the score
+        // tile's flat row, which IS the natural Q row), decomposed once for the history and
+        // the flat row both.
+        let p = r / (w4 * pg);
+        let rem = r % (w4 * pg);
+        let (w, flat) = (rem / pg, rem % pg);
+        let hist = &hists[flat / gqa / nkvh];
+        // The g-lanes are pre-replicated — identical bytes per group — so the loop states
+        // the tile's own row count, not new facts.
+        let slot_base = p * page_slots + w * 64;
+        let mut lanes = 0u32;
+        for cc in 0..64 {
+            let slot = slot_base + cc;
+            if hist.contains(slot) || slot == write.get() as usize {
+                lanes += 1;
+                m.extend_from_slice(&zero);
+            } else {
+                m.extend_from_slice(&neg);
             }
         }
+        valid.push(ValidKeys::of(lanes)?);
     }
     // One 64-lane window per row — the pre-replicated rows ARE windows, the pitch the counts
     // above were minted at.
