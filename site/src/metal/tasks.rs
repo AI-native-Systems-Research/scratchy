@@ -30,12 +30,16 @@ pub fn workload_label(w: &str) -> (&'static str, &'static str) {
             "short questions sharing one long system prompt",
         ),
         "shared-prefix-control" => ("Shared prompt, no reuse", "the same, every prompt its own"),
+        "rag-accuracy" => (
+            "RAG accuracy",
+            "a full run's RAG over more tasks, for its accuracy alone",
+        ),
         _ => ("dataset", ""),
     }
 }
 
 /// The page's order: the quick run's workloads first.
-const ORDER: [&str; 7] = [
+const ORDER: [&str; 8] = [
     "sharegpt",
     "rag",
     "rag-spans",
@@ -43,7 +47,11 @@ const ORDER: [&str; 7] = [
     "longbench",
     "shared-prefix",
     "shared-prefix-control",
+    "rag-accuracy",
 ];
+
+/// Fewer tasks than this and a cell's accuracy is indicative: at 8 a task is 12.5 points of it.
+const FIRM_ACCURACY_TASKS: u32 = 100;
 
 /// The engine scratchy's task numbers are compared with: the first, in the heat maps' order,
 /// that ran this workload at this users count.
@@ -115,6 +123,19 @@ fn pct(v: Option<f64>) -> String {
     v.map_or_else(|| "—".to_string(), |v| format!("{:.0}%", v * 100.0))
 }
 
+/// A cell's accuracy as the table shows it: with its task count, and marked `~` where too few
+/// tasks make it indicative ([`FIRM_ACCURACY_TASKS`]).
+fn right(c: &TaskCell) -> String {
+    let Some(a) = accuracy(c) else {
+        return "—".to_string();
+    };
+    match c.num_tasks {
+        Some(n) if n >= FIRM_ACCURACY_TASKS => format!("{} of {n}", pct(Some(a))),
+        Some(n) => format!("~{} of {n}", pct(Some(a))),
+        None => format!("~{}", pct(Some(a))),
+    }
+}
+
 /// How many times better scratchy is: `rival / scratchy` for a time (lower is better), `scratchy
 /// / rival` for cached tokens. None where either side has no number.
 pub fn times(scratchy: Option<f64>, rival: Option<f64>, lower_better: bool) -> Option<f64> {
@@ -163,7 +184,7 @@ pub fn tasks_table(m: &Model) -> Element {
                                 TableCell { "{ms(c.median_e2el_ms)}" }
                                 TableCell { "{n(c.answer_tokens())}" }
                                 TableCell { "{n(c.mean_cached_tokens)}" }
-                                TableCell { "{pct(accuracy(c))}" }
+                                TableCell { "{right(c)}" }
                             } else {
                                 TableCell { colspan: 5, "no answers" }
                             }
@@ -175,12 +196,34 @@ pub fn tasks_table(m: &Model) -> Element {
                 }
             }
         }
+        p { style: "font-size: 0.875rem",
+            "Right: the share of tasks answered right, a failed request or an answer that ran to its \
+             cap counted wrong; left out where most answers ran to their cap. ~ marks one over fewer \
+             than {FIRM_ACCURACY_TASKS} tasks, where one task moves it by 100/n points, so it is \
+             indicative only. The second total ratio is shown only where both engines' answers were \
+             about one length."
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Accuracy carries its task count, and under a hundred tasks reads as indicative.
+    #[test]
+    fn accuracy_says_how_many_tasks_it_is_over() {
+        let mut c: TaskCell = serde_json::from_value(serde_json::json!({
+            "workload": "rag", "conc": 1, "completed": 8, "accuracy": 0.375,
+            "thinking_answers": 0, "capped_answers": 0, "num_tasks": 8,
+        }))
+        .unwrap();
+        assert_eq!(right(&c), "~38% of 8");
+        c.num_tasks = Some(100);
+        assert_eq!(right(&c), "38% of 100");
+        c.num_tasks = None;
+        assert_eq!(right(&c), "~38%", "a run from before the count");
+    }
 
     /// The whole answer's time is set against the rival's only at about the same answer length,
     /// and neither mostly capped; the first token's always is.
@@ -199,6 +242,7 @@ mod tests {
             accuracy: None,
             thinking_answers: Some(0),
             capped_answers: Some(capped),
+            num_tasks: Some(8),
             timed_out: false,
         };
         assert_eq!(total_times(&cell(100.0, 0), &cell(105.0, 0)), Some(1.0));
@@ -242,6 +286,7 @@ mod tests {
             accuracy: Some(0.5),
             thinking_answers: Some(thinking),
             capped_answers: Some(0),
+            num_tasks: Some(4),
             timed_out: false,
         };
         assert_eq!(accuracy(&cell(0)), Some(0.5));

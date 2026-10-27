@@ -527,6 +527,9 @@ pub struct TaskCell {
     /// Answers that ran to their cap rather than ending on their own.
     #[serde(default)]
     pub capped_answers: Option<u32>,
+    /// Tasks sent, the denominator of accuracy. None in runs from before it was recorded.
+    #[serde(default)]
+    pub num_tasks: Option<u32>,
     #[serde(default)]
     pub timed_out: bool,
 }

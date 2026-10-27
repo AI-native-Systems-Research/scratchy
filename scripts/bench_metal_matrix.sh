@@ -293,8 +293,18 @@ SCALE_AXES="tasks"
 # Each runs at every --scale-grid-conc users count. rag-spans, scratchy's own passage reuse,
 # runs on scratchy only, next to rag.
 WORKLOADS="sharegpt,rag,sharegpt-multi-turn"
-(( FULL )) && WORKLOADS="sharegpt,rag,sharegpt-multi-turn,longbench,shared-prefix,shared-prefix-control"
+# LongBench is not among them: its shortest prompts run to 32k tokens, past the grid's 8k
+# (#939), so not one of its tasks fits. `--workloads longbench --scale-grid-input ...,32768`
+# still runs it.
+(( FULL )) && WORKLOADS="sharegpt,rag,sharegpt-multi-turn,shared-prefix,shared-prefix-control"
 WORKLOADS_SCRATCHY="rag-spans"
+# --full: one more RAG cell, for accuracy alone: ACCURACY_TASKS tasks at the largest users count,
+# where a task is 1 point of accuracy rather than a quick cell's 12.5. Its timing is not compared.
+ACCURACY_TASKS=0
+(( FULL )) && ACCURACY_TASKS=100
+# Its limit: 100 RAG tasks take about 25 minutes at 1 user on an 8B model, and minutes at the
+# largest users count, so --cell-timeout-s's 10 would cut it short. Still a limit, for a hung server.
+ACCURACY_TIMEOUT_S=2400
 # A task cell's sample: this many rounds of its users count, and at least TASK_MIN_PROMPTS (a
 # conversation of sharegpt-multi-turn is four of them).
 TASK_MIN_PROMPTS=8
@@ -630,7 +640,7 @@ PIN_PROBLEMS="$(printf '%s\n' ${pin_problems[@]+"${pin_problems[@]}"})"
 CLASS_TABLE="$(printf '%s\n' "${CLASSES[@]}")"
 export ENGINE_INFO PIN_PROBLEMS UNPINNED CLASS_TABLE LARGE_GB MODELS_GIVEN
 TASK_MAX_PROMPT=$(tr ',' '\n' <<<"${SCALE_GRID_INPUT}" | sort -n | tail -1)
-export WORKLOADS WORKLOADS_SCRATCHY TASK_MAX_PROMPT TASK_MIN_PROMPTS SHAREGPT_URL
+export WORKLOADS WORKLOADS_SCRATCHY TASK_MAX_PROMPT TASK_MIN_PROMPTS ACCURACY_TASKS SHAREGPT_URL
 export STARTED_UTC PERCENTILES PRIME_LAUNCHES INPUT_LEN OUTPUT_LEN WARM_REQUESTS SCENARIOS SCALING SCALE_AXES SCALE_CONC SCALE_INPUT SCALE_OUTPUT SCALE_GRID_INPUT \
        SCALE_GRID_OUTPUT SCALE_GRID_CONC SCALE_GRID_USERS_OUTPUT SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS SCALE_ROUNDS SCALE_REPEATS \
        MLX_PYTHON OLLAMA_BIN KV_CACHE_DTYPE SERVE_ARGS CELL_TIMEOUT_S CELL_HANG_TOK_S RESUME MODELS_FULL
@@ -713,6 +723,7 @@ json.dump({
                  "workloads_scratchy": [w for w in e["WORKLOADS_SCRATCHY"].split(",") if w] if "tasks" in e["SCALE_AXES"] else None,
                  "task_max_prompt": int(e["TASK_MAX_PROMPT"]) if "tasks" in e["SCALE_AXES"] else None,
                  "task_min_prompts": int(e["TASK_MIN_PROMPTS"]),
+                 "accuracy_tasks": int(e["ACCURACY_TASKS"]) or None,
                  "sharegpt": e["SHAREGPT_URL"],
                  "concurrency_is": "offered (--max-concurrency), not the effective decode batch"},
              "comparison": {row.split("|")[0]: row.split("|")[2] == "1"
@@ -1174,6 +1185,7 @@ run_task_cell() { # prefix workload conc
         sharegpt-multi-turn)   extra=(--dataset-name sharegpt-multi-turn --dataset-path "${SHAREGPT_PATH}")
                                n=$(( n / 4 > 2 ? n / 4 : 2 )) ;;   # conversations, of 4 turns each
         rag|rag-spans)         extra=(--dataset-name "${w}" --rag-source musique) ;;
+        rag-accuracy)          extra=(--dataset-name rag --rag-source musique); n="${ACCURACY_TASKS}" ;;
         longbench)             extra=(--dataset-name longbench --output-len 256) ;;
         shared-prefix)         extra=(--dataset-name shared-prefix) ;;
         shared-prefix-control) extra=(--dataset-name shared-prefix --no-reuse) ;;
@@ -1186,12 +1198,14 @@ run_task_cell() { # prefix workload conc
     local mem="${out_json%.json}.mem" sampler=""
     rm -f "${mem}"
     [[ -n "${srv}" ]] && { mem_sampler "${srv}" "${mem}" & sampler=$!; }
-    { perl -e 'alarm shift; exec @ARGV' "${CELL_TIMEOUT_S}" \
+    local limit="${CELL_TIMEOUT_S}"
+    if [[ "${w}" == rag-accuracy ]]; then limit="${ACCURACY_TIMEOUT_S}"; fi
+    { perl -e 'alarm shift; exec @ARGV' "${limit}" \
         "${BIN}" bench serve --base-url "http://127.0.0.1:${PORT}" --model "${cell_model:-${id}}" \
         ${cell_tok:+--tokenizer "${cell_tok}"} "${extra[@]}" ${chat[@]+"${chat[@]}"} \
         --num-prompts "${n}" --max-concurrency "$3" --temperature 0 --seed "${seed}" \
         --num-warmups "${SCALE_WARMUPS}" --max-prompt-tokens "$(task_max_prompt)" \
-        --percentile-metrics ttft,tpot,e2el --metric-percentiles 50,90,99 \
+        --percentile-metrics ttft,tpot,e2el --metric-percentiles "${PERCENTILES}" \
         --output-json "${out_json}" --disable-tqdm >>"${RAW}/cells-${stem}.log" 2>&1; } 2>/dev/null || rc=$?
     [[ -n "${sampler}" ]] && { kill "${sampler}" 2>/dev/null; wait "${sampler}" 2>/dev/null; } || true
     [[ -s "${mem}" && -f "${out_json}" ]] && python3 - "${out_json}" "${mem}" <<'PY' || true
@@ -1202,7 +1216,7 @@ json.dump(j, open(sys.argv[1], "w"), indent=2)
 PY
     if (( rc == 142 )); then
         cells_hung=1
-        echo "timed out after ${CELL_TIMEOUT_S}s"
+        echo "timed out after ${limit}s"
         python3 -c 'import json, sys; json.dump({"completed": 0, "failed": int(sys.argv[2]), "timed_out": True}, open(sys.argv[1], "w"), indent=2)' "${out_json}" "${n}"
     elif (( rc )); then
         cells_hung=1
@@ -1243,6 +1257,8 @@ run_scale_cells() { # prefix restart-function full-length [axes]
         # Fewest users first, as the grid does: every workload at 1 user is in hand before a
         # larger users count can run a server out of memory.
         for c in "${cs[@]}"; do for w in "${ws[@]}"; do run_task_cell "${prefix}" "${w}" "${c}"; done; done
+        # --full's accuracy cell, at the largest users count: the fewest seconds for its tasks.
+        if (( ACCURACY_TASKS > 0 )); then run_task_cell "${prefix}" rag-accuracy "${cs[${#cs[@]}-1]}"; fi
     fi
     if [[ "${axes}" == *",conc,"* ]]; then
         IFS=',' read -r -a xs <<<"${CONC_LIST}"
@@ -1800,8 +1816,7 @@ def scaling(engine):
         cells.append(cell)
     return cells or None
 # What a dataset cell keeps: the serving metrics, then what a task measures.
-TASK_KEEP = KEEP + ["dataset", "task_seed", "p90_ttft_ms", "p90_e2el_ms", "p99_e2el_ms",
-                    "mean_output_tokens", "mean_prompt_tokens", "mean_cached_tokens",
+TASK_KEEP = KEEP + ["dataset", "task_seed", "num_tasks", "mean_output_tokens", "mean_prompt_tokens", "mean_cached_tokens",
                     "accuracy", "empty_answers", "thinking_answers", "capped_answers"]
 TASK_CELL = re.compile(r"\.tasks-([a-z0-9-]+)@(\d+)\.json$")
 def tasks(engine):
@@ -1812,7 +1827,7 @@ def tasks(engine):
             continue
         workload, users = m.groups()
         cells.append({"workload": workload, "conc": int(users),
-                      **{k: j[k] for k in TASK_KEEP if k in j}})
+                      **{k: v for k, v in j.items() if k in TASK_KEEP or PCT.fullmatch(k)}})
     return cells or None
 def parity_ties():
     """From the gate's log: {prompt: [gap, ...]} for each prompt that passed as a near-tie."""
