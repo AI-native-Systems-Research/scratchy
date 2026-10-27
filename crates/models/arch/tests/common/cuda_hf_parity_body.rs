@@ -7,8 +7,8 @@
 // (the lm_head's own tensor, `None` when it is tied to the embedding table), and the goldens'
 // `MODEL` (`cuda_hf_reference.py --model`), `CHECKPOINT` and `GOLDENS` dir.
 // qwen3.6-35b-a3b's `cuda_hf_parity_35b.rs` includes it too (AI-native-Systems-Research/
-// scratchy#859): its P1 prints rather than gates (`p1_floor_gates`), and `load_checks` adds its
-// MoE bundles' rows.
+// scratchy#859): each binary states its P1 rule (`P1`, a `P1Rule`), and `load_checks` adds the
+// 35B's MoE bundles' rows.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -38,21 +38,42 @@ fn verdict(pass: bool) -> &'static str {
     if pass { "PASS" } else { "FAIL" }
 }
 
-/// P1's rule per model (AI-native-Systems-Research/scratchy#859). `true`: the merged floor, min
-/// cosine(CUDA, f32) ≥ 0.999 on every row, gates P1 and P8's two decode-row cosines (qwen3.5-0.8b
-/// and qwen3.5-9b). `false`: qwen3.6-35b-a3b, whose rule is min cosine(CUDA, f32) ≥ min
-/// cosine(HF-bf16, f32) − δ and whose (n) floor for P8's own-row cosine is set from its first
-/// run: until the user sets both, those cosines are printed beside HF-bf16's, not gated, and the
-/// rest of P8 still gates.
-fn p1_floor_gates() -> bool {
-    MODEL != "qwen3.6-35b-a3b"
+/// P1's rule (#859): a fixed floor on min cosine(CUDA, HF-f32), or at most `delta` below
+/// HF-bf16's own min cosine on the same prompt.
+enum P1Rule {
+    Floor(f64),
+    BelowHfBf16(f64),
 }
 
-/// The most P5 or P7 prompts whose first divergence is a near-tie: 1, every model's, the 9b's
-/// value pending the user's decision (#859). P5 and P7 gate on this and on their merged `at most 1`
-/// line, which agree.
-fn near_tie_cap() -> usize {
-    1
+/// Whether a cosine `cos` against HF-f32 passes `rule`, `hf_bf16_cos` HF-bf16's own cosine on the
+/// same rows: P1's and P8's cosine gate.
+fn p1_gate(rule: &P1Rule, cos: f64, hf_bf16_cos: f64) -> bool {
+    match *rule {
+        P1Rule::Floor(f) => cos >= f,
+        P1Rule::BelowHfBf16(d) => cos >= hf_bf16_cos - d,
+    }
+}
+
+/// Both P1 rules gate as stated, on fixed numbers (no GPU, no goldens): the fixed floor on CUDA's
+/// cosine alone, the HF-bf16 rule on CUDA's cosine against HF-bf16's minus delta. Each binary
+/// runs one of the two (`P1`), so this is where the other is checked.
+#[test]
+fn p1_rules_gate_as_stated() {
+    let floor = P1Rule::Floor(0.999);
+    let below = P1Rule::BelowHfBf16(0.005);
+    let cases = [
+        (&floor, 0.9995, 0.9, true),
+        (&floor, 0.9985, 1.0, false),
+        (&below, 0.980474, 0.983452, true),
+        (&below, 0.977, 0.983452, false),
+    ];
+    let mut pass = true;
+    for (rule, cos, noise, want) in cases {
+        let got = p1_gate(rule, cos, noise);
+        pass &= got == want;
+    }
+    eprintln!("P1 rules on fixed numbers {}", verdict(pass));
+    assert!(pass, "a P1 rule does not gate as stated");
 }
 
 /// The H100's device memory a worker over every tape may hold after its forwards: 78.0 GiB of
@@ -579,31 +600,36 @@ fn p1_to_p4_one_forward_per_prompt() {
         let noise_cos = (rows(&p.bf16).zip(rows(&p.f32)))
             .map(|(a, b)| cosine(a, b))
             .fold(f64::INFINITY, f64::min);
-        let ok1 = min_cos >= 0.999;
-        eprintln!(
-            "P1 prompt {}: {n} rows, min cosine(CUDA, f32) = {min_cos:.6} (HF-bf16 {noise_cos:.6}) \
-             (need >= 0.999) {}",
-            p.p,
-            verdict(ok1)
-        );
-        if noise_cos < 0.999 {
-            eprintln!(
-                "P1 prompt {}: HF-bf16's own min cosine is below 0.999: the floor is wrong, not \
-                 the kernels. STOP AND REPORT",
-                p.p
-            );
-        }
-        if !p1_floor_gates() {
-            eprintln!(
-                "P1 prompt {}: {MODEL} rule min cosine(CUDA, f32) >= min cosine(HF-bf16, f32) - \
-                 delta (delta: the user's, #859): CUDA {min_cos:.6} HF-bf16 {noise_cos:.6} \
-                 CUDA - HF-bf16 = {:+.6}; printed, not gated (the 0.999 line above is the 0.8b's \
-                 floor, printed beside it)",
-                p.p,
-                min_cos - noise_cos
-            );
-        }
-        let ok1 = ok1 || !p1_floor_gates();
+        let ok1 = match P1 {
+            P1Rule::Floor(f) => {
+                let ok1 = p1_gate(&P1, min_cos, noise_cos);
+                eprintln!(
+                    "P1 prompt {}: {n} rows, min cosine(CUDA, f32) = {min_cos:.6} (HF-bf16 \
+                     {noise_cos:.6}) (need >= {f}) {}",
+                    p.p,
+                    verdict(ok1)
+                );
+                if noise_cos < f {
+                    eprintln!(
+                        "P1 prompt {}: HF-bf16's own min cosine is below {f}: the floor is wrong, \
+                         not the kernels. STOP AND REPORT",
+                        p.p
+                    );
+                }
+                ok1
+            }
+            P1Rule::BelowHfBf16(d) => {
+                let ok1 = p1_gate(&P1, min_cos, noise_cos);
+                eprintln!(
+                    "P1 prompt {}: {n} rows, min cosine(CUDA, f32) = {min_cos:.6} HF-bf16 \
+                     {noise_cos:.6} CUDA - HF-bf16 = {:+.6} (need >= HF-bf16 - {d}) {}",
+                    p.p,
+                    min_cos - noise_cos,
+                    verdict(ok1)
+                );
+                ok1
+            }
+        };
         p1 &= ok1;
         // P2.
         let (rms, max) = error(got, &p.f32);
@@ -685,14 +711,16 @@ fn p1_to_p4_one_forward_per_prompt() {
         agree as f64 / total as f64
     );
     eprintln!(
-        "P1-P4 rules and their numbers' sources: P1 {} (0.999 from 0.8b runs, #816); P2 <= 2x \
+        "P1-P4 rules and their numbers' sources: P1 {}; P2 <= 2x \
          HF-bf16's RMS and max per prompt (this run's HF-bf16, #816); P3 no top-1 disagreement \
          outside a near-tie, margin <= 2x the row's max |HF-bf16 - f32| (this run's HF-bf16, the \
          user's 2026-10-23 rule); P4 >= 4 of 5 shared on the last row (#816)",
-        if p1_floor_gates() {
-            "min cosine >= 0.999, gated"
-        } else {
-            "min cosine >= HF-bf16's - delta, printed until the user sets delta (#859)"
+        match P1 {
+            P1Rule::Floor(f) => format!("min cosine >= {f}, gated (0.8b runs, #816)"),
+            P1Rule::BelowHfBf16(d) => format!(
+                "min cosine >= HF-bf16's - {d} per prompt, gated (the user's 2026-10-26 rule, \
+                 #859)"
+            ),
         }
     );
     assert!(p1 && p2 && p3 && p4, "P1 {p1} P2 {p2} P3 {p3} P4 {p4}");
@@ -747,20 +775,13 @@ fn p5_greedy_matches_hf_f32() {
         );
         pass &= ok;
     }
-    let ok = near_ties <= 1;
-    eprintln!(
-        "P5: near-tie prompts {near_ties} (at most 1) {}",
-        verdict(ok)
-    );
-    let ok = ok && near_ties <= near_tie_cap();
     eprintln!(
         "P5 rule: every first divergence at a near-tie step, margin < 2x the step's bf16_max_err \
-         (this run's HF-bf16, #816); near-tie prompts {near_ties} against near_tie_cap() {} (the \
-         9b's cap, pending the user, #859) {}",
-        near_tie_cap(),
-        verdict(ok)
+         (this run's HF-bf16, #816); near-tie prompts {near_ties} of 5, not capped (the user's \
+         2026-10-26 rule, as PR #11's chat rule) {}",
+        verdict(pass)
     );
-    assert!(pass && ok, "the greedy tokens differ from HF-f32's");
+    assert!(pass, "the greedy tokens differ from HF-f32's");
 }
 
 #[test]
@@ -849,8 +870,8 @@ fn greedy_by_decode(w: &mut CudaWorker<'_>, ids: &[u32], steps: usize) -> Vec<u3
 }
 
 /// P7: prompts 1-5, one fresh m=512 prefill then 7 decodes give HF-f32's 8 greedy tokens, under
-/// P5's near-tie rule (at most 1 prompt diverging, only at a step whose f32 margin is under twice
-/// that step's `bf16_max_err`). Both sides printed.
+/// P5's near-tie rule (every first divergence at a step whose f32 margin is under twice that
+/// step's `bf16_max_err`; the number of such prompts is not capped). Both sides printed.
 #[test]
 fn p7_greedy_via_decode_matches_hf_f32() {
     let r = rig();
@@ -891,26 +912,16 @@ fn p7_greedy_via_decode_matches_hf_f32() {
         );
         pass &= ok;
     }
-    let ok = near_ties <= 1;
     eprintln!(
-        "P7: near-tie prompts {near_ties} (at most 1) {}",
-        verdict(ok)
+        "P7 rule: P5's (this run's HF-bf16, #830); near-tie prompts {near_ties} of 5, not capped \
+         (the user's 2026-10-26 rule, as PR #11's chat rule) {}",
+        verdict(pass)
     );
-    let ok = ok && near_ties <= near_tie_cap();
-    eprintln!(
-        "P7 rule: P5's (this run's HF-bf16, #830); near-tie prompts {near_ties} against \
-         near_tie_cap() {} (the 9b's cap, pending the user, #859) {}",
-        near_tie_cap(),
-        verdict(ok)
-    );
-    assert!(
-        pass && ok,
-        "the greedy tokens via decode differ from HF-f32's"
-    );
+    assert!(pass, "the greedy tokens via decode differ from HF-f32's");
 }
 
 /// P8: for prompts 1-5, prefill the first L − 1 tokens, then decode token L − 1. That row against
-/// HF-f32's last row: cosine ≥ 0.999, RMS and max error ≤ 2 × HF-bf16's on that row, the same
+/// HF-f32's last row: cosine under the model's `P1` rule, RMS and max error ≤ 2 × HF-bf16's on that row, the same
 /// top-1 unless the f32 margin is at most twice the row's max noise, top-5 overlap ≥ 4. Against
 /// CUDA's own one-shot last row: cosine ≥ 0.999, the same argmax unless near-tie, max |diff|
 /// printed. A one-token prompt has no prefix to prefill, and is skipped, saying so.
@@ -943,13 +954,19 @@ fn p8_the_decode_row_matches_hf_f32() {
         let c5: BTreeSet<usize> = top_k(&row, 5).into_iter().collect();
         let f5: BTreeSet<usize> = top_k(f32_row, 5).into_iter().collect();
         let shared = c5.intersection(&f5).count();
-        let ok_hf = cos >= 0.999
+        let noise_cos = cosine(bf16_row, f32_row);
+        let cos_ok = p1_gate(&P1, cos, noise_cos);
+        let cos_need = match P1 {
+            P1Rule::Floor(f) => format!("{f}"),
+            P1Rule::BelowHfBf16(d) => format!("HF-bf16's {noise_cos:.6} - {d}"),
+        };
+        let ok_hf = cos_ok
             && rms <= 2.0 * noise_rms
             && max <= 2.0 * noise_max
             && (same || tie)
             && shared >= 4;
         eprintln!(
-            "P8 prompt {} decode row {} vs HF-f32: cosine={cos:.6} (need >= 0.999) \
+            "P8 prompt {} decode row {} vs HF-f32: cosine={cos:.6} (need >= {cos_need}) \
              RMS={rms:.6e} (HF-bf16 {noise_rms:.6e}) max={max:.6e} (HF-bf16 {noise_max:.6e}) \
              (need <= 2x each) top-1 same={same} (f32 margin {margin:.4e}, near-tie={tie}) \
              top-5 shared={shared} (need >= 4) {}",
@@ -968,27 +985,6 @@ fn p8_the_decode_row_matches_hf_f32() {
             n - 1,
             verdict(ok_own)
         );
-        // qwen3.6-35b-a3b: both cosines printed, not gated, until the user sets P1's delta and
-        // the 35B's (n) floor (#859); everything else on the line still gates.
-        let ok_hf = ok_hf
-            || (!p1_floor_gates()
-                && rms <= 2.0 * noise_rms
-                && max <= 2.0 * noise_max
-                && (same || tie)
-                && shared >= 4);
-        let ok_own = ok_own || (!p1_floor_gates() && (same_own || tie));
-        if !p1_floor_gates() {
-            eprintln!(
-                "P8 prompt {} decode row {}: {MODEL} cosine vs HF-f32 {cos:.6} (HF-bf16's last \
-                 row {:.6}, under P1's rule, delta the user's) and vs CUDA's one-shot \
-                 {cos_own:.6} (the 35B's (n) floor the user's): printed, not gated; the rest \
-                 {} (sources: P2-P4's, #830)",
-                p.p,
-                n - 1,
-                cosine(bf16_row, f32_row),
-                verdict(ok_hf && ok_own)
-            );
-        }
         pass &= ok_hf && ok_own;
     }
     assert!(

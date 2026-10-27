@@ -23,8 +23,8 @@
 //!   agree is printed, as information only (it was 245/249 = 0.9839 here, every disagreement a
 //!   near-tie).
 //! - P4 top-5: on each prompt's last row, the CUDA and f32 top-5 share at least 4 tokens.
-//! - P5 greedy: prompts 1-5, 8 tokens by fresh m=512 forwards, equal HF-f32's, at most 1 of the 5
-//!   a near-tie (a margin under twice the step's max |noise|).
+//! - P5 greedy: prompts 1-5, 8 tokens by fresh m=512 forwards, equal HF-f32's, each first
+//!   divergence a near-tie (a margin under twice the step's max |noise|).
 //! - P6 chunked: prompt 6 as 128 fresh tokens then the rest gives rows 128.. bit-identical to one
 //!   forward of it.
 //! - P7 greedy via decode: one prefill then 7 decodes give HF-f32's 8 tokens under P5's rule.
@@ -53,3 +53,5 @@ const UNTIED_LM_HEAD: Option<&str> = Some("lm_head.weight");
 const MODEL: &str = "qwen3.5-9b";
 const CHECKPOINT: &str = "Qwen3.5-9B";
 const GOLDENS: &str = "tests/goldens/qwen3-5-qwen3.5-9b-hf";
+/// P1's rule (#859): min cosine(CUDA, f32) ≥ 0.999 on every real row (0.8b runs, #816).
+const P1: P1Rule = P1Rule::Floor(0.999);

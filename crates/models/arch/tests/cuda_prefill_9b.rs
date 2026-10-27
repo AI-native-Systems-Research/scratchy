@@ -40,3 +40,5 @@ const ARENA: u64 = 3_202_384_896;
 /// teacher-forced decodes were at 0.99926–0.99938), because a deeper, wider model accumulates
 /// more bf16 difference between a decode and one forward.
 const BOUNDARY_DECODE_COSINE: f64 = 0.998;
+/// (k) teacher-forced's floor, #830.
+const TEACHER_FORCED_DECODE_COSINE: f64 = 0.999;

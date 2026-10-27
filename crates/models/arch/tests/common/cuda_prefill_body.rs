@@ -4,7 +4,8 @@
 // with `include!` at the binary's root, not as a module, so every test keeps its name. The
 // including binary supplies the model: its `CUDA_TAPES`, the `numerics` module
 // (`targets/cuda/tests/common/numerics.rs`), and the constants `HIDDEN`, `WEIGHTS` (the weight
-// buffers the rig uploads), `ARENA` (the largest tape's arena bytes) and
+// buffers the rig uploads), `ARENA` (the largest tape's arena bytes),
+// `TEACHER_FORCED_DECODE_COSINE` ((k) teacher-forced's cosine floor) and
 // `BOUNDARY_DECODE_COSINE` ((n)'s cosine floor).
 // qwen3.6-35b-a3b's `cuda_prefill_35b.rs` includes it too (AI-native-Systems-Research/
 // scratchy#859): its MoE bundles are filled as the GEMMs that read them.
@@ -915,7 +916,8 @@ fn k_chained_decodes_pick_the_one_shot_tokens() {
 /// then one decode at 300 + i, against row 300 + i of one 308-token forward in disjoint blocks and
 /// slot. Each decode is one step off the one-shot trajectory, so the difference is one step's (the
 /// GEMV and the decode attention against the tiled GEMM and the prefill attention): every logit
-/// finite and cosine ≥ 0.999 at every step, the max |difference| printed. (k)'s chain compounds
+/// finite and cosine ≥ the model's `TEACHER_FORCED_DECODE_COSINE` at every step, the max
+/// |difference| printed. (k)'s chain compounds
 /// those steps through the cache and GDN state; this isolates one.
 #[test]
 fn k_teacher_forced_decodes_agree_with_one_shot_rows() {
@@ -930,10 +932,11 @@ fn k_teacher_forced_decodes_agree_with_one_shot_rows() {
         let row = forward(&mut worker, 1, &[rows[p]], p as u32, SEAT_A).expect("the decode");
         let want = &one_shot[p * VOCAB..][..VOCAB];
         let (cos, diff, finite) = (cosine(&row, want), max_diff(&row, want), all_finite(&row));
-        let ok = finite && cos >= 0.999;
+        let ok = finite && cos >= TEACHER_FORCED_DECODE_COSINE;
         eprintln!(
             "(k teacher-forced) {p} tokens prefilled, decode at {p}, against row {p} of one \
-             308-token forward: finite={finite} cosine={cos:.6} (need >= 0.999) \
+             308-token forward: finite={finite} cosine={cos:.6} (need >= \
+             {TEACHER_FORCED_DECODE_COSINE}) \
              max|diff|={diff:e} {}",
             verdict(ok)
         );
@@ -1014,24 +1017,9 @@ fn n_decodes_at_a_block_boundary() {
             at + 1,
             verdict(ok)
         );
-        if !boundary_floor_gates() {
-            eprintln!(
-                "(n) decode at P={at}: a MoE model's (n) floor is the user's, set from this \
-                 run's cosine={cos:.6} (#859): printed, not gated; finite={finite} gated {}",
-                verdict(finite)
-            );
-        }
-        let ok = ok || (!boundary_floor_gates() && finite);
         pass &= ok;
     }
     assert!(pass, "a decode at the block boundary is out of agreement");
-}
-
-/// Whether (n)'s cosine floor gates: for every dense model (`BOUNDARY_DECODE_COSINE`, the 0.8b's
-/// and 9b's measured floors). A MoE model's (qwen3.6-35b-a3b's, #859) is set by the user from its
-/// first run's printed cosines, so until then (n) prints the cosine and gates only finiteness.
-fn boundary_floor_gates() -> bool {
-    CUDA_TAPES.iter().all(|t| t.moe.is_none())
 }
 
 /// (o): at m=1, a position other than `prefix_len`, a block table too short for `P + 1`, a GDN
@@ -1259,8 +1247,9 @@ fn report(what: &str, step: usize, got: &Snapshot, want: &Snapshot) -> f64 {
 /// GDN layer's conv ring and recurrent state, and the logits. The one-shot of 301 + i tokens is
 /// checked bit-identical, on its last row, to row 300 + i of one 308-token forward, so it is the
 /// one-shot trajectory (k) compares against. Asserted: every value finite, the references
-/// bit-identical, and every teacher-forced decode's logits at cosine ≥ 0.999 (one step's
-/// difference, which is (k)'s criterion for one step); the chain's numbers are printed.
+/// bit-identical, and every teacher-forced decode's logits at cosine ≥ the model's
+/// `TEACHER_FORCED_DECODE_COSINE` (one step's difference, which is (k)'s criterion for one step);
+/// the chain's numbers are printed.
 #[test]
 fn k_diag_decode_drift_against_one_shot() {
     let r = rig();
@@ -1299,11 +1288,11 @@ fn k_diag_decode_drift_against_one_shot() {
         refs_identical &= want.logits[..] == one_shot[p * VOCAB..][..VOCAB];
         forced_cos.push(report("teacher-forced", i, &got, &want));
     }
-    let forced_ok = forced_cos.iter().all(|&c| c >= 0.999);
+    let forced_ok = forced_cos.iter().all(|&c| c >= TEACHER_FORCED_DECODE_COSINE);
     eprintln!(
         "(k-diag) logits cosine per step: chain {chain_cos:.6?} teacher-forced {forced_cos:.6?}; \
          references bit-identical to the 308-token forward's rows={refs_identical} \
-         teacher-forced all >= 0.999={forced_ok} {}",
+         teacher-forced all >= {TEACHER_FORCED_DECODE_COSINE}={forced_ok} {}",
         verdict(pass && refs_identical && forced_ok)
     );
     assert!(
@@ -1313,6 +1302,6 @@ fn k_diag_decode_drift_against_one_shot() {
     assert!(pass, "a decode gave a non-finite logit");
     assert!(
         forced_ok,
-        "a teacher-forced decode is below cosine 0.999: one step is wrong"
+        "a teacher-forced decode is below cosine {TEACHER_FORCED_DECODE_COSINE}: one step is wrong"
     );
 }
