@@ -924,6 +924,10 @@ mod tests {
             Staged::F32(_) | Staged::F16(_) => {
                 panic!("an index table staged as a FLOAT — 65,280 is not representable in f16")
             }
+            Staged::U32(_) => panic!(
+                "an index table staged as raw u32 lanes — the chain seeds' own variant, not a \
+                 GatherEntry table"
+            ),
         }
     }
 
@@ -1142,6 +1146,9 @@ mod tests {
             }
             Staged::F16(_) => panic!("a broadcast row is f32; the bind loop narrows it"),
             Staged::I32(_) => panic!("a broadcast row is a MASK, not an index tensor"),
+            Staged::U32(_) => panic!(
+                "a broadcast row is f32 — the u32 lanes are the chain seeds' own variant"
+            ),
         }
         let _ = sa::POOL_STICK; // the Blocks variant's shape params come from here
     }
