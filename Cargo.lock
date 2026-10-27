@@ -3466,6 +3466,7 @@ name = "scratchy-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "dotenvy",
  "libc",
@@ -3483,6 +3484,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tracing",
  "ureq 3.4.2",
  "uuid",

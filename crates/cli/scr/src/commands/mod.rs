@@ -22,6 +22,8 @@ pub mod convert;
 pub mod launch;
 #[cfg(feature = "claude")]
 pub mod launch_auto;
+#[cfg(feature = "claude")]
+pub mod launch_proxy;
 pub mod model;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod model_info;

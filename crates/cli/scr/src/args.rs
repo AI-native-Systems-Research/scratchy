@@ -119,6 +119,16 @@ pub struct LaunchClaudeArgs {
     #[arg(short = 'a', value_name = "MODEL", conflicts_with_all = ["model_tag", "model"])]
     pub auto_model: Option<String>,
 
+    /// Keep the session on your own gateway and send only Claude Code's
+    /// auto-mode safety checks to the local model. Claude Code starts in auto
+    /// mode against a local proxy that forwards everything to
+    /// `ANTHROPIC_BASE_URL`, untouched and with your credentials, except the
+    /// checks, which a local scratchy server answers. Needs `ANTHROPIC_BASE_URL`
+    /// set to that gateway. The local model is whatever the other flags name:
+    /// `-A` picks one for this Mac, `-a`/`-m`/the positional names one.
+    #[arg(long)]
+    pub auto_mode_only: bool,
+
     /// Device: "cpu", "cuda:N", "metal", or "auto" (auto-detect best GPU).
     #[arg(long, default_value = "auto")]
     pub device: String,
