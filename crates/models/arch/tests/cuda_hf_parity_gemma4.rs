@@ -428,3 +428,121 @@ fn r_real_weights_decodes_across_the_window() {
     }
     decode_verdict("(r) real weights", pass, &cosines);
 }
+
+// ── #933's diagnosis prints: P1 prompt 6 and P3 prompt 3 ───────────
+
+/// The P1 prompt the diagnosis reads per row, and the row bands its RMS ratio is split into
+/// (inclusive; the first is the prefix prompt 6 shares with prompt 1, and 64 and 128 are key-tile
+/// boundaries of the D=512 global attention).
+const DIAG_P1_PROMPT: usize = 6;
+const DIAG_P1_BANDS: [(usize, usize); 4] = [(0, 20), (21, 63), (64, 127), (128, 158)];
+/// The rows printed as CUDA's worst per-row cosines.
+const DIAG_P1_WORST: usize = 5;
+/// The P3 prompt and row the diagnosis reads, and the two ids printed there: HF-f32's top-1 and
+/// top-2 on that row in the goldens.
+const DIAG_P3_PROMPT: usize = 3;
+const DIAG_P3_ROW: usize = 9;
+const DIAG_P3_IDS: [usize; 2] = [1852, 32990];
+
+/// #933's diagnosis (`/tmp/v933-diag.md`), printed only, nothing gated: one fresh forward each
+/// of prompts 6 and 3, as `p1_to_p4_one_forward_per_prompt` makes them.
+/// - Prompt 6, every row: cosine(CUDA, HF-f32) and cosine(HF-bf16, HF-f32); CUDA's
+///   [`DIAG_P1_WORST`] lowest rows; and per band of [`DIAG_P1_BANDS`], RMS(CUDA − f32),
+///   RMS(HF-bf16 − f32) and their ratio, which says whether CUDA's error steps up at row 64 or
+///   128.
+/// - Prompt 3, row 9: CUDA's argmax and its logit, and the logits at [`DIAG_P3_IDS`] from CUDA,
+///   HF-f32 and HF-bf16, with each side's argmax and the row's max |CUDA − f32| and
+///   max |HF-bf16 − f32|.
+#[test]
+fn diag_p1_prompt_6_rows_and_p3_prompt_3_row_9() {
+    let r = rig();
+    let mut w = r.worker();
+    let prompt = |n: usize| {
+        (prompts().iter().find(|p| p.p == n)).unwrap_or_else(|| panic!("prompt {n} in meta.json"))
+    };
+    // Prompt 6, per row.
+    let p = prompt(DIAG_P1_PROMPT);
+    let n = p.ids.len();
+    let got = forward(&mut w, &p.ids, 0, SEAT_A);
+    let mut per_row: Vec<(usize, f64, f64)> = Vec::with_capacity(n);
+    for (row, ((c, f), b)) in rows(&got).zip(rows(&p.f32)).zip(rows(&p.bf16)).enumerate() {
+        let (cc, bc) = (cosine(c, f), cosine(b, f));
+        let ((crms, cmax), (brms, bmax)) = (error(c, f), error(b, f));
+        eprintln!(
+            "diag P1 prompt {} row {row} (token {}): cosine(CUDA, f32)={cc:.6} \
+             cosine(HF-bf16, f32)={bc:.6} CUDA - HF-bf16={:+.6} RMS(CUDA-f32)={crms:.4e} \
+             RMS(HF-bf16-f32)={brms:.4e} max|CUDA-f32|={cmax:.4e} max|HF-bf16-f32|={bmax:.4e} \
+             (information only)",
+            p.p,
+            p.ids[row],
+            cc - bc
+        );
+        per_row.push((row, cc, bc));
+    }
+    let mut worst = per_row.clone();
+    worst.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+    for &(row, cc, bc) in worst.iter().take(DIAG_P1_WORST) {
+        eprintln!(
+            "diag P1 prompt {} worst CUDA row {row}: cosine(CUDA, f32)={cc:.6} \
+             cosine(HF-bf16, f32)={bc:.6} (information only)",
+            p.p
+        );
+    }
+    for (lo, hi) in DIAG_P1_BANDS {
+        if lo >= n {
+            eprintln!(
+                "diag P1 prompt {} rows {lo}-{hi}: none of its {n} rows",
+                p.p
+            );
+            continue;
+        }
+        let hi = hi.min(n - 1);
+        let span = lo * VOCAB..(hi + 1) * VOCAB;
+        let (crms, _) = error(&got[span.clone()], &p.f32[span.clone()]);
+        let (brms, _) = error(&p.bf16[span.clone()], &p.f32[span]);
+        let mean = |pick: fn(&(usize, f64, f64)) -> f64| {
+            per_row[lo..=hi].iter().map(pick).sum::<f64>() / (hi + 1 - lo) as f64
+        };
+        eprintln!(
+            "diag P1 prompt {} rows {lo}-{hi}: RMS(CUDA-f32)={crms:.4e} RMS(HF-bf16-f32)={brms:.4e} \
+             ratio CUDA/HF-bf16={:.3} mean cosine CUDA={:.6} HF-bf16={:.6} (information only)",
+            p.p,
+            crms / brms.max(f64::MIN_POSITIVE),
+            mean(|r| r.1),
+            mean(|r| r.2)
+        );
+    }
+    // Prompt 3, row 9.
+    let p = prompt(DIAG_P3_PROMPT);
+    let row = DIAG_P3_ROW;
+    assert!(row < p.ids.len(), "prompt {} has row {row}", p.p);
+    let got = forward(&mut w, &p.ids, 0, SEAT_A);
+    let at = |v: &[f32]| v[row * VOCAB..][..VOCAB].to_vec();
+    let (c, f, b) = (at(&got), at(&p.f32), at(&p.bf16));
+    for (side, logits) in [("CUDA", &c), ("HF-f32", &f), ("HF-bf16", &b)] {
+        let top = top_k(logits, 2);
+        eprintln!(
+            "diag P3 prompt {} row {row} (token {}) {side}: argmax {} logit {:.4} (2nd {} logit \
+             {:.4}), logit[{}]={:.4} logit[{}]={:.4} (information only)",
+            p.p,
+            p.ids[row],
+            top[0],
+            logits[top[0]],
+            top[1],
+            logits[top[1]],
+            DIAG_P3_IDS[0],
+            logits[DIAG_P3_IDS[0]],
+            DIAG_P3_IDS[1],
+            logits[DIAG_P3_IDS[1]]
+        );
+    }
+    let ((crms, cmax), (brms, bmax)) = (error(&c, &f), error(&b, &f));
+    eprintln!(
+        "diag P3 prompt {} row {row}: cosine(CUDA, f32)={:.6} cosine(HF-bf16, f32)={:.6} \
+         RMS(CUDA-f32)={crms:.4e} RMS(HF-bf16-f32)={brms:.4e} max|CUDA-f32|={cmax:.4e} \
+         max|HF-bf16-f32|={bmax:.4e} (information only)",
+        p.p,
+        cosine(&c, &f),
+        cosine(&b, &f)
+    );
+}

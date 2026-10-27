@@ -279,6 +279,9 @@ fn p9_expert_picks_match_hf_f32() {
             let tau = route.tau(layer);
             let (mut ties, mut inside, mut outside, mut bf16_flips, mut bad) = (0, 0, 0, 0, 0);
             let (mut excused, mut unexcused) = (0, 0);
+            // The outside-tie flips' rows, each with its f32 rank-8 minus rank-9 margin and
+            // whether an earlier flip excuses it: printed only (#933's diagnosis).
+            let mut outside_rows: Vec<(usize, f64, bool)> = Vec::new();
             for (row, got) in cuda.iter().enumerate() {
                 let want = route.f32.set(n, layer, row);
                 let (tie, _) = route.tie(layer, row, tau);
@@ -290,6 +293,7 @@ fn p9_expert_picks_match_hf_f32() {
                         inside += 1;
                     } else {
                         outside += 1;
+                        outside_rows.push((row, route.tie(layer, row, tau).1, flipped[row]));
                         if flipped[row] {
                             excused += 1;
                         } else {
@@ -311,6 +315,18 @@ fn p9_expert_picks_match_hf_f32() {
                 p.p,
                 verdict(ok)
             );
+            for &(row, margin, by_earlier) in &outside_rows {
+                eprintln!(
+                    "P9 prompt {} layer {layer}: flip outside a router tie at token {row} (id {}),                      f32 rank-8 minus rank-9 {margin:.4e} vs tau {tau:.4e}, {} (information only)",
+                    p.p,
+                    p.ids[row],
+                    if by_earlier {
+                        "excused by an earlier flip"
+                    } else {
+                        "not excused"
+                    }
+                );
+            }
             pass &= ok;
         }
         eprintln!(
