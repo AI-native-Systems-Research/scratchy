@@ -565,7 +565,19 @@ pub(crate) fn run_prefill_batch(
             // The rung's own width, not the solo meta's — see the seat-bind site above.
             let mut seat = *seat;
             seat.rows = mq as u32;
-            Some(read_sampled_tokens(pf, &seat, b.result_id as u32, vocab)?)
+            let picked = read_sampled_tokens(pf, &seat, b.result_id as u32, vocab)?;
+            // ── SAMPLE PROBE (SCRATCHY_SAMPLE_PROBE), BATCHED STEP ── the one-run
+            // localizer for a batched draw whose rows answer each other's requests:
+            // reads the WHOLE idx stick (every word, all rows), the per-step noise and
+            // inv_t placements, and the sampler's input logits row per row with the
+            // HOST's first-max beside the card's pick. If the LOGITS rows already hold
+            // row r-1's argmax, the defect is upstream of the sampler (the batch
+            // forward's KV or slot); if the logits are right but the idx stick is
+            // shifted, it is the sampler's store or the readback.
+            if std::env::var_os("SCRATCHY_SAMPLE_PROBE").is_some() {
+                sample_probe(pf, &seat, b.result_id as u32, vocab, &picked);
+            }
+            Some(picked)
         }
         LogitsWanted::None => {
             pf.run_step_i32(
@@ -991,8 +1003,16 @@ fn greedy_sample_binds(
 }
 
 /// Read the minted sampler's idx stick back and decode it: one i32 per row at
-/// lane 0 of a 64-lane padded row, so row r's token is `word[r·64]`. Any word
-/// at or past `vocab` is the sampler's sentinel — refuse it, never sample it.
+/// lane 0 of a 64-lane padded row. Any word at or past `vocab` is the sampler's
+/// sentinel — refuse it, never sample it.
+///
+/// ⭐ THE STICK IS SCATTERED, NOT ROW-MAJOR. A `[rows, 64]` SENUINT32 placement
+/// stores rows INTERLEAVED at the format's own 32-element stick — `dev_off_stk`
+/// with `SenUint32::ELEMS_PER_STICK` — so row r's lane 0 is word `r·32`, NOT
+/// `r·64`: measured on the card (probe, 2-row rung: each 64-word physical block
+/// held `32×row0's idx` then `32×row1's idx`, both blocks identical), where the
+/// row-major stride handed EVERY row row 0's pick. At `rows = 1` the scattered
+/// offset is 0 and the solo readback is byte-identical.
 #[cfg(feature = "spyre-hw")]
 fn read_sampled_tokens(
     session: &mut SuperDscSession,
@@ -1000,19 +1020,25 @@ fn read_sampled_tokens(
     result_id: u32,
     vocab: usize,
 ) -> ExecutorResult<Vec<u32>> {
+    let rows = seat.rows as usize;
     let bytes = session
         .read_tensor_raw(
             scratchy_target_spyre::bundle_code::PlaceId::Act(result_id),
-            seat.rows as usize * 64 * 4,
+            rows * 64 * 4,
         )
         .map_err(|e| werr(format!("sampler idx readback (t{result_id}): {e}")))?;
     let words: Vec<i32> = bytes
         .chunks_exact(4)
         .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
-    (0..seat.rows as usize)
+    // The idx stick's own format decides the stride — the same law every device
+    // tensor's host-side address takes (`dev_off_stk`), never a guessed row pitch.
+    let stk = <scratchy_subtile::superdsc_opspec::SenUint32 as scratchy_subtile::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+        as usize;
+    (0..rows)
         .map(|r| {
-            let w = words.get(r * 64).copied().unwrap_or(-1);
+            let off = scratchy_subtile::sdsc_abstract::dev_off_stk(&[rows, 64], 1, &[r, 0], stk);
+            let w = words.get(off).copied().unwrap_or(-1);
             let t = u32::try_from(w).map_err(|_| {
                 werr(format!(
                     "the card's token draw for row {r} is {w} — not a token id"
@@ -1027,6 +1053,105 @@ fn read_sampled_tokens(
             Ok(t)
         })
         .collect()
+}
+
+/// ⭐ THE BATCHED DRAW'S ONE-RUN LOCALIZER (SCRATCHY_SAMPLE_PROBE) — see the call site.
+/// Reads are PROBES, never gates: every failure to read prints and continues, so one
+/// run states everything it could see.
+#[cfg(feature = "spyre-hw")]
+fn sample_probe(
+    session: &mut SuperDscSession,
+    seat: &scratchy_target_spyre::wiring::SampleSeat,
+    result_id: u32,
+    vocab: usize,
+    picked: &[u32],
+) {
+    use scratchy_target_spyre::bundle_code::PlaceId;
+    let rows = seat.rows as usize;
+    let pad = seat.pad_vocab as usize;
+    // THE IDX STICK, EVERY WORD: row r's pick is `word[r·64]` by the readback's own
+    // law, so a word holding a valid token OFF that lane is the store's pitch, and a
+    // row whose lane holds ANOTHER row's token is the shift, stated by word index.
+    match session.read_tensor_raw(PlaceId::Act(result_id), rows * 64 * 4) {
+        Ok(bytes) => {
+            let words: Vec<i32> = bytes
+                .chunks_exact(4)
+                .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            eprintln!("[sample-probe] idx stick t{result_id}: {rows} rows x 64 words");
+            for r in 0..rows {
+                let row = &words[r * 64..(r + 1) * 64];
+                let nz: Vec<(usize, i32)> = row
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|(_, w)| *w != 0)
+                    .collect();
+                eprintln!(
+                    "[sample-probe]   idx row {r}: lane0={} nonzero={nz:?}",
+                    row.first().copied().unwrap_or(-1)
+                );
+            }
+        }
+        Err(e) => eprintln!("[sample-probe] idx read failed: {e}"),
+    }
+    // THE PER-STEP SEAT: noise (raw — its arrangement is the bake's own fact) and
+    // inv_t, per row. An unstaged or shifted seat row is a bind-volume defect.
+    for (what, tid, per_row_words) in
+        [("noise", seat.noise, pad), ("invt", seat.invt, 32)]
+    {
+        match session.read_tensor_raw(PlaceId::Act(tid), rows * per_row_words * 4) {
+            Ok(bytes) => {
+                let words: Vec<f32> = bytes
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                eprintln!("[sample-probe] {what} t{tid}: {rows} rows x {per_row_words} words");
+                for r in 0..rows {
+                    let row = &words[r * per_row_words..(r + 1) * per_row_words];
+                    let nz = row.iter().filter(|w| **w != 0.0).count();
+                    eprintln!(
+                        "[sample-probe]   {what} row {r}: first8={:?} nonzero={nz}",
+                        &row[..row.len().min(8)]
+                    );
+                }
+            }
+            Err(e) => eprintln!("[sample-probe] {what} read failed: {e}"),
+        }
+    }
+    // THE SAMPLER'S INPUT LOGITS, per row, with the HOST's first-max beside the card's
+    // pick — the stage split the probe exists for. `read_tensor` converts the stick to
+    // IEEE f16 in the placement's own order, the same convert the pre-front host argmax
+    // read through.
+    match session.read_tensor(PlaceId::Act(seat.row), rows * pad) {
+        Ok(elems) => {
+            eprintln!("[sample-probe] logits t{}: {rows} rows x {pad} lanes", seat.row);
+            // The row's lanes are STICK-SCATTERED (fp16: 64-element sticks), the same
+            // `dev_off_stk` law the idx readback takes — a row-major slice mixes rows.
+            let stk = 64usize;
+            for r in 0..rows {
+                let row: Vec<f32> = (0..pad)
+                    .map(|l| {
+                        elems
+                            [scratchy_subtile::sdsc_abstract::dev_off_stk(&[rows, pad], 1, &[r, l], stk)]
+                    })
+                    .collect();
+                let lane = row.len().min(vocab);
+                let (mut best, mut bi) = (f32::NEG_INFINITY, 0usize);
+                for (i, v) in row[..lane].iter().enumerate() {
+                    if *v > best {
+                        best = *v;
+                        bi = i;
+                    }
+                }
+                eprintln!(
+                    "[sample-probe]   logits row {r}: host first-max lane {bi} ({best:.4}); card pick {}",
+                    picked.get(r).copied().map(|t| t.to_string()).unwrap_or("?".into())
+                );
+            }
+        }
+        Err(e) => eprintln!("[sample-probe] logits read failed: {e}"),
+    }
 }
 
 #[cfg(feature = "spyre-hw")]
