@@ -1091,6 +1091,28 @@ fn sample_binds(
             laws.len()
         )));
     }
+    // ⭐ THE SEAT'S OWN LINE — what this launch's rows draw, stated where the
+    // words are built. The chat leg's order requires the server log to SHOW
+    // the seat binding the seeds (a seeded request served greedy, or two
+    // requests' seeds sharing one batched launch, is invisible without it):
+    // one line per launch, every row's seed, step salt, gate and inv_t.
+    tracing::debug!(
+        "SEAT_BIND rows={} seed_words={:?} invt=t{} laws={}",
+        rows,
+        seat.seed_words,
+        seat.invt,
+        laws.iter()
+            .enumerate()
+            .map(|(r, law)| match law.draw {
+                Some(d) => format!(
+                    "r{r}:seed={}@step{}:inv_t{}",
+                    d.seed, law.step, d.inv_t
+                ),
+                None => format!("r{r}:greedy@step{}", law.step),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     // (seed_lo, seed_hi, step, greedy_gate, row) — the greedy row is zeros and
     // its own index (the gate word's 0 is what makes the draw greedy); a
     // sampled row is its request's seed split low/high, its step salt, and the
