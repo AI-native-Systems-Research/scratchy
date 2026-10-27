@@ -96,15 +96,20 @@ type Shape = (i64, i64, Option<i64>);
 /// build compiles, resolve Hub-matching repo ids (cache-first) and verify each
 /// against this arch's own compiled shape(s) and quant preset(s).
 ///
-/// Returns the deduped/sorted union. The caller
-/// (`scratchy-forwards.rs::write_hf_registry_file`) renders it — writing happens
-/// on every build, resolving only under `hf-completions`, so both paths share
-/// one renderer and `$OUT_DIR/hf_registry.rs` always exists.
+/// Returns the deduped union in the Hub's popularity order: most downloads
+/// first, ties by id, so the canonical checkpoint leads its fine-tunes. The
+/// caller (`scratchy-forwards.rs::write_hf_registry_file`) renders it — writing
+/// happens on every build, resolving only under `hf-completions`, so both paths
+/// share one renderer and `$OUT_DIR/hf_registry.rs` always exists.
+///
+/// A gated candidate (its `config.json` answers 401/403 without a token that
+/// has accepted its license) can't be verified, so it is left out; the build
+/// says how many with a `cargo:warning` rather than dropping them silently.
 pub fn resolve_hf_registry(
     targets: &[(String, PathBuf)],
     enabled_quant_presets: &BTreeSet<String>,
     repo_root: &Path,
-) -> BTreeSet<String> {
+) -> Vec<String> {
     let quant_tags: BTreeSet<&str> = enabled_quant_presets
         .iter()
         .map(|p| preset_hub_tag(p))
@@ -116,7 +121,10 @@ pub fn resolve_hf_registry(
     let config_cache_dir = cache_dir.join("configs");
     let _ = std::fs::create_dir_all(&config_cache_dir);
 
-    let mut ids: BTreeSet<String> = BTreeSet::new();
+    // Each verified id at its download count (the same id found by several queries
+    // keeps one entry), and the gated ids that could not be verified.
+    let mut ranked: BTreeMap<String, u64> = BTreeMap::new();
+    let mut gated: BTreeMap<String, u64> = BTreeMap::new();
     for (arch, configs_dir) in targets {
         // One query per DISTINCT `model_type` among this arch's compiled
         // configs, not one per arch directory: the Hub tags by `model_type`, and
@@ -124,7 +132,7 @@ pub fn resolve_hf_registry(
         for (model_type, shapes) in compiled_variants(arch, configs_dir) {
             let tag = hub_tag_for(&model_type, arch, &cache_dir);
 
-            let candidates: Vec<String> = if quant_tags.is_empty() {
+            let candidates: Vec<Ranked> = if quant_tags.is_empty() {
                 resolve(&[&tag], &cache_dir)
             } else {
                 let mut v = Vec::new();
@@ -140,14 +148,78 @@ pub fn resolve_hf_registry(
             // each candidate touches its own cache file, so there is nothing to
             // serialize. Cache hits make repeat builds trivially fast either
             // way.
-            ids.par_extend(
-                candidates.into_par_iter().filter(|id| {
-                    candidate_matches(id, &shapes, &allowed_methods, &config_cache_dir)
-                }),
-            );
+            let verdicts: Vec<(Ranked, Verdict)> = candidates
+                .into_par_iter()
+                .map(|c| {
+                    let v = verify(&c.id, &shapes, &allowed_methods, &config_cache_dir);
+                    (c, v)
+                })
+                .collect();
+            for (c, verdict) in verdicts {
+                match verdict {
+                    Verdict::Loadable => {
+                        let n = ranked.entry(c.id).or_default();
+                        *n = (*n).max(c.downloads);
+                    }
+                    Verdict::Gated => {
+                        let n = gated.entry(c.id).or_default();
+                        *n = (*n).max(c.downloads);
+                    }
+                    Verdict::NotLoadable => {}
+                }
+            }
         }
     }
-    ids
+    gated.retain(|id, _| !ranked.contains_key(id));
+    if !gated.is_empty() {
+        let why = if std::env::var("HF_TOKEN").is_ok_and(|t| !t.is_empty()) {
+            "the HF_TOKEN this build ran with has not been granted access to them"
+        } else {
+            "their config.json needs a Hugging Face token; set HF_TOKEN at build time to verify them"
+        };
+        let some: Vec<&str> = by_downloads(&gated).into_iter().take(3).collect();
+        println!(
+            "cargo:warning=hf-completions: {} gated repo(s) in this build's architecture \
+             families are left out of tab completion ({}): {}{}",
+            gated.len(),
+            why,
+            some.join(", "),
+            if gated.len() > some.len() {
+                ", ..."
+            } else {
+                ""
+            }
+        );
+    }
+    by_downloads(&ranked)
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+/// The ids of `counts` most downloaded first, ties by id.
+fn by_downloads(counts: &BTreeMap<String, u64>) -> Vec<&str> {
+    let mut ids: Vec<(&str, u64)> = counts.iter().map(|(id, &n)| (id.as_str(), n)).collect();
+    ids.sort_by(|(a, x), (b, y)| y.cmp(x).then_with(|| a.cmp(b)));
+    ids.into_iter().map(|(id, _)| id).collect()
+}
+
+/// One Hub search result: a repo id and its download count, the order the Hub
+/// ranks by (`sort=downloads`).
+struct Ranked {
+    id: String,
+    downloads: u64,
+}
+
+/// What verifying one candidate found.
+enum Verdict {
+    /// Its arch, shape and quantization are this build's: `scr` can load it.
+    Loadable,
+    /// It was read and isn't (another shape, quantization or none).
+    NotLoadable,
+    /// Its `config.json` refused this build (401/403: a gated repo whose license
+    /// the build's token, if any, has not accepted), so it could not be read.
+    Gated,
 }
 
 /// The Hub filter tag for one compiled group.
@@ -287,12 +359,12 @@ fn compiled_variants(arch: &str, configs_dir: &Path) -> BTreeMap<String, BTreeSe
 /// `https://huggingface.co/<id>/raw/main/config.json` once for both checks.
 /// Network/parse failure degrades to `false` (excluded) — a candidate we
 /// can't verify is not one we can promise `scr chat`/`scr serve` will load.
-fn candidate_matches(
+fn verify(
     id: &str,
     compiled_shapes: &BTreeSet<Shape>,
     allowed_methods: &[QuantMethod],
     config_cache_dir: &Path,
-) -> bool {
+) -> Verdict {
     let cache_path = config_cache_dir.join(format!("{}.json", sanitize(id)));
 
     let cached_text = std::fs::read_to_string(&cache_path).ok();
@@ -308,35 +380,45 @@ fn candidate_matches(
         cached_text
     } else {
         match fetch_config(id) {
-            Some(t) => {
+            Ok(t) => {
                 let _ = std::fs::write(&cache_path, &t);
                 Some(t)
             }
-            None => cached_text,
+            // Not cached either: a gated repo is never written to the cache, so a
+            // later build with a token reads it afresh.
+            Err(Fetch::Gated) if cached_text.is_none() => return Verdict::Gated,
+            Err(_) => cached_text,
         }
     };
 
-    let Some(text) = text else { return false };
+    let Some(text) = text else {
+        return Verdict::NotLoadable;
+    };
     let Ok(json): Result<serde_json::Value, _> = serde_json::from_str(&text) else {
-        return false;
+        return Verdict::NotLoadable;
     };
 
     if !compiled_shapes.is_empty() && !shape_of(&json).is_some_and(|s| compiled_shapes.contains(&s))
     {
-        return false;
+        return Verdict::NotLoadable;
     }
 
     let candidate_method = QuantizationConfig::parse(&json)
         .ok()
         .flatten()
         .map(|c| c.method);
-    match (candidate_method, allowed_methods.is_empty()) {
+    let loadable = match (candidate_method, allowed_methods.is_empty()) {
         // Dense build (no quant preset enabled): only a candidate with NO
         // quantization_config at all is something this build can load.
         (None, true) => true,
         (None, false) => false,
         (Some(_), true) => false,
         (Some(m), false) => allowed_methods.iter().any(|a| m.same_storage_format(a)),
+    };
+    if loadable {
+        Verdict::Loadable
+    } else {
+        Verdict::NotLoadable
     }
 }
 
@@ -367,23 +449,37 @@ fn compiled_quant_methods(
         .collect()
 }
 
+/// Why a `config.json` could not be read.
+enum Fetch {
+    /// 401/403: a gated repo, whose license this build's token (if any) has not
+    /// accepted.
+    Gated,
+    /// Anything else: the network, the Hub, or a body that isn't text.
+    Failed,
+}
+
 /// Fetches with `HF_TOKEN` (same env var `hf-hub-downloader` reads at
 /// runtime) when set — without it, a gated repo (e.g. `meta-llama/*`, which
 /// requires accepting a license) 401s and its shape can't be verified, so
 /// it's excluded even though `scr chat`/`scr serve` would load it fine once
-/// the user authenticates. With the builder's own token (already required
-/// to download those checkpoints at all), the same gate that's already
-/// been cleared for real usage is cleared here too.
-fn fetch_config(id: &str) -> Option<String> {
+/// the user authenticates; [`resolve_hf_registry`] counts those aloud. With
+/// the builder's own token (already required to download those checkpoints at
+/// all), the same gate that's already been cleared for real usage is cleared
+/// here too.
+fn fetch_config(id: &str) -> Result<String, Fetch> {
     let url = format!("https://huggingface.co/{id}/raw/main/config.json");
     let mut req = ureq::get(&url);
     if let Some(token) = std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty()) {
         req = req.header("Authorization", format!("Bearer {token}"));
     }
-    let res = req.call().ok()?;
+    let res = req.call().map_err(|e| match e {
+        ureq::Error::StatusCode(401 | 403) => Fetch::Gated,
+        _ => Fetch::Failed,
+    })?;
     let mut body = String::new();
-    std::io::Read::read_to_string(&mut res.into_body().into_reader(), &mut body).ok()?;
-    Some(body)
+    std::io::Read::read_to_string(&mut res.into_body().into_reader(), &mut body)
+        .map_err(|_| Fetch::Failed)?;
+    Ok(body)
 }
 
 /// The decoder's own shape.
@@ -472,9 +568,10 @@ fn resolve_arch_tag(arch: &str, cache_dir: &Path) -> String {
         .unwrap_or_else(|| arch.to_string())
 }
 
-/// One `filter=` tag combination's ids: fresh cache hit, or a Hub query
-/// (falling back to stale cache, then to empty, on any failure).
-fn resolve(tags: &[&str], cache_dir: &Path) -> Vec<String> {
+/// One `filter=` tag combination's ids with their download counts: fresh cache
+/// hit, or a Hub query (falling back to stale cache, then to empty, on any
+/// failure).
+fn resolve(tags: &[&str], cache_dir: &Path) -> Vec<Ranked> {
     let cache_path = cache_dir.join(format!("{}.json", sanitize(&tags.join("+"))));
 
     let cached = std::fs::read_to_string(&cache_path)
@@ -487,8 +584,9 @@ fn resolve(tags: &[&str], cache_dir: &Path) -> Vec<String> {
             .and_then(|v| v.as_u64())
             .map(|t| now_secs().saturating_sub(t) < CACHE_TTL.as_secs())
             .unwrap_or(false);
-        if fresh {
-            return ids_from_cache_json(json);
+        // A cache from before the counts were kept has no `ranked` list: stale.
+        if fresh && json.get("ranked").is_some() {
+            return ranked_from_cache_json(json);
         }
     }
 
@@ -497,25 +595,48 @@ fn resolve(tags: &[&str], cache_dir: &Path) -> Vec<String> {
             write_cache(&cache_path, &ids);
             ids
         }
-        None => cached.as_ref().map(ids_from_cache_json).unwrap_or_default(),
+        None => cached
+            .as_ref()
+            .map(ranked_from_cache_json)
+            .unwrap_or_default(),
     }
 }
 
-fn ids_from_cache_json(json: &serde_json::Value) -> Vec<String> {
+/// The `ranked` `[id, downloads]` pairs a cache file holds, or, from a file
+/// written before the counts were kept, its `ids` at no downloads.
+fn ranked_from_cache_json(json: &serde_json::Value) -> Vec<Ranked> {
+    if let Some(pairs) = json.get("ranked").and_then(|v| v.as_array()) {
+        return pairs
+            .iter()
+            .filter_map(|p| {
+                Some(Ranked {
+                    id: p.get(0)?.as_str()?.to_string(),
+                    downloads: p.get(1)?.as_u64()?,
+                })
+            })
+            .collect();
+    }
     json.get("ids")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
+                .filter_map(|v| v.as_str())
+                .map(|id| Ranked {
+                    id: id.to_string(),
+                    downloads: 0,
+                })
                 .collect()
         })
         .unwrap_or_default()
 }
 
-fn write_cache(cache_path: &Path, ids: &[String]) {
+fn write_cache(cache_path: &Path, ranked: &[Ranked]) {
+    let pairs: Vec<serde_json::Value> = (ranked.iter())
+        .map(|r| serde_json::json!([r.id, r.downloads]))
+        .collect();
     let json = serde_json::json!({
         "fetched_at": now_secs(),
-        "ids": ids,
+        "ranked": pairs,
     });
     let _ = std::fs::write(cache_path, json.to_string());
 }
@@ -547,9 +668,9 @@ fn sanitize(tag: &str) -> String {
 
 /// `GET https://huggingface.co/api/models?filter=<tag1>&filter=<tag2>&...`,
 /// returning the repo ids matching every given tag (the Hub ANDs repeated
-/// `filter=` params). `None` on any network/parse failure — the caller
-/// falls back to cache.
-fn query_hub(tags: &[&str]) -> Option<Vec<String>> {
+/// `filter=` params) with their download counts, most downloaded first.
+/// `None` on any network/parse failure — the caller falls back to cache.
+fn query_hub(tags: &[&str]) -> Option<Vec<Ranked>> {
     let filters: String = tags
         .iter()
         .map(|t| format!("filter={}", urlencoding_minimal(t)))
@@ -565,8 +686,12 @@ fn query_hub(tags: &[&str]) -> Option<Vec<String>> {
     let arr = json.as_array()?;
     Some(
         arr.iter()
-            .filter_map(|entry| entry.get("id").and_then(|v| v.as_str()))
-            .map(str::to_string)
+            .filter_map(|entry| {
+                Some(Ranked {
+                    id: entry.get("id")?.as_str()?.to_string(),
+                    downloads: entry.get("downloads").and_then(|v| v.as_u64()).unwrap_or(0),
+                })
+            })
             .collect(),
     )
 }

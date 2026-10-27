@@ -112,7 +112,14 @@ pub struct JsonSchemaResponseFormat {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The schema, under OpenAI's key, `schema`, as vLLM reads it
+    /// (`response_format: {"type": "json_schema", "json_schema": {"name": …, "schema": {…}}}`).
+    /// `json_schema` is read too, the key this read before.
+    #[serde(
+        rename = "schema",
+        alias = "json_schema",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub json_schema: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
@@ -226,6 +233,182 @@ pub struct ChatCompletionToolsParam {
     pub function: FunctionDefinition,
 }
 
+/// ⭐ WHAT A REQUEST LETS THE MODEL DO WITH ITS TOOLS (`tool_choice`), whichever endpoint it came
+/// through. Each endpoint reads its own forms into this as the request is parsed
+/// ([`Self::from_chat`], [`Self::from_anthropic`], [`Self::from_responses`]), and a form it does not
+/// know fails the request there, rather than reaching the engine and acting as [`Self::Auto`].
+/// Serialized and deserialized in the chat completions' forms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolChoice {
+    /// No tool: the reply is never read for a tool call. The tools still render (#757).
+    None,
+    /// Any tool, or none.
+    Auto,
+    /// Some tool: the reply is constrained to a JSON array of calls to the declared tools (#765).
+    Required,
+    /// This tool: a call to any other is dropped, so the reply is the text around it (#746).
+    Function(String),
+}
+
+impl ToolChoice {
+    /// The chat completions' forms: `"none"`, `"auto"`, `"required"`, or
+    /// `{"type": "function", "function": {"name": …}}`, whose `type` may be left out (as vLLM
+    /// allows).
+    pub fn from_chat(v: &serde_json::Value) -> Result<Self, String> {
+        let named = |o: &serde_json::Map<String, serde_json::Value>| {
+            let typed = o.get("type").is_none_or(|t| t.as_str() == Some("function"));
+            let name = typed.then(|| o.get("function")?.get("name")?.as_str())??;
+            Some(Self::Function(name.to_owned()))
+        };
+        let choice = match v {
+            serde_json::Value::String(s) => Self::from_mode(s),
+            serde_json::Value::Object(o) => named(o),
+            _ => None,
+        };
+        choice.ok_or_else(|| {
+            format!(
+                r#"tool_choice must be "none", "auto", "required" or {{"type": "function", "function": {{"name": …}}}}, not {v}"#
+            )
+        })
+    }
+
+    /// The Anthropic Messages API's forms: `{"type": "auto" | "any" | "none"}`,
+    /// `{"type": "tool", "name": …}`, and the bare strings `"auto"`, `"any"` and `"none"`. `any` is
+    /// [`Self::Required`]. An object's `disable_parallel_tool_use` is read beside it, as a
+    /// [`CallLimit`] (`crate::anthropic::AnthropicToolChoice`).
+    pub fn from_anthropic(v: &serde_json::Value) -> Result<Self, String> {
+        let kind = |s: &str| match s {
+            "auto" => Some(Self::Auto),
+            "any" => Some(Self::Required),
+            "none" => Some(Self::None),
+            _ => None,
+        };
+        let choice = match v {
+            serde_json::Value::String(s) => kind(s),
+            serde_json::Value::Object(o) => match o.get("type").and_then(|t| t.as_str()) {
+                Some("tool") => (o.get("name").and_then(|n| n.as_str()))
+                    .map(|name| Self::Function(name.to_owned())),
+                Some(t) => kind(t),
+                None => None,
+            },
+            _ => None,
+        };
+        choice.ok_or_else(|| {
+            format!(
+                r#"tool_choice must be {{"type": "auto"}}, {{"type": "any"}}, {{"type": "none"}} or {{"type": "tool", "name": …}}, not {v}"#
+            )
+        })
+    }
+
+    /// The Responses API's forms: `"none"`, `"auto"`, `"required"`, or
+    /// `{"type": "function", "name": …}`. The chat completions'
+    /// `{"type": "function", "function": {"name": …}}` is read too. Hosted tools, such as
+    /// `{"type": "file_search"}`, are not served, so not choosable.
+    pub fn from_responses(v: &serde_json::Value) -> Result<Self, String> {
+        let named = |o: &serde_json::Map<String, serde_json::Value>| {
+            (o.get("type").and_then(|t| t.as_str()) == Some("function")).then_some(())?;
+            let name = o.get("name").or_else(|| o.get("function")?.get("name"))?;
+            Some(Self::Function(name.as_str()?.to_owned()))
+        };
+        let choice = match v {
+            serde_json::Value::String(s) => Self::from_mode(s),
+            serde_json::Value::Object(o) => named(o),
+            _ => None,
+        };
+        choice.ok_or_else(|| {
+            format!(
+                r#"tool_choice must be "none", "auto", "required" or {{"type": "function", "name": …}}, not {v}"#
+            )
+        })
+    }
+
+    /// The Anthropic Messages API's form of it: `{"type": …}`, `any` for [`Self::Required`].
+    pub fn to_anthropic(&self) -> serde_json::Value {
+        match self {
+            Self::None => serde_json::json!({ "type": "none" }),
+            Self::Auto => serde_json::json!({ "type": "auto" }),
+            Self::Required => serde_json::json!({ "type": "any" }),
+            Self::Function(name) => serde_json::json!({ "type": "tool", "name": name }),
+        }
+    }
+
+    /// The Responses API's form of it.
+    pub fn to_responses(&self) -> serde_json::Value {
+        match self {
+            Self::Function(name) => serde_json::json!({ "type": "function", "name": name }),
+            mode => serde_json::Value::String(mode.mode().to_owned()),
+        }
+    }
+
+    /// The OpenAI keyword for every choice but [`Self::Function`].
+    fn mode(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Auto => "auto",
+            Self::Required => "required",
+            Self::Function(_) => "function",
+        }
+    }
+
+    fn from_mode(s: &str) -> Option<Self> {
+        match s {
+            "none" => Some(Self::None),
+            "auto" => Some(Self::Auto),
+            "required" => Some(Self::Required),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for ToolChoice {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Function(name) => {
+                let form = serde_json::json!({ "type": "function", "function": { "name": name } });
+                form.serialize(serializer)
+            }
+            mode => serializer.serialize_str(mode.mode()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolChoice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let form = serde_json::Value::deserialize(deserializer)?;
+        Self::from_chat(&form).map_err(serde::de::Error::custom)
+    }
+}
+
+/// How many tool calls a reply may carry, whichever endpoint the request came through (#794):
+/// any, or with `parallel_tool_calls: false` (Anthropic's `disable_parallel_tool_use: true`) one.
+/// Under `tool_choice: "required"` the reply's grammar takes that many; otherwise the reply keeps
+/// that many of the calls it would keep, the first, as vLLM does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CallLimit {
+    #[default]
+    Any,
+    One,
+}
+
+impl CallLimit {
+    /// The limit a request's `parallel_tool_calls` sets: only an explicit `false` sets one, as vLLM
+    /// reads it.
+    pub fn of(parallel_tool_calls: Option<bool>) -> Self {
+        match parallel_tool_calls {
+            Some(false) => Self::One,
+            _ => Self::Any,
+        }
+    }
+
+    /// The most calls a reply keeps.
+    pub fn most(self) -> usize {
+        match self {
+            Self::Any => usize::MAX,
+            Self::One => 1,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Chat completion request
 // ---------------------------------------------------------------------------
@@ -333,7 +516,11 @@ pub struct ChatCompletionRequest {
 
     /// Controls which (if any) tool is called by the model.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<serde_json::Value>,
+    pub tool_choice: Option<ToolChoice>,
+
+    /// Whether the reply may call more than one tool: `false` limits it to one ([`CallLimit`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
 
     /// User identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -413,6 +600,13 @@ pub struct ChatCompletionRequest {
     /// Will be accessible by the chat template (e.g. `{"enable_thinking": false}`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<std::collections::HashMap<String, serde_json::Value>>,
+}
+
+impl ChatCompletionRequest {
+    /// How many tool calls the reply may carry, as its `parallel_tool_calls` sets it.
+    pub fn call_limit(&self) -> CallLimit {
+        CallLimit::of(self.parallel_tool_calls)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,8 +1330,18 @@ pub struct TokenizeRequest {
     #[serde(default)]
     pub messages: Option<Vec<ChatCompletionMessageParam>>,
 
+    /// The tools a chat request declares, rendered into its prompt as the chat path renders them
+    /// (chat-style only).
+    #[serde(default)]
+    pub tools: Option<Vec<ChatCompletionToolsParam>>,
+
+    /// Extra kwargs for the chat template (e.g. `{"enable_thinking": false}`), merged over the
+    /// server's defaults as the chat path merges them (chat-style only).
+    #[serde(default)]
+    pub chat_template_kwargs: Option<std::collections::HashMap<String, serde_json::Value>>,
+
     /// Whether to add special tokens (e.g. BOS). Default `true` for prompt
-    /// mode, `false` for chat mode (chat template usually adds them).
+    /// mode; for chat mode, whatever the prefill adds to the rendered prompt.
     #[serde(default)]
     pub add_special_tokens: Option<bool>,
 
@@ -1736,5 +1940,52 @@ mod tests {
         assert_eq!(input.custom_id, "emb-1");
         let req: EmbeddingRequest = serde_json::from_value(input.body).unwrap();
         assert_eq!(req.model.as_deref(), Some("test"));
+    }
+
+    /// The chat completions' `tool_choice` forms read and write as themselves; a named function
+    /// may leave `type` out, as vLLM allows.
+    #[test]
+    fn chat_tool_choice_forms_round_trip() {
+        use serde_json::json;
+        let cases = [
+            (json!("none"), ToolChoice::None),
+            (json!("auto"), ToolChoice::Auto),
+            (json!("required"), ToolChoice::Required),
+            (
+                json!({"type": "function", "function": {"name": "get_weather"}}),
+                ToolChoice::Function("get_weather".into()),
+            ),
+        ];
+        for (form, choice) in cases {
+            let read: ToolChoice = serde_json::from_value(form.clone()).unwrap();
+            assert_eq!(read, choice, "{form}");
+            assert_eq!(serde_json::to_value(&choice).unwrap(), form);
+        }
+        let untyped = json!({"function": {"name": "get_weather"}});
+        let read: ToolChoice = serde_json::from_value(untyped).unwrap();
+        assert_eq!(read, ToolChoice::Function("get_weather".into()));
+    }
+
+    /// A `tool_choice` the chat completions API doesn't define fails the request as it is parsed,
+    /// instead of acting as `"auto"`: a typo, a function naming no tool, another API's form.
+    #[test]
+    fn an_unknown_chat_tool_choice_fails_the_request() {
+        use serde_json::json;
+        for bad in [
+            json!("requried"),
+            json!({"type": "function", "function": {}}),
+            json!({"type": "function", "name": "get_weather"}),
+            json!({"type": "tool", "name": "Read"}),
+            json!({"type": "file_search"}),
+            json!(true),
+        ] {
+            let err = serde_json::from_value::<ToolChoice>(bad.clone()).expect_err("not a form");
+            assert!(err.to_string().contains(r#""required""#), "{bad}: {err}");
+            let request = json!({ "messages": [], "tool_choice": bad });
+            assert!(serde_json::from_value::<ChatCompletionRequest>(request).is_err());
+        }
+        let request = json!({ "messages": [], "tool_choice": null });
+        let parsed: ChatCompletionRequest = serde_json::from_value(request).unwrap();
+        assert_eq!(parsed.tool_choice, None);
     }
 }

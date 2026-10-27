@@ -258,9 +258,11 @@ fn the_restickify_door_carries_a_one_dim_output_stick_for_the_same_relayout() {
         "rk",
         slots,
         feats,
-        "k_nat",
+        // TRUE handles for the whole buffers the mint bounds each tile's flat run against — here a
+        // `[64, 64]` pair, the exact tile.
+        &ktir_superdsc::emit::rb("k_nat", 64, 64),
         DevOff::ZERO,
-        "k_t",
+        &ktir_superdsc::emit::rb("k_t", 64, 64),
         DevOff::ZERO,
         &mut sid,
         None,
@@ -301,14 +303,22 @@ fn the_restickify_door_carries_a_one_dim_output_stick_for_the_same_relayout() {
 /// is the single `y` axis. That pair is the whole contract: the swap is the relayout, and the one-dim
 /// stick is what `Ddc::transformForInterSliceRestickify` can land on a single-dim loop for
 /// `SNComputeLowering.cpp:74`. If the two orders were EQUAL the descriptor would be a re-stick with no
-/// transposition — the `restickify_v_opspec_2d` contract, which is a different op — and it would carry
+/// transposition — the deleted V-side re-stick's contract, a different op — and it would carry
 /// exactly the one-dim stick the first assertion accepts. So both are needed.
 #[test]
 fn the_rerouted_ktir_door_transposes_with_a_one_dim_output_stick_at_every_shape() {
     for &(mb, out, label) in SHAPES {
         let mut sid = -1i64;
         let op = ktir_superdsc::emit::try_assemble_restickify_transpose_2d(
-            "tr", mb, out, "t_in", "t_out", &mut sid, None,
+            "tr",
+            mb,
+            out,
+            // TRUE whole-buffer handles — the mint bounds the flat `[mb, out]`/`[out, mb]` runs
+            // against exactly these.
+            &ktir_superdsc::emit::rb("t_in", mb, out),
+            &ktir_superdsc::emit::rb("t_out", out, mb),
+            &mut sid,
+            None,
         )
         .unwrap_or_else(|e| {
             panic!(
@@ -377,7 +387,13 @@ fn an_over_lx_transpose_is_refused_and_the_half_size_control_is_accepted() {
     let mut sid = -1i64;
     // `EmittedOp` is not `Debug`, so the Ok arm is named by hand rather than through `expect_err`.
     let e = match ktir_superdsc::emit::try_assemble_restickify_transpose_2d(
-        "big", 4096, 4096, "t_in", "t_out", &mut sid, None,
+        "big",
+        4096,
+        4096,
+        &ktir_superdsc::emit::rb("t_in", 4096, 4096),
+        &ktir_superdsc::emit::rb("t_out", 4096, 4096),
+        &mut sid,
+        None,
     ) {
         Ok(_) => panic!(
             "[4096, 4096] EMITTED: its per-core tile is 2_097_152 B against the 1_677_721-B LX \
@@ -394,7 +410,13 @@ fn an_over_lx_transpose_is_refused_and_the_half_size_control_is_accepted() {
 
     let mut sid = -1i64;
     let op = ktir_superdsc::emit::try_assemble_restickify_transpose_2d(
-        "ctl", 4096, 2048, "t_in", "t_out", &mut sid, None,
+        "ctl",
+        4096,
+        2048,
+        &ktir_superdsc::emit::rb("t_in", 4096, 2048),
+        &ktir_superdsc::emit::rb("t_out", 2048, 4096),
+        &mut sid,
+        None,
     )
     .expect("the half-width control fits LX and must still be emitted");
     let (order, _) = output_stick(&op);

@@ -221,6 +221,9 @@ pub(crate) fn solo_step_is_decode(
 ///     win. Each row attends only its own request's blocks (PROVEN: per-row
 ///     block_table honored; rows don't cross-contaminate).
 impl Worker for SpyreWorker {
+    /// The Spyre worker applies no grammar.
+    fn set_stop_token_ids(&mut self, _stop_token_ids: &[u32]) {}
+
     /// THE CONTEXT THE POOL CAN ADDRESS, so the ENGINE rejects an over-long prompt at admission
     /// instead of the worker killing the whole batch mid-forward.
     ///
@@ -515,9 +518,9 @@ impl Worker for SpyreWorker {
             );
             // ⭐ THE HOST'S TABLE GOES INTO `InputBatch`, the engine's own per-request store — including,
             // on a prefix-cache hit, the blocks that already hold this request's first `start` tokens.
-            // ⛔ ONE KV CACHE GROUP: `block_ids` is per group and every group of a non-hybrid model gets
-            // the same ids ("In the common single-group case, all groups share the same block IDs"), so
-            // group 0 is the list. A hybrid model would need a group per attention class, which this
+            // ⛔ ONE KV CACHE GROUP: `block_ids` is per group, and the scheduler's tracker gives a
+            // non-hybrid model one (`SimpleBlockTracker::allocate_slots`), so group 0 is the list. A
+            // hybrid model gets a table per attention class (`allocate_slots_hybrid`), which this
             // backend does not bake.
             // ⭐ AND THE TOKENS THEMSELVES, in the same store as the block table. `ReqState` used to hold
             // `tokens` + `prompt_len`; the length is now derived from this one value.
@@ -539,10 +542,7 @@ impl Worker for SpyreWorker {
             // sharing is the whole point: the request does not recompute them and does not copy them,
             // because its block table names the same physical pages the earlier request wrote.
             //
-            // ⛔ ONE KV CACHE GROUP. `block_ids` is per group and every group of a non-hybrid model
-            // gets the same ids (`kv_cache_manager`: "In the common single-group case, all groups share
-            // the same block IDs"), so group 0 is the list. A hybrid model would need a group per
-            // attention class, which this backend does not bake.
+            // ⛔ ONE KV CACHE GROUP, as for `input_batch.add_request` above: group 0 is the list.
             #[cfg(feature = "spyre-hw")]
             install_host_blocks(
                 &mut model.session,

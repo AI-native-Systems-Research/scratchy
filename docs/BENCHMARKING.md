@@ -109,6 +109,16 @@ nothing is self-reported.
   under multi-token prediction or speculative decoding. ITL, the gap between
   chunks, does not: one gap then spans several tokens, so it reads slow. The
   Metal matrix neither asks `bench serve` for ITL nor keeps it.
+  - `bench serve` keeps ITL per chunk, one rule for every engine, and reports
+    beside it how many tokens a chunk carried: `median_tokens_per_chunk`, and
+    `multi_token_chunk_requests`, the requests averaging over 1.5. ITL reads per
+    token only where a chunk is one token. A chunk count can't tell speculative
+    decoding from a server holding tokens back.
+  - `--save-detailed` adds every request's own figures to the results JSON, in
+    `vllm bench serve --save-detailed`'s layout: `input_lens`, `output_lens`,
+    `ttfts`, `itls`, `latencies`, `start_times`, `generated_texts` and `errors`,
+    parallel arrays in seconds. It also adds `chunks`, which vLLM doesn't keep,
+    so an odd aggregate can be checked afterwards.
 - **`peak_rss`** / **`major_faults`** — the child's own `ru_maxrss` /
   `ru_majflt`, read via `wait4(2)` when it is reaped, same call for every
   backend. It has to be `wait4` rather than `getrusage(RUSAGE_CHILDREN)`: the
@@ -205,8 +215,41 @@ bimodal ITL distribution in this repo for a week
    reach the argmax: its set swaps the count prompt, whose procedural
    preamble ties at 0.0–0.5 logits at 3 bits, for a third short factual one
    with a 1.25-logit minimum margin (`parity_prompts` in
-   `crates/benches/src/startup_exec/mod.rs`). Every model keeps the exact-match
-   comparison; only the questions are chosen per model.
+   `crates/benches/src/startup_exec/mod.rs`).
+
+   The gate runs where its verdict guards a comparison: any run timing a
+   comparison engine (every full run), or `--parity` forcing it (the smoke
+   run's setup check). A scratchy-only quick run skips it — the mlx-lm side
+   reloads the whole checkpoint once per gate prompt, which on the large
+   models can outlast the run itself — and records `parity_mlx_lm: null`
+   with `parity_skipped` saying why.
+
+   Some models tie on every prompt: gpt-oss and Nemotron-3 think before they
+   answer, and their thought opens on near-ties of 0.0–0.75 logits whatever
+   the question. For them no prompt choice helps, so where the two answers'
+   text differs the gate asks the reference to judge (`--parity-score-cmd`,
+   `scripts/parity_ties.py`): mlx-lm runs one forward over the prompt and
+   scratchy's own answer token ids, teacher-forced, and scores the whole
+   answer as its mean log-probability per token, next to mlx-lm's own greedy
+   answer of the same length. A prompt passes when scratchy's answer scores
+   within `SCORE_NATS` (0.5) nats a token of the reference's. A correct
+   stack that broke a near-tie differently writes text the reference finds
+   about as likely as its own; a wrong computation writes text it finds far
+   less likely at nearly every token. On granite-4.2-3b's count answer (base
+   M5) the reference's own answer scores -0.079 a token, scratchy's under
+   TurboQuant 4-bit KV -0.141 — 0.06 below, though one of its thought
+   tokens sits 1.5 logits behind the reference's top, which the earlier
+   per-token bar (1.0 logits, at most 4 such tokens) failed although a
+   no-TurboQuant build matches mlx-lm byte for byte — and the same answer
+   with its ids shifted by one -12.17, 12.1 below. Judging the whole answer
+   keeps one drifted near-tie from failing an exact load path, and still
+   fails a defect by a factor of twenty. Each token where the two part is
+   still printed, with its logit gap, and the run records them as
+   `parity_ties`; the page says the model matched up to near-ties.
+   Where no token differs at all, scratchy's answer is the reference's own
+   greedy answer and the prompt passes as `OK`: the text differs only in how
+   the two print it (mlx_lm.generate shows gpt-oss's `<|channel|>` tokens,
+   `scr chat` drops them).
 4. **Same weights, matching preset.** scratchy must be built with the preset
    matching the checkpoint's `config.json`.
 5. **One model resident at a time**, and `HF_HUB_OFFLINE=1` for both — left
@@ -267,6 +310,18 @@ These favour one side or the other and must travel with any published number.
   ollama's own MLX builds (`gemma4:26b-mlx` is NVFP4, not 4-bit affine); llama.cpp
   and mistral.rs run a Q4_K_M GGUF. The run records each engine's quantization
   and file revision, and the page names them on its row.
+- **Not every engine answers to length.** `bench serve` asks every engine to
+  ignore EOS (`ignore_eos: true`), so each request decodes its full
+  `--output-len`. scratchy does.
+  - oMLX's HTTP API takes no `ignore_eos`. Its own flag of that name, added in
+    oMLX 2026-10-21 (#4687 there), is internal to its admin benchmark. Its answers
+    stop at EOS: on the M1 Max run in #479, qwen3.6-35b-a3b's oMLX cells delivered
+    62–64% of the tokens asked for.
+  - ollama ignores `ignore_eos` too, and mlx-lm sometimes stops short.
+  - Such a cell measures less decode than its label says, over shorter answers
+    with smaller KV, which flatters tok/s. So the page marks every number from a
+    live cell under 99% of its asked-for answer tokens with §, and says what
+    share it delivered.
 - **Prefix caching differs by engine and model**, so `bench serve` warms up
   and checks connectivity with prompts outside the measured set: replaying a
   measured prompt let an engine with a prefix cache serve it as a full hit
@@ -281,7 +336,12 @@ These favour one side or the other and must travel with any published number.
   quantization rungs to concrete per-engine artifacts: see
   [`CLAUDE_CODE_BENCH.md`](CLAUDE_CODE_BENCH.md), which carries the Claude Code
   comparison's pins, disclosures and blocked cells. Its method is promoted into
-  this file as a §7 once that epic's phase 5 lands.
+  this file as a §7 once that epic's phase 5 lands. The trace replay adds one
+  of its own
+  ([What the replay enforces](CLAUDE_CODE_BENCH.md#what-the-replay-enforces-lane-a)):
+  it sends a session's overlapping requests one at a time. It clears both
+  engines' prefix caches before every pass, but differently: scratchy has a
+  reset endpoint, while ollama has to unload and reload the model.
 
 ## 5. Running it
 

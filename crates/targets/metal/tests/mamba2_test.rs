@@ -11,15 +11,19 @@
 //! continuation across a chunk boundary (chunks shorter than the conv window included), decode
 //! steps of one token a sequence, and a slot re-taken fresh mid-run. Both scan mappings run — the
 //! per-thread scan (state 16, the parity-tiny geometry) and the simd scan (state 128, the real
-//! checkpoints'). The tests take turns on the GPU ([`gpu_turn`]).
+//! checkpoints').
+//!
+//! The ssm slot is the pool's f16 entry (the kernels' `device half*`): a step's last-row state
+//! rounds through it at its store and the next step's load, the reference modeling the same
+//! rounding where it carries a sequence across steps. The conv ring stays f32, exact.
 
 mod common;
 
-use common::Dtype;
+use common::{Dtype, shared_bytes};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions, MTLSize};
 use scratchy_target_metal::aot::baked_build;
 use scratchy_target_metal::detect_device;
-use scratchy_target_metal::gdn_state::{GdnSave, GdnSeqSlots, GdnSlot};
+use scratchy_target_metal::gdn_state::{GDN_SSM_STATE_DTYPE, GdnSave, GdnSeqSlots, GdnSlot};
 use scratchy_target_metal::mtl4_dispatch::Mtl4DispatchBatch;
 use scratchy_target_metal::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
@@ -32,18 +36,12 @@ const EPS: f32 = 1e-5;
 /// The lowering's 1-D / channel threadgroup cap (`THREADS_PER_GROUP`).
 const THREADS: usize = 256;
 
-/// The GPU, one test at a time. Apple's driver corrupts its own heap when these tests build their
-/// pipelines at the same time, each through its own `SpecializedPipelineCache` (crash reports: in
-/// `AGX::UserCommonShaderFactory` and `ReflectionKey::initGPUCompilerSPIOptionsHash`, under
-/// `SpecializedPipelineCache::get_or_build`), and `cargo test -p scratchy-target-metal` runs them
-/// on parallel threads. The driver crash is #288's (first seen in `quantized_qmv_test`); this lock
-/// goes when that is fixed.
-static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// This test's turn on the GPU; a test that panicked with it held leaves it usable.
-fn gpu_turn() -> std::sync::MutexGuard<'static, ()> {
-    GPU.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// The pool's ssm entry dtype the GDN kernels read and write (`GDN_SSM_STATE_DTYPE`), as the
+/// dispatch `Dtype`: the harness' ssm buffers and the reference's carry-rounding go through it,
+/// so the constant and these tests cannot drift apart.
+fn ssm_entry_dtype() -> Dtype {
+    Dtype::try_from(GDN_SSM_STATE_DTYPE)
+        .unwrap_or_else(|dt| panic!("the ssm state's dtype {dt:?} has no dispatch form"))
 }
 
 /// A Mamba-2 mixer's geometry, in the GDN state pool's terms: groups as key heads, heads as
@@ -255,7 +253,8 @@ impl Gpu {
         Self {
             cache: SpecializedPipelineCache::new(device.clone(), &[]).expect("shaders"),
             conv_state: shared(&device, conv),
-            ssm_state: shared(&device, ssm),
+            // The pool's ssm entry is f16, the kernels' `device half*`.
+            ssm_state: shared_bytes(&device, &ssm_entry_dtype().bytes(ssm)),
             conv_w: shared(&device, &dtype.bytes(&w.conv_w)),
             conv_b: shared(&device, &dtype.bytes(&w.conv_b)),
             a_log: shared(&device, &w.a_log),
@@ -278,27 +277,39 @@ impl Gpu {
         }
     }
 
-    /// The pools' contents, conv then ssm.
+    /// The pools' contents, conv then ssm — the ssm entry's halves widened.
     fn pools(&self) -> (Vec<f32>, Vec<f32>) {
         let floats = |b: &Buffer| b.length() / 4;
         (
             read(&self.conv_state, floats(&self.conv_state)),
-            read(&self.ssm_state, floats(&self.ssm_state)),
+            ssm_entry_dtype().decode(
+                &self.ssm_state,
+                self.ssm_state.length() / ssm_entry_dtype().size_bytes(),
+            ),
         )
     }
 
-    /// Make the pools hold `conv` and `ssm`.
+    /// Make the pools hold `conv` and `ssm`, the ssm rounded through its f16 entry.
     fn load(&self, conv: &[f32], ssm: &[f32]) {
-        for (buf, data) in [(&self.conv_state, conv), (&self.ssm_state, ssm)] {
-            assert_eq!(buf.length(), std::mem::size_of_val(data), "a whole pool");
-            // SAFETY: `buf` holds exactly `data`'s bytes and does not overlap it.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data.as_ptr() as *const u8,
-                    buf.contents().as_ptr() as *mut u8,
-                    std::mem::size_of_val(data),
-                );
-            }
+        let ssm = ssm_entry_dtype().bytes(ssm);
+        assert_eq!(
+            self.conv_state.length(),
+            std::mem::size_of_val(conv),
+            "a whole pool"
+        );
+        assert_eq!(self.ssm_state.length(), ssm.len(), "a whole pool");
+        // SAFETY: each buffer holds exactly its data's bytes and does not overlap it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                conv.as_ptr() as *const u8,
+                self.conv_state.contents().as_ptr() as *mut u8,
+                std::mem::size_of_val(conv),
+            );
+            std::ptr::copy_nonoverlapping(
+                ssm.as_ptr(),
+                self.ssm_state.contents().as_ptr() as *mut u8,
+                ssm.len(),
+            );
         }
     }
 
@@ -526,6 +537,7 @@ fn run(geo: Geometry, dtype: Dtype, slots: usize, steps: &[Step], routed: bool) 
             .collect();
         let mut cu = vec![0i32];
         let mut want = Vec::with_capacity(tokens * geo.inner());
+        let mut carried = Vec::with_capacity(tokens * geo.inner());
         for &(slot, n, fresh) in step {
             let at = *cu.last().unwrap() as usize;
             cu.push((at + n) as i32);
@@ -534,6 +546,13 @@ fn run(geo: Geometry, dtype: Dtype, slots: usize, steps: &[Step], routed: bool) 
             }
             let rows = &zx[at * geo.row()..(at + n) * geo.row()];
             want.extend(reference(geo, &w, rows, n, &mut states[slot]));
+            // The kernel leaves each step's last-row state in the slot through the pool's f16
+            // entry and the next step loads it back; the reference carries f32 registers, so
+            // round its state at the same point.
+            for v in states[slot].ssm.iter_mut() {
+                *v = ssm_entry_dtype().round(*v);
+            }
+            carried.extend(std::iter::repeat_n(!fresh, n * geo.inner()));
         }
         let seqs: Vec<GdnSeqSlots> = step
             .iter()
@@ -544,9 +563,18 @@ fn run(geo: Geometry, dtype: Dtype, slots: usize, steps: &[Step], routed: bool) 
             eprintln!("skipping: no MTL4 queue");
             return;
         };
-        for (j, (&g, &r)) in got.iter().zip(&want).enumerate() {
+        for (j, ((&g, &r), &c)) in got.iter().zip(&want).zip(&carried).enumerate() {
+            // A carried row's state crossed the entry's rounding between steps: the two arms
+            // round the same registers except where their f32 divergence straddles a boundary
+            // — one half ULP, ~1e-3 relative through the scan. A fresh row's state is zero:
+            // the model dtype's tolerance alone.
+            let tol = if c {
+                dtype.tol(r).max(1e-3 * (1.0 + r.abs()))
+            } else {
+                dtype.tol(r)
+            };
             assert!(
-                (g - r).abs() <= dtype.tol(r),
+                (g - r).abs() <= tol,
                 "{geo:?} {dtype:?} step {i}: out[{j}] (token {}, col {}) = {g}, reference {r}",
                 j / geo.inner(),
                 j % geo.inner(),
@@ -554,7 +582,7 @@ fn run(geo: Geometry, dtype: Dtype, slots: usize, steps: &[Step], routed: bool) 
         }
     }
     let conv = read::<f32>(&gpu.conv_state, slots * ring);
-    let ssm_got = read::<f32>(&gpu.ssm_state, slots * ssm);
+    let ssm_got = ssm_entry_dtype().decode(&gpu.ssm_state, slots * ssm);
     for slot in steps.iter().flatten().map(|s| s.0) {
         for (j, (&g, &r)) in conv[slot * ring..][..ring]
             .iter()
@@ -569,8 +597,10 @@ fn run(geo: Geometry, dtype: Dtype, slots: usize, steps: &[Step], routed: bool) 
             .zip(&states[slot].ssm)
             .enumerate()
         {
+            // Both arms round the carried state at the same steps; they differ only where
+            // their f32 registers straddled a rounding boundary — one half ULP.
             assert!(
-                (g - r).abs() <= 1e-4 * (1.0 + r.abs()),
+                (g - r).abs() <= 1e-3 * (1.0 + r.abs()),
                 "{geo:?} {dtype:?} slot {slot}: ssm state [{j}] = {g}, reference {r}"
             );
         }
@@ -597,7 +627,6 @@ fn schedule() -> Vec<Step> {
 /// The parity-tiny geometry (state 16): the gating, then the per-thread scan.
 #[test]
 fn mamba2_per_thread_scan_matches_reference() {
-    let _turn = gpu_turn();
     let geo = Geometry {
         heads: 8,
         head_dim: 16,
@@ -615,7 +644,6 @@ fn mamba2_per_thread_scan_matches_reference() {
 /// `dt` read straight off the in-projection row.
 #[test]
 fn mamba2_simd_scan_matches_reference() {
-    let _turn = gpu_turn();
     let geo = Geometry {
         heads: 8,
         head_dim: 64,
@@ -634,7 +662,6 @@ fn mamba2_simd_scan_matches_reference() {
 /// the same schedule.
 #[test]
 fn mamba2_pipelined_scan_matches_reference() {
-    let _turn = gpu_turn();
     let geo = Geometry {
         heads: 8,
         head_dim: 64,
@@ -668,7 +695,8 @@ fn assert_bits(got: &[f32], want: &[f32], what: &str) {
 /// slot 3 holds what a step of just those two rows leaves, slot 4 what the prefill leaves. A later
 /// step on slot 0 restores slot 3 and runs the prefill's remaining rows: its output is the
 /// prefill's rows past the junction and its state the prefill's, the snapshot as it was. All bit
-/// for bit: a save stores the registers the scan carries on, a restore loads them back.
+/// for bit: a save stores the registers the scan carries on — rounded through the entry's f16, so
+/// the cold run continues from what it stored — and a restore loads them back.
 fn snapshots(geo: Geometry, dtype: Dtype, routed: bool) {
     let Some(di) = detect_device() else {
         eprintln!("skipping: no Metal device");
@@ -726,7 +754,13 @@ fn snapshots(geo: Geometry, dtype: Dtype, routed: bool) {
     let after = gpu.pools();
     same(slot(&after, 3), at_junction, "the junction's snapshot");
     same(slot(&after, 4), slot(&after, 1), "the last row's snapshot");
-    let start = (conv0, ssm0);
+    // The untouched-slot arm: the entry's f16 rounds what `load` uploads, the ring exact.
+    let start = (
+        conv0,
+        ssm0.iter()
+            .map(|&x| ssm_entry_dtype().round(x))
+            .collect::<Vec<_>>(),
+    );
     same(slot(&after, 0), slot(&start, 0), "slot 0");
 
     // The junction restored on slot 0, running the prefill's rows past it.
@@ -737,12 +771,16 @@ fn snapshots(geo: Geometry, dtype: Dtype, routed: bool) {
     };
     let inner = geo.inner();
     let past_junction = &out[junction * inner..t * inner];
+    // The scan rounds its carried registers through the entry's f16 at the save, so the
+    // restore resumes from exactly what the cold run carried on from: the resumed rows
+    // are the prefill's rows past the junction, bit for bit.
     assert_bits(
         &resumed,
         past_junction,
         &format!("{what}: the resumed rows"),
     );
     let restored = gpu.pools();
+    // The whole resumed state — the ring and the ssm entry — is the prefill's, bit for bit.
     same(slot(&restored, 0), slot(&after, 1), "the resumed state");
     same(slot(&restored, 3), slot(&after, 3), "the restored snapshot");
 }
@@ -751,7 +789,6 @@ fn snapshots(geo: Geometry, dtype: Dtype, routed: bool) {
 /// routing at state 128 — a prefill the pipelined scan's — in both dtypes.
 #[test]
 fn mamba2_snapshots_resume_a_prefill() {
-    let _turn = gpu_turn();
     let per_thread = Geometry {
         heads: 8,
         head_dim: 16,
@@ -778,7 +815,6 @@ fn mamba2_snapshots_resume_a_prefill() {
 /// `rmsnorm_g(silu(z)·y)·w`, `z` a column slice of a wider row, the weight spanning all groups.
 #[test]
 fn mamba2_gate_before_norm_matches_reference() {
-    let _turn = gpu_turn();
     let Some(di) = detect_device() else {
         eprintln!("skipping: no Metal device");
         return;

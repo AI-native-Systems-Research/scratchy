@@ -14,26 +14,54 @@
 //! The pod's `dxp_standalone -d <dir>` compile of the staged groups is the next gate (`stage_*`): the
 //! reduced-axis pair, and the rows-first pair for contrast.
 
+use ktir_superdsc::addr::DevOff;
 use ktir_superdsc::emit::{EmittedOp, emit_sdsc_tiled};
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{
-    ReduceDivision, ReduceOffSpec, reduce_opspec_off_divided,
+    ReduceDivision, ReduceOffSpec, reduce_opspec_off, reduce_opspec_off_divided, win_reduce_accum,
+    win_reduce_data,
 };
+use ktir_superdsc::sdsc_abstract::{BlockCols, RowBlockedTag, RowCount, StickLayout, Stk};
 use ktir_superdsc::superdsc_opspec::{OpFunc, OpSpec, SdscFoldSet};
 
 const ROWS: u32 = 32;
 const COLS: u32 = 10240;
 
+/// The conc-8 cell's two operand handles — the `[32, 10240]` score block and its one-stick-per-row
+/// accum — at their TRUE shapes, the shapes the family mints read as bounds.
+fn handles() -> (Stk<RowBlockedTag>, Stk<RowBlockedTag>, RowCount, BlockCols) {
+    let data = Stk::<RowBlockedTag>::new(
+        "t_sc",
+        StickLayout::row_blocked(ROWS as usize, COLS as usize),
+    )
+    .expect("the score block is RowBlocked");
+    let accum = Stk::<RowBlockedTag>::new("t_bmax", StickLayout::row_blocked(ROWS as usize, 64))
+        .expect("the one-stick accum is RowBlocked");
+    (
+        data,
+        accum,
+        RowCount::of_head_major_rows(ROWS),
+        BlockCols::of_feature_cols(COLS),
+    )
+}
+
 /// The conc-8 cell's `[32, 10240]` score block reduced into a one-stick-per-row accum, at offset 0.
 fn spec(op: OpFunc, division: ReduceDivision) -> Result<OpSpec, String> {
+    let (data_stk, accum_stk, rows, cols) = handles();
+    let data = win_reduce_data(
+        None,
+        &data_stk,
+        DevOff::ZERO,
+        rows,
+        cols,
+        "test: the score reduce",
+    )?;
+    let accum = win_reduce_accum(None, &accum_stk, DevOff::ZERO, rows, "test: the row max")?;
     reduce_opspec_off_divided(ReduceOffSpec {
         op,
         rows: ROWS,
         cols: COLS,
-        data_name: "t_sc",
-        accum_name: "t_bmax",
-        data_off: 0,
-        accum_off: 0,
-        head_major: false,
+        data,
+        accum,
         division,
     })
 }
@@ -125,15 +153,21 @@ fn a_reduce_whose_template_cannot_combine_is_refused() {
 #[test]
 fn the_row_division_is_unchanged() {
     let spec = spec(OpFunc::Max, ReduceDivision::Rows).unwrap();
-    let plain = ktir_superdsc::ir::bridge::tiled_op_sdsc_op::reduce_opspec_off(
+    let (data_stk, accum_stk, rows, cols) = handles();
+    let plain = reduce_opspec_off(
         OpFunc::Max,
         ROWS,
         COLS,
-        "t_sc",
-        "t_bmax",
-        0,
-        0,
-        false,
+        win_reduce_data(
+            None,
+            &data_stk,
+            DevOff::ZERO,
+            rows,
+            cols,
+            "test: the plain form",
+        )
+        .unwrap(),
+        win_reduce_accum(None, &accum_stk, DevOff::ZERO, rows, "test: the plain form").unwrap(),
     )
     .unwrap();
     assert_eq!(spec.iter.splits(), plain.iter.splits());

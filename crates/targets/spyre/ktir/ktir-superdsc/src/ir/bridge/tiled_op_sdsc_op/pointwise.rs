@@ -12,7 +12,7 @@ use crate::superdsc_opspec::{
     Allocation, AnyTensorArg, DataFormat, Df, Fp16, MAX_CORES, MaxCores, OpFunc, OpInfo, OpSpec,
     Role, Scale, SdscFoldSet, TensorArg,
 };
-use crate::work::EwDivision;
+use crate::work::{CoreDivision, EwDivision};
 
 /// ⭐⭐⭐⭐⭐ THE GATHER'S OWN OP — a KERNEL-LESS `identity` that copies a PAGED source through an int32
 /// index into a CONTIGUOUS destination. This is the only op shape deeptools will schedule a gather on.
@@ -48,45 +48,26 @@ use crate::work::EwDivision;
 /// sees a regular buffer.
 ///
 /// ## ⛔ `rows` IS SUB-ROWS OF **ONE STICK**, AND `cols` MUST BE ONE STICK
-/// A `[mb, out]` operand sticked on a MULTI-STICK `out` is `RowBlocked` (stick-major), whose address law
-/// `(c/64)*(rows*64) + r*64 + c%64` scatters each gathered block across the whole buffer — off by `rows`
-/// from the contiguous `[hd, 64]` block the score kernel then reads, from a clean bake. At one stick of
-/// `out` the same law collapses to `r*64 + c`, i.e. ROW-MAJOR, and a pool block is `hd` consecutive
-/// sub-rows. `GatherScratch::sub_rows`/`entry_page` carry that split, and the gather's `page` is what
-/// keeps ONE ENTRY equal to one whole block.
+/// Stated on the spec that carries them — see `sdsc_abstract::GatherCopySpec`, whose doc holds
+/// the law and the address arithmetic it prevents.
 pub fn gather_copy_opspec(
     src: &str,
     dst: &str,
-    rows: u32,
-    cols: u32,
-    // ⭐⭐⭐ THE VALUE OPERANDS' FORMAT — fp16 for every gathered fold to date, fp8 for the MoE expert
-    // slabs. The vendor's `identity` bind carries NO DDL type constraint (unary_parallel.ddl:17
-    // "identity and shuffle only move data, so their input and output are free to arrange it
-    // differently"), so the copy's df is a property of the BANK it copies, not of the op — and the
-    // ONE-STICK law below transfers per-format: an fp8 copy's `cols` is one 128-elem fp8 stick, and
-    // the RowBlocked-scatter refusal the fp16 law states is the same law at its own width.
-    df: Df,
     gather: crate::superdsc_opspec::GatherIndex,
-    // ⭐⭐⭐⭐⭐ WHERE THIS RUN'S COPY STARTS, AT EACH END — see `superdsc_opspec::GatherRun`. The
-    // destination entry is separate from `gather.first_entry`, and it has to be. See
-    // `GatherCopy::dest_entry`: the two were one number while a run's entries and its destination
-    // rows advanced together (the window-granular cut, where one index stick IS 32 scratch rows),
-    // and a page-granular op breaks that — it names ONE entry but must sit at a stick boundary, so
-    // entries advance 32 per op while rows advance 1. Both are minted from the same request index
-    // by `copies()`, so they cannot drift; they simply are not equal any more. The source base is
-    // the SECOND paged-axis half of `addr = idx·skip_addr + base_addr`, for a source whose entries
-    // are RELATIVE to a base inside its own buffer. ZERO for every gathered KV copy (the pool's
-    // entries are GLOBAL stick-block numbers, and a per-run base would be added twice — see
-    // [`crate::sdsc_abstract::GatherCopy`]'s "source base stays ZERO" law). The expert bank is
-    // the other shape: its entries are EXPERT IDS relative to the bank's base, and the bank's
-    // packed device layout makes one expert's slab ONE CONTIGUOUS range, so a chunk of that slab
-    // is the range `[src_off, src_off + mb·page·cols)` and the index term `idx·skip_addr` still
-    // supplies the WHOLE-slab stride. Both base and index are added by `ConvertData_gather_idx`
-    // — card-proven at the score leg ("the index supplies only the PAGE term", `emit/mod.rs`'s
-    // isStartAddrSymbolic note) — so a nonzero base here survives the gather and a zero one
-    // changes nothing on every existing caller.
-    run: crate::superdsc_opspec::GatherRun,
+    // ⭐⭐⭐⭐⭐ THE COPY'S WHOLE DECLARED LAW AS ONE VALUE — the extents, the format, the run and the
+    // destination's bound ([`crate::sdsc_abstract::GatherCopySpec`]): the run's landing and the
+    // scratch it lands in are facts about ONE copy, and this builder takes them together or not
+    // at all. `GatherCopy` is the minted form; the spec is what a caller states when no scratch
+    // mints it for them.
+    spec: crate::sdsc_abstract::GatherCopySpec,
 ) -> Result<OpSpec, String> {
+    let crate::sdsc_abstract::GatherCopySpec {
+        rows,
+        cols,
+        df,
+        run,
+        dest,
+    } = spec;
     crate::superdsc_opspec::assert_df_stick_multiple(cols, df)?;
     // ⭐ `cols` IS the whole-stick width by the one-stick law below (`cols == df.elems_per_stick()`),
     // so it needs no `StickExtent` round-trip — and a typed one would have to name a format. The
@@ -138,6 +119,48 @@ pub fn gather_copy_opspec(
             "gather_copy_opspec('{src}' -> '{dst}'): {rows} `mb` positions do not divide into whole \
              {page}-position entries, so the last index entry would cover a partial block."
         ));
+    }
+    // ⭐⭐⭐⭐⭐ THE DESTINATION WINDOW, BOUNDED AT THE RAW DOOR. The run writes `rows × cols` elements
+    // at `entry_elems · dest_entry`, and the copy carries the destination's own law for where that
+    // window stops (`GatherDest`). The Scratch arm runs the SAME full-window mint the convert and
+    // restickify families take (`mint_full_window`, layout-free arm here — the placement half rides
+    // `assemble_gather_copy`, where the layout is at hand): the last stick of a pass ends exactly at
+    // the scratch's end, so a run whose window crosses it — the #717 class, a clean bake whose
+    // overrun is the next intermediate's bytes read back as keys — is a build `Err` here instead.
+    // The CoreLocalLx arm is that form's OWN window kind: each core's slice sits at the pin, so the
+    // run has no offset to take, and the per-core slice is the read law's bound at emit — stated as
+    // the law that applies, never exempted from the mint by silence.
+    let dest_base = entry_elems.checked_mul(run.dest.entries()).ok_or_else(|| {
+        format!(
+            "gather_copy_opspec('{src}' -> '{dst}'): the destination base for the run at entry \
+                 {} overflows a 32-bit element offset at {entry_elems} elements per entry",
+            run.dest.entries()
+        )
+    })?;
+    match dest {
+        crate::sdsc_abstract::GatherDest::Scratch {
+            rows: d_rows,
+            cols: d_cols,
+        } => {
+            crate::emit::mint_full_window(
+                &format!("gather_copy_opspec('{src}' -> '{dst}'): the destination"),
+                &crate::emit::rb_df(dst, d_rows, d_cols, df),
+                dest_base as u64,
+                rows,
+                cols,
+                None,
+            )?;
+        }
+        crate::sdsc_abstract::GatherDest::CoreLocalLx => {
+            if run.dest.entries() != 0 {
+                return Err(format!(
+                    "gather_copy_opspec('{src}' -> '{dst}'): the run at destination entry {} lands \
+                     in a CORE-LOCAL LX tensor — each core's slice sits at the pin, so a \
+                     core-local destination has no offset to take",
+                    run.dest.entries()
+                ));
+            }
+        }
     }
     let dim = |name: &'static str, size: u32, is_stick: bool| crate::superdsc_opspec::ItDim {
         name,
@@ -222,14 +245,10 @@ pub fn gather_copy_opspec(
         // the INDEX's base in entries — equal to the destination's only while one index stick is 32
         // consecutive destination rows. A page-granular op's index base is `32 * request` while its rows
         // start at `request`, so reusing it lands every op's rows 32× too far out, past the scratch and
-        // into the next intermediate's bytes. Read as keys, clean bake, no fault.
-        entry_elems.checked_mul(run.dest.entries()).ok_or_else(|| {
-            format!(
-                "gather_copy_opspec('{src}' -> '{dst}'): the destination base for the run at entry \
-                     {} overflows a 32-bit element offset at {entry_elems} elements per entry",
-                run.dest.entries()
-            )
-        })?,
+        // into the next intermediate's bytes. Read as keys, clean bake, no fault. (Derived and bounded
+        // once above — `dest_base` — so the base the op carries and the base the mint checks are one
+        // number.)
+        dest_base,
     )?;
     // ⭐ THE VALUE OPERANDS' OWN df — `pointwise_opspec_from_tile_split` builds args at fp16 (the
     // residual default), so an fp8 copy re-states BOTH value args here. The index arg does not
@@ -311,30 +330,77 @@ pub fn assemble_gather_copy(
     // defect, whose overrun is another page's keys read as block numbers) and the two pins could drift
     // apart with nothing refusing it. See `sdsc_abstract::CopyDims`.
     let d = copy.dims();
+    // ⭐⭐⭐⭐⭐ THE PLACEMENT DOOR — the raw door inside `gather_copy_opspec` bounds the run's window
+    // against the extent the copy carries; this half resolves the destination's NAME against the
+    // layout, the same two-door mint every family since #734 takes. For an HBM scratch that is
+    // `mint_full_window` with the layout at hand: the handle states the pair the copy carries (the
+    // scratch's own `footprint_dims`, the pair its synth declared), and the layout answers for the
+    // bytes behind the name — a reservation smaller than the window is the "512 reserved against
+    // 2048 declared" class, whose overrun is another page's keys read as block numbers.
+    //
+    // ⭐ AND THE CORE-LOCAL FORM'S OWN KIND RIDES HERE TOO: a copy that states a CORE-LOCAL
+    // destination must find that name held core-local by the layout — the minted law and the
+    // layout are two authorities for one fact, and their disagreement is a build failure rather
+    // than a copy that addresses LX bytes as HBM (or HBM bytes as a pin). The per-core slice
+    // itself is the read law's bound, checked against the pin at emit.
+    let entry_elems = d.page().get().saturating_mul(d.out()) as u64;
+    let dest_base = entry_elems * copy.dest_entry() as u64;
+    match copy.dest() {
+        crate::sdsc_abstract::GatherDest::Scratch {
+            rows: d_rows,
+            cols: d_cols,
+        } => {
+            crate::emit::mint_full_window(
+                &format!("assemble_gather_copy {op_name}: the destination"),
+                &crate::emit::rb_df(dst, d_rows, d_cols, Df::Fp16),
+                dest_base,
+                d.mb(),
+                d.out(),
+                layout,
+            )
+            .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"));
+        }
+        crate::sdsc_abstract::GatherDest::CoreLocalLx => {
+            if let Some(l) = layout
+                && !l.lx_core_local(dst)
+            {
+                panic!(
+                    "assemble_gather_copy {op_name}: the copy states a CORE-LOCAL destination but \
+                     the layout does not hold '{dst}' as core-local LX — the minted law and the \
+                     layout disagree about where this run lands, so it addresses bytes neither \
+                     authority stands behind"
+                );
+            }
+        }
+    }
     let mut op = gather_copy_opspec(
         src,
         dst,
-        d.mb(),
-        d.out(),
-        // Every gathered fold to date copies fp16 KV planes — the MoE expert-slab copy is the
-        // first fp8 caller and states its own df at its own door.
-        Df::Fp16,
         crate::superdsc_opspec::GatherIndex::of_scratch_rows(
             index.to_string(),
             d.page(),
             // THE INDEX's base, in whole index STICKS — dxp loads the IBR one stick at a time.
             copy.index_base(),
         ),
-        // ⛔ AND THE DESTINATION's base SEPARATELY, with the source's own base at its ZERO law. It
-        // used to be derived from the index base above; see `GatherCopy::dest_entry` for the
-        // measurement that separated them (a page-granular op names one entry at stick `r` but
-        // writes run `r`, so the two advance at different rates). Both come from `copies()`, which
-        // mints them from one request index. The KV pool's entries are GLOBAL block numbers — no
-        // source base (the `GatherCopy` law).
-        crate::superdsc_opspec::GatherRun::split(
-            crate::superdsc_opspec::DestEntry::of_entries(copy.dest_entry()),
-            0,
-        ),
+        crate::sdsc_abstract::GatherCopySpec {
+            rows: d.mb(),
+            cols: d.out(),
+            // Every gathered fold to date copies fp16 KV planes — the MoE expert-slab copy is the
+            // first fp8 caller and states its own df at its own door.
+            df: Df::Fp16,
+            // ⛔ AND THE DESTINATION's base SEPARATELY, with the source's own base at its ZERO law. It
+            // used to be derived from the index base above; see `GatherCopy::dest_entry` for the
+            // measurement that separated them (a page-granular op names one entry at stick `r` but
+            // writes run `r`, so the two advance at different rates). Both come from `copies()`, which
+            // mints them from one request index. The KV pool's entries are GLOBAL block numbers — no
+            // source base (the `GatherCopy` law).
+            run: crate::superdsc_opspec::GatherRun::split(
+                crate::superdsc_opspec::DestEntry::of_entries(copy.dest_entry()),
+                0,
+            ),
+            // The destination's own law, carried by the copy from the scratch it lands in.
+            dest: copy.dest(),
+        },
     )
     .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"));
     // ⭐ THE DESTINATION MAY BE CORE-LOCAL LX — the chunk's V, landing in the scratchpad of the core whose
@@ -468,6 +534,7 @@ fn pointwise_opspec_from_tile_split(
         tiled_symbols,
         time_tile,
         indirect: None,
+        coordinate_mask: None,
     })
 }
 
@@ -477,10 +544,12 @@ fn pointwise_opspec_from_tile_split(
 /// builder's `stickmajor`/block-alignment logic needs the untouched `rows·cols` product, not the
 /// stick-rounded `out` extent `TileOp` carries.
 ///
-/// `division` is [`EwDivision::Law`] for every caller but one, and the law reads `layout`: an op none of
-/// whose operands is a core-local LX pin takes the division its operands' layout calls for (`None`, every
-/// unit test without a layout, has no pins). The gathered-row leg passes [`EwDivision::RowsFirst`]: its
-/// index enumerates `mb` in whole entries, so `mb` must take the cores.
+/// `division` is [`CoreDivision::Ew`] at [`EwDivision::Law`] for every ungathered caller, and
+/// the law reads `layout`: an op none of whose operands is a core-local LX pin takes the
+/// division its operands' layout calls for (`None`, every unit test without a layout, has no
+/// pins). A gathered op passes [`CoreDivision::Gathered`] — its [`crate::work::GatherSplit`] is minted from
+/// its entries, not resolved from a layout, because only the entry axis may carry a split (the
+/// `skip_addr` law; see [`crate::work::GatherSplit`]).
 #[allow(clippy::too_many_arguments)]
 pub fn pointwise_broadcast_opspec_from_tile(
     tile_op: &TileOp,
@@ -492,15 +561,71 @@ pub fn pointwise_broadcast_opspec_from_tile(
     out_offset: OutCorner,
     head_major: bool,
     layout: Option<&BundleLayout>,
-    division: EwDivision,
+    division: CoreDivision,
 ) -> Result<OpSpec, String> {
     let (out_window, out_offset) = (
         out_offset.is_stick_major_window_for(rows),
         out_offset.elems(),
     );
     let df = tile_op.df;
+    // ⭐ THE FAMILY MINT — every operand's swept window (the per-form broadcast law,
+    // `EwOperand::swept_extents`) checked against its handle's declared shape and, when a layout
+    // is at hand, its placement footprint, BEFORE any op is built. This is the #731 door for the
+    // elementwise family: an op that reads past its tensor is a build failure naming the tensor
+    // and the bound it exceeded — the class #717's card failure (`add_o1137` reading `t1131`
+    // past its footprint) belongs to.
+    crate::emit::mint_ew_operands(op.name(), rows, cols, df, inputs, layout)?;
     let block = (rows as u64) * (cols as u64);
     let block_aligned = |off: u32| block != 0 && (off as u64).is_multiple_of(block);
+    // ⭐⭐⭐ THE ROW-SPLIT (Y) MODE — an op one of whose operands is a y-broadcast ([`In::y_broadcast`],
+    // the whole-function walk's Y admission: a leading-axis `linalg.broadcast` of a multi-row
+    // `[mb, out]` source into `[y, mb, out]`, the batched paged-decode kernel's J-slot merge).
+    // The op's tensors present Y-MAJOR — `["y", "mb", "out"]`, the same head-outermost spelling
+    // the batched matmul's I/O walks use — with `out` the ONE STICK the frame law
+    // ([`crate::sdsc_abstract::RegionFrame::split_rows`]) allows, so the source's `(mb, out)`
+    // bytes and the output's `(y·mb, out)` bytes are the same stick-blocked bytes the mints
+    // reserved. Everything below is cross-checks; the addressing itself is the ordinary
+    // scale-driven rule (`build_coordinates`/`per_core_addr`), which is why the form needs no
+    // new addressing code — only the layout order and the operand scales stated honestly.
+    let stated_ys: Vec<u32> = inputs
+        .iter()
+        .map(|i| i.y_broadcast())
+        .filter(|&y| y > 1)
+        .collect();
+    let ymajor = !stated_ys.is_empty();
+    if ymajor {
+        // ONE spray count per op: every y-broadcast operand of one op sprays the broadcast's own
+        // leading extent, so a disagreement is two ops fused under one name.
+        let y = stated_ys[0];
+        if !stated_ys.iter().all(|&s| s == y) {
+            return Err(format!(
+                "{o_name}: the op's y-broadcast operands state different spray counts \
+                 ({stated_ys:?}) — one op has ONE leading extent"
+            ));
+        }
+        // The TileOp must state the same count on its own `y` dim: the tiler's iteration space
+        // and the operands' addressing read the same spray, so a disagreement is a caller that
+        // built its TileOp from a different shape than its operands.
+        let tile_y = tile_op.dims.iter().find(|d| d.name == "y").map(|d| d.size);
+        if tile_y != Some(y) {
+            return Err(format!(
+                "{o_name}: the TileOp's `y` dim states {tile_y:?} but the y-broadcast operands \
+                 spray {y} — the tile and the operands disagree on the op's leading extent"
+            ));
+        }
+        // THE SINGLE-STICK LAW — the frame law's own `cols ≤ lanes` half, restated at the
+        // emission: the spray's source is single-stick, so an op wider than one stick did not
+        // come through the Y admission. This is also what keeps `ymajor` and `stickmajor` below
+        // disjoint (stickmajor requires `cols >` one stick).
+        if cols > Fp16::ELEMS_PER_STICK {
+            return Err(format!(
+                "{o_name}: a row-split (y-broadcast) op at cols={cols} > {} — the spray's \
+                 source is single-stick by the frame law, so a wider op did not come through \
+                 the Y admission",
+                Fp16::ELEMS_PER_STICK
+            ));
+        }
+    }
     // ⭐ A WHOLE-STICK COLUMN WINDOW IS A STICK-MAJOR CORNER TOO (#622) — admitted by its TYPE
     // ([`crate::addr::ColWindow`], carried as `EwOperand::col_window` / `out_window`), never by testing the
     // integer: the window's planes are whole `[rows, 64]` planes of the parent at the parent's plane stride,
@@ -513,20 +638,38 @@ pub fn pointwise_broadcast_opspec_from_tile(
         && inputs.iter().all(|i| {
             i.out_broadcast() || i.is_stick_major_window_for(rows) || block_aligned(i.col_offset())
         });
-    // ⭐ THE DIVISION FOLLOWS THE LAYOUT JUST DECIDED — the same `stickmajor`, so the operands' rank and the
-    // cores' cut are one decision. See `EwDivision`.
+    // ⭐ THE DIVISION FOLLOWS THE LAYOUT JUST DECIDED for an ungathered op — the same
+    // `stickmajor`, so the operands' rank and the cores' cut are one decision. See `EwDivision`.
     let core_local = layout.is_some_and(|l| {
         l.lx_core_local(o_name) || inputs.iter().any(|i| l.lx_core_local(i.name()))
     });
-    let tiled = tile_op
-        .tile(
-            MaxCores::<MAX_CORES>,
-            division.resolve(stickmajor, core_local).splitter(),
-            "out",
-        )
-        .map_err(|e| e.0)?;
+    // ⭐⭐⭐ A GATHERED OP'S SPLIT IS ITS `GatherSplit` (`crate::work`), VERBATIM — not resolved from the operand
+    // layout (the elementwise law's input) and not consulted for `stickmajor`: only the entry
+    // axis may carry a split, because dxp derives `skip_addr` from the per-core extents of the
+    // unpinned dims — a split elsewhere shrinks what one index entry covers. The mint already
+    // refused every shape that would have needed one, so the closure hands the tiler the minted
+    // map whatever budget it asks with.
+    let tiled = match &division {
+        CoreDivision::Gathered(g) => tile_op
+            .tile(MaxCores::<MAX_CORES>, |_, _| g.splits().clone(), "out")
+            .map_err(|e| e.0)?,
+        CoreDivision::Ew(d) => tile_op
+            .tile(
+                MaxCores::<MAX_CORES>,
+                d.resolve(stickmajor, core_local).splitter(),
+                "out",
+            )
+            .map_err(|e| e.0)?,
+    };
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
-    let device_dims = plan.iter_syms(["mb", "out", "y"]);
+    // Y-MAJOR in the row-split mode (`ymajor` above): the syms are picked by NAME in the order
+    // the layout states them, so the plan's own `y`/`mb`/`out` syms feed the `["y", "mb", "out"]`
+    // TensorArgs directly — the same plan, walked head-outermost.
+    let device_dims = if ymajor {
+        plan.iter_syms(["y", "mb", "out"])
+    } else {
+        plan.iter_syms(["mb", "out", "y"])
+    };
     // ── STICK-MAJOR RESIDUAL + PER-HEAD ATTN ── The m>1 seam fix: a residual whole-tensor
     // pointwise op writes FLAT (rank-3 [mb,out,y=1]) but the consuming matmul reads STICK-MAJOR
     // (rank-2 [mb,out]); byte-identical at rows==1, scrambled at rows>1 AND cols>64. Present the op
@@ -568,9 +711,10 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // and `tiled_trips_alias` (the OUTPUT-side backstop) still fire; the broadcast side
     // is pinned by `time_tiled_broadcast_operand_is_address_stable` in `emit/mod.rs`.
 
-    // Build a rank-2 stick-major (`stickmajor`) or the legacy rank-3 flat operand. rank-2 drops the
-    // size-1 `y` dim + its scale so `for_view_df` classifies it RowBlocked (stick-major), matching
-    // the matmul I/O.
+    // Build a rank-2 stick-major (`stickmajor`), the legacy rank-3 flat operand, or — in the
+    // row-split mode — the Y-MAJOR rank-3 operand (`["y", "mb", "out"]`, the caller passing the
+    // scale in the same order via [`EwOperand::scale_ymajor`]). rank-2 drops the size-1 `y` dim +
+    // its scale so `for_view_df` classifies it RowBlocked (stick-major), matching the matmul I/O.
     let mk =
         |is_input: bool, name: &str, scale: [Scale; 3], off: u32| -> Result<AnyTensorArg, String> {
             if stickmajor {
@@ -598,7 +742,11 @@ pub fn pointwise_broadcast_opspec_from_tile(
                         Role::Output,
                         scale,
                         device_dims,
-                        ["mb", "out", "y"],
+                        if ymajor {
+                            ["y", "mb", "out"]
+                        } else {
+                            ["mb", "out", "y"]
+                        },
                         "out",
                         Allocation::Hbm,
                     )
@@ -611,7 +759,16 @@ pub fn pointwise_broadcast_opspec_from_tile(
         };
     let mut args = Vec::with_capacity(inputs.len() + 1);
     for inp in inputs {
-        args.push(mk(true, inp.name(), inp.scale(), inp.col_offset())?);
+        args.push(mk(
+            true,
+            inp.name(),
+            if ymajor {
+                inp.scale_ymajor()
+            } else {
+                inp.scale()
+            },
+            inp.col_offset(),
+        )?);
     }
     // The OUTPUT may write to a COLUMN SLICE of its tensor (`out_offset` cols in →
     // `out_offset·2` byte offset): RoPE's rotate-half writes each head-half to a
@@ -638,6 +795,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
         tiled_symbols,
         time_tile,
         indirect: None,
+        coordinate_mask: None,
     })
 }
 
@@ -662,6 +820,19 @@ pub fn assemble_pointwise_broadcast_off_from_tile<O: KindTag>(
     let out_offset = out_offset.into();
     let o_name = o.name();
     let head_major = O::kind() == StickKind::Flat;
+    // ⭐ THE OUTPUT MINT — the output window `rows × stick-padded cols` at the corner, checked
+    // against the output handle's declared shape and placement before any op is built (the
+    // write-side twin of the input mint in `pointwise_broadcast_opspec_from_tile` below).
+    crate::emit::mint_ew_output(
+        op_name,
+        o,
+        out_offset.elems(),
+        rows,
+        cols,
+        tile_op.df,
+        layout,
+    )
+    .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast {op_name}: {e}"));
     // ⛔ ONE SHARED LIST, NOT A SECOND COPY. This was a verbatim duplicate of the `const` in
     // `emit::assemble_pointwise_broadcast_off`, so a fix had to land in both — and `"mish"` had been
     // added to neither. See [`crate::emit::SFP_SPLIT_TRANSCENDENTALS`] for the geometry, the dxp
@@ -690,7 +861,7 @@ pub fn assemble_pointwise_broadcast_off_from_tile<O: KindTag>(
         out_offset,
         head_major,
         layout,
-        EwDivision::Law,
+        CoreDivision::Ew(EwDivision::Law),
     )
     .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast {op_name}: {e}"));
     let folds = SdscFoldSet::new(op.iter.cores_used());

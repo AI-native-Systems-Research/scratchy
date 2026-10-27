@@ -11,7 +11,23 @@ description = "`scr`: the scratchy inference engine CLI"
 # vision was unconditionally compiled anyway. Off by default so a plain
 # `-Fmetal` build is genuinely chat-only-sized; pass `--features
 # chat,multimodal` (or `--features metal,multimodal`) explicitly for vision.
-default = ["chat", "hf-completions"]
+#
+# Shell tab completion over real HuggingFace model ids is ON by default:
+# scratchy-models' `hf-completions`, whose build script resolves the candidate
+# list against huggingface.co at build time (see docs/BUILD.md). Completing
+# model names is the point of `scr completions`, and a binary that silently
+# can't do it is the confusing case, not the useful one. Named here, not as a
+# feature of this crate, like every scratchy-models feature (see `metal`).
+#
+# `model?/...` is a WEAK dependency feature on purpose: it fires only when the
+# `model` dep is actually activated (i.e. the build named a `-Fmodel/<stem>`).
+# A build with no model scope compiles no registry to fill, and a CI run that
+# enables `scratchy-models/all` directly reaches scratchy-models rather than
+# through this edge, so neither pays for a Hub query it has no use for.
+#
+# To build with NO network access at all (air-gapped), drop the defaults:
+#   cargo build -p scratchy-cli --no-default-features --features chat,metal,model/<stem>
+default = ["chat", "model?/hf-completions"]
 
 # The in-process ENGINE (local model inference), no HTTP server: `scr chat`
 # running a model locally. Pulls scratchy-serving-api (WITHOUT its `serve`
@@ -31,15 +47,37 @@ claude = ["serve"]
 
 otel = ["scratchy-serving-api?/otel"]
 bench = ["scratchy-bench"]
+# The bench dataset loaders that read parquet (2WikiMQA, HotpotQA, MS MARCO), for `scr bench
+# serve --dataset-name rag --rag-source two-wiki|hotpotqa`.
+bench-datasets = ["bench", "scratchy-bench/datasets"]
 # `dep:scratchy-forward-compiler` + `scratchy-forward-compiler/metal` surface
 # `BackboneDumpRegistration` + `Instruction::normalize` so
 # `scr model info` works on metal builds. Backends enable the ENGINE (via scratchy-serving-api/
 # <backend>), not the HTTP server — a backend is only meaningful with local
-# inference. `metal` is `metal-base` with TurboQuant KV and MTP drafting on;
+# inference.
+#
+# `metal` is `metal-base` with two scratchy-models features on, both off for
+# spyre. They are named here, not as features of this crate:
+# `model/<feature>` already reaches every scratchy-models feature (see
+# `tests/arch_feature_passthrough.rs`).
+#
+# `turboquant` — TurboQuant KV compression. Every metal model whose geometry
+# the codec takes stores its KV cache as TurboQuant codes; the rest stay dense,
+# and the build output names them. `--kv-cache-dtype` cannot change it at
+# runtime.
+#
+# `mtp-heads` — multi-token-prediction drafting. Every selected model whose
+# checkpoint carries a head (Qwen3.5/3.6 MoE) compiles it, and so does every
+# selected model whose drafter is published as a model of its own (Gemma 4
+# 26B-A4B's assistant at MLX 4-bit g32, under `quant/mlx`). Serving the model
+# drafts with it; a checkpoint whose head is nowhere serves without drafting.
+# `spec/mtp` adds the other published drafters (Gemma 4's bf16 and QAT
+# assistants), which draft only when `--speculative-model` names them.
+#
 # `metal-base` alone builds the same engine with a dense KV cache and no MTP
-# heads (add `mtp-heads` back for drafting over a dense cache).
+# heads; add `model/mtp-heads` back for drafting over a dense cache.
 metal-base = ["scratchy-serving-api/metal", "scratchy-bench?/metal", "dep:scratchy-forward-compiler", "scratchy-forward-compiler/metal"]
-metal = ["metal-base", "turboquant", "mtp-heads"]
+metal = ["metal-base", "model?/turboquant", "model?/mtp-heads"]
 # IBM Spyre, BASE tier: the target crate and the `SubtileIR -> KTIR` producer, no
 # GPU toolchain and NO device — neither a card nor the host emulator. On its own it
 # builds and type-checks the whole lowering; pick `spyre-emu` or a card tier below to
@@ -63,35 +101,6 @@ spyre-emu = ["scratchy-serving-api/spyre-emu"]
 # above; enable it explicitly (e.g. `--features chat,guided-decoding`) to
 # build grammar support into a non-`serve` binary.
 guided-decoding = ["scratchy-serving-api?/guided-decoding"]
-# Shell tab completion over real HuggingFace model ids: forwards into
-# scratchy-models, whose build script resolves the candidate list against
-# huggingface.co at build time (see docs/BUILD.md). ON by default — completing
-# model names is the point of `scr completions`, and a binary that silently
-# can't do it is the confusing case, not the useful one.
-#
-# `model?/...` is a WEAK dependency feature on purpose: it fires only when the
-# `model` dep is actually activated (i.e. the build named a `-Fmodel/<stem>`).
-# A build with no model scope compiles no registry to fill, and a CI run that
-# enables `scratchy-models/all` directly reaches scratchy-models rather than
-# through this edge, so neither pays for a Hub query it has no use for.
-#
-# To build with NO network access at all (air-gapped), drop it:
-#   cargo build -p scratchy-cli --no-default-features #       --features chat,metal,model/<stem>
-hf-completions = ["model?/hf-completions"]
-# TurboQuant KV compression, on with `metal`: every metal model whose geometry
-# the codec takes stores its KV cache as TurboQuant codes, the rest stay dense
-# (the build output names them). Off for spyre. `--kv-cache-dtype`
-# cannot change it at runtime.
-turboquant = ["model?/turboquant"]
-# Multi-token-prediction drafting, on with `metal`: every selected model whose
-# checkpoint carries a head (Qwen3.5/3.6 MoE) compiles it, and so does every
-# selected model whose drafter is published as a model of its own (Gemma 4
-# 26B-A4B's assistant at MLX 4-bit g32, under `quant/mlx`); serving the model
-# drafts with it, and a checkpoint whose head is nowhere serves without
-# drafting. Off for spyre. `spec/mtp` adds the other published
-# drafters (Gemma 4's bf16 and QAT assistants), which draft only when
-# `--speculative-model` names them.
-mtp-heads = ["model?/mtp-heads"]
 # Gates the real image-decode stack: scratchy-serving-api/multimodal makes
 # its `scratchy-vision`/`image` deps optional-and-on, forwards
 # `scratchy-forward-compiler/vision` + `scratchy-serving-worker/vision`

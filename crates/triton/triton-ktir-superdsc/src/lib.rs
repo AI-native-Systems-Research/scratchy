@@ -100,6 +100,7 @@ pub fn node_for(m: &triton_ktir::ir::Module, program: Program) -> Result<KtirNod
         bindings,
         mask: None,
         node_out_tid: None,
+        minted: Default::default(),
     })
 }
 
@@ -579,6 +580,190 @@ pub fn emit_whole(node: &KtirNode, layout: Option<&BundleLayout>) -> Result<Vec<
             message: format!("{e:?}"),
         }
     })
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  THE RECOGNIZER BRIDGE — one module, both `uniform_corners`, one contract.
+//
+//  The uniform-corner family is stated TWICE by design (this crate's leaf, `ktir-superdsc`, cannot
+//  depend on the pass crate): `triton_ktir::passes::uniform_grid_corners::uniform_corners` decides
+//  what the pass mints, and `ktir-superdsc`'s twin decides what the door resolves. Two statements
+//  of one family are free to drift, and the one drift that already happened is why this test
+//  exists: the twin unpacked `arith.index_cast` as a two-operand op, so it skipped every cast —
+//  and the pass's minted spelling is `index_cast(muli(index_cast(landmark), S))`, casts all the
+//  way down. The twin resolved NOTHING the pass shipped, and silently: a corner it cannot claim
+//  is a refusal at the door, not a wrong answer, so nothing downstream ever compared the two.
+//
+//  So: both recognizers over one module, and the per-tile corner forms must AGREE. Two witnesses,
+//  because the family has two spellings: the MINTED one (the pass's own `AFFINE` fixture, a
+//  delinearized corner the pass rewrites) and the SHIPPED one (`mul_scale_small`, whose corner
+//  arrives already canonical — the fire gate's exemption shape). The comparison is per tile and
+//  slot, never per SSA — the handoff (`to_ktir_emit::lower`) owns its own numbering.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod uniform_corners_bridge {
+    use super::*;
+    use ktir_superdsc::ktir_node::Elementwise;
+    use triton_frontend::target::Target;
+    use triton_frontend::{codegen, opt};
+
+    /// The pass's own minting witness, from `uniform_grid_corners`'s tests: a sibling crate cannot
+    /// import another's test fixture, and the assertions below re-derive the pass's own, so if
+    /// either statement of the text moves, a test here fails rather than the two drifting apart.
+    /// TWO deliberate differences from the pass's copy, both demanded by the road to the door: the
+    /// pointer argument is stated as `index` — the form `to_ktir`'s own pointer rewrite leaves it
+    /// in, because the handoff refuses a surviving pointer — and the affine sets/maps are stated
+    /// as the parser's `#set`/`#map` aliases, its documented spelling for an attribute dictionary
+    /// (an inline `affine_set` carries `>=`, which the dictionary's depth counter reads as a
+    /// closing bracket).
+    const AFFINE: &str = "\
+#set0 = affine_set<(d0, d1) : (d0 >= 0, d1 >= 0)>
+#map0 = affine_map<(d0, d1) -> (d0, d1)>
+#set1 = affine_set<(d0, d1) : (d0 >= 0, d1 >= 0)>
+module {
+  func.func @k(%q: index) attributes {grid = [16 : index]} {
+    %tid = ktdp.get_compute_tile_id : index
+    %c4 = arith.constant 4 : index
+    %xm = arith.remui %tid, %c4 : index
+    %x = arith.index_cast %xm : index to i32
+    %yd = arith.divui %tid, %c4 : index
+    %y = arith.index_cast %yd : index to i32
+    %c64 = arith.constant 64 : i32
+    %c256 = arith.constant 256 : i32
+    %m = arith.muli %x, %c64 : i32
+    %h = arith.muli %y, %c256 : i32
+    %corner = arith.addi %h, %m : i32
+    %c0 = arith.constant 0 : i32
+    %v = ktdp.construct_memory_view %q, sizes: [1024, 64], strides: [64, 1] {coordinate_set = #set0, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<1024x64xf16>
+    %t = ktdp.construct_access_tile %v[%corner, %c0] {access_tile_order = #map0, access_tile_set = #set1} : memref<1024x64xf16> -> !ktdp.access_tile<64x64xindex>
+    return
+  }
+}
+";
+
+    /// Both recognizers over one module; the per-tile corner forms must AGREE. Returns the
+    /// pass-side forms, per tile and per corner slot (slot 0 is the view), so each witness can pin
+    /// its own specifics. `None` on both sides is a constant corner — agreed absence is agreement.
+    /// The comparison is per tile and slot, never per SSA — the handoff (`to_ktir_emit::lower`)
+    /// owns its own numbering.
+    fn assert_the_forms_agree(
+        m: &triton_ktir::ir::Module,
+        program: Program,
+    ) -> Vec<Option<(i64, i64)>> {
+        // ── THE PASS'S HALF — over the module as the pass left it ──
+        let kernel = m.kernel().expect("one kernel");
+        let body = kernel.regions[0].ops.clone();
+        let landmark = body
+            .iter()
+            .find(|o| o.kind == triton_ktir::ir::OpKind::KtdpGetComputeTileId)
+            .and_then(|o| o.result())
+            .expect("the launch states its position");
+        let index = m.def_index();
+        let shipped =
+            triton_ktir::passes::uniform_grid_corners::uniform_corners(&body, &index, landmark);
+
+        // ── THE DOOR'S HALF — over the node the door actually receives ──
+        let node = node_for(m, program).expect("handoff");
+        let consts = ktir_superdsc::emit::lower_ktir_to_superdsc::index_constants(&node.func);
+        let door =
+            ktir_superdsc::emit::lower_ktir_to_superdsc::uniform_corners(&node.func, &consts);
+
+        let mut pass_corners: Vec<Option<(i64, i64)>> = Vec::new();
+        for o in body.iter() {
+            if o.kind == triton_ktir::ir::OpKind::KtdpConstructAccessTile {
+                for slot in 1..o.operands.len() {
+                    pass_corners.push(shipped.get(&o.operands[slot]).map(|u| (u.stride, u.base)));
+                }
+            }
+        }
+        let mut door_corners: Vec<Option<(i64, i64)>> = Vec::new();
+        for o in node.func.operations.iter() {
+            if o.op_type == ktir_core::opkind::OpKind::KtdpConstructAccessTile {
+                for slot in 1..o.operands.len() {
+                    door_corners.push(door.get(&o.operands[slot]).map(|u| (u.stride, u.base)));
+                }
+            }
+        }
+        assert_eq!(
+            pass_corners, door_corners,
+            "the pass's recognizer and the door's twin disagree about this module's tile corners"
+        );
+        // NON-VACUOUS: something is claimed — else the equality above is `None == None` over an
+        // empty contract.
+        assert!(
+            pass_corners.iter().any(|c| c.is_some()),
+            "no tile corner is uniform — the recognizers agreed over nothing"
+        );
+        pass_corners
+    }
+
+    /// THE MINTED SPELLING. The `AFFINE` witness: the [4,4] Q/O corner arithmetic
+    /// (`start_m = ctid % 4`, `off_hz = ctid / 4`, corner `= off_hz·256 + start_m·64`) lands on
+    /// `ctid·64`, so the pass rewrites it to the canonical `muli(index_cast(landmark), 64)`. The
+    /// module goes through `to_ktir` — the pipeline that owns the pointer rewrite and runs the
+    /// corner pass — because that is the only road to the handoff, and the handoff is the road to
+    /// the door. The door's twin must claim exactly what the pass minted — and the mint's
+    /// `index_cast` is UNARY, the operand the twin once unpacked as two-operand and skipped, which
+    /// is the drift this bridge exists to hold shut. `Elementwise(Mul)` is a TAG ONLY: nothing is
+    /// emitted here, and neither recognizer reads it.
+    #[test]
+    fn the_door_reads_what_the_pass_mints() {
+        let mut m = triton_ktir::text::parse::parse(AFFINE).expect("parse the witness");
+        triton_ktir::passes::to_ktir::run(&mut m, &[4, 4]).expect("to_ktir mints the corner");
+
+        // The pass's own chain assertion, restated: the tile's row corner IS the mint — a `muli`
+        // over a UNARY `index_cast` of the landmark.
+        let body = m.kernel().unwrap().regions[0].ops.clone();
+        let tile = body
+            .iter()
+            .find(|o| o.kind == triton_ktir::ir::OpKind::KtdpConstructAccessTile)
+            .expect("one tile");
+        let row = tile.operands[1];
+        let index = m.def_index();
+        let head = index.def_of(row).expect("the corner is computed");
+        assert_eq!(head.kind, triton_ktir::ir::OpKind::ArithMuli);
+        let cast = index
+            .def_of(head.operands[0])
+            .expect("the stride's operand");
+        assert_eq!(cast.kind, triton_ktir::ir::OpKind::ArithIndexCast);
+        assert_eq!(cast.operands.len(), 1, "the mint's cast is unary");
+
+        let forms = assert_the_forms_agree(&m, Program::Elementwise(Elementwise::Mul));
+        assert_eq!(
+            forms,
+            vec![Some((64, 0)), None],
+            "row corner minted as ctid·64, column corner constant"
+        );
+    }
+
+    /// THE SHIPPED SPELLING. `mul_scale_small` compiles from the real fixture with its corner
+    /// ALREADY canonical (`index_cast(muli(index_cast(landmark), BLOCK))` — the fire gate's own
+    /// exemption shape, casts all the way down): no rewrite happens, the launch stays, and the
+    /// door still has to resolve what shipped. This is the spelling production modules carry and
+    /// the whole-function door actually bakes, so the bridge runs on the chain as the door
+    /// receives it, not only as the pass writes it.
+    #[test]
+    fn the_door_reads_the_shipped_spelling() {
+        let (kspec, grid, program) =
+            cases::case("mul_scale_small").expect("the case table states the configuration");
+        let src = std::fs::read_to_string(&kspec.file).expect("read the fixture");
+        let mut tt = codegen::compile(&src, &kspec, Target::spyre()).expect("codegen");
+        opt::make_ttir(&mut tt).expect("make_ttir");
+        let mut m = triton_ktir::from_ttir::convert(&tt).expect("from_ttir");
+        triton_ktir::make_ktir(&mut m, &grid).expect("make_ktir");
+        triton_ktir::passes::to_ktir::run(&mut m, &grid).expect("to_ktir");
+
+        let forms = assert_the_forms_agree(&m, program);
+        // The module's tiles: two with constant corners (the `None`s — agreed absence on both
+        // sides) and two whose corner is the per-core uniform one. Whatever is CLAIMED is the
+        // shipped form, and something is.
+        assert!(
+            !forms.is_empty()
+                && forms.iter().flatten().all(|f| *f == (64, 0))
+                && forms.contains(&Some((64, 0))),
+            "mul_scale's claimed corners are pid·BLOCK = pid·64 — got {forms:?}"
+        );
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════

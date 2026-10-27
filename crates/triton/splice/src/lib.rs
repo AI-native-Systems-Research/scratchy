@@ -1797,6 +1797,7 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         bindings,
         mask: mask_tid,
         node_out_tid: None,
+        minted: Default::default(),
     })
 }
 
@@ -2717,6 +2718,7 @@ fn mint<F: scratchy_subtile::subtile_ir::RopeForm>(
         bindings,
         mask: None,
         node_out_tid: None,
+        minted: Default::default(),
     })
 }
 

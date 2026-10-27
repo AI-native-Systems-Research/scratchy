@@ -15,13 +15,15 @@
 //! 2. **Spans** — `llm.execute_query()` with `cross` + `plus`, documents as
 //!    relocatable blocks. Shared documents hit the prefix cache automatically.
 
+use crate::scoring::token_f1;
+use crate::scoring::token_len;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
-use scratchy_serving_api::llm::{ChatMessage, LLM, LLMBuilder, SamplingParams};
+use scratchy_serving_api::llm::{LLM, LLMBuilder, SamplingParams};
 use scratchy_serving_api::tokenizer::Tokenizer;
 
 use crate::args::BenchHotpotqaArgs;
@@ -79,6 +81,28 @@ fn fetch_dataset(num_queries: usize) -> Result<Dataset> {
     };
 
     Ok(build_dataset(&raw, num_queries))
+}
+
+/// The first `n` tasks of the dataset, as `scr bench serve` sends them over HTTP
+/// ([`crate::workloads`]).
+pub(crate) fn tasks(n: usize) -> Result<Vec<crate::workloads::Task>> {
+    Ok(fetch_dataset(n)?
+        .queries
+        .iter()
+        .map(|q| task(q, crate::workloads::RAG_MAX_TOKENS))
+        .collect())
+}
+
+/// A query as a dataset task ([`crate::workloads`]): its documents by title, its one answer.
+fn task(q: &Query, max_tokens: usize) -> crate::workloads::Task {
+    crate::workloads::rag_task(
+        &crate::workloads::DOCUMENTS,
+        &q.documents,
+        &q.question,
+        std::slice::from_ref(&q.answer),
+        crate::workloads::Rule::OneAnswer,
+        max_tokens,
+    )
 }
 
 /// Build queries and corpus stats from the dataset's JSON rows.
@@ -146,13 +170,6 @@ fn build_dataset(raw: &[serde_json::Value], num_queries: usize) -> Dataset {
 // Tokenizer helpers
 // ---------------------------------------------------------------------------
 
-fn token_len(text: &str, tokenizer: &Tokenizer) -> usize {
-    tokenizer
-        .encode(text, false)
-        .map(|ids| ids.len())
-        .unwrap_or(0)
-}
-
 // ---------------------------------------------------------------------------
 // Evaluation
 // ---------------------------------------------------------------------------
@@ -166,61 +183,11 @@ fn evaluate(response: &str, expected: &str, debug: bool) -> f64 {
         eprintln!("  expected: {expected}");
         eprintln!("  response: {response}");
     }
-
-    let resp_lower = response.to_lowercase();
-    let exp_lower = expected.to_lowercase();
-
-    if resp_lower.contains(&exp_lower) {
-        return 1.0;
+    if crate::scoring::contains_or_f1(response, expected) {
+        1.0
+    } else {
+        0.0
     }
-
-    let exp_tokens = normalize_tokens(&exp_lower);
-    let resp_tokens = normalize_tokens(&resp_lower);
-
-    if exp_tokens.is_empty() {
-        return 0.0;
-    }
-
-    let common: usize = exp_tokens
-        .iter()
-        .filter(|t| resp_tokens.contains(t))
-        .count();
-
-    if common == 0 {
-        return 0.0;
-    }
-
-    let precision = common as f64 / resp_tokens.len().max(1) as f64;
-    let recall = common as f64 / exp_tokens.len() as f64;
-    let f1 = 2.0 * precision * recall / (precision + recall);
-
-    if f1 >= 0.5 { 1.0 } else { 0.0 }
-}
-
-fn normalize_tokens(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
-}
-
-/// Compute raw token F1 (0.0-1.0) for detailed reporting.
-fn token_f1(expected: &str, actual: &str) -> f64 {
-    let et = normalize_tokens(&expected.to_lowercase());
-    let at = normalize_tokens(&actual.to_lowercase());
-    if et.is_empty() && at.is_empty() {
-        return 1.0;
-    }
-    if et.is_empty() || at.is_empty() {
-        return 0.0;
-    }
-    let common: usize = et.iter().filter(|t| at.contains(t)).count();
-    if common == 0 {
-        return 0.0;
-    }
-    let p = common as f64 / at.len() as f64;
-    let r = common as f64 / et.len() as f64;
-    2.0 * p * r / (p + r)
 }
 
 // ---------------------------------------------------------------------------
@@ -386,8 +353,6 @@ pub(crate) fn run_bench_hotpotqa(args: BenchHotpotqaArgs) -> Result<()> {
         ..SamplingParams::default()
     };
 
-    let system_prompt = "You are a helpful assistant. Answer the question based only on the provided documents. Be concise — answer with just the entity, date, or fact requested.";
-
     let plain_style = ProgressStyle::default_bar()
         .template("  plain {bar:40.yellow/yellow} {pos:>4}/{len} {msg}")
         .unwrap();
@@ -407,11 +372,7 @@ pub(crate) fn run_bench_hotpotqa(args: BenchHotpotqaArgs) -> Result<()> {
         let debug = args.debug && i == 0;
         llm.reset_prefix_cache()?;
 
-        let mut msgs = vec![ChatMessage::system(system_prompt)];
-        for (j, (title, text)) in query.documents.iter().enumerate() {
-            msgs.push(ChatMessage::user(format!("Document {j} ({title}): {text}")));
-        }
-        msgs.push(ChatMessage::user(&query.question));
+        let msgs = task(query, args.max_tokens).chat_messages();
 
         let start = Instant::now();
         let result = llm.chat(&msgs, Some(sampling.clone()))?;
@@ -456,15 +417,6 @@ pub(crate) fn run_bench_hotpotqa(args: BenchHotpotqaArgs) -> Result<()> {
     for (i, query) in dataset.queries.iter().enumerate() {
         let debug = args.debug && i == 0;
 
-        let doc_json: Vec<serde_json::Value> = query
-            .documents
-            .iter()
-            .enumerate()
-            .map(|(j, (title, text))| {
-                serde_json::json!({ "user": format!("Document {j} ({title}): {text}") })
-            })
-            .collect();
-
         for (title, _) in &query.documents {
             total_doc_refs += 1;
             if docs_seen.contains(title) {
@@ -474,20 +426,9 @@ pub(crate) fn run_bench_hotpotqa(args: BenchHotpotqaArgs) -> Result<()> {
             }
         }
 
-        let span_query = serde_json::json!({
-            "g": {
-                "model": model_name,
-                "max_tokens": args.max_tokens,
-                "temperature": 0.0,
-                "input": {
-                    "cross": [
-                        { "system": system_prompt },
-                        { "plus": doc_json },
-                        { "user": &query.question }
-                    ]
-                }
-            }
-        });
+        let span_query = task(query, args.max_tokens)
+            .span_query(&model_name, args.max_tokens, 0.0)
+            .expect("a multi-document task has its span query");
 
         let start = Instant::now();
         let results = llm.execute_query(
@@ -568,6 +509,7 @@ pub(crate) fn run_bench_hotpotqa(args: BenchHotpotqaArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scoring::normalize_tokens;
     use arrow::datatypes::{DataType, Field, Fields, Schema};
     use serde_json::json;
 

@@ -1,27 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 //! THE SAMPLED ROWS OF A RESULT MATMUL, INSERTED FROM A TARGET'S DECLARED FACTS.
 //!
-//! The sampler reads one row of the forward's result per sequence, so on a multi-row step the
-//! result matmul — the vocabulary projection — need only compute those rows. A target that can
-//! compute them apart declares for which weights ([`SampleRowsFacts`]); this pass wraps each such
-//! result matmul of a multi-row canonical in one construct (one expansion, no guard):
+//! The sampler reads the rows of the forward's result a step samples — each sequence's last, every
+//! row of a sequence verifying drafts — so on a multi-row step the result matmul (the vocabulary
+//! projection) need only compute those rows, and its output need only hold them: the construct
+//! leaves their logits at the front of its output, in order (Python vLLM's `logits_indices`). A
+//! target that compacts them declares for which weights ([`SampleRowsFacts`]); this pass wraps
+//! each such result matmul of a multi-row canonical in one construct (one expansion, no guard):
 //!
-//! 1. [`SubOp::SampleRowsGather`] moves each sequence's sampled row to the front of the
-//!    activation, in place, and the matmul reads it;
-//! 2. the matmul;
-//! 3. [`SubOp::SampleRowsScatter`] moves its front rows back to the sampled rows, in place;
+//! 1. [`SubOp::SampleRowsGather`] moves the sampled rows to the front of the activation, in place,
+//!    and the matmul reads them;
+//! 2. the matmul, of the sampled rows;
+//! 3. [`SubOp::SampleRowsScatter`], in place over the matmul's output: what the target runs after
+//!    it — the gathered activation put back, or, where the matmul ran over every row, the sampled
+//!    rows' logits moved to the front;
 //! 4. [`SubOp::AllRowsMatmul`], the matmul over every row taking over that output — what a step
-//!    that reads every row runs instead of 1–3, and never on a step 1–3 run on.
+//!    that samples every row runs instead of 1–3 (its rows are its sampled rows, in order), and
+//!    never on a step 1–3 run on.
 //!
 //! Whether a bake point slices at all, and on which steps each part runs, is the target's
 //! lowering: the tape states the dataflow, and a part that does not run leaves the buffer it would
-//! rewrite in place as it was. A canonical of one row per sequence is left as it is. A target that
-//! samples no rows never calls this.
+//! rewrite in place as it was. A canonical of one row per sequence is left as it is, and so is one
+//! whose caller reads every row of its result ([`ResultRows::Every`]: an encoder's hidden state); a
+//! multi-row one the construct cannot wrap is refused, since its caller reads the front rows. A
+//! target that samples no rows never calls this.
 //!
-//! The result may be the matmul's logit tail instead ([`under_logit_tail`]): the construct then
-//! takes the matmul's place under it, and the tail reads the construct's end over every row, as it
-//! read the matmul. After 1–3 it caps or scales the sampled rows (the others are stale and never
-//! read); after 4, every row.
+//! The result may be the matmul's logit tail instead ([`logit_tail`]): the construct then
+//! takes the matmul's place under it, and the tail reads the construct's end, as it read the
+//! matmul — the sampled rows' logits, at the front.
 
 use std::cmp::Ordering;
 
@@ -35,9 +41,27 @@ pub struct SampleRowsFacts {
     pub weights: &'static [GemmWeightKind],
 }
 
+/// The rows of a canonical's result its caller reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResultRows {
+    /// The rows a step samples, at the front: a decoder's logits.
+    Sampled,
+    /// Every row, in order: an encoder's hidden state.
+    Every,
+}
+
 /// Why a canonical's sampled rows could not be inserted, naming the op at fault.
 #[derive(Debug)]
 pub enum SampleRowsError {
+    /// The result, under its logit tail, is no matmul: nothing leaves the sampled rows at the
+    /// front of it.
+    NotAMatmul { op: usize, name: &'static str },
+    /// The result matmul's weight is one the target samples no rows of.
+    Unsampled {
+        op: usize,
+        name: &'static str,
+        kind: GemmWeightKind,
+    },
     /// The result matmul has no activation operand.
     NoActivation { op: usize, name: &'static str },
     /// The result matmul is already part of another construct's expansion.
@@ -47,6 +71,16 @@ pub enum SampleRowsError {
 impl std::fmt::Display for SampleRowsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::NotAMatmul { op, name } => write!(
+                f,
+                "op {op} ({name}): the multi-row result under its logit tail is no matmul, so \
+                 nothing leaves the sampled rows at its front"
+            ),
+            Self::Unsampled { op, name, kind } => write!(
+                f,
+                "op {op} ({name}): the target samples no rows of a {kind:?} result matmul, so \
+                 nothing leaves the sampled rows at its front"
+            ),
             Self::NoActivation { op, name } => write!(f, "op {op} ({name}): no activation operand"),
             Self::AlreadyExpanded { op, name } => {
                 write!(f, "op {op} ({name}): already part of another expansion")
@@ -55,41 +89,59 @@ impl std::fmt::Display for SampleRowsError {
     }
 }
 
-/// The op under the result's logit tail: the chain of row-wise post-ops on the logits a decoder
-/// can end on (Gemma's final soft cap, Granite's `logits_scaling`, Command-R's `logit_scale`),
-/// each the only reader of the op it reads. The result itself when it has none.
-fn under_logit_tail(input: &LoweringInput) -> usize {
+/// The result's logit tail and the op under it: the chain of row-wise post-ops on the logits a
+/// decoder can end on (Gemma's final soft cap, Granite's `logits_scaling`, Command-R's
+/// `logit_scale`), the result's down, each the only reader of the op it reads; and the op under
+/// them, the result itself when it has none.
+fn logit_tail(input: &LoweringInput) -> (Vec<usize>, usize) {
     let only_reader = |j: usize| {
         (input.ops.iter().flat_map(|od| &od.inputs))
             .filter(|i| **i == InputRef::Op(j))
             .count()
             == 1
     };
-    let mut r = input.result;
+    let (mut tail, mut r) = (Vec::new(), input.result);
     while let (SubOp::TanhSoftCap { .. } | SubOp::ScalarMul { .. }, [InputRef::Op(j)]) =
         (input.ops[r].op, input.ops[r].inputs.as_slice())
         && only_reader(*j)
     {
+        tail.push(r);
         r = *j;
     }
-    r
+    (tail, r)
 }
 
-/// Wrap `l`'s result matmul, under its logit tail, in its sampled rows, when `facts` sample its
-/// weight and the canonical has more than one row per sequence.
+/// The ops of the logit tail [`expand_sample_rows`] left over its construct's end, the result's
+/// down: each runs over the sampled rows alone, at the front. None where it inserted no construct.
+pub fn sampled_logit_tail(input: &LoweringInput) -> Vec<usize> {
+    match logit_tail(input) {
+        (tail, under) if matches!(input.ops[under].op, SubOp::AllRowsMatmul) => tail,
+        _ => Vec::new(),
+    }
+}
+
+/// Wrap `l`'s result matmul, under its logit tail, in its sampled rows, when its caller reads the
+/// rows a step samples and the canonical has more than one row per sequence. Refused when it
+/// cannot: a result under its logit tail that is no matmul, or a matmul whose weight `facts` do
+/// not sample, would leave the rows unmoved where the caller reads the front ones.
 pub fn expand_sample_rows(
     l: &LoweredDecode,
     facts: &SampleRowsFacts,
+    rows: ResultRows,
 ) -> Result<LoweredDecode, SampleRowsError> {
-    let r = under_logit_tail(&l.input);
+    let (_, r) = logit_tail(&l.input);
     let od = &l.input.ops[r];
-    let SubOp::MatmulTile { weight, .. } = od.op else {
-        return Ok(l.clone());
-    };
-    if od.m < 2 || !facts.weights.contains(&weight.kind()) {
+    if rows == ResultRows::Every || od.m < 2 {
         return Ok(l.clone());
     }
     let name = od.op.name();
+    let SubOp::MatmulTile { weight, .. } = od.op else {
+        return Err(SampleRowsError::NotAMatmul { op: r, name });
+    };
+    let kind = weight.kind();
+    if !facts.weights.contains(&kind) {
+        return Err(SampleRowsError::Unsampled { op: r, name, kind });
+    }
     if l.op_expansion[r].is_some() {
         return Err(SampleRowsError::AlreadyExpanded { op: r, name });
     }
@@ -219,7 +271,8 @@ mod tests {
     /// activation's tile, the rest the matmul's.
     #[test]
     fn a_multi_row_result_matmul_is_sampled() {
-        let x = expand_sample_rows(&head(2, affine(256)), &AFFINE).expect("expands");
+        let x = expand_sample_rows(&head(2, affine(256)), &AFFINE, ResultRows::Sampled)
+            .expect("expands");
         assert_eq!(
             names(&x),
             [
@@ -249,35 +302,62 @@ mod tests {
         assert!(x.input.ops.iter().all(|od| od.m == 2));
     }
 
-    /// One row per sequence, a weight the target does not sample, or a result that is not a
-    /// matmul: the op list comes back as it was.
+    /// One row per sequence, or a result whose caller reads every row: the op list comes back as
+    /// it was, whatever the result is.
     #[test]
-    fn only_a_listed_multi_row_result_matmul_is_sampled() {
-        let unchanged = |l: LoweredDecode| {
-            let x = expand_sample_rows(&l, &AFFINE).expect("passes through");
+    fn a_one_row_or_whole_result_is_left_as_it_is() {
+        let unchanged = |l: LoweredDecode, rows| {
+            let x = expand_sample_rows(&l, &AFFINE, rows).expect("passes through");
             assert_eq!(names(&x), names(&l));
             assert_eq!(x.input.result, l.input.result);
         };
-        unchanged(head(1, affine(256)));
-        unchanged(head(2, GemmWeight::Dense));
-        unchanged(then(
-            head(1, affine(256)),
-            SubOp::TanhSoftCap { cap: 30.0 },
-            1,
-        ));
+        let cap = SubOp::TanhSoftCap { cap: 30.0 };
+        for rows in [ResultRows::Sampled, ResultRows::Every] {
+            unchanged(head(1, affine(256)), rows);
+            unchanged(head(1, GemmWeight::Dense), rows);
+            unchanged(then(head(1, affine(256)), cap, 1), rows);
+        }
+        unchanged(head(2, affine(256)), ResultRows::Every);
+        unchanged(head(2, GemmWeight::Dense), ResultRows::Every);
+        unchanged(then(head(2, affine(256)), cap, 0), ResultRows::Every);
+    }
+
+    /// A multi-row result its caller samples, which the construct cannot wrap — a weight the
+    /// target does not sample, a result under its logit tail that is no matmul — is refused,
+    /// naming the op: the caller would read the front rows of a result that never moved them.
+    #[test]
+    fn an_unwrappable_sampled_result_is_refused() {
+        let refused = |l: LoweredDecode| match expand_sample_rows(&l, &AFFINE, ResultRows::Sampled)
+        {
+            Ok(_) => panic!("expected a refusal"),
+            Err(e) => e,
+        };
+        match refused(head(2, GemmWeight::Dense)) {
+            SampleRowsError::Unsampled {
+                op: 1,
+                name: "MatmulTile",
+                kind: GemmWeightKind::Dense,
+            } => {}
+            other => panic!("expected Unsampled at op 1, got {other:?}"),
+        }
         // A cap over the norm, and a scale beside another reader of the matmul: neither is the
-        // matmul's tail.
-        unchanged(then(
-            head(2, affine(256)),
-            SubOp::TanhSoftCap { cap: 30.0 },
-            0,
-        ));
+        // matmul's tail, so the result under it is the post-op itself.
+        let cap = SubOp::TanhSoftCap { cap: 30.0 };
+        match refused(then(head(2, affine(256)), cap, 0)) {
+            SampleRowsError::NotAMatmul {
+                op: 2,
+                name: "TanhSoftCap",
+            } => {}
+            other => panic!("expected NotAMatmul at op 2, got {other:?}"),
+        }
         let scale = SubOp::ScalarMul { scale: 0.25 };
-        unchanged(then(
-            then(head(2, affine(256)), SubOp::TanhSoftCap { cap: 30.0 }, 1),
-            scale,
-            1,
-        ));
+        match refused(then(then(head(2, affine(256)), cap, 1), scale, 1)) {
+            SampleRowsError::NotAMatmul {
+                op: 3,
+                name: "ScalarMul",
+            } => {}
+            other => panic!("expected NotAMatmul at op 3, got {other:?}"),
+        }
     }
 
     /// `l` with `op` over op `of`'s output appended as its result, on a tile of its own.
@@ -301,7 +381,7 @@ mod tests {
     fn a_result_matmul_under_its_logit_tail_is_sampled() {
         let capped = then(head(2, affine(256)), SubOp::TanhSoftCap { cap: 30.0 }, 1);
         let tailed = then(capped, SubOp::ScalarMul { scale: 0.25 }, 2);
-        let x = expand_sample_rows(&tailed, &AFFINE).expect("expands");
+        let x = expand_sample_rows(&tailed, &AFFINE, ResultRows::Sampled).expect("expands");
         assert_eq!(
             names(&x),
             [
@@ -322,6 +402,10 @@ mod tests {
         assert_eq!(x.op_tiles, [t0, t0, t1, t1, t1, Some((2, 0)), Some((3, 0))]);
         assert!(x.op_expansion[1..5].iter().all(Option::is_some));
         assert_eq!(x.op_expansion[5..], [None, None]);
+        // The tail over the construct runs over the sampled rows; the same tail over the plain
+        // matmul it replaced, over every row.
+        assert_eq!(sampled_logit_tail(&x.input), [6, 5]);
+        assert_eq!(sampled_logit_tail(&tailed.input), [] as [usize; 0]);
     }
 
     /// A result matmul some construct already expanded to is refused, by name.
@@ -332,7 +416,7 @@ mod tests {
             id: ExpansionId(0),
             guard: None,
         });
-        match expand_sample_rows(&l, &AFFINE) {
+        match expand_sample_rows(&l, &AFFINE, ResultRows::Sampled) {
             Err(SampleRowsError::AlreadyExpanded { op: 1, name }) => assert_eq!(name, "MatmulTile"),
             other => panic!("expected AlreadyExpanded at op 1, got {other:?}"),
         }
@@ -346,7 +430,7 @@ mod tests {
             id: ExpansionId(6),
             guard: None,
         });
-        let x = expand_sample_rows(&l, &AFFINE).expect("expands");
+        let x = expand_sample_rows(&l, &AFFINE, ResultRows::Sampled).expect("expands");
         assert_eq!(x.op_expansion[2].map(|e| e.id), Some(ExpansionId(7)));
     }
 
@@ -378,7 +462,8 @@ mod tests {
         };
         let capped = then(head(2, affine(256)), SubOp::TanhSoftCap { cap: 30.0 }, 1);
         for plain in [head(2, affine(256)), capped] {
-            let sampled = expand_sample_rows(&plain, &AFFINE).expect("expands");
+            let sampled =
+                expand_sample_rows(&plain, &AFFINE, ResultRows::Sampled).expect("expands");
             assert_eq!(colours(&sampled), colours(&plain));
         }
     }

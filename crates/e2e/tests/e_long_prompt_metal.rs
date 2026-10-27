@@ -47,7 +47,7 @@ fn greedy_completion(prompt: &str, max_tokens: u32) -> CompletionRequest {
 }
 
 /// Repeat a sentence until the rough token estimate hits the target.
-/// SmolLM-135M's tokenizer averages ~4 chars/token on this kind of
+/// SmolLM2-135M's tokenizer averages ~4 chars/token on this kind of
 /// boilerplate prose, so we count chars and divide.
 fn build_prompt(target_tokens: usize, suffix: &str) -> String {
     let sentence = "The grass is green and the sky is blue. ";
@@ -63,14 +63,13 @@ fn build_prompt(target_tokens: usize, suffix: &str) -> String {
 }
 
 async fn start_metal_server() -> (TestServer, Client) {
-    // SmolLM-135M-Instruct uses the same llama-arch bucket spec
+    // SmolLM2-135M-Instruct uses the same llama-arch bucket spec
     // (`workloads = [1, 8, 64, 512, 4096]`) as Llama-3.2 — the
     // 4096-token bucket cap is what triggers chunking.
     //
-    // SmolLM-135M's default `max_model_len` is 2048; bump it to 8192
-    // so a >4096-token prompt fits in the model context (otherwise
-    // the engine bails before chunking matters — finish_reason="length"
-    // with completion_tokens=0).
+    // `--max-model-len 8192`, SmolLM2's whole context, pinned so a
+    // >4096-token prompt fits (otherwise the engine bails before
+    // chunking matters — finish_reason="length" with completion_tokens=0).
     let server = TestServer::builder(scratchy_e2e::TestModels::SMOLLM)
         .with_device("metal")
         .with_args(&["--max-model-len", "8192"])

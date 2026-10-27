@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use llguidance::api::TopLevelGrammar;
 use llguidance::{Matcher, ParserFactory};
-use scratchy_core_common::sampling::GuidedGrammar;
+use scratchy_core_common::sampling::{GuidedGrammar, ThinkFirst};
 use toktrie::TokenId;
 use toktrie_hf_tokenizers::ByteTokenizer;
 
@@ -33,6 +33,9 @@ pub struct GrammarGuide {
     /// Set to `true` once EOS has been consumed while the matcher is stopped.
     /// Mirrors Python's `GuidanceGrammar.terminated`.
     terminated: bool,
+    /// Where the reply is before its grammar applies ([`ThinkFirst`]): `None` once the grammar
+    /// does, or from the start.
+    think: Option<ThinkFirst>,
 }
 
 /// A generic JSON schema that matches any valid JSON object.
@@ -251,6 +254,7 @@ impl GrammarGuide {
             Ok(Self {
                 matcher: Matcher::new(Ok(parser)),
                 terminated: false,
+                think: None,
             })
         } else {
             Self::from_ebnf(&lark, factory)
@@ -267,6 +271,7 @@ impl GrammarGuide {
         Ok(Self {
             matcher: Matcher::new(Ok(parser)),
             terminated: false,
+            think: None,
         })
     }
 
@@ -277,6 +282,7 @@ impl GrammarGuide {
         Ok(Self {
             matcher: Matcher::new(Ok(parser)),
             terminated: false,
+            think: None,
         })
     }
 
@@ -294,7 +300,20 @@ impl GrammarGuide {
         Ok(Self {
             matcher: Matcher::new(Ok(parser)),
             terminated: false,
+            think: None,
         })
+    }
+
+    /// A request's grammar, as both workers build it: `grammar`, applied once a reasoning model
+    /// has thought, where `think_first` says it would (`SamplingParams::think_first`).
+    pub fn for_request(
+        grammar: &GuidedGrammar,
+        think_first: Option<ThinkFirst>,
+        factory: &Arc<ParserFactory>,
+    ) -> Result<Self, String> {
+        let mut guide = Self::from_guided_grammar(grammar, factory)?;
+        guide.think = think_first;
+        Ok(guide)
     }
 
     /// Create a `GrammarGuide` from a `GuidedGrammar` specification.
@@ -319,14 +338,23 @@ impl GrammarGuide {
     ///
     /// Matches Python's `_fill_bitmasks` + `fill_next_token_bitmask` flow:
     /// `compute_mask_or_eos()` returns EOS-only when stopped, normal mask otherwise.
+    ///
+    /// While a reasoning model thinks, `None`: no mask until its thinking closes. At a reply's
+    /// first token, when it may open thinking, the grammar's tokens and the one that opens it.
     pub fn allowed_tokens(&mut self) -> Option<Vec<TokenId>> {
         if self.terminated {
             return None;
         }
+        let open = match self.think {
+            Some(ThinkFirst::Thinking { .. }) => return None,
+            Some(ThinkFirst::MayOpen(tokens)) => Some(tokens.open),
+            None => None,
+        };
         match self.matcher.compute_mask_or_eos() {
             Ok(mask) => {
                 let mut tokens = Vec::new();
                 mask.iter_set_entries(|idx| tokens.push(idx as TokenId));
+                tokens.extend(open.filter(|open| !tokens.contains(open)));
                 Some(tokens)
             }
             Err(_) => None,
@@ -341,7 +369,27 @@ impl GrammarGuide {
     /// - Otherwise, consumes the token normally.
     ///
     /// Returns `true` if the transition was valid, `false` on error.
+    ///
+    /// While a reasoning model thinks, its tokens aren't the grammar's: the one that closes its
+    /// thinking starts the grammar from the next token. At a reply's first token, the one that
+    /// opens thinking starts it; any other is the grammar's first.
     pub fn advance(&mut self, token_id: TokenId) -> bool {
+        match self.think {
+            Some(ThinkFirst::Thinking { close }) => {
+                if token_id == close {
+                    self.think = None;
+                }
+                return true;
+            }
+            Some(ThinkFirst::MayOpen(tokens)) if token_id == tokens.open => {
+                self.think = Some(ThinkFirst::Thinking {
+                    close: tokens.close,
+                });
+                return true;
+            }
+            Some(ThinkFirst::MayOpen(_)) => self.think = None,
+            None => {}
+        }
         if self.matcher.is_stopped() {
             // Grammar already stopped — this token is EOS (or garbage after
             // stopped). Mark terminated so `allowed_tokens()` returns None.
@@ -385,13 +433,43 @@ pub fn apply_grammar_mask(logits: &mut [f32], allowed: &[TokenId]) {
     }
 }
 
-/// Build a `TokEnv` and `ParserFactory` from raw tokenizer.json bytes.
+/// Build a `TokEnv` and `ParserFactory` from raw tokenizer.json bytes, its grammars ending on
+/// `stop_token_ids`: the tokens the engine stops a request on (`EngineCoreConfig::eos_token_ids`).
+///
+/// ⛔ A FINISHED GRAMMAR ALLOWS ONLY ITS END OF SEQUENCE, SO THAT MUST BE WHAT STOPS THE REQUEST.
+/// toktrie reads its own from tokenizer.json, by name (`<|endoftext|>`, `</s>`, …), and on an
+/// instruct model that is often not the token that ends a turn. SmolLM2 and Qwen end one on
+/// `<|im_end|>`, and Llama 3 Instruct on `<|eot_id|>`. With toktrie's own, a constrained reply's
+/// model emits it, unstopped, until `max_tokens`. So every stop token in the tokenizer's vocab is
+/// the end of sequence here. A stop token past the vocab is left out with a warning, and with none
+/// left, toktrie's own is the end, with a warning that names it.
 ///
 /// Workers call this once at model-load time and cache the result.
 /// The `ParserFactory` is expensive to create (builds sliced bias computer)
 /// but is reused across all requests.
-pub fn build_parser_factory(tokenizer_json: &[u8]) -> Result<Arc<ParserFactory>, String> {
-    let byte_tok = ByteTokenizer::from_json_bytes(tokenizer_json).map_err(|e| e.to_string())?;
+pub fn build_parser_factory(
+    tokenizer_json: &[u8],
+    stop_token_ids: &[u32],
+) -> Result<Arc<ParserFactory>, String> {
+    let mut byte_tok = ByteTokenizer::from_json_bytes(tokenizer_json).map_err(|e| e.to_string())?;
+    let vocab_size = byte_tok.tokrx_info().vocab_size;
+    let (stops, past): (Vec<u32>, Vec<u32>) =
+        (stop_token_ids.iter()).partition(|&&id| id < vocab_size);
+    if !past.is_empty() {
+        tracing::warn!(
+            "guided-decoding: stop tokens {past:?} are past the tokenizer's vocab of {vocab_size}, \
+             so no grammar ends on them"
+        );
+    }
+    match stops.is_empty() {
+        false => byte_tok.set_eos_tokens(&stops),
+        true => tracing::warn!(
+            "guided-decoding: no stop token in the tokenizer's vocab (of {stop_token_ids:?}), so \
+             a finished grammar allows only the tokenizer's own end of sequence, {}, which may \
+             not stop the request",
+            byte_tok.tokrx_info().tok_eos
+        ),
+    }
     let tok_env = byte_tok.into_tok_env(None).map_err(|e| e.to_string())?;
     let mut factory = ParserFactory::new_simple(&tok_env).map_err(|e| e.to_string())?;
     factory.set_stderr_log_level(0);
@@ -407,6 +485,14 @@ mod tests {
     use super::*;
 
     fn make_test_factory() -> Arc<ParserFactory> {
+        make_test_factory_ending_on(&[])
+    }
+
+    /// The test tokenizer's factory, its grammars ending on `stop_token_ids`. The tokenizer's own
+    /// end of sequence, by toktrie's reading of its names, is `</s>` (31); `<|im_end|>` (32) is
+    /// the end of a turn, as an instruct model's chat template ends one. Ids are dense, as a real
+    /// tokenizer's are: toktrie sizes its vocab by the tokens it has, not by their largest id.
+    fn make_test_factory_ending_on(stop_token_ids: &[u32]) -> Arc<ParserFactory> {
         // Use a minimal BPE tokenizer JSON for testing.
         let tokenizer_json = r#"{
             "version": "1.0",
@@ -414,7 +500,10 @@ mod tests {
             "padding": null,
             "added_tokens": [
                 {"id": 0, "content": "<unk>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
-                {"id": 99, "content": "</s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+                {"id": 31, "content": "</s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+                {"id": 32, "content": "<|im_end|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+                {"id": 33, "content": "<think>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+                {"id": 34, "content": "</think>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
             ],
             "normalizer": null,
             "pre_tokenizer": {
@@ -470,7 +559,7 @@ mod tests {
                 "merges": []
             }
         }"#;
-        build_parser_factory(tokenizer_json.as_bytes()).unwrap()
+        build_parser_factory(tokenizer_json.as_bytes(), stop_token_ids).unwrap()
     }
 
     #[test]
@@ -570,6 +659,115 @@ mod tests {
             guide.allowed_tokens().is_none(),
             "terminated grammar should return None"
         );
+    }
+
+    /// ⭐ A finished grammar allows the tokens the engine stops a request on, so the request stops
+    /// there. The tokenizer's own end of sequence (`</s>`, 31) is not one of them on an instruct
+    /// model whose turns end on `<|im_end|>` (32, as SmolLM2's and Qwen's do): allowing it alone,
+    /// the model emits it until `max_tokens`. Every stop token is allowed, and each ends the
+    /// grammar. With none given, the tokenizer's own is the end, as before.
+    #[test]
+    fn a_finished_grammar_allows_the_tokens_that_stop_the_request() {
+        let finished = |stop_token_ids: &[u32]| {
+            let factory = make_test_factory_ending_on(stop_token_ids);
+            let mut guide = GrammarGuide::from_regex("[0-9]", &factory).unwrap();
+            assert!(guide.advance(8), "1");
+            assert!(guide.is_finished());
+            guide
+        };
+        let mut allowed = finished(&[32]).allowed_tokens().unwrap();
+        allowed.sort();
+        assert_eq!(allowed, [32], "<|im_end|>, the turn's end");
+
+        let mut allowed = finished(&[31, 32]).allowed_tokens().unwrap();
+        allowed.sort();
+        assert_eq!(allowed, [31, 32], "every stop token");
+        for stop in [31, 32] {
+            let mut guide = finished(&[31, 32]);
+            assert!(guide.advance(stop));
+            assert!(guide.is_terminated(), "{stop} ends it");
+        }
+
+        assert_eq!(finished(&[]).allowed_tokens().unwrap(), [31], "</s>");
+    }
+
+    /// ⭐ A reasoning model thinks before its grammar applies (#793). Left thinking by its prompt,
+    /// it is unmasked until `</think>`, and the grammar applies from the next token. Where it may
+    /// open thinking, its first token may be `<think>` or the grammar's; `<think>` holds the
+    /// grammar until `</think>`, a grammar token starts it. Without a gate, the grammar applies from
+    /// the first token, as before.
+    #[test]
+    fn a_reasoning_model_thinks_before_its_grammar_applies() {
+        use scratchy_core_common::sampling::ThinkTokens;
+        let factory = make_test_factory_ending_on(&[32]);
+        let tokens = ThinkTokens {
+            open: 33,
+            close: 34,
+        };
+        let digit = GuidedGrammar::Regex {
+            pattern: "[0-9]".to_string(),
+        };
+        let (a, one) = (11, 8);
+        let allowed = |guide: &mut GrammarGuide| {
+            guide.allowed_tokens().map(|mut ids| {
+                ids.sort();
+                ids
+            })
+        };
+        // The grammar's own tokens, ungated, and with others besides.
+        let grammar = allowed(&mut GrammarGuide::for_request(&digit, None, &factory).unwrap());
+        let grammar = grammar.expect("a mask");
+        assert!(!grammar.contains(&33) && grammar.contains(&one));
+        let digits_and = |extra: &[u32]| {
+            let mut ids = grammar.clone();
+            ids.extend(extra);
+            ids.sort();
+            ids
+        };
+
+        // Left thinking by the prompt.
+        let thinking = Some(ThinkFirst::Thinking { close: 34 });
+        let mut guide = GrammarGuide::for_request(&digit, thinking, &factory).unwrap();
+        for token in [a, one, a] {
+            assert_eq!(allowed(&mut guide), None, "thinking: unmasked");
+            assert!(guide.advance(token));
+        }
+        assert!(guide.advance(34), "</think>");
+        assert_eq!(
+            allowed(&mut guide),
+            Some(digits_and(&[])),
+            "then the grammar"
+        );
+        assert!(guide.advance(one));
+        assert!(guide.is_finished());
+
+        // May open thinking with its first token.
+        let may_open = Some(ThinkFirst::MayOpen(tokens));
+        let mut guide = GrammarGuide::for_request(&digit, may_open, &factory).unwrap();
+        assert_eq!(
+            allowed(&mut guide),
+            Some(digits_and(&[33])),
+            "the grammar's, or <think>"
+        );
+        assert!(guide.advance(33));
+        assert_eq!(allowed(&mut guide), None, "thinking");
+        assert!(guide.advance(a) && guide.advance(34));
+        assert_eq!(
+            allowed(&mut guide),
+            Some(digits_and(&[])),
+            "<think> no longer"
+        );
+        assert!(guide.advance(one));
+        assert!(guide.is_finished());
+
+        // Or answer at once: the first token is the grammar's.
+        let mut guide = GrammarGuide::for_request(&digit, may_open, &factory).unwrap();
+        assert!(guide.advance(one));
+        assert!(guide.is_finished());
+
+        // No gate: the grammar from the first token.
+        let mut guide = GrammarGuide::for_request(&digit, None, &factory).unwrap();
+        assert_eq!(allowed(&mut guide), Some(digits_and(&[])));
     }
 
     #[test]

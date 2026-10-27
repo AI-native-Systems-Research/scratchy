@@ -1649,6 +1649,18 @@ impl BakeQueue {
     /// Start the workers. `None` when this build has no dxp (cardless): the caller then writes json
     /// and leaves it for `build.rs`, exactly as before.
     pub fn start() -> Option<Bake> {
+        // ⭐ PLAN-ONLY OVERRIDES A PRESENT COMPILER TOO. `no_dxp_or_die` below reads
+        // `SCRATCHY_PLAN_ONLY_BAKE` as the cardless host's stated intent — but it was read
+        // ONLY there, so the variable pardoned a MISSING tool and nothing else: on a host
+        // that HAS dxp the queue started anyway and compiled every group the expansion
+        // produced, binaries nobody asked for and nobody would load (MEASURED: a plan-only
+        // check of a fresh kernel family spent 582 s compiling 723 such groups). The
+        // variable is a claim about the BUILD the host is doing, not merely about the
+        // hardware, so it is honored here too — plan-only takes the cardless arm by
+        // choice, dxp present or not.
+        if std::env::var_os("SCRATCHY_PLAN_ONLY_BAKE").is_some() {
+            return None;
+        }
         let tool = DxpTool::resolve()?;
         let reaper: Arc<Reaper> = Arc::new(Reaper::default());
         // Arm both teardowns before the first child can exist: the emit's own panics unwind only the
@@ -1893,8 +1905,10 @@ pub fn global() -> Option<&'static Bake> {
 /// RUNTIME stage but not in the stage that runs `cargo build`, and there was nothing anywhere to say so.
 ///
 /// So: FAIL, naming the variable and the stage. A host that genuinely has no card must say so on purpose
-/// via `SCRATCHY_PLAN_ONLY_BAKE=1` — which is a claim about the machine, not a fallback the build picks by
-/// itself. Type-checking without a card stays possible; shipping a model that cannot compute does not.
+/// via `SCRATCHY_PLAN_ONLY_BAKE=1` — which is a claim about the build being done, not a fallback the build
+/// picks by itself: it pardons a missing compiler HERE, and it takes the plan-only arm in
+/// [`BakeQueue::start`] even when the compiler is present, so a plan-only check never pays compile time.
+/// Type-checking without a card stays possible; shipping a model that cannot compute does not.
 fn no_dxp_or_die() {
     if std::env::var_os("SCRATCHY_PLAN_ONLY_BAKE").is_some() {
         return;

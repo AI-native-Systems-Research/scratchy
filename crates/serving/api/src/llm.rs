@@ -468,21 +468,51 @@ impl LLM {
         Generation(Arc::clone(&self.interrupt))
     }
 
-    /// Stop an interrupted generation: abort its requests and step the engine until they are
-    /// retired, then the [`Interrupted`] error it returns. The background pipeline keeps up to two
-    /// steps queued, and these steps are what finishes them.
-    fn stop(&mut self, request_ids: &[String]) -> anyhow::Error {
-        if let Err(e) = self.client.abort_requests(request_ids) {
-            return anyhow::anyhow!("abort_requests failed: {e}");
-        }
+    /// Abort requests the engine will not finish on its own and step the engine until it
+    /// retires them. The background pipeline keeps up to two steps queued, and these steps
+    /// are what finishes them. [`LLM::stop`] turns the result into the [`Interrupted`]
+    /// error; a stop-string finish (see [`LLM::chat_stream`]) returns through it as success.
+    fn abort_and_drain(&mut self, request_ids: &[String]) -> Result<()> {
+        self.client
+            .abort_requests(request_ids)
+            .map_err(|e| anyhow::anyhow!("abort_requests failed: {e}"))?;
         while self.client.has_unfinished_requests() {
             match self.client.get_output() {
                 Ok(StepOutcome::Progressed { .. }) => {}
                 Ok(StepOutcome::Stalled | StepOutcome::Idle) => break,
-                Err(e) => return anyhow::anyhow!("engine step failed: {e}"),
+                Err(e) => return Err(anyhow::anyhow!("engine step failed: {e}")),
             }
         }
-        Interrupted.into()
+        Ok(())
+    }
+
+    /// Stop an interrupted generation: abort its requests and step the engine until they are
+    /// retired, then the [`Interrupted`] error it returns. The background pipeline keeps up to two
+    /// steps queued, and these steps are what finishes them.
+    fn stop(&mut self, request_ids: &[String]) -> anyhow::Error {
+        self.abort_and_drain(request_ids)
+            .err()
+            .unwrap_or_else(|| Interrupted.into())
+    }
+
+    /// End a generation whose step failed: abort its requests and step the engine until they are
+    /// retired, as [`LLM::stop`] does, then the step's error. The engine aborts the failed step's
+    /// own requests; the generation's others, still waiting or behind it, would otherwise run on
+    /// under the next call on this `LLM` (#575).
+    fn fail(
+        &mut self,
+        request_ids: &[String],
+        error: scratchy_serving_engine::error::EngineError,
+    ) -> anyhow::Error {
+        // The step's failure stays the error a caller prints (`{e}` shows only the outermost
+        // message): a failed retire is appended to it, not wrapped around it.
+        match self.abort_and_drain(request_ids) {
+            Ok(()) => anyhow::anyhow!("engine step failed: {error}"),
+            Err(drain) => anyhow::anyhow!(
+                "engine step failed: {error} (and retiring the generation's requests failed: \
+                 {drain})"
+            ),
+        }
     }
 
     /// The model name / HuggingFace ID.
@@ -841,10 +871,10 @@ impl LLM {
             if self.interrupted() {
                 return Err(self.stop(&request_ids));
             }
-            let outcome = self
-                .client
-                .get_output()
-                .map_err(|e| anyhow::anyhow!("engine step failed: {e}"))?;
+            let outcome = match self.client.get_output() {
+                Ok(outcome) => outcome,
+                Err(e) => return Err(self.fail(&request_ids, e)),
+            };
             let outputs = match outcome {
                 StepOutcome::Progressed { outputs, .. } => outputs,
                 StepOutcome::Stalled => return Err(stalled_step("offline generate")),
@@ -1105,15 +1135,15 @@ impl LLM {
         // spinning while the request waits to be admitted) — two very different bugs, same symptom.
         let mut steps = 0usize;
         let mut _d_step0 = std::time::Duration::ZERO;
-        while self.client.has_unfinished_requests() {
+        'stream: while self.client.has_unfinished_requests() {
             if self.interrupted() {
                 return Err(self.stop(std::slice::from_ref(&request_id)));
             }
             let _t_step_i = std::time::Instant::now();
-            let outcome = self
-                .client
-                .get_output()
-                .map_err(|e| anyhow::anyhow!("engine step failed: {e}"))?;
+            let outcome = match self.client.get_output() {
+                Ok(outcome) => outcome,
+                Err(e) => return Err(self.fail(std::slice::from_ref(&request_id), e)),
+            };
             let outputs = match outcome {
                 StepOutcome::Progressed { outputs, .. } => outputs,
                 StepOutcome::Stalled => return Err(stalled_step("streaming chat/completion")),
@@ -1156,15 +1186,31 @@ impl LLM {
                 //   stop_string = req_state.detokenizer.update(
                 //       new_token_ids, finish_reason == FinishReason.STOP
                 //   )
+                //   if stop_string is not None: finish the request
+                // A stop string is not an engine-side criterion — the engine's
+                // criteria know EOS, stop tokens and max_tokens — so this loop is
+                // the only thing that can end the generation on one. Abort the
+                // engine-side request when it fires (the serve path's #711
+                // contract), or the engine decodes on to max_tokens after the
+                // reply is already complete. An engine finish in the same step
+                // means it already retired the request; nothing to abort.
+                let mut stop_string_finished = false;
                 if let Some(ref mut d) = detok {
                     use scratchy_core_common::engine_io::FinishReason;
                     let stop_terminated = output.finish_reason == Some(FinishReason::Stop);
-                    d.update(&output.new_token_ids, stop_terminated);
+                    let stop_string = d.update(&output.new_token_ids, stop_terminated);
                     let new_text = d.get_next_output_text(false, true);
                     if !new_text.is_empty() {
                         on_token(&new_text);
                         full_text.push_str(&new_text);
                     }
+                    stop_string_finished = stop_string.is_some() && output.finish_reason.is_none();
+                }
+                if stop_string_finished {
+                    use scratchy_core_common::engine_io::FinishReason;
+                    finish_reason = Some(FinishReason::Stop.to_string());
+                    self.abort_and_drain(std::slice::from_ref(&request_id))?;
+                    break 'stream;
                 }
             }
         }
@@ -1203,6 +1249,15 @@ impl LLM {
 mod tests {
     use super::*;
     use crate::protocol;
+    use crate::tokenizer::make_test_tokenizer;
+    use scratchy_core_common::sampling::GenerationDefaults;
+    use scratchy_core_config::{SchedulerConfig, SchedulerPolicy};
+    use scratchy_serving_engine::engine_core::EngineCoreConfig;
+    use scratchy_serving_engine::error::EngineResult;
+    use scratchy_serving_engine::executor::{Executor, ModelRunnerOutput};
+    use scratchy_serving_scheduler::scheduler::output::SchedulerOutput;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn build_batched_completion_request(
         prompts: &[Prompt],
@@ -1451,5 +1506,154 @@ mod tests {
     fn test_prompt_from_token_ids() {
         let p: Prompt = vec![1u32, 2, 3].into();
         assert!(matches!(p, Prompt::TokenIds(ids) if ids == [1, 2, 3]));
+    }
+
+    /// An [`Executor`] that samples a scripted token sequence, one token per scheduled
+    /// request per step — engine-core-test style, so the test drives the real
+    /// InprocClient + scheduler wiring, not a mocked client. `emitted` counts every
+    /// token the engine was made to produce: the zombie-decode detector.
+    struct ScriptedExecutor {
+        script: Vec<u32>,
+        next: usize,
+        emitted: Arc<AtomicUsize>,
+    }
+
+    impl Executor for ScriptedExecutor {
+        /// Its script samples no grammar.
+        fn set_stop_token_ids(&mut self, _stop_token_ids: &[u32]) {}
+
+        fn execute_model(
+            &mut self,
+            scheduler_output: &SchedulerOutput,
+        ) -> EngineResult<ModelRunnerOutput> {
+            let n = scheduler_output.num_scheduled_tokens.len();
+            let mut req_ids = Vec::with_capacity(n);
+            let mut req_id_to_index = HashMap::with_capacity(n);
+            let mut sampled_token_ids = Vec::with_capacity(n);
+            for (i, req_id) in scheduler_output.num_scheduled_tokens.keys().enumerate() {
+                req_id_to_index.insert(req_id.clone(), i);
+                req_ids.push(req_id.clone());
+                sampled_token_ids.push(vec![self.script[self.next % self.script.len()]]);
+                self.next += 1;
+                self.emitted.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(ModelRunnerOutput {
+                req_ids,
+                req_id_to_index,
+                sampled_token_ids,
+                logprobs: None,
+                prompt_logprobs_dict: HashMap::new(),
+                draft_token_ids: None,
+                draft_seed_inputs: None,
+                pooler_output: None,
+                kv_extent: HashMap::new(),
+                kv_pool_reach: None,
+                kv_backed: None,
+                d2h_resolver: None,
+            })
+        }
+
+        fn initialize_cache(&mut self, _gpu: usize, _cpu: usize) -> EngineResult<()> {
+            Ok(())
+        }
+
+        fn determine_available_memory(&mut self) -> EngineResult<Vec<usize>> {
+            Ok(vec![1024 * 16 * 1024])
+        }
+
+        fn shutdown(&mut self) {}
+    }
+
+    fn test_engine_config() -> EngineCoreConfig {
+        EngineCoreConfig {
+            scheduler_config: SchedulerConfig {
+                max_num_batched_tokens: 8192,
+                max_num_seqs: 256,
+                max_num_scheduled_tokens: None,
+                policy: SchedulerPolicy::Fcfs,
+                enable_chunked_prefill: true,
+                long_prefill_token_threshold: 0,
+                ..Default::default()
+            },
+            max_model_len: 4096,
+            num_gpu_blocks: 1024,
+            block_size: 16,
+            engine_index: 0,
+            async_scheduling: false,
+            use_spec_decode: false,
+            proposer_config: None,
+            eos_token_ids: vec![],
+            is_pooling: false,
+            enable_prefix_caching: false,
+            hybrid_kv: None,
+        }
+    }
+
+    /// An [`LLM`] over a [`ScriptedExecutor`] — the real InprocClient and chat
+    /// path with the model swapped for the script.
+    fn scripted_llm(script: Vec<u32>, emitted: Arc<AtomicUsize>) -> LLM {
+        LLM {
+            client: InprocClient::new(
+                test_engine_config(),
+                Box::new(ScriptedExecutor {
+                    script,
+                    next: 0,
+                    emitted,
+                }),
+            ),
+            tokenizer: Some(Arc::new(make_test_tokenizer())),
+            chat_template: Some(
+                ChatTemplate::new("{% for m in messages %}{{ m.content }}{% endfor %}".to_string())
+                    .unwrap(),
+            ),
+            model_name: "test-model".to_string(),
+            max_model_len: 4096,
+            block_size: 16,
+            generation_defaults: GenerationDefaults {
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                min_p: None,
+                repetition_penalty: None,
+                max_new_tokens: None,
+            },
+            interrupt: Arc::default(),
+        }
+    }
+
+    #[test]
+    fn a_stop_string_ends_a_streaming_chat_at_the_stop_not_max_tokens() {
+        let tok = make_test_tokenizer();
+        let script = tok
+            .encode("a b country c d e f g h i j k l m n o p", false)
+            .unwrap();
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let mut llm = scripted_llm(script, Arc::clone(&emitted));
+
+        let params = SamplingParams {
+            stop: vec!["country".to_string()],
+            max_tokens: Some(64),
+            ..Default::default()
+        };
+        let mut streamed = String::new();
+        let out = llm
+            .chat_stream(&[ChatMessage::user("hello")], Some(params), |t| {
+                streamed.push_str(t);
+            })
+            .unwrap();
+
+        let co = &out.outputs[0];
+        assert_eq!(co.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(co.text, "a b ");
+        assert_eq!(streamed, co.text);
+        // The zombie this PR removes: without the abort, the engine decodes on
+        // to max_tokens (64 here) after the stop string already finished the
+        // reply. With it, generation ends at the stop plus the abort's drain.
+        let emitted = emitted.load(Ordering::SeqCst);
+        assert!(
+            emitted < 20,
+            "stop string should end the generation at the stop, \
+             but the engine emitted {emitted} tokens"
+        );
     }
 }

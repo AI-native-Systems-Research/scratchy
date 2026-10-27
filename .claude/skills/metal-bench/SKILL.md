@@ -18,23 +18,63 @@ an editor, needs the user at a terminal. Give them the exact lines to run in
 a separate terminal window, then wait until they say it's done. The agent
 runs everything else.
 
-**Two kinds of run:**
-- A **full run** is what goes on the site: a whole round of models, every
-  rung, the default engines, all of them pinned, and default reps, priming
-  and scaling. It takes hours. The default round is the MoE models
-  (qwen3.6-35b-a3b, gemma-4-26b-a4b-it, glm-4.5-air); `--models full` adds the
-  dense ones (qwen3.6-27b, gemma-4-31b-it), and `--models dense` runs those
-  alone. The default engines are oMLX and oMLX TurboQuant, and the default
-  sweeps are the prompt × answer grid at 1, 2, 4, 8 and 16 users (1, 2, 4
-  for glm-4.5-air) plus prompt length; the grid's users replace the old
-  separate users sweep. `--engines all` adds every other installed engine
-  (much longer), and `--scale-axes conc,grid,input` adds the users sweep back.
-  Each cell sends at least 4 rounds of its users count (64 requests at 16
-  users, 32 at 8), so the sweep takes up to twice as long as it did with a
-  flat 12 per cell: about 2.6 h on an M5 Max, 12 h on an M1 Max.
-- A **smoke run** checks the setup. It runs gemma-4-26b-a4b-it only, the
-  smallest model left, with one rep, no scaling and output in `/tmp`. Its
-  JSON never goes on the site, so after step 4 you're done.
+**Three kinds of run:**
+- A **quick run** is the default, and what the user means by "run the
+  benchmark" unless they say otherwise. **It asks no questions:** see
+  **Quick run** below. The script with no flags but `--unpinned`: this Mac's
+  four models (the small set below 64 GB, the large set at 64 GB), scratchy
+  alone, cold and warm, one rep, the users × prompt grid at 1, 2 and 4
+  users and prompts to 8k, the same on every Mac (its memory picks the models),
+  and 64-token answers, two rounds of each users count a cell.
+  scratchy runs at its defaults on every Mac, and every cell runs: one
+  that runs out of memory is recorded as failed. The page keeps every
+  other engine's numbers, and scratchy's frozen launches, from the last full
+  run, each tagged with its date. Its length is not measured yet in this
+  form: the one M3 Pro quick run took 43 minutes, before every cell ran and
+  at four rounds a cell. The aim is about 25 minutes. Report the run's length.
+- A **full run** renews every number: `--full` adds the comparison engines
+  (oMLX and oMLX TurboQuant), frozen (needs `sudo purge`), three reps, four
+  rounds of each users count a cell, and the 512- and 2048-token answers at
+  1 user (the decode-vs-answer-length curve). It takes hours; run it when the engines or the grid change, or
+  for a published study. It's pinned (`--pin`) and goes through every
+  pre-flight question in step 2.
+- A **smoke run** checks the setup: `--models gpt-oss-20b --no-scaling
+  --parity --out-dir /tmp/metal-smoke`. Its JSON never goes on the site, so after
+  step 4 you're done.
+
+**The rounds:** one model per class, a small one for 36 GB and a large one
+for 64 GB. Sliding window: gpt-oss-20b / gpt-oss-120b-3bit. Mamba-2:
+nemotron-3-nano-30b-a3b / nemotron-3-super-120b-a12b. Gated DeltaNet:
+qwen3.6-35b-a3b / qwen3.5-122b-a10b. Dense: granite-4.2-3b / granite-4.2-30b. The large set is 2- and 3-bit (OptiQ or 3-bit), since no 4-bit 120B fits 64 GB: its numbers aren't comparable with the 4-bit small set on quality.
+`--models small`, `large` or `full` picks a set; glm-4.5-air and the gemma
+and qwen3.6-27b models run by name. The run file records the class table
+(`config.classes`), and the page's overview reads its columns from it.
+
+**Not on a 36 GB M3 Pro yet.** At scratchy's default budget it has panicked
+the kernel twice mid long prefill (#780), restarting the Mac. Don't run it
+there until #540 lands; tell the user why and stop.
+
+## Quick run
+
+Run it straight through. Don't ask about the commit, a dirty tree, the
+models or the flags: report them in the closing summary instead. Stop and
+tell the user only for:
+- **Battery:** `pmset -g batt | head -1` doesn't say `'AC Power'`. Battery
+  runs are throttled. Tell them to plug in, and wait.
+- **Something else running:** the `pgrep`/`lsof` lines in step 2 show a
+  process this skill didn't start. Ask before stopping it.
+
+Then, without `--fail-fast`, so one model's build failure does not stop the
+models after it. A quick run is scratchy alone, so it skips the mlx-lm parity
+gate and needs no mlx venv: each model records `parity_skipped` instead.
+```bash
+caffeinate -dims ./scripts/bench_metal_matrix.sh --unpinned
+```
+and go on to step 4. In the closing summary say: the commit benchmarked and
+where it is against upstream `main`, whether the tree was dirty (the JSON
+records it as `repo.dirty`), the models run and skipped, and the run's
+length. A clean quick run goes to the round issue (step 7, quick run), not
+straight into `site/data/metal`: skip steps 5 and 6.
 
 ## 1. One-time setup (per Mac)
 
@@ -96,7 +136,10 @@ no frozen rung, so treat it like any partial run in step 5.
 shows them available, and the check prints `rule works` without asking for a
 password, or the user has chosen to run without the frozen rung.
 
-## 2. Pre-flight (every run)
+## 2. Pre-flight
+
+A quick run runs these commands and acts on them as **Quick run** above
+says, without the questions below. A full run asks them.
 
 Find the upstream remote. In a fork clone, `origin` is the fork, and its
 `main` can be well behind upstream.
@@ -152,7 +195,7 @@ lsof -nP -iTCP:8751 -sTCP:LISTEN               # the script's --port
 **Done when:** the user has chosen the commit to benchmark,
 `git status --short` prints nothing, `pmset` says `'AC Power'`, the
 `pkill`/`pgrep`/`lsof` lines leave nothing running, and you've decided on
-the `--models` flag (none for the default MoE round, or `--models full`).
+the `--models` flag (none for this Mac's set, or `--models full`).
 
 ## 3. Run
 
@@ -180,8 +223,8 @@ Smoke run (a few minutes when the builds are cached):
 
 ```bash
 source ~/.venvs/mlx/bin/activate
-caffeinate -dims ./scripts/bench_metal_matrix.sh --fail-fast --unpinned --models gemma-4-26b-a4b-it \
-  --reps 1 --prime 1 --no-scaling --out-dir /tmp/metal-smoke 2>&1 | tee /tmp/metal-smoke.log
+caffeinate -dims ./scripts/bench_metal_matrix.sh --fail-fast --unpinned --models gpt-oss-20b \
+  --reps 1 --prime 1 --no-scaling --parity --out-dir /tmp/metal-smoke 2>&1 | tee /tmp/metal-smoke.log
 echo "exit ${PIPESTATUS[0]}"
 ```
 
@@ -191,11 +234,19 @@ first scratchy build or parity-gate failure, instead of going on to the next
 model.
 
 Before timing each model, the script runs a blocking **parity gate**: `scr
-chat` and `mlx_lm.generate`, both greedy, must give exactly the same answer
-to a few short prompts that have one right answer. A model that fails the
+chat` and `mlx_lm.generate`, both greedy, must give the same answer to a few
+short prompts that have one right answer. Where the text differs,
+`scripts/parity_ties.py` runs mlx-lm over scratchy's own answer and judges
+each token scratchy picked: one within a logit of mlx-lm's top is a near-tie
+(reasoning models' thoughts open on them), and the prompt passes as `TIE`.
+A token further behind, or more than a few near-ties, fails. A model that fails the
 gate isn't timed on any engine, because there would be no scratchy numbers
-to compare against. The gate needs mlx-lm, so it runs on every full and
-smoke run. Rules and rationale are in `docs/BENCHMARKING.md` (fairness
+to compare against. The gate needs mlx-lm, and runs wherever a comparison
+engine is timed — every full run — or wherever `--parity` forces it (the
+smoke run passes it). A scratchy-only quick run skips it — the mlx-lm side
+reloads the whole checkpoint once per gate prompt, which on the large models
+can outlast the run — and records `parity_mlx_lm: null` with `parity_skipped`
+saying why. Rules and rationale are in `docs/BENCHMARKING.md` (fairness
 rule 3).
 
 Run the command in the background, so a full run doesn't hit a shell timeout,
@@ -209,10 +260,11 @@ act on each one as it appears:
 - `skipped: needs N GB`: expected for glm-4.5-air on a Mac under 64 GB.
 - `--- mistral.rs: nothing to serve`: expected for every MoE model; it runs
   only the dense ones, since it runs out of memory on MoE GGUFs on Metal.
-- `N FAILED` on a cell, then `requests failed; skipping this server's
-  remaining cells`: that engine ran out of memory (or errored) at that size.
-  The run carries on, and the page marks the cell with ‡. Note which engine
-  and cell for the user; it's a finding, not a broken run.
+- `N FAILED` on a cell, then `requests failed`, or `timed out after 600s`:
+  that engine ran out of memory (or errored, or was too slow) at that size.
+  The server is restarted and the next cell runs (`(server restarted)`); the
+  page marks the cell with ‡. Note which engine and cell for the user; it's
+  a finding, not a broken run. `server would not restart` ends that sweep.
 - `<engine> declined <model> — its own memory guard refused it: ...`: oMLX's
   admission guard refused to load the model outright (its dynamic ceiling
   from system-reclaimable memory — not the Metal cap, so the wired-limit
@@ -226,7 +278,9 @@ act on each one as it appears:
 - `BUILD FAILED`: the run stops by itself with `--fail-fast`. Go to **On a
   build failure** below.
 - `--- parity gate vs mlx-lm (blocking)`, followed by either `PARITY OK` or
-  `PARITY FAILED — not timing <stem>`. On a failure, tell the user right
+  `PARITY FAILED — not timing <stem>` (full and `--parity` runs; a quick run
+  prints a `skipped` line instead). A `TIE` line, with its `token N:`
+  lines under it, is a pass: note the gaps for the user, nothing to do. On a failure, tell the user right
   away: that model has no numbers, and with `--fail-fast` the run stops
   there (without it, it moves on and exits 1 at the end). The lines under it
   show both answers; `the ... child crashed` means one side crashed rather
@@ -255,9 +309,10 @@ commands to get it through. A mismatch on these prompts means scratchy and
 mlx-lm computed different things, and timing either of them would compare
 different computations. The gate's full output is in
 `<out-dir>/<machine>/parity-<stem>.log`; the path is on the `PARITY FAILED`
-line. For each prompt it shows `OK` or `FAIL`, then `a:` (scratchy) and `b:`
-(mlx-lm) for every `FAIL`. Report the `FAIL` lines to the user, and say
-which of these the outputs look like:
+line. For each prompt it shows `OK`, `TIE` or `FAIL`, then `a:` (scratchy)
+and `b:` (mlx-lm) for every `FAIL`, with the reason in brackets: a token some
+logits behind mlx-lm's top, too many near-ties, or no score at all. Report
+the `FAIL` lines to the user, and say which of these the outputs look like:
 
 - **The two sides were given different prompts.** One side starts with a
   thought or reasoning block, or with template text the other doesn't have,
@@ -325,11 +380,14 @@ for m in d["models"]:
           "parity=" + str(m.get("parity_mlx_lm")), dict(reps))
 for x in d.get("skipped_models") or []:
     print("skipped", x["stem"], x["reason"])
-full = (c["scenarios"] == ["frozen", "cold", "warm"] and c["cold_priming_launches"] == 3
-        and c["scaling"] is not None and not c["scratchy_serve_args"]
-        and all(Counter(r["scenario"] for r in m.get("cache_ladder") or []).get("frozen") == 3
-                for m in d["models"]))
-print("scope  ", "full" if full else "PARTIAL (rungs, reps, priming, scaling or serve args not at defaults)")
+ladders = [Counter(r["scenario"] for r in m.get("cache_ladder") or []) for m in d["models"]]
+plain = c["scaling"] is not None and not c["scratchy_serve_args"]
+full = (plain and c["scenarios"] == ["frozen", "cold", "warm"] and c["cold_priming_launches"] == 3
+        and all(l.get("frozen") == 3 for l in ladders))
+quick = (plain and c["scenarios"] == ["cold", "warm"] and c["cold_priming_launches"] == 1
+         and all(l.get("cold") == 1 for l in ladders))
+print("scope  ", "full" if full else "quick" if quick else
+      "PARTIAL (rungs, reps, priming, scaling or serve args not at a quick or full run's)")
 EOF
 ```
 
@@ -338,7 +396,9 @@ hold for a run to go on the site: `AC Power`, `dirty=False`, `installed=True`
 for every engine the user meant to run, `pinned True` (each version equal to
 its pin), and every model `built=True` and `parity=True`. `parity=False`
 means the model failed the gate and has no numbers. `parity=None` on a built
-model means the gate didn't run, so its numbers were never checked. A
+model means the gate didn't run, so its numbers were never checked —
+expected on a quick run, which skips the gate for scratchy alone
+(`parity_skipped` says so). A
 `skipped` model is fine when its reason is memory. If any of these fails,
 report it and let the user decide whether the run is usable. Report the
 `commit` and `scope` lines too, but they don't fail the run on their own;
@@ -348,11 +408,14 @@ A smoke run ends here.
 ## 5. Copy into the site
 
 Before copying, ask the user to confirm if any of these is true:
-- `scope` is `PARTIAL`
-- the run has fewer models than the round it ran (the three MoE models, or
-  all five with `--models full`), not counting a model skipped for memory
+- `scope` is `PARTIAL` (`quick` and `full` are both fine)
+- the run has fewer models than the round it ran (this Mac's four, or all
+  eight with `--models full`), not counting a model skipped for memory
 - `commit` isn't upstream `main`
-- any model's `parity` isn't `True`
+- any model's `parity` is `False` (it failed the gate), or `None` with no
+  `parity_skipped` reason (the gate should have run but didn't, as on a full
+  run without mlx-lm). `None` with `parity_skipped` is a quick run, as
+  expected.
 
 Never copy a smoke run, or anything under `/tmp/metal-smoke`.
 
@@ -394,11 +457,67 @@ new run's date and commit.
 
 ## 7. Share or commit
 
-Either send the JSON to whoever collects the runs from all the Macs, or
-commit it on a new branch and open a PR titled:
+**A full run** goes in its own PR. Commit it on a new branch and open a PR
+titled:
 
 ```
 data(site): <machine> Metal run at <short-sha>
 ```
 
-**Done when:** the user has the JSON or the PR link.
+**A quick run** goes to the metal quick round: one open issue, labelled
+`metal-round`, whose comments collect a quick run from each of the four Macs
+(base M5, M3 Pro, M4 Max, M5 Max). Once all four are in, a workflow
+(`.github/workflows/metal-round.yml`) opens a PR adding the newest run per Mac
+to `site/data/metal` and closes the issue; an admin merges the PR. Post only a
+run that exited 0; a run that went wrong is not posted. A second run of the
+same Mac before the round closes is posted too: the newest run, by when it
+ran, is the one committed. Only runs from the repo's owners, members and
+collaborators count.
+
+First check it can go in a round: a quick run, scratchy alone at its
+defaults, one of the four Macs, a clean tree, and a commit on upstream `main`:
+
+```bash
+git fetch -q "$up" main
+python3 scripts/metal_round.py check "$f" --main-ref "$up/main"
+```
+
+If it says `not for a round`, tell the user why and stop: nothing is
+posted. Otherwise ask the user whether to post it, and post only on a yes.
+Then find the round's open issue, or open one:
+
+```bash
+repo=AI-native-Systems-Research/scratchy
+n=$(gh issue list -R "$repo" --label metal-round --state open --json number --jq '.[0].number')
+if [ -z "$n" ]; then
+  n=$(gh issue create -R "$repo" --label metal-round \
+    --title "Metal quick round $(date -u +%F)" \
+    --body "Collects one scratchy quick run from each Mac (base M5, M3 Pro, M4 Max, M5 Max) as comments, posted by the metal-bench skill. Once all four are in, the Metal round workflow opens a PR adding the newest run per Mac to site/data/metal, and closes this issue." \
+    | grep -o '[0-9]*$')
+fi
+```
+
+Two people opening a round at once makes two issues: post to the lower
+number, and close the other.
+
+Post the run as a comment: one line, then the JSON, compact (no indents: a
+64 GB Mac's run with every cell is about 64 KB indented, at GitHub's comment
+limit), in a collapsed block:
+
+```bash
+{
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["machine"]["chip"], "quick run,", d["generated_utc"] + ", at", d["repo"]["sha"][:8])' "$f"
+  printf '\n<details><summary>run JSON</summary>\n\n```json\n'
+  python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), separators=(",", ":")))' "$f"
+  printf '```\n</details>\n'
+} > /tmp/metal-round-comment.md
+wc -c < /tmp/metal-round-comment.md
+[ "$(wc -c < /tmp/metal-round-comment.md)" -le 65536 ] && gh issue comment "$n" -R "$repo" --body-file /tmp/metal-round-comment.md
+```
+
+If it's over 65,536 bytes, GitHub won't take it: tell the user, and don't
+split it. Within a minute the round's status comment on the issue lists this Mac
+as in, or a reply says why the run wasn't counted.
+
+**Done when:** the user has the PR link (a full run) or the comment's link
+and the round's status (a quick run).

@@ -679,6 +679,7 @@ where
         tiled_symbols,
         time_tile,
         indirect: None,
+        coordinate_mask: None,
     })
 }
 
@@ -960,5 +961,6 @@ pub fn matmul_opspec_batched_off(
         tiled_symbols,
         time_tile,
         indirect: None,
+        coordinate_mask: None,
     })
 }

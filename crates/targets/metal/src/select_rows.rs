@@ -42,6 +42,9 @@ pub struct Selection {
     pub len: usize,
     /// The variant's index: a `u32` `.1` bytes into `.0`, which an earlier command buffer wrote.
     pub selector: (crate::mtl4_dispatch::Buffer, usize),
+    /// How many variants there are: the device clamps the selector to them, since a failed
+    /// command buffer leaves a stale word there.
+    pub variants: usize,
     pub to: SelectInto,
     pub at: usize,
 }
@@ -70,7 +73,7 @@ pub struct SelectOp {
     pub src_at: u32,
     pub stride: u32,
     pub len: u32,
-    pub _pad: u32,
+    pub variants: u32,
     pub src: u64,
     pub dst: u64,
     pub sel: u64,
@@ -88,7 +91,7 @@ impl SelectOp {
             src_at: words(src_at),
             stride: words(s.stride),
             len: words(s.len),
-            _pad: 0,
+            variants: words(s.variants.max(1)),
             src,
             dst,
             sel: s.selector.0.gpuAddress() + s.selector.1 as u64,

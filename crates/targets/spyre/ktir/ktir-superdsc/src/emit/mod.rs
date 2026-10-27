@@ -490,7 +490,10 @@ fn pointwise_opspec(
 /// `RedNonStick` (-1, a non-stick size-1 dim); `out` broadcast (a `[m, 1]` column
 /// vector like RmsNorm's inv_rms, or a `[1,1]` scalar const) → `out` = `RedStick`
 /// (-2, the one-stick `alpha_=0` broadcast READ proven on-card 2026-06-25). Both
-/// are MaterializedStick-safe. `y` is always `Active` (the unused trailing slot).
+/// are MaterializedStick-safe. `y` is `Active` for every operand but the ROW-SPLIT form
+/// ([`In::y_broadcast`]): a `[mb, out]` source sprayed down the op's leading `y` dim carries
+/// `y = RedNonStick` there — the vendor's own reduced-dim law (`superdsc.py`'s
+/// `reduced_dims → scale = -1`), the same scale the on-card-proven pmask fusion uses.
 #[derive(Clone, Copy)]
 pub struct EwOperand<'a> {
     // Fields are PRIVATE and there are NO raw ctors: the ONLY way to build an EwOperand is `In::ew()`,
@@ -498,8 +501,20 @@ pub struct EwOperand<'a> {
     // `EwOperand::full(&str)` is UNCONSTRUCTABLE outside this module — the weakly-typed input path is
     // eliminated. Every pointwise/reduce input carries its layout kind in its type via `In<K>`.
     name: &'a str,
+    /// The handle's declared [`StickLayout`], captured by the `In` door that built this operand —
+    /// the shape authority the family mint (`mint_ew_operands`) checks every swept window against.
+    /// Carried IN the operand (not re-read from a handle at the funnel) so the checked shape is the
+    /// one the operand's own construction saw, and a broadcast form can never outlive the handle it
+    /// swept past.
+    layout: StickLayout,
     mb_broadcast: bool,
     out_broadcast: bool,
+    /// ⭐ THE ROW-SPLIT (Y) BROADCAST COUNT — 0 = not a y-broadcast; n ≥ 2 = the source is a
+    /// `[mb, out]` tile sprayed down the op's leading `y` dim, n sprays deep. Set only by
+    /// [`In::y_broadcast`], whose callers are the whole-function walk's Y admission (a
+    /// leading-axis `linalg.broadcast` over a multi-row source whose result is `[y, mb, ..]`),
+    /// so the count is the broadcast's OWN stated leading extent — not a caller's pick.
+    y_broadcast: u32,
     col_offset: u32,
     /// The [`crate::addr::ColWindow`] `col_offset` came from — set only by [`In::col_window`], so a
     /// stick-major presentation of a column window is admitted by type, never by testing the integer.
@@ -518,8 +533,22 @@ impl<'a> EwOperand<'a> {
             } else {
                 Scale::Active
             },
-            Scale::Active,
+            if self.y_broadcast > 0 {
+                Scale::RedNonStick
+            } else {
+                Scale::Active
+            },
         ]
+    }
+
+    /// The SAME scales in Y-MAJOR order `[y, mb, out]` — the layout order the row-split mode's
+    /// op presents its tensors in (the `TensorArg` layout of the y-major frame, the same
+    /// `["y", "mb", "out"]` head-outermost spelling the batched matmul's walks use). A rotation
+    /// of [`scale`](Self::scale)'s `[mb, out, y]`, so the y-major builder reads one ordered
+    /// triple per operand instead of re-deriving it at its own call site.
+    pub(crate) fn scale_ymajor(&self) -> [Scale; 3] {
+        let s = self.scale();
+        [s[2], s[0], s[1]]
     }
 
     // Read-only accessors, `pub(crate)` so the TileIR→SdscOp bridge functions that read these
@@ -533,12 +562,194 @@ impl<'a> EwOperand<'a> {
     pub(crate) fn out_broadcast(&self) -> bool {
         self.out_broadcast
     }
+    pub(crate) fn mb_broadcast(&self) -> bool {
+        self.mb_broadcast
+    }
+    /// The row-split spray count — 0 when this operand is not a y-broadcast.
+    pub(crate) fn y_broadcast(&self) -> u32 {
+        self.y_broadcast
+    }
     pub(crate) fn col_offset(&self) -> u32 {
         self.col_offset
     }
     /// Whether this operand is a [`crate::addr::ColWindow`] whose `[rows, ·]` view is stick-major.
     pub(crate) fn is_stick_major_window_for(&self, rows: u32) -> bool {
         self.col_window.is_some_and(|w| w.is_stick_major_for(rows))
+    }
+    /// The handle's declared [`StickLayout`], captured by the `In` door that built this operand.
+    pub(crate) fn declared(&self) -> StickLayout {
+        self.layout
+    }
+    /// The operand's SWEPT device-access window for a `[rows, cols]` op — the per-form law the
+    /// family mint (`mint_ew_operands`) checks. `stick_elems` is the op's stick-padded swept
+    /// width; `stick_lanes` one stick at the op's df:
+    /// - full / sliced / [`In::col_window`]: `rows × stick_elems` — the op's whole extent, padded
+    ///   lanes included (an `Active`-over-`out` operand reads the pad lanes of its last stick).
+    /// - out-broadcast (a per-row scalar: `col`/`col_at`): `rows × stick_lanes` — ONE STICK PER
+    ///   ROW, the RedStick `alpha_=0` broadcast READ.
+    /// - mb-broadcast (a `[1, cols]` row vector: `mb`/`mb_at`): `1 × stick_elems`.
+    /// - scalar (mb ∧ out, a `[1,1]` const): `1 × stick_lanes` — one stick.
+    /// - y-broadcast (the row-split form: `y_broadcast`): `(rows/y) × stick_elems` — the
+    ///   `[mb, out]` source at its own extent, one spray's worth of rows, at the SAME
+    ///   stick-padded width the dense operands sweep (the pad lanes are the mint's own
+    ///   footprint — the source region is single-stick by the frame law).
+    pub(crate) fn swept_extents(
+        &self,
+        rows: u32,
+        stick_elems: u32,
+        stick_lanes: u32,
+    ) -> (u32, u32) {
+        if self.y_broadcast > 1 {
+            return (rows / self.y_broadcast, stick_elems);
+        }
+        match (self.mb_broadcast, self.out_broadcast) {
+            (true, true) => (1, stick_lanes),
+            (true, false) => (1, stick_elems),
+            (false, true) => (rows, stick_lanes),
+            (false, false) => (rows, stick_elems),
+        }
+    }
+}
+
+/// ⭐⭐⭐ THE POINTWISE FAMILY'S OPERAND MINT — the #731 door for every elementwise input.
+///
+/// Each operand's SWEPT window ([`EwOperand::swept_extents`] — the per-form broadcast law) is
+/// checked against BOTH authorities, the same doors [`BundleLayout::win`] runs for a
+/// handle-minted [`Win`]: the handle's declared shape (always — the `In` door captured it when
+/// the operand was built), and the placement footprint by name (when a `BundleLayout` is at
+/// hand). An operand that reads past its tensor is an `Err` naming the tensor, its window and
+/// the bound it exceeded — the class #717's card failure belongs to (`add_o1137` reading
+/// `t1131` past its footprint at the width-512 prefix-capable continuation), refused at build
+/// instead of detected on card. A gathered operand's window is its table's own rows (the index
+/// selects within the table by contract), so a table smaller than the op's row count is caught
+/// here too.
+pub(crate) fn mint_ew_operands(
+    op_name: &str,
+    rows: u32,
+    cols: u32,
+    df: Df,
+    inputs: &[EwOperand<'_>],
+    layout: Option<&BundleLayout>,
+) -> Result<(), String> {
+    // The op's stick basis — the same two forms `pointwise_broadcast_opspec_df` tiles at: fp16's
+    // 64-stick, or fp32's 32 for the torch-spyre fp32 rmsnorm island.
+    let stick_elems = if matches!(df, Df::Fp32) {
+        StickExtent::<Fp32>::new(cols)?.elems()
+    } else {
+        StickExtent::<Fp16>::new(cols)?.elems()
+    };
+    let stick_lanes = df.elems_per_stick();
+    for i in inputs {
+        let (sw_rows, sw_cols) = i.swept_extents(rows, stick_elems, stick_lanes);
+        let what = format!("{op_name}: operand '{}'", i.name());
+        // ⭐ THE OUT-BROADCAST (RedStick) FORMS' DEVICE ACCESS IS THE STICK **RUN** CONTAINING THE
+        // OFFSET — the L3 EBR is stick-granular and rounds the reader's allocate down to the stick
+        // base (rmsnorm's `rinv` half-stick law: the sub-stick remainder is a lane select inside
+        // the stick, byte-granular on LX), and each op row steps one stick. So the window the two
+        // doors bound starts at the stick BASE, while the VALUE each row reads sits at the offset
+        // itself — stated as its own bound, so a sub-stick offset can neither overstate the access
+        // (refusing a legal lane select) nor hide a scalar past the tensor's end. Every other form
+        // reads a contiguous range from its offset and keeps the exact bound.
+        let off = if i.out_broadcast() {
+            let shape_elems = i.declared().rows as u64 * i.declared().cols as u64;
+            // The per-row forms (col/col_at) step one op row per stick — the operand's own row
+            // pitch. The scalar form (mb ∧ out) reads ONE value for the whole op, so no pitch.
+            let stride = if i.mb_broadcast() {
+                0
+            } else {
+                let pitch = i.declared().cols as u32;
+                if pitch != stick_lanes {
+                    return Err(format!(
+                        "{what}: the broadcast operand is {pitch} columns wide — a per-row \
+                         scalar broadcast reads ONE STICK PER ROW, and no bound is stated for a \
+                         wider one"
+                    ));
+                }
+                stick_lanes as u64
+            };
+            let last_value = i.col_offset() as u64 + (sw_rows.saturating_sub(1) as u64) * stride;
+            if last_value >= shape_elems {
+                return Err(format!(
+                    "{what}: the broadcast read's last row scalar (element {last_value}) runs \
+                     past the end its handle declares — {shape_elems} elements. An op that reads \
+                     past its own tensor is a defect in the computation that produced this \
+                     offset; it cannot compile."
+                ));
+            }
+            i.col_offset() - i.col_offset() % stick_lanes
+        } else {
+            i.col_offset()
+        };
+        match layout {
+            Some(l) => {
+                l.check_window(i.name(), i.declared(), off as u64, sw_rows, sw_cols, &what)?
+            }
+            None => crate::placement::window_fits_declared(
+                i.name(),
+                i.declared(),
+                off as u64,
+                sw_rows,
+                sw_cols,
+                &what,
+            )?,
+        }
+    }
+    Ok(())
+}
+
+/// ⭐ The pointwise family's OUTPUT mint — the output window `rows × stick_elems` at the corner
+/// the assembler was given, checked against the output handle's declared shape and (when at
+/// hand) its placement. The `(Stk, OutCorner)` pair stays typed at the assembler — the corner's
+/// [`crate::addr::ColWindow`] provenance is what the stick-major predicate reads, so folding it
+/// into a `Win` would lose it — and THIS is the door that refuses a corner running past the
+/// output's own end.
+pub(crate) fn mint_ew_output<O: KindTag>(
+    op_name: &str,
+    o: &Stk<O>,
+    off_elems: u32,
+    rows: u32,
+    cols: u32,
+    df: Df,
+    layout: Option<&BundleLayout>,
+) -> Result<(), String> {
+    let stick_elems = if matches!(df, Df::Fp32) {
+        StickExtent::<Fp32>::new(cols)?.elems()
+    } else {
+        StickExtent::<Fp16>::new(cols)?.elems()
+    };
+    let what = format!("{op_name}: output '{}'", o.name());
+    mint_full_window(&what, o, off_elems as u64, rows, stick_elems, layout)
+}
+
+/// ⭐ THE FULL-WINDOW MINT — one whole `[rows, cols]` window at an element corner, checked against
+/// BOTH authorities, the same doors [`mint_ew_operands`] runs for a pointwise operand: the handle's
+/// declared shape (always), and the placement footprint by name (when a `BundleLayout` is at hand).
+///
+/// This is the convert and restickify families' door. Their ops read and write whole tiles at
+/// nest-derived corners — no broadcast forms, no per-row value bounds — so the one question a mint
+/// can ask of them is whether the tile fits the tensor it names, and this asks exactly that. The
+/// corner arrives in ELEMENTS of the operand's own df (a `DevOff`'s raw elements, or 0), and the
+/// handle's own df must be the operand's real one: the placement door prices bytes at the handle's
+/// word length, so an fp16-annotated fp8 buffer overstates every window 2× and would refuse legal
+/// slots (see [`rb_df`]).
+pub(crate) fn mint_full_window<O: KindTag>(
+    what: &str,
+    h: &Stk<O>,
+    off_elems: u64,
+    rows: u32,
+    cols: u32,
+    layout: Option<&BundleLayout>,
+) -> Result<(), String> {
+    match layout {
+        Some(l) => l.check_window(h.name(), h.layout(), off_elems, rows, cols, what),
+        None => crate::placement::window_fits_declared(
+            h.name(),
+            h.layout(),
+            off_elems,
+            rows,
+            cols,
+            what,
+        ),
     }
 }
 
@@ -699,7 +910,19 @@ pub(crate) fn pointwise_broadcast_opspec_df(
         df,
     };
     pointwise_broadcast_opspec_from_tile(
-        &tile_op, rows, cols, op, inputs, o_name, out_offset, head_major, layout, division,
+        &tile_op,
+        rows,
+        cols,
+        op,
+        inputs,
+        o_name,
+        out_offset,
+        head_major,
+        layout,
+        // This door is the ungathered family's: the elementwise law, wrapped for the shared
+        // builder's `CoreDivision` (a gathered op's own split is a `GatherSplit`, minted by its
+        // leg — see `one_gathered_leg`).
+        crate::work::CoreDivision::Ew(division),
     )
 }
 
@@ -760,6 +983,7 @@ fn sfp_rank1_opspec(
         tiled_symbols: vec![],
         time_tile: None,
         indirect: None,
+        coordinate_mask: None,
     })
 }
 
@@ -866,13 +1090,14 @@ pub struct PointwiseGather<'a, O: KindTag> {
     /// The index buffer's operand spelling — `crate::place::act_name(index_tid)`, the same form every
     /// data operand here uses, so it resolves through the SAME [`BundleLayout`].
     pub index_name: &'a str,
-    /// ⭐ WHERE THIS GATHER'S RUN OF ENTRIES STARTS IN THE INDEX BUFFER — the program's own anchor
-    /// for this gather ([`Gather::first_entry`]), in ENTRIES. Zero for every gather whose index is
-    /// read from its start; an unrolled sweep's trip `b` states `b · BLOCK_N`, and each leg below
-    /// ADDS its own stick offset to it, so a trip's leg `k` reads index words
-    /// `[first_entry + k·32, first_entry + (k+1)·32)` of the SAME buffer the one-block form reads
-    /// from its start. An [`EntryBase`], so it is stick-aligned by construction (issue 201 item 7).
-    pub first_entry: crate::superdsc_opspec::EntryBase,
+    /// ⭐ THIS GATHER'S INDEX RUN — the stick-aligned start (the program's own anchor, in ENTRIES:
+    /// zero for every gather whose index is read from its start; an unrolled sweep's trip `b`
+    /// states `b · BLOCK_N`) plus the WHOLE STICKS the node's entries span. A [`StickRun`], so a
+    /// mid-stick run cannot be stated: the per-J merge form's run at entry 8 has no spelling, and
+    /// a kernel asking for one is refused at the walk that builds this value. Each leg below is
+    /// the run's own [`StickRun::leg`] — one stick, `k` sticks in — so the leg stride and the
+    /// run's span are the same unit by construction (issue 201 item 7's run half).
+    pub run: crate::superdsc_opspec::StickRun,
     pub o: &'a Stk<O>,
 }
 
@@ -933,7 +1158,7 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
         inputs,
         gathered_input,
         index_name,
-        first_entry,
+        run,
         o,
     } = g;
     // ⛔ THE GATHERED INPUT MUST BE THE **LAST** ONE, because that is the only position at which the
@@ -961,6 +1186,14 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
             inputs.len()
         )));
     }
+    // ⭐ THE OUTPUT MINT for the WHOLE NODE: the legs below each write a row window of the SAME
+    // output in place (together `[0, rows)`), so the node's full window is the bound every leg's
+    // write sits inside — `first_row·lanes + leg_rows·stick_elems ≤ rows·stick_elems` holds for
+    // every leg because `lanes ≤ stick_elems` and `first_row + leg_rows ≤ rows`. Checked once
+    // here, against the output handle's declared shape and placement. The legs' INPUTS are
+    // minted per-leg in `pointwise_broadcast_opspec_from_tile` (the leg's own tile carries
+    // `leg_rows`, so each broadcast form is checked at the rows that actually sweep it).
+    mint_ew_output(op_name, o, 0, rows, cols, tile_op.df, layout).map_err(SuperDscError)?;
     // ⭐ THE ENTRY COUNT, DERIVED BEFORE ANY OP IS BUILT — because it decides how many ops there are.
     // The page is [`PageExtent::single_position`] for a table lookup (one entry IS one row, see the
     // header); it is named ONCE here and handed to every leg, so the number this function counts
@@ -974,6 +1207,23 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
         ))
     })?;
     let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
+    // ⛔ THE RUN'S SPAN AND THE NODE'S ENTRIES ARE THE SAME FACT STATED TWICE, AND THE TYPE IS WHAT
+    // LETS THEM BE CHECKED AGAINST EACH OTHER. The cut below emits one op per index stick, so the
+    // stick count it cuts into IS the run's span; a caller that hand-built a shorter run (or
+    // stated the node's rows independently of the run it handed) would emit legs reading past the
+    // sticks the run declared — another run's words, converted as this one's page addresses.
+    // Refused here, by name, where both numbers are in hand.
+    let legs = entries.div_ceil(cap);
+    if legs != run.sticks() {
+        return Err(SuperDscError(format!(
+            "{op_name}: this node consumes {entries} index entries, which spans {legs} stick(s), but \
+             its gather run declares a span of {} stick(s) starting at stick {}. The cut emits one \
+             op per stick of the RUN, so the two must agree — a run shorter than the node reads \
+             index sticks it never declared, and a longer one leaves sticks no leg loads.",
+            run.sticks(),
+            run.start().sticks(),
+        )));
+    }
     // The OUTPUT kind drives the layout, exactly as in the sibling assemblers: a `Stk<FlatTag>` output
     // is a head-major rank-3 op, a `Stk<RowBlockedTag>` output is the rank-2 stick-major token stream.
     let head_major = O::kind() == StickKind::Flat;
@@ -994,11 +1244,11 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
                 gathered_input,
                 index_name,
                 page,
-                // ⭐ THE NODE'S OWN ANCHOR — the whole run starts where the program says, which is
-                // index word `first_entry` (an uncut gather's run and a one-stick gather's are both
-                // the program's own; only the CUT below adds to it). Stick-aligned, checked here:
-                // the IBR is loaded one `SenUint32` stick at a time.
-                first_entry,
+                // ⭐ THE NODE'S OWN RUN — the whole run is the program's, uncut (an uncut gather's
+                // run and a one-stick gather's are both the program's own; only the CUT below
+                // slices it per stick). The [`StickRun`] carries the stick-aligned start and the
+                // one-stick span together, so the leg states exactly what the IBR loads.
+                run,
                 o_name: o.name(),
                 head_major,
             },
@@ -1099,17 +1349,16 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
                 gathered_input,
                 index_name,
                 page,
-                // ⭐ THE RUN'S BASE IN THE INDEX TENSOR — the program's own anchor PLUS this leg's
-                // own stick offset, both in ENTRIES. Leg `k` of a run starting at the program's
-                // `first_entry` reads index words `[first_entry + k·cap, first_entry + k·cap +
-                // leg_rows/page)`, and dropping either term is every leg reading the run's first
-                // stick (the `EntryBase` type exists because the run-half of that happened).
-                // MEASURED: leg `k`'s index `allocate` starts 128 B = one 32-entry `SenUint32`
-                // stick further on than leg `k-1`'s, for all eight. `of_entries` IS the alignment
-                // check — it refuses both an unaligned program anchor and a leg stride that is
-                // not a whole stick (a `cap` change that breaks the stride fails HERE, at bake
-                // time, instead of gathering another run's rows on card).
-                first_entry: first_entry.plus_entries(k * cap).map_err(SuperDscError)?,
+                // ⭐ THE RUN'S OWN LEG `k` — one stick, `k` sticks in, both facts from the run
+                // itself ([`StickRun::leg`]). Leg `k` of a run starting at the program's anchor
+                // reads index words `[start + k·32, start + k·32 + leg_rows/page)`, and dropping
+                // either term is every leg reading the run's first stick (the `EntryBase` type
+                // exists because the run-half of that happened). MEASURED: leg `k`'s index
+                // `allocate` starts 128 B = one 32-entry `SenUint32` stick further on than leg
+                // `k-1`'s, for all eight — and the leg stride being one stick BY CONSTRUCTION is
+                // what `of_sticks` states, where `plus_entries` used to check it (a `cap` change
+                // that broke the stride would now fail to compile against `leg`, not bake).
+                run: run.leg(k).map_err(SuperDscError)?,
                 o_name: o.name(),
                 head_major,
             },
@@ -1145,7 +1394,10 @@ struct GatherLeg<'a> {
     gathered_input: usize,
     index_name: &'a str,
     page: crate::superdsc_opspec::PageExtent,
-    first_entry: crate::superdsc_opspec::EntryBase,
+    /// THIS leg's index run — one whole stick at the run's own leg-`k` start ([`StickRun::leg`]).
+    /// A [`StickRun`] and not a bare base, so a leg cannot state more than one stick of index
+    /// (the wrap the one-stick guard below refuses) or start between sticks (the IBR law).
+    run: crate::superdsc_opspec::StickRun,
     o_name: &'a str,
     head_major: bool,
 }
@@ -1168,7 +1420,7 @@ fn one_gathered_leg(
         gathered_input,
         index_name,
         page,
-        first_entry,
+        run,
         o_name,
         head_major,
     } = leg;
@@ -1194,6 +1446,24 @@ fn one_gathered_leg(
             .collect(),
         df: tile_op.df,
     };
+    // ⭐⭐⭐ THE LEG'S CORE SPLIT IS A `GatherSplit` — MINTED FROM THE LEG'S OWN FACTS, before any
+    // operand is built. Only the entry axis (`mb`) may carry a split: dxp derives `skip_addr`
+    // from the per-core extents of the unpinned dims, so a split elsewhere shrinks what one
+    // index entry covers and every index step lands a fraction of a row short, from a clean
+    // bake (the prefill attention kernel's leg t6 measured it: 8 entries on 32 cores left
+    // `distribute_cores` to split `out` 4 ways). The mint refuses the shapes the bytes do not
+    // support — no `mb` to enumerate, or a partial entry — and otherwise runs on
+    // `min(entries, cores)` cores over `mb` alone (ruling 10-20: the KV copy and the gathered
+    // matmul are card-proven at fewer cores than the machine; the idle cores are never filled
+    // by splitting another axis), so this leg cannot be built with any other division: the
+    // walk check this replaces IS the constructor now, and a wrong division is unrepresentable
+    // rather than inspected.
+    let split = crate::work::GatherSplit::over_entries(
+        &leg_tile.dims,
+        crate::superdsc_opspec::MAX_CORES,
+        page.get(),
+    )
+    .map_err(|e| SuperDscError(format!("{op_name}: leg `{leg_name}`: {e}")))?;
     let mut op = pointwise_broadcast_opspec_from_tile(
         &leg_tile,
         leg_rows,
@@ -1208,9 +1478,7 @@ fn one_gathered_leg(
         crate::addr::OutCorner::ZERO,
         head_major,
         layout,
-        // ⛔ ROWS FIRST, STATED: the gather's index enumerates `mb` in whole entries
-        // (`attach_gather_index` refuses a plan with no `mb` split to enumerate), so `mb` takes the cores.
-        crate::work::EwDivision::RowsFirst,
+        crate::work::CoreDivision::Gathered(split),
     )
     .map_err(SuperDscError)?;
     // ⭐⭐⭐ THE ROW WINDOW: THE ONLY BYTE OF THE OUTPUT OPERAND THE CUT MOVES.
@@ -1257,7 +1525,7 @@ fn one_gathered_leg(
                 // ⛔ NO SECOND PAGED AXIS. `out` is the factor `skip_addr` is made of; pinning it too
                 // would collapse an entry to a single element.
                 per_position: None,
-                first_entry,
+                first_entry: run.start(),
             },
             gathered_input,
         )
@@ -1283,62 +1551,27 @@ fn one_gathered_leg(
         ))
     })?;
     let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
-    if entries > cap {
+    if entries > cap || run.sticks() > 1 {
         return Err(SuperDscError(format!(
             "{op_name}: leg `{leg_name}` declares {entries} index entries ({leg_rows} `{}` \
-             position(s) / a {}-position page), and ONE gather op's index is ONE {cap}-entry stick. \
-             dxp fills the L3LU IBR with a single stick transfer and each core indexes it at its own \
-             work-slice word, so entries past the first {cap} WRAP — MEASURED on the card through this \
-             door: every output row `r` held the row `ids[r mod {cap}]` names, rows 0..{} exact and \
-             the whole tensor at 0.130597 with the right rms. Cut the node into one leg per index \
-             stick.",
+             position(s) / a {}-position page) over a run spanning {} stick(s), and ONE gather op's \
+             index is ONE {cap}-entry stick. dxp fills the L3LU IBR with a single stick transfer and \
+             each core indexes it at its own work-slice word, so entries past the first {cap} WRAP — \
+             MEASURED on the card through this door: every output row `r` held the row `ids[r mod \
+             {cap}]` names, rows 0..{} exact and the whole tensor at 0.130597 with the right rms. Cut \
+             the node into one leg per index stick.",
             ia.entry_dim.dim(),
             ia.page.get(),
+            run.sticks(),
             cap - 1,
         )));
     }
-    // ⛔⛔⛔ ONLY THE ENTRY AXIS MAY CARRY A SPLIT, AND THIS IS THE HALF OF `gather_copy_opspec`'S
-    // REASONING THAT TRANSFERS TO ANY GATHER.
-    //
-    // dxp derives `skip_addr` as `page x the PER-CORE extents of the UNPINNED dims`
-    // (`getBufferCapacityForNodePerDim`, reproduced by `zz_skip_addr_computed_from_our_own_emission.rs`),
-    // so a split `out` DIVIDES the entry by the core count: at `cols = 4096` split 2 ways, `skip_addr`
-    // is 2048 against a host staging row numbers in units of 4096 — a clean bake whose every index step
-    // lands half a row short, i.e. fluent text assembled from two different rows. dbo also reduces the
-    // value tensor's per-core starts to a single `min` before deriving any address
-    // (`computeGatherMetadata`), so a core owning a COLUMN SLICE of an entry loses that slice and reads
-    // the entry from its start.
-    //
-    // ⭐ SPLITTING THE ENTRY AXIS IS THE ONE DIVISION THAT SURVIVES BOTH: a core owns whole entries,
-    // each row's base comes from the index, and the per-core index offset is carried through the
-    // conversion (`allocateAndModifyGather` preserves it "by computing the delta from the original
-    // minimum address and applying it uniformly"). `distribute_cores` splits `mb` first and spends only
-    // what is left on the other axes, so this is the division it already makes whenever the row count
-    // reaches the core count — and where it does not (a 1-row lookup, whose cores must come from `out`)
-    // this is an `Err` naming the axis rather than a descriptor whose cores all read column 0.
-    //
-    // ⛔ IT LIVES HERE RATHER THAN IN `attach_gather_index` DELIBERATELY. That door is shared with the
-    // KV paths, whose own divider (`gather_copy_cores`) already satisfies this by construction; adding a
-    // blanket refusal there would change a card-measured mechanism to restate what one of its callers
-    // already guarantees. Promoting it is a question for that door's two existing callers, not a thing
-    // to decide from here.
+    // (The work-division inspection that lived here — "only the entry axis may carry a split",
+    // with the `skip_addr` derivation and the leg-t6 measurement — is `GatherSplit`'s own
+    // constructor now, called above: the leg's split is minted `mb`-only before any operand is
+    // built, so there is no division left to inspect and no way to state one that would shrink
+    // an entry. The law and its card measurements live in `crate::work::GatherSplit`'s doc.)
     let entry_axis = ia.entry_dim.dim();
-    if let Some(d) = op
-        .iter
-        .dims()
-        .iter()
-        .find(|d| d.name != entry_axis && op.iter.split_of(d.name) > 1)
-    {
-        return Err(SuperDscError(format!(
-            "{op_name}: leg `{leg_name}`'s work division splits `{}` {} ways, and only the entry axis \
-             (`{entry_axis}`) may carry a split. dxp derives `skip_addr` from the PER-CORE extents of \
-             the unpinned dims, so a split elsewhere shrinks what one index entry covers — every index \
-             step then lands a fraction of a row short, from a clean bake. Give the op enough rows for \
-             `distribute_cores` to spend its cores on `{entry_axis}` alone.",
-            d.name,
-            op.iter.split_of(d.name)
-        )));
-    }
     let folds = SdscFoldSet::new(op.iter.cores_used());
     let mut emitted = emit_sdsc_tiled(leg_name, &op, &folds, sym_id_base, layout)?;
     // ⭐⭐⭐⭐⭐ `N_` CARRIES THE **TENSOR'S** ROW COUNT, NOT THE LEG'S — THE ONE NUMBER THE CUT CHANGES
@@ -1609,6 +1842,12 @@ pub fn assemble_pointwise_broadcast_divided<O: KindTag>(
     } = p;
     let rows = rows.get();
     let cols = cols.get();
+    // ⭐ THE OUTPUT MINT — the output window `rows × stick-padded cols` at the corner, checked
+    // against the output handle's declared shape and placement before any op is built (the
+    // write-side twin of the input mint in `pointwise_broadcast_opspec_from_tile`, which runs
+    // inside the funnel call below).
+    mint_ew_output(op_name, o, out_offset.elems(), rows, cols, Df::Fp16, layout)
+        .unwrap_or_else(|e| panic!("assemble_pointwise_broadcast {op_name}: {e}"));
     // The OUTPUT type drives the layout: a `Stk<FlatTag>` output IS a head-major (per-head attention)
     // op — rank-3 flat; a `Stk<RowBlockedTag>` output is the residual token stream (rank-2 stick-major).
     // So `head_major` is DERIVED from the output kind (no redundant bool that could disagree with it).
@@ -1708,6 +1947,12 @@ pub fn assemble_broadcast_mul_gate(
     o_name: &str,
 ) -> EmittedOp {
     let mut sym = 0i64;
+    // ⭐ TRUE EXTENTS, not `rbo`'s `1×64` annotation: x and the output are the probe's own
+    // `[rows, cols]` tensors, and v is the `[rows, one-stick]` column the out-broadcast read sweeps
+    // (ONE STICK PER ROW — the RedStick law `EwOperand::swept_extents` states). The probe creates
+    // its tensors only in the descriptor (`layout: None`), so the handle IS the statement; the mint
+    // reads the dims as the bound.
+    let (r, c) = (rows.get(), cols.get());
     // "multiply" is the INTERNAL op_func_from_str key (→ OpFunc::Multiply, whose
     // wire name() is "mul"); passing "mul" would miss the match and default to Add.
     assemble_pointwise_broadcast(
@@ -1716,14 +1961,14 @@ pub fn assemble_broadcast_mul_gate(
         rows,
         cols,
         &[
-            In::full(&rbo(x_name)).ew(),
+            In::full(&rb(x_name, r, c)).ew(),
             EwOperand {
                 mb_broadcast: false,
                 out_broadcast: true,
-                ..In::full(&rbo(v_name)).ew()
+                ..In::full(&rb(v_name, r, Fp16::ELEMS_PER_STICK)).ew()
             },
         ],
-        &rbo(o_name),
+        &rb(o_name, r, c),
         &mut sym,
         None, // gate probe (not in the walk) → no global layout
     )
@@ -1805,6 +2050,7 @@ fn slice_add_gate_opspec(rows: u32, half: u32, x: &str, o: &str) -> Result<OpSpe
         tiled_symbols: vec![],
         time_tile: None,
         indirect: None,
+        coordinate_mask: None,
     })
 }
 
@@ -3685,6 +3931,39 @@ pub fn emit_sdsc(
             OpInfo::None | OpInfo::FusedEpilogue { .. } => serde_json::json!({}),
         }
     };
+    // ⭐ THE SAMV COORDINATE MASK (a padded reduce's identity-valued padding): when the op
+    // states one, its `samv-maskvalue` constant is APPENDED here at the next insertion index —
+    // the vendor's own rule (`constants["samv-maskvalue"] = _get_mask_value(op)` then
+    // `masking_const_id = len(constants)`, codegen/superdsc.py:2357-2365) — so the id is the
+    // index the appended entry occupies and can never collide with the scaling/exx2 entries
+    // above. `mask_bits` is the RAW SEN169 word (`0xFFFE` = the DDL's own negInf pattern for
+    // `max`, 0 otherwise), NOT a `sen169_bits` encoding: the backend's own multi-row max
+    // fixture pins the wire value (`"65534"`, `ddc/ddl_templates/test/sdsc_max.json`). See
+    // [`crate::superdsc_opspec::SamvCoordinateMask`] for the full law.
+    //
+    // The same mask feeds the two DSC-level fields: `coordinateMasking_` dims in ELEMENTS
+    // ([[valid, pad]] — valid + pad = the stick-padded extent) and the appended constant's id.
+    // Both stay empty/-1 for every stick-aligned reduce, byte-identical to before this field
+    // existed. The fixture's own `maskingConstId_: 8` counts ITS eight preceding constants;
+    // ours is 1 — `scaling_factor` occupies "0".
+    let (constant_info, coordinate_masking, masking_const_id) = match op.coordinate_mask {
+        None => (constant_info, BTreeMap::new(), -1),
+        Some(m) => {
+            let mut entries = constant_info.as_object().cloned().unwrap_or_default();
+            let idx = entries.len() as i64;
+            entries.insert(
+                idx.to_string(),
+                serde_json::json!({
+                    "dataFormat_": "SEN169_FP16",
+                    "name_": "samv-maskvalue",
+                    "data_": fold_manager_const(m.mask_bits, folds)
+                }),
+            );
+            let mut dims: BTreeMap<String, Vec<[i64; 2]>> = BTreeMap::new();
+            dims.insert(m.dim.to_string(), vec![[m.valid as i64, m.pad as i64]]);
+            (serde_json::Value::Object(entries), dims, idx)
+        }
+    };
     // torch-spyre's `generate_constant_info` returns the JSON *string* "{}" for the
     // EMPTY case and a DICT only when populated. VERIFIED on the REAL frontend (compiled
     // `torch.rsqrt` + `F.rms_norm`): rsqrt/add/mul → `"constantInfo_": "{}"` (a str), the
@@ -3745,8 +4024,8 @@ pub fn emit_sdsc(
         numCoreletsUsed_: folds.corelet_fold(),
         coreIdsUsed_: (0..cores).collect(),
         N_: n_space,
-        coordinateMasking_: BTreeMap::new(),
-        maskingConstId_: -1,
+        coordinateMasking_: coordinate_masking,
+        maskingConstId_: masking_const_id,
         dataStageParam_: BTreeMap::from([("0".to_string(), stage)]),
         primaryDsInfo_: primary,
         scheduleTree_: tree,
@@ -3909,6 +4188,19 @@ pub fn rb(name: &str, rows: u32, cols: u32) -> Stk<RowBlockedTag> {
         .expect("token-stream matmul operand is RowBlocked by construction")
 }
 
+/// [`rb`] at the operand's OWN df — the fp8 activation's handle. The kind is annotation-only to the
+/// emit (the OpSpec carries the real df), but the WINDOW MINT's placement door prices bytes at the
+/// handle's word length, so a buffer whose elements are 1 byte must not be annotated at 2: every
+/// window over it would be overstated 2× and the last slot's legal convert would refuse. Same
+/// infallibility contract as [`rb`] — only the df reaches the layout.
+pub fn rb_df(name: &str, rows: u32, cols: u32, df: Df) -> Stk<RowBlockedTag> {
+    Stk::<RowBlockedTag>::new(
+        name,
+        StickLayout::row_blocked_df(rows as usize, cols as usize, df),
+    )
+    .expect("token-stream matmul operand is RowBlocked by construction")
+}
+
 /// Mint a `Flat` (head-major, row-major) output handle `[rows, cols]` — the per-head attention
 /// pointwise/reduce path (`head_major`). Its `Stk<FlatTag>` type is what the builder reads to know the
 /// op is head-major (a `RowBlocked` output ⇒ residual token stream). df annotation-only.
@@ -3934,6 +4226,7 @@ pub struct In<'a, K: KindTag> {
     h: &'a Stk<K>,
     mb_broadcast: bool,
     out_broadcast: bool,
+    y_broadcast: u32,
     col_offset: u32,
     col_window: Option<crate::addr::ColWindow>,
 }
@@ -3944,6 +4237,7 @@ impl<'a, K: KindTag> In<'a, K> {
             h,
             mb_broadcast: false,
             out_broadcast: false,
+            y_broadcast: 0,
             col_offset: 0,
             col_window: None,
         }
@@ -3953,6 +4247,7 @@ impl<'a, K: KindTag> In<'a, K> {
             h,
             mb_broadcast: true,
             out_broadcast: true,
+            y_broadcast: 0,
             col_offset: 0,
             col_window: None,
         }
@@ -3962,6 +4257,7 @@ impl<'a, K: KindTag> In<'a, K> {
             h,
             mb_broadcast: false,
             out_broadcast: true,
+            y_broadcast: 0,
             col_offset: 0,
             col_window: None,
         }
@@ -3971,6 +4267,7 @@ impl<'a, K: KindTag> In<'a, K> {
             h,
             mb_broadcast: false,
             out_broadcast: false,
+            y_broadcast: 0,
             col_offset: col_offset.into_raw_elems(),
             col_window: None,
         }
@@ -3984,6 +4281,7 @@ impl<'a, K: KindTag> In<'a, K> {
             h,
             mb_broadcast: false,
             out_broadcast: false,
+            y_broadcast: 0,
             col_offset: w.dev().into_raw_elems(),
             col_window: Some(w),
         }
@@ -3995,6 +4293,7 @@ impl<'a, K: KindTag> In<'a, K> {
             h,
             mb_broadcast: false,
             out_broadcast: true,
+            y_broadcast: 0,
             col_offset: col_offset.into_raw_elems(),
             col_window: None,
         }
@@ -4005,6 +4304,7 @@ impl<'a, K: KindTag> In<'a, K> {
             h,
             mb_broadcast: true,
             out_broadcast: false,
+            y_broadcast: 0,
             col_offset: 0,
             col_window: None,
         }
@@ -4016,15 +4316,43 @@ impl<'a, K: KindTag> In<'a, K> {
             h,
             mb_broadcast: true,
             out_broadcast: false,
+            y_broadcast: 0,
             col_offset: col_offset.into_raw_elems(),
+            col_window: None,
+        }
+    }
+    /// ⭐⭐⭐ THE ROW-SPLIT (Y) BROADCAST — a `[mb, out]` source sprayed down the op's LEADING
+    /// `y` dim, `y` sprays deep: the batched paged-decode kernel's J-slot merge (`merged` at
+    /// `[64, 4]`, read by its consumer as the op `[mb = 64, out = 64, y = 4]`). The source is
+    /// addressed as the `[y, mb, out]` frame's `[mb, out]` slice at `y`'s stride-0 — scale
+    /// `y = RedNonStick`, the vendor's reduced-dim law — so flat element `(j, b, c)` reads the
+    /// source's `(b, c)` exactly. The frame law
+    /// ([`crate::sdsc_abstract::RegionFrame::split_rows`]) is checked by the consumer door
+    /// before this operand is built: `rows == y·mb`, the source single-stick. `y`
+    /// must be ≥ 2 — a spray of one is a reshape, not a broadcast, and is refused by the
+    /// admission upstream.
+    pub fn y_broadcast(h: &'a Stk<K>, y: u32) -> Self {
+        assert!(
+            y > 1,
+            "In::y_broadcast: a spray count of {y} is not a broadcast — the leading dim must \
+             spray a real count (the walk's Y admission refuses y == 1 upstream)"
+        );
+        In {
+            h,
+            mb_broadcast: false,
+            out_broadcast: false,
+            y_broadcast: y,
+            col_offset: 0,
             col_window: None,
         }
     }
     pub fn ew(&self) -> EwOperand<'a> {
         EwOperand {
             name: self.h.name(),
+            layout: self.h.layout(),
             mb_broadcast: self.mb_broadcast,
             out_broadcast: self.out_broadcast,
+            y_broadcast: self.y_broadcast,
             col_offset: self.col_offset,
             col_window: self.col_window,
         }
@@ -4258,6 +4586,7 @@ fn convert_opspec(
         tiled_symbols,
         time_tile,
         indirect: None,
+        coordinate_mask: None,
     })
 }
 
@@ -4276,6 +4605,29 @@ pub fn assemble_convert(
 ) -> EmittedOp {
     // TYPED: a dtype-convert's input and output are both the RowBlocked token stream (only the df
     // changes — fp16→fp32 / fp16→fp8); the handle carries only `.name()`, so the emit is byte-identical.
+    //
+    // ⭐ AND NOW MINTED: the whole-tensor window `[rows, cols]` at 0 against BOTH doors, on each side
+    // at its own df — the #731 law for this family (an op sweeping past its tensor is a defect in the
+    // computation that produced the offset; it cannot compile). The output handle's df is the OUTPUT's
+    // own (`rb_df`), so the placement door prices its bytes at one byte per fp8 element.
+    mint_full_window(
+        &format!("{op_name}: operand '{}'", in_.name()),
+        in_,
+        0,
+        rows,
+        cols,
+        layout,
+    )
+    .unwrap_or_else(|e| panic!("assemble_convert {op_name}: {e}"));
+    mint_full_window(
+        &format!("{op_name}: output '{}'", o.name()),
+        o,
+        0,
+        rows,
+        cols,
+        layout,
+    )
+    .unwrap_or_else(|e| panic!("assemble_convert {op_name}: {e}"));
     let op = convert_opspec(op_func_from_str(op_func), rows, cols, in_.name(), o.name())
         .unwrap_or_else(|e| panic!("assemble_convert {op_name}: {e}"));
     let folds = SdscFoldSet::new(op.iter.cores_used());
@@ -4283,49 +4635,15 @@ pub fn assemble_convert(
         .unwrap_or_else(|e| panic!("assemble_convert {op_name}: {e}"))
 }
 
-/// Assemble a dtype-convert op over an OFFSET SLICE of its operands (see [`convert_opspec`]):
-/// `in_off`/`o_off` are ELEMENT offsets along each operand's OWN df (the fp16 input counts fp16
-/// elements, the fp8 output fp8 elements), applied via [`AnyTensorArg::set_offset_elems`] before
-/// emit — the same plumbing the windowed matmul and the offset reduce use. ⛔ m=1 ONLY: the offset
-/// is a FLAT stick-axis slice, which addresses a single-row buffer's column window; at rows>1 a
-/// column window of a stick-major tensor is NOT contiguous (see `reduce_opspec_off`'s
-/// block-alignment law), so the per-pair caller routes `pairs > 1 ∧ m > 1` to
-/// [`assemble_convert_col`], the DevOff twin. Emit-time panic on a malformed spec = a `cargo build`
-/// error (guard-every-crash), same as the other `assemble_*`.
-#[allow(clippy::too_many_arguments)]
-pub fn assemble_convert_off(
-    op_name: &str,
-    op_func: &str,
-    rows: u32,
-    cols: u32,
-    in_: &Stk<RowBlockedTag>,
-    in_off: u32,
-    o: &Stk<RowBlockedTag>,
-    o_off: u32,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> EmittedOp {
-    // TYPED, same as `assemble_convert`: both operands are the RowBlocked token stream and the
-    // handles carry only `.name()` — the offsets ride the args, not the handles.
-    let mut op = convert_opspec(op_func_from_str(op_func), rows, cols, in_.name(), o.name())
-        .unwrap_or_else(|e| panic!("assemble_convert_off {op_name}: {e}"));
-    for (arg, off) in op.args.iter_mut().zip([in_off, o_off]) {
-        arg.set_offset_elems(off);
-    }
-    let folds = SdscFoldSet::new(op.iter.cores_used());
-    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_convert_off {op_name}: {e}"))
-}
-
 /// Assemble a dtype-convert op over a COLUMN WINDOW of its operands (see [`convert_opspec`]):
 /// `in_off`/`o_off` are [`crate::addr::DevOff`]s — nest-derived column offsets built by
 /// [`crate::addr::col_of`], so the `(c/lanes)·(rows·lanes)` group-corner term of the stick-major
-/// layout is present by construction (a flat stick-axis slice drops it, which is why the m=1 twin
-/// [`assemble_convert_off`] cannot serve rows>1 — see `reduce_opspec_off`'s block-alignment law).
-/// The m>1 twin the per-pair quantize tail routes to when `pairs > 1 ∧ m > 1`: the same
-/// `set_offset_elems` plumbing the windowed matmul and the offset reduce use, at DevOff precision.
-/// Emit-time panic on a malformed spec = a `cargo build` error (guard-every-crash), same as the
-/// other `assemble_*`.
+/// layout is present by construction. ⛔ THE ONE CONVERT DOOR FOR EVERY `m`: at `m == 1` a
+/// `col_of` corner degenerates to the flat stick-axis slice exactly (one row ⇒ no group-corner
+/// term), so the per-pair quantize tail's decode arm routes HERE too and the raw-`u32` twin that
+/// used to serve it (`assemble_convert_off`, flat offsets with no nest behind them) is deleted —
+/// there is no convert door left that takes an offset no nest minted. Emit-time panic on a
+/// malformed spec = a `cargo build` error (guard-every-crash), same as the other `assemble_*`.
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_convert_col(
     op_name: &str,
@@ -4339,8 +4657,32 @@ pub fn assemble_convert_col(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
-    // TYPED, same as `assemble_convert_off`: both operands are the RowBlocked token stream and
-    // the handles carry only `.name()` — the offsets ride the args, not the handles.
+    // TYPED, same as `assemble_convert`: both operands are the RowBlocked token stream and the
+    // handles carry only `.name()` — the offsets ride the args, not the handles.
+    //
+    // ⭐ AND MINTED at the corner, both doors, each side at its own df — the #731 law for the
+    // per-slot convert: slot `s`'s window `[rows, cols]` at `s·inn`/`s·inn_pad` must fit the
+    // FULL-buffer handles the caller trued (`cl_reach`/`k_pad`), which is exactly the arithmetic
+    // `cl_reach = (pairs−1)·inn + inn_pad` states — the last slot's window ends at the buffer's own
+    // end, so a caller that shrinks either side without re-deriving the other is a build failure.
+    mint_full_window(
+        &format!("{op_name}: operand '{}'", in_.name()),
+        in_,
+        in_off.into_raw_elems() as u64,
+        rows,
+        cols,
+        layout,
+    )
+    .unwrap_or_else(|e| panic!("assemble_convert_col {op_name}: {e}"));
+    mint_full_window(
+        &format!("{op_name}: output '{}'", o.name()),
+        o,
+        o_off.into_raw_elems() as u64,
+        rows,
+        cols,
+        layout,
+    )
+    .unwrap_or_else(|e| panic!("assemble_convert_col {op_name}: {e}"));
     let mut op = convert_opspec(op_func_from_str(op_func), rows, cols, in_.name(), o.name())
         .unwrap_or_else(|e| panic!("assemble_convert_col {op_name}: {e}"));
     for (arg, off) in op.args.iter_mut().zip([in_off, o_off]) {
@@ -4630,6 +4972,7 @@ fn transpose_opspec(mb: u32, out: u32, in_name: &str, o_name: &str) -> Result<Op
         tiled_symbols,
         time_tile,
         indirect: None,
+        coordinate_mask: None,
     })
 }
 
@@ -5005,6 +5348,7 @@ mod transpose_tests {
             bindings: vec![BufferId::new(101), BufferId::new(102)],
             mask: None,
             node_out_tid: None,
+            minted: Default::default(),
         }
     }
 
@@ -5291,227 +5635,13 @@ mod transpose_stick_law {
     }
 }
 
-/// Build the typed [`OpSpec`] for a `restickify` — a DEPLOYED device dim-reorder
-/// (vs the UNDEPLOYED `interslicetranspose`). Reorders `in_name` `[mb,out]`
-/// (sticked on `out`) → `o_name` `[out,mb]` (sticked on `mb`): the SAME logical
-/// data re-tiled so a downstream matmul reads it in the KERNEL `[in,out]` layout
-/// WITHOUT a fused bmm-transpose (which SIGABRTs in dxp_standalone — IBM #1731).
-/// torch-spyre inserts exactly this for a transposed matmul input
-/// (test_padding.py: "restickify reorders x's device dims").
-///
-/// Used by in-bundle attention to turn the natural-written K cache `[cap,hd]`
-/// (hd-sticked, the contiguous per-slot write layout) into the prefix-score
-/// kernel layout `[hd,cap]` (cap-sticked) on-card, resident — no host, no
-/// re-upload. The OUTPUT carries the reorder via its `layoutDimOrder_`
-/// (`["out","mb"]`) + `stickDimOrder_` (`["mb"]`), distinct from the INPUT's
-/// (`["mb","out"]` / `["out"]`); the normal emit branch handles distinct sticks
-/// (no Transpose-style 8×8 override).
-///
-/// ⚠️ POD-CONFIRM (SDK `dscdefn.cpp opFuncsToString` + a restickify golden): the
-/// exact `opFuncName`, `exUnit`, and the precise output layoutDimOrder/stickDimOrder
-/// the deployed template expects. `mb` (the output stick) MUST be 64-aligned.
-fn restickify_opspec(
-    batch: u32,
-    cap: u32,
-    hd: u32,
-    in_name: &str,
-    o_name: &str,
-) -> Result<OpSpec, String> {
-    // Dim names + stick roles match the dxp-validated golden sdsc_restickify.json
-    // EXACTLY: `out` = INPUT stick (carries hd), `y` = OUTPUT stick (carries cap),
-    // `mb` = the preserved batch (nqh heads — golden had mb=1; we ride nqh here).
-    // BOTH the input stick (hd→out) and output stick (cap→y) must be whole 64-sticks.
-    let _out_ext = StickExtent::<Fp16>::new(hd)?;
-    let _y_ext = StickExtent::<Fp16>::new(cap)?;
-    // BOTH out (input stick) and y (output stick) are 64-granular split dims — the dual
-    // stick. The golden splits both (out:2 × y:9 = 18 cores); marking only one leaves the
-    // other with no stick-multiple candidate → scheduler "no valid candidate". (matmul
-    // likewise has two stick dims: out + in.) mb (nqh) is the non-stick preserved batch.
-    let dims = vec![
-        ItDim {
-            name: "mb",
-            size: batch.max(1),
-            is_reduction: false,
-            is_stick: false,
-            df: Df::Fp16,
-        },
-        ItDim {
-            name: "out",
-            size: hd,
-            is_reduction: false,
-            is_stick: true,
-            df: Df::Fp16,
-        },
-        ItDim {
-            name: "y",
-            size: cap,
-            is_reduction: false,
-            is_stick: true,
-            df: Df::Fp16,
-        },
-    ];
-    let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, distribute_cores)?;
-    let device_dims = plan.iter_syms(["mb", "out", "y"]);
-    // INPUT: layout `[mb,out,y]` sticked on `out` (hd-sticked = the natural cache write
-    // layout). OUTPUT: layout KEEPS `[mb,out,y]` but sticks on `y` (cap-sticked = the
-    // transposed-kernel layout the score bmm reads). Same dim ORDER (batch `mb`=nqh
-    // OUTERMOST ⇒ each head's [hd,cap] block is CONTIGUOUS), only the stick axis swaps
-    // out→y — THE restickify. Batch-outermost is REQUIRED: the per-batch score bmm
-    // ([`matmul_opspec_batched`]) reads kc_t as KERNEL `[y,in,out]`=[nqh,hd,cap] and
-    // advances one `hd·cap` block per head; the OLD `[out,y,mb]` output put heads
-    // INNERMOST (interleaved) → per-head bytes wrong (the 5-attempt failure root).
-    let input = TensorArg::<3>::new(
-        true,
-        in_name.to_string(),
-        Role::Input,
-        [Scale::Active, Scale::Active, Scale::Active],
-        device_dims,
-        ["mb", "out", "y"],
-        "out",
-        Allocation::Hbm,
-    )
-    .map_err(|e| e.0)?;
-    let output = TensorArg::<3>::new(
-        false,
-        o_name.to_string(),
-        Role::Output,
-        [Scale::Active, Scale::Active, Scale::Active],
-        device_dims,
-        ["mb", "out", "y"],
-        "y",
-        Allocation::Hbm,
-    )
-    .map_err(|e| e.0)?;
-    Ok(OpSpec {
-        op: OpFunc::Restickify,
-        is_reduction: false,
-        iter: plan,
-        args: vec![AnyTensorArg::R3(input), AnyTensorArg::R3(output)],
-        op_info: OpInfo::None,
-        tiled_symbols: vec![],
-        time_tile: None,
-        indirect: None,
-    })
-}
-
-/// Assemble a complete SuperDSC `restickify` reordering `in_name` `[mb,out]`
-/// (sticked on `out`) → `o_name` `[out,mb]` (sticked on `mb`). See
-/// [`restickify_opspec`]. The deployed on-card transpose primitive.
-#[allow(clippy::too_many_arguments)]
-pub fn assemble_restickify(
-    op_name: &str,
-    batch: u32,
-    cap: u32,
-    hd: u32,
-    in_name: &str,
-    o_name: &str,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> EmittedOp {
-    let op = restickify_opspec(batch, cap, hd, in_name, o_name)
-        .unwrap_or_else(|e| panic!("assemble_restickify {op_name}: {e}"));
-    let folds = SdscFoldSet::new(op.iter.cores_used());
-    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_restickify {op_name}: {e}"))
-}
-
-/// [`restickify_opspec`] with per-operand ELEMENT offsets — for the PER-HEAD restickify
-/// (batch=1, head h's `[cap,hd]→[hd,cap]` block sliced via `in_off=h·cap·hd`,
-/// `out_off=h·hd·cap`). The batched (mb=nqh) restickify mishandles per-head data on-card
-/// (same class as the 3-D-kernel batched-matmul bug — PROVEN via the attn host oracle:
-/// cos 0.72-0.84), so emit nqh single-head restickifies, mirroring the per-head matmul fix.
-#[allow(clippy::too_many_arguments)]
-fn restickify_opspec_off(
-    batch: u32,
-    cap: u32,
-    hd: u32,
-    in_name: &str,
-    o_name: &str,
-    in_off: u32,
-    out_off: u32,
-) -> Result<OpSpec, String> {
-    let _out_ext = StickExtent::<Fp16>::new(hd)?;
-    let _y_ext = StickExtent::<Fp16>::new(cap)?;
-    let dims = vec![
-        ItDim {
-            name: "mb",
-            size: batch.max(1),
-            is_reduction: false,
-            is_stick: false,
-            df: Df::Fp16,
-        },
-        ItDim {
-            name: "out",
-            size: hd,
-            is_reduction: false,
-            is_stick: true,
-            df: Df::Fp16,
-        },
-        ItDim {
-            name: "y",
-            size: cap,
-            is_reduction: false,
-            is_stick: true,
-            df: Df::Fp16,
-        },
-    ];
-    let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, distribute_cores)?;
-    let device_dims = plan.iter_syms(["mb", "out", "y"]);
-    let input = TensorArg::<3>::new(
-        true,
-        in_name.to_string(),
-        Role::Input,
-        [Scale::Active, Scale::Active, Scale::Active],
-        device_dims,
-        ["mb", "out", "y"],
-        "out",
-        Allocation::Hbm,
-    )
-    .map_err(|e| e.0)?
-    .with_offset(in_off);
-    let output = TensorArg::<3>::new(
-        false,
-        o_name.to_string(),
-        Role::Output,
-        [Scale::Active, Scale::Active, Scale::Active],
-        device_dims,
-        ["mb", "out", "y"],
-        "y",
-        Allocation::Hbm,
-    )
-    .map_err(|e| e.0)?
-    .with_offset(out_off);
-    Ok(OpSpec {
-        op: OpFunc::Restickify,
-        is_reduction: false,
-        iter: plan,
-        args: vec![AnyTensorArg::R3(input), AnyTensorArg::R3(output)],
-        op_info: OpInfo::None,
-        tiled_symbols: vec![],
-        time_tile: None,
-        indirect: None,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn assemble_restickify_off(
-    op_name: &str,
-    batch: u32,
-    cap: u32,
-    hd: u32,
-    in_name: &str,
-    in_off: u32,
-    o_name: &str,
-    out_off: u32,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> EmittedOp {
-    let op = restickify_opspec_off(batch, cap, hd, in_name, o_name, in_off, out_off)
-        .unwrap_or_else(|e| panic!("assemble_restickify {op_name}: {e}"));
-    let folds = SdscFoldSet::new(op.iter.cores_used());
-    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_restickify {op_name}: {e}"))
-}
+// ⛔ THE 3-D RESTICKIFY FAMILY IS GONE — `restickify_opspec`/`assemble_restickify` (the batched
+// mb=nqh form), `restickify_opspec_off`/`assemble_restickify_off` (its per-head raw-`u32` twin)
+// and `restickify_v_opspec_2d`/`assemble_restickify_v_2d` (the V-side re-stick, further below) had
+// ZERO callers: the Kᵀ re-stick runs through [`assemble_restickify_kt_2d`] and the value bmm reads
+// the natural V cache directly. The raw-`u32` `in_off`/`out_off` pairs were the last restickify
+// doors with no nest behind them — a caller reintroducing this op writes it against a minted
+// handle at the kt_2d door, so an offset no view computed cannot be stated.
 
 // ════════════════════════════════════════════════════════════════════════════════════════════
 // THE VENDOR TOP-K PAIR — `topk.ddl`'s `topkindex`/`topkvalue`, the selection primitive that
@@ -5758,6 +5888,7 @@ fn topk_opspec(
         tiled_symbols,
         time_tile,
         indirect: None,
+        coordinate_mask: None,
     })
 }
 
@@ -5886,6 +6017,7 @@ fn restickify_kt_opspec_2d(
         tiled_symbols: vec![],
         time_tile: None,
         indirect: None,
+        coordinate_mask: None,
     })
 }
 
@@ -5895,26 +6027,59 @@ fn restickify_kt_opspec_2d(
 /// each door names which quantity fills it, so the pair cannot be handed over swapped.
 /// `in_off`/`out_off` are the per-head element offsets into the natural cache (`head·cap·hd`) and
 /// the Kᵀ scratch (`head·hd·cap`).
+///
+/// ⭐ AND NOW MINTED, BOTH SIDES. The op re-lays one tile — `[slots, feats]` read slab-major,
+/// `[feats, slots]` written slot-major — which is ONE CONTIGUOUS run of `slots·feats` elements at
+/// each corner, so the window the mint bounds is that flat run against the handle's declared
+/// buffer. The handles replace the names: the caller states what each tensor IS (`[mq_pad,
+/// nkvh·hd]` for the roped new-K; the plane totals for the resident caches), and an offset whose
+/// run would cross the tensor's end — the Kᵀ restickify writing past the `[nkvh, hd, mq_pad]`
+/// scratch into the next intermediate's bytes, read back as keys with a clean bake — is a `cargo
+/// build` failure at this door instead.
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_restickify_kt_2d(
     op_name: &str,
     slots: crate::sdsc_abstract::KtTileSlots,
     feats: crate::sdsc_abstract::KtTileFeats,
-    in_name: &str,
+    in_: &Stk<RowBlockedTag>,
     in_off: crate::addr::DevOff,
-    o_name: &str,
+    o: &Stk<RowBlockedTag>,
     out_off: crate::addr::DevOff,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
     let in_off = in_off.into_raw_elems();
     let out_off = out_off.into_raw_elems();
+    // THE TILE'S FLAT RUN — the element range each side touches. Not `[slots, feats]` as a strided
+    // window: the restickify reads its source sticked on the FEATURE axis and writes its output
+    // sticked on the SLOT axis, and both passes walk the SAME contiguous `slots·feats` elements
+    // from their corner (the addressing doc in `restickify_kt_opspec_2d`). One flat window states
+    // exactly the bytes either side can reach.
+    let run = slots.extent().saturating_mul(feats.extent());
+    mint_full_window(
+        &format!("{op_name}: operand '{}'", in_.name()),
+        in_,
+        in_off as u64,
+        1,
+        run,
+        layout,
+    )
+    .unwrap_or_else(|e| panic!("assemble_restickify_kt_2d {op_name}: {e}"));
+    mint_full_window(
+        &format!("{op_name}: output '{}'", o.name()),
+        o,
+        out_off as u64,
+        1,
+        run,
+        layout,
+    )
+    .unwrap_or_else(|e| panic!("assemble_restickify_kt_2d {op_name}: {e}"));
 
     let op = restickify_kt_opspec_2d(
         slots.extent(),
         feats.extent(),
-        in_name,
-        o_name,
+        in_.name(),
+        o.name(),
         in_off,
         out_off,
     )
@@ -5991,16 +6156,40 @@ fn restickify_transpose_opspec_2d(
 
 /// [`restickify_transpose_opspec_2d`] assembled — the fallible form, because this is reached by a
 /// third-party KTIR producer that has its own op to blame (see [`try_assemble_transpose`]).
+///
+/// ⭐ MINTED, BOTH SIDES, at the whole-buffer window: the caller's own law refuses a windowed
+/// transpose (whole views, both sides — see `lower_ktir_to_superdsc::transpose`), so the flat
+/// `[1, rows·cols]` run at 0 IS the op's whole access, and the mint's question is whether each
+/// handle's declared buffer — and, when a layout is at hand, its PLACEMENT — actually holds that
+/// many elements. The placement half is the new fact: a view can be whole while the reservation
+/// behind its name is smaller ("512 reserved against 2048 declared"), which is a clean-bake
+/// overrun into the next tensor's bytes, and it refuses here instead.
 pub fn try_assemble_restickify_transpose_2d(
     op_name: &str,
     rows: u32,
     cols: u32,
-    in_name: &str,
-    o_name: &str,
+    in_: &Stk<RowBlockedTag>,
+    o: &Stk<RowBlockedTag>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<EmittedOp, String> {
-    let op = restickify_transpose_opspec_2d(rows, cols, in_name, o_name)?;
+    mint_full_window(
+        &format!("{op_name}: operand '{}'", in_.name()),
+        in_,
+        0,
+        rows,
+        cols,
+        layout,
+    )?;
+    mint_full_window(
+        &format!("{op_name}: output '{}'", o.name()),
+        o,
+        0,
+        cols,
+        rows,
+        layout,
+    )?;
+    let op = restickify_transpose_opspec_2d(rows, cols, in_.name(), o.name())?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
     emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| e.0)
 }
@@ -6013,104 +6202,9 @@ pub fn try_assemble_restickify_transpose_2d(
 // record (the same-dim "silent" control refusing at `ddl_conversion.cpp:2539`, the
 // two-distinct-stick-dims law the restackify DDL demands) survives in this file's
 // history.
-
-/// PATH B (V side): a RANK-2 per-head restickify that RE-STICKS the natural V cache `[cap,hd]` (flat
-/// row-major, the on-card `[1,hd]`-per-slot write) into the hd-sticked `[cap,hd]` KERNEL the value bmm
-/// reads. UNLIKE K this is NOT a transpose — same dim order `[cap,hd]`, only the stick axis moves
-/// flat→hd (dim0→dim1). The value bmm `out_pre = probs[1,cap]·V[cap,hd] → [1,hd]` reads V as kernel
-/// `[k=cap, n=hd]` sticked on n=hd ⇒ device `[hd/64,cap,64]` = `vcache_write_offset`. Here:
-///   • INPUT  logical `[cap,hd]`, stick = `cap` (dim 0, NOT last) ⇒ device_size FLAT ⇒ reads V[slot][d]
-///     at `slot*hd+d` — EXACTLY the natural write (`dev_off([cap,hd],0,·)`).
-///   • OUTPUT logical `[cap,hd]`, stick = `hd` (dim 1 = LAST) ⇒ device_size `[hd/64,cap,64]` ⇒ writes
-///     V[slot][d] at `vcache_write_offset(slot,d)` = `dev_off([cap,hd],1,[slot,d])`, the value-bmm read.
-/// Proven by `restickify_v_opspec_realizes_contract{,_hd128}` (Kani) + the `pathb_v_*` chain.
-fn restickify_v_opspec_2d(
-    cap: u32,
-    hd: u32,
-    in_name: &str,
-    o_name: &str,
-    in_off: u32,
-    out_off: u32,
-) -> Result<OpSpec, String> {
-    let _cap_ext = StickExtent::<Fp16>::new(cap)?;
-    let _hd_ext = StickExtent::<Fp16>::new(hd)?;
-    let dims = vec![
-        ItDim {
-            name: "cap",
-            size: cap,
-            is_reduction: false,
-            is_stick: true,
-            df: Df::Fp16,
-        },
-        ItDim {
-            name: "hd",
-            size: hd,
-            is_reduction: false,
-            is_stick: true,
-            df: Df::Fp16,
-        },
-    ];
-    let plan = WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, distribute_cores)?;
-    // INPUT: natural V view `[cap,hd]` sticked on `cap` (dim 0) ⇒ NOT (len==2 && stick_idx==1) ⇒ FLAT
-    // row-major `slot*hd+d` = the natural per-slot dense write.
-    let input = TensorArg::<2>::new(
-        true,
-        in_name.to_string(),
-        Role::Input,
-        [Scale::Active, Scale::Active],
-        plan.iter_syms(["cap", "hd"]),
-        ["cap", "hd"],
-        "cap",
-        Allocation::Hbm,
-    )
-    .map_err(|e| e.0)?
-    .with_offset(in_off);
-    // OUTPUT: value-bmm kernel view `[cap,hd]` sticked on `hd` (dim 1 = LAST) ⇒ device_size
-    // `[hd/64,cap,64]` = the exact hd-sticked layout the value bmm reads (vcache_write_offset).
-    let output = TensorArg::<2>::new(
-        false,
-        o_name.to_string(),
-        Role::Output,
-        [Scale::Active, Scale::Active],
-        plan.iter_syms(["cap", "hd"]),
-        ["cap", "hd"],
-        "hd",
-        Allocation::Hbm,
-    )
-    .map_err(|e| e.0)?
-    .with_offset(out_off);
-    Ok(OpSpec {
-        op: OpFunc::Restickify,
-        is_reduction: false,
-        iter: plan,
-        args: vec![AnyTensorArg::R2(input), AnyTensorArg::R2(output)],
-        op_info: OpInfo::None,
-        tiled_symbols: vec![],
-        time_tile: None,
-        indirect: None,
-    })
-}
-
-/// Assemble ONE per-head V re-stickify (natural `[cap,hd]` → hd-sticked `[cap,hd]`). See
-/// [`restickify_v_opspec_2d`].
-#[allow(clippy::too_many_arguments)]
-pub fn assemble_restickify_v_2d(
-    op_name: &str,
-    cap: u32,
-    hd: u32,
-    in_name: &str,
-    in_off: u32,
-    o_name: &str,
-    out_off: u32,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> EmittedOp {
-    let op = restickify_v_opspec_2d(cap, hd, in_name, o_name, in_off, out_off)
-        .unwrap_or_else(|e| panic!("assemble_restickify_v_2d {op_name}: {e}"));
-    let folds = SdscFoldSet::new(op.iter.cores_used());
-    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_restickify_v_2d {op_name}: {e}"))
-}
+//
+// The V-side re-stick (`restickify_v_opspec_2d`/`assemble_restickify_v_2d`, "PATH B") is deleted
+// with them — see the tombstone at the 3-D family above.
 
 /// The SFP transcendentals that CRASH the dxp compile at multi-stick width with an out-broadcast
 /// operand — see the guard in `assemble_pointwise_broadcast_off`, which explains the geometry and cites
@@ -6702,9 +6796,13 @@ mod gather_cut {
     /// requirement coincide). `layout: None` is this crate's unit-test arm, so addresses come from the
     /// per-arg segment fallback — inert for every property below, which are all DIFFERENCES.
     fn legs(rows: u32) -> Vec<EmittedOp> {
+        // TRUE shapes, not `rbo` lies: the mint in `pointwise_broadcast_opspec_from_tile` (and the
+        // gather door's output mint) checks every swept window against the handle's declared shape,
+        // so the table and output are declared at the node's own `[rows, 4096]` — embedding_granite's
+        // extents. The `[1,1]` scale keeps `rbo`: one RedStick IS its whole swept window.
         let scale = rbo("t4294967275");
-        let table = rbo("t1");
-        let out = rbo("t2");
+        let table = rb("t1", rows, COLS);
+        let out = rb("t2", rows, COLS);
         let t = tile(rows);
         let mut sid = 0i64;
         assemble_pointwise_broadcast_gather(
@@ -6717,7 +6815,8 @@ mod gather_cut {
                 inputs: &[In::scalar(&scale).ew(), In::full(&table).ew()],
                 gathered_input: 1,
                 index_name: "t0",
-                first_entry: crate::superdsc_opspec::EntryBase::ZERO,
+                run: crate::superdsc_opspec::StickRun::covering(0, rows)
+                    .expect("the whole-buffer run covers any node"),
                 o: &out,
             },
             &mut sid,
@@ -6892,13 +6991,16 @@ mod gather_cut {
     /// ⛔⛔⛔ THE 32-ENTRY CEILING IS STILL ENFORCED ON THE OP THAT DECLARES THE INDEX, and the cut did
     /// not weaken it: `one_gathered_leg` refuses a longer run BY NAME. It is unreachable from the cut
     /// by construction, so it is reached here with a hand-built over-long leg — which is what makes it
-    /// a proof rather than dead code.
+    /// a proof rather than dead code. The over-long leg names a TWO-STICK run, the spelling the
+    /// [`crate::superdsc_opspec::StickRun`] type admits (a hand-built span) but the leg guard refuses.
     ///
     /// ⭐ AND THE DISCRIMINATING CONTROL IS ONE VARIABLE AWAY: the same leg at one stick emits.
     #[test]
     fn a_leg_longer_than_one_index_stick_is_refused_by_name() {
         let scale = rbo("t4294967275");
-        let table = rbo("t1");
+        // TRUE shape (`[cap()*2, 4096]`, covering both legs below): the input mint must not fire
+        // before the one-stick ceiling this test exists to pin.
+        let table = rb("t1", cap() * 2, COLS);
         let ins = [In::scalar(&scale).ew(), In::full(&table).ew()];
         let two = tile(cap() * 2);
         let mut sid = 0i64;
@@ -6916,7 +7018,7 @@ mod gather_cut {
                 gathered_input: 1,
                 index_name: "t0",
                 page: crate::superdsc_opspec::PageExtent::single_position(),
-                first_entry: crate::superdsc_opspec::EntryBase::ZERO,
+                run: crate::superdsc_opspec::StickRun::of_sticks(0, 2),
                 o_name: "t2",
                 head_major: false,
             },
@@ -6949,7 +7051,7 @@ mod gather_cut {
                     gathered_input: 1,
                     index_name: "t0",
                     page: crate::superdsc_opspec::PageExtent::single_position(),
-                    first_entry: crate::superdsc_opspec::EntryBase::ZERO,
+                    run: crate::superdsc_opspec::StickRun::of_sticks(0, 1),
                     o_name: "t2",
                     head_major: false,
                 },

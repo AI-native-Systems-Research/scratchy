@@ -124,12 +124,14 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
 
     let scalarmul_scales = scales_for_program_shape(node.program, &node.func)?;
 
-    // WHICH PARAMETER IS THE GATHER'S INDEX VECTOR, read off the program by the SAME function family
-    // the lowering body reads it with — so the placement and the descriptor cannot disagree about
-    // which buffer is the index. `None` for every affinely-addressed program. The MULTI-TILE reading
-    // (`gathers_of`) accepts an unrolled sweep's per-trip tiles — every one over the SAME index/value
-    // pair, which is all the placement needs: the index buffer is ONE buffer however many trips read
-    // it. Different pairs are refused by `gathers_of` itself, by name.
+    // WHICH PARAMETERS ARE GATHER INDEX VECTORS, read off the program by the SAME function family
+    // the lowering body reads them with — so the placement and the descriptor cannot disagree about
+    // which buffer is the index. Empty for every affinely-addressed program. The MULTI-TILE reading
+    // (`gathers_of`) accepts an unrolled sweep's per-trip tiles AND the batched paged-decode shape —
+    // several tables gathered through one or several index buffers — so this is the SET of distinct
+    // index tids, not the first gather's: a 4 B/elem index is a fact about an INDEX BUFFER, and a
+    // program with two of them sizes both or silently under-reserves the second (the 512 B/1024 B
+    // trap the SenUint32 arm exists for).
     let gathers =
         ktir_superdsc::emit::lower_ktir_to_superdsc::gathers_of(node).map_err(|e| Error {
             stage: "layout",
@@ -159,7 +161,7 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
             });
         }
     }
-    let index_tid = gathers.first().map(|g| g.index_tid);
+    let index_tids: std::collections::BTreeSet<u32> = gathers.iter().map(|g| g.index_tid).collect();
 
     let mut placements: std::collections::BTreeMap<u32, TensorPlacement> = Default::default();
     // Bytes placed per segment so far — the running high-water [`pack`] appends at.
@@ -235,7 +237,7 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // The format is [`Df::Uint32`], which is the format the DESCRIPTOR declares for that operand
         // (`Role::KernelIdx` ⇒ SENUINT32, `wordLength` 4) — so the placement and the access are sized in
         // ONE format rather than in two that have to agree.
-        let df = if Some(reg.tid) == index_tid {
+        let df = if index_tids.contains(&reg.tid) {
             Df::SenUint32
         } else if reg.is_fp8 {
             Df::Fp8
@@ -431,11 +433,16 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     // regression pins. `pack`'s own arithmetic already guarantees `segment_bytes[seg]` is a whole
     // 128-B multiple, so one granule of slack past the high-water covers the measured over-read
     // exactly.
-    if let Some(index_tid) = index_tid
-        && let Some(&p) = placements.get(&index_tid)
-        && p.offset + align128(p.size).max(GRANULE) == segment_bytes[p.segment]
-    {
-        segment_bytes[p.segment] += GRANULE;
+    // ⭐ PER INDEX BUFFER, not once for the program: a batched paged-decode kernel states TWO
+    // gathers (K^T and V) whose index buffers may land in different segments, and each one's
+    // fetch path pays the same over-read. At most one placement per segment can be flush at the
+    // high-water (only the last is), so the per-tid checks cannot double-add to one segment.
+    for index_tid in &index_tids {
+        if let Some(&p) = placements.get(index_tid)
+            && p.offset + align128(p.size).max(GRANULE) == segment_bytes[p.segment]
+        {
+            segment_bytes[p.segment] += GRANULE;
+        }
     }
 
     // ── THE CEILING THAT IS REAL: BYTES, PER SEGMENT ─────────────────────────────────────────────
@@ -497,6 +504,9 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     Ok(BundleLayout {
         placements,
         ids,
+        // No minted intermediates yet: the cursor seeds lazily, on the first mint, above this
+        // layout's own highest placement — one Triton kernel's bundle starts empty-handed.
+        inter_cursor: Default::default(),
         // The PLACEMENT high-water per segment. It does not include the synthetics, which are
         // bump-allocated during lowering through the `RefCell` above and so do not exist yet — the
         // same order `compute_bundle_layout` builds in.
@@ -866,5 +876,169 @@ fn scales_for(p: Program, f: &IRFunction<'static>) -> Vec<f32> {
         | Program::ScalarWeightMul
         | Program::Reshape
         | Program::WindowedRmsNorm { .. } => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ktir_core::affine::{AffineExpr, AffineMap};
+    use ktir_core::arena::Arena;
+    use ktir_core::attrkey::AttrKey;
+    use ktir_core::dtypes::DType;
+    use ktir_core::ir::{Attr, Operation, Ssa};
+    use ktir_core::irtype::IrType;
+    use ktir_core::opkind::OpKind;
+    use ktir_superdsc::ktir_node::{BufferId, KtirNode, Program};
+
+    /// ⭐⭐⭐ A TWO-IDS PROGRAM — two tables gathered through TWO SEPARATE index
+    /// buffers — sized by [`for_node`]. `gathers_of` admits multiple (index,
+    /// value) pairs since the batched paged-decode shape crossed it, so the set
+    /// of index buffers is a fact of the program, and EVERY one of them must be
+    /// sized `SenUint32` (4 B/elem): the old single-gather reading sized only
+    /// the FIRST, and a second ids buffer left at the fp16 default is the
+    /// 512 B/1024 B trap the `Df::SenUint32` arm's own doc records — an
+    /// under-reserved placement the footprint guard then waves every real
+    /// access through, or refuses a correct one.
+    ///
+    /// The two-trip and two-pair files (`zz_the_two_trip_gathers_*`,
+    /// `zz_the_two_pair_gathers_*`) pin the WALK's join; this pins the LAYOUT's
+    /// placement, which those files cannot see (they hand-build their layouts).
+    #[test]
+    fn both_index_buffers_of_a_two_ids_program_are_sized_uint32() {
+        let a: &'static Arena = Arena::global();
+        // Parameters: %0 = table A, %1 = table B, %2 = ids A, %3 = ids B.
+        let (p_t0, p_t1, p_i0, p_i1) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let (v_t0, v_t1, v_i0, v_i1) = (Ssa(4), Ssa(5), Ssa(6), Ssa(7));
+        let (ind0, load0, ind1, load1) = (Ssa(8), Ssa(9), Ssa(10), Ssa(11));
+        let zero = Ssa(12);
+
+        let shape = |op: Operation<'static>, r: i64, c: i64| {
+            op.with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![r, c])))
+                .with_attr(a, AttrKey::Dtype, Attr::Dtype(DType::F16))
+        };
+        let ids_view = |result: Ssa, param: Ssa| {
+            Operation::new(a, Some(result), OpKind::KtdpConstructMemoryView, &[param])
+                .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![64])))
+                .with_attr(a, AttrKey::Dtype, Attr::Dtype(DType::I32))
+        };
+        // The `Sym(1) + Dim(0)` subscript `gather_subscripts` builds, anchored at
+        // entry 0 by the shared zero constant.
+        let sub = a.expr(AffineExpr::Add(
+            a.expr(AffineExpr::Sym(1)),
+            a.expr(AffineExpr::Dim(0)),
+        ));
+        let indirect = |result: Ssa, table: Ssa, ids: Ssa| {
+            shape(
+                Operation::new(
+                    a,
+                    Some(result),
+                    OpKind::KtdpConstructIndirectAccessTile,
+                    &[table, ids],
+                ),
+                64,
+                64,
+            )
+            .with_attr(
+                a,
+                AttrKey::DimKinds,
+                Attr::StrList(a.names(vec!["indirect", "direct_sub"])),
+            )
+            .with_attr(a, AttrKey::DimData, Attr::IntList(a.ints(vec![0, 0])))
+            .with_attr(
+                a,
+                AttrKey::IntermediateVars,
+                Attr::Ssas(a.ssa(vec![zero, zero])),
+            )
+            .with_attr(
+                a,
+                AttrKey::DimSubs,
+                Attr::AffineMapList(a.maps(vec![
+                    AffineMap {
+                        num_dims: 2,
+                        num_syms: 2,
+                        exprs: std::slice::from_ref(sub),
+                    },
+                    AffineMap {
+                        num_dims: 2,
+                        num_syms: 2,
+                        exprs: a.exprs(vec![AffineExpr::Dim(1)]),
+                    },
+                ])),
+            )
+        };
+
+        let ops = vec![
+            Operation::new(a, Some(zero), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Int(0),
+            ),
+            shape(
+                Operation::new(a, Some(v_t0), OpKind::KtdpConstructMemoryView, &[p_t0]),
+                128,
+                64,
+            ),
+            shape(
+                Operation::new(a, Some(v_t1), OpKind::KtdpConstructMemoryView, &[p_t1]),
+                128,
+                64,
+            ),
+            ids_view(v_i0, p_i0),
+            ids_view(v_i1, p_i1),
+            indirect(ind0, v_t0, v_i0),
+            shape(
+                Operation::new(a, Some(load0), OpKind::KtdpLoad, &[ind0]),
+                64,
+                64,
+            ),
+            indirect(ind1, v_t1, v_i1),
+            shape(
+                Operation::new(a, Some(load1), OpKind::KtdpLoad, &[ind1]),
+                64,
+                64,
+            ),
+        ];
+
+        let node = KtirNode {
+            func: ktir_core::ir::IRFunction {
+                name: "two_ids",
+                arguments: a.args(vec![
+                    (p_t0, IrType::Index),
+                    (p_t1, IrType::Index),
+                    (p_i0, IrType::Index),
+                    (p_i1, IrType::Index),
+                ]),
+                operations: a.ops(ops),
+                grid: (1, 1, 1),
+                return_type: None,
+            },
+            program: Program::Matmul,
+            bindings: vec![
+                BufferId::new(401),
+                BufferId::new(402),
+                BufferId::new(403),
+                BufferId::new(404),
+            ],
+            mask: None,
+            node_out_tid: None,
+            minted: Default::default(),
+        };
+
+        let layout = for_node(&node).expect("the two-ids program has a layout");
+        // BOTH ids buffers are 64-entry i32 vectors: 256 B each at SenUint32,
+        // 128 B at the fp16 default the first-only reading left the second at.
+        for (tid, what) in [(403u32, "ids A"), (404, "ids B")] {
+            let p = layout
+                .placements
+                .get(&tid)
+                .unwrap_or_else(|| panic!("{what} (t{tid}) has no placement"));
+            assert_eq!(
+                p.size, 256,
+                "{what} (t{tid}) is a 64-entry SENUINT32 index: 4 B an element. A size of \
+                 128 is the fp16 default -- the under-reserved placement the footprint \
+                 guard cannot catch"
+            );
+        }
     }
 }

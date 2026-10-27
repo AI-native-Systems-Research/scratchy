@@ -98,6 +98,17 @@ pub enum QmvKernel {
     Wide { nv: u32 },
 }
 
+impl QmvKernel {
+    /// The times the kernel streams a matrix's weights over `rows` rows: the wide band once a
+    /// vector tile, every other kernel once a row.
+    pub fn weight_streams(self, rows: u32) -> u32 {
+        match self {
+            Self::Wide { nv } => rows.div_ceil(nv),
+            Self::Quad { .. } | Self::Fast | Self::FastFold | Self::Generic | Self::Tiny => rows,
+        }
+    }
+}
+
 /// Pick the right qmv variant per MLX `quantized.cpp:1826 dispatch_qmv`:
 /// quad first (tiny K), then the small-M wide band (`M ≥ 2` on gen-15+ —
 /// M3 and later, [`affine_qmv_wide_ok`](crate::targets::affine_qmv_wide_ok)),
@@ -684,11 +695,15 @@ pub fn qmm_t_kernel_static_name(
 // ─────────────────────────────────────────────────────────────────
 
 /// Step token counts the small-M matrix-unit GEMM (`affine_qmm_small_m_*`)
-/// serves on NAX devices. Below, `qmv_fast`'s per-row weight re-reads cost
-/// no more than the matrix unit's padding (base M5, Granite-3.3-2B: 333 vs
-/// 346 µs of GEMM per layer at 3 tokens, 393 vs 343 at 4); above, a second
-/// M tile re-reads the weights and NAX `qmm_t`'s 64-row tile wins (a 32-row
-/// tile loses too).
+/// may serve on NAX devices — the runtime gate's range. Below, a matvec that
+/// re-reads the weights a row costs no more than the matrix unit's padding
+/// (base M5, Granite-3.3-2B's `qmv_fast`: 333 vs 346 µs of GEMM per layer at 3
+/// tokens, 393 vs 343 at 4); above, a second M tile re-reads the weights and
+/// NAX `qmm_t`'s 64-row tile wins (a 32-row tile loses too). Within it, a
+/// bucket gets the twin only where its own matvec streams the weights more
+/// than once (`route_small_m`): not the 4-token bucket's wide matvec (every K
+/// but 64 and 128), so on a NAX device a 4-token step runs it only where its
+/// matvec is quad.
 pub const SMALL_M_TOKENS: std::ops::RangeInclusive<u32> = 4..=16;
 
 /// Output columns per small-M threadgroup.
@@ -720,7 +735,8 @@ impl SmallMTile {
 
     /// The tile of a bucket that can see a [`SMALL_M_TOKENS`] step: from the
     /// range's first count up to the 64-token bucket, the largest that serves
-    /// the range under the default ladder.
+    /// the range under the default ladder. Whether the bucket takes the twin at
+    /// all is its own matvec's (`route_small_m`).
     pub fn for_bucket(bucket_m: u32) -> Option<Self> {
         match bucket_m {
             m if m < *SMALL_M_TOKENS.start() || m > 64 => None,

@@ -109,16 +109,7 @@ impl ForwardArgs {
     /// The carrier decorator's arguments, with the defaults applied.
     fn from_carrier(carrier: &PythonCarrier) -> Self {
         Self {
-            // Omitting `workloads` gives the global default ladder.
-            // Per-bucket affordability is decided at load time by
-            // `select_prefill_bucket`, so declaring the full ladder here
-            // is free on small devices — they just prune it. Vision
-            // carriers always declare theirs (image-patch counts, not
-            // the text-decode ladder).
-            workloads: carrier
-                .workloads
-                .clone()
-                .unwrap_or_else(|| DEFAULT_DECODER_WORKLOADS.to_vec()),
+            workloads: carrier_ladder(carrier),
             // Omitting `sk_buckets` gives the standard KV-span ladder
             // (every decoder arch wants the same one). An explicit empty
             // list `sk_buckets=[]` opts into the legacy 1-D sweep, where
@@ -293,6 +284,131 @@ fn dedup_tp_sig(tp_world_size: u8) -> String {
 /// measured: `gemma4-moe.py` carries
 /// `workloads=[1,2,4,8,16,32,64,512,1024,2048,4096]`.
 const DEFAULT_DECODER_WORKLOADS: &[u64] = &[1, 2, 4, 8, 64, 512, 1024, 2048, 4096];
+
+/// The bucket ladder a carrier declares: its decorator's `workloads`, or the global default.
+/// Per-bucket affordability is decided at load time by `select_prefill_bucket`, so declaring the
+/// full ladder is free on small devices — they just prune it. Vision carriers always declare theirs
+/// (image-patch counts, not the text-decode ladder).
+fn carrier_ladder(carrier: &PythonCarrier) -> Vec<u64> {
+    (carrier.workloads.clone()).unwrap_or_else(|| DEFAULT_DECODER_WORKLOADS.to_vec())
+}
+
+/// ⛔ A HEAD THAT PREFILLS AT ITS TARGET'S CHUNK WIDTH HAS EVERY RUNG ITS TARGET HAS.
+///
+/// A multi-token-prediction head that keeps KV of its own (no `reads_target_kv` in its
+/// `arch.json`) runs a pass over every prompt chunk its target runs, at that chunk's width. The
+/// widest chunk is the target rung a device can afford (`select_prefill_bucket`, from the target's
+/// rung costs), and the head's device takes that cap and keeps only its own rungs at or below it.
+/// So each of the target's rungs must be one of the head's: a target rung the head lacks is a cap
+/// under which its widest chunk finds no head bucket, and the first such chunk panics inside the
+/// head's forward (`no bucket fits num_tokens=…`) while the server returns 500s (#600). A head
+/// reading its target's KV runs no prompt rows ([`model_workloads`]).
+///
+/// Checked over every head `arch_dir` (`crates/models/arch`) ships, selected for the build or not,
+/// from its `configs/<head>/arch.json` and the `dsl/<arch>.py` carriers of it and its targets, so a
+/// build fails before anything is expanded rather than a server at its first wide chunk.
+pub fn check_head_ladders(arch_dir: &std::path::Path) -> Result<(), String> {
+    let ladder = |arch: &str| -> Result<Vec<u64>, String> {
+        let path = arch_dir.join("dsl").join(format!("{arch}.py"));
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let carrier =
+            parse_python_file(&text).map_err(|e| format!("carrier {}: {e}", path.display()))?;
+        Ok(carrier_ladder(&carrier))
+    };
+    let configs = arch_dir.join("configs");
+    let mut heads: Vec<std::path::PathBuf> = std::fs::read_dir(&configs)
+        .map_err(|e| format!("read {}: {e}", configs.display()))?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|dir| dir.join("arch.json").is_file())
+        .collect();
+    heads.sort();
+    for dir in heads {
+        let spec = config::load_arch_json(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let targets: Vec<&str> = (spec.checkpoint_of.iter().map(String::as_str))
+            .chain(
+                spec.head_targets
+                    .iter()
+                    .filter_map(|(_, t)| t.split('/').next()),
+            )
+            .collect();
+        if spec.reads_target_kv || targets.is_empty() {
+            continue;
+        }
+        let head = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let target_ladders = (targets.into_iter())
+            .map(|target| Ok((target, ladder(target)?)))
+            .collect::<Result<Vec<_>, String>>()?;
+        head_has_target_rungs(head, &ladder(head)?, &target_ladders)?;
+    }
+    Ok(())
+}
+
+/// [`check_head_ladders`]' rule for one head keeping KV of its own: its `ladder` holds every rung
+/// of each of its `targets`' `(arch, ladder)`.
+fn head_has_target_rungs(
+    head: &str,
+    ladder: &[u64],
+    targets: &[(&str, Vec<u64>)],
+) -> Result<(), String> {
+    let missing = (targets.iter())
+        .find_map(|(target, rungs)| Some((target, rungs.iter().find(|m| !ladder.contains(m))?)));
+    match missing {
+        None => Ok(()),
+        Some((target, rung)) => Err(format!(
+            "dsl/{target}.py's ladder has a {rung} rung that its head dsl/{head}.py's lacks: \
+             {head} keeps KV of its own (no `reads_target_kv` in configs/{head}/arch.json), so it \
+             prefills every chunk {target} does, and on a device that caps prefill at {rung} the \
+             first {rung}-wide chunk would find no head bucket. Give dsl/{head}.py's @forward a \
+             workloads ladder holding every rung of dsl/{target}.py's."
+        )),
+    }
+}
+
+#[cfg(test)]
+mod head_ladder_tests {
+    use super::*;
+
+    /// A head keeping KV of its own whose ladder lacks one of a target's rungs is refused, naming
+    /// the head, the target and the rung (#600): its top rung, or one a device can stop at below
+    /// it, where the head falls back to its next rung down. A head holding every target rung
+    /// passes, rungs of its own besides.
+    #[test]
+    fn a_head_lacking_a_target_rung_is_refused() {
+        let default = DEFAULT_DECODER_WORKLOADS;
+        let refused = |targets: &[(&str, Vec<u64>)]| {
+            head_has_target_rungs("head", default, targets).expect_err("a target rung missing")
+        };
+        let wider = [default, &[8192]].concat();
+        let msg = refused(&[("small", vec![1, 2048]), ("tgt", wider)]);
+        for part in ["dsl/head.py", "dsl/tgt.py", "8192", "reads_target_kv"] {
+            assert!(msg.contains(part), "{part:?} not in: {msg}");
+        }
+        let middle = vec![1, 2, 4, 8, 64, 512, 1024, 2048, 3072, 4096];
+        let msg = refused(&[("tgt", middle)]);
+        assert!(msg.contains("3072 rung"), "the missing middle rung: {msg}");
+
+        assert_eq!(
+            head_has_target_rungs("head", default, &[("tgt", default.to_vec())]),
+            Ok(())
+        );
+        let fewer = vec![1, 64, 4096];
+        assert_eq!(
+            head_has_target_rungs("head", default, &[("tgt", fewer)]),
+            Ok(())
+        );
+    }
+
+    /// Every shipped head passes, as the build checks before expanding anything: today's heads
+    /// that keep KV of their own share their targets' default ladder, and Gemma 4's assistant
+    /// reads its target's KV.
+    #[test]
+    fn every_shipped_head_has_its_targets_rungs() {
+        let arch_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
+        assert_eq!(check_head_ladders(&arch_dir), Ok(()));
+    }
+}
 
 /// The bucket ladder `model` compiles: the carrier's `ladder`, except that a multi-token-prediction
 /// head reading its target's KV stops at the first rung that holds its `spec_verify_rows`. Such a
@@ -1812,23 +1928,6 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
-    // Per-variant `METAL_ARENA_PEAK_BYTES` reads. Each canonical mod
-    // emits this const from the macro's per-canonical metal_emission;
-    // shim variants re-export the canonical's. The trait impl below
-    // dispatches on `Weights` variant and returns the matched module's
-    // const so `determine_available_memory` reads the right per-arch
-    // peak rather than a 512 MiB placeholder.
-    let metal_arena_peak_arms: Vec<proc_macro2::TokenStream> = arms
-        .iter()
-        .map(|a| {
-            let variant_ident = pascal_case(&a.model_ident);
-            let model_ident = &a.model_ident;
-            quote! {
-                Weights::#variant_ident(_) => #model_ident::METAL_ARENA_PEAK_BYTES,
-            }
-        })
-        .collect();
-
     // Per-variant `CanonicalParams::METAL_DTYPE` reads.
     let metal_dtype_arms: Vec<proc_macro2::TokenStream> = arms
         .iter()
@@ -1855,16 +1954,31 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
-    // Per-variant lending of each model's resident pool's activation buffers.
-    let metal_lend_activation_arms: Vec<proc_macro2::TokenStream> = arms
+    // Per-variant: what each model's resident pool shares with its guest.
+    let metal_hosted_arms: Vec<proc_macro2::TokenStream> = arms
         .iter()
         .map(|a| {
             let variant_ident = pascal_case(&a.model_ident);
             quote! {
                 Weights::#variant_ident(w) => w.metal_pool.get().map(|p| {
-                    ::std::boxed::Box::new(p.lend_activation())
+                    ::std::boxed::Box::new(p.hosted())
                         as ::std::boxed::Box<dyn ::core::any::Any>
                 }),
+            }
+        })
+        .collect();
+
+    // Per-variant: make each model's resident pool hold a guest's arena, before it is built.
+    let metal_host_arms: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|a| {
+            let variant_ident = pascal_case(&a.model_ident);
+            quote! {
+                Weights::#variant_ident(w) => ::scratchy_target_metal::interpreter::metal::host_guest(
+                    &w.metal_pool,
+                    &w.metal_guest,
+                    guest,
+                ),
             }
         })
         .collect();
@@ -1877,20 +1991,6 @@ fn emit_arch_dispatcher(
             let model_ident = &a.model_ident;
             quote! {
                 Weights::#variant_ident(_) => &#model_ident::METAL_RUNGS,
-            }
-        })
-        .collect();
-
-    // Per-variant `METAL_BUCKET_ARENA_COSTS` reads — the `(bucket_m, bytes)`
-    // table the worker feeds to `select_prefill_bucket` for target-reactive
-    // bucket pruning. Mirrors `metal_arena_peak_arms`.
-    let metal_bucket_costs_arms: Vec<proc_macro2::TokenStream> = arms
-        .iter()
-        .map(|a| {
-            let variant_ident = pascal_case(&a.model_ident);
-            let model_ident = &a.model_ident;
-            quote! {
-                Weights::#variant_ident(_) => #model_ident::METAL_BUCKET_ARENA_COSTS,
             }
         })
         .collect();
@@ -2197,7 +2297,7 @@ fn emit_arch_dispatcher(
             device: &mut crate::__gpu::GpuDevice,
             num_tokens: u64,
             followup: ::core::option::Option<::scratchy_forward_compiler::MetalForwardFollowup<'_>>,
-        ) -> crate::__gpu::OwnedTensor {
+        ) -> ::core::result::Result<crate::__gpu::OwnedTensor, ::scratchy_forward_compiler::GpuExecutionFailed> {
             match w {
                 #(#forward_with_followup_arms)*
             }
@@ -2382,20 +2482,6 @@ fn emit_arch_dispatcher(
 
 
             #[cfg(feature = "metal")]
-            fn metal_arena_peak_bytes(&self) -> u64 {
-                match self {
-                    #(#metal_arena_peak_arms)*
-                }
-            }
-
-            #[cfg(feature = "metal")]
-            fn metal_bucket_arena_costs(&self) -> &'static [(u32, u64)] {
-                match self {
-                    #(#metal_bucket_costs_arms)*
-                }
-            }
-
-            #[cfg(feature = "metal")]
             fn metal_dtype(&self) -> ::scratchy_target_metal::interpreter::metal::MetalDtype {
                 match self {
                     #(#metal_dtype_arms)*
@@ -2421,9 +2507,19 @@ fn emit_arch_dispatcher(
             }
 
             #[cfg(feature = "metal")]
-            fn metal_lend_activation(&self) -> ::core::option::Option<::std::boxed::Box<dyn ::core::any::Any>> {
+            fn metal_hosted(&self) -> ::core::option::Option<::std::boxed::Box<dyn ::core::any::Any>> {
                 match self {
-                    #(#metal_lend_activation_arms)*
+                    #(#metal_hosted_arms)*
+                }
+            }
+
+            #[cfg(feature = "metal")]
+            fn metal_host(
+                &self,
+                guest: ::std::boxed::Box<dyn ::core::any::Any>,
+            ) -> ::core::result::Result<(), ::std::string::String> {
+                match self {
+                    #(#metal_host_arms)*
                 }
             }
 
@@ -2434,7 +2530,7 @@ fn emit_arch_dispatcher(
                 device: crate::__gpu::ForwardDeviceHandle<'_>,
                 num_tokens: u64,
                 followup: ::core::option::Option<::scratchy_forward_compiler::MetalForwardFollowup<'_>>,
-            ) -> crate::__gpu::OwnedTensor {
+            ) -> ::core::result::Result<crate::__gpu::OwnedTensor, ::scratchy_forward_compiler::GpuExecutionFailed> {
                 let ctx: &crate::__gpu::ForwardCtx = unsafe { ctx.as_ref() };
                 let device: &mut crate::__gpu::GpuDevice = unsafe { device.as_mut() };
                 unsafe { forward_with_metal_followup(self, ctx, device, num_tokens, followup) }

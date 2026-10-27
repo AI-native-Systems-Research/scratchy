@@ -192,10 +192,15 @@ fn rb(name: &str, rows: u32, cols: u32) -> Stk<RowBlockedTag> {
 /// `(mb, out)` splits of the descriptor the shipped pointwise door emits for a `[rows, cols]` multiply
 /// whose output is the column window starting at `c_start` of a `full_cols`-wide tensor, read off
 /// `numWkSlicesPerDim_`.
+///
+/// The handles declare the FULL `[rows, full_cols]` storage — the window rides the offset, and a
+/// window-shaped handle under a full-tensor offset is exactly the past-its-own-tensor window the
+/// operand mint refuses (#731's law: the column-chunk bodies declare the region's storage width
+/// too, never the piece's).
 fn emitted_split(rows: u32, cols: u32, full_cols: u32, c_start: u32) -> (u64, u64) {
-    let a = rb("t_a", rows, cols);
-    let b = rb("t_b", rows, cols);
-    let o = rb("t_o", rows, cols);
+    let a = rb("t_a", rows, full_cols);
+    let b = rb("t_b", rows, full_cols);
+    let o = rb("t_o", rows, full_cols);
     let mut sid = 0i64;
     let op = assemble_pointwise_broadcast_off(
         "mul",
@@ -218,16 +223,17 @@ fn emitted_split(rows: u32, cols: u32, full_cols: u32, c_start: u32) -> (u64, u6
 
 /// [`emitted_split`] with every operand and the output at a [`ktir_superdsc::addr::ColWindow`] — the corner
 /// the column-chunk bodies (`silumul`, `elementwise`, `scalarmul_scaled`) state since #622 —
-/// returning the `(mb, out)` split and the output's `layoutDimOrder_`.
+/// returning the `(mb, out)` split and the output's `layoutDimOrder_`. The handles declare the full
+/// `[rows, full_cols]` storage, as `emitted_split`'s and the chunk bodies' do.
 fn emitted_window_split(
     rows: u32,
     cols: u32,
     full_cols: u32,
     c_start: u32,
 ) -> ((u64, u64), serde_json::Value) {
-    let a = rb("t_a", rows, cols);
-    let b = rb("t_b", rows, cols);
-    let o = rb("t_o", rows, cols);
+    let a = rb("t_a", rows, full_cols);
+    let b = rb("t_b", rows, full_cols);
+    let o = rb("t_o", rows, full_cols);
     let w = ktir_superdsc::addr::col_window_of(rows, full_cols, c_start, Df::Fp16)
         .expect("a whole-stick corner");
     let mut sid = 0i64;

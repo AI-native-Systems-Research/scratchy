@@ -184,6 +184,11 @@ pub use crate::tape::constants::ConstSlot;
 // obvious mistake (`HeadDim(W::NUM_Q_HEADS)`) rather than silent
 // reordering of two interchangeable `u32`s.
 
+/// The rows one step samples (its `SampleIndices`' length): the count the chain step's trait
+/// carries ([`scratchy_forward_compiler::ChainStepHandle`]), read by a runtime gate and a
+/// [`crate::tape::lowered::SetAxis`].
+pub use scratchy_forward_compiler::SampledRowCount;
+
 macro_rules! u32_newtype {
     ($($(#[$m:meta])* $name:ident),* $(,)?) => {$(
         $(#[$m])*
@@ -270,8 +275,11 @@ u32_newtype!(
     /// MLP intermediate size (`W::INTERMEDIATE_SIZE`).
     IntermediateSize,
     /// Generic hidden size in elements (used by elementwise kernels —
-    /// `AffineEmbed.hidden_size`, `GatherLastToken.row_stride`).
+    /// `AffineEmbed.hidden_size`).
     HiddenSize,
+    /// Elements between one row of a buffer and the next, that a row-moving kernel swaps whole:
+    /// the hidden size (the lm_head's input) or the vocabulary (its logits).
+    RowStride,
     /// MLX-affine packed-K (input cols) for a qmv / qmm_t dispatch.
     KDim,
     /// MLX-affine output cols / weight rows (qmv / qmm_t `n_v`).
@@ -313,9 +321,11 @@ u32_newtype!(
     /// ([`crate::device::gpu_cores`]). No baked profile can stand in for it:
     /// one chip name ships with several core counts (an M1 Max has 24 or 32).
     GpuCores,
-    /// The most rows a decode or verify step brings — one a sequence of the serving engine's
-    /// `max_num_seqs`, a verify step's drafts too — read at load: the rows the TurboQuant decode split's partials are
-    /// reserved for ([`crate::tape::lowered::LoweredMetalTape::scratch_bytes`]).
+    /// The most rows a step samples, and a decode or verify step brings — one a sequence of the
+    /// serving engine's `max_num_seqs`, a verify step's drafts too — read at load: the rows a
+    /// decode-gated TurboQuant decode split's partials are reserved for
+    /// ([`crate::tape::lowered::LoweredMetalTape::scratch_bytes`]), and the logits buffer holds
+    /// ([`crate::tape::lowered::LoweredMetalTape::logits_rows`]).
     DecodeRows,
     /// Logits per row a model's forward leaves (`METAL_VOCAB_SIZE`): the width the off-tape
     /// kernels (argmax, grammar mask, sampler) read ([`crate::off_tape`]).

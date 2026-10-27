@@ -8,6 +8,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer};
 
+use super::numbers::Engine;
+
 #[derive(Deserialize)]
 pub struct Run {
     #[serde(rename = "schema")]
@@ -25,6 +27,80 @@ pub struct Run {
     /// The file it was read from, for the link to it.
     #[serde(skip)]
     pub file: PathBuf,
+}
+
+/// The least share of its answer tokens a live server delivers to an engine that honours
+/// `ignore_eos` ([`Engine::honours_ignore_eos`]), below which the cell measured one that had
+/// stopped answering (#413). In every published run, scratchy's live cells deliver 99% or more and
+/// its dead ones 0 to 19.8%.
+const LIVE_SHARE: f64 = 0.5;
+
+/// The least share of its answer tokens a live cell delivers where every answer ran to length:
+/// scratchy's live cells, which honour `ignore_eos`, deliver 99% or more in every published run. A
+/// live cell under it stopped answers early, at EOS (#479), so its numbers measure less decode than
+/// the cell asked for ([`Cell::short`]).
+const FULL_SHARE: f64 = 0.99;
+
+impl Run {
+    /// Mark the cells that measured a server which had stopped answering (#413). The bench judges
+    /// that itself where it can (`dead_server` on a cell, from a scratchy cell that came back with
+    /// under half its answer tokens), and that verdict is the one the page takes. A run file from
+    /// before the bench counted such requests as failed (`config.failures_counted`, #510) is
+    /// judged here by its answer tokens instead, and only for an engine that honours
+    /// `ignore_eos`: one that stops at EOS delivers short answers from a live server too.
+    pub fn mark_dead(&mut self) {
+        for m in &mut self.models {
+            for e in Engine::ALL {
+                for c in e.cells_mut(m) {
+                    c.dead |= c.dead_server;
+                }
+            }
+        }
+        if self.config.failures_counted == Some(true) {
+            return;
+        }
+        let base = self.config.base().and_then(|b| b.output);
+        for m in &mut self.models {
+            for e in Engine::ALL.into_iter().filter(|e| e.honours_ignore_eos()) {
+                for c in e.cells_mut(m) {
+                    c.dead |= c.delivered(base).is_some_and(|share| share < LIVE_SHARE);
+                }
+            }
+        }
+    }
+
+    /// Mark the live cells whose answers came back short of the tokens asked for (#479): an
+    /// engine that ignores `ignore_eos` stops at EOS, so its tok/s, TPOT and E2E latency come from
+    /// a shorter decode than the cell's label says. Done as the run loads, after
+    /// [`mark_dead`](Self::mark_dead), so a dead cell is never also short.
+    pub fn mark_short(&mut self) {
+        let base = self.config.base().and_then(|b| b.output);
+        for m in &mut self.models {
+            for e in Engine::ALL {
+                for c in e.cells_mut(m) {
+                    c.short = (c.delivered(base)).filter(|&share| !c.dead && share < FULL_SHARE);
+                }
+            }
+        }
+    }
+
+    /// Mark the scaling cells whose peak memory reads below the model's own weights (#414): a
+    /// process serving them holds at least that much, so the reading can't be all of it. Done as
+    /// the run loads, so every chart and table drops the number at once ([`Cell::mem_below_weights`]).
+    pub fn mark_mem_below_weights(&mut self) {
+        for m in &mut self.models {
+            let weights = m.weights();
+            for e in Engine::ALL
+                .into_iter()
+                .filter(|e| e.serves_mlx_checkpoint())
+            {
+                for c in e.cells_mut(m) {
+                    c.mem_below_weights = (c.server_mem_peak_mib)
+                        .is_some_and(|mib| weights.is_some_and(|w| mib < w.mib()));
+                }
+            }
+        }
+    }
 }
 
 /// The only schema this page reads.
@@ -72,7 +148,7 @@ impl fmt::Display for NonEmpty {
 }
 
 /// When a run started, `YYYY-MM-DDTHH:MM:SSZ`.
-#[derive(Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(try_from = "String")]
 pub struct Utc(String);
 
@@ -149,7 +225,14 @@ pub struct Config {
     pub cold_priming_launches: Option<u32>,
     pub kv_cache_dtype: Option<String>,
     pub scratchy_serve_args: Option<String>,
+    /// scratchy's `--gpu-memory-utilization` where the runner set it for the Mac's memory.
+    #[serde(default)]
+    pub scratchy_memory_util: Option<f64>,
     pub scaling: Option<Scaling>,
+    /// Whether the bench counted a request whose stream ended aborted or errored as failed
+    /// (#510); absent before it, where [`Run::mark_dead`] judges by the answer tokens instead.
+    #[serde(default)]
+    pub failures_counted: Option<bool>,
     /// Every engine with its version and pin; runs before pins have only
     /// `engine_versions` (mlx-lm and ollama).
     #[serde(default)]
@@ -165,8 +248,34 @@ pub struct Config {
     /// record a list kept only the default round, as `default_models`.
     #[serde(default)]
     pub current_models: Option<Vec<String>>,
+    /// The lineup this version of the runner measures, one model per architecture class
+    /// (`CLASSES` in the bench script); absent in runs from before it.
+    #[serde(default)]
+    pub classes: Option<Vec<Class>>,
+    /// The memory from which a Mac runs the large set of [`Config::classes`].
+    #[serde(default)]
+    pub large_from_gb: Option<u32>,
     #[serde(default)]
     pub default_models: Option<Vec<String>>,
+}
+
+/// One architecture class of the lineup: its model below 64 GB of memory and at 64 GB and above.
+#[derive(Deserialize, Clone, PartialEq, Eq)]
+pub struct Class {
+    pub class: String,
+    pub small: String,
+    pub large: String,
+}
+
+impl Class {
+    /// The class's model on a Mac with `memory_gb` of memory, the large one from `large_from_gb`.
+    pub fn model(&self, memory_gb: u32, large_from_gb: u32) -> &str {
+        if memory_gb >= large_from_gb {
+            &self.large
+        } else {
+            &self.small
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -183,11 +292,30 @@ impl Config {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq)]
 pub struct Scaling {
+    /// The sweeps it ran (`grid`, `input`, ...).
+    #[serde(default)]
+    pub axes: Option<Vec<String>>,
     pub base: Option<Base>,
     pub grid_input: Option<Vec<u32>>,
     pub grid_output: Option<Vec<u32>>,
+    /// The grid's users counts; absent in runs from before the grid had its own.
+    #[serde(default)]
+    pub grid_conc: Option<Vec<u32>>,
+    /// The answer lengths the grid ran at above 1 user (`--scale-grid-users-output`); absent
+    /// in runs from before it, which ran every `grid_output` at every users count.
+    pub grid_users_output: Option<Vec<u32>>,
+    /// The longest grid prompt the Mac's memory held (the runner's `--scale-max-prompt`, before
+    /// every cell ran): longer
+    /// `grid_input` lengths were not run. None: every one was.
+    #[serde(default)]
+    pub max_prompt: Option<u32>,
+    /// The longest grid prompt run above 1 user (the runner's `--scale-max-prompt-users`, before
+    /// every cell ran); longer prompts
+    /// ran at 1 user only. None: every prompt `max_prompt` allows.
+    #[serde(default)]
+    pub max_prompt_users: Option<u32>,
 }
 
 /// What a model ran at when a limit lowered it (GLM-4.5-Air: 4 users).
@@ -215,7 +343,7 @@ fn present<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<bool>>, D::E
 }
 
 /// The shape every non-grid measurement uses.
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq)]
 pub struct Base {
     pub input: Option<u32>,
     pub output: Option<u32>,
@@ -272,11 +400,26 @@ pub struct Model {
     /// failed (nothing timed), Some(None) not run, None from before the gate.
     #[serde(default, deserialize_with = "present")]
     pub parity_mlx_lm: Option<Option<bool>>,
+    /// Why the parity gate did not judge this model, where the runner skipped it on purpose.
+    #[serde(default)]
+    pub parity_skipped: Option<String>,
+    /// The gate's prompts that passed on near-ties, each with the logit gaps of the tokens where
+    /// scratchy's answer parted from mlx-lm's top; absent where every answer matched exactly.
+    #[serde(default)]
+    pub parity_ties: Option<BTreeMap<String, Vec<f64>>>,
     #[serde(default)]
     pub scaling_limits: Option<Limits>,
     /// Only its presence matters: whether scratchy served anything warm.
     pub warm_serving: Option<serde_json::Map<String, serde_json::Value>>,
+    /// What an earlier run of this model on this machine filled in, and when that run was made:
+    /// an engine this run did not measure (by its key), or scratchy's frozen launches
+    /// ([`BORROWED_FROZEN`]). Empty for the numbers this run measured itself.
+    #[serde(skip)]
+    pub borrowed: BTreeMap<String, Utc>,
 }
+
+/// The [`Model::borrowed`] key for scratchy's frozen launches.
+pub const BORROWED_FROZEN: &str = "scratchy frozen";
 
 #[derive(Deserialize)]
 pub struct Footprint {
@@ -303,7 +446,7 @@ pub enum Scenario {
 }
 
 /// One launch (or request) of a cache ladder.
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct Rep {
     pub scenario: Scenario,
     pub t_ready_s: Option<f64>,
@@ -322,12 +465,17 @@ impl Bytes {
     pub fn gb(self) -> f64 {
         self.0 as f64 / 1e9
     }
+
+    /// In MiB (2²⁰ bytes), as the runner records memory.
+    pub fn mib(self) -> f64 {
+        self.0 as f64 / (1u64 << 20) as f64
+    }
 }
 
 /// Each MLX checkpoint's weights: the `.safetensors` files scratchy and mlx-lm
 /// load, summed from the Hugging Face API (main, 2026-10-12). ollama runs its
 /// own build of the same model, named on its row.
-const WEIGHTS: [(&str, Bytes); 7] = [
+const WEIGHTS: [(&str, Bytes); 18] = [
     (
         "mlx-community/granite-3.3-2b-instruct-4bit",
         Bytes(1_425_458_043),
@@ -345,6 +493,28 @@ const WEIGHTS: [(&str, Bytes); 7] = [
     ("mlx-community/Qwen3.6-27B-4bit", Bytes(16_054_541_599)),
     ("mlx-community/gemma-4-31b-it-4bit", Bytes(18_412_016_676)),
     ("mlx-community/GLM-4.5-Air-3bit", Bytes(46_786_574_771)),
+    // The one-model-per-class round, small and large, from the same API (main, 2026-10-20).
+    // The same files, byte for byte: the project's copy, and the personal repo runs before it name.
+    ("scratchery/gpt-oss-20b-4bit", Bytes(11_774_668_888)),
+    ("jesusoctavioas/gpt-oss-20b-mlx-4Bit", Bytes(11_774_668_888)),
+    ("scratchery/gpt-oss-120b-3bit", Bytes(51_448_416_856)),
+    (
+        "mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-4bit",
+        Bytes(17_775_428_300),
+    ),
+    (
+        "mlx-community/NVIDIA-Nemotron-3-Super-120B-A12B-OptiQ-2bit",
+        Bytes(47_460_151_014),
+    ),
+    (
+        "scratchery/Qwen3.5-122B-A10B-OptiQ-2bit-mtp",
+        Bytes(48_263_329_425),
+    ),
+    ("mlx-community/granite-4.1-8b-4bit", Bytes(5_238_406_779)),
+    ("mlx-community/granite-4.1-30b-4bit", Bytes(18_041_976_573)),
+    ("ibm-granite/granite-4.2-3b-q4-mlx", Bytes(2_059_005_430)),
+    ("ibm-granite/granite-4.2-8b-q4-mlx", Bytes(4_945_853_970)),
+    ("ibm-granite/granite-4.2-30b-q4-mlx", Bytes(16_469_111_945)),
 ];
 
 impl Model {
@@ -372,7 +542,7 @@ pub enum At {
 }
 
 /// One `bench serve` cell of the scaling sweep.
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(try_from = "RawCell")]
 pub struct Cell {
     pub at: At,
@@ -391,6 +561,44 @@ pub struct Cell {
     /// A grid cell's users at once; None in runs from before the grid had its
     /// own, which ran it at the base users count.
     pub users: Option<u32>,
+    /// The answer tokens its requests delivered; None in runs from before
+    /// the run file kept it.
+    pub total_output_tokens: Option<u64>,
+    /// Whether the server it measured had stopped answering, in a run from before the bench
+    /// counted that itself ([`Run::mark_dead`]).
+    pub dead: bool,
+    /// Whether its peak memory reads below the model's own weights ([`Run::mark_mem_below_weights`]),
+    /// so it is no reading of the process.
+    pub mem_below_weights: bool,
+    /// The client never finished it (the run's `cell_timeout_s`), so every request counts as
+    /// failed: too slow, not out of memory.
+    pub timed_out: bool,
+    /// The bench's verdict that the server it measured answered with almost nothing (a scratchy
+    /// cell under half its answer tokens): its requests are recorded failed ([`Run::mark_dead`]).
+    pub dead_server: bool,
+    /// The share of the answer tokens asked for that a live cell delivered, where its answers came
+    /// back short ([`Run::mark_short`]); None where they ran to length or it can't say.
+    pub short: Option<f64>,
+}
+
+impl Cell {
+    /// The share of the answer tokens its completed requests asked for that they delivered: its
+    /// answer length is its rung's, or the run's `base` one. None where it can't say: no count in
+    /// the file, no request completed, or a count of 0 from requests that each got a first token,
+    /// which is a server that sent no usage (the bench takes the count from it), not a dead one.
+    fn delivered(&self, base: Option<u32>) -> Option<f64> {
+        let asked = match self.at {
+            At::Grid { output, .. } | At::Output(output) => Some(output),
+            At::Conc(_) | At::Input(_) => base,
+        };
+        let asked = u64::from(asked?) * u64::from(self.completed.filter(|&n| n > 0)?);
+        let got = self.total_output_tokens?;
+        if got == 0 && self.median_ttft_ms.is_some_and(|t| t > 0.0) && self.median_tpot_ms.is_some()
+        {
+            return None;
+        }
+        (asked > 0).then(|| got as f64 / asked as f64)
+    }
 }
 
 #[derive(Deserialize)]
@@ -424,6 +632,12 @@ struct RawCell {
     server_mem_peak_mib: Option<f64>,
     #[serde(default)]
     conc: Option<u32>,
+    #[serde(default)]
+    total_output_tokens: Option<u64>,
+    #[serde(default)]
+    timed_out: bool,
+    #[serde(default)]
+    dead_server: bool,
 }
 
 impl TryFrom<RawCell> for Cell {
@@ -458,6 +672,12 @@ impl TryFrom<RawCell> for Cell {
             failed: c.failed,
             server_mem_peak_mib: c.server_mem_peak_mib,
             users: c.conc,
+            total_output_tokens: c.total_output_tokens,
+            dead: false,
+            mem_below_weights: false,
+            timed_out: c.timed_out,
+            dead_server: c.dead_server,
+            short: None,
         })
     }
 }

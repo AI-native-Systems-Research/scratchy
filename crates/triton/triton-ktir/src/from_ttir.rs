@@ -143,6 +143,15 @@ pub const OP_SET: &[&str] = &[
     "tt.load",
     "tt.dot",
     "tt.trans",
+    // ⭐ THE FIRST ENTRY ADDED SINCE THE CENSUS, deliberately. `tl.reshape` is the front
+    // end's own `semantic.rs::reshape` (numel-preserving flat reinterpretation, NO
+    // attributes -- the destination extents ride the result type, which `ty` maps for any
+    // rank), and it appears in no golden because no fixture reshapes a COMPUTED value --
+    // the spliced `reshape.py` states its relayout as load/store pairs instead. The batched
+    // paged-decode kernel reshapes gather results and arithmetic tiles, so the op crosses
+    // this bridge as itself: one operand, one result, the result's type the destination.
+    // `to_ktir`'s `convert_reshape` is what turns it into a scheduler-dialect op.
+    "tt.reshape",
     "tt.reduce",
     "tt.reduce.return",
     "tt.expand_dims",

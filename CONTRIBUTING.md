@@ -144,7 +144,8 @@ sent back regardless of how well it works:
 - **Metal 4 only.** Classic MTL3 command buffers are banned — enforced by
   `crates/targets/metal/build.rs` (`guard_no_classic_mtl3`) and by
   `disallowed-methods` in `clippy.toml`.
-- No new env-var behavior toggles; no `#[allow]`; no weakening tests.
+- No new env-var behavior toggles; no `#[allow]`; no weakening tests
+  ([`docs/TESTING.md`](docs/TESTING.md)).
 
 #### Build — scope to one model
 
@@ -184,7 +185,8 @@ empirical claims about hardware and about the world; no type asserts them.
 **Never relax a numeric tolerance or add `#[ignore]` to make a failure go
 away** — that is the one change most likely to look reasonable and be wrong.
 
-See issues #8 and #13 for the tiering rationale and the protected set.
+[`docs/TESTING.md`](docs/TESTING.md) has the five tiers, the protected set, and what weakening
+a protected test means; #8 has the rationale.
 
 ### 5. Verify like CI before you push
 

@@ -9,6 +9,4 @@ description = "Scheduler, KV cache management, and block allocation for vLLM Rus
 scratchy-core-common = { workspace = true }
 scratchy-core-config = { workspace = true }
 tracing = { workspace = true }
-hashbrown = { workspace = true }
-smallvec = { workspace = true }
 serde = { workspace = true }

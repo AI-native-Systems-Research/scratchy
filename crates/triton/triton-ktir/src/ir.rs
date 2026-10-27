@@ -114,6 +114,9 @@ pub enum OpKind {
     TtSplat,
     TtMakeRange,
     TtAddptr,
+    /// `tt.reshape` -- the flat row-major reinterpretation. See the `from_spelling` arm for
+    /// why this one is a named variant.
+    TtReshape,
 
     // --- linalg
     LinalgMatmul,
@@ -198,6 +201,7 @@ impl OpKind {
             TtSplat => "tt.splat",
             TtMakeRange => "tt.make_range",
             TtAddptr => "tt.addptr",
+            TtReshape => "tt.reshape",
             LinalgMatmul => "linalg.matmul",
             LinalgGeneric => "linalg.generic",
             LinalgReduce => "linalg.reduce",
@@ -275,6 +279,13 @@ impl OpKind {
             "tt.splat" => TtSplat,
             "tt.make_range" => TtMakeRange,
             "tt.addptr" => TtAddptr,
+            // The flat row-major reinterpretation (`semantic.py`'s `reshape`, `can_reorder`
+            // false, no attributes -- the destination extents ride the result type). A
+            // NAMED variant rather than `Other` because [`crate::from_ttir::OP_SET`] admits
+            // it: a censused op carried as `Other` is the exact anti-pattern that module's
+            // doc refuses ("we do not model this" and "we model this as Other on purpose"
+            // must not look the same).
+            "tt.reshape" => TtReshape,
             "linalg.matmul" => LinalgMatmul,
             "linalg.generic" => LinalgGeneric,
             "linalg.reduce" => LinalgReduce,
@@ -427,6 +438,12 @@ pub enum AttrKey {
     /// `spyre.folded_grid_loop` -- THE LAUNCH CONTRACT: launch exactly `work_items`
     /// compute tiles, because the loop's zero-trip guard was folded away.
     FoldedGridLoop,
+    /// `spyre.unrolled_grid_loop` -- THE TRIP CONTRACT: `grid` was regridded to
+    /// `[num_cores]` by `fold_grid_work_loop`'s unroll arm and the body carries
+    /// `work_items / num_cores` copies per core, so every count of position-shaped
+    /// things downstream must multiply by the trip factor. `IntList [num_cores,
+    /// work_items]`.
+    UnrolledGridLoop,
     /// `spyre.canonical_verified` -- DotToLinalg's P1.0 trust tag.
     CanonicalVerified,
     /// `noinline`.
@@ -477,6 +494,7 @@ impl AttrKey {
             Grid => "grid",
             Reassociation => "reassociation",
             FoldedGridLoop => "spyre.folded_grid_loop",
+            UnrolledGridLoop => "spyre.unrolled_grid_loop",
             CanonicalVerified => "spyre.canonical_verified",
             Noinline => "noinline",
             Predicate => "predicate",
@@ -514,6 +532,7 @@ impl AttrKey {
             "grid" => Grid,
             "reassociation" => Reassociation,
             "spyre.folded_grid_loop" => FoldedGridLoop,
+            "spyre.unrolled_grid_loop" => UnrolledGridLoop,
             "spyre.canonical_verified" => CanonicalVerified,
             "noinline" => Noinline,
             "predicate" => Predicate,

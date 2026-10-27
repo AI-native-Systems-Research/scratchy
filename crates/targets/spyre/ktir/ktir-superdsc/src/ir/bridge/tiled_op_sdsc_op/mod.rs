@@ -49,6 +49,7 @@ pub use pointwise::{
 pub use reduce::{
     ReduceDivided, ReduceDivision, ReduceOffSpec, assemble_reduce, assemble_reduce_df,
     assemble_reduce_off, assemble_reduce_off_divided, assemble_reduce_seeded, reduce_opspec,
-    reduce_opspec_df, reduce_opspec_off, reduce_opspec_off_divided,
+    reduce_opspec_df, reduce_opspec_off, reduce_opspec_off_divided, win_reduce_accum,
+    win_reduce_data,
 };
 pub use rmsnorm::{assemble_rmsnorm, assemble_rmsnorm_unit, assemble_tanhsoftcap};

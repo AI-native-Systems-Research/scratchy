@@ -188,6 +188,13 @@ impl Tokenizer {
         Ok((encoding.get_ids().to_vec(), through))
     }
 
+    /// A chat prompt the template rendered, encoded as [`Self::encode_through`] does, with the
+    /// post-processor's special tokens: the one rule for every path that encodes one, so
+    /// `/tokenize` counts the ids the prefill reads.
+    pub fn encode_chat(&self, text: &str, marks: &[usize]) -> ServeResult<(Vec<u32>, Vec<u32>)> {
+        self.encode_through(text, true, marks)
+    }
+
     /// Decode token IDs back into text.
     pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> ServeResult<String> {
         with_inner!(&self.inner, t => t.decode(ids, skip_special_tokens))
@@ -268,6 +275,31 @@ impl std::fmt::Debug for Tokenizer {
 /// encode/decode roundtrips.
 #[cfg(test)]
 pub(crate) fn make_test_tokenizer() -> Tokenizer {
+    Tokenizer::from_hf_tokenizer(test_tokenizer_json().to_string().parse().unwrap())
+}
+
+/// [`make_test_tokenizer`] with a `<s>` (id 256) its post-processor puts in front of every
+/// sequence, as Llama 3's, Mistral's and Gemma's do.
+#[cfg(test)]
+pub(crate) fn make_test_tokenizer_with_bos() -> Tokenizer {
+    let mut json = test_tokenizer_json();
+    json["added_tokens"] = serde_json::json!([{
+        "id": 256, "content": "<s>", "single_word": false, "lstrip": false, "rstrip": false,
+        "normalized": false, "special": true
+    }]);
+    let bos = serde_json::json!({"SpecialToken": {"id": "<s>", "type_id": 0}});
+    let seq = |id: &str| serde_json::json!({"Sequence": {"id": id, "type_id": 0}});
+    json["post_processor"] = serde_json::json!({
+        "type": "TemplateProcessing",
+        "single": [bos, seq("A")],
+        "pair": [bos, seq("A"), seq("B")],
+        "special_tokens": {"<s>": {"id": "<s>", "ids": [256], "tokens": ["<s>"]}}
+    });
+    Tokenizer::from_hf_tokenizer(json.to_string().parse().unwrap())
+}
+
+#[cfg(test)]
+fn test_tokenizer_json() -> serde_json::Value {
     use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 
     // Build vocabulary JSON from the byte-level alphabet.
@@ -305,9 +337,7 @@ pub(crate) fn make_test_tokenizer() -> Tokenizer {
             }}
         }}"#
     );
-
-    let hf_tok: HfTokenizer = tokenizer_json.parse().unwrap();
-    Tokenizer::from_hf_tokenizer(hf_tok)
+    serde_json::from_str(&tokenizer_json).unwrap()
 }
 
 #[cfg(test)]
@@ -325,6 +355,17 @@ mod tests {
         assert_eq!(through, vec![0, 5, 11]);
         let reached = tok.decode(&ids[..through[1] as usize], false).unwrap();
         assert_eq!(reached, "hello");
+    }
+
+    /// The BOS fixture's post-processor puts `<s>` in front, and `<s>` in the text reads as that
+    /// one special token: what a template that writes `{{ bos_token }}` gives such a tokenizer.
+    #[test]
+    fn test_tokenizer_with_bos_posts_and_reads_its_bos() {
+        let tok = make_test_tokenizer_with_bos();
+        let bos_hi = [&[256], &tok.encode("hi", false).unwrap()[..]].concat();
+        assert_eq!(tok.encode("hi", true).unwrap(), bos_hi);
+        assert_eq!(tok.encode("<s>hi", false).unwrap(), bos_hi);
+        assert_eq!(tok.num_special_tokens_to_add(false), 1);
     }
 
     #[test]

@@ -5,7 +5,7 @@
 #
 # Why this wrapper exists
 # -----------------------
-# The `macos-arm64 (metal)` CI job must run natively on the Apple-Silicon host
+# The macOS CI jobs must run natively on the Apple-Silicon host
 # (Metal has no Linux container), so `act` needs `-P macos-26=-self-hosted`.
 # But then `dtolnay/rust-toolchain@stable` runs on your host and executes
 # `rustup toolchain install stable` + `rustup default stable` against your real
@@ -17,16 +17,16 @@
 #
 # The linux jobs (`workspace`, `fmt`) run inside Docker containers, so
 # they can't touch your host toolchain regardless — only the self-hosted macOS
-# job needed protecting.
+# jobs needed protecting.
 #
 # Usage
 # -----
-#   scripts/act-local.sh                 # full `pull_request` CI (all jobs)
-#   scripts/act-local.sh -j macos-metal  # just the metal job (skip the slow emulated Linux jobs)
-#   scripts/act-local.sh push            # a different event
+#   scripts/act-local.sh                       # full `pull_request` CI (all jobs)
+#   scripts/act-local.sh -j macos-metal-tests  # just the metal tests (skip the slow emulated Linux jobs)
+#   scripts/act-local.sh push                  # a different event
 # Any extra args are forwarded to `act`.
 #
-# Requires Docker running for the linux/fmt jobs (the macOS job runs natively).
+# Requires Docker running for the linux/fmt jobs (the macOS jobs run natively).
 set -euo pipefail
 
 # Persisted across runs so the sandbox toolchain is downloaded once, not every

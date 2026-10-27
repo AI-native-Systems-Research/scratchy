@@ -19,8 +19,9 @@
 //! refusals here (the footprint guard, [`BundleLayout::declare_arrangement`], the segment ceiling)
 //! as the ONE implementation rather than something each consumer re-derives.
 
+use crate::addr::{DevOff, Win};
 use crate::place::PlaceId;
-use crate::sdsc_abstract::StickLayout;
+use crate::sdsc_abstract::{KindTag, StickLayout, Stk};
 use crate::superdsc_error::SuperDscError;
 use crate::superdsc_opspec::Df;
 
@@ -201,6 +202,23 @@ pub struct BundleLayout {
     /// that spelling to its own identity, filled where the spelling is created.
     #[serde(skip)]
     pub ids: std::cell::RefCell<std::collections::BTreeMap<String, PlaceId>>,
+    /// ⭐ THE INTERMEDIATE-TID CURSOR — the ONE source of fresh intermediate tids, bundle-unique.
+    ///
+    /// ⛔ MEASURED on the card (2026-10-20, granite-2b fp16 at `load_model`): the mint used to
+    /// be seeded per NODE from that node's own bindings' max, so node B's mint landed on node
+    /// A's placement — `1310 placements collapse to 1214 distinct ids` (96 duplicates = the
+    /// number of intermediates one rope mints per node), the runtime refused to load, and the
+    /// load-time aliasing is worse than the refusal: a `BTreeMap` keeps ONE entry per id, so
+    /// the other tensor has NO placement at all and the device reads whatever shares its
+    /// address. The cursor is seeded LAZILY, on first mint, above the highest non-reserved
+    /// placement id in the WHOLE bundle — `#[forward]` expands every node before any lowering
+    /// runs, so the seed sees every placement — and advances monotonically past reserved tids
+    /// (the rope P / identity / scalarmul const tables live above `u32::MAX/2` and are skipped,
+    /// never minted onto). `take_inter_tid(floor)` also honors a caller-passed floor, so a
+    /// node lowered into TWO layouts (declare pass then real pass) can demand the same
+    /// tid again; [`KtirNode::minted`] replays the node's own record for exactly that.
+    #[serde(skip)]
+    pub inter_cursor: std::cell::Cell<Option<u32>>,
     /// Bytes occupied per segment (index = segment id 0..6). For the weight segment this is BANK
     /// 0's bytes — see [`BundleLayout::weight_bank_bytes`].
     pub segment_bytes: [u64; 7],
@@ -470,10 +488,190 @@ pub fn syn(layout: Option<&BundleLayout>, id: PlaceId) -> String {
     n
 }
 
+/// Door 1 of the window mints — the DECLARED-SHAPE bound, on the operand facts (name + declared
+/// [`StickLayout`]) rather than a handle. Shared by [`BundleLayout::check_window`] (which adds the
+/// placement door) and the pointwise family's operand mint, whose callers hold handles but no
+/// `BundleLayout` (every unit test; the gate probes). `off_elems` and the extents are ELEMENTS of
+/// the operand's own `df`.
+pub(crate) fn window_fits_declared(
+    name: &str,
+    layout: StickLayout,
+    off_elems: u64,
+    rows: u32,
+    cols: u32,
+    what: &str,
+) -> Result<(), String> {
+    let shape_elems = layout.rows as u64 * layout.cols as u64;
+    let end_elems = off_elems + rows as u64 * cols as u64;
+    if end_elems > shape_elems {
+        return Err(format!(
+            "{what}: the operand window [{off_elems}, {end_elems}) (elements) of '{name}' \
+             runs past the end its handle declares — {rows}×{cols} = {shape_elems} elements \
+             at {:?}. An op that sweeps past its own tensor is a defect in the computation \
+             that produced this offset; it cannot compile.",
+            layout.df,
+        ));
+    }
+    Ok(())
+}
+
 impl BundleLayout {
     /// The identity behind an emitted operand's spelling, or `None` if nothing minted it.
     pub fn id_of(&self, name: &str) -> Option<PlaceId> {
         self.ids.borrow().get(name).copied()
+    }
+
+    /// ⭐⭐⭐ THE PLACEMENT-AUTHORITY MINT — a [`Win`] over a tensor THIS layout places.
+    ///
+    /// Closes the class the bake-time guard could only catch late: an operand's offset and its
+    /// name arriving from different laws and sweeping past the tensor they name (the windowed
+    /// matmul that read 1/8 past its own tensor; the pad law that swept 512 columns out of a
+    /// 64-column window). Identity, offset and extents are minted as ONE value here, checked
+    /// against BOTH bounds at expansion time — a refusal is a `cargo build` failure:
+    ///
+    /// 1. THE DECLARED SHAPE — the handle's own [`StickLayout`] (`rows × cols` at its `df`): a
+    ///    window whose `off + rows·cols` runs past the tensor's own element count is an `Err`.
+    /// 2. THE PLACEMENT FOOTPRINT — resolved by NAME exactly the way `resolve_seg_base` resolves
+    ///    it at bake (LX pin → `Act` placement → declared synth), against the same `align128`
+    ///    granule, so the mint and the bake-time guard can never disagree about where a tensor
+    ///    ends. A window past the footprint is an `Err` naming the segment it would alias.
+    ///
+    /// And a placement SMALLER than the tensor's declared shape is itself an `Err`: the two
+    /// authorities disagree about the tensor, and every window over it is suspect — caught even
+    /// when the window itself fits both.
+    ///
+    /// `what` names the computation the window is for (op + operand role); every refusal carries
+    /// it with the offset, the extents and the bound it exceeded, so a failed build names the
+    /// defect, not just the number.
+    pub fn win<'a, K: KindTag>(
+        &self,
+        stk: &'a Stk<K>,
+        off: DevOff,
+        rows: u32,
+        cols: u32,
+        what: &str,
+    ) -> Result<Win<'a, K>, String> {
+        self.check_window(
+            stk.name(),
+            stk.layout(),
+            off.into_raw_elems() as u64,
+            rows,
+            cols,
+            what,
+        )?;
+        Ok(Win::minted(stk, off, rows, cols))
+    }
+
+    /// ⭐ The placement-authority CHECK behind [`Self::win`], on the operand FACTS — the handle's
+    /// name and declared [`StickLayout`] — instead of the handle itself. For the kind-erased
+    /// operand lists the pointwise family lowers ([`crate::emit::EwOperand`]): one slice holds
+    /// many layout kinds, so none of them can mint a kind-tagged [`Win`], but every one of them
+    /// runs the SAME two doors against the same numbers. A facts-checked operand and a
+    /// handle-minted window can never disagree about where a tensor ends.
+    pub(crate) fn check_window(
+        &self,
+        name: &str,
+        layout: StickLayout,
+        off_elems: u64,
+        rows: u32,
+        cols: u32,
+        what: &str,
+    ) -> Result<(), String> {
+        let word = layout.df.word_length() as u64;
+        let shape_elems = layout.rows as u64 * layout.cols as u64;
+        let shape_bytes = shape_elems * word;
+        let end_elems = off_elems + rows as u64 * cols as u64;
+        let end_bytes = end_elems * word;
+        // 1. THE DECLARED SHAPE — the window fits the tensor the HANDLE declares.
+        window_fits_declared(name, layout, off_elems, rows, cols, what)?;
+        // 2. THE PLACEMENT FOOTPRINT — `resolve_seg_base`'s three arms, same numbers, so the mint
+        //    and the bake-time guard read ONE window model.
+        if let Some((_pin, fp)) = self.lx_pin(name) {
+            // A CORE-LOCAL tensor's pin holds ONE core's slice, so the whole-operand window is
+            // not its bound (`core_local_reads_agree` checks the per-core slice against it) and
+            // its declared shape may be the full tensor's — the same early return the bake-time
+            // guard takes. But it has no addressable offset: every core's slice starts AT the pin.
+            if self.lx_core_local(name) {
+                if off_elems != 0 {
+                    return Err(format!(
+                        "{what}: core-local LX tensor '{name}' windowed at element {off_elems} — \
+                         each core's slice sits at the pin, so a view into it has no offset to take"
+                    ));
+                }
+                return Ok(());
+            }
+            if end_bytes > fp {
+                return Err(format!(
+                    "{what}: the operand window [{off_elems}, {end_elems}) = {end_bytes}B of \
+                     '{name}' exceeds its pinned-LX footprint {fp}B — the sweep would run past \
+                     the pin into the next pinned intermediate. Fix the declared shape \
+                     (`BundleLayout::synth_lx_op_local`) or the op's view/extents."
+                ));
+            }
+            if fp < shape_bytes {
+                return Err(format!(
+                    "{what}: '{name}' is pinned in LX at {fp}B but its handle declares \
+                     {rows}×{cols} = {shape_bytes}B — a pin smaller than the tensor's own \
+                     declared shape. The layout and the handle disagree about this tensor."
+                ));
+            }
+            return Ok(());
+        }
+        // A real caller-bound buffer → its global placement. The id comes from the layout's own
+        // mint table, NOT from picking the digits back out of the spelling.
+        if let Some(PlaceId::Act(tid)) = self.id_of(name)
+            && let Some(p) = self.placements.get(&tid)
+        {
+            let fp = align128(p.size).max(128);
+            if end_bytes > fp {
+                return Err(format!(
+                    "{what}: the operand window [{off_elems}, {end_elems}) = {end_bytes}B of \
+                     '{name}' (t{tid}) exceeds its placement footprint {fp}B (seg{}) — the sweep \
+                     addresses PAST its own tensor and would alias whatever is placed next. The \
+                     offset arithmetic and the placement must come from the SAME layout \
+                     authority.",
+                    p.segment
+                ));
+            }
+            if fp < shape_bytes {
+                return Err(format!(
+                    "{what}: '{name}' (t{tid}) is placed at {fp}B but its handle declares \
+                     {rows}×{cols} = {shape_bytes}B at {:?} — a placement smaller than the \
+                     tensor's own declared shape. The layout and the handle disagree about this \
+                     tensor; every window over it is suspect.",
+                    layout.df,
+                ));
+            }
+            return Ok(());
+        }
+        // A SYNTHETIC intermediate — declared or refused; the mint never allocates.
+        let s = self.synth.borrow();
+        match s.sizes.get(name).copied() {
+            None => Err(format!(
+                "{what}: '{name}' is windowed but was never declared to the layout. Every \
+                 intermediate is known at bake — declare it with `BundleLayout::synth(id, dims)` \
+                 at the site that mints the name."
+            )),
+            Some(fp) => {
+                if end_bytes > fp {
+                    return Err(format!(
+                        "{what}: the operand window [{off_elems}, {end_elems}) = {end_bytes}B of \
+                         '{name}' exceeds its declared synth footprint {fp}B — the sweep would \
+                         run past the intermediate into the next one. Fix the declared shape \
+                         (`BundleLayout::synth`) or the op's view/extents."
+                    ));
+                }
+                if fp < shape_bytes {
+                    return Err(format!(
+                        "{what}: '{name}' is declared at {fp}B but its handle declares \
+                         {rows}×{cols} = {shape_bytes}B — a declaration smaller than the \
+                         tensor's own declared shape. The layout and the handle disagree about \
+                         this tensor."
+                    ));
+                }
+                Ok(())
+            }
+        }
     }
 
     /// ⭐ THE `[hd, hd]` IDENTITY TABLE an attention class of head dim `hd` reads — its tid from this
@@ -485,6 +683,37 @@ impl BundleLayout {
             .iter()
             .position(|&h| h == hd)
             .map(crate::reserved_tids::identity_class_tid)
+    }
+
+    /// Mint the NEXT intermediate tid — bundle-unique by construction. First call seeds the
+    /// cursor above the highest non-reserved placement id in the whole bundle (reserved tids
+    /// are the const tables and are skipped, never landed on); every later call advances
+    /// monotonically. `floor` is the caller's node-derived bound: the returned tid is at or
+    /// above it, so a node whose bindings sit above the current cursor still mints clear of
+    /// its own tensors too. See [`Self::inter_cursor`] for why the seed is bundle-wide.
+    pub fn take_inter_tid(&self, floor: u32) -> u32 {
+        let mut cur = match self.inter_cursor.get() {
+            Some(c) => c,
+            None => {
+                let above_places = self
+                    .placements
+                    .keys()
+                    .copied()
+                    .filter(|t| !crate::reserved_tids::is_reserved(*t))
+                    .max()
+                    .map_or(0, |m| m + 1);
+                above_places.max(floor)
+            }
+        };
+        if cur < floor {
+            cur = floor;
+        }
+        while crate::reserved_tids::is_reserved(cur) {
+            cur += 1;
+        }
+        let tid = cur;
+        self.inter_cursor.set(Some(cur + 1));
+        tid
     }
 
     /// Declare a SYNTHETIC intermediate at its FULL shape (`dims`, outermost→innermost),

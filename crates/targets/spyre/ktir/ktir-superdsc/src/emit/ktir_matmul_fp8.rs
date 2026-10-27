@@ -14,12 +14,11 @@
 //! through the KTIR, from facts the KTIR itself states.
 
 use super::{
-    EmittedOp, In, assemble_convert, assemble_convert_col, assemble_convert_off,
-    assemble_pointwise_broadcast_off, bmm_site, emit_sdsc_tiled, op_func_from_str, pw1, pw2, rb,
-    rbo,
+    EmittedOp, In, assemble_convert, assemble_convert_col, assemble_pointwise_broadcast_off,
+    bmm_site, emit_sdsc_tiled, op_func_from_str, pw1, pw2, rb, rb_df, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::reduce::{
-    assemble_reduce_off, assemble_reduce_seeded, reduce_opspec,
+    assemble_reduce_off, assemble_reduce_seeded, reduce_opspec, win_reduce_accum, win_reduce_data,
 };
 use crate::place::{PlaceId, SynthRole};
 use crate::placement::{BundleLayout, syn};
@@ -311,10 +310,26 @@ pub(crate) fn fp8_quantize_descriptors(
                         "quantscalepertokenfp8",
                         m_rows,
                         crate::sdsc_abstract::BlockCols::of_feature_cols(k_part),
-                        &a_h,
-                        crate::addr::col_of(m, k, j * k_part, Df::Fp16),
-                        &accum_h,
-                        crate::addr::DevOff::ZERO,
+                        // The data window is the j-th `[m, k/time]` slab — `col_of`'s whole-block
+                        // shift (k/time is a whole 64-stick, the TimeTile invariant), minted
+                        // against the activation's own `[m, k]` handle.
+                        win_reduce_data(
+                            layout,
+                            &a_h,
+                            crate::addr::col_of(m, k, j * k_part, Df::Fp16),
+                            m_rows,
+                            crate::sdsc_abstract::BlockCols::of_feature_cols(k_part),
+                            &format!("{op_name}: activation"),
+                        )
+                        .map_err(SuperDscError)?,
+                        win_reduce_accum(
+                            layout,
+                            &accum_h,
+                            crate::addr::DevOff::ZERO,
+                            m_rows,
+                            &format!("{op_name}: scale"),
+                        )
+                        .map_err(SuperDscError)?,
                         sym_id_base,
                         layout,
                     ));
@@ -456,7 +471,7 @@ pub(crate) fn fp8_quantize_descriptors(
                     m,
                     k_pad,
                     &rb(&cl, m, k_pad),
-                    &rb(&afp8, m, k_pad),
+                    &rb_df(&afp8, m, k_pad, Df::Fp8),
                     sym_id_base,
                     layout,
                 ));
@@ -484,33 +499,29 @@ pub(crate) fn fp8_quantize_descriptors(
                     } else {
                         opn(&format!("fq_afp8_p{s}_op"))
                     };
-                    if m == 1 {
-                        ops.push(assemble_convert_off(
-                            &name,
-                            "qfp8ch",
-                            m,
-                            inn_pad,
-                            &rb(&cl, m, inn_pad),
-                            s * inn,
-                            &rb(&afp8, m, inn_pad),
-                            s * inn_pad,
-                            sym_id_base,
-                            layout,
-                        ));
-                    } else {
-                        ops.push(assemble_convert_col(
-                            &name,
-                            "qfp8ch",
-                            m,
-                            inn_pad,
-                            &rb(&cl, m, cl_reach),
-                            crate::addr::col_of(m, cl_reach, s * inn, Df::Fp16),
-                            &rb(&afp8, m, k_pad),
-                            crate::addr::col_of(m, k_pad, s * inn_pad, Df::Fp8),
-                            sym_id_base,
-                            layout,
-                        ));
-                    }
+                    // ⭐ ONE DOOR FOR EVERY `m`. The m=1 arm used to route to a raw-`u32` flat-offset
+                    // twin (`assemble_convert_off`, now deleted); at one row a `col_of` corner IS the
+                    // flat stick-axis slice exactly — the `(c/lanes)·(m·lanes)` group-corner term is
+                    // `m·c` and `m == 1` — so the decode arm emits the SAME offsets through the
+                    // DevOff twin and its mint. THE HANDLES ARE TRUED TO THE FULL BUFFERS (`cl_reach`,
+                    // `k_pad`) and the fp8 side carries its OWN df (`rb_df`): the mint's placement
+                    // door prices bytes at the handle's word length, so the fp16 annotation the
+                    // piece-wise handles used to carry would overstate every fp8 window 2× and refuse
+                    // the last slot — whose window ends exactly at `cl_reach = (pairs−1)·inn +
+                    // inn_pad` / `k_pad = pairs·inn_pad` BY CONSTRUCTION (the zero fill the last
+                    // slot's overhang reads is the `[k, cl_reach)` fill the clamp stage wrote).
+                    ops.push(assemble_convert_col(
+                        &name,
+                        "qfp8ch",
+                        m,
+                        inn_pad,
+                        &rb(&cl, m, cl_reach),
+                        crate::addr::col_of(m, cl_reach, s * inn, Df::Fp16),
+                        &rb_df(&afp8, m, k_pad, Df::Fp8),
+                        crate::addr::col_of(m, k_pad, s * inn_pad, Df::Fp8),
+                        sym_id_base,
+                        layout,
+                    ));
                 }
             }
         } // end `if !already_quantized` — the shared activation-quantize chain (per distinct activation).

@@ -148,8 +148,9 @@ macro_rules! for_each_subop {
             // also generating `expansion_ops!()`, the pattern a target without them refuses by.
             @expansion
             // Operand 0 is the cache/prefix source the writer filled — its rows are capacity, not
-            // this step's tokens.
-            KvEncode [SubOp::KvEncode { .. }] arity = (|n| n == 2 || n == 3), cols = [one],
+            // this step's tokens. An un-rotated writer (`kv_append`, Nemotron-H) has no rotary
+            // row, so its encode reads the cache alone.
+            KvEncode [SubOp::KvEncode { .. }] arity = (|n| (1..=3).contains(&n)), cols = [one],
                 rows = [m], gemm_w = [none];
             KvStage [SubOp::KvStage { .. }] arity = (|n| n == 1), cols = [one], rows = [m],
                 gemm_w = [none];

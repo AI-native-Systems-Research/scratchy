@@ -249,7 +249,9 @@ const SWA_PREFILL_CHUNK_CAP: usize = 2048;
 /// Resolve the full set of stop-on-generate token IDs the engine
 /// should honor, merging three HuggingFace conventions:
 ///
-/// 1. `config.json::eos_token_id` — single int or array. Always read.
+/// 1. `config.json::eos_token_id` — single int or array. Always read. A composite config with
+///    none at its top level gives its text backbone's, `text_config.eos_token_id` (Qwen3.5), as
+///    HF's `GenerationConfig.from_model_config` reads `get_text_config().eos_token_id` (#844).
 /// 2. `generation_config.json::eos_token_id` — same shape, but
 ///    authoritative when present (HF transformers reads this first
 ///    at `model.generate()` time; vLLM Python mirrors that).
@@ -291,8 +293,12 @@ fn resolve_eos_token_ids(
         }
     };
 
-    // (1) config.json::eos_token_id
-    if let Some(v) = hf_config.extra.get("eos_token_id") {
+    // (1) config.json::eos_token_id, or its text backbone's.
+    // A `null` top level is none, as HF drops it before falling back.
+    let config_eos = (hf_config.extra.get("eos_token_id"))
+        .filter(|v| !v.is_null())
+        .or_else(|| hf_config.extra.get("text_config")?.get("eos_token_id"));
+    if let Some(v) = config_eos {
         for id in extract_ids(v) {
             push(id, &mut out);
         }
@@ -433,7 +439,7 @@ fn create_worker(
         eos_token_ids: vec![],
         max_model_len: config.max_model_len,
         draft: speculation.worker_draft(),
-        verify_seqs: speculation.verify_seqs(),
+        verify_seqs: speculation.verify_seqs(config),
         draft_model_dtype: config.draft_model_dtype.clone(),
     };
 
@@ -685,12 +691,14 @@ impl Speculation {
     }
 
     /// The sequences a step may verify drafts for: a head drafts for as many as its budget does,
-    /// an n-gram or draft model for every sequence the engine schedules.
-    fn verify_seqs(&self) -> VerifySeqs {
+    /// an n-gram or draft model for every sequence the engine schedules, its `drafts` each.
+    fn verify_seqs(&self, config: &VllmConfig) -> VerifySeqs {
         match self {
             Self::Off => VerifySeqs::Off,
             Self::Head { head, .. } => VerifySeqs::Head(Self::budget(head)),
-            Self::Ngram | Self::DraftModel(_) => VerifySeqs::Every,
+            Self::Ngram | Self::DraftModel(_) => VerifySeqs::Every {
+                drafts: self.drafts(config),
+            },
         }
     }
 
@@ -1224,6 +1232,85 @@ fn effective_prefix_caching(requested: bool, recurrent_hybrid: bool, snapshots: 
     requested && (!recurrent_hybrid || snapshots)
 }
 
+/// ⭐ WHETHER THE ENGINE SERVES CACHED PREFIXES, as EVERY entry point decides it (#435): asked for,
+/// honoured by the backend ([`requested_prefix_caching`]), and, for a recurrent hybrid
+/// ([`is_recurrent_hybrid_arch`]), with `snapshots` of its recurrent state that a hit resumes
+/// from ([`effective_prefix_caching`]). `snapshots` is what the engine's executor reports
+/// (`Executor::snapshot_budget`): an executor that forwards none keeps a hybrid's caching off.
+fn prefix_caching(
+    config: &VllmConfig,
+    architectures: &[String],
+    worker_snapshots: Option<scratchy_serving_scheduler::scheduler::SnapshotBudget>,
+) -> bool {
+    let hybrid = is_recurrent_hybrid_arch(architectures);
+    let requested = requested_prefix_caching(config);
+    if hybrid && requested {
+        if let Some(budget) = worker_snapshots {
+            info!(
+                "Prefix caching on for {:?}, a recurrent/hybrid (Mamba/Gated-DeltaNet) \
+                 architecture: the worker keeps up to {} snapshots of its recurrent state in \
+                 the KV budget, and a hit resumes only where one exists",
+                architectures, budget.max_slots
+            );
+        } else {
+            info!(
+                "Prefix caching disabled: {:?} is a recurrent/hybrid (Mamba/Gated-DeltaNet) \
+                 architecture and the worker keeps no snapshots of its conv/ssm state, which a \
+                 cached KV prefix cannot reconstruct (a backend without them, a pooling or \
+                 draft-model run, or no memory for one beside the KV floor)",
+                architectures
+            );
+        }
+    }
+    // ⛔ AND THE BACKEND MUST BE ABLE TO HONOUR IT — asked HERE, where every entry point passes.
+    //
+    // A worker that cannot serve a cached prefix (`WorkerFactory::supports_prefix_caching`) gets a
+    // scheduler that SKIPS the prefill for a prefix it believes is resident, while the worker holds
+    // no KV for those slots. The rows then attend UNWRITTEN pool pages.
+    //
+    // ⭐ THIS CHECK ALREADY EXISTED — in `LlmEngine::from_config` ONLY. `scr batch` builds its stack
+    // through `initialize_stack` -> `initialize_core` and never reached it, so batch runs had prefix
+    // caching ON against a backend that declares it unsupported. Measured cost: rows whose prefill was
+    // skipped read unwritten pages, and the resulting garbage was indistinguishable from a batched-decode
+    // bug — it cost most of a session's debugging before `Prefix caching enabled` in the log gave it away.
+    // ⛔⛔⛔ AND WHEN A BACKEND REFUSES, THE REFUSAL MUST NAME A PROPERTY OF THE BACKEND — NOT A
+    // FEATURE SWITCHED OFF SO A TEST WOULD PASS.
+    //
+    // The comment that used to sit here said the spyre pool "cannot support it BY CONSTRUCTION"
+    // because `PageRun::physical(lp) = row * pages_per_row + lp` gave every row an exclusive page
+    // stripe. The striping was real; "by construction" was not — it described OUR construction, a
+    // layout picked so one launch could stride the whole batch. The device's actual limit is that it
+    // has no indirect addressing, which forbids nothing here. That `row *` term was also exactly the
+    // "request concept below the host" the KV design forbids, so prefix caching was never a separate
+    // feature to decline: it was blocked by a defect in the pool's addressing.
+    //
+    // ⭐ IT IS SUPPORTED NOW (`SpyreWorkerFactory::supports_prefix_caching`), by three changes that
+    // between them make a shared prefix real rather than promised:
+    //   1. a request's pages ARE the scheduler's `block_ids` (`install_host_blocks` + `BlockTable`,
+    //      whose only constructor takes host ids), so the worker's own free-list allocator — a second
+    //      allocator over the scheduler's pool, and the actual blocker — no longer exists;
+    //   2. the block size and the block COUNT come from the pool that addresses them
+    //      (`WorkerFactory::required_block_size`, `Worker::kv_cache_num_blocks_override`), so a block
+    //      id is a page and never one the pool lacks;
+    //   3. the worker reports, per request and per step, the SLOT SPAN its blocks must cover and the
+    //      leading tokens a token-indexed cache may hash (`ModelRunnerOutput::kv_extent`) — because a
+    //      batched step appends every row at one slot, so a short request's keys spread past its token
+    //      count and only its first contiguous run is token-addressed.
+    //
+    // Asked at the ONE point that computes the flag, so no future entry point can skip it.
+    if config.enable_prefix_caching && !requested {
+        info!(
+            "Prefix caching disabled: the {} backend's worker does not support it — the scheduler \
+             would skip the prefill for a prefix the worker holds no KV for",
+            config.device
+        );
+    }
+    effective_prefix_caching(requested, hybrid, worker_snapshots.is_some())
+}
+
+/// Common initialization: worker → cache → executor → InprocClient → tokenizer.
+///
+/// Handles both single-GPU (TP=1) and multi-GPU (TP>1) transparently.
 /// Offline (LLM/throughput) vs online-server default for `max_num_batched_tokens`,
 /// resolved per device (mirrors Python vLLM `EngineArgs.get_batch_defaults`):
 /// an H100-class GPU on the offline path gets 16384 rather than the base 2048.
@@ -1460,72 +1547,7 @@ fn initialize_core(
     // the worker keeps snapshots (`Worker::snapshot_budget`) — see
     // `effective_prefix_caching`. (Per-layer linear-attention is the marker;
     // detect by arch string.)
-    let enable_prefix_caching = {
-        let hybrid = is_recurrent_hybrid_arch(&hf_config.architectures);
-        let requested = requested_prefix_caching(config);
-        if hybrid && requested {
-            if let Some(budget) = worker_snapshots {
-                info!(
-                    "Prefix caching on for {:?}, a recurrent/hybrid (Mamba/Gated-DeltaNet) \
-                     architecture: the worker keeps up to {} snapshots of its recurrent state in \
-                     the KV budget, and a hit resumes only where one exists",
-                    hf_config.architectures, budget.max_slots
-                );
-            } else {
-                info!(
-                    "Prefix caching disabled: {:?} is a recurrent/hybrid (Mamba/Gated-DeltaNet) \
-                     architecture and the worker keeps no snapshots of its conv/ssm state, which a \
-                     cached KV prefix cannot reconstruct (a backend without them, a pooling or \
-                     draft-model run, or no memory for one beside the KV floor)",
-                    hf_config.architectures
-                );
-            }
-        }
-        // ⛔ AND THE BACKEND MUST BE ABLE TO HONOUR IT — asked HERE, where every entry point passes.
-        //
-        // A worker that cannot serve a cached prefix (`WorkerFactory::supports_prefix_caching`) gets a
-        // scheduler that SKIPS the prefill for a prefix it believes is resident, while the worker holds
-        // no KV for those slots. The rows then attend UNWRITTEN pool pages.
-        //
-        // ⭐ THIS CHECK ALREADY EXISTED — in `LlmEngine::from_config` ONLY. `scr batch` builds its stack
-        // through `initialize_stack` -> `initialize_core` and never reached it, so batch runs had prefix
-        // caching ON against a backend that declares it unsupported. Measured cost: rows whose prefill was
-        // skipped read unwritten pages, and the resulting garbage was indistinguishable from a batched-decode
-        // bug — it cost most of a session's debugging before `Prefix caching enabled` in the log gave it away.
-        // ⛔⛔⛔ AND WHEN A BACKEND REFUSES, THE REFUSAL MUST NAME A PROPERTY OF THE BACKEND — NOT A
-        // FEATURE SWITCHED OFF SO A TEST WOULD PASS.
-        //
-        // The comment that used to sit here said the spyre pool "cannot support it BY CONSTRUCTION"
-        // because `PageRun::physical(lp) = row * pages_per_row + lp` gave every row an exclusive page
-        // stripe. The striping was real; "by construction" was not — it described OUR construction, a
-        // layout picked so one launch could stride the whole batch. The device's actual limit is that it
-        // has no indirect addressing, which forbids nothing here. That `row *` term was also exactly the
-        // "request concept below the host" the KV design forbids, so prefix caching was never a separate
-        // feature to decline: it was blocked by a defect in the pool's addressing.
-        //
-        // ⭐ IT IS SUPPORTED NOW (`SpyreWorkerFactory::supports_prefix_caching`), by three changes that
-        // between them make a shared prefix real rather than promised:
-        //   1. a request's pages ARE the scheduler's `block_ids` (`install_host_blocks` + `BlockTable`,
-        //      whose only constructor takes host ids), so the worker's own free-list allocator — a second
-        //      allocator over the scheduler's pool, and the actual blocker — no longer exists;
-        //   2. the block size and the block COUNT come from the pool that addresses them
-        //      (`WorkerFactory::required_block_size`, `Worker::kv_cache_num_blocks_override`), so a block
-        //      id is a page and never one the pool lacks;
-        //   3. the worker reports, per request and per step, the SLOT SPAN its blocks must cover and the
-        //      leading tokens a token-indexed cache may hash (`ModelRunnerOutput::kv_extent`) — because a
-        //      batched step appends every row at one slot, so a short request's keys spread past its token
-        //      count and only its first contiguous run is token-addressed.
-        //
-        // Asked at the ONE point that computes the flag, so no future entry point can skip it.
-        if config.enable_prefix_caching && !requested {
-            info!(
-                "Prefix caching disabled: the {} backend's worker does not support it — the scheduler \
-                 would skip the prefill for a prefix the worker holds no KV for",
-                config.device
-            );
-        }
-        effective_prefix_caching(requested, hybrid, worker_snapshots.is_some())
-    };
+    let enable_prefix_caching = prefix_caching(config, &hf_config.architectures, worker_snapshots);
 
     // Device-specific `max_num_batched_tokens` default — no flat constant on any
     // backend. On backends that prune a compiled prefill-bucket ladder
@@ -1711,12 +1733,23 @@ pub fn initialize_stack_sync(config: &VllmConfig) -> Result<InitializedSyncStack
 /// The model's canonical architecture used to select parsers: `model_type` if
 /// present (e.g. `qwen3_5_moe`, `gemma4`, `llama`), else the first
 /// `architectures` entry. Never the model name/path.
+///
+/// Granite 4.2 keeps `model_type: granite` but switched to ChatML, ` MudThink`
+/// reasoning and Qwen3-Coder XML tool calls — and it is the first granite with
+/// an untied lm_head (`tie_word_embeddings: false`; every granite ≤4.1 ties).
+/// Untying is an architecture fact from `config.json`, so it keys the format
+/// split the same way `model_type` does: untied granites report `granite_4_2`.
 fn model_arch(hf: &HfModelConfig) -> &str {
-    hf.model_type
+    let base = hf
+        .model_type
         .as_deref()
         .filter(|s| !s.is_empty())
         .or_else(|| hf.architectures.first().map(String::as_str))
-        .unwrap_or("")
+        .unwrap_or("");
+    if base == "granite" && hf.tie_word_embeddings == Some(false) {
+        return "granite_4_2";
+    }
+    base
 }
 
 /// Install a tool-call parser on `engine`, chosen from the model **architecture**,
@@ -2317,6 +2350,45 @@ mod tests {
         );
     }
 
+    /// The decision every entry point makes (#435), from the config, the model's architectures
+    /// and the snapshots the engine's executor reports. An executor that forwards none (the
+    /// multi-GPU ones) keeps a recurrent hybrid's caching off; an attention-only model is cached
+    /// as asked.
+    #[test]
+    fn every_entry_point_decides_prefix_caching_by_one_rule() {
+        let config = VllmConfig {
+            device: "test-no-backend".to_string(),
+            ..VllmConfig::default()
+        };
+        let hybrid = ["Qwen3_5ForConditionalGeneration".to_string()];
+        let llama = ["LlamaForCausalLM".to_string()];
+        let snapshots = scratchy_serving_scheduler::scheduler::SnapshotBudget {
+            kv_block_bytes: 1,
+            kv_granule_blocks: std::num::NonZeroUsize::MIN,
+            slot_bytes: 0,
+            unit_slots: std::num::NonZeroUsize::MIN,
+            max_slots: 4,
+        };
+        assert!(config.enable_prefix_caching, "on by default");
+        assert!(
+            prefix_caching(&config, &llama, None),
+            "attention-only: as asked"
+        );
+        assert!(
+            !prefix_caching(&config, &hybrid, None),
+            "a hybrid without snapshots"
+        );
+        assert!(
+            prefix_caching(&config, &hybrid, Some(snapshots)),
+            "with them"
+        );
+        let off = VllmConfig {
+            enable_prefix_caching: false,
+            ..config.clone()
+        };
+        assert!(!prefix_caching(&off, &llama, None), "--no-prefix-caching");
+    }
+
     #[test]
     fn test_extract_model_name_hf_id() {
         assert_eq!(
@@ -2353,6 +2425,62 @@ mod tests {
         assert_eq!(
             resolve_eos_token_ids(&config, Some(dir.path()), None),
             vec![11, 2]
+        );
+    }
+
+    /// A composite config with no top-level `eos_token_id` stops on its text backbone's (#844):
+    /// `Qwen/Qwen3.5-0.8B` keeps `<|endoftext|>` (248044) only under `text_config`, and has no
+    /// `generation_config.json`, where HF transformers falls back to it. A top-level one is the
+    /// config's own, as before, and a nested one beside it adds nothing.
+    #[test]
+    fn a_composite_config_stops_on_its_text_backbones_eos() {
+        let composite = |config_json: serde_json::Value| {
+            let mut config = HfModelConfig::default();
+            let serde_json::Value::Object(fields) = config_json else {
+                unreachable!()
+            };
+            config.extra.extend(fields);
+            resolve_eos_token_ids(&config, None, None)
+        };
+        let nested = serde_json::json!({"text_config": {"eos_token_id": 248044}});
+        assert_eq!(composite(nested), vec![248044], "the text backbone's");
+        let both = serde_json::json!({"eos_token_id": 2, "text_config": {"eos_token_id": 248044}});
+        assert_eq!(composite(both), vec![2], "the top level's, as before");
+        let null =
+            serde_json::json!({"eos_token_id": null, "text_config": {"eos_token_id": 248044}});
+        assert_eq!(composite(null), vec![248044], "a null top level is none");
+        let neither = serde_json::json!({"text_config": {"hidden_size": 1024}});
+        assert!(composite(neither).is_empty());
+
+        // With the checkpoint's tokenizer files, the nested id joins the tokenizer's and the
+        // template's: Qwen3.5-0.8B's `[248044, 248046]`, where main stops on 248046 alone.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"eos_token": "<|im_end|>",
+                "chat_template": "{% for m in messages %}<|im_start|>{{ m.content }}<|im_end|>{% endfor %}"}"#,
+        )
+        .unwrap();
+        let tokenizer_json = r#"{
+            "version": "1.0",
+            "added_tokens": [
+                {"id": 248045, "content": "<|im_start|>", "single_word": false, "lstrip": false,
+                 "rstrip": false, "normalized": false, "special": true},
+                {"id": 248046, "content": "<|im_end|>", "single_word": false, "lstrip": false,
+                 "rstrip": false, "normalized": false, "special": true}
+            ],
+            "model": {"type": "BPE", "merges": [],
+                      "vocab": {"a": 0, "<|im_start|>": 248045, "<|im_end|>": 248046}}
+        }"#;
+        let tokenizer = Tokenizer::from_hf_tokenizer(tokenizer_json.parse().unwrap());
+        let mut config = HfModelConfig::default();
+        config.extra.insert(
+            "text_config".to_string(),
+            serde_json::json!({"eos_token_id": 248044}),
+        );
+        assert_eq!(
+            resolve_eos_token_ids(&config, Some(dir.path()), Some(&tokenizer)),
+            vec![248044, 248046]
         );
     }
 

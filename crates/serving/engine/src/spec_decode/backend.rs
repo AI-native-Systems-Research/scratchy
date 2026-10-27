@@ -32,6 +32,8 @@ use std::error::Error;
 use std::fmt;
 use std::path::Path;
 
+pub use scratchy_core_common::sampled_rows::{EmptySequence, SampledRows};
+
 /// Opaque token identifying a model registered with the backend.
 ///
 /// `0` is reserved for the primary (target) model loaded via the executor's
@@ -138,23 +140,10 @@ pub struct ForwardArgmaxRequest<'a> {
     pub max_seqlen_q: usize,
     pub max_seqlen_k: usize,
     pub num_tokens: usize,
-    /// `true` when this is a spec-decode verify batch (at least one
-    /// req carries `spec_token_ids`). Backend forwards this into the
-    /// lm_head slice's runtime gate so the slice (which writes only
-    /// the last logits row) is skipped and the full GEMM fires
-    /// instead — rejection sampling needs every row populated.
-    /// `false` for non-spec prefill/decode and for draft-model
-    /// lockstep prefill / K-step chain forwards.
-    pub has_spec_tokens: bool,
-    /// `[num_sample_rows]` u32 — per-sample-row source index into the
-    /// `[num_tokens, hidden]` activation produced by the forward.
-    /// Mirrors Python vLLM's `logits_indices = query_start_loc[1:] - 1`.
-    /// Backends
-    /// thread it into their lm_head fast path so the GEMM runs at
-    /// `M = num_sample_rows` instead of `M = num_tokens`. `None`
-    /// signals "no sampled tokens this step" (chunked-prefill
-    /// intermediate chunks) — backends fall back to the full GEMM.
-    pub last_token_indices: Option<&'a [u32]>,
+    /// The rows the forward samples ([`SampledRows::rows`]): Python vLLM's `logits_indices`. The
+    /// forward's logits, and the argmax the backend returns, are theirs, in order. `None`: each
+    /// sequence's last row.
+    pub sampled_rows: Option<&'a [u32]>,
     /// `[num_tokens, hidden]` row-major, model dtype: the final (post-norm) hidden state each row
     /// of a multi-token-prediction head reads — its target's, or its own from the pass before.
     /// `None` for every other model.
@@ -172,9 +161,9 @@ pub struct ForwardArgmaxRequest<'a> {
 /// See module docs for the design rationale.
 pub trait SpecDecodeBackend {
     /// Run a forward pass against `model` + `kv_pool` with the inputs in
-    /// `req`, plus a per-row argmax over the resulting `[req.num_tokens,
-    /// vocab]` logits. Blocks the calling thread until completion.
-    /// Returns per-row argmax IDs (length == `req.num_tokens`).
+    /// `req`, plus a per-row argmax over its logits — its sampled rows'
+    /// (`req.sampled_rows`). Blocks the calling thread until completion.
+    /// Returns an argmax ID per sampled row, in order.
     fn forward_argmax_blocking(
         &mut self,
         model: ModelHandle,

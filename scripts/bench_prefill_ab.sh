@@ -146,12 +146,15 @@ wait_wired_settled() {
 
 # --- prompts and requests ----------------------------------------------------
 
-# Natural filler paragraph, 75 words. Used for the long/batch shapes (labels,
-# not rung targets) and, cut to a token budget, for the rung shapes: a prompt
-# of repeated identical tokens routes MoE traffic to the same few experts, so
-# it times a workload real text never produces — the exact token count lives
-# in the server log's request-finished `prompt_tokens=N` line either way.
+# Natural filler paragraph of FILLER_WORDS words. Used for the long/batch
+# shapes (labels, not rung targets) and, cut to a token budget, for the rung
+# shapes: a prompt of repeated identical tokens routes MoE traffic to the same
+# few experts, so it times a workload real text never produces — the exact
+# token count lives in the server log's request-finished `prompt_tokens=N`
+# line either way.
 FILLER='The quick brown fox jumps over the lazy dog while the server warms its weights and the scheduler queues the first prefill chunk. Every op is a compile-time constant here: the tape was expanded at build time, the buckets were chosen, and the kernels only wait for their barriers. Latency is the only variable left, so we measure it twice, in both orders, because the second server always pays for the first one teardown.'
+read -ra filler_words <<<"$FILLER"
+FILLER_WORDS=${#filler_words[@]}
 
 # Word-approximate prompt of ~$1 tokens (repeats of the filler).
 synth_prompt() { # $1 = target tokens
@@ -159,18 +162,20 @@ synth_prompt() { # $1 = target tokens
   for _ in $(seq 1 "$reps"); do printf '%s ' "$FILLER"; done
 }
 
-# Natural-text prompt cut to a token budget: words-per-token calibrated on
-# this filler (23,700 words -> 27,502 tokens => 0.8618 words/token), so a
-# $1-token target becomes $1 * 0.8618 words of filler. Approximate on
-# purpose — the rung check warns if the prompt misses its rung.
+# Natural-text prompt cut to a token budget: the words of filler a $1-token
+# budget buys, measured on this filler (316 repeats ran to 27,502 tokens).
+# Re-measure if FILLER's text changes. Approximate on purpose — the rung check
+# warns if the prompt misses its rung.
 synth_natural() { # $1 = target tokens
   local k reps rem i
-  k=$(( $1 * 8618 / 10000 ))
-  reps=$(( k / 75 )); rem=$(( k % 75 ))
+  k=$(( $1 * 316 * FILLER_WORDS / 27502 ))
+  reps=$(( k / FILLER_WORDS )); rem=$(( k % FILLER_WORDS ))
   # while, not `seq 1 $reps`: BSD seq prints two lines for a zero-count range
   i=0
   while [ "$i" -lt "$reps" ]; do printf '%s ' "$FILLER"; i=$(( i + 1 )); done
-  [ "$rem" -gt 0 ] && echo "$FILLER" | cut -d' ' -f1-"$rem"
+  # if, not `&&`: as the last command, a false test would return 1, and under
+  # `set -e` the caller's `PROMPT=$(…)` would end the script without a word.
+  if [ "$rem" -gt 0 ]; then echo "$FILLER" | cut -d' ' -f1-"$rem"; fi
 }
 
 # request_json <max_tokens> <prompt>  (prompt travels via env, not argv, so
@@ -290,6 +295,17 @@ prompt_for_shape() { # $1 shape
     *) synth_natural $(( $1 - TEMPLATE_PAD )) ;;
   esac
 }
+
+# Each shape's prompt is made up front too, so a shape that gets none is
+# refused before anything is built or served: a rung whose budget past
+# --template-pad buys no word of filler, a name that is neither a shape nor a
+# number, an empty --prompt-file.
+for shape in ${SHAPES//,/ }; do
+  [ -n "$(prompt_for_shape "$shape")" ] || {
+    echo "--shapes $shape gives an empty prompt (--template-pad $TEMPLATE_PAD)" >&2
+    exit 2
+  }
+done
 
 # --- one-shot setup ------------------------------------------------------------
 

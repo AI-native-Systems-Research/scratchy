@@ -387,7 +387,7 @@ fn attrkey(k: &AttrKey) -> Result<Key> {
         Predicate => Key::As(KAttrKey::Predicate),
 
         // The function's, not an operation's.
-        SymName | Grid | Noinline | FoldedGridLoop => Key::OnFunction,
+        SymName | Grid | Noinline | FoldedGridLoop | UnrolledGridLoop => Key::OnFunction,
 
         // Ours. See the note above.
         Pattern | WorkDivision | Index | DataBounds | OutputPartition | PtRows | XrfCapacity
@@ -624,6 +624,7 @@ fn opkind(k: &OpKind) -> Result<KOpKind> {
             "tensor.extract_slice" => KOpKind::TensorExtractSlice,
             "tensor.insert_slice" => KOpKind::TensorInsertSlice,
             "tensor.from_elements" => KOpKind::TensorFromElements,
+            "tensor.reshape" => KOpKind::TensorReshape,
             other => {
                 return Err(refuse(format!(
                     "`{other}` is carried as our `OpKind::Other` and has no arm here. If \

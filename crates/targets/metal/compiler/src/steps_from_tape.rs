@@ -116,8 +116,6 @@ pub enum Refused {
     CodecUnanchored,
     /// A sample-rows step whose construct holds no matmul.
     NoSampledMatmul,
-    /// A sampled matmul metal lowers no slice of (only an MLX-affine one).
-    SampledNotAffine,
 }
 
 impl std::fmt::Display for StepRefusal {
@@ -1314,7 +1312,7 @@ impl Recording<'_> {
                 }
                 Ok(e)
             }
-            // A gated command routing its token itself: the expert fold it extends.
+            // A gated command routing each of its tokens itself: the expert fold it extends.
             (F::MoeRouted, Sh::Routed { .. }) => {
                 let driven = self.folds.driven(self.steps.slot[i]);
                 let expert = driven.iter().rev().find(|f| f.kernel != F::MoeRouted);
@@ -1878,20 +1876,37 @@ impl Recording<'_> {
                 ends,
             }),
         };
-        let (Some(step), MetalStep::AffineQmm(g)) = (step, &plain) else {
-            return match step {
-                None => Ok(em(plain, &reads, &[out], site)),
-                Some(_) => Err(self.no(i, Refused::SampledNotAffine)),
-            };
+        let Some(step) = step else {
+            return Ok(em(plain, &reads, &[out], site));
         };
-        // The scatter also puts the gathered activation back.
+        let sampled = match plain {
+            MetalStep::AffineQmm(g) => st::SampledMatmul::Affine(g),
+            MetalStep::Gemm(input, out, layer, n, k) => {
+                st::SampledMatmul::Dense(input, out, layer, n, k)
+            }
+            _ => return Err(self.no(i, Refused::FusionShape)),
+        };
+        // The scatter puts the gathered activation back, or moves every row's logits' sampled
+        // rows to the front.
         let (reads, writes): (&[Slot], &[Slot]) = match step {
             R::Gather => (&[input], &[input]),
             R::Matmul => (&[input], &[out]),
             R::Scatter => (&[input, out], &[input, out]),
             R::AllRows => (&[input, out], &[out]),
         };
-        Ok(em(MetalStep::SampleRows(*g, step), reads, writes, site))
+        Ok(em(
+            MetalStep::SampleRows(sampled, step),
+            reads,
+            writes,
+            site,
+        ))
+    }
+
+    /// Whether op `i` is of the logit tail the shared pass left over its sampled rows' construct
+    /// ([`scratchy_subtile::sample_rows::sampled_logit_tail`]), whose rows are the sampled rows'
+    /// logits alone.
+    fn in_logit_tail(&self, i: usize) -> bool {
+        scratchy_subtile::sample_rows::sampled_logit_tail(&self.l.input).contains(&i)
     }
 
     /// A step no fold touches, lowered on its own.
@@ -1960,6 +1975,9 @@ impl Recording<'_> {
             }
             L::Elementwise(E::GeluErf) => unary(&|i, o, w| S::Activation(i, o, w, Act::GeluErf))?,
             L::Elementwise(E::Relu2) => unary(&|i, o, w| S::Activation(i, o, w, Act::Relu2))?,
+            L::TanhSoftCap { .. } if self.in_logit_tail(i) => {
+                unary(&|a, b, w| S::SampledLogits(a, b, st::LogitOp::SoftCap, w))?
+            }
             L::TanhSoftCap { .. } => unary(&S::TanhSoftCap)?,
             L::RmsNorm { gain, .. } => self.norm(i, gain)?,
             L::MatmulTile { .. } => {
@@ -2132,6 +2150,10 @@ impl Recording<'_> {
             L::SiluMul => return Err(self.no(i, Refused::SplitSiluMul)),
             // Identity — the op's buffer IS its operand's (in place by contract).
             L::ScalarMul { scale: 1.0 } => return Ok(None),
+            L::ScalarMul { scale } if self.in_logit_tail(i) => {
+                let op = st::LogitOp::Scale(st::Scale(scale));
+                unary(&|a, b, w| S::SampledLogits(a, b, op, w))?
+            }
             L::ScalarMul { scale } => unary(&|a, b, w| S::ScalarMul(a, b, st::Scale(scale), w))?,
             // The accessor is the UPSTREAM gemm's LinearLayer (the bias rides on it): base name,
             // layer and storage all come from that gemm.

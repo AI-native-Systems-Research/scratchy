@@ -565,8 +565,8 @@ fn sorted_gathered_moe_matches_the_token_order_chain() {
     }
 }
 
-/// The routing of one token's `logits` by `program`: the routing command's picks and scores, then
-/// the fused kernels over them, against the gated kernel routing the token itself and storing the
+/// The routing of the block's `logits` by `program`: the routing command's picks and scores, then
+/// the fused kernels over them, against the gated kernel routing each token itself and storing the
 /// picks and scores the combine then reads. `time`: the chains' best times per run, in µs.
 fn routed_matches_the_routing_command(
     device: &common::Device,
@@ -574,8 +574,9 @@ fn routed_matches_the_routing_command(
     program: RouteProgram,
     time: bool,
 ) -> Result<Option<(f64, f64)>, String> {
+    let tokens = block.tokens;
     let mut rng = Lcg(0xfeed);
-    let logits = rng.bf16s(EXPERTS, -3.0, 3.0);
+    let logits = rng.bf16s(tokens * EXPERTS, -3.0, 3.0);
     let expert_scale = common::shared_slice(device, &rng.bf16s(EXPERTS, 0.5, 1.5));
     let experts = NumExperts(EXPERTS as u32);
     let top_k = TopK(TOP_K as u32);
@@ -594,8 +595,8 @@ fn routed_matches_the_routing_command(
     // Each chain's picks and scores; the routed chain's start zero, its gated kernel's to store.
     let picks = || {
         (
-            common::shared_zeroed(device, TOP_K * 4),
-            common::shared_zeroed(device, TOP_K * 2),
+            common::shared_zeroed(device, tokens * TOP_K * 4),
+            common::shared_zeroed(device, tokens * TOP_K * 2),
         )
     };
     let ((inds, scores), (routed_inds, routed_scores)) = (picks(), picks());
@@ -615,10 +616,10 @@ fn routed_matches_the_routing_command(
         .pipeline(device, "affine_gather_qmv_gated", gated_c);
     let zeroed = |n: usize| common::shared_zeroed(device, n * 2);
     let (gate_y, up_y, down_y, out) = (
-        zeroed(TOP_K * INTER),
-        zeroed(TOP_K * INTER),
-        zeroed(TOP_K * HIDDEN),
-        zeroed(HIDDEN),
+        zeroed(tokens * TOP_K * INTER),
+        zeroed(tokens * TOP_K * INTER),
+        zeroed(tokens * TOP_K * HIDDEN),
+        zeroed(tokens * HIDDEN),
     );
     let chain = |routed: bool| {
         let (gy, uy, dy, o) = match routed {
@@ -649,7 +650,8 @@ fn routed_matches_the_routing_command(
             false => chain.push(Dispatch {
                 pso: &route,
                 buffers: vec![(&in_place, 0), (&inds, 1), (&scores, 2), (&expert_scale, 3)],
-                groups: size(1, 1, 1),
+                // One threadgroup per token, as the command dispatches it.
+                groups: size(1, tokens, 1),
                 threads: size(32, 1, 1),
             }),
             true => g.extend([(&read, 10), (sc, 11), (&expert_scale, 12)]),
@@ -659,38 +661,40 @@ fn routed_matches_the_routing_command(
             pso: gated,
             buffers: g,
             // Pairs along X, as the fused path.
-            groups: size(TOP_K, INTER.div_ceil(8), 1),
+            groups: size(tokens * TOP_K, INTER.div_ceil(8), 1),
             threads: size(32, 4, 1),
         });
         chain.push(Dispatch {
             pso: &block.combine,
             buffers: c,
-            groups: size(1, HIDDEN.div_ceil(4), 1),
+            groups: size(tokens, HIDDEN.div_ceil(4), 1),
             threads: size(32, TOP_K, 1),
         });
         chain
     };
     run(device, 1, 1, |_| chain(false));
     run(device, 1, 1, |_| chain(true));
-    let picked = common::read_slice::<u32>(&inds, TOP_K);
-    let mut distinct = picked.clone();
-    distinct.sort_unstable();
-    distinct.dedup();
-    if distinct.len() != TOP_K || picked.iter().any(|&e| e as usize >= EXPERTS) {
-        return Err(format!("the routing command's picks {picked:?}"));
+    let picked = common::read_slice::<u32>(&inds, tokens * TOP_K);
+    for (t, row) in picked.chunks(TOP_K).enumerate() {
+        let mut distinct = row.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        if distinct.len() != TOP_K || row.iter().any(|&e| e as usize >= EXPERTS) {
+            return Err(format!("token {t}: the routing command's picks {row:?}"));
+        }
     }
-    if picked != common::read_slice::<u32>(&routed_inds, TOP_K) {
+    if picked != common::read_slice::<u32>(&routed_inds, tokens * TOP_K) {
         return Err("the stored picks differ".into());
     }
-    if bits(&scores, TOP_K) != bits(&routed_scores, TOP_K) {
+    if bits(&scores, tokens * TOP_K) != bits(&routed_scores, tokens * TOP_K) {
         return Err("the stored scores differ".into());
     }
-    let act = bits(&block.fused_gate_y, TOP_K * INTER);
-    if act != bits(&gate_y, TOP_K * INTER) {
+    let act = bits(&block.fused_gate_y, tokens * TOP_K * INTER);
+    if act != bits(&gate_y, tokens * TOP_K * INTER) {
         return Err("act(gate) * up differs".into());
     }
-    let combined = bits(&block.fused_out, HIDDEN);
-    if combined.iter().all(|&v| v == 0) || combined != bits(&out, HIDDEN) {
+    let combined = bits(&block.fused_out, tokens * HIDDEN);
+    if combined.iter().all(|&v| v == 0) || combined != bits(&out, tokens * HIDDEN) {
         return Err("the combined rows differ".into());
     }
     // Timed after the checks: the routing command's softmax runs in place.
@@ -706,7 +710,6 @@ fn routed_matches_the_routing_command(
 fn routed_moe_kernels_match_the_routing_command_then_the_fused_kernels() {
     let Some(d) = detect_device() else { return };
     let device = d.device;
-    let block = Block::new(&device, 1, true, EXPERTS, SharedExperts::Apart);
     // Gemma-4's program, and the shared-expert router's (a softmax over every expert first).
     let gemma = RouteProgram {
         pre: RoutePre::None,
@@ -722,9 +725,14 @@ fn routed_moe_kernels_match_the_routing_command_then_the_fused_kernels() {
         expert_scale: None,
         post_scale: None,
     };
-    for (what, program) in [("gemma", gemma), ("shared", shared)] {
-        routed_matches_the_routing_command(&device, &block, program, false)
-            .unwrap_or_else(|e| panic!("{what}: {e}"));
+    // The routed kernel serves the decode bucket and the verify-sized ones: its pairs run apart,
+    // each threadgroup deriving its own token's picks from the logits.
+    for tokens in [1, 2, 4, 8] {
+        let block = Block::new(&device, tokens, true, EXPERTS, SharedExperts::Apart);
+        for (what, program) in [("gemma", gemma), ("shared", shared)] {
+            routed_matches_the_routing_command(&device, &block, program, false)
+                .unwrap_or_else(|e| panic!("tokens={tokens} {what}: {e}"));
+        }
     }
 }
 

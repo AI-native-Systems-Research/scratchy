@@ -1701,12 +1701,15 @@ pub(crate) fn superdsc_forward_chunk(
     Ok(ChunkOut::Rows(logits_rows))
 }
 
-/// The request a [`forward_chunk`] runs for: its state, its id, and the live store its tokens and
-/// token-count live in. Grouped because both `forward_chunk` definitions take all three together.
-pub(crate) struct ChunkRequest<'a> {
-    pub(crate) req: &'a mut ReqState,
+/// What a [`forward_chunk`] runs: one request's chunk, the tokens `toks` at absolute positions
+/// `start..start + toks.len()`, with the request's state, its id, and the store its tokens and
+/// token count live in.
+pub(crate) struct Chunk<'a> {
+    pub(crate) state: &'a mut ReqState,
     pub(crate) id: &'a str,
     pub(crate) tokens: &'a mut scratchy_serving_engine::input_batch::InputBatch,
+    pub(crate) start: usize,
+    pub(crate) toks: &'a [usize],
 }
 
 /// Run `b` ONCE for `toks` at absolute positions `start..start+toks.len()`
@@ -1721,9 +1724,13 @@ pub(crate) fn forward_chunk(
     // The preserved prefill meta for the batched-prefill path, bound to the distinct prefill SESSION
     // by run_prefill_batch. None for every non-batched path (they use `b`, the decode meta).
     prefill_meta: Option<&BundleMeta>,
-    rq: ChunkRequest<'_>,
-    start: usize,
-    toks: &[usize],
+    Chunk {
+        state: req,
+        id,
+        tokens,
+        start,
+        toks,
+    }: Chunk<'_>,
     // The host's list + the pool's owner split: every bind DERIVES this request's page map, and the map's
     // fully-masked and hole pages come from the range the host is never told about.
     ctx: PageMapCtx<'_>,
@@ -1774,15 +1781,15 @@ pub(crate) fn forward_chunk(
     session: &mut SpyreSession,
     b: &BundleMeta,
     prefill_meta: Option<&BundleMeta>,
-    // `rq.id` is unused here — the emulator is handed its `toks` and never re-slices the history — but
-    // present so the two `forward_chunk` definitions have ONE signature. A cfg pair that differs in
-    // shape is a second call site the other cfg never compiles.
-    rq: ChunkRequest<'_>,
-    start: usize,
-    toks: &[usize],
+    Chunk {
+        state: req,
+        id,
+        tokens,
+        start,
+        toks,
+    }: Chunk<'_>,
 ) -> ExecutorResult<ChunkOut> {
-    let ChunkRequest { req, id, tokens } = rq;
-    let _ = (prefill_meta, id); // the batched-prefill session pair is a sendnn-only shape
+    let _ = prefill_meta; // the batched-prefill session pair is a sendnn-only shape
     let n = toks.len();
     // KTIR caps a forward at the baked m_cap. The sendnn paged prefill runs the
     // WHOLE prompt in one forward (s0 = padded bucket up to capacity), so its only
@@ -2232,13 +2239,13 @@ pub(crate) fn run_request_step(
             &mut model.session,
             b,
             model.batched_prefill.as_ref(),
-            ChunkRequest {
-                req: &mut *req,
+            Chunk {
+                state: req,
                 id,
-                tokens: &mut *tokens,
+                tokens,
+                start: pos,
+                toks: chunk,
             },
-            pos,
-            chunk,
             #[cfg(feature = "spyre-hw")]
             ctx,
             #[cfg(feature = "spyre-hw")]

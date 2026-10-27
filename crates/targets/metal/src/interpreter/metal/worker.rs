@@ -34,6 +34,7 @@ use crate::sparse_arena::SparseBuffer;
 use crate::tape::constants::TapeVariant;
 use crate::tape::ids::SourceIx;
 use crate::tape::lowered::ModelSources;
+use crate::tape::lowered::{PerScratch, ScratchKind};
 #[cfg(feature = "forward-telemetry")]
 use scratchy_core_common::forward_telemetry::{
     ForwardRecord, ForwardTelemetry, KernelKind, TapeEntry,
@@ -65,14 +66,14 @@ impl Activation {
 }
 
 /// What a pool's worker maps as its buckets reach it ([`SparseBuffer`]) rather than allocating in
-/// full: each bucket's bytes in each arena slot, in bucket order (`MetalBucketSpec::arena_bytes`),
+/// full: each bucket's bytes in each arena slot, in bucket order (`MetalBucketSpec::slot_bytes`),
 /// and the slots the host reads by pointer, which stay allocated in full and shared — every
-/// bucket's backbone hidden states (an MTP head's next input; an encoder's output, which is its
-/// terminal slot too) and, where the pool's owner reads its logits on the host, every terminal slot
-/// ([`TerminalReads`]).
+/// bucket's backbone hidden states (a forward's `hidden_out` rows; an encoder's output, which is
+/// its terminal slot too) and, where the pool's owner reads its logits on the host, every terminal
+/// slot ([`TerminalReads`]). A guest's host reads none ([`ArenaShare::In`]).
 #[derive(Clone, Default)]
 pub struct SparsePlan {
-    pub bucket_arena: Vec<&'static [u64]>,
+    pub bucket_arena: Vec<Vec<u64>>,
     pub host_slots: Vec<u32>,
 }
 
@@ -85,20 +86,237 @@ pub enum TerminalReads {
     Host,
 }
 
-/// A worker's arena slots and scratch, lent to a new worker of a model that never runs at the same
-/// time ([`scratchy_core_common::lend`]): it places its own in them, allocating only what they do
-/// not hold.
+/// An arena slot: the buffer a tape's colour lives in, an index into a worker's `arena`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Slot(pub usize);
+
+/// A slot's place in its model's [`ArenaRanks`]: a guest's slot of rank `r` is its host's slot
+/// of rank `r`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Rank(pub usize);
+
+/// One `T` per rank, rank 0 first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ByRank<T>(Vec<T>);
+
+impl<T> Default for ByRank<T> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<T> ByRank<T> {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn get(&self, rank: Rank) -> Option<&T> {
+        self.0.get(rank.0)
+    }
+
+    /// Each rank with its value.
+    pub fn iter(&self) -> impl Iterator<Item = (Rank, &T)> {
+        self.0.iter().enumerate().map(|(r, v)| (Rank(r), v))
+    }
+}
+
+impl<T> FromIterator<T> for ByRank<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+/// A model's arena slots by size, largest first — each slot's bytes at its largest bucket, ties by
+/// slot — baked at expansion: the order in which two models whose forwards never overlap share one
+/// arena ([`ArenaShare`]). The guest's slot of rank `r` is its host's slot of rank `r`, which the
+/// host sizes to hold both ([`Hosting`]). Built only by [`Self::new`], which checks what it holds.
+#[derive(Clone, Copy, Debug)]
+pub struct ArenaRanks {
+    /// Every slot: the order in which it takes its host's slots, as a guest.
+    all: &'static [u32],
+    /// Every slot but the buckets' final hidden states: the order in which it holds a guest's
+    /// slots, as a host. A guest reads its host's hidden states after its own forward has begun —
+    /// an MTP head's pass 1 once a run of rows — so it shares none of them.
+    hosting: &'static [u32],
+}
+
+impl ArenaRanks {
+    /// No slots: the ranks of a model whose arena is never shared (a test's).
+    pub const NONE: Self = Self::new(&[], &[], &[]);
+
+    /// The ranks of the model whose buckets are `buckets`: `all`, every slot of `0..all.len()` once
+    /// — every slot of every bucket among them — and `hosting`, `all` in its order less each
+    /// bucket's final hidden states (`backbone_slot`, read off the buckets themselves). Checked
+    /// here, which the `static` the macro emits them in evaluates as it compiles: ranks breaking
+    /// any of it fail the model's build.
+    pub const fn new(
+        all: &'static [u32],
+        hosting: &'static [u32],
+        buckets: &[super::pool::MetalBucketSpec],
+    ) -> Self {
+        let n = all.len();
+        let mut b = 0;
+        while b < buckets.len() {
+            assert!(
+                (buckets[b].num_arena_slots as usize) <= n,
+                "ArenaRanks: a bucket's slot is unranked"
+            );
+            b += 1;
+        }
+        let mut i = 0;
+        while i < n {
+            assert!(
+                (all[i] as usize) < n,
+                "ArenaRanks: a ranked slot past the arena"
+            );
+            let mut j = i + 1;
+            while j < n {
+                assert!(all[i] != all[j], "ArenaRanks: a slot ranked twice");
+                j += 1;
+            }
+            i += 1;
+        }
+        let (mut a, mut h) = (0, 0);
+        while a < n {
+            let mut is_hidden = false;
+            let mut k = 0;
+            while k < buckets.len() {
+                is_hidden |= buckets[k].backbone_slot == all[a];
+                k += 1;
+            }
+            if !is_hidden {
+                assert!(
+                    h < hosting.len() && hosting[h] == all[a],
+                    "ArenaRanks: the hosting ranks are not every slot but the hidden states', in \
+                     rank order"
+                );
+                h += 1;
+            }
+            a += 1;
+        }
+        assert!(
+            h == hosting.len(),
+            "ArenaRanks: a hosting rank past the slots"
+        );
+        Self { all, hosting }
+    }
+
+    /// The slots of an arena of `len` slots, in the order of `ranks`.
+    fn within(ranks: &[u32], len: usize) -> impl Iterator<Item = Slot> + '_ {
+        (ranks.iter().map(|&s| Slot(s as usize))).filter(move |s| s.0 < len)
+    }
+
+    /// As a guest with an arena of `len` slots: its slots, rank by rank — every one of them, its
+    /// ranks naming every slot of its largest arena.
+    pub fn guest_slots(&self, len: usize) -> ByRank<Slot> {
+        Self::within(self.all, len).collect()
+    }
+
+    /// As a host with an arena of `len` slots, of a guest of `count` ranks: the slot each rank
+    /// takes — the host's hosting slots in order, then fresh slots past its own for the rest.
+    pub fn hosting_slots(&self, len: usize, count: usize) -> ByRank<Slot> {
+        let hosting = Self::within(self.hosting, len);
+        hosting.chain((len..).map(Slot)).take(count).collect()
+    }
+}
+
+/// What a guest of a pool's arena needs of it ([`ArenaShare::Hosts`]): its slots' bytes, rank by
+/// rank ([`ArenaRanks::guest_slots`]), and its scratch by kind. The host reads none of a guest's
+/// slots by pointer, so any may be sparse.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GuestArena {
+    /// Each rank's bytes: the largest of its kept buckets'.
+    pub arena: ByRank<u64>,
+    /// The host's scratch of each kind is the guest's too.
+    pub scratch: PerScratch<u64>,
+}
+
+/// A host's arena grown to hold its guest's ([`ArenaShare::Hosts`]): the one arena the two models'
+/// forwards run in, which the host allocates and the memory budget prices, and the slot of it each
+/// guest rank takes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hosting {
+    pub layout: ArenaLayout,
+    pub slots: ByRank<Slot>,
+}
+
+impl Hosting {
+    /// `layout`, a host's own arena ranked `ranks`, with each slot a rank of `guest` takes
+    /// ([`ArenaRanks::hosting_slots`]) at least that rank's bytes.
+    pub fn of(layout: &[u64], ranks: &ArenaRanks, guest: &GuestArena) -> Self {
+        let slots = ranks.hosting_slots(layout.len(), guest.arena.len());
+        let len = (slots.iter().map(|(_, s)| s.0 + 1)).fold(layout.len(), usize::max);
+        let mut out = layout.to_vec();
+        out.resize(len, 0);
+        for ((_, &Slot(slot)), (_, &bytes)) in slots.iter().zip(guest.arena.iter()) {
+            out[slot] = out[slot].max(bytes);
+        }
+        Self { layout: out, slots }
+    }
+
+    /// A host's scratch `own` grown to hold `guest`'s, kind by kind.
+    pub fn scratch(own: PerScratch<u64>, guest: &GuestArena) -> PerScratch<u64> {
+        PerScratch::from_fn(|kind| own[kind].max(guest.scratch[kind]))
+    }
+}
+
+/// What a host pool shares with its guest ([`ArenaShare::In`]): the slot each guest rank takes, its
+/// scratch by kind; and its TurboQuant scratch, which a guest of the same geometry stages through,
+/// and whole TurboQuant runtime — its packed KV stores, codebook and scratch — which a guest
+/// reading the host's KV binds (an MTP head with none of its own).
 #[derive(Clone, Default)]
-pub struct LentActivation {
-    /// Arena slots, as the borrower's arena slots.
-    pub arena: Vec<Activation>,
-    /// Scratch: private storage, as the borrower's scratch.
-    pub scratch: Vec<Activation>,
-    /// A TurboQuant pool's fp16 scratch, staged through by a borrower of the same geometry.
+pub struct HostArena {
+    pub arena: ByRank<Activation>,
+    pub scratch: PerScratch<Option<Activation>>,
     pub tq_scratch: Option<super::runtime::TqScratch>,
-    /// The lender's whole TurboQuant runtime — its packed KV stores, codebook and scratch: a
-    /// borrower that reads the lender's KV (an MTP head with none of its own) binds them.
     pub tq: Option<super::runtime::TqRuntimeBuffers>,
+}
+
+/// How a pool's arena relates to that of a model whose forwards never overlap its own, and follow
+/// them on its command buffer: an MTP head's, its target's.
+#[derive(Clone, Default)]
+pub enum ArenaShare {
+    /// Its arena is its own.
+    #[default]
+    Own,
+    /// It holds the guest's arena in its own ([`Hosting`]).
+    Hosts(GuestArena),
+    /// Its arena and scratch are its host's, rank by rank and kind by kind. The host reads none
+    /// of them by pointer: neither its hidden states nor its logits.
+    In(Box<HostArena>),
+}
+
+impl ArenaShare {
+    /// A pool's share: holding `guest`'s arena (its model's guest, set before the pool is built),
+    /// or in `host`'s (its device's host). A model is a host or a guest, never both.
+    pub fn of(guest: Option<&GuestArena>, host: Option<&HostArena>) -> Self {
+        match (guest, host) {
+            (Some(guest), None) => Self::Hosts(guest.clone()),
+            (None, Some(host)) => Self::In(Box::new(host.clone())),
+            (None, None) => Self::Own,
+            (Some(_), Some(_)) => panic!("a pool both holds a guest's arena and runs in a host's"),
+        }
+    }
+
+    pub fn role(&self) -> ArenaRole {
+        match self {
+            Self::Own => ArenaRole::Own,
+            Self::Hosts(_) => ArenaRole::Host,
+            Self::In(_) => ArenaRole::Guest,
+        }
+    }
+}
+
+/// What a pool is to the arena it runs in ([`ArenaShare`]), without the buffers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArenaRole {
+    Own,
+    Host,
+    Guest,
 }
 
 /// One unit of execution in a bucket's plan.
@@ -226,6 +444,28 @@ pub enum WorkerError {
     SparseMap { bucket: usize, reason: String },
     /// The queue the sparse activations map on could not be created.
     SparseMapper { reason: String },
+    /// A guest's `part` needs `need` bytes of its host's arena, which holds `has`: the host was
+    /// sized for another guest, or for none.
+    HostShort { part: HostPart, need: u64, has: u64 },
+    /// A guest's slot `slot` has no rank, so no slot of its host's: its ranks are another
+    /// model's.
+    GuestSlotUnranked { slot: Slot },
+}
+
+/// What of its host's arena a guest takes: the slot of a rank, or the scratch of a kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostPart {
+    Slot(Rank),
+    Scratch(ScratchKind),
+}
+
+impl std::fmt::Display for HostPart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Slot(Rank(rank)) => write!(f, "arena slot of rank {rank}"),
+            Self::Scratch(kind) => f.write_str(kind.what()),
+        }
+    }
 }
 
 impl std::fmt::Display for WorkerError {
@@ -306,6 +546,16 @@ impl std::fmt::Display for WorkerError {
                     "MetalWorker: the sparse activations' mapping queue: {reason}"
                 )
             }
+            Self::HostShort { part, need, has } => write!(
+                f,
+                "MetalWorker: a guest's {part} needs {need} bytes of its host's arena, which \
+                 holds {has}: the host was sized for another guest"
+            ),
+            Self::GuestSlotUnranked { slot: Slot(slot) } => write!(
+                f,
+                "MetalWorker: a guest's arena slot {slot} has no rank, so no slot of its host's: \
+                 its ranks are another model's"
+            ),
         }
     }
 }
@@ -331,14 +581,16 @@ pub enum SourceMiss {
 /// references threaded through `new`.
 pub struct MetalWorker<W: CanonicalParams> {
     pub arena: Vec<Buffer>,
-    /// The arena slots as allocated, to lend ([`Self::activation`]).
+    /// The arena slots as allocated, to share with a guest ([`Self::hosted`]).
     arena_activation: Vec<Activation>,
+    /// The slot each rank of its guest takes, as a host ([`Hosting::slots`]); none otherwise.
+    hosting: ByRank<Slot>,
     /// Residency pins for every buffer the baked dispatches reach by address.
     _pins: Vec<crate::residency::Pinned>,
     pub bucket_bakings: Vec<BucketBaking>,
-    /// The scratch buffers the baked dispatches bind by address (split-K, MoE, roped K, hd512
-    /// unfused: those some tape needs, see [`Self::new_with_residency`]), held for them.
-    scratch: Vec<Activation>,
+    /// The scratch buffers the baked dispatches bind by address, by kind (those some tape needs,
+    /// see [`Self::new_with_residency`]), held for them.
+    scratch: PerScratch<Option<Activation>>,
     /// The sparse activations and how far each bucket reaches in them; `None` when every
     /// activation is allocated in full.
     sparse: Option<SparseActivation>,
@@ -405,12 +657,14 @@ impl SparseActivation {
 }
 
 impl<W: CanonicalParams> MetalWorker<W> {
-    /// This worker's arena slots and scratch, to lend ([`LentActivation`]).
-    pub fn activation(&self) -> LentActivation {
-        let (arena, scratch) = (self.arena_activation.clone(), self.scratch.clone());
-        LentActivation {
-            arena,
-            scratch,
+    /// What this worker shares with its guest ([`HostArena`]): the slot each guest rank takes, and
+    /// its scratch. A worker hosting no guest shares no slot.
+    pub fn hosted(&self) -> HostArena {
+        HostArena {
+            arena: (self.hosting.iter())
+                .map(|(_, &Slot(slot))| self.arena_activation[slot].clone())
+                .collect(),
+            scratch: self.scratch.clone(),
             tq_scratch: None,
             tq: None,
         }
@@ -443,7 +697,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
             runtime,
             None,
             None,
-            &LentActivation::default(),
+            &ArenaShare::Own,
+            &ArenaRanks::NONE,
             None,
         )
     }
@@ -452,10 +707,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
     /// that worker-local arena slots get inserted into. Used by the
     /// pool to pin every per-worker arena into the wired set so cmdbuf
     /// dispatches don't race against Apple's lazy paging on
-    /// Llama-3.2-class working sets. The arena slots and scratch take
-    /// `lent` buffers where they hold them ([`LentActivation`]); with a
-    /// residency set and a `plan`, the rest are placement-sparse, mapped as
-    /// far as the buckets that run reach ([`SparsePlan`]).
+    /// Llama-3.2-class working sets. The arena and scratch are shared with
+    /// another model's as `share` says, by this model's `ranks`
+    /// ([`ArenaShare`]); with a residency set and a `plan`, what the host does
+    /// not read by pointer is placement-sparse, mapped as far as the buckets
+    /// that run reach ([`SparsePlan`]).
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_residency(
         device: Arc<Device>,
@@ -468,7 +724,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
         // The most rows a decode or verify step brings (`GpuDevice::max_decode_rows`): the decode
         // split's partials are reserved for at most these.
         decode_rows: Option<crate::tape::ids::DecodeRows>,
-        lent: &LentActivation,
+        share: &ArenaShare,
+        ranks: &ArenaRanks,
         plan: Option<&SparsePlan>,
     ) -> Result<Self, WorkerError> {
         // Arena slot count comes from the lowered tape (post-FUF
@@ -503,36 +760,51 @@ impl<W: CanonicalParams> MetalWorker<W> {
         // only what the buckets that run reach, where one allocated in full is zero-filled and wired
         // whole on the first forward, whatever its bucket.
         let plan = plan.filter(|_| residency.is_some());
-        let host_read = |slot: usize| plan.is_none_or(|p| p.host_slots.contains(&(slot as u32)));
         let make = |bytes: u64, mode, sparse: bool, what| match sparse {
             true => SparseBuffer::new(&device, bytes)
                 .map(Activation::Sparse)
                 .map_err(|_| WorkerError::BufferAlloc { what, bytes }),
             false => alloc(bytes, mode, what).map(Activation::Full),
         };
-        // Need `i`'s lent buffer, where one holds it; else it is allocated.
-        fn place<'a>(
-            needs: &[u64],
-            from: &'a [Activation],
-        ) -> impl Fn(usize) -> Option<Activation> + 'a {
+        let held = |a: &Activation| {
             use crate::interpreter::metal::__re::MTLBuffer as _;
-            let lengths: Vec<u64> = from.iter().map(|a| a.buffer().length() as u64).collect();
-            let lent = scratchy_core_common::lend::lend(needs, &lengths);
-            move |i| lent[i].map(|j| from[j].clone())
+            a.buffer().length() as u64
+        };
+        // A host holds its guest's slots too, rank by rank: each it hosts one in grown to that
+        // rank's bytes, fresh slots past its own for the ranks its hosting slots do not reach.
+        let (layout, hosting) = match share {
+            ArenaShare::Hosts(guest) => {
+                let Hosting { layout, slots } = Hosting::of(arena_layout, ranks, guest);
+                (layout, slots)
+            }
+            ArenaShare::Own | ArenaShare::In(_) => (arena_layout.clone(), ByRank::default()),
+        };
+        let host_read = |slot: usize| plan.is_none_or(|p| p.host_slots.contains(&(slot as u32)));
+        // A guest's slots are its host's, rank by rank, which the host sized to hold them.
+        let mut hosted: Vec<Option<Activation>> = vec![None; layout.len()];
+        if let ArenaShare::In(host) = share {
+            for (rank, &Slot(slot)) in ranks.guest_slots(layout.len()).iter() {
+                let taken = host.arena.get(rank);
+                let (need, has) = (layout[slot], taken.map_or(0, held));
+                let part = HostPart::Slot(rank);
+                hosted[slot] = Some(
+                    taken
+                        .filter(|_| has >= need)
+                        .ok_or(WorkerError::HostShort { part, need, has })?
+                        .clone(),
+                );
+            }
+            // Every slot is its host's: one its ranks miss would be allocated beside the host's
+            // arena, unpriced.
+            if let Some(slot) = hosted.iter().position(Option::is_none) {
+                return Err(WorkerError::GuestSlotUnranked { slot: Slot(slot) });
+            }
         }
         // Shared storage so test code can seed/inspect arena contents without staging copies, and
         // so the host can read the slots it reads by pointer; dispatch-bound buffers are fine in
-        // shared on Apple silicon — the existing `MetalAllocator` uses the same mode. A slot the
-        // host reads takes no lent sparse buffer: the host cannot read one.
-        let lent_slot = place(arena_layout, &lent.arena);
-        let arena_activation: Vec<Activation> = (arena_layout.iter().enumerate())
-            .map(|(i, &size)| match lent_slot(i) {
-                Some(Activation::Sparse(_)) if host_read(i) => make(
-                    size,
-                    MTLResourceOptions::StorageModeShared,
-                    false,
-                    "arena slot",
-                ),
+        // shared on Apple silicon — the existing `MetalAllocator` uses the same mode.
+        let arena_activation: Vec<Activation> = (layout.iter().zip(hosted).enumerate())
+            .map(|(i, (&size, hosted))| match hosted {
                 Some(activation) => Ok(activation),
                 None => make(
                     size,
@@ -549,9 +821,9 @@ impl<W: CanonicalParams> MetalWorker<W> {
         arena.iter().for_each(&mut pin);
 
         // A Private scratch buffer (the host never reads scratch back) per scratch the tapes bind
-        // (`LoweredMetalTape::scratch_bytes`: split-K, MoE, roped K, hd512 unfused), sized to the
-        // max across bucket tapes and pinned, since dispatches bind it by baked address; `None`
-        // when no tape needs it.
+        // (`LoweredMetalTape::scratch_bytes`, one a `ScratchKind`), sized to the max across bucket
+        // tapes and pinned, since dispatches bind it by baked address; `None` when no tape needs
+        // it.
         // - SplitK: successive `affine_qmm_t_splitk` / `splitk_reduce_sum` pairs run serially
         //   inside a single encoder.
         // - MoE: MoE blocks within one bucket execute serially through the dispatch; cross-bucket
@@ -562,34 +834,36 @@ impl<W: CanonicalParams> MetalWorker<W> {
         //   scratch, is the persistent artifact).
         // - hd512-unfused attention (q_head/Kdense/Vdense_T/scores/out_head packed at baked
         //   offsets): one buffer, overwritten per layer.
-        let sizes: [u64; 4] = std::array::from_fn(|i| {
-            let max = bucket_tapes
-                .iter()
-                .map(|t| t.scratch_bytes(decode_rows)[i])
+        let own: PerScratch<u64> = PerScratch::from_fn(|kind| {
+            let max = (bucket_tapes.iter())
+                .map(|t| t.scratch_bytes(decode_rows)[kind])
                 .max();
             max.map_or(0, u64::from)
         });
-        let lent_scratch = place(&sizes, &lent.scratch);
-        let private = MTLResourceOptions::StorageModePrivate;
-        let scratch = |i: usize, what| match lent_scratch(i) {
-            Some(activation) => Ok(Some(activation)),
-            None => (sizes[i] > 0)
-                .then(|| make(sizes[i], private, plan.is_some(), what))
-                .transpose(),
+        // A host's scratch of each kind holds its guest's too; a guest's is its host's.
+        let sizes = match share {
+            ArenaShare::Hosts(guest) => Hosting::scratch(own, guest),
+            ArenaShare::Own | ArenaShare::In(_) => own,
         };
-        let splitk_scratch = scratch(0, "splitk scratch")?;
-        let moe_scratch = scratch(1, "moe scratch")?;
-        let roped_k_scratch = scratch(2, "roped-K scratch")?;
-        let attn_unfused_scratch = scratch(3, "attn-unfused scratch")?;
-        let scratches = [
-            &splitk_scratch,
-            &moe_scratch,
-            &roped_k_scratch,
-            &attn_unfused_scratch,
-        ];
-        scratches
-            .into_iter()
-            .flatten()
+        let private = MTLResourceOptions::StorageModePrivate;
+        let scratch = PerScratch::try_from_fn(|kind| match share {
+            ArenaShare::In(host) if sizes[kind] > 0 => {
+                let taken = host.scratch[kind].as_ref();
+                let (need, has) = (sizes[kind], taken.map_or(0, held));
+                let part = HostPart::Scratch(kind);
+                let activation = taken.filter(|_| has >= need);
+                Ok(Some(
+                    activation
+                        .ok_or(WorkerError::HostShort { part, need, has })?
+                        .clone(),
+                ))
+            }
+            _ => (sizes[kind] > 0)
+                .then(|| make(sizes[kind], private, plan.is_some(), kind.what()))
+                .transpose(),
+        })?;
+        (scratch.iter())
+            .filter_map(|(_, a)| a.as_ref())
             .for_each(|a| pin(a.buffer()));
 
         // What each bucket binds of every sparse buffer: its arena bytes in a slot, its scratch
@@ -602,21 +876,20 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     "SparsePlan: one arena table per bucket tape"
                 );
                 let arena_needs = |slot: usize| -> Vec<usize> {
-                    let bytes = |t: &&[u64]| t.get(slot).copied().unwrap_or(0) as usize;
+                    let bytes = |t: &Vec<u64>| t.get(slot).copied().unwrap_or(0) as usize;
                     plan.bucket_arena.iter().map(bytes).collect()
                 };
-                let scratch_needs = |kind: usize| -> Vec<usize> {
+                let scratch_needs = |kind: ScratchKind| -> Vec<usize> {
                     let bytes = |t: &LoweredMetalTape| t.scratch_bytes(decode_rows)[kind] as usize;
                     bucket_tapes.iter().map(bytes).collect()
                 };
                 let arena_sparse = arena_activation.iter().enumerate();
-                let scratch_sparse = scratches.into_iter().enumerate();
                 let per_buffer: Vec<(Arc<SparseBuffer>, Vec<usize>)> = (arena_sparse)
                     .filter_map(|(slot, a)| match a {
                         Activation::Sparse(s) => Some((s.clone(), arena_needs(slot))),
                         Activation::Full(_) => None,
                     })
-                    .chain(scratch_sparse.filter_map(|(kind, a)| match a {
+                    .chain(scratch.iter().filter_map(|(kind, a)| match a {
                         Some(Activation::Sparse(s)) => Some((s.clone(), scratch_needs(kind))),
                         _ => None,
                     }))
@@ -678,11 +951,12 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // when W::ROPE_ON_READ, so pinned below like block_tables
                 // (16-byte placeholder + never bound on non-spans arches).
                 block_unrotated_flags,
-                // Written + read within the same encoder via setBuffer (not a
-                // baked dispatch address), so the lazy-pager hazard doesn't apply.
+                // Bound by no command.
                 num_tokens_u32: _,
-                num_sample_rows_u32: _,
-                sample_indices: _,
+                // The sampled rows the gather and its undoing read by baked gpuAddress — pinned
+                // below.
+                num_sample_rows_u32,
+                sample_indices,
                 // GDN persistent state pools and draft lanes — pinned by the GdnStatePool owner.
                 gdn_state_conv: _,
                 gdn_state_ssm: _,
@@ -715,6 +989,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
             // Span labels: bound by dispatch-baked address on rope-on-read
             // arches (slot 8 of the prefill attention), so pin like seq_used_k.
             pin(span_ids);
+            // The rows the forward samples: the lm_head slice's gather and the logits compaction
+            // bind them by dispatch-baked address, same lazy-pager hazard as the inputs.
+            pin(num_sample_rows_u32);
+            pin(sample_indices);
             // Per-KV-cache-group slot_mappings + block tables (vLLM hybrid
             // layout). One group on uniform models; full + N sliding on gemma4
             // SWA. Each is bound by dispatch-baked gpuAddress (same lazy-pager
@@ -788,10 +1066,16 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 bucket_idx,
                 tape,
                 &arena,
-                splitk_scratch.as_ref().map(Activation::buffer),
-                moe_scratch.as_ref().map(Activation::buffer),
-                roped_k_scratch.as_ref().map(Activation::buffer),
-                attn_unfused_scratch.as_ref().map(Activation::buffer),
+                scratch[ScratchKind::SplitK]
+                    .as_ref()
+                    .map(Activation::buffer),
+                scratch[ScratchKind::Moe].as_ref().map(Activation::buffer),
+                scratch[ScratchKind::RopedK]
+                    .as_ref()
+                    .map(Activation::buffer),
+                scratch[ScratchKind::AttnUnfused]
+                    .as_ref()
+                    .map(Activation::buffer),
                 pipelines,
                 sources,
                 runtime,
@@ -808,17 +1092,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
         Ok(Self {
             arena,
             arena_activation,
+            hosting,
             _pins: pins,
             bucket_bakings,
-            scratch: [
-                splitk_scratch,
-                moe_scratch,
-                roped_k_scratch,
-                attn_unfused_scratch,
-            ]
-            .into_iter()
-            .flatten()
-            .collect(),
+            scratch,
             sparse,
             tq_dequant_max_blocks: std::sync::atomic::AtomicU32::new(0),
             unrotated_blocks: std::sync::atomic::AtomicBool::new(false),
@@ -878,19 +1155,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
         bucket: usize,
         num_tokens: u32,
         num_seqs: u32,
-        has_spec_tokens: bool,
+        sampled_rows: crate::tape::ids::SampledRowCount,
         reads: super::ForwardReads,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
     ) -> Result<(), WorkerError> {
-        self.run_bucket_mtl4_inner(
-            bucket,
-            num_tokens,
-            num_seqs,
-            has_spec_tokens,
-            reads,
-            enc,
-            None,
-        )
+        self.run_bucket_mtl4_inner(bucket, num_tokens, num_seqs, sampled_rows, reads, enc, None)
     }
 
     /// Activation-dump replay segment: encode only the flat dispatch
@@ -904,7 +1173,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         bucket: usize,
         num_tokens: u32,
         num_seqs: u32,
-        has_spec_tokens: bool,
+        sampled_rows: crate::tape::ids::SampledRowCount,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         range: std::ops::Range<usize>,
     ) -> Result<(), WorkerError> {
@@ -912,7 +1181,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             bucket,
             num_tokens,
             num_seqs,
-            has_spec_tokens,
+            sampled_rows,
             super::ForwardReads::Outputs,
             enc,
             Some(range),
@@ -924,7 +1193,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         bucket: usize,
         num_tokens: u32,
         num_seqs: u32,
-        has_spec_tokens: bool,
+        sampled_rows: crate::tape::ids::SampledRowCount,
         reads: super::ForwardReads,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         range: Option<std::ops::Range<usize>>,
@@ -971,7 +1240,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         let facts = StepFacts {
             num_tokens,
             num_seqs,
-            has_spec_tokens,
+            sampled_rows,
             unrotated_blocks: self
                 .unrotated_blocks
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -1019,9 +1288,9 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     }
                 }
                 if !gate_matches(*gate, facts) {
-                    // Skipped: e.g. the lm_head slice's gather/qmv/scatter
-                    // (`OnlyIfNoSpec`) on a spec-decode verify step, or
-                    // its M=bucket_m fallback (`OnlyIfSpec`) on any other.
+                    // Skipped: e.g. the lm_head slice (`UnlessEveryRowSampled`)
+                    // on a step that samples every row, or the every-row
+                    // lm_head (`OnlyIfEveryRowSampled`) on any other.
                     // Either way the timestamp slot, barrier, and
                     // dispatch are skipped together so the kernel
                     // doesn't run with stale per-dispatch state.
@@ -1057,12 +1326,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         visibility,
                     );
                 }
-                let tg_scaled = scale_tg_for_num_tokens(
-                    *tg,
-                    *scaling,
-                    super::ids::NumTokens(num_tokens),
-                    num_seqs,
-                );
+                let tg_scaled = scale_tg_for_num_tokens(*tg, *scaling, facts);
                 // TurboQuant full-context staging: the baked grid is a
                 // placeholder; the kernel needs (max_blocks, num_kv_heads,
                 // num_seqs) — block-table-driven, with early-exit past
@@ -1237,7 +1501,7 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         K::FusedGateUpSiluMul | K::SiluMul | K::GeluMul | K::AffineGatherW4a8ActQuant => {
             KernelKind::Mlp
         }
-        K::GatherLastToken | K::ScatterFirstToLastRow | K::Softmax | K::SliceTrailingColsU32 => {
+        K::GatherSampledRows | K::PutSampledRowsBack | K::Softmax | K::SliceTrailingColsU32 => {
             KernelKind::Sample
         }
         K::VisionLayerNorm | K::VisionRope | K::VisionVarlenAttn | K::AvgPool2d | K::VisionGelu => {
@@ -1696,66 +1960,33 @@ fn resolve_bindings(
     Ok(out)
 }
 
-/// Rewrite the m-axis of a baked threadgroup grid to match the
-/// actual `num_tokens` of this forward, instead of the bucket_m the
-/// grid was baked against.
+/// Evaluate a per-dispatch [`RuntimeGate`] against the step being encoded: `true` when the
+/// dispatch fires, `false` when it is skipped. `gate == None` (the common case) always fires.
 ///
-/// `scaling = None` means the kernel's grid doesn't scale with M
-/// (or the lowering pass hasn't yet been taught to emit a scaling
-/// hint for it) — return the baked grid unchanged. When `scaling =
-/// Some(MScaling { axis, tile })`, replace `tg.{axis}` with
-/// `num_tokens.div_ceil(tile)`, clamped so we never grow above the
-/// baked value (guards against `num_tokens > bucket_m`, which the
-/// bucket picker already rules out but defense-in-depth).
-/// Evaluate a per-dispatch [`RuntimeGate`] against the live
-/// `num_seqs` of this forward (= `cu_seqlens_q.len() - 1`).
-/// Returns `true` when the dispatch should fire, `false` when it
-/// should be skipped. `gate == None` (the common case) always
-/// fires.
-///
-/// `OnlyIfNoSpec` fires when there's exactly one sequence in
-/// the bucket — either pure single-seq prefill or a one-token
-/// decode forward. The lm_head slice's gather/qmv/scatter trio is
-/// gated this way.
-///
-/// `OnlyIfSpec` fires on a spec-decode verify step, and on a
-/// decode-only step (every sequence one token). The
-/// full-`M=bucket_m` lm_head fallback is gated this way so the
-/// slice's per-seq-incorrect logits get overwritten with a
-/// correct multi-row GEMM result — and so a decode-only step,
-/// where the slice is off, still computes logits at all.
+/// The lm_head pair splits on whether the step samples every row it runs. A decode step, or a
+/// speculative verify step of drafting sequences alone, does (`OnlyIfEveryRowSampled`): the
+/// lm_head over every row leaves the sampled rows' logits in order, and slicing would only add
+/// launches — gating the slice on at every multi-sequence step regressed c=4 TPOT by +5% on
+/// Llama-1B. A prefill chunk or a mixed batch does not (`UnlessEveryRowSampled`): the slice, or
+/// the compaction. The pair is exhaustive by construction: a decode step that ran neither left
+/// the logits slot's stale contents for the argmax, and every row froze on its first token
+/// (issue #361).
 pub fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) -> bool {
     let StepFacts {
         num_tokens,
         num_seqs,
-        has_spec_tokens,
+        sampled_rows,
         unrotated_blocks,
         gdn_plain,
         gdn_plain_rows,
     } = step;
-    // lm_head slice (`OnlyIfNoSpec`) fires only when there are EXTRA
-    // tokens to drop (prefill / chunked-prefill / mixed batches);
-    // steady-state decode has `num_tokens == num_seqs` and slicing
-    // would just add 2 kernel launches with no GEMM-work savings
-    // (qmv at M=num_seqs == qmm at M=num_seqs). Verified: gating
-    // unconditionally on multi-seq regressed c=4 TPOT by +5% on
-    // Llama-1B; gating on `num_tokens > num_seqs` keeps the prefill
-    // win without hurting decode.
-    //
-    // That carve-out hands decode-only steps to the full-M fallback
-    // (`OnlyIfSpec`), which must therefore fire there too: the pair
-    // is exhaustive by construction, and before it was, a decode-only
-    // step in a bucket whose lm_head lowers to one `qmm_t` (the slice
-    // band, `bucket_m ≥ vector_limit`) ran NO lm_head command at all —
-    // the argmax re-read the logits slot's stale contents and every
-    // row froze on its first token (issue #361).
     let decode_step = num_tokens == num_seqs;
     match gate {
         None => true,
-        Some(super::lowered::RuntimeGate::OnlyIfNoSpec) => {
-            !has_spec_tokens && num_tokens > num_seqs
+        Some(super::lowered::RuntimeGate::UnlessEveryRowSampled) => sampled_rows.get() < num_tokens,
+        Some(super::lowered::RuntimeGate::OnlyIfEveryRowSampled) => {
+            sampled_rows.get() >= num_tokens
         }
-        Some(super::lowered::RuntimeGate::OnlyIfSpec) => has_spec_tokens || decode_step,
         Some(super::lowered::RuntimeGate::OnlyIfDecodeStep) => decode_step,
         Some(super::lowered::RuntimeGate::UnlessDecodeStep) => !decode_step,
         Some(super::lowered::RuntimeGate::OnlyIfSmallMTokens) => {
@@ -1785,7 +2016,9 @@ pub fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) 
 pub struct StepFacts {
     pub num_tokens: u32,
     pub num_seqs: u32,
-    pub has_spec_tokens: bool,
+    /// The rows the step samples (its `SampleIndices`' length): one a sequence, every row of a
+    /// sequence verifying drafts.
+    pub sampled_rows: crate::tape::ids::SampledRowCount,
     /// Some sequence's block table has an unrotated (bit-31, span) block.
     pub unrotated_blocks: bool,
     /// Every sequence's Gated-DeltaNet step is plain: no replay, no records.
@@ -1794,40 +2027,49 @@ pub struct StepFacts {
     pub gdn_plain_rows: bool,
 }
 
+/// Rewrite the m-axis of a baked threadgroup grid to match the
+/// actual `num_tokens` of this forward, instead of the bucket_m the
+/// grid was baked against.
+///
+/// `scaling = None` means the kernel's grid doesn't scale with M
+/// (or the lowering pass hasn't yet been taught to emit a scaling
+/// hint for it) — return the baked grid unchanged. When `scaling =
+/// Some(MScaling { axis, tile })`, replace `tg.{axis}` with
+/// `num_tokens.div_ceil(tile)`, clamped so we never grow above the
+/// baked value (guards against `num_tokens > bucket_m`, which the
+/// bucket picker already rules out but defense-in-depth). Its
+/// `set_axis`, if any, is then SET to the live count it names.
 fn scale_tg_for_num_tokens(
     mut tg: MTLSize,
     scaling: Option<super::lowered::MScaling>,
-    num_tokens: super::ids::NumTokens,
-    num_seqs: u32,
+    step: StepFacts,
 ) -> MTLSize {
     let Some(s) = scaling else {
         return tg;
     };
-    let bm = s.bucket_m.get().max(1) as u64;
-    let n = (num_tokens.get().max(1) as u64).min(bm);
     let slot = match s.axis {
         super::lowered::MScaleAxis::X => &mut tg.width,
         super::lowered::MScaleAxis::Y => &mut tg.height,
         super::lowered::MScaleAxis::Z => &mut tg.depth,
     };
-    // new = ceil(baseline * n / bucket_m). Clamped above to the
-    // baseline so accidental num_tokens > bucket_m can't grow the
-    // grid past what was baked.
-    let baseline = *slot as u64;
-    let scaled = baseline.saturating_mul(n).div_ceil(bm);
-    *slot = scaled as usize;
-    // `seq_axis`: SET (not scale) the chosen axis to the live num_seqs.
-    // The steel paged prefill kernel needs one grid-Z layer per sequence
-    // (`tid.z = seq_idx`) so a BQ-block tile never straddles a sequence
-    // boundary; over-dispatched (seq, q-block) pairs early-out in the
-    // kernel. See `MScaling::seq_axis`.
-    if let Some(seq_ax) = s.seq_axis {
-        let seq_slot = match seq_ax {
+    // new = ceil(baseline * n / bucket_m), n capped at the bucket so an
+    // accidental num_tokens > bucket_m can't grow the grid past what was
+    // baked — the count the logits buffer's rows are sized by too.
+    let live = u64::from(step.num_tokens.max(1));
+    *slot = super::lowered::scaled_groups(*slot as u64, live, u64::from(s.bucket_m.get())) as usize;
+    // `set_axis`: SET (not scale) the chosen axis to the live count (`SetAxis`).
+    let set = match s.set_axis {
+        Some(super::lowered::SetAxis::Seqs(axis)) => Some((axis, step.num_seqs)),
+        Some(super::lowered::SetAxis::SampledRows(axis)) => Some((axis, step.sampled_rows.get())),
+        None => None,
+    };
+    if let Some((axis, count)) = set {
+        let slot = match axis {
             super::lowered::MScaleAxis::X => &mut tg.width,
             super::lowered::MScaleAxis::Y => &mut tg.height,
             super::lowered::MScaleAxis::Z => &mut tg.depth,
         };
-        *seq_slot = num_seqs.max(1) as usize;
+        *slot = count.max(1) as usize;
     }
     tg
 }
@@ -1931,7 +2173,7 @@ mod tests {
         let step = |num_tokens, num_seqs, unrotated_blocks| StepFacts {
             num_tokens,
             num_seqs,
-            has_spec_tokens: false,
+            sampled_rows: crate::tape::ids::SampledRowCount(num_seqs),
             unrotated_blocks,
             gdn_plain: true,
             gdn_plain_rows: true,
@@ -2003,86 +2245,60 @@ mod tests {
             "a decode step"
         );
         // The lm_head pair is exhaustive — no step runs neither, no step runs
-        // both — and each side takes the steps it is for: the slice the
-        // prefill-shaped steps, the full-M fallback the spec verifies and the
-        // decode-only steps. Issue #361: before the fallback took decode-only
-        // steps, a decode step in a bucket whose lm_head lowers to one `qmm_t`
-        // (the slice band, `bucket_m ≥ vector_limit`) ran no lm_head at all —
-        // the argmax re-read the logits slot's stale contents and every row
-        // froze on its first token.
-        use super::super::lowered::RuntimeGate::{OnlyIfNoSpec, OnlyIfSpec};
-        for has_spec in [false, true] {
-            for (tokens, seqs) in [
-                (1u32, 1u32),
-                (9, 9),
-                (16, 16),
-                (80, 80),
-                (18, 16),
-                (512, 9),
-                (4096, 128),
-            ] {
-                let s = StepFacts {
-                    num_tokens: tokens,
-                    num_seqs: seqs,
-                    has_spec_tokens: has_spec,
-                    unrotated_blocks: false,
-                    gdn_plain: true,
-                    gdn_plain_rows: true,
-                };
-                let (slice, full) = (
-                    gate_matches(Some(OnlyIfNoSpec), s),
-                    gate_matches(Some(OnlyIfSpec), s),
-                );
-                assert!(
-                    slice ^ full,
-                    "the lm_head gate pair must be exhaustive at num_tokens={tokens} \
-                     num_seqs={seqs} has_spec_tokens={has_spec}"
-                );
-            }
+        // both — and each side takes the steps it is for: the slice the steps
+        // that sample fewer rows than they run (a prefill chunk, a mixed batch,
+        // a verify step beside a prefill chunk), the every-row matmul those
+        // that sample each (a decode step, a verify step alone). Issue #361:
+        // before the every-row matmul took decode steps, a decode step in a
+        // bucket whose lm_head lowers to one `qmm_t` (the slice band,
+        // `bucket_m ≥ vector_limit`) ran no lm_head at all — the argmax re-read
+        // the logits slot's stale contents and every row froze on its first
+        // token.
+        use super::super::lowered::RuntimeGate::{OnlyIfEveryRowSampled, UnlessEveryRowSampled};
+        let lm_head = |tokens, seqs, sampled| {
+            let s = StepFacts {
+                sampled_rows: crate::tape::ids::SampledRowCount(sampled),
+                ..step(tokens, seqs, false)
+            };
+            let slice = gate_matches(Some(UnlessEveryRowSampled), s);
+            let every = gate_matches(Some(OnlyIfEveryRowSampled), s);
+            assert!(
+                slice ^ every,
+                "the lm_head gate pair must be exhaustive at num_tokens={tokens} \
+                 num_seqs={seqs} sampled_rows={sampled}"
+            );
+            slice
+        };
+        for (tokens, seqs, sampled, slices) in [
+            // Decode steps.
+            (1u32, 1u32, 1u32, false),
+            (9, 9, 9, false),
+            (80, 80, 80, false),
+            // Prefill chunks and mixed batches: a row a sequence.
+            (18, 16, 16, true),
+            (512, 9, 9, true),
+            (4096, 128, 128, true),
+            // A verify step of six sequences, three rows each, alone; beside a prefill chunk.
+            (18, 6, 18, false),
+            (530, 7, 19, true),
+        ] {
+            assert_eq!(
+                lm_head(tokens, seqs, sampled),
+                slices,
+                "{tokens} {seqs} {sampled}"
+            );
         }
-        // Decode-only, no spec: the fallback is the only lm_head that runs.
-        let decode_only = StepFacts {
-            num_tokens: 9,
-            num_seqs: 9,
-            has_spec_tokens: false,
-            unrotated_blocks: false,
-            gdn_plain: true,
-            gdn_plain_rows: true,
-        };
-        assert!(!gate_matches(Some(OnlyIfNoSpec), decode_only));
-        assert!(gate_matches(Some(OnlyIfSpec), decode_only));
-        // Prefill-shaped, no spec: the slice runs, the fallback does not.
-        let prefill = StepFacts {
-            num_tokens: 512,
-            num_seqs: 9,
-            has_spec_tokens: false,
-            unrotated_blocks: false,
-            gdn_plain: true,
-            gdn_plain_rows: true,
-        };
-        assert!(gate_matches(Some(OnlyIfNoSpec), prefill));
-        assert!(!gate_matches(Some(OnlyIfSpec), prefill));
-        // A spec verify reads every row: the fallback, never the slice.
-        let verify = StepFacts {
-            num_tokens: 18,
-            num_seqs: 6,
-            has_spec_tokens: true,
-            unrotated_blocks: false,
-            gdn_plain: true,
-            gdn_plain_rows: true,
-        };
-        assert!(!gate_matches(Some(OnlyIfNoSpec), verify));
-        assert!(gate_matches(Some(OnlyIfSpec), verify));
     }
 
     /// The lm_head sample slice, as the tape builds and dispatches it: the
-    /// gather swaps each sequence's last row into row `i`, the scatter swaps
-    /// row `i` back, both in place. In a mixed step, decodes and short chunks
-    /// put some sequences' last rows inside `0..num_seqs`, the rows the
-    /// others are moved to; every sequence must still get its own row, and
-    /// the scatter after the gather must leave every row where it started.
+    /// gather swaps sampled row `i` into row `i`, the scatter swaps row `i`
+    /// back, both in place. In a mixed step, decodes, verifies and short
+    /// chunks put some sampled rows inside `0..num_sampled`, the rows the
+    /// others are moved to; every sampled row must still land at its own
+    /// index, and the scatter after the gather must leave every row where it
+    /// started.
     #[test]
-    fn sample_slice_moves_each_sequences_own_row() {
+    fn sample_slice_moves_each_sampled_row() {
         let Some(device) = crate::detect_device().filter(|_| crate::metal4_available()) else {
             eprintln!("skipping: no Metal device");
             return;
@@ -2094,26 +2310,42 @@ mod tests {
             metal_dtype: MetalDtype::F16,
             ..crate::tape::model_consts::MetalModelConsts::from_canonical::<TestWeights>()
         };
-        // Decodes, then short prefix-hit chunks, then long chunks.
-        let q_lens: Vec<u32> = [vec![1; 24], vec![2; 16], vec![3; 8], vec![40; 4]].concat();
+        // Decodes, then verifies (every row sampled), then short prefix-hit chunks, then long
+        // chunks.
+        let q_lens: Vec<u32> = [
+            vec![1; 24],
+            vec![3; 6],
+            vec![2; 16],
+            vec![3; 8],
+            vec![40; 4],
+        ]
+        .concat();
         let cu: Vec<u32> = std::iter::once(0)
             .chain(q_lens.iter().scan(0, |end, n| {
                 *end += n;
                 Some(*end)
             }))
             .collect();
-        let (num_seqs, num_tokens) = (q_lens.len(), *cu.last().unwrap() as usize);
-        let last = |i: usize| cu[i + 1] as usize - 1;
-        let width = 1024u32;
+        let num_tokens = *cu.last().unwrap() as usize;
+        let verifies = 24..30;
+        let sampled: Vec<u32> = (0..q_lens.len())
+            .flat_map(|i| match verifies.contains(&i) {
+                true => cu[i]..cu[i + 1],
+                false => cu[i + 1] - 1..cu[i + 1],
+            })
+            .collect();
+        let num_sampled = sampled.len();
+        let row_stride = crate::tape::ids::RowStride(1024);
+        let width = row_stride.get();
         let bucket_m = 512;
         let slot = crate::tape::ids::ArenaSlotIdx(0);
-        let gather = crate::tape::lowering::gather_last_token_command(&p, slot, width);
-        let scatter = crate::tape::lowering::scatter_first_to_last_row_command(&p, slot, width);
-        // `(row, the row it holds)`. Gather: row i holds sequence i's last
-        // row. Scatter: that last row holds row i, sequence i's logits. Both:
-        // every row holds itself.
-        let gathered = (0..num_seqs).map(|i| (i, last(i))).collect();
-        let scattered = (0..num_seqs).map(|i| (last(i), i)).collect();
+        let gather = crate::tape::lowering::gather_sampled_rows_command(&p, slot, row_stride);
+        let scatter = crate::tape::lowering::put_sampled_rows_back_command(&p, slot, row_stride);
+        // `(row, the row it holds)`. Gather: row i holds sampled row i.
+        // Scatter: sampled row i holds row i. Both: every row holds itself.
+        let at = |i: usize| sampled[i] as usize;
+        let gathered = (0..num_sampled).map(|i| (i, at(i))).collect();
+        let scattered = (0..num_sampled).map(|i| (at(i), i)).collect();
         let restored = (0..num_tokens).map(|r| (r, r)).collect();
         let cases: [(&str, Vec<&LoweredCommand>, Vec<(usize, usize)>); 3] = [
             ("gather", vec![&gather], gathered),
@@ -2128,8 +2360,16 @@ mod tests {
                 })
                 .collect();
             let buf = crate::mtl4_dispatch::shared_slice(&device, &rows);
-            let cu_buf = crate::mtl4_dispatch::shared_slice(&device, &cu);
-            let n_buf = crate::mtl4_dispatch::shared_u32(&device, num_seqs as u32);
+            let sampled_buf = crate::mtl4_dispatch::shared_slice(&device, &sampled);
+            let n_buf = crate::mtl4_dispatch::shared_u32(&device, num_sampled as u32);
+            let step = StepFacts {
+                num_tokens: num_tokens as u32,
+                num_seqs: q_lens.len() as u32,
+                sampled_rows: crate::tape::ids::SampledRowCount(num_sampled as u32),
+                unrotated_blocks: false,
+                gdn_plain: true,
+                gdn_plain_rows: true,
+            };
             for cmd in cmds {
                 let key = crate::specialized_pipeline_cache::PipelineKey::new(
                     cmd.library,
@@ -2138,16 +2378,11 @@ mod tests {
                 );
                 let pso = crate::aot::baked_build(&cache, &key).expect("pipeline");
                 let (grid, threads) = mtl_size_pair(cmd, TEST_VARIANT);
-                let grid = scale_tg_for_num_tokens(
-                    grid,
-                    cmd.dispatch.m_scaling,
-                    super::super::ids::NumTokens(num_tokens as u32),
-                    num_seqs as u32,
-                );
+                let grid = scale_tg_for_num_tokens(grid, cmd.dispatch.m_scaling, step);
                 assert!(crate::mtl4_dispatch::dispatch_threadgroups(
                     &device,
                     &pso,
-                    &[&buf, &cu_buf, &n_buf],
+                    &[&buf, &sampled_buf, &n_buf],
                     grid,
                     threads,
                 ));
@@ -2404,9 +2639,10 @@ mod tests {
             .expect("commands"),
             splitk_scratch_bytes: 0,
             moe_scratch_bytes: 0,
-            decode_partials_row_bytes: 0,
+            decode_partials: crate::tape::lowered::DecodePartials::default(),
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
+            logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             cache_live: &[],
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
@@ -2483,10 +2719,111 @@ mod tests {
         }
     }
 
-    /// A worker built with another's activation lent places each arena slot in the smallest lent
-    /// buffer that holds it, and allocates the slot no lent buffer holds.
+    /// The buckets of a model whose arena has `slots` slots: one a slot of `hidden`, which holds its
+    /// final hidden states — what `ArenaRanks::new` reads those slots off.
+    fn buckets(slots: u32, hidden: &[u32]) -> Vec<super::super::pool::MetalBucketSpec> {
+        let bucket = |&backbone_slot: &u32| super::super::pool::MetalBucketSpec {
+            bucket_m: 1,
+            band: super::super::pool::FoldBand::Narrow,
+            num_arena_slots: slots,
+            terminal_slot: 0,
+            backbone_slot,
+            arena_bytes: &[],
+            logits_row_bytes: 0,
+            backbone: &[],
+            lm_head: &[],
+            backbone_barriers: &[],
+            lm_head_barriers: &[],
+            tapes: &[],
+            kernels: &[],
+        };
+        hidden.iter().map(bucket).collect()
+    }
+
+    /// A host holds its guest rank by rank: each hosting slot grows to the guest rank's bytes, a
+    /// slot outside the hosting ranks (a bucket's hidden states) and a slot past the host's arena
+    /// (another canonical's, not kept) host nothing, and the ranks past the hosting slots take
+    /// fresh slots; the scratch grows kind by kind. Pure arithmetic: no device.
     #[test]
-    fn a_worker_places_its_arena_in_lent_buffers() {
+    fn a_host_grows_its_arena_and_scratch_to_hold_its_guest() {
+        let ranks = ArenaRanks::new(&[3, 0, 2, 1], &[3, 0, 1], &buckets(4, &[2]));
+        let slots = |s: ByRank<Slot>| s.iter().map(|(_, s)| s.0).collect::<Vec<_>>();
+        // Slot 3 ranks first but lies past this 3-slot arena: its bucket is not kept.
+        assert_eq!(slots(ranks.guest_slots(3)), [0, 2, 1]);
+        assert_eq!(slots(ranks.hosting_slots(3, 4)), [0, 1, 3, 4]);
+        let guest = GuestArena {
+            arena: [100, 50, 30, 20].into_iter().collect(),
+            scratch: PerScratch::from_fn(|kind| match kind {
+                ScratchKind::Moe => 70,
+                ScratchKind::RopedK => 5,
+                _ => 0,
+            }),
+        };
+        let hosting = Hosting::of(&[80, 60, 40], &ranks, &guest);
+        assert_eq!(
+            hosting.layout,
+            [100, 60, 40, 30, 20],
+            "rank 0 grows slot 0, rank 1 fits slot 1, slot 2 (hidden states) hosts nothing"
+        );
+        assert_eq!(slots(hosting.slots), [0, 1, 3, 4]);
+        let own = PerScratch::from_fn(|kind| match kind {
+            ScratchKind::SplitK => 10,
+            ScratchKind::Moe => 90,
+            ScratchKind::AttnUnfused => 3,
+            ScratchKind::RopedK => 0,
+        });
+        let grown = Hosting::scratch(own, &guest);
+        let bytes: Vec<u64> = grown.iter().map(|(_, &b)| b).collect();
+        assert_eq!(bytes, [10, 90, 5, 3]);
+    }
+
+    /// Whatever a host's arena keeps and however many ranks its guest has, no guest rank takes a
+    /// slot holding the host's hidden states: the guest reads them after its forward has begun.
+    #[test]
+    fn a_guest_never_takes_its_hosts_hidden_states() {
+        let hidden = [1, 4];
+        let ranks = ArenaRanks::new(&[4, 2, 0, 5, 1, 3], &[2, 0, 5, 3], &buckets(6, &hidden));
+        for len in 0..=6 {
+            for count in 0..=8 {
+                let slots = ranks.hosting_slots(len, count);
+                assert_eq!(slots.len(), count);
+                assert!(
+                    slots
+                        .iter()
+                        .all(|(_, s)| !(s.0 < len && hidden.contains(&(s.0 as u32)))),
+                    "len {len}, count {count}: {slots:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "a slot ranked twice")]
+    fn arena_ranks_refuse_a_slot_ranked_twice() {
+        ArenaRanks::new(&[0, 1, 1], &[0, 1, 1], &[]);
+    }
+
+    /// The hidden-states slots are read off the buckets, not taken on trust.
+    #[test]
+    #[should_panic(expected = "every slot but the hidden states'")]
+    fn arena_ranks_refuse_hosting_a_hidden_states_slot() {
+        ArenaRanks::new(&[0, 1, 2], &[0, 1, 2], &buckets(3, &[1]));
+    }
+
+    /// Ranks naming fewer slots than a bucket's arena holds leave a slot no host would hold.
+    #[test]
+    #[should_panic(expected = "a bucket's slot is unranked")]
+    fn arena_ranks_refuse_a_bucket_slot_unranked() {
+        ArenaRanks::new(&[1, 0], &[1], &buckets(3, &[0]));
+    }
+
+    /// A host and its guest run in one arena: the guest's slot of each rank is the host's slot of
+    /// that rank, grown to hold both; the host's hidden-states slot holds none of the guest's; a
+    /// rank past the host's hosting slots takes a fresh slot of the host's. The host allocates
+    /// exactly the arena its `Hosting` prices. A host sized for another guest refuses this one —
+    /// an arena slot too small, or a scratch it never allocated.
+    #[test]
+    fn a_guest_runs_in_its_hosts_arena_rank_by_rank() {
         use crate::interpreter::metal::__re::MTLBuffer as _;
         let Some(device) = crate::detect_device().filter(|_| crate::metal4_available()) else {
             eprintln!("skipping: no Metal device");
@@ -2499,33 +2836,91 @@ mod tests {
         let pipelines =
             crate::aot::tape_pipelines(&device, &tapes, TestWeights::METAL_DTYPE, TEST_VARIANT)
                 .expect("pipelines");
-        let build = |layout: &ArenaLayout, lent: &LentActivation| {
+        let build = |layout: &ArenaLayout,
+                     tapes: &[LoweredMetalTape],
+                     share: &ArenaShare,
+                     ranks: &ArenaRanks| {
             MetalWorker::<TestWeights>::new_with_residency(
                 device.clone(),
                 layout,
-                &tapes,
+                tapes,
                 &pipelines,
-                &sources(&weights, &allocator, &tapes),
+                &sources(&weights, &allocator, tapes),
                 &runtime,
                 None,
                 None,
-                lent,
+                share,
+                ranks,
                 None,
             )
-            .expect("worker builds")
         };
-        let lender = build(&vec![64 * 1024, 4 * 1024], &LentActivation::default());
-        let borrower = build(&vec![4 * 1024, 16 * 1024, 128 * 1024], &lender.activation());
-        let address = |b: &Buffer| b.gpuAddress();
-        assert_eq!(address(&borrower.arena[0]), address(&lender.arena[1]));
-        assert_eq!(address(&borrower.arena[1]), address(&lender.arena[0]));
-        assert!(
-            lender
-                .arena
-                .iter()
-                .all(|b| address(b) != address(&borrower.arena[2]))
+        const K: u64 = 1024;
+        // The host's slot 2 holds its hidden states: it hosts in slots 0 and 1 only.
+        let host_layout = vec![64 * K, 4 * K, 8 * K];
+        let host_ranks = ArenaRanks::new(&[0, 2, 1], &[0, 1], &buckets(3, &[2]));
+        let guest_layout = vec![4 * K, 16 * K, 128 * K];
+        let guest_ranks = ArenaRanks::new(&[2, 1, 0], &[2, 1], &buckets(3, &[0]));
+        let guest = GuestArena {
+            arena: [128 * K, 16 * K, 4 * K].into_iter().collect(),
+            scratch: PerScratch::default(),
+        };
+        let hosts = ArenaShare::Hosts(guest.clone());
+        let host = build(&host_layout, &tapes, &hosts, &host_ranks).expect("the host builds");
+        let lengths: Vec<u64> = host.arena.iter().map(|b| b.length() as u64).collect();
+        let priced = Hosting::of(&host_layout, &host_ranks, &guest);
+        assert_eq!(
+            lengths, priced.layout,
+            "the host allocates what its hosting prices"
         );
-        assert_eq!(borrower.arena[2].length(), 128 * 1024);
+        assert_eq!(lengths, [128 * K, 16 * K, 8 * K, 4 * K]);
+        let hosted = ArenaShare::In(Box::new(host.hosted()));
+        let guest_worker =
+            build(&guest_layout, &tapes, &hosted, &guest_ranks).expect("the guest builds");
+        let at = |w: &MetalWorker<TestWeights>, slot: usize| w.arena[slot].gpuAddress();
+        assert_eq!(at(&guest_worker, 2), at(&host, 0));
+        assert_eq!(at(&guest_worker, 1), at(&host, 1));
+        assert_eq!(at(&guest_worker, 0), at(&host, 3));
+        assert!((0..3).all(|slot| at(&guest_worker, slot) != at(&host, 2)));
+
+        let bigger = vec![4 * K, 16 * K, 256 * K];
+        let refused = build(&bigger, &tapes, &hosted, &guest_ranks).err();
+        assert!(
+            matches!(
+                refused,
+                Some(WorkerError::HostShort {
+                    part: HostPart::Slot(Rank(0)),
+                    need,
+                    has,
+                }) if need == 256 * K && has == 128 * K
+            ),
+            "{refused:?}"
+        );
+        // A guest whose tape binds a MoE scratch its host was not sized for.
+        let mut scratching = build_synthetic_tape(1);
+        scratching.moe_scratch_bytes = 4 * K as u32;
+        let refused = build(&guest_layout, &[scratching], &hosted, &guest_ranks).err();
+        assert!(
+            matches!(
+                refused,
+                Some(WorkerError::HostShort {
+                    part: HostPart::Scratch(ScratchKind::Moe),
+                    need,
+                    has: 0,
+                }) if need == 4 * K
+            ),
+            "{refused:?}"
+        );
+        // A guest whose ranks are another model's, naming two of its three slots: its third would
+        // be allocated beside the host's arena, unpriced.
+        let short_ranks = ArenaRanks::new(&[1, 0], &[1], &buckets(2, &[0]));
+        let refused = build(&guest_layout, &tapes, &hosted, &short_ranks).err();
+        assert!(
+            matches!(
+                refused,
+                Some(WorkerError::GuestSlotUnranked { slot: Slot(2) })
+            ),
+            "{refused:?}"
+        );
     }
 
     #[test]
@@ -2641,9 +3036,10 @@ mod tests {
                 .expect("commands"),
             splitk_scratch_bytes: 0,
             moe_scratch_bytes: 0,
-            decode_partials_row_bytes: 0,
+            decode_partials: crate::tape::lowered::DecodePartials::default(),
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
+            logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             cache_live: &[],
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
@@ -2733,9 +3129,10 @@ mod tests {
             .expect("commands"),
             splitk_scratch_bytes: 0,
             moe_scratch_bytes: 0,
-            decode_partials_row_bytes: 0,
+            decode_partials: crate::tape::lowered::DecodePartials::default(),
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
+            logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             cache_live: &[],
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
@@ -2859,9 +3256,10 @@ mod tests {
             .expect("commands"),
             splitk_scratch_bytes: 0,
             moe_scratch_bytes: 0,
-            decode_partials_row_bytes: 0,
+            decode_partials: crate::tape::lowered::DecodePartials::default(),
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
+            logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             cache_live: &[],
             barrier_before: &[],
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.

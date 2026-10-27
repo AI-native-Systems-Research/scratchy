@@ -604,8 +604,8 @@ mod tests {
             | KernelId::TqStageRotated
             | KernelId::TqRotateRows
             | KernelId::TanhSoftCap
-            | KernelId::GatherLastToken
-            | KernelId::ScatterFirstToLastRow
+            | KernelId::GatherSampledRows
+            | KernelId::PutSampledRowsBack
             | KernelId::Softmax
             | KernelId::ArgPartitionTopK
             | KernelId::TakeAlongAxis
@@ -790,8 +790,8 @@ mod tests {
             | KernelId::TqStageRotated
             | KernelId::TqRotateRows
             | KernelId::TanhSoftCap
-            | KernelId::GatherLastToken
-            | KernelId::ScatterFirstToLastRow
+            | KernelId::GatherSampledRows
+            | KernelId::PutSampledRowsBack
             | KernelId::Softmax
             | KernelId::ArgPartitionTopK
             | KernelId::TakeAlongAxis

@@ -283,33 +283,6 @@ pub trait ScratchyWeights: Send + Sync {
         num_tokens: u64,
     ) -> OwnedTensor;
 
-    /// Per-worker arena peak in bytes (metal only).
-    ///
-    /// `MetalWorkerPool::for_buckets` derives the per-worker arena
-    /// layout as the elementwise-max across [`METAL_BUCKETS`]'
-    /// `arena_bytes` rows; the peak resident bytes per worker is
-    /// the sum of that elementwise-max. The metal worker reads
-    /// this to size `peak_activation_bytes` in
-    /// `determine_available_memory`, replacing the 512 MiB
-    /// placeholder from Step 3.B.
-    ///
-    /// Default returns 512 MiB so arches that never override this
-    /// still surface a sane placeholder.
-    #[cfg(feature = "metal")]
-    fn metal_arena_peak_bytes(&self) -> u64 {
-        512 * 1024 * 1024
-    }
-
-    /// `(bucket_m, total_arena_bytes)` for every compiled prefill bucket,
-    /// ascending by `bucket_m`. The macro overrides this per-arch from the
-    /// canonical's `METAL_BUCKET_ARENA_COSTS`; the load-time selector uses
-    /// it to prune the global ladder to what the device can afford. Default
-    /// empty → the selector falls back to keeping all compiled buckets.
-    #[cfg(feature = "metal")]
-    fn metal_bucket_arena_costs(&self) -> &'static [(u32, u64)] {
-        &[]
-    }
-
     /// The kernels this model runs on its logits outside its tape (argmax,
     /// grammar mask, sampler), baked at expansion with its logits width and
     /// dtype: a `scratchy_target_metal::off_tape::OffTapeKernels`, typed `Any`
@@ -323,12 +296,21 @@ pub trait ScratchyWeights: Send + Sync {
     #[cfg(feature = "metal")]
     fn metal_rungs(&self) -> &'static (dyn core::any::Any + Send + Sync);
 
-    /// The arena slots and scratch of the model's resident pool, a
-    /// `scratchy_target_metal::interpreter::metal::LentActivation` typed `Any` (as
-    /// [`Self::metal_rungs`]): what a model whose forwards never overlap this one's places its own
-    /// in. `None` until this model's first forward builds the pool.
+    /// What the model's resident pool shares with its guest, a
+    /// `scratchy_target_metal::interpreter::metal::HostArena` typed `Any` (as
+    /// [`Self::metal_rungs`]): the arena slots and scratch a model whose forwards never overlap
+    /// this one's runs in, which the pool was sized to hold. `None` until this model's first
+    /// forward builds the pool.
     #[cfg(feature = "metal")]
-    fn metal_lend_activation(&self) -> Option<Box<dyn core::any::Any>>;
+    fn metal_hosted(&self) -> Option<Box<dyn core::any::Any>>;
+
+    /// Make this model's resident pool hold a guest's arena: `guest` a
+    /// `scratchy_target_metal::interpreter::metal::GuestArena` typed `Any` (as
+    /// [`Self::metal_rungs`]), what a model whose forwards follow this one's on its command buffer
+    /// (an MTP head) needs of it. Set once, before the pool is built at this model's first forward;
+    /// refused once the pool exists — it was sized without the guest.
+    #[cfg(feature = "metal")]
+    fn metal_host(&self, guest: Box<dyn core::any::Any>) -> Result<(), String>;
 
     /// The model's `CanonicalParams::METAL_DTYPE`, so the worker can size
     /// its KV cache without monomorphizing on `W`.
@@ -344,6 +326,10 @@ pub trait ScratchyWeights: Send + Sync {
     /// hook — non-metal builds and arches that haven't been
     /// re-emitted with the metal followup glue still build.
     ///
+    /// `Err` only when the forward's command buffer failed on the GPU (an
+    /// out-of-memory, say): the executor fails the step and goes on. A
+    /// forward that breaks an invariant still panics.
+    ///
     /// # Safety
     /// Same as [`Self::forward`].
     #[cfg(feature = "metal")]
@@ -353,8 +339,8 @@ pub trait ScratchyWeights: Send + Sync {
         device: ForwardDeviceHandle<'_>,
         num_tokens: u64,
         _followup: Option<MetalForwardFollowup<'_>>,
-    ) -> OwnedTensor {
-        unsafe { self.forward(ctx, device, num_tokens) }
+    ) -> Result<OwnedTensor, GpuExecutionFailed> {
+        Ok(unsafe { self.forward(ctx, device, num_tokens) })
     }
 
     /// The rotary cos/sin rows a forward at `positions` (one a token) reads in place of a
@@ -407,6 +393,23 @@ pub trait ScratchyWeights: Send + Sync {
     }
 }
 
+/// A metal forward whose command buffer the GPU failed to run (an out-of-memory, say): the one
+/// failure `forward_with_metal_followup` returns rather than panics on, so the executor can fail
+/// the step and go on. Its text is the pool's error.
+#[cfg(feature = "metal")]
+#[derive(Debug)]
+pub struct GpuExecutionFailed(pub String);
+
+#[cfg(feature = "metal")]
+impl std::fmt::Display for GpuExecutionFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(feature = "metal")]
+impl std::error::Error for GpuExecutionFailed {}
+
 /// Box for a Metal forward-encoder tail hook. Invoked on the same
 /// MTL4 compute encoder used to encode the forward, AFTER the
 /// forward dispatches and BEFORE `endEncoding`. The callee can
@@ -414,10 +417,11 @@ pub trait ScratchyWeights: Send + Sync {
 /// forward) so they run inside the same command buffer with one
 /// commit and one host wait. Receives:
 ///   - the MTL4 compute encoder to append dispatches onto;
-///   - the logits MTLBuffer (the bucket's terminal arena slot);
-///   - the final (post-norm) hidden states, `[total_n, hidden]` (the
+///   - the logits MTLBuffer (the bucket's terminal arena slot): the logits of the rows the
+///     step samples, at its front, in order;
+///   - the final (post-norm) hidden states, `[num_tokens, hidden]` (the
 ///     bucket's backbone slot);
-///   - `total_n` (logits row count) and `vocab` (column count).
+///   - `total_n` (the sampled rows: the logits row count) and `vocab` (column count).
 ///
 /// MTL4 only.
 #[cfg(feature = "metal")]
@@ -452,14 +456,26 @@ pub trait MetalForwardOnto {
     /// The final (post-norm) hidden states, `[num_tokens, hidden]` (the bucket's backbone slot).
     fn hidden(&self) -> &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>;
 
-    /// The lm_head output, `[num_tokens, vocab]` rows (the bucket's terminal arena slot).
+    /// The lm_head output (the bucket's terminal arena slot): the logits of the rows the forward
+    /// sampled, at its front, `vocab` wide.
     fn logits(&self) -> &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>;
 
     /// The logits' row width.
     fn vocab(&self) -> u32;
+}
 
-    /// Rows `rows` of the final (post-norm) hidden states, as bytes.
-    fn hidden_rows(&self, rows: &[u32]) -> Vec<u8>;
+/// The rows one forward samples (its sampled rows' count): one a sequence, every row of a
+/// sequence verifying drafts — the logits it leaves at the front of its output, what a metal
+/// tape's runtime gates and sampled-rows grids read.
+#[cfg(feature = "metal")]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct SampledRowCount(pub u32);
+
+#[cfg(feature = "metal")]
+impl SampledRowCount {
+    pub fn get(self) -> u32 {
+        self.0
+    }
 }
 
 /// Non-generic view of the macro-emitted MetalWorker for the
@@ -473,13 +489,14 @@ pub trait MetalForwardOnto {
 pub trait ChainStepHandle {
     /// Encode one bucket forward dispatch onto the chain encoder.
     /// `num_tokens` is real (the bucket is fixed across iters
-    /// because the K-step decode shape doesn't change).
+    /// because the K-step decode shape doesn't change); `sampled_rows`
+    /// the rows whose logits it leaves, at the front.
     fn run_forward_step(
         &self,
         encoder: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         num_tokens: u32,
         num_seqs: u32,
-        has_spec_tokens: bool,
+        sampled_rows: SampledRowCount,
     ) -> Result<(), String>;
 
     /// The bucket's terminal arena slot (lm_head output). Stable

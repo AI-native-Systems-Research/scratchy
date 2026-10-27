@@ -299,9 +299,7 @@ mod green_gate {
             vision_window_index: None,
             vision_reverse_indices: None,
             vision_position_ids: None,
-            last_token_indices: None,
-            #[cfg(feature = "metal")]
-            has_spec_tokens: false,
+            sampled_rows: None,
             #[cfg(feature = "metal")]
             gdn_state: None,
             #[cfg(feature = "metal")]

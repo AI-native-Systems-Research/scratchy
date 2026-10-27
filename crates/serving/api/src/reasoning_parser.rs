@@ -14,6 +14,8 @@
 //! `qwen3_reasoning_parser.py`
 
 use std::collections::HashMap;
+
+use scratchy_core_common::sampling::ThinkTokens;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -110,6 +112,11 @@ pub trait ReasoningParser: Send + Sync {
     fn requires_special_tokens(&self) -> bool {
         false
     }
+
+    /// The tokens this parser's thinking opens and closes on, when they are single tokens
+    /// (`<think>` and `</think>`): a request's guided grammar waits for the close (#793). `None`
+    /// for a parser that reads its markers as text, so the grammar applies from the first token.
+    fn think_tokens(&self) -> Option<ThinkTokens>;
 }
 
 /// Per-request state for streaming reasoning extraction.
@@ -138,20 +145,24 @@ pub trait StreamingReasoningParserState: Send {
 
     /// Whether reasoning can re-open after content in a single generation.
     ///
-    /// Most formats are strictly reasoning-first (DeepSeek, Qwen3, harmony);
-    /// the engine stops routing text through the parser once content has been
-    /// seen. Gemma 4's thought channels interleave — text, then a channel,
-    /// then a tool call — so its parser overrides this and keeps routing
-    /// every delta.
+    /// Most formats are strictly reasoning-first (DeepSeek, Qwen3); the engine
+    /// stops routing text through the parser once content has been seen.
+    /// Gemma 4's thought channels interleave — text, then a channel, then a
+    /// tool call — and so can harmony's messages, so their parsers override
+    /// this and keep routing every delta.
     fn interleaved(&self) -> bool {
         false
     }
 
     /// Release anything the parser held back against a marker that never
-    /// arrived, as a final delta. Called once when the request finishes;
-    /// parsers that hold text back across deltas (Gemma 4's channel-name
-    /// hold) must return it here so a reply ending on held text is not
-    /// truncated.
+    /// arrived, as a final delta. Called once when the request finishes, if
+    /// the parser still routes text then: always for an [`interleaved`]
+    /// parser, and for a reasoning-first one only if no content came. A
+    /// parser that holds text back across deltas (Gemma 4's channel-name
+    /// hold, harmony's unclosed `<`) must be interleaved, and return the text
+    /// here, so a reply ending on held text is not truncated.
+    ///
+    /// [`interleaved`]: StreamingReasoningParserState::interleaved
     fn flush(&mut self) -> ReasoningDelta {
         ReasoningDelta::None
     }
@@ -195,6 +206,13 @@ impl DeepSeekR1ReasoningParser {
 }
 
 impl ReasoningParser for DeepSeekR1ReasoningParser {
+    fn think_tokens(&self) -> Option<ThinkTokens> {
+        Some(ThinkTokens {
+            open: self.start_token_id,
+            close: self.end_token_id,
+        })
+    }
+
     fn extract_reasoning(&self, model_output: &str) -> ExtractedReasoning {
         // Strip <think> if present.
         let output = if let Some(after) = strip_start_token(model_output, self.start_token) {
@@ -365,6 +383,13 @@ impl Qwen3ReasoningParser {
 }
 
 impl ReasoningParser for Qwen3ReasoningParser {
+    fn think_tokens(&self) -> Option<ThinkTokens> {
+        Some(ThinkTokens {
+            open: self.start_token_id,
+            close: self.end_token_id,
+        })
+    }
+
     fn extract_reasoning(&self, model_output: &str) -> ExtractedReasoning {
         // Strip <think> if present in the generated output.
         let output = if let Some(after) = strip_start_token(model_output, self.start_token) {
@@ -480,10 +505,6 @@ impl StreamingReasoningParserState for Qwen3StreamingState {
 /// single vocab tokens across quantized ports, so we match on their text.
 pub struct GptOssReasoningParser;
 
-impl GptOssReasoningParser {
-    const CHANNEL: &'static str = "<|channel|>";
-}
-
 /// A recognized harmony control marker. Classification is tolerant of quant
 /// ports that emit the pipe on only one side: `<|channel>` (open) and the
 /// stray `<channel|>` both occur in the wild alongside canonical
@@ -528,66 +549,123 @@ fn is_reasoning_channel(name: &str) -> bool {
         .any(|k| n.contains(k))
 }
 
-impl ReasoningParser for GptOssReasoningParser {
-    fn extract_reasoning(&self, model_output: &str) -> ExtractedReasoning {
-        // What the text since the last marker represents.
-        enum Prev {
-            Body,
-            ChannelName,
-            Role,
-        }
-        let mut reasoning = String::new();
-        let mut content = String::new();
-        let mut target_reasoning = false;
-        let mut prev = Prev::Body;
-        let mut saw_marker = false;
-        let mut seg = String::new();
+/// What the harmony text since the last marker is.
+#[derive(Clone, Copy, Default)]
+enum HarmonyPart {
+    /// A message body (or text before any marker), routed by the open channel.
+    #[default]
+    Body,
+    /// A channel's name, after `<|channel|>`: never emitted.
+    ChannelName,
+    /// A message's role, after `<|start|>` (e.g. `assistant`): never emitted.
+    Role,
+}
 
-        let chars: Vec<char> = model_output.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            if chars[i] == '<'
-                && let Some(rel) = chars[i + 1..].iter().position(|&c| c == '>')
-            {
-                let close = i + 1 + rel;
-                let inner: String = chars[i + 1..close].iter().collect();
-                let marker = classify_marker(&inner);
-                if marker != HarmonyMarker::NotMarker {
-                    match prev {
-                        Prev::ChannelName => target_reasoning = is_reasoning_channel(seg.trim()),
-                        Prev::Role => {} // the role token (e.g. "assistant") is dropped
-                        Prev::Body => {
-                            if target_reasoning {
-                                reasoning.push_str(&seg);
-                            } else {
-                                content.push_str(&seg);
-                            }
-                        }
+/// The longest text after a `<` the scanner holds for a `>` that may close a marker: every
+/// harmony marker with room for a malformed port's stray whitespace.
+const HARMONY_MARKER_MAX: usize = 24;
+
+/// The harmony scanner both of [`GptOssReasoningParser`]'s paths run, so the streamed reply and
+/// the complete one split text the same way. Fed text piece by piece; a `<` whose marker has not
+/// closed yet is held until it does, or until it is too long to be one.
+#[derive(Default)]
+struct HarmonyScanner {
+    part: HarmonyPart,
+    /// The open channel is a reasoning channel ([`is_reasoning_channel`]).
+    reasoning_channel: bool,
+    saw_marker: bool,
+    /// The channel name or role read so far.
+    header: String,
+    /// A `<` that may open a marker, and the text after it.
+    carry: String,
+}
+
+impl HarmonyScanner {
+    /// Scan `text`, appending reasoning-channel bodies to `reasoning` and the rest of the bodies
+    /// to `content`. Markers, channel names and roles are consumed.
+    fn feed(&mut self, text: &str, reasoning: &mut String, content: &mut String) {
+        let buf = std::mem::take(&mut self.carry) + text;
+        let mut rest = buf.as_str();
+        while let Some(lt) = rest.find('<') {
+            self.push(&rest[..lt], reasoning, content);
+            let tail = &rest[lt..];
+            match tail[1..].find('>') {
+                Some(gt) => match classify_marker(&tail[1..1 + gt]) {
+                    HarmonyMarker::NotMarker => {
+                        self.push("<", reasoning, content);
+                        rest = &tail[1..];
                     }
-                    seg.clear();
-                    saw_marker = true;
-                    prev = match marker {
-                        HarmonyMarker::Channel => Prev::ChannelName,
-                        HarmonyMarker::Start => Prev::Role,
-                        _ => Prev::Body,
-                    };
-                    i = close + 1;
-                    continue;
+                    marker => {
+                        self.mark(marker);
+                        rest = &tail[gt + 2..];
+                    }
+                },
+                None if tail.len() < HARMONY_MARKER_MAX => {
+                    self.carry = tail.to_string();
+                    return;
+                }
+                None => {
+                    self.push("<", reasoning, content);
+                    rest = &tail[1..];
                 }
             }
-            seg.push(chars[i]);
-            i += 1;
         }
-        // Trailing segment: only a body contributes (a dangling name/role is dropped).
-        if let Prev::Body = prev {
-            if target_reasoning {
-                reasoning.push_str(&seg);
-            } else {
-                content.push_str(&seg);
-            }
-        }
+        self.push(rest, reasoning, content);
+    }
 
-        if !saw_marker {
+    /// The end of the text: a held `<` that opened no marker is text.
+    fn finish(&mut self, reasoning: &mut String, content: &mut String) {
+        let carry = std::mem::take(&mut self.carry);
+        self.push(&carry, reasoning, content);
+    }
+
+    fn mark(&mut self, marker: HarmonyMarker) {
+        if let HarmonyPart::ChannelName = self.part {
+            self.reasoning_channel = is_reasoning_channel(self.header.trim());
+        }
+        self.header.clear();
+        self.saw_marker = true;
+        self.part = match marker {
+            HarmonyMarker::Channel => HarmonyPart::ChannelName,
+            HarmonyMarker::Start => HarmonyPart::Role,
+            _ => HarmonyPart::Body,
+        };
+    }
+
+    fn push(&mut self, text: &str, reasoning: &mut String, content: &mut String) {
+        match self.part {
+            HarmonyPart::Body if self.reasoning_channel => reasoning.push_str(text),
+            HarmonyPart::Body => content.push_str(text),
+            HarmonyPart::ChannelName | HarmonyPart::Role => self.header.push_str(text),
+        }
+    }
+}
+
+/// One streamed delta's split.
+fn reasoning_delta(reasoning: String, content: String) -> ReasoningDelta {
+    match (reasoning.is_empty(), content.is_empty()) {
+        (true, true) => ReasoningDelta::None,
+        (false, true) => ReasoningDelta::Reasoning(reasoning),
+        (true, false) => ReasoningDelta::Content(content),
+        (false, false) => ReasoningDelta::Split {
+            reasoning: Some(reasoning),
+            content: Some(content),
+        },
+    }
+}
+
+impl ReasoningParser for GptOssReasoningParser {
+    /// Harmony's channel markers are read as text: they aren't single tokens on every port.
+    fn think_tokens(&self) -> Option<ThinkTokens> {
+        None
+    }
+
+    fn extract_reasoning(&self, model_output: &str) -> ExtractedReasoning {
+        let mut scanner = HarmonyScanner::default();
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        scanner.feed(model_output, &mut reasoning, &mut content);
+        scanner.finish(&mut reasoning, &mut content);
+        if !scanner.saw_marker {
             return ExtractedReasoning {
                 reasoning: None,
                 content: non_empty(model_output),
@@ -600,39 +678,48 @@ impl ReasoningParser for GptOssReasoningParser {
     }
 
     fn create_streaming_state(&self) -> Box<dyn StreamingReasoningParserState + Send> {
-        Box::new(GptOssStreamingState)
+        Box::new(GptOssStreamingState::default())
+    }
+
+    /// The harmony markers are special tokens in gpt-oss's tokenizer (`<|channel|>`,
+    /// `<|message|>`, `<|start|>`, `<|end|>`, `<|return|>`, `<|call|>`), so
+    /// `skip_special_tokens` strips them before this parser reads the text, and the analysis
+    /// channel came back as content (#601).
+    fn requires_special_tokens(&self) -> bool {
+        true
     }
 }
 
-struct GptOssStreamingState;
+#[derive(Default)]
+struct GptOssStreamingState(HarmonyScanner);
 
 impl StreamingReasoningParserState for GptOssStreamingState {
     fn process_delta(
         &mut self,
         _previous_text: &str,
-        current_text: &str,
+        _current_text: &str,
         delta_text: &str,
         _previous_token_ids: &[u32],
         _current_token_ids: &[u32],
         _delta_token_ids: &[u32],
     ) -> ReasoningDelta {
-        // Suppress fragments that carry a harmony control marker.
-        if delta_text.contains("<|") || delta_text.contains("|>") {
-            return ReasoningDelta::None;
-        }
-        // Route by the channel opened most recently in the accumulated text.
-        let in_final = current_text
-            .rsplit(GptOssReasoningParser::CHANNEL)
-            .next()
-            .map(|seg| seg.trim_start().starts_with("final"))
-            .unwrap_or(false);
-        if delta_text.is_empty() {
-            ReasoningDelta::None
-        } else if in_final {
-            ReasoningDelta::Content(delta_text.to_string())
-        } else {
-            ReasoningDelta::Reasoning(delta_text.to_string())
-        }
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        self.0.feed(delta_text, &mut reasoning, &mut content);
+        reasoning_delta(reasoning, content)
+    }
+
+    fn flush(&mut self) -> ReasoningDelta {
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        self.0.finish(&mut reasoning, &mut content);
+        reasoning_delta(reasoning, content)
+    }
+
+    /// Every delta goes through the scanner, content included: a harmony reply can open another
+    /// channel after content (a later message), and the scanner may hold a `<` that the next
+    /// delta closes. Left to the engine after the first content, the held `<` was lost and any
+    /// later marker streamed as text.
+    fn interleaved(&self) -> bool {
+        true
     }
 }
 
@@ -664,6 +751,11 @@ impl Gemma4ReasoningParser {
 }
 
 impl ReasoningParser for Gemma4ReasoningParser {
+    /// Its channel markers are read as text, atom by atom.
+    fn think_tokens(&self) -> Option<ThinkTokens> {
+        None
+    }
+
     fn extract_reasoning(&self, model_output: &str) -> ExtractedReasoning {
         let mut state = Gemma4StreamingState::default();
         let mut reasoning = String::new();
@@ -1118,6 +1210,11 @@ pub fn detect_reasoning_parser(arch: &str) -> Option<&'static str> {
     } else if a.contains("deepseek") {
         // deepseek_v3 / R1 emit `<think>…</think>`.
         Some("deepseek_r1")
+    } else if a.contains("granite_4_2") {
+        // Granite 4.2 (the first granite with an untied lm_head — see
+        // `model_arch` in init.rs) thinks in ` MudThink… MudThinkEnd`, Qwen3's
+        // tokens, so it reuses the Qwen3 parser.
+        Some("qwen3")
     } else if a.contains("qwen3") || a.contains("qwq") || a.contains("nemotron_h") {
         // Nemotron-H's template opens `<think>\n` in the prompt (`</think>` closed
         // there when thinking is off), Qwen3.5's convention.
@@ -1972,6 +2069,77 @@ mod gpt_oss_tests {
         assert_eq!(r.content.as_deref(), Some("the answer"));
     }
 
+    /// The reasoning and content a stream of `pieces` adds up to, its end-of-stream flush
+    /// included.
+    fn stream(pieces: &[&str]) -> (String, String) {
+        let mut state = GptOssReasoningParser.create_streaming_state();
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        let mut text = String::new();
+        for piece in pieces {
+            let previous = text.clone();
+            text.push_str(piece);
+            let delta = state.process_delta(&previous, &text, piece, &[], &[], &[]);
+            let (r, c) = delta.into_parts();
+            reasoning.extend(r);
+            content.extend(c);
+        }
+        let (r, c) = state.flush().into_parts();
+        reasoning.extend(r);
+        content.extend(c);
+        (reasoning, content)
+    }
+
+    /// A streamed harmony reply, one token per delta, splits as the complete reply does: channel
+    /// names and the role never stream as reasoning or content (#601: they did, "analysis"
+    /// first).
+    #[test]
+    fn a_streamed_reply_splits_as_the_complete_reply() {
+        let pieces = [
+            "<|channel|>",
+            "analysis",
+            "<|message|>",
+            "weighing",
+            " options",
+            "<|end|>",
+            "<|start|>",
+            "assistant",
+            "<|channel|>",
+            "final",
+            "<|message|>",
+            "the",
+            " answer",
+        ];
+        assert_eq!(
+            stream(&pieces),
+            ("weighing options".to_string(), "the answer".to_string())
+        );
+        let whole = GptOssReasoningParser.extract_reasoning(&pieces.concat());
+        assert_eq!(whole.reasoning.as_deref(), Some("weighing options"));
+        assert_eq!(whole.content.as_deref(), Some("the answer"));
+    }
+
+    /// A marker a quant port writes as several text pieces is held until it closes; a `<` that
+    /// opens none is text.
+    #[test]
+    fn a_marker_split_across_deltas_still_matches() {
+        let pieces = [
+            "<|chan",
+            "nel|>analysis<|mes",
+            "sage|>is a < b?",
+            "<|channel|>final<",
+            "|message|>yes",
+        ];
+        assert_eq!(
+            stream(&pieces),
+            ("is a < b?".to_string(), "yes".to_string())
+        );
+        // A `<` the stream ends on opens nothing: it is text.
+        assert_eq!(
+            stream(&["no markers <"]),
+            (String::new(), "no markers <".into())
+        );
+    }
+
     #[test]
     fn no_channels_is_all_content() {
         let p = GptOssReasoningParser;
@@ -2004,6 +2172,9 @@ mod gpt_oss_tests {
         assert_eq!(detect_reasoning_parser("gemma4"), Some("gemma4"));
         assert_eq!(detect_reasoning_parser("gemma4_moe"), Some("gemma4"));
         assert_eq!(detect_reasoning_parser("gemma4_unified"), Some("gemma4"));
+        // Granite 4.2 (untied lm_head) thinks; ≤4.1 does not.
+        assert_eq!(detect_reasoning_parser("granite_4_2"), Some("qwen3"));
+        assert_eq!(detect_reasoning_parser("granite"), None);
         // Architectures with no known reasoning format get no parser.
         assert_eq!(detect_reasoning_parser("gemma3"), None);
         assert_eq!(detect_reasoning_parser("llama"), None);
@@ -2324,8 +2495,9 @@ mod gemma4_tests {
         let parser = Gemma4ReasoningParser;
         assert!(parser.requires_special_tokens());
         assert!(parser.create_streaming_state().interleaved());
-        // The default parsers stay reasoning-first and text-based.
-        assert!(!GptOssReasoningParser.requires_special_tokens());
-        assert!(!GptOssReasoningParser.create_streaming_state().interleaved());
+        // Harmony's messages interleave too, and its markers are special tokens in gpt-oss's
+        // tokenizer.
+        assert!(GptOssReasoningParser.requires_special_tokens());
+        assert!(GptOssReasoningParser.create_streaming_state().interleaved());
     }
 }

@@ -2,7 +2,8 @@
 //! ONE CANONICAL, LOWERED — the entry the `#[forward]` macro calls for each decode canonical.
 //!
 //! Metal's orchestration of the shared passes: the tape and its re-roll ([`tape_program`]), the
-//! fold pass under `op_abi::METAL_FUSIONS`, the colourer under `op_abi::METAL_COLOUR_FACTS`. Then
+//! fold pass under `op_abi::METAL_FUSIONS` and its narrow-band twin, the colourer under
+//! `op_abi::METAL_COLOUR_FACTS`. Then
 //! metal's step records ([`steps_from_tape`]), laid out along the ROLLED tape and proven against
 //! the unrolled layout; where the roll does not prove, the cut is moved until it does. Out come
 //! the step tape the bake lowers — each row's weights named by the model's [`SourceManifest`],
@@ -16,15 +17,15 @@ use proc_macro2::{Literal, TokenStream};
 use quote::{format_ident, quote};
 use scratchy_subtile::handoff::{LoweredDecode, SlotMap, WeightKind, WeightSlot};
 use scratchy_subtile::kv_codec::{KvCodecError, expand_kv_codec};
-use scratchy_subtile::sample_rows::{SampleRowsError, expand_sample_rows};
+use scratchy_subtile::sample_rows::{ResultRows, SampleRowsError, expand_sample_rows};
 use scratchy_subtile::subtile_ir::ExpertBody;
 use scratchy_subtile::tape_colouring::{Colour, ColourCount, ColourError, colour_tape};
-use scratchy_subtile::tape_folding::{FoldError, ModelFoldFacts, fold_tape};
+use scratchy_subtile::tape_folding::{FoldError, FusionTable, ModelFoldFacts, fold_tape};
 use scratchy_subtile::wave_schedule::wave_order;
 use scratchy_target_metal::from_tape::{TapeItem, roll_at};
 use scratchy_target_metal::op_abi::{
-    METAL_COLOUR_FACTS, METAL_FUSIONS, METAL_KV_CODEC, METAL_SAMPLE_ROWS, METAL_WAVE_ORDER_ROWS,
-    metal_colour_rule, metal_guard_gates,
+    METAL_COLOUR_FACTS, METAL_FUSIONS, METAL_FUSIONS_NARROW, METAL_KV_CODEC, METAL_SAMPLE_ROWS,
+    METAL_WAVE_ORDER_ROWS, MetalFusion, metal_colour_rule, metal_guard_gates,
 };
 use scratchy_target_metal::tape::ids::{ArenaSlotIdx, SourceIx};
 use scratchy_target_metal::tape::lowered::Fence;
@@ -188,11 +189,15 @@ pub struct MetalStepFacts<'a> {
 pub type MoeExpertBits<'f> = dyn Fn(&str, LayerId, ExpertBody) -> [Option<AffineBits>; 3] + 'f;
 
 /// Which canonical this is, for the log and the refusals.
+#[derive(Clone, Copy)]
 pub struct CanonicalAt<'a> {
     pub stem: &'a str,
     pub m: u64,
     /// The buckets it stands for, `m` among them: each runs its tape, codec guards realized at `m`.
     pub buckets: &'a [u64],
+    /// The rows of its result the forward's caller reads: a decoder's sampled logits, an
+    /// encoder's every row.
+    pub rows: ResultRows,
 }
 
 /// Where the backbone's layer loop was cut.
@@ -260,7 +265,8 @@ fn decode_barriers(t: &Assembled, flags: &[Fence], m: u64) -> usize {
     let decode = StepFacts {
         num_tokens: rows,
         num_seqs: rows,
-        has_spec_tokens: false,
+        // A decode step samples its every row.
+        sampled_rows: scratchy_target_metal::tape::ids::SampledRowCount(rows),
         unrotated_blocks: false,
         gdn_plain: true,
         // A decode step's sequences are one row each.
@@ -273,16 +279,23 @@ fn decode_barriers(t: &Assembled, flags: &[Fence], m: u64) -> usize {
 }
 
 /// Lower one decode canonical: step tape (its weights interned into the model's `sources`),
-/// colours and arena.
+/// colours and arena. `fusions` is the fold table this lowering runs under — the routed band
+/// a chip class takes ([`lower_canonical_classed`]).
 pub fn lower_canonical(
     l: &LoweredDecode,
     facts: &MetalStepFacts<'_>,
     consts: &MetalModelConsts,
     at: CanonicalAt<'_>,
     sources: &mut SourceManifest,
+    fusions: &FusionTable<MetalFusion>,
 ) -> Result<MetalCanonical, CanonicalRefusal> {
     use CanonicalRefusal::Steps;
-    let CanonicalAt { stem, m, buckets } = at;
+    let CanonicalAt {
+        stem,
+        m,
+        buckets,
+        rows,
+    } = at;
     let guards = |m: u64| metal_guard_gates(m as u32);
     if let Some(&bucket) = buckets.iter().find(|&&b| guards(b) != guards(m)) {
         return Err(CanonicalRefusal::Guards { bucket });
@@ -297,7 +310,8 @@ pub fn lower_canonical(
         l
     };
     // Metal's lm_head slice: the sampled rows its declared facts insert.
-    let l = &expand_sample_rows(l, &METAL_SAMPLE_ROWS).map_err(CanonicalRefusal::SampleRows)?;
+    let l =
+        &expand_sample_rows(l, &METAL_SAMPLE_ROWS, rows).map_err(CanonicalRefusal::SampleRows)?;
     // Whether the gate/up projections fold is this model's fact: a dense preset has the fused
     // projection kernel, and an affine one the fused one-row matvec, for its one-row bucket.
     let fold_projections = facts.mlp == MlpForm::Packed || m == 1;
@@ -328,8 +342,8 @@ pub fn lower_canonical(
     let waved;
     let l = if m <= METAL_WAVE_ORDER_ROWS {
         let tp = crate::tape_program::tape_program(l, stem, m);
-        let folds = fold_tape(&tp.graph, &tp.tape, l, &METAL_FUSIONS, model)
-            .map_err(CanonicalRefusal::Fold)?;
+        let folds =
+            fold_tape(&tp.graph, &tp.tape, l, fusions, model).map_err(CanonicalRefusal::Fold)?;
         // What runs no command of its own: a step a fold computes inside another, and the expert
         // sort of a bake that gathers (its readers bind what it views).
         let mut free = vec![false; l.input.ops.len()];
@@ -350,7 +364,7 @@ pub fn lower_canonical(
     };
     let tp = crate::tape_program::tape_program(l, stem, m);
     let folds =
-        fold_tape(&tp.graph, &tp.tape, l, &METAL_FUSIONS, model).map_err(CanonicalRefusal::Fold)?;
+        fold_tape(&tp.graph, &tp.tape, l, fusions, model).map_err(CanonicalRefusal::Fold)?;
     let colouring = colour_tape(
         &tp.graph,
         &tp.tape,
@@ -483,4 +497,45 @@ pub fn lower_canonical(
         arena: colours.arena().clone(),
         roll,
     })
+}
+
+/// One decode canonical, lowered under both routed bands. The bands change WHICH steps the
+/// routed fold merges — and with them the colouring those steps were coloured under, so each
+/// band carries its own whole lowering: the macro emits one bucket row per band and the pool
+/// picks the row its device's class lowers under.
+pub struct ClassedCanonical {
+    /// The narrow band's lowering: what every chip but the wide-M5 class runs — by construction
+    /// the pre-fold decision at every bucket (`rows_through: 1`; the band alone decides).
+    pub narrow: MetalCanonical,
+    /// The wide band's lowering, `None` when the bands fold the same step tape (no routing ops,
+    /// or the fold refused at this bucket), so `narrow` serves every class.
+    pub wide: Option<MetalCanonical>,
+}
+
+/// Lower one canonical under both of metal's routed bands ([`METAL_FUSIONS`] wide,
+/// [`METAL_FUSIONS_NARROW`] narrow): the routed-experts fold is the one pattern whose band the
+/// target chip decides — its per-threadgroup routing hides behind cores a Max-scale M5 has and a
+/// 10-core one does not (PR #847's A/B and its base-M5 review). A model with no routing ops
+/// cannot tell the bands apart, so it lowers once.
+pub fn lower_canonical_classed(
+    l: &LoweredDecode,
+    facts: &MetalStepFacts<'_>,
+    consts: &MetalModelConsts,
+    at: CanonicalAt<'_>,
+    sources: &mut SourceManifest,
+) -> Result<ClassedCanonical, CanonicalRefusal> {
+    let narrow = lower_canonical(l, facts, consts, at, sources, &METAL_FUSIONS_NARROW)?;
+    let routed = l
+        .input
+        .ops
+        .iter()
+        .any(|od| matches!(od.op, scratchy_subtile::subtile_ir::SubOp::RouteTopK { .. }));
+    if !routed {
+        return Ok(ClassedCanonical { narrow, wide: None });
+    }
+    let wide = lower_canonical(l, facts, consts, at, sources, &METAL_FUSIONS)?;
+    // The bands folding the same step tape (the fold refused at this bucket) need one lowering:
+    // `narrow` serves every class.
+    let wide = (wide.steps != narrow.steps).then_some(wide);
+    Ok(ClassedCanonical { narrow, wide })
 }

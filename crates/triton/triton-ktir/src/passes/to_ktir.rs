@@ -136,11 +136,18 @@ pub fn run(module: &mut Module, grid: &[i64]) -> Result<()> {
     // anything else is left for the window guard to report by name. See the pass doc.
     unroll_constant_trip_loops(module)?;
     fold_unit_grid_tile_id(module);
-    // AFTER the unit fold, deliberately: a unit grid already folded its landmark to zero and
-    // has nothing for this pass to do, and the twelve card-verified kernels at multi-tile grids
-    // (the embedding, the whole-node MLPs) never state a computed window corner, so the fire
-    // gate below leaves them byte-identical. Only the genuinely corner-carrying multi-tile
-    // body -- attention at 16 -- is unrolled.
+    // THE GRID-CORNER UNIFORM SPELLING, between the unit fold and the fire gate: a corner
+    // this pass rewrites is claimed by the recognizer the gate consults below, so an
+    // all-uniform grid keeps its launch instead of paying the clone protocol -- while a
+    // corner that is computed and NOT uniform (attention's head-grouped K/V at 16) still
+    // trips the gate exactly as before. See the pass doc for the proof discipline.
+    crate::passes::uniform_grid_corners::run(module, grid)?;
+    // AFTER the unit fold and the uniform rewrite, deliberately: a unit grid already folded
+    // its landmark to zero and has nothing for this pass to do, and the twelve
+    // card-verified kernels at multi-tile grids (the embedding, the whole-node MLPs) never
+    // state a computed window corner, so the fire gate below leaves them byte-identical.
+    // Only the genuinely corner-carrying multi-tile body -- attention at 16, whose K/V
+    // corner is the head-grouped family the uniform pass cannot state -- is unrolled.
     unroll_grid_positions(module)?;
     // SECOND TRIP-UNROLL ARM, deliberately after the grid unroll: a CAUSAL sweep's trip count is a
     // function of the grid position (`off_band = f(start_m)`), so the FIRST arm above -- run while
@@ -285,6 +292,7 @@ fn convert_body(module: &mut Module) -> Result<()> {
     convert_all(module, OpKind::TtBroadcast, convert_broadcast)?;
     convert_all(module, OpKind::TtExpandDims, convert_expand_dims)?;
     convert_all(module, OpKind::TtTrans, convert_trans)?;
+    convert_all(module, OpKind::TtReshape, convert_reshape)?;
     convert_all(module, OpKind::TtSplat, convert_splat_of_argument)?;
     convert_all(module, OpKind::TtMakeRange, convert_make_range)?;
     expand_splat_of_scalar_argument(module)?;
@@ -637,6 +645,87 @@ fn convert_trans(module: &mut Module, index: &DefIndex, path: &OpPath) -> Result
     let block = walk::block_mut(module, path).expect("path");
     block[idx] = transpose;
     block.insert(idx, init_op);
+    Ok(())
+}
+
+/// A `tt.reshape` as `tensor.reshape` -- the flat row-major reinterpretation the
+/// batched paged-decode kernel states over gathered pages and computed tiles.
+///
+/// # WHY THE TARGET RIDES AN ATTRIBUTE AND NOT A SECOND OPERAND
+///
+/// Real MLIR's `tensor.reshape` takes a runtime `shape` tensor operand, because the
+/// destination extents can be dynamic there. OURS CANNOT BE: the front end's
+/// `semantic.rs::reshape` builds the result type from the `dst_shape` the kernel
+/// spelled as constexpr literals, so the extents are compile-time facts of the TYPE.
+/// The scheduler dialect's own reshape family states them exactly this way -- the
+/// emulator's `tensor.reshape` reads a result-type-pinned `target_shape` attribute and
+/// IGNORES a second operand, and the door's `expand_shape`/`collapse_shape` arms read
+/// `TargetShape` off the attr -- so the attribute is the dialect's form, not a shortcut
+/// around it.
+///
+/// The value is DERIVED FROM THE RESULT TYPE here (never copied from the source), the
+/// same non-disagreeable discipline as `lower_op_kind`'s minting for the expand/collapse
+/// pair: the op cannot state a destination other than the type it produces.
+///
+/// # ⛔ FAIL CLOSED ON THE ELEMENT COUNT AND DTYPE
+///
+/// The front end already refuses a numel-changing reshape, but the bridge does not
+/// trust the front end's check as its own: a reshape that changed the element count or
+/// the element type would be a SILENT REINTERPRETATION -- wrong bytes with no
+/// diagnostic -- which is the one failure this pass exists to make loud.
+fn convert_reshape(module: &mut Module, index: &DefIndex, path: &OpPath) -> Result<()> {
+    let op = walk::at(module, path).expect("path").clone();
+    if op.operands.len() != 1 || op.results.len() != 1 {
+        return Err(refuse(format!(
+            "`tt.reshape` with {} operands and {} results: the reinterpretation is one \
+             value in, one value out",
+            op.operands.len(),
+            op.results.len()
+        )));
+    }
+    let src_ty = index
+        .type_of(op.operands[0])
+        .ok_or_else(|| refuse("tt.reshape operand has no type"))?;
+    let res_ty = op
+        .result_types
+        .first()
+        .cloned()
+        .ok_or_else(|| refuse("tt.reshape has no result type"))?;
+    let (src_dims, res_dims) = match (src_ty.dims(), res_ty.dims()) {
+        (Some(s), Some(r)) => (s.to_vec(), r.to_vec()),
+        _ => {
+            return Err(refuse(
+                "tt.reshape is not a reinterpretation of ranked tensors",
+            ));
+        }
+    };
+    let src_numel: i64 = src_dims.iter().product();
+    let res_numel: i64 = res_dims.iter().product();
+    if src_numel != res_numel {
+        return Err(refuse(format!(
+            "tt.reshape would reinterpret {src_numel} elements as {res_numel} ({src_dims:?} \
+             -> {res_dims:?}): the element count is the one thing a reshape must preserve",
+        )));
+    }
+    if src_ty.elem() != res_ty.elem() {
+        return Err(refuse(format!(
+            "tt.reshape would reinterpret a {:?} tile as a {:?} one: the front end's \
+             reshape preserves the element type, so a disagreement here is a silently \
+             mistyped tile",
+            src_ty.elem(),
+            res_ty.elem()
+        )));
+    }
+
+    let reshape = Op::new(OpKind::Other("tensor.reshape".into()))
+        .with_result(op.results[0], res_ty)
+        .with_operands([op.operands[0]])
+        .with_attr(
+            AttrKey::Other("target_shape".into()),
+            Attr::IntList(res_dims),
+        );
+    let idx = path.index();
+    walk::block_mut(module, path).expect("path")[idx] = reshape;
     Ok(())
 }
 
@@ -1202,7 +1291,10 @@ fn fold_grid_work_loop(module: &mut Module) -> Result<()> {
             // those trips, in order, and every work item is still covered exactly once. Unlike
             // the fold there is no zero-trip tile to invent a trip for, so there is no launch
             // obligation to record and `spyre.folded_grid_loop` is deliberately not set -- the
-            // same reasoning that applied when this arm left the loop alone.
+            // same reasoning that applied when this arm left the loop alone. The TRIP COUNT is
+            // a different fact and IS recorded, at the regrid below: it is a count obligation
+            // (`unroll_grid_positions` counts a parameter's windows against the positions),
+            // not a launch one.
             //
             // ⭐ WHY THE POSITION IS STILL ADDRESSABLE. The note above records that the grid
             // position must reach the scheduler either as an `scf.for`/`affine.for` induction
@@ -1324,8 +1416,27 @@ fn fold_grid_work_loop(module: &mut Module) -> Result<()> {
             // the loop FOLDS because one tile then runs per work item. Unrolled, `num_cores`
             // tiles launch and each covers `trips` work items, so leaving `grid` at `work_items`
             // would over-launch by the trip count -- here by 4x.
+            //
+            // ⭐ AND THE TRIP FACTOR IS A CONTRACT, NOT AN INFERENCE. `grid` now understates
+            // the position count: `num_cores` tiles each run `trips` work items, so the body
+            // holds `work_items` positions' worth of windows under an `n = num_cores` grid.
+            // `unroll_grid_positions` tells a parameter's partitioned windows from its swept
+            // ones BY COUNT against that `n`, so a factor that does not travel with the
+            // regrid makes the count silently wrong: a partitioned parameter's `n * trips`
+            // tiles read as a swept parameter's over-count and NOTHING materializes
+            // (MEASURED: the banded-attention twin at 64 positions, two trips -- the door's
+            // whole-view cover unions the store windows nothing wrote and the epilogue
+            // divide's extent check refuses). It travels as
+            // `spyre.unrolled_grid_loop = [num_cores, work_items]`, the same
+            // carry-the-numbers shape as the fold arm's launch contract: an obligation
+            // whose quantity the caller has to rediscover is most of the way to no
+            // obligation at all.
             if let Some(f) = module.ops.iter_mut().find(|o| o.kind == OpKind::FuncFunc) {
                 f.set_attr(AttrKey::Grid, Attr::IntList(vec![num_cores]));
+                f.set_attr(
+                    AttrKey::UnrolledGridLoop,
+                    Attr::IntList(vec![num_cores, work_items]),
+                );
             }
             continue;
         }
@@ -1789,7 +1900,9 @@ fn fold_index_arithmetic(module: &mut Module) {
 ///
 /// ⛔⛔ GRID-PARTITIONED BUFFERS ARE MATERIALIZED PER COPY; SWEPT BUFFERS ARE SHARED.
 /// The discriminator is read from the program after per-copy fold: a parameter whose copies
-/// state EXACTLY ONE access tile over its view, at a row corner that VARIES with the
+/// state EXACTLY ONE access tile per copy over its view (`trips` per copy when the grid
+/// work loop unrolled -- one per trip, see the trip contract at the head of the pass), at a
+/// row corner that VARIES with the
 /// position, is grid-partitioned -- each position owns a disjoint window (attention's Q and
 /// O: one [64, 128] window at `h*256 + m*64`). Such a corner is refused by `base_addressed`
 /// on every `rb`-addressed operand downstream, so each copy whose corner is nonzero gets a
@@ -1817,6 +1930,39 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
     if n <= 1 {
         return Ok(());
     }
+    // ⛔ THE TRIP CONTRACT, READ OFF THE REGRID. When the grid work loop had more work
+    // items than cores, `fold_grid_work_loop`'s unroll arm regridded `grid` to
+    // `[num_cores]` and left `trips = work_items / num_cores` straight-line copies per
+    // core in the body -- so an `n`-tile grid carries `n * trips` positions' worth of
+    // windows, and every position-shaped count below must carry the same factor. The
+    // factor is recorded by the arm that created it rather than re-derived from the
+    // body's copy structure, so the two passes cannot disagree about what a copy is.
+    // The sanity checks below are corruption checks, not workspace: the unroll arm
+    // guarantees both invariants when it sets the pair, so a violation here means one
+    // attr was set without the other and the counts below would be silently wrong.
+    let trips: i64 = match f.attr(&AttrKey::UnrolledGridLoop) {
+        Some(Attr::IntList(pair)) => {
+            let [cores, work_items] = pair.as_slice() else {
+                return Err(refuse(
+                    "`spyre.unrolled_grid_loop` must carry [num_cores, work_items]",
+                ));
+            };
+            if *cores != n {
+                return Err(refuse(format!(
+                    "`spyre.unrolled_grid_loop` records {cores} compute tiles but the \
+                     launch grid is {grid:?}"
+                )));
+            }
+            if work_items % cores != 0 {
+                return Err(refuse(format!(
+                    "`spyre.unrolled_grid_loop` records {work_items} work items over \
+                     {cores} compute tiles, which does not divide"
+                )));
+            }
+            work_items / cores
+        }
+        _ => 1,
+    };
     let kernel = module.kernel().map_err(|e| refuse(e.to_string()))?.clone();
     let body: Vec<Op> = kernel.regions[0].ops.clone();
     let Some(landmark_op) = body.iter().find(|o| o.kind == OpKind::KtdpGetComputeTileId) else {
@@ -1829,9 +1975,11 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
 
     // ── FIRE GATE ──
     // ── FIRE GATE ──
-    // A load whose tile corner is not a constant, at a grid of more than one tile, whose
-    // tile feeds a MATMUL INPUT. The corner chain is the grid delinearisation, so a
-    // constant here means the grid position never reached the window. And the MATMUL
+    // A load whose tile corner is neither a constant nor a per-core uniform, at a grid of
+    // more than one tile, whose tile feeds a MATMUL INPUT. The corner chain is the grid
+    // delinearisation, so a constant here means the grid position never reached the
+    // window, and a uniform corner means the work division already carries it. And the
+    // MATMUL
     // INPUT is what separates the refused case from the card-verified whole-node ones:
     // a computed corner on a pointwise/store operand is carried by the door's
     // whole-node store regions and per-core work-slice addressing (MEASURED: rope_kv8
@@ -1843,6 +1991,9 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
     // ONE definition snapshot: the corner reads below were whole-module scans
     // paid per load candidate.
     let index = module.def_index();
+    // And ONE uniform-form snapshot: the same map for the corners the door resolves
+    // per core -- built once here, consulted per corner below.
+    let uniform = crate::passes::uniform_grid_corners::uniform_corners(&body, &index, landmark);
     let fires = body.iter().any(|o| {
         if o.kind != OpKind::KtdpLoad {
             return false;
@@ -1860,8 +2011,15 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
             .operands
             .get(1..3)
             .map(|cs| {
-                cs.iter()
-                    .any(|c| crate::passes::dot_to_linalg::const_int_index(&index, *c).is_none())
+                cs.iter().any(|c| {
+                    // Computed means NEITHER constant NOR uniform. The uniform corners
+                    // -- the spelling `uniform_grid_corners` mints and the form the
+                    // folded configurations already ship -- are resolved by the door's
+                    // per-core work division, so they are not this gate's business; a
+                    // corner that is neither is the clone protocol's.
+                    crate::passes::dot_to_linalg::const_int_index(&index, *c).is_none()
+                        && !uniform.contains_key(c)
+                })
             })
             .unwrap_or(false);
         if !computed {
@@ -1971,9 +2129,10 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
     //
     // Per parameter: its view (one per pointer in every fixture here; several views of one
     // pointer is left shared rather than guessed at), the tiles over that view across the
-    // WHOLE unrolled body, and their constant row corners. Exactly N tiles at row corners
-    // that vary = partitioned. More than N tiles = swept (K/V: 4 per copy -> 4N total).
-    // Fewer than N = a position that does not read the buffer, left shared.
+    // WHOLE unrolled body, and their constant row corners. Exactly `n * trips` tiles at row
+    // corners that vary = partitioned (`n` positions, one window per position per trip when
+    // the grid work loop unrolled). More than that = swept (K/V: 4 per copy ->
+    // 4N·trips total). Fewer = a position that does not read the buffer, left shared.
     let kernel = module.kernel().map_err(|e| refuse(e.to_string()))?.clone();
     let body: Vec<Op> = kernel.regions[0].ops.clone();
     let mut view_of: HashMap<Ssa, Ssa> = HashMap::new();
@@ -2001,7 +2160,7 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
         let Some(idxs) = tiles_of.get(view) else {
             continue;
         };
-        if idxs.len() != n as usize {
+        if idxs.len() != (n * trips) as usize {
             continue;
         }
         let corners: Vec<Option<i64>> = idxs
@@ -3168,6 +3327,73 @@ module {
                 .iter()
                 .any(|o| o.kind == OpKind::TensorCollapseShape)
         );
+    }
+
+    /// `tt.reshape` -- the flat row-major reinterpretation the batched paged-decode
+    /// kernel states over gathered pages and computed tiles. The positive asserts
+    /// the `tensor.reshape` it becomes and the `target_shape` derived from the
+    /// RESULT TYPE; the controls below break the two laws the front end already
+    /// enforces, so reaching them means hand-written IR.
+    const RESHAPE: &str = "\
+module {
+  tt.func public @k(%q: !tt.ptr<f16>) attributes {noinline = false} {
+    %x = arith.constant dense<0.000000e+00> : tensor<64x64xf16>
+    %r = tt.reshape %x : tensor<64x64xf16> -> tensor<8x512xf16>
+    tt.return
+  }
+}
+";
+
+    /// The reshape crosses as `tensor.reshape` with its target derived from the
+    /// result type -- never copied from the source, so it cannot disagree with the
+    /// type the op actually produces -- and no `tt.*` survives.
+    #[test]
+    fn a_reshape_becomes_tensor_reshape_with_the_target_from_its_result_type() {
+        let m = run_on(RESHAPE, &[8]).unwrap();
+        let r = m
+            .ops_deep()
+            .into_iter()
+            .find(|o| o.kind.spelling() == "tensor.reshape")
+            .expect("the reshape crossed as tensor.reshape");
+        assert_eq!(
+            r.attr(&AttrKey::Other("target_shape".into())),
+            Some(&Attr::IntList(vec![8, 512])),
+            "target_shape is the RESULT TYPE's dims, emitted from the type rather than \
+             from the source"
+        );
+        assert_eq!(
+            r.result_types.first().and_then(|t| t.dims()),
+            Some(&[8i64, 512][..]),
+            "the result type is preserved by the rewrite"
+        );
+        assert!(
+            !m.ops_deep()
+                .iter()
+                .any(|o| o.kind.spelling().starts_with("tt.")),
+            "no tt.* op survives the conversion"
+        );
+    }
+
+    /// CONTROL — a reshape that changes the element count would be a silent
+    /// reinterpretation, so it is refused by name at the bridge.
+    #[test]
+    fn a_numel_changing_reshape_is_refused() {
+        let src = RESHAPE.replacen("-> tensor<8x512xf16>", "-> tensor<8x511xf16>", 1);
+        let e = run_on(&src, &[8]).unwrap_err();
+        assert!(
+            e.message
+                .contains("the element count is the one thing a reshape must preserve"),
+            "got {e}"
+        );
+    }
+
+    /// CONTROL — a reshape that changes the element type would be a silently
+    /// mistyped tile, so it is refused by name at the bridge.
+    #[test]
+    fn a_dtype_changing_reshape_is_refused() {
+        let src = RESHAPE.replacen("-> tensor<8x512xf16>", "-> tensor<8x512xf32>", 1);
+        let e = run_on(&src, &[8]).unwrap_err();
+        assert!(e.message.contains("a silently mistyped tile"), "got {e}");
     }
 
     #[test]

@@ -22,6 +22,7 @@ use uuid::Uuid;
 use scratchy_core_common::FinishReason;
 
 use crate::engine::StreamDelta;
+use crate::error::ApiJson;
 use crate::protocol;
 use crate::server::AppState;
 
@@ -111,7 +112,10 @@ pub struct ResponsesRequest {
     #[serde(default)]
     pub tools: Vec<FunctionToolDef>,
     #[serde(default)]
-    pub tool_choice: Option<Value>,
+    pub tool_choice: Option<ResponsesToolChoice>,
+    /// `false` limits the reply to one tool call ([`protocol::CallLimit`]).
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
     #[serde(default)]
     pub metadata: Option<Value>,
     #[serde(default)]
@@ -126,6 +130,26 @@ pub struct ResponsesRequest {
     pub top_logprobs: Option<u32>,
     #[serde(default)]
     pub text: Option<Value>,
+}
+
+/// A request's `tool_choice` in the Responses API's forms ([`protocol::ToolChoice::from_responses`]),
+/// echoed back in them: one it does not know fails the request as it is parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponsesToolChoice(pub protocol::ToolChoice);
+
+impl Serialize for ResponsesToolChoice {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.to_responses().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ResponsesToolChoice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let form = Value::deserialize(deserializer)?;
+        protocol::ToolChoice::from_responses(&form)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 /// Stop condition — single string or array.
@@ -158,7 +182,7 @@ pub struct ResponsesResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<Value>,
+    pub tool_choice: Option<ResponsesToolChoice>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Value>,
 }
@@ -324,20 +348,7 @@ fn convert_request(req: &ResponsesRequest) -> protocol::ChatCompletionRequest {
         )
     };
 
-    // Convert tool_choice
-    let tool_choice = req.tool_choice.clone().map(|tc| {
-        if let Some(s) = tc.as_str() {
-            match s {
-                "auto" | "none" | "required" => tc,
-                name => serde_json::json!({
-                    "type": "function",
-                    "function": { "name": name }
-                }),
-            }
-        } else {
-            tc
-        }
-    });
+    let tool_choice = (req.tool_choice.clone()).map(|ResponsesToolChoice(choice)| choice);
 
     // Convert stop
     let stop = req.stop.as_ref().map(|s| match s {
@@ -345,30 +356,26 @@ fn convert_request(req: &ResponsesRequest) -> protocol::ChatCompletionRequest {
         StopParam::Multiple(v) => protocol::StopCondition::Multiple(v.clone()),
     });
 
-    // Extract json_schema from text.format if present
+    // `text.format`, in the Responses API's form: a json_schema format carries its name, schema
+    // and strictness itself, `{"type": "json_schema", "name": …, "schema": {…}, "strict": …}`. One
+    // without a `schema` reaches the chat path as a json_schema format without one, which refuses
+    // it (a 400), rather than being read as no format.
     let response_format = req.text.as_ref().and_then(|text| {
         let format = text.get("format")?;
         let fmt_type = format.get("type")?.as_str()?;
+        let string = |key: &str| format.get(key).and_then(|v| v.as_str()).map(str::to_string);
         match fmt_type {
-            "json_schema" => {
-                let schema = format.get("json_schema")?;
-                let name = schema
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("response")
-                    .to_string();
-                Some(protocol::ResponseFormat::Standard(
-                    protocol::StandardResponseFormat {
-                        format_type: "json_schema".to_string(),
-                        json_schema: Some(protocol::JsonSchemaResponseFormat {
-                            name,
-                            description: None,
-                            json_schema: Some(schema.clone()),
-                            strict: schema.get("strict").and_then(|s| s.as_bool()),
-                        }),
-                    },
-                ))
-            }
+            "json_schema" => Some(protocol::ResponseFormat::Standard(
+                protocol::StandardResponseFormat {
+                    format_type: "json_schema".to_string(),
+                    json_schema: Some(protocol::JsonSchemaResponseFormat {
+                        name: string("name").unwrap_or_else(|| "response".to_string()),
+                        description: string("description"),
+                        json_schema: format.get("schema").cloned(),
+                        strict: format.get("strict").and_then(|s| s.as_bool()),
+                    }),
+                },
+            )),
             "json_object" => Some(protocol::ResponseFormat::Standard(
                 protocol::StandardResponseFormat {
                     format_type: "json_object".to_string(),
@@ -400,6 +407,7 @@ fn convert_request(req: &ResponsesRequest) -> protocol::ChatCompletionRequest {
         response_format,
         tools,
         tool_choice,
+        parallel_tool_calls: req.parallel_tool_calls,
         user: None,
         top_k: req.top_k,
         min_p: None,
@@ -510,7 +518,7 @@ fn convert_response(
 /// POST /v1/responses — OpenAI Responses API.
 pub async fn responses(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<ResponsesRequest>,
+    ApiJson(request): ApiJson<ResponsesRequest>,
 ) -> Response {
     info!(
         "POST /v1/responses: model={:?}, stream={}",
@@ -956,6 +964,65 @@ fn stream_responses(
 mod tests {
     use super::*;
 
+    /// The Responses API's `tool_choice` forms read into the engine's choice (#767): its forced
+    /// tool `{"type": "function", "name": …}` (the chat form's nesting read too), and the three
+    /// keywords. The request echoes them back in the Responses form.
+    #[test]
+    fn responses_tool_choice_forms_reach_the_engine() {
+        use protocol::ToolChoice;
+        use serde_json::json;
+        let cases = [
+            (json!("none"), ToolChoice::None),
+            (json!("auto"), ToolChoice::Auto),
+            (json!("required"), ToolChoice::Required),
+            (
+                json!({"type": "function", "name": "get_weather"}),
+                ToolChoice::Function("get_weather".into()),
+            ),
+            (
+                json!({"type": "function", "function": {"name": "get_weather"}}),
+                ToolChoice::Function("get_weather".into()),
+            ),
+        ];
+        for (form, choice) in cases {
+            let req: ResponsesRequest =
+                serde_json::from_value(json!({ "input": "Hi", "tool_choice": form })).unwrap();
+            assert_eq!(
+                convert_request(&req).tool_choice,
+                Some(choice.clone()),
+                "{form}"
+            );
+            let echoed = serde_json::to_value(ResponsesToolChoice(choice)).unwrap();
+            let canonical = match &form {
+                Value::Object(_) => json!({"type": "function", "name": "get_weather"}),
+                keyword => keyword.clone(),
+            };
+            assert_eq!(echoed, canonical, "{form}");
+        }
+    }
+
+    /// A `tool_choice` the Responses API doesn't define fails the request as it is parsed (#767):
+    /// a bare string other than the three keywords was read as a tool name, and a hosted tool
+    /// isn't served.
+    #[test]
+    fn an_unknown_responses_tool_choice_fails_the_request() {
+        use serde_json::json;
+        for bad in [
+            json!("requried"),
+            json!("get_weather"),
+            json!({"type": "file_search"}),
+            json!({"type": "function"}),
+            json!(1),
+        ] {
+            let request = json!({ "input": "Hi", "tool_choice": bad });
+            let err = serde_json::from_value::<ResponsesRequest>(request).expect_err("not a form");
+            assert!(
+                err.to_string().contains(r#"{"type": "function", "name""#),
+                "{bad}: {err}"
+            );
+        }
+    }
+
     #[test]
     fn test_deserialize_simple_text_input() {
         let json = r#"{"input": "Hello", "max_output_tokens": 100}"#;
@@ -1041,6 +1108,7 @@ mod tests {
             stream: false,
             tools: vec![],
             tool_choice: None,
+            parallel_tool_calls: None,
             metadata: None,
             stop: None,
             seed: None,
@@ -1056,6 +1124,50 @@ mod tests {
         assert_eq!(chat.temperature, Some(0.7));
     }
 
+    /// A json_schema `text.format` is read as the Responses API writes it, with its name, schema
+    /// and strictness on the format itself: the schema is the format's `schema`, not the format
+    /// object.
+    #[test]
+    fn a_json_schema_text_format_carries_its_schema() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        });
+        let text = serde_json::json!({"format": {
+            "type": "json_schema", "name": "city", "schema": schema, "strict": true,
+        }});
+        let req: ResponsesRequest = serde_json::from_value(
+            serde_json::json!({"input": "Where is the Eiffel Tower?", "text": text}),
+        )
+        .unwrap();
+        let Some(protocol::ResponseFormat::Standard(format)) =
+            convert_request(&req).response_format
+        else {
+            panic!("a json_schema format");
+        };
+        assert_eq!(format.format_type, "json_schema");
+        let json_schema = format.json_schema.unwrap();
+        assert_eq!(json_schema.name, "city");
+        assert_eq!(json_schema.json_schema, Some(schema));
+        assert_eq!(json_schema.strict, Some(true));
+
+        // Without a schema it is still a json_schema format, one the chat path refuses (a 400).
+        let bare = serde_json::json!({"format": {"type": "json_schema", "name": "city"}});
+        let req: ResponsesRequest =
+            serde_json::from_value(serde_json::json!({"input": "Hi", "text": bare})).unwrap();
+        let response_format = convert_request(&req).response_format;
+        let Some(protocol::ResponseFormat::Standard(format)) = &response_format else {
+            panic!("a json_schema format");
+        };
+        assert_eq!(format.json_schema.as_ref().unwrap().json_schema, None);
+        let refused = crate::engine::parse_response_format(&response_format);
+        assert!(
+            matches!(refused, Err(crate::error::ServeError::Validation(_))),
+            "{refused:?}"
+        );
+    }
+
     #[test]
     fn test_convert_instructions() {
         let req = ResponsesRequest {
@@ -1069,6 +1181,7 @@ mod tests {
             stream: false,
             tools: vec![],
             tool_choice: None,
+            parallel_tool_calls: None,
             metadata: None,
             stop: None,
             seed: None,
@@ -1114,6 +1227,7 @@ mod tests {
             stream: false,
             tools: vec![],
             tool_choice: None,
+            parallel_tool_calls: None,
             metadata: None,
             stop: None,
             seed: None,
@@ -1150,6 +1264,7 @@ mod tests {
                 strict: None,
             }],
             tool_choice: None,
+            parallel_tool_calls: None,
             metadata: None,
             stop: None,
             seed: None,
@@ -1177,6 +1292,7 @@ mod tests {
             stream: false,
             tools: vec![],
             tool_choice: None,
+            parallel_tool_calls: None,
             metadata: None,
             stop: None,
             seed: None,
@@ -1240,6 +1356,7 @@ mod tests {
             stream: false,
             tools: vec![],
             tool_choice: None,
+            parallel_tool_calls: None,
             metadata: None,
             stop: None,
             seed: None,
@@ -1313,6 +1430,7 @@ mod tests {
             stream: false,
             tools: vec![],
             tool_choice: None,
+            parallel_tool_calls: None,
             metadata: None,
             stop: None,
             seed: None,
@@ -1423,6 +1541,7 @@ mod tests {
                 tool_call_deltas: None,
                 reasoning: None,
                 usage: crate::engine::StreamUsage {
+                    prompt: crate::engine::PromptIndex(0),
                     prompt_tokens: 42,
                     cached_tokens: 0,
                     completion_tokens: generated,
@@ -1459,7 +1578,10 @@ mod tests {
     async fn test_stream_tool_call_reports_buffered_tokens() {
         use http_body_util::BodyExt;
 
-        let (deltas, generated) = crate::engine::test_support::buffered_tool_call_deltas(false);
+        let (deltas, generated) = crate::engine::test_support::buffered_tool_call_deltas(
+            false,
+            scratchy_core_common::FinishReason::Stop,
+        );
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         for delta in deltas {
             tx.send(delta).unwrap();

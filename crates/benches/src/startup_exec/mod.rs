@@ -145,18 +145,7 @@ fn wait4_child(child: &mut Child) -> Result<ChildUsage> {
     // writes through and does not retain.
     let rc = unsafe { libc::wait4(pid, &mut status, 0, &mut ru) };
     anyhow::ensure!(rc == pid, "wait4({pid}) returned {rc}");
-    let ok = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
-    let how = if libc::WIFSIGNALED(status) {
-        format!("signal {}", libc::WTERMSIG(status))
-    } else {
-        format!("exit {}", libc::WEXITSTATUS(status))
-    };
-    Ok(ChildUsage {
-        peak_rss_mib: rss_to_mib(ru.ru_maxrss as i64),
-        major_faults: ru.ru_majflt as i64,
-        ok,
-        status: how,
-    })
+    Ok(usage_of(status, ru))
 }
 
 /// The process group of the server child currently running, for the signal
@@ -182,6 +171,18 @@ fn spawn_child(argv: &[String]) -> Result<Child> {
 
 /// Kill the child's whole process group, then reap the child itself.
 ///
+/// How long `kill_group` waits after SIGTERM before it sends SIGKILL. Mirrors
+/// the metal aligned-weights sidecar writer's own drain budget
+/// (`DRAIN_BUDGET_SECS` in `join_sidecar_writers`): a server tearing down
+/// gracefully flushes one-time on-disk caches, the sidecar's background writer
+/// only persists its build through that drain, and the writer's own watchdog
+/// cancels a wedged write at the same 300 s this waits — so a healthy drain is
+/// never killed mid-write, and a stuck child never stalls the harness past the
+/// deadline its own shutdown would have enforced anyway. A server with nothing
+/// to flush exits on SIGTERM at once, so a launch that built nothing pays
+/// nothing.
+const KILL_GRACE: Duration = Duration::from_secs(300);
+
 /// A server is not necessarily one process. vLLM's API server spawns
 /// `VLLM::EngineCore` separately, so `Child::kill` — which signals exactly one
 /// pid — left the engine orphaned to init still holding 72444 MiB of device
@@ -191,6 +192,17 @@ fn spawn_child(argv: &[String]) -> Result<Child> {
 ///
 /// Kill before reap, as `wait4_child` explains: reaping frees the pid, and a
 /// freed pid may be recycled into an unrelated process group.
+///
+/// SIGTERM first, SIGKILL only after [`KILL_GRACE`]. The order is
+/// load-bearing, not politeness: the ladder's COLD/WARM rungs mean "the
+/// derived on-disk caches are populated", and a cache that is only written by
+/// a graceful shutdown never populates under a straight SIGKILL. The metal
+/// worker's aligned-weights sidecar is exactly that — its background writer
+/// is detached, persists only through `join_sidecar_writers` at exit, and a
+/// SIGKILL discards the build mid-write. Measured consequence: every primed
+/// launch re-paid the realign copy (peak RSS ≈ 2× the weights, #411), so the
+/// ladder's COLD/WARM reps measured the one-shot copy path instead of the
+/// settled state their rung names.
 fn kill_group(child: &mut Child) -> Result<ChildUsage> {
     let pid = child.id() as libc::pid_t;
     // A child that died during startup was already reaped by `wait_ready`'s
@@ -200,13 +212,61 @@ fn kill_group(child: &mut Child) -> Result<ChildUsage> {
         // SAFETY: `pid` is a live, unreaped child that `spawn_child` placed in
         // a new group of its own, so `-pid` names that group and nothing else.
         // The only failure is ESRCH, i.e. the tree is already gone.
+        unsafe { libc::kill(-pid, libc::SIGTERM) };
+        // Wait out the grace period with wait4(WNOHANG), not `try_wait`: the
+        // reap must land here, with the rusage of *this* child attached —
+        // `try_wait` would also reap, but its cached status leaves the
+        // blocking wait4 below nothing to wait for (ECHILD).
+        let deadline = Instant::now() + KILL_GRACE;
+        loop {
+            let mut status: libc::c_int = 0;
+            let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+            // SAFETY: WNOHANG on our own live, unreaped child; `wait4` only
+            // writes through the status and rusage pointers it is given.
+            let rc = unsafe { libc::wait4(pid, &mut status, libc::WNOHANG, &mut ru) };
+            anyhow::ensure!(rc != -1, "wait4(WNOHANG, {pid}) returned {rc}");
+            if rc == pid {
+                CHILD_GROUP.store(0, Ordering::SeqCst);
+                return Ok(usage_of(status, ru));
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Overran the grace — the hard stop the child's own shutdown watchdog
+        // would have enforced by now.
+        // SAFETY: as above; the child is still unreaped, so `-pid` still
+        // names its group.
         unsafe { libc::kill(-pid, libc::SIGKILL) };
+        // A child that moved itself out of the group would escape the signal above;
+        // this one cannot miss it, and is a no-op when the group kill worked.
+        let _ = child.kill();
     }
-    // A child that moved itself out of the group would escape the signal above;
-    // this one cannot miss it, and is a no-op when the group kill worked.
-    let _ = child.kill();
     CHILD_GROUP.store(0, Ordering::SeqCst);
     wait4_child(child)
+}
+
+/// A reaped child's status and rusage as a [`ChildUsage`]. Shared by the
+/// blocking reap in `wait4_child` and the WNOHANG reap inside `kill_group`'s
+/// grace loop, so both report exit status and resource usage identically.
+fn usage_of(status: libc::c_int, ru: libc::rusage) -> ChildUsage {
+    let ok = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+    let how = if libc::WIFSIGNALED(status) {
+        format!("signal {}", libc::WTERMSIG(status))
+    } else {
+        format!("exit {}", libc::WEXITSTATUS(status))
+    };
+    ChildUsage {
+        // `rusage`'s counters are `i64` on every supported target (apple
+        // spells them i64, linux `c_long` — i64 on the 64-bit targets CI
+        // runs), so no cast is needed and one would trip
+        // `unnecessary_cast` on apple.
+        peak_rss_mib: rss_to_mib(ru.ru_maxrss),
+        major_faults: ru.ru_majflt,
+        ok,
+        status: how,
+    }
 }
 
 /// Make Ctrl-C tear the child's group down too.
@@ -455,6 +515,10 @@ pub(crate) struct Rep {
     /// rather than comparing a half-written answer.
     #[serde(skip)]
     pub crash: Option<String>,
+    /// CLI mode: the end of the child's stderr, however it exited. The parity gate reads
+    /// scratchy's answer token ids from it (`[diag] token_ids=`).
+    #[serde(skip)]
+    pub stderr_tail: String,
 }
 
 /// How much of a CLI child's stderr an error message carries.
@@ -590,6 +654,7 @@ fn run_cli(argv: &[String], backend: Backend) -> Result<Rep> {
         major_faults: usage.major_faults,
         text,
         crash,
+        stderr_tail: tail,
         ..Default::default()
     })
 }
@@ -1138,12 +1203,107 @@ fn normalize(s: &str, backend: Backend) -> String {
         .join(" ")
 }
 
+/// How far below the reference's own greedy answer scratchy's may score, in mean log-probability
+/// per token under the reference, teacher-forced. A correct stack that breaks a near-tie
+/// differently writes text the reference finds about as likely as its own; a wrong computation
+/// writes text it finds far less likely, at nearly every token. Measured on granite-4.2-3b's
+/// count answer (base M5, mlx-lm 0.31.4): the reference's greedy answer -0.079 a token,
+/// scratchy's under TurboQuant 4-bit KV -0.141 (0.06 below, though one of its tokens sits 1.5
+/// logits behind the reference's top), and the same answer with its ids shifted by one -12.17
+/// (12.1 below). The bar sits about 8x above that noise and 24x below that defect. Judging the
+/// whole answer, not its worst token, is what keeps a single drifted near-tie inside a thought
+/// preamble from failing a model whose load path is exact.
+const SCORE_NATS: f64 = 0.5;
+
+/// What the score command found on one answer ([`SCORE_NATS`]).
+#[derive(serde::Deserialize)]
+struct Ties {
+    tokens: usize,
+    differ: Vec<Tie>,
+    max_gap: f64,
+    /// Scratchy's answer: mean log-probability per token under the reference, teacher-forced.
+    mean_logprob: f64,
+    /// The reference's own greedy answer of the same length, scored the same way.
+    reference_mean_logprob: f64,
+}
+
+#[derive(serde::Deserialize)]
+struct Tie {
+    at: usize,
+    scratchy: String,
+    mlx_lm: String,
+    gap: f64,
+}
+
+impl Ties {
+    /// How far below the reference's own answer scratchy's scores, in nats a token.
+    fn shortfall(&self) -> f64 {
+        self.reference_mean_logprob - self.mean_logprob
+    }
+
+    /// None when the reference finds the answer about as likely as its own, else why not. No
+    /// token differing is the reference's own greedy answer, whose text differs only in how the
+    /// two print it (mlx_lm.generate shows gpt-oss's special tokens, `scr chat` drops them).
+    fn defect(&self) -> Option<String> {
+        (self.shortfall() > SCORE_NATS).then(|| {
+            format!(
+                "the reference scores it {:.3} nats a token below its own answer ({:.3} vs {:.3}; \
+                 at most {SCORE_NATS})",
+                self.shortfall(),
+                self.mean_logprob,
+                self.reference_mean_logprob
+            )
+        })
+    }
+}
+
+/// The answer token ids `scr chat` prints with `VLLM_PRINT_TOKEN_IDS` set (`[diag] token_ids=[..]`).
+fn diag_token_ids(stderr: &str) -> Option<Vec<u32>> {
+    let line = stderr
+        .lines()
+        .rev()
+        .find(|l| l.contains("[diag] token_ids="))?;
+    let list = line.split("token_ids=").nth(1)?;
+    let list = &list[..=list.find(']')?];
+    serde_json::from_str(list).ok()
+}
+
+/// Score an answer whose text differs: run `score_cmd` on its token ids.
+fn score_ties(score_cmd: &[String], prompt: &str, tokens: &[u32]) -> Result<Ties> {
+    let file = std::env::temp_dir().join(format!("parity-tokens-{}.json", std::process::id()));
+    std::fs::write(&file, serde_json::to_string(tokens)?)?;
+    let argv: Vec<String> = score_cmd
+        .iter()
+        .map(|a| {
+            a.replace("{prompt}", prompt)
+                .replace("{tokens}", &file.to_string_lossy())
+        })
+        .collect();
+    let out = Command::new(&argv[0])
+        .args(&argv[1..])
+        .stderr(Stdio::inherit())
+        .output()
+        .with_context(|| format!("failed to exec {}", argv[0]));
+    let _ = std::fs::remove_file(&file);
+    let out = out?;
+    anyhow::ensure!(
+        out.status.success(),
+        "the parity score command {}",
+        out.status
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let last = text.lines().rev().find(|l| l.trim_start().starts_with('{'));
+    serde_json::from_str(last.unwrap_or_default())
+        .with_context(|| format!("the parity score command printed no result: {text}"))
+}
+
 fn parity_gate(
     a_cmd: &[String],
     a_backend: Backend,
     b_cmd: &[String],
     b_backend: Backend,
     model: &str,
+    score_cmd: Option<&[String]>,
 ) -> Result<()> {
     println!("=== parity gate: same model, greedy, high-confidence prompts ===");
     let mut failures = Vec::new();
@@ -1155,22 +1315,72 @@ fn parity_gate(
         if let Some(why) = rep.crash {
             anyhow::bail!("the {backend:?} child crashed on the {name} prompt: {why}");
         }
-        Ok(normalize(&rep.text, backend))
+        Ok((normalize(&rep.text, backend), rep.stderr_tail))
+    };
+    // `scr chat` prints its answer's token ids with VLLM_PRINT_TOKEN_IDS set, which the score
+    // command reads; only that child gets it.
+    let a_cmd: Vec<String> = match score_cmd {
+        Some(_) => ["/usr/bin/env", "VLLM_PRINT_TOKEN_IDS=1"]
+            .iter()
+            .map(|s| s.to_string())
+            .chain(a_cmd.iter().cloned())
+            .collect(),
+        None => a_cmd.to_vec(),
     };
     for (name, prompt, ntok) in parity_prompts(model) {
-        let a = answer(a_cmd, a_backend, name, prompt, *ntok)?;
-        let b = answer(b_cmd, b_backend, name, prompt, *ntok)?;
+        let (a, a_err) = answer(&a_cmd, a_backend, name, prompt, *ntok)?;
+        let (b, _) = answer(b_cmd, b_backend, name, prompt, *ntok)?;
         let agree = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
         let common = a.chars().count().min(b.chars().count());
         let exact = common > 0 && agree == common;
-        println!(
-            "  {name:<9} {:<5} agree {agree}/{common} chars",
-            if exact { "OK" } else { "FAIL" }
-        );
-        if !exact {
-            println!("      a: {a}");
-            println!("      b: {b}");
-            failures.push(*name);
+        if exact {
+            println!("  {name:<9} OK    agree {agree}/{common} chars");
+            continue;
+        }
+        // Where the text differs, the reference judges each token scratchy picked: a near-tie
+        // passes, anything else fails.
+        let judged = score_cmd.map(|cmd| -> Result<Ties> {
+            let ids = diag_token_ids(&a_err).with_context(|| {
+                format!("the {a_backend:?} child printed no token ids on the {name} prompt")
+            })?;
+            score_ties(cmd, prompt, &ids)
+        });
+        let verdict = match judged {
+            Some(Ok(t)) if t.differ.is_empty() => {
+                println!(
+                    "  {name:<9} OK    every one of its {} tokens is mlx-lm's top (the text differs \
+                     only in how it prints)",
+                    t.tokens
+                );
+                continue;
+            }
+            None => Err("no score command".to_string()),
+            Some(Err(e)) => Err(format!("{e:#}")),
+            Some(Ok(t)) => match t.defect() {
+                None => Ok(t),
+                Some(why) => {
+                    print_ties(&t);
+                    Err(why)
+                }
+            },
+        };
+        match verdict {
+            Ok(t) => {
+                println!(
+                    "  {name:<9} TIE   agree {agree}/{common} chars; {:.3} nats a token below the \
+                     reference's own answer; {} token(s) not its top, at most {:.3} logits",
+                    t.shortfall(),
+                    t.differ.len(),
+                    t.max_gap
+                );
+                print_ties(&t);
+            }
+            Err(why) => {
+                println!("  {name:<9} FAIL  agree {agree}/{common} chars ({why})");
+                println!("      a: {a}");
+                println!("      b: {b}");
+                failures.push(*name);
+            }
         }
     }
     anyhow::ensure!(
@@ -1180,8 +1390,17 @@ fn parity_gate(
          Every timing below would be measuring a different computation. Refusing to benchmark.",
         failures.join(", ")
     );
-    println!("  PARITY OK — all high-confidence prompts match exactly.");
+    println!("  PARITY OK — all high-confidence prompts match, up to near-ties.");
     Ok(())
+}
+
+fn print_ties(t: &Ties) {
+    for d in &t.differ {
+        println!(
+            "      token {:>3}: scratchy {:?}, mlx-lm {:?}, {:.3} logits behind",
+            d.at, d.scratchy, d.mlx_lm, d.gap
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1262,7 +1481,15 @@ pub(crate) fn run(args: &BenchStartupArgs) -> Result<()> {
     };
 
     if let Some(ref other) = ex.parity_cmd {
-        parity_gate(&argv, ex.backend, &other.argv, ex.parity_backend, &model)?;
+        let score = ex.parity_score_cmd.as_ref().map(|c| c.argv.as_slice());
+        parity_gate(
+            &argv,
+            ex.backend,
+            &other.argv,
+            ex.parity_backend,
+            &model,
+            score,
+        )?;
     }
 
     // Provenance: a number without its machine state is not a result.
@@ -1683,6 +1910,7 @@ mod tests {
             &crashing,
             Backend::Scratchy,
             "mlx-community/Qwen3.6-35B-A3B-4bit",
+            None,
         )
         .expect_err("a crashing side fails the gate");
         let msg = format!("{err:#}");
@@ -1691,6 +1919,101 @@ mod tests {
             "{msg}"
         );
         assert!(!msg.contains("load path"), "reported as a mismatch: {msg}");
+    }
+
+    /// The token ids `scr chat` prints with VLLM_PRINT_TOKEN_IDS set, from the end of its stderr.
+    #[test]
+    fn the_gate_reads_scratchys_token_ids_from_its_stderr() {
+        let err = "INFO loading\n[diag] token_ids=[200005, 35644, 976] text=\"x\" finish_reason=Some(Length)\n";
+        assert_eq!(diag_token_ids(err), Some(vec![200005, 35644, 976]));
+        assert_eq!(diag_token_ids("INFO nothing here"), None);
+    }
+
+    /// The answer passes when the reference scores it within SCORE_NATS of its own, whatever
+    /// its single worst token; it fails when the reference finds it far less likely.
+    #[test]
+    fn an_answer_the_reference_finds_as_likely_passes_and_a_wrong_one_fails() {
+        let tie = |at, gap| Tie {
+            at,
+            scratchy: " seems".into(),
+            mlx_lm: "'s".into(),
+            gap,
+        };
+        // granite-4.2-3b's count answer under TurboQuant KV, as mlx-lm scored it on the base M5:
+        // one token 1.5 logits behind, the whole answer 0.06 nats a token below the reference's.
+        let granite = Ties {
+            tokens: 40,
+            differ: vec![tie(17, 1.5), tie(26, 0.25), tie(31, 1.0)],
+            max_gap: 1.5,
+            mean_logprob: -0.141,
+            reference_mean_logprob: -0.079,
+        };
+        assert!(granite.defect().is_none());
+        // The same answer with its ids shifted by one.
+        let shifted = Ties {
+            tokens: 40,
+            differ: (0..40).map(|i| tie(i, 28.0)).collect(),
+            max_gap: 49.7,
+            mean_logprob: -12.17,
+            reference_mean_logprob: -0.079,
+        };
+        assert!(shifted.defect().unwrap().contains("12.091 nats"));
+        let none = Ties {
+            tokens: 12,
+            differ: vec![],
+            max_gap: 0.0,
+            mean_logprob: -0.2,
+            reference_mean_logprob: -0.2,
+        };
+        assert!(
+            none.defect().is_none(),
+            "no token differing is the reference's own answer"
+        );
+    }
+
+    /// Text that differs passes when the score command calls every differing token a near-tie,
+    /// and fails when it does not; without a score command, any difference fails.
+    #[test]
+    fn the_gate_passes_a_near_tie_the_score_command_measured() {
+        let sh = |cmd: &str| -> Vec<String> { ["/bin/sh", "-c", cmd].map(String::from).to_vec() };
+        let scratchy = sh("echo We need {prompt}; echo '[diag] token_ids=[1, 2, 3]' >&2");
+        let reference = sh("echo The user {prompt}");
+        let scored = |json: &str| sh(&format!("cat {{tokens}} >/dev/null && echo '{json}'"));
+        let model = "mlx-community/some-model-4bit";
+        let near = scored(
+            r#"{"tokens": 3, "differ": [{"at": 0, "scratchy": "We", "mlx_lm": "The", "gap": 1.5}], "max_gap": 1.5, "mean_logprob": -0.141, "reference_mean_logprob": -0.079}"#,
+        );
+        parity_gate(
+            &scratchy,
+            Backend::Scratchy,
+            &reference,
+            Backend::Scratchy,
+            model,
+            Some(&near),
+        )
+        .expect("an answer the reference finds as likely as its own passes");
+        let far = scored(
+            r#"{"tokens": 3, "differ": [{"at": 0, "scratchy": "We", "mlx_lm": "The", "gap": 9.5}], "max_gap": 9.5, "mean_logprob": -6.2, "reference_mean_logprob": -0.1}"#,
+        );
+        let err = parity_gate(
+            &scratchy,
+            Backend::Scratchy,
+            &reference,
+            Backend::Scratchy,
+            model,
+            Some(&far),
+        )
+        .expect_err("an answer the reference finds far less likely fails");
+        assert!(format!("{err:#}").contains("load path"));
+        parity_gate(
+            &scratchy,
+            Backend::Scratchy,
+            &reference,
+            Backend::Scratchy,
+            model,
+            None,
+        )
+        .expect_err("without a score command any difference fails");
     }
 
     /// The gate asks GLM-4.5-Air-3bit and Qwen3.6-35B-A3B questions their

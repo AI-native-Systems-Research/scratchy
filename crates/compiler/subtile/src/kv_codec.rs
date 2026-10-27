@@ -576,6 +576,9 @@ mod tests {
         let ins = |l: &LoweredDecode, i: usize| l.input.ops[i].inputs.clone();
         assert_eq!(ins(&l, 6), [Ext(7)]);
         assert_eq!(ins(&l, 7), [Ext(8)]);
+        // The op registry admits the one-operand encode, or the IR validator refuses the tape.
+        let bad = (l.input.ops.iter()).find(|od| !od.op.arity_ok(od.inputs.len()));
+        assert!(bad.is_none(), "{bad:?}");
         assert_eq!(ins(&l, 9), [Op(4), Op(8), Op(6), Op(7)]);
         let l = unrotated(2);
         assert_eq!(

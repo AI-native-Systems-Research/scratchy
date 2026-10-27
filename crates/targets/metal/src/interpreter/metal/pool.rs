@@ -28,23 +28,48 @@ use objc2_metal::{
 use crate::specialized_pipeline_cache::SpecializedPipelineCache;
 
 use super::forward::{
-    Deferral, DeviceInputInto, ForwardError, ForwardInputs, ForwardReads, InFlight,
+    CommitFeedback, Deferral, Delivered, DeviceInputInto, ForwardError, ForwardInputs,
+    ForwardReads, InFlight,
 };
 use super::lowered::{LoweredMetalTape, ModelSources};
 use super::pipelines::SpecializedPipelines;
 use super::runtime::{InputWrite, InputWrites, Padding, RuntimeBindings};
 use super::worker::{
-    ArenaLayout, LentActivation, MetalWorker, ResolvedSources, SparsePlan, TerminalReads,
-    WorkerError,
+    ArenaLayout, ArenaRanks, ArenaRole, ArenaShare, GuestArena, HostArena, Hosting, MetalWorker,
+    ResolvedSources, Slot, SparsePlan, TerminalReads, WorkerError,
 };
 use crate::MetalAllocator;
 use crate::tape::constants::TapeVariant;
 use crate::tape::ids::{
     DecodeRows, HeadDim, MaxBlocksPerSeq, NumKvHeads, NumQHeads, TqDecodeHeads,
 };
+use crate::tape::lowered::PerScratch;
 use crate::tape::lowered::{ClassedTape, KvAddressing};
 use objc2::runtime::ProtocolObject;
 use scratchy_ir::{CanonicalParams, Instruction};
+
+/// The routed fold band a bucket row carries: which band's step tape its slots, terminal and
+/// arena were coloured under ([`crate::op_abi::METAL_FUSIONS`] wide,
+/// [`crate::op_abi::METAL_FUSIONS_NARROW`] narrow). One row per bucket per band — a bucket
+/// whose bands fold the same step tape (every dense model, and every bucket the routed fold
+/// refuses) carries twin rows, whose facts serve every class alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum FoldBand {
+    /// The band every chip but the wide-M5 class lowers: the fold's one-row origin.
+    Narrow,
+    /// The band the wide-M5 class lowers: the fold through the verify-sized rows.
+    Wide,
+}
+
+impl FoldBand {
+    /// The band a device of `class` runs.
+    pub fn for_class(class: crate::tape::lowered::GenClass) -> Self {
+        match class {
+            crate::tape::lowered::GenClass::M5Wide => FoldBand::Wide,
+            _ => FoldBand::Narrow,
+        }
+    }
+}
 
 /// One bucket's compile-time data, ready to be lowered + handed to a
 /// [`MetalWorkerPool`].
@@ -70,6 +95,9 @@ use scratchy_ir::{CanonicalParams, Instruction};
 /// an `Arc<[MetalBucketSpec]>` cheaply.
 pub struct MetalBucketSpec {
     pub bucket_m: u32,
+    /// The routed fold band this row's slots, terminal and arena were coloured under; the pool
+    /// keeps the rows whose band its device's class lowers. See [`FoldBand`].
+    pub band: FoldBand,
     pub num_arena_slots: u32,
     /// Index in the colored arena where this bucket's terminal
     /// activation lands (lm_head output for decoder layouts; the
@@ -83,10 +111,15 @@ pub struct MetalBucketSpec {
     pub backbone_slot: u32,
     /// Per-arena-slot byte sizes derived from the FUF tile shapes
     /// at macro-expansion time (post-coloring, with bucket-specific
-    /// `num_tokens` baked in). `len() == num_arena_slots`. The
-    /// pool takes the elementwise max across every bucket to size
-    /// the single per-worker arena.
+    /// `num_tokens` baked in), but for the logits in the terminal slot,
+    /// which hold the rows a step samples ([`Self::logits_row_bytes`]).
+    /// `len() == num_arena_slots`. The pool takes the elementwise max
+    /// across every bucket's [`Self::slot_bytes`] to size the single
+    /// per-worker arena.
     pub arena_bytes: &'static [u64],
+    /// Bytes of one row of the logits the terminal slot holds (0 for an encoder layout, whose
+    /// terminal rows are in [`Self::arena_bytes`]).
+    pub logits_row_bytes: u64,
     pub backbone: &'static [Instruction],
     pub lm_head: &'static [Instruction],
     /// MTL4 encoder barrier flags computed at macro time from the
@@ -107,6 +140,20 @@ pub struct MetalBucketSpec {
     /// Every kernel of a baked library ([`crate::aot::baked_library`]) the model's tapes name,
     /// compiled with its constants: the model's one table, which each of its buckets names.
     pub kernels: &'static [crate::tape::lowered::BakedKernel],
+}
+
+impl MetalBucketSpec {
+    /// Each arena slot's bytes when this bucket runs `tape` and no step samples more than
+    /// `sampled` rows (`None`: every row): the terminal slot holds what the tape writes of the
+    /// logits ([`LoweredMetalTape::logits_slot_rows`]) beside what else it holds.
+    pub fn slot_bytes(&self, tape: &LoweredMetalTape, sampled: Option<DecodeRows>) -> Vec<u64> {
+        let logits = self.logits_row_bytes * u64::from(tape.logits_slot_rows(sampled));
+        let mut bytes = self.arena_bytes.to_vec();
+        if let Some(terminal) = bytes.get_mut(self.terminal_slot as usize) {
+            *terminal = (*terminal).max(logits);
+        }
+        bytes
+    }
 }
 
 impl Clone for MetalBucketSpec {
@@ -150,6 +197,9 @@ pub enum PoolBuildError {
     /// The device's IO-registry entry has no GPU core count
     /// ([`crate::device::gpu_cores`]), which the TurboQuant decode tapes need.
     UnknownGpuCores,
+    /// A guest of another pool's arena was asked to keep its logits for the host, which reads
+    /// none of a guest's slots: they may be its host's sparse buffers.
+    GuestReadsLogits,
 }
 
 impl std::fmt::Display for PoolBuildError {
@@ -175,6 +225,10 @@ impl std::fmt::Display for PoolBuildError {
             ),
             Self::Worker(e) => write!(f, "MetalWorkerPool::for_buckets: {e}"),
             Self::NoBuckets => write!(f, "MetalWorkerPool::for_buckets: bucket_specs is empty"),
+            Self::GuestReadsLogits => f.write_str(
+                "MetalWorkerPool::for_buckets: a guest of another pool's arena cannot keep its \
+                 logits for the host",
+            ),
             Self::UnknownGpuCores => write!(
                 f,
                 "MetalWorkerPool::for_buckets: the device's IO-registry entry has no gpu-core-count"
@@ -210,7 +264,7 @@ impl From<WorkerError> for PoolBuildError {
 #[derive(Clone)]
 pub struct RuntimeFactory(Arc<FactoryFn>);
 
-struct FactoryFn(Box<dyn Fn(&Device, &LentActivation) -> RuntimeBindings>);
+struct FactoryFn(Box<dyn Fn(&Device, &HostArena) -> RuntimeBindings>);
 
 // SAFETY: the boxed closure captures only Metal object handles (objc2
 // `Retained`, thread-safe retain/release) and POD; identical grounds to
@@ -220,14 +274,15 @@ unsafe impl Sync for FactoryFn {}
 
 impl RuntimeFactory {
     /// Wrap a per-worker `RuntimeBindings` builder.
-    pub fn new(f: impl Fn(&Device, &LentActivation) -> RuntimeBindings + 'static) -> Self {
+    pub fn new(f: impl Fn(&Device, &HostArena) -> RuntimeBindings + 'static) -> Self {
         Self(Arc::new(FactoryFn(Box::new(f))))
     }
 
-    /// Build a fresh set of runtime bindings for a worker on `device`, placing what it can in
-    /// `lent` ([`LentActivation::tq_scratch`]).
-    pub fn build(&self, device: &Device, lent: &LentActivation) -> RuntimeBindings {
-        ((self.0).0)(device, lent)
+    /// Build a fresh set of runtime bindings for a worker on `device`, staging through its host's
+    /// TurboQuant scratch where it has one of the same geometry, and binding its host's KV where
+    /// it reads it ([`HostArena`]).
+    pub fn build(&self, device: &Device, host: &HostArena) -> RuntimeBindings {
+        ((self.0).0)(device, host)
     }
 }
 
@@ -308,6 +363,9 @@ pub struct MetalWorkerPool<W: CanonicalParams> {
     allocator: Arc<MetalAllocator>,
     pipelines: Arc<SpecializedPipelines>,
     bucket_tapes: Arc<[LoweredMetalTape]>,
+    /// Each tape's bucket row, index for index: the slots a forward's outputs are read from
+    /// ([`Self::bucket_spec`]).
+    bucket_specs: Arc<[&'static MetalBucketSpec]>,
     /// The KV cap rung the tapes are baked for: the row stride each step's block tables are laid
     /// out at.
     block_table_stride: MaxBlocksPerSeq,
@@ -336,8 +394,10 @@ pub struct MetalWorkerPool<W: CanonicalParams> {
     mtl4: Mutex<Option<Mtl4Pool>>,
     inner: Mutex<PoolInner<W>>,
     cv: Condvar,
-    /// The first worker's arena slots, scratch and TurboQuant scratch ([`Self::lend_activation`]).
-    lendable: LentActivation,
+    /// What the first worker shares with the pool's guest ([`Self::hosted`]).
+    hosting: HostArena,
+    /// What the pool is to the arena it runs in ([`Self::role`]).
+    role: ArenaRole,
 }
 
 /// Pool-owned MTL4 surface. The command buffer is re-created per forward
@@ -438,6 +498,8 @@ pub struct TqGroup {
 pub struct MetalRungs {
     pub buckets: &'static [MetalBucketSpec],
     pub tq: TqGroup,
+    /// Its arena slots by size, as a guest and as a host ([`ArenaRanks`]).
+    pub ranks: ArenaRanks,
 }
 
 /// The rung a pool runs on: its KV cap, which is the row width of every step's block tables, and
@@ -447,6 +509,8 @@ pub struct PickedRung<'a> {
     /// The query heads one TurboQuant decode threadgroup serves on this device.
     pub tq_heads: TqDecodeHeads,
     pub tapes: Vec<(&'a MetalBucketSpec, &'a ClassedTape)>,
+    /// The model's arena ranks, which it shares an arena with another model's by.
+    pub ranks: ArenaRanks,
 }
 
 impl PickedRung<'_> {
@@ -460,17 +524,16 @@ impl PickedRung<'_> {
 }
 
 impl PickedRung<'_> {
-    /// The bytes of each scratch buffer a worker allocates for these tapes (split-K, MoE, roped K,
-    /// hd512 unfused): the largest any tape needs, the decode split's partials for at most
-    /// `decode_rows` rows.
-    pub fn scratch_sizes(&self, decode_rows: Option<DecodeRows>) -> [u64; 4] {
+    /// The bytes of each scratch buffer a worker allocates for these tapes: the largest any tape
+    /// needs of its kind, the decode split's partials for at most `decode_rows` rows.
+    pub fn scratch_sizes(&self, decode_rows: Option<DecodeRows>) -> PerScratch<u64> {
         let tapes = || (self.tapes.iter()).map(|(_, rung)| rung.tape.scratch_bytes(decode_rows));
-        std::array::from_fn(|i| tapes().map(|s| u64::from(s[i])).max().unwrap_or(0))
+        PerScratch::from_fn(|kind| tapes().map(|s| u64::from(s[kind])).max().unwrap_or(0))
     }
 
     /// The bytes of the scratch buffers a worker allocates for these tapes.
     pub fn scratch_bytes(&self, decode_rows: Option<DecodeRows>) -> u64 {
-        self.scratch_sizes(decode_rows).iter().sum()
+        self.scratch_sizes(decode_rows).iter().map(|(_, b)| b).sum()
     }
 
     /// The worker's arena: sized for the largest activation across every bucket, AND for the
@@ -480,22 +543,80 @@ impl PickedRung<'_> {
     /// instead of in place to avoid a cross-threadgroup race — carries more colored slots than a
     /// bucket that didn't. A bucket's tape only ever references slots in `0..its own
     /// num_arena_slots`, so an arena sized to the max serves every bucket; smaller buckets simply
-    /// leave the tail slots resident and idle. `arena_bytes` is elementwise-maxed over whatever
-    /// slots each spec defines.
-    pub fn arena_layout(&self) -> ArenaLayout {
+    /// leave the tail slots resident and idle. Each bucket's [`MetalBucketSpec::slot_bytes`] — its
+    /// logits for at most `sampled` rows a step — is elementwise-maxed over whatever slots each
+    /// spec defines.
+    pub fn arena_layout(&self, sampled: Option<DecodeRows>) -> ArenaLayout {
         let num_slots = (self.tapes.iter())
             .map(|(s, _)| s.num_arena_slots as usize)
             .max()
             .unwrap_or(0);
         let mut arena_layout: ArenaLayout = vec![0u64; num_slots];
-        for (spec, _) in &self.tapes {
-            for (slot, &bytes) in spec.arena_bytes.iter().enumerate() {
+        for bytes in self.bucket_arena(sampled) {
+            for (slot, bytes) in bytes.into_iter().enumerate() {
                 if bytes > arena_layout[slot] {
                     arena_layout[slot] = bytes;
                 }
             }
         }
         arena_layout
+    }
+
+    /// Each picked bucket's arena slots' bytes ([`MetalBucketSpec::slot_bytes`]), in bucket order:
+    /// its logits for at most `sampled` rows a step.
+    pub fn bucket_arena(&self, sampled: Option<DecodeRows>) -> Vec<Vec<u64>> {
+        (self.tapes.iter())
+            .map(|(spec, rung)| spec.slot_bytes(&rung.tape, sampled))
+            .collect()
+    }
+
+    /// The slots the host reads by pointer, which stay allocated in full and shared: each kept
+    /// bucket's final hidden states, and its logits where the host reads those
+    /// ([`TerminalReads`]). A guest's ([`ArenaShare::In`]): none — the slots it takes are its
+    /// host's, which may be sparse.
+    pub fn host_slots(&self, share: &ArenaShare, terminal: TerminalReads) -> Vec<u32> {
+        if share.role() == ArenaRole::Guest {
+            return Vec::new();
+        }
+        (self.tapes.iter())
+            .flat_map(|(spec, _)| {
+                let logits = (terminal == TerminalReads::Host).then_some(spec.terminal_slot);
+                [Some(spec.backbone_slot), logits]
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// What this rung needs of its host's arena as a guest: each slot's bytes rank by rank, its
+    /// logits and the decode split's partials for at most `decode_rows` rows, its scratch by kind.
+    pub fn guest(&self, decode_rows: Option<DecodeRows>) -> GuestArena {
+        let layout = self.arena_layout(decode_rows);
+        let slots = self.ranks.guest_slots(layout.len());
+        GuestArena {
+            arena: slots.iter().map(|(_, &Slot(slot))| layout[slot]).collect(),
+            scratch: self.scratch_sizes(decode_rows),
+        }
+    }
+
+    /// The bytes this rung's arena, its logits for at most `decode_rows` rows, grows by to hold
+    /// `guest`'s ([`Hosting`]): what its pool allocates for the guest, which the memory budget
+    /// prices.
+    pub fn hosting_arena_bytes(&self, decode_rows: Option<DecodeRows>, guest: &GuestArena) -> u64 {
+        let own = self.arena_layout(decode_rows);
+        let hosted = Hosting::of(&own, &self.ranks, guest).layout;
+        hosted.iter().sum::<u64>() - own.iter().sum::<u64>()
+    }
+
+    /// The bytes this rung's scratch grows by to hold `guest`'s, kind by kind
+    /// ([`Hosting::scratch`]), the decode split's partials for at most `decode_rows` rows.
+    pub fn hosting_scratch_bytes(
+        &self,
+        decode_rows: Option<DecodeRows>,
+        guest: &GuestArena,
+    ) -> u64 {
+        let own = self.scratch_sizes(decode_rows);
+        let sum = |s: PerScratch<u64>| s.iter().map(|(_, b)| b).sum::<u64>();
+        sum(Hosting::scratch(own, guest)) - sum(own)
     }
 }
 
@@ -509,28 +630,44 @@ impl PickedRung<'_> {
 /// less any whose tape cannot exist at the rung (its scratch outgrows the 32-bit offsets its
 /// kernels bind: no such rung was baked). Longer prompts chunk to the largest kept bucket via
 /// `pick_bucket`.
-pub fn pick_rung<'a>(
+pub fn pick_rung(
     device: &ProtocolObject<dyn MTLDevice>,
-    bucket_specs: &'a [MetalBucketSpec],
-    tq: TqGroup,
+    rungs: &MetalRungs,
     max_bucket_m: Option<u32>,
     block_cap: usize,
     addressing: KvAddressing,
-) -> Result<PickedRung<'a>, PoolBuildError> {
-    let smallest = bucket_specs
+) -> Result<PickedRung<'static>, PoolBuildError> {
+    let MetalRungs {
+        buckets: bucket_specs,
+        tq,
+        ranks,
+    } = *rungs;
+    // The bucket rows whose band this device lowers — one per bucket, the other band's row
+    // dropped here — kept to those the memory budget affords, at least the smallest.
+    let band_specs = |band: FoldBand| {
+        bucket_specs
+            .iter()
+            .filter(|s| s.band == band)
+            .collect::<Vec<_>>()
+    };
+    let profile = crate::device::known_profile(device)
+        .ok_or_else(|| PoolBuildError::UnknownDevice(device.name().to_string()))?;
+    let gpu_cores = crate::device::gpu_cores(device).ok_or(PoolBuildError::UnknownGpuCores)?;
+    // The class the routed fold's band rides on: a Max-scale M5 (enough GPU cores) takes the
+    // wide band, every other chip the narrow one — selection only, both bands baked at expansion.
+    let gen_class = crate::tape::lowered::GenClass::for_device(profile.generation, gpu_cores);
+    let band = FoldBand::for_class(gen_class);
+    let band_buckets = band_specs(band);
+    let smallest = band_buckets
         .iter()
         .min_by_key(|s| s.bucket_m)
         .ok_or(PoolBuildError::NoBuckets)?;
     let affords = |s: &&MetalBucketSpec| max_bucket_m.is_none_or(|cap| s.bucket_m <= cap);
-    let mut buckets: Vec<&MetalBucketSpec> = bucket_specs.iter().filter(affords).collect();
+    let mut buckets: Vec<&MetalBucketSpec> = band_buckets.iter().copied().filter(affords).collect();
     if buckets.is_empty() {
         buckets.push(smallest);
     }
-    let profile = crate::device::known_profile(device)
-        .ok_or_else(|| PoolBuildError::UnknownDevice(device.name().to_string()))?;
-    let gen_class = crate::tape::lowered::GenClass::of(profile.generation);
     let need = MaxBlocksPerSeq(u32::try_from(block_cap).unwrap_or(u32::MAX));
-    let gpu_cores = crate::device::gpu_cores(device).ok_or(PoolBuildError::UnknownGpuCores)?;
     let tq_heads = TqDecodeHeads::for_group(tq.head_dim, tq.q_heads, tq.kv_heads, gpu_cores);
     let serves = |t: &&ClassedTape| {
         t.gen_class == gen_class
@@ -563,7 +700,27 @@ pub fn pick_rung<'a>(
         cap,
         tq_heads,
         tapes,
+        ranks,
     })
+}
+
+/// Make the pool built into `pool` hold `guest`'s arena too (`ScratchyWeights::metal_host`, typed
+/// there as `Any`: the trait cannot name this crate): set once, into `slot`, before the pool is
+/// built. A pool already built was sized without the guest, and refuses it at load rather than at
+/// the guest's first forward.
+pub fn host_guest<W: CanonicalParams>(
+    pool: &std::sync::OnceLock<MetalWorkerPool<W>>,
+    slot: &std::sync::OnceLock<GuestArena>,
+    guest: Box<dyn std::any::Any>,
+) -> Result<(), String> {
+    let guest = guest
+        .downcast::<GuestArena>()
+        .map_err(|_| "metal_host: the guest is not a GuestArena (stale build)".to_string())?;
+    if pool.get().is_some() {
+        return Err("metal_host: the pool is built, sized without its guest".into());
+    }
+    slot.set(*guest)
+        .map_err(|_| "metal_host: the pool already holds a guest".into())
 }
 
 impl MetalRungs {
@@ -583,14 +740,16 @@ impl MetalRungs {
         block_cap: usize,
         addressing: KvAddressing,
     ) -> Result<PickedRung<'static>, PoolBuildError> {
-        pick_rung(
-            device,
-            self.buckets,
-            self.tq,
-            max_bucket_m,
-            block_cap,
-            addressing,
-        )
+        pick_rung(device, self, max_bucket_m, block_cap, addressing)
+    }
+
+    /// The model's bucket sizes, ascending, each once: its table holds a row per bucket per fold
+    /// band ([`FoldBand`]), of which a device runs one.
+    pub fn bucket_ms(&self) -> Vec<u32> {
+        let mut ms: Vec<u32> = self.buckets.iter().map(|s| s.bucket_m).collect();
+        ms.sort_unstable();
+        ms.dedup();
+        ms
     }
 }
 
@@ -599,27 +758,34 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     ///
     /// Eager creation surfaces allocation/recording/pipeline-lookup
     /// failures at construction time and warms the first-forward
-    /// path (no creation cost on the first checkout). The first worker places its
-    /// buffers in `lent` ([`LentActivation`]); any later one allocates its own.
+    /// path (no creation cost on the first checkout). The first worker's arena is shared with
+    /// another model's as `share` says, by this model's `ranks` ([`ArenaShare`]); any later
+    /// worker's is its own.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: Arc<Device>,
         weights: &W,
         allocator: Arc<MetalAllocator>,
         pipelines: Arc<SpecializedPipelines>,
-        bucket_tapes: Arc<[LoweredMetalTape]>,
+        // Each bucket's row and the tape it runs, in bucket order: a forward's output slots are
+        // read off the row of the tape it ran ([`Self::bucket_spec`]).
+        buckets: &[(&'static MetalBucketSpec, LoweredMetalTape)],
         block_table_stride: MaxBlocksPerSeq,
         arena_layout: ArenaLayout,
         runtime_factory: RuntimeFactory,
         max_workers: usize,
         decode_rows: Option<DecodeRows>,
-        lent: LentActivation,
+        share: ArenaShare,
+        ranks: ArenaRanks,
         sparse_plan: Option<SparsePlan>,
     ) -> Result<Self, WorkerError>
     where
         W: ModelSources,
     {
         assert!(max_workers >= 1, "max_workers must be >= 1");
+        let bucket_tapes: Arc<[LoweredMetalTape]> = buckets.iter().map(|&(_, tape)| tape).collect();
+        let bucket_specs: Arc<[&'static MetalBucketSpec]> =
+            buckets.iter().map(|&(spec, _)| spec).collect();
         let sources = ResolvedSources::resolve(weights, &allocator, &bucket_tapes)?;
 
         // The shared `MetalResidencySet` lives on the allocator now —
@@ -641,6 +807,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             allocator,
             pipelines,
             bucket_tapes,
+            bucket_specs,
             block_table_stride,
             sources,
             arena_layout: Arc::new(arena_layout),
@@ -655,13 +822,14 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 total_created: 0,
             }),
             cv: Condvar::new(),
-            lendable: LentActivation::default(),
+            hosting: HostArena::default(),
+            role: share.role(),
         };
-        let first = pool.spawn_worker(&lent)?;
-        pool.lendable = LentActivation {
+        let first = pool.spawn_worker(&share, &ranks)?;
+        pool.hosting = HostArena {
             tq_scratch: first.runtime.tq.as_ref().map(|t| t.scratch.clone()),
             tq: first.runtime.tq.clone(),
-            ..first.worker.activation()
+            ..first.worker.hosted()
         };
         {
             let mut inner = pool.inner.lock().unwrap();
@@ -686,7 +854,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         device: Arc<Device>,
         weights: &W,
         allocator: Arc<MetalAllocator>,
-        bucket_specs: &[MetalBucketSpec],
+        // The model's buckets and arena ranks, one model's both.
+        rungs: &MetalRungs,
         runtime_factory: RuntimeFactory,
         max_workers: usize,
         max_bucket_m: Option<u32>,
@@ -697,30 +866,25 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         addressing: KvAddressing,
         // The most rows a decode or verify step brings (`GpuDevice::max_decode_rows`).
         decode_rows: Option<DecodeRows>,
-        // Buffers of a pool whose forwards never overlap this one's, for the first worker to place
-        // its own in ([`LentActivation`]).
-        lent: LentActivation,
-        // Whether the host reads the logits by pointer, so the terminal slots stay shared.
+        // How its arena is shared with that of a model whose forwards never overlap its own
+        // ([`ArenaShare`]).
+        share: ArenaShare,
+        // Whether the host reads the logits by pointer, so the terminal slots stay shared. A
+        // guest's host reads none of its slots.
         terminal: TerminalReads,
     ) -> Result<Self, PoolBuildError>
     where
         W: ModelSources,
     {
-        let tq = TqGroup {
-            head_dim: HeadDim(W::GLOBAL_HEAD_DIM),
-            q_heads: NumQHeads(W::NUM_Q_HEADS),
-            kv_heads: NumKvHeads(W::NUM_GLOBAL_KV_HEADS),
-        };
-        let rung = pick_rung(
-            &device,
-            bucket_specs,
-            tq,
-            max_bucket_m,
-            block_cap,
-            addressing,
-        )?;
+        if share.role() == ArenaRole::Guest && terminal == TerminalReads::Host {
+            return Err(PoolBuildError::GuestReadsLogits);
+        }
+        let rung = pick_rung(&device, rungs, max_bucket_m, block_cap, addressing)?;
         let variant = rung.variant();
-        let arena_layout = rung.arena_layout();
+        let arena_layout = rung.arena_layout(decode_rows);
+        let bucket_arena = rung.bucket_arena(decode_rows);
+        let host_slots = rung.host_slots(&share, terminal);
+        let ranks = rung.ranks;
         let picked = rung.tapes;
 
         let cache = SpecializedPipelineCache::new((*device).clone(), &[])
@@ -732,21 +896,13 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 cache.register_baked(spec.kernels);
             }
         }
-        let tapes: Vec<LoweredMetalTape> = picked.iter().map(|(_, rung)| rung.tape).collect();
-        let bucket_tapes: Arc<[LoweredMetalTape]> = Arc::from(tapes);
-        let pipelines = Arc::new(SpecializedPipelines::new(Arc::new(cache), variant));
-        // Every slot the host reads by pointer stays shared: each bucket's backbone hidden states
-        // (an MTP head's next input; an encoder's output, its terminal too) and, where the host
-        // reads the logits, each terminal slot.
-        let host_slots = (picked.iter())
-            .flat_map(|(spec, _)| {
-                let logits = (terminal == TerminalReads::Host).then_some(spec.terminal_slot);
-                [Some(spec.backbone_slot), logits]
-            })
-            .flatten()
+        let buckets: Vec<_> = picked
+            .iter()
+            .map(|&(spec, rung)| (spec, rung.tape))
             .collect();
+        let pipelines = Arc::new(SpecializedPipelines::new(Arc::new(cache), variant));
         let sparse_plan = SparsePlan {
-            bucket_arena: picked.iter().map(|(spec, _)| spec.arena_bytes).collect(),
+            bucket_arena,
             host_slots,
         };
 
@@ -755,13 +911,14 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             weights,
             allocator,
             pipelines,
-            bucket_tapes,
+            &buckets,
             variant.cap,
             arena_layout,
             runtime_factory,
             max_workers,
             decode_rows,
-            lent,
+            share,
+            ranks,
             Some(sparse_plan),
         )
         .map_err(PoolBuildError::Worker)
@@ -814,7 +971,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             if inner.total_created < self.max_workers {
                 inner.total_created += 1;
                 drop(inner);
-                match self.spawn_worker(&LentActivation::default()) {
+                match self.spawn_worker(&ArenaShare::Own, &ArenaRanks::NONE) {
                     Ok(pooled) => {
                         return Ok(WorkerGuard {
                             pool: self,
@@ -854,7 +1011,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         if inner.total_created < self.max_workers {
             inner.total_created += 1;
             drop(inner);
-            match self.spawn_worker(&LentActivation::default()) {
+            match self.spawn_worker(&ArenaShare::Own, &ArenaRanks::NONE) {
                 Ok(pooled) => Some(Ok(WorkerGuard {
                     pool: self,
                     inner: Some(pooled),
@@ -869,6 +1026,13 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         } else {
             None
         }
+    }
+
+    /// The bucket row of the bucket at `bucket_idx` ([`Self::pick_bucket`]'s index): the slots its
+    /// forward leaves the final hidden states and logits in. The model's baked table holds a row
+    /// per bucket per fold band ([`FoldBand`]), so only the pool's own rows are indexed this way.
+    pub fn bucket_spec(&self, bucket_idx: usize) -> &'static MetalBucketSpec {
+        self.bucket_specs[bucket_idx]
     }
 
     /// Map a real `num_tokens` to the bucket index that should run.
@@ -919,6 +1083,18 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         })
     }
 
+    /// [`Self::pick_bucket`] for `inputs`' step, whose logits its bucket's buffer must hold
+    /// ([`LoweredMetalTape::logits_overflow`]): a step writing more would write past it.
+    pub fn pick_bucket_for(&self, inputs: &ForwardInputs<'_>) -> Result<usize, ForwardError> {
+        let bucket_idx = self.pick_bucket(inputs.num_tokens)?;
+        let sampled = inputs.sampled_row_count();
+        let tape = &self.bucket_tapes[bucket_idx];
+        match tape.logits_overflow(self.decode_rows, sampled) {
+            Some(overflow) => Err(ForwardError::TooManySampledRows { sampled, overflow }),
+            None => Ok(bucket_idx),
+        }
+    }
+
     /// Lazily build the pool's MTL4 surface (queue + allocator +
     /// shared event). Panics if MTL4 is unavailable on this host
     /// (requires macOS 15+ on Apple Family 7+).
@@ -967,7 +1143,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         bucket_idx: usize,
         num_tokens: usize,
         num_seqs: u32,
-        has_spec_tokens: bool,
+        sampled_rows: crate::tape::ids::SampledRowCount,
         reads: ForwardReads,
         tail: Option<F>,
         writes: &InputWrites,
@@ -1017,7 +1193,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                     bucket_idx,
                     num_tokens,
                     num_seqs,
-                    has_spec_tokens,
+                    sampled_rows,
                     start..end,
                     (start == 0).then_some(writes),
                 )?;
@@ -1034,7 +1210,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                     bucket_idx,
                     num_tokens as u32,
                     num_seqs,
-                    has_spec_tokens,
+                    sampled_rows,
                     reads,
                     enc,
                 )
@@ -1164,7 +1340,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             if event.signaledValue() < before {
                 queue.waitForEvent_value(ProtocolObject::from_ref(&**event), before);
             }
-            let error = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let error = std::sync::Arc::new(CommitFeedback::default());
             let feedback = commit_options(&error);
             let cb_protocol: &ProtocolObject<dyn ::objc2_metal::MTL4CommandBuffer> = &cb;
             let mut cb_array = [NonNull::from(cb_protocol)];
@@ -1205,7 +1381,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         bucket_idx: usize,
         num_tokens: usize,
         num_seqs: u32,
-        has_spec_tokens: bool,
+        sampled_rows: crate::tape::ids::SampledRowCount,
         range: std::ops::Range<usize>,
         writes: Option<&InputWrites>,
     ) -> Result<(), ForwardError> {
@@ -1215,7 +1391,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                     bucket_idx,
                     num_tokens as u32,
                     num_seqs,
-                    has_spec_tokens,
+                    sampled_rows,
                     enc,
                     range,
                 )
@@ -1318,9 +1494,9 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             usize,
         ) -> Result<(), ForwardError>,
     {
-        let bucket_idx = self.pick_bucket(inputs.num_tokens)?;
+        let bucket_idx = self.pick_bucket_for(inputs)?;
         let num_seqs = num_seqs(inputs);
-        let has_spec_tokens = inputs.has_spec_tokens;
+        let sampled_rows = inputs.sampled_row_count();
         self.attach_residency();
 
         let guard = self.checkout()?;
@@ -1343,7 +1519,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             bucket_idx,
             inputs.num_tokens as usize,
             num_seqs,
-            has_spec_tokens,
+            sampled_rows,
             inputs.reads,
             tail,
             &writes,
@@ -1485,8 +1661,16 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         (at, replaced)
     }
 
-    fn spawn_worker(&self, lent: &LentActivation) -> Result<PooledWorker<W>, WorkerError> {
-        let runtime = self.runtime_factory.build(&self.device, lent);
+    fn spawn_worker(
+        &self,
+        share: &ArenaShare,
+        ranks: &ArenaRanks,
+    ) -> Result<PooledWorker<W>, WorkerError> {
+        let host = match share {
+            ArenaShare::In(host) => &**host,
+            ArenaShare::Own | ArenaShare::Hosts(_) => &HostArena::default(),
+        };
+        let runtime = self.runtime_factory.build(&self.device, host);
         let worker = MetalWorker::<W>::new_with_residency(
             self.device.clone(),
             &self.arena_layout,
@@ -1496,7 +1680,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             &runtime,
             Some(self.allocator.residency()),
             self.decode_rows,
-            lent,
+            share,
+            ranks,
             self.sparse_plan.as_ref(),
         )?;
         Ok(PooledWorker {
@@ -1507,12 +1692,16 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         })
     }
 
-    /// The first worker's arena slots, scratch and TurboQuant scratch, to lend a pool whose
-    /// forwards never overlap this one's ([`LentActivation`]), out of the pool or not: the borrower
-    /// places its buffers in them once, building its pool, and every forward of it follows this
-    /// pool's — an MTP head's even on the command buffer of the target forward that holds the worker.
-    pub fn lend_activation(&self) -> LentActivation {
-        self.lendable.clone()
+    /// What the first worker shares with the pool's guest ([`HostArena`]), out of the pool or not:
+    /// the guest builds its pool in it once, and every forward of it follows this pool's — an MTP
+    /// head's even on the command buffer of the target forward that holds the worker.
+    pub fn hosted(&self) -> HostArena {
+        self.hosting.clone()
+    }
+
+    /// What the pool is to the arena it runs in: a guest's host reads none of its slots.
+    pub fn role(&self) -> ArenaRole {
+        self.role
     }
 
     fn checkin(&self, pooled: PooledWorker<W>) {
@@ -1642,7 +1831,7 @@ impl<W: CanonicalParams> Onto<'_, W> {
             "a forward played in another's command buffer is waited for with it"
         );
         let pool = self.guard.pool;
-        let bucket_idx = pool.pick_bucket(inputs.num_tokens)?;
+        let bucket_idx = pool.pick_bucket_for(inputs)?;
         assert!(
             !self.guard.worker.bucket_has_avg_pool_2d(bucket_idx),
             "a serialized forward runs in command buffers of its own"
@@ -1654,7 +1843,7 @@ impl<W: CanonicalParams> Onto<'_, W> {
         staging.retired.extend(replaced);
         self.staged = at + writes.staged.len();
         // After everything on the encoder so far: it wrote what the device inputs read, and may
-        // read this worker's runtime inputs or share its activation (an arena lent to it).
+        // read this worker's runtime inputs or run in its arena (a guest's).
         let all = MTLStages::Dispatch | MTLStages::Blit;
         enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
             all,
@@ -1673,7 +1862,7 @@ impl<W: CanonicalParams> Onto<'_, W> {
                 bucket_idx,
                 inputs.num_tokens,
                 num_seqs(inputs),
-                inputs.has_spec_tokens,
+                inputs.sampled_row_count(),
                 inputs.reads,
                 enc,
             )
@@ -1694,22 +1883,23 @@ impl<W: CanonicalParams> Onto<'_, W> {
         &self.guard.worker
     }
 
-    /// The bucket the last forward ran.
-    pub fn bucket_idx(&self) -> usize {
-        self.bucket_idx
+    /// The bucket row of the bucket the last forward ran ([`MetalWorkerPool::bucket_spec`]).
+    pub fn bucket_spec(&self) -> &'static MetalBucketSpec {
+        self.guard.pool.bucket_spec(self.bucket_idx)
     }
 }
 
-/// Commit options for ONE command buffer, whose feedback handler records that command buffer's GPU
-/// execution error (e.g. kIOGPUCommandBufferCallbackErrorOutOfMemory) in `error`. It is checked after
-/// the wait — a silently-failed command buffer otherwise produces all-zero outputs and degenerate
-/// logits (the macOS 26.5.1 Qwen3.5-MoE "!!!!" failure mode) — and a slot of its own means a later
-/// command buffer's error can neither be taken for it nor consumed by it.
+/// Commit options for ONE command buffer, whose feedback handler delivers how that command buffer
+/// went into `feedback`: its GPU execution error (e.g. kIOGPUCommandBufferCallbackErrorOutOfMemory),
+/// or that it had none. Every wait waits for it — a silently-failed command buffer otherwise
+/// produces all-zero outputs and degenerate logits (the macOS 26.5.1 Qwen3.5-MoE "!!!!" failure
+/// mode), and the handler is not ordered before the event the queue signals — and one of its own
+/// means a later command buffer's error can neither be taken for it nor consumed by it.
 fn commit_options(
-    error: &std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    feedback: &std::sync::Arc<CommitFeedback>,
 ) -> objc2::rc::Retained<objc2_metal::MTL4CommitOptions> {
     let options = objc2_metal::MTL4CommitOptions::new();
-    let err_slot = std::sync::Arc::clone(error);
+    let err_slot = std::sync::Arc::clone(feedback);
     let block = block2::RcBlock::new(
         move |feedback: std::ptr::NonNull<
             objc2::runtime::ProtocolObject<dyn objc2_metal::MTL4CommitFeedback>,
@@ -1742,7 +1932,9 @@ fn commit_options(
                         unsafe { objc2::msg_send![ui_obj, description] };
                     eprintln!("[scratchy-target-metal] GPU COMMIT ERROR userInfo: {desc}");
                 }
-                *err_slot.lock().expect("commit_error mutex") = Some(msg);
+                err_slot.deliver(Delivered::Err(msg));
+            } else {
+                err_slot.deliver(Delivered::Ok);
             }
         },
     );
@@ -2026,38 +2218,28 @@ fn write_runtime_inputs(
             return Err(ForwardError::KvNotMapped { block, mapped });
         }
     }
-    // Tell the gather kernel (used right before lm_head) what the
-    // actual num_tokens of this forward is so it can pick the
-    // last-token source row.
+    // The forward's actual num_tokens, for a kernel that reads M at runtime.
     write(
         "num_tokens",
         &runtime.num_tokens_u32,
         bytes_of(&[inputs.num_tokens]),
         Padding::Zero,
     )?;
-    // Plumb the lm_head sample-row index list. When the caller
-    // supplies `last_token_indices` (the common case: every forward
-    // that produces a sampled token) the slice trio uses these as
-    // the gather sources and scatter destinations; otherwise the
-    // count is 0 and the slice is a no-op for this step.
-    let num_sample_rows = inputs
-        .last_token_indices
-        .map(|s| s.len() as u32)
-        .unwrap_or(0);
+    // The rows the forward samples: the lm_head slice gathers them and puts them back, a
+    // compaction moves their logits to the front.
+    let sampled = inputs.sampled_rows;
     write(
         "num_sample_rows",
         &runtime.num_sample_rows_u32,
-        bytes_of(&[num_sample_rows]),
+        bytes_of(&[sampled.len() as u32]),
         Padding::Zero,
     )?;
-    if let Some(s) = inputs.last_token_indices {
-        write(
-            "last_token_indices",
-            &runtime.sample_indices,
-            bytes_of(s),
-            Padding::Zero,
-        )?;
-    }
+    write(
+        "sampled_rows",
+        &runtime.sample_indices,
+        bytes_of(sampled),
+        Padding::Zero,
+    )?;
     // GDN per-forward indices (hybrid arches only): a `GdnSeqSlots` record
     // (6 i32s) + a u32 step code per batched sequence in cu_seqlens order.
     if let Some(idx) = inputs.gdn_state_indices {
@@ -2178,6 +2360,10 @@ mod tests {
     use scratchy_tensors::{DType, DeviceAllocator, GpuTensor};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    /// The rows a step of at most 9 one-row sequences samples, its first `n` for `n` rows: every
+    /// row, each its sequence's last.
+    const EVERY_ROW: [u32; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
 
     /// The test tapes' variant: `TestWeights`' block capacity, no TurboQuant decode attention.
     const TEST_VARIANT: TapeVariant = TapeVariant {
@@ -2341,11 +2527,36 @@ mod tests {
             // Straight-line: this fixture is one hand-built body, no rolled layer loop.
             loops: &[],
             moe_scratch_bytes: 0,
-            decode_partials_row_bytes: 0,
+            decode_partials: crate::tape::lowered::DecodePartials::default(),
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
+            logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             cache_live: &[],
         }
+    }
+
+    /// A step's logits fit its bucket's buffer only if every row its tape writes does. A 96-row
+    /// bucket tiled by 64 (NAX) whose buffer is sized for 40 sampled rows holds one tile, 64 rows:
+    /// a step sampling 64 rows passes that count, but the matmul over every row runs
+    /// `⌈2 · 64 / 96⌉ = 2` tiles, the bucket's 96 rows, so it is refused.
+    #[test]
+    fn a_step_whose_tiles_pass_the_logits_buffer_is_refused() {
+        use crate::tape::ids::{DecodeRows, SampledRowCount};
+        use crate::tape::lowered::{LogitsOverflow, LogitsRows, RowTile};
+        let tape = LoweredMetalTape {
+            logits_rows: LogitsRows::Sampled {
+                tile: RowTile::Rows64,
+            },
+            ..synthetic_tape(96)
+        };
+        let decode_rows = Some(DecodeRows(40));
+        assert_eq!(tape.logits_slot_rows(decode_rows), 64);
+        let overflow = |n| tape.logits_overflow(decode_rows, SampledRowCount(n));
+        assert_eq!(overflow(40), None);
+        let (writes, holds) = (96, 64);
+        assert_eq!(overflow(64), Some(LogitsOverflow { writes, holds }));
+        // A buffer of the bucket's rows holds every row the bucket runs.
+        assert_eq!(tape.logits_overflow(None, SampledRowCount(96)), None);
     }
 
     /// Build a pool with `max_workers = max` for a one-bucket
@@ -2371,13 +2582,14 @@ mod tests {
             &weights,
             allocator,
             pipelines,
-            tapes,
+            &test_buckets(&tapes),
             MaxBlocksPerSeq(128),
             arena_layout,
             runtime_factory,
             max,
             None,
-            LentActivation::default(),
+            ArenaShare::Own,
+            ArenaRanks::NONE,
             None,
         )
         .expect("pool builds");
@@ -2616,13 +2828,14 @@ mod tests {
             &weights,
             allocator,
             pipelines,
-            tapes,
+            &test_buckets(&tapes),
             MaxBlocksPerSeq(128),
             arena_layout,
             runtime_factory,
             max_workers,
             None,
-            LentActivation::default(),
+            ArenaShare::Own,
+            ArenaRanks::NONE,
             None,
         )
         .expect("pool builds");
@@ -2651,6 +2864,28 @@ mod tests {
             return;
         };
         assert!(matches!(pool.pick_bucket(0), Err(ForwardError::ZeroTokens)));
+    }
+
+    /// The wide class is the M5 generation at Max-scale core counts alone: the class the routed
+    /// fold's wide band rides on (`M5_WIDE_MIN_CORES` — measured on a 40-core M5 Max, PR #847,
+    /// and lost on a 10-core base M5, its review). Every other chip, and an M5 under the
+    /// threshold, lowers the narrow band.
+    #[test]
+    fn the_wide_class_is_a_max_scale_m5_alone() {
+        use crate::tape::ids::GpuCores;
+        use crate::tape::lowered::GenClass;
+        use crate::tape::targets::AppleSiliconGen as G;
+        let class = |generation, cores| GenClass::for_device(generation, GpuCores(cores));
+        assert_eq!(class(G::M5, 10), GenClass::M5);
+        // The unmeasured 20-core M5 Pro stays narrow until benched.
+        assert_eq!(class(G::M5, 20), GenClass::M5);
+        assert_eq!(class(G::M5, 40), GenClass::M5Wide);
+        assert_eq!(class(G::M4, 40), GenClass::Mid);
+        assert_eq!(class(G::M1, 32), GenClass::M1);
+        let band = |generation, cores| FoldBand::for_class(class(generation, cores));
+        assert_eq!(band(G::M5, 40), FoldBand::Wide);
+        assert_eq!(band(G::M5, 10), FoldBand::Narrow);
+        assert_eq!(band(G::M2, 10), FoldBand::Narrow);
     }
 
     #[test]
@@ -2701,8 +2936,7 @@ mod tests {
             cu_seqlens_q: Some(cu),
             seq_used_k: Some(used),
             block_tables: vec![table],
-            has_spec_tokens: false,
-            last_token_indices: None,
+            sampled_rows: &EVERY_ROW[..2],
             gdn_state_indices: None,
             gdn_is_fresh: None,
             vision_rope_freqs: None,
@@ -2765,8 +2999,7 @@ mod tests {
             cu_seqlens_q: None,
             seq_used_k: None,
             block_tables: Vec::new(),
-            has_spec_tokens: false,
-            last_token_indices: None,
+            sampled_rows: &EVERY_ROW[..1],
             gdn_state_indices: None,
             gdn_is_fresh: None,
             vision_rope_freqs: None,
@@ -2814,7 +3047,8 @@ mod tests {
         let event = pool.device.newSharedEvent().expect("shared event");
         event.setSignaledValue(2);
         let failed = |value| {
-            let error = Arc::new(Mutex::new(Some(format!("command buffer {value} failed"))));
+            let error = Arc::new(CommitFeedback::default());
+            error.deliver(Delivered::Err(format!("command buffer {value} failed")));
             InFlight {
                 event: event.clone(),
                 value,
@@ -2864,8 +3098,7 @@ mod tests {
                 cu_seqlens_q: None,
                 seq_used_k: None,
                 block_tables: Vec::new(),
-                has_spec_tokens: false,
-                last_token_indices: None,
+                sampled_rows: &EVERY_ROW[..ids.len()],
                 gdn_state_indices: None,
                 gdn_is_fresh: None,
                 vision_rope_freqs: None,
@@ -2931,6 +3164,7 @@ mod tests {
             stride: 2,
             len: 2,
             selector: ((*picked).clone(), 0),
+            variants: 3,
             to: crate::select_rows::SelectInto::Input(DeviceInputInto::InputIds),
             at: size_of::<u32>(),
         }];
@@ -2944,8 +3178,7 @@ mod tests {
             cu_seqlens_q: None,
             seq_used_k: None,
             block_tables: Vec::new(),
-            has_spec_tokens: false,
-            last_token_indices: None,
+            sampled_rows: &EVERY_ROW[..4],
             gdn_state_indices: None,
             gdn_is_fresh: None,
             vision_rope_freqs: None,
@@ -3002,8 +3235,7 @@ mod tests {
             cu_seqlens_q: None,
             seq_used_k: None,
             block_tables: Vec::new(),
-            has_spec_tokens: false,
-            last_token_indices: None,
+            sampled_rows: &EVERY_ROW[..<[u32]>::len(ids)],
             gdn_state_indices: None,
             gdn_is_fresh: None,
             vision_rope_freqs: None,
@@ -3107,8 +3339,7 @@ mod tests {
             cu_seqlens_q: None,
             seq_used_k: None,
             block_tables: Vec::new(),
-            has_spec_tokens: false,
-            last_token_indices: None,
+            sampled_rows: &EVERY_ROW[..0],
             gdn_state_indices: None,
             gdn_is_fresh: None,
             vision_rope_freqs: None,
@@ -3151,8 +3382,7 @@ mod tests {
             cu_seqlens_q: None,
             seq_used_k: None,
             block_tables: Vec::new(),
-            has_spec_tokens: false,
-            last_token_indices: None,
+            sampled_rows: &EVERY_ROW[..9],
             gdn_state_indices: None,
             gdn_is_fresh: None,
             vision_rope_freqs: None,
@@ -3205,8 +3435,7 @@ mod tests {
             cu_seqlens_q: None,
             seq_used_k: None,
             block_tables: Vec::new(),
-            has_spec_tokens: false,
-            last_token_indices: None,
+            sampled_rows: &EVERY_ROW[..1],
             gdn_state_indices: None,
             gdn_is_fresh: None,
             vision_rope_freqs: None,
@@ -3256,6 +3485,18 @@ mod tests {
     /// stands one worker up eagerly.
     const EMPTY_BACKBONE: &[Instruction] = &[];
 
+    /// A bucket's two band rows, identical — the twin rows a real model emits when its bands
+    /// fold the same step tape, so whichever band the device picks serves it.
+    fn twin_rows(spec: &MetalBucketSpec) -> Vec<MetalBucketSpec> {
+        vec![
+            *spec,
+            MetalBucketSpec {
+                band: FoldBand::Wide,
+                ..*spec
+            },
+        ]
+    }
+
     /// Baked tape rungs for an empty test bucket — what the macro
     /// would emit for `(empty, empty)` instruction streams: an
     /// empty-command tape per (gen class × chunked) pair at KV cap 128.
@@ -3273,13 +3514,14 @@ mod tests {
             loops: &[],
             splitk_scratch_bytes: 0,
             moe_scratch_bytes: 0,
-            decode_partials_row_bytes: 0,
+            decode_partials: crate::tape::lowered::DecodePartials::default(),
             roped_k_scratch_bytes: 0,
             attn_unfused_scratch_bytes: 0,
+            logits_rows: crate::tape::lowered::LogitsRows::Bucket,
             cache_live: &[],
         };
         let mut v = Vec::new();
-        for gen_class in [GenClass::M1, GenClass::Mid, GenClass::M5] {
+        for gen_class in [GenClass::M1, GenClass::Mid, GenClass::M5, GenClass::M5Wide] {
             for addressing in [KvAddressing::Direct, KvAddressing::Chunked] {
                 v.push(ClassedTape {
                     gen_class,
@@ -3298,6 +3540,46 @@ mod tests {
     // are empty here so the barrier slices are empty too.
     const EMPTY_BARRIERS: &[bool] = &[];
 
+    /// Each of `tapes` with its bucket row (leaked: a pool's rows are `'static`). A test's forwards
+    /// read no output slot, so each row's are slot 0.
+    fn test_buckets(
+        tapes: &[LoweredMetalTape],
+    ) -> Vec<(&'static MetalBucketSpec, LoweredMetalTape)> {
+        (tapes.iter())
+            .map(|&tape| {
+                let spec = &*Box::leak(Box::new(MetalBucketSpec {
+                    bucket_m: tape.bucket_m,
+                    band: FoldBand::Narrow,
+                    num_arena_slots: tape.num_arena_slots,
+                    terminal_slot: 0,
+                    backbone_slot: 0,
+                    arena_bytes: TEST_ARENA_BYTES,
+                    logits_row_bytes: 0,
+                    backbone: EMPTY_BACKBONE,
+                    lm_head: EMPTY_LM_HEAD,
+                    backbone_barriers: EMPTY_BARRIERS,
+                    lm_head_barriers: EMPTY_BARRIERS,
+                    tapes: &[],
+                    kernels: &[],
+                }));
+                (spec, tape)
+            })
+            .collect()
+    }
+
+    /// `specs` as one model's rungs, ranked `ranks` (leaked: a pool's rungs are `'static`).
+    fn test_rungs(specs: &[MetalBucketSpec], ranks: ArenaRanks) -> &'static MetalRungs {
+        Box::leak(Box::new(MetalRungs {
+            buckets: Box::leak(specs.to_vec().into_boxed_slice()),
+            tq: TqGroup {
+                head_dim: HeadDim(TestWeights::GLOBAL_HEAD_DIM),
+                q_heads: NumQHeads(TestWeights::NUM_Q_HEADS),
+                kv_heads: NumKvHeads(TestWeights::NUM_GLOBAL_KV_HEADS),
+            },
+            ranks,
+        }))
+    }
+
     fn build_via_for_buckets(
         bucket_specs: &[MetalBucketSpec],
         max_workers: usize,
@@ -3310,14 +3592,14 @@ mod tests {
             device,
             &weights,
             allocator,
-            bucket_specs,
+            test_rungs(bucket_specs, ArenaRanks::NONE),
             runtime_factory,
             max_workers,
             None,
             128, // block_cap (test default — matches the legacy MAX_BLOCKS_PER_SEQ)
             KvAddressing::Direct,
             None,
-            LentActivation::default(),
+            ArenaShare::Own,
             TerminalReads::Gpu,
         ))
     }
@@ -3343,14 +3625,14 @@ mod tests {
             device,
             &weights,
             allocator,
-            &[],
+            test_rungs(&[], ArenaRanks::NONE),
             runtime_factory,
             1,
             None,
             128, // block_cap (unused — NoBuckets fires first)
             KvAddressing::Direct,
             None,
-            LentActivation::default(),
+            ArenaShare::Own,
             TerminalReads::Gpu,
         );
         match res {
@@ -3367,19 +3649,22 @@ mod tests {
     /// pipeline cache / lowering / pool spawn end-to-end.
     #[test]
     fn for_buckets_builds_pool_for_single_empty_bucket() {
-        let specs = [MetalBucketSpec {
+        let spec = MetalBucketSpec {
             bucket_m: 1,
+            band: FoldBand::Narrow,
             num_arena_slots: 2,
             terminal_slot: 1,
             backbone_slot: 0,
             arena_bytes: TEST_ARENA_BYTES,
+            logits_row_bytes: 0,
             backbone: EMPTY_BACKBONE,
             lm_head: EMPTY_LM_HEAD,
             backbone_barriers: EMPTY_BARRIERS,
             lm_head_barriers: EMPTY_BARRIERS,
             tapes: test_empty_tapes(1, 2),
             kernels: &[],
-        }];
+        };
+        let specs = twin_rows(&spec);
         let Some(res) = build_via_for_buckets(&specs, 2) else {
             eprintln!("skipping: no Metal device");
             return;
@@ -3398,19 +3683,22 @@ mod tests {
     /// contract: "the POOL refuses at load".
     #[test]
     fn for_buckets_refuses_bucket_with_no_tape_variants() {
-        let specs = [MetalBucketSpec {
+        let spec = MetalBucketSpec {
             bucket_m: 1,
+            band: FoldBand::Narrow,
             num_arena_slots: 2,
             terminal_slot: 1,
             backbone_slot: 0,
             arena_bytes: TEST_ARENA_BYTES,
+            logits_row_bytes: 0,
             backbone: EMPTY_BACKBONE,
             lm_head: EMPTY_LM_HEAD,
             backbone_barriers: EMPTY_BARRIERS,
             lm_head_barriers: EMPTY_BARRIERS,
             tapes: &[],
             kernels: &[],
-        }];
+        };
+        let specs = twin_rows(&spec);
         let Some(res) = build_via_for_buckets(&specs, 1) else {
             eprintln!("skipping: no Metal device");
             return;
@@ -3432,13 +3720,15 @@ mod tests {
     /// `Arc<[…]>`.
     #[test]
     fn for_buckets_preserves_bucket_order() {
-        let specs = [
+        let narrow = [
             MetalBucketSpec {
                 bucket_m: 1,
+                band: FoldBand::Narrow,
                 num_arena_slots: 2,
                 terminal_slot: 1,
                 backbone_slot: 0,
                 arena_bytes: TEST_ARENA_BYTES,
+                logits_row_bytes: 0,
                 backbone: EMPTY_BACKBONE,
                 lm_head: EMPTY_LM_HEAD,
                 backbone_barriers: EMPTY_BARRIERS,
@@ -3448,10 +3738,12 @@ mod tests {
             },
             MetalBucketSpec {
                 bucket_m: 8,
+                band: FoldBand::Narrow,
                 num_arena_slots: 2,
                 terminal_slot: 1,
                 backbone_slot: 0,
                 arena_bytes: TEST_ARENA_BYTES,
+                logits_row_bytes: 0,
                 backbone: EMPTY_BACKBONE,
                 lm_head: EMPTY_LM_HEAD,
                 backbone_barriers: EMPTY_BARRIERS,
@@ -3460,6 +3752,7 @@ mod tests {
                 kernels: &[],
             },
         ];
+        let specs = narrow.iter().flat_map(twin_rows).collect::<Vec<_>>();
         let Some(res) = build_via_for_buckets(&specs, 1) else {
             eprintln!("skipping: no Metal device");
             return;
@@ -3471,5 +3764,166 @@ mod tests {
             pool.pick_bucket(9),
             Err(ForwardError::NoBucketFits { .. })
         ));
+    }
+
+    /// A pool's bucket row is its own bucket's, in its device's band: the model's table holds a
+    /// row per bucket per fold band, so the pool's bucket index is no index into that table (the
+    /// bands' rows interleave). Each band's rows here name their own slots, so a row of the other
+    /// band, or of another bucket, shows.
+    #[test]
+    fn a_pools_bucket_row_is_its_own_buckets_in_one_band() {
+        let slots = |band| match band {
+            FoldBand::Narrow => (1, 0),
+            FoldBand::Wide => (0, 1),
+        };
+        let row = |bucket_m, band| {
+            let (terminal_slot, backbone_slot) = slots(band);
+            MetalBucketSpec {
+                bucket_m,
+                band,
+                num_arena_slots: 2,
+                terminal_slot,
+                backbone_slot,
+                arena_bytes: TEST_ARENA_BYTES,
+                logits_row_bytes: 0,
+                backbone: EMPTY_BACKBONE,
+                lm_head: EMPTY_LM_HEAD,
+                backbone_barriers: EMPTY_BARRIERS,
+                lm_head_barriers: EMPTY_BARRIERS,
+                tapes: test_empty_tapes(bucket_m, 2),
+                kernels: &[],
+            }
+        };
+        let specs = ([1, 8].into_iter())
+            .flat_map(|m| [FoldBand::Narrow, FoldBand::Wide].map(|band| row(m, band)))
+            .collect::<Vec<_>>();
+        let Some(res) = build_via_for_buckets(&specs, 1) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let pool = res.expect("for_buckets constructs pool");
+        let band = pool.bucket_spec(0).band;
+        for (bucket_idx, bucket_m) in [1, 8].into_iter().enumerate() {
+            let spec = pool.bucket_spec(bucket_idx);
+            assert_eq!(spec.bucket_m, bucket_m);
+            assert_eq!(spec.band, band);
+            assert_eq!((spec.terminal_slot, spec.backbone_slot), slots(band));
+        }
+    }
+
+    /// A model's bucket sizes name each bucket once, whatever rows its bands add.
+    #[test]
+    fn bucket_ms_names_each_bucket_once() {
+        let spec = |bucket_m| MetalBucketSpec {
+            bucket_m,
+            band: FoldBand::Narrow,
+            num_arena_slots: 2,
+            terminal_slot: 1,
+            backbone_slot: 0,
+            arena_bytes: TEST_ARENA_BYTES,
+            logits_row_bytes: 0,
+            backbone: EMPTY_BACKBONE,
+            lm_head: EMPTY_LM_HEAD,
+            backbone_barriers: EMPTY_BARRIERS,
+            lm_head_barriers: EMPTY_BARRIERS,
+            tapes: &[],
+            kernels: &[],
+        };
+        let specs = [spec(1), spec(8)]
+            .iter()
+            .flat_map(twin_rows)
+            .collect::<Vec<_>>();
+        assert_eq!(specs.len(), 4);
+        assert_eq!(test_rungs(&specs, ArenaRanks::NONE).bucket_ms(), [1, 8]);
+    }
+
+    /// A host pool built to hold its guest allocates what the budget prices for it
+    /// (`PickedRung::hosting_arena_bytes`), and a guest pool built in what it shares runs in the
+    /// host's buffers rank by rank, never in the host's hidden states; a guest keeps no logits for
+    /// the host.
+    #[test]
+    fn a_guest_pool_runs_in_its_host_pools_arena() {
+        use crate::interpreter::metal::__re::MTLBuffer as _;
+        let Some(device) = crate::detect_device().filter(|_| crate::metal4_available()) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = Arc::new(device.device.clone());
+        const K: u64 = 1024;
+        // Whole sparse tiles, so the buffers' lengths are the bytes asked for.
+        static HOST_ARENA: [u64; 3] = [256 * K, 64 * K, 128 * K];
+        static GUEST_ARENA: [u64; 3] = [64 * K, 128 * K, 512 * K];
+        let spec = |arena: &'static [u64], backbone_slot| MetalBucketSpec {
+            bucket_m: 1,
+            band: FoldBand::Narrow,
+            num_arena_slots: 3,
+            terminal_slot: 1,
+            backbone_slot,
+            arena_bytes: arena,
+            logits_row_bytes: 0,
+            backbone: EMPTY_BACKBONE,
+            lm_head: EMPTY_LM_HEAD,
+            backbone_barriers: EMPTY_BARRIERS,
+            lm_head_barriers: EMPTY_BARRIERS,
+            tapes: test_empty_tapes(1, 3),
+            kernels: &[],
+        };
+        let (host, guest) = (
+            twin_rows(&spec(&HOST_ARENA, 2)),
+            twin_rows(&spec(&GUEST_ARENA, 0)),
+        );
+        let host = test_rungs(&host, ArenaRanks::new(&[0, 2, 1], &[0, 1], &host));
+        let guest = test_rungs(&guest, ArenaRanks::new(&[2, 1, 0], &[2, 1], &guest));
+        let pick = |rungs: &MetalRungs| {
+            (rungs.pick(&device, None, 128, KvAddressing::Direct)).expect("a test rung")
+        };
+        let needs = pick(guest).guest(None);
+        let priced = pick(host).hosting_arena_bytes(None, &needs);
+        let (weights, allocator) = build_test_weights(&device);
+        let build = |rungs, share, terminal| {
+            let factory = RuntimeFactory::new(|d, _| empty_runtime(d, 1));
+            MetalWorkerPool::<TestWeights>::for_buckets(
+                device.clone(),
+                &weights,
+                allocator.clone(),
+                rungs,
+                factory,
+                1,
+                None,
+                128,
+                KvAddressing::Direct,
+                None,
+                share,
+                terminal,
+            )
+        };
+        let host_pool = build(host, ArenaShare::Hosts(needs), TerminalReads::Gpu)
+            .expect("the host pool builds");
+        assert_eq!(host_pool.role(), ArenaRole::Host);
+        let host_worker = host_pool.checkout().expect("a host worker");
+        let allocated: u64 = (host_worker.worker.arena.iter())
+            .map(|b| b.length() as u64)
+            .sum();
+        assert_eq!(allocated, HOST_ARENA.iter().sum::<u64>() + priced);
+
+        let shared = || ArenaShare::In(Box::new(host_pool.hosted()));
+        let guest_pool = build(guest, shared(), TerminalReads::Gpu).expect("the guest pool builds");
+        assert_eq!(guest_pool.role(), ArenaRole::Guest);
+        let guest_worker = guest_pool.checkout().expect("a guest worker");
+        let at = |arena: &[Buffer], slot: usize| arena[slot].gpuAddress();
+        let (h, g) = (&host_worker.worker.arena, &guest_worker.worker.arena);
+        assert_eq!(at(g, 2), at(h, 0), "rank 0");
+        assert_eq!(at(g, 1), at(h, 1), "rank 1");
+        assert_eq!(at(g, 0), at(h, 3), "rank 2, past the host's hosting slots");
+        assert!(
+            (0..3).all(|slot| at(g, slot) != at(h, 2)),
+            "the host's hidden states"
+        );
+
+        let refused = build(guest, shared(), TerminalReads::Host).err();
+        assert!(
+            matches!(refused, Some(PoolBuildError::GuestReadsLogits)),
+            "{refused:?}"
+        );
     }
 }

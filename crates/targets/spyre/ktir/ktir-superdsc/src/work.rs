@@ -492,6 +492,225 @@ impl EwDivision {
     }
 }
 
+/// ⭐⭐⭐ A GATHERED OP'S WORK DIVISION — the ENTRY axis split over WHOLE ENTRIES and nothing
+/// else, minted by exactly one constructor.
+///
+/// ⛔⛔ ONLY THE ENTRY AXIS (`mb`) MAY CARRY A SPLIT, AND THIS IS THE ONE NUMBER A GATHER'S
+/// CORRECTNESS HANGS ON. dxp derives `skip_addr` as `page × the per-core extents of the
+/// UNPINNED dims` (`getBufferCapacityForNodePerDim`, reproduced by
+/// `zz_skip_addr_computed_from_our_own_emission.rs`), so a split on any other axis DIVIDES what
+/// one index entry covers: every index step then lands a fraction of a row short, from a clean
+/// bake. MEASURED through the gathered pointwise door (the prefill attention kernel's leg t6):
+/// 8 entries on 32 cores left 24 cores for `distribute_cores` to fill, and it split `out`
+/// 4 ways — fluent text assembled from two different rows. dbo also reduces the value tensor's
+/// per-core starts to a single `min` before deriving any address (`computeGatherMetadata`), so
+/// a core owning a COLUMN SLICE of an entry loses that slice and reads the entry from its
+/// start.
+///
+/// ⭐ AND A GATHER LAWFULLY RUNS ON `min(entries, cores)` CORES — fewer cores than the machine
+/// is the CARD-PROVEN shape of both existing gathered doors (`gather_copy_cores`' KV copy and
+/// the gathered matmul arm's re-division), and the vendor's own one-core gather
+/// (`dxp/test/test_gather_1core`) is the `entries == 1` case. The cores the entries cannot
+/// take are LEFT IDLE, never filled by splitting another axis — that filler split is the
+/// wrong-byte shape above, and it is the only way this law can be broken, so the mint refuses
+/// nothing about the core count. The split is [`core_split`]'s largest divisor of `entries`
+/// within the budget — exactly `min(entries, cores)` at every `entries ≤ cores` — so every
+/// core owns one or more WHOLE entries whatever the count. (Ruling 10-20: `entries ≥ cores`
+/// was this door's fill POLICY, not a byte law; the producer's batch-width move stays the
+/// perf move, but a short gather is no longer unconstructible.)
+///
+/// This is the gathered POINTWISE leg's door (the attention legs). The KV copy door
+/// (`gather_copy_cores`) states the mb-only half of this law privately — its entries are
+/// `nkvh·nb·mq` (≥ 8) and a copy may lawfully run on the cores its entries can take; the
+/// gathered matmul arm states it inline over its own re-division. Both cite the same
+/// `skip_addr` derivation; this type is where the law lives for the door that hit it.
+pub struct GatherSplit {
+    splits: BTreeMap<&'static str, u32>,
+}
+
+impl GatherSplit {
+    /// THE ONLY CONSTRUCTOR — the cores distributed over the gather's ENTRIES. `entry_page` is
+    /// the `mb` positions ONE index entry covers; the division is over entries, so no core owns
+    /// a fraction of one. The mint runs on `min(entries, max_cores)` cores (the largest divisor
+    /// of `entries` within the budget — the same number at every `entries ≤ max_cores`) and
+    /// splits NOTHING but `mb`. `Err` names the law that failed: a plan with no `mb` dim for
+    /// the entries to enumerate, or an `mb` that does not divide into whole entries.
+    pub fn over_entries(dims: &[ItDim], max_cores: u32, entry_page: u32) -> Result<Self, String> {
+        let Some(mb) = dims
+            .iter()
+            .find(|d| d.name == "mb" && !d.is_reduction && !d.is_stick)
+        else {
+            return Err(
+                "the op's work plan has no `mb` dim for the entries to enumerate — a gathered \
+                 op's core split is the entry axis alone, and there is none"
+                    .to_string(),
+            );
+        };
+        if entry_page == 0 || mb.size % entry_page != 0 {
+            return Err(format!(
+                "the gather pages `mb` by {entry_page} position(s) and the axis is {} \
+                 positions — an entry would cover a fraction of the axis, and a partial entry \
+                 is an address",
+                mb.size
+            ));
+        }
+        let entries = mb.size / entry_page;
+        let mut splits = BTreeMap::new();
+        let split = core_split(entries, max_cores);
+        if split > 1 {
+            splits.insert(mb.name, split);
+        }
+        Ok(GatherSplit { splits })
+    }
+
+    /// The minted split — `mb` alone. The tiler consumes this verbatim; there is no door that
+    /// hands a gathered op any other division.
+    pub fn splits(&self) -> &BTreeMap<&'static str, u32> {
+        &self.splits
+    }
+}
+
+/// How a pointwise op's cores are divided: the elementwise law ([`EwDivision`]), or a gathered
+/// op's own [`GatherSplit`]. The two are mutually exclusive BY TYPE — a gathered op's division
+/// is not resolved from its operand layout (the elementwise law's input) but minted from its
+/// entries, because only the entry axis may carry a split (see [`GatherSplit`]'s law).
+pub enum CoreDivision {
+    Ew(EwDivision),
+    Gathered(GatherSplit),
+}
+
+#[cfg(test)]
+mod gather_split_tests {
+    use super::{CoreDivision, GatherSplit, ItDim};
+    use crate::superdsc_opspec::Df;
+    use std::collections::BTreeMap;
+
+    /// A tile's `[mb, out, y]` dims — the spelling every pointwise gather states.
+    fn dims(mb: u32, out: u32) -> Vec<ItDim> {
+        let d = |name: &'static str, size: u32, is_stick: bool| ItDim {
+            name,
+            size,
+            is_reduction: false,
+            is_stick,
+            df: Df::Fp16,
+        };
+        vec![d("mb", mb, false), d("out", out, true), d("y", 1, false)]
+    }
+
+    /// ⭐ THE SPLIT IS THE ENTRY AXIS ALONE — at the prefill kernel's own current form (32
+    /// entries on 32 cores) the mint is `{mb: 32}` and `out` is carried WHOLE however many
+    /// sticks it spans, because dxp derives `skip_addr` from the per-core extents of the
+    /// unpinned dims and a split `out` shrinks what one index entry covers.
+    #[test]
+    fn the_split_is_the_entry_axis_alone() {
+        let g = GatherSplit::over_entries(&dims(32, 256), 32, 1).expect("32 entries on 32 cores");
+        assert_eq!(
+            g.splits(),
+            &BTreeMap::from([("mb", 32u32)]),
+            "`mb` takes all the cores; `out` stays whole however many sticks it spans"
+        );
+    }
+
+    /// ⭐ THE RULING (10-20): A GATHER LAWFULLY RUNS ON FEWER CORES THAN THE MACHINE — the
+    /// prefill kernel's earlier 8-entry form is CONSTRUCTIBLE: the mint is `{mb: 8}`, the op
+    /// runs on 8 cores with 24 idle, and `out` is still carried whole. What that form measured
+    /// (`out` split 4 ways) was the FILLER split `distribute_cores` made to spend the idle
+    /// cores — the wrong-byte shape — and `min(entries, cores)` over `mb` alone is the shape
+    /// that keeps `skip_addr` correct at any core count. The batch width stays the perf move;
+    /// it is no longer a correctness refusal.
+    #[test]
+    fn entries_fewer_than_cores_run_on_their_entries() {
+        let g = GatherSplit::over_entries(&dims(8, 256), 32, 1).expect("8 entries on 32 cores");
+        assert_eq!(
+            g.splits(),
+            &BTreeMap::from([("mb", 8u32)]),
+            "8 whole entries, one per core, `out` never the filler"
+        );
+    }
+
+    /// The vendor's own one-core gather (`dxp/test/test_gather_1core`) is the `entries == 1`
+    /// case: `mb` is UNSPLIT (a split of 1 is no split) and the op runs on one core.
+    #[test]
+    fn one_entry_is_the_vendors_own_one_core_gather() {
+        let g = GatherSplit::over_entries(&dims(1, 256), 32, 1).expect("1 entry on 32 cores");
+        assert!(
+            g.splits().is_empty(),
+            "a single entry leaves `mb` unsplit — one core, one whole entry"
+        );
+    }
+
+    /// At MORE entries than cores the split is [`core_split`]'s largest divisor — every core
+    /// owns one or more WHOLE entries, and `out` still never splits.
+    #[test]
+    fn more_entries_than_cores_split_at_the_largest_divisor() {
+        let g = GatherSplit::over_entries(&dims(64, 256), 32, 1).expect("64 entries on 32 cores");
+        assert_eq!(g.splits(), &BTreeMap::from([("mb", 32u32)]));
+        let g = GatherSplit::over_entries(&dims(48, 256), 32, 1)
+            .expect("48 entries: 24 whole entries per core pair, no other axis touched");
+        assert_eq!(
+            g.splits(),
+            &BTreeMap::from([("mb", 24u32)]),
+            "the largest divisor within the budget — 48 has no 32, and `out` is not the filler"
+        );
+    }
+
+    /// ⛔ A PARTIAL ENTRY IS AN ADDRESS — an `mb` the page does not divide would leave the last
+    /// index entry covering a fraction of the axis, refused by name.
+    #[test]
+    fn a_partial_entry_is_refused() {
+        let Err(m) = GatherSplit::over_entries(&dims(33, 256), 32, 2) else {
+            panic!("33 positions at 2 per entry is a partial entry");
+        };
+        assert!(
+            m.contains("fraction of the axis"),
+            "names the partial entry: {m}"
+        );
+    }
+
+    /// ⛔ NO `mb`, NO GATHER — a plan with no entry axis for the index to enumerate cannot be
+    /// divided at this door at all.
+    #[test]
+    fn a_plan_with_no_mb_dim_is_refused() {
+        let d = ItDim {
+            name: "out",
+            size: 256,
+            is_reduction: false,
+            is_stick: true,
+            df: Df::Fp16,
+        };
+        let Err(m) = GatherSplit::over_entries(&[d], 32, 1) else {
+            panic!("no `mb` dim means no entries to enumerate");
+        };
+        assert!(
+            m.contains("no `mb` dim for the entries to enumerate"),
+            "names the missing axis: {m}"
+        );
+    }
+
+    /// THE PAGE DIVIDES POSITIONS INTO ENTRIES — the copy door's own law: at 64 positions and
+    /// 2 per entry the division is over the 32 ENTRIES, so no core owns a fraction of one.
+    #[test]
+    fn the_page_divides_positions_into_entries() {
+        let g = GatherSplit::over_entries(&dims(64, 64), 32, 2).expect("32 whole entries");
+        assert_eq!(
+            g.splits(),
+            &BTreeMap::from([("mb", 32u32)]),
+            "the split is over entries, not positions"
+        );
+    }
+
+    /// The enum is the door's statement: an ungathered op carries the elementwise law, a
+    /// gathered op carries its minted split — and the two spellings are the only ones.
+    #[test]
+    fn the_enum_carries_either_the_law_or_the_mint() {
+        let g = GatherSplit::over_entries(&dims(32, 256), 32, 1).expect("the mint");
+        match CoreDivision::Gathered(g) {
+            CoreDivision::Gathered(g) => assert_eq!(g.splits(), &BTreeMap::from([("mb", 32u32)])),
+            CoreDivision::Ew(_) => panic!("the minted split round-trips"),
+        }
+    }
+}
+
 /// [`distribute_cores`] with the STICK dim served FIRST — for a stick-major rank-2 elementwise op
 /// ([`EwDivision::SticksFirst`]). Reductions are never split, for [`distribute_cores`]' own reason.
 ///

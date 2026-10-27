@@ -96,6 +96,11 @@ impl Executor for MultiNodeExecutor {
         self.inner.max_concurrent_batches()
     }
 
+    /// To the leader's own executor: the leader samples.
+    fn set_stop_token_ids(&mut self, stop_token_ids: &[u32]) {
+        self.inner.set_stop_token_ids(stop_token_ids);
+    }
+
     fn initialize_cache(
         &mut self,
         num_gpu_blocks: usize,

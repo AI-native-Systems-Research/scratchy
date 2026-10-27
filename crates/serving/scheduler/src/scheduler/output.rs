@@ -205,6 +205,26 @@ pub struct SchedulerOutput {
     /// state (Gated-DeltaNet hybrids) and prefix caching is on.
     #[serde(default)]
     pub recurrent_state: RecurrentStateOps,
+
+    /// Which scheduling step this is: what its coming back, or failing, settles about the
+    /// prefix-cache blocks registered while it was scheduled.
+    #[serde(default)]
+    pub step: StepId,
+}
+
+/// ⭐ A SCHEDULING STEP, numbered from 1 by the KV cache manager as it starts
+/// (`KVCacheManagerOps::new_step_starts`); 0 for an output built by hand. Steps come back, or
+/// fail, in this order.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub struct StepId(u64);
+
+impl StepId {
+    /// The step after this one. Only the KV cache manager numbers steps.
+    pub(crate) fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
 }
 
 /// A speculative step scheduled ahead (#240): the engine schedules the step after one that drafts
@@ -348,6 +368,7 @@ impl SchedulerOutput {
             primes_only: false,
             spec_pipeline: SpecPipeline::default(),
             recurrent_state: RecurrentStateOps::default(),
+            step: StepId::default(),
         }
     }
 }
@@ -443,6 +464,7 @@ mod tests {
             primes_only: false,
             spec_pipeline: SpecPipeline::default(),
             recurrent_state: RecurrentStateOps::default(),
+            step: StepId::default(),
         };
         assert_eq!(so.total_num_scheduled_tokens, 150);
         assert_eq!(so.scheduled_new_reqs.len(), 1);

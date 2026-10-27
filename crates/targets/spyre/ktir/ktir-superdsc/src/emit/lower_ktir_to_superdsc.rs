@@ -235,11 +235,22 @@ pub fn gather_of(k: &KtirNode) -> Result<Option<Gather>, Error> {
 /// operand, which the contract admits and the one-gather reading refuses only because it counts
 /// tiles instead of ops.
 ///
-/// The joins stay EXACTLY `gather_of`'s — same param walk, same self-reference refusal, same
-/// `entries` off the tile's own shape — with one added DISCRIMINATOR the single-gather reading
-/// never needed: every tile must name the SAME index and value parameters. Tiles over different
-/// pairs really would need two index operands on one descriptor-shaped op and are refused by name
-/// here rather than half-lowered; tiles over the same pair are the unrolled sweep's trips.
+/// ⭐⭐ AND THE PAIRS MAY DIFFER — the batched paged-decode shape. That kernel gathers TWO tables
+/// through ONE ids buffer: K^T whole pages and V whole pages, each feeding its own contraction,
+/// so its tiles span two (index, value) pairs in one function. This is safe for the same reason
+/// the unrolled sweep is: the one-index law is a PER-DESCRIPTOR fact, and the whole-function walk
+/// joins EACH op to its own tile by the identity of the gathered LOAD (`op_gather`), appending
+/// that tile's index region to THAT op's operand list — two ops gathering different tables are
+/// two descriptors, each carrying its own single index operand. The shapes that would violate the
+/// per-descriptor law are refused downstream, by name: an op reading a gathered value reaches the
+/// walk's ScalarMul-or-materialized rule, the materializer demands the gather be the matmul's B
+/// with exactly one consumer, and a tile no descriptor declares trips the uncarried check. None
+/// of those guards looks at a SECOND tile, so none is weakened by admitting one.
+///
+/// What the multi-pair reading DOES add is a fact the placement owns: the set of index buffers.
+/// A program may now state SEVERAL distinct index tids, and the layout sizes every one of them
+/// `SenUint32` (a 4 B/elem index is per-INDEX-BUFFER, not per-program), dtype-checks each, and
+/// gives each its flush-at-end fetch slack.
 ///
 /// A gather the walk below does not carry is still the silent-direct-read hazard `gather_of`'s
 /// comment names, so callers refuse an uncarried one exactly as before.
@@ -252,7 +263,6 @@ pub fn gathers_of(k: &KtirNode) -> Result<Vec<Gather>, Error> {
         .filter(|o| o.op_type == OpKind::KtdpConstructIndirectAccessTile)
         .collect();
     let mut out: Vec<Gather> = Vec::with_capacity(tiles.len());
-    let tile_count = tiles.len();
     for tile in &tiles {
         // The SAME param walk `gather_of` runs, per tile — a closure over this tile's operands so
         // the two readings cannot disagree about which parameter a tile's view names.
@@ -386,24 +396,14 @@ pub fn gathers_of(k: &KtirNode) -> Result<Vec<Gather>, Error> {
                 message: format!("{}: {msg}", f.name),
             })?
         };
-        // ⛔ THE ONE NEW DISCRIMINATOR: every tile must name the SAME parameter pair. A second
-        // pair really is two gathers on one descriptor-shaped program — the shape `gather_of`
-        // exists to refuse — and refusing it HERE names the pair instead of letting the walk
-        // half-materialize one of them.
-        if out
-            .first()
-            .is_some_and(|first| first.index_tid != index_tid || first.value_tid != value_tid)
-        {
-            return err(format!(
-                "{}: {} `ktdp.construct_indirect_access_tile` op(s) over {} different \
-                 index/value parameter pairs — one descriptor carries ONE index operand \
-                 (DSC2ToDataflowIR.cpp:51), so gathers over different buffers need one node \
-                 per gather. Tiles over the SAME pair (an unrolled sweep's trips) are fine.",
-                f.name,
-                tile_count,
-                out.len() + 1
-            ));
-        }
+        // ⭐ NO CROSS-TILE PAIR CHECK — deliberately. The one-index law is per DESCRIPTOR, and the
+        // walk below joins each op to its own tile by load identity, so two tiles over different
+        // pairs are two descriptors each carrying one index operand — the batched paged-decode
+        // shape (K^T and V gathered through one ids buffer). The per-op guards downstream (the
+        // ScalarMul-or-materialized rule, the materializer's B-side and single-consumer demands,
+        // the uncarried-tile check) are what enforce the law where it binds; a pair check HERE
+        // would refuse a shape those guards admit, which is how this reading used to stop one
+        // generalization short.
         // ⭐ THIS TILE'S GATHERED LOAD — the `ktdp.load` over the tile, found HERE so the value
         // travels with the gather. Exactly one load per tile: the tile IS the statement "the row
         // index is data", and a tile with no load states a gather nothing reads (refused below as
@@ -750,7 +750,7 @@ fn store_views(f: &IRFunction<'static>) -> std::collections::HashSet<Ssa> {
 
 /// Every `arith.constant` index in the func, by the SSA it defines — an access tile's corner is one
 /// of these, and a corner is what carries a column-chunked node's `region.cols.start`.
-pub(crate) fn index_constants(f: &IRFunction<'static>) -> std::collections::HashMap<Ssa, i64> {
+pub fn index_constants(f: &IRFunction<'static>) -> std::collections::HashMap<Ssa, i64> {
     let mut m = std::collections::HashMap::new();
     for op in f.operations.iter() {
         if op.op_type != OpKind::ArithConstant {
@@ -791,6 +791,110 @@ pub(crate) fn index_constants(f: &IRFunction<'static>) -> std::collections::Hash
     m
 }
 
+/// A corner's affine form over the launch position: `stride · core_id + base`.
+///
+/// The door's half of the shared contract with triton-ktir's
+/// `uniform_grid_corners::uniform_corners` — the recognizer that crate's fire gate consults
+/// and whose pass mints the spelling this one reads. This crate is a serde-only leaf and
+/// cannot depend on that one, so the family is stated twice; the bridge test in
+/// `triton-ktir-superdsc` runs one module through both and asserts they agree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Uniform {
+    pub stride: i64,
+    pub base: i64,
+}
+
+/// Every SSA the affine-form propagation can state as `stride · core_id + base` over the
+/// landmark — the door's twin of triton-ktir's `uniform_corners`, built the same way
+/// `index_constants` builds its constants: one pass over the function's top-level ops in
+/// program order (SSA definitions precede uses), seeded with the landmark itself.
+///
+/// SOUND by the same law as the twin: only ops closed under affine forms propagate — an
+/// `index_cast` is transparent, an `addi` of a constant or another uniform composes, a
+/// `muli` by a constant scales. Division, remainder, and a product of two position terms
+/// are dropped, so nothing is claimed the twin cannot also claim. Only the landmark's own
+/// `result` seeds the position: a multi-axis `ktdp.get_compute_tile_id` (scratchy's own
+/// producer emits those) names its other axes in `result_names`, and an axis coordinate is
+/// not the flat position — a corner riding one is not claimed rather than misclaimed.
+pub fn uniform_corners(
+    f: &IRFunction<'static>,
+    consts: &std::collections::HashMap<Ssa, i64>,
+) -> std::collections::HashMap<Ssa, Uniform> {
+    let mut out: std::collections::HashMap<Ssa, Uniform> = std::collections::HashMap::new();
+    let Some(landmark) = f
+        .operations
+        .iter()
+        .find(|o| o.op_type == OpKind::KtdpGetComputeTileId)
+        .and_then(|o| o.result)
+    else {
+        return out;
+    };
+    out.insert(landmark, Uniform { stride: 1, base: 0 });
+    for op in f.operations.iter() {
+        let Some(r) = op.result else { continue };
+        // ⛔ THE UNPACK IS PER-ARM, NOT UP FRONT: an `arith.index_cast` is UNARY (operand 1 is
+        // absent), so a two-operand tuple match would skip every cast — and the canonical
+        // spelling is `index_cast(muli(index_cast(landmark), S))`, three casts deep. The casts
+        // must propagate or NOTHING does.
+        let form: Option<Uniform> = match op.op_type {
+            OpKind::ArithIndexCast => op.operands.first().and_then(|a| out.get(a).copied()),
+            OpKind::ArithAddi | OpKind::ArithMuli => {
+                let (Some(a), Some(b)) =
+                    (op.operands.first().copied(), op.operands.get(1).copied())
+                else {
+                    continue;
+                };
+                let (fa, fb, ka, kb) = (
+                    out.get(&a).copied(),
+                    out.get(&b).copied(),
+                    consts.get(&a).copied(),
+                    consts.get(&b).copied(),
+                );
+                if op.op_type == OpKind::ArithAddi {
+                    match (fa, fb, ka, kb) {
+                        (Some(x), Some(y), _, _) => {
+                            compose(x.stride.checked_add(y.stride), x.base.checked_add(y.base))
+                        }
+                        (Some(x), None, _, Some(c)) => {
+                            compose(Some(x.stride), x.base.checked_add(c))
+                        }
+                        (None, Some(y), Some(c), _) => {
+                            compose(Some(y.stride), y.base.checked_add(c))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    // A product of two position terms is quadratic, not uniform: only mul by a
+                    // CONSTANT propagates — the same deliberate narrowing the twin states.
+                    match (fa, fb, ka, kb) {
+                        (Some(x), None, _, Some(c)) => {
+                            compose(x.stride.checked_mul(c), x.base.checked_mul(c))
+                        }
+                        (None, Some(y), Some(c), _) => {
+                            compose(y.stride.checked_mul(c), y.base.checked_mul(c))
+                        }
+                        _ => None,
+                    }
+                }
+            }
+            _ => None,
+        };
+        if let Some(form) = form {
+            out.insert(r, form);
+        }
+    }
+    out
+}
+
+/// `Some` for a form inside the i32 domain, `None` for one that left it (or whose
+/// arithmetic overflowed) — the same guard the twin applies, so a form one side refuses
+/// the other refuses too.
+fn compose(stride: Option<i64>, base: Option<i64>) -> Option<Uniform> {
+    let stride = stride.filter(|s| (i32::MIN as i64..=i32::MAX as i64).contains(s))?;
+    let base = base.filter(|b| (i32::MIN as i64..=i32::MAX as i64).contains(b))?;
+    Some(Uniform { stride, base })
+}
+
 /// An op's `[.., rows, cols]` from its own `shape` attribute or result type — the same reading
 /// `logical_2d` did, kept because a 1-D shape is a ROW (our per-channel vectors are `[hidden]`).
 pub(crate) fn shape_2d(op: &Operation<'_>) -> Option<(u32, u32)> {
@@ -806,7 +910,22 @@ pub(crate) fn shape_2d(op: &Operation<'_>) -> Option<(u32, u32)> {
     Some(match dims.as_slice() {
         [] => (1, 1),
         [a] => (1, *a as u32),
-        [.., a, b] => (*a as u32, *b as u32),
+        // ⭐⭐⭐ RANK > 2 IS READ IN THE FLAT FRAME: every axis but the last folded into rows, the
+        // last the columns. Row-major, a rank-N tile and its `[prod(leading..=second-last), last]`
+        // flattening are the SAME BYTES at the same offsets — the batched paged-decode kernel's
+        // `[B, G, PS]` score tile IS the `[B·G, PS]` tile its pointwise consumers address — so this
+        // is a reading, not a relayout. For rank 2 the leading fold is the empty product (1) and
+        // the pair is exactly what it always was, so every existing caller is byte-identical; the
+        // OLD `[.., a, b]` arm took the LAST TWO AXES ONLY (`[256, 4, 256]` read as `(4, 256)`),
+        // which drops the batch multiplier and was never reachable anyway — no rank-3 op survived
+        // the ladder to reach it until the batched dot and the reshape bridge landed.
+        [rest @ .., a, b] => (
+            rest.iter()
+                .copied()
+                .chain(std::iter::once(*a))
+                .product::<i64>() as u32,
+            *b as u32,
+        ),
     })
 }
 
@@ -822,8 +941,12 @@ fn scale_idx_of(layout: Option<&BundleLayout>, tid: u32) -> Option<usize> {
 /// ⛔ IT IS `node_to_tile_ops`' OWN DECLARATION, NOT A NEW ONE. That function builds `mb` from the
 /// output's rows, `out` from its cols (`is_stick`), a size-1 `y`, and `n_operands` from the operand
 /// count — pure shape, nothing that needs the node. `in`(K) is added for a matmul, and a ScalarMul's
-/// `out` is the DEVICE width. Those are the three arms, and they are the three arms here.
-pub(crate) fn pointwise_tile_op(rows: u32, cols: u32, n_operands: u32) -> TileOp {
+/// `out` is the DEVICE width. Those are the three arms, and they are the three arms here — plus the
+/// `y` PARAMETER the row-split broadcast mode adds: the one arm that states a real `y > 1` is the
+/// leading-axis broadcast consumer (`elementwise_broadcast`'s Y arm, which derives `y` and
+/// `mb = rows/y` from the checked [`crate::sdsc_abstract::RowSplitFrame`]); every other caller
+/// passes 1 and keeps the size-1 dim this doc describes.
+pub(crate) fn pointwise_tile_op(rows: u32, cols: u32, y: u32, n_operands: u32) -> TileOp {
     TileOp {
         kind: TileOpKind::PointwiseOrReduce { n_operands },
         dims: vec![
@@ -843,7 +966,7 @@ pub(crate) fn pointwise_tile_op(rows: u32, cols: u32, n_operands: u32) -> TileOp
             },
             ItDim {
                 name: "y",
-                size: 1,
+                size: y.max(1),
                 is_reduction: false,
                 is_stick: false,
                 df: Df::Fp16,
@@ -951,36 +1074,65 @@ pub fn elementwise_op_func(name: &str, kind: Elementwise) -> Result<(&'static st
 /// ⭐ EVERY INPUT, NOT JUST A BINARY'S SECOND. The builder gives a unary's single input the output's
 /// dims too, so the same silence applies; the invariant is "all operands share the output's extent",
 /// and stating it per-arity would be the scattered logic this crate exists to avoid.
+/// ⭐⭐⭐ TWO BASES, ONE LAW: every operand must hold the op's row sweep (`rows` — the basis
+/// [`pointwise_rows`] reads off the OUTPUT), and the basis an operand holds it in is the
+/// operand's own.
+///
+/// A WHOLE-VIEW operand holds the sweep by BEING it (`v_rows == rows`, at row 0) — the seeded
+/// family's shape, and the only shape the old law here described (it compared `v_rows` against
+/// the output's `v_rows`). A WINDOWED operand — a banded program's per-core window, or a minted
+/// intermediate consumed by a banded op — holds the sweep as its WINDOW (`r_len == rows`, fitting
+/// its view), and comparing its `v_rows` instead would refuse exactly the programs the band lift
+/// admits: a banded output's whole view is every core's bands, not this op's sweep. The c_len
+/// equality is unchanged — the op's width is one number every operand shares.
 fn pointwise_extents_agree(
     name: &str,
     kind: Elementwise,
     ins: &[Region],
     out: &Region,
+    rows: u32,
 ) -> Result<(), Error> {
     for (i, x) in ins.iter().enumerate() {
-        if (x.v_rows, x.c_len) != (out.v_rows, out.c_len) {
+        let row_ok = if x.r_cover == (0, x.v_rows) {
+            x.r_start == 0 && x.v_rows == rows
+        } else {
+            x.r_len == rows && x.r_start + x.r_len <= x.v_rows
+        };
+        if !row_ok || x.c_len != out.c_len {
+            if x.r_cover == (0, x.v_rows) {
+                return err(format!(
+                    "Elementwise({kind:?}) {name}: input {i} t{} is `[{}, {}]` (view rows × window \
+                     cols) but the output t{} is `[{}, {}]`, and this emitter addresses EVERY operand \
+                     at the OUTPUT's extent — `pointwise_opspec_from_tile` computes `device_dims` once \
+                     from the output tile and hands the same dims to every TensorArg, so nothing \
+                     downstream ever reads this input's own view. The descriptor would read a {}-row × \
+                     {}-col tile out of a {}-row × {}-col operand, running off its end and taking the \
+                     wrong bytes for every row after the first — silently, and reporting success. \
+                     A row-broadcast `[1, n]` source or a per-row `[m, 1]` scalar is expressible only \
+                     through the EwOperand builders (`pw2` + `In::col`), which mark the operand \
+                     out-broadcast so the descriptor STATES the broadcast; this seeded whole-tensor \
+                     path cannot express it, so it refuses rather than mis-address it.",
+                    x.tid,
+                    x.v_rows,
+                    x.c_len,
+                    out.tid,
+                    out.v_rows,
+                    out.c_len,
+                    rows,
+                    out.c_len,
+                    x.v_rows,
+                    x.c_len,
+                ));
+            }
             return err(format!(
-                "Elementwise({kind:?}) {name}: input {i} t{} is `[{}, {}]` (view rows × window \
-                 cols) but the output t{} is `[{}, {}]`, and this emitter addresses EVERY operand \
-                 at the OUTPUT's extent — `pointwise_opspec_from_tile` computes `device_dims` once \
-                 from the output tile and hands the same dims to every TensorArg, so nothing \
-                 downstream ever reads this input's own view. The descriptor would read a {}-row × \
-                 {}-col tile out of a {}-row × {}-col operand, running off its end and taking the \
-                 wrong bytes for every row after the first — silently, and reporting success. \
-                 A row-broadcast `[1, n]` source or a per-row `[m, 1]` scalar is expressible only \
-                 through the EwOperand builders (`pw2` + `In::col`), which mark the operand \
-                 out-broadcast so the descriptor STATES the broadcast; this seeded whole-tensor \
-                 path cannot express it, so it refuses rather than mis-address it.",
-                x.tid,
-                x.v_rows,
-                x.c_len,
-                out.tid,
-                out.v_rows,
-                out.c_len,
-                out.v_rows,
-                out.c_len,
-                x.v_rows,
-                x.c_len,
+                "Elementwise({kind:?}) {name}: input {i} t{}'s window is `[{}, {}]` at row {} of its \
+                 `[{}, {}]` view, but the op sweeps `[{}, {}]` (the output t{}'s basis) — a windowed \
+                 operand must hold the sweep as its OWN window (`r_len` the sweep, fitting the view), \
+                 or the descriptor would read the wrong rows of this operand for the rows the output \
+                 states. The column extent is shared (`c_len`), so a mismatch there is the same \
+                 refusal; a row-broadcast `[1, n]` source or a per-row `[m, 1]` scalar is expressible \
+                 only through the EwOperand builders (`pw2` + `In::col`), which state the broadcast.",
+                x.tid, x.r_len, x.c_len, x.r_start, x.v_rows, x.v_cols, rows, out.c_len, out.tid,
             ));
         }
     }
@@ -989,11 +1141,13 @@ fn pointwise_extents_agree(
 
 /// WHICH AXIS a pointwise operand is broadcast along.
 ///
-/// The two are not interchangeable and the device says which through a different [`In`] builder, so
+/// The three are not interchangeable and the device says which through a different [`In`] builder, so
 /// they are a variant rather than a `bool`: [`In::col`] marks the operand out-broadcast (a per-row
 /// scalar sprayed along the stick axis) and [`In::mb`] marks it mb-broadcast (a row vector sprayed
 /// down the rows). Emitting one for the other reads a `[m, 1]` operand as a `[1, n]` and takes the
-/// wrong bytes for every row after the first.
+/// wrong bytes for every row after the first. [`In::y_broadcast`] marks the ROW-SPLIT form — a
+/// multi-row `[mb, out]` source sprayed down the op's LEADING dim — whose count is carried in the
+/// variant because the op's `[mb, out, y]` facts are a function of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BcastAxis {
     /// `[m, 1]` → `[m, n]`: a per-row scalar (a row reduction's result) sprayed along the columns.
@@ -1001,6 +1155,12 @@ pub enum BcastAxis {
     Col,
     /// `[1, n]` → `[m, n]`: a row vector (an rmsnorm gain) sprayed down the rows. `n1[None, :]`.
     Mb,
+    /// `[mb, out]` → `[y, mb, out]`: a MULTI-row source sprayed down a new LEADING dim — the
+    /// row-split form, the batched paged-decode kernel's J-slot merge (`[64, 4] -> [4, 64, 4]`,
+    /// `Dimensions=[0]` over a source the walk-back proved to be `y·mb` rows). The count is the
+    /// broadcast's own stated leading extent; the consumer checks it against the source region's
+    /// frame ([`crate::sdsc_abstract::RegionFrame::split_rows`]) before building the operand.
+    Y(u32),
 }
 
 /// main's `lower_elementwise_node` (main 8362-8432). Its door: the [`Elementwise`] kind is stated by
@@ -1021,7 +1181,11 @@ pub fn elementwise(
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
     let (op_func, arity) = elementwise_op_func(name, kind)?;
-    let (ins, out) = split_out(name, r, layout, arity)?;
+    // ⭐ SPLIT WITHOUT THE BASE-ADDRESS GUARD: the dense arm below places row corners
+    // per-operand (the windowed emission), so which operands are inputs is a fact about the
+    // parameter list, not about how one arm addresses them. The arms that CANNOT carry a corner
+    // are refused it by the guard just below; every other body keeps `split_out`'s guard.
+    let (ins, out) = split_regions(name, r, layout, arity, &[])?;
     if !bcast.is_empty() && bcast.len() != ins.len() {
         return err(format!(
             "Elementwise({kind:?}) {name}: {} broadcast flags for {} inputs — the flags are \
@@ -1031,18 +1195,22 @@ pub fn elementwise(
             ins.len(),
         ));
     }
-    // ⛔⛔⛔ THE BROADCAST AND PER-ROW ARMS CANNOT CARRY A COLUMN CORNER, AND ONE NEVER REACHES
-    // THEM FROM THIS FRONT END. A broadcast operand is addressed at its OWN extent (`In::col`:
+    // ⛔⛔⛔ THE BROADCAST AND PER-ROW ARMS CANNOT CARRY A CORNER — COLUMN OR ROW — AND ONE NEVER
+    // REACHES THEM FROM THIS FRONT END. A broadcast operand is addressed at its OWN extent (`In::col`:
     // one lane per row; `In::mb`: one row of values) and the per-row chain writes LANE 0 of a
     // one-stick output at the buffer base — neither form can state "columns
-    // `[c_start, c_start+c_len)` of a wider stick-blocked tensor", which is what a column-blocked
-    // chunk is. The column-tiling set (`subtile_ir.rs`: `EwKind::Silu | Mul | Add`, `ScalarMul`,
-    // `SiluMul`) is all DENSE, so a corner arriving at either arm is a producer shape this door
-    // refuses BY NAME rather than mis-addressing — the same contract `base_addressed` states for
-    // a row corner. The DENSE arm below carries the corner; this guard is what keeps the other
-    // two from silently dropping it.
+    // `[c_start, c_start+c_len)` of a wider stick-blocked tensor" (what a column-blocked chunk is)
+    // nor "rows `[r_start, r_start+r_len)` of a taller one" (what a banded program's window is).
+    // The column-tiling set (`subtile_ir.rs`: `EwKind::Silu | Mul | Add`, `ScalarMul`, `SiluMul`)
+    // is all DENSE, so a corner arriving at either arm is a producer shape this door refuses BY
+    // NAME rather than mis-addressing — the same contract `base_addressed` states for a row corner
+    // on every other body. The DENSE arm below carries both corners; this guard is what keeps the
+    // other two from silently dropping them.
     if (bcast.iter().any(Option::is_some) || out.c_len == 1)
-        && (out.c_start != 0 || ins.iter().any(|x| x.c_start != 0))
+        && (out.c_start != 0
+            || ins.iter().any(|x| x.c_start != 0)
+            || out.r_start != 0
+            || ins.iter().any(|x| x.r_start != 0))
     {
         let (who, cs) = ins
             .iter()
@@ -1053,8 +1221,9 @@ pub fn elementwise(
             "Elementwise({kind:?}) {name}: {who} states column corner {cs} of its view, and the \
              arm this shape routes to (a broadcast operand or the per-row one-stick chain) \
              addresses its operands at the BUFFER BASE or at a broadcast mode — neither can place \
-             a column window. A column-blocked chunk is DENSE elementwise; the dense arm carries \
-             the corner, so give the broadcast/per-row chains whole-tensor regions.",
+             a column window, and neither a row corner (`base_addressed`'s own argument). A \
+             column-blocked chunk or a banded window is DENSE elementwise; the dense arm carries \
+             both corners, so give the broadcast/per-row chains whole-tensor regions.",
         ));
     }
     if bcast.iter().any(Option::is_some) {
@@ -1066,7 +1235,6 @@ pub fn elementwise(
     if out.c_len == 1 {
         return elementwise_per_row(name, kind, &ins, &out, sym_id_base, layout);
     }
-    pointwise_extents_agree(name, kind, &ins, &out)?;
     // ⛔ THIS COMMENT USED TO SAY `assemble_pointwise` EMITS THE SFP POLYNOMIAL TABLE "via
     // `constant_info(op_func)`". THERE IS NO SUCH FUNCTION. `constant_info` is a local in `emit_sdsc`
     // derived from the TYPED `op.op_info`, and the table is gated on
@@ -1079,7 +1247,11 @@ pub fn elementwise(
     // them. A comment claiming we emit the table describes the bug, not the fix.
     let cols = out.c_len;
     check_pointwise_cols(cols, "Elementwise", out.tid)?;
+    // ⭐ THE SWEEP IS COMPUTED BEFORE THE EXTENTS LAW, because the law is now stated OVER it: a
+    // windowed (banded) output's sweep is its window, not its whole view, and the operands are
+    // held to that basis ([`pointwise_extents_agree`]'s two-basis law below).
     let rows = pointwise_rows(name, &out)?;
+    pointwise_extents_agree(name, kind, &ins, &out, rows)?;
     let op_name = format!("{op_func}_o{}", out.tid);
     // ⛔⛔⛔ A COLUMN-BLOCKED CHUNK IS DENSE ELEMENTWISE WITH A CORNER, AND THE CORNER MUST RIDE
     // EVERY OPERAND — the 12b gemma-4 garbage. `subtile_ir.rs`'s column-tiling set
@@ -1103,10 +1275,20 @@ pub fn elementwise(
     // offset is the ONLY thing this change adds, so it is the only thing that may change the
     // bytes: any corner on any operand routes to the offset form, and a corner-free program does
     // not.
-    if out.c_start == 0 && ins.iter().all(|x| x.c_start == 0) {
+    //
+    // ⛔ AND "CORNER-FREE" MEANS ROWS TOO. The seeded form addresses every operand at the buffer
+    // base — a banded op whose every COLUMN corner happens to be 0 (a rope copy's first half)
+    // would silently read the wrong band at the base if the row corner were not part of this
+    // gate. The row term joins the column term here rather than in `base_addressed`, because the
+    // arm below this one CAN place it.
+    if out.c_start == 0
+        && ins.iter().all(|x| x.c_start == 0)
+        && out.r_start == 0
+        && ins.iter().all(|x| x.r_start == 0)
+    {
         let in_names: Vec<String> = ins.iter().map(|x| x.name()).collect();
         let in_refs: Vec<&str> = in_names.iter().map(|s| s.as_str()).collect();
-        let tile_op = pointwise_tile_op(rows, cols, arity as u32 + 1);
+        let tile_op = pointwise_tile_op(rows, cols, 1, arity as u32 + 1);
         let op = assemble_pointwise_seeded_from_tile(
             &op_name,
             &tile_op,
@@ -1118,39 +1300,58 @@ pub fn elementwise(
         );
         return Ok(vec![op]);
     }
-    // ⛔ THE EXTENTS LAW RESTATED FOR THE CHUNK: `pointwise_extents_agree` compared
-    // `(v_rows, c_len)` — the window's width, which every chunk's operands share — so it cannot
-    // catch a chunk whose operands carry DIFFERENT corners. Every operand of a column-blocked
-    // op reads the same window of the same-width tensors, so the corners must be equal; a
-    // mismatch would address one operand's window at another's corner.
-    if !ins.iter().all(|x| x.c_start == out.c_start) {
-        let who: Vec<String> = ins
-            .iter()
-            .map(|x| format!("t{}@{}", x.tid, x.c_start))
-            .collect();
-        return err(format!(
-            "Elementwise({kind:?}) {name}: the output t{}'s window starts at column {} but its \
-             inputs sit at [{}] — a column-blocked chunk reads and writes ONE window shared by \
-             every operand, so unequal corners would address one operand's columns at another's. \
-             The tiling front end mints one block per operand set; unequal corners mean a producer \
-             windowed the operands by hand.",
-            out.tid,
-            out.c_start,
-            who.join(", "),
-        ));
-    }
-    // Every operand sits at the output's corner (checked just above), so one corner serves all — a
-    // [`crate::addr::ColWindow`], so the piece is presented stick-major (#622).
-    let out_off = chunk_window(name, rows, &out)?;
+    // ⛔⛔⛔ THE CORNERS ARE PER-OPERAND, AND THE PAIRING IS THE PROGRAM'S OWN — the rotate-half
+    // finding. The old law here required every input's column corner to equal the output's,
+    // because the tiling front end mints one block per operand set and nothing else was known to
+    // reach this arm. But a rotate-half rope pairs the halves' windows over ONE view: `x1` reads
+    // columns `[0, 64)` while `x2` reads `[64, 128)` of the SAME tensor, and each product's
+    // operands sit at their OWN corners (`x1·cos` reads `x1@0` against `cos@0`, `x2·sin` reads
+    // `x2@64` against a `sin` window of its own view) — a single shared corner cannot state any
+    // of it. So the corner is per-operand now: every operand — input or output — is addressed at
+    // the window ITS OWN region states, and the extents law above is what makes that safe (every
+    // operand holds the same `[rows, cols]` sweep; only the corner differs). Equal corners —
+    // every column-blocked chunk the front end mints — emit exactly the bytes the shared-corner
+    // form did: same offset on every operand, same [`crate::addr::ColWindow`].
+    //
+    // ⭐ TWO FORMS, ONE BUILDER, PICKED BY THE ROW CORNER. At row 0 the window is a whole-stick
+    // COLUMN window of a same-rows stick-major parent — a [`crate::addr::ColWindow`], so the
+    // piece is presented stick-major and the work-division law reaches it (#622; the 12b gemma-4
+    // chunk family, card-proven). At a nonzero row corner — a BANDED program's window, one
+    // core's row band of a taller view — the window is not a column window of a same-rows tensor
+    // at all; it is a rectangle at `(r_start, c_start)` of the parent, addressed flat through
+    // [`band_corner`] (`In::sliced` at an `rc_of` corner, the write at `OutCorner::At`). That
+    // form is exactly the card-proven rotate-half geometry — a `[rows, 64]` window at a column
+    // corner of a wider view — with the row term the corner adds.
+    let out_off: crate::addr::OutCorner = if out.r_start == 0 {
+        chunk_window(name, rows, &out)?.into()
+    } else {
+        crate::addr::OutCorner::At(band_corner(name, rows, &out)?)
+    };
     // HANDLE-FLOW, `silumul`'s own discipline: the handles are bound once and the operands
     // borrow them, because an `EwOperand` holds a `&Stk` that must outlive the builder call.
-    let out_h = rb(&out.name(), rows, cols);
-    let in_handles: Vec<_> = ins.iter().map(|x| rb(&x.name(), rows, cols)).collect();
+    // ⭐ AND THE HANDLE DECLARES THE **STORAGE**, NOT THE WINDOW: each region's own view
+    // `[v_rows, v_cols]` — the parent the corner arithmetic (`chunk_window`/`band_corner` over
+    // `rc_of`'s nest) addresses within. A handle declared at the window `[rows, cols]` makes the
+    // corner itself past-the-end (chunk 1 of the `[25, 15360]` MLP intermediate: corner 204800
+    // against a 179200-element declaration), which the operand mint refuses — the same
+    // annotation-only dims the `rbo` comment promises nothing reads but the checks.
+    let out_h = rb(&out.name(), out.v_rows, out.v_cols);
+    let in_handles: Vec<_> = ins
+        .iter()
+        .map(|x| rb(&x.name(), x.v_rows, x.v_cols))
+        .collect();
     let ew: Vec<_> = in_handles
         .iter()
-        .map(|h| In::col_window(h, out_off).ew())
-        .collect();
-    let tile_op = pointwise_tile_op(rows, cols, arity as u32 + 1);
+        .zip(ins.iter())
+        .map(|(h, x)| {
+            Ok(if x.r_start == 0 {
+                In::col_window(h, chunk_window(name, rows, x)?).ew()
+            } else {
+                In::sliced(h, band_corner(name, rows, x)?).ew()
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    let tile_op = pointwise_tile_op(rows, cols, 1, arity as u32 + 1);
     Ok(vec![assemble_pointwise_broadcast_off_from_tile(
         &op_name,
         &tile_op,
@@ -1176,25 +1377,31 @@ pub fn elementwise(
 /// test asked the body and the body agreed with itself.
 ///
 /// So this asks the emission. For every op of the node and every operand binding naming a tensor the
-/// program windows at a column corner, the binding's `offset_elems` must be that window's corner in
-/// the tensor's storage ([`chunk_corner`]); the node's ops must start at least one write at the
-/// output's corner. A body that ignores `c_start` cannot produce a bundle: the door returns this `Err`
-/// and the bake fails naming the op.
+/// program windows at a corner — a COLUMN corner, or the ROW corner of a banded window, which the
+/// windowed pointwise emission places the same way — the binding's `offset_elems` must be that
+/// window's corner in the tensor's storage (`rc_of` over the region's own view, the plane term
+/// `c/64·v_rows·64` plus the row term; at row 0 it is the column corner alone); the node's ops must
+/// start at least one write at the output's corner. A body that ignores a stated corner cannot
+/// produce a bundle: the door returns this `Err` and the bake fails naming the op.
 ///
-/// A whole-tensor node (every corner 0) passes without looking, so nothing that is not column-blocked
+/// A whole-tensor node (every corner 0) passes without looking, so nothing that is not windowed
 /// pays for it.
 pub fn column_windows_are_honoured(
     name: &str,
     r: &[Region],
     ops: &[EmittedOp],
 ) -> Result<(), Error> {
-    let windowed: Vec<&Region> = r.iter().filter(|x| x.c_start != 0).collect();
+    let windowed: Vec<&Region> = r
+        .iter()
+        .filter(|x| x.c_start != 0 || x.r_start != 0)
+        .collect();
     if windowed.is_empty() {
         return Ok(());
     }
     for x in windowed {
         let rows = x.v_rows;
-        let want = chunk_corner(rows, x).into_raw_elems();
+        let want =
+            crate::addr::rc_of(rows, x.v_cols, x.r_start, x.c_start, Df::Fp16).into_raw_elems();
         let buf = x.name();
         let mut seen = false;
         for op in ops {
@@ -1203,13 +1410,16 @@ pub fn column_windows_are_honoured(
                 if b.offset_elems != want {
                     return err(format!(
                         "{name}: op `{}` addresses t{} at element {} of its buffer, but the program \
-                         windows that tensor at column {} — element {want} of its `[{rows}, {}]` \
-                         storage. A column-blocked piece that does not address its own window \
-                         recomputes another piece's columns and leaves its own unwritten.",
+                         windows that tensor at rows {}..{} × columns {}..{} — element {want} of its \
+                         `[{rows}, {}]` storage. A windowed piece that does not address its own \
+                         window recomputes another piece's bytes and leaves its own unwritten.",
                         op.op_name,
                         x.tid,
                         b.offset_elems,
+                        x.r_start,
+                        x.r_start + x.r_len,
                         x.c_start,
+                        x.c_start + x.c_len,
                         x.c_start + x.c_len,
                     ));
                 }
@@ -1217,8 +1427,11 @@ pub fn column_windows_are_honoured(
         }
         if x.is_out && !seen {
             return err(format!(
-                "{name}: the program writes t{} at column window {}..{}, and no emitted op names it",
+                "{name}: the program writes t{} at rows {}..{} × columns {}..{}, and no emitted op \
+                 names it",
                 x.tid,
+                x.r_start,
+                x.r_start + x.r_len,
                 x.c_start,
                 x.c_start + x.c_len,
             ));
@@ -1227,24 +1440,13 @@ pub fn column_windows_are_honoured(
     Ok(())
 }
 
-/// ⭐ WHERE A COLUMN-BLOCKED PIECE's WINDOW STARTS in its stick-blocked `[rows, full]` storage — the
-/// device element offset of column `out.c_start`, `(c/64)·(rows·64)`, through the address nest. The ONE
-/// spelling for every pointwise body whose pieces share one output tensor (`elementwise`'s dense arm,
-/// `scalarmul_scaled`); `full` is the storage's width (`c_start + c_len`), because the nest's row
-/// stride is a property of the storage, not of this piece's view. Zero for a whole-tensor region.
-fn chunk_corner(rows: u32, out: &Region) -> crate::addr::DevOff {
-    crate::addr::col_of(
-        rows,
-        out.c_start + out.c_len,
-        pointwise_chunk_out_offset(out.c_start),
-        Df::Fp16,
-    )
-}
-
-/// [`chunk_corner`] as a [`crate::addr::ColWindow`] — the same element, carrying the fact that a
-/// column-blocked piece is a whole-stick window of its stick-major storage, so the door presents it
-/// rank-2 stick-major and the work-division law reaches it (#622). `Err`, naming the op, when the
-/// piece's corner is not a whole stick.
+/// ⭐ A COLUMN-BLOCKED PIECE's WINDOW as a [`crate::addr::ColWindow`] — the device element offset of
+/// column `c_start` in its stick-blocked `[rows, full]` storage, `(c/64)·(rows·64)` through the
+/// address nest (`full` the storage's width `c_start + c_len`, because the nest's row stride is a
+/// property of the storage, not of this piece's view), carrying the fact that a column-blocked
+/// piece is a whole-stick window of its stick-major storage, so the door presents it rank-2
+/// stick-major and the work-division law reaches it (#622). `Err`, naming the op, when the piece's
+/// corner is not a whole stick.
 fn chunk_window(name: &str, rows: u32, out: &Region) -> Result<crate::addr::ColWindow, Error> {
     crate::addr::col_window_of(
         rows,
@@ -1255,6 +1457,45 @@ fn chunk_window(name: &str, rows: u32, out: &Region) -> Result<crate::addr::ColW
     .map_err(|e| Error {
         message: format!("{name}: {e}"),
     })
+}
+
+/// ⭐ THE CORNER OF A BANDED WINDOW — a row AND column corner of a stick-blocked view, the
+/// per-operand spelling the banded family's emission addresses through (`In::sliced` on the read
+/// side, `OutCorner::At` on the write). A rope copy's window is `[band, 64]` at `(r_start, 0)` or
+/// `(r_start, 64)` of its `[v_rows, 128]` view; the corner is that rectangle's first element in
+/// the view's own nest, `rc_of` — the parent's plane stride `v_rows·64` and row stride `64` both
+/// stated by the VIEW, never by the window.
+///
+/// ⛔⛔ SINGLE-STICK ONLY, AND THIS IS GEOMETRY, NOT TASTE. A window at a nonzero row corner is
+/// addressable only while it stays inside ONE column plane of the parent: the parent strides its
+/// planes `v_rows·64` apart while the window's own `[rows, c_len]` stick-major view strides them
+/// `rows·64`, so a multi-stick window's second plane lands `rows·64` from the first in the window
+/// and `(v_rows − rows)·64` further in the parent — not contiguous, and no flat or stick-major
+/// presentation reaches both planes at once. A sub-stick width mis-strides the rows the same way
+/// (`rows·c_len` against the parent's `rows·64`). The card-proven precedents for this exact form
+/// are the rotate-half halves and the per-head attention blocks — `[rows, 64]` rectangles at a
+/// corner of a wider view — and the band lift adds only the row term to that corner. Anything
+/// wider than one stick at a row corner is refused BY NAME, here, where the geometry says so.
+fn band_corner(name: &str, rows: u32, x: &Region) -> Result<crate::addr::DevOff, Error> {
+    if x.c_len != FP16_ELEMS_PER_STICK || !x.c_start.is_multiple_of(FP16_ELEMS_PER_STICK) {
+        return err(format!(
+            "{name}: t{}'s window is `[{}, {}]` at column {} of its `[{}, {}]` view, at row \
+             corner {} — a banded window is addressable only as ONE WHOLE \
+             {FP16_ELEMS_PER_STICK}-element stick at a whole-stick column: the parent strides its \
+             column planes `v_rows·64` elements apart while a window of {rows} rows would stride \
+             its own `rows·64`, so a multi-stick window's planes are not contiguous in the parent, \
+             and a sub-stick width mis-strides every row. Widen the sweep or keep the window at \
+             row 0, where the whole-stick column-window form reaches any width.",
+            x.tid, x.r_len, x.c_len, x.c_start, x.v_rows, x.v_cols, x.r_start,
+        ));
+    }
+    Ok(crate::addr::rc_of(
+        x.v_rows,
+        x.v_cols,
+        x.r_start,
+        x.c_start,
+        Df::Fp16,
+    ))
 }
 
 /// ⭐⭐⭐ THE PER-ROW CLASS — `[rows, 1]` elementwise, the running-max/alpha/denominator chain of an
@@ -1300,7 +1541,7 @@ fn elementwise_per_row(
     let cols = FP16_ELEMS_PER_STICK;
     let rows = pointwise_rows(name, out)?;
     let op_name = format!("{op_func}_o{}", out.tid);
-    let tile_op = pointwise_tile_op(rows, cols, arity as u32 + 1);
+    let tile_op = pointwise_tile_op(rows, cols, 1, arity as u32 + 1);
     let in_names: Vec<String> = ins.iter().map(|x| x.name()).collect();
     let in_refs: Vec<&str> = in_names.iter().map(|s| s.as_str()).collect();
     let op = assemble_pointwise_seeded_from_tile(
@@ -1380,17 +1621,47 @@ fn elementwise_broadcast(
     // one; comparing a window's inputs against a view's extent is the mismatch that reads rows
     // nobody wrote.
     let rows = pointwise_rows(name, out)?;
+    // ⭐⭐⭐ THE ROW-SPLIT (Y) MODE'S FRAME, DERIVED BEFORE THE WANT LOOP — because the want row
+    // for a `Y` operand (`rows/y`) is only honest when `y` DIVIDES `rows`, and that divisibility
+    // is itself half of the frame law: the output's own device frame `[rows, c_len]` must split
+    // into exactly `y` sprays of `rows/y` rows with the `out` dim the ONE stick (the source is
+    // single-stick). [`RegionFrame::split_rows`] checks all of it and returns the op's
+    // `[mb, out, y]` facts; its `Err` is the refusal, so a row-split the bytes do not support is
+    // a build failure here, not a wrong-byte bake (the mb re-row's own defect class).
+    let ymode: Option<u32> = bcast.iter().find_map(|b| match b {
+        Some(BcastAxis::Y(y)) => Some(*y),
+        _ => None,
+    });
+    let split = match ymode {
+        Some(y) => Some(
+            crate::sdsc_abstract::RegionFrame::stick_blocked(
+                rows as usize,
+                out.c_len as usize,
+                crate::superdsc_opspec::Df::Fp16,
+            )
+            .split_rows(y as usize, (rows / y) as usize)
+            .map_err(|e| Error {
+                message: format!("Elementwise({kind:?}) {name}: output t{}: {e}", out.tid),
+            })?,
+        ),
+        None => None,
+    };
     for (i, x) in ins.iter().enumerate() {
         let want = match bcast[i] {
             None => (rows, out.c_len),
             Some(BcastAxis::Col) => (rows, 1),
             Some(BcastAxis::Mb) => (1, out.c_len),
+            // ⭐ THE ROW-SPLIT SOURCE IS THE `[mb, out]` TILE — one spray's worth of the output's
+            // rows, at the output's own column extent. The divisibility that makes `rows/y`
+            // honest is the frame law above, already proven.
+            Some(BcastAxis::Y(y)) => (rows / y, out.c_len),
         };
         if (x.v_rows, x.c_len) != want {
             return err(format!(
                 "Elementwise({kind:?}) {name}: input {i} t{} is `[{}, {}]` but its operand mode \
                  ({:?}) requires `[{}, {}]` against the `[{}, {}]` output t{}. A `Col` operand is one \
-                 value per row (`[rows, 1]`), an `Mb` operand one row of values (`[1, cols]`), and a \
+                 value per row (`[rows, 1]`), an `Mb` operand one row of values (`[1, cols]`), a `Y` \
+                 operand one spray's worth of rows (`[rows/y, cols]`), and a \
                  dense operand the whole tile; the descriptor addresses it as its mode says, so an \
                  extent that disagrees reads bytes nobody wrote.",
                 x.tid, x.v_rows, x.c_len, bcast[i], want.0, want.1, out.v_rows, out.c_len, out.tid,
@@ -1401,7 +1672,11 @@ fn elementwise_broadcast(
     // through [`elementwise_per_row`]: the value rides in lane 0 of a one-stick output, which is the
     // width `attn.rs`'s own `lcorr`/`ladd` emissions state. A broadcast OPERAND of a per-row op is
     // still an operand mode (a spray is addressing, not width), so only the width is folded here.
-    let cols = if out.c_len == 1 {
+    // The Y mode's width is the frame's `out` — the ONE stick the split law allows — which is the
+    // same pad-up a `[rows, 1]` output takes: the mint's footprint already reserved it.
+    let cols = if let Some(s) = split {
+        s.out as u32
+    } else if out.c_len == 1 {
         FP16_ELEMS_PER_STICK
     } else {
         out.c_len
@@ -1418,7 +1693,22 @@ fn elementwise_broadcast(
     let in_handles: Vec<_> = in_names
         .iter()
         .zip(ins)
-        .map(|(n, x)| rb(n, x.v_rows, x.c_len))
+        .zip(bcast)
+        .map(|((n, x), b)| match b {
+            // ⭐ A `Col` OPERAND'S STORAGE IS STICK-WIDE, not `[rows, 1]`: the row reduction that
+            // wrote it reserved `rows × 64` (`synth_footprint_bytes` rounds the inner extent up to
+            // a whole stick — the `rinv` law this arm's own header cites), and the RedStick read
+            // sweeps ONE STICK PER ROW. The operand mint checks that swept window against the
+            // handle's declaration, so the annotation now states the footprint the storage always
+            // had — `rb(name, rows, 64)`, the same handle `rmsnorm.rs` mints for `rinv`.
+            Some(BcastAxis::Col) => rb(n, x.v_rows, FP16_ELEMS_PER_STICK),
+            // ⭐⭐⭐ AND IN THE Y MODE EVERY OPERAND IS STICK-WIDE for the same reason: the op's
+            // `out` dim IS the one stick the frame law allows, so the dense operand's storage is
+            // `[v_rows, 64]` — the footprint its `(v_rows, c_len < 64)` mint already reserved —
+            // and the swept window the mint checks (`rows × stick` dense, `rows/y × stick` for
+            // the spray) fits it exactly.
+            _ => rb(n, x.v_rows, if split.is_some() { cols } else { x.c_len }),
+        })
         .collect();
     let ew: Vec<_> = in_handles
         .iter()
@@ -1427,11 +1717,22 @@ fn elementwise_broadcast(
             None => In::full(h).ew(),
             Some(BcastAxis::Col) => In::col(h).ew(),
             Some(BcastAxis::Mb) => In::mb(h).ew(),
+            Some(BcastAxis::Y(y)) => In::y_broadcast(h, *y).ew(),
         })
         .collect();
     // The SAME `TileOp` the dense arm builds, so the two arms share one LX-tiling contract and a
-    // broadcast op is not silently exempt from it.
-    let tile_op = pointwise_tile_op(rows, cols, ins.len() as u32 + 1);
+    // broadcast op is not silently exempt from it. In the Y mode the tile states the OP's own
+    // `[mb, out, y]` dims — `mb` one spray's worth of rows, `y` the spray count — which is the
+    // iteration space the y-major TensorArgs (`["y", "mb", "out"]`) walk.
+    let tile_op = pointwise_tile_op(
+        match &split {
+            Some(s) => s.mb as u32,
+            None => rows,
+        },
+        cols,
+        ymode.unwrap_or(1),
+        ins.len() as u32 + 1,
+    );
     Ok(vec![assemble_pointwise_broadcast_off_from_tile(
         &op_name,
         &tile_op,
@@ -1514,10 +1815,15 @@ pub fn silumul(
     };
     let (gate_w, up_w, out_w) = (window(gate_off)?, window(up_off)?, window(out_off)?);
     // HANDLE-FLOW: bind gate/up/tmp/out once; `tmp` flows from the silu output INTO the mul input.
-    let gate = rb(&gate, rows, cols);
-    let up = rb(&up, rows, cols);
-    let tmp = rb(&tmp, rows, cols);
-    let out = rb(&out, rows, cols);
+    // ⭐ THE HANDLES DECLARE THE **STORAGE**, like the corners above them: each tensor is the WHOLE
+    // `[rows, v_cols]` intermediate (the region's own view — `full_cols` is the chunk-relative
+    // width the corner arithmetic takes, which for a non-final chunk under-states the view). A
+    // handle at the chunk's `[rows, cols]` makes chunk 1's own corner past-the-end, which the
+    // operand mint refuses — the dims are annotation-only, so this changes no byte.
+    let gate = rb(&gate, rows, gate_r.v_cols);
+    let up = rb(&up, rows, up_r.v_cols);
+    let tmp = rb(&tmp, rows, o.v_cols);
+    let out = rb(&out, rows, o.v_cols);
     Ok(vec![
         assemble_pointwise_broadcast_off(
             &silu_name,
@@ -1691,15 +1997,47 @@ pub fn rmsnorm(
 /// satisfied by a narrower descriptor that computes fewer columns than the program states. And it is a
 /// no-op wherever the layout does reserve the pad, which is the lm-head logits case the rule exists
 /// for.
+/// Returns the width PAIR a pointwise op over `[rows, ·]` may emit at:
+///
+/// * **the op width** — the floored device width, dropped to what the placement holds when the
+///   excess is provably the floor's own pad (unchanged law); and
+/// * **the storage width** — what the placement holds PER ROW (the whole-view width the tensors
+///   are stored at, not any one chunk's), which is what the operand handles declare so the
+///   operand mint checks every swept window against the storage that actually holds it.
+///
+/// # ⛔⛔⛔ A PLACEMENT SMALLER THAN THE PROGRAM'S OWN WIDTH IS AN `Err`, NEVER A CAP
+///
+/// `view_cols` is the program's own width — the region's view, the columns the program
+/// states. When the narrowest placement among `names` holds LESS than that, the emission would
+/// have to compute fewer columns than the program states to fit — the SILENT wrong answer this
+/// function used to produce whenever its reproduction proof passed vacuously (the measured
+/// case: a `[512, 512]` whole-view mask add over a validity-shaped `[1, 139776]` reservation —
+/// `held = 279552/512` B/row → 273 elems → floor-stick 256, and `for_pointwise(256) == 512`
+/// "reproduced" the asked width, so the add baked at `[512, 256]`, half the causal triangle
+/// unswept and half the output unwritten while downstream max/sub/exp read all 512). Under the
+/// Win ruling that is unreachable: the refusal names the tensor, its placement and the width
+/// the program states, and the build fails instead of the descriptor lying.
+///
+/// The floor-drop band is unchanged and still legal: `view_cols ≤ held < cols` with the
+/// reproduction proof (`for_pointwise(held) == cols`) drops only the pad this rule's own floor
+/// added. A placement that holds AT LEAST the program's width but not the floor is the
+/// measured decoder-intermediate case (a `[64, 64]` score tile whose 64 columns `for_pointwise`
+/// bumps to the 8-stick occupancy floor) — the op emits at `held` and every byte is one the
+/// program states.
 fn pointwise_width_the_output_holds(
     layout: Option<&BundleLayout>,
     names: &[&str],
     rows: u32,
+    view_cols: u32,
     cols: u32,
-) -> u32 {
-    let Some(l) = layout else { return cols };
+) -> Result<(u32, u32), Error> {
+    let Some(l) = layout else {
+        // No layout (every unit test; the gate probes): the op keeps its floored width and the
+        // storage is the whole view at the same padding law.
+        return Ok((cols, DeviceWidth::for_pointwise(view_cols).get()));
+    };
     if rows == 0 {
-        return cols;
+        return Ok((cols, cols));
     }
     // ⭐ EVERY TENSOR THE OP ADDRESSES AT `cols`, NOT JUST THE OUTPUT. `cols` sizes the input view and
     // the output view alike, so the pad is only real if BOTH hold it — and MEASURED, the one that did
@@ -1728,16 +2066,33 @@ fn pointwise_width_the_output_holds(
         Some(((row_bytes / 2) as u32 / FP16_ELEMS_PER_STICK) * FP16_ELEMS_PER_STICK)
     };
     let Some(held) = names.iter().filter_map(|n| held_of(n)).min() else {
-        return cols;
+        return Ok((cols, cols));
     };
+    // ⛔⛔⛔ THE PROGRAM'S OWN WIDTH IS THE FLOOR OF THE LEGAL — a placement that cannot hold it is a
+    // reservation defect (the prefix-continuation mask's validity-shaped reservation under a
+    // whole-view score mask), and satisfying it with a narrower descriptor computes fewer columns
+    // than the program states. Refused BY NAME; never capped.
+    if held > 0 && held < view_cols {
+        let who = names
+            .iter()
+            .find(|n| held_of(n) == Some(held))
+            .copied()
+            .unwrap_or(names.first().copied().unwrap_or("the operand"));
+        return err(format!(
+            "a pointwise op over a [{rows}, {view_cols}] view whose narrowest placement '{who}' \
+             holds only {held} columns per row — the placement cannot hold the width the program \
+             itself states, so the only descriptor that fits would compute fewer columns than the \
+             program. This is a reservation defect, not a pad to drop: reserve '{who}' at the width \
+             the program states (or wider), or state the program's true width."
+        ));
+    }
     // THE PROOF: re-pad what the layout holds and require it to REPRODUCE the width we were about to
-    // emit. Only then is the excess demonstrably this rule's own pad; anything else is a genuine
-    // over-run and must still reach the footprint guard and be refused BY NAME, rather than be quietly
-    // satisfied by a narrower descriptor computing fewer columns than the program states.
+    // emit. Only then is the excess demonstrably this rule's own pad; anything else keeps `cols` and
+    // the operand mint / the footprint guard refuse the genuine over-run BY NAME.
     if held > 0 && held < cols && DeviceWidth::for_pointwise(held).get() == cols {
-        held
+        Ok((held, held))
     } else {
-        cols
+        Ok((cols, held.max(cols)))
     }
 }
 
@@ -1804,10 +2159,12 @@ mod pointwise_width_caps {
         l
     }
 
-    /// The width the guard returns for a single placed operand of `size` bytes at `cols`.
-    fn width_for(size: u64, cols: u32) -> u32 {
+    /// The OP width the guard returns for a single placed operand of `size` bytes, a program
+    /// view of `view` columns and a floored ask of `cols`.
+    fn width_for(size: u64, view: u32, cols: u32) -> Result<u32, Error> {
         let l = placed(size);
-        pointwise_width_the_output_holds(Some(&l), &[&act_name(1)], ROWS, cols)
+        pointwise_width_the_output_holds(Some(&l), &[&act_name(1)], ROWS, view, cols)
+            .map(|(op, _)| op)
     }
 
     /// ⛔ CASE (a) — THE MEASURED OVER-RUN. `qk · QK_SCALE` writes a `[64, 64]` tile;
@@ -1816,10 +2173,10 @@ mod pointwise_width_caps {
     #[test]
     fn an_under_reserved_intermediate_caps_the_pointwise_width() {
         assert_eq!(
-            width_for(64 * 64 * 2, 512),
+            width_for(64 * 64 * 2, 64, 512).expect("the floor pad drops"),
             64,
             "a `[64, 64]` tile holds 64 columns; emitting 512 is the measured \
-             `0B + 65536B exceeds footprint 8192B` refusal"
+             `0B + 65536B exceeds footprint 8192B` refusal — the floor's own pad, dropped"
         );
     }
 
@@ -1829,22 +2186,30 @@ mod pointwise_width_caps {
     #[test]
     fn a_fully_reserved_tensor_keeps_the_padded_width() {
         assert_eq!(
-            width_for(u64::from(ROWS) * 512 * 2, 512),
+            width_for(u64::from(ROWS) * 512 * 2, 512, 512).expect("the pad is reserved"),
             512,
             "when the layout reserves the padded width the pad is REAL and nothing may move"
         );
     }
 
-    /// ⛔ CASE (c) — A SHORTFALL THAT IS NOT THIS RULE'S PAD IS LEFT TO THE FOOTPRINT GUARD.
-    /// `for_pointwise(512)` is 512, which does not reproduce the 1024 asked for, so this is a real
-    /// over-run: `cols` comes back unchanged and the refusal happens by name. Remove the reproduction
-    /// check and this returns 512 while (a) and (b) stay green.
+    /// ⛔ CASE (c) — A PLACEMENT SMALLER THAN THE PROGRAM'S OWN WIDTH IS REFUSED HERE, BY NAME.
+    /// The program states 1024 columns and the placement holds 512: the only descriptor that
+    /// fits would compute fewer columns than the program states — the silent wrong answer this
+    /// cap used to reach the footprint guard with (and, when the reproduction proof passed
+    /// vacuously, to bake — the `[512, 512]` mask add capped to `[512, 256]`). Under the Win
+    /// ruling the refusal happens at the width choice itself.
     #[test]
-    fn a_shortfall_that_is_not_this_rules_pad_is_left_to_the_footprint_guard() {
-        assert_eq!(
-            width_for(u64::from(ROWS) * 512 * 2, 1024),
-            1024,
-            "512 does not re-pad to 1024, so this is a real over-run and must NOT be narrowed away"
+    fn a_shortfall_below_the_programs_own_width_is_refused_by_name() {
+        let Err(e) = width_for(u64::from(ROWS) * 512 * 2, 1024, 1024) else {
+            panic!(
+                "a placement holding 512 of a 1024-column program was ACCEPTED — the only \
+                    descriptor that fits computes half the columns the program states"
+            )
+        };
+        assert!(
+            e.message.contains("reservation defect") && e.message.contains("[64, 1024]"),
+            "the refusal names the defect and the shape: {}",
+            e.message
         );
     }
 
@@ -1861,16 +2226,50 @@ mod pointwise_width_caps {
             .insert(narrow.to_string(), 64 * 64 * 2);
         let out = act_name(1);
         assert_eq!(
-            pointwise_width_the_output_holds(Some(&l), &[&out, narrow], ROWS, 512),
+            pointwise_width_the_output_holds(Some(&l), &[&out, narrow], ROWS, 64, 512)
+                .expect("the narrow input's floor pad drops")
+                .0,
             64,
             "the INPUT is the operand that does not hold the pad, and it lives in the synth \
              allocator rather than in `placements` — both halves of the bug this once had"
         );
         assert_eq!(
-            pointwise_width_the_output_holds(Some(&l), &[&out], ROWS, 512),
+            pointwise_width_the_output_holds(Some(&l), &[&out], ROWS, 64, 512)
+                .expect("the output alone holds the pad")
+                .0,
             512,
             "reading ONLY the output finds nothing wrong, which is why the minimum is taken over \
              every tensor the op addresses"
+        );
+    }
+
+    /// ⛔⛔⛔ THE VACUOUS PROOF — the measured silent cap this function's `Err` exists to make
+    /// unreachable. A `[512, 512]` whole-view mask add over a validity-shaped `[1, 139776]`
+    /// reservation: `held = 279552/512` B/row → 273 elems → floor-stick 256, and
+    /// `for_pointwise(256) == 512` "reproduced" the asked width — so the old cap narrowed the add
+    /// to `[512, 256]`, sweeping half the causal triangle and leaving half the output unwritten
+    /// while downstream max/sub/exp read all 512. The proof passing is EXACTLY what must not
+    /// satisfy a placement smaller than the program's own 512-column view.
+    #[test]
+    fn a_vacuously_reproducing_reservation_is_refused_not_capped() {
+        // The pod's own numbers: 279552 B over 512 rows → 273 elems/row → floor-stick 256.
+        let l = placed(279552);
+        let Err(e) = pointwise_width_the_output_holds(
+            Some(&l),
+            &[&act_name(1)],
+            512,
+            512,
+            DeviceWidth::for_pointwise(512).get(),
+        ) else {
+            panic!(
+                "the vacuous reproduction was ACCEPTED — the add bakes at [512, 256] and half \
+                    the causal triangle is never swept"
+            )
+        };
+        assert!(
+            e.message.contains("reservation defect"),
+            "the refusal names the class: {}",
+            e.message
         );
     }
 }
@@ -2779,13 +3178,19 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
         // by a `[1, hd]` matmul, so reading it as `[1, stick]` slices declares a second arrangement for
         // one tensor and the arrangement authority rejects the bundle. Making decode stick-wide means
         // making the P matmul stick-wide too, which is a different rotate formulation, not a slice.
+        //
+        // ⭐ TRUE EXTENTS, not `rbo`'s `1×64` annotation: every rope buffer — x/cos/sin (the worker's
+        // `[mq, total]` plane) and the rot/xc/rs intermediates — is `[mq, total]` in elements, and this
+        // op's `[1, hd]` window rides a `rope_prefill_block_offset` corner of it. The mint reads the
+        // handle's dims as the BOUND (#731's door), so the annotation lie is now a refusal; the builder
+        // reads name + kind only, so the emission is byte-identical.
         let op = pointwise_broadcast_opspec_df(
             op_func_from_str(f),
             1,
             hd,
             &[
-                In::sliced(&rbo(a), aoff).ew(),
-                In::sliced(&rbo(b), boff).ew(),
+                In::sliced(&rb(a, mq, total), aoff).ew(),
+                In::sliced(&rb(b, mq, total), boff).ew(),
             ],
             o,
             ooff.into(),
@@ -2950,13 +3355,16 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                        ooff: crate::addr::DevOff,
                        sib: &mut i64|
          -> Result<(), Error> {
+            // ⭐ TRUE EXTENTS (`[mq, total]`), not `rbo`'s `1×64` annotation — the slab windows are
+            // corners of the same `[mq, total]` plane `ew_ph` reads (see its note); the mint reads the
+            // dims as the bound and the builder reads name + kind only.
             let op = pointwise_broadcast_opspec_df(
                 op_func_from_str(f),
                 mq,
                 stk,
                 &[
-                    In::sliced(&rbo(a), aoff).ew(),
-                    In::sliced(&rbo(b), boff).ew(),
+                    In::sliced(&rb(a, mq, total), aoff).ew(),
+                    In::sliced(&rb(b, mq, total), boff).ew(),
                 ],
                 o,
                 ooff.into(),
@@ -3121,9 +3529,9 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             "multiply",
             rows_all,
             cols_all,
-            In::full(&rbo(&x)),
-            In::full(&rbo(&cos)),
-            &rbo(&xc),
+            In::full(&rb(&x, mq, total)),
+            In::full(&rb(&cos, mq, total)),
+            &rb(&xc, mq, total),
             sym_id_base,
             layout,
         ));
@@ -3132,9 +3540,9 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             "multiply",
             rows_all,
             cols_all,
-            In::full(&rbo(&rot)),
-            In::full(&rbo(&sin)),
-            &rbo(&rs),
+            In::full(&rb(&rot, mq, total)),
+            In::full(&rb(&sin, mq, total)),
+            &rb(&rs, mq, total),
             sym_id_base,
             layout,
         ));
@@ -3146,9 +3554,9 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             "add",
             rows_all,
             cols_all,
-            In::full(&rbo(&xc)),
-            In::full(&rbo(&rs)),
-            &rbo(&out),
+            In::full(&rb(&xc, mq, total)),
+            In::full(&rb(&rs, mq, total)),
+            &rb(&out, mq, total),
             sym_id_base,
             layout,
         ));
@@ -3204,13 +3612,17 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                        ooff: crate::addr::DevOff,
                        sib: &mut i64|
          -> Result<(), Error> {
+            // ⭐ TRUE EXTENTS, not `rbo`'s `1×64` annotation: this branch reads every buffer as the
+            // `[rows, hd]` image — the same elements the `[heads*mq, hd]` synth above reserves (the
+            // callers pass `all = heads*mq`) — so the handle states the swept window's own extent. The
+            // mint reads the dims as the bound; the builder reads name + kind only.
             let op = pointwise_broadcast_opspec_df(
                 op_func_from_str(f),
                 rows,
                 hd,
                 &[
-                    In::sliced(&rbo(a), aoff).ew(),
-                    In::sliced(&rbo(b), boff).ew(),
+                    In::sliced(&rb(a, rows, hd), aoff).ew(),
+                    In::sliced(&rb(b, rows, hd), boff).ew(),
                 ],
                 o,
                 ooff.into(),
@@ -3878,8 +4290,15 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
                     crate::sdsc_abstract::QueryRowCount::of_mq(mq),
                 ),
                 crate::sdsc_abstract::BlockCols::of_feature_cols(nqh * hd),
-                &[In::full(&rbo(&q)).ew(), In::scalar(&rbo(&sqrt_scale)).ew()],
-                &rbo(&qs),
+                // ⭐ TRUE EXTENTS, not `rbo`'s `1×64` annotation: the qs synthetic above reserves
+                // `[mq, nqh*hd]` and Q is the same plane, so both handles state the swept extent —
+                // the mint's bound. The `[1,1]` √scale keeps `rbo`: one RedStick IS its whole
+                // swept window.
+                &[
+                    In::full(&rb(&q, mq, nqh * hd)).ew(),
+                    In::scalar(&rbo(&sqrt_scale)).ew(),
+                ],
+                &rb(&qs, mq, nqh * hd),
                 crate::addr::DevOff::ZERO,
                 sym_id_base,
                 layout,
@@ -3891,10 +4310,10 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
                 crate::sdsc_abstract::RowCount::of_padded_chunk_rows(mq_pad),
                 crate::sdsc_abstract::BlockCols::of_feature_cols(nkvh * hd),
                 &[
-                    In::full(&rbo(&new_k_rep)).ew(),
+                    In::full(&rb(&new_k_rep, mq_pad.row_axis_extent(), nkvh * hd)).ew(),
                     In::scalar(&rbo(&sqrt_scale)).ew(),
                 ],
-                &rbo(&new_k_scaled),
+                &rb(&new_k_scaled, mq_pad.row_axis_extent(), nkvh * hd),
                 crate::addr::DevOff::ZERO,
                 sym_id_base,
                 layout,
@@ -4369,14 +4788,21 @@ pub fn kv_cache_write(
             &format!("attn_kctpost{kvh}{rq}{pt}_o{t}"),
             crate::sdsc_abstract::KtTileSlots::of_page(),
             crate::sdsc_abstract::KtTileFeats::of_head_dim(hd),
-            kc,
+            // ⭐ BOTH HANDLES AT THE PLANE'S OWN LAW — `pool.addr` is PLANE-RELATIVE (each plane is
+            // its own named tensor; the plane base is implicit in which name an op takes), so the
+            // bound the mint states is the plane's own `plane_stride()` — the one number that sizes
+            // the pool's placement, stated by the same function the offsets come from. The window is
+            // ONE block (`[PAGE_SLOTS, hd]`), which the pool's own doctest pins inside the stride
+            // for every head the block table can name; a kv head past `nkvh` now refuses HERE
+            // instead of re-transposing another plane's bytes into Kᵀ.
+            &rb(kc, 1, pool.plane_stride() as u32),
             // The two planes are the whole content of this op: it reads natural K and writes Kᵀ, both at
             // the same `(kv head)` block of the page the launch was shifted to.
             crate::addr::DevOff::from_view_step(pool.addr(crate::sdsc_abstract::KvCoord::block(
                 crate::sdsc_abstract::KvPlane::Knat,
                 kv_head_of(kvh, nkvh)?,
             ))),
-            kct,
+            &rb(kct, 1, pool.plane_stride() as u32),
             crate::addr::DevOff::from_view_step(pool.addr(crate::sdsc_abstract::KvCoord::block(
                 crate::sdsc_abstract::KvPlane::Kt,
                 kv_head_of(kvh, nkvh)?,
@@ -4500,8 +4926,12 @@ pub fn lmlast(
     if let Some(l) = layout {
         l.synth(PlaceId::Act(out.tid), &[1, hidden]);
     }
-    let src_name = rb(&src.name(), 1, stk);
-    let dst = rbo(&out.name());
+    // ⭐ TRUE EXTENTS, not the `[1, stk]`/`rbo` staging annotations: the source IS the `[mq, hidden]`
+    // prompt buffer and the destination IS the `[1, hidden]` staging the synth above reserves, so the
+    // handles state the buffers the corners below address — the mint's bound. The stick walk's last
+    // window ends exactly at `mq*hidden` / `hidden` elements respectively.
+    let src_name = rb(&src.name(), mq, hidden);
+    let dst = rb(&out.name(), 1, hidden);
     Ok((0..hidden / stk)
         .map(|j| {
             assemble_pointwise_broadcast_off(
@@ -5106,12 +5536,16 @@ pub fn transpose(
     // on `distribute_cores`' answer for this shape. Restating that here would mean duplicating the
     // divider; a panicking assembler would abort the build with a bare panic where a producer needs an
     // error against its own op.
+    // ⭐ THE HANDLES STATE THE VIEWS THE CHECKS ABOVE ALREADY PROVED: `[mb, cols]` in, `[cols, mb]`
+    // out — whole buffers, both sides, by this body's own whole-view law. The mint's new fact is the
+    // PLACEMENT half: a view can be whole while the reservation behind its name is smaller, which
+    // bakes clean and overruns into the next tensor's bytes.
     super::try_assemble_restickify_transpose_2d(
         &format!("transpose_o{}", out.tid),
         mb,
         cols,
-        &a.name(),
-        &out.name(),
+        &rb(&a.name(), mb, cols),
+        &rb(&out.name(), cols, mb),
         sym_id_base,
         layout,
     )
@@ -5150,7 +5584,31 @@ pub fn split_out(
 ///
 /// `skip_tids` comes from [`gather_of`], i.e. from the program, never from a caller's assumption about
 /// which parameter is an index.
+///
+/// ⛔ EVERY OPERAND THESE BODIES EMIT IS BASE-ADDRESSED, so a stated row corner cannot ride one
+/// ([`base_addressed`]'s own argument). The windowed pointwise arm is the one emitter that CAN place a
+/// row corner, and it splits through [`split_regions`] directly — this guard is what keeps every other
+/// body from silently reading row 0 of a cornered operand.
 pub fn split_out_excluding(
+    name: &str,
+    r: &[Region],
+    layout: Option<&BundleLayout>,
+    arity: usize,
+    skip_tids: &[u32],
+) -> Result<(Vec<Region>, Region), Error> {
+    let (ins, out) = split_regions(name, r, layout, arity, skip_tids)?;
+    base_addressed(name, &out, "output")?;
+    for (i, x) in ins.iter().enumerate() {
+        base_addressed(name, x, &format!("input {i}"))?;
+    }
+    Ok((ins, out))
+}
+
+/// [`split_out_excluding`]'s SPLIT — the is_out/scale/skip filter and the arity check, with NO
+/// addressing guard. The door the windowed pointwise arm needs: its operands carry row corners the
+/// per-operand window emission places, so which operands are inputs is a fact about the parameter
+/// list, not about how any one body addresses them.
+fn split_regions(
     name: &str,
     r: &[Region],
     layout: Option<&BundleLayout>,
@@ -5176,11 +5634,6 @@ pub fn split_out_excluding(
             "{name}: {} tensor input(s) for an op that reads {arity}",
             ins.len()
         ));
-    }
-    // Every operand these bodies emit is base-addressed; a stated row corner cannot ride one.
-    base_addressed(name, &out, "output")?;
-    for (i, x) in ins.iter().enumerate() {
-        base_addressed(name, x, &format!("input {i}"))?;
     }
     Ok((ins, out))
 }
@@ -5377,6 +5830,208 @@ mod elementwise_tests {
         .expect("a [1, n] row vector is the mb-broadcast operand mode");
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].op_name, "multiply_o7");
+    }
+
+    /// ⭐⭐⭐ THE ROW-SPLIT (Y) MODE NOW EMITS — the J-slot merge's own op at its production
+    /// geometry: the subtract whose operands are the `[256, 4]` score tile (dense) and the
+    /// `[64, 4]` merged max (the J-reduce's output, one spray's worth of rows), under a
+    /// `[256, 4]` output — the exact regions the batched paged-decode kernel's broadcast chain
+    /// resolves to. One op, still `sub_o*`: the operand mode is addressing, not a
+    /// decomposition, and the frame law (`RegionFrame::split_rows`) has already re-proven
+    /// `rows == y*mb` and the single-stick source before any operand was built.
+    #[test]
+    fn a_stated_y_broadcast_operand_emits_one_op() {
+        let r = node(
+            reg(5, 256, 4, false),
+            reg(6, 64, 4, false),
+            reg(7, 256, 4, true),
+        );
+        let mut sym = 0i64;
+        let ops = elementwise(
+            "sub_s3",
+            Elementwise::Sub,
+            &r,
+            &[None, Some(BcastAxis::Y(4))],
+            &mut sym,
+            None,
+        )
+        .expect("the J-slot merge's subtract is the row-split operand mode");
+        assert_eq!(ops.len(), 1, "an operand mode is not a decomposition");
+        assert_eq!(
+            ops[0].op_name, "sub_o7",
+            "the descriptor NAME must not change with the operand mode — it feeds the bundle \
+             fingerprint, and the row-split arm is the same op",
+        );
+    }
+
+    /// ⭐ AND THE DESCRIPTOR STATES THE Y-MAJOR FRAME — the same op built directly at the
+    /// `OpSpec` door, pinning what the bake actually receives: the plan walks `mb=64` (one
+    /// spray's worth of rows), `out=64` (the ONE stick the frame law allows), `y=4` (the spray
+    /// count); every tensor's layout is `["y", "mb", "out"]`; and the merged source's scale is
+    /// `RedNonStick` on the `y` slot — the vendor's reduced-dim law, the stride-0 read that
+    /// addresses `source[b, c]` at `result[j, b, c]` byte for byte.
+    #[test]
+    fn the_row_split_op_states_the_y_major_frame() {
+        use crate::superdsc_opspec::Scale;
+        let dense_h = rb("t5", 256, 64);
+        let merged_h = rb("t6", 64, 64);
+        let dense = In::full(&dense_h).ew();
+        let merged = In::y_broadcast(&merged_h, 4).ew();
+        let op = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
+            &pointwise_tile_op(64, 64, 4, 3),
+            256,
+            64,
+            op_func_from_str("sub"),
+            &[dense, merged],
+            "t7",
+            crate::addr::OutCorner::ZERO,
+            false,
+            None,
+            crate::work::CoreDivision::Ew(EwDivision::Law),
+        )
+        .expect("the row-split op emits");
+        assert_eq!(op.iter.extent("mb"), 64, "mb is one spray's worth of rows");
+        assert_eq!(
+            op.iter.extent("out"),
+            64,
+            "out is the ONE stick the frame law allows"
+        );
+        assert_eq!(op.iter.extent("y"), 4, "y is the spray count");
+        for a in &op.args {
+            assert_eq!(
+                a.view().layout,
+                &["y", "mb", "out"] as &[&'static str],
+                "every tensor presents y-major in the row-split mode: {}",
+                a.view().name
+            );
+        }
+        let merged_view = op
+            .args
+            .iter()
+            .find(|a| a.view().name == "t6")
+            .expect("the merged source's arg")
+            .view();
+        assert_eq!(
+            merged_view.scale,
+            &[Scale::RedNonStick, Scale::Active, Scale::Active] as &[Scale],
+            "the spray dim is the stride-0 read — the vendor's reduced-dim law"
+        );
+    }
+
+    /// ⛔ THE TILE AND THE OPERANDS MUST AGREE ON THE SPRAY COUNT — a `TileOp` whose `y` dim
+    /// states a different count than the y-broadcast operands spray is a caller that built its
+    /// tile from a different shape than its operands, and the tiler's iteration space and the
+    /// operands' addressing would read different bytes. Refused by name.
+    #[test]
+    fn a_tile_that_disagrees_with_the_spray_count_is_refused() {
+        let dense_h = rb("t5", 256, 64);
+        let merged_h = rb("t6", 64, 64);
+        let dense = In::full(&dense_h).ew();
+        let merged = In::y_broadcast(&merged_h, 4).ew();
+        let Err(m) = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
+            &pointwise_tile_op(64, 64, 2, 3),
+            256,
+            64,
+            op_func_from_str("sub"),
+            &[dense, merged],
+            "t7",
+            crate::addr::OutCorner::ZERO,
+            false,
+            None,
+            crate::work::CoreDivision::Ew(EwDivision::Law),
+        ) else {
+            panic!("a tile stating y=2 over operands that spray 4 must not emit");
+        };
+        assert!(
+            m.contains("the TileOp's `y` dim states") && m.contains("spray 4"),
+            "states both counts: {m}"
+        );
+    }
+
+    /// ⛔ THE SINGLE-STICK LAW AT THE OPSPEC DOOR — a row-split op wider than one stick did not
+    /// come through the Y admission (the spray's source is single-stick by the frame law), and
+    /// emitting it would address a wide op in a frame built for one stick. Refused by name.
+    #[test]
+    fn a_row_split_op_wider_than_one_stick_is_refused() {
+        let dense_h = rb("t5", 256, 128);
+        let merged_h = rb("t6", 64, 128);
+        let dense = In::full(&dense_h).ew();
+        let merged = In::y_broadcast(&merged_h, 4).ew();
+        let Err(m) = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
+            &pointwise_tile_op(64, 128, 4, 3),
+            256,
+            128,
+            op_func_from_str("sub"),
+            &[dense, merged],
+            "t7",
+            crate::addr::OutCorner::ZERO,
+            false,
+            None,
+            crate::work::CoreDivision::Ew(EwDivision::Law),
+        ) else {
+            panic!("a row-split op at cols=128 must not emit");
+        };
+        assert!(
+            m.contains("a row-split (y-broadcast) op at cols=128"),
+            "names the width and the law: {m}"
+        );
+    }
+
+    /// ⛔ THE FRAME LAW AT THE CONSUMER DOOR — an output whose rows do not split into exactly
+    /// `y` sprays of the source's rows (`250` into 4 sprays of 62 — 248, two short) is refused
+    /// by the frame law BEFORE any want check or operand is built: the split the bytes do not
+    /// support is a build failure, not a wrong-byte bake.
+    #[test]
+    fn an_output_whose_rows_do_not_split_is_refused_by_the_frame_law() {
+        let r = node(
+            reg(5, 250, 4, false),
+            reg(6, 62, 4, false),
+            reg(7, 250, 4, true),
+        );
+        let mut sym = 0i64;
+        let Err(e) = elementwise(
+            "sub_s3",
+            Elementwise::Sub,
+            &r,
+            &[None, Some(BcastAxis::Y(4))],
+            &mut sym,
+            None,
+        ) else {
+            panic!("250 rows do not split into 4 sprays of 62 — the frame law must refuse");
+        };
+        assert!(
+            e.message.contains("rows == y*mb"),
+            "names the frame law's own arithmetic: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ AND THE MULTI-STICK OUTPUT — a `[256, 128]` output under a row-split flag: the
+    /// source would have to be multi-stick, which the split law refuses (the split's `out` dim
+    /// IS the one stick). Refused by name at the same door.
+    #[test]
+    fn a_multi_stick_output_under_a_row_split_flag_is_refused() {
+        let r = node(
+            reg(5, 256, 128, false),
+            reg(6, 64, 128, false),
+            reg(7, 256, 128, true),
+        );
+        let mut sym = 0i64;
+        let Err(e) = elementwise(
+            "sub_s3",
+            Elementwise::Sub,
+            &r,
+            &[None, Some(BcastAxis::Y(4))],
+            &mut sym,
+            None,
+        ) else {
+            panic!("a multi-stick row-split source must not emit");
+        };
+        assert!(
+            e.message.contains("SINGLE stick column"),
+            "names the single-stick law: {}",
+            e.message
+        );
     }
 
     /// ⛔⛔⛔ THE AXIS AND THE EXTENT MUST AGREE, and this is the refusal that makes the flag a
@@ -5627,11 +6282,13 @@ mod elementwise_tests {
         ];
         for o in EXTENTS {
             let out = reg(7, o.0, o.1, true);
-            // UNARY: one input, so the quantifier is exercised at arity 1.
+            // UNARY: one input, so the quantifier is exercised at arity 1. The basis is the
+            // output's own rows — `reg` mints a whole-view region, the shape `pointwise_rows`
+            // reads `v_rows` off.
             for a in EXTENTS {
                 let ins = [reg(5, a.0, a.1, false)];
                 assert_eq!(
-                    pointwise_extents_agree("p", Elementwise::Silu, &ins, &out).is_ok(),
+                    pointwise_extents_agree("p", Elementwise::Silu, &ins, &out, o.0).is_ok(),
                     a == o,
                     "unary out={o:?} in={a:?}"
                 );
@@ -5641,7 +6298,7 @@ mod elementwise_tests {
                 for b in EXTENTS {
                     let ins = [reg(5, a.0, a.1, false), reg(6, b.0, b.1, false)];
                     assert_eq!(
-                        pointwise_extents_agree("p", Elementwise::Add, &ins, &out).is_ok(),
+                        pointwise_extents_agree("p", Elementwise::Add, &ins, &out, o.0).is_ok(),
                         a == o && b == o,
                         "binary out={o:?} in0={a:?} in1={b:?}"
                     );
@@ -5851,11 +6508,15 @@ mod elementwise_tests {
         }
     }
 
-    /// ⛔ UNEQUAL CORNERS ARE REFUSED, not zipped: the tiling front end mints ONE window shared
-    /// by every operand of a chunk, so a producer that windowed operands by hand is a shape this
-    /// door names rather than guessing which corner to use.
+    /// ⭐ UNEQUAL CORNERS ARE CARRIED PER-OPERAND, not refused: a rotate-half rope pairs the
+    /// halves' windows over ONE view (`x1` at columns `[0, 64)` against `x2` at `[64, 128)` of the
+    /// same tensor), and each product's operands sit at their OWN corners — no single shared
+    /// corner states that. The law here used to refuse every unequal pair, because the tiling
+    /// front end mints one window per operand set and nothing else was known to reach the arm;
+    /// the per-operand window emission makes the corner an operand fact, and the class law
+    /// ([`column_windows_are_honoured`]) is what holds each binding to its own region's corner.
     #[test]
-    fn unequal_input_corners_are_refused_by_name() {
+    fn unequal_input_corners_are_carried_per_operand() {
         let rows = 25u32;
         let r = vec![
             chunked(5, rows, 8192, 7168, 15360, false),
@@ -5863,13 +6524,27 @@ mod elementwise_tests {
             chunked(7, rows, 8192, 7168, 15360, true),
         ];
         let mut sym = 0i64;
-        let Err(e) = elementwise("mul_s23", Elementwise::Mul, &r, &[], &mut sym, None) else {
-            panic!("operands at different corners must refuse, not pick one")
+        let ops = elementwise("mul_s23", Elementwise::Mul, &r, &[], &mut sym, None)
+            .expect("operands at different corners lower, each at its own");
+        // The class law holds every binding to its OWN region's corner — t6 at 0, t5 and the
+        // output at the stick-block corner of column 8192.
+        column_windows_are_honoured("mul_s23", &r, &ops)
+            .expect("each operand is addressed at its own corner");
+        let off = |ops: &Vec<EmittedOp>, buf: String| {
+            ops[0]
+                .arg_bindings
+                .iter()
+                .find(|b| b.buffer == buf)
+                .unwrap_or_else(|| panic!("a binding for {buf}"))
+                .offset_elems
         };
-        assert!(
-            e.message.contains("t6@0"),
-            "names the operand and its corner: {}",
-            e.message
+        assert_eq!(off(&ops, r[1].name()), 0, "t6 reads at its own corner 0");
+        let corner = (8192 / FP16_ELEMS_PER_STICK) * rows * FP16_ELEMS_PER_STICK;
+        assert_eq!(off(&ops, r[0].name()), corner, "t5 reads at its own corner");
+        assert_eq!(
+            off(&ops, r[2].name()),
+            corner,
+            "the output writes its own corner"
         );
     }
 
@@ -6047,7 +6722,7 @@ mod elementwise_tests {
             panic!("a piece written at the buffer base must be refused")
         };
         assert!(
-            e.message.contains("t7") && e.message.contains("column 8192"),
+            e.message.contains("t7") && e.message.contains("columns 8192..16384"),
             "names the tensor and its window: {}",
             e.message
         );
@@ -6347,7 +7022,9 @@ pub fn windowed_rmsnorm(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
-    use crate::ir::bridge::tiled_op_sdsc_op::assemble_reduce_off;
+    use crate::ir::bridge::tiled_op_sdsc_op::{
+        assemble_reduce_off, win_reduce_accum, win_reduce_data,
+    };
     let unit = matches!(
         k.program,
         crate::ktir_node::Program::WindowedRmsNorm { unit: true }
@@ -6512,15 +7189,31 @@ pub fn windowed_rmsnorm(
         ));
         // 2. mean(x²) — the per-head reduce: data at the window (block-aligned), accum at
         //    its own head's buffer at ZERO (the fp8 amax-partial shape).
+        let rmmean_op = format!("rmmean_{prefix}");
         ops.push(assemble_reduce_off(
-            &format!("rmmean_{prefix}"),
+            &rmmean_op,
             "mean",
             t_rows,
             f_cols,
-            &sq16_h,
-            win,
-            &mean_h,
-            crate::addr::DevOff::ZERO,
+            // The data window is head `h`'s `[m, d]` slab of the `[m, full]` square — `col_of`'s
+            // whole-block shift, minted against the buffer's own handle.
+            win_reduce_data(
+                layout,
+                &sq16_h,
+                win,
+                t_rows,
+                f_cols,
+                &format!("{rmmean_op}: squares"),
+            )
+            .map_err(|e| Error { message: e })?,
+            win_reduce_accum(
+                layout,
+                &mean_h,
+                crate::addr::DevOff::ZERO,
+                t_rows,
+                &format!("{rmmean_op}: mean"),
+            )
+            .map_err(|e| Error { message: e })?,
             sym_id_base,
             layout,
         ));
@@ -6662,19 +7355,22 @@ pub fn scalarweightmul(
 ) -> Result<Vec<EmittedOp>, Error> {
     // x, the weight, and the output — the parameters `KtirFunc::scalar_weight_mul` mints.
     let (tensors, out) = split_out(name, r, layout, 2)?;
-    pointwise_extents_agree(name, Elementwise::Mul, &tensors[0..1], &out)?;
-    check_pointwise_cols(out.c_len, "ScalarWeightMul", out.tid)?;
     let rows = node_rows(name, &out)?;
+    pointwise_extents_agree(name, Elementwise::Mul, &tensors[0..1], &out, rows)?;
+    check_pointwise_cols(out.c_len, "ScalarWeightMul", out.tid)?;
     let cols = out.c_len;
     let x = tensors[0].name();
     let w = tensors[1].name();
     let t = out.tid;
-    let x_h = rbo(&x);
+    // ⭐ TRUE EXTENTS, not `rbo`'s `1×64` annotation: the op sweeps `[rows, cols]` (the extents the
+    // `RowCount`/`BlockCols` slots below state), so x and the output declare exactly that — the
+    // mint's bound. The builder reads name + kind only.
+    let x_h = rb(&x, rows, cols);
     // The weight is `[1]` on disk and `[1, stick]` in its placement — the same
     // one-stick shape the rmsnorm's `[1,1]` epsilon const takes, read in the
     // same `In::scalar` broadcast mode (lane 0 sprayed over rows and cols).
     let w_h = rb(&w, 1, crate::work::FP16_ELEMS_PER_STICK);
-    let out_h = rbo(&out.name());
+    let out_h = rb(&out.name(), rows, cols);
     let op_name = format!("scalarmul_o{t}");
     Ok(vec![pw2(
         &op_name,
@@ -6793,8 +7489,11 @@ pub fn reshape(
     // multiples of `stk`, so `base % c_in` (and `base % c_out`) is a multiple of `stk` at most
     // `c − stk` — the 64-element run lies inside ONE row's column stick on both the input and
     // the output, one copy covers it, and no partial-stick address is ever formed.
-    let src_name = rb(&src.name(), 1, stk);
-    let dst = rbo(&out.name());
+    // ⭐ TRUE EXTENTS on both sides, not the `[1, stk]`/`rbo` staging annotations: the corners below
+    // are `rc_of` corners of each side's OWN `[r, c]` view, so the handles declare those views —
+    // the mint's bound. The stick walk's last window ends exactly at `total` elements on each side.
+    let src_name = rb(&src.name(), r_in, c_in);
+    let dst = rb(&out.name(), r_out, c_out);
     let n_sticks = total / u64::from(stk);
     let mut ops = Vec::with_capacity(n_sticks as usize);
     for q in 0..n_sticks {
@@ -6975,17 +7674,26 @@ fn scalarmul_scaled(
     // scheduler rejects). `for_pointwise` == the producer's `for_output` for macs≥2^20 producers. A no-op
     // for 64-aligned tensors (residual/embedding [.,4096]).
     //
-    // ⛔ AND THE PAD IS ONLY REAL IF SOMETHING RESERVED IT — capped at the width the OUTPUT's placement
-    // actually holds. See [`pointwise_width_the_output_holds`].
-    let cols = pointwise_width_the_output_holds(
+    // ⛔ AND THE PAD IS ONLY REAL IF SOMETHING RESERVED IT — the width pair: `cols` is what the op
+    // sweeps (the floored width, floor-dropped to what the placement holds), `store_cols` is what
+    // the placement holds per row (the whole-view storage the handles declare). A placement that
+    // cannot hold the program's own view width is an `Err` here — never a narrower descriptor.
+    // See [`pointwise_width_the_output_holds`].
+    let (cols, store_cols) = pointwise_width_the_output_holds(
         layout,
         &[&out_name, &x],
         rows,
+        out.v_cols,
         DeviceWidth::for_pointwise(out.c_len).get(),
-    );
+    )?;
     let scale_name = crate::place::act_name(scale_tid);
     let op_name = format!("scalarmul_o{}", out.tid);
-    let x_h = rbo(&x);
+    // ⭐ TRUE SHAPES, not `rbo` lies: the tile and output are declared at the `[rows, store_cols]`
+    // the placement actually holds per row (the whole-view storage — a chunked piece's corner sits
+    // past a piece-width declaration), and the op sweeps `cols` within it. The `[1,1]` scale keeps
+    // `rbo`: one RedStick IS its whole swept window.
+    let x_h = rb(&x, rows, store_cols);
+    let out_h = rb(&out_name, rows, store_cols);
     let scale_h = rbo(&scale_name);
     // `In::col_window` at corner 0 is field for field `In::full` in what it emits (corner 0 is a whole-block
     // shift, stick-major either way), so a whole-tensor ScalarMul (piece 0, and every node narrower than one
@@ -6993,7 +7701,7 @@ fn scalarmul_scaled(
     let inputs = [In::col_window(&x_h, corner).ew(), In::scalar(&scale_h).ew()];
     // ⭐ THE SAME `TileOp` `node_to_tile_ops`' ScalarMul arm declares: `out` at the DEVICE width
     // computed above, `n_operands: 2` (the scalar rides in the op, not as a tiled operand).
-    let mut tile_op = pointwise_tile_op(rows, cols, 2);
+    let mut tile_op = pointwise_tile_op(rows, cols, 1, 2);
     tile_op.kind = TileOpKind::PointwiseOrReduce { n_operands: 2 };
     // ⭐⭐⭐ THE GATHERED FORM IS THE SAME OP WITH AN INDEX OPERAND ON ITS FIRST INPUT — not a different
     // `opFuncName`. The shipped `dxp/test/test_gather_1core/sdsc_1.json` is an ordinary `identity`
@@ -7098,6 +7806,15 @@ fn scalarmul_scaled(
         // that refusal was lifted: `KTIR_WHOLE=1 bake_py embedding_granite`. `scalarmul` now DELEGATES
         // here, so there is one body and the drift class is gone rather than repaired.
         let gathered_inputs = [In::scalar(&scale_h).ew(), In::full(&x_h).ew()];
+        // ⭐ THE RUN, BUILT WHERE THE NODE'S ROWS ARE KNOWN — the program's stick-checked anchor
+        // plus the whole sticks this node's entries span ([`StickRun::covering`]). The constructor
+        // re-states the anchor check `gathers_of` already made, which is the point: the run is
+        // refused at the FIRST door that can see a mid-stick start, and a hand-built one cannot
+        // get behind it.
+        let run = crate::superdsc_opspec::StickRun::covering(g.first_entry.entries(), rows)
+            .map_err(|msg| Error {
+                message: format!("{name}: {msg}"),
+            })?;
         return crate::emit::assemble_pointwise_broadcast_gather(
             crate::emit::PointwiseGather {
                 op_name: &op_name,
@@ -7108,8 +7825,8 @@ fn scalarmul_scaled(
                 inputs: &gathered_inputs,
                 gathered_input: 1,
                 index_name: &crate::place::act_name(g.index_tid),
-                first_entry: g.first_entry,
-                o: &rbo(&out_name),
+                run,
+                o: &out_h,
             },
             sym_id_base,
             layout,
@@ -7127,7 +7844,7 @@ fn scalarmul_scaled(
         rows,
         cols,
         &inputs,
-        &rbo(&out_name),
+        &out_h,
         corner,
         sym_id_base,
         layout,
@@ -7142,46 +7859,42 @@ fn scalarmul_scaled(
 /// kind. A producer whose program states a bare `linalg.reduce` — every Triton `tl.sum(x, 1)` or
 /// `tl.max(x, 1)` that is not part of a recognised rmsnorm — had no entry point at all.
 ///
-/// # ⛔⛔⛔ A WIDE MULTI-ROW MAX IS REFUSED — THE SHARPEST SILENT WRONG ANSWER IN THIS FILE
+/// # ⭐ THE WIDE MULTI-ROW MAX LOWERS — THE REFUSAL THAT USED TO LIVE HERE MISREAD ITS ONE DIAGNOSTIC
 ///
-/// Inside `rows > 1` **AND** a reduced extent past ONE STICK, an on-card reduce-MAX mis-combines the
-/// per-stick partial maxima and hands back the SEED. That LOWERS, BAKES, produces a well-formed
-/// descriptor and exits 0 under `dxp_standalone`, which executes no arithmetic — so nothing in the
-/// compile path can see it, and a softmax built on it computes `exp(x - 0)` for every row. It is
-/// refused BY NAME instead.
+/// This door used to REFUSE `Max` at `rows > 1 && cols > 64` by name, on the reading that the
+/// on-card reduce-MAX "mis-combines the per-stick partial maxima and hands back the seed" inside
+/// exactly that cell. The template's own DDL refutes both halves of that sentence:
 ///
-/// ## ⭐⭐⭐ IT IS THE CONJUNCTION, AND EACH SINGLE-AXIS READING HAS A SHIPPING COUNTER-EXAMPLE
+/// * `summeanmaxexx2.ddl` seeds the identity ITSELF — `negInf`/`posInf`/`zero`/`one`
+///   `ddl.define_constant`s (`:69-72`) that the PE accumulator LRFs are initialized from (negInf
+///   for max at `:209`/`:235`, zero for sum), with the accumulator's HBM content read only on
+///   second-and-later reduce-dim chunk trips (`:159-196`, `:583-585`). The seed is not the
+///   accumulator's launch content, and a seed-win would read −65504, not 0.
+/// * The one diagnostic that ever measured the defect — `mxp = 0` over `[nqh, cap]`, 2026-07-28 —
+///   is the ZEROS-READ signature: `max(−65504, 0, x) = 0` for non-positive `x`, i.e. the reduced
+///   width walked its stick PADDING and the padding read a fresh buffer's zeros. And it predates
+///   the row-mixing fixes — `wire.rs`'s `group_stride` law records the same-era signature for a
+///   SUM ("summed a single stick across 32 consecutive rows (+ zero padding) instead of one
+///   row's 32 sticks → Σx²≈0 → amax≈0"), and that fix landed 2026-09-16 (`d878aceae`), with the
+///   `head_major` fix in the same window. The measured cell carried OUR addressing defect and
+///   OUR unmasked padding together; it could not have attributed itself to the reduce.
 ///
-/// Exactly ONE diagnostic ever measured this defect — `mxp = 0` over `[nqh, cap]` — and it moved the row
-/// count AND the width off their safe values TOGETHER, so on its own it cannot attribute the failure to
-/// either. Both single-axis readings were written down in this tree, and each is refuted by a different
-/// piece of hardware-proven emission:
+/// Both causes are closed in the emission: the addressing by the `group_stride`/`head_major`
+/// fixes — sum at `[rows>1, cols>64]` has been card-proven since (the rmsnorm prefill parity
+/// runs), and the template's sum and max paths differ only in compute type and internal seed —
+/// and the pad lanes by the SAMV coordinate masking
+/// ([`crate::superdsc_opspec::SamvCoordinateMask`], the vendor's own `_get_coordinate_mask`).
+/// torch-spyre lowers the wide multi-row max as ONE descriptor in ordinary production (SDPA's
+/// `torch.amax(scores, dim=-1)` over 512-wide = 8-stick tiles, pinned against CPU in their own
+/// test suite), so the shape is template-supported. The door lowers it.
 ///
-/// * **"`rows > 1` is the defect"** — refuted by [`attn.rs`](crate::ir::bridge::tiled_op_sdsc_op::attn),
-///   which records a per-row split TRIED AND REVERTED (2026-07-28) after direct comparison against the
-///   old proven flash-decode's `attn_bmax{b}_o{t}`: that code reduces MAX at `rows = nqh` (> 1) with
-///   `width` one stick, on real hardware, at 31 tok/s. Its `assemble_attn_block` `width` parameter states
-///   the safe regime and names the two other 64s it must not be confused with — "one stick for every live
-///   caller; `mq_pad` and the head dim are the other 64s it must not silently become".
-/// * **"`cols` past one stick is the defect"** — refuted by [`ktir_matmul_fp8`](crate::emit::ktir_matmul_fp8)'s
-///   `fq_amax_op`, the fp8 activation-quantize amax on EVERY fp8 matmul of every layer: it reduces MAX
-///   over the FULL hidden width `k` (2048/4096 — many sticks). At decode `m == 1` and that is the same
-///   rank-3 flat emission this door produces, proven on card at 41 tok/s.
+/// ⛔ THE ARBITER IS THE CARD, NOT THE COMPILE PATH: `dxp_standalone` executes no arithmetic, so
+/// no gate here can see numerics. The wide multi-row max is validated by the card gate — `[4,
+/// W>64]` max AND sum against the host reference, the `attn_bmax`-form and `fq_amax`-form
+/// no-regression runs, and the GQA-shared paged-attention twin flipping green.
 ///
-/// What the broken cell has that neither counter-example has is BOTH at once, and the conjunction is
-/// already named twice in the tree: `reduce.rs`'s `stickmajor` branch fires at exactly
-/// `rows > 1 && cols > 64`, and `ktir_matmul_fp8.rs` calls that regime "scrambled at rows>1 AND
-/// cols>64". Two readers each took half of it.
-///
-/// ## THE REMEDY IS TO TILE THE REDUCTION, NOT TO SPLIT ROWS
-///
-/// A genuinely wide max is tiled to one stick and combined — which is what `attention_flash.py` and
-/// `swiglu_mlp.py` pin `BLOCK_N = 64` for, as a CORRECTNESS constraint. It is NOT split into one reduce
-/// per row: that is the experiment `attn.rs` reverted, measured on hardware as zero behavioural change,
-/// and it costs `rows` descriptors per softmax for nothing.
-///
-/// `Sum` combines correctly multi-row at any width, and `Max` is correct at `rows == 1` (any width) and
-/// at one stick (any row count) — the decoder's `[64, 64]` softmax is the latter, so it lowers.
+/// `attention_flash.py` and `swiglu_mlp.py` still pin `BLOCK_N = 64` — that is those kernels'
+/// own work-division choice (and the fixtures' correctness constraint), not a door law.
 pub fn reduce(
     name: &str,
     kind: crate::ktir_node::ReduceKind,
@@ -7189,7 +7902,6 @@ pub fn reduce(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
-    use crate::ktir_node::ReduceKind;
     let (ins, out) = split_out(name, r, layout, 1)?;
     let data = ins[0];
     // The REDUCED extent is the data's column span and the result is one column per row. Read the
@@ -7202,40 +7914,10 @@ pub fn reduce(
             data.tid
         ));
     }
-    // ⛔⛔⛔ THE MEASURED DEVICE DEFECT, FIRST, so no other complaint can mask it.
-    //
-    // THE STICK WIDTH COMES FROM THE DATA FORMAT, NOT FROM A LITERAL 64. This door emits through
-    // `assemble_reduce_seeded` → `reduce_opspec`, the fp16 wrapper, so the reduced axis is an
-    // fp16 `StickExtent` and `Df::Fp16` is the format to ask. Asking it through
-    // `Df::elems_per_stick` (which defers to the type-level `DataFormat::ELEMS_PER_STICK`, the single
-    // source of truth) is what makes fp32's 32 and fp8/int8's 128 come out right BY CONSTRUCTION if a
-    // non-fp16 reduce is ever routed here — a literal would be silently wrong for three of the five
-    // formats, and a comment saying "64 is fp16's stick" would not travel with the code.
-    let stick = Df::Fp16.elems_per_stick();
-    if matches!(kind, ReduceKind::Max) && rows > 1 && cols > stick {
-        return err(format!(
-            "{name}: a `max` reduce over t{}'s {cols} columns × {rows} rows is REFUSED, and not \
-             because it cannot be described. THE REFUSED CELL IS THE CONJUNCTION: `rows > 1` AND a \
-             reduced extent past ONE STICK ({stick} elements at fp16). Inside it the on-card \
-             reduce-MAX mis-combines the per-stick partial maxima and hands back THE SEED, so this \
-             would emit a well-formed descriptor, bake, exit 0 under `dxp_standalone` (which executes \
-             no arithmetic), and return that seed for all {rows} rows — a softmax built on it computes \
-             `exp(x - 0)`, silently.              DO NOT READ THIS AS EITHER AXIS ALONE; each single-axis reading has a shipping, \
-             hardware-proven counter-example. `rows > 1` is NOT the defect: \
-             `ir/bridge/tiled_op_sdsc_op/attn.rs`'s `attn_bmax` reduces MAX at `rows = nqh > 1` with \
-             `width` one stick at 31 tok/s on card, and that file records a per-row split TRIED AND \
-             REVERTED (2026-07-28) against exactly that comparison. A width past one stick is NOT the \
-             defect either: `emit/ktir_matmul_fp8.rs`'s `fq_amax_op` reduces MAX over the whole hidden \
-             width `k` (2048/4096, many sticks) on every fp8 matmul, and at decode (`m == 1`) that is \
-             this same rank-3 flat emission at 41 tok/s. Only BOTH AT ONCE is broken, which is why the \
-             one diagnostic that measured it (`mxp=0` over `[nqh,cap]`) could not tell the axes apart.              THE REMEDY: tile the reduction to ONE STICK and combine the partials — which is what \
-             `attention_flash.py` and `swiglu_mlp.py` pin `BLOCK_N = 64` for, as a correctness \
-             constraint — or reduce with `sum`, which combines correctly multi-row at any width. It is \
-             NOT to split rows: that is the reverted experiment, measured on hardware as zero \
-             behavioural change, and it costs {rows} descriptors per softmax for nothing.",
-            data.tid
-        ));
-    }
+    // ⭐ THE WIDE MULTI-ROW MAX PASSES THROUGH — the guard that used to refuse it here was built
+    // on a misread diagnostic and is deleted; the corrected law (with the DDL citations and the
+    // card gate that arbitrates) is this function's own doc above. The shape checks below are
+    // unchanged and still refuse everything that is not a well-formed row reduction.
     // A `[rows, 1]` accumulator: the reduce writes one value per row.
     if out.c_len != 1 {
         return err(format!(

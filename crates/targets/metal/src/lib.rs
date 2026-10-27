@@ -275,6 +275,7 @@ pub mod tape;
 /// Apple Silicon target profiles and cost models.
 pub mod targets;
 pub mod turboquant;
+pub mod vocab_suffix;
 
 // The bake: AoT metallib compiles.
 pub mod aot;

@@ -8,7 +8,7 @@
 //!
 //! Port of: `vllm/v1/engine/async_llm.py` (subset)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Marks a client's prompt-cache breakpoint in a chat message's text (the Anthropic path's
@@ -66,12 +66,14 @@ use crate::tool_parser::{
 /// directly — an attacker-controlled allocation size (CWE-789).
 const MAX_N: u32 = 128;
 
-fn validate_n(n: u32) -> ServeResult<usize> {
+fn validate_n(n: u32, params: &SamplingParams) -> ServeResult<usize> {
     if n > MAX_N {
         return Err(ServeError::Validation(format!(
             "n={n} exceeds the maximum of {MAX_N}"
         )));
     }
+    // `params` carries the temperature the request samples at, generation defaults applied.
+    (params.check_greedy_n(n)).map_err(|msg| ServeError::Validation(msg.into_owned()))?;
     Ok(n.max(1) as usize)
 }
 
@@ -202,8 +204,8 @@ struct RequestState {
     /// [`SharedDetok`] for why it is shared rather than moved in and out.
     detokenizer: Option<SharedDetok>,
 
-    /// Position in response choices (for n>1 / multi-prompt support).
-    choice_index: u32,
+    /// The response choice it fills, and the prompt it answers (for n>1 / multi-prompt support).
+    choice: Choice,
 
     /// When this request was submitted (for TTFT calculation).
     submit_time: Instant,
@@ -253,8 +255,8 @@ struct RequestState {
     /// Whether any tool call deltas have been emitted (for setting finish_reason).
     tool_calls_emitted: bool,
 
-    /// Forced function name from `tool_choice: {function: {name}}` (for filtering).
-    forced_function_name: Option<String>,
+    /// The tool calls streamed so far: each call named first, and only the forced tool's.
+    tool_calls: ToolCallStream,
 
     /// Pooling output (embedding data), set when the engine is in pooling mode.
     pooler_output: Option<EmbeddingData>,
@@ -264,12 +266,27 @@ impl RequestState {
     /// The token counts every delta sent for this request carries, as of now.
     fn stream_usage(&self) -> StreamUsage {
         StreamUsage {
+            prompt: self.choice.prompt,
             prompt_tokens: self.num_prompt_tokens,
             cached_tokens: self.num_cached_tokens,
             completion_tokens: self.generated_token_ids.len() as u32,
         }
     }
 }
+
+/// Where one engine request's output goes in its response: the choice it fills, and the prompt it
+/// answers. A completion request runs `n` choices of each of its prompts, a chat request `n` of
+/// its one.
+#[derive(Debug, Clone, Copy, Default)]
+struct Choice {
+    index: u32,
+    prompt: PromptIndex,
+}
+
+/// Which of a request's prompts a choice answers: its position in a completion request's prompt
+/// list (0 for chat, which has one). Its own type, so it cannot be swapped for a choice index.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct PromptIndex(pub u32);
 
 /// Token counts for one request, carried on every [`StreamDelta`].
 ///
@@ -280,6 +297,9 @@ impl RequestState {
 /// value it sees rather than assume which delta arrives first.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StreamUsage {
+    /// Which of the request's prompts this choice answers. The choices of one prompt share its
+    /// tokens and its cache hit, so a response counts each once per prompt, not once per choice.
+    pub prompt: PromptIndex,
     /// Total prompt tokens for the request.
     pub prompt_tokens: u32,
     /// Prompt tokens served from the prefix cache. Block-aligned, so it
@@ -404,6 +424,9 @@ pub struct AsyncEngine {
     generation_defaults: scratchy_core_common::sampling::GenerationDefaults,
     /// Whether async scheduling is enabled (overlap GPU execution with CPU scheduling).
     async_scheduling: bool,
+    /// Non-streamed chat and completion calls that have handed every one of their requests to
+    /// the step loop's channel ([`calls_submitted`](Self::calls_submitted)).
+    calls_submitted: std::sync::atomic::AtomicUsize,
     /// Where the step loop is. `poll_until_done` reads it to see a dead loop, and the server
     /// watches it to shut down when the loop ends, since nothing can then be served.
     step_loop: Arc<watch::Sender<StepLoop>>,
@@ -453,6 +476,7 @@ impl AsyncEngine {
             default_chat_template_kwargs: None,
             generation_defaults: Default::default(),
             async_scheduling: false,
+            calls_submitted: std::sync::atomic::AtomicUsize::new(0),
             step_loop: Arc::new(watch::Sender::new(StepLoop::Pending)),
             #[cfg(feature = "multimodal")]
             mm_processor: None,
@@ -566,6 +590,63 @@ impl AsyncEngine {
         self.tool_parser.clone()
     }
 
+    /// The parser `request`'s reply is read with: under `tool_choice: "required"`, the one for
+    /// the JSON its grammar makes the reply (`RequiredToolCallsParser`), with or without a parser
+    /// set on the engine, which reads any reply the grammar didn't shape; otherwise the engine's.
+    fn request_tool_parser(
+        &self,
+        request: &protocol::ChatCompletionRequest,
+    ) -> Option<Arc<dyn ToolCallParser>> {
+        match request.tool_choice {
+            Some(protocol::ToolChoice::Required) => {
+                let fallback = self.tool_parser.clone();
+                Some(Arc::new(crate::tool_parser::RequiredToolCallsParser {
+                    fallback,
+                }))
+            }
+            _ => self.tool_parser.clone(),
+        }
+    }
+
+    /// Where `prompt` leaves its model's thinking ([`PromptThinking::of`]), whitespace judged by
+    /// decoding: a prompt that ends with a closed think block closed thinking (thinking off).
+    ///
+    /// ⛔ A TAIL IS DECODED A TOKEN AT A TIME, TO ITS FIRST TOKEN THAT ISN'T WHITESPACE. A tool
+    /// loop's tail after its last `</think>` is every call and result since, thousands of tokens on
+    /// the request path. A thinking-off tail is a token or two, and a long one costs one decode. A
+    /// whitespace token decodes alone: it splits no character.
+    ///
+    /// [`PromptThinking::of`]: scratchy_core_common::sampling::PromptThinking::of
+    fn prompt_thinking(
+        &self,
+        tokens: scratchy_core_common::sampling::ThinkTokens,
+        prompt: &[u32],
+    ) -> scratchy_core_common::sampling::PromptThinking {
+        let blank = |tail: &[u32]| match &self.tokenizer {
+            Some(tokenizer) => (tail.iter()).all(|&token| {
+                (tokenizer.decode(&[token], false)).is_ok_and(|s| s.trim().is_empty())
+            }),
+            None => tail.is_empty(),
+        };
+        scratchy_core_common::sampling::PromptThinking::of(tokens, prompt, blank)
+    }
+
+    /// ⭐ THE REASONING PARSER THAT READS A REQUEST'S REPLY (#819): none where its prompt closed
+    /// the model's thinking ([`PromptThinking::Closed`]: a template with thinking off ends the
+    /// prompt `<think>\n\n</think>\n\n`), so the reply is content, whole and streamed, as vLLM
+    /// reads a reply after a prompt that ends reasoning. A stream's parser never sees the prompt,
+    /// and read alone the qwen3 parser takes an output with no `</think>` for reasoning.
+    ///
+    /// [`PromptThinking::Closed`]: scratchy_core_common::sampling::PromptThinking::Closed
+    fn request_reasoning_parser(&self, prompt: &[u32]) -> Option<&Arc<dyn ReasoningParser>> {
+        let parser = self.reasoning_parser.as_ref()?;
+        let closed = (parser.think_tokens()).is_some_and(|tokens| {
+            self.prompt_thinking(tokens, prompt)
+                == scratchy_core_common::sampling::PromptThinking::Closed
+        });
+        (!closed).then_some(parser)
+    }
+
     /// Set the reasoning parser on this engine.
     pub fn set_reasoning_parser(&mut self, parser: Arc<dyn ReasoningParser>) {
         self.reasoning_parser = Some(parser);
@@ -604,6 +685,18 @@ impl AsyncEngine {
         processor: Option<std::sync::Arc<crate::multimodal::ResolvedMmProcessor>>,
     ) {
         self.mm_processor = processor;
+    }
+
+    /// Whether the engine takes image inputs: a multimodal processor is set.
+    #[cfg(feature = "multimodal")]
+    pub fn takes_images(&self) -> bool {
+        self.mm_processor.is_some()
+    }
+
+    /// Whether the engine takes image inputs: never, in a build without `multimodal`.
+    #[cfg(not(feature = "multimodal"))]
+    pub fn takes_images(&self) -> bool {
+        false
     }
 
     /// Get the model name.
@@ -694,6 +787,22 @@ impl AsyncEngine {
             .unwrap_or_else(|| format!("<token_{id}>"))
     }
 
+    /// ⭐ A CHAT PROMPT, RENDERED ONE WAY (#214): `messages` and `tools` through the model's chat
+    /// template, with the server's default chat-template kwargs and `kwargs` merged over them.
+    /// The prefill renders through it and encodes with [`Tokenizer::encode_chat`], and so does
+    /// `/tokenize`, so its count is the prefill's. `None` without a chat template.
+    pub(crate) fn render_chat(
+        &self,
+        messages: &[protocol::ChatCompletionMessageParam],
+        tools: Option<&[protocol::ChatCompletionToolsParam]>,
+        kwargs: Option<&HashMap<String, serde_json::Value>>,
+        add_generation_prompt: bool,
+    ) -> Option<ServeResult<String>> {
+        let template = self.chat_template.as_ref()?;
+        let merged = merge_chat_template_kwargs(self.default_chat_template_kwargs.as_ref(), kwargs);
+        Some(template.render_chat(messages, tools, merged.as_ref(), add_generation_prompt))
+    }
+
     /// Get a reference to the chat template, if available.
     pub fn chat_template(&self) -> Option<&Arc<ChatTemplate>> {
         self.chat_template.as_ref()
@@ -724,17 +833,12 @@ impl AsyncEngine {
             .model
             .clone()
             .unwrap_or_else(|| self.model_name.clone());
-        let n = validate_n(request.n)?;
-
         let mut sampling_params = self.build_sampling_params_from_chat(&request)?;
+        let n = validate_n(request.n, &sampling_params)?;
 
         // Tokenize prompt once.
-        let mut ec_request = self.chat_to_engine_request(&base_id, &request, &sampling_params)?;
-        let mut prompt_token_ids = ec_request.prompt_token_ids.clone().unwrap_or_default();
-
-        // Truncate prompt tokens from the left (keep the last N).
-        truncate_prompt(&mut prompt_token_ids, request.truncate_prompt_tokens)?;
-        ec_request.prompt_token_ids = Some(prompt_token_ids.clone());
+        let ec_request = self.chat_to_engine_request(&base_id, &request, &mut sampling_params)?;
+        let prompt_token_ids = ec_request.prompt_token_ids.clone().unwrap_or_default();
 
         let num_prompt_tokens = prompt_token_ids.len() as u32;
 
@@ -799,9 +903,12 @@ impl AsyncEngine {
                 num_prompt_tokens,
                 None,
                 detokenizer,
-                i as u32,
+                Choice {
+                    index: i as u32,
+                    prompt: PromptIndex(0),
+                },
                 None, // no streaming tool parser for non-streaming requests
-                None,
+                ToolCallStream::default(),
                 None, // no streaming reasoning parser for non-streaming requests
                 request.include_reasoning,
             )
@@ -810,16 +917,22 @@ impl AsyncEngine {
             child_ids.push(child_id);
         }
 
+        self.handed_over();
         // Poll all children and build choices.
         let mut choices = Vec::with_capacity(n);
         let mut total_completion_tokens = 0u32;
-        let mut total_cached_tokens = 0u32;
+        // The prompt's cache hit, counted once as the prompt is: every choice runs the same
+        // prompt, and each records its own hit on it (#580). The least of them: what the cache
+        // held when the request came in, not a sibling's fresh prefill (`ChoiceUsage::totals`).
+        let mut cached_tokens: Option<u32> = None;
 
         for (i, child_id) in child_ids.iter().enumerate() {
             let state = self.poll_until_done(child_id).await?;
             let completion_tokens = state.generated_token_ids.len() as u32;
             total_completion_tokens += completion_tokens;
-            total_cached_tokens += state.num_cached_tokens;
+            cached_tokens = Some(
+                cached_tokens.map_or(state.num_cached_tokens, |c| c.min(state.num_cached_tokens)),
+            );
 
             let finish_reason_str = state
                 .finish_reason
@@ -849,7 +962,7 @@ impl AsyncEngine {
 
             // Extract reasoning content if parser is configured.
             let (reasoning_text, text_for_tools, content_was_none) =
-                if let Some(ref rp) = self.reasoning_parser {
+                if let Some(rp) = self.request_reasoning_parser(&prompt_token_ids) {
                     let extracted = rp.extract_reasoning(&text);
                     let reasoning = if request.include_reasoning {
                         extracted.reasoning
@@ -865,47 +978,24 @@ impl AsyncEngine {
                 };
 
             // Try tool call extraction if parser is configured and request has tools.
-            let (final_content, final_tool_calls, final_finish_reason) =
-                if let Some(ref parser) = self.tool_parser {
-                    if request.tools.is_some() && !is_tool_choice_none(&request.tool_choice) {
-                        let extracted = parser.extract_tool_calls(&text_for_tools);
-                        if extracted.tools_called {
-                            // Filter by forced function name if tool_choice specifies one.
-                            let tool_calls = if let Some(forced) =
-                                get_tool_choice_function_name(&request.tool_choice)
-                            {
-                                extracted
-                                    .tool_calls
-                                    .into_iter()
-                                    .filter(|tc| tc.function.name == forced)
-                                    .collect::<Vec<_>>()
-                            } else {
-                                extracted.tool_calls
-                            };
-                            if tool_calls.is_empty() {
-                                (Some(text_for_tools), None, finish_reason_str)
-                            } else {
-                                (
-                                    extracted.content,
-                                    Some(tool_calls),
-                                    "tool_calls".to_string(),
-                                )
-                            }
-                        } else {
-                            // No tool call: keep the parser's cleaned content (it
-                            // may strip control tokens) instead of the raw text.
-                            (
-                                extracted.content.or(Some(text_for_tools)),
-                                None,
-                                finish_reason_str,
-                            )
-                        }
-                    } else {
-                        (Some(text_for_tools), None, finish_reason_str)
-                    }
-                } else {
-                    (Some(text_for_tools), None, finish_reason_str)
-                };
+            let parser = self.request_tool_parser(&request);
+            let (final_content, final_tool_calls, final_finish_reason) = match parser {
+                Some(parser) if request.tools.is_some() => {
+                    let limit = request.call_limit();
+                    let reply = reply_tool_calls(
+                        parser.as_ref(),
+                        text_for_tools,
+                        &request.tool_choice,
+                        limit,
+                    );
+                    let finish = match reply.calls {
+                        Some(_) => "tool_calls".to_string(),
+                        None => finish_reason_str,
+                    };
+                    (reply.content, reply.calls, finish)
+                }
+                _ => (Some(text_for_tools), None, finish_reason_str),
+            };
 
             // If reasoning parser returned content=None (everything was reasoning),
             // preserve None rather than wrapping an empty string.
@@ -978,13 +1068,11 @@ impl AsyncEngine {
             prompt_tokens: num_prompt_tokens,
             completion_tokens: Some(total_completion_tokens),
             total_tokens: num_prompt_tokens + total_completion_tokens,
-            prompt_tokens_details: if total_cached_tokens > 0 {
-                Some(protocol::PromptTokenUsageInfo {
-                    cached_tokens: Some(total_cached_tokens),
-                })
-            } else {
-                None
-            },
+            prompt_tokens_details: (cached_tokens.filter(|&c| c > 0)).map(|c| {
+                protocol::PromptTokenUsageInfo {
+                    cached_tokens: Some(c),
+                }
+            }),
         };
 
         Ok(protocol::ChatCompletionResponse::new(model, choices, usage))
@@ -1018,8 +1106,8 @@ impl AsyncEngine {
             .request_id
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let sampling_params = self.build_sampling_params_from_chat(&request)?;
-        let ec_request = self.chat_to_engine_request(&base_id, &request, &sampling_params)?;
+        let mut sampling_params = self.build_sampling_params_from_chat(&request)?;
+        let ec_request = self.chat_to_engine_request(&base_id, &request, &mut sampling_params)?;
         let token_ids = ec_request.prompt_token_ids.unwrap_or_default();
 
         // Decode token IDs back to text for the prompt field.
@@ -1061,15 +1149,10 @@ impl AsyncEngine {
             .model
             .clone()
             .unwrap_or_else(|| self.model_name.clone());
-        let n = validate_n(request.n)?;
-
         let mut sampling_params = self.build_sampling_params_from_chat(&request)?;
-        let mut ec_request = self.chat_to_engine_request(&base_id, &request, &sampling_params)?;
-        let mut prompt_token_ids = ec_request.prompt_token_ids.clone().unwrap_or_default();
-
-        // Truncate prompt tokens from the left (keep the last N).
-        truncate_prompt(&mut prompt_token_ids, request.truncate_prompt_tokens)?;
-        ec_request.prompt_token_ids = Some(prompt_token_ids.clone());
+        let n = validate_n(request.n, &sampling_params)?;
+        let ec_request = self.chat_to_engine_request(&base_id, &request, &mut sampling_params)?;
+        let prompt_token_ids = ec_request.prompt_token_ids.clone().unwrap_or_default();
 
         let num_prompt_tokens = prompt_token_ids.len() as u32;
 
@@ -1096,11 +1179,13 @@ impl AsyncEngine {
         }
 
         // Determine if tool parsing is active for this request.
-        let use_tool_parser = self.tool_parser.is_some()
+        let tool_parser = self.request_tool_parser(&request);
+        let use_tool_parser = tool_parser.is_some()
             && request.tools.is_some()
             && !is_tool_choice_none(&request.tool_choice);
 
-        let forced_fn = get_tool_choice_function_name(&request.tool_choice);
+        let forced_tool = ForcedTool::of(&request.tool_choice);
+        let limit = request.call_limit();
 
         // All n children share one channel.
         let (tx, rx) = mpsc::unbounded_channel();
@@ -1136,17 +1221,13 @@ impl AsyncEngine {
 
             // Create streaming tool parser state if applicable.
             let tool_state = if use_tool_parser {
-                self.tool_parser
-                    .as_ref()
-                    .map(|p| p.create_streaming_state())
+                tool_parser.as_ref().map(|p| p.create_streaming_state())
             } else {
                 None
             };
 
             // Create streaming reasoning parser state if applicable.
-            let reasoning_state = self
-                .reasoning_parser
-                .as_ref()
+            let reasoning_state = (self.request_reasoning_parser(&prompt_token_ids))
                 .map(|p| p.create_streaming_state());
 
             self.submit_request(
@@ -1155,9 +1236,12 @@ impl AsyncEngine {
                 num_prompt_tokens,
                 Some(tx.clone()),
                 detokenizer,
-                i as u32,
+                Choice {
+                    index: i as u32,
+                    prompt: PromptIndex(0),
+                },
                 tool_state,
-                forced_fn.clone(),
+                ToolCallStream::new(forced_tool.clone(), limit),
                 reasoning_state,
                 request.include_reasoning,
             )
@@ -1190,9 +1274,8 @@ impl AsyncEngine {
             .model
             .clone()
             .unwrap_or_else(|| self.model_name.clone());
-        let n = validate_n(request.n)?;
-
         let sampling_params = self.build_sampling_params_from_completion(&request)?;
+        let n = validate_n(request.n, &sampling_params)?;
 
         // Normalize prompt to Vec<Vec<u32>>.
         let mut prompts = self.tokenize_completion_prompts(&request)?;
@@ -1270,9 +1353,12 @@ impl AsyncEngine {
                     num_prompt_tokens,
                     None,
                     detokenizer,
-                    choice_index,
+                    Choice {
+                        index: choice_index,
+                        prompt: PromptIndex(p_idx as u32),
+                    },
                     None, // no tool parsing for completions
-                    None,
+                    ToolCallStream::default(),
                     None, // no reasoning parsing for completions
                     true,
                 )
@@ -1282,6 +1368,7 @@ impl AsyncEngine {
             }
         }
 
+        self.handed_over();
         // Poll all children and build choices.
         let mut choices = Vec::with_capacity(total);
         let mut total_completion_tokens = 0u32;
@@ -1379,9 +1466,8 @@ impl AsyncEngine {
             .model
             .clone()
             .unwrap_or_else(|| self.model_name.clone());
-        let n = validate_n(request.n)?;
-
         let sampling_params = self.build_sampling_params_from_completion(&request)?;
+        let n = validate_n(request.n, &sampling_params)?;
 
         // Normalize prompt to Vec<Vec<u32>>.
         let mut prompts = self.tokenize_completion_prompts(&request)?;
@@ -1460,9 +1546,12 @@ impl AsyncEngine {
                     num_prompt_tokens,
                     Some(tx.clone()),
                     detokenizer,
-                    choice_index,
+                    Choice {
+                        index: choice_index,
+                        prompt: PromptIndex(p_idx as u32),
+                    },
                     None, // no tool parsing for completions
-                    None,
+                    ToolCallStream::default(),
                     None, // no reasoning parsing for completions
                     true,
                 )
@@ -1549,9 +1638,9 @@ impl AsyncEngine {
                     num_prompt_tokens,
                     None,
                     None,
-                    0,
+                    Choice::default(),
                     None,
-                    None,
+                    ToolCallStream::default(),
                     None,
                     true,
                 )
@@ -1696,6 +1785,17 @@ impl AsyncEngine {
     ///
     /// Must be called exactly once. Panics if called twice.
     pub fn spawn_step_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        self.spawn_step_loop_after(std::future::ready(()))
+    }
+
+    /// [`spawn_step_loop`](Self::spawn_step_loop), holding the loop's first step until `gate`
+    /// resolves. The loop is running for every waiter at once, and requests submitted meanwhile
+    /// queue in the order they came. An offline batch submits all of its requests behind the gate,
+    /// so the first steps batch them the same way every run, as an offline vLLM batch's do.
+    pub fn spawn_step_loop_after(
+        self: &Arc<Self>,
+        gate: impl Future<Output = ()> + Send + 'static,
+    ) -> tokio::task::JoinHandle<()> {
         let (client, rx, embed_rx, control_rx) = self
             .pending_loop
             .lock()
@@ -1721,20 +1821,48 @@ impl AsyncEngine {
         let state = Arc::clone(&self.step_loop);
         if self.async_scheduling {
             info!("Async scheduling enabled — overlapping GPU execution with CPU scheduling");
+            let step_loop = Self::step_loop_async(args);
             tokio::spawn(Self::run_to_end(
-                Self::step_loop_async(args),
+                async move {
+                    gate.await;
+                    step_loop.await
+                },
                 requests,
                 notify,
                 state,
             ))
         } else {
+            let step_loop = Self::step_loop_sync(args);
             tokio::spawn(Self::run_to_end(
-                Self::step_loop_sync(args),
+                async move {
+                    gate.await;
+                    step_loop.await
+                },
                 requests,
                 notify,
                 state,
             ))
         }
+    }
+
+    /// How many non-streamed chat and completion calls have handed every one of their
+    /// requests to the step loop: each counts once its choices (and, for a completion, every
+    /// prompt's) are in the loop's channel, before it waits for any reply. A call refused before
+    /// that never counts. An offline batch submits behind [`spawn_step_loop_after`]'s gate by
+    /// this: a line is in once the count moves, or its call has returned.
+    ///
+    /// [`spawn_step_loop_after`]: Self::spawn_step_loop_after
+    pub fn calls_submitted(&self) -> usize {
+        self.calls_submitted
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A call's requests are all in the step loop's channel ([`calls_submitted`]).
+    ///
+    /// [`calls_submitted`]: Self::calls_submitted
+    fn handed_over(&self) {
+        self.calls_submitted
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Run a step loop to its end, however it ends, then fail every request it was still
@@ -1982,13 +2110,22 @@ impl AsyncEngine {
                             });
 
                             // Phase 3: apply detok results, send streams (brief lock).
-                            {
+                            let stop_string_finished = {
                                 let mut reqs = requests.lock().await;
                                 Self::process_outputs_phase3(
                                     &mut reqs,
                                     outputs.outputs,
                                     detok_results,
-                                );
+                                )
+                            };
+
+                            // A stop string finished a request the engine is still decoding —
+                            // abort it there, or it runs on to max_tokens under the next
+                            // request's steps (#711).
+                            if !stop_string_finished.is_empty() {
+                                client
+                                    .abort_requests(&stop_string_finished)
+                                    .unwrap_or_else(|e| error!("abort_requests failed: {e}"));
                             }
 
                             // Wake waiters only when there are actual outputs.
@@ -2061,11 +2198,24 @@ impl AsyncEngine {
         let (sched_tx, sched_rx) = tokio::sync::mpsc::channel::<ExecutorWork>(2);
         let (model_tx, mut model_rx) = tokio::sync::mpsc::channel::<ExecutorResult>(2);
 
-        // Spawn the executor on a dedicated OS thread.
-        std::thread::Builder::new()
-            .name("scratchy-serving-worker".into())
-            .spawn(move || executor_thread_loop(executor, sched_rx, model_tx))
-            .expect("failed to spawn executor thread");
+        // Spawn the executor on a dedicated OS thread, and own both its
+        // channel sender and its join handle in one guard moved into the
+        // loop below. A bare `spawn` whose handle is dropped detaches the
+        // thread: nothing then waits out the teardown it runs at the end
+        // (`executor.shutdown()` → the worker's sidecar drain and residency
+        // release), so the process exited mid-drain whenever the loop ended
+        // — measured as the aligned-weights sidecar being discarded
+        // mid-write on every SIGTERM'd launch (#411), the step loop's task
+        // finishing while the executor thread was still shutting down.
+        let executor_pipe = ExecutorPipeline {
+            tx: Some(sched_tx),
+            thread: Some(
+                std::thread::Builder::new()
+                    .name("scratchy-serving-worker".into())
+                    .spawn(move || executor_thread_loop(executor, sched_rx, model_tx))
+                    .expect("failed to spawn executor thread"),
+            ),
+        };
 
         async move {
             // Pre-scheduling with deferred finalization:
@@ -2088,12 +2238,26 @@ impl AsyncEngine {
             // scheduled behind it until it is finalized.
             let mut awaits_step = false;
             let mut last_progress = Instant::now();
+            // TTFT ATTRIBUTION (SCRATCHY_TTFT_PHASE): the `[ttft-step]` breakdown lives in
+            // `EngineCore::step` (sync) and `InprocClient::get_output` (pipelined), and this loop
+            // calls neither — without a port of the print here the flag is silently dead on
+            // `scr serve` (#394). `exec_wait` pairs with the step finalized NEXT iteration (it is
+            // the recv round trip that produced that result, resolve included); `sched_next` is
+            // the schedule wall of the iteration that waited for this step: after the previous
+            // finalize, before this step's recv (≈0 when nothing was scheduled then: a speculative
+            // step in flight, or two steps already). Decode-only steps print too when they carry
+            // more than one row — tokens==reqs distinguishes them from prefill, except under
+            // speculative decoding, where a verify step's drafts count as scheduled tokens.
+            let ttft_phase = std::env::var_os("SCRATCHY_TTFT_PHASE").is_some();
+            let mut last_exec_wait = Duration::ZERO;
+            let mut last_sched_wall = Duration::ZERO;
 
             'step: loop {
                 // 0. Drain pending embedding requests.
                 while let Ok(embed_req) = embed_rx.try_recv() {
                     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                    if sched_tx
+                    if executor_pipe
+                        .tx()
                         .send(ExecutorWork::Embed(embed_req.token_id_seqs, reply_tx))
                         .await
                         .is_err()
@@ -2111,7 +2275,7 @@ impl AsyncEngine {
 
                 // 0b. Drain control messages.
                 while let Ok(msg) = control_rx.try_recv() {
-                    Self::handle_control_message_async(&mut client, msg, &sched_tx).await;
+                    Self::handle_control_message_async(&mut client, msg, executor_pipe.tx()).await;
                 }
 
                 // 1. Drain pending request submissions (non-blocking).
@@ -2127,9 +2291,20 @@ impl AsyncEngine {
                 //    already running (or about to run) the next batch, so
                 //    this CPU work overlaps with GPU execution.
                 if let Some((prev_sched, prev_output)) = deferred.take() {
+                    let t_finalize = Instant::now();
+                    let finalized_tokens = prev_sched.total_num_scheduled_tokens;
+                    let finalized_reqs = prev_sched.num_scheduled_tokens.len();
                     match client.finalize_step(&prev_sched, &prev_output) {
                         Ok(outputs) => {
-                            route_step_outputs(&requests, outputs).await;
+                            let stop_string_finished = route_step_outputs(&requests, outputs).await;
+                            // A stop string finished a request the engine is still decoding —
+                            // abort it there, or it runs on to max_tokens under the next
+                            // request's steps (#711).
+                            if !stop_string_finished.is_empty() {
+                                client
+                                    .abort_requests(&stop_string_finished)
+                                    .unwrap_or_else(|e| error!("abort_requests failed: {e}"));
+                            }
                             // A finalized step IS forward progress: prefill
                             // chunks sample no tokens, so gating this reset on
                             // sampled outputs would let the watchdog shoot a
@@ -2141,17 +2316,30 @@ impl AsyncEngine {
                             error!("finalize_step error: {}", e);
                         }
                     }
+                    if ttft_phase && finalized_tokens > 1 {
+                        eprintln!(
+                            "[ttft-step] exec_wait={:.2} finalize={:.2} sched_next={:.2} ms  \
+                             ({} scheduled tokens, {} reqs)",
+                            last_exec_wait.as_secs_f64() * 1e3,
+                            t_finalize.elapsed().as_secs_f64() * 1e3,
+                            last_sched_wall.as_secs_f64() * 1e3,
+                            finalized_tokens,
+                            finalized_reqs
+                        );
+                    }
                     notify.notify_waiters();
                 }
 
                 // 3. Pre-schedule: fill the pipeline up to 2 in-flight
                 //    batches. With placeholder tracking, the scheduler
                 //    correctly accounts for tokens still on the GPU.
+                let t_schedule = Instant::now();
                 while gpu_in_flight < 2 && !awaits_step {
                     match client.schedule_next() {
                         Ok(Some(sched)) => {
                             let speculative = sched.is_speculative() && !sched.spec_pipeline.leads;
-                            if sched_tx
+                            if executor_pipe
+                                .tx()
                                 .send(ExecutorWork::Execute(Box::new(sched)))
                                 .await
                                 .is_err()
@@ -2169,22 +2357,34 @@ impl AsyncEngine {
                         }
                     }
                 }
+                last_sched_wall = t_schedule.elapsed();
 
                 // 4. Wait for the oldest GPU result. A deferred one is waited
                 //    for here — the batch queued behind it keeps the GPU busy —
                 //    and fails its step like an executor error if its device
                 //    work did.
+                //    The wait blocks its thread for the step's device work, so
+                //    it runs on a blocking thread, never this task's worker:
+                //    there it held the streams this loop had just woken (in
+                //    the worker's LIFO slot, which no other worker steals)
+                //    until the loop next yielded, and their chunks went out
+                //    in bursts.
                 if gpu_in_flight > 0 {
-                    let received =
-                        model_rx
-                            .recv()
-                            .await
-                            .map(|ExecutorResult::Model(result, sched)| {
-                                let resolved = result
+                    let t_recv = Instant::now();
+                    let received = match model_rx.recv().await {
+                        Some(ExecutorResult::Model(result, sched)) => {
+                            let resolved = tokio::task::spawn_blocking(move || {
+                                result
                                     .map_err(|e| e.to_string())
-                                    .and_then(|mut output| output.resolve().map(|()| output));
-                                (resolved, sched)
-                            });
+                                    .and_then(|mut output| output.resolve().map(|()| output))
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(format!("resolving the step: {e}")));
+                            Some((resolved, sched))
+                        }
+                        None => None,
+                    };
+                    last_exec_wait = t_recv.elapsed();
                     match received {
                         Some((Ok(model_output), sched)) => {
                             deferred = Some((sched, model_output));
@@ -2192,15 +2392,12 @@ impl AsyncEngine {
                         }
                         Some((Err(e), sched)) => {
                             error!("Executor error: {}", e);
-                            client.abandon_step(&sched);
+                            // Aborts the step's requests in the engine, too, and any a step behind
+                            // it admitted onto the KV it never wrote.
+                            let aborted = client.abandon_step(&sched);
                             let err_msg = format!("Executor error: {e}");
-                            let req_ids: Vec<String> =
-                                sched.num_scheduled_tokens.keys().cloned().collect();
-                            client
-                                .abort_requests(&req_ids)
-                                .unwrap_or_else(|e| error!("abort_requests failed: {e}"));
                             Self::fail_requests(&mut *requests.lock().await, &err_msg, |id| {
-                                req_ids.iter().any(|r| r == id)
+                                aborted.iter().any(|a| a == id)
                             });
                             notify.notify_waiters();
                             gpu_in_flight -= 1;
@@ -2239,7 +2436,8 @@ impl AsyncEngine {
                             }
                             Some(embed_req) = embed_rx.recv() => {
                                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                                if sched_tx
+                                if executor_pipe
+                                    .tx()
                                     .send(ExecutorWork::Embed(
                                         embed_req.token_id_seqs,
                                         reply_tx,
@@ -2261,7 +2459,7 @@ impl AsyncEngine {
                                 continue;
                             }
                             Some(msg) = control_rx.recv() => {
-                                Self::handle_control_message_async(&mut client, msg, &sched_tx).await;
+                                Self::handle_control_message_async(&mut client, msg, executor_pipe.tx()).await;
                                 continue;
                             }
                             else => break, // All channels closed.
@@ -2296,13 +2494,21 @@ impl AsyncEngine {
             // Finalize any remaining deferred output before shutdown.
             if let Some((prev_sched, prev_output)) = deferred.take() {
                 if let Ok(outputs) = client.finalize_step(&prev_sched, &prev_output) {
-                    route_step_outputs(&requests, outputs).await;
+                    let stop_string_finished = route_step_outputs(&requests, outputs).await;
+                    // A stop string finished a request the engine is still decoding —
+                    // abort it there, or it runs on to max_tokens under the next
+                    // request's steps (#711).
+                    if !stop_string_finished.is_empty() {
+                        client
+                            .abort_requests(&stop_string_finished)
+                            .unwrap_or_else(|e| error!("abort_requests failed: {e}"));
+                    }
                 }
                 notify.notify_waiters();
             }
 
             // Shutdown: drop the sender so the executor thread exits.
-            let _ = sched_tx.send(ExecutorWork::Shutdown).await;
+            let _ = executor_pipe.tx().send(ExecutorWork::Shutdown).await;
         }
     }
 
@@ -2326,9 +2532,9 @@ impl AsyncEngine {
         num_prompt_tokens: u32,
         stream_tx: Option<mpsc::UnboundedSender<StreamDelta>>,
         detokenizer: Option<IncrementalDetokenizer>,
-        choice_index: u32,
+        choice: Choice,
         tool_parser_state: Option<Box<dyn StreamingToolParserState + Send>>,
-        forced_function_name: Option<String>,
+        tool_calls: ToolCallStream,
         reasoning_parser_state: Option<Box<dyn StreamingReasoningParserState + Send>>,
         include_reasoning: bool,
     ) -> ServeResult<()> {
@@ -2377,7 +2583,7 @@ impl AsyncEngine {
                     // the state's business, and this is the only place a request's is installed — so
                     // exactly one place could ever get it wrong.
                     detokenizer: detokenizer.map(|d| Arc::new(std::sync::Mutex::new(d))),
-                    choice_index,
+                    choice,
                     submit_time: Instant::now(),
                     first_token_time: None,
                     last_token_time: None,
@@ -2395,7 +2601,7 @@ impl AsyncEngine {
                     accumulated_content: String::new(),
                     accumulated_token_ids: Vec::new(),
                     tool_calls_emitted: false,
-                    forced_function_name,
+                    tool_calls,
                     pooler_output: None,
                 },
             );
@@ -2607,7 +2813,7 @@ impl AsyncEngine {
             req_state.error = Some(err.to_string());
             if let Some(tx) = req_state.stream_tx.take() {
                 let _ = tx.send(StreamDelta {
-                    index: req_state.choice_index,
+                    index: req_state.choice.index,
                     new_token_ids: Vec::new(),
                     text: None,
                     finish_reason: Some(FinishReason::Abort),
@@ -2631,7 +2837,16 @@ impl AsyncEngine {
         requests: &mut HashMap<String, RequestState>,
         outputs: Vec<EngineCoreOutput>,
         detok_results: Vec<Option<DetokResult>>,
-    ) {
+    ) -> Vec<String> {
+        // The requests this call finishes by a STOP STRING alone — the engine kept
+        // decoding them, because a stop string is not an engine-side criterion
+        // (engine_core's `check_stop_criteria` knows EOS, stop tokens and
+        // max_tokens only). The caller must abort each one engine-side or it
+        // decodes on to max_tokens while the client believes it done: the next
+        // request is then admitted under a still-running row, sharing its steps
+        // (a 3.3x first-token latency), and its eventual retirement changes the
+        // batch's composition under whoever is still decoding (#711).
+        let mut stop_string_finished: Vec<String> = Vec::new();
         for (output, detok_result) in outputs.into_iter().zip(detok_results) {
             let Some(req_state) = requests.get_mut(&output.request_id) else {
                 // Already logged in Phase 1.
@@ -2644,7 +2859,21 @@ impl AsyncEngine {
 
             // NOTHING TO PUT BACK — the detokenizer never left. This arm used to reinstall it, and
             // when the state had already been removed it `continue`d above and dropped it forever.
-            let (detokenizer_stop, delta_text) = detok_result.unwrap_or((None, None));
+            // No result here means no detokenizer, so the engine has no tokenizer
+            // ([`SharedDetok`]): a step's text is its token ids' placeholders, as the
+            // non-streaming response's is. Filled here, the one place that knows why the text is
+            // missing: a delta's `text: None` means "no text" to every encoder, which is what a
+            // reasoning-only or finish delta carries (#601: the chat encoder streamed a reasoning
+            // delta's token ids as `<token_N>` content).
+            let (detokenizer_stop, delta_text) = detok_result
+                .unwrap_or_else(|| (None, Some(placeholder_text(&output.new_token_ids))));
+
+            // Captured before `output` is consumed by the stream deltas below.
+            // The engine's own finish for this step means it has already retired
+            // the request — only a detokenizer-only finish leaves it running.
+            if detokenizer_stop.is_some() && output.finish_reason.is_none() {
+                stop_string_finished.push(output.request_id.clone());
+            }
 
             let step_logprobs = output.new_logprobs.clone();
 
@@ -2775,7 +3004,7 @@ impl AsyncEngine {
                             ToolParserDelta::Content(content) => {
                                 let attach_finish = is_finished && !req_state.tool_calls_emitted;
                                 let delta = StreamDelta {
-                                    index: req_state.choice_index,
+                                    index: req_state.choice.index,
                                     new_token_ids: output.new_token_ids.clone(),
                                     text: Some(content),
                                     finish_reason: if attach_finish {
@@ -2800,7 +3029,7 @@ impl AsyncEngine {
                                 // Emit reasoning delta separately if present.
                                 if let Some(reasoning) = reasoning_delta {
                                     let delta = StreamDelta {
-                                        index: req_state.choice_index,
+                                        index: req_state.choice.index,
                                         new_token_ids: vec![],
                                         text: None,
                                         finish_reason: None,
@@ -2812,24 +3041,13 @@ impl AsyncEngine {
                                     };
                                     let _ = tx.send(delta);
                                 }
-                                // Filter by forced function name if specified.
-                                let tool_deltas =
-                                    if let Some(ref forced) = req_state.forced_function_name {
-                                        tool_deltas
-                                            .into_iter()
-                                            .filter(|d| {
-                                                d.function_name.as_ref().is_none_or(|n| n == forced)
-                                            })
-                                            .collect::<Vec<_>>()
-                                    } else {
-                                        tool_deltas
-                                    };
+                                let tool_deltas = req_state.tool_calls.admit(tool_deltas);
                                 if tool_deltas.is_empty() {
-                                    // Filtered out — don't emit.
+                                    // Held for a name, or dropped — don't emit.
                                 } else {
                                     req_state.tool_calls_emitted = true;
                                     let delta = StreamDelta {
-                                        index: req_state.choice_index,
+                                        index: req_state.choice.index,
                                         new_token_ids: output.new_token_ids.clone(),
                                         text: None,
                                         finish_reason: None,
@@ -2846,7 +3064,7 @@ impl AsyncEngine {
                                 // Buffering in tool parser — but still emit reasoning if present.
                                 if let Some(reasoning) = reasoning_delta {
                                     let delta = StreamDelta {
-                                        index: req_state.choice_index,
+                                        index: req_state.choice.index,
                                         new_token_ids: output.new_token_ids.clone(),
                                         text: None,
                                         finish_reason: None,
@@ -2876,16 +3094,14 @@ impl AsyncEngine {
                         // "Streaming response ended before any complete data was
                         // received").
                         if is_finished && !finish_sent {
-                            let finish_reason = if req_state.tool_calls_emitted {
-                                Some(FinishReason::Stop)
-                            } else {
-                                delta_finish_reason
-                            };
+                            // The step's own reason, a tool call's included: the stream encoder
+                            // makes a tool call's `Stop` `tool_calls`, and a `Length` stays
+                            // `length` (the call was cut off).
                             let finish_delta = StreamDelta {
-                                index: req_state.choice_index,
+                                index: req_state.choice.index,
                                 new_token_ids: vec![],
                                 text: None,
-                                finish_reason,
+                                finish_reason: delta_finish_reason,
                                 stop_reason: delta_stop_reason.clone(),
                                 logprobs: None,
                                 tool_call_deltas: None,
@@ -2895,17 +3111,13 @@ impl AsyncEngine {
                             let _ = tx.send(finish_delta);
                         }
                     } else if is_finished {
-                        // No content text but finished — send finish delta.
-                        let fr = if req_state.tool_calls_emitted {
-                            Some(FinishReason::Stop)
-                        } else {
-                            delta_finish_reason
-                        };
+                        // No content text but finished — send finish delta, with the step's own
+                        // reason (see the finish above).
                         let delta = StreamDelta {
-                            index: req_state.choice_index,
+                            index: req_state.choice.index,
                             new_token_ids: output.new_token_ids.clone(),
                             text: None,
-                            finish_reason: fr,
+                            finish_reason: delta_finish_reason,
                             stop_reason: delta_stop_reason.clone(),
                             logprobs: step_logprobs.clone(),
                             tool_call_deltas: None,
@@ -2916,7 +3128,7 @@ impl AsyncEngine {
                     } else if reasoning_delta.is_some() {
                         // Only reasoning, no content for tool parser yet.
                         let delta = StreamDelta {
-                            index: req_state.choice_index,
+                            index: req_state.choice.index,
                             new_token_ids: output.new_token_ids.clone(),
                             text: None,
                             finish_reason: None,
@@ -2937,7 +3149,7 @@ impl AsyncEngine {
                     };
                     if text_out.is_some() || reasoning_delta.is_some() || is_finished {
                         let delta = StreamDelta {
-                            index: req_state.choice_index,
+                            index: req_state.choice.index,
                             new_token_ids: output.new_token_ids,
                             text: text_out,
                             finish_reason: delta_finish_reason,
@@ -3015,302 +3227,7 @@ impl AsyncEngine {
                 }
             }
         }
-    }
-
-    /// Process an engine output for a single request (single-threaded path,
-    /// used by tests).
-    #[cfg(test)]
-    fn process_output(requests: &mut HashMap<String, RequestState>, output: EngineCoreOutput) {
-        let Some(req_state) = requests.get_mut(&output.request_id) else {
-            debug!("Output for unknown request {}, ignoring", output.request_id);
-            return;
-        };
-        if req_state.finish_reason.is_some() {
-            return;
-        }
-
-        // Track output tokens.
-        #[cfg(feature = "metrics")]
-        {
-            let metrics = crate::metrics::VllmMetrics::global();
-            metrics
-                .output_tokens_total
-                .inc_by(output.new_token_ids.len() as u64);
-        }
-
-        // --- TTFT / ITL timing ---
-        let now = Instant::now();
-        if !output.new_token_ids.is_empty() {
-            if req_state.first_token_time.is_none() {
-                // First token: record TTFT.
-                req_state.first_token_time = Some(now);
-                if std::env::var_os("SCRATCHY_TTFT_PHASE").is_some() {
-                    eprintln!(
-                        "[ttft-host] submit_to_first_token={:.2} ms  (queue + prefill forward + sample + detokenize)",
-                        now.duration_since(req_state.submit_time).as_secs_f64() * 1e3,
-                    );
-                }
-                #[cfg(feature = "metrics")]
-                {
-                    let ttft = now.duration_since(req_state.submit_time).as_secs_f64();
-                    crate::metrics::VllmMetrics::global()
-                        .time_to_first_token_seconds
-                        .observe(ttft);
-                }
-            } else if let Some(last) = req_state.last_token_time {
-                // Subsequent token: record inter-token latency.
-                let itl = now.duration_since(last).as_secs_f64();
-                #[cfg(feature = "metrics")]
-                crate::metrics::VllmMetrics::global()
-                    .inter_token_latency_seconds
-                    .observe(itl);
-                req_state.itl_count += 1;
-                req_state.itl_sum += itl;
-            }
-            req_state.last_token_time = Some(now);
-        }
-
-        // Accumulate tokens and logprobs.
-        req_state.generated_token_ids.extend(&output.new_token_ids);
-        if let Some(lps) = &output.new_logprobs {
-            req_state.logprobs.extend(lps.iter().cloned());
-        }
-        if let Some(plps) = output.new_prompt_logprobs {
-            req_state.prompt_logprobs = Some(plps);
-        }
-        let step_logprobs = output.new_logprobs.clone();
-
-        // Update cached tokens.
-        if output.num_cached_tokens > 0 {
-            req_state.num_cached_tokens = output.num_cached_tokens;
-        }
-
-        // Store pooler output (embedding vector) if present.
-        if output.pooler_output.is_some() {
-            req_state.pooler_output = output.pooler_output;
-        }
-
-        // Determine if the engine already terminated (stop token).
-        let stop_terminated = output.finish_reason == Some(FinishReason::Stop);
-
-        // Update the detokenizer with new tokens. Shared behind a lock now (see [`SharedDetok`]) —
-        // uncontended here, this is the serial path.
-        let mut detokenizer_stop = None;
-        if let Some(detok) = req_state.detokenizer.as_ref() {
-            detokenizer_stop = detok
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .update(&output.new_token_ids, stop_terminated);
-        }
-
-        // Determine finish/stop reason. Detokenizer stop takes priority.
-        let is_finished = output.finish_reason.is_some() || detokenizer_stop.is_some();
-        let (delta_finish_reason, delta_stop_reason) = if let Some(stop_str) = detokenizer_stop {
-            (Some(FinishReason::Stop), Some(StopReason::String(stop_str)))
-        } else {
-            (output.finish_reason, output.stop_reason.clone())
-        };
-
-        // Get delta text for streaming.
-        let delta_text = req_state.detokenizer.as_ref().map(|detok| {
-            detok
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get_next_output_text(is_finished, true)
-        });
-
-        // Send streaming delta if applicable.
-        // Token counts, stamped on every delta this step emits. Read once
-        // here so the literals below stay uniform: which of them fires
-        // first depends on reasoning/tool-parser state, so there is no single
-        // "first delta" to special-case. `num_cached_tokens` is already set
-        // for this step (above), and the scheduler fixes it at admission.
-        // `generated_token_ids` already holds this step's tokens (above).
-        let usage = req_state.stream_usage();
-
-        if let Some(tx) = &req_state.stream_tx {
-            // If tool parser state is active, route through it.
-            if let Some(ref mut parser_state) = req_state.tool_parser_state {
-                if let Some(ref text) = delta_text {
-                    let previous_text = req_state.accumulated_text.clone();
-                    req_state.accumulated_text.push_str(text);
-                    let current_text = req_state.accumulated_text.clone();
-
-                    let parser_result =
-                        parser_state.process_delta(&previous_text, &current_text, text);
-
-                    match parser_result {
-                        ToolParserDelta::Content(content) => {
-                            let delta = StreamDelta {
-                                index: req_state.choice_index,
-                                new_token_ids: output.new_token_ids.clone(),
-                                text: Some(content),
-                                finish_reason: if is_finished && !req_state.tool_calls_emitted {
-                                    delta_finish_reason
-                                } else {
-                                    None
-                                },
-                                stop_reason: if is_finished && !req_state.tool_calls_emitted {
-                                    delta_stop_reason.clone()
-                                } else {
-                                    None
-                                },
-                                logprobs: step_logprobs.clone(),
-                                tool_call_deltas: None,
-                                reasoning: None,
-                                usage,
-                            };
-                            let _ = tx.send(delta);
-                        }
-                        ToolParserDelta::ToolCalls(tool_deltas) => {
-                            // Filter by forced function name if specified.
-                            let tool_deltas =
-                                if let Some(ref forced) = req_state.forced_function_name {
-                                    tool_deltas
-                                        .into_iter()
-                                        .filter(|d| {
-                                            d.function_name.as_ref().is_none_or(|n| n == forced)
-                                        })
-                                        .collect::<Vec<_>>()
-                                } else {
-                                    tool_deltas
-                                };
-                            if tool_deltas.is_empty() {
-                                // Filtered out — don't emit.
-                            } else {
-                                req_state.tool_calls_emitted = true;
-                                let delta = StreamDelta {
-                                    index: req_state.choice_index,
-                                    new_token_ids: output.new_token_ids.clone(),
-                                    text: None,
-                                    finish_reason: None,
-                                    stop_reason: None,
-                                    logprobs: step_logprobs.clone(),
-                                    tool_call_deltas: Some(tool_deltas),
-                                    reasoning: None,
-                                    usage,
-                                };
-                                let _ = tx.send(delta);
-                            }
-                        }
-                        ToolParserDelta::None => {
-                            // Buffering, don't send anything yet.
-                        }
-                    }
-
-                    // Send finish delta separately if finished and tool calls were emitted.
-                    if is_finished && req_state.tool_calls_emitted {
-                        let finish_delta = StreamDelta {
-                            index: req_state.choice_index,
-                            new_token_ids: vec![],
-                            text: None,
-                            finish_reason: Some(FinishReason::Stop), // overridden to tool_calls in server.rs
-                            stop_reason: delta_stop_reason.clone(),
-                            logprobs: None,
-                            tool_call_deltas: None,
-                            reasoning: None,
-                            usage,
-                        };
-                        let _ = tx.send(finish_delta);
-                    }
-                } else if is_finished {
-                    // No text but finished — send finish delta.
-                    let fr = if req_state.tool_calls_emitted {
-                        Some(FinishReason::Stop)
-                    } else {
-                        delta_finish_reason
-                    };
-                    let delta = StreamDelta {
-                        index: req_state.choice_index,
-                        new_token_ids: output.new_token_ids.clone(),
-                        text: None,
-                        finish_reason: fr,
-                        stop_reason: delta_stop_reason.clone(),
-                        logprobs: step_logprobs.clone(),
-                        tool_call_deltas: None,
-                        reasoning: None,
-                        usage,
-                    };
-                    let _ = tx.send(delta);
-                }
-            } else {
-                // No tool parsing — normal streaming path.
-                let delta = StreamDelta {
-                    index: req_state.choice_index,
-                    new_token_ids: output.new_token_ids,
-                    text: delta_text,
-                    finish_reason: delta_finish_reason,
-                    stop_reason: delta_stop_reason.clone(),
-                    logprobs: step_logprobs.clone(),
-                    tool_call_deltas: None,
-                    reasoning: None,
-                    usage,
-                };
-                let _ = tx.send(delta);
-            }
-        }
-
-        // Update request state finish/stop reason.
-        if is_finished && req_state.finish_reason.is_none() {
-            req_state.finish_reason = delta_finish_reason;
-            req_state.stop_reason = delta_stop_reason.or(output.stop_reason);
-        }
-
-        // Log and clean up when done.
-        if is_finished {
-            let total_latency = now.duration_since(req_state.submit_time).as_secs_f64();
-            let ttft_ms = req_state
-                .first_token_time
-                .map(|t| t.duration_since(req_state.submit_time).as_secs_f64() * 1000.0);
-            let avg_itl_ms = if req_state.itl_count > 0 {
-                Some(req_state.itl_sum / req_state.itl_count as f64 * 1000.0)
-            } else {
-                None
-            };
-            let prompt_tokens = req_state.num_prompt_tokens;
-            let completion_tokens = req_state.generated_token_ids.len() as u32;
-
-            let finish_str = req_state
-                .finish_reason
-                .map(|r| r.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            let stop_str = req_state
-                .stop_reason
-                .as_ref()
-                .map(|sr| match sr {
-                    StopReason::Token(id) => format!("token:{id}"),
-                    StopReason::String(s) => format!("string:{s}"),
-                })
-                .unwrap_or_default();
-
-            tracing::info!(
-                request_id = %output.request_id,
-                prompt_tokens = prompt_tokens,
-                completion_tokens = completion_tokens,
-                finish_reason = finish_str,
-                stop_reason = stop_str,
-                latency_ms = format!("{:.1}", total_latency * 1000.0),
-                ttft_ms = ttft_ms.map(|v| format!("{v:.1}")).unwrap_or_else(|| "-".into()),
-                avg_itl_ms = avg_itl_ms.map(|v| format!("{v:.1}")).unwrap_or_else(|| "-".into()),
-                "request finished"
-            );
-
-            #[cfg(feature = "metrics")]
-            {
-                let metrics = crate::metrics::VllmMetrics::global();
-                metrics.request_latency_seconds.observe(total_latency);
-                metrics.requests_active.dec();
-                metrics.requests_success_total.inc();
-            }
-            // Drop stream sender; capture whether this was a streaming request.
-            let was_streaming = req_state.stream_tx.take().is_some();
-
-            // Streaming requests are cleaned up here — there's no poll_until_done
-            // consumer. Non-streaming requests stay for poll_until_done to remove.
-            if was_streaming {
-                requests.remove(&output.request_id);
-            }
-        }
+        stop_string_finished
     }
 
     /// Convert a chat completion request to an engine core request.
@@ -3318,23 +3235,17 @@ impl AsyncEngine {
         &self,
         request_id: &str,
         request: &protocol::ChatCompletionRequest,
-        sampling_params: &SamplingParams,
+        sampling_params: &mut SamplingParams,
     ) -> ServeResult<EngineCoreRequest> {
         // Build text from chat messages — using chat template if available.
-        let text = if let Some(template) = &self.chat_template {
-            // Merge default + per-request chat template kwargs.
-            let merged_kwargs = merge_chat_template_kwargs(
-                self.default_chat_template_kwargs.as_ref(),
-                request.chat_template_kwargs.as_ref(),
-            );
-
-            template.render_chat(
-                &request.messages,
-                request.tools.as_deref(),
-                request.tool_choice.as_ref(),
-                merged_kwargs.as_ref(),
-                true,
-            )?
+        let rendered = self.render_chat(
+            &request.messages,
+            request.tools.as_deref(),
+            request.chat_template_kwargs.as_ref(),
+            true,
+        );
+        let text = if let Some(rendered) = rendered {
+            rendered?
         } else {
             // Fallback: concatenate messages with newlines.
             let mut text = String::new();
@@ -3378,7 +3289,7 @@ impl AsyncEngine {
             if text.is_empty() {
                 vec![]
             } else {
-                let (ids, through) = tok.encode_through(&text, true, &marks)?;
+                let (ids, through) = tok.encode_chat(&text, &marks)?;
                 cache_breakpoints = through;
                 ids
             }
@@ -3401,6 +3312,20 @@ impl AsyncEngine {
         if mm_data.is_some() {
             cache_breakpoints.clear();
         }
+
+        // Truncate prompt tokens from the left (keep the last N): the prompt the model reads.
+        truncate_prompt(&mut token_ids, request.truncate_prompt_tokens)?;
+
+        // ⭐ A REASONING MODEL THINKS BEFORE ITS GRAMMAR APPLIES (#793), where the prompt it reads
+        // leaves it thinking or lets it start to.
+        sampling_params.think_first =
+            match (&sampling_params.guided_grammar, &self.reasoning_parser) {
+                (Some(_), Some(parser)) => (parser.think_tokens()).and_then(|tokens| {
+                    let prompt = self.prompt_thinking(tokens, &token_ids);
+                    scratchy_core_common::sampling::ThinkFirst::of(tokens, prompt)
+                }),
+                _ => None,
+            };
 
         Ok(EngineCoreRequest {
             request_id: request_id.to_string(),
@@ -3648,6 +3573,10 @@ impl AsyncEngine {
         &self,
         request: &protocol::ChatCompletionRequest,
     ) -> ServeResult<SamplingParams> {
+        let tools: Vec<&str> = (request.tools.iter().flatten())
+            .map(|t| t.function.name.as_str())
+            .collect();
+        check_tool_choice(&request.tool_choice, &tools)?;
         let stop = match &request.stop {
             Some(protocol::StopCondition::Single(s)) => vec![s.clone()],
             Some(protocol::StopCondition::Multiple(v)) => v.clone(),
@@ -3669,6 +3598,26 @@ impl AsyncEngine {
             &request.guided_regex,
             &request.guided_grammar,
         )?;
+        // ⭐ `tool_choice: "required"` IS A GRAMMAR (#765): the reply is a JSON array of calls to
+        // the declared tools, so it is a tool call whatever the model would have said. It shapes
+        // the whole reply, so a reply already shaped another way can't take it too.
+        let guided_grammar = match (&request.tool_choice, guided_grammar) {
+            (Some(protocol::ToolChoice::Required), None) => {
+                let tools = request.tools.as_deref().unwrap_or_default();
+                let limit = request.call_limit();
+                let schema = crate::tool_parser::required_tool_calls_schema(tools, limit)
+                    .map_err(ServeError::Validation)?;
+                Some(GuidedGrammar::JsonSchema { schema })
+            }
+            (Some(protocol::ToolChoice::Required), Some(_)) => {
+                return Err(ServeError::Validation(
+                    "tool_choice \"required\" constrains the reply itself, so it can't be \
+                     combined with response_format, guided_regex or guided_grammar"
+                        .to_string(),
+                ));
+            }
+            (_, guided_grammar) => guided_grammar,
+        };
 
         // Tokenize bad_words strings into token sequences.
         let bad_words_token_ids = self.tokenize_bad_words(&request.bad_words)?;
@@ -3718,12 +3667,46 @@ impl AsyncEngine {
             skip_special_tokens: request.skip_special_tokens && !keep_special_tokens,
             logprobs,
             prompt_logprobs: request.prompt_logprobs.map(|n| n as i32),
-            logit_bias: parse_logit_bias(&request.logit_bias),
+            logit_bias: self.logit_bias(&request.logit_bias)?,
             guided_grammar,
             allowed_token_ids: request.allowed_token_ids.clone(),
             bad_words_token_ids,
             ..Default::default()
         })
+    }
+
+    /// A request's `logit_bias` (OpenAI's string token-id keys) keyed by token id. A key that is
+    /// not a token id, or names one outside the vocabulary, is a 400, as vLLM refuses both (its
+    /// `int(token)` and `_validate_logit_bias`), rather than a bias silently dropped.
+    fn logit_bias(
+        &self,
+        api_bias: &Option<HashMap<String, f64>>,
+    ) -> ServeResult<Option<HashMap<u32, f32>>> {
+        let Some(bias) = api_bias.as_ref().filter(|b| !b.is_empty()) else {
+            return Ok(None);
+        };
+        let parsed = (bias.iter())
+            .map(|(key, &value)| match key.parse::<u32>() {
+                Ok(id) => Ok((id, value as f32)),
+                Err(_) => Err(ServeError::Validation(format!(
+                    "logit_bias key {key:?} is not a token id"
+                ))),
+            })
+            .collect::<ServeResult<HashMap<u32, f32>>>()?;
+        if let Some(tokenizer) = &self.tokenizer {
+            let vocab = tokenizer.vocab_size();
+            let mut outside: Vec<u32> = (parsed.keys().copied())
+                .filter(|&id| id as usize >= vocab)
+                .collect();
+            if !outside.is_empty() {
+                outside.sort_unstable();
+                return Err(ServeError::Validation(format!(
+                    "token_id(s) {outside:?} in logit_bias contain out-of-vocab token ids. \
+                     Vocabulary size: {vocab}"
+                )));
+            }
+        }
+        Ok(Some(parsed))
     }
 
     /// Build SamplingParams from a completion request.
@@ -3768,7 +3751,7 @@ impl AsyncEngine {
             skip_special_tokens: request.skip_special_tokens,
             logprobs,
             prompt_logprobs: request.prompt_logprobs.map(|n| n as i32),
-            logit_bias: parse_logit_bias(&request.logit_bias),
+            logit_bias: self.logit_bias(&request.logit_bias)?,
             guided_grammar,
             allowed_token_ids: request.allowed_token_ids.clone(),
             bad_words_token_ids,
@@ -3840,6 +3823,43 @@ enum ExecutorResult {
     ),
 }
 
+/// Owns the async executor thread's channel sender and join handle, so the
+/// thread's teardown is waited out wherever the step loop's future ends —
+/// completed or dropped mid-await (a SIGTERM ends the process through
+/// `serve` returning, which can drop the loop's task before its own tail
+/// runs). [`Drop`] closes the channel first — the executor thread's cue to
+/// run `executor.shutdown()` (see `executor_thread_loop`) — then joins, so
+/// the worker shutdown the thread performs (the metal aligned-sidecar
+/// drain, the GPU residency release) completes before whatever dropped this
+/// proceeds. The sender is `Option` only so `Drop` can take it; the thread
+/// handle likewise. Mirrors the `InprocClient` pipeline's own
+/// drop-sender-then-join teardown in `core_client.rs`.
+struct ExecutorPipeline {
+    tx: Option<tokio::sync::mpsc::Sender<ExecutorWork>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ExecutorPipeline {
+    /// The sender, for as long as the pipeline is alive.
+    fn tx(&self) -> &tokio::sync::mpsc::Sender<ExecutorWork> {
+        self.tx
+            .as_ref()
+            .expect("executor pipeline sender already dropped")
+    }
+}
+
+impl Drop for ExecutorPipeline {
+    fn drop(&mut self) {
+        // Close the channel before joining: the executor thread exits its
+        // work loop on a closed channel (running its teardown), and would
+        // otherwise sit in `blocking_recv` forever waiting for this sender.
+        drop(self.tx.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// The executor thread's main loop.
 ///
 /// Receives work items from the step loop, executes them, and sends results
@@ -3878,21 +3898,41 @@ fn executor_thread_loop(
             ExecutorWork::IsSleeping(reply) => {
                 let _ = reply.send(executor.is_sleeping());
             }
-            ExecutorWork::Shutdown => {
-                executor.shutdown();
-                break;
-            }
+            // The teardown itself runs once, below the loop: `Shutdown`
+            // breaks out of it, and a channel that closed without `Shutdown`
+            // must reach the same call.
+            ExecutorWork::Shutdown => break,
         }
     }
+    // Shut down on EVERY exit from the loop, not just the explicit
+    // `Shutdown` work item. The other exit — the channel closing — is the
+    // common way a SIGTERM ends this server: the step loop's task is
+    // dropped when the tokio runtime tears down after `serve` returns,
+    // racing the loop's own wake-and-break (its tail sends `Shutdown`
+    // only if it gets to run first), so the executor thread used to see a
+    // closed channel and exit silently, skipping `worker.shutdown()`.
+    // Measured consequence: the metal worker's aligned-sidecar drain never
+    // ran — the background writer was killed mid-write and its build
+    // discarded, so every launch re-paid the cold realign copy (#411) —
+    // and the wired GPU residency was left to the kernel's intermittent
+    // reclaim instead of the deterministic release this path promises.
+    // With the teardown here, the dropping thread's `InprocClient` join
+    // (which is what closed the channel) waits out the drain before the
+    // process can exit. The sibling `executor_bg_loop` has always run
+    // this same tail on its own channel-close path.
+    executor.shutdown();
 }
 
 /// Route step outputs to request states and update metrics.
-/// Returns `true` if any output tokens were produced.
+///
+/// Returns the requests this pass finishes by a stop string alone — the engine
+/// is still decoding each of those (a stop string is not an engine-side
+/// criterion), and the caller must abort them engine-side (#711).
 async fn route_step_outputs(
     requests: &Mutex<HashMap<String, RequestState>>,
     outputs: scratchy_serving_engine::engine_core::StepOutputs,
-) -> bool {
-    let mut had_outputs = false;
+) -> Vec<String> {
+    let mut stop_string_finished: Vec<String> = Vec::new();
     for (_, engine_outputs) in outputs {
         // Update scheduler gauges from stats.
         #[cfg(feature = "metrics")]
@@ -3916,8 +3956,6 @@ async fn route_step_outputs(
         }
 
         if !engine_outputs.outputs.is_empty() {
-            had_outputs = true;
-
             // Phase 1: accumulate tokens, take detokenizers (brief lock).
             let detok_work = {
                 let mut reqs = requests.lock().await;
@@ -3934,25 +3972,21 @@ async fn route_step_outputs(
             // Phase 3: apply detok results, send streams (brief lock).
             {
                 let mut reqs = requests.lock().await;
-                AsyncEngine::process_outputs_phase3(
+                stop_string_finished.extend(AsyncEngine::process_outputs_phase3(
                     &mut reqs,
                     engine_outputs.outputs,
                     detok_results,
-                );
+                ));
             }
         }
     }
-    had_outputs
+    stop_string_finished
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Convert API-style logit_bias (string keys, f64 values) to sampler format.
-///
-/// OpenAI API uses string token IDs as keys; we parse them to u32.
-/// Invalid keys are silently ignored.
 /// Truncate prompt token IDs from the left, keeping the last N tokens.
 ///
 /// `truncate` values: `None` → no-op, `Some(-1)` → no-op (model max),
@@ -3977,31 +4011,13 @@ fn truncate_prompt(tokens: &mut Vec<u32>, truncate: Option<i64>) -> ServeResult<
     Ok(())
 }
 
-fn parse_logit_bias(
-    api_bias: &Option<std::collections::HashMap<String, f64>>,
-) -> Option<std::collections::HashMap<u32, f32>> {
-    let bias = api_bias.as_ref()?;
-    if bias.is_empty() {
-        return None;
-    }
-    let parsed: std::collections::HashMap<u32, f32> = bias
-        .iter()
-        .filter_map(|(k, &v)| k.parse::<u32>().ok().map(|tid| (tid, v as f32)))
-        .collect();
-    if parsed.is_empty() {
-        None
-    } else {
-        Some(parsed)
-    }
-}
-
 /// Parse `response_format` from an API request into a `GuidedGrammar`.
 ///
 /// - `type: "text"` → `None` (no constraint)
 /// - `type: "json_object"` → `Some(GuidedGrammar::Json)`
 /// - `type: "json_schema"` → `Some(GuidedGrammar::JsonSchema { schema })`
 /// - `type: "structural_tag"` → `Some(GuidedGrammar::StructuralTag { spec })`
-fn parse_response_format(
+pub(crate) fn parse_response_format(
     rf: &Option<protocol::ResponseFormat>,
 ) -> ServeResult<Option<GuidedGrammar>> {
     let Some(rf) = rf else {
@@ -4160,19 +4176,173 @@ fn build_completion_logprobs(
     }
 }
 
-/// Check if tool_choice is set to "none" (disabling tool use).
-fn is_tool_choice_none(tool_choice: &Option<serde_json::Value>) -> bool {
-    tool_choice.as_ref().and_then(|v| v.as_str()) == Some("none")
+/// ⛔ A `tool_choice` THAT NEEDS A TOOL NAMES ONE THE REQUEST DECLARES. A forced tool missing
+/// from `tools` would have every call the model makes dropped, and its reply would come back as
+/// text with no error: #767's bug, through a misspelled name. `"required"` with no tools could be
+/// met by none. Both are refused, as vLLM's `check_tool_usage` and the upstream APIs refuse them.
+/// `tools` names the tools the request declares. Every chat request is checked as its sampling
+/// params are built; `/v1/messages`' `tool-spans` path, which builds none, checks its own.
+pub(crate) fn check_tool_choice(
+    tool_choice: &Option<protocol::ToolChoice>,
+    tools: &[&str],
+) -> ServeResult<()> {
+    match tool_choice {
+        Some(protocol::ToolChoice::Function(name)) if !tools.contains(&name.as_str()) => {
+            Err(ServeError::Validation(format!(
+                "tool_choice forces the tool `{name}`, which `tools` does not declare"
+            )))
+        }
+        Some(protocol::ToolChoice::Required) if tools.is_empty() => Err(ServeError::Validation(
+            "tool_choice requires a tool call, and `tools` declares none".to_string(),
+        )),
+        _ => Ok(()),
+    }
 }
 
-/// Extract the forced function name from `tool_choice`, if it specifies one.
+/// Whether `tool_choice` is `"none"`: the reply is never read for a tool call.
+fn is_tool_choice_none(tool_choice: &Option<protocol::ToolChoice>) -> bool {
+    matches!(tool_choice, Some(protocol::ToolChoice::None))
+}
+
+/// A whole reply as its `tool_choice` lets its tool calls out: read by `parser` unless the choice
+/// is `"none"`, and with a [`ForcedTool`] only that tool's calls, the reply then the text around
+/// the others. Of the calls kept, `limit` keeps the first ones (#794). Both whole-reply paths
+/// apply it (the chat endpoint's, and `/v1/messages`' under `tool-spans`); the stream applies the
+/// same rule call by call ([`ToolCallStream`]).
+pub(crate) fn reply_tool_calls(
+    parser: &dyn ToolCallParser,
+    text: String,
+    tool_choice: &Option<protocol::ToolChoice>,
+    limit: protocol::CallLimit,
+) -> ToolReply {
+    if is_tool_choice_none(tool_choice) {
+        return ToolReply {
+            content: Some(text),
+            calls: None,
+        };
+    }
+    let extracted = parser.extract_tool_calls(&text);
+    if !extracted.tools_called {
+        // No tool call: keep the parser's cleaned content (it may strip control tokens) instead
+        // of the raw text.
+        return ToolReply {
+            content: extracted.content.or(Some(text)),
+            calls: None,
+        };
+    }
+    let forced = ForcedTool::of(tool_choice);
+    let calls: Vec<_> = (extracted.tool_calls.into_iter())
+        .filter(|tc| (forced.as_ref()).is_none_or(|f| f.admits(&tc.function.name)))
+        .take(limit.most())
+        .collect();
+    // Every call named a tool other than the forced one: dropped, as the stream drops them, so
+    // the reply is the text around them.
+    ToolReply {
+        content: extracted.content,
+        calls: (!calls.is_empty()).then_some(calls),
+    }
+}
+
+/// A whole reply's text and the tool calls [`reply_tool_calls`] kept, `None` when it kept none.
+pub(crate) struct ToolReply {
+    pub content: Option<String>,
+    pub calls: Option<Vec<protocol::ToolCall>>,
+}
+
+/// The one tool a `tool_choice` makes the model call (OpenAI's
+/// `{"type": "function", "function": {"name": "get_weather"}}`, Anthropic's
+/// `{"type": "tool", "name": …}`: [`protocol::ToolChoice::Function`]), decoded once per request.
+/// Both replies drop a call to any other tool, so the reply is the text around it: the stream must
+/// decide a call at its first delta, before it can know whether a later call will be kept (#683).
+#[derive(Clone, Debug, PartialEq)]
+struct ForcedTool(String);
+
+impl ForcedTool {
+    /// The tool `tool_choice` forces, if it names one.
+    fn of(tool_choice: &Option<protocol::ToolChoice>) -> Option<Self> {
+        match tool_choice {
+            Some(protocol::ToolChoice::Function(name)) => Some(Self(name.clone())),
+            _ => None,
+        }
+    }
+
+    /// Whether a call to `name` is kept.
+    fn admits(&self, name: &str) -> bool {
+        self.0 == name
+    }
+}
+
+/// A tool call's index among the tool parser's deltas.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ParserCall(u32);
+
+/// A tool call's index in the stream the client receives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct StreamCall(u32);
+
+/// A request's streamed tool calls as they leave the output path: each call's name first, and
+/// with a [`ForcedTool`], only that tool's calls, and of those only the first ones its
+/// [`protocol::CallLimit`] keeps, numbered from 0 in the order they are named (the places they
+/// hold in the non-streaming reply's list).
 ///
-/// OpenAI format: `{"type": "function", "function": {"name": "get_weather"}}`
-fn get_tool_choice_function_name(tool_choice: &Option<serde_json::Value>) -> Option<String> {
-    let val = tool_choice.as_ref()?;
-    let obj = val.as_object()?;
-    let func = obj.get("function")?.as_object()?;
-    func.get("name")?.as_str().map(|s| s.to_string())
+/// Every consumer reads a call's first delta as its start (`/v1/messages` opens the `tool_use`
+/// block with its name; the forced filter keeps or drops the call on it), but a parser can write
+/// a call's arguments before its name: Mistral's pre-v11 format takes the object's keys in the
+/// order the model writes them. So a call's deltas are held until its name arrives, and go out
+/// right after it; a call that never names its tool sends nothing.
+#[derive(Default)]
+struct ToolCallStream {
+    forced: Option<ForcedTool>,
+    limit: protocol::CallLimit,
+    kept: HashMap<ParserCall, StreamCall>,
+    /// The calls that named a tool the request does not allow, or came past its limit.
+    dropped: HashSet<ParserCall>,
+    /// The deltas of calls whose name has not arrived.
+    unnamed: HashMap<ParserCall, Vec<DeltaToolCall>>,
+}
+
+impl ToolCallStream {
+    fn new(forced: Option<ForcedTool>, limit: protocol::CallLimit) -> Self {
+        Self {
+            forced,
+            limit,
+            ..Self::default()
+        }
+    }
+
+    /// The deltas to send for the parser's `deltas`, renumbered for the stream.
+    fn admit(&mut self, deltas: Vec<DeltaToolCall>) -> Vec<DeltaToolCall> {
+        let mut out = Vec::new();
+        for delta in deltas {
+            let call = ParserCall(delta.index);
+            if self.dropped.contains(&call) {
+                continue;
+            }
+            if let Some(&StreamCall(index)) = self.kept.get(&call) {
+                out.push(DeltaToolCall { index, ..delta });
+                continue;
+            }
+            let Some(name) = delta.function_name.as_deref() else {
+                self.unnamed.entry(call).or_default().push(delta);
+                continue;
+            };
+            let held = self.unnamed.remove(&call).unwrap_or_default();
+            let forced_out = self.forced.as_ref().is_some_and(|f| !f.admits(name));
+            if forced_out || self.kept.len() >= self.limit.most() {
+                self.dropped.insert(call);
+                continue;
+            }
+            let stream_call = StreamCall(self.kept.len() as u32);
+            self.kept.insert(call, stream_call);
+            let StreamCall(index) = stream_call;
+            out.extend(
+                std::iter::once(delta)
+                    .chain(held)
+                    .map(|d| DeltaToolCall { index, ..d }),
+            );
+        }
+        out
+    }
 }
 
 /// Generate placeholder text from token IDs (used when no tokenizer is available).
@@ -4260,6 +4430,13 @@ mod tests {
     use scratchy_serving_engine::executor::NoopExecutor;
     use scratchy_serving_transport::messages::PauseMode;
 
+    /// One engine output through the server's output path: phase 1, the detokenizer, phase 3.
+    fn run_output(requests: &mut HashMap<String, RequestState>, output: EngineCoreOutput) {
+        let work = AsyncEngine::process_outputs_phase1(requests, std::slice::from_ref(&output));
+        let results = AsyncEngine::parallel_detokenize(work);
+        AsyncEngine::process_outputs_phase3(requests, vec![output], results);
+    }
+
     pub(super) fn make_test_request_state(
         stream_tx: Option<mpsc::UnboundedSender<StreamDelta>>,
     ) -> RequestState {
@@ -4272,7 +4449,7 @@ mod tests {
             stop_reason: None,
             stream_tx,
             detokenizer: None,
-            choice_index: 0,
+            choice: Choice::default(),
             submit_time: Instant::now(),
             first_token_time: None,
             last_token_time: None,
@@ -4288,7 +4465,7 @@ mod tests {
             accumulated_content: String::new(),
             accumulated_token_ids: Vec::new(),
             tool_calls_emitted: false,
-            forced_function_name: None,
+            tool_calls: ToolCallStream::default(),
             pooler_output: None,
         }
     }
@@ -4360,6 +4537,7 @@ mod tests {
             response_format: None,
             tools: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             user: None,
             top_k: None,
             min_p: None,
@@ -4443,13 +4621,232 @@ mod tests {
         assert!(engine.check_prompt_fits(1024).is_ok());
     }
 
+    /// A reasoning model's grammar waits for it to think (#793). On an engine whose reasoning
+    /// parser thinks in `<think>` tokens, a request with a grammar carries where its reply starts
+    /// thinking: here, where it may open it, as the prompt has neither token. A request without a
+    /// grammar, or an engine whose parser reads its markers as text (harmony), carries none.
+    #[test]
+    fn a_grammar_request_on_a_reasoning_model_thinks_first() {
+        use scratchy_core_common::sampling::{ThinkFirst, ThinkTokens};
+        let vocab = HashMap::from([
+            ("<think>".to_string(), 1000),
+            ("</think>".to_string(), 1001),
+        ]);
+        let think = |engine: &AsyncEngine, response_format: Option<serde_json::Value>| {
+            let request = protocol::ChatCompletionRequest {
+                response_format: response_format.map(|f| serde_json::from_value(f).unwrap()),
+                ..make_chat_request()
+            };
+            let mut params = engine.build_sampling_params_from_chat(&request).unwrap();
+            let ec_request = engine
+                .chat_to_engine_request("test-1", &request, &mut params)
+                .unwrap();
+            let sent = ec_request.sampling_params.unwrap().think_first;
+            assert_eq!(
+                sent, params.think_first,
+                "the request carries what the params do"
+            );
+            params.think_first
+        };
+        let json = Some(serde_json::json!({"type": "json_object"}));
+
+        let mut qwen3 = make_test_engine();
+        let parser = crate::reasoning_parser::get_reasoning_parser("qwen3", &vocab).unwrap();
+        qwen3.set_reasoning_parser(parser);
+        let tokens = ThinkTokens {
+            open: 1000,
+            close: 1001,
+        };
+        assert_eq!(
+            think(&qwen3, json.clone()),
+            Some(ThinkFirst::MayOpen(tokens))
+        );
+        assert_eq!(think(&qwen3, None), None, "no grammar");
+
+        let mut harmony = make_test_engine();
+        let parser = crate::reasoning_parser::get_reasoning_parser("gpt_oss", &vocab).unwrap();
+        harmony.set_reasoning_parser(parser);
+        assert_eq!(think(&harmony, json.clone()), None, "markers read as text");
+
+        assert_eq!(
+            think(&make_test_engine(), json),
+            None,
+            "no reasoning parser"
+        );
+    }
+
+    /// The engine reads a prompt as having closed thinking only where it ends with a closed think
+    /// block, judging the tail by decoding it: whitespace alone after the close (a template with
+    /// thinking off), not an earlier turn's thinking with the conversation after it. Byte-level
+    /// test tokenizer; `T` and `U` stand in for `<think>` and `</think>`.
+    #[test]
+    fn a_prompt_closes_thinking_only_where_it_ends_with_a_closed_think_block() {
+        use scratchy_core_common::sampling::{PromptThinking, ThinkTokens};
+        let engine = make_test_engine_with_tokenizer();
+        let tokenizer = engine.tokenizer.clone().unwrap();
+        let ids = |text: &str| tokenizer.encode(text, false).unwrap();
+        let [open, close] = [ids("T")[0], ids("U")[0]];
+        let tokens = ThinkTokens { open, close };
+        let reads = |text: &str| engine.prompt_thinking(tokens, &ids(text));
+        assert_eq!(reads("hi T"), PromptThinking::Open);
+        assert_eq!(
+            reads("hi T\n\nU\n\n"),
+            PromptThinking::Closed,
+            "thinking off"
+        );
+        assert_eq!(
+            reads("hi TaU"),
+            PromptThinking::Closed,
+            "closed at the very end"
+        );
+        assert_eq!(
+            reads("hi TaU then a tool call"),
+            PromptThinking::Absent,
+            "an earlier turn's"
+        );
+        assert_eq!(
+            reads(&format!("hi TaU \n {}", "tool result ".repeat(4096))),
+            PromptThinking::Absent,
+            "a long tail, its first text deciding it"
+        );
+        assert_eq!(reads("hi"), PromptThinking::Absent);
+    }
+
+    /// A reply after a prompt that closed its model's thinking is content, whole and streamed: no
+    /// reasoning parser reads it (#819). One after a prompt that opened thinking, or has none, or
+    /// keeps an earlier turn's thinking, is read by the engine's parser. A parser whose markers are
+    /// text reads every reply. Byte-level test tokenizer; `T` and `U` stand in for `<think>` and
+    /// `</think>`.
+    #[test]
+    fn a_reply_after_a_prompt_that_closed_thinking_is_content() {
+        let mut engine = make_test_engine_with_tokenizer();
+        let tokenizer = engine.tokenizer.clone().unwrap();
+        let ids = |text: &str| tokenizer.encode(text, false).unwrap();
+        let vocab = HashMap::from([
+            ("<think>".to_string(), ids("T")[0]),
+            ("</think>".to_string(), ids("U")[0]),
+        ]);
+        let reads = |engine: &AsyncEngine, prompt: &str| {
+            engine.request_reasoning_parser(&ids(prompt)).is_some()
+        };
+        assert!(!reads(&engine, "hi"), "no parser");
+
+        let qwen3 = crate::reasoning_parser::get_reasoning_parser("qwen3", &vocab).unwrap();
+        engine.set_reasoning_parser(qwen3);
+        assert!(!reads(&engine, "hi T\n\nU\n\n"), "thinking off: content");
+        assert!(reads(&engine, "hi T"), "thinking open");
+        assert!(reads(&engine, "hi"), "no thinking in the prompt");
+        assert!(
+            reads(&engine, "hi TaU and a tool call"),
+            "an earlier turn's thinking"
+        );
+
+        let harmony = crate::reasoning_parser::get_reasoning_parser("gpt_oss", &vocab).unwrap();
+        engine.set_reasoning_parser(harmony);
+        assert!(reads(&engine, "hi T\n\nU\n\n"), "text markers: always read");
+    }
+
+    /// `/tokenize` counts a chat request's prompt as the prefill builds it (#214): its tools, its
+    /// chat-template kwargs merged over the server's defaults, and the special tokens the prefill
+    /// encodes it with, also on a tokenizer whose post-processor adds a BOS. The handler's count
+    /// is the prefill's prompt ids, `chat_to_engine_request`'s; without the tools it falls short,
+    /// as it did before, and a client's own `add_special_tokens` is still honored.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn tokenize_counts_a_chat_prompt_as_the_prefill_builds_it() {
+        use crate::tokenizer::make_test_tokenizer_with_bos;
+        use tower::ServiceExt;
+        let template = "{{ bos_token }}{% for m in messages %}{{ m.content }}{% endfor %}\
+                        {% if tools %}TOOLS:{{ tools | tojson }}{% endif %}\
+                        {% if think %}THINK{% endif %}{% if terse %}TERSE{% endif %}";
+        let tools = serde_json::json!([{"type": "function", "function": {
+            "name": "Bash", "description": "Run a shell command",
+            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}
+        }}]);
+        let kwargs = serde_json::json!({"terse": true});
+        let request = protocol::ChatCompletionRequest {
+            tools: Some(serde_json::from_value(tools.clone()).unwrap()),
+            chat_template_kwargs: Some(serde_json::from_value(kwargs.clone()).unwrap()),
+            ..make_chat_request()
+        };
+        let messages = serde_json::to_value(&request.messages).unwrap();
+        for (tok, posts_bos) in [
+            (make_test_tokenizer(), false),
+            (make_test_tokenizer_with_bos(), true),
+        ] {
+            let client = Box::new(InprocClient::new(
+                make_engine_config(),
+                Box::new(NoopExecutor::new(1024)),
+            ));
+            let mut engine =
+                AsyncEngine::with_tokenizer(client, "test-model".to_string(), 4096, Arc::new(tok));
+            let template = ChatTemplate::new(template.to_string()).unwrap();
+            engine.set_chat_template(Arc::new(template.with_bos_token("<s>".to_string())));
+            engine.set_default_chat_template_kwargs(HashMap::from([(
+                "think".to_string(),
+                serde_json::json!(true),
+            )]));
+            let mut params = engine.build_sampling_params_from_chat(&request).unwrap();
+            let prefill = (engine.chat_to_engine_request("test-1", &request, &mut params))
+                .unwrap()
+                .prompt_token_ids
+                .unwrap();
+
+            let state = Arc::new(crate::server::AppState {
+                engine: Arc::new(engine),
+                config: Default::default(),
+                is_pooling: false,
+                scratchy_core_config: None,
+                requests_served: std::sync::atomic::AtomicU64::new(0),
+            });
+            let count = |body: serde_json::Value| {
+                let router = crate::server::build_router(state.clone());
+                async move {
+                    let request = http::Request::builder()
+                        .method("POST")
+                        .uri("/tokenize")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap();
+                    let response = router.oneshot(request).await.unwrap();
+                    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    response["count"].as_u64().unwrap() as usize
+                }
+            };
+            let body = serde_json::json!({
+                "messages": messages, "tools": tools, "chat_template_kwargs": kwargs,
+            });
+            let counted = count(body.clone()).await;
+            assert_eq!(
+                counted,
+                prefill.len(),
+                "the prefill's count, BOS post-processor: {posts_bos}"
+            );
+            let without_tools =
+                count(serde_json::json!({"messages": messages, "chat_template_kwargs": kwargs}))
+                    .await;
+            assert!(without_tools < counted, "{without_tools} without the tools");
+            let mut plain = body;
+            plain["add_special_tokens"] = serde_json::json!(false);
+            let posted = usize::from(posts_bos);
+            assert_eq!(
+                count(plain).await,
+                prefill.len() - posted,
+                "the client's own flag"
+            );
+        }
+    }
+
     #[test]
     fn test_chat_to_engine_request_without_tokenizer() {
         let engine = make_test_engine();
         let request = make_chat_request();
-        let params = engine.build_sampling_params_from_chat(&request).unwrap();
+        let mut params = engine.build_sampling_params_from_chat(&request).unwrap();
         let ec_req = engine
-            .chat_to_engine_request("test-1", &request, &params)
+            .chat_to_engine_request("test-1", &request, &mut params)
             .unwrap();
         assert_eq!(ec_req.request_id, "test-1");
         assert!(ec_req.prompt_token_ids.is_some());
@@ -4459,13 +4856,47 @@ mod tests {
         assert_eq!(ids.len(), 5); // b"Hello" = 5 bytes
     }
 
+    /// A `tool_choice` of `"none"` renders the same prompt as `"auto"`, tools included: most
+    /// templates put the tools first, so leaving them out would give a `"none"` request no
+    /// prefix in common with its siblings', and it would prefill from scratch. The engine reads
+    /// no tool call out of its reply instead.
+    #[test]
+    fn a_tool_choice_of_none_renders_the_prompt_auto_does() {
+        let mut engine = make_test_engine();
+        let template = "{% if tools %}TOOLS {% endif %}{{ messages[0]['content'] }}";
+        engine.set_chat_template(Arc::new(ChatTemplate::new(template.to_string()).unwrap()));
+        let prompt = |tool_choice: Option<protocol::ToolChoice>| {
+            let request = protocol::ChatCompletionRequest {
+                tools: Some(vec![protocol::ChatCompletionToolsParam {
+                    tool_type: "function".to_string(),
+                    function: protocol::FunctionDefinition {
+                        name: "Bash".to_string(),
+                        description: None,
+                        parameters: None,
+                    },
+                }]),
+                tool_choice,
+                ..make_chat_request()
+            };
+            let mut params = engine.build_sampling_params_from_chat(&request).unwrap();
+            let ec_req = engine
+                .chat_to_engine_request("test-1", &request, &mut params)
+                .unwrap();
+            ec_req.prompt_token_ids.unwrap()
+        };
+        let auto = prompt(Some(protocol::ToolChoice::Auto));
+        assert_eq!(auto, b"TOOLS Hello".map(u32::from), "the tools render");
+        assert_eq!(prompt(Some(protocol::ToolChoice::None)), auto);
+        assert_eq!(prompt(None), auto);
+    }
+
     #[test]
     fn test_chat_to_engine_request_with_tokenizer() {
         let engine = make_test_engine_with_tokenizer();
         let request = make_chat_request();
-        let params = engine.build_sampling_params_from_chat(&request).unwrap();
+        let mut params = engine.build_sampling_params_from_chat(&request).unwrap();
         let ec_req = engine
-            .chat_to_engine_request("test-1", &request, &params)
+            .chat_to_engine_request("test-1", &request, &mut params)
             .unwrap();
         assert_eq!(ec_req.request_id, "test-1");
         let ids = ec_req.prompt_token_ids.unwrap();
@@ -4592,7 +5023,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_output_unknown_request() {
+    fn test_run_output_unknown_request() {
         let mut requests = HashMap::new();
         let output = EngineCoreOutput {
             request_id: "unknown".to_string(),
@@ -4606,12 +5037,12 @@ mod tests {
             pooler_output: None,
         };
         // Should not panic.
-        AsyncEngine::process_output(&mut requests, output);
+        run_output(&mut requests, output);
     }
 
     /// An output for a request finished here already — a stop string matched, its non-streaming
-    /// entry waiting to be collected — came from a step still in flight for it: every path drops
-    /// it, the request's tokens as they were.
+    /// entry waiting to be collected — came from a step still in flight for it: the output path
+    /// drops it, the request's tokens as they were.
     #[test]
     fn an_output_for_a_finished_request_is_dropped() {
         let mut requests = HashMap::new();
@@ -4634,17 +5065,96 @@ mod tests {
         assert!(work.iter().all(Option::is_none), "nothing to detokenize");
         let results = AsyncEngine::parallel_detokenize(work);
         AsyncEngine::process_outputs_phase3(&mut requests, vec![output()], results);
-        AsyncEngine::process_output(&mut requests, output());
         assert_eq!(requests["req-1"].generated_token_ids, [10, 11]);
     }
 
+    /// A stop string is not an engine-side criterion, so a request it finishes is still running
+    /// engine-side. Phase 3 names every such request so the step loop can abort it there —
+    /// without that abort the engine decodes it on to max_tokens under the NEXT request's steps
+    /// (#711: the follow-up request came back garbage with a 3.3x first-token latency).
     #[test]
-    fn test_process_output_accumulates_tokens() {
+    fn a_stop_string_finish_names_the_request_for_engine_abort() {
+        let mut requests = HashMap::new();
+        requests.insert("req-1".to_string(), make_test_request_state(None));
+        let output = EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            new_token_ids: vec![12, 13],
+            finish_reason: None,
+            stop_reason: None,
+            num_cached_tokens: 0,
+            events: None,
+            new_logprobs: None,
+            new_prompt_logprobs: None,
+            pooler_output: None,
+        };
+        let detok = Some((Some("Century".to_string()), Some("…Cent".to_string())));
+        let to_abort =
+            AsyncEngine::process_outputs_phase3(&mut requests, vec![output], vec![detok]);
+        assert_eq!(
+            to_abort,
+            vec!["req-1".to_string()],
+            "the engine still holds req-1"
+        );
+        assert_eq!(requests["req-1"].finish_reason, Some(FinishReason::Stop));
+        assert_eq!(
+            requests["req-1"].stop_reason,
+            Some(StopReason::String("Century".to_string()))
+        );
+    }
+
+    /// The engine's own finish for the same step means it already retired the request — no abort
+    /// may be asked for, or the loop would abort an id the scheduler no longer knows.
+    #[test]
+    fn an_engine_finish_needs_no_abort() {
+        let mut requests = HashMap::new();
+        requests.insert("req-1".to_string(), make_test_request_state(None));
+        let output = EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            new_token_ids: vec![12, 13],
+            finish_reason: Some(FinishReason::Length),
+            stop_reason: None,
+            num_cached_tokens: 0,
+            events: None,
+            new_logprobs: None,
+            new_prompt_logprobs: None,
+            pooler_output: None,
+        };
+        let detok = Some((Some("Century".to_string()), Some("…Cent".to_string())));
+        let to_abort =
+            AsyncEngine::process_outputs_phase3(&mut requests, vec![output], vec![detok]);
+        assert!(to_abort.is_empty(), "the engine finished it itself");
+    }
+
+    /// No stop string, no engine finish: the request keeps decoding and nothing is named.
+    #[test]
+    fn a_running_request_names_no_abort() {
+        let mut requests = HashMap::new();
+        requests.insert("req-1".to_string(), make_test_request_state(None));
+        let output = EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            new_token_ids: vec![12, 13],
+            finish_reason: None,
+            stop_reason: None,
+            num_cached_tokens: 0,
+            events: None,
+            new_logprobs: None,
+            new_prompt_logprobs: None,
+            pooler_output: None,
+        };
+        let detok = Some((None, Some("…".to_string())));
+        let to_abort =
+            AsyncEngine::process_outputs_phase3(&mut requests, vec![output], vec![detok]);
+        assert!(to_abort.is_empty());
+        assert_eq!(requests["req-1"].finish_reason, None);
+    }
+
+    #[test]
+    fn test_run_output_accumulates_tokens() {
         let mut requests = HashMap::new();
         requests.insert("req-1".to_string(), make_test_request_state(None));
 
         // First output.
-        AsyncEngine::process_output(
+        run_output(
             &mut requests,
             EngineCoreOutput {
                 request_id: "req-1".to_string(),
@@ -4660,7 +5170,7 @@ mod tests {
         );
 
         // Second output.
-        AsyncEngine::process_output(
+        run_output(
             &mut requests,
             EngineCoreOutput {
                 request_id: "req-1".to_string(),
@@ -4683,17 +5193,30 @@ mod tests {
     }
 
     #[test]
-    fn test_process_output_streaming() {
+    fn test_run_output_streaming() {
+        let tok = Arc::new(make_test_tokenizer());
+        let prompt_ids = tok.encode("Hi", false).unwrap();
+        let (first, last) = (
+            tok.encode("ab", false).unwrap(),
+            tok.encode("c", false).unwrap(),
+        );
+        let detok =
+            IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         let mut requests = HashMap::new();
-        requests.insert("req-1".to_string(), make_test_request_state(Some(tx)));
+        {
+            let mut state = make_test_request_state(Some(tx));
+            state.num_prompt_tokens = prompt_ids.len() as u32;
+            state.detokenizer = Some(Arc::new(std::sync::Mutex::new(detok)));
+            requests.insert("req-1".to_string(), state);
+        }
 
-        AsyncEngine::process_output(
+        run_output(
             &mut requests,
             EngineCoreOutput {
                 request_id: "req-1".to_string(),
-                new_token_ids: vec![10, 11],
+                new_token_ids: first.clone(),
                 finish_reason: None,
                 stop_reason: None,
                 num_cached_tokens: 0,
@@ -4705,16 +5228,16 @@ mod tests {
         );
 
         let delta = rx.try_recv().unwrap();
-        assert_eq!(delta.new_token_ids, vec![10, 11]);
+        assert_eq!(delta.new_token_ids, first);
         assert!(delta.finish_reason.is_none());
-        assert!(delta.text.is_none()); // No tokenizer = no text.
+        assert_eq!(delta.text.as_deref(), Some("ab"));
 
         // Finish.
-        AsyncEngine::process_output(
+        run_output(
             &mut requests,
             EngineCoreOutput {
                 request_id: "req-1".to_string(),
-                new_token_ids: vec![12],
+                new_token_ids: last.clone(),
                 finish_reason: Some(FinishReason::Length),
                 stop_reason: None,
                 num_cached_tokens: 0,
@@ -4726,7 +5249,8 @@ mod tests {
         );
 
         let delta = rx.try_recv().unwrap();
-        assert_eq!(delta.new_token_ids, vec![12]);
+        assert_eq!(delta.new_token_ids, last);
+        assert_eq!(delta.text.as_deref(), Some("c"));
         assert_eq!(delta.finish_reason, Some(FinishReason::Length));
 
         // Finished streaming request should be removed from the map.
@@ -4734,7 +5258,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_output_with_detokenizer() {
+    fn test_run_output_with_detokenizer() {
         let tok = Arc::new(make_test_tokenizer());
         // Encode a prompt and some continuation.
         let prompt = "Hi";
@@ -4755,7 +5279,7 @@ mod tests {
             requests.insert("req-1".to_string(), state);
         }
 
-        AsyncEngine::process_output(
+        run_output(
             &mut requests,
             EngineCoreOutput {
                 request_id: "req-1".to_string(),
@@ -4778,6 +5302,32 @@ mod tests {
             text.contains("there"),
             "Expected 'there' in delta text, got: {text:?}"
         );
+    }
+
+    /// An engine with no tokenizer streams each step's token ids as placeholders, as its
+    /// non-streaming response does: the output path fills them, so an encoder reads a delta's
+    /// `text: None` as no text.
+    #[test]
+    fn a_request_with_no_detokenizer_streams_placeholders() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut requests =
+            HashMap::from([("req-1".to_string(), make_test_request_state(Some(tx)))]);
+        let outputs = vec![EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            new_token_ids: vec![10, 11],
+            finish_reason: None,
+            stop_reason: None,
+            num_cached_tokens: 0,
+            events: None,
+            new_logprobs: None,
+            new_prompt_logprobs: None,
+            pooler_output: None,
+        }];
+        let work = AsyncEngine::process_outputs_phase1(&mut requests, &outputs);
+        let results = AsyncEngine::parallel_detokenize(work);
+        AsyncEngine::process_outputs_phase3(&mut requests, outputs, results);
+        let delta = rx.try_recv().unwrap();
+        assert_eq!(delta.text.as_deref(), Some("<token_10><token_11>"));
     }
 
     #[test]
@@ -4888,6 +5438,59 @@ mod tests {
         assert!(truncate_prompt(&mut tokens, Some(-2)).is_err());
     }
 
+    /// `spawn_step_loop_after` holds the loop's first step until its gate opens: a request
+    /// submitted behind it waits, counted as unfinished, and is served once the gate opens.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gated_step_loop_takes_no_step_until_the_gate_opens() {
+        let engine = Arc::new(make_test_engine());
+        let (open, gate) = tokio::sync::oneshot::channel::<()>();
+        engine.spawn_step_loop_after(async {
+            let _ = gate.await;
+        });
+        let task_engine = Arc::clone(&engine);
+        let reply = tokio::spawn(async move {
+            let prompt = protocol::CompletionPrompt::TokenIds(vec![1, 2, 3]);
+            task_engine
+                .completion(make_completion_request(Some(prompt)))
+                .await
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while engine.calls_submitted() == 0 && Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(engine.calls_submitted(), 1, "submitted behind the gate");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!reply.is_finished(), "served before the gate opened");
+        open.send(()).unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(5), reply).await;
+        assert_eq!(reply.unwrap().unwrap().unwrap().choices.len(), 1);
+    }
+
+    /// A call counts as submitted once, however many requests it fans out to, and only once
+    /// every one is in the step loop's channel; a refused call never counts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_call_counts_as_submitted_once_all_its_requests_are_in() {
+        let engine = Arc::new(make_test_engine());
+        engine.spawn_step_loop();
+        let prompts = protocol::CompletionPrompt::MultipleTokenIds(vec![vec![1, 2], vec![3]]);
+        let fanned = protocol::CompletionRequest {
+            n: 2,
+            ..make_completion_request(Some(prompts))
+        };
+        assert_eq!(engine.completion(fanned).await.unwrap().choices.len(), 4);
+        assert_eq!(engine.calls_submitted(), 1, "four requests, one call");
+        let chat = protocol::ChatCompletionRequest {
+            n: 3,
+            ..make_chat_request()
+        };
+        assert_eq!(engine.chat_completion(chat).await.unwrap().choices.len(), 3);
+        assert_eq!(engine.calls_submitted(), 2);
+        let too_long =
+            make_completion_request(Some(protocol::CompletionPrompt::TokenIds(vec![1; 5000])));
+        assert!(engine.completion(too_long).await.is_err());
+        assert_eq!(engine.calls_submitted(), 2, "a refused call never counts");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_chat_completion_n1_regression() {
         let engine = Arc::new(make_test_engine());
@@ -4954,6 +5557,75 @@ mod tests {
         assert!(response.usage.completion_tokens.unwrap_or(0) > 0);
     }
 
+    /// `n > 1` under greedy sampling is a 400, as vLLM refuses it ("n must be 1 when using greedy
+    /// sampling"), on the chat and the completion path, streamed or not. The temperature that
+    /// decides it is the one the request samples at: a request with none takes the model's
+    /// generation default. A sampled `n > 1`, and a greedy `n: 1`, are served.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn greedy_n_above_one_is_a_400_on_chat_and_completion() {
+        let mut engine = make_test_engine();
+        let greedy_n3 = |err: Option<ServeError>| {
+            assert!(
+                matches!(
+                    err,
+                    Some(ServeError::Validation(ref msg))
+                        if msg == "n must be 1 when using greedy sampling, got 3."
+                ),
+                "{err:?}"
+            );
+        };
+        let chat = protocol::ChatCompletionRequest {
+            n: 3,
+            temperature: Some(0.0),
+            ..make_chat_request()
+        };
+        greedy_n3(engine.chat_completion(chat.clone()).await.err());
+        let stream = protocol::ChatCompletionRequest {
+            stream: true,
+            ..chat
+        };
+        greedy_n3(engine.chat_completion_stream(stream).await.err());
+        let completion = protocol::CompletionRequest {
+            n: 3,
+            temperature: Some(0.0),
+            ..make_completion_request(Some(protocol::CompletionPrompt::TokenIds(vec![1, 2, 3])))
+        };
+        greedy_n3(engine.completion(completion.clone()).await.err());
+        let stream = protocol::CompletionRequest {
+            stream: true,
+            ..completion
+        };
+        greedy_n3(engine.completion_stream(stream).await.err());
+
+        // No temperature in the request: the generation default decides.
+        let defaulted = protocol::CompletionRequest {
+            n: 3,
+            ..make_completion_request(Some(protocol::CompletionPrompt::TokenIds(vec![1, 2, 3])))
+        };
+        let greedy_default = scratchy_core_common::sampling::GenerationDefaults {
+            temperature: Some(0.0),
+            ..Default::default()
+        };
+        engine.set_generation_defaults(greedy_default);
+        greedy_n3(engine.completion(defaulted.clone()).await.err());
+
+        // Sampled, three choices are served; greedy, one is.
+        engine.set_generation_defaults(Default::default());
+        let engine = Arc::new(engine);
+        engine.spawn_step_loop();
+        let sampled = engine.completion(defaulted.clone()).await.unwrap();
+        assert_eq!(sampled.choices.len(), 3);
+        let greedy_one = protocol::CompletionRequest {
+            n: 1,
+            temperature: Some(0.0),
+            ..defaulted
+        };
+        assert_eq!(
+            engine.completion(greedy_one).await.unwrap().choices.len(),
+            1
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_completion_multi_prompt_n1() {
         let engine = Arc::new(make_test_engine());
@@ -4994,6 +5666,77 @@ mod tests {
         assert_eq!(response.choices[3].index, 3);
         // prompt_tokens = sum of unique prompt lengths: 2 + 3 = 5.
         assert_eq!(response.usage.prompt_tokens, 5);
+    }
+
+    /// A streamed completion stamps each choice's delta with the prompt it answers, the one
+    /// fact the usage chunk counts each prompt once by (#557): choice `i` of `n` per prompt
+    /// answers prompt `i / n`, with that prompt's length.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_completion_stream_stamps_each_choice_with_its_prompt() {
+        let engine = Arc::new(make_test_engine());
+        engine.spawn_step_loop();
+        let mut request =
+            make_completion_request(Some(protocol::CompletionPrompt::MultipleTokenIds(vec![
+                vec![1, 2],
+                vec![3, 4, 5],
+            ])));
+        request.n = 2;
+        request.stream = true;
+        let (_, _, mut rx) = engine.completion_stream(request).await.unwrap();
+
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(delta) = rx.recv().await {
+            let prompt = delta.index / 2;
+            assert_eq!(
+                delta.usage.prompt,
+                PromptIndex(prompt),
+                "choice {}",
+                delta.index
+            );
+            assert_eq!(delta.usage.prompt_tokens, [2, 3][prompt as usize]);
+            seen.insert(delta.index);
+        }
+        assert_eq!(seen, (0..4).collect(), "every choice streamed");
+    }
+
+    /// The non-streaming chat reply counts the prompt's cache hit once, as it counts the prompt
+    /// (#580): with the prompt cached, two choices that each hit it report the one hit, and never
+    /// more cached tokens than prompt tokens.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_chat_completion_n2_counts_the_prompts_cache_hit_once() {
+        let mut config = make_engine_config();
+        config.enable_prefix_caching = true;
+        let client = Box::new(InprocClient::new(config, Box::new(NoopExecutor::new(1024))));
+        let tok = Arc::new(make_test_tokenizer());
+        let engine = Arc::new(AsyncEngine::with_tokenizer(
+            client,
+            "test-model".to_string(),
+            4096,
+            tok,
+        ));
+        engine.spawn_step_loop();
+        // Several 16-token blocks long, so a cache hit spans whole blocks.
+        let request = |n| {
+            let mut request = make_chat_request();
+            request.messages[0].content = Some(serde_json::Value::String(
+                "a prompt long enough to fill several cache blocks of sixteen tokens".repeat(2),
+            ));
+            request.n = n;
+            request.max_tokens = Some(2);
+            request
+        };
+        let cached = |usage: &protocol::UsageInfo| {
+            (usage.prompt_tokens_details.as_ref()).and_then(|d| d.cached_tokens)
+        };
+
+        engine.chat_completion(request(1)).await.unwrap();
+        let warm = engine.chat_completion(request(1)).await.unwrap().usage;
+        let hit = cached(&warm).expect("the prompt is cached");
+        assert!(hit > 0 && hit <= warm.prompt_tokens);
+
+        let two = engine.chat_completion(request(2)).await.unwrap().usage;
+        assert_eq!(two.prompt_tokens, warm.prompt_tokens);
+        assert_eq!(cached(&two), Some(hit), "the one hit, not one per choice");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5073,11 +5816,11 @@ mod tests {
         {
             let mut state = make_test_request_state(Some(tx));
             state.num_prompt_tokens = 3;
-            state.choice_index = 7;
+            state.choice.index = 7;
             requests.insert("req-idx".to_string(), state);
         }
 
-        AsyncEngine::process_output(
+        run_output(
             &mut requests,
             EngineCoreOutput {
                 request_id: "req-idx".to_string(),
@@ -5319,20 +6062,28 @@ mod tests {
         assert!(matches!(result, Some(GuidedGrammar::Json)));
     }
 
+    /// A json_schema `response_format` carries its schema under OpenAI's key, `schema`, as vLLM
+    /// reads it, and the schema is the grammar's. `json_schema`, the key read before, is read too.
+    /// It is written under `schema`.
     #[test]
-    fn test_protocol_response_format_json_schema_still_works() {
-        // Note: the inner `json_schema` field maps to JsonSchemaResponseFormat.json_schema
-        // which expects the key "json_schema" (not "schema") in our struct.
-        let json_str = r#"{
-            "type": "json_schema",
-            "json_schema": {
-                "name": "test",
-                "json_schema": {"type": "object", "properties": {"x": {"type": "integer"}}}
-            }
-        }"#;
-        let rf: protocol::ResponseFormat = serde_json::from_str(json_str).unwrap();
-        let result = parse_response_format(&Some(rf)).unwrap();
-        assert!(matches!(result, Some(GuidedGrammar::JsonSchema { .. })));
+    fn a_json_schema_response_format_reads_its_schema_where_openai_puts_it() {
+        let schema =
+            serde_json::json!({"type": "object", "properties": {"x": {"type": "integer"}}});
+        for key in ["schema", "json_schema"] {
+            let form = serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {"name": "test", key: schema},
+            });
+            let rf: protocol::ResponseFormat = serde_json::from_value(form).unwrap();
+            let result = parse_response_format(&Some(rf.clone())).unwrap();
+            assert!(
+                matches!(result, Some(GuidedGrammar::JsonSchema { schema: ref s }) if *s == schema),
+                "{key}: {result:?}"
+            );
+            let written = serde_json::to_value(&rf).unwrap();
+            assert_eq!(written["json_schema"]["schema"], schema, "{key}");
+            assert!(written["json_schema"].get("json_schema").is_none(), "{key}");
+        }
     }
 
     // ---------------------------------------------------------------
@@ -5346,43 +6097,469 @@ mod tests {
 
     #[test]
     fn test_is_tool_choice_none_with_none_string() {
-        assert!(is_tool_choice_none(&Some(serde_json::json!("none"))));
+        assert!(is_tool_choice_none(&Some(protocol::ToolChoice::None)));
     }
 
     #[test]
     fn test_is_tool_choice_none_with_auto() {
-        assert!(!is_tool_choice_none(&Some(serde_json::json!("auto"))));
+        assert!(!is_tool_choice_none(&Some(protocol::ToolChoice::Auto)));
     }
 
+    /// `"required"` is a grammar (#765): its sampling params carry the schema of calls to the
+    /// declared tools, a request that shapes its reply another way too is refused, and its reply is
+    /// read as those calls, whether the engine has a tool parser or not.
     #[test]
-    fn test_get_tool_choice_function_name_none() {
-        assert_eq!(get_tool_choice_function_name(&None), None);
-    }
+    fn a_required_tool_choice_constrains_the_reply_to_calls() {
+        use protocol::ToolChoice;
+        let engine = make_test_engine();
+        let bash = protocol::ChatCompletionToolsParam {
+            tool_type: "function".to_string(),
+            function: protocol::FunctionDefinition {
+                name: "Bash".to_string(),
+                description: None,
+                parameters: None,
+            },
+        };
+        let request = |choice, response_format| protocol::ChatCompletionRequest {
+            tools: Some(vec![bash.clone()]),
+            tool_choice: Some(choice),
+            response_format,
+            ..make_chat_request()
+        };
 
-    #[test]
-    fn test_get_tool_choice_function_name_auto() {
-        assert_eq!(
-            get_tool_choice_function_name(&Some(serde_json::json!("auto"))),
-            None
+        // The grammar: the schema of calls to the declared tools.
+        let params = engine.build_sampling_params_from_chat(&request(ToolChoice::Required, None));
+        let schema = |limit| {
+            crate::tool_parser::required_tool_calls_schema(std::slice::from_ref(&bash), limit)
+        };
+        let expected = schema(protocol::CallLimit::Any).unwrap();
+        assert!(
+            matches!(
+                params.unwrap().guided_grammar,
+                Some(GuidedGrammar::JsonSchema { ref schema }) if *schema == expected
+            ),
+            "\"required\" carries its grammar"
+        );
+        // `parallel_tool_calls: false`: the grammar of one call.
+        let one = protocol::ChatCompletionRequest {
+            parallel_tool_calls: Some(false),
+            ..request(ToolChoice::Required, None)
+        };
+        let expected = schema(protocol::CallLimit::One).unwrap();
+        assert!(
+            matches!(
+                engine.build_sampling_params_from_chat(&one).unwrap().guided_grammar,
+                Some(GuidedGrammar::JsonSchema { ref schema }) if *schema == expected
+            ),
+            "parallel_tool_calls: false carries the grammar of one call"
+        );
+        let auto = engine.build_sampling_params_from_chat(&request(ToolChoice::Auto, None));
+        assert!(auto.unwrap().guided_grammar.is_none());
+
+        // A reply already shaped another way can't take it too.
+        let json_object: protocol::ResponseFormat =
+            serde_json::from_value(serde_json::json!({"type": "json_object"})).unwrap();
+        let both = request(ToolChoice::Required, Some(json_object));
+        let err = engine.build_sampling_params_from_chat(&both).err();
+        assert!(matches!(err, Some(ServeError::Validation(_))), "{err:?}");
+
+        // A tool schema the grammar can't take (`$defs` that isn't an object) is a 400 too.
+        let mut listed = bash.clone();
+        listed.function.parameters = Some(serde_json::json!({ "$defs": ["Point"] }).into());
+        let bad_defs = protocol::ChatCompletionRequest {
+            tools: Some(vec![listed]),
+            ..request(ToolChoice::Required, None)
+        };
+        let err = engine.build_sampling_params_from_chat(&bad_defs).err();
+        assert!(matches!(err, Some(ServeError::Validation(_))), "{err:?}");
+
+        // Its reply is read as calls, with no tool parser set on the engine.
+        assert!(engine.tool_parser().is_none());
+        let parser = engine.request_tool_parser(&request(ToolChoice::Required, None));
+        let reply = r#"[{"name": "Bash", "parameters": {"command": "ls"}}]"#;
+        let tool_reply = reply_tool_calls(
+            parser.expect("\"required\" has its parser").as_ref(),
+            reply.to_string(),
+            &Some(ToolChoice::Required),
+            protocol::CallLimit::Any,
+        );
+        let names: Vec<_> = (tool_reply.calls.iter().flatten())
+            .map(|tc| tc.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["Bash"]);
+        assert_eq!(tool_reply.content, None);
+        let auto_parser = engine.request_tool_parser(&request(ToolChoice::Auto, None));
+        assert!(
+            auto_parser.is_none(),
+            "otherwise the engine's own: none here"
         );
     }
 
+    /// A `logit_bias` key naming a token outside the vocabulary is a 400 naming it, in vLLM's
+    /// words, on the chat and the completion path; so is a key that is not a token id. A bias on
+    /// a token in the vocabulary is kept, as its id.
     #[test]
-    fn test_get_tool_choice_function_name_object() {
-        let tc = serde_json::json!({
-            "type": "function",
-            "function": {"name": "get_weather"}
-        });
+    fn a_logit_bias_outside_the_vocabulary_is_refused() {
+        let engine = make_test_engine_with_tokenizer();
+        let vocab = engine.tokenizer.as_ref().unwrap().vocab_size();
+        let bias = |keys: &[String]| Some(keys.iter().map(|k| (k.clone(), 2.0)).collect());
+        // The chat path's params (`chat`), or the completion path's.
+        let params = |chat: bool, keys: &[String]| {
+            if chat {
+                let request = protocol::ChatCompletionRequest {
+                    logit_bias: bias(keys),
+                    ..make_chat_request()
+                };
+                engine.build_sampling_params_from_chat(&request)
+            } else {
+                let request = protocol::CompletionRequest {
+                    logit_bias: bias(keys),
+                    ..make_completion_request(Some(protocol::CompletionPrompt::TokenIds(vec![1])))
+                };
+                engine.build_sampling_params_from_completion(&request)
+            }
+        };
+        for chat in [true, false] {
+            let build = |keys: &[String]| params(chat, keys);
+            let kept = build(&["5".to_string()]).unwrap().logit_bias;
+            assert_eq!(kept, Some(HashMap::from([(5, 2.0)])));
+
+            let outside = [vocab.to_string(), "5".to_string(), (vocab + 7).to_string()];
+            let err = build(&outside).err();
+            let want = format!(
+                "token_id(s) [{vocab}, {}] in logit_bias contain out-of-vocab token ids. \
+                 Vocabulary size: {vocab}",
+                vocab + 7
+            );
+            assert!(
+                matches!(err, Some(ServeError::Validation(ref msg)) if *msg == want),
+                "{err:?}"
+            );
+
+            for key in ["abc", "-5"] {
+                let err = build(&[key.to_string()]).err();
+                assert!(
+                    matches!(err, Some(ServeError::Validation(ref msg)) if msg.contains(key)),
+                    "{key}: {err:?}"
+                );
+            }
+        }
+    }
+
+    /// A forced tool `tools` doesn't declare (a misspelled or empty name), and `"required"` with
+    /// no tools, are refused as the request is read: a 400, not a reply with every call dropped.
+    /// A declared tool, `"auto"` and `"none"` pass, with tools or without.
+    #[test]
+    fn a_tool_choice_naming_an_undeclared_tool_is_refused() {
+        use protocol::ToolChoice;
+        let engine = make_test_engine();
+        let bash = protocol::ChatCompletionToolsParam {
+            tool_type: "function".to_string(),
+            function: protocol::FunctionDefinition {
+                name: "Bash".to_string(),
+                description: None,
+                parameters: None,
+            },
+        };
+        let check = |tools: Option<Vec<protocol::ChatCompletionToolsParam>>, choice| {
+            let request = protocol::ChatCompletionRequest {
+                tools,
+                tool_choice: Some(choice),
+                ..make_chat_request()
+            };
+            engine.build_sampling_params_from_chat(&request).err()
+        };
+        let declared = || Some(vec![bash.clone()]);
+        for (tools, choice) in [
+            (declared(), ToolChoice::Function("Bsh".into())),
+            (declared(), ToolChoice::Function(String::new())),
+            (None, ToolChoice::Function("Bash".into())),
+            (None, ToolChoice::Required),
+            (Some(vec![]), ToolChoice::Required),
+        ] {
+            let err = check(tools, choice.clone());
+            assert!(
+                matches!(err, Some(ServeError::Validation(_))),
+                "{choice:?}: {err:?}"
+            );
+        }
+        for (tools, choice) in [
+            (declared(), ToolChoice::Function("Bash".into())),
+            (declared(), ToolChoice::Required),
+            (None, ToolChoice::Auto),
+            (None, ToolChoice::None),
+        ] {
+            assert!(check(tools, choice.clone()).is_none(), "{choice:?}");
+        }
+    }
+
+    /// `tool_choice` forces a tool only when it names one.
+    #[test]
+    fn a_forced_tool_is_read_from_a_named_function_only() {
+        use protocol::ToolChoice;
+        let of = |tc: Option<ToolChoice>| ForcedTool::of(&tc);
+        assert_eq!(of(None), None);
+        assert_eq!(of(Some(ToolChoice::Auto)), None);
+        assert_eq!(of(Some(ToolChoice::Required)), None);
         assert_eq!(
-            get_tool_choice_function_name(&Some(tc)),
-            Some("get_weather".to_string())
+            of(Some(ToolChoice::Function("get_weather".into()))),
+            Some(ForcedTool("get_weather".to_string()))
         );
     }
 
+    /// What a reply streams for `pieces` (one engine output each, the last finishing it) with
+    /// the `parser` tool parser, `forced` as the request's forced tool and `limit` as its call limit.
+    fn stream_tool_reply(
+        parser: &str,
+        forced: Option<&str>,
+        limit: protocol::CallLimit,
+        pieces: &[&str],
+    ) -> Vec<StreamDelta> {
+        let pieces = (pieces.iter().enumerate())
+            .map(|(i, text)| (vec![20 + i as u32], *text))
+            .collect();
+        let configure = |state: &mut RequestState| {
+            state.tool_parser_state = Some(
+                crate::tool_parser::get_tool_parser(parser)
+                    .unwrap()
+                    .create_streaming_state(),
+            );
+            let forced = forced.map(|f| ForcedTool(f.to_string()));
+            state.tool_calls = ToolCallStream::new(forced, limit);
+        };
+        super::test_support::stream_pieces(configure, pieces, FinishReason::Stop)
+    }
+
+    /// The tool-call deltas of `deltas`, in order. A call's id is random per run, so each one
+    /// present reads `call`.
+    fn tool_calls(deltas: &[StreamDelta]) -> Vec<DeltaToolCall> {
+        let calls = deltas
+            .iter()
+            .flat_map(|d| d.tool_call_deltas.iter().flatten());
+        calls
+            .map(|d| DeltaToolCall {
+                id: d.id.as_ref().map(|_| "call".to_string()),
+                ..d.clone()
+            })
+            .collect()
+    }
+
+    /// A whole reply under each `tool_choice`, as both whole-reply paths take it (the chat
+    /// endpoint's, and `/v1/messages`' under `tool-spans`, #758): `"none"` reads no call, so the
+    /// text comes back as written; a forced tool keeps only its own calls, and the reply is the text
+    /// around the rest; anything else keeps every call.
     #[test]
-    fn test_get_tool_choice_function_name_missing_name() {
-        let tc = serde_json::json!({"type": "function", "function": {}});
-        assert_eq!(get_tool_choice_function_name(&Some(tc)), None);
+    fn a_whole_reply_keeps_the_calls_its_tool_choice_lets_out() {
+        use protocol::ToolChoice;
+        let parser = crate::tool_parser::get_tool_parser("hermes").unwrap();
+        let text = format!("Let me look.{}", BASH_CALL.concat());
+        let reply = |choice: Option<ToolChoice>| {
+            let reply = reply_tool_calls(
+                parser.as_ref(),
+                text.clone(),
+                &choice,
+                protocol::CallLimit::Any,
+            );
+            let names = (reply.calls.iter().flatten())
+                .map(|tc| tc.function.name.clone())
+                .collect::<Vec<_>>();
+            (reply.content, names)
+        };
+        let calls_bash = (Some("Let me look.".to_string()), vec!["Bash".to_string()]);
+        assert_eq!(reply(None), calls_bash);
+        assert_eq!(reply(Some(ToolChoice::Auto)), calls_bash);
+        assert_eq!(reply(Some(ToolChoice::Required)), calls_bash);
+        assert_eq!(reply(Some(ToolChoice::Function("Bash".into()))), calls_bash);
+        assert_eq!(
+            reply(Some(ToolChoice::Function("Read".into()))),
+            (Some("Let me look.".to_string()), vec![])
+        );
+        assert_eq!(reply(Some(ToolChoice::None)), (Some(text.clone()), vec![]));
+    }
+
+    /// A call to Bash, written across five tokens.
+    const BASH_CALL: [&str; 5] = [
+        "<tool_call>\n",
+        "{\"name\": \"Bash\", ",
+        "\"arguments\": {\"command\": ",
+        "\"rm -rf build\"}}",
+        "\n</tool_call>",
+    ];
+
+    /// A call to Read after one before it, written across four tokens.
+    const READ_CALL: [&str; 4] = [
+        "\n<tool_call>\n",
+        "{\"name\": \"Read\", ",
+        "\"arguments\": {\"file_path\": \"a.rs\"}}",
+        "\n</tool_call>",
+    ];
+
+    /// A forced tool_choice drops a call to another tool whole: the deltas after its first carry
+    /// no name, and none of its arguments may reach the stream (#683). The reply then is the text
+    /// around the call — none here — and finishes `Stop`, with nothing a stream encoder would
+    /// turn into a tool-call finish.
+    #[test]
+    fn a_forced_tool_choice_streams_no_part_of_another_tools_call() {
+        let unforced = tool_calls(&stream_tool_reply(
+            "hermes",
+            None,
+            protocol::CallLimit::Any,
+            &BASH_CALL,
+        ));
+        assert_eq!(unforced[0].function_name.as_deref(), Some("Bash"));
+        assert!(
+            unforced[1..].iter().any(|d| d.function_arguments.is_some()),
+            "unforced, the call streams its arguments after its name: {unforced:?}"
+        );
+
+        let forced =
+            stream_tool_reply("hermes", Some("Read"), protocol::CallLimit::Any, &BASH_CALL);
+        assert!(tool_calls(&forced).is_empty(), "{forced:?}");
+        assert!(
+            forced
+                .iter()
+                .all(|d| d.text.as_deref().is_none_or(str::is_empty)),
+            "no text around the call, and none of the call's own: {forced:?}"
+        );
+        let finishes: Vec<_> = forced.iter().filter_map(|d| d.finish_reason).collect();
+        assert_eq!(finishes, [FinishReason::Stop]);
+
+        let kept = stream_tool_reply("hermes", Some("Bash"), protocol::CallLimit::Any, &BASH_CALL);
+        assert_eq!(tool_calls(&kept), unforced);
+    }
+
+    /// The calls a forced tool_choice keeps are numbered from 0, the places they hold in the
+    /// non-streaming response's list, whatever calls before them it dropped.
+    #[test]
+    fn a_forced_tool_choice_numbers_the_calls_it_keeps_from_zero() {
+        let mut pieces = BASH_CALL.to_vec();
+        pieces.extend(READ_CALL);
+        let unforced = tool_calls(&stream_tool_reply(
+            "hermes",
+            None,
+            protocol::CallLimit::Any,
+            &pieces,
+        ));
+        let read_index = unforced
+            .iter()
+            .find(|d| d.function_name.as_deref() == Some("Read"))
+            .unwrap()
+            .index;
+        assert_ne!(read_index, 0, "the parser numbers Read after Bash");
+
+        let read: Vec<_> = unforced
+            .into_iter()
+            .filter(|d| d.index == read_index)
+            .map(|d| DeltaToolCall { index: 0, ..d })
+            .collect();
+        assert!(read.iter().any(|d| d.function_arguments.is_some()));
+        assert_eq!(
+            tool_calls(&stream_tool_reply(
+                "hermes",
+                Some("Read"),
+                protocol::CallLimit::Any,
+                &pieces
+            )),
+            read,
+            "Read's deltas, at index 0"
+        );
+    }
+
+    /// `parallel_tool_calls: false` keeps a reply's first call and drops the rest, whole and
+    /// streamed, as vLLM does (#794). The first call kept, that is: under a forced tool, the first
+    /// call to it, at index 0.
+    #[test]
+    fn parallel_tool_calls_false_keeps_a_replys_first_call() {
+        use protocol::{CallLimit, ToolChoice};
+        let mut pieces = BASH_CALL.to_vec();
+        pieces.extend(READ_CALL);
+        let parser = crate::tool_parser::get_tool_parser("hermes").unwrap();
+        let whole = |choice: Option<ToolChoice>, limit| {
+            let reply = reply_tool_calls(parser.as_ref(), pieces.concat(), &choice, limit);
+            (reply.calls.iter().flatten())
+                .map(|tc| tc.function.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(whole(None, CallLimit::Any), ["Bash", "Read"]);
+        assert_eq!(whole(None, CallLimit::One), ["Bash"]);
+        let read = Some(ToolChoice::Function("Read".into()));
+        assert_eq!(whole(read, CallLimit::One), ["Read"]);
+
+        let streamed =
+            |forced, limit| tool_calls(&stream_tool_reply("hermes", forced, limit, &pieces));
+        let bash = tool_calls(&stream_tool_reply(
+            "hermes",
+            None,
+            CallLimit::Any,
+            &BASH_CALL,
+        ));
+        let both = streamed(None, CallLimit::Any);
+        assert!(
+            both.len() > bash.len(),
+            "unlimited, Read streams after Bash"
+        );
+        assert_eq!(both[..bash.len()], bash[..]);
+        assert_eq!(streamed(None, CallLimit::One), bash, "Bash's deltas alone");
+        assert_eq!(
+            streamed(Some("Read"), CallLimit::One),
+            streamed(Some("Read"), CallLimit::Any),
+            "Read's deltas, at index 0"
+        );
+    }
+
+    /// Mistral's pre-v11 format takes a call's keys in the order the model writes them, so its
+    /// arguments can stream before its name. The output path holds them until the name arrives:
+    /// every consumer reads a call's first delta as its start (`/v1/messages` opened a `tool_use`
+    /// block named ""), and a forced tool_choice decides the call on its name (it dropped the
+    /// arguments and kept the name).
+    #[test]
+    fn a_calls_name_streams_before_its_arguments() {
+        let pieces = [
+            "[TOOL_CALLS]",
+            " [{\"arguments\": {\"file_path\": ",
+            "\"a.rs\"}",
+            ", \"name\": \"Read\"}]",
+        ];
+        // The parser itself writes the arguments first: without the hold, the stream would too.
+        let mut parser = crate::tool_parser::get_tool_parser("mistral")
+            .unwrap()
+            .create_streaming_state();
+        let mut text = String::new();
+        let mut parsed = Vec::new();
+        for piece in pieces {
+            let previous = text.clone();
+            text.push_str(piece);
+            if let ToolParserDelta::ToolCalls(d) = parser.process_delta(&previous, &text, piece) {
+                parsed.extend(d);
+            }
+        }
+        assert!(
+            parsed[0].function_name.is_none() && parsed[0].function_arguments.is_some(),
+            "{parsed:?}"
+        );
+
+        for forced in [None, Some("Read")] {
+            let calls = tool_calls(&stream_tool_reply(
+                "mistral",
+                forced,
+                protocol::CallLimit::Any,
+                &pieces,
+            ));
+            assert_eq!(
+                calls[0].function_name.as_deref(),
+                Some("Read"),
+                "{forced:?}"
+            );
+            assert!(calls.iter().all(|d| d.index == 0), "{forced:?}");
+            let args: String = calls
+                .iter()
+                .filter_map(|d| d.function_arguments.as_deref())
+                .collect();
+            let args: serde_json::Value = serde_json::from_str(&args).unwrap();
+            assert_eq!(args, serde_json::json!({"file_path": "a.rs"}), "{forced:?}");
+        }
+        let other = stream_tool_reply("mistral", Some("Bash"), protocol::CallLimit::Any, &pieces);
+        assert!(tool_calls(&other).is_empty(), "{other:?}");
     }
 
     // -------------------------------------------------------------------
@@ -5428,12 +6605,12 @@ mod tests {
     }
 
     #[test]
-    fn test_process_output_stores_pooler_output() {
+    fn test_run_output_stores_pooler_output() {
         let mut requests = HashMap::new();
         requests.insert("pool-1".to_string(), make_test_request_state(None));
 
         let embedding = EmbeddingData::Single(vec![0.1, 0.2, 0.3]);
-        AsyncEngine::process_output(
+        run_output(
             &mut requests,
             EngineCoreOutput {
                 request_id: "pool-1".to_string(),
@@ -5454,7 +6631,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         requests2.insert("pool-2".to_string(), make_test_request_state(Some(tx)));
 
-        AsyncEngine::process_output(
+        run_output(
             &mut requests2,
             EngineCoreOutput {
                 request_id: "pool-2".to_string(),
@@ -5490,6 +6667,9 @@ mod tests {
     struct FailingExecutor;
 
     impl scratchy_serving_engine::executor::Executor for FailingExecutor {
+        /// It samples no grammar.
+        fn set_stop_token_ids(&mut self, _stop_token_ids: &[u32]) {}
+
         fn execute_model(
             &mut self,
             _scheduler_output: &scratchy_serving_scheduler::scheduler::output::SchedulerOutput,
@@ -5531,6 +6711,9 @@ mod tests {
     struct PanickingExecutor;
 
     impl scratchy_serving_engine::executor::Executor for PanickingExecutor {
+        /// It samples no grammar.
+        fn set_stop_token_ids(&mut self, _stop_token_ids: &[u32]) {}
+
         fn execute_model(
             &mut self,
             _scheduler_output: &scratchy_serving_scheduler::scheduler::output::SchedulerOutput,
@@ -5600,6 +6783,14 @@ mod tests {
             Ok(())
         }
 
+        // It never schedules a step, so none can fail.
+        fn abandon_step(
+            &mut self,
+            _sched: &scratchy_serving_scheduler::scheduler::output::SchedulerOutput,
+        ) -> Vec<String> {
+            Vec::new()
+        }
+
         fn abort_running_requests(&mut self) {}
 
         fn shutdown(&mut self) -> scratchy_serving_engine::error::EngineResult<()> {
@@ -5646,6 +6837,213 @@ mod tests {
         let mut engine = AsyncEngine::new(client, "test-model".to_string(), 4096);
         engine.set_no_progress_timeout(Duration::from_secs(2));
         engine
+    }
+
+    /// The stop-string abort test's shared id recorders (added ids, aborted ids).
+    type IdLog = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A client whose every request decodes to text containing the stop word, and which records
+    /// every abort it is asked for. The stop word finishes each request API-side while the
+    /// engine-side request would decode on to max_tokens: the step loop must abort it there
+    /// (#711 — the request after a stop-string finish decoded garbage).
+    struct StopStringClient {
+        /// The stop word's token ids, ENCODED by the same tokenizer the engine detokenizes with
+        /// (the test vocab is the sorted byte-level alphabet, so an id is not its byte value).
+        stop_word_tokens: Vec<u32>,
+        added: IdLog,
+        aborted: IdLog,
+        emitted: std::sync::Mutex<std::collections::HashSet<String>>,
+    }
+
+    impl StopStringClient {
+        fn new(stop_word_tokens: Vec<u32>) -> (Self, IdLog, IdLog) {
+            let added = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let aborted = Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Self {
+                    stop_word_tokens,
+                    added: Arc::clone(&added),
+                    aborted: Arc::clone(&aborted),
+                    emitted: std::sync::Mutex::new(std::collections::HashSet::new()),
+                },
+                added,
+                aborted,
+            )
+        }
+    }
+
+    impl EngineCoreClient for StopStringClient {
+        fn get_output(
+            &mut self,
+        ) -> scratchy_serving_engine::error::EngineResult<
+            StepOutcome<scratchy_core_common::EngineCoreOutputs>,
+        > {
+            let pending: Vec<String> = {
+                let added = self.added.lock().unwrap().clone();
+                let mut emitted = self.emitted.lock().unwrap();
+                added
+                    .into_iter()
+                    .filter(|id| emitted.insert(id.clone()))
+                    .collect()
+            };
+            if pending.is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                return Ok(StepOutcome::Stalled);
+            }
+            let outputs = pending
+                .into_iter()
+                .map(|id| EngineCoreOutput {
+                    request_id: id,
+                    new_token_ids: self.stop_word_tokens.clone(),
+                    finish_reason: None,
+                    stop_reason: None,
+                    num_cached_tokens: 0,
+                    events: None,
+                    new_logprobs: None,
+                    new_prompt_logprobs: None,
+                    pooler_output: None,
+                })
+                .collect();
+            Ok(StepOutcome::Progressed {
+                outputs: scratchy_core_common::EngineCoreOutputs {
+                    outputs,
+                    ..Default::default()
+                },
+                model_executed: true,
+            })
+        }
+
+        fn add_request(
+            &mut self,
+            request: EngineCoreRequest,
+        ) -> scratchy_serving_engine::error::EngineResult<()> {
+            self.added.lock().unwrap().push(request.request_id);
+            Ok(())
+        }
+
+        fn abort_requests(
+            &mut self,
+            request_ids: &[String],
+        ) -> scratchy_serving_engine::error::EngineResult<()> {
+            self.aborted.lock().unwrap().extend_from_slice(request_ids);
+            Ok(())
+        }
+
+        // As the engine does: a failed step's requests are aborted.
+        fn abandon_step(
+            &mut self,
+            sched: &scratchy_serving_scheduler::scheduler::output::SchedulerOutput,
+        ) -> Vec<String> {
+            let ids: Vec<String> = sched.num_scheduled_tokens.keys().cloned().collect();
+            self.aborted.lock().unwrap().extend_from_slice(&ids);
+            ids
+        }
+
+        fn abort_running_requests(&mut self) {}
+
+        fn shutdown(&mut self) -> scratchy_serving_engine::error::EngineResult<()> {
+            Ok(())
+        }
+
+        fn reset_prefix_cache(&mut self) -> scratchy_serving_engine::error::EngineResult<bool> {
+            Ok(true)
+        }
+
+        fn pause_scheduler(
+            &mut self,
+            _mode: PauseMode,
+        ) -> scratchy_serving_engine::error::EngineResult<()> {
+            Ok(())
+        }
+
+        fn resume_scheduler(&mut self) -> scratchy_serving_engine::error::EngineResult<()> {
+            Ok(())
+        }
+
+        fn is_scheduler_paused(&self) -> bool {
+            false
+        }
+
+        fn sleep(&mut self, _level: u32) -> scratchy_serving_engine::error::EngineResult<()> {
+            Ok(())
+        }
+
+        fn wake_up(
+            &mut self,
+            _tags: Option<&[String]>,
+        ) -> scratchy_serving_engine::error::EngineResult<()> {
+            Ok(())
+        }
+
+        fn is_sleeping(&self) -> bool {
+            false
+        }
+    }
+
+    /// Stop → stop: each request finishes by its stop string API-side while the engine would
+    /// keep decoding it — the loop must abort each one engine-side, or the request after a
+    /// stop-string finish shares its steps with the leftover row (#711).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_string_finish_aborts_the_engine_side_request() {
+        let tok = Arc::new(make_test_tokenizer());
+        // " the country" — decodes to text matching a `stop: ["country"]` request.
+        let stop_word_tokens = tok.encode(" the country", false).unwrap();
+        let (client, added, aborted) = StopStringClient::new(stop_word_tokens);
+        let client: Box<dyn EngineCoreClient + Send> = Box::new(client);
+        let engine = Arc::new(AsyncEngine::with_tokenizer(
+            client,
+            "test-model".to_string(),
+            4096,
+            tok,
+        ));
+        engine.spawn_step_loop();
+
+        let mut request = make_chat_request();
+        request.stop = Some(protocol::StopCondition::Multiple(vec![
+            "country".to_string(),
+        ]));
+        request.max_tokens = Some(50);
+
+        let a = tokio::time::timeout(
+            Duration::from_secs(10),
+            engine.chat_completion(request.clone()),
+        )
+        .await
+        .expect("request A timed out — the stop string never finished it")
+        .expect("request A failed");
+        assert_eq!(a.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert!(
+            !a.choices[0]
+                .message
+                .content
+                .as_deref()
+                .unwrap_or("")
+                .contains("country"),
+            "the reply is truncated at the stop string"
+        );
+
+        // The request right after the stop-string finish — the one #711 caught decoding
+        // garbage. Its own stop string must finish it the same way.
+        let b = tokio::time::timeout(Duration::from_secs(10), engine.chat_completion(request))
+            .await
+            .expect("request B timed out — the stop string never finished it")
+            .expect("request B failed");
+        assert_eq!(b.choices[0].finish_reason.as_deref(), Some("stop"));
+
+        let added = added.lock().unwrap().clone();
+        let aborted = aborted.lock().unwrap().clone();
+        assert_eq!(
+            added.len(),
+            2,
+            "both requests reached the engine: {added:?}"
+        );
+        assert_eq!(
+            aborted.len(),
+            2,
+            "every stop-string-finished request is aborted engine-side — without the abort the \
+             engine decodes it on to max_tokens under the next request's steps (#711); \
+             aborted {aborted:?} of {added:?}"
+        );
     }
 
     /// Test that the no-progress watchdog aborts requests stuck with no output.
@@ -5881,6 +7279,125 @@ mod tests {
         );
     }
 
+    /// An executor whose steps resolve as a device's do: each output deferred, its resolve
+    /// blocking its thread for a 2 ms device step — by when the step behind it has its output
+    /// queued — and then until the request's stream has received every step before it, what a
+    /// device step's wait overlaps when the step loop holds no stream behind it, or until a
+    /// second passes, a stall it counts.
+    struct DeviceStepExecutor {
+        inner: NoopExecutor,
+        steps: usize,
+        streamed: Arc<std::sync::atomic::AtomicUsize>,
+        stalls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl scratchy_serving_engine::executor::Executor for DeviceStepExecutor {
+        /// It samples no grammar.
+        fn set_stop_token_ids(&mut self, _stop_token_ids: &[u32]) {}
+
+        fn execute_model(
+            &mut self,
+            scheduler_output: &scratchy_serving_scheduler::scheduler::output::SchedulerOutput,
+        ) -> scratchy_serving_engine::error::EngineResult<
+            scratchy_serving_engine::executor::ModelRunnerOutput,
+        > {
+            use std::sync::atomic::Ordering::SeqCst;
+            let output = self.inner.execute_model(scheduler_output)?;
+            let before = self.steps;
+            self.steps += 1;
+            let (streamed, stalls) = (Arc::clone(&self.streamed), Arc::clone(&self.stalls));
+            let tokens = output.sampled_token_ids.into_iter().flatten().collect();
+            Ok(
+                scratchy_serving_engine::executor::ModelRunnerOutput::deferred(
+                    output.req_ids,
+                    Box::new(move || {
+                        std::thread::sleep(Duration::from_millis(2));
+                        let deadline = Instant::now() + Duration::from_secs(1);
+                        while streamed.load(SeqCst) < before {
+                            if Instant::now() > deadline {
+                                stalls.fetch_add(1, SeqCst);
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Ok(tokens)
+                    }),
+                ),
+            )
+        }
+
+        fn initialize_cache(
+            &mut self,
+            num_gpu_blocks: usize,
+            num_cpu_blocks: usize,
+        ) -> scratchy_serving_engine::error::EngineResult<()> {
+            self.inner.initialize_cache(num_gpu_blocks, num_cpu_blocks)
+        }
+
+        fn determine_available_memory(
+            &mut self,
+        ) -> scratchy_serving_engine::error::EngineResult<Vec<usize>> {
+            self.inner.determine_available_memory()
+        }
+
+        fn shutdown(&mut self) {
+            self.inner.shutdown()
+        }
+
+        fn is_sleeping(&self) -> bool {
+            self.inner.is_sleeping()
+        }
+    }
+
+    /// The async step loop waits out a deferred step's device work without holding the streams
+    /// it just sent a step's tokens to: each reaches its reader while the next step resolves.
+    /// Waited for on the loop's own worker, a reader that step had woken sat in that worker's
+    /// LIFO slot, which no other worker steals, until the loop next yielded — its tokens went
+    /// out in bursts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_async_loop_streams_each_step_while_the_next_resolves() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let (streamed, stalls) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let executor = DeviceStepExecutor {
+            inner: NoopExecutor::new(1024),
+            steps: 0,
+            streamed: Arc::clone(&streamed),
+            stalls: Arc::clone(&stalls),
+        };
+        // The scheduler's own flag too: a step is scheduled behind the one in flight, so the
+        // loop's wait for its result is ready at once, as a device step's is.
+        let mut config = make_engine_config();
+        config.async_scheduling = true;
+        config.scheduler_config.async_scheduling = Some(true);
+        let client = Box::new(InprocClient::new(config, Box::new(executor)));
+        let mut engine = AsyncEngine::new(client, "test-model".to_string(), 4096);
+        engine.set_async_scheduling(true);
+        let engine = Arc::new(engine);
+        engine.spawn_step_loop();
+
+        let mut request =
+            make_completion_request(Some(protocol::CompletionPrompt::TokenIds(vec![1, 2, 3])));
+        request.max_tokens = Some(64);
+        request.stream = true;
+        let (_, _, mut rx) = engine.completion_stream(request).await.unwrap();
+        // The stream's reader is a task of the runtime, as a server connection's is.
+        let reader = Arc::clone(&streamed);
+        tokio::spawn(async move {
+            while rx.recv().await.is_some() {
+                reader.fetch_add(1, SeqCst);
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(streamed.load(SeqCst) >= 64, "every token streamed");
+        assert_eq!(
+            stalls.load(SeqCst),
+            0,
+            "steps resolved with their stream held"
+        );
+    }
+
     /// A failed speculative step (an MTP head plans drafts for every request it admits) is
     /// never finalized, so the async loop must stop waiting on it: the next request is
     /// scheduled — and fails — at once, not left pending for the no-progress watchdog (#477).
@@ -5991,6 +7508,75 @@ mod tests {
         assert!(
             msg.content.is_none(),
             "content should be None when no </think>"
+        );
+    }
+
+    /// A tool parser that reads one Bash call beside fixed text out of any reply, so a
+    /// non-streaming test can see what the response keeps of it (NoopExecutor's text is
+    /// placeholders).
+    struct OneBashCall;
+
+    impl crate::tool_parser::ToolCallParser for OneBashCall {
+        fn extract_tool_calls(&self, _: &str) -> crate::tool_parser::ExtractedToolCallInfo {
+            crate::tool_parser::ExtractedToolCallInfo {
+                tools_called: true,
+                tool_calls: vec![protocol::ToolCall {
+                    id: "call_1".to_string(),
+                    call_type: "function".to_string(),
+                    function: protocol::FunctionCall {
+                        name: "Bash".to_string(),
+                        arguments: "{\"command\": \"ls\"}".to_string(),
+                    },
+                }],
+                content: Some("Let me look.".to_string()),
+            }
+        }
+
+        fn create_streaming_state(&self) -> Box<dyn StreamingToolParserState + Send> {
+            crate::tool_parser::get_tool_parser("hermes")
+                .unwrap()
+                .create_streaming_state()
+        }
+    }
+
+    /// The non-streaming reply drops a call to a tool other than the forced one, as the stream
+    /// does, and is the text around it — not the raw output, and not a tool-call finish (#683).
+    /// Forcing the tool the model called keeps the call (the control).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_chat_completion_drops_a_call_to_a_tool_not_forced() {
+        let mut engine = make_test_engine();
+        engine.set_tool_parser(Arc::new(OneBashCall));
+        let engine = Arc::new(engine);
+        engine.spawn_step_loop();
+        let request = |forced: &str| protocol::ChatCompletionRequest {
+            tools: Some(vec![protocol::ChatCompletionToolsParam {
+                tool_type: "function".to_string(),
+                function: protocol::FunctionDefinition {
+                    name: forced.to_string(),
+                    description: None,
+                    parameters: None,
+                },
+            }]),
+            tool_choice: Some(protocol::ToolChoice::Function(forced.to_string())),
+            max_tokens: Some(4),
+            ..make_chat_request()
+        };
+
+        let kept = engine.chat_completion(request("Bash")).await.unwrap();
+        let choice = &kept.choices[0];
+        let calls = choice.message.tool_calls.as_ref().expect("the Bash call");
+        assert_eq!(calls[0].function.name, "Bash");
+        assert_eq!(choice.message.content.as_deref(), Some("Let me look."));
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+
+        let dropped = engine.chat_completion(request("Read")).await.unwrap();
+        let choice = &dropped.choices[0];
+        assert!(choice.message.tool_calls.is_none(), "{choice:?}");
+        assert_eq!(choice.message.content.as_deref(), Some("Let me look."));
+        assert_eq!(
+            choice.finish_reason.as_deref(),
+            Some("length"),
+            "max_tokens ended it"
         );
     }
 
@@ -6621,7 +8207,8 @@ mod tests {
     #[test]
     fn test_streaming_buffered_tool_call_reports_every_token() {
         for reasoning in [false, true] {
-            let (deltas, generated) = super::test_support::buffered_tool_call_deltas(reasoning);
+            let (deltas, generated) =
+                super::test_support::buffered_tool_call_deltas(reasoning, FinishReason::Stop);
             let summed: u32 = deltas.iter().map(|d| d.new_token_ids.len() as u32).sum();
             assert!(
                 summed < generated,
@@ -6636,6 +8223,100 @@ mod tests {
             );
         }
     }
+
+    /// A tool call's finish carries the step's own reason: one cut off by `max_tokens` streams
+    /// `Length`, which the encoders keep (`length`, `max_tokens`) rather than turning into a
+    /// tool-call finish. It used to stream `Stop` whatever ended the request.
+    #[test]
+    fn test_streaming_tool_call_finish_keeps_the_steps_reason() {
+        for reasoning in [false, true] {
+            for finish in [FinishReason::Stop, FinishReason::Length] {
+                let (deltas, _) = super::test_support::buffered_tool_call_deltas(reasoning, finish);
+                assert!(deltas.iter().any(|d| d.tool_call_deltas.is_some()));
+                let finishes: Vec<_> = deltas.iter().filter_map(|d| d.finish_reason).collect();
+                assert_eq!(finishes, [finish], "reasoning={reasoning}");
+            }
+        }
+    }
+
+    /// The content a gpt-oss reply streams for `pieces` (one engine output each, the last ending
+    /// it on `max_tokens`), through phases 1 and 3 as the step loop runs them.
+    fn harmony_streamed_content(pieces: &[&str]) -> String {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = make_test_request_state(Some(tx));
+        state.reasoning_parser_state =
+            Some(crate::reasoning_parser::GptOssReasoningParser.create_streaming_state());
+        let mut requests = HashMap::from([("req-1".to_string(), state)]);
+        let last = pieces.len() - 1;
+        for (i, text) in pieces.iter().enumerate() {
+            let outputs = vec![EngineCoreOutput {
+                request_id: "req-1".to_string(),
+                new_token_ids: vec![20 + i as u32],
+                finish_reason: (i == last).then_some(FinishReason::Length),
+                stop_reason: None,
+                num_cached_tokens: 0,
+                events: None,
+                new_logprobs: None,
+                new_prompt_logprobs: None,
+                pooler_output: None,
+            }];
+            AsyncEngine::process_outputs_phase1(&mut requests, &outputs);
+            let detok = vec![Some((None, Some(text.to_string())))];
+            AsyncEngine::process_outputs_phase3(&mut requests, outputs, detok);
+        }
+        let mut content = String::new();
+        while let Ok(delta) = rx.try_recv() {
+            content.extend(delta.text);
+        }
+        content
+    }
+
+    /// A gpt-oss reply streams the same content the complete reply splits out, through the
+    /// engine's own routing: every delta goes through the harmony scanner, content included, and
+    /// the scanner's held text is flushed at the end. Reasoning-first, the engine stopped feeding
+    /// it at the first content, so a `<` held there was lost and later markers streamed as text.
+    #[test]
+    fn a_harmony_reply_streams_the_content_the_complete_reply_splits_out() {
+        let header = [
+            "<|channel|>",
+            "analysis",
+            "<|message|>",
+            "think",
+            "<|end|>",
+            "<|start|>",
+            "assistant",
+            "<|channel|>",
+            "final",
+            "<|message|>",
+        ];
+        let finals: [&[&str]; 3] = [
+            // The control: content whose `<` closes in the same delta.
+            &["Use", " \"<", "div", ">\""],
+            // Content whose first delta ends on an unclosed `<`.
+            &["\"<", "div", ">\""],
+            // A second final message after content.
+            &[
+                "Hi",
+                "<|end|>",
+                "<|start|>",
+                "assistant",
+                "<|channel|>",
+                "final",
+                "<|message|>",
+                " again",
+            ],
+        ];
+        for content in finals {
+            let pieces: Vec<&str> = header.iter().chain(content).copied().collect();
+            let whole =
+                crate::reasoning_parser::GptOssReasoningParser.extract_reasoning(&pieces.concat());
+            assert_eq!(
+                Some(harmony_streamed_content(&pieces)),
+                whole.content,
+                "{content:?}"
+            );
+        }
+    }
 }
 
 /// Engine-produced delta streams for the HTTP encoders' tests.
@@ -6644,31 +8325,20 @@ pub(crate) mod test_support {
     use super::*;
 
     /// The deltas the engine streams for a qwen3_coder tool call the parser buffers for most of
-    /// its steps — run through phases 1 and 3 as the step loop does — with the number of tokens
-    /// generated. `reasoning` puts a reasoning parser in front, with a short thought first.
+    /// its steps, with the number of tokens generated. `reasoning` puts a reasoning parser in
+    /// front, with a short thought first; the last step ends the request with `finish`.
     ///
     /// The buffered steps send no delta, so the deltas' `new_token_ids` add up to fewer tokens
     /// than were generated: a consumer has to read the count from [`StreamUsage`].
-    pub(crate) fn buffered_tool_call_deltas(reasoning: bool) -> (Vec<StreamDelta>, u32) {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut requests = HashMap::new();
-        let mut state = super::tests::make_test_request_state(Some(tx));
-        state.tool_parser_state = Some(
-            crate::tool_parser::get_tool_parser("qwen3_coder")
-                .unwrap()
-                .create_streaming_state(),
-        );
+    pub(crate) fn buffered_tool_call_deltas(
+        reasoning: bool,
+        finish: FinishReason,
+    ) -> (Vec<StreamDelta>, u32) {
         let mut pieces: Vec<(Vec<u32>, &str)> = Vec::new();
         if reasoning {
-            let parser = crate::reasoning_parser::Qwen3ReasoningParser::new(
-                &super::tests::reasoning_test_vocab(),
-            )
-            .unwrap();
-            state.reasoning_parser_state = Some(parser.create_streaming_state());
             pieces.push((vec![10], "I will run ls."));
             pieces.push((vec![101, 11], "\n</think>\n\n"));
         }
-        requests.insert("req-1".to_string(), state);
         pieces.extend([
             (vec![12], "<tool_call>\n"),
             (vec![13], "<function=Bash>\n"),
@@ -6678,14 +8348,42 @@ pub(crate) mod test_support {
             (vec![17], "</function>\n"),
             (vec![18], "</tool_call>"),
         ]);
-
         let generated = pieces.iter().map(|(ids, _)| ids.len() as u32).sum();
+        let configure = |state: &mut RequestState| {
+            state.tool_parser_state = Some(
+                crate::tool_parser::get_tool_parser("qwen3_coder")
+                    .unwrap()
+                    .create_streaming_state(),
+            );
+            if reasoning {
+                let parser = crate::reasoning_parser::Qwen3ReasoningParser::new(
+                    &super::tests::reasoning_test_vocab(),
+                )
+                .unwrap();
+                state.reasoning_parser_state = Some(parser.create_streaming_state());
+            }
+        };
+        (stream_pieces(configure, pieces, finish), generated)
+    }
+
+    /// The deltas a request streams for `pieces` — each piece one engine output, its token ids
+    /// and the text they detokenize to, the last one finishing the request with `finish` — run
+    /// through phases 1 and 3 as the step loop runs them. `configure` sets the request's parsers.
+    pub(super) fn stream_pieces(
+        configure: impl FnOnce(&mut RequestState),
+        pieces: Vec<(Vec<u32>, &str)>,
+        finish: FinishReason,
+    ) -> Vec<StreamDelta> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = super::tests::make_test_request_state(Some(tx));
+        configure(&mut state);
+        let mut requests = HashMap::from([("req-1".to_string(), state)]);
         let last = pieces.len() - 1;
         for (i, (ids, text)) in pieces.into_iter().enumerate() {
             let outputs = vec![EngineCoreOutput {
                 request_id: "req-1".to_string(),
                 new_token_ids: ids,
-                finish_reason: (i == last).then_some(FinishReason::Stop),
+                finish_reason: (i == last).then_some(finish),
                 stop_reason: None,
                 num_cached_tokens: 0,
                 events: None,
@@ -6701,6 +8399,6 @@ pub(crate) mod test_support {
         while let Ok(delta) = rx.try_recv() {
             deltas.push(delta);
         }
-        (deltas, generated)
+        deltas
     }
 }

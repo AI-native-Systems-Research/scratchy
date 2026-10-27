@@ -49,15 +49,15 @@ pub struct TqRuntimeBuffers {
 /// coded layer of a forward — chunk tables (bound at each layer's `kv_cache_k/v` slot: attention,
 /// rope, dequant and quantize all use it) and their backing data (kept alive and resident here).
 /// Its contents live within one layer of one forward, so a model whose forwards never overlap this
-/// one's stages through it too ([`super::worker::LentActivation`]) when its geometry is the same.
+/// one's stages through it too ([`super::worker::HostArena`]) when its geometry is the same.
 #[derive(Clone)]
 pub struct TqScratch {
     pub k_table: Buffer,
     pub v_table: Buffer,
     pub k_data: Buffer,
     pub v_data: Buffer,
-    /// The bytes of each of K and V, and of one chunk the tables address: the geometry a borrower
-    /// must match.
+    /// The bytes of each of K and V, and of one chunk the tables address: the geometry a guest
+    /// staging through it must match.
     pub bytes: usize,
     pub chunk_bytes: usize,
 }
@@ -108,19 +108,14 @@ pub struct RuntimeBindings {
     /// that need M at runtime can read it without a function
     /// constant (M varies per call).
     pub num_tokens_u32: Buffer,
-    /// `[1]` u32 — number of sample rows the lm_head slice trio
-    /// gathers / GEMMs / scatters this forward. Equals the length
-    /// of the in-flight `last_token_indices` slice (= `num_seqs` for
-    /// non-spec prefill/decode, `K+1` for spec-decode verify, `0`
-    /// when the caller doesn't pass indices). Read by the
-    /// `gather_last_token`/`scatter_first_to_last_row` kernels.
+    /// `[1]` u32 — the in-flight forward's sampled rows' count
+    /// ([`super::ForwardInputs::sampled_rows`]). Read by the
+    /// `gather_sampled_rows`/`put_sampled_rows_back` kernels.
     pub num_sample_rows_u32: Buffer,
-    /// `[num_sample_rows]` u32 — per-sample-row source/destination
-    /// index into the lm_head input/output tensor. Mirrors Python
-    /// vLLM's `logits_indices` and the CUDA path's
-    /// `ForwardCtx.last_token_indices`. Sized at construction for
-    /// the worker's largest bucket's `bucket_m`; the pool writes
-    /// the in-flight slice's content at the start of every forward.
+    /// `[num_sample_rows]` u32 — the in-flight forward's sampled rows,
+    /// ascending: Python vLLM's `logits_indices`. Sized at construction
+    /// for the worker's largest bucket's `bucket_m`; the pool writes the
+    /// in-flight rows at the start of every forward.
     pub sample_indices: Buffer,
     /// Per-layer GDN conv-state ring buffers (persistent f32 pool),
     /// GLOBAL-layer-indexed like `gdn_state_ssm`. Non-linear (full-attn)
@@ -361,7 +356,7 @@ impl RuntimeBindings {
             RuntimeBindingKind::TqBoundaries => &self.tq().boundaries,
             RuntimeBindingKind::TqCentroids => &self.tq().centroids,
             RuntimeBindingKind::NumTokensU32 => &self.num_tokens_u32,
-            RuntimeBindingKind::NumSeqsU32 => &self.num_sample_rows_u32,
+            RuntimeBindingKind::NumSampleRowsU32 => &self.num_sample_rows_u32,
             RuntimeBindingKind::SampleIndices => &self.sample_indices,
             RuntimeBindingKind::GdnConvState { layer } => {
                 &self.gdn_state_conv[layer.get() as usize]

@@ -16,7 +16,7 @@ use objc2_metal::{
 };
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use crate::shader_cache::load_library_from_bytes;
 use crate::stream::MetalStreamError;
@@ -27,6 +27,16 @@ pub type Library = Retained<ProtocolObject<dyn MTLLibrary>>;
 pub type ComputePipelineState = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 
 type MetallibBytes = &'static [u8];
+
+/// The process's one turn at building a pipeline state. Apple's GPU compiler corrupts its own heap
+/// when several threads build pipelines at once, each through its own compiler and descriptors
+/// (a malloc trap under `ReflectionKey::initGPUCompilerSPIOptionsHash`: #288, #507), so every
+/// pipeline build in the crate takes this turn. A build happens once per key and is cached, so
+/// the turn is all but uncontended; a build that panicked with it held leaves it usable.
+pub(crate) fn pipeline_build_turn() -> MutexGuard<'static, ()> {
+    static TURN: Mutex<()> = Mutex::new(());
+    TURN.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PipelineKey {
@@ -178,6 +188,7 @@ impl SpecializedPipelineCache {
         let lib_fn_super: &::objc2_metal::MTL4FunctionDescriptor = &lib_fn_desc;
         pipe_desc.setComputeFunctionDescriptor(Some(lib_fn_super));
 
+        let turn = pipeline_build_turn();
         let compiler = self.compiler.get_or_init(|| {
             let cdesc = MTL4CompilerDescriptor::new();
             self.device
@@ -194,6 +205,7 @@ impl SpecializedPipelineCache {
                     key.constants.len(),
                 ))
             })?;
+        drop(turn);
 
         // GUARD (threadgroup-overflow class): a kernel whose total threadgroup
         // memory exceeds the device limit faults at GPU exec with a cryptic
