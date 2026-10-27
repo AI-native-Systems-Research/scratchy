@@ -9493,10 +9493,10 @@ fn emit_superdsc_wiring(
                 // declares: covered BY CLASS (the tape's ChainSeed steps bind
                 // both sticks every step), which is why this is a `continue`
                 // and not a refusal.
-                if let Some((s_src, l_src)) = chain_sticks {
-                    if s_src == id || l_src == id {
-                        continue;
-                    }
+                if let Some((s_src, l_src)) = chain_sticks
+                    && (s_src == id || l_src == id)
+                {
+                    continue;
                 }
                 fail.push(format!(
                     "source t{id} is inside `num_sources` but has NO binding — nothing fills it"
@@ -9515,10 +9515,9 @@ fn emit_superdsc_wiring(
                     // the replaced id at the mint; this gate reads the same
                     // statement, never a re-derivation.
                     if let scratchy_target_spyre::wiring::ChainFact::Chained { chain } = &gk.chain
+                        && id == chain.replaces
                     {
-                        if id == chain.replaces {
-                            continue;
-                        }
+                        continue;
                     }
                     embeds += 1;
                     if id != embed_src {

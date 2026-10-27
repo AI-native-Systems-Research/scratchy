@@ -1090,6 +1090,9 @@ impl LoadConst {
             LoadConst::SampleTable { operand, .. } => {
                 (10..=13).contains(&operand) || (15..=20).contains(&operand)
             }
+            // The chain's decompose tables are whole-row multi-stick ramps —
+            // never the seeds' one-word-per-row class.
+            LoadConst::ChainStageTable { .. } => false,
         }
     }
 
@@ -1110,14 +1113,19 @@ impl LoadConst {
     /// it, never permute the rows' words.
     pub fn card_bytes(&self) -> (Vec<u8>, scratchy_tensors::DType, [usize; 2]) {
         let (bytes, dt, shape) = self.build();
-        // The enum's one variant today; a second kind that is not a sampler
-        // table falls through VERBATIM by this destructure failing to compile.
-        let LoadConst::SampleTable {
-            rows,
-            operand,
-            arrangement,
-            ..
-        } = *self;
+        // Only the sampler's own tables carry the uniform-col class; every
+        // other kind — the chain's decompose ramps — falls through VERBATIM,
+        // and a second such kind arrives here by this match failing to
+        // compile, never by silently taking the per-row spread.
+        let (rows, operand, arrangement) = match *self {
+            LoadConst::SampleTable {
+                rows,
+                operand,
+                arrangement,
+                ..
+            } => (rows, operand, arrangement),
+            LoadConst::ChainStageTable { .. } => return (bytes, dt, shape),
+        };
         if self.is_uniform_col() {
             if matches!(arrangement, ElementArrangement::Dl16ToFp32) {
                 panic!(

@@ -2044,7 +2044,7 @@ pub fn load_consts_of_ir<F: RopeForm>(
                 "the Sample node's arity is the registry's own row (logits + the four seed word \
                  tables + inv_t + twenty tables)"
             );
-            Ok(node.inputs[6..]
+            node.inputs[6..]
                 .iter()
                 .enumerate()
                 .map(|(i, tr)| {

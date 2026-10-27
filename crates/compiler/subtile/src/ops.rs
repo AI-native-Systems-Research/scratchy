@@ -161,7 +161,6 @@ macro_rules! for_each_subop {
             // ruling, 2026-10-27): the seed quadruple is request-owned.
             Sample [SubOp::Sample { .. }] arity = (|n| n == 26), cols = [stick],
                 rows = [in0], gemm_w = [none];
-                rows = [in0], gemm_w = [none];
             // The chained head's row gather: `[s_stick, l_stick, embed_matrix]` —
             // the s stick's rows out (one per request), `hidden` wide (the op's
             // own field, never a shape read). The matrix is read as DATA already

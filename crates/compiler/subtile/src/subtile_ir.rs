@@ -1919,8 +1919,8 @@ pub const CHAIN_IDX_BLOCK: u32 = 32;
 
 /// The sampler's sentinel OFFSET from the padded row — the distance from
 /// `PAD_V` to the all-NaN row's answer `PAD_V + G·4096 + 4160`: the staged
-/// tables' `ginc`/`binc`/`linc` combine, `SAMPLE_GROUP_BLOCKS · SAMPLE_BLOCK
-/// + SAMPLE_BLOCK` = 4160. The sampler's own sentinel law (the host
+/// tables' `ginc`/`binc`/`linc` combine, `SAMPLE_GROUP_BLOCKS · SAMPLE_BLOCK +
+/// SAMPLE_BLOCK` = 4160. The sampler's own sentinel law (the host
 /// reference's `None` arm) stated as the offset the chain's table range
 /// reads — ONE derivation, no argmax twin.
 pub const SAMPLE_SENTINEL_OFFSET: u32 =
