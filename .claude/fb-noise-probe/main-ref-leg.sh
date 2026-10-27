@@ -62,7 +62,7 @@ echo "==== MAINREF-BUILD-OK $(date -u +%FT%TZ) ===="
 # ── leg 2: the greedy reference chat, with the logits dump riding it ──
 mkdir -p "$PROBE"
 echo "==== MAINREF-RUN-START $(date -u +%FT%TZ) ===="
-"$SCR" chat -m ibm-granite/granite-3.1-2b-instruct --device spyre \
+"$SCR" chat -m RedHatAI/granite-3.1-2b-instruct-FP8-dynamic --device spyre \
   -q "$PROMPT" --max-tokens 64 \
   > "$PROBE/main-greedy.run" 2> "$PROBE/main-greedy.err"
 rc=$?

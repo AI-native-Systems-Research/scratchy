@@ -60,12 +60,16 @@ def softmax(x: np.ndarray) -> np.ndarray:
 def main() -> int:
     tok_path = sorted(
         glob.glob(
-            "/root/.cache/huggingface/hub/models--ibm-granite--granite-3.1-2b-instruct/"
+            "/root/.cache/huggingface/hub/models--RedHatAI--granite-3.1-2b-instruct-FP8-dynamic/"
             "snapshots/*/tokenizer.json"
         )
         + glob.glob(
             str(pathlib.Path.home() / ".cache/huggingface/hub/"
-                "models--ibm-granite--granite-3.1-2b-instruct/snapshots/*/tokenizer.json")
+                "models--RedHatAI--granite-3.1-2b-instruct-FP8-dynamic/snapshots/*/tokenizer.json")
+        )
+        + glob.glob(
+            "/work/huggingface/hub/"
+            "models--RedHatAI--granite-3.1-2b-instruct-FP8-dynamic/snapshots/*/tokenizer.json"
         )
     )
     if not tok_path:

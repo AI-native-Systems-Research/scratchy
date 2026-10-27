@@ -72,7 +72,7 @@ echo "==== CHAT-BUILD-OK $(date -u +%FT%TZ) ===="
 # ── leg 2: the server, at debug so the seat + rung lines land in the log ──
 SRVLOG=$PROBE/chat-server.log
 echo "==== CHAT-SERVE-START $(date -u +%FT%TZ) ===="
-setsid nohup "$SCR" serve -m ibm-granite/granite-3.1-2b-instruct --device spyre \
+setsid nohup "$SCR" serve -m RedHatAI/granite-3.1-2b-instruct-FP8-dynamic --device spyre \
   --port $PORT --log-level debug > "$SRVLOG" 2>&1 &
 SRVPID=$!
 # wait for readiness (the health/models endpoint answers)
@@ -140,7 +140,7 @@ trap - EXIT
 
 # ── part 4b: the in-process greedy twin, AFTER the server released the card ──
 echo "==== CHAT-P4B-START $(date -u +%FT%TZ) ===="
-"$SCR" chat -m ibm-granite/granite-3.1-2b-instruct --device spyre \
+"$SCR" chat -m RedHatAI/granite-3.1-2b-instruct-FP8-dynamic --device spyre \
   -q "$PROMPT" --temperature 0.0 --max-tokens 64 \
   > "$PROBE/chat-p4-greedy-chat.run" 2> "$PROBE/chat-p4-greedy-chat.err"
 echo "==== CHAT-P4B-RC rc=$? $(date -u +%FT%TZ) ===="
@@ -150,7 +150,7 @@ echo "==== CHAT-P4B-RC rc=$? $(date -u +%FT%TZ) ===="
 #    seat-law (row word) one. The verdict reads these as diagnostics only. ──
 echo "==== CHAT-B-SERVE-START $(date -u +%FT%TZ) ===="
 SRVLOGB=$PROBE/chatb-server.log
-setsid nohup "$SCR" serve -m ibm-granite/granite-3.1-2b-instruct --device spyre \
+setsid nohup "$SCR" serve -m RedHatAI/granite-3.1-2b-instruct-FP8-dynamic --device spyre \
   --port $PORT --log-level debug --no-prefix-caching > "$SRVLOGB" 2>&1 &
 SRVPID=$!
 for i in $(seq 1 120); do
