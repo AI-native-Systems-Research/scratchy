@@ -8,9 +8,17 @@ step where they differ, and which of the auditor's two branches it is:
 
   - SEAT WORDS DIFFER -> the differing word is batch-dependent; it must be
     a function of the request alone (its own step count and its own seed).
-  - WORDS EQUAL, PICK DIFFERS -> numeric (the rows=2 decode rung is a
-    different baked tape than the rows=1 one); the gate becomes 'batched
-    equals main's batched', not solo.
+  - WORDS EQUAL, PICK DIFFERS -> numeric (the rows=2 decode-batch rung is
+    a different baked tape than the rows=1 solo one); the gate becomes
+    'batched equals main's batched', not solo.
+
+Launch geometry this log actually carries (measured, first run): a solo
+request's decode steps run one launch each, ctx 'solo pos=N' (rows=1); a
+concurrent pair runs each request's first decode steps solo, then shared
+'decode-batch mq=2' launches — request 1234 at row 0, request 9999 at row
+1 (the row word of the second request is 1 in the pair and 0 in any solo
+run). Comparison is keyed on the step word (words[2], the request's own
+absolute position), never on list index.
 
 Reads (all produced by p3-loc-leg.sh on the pod):
   p3-loc-server.log   — the server log, debug level (SEAT_BIND +
@@ -42,8 +50,10 @@ WORD_NAMES = ["seed_lo", "seed_hi", "step", "gate", "row"]
 BIND_RE = re.compile(
     r"SEAT_BIND rows=(\d+) seed_words=\[([^\]]*)\] invt=t(\d+) laws=(.*)")
 LAW_RE = re.compile(r"r(\d+):(?:(seed=\d+)|greedy)@step(\d+):inv_t([0-9.]+)")
-RB_RE = re.compile(
-    r"SEAT_READBACK (decode-batch|prefill-final) mq=(\d+) start=(\d+) rows=(\d+)")
+# ctx is free-form ("decode-batch mq=2 start=69", "prefill-final mq=71
+# start=0", "solo pos=67"); the rows count is the first ' rows=N ' after it.
+RB_RE = re.compile(r"SEAT_READBACK (.+?) rows=(\d+) ")
+MQ_RE = re.compile(r"mq=(\d+)")
 ROW_RE = re.compile(
     r"r(\d+):words=\[([^\]]*)\]:invt=([^:]*):pick=(None|Some\(\d+\))"
     r":argmax=(None|Some\(\d+\)):eq=(true|false)")
@@ -79,8 +89,10 @@ def seat_events(lines):
             m = RB_RE.search(ln)
             if not m:
                 # the readback's own failure lines ("... read failed") carry
-                # no rows — count them so a vanished row is visible, not silent
+                # no rows — skipped; an empty sequence fails structurally
                 continue
+            ctx = m.group(1).strip()
+            mq_m = MQ_RE.search(ctx)
             per_row = []
             for rm in ROW_RE.finditer(ln):
                 words = [int(x.strip()) for x in rm.group(2).split(",")]
@@ -93,9 +105,8 @@ def seat_events(lines):
                     "eq": rm.group(6) == "true",
                 })
             reads.append({
-                "ctx": m.group(1), "mq": int(m.group(2)),
-                "start": int(m.group(3)), "rows": int(m.group(4)),
-                "per_row": per_row,
+                "ctx": ctx, "mq": int(mq_m.group(1)) if mq_m else None,
+                "rows": int(m.group(2)), "per_row": per_row,
                 "bind_raw": last_bind["raw"] if last_bind else None,
                 "raw": ln.strip(),
             })
@@ -110,16 +121,25 @@ def req_seq(reads, seed):
         for r in ev["per_row"]:
             if r["words"] and r["words"][0] == seed:
                 out.append({"ctx": ev["ctx"], "mq": ev["mq"],
-                            "start": ev["start"], "bind_raw": ev["bind_raw"],
-                            "raw": ev["raw"], **r})
+                            "bind_raw": ev["bind_raw"], "raw": ev["raw"],
+                            **r})
+    return out
+
+
+def by_step(seq):
+    """Step word -> entry. A step appearing twice (two launches at one
+    position) is kept as a list and flagged by the caller."""
+    out = {}
+    for e in seq:
+        out.setdefault(e["words"][2], []).append(e)
     return out
 
 
 def ctx_win(seq, i, w=2):
     lo, hi = max(0, i - w), min(len(seq), i + w + 1)
-    return [{"ctx": e["ctx"], "mq": e["mq"], "row": e["row"],
-             "words": e["words"], "pick": e["pick"], "argmax": e["argmax"],
-             "eq": e["eq"]} for e in seq[lo:hi]]
+    return [{"ctx": e["ctx"], "row": e["row"], "words": e["words"],
+             "pick": e["pick"], "argmax": e["argmax"], "eq": e["eq"]}
+            for e in seq[lo:hi]]
 
 
 def text_of(p):
@@ -158,40 +178,51 @@ def main():
         print("P3-LOC STRUCTURAL FAILURE: " + "; ".join(fail))
         return 1
 
-    n = min(len(solo), len(pair))
+    solo_steps = by_step(solo)
+    pair_steps = by_step(pair)
+    dup = ([k for k, v in solo_steps.items() if len(v) > 1]
+           + [k for k, v in pair_steps.items() if len(v) > 1])
+    common = sorted(set(solo_steps) & set(pair_steps))
+    only_solo = sorted(set(solo_steps) - set(pair_steps))
+    only_pair = sorted(set(pair_steps) - set(solo_steps))
+
     first_words = first_pick = first_any = None
     member_diff_counts = {name: 0 for name in WORD_NAMES}
     pick_diff_count = 0
-    for i in range(n):
-        a, b = solo[i], pair[i]
+    pick_diff_steps = []
+    for st in common:
+        a = solo_steps[st][0]
+        b = pair_steps[st][0]
         words_differ = a["words"] != b["words"]
         if words_differ:
             for k in range(min(5, len(a["words"]), len(b["words"]))):
                 if a["words"][k] != b["words"][k]:
                     member_diff_counts[WORD_NAMES[k]] += 1
-        if a["pick"] != b["pick"]:
+        pick_differ = a["pick"] != b["pick"]
+        if pick_differ:
             pick_diff_count += 1
+            pick_diff_steps.append(st)
         if words_differ and first_words is None:
             members = [WORD_NAMES[k]
                        for k in range(min(5, len(a["words"]), len(b["words"])))
                        if a["words"][k] != b["words"][k]]
-            first_words = {"index": i, "step": b["words"][2], "members": members,
+            first_words = {"step": st, "members": members,
                            "solo_words": a["words"], "pair_words": b["words"],
-                           "ctx": b["ctx"], "mq": b["mq"], "row": b["row"]}
-        if a["pick"] != b["pick"] and first_pick is None:
-            first_pick = {"index": i, "step": b["words"][2],
-                          "solo_pick": a["pick"], "pair_pick": b["pick"],
+                           "ctx": b["ctx"], "row": b["row"]}
+        if pick_differ and first_pick is None:
+            first_pick = {"step": st, "solo_pick": a["pick"],
+                          "pair_pick": b["pick"],
                           "words_equal": not words_differ,
                           "solo_argmax": a["argmax"], "pair_argmax": b["argmax"],
-                          "ctx": b["ctx"], "mq": b["mq"], "row": b["row"]}
-        if (words_differ or a["pick"] != b["pick"]) and first_any is None:
-            first_any = i
+                          "ctx": b["ctx"], "row": b["row"]}
+        if (words_differ or pick_differ) and first_any is None:
+            first_any = st
 
     if first_any is None:
-        branch = ("no-divergence" if len(solo) == len(pair)
-                  else "no-divergence-in-overlap (sequence lengths differ: "
-                       f"solo {len(solo)} vs pair {len(pair)})")
-    elif first_words is not None and first_words["index"] == first_any:
+        branch = ("no-divergence" if not only_solo and not only_pair
+                  else "no-divergence-in-common-steps (step sets differ: "
+                       f"solo-only {only_solo}, pair-only {only_pair})")
+    elif first_words is not None and first_words["step"] == first_any:
         branch = "seat-words-differ"
     else:
         branch = "numeric"
@@ -202,12 +233,23 @@ def main():
             "is batch-dependent; it must be a function of the request alone "
             "(its own step count and its own seed).",
         "numeric":
-            "Seat words are equal at every compared step but the pick "
-            "differs — numeric (the rows=2 decode rung is a different baked "
-            "tape than the rows=1 one); main's batched path shows the same "
-            "flip class, and the gate becomes 'batched equals main's "
-            "batched', not solo.",
-    }.get(branch, "No divergence found in the compared overlap.")
+            "Seat words are equal at every common step but the pick "
+            "differs — numeric (the shared decode-batch mq=2 rung is a "
+            "different baked tape than the solo rows=1 one); main's batched "
+            "path shows the same flip class, and the gate becomes 'batched "
+            "equals main's batched', not solo.",
+    }.get(branch, "No divergence found in the common steps.")
+
+    # The second request's seat in the pair — its row word vs any solo run's
+    # (a solo launch is always row 0; this run's solo slice shows it).
+    pair_b_rows = Counter(e["row"] for e in pair_b)
+    pair_b_row_words = Counter(e["words"][4] for e in pair_b)
+
+    def solo_index_of(st):
+        return next((i for i, e in enumerate(solo) if e["words"][2] == st), None)
+
+    def pair_index_of(st):
+        return next((i for i, e in enumerate(pair) if e["words"][2] == st), None)
 
     verdict = {
         "probe": "p3-localize",
@@ -221,15 +263,21 @@ def main():
         "solo_launches_with_readback": len(solo_reads),
         "pair_launches_with_readback": len(pair_reads),
         "pair_1234_rows": dict(Counter(e["row"] for e in pair)),
-        "pair_1234_launch_kinds": {f"{k[0]} mq={k[1]}": v for k, v in
-                                   sorted(Counter((e["ctx"], e["mq"])
+        "pair_1234_launch_kinds": {k: v for k, v in
+                                   sorted(Counter(e["ctx"].split()[0]
                                                   for e in pair).items())},
-        "compared_steps": n,
-        "first_divergence_index": first_any,
+        "pair_9999_rows": dict(pair_b_rows),
+        "pair_9999_row_words": dict(pair_b_row_words),
+        "common_steps": len(common),
+        "solo_only_steps": only_solo,
+        "pair_only_steps": only_pair,
+        "duplicate_step_words": dup,
+        "first_divergence_step": first_any,
         "first_words_diff": first_words,
         "first_pick_diff": first_pick,
-        "member_diff_counts_over_compared": member_diff_counts,
-        "pick_diff_count_over_compared": pick_diff_count,
+        "member_diff_counts_over_common": member_diff_counts,
+        "pick_diff_count_over_common": pick_diff_count,
+        "pick_diff_steps": pick_diff_steps,
         "branch": branch,
         "branch_text": branch_text,
         "texts": {
@@ -237,29 +285,35 @@ def main():
             "pair_seed1234": text_of(PAIR1234_JSON),
             "pair_seed9999": text_of(PAIR9999_JSON),
         },
-        "solo_context": ctx_win(solo, first_any) if first_any is not None else [],
-        "pair_context": ctx_win(pair, first_any) if first_any is not None else [],
+        "solo_context": (ctx_win(solo, solo_index_of(first_any))
+                         if first_any is not None else []),
+        "pair_context": (ctx_win(pair, pair_index_of(first_any))
+                         if first_any is not None else []),
         "divergence_solo_readback_raw":
-            solo[first_any]["raw"] if first_any is not None else None,
+            solo[solo_index_of(first_any)]["raw"] if first_any is not None else None,
         "divergence_pair_readback_raw":
-            pair[first_any]["raw"] if first_any is not None else None,
+            pair[pair_index_of(first_any)]["raw"] if first_any is not None else None,
         "divergence_pair_bind_raw":
-            pair[first_any]["bind_raw"] if first_any is not None else None,
+            pair[pair_index_of(first_any)]["bind_raw"] if first_any is not None else None,
     }
     out = HERE / "p3-localize-verdict.json"
     out.write_text(json.dumps(verdict, indent=2) + "\n")
 
     print(f"P3-LOCALIZE verdict -> {out}")
     print(f"  solo entries {len(solo)}, pair entries (1234) {len(pair)}, "
-          f"compared {n}")
+          f"common steps {len(common)}")
     print(f"  pair 1234 rows: {verdict['pair_1234_rows']}, "
           f"launch kinds: {verdict['pair_1234_launch_kinds']}")
+    print(f"  pair 9999 rows: {dict(pair_b_rows)}, row words: {dict(pair_b_row_words)}")
+    if only_solo or only_pair or dup:
+        print(f"  step-set notes: solo-only {only_solo}, pair-only "
+              f"{only_pair}, dup {dup}")
     if first_any is None:
-        print(f"  NO DIVERGENCE in the compared overlap. {branch}")
+        print(f"  NO DIVERGENCE in the common steps. {branch}")
     else:
-        print(f"  first divergence at index {first_any} "
-              f"(step {pair[first_any]['words'][2]}, {pair[first_any]['ctx']} "
-              f"mq={pair[first_any]['mq']} row={pair[first_any]['row']})")
+        print(f"  first divergence at step {first_any} "
+              f"(ctx '{pair[pair_index_of(first_any)]['ctx']}', "
+              f"row {pair[pair_index_of(first_any)]['row']})")
         if first_words:
             print(f"  words differ: {first_words['members']} "
                   f"solo={first_words['solo_words']} "
@@ -270,8 +324,10 @@ def main():
                   f"(words_equal={first_pick['words_equal']}, "
                   f"argmax solo={first_pick['solo_argmax']} "
                   f"pair={first_pick['pair_argmax']})")
-        print(f"  member diff counts over {n} compared: {member_diff_counts}; "
-              f"pick diffs: {pick_diff_count}")
+        print(f"  member diff counts over {len(common)} common steps: "
+              f"{member_diff_counts}; pick diffs: {pick_diff_count}")
+        if pick_diff_steps:
+            print(f"  pick-diff steps: {pick_diff_steps}")
     print(f"  BRANCH: {branch}")
     print(branch_text)
     return 0
