@@ -70,9 +70,14 @@ setsid nohup "$SCR" serve -m RedHatAI/granite-3.1-8b-instruct-FP8-dynamic --devi
 SRVPID=$!
 for i in $(seq 1 240); do
   if curl -s -o /dev/null "http://127.0.0.1:$PORT/v1/models"; then break; fi
+  # A DEAD SERVER ENDS THE LEG — never poll a corpse for 20 minutes.
+  if ! kill -0 $SRVPID 2>/dev/null; then break; fi
   sleep 5
 done
 if ! curl -s -o /dev/null "http://127.0.0.1:$PORT/v1/models"; then
+  if ! kill -0 $SRVPID 2>/dev/null; then
+    echo "MAINREF8B-SERVE-DIED"; tail -30 "$SRVLOG"; echo MAINREF8B-FAILED; exit 1
+  fi
   echo "MAINREF8B-SERVE-NEVER-READY"; kill $SRVPID 2>/dev/null; tail -30 "$SRVLOG"; echo MAINREF8B-FAILED; exit 1
 fi
 echo "==== MAINREF8B-SERVE-READY $(date -u +%FT%TZ) ===="

@@ -1977,9 +1977,20 @@ impl Executor {
         // placement pass kept placing, so every copy window sat never-written while the m=1 fp8 o
         // matmul read it: fluent garbage, card-only, granite-3.1-8b fp8 m=1 alone (every other
         // geometry never reads a copy, and the emulator executes the KTIR program, not the staging,
-        // so no bench caught it either). Scoped to sessions that stage weights — a borrower binds
-        // none by design and adopts the owner's populated regions.
-        let stages_weights = self.bound.keys().any(|nm| self.weight_ids.contains(nm));
+        // so no bench caught it either).
+        //
+        // ⛔ THE CHECK BELONGS TO THE WEIGHT-SEGMENT OWNER ALONE (2026-10-27, granite-3.1-8b fp8:
+        // the borrowing prefill anchor refused at load over 40 copies it never stages). A borrower
+        // BINDS NO WEIGHTS, whatever its `bound` holds: the load-const channel stages resident
+        // constants through the weight channel (`bind_const_fp32` and `bind_weight` both insert
+        // into `weight_ids`), so a borrowing rung or anchor that stages its own tables trips the
+        // `bound ∩ weight_ids` test below — while the copies it "fails" to bind are delivered by
+        // the owner's alias (`alias_seg_from` / `adopt_from_owner`), never by its own staging. The
+        // mint is bundle-invariant (one staged weight segment serves every bundle), so the owner's
+        // check covers every borrower's reads: a wiring list that lost the copies refuses at the
+        // OWNER, naming the same #299 class.
+        let stages_weights = !self.seg_borrowed[SEG_WEIGHT.get()]
+            && self.bound.keys().any(|nm| self.weight_ids.contains(nm));
         if stages_weights {
             let unbound: Vec<u32> = self
                 .code
