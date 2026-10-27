@@ -2494,9 +2494,23 @@ impl SpyreWorker {
                              load"
                         ),
                     };
+                    // ⭐ THE LOGITS TID IS THE SEAT'S `row` WHEN THE BAKE MINTED A DRAW. The
+                    // token-draw mint re-points the rung's RESULT to the idx stick, so
+                    // `dparsed.result_id` names the `[rows, BLOCK]` pick — the placement exists
+                    // but is not `seqs` rows of vocab, and reading it as logits refused every
+                    // rung at load. The wiring's `SampleSeat.row` is the Sample node's
+                    // inputs[0] — the logits row the mint deliberately keeps placed and
+                    // readable by tid — the same fact the solo launch reads the pick through.
+                    // A bake without a draw keeps the result AS the logits (the host-argmax
+                    // readback this front replaces), so `result_id` stays the fallback.
+                    let logits_tid = wirings
+                        .decode
+                        .sample_seat
+                        .map(|seat| seat.row)
+                        .unwrap_or(dparsed.result_id as u32);
                     let logits = rcode
                         .layout
-                        .place_of_tid(dparsed.result_id as u32)
+                        .place_of_tid(logits_tid)
                         .and_then(|p| {
                             LogitsGeom::from_placement(p.size, rung_width, vocab as usize)
                         });

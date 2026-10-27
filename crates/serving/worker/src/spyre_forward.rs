@@ -472,7 +472,17 @@ pub(crate) fn run_prefill_batch(
                 b.result_id
             ))
         })?;
-        acts_i32.extend(greedy_sample_binds(seat));
+        // ⭐ A DECODE BATCH'S SEAT IS THE RUNG'S OWN WIDTH. `b` is the single-request meta
+        // borrowed for its tensor ids, so its seat states the SOLO rung's `rows = 1` — a
+        // launch at `mq` rows binds and reads `mq` rows of the per-step pair, or every row
+        // past the first draws from an unstaged seat (and the readback below returns one
+        // token for a `mq`-slot launch). A prompt-final chunk keeps the prefill rung's own
+        // seat verbatim: its draw is the FOLDED single row.
+        let mut seat = *seat;
+        if per_request.is_some() {
+            seat.rows = mq as u32;
+        }
+        acts_i32.extend(greedy_sample_binds(&seat));
     }
     if let Some((id, key, vals)) = launcher.causal_keyed {
         pf.bind_keyed(id, key, &vals)
@@ -552,7 +562,10 @@ pub(crate) fn run_prefill_batch(
                 .sample_seat
                 .as_ref()
                 .ok_or_else(|| werr("decode bundle has no sampler seat".to_string()))?;
-            Some(read_sampled_tokens(pf, seat, b.result_id as u32, vocab)?)
+            // The rung's own width, not the solo meta's — see the seat-bind site above.
+            let mut seat = *seat;
+            seat.rows = mq as u32;
+            Some(read_sampled_tokens(pf, &seat, b.result_id as u32, vocab)?)
         }
         LogitsWanted::None => {
             pf.run_step_i32(
