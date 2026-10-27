@@ -698,3 +698,163 @@ fn diag_decode_vs_one_shot_at_bad_rows() {
         }
     }
 }
+
+// ── #933's diagnosis, test (ii): the residual stream layer by layer ─
+
+/// Where `cuda_hf_reference.py --hidden-states 3,6` writes its per-layer dump: a directory of its
+/// own beside the goldens, so the goldens' files and their shas stay as they are.
+const HIDDEN_GOLDENS: &str = "tests/goldens/gemma4-moe-gemma-4-26b-a4b-it-hidden";
+/// The prompts test (ii) reads, and the rows it prints on each (the bad rows of
+/// `/tmp/v933-diag3.md`; the prompt's worst row is added, and rows past a prompt's end are left
+/// out).
+const HIDDEN_PROMPTS: [usize; 2] = [DIAG_P3_PROMPT, DIAG_P1_PROMPT];
+const HIDDEN_ROWS: [usize; 7] = [9, 25, 30, 37, 41, 71, 148];
+
+/// One prompt's per-layer residual dump: `[LAYERS + 1, L, HIDDEN]` f32 of the f32 run, then of the
+/// bf16 run (`cuda_hf_reference.py --hidden-states`'s `hidden_<p>.bin`).
+fn read_hidden(p: usize, n: usize) -> (Vec<f32>, Vec<f32>) {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(HIDDEN_GOLDENS);
+    let path = dir.join(format!("hidden_{p}.bin"));
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "{}: {e}. Make it first: python3 -I crates/models/arch/tests/cuda_hf_reference.py \
+             --model {MODEL} --checkpoint <{CHECKPOINT} dir> --prompts \
+             crates/e2e/testdata/prompts.txt --hidden-states 3,6 --out \
+             crates/models/arch/{HIDDEN_GOLDENS}",
+            path.display()
+        )
+    });
+    let one = (LAYERS + 1) * n * HIDDEN;
+    assert_eq!(
+        bytes.len(),
+        2 * one * 4,
+        "hidden_{p}.bin: two runs of [{}, {n}, {HIDDEN}] f32",
+        LAYERS + 1
+    );
+    let all: Vec<f32> = (bytes.as_chunks::<4>().0.iter())
+        .map(|&q| f32::from_le_bytes(q))
+        .collect();
+    let (f32s, bf16s) = all.split_at(one);
+    (f32s.to_vec(), bf16s.to_vec())
+}
+
+/// [`CUDA_TAPES`], then the m=512 tape cut just after each layer's `LayerScale` (the layer's last
+/// step), its result that step's `out`, the layer's residual `[m, HIDDEN]`; then the same tape cut
+/// after each layer's routing, its result `topk_idx`. Cut `l` of each kind is tape
+/// `CUDA_TAPES.len() + l` and `CUDA_TAPES.len() + LAYERS + l`.
+fn hidden_and_route_cuts() -> &'static [CudaTape] {
+    use scratchy_target_cuda::tape::ArenaSpan;
+    let tape = &CUDA_TAPES[bucket_of(M)];
+    let cut = |last: usize, result: ArenaSpan| CudaTape {
+        steps: Box::leak(tape.steps[..=last].to_vec().into_boxed_slice()),
+        result,
+        ..*tape
+    };
+    let moe = tape.moe.expect("a MoE scratch");
+    let rows = u64::from(tape.bucket_m);
+    let residual: Vec<CudaTape> = (tape.steps.iter().enumerate())
+        .filter_map(|(i, s)| match *s {
+            CudaStep::LayerScale(l) => Some(cut(
+                i,
+                ArenaSpan {
+                    offset: l.out,
+                    bytes: rows * u64::from(l.cols) * 2,
+                },
+            )),
+            _ => None,
+        })
+        .collect();
+    let route: Vec<CudaTape> = (tape.steps.iter().enumerate())
+        .filter(|(_, s)| matches!(s, CudaStep::MoeRoute(_)))
+        .map(|(i, _)| cut(i, moe.topk_idx))
+        .collect();
+    assert_eq!(residual.len(), LAYERS, "one layer scale per layer");
+    assert_eq!(route.len(), LAYERS, "one routing per layer");
+    let mut list = CUDA_TAPES.to_vec();
+    list.extend(residual);
+    list.extend(route);
+    Box::leak(list.into_boxed_slice())
+}
+
+/// #933's diagnosis, test (ii) (`/tmp/v933-diag3.md` §3(ii)), printed only, nothing gated: for
+/// prompts 3 and 6, CUDA's residual after each layer (the m=512 tape cut after that layer's
+/// `LayerScale`, read back as bf16) against HF-f32's same layer output from
+/// `cuda_hf_reference.py --hidden-states`, beside HF-bf16's against HF-f32. Per layer and per row
+/// of [`HIDDEN_ROWS`] and the prompt's worst row (by final-logits cosine): cosine and RMS of CUDA
+/// against HF-f32, the same of HF-bf16, their RMS ratio, and whether that row's CUDA picks differ
+/// from HF-f32's at that layer; per layer, how many rows' picks differ. The first layer where a
+/// row's ratio jumps names the layer to cut inside next.
+#[test]
+fn diag_hidden_per_layer() {
+    let r = rig();
+    let tapes = hidden_and_route_cuts();
+    let mut w = CudaWorker::new(&r.device, tapes, &r.weights, Some(KV_POOL), GDN_POOL)
+        .unwrap_or_else(|e| panic!("CudaWorker::new over the tapes and the cuts: {e}"));
+    let base = CUDA_TAPES.len();
+    let top_k = (CUDA_TAPES[bucket_of(M)].moe).expect("a MoE scratch").top_k as usize;
+    for want in HIDDEN_PROMPTS {
+        let p = (prompts().iter().find(|p| p.p == want))
+            .unwrap_or_else(|| panic!("prompt {want} in meta.json"));
+        let n = p.ids.len();
+        let (hf32, hbf16) = read_hidden(want, n);
+        // The prompt's worst row by its final logits against HF-f32.
+        let logits = run_on(&mut w, (tapes, bucket_of(M)), &p.ids, 0, &DECODE_SEAT_B);
+        let worst = (0..n)
+            .map(|row| {
+                let c: Vec<f32> = (logits[row * VOCAB..][..VOCAB].iter())
+                    .map(|&b| bf16::from_bits(b).to_f32())
+                    .collect();
+                (row, cosine(&c, &p.f32[row * VOCAB..][..VOCAB]))
+            })
+            .fold((0, f64::INFINITY), |m, x| if x.1 < m.1 { x } else { m });
+        let mut rows: Vec<usize> = HIDDEN_ROWS.iter().copied().filter(|&r| r < n).collect();
+        if !rows.contains(&worst.0) {
+            rows.push(worst.0);
+        }
+        eprintln!(
+            "diag (ii) prompt {want}: {n} rows, worst final-logits row {} (cosine {:.6}); rows \
+             printed {rows:?} (information only)",
+            worst.0, worst.1
+        );
+        let route = read_route_of(&format!("route_{want}.bin"), n, (LAYERS, top_k));
+        for layer in 0..LAYERS {
+            let out = run_on(&mut w, (tapes, base + layer), &p.ids, 0, &DECODE_SEAT_B);
+            let cuda: Vec<f32> = (out[..n * HIDDEN].iter())
+                .map(|&b| bf16::from_bits(b).to_f32())
+                .collect();
+            let picks = pick_words(&run_on(
+                &mut w,
+                (tapes, base + LAYERS + layer),
+                &p.ids,
+                0,
+                &DECODE_SEAT_B,
+            ));
+            let differs = |row: usize| pick_set(&picks, row, top_k) != route.f32.set(n, layer, row);
+            let flips = (0..n).filter(|&row| differs(row)).count();
+            // HF's entry `layer + 1` is decoder layer `layer`'s output.
+            let at =
+                |v: &[f32], row: usize| v[((layer + 1) * n + row) * HIDDEN..][..HIDDEN].to_vec();
+            for &row in &rows {
+                let (c, f, b) = (
+                    &cuda[row * HIDDEN..][..HIDDEN],
+                    at(&hf32, row),
+                    at(&hbf16, row),
+                );
+                let ((crms, _), (brms, _)) = (error(c, &f), error(&b, &f));
+                eprintln!(
+                    "diag (ii) prompt {want} layer {layer} row {row}: CUDA vs f32 cosine={:.6} \
+                     RMS={crms:.4e}; HF-bf16 vs f32 cosine={:.6} RMS={brms:.4e}; RMS ratio \
+                     CUDA/HF-bf16={:.3}; picks differ from f32's here={} (information only)",
+                    cosine(c, &f),
+                    cosine(&b, &f),
+                    crms / brms.max(f64::MIN_POSITIVE),
+                    differs(row)
+                );
+            }
+            eprintln!(
+                "diag (ii) prompt {want} layer {layer}: {flips} of {n} rows' picks differ from \
+                 HF-f32's (information only)"
+            );
+        }
+    }
+}

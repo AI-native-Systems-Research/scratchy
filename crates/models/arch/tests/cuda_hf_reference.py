@@ -44,6 +44,18 @@ Writes to `--out`:
                      float32, then the bf16 run's, little-endian
   route_greedy_<p>.bin  prompts 1-5, the same for each greedy step's last row ([layers, 8, ...])
 
+With `--hidden-states P,P,...` (#933's diagnosis, `cuda_hf_parity_gemma4.rs`'s
+`diag_hidden_per_layer`), it writes nothing above and writes instead, to `--out` (a directory of its
+own, so the goldens' files and their shas are untouched):
+  hidden_<p>.bin     for each listed prompt, the residual stream at every layer boundary: the
+                     scaled embedding (entry 0), then each decoder layer's output, layer by layer
+                     ([layers + 1, L, hidden]); the f32 run's, then the bf16 run's, float32
+                     little-endian. HF's own `hidden_states`, recorded with forward hooks on the
+                     embedding and every `Gemma4TextDecoderLayer` (`output_hidden_states=True`
+                     would end with the final norm's output, not the last layer's)
+  hidden.json        the model, checkpoint, revision, safetensors sha256, versions, the prompts'
+                     ids and per file its shape and sha256
+
 Needs only torch and transformers. The plain-torch path must be the one that runs, so this refuses
 to start when `fla`, `causal_conv1d` or `kernels` is importable (so no hub kernel, such as the MoE
 router's `SoftmaxTopKRouter`, can replace HF's code). It also refuses a `--revision` other than the
@@ -251,6 +263,76 @@ def stats(torch, bf16, f32):
     }
 
 
+class HiddenDump:
+    """Forward hooks on the text model's embedding and every decoder layer: each forward's residual
+    stream at every layer boundary, `[layers + 1, L, hidden]` float32 (the scaled embedding, then
+    each layer's output)."""
+
+    def __init__(self, torch, model):
+        self.torch = torch
+        text = model.model.language_model
+        self.layers = list(text.layers[: text.config.num_hidden_layers])
+        self.seen = []
+        self.handles = [text.embed_tokens.register_forward_hook(self.hook)]
+        self.handles += [layer.register_forward_hook(self.hook) for layer in self.layers]
+
+    def hook(self, _module, _inputs, out):
+        h = out[0] if isinstance(out, tuple) else out
+        self.seen.append(h[0].detach().float())
+
+    def take(self):
+        n = len(self.layers) + 1
+        assert len(self.seen) == n, f"{len(self.seen)} recorded, {n} boundaries"
+        out, self.seen = self.torch.stack(self.seen), []
+        return out
+
+    def remove(self):
+        for h in self.handles:
+            h.remove()
+
+
+def hidden_states_only(args, model_class, load_kwargs, ids, shas, revision, torch, transformers):
+    """`--hidden-states`: each listed prompt's residual stream at every layer boundary, in float32
+    then bfloat16, to `hidden_<p>.bin` and `hidden.json` in `--out`. Nothing else is written."""
+    wanted = [int(p) for p in args.hidden_states.split(",")]
+    missing = [p for p in wanted if p not in ids]
+    if missing:
+        sys.exit(f"cuda_hf_reference: --hidden-states names prompts {missing} the file lacks")
+    runs = {p: [] for p in wanted}
+    for dtype in (torch.float32, torch.bfloat16):
+        model = model_class.from_pretrained(args.checkpoint, dtype=dtype, **load_kwargs)
+        model.eval()
+        dump = HiddenDump(torch, model)
+        for p in wanted:
+            t = time.time()
+            logits(model, torch, ids[p])
+            runs[p].append(dump.take())
+            print(f"prompt {p}: {dtype} hidden states {time.time() - t:.1f}s", flush=True)
+        dump.remove()
+        del model, dump
+        gc.collect()
+    meta = {
+        "model": args.model,
+        "checkpoint": os.path.abspath(args.checkpoint),
+        "revision": revision,
+        "safetensors_sha256": shas,
+        "torch": torch.__version__,
+        "transformers": transformers.__version__,
+        "layout": "per file: the f32 run's [layers + 1, L, hidden] float32, then the bf16 run's; "
+        "entry 0 the scaled embedding, entry l + 1 decoder layer l's output",
+        "prompts": [],
+    }
+    for p in wanted:
+        path = os.path.join(args.out, f"hidden_{p}.bin")
+        f32, bf16 = runs[p]
+        write_bin(path, torch.cat([f32, bf16]))
+        meta["prompts"].append(
+            {"prompt": p, "ids": ids[p], "shape": list(f32.shape), "sha256": sha256(path)}
+        )
+    with open(os.path.join(args.out, "hidden.json"), "w") as f:
+        json.dump(meta, f, indent=1)
+
+
 def write_bin(path, t):
     t.contiguous().numpy().astype("<f4").tofile(path)
 
@@ -312,6 +394,11 @@ def main():
     ap.add_argument("--prompts", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--revision", help="default: the model's pinned revision")
+    ap.add_argument(
+        "--hidden-states",
+        help="comma-separated prompt numbers: write only their per-layer residual streams "
+        "(hidden_<p>.bin, hidden.json) to --out, nothing else",
+    )
     args = ap.parse_args()
     revision = args.revision or PINNED[args.model][0]
     refuse_kernel_packages()
@@ -336,6 +423,12 @@ def main():
         if doubled:
             sys.exit(f"cuda_hf_reference: prompts {doubled} already start with bos {bos}")
         ids = {p: [bos] + i for p, i in ids.items()}
+    os.makedirs(args.out, exist_ok=True)
+    if args.hidden_states:
+        hidden_states_only(
+            args, model_class, load_kwargs, ids, shas, revision, torch, transformers
+        )
+        return
 
     def load(dtype):
         m = model_class.from_pretrained(args.checkpoint, dtype=dtype, **load_kwargs)
