@@ -2019,6 +2019,18 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     .into_iter()
                     .map(|(tid, _)| tid),
             );
+            // ⭐ THE CHAIN'S REPLACED ROW — the same `replaces` id `chain_of_ir` reads off the
+            // gather's own payload (the one derivation: the wiring's chain fact, the binding
+            // check, and this stamp all name the same row). A chained decode writes the row's
+            // slot ON CARD — the ChainStage's gather owns those bytes the moment the seeds land
+            // — so the host has no filler for it, exactly like a prefix-KV page: without the
+            // excuse the executor's completeness gate refuses the launch ("caller-filled
+            // source(s) were never written this step"). `Unchained` adds nothing.
+            if let crate::wiring::ChainFact::Chained { chain } =
+                crate::lower_subtile_tape_to_ktir::chain_of_ir(ir)
+            {
+                tids.push(chain.replaces);
+            }
             tids.sort_unstable();
             tids.dedup();
             // ⛔ EVERY STAMPED ID IS A SOURCE OF THIS GRAPH. The runtime's completeness check
