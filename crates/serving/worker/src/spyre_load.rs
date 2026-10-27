@@ -184,14 +184,21 @@ use crate::worker_factory::resolve_model_path;
 /// session) + model-level dims. No weights, no session — the caller builds those
 /// ONCE across both programs (decode + prefill share weight tensor ids).
 pub(crate) struct Parsed {
+    // ⛔ THE FOUR cfg'd FIELDS ARE EMULATOR-ONLY: they flow to `BundleMeta`'s own emulator-only
+    // fields (see there). Everything else is read on both tiers (dims, capacity, result id,
+    // the layers list whose length the load log prints).
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) embed_src: usize,
     /// The attention length-mask source, when the wiring names one.
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) attn_mask_src: Option<usize>,
     /// cos / sin runtime sources as `(source id, full column width, rotary class)`.
     /// GQA gives more than one width (Q vs K); a hybrid-attention arch (gemma-4)
     /// gives classes different tables. Each is filled by tiling the class's own
     /// per-position rotary row across heads.
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) cos_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) sin_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
     pub(crate) result_id: usize,
     pub(crate) capacity: usize,
@@ -232,19 +239,25 @@ pub(crate) fn wiring_to_parsed(
         .layers
         .iter()
         .map(|l| LayerWiring {
+            // Emulator-only, like every field of the struct: the card keeps the K/V cache
+            // RESIDENT and writes this step's V device-side, so no host binding names a
+            // cache source or lift id there.
+            #[cfg(not(feature = "spyre-hw"))]
             prefix_k_src: l.prefix_k as usize,
-            // Emulator-only, like the field itself: the card keeps the K/V cache RESIDENT and writes
-            // this step's V device-side, so no host binding names prefix-V there.
             #[cfg(not(feature = "spyre-hw"))]
             prefix_v_src: l.prefix_v as usize,
+            #[cfg(not(feature = "spyre-hw"))]
             new_k_id: l.new_k as usize,
+            #[cfg(not(feature = "spyre-hw"))]
             new_v_id: l.new_v as usize,
+            #[cfg(not(feature = "spyre-hw"))]
             kv_width: l.kv_width as usize,
         })
         .collect();
     if layers.is_empty() {
         return Err(werr("wiring carries no per-layer AttnDecode wiring"));
     }
+    #[cfg(not(feature = "spyre-hw"))]
     let triples = |v: &'static [(u32, u32, scratchy_target_spyre::wiring::RotaryKind)]| -> Vec<
         (usize, usize, scratchy_target_spyre::wiring::RotaryKind),
     > {
@@ -254,8 +267,11 @@ pub(crate) fn wiring_to_parsed(
     };
     let embed_src = w.embed_src as usize;
     Ok(Parsed {
+        #[cfg(not(feature = "spyre-hw"))]
         embed_src,
+        #[cfg(not(feature = "spyre-hw"))]
         cos_srcs: triples(w.cos_srcs),
+        #[cfg(not(feature = "spyre-hw"))]
         sin_srcs: triples(w.sin_srcs),
         result_id: w.result as usize,
         capacity,
@@ -278,6 +294,7 @@ pub(crate) fn wiring_to_parsed(
                     .flat_map(|l| [l.new_k as usize, l.new_v as usize]),
             )
             .collect(),
+        #[cfg(not(feature = "spyre-hw"))]
         attn_mask_src: w.attn_mask.map(|m| m as usize),
     })
 }
@@ -1050,11 +1067,14 @@ impl SpyreWorker {
         #[cfg(not(feature = "spyre-hw"))]
         let served_context_v: usize = usize::MAX;
         // The paged pool's page stride — filled beside `kv_budget_bytes_v` (the SuperDsc branch
-        // below is the one site both are derived) so `Worker::kv_block_bytes` can hand the engine
-        // the same stride the pool was sized by. Card tier only: the emulator never sizes a pool,
-        // and the construction below carries `None` there.
+        // below is the one site both are derived, on EVERY path through it) so
+        // `Worker::kv_block_bytes` can hand the engine the same stride the pool was sized by.
+        // Card tier only: the emulator never sizes a pool. No initializer — the session block
+        // below assigns it on every path that reaches the read, and rustc's own
+        // possibly-uninitialized analysis is the proof (the `= None` it replaces was a dead
+        // assignment under spyre-hw, where the block always runs).
         #[cfg(feature = "spyre-hw")]
-        let mut pool_stride_bytes_v: Option<u64> = None;
+        let pool_stride_bytes_v: Option<u64>;
         #[cfg(feature = "spyre-hw")]
         let session = {
             // ⛔ GUARD (mirror of the build-time flit-cap guard): an EMPTY group
@@ -2583,8 +2603,10 @@ impl SpyreWorker {
                         // ⛔ NO `swept` AND NO `gathers_kv` HERE ANY MORE — both are
                         // per-BODY and this is per-bundle; see `DecodeRung`. The launch
                         // asks `sess.step_body(start)`, which is the selector itself.
+                        // And no `logits` — the geometry's only runtime reader was the
+                        // host readback the submit/collect split deleted; the load-time
+                        // refusal above is what stays.
                         sess: rs,
-                        logits,
                     });
                 }
                 decode_ladder.sort_by_key(|r| r.seqs);
@@ -2722,11 +2744,15 @@ impl SpyreWorker {
              wiring: &'static scratchy_target_spyre::wiring::Wiring| BundleMeta {
                 #[cfg(not(feature = "spyre-hw"))]
                 prog,
+                #[cfg(not(feature = "spyre-hw"))]
                 attn_mask_src: p.attn_mask_src,
                 capacity: p.capacity,
                 m_cap: p.m_cap,
+                #[cfg(not(feature = "spyre-hw"))]
                 embed_src: p.embed_src,
+                #[cfg(not(feature = "spyre-hw"))]
                 cos_srcs: p.cos_srcs,
+                #[cfg(not(feature = "spyre-hw"))]
                 sin_srcs: p.sin_srcs,
                 result_id: p.result_id,
                 layers: p.layers,

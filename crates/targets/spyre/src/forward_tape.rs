@@ -246,7 +246,6 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
                     .to_string(),
             );
         }
-        let toks = &toks[..];
         let is_s = step.tensor == PlaceId::Act(chain.s_src);
         if !is_s && step.tensor != PlaceId::Act(chain.l_src) {
             return Err(format!(

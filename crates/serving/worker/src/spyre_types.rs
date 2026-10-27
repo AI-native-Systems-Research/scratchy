@@ -30,18 +30,27 @@ use crate::spyre_pool::*;
 /// it fills, and the op-output tensors holding THIS position's roped-K / V to
 /// lift back into the cache.
 pub(crate) struct LayerWiring {
+    // ⛔ EVERY FIELD HERE IS EMULATOR-ONLY NOW (cfg'd like `prefix_v_src` below): the card
+    // keeps the KV cache RESIDENT and writes each step's new K/V device-side, so nothing
+    // on the spyre-hw arm reads a per-layer cache source or lift id. Deleted from the hw
+    // build by cfg rather than by removal — the emulator's host KV threading still reads
+    // all four, and the struct itself stays (its len is the layer count the load log prints).
     /// Source tensor id of `prefix_k[layer]` (filled with the KV cache).
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) prefix_k_src: usize,
     #[cfg(not(feature = "spyre-hw"))]
     pub(crate) prefix_v_src: usize,
     /// Op-output tensor id of the new token's roped K (AttnDecode's seg-1 K).
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) new_k_id: usize,
     /// Op-output tensor id of the new token's V (AttnDecode's seg-1 V).
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) new_v_id: usize,
     /// THIS layer's per-token KV width — `kv_heads * head_dim` off the baked
     /// prefix-K shape. A hybrid-attention arch (gemma-4) gives sliding and global
     /// layers different widths, so every per-layer buffer size, readback count and
     /// extend length reads THIS, never the model-wide `kv_dim`.
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) kv_width: usize,
 }
 
@@ -58,16 +67,26 @@ pub(crate) struct BundleMeta {
     /// ⭐ A FACT OF THE WIRING, NOT OF A MANIFEST. The prefix cache tensor spans the full
     /// structural capacity while only `decode_position` of its rows are valid at run time, so the
     /// host fills this `[1, capacity]` source per step and the masked columns leave the softmax.
+    ///
+    /// ⛔ EMULATOR-ONLY (cfg'd): the per-step host mask fill is the emulator arm's; the card's
+    /// prefix mask rides the forward tape's `PrefixMask` step straight off the wiring.
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) attn_mask_src: Option<usize>,
     /// Prefix capacity (mask cols) — max context length this bundle serves.
     pub(crate) capacity: usize,
     /// Baked query-row count: 1 (decode) or M (batched prefill).
     pub(crate) m_cap: usize,
+    // ⛔ THE FOUR BELOW ARE EMULATOR-ONLY (cfg'd): their one spyre-hw reader was the host
+    // readback/staging the forward tape replaced — the tape reads sources, rotary tables
+    // and the embed row straight off `wiring`, so no card launch consults these copies.
     /// Runtime source ids (shared id space across phases).
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) embed_src: usize,
     /// cos / sin sources as `(id, full width, rotary class)` — GQA gives >1
     /// width, and a hybrid-attention arch gives classes different tables.
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) cos_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) sin_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
     pub(crate) result_id: usize,
     /// One per layer, in layer order.
@@ -140,26 +159,12 @@ impl LogitsGeom {
         let width = elems / rows;
         (width >= vocab).then_some(LogitsGeom { rows, width })
     }
-
-    /// Element count of the whole placement — what to ask [`SuperDscSession::read_tensor`] for.
-    pub(crate) fn len(&self) -> usize {
-        self.rows * self.width
-    }
-
-    /// De-interleave `flat` (the whole `[rows, width]` placement) into `rows` CONTIGUOUS `vocab`-wide
-    /// rows, so a caller can index request `r` at `r * vocab`. The gather runs through the SSOT
-    /// device-layout formula, never a copy of it, so it cannot drift from the addresses the emitter
-    /// baked.
-    pub(crate) fn rows_contiguous(&self, flat: &[f32], vocab: usize) -> Option<Vec<f32>> {
-        let lay = scratchy_subtile::sdsc_abstract::StickLayout::row_blocked(self.rows, self.width);
-        let mut out = Vec::with_capacity(self.rows * vocab);
-        for r in 0..self.rows {
-            for c in 0..vocab {
-                out.push(*flat.get(lay.dev_off(r, c))?);
-            }
-        }
-        Some(out)
-    }
+    // ⛔ THE HOST READBACK HALF IS GONE — `len` (the whole-placement element count for
+    // `read_tensor`) and `rows_contiguous` (the de-interleave into per-request rows) served
+    // the per-request logits readback the submit/collect split deleted: the sampler answers
+    // on the card now and the idx stick is the only readback. Both deleted with their
+    // readers, at the auditor's order — the struct stays for the load-time placement
+    // refusal and the rung's own log line.
 }
 
 /// What a forward should hand back from its lm-head tail. An enum rather than a `bool` because the
@@ -211,10 +216,11 @@ pub(crate) struct DecodeRung {
     // (`bundle::KvShifts::gathered`). Same authority as `latch_paged_geometry`'s `page_slots`: a bake
     // fact rides on the launch group it describes.
     pub(crate) sess: SuperDscSession,
-    /// THIS rung's logits geometry. It is per-rung, not per-model: the lm-head tail runs unfolded at
-    /// `m = seqs`, so the placement's row count — and therefore every gather address — differs
-    /// between rungs.
-    pub(crate) logits: LogitsGeom,
+    // ⛔ NO `logits` FIELD ANY MORE — the rung's LogitsGeom served the host per-request
+    // readback the submit/collect split deleted (the sampler answers on the card; the idx
+    // stick is the only readback). The LOAD-TIME refusal stays in spyre_load: a rung whose
+    // baked logits placement is missing or not whole rows still panics at load, off
+    // `LogitsGeom::from_placement` directly.
 }
 
 #[cfg(feature = "spyre-hw")]
