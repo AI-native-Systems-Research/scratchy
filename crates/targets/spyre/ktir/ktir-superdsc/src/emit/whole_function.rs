@@ -3467,21 +3467,27 @@ pub fn lower_function(
         // shape guess: it fires only when an input CARRIES a band (`RowBand`, constructed
         // only by `windowed_region`'s uniform-row arm) whose height exceeds one row, and
         // only for the elementwise kinds whose door consumes the axis. The operand must be
-        // whole-view single-row at row 0, un-banded, and column-matched to the banded input
-        // it is sprayed against — every existing kernel (no banded input) is untouched.
+        // whole-view single-row at row 0, un-banded, and as wide as the OUTPUT's own column
+        // extent — the width check is against the op's stated result, not against a sibling
+        // input, because the banded operand beside the table can be the reduce's `[B, 1]`
+        // per-row scalar (mode `Col`), whose one column says nothing about the spray's width.
+        // A table wider or narrower than the output is still refused by name at the extents
+        // law below; every existing kernel (no banded input) is untouched.
         if matches!(program, Lowering::Node(Program::Elementwise(_)))
             && let Some(band) = band_of(f.name, &per_op)?
             && band.height() > 1
         {
+            let out_cols = op
+                .result_type
+                .and_then(|t| t.dims())
+                .and_then(|d| d.last().copied());
             for (i, x) in per_op.iter().enumerate() {
                 if bcast_axes[i].is_none()
                     && x.band.is_none()
                     && x.r_start == 0
                     && x.r_cover == (0, x.v_rows)
                     && x.v_rows == 1
-                    && per_op
-                        .iter()
-                        .any(|d| d.band.is_some() && d.c_len == x.c_len)
+                    && out_cols == Some(x.c_len as i64)
                 {
                     bcast_axes[i] = Some(BcastAxis::Mb);
                 }
