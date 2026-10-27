@@ -21,6 +21,7 @@
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::emit::lower_ktir_to_superdsc::{Region, reduce};
 use ktir_superdsc::ktir_node::ReduceKind;
+use ktir_superdsc::superdsc_opspec::Df;
 
 /// The historical cell's shape family: 4 query-head rows × a 512-wide score row (8 sticks).
 const ROWS: u32 = 4;
@@ -39,6 +40,7 @@ fn region(tid: u32, rows: u32, cols: u32, is_out: bool) -> Region {
         c_cover: (0, cols),
         is_out,
         is_fp8: false,
+        band: None,
     }
 }
 
@@ -46,7 +48,11 @@ fn lower(kind: ReduceKind, rows: u32, cols: u32) -> Vec<EmittedOp> {
     let data = region(7, rows, cols, false);
     let out = region(8, rows, 1, true);
     let mut sym = 0i64;
-    reduce("attn_bmax_g0", kind, &[data, out], &mut sym, None).unwrap_or_else(|e| {
+    // ⭐ THE REDUCE'S OWN DF — 9fc555341a threaded the op's result type into the door so
+    // an fp32-island reduce lowers at wordLength 4. This cell is the historical fp16
+    // attention score row (the 514→576 pad below is the 64-element fp16 stick), so the
+    // control stays `Df::Fp16` — the arm the door ran before the parameter existed.
+    reduce("attn_bmax_g0", kind, Df::Fp16, &[data, out], &mut sym, None).unwrap_or_else(|e| {
         panic!(
             "{kind:?} [{rows}, {cols}]: the door must lower it: {}",
             e.message

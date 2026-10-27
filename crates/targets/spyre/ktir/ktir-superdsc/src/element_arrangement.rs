@@ -74,7 +74,7 @@ const fn dl16tofp32_permutation() -> [u8; 64] {
 /// program that would need its staging rather than guessing a table for it. The row exists so
 /// the ABI fact is stated where the ABI facts live; the day a card probe measures it, the
 /// refusal is replaced by the measured table and nothing else moves.
-pub const OP_OUTPUT_ARRANGEMENT: &[(&'static str, ElementArrangement)] = &[
+pub const OP_OUTPUT_ARRANGEMENT: &[(&str, ElementArrangement)] = &[
     ("dl16tofp32", ElementArrangement::Dl16ToFp32),
     ("fp32todl16", ElementArrangement::Dl16ToFp32),
 ];
@@ -99,8 +99,8 @@ pub fn output_arrangement_of(op_func: &str) -> Option<ElementArrangement> {
 /// block, and every buffer this tree stages staggered is a whole-block `[·, PAD_V]` row).
 pub fn dl16tofp32_stagger(words: &[f32]) -> Vec<f32> {
     let mut out = words.to_vec();
-    for block in out.chunks_exact_mut(64) {
-        let logical: [f32; 64] = block.try_into().expect("chunks_exact_mut is 64 wide");
+    for block in out.as_chunks_mut::<64>().0 {
+        let logical: [f32; 64] = *block;
         for (i, word) in logical.iter().enumerate() {
             block[DL16TOFP32_PERMUTATION[i] as usize] = *word;
         }
@@ -126,11 +126,11 @@ mod tests {
             "the measured stagger put lane 1318 at buffer 1330 — local 38 at 50"
         );
         // Lanes 0-3 (group 0) and 60-63 (group 15) are the rotation's fixed points.
-        for i in 0..4 {
-            assert_eq!(DL16TOFP32_PERMUTATION[i], i as u8, "lane {i} is fixed");
+        for (i, &lane) in DL16TOFP32_PERMUTATION.iter().enumerate().take(4) {
+            assert_eq!(lane, i as u8, "lane {i} is fixed");
         }
-        for i in 60..64 {
-            assert_eq!(DL16TOFP32_PERMUTATION[i], i as u8, "lane {i} is fixed");
+        for (i, &lane) in DL16TOFP32_PERMUTATION.iter().enumerate().skip(60) {
+            assert_eq!(lane, i as u8, "lane {i} is fixed");
         }
         // A permutation, not a projection: every buffer position is written exactly once.
         let mut seen = [false; 64];

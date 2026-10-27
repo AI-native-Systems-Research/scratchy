@@ -44,6 +44,7 @@ fn region(tid: u32, rows: u32, cols: u32, is_out: bool) -> Region {
         c_cover: (0, cols),
         is_out,
         is_fp8: false,
+        band: None,
     }
 }
 
