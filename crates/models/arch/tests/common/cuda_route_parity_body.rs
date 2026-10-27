@@ -157,17 +157,19 @@ impl Route {
 }
 
 /// P9's rule at `layer`, for both models (#933: one function, so the two cannot drift apart):
-/// layer 0, no flip outside a router tie; layers ≥ 1, no flip outside a router tie (the same τ),
-/// every flip inside one accepted with no count limit (the user's decision 2026-10-26/27).
+/// layer 0, no flip outside a router tie; layers ≥ 1, a flip inside a router tie (the same τ)
+/// accepted with no count limit, and one outside a tie accepted only when the same token flipped
+/// at an earlier layer (`unexcused` counts those that did not; the user's decision 2026-10-27,
+/// option (a)). Layer 0's `unexcused` is all its outside-tie flips: no token has an earlier flip.
 /// Whether it passes, and its text.
-fn layer_rule(layer: usize, outside: usize) -> (bool, String) {
+fn layer_rule(layer: usize, outside: usize, unexcused: usize) -> (bool, String) {
     if layer == 0 {
         (outside == 0, "0 flips outside router ties".to_string())
     } else {
         (
-            outside == 0,
-            "0 flips outside router ties, those inside not capped (the user's decision \
-             2026-10-26/27)"
+            unexcused == 0,
+            "0 flips outside router ties on a token with no earlier flip, those inside \
+             not capped (the user's decision 2026-10-27, option (a))"
                 .to_string(),
         )
     }
@@ -270,10 +272,13 @@ fn p9_expert_picks_match_hf_f32() {
         assert!(n > 0 && n <= M as usize, "prompt {}: {n} ids", p.p);
         let route = read_route(&format!("route_{}.bin", p.p), n);
         let (mut total_cuda, mut total_bf16) = (0usize, 0usize);
+        // Per token: whether its pick flipped at an earlier layer.
+        let mut flipped = vec![false; n];
         for layer in 0..LAYERS {
             let cuda = cuda_picks(&mut w, layer, &p.ids);
             let tau = route.tau(layer);
             let (mut ties, mut inside, mut outside, mut bf16_flips, mut bad) = (0, 0, 0, 0, 0);
+            let (mut excused, mut unexcused) = (0, 0);
             for (row, got) in cuda.iter().enumerate() {
                 let want = route.f32.set(n, layer, row);
                 let (tie, _) = route.tie(layer, row, tau);
@@ -285,17 +290,24 @@ fn p9_expert_picks_match_hf_f32() {
                         inside += 1;
                     } else {
                         outside += 1;
+                        if flipped[row] {
+                            excused += 1;
+                        } else {
+                            unexcused += 1;
+                        }
                     }
                 }
+                flipped[row] |= *got != want;
             }
             let flips = inside + outside;
             total_cuda += flips;
             total_bf16 += bf16_flips;
-            let (ok, rule) = layer_rule(layer, outside);
+            let (ok, rule) = layer_rule(layer, outside, unexcused);
             eprintln!(
                 "P9 prompt {} layer {layer}: {n} tokens, router ties={ties} (tau={tau:.4e}) \
-                 CUDA flips={flips} (inside ties {inside}, outside {outside}) HF-bf16 \
-                 flips={bf16_flips} malformed CUDA picks={bad} (need {rule}) {}",
+                 CUDA flips={flips} (inside ties {inside}, outside {outside}: excused by an \
+                 earlier flip {excused}, not excused {unexcused}) HF-bf16 flips={bf16_flips} \
+                 malformed CUDA picks={bad} (need {rule}) {}",
                 p.p,
                 verdict(ok)
             );

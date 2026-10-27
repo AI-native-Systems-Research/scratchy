@@ -19,9 +19,11 @@
 //!   HF-bf16's own flips against HF-f32 (the yardstick).
 //! - Gate, layer 0: no flip outside a router tie (its input, the embedding and one attention
 //!   layer, is the same up to rounding on both sides).
-//! - Gate, layers 1-29: the shared body's one rule (`layer_rule`), the 35B's: no flip outside a
-//!   router tie (the same τ), every flip inside one accepted with no count limit (the user's
-//!   decision 2026-10-26/27).
+//! - Gate, layers 1-29: the shared body's one rule (`layer_rule`), the 35B's: a flip inside a
+//!   router tie (the same τ) accepted with no count limit; one outside a tie accepted only when the
+//!   same token flipped at an earlier layer, else it fails (the user's decision 2026-10-27, option
+//!   (a)). Per layer, the outside-tie flips an earlier flip excuses and those it does not are
+//!   printed.
 //! - Attribution for P5/P7, printed: per greedy step of prompts 1-5 (HF-f32's sequence), the
 //!   first layer at which the step's last token's CUDA pick differs from HF-f32's.
 //!
