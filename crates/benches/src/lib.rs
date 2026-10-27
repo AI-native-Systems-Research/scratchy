@@ -7,6 +7,7 @@
 //! driven from any CLI frontend. The canonical entry point is [`run_bench`].
 
 mod args;
+mod coding;
 pub(crate) mod datasets;
 #[cfg(feature = "datasets")]
 mod hotpotqa;

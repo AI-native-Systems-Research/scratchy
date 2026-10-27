@@ -525,6 +525,11 @@ pub struct BenchServeArgs {
     #[arg(long)]
     pub save_answers: Option<String>,
 
+    /// `polyglot`: the Python an answer's tests run under, in `sandbox-exec`. Missing, the answers
+    /// are not run and the cell records no accuracy.
+    #[arg(long, default_value = "python3")]
+    pub coding_python: String,
+
     /// `shared-prefix`: tokens in each group's shared system prompt.
     #[arg(long, default_value_t = 2048)]
     pub shared_prefix_len: usize,
@@ -558,6 +563,8 @@ impl BenchServeArgs {
                 | ServeDataset::Longbench
                 | ServeDataset::SharegptMultiTurn
                 | ServeDataset::SharedPrefix
+                | ServeDataset::Polyglot
+                | ServeDataset::SweBench
         )
     }
 
@@ -615,6 +622,12 @@ pub enum ServeDataset {
     /// Groups of short questions sharing one long system prompt (`--shared-prefix-len`); with
     /// `--no-reuse`, the control, every question has a prompt of its own of the same length.
     SharedPrefix,
+    /// The Python exercises of Aider's polyglot benchmark, as Aider sends them, each answer run
+    /// against the exercise's unit tests in a sandbox (`--coding-python`): pass@1.
+    Polyglot,
+    /// SWE-bench Lite's oracle prompts, an issue and the files its fix touches: prompts only,
+    /// unscored (needs the `datasets` feature).
+    SweBench,
 }
 
 /// Where `--dataset-name rag` takes its tasks from: the multi-document QA loaders.
@@ -1755,7 +1768,12 @@ mod tests {
         assert_eq!(a.rag_source, RagSource::Musique);
         assert_eq!(a.longbench_length, "short");
         assert!(!parse("sharegpt").unwrap().is_task_dataset());
-        for name in ["sharegpt-multi-turn", "shared-prefix"] {
+        for name in [
+            "sharegpt-multi-turn",
+            "shared-prefix",
+            "polyglot",
+            "swe-bench",
+        ] {
             let a = parse(name).unwrap();
             assert!(a.is_task_dataset(), "{name}");
             assert_eq!(a.endpoint(), "/v1/chat/completions", "{name}");

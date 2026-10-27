@@ -34,12 +34,22 @@ pub fn workload_label(w: &str) -> (&'static str, &'static str) {
             "RAG accuracy",
             "a full run's RAG over more tasks, for its accuracy alone",
         ),
+        "polyglot" => (
+            "Coding, Polyglot",
+            "Aider's Python exercises, each answer run against its unit tests (pass@1); answers run \
+             to each model's own length, so its time to first token compares across engines and its \
+             total time does not. Aider-derived prompts: not comparable with Aider's published scores",
+        ),
+        "swe-bench" => (
+            "Coding, SWE-bench",
+            "SWE-bench Lite issues with the files to fix, under 8k tokens: timed only",
+        ),
         _ => ("dataset", ""),
     }
 }
 
 /// The page's order: the quick run's workloads first.
-const ORDER: [&str; 8] = [
+const ORDER: [&str; 10] = [
     "sharegpt",
     "rag",
     "rag-spans",
@@ -47,6 +57,8 @@ const ORDER: [&str; 8] = [
     "longbench",
     "shared-prefix",
     "shared-prefix-control",
+    "polyglot",
+    "swe-bench",
     "rag-accuracy",
 ];
 
