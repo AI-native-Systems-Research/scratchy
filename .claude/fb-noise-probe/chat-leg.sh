@@ -20,7 +20,10 @@ set -u
 
 LOG=/work/chat-leg.log
 TREE=/work/front-b-noise
-TDIR=/work/pr916/head/target
+# ── front-b's OWN target dir (auditor order 2026-10-27: the shared
+#    /work/pr916/head/target is a hazard — another tree's rlibs can be
+#    served as fresh). Cold once, then warm. ──
+TDIR=/work/front-b/target
 PROBE=/work/fb-noise-probe
 REF=/work/fb-chat-main
 SCR=$TDIR/release/scr
