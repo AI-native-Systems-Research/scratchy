@@ -857,6 +857,28 @@ pub struct Executor {
     weight_bank_aliased: Vec<bool>,
     /// Host staging (sen bytes) per segment.
     seg_host: [Vec<u8>; NUM_SEGMENTS],
+    /// ⭐ #32 (C) — THE DEFERRED PICKS' LANDING RING: one slot per outstanding deferred
+    /// read, allocated ONCE at first use at the read's own length and reused forever.
+    /// The shadow slice a deferred read lands in today is the PLACEMENT's own window in
+    /// `seg_host`, so two outstanding reads for the same stick race — the later transfer
+    /// clobbers the earlier pick before the host slices it out. The ring gives every
+    /// in-flight step its own bytes; the slot returns to `read_ring_free` at the finish
+    /// half, so the ring's live size IS the number of reads in flight, bounded by the
+    /// pipeline's own depth.
+    read_ring: Vec<Vec<u8>>,
+    read_ring_free: Vec<usize>,
+    /// ⭐ #32 — THE LAST H2D A SUBMIT ENQUEUED, signaled: the shadow's quiet
+    /// point. An H2D reads the HOST SHADOW at device-execution time, so a host
+    /// thread may only overwrite the shadow once every in-flight H2D has
+    /// executed; FIFO retires the whole prefix behind the last-enqueued one, so
+    /// waiting IT is waiting them all. EVERY door that writes the shadow takes
+    /// this latch first through [`Executor::quiet_shadow`] — the drain
+    /// ([`Executor::finish_deferred_read_raw`]) beside the read's own signal,
+    /// and every bind/write door on its own — so no writer and no drain can
+    /// disagree about when the shadow went quiet. In the pipelined cadence the
+    /// drain took the latch one message ago and the next door's take is free;
+    /// at startup and between back-to-back submits it costs one H2D.
+    last_h2d: Option<crate::runtime::ReadSignal>,
     /// This segment's device region is BORROWED from another session, so `seg_host` is NOT its
     /// authoritative shadow and must never be H2D'd over it.
     seg_aliased: [bool; NUM_SEGMENTS],
@@ -992,6 +1014,58 @@ pub struct RawBind {
     bytes: Vec<u8>,
 }
 
+/// ⭐ #32 — ONE DEFERRED READ, IN FLIGHT: the enqueue half
+/// ([`Executor::defer_read_tensor_raw`] / [`Executor::defer_read_tensor_ring`]) hands this
+/// back instead of the bytes, and the finish half ([`Executor::finish_deferred_read_raw`])
+/// parks on `done` and slices the landed bytes out. The pipelined decode loop holds the
+/// enqueue across its prep-ahead and drains at the token's own deadline.
+pub struct DeferredRead {
+    id: bundle::PlaceId,
+    seg: SegIdx,
+    /// The placement's offset into its segment.
+    offset: u64,
+    /// The window's END — the placement's offset plus the transfer's flit-rounded length on the
+    /// own-window arm, the whole region's size on the fallback. The shadow read never needs it
+    /// (its slice indexes the placement offset into the whole segment); the RING read does (its
+    /// slot holds only the window, so the placement's bytes start `offset − win_start` into the
+    /// slot).
+    end: u64,
+    /// The window's start — the placement's offset on the own-window arm,
+    /// 0 on the whole-region fallback.
+    win_start: u64,
+    /// The placement's own size — the return clamp.
+    size: u64,
+    /// The caller's cap — the return clamp.
+    cap: usize,
+    /// ⭐ #32 (C) — THE LANDING SLOT, when this read was deferred into the ring
+    /// (the in-flight spelling; `None` for the shadow spelling). The finish
+    /// half slices the slot and returns it to the free list — one slot out
+    /// per outstanding read, one slot back per finish, so the two lists can
+    /// never disagree about what is in flight.
+    ring: Option<usize>,
+    /// ⭐ #32 — THE READ'S OWN COMPLETION, armed at the enqueue (the D2H op's
+    /// user callback — the per-op hook the seat's `d2h_on_compute_signaled`
+    /// arms). The finish half parks on THIS, not on a stream synchronize: the
+    /// whole-stream wait retired every op behind the read, including the step
+    /// the pipelined loop had just submitted for overlap.
+    done: crate::runtime::ReadSignal,
+}
+
+impl DeferredRead {
+    /// ⭐ #32 (E) — THE OVERLAP PROBE'S HANDLE: this read's completion
+    /// signal, AS A PEEK HANDLE ([`crate::runtime::ReadSignal::peek_handle`]
+    /// — `fired` is the whole of its surface, BY TYPE: the handle cannot
+    /// wait, so the drain's park on the read's own signal stays its one
+    /// waiter, and nothing here reads a byte of the slot). The submit side
+    /// holds it for the NEXT submit's non-blocking ask, so the "card busy
+    /// at submit" row measures the pipeline's real overlap. The ring law is
+    /// untouched: the slot's bytes are still read exactly once, by the drain
+    /// that owns the read.
+    pub fn signal(&self) -> crate::runtime::ReadPeek {
+        self.done.peek_handle()
+    }
+}
+
 /// The timers and H2D accounting of a step's FORWARD HALF — everything upstream of the
 /// readback that [`Executor::predict`] (logits D2H) shares, held in one struct so the
 /// step's tails print from the
@@ -1093,6 +1167,9 @@ impl Executor {
             weight_bank_bytes: code.layout.weight_bank_bytes.to_vec(),
             weight_bank_aliased: vec![false; code.layout.weight_bank_bytes.len()],
             seg_host: [const { Vec::new() }; NUM_SEGMENTS],
+            read_ring: Vec::new(),
+            read_ring_free: Vec::new(),
+            last_h2d: None,
             seg_aliased: [false; NUM_SEGMENTS],
             seg_borrowed: [false; NUM_SEGMENTS],
             bound: BTreeMap::new(),
@@ -1594,9 +1671,15 @@ impl Executor {
                 p.offset
             );
         }
-        let dst = self.seg_host[seg.get()]
-            .get_mut(p.offset as usize..(p.offset + len) as usize)
-            .ok_or_else(|| anyhow!("bind: activation '{id}' overflows seg{}", p.segment))?;
+        // The shadow's quiet point, at the door: this write can arrive with no
+        // drain behind it (a request switch's fresh binds, a k>1 iteration).
+        // `p`'s fields copy out FIRST — the placement's borrow of `self` cannot
+        // live across a `&mut self` call.
+        let (segi, off) = (seg.get(), p.offset);
+        self.quiet_shadow()?;
+        let dst = self.seg_host[segi]
+            .get_mut(off as usize..(off + len) as usize)
+            .ok_or_else(|| anyhow!("bind: activation '{id}' overflows seg{}", segi))?;
         sen_convert::f32_to_sen_bytes(vals, dst);
         self.raw_ids.remove(&id);
         self.keyed.remove(&id);
@@ -4470,6 +4553,60 @@ impl Executor {
         Ok(())
     }
 
+    /// ⭐ #32 — THE SHADOW'S QUIET POINT, TAKEN BY EVERY DOOR THAT WRITES IT.
+    /// An H2D reads the host shadow at DEVICE-EXECUTION time (the CB DMAs from
+    /// the shadow pointer when the card plays it), so a host write into
+    /// `seg_host` may only happen once every in-flight H2D has executed; FIFO
+    /// retires the whole prefix behind the last-enqueued one, so waiting IT is
+    /// waiting them all. The doors that write the shadow —
+    /// [`Self::bind_input_f32`], the refill's convert loop,
+    /// [`Self::write_seg_prefix`] (and through the convert
+    /// loop, every door whose bytes it writes: `stage_keyed`, the keyed and raw
+    /// bind channels) — all pass through here first. A wait in the drain alone
+    /// does not close the law: a bind can arrive with NO drain behind it
+    /// (a k>1 loop iteration, a request switch), and those writes race exactly
+    /// the same H2Ds.
+    ///
+    /// In the pipelined cadence this is FREE — the drain took the latch one
+    /// message ago and the take finds `None`; at startup and between
+    /// back-to-back submits it costs exactly one H2D's execution, which is the
+    /// price of the card not reading bytes the host already replaced.
+    ///
+    /// Device-side landings need no such wait: a D2H writes its host buffer
+    /// when IT executes, FIFO behind every earlier H2D, so the queue itself
+    /// orders those writes — only the HOST's own copies race, and only those
+    /// go through this door. `prepare`/`stage_weights` write the shadow before
+    /// any refill exists to arm a latch, so they are exempt by construction
+    /// (and the first refill re-sends every per-step range regardless).
+    ///
+    /// The dead arm is the same escape [`Self::finish_deferred_read_raw`]
+    /// runs: a failed op never fires its callback, the latch's timeout tick
+    /// hands the park back, the synchronize below rethrows the stream's
+    /// deferred error, and a stream that died is REFUSED rather than written
+    /// past.
+    fn quiet_shadow(&mut self) -> Result<()> {
+        let Some(h2d) = self.last_h2d.take() else {
+            return Ok(()); // nothing was ever enqueued — nothing to wait
+        };
+        let quiet = {
+            // Scoped: `dead` borrows `self` immutably for the park, and the
+            // take above was the one mutable touch — sequenced first, the two
+            // never overlap.
+            let dead = || self.stream_ref().map(|s| s.is_dead()).unwrap_or(true);
+            h2d.wait_or(dead)
+        };
+        if !quiet {
+            self.stream_ref()?
+                .synchronize()
+                .map_err(|e| anyhow!("shadow quiet point: sync: {e}"))?;
+            bail!(
+                "the stream died before the shadow went quiet — refusing to write bytes an \
+                 in-flight H2D may still read"
+            );
+        }
+        Ok(())
+    }
+
     /// Refill per-step ACTIVATIONS into their segment's host staging at the baked offset
     /// (IEEE→sen), and re-H2D the dirtied segments. Weights (seg1) and KV (seg2) stay RESIDENT —
     /// never re-uploaded, which is the whole perf point.
@@ -4558,6 +4695,13 @@ impl Executor {
         }
         // The convert cannot borrow `self.bound` and `self.seg_host` at once, so the sources move
         // out for the duration — a `Vec` swap, not a copy of the bytes.
+        //
+        // ⭐ AND THE QUIET POINT IS TAKEN AT THE DOOR, not assumed of the caller:
+        // a refill can run with the previous submit's H2Ds still in flight
+        // (a k>1 loop iteration with no drain between submits, or a request
+        // switch's fresh binds). The latch is free in the drained cadence (the
+        // drain took it one message ago) and costs one H2D otherwise.
+        self.quiet_shadow()?;
         let bound = std::mem::take(&mut self.bound);
         for (nm, src) in &bound {
             if self.weight_ids.contains(nm) {
@@ -4591,6 +4735,14 @@ impl Executor {
 
         let mut note = String::new();
         let mut total = 0u64;
+        // ⭐ #32 — THE LAST-ENQUEUED H2D'S SIGNAL, kept for the drain: FIFO
+        // retires every earlier H2D behind it, so this one latch is the whole
+        // submit's shadow-quiet point (see the `last_h2d` field's law). Every
+        // window is armed and the final overwrite wins — the dropped latches
+        // fire harmlessly into nothing (their own `Arc` keeps the callback
+        // sound), and tracking "only the last call" would re-derive the same
+        // fact the enqueue order already states.
+        let mut last_h2d: Option<crate::runtime::ReadSignal> = None;
         for i in 0..NUM_SEGMENTS {
             if !seg_dirty[i] {
                 continue; // only re-upload activation segments
@@ -4643,20 +4795,25 @@ impl Executor {
             // nothing, and the queue's own FIFO orders the preamble CB ahead of the step's
             // compute CBs — the whole step submits with no host-side waits.
             if runs.is_empty() {
-                stream
-                    .h2d_on_compute(whole_shadow(&self.seg_host[i], addr, i)?, addr)
-                    .map_err(|e| anyhow!("preamble H2D seg{i}: {e}"))?;
+                last_h2d = Some(
+                    stream
+                        .h2d_on_compute_signaled(whole_shadow(&self.seg_host[i], addr, i)?, addr)
+                        .map_err(|e| anyhow!("preamble H2D seg{i}: {e}"))?,
+                );
             } else {
                 for (a, b) in runs {
                     let win = addr
                         .window(ByteOffset(a), ByteSize(b - a))
                         .ok_or_else(|| anyhow!("seg{i} window {a}..{b} unaddressable"))?;
-                    stream
-                        .h2d_on_compute(&self.seg_host[i][a as usize..b as usize], &win)
-                        .map_err(|e| anyhow!("preamble H2D seg{i} window: {e}"))?;
+                    last_h2d = Some(
+                        stream
+                            .h2d_on_compute_signaled(&self.seg_host[i][a as usize..b as usize], &win)
+                            .map_err(|e| anyhow!("preamble H2D seg{i} window: {e}"))?,
+                    );
                 }
             }
         }
+        self.last_h2d = last_h2d;
         Ok((note, total))
     }
 
@@ -5278,6 +5435,49 @@ impl Executor {
     /// CB queues behind the step's compute CBs and the FIFO carries the
     /// ordering the host-side wait used to.
     pub fn read_tensor_raw(&mut self, id: bundle::PlaceId, cap_bytes: usize) -> Result<Vec<u8>> {
+        let read = self.defer_read_tensor_raw(id, cap_bytes)?;
+        self.finish_deferred_read_raw(&read)
+    }
+
+    /// ⭐ #32 — THE ENQUEUE HALF of [`Self::read_tensor_raw`]: the same
+    /// placement law, the same window, but the transfer is ARMED
+    /// (`d2h_on_compute_signaled`) and the handle comes back UNRESOLVED — the
+    /// one-shot caller resolves it immediately (the pair above composes into
+    /// exactly the old one-shot contract), while the pipelined loop holds the
+    /// enqueue across its prep-ahead and drains at the token's own deadline.
+    pub fn defer_read_tensor_raw(
+        &mut self,
+        id: bundle::PlaceId,
+        cap_bytes: usize,
+    ) -> Result<DeferredRead> {
+        self.defer_read_into(id, cap_bytes, false)
+    }
+
+    /// ⭐ #32 (C) — THE RING TWIN of [`Self::defer_read_tensor_raw`]: the same
+    /// placement law, the same enqueue, a DIFFERENT landing — a persistent ring slot
+    /// instead of the placement's shadow window. The in-flight spelling: a step whose
+    /// pick is not consumed until a later drain lands here, because two outstanding
+    /// shadow reads for the same stick would race (the later transfer clobbers the
+    /// earlier pick before the host slices it out). The one-shot and the ring compose
+    /// into the SAME finish half — `finish_deferred_read_raw` reads whichever site the
+    /// handle names — so the two doors cannot drift apart.
+    pub fn defer_read_tensor_ring(
+        &mut self,
+        id: bundle::PlaceId,
+        cap_bytes: usize,
+    ) -> Result<DeferredRead> {
+        self.defer_read_into(id, cap_bytes, true)
+    }
+
+    /// The ONE body behind the two read doors: the placement table lookup, the bank
+    /// law, the flit round-up, the whole-region fallback — everything except WHERE the
+    /// transfer lands, which is the doors' only difference.
+    fn defer_read_into(
+        &mut self,
+        id: bundle::PlaceId,
+        cap_bytes: usize,
+        ring: bool,
+    ) -> Result<DeferredRead> {
         let p = self
             .places
             .get(&id)
@@ -5314,22 +5514,129 @@ impl Executor {
             Some(w) => (w, p.offset, p.offset + len),
             None => (addr, 0, tot),
         };
-        let host = &mut self.seg_host[seg.get()][a as usize..b as usize];
-        self.stream
+        // The landing: the shadow window (one-shot law) or a ring slot (in-flight
+        // law). Field-direct on purpose — `addr`/`win` hold the shared borrow of
+        // `seg_addr` this whole body is written under, and the slot's take/grow is
+        // three field moves, not a method call.
+        let (host, ring_slot) = if ring {
+            let need = (b - a) as usize;
+            let slot = match self.read_ring_free.pop() {
+                Some(s) => s,
+                None => {
+                    self.read_ring.push(Vec::new());
+                    self.read_ring.len() - 1
+                }
+            };
+            let s = &mut self.read_ring[slot];
+            if s.len() < need {
+                // A wider stick than the slot has seen (a different bundle's cap):
+                // grow IN PLACE — the slot stays the same index, so outstanding
+                // handles naming it stay valid, and the allocation is paid once
+                // per width, not per read.
+                s.resize(need, 0);
+            }
+            (&mut s[..need], Some(slot))
+        } else {
+            (
+                &mut self.seg_host[seg.get()][a as usize..b as usize],
+                None,
+            )
+        };
+        let done = self
+            .stream
             .as_ref()
             .ok_or_else(|| anyhow!("no stream — prepare was not called"))?
-            .d2h_on_compute(host, src)
+            .d2h_on_compute_signaled(host, src)
             .map_err(|e| anyhow!("read_tensor_raw({id}) D2H: {e}"))?;
-        self.stream_ref()?
-            .synchronize()
-            .map_err(|e| anyhow!("read_tensor_raw({id}) sync: {e}"))?;
+        Ok(DeferredRead {
+            id,
+            seg,
+            offset: p.offset,
+            end: b,
+            win_start: a,
+            size: p.size,
+            cap: cap_bytes,
+            ring: ring_slot,
+            done,
+        })
+    }
+
+    /// ⭐ #32 — THE STICK READ'S FINISH HALF: the loop's ONE fence, now scoped
+    /// to THIS read — park on the transfer's own completion signal (armed at
+    /// the enqueue, `d2h_on_compute_signaled`), then slice the landed bytes out
+    /// of whichever site the handle names (the shadow window, one-shot, or the
+    /// ring slot, in-flight, returned to the free list here, the slot's
+    /// one-way-out) under `read_tensor_raw`'s own return clamps. The two halves
+    /// compose into exactly the old one-shot contract — `read_tensor_raw` above
+    /// IS this pair — so the one-shot caller keeps its behavior byte-for-byte
+    /// while the pipelined loop holds the enqueue across its prep-ahead.
+    ///
+    /// ⛔ THE WAIT IS TWO-SIGNALS, NOT THE STREAM. The whole-stream synchronize
+    /// this replaces retired EVERY op the stream held — including the step the
+    /// pipelined loop had just submitted for overlap — so each per-step drain
+    /// fenced a full step anyway and the depth-2 queue bought nothing
+    /// (measured 2026-10-25: fence mean = one step ≈ 23.8 ms, ≈ serial tok/s).
+    /// The two signals are the read's own D2H (the bytes this call returns)
+    /// and the LAST H2D a submit enqueued — the shadow's quiet point, taken
+    /// here through the SAME door ([`Self::quiet_shadow`]) every writer of the
+    /// shadow passes through, so the drain and any later bind cannot disagree
+    /// about when the shadow went quiet. Both sit adjacent in the queue at
+    /// depth 2 — the DMAs of the next step's preamble, microseconds behind
+    /// this read — so the park costs the read and not the step, and the steps'
+    /// COMPUTE behind them runs through the drain.
+    ///
+    /// The dead arm is the error escape, and it surfaces the SAME error the
+    /// whole-stream wait did by the SAME door: a failed op never fires its
+    /// user callback (the stream records a deferred error and goes
+    /// sticky-shutdown, `make_completion_callback`'s Err arm), so the signal's
+    /// timeout tick hands the park back and the synchronize below — which does
+    /// not wait a dead stream, it rethrows — carries the root cause out.
+    pub fn finish_deferred_read_raw(&mut self, read: &DeferredRead) -> Result<Vec<u8>> {
+        // The read's own landing, scoped so `dead`'s immutable borrow of `self`
+        // ends before the quiet point's mutable half begins.
+        let landed = {
+            let dead = || self.stream_ref().map(|s| s.is_dead()).unwrap_or(true);
+            read.done.wait_or(dead)
+        };
+        if !landed {
+            self.stream_ref()?
+                .synchronize()
+                .map_err(|e| anyhow!("read_tensor_raw({}) sync: {e}", read.id))?;
+            // A dead stream's synchronize rethrows its deferred error; if it
+            // returned anyway, the transfer never landed and the bytes below
+            // would be a lie — refuse rather than slice them. The ring slot is
+            // deliberately NOT returned on this path: only its own signal (or
+            // teardown) walks a slot back.
+            bail!(
+                "read_tensor_raw({}): the stream died before this read landed — no bytes to slice",
+                read.id
+            );
+        }
+        // And the shadow half — the shared door. In the drained cadence the
+        // latch has fired (or was never armed); this is where the drain
+        // HANDS the quiet point to the next writer by taking it.
+        self.quiet_shadow()?;
         // May only return the bytes the transfer actually brought back.
-        let avail = (b - p.offset) as usize;
-        let n = (p.size as usize).min(cap_bytes).min(avail);
+        let avail = (read.end - read.offset) as usize;
+        let n = (read.size as usize).min(read.cap).min(avail);
         if n == 0 {
+            if let Some(slot) = read.ring {
+                self.read_ring_free.push(slot);
+            }
             return Ok(Vec::new()); // a wholly-unreadable placement also has no valid base
         }
-        Ok(self.seg_host[seg.get()][p.offset as usize..][..n].to_vec())
+        match read.ring {
+            Some(slot) => {
+                // The slot holds the WINDOW; the placement's bytes start
+                // `offset − win_start` into it (0 on the own-window arm — the
+                // placement IS the window's start).
+                let start = (read.offset - read.win_start) as usize;
+                let bytes = self.read_ring[slot][start..][..n].to_vec();
+                self.read_ring_free.push(slot);
+                Ok(bytes)
+            }
+            None => Ok(self.seg_host[read.seg.get()][read.offset as usize..][..n].to_vec()),
+        }
     }
 
     /// The host shadow's byte size for `seg` — what to size a [`Executor::read_seg`] buffer at.
@@ -5381,12 +5688,11 @@ impl Executor {
 
     /// Overwrite the FIRST `data.len()` bytes of a tensor segment and H2D exactly that window.
     ///
-    /// ⛔ WHY NOT [`Executor::write_seg`]: that one is a WHOLE-segment copy, and the thing this
-    /// exists for — handing a BORROWING session its own copy of the spilled weight tail — crosses
-    /// two bundles whose extents for that segment DIFFER. The spill slot is also an intermediate
-    /// COLOR segment, and a prefill rung's intermediates are wider than decode's, so a whole-segment
-    /// copy is not merely wasteful but unrepresentable: MEASURED, 421,257,216 source bytes against a
-    /// 432,218,112 B segment, which `write_seg`'s equality guard correctly refuses.
+    /// ⛔ WHY A PREFIX AND NOT A WHOLE-SEGMENT COPY: the thing this exists for — handing a BORROWING
+    /// session its own copy of the spilled weight tail — crosses two bundles whose extents for that
+    /// segment DIFFER. The spill slot is also an intermediate COLOR segment, and a prefill rung's
+    /// intermediates are wider than decode's, so a whole-segment copy is not merely wasteful but
+    /// unrepresentable: MEASURED, 421,257,216 source bytes against a 432,218,112 B segment.
     ///
     /// The tail occupies `[0, len)` by construction (`spill_weight_tail` places it at offset 0 for
     /// exactly this reason), so writing that prefix and leaving the rest of the shadow as `prepare`
@@ -5400,6 +5706,9 @@ impl Executor {
                 self.seg_host[i].len()
             );
         }
+        // The shadow's quiet point, at the door — this copy overwrites the whole
+        // prefix while an earlier H2D may still be reading the shadow.
+        self.quiet_shadow()?;
         self.seg_host[i][..data.len()].copy_from_slice(data);
         let addr = self.seg_addr[i]
             .as_ref()
@@ -5414,25 +5723,6 @@ impl Executor {
         stream
             .synchronize()
             .map_err(|e| anyhow!("write_seg_prefix sync seg{i}: {e}"))
-    }
-
-    /// Overwrite the WHOLE tensor segment from raw sen-fp16 bytes + H2D it. The counterpart of
-    /// [`Executor::read_seg`].
-    pub fn write_seg(&mut self, seg: SegIdx, data: &[u8]) -> Result<()> {
-        let i = seg.get();
-        let n = data.len().min(self.seg_host[i].len());
-        self.seg_host[i][..n].copy_from_slice(&data[..n]);
-        let addr = self.seg_addr[i]
-            .as_ref()
-            .ok_or_else(|| anyhow!("seg{i} has no region"))?;
-        let src = whole_shadow(&self.seg_host[i], addr, i)?;
-        let stream = self.stream_ref()?;
-        stream
-            .h2d(src, addr)
-            .map_err(|e| anyhow!("write_seg H2D: {e}"))?;
-        stream
-            .synchronize()
-            .map_err(|e| anyhow!("write_seg sync: {e}"))
     }
 
     /// Point THIS session's segment `seg` at `owner`'s DEVICE region so the two SHARE it outright
