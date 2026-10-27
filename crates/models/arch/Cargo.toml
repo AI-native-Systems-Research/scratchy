@@ -844,6 +844,14 @@ required-features = ["cuda", "qwen3.6-35b-a3b"]
 name = "cuda_tapes_gemma4"
 required-features = ["cuda", "gemma-4-26b-a4b-it"]
 
+# Gemma 4 26B-A4B's whole-model synthetic-weight forward on the H100 (#925): the qwen checks (a)-(o)
+# where they apply, plus the sliding window's (p)-(r), in its own body
+# (tests/common/cuda_prefill_gemma4_body.rs). Needs nvcc to build, and an H100 and about 51 GB of
+# host RAM to run.
+[[test]]
+name = "cuda_prefill_gemma4"
+required-features = ["nvcc", "gemma-4-26b-a4b-it"]
+
 [[test]]
 name = "cuda_prefill_9b"
 required-features = ["nvcc", "qwen3.5-9b-text-only"]
