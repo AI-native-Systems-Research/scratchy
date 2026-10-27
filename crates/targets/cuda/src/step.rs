@@ -388,9 +388,9 @@ pub const GDN_CONV_TOKEN_BLOCK: u32 = 64;
 /// `rv_fl<128>` (`kernels/gdn_conv1d.cu`). Checked by the launcher only; qwen3.5's `conv_dim`
 /// (6144 at the 0.8b, 8192 at the 9b) is a multiple, so no lowered tape is refused.
 pub const GDN_CONV_CHANNEL_GROUP: u32 = 128;
-/// The GDN gating's `nv` is a multiple of this, at most twice it: one warp per row holds the row as
-/// a naive `rv_fl<nv>`, instantiated for 16 and 32 (`kernels/gdn_gating.cu`). Checked by the
-/// launcher only; qwen3.5's `nv` is 16 at the 0.8b and 32 at the 9b.
+/// The GDN gating's `nv` is a non-zero multiple of this: one warp per row walks the row in naive
+/// `rv_fl<16>` chunks (`kernels/gdn_gating.cu`). Checked by the launcher only; qwen3.5's `nv` is 16
+/// at the 0.8b and 32 at the 9b, 48 at qwen3.6-27b and 64 at qwen3.5-122b-a10b.
 pub const GDN_GATING_NV_MULTIPLE: u32 = 16;
 /// The tokens the scan stages in shared memory at once.
 pub const GDN_SCAN_TOKEN_BLOCK: u32 = 32;

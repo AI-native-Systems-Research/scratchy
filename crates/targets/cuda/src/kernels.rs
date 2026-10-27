@@ -1187,8 +1187,8 @@ pub unsafe fn gdn_conv1d(
 /// row, the row a ThunderKittens warp vector (`kernels/gdn_gating.cu`). Asynchronous.
 ///
 /// Refused with [`KernelError::GdnGatingShape`], before any pointer is touched, unless `rows` and
-/// `nv` are non-zero, `nv` 16 or 32 (a multiple of `step::GDN_GATING_NV_MULTIPLE`, the widths the
-/// kernel is instantiated for), and `rows · nv` at most `i32::MAX`.
+/// `nv` are non-zero, `nv` a multiple of `step::GDN_GATING_NV_MULTIPLE` (the kernel's chunk width;
+/// 48 at qwen3.6-27b, 64 at qwen3.5-122b-a10b), and `rows · nv` at most `i32::MAX`.
 ///
 /// # Safety
 ///
