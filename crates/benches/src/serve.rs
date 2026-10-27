@@ -50,6 +50,9 @@ struct RequestResult {
     cached_tokens: Option<usize>,
     /// `usage.prompt_tokens`, where the server sent it.
     prompt_tokens: Option<usize>,
+    /// The stream's last `finish_reason`, where it sent one: `length` for an answer that ran to
+    /// its cap. A span query's stream carries no usage, so this is how its capped answers show.
+    finish_reason: Option<String>,
 }
 
 impl RequestResult {
@@ -67,6 +70,7 @@ impl RequestResult {
             error,
             cached_tokens: None,
             prompt_tokens: None,
+            finish_reason: None,
         }
     }
 
@@ -220,6 +224,7 @@ fn send_body(
     let mut usage_completion_tokens: Option<usize> = None;
     let mut cached_tokens: Option<usize> = None;
     let mut prompt_tokens: Option<usize> = None;
+    let mut finish_reason: Option<String> = None;
     let mut chunks = 0usize;
     let mut generated_text = String::new();
     let mut last_choices_time: Option<Instant> = None;
@@ -274,6 +279,9 @@ fn send_body(
                     }
                     if let Some(n) = parsed["usage"]["prompt_tokens"].as_u64() {
                         prompt_tokens = Some(n as usize);
+                    }
+                    if let Some(r) = parsed["choices"][0]["finish_reason"].as_str() {
+                        finish_reason = Some(r.to_string());
                     }
                     if let Some(text) = chunk_text(&parsed) {
                         generated_text.push_str(text);
@@ -337,6 +345,7 @@ fn send_body(
         error: String::new(),
         cached_tokens,
         prompt_tokens,
+        finish_reason,
     }
 }
 
@@ -1433,6 +1442,7 @@ fn run_prompts(args: &BenchServeArgs, client: &Arc<Client>, tokenizer: &Tokenize
 
     let benchmark_start = Instant::now();
     let mut handles = Vec::with_capacity(num_prompts);
+    let output_cap = args.sharegpt_max_output_len.unwrap_or(usize::MAX);
 
     for (i, entry) in prompt_entries.into_iter().enumerate() {
         wait_until(benchmark_start, cumulative_delays[i]);
@@ -1454,7 +1464,7 @@ fn run_prompts(args: &BenchServeArgs, client: &Arc<Client>, tokenizer: &Tokenize
             let result = send_request(
                 &client,
                 &entry.prompt,
-                entry.expected_output_len,
+                entry.expected_output_len.min(output_cap),
                 &request_id,
                 benchmark_start,
             );
@@ -1796,11 +1806,16 @@ fn task_metrics(
     let out: Vec<usize> = ok.iter().map(|(r, _)| answer_tokens(r)).collect();
     let total_out: usize = out.iter().sum();
     let mean = |v: &[f64]| (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64);
+    // Answers that ran to their cap rather than ending on their own: the server's `length`, or
+    // where it sent no reason, the token count.
+    let capped = |r: &RequestResult, t: &crate::workloads::Task| match r.finish_reason.as_deref() {
+        Some(why) => why == "length",
+        None => answer_tokens(r) >= t.max_tokens,
+    };
     // Over every task sent that has a right answer (null for a workload with none: chat turns,
     // the shared-prefix questions). A request that failed scores wrong, as does an answer that ran
     // to its cap, whose text may hold the answer somewhere in a ramble that never gave it. Over
     // the answered only, an engine that failed the hard tasks would score higher.
-    let capped = |r: &RequestResult, t: &crate::workloads::Task| answer_tokens(r) >= t.max_tokens;
     let accuracy = mean(
         &(results.iter().zip(tasks))
             .filter(|(_, t)| t.score.scored())
@@ -1819,12 +1834,7 @@ fn task_metrics(
     let thought = (ok.iter())
         .filter(|(r, _)| opens_as_thought(&r.generated_text))
         .count();
-    // Answers that ran to their cap rather than ending on their own. A cell all of whose answers
-    // did is no reading of its accuracy: on one server the same RAG tasks that end at 4 to 162
-    // tokens elsewhere all ran to 256 and scored 0%.
-    let capped = (ok.iter())
-        .filter(|(r, t)| answer_tokens(r) >= t.max_tokens)
-        .count();
+    let capped = ok.iter().filter(|(r, t)| capped(r, t)).count();
     let cached: Vec<f64> = (ok.iter())
         .filter_map(|(r, _)| r.cached_tokens.map(|c| c as f64))
         .collect();
@@ -2229,6 +2239,13 @@ mod tests {
             j["accuracy"], 0.0,
             "counted from its text, it ran to its cap"
         );
+        // A span answer has no usage: its cap shows in the server's finish reason, not its count.
+        let mut span = answered("The question asks", 0, None);
+        span.finish_reason = Some("length".into());
+        let mut ended = answered("Paris", 0, None);
+        ended.finish_reason = Some("stop".into());
+        let j = task_metrics(&[span, ended], &tasks[..2], tokenizer, 1.0, "musique", 7);
+        assert_eq!(j["capped_answers"], 1);
     }
 
     /// The shared-prefix warmups share no prompt with a measured question: drawn from the same
@@ -2322,6 +2339,11 @@ mod tests {
         assert_eq!(r.output_tokens, 2);
         assert_eq!(r.cached_tokens, Some(96));
         assert_eq!(r.prompt_tokens, Some(120));
+        assert_eq!(
+            r.finish_reason.as_deref(),
+            Some("stop"),
+            "the usage chunk has no choice"
+        );
     }
 
     /// A stream that breaks off mid-answer failed; one that breaks off only after `[DONE]` finished.
@@ -2387,6 +2409,7 @@ mod tests {
             error: String::new(),
             cached_tokens: None,
             prompt_tokens: None,
+            finish_reason: None,
         }
     }
 

@@ -408,6 +408,12 @@ pub struct BenchServeArgs {
     #[arg(long)]
     pub dataset_path: Option<String>,
 
+    /// `sharegpt`: the most tokens a request asks for. A request asks for its conversation's
+    /// recorded reply length, which runs to 800 tokens and more; this caps it, keeping the
+    /// shorter ones as they are. None by default: the recorded lengths, as vLLM's suite sends.
+    #[arg(long)]
+    pub sharegpt_max_output_len: Option<usize>,
+
     /// Ignore EOS token (force generation to max output length).
     /// Defaults to true for random prompts, matching Python's behavior.
     #[arg(long, default_value_t = true)]
