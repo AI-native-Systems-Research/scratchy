@@ -788,7 +788,7 @@ fn hidden_and_route_cuts() -> &'static [CudaTape] {
 fn diag_hidden_per_layer() {
     let r = rig();
     let tapes = hidden_and_route_cuts();
-    let mut w = CudaWorker::new(&r.device, tapes, &r.weights, Some(KV_POOL), GDN_POOL)
+    let mut w = CudaWorker::new(&r.device, tapes, &r.weights, Some(DECODE_KV_POOL), GDN_POOL)
         .unwrap_or_else(|e| panic!("CudaWorker::new over the tapes and the cuts: {e}"));
     let base = CUDA_TAPES.len();
     let top_k = (CUDA_TAPES[bucket_of(M)].moe).expect("a MoE scratch").top_k as usize;
