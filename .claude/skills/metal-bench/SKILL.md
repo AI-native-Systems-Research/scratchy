@@ -23,9 +23,9 @@ runs everything else.
   benchmark" unless they say otherwise. **It asks no questions:** see
   **Quick run** below. The script with no flags but `--unpinned`: this Mac's
   four models (the small set below 64 GB, the large set at 64 GB), scratchy
-  alone, cold and warm, one rep, the users × prompt grid at 1, 4, 8 and 16
-  users and prompts to 32k at 64 GB (1, 2 and 4 users and prompts to 8k
-  below it) and 64-token answers, two rounds of each users count a cell.
+  alone, cold and warm, one rep, the users × prompt grid at 1, 2 and 4
+  users and prompts to 8k, the same on every Mac (its memory picks the models),
+  and 64-token answers, two rounds of each users count a cell.
   scratchy runs at its defaults on every Mac, and every cell runs: one
   that runs out of memory is recorded as failed. The page keeps every
   other engine's numbers, and scratchy's frozen launches, from the last full
@@ -260,7 +260,7 @@ act on each one as it appears:
 - `skipped: needs N GB`: expected for glm-4.5-air on a Mac under 64 GB.
 - `--- mistral.rs: nothing to serve`: expected for every MoE model; it runs
   only the dense ones, since it runs out of memory on MoE GGUFs on Metal.
-- `N FAILED` on a cell, then `requests failed`, or `timed out after 1200s`:
+- `N FAILED` on a cell, then `requests failed`, or `timed out after 600s`:
   that engine ran out of memory (or errored, or was too slow) at that size.
   The server is restarted and the next cell runs (`(server restarted)`); the
   page marks the cell with ‡. Note which engine and cell for the user; it's

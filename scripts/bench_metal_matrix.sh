@@ -20,8 +20,8 @@
 #   warm: send -> first token, median over unique prompts to a resident server
 #   peak RSS, major faults             scr bench startup --exec (per child, wait4)
 #   TTFT/TPOT/ITL p50+p99, tok/s       scr bench serve (warm, conc 1)
-#   prompt x answer x users grid       scr bench serve (1, 4, 8, 16 users;
-#     (heat maps, every curve)           128 to 32768 in;
+#   prompt x answer x users grid       scr bench serve (1, 2, 4 users;
+#     (heat maps, every curve)           128 to 8192 in;
 #                                        64 out, --full adds 512 and 2048 at 1)
 #
 # Rung definitions and fairness rules: docs/BENCHMARKING.md.
@@ -35,13 +35,12 @@
 # later cell, shared across engines so all see the same prompts. Concurrency is
 # offered (--max-concurrency), not the effective decode batch. The default
 # sweep is the grid: prompt x answer x users, at --scale-grid-conc's user
-# counts (1, 4, 8 and 16 by default at 64 GB and above; 1, 2 and 4 below,
-# where one 32k-prompt cell at 16 users takes half an hour), so neither the separate users sweep
-# (conc) nor the prompt sweep (input) is needed: the grid's prompts reach 32k (8k below 64 GB)
+# counts (1, 2 and 4 by default, on every Mac), so neither the separate
+# users sweep (conc) nor the prompt sweep (input) is needed: the grid's prompts reach 8k
 # and its 1-user row is the prompt sweep. One user at a time is what most Macs
 # see (#349). --scale-axes conc,grid,input adds the other sweeps back. A cell
 # sends --scale-rounds rounds of its users count (4; a quick run, 2), and at least
-# --scale-num-prompts requests (12): 12 at 1 user, 64 at 16, so its medians are
+# --scale-num-prompts requests (12): 12 at 1 user, 16 at 4, so its medians are
 # of the users count kept full, not one ramp-up and drain.
 # Above 1 user the grid runs only --scale-grid-users-output's answer lengths
 # (64): the users x prompt heat maps read 64-token answers, and long answers at
@@ -258,7 +257,9 @@ EVICT_PATH=()
 SETTLE_S=""
 # --exec's 600 s default timed out gemma-4-31b-it (18.4 GB) on this class of machine.
 READY_TIMEOUT_S=1800
-CELL_TIMEOUT_S=1200     # the slowest real cell takes minutes; a hung server, forever
+# A cell's limit. On a 36 GB M3 Pro 221 of 222 grid cells finished inside it, the slowest 2048-
+# token answers to 8k prompts near 10 minutes; a hung server would otherwise hold a cell forever.
+CELL_TIMEOUT_S=600
 SERVE_ARGS=""
 SEED=""
 MLX_PYTHON=""
@@ -273,14 +274,17 @@ PINS=()
 UNPINNED=0
 SCALING=1
 SCALE_AXES="grid"
-SCALE_CONC="1,4,16"
+SCALE_CONC="1,2,4"
 SCALE_INPUT="128,512,2048,8192"
 SCALE_OUTPUT="16,64,256,1024"
-# SCALE_GRID_INPUT, the grid's prompt lengths, defaults by this Mac's memory below.
+# The grid, the same on every Mac: a Mac's memory picks its models, not its cells, so each square
+# of the page means one thing on every machine. 32k prompts and 8 or 16 users cost more than they
+# showed: on a 32 GB base M5 two 32k prompts at once did not finish 12 requests in the cell
+# timeout, and the full run took about a day on the M4 and M5 Macs.
+SCALE_GRID_INPUT="128,1024,4096,8192"
 SCALE_GRID_OUTPUT="64"         # --full: 64,512,2048, the 1-user decode-vs-answer-length curve
 (( FULL )) && SCALE_GRID_OUTPUT="64,512,2048"
-# SCALE_GRID_CONC, the grid's users dimension (empty: 1 and the base count),
-# defaults by this Mac's memory once it is read, below.
+SCALE_GRID_CONC="1,2,4"        # the grid's users dimension; empty: 1 and the base count
 SCALE_GRID_USERS_OUTPUT="64"   # the answer lengths above 1 user; empty: every --scale-grid-output
 SCALE_BASE_INPUT=1024
 SCALE_BASE_OUTPUT=64
@@ -349,17 +353,6 @@ done
 # This Mac's set: the large models need 64 GB, the small ones are the round below that.
 MEM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 if (( MEM_GB >= LARGE_GB )); then MODELS_DEFAULT="${MODELS_LARGE}"; else MODELS_DEFAULT="${MODELS_SMALL}"; fi
-# The same cut sizes the users dimension: a Mac below it reads a 32k prompt in
-# about half a minute, so 8 and 16 users there are mostly prefill queueing.
-if [[ -z "${SCALE_GRID_CONC+set}" ]]; then
-    if (( MEM_GB >= LARGE_GB )); then SCALE_GRID_CONC="1,4,8,16"; else SCALE_GRID_CONC="1,2,4"; fi
-fi
-# And its prompts: on a 32 GB base M5 a 32k prompt alone prefills in 25 s, but two at once did not
-# finish 12 requests in --cell-timeout-s (1200 s), so each 32k cell above 1 user was twenty
-# minutes that recorded only a timeout. Below the cut the longest prompt is 8k.
-if [[ -z "${SCALE_GRID_INPUT+set}" ]]; then
-    if (( MEM_GB >= LARGE_GB )); then SCALE_GRID_INPUT="128,1024,4096,32768"; else SCALE_GRID_INPUT="128,1024,4096,8192"; fi
-fi
 [[ ${#MODELS[@]} -eq 0 ]] && IFS=',' read -r -a MODELS <<<"${MODELS_DEFAULT}"
 case "${MODELS[*]}" in
     all)   MODELS=("${MODELS_ALL[@]}") ;;
