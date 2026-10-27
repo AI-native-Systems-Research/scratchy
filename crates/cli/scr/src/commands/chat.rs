@@ -247,6 +247,9 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
         if let Some(t) = args.temperature {
             p.temperature = t;
         }
+        // The seed rides the params to the backend's sampler: seeded + temp > 0
+        // is a reproducible draw; unseeded leaves the backend to derive one.
+        p.seed = args.seed;
         Some(p)
     };
 

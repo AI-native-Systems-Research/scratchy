@@ -328,6 +328,21 @@ pub fn fnv_seed(req_id: &str, position: u32) -> u32 {
     (h >> 32) as u32 // upper 32 bits for maximum entropy
 }
 
+/// The un-truncated FNV-1a state behind [`fnv_seed`] — a PER-REQUEST seed for a
+/// draw whose per-position salt lives somewhere else (the spyre seat stages one
+/// seed per request and lets the card's noise hash mix the position in, so the
+/// request-level seed must not already depend on it). Same basis, same prime,
+/// same "not `DefaultHasher`" law; the only difference is that nothing is cut
+/// off.
+pub fn fnv_seed64(req_id: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+    for b in req_id.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+    }
+    h
+}
+
 /// Convert a `u32` seed to a uniform in `[0, 1)` by stuffing its top 23 bits into
 /// an IEEE-754 f32 mantissa — matches cuda's `gen_seed → uniform` conversion so
 /// the metal and cuda samplers turn the same seed into the same uniform.
@@ -549,6 +564,18 @@ mod tests {
             ThinkFirst::of(tokens, Absent),
             Some(ThinkFirst::MayOpen(tokens))
         );
+    }
+
+    /// The per-request seed derivation is a FIXED function of the id: same id
+    /// → same seed, every call and every process (no RNG, no clock — the
+    /// `fnv_seed` law), and different ids disagree. A seed that drifted would
+    /// make an unseeded draw unreproducible within one run, which is the one
+    /// property this derivation exists for.
+    #[test]
+    fn fnv_seed64_is_a_fixed_function_of_the_request_id() {
+        assert_eq!(fnv_seed64("req-1"), fnv_seed64("req-1"));
+        assert_ne!(fnv_seed64("req-1"), fnv_seed64("req-2"));
+        assert_ne!(fnv_seed64(""), 0);
     }
 
     #[test]

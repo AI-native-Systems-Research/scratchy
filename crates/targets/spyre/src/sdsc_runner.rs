@@ -263,7 +263,6 @@ impl SuperDscSession {
             Vec::new(),
             load_consts,
             &[],
-            &[],
             spilled_tail,
         )
     }

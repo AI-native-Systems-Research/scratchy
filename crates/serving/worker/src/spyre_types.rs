@@ -638,6 +638,18 @@ pub(crate) struct ReqState {
     /// WHICH KV SLOTS THIS REQUEST'S KEYS OCCUPY. Its own `[0, prompt)` until it shares a step with a
     /// longer request, after which it holds a masked hole and its slot count exceeds `n_computed`.
     pub(crate) kv_hist: scratchy_subtile::sdsc_abstract::KvHistory,
+    /// ⭐ THE REQUEST'S DRAW — the seed and inverse temperature every launch this request's rows
+    /// run under, decided ONCE here at admission (nothing re-derives it mid-generation: the seat's
+    /// per-step staging is a pure function of this value plus the row's absolute position, the
+    /// step salt). `None` is the greedy law — temperature ≤ 0, or a request that arrived with no
+    /// sampling params at all — and stages the exact bytes the pre-sampler path did
+    /// (quintuple `(0, 0, 0, 0, r)`, `inv_t = 1.0`).
+    ///
+    /// ⛔ WHAT IT DOES NOT CARRY IS REFUSED AT THE DERIVATION ([`SampledDraw::of`]), not silently
+    /// dropped here: this path's draw is temperature alone, so a request asking for `top_p`,
+    /// `top_k`, `min_p`, penalties or `n > 1` is turned away at admission rather than served a
+    /// draw that ignores half of what it asked for.
+    pub(crate) draw: Option<SampledDraw>,
     /// ⛔ A HOST MIRROR OF THE KV — and it does not exist on the sendnn path at all.
     ///
     /// Per-layer, row-major `[n_computed, kv_dim]`, grown one row per step by the KTIR EMULATOR's
@@ -655,6 +667,90 @@ pub(crate) struct ReqState {
     // scheduler allocates that page now, so a request's on-card KV is fully described by two things this
     // struct already has: `kv_hist` (which slots its keys occupy) and the host's block list in `InputBatch`.
     // The map one launch binds is derived from those on every bind and stored nowhere.
+}
+
+/// ⭐ ONE REQUEST'S DRAW, in the two numbers the card's noise kernel wants: a
+/// 64-bit seed (hashed on-card with the row's step salt and lane) and the
+/// inverse temperature the folded lm-head row is scaled by before the noise is
+/// added. Carried on [`ReqState::draw`] — one value per request, staged per
+/// step by the seat's binders.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SampledDraw {
+    /// The seed of the row's quintuple `(seed_lo, seed_hi, step, 1, r)` — the
+    /// request's own when it arrived seeded, else the FNV-1a of its id (the
+    /// `fnv_seed` law: deterministic within a run, no process RNG, so an
+    /// unseeded draw is still a reproducible function of the request).
+    pub(crate) seed: u64,
+    /// `1 / T` as f32 — the sampler's own scaling (`score = x·inv_t + g·gate`),
+    /// so temperature 1.0 stages the same `1.0` the greedy law does and only
+    /// the gate and seed words differ.
+    pub(crate) inv_t: f32,
+}
+
+impl SampledDraw {
+    /// ⭐ THE DRAW A REQUEST'S SAMPLING PARAMS ASK FOR — the ONE derivation, run
+    /// at admission. `Ok(None)` is the greedy law (no params, or temperature
+    /// ≤ 0 — the exact bytes the pre-sampler path staged). `Ok(Some)` is a draw:
+    /// the seeded-or-derived 64-bit seed and `1/T`. `Err` is a request this
+    /// path cannot serve honestly.
+    ///
+    /// ⛔ THE ERRORS ARE THE POINT. This path's on-card draw is TEMPERATURE
+    /// ALONE: `top_p`, `top_k`, `min_p`, the three penalties and `n > 1` have
+    /// no card leg here. Serving such a request anyway would answer a nucleus
+    /// ask with an unfiltered softmax sample — silently wrong in the one
+    /// direction nobody can see from the output — so the request is refused at
+    /// admission, naming every knob it asked for. The day a knob gains a card
+    /// leg, its arm moves from this refusal to the draw.
+    pub(crate) fn of(
+        req_id: &str,
+        sp: Option<&scratchy_core_common::SamplingParams>,
+    ) -> Result<Option<SampledDraw>, String> {
+        let Some(sp) = sp else {
+            // No params at all: nothing asked for a draw, and the greedy law is
+            // what the seat stages.
+            return Ok(None);
+        };
+        if sp.temperature <= 0.0 {
+            // Temperature 0 (and anything below it) is greedy by definition —
+            // the gate word's 0, `inv_t` irrelevant.
+            return Ok(None);
+        }
+        let refused: Vec<String> = [
+            (sp.top_p != 1.0, format!("top_p={}", sp.top_p)),
+            (sp.top_k > 0, format!("top_k={}", sp.top_k)),
+            (sp.min_p > 0.0, format!("min_p={}", sp.min_p)),
+            (
+                sp.presence_penalty != 0.0,
+                format!("presence_penalty={}", sp.presence_penalty),
+            ),
+            (
+                sp.frequency_penalty != 0.0,
+                format!("frequency_penalty={}", sp.frequency_penalty),
+            ),
+            (
+                sp.repetition_penalty != 1.0,
+                format!("repetition_penalty={}", sp.repetition_penalty),
+            ),
+            (sp.n > 1, format!("n={}", sp.n)),
+        ]
+        .into_iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, what)| what)
+        .collect();
+        if !refused.is_empty() {
+            return Err(format!(
+                "this Spyre path samples with temperature alone — request {req_id} also asked for \
+                 {}, which has no card leg here; refuse rather than serve a draw that ignores it",
+                refused.join(", ")
+            ));
+        }
+        Ok(Some(SampledDraw {
+            seed: sp
+                .seed
+                .unwrap_or_else(|| scratchy_core_common::fnv_seed64(req_id)),
+            inv_t: (1.0 / sp.temperature) as f32,
+        }))
+    }
 }
 
 #[allow(dead_code)]

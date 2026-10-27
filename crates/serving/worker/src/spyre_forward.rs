@@ -111,6 +111,14 @@ pub(crate) fn run_prefill_batch(
     gathers: scratchy_target_spyre::wiring::GathersKv,
     start: usize,
     want_logits: LogitsWanted,
+    // ⭐ THE SEAT LAWS THIS LAUNCH'S ROWS RUN UNDER — one law per row the
+    // suffix's sampler picks for, staged before anything runs. The variant must
+    // match the launch's own arm: `Prompt` for a prompt-final chunk (whose rows
+    // are one request's consecutive positions), `Batch` for a decode batch (one
+    // law per live row). A middle prompt chunk stages nothing (its suffix never
+    // runs), so the value it passes is inert — but the arm/variant match is
+    // still refused wherever the seat IS staged, never silently resolved.
+    seat_laws: SeatLaws<'_>,
 ) -> ExecutorResult<Option<Vec<u32>>> {
     use scratchy_subtile::sdsc_abstract::{ChunkRows, decode_prefix_col_valid};
     // ⭐ NO `hd` HERE ANY MORE. The one head-count question this function asked (`h / hd`) is now
@@ -156,6 +164,10 @@ pub(crate) fn run_prefill_batch(
     // any one of them changes the hidden state at layer 1 and every layer after it writes different K/V
     // into live 0's cell. `LaunchRows` is the one value that answers all four, so a row cannot be
     // mirrored in some aspects and not others.
+    // The LIVE rows by slot, kept past the widening below — the seat's laws are indexed by LAUNCH
+    // slot, and only the live batch says which slot is a request's own (a padding slot's law is
+    // greedy: its pick is never read, and its forward is live 0's by the replica law).
+    let live_batch = per_request.as_ref().map(|(rows, _)| *rows);
     let per_request: Option<(
         scratchy_subtile::sdsc_abstract::LaunchRows<'_>,
         scratchy_subtile::sdsc_abstract::BatchPrefix,
@@ -482,7 +494,71 @@ pub(crate) fn run_prefill_batch(
         if per_request.is_some() {
             seat.rows = mq as u32;
         }
-        acts_i32.extend(greedy_sample_binds(&seat));
+        // ⭐ THE ROWS' LAWS, built to the launch's own arm — the variant must
+        // match `per_request`, and a mismatch is refused here, never silently
+        // resolved into a sampled request served greedy or a row sampling a
+        // request that is not its own.
+        let seat_rows = seat.rows as usize;
+        let laws: Vec<RowLaw<'_>> = match (&seat_laws, live_batch) {
+            // A PROMPT-FINAL CHUNK: one request, real row `i` at its own
+            // absolute position `start + i`, and a pad row CLAMPED to the last
+            // real position (the `tok_at` law — its whole forward is the last
+            // real token's). The consumed pick is the LAST BAKED ROW's, so an
+            // unfilled rung's pad rows must carry the same draw at the same
+            // salt the last real row would: a greedy pad law would silently
+            // pick greedy for a sampled request whenever the chunk did not
+            // fill its rung.
+            (SeatLaws::Prompt { draw }, None) => (0..seat_rows)
+                .map(|r| RowLaw {
+                    draw: *draw,
+                    step: (start + r.min(real - 1)) as u32,
+                })
+                .collect(),
+            // A DECODE BATCH: live slot `s` runs its own request's draw at its
+            // own rotary position (`rope_pos` IS that request's token count);
+            // a padding slot runs greedy — its pick is never read, and greedy
+            // over live 0's replicated forward is always a real token, never
+            // the sentinel.
+            (SeatLaws::Batch { draws }, Some(live)) => {
+                if draws.len() != live.live() {
+                    return Err(werr(format!(
+                        "run_prefill_batch: {} seat law(s) for {} live row(s) — one law per \
+                         live request, in slot order",
+                        draws.len(),
+                        live.live()
+                    )));
+                }
+                let mut next_live = 0usize;
+                (0..seat_rows)
+                    .map(|s| match live.row(s) {
+                        Some(b) => {
+                            let law = RowLaw {
+                                draw: draws[next_live],
+                                step: b.rope_pos.get(),
+                            };
+                            next_live += 1;
+                            law
+                        }
+                        None => RowLaw { draw: None, step: 0 },
+                    })
+                    .collect()
+            }
+            (SeatLaws::Batch { .. }, None) => {
+                return Err(werr(
+                    "run_prefill_batch: decode-batch seat laws for a launch with no \
+                     per-request rows — the laws must match the launch's own arm"
+                        .to_string(),
+                ));
+            }
+            (SeatLaws::Prompt { .. }, Some(_)) => {
+                return Err(werr(
+                    "run_prefill_batch: prompt-chunk seat laws for a decode batch — the laws \
+                     must match the launch's own arm"
+                        .to_string(),
+                ));
+            }
+        };
+        acts_i32.extend(sample_binds(&seat, &laws)?);
     }
     if let Some((id, key, vals)) = launcher.causal_keyed {
         pf.bind_keyed(id, key, &vals)
@@ -942,57 +1018,118 @@ pub(crate) enum ChunkOut {
     Tokens(Vec<u32>),
 }
 
-/// ⭐ THE GREEDY LAW every decode launch binds — the seat's per-step
-/// operands at their baked offsets, spelled so the draw is the plain
-/// first-max: the seed quintuple `(0, 0, 0, 0, r)` — the GATE table's 0 IS
-/// the greedy law, `score = xm·inv_t + g·0 = xm·inv_t` exactly (the fold's
-/// clamps keep g FINITE for any seed bytes, so `g·0` is +0, never NaN) —
-/// and inv_t = 1.0. FIVE `[rows, 1]` i32 word tables, one per member of
-/// the quintuple (the auditor's wall-4 ruling (a)): each is `invt`'s own
-/// class — one 128-B stick per row, the word at the STICK HEAD
-/// (`r · seed_row_words`, the seat's baked stride — the Col operand mode
-/// reads the head alone, the int-bcast leg's measured law) — and the
-/// worker writes the five words of row r at the five tables' stick heads
-/// and nothing else (the sticks' zero padding is the reservation's own,
-/// exactly inv_t's bind). Emitted as LE words for the raw (`acts_i32`)
-/// channel, which binds verbatim — i32 words for the seed tables, IEEE f32
-/// for inv_t; the f32 `Bind` channel converts to SEN169 and is NOT
-/// verbatim.
+/// ⭐ ONE ROW'S LAW FOR THE SEAT — what the launch's row `r` draws. `None` is
+/// the greedy law: the seed quintuple `(0, 0, 0, 0, r)` and `inv_t = 1.0`,
+/// byte-identical to the bind this path staged before any request asked for a
+/// draw. `Some` is that row's request's draw, and the STEP SALT is the row's
+/// ABSOLUTE position — the one input that changes every launch of one
+/// generation, so the same seed draws different noise (hence, past rare ties,
+/// a different token) at every position instead of repeating one pick.
 #[cfg(feature = "spyre-hw")]
-fn greedy_sample_binds(
+pub(crate) struct RowLaw<'a> {
+    pub(crate) draw: Option<&'a SampledDraw>,
+    /// The row's absolute position — its request's own token count at this
+    /// step, or (a prompt chunk's pad row) the last real position it clamps to.
+    pub(crate) step: u32,
+}
+
+/// ⭐ THE SEAT LAWS ONE LAUNCH RUNS ITS ROWS UNDER — the two shapes a caller
+/// can know them in, and ONLY those two: a prompt-final chunk serves ONE
+/// request whose rows are consecutive positions of one sequence, and a decode
+/// batch serves one request PER LIVE ROW. The variant must match the launch's
+/// own arm (`per_request`); a mismatch is refused where the seat is staged,
+/// never silently resolved.
+#[cfg(feature = "spyre-hw")]
+pub(crate) enum SeatLaws<'a> {
+    /// A prompt-final chunk: every baked row runs `draw` — real row `i` at its
+    /// own position `start + i`, and a pad row at the last real position it
+    /// clamps to (the pad row replicates the last real token's entire forward,
+    /// and the CONSUMED pick is the last baked row's, so the pad row must carry
+    /// the same draw the last real row would, or an unfilled rung would pick
+    /// greedy for a sampled request).
+    Prompt {
+        draw: Option<&'a SampledDraw>,
+    },
+    /// A decode batch: one law per LIVE row, in slot order — that row's
+    /// request's draw at that request's own position. Padding slots run greedy:
+    /// their picks are never read (the caller maps live slots only), and the
+    /// greedy pick of live 0's replicated forward is always a real token, never
+    /// the sentinel.
+    Batch {
+        draws: &'a [Option<&'a SampledDraw>],
+    },
+}
+
+/// ⭐ THE SEAT BINDS EVERY LAUNCH STAGES — the seat's per-step operands at
+/// their baked offsets, one law per baked row. Spelled so the greedy law is
+/// the plain first-max: the seed quintuple `(0, 0, 0, 0, r)` — the GATE
+/// table's 0 IS the greedy law, `score = xm·inv_t + g·0 = xm·inv_t` exactly
+/// (the fold's clamps keep g FINITE for any seed bytes, so `g·0` is +0, never
+/// NaN) — and inv_t = 1.0. A sampled row stages its request's draw instead:
+/// `(seed_lo, seed_hi, step, 1, r)` and that draw's own inverse temperature —
+/// the gate's 1 turns the noise on, and the step salt is the row's absolute
+/// position. FIVE `[rows, 1]` i32 word tables, one per member of the
+/// quintuple (the auditor's wall-4 ruling (a)): each is `invt`'s own class —
+/// one 128-B stick per row, the word at the STICK HEAD (`r · seed_row_words`,
+/// the seat's baked stride — the Col operand mode reads the head alone, the
+/// int-bcast leg's measured law) — and the worker writes the five words of
+/// row r at the five tables' stick heads and nothing else (the sticks' zero
+/// padding is the reservation's own, exactly inv_t's bind). Emitted as LE
+/// words for the raw (`acts_i32`) channel, which binds verbatim — i32 words
+/// for the seed tables, IEEE f32 for inv_t; the f32 `Bind` channel converts
+/// to SEN169 and is NOT verbatim.
+#[cfg(feature = "spyre-hw")]
+fn sample_binds(
     seat: &scratchy_target_spyre::wiring::SampleSeat,
-) -> Vec<(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)> {
+    laws: &[RowLaw<'_>],
+) -> ExecutorResult<Vec<(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)>> {
     let rows = seat.rows as usize;
-    let stride = seat.seed_row_words as usize;
-    // (seed_lo, seed_hi, step, greedy_gate, row) — zeros and the row's own
-    // index; the gate word's 0 is what makes the draw greedy. One word per
-    // table, at each row's stick head.
+    if laws.len() != rows {
+        return Err(werr(format!(
+            "the sampler seat holds {rows} baked row(s) but {} law(s) were staged — one law per \
+             baked row, never fewer, never more",
+            laws.len()
+        )));
+    }
+    // (seed_lo, seed_hi, step, greedy_gate, row) — the greedy row is zeros and
+    // its own index (the gate word's 0 is what makes the draw greedy); a
+    // sampled row is its request's seed split low/high, its step salt, and the
+    // gate's 1. One word per table, at each row's stick head.
     let word_of = |k: usize, r: usize| -> i32 {
-        if k == 4 {
-            r as i32
-        } else {
-            0
+        let law = &laws[r];
+        match (k, law.draw) {
+            (0, Some(d)) => d.seed as u32 as i32,
+            (1, Some(d)) => (d.seed >> 32) as u32 as i32,
+            (2, Some(_)) => law.step as i32,
+            (3, Some(_)) => 1,
+            // The row's own index — every law, greedy or sampled.
+            (4, _) => r as i32,
+            // A greedy row: zeros for the seed, the step and the gate.
+            (_, None) => 0,
         }
     };
     let mut binds = Vec::with_capacity(1 + seat.seed_words.len());
     for (k, &tid) in seat.seed_words.iter().enumerate() {
-        let mut table = vec![0i32; rows * stride];
+        let mut table = vec![0i32; rows * seat.seed_row_words as usize];
         for r in 0..rows {
-            table[r * stride] = word_of(k, r);
+            table[r * seat.seed_row_words as usize] = word_of(k, r);
         }
         let le: Vec<u8> = table.iter().flat_map(|w| w.to_le_bytes()).collect();
         binds.push((scratchy_target_spyre::bundle_code::PlaceId::Act(tid), le));
     }
+    // inv_t per row: the greedy law's 1.0, or the draw's own 1/T — at
+    // temperature 1.0 the two are the same bytes and only the seed and gate
+    // words differ.
     let mut invt = vec![0.0f32; rows * 32];
-    for v in invt.iter_mut().step_by(32) {
-        *v = 1.0;
+    for r in 0..rows {
+        invt[r * 32] = laws[r].draw.map_or(1.0, |d| d.inv_t);
     }
     let invt_le: Vec<u8> = invt.iter().flat_map(|f| f.to_le_bytes()).collect();
     binds.push((
         scratchy_target_spyre::bundle_code::PlaceId::Act(seat.invt),
         invt_le,
     ));
-    binds
+    Ok(binds)
 }
 
 /// Read the minted sampler's idx stick back and decode it: one i32 per row at
@@ -1426,6 +1563,14 @@ pub(crate) fn superdsc_forward_chunk(
                     } else {
                         LogitsWanted::None
                     },
+                    // ⭐ THE CHUNK'S SEAT LAW — this request's draw, every row of
+                    // it (the staging arm clamps pad rows to the last real
+                    // position). Only the prompt-FINAL chunk's value is ever
+                    // staged; a middle chunk's suffix never runs, so its law is
+                    // inert — but it is still THIS request's, never invented.
+                    SeatLaws::Prompt {
+                        draw: req.draw.as_ref(),
+                    },
                 )?;
                 prompt_pick = chunk_pick;
                 // UNCONDITIONAL truth-signal per chunk: `chunk_len` prompt tokens went through ONE
@@ -1763,10 +1908,12 @@ pub(crate) fn superdsc_forward_chunk(
         log_binds(&format!("decode pos={p}"), b.wiring, &acts, &acts_f16);
         // ⭐ EVERY DECODE LAUNCH BINDS ITS SAMPLER SEAT — the mint's noise/inv_t
         // sources are per-session seg3 placements no alias covers, so an unbound
-        // seat reads ZEROS, which under the greedy law is exactly right. Greedy
-        // for every row until the on-card noise kernel fills this buffer. A
-        // decode bundle with no seat cannot pick: refuse, never fall back to a
-        // host readback.
+        // seat reads ZEROS, which under the greedy law is exactly right. This
+        // launch's row 0 is the request itself: its law is the request's own
+        // draw at THIS absolute position (the step salt), and any further baked
+        // row would be padding this single-request session never lays — greedy,
+        // like every padding row. A decode bundle with no seat cannot pick:
+        // refuse, never fall back to a host readback.
         let seat = b.wiring.sample_seat.as_ref().ok_or_else(|| {
             werr(format!(
                 "decode bundle has no sampler seat (result t{}) — a decode launch cannot pick \
@@ -1774,7 +1921,15 @@ pub(crate) fn superdsc_forward_chunk(
                 b.result_id
             ))
         })?;
-        acts_i32.extend(greedy_sample_binds(seat));
+        let mut solo_laws = Vec::with_capacity(seat.rows as usize);
+        solo_laws.push(RowLaw {
+            draw: req.draw.as_ref(),
+            step: p as u32,
+        });
+        for _ in 1..seat.rows as usize {
+            solo_laws.push(RowLaw { draw: None, step: 0 });
+        }
+        acts_i32.extend(sample_binds(seat, &solo_laws)?);
         {
             // The whole result stays ON THE CARD: the minted sampler consumed the
             // logits there and left the idx stick in their place. LeftOnDevice +

@@ -681,6 +681,11 @@ pub struct ChatArgs {
     #[arg(long)]
     pub temperature: Option<f64>,
 
+    /// Random seed for reproducible sampling (with temperature > 0: the same
+    /// seed gives the same text run-to-run; a different seed different text).
+    #[arg(long)]
+    pub seed: Option<u64>,
+
     /// Number of GPUs for tensor parallelism (default: 1).
     #[arg(long, default_value_t = 1)]
     pub tensor_parallel_size: usize,

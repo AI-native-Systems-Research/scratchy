@@ -508,6 +508,13 @@ impl Worker for SpyreWorker {
                     // prefix-cache hit otherwise): it has not shared a step with anyone yet, so its
                     // slots and its tokens are still the same set.
                     kv_hist: scratchy_subtile::sdsc_abstract::KvHistory::contiguous(start),
+                    // ⭐ THE DRAW, DECIDED ONCE AT ADMISSION and staged per step by every seat the
+                    // request's rows run through — the prompt-final chunk's, the solo decode loop's,
+                    // the batch's. Cached steps never see sampling params again, so this is the one
+                    // door. A request this path cannot serve honestly (a knob with no card leg) is
+                    // refused here, naming the knob.
+                    draw: SampledDraw::of(&nr.req_id, nr.sampling_params.as_ref())
+                        .map_err(werr)?,
                     #[cfg(not(feature = "spyre-hw"))]
                     kv_k: vec![Vec::new(); nlayers],
                     #[cfg(not(feature = "spyre-hw"))]
@@ -1142,11 +1149,20 @@ impl Worker for SpyreWorker {
                 // never read. The launch geometry is still the RUNG's: `seqs` rows are bound and
                 // run, live or padding.
                 let mut toks: Vec<usize> = Vec::with_capacity(slots.live());
+                // ⭐ THE LIVE ROWS' DRAWS, collected by the SAME walk that lays
+                // the rows — one per live slot, in slot order, so a law can
+                // never describe another request's row. A greedy request's
+                // `None` keeps its bytes exactly the pre-sampler bind's; a
+                // sampled request in the SAME batch draws under its own seed
+                // and temperature (the gate word is per-row, so the two laws
+                // mix freely in one launch).
+                let mut draws: Vec<Option<&SampledDraw>> = Vec::with_capacity(slots.live());
                 let rows_in = slots.live_rows(|live| {
                     let (id, start) = &decode_ids[live];
                     let req = requests
                         .get(id)
                         .ok_or_else(|| werr(format!("unknown cached req {id}")))?;
+                    draws.push(req.draw.as_ref());
                     let tok = input_batch.token_at(id, *start).ok_or_else(|| {
                         werr(format!("decode batch: req {id} has no token at {start}"))
                     })? as usize;
@@ -1486,6 +1502,10 @@ impl Worker for SpyreWorker {
                     // CARD, by the rung's minted sampler. The idx stick comes back raw,
                     // one token per launch slot; no logits are ever read.
                     LogitsWanted::PerRequest,
+                    // ⭐ EACH LIVE ROW ITS OWN REQUEST'S DRAW, laid by the same
+                    // walk that laid the rows (the staging arm pairs them by
+                    // slot and gives every padding slot the greedy law).
+                    SeatLaws::Batch { draws: &draws },
                 )?
                 .ok_or_else(|| werr("decode batch: the rung picked no tokens".to_string()))?;
                 // ── KCACHE PROBE (SCRATCHY_KCACHE_PROBE), BATCHED STEP ── the batched counterpart of the
