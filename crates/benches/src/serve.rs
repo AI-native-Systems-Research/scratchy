@@ -1606,7 +1606,8 @@ fn run_tasks(
             .collect();
         std::fs::write(path, serde_json::to_string_pretty(&rows)?)?;
     }
-    let json = task_metrics(&results, &tasks, tokenizer, total_time, &dataset, args.seed);
+    let count = |t: &str| datasets::token_count(tokenizer, t).unwrap_or(0);
+    let json = task_metrics(&results, &tasks, &count, total_time, &dataset, args.seed);
     print_task_summary(&dataset, &json);
     write_results(args, model, &json)
 }
@@ -1647,7 +1648,7 @@ fn task_body(
 fn task_metrics(
     results: &[RequestResult],
     tasks: &[crate::workloads::Task],
-    tokenizer: &Tokenizer,
+    count_tokens: &dyn Fn(&str) -> usize,
     total_time: f64,
     dataset: &str,
     seed: u64,
@@ -1665,7 +1666,7 @@ fn task_metrics(
         if r.output_tokens > 0 {
             r.output_tokens
         } else {
-            datasets::token_count(tokenizer, &r.generated_text).unwrap_or(0)
+            count_tokens(&r.generated_text)
         }
     };
     let ttft = sorted(ok.iter().map(|(r, _)| r.ttft).collect());
@@ -1679,9 +1680,19 @@ fn task_metrics(
     let out: Vec<usize> = ok.iter().map(|(r, _)| answer_tokens(r)).collect();
     let total_out: usize = out.iter().sum();
     let mean = |v: &[f64]| (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64);
+    // Over every task sent: a request that failed scores wrong, as does an answer that ran to its
+    // cap, whose text may hold the answer somewhere in a ramble that never gave it. Over the
+    // answered only, an engine that failed the hard tasks would score higher.
+    let capped = |r: &RequestResult, t: &crate::workloads::Task| answer_tokens(r) >= t.max_tokens;
     let accuracy = mean(
-        &ok.iter()
-            .map(|(r, t)| t.score.score(&r.generated_text))
+        &(results.iter().zip(tasks))
+            .map(|(r, t)| {
+                if r.success && !capped(r, t) {
+                    t.score.score(&r.generated_text)
+                } else {
+                    0.0
+                }
+            })
             .collect::<Vec<_>>(),
     );
     // Answers that open as a thought: a request whose `enable_thinking: false` did not reach the
@@ -2011,6 +2022,7 @@ mod tests {
             &docs,
             "Capital of France?",
             &[answer.to_string()],
+            crate::workloads::Rule::AnyAnswer,
             crate::workloads::RAG_MAX_TOKENS,
         )
     }
@@ -2042,18 +2054,14 @@ mod tests {
         assert!(spans.get("messages").is_none());
     }
 
-    /// A dataset workload's metrics: accuracy over the answers, cached prompt tokens from the
-    /// server's usage (null where it sent none), and the failed and empty answers counted apart.
+    /// A dataset workload's metrics: accuracy over every task sent, a failed request or a capped
+    /// answer scoring wrong; cached prompt tokens from the server's usage (null where it sent
+    /// none); and the failed and empty answers counted apart.
     #[test]
     fn a_workloads_metrics_score_the_answers_and_read_the_cache() {
-        let tok_path = std::env::var("SCR_TEST_TOKENIZER").ok();
-        let Some(tokenizer) = tok_path
-            .as_deref()
-            .and_then(|p| scratchy_serving_api::Tokenizer::from_file(std::path::Path::new(p)).ok())
-        else {
-            eprintln!("skipped: set SCR_TEST_TOKENIZER to a tokenizer.json");
-            return;
-        };
+        // A span answer's tokens, where the server sent no count: a word a token, here.
+        let words = |t: &str| t.split_whitespace().count();
+        let tokenizer = &words;
         let answered = |text: &str, tokens: usize, cached: Option<usize>| {
             let mut r = req(tokens, tokens, 0.1, 0.5);
             r.generated_text = text.into();
@@ -2067,10 +2075,10 @@ mod tests {
             RequestResult::failed(0.0, 1.0, "timed out".into()),
         ];
         let tasks = vec![rag("Paris"), rag("Paris"), rag("Paris")];
-        let j = task_metrics(&results, &tasks, &tokenizer, 1.0, "musique", 7);
+        let j = task_metrics(&results, &tasks, tokenizer, 1.0, "musique", 7);
         assert_eq!(j["completed"], 2);
         assert_eq!(j["failed"], 1);
-        assert_eq!(j["accuracy"], 0.5);
+        assert_eq!(j["accuracy"], 1.0 / 3.0, "the failed request scores wrong");
         assert_eq!(j["mean_cached_tokens"], 60.0);
         assert_eq!(j["mean_prompt_tokens"], 100.0);
         assert_eq!(j["dataset"], "musique");
@@ -2078,11 +2086,23 @@ mod tests {
         assert_eq!(j["empty_answers"], 0);
         assert_eq!(j["thinking_answers"], 0);
         let thinking = vec![answered("We need to answer: what is the capital?", 9, None)];
-        let j = task_metrics(&thinking, &tasks[..1], &tokenizer, 1.0, "musique", 7);
+        let j = task_metrics(&thinking, &tasks[..1], tokenizer, 1.0, "musique", 7);
         assert_eq!(j["thinking_answers"], 1);
         let no_usage = vec![answered("Paris", 1, None)];
-        let j = task_metrics(&no_usage, &tasks[..1], &tokenizer, 1.0, "musique", 7);
+        let j = task_metrics(&no_usage, &tasks[..1], tokenizer, 1.0, "musique", 7);
         assert!(j["mean_cached_tokens"].is_null(), "no count is not zero");
+        // An answer that ran to its cap scores wrong, though the answer is somewhere in it.
+        let ramble = format!("Paris {}", "and ".repeat(crate::workloads::RAG_MAX_TOKENS));
+        let capped = vec![answered(&ramble, crate::workloads::RAG_MAX_TOKENS, None)];
+        let j = task_metrics(&capped, &tasks[..1], tokenizer, 1.0, "musique", 7);
+        assert_eq!(j["accuracy"], 0.0);
+        // A span answer has no usage: its tokens are counted from its text.
+        let span = vec![answered(&ramble, 0, None)];
+        let j = task_metrics(&span, &tasks[..1], tokenizer, 1.0, "musique", 7);
+        assert_eq!(
+            j["accuracy"], 0.0,
+            "counted from its text, it ran to its cap"
+        );
     }
 
     /// A streamed chat answer comes back with its text and the server's cached and prompt token

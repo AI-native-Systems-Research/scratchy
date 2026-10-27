@@ -101,6 +101,7 @@ fn task(q: &Query, max_tokens: usize) -> crate::workloads::Task {
         &q.documents,
         &q.question,
         std::slice::from_ref(&q.answer),
+        crate::workloads::Rule::OneAnswer,
         max_tokens,
     )
 }

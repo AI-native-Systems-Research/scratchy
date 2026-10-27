@@ -90,6 +90,7 @@ fn task(q: &Query, max_tokens: usize) -> crate::workloads::Task {
         &q.passages,
         &q.question,
         &q.answers,
+        crate::workloads::Rule::AnyAnswer,
         max_tokens,
     )
 }

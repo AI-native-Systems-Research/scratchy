@@ -187,6 +187,7 @@ fn task(q: &Query, max_tokens: usize) -> crate::workloads::Task {
         &docs,
         &q.question,
         &answers,
+        crate::workloads::Rule::AnyAnswer,
         max_tokens,
     )
 }
