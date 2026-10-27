@@ -101,7 +101,7 @@ fn token_plane() -> GatherIndex {
 
 fn emit(op: &ktir_superdsc::superdsc_opspec::OpSpec) -> serde_json::Value {
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    let e = superdsc::emit_sdsc("MatMul_0", op, &folds, None)
+    let (e, _) = superdsc::emit_sdsc("MatMul_0", op, &folds, None)
         .expect("the token-plane gathered matmul emits");
     serde_json::to_value(&e).unwrap()
 }
@@ -452,7 +452,7 @@ fn the_plan_under_a_token_plane_gather_splits_mb_only_at_a_multi_stick_out() {
     );
     // AND IT EMITS — where the cost model's own plan would have been refused by the guard.
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    let e = superdsc::emit_sdsc("MatMul_0", &op, &folds, None)
+    let (e, _) = superdsc::emit_sdsc("MatMul_0", &op, &folds, None)
         .expect("the mb-only plan emits at the multi-stick-out geometry");
     let j = serde_json::to_value(&e).unwrap();
     assert_eq!(

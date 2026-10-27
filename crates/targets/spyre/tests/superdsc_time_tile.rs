@@ -31,8 +31,10 @@
 //! which do not build on a plain `cargo test` here.
 
 use ktir_superdsc::emit;
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{assemble_reduce, assemble_rmsnorm};
-use scratchy_subtile::sdsc_abstract::{KernelTag, Stk};
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{
+    RmsnormFacts, assemble_reduce, assemble_rmsnorm,
+};
+use scratchy_subtile::sdsc_abstract::{BlockCols, KernelTag, RowCount, Stk};
 use scratchy_subtile::superdsc_opspec::{
     Allocation, DataFormat, Df, FP16_BYTES, Fp16, ItDim, MAX_CORES, MaxCores, OpFunc, Role, Scale,
     TensorArg, USABLE_LX_BYTES, WorkPlan,
@@ -202,8 +204,16 @@ fn reduce_and_multiop_invariants() {
         "mean",
         64,
         576,
-        &emit::rb("r_x", 64, 576),
-        &emit::rb("r_acc", 64, 1),
+        &emit::rb(
+            "r_x",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(576),
+        ),
+        &emit::rb(
+            "r_acc",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(1),
+        ),
         None,
     );
     let j: serde_json::Value =
@@ -245,14 +255,16 @@ fn reduce_and_multiop_invariants() {
     // rmsnorm.rs's module doc): the former `rmsq`+`rmmean` pair is ONE op, 6 → 5.
     let mut sym = 0i64;
     let ops = assemble_rmsnorm(
-        "g",
-        64,
-        576,
-        "x",
-        "w",
-        scratchy_target_spyre::bundle_code::PlaceId::Act(7),
-        "eps",
-        None,
+        RmsnormFacts {
+            prefix: "g",
+            rows: 64,
+            cols: 576,
+            x: "x",
+            gamma: "w",
+            out_id: scratchy_target_spyre::bundle_code::PlaceId::Act(7),
+            eps_const: "eps",
+            ones_const: None,
+        },
         &mut sym,
         None,
     );
@@ -373,6 +385,7 @@ fn rmsnorm_rinv_is_pinned_lx() {
                     bank: 0,
                     offset: 0,
                     size,
+                    cover: ktir_superdsc::placement::BindCover::Full,
                 },
             );
         };
@@ -387,17 +400,19 @@ fn rmsnorm_rinv_is_pinned_lx() {
         let l = layout_for(rows, 576);
         let mut sym = 0i64;
         assemble_rmsnorm(
-            "g",
-            rows,
-            576,
-            "t1",
-            "t2",
-            PlaceId::Act(7),
-            "t3",
-            // The Scale convention — no `γ+1` row, byte-identical to the emission before
-            // the OnePlusScale row existed. The oneplus law has its own golden
-            // (triton-numeric's `rmsnorm_oneplus`).
-            None,
+            RmsnormFacts {
+                prefix: "g",
+                rows,
+                cols: 576,
+                x: "t1",
+                gamma: "t2",
+                out_id: PlaceId::Act(7),
+                eps_const: "t3",
+                // The Scale convention — no `γ+1` row, byte-identical to the emission before
+                // the OnePlusScale row existed. The oneplus law has its own golden
+                // (triton-numeric's `rmsnorm_oneplus`).
+                ones_const: None,
+            },
             &mut sym,
             Some(&l),
         )
@@ -540,6 +555,7 @@ fn two_norm_layout() -> ktir_superdsc::placement::BundleLayout {
                 bank: 0,
                 offset: 0,
                 size,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
     };
@@ -563,14 +579,16 @@ fn norm(
     sym: &mut i64,
 ) -> Vec<emit::EmittedOp> {
     assemble_rmsnorm(
-        prefix,
-        64,
-        576,
-        "t1",
-        "t2",
-        scratchy_target_spyre::bundle_code::PlaceId::Act(out),
-        "t3",
-        None,
+        RmsnormFacts {
+            prefix,
+            rows: 64,
+            cols: 576,
+            x: "t1",
+            gamma: "t2",
+            out_id: scratchy_target_spyre::bundle_code::PlaceId::Act(out),
+            eps_const: "t3",
+            ones_const: None,
+        },
         sym,
         Some(l),
     )
@@ -873,165 +891,6 @@ fn the_walk_leaves_a_pin_this_bundle_never_touches_alone() {
     );
 }
 
-// ── THE REAL BUNDLE SHAPE the walk guards: an attention chunk's program followed by a
-//    trailing norm's — the #645 fix (a) emission order (declare pass first, chunk second,
-//    norm's real pass third). The chunk's pins are CORE-LOCAL (per-core scratch), never
-//    op-local, so the op-local ledger carries exactly the trailing norm's rinv; the walk's
-//    acceptance here is the green test that the guard does not refuse the very bundle the
-//    fix exists to enable. The ADMISSION side of the same bundle — the chunk's `lx_form`
-//    budgeting against the declared trailing norm — is pinned in ktir-superdsc's
-//    `zz_the_hd128_chunk_in_lx.rs` (`a_trailing_norms_slot_still_bounds_the_chunk_that_precedes_it`).
-#[test]
-fn the_walk_accepts_a_chunk_program_followed_by_its_trailing_norm() {
-    use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
-    use ktir_superdsc::place::{PlaceId, SynthRole};
-    use ktir_superdsc::placement::{SegRole, TensorPlacement};
-    use ktir_superdsc::sdsc_abstract::{AttnGeometry, ChunkScratch, PagedKvPool, attn_bundle_rows};
-
-    const NQH: u32 = 32;
-    const NKVH: u32 = 8;
-    const HD: u32 = 128;
-    // The hd128 one-request decode layout (zz_the_hd128_chunk_in_lx's shape): eight placed
-    // activation names for the attention operands, plus the trailing norm's out and eps.
-    let mut layout = ktir_superdsc::placement::BundleLayout {
-        attn_class_hds: vec![HD],
-        ..ktir_superdsc::placement::BundleLayout::default()
-    };
-    let mut names = Vec::new();
-    let ident = ktir_superdsc::reserved_tids::identity_class_tid(0);
-    for (i, tid) in (1..=8u32).chain([900, ident]).enumerate() {
-        let name = PlaceId::Act(tid).to_string();
-        layout
-            .ids
-            .borrow_mut()
-            .insert(name.clone(), PlaceId::Act(tid));
-        names.push(name);
-        layout.placements.insert(
-            tid,
-            TensorPlacement {
-                tid,
-                role: SegRole::Activation,
-                segment: 3,
-                bank: 0,
-                offset: (i as u64) << 30,
-                size: 1 << 30,
-            },
-        );
-    }
-    let place = |l: &mut ktir_superdsc::placement::BundleLayout, tid: u32, size: u64| {
-        l.ids
-            .borrow_mut()
-            .insert(PlaceId::Act(tid).to_string(), PlaceId::Act(tid));
-        l.placements.insert(
-            tid,
-            TensorPlacement {
-                tid,
-                role: SegRole::Activation,
-                segment: 3,
-                bank: 0,
-                offset: 40 << 30,
-                size,
-            },
-        );
-    };
-    place(&mut layout, 901, 64 * 576 * FP16_BYTES); // the trailing norm's out
-    place(&mut layout, 902, 64 * FP16_BYTES); // its eps const
-    // ⭐ THE DECLARE PASS'S ACTION, one program EARLY: the trailing norm's whole public
-    //    lowering runs against the shared layout first — throwaway symbols, ops dropped —
-    //    so its rinv pin is in the table before the chunk's admission consults the slot sum.
-    let mut declare_syms = 0i64;
-    let _ = assemble_rmsnorm(
-        "tail",
-        64,
-        576,
-        &names[0],
-        &names[1],
-        PlaceId::Act(901),
-        "t902",
-        None,
-        &mut declare_syms,
-        Some(&layout),
-    );
-    // The chunk: 40 pages, the widest rung the hd128 one-request form admits.
-    let geom = AttnGeometry::<NQH, NKVH, HD>::minted();
-    let rows = attn_bundle_rows(geom, 1, true).expect("the one-request decode rung");
-    let chunk =
-        ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, HD as usize), 40).expect("a chunk");
-    let mut sym = 0i64;
-    let attn_ops = assemble_attn(
-        0,
-        geom,
-        rows,
-        256,
-        256,
-        &names[0],
-        &names[1],
-        &names[2],
-        &names[3],
-        &names[4],
-        &names[5],
-        &names[6],
-        Some(&names[7]),
-        Some(chunk),
-        PlaceId::Act(900),
-        false,
-        false,
-        &mut sym,
-        Some(&layout),
-    )
-    .unwrap_or_else(|e| panic!("assemble_attn refused: {}", e.0));
-    assert!(
-        attn_ops.iter().any(|e| e.op_name.starts_with("attn_cgkt_")),
-        "the chunk's Kᵗ gather copies are present"
-    );
-    // The trailing norm's REAL pass: the same public lowering, its pin already declared.
-    let tail = assemble_rmsnorm(
-        "tail",
-        64,
-        576,
-        &names[0],
-        &names[1],
-        PlaceId::Act(901),
-        "t902",
-        None,
-        &mut sym,
-        Some(&layout),
-    );
-    // THE BUNDLE: the chunk's program, then the norm's — the norm FOLLOWS the chunk in
-    // program order, exactly as the rung lowers.
-    let mut ops = attn_ops.clone();
-    ops.extend(tail.iter().cloned());
-    let per_prog = vec![
-        ("attn_chunk".to_string(), attn_ops.len()),
-        ("rmsnorm_tail".to_string(), tail.len()),
-    ];
-    let ledger = superdsc::walk_lx_slot_alternation(
-        &ops,
-        &per_prog,
-        superdsc::FoldGrouping::Fused,
-        Some(&layout),
-    )
-    .unwrap();
-    assert_eq!(
-        ledger.len(),
-        1,
-        "the chunk's pins are core-local, not op-local"
-    );
-    assert_eq!(
-        ledger[0].name,
-        PlaceId::Act(901).synth(SynthRole::Rinv).to_string(),
-        "the one op-local pin is the trailing norm's rinv"
-    );
-    assert_eq!(
-        ledger[0].touched_by,
-        vec![
-            ("rmsnorm_tail".to_string(), false),
-            ("rmsnorm_tail".to_string(), true)
-        ],
-        "touched only by the norm's own program — the chunk's program never appears"
-    );
-}
-
 // ── SLICE operand (RoPE prerequisite, proven on-card SLICE_RC=0 2026-06-25): a
 //    `.with_offset(n)` operand reads `x[n:]` — its AllocNode startAddr is bumped by
 //    `n·2` bytes. Pins that the offset reaches the emitted startAddr.
@@ -1101,9 +960,17 @@ fn per_core_addresses_use_distinct_segments_and_disjoint_cores() {
         384,
         64,
         16,
-        &emit::rb("a", 384, 64),
+        &emit::rb(
+            "a",
+            RowCount::of_token_rows(384),
+            BlockCols::of_feature_cols(64),
+        ),
         &Stk::<KernelTag>::kernel(64_usize, 384_usize, "w"),
-        &emit::rb("o", 384, 384),
+        &emit::rb(
+            "o",
+            RowCount::of_token_rows(384),
+            BlockCols::of_feature_cols(384),
+        ),
         None,
     );
     assert_eq!(e.time, 1, "bmm fits LX in one trip");
@@ -1214,9 +1081,17 @@ fn batched_lx_overflowing_matmul() -> emit::EmittedOp {
         n,
         k,
         batch,
-        &emit::rb("a", m, k),
+        &emit::rb(
+            "a",
+            RowCount::of_token_rows(m),
+            BlockCols::of_feature_cols(k),
+        ),
         &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
-        &emit::rb("o", m, n),
+        &emit::rb(
+            "o",
+            RowCount::of_token_rows(m),
+            BlockCols::of_feature_cols(n),
+        ),
         None,
     )
 }
@@ -1231,9 +1106,17 @@ fn assert_the_multi_stick_batched_matmul_is_refused() {
         16384,
         2048,
         2,
-        &emit::rb("a", 64, 2048),
+        &emit::rb(
+            "a",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(2048),
+        ),
         &Stk::<KernelTag>::kernel(2048_usize, 16384_usize, "w"),
-        &emit::rb("o", 64, 16384),
+        &emit::rb(
+            "o",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(16384),
+        ),
         &mut 0,
         None,
     )
@@ -1492,9 +1375,17 @@ fn time1_bundle_mlir_is_byte_identical_to_flat() {
         384,
         64,
         16,
-        &emit::rb("act", 384, 64),
+        &emit::rb(
+            "act",
+            RowCount::of_token_rows(384),
+            BlockCols::of_feature_cols(64),
+        ),
         &Stk::<KernelTag>::kernel(64_usize, 384_usize, "wt"),
-        &emit::rb("out", 384, 384),
+        &emit::rb(
+            "out",
+            RowCount::of_token_rows(384),
+            BlockCols::of_feature_cols(384),
+        ),
         None,
     );
     assert_eq!(emitted.time, 1, "bmm must NOT time-tile");
@@ -1524,9 +1415,17 @@ fn dump_gate_bundles() {
         64,
         64,
         1,
-        &emit::rb("g1_a", 64, 64),
+        &emit::rb(
+            "g1_a",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(64),
+        ),
         &Stk::<KernelTag>::kernel(64_usize, 64_usize, "g1_w"),
-        &emit::rb("g1_o", 64, 64),
+        &emit::rb(
+            "g1_o",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(64),
+        ),
         None,
     );
     assert_eq!(fit.time, 1, "64^3 must fit LX in one trip");
@@ -1559,9 +1458,17 @@ fn dump_gate_bundles() {
                 n,
                 k,
                 b,
-                &emit::rb("gb_a", m, k),
+                &emit::rb(
+                    "gb_a",
+                    RowCount::of_token_rows(m),
+                    BlockCols::of_feature_cols(k),
+                ),
                 &Stk::<KernelTag>::kernel(k as usize, n as usize, "gb_w"),
-                &emit::rb("gb_o", m, n),
+                &emit::rb(
+                    "gb_o",
+                    RowCount::of_token_rows(m),
+                    BlockCols::of_feature_cols(n),
+                ),
                 None,
             );
             assert!(ov.time > 1, "{label} must time-tile");
@@ -1594,14 +1501,16 @@ fn dump_gate_bundles() {
     //     multi-op + broadcast chain (exx2-reduce→add(eps)→rsqrt→broadcast-mul) on-card.
     let mut sym = 0i64;
     let rms = assemble_rmsnorm(
-        "gate",
-        64,
-        576,
-        "rms_x",
-        "rms_w",
-        scratchy_target_spyre::bundle_code::PlaceId::Act(7),
-        "eps",
-        None,
+        RmsnormFacts {
+            prefix: "gate",
+            rows: 64,
+            cols: 576,
+            x: "rms_x",
+            gamma: "rms_w",
+            out_id: scratchy_target_spyre::bundle_code::PlaceId::Act(7),
+            eps_const: "eps",
+            ones_const: None,
+        },
         &mut sym,
         None,
     );

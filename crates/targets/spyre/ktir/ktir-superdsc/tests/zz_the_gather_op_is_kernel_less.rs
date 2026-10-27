@@ -101,7 +101,8 @@ fn dsc(j: &serde_json::Value) -> &serde_json::Value {
 
 fn emit(op: &ktir_superdsc::superdsc_opspec::OpSpec) -> serde_json::Value {
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    let e = superdsc::emit_sdsc("Gather_0", op, &folds, None).expect("the gather-copy op emits");
+    let (e, _) =
+        superdsc::emit_sdsc("Gather_0", op, &folds, None).expect("the gather-copy op emits");
     serde_json::to_value(&e).unwrap()
 }
 

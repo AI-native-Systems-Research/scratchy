@@ -71,7 +71,7 @@ fn ops_with(
                 &rbh("t_qs", 1, NQH * HD),
                 src,
                 // I[64,64] at offset 0 of the class's `[hd, hd]` identity — the cache write's kernel.
-                &Stk::<KernelTag>::kernel(STICK as usize, STICK as usize, "t_ident"),
+                &Stk::<KernelTag>::one_stick_identity("t_ident"),
                 DevOff::ZERO,
                 &rbh("t_qg", NKVH * GQA, HD),
                 dst,

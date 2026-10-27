@@ -74,7 +74,8 @@ fn a_pass_past_a_rows_own_pages_has_no_valid_column() {
         .expect("at least one page")
         .grid(rung, MaskBlockForm::PerRowPage);
     let max_pages = grid.pages().get();
-    let bytes = decode_batch_prefix_mask_f16::<PER_PAGE>(shape, declare(grid), &hists, -30000.0);
+    let bytes = decode_batch_prefix_mask_f16::<PER_PAGE>(shape, declare(grid), &hists, -30000.0)
+        .into_wire_bytes();
 
     let mut checked = 0usize;
     for (r, own) in pages_each.iter().enumerate() {
@@ -164,7 +165,8 @@ fn the_boundary_column_agrees_for_holed_and_hole_free_rows() {
         "a shallower row must hold a hole (two runs)"
     );
 
-    let bytes = decode_batch_prefix_mask_f16::<PER_PAGE>(shape, declare(grid), &hists, -30000.0);
+    let bytes = decode_batch_prefix_mask_f16::<PER_PAGE>(shape, declare(grid), &hists, -30000.0)
+        .into_wire_bytes();
     let page = (shared / PagedKvPool::PAGE_SLOTS) as u32;
     let col = (shared % PagedKvPool::PAGE_SLOTS) as u32;
 

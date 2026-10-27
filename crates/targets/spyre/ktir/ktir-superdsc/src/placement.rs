@@ -148,6 +148,73 @@ impl SegRole {
     }
 }
 
+/// ⭐⭐⭐⭐⭐ THE WRITE-COVER LAW — WHAT A BIND MAY LEAVE UNWRITTEN, AS A TYPE.
+///
+/// A placement's `size` is what the bake RESERVES; a bind's byte count is what
+/// a producer WRITES. Those were two unrelated numbers until now: every bind door
+/// refused only the over-bind (`bytes > size`), and a short bind silently left
+/// the placement's tail holding whatever the shadow had — which the consumers
+/// then read. [`crate::sdsc_abstract`]'s staging docs have named the hazard for
+/// the whole campaign ("an under-bind of an ADDITIVE mask leaves a tail the ops
+/// read as ZERO, i.e. as 'no mask'"); this type is that prose, enforced.
+///
+/// Every placement STATES its cover at construction — there is no default and no
+/// omission: a construction site that cannot name its cover has not finished
+/// stating its placement. Two classes exist because two bind laws exist:
+///
+/// * **`Full`** — every bind fills the placement exactly (`bytes == size`). The
+///   weights, the embeddings, the rotary tables, the causal mask, the constants,
+///   the spliced step inputs (whose fill door already demands `==`), and the
+///   BROADCAST prefix mask of a prompt chunk or solo decode, whose staging law is
+///   "THE EXTENT IS THE BAKE'S RESERVE … every swept column gets an explicit
+///   value" — the one-row form is bound whole.
+/// * **`FoldBlocks`** — the fold's per-pass tensors. A decode-BATCH prefix mask
+///   places `[nqh·mq rows, max_pages blocks]` and the host stages only the LIVE
+///   blocks ("3 blocks instead of 24"); the KV block index rides the mask's own
+///   per-pass shift, so its pitch IS the mask's block stride — one number, both
+///   tensors. A bind is a WHOLE NUMBER of blocks, never a partial one: a partial
+///   block is a truncated row of a `[pass][row][page]` grid, read as mask bytes
+///   nobody staged (which read as ZERO and therefore VALID) or as block numbers
+///   that point somewhere real.
+///
+/// ⛔ THE DOORS ASK, THE BAKE PROVES. `admits` is the one extent law every bind
+/// door consults ([`crate::Executor`]'s `place_raw` / `bind_input` family); the
+/// address audit proves the class's arithmetic against the placement's own size
+/// (`block_bytes` divides `size`, is nonzero, and does not exceed it) at bake,
+/// where those are constants. A new bind law is a new VARIANT, minted where its
+/// geometry is computed, refused by every door until then — never a relaxation
+/// of an existing one.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum BindCover {
+    /// Every bind fills the placement exactly: `bytes == size`.
+    Full,
+    /// Every bind is a whole number of `block_bytes` blocks, at most the
+    /// placement's: the fold's per-pass mask and index tables.
+    FoldBlocks {
+        /// One `[pass][row][page]` block — the mask's own pass stride.
+        block_bytes: u64,
+    },
+}
+
+impl BindCover {
+    /// ⭐ THE ONE EXTENT LAW — does a bind of `bytes` into a `size`-byte
+    /// placement obey this cover? Every bind door asks this and nothing else;
+    /// the over-bind and the silent-short-bind are the same refusal here.
+    pub fn admits(&self, bytes: u64, size: u64) -> bool {
+        match self {
+            BindCover::Full => bytes == size,
+            BindCover::FoldBlocks { block_bytes } => {
+                bytes != 0
+                    && *block_bytes != 0
+                    && bytes.is_multiple_of(*block_bytes)
+                    && bytes <= size
+            }
+        }
+    }
+}
+
 /// One tensor's global placement in the packed bundle.
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 pub struct TensorPlacement {
@@ -162,6 +229,9 @@ pub struct TensorPlacement {
     pub offset: u64,
     /// Byte size (f16 = 2 B/elem, rows*cols*2).
     pub size: u64,
+    /// ⭐ WHAT A BIND MAY LEAVE UNWRITTEN — the write-cover law, stated at
+    /// construction. See [`BindCover`].
+    pub cover: BindCover,
 }
 
 /// The device-tile re-tile spec the executor (C++ shim) consumes to stage a matmul
@@ -182,6 +252,129 @@ pub struct RetileDescriptor {
     pub stick_size: u32,
     /// Bytes per element (2 for fp16).
     pub word_length: u32,
+}
+
+/// One row of the step-input discovery table ([`BundleLayout::step_inputs`]): the SLOT the one
+/// numbering law ([`step_input_tid`](crate::ktir_node::step_input_tid)) gave the tid, and the
+/// ELEMENT FORMAT the program's own view states for that buffer.
+///
+/// ⛔ BOTH FACTS ARE THE PROGRAM'S OWN STATEMENTS, recorded by the placement pass at the same
+/// statements it sizes the placement from — the slot is what the producer numbered the binding
+/// through, and the element format is the dtype of the buffer's own `construct_memory_view`. The
+/// slot is what the runtime ADDRESSES the input by; the element format is what the bake maps to
+/// the staging law. Neither is given a meaning here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StepInputRow {
+    pub slot: u32,
+    pub df: Df,
+}
+
+// `Df`'s own doc law is that the typed core does NOT derive `Serialize` (the wire structs do), so
+// the row serializes its format as the dataspace's own `dataFormat_` string — the same spelling
+// the emitted descriptors carry, which is what a runtime diagnostic reading `bundle_layout.json`
+// can actually compare against.
+impl serde::Serialize for StepInputRow {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("StepInputRow", 2)?;
+        st.serialize_field("slot", &self.slot)?;
+        st.serialize_field("df", self.df.dataformat())?;
+        st.end()
+    }
+}
+
+/// ⭐⭐⭐ THE KV BLOCK INDEX, HELD UNPLACED — the ONE activation a session's bodies may
+/// legitimately disagree about, which is why its offset cannot be taken where the masks take
+/// theirs.
+///
+/// Only a gathering body reserves the index (`gathers_kv`: the batched rungs and a chunked
+/// one-request ceiling gather through the page table; an unchunked sweep rung sweeps the
+/// resident KV and needs no table), while the host binds every step at the CEILING bundle's
+/// placements — so the index's PRESENCE must move nothing the host stages.
+/// [`BundleLayout`] therefore carries the reservation as a VALUE and takes no offset for it in
+/// the placement pass; the one placement door is
+/// [`BundleLayout::place_kv_block_index_last`], which a walk must call AFTER the last
+/// host-staged placement (`place_step_inputs`, `complete_program_scales`). A reservation
+/// still pending at the bake is a `cargo build` panic, never a silently unplaced index: the
+/// placement's PRESENCE is `BakeFacts::gathers_kv`, and a gather that finds no table reads
+/// entry 0 — which is a real address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvBlockIndexReservation {
+    /// The MASK'S OWN PASS-GRID BYTES (`pmbytes`) — one derivation for both tensors: the index
+    /// rides the mask's per-pass shift, so its per-pass pitch is this over the mask's block
+    /// count and its reservation is the whole grid. There is no second spelling of this number.
+    pub bytes: u64,
+    /// ⭐ THE SAME GRID'S BLOCK STRIDE — `pmbytes / pm_blocks`, the one number the mask's own
+    /// [`BindCover::FoldBlocks`] mint uses. The index's binds are whole blocks of exactly this
+    /// many bytes (the host stages the live passes' entries at the head, one block per live
+    /// page), so this is the cover the placement door mints — a bind that is not a whole
+    /// number of these blocks is a truncated row of the pass grid, read as block numbers.
+    pub block_bytes: u64,
+}
+
+/// ⭐⭐⭐ THE BATCHED REP TABLE, HELD UNPLACED — the SECOND activation a session's bodies may
+/// legitimately disagree about, which is why its offset cannot be taken where the other step
+/// inputs take theirs.
+///
+/// Only a batched decode row states the rep (`attn_step_slots::REP`: the bridge from the
+/// request-major score row to the head-major q/o row — an identity at one request, so the solo
+/// decode changes no bytes and states no slot; the paged-fold body states the same three slots
+/// the solo path does and no rep), while the host binds every step at the CEILING bundle's
+/// placements — so the rep's PRESENCE must move nothing the host stages. The KV block index's
+/// law ([`KvBlockIndexReservation`]), restated for a law-numbered tid: the reservation is
+/// carried as a VALUE, no offset is taken for it where the other step inputs take theirs (the
+/// consumer's `place_step_inputs` defers the rep slot), and the one placement door is
+/// [`BundleLayout::place_rep_table_last`], called AFTER `place_kv_block_index_last`. A
+/// reservation still pending at the bake is a `cargo build` panic, never a silently unplaced
+/// table: a batched score read with no rep reads stick 0 — which is a real address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RepTableReservation {
+    /// The numbering law's own tid for the rep slot (`step_input_tid(n_graph_tensors, REP)`) —
+    /// law-derived per graph, never a constant, which is why the reservation carries it.
+    pub tid: u32,
+    /// The staged buffer's WHOLE extent — the region's rows × cols × word length, the same
+    /// derivation `place_step_inputs` sizes every step input by. The door places exactly this
+    /// many bytes and mints the same `==`-extent cover the inline path would.
+    pub bytes: u64,
+}
+
+impl RepTableReservation {
+    /// ⭐⭐⭐⭐⭐ THE IDX2ADDR REACH — the bytes the CARD reads of an index table, WIDER than the
+    /// table the host stages whenever the table spans more than one index stick.
+    ///
+    /// dxp lowers every gather/scatter through `createIdx2AddrSdsc`
+    /// (`dbo/src/Transforms/sdsc_bundle/GatherIndexConversion.cpp:108`), whose conversion SDSC
+    /// takes its `N_` **from the gather op's own `N_`** (divided by the index's page sizes, then
+    /// rounded UP to the index's stick), and `allocateAndModifyGather`
+    /// (`dbo/src/Utils/sdsc_bundle/GatherBuffers.cpp`) reads that input as ONE CONTIGUOUS RUN of
+    /// that many entries from the MINIMUM of the index's per-core start addresses. The leg cuts
+    /// state each leg's op `N_` at the TABLE's row count (the gather cut's measured `node_rows`
+    /// law; the scatter's `N_` carry), so EVERY leg's conversion reads a table-sized run from the
+    /// LEG's own stick base: the last leg's run ends `(sticks − 1)` sticks of base plus `sticks`
+    /// sticks of run — `(2·sticks − 1)` sticks in all, and that is this number.
+    ///
+    /// The entries past the table's end are converted but never dereferenced (the work division
+    /// consumes only the leg's own rows), which is why the embedding's card-proven eight-leg
+    /// gather reads 896 B past its 1024 B ids table with byte-exact results — its table had
+    /// mapped bytes after it. A table placed at a SEGMENT TAIL has none, and the read faults
+    /// (measured, granite-3.1-2b at 2 requests: `HMI=FETCH` at the rep's second index stick, the
+    /// stream dead, the rung flush refused) — so the ONE table this reservation places, at the
+    /// activation segment's tail, is placed and staged whole at the reach, the host padding the
+    /// tail with zeros (a zero converts to the value's own base — the most benign address there
+    /// is, and an unused one).
+    ///
+    /// `view_bytes` is the table's own extent as the program's view states it (rows × cols ×
+    /// word length); `word_length` is that view's element length. A one-stick table's reach is
+    /// itself, so every one-stick width (the solo decode's identity rep) is byte-identical.
+    pub fn reach_bytes(view_bytes: u64, word_length: u64) -> u64 {
+        if view_bytes == 0 {
+            return 0;
+        }
+        let cap = u64::from(crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP);
+        let stick = cap * word_length;
+        let sticks = (view_bytes / word_length).div_ceil(cap);
+        (2 * sticks - 1) * stick
+    }
 }
 
 /// The whole-bundle memory plan: every tensor → (segment, offset, size, role),
@@ -246,6 +439,16 @@ pub struct BundleLayout {
     /// fold, no host-route — the op is a real on-device pointwise `mul`).
     #[serde(default)]
     pub scalarmul_scales: Vec<f32>,
+    /// ⭐ THE SCALE REGISTRY'S FORMAT COLUMN — `scalarmul_scales[i]`'s own `df`, parallel by
+    /// construction. The PAYLOAD half (the census) is all `Fp16`, the staging-twin law: the
+    /// value the card applies is `f16(v)`, written by the existing `[1,1]` const fill. The
+    /// PROGRAM-STATED half carries the element type each constant's own `tensor.splat` states
+    /// (`Fp32` for the f32 m-merge's constants), appended by the completion pass in the same
+    /// bits-sorted order the values are. The runtime reads this column to pick each slot's
+    /// staging channel — f16 fill vs raw f32 word — so it is baked into the artifact beside the
+    /// values, never re-derived on the host.
+    #[serde(default)]
+    pub scalarmul_scales_df: Vec<Df>,
     /// ⭐ THE WEIGHT FOLDS — `(weight tensor id, multiplier)`, one per fold the producer half
     /// recognized, of EITHER kind: a `ScalarMul` multiplier scaling a MATMUL's whole, unshared
     /// output (`scalar_mul_weight_folds`), or an attention's `√scale` scaling its `W_q`/`W_k`
@@ -287,6 +490,19 @@ pub struct BundleLayout {
     /// the wide class's upper lanes (dump-proven on gemma-4 tiny-allglobal).
     #[serde(default)]
     pub attn_class_hds: Vec<u32>,
+    /// ⭐⭐⭐ THE HOST-STAGED PER-STEP INPUTS — tid → its [`StepInputRow`].
+    ///
+    /// This is the WORKER'S DISCOVERY TABLE, and it is DATA, exactly like [`Self::weight_copies`]
+    /// and [`Self::scalarmul_scales`]: a per-step input is placed like any other Activation (its
+    /// placement is in [`Self::placements`], sized from the program's own view), and this field is
+    /// how the runtime tells a staged buffer apart from an intermediate WITHOUT recomputing the
+    /// producer's numbering — the runtime reads the tid, the slot and the element format off the
+    /// artifact and never re-derives `graph.tensors.len() + k`. The element format is the
+    /// program's own view statement, recorded at the same statement the placement was sized from,
+    /// and it is what the bake maps to the staging law (which runtime channel narrows the host's
+    /// bytes); this crate serializes all of it and branches on none of it.
+    #[serde(default)]
+    pub step_inputs: std::collections::BTreeMap<u32, StepInputRow>,
     /// SYNTHETIC intermediates created during lowering (silu's `{out}_silu`,
     /// rmsnorm's `{out}_sq/mean/meps/inv/tmp/eps`) are NOT SubtileIR tensors, so
     /// they have no `t{id}` placement. They are lazily assigned a STABLE offset in
@@ -328,6 +544,48 @@ pub struct BundleLayout {
     /// [`PagedKvPool::request_stride`]: crate::sdsc_abstract::PagedKvPool::request_stride
     #[serde(default)]
     pub kv_request_stride_bytes: u64,
+    /// ⭐ THE GATHER REACH — source tid → the bound on the index VALUES a GATHERED read of that
+    /// tensor may hold, as the typed pair ([`crate::sdsc_abstract::GatherReach`]): the entry
+    /// ceiling and the entry unit those values address at.
+    ///
+    /// Declared by the producer for a POOLED tensor only. A pooled tensor's placement covers
+    /// ONE slice of a pool (the paged KV cache's per-layer plane: one page, one layer, one
+    /// plane), while a gathered read's index names stick-blocks across the WHOLE pool the
+    /// runtime re-bases per launch — RELATIVE TO THE PLANE'S OWN BASE, which is why one reach
+    /// serves every plane. So the placement footprint, the bound every plain window runs
+    /// against, is the WRONG bound for the indexed read, and this pair is the right one: the
+    /// gather door (`crate::emit::assemble_pointwise_broadcast_gather`) checks the descriptor's
+    /// own entry stride against it — the unit the host's `GatherEntry` composition counts in —
+    /// and the host-side composition mints through the SAME ceiling
+    /// ([`crate::sdsc_abstract::gather_entry_ceiling`]), so a value above the pool's bound is
+    /// unconstructible at both halves and the two cannot disagree. Nothing else widens — a
+    /// plain sweep or a producer's write of the same tid is still bounded by the placement
+    /// alone, so the reach is a fact about the INDEXED read, never about the tensor. Empty for
+    /// every bundle with no pooled tensor, keeping those byte-identical.
+    #[serde(default)]
+    pub gather_reach: std::collections::BTreeMap<u32, crate::sdsc_abstract::GatherReach>,
+    /// ⭐ THE KV BLOCK INDEX'S PENDING RESERVATION — carried UNPLACED out of the placement pass
+    /// ([`KvBlockIndexReservation`] states why), spent by the one door
+    /// [`BundleLayout::place_kv_block_index_last`] after the last host-staged activation has its
+    /// offset. Compile-time only: the baked artifact carries the PLACEMENT the door mints, not
+    /// the pending value.
+    #[serde(skip)]
+    pub kv_block_index: Option<KvBlockIndexReservation>,
+    /// ⭐ THE BATCHED REP TABLE'S PENDING RESERVATION — carried UNPLACED out of the placement
+    /// pass ([`RepTableReservation`] states why: the rep slot is the one step input whose
+    /// PRESENCE differs between a session's bodies), spent by the one door
+    /// [`BundleLayout::place_rep_table_last`] after the KV block index. Compile-time only: the
+    /// baked artifact carries the PLACEMENT the door mints, not the pending value.
+    #[serde(skip)]
+    pub rep_table: Option<RepTableReservation>,
+    /// ⭐ THE PAGED-FOLD REGION'S PAGE CEILING — the ONE derivation, recorded where the prefix
+    /// mask's pass grid is sized: the device's own cap over this bundle's page bytes (a pool is
+    /// a single flex region) BOUNDED BY the pool this graph actually laid (its cache tensor's
+    /// row extent — a reach fact: no context can out-reach the pool its entries gather). Read
+    /// by the tape walk to state the region the fold family's tables and mask describe. `None`
+    /// for a bundle with no attention — and for every bundle baked before the field existed.
+    #[serde(default)]
+    pub paged_fold_region_pages: Option<u32>,
 }
 
 /// Bump allocator for synthetic-intermediate offsets within the Intermediate
@@ -390,13 +648,14 @@ pub struct LxAlloc {
     /// meet — so a chunk pin landing later in walk order can never eat a slot reserved earlier.
     pub next_down: u64,
     /// Sum of the op-local slot footprints reserved so far — the [`lx_window_fits`] term the
-    /// allocator guard and the `lx_form` witness both read (one number, two consults).
+    /// allocator guard reads and the deleted `lx_form` witness read (one number, two consults).
     pub op_local_bytes: u64,
-    /// The probability-part pins the chunk form mints BESIDE its gathers — the other
-    /// core-local term of the `lx_form` witness's budget, recorded at the chunk's admission
-    /// ([`BundleLayout::note_chunk_prob_pin_bytes`]) so the baked artifact carries it to the
-    /// host's own `chunk_gather_index_table` read. RECORDED, not bumped: the mint itself bumps
-    /// `next`; this is the number the ADMISSION budgeted, noted so the two arms cannot drift.
+    /// The probability-part pins the chunk form minted BESIDE its gathers — the other
+    /// core-local term of the deleted `lx_form` witness's budget, recorded at the chunk's
+    /// admission ([`BundleLayout::note_chunk_prob_pin_bytes`]) so the baked artifact carried it
+    /// to the host's own index-table read (also deleted with the copy-gather family). RECORDED,
+    /// not bumped: the mint itself bumps `next`; this is the number the ADMISSION budgeted,
+    /// noted so the two arms cannot drift.
     pub prob_pin_bytes: u64,
     /// The shared slot's start address per footprint class (bytes) — one slot per class,
     /// every op-local pin of that class resolving to the same address ([`LxAlloc::next_down`]).
@@ -438,9 +697,9 @@ impl Default for LxAlloc {
 /// regions of the pin window are summed here and nowhere else: core-local chunk pins bump
 /// UP from [`LX_PIN_BASE`], op-local shared slots bump DOWN from [`LX_PIN_END`], and the
 /// window holds exactly when the two never meet. Every guard consults THIS function — the
-/// allocator's per-declaration asserts (below) with the live cursor state, and the
-/// `ChunkScratch::lx_form` admission witness with the chunk's would-be bytes — so the
-/// witness can never admit a form the allocator would refuse: one law, two readers,
+/// allocator's per-declaration asserts (below) with the live cursor state, and the deleted
+/// `ChunkScratch::lx_form` admission witness did with the chunk's would-be bytes — so a
+/// witness could never admit a form the allocator would refuse: one law, two readers,
 /// zero drift (#645's ruling 4).
 pub const fn lx_window_fits(core_local_bytes: u64, op_local_slot_bytes: u64) -> bool {
     LX_PIN_BASE + core_local_bytes + op_local_slot_bytes <= LX_PIN_END
@@ -674,8 +933,64 @@ impl BundleLayout {
         }
     }
 
-    /// ⭐ THE `[hd, hd]` IDENTITY TABLE an attention class of head dim `hd` reads — its tid from this
-    /// bundle's [`Self::attn_class_hds`] registry, the one lookup every identity-kernel copy (krep/vrep,
+    /// ⭐ LAW (b)'s AUTHORITY — a gathered source's window at a sweep, under the TYPED-REACH
+    /// law: a sweep that fits the placement keeps its window (no reach needed, byte-identical);
+    /// a sweep that EXCEEDS the placement must carry a DECLARED reach — the typed statement of
+    /// its index values' bound (entry ceiling + unit, `BundleLayout::gather_reach`) — and the
+    /// family is then read from the placement (a placement holding the whole reach is a source
+    /// extent, `min(swept, ceiling)`; a slice is a pool, one entry). The placement footprint
+    /// (real buffer, LX pin, or synth declaration — the same three arms [`Self::check_window`]'s
+    /// footprint doors read, so the two can never disagree about where a tensor ends) supplies
+    /// the bytes through [`gathered_window_rows`], the one pure statement of the law the proof
+    /// series pins. Refuses, fail-closed: an over-sweep with no reach, a source whose placement
+    /// holds less than one whole row of the stated width, and a name the layout never declared.
+    pub(crate) fn gathered_source_rows(
+        &self,
+        name: &str,
+        swept: u32,
+        row_elems: u32,
+        df: crate::superdsc_opspec::Df,
+        reach: Option<crate::sdsc_abstract::GatherReach>,
+    ) -> Result<u32, String> {
+        let row_bytes = row_elems as u64 * df.word_length() as u64;
+        let fp = if let Some((_pin, fp)) = self.lx_pin(name) {
+            fp
+        } else if let Some(crate::place::PlaceId::Act(tid)) = self.id_of(name)
+            && let Some(p) = self.placements.get(&tid)
+        {
+            align128(p.size).max(128)
+        } else {
+            *self.synth.borrow().sizes.get(name).ok_or_else(|| {
+                format!(
+                    "'{name}' is read through an index but was never declared to the layout \
+                         — every intermediate is known at bake; declare it (`BundleLayout::synth`) \
+                         or bind it before gathering through it"
+                )
+            })?
+        };
+        let swept_bytes = u64::from(swept).saturating_mul(row_bytes);
+        gathered_window_rows(swept, fp, row_bytes, reach.map(|r| r.max_entry().get() as u64))
+            .ok_or_else(|| {
+                if fp < row_bytes {
+                    format!(
+                        "'{name}' (placed at {fp}B) holds less than one {row_elems}-element row of \
+                         the width this gather strides — the index has no row it could legally name"
+                    )
+                } else {
+                    format!(
+                        "'{name}' is swept for {swept} rows × {row_elems} elements ({swept_bytes}B) \
+                         but placed at {fp}B — the swept window exceeds its placement footprint, and \
+                         a gathered read may address past its placement only under a DECLARED REACH \
+                         (the typed bound on its index values: an entry ceiling and unit, \
+                         `BundleLayout::gather_reach`). Declare the reach for '{name}' or place the \
+                         whole source"
+                    )
+                }
+            })
+    }
+
+    /// ⭐ THE `[hd, hd]` IDENTITY TABLE an attention class of head dim `hd` reads — its tid
+    /// from this bundle's [`Self::attn_class_hds`] registry, the one lookup every identity-kernel copy (krep/vrep,
     /// the KV cache write, the query group re-layout) resolves through. `None` when `hd` is not one of
     /// the tape's attention classes — a registry desync each caller refuses at build.
     pub fn identity_tid_of_class(&self, hd: u32) -> Option<u32> {
@@ -761,7 +1076,7 @@ impl BundleLayout {
     /// are compared is [`lx_window_fits`].
     ///
     /// ⛔ PANICS when the two regions would meet — computed by [`lx_window_fits`], the same
-    /// one-function budget the `lx_form` admission witness reads — so this runs at
+    /// one-function budget the deleted `lx_form` admission witness read — so this runs at
     /// `#[forward]` expansion AS the cargo-build guard: a bundle whose pins do not fit the
     /// frontend's LX window is unbuildable, not silently overlapping dxp's own LX allocations.
     pub fn synth_lx_op_local(&self, id: PlaceId, dims: &[u32]) {
@@ -783,8 +1098,8 @@ impl BundleLayout {
              {} B of op-local slots against the {LX_PIN_END} boundary. The op-local classes are \
              per-FOOTPRINT, so this is one class too many at this geometry — either the norm \
              rows shrank a class away, or a chunk form this bundle also declares leaves no room \
-             for it. The `lx_form` witness reads the same budget (`lx_window_fits`), so it \
-             refusing a chunk form here is the designed alternative, not this panic.",
+             for it. The deleted `lx_form` witness read the same budget (`lx_window_fits`), so \
+             a chunk form being refused there was the designed alternative, not this panic.",
             a.next,
             a.op_local_bytes + added
         );
@@ -823,9 +1138,9 @@ impl BundleLayout {
             "a core-local LX intermediate overflows the frontend's LX window: '{name}' pins at {o} \
              with a {fp}-byte per-core slice, meeting the {} B of op-local slots already reserved \
              against the {LX_PIN_END} boundary. Cut the op into smaller parts so one core's slice \
-             fits, or keep the tensor in HBM (`BundleLayout::synth`). The `lx_form` witness reads \
-             the same budget (`lx_window_fits`), so this chunk form being refused there instead is \
-             the designed alternative, not this panic.",
+             fits, or keep the tensor in HBM (`BundleLayout::synth`). The deleted `lx_form` \
+             witness read the same budget (`lx_window_fits`), so a chunk form being refused there \
+             instead was the designed alternative, not this panic.",
             a.op_local_bytes
         );
         a.next = o + fp;
@@ -835,22 +1150,22 @@ impl BundleLayout {
     }
 
     /// The op-local slot bytes reserved so far — one slot per footprint class
-    /// ([`Self::synth_lx_op_local`]). THE `lx_form` witness's op-local term: by the time the
-    /// consumer pass runs, the declare pass has already declared every op-local pin of the
-    /// rung, so this number is final and the witness and the allocator's guard read the same
-    /// quantity through [`lx_window_fits`].
+    /// ([`Self::synth_lx_op_local`]). The deleted `lx_form` witness's op-local term: by the
+    /// time the consumer pass runs, the declare pass has already declared every op-local pin
+    /// of the rung, so this number is final and the witness and the allocator's guard read the
+    /// same quantity through [`lx_window_fits`].
     pub fn lx_op_local_slot_bytes(&self) -> u64 {
         self.lx.borrow().op_local_bytes
     }
 
-    /// Record the probability-part pins the chunk form mints beside its gathers
-    /// ([`crate::ir::bridge::tiled_op_sdsc_op::attn::chunk_prob_pins`]) — the second core-local
-    /// term of the `lx_form` witness's budget, summed with the gather pins at the chunk's
-    /// admission. Noted so the baked artifact carries the term to the host's own
-    /// `chunk_gather_index_table` read — the bake/host agreement law: the host must refuse
-    /// exactly what the bake refused. REPLACEMENT, not a sum: one bundle mints one attention
-    /// op's probability parts, so re-emitting the same chunk (the declare pass, then the real
-    /// one) notes the same number.
+    /// Record the probability-part pins the chunk form minted beside its gathers
+    /// (summed by the deleted old emitter's `chunk_prob_pins`) — the second core-local
+    /// term of the deleted `lx_form` witness's budget, summed with the gather pins at the
+    /// chunk's admission. Noted so the baked artifact carried the term to the host's own
+    /// index-table read (also deleted with the copy-gather family) — the bake/host agreement
+    /// law: the host refused exactly what the bake refused. REPLACEMENT, not a sum: one bundle
+    /// mints one attention op's probability parts, so re-emitting the same chunk (the declare
+    /// pass, then the real one) notes the same number.
     pub fn note_chunk_prob_pin_bytes(&self, bytes: u64) {
         self.lx.borrow_mut().prob_pin_bytes = bytes;
     }
@@ -999,6 +1314,242 @@ impl BundleLayout {
                 m.insert(name.to_string(), want);
                 Ok(want)
             }
+        }
+    }
+
+    /// ⭐⭐⭐ THE KV BLOCK INDEX'S ONE PLACEMENT DOOR — the LAST host-staged activation.
+    ///
+    /// ⛔ WHY A DOOR, AND WHY "LAST" IS LOAD-BEARING. One session runs bodies that gather and
+    /// bodies that do not (the one-request ladder's chunked ceiling beside its unchunked sweep
+    /// rungs), and the host binds each step at the CEILING's placements — so
+    /// `ladder_stages_one_layout` exempts exactly `KV_BLOCK_INDEX_TID` from its comparison, an
+    /// exemption that is sound ONLY if the index's presence moves nothing the guard compares.
+    /// Placed where the reservation used to sit — beside the masks, inside the placement pass —
+    /// it pushed every LATER host-staged tensor (the step inputs, then the program-stated
+    /// scales) down by its reservation (279,552 B on granite-3.1-2b), and the guard refused the
+    /// first rung whose gathering differed: the ceiling staged `t1412` at 603,392 while the
+    /// rung's own layout read it at 323,840. Called AFTER `place_step_inputs` and
+    /// `complete_program_scales`, a gathering body's index lands past every compared offset and
+    /// a non-gathering body simply has none — the exemption holds by construction, and every
+    /// gathering body of the session places its index at the SAME tail (their compared
+    /// placements agree, so their tails agree), which is the offset the host stages the table
+    /// at for all of them.
+    pub fn place_kv_block_index_last(&mut self) {
+        let Some(res) = self.kv_block_index.take() else {
+            return;
+        };
+        let seg = SegRole::Activation.segment();
+        let off = self.segment_bytes[seg];
+        let tid = crate::reserved_tids::KV_BLOCK_INDEX_TID;
+        self.placements.insert(
+            tid,
+            TensorPlacement {
+                tid,
+                bank: 0,
+                role: SegRole::Activation,
+                segment: seg,
+                offset: off,
+                size: res.bytes,
+                // ⭐ THE WRITE-COVER, FROM THE RESERVATION'S OWN PITCH — the mask's block
+                // stride, the one number both tensors derive from. A bind is a whole number
+                // of these blocks: the host stages the live passes' entries, one block per
+                // live page, and a partial block is a truncated pass row.
+                cover: BindCover::FoldBlocks {
+                    block_bytes: res.block_bytes,
+                },
+            },
+        );
+        self.segment_bytes[seg] = align128(off + res.bytes);
+    }
+
+    /// ⭐⭐⭐ THE REP TABLE'S ONE PLACEMENT DOOR — the last host-staged activation after the KV
+    /// block index.
+    ///
+    /// ⛔ WHY A DOOR, AND WHY AFTER `place_kv_block_index_last`. The rep slot
+    /// (`attn_step_slots::REP`) is the ONE step input whose presence differs between a
+    /// session's bodies: a batched decode row states it (the request-major → head-major row
+    /// bridge), while the paged-fold body and every one-request or prefill row state no rep at
+    /// all — and the host binds each step at the CEILING's placements, so
+    /// `ladder_stages_one_layout` exempts the rep from its comparison (per layout, through the
+    /// layout's own step-input rows). That exemption is sound ONLY if the rep's presence moves
+    /// nothing the guard compares. Placed inline where the other step inputs take their
+    /// offsets, it pushed every LATER host-staged tensor (the program-stated scales) down by
+    /// its extent (4,096 B on granite-3.1-2b at 32 requests), and the guard refused the fold
+    /// body — the rung that lawfully mints no rep. Called AFTER
+    /// [`Self::place_kv_block_index_last`], a batched body's rep lands past every compared
+    /// offset and a body that states none simply has none — the exemption holds by
+    /// construction, and every batched body of the session places its rep at the SAME tail
+    /// (their compared placements agree, so their tails agree), which is the offset the host
+    /// stages the table at for all of them.
+    ///
+    /// The identity row arrives HERE, with the placement, never at the deferral: a placement
+    /// without it is invisible to `resolve_seg_base`, and a row without a placement resolves to
+    /// nothing — the two halves of one address mint together or not at all.
+    pub fn place_rep_table_last(&mut self) {
+        let Some(res) = self.rep_table.take() else {
+            return;
+        };
+        let seg = SegRole::Activation.segment();
+        let off = self.segment_bytes[seg];
+        self.placements.insert(
+            res.tid,
+            TensorPlacement {
+                tid: res.tid,
+                bank: 0,
+                role: SegRole::Activation,
+                segment: seg,
+                offset: off,
+                size: res.bytes,
+                // ⭐ FULL — a spliced step input is filled through `fill_step_input`, whose
+                // extent law is `==` exactly; the same cover `place_step_inputs` mints for
+                // every slot it places inline.
+                cover: BindCover::Full,
+            },
+        );
+        self.ids.borrow_mut().insert(
+            crate::place::act_name(res.tid),
+            crate::place::PlaceId::Act(res.tid),
+        );
+        self.segment_bytes[seg] = align128(off + res.bytes);
+    }
+}
+
+/// ⭐⭐⭐ LAW (b)'s ONE PURE STATEMENT — a gathered source's window rows at a sweep, a placement
+/// footprint, and the reach the table declared (its entry ceiling; `None` = no reach). For a
+/// gathered source the addressable set is the index's IMAGE over the source's rows — `addr =
+/// idx·skip_addr + base`, one row per entry — so the bytes an op can touch are rows the INDEX
+/// names, never the swept rectangle. The law, in two halves:
+///
+/// * **A SWEEP THAT FITS KEEPS ITS WINDOW** — `swept·row_bytes ≤ fp` ⇒ `window == swept`, no
+///   reach needed. Every existing gather form (the embedding's card-proven emission, every pool
+///   leg under its plane) lands here: byte-identical, no reach required.
+/// * **AN OVER-SWEEP REQUIRES A DECLARED REACH** — the placement alone cannot bound the values:
+///   for a source placed WHOLE the image ⊆ the placement, but for a SLICE of a pool the values
+///   address past the placement into the pool the layout cannot see, and `min(swept, fp)` would
+///   bound nothing they obey. So the over-sweep must carry the TYPED statement of its index
+///   values' bound — a [`GatherReach`](crate::sdsc_abstract::GatherReach), whose unit the door
+///   has already checked against the read's stride — and the family is then read from the
+///   placement: `fp ≥ ceiling·row_bytes` (the placement holds the WHOLE reach) is a SOURCE
+///   EXTENT, `window = min(swept, ceiling)`; a placement holding less is a POOL SLICE the
+///   runtime re-bases, `window = 1` entry's direct coverage. NO reach ⇒ `None`: fail-closed,
+///   the refusal `gathered_source_rows` words.
+///
+/// * **SAFETY** — `window·row_bytes ≤ fp` always: the fitting half is the sweep itself; the
+///   source-extent min is at most the ceiling, and `ceiling·row_bytes ≤ fp` is that family's
+///   own condition; the pool's one entry is at most `fp` because `fp ≥ row_bytes` is a
+///   precondition. The guard's purpose (no aliasing past the placement) is preserved by
+///   construction.
+/// * **MONOTONE** — `window ≤ swept` always: the reach-bounded window never exceeds the swept
+///   window. The law only ever shrinks a handle, the same shape as the residency fix.
+/// * **BYTE-IDENTITY** — where the sweep fits, `window == swept` exactly.
+/// * **TABLE-VALUE CORRECTNESS IS NOT THIS LAW'S** — whether the staged values name in-range
+///   rows is the staging family's own law at birth (the reach's ceiling is enforced where the
+///   values are BORN), not a fact a window over the placement could check.
+/// * **THE FAMILY FORK IS SOUNDNESS-BASED, NOT PROVENANCE-BASED** — `fp ≥
+///   ceiling·row_bytes ⇒ source extent` is safe WHATEVER family minted the reach: a placement
+///   that holds the whole reach cannot be exceeded by the source-extent window (`min(swept,
+///   ceiling)` rows of in-range values, `ceiling·row_bytes ≤ fp` by the fork's own
+///   condition), and the one-entry pool window fires only where the placement does NOT hold
+///   the reach — which is exactly where the pool's own machinery (the runtime re-base, the
+///   birth-door ceiling) governs what the values address. The fork reads WHICH BOUND THE
+///   PLACEMENT CAN CERTIFY, never which producer minted the reach; nobody should read it as a
+///   family recognizer.
+///
+/// The proof series pins the properties above (see `proofs` below).
+pub(crate) fn gathered_window_rows(
+    swept: u32,
+    fp: u64,
+    row_bytes: u64,
+    reach_ceiling: Option<u64>,
+) -> Option<u32> {
+    if row_bytes == 0 || fp < row_bytes {
+        // No whole row of this width to name — the index has no row it could legally address.
+        return None;
+    }
+    if u64::from(swept)
+        .checked_mul(row_bytes)
+        .is_some_and(|b| b <= fp)
+    {
+        // The sweep fits: byte-identical, no reach needed.
+        return Some(swept);
+    }
+    // The over-sweep: fail-closed without a declared reach.
+    let ceiling = reach_ceiling?;
+    // The reach's own extent at the read's stride — `ceiling · entry_elems · word`, the unit
+    // check having equated the read's row with the reach's entry. Overflow is a refusal: a
+    // reach whose extent does not fit u64 bounds nothing.
+    let coverage = ceiling.checked_mul(row_bytes)?;
+    if fp >= coverage {
+        // SOURCE EXTENT — the placement holds the whole reach; the values name its rows.
+        Some(swept.min(u32::try_from(ceiling).unwrap_or(swept)))
+    } else {
+        // POOL SLICE — the runtime re-bases; the direct window is one entry's coverage.
+        Some(1)
+    }
+}
+
+#[cfg(kani)]
+mod proofs {
+    use super::{Df, gathered_window_rows};
+
+    /// LAW (b), pinned at the compiler's own vocabulary. The grind diagnosis first: this
+    /// harness's first draft gave `row_bytes`, `swept`, `ceiling` and `fp` to z3 as FREE u64s,
+    /// and every product in the law and the harness (`swept × row_bytes`, `ceiling ×
+    /// row_bytes`, `window × row_bytes`) had TWO symbolic sides — nonlinear bitvector
+    /// arithmetic no solver converges on (8 CPU-hours, no verdict; the standing 15-minute
+    /// no-verdict rule exists because of it). The fix is TYPING, not narrowing: `row_bytes`
+    /// is one of `Df::word_length`'s values ({1, 2, 4} — fp8/int8 are 1-byte, fp16/bf16 are
+    /// 2-byte, fp32/uint32 are 4-byte; there is no fifth word length), so every product has
+    /// one CONCRETE side — a multiply by 1, 2 or 4, a shift. `swept`, `ceiling` and `fp` are
+    /// u32, the walk's own row-count and placement-footprint types; a gathered source's
+    /// placement is a pool activation (tile-sized — the real gathered tables are
+    /// hundreds of KiB), far under the 4 GiB the type bounds, and the 16 GiB weight regions
+    /// are not gathered sources. At this vocabulary the u64 headroom the general signature
+    /// keeps for the overflow refusals is unreachable (ceiling ≤ u32::MAX, row_bytes ≤ 4),
+    /// and the law is proved over exactly the values the placement code can hand it.
+    #[kani::proof]
+    fn gathered_source_window_never_exceeds_its_placement() {
+        let df: u8 = kani::any();
+        kani::assume(df < 3);
+        let row_bytes: u64 = match df {
+            0 => u64::from(Df::Fp8.word_length()),
+            1 => u64::from(Df::Fp16.word_length()),
+            _ => u64::from(Df::Fp32.word_length()),
+        };
+        let swept: u32 = kani::any();
+        kani::assume(swept >= 1);
+        let fp = u64::from(kani::any::<u32>());
+        let has_reach: bool = kani::any();
+        let ceiling = u64::from(kani::any::<u32>());
+        let reach = has_reach.then_some(ceiling);
+        let fits = u64::from(swept)
+            .checked_mul(row_bytes)
+            .is_some_and(|b| b <= fp);
+        let Some(w) = gathered_window_rows(swept, fp, row_bytes, reach) else {
+            // The only refusals: no whole row of this width, an over-sweep with no reach, or a
+            // reach whose own extent overflows — each names a fact, none is a silent admit.
+            if fp >= row_bytes && fits {
+                assert!(false, "a fitting sweep never refuses");
+            }
+            if fp >= row_bytes && !fits && reach.is_some() {
+                assert!(
+                    ceiling.checked_mul(row_bytes).is_none(),
+                    "an over-sweep with a reach refuses only when the reach's extent overflows"
+                );
+            }
+            return;
+        };
+        // SAFETY — the window, at the row width, stays inside the footprint.
+        assert!(u64::from(w) * row_bytes <= fp);
+        // BYTE-IDENTITY — a sweep that fits its placement keeps its window exactly.
+        if fits {
+            assert!(w == swept);
+        }
+        // MONOTONE — the reach-bounded window never exceeds the swept window.
+        assert!(w <= swept);
+        // FAIL-CLOSED — an over-sweep admits only under a declared reach.
+        if !fits {
+            assert!(reach.is_some(), "an over-sweep with no reach must refuse");
         }
     }
 }

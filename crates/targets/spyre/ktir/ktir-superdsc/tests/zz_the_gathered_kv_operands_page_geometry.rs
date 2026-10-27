@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-//! ⭐⭐⭐⭐⭐ THE PAGE GEOMETRY OF THE KV OPERAND A GATHER WOULD READ — measured off the SHIPPED
-//! attention emission, because every previous answer here came from reading a declaration instead of
-//! evaluating one.
+//! ⭐⭐⭐⭐⭐ THE PAGE GEOMETRY OF THE KV OPERAND A GATHER WOULD READ — measured off the gather-copy
+//! op the live path emits, because every previous answer here came from reading a declaration
+//! instead of evaluating one. (The three measurements that needed the deleted hand-written
+//! attention emitter — the ungathered score kernel's baseline capacity, its 2-D walk, and the
+//! capacity's rung sweep — went with it; when a live mint can state them again, re-pin them from it.)
 //!
 //! ## The question this settles
 //! dxp computes `addr = idx * skip_addr + base`, and derives `skip_addr` itself from the value
@@ -24,17 +26,11 @@
 //! never asked for.
 
 use ktir_superdsc::emit as superdsc;
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
-use ktir_superdsc::sdsc_abstract::{AttnGeometry, PagedKvPool, attn_bundle_rows};
+use ktir_superdsc::sdsc_abstract::PagedKvPool;
 use ktir_superdsc::superdsc_opspec::{GatherIndex, KernelAxis, PageExtent, SdscFoldSet};
 
-const NQH: u32 = 32;
 const NKVH: u32 = 8;
 const HD: u32 = 64;
-/// ONE PAGE. The mask blocks by the page, so a fold pass may not sweep more than one — assembling with
-/// a wider `active_cap` is refused at build, which is the guard that caught the first draft of this file.
-const CAP: u32 = PagedKvPool::PAGE_SLOTS as u32;
-const ACTIVE_CAP: u32 = PagedKvPool::PAGE_SLOTS as u32;
 // ⛔ `SCORE_WINDOW` IS GONE — it was the KV columns one op sweeps (one page), and it sized the copy
 // harness's `mb` as `HD * SCORE_WINDOW / POOL_STICK`. A gather copy's width is no longer a sweep: it is
 // ONE INDEX STICK of entries (`CopyDims::ENTRIES_PER_OP`), because that is all dxp loads. The harness
@@ -124,58 +120,16 @@ fn capacity_of(v: &serde_json::Value, arg: usize) -> (String, Capacity) {
     (name, Capacity { dims })
 }
 
-/// The group-0 PREFIX score op — the one op whose kernel is the resident Kᵗ pool, i.e. the operand a
-/// gather reads through. Not the new-token block's (`attn_nsc_*`), whose kernel is this step's own
-/// freshly transposed keys and has no page table.
-fn prefix_score_op(rung: u32, kv_block_index: Option<&str>) -> serde_json::Value {
-    let geom = AttnGeometry::<NQH, NKVH, HD>::minted();
-    let rows = attn_bundle_rows(geom, rung, true).expect("a baked rung");
-    let mut sym = 0i64;
-    assemble_attn(
-        0,
-        geom,
-        rows,
-        CAP,
-        ACTIVE_CAP,
-        "t_qs",
-        "t_new_k",
-        "t_new_v",
-        "t_kct",
-        "t_vc",
-        "t_pmask",
-        "t_cmask",
-        kv_block_index,
-        None,
-        ktir_superdsc::place::PlaceId::Act(900),
-        true,
-        false,
-        &mut sym,
-        None,
-    )
-    .expect("attention emits")
-    .into_iter()
-    .map(|e| serde_json::to_value(&e.op).expect("serializes"))
-    .find(|v| {
-        v["dscs_"][0]
-            .as_object()
-            .and_then(|m| m.keys().next().cloned())
-            .is_some_and(|k| k.contains("sc_g0") && !k.contains("nsc"))
-    })
-    .expect("the group-0 prefix score op")
-}
-
 /// ⭐⭐⭐⭐⭐ THE REAL ATTENTION BUNDLE CONTAINS A GATHER — the claim every earlier commit here made
 /// about a synthetic op instead, and the one that has to hold before any of the stride arithmetic
 /// below means anything.
 ///
-/// Asserted on the DESCRIPTOR, not on the call site: `assemble_attn` taking an index name proves
+/// Asserted on the DESCRIPTOR, not on the call site: a builder taking an index name proves
 /// nothing about what reached the JSON, and "a port with no caller is dead code" applies just as well
 /// to a declaration no node carries.
 /// ⛔ RETARGETED: the SHIPPED score op no longer declares a gather — it CANNOT, because it is a matmul
 /// and deeptools refuses to schedule a gather on an op with a KERNEL (measured as a bake refusal on the
-/// card at both index `memOrg_` values; `emit_sdsc` now refuses it at build time, and
-/// `zz_diff_the_rung_descriptors::asking_the_shipped_prefix_fold_for_a_gather_is_refused_naming_the_kernel`
-/// pins that at the real call path). The property this test exists for — a DECLARATION must reach a
+/// card at both index `memOrg_` values; `emit_sdsc` now refuses it at build time). The property this test exists for — a DECLARATION must reach a
 /// descriptor NODE, because "a port with no caller is dead code" applies to declarations too — is
 /// unchanged and is now asserted on the op that ships the gather.
 #[test]
@@ -287,37 +241,13 @@ fn the_gather_does_not_displace_the_output() {
     );
 }
 
-/// ⛔ THE BASELINE, AND THE TRAP THAT PRODUCED THE "4096" FIGURE. This is the score kernel with NO
-/// gather attached: every dim `-1`, so the capacity is the plain per-core product. It is recorded as a
-/// baseline precisely so that the gathered number below can be compared against it — reading THIS and
-/// calling it the gather's stride is the mistake c6a1f331d shipped.
-#[test]
-fn the_ungathered_capacity_is_the_whole_per_core_product() {
-    let op = prefix_score_op(8, None);
-    let (name, cap) = capacity_of(&op, 1);
-    let ungathered = cap.skip_addr();
-    println!(
-        "{name}: UNGATHERED kernel {} => {ungathered}",
-        cap.describe()
-    );
-    assert!(
-        cap.dims.iter().all(|(_, _, pin)| *pin < 0),
-        "an op with no gather must declare no pin — a pin is what makes a dim paged"
-    );
-    let product: i64 = cap.dims.iter().map(|(_, e, _)| e).product();
-    assert_eq!(
-        ungathered, product,
-        "with nothing pinned the capacity is just the per-core product — NOT the gather's skip_addr"
-    );
-}
-
 /// A matmul at the PREFIX SCORE LEG'S OWN EXTENTS, gathered on a CHOSEN axis and page.
 ///
 /// ⭐ USED ONLY FOR THE FOUR-ROW COMPARISON TABLE, where the point is to vary the declaration —
-/// `assemble_attn` offers exactly one (`GatherIndex::of_pool_blocks`), which is the whole reason it is
-/// a named door. The shipped declaration is measured off the REAL emission by
+/// the pool-block door (`GatherIndex::of_pool_blocks`) is a named door, which is the whole reason it is
+/// one. The shipped declaration is measured off the REAL emission by
 /// `the_gathered_kv_operand_capacity_divides_the_pool_block`; this stand-in exists so the other three
-/// rows, which the emitter cannot be asked for, are still measured rather than reasoned about.
+/// rows, which no shipped path mints, are still measured rather than reasoned about.
 /// ⛔ ON THE **KERNEL-LESS GATHER-COPY OP**, at the same extents. This built a matmul, which `emit_sdsc`
 /// now refuses: deeptools cannot schedule a gather on an op with a KERNEL (`hasDimensionReuse` ->
 /// the arithmetic-intensity explorer -> an LX allocate node an index never gets; MEASURED as a bake
@@ -367,7 +297,7 @@ fn gathered_score_shaped_op(axis: KernelAxis, page: PageExtent) -> serde_json::V
     )
     .expect("the gather-copy op builds at the score leg's extents");
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    let e = superdsc::emit_sdsc("score_gathered", &op, &folds, None).expect("emits");
+    let (e, _) = superdsc::emit_sdsc("score_gathered", &op, &folds, None).expect("emits");
     serde_json::to_value(&e).expect("serializes")
 }
 
@@ -403,7 +333,7 @@ fn ungathered_score_shaped_op() -> serde_json::Value {
     op.args.remove(idx);
     op.indirect = None;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    let e = superdsc::emit_sdsc("score_ungathered", &op, &folds, None).expect("emits");
+    let (e, _) = superdsc::emit_sdsc("score_ungathered", &op, &folds, None).expect("emits");
     serde_json::to_value(&e).expect("serializes")
 }
 
@@ -417,9 +347,9 @@ fn ungathered_score_shaped_op() -> serde_json::Value {
 /// multiplier is computed from it.
 #[test]
 fn the_gathered_kv_operand_capacity_divides_the_pool_block() {
-    // ⭐ THE REAL ATTENTION EMISSION, GATHERED. `assemble_attn` takes the index tensor's name and
-    // declares `GatherIndex::of_pool_blocks` on the prefix score leg's Kᵗ operand, so what is measured
-    // here is the descriptor the card would receive — not a matmul shaped to resemble it.
+    // ⭐ THE LIVE GATHER DECLARATION. The index tensor's name is declared through the scratch-rows
+    // door (`GatherIndex::of_scratch_rows`, the door the KV gather's host staging reads), so what is
+    // measured here is the descriptor the card would receive — not a matmul shaped to resemble it.
     // ⛔ ON THE KERNEL-LESS COPY OP, at the score leg's own extents, and at OPERAND 0. The shipped score
     // matmul cannot carry a gather (see `the_real_prefix_score_op_declares_the_gather`), and the operand
     // order here is `[source, index, destination]` — the gathered VALUE is 0, where 1 would measure the
@@ -448,7 +378,7 @@ fn the_gathered_kv_operand_capacity_divides_the_pool_block() {
     // base EXACTLY: `addr = idx*skip + base`, block `B` sits at `4096*B`, so `skip` must divide 4096.
     // Anything else and no integer index reaches a block boundary — every step lands inside a block,
     // which is a clean bake reading a fraction of another row's keys.
-    let block = PagedKvPool::new(NKVH as usize, HD as usize).stick_block_elems() as i64;
+    let block = PagedKvPool::new(NKVH, HD).stick_block_elems() as i64;
     assert_eq!(
         block, 4096,
         "the pool's uniform block, from the pool itself"
@@ -467,37 +397,6 @@ fn the_gathered_kv_operand_capacity_divides_the_pool_block() {
     );
 }
 
-/// ⛔ THE WALK IS RANK 2, WHICH IS WHY THERE IS NOTHING TO PAGE YET.
-///
-/// The index enumerates positions along the PINNED dim (the vendor's rank-3 value pins dim 0 to 1 and
-/// its index is rank 1 with one entry per position along it). The score kernel's walk is
-/// `["in","out"]` — a head-dim axis and a KV-slot axis — and NEITHER counts pages: `out` is one
-/// window's slots. So pinning either dim makes the index enumerate *within* one window, which is the
-/// contiguous read we already have, not a page table.
-///
-/// This is the structural finding that says what the next emission change must be, and it is asserted
-/// rather than written in a comment so that widening the operand to span pages BREAKS this test — the
-/// signal that the page axis now exists.
-#[test]
-fn the_score_kernels_walk_has_no_page_axis_today() {
-    let op = prefix_score_op(8, None);
-    let (_, cap) = capacity_of(&op, 1);
-    let names: Vec<&str> = cap.dims.iter().map(|(d, _, _)| d.as_str()).collect();
-    assert_eq!(
-        names,
-        vec!["in", "out"],
-        "the score kernel is a 2-D [feature, slot] operand; a page axis would be a THIRD dim"
-    );
-    // Every dim is one window's own extent, so the product is one window — not a multi-page span.
-    let block = PagedKvPool::new(NKVH as usize, HD as usize).stick_block_elems() as i64;
-    let window: i64 = cap.dims.iter().map(|(_, e, _)| e).product();
-    assert!(
-        window <= block,
-        "the operand spans {window} elems, at most one {block}-element block: it reaches ONE block, \
-         which is why the fold has to re-launch per page"
-    );
-}
-
 /// ⭐⭐⭐ THE POOL IS A UNIFORM ARRAY OF STICK BLOCKS — the fact that makes ONE integer index able to
 /// name any cell, and the reason `skip_addr` only has to DIVIDE the block rather than equal a page.
 ///
@@ -506,7 +405,7 @@ fn the_score_kernels_walk_has_no_page_axis_today() {
 /// being expressible and this fails at `cargo test` instead of on the card.
 #[test]
 fn the_pool_is_a_uniform_array_of_stick_blocks() {
-    let p = PagedKvPool::new(NKVH as usize, HD as usize);
+    let p = PagedKvPool::new(NKVH, HD);
     let block = p.stick_block_elems();
     assert!(block > 0, "a zero block makes every index step a no-op");
     // ⛔ THE ONE THAT HAS ALREADY BEEN CONFUSED FOR THE BLOCK: the distance to the next KV head is
@@ -542,7 +441,7 @@ fn the_pool_is_a_uniform_array_of_stick_blocks() {
 /// caller fills in: the row of this table that the KV pool's layout actually supports is the second.
 #[test]
 fn the_axis_and_page_together_decide_the_stride() {
-    let block = PagedKvPool::new(NKVH as usize, HD as usize).stick_block_elems() as i64;
+    let block = PagedKvPool::new(NKVH, HD).stick_block_elems() as i64;
     let mut table = Vec::new();
     // ⛔ `Batch` ("mb") REPLACES `Feature` ("in"): the harness is the KERNEL-less gather-copy op now,
     // whose dims are `[mb, out, y]`. `in` belongs to a matmul, which cannot carry a gather at all, and
@@ -590,22 +489,5 @@ fn the_axis_and_page_together_decide_the_stride() {
         block,
         "of_scratch_rows must make one index step exactly one pool block, or a host staging block \
          numbers addresses by the wrong factor"
-    );
-}
-
-/// ⭐ THE RUNG DOES NOT MOVE THE CAPACITY — so `skip_addr` is a property of the KV geometry, not of
-/// the batch width, and a wider rung cannot silently change the address stride under us.
-#[test]
-fn skip_addr_is_the_same_at_every_baked_rung() {
-    let mut seen: Vec<(u32, i64)> = Vec::new();
-    for rung in PagedKvPool::BATCH_RUNGS {
-        let (_, cap) = capacity_of(&prefix_score_op(rung, None), 1);
-        seen.push((rung, cap.skip_addr()));
-    }
-    println!("skip_addr per rung: {seen:?}");
-    let first = seen[0].1;
-    assert!(
-        seen.iter().all(|&(_, s)| s == first),
-        "skip_addr moves with the rung ({seen:?}) — then one index table cannot serve two widths"
     );
 }

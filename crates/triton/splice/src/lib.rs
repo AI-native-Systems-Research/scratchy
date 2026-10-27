@@ -284,14 +284,120 @@ pub fn lmlast_row() -> TritonKernelRow {
     }
 }
 
-/// THE ATTENTION FAMILY — one row, one kernel, every shape: `attn.py`'s own three
-/// constexpr-selected arms (the causal one-pass, decode, prefill continuation) are the
-/// builder's own three arms restated, so the row does not branch on shape at all.
-pub fn attn_row() -> TritonKernelRow {
+/// THE ATTENTION FAMILY — one row, one kernel: `batched_decode.py`'s own batched paged-decode
+/// kernel, the Spyre-native `batched_decode_hm`. The old attention row (the three
+/// constexpr-selected arms over the flat cache) is deleted, not left beside it; the prefill
+/// shapes it served are the prefill kernel's to serve.
+pub fn attn_decode_row() -> TritonKernelRow {
     TritonKernelRow::Spliced {
-        src: include_str!("../../../targets/spyre/kernels/attn.py"),
-        file: "attn.py",
-        entry: "attn_fwd",
+        src: include_str!("../../../targets/spyre/kernels/batched_decode.py"),
+        file: "batched_decode.py",
+        entry: "batched_decode_hm",
+        program: Program::Attn,
+    }
+}
+
+/// THE ATTENTION FAMILY'S PREFILL ROW — `batched_prefill.py`'s own chunked-prefill kernel,
+/// the Spyre-native `batched_prefill_hm`: the token-row shapes (the prompt chunk and its
+/// continuations), torch's `page_attn_head_major_prefill` algorithm over the same pool and
+/// id-stick laws as the decode row.
+pub fn attn_prefill_row() -> TritonKernelRow {
+    TritonKernelRow::Spliced {
+        src: include_str!("../../../targets/spyre/kernels/batched_prefill.py"),
+        file: "batched_prefill.py",
+        entry: "batched_prefill_hm",
+        program: Program::Attn,
+    }
+}
+
+/// THE PAGED-FOLD FAMILY'S SEED ROW — `paged_fold.py`'s `paged_fold_seed_hm`: the once-per-step
+/// program that writes the fold carry's seed values (max at the finite −65504 sentinel, sum and
+/// accumulator at zero). The per-page body of a chunked ladder's `(FULL, no-chunk)` rung lowers
+/// as this THREE-PROGRAM family; see [`lower_attn`] for the family's contract.
+pub fn paged_fold_seed_row() -> TritonKernelRow {
+    TritonKernelRow::Spliced {
+        src: include_str!("../../../targets/spyre/kernels/paged_fold.py"),
+        file: "paged_fold.py",
+        entry: "paged_fold_seed_hm",
+        program: Program::Attn,
+    }
+}
+
+/// THE PAGED-FOLD FAMILY'S BODY ROW — `paged_fold.py`'s `paged_fold_hm`: ONE page of the walk,
+/// folded into the carried online-softmax state. Repeating this launch IS the loop; the runtime
+/// re-launches it once per resident page, shifting the activation segment's base one page's
+/// worth of bytes per pass (the tables and mask are page-major over the region).
+pub fn paged_fold_row() -> TritonKernelRow {
+    TritonKernelRow::Spliced {
+        src: include_str!("../../../targets/spyre/kernels/paged_fold.py"),
+        file: "paged_fold.py",
+        entry: "paged_fold_hm",
+        program: Program::Attn,
+    }
+}
+
+/// THE PAGED-FOLD FAMILY'S FINALIZE ROW — `paged_fold.py`'s `paged_fold_finalize_hm`: the one
+/// normalize (`out = acc / l`), once, after the last pass.
+pub fn paged_fold_finalize_row() -> TritonKernelRow {
+    TritonKernelRow::Spliced {
+        src: include_str!("../../../targets/spyre/kernels/paged_fold.py"),
+        file: "paged_fold.py",
+        entry: "paged_fold_finalize_hm",
+        program: Program::Attn,
+    }
+}
+
+/// THE HEAD RELAYOUT'S TWO ROWS — `head_relayout.py`'s `to_head_rows_fwd` (the token stream's
+/// q into the attention kernels' per-head row frame) and `from_head_rows_fwd` (the attention
+/// output back). Spliced around an attention program exactly where the two frames are different
+/// bytes: a multi-slab head dim (see [`HeadRelayout`]).
+fn head_relayout_row(entry: &'static str) -> TritonKernelRow {
+    TritonKernelRow::Spliced {
+        src: include_str!("../../../targets/spyre/kernels/head_relayout.py"),
+        file: "head_relayout.py",
+        entry,
+        program: Program::BlockCopy,
+    }
+}
+
+/// THE BATCHED PAGED-FOLD FAMILY'S SEED ROW — `paged_fold_batched.py`'s
+/// `paged_fold_batched_seed_hm`: the batched twin of [`paged_fold_seed_row`], seeding the carry
+/// at the batched stick's own frames (`[PG, 1]` max/sum, `[PG, HD]` accumulator). The per-page
+/// body of a BATCHED decode ladder's `(FULL, no-chunk)` rung lowers as this three-program
+/// family — every request row's pages folded by ONE launch per page-ordinal, no fallback to the
+/// solo rungs.
+pub fn paged_fold_batched_seed_row() -> TritonKernelRow {
+    TritonKernelRow::Spliced {
+        src: include_str!("../../../targets/spyre/kernels/paged_fold_batched.py"),
+        file: "paged_fold_batched.py",
+        entry: "paged_fold_batched_seed_hm",
+        program: Program::Attn,
+    }
+}
+
+/// THE BATCHED PAGED-FOLD FAMILY'S BODY ROW — `paged_fold_batched.py`'s
+/// `paged_fold_batched_hm`: ONE page-ordinal of the batched walk, folded into the carried
+/// online-softmax state at every request row at once. Repeating this launch IS the loop; the
+/// runtime re-launches it once per resident page-ordinal, shifting the activation segment's
+/// base one page block per pass (the tables and mask are page-major over the region at the
+/// batched pitch).
+pub fn paged_fold_batched_row() -> TritonKernelRow {
+    TritonKernelRow::Spliced {
+        src: include_str!("../../../targets/spyre/kernels/paged_fold_batched.py"),
+        file: "paged_fold_batched.py",
+        entry: "paged_fold_batched_hm",
+        program: Program::Attn,
+    }
+}
+
+/// THE BATCHED PAGED-FOLD FAMILY'S FINALIZE ROW — `paged_fold_batched.py`'s
+/// `paged_fold_batched_finalize_hm`: the one normalize (`out = acc / l`), once, after the last
+/// pass — the identity merge, no J-tail.
+pub fn paged_fold_batched_finalize_row() -> TritonKernelRow {
+    TritonKernelRow::Spliced {
+        src: include_str!("../../../targets/spyre/kernels/paged_fold_batched.py"),
+        file: "paged_fold_batched.py",
+        entry: "paged_fold_batched_finalize_hm",
         program: Program::Attn,
     }
 }
@@ -317,24 +423,31 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
             entry: "scalarmul_fwd",
             program: Program::ScalarMul,
         },
-        // `RopeAppend` carries 6 inputs but only the first three are the rotation (V
-        // and the KV-cache destinations flow through GRAPH edges — the builder's own
-        // `lower_rope_node` reads `inputs[0..3]`), so the kernel consumes x/cos/sin/out
-        // and the row covers BOTH `RopeAppend` and the standalone `RopeRotate`.
-        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => TritonKernelRow::Spliced {
+        // ⭐ THE TWO ROPE FORMS ARE TWO CONTRACTS, told apart by the SubOp — never by sniffing a
+        // chain. `RopeRotate` is the q stream's rotation (arity 3, no cache); `RopeAppend` is the
+        // front end's arity-6 `[K, cos, sin, V, K_cache, V_cache]` whose WRITE HALF rides the
+        // door's recipe — its own kernel (the never-walked contract statement), its own
+        // `Program`, and its own lowering entry ([`lower_rope_append`]), because one node
+        // lowers to TWO programs (the rotation plus the carrier).
+        SubOp::RopeRotate { .. } => TritonKernelRow::Spliced {
             src: include_str!("../../../targets/spyre/kernels/rope.py"),
             file: "rope.py",
             entry: "rope_fwd",
             program: Program::Rope,
         },
-        // ATTENTION SPLICES — `lower_attn` is the entry: the kernel states the same
-        // three arms as constexpr-selected cases, and the door (`attn_operands`) reads
-        // every fact — the q/out views, the swept rung, the scale — off the program
+        SubOp::RopeAppend { .. } => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/rope.py"),
+            file: "rope.py",
+            entry: "rope_append_fwd",
+            program: Program::RopeAppend,
+        },
+        // ATTENTION SPLICES — `lower_attn` is the entry: the batched paged-decode kernel
+        // states its whole contract as constexprs off the SubOp's own fields, and the door
+        // reads every fact — the q/out views, the pool planes, the scale — off the program
         // itself. This row exists so `row()` stays exhaustive; the walk never routes
-        // attention through `lower_one` (attention needs door-order bindings, the mask
-        // binding, and the dead-prefix view injection that no pure-Triton program can
-        // state).
-        SubOp::AttnDecode { .. } => attn_row(),
+        // attention through `lower_one` (attention needs door-order bindings and the
+        // synthetic id-table and mask bindings that no pure-Triton program can state).
+        SubOp::AttnDecode { .. } => attn_decode_row(),
         // ⛔ THE MoE SUB-OPS ARE NOT SPLICED KINDS ANY MORE — the MoE lowers
         // only from `kernels/moe.py` through KTIR, and
         // `lower_subtile_tape_to_ktir` refuses every MoE SubOp before the
@@ -462,13 +575,28 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// stayed fp16-clean. A width COLLISION is not an identity: only the tail's own
 /// rows are dead, and only the result's ancestors are the tail. The walk is
 /// [`tensor_feeds_result_through_row_local_ops`] (main's own law).
+///
+/// ⭐ THE WIDTH CONJUNCT READS THE OUTPUT **TENSOR'S** COLS, NOT THE REGION'S.
+/// The front end column-chunks every elementwise op (`n_blocks(out_cols, nb)`,
+/// subtile_ir.rs) — granite's 49155-wide logits ScalarMul arrives here as SEVEN
+/// chunk nodes (six of 8192 + one of 3) — so a region-keyed test sees each
+/// chunk's 8192 against the result's 49155 and the fold's elementwise arms
+/// (ScalarMul, TanhSoftCap) never fire, while the MatmulTile above them IS
+/// whole-width and folds: the tail's own scale then reads mq rows of which
+/// mq−1 were never written (the read-before-write walk's first true positive,
+/// prefill leg 55). Keying on the TENSOR's width makes a chunk fold iff its
+/// tensor would fold as a whole node — the chunking stops changing the fold's
+/// decision. For a whole-region node the two readings agree (the region IS the
+/// tensor), so the MatmulTile arm and the gemma-4 collision refusal (still
+/// rejected by the dataflow conjunct — a width collision is not an identity)
+/// are unchanged.
 pub fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
 ) -> bool {
     let result_cols = ir.tensors[ir.result.index()].cols;
-    node.output.region.cols.len == result_cols
+    ir.tensors[node.output.tensor.index()].cols == result_cols
         && node.output.region.rows.len > 1
         && !rows_are_requests
         && tensor_feeds_result_through_row_local_ops(ir, node.output.tensor)
@@ -501,7 +629,30 @@ pub fn lower_all<F: scratchy_subtile::subtile_ir::RopeForm>(
             return Ok(Vec::new());
         }
         if let Some(sandwich) = sandwich_at_split(node, ir) {
-            return lower_sandwich_node(&sandwich);
+            // ⭐ THE FUSED FORM COMPILES AT THE MODEL'S OWN CONST HEAD DIM: the emit site
+            // crosses the config-declared head-dim door — the ONLY crossing, the same
+            // door every head-width reader crosses — so the mint's `D`/`HEADS`/`INV_D`
+            // bind the const generic, never the node's value. The sandwich fuses or not
+            // by the graph's own structure alone; `None` is a head width no config in
+            // this workspace declares, refused loudly here — the fix is the
+            // `config.json` that names this model, never an edit to the door.
+            return match scratchy_subtile::model_geometry::with_config_head_dim(
+                scratchy_subtile::model_geometry::HeadDim::new(sandwich.head_dim),
+                SandwichAtTheDoor {
+                    sandwich: &sandwich,
+                },
+            ) {
+                Some(out) => out,
+                None => Err(format!(
+                    "triton splice: rmsnorm_s{} (head-norm sandwich) states head dim {} — \
+                     no config declares that head width ({}); the model's head dims are const \
+                     generics crossed at this door, so the fix is the config that names this \
+                     model, never an edit here",
+                    sandwich.split.id.index(),
+                    sandwich.head_dim,
+                    scratchy_subtile::model_geometry::geometry_sources(),
+                )),
+            };
         }
     }
     if matches!(&node.op, SubOp::RmsNorm { .. } | SubOp::RmsNormUnit { .. })
@@ -568,6 +719,270 @@ fn node_at_one_row<F: scratchy_subtile::subtile_ir::RopeForm>(
     }
 }
 
+/// ⭐⭐⭐ THE APPEND LOWERING — `RopeAppend`'s own entry, because one node lowers to TWO
+/// PROGRAMS (the wall-22 ruling: two card-proven mechanisms, both main's, wired through
+/// the door's own arms):
+///
+/// 1. THE ROTATION — `rope.py`'s `rope_fwd` minted as [`Program::Rope`], exactly the
+///    `RopeRotate` row's own op: the door's `fn rope` lowers it through `rope_at` (the
+///    P-table matmul), so no kernel body ever runs and the sub-stick rotation tiles that
+///    wall 22 refused are never walked. The rotation writes the node's output — the
+///    rotated K, PLAIN (the fp8 k_proj's scale fold is refused, so the pool readers own
+///    the scale).
+/// 2. THE CARRIER — `rope.py`'s `rope_append_fwd` minted as [`Program::RopeAppend`], the
+///    arity-6 contract statement `[K, cos, sin, V, K_cache, V_cache]`. Its body is NEVER
+///    WALKED (rope_fwd's own precedent): the door's `Program::RopeAppend` arm lowers the
+///    node's write contract through `kv_cache_write` — main's recipe, re-homed from the
+///    deleted attention door to the rope arm — which self-stamps every op it mints (the paged latch's
+///    own source). The carrier carries NO stamps and states its node's output tensor on
+///    [`KtirNode::node_out_tid`] (the two-halves law: the rotation writes it, the carrier
+///    names it).
+///
+/// Program order is the ruling's own: rotate (the P-matmul) → write (the copies + stamps
+/// + the Kᵀ tail) → the attention gather that reads the pool.
+///
+/// ⛔ THE RECIPE CALL LIVES IN THE WALK, NEVER HERE — the splice mints TYPED programs and
+/// states their bindings; lowering a node's contract through a recipe is the door's own
+/// class of work (the same class as `fn rope` itself), and a splice that minted door ops
+/// from a registry row would be the chain-recognizer shape the wall-21 ruling rejected.
+pub fn lower_rope_append<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+) -> Result<Vec<EmittedOp>, String> {
+    let SubOp::RopeAppend { head_dim, .. } = &node.op else {
+        return Err(
+            "triton splice: lower_rope_append called on a node that is not a RopeAppend"
+                .to_string(),
+        );
+    };
+    // ⭐ THE HEAD DIM IS A CONST: the append's head width crosses the config-declared
+    // head-dim door — the same door the rotation's own spec crosses — and the const body
+    // binds every head-width fact (`HEAD_DIM`/`HALF`, the head count) off the const
+    // generic it hands down. `None` is a head width no config declares: refused loudly,
+    // naming the configs read; the fix is the `config.json` that names this model, never
+    // an edit here.
+    match scratchy_subtile::model_geometry::with_config_head_dim(
+        *head_dim,
+        RopeAppendAtTheDoor { node, ir },
+    ) {
+        Some(out) => out,
+        None => Err(format!(
+            "triton splice: rope_append t{} states head dim {} — no config declares that \
+             head width ({}); the model's head dims are const generics crossed at this \
+             door, so the fix is the config that names this model, never an edit here",
+            node.output.tensor.index(),
+            head_dim.get(),
+            scratchy_subtile::model_geometry::geometry_sources(),
+        )),
+    }
+}
+
+/// The consumer that carries [`lower_rope_append`]'s body across the head-dim door.
+struct RopeAppendAtTheDoor<'a, F: scratchy_subtile::subtile_ir::RopeForm> {
+    node: &'a SubtileNode<F>,
+    ir: &'a SubtileIR<F>,
+}
+
+impl<F: scratchy_subtile::subtile_ir::RopeForm> scratchy_subtile::model_geometry::OnHeadDim
+    for RopeAppendAtTheDoor<'_, F>
+{
+    type Out = Result<Vec<EmittedOp>, String>;
+
+    fn on_head_dim<const HD: u32>(self) -> Self::Out {
+        lower_rope_append_at::<F, HD>(self.node, self.ir)
+    }
+}
+
+/// The append lowering at a CONFIG-DECLARED head dim — the two-halves body the entry's
+/// doc header states, with every head-width fact read off the const generic.
+fn lower_rope_append_at<F: scratchy_subtile::subtile_ir::RopeForm, const HD: u32>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+) -> Result<Vec<EmittedOp>, String> {
+    let SubOp::RopeAppend { layout, .. } = &node.op else {
+        return Err(
+            "triton splice: lower_rope_append called on a node that is not a RopeAppend"
+                .to_string(),
+        );
+    };
+    // ⛔ THE CONTRACT IS THE ARITY AND THE LAYOUT WITNESS, stated once here: six inputs,
+    // and the cache pair the sealed `KvCacheLayout` names IS the pair the node carries as
+    // inputs[4]/[5] — the same tensors `AttnDecode`'s prefix reads, so a divergent pair is
+    // a malformed graph, not a lowering decision.
+    if node.inputs.len() != 6 {
+        return Err(format!(
+            "triton splice: rope_append t{} states {} operand(s) — the append contract is \
+             exactly [K, cos, sin, V, K_cache, V_cache]",
+            node.output.tensor.index(),
+            node.inputs.len()
+        ));
+    }
+    let t =
+        |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
+    let (kc_tid, vc_tid) = (layout.cache_tensor(), layout.v_cache_tensor());
+    for (bound, stated, role) in [
+        (kc_tid, node.inputs[4].tensor, "the K cache"),
+        (vc_tid, node.inputs[5].tensor, "the V cache"),
+    ] {
+        if bound != stated {
+            return Err(format!(
+                "triton splice: rope_append t{} binds {role} as t{} but the node's operand \
+                 is t{} — the KvCacheLayout's sealed pair and the graph edges diverged, which \
+                 is a malformed graph (the layout is the same witness AttnDecode reads)",
+                node.output.tensor.index(),
+                bound.index(),
+                stated.index()
+            ));
+        }
+    }
+    // The door's contract, stated from the node's own facts — the same derivation the
+    // `rope_fwd` spec makes: total = the output's declared width (`heads * hd`), and the
+    // builder's own refusal (`total` not a whole number of `hd`-wide heads) is mirrored.
+    let total = node.output.region.cols.len;
+    if HD == 0 || !total.is_multiple_of(HD) {
+        return Err(format!(
+            "triton splice: rope_append t{}: {total} cols is not a whole number of \
+             {HD}-wide heads",
+            node.output.tensor.index()
+        ));
+    }
+    let heads = total / HD;
+    // ⛔ THE WINDOWING LAW, the `rope_fwd` arm's own, minus the dead `out`: x, cos, sin
+    // and V share ONE row window, take WHOLE columns of `total`, and sit over tensors of
+    // ONE height (the head-replicated cos/sin reinterpretation is same-bytes only at that
+    // width). The rotation's own mint re-states the law OVER THE OUTPUT (`kernel_spec`'s
+    // `rope_fwd` arm checks all four regions), so a divergent out refuses there. The
+    // caches are bound by identity, not by window — the pool planes are the layout's own
+    // tensors.
+    let x = &node.inputs[0];
+    let window = (x.region.rows.start, x.region.rows.len);
+    let y_rows = ir.tensors[x.tensor.index()].rows;
+    for (tr, role) in [
+        (x, "the `x` view"),
+        (&node.inputs[1], "the `cos` view"),
+        (&node.inputs[2], "the `sin` view"),
+        (&node.inputs[3], "the `v` view"),
+    ] {
+        let t_rows = ir.tensors[tr.tensor.index()].rows;
+        let shared = (tr.region.rows.start, tr.region.rows.len) == window;
+        let cols_whole = tr.region.cols.start == 0 && tr.region.cols.len == total;
+        if !shared || !cols_whole || t_rows != y_rows {
+            return Err(format!(
+                "triton splice: rope_append t{}: {role} states rows [{}, {}] × cols [{}, \
+                 {}] of a [{t_rows}, {}] tensor, but `x` states rows [{}, {}] over a \
+                 [{y_rows}, {total}] one — an append's four stream regions must share ONE \
+                 row window and whole `total` columns over tensors of one height",
+                node.output.tensor.index(),
+                tr.region.rows.start,
+                tr.region.rows.len,
+                tr.region.cols.start,
+                tr.region.cols.len,
+                ir.tensors[tr.tensor.index()].cols,
+                window.0,
+                window.1,
+            ));
+        }
+    }
+    let src = match row(&node.op) {
+        TritonKernelRow::Spliced { src, .. } => src,
+        TritonKernelRow::Refused(why) => return Err(why.to_string()),
+    };
+
+    // ── HALF 1: THE ROTATION — `rope_fwd` minted as `Program::Rope`, the `RopeRotate`
+    // row's own op. Its spec is derived at the SAME const head dim the door handed this
+    // body ([`rope_spec_at`] — no second crossing, no second spelling), and the door's
+    // `fn rope` lowers the program through `rope_at` — the card-proven P-table matmul,
+    // no kernel body, no halves.
+    let spec = rope_spec_at::<F, HD>(node, ir)?;
+    let module = compile_kernel(src, &spec, &[1])?;
+    let rotation = mint(
+        node,
+        module,
+        &Program::Rope,
+        vec![
+            t(&node.inputs[0]),
+            t(&node.inputs[1]),
+            t(&node.inputs[2]),
+            t(&node.output),
+        ],
+    )?;
+    let mut e = EmittedOp::bare(format!("rope_s{}", node.id.index()));
+    e.ktir = Some(rotation);
+
+    // ── HALF 2: THE CARRIER — `rope_append_fwd`, the arity-6 contract statement. Its
+    // body is never walked (the door's `Program::RopeAppend` arm lowers the write through
+    // `kv_cache_write`), so its constexprs state the CONTRACT: the node's window and the
+    // pool's plane law, `SLOT_START = 0` because the runtime aims every slot (the
+    // recipe's `kv_part` / `slot_stride_bytes` stamps, never a baked corner).
+    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+    let mut constexprs: HashMap<String, Val> = HashMap::new();
+    for param in [
+        "desc_x", "desc_cos", "desc_sin", "desc_v", "desc_kc", "desc_vc",
+    ] {
+        signature.insert(
+            param.to_string(),
+            ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+        );
+    }
+    let mut ce = |k: &str, v: Val| -> Result<(), String> {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), v);
+        Ok(())
+    };
+    ce("H", Val::Int(i128::from(heads)))?;
+    ce("HEAD_DIM", Val::Int(i128::from(HD)))?;
+    ce("HALF", Val::Int(i128::from(HD / 2)))?;
+    ce("X_ROWS", Val::Int(i128::from(y_rows)))?;
+    ce("ROW_START", Val::Int(i128::from(window.0)))?;
+    ce("PART_ROWS", Val::Int(i128::from(window.1)))?;
+    ce("SLOT_START", Val::Int(0))?;
+    ce(
+        "PLANE_SLOTS",
+        Val::Int(ktir_superdsc::sdsc_abstract::PagedKvPool::PLANE_SLOTS as i128),
+    )?;
+    let spec = KernelSpec {
+        file: "rope.py".to_string(),
+        kernel: "rope_append_fwd".to_string(),
+        signature,
+        constexprs,
+    };
+    let module = compile_kernel(src, &spec, &[1])?;
+    // The bindings in the KERNEL's parameter order: the four stream operands, then the
+    // two pool planes — the pair's OWN tensors, the WRITE's destinations (natural K and V;
+    // the Kᵀ tail re-transposes from the K one into the reserved Kᵀ plane
+    // (`KctResident::of(k).wire_tid()`),
+    // which is what `mint_attn`'s gather reads — the pair's K tid KEYS that plane, and the
+    // carrier never reads it, only fills its source). The pair is the one the contract
+    // check above pinned to the graph edges.
+    let bindings = vec![
+        t(&node.inputs[0]),
+        t(&node.inputs[1]),
+        t(&node.inputs[2]),
+        t(&node.inputs[3]),
+        BufferId::new(kc_tid.index() as u32),
+        BufferId::new(vc_tid.index() as u32),
+    ];
+    let mut carrier = mint(node, module, &Program::RopeAppend, bindings)?;
+    // ⭐ THE TWO-HALVES LAW, STATED ON THE CARRIER: this program is HALF of the node —
+    // the rotation writes the node's output, the carrier only names it (the recipe
+    // suffixes its ops `_o{t}` after it) — so `node_out_tid` carries the node's output
+    // tensor, exactly `LmLast`'s own precedent for a program that does not write its
+    // node's output itself.
+    carrier.node_out_tid = Some(t(&node.output));
+    // ⭐ AND ITS OWN NAME — `ropewr_s{id}`, never the rotation's `rope_s{id}`: both
+    // halves mint through `program_stem`'s `rope` stem, and two programs of one node
+    // with one name is a collision the emulator's function key would take for one
+    // function.
+    let carrier_name = format!("ropewr_s{}", node.id.index());
+    carrier.func.name = Arena::global().str(carrier_name.clone());
+    let mut w = EmittedOp::bare(carrier_name);
+    w.ktir = Some(carrier);
+    // NO STAMPS ON THE CARRIER: the recipe self-stamps every op it mints (the paged
+    // latch's own source — `latch_paged_geometry` reads the FINAL ops), so a carrier
+    // carrying write facts would be a second stamping site for one fact.
+    Ok(vec![e, w])
+}
+
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 //  THE HEAD-NORM SANDWICH — `Reshape{Times(H)} → RmsNorm/RmsNormUnit → Reshape{Times(1)}`,
 //  gemma-4's per-head q/k norms (87% of its descriptors when un-fused), fused to ONE
@@ -599,7 +1014,9 @@ struct HeadNormSandwich<'a, F: scratchy_subtile::subtile_ir::RopeForm> {
     flatten: &'a SubtileNode<F>,
     /// The per-head width `D` (the split's output columns). The head COUNT is not
     /// carried: it is `full / D` of the split input's own extents, re-derived by the
-    /// spec and the door alike, so no second spelling can disagree.
+    /// spec and the door alike, so no second spelling can disagree. The width itself is
+    /// the door's input, never the mint's: the emit site crosses the head-dim door, and
+    /// the kernel's `D` binds the const generic it hands down.
     head_dim: u32,
     /// The norm's epsilon, read once here so the mint states one value.
     eps: f32,
@@ -775,37 +1192,54 @@ fn is_sandwich_flatten<F: scratchy_subtile::subtile_ir::RopeForm>(
     producer_of(ir, x.tensor).is_some_and(|norm| is_sandwich_norm(norm, ir))
 }
 
+/// The consumer that carries the head-norm sandwich's mint across the head-dim door.
+struct SandwichAtTheDoor<'a, F: scratchy_subtile::subtile_ir::RopeForm> {
+    sandwich: &'a HeadNormSandwich<'a, F>,
+}
+
+impl<F: scratchy_subtile::subtile_ir::RopeForm> scratchy_subtile::model_geometry::OnHeadDim
+    for SandwichAtTheDoor<'_, F>
+{
+    type Out = Result<Vec<EmittedOp>, String>;
+
+    fn on_head_dim<const HD: u32>(self) -> Self::Out {
+        lower_sandwich_node_at::<F, HD>(self.sandwich)
+    }
+}
+
 /// Lower the per-head norm SANDWICH to ONE program — the norm applied to head windows
 /// of the ORIGINAL tensor, both reshapes deleted. [`HeadNormSandwich`]'s docs carry
-/// the proof; this mints the kernel: `windowedrmsnorm.py`'s gained, oneplus, or unit
+/// the proof; this mints the kernel at the CONFIG-DECLARED head dim the door handed
+/// down (`D`/`INV_D` bind the const generic, never the node's value):
+/// `windowedrmsnorm.py`'s gained, oneplus, or unit
 /// entry, compiled at the sandwich's own geometry, bound to the split's SOURCE `x`, the
 /// gamma row (gained form only) and the flatten's OUTPUT — the same
 /// synthetic-node-and-mint shape the prefill lm-head fold uses for `lmlast.py`.
-fn lower_sandwich_node<F: scratchy_subtile::subtile_ir::RopeForm>(
+fn lower_sandwich_node_at<F: scratchy_subtile::subtile_ir::RopeForm, const HD: u32>(
     sandwich: &HeadNormSandwich<'_, F>,
 ) -> Result<Vec<EmittedOp>, String> {
     let HeadNormSandwich {
         split,
         norm,
         flatten,
-        head_dim,
         eps,
         gained,
         oneplus,
+        ..
     } = sandwich;
     let x_r = &split.inputs[0];
     let out_r = &flatten.output;
     let (m, full) = (out_r.region.rows.len, out_r.region.cols.len);
-    if *head_dim == 0 || full % head_dim != 0 {
+    if HD == 0 || !full.is_multiple_of(HD) {
         return Err(format!(
             "triton splice: rmsnorm_s{} (head-norm sandwich): the output t{} is [{m}, {full}] \
-             over head dim {head_dim}, which does not divide — a per-head window must tile the \
+             over head dim {HD}, which does not divide — a per-head window must tile the \
              width exactly",
             split.id.index(),
             out_r.tensor.index()
         ));
     }
-    let heads = full / head_dim;
+    let heads = full / HD;
     let src = include_str!("../../../targets/spyre/kernels/windowedrmsnorm.py");
     // THREE entries, one body: the matcher's own convention triple, stated as the
     // entry name only — the bindings are identical across the gained forms, and the
@@ -834,10 +1268,10 @@ fn lower_sandwich_node<F: scratchy_subtile::subtile_ir::RopeForm>(
         Ok(())
     };
     ce("M", Val::Int(i128::from(m)))?;
-    ce("D", Val::Int(i128::from(*head_dim)))?;
+    ce("D", Val::Int(i128::from(HD)))?;
     ce("HEADS", Val::Int(i128::from(heads)))?;
     ce("EPS", Val::Float(f64::from(*eps)))?;
-    ce("INV_D", Val::Float(1.0 / f64::from(*head_dim)))?;
+    ce("INV_D", Val::Float(1.0 / f64::from(HD)))?;
     if *oneplus {
         // The convention's own `offset()` (1.0), the same value the census
         // collects and the door resolves — one constant, three readers, one
@@ -1110,11 +1544,11 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
 
     // ⛔ THE ARITY IS THE NODE'S OWN CONTRACT, stated once per op kind so the splice and
     // the builder cannot disagree about it. The builder arm's own check is identical.
-    // ⭐ ROPE'S ARITY IS 3, NOT THE NODE'S INPUT COUNT: `lower_rope_node` reads only
-    // `inputs[0..3]` (x, cos, sin) — a `RopeAppend` carries 6 inputs but its V and
-    // KV-cache destinations flow through GRAPH edges, not through the op — so the
-    // splice binds the same first three operands the builder's program does, and the
-    // check below is `>= 3` exactly as the builder's own `inputs.len() < 3` refusal is.
+    // ⭐ ROPE-ROTATE'S ARITY IS 3, NOT THE NODE'S INPUT COUNT: `lower_rope_node` reads only
+    // `inputs[0..3]` (x, cos, sin) — the rotation's own operands, the output binding
+    // appended by `default_bindings`. `RopeAppend` has NO arity here on purpose: it routes
+    // through [`lower_rope_append`] before `lower_one` is reachable, so one reaching THIS
+    // match is a routing change and the `_` arm's refusal names it.
     let arity = match &node.op {
         SubOp::RmsNorm { .. } => 2,
         SubOp::SiluMul => 2,
@@ -1131,7 +1565,7 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
         SubOp::Elementwise(EwKind::Silu | EwKind::Gelu) => 1,
         SubOp::Elementwise(_) => 2,
         SubOp::ScalarMul { .. } => 1,
-        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => 3,
+        SubOp::RopeRotate { .. } => 3,
         // ⭐ SCALAR-WEIGHT MUL IS ARITY-2 (`[act, weight]`, the builder's own
         // binding). The MoE sub-ops have NO arity here any more: the registry
         // refuses them before the splice — the MoE lowers only from
@@ -1294,300 +1728,712 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
 //  ATTENTION — the one spliced kind whose program is NOT a straight parameter-for-tensor
 //  substitution, which is why it gets its own entry rather than riding `lower_one`:
 //
-//  * the DOOR's parameter order is q, out, then kc, new_k, vc, new_v, then the mask — the
-//    output is SECOND, not last, because `attn_operands` reads `r[0]`/`r[1]` as q/out and
-//    the next four as the segment pairs (`KtirFunc::attn`'s own `arg_for` order);
-//  * the MASK is a bound synthetic tensor beyond the graph (`k.mask`, not a binding slot
-//    the positional mint could name);
-//  * the DEAD PREFIX is a SPLICE-INJECTED VIEW: at `SWEPT == 0` the kernel's `if SWEPT > 0`
-//    guards leave the resident cache parameters addressed nowhere, the ladder DCEs an
-//    unconsumed descriptor, and no Triton program can state "a parameter with a view and no
-//    access tile" — so this entry injects the two `ktdp.construct_memory_view` ops into the
-//    compiled module post-hoc, the same law as `lmlast`'s `node_out_tid` (a stated tape
-//    fact, not an inferred one).
+//  * the KERNEL is `batched_decode.py`'s `batched_decode_hm` — the Spyre-native batched
+//    paged-decode kernel, ONE program for the whole decode batch, the pool swept through
+//    the device-resident page-id table (the old attention row is deleted; the prefill
+//    shapes it served are the prefill kernel's to serve, refused by name until that row
+//    lands);
+//  * the DOOR's parameter order is q, out, kt, v, ids, mask — the output is SECOND, the
+//    Kᵀ plane is the RESERVED name keyed on the sealed pair's K tid (the door's own naming
+//    law, `KctResident::of(k).wire_tid()` — the same derivation the write's tail fills and main's
+//    card-proven reader reads; the pair's OWN K tensor is the NATURAL plane the write's
+//    cachewr copies fill, and reading it here would misread real K as transposed — same
+//    size, wrong plane, invisible to every extent law), the V plane is the pair's own V
+//    tensor (read natural), and the id table and the mask are bound
+//    synthetic tensors beyond the graph (`k.mask`'s own law), because no graph tensor
+//    names them;
+//  * EVERY CONSTEXPR IS THE NODE'S OWN FACT OR A SHARED LAW — the geometry and scale off
+//    `SubOp::AttnDecode`, the page geometry off `PagedKvPool`/`CopyDims` (the pool's page
+//    width and the id stick's entry count are device laws, not per-model numbers), and
+//    the batching off the request count the walk itself carries. Nothing is hand-typed
+//    per model.
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// THE ATTENTION SPLICE — compile `attn.py` for this node's geometry and swept rung, and
-/// mint the `Program::Attn` `KtirNode` with the door's own parameter order.
+/// THE ATTENTION SPLICE — compile `batched_decode.py` for this node's geometry, and mint the
+/// `Program::Attn` `KtirNode` with the kernel's own parameter order.
 ///
-/// `cap` is the resident cache tensor's row extent (`lower_attn_node`'s own read), and
-/// `active_cap` is the swept rung the bundle was baked for — THE one bundle fact that must
-/// meet the program here, because `attn_at` reads the swept extent back off the program
-/// (`param_read_rows`) and the two must agree by the door's own hard error.
+/// ⭐ THE SYNTHETIC BINDING SLOTS — the host-staged inputs past the graph's own tensors,
+/// numbered through the ONE shared law (`step_input_tid`) so the producer's placement pass
+/// places exactly these tids and refuses any disagreement. The slot table is the CONTRACT's
+/// own (`ktir_superdsc::sdsc_abstract::attn_step_slots` — the splice is the STATER, the worker
+/// the FILLER, and the table lives in the one vocabulary crate both link; see its doc for why
+/// it is a fixed ABI and not wiring data). Slot 0 keeps the mask on the tid the wiring's own
+/// one-past-the-graph law already assigns it, so nothing pre-existing moves. EVERY attention
+/// program of a bundle — the one-shot kernels and the paged-fold family's body — states the
+/// SAME slots, so the placement pass and the runtime's staging treat them alike.
+use ktir_superdsc::sdsc_abstract::attn_step_slots;
+
+/// `cap` is the resident pool tensor's row extent (`lower_attn_node`'s own read) — for the
+/// paged pool a row IS a page, so it is the decode kernel's `PAGES` constexpr. `_active_cap`
+/// is the walk's swept rung, carried for the caller's contract and unread here: both batched
+/// kernels sweep the pool through the id table, not a baked rung. `rows_are_requests` is the
+/// ONE routing bit — the decode rung's rows are requests and `batched_decode_hm` serves
+/// them; a token-row shape is a chunk and `batched_prefill_hm` serves it.
+/// THE TWO BUNDLE-WIDE FACTS [`lower_attn`] reads that no program states — minted by the
+/// walk from the bundle's own `BundleAttnParams` derivation, so the splice and the door read
+/// one statement of each.
+#[derive(Clone, Copy, Debug)]
+pub struct AttnBundleFacts {
+    /// ⭐⭐⭐ THE BUNDLE'S SCORE-SCALE LAW — threaded from the walk that minted it
+    /// (`score_scale_law`'s ONE derivation, the same one the door's `BundleAttnParams` and the
+    /// pool write read). `None` only over a graph with no attention node; an AttnDecode under a
+    /// `None` is a walk/splice desync and refuses below.
+    pub scale_law: Option<ktir_superdsc::score_scale::ScoreScaleLaw>,
+    /// ⭐ WHETHER THE ATTENTION OUTPUT STAYS IN THE PER-HEAD ROW FRAME — the head-major o_proj
+    /// handoff (`BundleAttnParams::headmajor_handoff`): its permuted weight copy reads exactly
+    /// those bytes, so the from-rows copy is not emitted under it. See [`HeadRelayout`].
+    pub out_stays_head_rows: bool,
+}
+
 pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     cap: u32,
-    active_cap: ktir_superdsc::ktir_node::ActiveCap,
-) -> Result<EmittedOp, String> {
-    let row = attn_row();
+    _active_cap: ktir_superdsc::ktir_node::ActiveCap,
+    rows_are_requests: bool,
+    paged_fold: Option<&PagedFoldRung>,
+    bundle: AttnBundleFacts,
+) -> Result<Vec<EmittedOp>, String> {
+    let AttnBundleFacts {
+        scale_law,
+        out_stays_head_rows,
+    } = bundle;
+    let SubOp::AttnDecode { geom, .. } = &node.op else {
+        return Err(
+            "triton splice: lower_attn called on a node that is not an AttnDecode".to_string(),
+        );
+    };
+    // ⭐⭐⭐⭐⭐ THE VALUE→CONST DOOR FOR THE ATTENTION GEOMETRY — the same door main's
+    // attention arm crossed (`with_config_attn_geometry`), at the same boundary: the
+    // attention lowering runs at head geometry as CONST GENERICS, and this is the only
+    // place the node's geometry value becomes them. The arms are generated from the model
+    // configs by scratchy-subtile's build script, so a `None` is a geometry no config in
+    // this workspace declares — a build refusal naming it, answered by a `config.json`,
+    // never by an edit to the door. Past the door ([`lower_attn_at`]) there is no bare
+    // head-count value anywhere on the attention path: NKVH/HD are const generics, GQA is
+    // the witness's own const-backed associated const, and every extent derived from them
+    // is the compiler's arithmetic.
+    match scratchy_subtile::model_geometry::with_config_attn_geometry(
+        *geom,
+        AttnAtTheDoor {
+            node,
+            ir,
+            cap,
+            rows_are_requests,
+            paged_fold,
+            scale_law,
+            out_stays_head_rows,
+        },
+    ) {
+        Some(out) => out,
+        None => Err(format!(
+            "triton splice: AttnDecode t{} carries a geometry no model config declares \
+             ({geom}; the configs in scope: {}). The attention lowering runs at head geometry \
+             as const generics, instantiated per config by the build script, so a geometry \
+             outside that set has no compiled arm — the fix is a `config.json`, never an \
+             edit to the door",
+            node.output.tensor.index(),
+            scratchy_subtile::model_geometry::geometry_sources(),
+        )),
+    }
+}
+
+/// The consumer [`lower_attn`] hands the geometry door: the ENTIRE attention lowering runs
+/// inside `on_geometry::<NQH, NKVH, HD>`, so nothing past the door can hold a bare
+/// head-count value. The same discipline as `ktir_superdsc_door`'s rope arm (`OnHeadDim`
+/// over `with_config_head_dim`) — the door's witness spends the GQA divisibility proof, so
+/// the body's every derived extent is the compiler's arithmetic.
+struct AttnAtTheDoor<'a, F: scratchy_subtile::subtile_ir::RopeForm> {
+    node: &'a SubtileNode<F>,
+    ir: &'a SubtileIR<F>,
+    cap: u32,
+    rows_are_requests: bool,
+    paged_fold: Option<&'a PagedFoldRung>,
+    scale_law: Option<ktir_superdsc::score_scale::ScoreScaleLaw>,
+    out_stays_head_rows: bool,
+}
+
+impl<F: scratchy_subtile::subtile_ir::RopeForm> scratchy_subtile::model_geometry::OnAttnGeometry
+    for AttnAtTheDoor<'_, F>
+{
+    type Out = Result<Vec<EmittedOp>, String>;
+    fn on_geometry<const NQH: u32, const NKVH: u32, const HD: u32>(
+        self,
+        geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    ) -> Self::Out {
+        // ⭐ THE RELAYOUT IS DECIDED BY THE GEOMETRY, NOT BY A ROW ARM: the per-head row frame
+        // and the token stream are different bytes at every multi-slab head dim, for every
+        // attention program this door mints (prefill, solo decode, the fold family) — so the
+        // wrap is one tail over all of them.
+        let relayout = HeadRelayout::of(geom, self.node, self.out_stays_head_rows);
+        let (node, ir) = (self.node, self.ir);
+        let ops = lower_attn_at(geom, self)?;
+        match relayout {
+            Some(r) => r.wrap(node, ir, ops),
+            None => Ok(ops),
+        }
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ THE HEAD RELAYOUT — the attention kernels' per-head row frame, made the bytes their
+/// views state at every head dim.
+///
+/// The kernels read q and write their output through `[nqh·R, HD]` views (row `h·R + r`, the
+/// torch head-major layout), while the graph's q and attention output are the `[R, nqh·HD]`
+/// token stream. Stick-blocked, the token stream puts head `h` slab `s` row `r` at stick
+/// `(h·SLABS + s)·R + r` and the row frame at `s·nqh·R + h·R + r`: the SAME bytes exactly when
+/// `SLABS == 1`, a permutation of whole `[R, 64]` blocks at every wider head dim (128, 256, 512).
+/// So at `SLABS > 1` the attention program binds two reserved row-frame buffers instead of the
+/// graph tensors, and two copies (`head_relayout.py`) move the bytes: the token stream's q into
+/// the q rows before it, the output rows back into the token stream after it. `SLABS == 1` emits
+/// nothing — the bundle is byte-identical.
+///
+/// ⭐ UNDER THE HEAD-MAJOR o_proj HANDOFF THE OUTPUT STAYS IN THE ROW FRAME: the handoff's
+/// permuted o_proj copy is derived for exactly those bytes, so the from-rows copy is dropped and
+/// the attention writes the graph's output tensor directly in the row frame.
+struct HeadRelayout {
+    rows: u32,
+    heads: u32,
+    hd: u32,
+    out_stays_head_rows: bool,
+}
+
+impl HeadRelayout {
+    fn of<
+        F: scratchy_subtile::subtile_ir::RopeForm,
+        const NQH: u32,
+        const NKVH: u32,
+        const HD: u32,
+    >(
+        geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+        node: &SubtileNode<F>,
+        out_stays_head_rows: bool,
+    ) -> Option<HeadRelayout> {
+        (geom.slabs() > 1).then_some(HeadRelayout {
+            rows: node.output.region.rows.len,
+            heads: NQH,
+            hd: HD,
+            out_stays_head_rows,
+        })
+    }
+
+    fn spec(&self, entry: &str) -> Result<KernelSpec, String> {
+        let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+        let mut constexprs: HashMap<String, Val> = HashMap::new();
+        for p in ["desc_src", "desc_dst"] {
+            signature.insert(
+                p.to_string(),
+                ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+            );
+        }
+        for (k, v) in [
+            ("R", self.rows),
+            ("H", self.heads),
+            ("HD", self.hd),
+            ("STK", ktir_superdsc::sdsc_abstract::POOL_STICK),
+        ] {
+            signature.insert(k.to_string(), ArgSpec::Constexpr);
+            constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
+        }
+        Ok(KernelSpec {
+            kernel: entry.to_string(),
+            signature,
+            constexprs,
+            file: "head_relayout.py".to_string(),
+        })
+    }
+
+    /// One relayout copy program, bound `[src, dst]`.
+    fn copy(
+        &self,
+        entry: &'static str,
+        name: String,
+        src: u32,
+        dst: u32,
+    ) -> Result<EmittedOp, String> {
+        let (k_src, program) = match head_relayout_row(entry) {
+            TritonKernelRow::Spliced { src, program, .. } => (src, program),
+            TritonKernelRow::Refused(why) => return Err(why.to_string()),
+        };
+        let positional = attn_positional(k_src, &self.spec(entry)?, &[1], program)?;
+        let KtirNode { func, program, .. } = positional;
+        if func.arguments.len() != 2 {
+            return Err(format!(
+                "triton splice: {entry} compiled to {} parameters — the relayout binds [src, dst]",
+                func.arguments.len()
+            ));
+        }
+        let name = Arena::global().str(name);
+        let mut e = EmittedOp::bare(name.to_string());
+        e.ktir = Some(KtirNode {
+            func: ktir_core::ir::IRFunction { name, ..func },
+            program,
+            bindings: vec![BufferId::new(src), BufferId::new(dst)],
+            mask: None,
+            step_inputs: Vec::new(),
+            node_out_tid: None,
+            minted: Default::default(),
+        });
+        Ok(e)
+    }
+
+    /// Re-point every attention program's q / output binding at the row-frame buffers and put
+    /// the two copies around them, in program order.
+    fn wrap<F: scratchy_subtile::subtile_ir::RopeForm>(
+        &self,
+        node: &SubtileNode<F>,
+        _ir: &SubtileIR<F>,
+        mut ops: Vec<EmittedOp>,
+    ) -> Result<Vec<EmittedOp>, String> {
+        use ktir_superdsc::reserved_tids::{HeadRows, head_rows_tid};
+        let q = node.inputs[0].tensor.index() as u32;
+        let out = node.output.tensor.index() as u32;
+        let q_rows = head_rows_tid(out, HeadRows::Q);
+        let out_rows = if self.out_stays_head_rows {
+            out
+        } else {
+            head_rows_tid(out, HeadRows::Out)
+        };
+        let mut rebound = 0;
+        for e in ops.iter_mut() {
+            if let Some(k) = e.ktir.as_mut() {
+                for b in k.bindings.iter_mut() {
+                    if b.get() == q {
+                        *b = BufferId::new(q_rows);
+                        rebound += 1;
+                    } else if b.get() == out && out_rows != out {
+                        *b = BufferId::new(out_rows);
+                        rebound += 1;
+                    }
+                }
+            }
+        }
+        if rebound == 0 {
+            return Err(format!(
+                "triton splice: AttnDecode t{out}: the head relayout found no attention program \
+                 binding q t{q} or the output — nothing would read the relaid bytes"
+            ));
+        }
+        let id = node.id.index();
+        let mut wrapped = Vec::with_capacity(ops.len() + 2);
+        wrapped.push(self.copy("to_head_rows_fwd", format!("blkcp_q_s{id}"), q, q_rows)?);
+        wrapped.extend(ops);
+        if !self.out_stays_head_rows {
+            wrapped.push(self.copy(
+                "from_head_rows_fwd",
+                format!("blkcp_o_s{id}"),
+                out_rows,
+                out,
+            )?);
+        }
+        Ok(wrapped)
+    }
+}
+
+/// [`lower_attn`]'s body at the geometry the door chose — head counts are CONSTS here
+/// (`NKVH`/`HD` as const generics, GQA off the witness), so every extent derived from them
+/// below is the compiler's arithmetic, and a geometry the kernels cannot state refuses at
+/// THEIR compile-time asserts, in the kernel's own terms.
+fn lower_attn_at<
+    F: scratchy_subtile::subtile_ir::RopeForm,
+    const NQH: u32,
+    const NKVH: u32,
+    const HD: u32,
+>(
+    geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    at: AttnAtTheDoor<F>,
+) -> Result<Vec<EmittedOp>, String> {
+    let AttnAtTheDoor {
+        node,
+        ir,
+        cap,
+        rows_are_requests,
+        paged_fold,
+        scale_law,
+        // Read by the geometry door's wrap ([`HeadRelayout`]), not by this body.
+        out_stays_head_rows: _,
+    } = at;
+    let row = if rows_are_requests {
+        attn_decode_row()
+    } else {
+        attn_prefill_row()
+    };
     let (src, attn_program) = match &row {
         TritonKernelRow::Spliced { src, program, .. } => (*src, program),
         TritonKernelRow::Refused(why) => return Err(why.to_string()),
     };
-    let SubOp::AttnDecode { geom, scale, .. } = &node.op else {
+    let SubOp::AttnDecode {
+        scale,
+        valid_len,
+        layout: kv,
+        ..
+    } = &node.op
+    else {
         return Err(
             "triton splice: lower_attn called on a node that is not an AttnDecode — the \
              entry is AttnDecode's"
                 .to_string(),
         );
     };
-    if node.inputs.len() < 5 {
+    // ⭐⭐⭐⭐⭐ THE SCALE, DERIVED BY EXHAUSTIVE MATCH OVER THE LAW — never a naked read off
+    // the node. The node handed in may be a REWRITE (the walk rewrites `scale = 1.0` under the
+    // fold's receipt, and only then); the ORIGINAL IR payload is the arch's own statement (the
+    // IR is `&`-shared and every rewrite happens on a clone, so `ir.nodes[node.id]` is the
+    // model's number and never a rewrite's residue); and the LAW is the bundle's proof of
+    // WHERE the scale lives. The three arms:
+    //   * `StatedByProgram` — the fold was REFUSED (fp8 payload, shared readers, the f16
+    //     floor), the pool is RAW ([`ScoreScaleLaw::pool_k`]), and the program MUST state the
+    //     arch's whole multiplier;
+    //   * `CommutedIntoWeights` — the receipt: √s lives in BOTH projection weights, the pool
+    //     is born scaled, and the program states the identity;
+    //   * `UnitByModel` — the arch's own multiplier IS 1.0; nothing for anyone to carry.
+    // The derived value is then CROSS-CHECKED against the node's carried scale: a rewritten
+    // 1.0 arriving under `StatedByProgram` is the HALF-APPLIED FOLD (the recognition rewrote
+    // the node while the gates refused the weight side — scores missing s, a flat softmax,
+    // attention ≈ mean-V, invisible to every extent law), and a real multiplier arriving
+    // under a carried-elsewhere law is the DOUBLE-APPLY. Both are build errors naming the
+    // layer and both values, not emissions.
+    let original = match &ir.nodes[node.id.index()].op {
+        SubOp::AttnDecode { scale, .. } => *scale,
+        _ => {
+            return Err(format!(
+                "triton splice: AttnDecode t{} is not in the graph the walk handed over — the \
+                 ORIGINAL scale payload is read off `ir` (the rewrite happens on a clone), so a \
+                 node the IR does not carry has no arch statement to derive the scale from",
+                node.output.tensor.index()
+            ));
+        }
+    };
+    let Some(law) = scale_law else {
         return Err(format!(
-            "triton splice: AttnDecode t{} expects 5 inputs [q, prefix_k, prefix_v, new_k, \
-             new_v], found {}",
+            "triton splice: AttnDecode t{} reached the splice with no score-scale law — the \
+             walk mints one over every graph with an attention node, so a None here is a \
+             walk/splice desync, not a lawless graph",
+            node.output.tensor.index()
+        ));
+    };
+    let lawful = match law {
+        ktir_superdsc::score_scale::ScoreScaleLaw::StatedByProgram => original,
+        ktir_superdsc::score_scale::ScoreScaleLaw::CommutedIntoWeights => 1.0,
+        ktir_superdsc::score_scale::ScoreScaleLaw::UnitByModel => original,
+    };
+    if *scale != lawful {
+        return Err(format!(
+            "triton splice: AttnDecode t{} carries scale {} but the bundle's law is {law:?} over \
+             an IR payload of {original}, which mints {}. A rewritten 1.0 under StatedByProgram is \
+             the HALF-APPLIED FOLD — the recognition rewrote the node while its gates refused the \
+             weight side, so the pool is raw K and this program would compute scores at t = 1, a \
+             flat softmax no extent law can see; a real multiplier under a carried-elsewhere law \
+             is the DOUBLE-APPLY. Either the recognition must not rewrite when its gates refuse, \
+             or the gates must pass",
             node.output.tensor.index(),
-            node.inputs.len()
+            scale,
+            lawful,
         ));
     }
-    let (nqh, nkvh, hd) = (geom.nqh().get(), geom.nkvh().get(), geom.hd().get());
-    let stick = ktir_superdsc::sdsc_abstract::POOL_STICK; // 64 — the rung alignment law
-    let swept = active_cap.resolve(cap, stick);
-    let mq = node.output.region.rows.len;
-    let gqa = geom.gqa().get();
-    // ⛔ THE PREFIX SEGMENT'S OWN LAW, `KtirSeg`'s and not the rung's: a MASKED prefix
-    // (this forward's own rope-append) is read from row 0 to the SWEPT extent — the
-    // rung, bounded by the cache TENSOR's own rows (`graph.shape(kr.tensor).rows`,
-    // NOT the region's: `lower_region` slices a rope-append prefix's region to
-    // `valid_len - 1` rows while the builder's tile sweeps the rung and lets the
-    // runtime length mask bound it); a PRE-POPULATED one (the emulator's host-threaded
-    // cache) is read at its own region rows and corner. The door reads this extent
-    // back off the program (`param_read_rows`), so the spliced tile must state exactly
-    // the builder's.
-    let mask_prefix = matches!(
-        &node.op,
-        SubOp::AttnDecode {
-            producer: scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend { .. },
-            ..
-        }
-    );
-    // The cache tensor's own row count — the builder's bound (`swept.min` of exactly
-    // this), and the same reading `lower_one_node`'s walk used for `cap`.
-    let cache_rows = ir.tensors[node.inputs[1].tensor.index()].rows;
-    let (prefix_len, kc_row) = if mask_prefix {
-        (swept.min(cache_rows), 0)
-    } else {
-        (
-            node.inputs[1].region.rows.len,
-            node.inputs[1].region.rows.start,
-        )
-    };
-    // `KtirFunc::attn`'s zero-length segment law: a dead prefix (prefix_len == 0) keeps
-    // its VIEW (injected below) and drops its compute, AND CLEARS `mask_prefix` — with no
-    // prefix segment there is nothing the runtime length mask could bound. That clearing
-    // is what makes a no-prefix prompt chunk take the causal ONE-PASS arm.
-    let mask_eff = mask_prefix && prefix_len > 0;
-    let new_len = node.inputs[3].region.rows.len;
-    // The builder's own one-pass arm condition, verbatim: ONE LIVE SEGMENT (the dead
-    // prefix leaves exactly the new block), mq > 1, no runtime length mask, and the new
-    // block spanning the whole chunk (`seq_len == mq`) — the additive `[mq, mq]` causal
-    // triangle can then replace the per-row slice. (A temporary `mq >= 8` floor sat
-    // here to satisfy the front end's since-removed TMA 16-byte check — a GPU law the
-    // Spyre target does not have; with the check gone the builder's own condition
-    // stands again, and the ladder's bottom rung takes the one-pass arm like main.)
-    let one_pass = !mask_eff && prefix_len == 0 && new_len == mq && mq > 1;
-    // Every other multi-row shape is the whole-chunk continuation (`attn.py`'s
-    // `_attn_cont_head`), which states its causality in the mask rather than in per-row
-    // tile extents — so it always binds one.
-    let continuation = mq > 1 && !one_pass;
-    if continuation && (prefix_len == 0 || new_len < mq) {
+    let scale = lawful;
+    // THE PAGE GEOMETRY IS A SHARED DEVICE LAW, NOT A MODEL NUMBER: the pool's page width
+    // and the id stick's entry count live beside the pool types every other consumer reads.
+    let page_slots = ktir_superdsc::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
+    // ⛔ THE POOL'S ROWS ARE ITS PAGES — `cap` is the cache tensor's own row extent, and a
+    // paged pool row is one whole page for every KV head. The decode kernel states it as
+    // its `PAGES` constexpr.
+    if cap == 0 {
         return Err(format!(
-            "triton splice: AttnDecode t{}: a {mq}-row attention with a {prefix_len}-row prefix and \
-             a {new_len}-row new block — the whole-chunk continuation needs a live prefix and a new \
-             block covering every row, and a dead prefix with a full new block is the one-pass arm",
+            "triton splice: AttnDecode t{} reads a zero-page pool — PAGES is the cache \
+             tensor's row extent and cannot be 0",
             node.output.tensor.index()
         ));
     }
-    // THE MASK IS BOUND WHEN A SEGMENT CONSUMES IT — the runtime length mask (decode,
-    // `[1, prefix_len]`), the causal triangle (the one-pass, `[mq, mq]`), or the
-    // continuation's `[mq, prefix_len + mq]` prefix-plus-new-block mask.
-    let has_mask = mask_eff || one_pass || continuation;
-    // The scale, stated as the kernel's own constexpr so the program's `qk * SCALE` mulf
-    // carries exactly the value `program_score_scale` reads back — the door resolves the
-    // registry slot FROM that value, so the program and `scalarmul_scales` cannot disagree.
-    let spec = attn_kernel_spec(
-        node,
-        &AttnFacts {
-            nqh,
-            nkvh,
-            hd,
-            gqa,
-            mq,
-            cap,
-            prefix_len,
-            kc_row,
-            new_len,
-            scale: *scale,
-            has_mask,
-            one_pass,
-        },
-    )?;
-    // ⭐ THE GRID IS THE HEAD COUNT AT mq > 1 — the builder's own structure. `KtirFunc::attn`
-    // runs one head per program instance when `mq > 1` (`KtdpGetComputeTileId`, grid
-    // `(nq, 1)`), and the kernel states the same shape: `tl.program_id(0)` IS the head in
-    // its mq > 1 arms, so the grid folds the head axis and the program carries ONE head's
-    // body — 32x fewer ops per program than a static_range head loop unrolled into one
-    // grid-[1] program (granite: 32 query heads), which is the compile-time law the
-    // builder's form sets. Decode keeps grid [1] and the kernel's own static head loop,
-    // exactly the builder's `mq == 1` arm.
-    let grid: Vec<i64> = if mq > 1 {
-        vec![i64::from(nqh)]
+    // ── THE PAGED-FOLD FAMILY — the `(FULL, no-chunk)` rung of a chunked ladder. ──
+    //
+    // That rung's attention is the ONE body every context past the widest chunk falls back to,
+    // so it must serve any length the pool holds — which a baked walk extent cannot. The
+    // family below is the other shape: the online-softmax carry in DEVICE MEMORY, ONE page per
+    // launch, the runtime re-launching the body once per resident page. Three programs, in
+    // program order (seed, body, finalize): the seed is separate because a seeding PASS would
+    // reset the running state mid-accumulation, and the finalize is separate because the
+    // normalize runs ONCE, after the last pass.
+    //
+    // ⭐ TWO ROW FORMS, TWO FAMILIES — the token-row (MQ==1) rung mints the solo family
+    // (`paged_fold.py`, one sequence's rows); a REQUEST-ROW rung mints the batched family
+    // (`paged_fold_batched.py`, every request row folded by ONE launch per page-ordinal, its
+    // carry, tables and mask at the batched stick's own frames). Batched decode past the
+    // widest chunk folds HERE — on its own rung, never by falling back to the solo rungs.
+    if let Some(pf) = paged_fold.filter(|pf| pf.fold_body) {
+        // ⛔ THE REGION CANNOT OUT-REACH THE POOL IT GATHERS: the fold's plane descriptors
+        // state the region's page count, and a region past the pool's own rows sweeps past
+        // the cache tensor's placement.
+        if pf.region_pages > cap {
+            return Err(format!(
+                "triton splice: AttnDecode t{} states a {}-page table region over a {}-page \
+                 pool — the region the ladder stages cannot out-reach the pool its entries \
+                 gather",
+                node.output.tensor.index(),
+                pf.region_pages,
+                cap
+            ));
+        }
+        if rows_are_requests {
+            return mint_paged_fold_batched(geom, node, ir, scale, pf.region_pages);
+        }
+        return mint_paged_fold(geom, node, ir, scale, pf.region_pages);
+    }
+    // ⛔ A RUNG ON A CHUNKED LADDER THAT IS NOT THE FOLD BODY still states the region: every
+    // rung of the ladder places its step inputs identically (`ladder_stages_one_layout`), so
+    // the sweep and chunk rungs' tables and mask state the SAME region the fold reads.
+    let region_pages = paged_fold.map(|pf| pf.region_pages);
+    // ⭐ THE REGION VALUE IS BOUND PER ARM, from the same pages fact that arm's spec got — the
+    // spec's own law, not a second derivation: BOTH arms' specs default a `None` region to the
+    // walk's own extent. The mint below states it on the carrier unconditionally.
+    let (spec, region) = if rows_are_requests {
+        // ── THE DECODE ROW: the request count is the batch. ──
+        let num_seqs = node.output.region.rows.len;
+        if num_seqs == 0 {
+            return Err(format!(
+                "triton splice: AttnDecode t{} states a zero-row decode output — the batched \
+                 kernel's NUM_SEQS is the request count and cannot be 0",
+                node.output.tensor.index()
+            ));
+        }
+        // THE WALK COVERS THE NODE'S OWN VALID LENGTH: `valid_len` is the SubOp's stated
+        // logical length (prefix ++ new), the one sequence-extent fact the node carries —
+        // pages per sequence, the prefill arm's own one-param form. The tables and mask
+        // state the REGION (the value bound below), not the walk; the pool-capacity
+        // `PAGES` and the chunk-slot stick law are this family's deleted history.
+        let pages = valid_len.div_ceil(page_slots);
+        if pages == 0 {
+            return Err(format!(
+                "triton splice: AttnDecode t{} attends zero pages — a valid length of \
+                 {valid_len} has no page under PAGE_SLOTS = {page_slots}",
+                node.output.tensor.index()
+            ));
+        }
+        (
+            batched_decode_spec(&BatchedDecodeFacts {
+                geom,
+                num_seqs,
+                pages,
+                region_pages,
+                scale,
+            })?,
+            // The spec's own default law (`batched_decode_spec`'s `region_pages.unwrap_or(pages)`):
+            // a rung whose ladder stated no fold region keeps the region at the walk's own extent.
+            region_pages.unwrap_or(pages),
+        )
     } else {
-        vec![1]
+        // ── THE PREFILL ROW: the chunk's query rows are M. ──
+        if node.inputs.len() < 5 {
+            return Err(format!(
+                "triton splice: AttnDecode t{} expects 5 inputs [q, prefix_k, prefix_v, \
+                 new_k, new_v], found {}",
+                node.output.tensor.index(),
+                node.inputs.len()
+            ));
+        }
+        let mq = node.output.region.rows.len;
+        if mq == 0 {
+            return Err(format!(
+                "triton splice: AttnDecode t{} states a zero-row chunk — the prefill \
+                 kernel's MQ is the chunk's query rows and cannot be 0",
+                node.output.tensor.index()
+            ));
+        }
+        // THE PAGES THE CHUNK ATTENDS: the prefix segment's rows plus the new block's —
+        // the graph's own regions, the same reading the old one-shot attention splice took — padded
+        // to whole pages. The kernel's id-stick and pitch laws are its own bound constexprs
+        // (`KTB`, `PITCH`), stated at the typed consts.
+        let prefix_len = node.inputs[1].region.rows.len;
+        let new_len = node.inputs[3].region.rows.len;
+        let pages = (prefix_len + new_len).div_ceil(page_slots);
+        if pages == 0 {
+            return Err(format!(
+                "triton splice: AttnDecode t{} attends zero pages — a {prefix_len}-row \
+                 prefix plus a {new_len}-row new block has no page under PAGE_SLOTS = \
+                 {page_slots}",
+                node.output.tensor.index()
+            ));
+        }
+        (
+            batched_prefill_spec(&BatchedPrefillFacts {
+                geom,
+                mq,
+                pages,
+                region_pages,
+                scale,
+            })?,
+            // The spec's own default law (`batched_prefill_spec`'s `region_pages.unwrap_or(pages)`):
+            // a rung whose ladder stated no fold region keeps the region at the walk's own extent.
+            region_pages.unwrap_or(pages),
+        )
     };
-    let positional = attn_positional(
-        src,
-        &spec,
-        &grid,
-        *attn_program,
-        AttnPostCompile {
-            cap,
-            kv_width: nkvh * hd,
-            dead_prefix: prefix_len == 0,
-            has_mask,
-        },
-    )?;
-    let k = mint_attn(node, ir, positional, has_mask)?;
+    // ONE PROGRAM FOR THE WHOLE BATCH/CHUNK — grid [1, 1] is both kernels' own contract:
+    // every descriptor corner is a compile-time constant (the page/chunk loop is
+    // `tl.static_range`).
+    let grid: Vec<i64> = vec![1, 1];
+    let positional = attn_positional(src, &spec, &grid, *attn_program)?;
+    let k = mint_attn(node, ir, positional, rows_are_requests)?;
     let name = format!("attn_s{}", node.id.index());
-    let mut e = EmittedOp::bare(name);
+    // ⭐⭐⭐⭐⭐ THE REGION FACT AT THE MINT — UNCONDITIONAL, the SHARED TAIL over both row
+    // arms. Every op this arm mints is a one-shot attention carrier whose program gathers the
+    // paged pool through the absolute-entry tables — `mint_attn` binds the id tables in BOTH
+    // row arms — whether or not its ladder stated a fold region: a PREFIX-FREE rung states
+    // none (its bake is `ActiveCap::NONE`, because a start==0 chunk has nothing resident to
+    // attend) yet its kernel gathers the pool the same way, so keying the mint on
+    // `region_pages` left those carriers BARE and their reads double-based (the page base
+    // composed on top of the absolute entries — token 0's defect). The region VALUE is each
+    // arm's own contract, bound above. The pool's tids ride with it: the walk's stamp site
+    // checks the layout's gather reach for exactly those tids before stamping, so a graph
+    // that placed no pool REFUSES the build instead of taking the zero shift over an
+    // unpaged read.
+    let mut e = EmittedOp::paged_region(
+        name,
+        ktir_superdsc::sdsc_abstract::PagedRegion {
+            region_pages: region,
+            k_tid: kv.cache_tensor().index() as u32,
+            v_tid: kv.v_cache_tensor().index() as u32,
+        },
+    );
     e.ktir = Some(k);
-    Ok(e)
-}
-
-/// What [`attn_positional`] does to the compiled module before `node_for` reads it — every input
-/// of those edits, so the memo keys on all of them by name rather than on the claim that the
-/// spec's constexprs already spell them.
-struct AttnPostCompile {
-    cap: u32,
-    kv_width: u32,
-    dead_prefix: bool,
-    has_mask: bool,
+    Ok(vec![e])
 }
 
 /// ⭐ THE ATTENTION PROGRAM, MEMOIZED PAST `node_for` — the per-LAYER cost law.
 ///
 /// Every layer of a rung states the SAME spec (the geometry, the widths and the corners are the
 /// rung's, not the layer's), and the wiring walk lowers every layer of the unrolled graph. With
-/// only [`compile_kernel`] memoized, each of the 40 layers still cloned the cached module, edited
-/// it and re-ran `node_for` over it — MEASURED, after the compile memo, `node_for` alone was a
+/// only [`compile_kernel`] memoized, each of the 40 layers still cloned the cached module and
+/// re-ran `node_for` over it — MEASURED, after the compile memo, `node_for` alone was a
 /// third of the granite-2b models build script on the 256-row prompt chunk. What differs per
 /// layer is exactly what [`mint_attn`] re-states (name, bindings, mask slot), so the positional
-/// node is computed once per (compile key, post-compile edits, program) and cloned.
+/// node is computed once per (compile key, program) and cloned.
+///
+/// ⛔ THE MODULE IS NOT EDITED PAST COMPILE. The old row carried two post-compile surgeries —
+/// injecting dead cache views at `prefix_len == 0`, truncating an unconsumed tail mask
+/// parameter — both attention-named edits of the compiled TTIR, both unreachable on the
+/// batched rows (the kernels always trace their pool views and always consume the mask), and
+/// both DELETED rather than generalized: a fact the kernel does not state belongs in the
+/// kernel (or in the descriptor's spec), never in a splice-side rewrite of the module the
+/// walk then misreads as the kernel's own.
 fn attn_positional(
     src: &str,
     spec: &KernelSpec,
     grid: &[i64],
     program: Program,
-    post: AttnPostCompile,
 ) -> Result<KtirNode, String> {
     static NODES: Memo<KtirNode> = Memo::new();
-    let AttnPostCompile {
-        cap,
-        kv_width,
-        dead_prefix,
-        has_mask,
-    } = post;
-    let key = memo_key(src, spec, grid).map(|k| {
-        format!("{k}\0{program:?}\u{1}{cap}\u{1}{kv_width}\u{1}{dead_prefix}\u{1}{has_mask}")
-    });
+    let key = memo_key(src, spec, grid).map(|k| format!("{k}\0{program:?}"));
     NODES.get_or_compute(key, || {
-        let mut module = compile_kernel(src, spec, grid)?;
-        // ⛔ THE DEAD PREFIX'S VIEWS, INJECTED. At `prefix_len == 0` the kernel guards its
-        // kc/vc descriptors away, the ladder DCEs them, and the resident cache parameters would
-        // be "addressed NOWHERE" — but the door requires them: `attn_operands` reads the cache's
-        // identity and capacity off those views, and the card keeps the cache RESIDENT through
-        // them. The builder keeps the view by construction (`KtirFunc::attn`'s zero-length
-        // segment); the splice states the same fact post-compile, as one
-        // `ktdp.construct_memory_view` per cache parameter over the SAME shape the live
-        // segment's view states (the full `[cap, nkvh·hd]` capacity).
-        if dead_prefix {
-            inject_dead_cache_views(&mut module, cap, kv_width)?;
-        }
-        // ⛔ THE MASKLESS SHAPE TRUNCATES THE MASK PARAMETER. The kernel's parameter list is
-        // static Python, so `desc_mask` is declared in every arm; a maskless shape (a
-        // pre-populated cache at decode, a continuation chunk) traces no view over it, and the
-        // handoff refuses an unaddressed parameter rather than inventing a width. The builder's
-        // own maskless arm mints NO mask parameter (`KtirFunc::attn` registers the mask tile
-        // only under `mask_prefix` / the one-pass arm), so the same law holds here: the
-        // parameter must not survive. `desc_mask` is the LAST parameter — the consumer numbers
-        // its buffers by parameter position, so removing the tail renumbers nothing (the
-        // handoff's own law).
-        if !has_mask {
-            truncate_unused_mask_param(&mut module)?;
-        }
+        let module = compile_kernel(src, spec, grid)?;
         triton_ktir_superdsc::node_for(&module, program)
             .map_err(|e| format!("triton splice: node_for: {e}"))
     })
 }
 
-/// THE ATTENTION KERNEL'S LAUNCH CONTRACT — the door's own parameter order (q, out, the
-/// four segment buffers in `attn_operands`'s positional order — resident K, new K,
-/// resident V, new V — then the mask), plus every extent as a constexpr: the geometry
-/// (`NQH/NKVH/HD/GQA`), the widths (`MQ/CAP/SWEPT/NEW_LEN`), the segment corners
-/// (`KC_*/KD_*`, the region row/col starts), the scale, and the two arm selectors
-/// (`HAS_MASK`, `ONE_PASS`).
-///
-/// ⭐ THE MASK PARAMETER IS STATED ONLY WHEN A SEGMENT CONSUMES IT — the kernel builds its
-/// mask descriptor under the same `HAS_MASK` guard, so an always-declared parameter would
-/// be a binding slot nothing addresses (the ladder DCEs the unconsumed descriptor and the
-/// handoff refuses "addressed NOWHERE"). `HAS_MASK` is the builder's own `mask_prefix`,
-/// and `ONE_PASS` the builder's own one-pass arm condition (`live.len() == 1 && mq > 1 &&
-/// !mask_prefix && seq_len == mq`).
-///
-/// The facts arrive as ONE struct — the group is the shape's own frame (geometry, widths,
-/// segment extents, arm selectors), minted by `lower_attn` beside the laws that derive
-/// each member, so this mint holds no derivation of its own.
-struct AttnFacts {
-    nqh: u32,
-    nkvh: u32,
-    hd: u32,
-    gqa: u32,
-    mq: u32,
-    cap: u32,
-    prefix_len: u32,
-    kc_row: u32,
-    new_len: u32,
+/// The batched paged-decode kernel's facts — every one the node's own or a shared law,
+/// minted by [`lower_attn`] beside the law that derives each member, so this struct holds
+/// no derivation of its own. The geometry rides as the DOOR'S WITNESS (`AttnGeometry`
+/// const-generic over the head counts), never as bare `u32` head counts: the facts a
+/// kernel's constexprs state are the compiler's arithmetic past the geometry door.
+struct BatchedDecodeFacts<const NQH: u32, const NKVH: u32, const HD: u32> {
+    /// The head geometry as consts — the door's witness.
+    geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    num_seqs: u32,
+    pages: u32,
+    /// The page ceiling of the region the tables and mask STATE, when this rung sits on a
+    /// ladder (the census's ONE `max_pages` derivation, threaded by the walk). `None`
+    /// states the region at the walk's own extent — the prefill facts' own law.
+    region_pages: Option<u32>,
     scale: f32,
-    has_mask: bool,
-    one_pass: bool,
 }
 
-fn attn_kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
-    node: &SubtileNode<F>,
-    f: &AttnFacts,
+/// THE BATCHED DECODE KERNEL'S LAUNCH CONTRACT — the kernel's own parameter order
+/// (`batched_decode_hm`: q, out, the two pool planes, the two block-entry tables, the
+/// mask, and the repetition table — the decode row's own fourth parameter, the bridge
+/// from its request-major score rows to the head-major q/o rows the stream law states),
+/// plus every extent as a constexpr: the geometry (`NUM_SEQS/NKVH/GQA/HD`), the
+/// pool's own derived facts (`SLABS/STK/W4/PITCH`), the pool walk (`PAGES`), the region
+/// the tables and mask state (`REGION_PAGES`), and the scale.
+///
+/// The ids tables and the repetition table are `*i32` — the kernel gathers pages
+/// through the former and q/o rows through the latter, and the door sizes an index
+/// buffer `SenUint32` by its own gather law. The mask is ALWAYS consumed (the kernel
+/// loads it unconditionally in the page walk — the additive -65504 sentinel is what makes a
+/// padded page merge with weight zero), so the parameter is always in the signature.
+///
+/// ⭐ THE GEOMETRY CONSTEXPRS ARE THE CONSTS, not copies of values: `NKVH`/`HD` are this
+/// function's own const generics and `GQA` is the witness's associated const, so a
+/// constexpr and the door's arm can never disagree about a head count. ⭐ THE POOL'S OWN
+/// DERIVED FACTS RIDE THE SAME LAW: `SLABS` is spent as `geom.slabs()` — the call itself
+/// is the stick-multiple law's firing point, so a sub-stick head is the declaring model's
+/// build failure HERE, at the mint — and `STK`/`W4` are the pool's own consts
+/// (`POOL_STICK`, `WINDOWS_PER_PAGE`), never values the mint recomputed. ⭐ `PITCH` is the
+/// BATCHED stick's own pitch (`batched_table_pitch` at `NUM_SEQS·NKVH`), and the pitch
+/// law's trip-slot count `MQ = PG·STK·2/(SLABS·PITCH)` must come out WHOLE — the kernel
+/// derives it by integer division, so a geometry the pitch cannot serve is refused HERE,
+/// at the mint, never silently floored on the card. The kernel takes no `PAGE_SLOTS`:
+/// nothing it states derives from it any more.
+fn batched_decode_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
+    f: &BatchedDecodeFacts<NQH, NKVH, HD>,
 ) -> Result<KernelSpec, String> {
-    let AttnFacts {
-        nqh,
-        nkvh,
-        hd,
-        gqa,
-        mq,
-        cap,
-        prefix_len,
-        kc_row,
-        new_len,
+    let BatchedDecodeFacts {
+        geom,
+        num_seqs,
+        pages,
+        region_pages,
         scale,
-        has_mask,
-        one_pass,
     } = *f;
+    // ⛔ THE REGION IS THE LADDER'S, NOT THE WALK'S: on a ladder every rung states the SAME
+    // region so the step-input placements the placement pass mints agree across rungs
+    // (`ladder_stages_one_layout`), and the per-page fold body the ladder also bakes reads the
+    // same region one page per launch. `None` (an unladdered bundle) keeps the region at the
+    // walk's own extent, which is the byte-for-byte region-less statement.
+    let region_pages = region_pages.unwrap_or(pages);
+    // The pitch law, refused rather than floored: the per-window mask bytes (`PG·STK·2`)
+    // over the per-window table block (`SLABS·PITCH`) must be a whole trip-slot count.
+    let pitch =
+        ktir_superdsc::sdsc_abstract::batched_table_pitch(num_seqs, NKVH).ok_or_else(|| {
+            format!(
+                "triton splice: batched_decode_hm at {num_seqs} sequence(s) x {NKVH} kv head(s) \
+                 overflows the table pitch — no u32 states this batched stick"
+            )
+        })?;
+    let ktb = u64::from(num_seqs) * u64::from(NKVH);
+    let pg = ktb * u64::from(geom.gqa());
+    let per_window = u64::from(geom.slabs()) * u64::from(pitch);
+    if per_window == 0
+        || (pg * u64::from(ktir_superdsc::sdsc_abstract::POOL_STICK) * 2) % per_window != 0
+    {
+        return Err(format!(
+            "triton splice: batched_decode_hm at {num_seqs} sequence(s) x {NKVH} kv head(s) x \
+             {} group replica(s) states a non-integral trip-slot count — the per-window mask \
+             bytes ({pg} rows of STK·2) are not a whole number of per-window table blocks \
+             ({per_window} B), so the pitch law has no form at this geometry",
+            geom.gqa()
+        ));
+    }
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
-    // The door's positional order: q, out, kc, kd, vc, vd — the cache's K before the new
-    // block's K, then the same for V — then the mask when a segment reads it.
-    let mut params: Vec<&str> = vec![
-        "desc_q", "desc_o", "desc_kc", "desc_kd", "desc_vc", "desc_vd",
-    ];
-    // ⛔ THE MASK PARAMETER IS ALWAYS IN THE SIGNATURE: the kernel's parameter list is static
-    // Python, so a shape without a mask still declares `desc_mask` — and the trace (every
-    // descriptor and load under `if HAS_MASK:` / `if SWEPT > 0`) never references it, so the
-    // pipeline DCEs the unaddressed parameter and the compiled program carries exactly the
-    // arguments the builder's own arm states (six, for a maskless shape). Same law as the dead
-    // prefix's cache views: the program's parameter set is decided by what the trace addresses.
-    params.push("desc_mask");
-    for p in params {
+    // THE BLOCK-ENTRY CONTRACT: the decode kernel gathers the pool ONE SLAB BLOCK per
+    // index entry, through TWO tables — each plane's own block numbering — whose values
+    // are the host's `GatherEntry` bytes. No page stride or block offset is a constexpr
+    // here: those live in the values, composed at the pool's one door on the host.
+    // `desc_rep` is the decode row's own repetition table — the bridge from its
+    // request-major score rows to the head-major q/o rows — staged by the host at
+    // `attn_step_slots::REP`.
+    for (p, ty) in [
+        ("desc_q", "*fp16"),
+        ("desc_o", "*fp16"),
+        ("desc_kt", "*fp16"),
+        ("desc_v", "*fp16"),
+        ("desc_ids_kt", "*i32"),
+        ("desc_ids_v", "*i32"),
+        ("desc_mask", "*fp16"),
+        ("desc_rep", "*i32"),
+    ] {
         signature.insert(
             p.to_string(),
-            ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+            ArgSpec::parse(ty).map_err(|e| e.to_string())?,
         );
     }
     let mut ce = |k: &str, v: Val| -> Result<(), String> {
@@ -1595,196 +2441,996 @@ fn attn_kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
         constexprs.insert(k.to_string(), v);
         Ok(())
     };
-    // The segment corners, from the node's own regions — the row/col starts the builder's
-    // `KtirSeg` states (`kr.region.rows.start`, `kr.region.cols.start`). The MASKED prefix's
-    // row corner is 0 by the builder's own law (`row_start = 0` at `mask_prefix && i == 0`),
-    // which is why `kc_row` arrives as its own parameter and is not read off the region.
-    let (kc_c, kd_r, kd_c) = (
-        node.inputs[1].region.cols.start,
-        node.inputs[3].region.rows.start,
-        node.inputs[3].region.cols.start,
-    );
-    ce("NQH", Val::Int(i128::from(nqh)))?;
-    ce("NKVH", Val::Int(i128::from(nkvh)))?;
-    ce("HD", Val::Int(i128::from(hd)))?;
-    ce("GQA", Val::Int(i128::from(gqa)))?;
-    ce("MQ", Val::Int(i128::from(mq)))?;
-    ce("CAP", Val::Int(i128::from(cap)))?;
-    ce("SWEPT", Val::Int(i128::from(prefix_len)))?;
-    ce("NEW_LEN", Val::Int(i128::from(new_len)))?;
-    ce("KC_ROW", Val::Int(i128::from(kc_row)))?;
-    ce("KC_COL", Val::Int(i128::from(kc_c)))?;
-    ce("KD_ROW", Val::Int(i128::from(kd_r)))?;
-    ce("KD_COL", Val::Int(i128::from(kd_c)))?;
+    ce("NUM_SEQS", Val::Int(i128::from(num_seqs)))?;
+    ce("NKVH", Val::Int(i128::from(NKVH)))?;
+    ce("GQA", Val::Int(i128::from(geom.gqa())))?;
+    ce("HD", Val::Int(i128::from(HD)))?;
+    // SLABS is spent as `geom.slabs()` — the call is the stick-multiple law's firing point —
+    // and STK/W4 are the pool's own consts, read at the same names the kernel's docstring
+    // cites. The mint recomputes none of them.
+    ce("SLABS", Val::Int(i128::from(geom.slabs())))?;
+    ce(
+        "STK",
+        Val::Int(i128::from(ktir_superdsc::sdsc_abstract::POOL_STICK)),
+    )?;
+    ce(
+        "W4",
+        Val::Int(i128::from(
+            ktir_superdsc::sdsc_abstract::PagedKvPool::WINDOWS_PER_PAGE,
+        )),
+    )?;
+    ce("PITCH", Val::Int(i128::from(pitch)))?;
+    ce("PAGES", Val::Int(i128::from(pages)))?;
+    ce("REGION_PAGES", Val::Int(i128::from(region_pages)))?;
     ce("SCALE", Val::Float(f64::from(scale)))?;
-    ce("HAS_MASK", Val::Bool(has_mask))?;
-    ce("ONE_PASS", Val::Bool(one_pass))?;
     Ok(KernelSpec {
-        kernel: "attn_fwd".to_string(),
+        kernel: "batched_decode_hm".to_string(),
         signature,
         constexprs,
-        file: "attn.py".to_string(),
+        file: "batched_decode.py".to_string(),
     })
 }
 
-/// THE DEAD PREFIX'S VIEWS — one `ktdp.construct_memory_view` per resident-cache
-/// parameter, spliced at the top of the compiled kernel's body.
-///
-/// ⛔ THE PARAMETER POSITIONS ARE THE DOOR'S, and the injection must find its own
-/// parameter: the kernel's pointer parameters are `desc_q` (0), `desc_o` (1), `desc_kc`
-/// (2), `desc_kd` (3), `desc_vc` (4), `desc_vd` (5), so the cache parameters are 2 and 4.
-/// The view shape is the segment's own `[cap, kv_width]` — the capacity
-/// `attn_operands` reads as `cap = kc.v_rows`, exactly what a live segment's view states
-/// and what the builder's dead segment keeps.
-fn inject_dead_cache_views(
-    module: &mut triton_ktir::ir::Module,
-    cap: u32,
-    kv_width: u32,
-) -> Result<(), String> {
-    use triton_ktir::ir::{Attr, AttrKey, IrType, Op, OpKind};
-    // Mint the view names BEFORE the body borrow: `fresh_named` needs `&mut module` and
-    // the splice needs `&mut` the body, so the two phases cannot interleave (the rung-3
-    // rewrite's own law).
-    let view_names = [module.fresh_named("kc_dead"), module.fresh_named("vc_dead")];
-    let kernel = module
-        .kernel_mut()
-        .map_err(|e| format!("triton splice: attn dead-view injection: {e}"))?;
-    let region = kernel.regions.first_mut().ok_or_else(|| {
-        "triton splice: attn dead-view injection: the kernel has no body".to_string()
-    })?;
-    // The dead segment's view shape, as the ladder's own `build_base_memory_view` spells
-    // it: `Shape`/`Strides` as element counts, `CoordinateSet` from the range-set law, HBM.
-    let dims = vec![i64::from(cap), i64::from(kv_width)];
-    let range_set = format!(
-        "(d0, d1) : (d0 >= 0, -d0 + {r} >= 0, d1 >= 0, -d1 + {c} >= 0)",
-        r = cap - 1,
-        c = kv_width - 1,
-    );
-    // Positions 2 and 4: the resident K and V cache parameters (`desc_kc`, `desc_vc`).
-    for (n, (view, param_idx)) in view_names.iter().zip([2usize, 4usize]).enumerate() {
-        let Some(&(ptr, _)) = region.args.get(param_idx) else {
-            return Err(format!(
-                "triton splice: attn dead-view injection: the kernel states fewer than {} \
-                 parameters — the door's order is q, out, kc, kd, vc, vd",
-                param_idx + 1
-            ));
-        };
-        // The parameter must be addressed nowhere — that is the dead prefix's own shape,
-        // and a view that already exists means the kernel's guards diverged from SWEPT==0.
-        if region
-            .ops
-            .iter()
-            .any(|o| o.kind == OpKind::KtdpConstructMemoryView && o.operands.first() == Some(&ptr))
-        {
-            return Err(format!(
-                "triton splice: attn dead-view injection: parameter {param_idx} already states \
-                 a view — the kernel's SWEPT==0 guards left the cache descriptors live, and \
-                 injecting a second view over one pointer would give the door two extents to \
-                 read where it takes the first"
-            ));
-        }
-        let view_op = Op::new(OpKind::KtdpConstructMemoryView)
-            .with_result(
-                *view,
-                IrType::MemRef {
-                    dims: dims.clone(),
-                    elem: triton_ktir::ir::DType::F16,
-                },
-            )
-            .with_operands([ptr])
-            .with_attr(AttrKey::Shape, Attr::IntList(dims.clone()))
-            .with_attr(
-                AttrKey::Strides,
-                Attr::IntList(vec![i64::from(kv_width), 1]),
-            )
-            .with_attr(AttrKey::CoordinateSet, Attr::AffineSet(range_set.clone()))
-            .with_attr(AttrKey::MemorySpace, Attr::Str("HBM".into()));
-        // Splice at the TOP of the body, in parameter order: a view is loop-invariant by
-        // construction (its one operand is the base address), and `regions()` finds it by
-        // a non-recursive search of the function's top-level ops.
-        region.ops.insert(n, view_op);
-    }
-    Ok(())
+/// The batched prefill kernel's facts — every one the node's own or a shared law, minted by
+/// [`lower_attn`] beside the law that derives each member, so this struct holds no
+/// derivation of its own. The geometry rides as the door's witness, never as bare `u32`
+/// head counts (the decode facts' own law).
+struct BatchedPrefillFacts<const NQH: u32, const NKVH: u32, const HD: u32> {
+    /// The head geometry as consts — the door's witness.
+    geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    mq: u32,
+    pages: u32,
+    /// The page ceiling of the region the tables and mask STATE, when this rung sits on a
+    /// chunked ladder (the census's ONE `max_pages` derivation, threaded by the walk). `None`
+    /// states the region at the walk's own extent — byte for byte the region-less statement.
+    region_pages: Option<u32>,
+    scale: f32,
 }
 
-/// THE MASKLESS SHAPE'S PARAMETER TRUNCATION — drop the tail `desc_mask` parameter the
-/// kernel declares but no arm traced a view over.
+/// THE BATCHED PREFILL KERNEL'S LAUNCH CONTRACT — the same parameter order as the decode
+/// kernel's (`batched_prefill_hm`: q, out, the two pool planes, the TWO block-entry tables,
+/// the mask), plus every extent as a constexpr: the geometry (`MQ/NKVH/GQA/HD`), the pool's
+/// own derived facts (`SLABS/STK/W4/KTB/PITCH`), the pool walk (`PAGES`), and the scale.
 ///
-/// ⛔ THE PARAMETER MUST BE UNUSED **AND LAST**. The consumer numbers its buffers by
-/// parameter position, so only removing the tail renumbers nothing — anything but the last
-/// slot would silently re-index every later buffer. And the parameter must be addressed
-/// NOWHERE (the same `every_parameter_states_its_width` precondition the handoff enforces):
-/// a body that still holds a view over it means `HAS_MASK` and the trace's own guards
-/// disagreed, which is a kernel bug this refuses rather than papers over.
-fn truncate_unused_mask_param(module: &mut triton_ktir::ir::Module) -> Result<(), String> {
-    use triton_ktir::ir::OpKind;
-    let kernel = module
-        .kernel_mut()
-        .map_err(|e| format!("triton splice: attn mask truncation: {e}"))?;
-    let region = kernel
-        .regions
-        .first_mut()
-        .ok_or_else(|| "triton splice: attn mask truncation: the kernel has no body".to_string())?;
-    let Some(&(ptr, _)) = region.args.last() else {
-        return Err(
-            "triton splice: attn mask truncation: the kernel states no parameters".to_string(),
-        );
-    };
-    if region
-        .ops
-        .iter()
-        .any(|o| o.kind == OpKind::KtdpConstructMemoryView && o.operands.first() == Some(&ptr))
-    {
-        return Err(
-            "triton splice: attn mask truncation: the last parameter is addressed by a view — \
-             HAS_MASK is false for this shape, so the kernel's mask guards left the mask \
-             descriptor live; the maskless arm must not reference `desc_mask` at all"
-                .to_string(),
+/// THE BLOCK-ENTRY CONTRACT, under the same laws as the decode spec: the kernel gathers the
+/// pool ONE SLAB BLOCK per index entry, through TWO tables — each plane's own block
+/// numbering — whose values are the host's `GatherEntry` bytes. No page stride or block
+/// offset is a constexpr here: those live in the values, composed at the pool's one door on
+/// the host. The ids table is `*i32` and the mask always consumed. ⭐ THE GEOMETRY
+/// CONSTEXPRS ARE THE CONSTS, not copies of values: `KTB` is `AttnGeometry::KTB` (the
+/// id-stick width — the kernel's batch axis derives from it, never from the head counts),
+/// `SLABS` is spent as `geom.slabs()` — the call itself is the stick-multiple law's firing
+/// point, so a sub-stick head is the declaring model's build failure HERE, at the mint —
+/// `STK`/`W4` are the pool's own consts (`POOL_STICK`, `WINDOWS_PER_PAGE`), and `PITCH` is
+/// `AttnGeometry::table_pitch()`, the ONE typed item the tables, the mask and the fold's
+/// per-pass shift all read. The kernel takes no `PAGE_SLOTS`.
+fn batched_prefill_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
+    f: &BatchedPrefillFacts<NQH, NKVH, HD>,
+) -> Result<KernelSpec, String> {
+    let BatchedPrefillFacts {
+        geom,
+        mq,
+        pages,
+        region_pages,
+        scale,
+    } = *f;
+    // ⛔ THE REGION IS THE LADDER'S, NOT THE WALK'S: on a chunked ladder every rung states the
+    // SAME region so the step-input placements the placement pass mints agree across rungs
+    // (`ladder_stages_one_layout`), and the per-page fold body the ladder also bakes reads the
+    // same region one page per launch. `None` (an unchunked bundle) keeps the region at the
+    // walk's own extent, which is the byte-for-byte region-less statement.
+    let region_pages = region_pages.unwrap_or(pages);
+    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+    let mut constexprs: HashMap<String, Val> = HashMap::new();
+    for (p, ty) in [
+        ("desc_q", "*fp16"),
+        ("desc_o", "*fp16"),
+        ("desc_kt", "*fp16"),
+        ("desc_v", "*fp16"),
+        ("desc_ids_kt", "*i32"),
+        ("desc_ids_v", "*i32"),
+        ("desc_mask", "*fp16"),
+    ] {
+        signature.insert(
+            p.to_string(),
+            ArgSpec::parse(ty).map_err(|e| e.to_string())?,
         );
     }
-    region.args.pop();
-    Ok(())
+    let mut ce = |k: &str, v: Val| -> Result<(), String> {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), v);
+        Ok(())
+    };
+    ce("MQ", Val::Int(i128::from(mq)))?;
+    ce("NKVH", Val::Int(i128::from(NKVH)))?;
+    ce("GQA", Val::Int(i128::from(geom.gqa())))?;
+    ce("HD", Val::Int(i128::from(HD)))?;
+    // The geometry's own id-stick width, the pool's own consts, and the common pitch —
+    // each spent at the typed const, exactly like SLABS below: `geom.slabs()` is the call
+    // that fires the stick-multiple law (a sub-stick head refuses HERE), and `table_pitch`
+    // is the one item the tables, the mask and the fold's per-pass shift all read.
+    ce("KTB", Val::Int(i128::from(geom.ktb())))?;
+    ce("SLABS", Val::Int(i128::from(geom.slabs())))?;
+    ce(
+        "STK",
+        Val::Int(i128::from(ktir_superdsc::sdsc_abstract::POOL_STICK)),
+    )?;
+    ce(
+        "W4",
+        Val::Int(i128::from(
+            ktir_superdsc::sdsc_abstract::PagedKvPool::WINDOWS_PER_PAGE,
+        )),
+    )?;
+    ce("PITCH", Val::Int(i128::from(geom.table_pitch())))?;
+    ce("PAGES", Val::Int(i128::from(pages)))?;
+    ce("REGION_PAGES", Val::Int(i128::from(region_pages)))?;
+    ce("SCALE", Val::Float(f64::from(scale)))?;
+    Ok(KernelSpec {
+        kernel: "batched_prefill_hm".to_string(),
+        signature,
+        constexprs,
+        file: "batched_prefill.py".to_string(),
+    })
+}
+
+/// ⭐ WHAT THE LADDER STATES TO THE SPLICE ABOUT THE PAGED FOLD, at the rung being lowered.
+///
+/// A chunked ladder states this for EVERY rung (the ceiling included): the sweep and chunk
+/// rungs need the REGION so their step-input placements agree with the fold body's
+/// (`ladder_stages_one_layout` — one session stages one layout), and the fold body is the
+/// `(FULL, no-chunk)` rung the ladder's every-past-the-widest-chunk context falls back to.
+/// `region_pages` is the census's ONE `max_pages` derivation, threaded by the walk — the
+/// splice never re-derives it.
+pub struct PagedFoldRung {
+    /// The page ceiling of the region the block-entry tables and the mask state.
+    pub region_pages: u32,
+    /// THIS rung is the per-page fold body — the `(FULL, no-chunk)` rung.
+    pub fold_body: bool,
+}
+
+/// The paged-fold family's facts — the fold body's own geometry, minted by
+/// [`mint_paged_fold`] beside the law that derives each member. The seed and finalize
+/// programs read the SUBSET of these their signatures state. The geometry rides as the
+/// door's witness, never as bare `u32` head counts (the decode facts' own law).
+struct PagedFoldFamilyFacts<const NQH: u32, const NKVH: u32, const HD: u32> {
+    /// The head geometry as consts — the door's witness.
+    geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    mq: u32,
+    region_pages: u32,
+    scale: f32,
+}
+
+/// THE SEED PROGRAM'S LAUNCH CONTRACT — `paged_fold_seed_hm`'s own parameter order (the
+/// carry's max, sum, accumulator), plus the geometry as constexprs. The carry's memory image
+/// is f16 throughout — the one-shot kernel's own legalized grading (the kernel's module doc
+/// states the law), so the fold is numerically identical to the body it replaces.
+fn paged_fold_seed_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
+    f: &PagedFoldFamilyFacts<NQH, NKVH, HD>,
+) -> Result<KernelSpec, String> {
+    let PagedFoldFamilyFacts { geom, mq, .. } = *f;
+    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+    let mut constexprs: HashMap<String, Val> = HashMap::new();
+    for (p, ty) in [
+        ("desc_m", "*fp16"),
+        ("desc_l", "*fp16"),
+        ("desc_acc", "*fp16"),
+    ] {
+        signature.insert(
+            p.to_string(),
+            ArgSpec::parse(ty).map_err(|e| e.to_string())?,
+        );
+    }
+    let mut ce = |k: &str, v: Val| -> Result<(), String> {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), v);
+        Ok(())
+    };
+    ce("MQ", Val::Int(i128::from(mq)))?;
+    ce("NKVH", Val::Int(i128::from(NKVH)))?;
+    ce("GQA", Val::Int(i128::from(geom.gqa())))?;
+    ce("HD", Val::Int(i128::from(HD)))?;
+    ce("KTB", Val::Int(i128::from(geom.ktb())))?;
+    ce(
+        "STK",
+        Val::Int(i128::from(ktir_superdsc::sdsc_abstract::POOL_STICK)),
+    )?;
+    Ok(KernelSpec {
+        kernel: "paged_fold_seed_hm".to_string(),
+        signature,
+        constexprs,
+        file: "paged_fold.py".to_string(),
+    })
+}
+
+/// THE FOLD BODY'S LAUNCH CONTRACT — `paged_fold_hm`'s own parameter order (q, the carried
+/// max/sum/accumulator, the two pool planes, the two block-entry tables, the mask), plus every
+/// extent as a constexpr: the geometry (`MQ/NKVH/GQA/HD`), the pool's own derived facts
+/// (`SLABS/STK/W4/KTB/PITCH`), the region the tables and mask state (`REGION_PAGES`), and
+/// the scale. The block-entry contract is the prefill kernel's own — global slab-block
+/// entries, one per table row, at the COMMON PITCH (`AttnGeometry::table_pitch()`, the one
+/// typed item the tables, the mask and the per-pass shift read) — and the per-pass shift
+/// the runtime applies rides the ACTIVATION segment, page-major, which is why the tables
+/// and the mask state the REGION and not the page.
+fn paged_fold_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
+    f: &PagedFoldFamilyFacts<NQH, NKVH, HD>,
+) -> Result<KernelSpec, String> {
+    let PagedFoldFamilyFacts {
+        geom,
+        mq,
+        region_pages,
+        scale,
+    } = *f;
+    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+    let mut constexprs: HashMap<String, Val> = HashMap::new();
+    for (p, ty) in [
+        ("desc_q", "*fp16"),
+        ("desc_m", "*fp16"),
+        ("desc_l", "*fp16"),
+        ("desc_acc", "*fp16"),
+        ("desc_kt", "*fp16"),
+        ("desc_v", "*fp16"),
+        ("desc_ids_kt", "*i32"),
+        ("desc_ids_v", "*i32"),
+        ("desc_mask", "*fp16"),
+    ] {
+        signature.insert(
+            p.to_string(),
+            ArgSpec::parse(ty).map_err(|e| e.to_string())?,
+        );
+    }
+    let mut ce = |k: &str, v: Val| -> Result<(), String> {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), v);
+        Ok(())
+    };
+    ce("MQ", Val::Int(i128::from(mq)))?;
+    ce("NKVH", Val::Int(i128::from(NKVH)))?;
+    ce("GQA", Val::Int(i128::from(geom.gqa())))?;
+    ce("HD", Val::Int(i128::from(HD)))?;
+    // The geometry's own id-stick width, the pool's own consts, and the common pitch —
+    // spent at the typed consts under the same law as the prefill spec's.
+    ce("KTB", Val::Int(i128::from(geom.ktb())))?;
+    ce("SLABS", Val::Int(i128::from(geom.slabs())))?;
+    ce(
+        "STK",
+        Val::Int(i128::from(ktir_superdsc::sdsc_abstract::POOL_STICK)),
+    )?;
+    ce(
+        "W4",
+        Val::Int(i128::from(
+            ktir_superdsc::sdsc_abstract::PagedKvPool::WINDOWS_PER_PAGE,
+        )),
+    )?;
+    ce("PITCH", Val::Int(i128::from(geom.table_pitch())))?;
+    ce("REGION_PAGES", Val::Int(i128::from(region_pages)))?;
+    ce("SCALE", Val::Float(f64::from(scale)))?;
+    Ok(KernelSpec {
+        kernel: "paged_fold_hm".to_string(),
+        signature,
+        constexprs,
+        file: "paged_fold.py".to_string(),
+    })
+}
+
+/// THE FINALIZE PROGRAM'S LAUNCH CONTRACT — `paged_fold_finalize_hm`'s own parameter order
+/// (the output, the carried sum, the carried accumulator). The max is spent by the last pass,
+/// so nothing reads it here — the signature states no `desc_m`, and an unused parameter is
+/// not merely dead weight: Triton may drop it from the compiled signature and break the
+/// parameter-count guard below.
+fn paged_fold_finalize_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
+    f: &PagedFoldFamilyFacts<NQH, NKVH, HD>,
+) -> Result<KernelSpec, String> {
+    let PagedFoldFamilyFacts { geom, mq, .. } = *f;
+    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+    let mut constexprs: HashMap<String, Val> = HashMap::new();
+    for (p, ty) in [
+        ("desc_o", "*fp16"),
+        ("desc_l", "*fp16"),
+        ("desc_acc", "*fp16"),
+    ] {
+        signature.insert(
+            p.to_string(),
+            ArgSpec::parse(ty).map_err(|e| e.to_string())?,
+        );
+    }
+    let mut ce = |k: &str, v: Val| -> Result<(), String> {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), v);
+        Ok(())
+    };
+    ce("MQ", Val::Int(i128::from(mq)))?;
+    ce("NKVH", Val::Int(i128::from(NKVH)))?;
+    ce("GQA", Val::Int(i128::from(geom.gqa())))?;
+    ce("HD", Val::Int(i128::from(HD)))?;
+    ce("KTB", Val::Int(i128::from(geom.ktb())))?;
+    ce("SLABS", Val::Int(i128::from(geom.slabs())))?;
+    ce(
+        "STK",
+        Val::Int(i128::from(ktir_superdsc::sdsc_abstract::POOL_STICK)),
+    )?;
+    Ok(KernelSpec {
+        kernel: "paged_fold_finalize_hm".to_string(),
+        signature,
+        constexprs,
+        file: "paged_fold.py".to_string(),
+    })
+}
+
+/// THE PAGED-FOLD FAMILY'S MINT — three programs, in PROGRAM ORDER (seed, fold body,
+/// finalize), each re-stated like [`mint_attn`] re-states the one-shot kernels: the bindings
+/// in the KERNEL's parameter order, the Kᵀ plane bound to the RESERVED tid keyed on the
+/// sealed pair's K tid and the V plane to the pair's own V tensor (the same naming law
+/// [`mint_attn`] states), the tables and mask as host-staged step inputs past the graph (the
+/// SAME slot law [`mint_attn`] numbers), and the carry bound to its three reserved tids — the
+/// placements the census mints, gated on the ladder's fold statement.
+///
+/// ⭐ ONLY THE BODY CARRIES THE FOLD ATTRIBUTE ([`EmittedOp::paged_fold`], the ONE door): the
+/// seed and the finalize launch once per step, not once per page, so stamping a fold onto
+/// them would re-launch a seeding pass mid-accumulation and a normalize per page — the two
+/// defects the three-program split exists to prevent.
+fn mint_paged_fold<
+    F: scratchy_subtile::subtile_ir::RopeForm,
+    const NQH: u32,
+    const NKVH: u32,
+    const HD: u32,
+>(
+    geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    scale: f32,
+    region_pages: u32,
+) -> Result<Vec<EmittedOp>, String> {
+    let SubOp::AttnDecode { layout, .. } = &node.op else {
+        return Err(
+            "triton splice: mint_paged_fold called on a node that is not an AttnDecode".to_string(),
+        );
+    };
+    let mq = node.output.region.rows.len;
+    let facts = PagedFoldFamilyFacts {
+        geom,
+        mq,
+        region_pages,
+        scale,
+    };
+    // ONE PROGRAM PER FAMILY MEMBER — grid [1, 1] is the family's own contract: every
+    // descriptor corner is a compile-time constant, the body's page loop is the RUNTIME's
+    // re-launch, not a `tl.static_range` walk.
+    let grid: Vec<i64> = vec![1, 1];
+    let row_src = |row: &TritonKernelRow| -> Result<(&str, Program), String> {
+        match row {
+            TritonKernelRow::Spliced { src, program, .. } => Ok((src, *program)),
+            TritonKernelRow::Refused(why) => Err(why.to_string()),
+        }
+    };
+    let (seed_src, seed_prog) = row_src(&paged_fold_seed_row())?;
+    let (fold_src, fold_prog) = row_src(&paged_fold_row())?;
+    let (fin_src, fin_prog) = row_src(&paged_fold_finalize_row())?;
+    let seed_pos = attn_positional(seed_src, &paged_fold_seed_spec(&facts)?, &grid, seed_prog)?;
+    let fold_pos = attn_positional(fold_src, &paged_fold_spec(&facts)?, &grid, fold_prog)?;
+    let fin_pos = attn_positional(fin_src, &paged_fold_finalize_spec(&facts)?, &grid, fin_prog)?;
+    // ⭐ THE TAPE'S REAL TENSOR INDICES over the adapter's positional ones — the same law
+    // `mint_attn` states: a splice that kept the positional ids would emit descriptors over
+    // `t0/t1/t2` while the tape's buffers are elsewhere.
+    let t =
+        |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
+    // The carry's three reserved tids — the census places exactly these, gated on the fold
+    // statement, so a binding and a placement can never disagree about which tensor is which.
+    let carry = |which: ktir_superdsc::reserved_tids::PagedFoldCarry| BufferId::new(which.tid());
+    let m_tid = carry(ktir_superdsc::reserved_tids::PagedFoldCarry::Max);
+    let l_tid = carry(ktir_superdsc::reserved_tids::PagedFoldCarry::Sum);
+    let acc_tid = carry(ktir_superdsc::reserved_tids::PagedFoldCarry::Acc);
+    // The step-input slot law is `mint_attn`'s own (the mask at 0, the two tables at 1 and 2)
+    // — the fold body states the SAME host-staged inputs the one-shot kernels do, at the
+    // SAME tids, so the placement pass and the runtime's staging treat every attention
+    // program of the bundle alike.
+    let n_tensors = ir.tensors.len() as u32;
+    let law = |slot: u32| BufferId::new(ktir_superdsc::ktir_node::step_input_tid(n_tensors, slot));
+    let mask_tid = law(attn_step_slots::MASK);
+    let kt_ids_tid = law(attn_step_slots::KT_BLOCK_IDS);
+    let v_ids_tid = law(attn_step_slots::V_BLOCK_IDS);
+    // The re-state: the positional node's func with THIS program's own name, bindings, mask
+    // and step inputs. The parameter-count guard is `mint_attn`'s own — the kernel's
+    // parameter list and the row's contract cannot diverge silently.
+    let restate = |positional: KtirNode,
+                   name: &'static str,
+                   bindings: Vec<BufferId>,
+                   mask: Option<BufferId>,
+                   step_inputs: Vec<ktir_superdsc::ktir_node::StepInput>|
+     -> Result<KtirNode, String> {
+        let KtirNode { func, program, .. } = positional;
+        if func.arguments.len() != bindings.len() {
+            return Err(format!(
+                "triton splice: {} compiled to {} parameters but the kernel's order states {} \
+                 bindings — the kernel's parameter list diverged from the row's contract",
+                func.name,
+                func.arguments.len(),
+                bindings.len()
+            ));
+        }
+        Ok(KtirNode {
+            func: ktir_core::ir::IRFunction { name, ..func },
+            program,
+            bindings,
+            mask,
+            step_inputs,
+            node_out_tid: None,
+            minted: Default::default(),
+        })
+    };
+    let id = node.id.index();
+    // ── THE SEED: the carry's three tensors, in the kernel's order (max, sum, accumulator).
+    // No step inputs, no mask — the program touches nothing the host stages. ──
+    let seed = restate(
+        seed_pos,
+        Arena::global().str(format!("attn_s{id}_fseed")),
+        vec![m_tid, l_tid, acc_tid],
+        None,
+        Vec::new(),
+    )?;
+    // ── THE BODY: q, the carry, the pool planes, the tables, the mask — the kernel's own
+    // parameter order. ──
+    let fold = restate(
+        fold_pos,
+        Arena::global().str(format!("attn_s{id}_fold")),
+        vec![
+            t(&node.inputs[0]),
+            m_tid,
+            l_tid,
+            acc_tid,
+            // ⭐ THE SCORE GATHER READS THE RESERVED Kᵀ PLANE — `KctResident` keyed on the
+            // sealed pair's K tid, the SAME expression the door's write tail
+            // (ktir_superdsc_door.rs) and main's card-proven reader spell, and the tape layer's
+            // body-representative table before them: the THIRD sayer of one derivation. The
+            // pair's own K tensor is the NATURAL plane the write's cachewr copies fill; binding
+            // it here misreads real K as transposed — same size, wrong plane, invisible to every
+            // extent law (both planes are `plane_stride` per kv head). Minted through the TYPE
+            // so the binding cannot be spelled as the source tid: the gather door classifies it
+            // by kind, and a `KctResident` resolves to the reserved plane placement and nothing
+            // else.
+            BufferId::new(
+                ktir_superdsc::reserved_tids::KctResident::of(layout.cache_tensor().index() as u32)
+                    .wire_tid(),
+            ),
+            BufferId::new(layout.v_cache_tensor().index() as u32),
+            kt_ids_tid,
+            v_ids_tid,
+            mask_tid,
+        ],
+        Some(mask_tid),
+        vec![
+            ktir_superdsc::ktir_node::StepInput {
+                buffer: kt_ids_tid,
+                slot: attn_step_slots::KT_BLOCK_IDS,
+            },
+            ktir_superdsc::ktir_node::StepInput {
+                buffer: v_ids_tid,
+                slot: attn_step_slots::V_BLOCK_IDS,
+            },
+            ktir_superdsc::ktir_node::StepInput {
+                buffer: mask_tid,
+                slot: attn_step_slots::MASK,
+            },
+        ],
+    )?;
+    // ── THE FINALIZE: the output, the sum, the accumulator — in the kernel's order. ──
+    let fin = restate(
+        fin_pos,
+        Arena::global().str(format!("attn_s{id}_ffin")),
+        vec![t(&node.output), l_tid, acc_tid],
+        None,
+        Vec::new(),
+    )?;
+    // The BODY carries the fold attribute — the family's launch-ABI laws, stated at the one
+    // door the walk's stamp and the bake's proof read. `page_slots` is restated from the
+    // shared device law so the stamp never re-derives it.
+    let mut body = EmittedOp::paged_fold(
+        format!("attn_s{id}_fold"),
+        ktir_superdsc::sdsc_abstract::PagedFold {
+            gathered: true,
+            batched_requests: false,
+            fold_rows: ktir_superdsc::sdsc_abstract::FoldRowRegime::WholeBatch,
+            page_slots: ktir_superdsc::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32,
+        },
+    );
+    body.ktir = Some(fold);
+    let mut seed_op = EmittedOp::bare(format!("attn_s{id}_fseed"));
+    seed_op.ktir = Some(seed);
+    let mut fin_op = EmittedOp::bare(format!("attn_s{id}_ffin"));
+    fin_op.ktir = Some(fin);
+    Ok(vec![seed_op, body, fin_op])
+}
+
+/// The batched paged-fold family's facts — the fold body's own geometry at the BATCHED
+/// stick, minted by [`mint_paged_fold_batched`] beside the law that derives each member.
+/// The seed and finalize programs read the SUBSET of these their signatures state. The
+/// geometry rides as the door's witness, never as bare `u32` head counts (the decode
+/// facts' own law); `num_seqs` replaces the solo family's `mq` — the batched family's
+/// rows are the launch's request slots.
+struct PagedFoldBatchedFacts<const NQH: u32, const NKVH: u32, const HD: u32> {
+    /// The head geometry as consts — the door's witness.
+    geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    num_seqs: u32,
+    region_pages: u32,
+    scale: f32,
+}
+
+/// THE BATCHED SEED PROGRAM'S LAUNCH CONTRACT — `paged_fold_batched_seed_hm`'s own parameter
+/// order (the carry's max, sum, accumulator), plus the geometry as constexprs. The carry's
+/// memory image is f16 throughout — the one-shot kernel's own legalized grading (the
+/// kernel's module doc states the law), so the fold is numerically identical to the body it
+/// replaces.
+fn paged_fold_batched_seed_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
+    f: &PagedFoldBatchedFacts<NQH, NKVH, HD>,
+) -> Result<KernelSpec, String> {
+    let PagedFoldBatchedFacts { geom, num_seqs, .. } = *f;
+    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+    let mut constexprs: HashMap<String, Val> = HashMap::new();
+    for (p, ty) in [
+        ("desc_m", "*fp16"),
+        ("desc_l", "*fp16"),
+        ("desc_acc", "*fp16"),
+    ] {
+        signature.insert(
+            p.to_string(),
+            ArgSpec::parse(ty).map_err(|e| e.to_string())?,
+        );
+    }
+    let mut ce = |k: &str, v: Val| -> Result<(), String> {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), v);
+        Ok(())
+    };
+    ce("NUM_SEQS", Val::Int(i128::from(num_seqs)))?;
+    ce("NKVH", Val::Int(i128::from(NKVH)))?;
+    ce("GQA", Val::Int(i128::from(geom.gqa())))?;
+    ce("HD", Val::Int(i128::from(HD)))?;
+    ce(
+        "STK",
+        Val::Int(i128::from(ktir_superdsc::sdsc_abstract::POOL_STICK)),
+    )?;
+    Ok(KernelSpec {
+        kernel: "paged_fold_batched_seed_hm".to_string(),
+        signature,
+        constexprs,
+        file: "paged_fold_batched.py".to_string(),
+    })
+}
+
+/// THE BATCHED FOLD BODY'S LAUNCH CONTRACT — `paged_fold_batched_hm`'s own parameter order
+/// (q, the carried max/sum/accumulator, the two pool planes, the two block-entry tables,
+/// the mask), plus every extent as a constexpr: the geometry
+/// (`NUM_SEQS/NKVH/GQA/HD`), the pool's own derived facts (`SLABS/STK/W4/PITCH`), the
+/// region the tables and mask state (`REGION_PAGES`), and the scale. The block-entry
+/// contract is the batched one-shot kernel's own — global slab-block entries, one per
+/// table row, at the BATCHED common pitch (`batched_table_pitch` at `NUM_SEQS·NKVH`) —
+/// and the per-pass shift the runtime applies rides the ACTIVATION segment, page-major,
+/// which is why the tables and the mask state the REGION and not the page. The pitch
+/// law's trip-slot count must come out WHOLE, refused here exactly as the one-shot spec
+/// refuses it.
+fn paged_fold_batched_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
+    f: &PagedFoldBatchedFacts<NQH, NKVH, HD>,
+) -> Result<KernelSpec, String> {
+    let PagedFoldBatchedFacts {
+        geom,
+        num_seqs,
+        region_pages,
+        scale,
+    } = *f;
+    let pitch =
+        ktir_superdsc::sdsc_abstract::batched_table_pitch(num_seqs, NKVH).ok_or_else(|| {
+            format!(
+                "triton splice: paged_fold_batched_hm at {num_seqs} sequence(s) x {NKVH} kv \
+                 head(s) overflows the table pitch — no u32 states this batched stick"
+            )
+        })?;
+    let ktb = u64::from(num_seqs) * u64::from(NKVH);
+    let pg = ktb * u64::from(geom.gqa());
+    let per_window = u64::from(geom.slabs()) * u64::from(pitch);
+    if per_window == 0
+        || (pg * u64::from(ktir_superdsc::sdsc_abstract::POOL_STICK) * 2) % per_window != 0
+    {
+        return Err(format!(
+            "triton splice: paged_fold_batched_hm at {num_seqs} sequence(s) x {NKVH} kv head(s) \
+             x {} group replica(s) states a non-integral trip-slot count — the per-window mask \
+             bytes ({pg} rows of STK·2) are not a whole number of per-window table blocks \
+             ({per_window} B), so the pitch law has no form at this geometry",
+            geom.gqa()
+        ));
+    }
+    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+    let mut constexprs: HashMap<String, Val> = HashMap::new();
+    for (p, ty) in [
+        ("desc_q", "*fp16"),
+        ("desc_m", "*fp16"),
+        ("desc_l", "*fp16"),
+        ("desc_acc", "*fp16"),
+        ("desc_kt", "*fp16"),
+        ("desc_v", "*fp16"),
+        ("desc_ids_kt", "*i32"),
+        ("desc_ids_v", "*i32"),
+        ("desc_mask", "*fp16"),
+    ] {
+        signature.insert(
+            p.to_string(),
+            ArgSpec::parse(ty).map_err(|e| e.to_string())?,
+        );
+    }
+    let mut ce = |k: &str, v: Val| -> Result<(), String> {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), v);
+        Ok(())
+    };
+    ce("NUM_SEQS", Val::Int(i128::from(num_seqs)))?;
+    ce("NKVH", Val::Int(i128::from(NKVH)))?;
+    ce("GQA", Val::Int(i128::from(geom.gqa())))?;
+    ce("HD", Val::Int(i128::from(HD)))?;
+    ce("SLABS", Val::Int(i128::from(geom.slabs())))?;
+    ce(
+        "STK",
+        Val::Int(i128::from(ktir_superdsc::sdsc_abstract::POOL_STICK)),
+    )?;
+    ce(
+        "W4",
+        Val::Int(i128::from(
+            ktir_superdsc::sdsc_abstract::PagedKvPool::WINDOWS_PER_PAGE,
+        )),
+    )?;
+    ce("PITCH", Val::Int(i128::from(pitch)))?;
+    ce("REGION_PAGES", Val::Int(i128::from(region_pages)))?;
+    ce("SCALE", Val::Float(f64::from(scale)))?;
+    Ok(KernelSpec {
+        kernel: "paged_fold_batched_hm".to_string(),
+        signature,
+        constexprs,
+        file: "paged_fold_batched.py".to_string(),
+    })
+}
+
+/// THE BATCHED FINALIZE PROGRAM'S LAUNCH CONTRACT — `paged_fold_batched_finalize_hm`'s own
+/// parameter order (the output, the carried sum, the carried accumulator). The max is spent
+/// by the last pass, so nothing reads it here — the signature states no `desc_m`, and an
+/// unused parameter is not merely dead weight: Triton may drop it from the compiled
+/// signature and break the parameter-count guard below.
+fn paged_fold_batched_finalize_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
+    f: &PagedFoldBatchedFacts<NQH, NKVH, HD>,
+) -> Result<KernelSpec, String> {
+    let PagedFoldBatchedFacts { geom, num_seqs, .. } = *f;
+    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+    let mut constexprs: HashMap<String, Val> = HashMap::new();
+    for (p, ty) in [
+        ("desc_o", "*fp16"),
+        ("desc_l", "*fp16"),
+        ("desc_acc", "*fp16"),
+    ] {
+        signature.insert(
+            p.to_string(),
+            ArgSpec::parse(ty).map_err(|e| e.to_string())?,
+        );
+    }
+    let mut ce = |k: &str, v: Val| -> Result<(), String> {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), v);
+        Ok(())
+    };
+    ce("NUM_SEQS", Val::Int(i128::from(num_seqs)))?;
+    ce("NKVH", Val::Int(i128::from(NKVH)))?;
+    ce("GQA", Val::Int(i128::from(geom.gqa())))?;
+    ce("HD", Val::Int(i128::from(HD)))?;
+    ce("SLABS", Val::Int(i128::from(geom.slabs())))?;
+    ce(
+        "STK",
+        Val::Int(i128::from(ktir_superdsc::sdsc_abstract::POOL_STICK)),
+    )?;
+    Ok(KernelSpec {
+        kernel: "paged_fold_batched_finalize_hm".to_string(),
+        signature,
+        constexprs,
+        file: "paged_fold_batched.py".to_string(),
+    })
+}
+
+/// THE BATCHED PAGED-FOLD FAMILY'S MINT — the batched twin of [`mint_paged_fold`]: three
+/// programs in PROGRAM ORDER (seed, fold body, finalize), the bindings in the KERNEL's
+/// parameter order, the Kᵀ plane bound to the RESERVED tid keyed on the sealed pair's K
+/// tid and the V plane to the pair's own V tensor, the tables and mask as host-staged step
+/// inputs past the graph (the SAME slot law [`mint_attn`] numbers), and the carry bound to
+/// its three reserved tids — the placements the census mints, gated on the ladder's fold
+/// statement. The BODY carries the fold attribute with `batched_requests: true` — the ONE
+/// door the runtime's fold plan reads to collapse the per-pass walk to the batch's own
+/// page-ordinals (one launch per page-ordinal, every request row folded at once), never
+/// the per-request walk of the solo family.
+fn mint_paged_fold_batched<
+    F: scratchy_subtile::subtile_ir::RopeForm,
+    const NQH: u32,
+    const NKVH: u32,
+    const HD: u32,
+>(
+    geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    scale: f32,
+    region_pages: u32,
+) -> Result<Vec<EmittedOp>, String> {
+    let SubOp::AttnDecode { layout, .. } = &node.op else {
+        return Err(
+            "triton splice: mint_paged_fold_batched called on a node that is not an AttnDecode"
+                .to_string(),
+        );
+    };
+    let num_seqs = node.output.region.rows.len;
+    if num_seqs == 0 {
+        return Err(format!(
+            "triton splice: AttnDecode t{} states a zero-row decode output — the batched \
+             fold's NUM_SEQS is the request count and cannot be 0",
+            node.output.tensor.index()
+        ));
+    }
+    let facts = PagedFoldBatchedFacts {
+        geom,
+        num_seqs,
+        region_pages,
+        scale,
+    };
+    // ONE PROGRAM PER FAMILY MEMBER — grid [1, 1] is the family's own contract: every
+    // descriptor corner is a compile-time constant, the body's page loop is the RUNTIME's
+    // re-launch, not a `tl.static_range` walk.
+    let grid: Vec<i64> = vec![1, 1];
+    let row_src = |row: &TritonKernelRow| -> Result<(&str, Program), String> {
+        match row {
+            TritonKernelRow::Spliced { src, program, .. } => Ok((src, *program)),
+            TritonKernelRow::Refused(why) => Err(why.to_string()),
+        }
+    };
+    let (seed_src, seed_prog) = row_src(&paged_fold_batched_seed_row())?;
+    let (fold_src, fold_prog) = row_src(&paged_fold_batched_row())?;
+    let (fin_src, fin_prog) = row_src(&paged_fold_batched_finalize_row())?;
+    let seed_pos = attn_positional(
+        seed_src,
+        &paged_fold_batched_seed_spec(&facts)?,
+        &grid,
+        seed_prog,
+    )?;
+    let fold_pos = attn_positional(
+        fold_src,
+        &paged_fold_batched_spec(&facts)?,
+        &grid,
+        fold_prog,
+    )?;
+    let fin_pos = attn_positional(
+        fin_src,
+        &paged_fold_batched_finalize_spec(&facts)?,
+        &grid,
+        fin_prog,
+    )?;
+    // ⭐ THE TAPE'S REAL TENSOR INDICES over the adapter's positional ones — the same law
+    // `mint_attn` states: a splice that kept the positional ids would emit descriptors over
+    // `t0/t1/t2` while the tape's buffers are elsewhere.
+    let t =
+        |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
+    // The carry's three reserved tids — the census places exactly these, gated on the fold
+    // statement, so a binding and a placement can never disagree about which tensor is which.
+    let carry = |which: ktir_superdsc::reserved_tids::PagedFoldCarry| BufferId::new(which.tid());
+    let m_tid = carry(ktir_superdsc::reserved_tids::PagedFoldCarry::Max);
+    let l_tid = carry(ktir_superdsc::reserved_tids::PagedFoldCarry::Sum);
+    let acc_tid = carry(ktir_superdsc::reserved_tids::PagedFoldCarry::Acc);
+    // The step-input slot law is `mint_attn`'s own (the mask at 0, the two tables at 1 and 2)
+    // — the fold body states the SAME host-staged inputs the one-shot kernels do, at the
+    // SAME tids, so the placement pass and the runtime's staging treat every attention
+    // program of the bundle alike.
+    let n_tensors = ir.tensors.len() as u32;
+    let law = |slot: u32| BufferId::new(ktir_superdsc::ktir_node::step_input_tid(n_tensors, slot));
+    let mask_tid = law(attn_step_slots::MASK);
+    let kt_ids_tid = law(attn_step_slots::KT_BLOCK_IDS);
+    let v_ids_tid = law(attn_step_slots::V_BLOCK_IDS);
+    // The re-state: the positional node's func with THIS program's own name, bindings, mask
+    // and step inputs. The parameter-count guard is `mint_attn`'s own — the kernel's
+    // parameter list and the row's contract cannot diverge silently.
+    let restate = |positional: KtirNode,
+                   name: &'static str,
+                   bindings: Vec<BufferId>,
+                   mask: Option<BufferId>,
+                   step_inputs: Vec<ktir_superdsc::ktir_node::StepInput>|
+     -> Result<KtirNode, String> {
+        let KtirNode { func, program, .. } = positional;
+        if func.arguments.len() != bindings.len() {
+            return Err(format!(
+                "triton splice: {} compiled to {} parameters but the kernel's order states {} \
+                 bindings — the kernel's parameter list diverged from the row's contract",
+                func.name,
+                func.arguments.len(),
+                bindings.len()
+            ));
+        }
+        Ok(KtirNode {
+            func: ktir_core::ir::IRFunction { name, ..func },
+            program,
+            bindings,
+            mask,
+            step_inputs,
+            node_out_tid: None,
+            minted: Default::default(),
+        })
+    };
+    let id = node.id.index();
+    // ── THE SEED: the carry's three tensors, in the kernel's order (max, sum, accumulator).
+    // No step inputs, no mask — the program touches nothing the host stages. ──
+    let seed = restate(
+        seed_pos,
+        Arena::global().str(format!("attn_s{id}_bfseed")),
+        vec![m_tid, l_tid, acc_tid],
+        None,
+        Vec::new(),
+    )?;
+    // ── THE BODY: q, the carry, the pool planes, the tables, the mask — the kernel's own
+    // parameter order. ──
+    let fold = restate(
+        fold_pos,
+        Arena::global().str(format!("attn_s{id}_bfold")),
+        vec![
+            t(&node.inputs[0]),
+            m_tid,
+            l_tid,
+            acc_tid,
+            // ⭐ THE SCORE GATHER READS THE RESERVED Kᵀ PLANE — `KctResident` keyed on the
+            // sealed pair's K tid, the SAME expression the door's write tail and the solo
+            // fold's body state: minted through the TYPE so the binding cannot be spelled
+            // as the source tid (the gather door classifies it by kind, and a `KctResident`
+            // resolves to the reserved plane placement and nothing else).
+            BufferId::new(
+                ktir_superdsc::reserved_tids::KctResident::of(layout.cache_tensor().index() as u32)
+                    .wire_tid(),
+            ),
+            BufferId::new(layout.v_cache_tensor().index() as u32),
+            kt_ids_tid,
+            v_ids_tid,
+            mask_tid,
+        ],
+        Some(mask_tid),
+        vec![
+            ktir_superdsc::ktir_node::StepInput {
+                buffer: kt_ids_tid,
+                slot: attn_step_slots::KT_BLOCK_IDS,
+            },
+            ktir_superdsc::ktir_node::StepInput {
+                buffer: v_ids_tid,
+                slot: attn_step_slots::V_BLOCK_IDS,
+            },
+            ktir_superdsc::ktir_node::StepInput {
+                buffer: mask_tid,
+                slot: attn_step_slots::MASK,
+            },
+        ],
+    )?;
+    // ── THE FINALIZE: the output, the sum, the accumulator — in the kernel's order. ──
+    let fin = restate(
+        fin_pos,
+        Arena::global().str(format!("attn_s{id}_bffin")),
+        vec![t(&node.output), l_tid, acc_tid],
+        None,
+        Vec::new(),
+    )?;
+    // The BODY carries the fold attribute — the family's launch-ABI laws, stated at the one
+    // door the walk's stamp and the bake's proof read. `batched_requests: true` is what
+    // collapses the runtime's per-pass walk to the batch's own page-ordinals;
+    // `fold_rows: WholeBatch` is the batched carry's own regime (the whole batch's carry
+    // advances together — no per-request intermediate). `page_slots` is restated from the
+    // shared device law so the stamp never re-derives it.
+    let mut body = EmittedOp::paged_fold(
+        format!("attn_s{id}_bfold"),
+        ktir_superdsc::sdsc_abstract::PagedFold {
+            gathered: true,
+            batched_requests: true,
+            fold_rows: ktir_superdsc::sdsc_abstract::FoldRowRegime::WholeBatch,
+            page_slots: ktir_superdsc::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32,
+        },
+    );
+    body.ktir = Some(fold);
+    let mut seed_op = EmittedOp::bare(format!("attn_s{id}_bfseed"));
+    seed_op.ktir = Some(seed);
+    let mut fin_op = EmittedOp::bare(format!("attn_s{id}_bffin"));
+    fin_op.ktir = Some(fin);
+    Ok(vec![seed_op, body, fin_op])
 }
 
 /// THE ATTENTION MINT — the adapter's `node_for` compilation ([`attn_positional`]), then the
-/// attention's own re-state: the bindings in the DOOR's parameter order (q, out, then the
-/// segment pairs, with the output SECOND, not last), the mask as a bound synthetic tensor id
-/// (the graph's next free one — the builder's own `graph.tensors.len()` law for the mask id),
-/// and the builder's `attn_s{id}` name.
+/// attention's own re-state: the bindings in the KERNEL's parameter order (q, out, the two
+/// pool planes, the two block-entry tables, the mask), the Kᵀ plane bound to the RESERVED name
+/// keyed on the sealed pair's K tid (the door's own naming law, `KctResident::of(k).wire_tid()` — the same
+/// derivation the write's tail fills and main's card-proven reader reads; the pair's OWN K
+/// tensor is the NATURAL plane the write's cachewr copies fill, and the score gather must not
+/// read it — same size, wrong plane, invisible to every extent law) and the V plane to the
+/// pair's own V tensor (read natural), the two block-entry tables and the mask as host-staged
+/// step inputs past the graph (numbered through the one shared `step_input_tid` law and STATED
+/// on the node, so the producer's placement pass places exactly those tids and the runtime
+/// discovers them by placement), and the builder's `attn_s{id}` name.
+///
+/// ⭐ BOTH ROWS STATE THE SAME FIRST SEVEN: the two block-entry tables and the mask, the
+/// contract every attention program of a bundle declares. The decode row states ONE MORE —
+/// its OWN repetition table (`desc_rep`, slot `REP`): the batched decode's score rows are
+/// request-major while its q and o bytes ride head-major rows, and the table is the bridge
+/// between the two orders (an identity at one request). The prefill row's score rows ARE its
+/// q rows (token rows), so it declares nothing past the seven and this mint adds the eighth
+/// binding only when `rows_are_requests` — the same routing bit that chose the kernel at
+/// [`lower_attn_at`], threaded here so the binding list and the kernel's own parameter list
+/// are decided by ONE fact, never two that can disagree.
 fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     positional: KtirNode,
-    mask_bound: bool,
+    rows_are_requests: bool,
 ) -> Result<KtirNode, String> {
-    // ⛔ THE DOOR'S ORDER, NOT `lower_one`'s: q (inputs[0]), OUT (the node's output), then
-    // kc (inputs[1]), kd (inputs[3]), vc (inputs[2]), vd (inputs[4]) — the order
-    // `KtirFunc::attn`'s `arg_for` mints and `attn_operands` reads back. `regions()` zips
-    // `bindings[i]` against `arguments[i]`, so a swapped binding is a descriptor over the
-    // wrong tensor, and the door's `is_out` check is what catches a transposed q/out.
+    let SubOp::AttnDecode { layout, .. } = &node.op else {
+        return Err(
+            "triton splice: mint_attn called on a node that is not an AttnDecode".to_string(),
+        );
+    };
+    // ⛔ THE KERNEL'S ORDER, NOT `lower_one`'s — the shared seven-parameter contract both
+    // rows state, plus the decode row's own repetition table. `regions()` zips
+    // `bindings[i]` against `arguments[i]`, so a swapped or extra binding is a descriptor
+    // over the wrong tensor — the parameter-count guard below refuses the divergence.
     let t =
         |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
+    // ⭐ THE SYNTHETIC BINDING SLOTS — the contract's own `attn_step_slots` table (the
+    // paged-fold family's body states the same slots), numbered through the ONE shared law
+    // (`step_input_tid`).
+    let n_tensors = ir.tensors.len() as u32;
+    let law = |slot: u32| BufferId::new(ktir_superdsc::ktir_node::step_input_tid(n_tensors, slot));
+    let mask_tid = law(attn_step_slots::MASK);
+    let kt_ids_tid = law(attn_step_slots::KT_BLOCK_IDS);
+    let v_ids_tid = law(attn_step_slots::V_BLOCK_IDS);
+    let rep_tid = law(attn_step_slots::REP);
     let mut bindings = vec![
         t(&node.inputs[0]),
         t(&node.output),
-        t(&node.inputs[1]),
-        t(&node.inputs[3]),
-        t(&node.inputs[2]),
-        t(&node.inputs[4]),
+        // ⭐ THE SCORE GATHER READS THE RESERVED Kᵀ PLANE — `KctResident` keyed on the
+        // sealed pair's K tid, the SAME expression the door's write tail
+        // (ktir_superdsc_door.rs) and main's card-proven reader spell, and the tape layer's
+        // body-representative table before them: the THIRD sayer of one derivation. The pair's
+        // own K tensor is the NATURAL plane the write's cachewr copies fill; binding it here
+        // misreads real K as transposed — same size, wrong plane, invisible to every extent law
+        // (both planes are `plane_stride` per kv head). Minted through the TYPE so the binding
+        // cannot be spelled as the source tid: the gather door classifies it by kind, and a
+        // `KctResident` resolves to the reserved plane placement and nothing else.
+        BufferId::new(
+            ktir_superdsc::reserved_tids::KctResident::of(layout.cache_tensor().index() as u32)
+                .wire_tid(),
+        ),
+        BufferId::new(layout.v_cache_tensor().index() as u32),
+        kt_ids_tid,
+        v_ids_tid,
+        mask_tid,
     ];
-    // ⭐ THE MASK'S BINDING SLOT — the synthetic tensor BEYOND the graph, numbered the way
-    // the builder numbers it (`self.graph.tensors.len()`): the door skips the parameter
-    // by this very tid (`k.mask`), so beyond-the-graph is the only requirement, and the
-    // builder's own law is the graph's extent.
-    let mask_tid = mask_bound.then(|| BufferId::new(ir.tensors.len() as u32));
-    if let Some(m) = mask_tid {
-        bindings.push(m);
+    // ⭐ THE DECODE ROW'S OWN EIGHTH BINDING — the repetition table, the only parameter the
+    // two kernels' contracts do not share. Pushed (never spliced mid-list) so the shared
+    // seven keep their positions verbatim, and the step-input statement follows the same
+    // condition as the binding: a declared-but-unstaged slot is the fill side's desync to
+    // refuse, never a default this mint could paper over.
+    let mut step_inputs = vec![
+        ktir_superdsc::ktir_node::StepInput {
+            buffer: kt_ids_tid,
+            slot: attn_step_slots::KT_BLOCK_IDS,
+        },
+        ktir_superdsc::ktir_node::StepInput {
+            buffer: v_ids_tid,
+            slot: attn_step_slots::V_BLOCK_IDS,
+        },
+        ktir_superdsc::ktir_node::StepInput {
+            buffer: mask_tid,
+            slot: attn_step_slots::MASK,
+        },
+    ];
+    if rows_are_requests {
+        bindings.push(rep_tid);
+        step_inputs.push(ktir_superdsc::ktir_node::StepInput {
+            buffer: rep_tid,
+            slot: attn_step_slots::REP,
+        });
     }
     let name = Arena::global().str(format!("attn_s{}", node.id.index()));
     let KtirNode { func, program, .. } = positional;
     if func.arguments.len() != bindings.len() {
         return Err(format!(
-            "triton splice: {} compiled to {} parameters but the door's order states {} \
+            "triton splice: {} compiled to {} parameters but the kernel's order states {} \
              bindings — the kernel's parameter list diverged from the row's contract",
             func.name,
             func.arguments.len(),
@@ -1795,7 +3441,8 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         func: ktir_core::ir::IRFunction { name, ..func },
         program,
         bindings,
-        mask: mask_tid,
+        mask: Some(mask_tid),
+        step_inputs,
         node_out_tid: None,
         minted: Default::default(),
     })
@@ -1805,6 +3452,121 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// descriptor per operand plus the output), the constexprs (the node's facts as
 /// `tl.constexpr`s, the monomorphisation key), all in the case-table's own shape
 /// (`cases::spec`).
+/// The consumer that carries a rope node's `rope_fwd` spec across the head-dim door.
+struct RopeSpecAtTheDoor<'a, F: scratchy_subtile::subtile_ir::RopeForm> {
+    node: &'a SubtileNode<F>,
+    ir: &'a SubtileIR<F>,
+}
+
+impl<F: scratchy_subtile::subtile_ir::RopeForm> scratchy_subtile::model_geometry::OnHeadDim
+    for RopeSpecAtTheDoor<'_, F>
+{
+    type Out = Result<KernelSpec, String>;
+
+    fn on_head_dim<const HD: u32>(self) -> Self::Out {
+        rope_spec_at::<F, HD>(self.node, self.ir)
+    }
+}
+
+/// `rope.py`'s `rope_fwd` spec at a CONFIG-DECLARED head dim — the head width crosses
+/// [`scratchy_subtile::model_geometry::with_config_head_dim`] at the call site (the
+/// `kernel_spec` rope arm for a standalone `RopeRotate` row, or `lower_rope_append_at`
+/// directly for the append's rotation half), and `HEAD_DIM`/`HALF` bind the const generic
+/// the door hands down instead of the node's `head_dim` value: the model's head dim is a
+/// const, and this spec is one of its readers.
+fn rope_spec_at<F: scratchy_subtile::subtile_ir::RopeForm, const HD: u32>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+) -> Result<KernelSpec, String> {
+    let out = &node.output;
+    let total = out.region.cols.len;
+    // The door's contract, stated from the node's own facts: total = the output's
+    // declared width (`heads * hd`), heads = total / hd, mq = the output's rows —
+    // the same derivation `KtirFunc::rope`'s views state. The builder's own
+    // refusal (`total` not a whole number of `hd`-wide heads) is mirrored here
+    // as an `Err`: the node is malformed, and no kernel can state it.
+    if HD == 0 || !total.is_multiple_of(HD) {
+        return Err(format!(
+            "triton splice: rope t{}: {total} cols is not a whole number of \
+             {HD}-wide heads",
+            node.output.tensor.index()
+        ));
+    }
+    let heads = total / HD;
+    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+    let mut constexprs: HashMap<String, Val> = HashMap::new();
+    for p in ["desc_x", "desc_cos", "desc_sin", "desc_o"] {
+        signature.insert(
+            p.to_string(),
+            ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+        );
+    }
+    let mut ce = |k: &str, v: Val| -> Result<(), String> {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), v);
+        Ok(())
+    };
+    // ⭐ THE ROW WINDOW, THE PER-ROW ROPE LAW. The real front end's
+    // per-position decomposition mints rope nodes whose regions are ONE
+    // row's slice of the shared q plane — a row slice expressed by the
+    // ACCESS TILE's row corner (`R_START`), never by a taller view. The
+    // kernel therefore states `Y_TOTAL` (the x TENSOR's full re-tiled
+    // height `rows·H`, so the tile corners stay in bounds) and `R_START`
+    // (the window's row corner `ri·H`, baked into every load/store row);
+    // `MQ` is then the REGION's row count. A whole-region node states
+    // `R_START = 0`, `Y_TOTAL = MQ·H` — byte-identical to the one form
+    // this kernel used to state. ⛔ THE WINDOWING LAW, stated here because
+    // only this body reads the facts: all four regions share ONE row
+    // window, take WHOLE columns of `total`, and sit over tensors of ONE
+    // height (the single `Y_TOTAL` names all four views, and the
+    // head-replicated cos/sin reinterpretation is same-bytes only at that
+    // width).
+    let x = &node.inputs[0];
+    let window = (x.region.rows.start, x.region.rows.len);
+    let y_rows = ir.tensors[x.tensor.index()].rows;
+    for (tr, role) in [
+        (x, "the `x` view"),
+        (&node.inputs[1], "the `cos` view"),
+        (&node.inputs[2], "the `sin` view"),
+        (out, "the `out` view"),
+    ] {
+        let t_rows = ir.tensors[tr.tensor.index()].rows;
+        let shared = (tr.region.rows.start, tr.region.rows.len) == window;
+        let cols_whole = tr.region.cols.start == 0 && tr.region.cols.len == total;
+        if !shared || !cols_whole || t_rows != y_rows {
+            return Err(format!(
+                "triton splice: rope t{}: {role} states rows [{}, {}] × cols [{}, \
+                 {}] of a [{t_rows}, {}] tensor, but `x` states rows [{}, {}] over a \
+                 [{y_rows}, {total}] one — a rope's four regions must share ONE row \
+                 window and whole `total` columns over tensors of one height (the \
+                 single `Y_TOTAL` names all four views)",
+                node.output.tensor.index(),
+                tr.region.rows.start,
+                tr.region.rows.len,
+                tr.region.cols.start,
+                tr.region.cols.len,
+                ir.tensors[tr.tensor.index()].cols,
+                window.0,
+                window.1,
+            ));
+        }
+    }
+    let (r_start, mq_rows) = (window.0 * heads, window.1);
+    let y_total = y_rows * heads;
+    ce("H", Val::Int(i128::from(heads)))?;
+    ce("MQ", Val::Int(i128::from(mq_rows)))?;
+    ce("HEAD_DIM", Val::Int(i128::from(HD)))?;
+    ce("HALF", Val::Int(i128::from(HD / 2)))?;
+    ce("Y_TOTAL", Val::Int(i128::from(y_total)))?;
+    ce("R_START", Val::Int(i128::from(r_start)))?;
+    Ok(KernelSpec {
+        kernel: "rope_fwd".to_string(),
+        signature,
+        constexprs,
+        file: "rope.py".to_string(),
+    })
+}
+
 fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
@@ -2128,85 +3890,29 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             ce("SCALE", Val::Float(f64::from(*scale)))?;
         }
         (SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. }, "rope_fwd") => {
-            // The door's contract, stated from the node's own facts: total = the output's
-            // declared width (`heads * hd`), heads = total / hd, mq = the output's rows —
-            // the same derivation `KtirFunc::rope`'s views state. The builder's own
-            // refusal (`total` not a whole number of `hd`-wide heads) is mirrored here
-            // as an `Err`: the node is malformed, and no kernel can state it.
-            let hd = head_dim.get();
-            let total = c;
-            if hd == 0 || total % hd != 0 {
-                return Err(format!(
-                    "triton splice: rope t{}: {total} cols is not a whole number of \
-                     {hd}-wide heads",
-                    node.output.tensor.index()
-                ));
-            }
-            let heads = total / hd;
-            for p in ["desc_x", "desc_cos", "desc_sin", "desc_o"] {
-                signature.insert(
-                    p.to_string(),
-                    ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
-                );
-            }
-            let mut ce = |k: &str, v: Val| -> Result<(), String> {
-                signature.insert(k.to_string(), ArgSpec::Constexpr);
-                constexprs.insert(k.to_string(), v);
-                Ok(())
-            };
-            // ⭐ THE ROW WINDOW, THE PER-ROW ROPE LAW. The real front end's
-            // per-position decomposition mints rope nodes whose regions are ONE
-            // row's slice of the shared q plane — a row slice expressed by the
-            // ACCESS TILE's row corner (`R_START`), never by a taller view. The
-            // kernel therefore states `Y_TOTAL` (the x TENSOR's full re-tiled
-            // height `rows·H`, so the tile corners stay in bounds) and `R_START`
-            // (the window's row corner `ri·H`, baked into every load/store row);
-            // `MQ` is then the REGION's row count. A whole-region node states
-            // `R_START = 0`, `Y_TOTAL = MQ·H` — byte-identical to the one form
-            // this kernel used to state. ⛔ THE WINDOWING LAW, stated here because
-            // only this arm reads the facts: all four regions share ONE row
-            // window, take WHOLE columns of `total`, and sit over tensors of ONE
-            // height (the single `Y_TOTAL` names all four views, and the
-            // head-replicated cos/sin reinterpretation is same-bytes only at that
-            // width).
-            let x = &node.inputs[0];
-            let window = (x.region.rows.start, x.region.rows.len);
-            let y_rows = ir.tensors[x.tensor.index()].rows;
-            for (tr, role) in [
-                (x, "the `x` view"),
-                (&node.inputs[1], "the `cos` view"),
-                (&node.inputs[2], "the `sin` view"),
-                (out, "the `out` view"),
-            ] {
-                let t_rows = ir.tensors[tr.tensor.index()].rows;
-                let shared = (tr.region.rows.start, tr.region.rows.len) == window;
-                let cols_whole = tr.region.cols.start == 0 && tr.region.cols.len == total;
-                if !shared || !cols_whole || t_rows != y_rows {
+            // ⭐ THE HEAD DIM IS A CONST: the arm crosses the config-declared head-dim door
+            // — the same door `lower_rope_append_at` crosses for the whole node — and
+            // [`rope_spec_at`] binds `HEAD_DIM`/`HALF` off the const generic it hands
+            // down. `None` is a head width no config declares: refused loudly, naming the
+            // configs read; the fix is the `config.json` that names this model, never an
+            // edit here.
+            match scratchy_subtile::model_geometry::with_config_head_dim(
+                *head_dim,
+                RopeSpecAtTheDoor { node, ir },
+            ) {
+                Some(spec) => return spec,
+                None => {
                     return Err(format!(
-                        "triton splice: rope t{}: {role} states rows [{}, {}] × cols [{}, \
-                         {}] of a [{t_rows}, {}] tensor, but `x` states rows [{}, {}] over a \
-                         [{y_rows}, {total}] one — a rope's four regions must share ONE row \
-                         window and whole `total` columns over tensors of one height (the \
-                         single `Y_TOTAL` names all four views)",
+                        "triton splice: rope t{} states head dim {} — no config declares that \
+                         head width ({}); the model's head dims are const generics crossed at \
+                         this door, so the fix is the config that names this model, never an \
+                         edit here",
                         node.output.tensor.index(),
-                        tr.region.rows.start,
-                        tr.region.rows.len,
-                        tr.region.cols.start,
-                        tr.region.cols.len,
-                        ir.tensors[tr.tensor.index()].cols,
-                        window.0,
-                        window.1,
+                        head_dim.get(),
+                        scratchy_subtile::model_geometry::geometry_sources(),
                     ));
                 }
             }
-            let (r_start, mq_rows) = (window.0 * heads, window.1);
-            let y_total = y_rows * heads;
-            ce("H", Val::Int(i128::from(heads)))?;
-            ce("MQ", Val::Int(i128::from(mq_rows)))?;
-            ce("HEAD_DIM", Val::Int(i128::from(hd)))?;
-            ce("HALF", Val::Int(i128::from(hd / 2)))?;
-            ce("Y_TOTAL", Val::Int(i128::from(y_total)))?;
-            ce("R_START", Val::Int(i128::from(r_start)))?;
         }
         (SubOp::TanhSoftCap { cap }, "tanhsoftcap_fwd") => {
             // The kernel's own parameter spellings: desc_x, desc_o, then the constexprs
@@ -2510,8 +4216,7 @@ fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// where main's direct-emission builder paid none of it. The compile is a pure function
 /// of (source, spec, grid) — the ladder is deterministic — so the second and later
 /// callers get a CLONE of the first result. Every consumer mutates only its own copy
-/// (`mint`/`mint_attn` re-state names and bindings; `inject_dead_cache_views` and
-/// `truncate_unused_mask_param` edit their own copy), so a cached pristine `Module` is
+/// (`mint`/`mint_attn` re-state names and bindings), so a cached pristine `Module` is
 /// safe to hand out again.
 fn compile_kernel(
     src: &str,
@@ -2668,8 +4373,14 @@ fn default_bindings<F: scratchy_subtile::subtile_ir::RopeForm>(
 ) -> Vec<BufferId> {
     let t =
         |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
+    // ⭐ `RopeAppend` never routes through here — [`lower_rope_append`] states its bindings
+    // itself (the four stream operands plus the two pool planes off the sealed
+    // `KvCacheLayout`, no output binding: the write rides the door's recipe, so the
+    // carrier names its node's output on `node_out_tid` instead). Keeping it out of
+    // this match makes a misroute loud at the arity check instead of binding six
+    // as if three were the rotation.
     let n_bound = match &node.op {
-        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => 3,
+        SubOp::RopeRotate { .. } => 3,
         _ => node.inputs.len(),
     };
     let mut bindings: Vec<BufferId> = node.inputs.iter().take(n_bound).map(&t).collect();
@@ -2717,6 +4428,7 @@ fn mint<F: scratchy_subtile::subtile_ir::RopeForm>(
         program,
         bindings,
         mask: None,
+        step_inputs: Vec::new(),
         node_out_tid: None,
         minted: Default::default(),
     })
@@ -2752,6 +4464,10 @@ fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
         Program::SiluMul => "silumul",
         Program::Matmul => "matmul",
         Program::Rope => "rope",
+        // The append keeps the builder's `rope` stem at the mint — it IS the rope node —
+        // and `lower_rope_append` then renames the carrier `ropewr_s{id}` so the node's
+        // two programs (rotation + carrier) never share one name.
+        Program::RopeAppend => "rope",
         Program::ScalarMul => "scalarmul",
         // ⭐ THE SANDWICH'S OWN STEM — `rmsnorm_s{split.id}` (the split's id, not the
         // middle norm's), main's naming law for the fused per-head norm.
@@ -2760,6 +4476,7 @@ fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
         Program::TanhSoftCap => "tanhsoftcap",
         Program::ScalarWeightMul => "scalarwmul",
         Program::Reshape => "reshape",
+        Program::BlockCopy => "blkcp",
         _ => "triton",
     }
 }

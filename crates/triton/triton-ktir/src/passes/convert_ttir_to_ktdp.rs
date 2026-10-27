@@ -1230,17 +1230,40 @@ fn convert_gathers(module: &mut Module) -> Result<()> {
         .into_iter()
         .filter(|p| {
             walk::at(module, p)
-                .map(|o| o.kind == OpKind::TtDescriptorGather)
+                .map(|o| {
+                    matches!(
+                        o.kind,
+                        OpKind::TtDescriptorGather | OpKind::TtDescriptorScatter
+                    )
+                })
                 .unwrap_or(false)
         })
         .collect();
     let index = module.def_index();
     let mut edits: Vec<(OpPath, Vec<Op>)> = Vec::with_capacity(paths.len());
     for path in paths {
-        let op = walk::at(module, &path).expect("path").clone();
-        if op.kind != OpKind::TtDescriptorGather {
-            continue;
-        }
+        let mut op = walk::at(module, &path).expect("path").clone();
+        // ⭐ A SCATTER IS THE STORE TWIN OF A GATHER: `tt.descriptor_scatter %desc, %value,
+        // %x_offsets, %y_offset` addresses rows exactly as the gather does, so it lowers through
+        // the SAME indirect access tile and ends in a `ktdp.store` of `value` instead of a load.
+        let scatter_value = match op.kind {
+            OpKind::TtDescriptorGather => None,
+            OpKind::TtDescriptorScatter => {
+                if op.operands.len() != 4 {
+                    return Err(Refusal::new(
+                        PASS,
+                        format!(
+                            "tt.descriptor_scatter takes a descriptor, a value, an x_offsets \
+                             tensor and a y_offset; found {} operand(s)",
+                            op.operands.len()
+                        ),
+                    ));
+                }
+                let v = op.operands.remove(1);
+                Some(v)
+            }
+            _ => continue,
+        };
         // `tt.descriptor_gather %desc[%x_offsets, %y_offset]`.
         if op.operands.len() != 3 {
             return Err(Refusal::new(
@@ -1256,16 +1279,22 @@ fn convert_gathers(module: &mut Module) -> Result<()> {
             Refusal::new(PASS, "the gather's descriptor was not lowered by walk 1")
         })?;
         let (index_view, anchors) = trace_index_view(module, op.operands[1])?;
-        let result_ty = op
-            .result_type()
-            .cloned()
-            .ok_or_else(|| Refusal::new(PASS, "tt.descriptor_gather has no result type"))?;
+        let result_ty = match scatter_value {
+            Some(v) => index
+                .type_of(v)
+                .ok_or_else(|| Refusal::new(PASS, "tt.descriptor_scatter's value has no type"))?,
+            None => op
+                .result_type()
+                .cloned()
+                .ok_or_else(|| Refusal::new(PASS, "tt.descriptor_gather has no result type"))?,
+        };
         let result_shape = result_ty.dims().map(|d| d.to_vec()).unwrap_or_default();
         let (kinds, maps, space_set, space_order) =
             gather_subscripts(anchors.len(), &result_shape)?;
 
         let hint = op
             .result()
+            .or(scatter_value)
             .map(|r| module.hint(r))
             .unwrap_or_else(|| "gather".into());
         // The y_offset arrives as i32 and is cast to index, exactly as the direct path casts
@@ -1323,14 +1352,19 @@ fn convert_gathers(module: &mut Module) -> Result<()> {
                 ops: Vec::new(),
             });
 
-        let res = op.result().expect("a gather defines a value");
-        let load = Op::new(OpKind::KtdpLoad)
-            .with_result(res, result_ty)
-            .with_operands([tile_val]);
+        let access = match scatter_value {
+            Some(v) => Op::new(OpKind::KtdpStore).with_operands([v, tile_val]),
+            None => {
+                let res = op.result().expect("a gather defines a value");
+                Op::new(OpKind::KtdpLoad)
+                    .with_result(res, result_ty)
+                    .with_operands([tile_val])
+            }
+        };
 
         let mut replacement = casts;
         replacement.push(tile);
-        replacement.push(load);
+        replacement.push(access);
         edits.push((path, replacement));
     }
     walk::splice_many(module, edits);

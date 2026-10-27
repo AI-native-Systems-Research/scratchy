@@ -77,7 +77,7 @@ const NKVH: usize = 8;
 /// loudly the day the two split.
 #[test]
 fn the_pinned_request_stride_is_exactly_the_kv_head_stride() {
-    let pool = PagedKvPool::new(NKVH, HD);
+    let pool = PagedKvPool::new(NKVH as u32, HD as u32);
     let pinned = HD * PagedKvPool::PAGE_SLOTS;
     assert_eq!(
         pool.plane_block_elems(),
@@ -107,7 +107,7 @@ fn the_pinned_request_stride_is_exactly_the_kv_head_stride() {
 /// `r`'s keys. Every row gets real, well-formed keys belonging to the wrong head of the wrong request.
 #[test]
 fn stepping_the_batch_axis_by_the_pinned_constant_walks_the_kv_head_axis() {
-    let pool = PagedKvPool::new(NKVH, HD);
+    let pool = PagedKvPool::new(NKVH as u32, HD as u32);
     let nkvh_nz = std::num::NonZeroU32::new(NKVH as u32).expect("nkvh > 0");
     let head0 = KvHead::new(0, nkvh_nz).expect("kv head 0");
     let head1 = KvHead::new(1, nkvh_nz).expect("kv head 1");
@@ -130,7 +130,7 @@ fn stepping_the_batch_axis_by_the_pinned_constant_walks_the_kv_head_axis() {
 /// gave it, and the device never computes with that.
 #[test]
 fn the_only_axis_the_pinned_constant_matches_is_the_kv_head_one() {
-    let pool = PagedKvPool::new(NKVH, HD);
+    let pool = PagedKvPool::new(NKVH as u32, HD as u32);
     let nkvh_nz = std::num::NonZeroU32::new(NKVH as u32).expect("nkvh > 0");
     let kvh0 = KvHead::new(0, nkvh_nz).expect("kv head 0");
     let base = pool.addr(KvCoord::block(KvPlane::Kt, kvh0));

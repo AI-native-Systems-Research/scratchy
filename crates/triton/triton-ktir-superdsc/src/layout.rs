@@ -37,7 +37,8 @@
 //! states (`[hd, hd]` at the head dim its own output view declares). It does not place the
 //! constants whose extent nothing in the program says: `ATTN_MASK_TID` and `ATTN_CAUSAL_TID` are
 //! the worker's per-step tables sized by a prefix CAPACITY, `IDENTITY_TID` by the head dim of a
-//! geometry the program does not carry, `kct_resident_tid` is resident scratch. A placement with an
+//! geometry the program does not carry, the reserved Kᵀ name (`KctResident::wire_tid`) is
+//! resident scratch. A placement with an
 //! invented extent is the footprint guard's false negative — the guard compares an access against
 //! `p.size`, so a size this module made up turns the one check that catches an over-run into a
 //! rubber stamp. [`for_node`] therefore REFUSES a program whose entry point needs those, by name —
@@ -90,8 +91,9 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     //
     // ⭐ AND THE REFUSAL IS ABOUT THE **BODY THAT WILL RUN**, WHICH IS WHY IT IS GATED ON
     // [`is_per_program_node`]. The reserved constants below are named by the per-`Program` entry
-    // points — `attn_at`'s `ATTN_MASK_TID`/`IDENTITY_TID`/`kct_resident_tid(k)` are that hand-written
-    // body's device state, and it is the body that looks them up. The WHOLE-FUNCTION door never
+    // points — the deleted hand-written attention body's `ATTN_MASK_TID`/`IDENTITY_TID`/the
+    // reserved Kᵀ name (`KctResident::of(k).wire_tid()`) were that
+    // body's device state, and it was the body that looked them up. The WHOLE-FUNCTION door never
     // calls it: it walks the function's own ops, every operand of which is a parameter or an
     // in-function value, so nothing in that emission can reach a name this module did not place.
     //
@@ -161,7 +163,18 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
             });
         }
     }
-    let index_tids: std::collections::BTreeSet<u32> = gathers.iter().map(|g| g.index_tid).collect();
+    // ⭐ AND EVERY SCATTER'S INDEX — an indexed write's index buffer is the same `SenUint32`
+    // table a gather's is (the vendor's `test_scatter_1core` declares it identically).
+    let scatters =
+        ktir_superdsc::emit::lower_ktir_to_superdsc::scatters_of(node).map_err(|e| Error {
+            stage: "layout",
+            message: format!("{e:?}"),
+        })?;
+    let index_tids: std::collections::BTreeSet<u32> = gathers
+        .iter()
+        .map(|g| g.index_tid)
+        .chain(scatters.iter().map(|s| s.index_tid))
+        .collect();
 
     let mut placements: std::collections::BTreeMap<u32, TensorPlacement> = Default::default();
     // Bytes placed per segment so far — the running high-water [`pack`] appends at.
@@ -237,13 +250,20 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // The format is [`Df::Uint32`], which is the format the DESCRIPTOR declares for that operand
         // (`Role::KernelIdx` ⇒ SENUINT32, `wordLength` 4) — so the placement and the access are sized in
         // ONE format rather than in two that have to agree.
-        let df = if index_tids.contains(&reg.tid) {
-            Df::SenUint32
-        } else if reg.is_fp8 {
-            Df::Fp8
-        } else {
-            Df::Fp16
-        };
+        // ⭐⭐⭐ WALL 13 — THE FORMAT IS THE REGION'S OWN `df`, READ OFF ITS VIEW, NOT REBUILT HERE.
+        // This arm used to reconstruct the format from three guesses — `SenUint32` for a gather's
+        // index tid, `Fp8` for an fp8 view, `Fp16` for everything else — and "everything else" hid
+        // the one case the reconstruction cannot see: the online-softmax `m`/`l` merges, whose
+        // buffers the kernel states at `tl.float32` and whose views therefore declare IEEE f32.
+        // Sizing those at the fp16 word length placed HALF their true footprint — measured, the
+        // granite numeric gate: `construct_memory_view: view [128] strides [1] spans 512 bytes but
+        // the tensor allocated at byte 454541824 holds only 256` — a view the hardware addresses
+        // past its allocation. `Region::df` is the same view's `Dtype` through [`df_of_dtype`], so
+        // every case the old arms covered is byte-identical (an index view declares I32 ⇒
+        // `SenUint32`, an fp8 view ⇒ `Fp8`, an f16 view ⇒ `Fp16`) and the f32 case is now sized at
+        // its own 4-byte word — the placement and the access in ONE format, which is the law the
+        // index arm below already states.
+        let df = reg.df;
         // ⛔⛔⛔ A RUNG-3 BOUND SCALE — a `[1,1]` PARAMETER — IS 2 B, NOT ITS STICK-PADDED
         // FOOTPRINT. `synth_footprint_bytes(&[1,1], Fp16)` pads the inner axis to the
         // 64-elem stick (128 B), which is right for a tensor the descriptors address and
@@ -263,7 +283,13 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // never counts as tensor arity.
         let is_bound_scale = reg.v_rows == 1 && reg.v_cols == 1;
         let size = if is_bound_scale {
-            SCALE_BYTES
+            // ⭐ THE CONST'S OWN WORD LENGTH, NOT THE FIXED `SCALE_BYTES`: the runner's
+            // `const:t<id>=<value>` arm demands an EXACT payload match against the placement, and
+            // the payload is one word of the format the const's own view states — 2 B at f16
+            // (byte-identical to `SCALE_BYTES`, which is every const this ladder has bound), 4 B
+            // at f32. A fixed 2 B would refuse a correct f32 const bind the same way the 128 B
+            // stick-pad refused the f16 one.
+            df.word_length() as u64
         } else {
             synth_footprint_bytes(&[reg.v_rows, reg.v_cols], df)
         };
@@ -330,10 +356,10 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     //
     // ⭐ AND ITS EXTENT IS READ, NOT INVENTED, WHICH IS WHY THIS ONE RESERVED CONST CAN BE PLACED
     // HERE AT ALL. P is `[hd, hd]` fp16 — `rope_at` addresses it as
-    // `Stk::<KernelTag>::kernel(hd, hd, &p)` and scratchy places it at `hd * hd * 2` — and `hd` is
-    // stated by the program: `Region`'s own doc says the rope views its plane as `[rows·heads, hd]`,
-    // so the OUTPUT view's column count IS the head dim. Nothing is guessed, so the footprint guard
-    // keeps its teeth for P as well.
+    // `Stk::<KernelTag>::head_dim_square(hd, &p)` and scratchy places it at `hd * hd * 2` — and
+    // `hd` is stated by the program: `Region`'s own doc says the rope views its plane as
+    // `[rows·heads, hd]`, so the OUTPUT view's column count IS the head dim. Nothing is guessed,
+    // so the footprint guard keeps its teeth for P as well.
     //
     // ⛔ IT IS A DEVICE CONSTANT AND NOT A PARAMETER, so it is placed with the per-launch inputs
     // (`SegRole::Activation`) and not in the output segment: scratchy's own comment at this
@@ -521,6 +547,11 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // entry invented here would be a second, unwitnessed layout. `Program::Matmul` on a
         // Triton kernel therefore stages its weight FLAT, which is what an empty map states.
         kernel_weights: Default::default(),
+        // The standalone registry's format column: ALL Fp16 — this ladder's ONE staging
+        // channel binds one f16 word per const (`SCALE_BYTES = 2`), and a program stating a
+        // scale at another df is refused at the collection site (`scales_for_program_shape`)
+        // rather than silently narrowed, so the column never needs another entry.
+        scalarmul_scales_df: vec![Df::Fp16; scalarmul_scales.len()],
         scalarmul_scales,
         // No ScalarMul weight folds: a fold is a SUBTILE-GRAPH fact (a multiplier whose producer
         // is a matmul), and one Triton kernel's parameter list is not a graph — its scale consts
@@ -547,6 +578,31 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // No paged KV in a single Triton kernel's parameter list; 0 is the documented "no paged KV"
         // value, not a placeholder.
         kv_request_stride_bytes: 0,
+        // No pooled tables: a gather reach is declared by the consumer ladder's producer for a
+        // POOLED tensor — a placement covering one slice of a pool its index re-bases. One Triton
+        // kernel's parameter list places its tables whole, so there is no slice/pool split to
+        // state and the gather door bounds every run by the placement itself.
+        gather_reach: Default::default(),
+        // No host-staged step inputs: this layout serves ONE kernel minted through `node_for`,
+        // which is positional and states none. A node that states per-step inputs is placed by
+        // the consumer ladder's producer (`place_step_inputs`), whose layout this is not.
+        step_inputs: Default::default(),
+        // No KV block index to carry: the reservation is a whole-GRAPH fact (an `AttnDecode`
+        // node's gathered paged KV), and one Triton kernel's parameter list is not that graph —
+        // `Attn` is refused BY NAME at this crate's doors. `None` is "this bundle never
+        // gathers", which is the documented meaning, not a placeholder.
+        kv_block_index: None,
+        // No rep table either: the reservation is a whole-GRAPH fact (a batched decode row's
+        // rep slot), and one Triton kernel's parameter list is not that graph — the nodes that
+        // state step inputs are placed by the consumer ladder's producer
+        // (`place_step_inputs`), whose layout this is not. `None` is "this bundle states no
+        // rep", the documented meaning.
+        rep_table: None,
+        // No paged-fold region: the ceiling is a whole-GRAPH fact derived from a paged-KV pool's
+        // own stride (`compute_bundle_layout` records it beside the prefix mask), and one Triton
+        // kernel's parameter list places no pool — `Attn` is refused BY NAME at this crate's
+        // doors. `None` is "this bundle states no fold region", the documented meaning.
+        paged_fold_region_pages: None,
     })
 }
 
@@ -579,8 +635,9 @@ fn index_view_dtype(node: &KtirNode, tid: u32) -> Option<ktir_core::dtypes::DTyp
 /// `None` when it names none.
 ///
 /// ⛔ READ OFF THE BODIES, one by one. `rope_at` opens with `crate::place::act_name(ROPE_P_TID)`
-/// (the rotate matrix) and `attn_at` names `ATTN_MASK_TID`, `ATTN_CAUSAL_TID`, `IDENTITY_TID` and
-/// `kct_resident_tid(k_id)`. None of those is a buffer a Triton kernel declares. Every other body
+/// (the rotate matrix) and the deleted hand-written attention body named `ATTN_MASK_TID`,
+/// `ATTN_CAUSAL_TID`, `IDENTITY_TID` and the reserved Kᵀ name (`KctResident::of(k_id).wire_tid()`).
+/// None of those is a buffer a Triton kernel declares. Every other body
 /// names only its parameters and its own declared synthetics.
 ///
 /// ⭐ THE LINE IS NOT "IS IT A PARAMETER", IT IS "DOES THE PROGRAM STATE ITS EXTENT" — and that is
@@ -590,8 +647,9 @@ fn index_view_dtype(node: &KtirNode, tid: u32) -> Option<ktir_core::dtypes::DTyp
 /// is the rope output view's own column count (see [`for_regions`]'s P placement), so it is read.
 /// Attention's are not, and none of them is close: `ATTN_MASK_TID` is `[nqh·mq, cap]` over a prefix
 /// CAPACITY the worker chooses per step, `ATTN_CAUSAL_TID` the same, `IDENTITY_TID` is `[hd, hd]` at
-/// the head dim of a GQA geometry that reaches `attn_at` as a const generic and not as a view, and
-/// `kct_resident_tid` is resident scratch whose extent is the K cache's. So `Attn` stays refused BY
+/// the head dim of a GQA geometry that reached the hand-written attention as a const generic and
+/// not as a view, and
+/// the reserved Kᵀ name (`KctResident::wire_tid`) is resident scratch whose extent is the K cache's. So `Attn` stays refused BY
 /// NAME, which is the whole point of this function: `resolve_seg_base` PANICS on a name in neither
 /// `ids` nor the synth map, so the choice is a diagnostic here or a build crash there.
 /// Does this function go through the PER-`Program` door, or the whole-function walk?
@@ -622,11 +680,14 @@ fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
             "ATTN_MASK_TID",
             "ATTN_CAUSAL_TID",
             "IDENTITY_TID",
-            "kct_resident_tid(k)",
+            "KctResident::of(k).wire_tid()",
         ]),
         // `Rope` is HERE and not above: its one reserved constant is placed by [`for_regions`],
-        // from an extent the program states.
+        // from an extent the program states. `RopeAppend` joins it: its own body states no
+        // reserved constant (the stores are ordinary plane stores), and the Kᵀ tail that
+        // names the reserved Kᵀ name is the SPYRE door's emission, not this ladder's.
         Program::Rope
+        | Program::RopeAppend
         | Program::RmsNorm
         | Program::ScalarMul
         | Program::Elementwise(_)
@@ -645,6 +706,7 @@ fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
         | Program::TanhSoftCap
         | Program::ScalarWeightMul
         | Program::Reshape
+        | Program::BlockCopy
         | Program::WindowedRmsNorm { .. } => None,
     }
 }
@@ -678,6 +740,10 @@ fn pack(
             bank: 0,
             offset,
             size,
+            // ⭐ FULL — a spliced-program parameter is staged through the step-input fill,
+            // whose extent law is `==` exactly; the FoldBlocks family is the paged-fold
+            // pass's own, minted where its grid is computed.
+            cover: ktir_superdsc::placement::BindCover::Full,
         },
     ) {
         // A repeated tid means one buffer reached this walk twice — two parameters bound to it, or a
@@ -805,8 +871,28 @@ fn scales_for_program_shape(p: Program, f: &IRFunction<'static>) -> Result<Vec<f
         if op.result.is_some_and(|r| interior.contains(&r)) {
             continue;
         }
-        if let Some((v, _)) = W::splat_scale_of(f, op) {
-            push(v, &mut out);
+        if let Some(sf) = W::splat_scale_of(f, op) {
+            // ⛔ THE STANDALONE REGISTRY STAGES ONLY f16 SCALE SLOTS. The model path's registry
+            // carries each slot's own df (the completion pass threads it to the worker's staging
+            // channels — f16 fill and raw f32 word); THIS registry has ONE channel, the f16
+            // `[1,1]` const bind (`SCALE_BYTES = 2` in the pack loop below), so a program
+            // stating a scale constant at f32 — the f32 m-merge's own form — is refused BY NAME
+            // here rather than silently narrowed to its f16 image. Fail closed, the same law
+            // the model path's foreign-df refusal states.
+            let df =
+                ktir_superdsc::emit::lower_ktir_to_superdsc::scale_slot_df(f, sf.splat, sf.value);
+            if df != Df::Fp16 {
+                return Err(crate::Error {
+                    stage: "layout",
+                    message: format!(
+                        "{}: the scale slot for {} is stated at {:?}, and the standalone registry \
+                         does not stage f32 scale slots — its one channel binds one f16 word per \
+                         const, so this bundle cannot bake on this ladder",
+                        f.name, sf.value, df
+                    ),
+                });
+            }
+            push(sf.value, &mut out);
         }
     }
     Ok(out)
@@ -844,7 +930,7 @@ fn scales_for(p: Program, f: &IRFunction<'static>) -> Vec<f32> {
         Program::RmsNorm => L::program_rmsnorm_eps(f).into_iter().collect(),
         // `scalarmul` resolves ONE value: `scale_slot(layout, program_scalarmul_scale(&k.func))`.
         Program::ScalarMul => L::program_scalarmul_scale(f).into_iter().collect(),
-        // `attn_at` resolves TWO — the score scale AND its square root, in that order:
+        // `Program::Attn` resolves TWO — the score scale AND its square root, in that order:
         // `scale_idx` on `scale_val`, then `sqrt_scale_idx` on `scale_val.sqrt()`, because
         // "torch-spyre splits into sqrt_scale on both Q and K". `compute_bundle_layout` pushes the
         // same pair for `SubOp::AttnDecode` (`push_scale(*scale)` then `push_scale(scale.sqrt())`).
@@ -856,7 +942,7 @@ fn scales_for(p: Program, f: &IRFunction<'static>) -> Vec<f32> {
         },
         // ⭐ EMPTY, AND THAT IS THE ANSWER FOR THESE. None of these bodies calls `scale_slot` or
         // indexes `scalarmul_scales` — grep over the file: the only readers are `rmsnorm`,
-        // `scalarmul`, `attn_at` and `scale_idx_of` (which only recognises a RESERVED tid among the
+        // `scalarmul` and `scale_idx_of` (which only recognises a RESERVED tid among the
         // parameters and finds none when the registry is empty). A value registered for them would
         // occupy a slot nothing asks for.
         Program::Elementwise(_)
@@ -864,7 +950,8 @@ fn scales_for(p: Program, f: &IRFunction<'static>) -> Vec<f32> {
         | Program::LmLast
         | Program::Transpose
         | Program::Matmul
-        | Program::Rope => Vec::new(),
+        | Program::Rope
+        | Program::RopeAppend => Vec::new(),
         // ⭐ EMPTY FOR THE SAME REASON, ONE STEP EARLIER: none of these programs has a body on
         // this ladder (the splice produces none of them and the door refuses them by name), so
         // there is no body to ask which values it looks up. A value registered for a program that
@@ -875,6 +962,7 @@ fn scales_for(p: Program, f: &IRFunction<'static>) -> Vec<f32> {
         | Program::TanhSoftCap
         | Program::ScalarWeightMul
         | Program::Reshape
+        | Program::BlockCopy
         | Program::WindowedRmsNorm { .. } => Vec::new(),
     }
 }
@@ -1021,6 +1109,7 @@ mod tests {
                 BufferId::new(404),
             ],
             mask: None,
+            step_inputs: Vec::new(),
             node_out_tid: None,
             minted: Default::default(),
         };

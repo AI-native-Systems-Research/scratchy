@@ -29,8 +29,8 @@ use std::marker::PhantomData;
 use crate::sdsc_abstract::QueryRowCount;
 
 /// ⭐ WHICH FORM a SHARED-KERNEL batched (`y > 1`, 2-D-kernel) matmul takes: the RUNG REGIME it is
-/// emitted under, carried as a VALUE of that regime's sealed type. Threaded from `assemble_attn`
-/// down through the opspec builders — no env var, no thread-local, no site that infers it from a
+/// emitted under, carried as a VALUE of that regime's sealed type. Threaded from the attention
+/// boundary down through the opspec builders — no env var, no thread-local, no site that infers it from a
 /// row count. The declared rank-3 walk ORDER and the work-division policy are not stored here at
 /// all: both are ASSOCIATED to the regime type ([`RungRegime`]), so this form can only relay them,
 /// never recombine them.

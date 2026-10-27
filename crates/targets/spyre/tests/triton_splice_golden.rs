@@ -555,6 +555,7 @@ fn spliced_dense_matmul_executes_the_real_program() {
 
 /// One spliced dense matmul through the production session entry, checked against a
 /// host reference over the SAME on-disk `[n, k]` weight bytes the worker binds.
+#[cfg(feature = "spyre-emu")]
 fn execute_one_spliced_matmul(m: u32, k: u32, n: u32) {
     use std::borrow::Cow;
 
@@ -615,9 +616,14 @@ fn execute_one_spliced_matmul(m: u32, k: u32, n: u32) {
         }
     }
 
-    let mut session =
-        scratchy_target_spyre::runner::SpyreSession::new_multi(&[(&[group], &[2u64])], Vec::new())
-            .expect("build the one-program session");
+    let mut session = scratchy_target_spyre::runner::SpyreSession::new_multi(
+        &[(&[group], &[2u64])],
+        Vec::new(),
+        // No scale slot in this program's sources — the empty stage table is the
+        // byte-identical incumbent (seat (i) declares nothing when nothing is f32).
+        &[],
+    )
+    .expect("build the one-program session");
     let out = session
         .run_step(
             0,
@@ -661,6 +667,7 @@ fn spliced_elementwise_executes_the_real_program() {
 
 /// One spliced elementwise program through the production session entry, checked
 /// against a host reference.
+#[cfg(feature = "spyre-emu")]
 fn execute_one_spliced_elementwise(m: u32, c: u32, kind: EwKind) {
     use std::borrow::Cow;
 
@@ -711,9 +718,14 @@ fn execute_one_spliced_elementwise(m: u32, c: u32, kind: EwKind) {
         other => unreachable!("exec fixture for {other:?}"),
     };
 
-    let mut session =
-        scratchy_target_spyre::runner::SpyreSession::new_multi(&[(&[group], &[2u64])], Vec::new())
-            .expect("build the one-program session");
+    let mut session = scratchy_target_spyre::runner::SpyreSession::new_multi(
+        &[(&[group], &[2u64])],
+        Vec::new(),
+        // No scale slot in this program's sources — the empty stage table is the
+        // byte-identical incumbent (seat (i) declares nothing when nothing is f32).
+        &[],
+    )
+    .expect("build the one-program session");
     let sources = if matches!(kind, EwKind::Silu) {
         vec![(0u64, a, vec![m as usize, c as usize])]
     } else {
@@ -753,6 +765,7 @@ fn spliced_gelu_executes_the_real_program() {
 
 /// One spliced gelu program through the production session entry, checked against the
 /// tanh-form host reference.
+#[cfg(feature = "spyre-emu")]
 fn execute_one_spliced_gelu(m: u32, c: u32) {
     use std::borrow::Cow;
 
@@ -802,9 +815,14 @@ fn execute_one_spliced_gelu(m: u32, c: u32) {
         })
         .collect();
 
-    let mut session =
-        scratchy_target_spyre::runner::SpyreSession::new_multi(&[(&[group], &[2u64])], Vec::new())
-            .expect("build the one-program session");
+    let mut session = scratchy_target_spyre::runner::SpyreSession::new_multi(
+        &[(&[group], &[2u64])],
+        Vec::new(),
+        // No scale slot in this program's sources — the empty stage table is the
+        // byte-identical incumbent (seat (i) declares nothing when nothing is f32).
+        &[],
+    )
+    .expect("build the one-program session");
     let out = session
         .run_step(0, vec![(0u64, a, vec![m as usize, c as usize])], &[(2, 0)])
         .unwrap_or_else(|_| panic!("run the spliced gelu program (m={m} c={c})"));
@@ -1032,6 +1050,7 @@ fn a_prompt_chunks_rope_does_not_grow_with_its_rows() {
 
 /// One spliced rope program through the production session entry, checked against a
 /// host NeoX reference over the worker-staged bytes.
+#[cfg(feature = "spyre-emu")]
 fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
     use std::borrow::Cow;
 
@@ -1115,9 +1134,14 @@ fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
         }
     }
 
-    let mut session =
-        scratchy_target_spyre::runner::SpyreSession::new_multi(&[(&[group], &[2u64])], Vec::new())
-            .expect("build the one-program session");
+    let mut session = scratchy_target_spyre::runner::SpyreSession::new_multi(
+        &[(&[group], &[2u64])],
+        Vec::new(),
+        // No scale slot in this program's sources — the empty stage table is the
+        // byte-identical incumbent (seat (i) declares nothing when nothing is f32).
+        &[],
+    )
+    .expect("build the one-program session");
     let out = session
         .run_step(
             0,
@@ -1332,6 +1356,7 @@ fn spliced_fp8_matmul_executes_the_real_program() {
 /// a host reference over the SAME packed e4m3 bytes and per-channel scale the
 /// worker binds (`spyre_load.rs`'s fp8 arm stages the weight verbatim 1-byte;
 /// `weight_arg`'s `Fp8E4m3` arm mirrors it here).
+#[cfg(feature = "spyre-emu")]
 fn execute_one_spliced_fp8_matmul(m: u32, k: u32, n: u32) {
     let ir = matmul_fp8_ir(m, k, n);
     let node = &ir.nodes[0];
@@ -1386,6 +1411,7 @@ fn execute_one_spliced_fp8_matmul(m: u32, k: u32, n: u32) {
 
 /// Run ONE fp8 matmul KtirNode through the production session entry with the
 /// given host bytes, returning the `[m, n]` output.
+#[cfg(feature = "spyre-emu")]
 fn execute_fp8_program(
     m: u32,
     k: u32,
@@ -1447,6 +1473,9 @@ fn execute_fp8_program(
                 vec![1, n as usize],
             ),
         ],
+        // No scale slot in this program's sources — the empty stage table is the
+        // byte-identical incumbent (seat (i) declares nothing when nothing is f32).
+        &[],
     )
     .unwrap_or_else(|e| panic!("build the one-program session (m={m} k={k} n={n}): {e}"));
     let out = session
@@ -1582,10 +1611,10 @@ fn spliced_rope_lowers_through_the_door() {
                 // rung to widen it: the gather follows the row kind here.
                 gathers_kv: rows_are_requests,
                 chunk_pages: None,
-                // Not in weights: this fixture's q/k are Ext sources with no projection
+                // Stated by the program: this fixture's q/k are Ext sources with no projection
                 // matmuls, so the program states its real scale and the door emits the score
                 // multiplies.
-                scale_in_weights: false,
+                scale_law: ktir_superdsc::score_scale::ScoreScaleLaw::StatedByProgram,
                 // No handoff: this fixture's rope program has no o matmul at all, and a stated
                 // handoff without one is the door's own refusal.
                 headmajor_handoff: false,
@@ -1695,7 +1724,7 @@ fn rope_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
 // THE ATTENTION GOLDEN
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// One attention shape the golden compares: everything the spliced `attn.py` derives its program
+/// One attention shape the golden compares: everything the spliced attention kernel derives its program
 /// from — geometry, rung, cache producer — so a shape here is one (arm × geometry × rung ×
 /// producer) cell of the delivery scope.
 #[derive(Clone, Copy)]
@@ -1900,13 +1929,24 @@ fn attn_ir(s: AttnShape, scale: f32) -> SubtileIR {
                 rows: new_len,
                 cols: kv_width,
             }, // 4: new_v
+            // ⭐ 5/6: cos/sin AT THE K STREAM'S OWN WIDTH — to_wavefront's production binding:
+            // "Cos/sin pre-tiled to each rope's full width (GQA: Q and K differ)", the K-side
+            // tables minted through `bx.cos_sin(k_cols)` over the K projection's own width,
+            // and the worker fills them head-replicated at exactly that width
+            // (`spyre_forward.rs`'s `tile`: a `[rows, width]` source, the per-position rotary
+            // row repeated `width / head_dim` times per row). The splice's windowing law
+            // demands this staging — x, cos, sin and v share ONE row window and take WHOLE
+            // `total` columns over tensors of one height, `total` being the append's output
+            // width (`kv_width`) — so a `[mq, q_width]` cos beside a `[new_len, kv_width]` x
+            // refuses at the mint. Rows are `new_len` (the rope op's own `m`, the shared
+            // window; equal to `mq` by this fixture's own `new_len` derivation above).
             scratchy_subtile::subtile_ir::SourceShape {
-                rows: mq,
-                cols: q_width,
+                rows: new_len,
+                cols: kv_width,
             }, // 5: cos
             scratchy_subtile::subtile_ir::SourceShape {
-                rows: mq,
-                cols: q_width,
+                rows: new_len,
+                cols: kv_width,
             }, // 6: sin
         ]
     };
@@ -2014,7 +2054,17 @@ fn the_kv_block_index_moves_no_other_staged_activation() {
                 )
             })
         };
-        let (plain, gathering) = (layout(false), layout(true));
+        let plain = layout(false);
+        // ⭐ PRODUCTION'S ORDER, MIRRORED: `compute_bundle_layout` only RECORDS the
+        // index's reservation (carried into the layout as its `kv_block_index`);
+        // each walk PLACES it last of all, after every host-staged placement,
+        // through the one door `BundleLayout::place_kv_block_index_last`
+        // (lower_subtile_tape_to_ktir.rs's walks, :1237 and :2767). Mirroring that
+        // call here is what runs the assertions below against the REAL sequence —
+        // reading `placements` straight off the mint is the stale half-sequence
+        // this test was born red on (57b: "a gathering bundle placed no index").
+        let mut gathering = layout(true);
+        gathering.place_kv_block_index_last();
         assert!(
             !plain.placements.contains_key(&KV_BLOCK_INDEX_TID),
             "geom={:?}: a bundle that does not gather placed the index",
@@ -2048,8 +2098,13 @@ fn spliced_attn_lowers_through_the_door() {
         // ⛔ ROWS-ARE-REQUESTS IS A DECODE-BUNDLE FACT: the bake states it per
         // bundle — a decode batch's rows are requests, a prefill chunk's rows are
         // positions of one sequence. The gate states it the way the bake does:
-        // decode (mq == 1) tries BOTH kinds (the door's GQA-replicate and
-        // kv_block_index arms differ), prefill only `false`.
+        // decode (mq == 1) tries BOTH kinds, prefill only `false`. `false` at
+        // mq == 1 is PRODUCTION'S ROUTING — the bake states
+        // `rows_are_requests = !is_prefill && decode_rows > 1`, so the judgment's
+        // solo decode lowers through the prefill arm and those cells MUST lower
+        // green. `true` at mq == 1 is the batched kernel's slot merge at
+        // NUM_SEQS = 1, a width production never bakes — the sub-stick class the
+        // door-lowering block below expects and pins.
         let row_kinds: &[bool] = if s.mq == 1 { &[false, true] } else { &[false] };
         for &rows_are_requests in row_kinds {
             // granite's attention_multiplier, the config value (NOT a recomputed 1/sqrt(hd)):
@@ -2060,8 +2115,11 @@ fn spliced_attn_lowers_through_the_door() {
             // activation or a KV cache (the layout walk re-places the caches into seg2 itself).
             let weight_ids: HashSet<u32> = HashSet::new();
 
-            // The layout the tape walk computes for this graph.
-            let layout = compute_bundle_layout(
+            // The layout the tape walk computes for this graph — MUTABLE here because the
+            // producer's placement pass extends it: the host-staged inputs the spliced
+            // program states are placed after the splice, before the door, exactly where
+            // the re-rolled walk runs the pass.
+            let mut layout = compute_bundle_layout(
                 &ir,
                 &weight_ids,
                 rows_are_requests,
@@ -2077,20 +2135,124 @@ fn spliced_attn_lowers_through_the_door() {
             let node = ir.nodes.last().unwrap();
             let cap = ir.tensors[node.inputs[1].tensor.index()].rows;
 
-            // The splice — `lower_attn` compiles attn.py for this node's geometry and rung.
-            let spliced = scratchy_triton_splice::lower_attn(node, &ir, cap, s.active_cap())
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "splice compiled geom={:?} mq={} rung={} r_ar={rows_are_requests}: {e}",
-                        s.geom, s.mq, s.rung
-                    )
-                });
+            // The splice — `lower_attn` compiles the attention kernel for this node's geometry and rung.
+            // No fold statement on these fixtures (`None`): the one-shot form, ONE program —
+            // the paged-fold family is the chunked-ladder rung's own statement, pinned by its
+            // own fixtures.
+            let spliced_result = scratchy_triton_splice::lower_attn(
+                node,
+                &ir,
+                cap,
+                s.active_cap(),
+                rows_are_requests,
+                None,
+                // The fixtures' nodes carry real multipliers (0.015625/0.0078125 below) and no
+                // fold receipt, so their law is the one every real-batch model lives under: the
+                // program states the whole scale.
+                scratchy_triton_splice::AttnBundleFacts {
+                    scale_law: Some(ktir_superdsc::score_scale::ScoreScaleLaw::StatedByProgram),
+                    out_stays_head_rows: false,
+                },
+            );
+            // ⛔ ALL-SHAPE KERNELS — the STEP B law, pinned here, never skipped.
+            // The kernels' geometry is CONST-GENERIC: SLABS is bound from
+            // `AttnGeometry::slabs()` (hd 128 = 2 slabs), KTB from the geometry's
+            // own stick width, PITCH from `AttnGeometry::table_pitch()` — so every
+            // geometry in the table LOWERS, and a splice that REFUSES one fails by
+            // name. (These cells used to pin the kernels' own HD-64 static_assert —
+            // "the V plane's [64, HD] block is one contiguous stick block only at HD
+            // 64" — a designed refusal this branch deleted when the per-slab V
+            // gather landed; a rung that cannot lower is a compile error now, never
+            // a runtime skip.)
+            let spliced_ops = spliced_result.unwrap_or_else(|e| {
+                panic!(
+                    "splice compiled geom={:?} mq={} rung={} r_ar={rows_are_requests}: {e}",
+                    s.geom, s.mq, s.rung
+                )
+            });
+            // ⭐ ONE PROGRAM AT ONE SLAB, THREE PAST IT: at a multi-slab head dim the token
+            // stream and the kernel's `[nqh·R, HD]` per-head rows are different bytes, so the
+            // splice wraps the one-shot program in the head relayout's two copies
+            // (`HeadRelayout`: q into the rows before it, the output back after it).
+            let multi_slab = s.geom.2 > ktir_superdsc::sdsc_abstract::POOL_STICK;
+            assert_eq!(
+                spliced_ops.len(),
+                if multi_slab { 3 } else { 1 },
+                "a foldless `lower_attn` returns the one-shot program, wrapped in the head \
+                 relayout's two copies past one slab (geom={:?} mq={} rung={})",
+                s.geom,
+                s.mq,
+                s.rung
+            );
+            let spliced = &spliced_ops[usize::from(multi_slab)];
 
             // ⛔ THE NAME LAW — `attn_s{id}`.
             assert_eq!(
                 spliced.op_name,
                 format!("attn_s{}", node.id.index()),
                 "op_name (geom={:?} mq={} rung={})",
+                s.geom,
+                s.mq,
+                s.rung
+            );
+
+            // ⛔ THE REGION FACT RIDES EVERY CARRIER, UNCONDITIONALLY — the trigger fix's
+            // anti-regression pin (the CARRIER half; the walk-stamp half lives in the spyre
+            // crate's own tests). The one-shot program gathers the paged pool through the
+            // absolute-entry tables in BOTH row arms (`mint_attn` binds the id tables either
+            // way), so a carrier minted BARE — the hole this pins shut — is a double-based
+            // read: the page base composed on top of the absolute entries. The prefix-free
+            // rungs (`rung == u32::MAX`, a start==0 chunk whose ladder stated no fold region)
+            // are the shapes that hit that hole, and they run right here in this table.
+            let region = spliced.kv_paged_region.unwrap_or_else(|| {
+                panic!(
+                    "the one-shot carrier states its paged region (geom={:?} mq={} rung={} \
+                     r_ar={rows_are_requests}) — a bare carrier double-bases its reads",
+                    s.geom, s.mq, s.rung
+                )
+            });
+            // The region's VALUE is the arm's own contract, stated above at the mint: BOTH
+            // arms' specs default a `None` region to the walk's own extent — the decode arm's
+            // the pages its valid length spans (`valid_len.div_ceil(PAGE_SLOTS)`, the batched
+            // family's page-major region), the prefill arm's the pages the chunk attends, read
+            // off the node's own regions exactly as the arm reads them.
+            let expected_pages = if rows_are_requests {
+                ATTN_VALID_LEN
+                    .div_ceil(ktir_superdsc::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32)
+            } else {
+                let prefix_len = node.inputs[1].region.rows.len;
+                let new_len = node.inputs[3].region.rows.len;
+                (prefix_len + new_len)
+                    .div_ceil(ktir_superdsc::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32)
+            };
+            assert_eq!(
+                region.region_pages, expected_pages,
+                "the region's page count is the arm's own pages contract (geom={:?} mq={} \
+                 rung={} r_ar={rows_are_requests})",
+                s.geom, s.mq, s.rung
+            );
+            // The pool's tids ride with the region — the same pair the stamp site's reach
+            // guard asks the layout for, so the stamp and the placement can never name
+            // different pools.
+            let scratchy_subtile::subtile_ir::SubOp::AttnDecode { layout: kv, .. } = &node.op
+            else {
+                panic!(
+                    "the attention fixture's last node is an AttnDecode (geom={:?})",
+                    s.geom
+                );
+            };
+            assert_eq!(
+                region.k_tid,
+                kv.cache_tensor().index() as u32,
+                "the region's K tid is the node's own K cache (geom={:?} mq={} rung={})",
+                s.geom,
+                s.mq,
+                s.rung
+            );
+            assert_eq!(
+                region.v_tid,
+                kv.v_cache_tensor().index() as u32,
+                "the region's V tid is the node's own V cache (geom={:?} mq={} rung={})",
                 s.geom,
                 s.mq,
                 s.rung
@@ -2121,9 +2283,55 @@ fn spliced_attn_lowers_through_the_door() {
                 );
             }
 
+            // The producer's own placement pass, run at its own site in the walk (after the
+            // splice has stated its bindings, before the door): every host-staged input the
+            // spliced program states takes a seg-ACTIVATION placement minted from the
+            // program's own view, checked against the numbering law — the pass the door's
+            // unplaced-parameter refusal waits for.
+            scratchy_target_spyre::lower_subtile_tape_to_superdsc::place_step_inputs(
+                &mut layout,
+                &[std::slice::from_ref(spliced)],
+                ir.tensors.len() as u32,
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "step inputs placed (geom={:?} mq={} rung={} r_ar={rows_are_requests}): {}",
+                    s.geom, s.mq, s.rung, e
+                )
+            });
+            // The head relayout's row-frame buffers, placed from the programs' own views —
+            // the same pass the walks run beside `place_step_inputs` (a no-op at one slab).
+            scratchy_target_spyre::lower_subtile_tape_to_ktir::place_head_rows(
+                &mut layout,
+                &[spliced_ops.as_slice()],
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "head rows placed (geom={:?} mq={} rung={} r_ar={rows_are_requests}): {}",
+                    s.geom, s.mq, s.rung, e
+                )
+            });
+
+            // The walk's own scale-registry completion, run at its own site (beside the
+            // placement pass, before the door): the spliced program states its exp2-restated
+            // constant as a front-end FOLD of two config constants (`SCALE * LOG2E`), which no
+            // graph payload names, so the registry's program-stated half is what the door's
+            // by-bits lookup resolves it through.
+            scratchy_target_spyre::lower_subtile_tape_to_ktir::complete_program_scales(
+                &mut layout,
+                &[std::slice::from_ref(spliced)],
+            );
+            // The walk's own TAIL placements, in its own order (`lower_subtile_tape_to_ktir`'s
+            // re-rolled walk and `lower_subtile_tape_to_superdsc`'s unrolled one): the KV block
+            // index, then the batched arm's Q repetition table, which `place_step_inputs`
+            // defers because it is the one step input whose presence differs between a
+            // session's bodies. Both are no-ops when nothing was deferred.
+            layout.place_kv_block_index_last();
+            layout.place_rep_table_last();
+
             // The program lowers through the production door under the walk's own
             // layout, with the bundle facts stated exactly as the tape walk states
-            // them (`attn_at` reads the swept extent, the scale, the span guard and
+            // them (the door reads the swept extent, the scale, the span guard and
             // the row laws off the program).
             let attn_params = scratchy_target_spyre::ktir_superdsc_door::BundleAttnParams {
                 rows_are_requests,
@@ -2131,9 +2339,9 @@ fn spliced_attn_lowers_through_the_door() {
                 // rung to widen it: the gather follows the row kind here.
                 gathers_kv: rows_are_requests,
                 chunk_pages: None,
-                // Not in weights: same as the rope door's fixture — the program states its real
-                // scale.
-                scale_in_weights: false,
+                // Stated by the program: same as the rope door's fixture — the program states
+                // its real scale.
+                scale_law: ktir_superdsc::score_scale::ScoreScaleLaw::StatedByProgram,
                 // No handoff: this fixture's attention output is the graph RESULT (no o matmul
                 // consumes it), so the dataflow the handoff keys on finds no edge — stated here
                 // exactly as `attn_bundle_params` would state it for such a graph.
@@ -2141,18 +2349,44 @@ fn spliced_attn_lowers_through_the_door() {
                 oproj_wtid: None,
             };
             let mut sym = 0i64;
-            let _emitted = door_lower(
-                spliced.ktir.as_ref().expect("spliced op carries its program"),
-                &mut sym,
-                Some(&layout),
-                Some(attn_params),
-            )
-            .unwrap_or_else(|e| {
-                panic!(
-                    "spliced program lowered (geom={:?} mq={} rung={} r_ar={rows_are_requests}): {}",
-                    s.geom, s.mq, s.rung, e.message
+            // ⭐ THE BATCHED ARM LOWERS AT EVERY WIDTH, `NUM_SEQS = 1` INCLUDED. The old
+            // `batched_decode_hm` merged its slots with `tl.max(mm, 0)` down to
+            // `[NUM_SEQS·NKVH, GQA]` — 32 survivor lanes at this geometry, half a stick, wall
+            // 13's refusal site — and this cell pinned that refusal. The rework's landing is
+            // torch's `_merge_entry_local` at `J == 1` stated as the identity (weights
+            // `exp2(m − m) = 1`, the denominator the carry itself), so there is no survivor
+            // merge left to refuse: the `r_ar=true` cell now pins that the batched arm LOWERS
+            // with its repetition table placed at the tail. A reintroduced merge, or any other
+            // door refusal, fails here by name.
+            if rows_are_requests {
+                assert!(
+                    layout.step_inputs.values().any(|row| {
+                        row.slot == ktir_superdsc::sdsc_abstract::attn_step_slots::REP
+                    }),
+                    "the batched arm states its rep slot (geom={:?} mq={} rung={}) — the row \
+                     bridge `place_rep_table_last` spends",
+                    s.geom,
+                    s.mq,
+                    s.rung
+                );
+            }
+            // EVERY program the splice returned lowers — the relayout copies as well as the
+            // attention between them.
+            for op in &spliced_ops {
+                door_lower(
+                    op.ktir.as_ref().expect("spliced op carries its program"),
+                    &mut sym,
+                    Some(&layout),
+                    Some(attn_params),
                 )
-            });
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "spliced program {} lowered (geom={:?} mq={} rung={} \
+                         r_ar={rows_are_requests}): {}",
+                        op.op_name, s.geom, s.mq, s.rung, e.message
+                    )
+                });
+            }
         }
     }
 }
@@ -2279,6 +2513,7 @@ fn rmsnorm_recognizers_agree_on_the_shipped_programs() {
 /// (`rmsnormunit.py`, the head-norm sandwich's unit): one input, no gamma. t0 = x
 /// source, t1 = result. Eps is gemma-4's `1e-6` — the subnormal regime the DLF16
 /// landing exists for.
+#[cfg(feature = "spyre-emu")]
 fn rmsnormunit_ir(m: u32, c: u32) -> SubtileIR {
     let tensors = vec![
         TensorShape { rows: m, cols: c },
@@ -2303,10 +2538,14 @@ fn rmsnormunit_ir(m: u32, c: u32) -> SubtileIR {
     }
 }
 
-/// ⛔⛔⛔ A CONTINUATION'S PROGRAM IS FLAT IN ITS ROWS — the whole-chunk form, pinned at the door's own
-/// guard and across row counts. The per-row arm it replaced held `mq` row bodies (granite-2b at 256
-/// rows: 94.7 s to lower; at 512, never finished). Eight times the rows must not grow the program, both
-/// widths must pass the door's guard, and a program that windows its query per row must be refused.
+/// ⛔⛔⛔ A CONTINUATION'S PROGRAM IS FLAT IN ITS ROWS AND LINEAR IN ITS PAGES — the whole-chunk
+/// form, pinned at the door's own guard and across row counts. `batched_prefill_hm` unrolls one
+/// body per page the chunk attends (`for s in tl.static_range(PAGES)`), so the program is
+/// `fixed + pages·per_page`: at a FIXED page count the rows must not grow it (the per-row arm it
+/// replaced held `mq` row bodies — granite-2b at 256 rows: 94.7 s to lower; at 512, never
+/// finished), and growth with PAGES is intended — pinned below as one whole per-page quantum,
+/// never hidden. Both widths must pass the door's guard, and a program that windows its query
+/// per row must be refused.
 #[test]
 fn a_continuation_programs_size_does_not_grow_with_its_rows() {
     let ops_at = |mq: u32| {
@@ -2320,51 +2559,57 @@ fn a_continuation_programs_size_does_not_grow_with_its_rows() {
         let ir = attn_ir(s, 0.015625);
         let node = ir.nodes.last().unwrap();
         let cap = ir.tensors[node.inputs[1].tensor.index()].rows;
-        let spliced = scratchy_triton_splice::lower_attn(node, &ir, cap, s.active_cap())
-            .unwrap_or_else(|e| panic!("splice compiled mq={mq}: {e}"));
-        let k = spliced.ktir.expect("spliced op carries its program");
-        assert!(k.mask.is_some(), "mq={mq}: the continuation binds its mask");
-        ktir_superdsc::emit::lower_ktir_to_superdsc::attn_program_is_flat_in_rows(
-            "continuation",
-            &k.func,
-            mq,
-            32,
+        let spliced = scratchy_triton_splice::lower_attn(
+            node,
+            &ir,
+            cap,
+            s.active_cap(),
+            false,
+            None,
+            // The node's 0.015625 is a real multiplier with no fold receipt — StatedByProgram.
+            scratchy_triton_splice::AttnBundleFacts {
+                scale_law: Some(ktir_superdsc::score_scale::ScoreScaleLaw::StatedByProgram),
+                out_stays_head_rows: false,
+            },
         )
-        .unwrap_or_else(|e| panic!("mq={mq}: {}", e.message));
+        .unwrap_or_else(|e| panic!("splice compiled mq={mq}: {e}"));
+        assert_eq!(
+            spliced.len(),
+            1,
+            "a foldless splice is the one-shot program"
+        );
+        let k = spliced[0]
+            .ktir
+            .clone()
+            .expect("spliced op carries its program");
+        assert!(k.mask.is_some(), "mq={mq}: the continuation binds its mask");
         k.func.ops_deep().len()
     };
-    let (small, wide) = (ops_at(31), ops_at(256));
+    // ⛔ FLAT IN ROWS AT A FIXED PAGE COUNT — the fixture's rope-appended prefix is
+    // 32 rows (`ATTN_VALID_LEN − 1`), so a chunk of `mq` rows attends
+    // ⌈(32 + mq)/256⌉ pages (the splice's own reading, lib.rs's `pages`): ONE page
+    // at mq 31 and at mq 200 alike. Six times the rows must not grow the program.
+    let (small, wide) = (ops_at(31), ops_at(200));
     assert!(
         wide <= small,
-        "8x the rows grew the program: 31 rows {small} ops, 256 rows {wide} ops"
+        "rows at a fixed page count grew the program: 31 rows {small} ops, 200 rows \
+         {wide} ops"
     );
-    // The door's refusal, on a REAL unrolled program: decode windows its query once for each of its 32
-    // heads, so the same program presented as ONE head over two rows windows its query 32 times for
-    // one head — exactly the shape a per-row unroll has, which the guard exists to refuse.
-    let decode = AttnShape {
-        geom: (32, 8, 64),
-        mq: 1,
-        cap: 256,
-        rung: 0,
-        rope_appended: true,
-    };
-    let ir = attn_ir(decode, 0.015625);
-    let node = ir.nodes.last().unwrap();
-    let cap = ir.tensors[node.inputs[1].tensor.index()].rows;
-    let unrolled = scratchy_triton_splice::lower_attn(node, &ir, cap, decode.active_cap())
-        .expect("the decode splice compiles")
-        .ktir
-        .expect("spliced op carries its program");
-    use ktir_superdsc::emit::lower_ktir_to_superdsc::attn_program_is_flat_in_rows;
-    assert!(
-        attn_program_is_flat_in_rows("decode", &unrolled.func, 1, 32).is_ok(),
-        "decode's one row is exempt"
+    // ⛔ AND GROWTH WITH PAGES IS ONE WHOLE PER-PAGE QUANTUM — intended, pinned
+    // rather than hidden: mq 256 attends ⌈(32 + 256)/256⌉ = 2 pages, and the second
+    // page costs exactly one page's worth of unrolled trips. Measured on this tree:
+    // 204 ops per page (230 ops at one page, 434 at two — the 57b run's own
+    // numbers, which the old per-row law read as a defect).
+    const PER_PAGE_OPS: usize = 204;
+    let two_pages = ops_at(256);
+    assert_eq!(
+        two_pages - small,
+        PER_PAGE_OPS,
+        "pages 1 → 2 must grow the program by exactly one per-page quantum (measured \
+         {PER_PAGE_OPS} ops on this tree): 1 page {small} ops, 2 pages {two_pages} ops"
     );
-    let refused = attn_program_is_flat_in_rows("unrolled", &unrolled.func, 2, 1)
-        .expect_err("32 query windows for one head over two rows must be refused");
-    assert!(
-        refused.message.contains("unrolls per row") && refused.message.contains("2-row"),
-        "names the row count and the cause: {}",
-        refused.message
-    );
+    // The live kernels read q once by construction (batched_decode.py's one `q_desc.gather`;
+    // batched_prefill.py's one `q_desc` load), so every live program is flat in rows by
+    // construction — pinned by `ops_at`'s own numbers above. The door's old flat-in-rows
+    // guard went with the dead hand-written attention that was its one production caller.
 }

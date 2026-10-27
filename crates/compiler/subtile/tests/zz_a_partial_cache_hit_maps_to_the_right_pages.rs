@@ -16,8 +16,8 @@
 //! written, so putting a page with real keys there loses them silently.
 
 use scratchy_subtile::sdsc_abstract::{
-    BatchSlot, BlockTable, ChunkStart, KvHistory, KvSlot, PagedKvPool, PoolPages, PoolPartition,
-    PoolRows, RowPages, SlotCount,
+    BatchSlot, BlockTable, KvHistory, KvSlot, PagedKvPool, PoolPages, PoolPartition, PoolRows,
+    RowPages, SlotCount,
 };
 
 const PAGE: u32 = PagedKvPool::PAGE_SLOTS as u32;

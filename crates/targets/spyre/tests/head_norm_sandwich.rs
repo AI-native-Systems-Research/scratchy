@@ -284,6 +284,9 @@ fn windowed_rmsnorm_matches_the_unfused_sandwich() {
             let mut session = scratchy_target_spyre::runner::SpyreSession::new_multi(
                 &[(&groups, &results)],
                 Vec::new(),
+                // No scale slot in this program's sources — the empty stage table is the
+                // byte-identical incumbent (seat (i) declares nothing when nothing is f32).
+                &[],
             )
             .expect("build the sandwich session");
             let out = session

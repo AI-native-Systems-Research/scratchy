@@ -44,8 +44,7 @@ pub use crate::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off;
 // bytes against torch-spyre, i.e. exactly the machinery under suspicion for the composite-m
 // garble. Nothing caught it because CI never builds this crate with `--features superdsc`.
 pub use crate::ir::bridge::tiled_op_sdsc_op::{
-    assemble_attn, assemble_matmul, assemble_matmul_off, assemble_matmul_seeded,
-    assemble_matmul_split,
+    assemble_matmul, assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_split,
 };
 use ktir_core::attrkey::AttrKey;
 use ktir_core::ir::Attr;
@@ -57,8 +56,8 @@ pub use scratchy_spyre_bundle as bundle;
 // codegen: `superdsc::graph_wiring`, `superdsc::unroll_layers`) keep resolving through this module's
 // path after the SubtileIR → KTIR construction moved to its own file.
 pub use crate::lower_subtile_tape_to_ktir::{
-    BundleWiring, NodeArgs, graph_wiring, lower_graph_to_ktir, lower_graph_to_superdsc,
-    lower_subtile_tape_to_ktir,
+    AttnWiring, BundleWiring, NodeArgs, graph_wiring, lower_graph_to_ktir, lower_graph_to_superdsc,
+    lower_subtile_tape_to_ktir, place_step_inputs,
 };
 // ⭐⭐⭐ THE REQUEST TYPE LIVES IN `ktir_superdsc::ktir_node` — `KtirNode` and the decode ladder rung
 // `ActiveCap`. Not a device fact and not the caller's own plan: what a KTIR producer hands in.
@@ -103,6 +102,10 @@ pub use ktir_superdsc::work::{
 // be a NEW name in a file that already resolves this one. See `DxGroupCeiling`'s own doc for
 // the measured pedigree of 4204.
 pub use ktir_superdsc::sdsc_abstract::DxGroupCeiling;
+// ⭐ THE POOL'S TYPED PLANE KINDS — brought in beside the ceiling re-export because this file
+// places the pool's planes (`pool.plane::<KtPlane>().base_bytes()`): the placement's byte fact
+// and the pool's element fact must be one derivation, stated through the pool's own handles.
+use ktir_superdsc::sdsc_abstract::{KnatPlane, KtPlane, VPlane};
 
 // ── EMIT-TIME CONSTANTS THAT USED TO BE ENVIRONMENT READS ───────────────────
 //
@@ -179,26 +182,26 @@ const _: () = assert!(bundle::MAX_SEGMENT_BYTES == SEGMENT_SIZE);
 
 // ⭐⭐⭐ THE RESERVED TID SPACE LIVES IN `ktir_superdsc::reserved_tids` — every `*_TID` sentinel, the
 // `TidRegion`/`RESERVED_REGIONS` table with both of its compile-time disjointness proofs,
-// `scalarmul_scale_tid` and `kct_resident_tid`.
+// `scalarmul_scale_tid` and the `KctResident` plane-name type.
 //
 // ⭐ IT IS THE PRODUCER↔LOWERING ABI, not scratchy's plan: each id names a tensor the LOWERING
 // invents or requires and the caller binds, so a third-party KTIR producer has to agree with these
 // numbers to bind anything at all. Re-exported so every path in the tree resolves unchanged.
 pub use ktir_superdsc::reserved_tids::{
     ATTN_CAUSAL_TID, ATTN_MASK_TID, ATTN_SCALE_TID, ATTN_ZERO_TID, FP8_INV448_TID, FP8_NEG448_TID,
-    FP8_POS448_TID, IDENTITY_TID, KCT_RESIDENT_BASE, KV_BLOCK_INDEX_TID, LAST_HIDDEN_TID,
-    NEW_V_PROBE_TID, ONES_REDUCE_TID, OPROJ_HEADMAJOR_BASE, RESERVED_REGIONS,
+    FP8_POS448_TID, IDENTITY_TID, KCT_RESIDENT_BASE, KV_BLOCK_INDEX_TID, KctResident,
+    LAST_HIDDEN_TID, NEW_V_PROBE_TID, ONES_REDUCE_TID, OPROJ_HEADMAJOR_BASE, RESERVED_REGIONS,
     RESERVED_REGIONS_ARE_DISJOINT, RMS_HALF_TID, RMS_INVCOLS_TID, RMS_RSQRT_PROBE_TID,
     RMS_SEED_TID, RMS_VAR_PROBE_TID, ROPE_P_TID, SCALARMUL_SCALE_BASE, SEL_HEADMAJOR_TID,
     SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID, SENTINELS_ARE_INSIDE_THEIR_REGION, TidRegion,
-    identity_class_tid, is_kernel_table_class_tid, kct_resident_tid, oproj_headmajor_tid,
-    reserved_region, rope_p_class_hds, rope_p_class_tid, scalarmul_scale_tid,
+    identity_class_tid, is_kernel_table_class_tid, oproj_headmajor_tid, reserved_region,
+    rope_p_class_hds, rope_p_class_tid, scalarmul_scale_tid,
 };
 
 // The rung facts the walk takes as one explicit struct — the `#[forward]` expansion
 // (which aliases this module as `superdsc`) constructs it, so it spells through this
 // module's path.
-pub use crate::lower_subtile_tape_to_ktir::RungFacts;
+pub use crate::lower_subtile_tape_to_ktir::{PagedFoldStatement, RungFacts};
 
 // ⭐⭐⭐ THE MEMORY PLAN LIVES IN `ktir_superdsc::placement` — `SegRole`, `TensorPlacement`,
 // `RetileDescriptor`, `BundleLayout` and its whole impl, `SynthAlloc`, `align128`, `syn`.
@@ -248,6 +251,9 @@ use ktir_superdsc::emit::EmittedOp;
 ///    other's, which is silent: wrong output, or a fault when the second is a kernel.
 ///  * **Non-empty.** A zero-length field is read by the device as `1 << 27` flits = 16 GiB, in both
 ///    `handleHostDMA` and `handleXLATentry`. Zero does not mean nothing.
+///  * **Cover arithmetic.** A `FoldBlocks` write-cover whose block does not divide the placement's
+///    size describes no legal bind — the doors would refuse every producer forever. See
+///    [`ktir_superdsc::placement::BindCover`].
 ///  * **Allocatable.** A segment is ONE `FlexAllocator` allocation, served from ONE region, so it
 ///    cannot exceed [`bundle::MAX_SEGMENT_BYTES`] — see that constant for the granite-3.1-8b-fp16
 ///    weight segment this catches.
@@ -348,6 +354,38 @@ fn audit_layout_addresses(
                 p.bank,
             ));
         }
+        // ── COVER: the write-cover class's arithmetic, proven against the placement's own size ──
+        //
+        // The class is a law the bind doors enforce at runtime; here its NUMBERS are constants,
+        // so a class that cannot describe any legal bind of this placement is a `cargo build`
+        // error and not a launch-time refusal. A `FoldBlocks` whose block does not divide the
+        // size leaves a tail no whole number of blocks can ever fill; a block of 0 admits only
+        // 0-byte binds (the device reads a zero length as 16 GiB); a block past the size admits
+        // nothing at all. `Full` states `bytes == size` and needs no arithmetic.
+        if let ktir_superdsc::placement::BindCover::FoldBlocks { block_bytes } = p.cover {
+            if block_bytes == 0 {
+                fail.push(format!(
+                    "{} declares a FoldBlocks cover with a 0 B block — no nonzero bind can be a \
+                     whole number of zero-byte blocks",
+                    p.id
+                ));
+            } else if block_bytes > p.size {
+                fail.push(format!(
+                    "{} declares a FoldBlocks cover of {block_bytes} B blocks over a {} B \
+                     placement — one block already over-binds it",
+                    p.id, p.size
+                ));
+            } else if p.size % block_bytes != 0 {
+                fail.push(format!(
+                    "{} declares a FoldBlocks cover of {block_bytes} B blocks over a {} B \
+                     placement, which is not a whole number of blocks — the {} B tail can never \
+                     be filled by any legal bind",
+                    p.id,
+                    p.size,
+                    p.size % block_bytes
+                ));
+            }
+        }
     }
 
     // ── overlap, per segment — SYNTHETICS ONLY ──
@@ -409,19 +447,36 @@ fn audit_layout_addresses(
 }
 
 /// ⛔⛔⛔ ONE SESSION STAGES ONE LAYOUT — every ladder rung must place every host-staged ACTIVATION
-/// exactly where the ceiling does, the gather's own index excepted.
+/// exactly where the ceiling does, the gather's own index and the batched rep table excepted.
 ///
 /// A decode session's host binds each step at the CEILING bundle's placements, whichever rung body it
 /// then launches, while that body's descriptors were emitted against its OWN layout. A tensor the two
 /// place apart is read by the body from bytes the host never wrote there — a clean bake, no fault, a
-/// wrong constant. The one tensor allowed to differ is [`KV_BLOCK_INDEX_TID`]: only a gathering body
-/// places it, only a gathering step stages it, and [`compute_bundle_layout`] places it LAST so it moves
-/// nothing else. The macro calls this on every rung it bakes, so a disagreement is a build failure.
+/// wrong constant. Two tensors are allowed to differ. One is [`KV_BLOCK_INDEX_TID`]: only a gathering
+/// body places it, only a gathering step stages it, and [`compute_bundle_layout`] places it LAST so it
+/// moves nothing else. The other is the batched decode row's REP TABLE (`attn_step_slots::REP`, a
+/// law-numbered tid, so the exemption is looked up per layout through that layout's own step-input
+/// rows): only a batched decode row states it, only a batched decode step stages it, and
+/// [`compute_bundle_layout`] places it LAST — after the KV block index — so it moves nothing else
+/// either. The macro calls this on every rung it bakes, so a disagreement is a build failure.
 pub fn ladder_stages_one_layout(ceiling: &BundleLayout, rung: &BundleLayout) -> Result<(), String> {
     let staged = |l: &BundleLayout| -> Vec<(u32, usize, u64, u64)> {
+        // ⭐ THE REP'S OWN TID, FROM THIS LAYOUT'S OWN STEP-INPUT ROWS — the rep slot is
+        // stated by this layout's own programs or by none of them, so the lookup answers
+        // per layout and never needs a constant tid (the numbering law derives it from the
+        // graph's own tensor count).
+        let rep = l
+            .step_inputs
+            .iter()
+            .find(|(_, row)| row.slot == ktir_superdsc::sdsc_abstract::attn_step_slots::REP)
+            .map(|(tid, _)| *tid);
         l.placements
             .values()
-            .filter(|p| matches!(p.role, SegRole::Activation) && p.tid != KV_BLOCK_INDEX_TID)
+            .filter(|p| {
+                matches!(p.role, SegRole::Activation)
+                    && p.tid != KV_BLOCK_INDEX_TID
+                    && Some(p.tid) != rep
+            })
             .map(|p| (p.tid, p.segment, p.offset, p.size))
             .collect()
     };
@@ -437,9 +492,39 @@ pub fn ladder_stages_one_layout(ceiling: &BundleLayout, rung: &BundleLayout) -> 
             format!("first difference (tid, seg, offset, size): ceiling {a:?} vs rung {b:?}")
         })
         .unwrap_or_else(|| format!("{} vs {} staged activation(s)", c.len(), r.len()));
+    // ⭐ THE REFUSAL CARRIES ITS OWN EVIDENCE. The lists are the whole story — a positional
+    // zip over tid-sorted tuples can only say WHICH entry moved, and the walk order that
+    // assigned the offsets is not recoverable from the first difference alone. Every staged
+    // activation of BOTH layouts, plus the step-input discovery table (the slot identities
+    // behind the tids) and the activation segment's high-water: one refusal, everything a
+    // fix needs, no second build to gather it.
+    let show = |rows: &[(u32, usize, u64, u64)]| {
+        rows.iter()
+            .map(|(tid, seg, off, size)| format!("t{tid}:s{seg}@{off}+{size}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let steps = |l: &BundleLayout| {
+        l.step_inputs
+            .iter()
+            .map(|(tid, row)| format!("t{tid}=slot{}:{:?}", row.slot, row.df))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let act_seg = SegRole::Activation.segment();
     Err(format!(
         "a ladder rung places a host-staged activation apart from its ceiling — the host stages the \
-         ceiling's placements, so the rung would read bytes nobody wrote: {first}"
+         ceiling's placements, so the rung would read bytes nobody wrote: {first}\n  ceiling \
+         staged ({}): {}\n  rung staged ({}): {}\n  ceiling step inputs: {}\n  rung step inputs: \
+         {}\n  activation-segment high-water: ceiling {} B vs rung {} B",
+        c.len(),
+        show(&c),
+        r.len(),
+        show(&r),
+        steps(ceiling),
+        steps(rung),
+        ceiling.segment_bytes[act_seg],
+        rung.segment_bytes[act_seg],
     ))
 }
 
@@ -626,7 +711,7 @@ pub(crate) fn scalar_registry<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<f32> {
 /// registers is staged here; a variant it does not is left exact. Two omissions
 /// are the census's own: the OnePlusScale offset is 1.0 (f16-exact — staging it is
 /// the identity), and the attention `√scale` is not a node field — it is a
-/// DERIVED registry slot the door reads: the decode door (`attn_at`) multiplies
+/// DERIVED registry slot the old decode door read: it multiplied
 /// BOTH Q and the roped new-K by it, so the card's effective decode score scale
 /// is `f16(√s)²` — two f16-slot multiplies — while the emulator's program
 /// (`qk · SCALE` on the f16 dot) and this golden both apply `f16(s)`. That
@@ -799,6 +884,11 @@ pub fn compute_bundle_layout<F: RopeForm>(
 
     let mut placements: std::collections::BTreeMap<u32, TensorPlacement> = Default::default();
     let mut seg_bytes = [0u64; 7];
+    // ⭐ THE PAGED-FOLD REGION'S PAGE CEILING — None until the attention placement below derives it
+    // (the SAME `max_pages` that sizes the prefix-validity mask's rows), then carried on the layout so
+    // the tape walk states the fold family's tables and mask at the region they actually describe —
+    // ONE derivation, one field, no re-computation in the walk.
+    let mut paged_fold_region_pages: Option<u32> = None;
     // Set by the paged-KV placement below, from the SAME `PagedKvPool` that sized the placement, so the
     // stride the runtime shifts by and the stride the addresses were baked with are one value.
     let kv_request_stride_bytes: u64 = 0;
@@ -824,6 +914,11 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 bank: 0,
                 offset: off,
                 size: sz,
+                // ⭐ FULL — a source's binds are its whole extent: weights stage exactly, and an
+                // activation the host binds short is a tail the consumers read unwritten. The
+                // fold's per-pass tensors are the one family with a block law, and each of those
+                // mints its cover at its own site with its geometry in hand.
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
         seg_bytes[seg] = align128(off + sz);
@@ -896,6 +991,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     bank: companion.bank,
                     offset: off,
                     size: companion.size,
+                    cover: ktir_superdsc::placement::BindCover::Full,
                 },
             );
             seg_bytes[seg] = align128(off + companion.size);
@@ -1026,6 +1122,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 segment: seg,
                 offset: off,
                 size: sz,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
         seg_bytes[seg] = align128(off + sz);
@@ -1054,9 +1151,9 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // row-major identity (single stick) ⇒ NO RetileDescriptor (like the all-ones). The mq>1 cachewr
     // becomes matmul(kh[mqu,hd], I[hd,hd]) = kh, replacing the mqu·nqh·2 SlotSolo copies.
     //
-    // BUG #1 (found via a real pod trace, 20cf993a): `assemble_attn`'s GQA new_k/new_v replication
-    // (ir::bridge::tiled_op_sdsc_op::attn.rs, `attn_krep{h}`/`attn_vrep{h}`) references this SAME
-    // `ident` tensor UNCONDITIONALLY — every model with attention, every mq, no env-var check at
+    // BUG #1 (found via a real pod trace, 20cf993a): the attention's identity-contracted copies
+    // (the old emitter's GQA new_k/new_v replication, `attn_krep{h}`/`attn_vrep{h}`, now the KV
+    // cache write's cachewr matmuls) reference this SAME `ident` tensor UNCONDITIONALLY — every model with attention, every mq, no env-var check at
     // all (the on-card multi-row plain copy is proven broken, so this IS the copy mechanism, not
     // an optional #3 optimization for it). But this placement was gated ONLY on the opt-in
     // SCRATCHY_SUPERDSC_KV_MATMUL env var — unset in a normal build, IDENTITY_TID was never placed
@@ -1070,7 +1167,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // ran for decode's own bundle at all. Confirmed by the worker's own hard-fail: decode's baked
     // bundle_layout.json genuinely never had IDENTITY_TID, exactly as this predicts. Moved OUTSIDE that
     // mq>1 guard so it runs for ANY AttnDecode node regardless of mq, matching the consumer's real,
-    // unconditional need (assemble_attn_head references `ident` at every mq, decode included).
+    // unconditional need (the KV cache write's copies reference `ident` at every mq, decode included).
     // ⭐⭐ ONE IDENTITY PER DISTINCT ATTENTION HEAD DIM, NOT ONE AT THE MAX. The max-fold this
     // replaced sized the placement at the widest `AttnDecode` head dim while the VALUE was staged at
     // the base head dim — so on gemma-4 tiny-allglobal a `[64,64]` identity sat in a `[128,128]`
@@ -1101,6 +1198,10 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     segment: seg,
                     offset: off,
                     size: sz,
+                    // ⭐ FULL — an identity class is a synthetic constant, bound whole at load
+                    // (`synthetic_constants`); a short bind would leave identity rows the
+                    // class-split copies read as whatever the shadow held.
+                    cover: ktir_superdsc::placement::BindCover::Full,
                 },
             );
             seg_bytes[seg] = align128(off + sz);
@@ -1176,6 +1277,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 segment: seg,
                 offset: off,
                 size: sz,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
         seg_bytes[seg] = align128(off + sz);
@@ -1208,6 +1310,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 segment: a,
                 offset: hoff,
                 size: sz,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
         seg_bytes[a] = align128(hoff + sz);
@@ -1222,6 +1325,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 segment: a,
                 offset: ioff,
                 size: sz,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
         seg_bytes[a] = align128(ioff + sz);
@@ -1249,6 +1353,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     bank: 0,
                     offset: off,
                     size: sz,
+                    cover: ktir_superdsc::placement::BindCover::Full,
                 },
             );
             seg_bytes[a] = align128(off + sz);
@@ -1337,6 +1442,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 bank: 0,
                 offset: off,
                 size: nbytes(tid),
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
     }
@@ -1367,9 +1473,43 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // intermediate classification of the cache ids.
     let mut scale_placed = false;
     // The KV block index's bytes when this bundle gathers — sized below beside the mask whose pass
-    // grid it shares, PLACED after every other activation (see the placement after the scale
-    // registry).
-    let mut kv_block_index_bytes: Option<u64> = None;
+    // grid it shares, CARRIED UNPLACED on the layout (see the comment at its hand-off below) and
+    // placed by `BundleLayout::place_kv_block_index_last` after the last host-staged activation,
+    // so a body whose gathering differs moves nothing the host stages.
+    let mut kv_block_index_reservation: Option<ktir_superdsc::placement::KvBlockIndexReservation> =
+        None;
+    // ⭐ THE GATHER REACH per pooled source tid — stated beside each attention node's KV plane
+    // placements below (the pool those planes' gathers name), consumed by the gather door's
+    // entry-unit check.
+    let mut gather_reach =
+        std::collections::BTreeMap::<u32, ktir_superdsc::sdsc_abstract::GatherReach>::new();
+    // ⭐ THE LAYER COUNT A PAGE SPANS — hoisted above the node loop because TWO consumers read
+    // it: the gather reach stated at every attention node's plane placements, and the page
+    // ceiling the mask's pass grid derives inside the first node's block. ONE derivation, both
+    // consumers — the reach and the pass grid cannot disagree about how many layers a page spans.
+    //
+    // ⭐ THE TRIP COUNT, NEVER THE CONTAINER LENGTH. `per_layer_ext` is ONE MAP PER
+    // ATTENTION CLASS, and every value in a class's map is that class's per-layer tid
+    // list — filed by [`per_layer_external_tids`] under the law `pl.len() == iters`, so
+    // a value's LENGTH is the class loop's iteration count. A page spans EVERY layer of
+    // EVERY class, so the count is the SUM of the class trip counts. `.len()` on the
+    // slice is the CLASS COUNT — 1 for any uniform model — which understates the page
+    // 40× on granite, multiplies `max_pages` by the same factor, and reserves two
+    // 10.67 GiB mask/index tensors that seg3 cannot hold. (The merge that brought the
+    // derived ceiling here met the per-class slice type and kept `.len()` silently —
+    // it type-checks against both the single-map and per-class shapes.)
+    let kv_layers = if per_layer_ext.is_empty() {
+        ir.nodes
+            .iter()
+            .filter(|n| matches!(n.op, SubOp::AttnDecode { .. }))
+            .count()
+    } else {
+        per_layer_ext
+            .iter()
+            .map(|class| class.values().next().map_or(0, Vec::len))
+            .sum::<usize>()
+    }
+    .max(1) as u64;
     for node in &ir.nodes {
         if let SubOp::AttnDecode {
             geom, layout: kv, ..
@@ -1425,8 +1565,12 @@ pub fn compute_bundle_layout<F: RopeForm>(
             // The real ceiling is MEMORY: a page is `nkvh * hd * slots * 2 * layers`, so the pool has
             // to be sized for the batch width actually run. That is the constraint a 4-bit KV cache
             // lifts, by making a page denser instead of bigger.
-            let pool =
-                scratchy_subtile::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize);
+            // The pool from the GEOMETRY itself — the pair at its source, not the u64 memory-math
+            // locals above re-narrowed into the seam.
+            let pool = scratchy_subtile::sdsc_abstract::PagedKvPool::new(
+                geom.nkvh().get(),
+                geom.hd().get(),
+            );
             let _ = cap;
             let seg = SegRole::Kv.segment();
             let plane_bytes = pool.plane_stride() as u64 * 2;
@@ -1439,13 +1583,18 @@ pub fn compute_bundle_layout<F: RopeForm>(
             // PAGE, through the host's block table. Left at 0, which is what an unbatched bundle always
             // published and what `LaunchPages` reads as "no request dimension".
             let layer_base = seg_bytes[seg];
-            // Kᵀ at 0, V at `v_plane_base`, natural K at `knat_plane_base` — the offsets
-            // `PagedKvPool` bakes into the ops' plane-relative bases.
+            // Natural K at 0 (`knat_plane_base`), V at `v_plane_base`, Kᵀ at `kt_plane_base` —
+            // the offsets `PagedKvPool` bakes into the ops' plane-relative bases, stated here
+            // through the pool's TYPED plane handles so the placement's byte fact and the
+            // pool's element fact are one derivation.
             for (tid, plane_off) in [
                 // natural K, V, transposed K — the pre-paged cache's own order.
-                (k_id, pool.knat_plane_base() as u64 * 2),
-                (v_id, pool.v_plane_base() as u64 * 2),
-                (kct_resident_tid(k_id), pool.kt_plane_base() as u64 * 2),
+                (k_id, pool.plane::<KnatPlane>().base_bytes()),
+                (v_id, pool.plane::<VPlane>().base_bytes()),
+                (
+                    ktir_superdsc::reserved_tids::KctResident::of(k_id).wire_tid(),
+                    pool.plane::<KtPlane>().base_bytes(),
+                ),
             ] {
                 placements.insert(
                     tid,
@@ -1456,8 +1605,46 @@ pub fn compute_bundle_layout<F: RopeForm>(
                         bank: 0,
                         offset: layer_base + plane_off,
                         size: plane_bytes,
+                        cover: ktir_superdsc::placement::BindCover::Full,
                     },
                 );
+            }
+            // ⭐⭐⭐⭐⭐ THE GATHER REACH — the POOL a gathered read of these planes names, stated
+            // where the slice is placed so the two are ONE fact at one site. The placement above
+            // covers this layer's slice of ONE page; a gathered read's index names slab-blocks
+            // RELATIVE TO THE PLANE'S OWN BASE across the whole pool — every page, in the
+            // uniform `POOL_STICK²`-element slab-block grid `GatherEntry::of_slab_block` counts
+            // in — so the
+            // gather door checks the read's entry stride against THIS reach instead of the
+            // slice footprint. The reach is the TYPED pair
+            // (`GatherReach::of_plane` — the entry ceiling and the entry unit), minted from the
+            // SAME page ceiling the mask's pass grid derives in the first node's block below
+            // (one flex region, `bundle::MAX_SEGMENT_BYTES`, over this bundle's own page bytes)
+            // and the pool's own geometry, and the host-side index composition mints through
+            // the SAME door (`gather_entry_ceiling`), so a value above the ceiling is
+            // unconstructible at both halves and the two cannot disagree. Nothing else widens:
+            // a plain sweep of these tids is still bounded by the placement alone.
+            let page_elems = pool.layer_stride() as u64 * kv_layers;
+            let page_bytes = page_elems * 2;
+            let page_ceiling = (bundle::MAX_SEGMENT_BYTES / page_bytes).max(1);
+            let reach = ktir_superdsc::sdsc_abstract::GatherReach::of_plane(
+                page_ceiling,
+                page_bytes,
+                pool,
+            )
+            .ok_or_else(|| {
+                SuperDscError(format!(
+                    "attn t{k_id}: the paged KV pool's own geometry admits no gather reach — a \
+                     page ({page_bytes} B over {kv_layers} layer(s)) is not a whole number of the \
+                     pool's stick blocks, so no integer index can name a page boundary and the \
+                     gathered read this bundle emits cannot address the pool"
+                ))
+            })?;
+            // ⛔ ONE SPELLING OF THE TID SET — `pool_reach_tids`, the same derivation the
+            // region stamp's premise guard asks, so the set this insertion covers and the set
+            // the stamp checks can never name different pools.
+            for tid in ktir_superdsc::sdsc_abstract::pool_reach_tids(k_id, v_id) {
+                gather_reach.insert(tid, reach);
             }
             // The per-layer stride the executor advances by MUST be exactly the three planes, with
             // no alignment padding creeping in between layers (hd and page_slots are 64-multiples,
@@ -1504,6 +1691,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                             segment: seg3i,
                             offset: off,
                             size: pbytes,
+                            cover: ktir_superdsc::placement::BindCover::Full,
                         },
                     );
                     seg_bytes[seg3i] = align128(off + pbytes);
@@ -1561,30 +1749,25 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 // count for a re-rolled tape; an unrolled graph states its own, one AttnDecode node
                 // per layer.
                 //
-                // ⭐ THE TRIP COUNT, NEVER THE CONTAINER LENGTH. `per_layer_ext` is ONE MAP PER
-                // ATTENTION CLASS, and every value in a class's map is that class's per-layer tid
-                // list — filed by [`per_layer_external_tids`] under the law `pl.len() == iters`, so
-                // a value's LENGTH is the class loop's iteration count. A page spans EVERY layer of
-                // EVERY class, so the count is the SUM of the class trip counts. `.len()` on the
-                // slice is the CLASS COUNT — 1 for any uniform model — which understates the page
-                // 40× on granite, multiplies `max_pages` by the same factor, and reserves two
-                // 10.67 GiB mask/index tensors that seg3 cannot hold. (The merge that brought the
-                // derived ceiling here met the per-class slice type and kept `.len()` silently —
-                // it type-checks against both the single-map and per-class shapes.)
-                let layers = if per_layer_ext.is_empty() {
-                    ir.nodes
-                        .iter()
-                        .filter(|n| matches!(n.op, SubOp::AttnDecode { .. }))
-                        .count()
-                } else {
-                    per_layer_ext
-                        .iter()
-                        .map(|class| class.values().next().map_or(0, Vec::len))
-                        .sum::<usize>()
-                }
-                .max(1) as u64;
+                // ⭐ THE TRIP COUNT IS `kv_layers`, hoisted above the node loop — the gather
+                // reach stated at every node's plane placements and this page ceiling read ONE
+                // derivation of the layer count (the trip-count law lives at the hoist).
+                let layers = kv_layers;
                 let page_bytes = pool.layer_stride() as u64 * 2 * layers;
                 let max_pages = (bundle::MAX_SEGMENT_BYTES / page_bytes).max(1);
+                // ⭐ THE FOLD FAMILY'S REGION — the SAME ceiling, bounded by the pool THIS graph
+                // laid. `max_pages` is the DEVICE-side bound (one flex region over this bundle's
+                // page bytes — the number the mask reservation above keeps, covering every pool a
+                // card could budget); the fold's region is a REACH fact: its tables and mask are
+                // walked one page per pass by entries that gather from THIS pool, and no context
+                // can out-reach the pool's own rows (the cache tensor's row extent, `cap`). The
+                // min is belt-and-braces in the direction that cannot strand a context: a pool
+                // larger than one region cannot be placed, so `cap <= max_pages` in every baked
+                // bundle, and a smaller pool (this 256-page one against the 546-page device
+                // ceiling) takes its own page count as the region — the fold's plane descriptors
+                // state the region, and a region past the pool's placements sweeps past them
+                // (the splice refuses exactly that).
+                paged_fold_region_pages = Some(max_pages.min(cap).max(1) as u32);
                 // ONE validity row over the max context, or one PER QUERY ROW when the rows are
                 // separate requests and each carries its own history. The multiplier is the op row
                 // count the attention sweeps (`nqh*mq`), which is what the per-row read addresses.
@@ -1601,7 +1784,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 // pages, 3 blocks instead of 24.
                 //
                 // ⛔ WHICH FORM THIS BUNDLE USES IS THE SAME `rows_are_requests` CONDITION THE INDEX
-                // PLACEMENT AND `assemble_attn`'s gather are gated on — one predicate, three consumers.
+                // PLACEMENT AND the attention gather are gated on — one predicate, three consumers.
                 // Getting it wrong is silent in the dangerous direction: too few blocks against the fold
                 // is a fold reading mask bytes nobody staged, which read as ZERO and therefore VALID.
                 let (pm_rows, pm_blocks) = if rows_are_requests {
@@ -1613,6 +1796,16 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     * pm_blocks
                     * scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u64
                     * 2;
+                // ⭐⭐⭐ THE MASK'S WRITE-COVER — the same `rows_are_requests` predicate the
+                // reservation above gates on, because it is the same fact: a PROMPT CHUNK's one
+                // row is bound WHOLE ("the extent is the bake's reserve … every swept column
+                // gets an explicit value" — `Full`), while a decode BATCH's host stages only
+                // the LIVE blocks of the `[pass][row][page]` grid, one `pm_block_bytes` block
+                // per live page. `pm_block_bytes` is `pmbytes / pm_blocks` by construction —
+                // the mask's own pass stride, the ONE number the KV block index's reservation
+                // takes for its pitch too. There is no second spelling of this number.
+                let pm_block_bytes =
+                    pm_rows * scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u64 * 2;
                 placements.insert(
                     ATTN_MASK_TID,
                     TensorPlacement {
@@ -1622,6 +1815,13 @@ pub fn compute_bundle_layout<F: RopeForm>(
                         segment: mseg,
                         offset: pmoff,
                         size: pmbytes,
+                        cover: if rows_are_requests {
+                            ktir_superdsc::placement::BindCover::FoldBlocks {
+                                block_bytes: pm_block_bytes,
+                            }
+                        } else {
+                            ktir_superdsc::placement::BindCover::Full
+                        },
                     },
                 );
                 seg_bytes[mseg] = align128(pmoff + pmbytes);
@@ -1639,6 +1839,10 @@ pub fn compute_bundle_layout<F: RopeForm>(
                         segment: a,
                         offset: cmoff,
                         size: cmbytes,
+                        // ⭐ FULL — the causal mask is bound whole, keyed, once per causal
+                        // shape (`CausalKey`); a short bind would leave swept columns
+                        // unmasked, i.e. VALID.
+                        cover: ktir_superdsc::placement::BindCover::Full,
                     },
                 );
                 seg_bytes[a] = align128(cmoff + cmbytes);
@@ -1659,7 +1863,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 // have had to be re-derived somewhere else.
                 //
                 // ⭐⭐⭐ `gathers_kv` is that condition, and it is the SAME fact
-                // `lower_ktir_to_superdsc` passes `assemble_attn`'s `kv_block_index` from. The
+                // the attention lowering's gather admission keys on. The
                 // reference gathers its pages on EVERY decode — batched and one-request alike — so
                 // both rungs place the index; prefill's rows are consecutive positions of one
                 // sequence sharing ONE resident history, so there is nothing for an index to
@@ -1669,7 +1873,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 // OBVIOUS FIX, BECAUSE THE 8b BATCHED PATH **READS THESE BYTES** — MEASURED, TWICE, ON
                 // THE CARD.
                 //
-                // The split is real and it is stated on [`GatherScratch::admits`]: `assemble_attn` may
+                // The split is real and it is stated on [`GatherScratch::admits`]: the old emitter could
                 // DECLINE the gather on the geometry (`of_fold_pass` refuses a head dim its flat copy
                 // cannot express) and this placement does not ask, so an hd=128 bundle reserves this
                 // activation, `BakeFacts::gathers_kv` answers `true` and the forward tape stages a table
@@ -1731,7 +1935,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 // oracle first (find why the same source rebuilt is not the same numerics), then narrow
                 // this, then measure. Until then only the emitter-side half of the one rule lands:
                 // `lower_ktir_to_superdsc` gates the tensor's NAME on `admits`, which is provably
-                // non-observable (`assemble_attn`'s `kv_block_index.zip(of_fold_pass(..))` is already `None`
+                // non-observable (the old emitter's `kv_block_index.zip(of_fold_pass(..))` was already `None`
                 // at hd=128 whichever way the name goes), so the coupling is stated where it costs no
                 // addresses and this placement keeps every byte it had.
                 if gathers_kv {
@@ -1789,7 +1993,11 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     // it is: a gathered fold's passes are the pages ONE ROW holds. Over-reserving
                     // would be inert here, but agreeing with the mask's own grid is what keeps the
                     // shift meaningful for both tensors.
-                    kv_block_index_bytes = Some(pmbytes);
+                    kv_block_index_reservation =
+                        Some(ktir_superdsc::placement::KvBlockIndexReservation {
+                            bytes: pmbytes,
+                            block_bytes: pm_block_bytes,
+                        });
                 }
                 // DIAGNOSTIC probe (mq>1 only): persistent seg0 buffer for layer-0's pre-selector new_v
                 // [mq_pad, nkvh·hd]. main's `lower_attn_node` copies layer-0 new_v here; the worker reads it to split
@@ -1806,6 +2014,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                             segment: a,
                             offset: npoff,
                             size: npbytes,
+                            cover: ktir_superdsc::placement::BindCover::Full,
                         },
                     );
                     seg_bytes[a] = align128(npoff + npbytes);
@@ -1865,8 +2074,14 @@ pub fn compute_bundle_layout<F: RopeForm>(
     //    layout from, so the bake's list and the wiring's cannot drift); what stays HERE is
     //    only the placement: a `[1,1]` worker-bound const per scale in seg0 (ACTIVATION,
     //    exactly like ATTN_SCALE). The pointwise `mul` the door lowers reads the index here →
-    //    the const TID it multiplies by; the worker binds each `t{tid}=[scale]`.
+    //    the const TID it multiplies by; the worker binds each `t{tid}=[scale]`. The PAYLOAD
+    //    half is all `Fp16` — the staging-twin law, the value the card applies is `f16(v)` —
+    //    so every census placement is 2 B and the format column is one flat Fp16 list. The
+    //    program-stated half (which can state `Fp32`) is appended LATER, by the completion
+    //    pass, at each slot's own word length.
     let scalarmul_scales = scalar_registry(ir);
+    let scalarmul_scales_df =
+        vec![ktir_superdsc::superdsc_opspec::Df::Fp16; scalarmul_scales.len()];
     for i in 0..scalarmul_scales.len() {
         let a = SegRole::Activation.segment();
         let off = seg_bytes[a];
@@ -1880,35 +2095,31 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 bank: 0,
                 offset: off,
                 size: 2,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
         seg_bytes[a] = align128(off + 2);
     }
 
-    // ⛔⛔⛔ THE KV BLOCK INDEX IS THE LAST ACTIVATION, SO ITS PRESENCE MOVES NOTHING ELSE. One session
-    // runs bodies that gather and bodies that do not — the one-request ladder's per-page bodies within
-    // one page under a split-KV chunk ceiling — and the host stages every input at the CEILING's
-    // placements, while each body's descriptors read its OWN layout. Placed where it was, beside the
-    // mask, it pushed the scale registry above down by its size: a non-gathering body read the
-    // RMSNorm epsilon out of the index's bytes (zero, or the previous long request's block numbers)
-    // and paid a separate DMA run every step for the scales the host staged out of reach. Last, the
-    // two layouts agree on every other tensor — which `ladder_stages_one_layout` holds the macro to.
-    if let Some(bibytes) = kv_block_index_bytes {
-        let a = SegRole::Activation.segment();
-        let bioff = seg_bytes[a];
-        placements.insert(
-            KV_BLOCK_INDEX_TID,
-            TensorPlacement {
-                tid: KV_BLOCK_INDEX_TID,
-                bank: 0,
-                role: SegRole::Activation,
-                segment: a,
-                offset: bioff,
-                size: bibytes,
-            },
-        );
-        seg_bytes[a] = align128(bioff + bibytes);
-    }
+    // ⛔⛔⛔ THE KV BLOCK INDEX IS NOT PLACED HERE — ITS RESERVATION IS CARRIED, AND THE WALK
+    // PLACES IT LAST OF ALL. One session runs bodies that gather and bodies that do not — the
+    // one-request ladder's per-page bodies under a split-KV chunk ceiling gather through the
+    // page table while its unchunked sweep rungs sweep the resident KV — and the host stages
+    // every input at the CEILING's placements, while each body's descriptors read its OWN
+    // layout. Placed where it was — first beside the mask, then at the tail of THIS pass —
+    // the index still sat before the two placements that come after the pass
+    // (`place_step_inputs`, `complete_program_scales`), so a body whose gathering differed
+    // pushed every step input and program scale down by its reservation (279,552 B on
+    // granite-3.1-2b) and `ladder_stages_one_layout` refused the first such rung: the ceiling
+    // staged `t1412` at 603,392 while the rung's own layout read it at 323,840. The
+    // reservation therefore rides the layout as a typed value
+    // ([`BundleLayout::kv_block_index`]), and the ONE door
+    // [`BundleLayout::place_kv_block_index_last`] — called by each walk after the last
+    // host-staged placement — puts it past every offset the guard compares, so the two
+    // layouts agree on every other tensor by construction, which is what
+    // `ladder_stages_one_layout` holds the macro to. A reservation still pending at the bake
+    // is a build panic, never a silently unplaced index.
+    let kv_block_index = kv_block_index_reservation;
 
     // Synthetic intermediates (assigned lazily during lowering) start ABOVE the
     // colored intermediates in seg3, so they never overlap a real intermediate.
@@ -1941,6 +2152,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
         weight_tail,
         kernel_weights: std::collections::BTreeMap::new(),
         scalarmul_scales,
+        scalarmul_scales_df,
         weight_scale_folds: weight_scale_folds
             .into_iter()
             .map(|(_, tid, scale)| (tid, scale))
@@ -1956,12 +2168,27 @@ pub fn compute_bundle_layout<F: RopeForm>(
         lx: Default::default(),
         arrangements: std::cell::RefCell::new(std::collections::BTreeMap::new()),
         kv_request_stride_bytes,
+        // ⭐ THE GATHER REACH — filled beside each attention node's KV plane placements above.
+        // Empty for every bundle with no paged KV, keeping those byte-identical.
+        gather_reach,
         // ⛔ THE CLASS REGISTRIES, filled where their tables are placed above — the door resolves
         // a rope/attention program's class off these lists and the worker's load-time bind builds
         // each class's table from the same lists the macro bakes into the wiring, so this is the
         // ONE source of truth for all three. Empty for a tape with no rope/attention nodes.
         rope_class_hds,
         attn_class_hds,
+        // ⭐ THE HOST-STAGED STEP INPUTS — empty here (the layout walk places graph tensors and
+        // pools only); `place_step_inputs` fills it after the splices state their bindings.
+        step_inputs: std::collections::BTreeMap::new(),
+        // ⭐ THE KV BLOCK INDEX'S PENDING RESERVATION — unplaced by design (the comment at its
+        // derivation above); the walk's `place_kv_block_index_last` spends it after the last
+        // host-staged placement.
+        kv_block_index,
+        // ⭐ THE BATCHED REP TABLE'S PENDING RESERVATION — None here (no step input has been
+        // stated yet); `place_step_inputs` defers the rep slot onto this field, and the walk's
+        // `place_rep_table_last` spends it after the KV block index.
+        rep_table: None,
+        paged_fold_region_pages,
     })
 }
 
@@ -2170,6 +2397,7 @@ mod weight_tail_tests {
                     bank: 0,
                     offset,
                     size,
+                    cover: ktir_superdsc::placement::BindCover::Full,
                 },
             );
             seg_bytes[w] = align128(offset + size);
@@ -3795,6 +4023,201 @@ pub struct GateRung<'a> {
     /// The rung's KV capacity — the decode length mask's width, and the dump's
     /// directory half.
     pub cap: u32,
+    /// The rung's KV PAGE STRIDE, in bytes — `RolledSuperDsc::kv_page_stride`, the
+    /// same number the card session's `gather_entry_ceiling` reads off its own
+    /// executor. The gate's attention step-input staging derives its gather
+    /// ceiling from it through the ONE shared law
+    /// (`attn_step_staging::gather_entry_ceiling_for`), so the gate's entry bound
+    /// and the card's are one function of one number, not two derivations.
+    pub page_stride_bytes: u64,
+}
+
+/// The leg the gate is staging rows for — the rung's own query-row facts, which
+/// pick the chunk family's `mq`/`start`/`real`.
+#[cfg(feature = "spyre-emu")]
+enum GateAttnLeg {
+    /// A prefill chunk: `mq` real rows at position 0, every row its own causal
+    /// bound (the rung the `PrefillGate` states).
+    Prefill { mq: u32 },
+    /// The solo decode row: one real row at `start` — the prefix the reference's
+    /// own key set states (`valid_prefix`, the max rope-append region length).
+    Decode { start: usize },
+}
+
+/// ⭐⭐⭐⭐⭐ STAGE THE ATTENTION FAMILY'S STEP INPUTS ON THE GATE'S SESSION — the gate's half
+/// of the contract `attn_step_slots` spells, and the fix for the m=1 fp16 refusal: the gate
+/// used to stage NONE of the four slots (an unstaged id table reads as block 0, a REAL
+/// address; an unstaged mask reads as zero, NO masking), so it judged the branch's paged
+/// attention against a sweep that never left block 0's windows. This stages byte-identically
+/// what the card stages, because the CONTENT is the SAME builder the worker's fill calls
+/// ([`crate::attn_step_staging::build_attn_step_inputs`]) — only the session half differs
+/// (the emulator's raw byte channel, not the card's fill door).
+///
+/// ⭐ THE IDENTITY PAGE MAP — logical page p is physical page p, `0..region.pages()` in
+/// order: the reference reads the cache as ONE logical sequence, which IS this map, so the
+/// pages the gate's tables name are exactly the rows the golden's regions hold.
+///
+/// `Ok(())` with nothing staged only when the tape carries no `AttnDecode` at all (nothing to
+/// stage); a tape that DOES run attention while its placement declares no step inputs is a
+/// desync and refuses — there is no fallback mask law, because there is no second producer:
+/// on this branch every attention program is one of the three spliced kernels and all of them
+/// declare the step inputs.
+#[cfg(feature = "spyre-emu")]
+fn stage_attn_step_inputs<F: RopeForm>(
+    session: &mut crate::runner::SpyreSession,
+    fp: &str,
+    ir: &SubtileIR<F>,
+    page_stride_bytes: u64,
+    leg: GateAttnLeg,
+) -> Result<(), String> {
+    // The geometry the tape carries — every AttnDecode of this graph holds the model's own
+    // value, minted once at the parse boundary with its GQA proof spent there.
+    let Some(geometry) = ir.nodes.iter().find_map(|n| match &n.op {
+        SubOp::AttnDecode { geom, .. } => Some(*geom),
+        _ => None,
+    }) else {
+        // No attention in this tape: nothing to stage, and no mask law to fall back to —
+        // a tape with no AttnDecode never binds the mask tid at all.
+        return Ok(());
+    };
+    let what = format!("numeric gate {fp}");
+    scratchy_subtile::model_geometry::with_config_attn_geometry(
+        geometry,
+        GateStageAtTheGeometry {
+            session,
+            what: &what,
+            n_graph_tensors: ir.tensors.len() as u32,
+            page_stride_bytes,
+            leg,
+        },
+    )
+    .ok_or_else(|| {
+        format!(
+            "{what}: geometry {geometry} is declared by no model config in scope ({}) — the fix \
+             is the config naming this model, never an edit to the gate",
+            scratchy_subtile::model_geometry::geometry_sources()
+        )
+    })?
+}
+
+/// The gate's staging at the geometry the configs declare — the consumer side of the door.
+#[cfg(feature = "spyre-emu")]
+struct GateStageAtTheGeometry<'a> {
+    session: &'a mut crate::runner::SpyreSession,
+    what: &'a str,
+    n_graph_tensors: u32,
+    page_stride_bytes: u64,
+    leg: GateAttnLeg,
+}
+
+#[cfg(feature = "spyre-emu")]
+impl scratchy_subtile::model_geometry::OnAttnGeometry for GateStageAtTheGeometry<'_> {
+    type Out = Result<(), String>;
+
+    fn on_geometry<const NQH: u32, const NKVH: u32, const HD: u32>(
+        self,
+        geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    ) -> Self::Out {
+        use crate::attn_step_staging::{self, AttnStepExtents, AttnStepRows};
+        use ktir_emulator::dtypes::DType;
+        use ktir_superdsc::ktir_node::step_input_tid;
+        use ktir_superdsc::sdsc_abstract as sd;
+        use ktir_superdsc::sdsc_abstract::attn_step_slots;
+        let GateStageAtTheGeometry {
+            session,
+            what,
+            n_graph_tensors,
+            page_stride_bytes,
+            leg,
+        } = self;
+        let pool = sd::PagedKvPool::of_geometry(geom);
+        // The slots' extents, asked of the session at the numbering law's own tids —
+        // `None` for a slot this bundle's programs never bound. The repetition table's
+        // slot is queried for the same law the worker queries it: the gate stages only
+        // CHUNK legs, whose builder arm refuses a declared rep slot, so the query here is
+        // what makes that refusal fire on the gate's session too (a bundle that declared
+        // the batch-only slot for a chunk leg is a desync on BOTH runtimes, not just the
+        // card's).
+        let extent = |slot: u32| {
+            session.source_extent_bytes(u64::from(step_input_tid(n_graph_tensors, slot)))
+        };
+        let extents = AttnStepExtents {
+            mask: extent(attn_step_slots::MASK),
+            kt: extent(attn_step_slots::KT_BLOCK_IDS),
+            v: extent(attn_step_slots::V_BLOCK_IDS),
+            rep: extent(attn_step_slots::REP),
+        };
+        // The pattern check — the region's derivation below needs the mask extent, and the
+        // check itself is the ONE spelling (the builder runs it again; same function).
+        attn_step_staging::slot_pattern(what, &extents)?;
+        // The ceiling from the rolled layout's own page stride — the card session's number,
+        // through the ONE shared law.
+        let ceiling = attn_step_staging::gather_entry_ceiling_for(page_stride_bytes, pool);
+        // The rung's own query-row facts, per leg — the same facts the worker's fill stages
+        // for the body that runs (a prefill chunk at position 0, the solo decode row at the
+        // prefix bound).
+        let (mq, chunk_rows, start, real) = match leg {
+            GateAttnLeg::Prefill { mq } => {
+                let nz = std::num::NonZeroU32::new(mq).expect("a prefill rung bakes mq > 1");
+                let w = sd::RungWidth::of_emitted_rows(mq).expect("a prefill rung bakes mq > 1");
+                (w, sd::ChunkRows::chunk(nz), 0usize, nz)
+            }
+            GateAttnLeg::Decode { start } => (
+                sd::RungWidth::of_emitted_rows(1).expect("1 is a rung width"),
+                sd::ChunkRows::single(),
+                start,
+                std::num::NonZeroU32::new(1).expect("1 is nonzero"),
+            ),
+        };
+        // The region — the ladder's own declared region, from the mask slot's placement
+        // extent, so the map below covers exactly the pages the tables state.
+        let region = attn_step_staging::chunk_region(
+            what,
+            extents.mask.unwrap_or(0),
+            pool,
+            geom.gqa_nz(),
+            mq,
+        )?;
+        // ⭐ THE IDENTITY PAGE MAP — pages `0..region.pages()` in order. The ids-table law
+        // repeats the map's LAST page for a region longer than the map, so the map is minted
+        // at the region's own page count: the one number the region states, never a second
+        // derivation of it.
+        let map: Vec<i64> = (0..region.pages()).map(i64::from).collect();
+        let rows = AttnStepRows::Chunk {
+            rows: chunk_rows,
+            mq,
+            start,
+            real,
+            map,
+        };
+        let p = attn_step_staging::build_attn_step_inputs(geom, what, &extents, ceiling, rows)?;
+        // Stage each slot at the wire dtype the card's fill channel states — ids as I32 (the
+        // RawU32 channel), the mask as F16 (the IeeeF16 channel) — with the minted length
+        // checked against the session's own stick extent first: the fill door's `==` law, on
+        // the gate's session.
+        let mut stage = |slot: u32, dtype: DType, bytes: Vec<u8>| -> Result<(), String> {
+            let tid = u64::from(step_input_tid(n_graph_tensors, slot));
+            let declared = session.source_extent_bytes(tid);
+            if declared != Some(bytes.len() as u64) {
+                return Err(format!(
+                    "{what}: the minted step input for slot {slot} is {} B but the session's \
+                     placement declares {} — the staged table and the bundle's own slot \
+                     disagree about what runs at this rung",
+                    bytes.len(),
+                    declared
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "no such slot".to_string())
+                ));
+            }
+            session
+                .set_source_bytes(tid, bytes, dtype)
+                .map_err(|e| format!("{what}: stage step input slot {slot}: {e}"))
+        };
+        stage(attn_step_slots::KT_BLOCK_IDS, DType::I32, p.kt)?;
+        stage(attn_step_slots::V_BLOCK_IDS, DType::I32, p.v)?;
+        stage(attn_step_slots::MASK, DType::F16, p.mask)?;
+        Ok(())
+    }
 }
 
 #[cfg(feature = "spyre-emu")]
@@ -4044,63 +4467,13 @@ pub fn numeric_gate<F: RopeForm>(
     for (i, v) in sm.iter().enumerate() {
         sources.push((u64::from(scalarmul_scale_tid(i)), vec![*v], vec![1, 1]));
     }
-    // The length mask: the synthetic one-past-the-graph tid (`BundleWiring`'s
-    // own placement law). ⭐ NOT ALL-VALID — the append slot must stay masked.
-    // A rope-append prefix's IR region is sliced to `valid_len - 1` rows (the
-    // keys BEFORE this token) while the spliced program sweeps the rung and
-    // lets THIS mask bound it; all-valid unmasks the append slot itself and
-    // hands the program one extra key the reference does not attend (its
-    // v-cache row is never written — the fresh v rides the new-v segment —
-    // measured: granite decode diverged at every AttnDecode output by exactly
-    // one synth row's v-mix term at weight 1/257). The reference's own key set
-    // is the region, so the mask keeps exactly its rows valid. Pre-populated
-    // prefixes read their region directly (the mask parameter is truncated
-    // away for them), so a tape with no rope-append prefix keeps the
-    // all-valid default — the bind is then simply unused.
-    if let Some(pg) = prefill {
-        // ⭐ THE PREFILL MASK, BY THE RUNTIME'S OWN LAW: the forward's emu
-        // staging binds a `[mq, mq]` clamped causal triangle — the same two
-        // calls the worker's `forward_chunk` composes (`ChunkRows::row_logical_pos`
-        // over `prefill_causal_col_valid`, the SSOT the one-pass kernel's own
-        // `[MQ, MQ]` mask descriptor states) — at a FULL chunk: every row
-        // real, so the clamp is the identity and the golden, which has no
-        // pad-row law, sees exactly the rows the program reads. ⛔ NOT
-        // `CausalKey::mask`: that is the card's `[mq, mq_pad]` stick-padded
-        // layout — a different tensor than the one-pass kernel consumes.
-        let mq = pg.mq as usize;
-        let chunk = scratchy_subtile::sdsc_abstract::ChunkRows::chunk(
-            std::num::NonZeroU32::new(pg.mq).expect("a prefill rung bakes mq > 1"),
-        );
-        let mut m = vec![0.0f32; mq * mq];
-        for r in 0..mq {
-            let pos = chunk.row_logical_pos(r, mq);
-            for c in 0..mq {
-                if !scratchy_subtile::sdsc_abstract::prefill_causal_col_valid(c, pos) {
-                    m[r * mq + c] = -1.0e38;
-                }
-            }
-        }
-        sources.push((u64::from(ir.tensors.len() as u32), m, vec![mq, mq]));
-    } else {
-        let valid_prefix = ir
-            .nodes
-            .iter()
-            .filter_map(|n| match &n.op {
-                SubOp::AttnDecode {
-                    producer:
-                        scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend { .. },
-                    ..
-                } if n.inputs.len() >= 5 => Some(n.inputs[1].region.rows.len as usize),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(cap as usize);
-        sources.push((
-            u64::from(ir.tensors.len() as u32),
-            crate::manifest::attn_mask_fill(cap as usize, valid_prefix),
-            vec![1, cap as usize],
-        ));
-    }
+    // ── The attention family's step inputs are staged BELOW, on the session ──
+    // through the ONE builder the card's fill stages through (`stage_attn_step_inputs`),
+    // at slot 0's own numbering: `step_input_tid` at slot `MASK` is `ir.tensors.len()`,
+    // the synthetic one-past-the-graph placement `BundleWiring` always stated. There is
+    // NO fallback length-mask law and no second producer: on this branch every attention
+    // program is one of the three spliced kernels and all of them declare the step
+    // inputs, so a bundle that runs attention while declaring none refuses, loud.
     // ── Run the bundle on the emulator ──
     // The golden tids, in the writer's own first-seen order — each with the
     // registry name of the op that first produces it (`SubOp::name`, so no
@@ -4159,7 +4532,13 @@ pub fn numeric_gate<F: RopeForm>(
         .filter(|t| bound.contains(t))
         .collect();
     let refs: Vec<(&[bundle::LaunchGroup<'static>], &[u64])> = vec![(groups, &results)];
-    let mut session = crate::runner::SpyreSession::new_multi(&refs, emu_weights)
+    // ⭐ SEAT (i), THE EMPTY TABLE ON PURPOSE: this gate's own scale staging (above) is the
+    // census half — `SubOp::ScalarMul` multipliers, every one staged at the incumbent f16 —
+    // so there is no f32 slot to declare and the session stays byte-identical. A program
+    // stating an f32 scale (the triton m-merge, once its l-line lands) hands the REAL table
+    // here, and a bundle whose f32 slot goes undeclared would fall back to the f16 fill —
+    // which is why the worker's one real call site passes the baked column, not this default.
+    let mut session = crate::runner::SpyreSession::new_multi(&refs, emu_weights, &[])
         .map_err(|e| format!("gate session: {e}"))?;
     let observables = session.observable_tids(0);
     let compare: Vec<(u64, usize)> = golden_tids
@@ -4175,6 +4554,66 @@ pub fn numeric_gate<F: RopeForm>(
             golden_tids.len(),
             observables.len()
         ));
+    }
+    // ── The attention family's step inputs, staged on the session ──
+    // ⭐ THE GATE'S HALF OF THE `attn_step_slots` CONTRACT. The CONTENT is the
+    // same builder the worker's fill calls, so the gate stages byte-identically
+    // what the card stages: the id tables name the identity page map's pages
+    // (logical page p = physical page p — the reference reads ONE logical
+    // sequence, which IS that map), and the mask is the region's own validity
+    // law (decode: slots `<= start`; prefill: the chunk's causal bound) — the
+    // same law the golden's key set states. A tape with no AttnDecode stages
+    // nothing (the bind is unused); a tape that runs attention while its
+    // placement declares no step inputs refuses — no fallback, no second
+    // producer.
+    // `Option`: `None` = no AttnDecode in this tape at all — nothing to stage,
+    // no leg to state. No meaningless `cap` placeholder exists.
+    let leg = match prefill {
+        Some(pg) => Some(GateAttnLeg::Prefill { mq: pg.mq }),
+        None => {
+            // The reference's own key set: the max rope-append prefix region
+            // length — the prefix rows the golden concatenates, which is the
+            // `start` the solo decode row runs at. ⛔ NO DEFAULT and NO MIXING:
+            // every attention on this branch reads a rope-appended pool, so an
+            // AttnDecode with no SameForwardRopeAppend prefix is a tape this
+            // branch never bakes — a refusal naming the node, whether or not
+            // other AttnDecodes in the same tape carry a prefix.
+            let mut start: Option<usize> = None;
+            let mut first_unprefixed: Option<usize> = None;
+            for n in &ir.nodes {
+                let SubOp::AttnDecode { producer, .. } = &n.op else {
+                    continue;
+                };
+                match producer {
+                    scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend {
+                        ..
+                    } if n.inputs.len() >= 5 => {
+                        let len = n.inputs[1].region.rows.len as usize;
+                        if start.is_none_or(|s| len > s) {
+                            start = Some(len);
+                        }
+                    }
+                    _ => {
+                        first_unprefixed.get_or_insert(n.output.tensor.index());
+                    }
+                }
+            }
+            match (start, first_unprefixed) {
+                (_, Some(tid)) => {
+                    return Err(format!(
+                        "numeric gate {fp}: this decode rung's AttnDecode at output tid {tid} \
+                         carries no SameForwardRopeAppend prefix — every attention on this \
+                         branch reads a rope-appended pool, so this tape is not one this \
+                         branch bakes"
+                    ));
+                }
+                (Some(s), None) => Some(GateAttnLeg::Decode { start: s }),
+                (None, None) => None,
+            }
+        }
+    };
+    if let Some(leg) = leg {
+        stage_attn_step_inputs(&mut session, fp, ir, rung.page_stride_bytes, leg)?;
     }
     let out = session
         .run_step(0, sources, &compare)
@@ -4226,21 +4665,26 @@ pub fn numeric_gate<F: RopeForm>(
     // membership: the result joins the folded law iff the splice's own
     // `tensor_feeds_result_through_row_local_ops` holds from a FOLDED node's
     // output to the result — the same predicate that admitted the fold, so
-    // nothing un-folded can ride in. The front end column-chunks a wide
-    // pointwise tail op past the predicate's width conjunct
-    // (`n_blocks(out_cols, nb)` chunks Silu/Mul/Add/ScalarMul/SiluMul —
-    // measured: granite's 49155-wide logits ScalarMul is 7 region-slice
-    // nodes of 8192 cols, so none matches and the tail op stays un-folded,
-    // the splice's documented cost-only shape: "row 0 is still right ...
-    // the device pays mq−1 rows of reads of unwritten logits for
-    // nothing"). Those chunks still scale the folded matmul's row-0 (=
-    // LAST-row) product — row-locally, guaranteed by this same walk — so
-    // the RESULT's row 0 is the fold's product and its rows 1+ are the
-    // dead stick: it takes the same last-row-vs-row-0 law (measured on the
-    // granite refusal dump: last-row rel 0.00049 at the fp8 floor, rows
-    // 1-30 exactly zero; the plain law reads 1.0136). A no-op when the
-    // tail's own op matched whole-region (gemma's TanhSoftCap already put
-    // the result in the set).
+    // nothing un-folded can ride in. The front end column-chunks every wide
+    // pointwise tail op (`n_blocks(out_cols, nb)` chunks Silu/Mul/Add/
+    // ScalarMul/SiluMul — measured: granite's 49155-wide logits ScalarMul is
+    // SEVEN region-slice nodes, six of 8192 + one of 3), and the predicate's
+    // width conjunct reads the output TENSOR's cols, not the chunk region's,
+    // so the chunking does not change the fold's decision: EVERY region-slice
+    // piece of the result-feeding tail tensor folds to the m=1 tail. (This is
+    // the leg-55 fix: region-keyed, every piece's 8192 failed the equality,
+    // the pieces stayed un-folded and read mq−1 rows the folded m=1 matmul
+    // never wrote — "row 0 is still right ... the device pays mq−1 rows of
+    // reads of unwritten logits for nothing" — a cost-only shape the tree
+    // carried on main too, until the read-before-write walk refused it at
+    // prefill leg 55.) The folded pieces each scale one row-0 column slice of
+    // the folded matmul's (= LAST-row) product — row-locally, guaranteed by
+    // this same walk — so the RESULT's row 0 is the fold's product and its
+    // rows 1+ are the dead stick: it takes the same last-row-vs-row-0 law
+    // (measured on the granite refusal dump: last-row rel 0.00049 at the fp8
+    // floor, rows 1-30 exactly zero; the plain law reads 1.0136). A no-op
+    // when the tail's own op matched whole-region (gemma's TanhSoftCap is
+    // never chunked and already put the result in the set).
     if ir.nodes.iter().any(|n| {
         folded.contains(&(n.output.tensor.index() as u64))
             && scratchy_triton_splice::tensor_feeds_result_through_row_local_ops(
@@ -4620,8 +5064,10 @@ pub enum GroupKind {
     /// cache writes are `nkvh · requests · 2` per layer, and making each its own singleton (which is
     /// what treating them as distinct-slot did) cost ~5,300 extra launches per forward and ran a
     /// batch of 8 twenty times slower than one request. 0 for an unbatched bundle, so its grouping
-    /// is exactly what it was.
-    Slot { req: u32 },
+    /// is exactly what it was. The request rides as a [`TripRequest`] — the same wrapper [`Trip`]
+    /// carries — so the kind's own comparison (`fusable_kind_with`) cannot match it against a
+    /// bare small integer that happens to equal a request.
+    Slot { req: TripRequest },
     /// `slot_write` PREFILL cachewr: writes a DISTINCT per-entry slot (baked at `s·hd`). The
     /// shim's single per-group slot-shift CANNOT express distinct slots, so each is its OWN
     /// singleton group (launched with its baked slot doff; prefill `slot_pos==0` ⇒ no shift).
@@ -4644,8 +5090,8 @@ pub enum GroupKind {
     /// its stride (STICK_BYTES·stick = 8192) ≠ the cachewr's `slot_stride_bytes` (128), so fusing the two
     /// would trip the per-group uniform-stride assert (mixed-stride group → wrong base shift).
     Slab,
-    /// A GATHERED read outside any fold — the split-KV chunk's copies (`attn.rs`'s
-    /// `assemble_attn_chunk`), which pull every resident page through the index ONCE per launch.
+    /// A GATHERED read outside any fold — the split-KV chunk's copies (the deleted old emitter's
+    /// `assemble_attn_chunk`), which pulled every resident page through the index ONCE per launch.
     /// Consecutive `Gathered` trips FUSE, but never with anything else: the group's `KvShifts::gathered`
     /// is what zeroes its KV page shift (the entries are absolute) and what tells the host this body
     /// needs its index staged, so a `Pure` op swept in would lose its page base, and a copy swept into
@@ -4680,11 +5126,17 @@ pub struct TripRequest(pub u32);
 pub struct Trip {
     pub kind: GroupKind,
     pub req: TripRequest,
-    /// ⭐ THE OP'S [`EmittedOp::kv_slot_offset`] — which PAGE PART of a multi-page prefill window it
-    /// addresses. Checked beside the request, for every kind, and for the same reason: a launch resolves
-    /// ONE page per group, so a cache-write part (a `Slot`) and a Kᵀ re-transpose part (a `Pure`) of the
-    /// window's second page cannot share a group with anything aimed at its first.
-    pub slot_offset: u32,
+    /// ⭐ THE OP'S [`EmittedOp::kv_part`] — which page of a multi-page window it addresses. A
+    /// [`PagePart`](ktir_superdsc::page_part::PagePart), minted only by the cutting law
+    /// (`PagedKvPool::write_parts`) and copied op → trip → launch, so the value the walk
+    /// compares and the value the launch shifts by are ONE value. Compared beside the request,
+    /// for every kind, and for the same reason: a launch resolves ONE page per group, so a
+    /// cache-write part (a `Slot`) and a Kᵀ re-transpose part (a `Pure`) of the window's second
+    /// page cannot share a group with anything aimed at its first. WHAT THE PART CARRIES IS THE
+    /// ARGUMENT'S TYPE, NOT THIS COMMENT — a bare `u32` here is what made the walk's comparison
+    /// and the launch's re-read two derivations that could disagree (and did, guarded only by an
+    /// assert at bake).
+    pub part: ktir_superdsc::page_part::PagePart,
 }
 
 impl GroupKind {
@@ -4780,16 +5232,17 @@ impl GroupKind {
 impl Trip {
     /// A trip addressing its request's page at the write cursor — every trip but a page part's.
     pub fn new(kind: GroupKind, req: TripRequest) -> Trip {
-        Trip::at_slot_offset(kind, req, 0)
+        Trip::at_part(kind, req, ktir_superdsc::page_part::PagePart::at_cursor())
     }
 
-    /// A trip addressing the page `slot_offset` slots past the write cursor (see [`Trip::slot_offset`]).
-    pub fn at_slot_offset(kind: GroupKind, req: TripRequest, slot_offset: u32) -> Trip {
-        Trip {
-            kind,
-            req,
-            slot_offset,
-        }
+    /// A trip addressing the page `part` names past the write cursor — the part the cutting law
+    /// minted for the op this trip was built from (see [`Trip::part`]).
+    pub fn at_part(
+        kind: GroupKind,
+        req: TripRequest,
+        part: ktir_superdsc::page_part::PagePart,
+    ) -> Trip {
+        Trip { kind, req, part }
     }
 
     /// THE ONE RULE THAT DECIDES EVERY GROUP BOUNDARY: same request, same page part, and kinds that fuse.
@@ -4797,11 +5250,13 @@ impl Trip {
     /// A group is one launch; a launch resolves one request's page table and one write cursor and
     /// shifts the segment base ONCE. Two requests therefore cannot share a group whatever their
     /// kinds — so the request test lives HERE, above the kind test, and applies to kinds that do not
-    /// exist yet. Two page parts cannot either: their pages differ, and the shift is one page.
+    /// exist yet. Two page parts cannot either: their pages differ, and the shift is one page — the
+    /// part comparison is over the OPAQUE [`PagePart`](ktir_superdsc::page_part::PagePart) type,
+    /// which the cutting law alone mints, so it cannot be confused with a slot index, a page count
+    /// or a `rep`, and the value compared here is the value the launch later shifts by (there is no
+    /// second derivation to disagree with it).
     fn fusable_with(&self, other: &Trip) -> bool {
-        self.req == other.req
-            && self.slot_offset == other.slot_offset
-            && self.kind.fusable_kind_with(other.kind)
+        self.req == other.req && self.part == other.part && self.kind.fusable_kind_with(other.kind)
     }
 }
 
@@ -5175,16 +5630,14 @@ fn trip_kinds_and_owner(ops: &[EmittedOp]) -> (Vec<Trip>, Vec<usize>) {
                 if e.slot_no_fuse {
                     GroupKind::SlotSolo
                 } else {
-                    GroupKind::Slot { req: e.kv_request }
+                    GroupKind::Slot {
+                        req: TripRequest(e.kv_request),
+                    }
                 }
             } else {
                 GroupKind::Pure
             };
-            kinds.push(Trip::at_slot_offset(
-                k,
-                TripRequest(e.kv_request),
-                e.kv_slot_offset,
-            ));
+            kinds.push(Trip::at_part(k, TripRequest(e.kv_request), e.kv_part));
             owner.push(oi);
         }
     }
@@ -5223,9 +5676,26 @@ fn trip_kinds_for(ops: &[EmittedOp], fold: FoldGrouping) -> (Vec<Trip>, Vec<usiz
     let (mut kinds, owner) = trip_kinds_and_owner(ops);
     if fold == FoldGrouping::Fused {
         for t in kinds.iter_mut() {
-            if matches!(t.kind, GroupKind::PageFold { .. }) {
+            if let GroupKind::PageFold { gathered } = t.kind {
                 // Reclassified, but it KEEPS ITS REQUEST — so it still cannot fuse across requests.
-                t.kind = GroupKind::Pure;
+                // ⭐⭐⭐⭐⭐ AND THE FUSED VARIANT FOLDS AWAY THE PER-PAGE RELAUNCH, NOT THE ENTRY
+                // SEMANTICS. A fold op whose gather reads ABSOLUTE stick-blocks (`kv_gathered`,
+                // carried here in the kind by `trip_kinds_and_owner` from the paged-fold stamp's
+                // chain of custody) is a `Gathered` run: `launch_index` derives the group's
+                // `KvShifts.gathered` from this kind, and the runtime's page-base composition
+                // asks that bit — a gathered fold rewritten to `Pure` composes the page base on
+                // top of the operand's own pool base and reads one page past its keys, the same
+                // two-bases defect the copy-leg stamp cures, through the fused twin. `Gathered`
+                // fuses only with `Gathered` (`fusable_kind_with`), so the fold's gathered ops
+                // leave the neighbouring `Pure` run — the launch-count cost the `FoldGrouping`
+                // doc already records for the split variant, paid here for correctness. An
+                // UNGATHERED fold stays `Pure` exactly as before, and `page_fold` stays `false`
+                // for either: the fused variant still never re-launches.
+                t.kind = if gathered {
+                    GroupKind::Gathered
+                } else {
+                    GroupKind::Pure
+                };
             }
         }
     }
@@ -5514,23 +5984,21 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
         } else {
             0
         };
-        // ONE PAGE PART per group, of ANY kind — the runtime resolves the group's page once, at the
-        // owner's offset, so an op of another part would land on the wrong page. `group_ranges` breaks a
-        // run where the offset changes (`Trip::fusable_with`), so this cannot fire; it is here because a
-        // part on the wrong page is a cache write nothing downstream can detect.
-        for t in r.clone() {
-            let o = &ops[owner[t]];
-            assert!(
-                o.kv_slot_offset == e.kv_slot_offset,
-                "group {gi}: op '{}' addresses slot offset {} but the group resolves {} — one group is \
-                 one page shift, so a page part must not share a group with another part",
-                o.op_name,
-                o.kv_slot_offset,
-                e.kv_slot_offset
-            );
-        }
+        // ⭐ ONE PAGE PART per group, of ANY kind — AS A TYPE, NOT AN ASSERT. The runtime resolves the
+        // group's page once, at the group's part, so an op of another part would land on the wrong
+        // page: a cache write nothing downstream can detect. That guard used to be an `assert!` here,
+        // re-reading the owner op's field against every member's — two derivations that could only be
+        // proven to agree by running them. There is ONE derivation now: [`Trip::fusable_with`] breaks
+        // every run where the part changes, and the shift below reads the group's own first trip's
+        // part — the same value the walk compared — so "the members disagree with the shift" is not a
+        // state the emitter can construct. What the part carries is [`Trip::part`]'s type.
         let fold_group = matches!(kinds[r.start].kind, GroupKind::PageFold { .. });
         let _ = gi; // launch order is the slice position now, not a field
+        // ⭐ THE GROUP'S GATHERED ANSWER, derived ONCE — the KV shift's zero and the staging
+        // channel below both key off it, so there is one derivation, not two that could
+        // disagree.
+        let gathered =
+            (fold_group && e.kv_gathered) || matches!(kinds[r.start].kind, GroupKind::Gathered);
         shifts.push(bundle::KvShifts {
             slot_stride_bytes: slot,
             slab_stride_bytes: slab,
@@ -5539,7 +6007,11 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
             // absolute-position shift and land past the page.
             page_slots: e.kv_page_slots,
             request: e.kv_request,
-            slot_offset: e.kv_slot_offset,
+            // ⭐ THE GROUP'S PART, OFF THE WALK'S OWN TRIP — the first trip of the run `group_ranges`
+            // formed, whose part every other member's was compared against by `fusable_with`. Never
+            // the owner op's field: before this was a second read of a second derivation, and the
+            // assert that proved the two agreed was a refusal at bake. One derivation, one source.
+            part: kinds[r.start].part,
             // `page_fold` marks the group the runtime re-launches once per page.
             page_fold: fold_group,
             // ONE PASS PER PAGE INSTEAD OF PER (REQUEST, PAGE) — only when the fold's kernels actually
@@ -5548,8 +6020,15 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
             // ⭐ AND WHETHER THAT AXIS IS OVER A GATHERED SCRATCH — the other half of `fold_plan::collapsed`,
             // and what sends the fold's KV shift to zero. A non-fold group gathers only as a `Gathered`
             // run (the split-KV chunk's copies), which takes the same zero shift and the same staged index.
-            gathered: (fold_group && e.kv_gathered)
-                || matches!(kinds[r.start].kind, GroupKind::Gathered),
+            // Derived ONCE here: the staging channel below keys off the same answer.
+            gathered,
+            // ⭐ THE STAGING CHANNEL — whether the table those absolute entries read through is
+            // the FILL-STAGED REGION FORM, not the composer's page-list table. Both channels'
+            // entries are ABSOLUTE (both take the zero shift above); this bit only discriminates
+            // WHO stages the table, so the composer and the forward's index-step door key their
+            // page-list answer on `gathered && !region_form`. Stamped by the walk on a region
+            // carrier's ops and on fold carriers (folds stage through the same host fill).
+            region_form: gathered && e.kv_region_form,
             fold_rows: match e.kv_fold_rows {
                 scratchy_subtile::sdsc_abstract::FoldRowRegime::PerRequest => {
                     bundle::FoldRows::PerRequest
@@ -5969,6 +6448,7 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         weight_tail,
         kernel_weights,
         scalarmul_scales,
+        scalarmul_scales_df,
         weight_scale_folds,
         weight_copies,
         synth,
@@ -5985,6 +6465,18 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // it — the slot map is this layout's, gone when the bake returns.
         lx,
         kv_request_stride_bytes,
+        // ⭐ THE HOST-STAGED STEP INPUTS' DISCOVERY TABLE + STAGING LAW, BAKED. The placement pass
+        // recorded each stated input's slot and the element format its program's own view states;
+        // here that format becomes the staging channel — WHICH runtime narrowing the host's bytes
+        // take — and a format with no channel is a `cargo build` panic (this runs at bake), not a
+        // launch-time guess. The runtime resolves slots through the baked table and never
+        // recomputes the producer's `tensors.len()+k` numbering.
+        step_inputs,
+        // EMIT-ONLY: the gather reach is the gather door's compile-time bound — the pool a pooled
+        // table's entry run is refused past at build. The runtime's own pool budget and the host's
+        // `GatherEntry` composition are the value-side authorities; the baked artifact carries the
+        // placements those entries address, not the bound that checked them.
+        gather_reach: _,
         // EMIT-ONLY too: the class registries are build-time facts the door and the load-time bind
         // resolve through; the baked artifact carries each class's PLACEMENT (in `places` above),
         // which is all the runtime needs.
@@ -5994,7 +6486,40 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // job is done at mint time (bundle-unique tids, above every placement). The baked artifact
         // carries the minted RESULTS (the synth placements above), not the minter.
         inter_cursor: _,
+        // ⛔ THE PENDING KV BLOCK INDEX — SPENT OR REFUSED, never silently dropped (checked just
+        // below). The reservation is placed (or this bundle never gathered) by the time any
+        // bundle bakes; a `Some` here means a walk forgot
+        // [`BundleLayout::place_kv_block_index_last`]. The placement's PRESENCE is
+        // `BakeFacts::gathers_kv`, and a gather that finds no table reads entry 0 — a real
+        // address — so an unspent reservation is a `cargo build` panic (this runs at bake),
+        // never a silent `gathers_kv: false`.
+        kv_block_index,
+        // ⛔ THE PENDING REP TABLE — SPENT OR REFUSED, never silently dropped (same law as the
+        // KV block index just above). The reservation is placed (or this bundle's rows stated
+        // no rep slot) by the time any bundle bakes; a `Some` here means a walk forgot
+        // [`BundleLayout::place_rep_table_last`]. A batched score read with no table reads
+        // stick 0 — a real address — so an unspent reservation is a `cargo build` panic (this
+        // runs at bake), never a silently unplaced rep.
+        rep_table,
+        // EMIT-ONLY: the paged-fold region's page ceiling is the WALK's input — the fact the
+        // fold family's tables and mask state their extents against. The baked artifact carries
+        // those extents themselves (the step-input placements below), and the runtime's fold
+        // passes answer "how many" from the launch group's own declaration, never by re-reading
+        // a ceiling — so there is nothing for the bake to carry.
+        paged_fold_region_pages: _,
     } = l;
+    assert!(
+        kv_block_index.is_none(),
+        "the KV block index reservation reached the bake unplaced — the walk forgot \
+         BundleLayout::place_kv_block_index_last, and the placement's presence is \
+         BakeFacts::gathers_kv: a gather with no table reads entry 0"
+    );
+    assert!(
+        rep_table.is_none(),
+        "the rep table reservation reached the bake unplaced — the walk forgot \
+         BundleLayout::place_rep_table_last, and a batched score read with no table reads \
+         stick 0"
+    );
 
     let mut places: Vec<bundle::Placement> = placements
         .iter()
@@ -6005,6 +6530,9 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
             offset: p.offset,
             size: p.size,
             is_logits: p.role == SegRole::Logits,
+            // ⭐ THE WRITE-COVER RIDES ALONG — minted at the placement's own construction
+            // site, where its geometry was in hand; the runtime's bind doors read it here.
+            cover: p.cover,
         })
         .collect();
     // SYNTHETIC intermediates are not SubtileIR tensors, so they have no `t{id}` — they are named
@@ -6033,6 +6561,9 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
                 .get(name)
                 .unwrap_or_else(|| panic!("synthetic '{name}' has an offset but no reserved size")),
             is_logits: false,
+            // ⭐ FULL — a synthetic is device-written by the op that minted it; a host bind
+            // short of its extent would leave the op's readers on unwritten bytes.
+            cover: ktir_superdsc::placement::BindCover::Full,
         }
     }));
 
@@ -6111,6 +6642,35 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
                 .collect(),
         ),
         scalarmul_scales: std::borrow::Cow::Owned(scalarmul_scales.clone()),
+        // Each scale slot's staging channel, off the registry's own df column — the same
+        // fail-closed projection `step_inputs` below runs: a format with no channel is a BUILD
+        // PANIC naming the slot, not a launch-time guess. The columns enter parallel (the
+        // completion pass keeps them one length), and the mapping is total over the registry.
+        scalarmul_scales_stage: {
+            assert_eq!(
+                scalarmul_scales.len(),
+                scalarmul_scales_df.len(),
+                "the scale registry's value and format columns are out of parallel — the layout \
+                 was built with one column missing"
+            );
+            std::borrow::Cow::Owned(
+                scalarmul_scales
+                    .iter()
+                    .zip(scalarmul_scales_df.iter())
+                    .enumerate()
+                    .map(|(i, (v, df))| {
+                        crate::wiring::scale_stage_of(
+                            *df,
+                            &format!(
+                                "scale slot {} (value {})",
+                                ktir_superdsc::reserved_tids::scalarmul_scale_tid(i),
+                                v
+                            ),
+                        )
+                    })
+                    .collect(),
+            )
+        },
         weight_scale_folds: std::borrow::Cow::Owned(weight_scale_folds.clone()),
         weight_copies: std::borrow::Cow::Owned(weight_copies.clone()),
         kv_request_stride_bytes: *kv_request_stride_bytes,
@@ -6123,6 +6683,33 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // `chunk_gather_index_table` read passes it beside `lx_op_local_bytes`, so it refuses
         // exactly what the bake refused.
         lx_prob_pin_bytes: lx.borrow().prob_pin_bytes,
+        // The discovery table + staging law, tid-sorted (the placement pass kept a BTreeMap): one
+        // row per stated input, its element format mapped to the runtime channel that narrows it.
+        // ⛔ A FORMAT WITH NO CHANNEL IS A BUILD PANIC, not a silent default: this runs at bake, so
+        // a program stating a step input the launch could not stage fails `cargo build` naming the
+        // tid — the same fail-closed shape as every other bake-time guard here.
+        step_inputs: std::borrow::Cow::Owned(
+            step_inputs
+                .iter()
+                .map(|(&tid, row)| {
+                    let stage = match row.df {
+                        Df::Fp16 => bundle::StepInputStage::IeeeF16,
+                        Df::SenUint32 => bundle::StepInputStage::RawU32,
+                        other => panic!(
+                            "t{tid}: a host-staged step input whose program states {other:?} has \
+                             no staging channel — the runtime narrows IEEE f16 to SEN169 or copies \
+                             raw u32 entries, and nothing else. REFUSING to bake a buffer the \
+                             launch could not stage."
+                        ),
+                    };
+                    bundle::StepInput {
+                        tid,
+                        slot: row.slot,
+                        stage,
+                    }
+                })
+                .collect(),
+        ),
     }
 }
 
@@ -6893,8 +7480,9 @@ pub struct RolledSuperDsc {
     /// there, where a second derivation would be free to disagree. `None` when the graph has no
     /// attention node. See [`crate::ktir_superdsc_door::BundleAttnParams`].
     ///
-    /// ⛔ NOT A RECORD ON THE PROGRAM. `AttnFacts` was that, and it let the emulator and the card
-    /// compute different attention; these are arguments of [`emit_bundle`], stated once per bundle.
+    /// ⛔ NOT A RECORD ON THE PROGRAM. A sidecar record (`AttnFacts`, deleted) was that, and it let
+    /// the emulator and the card compute different attention; these are arguments of
+    /// [`emit_bundle`], stated once per bundle.
     pub attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
 }
 
@@ -7170,6 +7758,210 @@ pub fn ktir_groups(
     Ok(out)
 }
 
+/// ⭐ THE STAMP — ONE FUNCTION, and the walk's call is the production path. Everything the
+/// splice states about a carrier's KV (`kv_paged_fold`, `kv_paged_region` — each the ONE door
+/// for its fact) reaches the descriptors the bake actually groups HERE, copied verbatim onto
+/// every op the door minted from that carrier's program. One function so there is one
+/// stamping site to audit; [`mint_bundle_ops`]'s call below is the only production
+/// caller, and the pin (`prefix_free_prefill_rung_stamps_its_carrier_at`) calls it
+/// directly on a door-lowered carrier to check the stamp's own contract — every op, no
+/// exceptions, non-empty.
+/// Fatal refusals — no rung can survive a broken stamp premise.
+fn stamp_carrier_kv_facts(
+    carrier: &EmittedOp,
+    lowered: &mut Vec<EmittedOp>,
+    layout: Option<&BundleLayout>,
+) -> Result<(), SuperDscError> {
+    // ⭐ THE PAGED-FOLD STAMP — the CHAIN-OF-CUSTODY step. The splice states the fold on the
+    // program's EmittedOp (`kv_paged_fold`, the ONE door: no other site may set it); THIS is
+    // where it reaches the descriptors the bake actually groups, copied VERBATIM onto every
+    // op the door minted from that program — the walk derives nothing, the stamp recomputes
+    // nothing, and `emitted_bundle_folds`'s proof reads what this wrote. A program that
+    // states no fold stamps nothing, so every non-fold bundle stays byte-identical.
+    // The `kv_region_form` rider: a fold's step inputs are staged by the SAME host fill
+    // (`fill_attn_step_inputs`) a region carrier's are, so its groups answer the staging
+    // channel `region_form = true` — folds never read the composer's page-list table.
+    if let Some(facts) = carrier.kv_paged_fold {
+        for o in lowered {
+            o.kv_page_fold = true;
+            o.kv_batched_requests = facts.batched_requests;
+            o.kv_gathered = facts.gathered;
+            o.kv_region_form = true;
+            o.kv_fold_rows = facts.fold_rows;
+            o.kv_page_slots = facts.page_slots;
+        }
+    }
+    // ⭐ THE PAGED-REGION STAMP — the one-shot attention chain of custody, the same shape as
+    // the fold's. The splice states the fill-form region on the program's EmittedOp
+    // (`kv_paged_region`, the ONE door); THIS is where it reaches the descriptors the bake
+    // actually groups. The addressing fact (`kv_gathered` — the entries are ABSOLUTE
+    // stick-blocks, the op takes the ZERO KV shift, never the page base on top) and the
+    // staging channel (`kv_region_form` — the table is host-fill-staged, not
+    // composer-composed) are stamped together onto EVERY op the door minted from that
+    // carrier's program: the door materializes the gather as legs + dots + softmax inside
+    // the one carrier, the KV shift only touches seg2 operands, and the whole attention
+    // group takes the zero shift — the per-leg granularity the retired door stamps carried
+    // was a grouping optimization, not a correctness requirement. A program that states no
+    // region stamps nothing.
+    //
+    // ⛔ THE SLOT/SLAB GUARD — the stamp's soundness, ENFORCED, not assumed. The region
+    // stamp is sound because the attention program carries no runtime-composed seg2 shift
+    // of its own: it has no slot writes (the cache write is the door's RopeAppend arm, a
+    // SEPARATE program that self-stamps its slot facts) and its only SEG_KV readers are
+    // the pool gathers (absolute entries — the second half of the soundness statement is
+    // what `kv_gathered` means). An op with a runtime-composed slot/slab shift inside this
+    // carrier would have that shift zeroed too — every new key landing on the wrong slot,
+    // silently — so a future kernel that fuses the cache write into attention must hit
+    // THIS refusal, not the card. (The else-if order above already makes a mixed
+    // fold+region carrier impossible: `kv_paged_fold` is checked first.)
+    else if let Some(region) = carrier.kv_paged_region {
+        // ⛔⛔ (a') THE REACH GUARD — the stamp's premise, CHECKED, not assumed. The stamp
+        // is sound because the entries the carrier gathers are ABSOLUTE stick-blocks, and
+        // "absolute" is a fact of a POOL the layout placed a `gather_reach` for — the same
+        // reach the placement loop inserts for these tids (`pool_reach_tids`, the ONE
+        // spelling both sites derive through). A carrier whose pool carries no reach is a
+        // graph that is not paged the way the mint assumed — a future non-paged attention
+        // form reaching the one-shot arm — and stamping it would zero the KV shift over an
+        // UNPAGED read, silently. It refuses here, at the build, instead.
+        let reach_tids = region.reach_tids();
+        match layout {
+            Some(l)
+                if reach_tids
+                    .iter()
+                    .all(|tid| l.gather_reach.contains_key(tid)) => {}
+            Some(_) => {
+                return Err(SuperDscError(format!(
+                    "[spyre-superdsc] {}: the paged-region carrier's pool (k=t{}, v=t{}) \
+                     carries no gather reach in this bundle's layout — the region stamp gives \
+                     every op of the carrier the ZERO KV page shift because the entries are \
+                     ABSOLUTE stick-blocks, and absolute entries are a fact of a pool the \
+                     placement covered. A graph that placed no reach for these tids is not \
+                     paged; stamping it would zero the shift over an unpaged read. Refusing.",
+                    carrier.op_name, region.k_tid, region.v_tid
+                )));
+            }
+            None => {
+                return Err(SuperDscError(format!(
+                    "[spyre-superdsc] {}: a paged-region carrier arrived with no bundle \
+                     layout to check its pool's gather reach against — the region stamp's \
+                     premise (a placed pool) has no artifact behind it on this path. \
+                     Refusing.",
+                    carrier.op_name
+                )));
+            }
+        }
+        if let Some(o) = lowered
+            .iter()
+            .find(|o| o.slot_stride_bytes > 0 || o.slab_write)
+        {
+            return Err(SuperDscError(format!(
+                "[spyre-superdsc] {}: a paged-region carrier may not carry the \
+                 slot/slab-shifted op '{}' (slot_stride_bytes={}, slab_write={}): the \
+                 region stamp gives every op of the carrier the ZERO KV page shift, which \
+                 would corrupt a runtime-composed slot/slab shift. The cache write is a \
+                 separate program; keep it there.",
+                carrier.op_name, o.op_name, o.slot_stride_bytes, o.slab_write
+            )));
+        }
+        for o in lowered {
+            o.kv_gathered = true;
+            o.kv_region_form = true;
+        }
+    }
+    Ok(())
+}
+
+/// What the walk's mint hands the rest of the walk: every descriptor it lowered, in program
+/// order, and each program's name with its descriptor count (the dump's `per_program` and the
+/// LX slot walk read the second).
+struct MintedBundle {
+    ops: Vec<EmittedOp>,
+    per_prog: Vec<(String, usize)>,
+}
+
+/// The walk's mint, extracted verbatim so the stamp's custody is testable WITHOUT the bake: a test
+/// can run this, then the walk's own pure consumers (`launch_index`, `render_dxp_input`), and count
+/// trips — the same counting the walk itself groups by — while never touching the bake queue, the
+/// staging root, or dxp. The walk (`ktir_groups_via_superdsc`) calls this and then runs its guards,
+/// render, and staging exactly as before.
+fn mint_bundle_ops(
+    ops: &[EmittedOp],
+    layout: Option<&BundleLayout>,
+    attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
+) -> Result<MintedBundle, SuperDscError> {
+    // KTIR → SuperDSC, in memory. One symbol counter for the WHOLE bundle, exactly as the SubtileIR
+    // walk threads it: a per-op restart would alias addresses across ops in one bundle.
+    let mut sym_id_base: i64 = 0;
+    let mut sdsc_ops: Vec<EmittedOp> = Vec::new();
+    // (program name, descriptors) — written into the dump's `bundle_id.json`, since the eprintln below
+    // is invisible on a successful build.
+    let mut per_prog: Vec<(String, usize)> = Vec::new();
+    for e in ops {
+        // ⛔ ONE PATH, AND IT IS CHECKED HERE. An op arriving with a descriptor ALREADY BUILT means
+        // some producer arm lowered a `SubtileNode` straight to SuperDSC, which is the `*_sdsc`
+        // side-path class. There used to be a pass-through here for exactly one such arm
+        // (`lower_sumreduce_node`); that arm is deleted, so the pass-through is a refusal now — the
+        // only way to SuperDSC is through a KTIR program.
+        if e.op.is_some() {
+            return Err(SuperDscError(format!(
+                "{}: arrived carrying a SuperDSC descriptor built by the PRODUCER. The only path to \
+                 SuperDSC is `SubtileIR → KTIR → SuperDSC`; a node lowered straight to a descriptor \
+                 is a second path to the same format. Build its KTIR in \
+                 `lower_subtile_tape_to_ktir` and port main's body in `lower_ktir_to_superdsc`.",
+                e.op_name
+            )));
+        }
+        let k = e.ktir.as_ref().ok_or_else(|| {
+            SuperDscError(format!(
+                "{}: no KTIR program — the node lowering declined this op, and a bundle short a \
+                 program computes something else",
+                e.op_name
+            ))
+        })?;
+        let _pc_cls = crate::pc::Pc::start(crate::pc::mint_class(&e.op_name));
+        let mut lowered =
+            crate::ktir_superdsc_door::lower(k, &mut sym_id_base, layout, attn_params).map_err(
+                |err| SuperDscError(format!("{}: KTIR -> SuperDSC: {}", e.op_name, err.message)),
+            )?;
+        drop(_pc_cls);
+        crate::pc::count(crate::pc::mint_class(&e.op_name), lowered.len() as u64);
+        stamp_carrier_kv_facts(e, &mut lowered, layout)?;
+        // ⭐ THE CACHE-WRITE FACTS NEED NO STAMP SITE — the append's recipe
+        // (`kv_cache_write`, called from the door's `Program::RopeAppend` arm)
+        // SELF-STAMPS every op it mints (`kv_page_slots`, `kv_request`,
+        // `kv_part`, the slot stride), which is what `latch_paged_geometry`
+        // reads off the final ops. A carrier-borne stamp copied here would be a second
+        // stamping site for one fact; there is none.
+        // ⭐ PER-PROGRAM ATTRIBUTION, because a TRIP IS NOT A DESCRIPTOR. `render_dxp_input`
+        // pre-unrolls each op into `concrete_trips(e)` — `EmittedOp::time` trips, set by
+        // `WorkPlan::time_tile_for_lx` when a per-core tile does not fit the scratchpad. So a bundle's
+        // trip total is `sum(descriptors × time)`, and a handful of descriptors with a large `time` is
+        // indistinguishable from many descriptors in the `GROUPS` line alone. Printed per program so
+        // the two causes can be told apart — a body of 17 nodes reporting 8748 trips is one or the
+        // other, and only this says which.
+        let trips: u32 = lowered.iter().map(|o| o.time.max(1)).sum();
+        if lowered.len() as u32 != trips {
+            eprintln!(
+                "  [ktir->sdsc] {}: {} descriptor(s), {trips} trip(s) — TIME-TILED",
+                e.op_name,
+                lowered.len(),
+            );
+        } else {
+            eprintln!(
+                "  [ktir->sdsc] {}: {} descriptor(s)",
+                e.op_name,
+                lowered.len()
+            );
+        }
+        per_prog.push((e.op_name.clone(), lowered.len()));
+        sdsc_ops.extend(lowered);
+    }
+    Ok(MintedBundle {
+        ops: sdsc_ops,
+        per_prog,
+    })
+}
+
 /// `-Fspyre-hw`'s counterpart to [`ktir_groups`]: the SAME per-op KTIR, lowered to real SuperDSC
 /// descriptors and handed to the bake queue.
 ///
@@ -7197,67 +7989,11 @@ fn ktir_groups_via_superdsc(
     layout: Option<&BundleLayout>,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
 ) -> Result<Vec<(bundle::KvShifts, crate::superdsc_bake::GroupId)>, SuperDscError> {
-    // KTIR → SuperDSC, in memory. One symbol counter for the WHOLE bundle, exactly as the SubtileIR
-    // walk threads it: a per-op restart would alias addresses across ops in one bundle.
-    let mut sym_id_base: i64 = 0;
-    let mut sdsc_ops: Vec<EmittedOp> = Vec::new();
-    // (program name, descriptors) — written into the dump's `bundle_id.json`, since the eprintln below
-    // is invisible on a successful build.
-    let mut per_prog: Vec<(String, usize)> = Vec::new();
     let _pc_mint = crate::pc::Pc::start("mint");
-    for e in ops {
-        // ⛔ ONE PATH, AND IT IS CHECKED HERE. An op arriving with a descriptor ALREADY BUILT means
-        // some producer arm lowered a `SubtileNode` straight to SuperDSC, which is the `*_sdsc`
-        // side-path class. There used to be a pass-through here for exactly one such arm
-        // (`lower_sumreduce_node`); that arm is deleted, so the pass-through is a refusal now — the
-        // only way to SuperDSC is through a KTIR program.
-        if e.op.is_some() {
-            return Err(SuperDscError(format!(
-                "{}: arrived carrying a SuperDSC descriptor built by the PRODUCER. The only path to \
-                 SuperDSC is `SubtileIR → KTIR → SuperDSC`; a node lowered straight to a descriptor \
-                 is a second path to the same format. Build its KTIR in \
-                 `lower_subtile_tape_to_ktir` and port main's body in `lower_ktir_to_superdsc`.",
-                e.op_name
-            )));
-        }
-        let k = e.ktir.as_ref().ok_or_else(|| {
-            SuperDscError(format!(
-                "{}: no KTIR program — the node lowering declined this op, and a bundle short a \
-                 program computes something else",
-                e.op_name
-            ))
-        })?;
-        let _pc_cls = crate::pc::Pc::start(crate::pc::mint_class(&e.op_name));
-        let lowered = crate::ktir_superdsc_door::lower(k, &mut sym_id_base, layout, attn_params)
-            .map_err(|err| {
-                SuperDscError(format!("{}: KTIR -> SuperDSC: {}", e.op_name, err.message))
-            })?;
-        drop(_pc_cls);
-        crate::pc::count(crate::pc::mint_class(&e.op_name), lowered.len() as u64);
-        // ⭐ PER-PROGRAM ATTRIBUTION, because a TRIP IS NOT A DESCRIPTOR. `render_dxp_input`
-        // pre-unrolls each op into `concrete_trips(e)` — `EmittedOp::time` trips, set by
-        // `WorkPlan::time_tile_for_lx` when a per-core tile does not fit the scratchpad. So a bundle's
-        // trip total is `sum(descriptors × time)`, and a handful of descriptors with a large `time` is
-        // indistinguishable from many descriptors in the `GROUPS` line alone. Printed per program so
-        // the two causes can be told apart — a body of 17 nodes reporting 8748 trips is one or the
-        // other, and only this says which.
-        let trips: u32 = lowered.iter().map(|o| o.time.max(1)).sum();
-        if lowered.len() as u32 != trips {
-            eprintln!(
-                "  [ktir->sdsc] {}: {} descriptor(s), {trips} trip(s) — TIME-TILED",
-                e.op_name,
-                lowered.len(),
-            );
-        } else {
-            eprintln!(
-                "  [ktir->sdsc] {}: {} descriptor(s)",
-                e.op_name,
-                lowered.len()
-            );
-        }
-        per_prog.push((e.op_name.clone(), lowered.len()));
-        sdsc_ops.extend(lowered);
-    }
+    let MintedBundle {
+        ops: sdsc_ops,
+        per_prog,
+    } = mint_bundle_ops(ops, layout, attn_params)?;
 
     // ⛔⛔⛔ main's FOUR POST-LOWERING GUARDS, AT THE GRAIN WHERE THE DESCRIPTORS NOW EXIST.
     //
@@ -7719,7 +8455,7 @@ mod tests {
         // positional form could not make: it compares two INDEPENDENTLY derived tids rather than one
         // constant against its own definition.
         assert_ne!(
-            kct_resident_tid(0),
+            KctResident::of(0).wire_tid(),
             KV_BLOCK_INDEX_TID,
             "the resident Kᵗ kernel of layer 0 and the gather's index tensor are ONE tid"
         );
@@ -8057,7 +8793,7 @@ mod tests {
         // The matmul OpSpec lowers to the frontend-minimal field set.
         let op = matmul_opspec(384, 384, 64, 16, "Tensor0", "Tensor1", "Tensor2").unwrap();
         let folds = SdscFoldSet::new(op.iter.cores_used());
-        let sdsc = emit_sdsc("MatMul_0", &op, &folds, None).unwrap();
+        let (sdsc, _) = emit_sdsc("MatMul_0", &op, &folds, None).unwrap();
         let j = serde_json::to_string(&sdsc).unwrap();
         // Frontend-minimal memOrg: hbm+lx only, NO register file.
         assert!(j.contains("\"memOrg_\":{\"hbm\":{\"isPresent\":1},\"lx\":{\"isPresent\":1}}"));
@@ -8128,7 +8864,7 @@ mod tests {
         // And the FULL emit succeeds (would have panicked pre-fix if "y" were absent from this
         // shape's layout, or produced a silently-wrong scale_ if the marker were dropped).
         let folds = SdscFoldSet::new(op.iter.cores_used());
-        let sdsc = emit_sdsc("MatMul_0", &op, &folds, None).unwrap();
+        let (sdsc, _) = emit_sdsc("MatMul_0", &op, &folds, None).unwrap();
         let labeled = &sdsc.dscs_[0]["MatMul_0"].labeledDs_;
         let mask_lds = labeled
             .iter()
@@ -8205,7 +8941,7 @@ mod tests {
             },
         });
         let folds = SdscFoldSet::new(op.iter.cores_used());
-        let sdsc = emit_sdsc("MatMul_0", &op, &folds, None).unwrap();
+        let (sdsc, _) = emit_sdsc("MatMul_0", &op, &folds, None).unwrap();
         let ops = &sdsc.dscs_[0]["MatMul_0"].computeOp_;
         assert_eq!(
             ops.len(),
@@ -8816,9 +9552,17 @@ mod tests {
             384,
             64,
             16,
-            &rb("act", 384, 64),
+            &rb(
+                "act",
+                ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(384),
+                ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(64),
+            ),
             &Stk::<KernelTag>::kernel(64, 384, "wt"),
-            &rb("out", 384, 384),
+            &rb(
+                "out",
+                ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(384),
+                ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(384),
+            ),
             None,
         );
         assert_eq!(emitted.time, 1, "bmm must NOT time-tile (fits LX)");
@@ -8860,9 +9604,17 @@ mod tests {
             384,
             64,
             16,
-            &rb("act", 384, 64),
+            &rb(
+                "act",
+                ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(384),
+                ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(64),
+            ),
             &Stk::<KernelTag>::kernel(64, 384, "wt"),
-            &rb("out", 384, 384),
+            &rb(
+                "out",
+                ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(384),
+                ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(384),
+            ),
             None,
         );
         let via_emitted = emit_bundle_mlir(&[emitted]);
@@ -8889,9 +9641,17 @@ mod tests {
             n,
             k,
             1,
-            &rb("a", m, k),
+            &rb(
+                "a",
+                ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(m),
+                ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(k),
+            ),
             &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
-            &rb("o", m, n),
+            &rb(
+                "o",
+                ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(m),
+                ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(n),
+            ),
             None,
         );
         assert_eq!(whole.time, 1, "an unbatched fp16 matmul is staged by dxp");
@@ -8904,9 +9664,17 @@ mod tests {
             16384,
             2048,
             2,
-            &rb("a", 64, 2048),
+            &rb(
+                "a",
+                ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(64),
+                ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(2048),
+            ),
             &Stk::<KernelTag>::kernel(2048, 16384, "w"),
-            &rb("o", 64, 16384),
+            &rb(
+                "o",
+                ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(64),
+                ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(16384),
+            ),
             &mut 0,
             None,
         )
@@ -8924,9 +9692,17 @@ mod tests {
             n,
             k,
             batch,
-            &rb("a", m, k),
+            &rb(
+                "a",
+                ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(m),
+                ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(k),
+            ),
             &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
-            &rb("o", m, n),
+            &rb(
+                "o",
+                ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(m),
+                ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(n),
+            ),
             None,
         );
         let n = emitted.time;
@@ -9305,6 +10081,7 @@ mod tests {
             program: Program::Elementwise(Elementwise::Mul),
             bindings: vec![BufferId::new(a), BufferId::new(b), BufferId::new(out)],
             mask: None,
+            step_inputs: Vec::new(),
             node_out_tid: None,
             minted: Default::default(),
         }
@@ -9331,6 +10108,7 @@ mod tests {
                     bank: 0,
                     offset: u64::from(tid) * 0x10000,
                     size: 8 * 64 * 2,
+                    cover: ktir_superdsc::placement::BindCover::Full,
                 },
             );
         }
@@ -9446,5 +10224,406 @@ mod tests {
         );
         layout.synth(ktir_superdsc::place::PlaceId::Act(victim), &[1, 64]);
         let _ = bake_layout(&layout);
+    }
+
+    /// ⭐⭐⭐ THE FILL HALF'S BAKE: the discovery table crosses into the runtime artifact, each
+    /// row's element format mapped to the staging channel that narrows its bytes. The two formats
+    /// today's programs state — an fp16 buffer (the SEN169 narrowing) and a u32 index table (the
+    /// raw copy) — bake to their channels, tid-sorted (the placement pass kept a `BTreeMap`, so
+    /// the artifact's byte order cannot depend on the walk's program order).
+    #[test]
+    fn the_bake_maps_each_step_inputs_format_to_its_staging_channel() {
+        let mut layout = two_node_layout();
+        layout.step_inputs.insert(
+            5,
+            ktir_superdsc::placement::StepInputRow {
+                slot: 0,
+                df: Df::Fp16,
+            },
+        );
+        layout.step_inputs.insert(
+            2,
+            ktir_superdsc::placement::StepInputRow {
+                slot: 1,
+                df: Df::SenUint32,
+            },
+        );
+        let baked = bake_layout(&layout);
+        assert_eq!(
+            baked.step_inputs.iter().copied().collect::<Vec<_>>(),
+            vec![
+                bundle::StepInput {
+                    tid: 2,
+                    slot: 1,
+                    stage: bundle::StepInputStage::RawU32,
+                },
+                bundle::StepInput {
+                    tid: 5,
+                    slot: 0,
+                    stage: bundle::StepInputStage::IeeeF16,
+                },
+            ],
+            "tid-sorted, each row's format mapped to its channel"
+        );
+        // And the fill answers through the baked table: slot 1 is t2 at its own placement extent.
+        assert_eq!(
+            baked.step_input_fill(1, 8 * 64 * 2),
+            Ok(bundle::StepInputFill {
+                place: bundle::PlaceId::Act(2),
+                size: 8 * 64 * 2,
+                stage: bundle::StepInputStage::RawU32,
+            }),
+            "the baked table answers the fill's own question end to end"
+        );
+    }
+
+    /// ⛔ A FORMAT WITH NO STAGING CHANNEL IS A BUILD PANIC, NOT A SILENT DEFAULT. This runs at
+    /// bake, so a program stating a step input the launch could not stage fails `cargo build`
+    /// naming the tid — fail-closed, exactly like every other bake-time guard here. A new format
+    /// gains a channel and a variant in the same commit, never a fallback.
+    #[test]
+    #[should_panic(expected = "no staging channel")]
+    fn the_bake_refuses_a_step_input_format_with_no_channel() {
+        let mut layout = two_node_layout();
+        layout.step_inputs.insert(
+            5,
+            ktir_superdsc::placement::StepInputRow {
+                slot: 0,
+                df: Df::Fp8,
+            },
+        );
+        let _ = bake_layout(&layout);
+    }
+
+    /// ⛔ (b) THE PREFIX-FREE PREFILL RUNG STAMPS ITS CARRIER — the trigger fix's anti-regression
+    /// pin, the WALK-STAMP half (the carrier half is `triton_splice_golden`'s door test, which
+    /// asserts the mint over every arm and shape). A fresh prompt (start == 0) bakes a
+    /// PREFIX-FREE rung — `ActiveCap::NONE`, a chunk ceiling the ladder never stated — so its walk
+    /// threads NO fold region, and that is exactly the shape whose carrier the old region-keyed
+    /// mint left BARE: the fill-staged absolute entries read with the page base composed on top
+    /// (token 0's double-base defect). This test runs the production chain up to the walk —
+    /// [`super::lower_graph_to_ktir`] (which threads `paged_fold = None` to every node) → the
+    /// step-input placements → the walk's own bundle params — then, for the wiring half, the
+    /// walk's own mint ([`super::mint_bundle_ops`]) and the walk's own PURE consumers
+    /// ([`super::launch_index`], [`super::render_dxp_input`]), NEVER the walk itself: the walk's
+    /// group Vec is filled only inside the bake, so a cardless test through the walk would assert
+    /// over nothing, and a bake-side test would start a real bake from inside `cargo test`. The
+    /// render is machine-independent — no dxp, no staging, nothing written — so the test runs
+    /// cardless exactly where the walk's mint does. It asserts BOTH halves of the fix: the
+    /// carrier arrives at the walk stating its region (the prefill arm's own extent contract),
+    /// and the walk's minted gathered groups account for EXACTLY the carrier's own trips — the
+    /// TRIP-ARITHMETIC DIFFERENTIAL against a carrier-alone run of the same mint (program
+    /// identity is not name-readable off the trips: the walk composes op names from roles
+    /// and regions, a different name space from the program's own) — the zero-KV-shift
+    /// contract whose absence double-based the read.
+    ///
+    /// The pin's body, parameterized over the rung's WIDTH: `valid_len` states the
+    /// one-pass cell's dead prefix (`prefix = valid_len − 1`), the golden cell's own
+    /// prefix-free law scaled to the width.
+    fn prefix_free_prefill_rung_stamps_its_carrier_at(mq: u32, valid_len: u32) {
+        // The judgment's GEOMETRY: granite 2b (32 q-heads, 8 kv-heads, hd 64), a
+        // one-page pool (`cap` 256), rope-appended caches — the golden's rope-appended
+        // prefix-free prefill cell, restated here through the same `lower_region`
+        // entrance so the graph is the production shape, rope tables included (the
+        // cos/sin sources below state the K stream's own width, the same real-path
+        // staging the golden's `attn_ir` states since its own fix). This fixture was
+        // BORN RED on that very shape — its cos/sin first stated `q_width` against
+        // the K stream's `kv_width`, and the committed windowing law refused it at
+        // the mint (§9 of the campaign proposal carries the record).
+        let (nqh, nkvh, hd) = (32u32, 8u32, 64u32);
+        let cap = 256u32;
+        let scale = 0.015625f32; // granite 2b's attention_multiplier (hd 64, f16-exact)
+        let q_width = nqh * hd;
+        let kv_width = nkvh * hd;
+        let sources = |cache_rows: u32| {
+            vec![
+                scratchy_subtile::subtile_ir::SourceShape {
+                    rows: mq,
+                    cols: q_width,
+                }, // 0: q
+                scratchy_subtile::subtile_ir::SourceShape {
+                    rows: cache_rows,
+                    cols: kv_width,
+                }, // 1: prefix_k
+                scratchy_subtile::subtile_ir::SourceShape {
+                    rows: cache_rows,
+                    cols: kv_width,
+                }, // 2: prefix_v
+                scratchy_subtile::subtile_ir::SourceShape {
+                    rows: mq,
+                    cols: kv_width,
+                }, // 3: new_k
+                scratchy_subtile::subtile_ir::SourceShape {
+                    rows: mq,
+                    cols: kv_width,
+                }, // 4: new_v
+                // ⭐ 5/6: cos/sin AT THE K STREAM'S OWN WIDTH — the REAL construction. The
+                // real path stages each rope's tables at THAT rope's own full column width —
+                // GQA's Q and K differ (`to_wavefront.rs`: "Cos/sin pre-tiled to each rope's
+                // full width (GQA: Q and K differ)", minted through `bx.cos_sin(k_cols)` over
+                // the K projection's own width) — and the worker fills them head-replicated
+                // at exactly that width (`spyre_forward.rs`'s `tile`: a `[rows, width]`
+                // source, `width` a multiple of the class's head dim, the per-position
+                // rotary row repeated `width / head_dim` times per row). The splice's
+                // windowing law demands precisely this staging: x, cos, sin and v share ONE
+                // row window and take WHOLE `total` columns over tensors of one height,
+                // `total` being the append's output width — `kv_width` here. This fixture
+                // was BORN RED on that law (its cos/sin stated `q_width`, copied from the
+                // golden `attn_ir`'s then-inert spelling, and the mint refused it); both
+                // fixtures now state the real staging.
+                scratchy_subtile::subtile_ir::SourceShape {
+                    rows: mq,
+                    cols: kv_width,
+                }, // 5: cos
+                scratchy_subtile::subtile_ir::SourceShape {
+                    rows: mq,
+                    cols: kv_width,
+                }, // 6: sin
+            ]
+        };
+        let geom = scratchy_subtile::model_geometry::ModelAttnGeometry::mint(
+            scratchy_subtile::model_geometry::QueryHeads::new(nqh),
+            scratchy_subtile::model_geometry::KvHeads::new(nkvh),
+            scratchy_subtile::model_geometry::HeadDim::new(hd),
+        )
+        .expect("granite's geometry mints");
+        let attn_op = scratchy_subtile::lower::OpDesc {
+            op: scratchy_subtile::subtile_ir::SubOp::attn_decode(
+                geom,
+                scale,
+                valid_len,
+                scratchy_subtile::subtile_ir::AttnMask::Causal,
+            ),
+            m: mq,
+            inputs: vec![
+                scratchy_subtile::lower::InputRef::Ext(0),
+                scratchy_subtile::lower::InputRef::Ext(1),
+                scratchy_subtile::lower::InputRef::Ext(2),
+                scratchy_subtile::lower::InputRef::Ext(3),
+                scratchy_subtile::lower::InputRef::Ext(4),
+            ],
+        };
+        let input = scratchy_subtile::lower::LoweringInput {
+            sources: sources(cap),
+            ops: vec![
+                // 0: k' = rope_append(k, cos, sin, v, prefix_k, prefix_v) — the cache write that
+                // binds `KvCacheProducer::SameForwardRopeAppend` for the attention below.
+                scratchy_subtile::lower::OpDesc {
+                    op: scratchy_subtile::subtile_ir::SubOp::rope_append(
+                        scratchy_subtile::model_geometry::HeadDim::new(hd),
+                        0,
+                        scratchy_subtile::subtile_ir::AttnMask::Causal,
+                        scratchy_subtile::subtile_ir::RopeFormTag::NeoX,
+                    ),
+                    m: mq,
+                    inputs: vec![
+                        scratchy_subtile::lower::InputRef::Ext(3),
+                        scratchy_subtile::lower::InputRef::Ext(5),
+                        scratchy_subtile::lower::InputRef::Ext(6),
+                        scratchy_subtile::lower::InputRef::Ext(4),
+                        scratchy_subtile::lower::InputRef::Ext(1),
+                        scratchy_subtile::lower::InputRef::Ext(2),
+                    ],
+                },
+                // 1: attn = AttnDecode(q, prefix_k, prefix_v, new_k, new_v)
+                attn_op,
+            ],
+            result: 1,
+            exported: None,
+        };
+        let nb = std::num::NonZeroU32::new(8192).expect("8192 != 0");
+        let ir = scratchy_subtile::subtile_ir::lower_region(&input, nb);
+
+        // ⛔ THE PREFIX-FREE WALK: `ActiveCap::NONE` (a start==0 chunk has nothing resident to
+        // attend) and prefill rows, through the production unrolled entrance — which threads
+        // `paged_fold = None` to every node, the exact condition the judgment prefill's bake
+        // runs under.
+        let weight_ids = std::collections::HashSet::new();
+        let (programs, mut layout) =
+            super::lower_graph_to_ktir(&ir, &weight_ids, super::ActiveCap::new(u32::MAX), false)
+                .unwrap_or_else(|e| panic!("the prefix-free prefill walk lowered: {e}"));
+
+        // ── THE CARRIER HALF: exactly one op arrives stating its region, and it states the
+        // prefill arm's own extent contract. ──
+        let carriers: Vec<_> = programs
+            .iter()
+            .filter(|e| e.kv_paged_region.is_some())
+            .collect();
+        assert_eq!(
+            carriers.len(),
+            1,
+            "the walk's one attention carrier — and only it — states a paged region"
+        );
+        let carrier = carriers[0];
+        let region = carrier.kv_paged_region.expect("filtered on Some");
+        let node = ir.nodes.last().expect("the attention node");
+        let prefix_len = node.inputs[1].region.rows.len;
+        let new_len = node.inputs[3].region.rows.len;
+        let expected_pages = (prefix_len + new_len)
+            .div_ceil(ktir_superdsc::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32);
+        assert_eq!(
+            region.region_pages, expected_pages,
+            "the prefix-free carrier's region defaults to the walk's own extent (the spec's \
+             `region_pages.unwrap_or(pages)` law)"
+        );
+        // And the layout this walk returned PLACED the pool the region names — the reach the
+        // stamp's premise guard checks is present, not just assumed.
+        for tid in region.reach_tids() {
+            assert!(
+                layout.gather_reach.contains_key(&tid),
+                "the layout placed no gather reach for t{tid} — the stamp's premise guard \
+                 would refuse this walk"
+            );
+        }
+
+        // ── THE WALK-STAMP HALF: the same chain the unrolled entrance runs, landing in the
+        // walk that stamps. ──
+        super::place_step_inputs(&mut layout, &[&programs], ir.tensors.len() as u32)
+            .unwrap_or_else(|e| panic!("step inputs placed: {e}"));
+        layout.place_kv_block_index_last();
+        let attn_params =
+            crate::lower_subtile_tape_to_ktir::attn_bundle_params(&ir, false, false, None)
+                .unwrap_or_else(|e| panic!("bundle params minted: {e}"))
+                .expect("an attention graph mints attention params");
+        // ── THE DIRECT-STAMP PIN (the child): the stamp's OWN contract, checked where it
+        // happens. Lower the carrier through the door directly — a fresh sym-id base is
+        // immaterial here, the stamped bits are constants and only per-op coverage and
+        // non-emptiness matter — and call the walk's own stamp function
+        // (`stamp_carrier_kv_facts`, the ONE stamping site) on the result. ──
+        let k = carrier
+            .ktir
+            .as_ref()
+            .expect("the carrier carries its KTIR program");
+        let mut solo_base: i64 = 0;
+        let mut solo_lowered =
+            crate::ktir_superdsc_door::lower(k, &mut solo_base, Some(&layout), Some(attn_params))
+                .unwrap_or_else(|err| {
+                    panic!("the carrier lowered through the door: {}", err.message)
+                });
+        super::stamp_carrier_kv_facts(carrier, &mut solo_lowered, Some(&layout))
+            .unwrap_or_else(|e| panic!("the stamp function accepted the carrier: {e}"));
+        assert!(
+            !solo_lowered.is_empty(),
+            "the door minted no ops from the carrier — the stamp would cover nothing"
+        );
+        assert!(
+            solo_lowered
+                .iter()
+                .all(|o| o.kv_gathered && o.kv_region_form),
+            "the stamp left an op of the carrier unstamped — a partial stamp is exactly \
+             the defect class this pin exists for"
+        );
+
+        // ── THE WIRING HALF: the walk's own mint and the walk's own PURE consumers — launch_index
+        // and render_dxp_input — NEVER the walk itself. The walk's group Vec is filled only inside
+        // the bake (`if let Some(bake) = superdsc_bake::global()`), so a cardless test through the
+        // walk would assert over NOTHING, and a bake-side test would start a REAL bake from inside
+        // `cargo test`. The mint is the walk's own extraction — same loop, same stamp call — so
+        // what it stamps is what the walk stamps. ──
+        let sdsc = super::mint_bundle_ops(&programs, Some(&layout), Some(attn_params))
+            .unwrap_or_else(|e| panic!("the walk's mint rendered: {e}"))
+            .ops;
+        let shifts = super::launch_index(&sdsc, super::FoldGrouping::Split);
+        let rendered = super::render_dxp_input(&sdsc, super::FoldGrouping::Split)
+            .unwrap_or_else(|e| panic!("the walk's render ran cardless: {e}"));
+        // ⛔ THE TRIP-ARITHMETIC DIFFERENTIAL (the wiring half) — the walk's mint APPLIED the
+        // stamp and the groups FAITHFULLY CARRY the bits, proven by COUNTING, not naming.
+        // Program identity is NOT readable off the rendered trips: the walk composes op
+        // names from roles and regions (`{act_name(tid)}_g{leg}`, `{name}_scatter_t{tid}`,
+        // …) — a different name space from the program's own `attn_s{id}` — so no
+        // name-keyed membership test can find the carrier's trips. Instead the mint runs a
+        // SECOND TIME on the carrier ALONE, and the full run's gathered groups must account
+        // for EXACTLY the carrier's own trip total. The per-group trip count is the walk's
+        // OWN derivation, not a new one: `files.len() − 1`, the same formula the group
+        // budget uses for its `descriptors` count, resting on the render law "one
+        // `sdsc_{i}.json` per trip, then `bundle.mlir` LAST" (`render_dxp_input`
+        // constructs exactly one file per trip). TWO PREMISES, both stated:
+        // (i) `group_ranges` is an EXACT covering partition (Kani-proven via the scalar
+        //     twin `group_ranges_cover_ok`), so Σ trips over groups answering `gathered`
+        //     is exactly the Gathered-kind trip count — a partial stamp leaves carrier
+        //     trips Pure, a strict shortfall, never an invisible shuffle;
+        // (ii) the carrier's trip count is bundle-context-free (the door's time-tiling is
+        //      a per-op decision, sym-id-independent) — if that ever breaks, the equality
+        //      fails LOUDLY here, which is the pin doing its job. The emptiness case — a
+        //      deleted stamp leaving no gathered group at all — is caught by the alone
+        //      run's own trip count.
+        let carrier_idx = programs
+            .iter()
+            .position(|e| e.kv_paged_region.is_some())
+            .expect("the carrier asserted above");
+        let alone_sdsc = super::mint_bundle_ops(
+            &programs[carrier_idx..carrier_idx + 1],
+            Some(&layout),
+            Some(attn_params),
+        )
+        .unwrap_or_else(|e| panic!("the carrier-alone mint rendered: {e}"))
+        .ops;
+        let alone_rendered = super::render_dxp_input(&alone_sdsc, super::FoldGrouping::Split)
+            .unwrap_or_else(|e| panic!("the carrier-alone render ran cardless: {e}"));
+        // Summed over ALL of the alone run's groups — not its gathered ones — so a deleted
+        // stamp leaves `alone_trips` intact and the differential below fails at the
+        // EQUALITY, not vacuously at this assert.
+        let alone_trips = alone_rendered
+            .iter()
+            .map(|g| (g.files.len() - 1) as u64)
+            .sum::<u64>();
+        assert!(
+            alone_trips > 0,
+            "the carrier-alone run minted no trips — the carrier lowered to nothing, so \
+             the differential below would pass vacuously"
+        );
+        let mut gathered_trips = 0u64;
+        let mut region_form_trips = 0u64;
+        for g in &rendered {
+            // One `sdsc_{li}.json` per trip, then `bundle.mlir` last — a group's trip
+            // count is its file count minus one. The group's channel bits come from the
+            // walk's own launch index, keyed by the group's own id — the same pairing the
+            // walk's staging loop uses.
+            let group_trips = (g.files.len() - 1) as u64;
+            let kv = *shifts.get(g.group as usize).unwrap_or_else(|| {
+                panic!(
+                    "group {} has dxp input but no entry in the launch index ({} entries) — \
+                     `render_dxp_input` and `launch_index` disagree about the group partition",
+                    g.group,
+                    shifts.len()
+                )
+            });
+            if kv.gathered {
+                gathered_trips += group_trips;
+            }
+            if kv.gathered && kv.region_form {
+                region_form_trips += group_trips;
+            }
+        }
+        assert_eq!(
+            gathered_trips, alone_trips,
+            "the full run's gathered groups hold {gathered_trips} trips but the carrier \
+             alone mints {alone_trips} — the stamp lost part of the carrier mid-body"
+        );
+        assert_eq!(
+            region_form_trips, alone_trips,
+            "the full run's gathered-and-region-form groups hold {region_form_trips} trips \
+             but the carrier alone mints {alone_trips} — part of the carrier read the region \
+             form unstaged"
+        );
+    }
+
+    #[test]
+    fn the_prefix_free_prefill_rung_stamps_its_carrier() {
+        // The judgment's GEOMETRY at the m=31 one-pass rung — NOT the judgment prefill's
+        // own shape: the judgment prefill's BODY is the mq=256 primary top
+        // (4ae78fbfabfa3098, 4 groups/257 trips), whose width the variant below pins.
+        prefix_free_prefill_rung_stamps_its_carrier_at(31, 33);
+    }
+
+    #[test]
+    fn the_judgment_prefill_width_stamps_its_split_carrier() {
+        // The judgment prefill's own WIDTH (mq=256, a one-page dead prefix over a
+        // two-page gathered region) — the split-carrier case: the real body's carrier
+        // is 161 counted ops spanning the 128-cut into two Gathered groups. Whether
+        // this fixture's synthetic carrier crosses the cut is a counted fact the pod
+        // run's dump will show; the stamp assert holds over every carved group either
+        // way.
+        prefix_free_prefill_rung_stamps_its_carrier_at(256, 257);
     }
 }

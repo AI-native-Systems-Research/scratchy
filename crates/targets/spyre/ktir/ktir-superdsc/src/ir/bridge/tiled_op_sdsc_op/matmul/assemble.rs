@@ -482,8 +482,9 @@ fn assemble_from_opspec(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
-    // ⭐ A KERNEL MAY LIVE IN LX — the split-KV chunk's gathered Kᵗ and V (`ChunkScratch::lx_form`), read by
-    // the core that gathered it. The residency is the tensor's (decided where its name is pinned), so the
+    // ⭐ A KERNEL MAY LIVE IN LX — a gathered operand read by the core that gathered it (the
+    // split-KV chunk's LX form, `ChunkScratch::lx_form`, deleted with the copy-gather family). The
+    // residency is the tensor's (decided where its name is pinned), so the
     // matmul door consults it by name exactly as the pointwise door does; `emit`'s core-local read law
     // then proves this op hands each core the slice its producer wrote. No-op for every unpinned operand.
     crate::emit::apply_lx_residency(&mut op, layout);
@@ -981,6 +982,7 @@ mod out_width_caps {
                 bank: 0,
                 offset: 0,
                 size,
+                cover: crate::placement::BindCover::Full,
             },
         );
         l
@@ -1046,5 +1048,5 @@ mod out_width_caps {
 // The collapsed fold now emits one op per (request, kv head) through
 // `assemble_matmul_off_phys_m_with_epilogue` — the SHIPPED shared-2-D-kernel form, `y` on the GQA group —
 // and reaches request `r`'s block by a baked offset (`GatherScratch::kernel_row_off`). Nothing in
-// attention declares a 3-D kernel any more, which is asserted on the emitted descriptors by
-// `zz_the_declared_y_of_every_gathered_op`.
+// attention declares a 3-D kernel any more (a descriptor test that pinned this on the old
+// emission, `zz_the_declared_y_of_every_gathered_op`, went with it).

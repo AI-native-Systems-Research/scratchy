@@ -394,14 +394,37 @@ impl SuperDscSession {
     /// session knows.
     ///
     /// [`gather_entries_per_page`]: scratchy_subtile::sdsc_abstract::gather_entries_per_page
-    pub fn gather_entries_per_page(
+    /// ⭐⭐⭐⭐⭐ THE GATHER'S ENTRY CEILING FOR THIS SESSION — the page factor (`phys → entry`) and the
+    /// page budget (the most pages one region of KV holds) in ONE type, minted from the session's own
+    /// `page_stride_bytes` and the device's own `MAX_SEGMENT_BYTES`, the same two numbers the bake's
+    /// prefix-mask block count and `BundleLayout::gather_reach` derive from. Every index table the
+    /// host stages composes its entries through it, so a value above the pool's bound is
+    /// UNCONSTRUCTIBLE here rather than checked after the fact — and because the bake states the same
+    /// reach through the same door, the stage-time bound and the bake-time bound are one number, not
+    /// two derivations kept in agreement.
+    ///
+    /// ⛔ DERIVED FROM THE SESSION'S OWN `page_stride_bytes`, WHICH IS THE NUMBER `page_base_bytes`
+    /// MULTIPLIES. That is the whole point: the host's page address is `phys * page_stride_bytes` and
+    /// the card's is `idx * skip_addr + base`, so `idx = phys * (page_stride_bytes / skip_addr_bytes)` is an
+    /// identity between two quantities read off the same session — not two derivations that must be kept
+    /// in agreement. `zz_the_gather_index_reproduces_the_host_page_address` pins it.
+    ///
+    /// `None` when the bundle is unpaged, or when a page is not a whole number of entries — in which case
+    /// no integer index can name a page boundary and the caller must refuse rather than round.
+    ///
+    /// The arithmetic itself is [`gather_entry_ceiling`]; this hands it the ONE number only the
+    /// session knows.
+    ///
+    /// [`gather_entry_ceiling`]: scratchy_subtile::sdsc_abstract::gather_entry_ceiling
+    pub fn gather_entry_ceiling(
         &self,
         pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
-    ) -> Option<scratchy_subtile::sdsc_abstract::EntriesPerPage> {
-        scratchy_subtile::sdsc_abstract::gather_entries_per_page(
-            self.exec.kv_page_stride_bytes(),
-            pool,
-        )
+    ) -> Option<scratchy_subtile::sdsc_abstract::GatherEntryCeiling> {
+        // ⭐ ONE LAW, TWO SESSIONS: this hands the session's own `page_stride_bytes` to the
+        // shared spelling in `attn_step_staging` — the same function the numeric gate passes
+        // the rolled layout's stride through — so the card's stage-time bound and the gate's
+        // are one function, not two derivations kept in agreement.
+        crate::attn_step_staging::gather_entry_ceiling_for(self.exec.kv_page_stride_bytes(), pool)
     }
 
     // ⛔ THERE IS NO SECOND FACTOR HERE ANY MORE. `gather_planes_per_page` returned a page-per-PLANE
@@ -457,6 +480,27 @@ impl SuperDscSession {
             })
     }
 
+    /// ⭐ THE PLACEMENT EXTENT of step-input `slot`, in bytes — the session's forward of the
+    /// executor's own query ([`Executor::step_input_extent`]). The FILLER's sizing door: the
+    /// caller stages exactly this many bytes, and `fill_step_input`'s `==` law re-measures them
+    /// against the same placement. `None` when this bundle declares no such slot.
+    ///
+    /// [`Executor::step_input_extent`]: crate::superdsc_exec::Executor::step_input_extent
+    pub fn step_input_extent(&self, slot: u32) -> Option<u64> {
+        self.exec.step_input_extent(slot)
+    }
+
+    /// ⭐⭐⭐ FILL ONE HOST-STAGED STEP INPUT by its SLOT — the session's forward of the executor's
+    /// own door ([`Executor::fill_step_input`]). The slot is the caller's whole handle: the
+    /// discovery, the extent law and the staging channel are the bundle's own baked answers, and
+    /// every disagreement refuses naming the slot. See the executor's doc for why the refusal set
+    /// is what it is (absent slot, unplaced tid, partial bytes, pre-prepare bind).
+    ///
+    /// [`Executor::fill_step_input`]: crate::superdsc_exec::Executor::fill_step_input
+    pub fn fill_step_input(&mut self, slot: u32, bytes: Vec<u8>) -> Result<()> {
+        self.exec.fill_step_input(slot, bytes)
+    }
+
     /// Run ONE INCREMENTAL forward over `n_new` NEW positions at `[seq_pos..seq_pos+n_new)`.
     /// `activations[i] = (name, f32 data)` are this step's NEW-token sources bound by NAME
     /// (`t{id}` embed + cos/sin), narrowed to f16 at the boundary. The resident pool holds
@@ -469,7 +513,7 @@ impl SuperDscSession {
         activations: &[crate::wiring::Bind],
     ) -> Result<Vec<f32>> {
         Ok(self
-            .run_step_inner(n_new, seq_pos, activations, &[], &[], StepLogits::ReadBack)?
+            .run_step_inner(n_new, seq_pos, activations, &[], StepLogits::ReadBack)?
             .unwrap_or_default())
     }
 
@@ -481,14 +525,7 @@ impl SuperDscSession {
         seq_pos: usize,
         activations: &[crate::wiring::Bind],
     ) -> Result<()> {
-        self.run_step_inner(
-            n_new,
-            seq_pos,
-            activations,
-            &[],
-            &[],
-            StepLogits::LeftOnDevice,
-        )?;
+        self.run_step_inner(n_new, seq_pos, activations, &[], StepLogits::LeftOnDevice)?;
         Ok(())
     }
 
@@ -514,7 +551,6 @@ impl SuperDscSession {
             seq_pos,
             activations,
             activations_f16,
-            &[],
             StepLogits::LeftOnDevice,
         )?;
         Ok(())
@@ -534,35 +570,25 @@ impl SuperDscSession {
                 seq_pos,
                 activations,
                 activations_f16,
-                &[],
                 StepLogits::ReadBack,
             )?
             .unwrap_or_default())
     }
 
-    /// ⭐⭐⭐ [`run_step_f16`](Self::run_step_f16) plus the INT32 channel — a gather's index table.
-    ///
-    /// ⛔ A THIRD LIST, NOT A THIRD ENTRY IN THE f16 ONE. `activations_f16` means "bytes that are
-    /// already fp16", and every one of them still passes through `ieee_to_sen_bytes` in the shadow
-    /// write; int32 entries must NOT (see `Executor::raw_ids`). Two lists that both mean "device
-    /// bytes" but need different shadow writes is exactly the collapse this keeps apart.
-    pub fn run_step_i32(
+    /// ⭐⭐⭐ [`run_step_f16`](Self::run_step_f16) with the logits policy stated by the caller —
+    /// the batched family's door. A prompt chunk's final step reads one row back
+    /// (`StepLogits::ReadBack`), a decode batch leaves its whole `[rows, vocab]` result on the
+    /// device (`LeftOnDevice`) for the caller's own read, and every non-final chunk discards
+    /// (`Discarded`), so the returned `Option` is the policy's own shape.
+    pub fn run_step_f16_logits(
         &mut self,
         n_new: usize,
         seq_pos: usize,
         activations: &[crate::wiring::Bind],
         activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
-        activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
         logits: StepLogits,
     ) -> Result<Option<Vec<f32>>> {
-        self.run_step_inner(
-            n_new,
-            seq_pos,
-            activations,
-            activations_f16,
-            activations_i32,
-            logits,
-        )
+        self.run_step_inner(n_new, seq_pos, activations, activations_f16, logits)
     }
 
     /// The [`CausalKey`] this session's staged activation `id` was last bound under, if it was
@@ -605,15 +631,14 @@ impl SuperDscSession {
         self.exec.stage_keyed(id, key, f32_to_f16_le(vals))
     }
 
-    /// The bind loop every step runs before its forward — the three channels
-    /// (`run_step_inner`'s own): f32 narrowed to f16 at the boundary, already-f16
-    /// bytes as-is, and RAW LE int32 through `bind_input_raw`. One body, so a new
-    /// channel or a new guard cannot land on one step shape and skip the other.
+    /// The bind loop every step runs before its forward — the two channels
+    /// (`run_step_inner`'s own): f32 narrowed to f16 at the boundary, and already-f16
+    /// bytes as-is. One body, so a new channel or a new guard cannot land on one
+    /// step shape and skip the other.
     fn bind_activations(
         &mut self,
         activations: &[crate::wiring::Bind],
         activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
-        activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
     ) -> Result<()> {
         // BIND-LOOP TIMING (SCRATCHY_SDSC_PHASE_TIME, the same flag as the executor's phase
         // breakdown): this loop runs BEFORE predict, so it is invisible to the
@@ -632,29 +657,7 @@ impl SuperDscSession {
         let mut bind_f16_bytes = 0usize;
         for (id, bytes) in activations_f16 {
             bind_f16_bytes += bytes.len();
-            self.exec.bind_input(*id, bytes.clone());
-        }
-        // ⛔ `bind_input_raw`, NOT `bind_input`. See `Executor::raw_ids`: the shadow write applies
-        // `ieee_to_sen_bytes` to every ordinary bind, which reads each 4-byte index entry as two fp16
-        // values and rewrites both — turning block 37 into a different, valid, arbitrary block.
-        // ⛔ AND THE PAYLOAD ARRIVES PAIRED WITH ITS PLACEMENT. `place_raw` is the only constructor of
-        // the value `bind_input_raw` takes, so the three ways a raw bind used to go wrong — a byte
-        // count that is not whole int32 entries, a payload longer than its own placement, and a name
-        // this bundle never placed (silently SKIPPED, and a skipped index reads as entry 0, a real
-        // address) — are one refusal at one door instead of a check here, a `bail!` in the refill loop
-        // and a `continue` nobody could see.
-        for (id, bytes) in activations_i32 {
-            let bind = self.exec.place_raw(*id, bytes.clone()).ok_or_else(|| {
-                anyhow!(
-                    "bind: raw tensor '{id}' ({} B) has no placement in this bundle, does not fit \
-                     the one it has, or is not a whole number of int32 entries — a partial trailing \
-                     entry is a truncated address, an over-long bind overwrites the next tensor, and \
-                     an unplaced one would be skipped in silence (entry 0 is page 0's first block, a \
-                     REAL address)",
-                    bytes.len()
-                )
-            })?;
-            self.exec.bind_input_raw(bind);
+            self.exec.bind_input(*id, bytes.clone())?;
         }
         if std::env::var_os("SCRATCHY_SDSC_PHASE_TIME").is_some() {
             eprintln!(
@@ -675,12 +678,9 @@ impl SuperDscSession {
         activations: &[crate::wiring::Bind],
         // Already in the device's format — bound as-is, never re-narrowed.
         activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
-        // ⭐ RAW LE int32 bytes — bound through `bind_input_raw`, so the shadow write COPIES them
-        // instead of re-encoding them as fp16. A gather's index table, and nothing else today.
-        activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
         logits: StepLogits,
     ) -> Result<Option<Vec<f32>>> {
-        self.bind_activations(activations, activations_f16, activations_i32)?;
+        self.bind_activations(activations, activations_f16)?;
         let (n_new, seq_pos) = (NewTokens(n_new as i64), SeqPos(seq_pos as i64));
         match logits {
             StepLogits::ReadBack => {
@@ -704,7 +704,7 @@ impl SuperDscSession {
 
     /// Bind an activation source (f32 → f16) before a prefix run.
     pub fn bind(&mut self, id: crate::bundle_code::PlaceId, vals: &[f32]) -> Result<()> {
-        self.exec.bind_input(id, f32_to_f16_le(vals));
+        self.exec.bind_input(id, f32_to_f16_le(vals))?;
         Ok(())
     }
 

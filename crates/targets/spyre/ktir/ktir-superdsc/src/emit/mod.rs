@@ -25,7 +25,9 @@ use crate::ir::bridge::tiled_op_sdsc_op::{
 };
 use crate::ktir_node::KtirNode;
 use crate::placement::{BundleLayout, SegRole, align128};
-use crate::sdsc_abstract::{FlatTag, KindTag, RowBlockedTag, StickKind, StickLayout, Stk};
+use crate::sdsc_abstract::{
+    BlockCols, FlatTag, KindTag, Lanes, RowBlockedTag, RowCount, StickKind, StickLayout, Stk,
+};
 use crate::superdsc_error::SuperDscError;
 use crate::superdsc_opspec::{
     Allocation, AnyTensorArg, ArgView, DataFormat, DeviceTileLayout, Df, Fp8, Fp16, Fp32,
@@ -40,19 +42,33 @@ use crate::wire::{
 use crate::work::{FP16_ELEMS_PER_STICK, core_to_wk_slice, distribute_cores};
 use std::collections::BTreeMap;
 
-/// main's `lower_matmul_node` arity-3 branch — the W8A8 fp8 matmul descriptors, reached from the
-/// facts the KTIR states. See its own header.
-pub mod ktir_matmul_fp8;
-/// KTIR → SuperDSC: `ibm/main`'s eight `lower_*_node` bodies with their input door changed. The two
-/// that cross a model-geometry const door ([`lower_ktir_to_superdsc::attn_at`],
-/// [`lower_ktir_to_superdsc::rope_at`]) are public generic entry points the CALLER instantiates.
-pub mod lower_ktir_to_superdsc;
 /// THE WHOLE-FUNCTION DOOR — walk a multi-op KTIR program in program order and dispatch each
 /// compute op to the per-kind entry point that already lowers it. A producer that hands over a
 /// whole kernel (a Triton-derived `IRFunction` holding an MLP's two projections and its silu, or a
 /// decoder layer's twelve `linalg.matmul`s) has no door otherwise: stating one `Program` for such a
 /// function is refused by arity, correctly, and there is nothing else to state.
+/// A batched gathered contraction — the gather's entry axis as the dot's batch axis. See the
+/// module doc for the frame law and the honesty row.
+pub mod batched_gathered;
+/// main's `lower_matmul_node` arity-3 branch — the W8A8 fp8 matmul descriptors, reached from the
+/// facts the KTIR states. See its own header.
+pub mod ktir_matmul_fp8;
+/// KTIR → SuperDSC: `ibm/main`'s eight `lower_*_node` bodies with their input door changed. The one
+/// that crosses a model-geometry const door ([`lower_ktir_to_superdsc::rope_at`]) is a public
+/// generic entry point the CALLER instantiates.
+pub mod lower_ktir_to_superdsc;
 pub mod whole_function;
+
+/// A per-`layout`-dim field in the order dxp reads it: as stated, or REVERSED for a view that
+/// states [`crate::superdsc_opspec::TensorArg::with_dxp_innermost_first`]. Every serialization of a
+/// view's dim order — `layoutDimOrder_` on the alloc node and on `primaryDsInfo_`, `scale_` — goes
+/// through here, so the three cannot disagree about which end of `layout` dxp reads first.
+fn wire_order<T>(v: &ArgView<'_>, mut xs: Vec<T>) -> Vec<T> {
+    if v.dxp_innermost_first {
+        xs.reverse();
+    }
+    xs
+}
 
 /// REAL per-core HBM start addresses for one tensor's allocate node (task #50 —
 /// replaces the former same-base-for-all-cores stub). Each core `c` gets:
@@ -519,6 +535,24 @@ pub struct EwOperand<'a> {
     /// The [`crate::addr::ColWindow`] `col_offset` came from — set only by [`In::col_window`], so a
     /// stick-major presentation of a column window is admitted by type, never by testing the integer.
     col_window: Option<crate::addr::ColWindow>,
+    /// ⭐ THE POOLED MARK — the reach the gather door admitted this operand under, set only by
+    /// [`mark_pooled`] on the gathered operand of a table whose layout declares a
+    /// `BundleLayout::gather_reach` for it. The mark CARRIES the reach so the window the mint
+    /// selects and the bound the door admitted under are one value, not two facts that could
+    /// disagree; the mint then reads the FAMILY from the placement — a slice of a pool its
+    /// index re-bases takes ONE ENTRY's direct coverage, a placement holding the WHOLE reach
+    /// (a source extent) takes `min(swept, the reach's ceiling)`. Nothing else about the
+    /// operand — bytes, scales, offsets — changes; the mark selects a bound, never a descriptor.
+    pooled: Option<crate::sdsc_abstract::GatherReach>,
+    /// ⭐ THE GATHERED MARK — set only by [`mark_gathered`] on the operand an index reads through
+    /// ([`assemble_pointwise_broadcast_gather`]'s `gathered_input`) when the table declares NO
+    /// reach. It selects the SOURCE-WINDOW LAW at the family mint ([`mint_ew_operands`]): a
+    /// gathered operand's addressable set is the index's image over the source's rows, never
+    /// the swept rectangle, so a sweep that fits the placement keeps its window and an
+    /// over-sweep is REFUSED, fail-closed, until the table declares its reach (the
+    /// `GatherReach` the pooled mark above then carries) — see that branch's doc for the law.
+    /// Like [`pooled`], the mark selects a bound and never a descriptor.
+    gathered: bool,
 }
 impl<'a> EwOperand<'a> {
     pub(crate) fn scale(&self) -> [Scale; 3] {
@@ -575,6 +609,34 @@ impl<'a> EwOperand<'a> {
     /// Whether this operand is a [`crate::addr::ColWindow`] whose `[rows, ·]` view is stick-major.
     pub(crate) fn is_stick_major_window_for(&self, rows: u32) -> bool {
         self.col_window.is_some_and(|w| w.is_stick_major_for(rows))
+    }
+    /// ⭐ THE POOLED MARK — the same operand under the gather door's pooled-table law, carrying
+    /// the reach it was admitted under. Set only by [`assemble_pointwise_broadcast_gather`] for
+    /// the gathered operand of a table whose layout declares a `BundleLayout::gather_reach`; see
+    /// the field's own doc for why the mark selects a bound and never a descriptor.
+    pub(crate) fn mark_pooled(&self, reach: crate::sdsc_abstract::GatherReach) -> Self {
+        Self {
+            pooled: Some(reach),
+            ..*self
+        }
+    }
+    /// The reach this operand was admitted under, if the gather door pooled it (see
+    /// [`mark_pooled`]).
+    pub(crate) fn pooled(&self) -> Option<crate::sdsc_abstract::GatherReach> {
+        self.pooled
+    }
+    /// ⭐ THE GATHERED MARK — the same operand under the gather door's source-window law. Set
+    /// only by [`assemble_pointwise_broadcast_gather`] for the operand its index reads through;
+    /// see the field's own doc for why the mark selects a bound and never a descriptor.
+    pub(crate) fn mark_gathered(&self) -> Self {
+        Self {
+            gathered: true,
+            ..*self
+        }
+    }
+    /// Whether an index reads this operand through (see [`mark_gathered`]).
+    pub(crate) fn gathered(&self) -> bool {
+        self.gathered
     }
     /// The handle's declared [`StickLayout`], captured by the `In` door that built this operand.
     pub(crate) fn declared(&self) -> StickLayout {
@@ -682,7 +744,75 @@ pub(crate) fn mint_ew_operands(
         };
         match layout {
             Some(l) => {
-                l.check_window(i.name(), i.declared(), off as u64, sw_rows, sw_cols, &what)?
+                // ⭐⭐⭐ A POOLED GATHERED TABLE'S WINDOW IS ONE ENTRY'S COVERAGE — the mark the
+                // gather door sets when the layout declares a `gather_reach` for this table. Its
+                // placement is ONE slice of a pool the index re-bases, so the swept rectangle
+                // `sw_rows × sw_cols` is not this operand's access model (its rows are
+                // index-named, never contiguous) and the slice placement is not its bound. What
+                // this mint bounds instead is the DIRECT window: the bytes at the base before
+                // the index moves it, which is ONE entry — and an entry is the reach's own
+                // `entry_elems` (the mark CARRIES the value, so the window selected here and the
+                // bound the door admitted under are one number, never two facts that could
+                // disagree). The VALUES' bound is not here at all: it is the ceiling the
+                // host-side `GatherEntry` composition mints through, unconstructible past it.
+                if let Some(reach) = i.pooled() {
+                    let d = i.declared();
+                    let entry = reach.entry_elems() as usize;
+                    // ⭐ THE REACH-DECLARED WINDOW, BY FAMILY (law (b)'s one law,
+                    // [`BundleLayout::gathered_source_rows`]): the mark CARRIES the reach, so
+                    // the window selected here and the bound the door admitted under are one
+                    // number, never two facts that could disagree. A placement holding the
+                    // WHOLE reach is a SOURCE EXTENT — the window is `min(swept, the reach's
+                    // ceiling)`; a placement holding a SLICE is a POOL — the swept rectangle
+                    // is not this operand's access model (its rows are index-named, never
+                    // contiguous) and the runtime re-bases, so the direct window is ONE
+                    // entry's coverage. The VALUES' bound is not here at all: it is the
+                    // ceiling the host-side composition mints through, unconstructible past it.
+                    let rows =
+                        l.gathered_source_rows(i.name(), sw_rows, entry as u32, d.df, Some(reach))?;
+                    l.check_window(
+                        i.name(),
+                        StickLayout::row_blocked_df(rows as usize, entry, d.df),
+                        off as u64,
+                        rows,
+                        entry as u32,
+                        &what,
+                    )?
+                } else if i.gathered() {
+                    // ⭐⭐⭐ LAW (b) — A GATHERED SOURCE'S WINDOW IS ITS SWEPT EXTENT WHEREVER
+                    // THE SWEEP FITS THE PLACEMENT, AND AN OVER-SWEEP IS REFUSED, FAIL-CLOSED,
+                    // WITHOUT A DECLARED REACH. For a gathered source the addressable set is
+                    // the index's IMAGE over the source's rows — `addr = idx·skip_addr + base`,
+                    // one source row per entry — so the bytes this op can touch are the rows
+                    // the INDEX names, never the contiguous `sw_rows × sw_cols` rectangle the
+                    // plain window model assumes. Where the image's worst case (the whole
+                    // source) fits the placement, the swept window is honest and kept byte for
+                    // byte; where the sweep EXCEEDS the placement, the placement alone cannot
+                    // bound the values — a repeat gather over a source placed whole may exceed
+                    // it (each row read many entries' worth of times) while a pool slice hides
+                    // a source the layout cannot see — so the over-sweep must carry the TYPED
+                    // statement of its values' bound (a `GatherReach`; this branch is the
+                    // NO-reach mark, so it refuses here, naming the sweep, the placement and
+                    // the missing declaration). The reach-declared form takes the pooled mark
+                    // above, one law, family-forked.
+                    //
+                    // ⛔ TABLE-VALUE CORRECTNESS IS NOT THIS GUARD'S: whether the staged values
+                    // really name in-range rows is the staging family's own law at birth, not a
+                    // fact a window over the placement could check — the same division the
+                    // reach-declared branch's doc states for its ceiling.
+                    let d = i.declared();
+                    let rows = l.gathered_source_rows(i.name(), sw_rows, sw_cols, d.df, None)?;
+                    l.check_window(
+                        i.name(),
+                        StickLayout::row_blocked_df(rows as usize, sw_cols as usize, d.df),
+                        off as u64,
+                        rows,
+                        sw_cols,
+                        &what,
+                    )?
+                } else {
+                    l.check_window(i.name(), i.declared(), off as u64, sw_rows, sw_cols, &what)?
+                }
             }
             None => crate::placement::window_fits_declared(
                 i.name(),
@@ -833,7 +963,10 @@ pub fn pointwise_untiled_slice_bytes_divided(
     tile_op
         .tile(
             crate::superdsc_opspec::MaxCores::<{ crate::superdsc_opspec::MAX_CORES }>,
-            division.resolve(true, true).splitter(),
+            // `false` for the spray fact: this sizing helper's tile states `y=1`, so the row-split
+            // (y-major) mode — the only presentation whose division that fact selects — cannot
+            // reach it.
+            division.resolve(true, true, false).splitter(),
             "out",
         )
         .ok()
@@ -1019,13 +1152,15 @@ pub fn assemble_pointwise_broadcast(
 ) -> EmittedOp {
     // RowBlocked output ⇒ residual token stream (not head-major). head_major is derived from the type.
     assemble_pointwise_broadcast_off(
-        op_name,
-        op_func,
-        rows,
-        cols,
-        inputs,
-        o,
-        crate::addr::DevOff::ZERO,
+        PointwiseFacts {
+            op_name,
+            op_func,
+            rows,
+            cols,
+            inputs,
+            o,
+            out_offset: crate::addr::DevOff::ZERO.into(),
+        },
         sym_id_base,
         layout,
     )
@@ -1051,13 +1186,15 @@ pub fn assemble_pointwise_broadcast_hm(
 ) -> EmittedOp {
     // Flat output ⇒ head-major (per-head attention) op; the builder derives head_major from the type.
     assemble_pointwise_broadcast_off(
-        op_name,
-        op_func,
-        rows,
-        cols,
-        inputs,
-        o,
-        crate::addr::DevOff::ZERO,
+        PointwiseFacts {
+            op_name,
+            op_func,
+            rows,
+            cols,
+            inputs,
+            o,
+            out_offset: crate::addr::DevOff::ZERO.into(),
+        },
         sym_id_base,
         layout,
     )
@@ -1099,6 +1236,63 @@ pub struct PointwiseGather<'a, O: KindTag> {
     /// run's span are the same unit by construction (issue 201 item 7's run half).
     pub run: crate::superdsc_opspec::StickRun,
     pub o: &'a Stk<O>,
+}
+
+/// ⭐ THE POOL ADMISSION — ONE LAW, TWO DOORS. A table whose layout declares a
+/// `BundleLayout::gather_reach` is a POOL SLICE, not a table: its placement covers one slice (the
+/// paged KV cache's per-layer plane) while its index names stick-blocks RELATIVE TO THE PLANE'S
+/// OWN BASE across the whole pool the runtime re-bases per launch, so the swept-rectangle law is
+/// the wrong pair of facts for it. What replaces it is ONE check, on the one fact the admitting
+/// door uniquely sees:
+///
+/// THE ENTRY UNIT. dxp turns an entry value into an address as `idx * skip_addr + base`, and a
+/// gathered read of this pool strides one entry at `entry_elems` elements — while the reach's
+/// entries are `entry_elems`-element SLAB blocks, the unit the host's `GatherEntry::of_slab_block`
+/// composes its runtime values in. Two units for one address is two authorities for the same
+/// bytes: a descriptor striding at any other width reads every entry at the wrong address, from a
+/// clean bake — refused here, by name, with both numbers.
+///
+/// ⛔ THE VALUES' BOUND IS NOT A CHECK HERE, because it cannot be one: the values are runtime data
+/// and any run-shaped inequality against the reach compares two different tensors' coordinates.
+/// The honest bound is the ceiling the reach carries, enforced where a value is BORN (the
+/// host-side `gather_entry_ceiling` → `GatherEntry::of_slab_block` composition); the extent law
+/// holds by TYPE (`skip_addr` equal to `entry_elems` satisfies the reach's derived element extent
+/// exactly). A table with NO declared reach returns `None` and takes none of this — its gather
+/// keeps the swept-window law byte for byte.
+///
+/// Both doors that admit a gathered read of a pool run THIS function — the pointwise gather door
+/// (which then marks its operand pooled, so the operand mint takes the one-entry window) and the
+/// batched gathered contraction's copy — so the two cannot drift about what a pool's entry unit
+/// is. Returns the reach when the table is pooled (after the entry-unit check), `None` when no
+/// reach is declared for it.
+pub(crate) fn pooled_reach_of(
+    what: &str,
+    layout: Option<&BundleLayout>,
+    table: &str,
+    entry_elems: u32,
+) -> Result<Option<crate::sdsc_abstract::GatherReach>, SuperDscError> {
+    let Some((tid, reach)) = layout.and_then(|l| match l.id_of(table) {
+        Some(crate::place::PlaceId::Act(tid)) => l.gather_reach.get(&tid).map(|&r| (tid, r)),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    if entry_elems as u64 != reach.entry_elems() {
+        return Err(SuperDscError(format!(
+            "{what}: this gathered read of '{table}' (t{tid}) strides one index entry at \
+             {entry_elems} elements, but the bundle declares that pool's entries as {}-element \
+             slab blocks (a ceiling of {} entry values, {} elements of reach). dxp turns a value \
+             into an address as `idx * skip_addr + base`, and the host composes those values in \
+             the pool's own unit (`GatherEntry::of_slab_block`), so a descriptor striding at any \
+             other width reads every entry at the wrong address — from a clean bake. State the \
+             read at the pool's entry width, or declare the reach for the pool this read really \
+             strides (`BundleLayout::gather_reach`).",
+            reach.entry_elems(),
+            reach.max_entry().get(),
+            reach.reach_elems(),
+        )));
+    }
+    Ok(Some(reach))
 }
 
 /// ⭐⭐⭐ A POINTWISE OP ONE OF WHOSE INPUTS IS **GATHERED** — a row lookup `table[ids[row], :]`.
@@ -1224,6 +1418,66 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
             run.start().sticks(),
         )));
     }
+    // ⭐⭐⭐⭐⭐ THE POOLED TABLE — DESCRIBED AS IT REALLY LIVES. A gathered source whose layout
+    // declares a `BundleLayout::gather_reach` is a POOL SLICE, not a table: its placement covers
+    // one slice (the paged KV cache's per-layer plane) while its index names stick-blocks
+    // RELATIVE TO THE PLANE'S OWN BASE across the whole pool the runtime re-bases per launch,
+    // so the swept-rectangle-vs-placement law the legs' mint runs for every other operand is
+    // the WRONG pair of facts for it — the rectangle `rows × cols` is not contiguous and the
+    // placement is not the pool. What replaces it is ONE check, on the one fact this door
+    // uniquely sees:
+    //
+    // THE ENTRY UNIT. dxp turns an entry value into an address as `idx * skip_addr + base`,
+    // and this descriptor strides one entry at `cols` elements — while the reach's entries are
+    // `entry_elems`-element SLAB blocks, the unit the host's `GatherEntry::of_slab_block`
+    // composes its runtime values in. Two units for one address is two authorities for the
+    // same bytes: a descriptor striding at any other width reads every entry at the wrong
+    // address, from a clean bake — refused here, by name, with both numbers.
+    //
+    // ⛔ AND THE VALUES' BOUND IS NOT A CHECK HERE, BECAUSE IT CANNOT BE ONE. The values are
+    // runtime data (the host's index table); `run.start()` is a POSITION in the index buffer,
+    // not a value, so any run-shaped inequality against the reach compares two different
+    // tensors' coordinates and is vacuous on every real bundle. The honest bound on the
+    // VALUES is the ceiling the reach carries — `(page_ceiling − 1) · per_page + plane_blocks`
+    // — and it is enforced where a value is BORN: the host-side composition
+    // (`gather_entry_ceiling` → `GatherEntry::of_slab_block`) refuses every value at or above
+    // it, and the same door minted the reach the producer declared, so the bake-time and
+    // stage-time halves are one number by construction. The extent law — the descriptor's
+    // `skip_addr` times the ceiling stays inside the reach — holds by TYPE: the reach's
+    // element extent IS `ceiling · entry_elems` ([`GatherReach::reach_elems`], derived, never
+    // stored), so a `skip_addr` equal to `entry_elems` satisfies it exactly and any other
+    // `skip_addr` is the refusal below.
+    //
+    // A table with NO declared reach takes none of this: its gather keeps the swept-window law
+    // exactly as the embedding's card-proven emission runs it, byte for byte.
+    let mut pooled_inputs;
+    let reach_of_table = pooled_reach_of(op_name, layout, inputs[gathered_input].name(), cols)?;
+    let inputs = if let Some(reach) = reach_of_table {
+        pooled_inputs = inputs.to_vec();
+        pooled_inputs[gathered_input] = pooled_inputs[gathered_input].mark_pooled(reach);
+        &pooled_inputs[..]
+    } else {
+        // ⭐ LAW (b)'s MARK — the operand the index reads through takes the source-window law
+        // at the family mint even when the table is NOT a pool: a sweep that fits its
+        // placement keeps its window byte for byte, and an over-sweep is REFUSED here,
+        // fail-closed, until the table declares a reach (the typed bound on its index values —
+        // a pool's `GatherReach::of_plane`, or a whole-placed source's
+        // `GatherReach::of_source_extent`, which the mark above then carries). See the mark's
+        // own doc and `mint_ew_operands`'s gathered branch for the law.
+        pooled_inputs = inputs.to_vec();
+        pooled_inputs[gathered_input] = pooled_inputs[gathered_input].mark_gathered();
+        &pooled_inputs[..]
+    };
+    // 🅿️ PARKED — THE GENERAL-DOOR STAMP FOR POOL LEGS IN NON-CARRIER PROGRAMS. This door's
+    // pool legs (a `GatherReach::of_plane` table reached here, in a program that is NOT a
+    // spliced attention carrier) are UNSTAMPED by the unified gathered-fact slice: the
+    // addressing fact is stated at the CARRIER's mint (`EmittedOp::paged_region`, the one
+    // door) and stamped by the walk onto every op it lowers from that carrier — so a door
+    // stamp here would be a SECOND writer for the same fact on the same ops, which the
+    // one-stamping-site law forbids. No such program exists in the tree's models today
+    // (every live pool gather rides an attention carrier); the door-law stamp for that
+    // class is PARKED, not silently dropped — landing it means minting the carrier fact
+    // for that program class first.
     // The OUTPUT kind drives the layout, exactly as in the sibling assemblers: a `Stk<FlatTag>` output
     // is a head-major rank-3 op, a `Stk<RowBlockedTag>` output is the rank-2 stick-major token stream.
     let head_major = O::kind() == StickKind::Flat;
@@ -1574,6 +1828,11 @@ fn one_gathered_leg(
     let entry_axis = ia.entry_dim.dim();
     let folds = SdscFoldSet::new(op.iter.cores_used());
     let mut emitted = emit_sdsc_tiled(leg_name, &op, &folds, sym_id_base, layout)?;
+    // 🅿️ NO STAMP HERE — the door's pool legs take their addressing fact from the CARRIER's
+    // mint (`EmittedOp::paged_region`), stamped by the walk onto the ops it lowers from that
+    // carrier; a stamp here would be a second writer for the same fact on the same ops. The
+    // parked general-door note at the reach binding above states the class this leaves
+    // unstamped (non-carrier programs — none exist in the tree's models today).
     // ⭐⭐⭐⭐⭐ `N_` CARRIES THE **TENSOR'S** ROW COUNT, NOT THE LEG'S — THE ONE NUMBER THE CUT CHANGES
     // ABOUT THE WIRE, AND THE CARD DECIDED IT.
     //
@@ -1606,6 +1865,253 @@ fn one_gathered_leg(
         }
     }
     Ok(emitted)
+}
+
+/// ⭐⭐⭐ AN INDEXED WRITE — `table[ids[row], :] = src[row, :]`, the store twin of
+/// [`assemble_pointwise_broadcast_gather`] and the vendor's `dxp/test/test_scatter_1core` shape: an
+/// `identity` copy over `[rows, cols]` whose OUTPUT is the table, the index declared on it through
+/// [`OpSpec::attach_scatter_index`]. One entry per row ([`PageExtent::single_position`]), so
+/// `skip_addr` is one table row; the work split is [`crate::work::GatherSplit`]'s, `mb` only, for
+/// the same `skip_addr` reason the gather leg states.
+///
+/// ⭐⭐⭐ THE CUT: ONE OP PER INDEX STICK, EACH COPYING A **ROW WINDOW** OF THE SOURCE — the store
+/// twin of [`assemble_pointwise_broadcast_gather`]'s own cut, for the same measured reason: dxp
+/// fills the L3LU IBR with a single stick transfer and each core indexes it at its own work-slice
+/// word, so entries past the first `ENTRIES_PER_OP` WRAP. Leg `k` declares one stick of index
+/// (`run.leg(k)`), copies source rows `[k·cap, (k+1)·cap)` (the row window through
+/// `AnyTensorArg::set_offset_elems`, the gather leg's own law stated for the input), and writes
+/// them wherever that stick's index entries name — the table needs no window, the index IS its
+/// addressing. `N_` carries the TABLE's own row count on every leg, the gather cut's
+/// `node_rows` law: `maxDimSizes_ = -1` reconstructs the stick-blocked `device_size` from `N_`'s
+/// `mb_`, and a leg left at its own `cap` rows strides the table's stick planes by `cap` rows.
+///
+/// ⭐⭐⭐⭐⭐ THE RUN'S COVERAGE, STATED ON THE LAST LEG'S OUTPUT BINDING. The read-before-write walk
+/// models an op's writes from its bindings' own `touched` blocks, and the door stamps those from
+/// the op's ITERATION — `leg_rows` contiguous rows at the table's corner — because the entries the
+/// index names are runtime data no bake can read. That model is a LIE for an indexed write: the
+/// leg writes wherever its stick of entries names, and at `rows > cap` every leg stamps the SAME
+/// corner interval, so the walk sees one leg's worth of coverage and refuses the consumer's read
+/// of the rest of the table (measured at `decode_rows=32`: the 32 legs covered one 4096-byte
+/// corner of the 131072-byte landing and the walk refused the reshape's read of the upper half).
+/// What IS stated at bake time is the RUN's coverage law: the entries enumerate the table's rows
+/// at a UNIFORM row stride of `table_rows / rows` — the repetition table's own mint law (the
+/// staging builder contributes one entry per (slab, score-row) pair, `head_major·SLABS + slab`,
+/// bijective onto `[0, table_rows)` per slab slice, its byte size pinned to `table_rows` words by
+/// the extent check where it is staged). At `SLABS == 1` that is the dense full table; at
+/// `SLABS > 1` one slab's run writes every `SLABS`-th row and the runs tile the table. The
+/// binding is the walk's only carrier, so the LAST leg's output binding states the run's
+/// coverage — `rows` one-row blocks at `stride_rows·row_bytes`, anchored at the row the run's
+/// slice begins — and only the last leg's, because that is the op at which the run's writes are
+/// complete: a reader between the legs is refused, the conservative direction (an overstated
+/// write is the one that hides bugs, the [`TouchedBlocks`] law). A table whose row count does
+/// not divide the run's entries, or a run whose entry anchor does not divide by them, is
+/// refused here rather than stated with a pattern the mint law does not back.
+pub struct IndexedWrite<'a> {
+    pub op_name: &'a str,
+    pub rows: u32,
+    pub cols: u32,
+    /// The rows written, `[rows, cols]` stick-major.
+    pub src: &'a str,
+    /// The table written through the index.
+    pub table: &'a str,
+    /// The table's own row count — its residency, carried as the output's `N_` row extent the way
+    /// the gather leg's cut carries its tensor's.
+    pub table_rows: u32,
+    pub index_name: &'a str,
+    pub run: crate::superdsc_opspec::StickRun,
+}
+
+pub fn assemble_indexed_write(
+    w: IndexedWrite<'_>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, SuperDscError> {
+    let IndexedWrite {
+        op_name,
+        rows,
+        cols,
+        src,
+        table,
+        table_rows,
+        index_name,
+        run,
+    } = w;
+    let page = crate::superdsc_opspec::PageExtent::single_position();
+    let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
+    // ⛔ A TABLE WIDER THAN ONE STICK IS REFUSED: its stick-plane stride is reconstructed from
+    // `N_`, which a leg states at its own `cap` rows — the gather leg's measured plane-stride
+    // trap. One stick wide, there is one plane and no stride to get wrong.
+    if cols > Fp16::ELEMS_PER_STICK {
+        return Err(SuperDscError(format!(
+            "{op_name}: an indexed write into a {cols}-wide table ({table_rows} rows) — wider than \
+             one {}-element stick, so the table's stick-plane stride would be reconstructed from \
+             a leg's own row count instead of the table's {}",
+            Fp16::ELEMS_PER_STICK,
+            table_rows
+        )));
+    }
+    // The cut: `cap` rows per leg, one index stick each, the run's own leg `k` naming the stick.
+    let legs = rows.div_ceil(cap);
+    // ⛔ THE RUN'S COVERAGE — the stride pattern the entries enumerate the table at, from the
+    // repetition table's mint law (stated in the struct doc): one slab's run is `rows` one-row
+    // blocks at a row stride of `table_rows / rows`, ANCHORED at the row its slice begins,
+    // `first_entry / rows` (the table is laid out slab-major, one `rows`-entry slice per slab,
+    // and the slice's entries are `head_major·SLABS + slab`). Both divisibility facts are that
+    // law — a table or a run whose arithmetic does not state them has no coverage this door can
+    // claim for the read-before-write walk, and guessing one would stamp the write table with
+    // bytes no host mint guarantees.
+    let first = u64::from(run.start().entries());
+    if rows == 0 || table_rows % rows != 0 || first % u64::from(rows) != 0 {
+        return Err(SuperDscError(format!(
+            "{op_name}: an indexed write of {rows} rows over a run beginning at index entry \
+             {first} into a {table_rows}-row table — the run's entries enumerate the table at a \
+             uniform stride of table_rows/rows anchored at first_entry/rows, and \
+             ({table_rows} mod {rows}, {first} mod {rows}) is not (0, 0). The repetition table's \
+             mint law backs exactly that pattern; an indexed write of any other shape has no \
+             coverage this door can state for the read-before-write walk"
+        )));
+    }
+    let stride_rows = table_rows / rows;
+    let row_bytes = u64::from(cols) * Df::Fp16.word_length() as u64;
+    let coverage = TouchedBlocks {
+        start_bytes: (first / u64::from(rows)) * row_bytes,
+        run_bytes: row_bytes,
+        outer: vec![(u64::from(rows), u64::from(stride_rows) * row_bytes)],
+    };
+    let mut ops: Vec<EmittedOp> = Vec::with_capacity(legs as usize);
+    let mut first_row = 0u32;
+    for k in 0..legs {
+        // The LAST leg may be SHORT — a short index run is the vendor's own shape
+        // (`test_gather_1core` at 3 entries), the same tail law the gather cut states.
+        let leg_rows = (rows - first_row).min(cap);
+        let leg_name = format!("{op_name}_s{k}");
+        let tile_op =
+            crate::emit::lower_ktir_to_superdsc::pointwise_tile_op(leg_rows, cols, 1, 2, Df::Fp16);
+        let split = crate::work::GatherSplit::over_entries(
+            &tile_op.dims,
+            crate::superdsc_opspec::MAX_CORES,
+            page.get(),
+        )
+        .map_err(|e| SuperDscError(format!("{op_name}: leg `{leg_name}`: {e}")))?;
+        // The leg's source window: `leg_rows` rows of the same stick-major `[rows, cols]` source.
+        let src_h = rb(
+            src,
+            RowCount::of_token_rows(leg_rows),
+            BlockCols::of_feature_cols(cols),
+        );
+        let inputs = [In::full(&src_h).ew()];
+        let mut op = pointwise_broadcast_opspec_from_tile(
+            &tile_op,
+            leg_rows,
+            cols,
+            op_func_from_str("identity"),
+            &inputs,
+            table,
+            crate::addr::OutCorner::ZERO,
+            false,
+            layout,
+            crate::work::CoreDivision::Gathered(split),
+        )
+        .map_err(SuperDscError)?;
+        // ⭐⭐⭐ THE SOURCE'S ROW WINDOW — the gather leg's output-window law, stated for the
+        // input: row `r` of a stick-major `[R, C]` tensor begins at element `r · lanes`, and the
+        // offset goes through `AnyTensorArg::set_offset_elems` (NOT the builder's `out_offset`,
+        // which would drop the operand to the rank-3 flat presentation) so the leg's descriptor
+        // keeps the form the uncut op declares. Arg 0 is the source; the table is addressed by
+        // the INDEX, so it keeps the zero corner.
+        if first_row > 0 {
+            let lanes = tile_op.df.elems_per_stick();
+            let off = first_row.checked_mul(lanes).ok_or_else(|| {
+                SuperDscError(format!(
+                    "{op_name}: leg `{leg_name}`'s row base {first_row} x {lanes} lanes overflows \
+                     an element offset"
+                ))
+            })?;
+            op.args
+                .first_mut()
+                .ok_or_else(|| {
+                    SuperDscError(format!(
+                        "{op_name}: leg `{leg_name}` has no operands, so it has no source to move"
+                    ))
+                })?
+                .set_offset_elems(off);
+        }
+        let ia = op
+            .attach_scatter_index(crate::superdsc_opspec::GatherIndex {
+                name: index_name.to_string(),
+                entry_dim: crate::superdsc_opspec::KernelAxis::Batch,
+                page,
+                per_position: None,
+                // ⭐ THE RUN'S OWN LEG `k` — one stick, `k` sticks in, both facts from the run
+                // itself ([`StickRun::leg`]): leg `k` reads index words
+                // `[start + k·cap, start + k·cap + leg_rows)`, and dropping either term is every
+                // leg reading the run's first stick (the `EntryBase` type exists because the
+                // run-half of that happened, measured on the gather side).
+                first_entry: run.leg(k).map_err(SuperDscError)?.start(),
+            })
+            .ok_or_else(|| {
+                SuperDscError(format!(
+                    "{op_name}: leg `{leg_name}`: the scatter declaration was refused — the op's \
+                     plan has no `mb` dim for the entries to enumerate"
+                ))
+            })?;
+        let entry_axis = ia.entry_dim.dim();
+        let folds = SdscFoldSet::new(op.iter.cores_used());
+        let mut emitted = emit_sdsc_tiled(&leg_name, &op, &folds, sym_id_base, layout)?;
+        // ⭐⭐⭐⭐⭐ `N_` CARRIES THE **TABLE'S** ROW COUNT, NOT THE LEG'S — the gather cut's
+        // `node_rows` law, stated for the scatter: the reconstruction `maxDimSizes_ = -1` names
+        // reads `N_`'s `mb_`, and a leg left at its own `cap` strides the table's stick planes
+        // by `cap` rows (the gather's measured 0.017013 trap). The work division, the per-core
+        // starts and the index's own `cap`-entry extent keep the LEG's rows — they are its work.
+        if table_rows != leg_rows
+            && let Some(dsc) = emitted.op.as_mut()
+        {
+            for dsc_map in dsc.dscs_.iter_mut() {
+                for d in dsc_map.values_mut() {
+                    set_iter_dim(&mut d.N_, entry_axis, table_rows);
+                }
+            }
+        }
+        // ⭐⭐⭐⭐⭐ AND THE LEGS' OUTPUT BINDINGS CARRY THE RUN'S COVERAGE, NOT THEIR OWN — the law
+        // the struct doc states. The scatter declares the output LAST (`[src, index, table]`, the
+        // insertion law), so the final binding is the table's; anything else there is an emission
+        // defect this cut refuses rather than stamps the run's coverage on the wrong buffer. The
+        // LAST leg states the run's coverage — the op at which the run's writes are complete — and
+        // every EARLIER leg states NONE: its writes are runtime-addressed, and the door's own
+        // `leg_rows`-contiguous-at-the-corner model would claim bytes the entries may not name
+        // (the overstatement direction the [`TouchedBlocks`] law refuses). A reader between the
+        // legs stays refused, the conservative direction.
+        {
+            let out = emitted.arg_bindings.last_mut().ok_or_else(|| {
+                SuperDscError(format!(
+                    "{op_name}: leg `{leg_name}` binds no operands, so it has no output binding to \
+                     state the run's coverage on"
+                ))
+            })?;
+            if out.buffer != table || out.is_input {
+                return Err(SuperDscError(format!(
+                    "{op_name}: leg `{leg_name}`'s last binding is '{}', not the written table \
+                     '{table}' — the scatter declares the output last ([src, index, table]), so a \
+                     different operand there is an emission defect this cut refuses rather than \
+                     stamps the run's coverage on the wrong buffer",
+                    out.buffer
+                )));
+            }
+            if k + 1 == legs {
+                out.footprint_bytes = u64::from(rows) * row_bytes;
+                out.touched = coverage.clone();
+            } else {
+                out.touched = TouchedBlocks {
+                    start_bytes: 0,
+                    run_bytes: 0,
+                    outer: Vec::new(),
+                };
+            }
+        }
+        ops.push(emitted);
+        first_row += leg_rows;
+    }
+    Ok(ops)
 }
 
 /// The per-chunk OUTPUT column offset (in elements) the emitter must apply for a
@@ -1740,6 +2246,7 @@ fn core_local_reads_agree(
             df: v.df,
             row_blocked: v.row_blocked,
             device_extent: v.device_extent,
+            dxp_innermost_first: v.dxp_innermost_first,
         };
         let dims: Vec<&'static str> = plan.dims().iter().map(|d| d.name).collect();
         let corners = per_core_addr(
@@ -1760,30 +2267,52 @@ fn core_local_reads_agree(
 
 /// [`assemble_pointwise_broadcast`] that writes the output to a COLUMN-BLOCK OFFSET
 /// (`out_offset` elements into the output tensor) — see [`pointwise_chunk_out_offset`].
-#[allow(clippy::too_many_arguments)]
+///
+/// ⭐ THE OP'S WHOLE FACT SET, ON ONE CARRIER — [`PointwiseDivided`] minus the `division` field,
+/// because this door's contract is that the LAW states the division; the body below fills it in
+/// when it delegates to [`assemble_pointwise_broadcast_divided`]. This deletes the nine-parameter
+/// positional run every caller spelled (the arrangement where a name, an extent or an offset
+/// transposes silently). The sink pair (`sym_id_base`/`layout`) stays in the signature BESIDE the
+/// carrier, as it does at every door of this family.
+pub struct PointwiseFacts<'a, O: KindTag> {
+    pub op_name: &'a str,
+    pub op_func: &'static str,
+    /// TYPED row/width slots. Every caller states WHICH row quantity (`RowCount`'s doors: mask rows,
+    /// chunk rows, padded rows, pad remainder, token rows) and WHICH width (`BlockCols`'s doors: one
+    /// stick, the new block's `mq_pad`, the head dim, feature cols) fills the slot — the quantities
+    /// are numerically equal across whole rung families (64 == 64 at mq<=2, hd == stick at hd=64),
+    /// so a bare `u32` could carry any of them without anything noticing.
+    pub rows: crate::sdsc_abstract::RowCount,
+    pub cols: crate::sdsc_abstract::BlockCols,
+    pub inputs: &'a [EwOperand<'a>],
+    pub o: &'a Stk<O>,
+    /// TYPED, like the inputs' `In::sliced`. A write offset is a DEVICE address, so it must come from
+    /// a nest that knows the tensor's extents; the only constructor is `View::dev`. When this was a
+    /// bare `u32` a caller could pass a flat column index, and one did -- the split MLP intermediate
+    /// wrote its second column block at element 8192 instead of `(8192/64)*(rows*64)`, correct at one
+    /// row and wrong at every prefill. The reads were already typed and were already right.
+    /// A [`crate::addr::ColWindow`] (a whole-stick column window, #622) converts too, and carries the fact
+    /// that the window is a stick-major tensor of its own.
+    pub out_offset: crate::addr::OutCorner,
+}
+
 pub fn assemble_pointwise_broadcast_off<O: KindTag>(
-    op_name: &str,
-    op_func: &'static str,
-    // TYPED row/width slots. Every caller states WHICH row quantity (`RowCount`'s doors: mask rows,
-    // chunk rows, padded rows, pad remainder, token rows) and WHICH width (`BlockCols`'s doors: one
-    // stick, the new block's `mq_pad`, the head dim, feature cols) fills the slot — the quantities
-    // are numerically equal across whole rung families (64 == 64 at mq<=2, hd == stick at hd=64),
-    // so a bare `u32` could carry any of them without anything noticing.
-    rows: crate::sdsc_abstract::RowCount,
-    cols: crate::sdsc_abstract::BlockCols,
-    inputs: &[EwOperand<'_>],
-    o: &Stk<O>,
-    // TYPED, like the inputs' `In::sliced`. A write offset is a DEVICE address, so it must come from
-    // a nest that knows the tensor's extents; the only constructor is `View::dev`. When this was a
-    // bare `u32` a caller could pass a flat column index, and one did -- the split MLP intermediate
-    // wrote its second column block at element 8192 instead of `(8192/64)*(rows*64)`, correct at one
-    // row and wrong at every prefill. The reads were already typed and were already right.
-    // A [`crate::addr::ColWindow`] (a whole-stick column window, #622) converts too, and carries the fact
-    // that the window is a stick-major tensor of its own.
-    out_offset: impl Into<crate::addr::OutCorner>,
+    p: PointwiseFacts<'_, O>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
+    // ⭐ THE OP'S FACTS, DESTRUCTURED ONCE AT THE DOOR — the same names the parameter list
+    // spelled, so the delegation below states the same op on the same values. The LAW division
+    // this door has always implied is filled in here, at the one place that owns it.
+    let PointwiseFacts {
+        op_name,
+        op_func,
+        rows,
+        cols,
+        inputs,
+        o,
+        out_offset,
+    } = p;
     assemble_pointwise_broadcast_divided(
         PointwiseDivided {
             op_name,
@@ -1792,7 +2321,7 @@ pub fn assemble_pointwise_broadcast_off<O: KindTag>(
             cols,
             inputs,
             o,
-            out_offset: out_offset.into(),
+            out_offset,
             division: crate::work::EwDivision::Law,
         },
         sym_id_base,
@@ -1951,8 +2480,7 @@ pub fn assemble_broadcast_mul_gate(
     // `[rows, cols]` tensors, and v is the `[rows, one-stick]` column the out-broadcast read sweeps
     // (ONE STICK PER ROW — the RedStick law `EwOperand::swept_extents` states). The probe creates
     // its tensors only in the descriptor (`layout: None`), so the handle IS the statement; the mint
-    // reads the dims as the bound.
-    let (r, c) = (rows.get(), cols.get());
+    // reads the dims as the bound — the typed pair crosses whole, no bare twin.
     // "multiply" is the INTERNAL op_func_from_str key (→ OpFunc::Multiply, whose
     // wire name() is "mul"); passing "mul" would miss the match and default to Add.
     assemble_pointwise_broadcast(
@@ -1961,14 +2489,14 @@ pub fn assemble_broadcast_mul_gate(
         rows,
         cols,
         &[
-            In::full(&rb(x_name, r, c)).ew(),
+            In::full(&rb(x_name, rows, cols)).ew(),
             EwOperand {
                 mb_broadcast: false,
                 out_broadcast: true,
-                ..In::full(&rb(v_name, r, Fp16::ELEMS_PER_STICK)).ew()
+                ..In::full(&rb(v_name, rows, BlockCols::of_one_stick(Lanes::FP16))).ew()
             },
         ],
-        &rb(o_name, r, c),
+        &rb(o_name, rows, cols),
         &mut sym,
         None, // gate probe (not in the walk) → no global layout
     )
@@ -2090,6 +2618,32 @@ pub struct ArgBinding {
     /// whole tensor). What [`crate::emit::lower_ktir_to_superdsc::column_windows_are_honoured`] holds
     /// a column-blocked piece's operands to.
     pub offset_elems: u32,
+    /// ⭐⭐⭐ THE DOOR'S OWN ANSWER, CARRIED — `resolve_seg_base`'s resolution of THIS
+    /// operand, stamped here by [`EmittedOp::new`] from the facts the door returned at
+    /// emission time. There is ONE resolution in the codebase; a consumer that resolves
+    /// again keeps its own copy of the door's address logic and the copy DRIFTS (the
+    /// record-53 word-source drift, then the record-54 arm-order drift — both were the
+    /// walk's private `resolve()` disagreeing with `resolve_seg_base` on the same
+    /// operand). Not serialised into the op.
+    ///
+    /// The segment the door resolved this operand into (`segment_base`'s index), NOT
+    /// derivable from `base_bytes` — the walk keys its Written table by (segment, bank)
+    /// so two different banks of the same role never alias, and a consumer must not
+    /// invert the base address to get it back.
+    pub segment: usize,
+    /// The bank WITHIN `segment` the door resolved — part of the Written-table key.
+    pub bank: u32,
+    /// The role the door resolved — the read-before-write walk's honest-set membership
+    /// (`Weight | Activation | Kv`, nothing else).
+    pub role: crate::placement::SegRole,
+    /// The door's INTRA-segment base in bytes: the placement/synth/segment-fallback
+    /// offset PLUS the `offset_elems · word` slice. The walk's byte interval base is
+    /// EXACTLY this (plus per-trip affine shift), so the walk never re-derives the
+    /// slice arithmetic either.
+    pub base_bytes: u64,
+    /// The door's LX verdict — true means core-local (a pin in core-local space, no
+    /// HBM bytes), and the walk SKIPS the operand rather than judge core-local bytes.
+    pub lx: bool,
 }
 
 /// ⭐⭐⭐ AN OPERAND'S MATERIALIZED FOOTPRINT IN BYTES — the ONE derivation, for every caller.
@@ -2182,6 +2736,9 @@ pub fn declared_axis_block_steps(v: &crate::superdsc_opspec::ArgView, iter: &Wor
 /// ACCEPTING real gaps. Overstating a write is the direction that hides bugs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TouchedBlocks {
+    /// The byte offset of the FIRST block — an anchored stride pattern (an indexed write whose
+    /// run starts partway into the table) begins there, not at the operand's base.
+    pub start_bytes: u64,
     /// The contiguous run at each block, in bytes.
     pub run_bytes: u64,
     /// `(count, stride_bytes)` per outer axis this op sweeps more than once.
@@ -2191,7 +2748,7 @@ pub struct TouchedBlocks {
 impl TouchedBlocks {
     /// Every block's byte offset from the operand's base.
     pub fn offsets(&self) -> Vec<u64> {
-        let mut offs = vec![0u64];
+        let mut offs = vec![self.start_bytes];
         for &(count, stride) in &self.outer {
             let mut next = Vec::with_capacity(offs.len() * count.max(1) as usize);
             for &o in &offs {
@@ -2246,9 +2803,31 @@ pub fn touched_blocks(v: &crate::superdsc_opspec::ArgView, iter: &WorkPlan) -> T
         }
     }
     TouchedBlocks {
+        start_bytes: 0,
         run_bytes: run,
         outer,
     }
+}
+
+/// ⭐ THE EMITTER CONTEXT — the op sink, the sym-id counter and the placement authority as ONE
+/// value, because they are ONE fact: a single emission whose program order is the call order into
+/// the ONE sink, whose sym ids are minted only through the ONE counter, and whose placement
+/// questions have exactly one authority. Minted once at the door that owns the sink —
+/// `lower_function` for the whole-function walk (the attention rides it since the hand-written
+/// emitter's deletion) — and
+/// threaded as ONE `&mut EmitCtx` through every emitter that pushes into it, never split into
+/// per-field borrows at a call site, which would let two spellings of "the" emission disagree
+/// about order, ids or placement. The one-op assemblers (`matmul`, `reduce`, `pointwise`) keep
+/// their `(sym_id_base, layout)` pair WITHOUT the sink — they RETURN their op rather than push it,
+/// the one-op-descriptor form — and a sink-threader hands them `ctx.sym_id_base` / `ctx.layout`
+/// as plain call arguments.
+pub(crate) struct EmitCtx<'a> {
+    /// The one sink: program order is call order into this Vec.
+    pub(crate) ops: &'a mut Vec<EmittedOp>,
+    /// The one counter: every sym id is minted through this base.
+    pub(crate) sym_id_base: &'a mut i64,
+    /// The one placement authority — absent exactly where the pair's was.
+    pub(crate) layout: Option<&'a BundleLayout>,
 }
 
 #[derive(Clone)]
@@ -2309,6 +2888,19 @@ pub struct EmittedOp {
     /// false for any free-list allocation — stops being a precondition. Without it a request axis still
     /// needs that proof, so the runtime must be able to tell the two situations apart.
     pub kv_gathered: bool,
+    /// ⭐ THE STAGING CHANNEL — this op's gathered table is the FILL-STAGED REGION FORM
+    /// (`fill_attn_step_inputs`), not the composer's page-list table.
+    ///
+    /// `kv_gathered` alone carries TWO consequences that can diverge: the addressing half (the
+    /// group's KV shift must be ZERO — absolute entries plus a page base compose two bases) and
+    /// the staging half (the host must stage an index table). A region-form body answers YES to
+    /// the first and NO to the second's page-list spelling: its table is already staged by the
+    /// fill, and the composer must not drive it as a chunk body (a swept extent that is not a
+    /// whole multiple of the page would refuse). BOTH channels' entries are ABSOLUTE, so the
+    /// zero shift is correct for both — this bit only discriminates WHO stages the table.
+    /// Written ONLY by the walk's chain-of-custody stamps (a fold carrier's or a region
+    /// carrier's), never at a mint.
+    pub kv_region_form: bool,
     /// THE ROW REGIME this op's fold passes were baked under (meaningful with [`Self::kv_page_fold`]):
     /// whole-batch passes sweep every `nqh*mq` shared-buffer row and need NO per-pass rebase in the
     /// intermediate segment; per-request passes carry one request's `nqh` rows and do. Declared on the
@@ -2333,16 +2925,40 @@ pub struct EmittedOp {
     /// 0 for every op of an unbatched bundle and for the first request of a batched one, so the
     /// single-request path is untouched.
     pub kv_request: u32,
-    /// ⭐ SLOTS PAST THE LAUNCH'S WRITE CURSOR WHERE THIS OP'S KV STARTS — a whole number of pages,
-    /// non-zero only for the later PAGE PARTS of a prefill chunk whose window spans more than one page.
+    /// ⭐⭐⭐⭐⭐ THE PAGED FOLD THIS OP'S PROGRAM WAS MINTED AS — the attribute the fold's chain
+    /// of custody runs on. `None` on every op but a spliced fold family's BODY carrier: the
+    /// splice STATES the family's laws here through [`Self::paged_fold`] (the ONE door), the
+    /// walk STAMPS them onto every op it lowers from that carrier's program, and the bake's
+    /// fallback proof CHECKS the stamped groups. The seed and finalize carriers of the same
+    /// family stay `None` — they launch once per step, not once per page.
+    pub kv_paged_fold: Option<crate::sdsc_abstract::PagedFold>,
+    /// ⭐⭐⭐⭐⭐ THE PAGED REGION THIS OP'S PROGRAM GATHERS ITS KV THROUGH — the attribute the
+    /// ONE-SHOT attention chain of custody runs on. `None` on every op but a spliced
+    /// attention body: the splice STATES the region here through [`Self::paged_region`] (the
+    /// ONE door, UNCONDITIONALLY — every one-shot attention program gathers the pool through
+    /// the absolute-entry tables, whether or not its ladder stated a fold region), the walk
+    /// STAMPS the addressing fact onto every op it lowers from that carrier's program
+    /// (`kv_gathered`, plus the region-form channel bit the staging side keys on), and the
+    /// entries the host stages are ABSOLUTE stick-block numbers — the op takes the ZERO KV
+    /// shift, never the page base on top. The seed and finalize carriers of a fold family
+    /// stay `None`; the fold body itself states its region through [`Self::kv_paged_fold`]
+    /// instead, whose stamped ops carry the same region form. The pool tids ride with the
+    /// region so the stamp site can check the layout's gather reach — see
+    /// [`crate::sdsc_abstract::PagedRegion`].
+    pub kv_paged_region: Option<crate::sdsc_abstract::PagedRegion>,
+    /// ⭐ WHICH PAGE OF A MULTI-PAGE WINDOW THIS OP ADDRESSES — a
+    /// [`PagePart`](crate::page_part::PagePart), never a number.
     ///
-    /// One launch resolves ONE page per op from the request's block table, at the page holding the op's
-    /// cursor. A window of `PREFILL_WINDOW_PAGES` pages therefore cannot be one write: the emitter cuts
-    /// each `(kv head, slab)` copy into parts of `PAGE_SLOTS` rows, and part `p` carries `p·PAGE_SLOTS`
-    /// here, so the runtime resolves ITS page at `cursor + offset` (`fold_plan::op_slot_pos`). A part
-    /// whose page the request does not hold (a short last chunk's padding) is SKIPPED, never aimed at
-    /// part 0's page. Ops with different offsets never share a group: one group is one page shift.
-    pub kv_slot_offset: u32,
+    /// One launch resolves ONE page per op from the request's block table, at the page holding the
+    /// op's cursor. A window of `PREFILL_WINDOW_PAGES` pages therefore cannot be one write: the
+    /// emitter cuts each `(kv head, slab)` copy into parts of `PAGE_SLOTS` rows, and the op carries
+    /// THE CUT'S OWN part (stamped from the [`KvWritePart`](crate::sdsc_abstract::KvWritePart)
+    /// `write_parts` returned — the only minter), so the runtime resolves ITS page at
+    /// `cursor + part` (`fold_plan::op_slot_pos`). A part whose page the request does not hold (a
+    /// short last chunk's padding) is SKIPPED, never aimed at part 0's page. Ops of different parts
+    /// never share a group: one group is one page shift, and the fusion walk compares THIS TYPE —
+    /// what the part carries is the argument's type, not this comment.
+    pub kv_part: crate::page_part::PagePart,
     /// TRUE for a cache-write copy that writes a DISTINCT per-entry slot (the mq>1 PREFILL
     /// per-slot cachewr copies, baked at `qh·cap·hd + s·hd` for distinct `s`). Such copies
     /// MUST NOT be fused into a `GroupKind::Slot` group: the shim applies ONE `slot_pos`
@@ -2445,10 +3061,13 @@ impl EmittedOp {
             kv_page_fold: false,
             kv_batched_requests: false,
             kv_gathered: false,
+            kv_region_form: false,
             kv_fold_rows: Default::default(),
             kv_page_slots: 0,
             kv_request: 0,
-            kv_slot_offset: 0,
+            kv_paged_fold: None,
+            kv_paged_region: None,
+            kv_part: crate::page_part::PagePart::at_cursor(),
             host_kv_write: false,
             kv_n_skip: 0,
             kv_new_k_tid: 0,
@@ -2460,6 +3079,40 @@ impl EmittedOp {
             kv_hd: 0,
             kv_cap: 0,
         }
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE ONE DOOR FOR THE PAGED-FOLD ATTRIBUTE — a fold family's BODY carrier, with
+    /// the family's launch-ABI laws stated by the layer that minted it (the splice).
+    ///
+    /// ⛔ NOTHING ELSE MAY WRITE [`Self::kv_paged_fold`]. The attribute is the single carrier
+    /// between the splice's statement and the walk's stamp (`ktir_groups_via_superdsc`, which
+    /// copies these facts onto every op it lowers from this carrier's program) and the proof the
+    /// bake runs over the stamped groups — so a second writer is a second source of the fold
+    /// facts, which is the desync the field exists to prevent. The seed and finalize carriers
+    /// of the same family are `bare` ops: they launch once per step, not once per page, and
+    /// carrying the attribute on them would stamp a fold onto programs that must not re-launch.
+    pub fn paged_fold(op_name: String, fold: crate::sdsc_abstract::PagedFold) -> EmittedOp {
+        let mut e = EmittedOp::bare(op_name);
+        e.kv_paged_fold = Some(fold);
+        e
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE ONE DOOR FOR THE PAGED-REGION ATTRIBUTE — a one-shot attention body, with
+    /// the region stated by the layer that minted it (the splice, at the shared tail of both
+    /// row arms) and the pool's own tids riding with it for the stamp site's premise check.
+    ///
+    /// ⛔ NOTHING ELSE MAY WRITE [`Self::kv_paged_region`]. The attribute is the single
+    /// carrier between the splice's statement and the walk's stamp (which copies the
+    /// addressing fact onto every op it lowers from this carrier's program), so a second
+    /// writer is a second source of the region fact, which is the desync the field exists
+    /// to prevent. `bare` stays the mint for every op that is not a one-shot attention
+    /// carrier: the region is now stated UNCONDITIONALLY for the arm (a prefix-free rung
+    /// gathers the pool through the same absolute-entry tables), so an attention body with
+    /// NO attribute is a walk/splice desync, not an unpaged form.
+    pub fn paged_region(op_name: String, region: crate::sdsc_abstract::PagedRegion) -> EmittedOp {
+        let mut e = EmittedOp::bare(op_name);
+        e.kv_paged_region = Some(region);
+        e
     }
 
     /// A by-value copy, for building a trimmed op list (see `ops_for_grouping`). `EmittedOp` is not
@@ -2476,10 +3129,13 @@ impl EmittedOp {
             kv_page_fold: self.kv_page_fold,
             kv_batched_requests: self.kv_batched_requests,
             kv_gathered: self.kv_gathered,
+            kv_region_form: self.kv_region_form,
             kv_fold_rows: self.kv_fold_rows,
             kv_page_slots: self.kv_page_slots,
             kv_request: self.kv_request,
-            kv_slot_offset: self.kv_slot_offset,
+            kv_paged_fold: self.kv_paged_fold,
+            kv_paged_region: self.kv_paged_region,
+            kv_part: self.kv_part,
             slab_write: self.slab_write,
             slab_stride_bytes: self.slab_stride_bytes,
             slot_no_fuse: self.slot_no_fuse,
@@ -2501,6 +3157,12 @@ impl EmittedOp {
     /// has a matching AllocNode (so [`concrete_trips`] can bump its base address
     /// per trip) — a tiled tensor with a stride but no node is a build-time panic
     /// (internal-consistency bug), not a silently-wrong on-card address.
+    ///
+    /// It also ASSERTS **FactsMatchBindings**: `facts.len() == spec_args.len()` —
+    /// the door resolved every operand, so a parallel-array mismatch is a
+    /// build-time panic (the same internal-consistency class as
+    /// TiledHasStrideAndNode), never an unchecked parallel-index assumption that
+    /// stamps one operand's resolution onto another's binding.
     fn new(
         op_name: String,
         op: SdscOp,
@@ -2512,7 +3174,17 @@ impl EmittedOp {
         iter: &WorkPlan,
         time: u32,
         affine_strides: Vec<BTreeMap<&'static str, i64>>,
+        // The door's per-operand resolutions (`resolve_seg_base`, collected by `emit_sdsc`) —
+        // stamped onto binding[i] so there is ONE resolution in the codebase, never a second copy.
+        facts: &[SegFacts],
     ) -> EmittedOp {
+        assert!(
+            facts.len() == spec_args.len(),
+            "EmittedOp {op_name}: the door resolved {} operands but the op binds {} \
+             (FactsMatchBindings witness)",
+            facts.len(),
+            spec_args.len()
+        );
         if time > 1 {
             for dsc_map in &op.dscs_ {
                 for dsc in dsc_map.values() {
@@ -2531,14 +3203,21 @@ impl EmittedOp {
         }
         let arg_bindings = spec_args
             .iter()
-            .map(|a| {
+            .enumerate()
+            .map(|(i, a)| {
                 let v = a.view();
+                let f = facts[i];
                 ArgBinding {
                     buffer: v.name.to_string(),
                     is_input: v.is_input,
                     footprint_bytes: materialized_bytes(&v, iter),
                     touched: touched_blocks(&v, iter),
                     offset_elems: v.offset_elems,
+                    segment: f.segment,
+                    bank: f.bank,
+                    role: f.role,
+                    base_bytes: f.intra_base,
+                    lx: f.lx,
                 }
             })
             .collect();
@@ -2554,10 +3233,13 @@ impl EmittedOp {
             kv_page_fold: false,
             kv_batched_requests: false,
             kv_gathered: false,
+            kv_region_form: false,
             kv_fold_rows: crate::sdsc_abstract::FoldRowRegime::WholeBatch,
             kv_page_slots: 0,
             kv_request: 0,
-            kv_slot_offset: 0,
+            kv_paged_fold: None,
+            kv_paged_region: None,
+            kv_part: crate::page_part::PagePart::at_cursor(),
             slab_write: false,
             slab_stride_bytes: 0,
             slot_no_fuse: false,
@@ -2606,7 +3288,7 @@ pub fn emit_sdsc_tiled(
         _ => op,
     };
     let time = op.time();
-    let inner = emit_sdsc(op_name, op, folds, layout)?;
+    let (inner, facts) = emit_sdsc(op_name, op, folds, layout)?;
     if time == 1 {
         // Concrete-address single-shot path: all-empty strides, no unroll.
         let affine_strides = vec![BTreeMap::new(); op.args.len()];
@@ -2617,9 +3299,10 @@ pub fn emit_sdsc_tiled(
             &op.iter,
             1,
             affine_strides,
+            &facts,
         ));
     }
-    rewrite_op_for_time_tile(op_name, op, folds, inner, time, sym_id_base)
+    rewrite_op_for_time_tile(op_name, op, folds, inner, time, sym_id_base, &facts)
 }
 
 /// Rewrite a freshly-emitted (time=1-shaped) [`SdscOp`] into its TIME-TILED form:
@@ -2637,6 +3320,7 @@ fn rewrite_op_for_time_tile(
     mut inner: SdscOp,
     time: u32,
     sym_id_base: &mut i64,
+    facts: &[SegFacts],
 ) -> Result<EmittedOp, SuperDscError> {
     let tiled_dim = op
         .time_tile
@@ -2919,6 +3603,7 @@ fn rewrite_op_for_time_tile(
         &op.iter,
         time,
         affine_strides,
+        facts,
     ))
 }
 
@@ -2975,7 +3660,55 @@ fn set_iter_dim_i(it: &mut IterSpace, name: &str, v: i64) {
     }
 }
 
-/// Resolve one arg's HBM segment base + intra-segment byte offset. With a
+/// ⭐⭐⭐⭐⭐ THE RESOLVED PLACEMENT FACTS FOR ONE OPERAND — `resolve_seg_base`'s
+/// answer, carried whole. Every field was already in hand per arm; the struct
+/// exists so the answer can TRAVEL: `emit_sdsc` collects one per operand and
+/// `EmittedOp::new` stamps it onto the matching [`ArgBinding`], which is how the
+/// read-before-write walk reads placement facts OFF THE BINDING instead of
+/// re-deriving them — records 53 and 54 were the same defect twice (the walk's
+/// own copy of this resolution drifting from the door's at a different spot
+/// each time), and the cure is ONE resolution, stated here, consumed
+/// everywhere. `seg_base`/`intra_base` are the address pair the on-card walk
+/// always consumed; `role`/`segment`/`bank` are the facts the coverage walk
+/// keys on; `lx` marks the pinned-LX arm (per-core scratchpad, out of the HBM
+/// walk's domain).
+#[derive(Clone, Copy)]
+pub struct SegFacts {
+    /// The operand's HBM segment base (`SEGMENT_OFFSETS[segment]`); 0 for an
+    /// LX-resident name, whose address is its pin.
+    pub seg_base: u64,
+    /// The intra-segment byte base — the placement/synth offset PLUS the
+    /// `offset_elems · df.word_length()` slice, exactly the number the address
+    /// math always consumed.
+    pub intra_base: u64,
+    /// The buffer's role — the honest-set key for the coverage walk.
+    pub role: crate::placement::SegRole,
+    /// The segment INDEX (never the base address — the walk keys its written
+    /// table on the index, which cannot alias the way a number can).
+    pub segment: usize,
+    /// The weight bank, for the walk's `(segment, bank)` table key.
+    pub bank: u32,
+    /// TRUE when the name resolved through the pinned-LX arm: per-core
+    /// scratchpad, invisible to (and skipped by) the HBM coverage walk.
+    pub lx: bool,
+}
+
+/// The role a segment index belongs to — the inverse of `SegRole::segment()`,
+/// stated for the NO-LAYOUT fallback only (a real bundle's facts come from the
+/// placement row or the synth map, never from here). Segments 5 and 6 are
+/// intermediate COLORS (`inter_segs`), so they answer Intermediate.
+fn role_of_segment(seg: usize) -> crate::placement::SegRole {
+    match seg {
+        1 => crate::placement::SegRole::Weight,
+        2 => crate::placement::SegRole::Kv,
+        3 => crate::placement::SegRole::Activation,
+        4 => crate::placement::SegRole::Logits,
+        _ => crate::placement::SegRole::Intermediate,
+    }
+}
+
+/// Resolve one arg's HBM segment base + intra-segment byte offset, and the
+/// placement facts that travel with them. With a
 /// [`BundleLayout`] (the real full-model walk) the arg's GLOBAL placement is looked
 /// up by its `t{id}` name → `(SEGMENT_OFFSETS[role_segment], packed_offset + slice)`,
 /// so every op references a shared tensor at the SAME address (task #55). Without a
@@ -2989,7 +3722,7 @@ fn resolve_seg_base(
     arg_bytes: u64,
     df: Df,
     lane_read: bool,
-) -> Result<(u64, u64), SuperDscError> {
+) -> Result<SegFacts, SuperDscError> {
     let slice = offset_elems as u64 * df.word_length() as u64; // 4 B for fp32, 1 B fp8/int8, else 2 B fp16
     // The footprint guard's WINDOW END — the last byte this access can touch.
     //
@@ -3036,7 +3769,14 @@ fn resolve_seg_base(
                          sits at the pin, so a view into it has no offset to take"
                     )));
                 }
-                return Ok((0, pin));
+                return Ok(SegFacts {
+                    seg_base: 0,
+                    intra_base: pin,
+                    role: crate::placement::SegRole::Intermediate,
+                    segment: crate::placement::SegRole::Intermediate.segment(),
+                    bank: 0,
+                    lx: true,
+                });
             }
             if window_end > fp {
                 return Err(SuperDscError(format!(
@@ -3047,7 +3787,14 @@ fn resolve_seg_base(
                      op's view/offset."
                 )));
             }
-            return Ok((0, pin + slice));
+            return Ok(SegFacts {
+                seg_base: 0,
+                intra_base: pin + slice,
+                role: crate::placement::SegRole::Intermediate,
+                segment: crate::placement::SegRole::Intermediate.segment(),
+                bank: 0,
+                lx: true,
+            });
         }
         // 1. A real caller-bound buffer → its global placement. The id comes from the layout's own
         //    mint table, NOT from picking the digits back out of the spelling.
@@ -3070,7 +3817,14 @@ fn resolve_seg_base(
                     p.size, p.segment
                 )));
             }
-            return Ok((segment_base(p.segment)?, p.offset + slice));
+            return Ok(SegFacts {
+                seg_base: segment_base(p.segment)?,
+                intra_base: p.offset + slice,
+                role: p.role,
+                segment: p.segment,
+                bank: p.bank,
+                lx: false,
+            });
         }
         // 2. A SYNTHETIC intermediate (silu/rmsnorm decomposition: `t{id}_silu`,
         //    `t{id}_sq`, …) — no `t{id}` placement. Assign it a STABLE offset in the
@@ -3133,10 +3887,24 @@ fn resolve_seg_base(
                 s.next = end;
             }
         }
-        return Ok((segment_base(seg)?, off + slice));
+        return Ok(SegFacts {
+            seg_base: segment_base(seg)?,
+            intra_base: off + slice,
+            role: crate::placement::SegRole::Intermediate,
+            segment: seg,
+            bank: 0,
+            lx: false,
+        });
     }
     // No layout (single-op fixtures / unit tests): per-op segment by arg position.
-    Ok((segment_base(arg_index)?, slice))
+    Ok(SegFacts {
+        seg_base: segment_base(arg_index)?,
+        intra_base: slice,
+        role: role_of_segment(arg_index),
+        segment: arg_index,
+        bank: 0,
+        lx: false,
+    })
 }
 
 pub fn emit_sdsc(
@@ -3144,7 +3912,7 @@ pub fn emit_sdsc(
     op: &OpSpec,
     folds: &SdscFoldSet,
     layout: Option<&BundleLayout>,
-) -> Result<SdscOp, SuperDscError> {
+) -> Result<(SdscOp, Vec<SegFacts>), SuperDscError> {
     let cores = folds.core_fold();
     let views: Vec<ArgView<'_>> = op.args.iter().map(|a| a.view()).collect();
     let out_idx = views.len().saturating_sub(1);
@@ -3266,7 +4034,7 @@ pub fn emit_sdsc(
             ldsIdx_: i as u32,
             dsName_: format!("Tensor{i}"),
             dsType_: v.role.ds_type(),
-            scale_: v.scale.iter().map(|s| s.to_i64()).collect(),
+            scale_: wire_order(v, v.scale.iter().map(|s| s.to_i64()).collect()),
             wordLength: v.df.word_length(),
             // Per-tensor dtype from the arg's typed `Df` (`v.df`, the SINGLE source of truth) — NOT a name
             // suffix. `Df::Fp32` → IEEE_FP32 (4-byte, the KSPLIT fp32-SFP-merge partials); `Df::Fp8` →
@@ -3317,19 +4085,19 @@ pub fn emit_sdsc(
         primary.entry(v.role.ds_type()).or_insert_with(|| {
             if is_transpose_out {
                 LayoutInfo {
-                    layoutDimOrder_: v.layout.to_vec(),
+                    layoutDimOrder_: wire_order(v, v.layout.to_vec()),
                     stickDimOrder_: vec!["out", "mb"],
                     stickSize_: vec![8, 8],
                 }
             } else if is_fp8_kernel {
                 LayoutInfo {
-                    layoutDimOrder_: v.layout.to_vec(),
+                    layoutDimOrder_: wire_order(v, v.layout.to_vec()),
                     stickDimOrder_: vec!["in", "out"],
                     stickSize_: vec![2, 64],
                 }
             } else {
                 LayoutInfo {
-                    layoutDimOrder_: v.layout.to_vec(),
+                    layoutDimOrder_: wire_order(v, v.layout.to_vec()),
                     stickDimOrder_: vec![v.stick],
                     stickSize_: vec![v.df.elems_per_stick()], // fp16/bf16: 64; fp32: 32; fp8/int8: 128
                 }
@@ -3473,6 +4241,10 @@ pub fn emit_sdsc(
     // Collision guard: collect every (output) byte address emitted; any duplicate
     // is two cores writing the same byte = silently-wrong → build `Err`.
     let mut out_addr_seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    // ⭐ THE PER-ARG RESOLVED FACTS, collected beside the addresses they came from —
+    // one `SegFacts` per operand, threaded to `EmittedOp::new` so the binding
+    // carries the door's OWN resolution and no consumer ever re-derives it.
+    let mut arg_facts: Vec<SegFacts> = Vec::with_capacity(views.len());
     for (i, v) in views.iter().enumerate() {
         let comp = v.allocation.component();
         let name = format!("allocate-Tensor{i}_{comp}");
@@ -3633,25 +4405,24 @@ pub fn emit_sdsc(
             }
             clamped * v.df.word_length() as u64
         };
-        let (seg_base, intra_base) =
-            resolve_seg_base(layout, v.name, i, v.offset_elems, arg_bytes, v.df, {
-                // ⭐ A SUB-STICK OFFSET ON A COLLAPSED STICK DIM IS A LANE READ — the RedStick
-                // stride-0 fold reads ONE element per materialized row at `row_base + offset`
-                // (exx2's E[x²] pair slot at element 8, read by rmsnorm's `rmxn`), so the offset
-                // addresses a lane within each row's stick rather than shifting the block. Every
-                // prior offset on a collapsed-stick operand is a stick-MULTIPLE block base (the
-                // per-head attention `col_at` bases), which keeps the default window model — this
-                // fires only for the lane read. See `resolve_seg_base`'s own doc for the window
-                // arithmetic the flag selects.
-                let stick_collapsed = v
-                    .layout
-                    .iter()
-                    .position(|&d| d == v.stick)
-                    .is_some_and(|p| !matches!(v.scale.get(p), Some(Scale::Active) | None));
-                stick_collapsed
-                    && v.offset_elems > 0
-                    && !(v.offset_elems as u64).is_multiple_of(v.df.elems_per_stick() as u64)
-            })?;
+        let facts = resolve_seg_base(layout, v.name, i, v.offset_elems, arg_bytes, v.df, {
+            // ⭐ A SUB-STICK OFFSET ON A COLLAPSED STICK DIM IS A LANE READ — the RedStick
+            // stride-0 fold reads ONE element per materialized row at `row_base + offset`
+            // (exx2's E[x²] pair slot at element 8, read by rmsnorm's `rmxn`), so the offset
+            // addresses a lane within each row's stick rather than shifting the block. Every
+            // prior offset on a collapsed-stick operand is a stick-MULTIPLE block base (the
+            // per-head attention `col_at` bases), which keeps the default window model — this
+            // fires only for the lane read. See `resolve_seg_base`'s own doc for the window
+            // arithmetic the flag selects.
+            let stick_collapsed = v
+                .layout
+                .iter()
+                .position(|&d| d == v.stick)
+                .is_some_and(|p| !matches!(v.scale.get(p), Some(Scale::Active) | None));
+            stick_collapsed
+                && v.offset_elems > 0
+                && !(v.offset_elems as u64).is_multiple_of(v.df.elems_per_stick() as u64)
+        })?;
         // ── arrangement authority ── record THIS view's device layout for its tensor. If an earlier op
         // addressed the same tensor NON-equivalently (a producer/consumer Dense-vs-stick disagreement, the
         // M>1 scramble), this is a build Err naming the tensor — not silent garbage on-card. Declare only
@@ -3678,7 +4449,16 @@ pub fn emit_sdsc(
                 l.declare_arrangement(v.name, view_stick_layout(v, iter))?;
             }
         }
-        let per_core = per_core_addr(seg_base, v, &sl, iter, &wk_slice, intra_base, cores)?;
+        arg_facts.push(facts);
+        let per_core = per_core_addr(
+            facts.seg_base,
+            v,
+            &sl,
+            iter,
+            &wk_slice,
+            facts.intra_base,
+            cores,
+        )?;
         // No two cores of an OUTPUT tensor may share a byte address (aliased write) — EXCEPT a K-split
         // matmul, where the `k` cores each contract a K-slice into a PARTIAL product that dxp
         // PSUM-accumulates into the SHARED output tile (torch-spyre's reduction-dim split). That case is
@@ -3762,7 +4542,7 @@ pub fn emit_sdsc(
             // stick-major tensor — dxp applies `get_generic_stick_layout` INTERNALLY when it reconstructs
             // the stick-blocked `device_size` from `-1`, so the mb-outermost label + `-1` already yields the
             // stick-major walk (`element_torchspyre_parity`). Reordering here DIVERGES from the golden.
-            layoutDimOrder_: v.layout.to_vec(),
+            layoutDimOrder_: wire_order(v, v.layout.to_vec()),
             // ── The ON-CARD WALK, DERIVED from the SAME `sl` the per-core START uses (`StickLayout::
             // max_dim_sizes`) so the two cannot disagree. Stick-blocked (`RowBlocked`/`Kernel`) ⇒ `-1` per
             // dim (dxp reconstructs the RowBlocked device_size from N_/layoutDimOrder_/stickSize_ and
@@ -3816,7 +4596,17 @@ pub fn emit_sdsc(
                 );
                 // Paged only on the gathered value side. Every pin was resolved against this operand's
                 // own layout above, so `paged_at` cannot be the thing that drops one.
-                if paged_dims.is_empty() {
+                //
+                // ⭐ A dxp-INNERMOST-FIRST VIEW IS RECONSTRUCTED, NOT PINNED: dxp builds its walk from
+                // the REVERSED `layoutDimOrder_` plus the view's back gaps, and a pinned extents array
+                // would be read at the opposite end first — the same strides it derives from the labels,
+                // restated in an order the labels do not carry. `-1` per dim hands the reconstruction to
+                // the labels (the same spelling every stick-blocked view above takes). Ungathered only:
+                // a paged axis keeps its pin, which is what `paged_at` states.
+                if v.dxp_innermost_first && paged_dims.is_empty() {
+                    crate::sdsc_abstract::StickLayout::kernel(1, 1)
+                        .device_walk(&vec![1i64; v.layout.len()])
+                } else if paged_dims.is_empty() {
                     walk
                 } else {
                     walk.clone().paged_at(&paged_dims).unwrap_or(walk)
@@ -3877,7 +4667,34 @@ pub fn emit_sdsc(
                 None | Some(IndirectRole::Value { .. }) => None,
             },
             startAddressCoreCorelet_: addr,
-            backGapCore_: None,
+            // HBM back gaps, `-1`-keyed for all cores — torch-spyre's own spelling (`compute_ops.py`'s
+            // `backGapCore_`). Absent unless a dim states one, and the ONE thing that states one on
+            // this crate is a dxp-innermost-first view's declared `device_extent` wider than its sweep
+            // (`phys − swept`): the only spelling of a physical extent dxp honours as a stride
+            // (`sizesWithGaps_`, dsc2.cpp:2899 — a pinned `maxDimSizes_` entry is not one). Every
+            // existing view declares no extent or serializes as stated, so this stays `None` for every
+            // bundle the crate emitted before the flag existed.
+            backGapCore_: {
+                let gaps: serde_json::Map<String, serde_json::Value> = v
+                    .layout
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(li, d)| {
+                        let gap = if v.dxp_innermost_first {
+                            v.device_extent
+                                .get(li)
+                                .copied()
+                                .flatten()
+                                .map_or(0, |p| p.saturating_sub(iter.extent(d)))
+                        } else {
+                            0
+                        };
+                        (gap > 0)
+                            .then(|| (d.to_string(), serde_json::json!({ "-1": gap.to_string() })))
+                    })
+                    .collect();
+                (!gaps.is_empty()).then_some(serde_json::Value::Object(gaps))
+            },
             coordinates_: coordinates,
         });
     }
@@ -4124,7 +4941,7 @@ pub fn emit_sdsc(
         },
     };
 
-    Ok(SdscOp {
+    let sdsc = SdscOp {
         sdscFoldProps_: vec![FoldProp {
             factor_: folds.time_fold() as i64,
             label_: "time",
@@ -4160,7 +4977,8 @@ pub fn emit_sdsc(
         coreIdToWkSlice_: wk_slice,
         coreIdToDscSchedule: core_dsc_schedule(cores),
         dscs_: vec![BTreeMap::from([(op_name.to_string(), dsc)])],
-    })
+    };
+    Ok((sdsc, arg_facts))
 }
 
 /// Set one named iteration dim in the dense [`IterSpace`] by slot name.
@@ -4183,20 +5001,31 @@ fn set_iter_dim(it: &mut IterSpace, name: &str, v: u32) {
 /// kind-boundary (the token stream IS RowBlocked, so this never fails; a genuinely non-RowBlocked tensor
 /// cannot be minted here, which is the point). Named `rb_*` for terse call sites. df is annotation-only
 /// (the emit reads it from the OpSpec), so fp16 is fine for the fp8 activation too.
-pub fn rb(name: &str, rows: u32, cols: u32) -> Stk<RowBlockedTag> {
-    Stk::<RowBlockedTag>::new(name, StickLayout::row_blocked(rows as usize, cols as usize))
-        .expect("token-stream matmul operand is RowBlocked by construction")
+///
+/// ⭐⭐⭐⭐⭐ THE DIMS CROSS AS THE COUNTS THEY ARE — [`RowCount`] / [`BlockCols`], the same typed
+/// pair the reduce/pointwise mints take, so a wrong-kind count (a slot extent in a row slot, a lane
+/// count in a width slot, or the two positions swapped) is a `cargo build` type error at the call
+/// site, not a silently mis-shaped handle. This mint was the LAST place an attention intermediate's
+/// shape lost its name on its way into the opspec: the counts arrived typed at the assembler doors
+/// and were destructured to bare `u32` "for the `rb` shape slots only" — that exception is closed;
+/// a caller now spends the typed count it holds or crosses through a door that names the quantity.
+pub fn rb(name: &str, rows: RowCount, cols: BlockCols) -> Stk<RowBlockedTag> {
+    Stk::<RowBlockedTag>::new(
+        name,
+        StickLayout::row_blocked(rows.get() as usize, cols.get() as usize),
+    )
+    .expect("token-stream matmul operand is RowBlocked by construction")
 }
 
 /// [`rb`] at the operand's OWN df — the fp8 activation's handle. The kind is annotation-only to the
 /// emit (the OpSpec carries the real df), but the WINDOW MINT's placement door prices bytes at the
 /// handle's word length, so a buffer whose elements are 1 byte must not be annotated at 2: every
 /// window over it would be overstated 2× and the last slot's legal convert would refuse. Same
-/// infallibility contract as [`rb`] — only the df reaches the layout.
-pub fn rb_df(name: &str, rows: u32, cols: u32, df: Df) -> Stk<RowBlockedTag> {
+/// infallibility contract and same typed-dims law as [`rb`] — only the df reaches the layout.
+pub fn rb_df(name: &str, rows: RowCount, cols: BlockCols, df: Df) -> Stk<RowBlockedTag> {
     Stk::<RowBlockedTag>::new(
         name,
-        StickLayout::row_blocked_df(rows as usize, cols as usize, df),
+        StickLayout::row_blocked_df(rows.get() as usize, cols.get() as usize, df),
     )
     .expect("token-stream matmul operand is RowBlocked by construction")
 }
@@ -4214,7 +5043,11 @@ pub(crate) fn fl(name: &str, rows: u32, cols: u32) -> Stk<FlatTag> {
 /// `rbo` = RowBlocked (residual token stream), `flo` = Flat (head-major / per-head attention). The KIND
 /// is the whole point: it's what the builder can't be handed wrong, and what drives head_major.
 pub(crate) fn rbo(name: &str) -> Stk<RowBlockedTag> {
-    rb(name, 1, 64)
+    rb(
+        name,
+        RowCount::of_broadcast_row(),
+        BlockCols::of_one_stick(Lanes::FP16),
+    )
 }
 
 /// A typed pointwise INPUT operand: a handle whose layout KIND is in its type (`K`), plus its broadcast
@@ -4346,6 +5179,28 @@ impl<'a, K: KindTag> In<'a, K> {
             col_window: None,
         }
     }
+    /// [`y_broadcast`](Self::y_broadcast) AT A ROW CORNER — the per-trip window form of the
+    /// row-split source: a `[mb, out]` window at row `r_start` of a taller region-stated view
+    /// (the prefill mask, page-major). The corner is the window's own device offset in the
+    /// parent's stick-blocked storage (`rc_of` at `(r_start, 0)` — the same typed corner law
+    /// [`In::mb_at`](Self::mb_at) states for the Mb source's column window); the source is
+    /// single-stick by the frame law, so one stick per row means the corner composes
+    /// additively with the mb-row addressing and the spray reads exactly the window's rows.
+    pub fn y_at(h: &'a Stk<K>, y: u32, off: crate::addr::DevOff) -> Self {
+        assert!(
+            y > 1,
+            "In::y_at: a spray count of {y} is not a broadcast — the leading dim must \
+             spray a real count (the walk's Y admission refuses y == 1 upstream)"
+        );
+        In {
+            h,
+            mb_broadcast: false,
+            out_broadcast: false,
+            y_broadcast: y,
+            col_offset: off.into_raw_elems(),
+            col_window: None,
+        }
+    }
     pub fn ew(&self) -> EwOperand<'a> {
         EwOperand {
             name: self.h.name(),
@@ -4355,6 +5210,8 @@ impl<'a, K: KindTag> In<'a, K> {
             y_broadcast: self.y_broadcast,
             col_offset: self.col_offset,
             col_window: self.col_window,
+            pooled: None,
+            gathered: false,
         }
     }
 }
@@ -4376,13 +5233,15 @@ pub fn pw1<A: KindTag, O: KindTag>(
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
     assemble_pointwise_broadcast_off(
-        op_name,
-        op_func,
-        rows,
-        cols,
-        &[a.ew()],
-        o,
-        crate::addr::DevOff::ZERO,
+        PointwiseFacts {
+            op_name,
+            op_func,
+            rows,
+            cols,
+            inputs: &[a.ew()],
+            o,
+            out_offset: crate::addr::DevOff::ZERO.into(),
+        },
         sym,
         layout,
     )
@@ -4403,13 +5262,15 @@ pub fn pw2<A: KindTag, B: KindTag, O: KindTag>(
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
     assemble_pointwise_broadcast_off(
-        op_name,
-        op_func,
-        rows,
-        cols,
-        &[a.ew(), b.ew()],
-        o,
-        crate::addr::DevOff::ZERO,
+        PointwiseFacts {
+            op_name,
+            op_func,
+            rows,
+            cols,
+            inputs: &[a.ew(), b.ew()],
+            o,
+            out_offset: crate::addr::DevOff::ZERO.into(),
+        },
         sym,
         layout,
     )
@@ -5347,6 +6208,7 @@ mod transpose_tests {
             program: Program::Transpose,
             bindings: vec![BufferId::new(101), BufferId::new(102)],
             mask: None,
+            step_inputs: Vec::new(),
             node_out_tid: None,
             minted: Default::default(),
         }
@@ -6281,6 +7143,14 @@ pub fn op_func_from_str(s: &str) -> OpFunc {
         "sum" => OpFunc::Sum,
         "max" => OpFunc::Max,
         "mean" => OpFunc::Mean,
+        // ⭐ WALL 12 — the nonstick twins of the seeded reduce (`summeanmaxexx2.ddl:39/:45`,
+        // exact `opFuncName` matches; matchDdl2Dsc compares the string EXACTLY,
+        // ddl_conversion.cpp:2117-2122, so these spellings are load-bearing wire names, never
+        // renamed). These arms MUST land before any assembler touches the names — this function
+        // panics on an unknown name rather than guessing, and the door derives the names from the
+        // IR's own combiner (`ReduceKind::nonstick_op_func`).
+        "sumnonstick" => OpFunc::SumNonStick,
+        "maxnonstick" => OpFunc::MaxNonStick,
         // The ONLY runtime-supported spelling: plain `exx2` maps to `OpFuncs::EXX2` →
         // exx2_fwd.smc (updatelibrary.cpp). The `exx2_zeromean` spelling ddc can rewrite to
         // is a distinct enum with NO smc-table entry — see `exx2_consts`' doc.
@@ -6505,13 +7375,19 @@ fn sfp_constant_table(folds: &SdscFoldSet) -> serde_json::Value {
 /// `assemble_pointwise` emits no coordinateMasking_ (guard #3, pointwise twin).
 pub(crate) fn check_pointwise_cols(
     cols: u32,
+    df: Df,
     what: &str,
     out_id: u32,
 ) -> Result<(), SuperDscError> {
-    if !cols.is_multiple_of(FP16_ELEMS_PER_STICK) {
+    // ⭐ WALL 13 — the stick law at the DATA'S OWN df: an f32 op's columns are multiple of the
+    // 32-lane IEEE_FP32 stick, an f16 op's of the 64-lane SEN169 one (`Df::elems_per_stick`,
+    // the same single source every door reads).
+    let stick = df.elems_per_stick();
+    if !cols.is_multiple_of(stick) {
         return Err(SuperDscError(format!(
-            "{what} t{out_id}: cols={cols} not a multiple of the {FP16_ELEMS_PER_STICK}-fp16 \
-             stick (assemble_pointwise emits no coordinateMasking_) — pad cols"
+            "{what} t{out_id}: cols={cols} not a multiple of the {stick}-lane {} stick \
+             (assemble_pointwise emits no coordinateMasking_) — pad cols",
+            df.name()
         )));
     }
     Ok(())
@@ -6562,7 +7438,7 @@ mod indirect_access_baseline {
         let op = matmul_opspec(384, 384, 64, 16, "Tensor0", "Tensor1", "Tensor2")
             .expect("a 384x384x64 batch-16 fp16 matmul is a legal OpSpec");
         let folds = SdscFoldSet::new(op.iter.cores_used());
-        let sdsc = emit_sdsc("MatMul_0", &op, &folds, None).expect("emit_sdsc accepts it");
+        let (sdsc, _) = emit_sdsc("MatMul_0", &op, &folds, None).expect("emit_sdsc accepts it");
         let json = serde_json::to_string(&sdsc).expect("SdscOp serializes");
         (sdsc, json)
     }
@@ -6801,8 +7677,16 @@ mod gather_cut {
         // so the table and output are declared at the node's own `[rows, 4096]` — embedding_granite's
         // extents. The `[1,1]` scale keeps `rbo`: one RedStick IS its whole swept window.
         let scale = rbo("t4294967275");
-        let table = rb("t1", rows, COLS);
-        let out = rb("t2", rows, COLS);
+        let table = rb(
+            "t1",
+            RowCount::of_token_rows(rows),
+            BlockCols::of_feature_cols(COLS),
+        );
+        let out = rb(
+            "t2",
+            RowCount::of_token_rows(rows),
+            BlockCols::of_feature_cols(COLS),
+        );
         let t = tile(rows);
         let mut sid = 0i64;
         assemble_pointwise_broadcast_gather(
@@ -7000,7 +7884,11 @@ mod gather_cut {
         let scale = rbo("t4294967275");
         // TRUE shape (`[cap()*2, 4096]`, covering both legs below): the input mint must not fire
         // before the one-stick ceiling this test exists to pin.
-        let table = rb("t1", cap() * 2, COLS);
+        let table = rb(
+            "t1",
+            RowCount::of_token_rows(cap() * 2),
+            BlockCols::of_feature_cols(COLS),
+        );
         let ins = [In::scalar(&scale).ew(), In::full(&table).ew()];
         let two = tile(cap() * 2);
         let mut sid = 0i64;
@@ -7220,17 +8108,31 @@ mod time_tiled_broadcast_operand_is_address_stable {
 
     /// The failing op itself, verbatim: `tscdiv` = realdiv(x, cap), x full, cap `[1,1]` broadcast.
     fn tscdiv() -> EmittedOp {
-        let x = rb("tsc_x", ROWS, COLS);
-        let cap = rb("tsc_cap", 1, Fp16::ELEMS_PER_STICK);
-        let out = rb("tsc_o", ROWS, COLS);
-        assemble_pointwise_broadcast_off(
-            "tscdiv_t2326",
-            "realdiv",
+        let x = rb(
+            "tsc_x",
             RowCount::of_token_rows(ROWS),
             BlockCols::of_feature_cols(COLS),
-            &[In::full(&x).ew(), In::scalar(&cap).ew()],
-            &out,
-            crate::addr::DevOff::ZERO,
+        );
+        let cap = rb(
+            "tsc_cap",
+            RowCount::of_broadcast_row(),
+            BlockCols::of_one_stick(Lanes::FP16),
+        );
+        let out = rb(
+            "tsc_o",
+            RowCount::of_token_rows(ROWS),
+            BlockCols::of_feature_cols(COLS),
+        );
+        assemble_pointwise_broadcast_off(
+            PointwiseFacts {
+                op_name: "tscdiv_t2326",
+                op_func: "realdiv",
+                rows: RowCount::of_token_rows(ROWS),
+                cols: BlockCols::of_feature_cols(COLS),
+                inputs: &[In::full(&x).ew(), In::scalar(&cap).ew()],
+                o: &out,
+                out_offset: crate::addr::DevOff::ZERO.into(),
+            },
             &mut 0i64,
             None,
         )
@@ -7337,17 +8239,31 @@ mod time_tiled_mb_operand_advances_per_trip {
     /// realdiv(x, gamma): x full `[rows, cols]`, gamma an `In::mb` `[1, cols]` row
     /// vector — broadcast over ROWS, ACTIVE over cols (the rmsnorm-gamma form).
     fn mbdiv() -> EmittedOp {
-        let x = rb("mb_x", ROWS, COLS);
-        let gamma = rb("mb_gamma", 1, COLS);
-        let out = rb("mb_o", ROWS, COLS);
-        assemble_pointwise_broadcast_off(
-            "mbdiv_t2326",
-            "realdiv",
+        let x = rb(
+            "mb_x",
             RowCount::of_token_rows(ROWS),
             BlockCols::of_feature_cols(COLS),
-            &[In::full(&x).ew(), In::mb(&gamma).ew()],
-            &out,
-            crate::addr::DevOff::ZERO,
+        );
+        let gamma = rb(
+            "mb_gamma",
+            RowCount::of_broadcast_row(),
+            BlockCols::of_feature_cols(COLS),
+        );
+        let out = rb(
+            "mb_o",
+            RowCount::of_token_rows(ROWS),
+            BlockCols::of_feature_cols(COLS),
+        );
+        assemble_pointwise_broadcast_off(
+            PointwiseFacts {
+                op_name: "mbdiv_t2326",
+                op_func: "realdiv",
+                rows: RowCount::of_token_rows(ROWS),
+                cols: BlockCols::of_feature_cols(COLS),
+                inputs: &[In::full(&x).ew(), In::mb(&gamma).ew()],
+                o: &out,
+                out_offset: crate::addr::DevOff::ZERO.into(),
+            },
             &mut 0i64,
             None,
         )
@@ -7409,6 +8325,48 @@ mod time_tiled_mb_operand_advances_per_trip {
             g1 > g0,
             "the mb operand moved {g0:#x} → {g1:#x}: it must ADVANCE — each trip reads its \
              own out-window of the row, unlike the address-stable scalar broadcast"
+        );
+    }
+}
+
+/// ⭐ THE FactsMatchBindings WITNESS, PINNED AT THE STAMP: `EmittedOp::new` refuses a
+/// facts/bindings length mismatch BY NAME before stamping anything. The door resolves
+/// one fact per spec operand; a parallel-array mismatch here would silently stamp one
+/// operand's resolution onto another's binding (the exact drift class records 53 and
+/// 54 paid for), so it is a build-time panic, never an unchecked zip.
+#[cfg(test)]
+mod facts_match_bindings_witness {
+    use super::*;
+
+    /// Emit a real three-operand matmul through the door, then re-stamp it with a
+    /// TRUNCATED facts list — the shape only an internal defect can produce.
+    #[test]
+    #[should_panic(
+        expected = "EmittedOp factless: the door resolved 1 operands but the op binds 3 \
+                    (FactsMatchBindings witness)"
+    )]
+    fn a_facts_bindings_length_mismatch_panics_naming_the_op() {
+        let op =
+            crate::ir::bridge::tiled_op_sdsc_op::matmul_opspec(64, 64, 64, 1, "tA", "tW", "tO")
+                .expect("a small matmul is a legal OpSpec");
+        let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
+        let (inner, facts) =
+            emit_sdsc("factless", &op, &folds, None).expect("the small matmul emits");
+        assert_eq!(
+            facts.len(),
+            op.args.len(),
+            "the fixture premise: the door resolved one fact per operand"
+        );
+        // The mismatch: 1 fact for 3 operands. The panic must name the OP and state
+        // both counts before any binding is stamped.
+        let _ = EmittedOp::new(
+            "factless".to_string(),
+            inner,
+            &op.args,
+            &op.iter,
+            1,
+            vec![std::collections::BTreeMap::new(); op.args.len()],
+            &facts[..1],
         );
     }
 }

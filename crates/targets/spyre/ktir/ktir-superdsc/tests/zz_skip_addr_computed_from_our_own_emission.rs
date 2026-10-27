@@ -84,7 +84,7 @@ fn dsc_and_node<'a>(
 fn the_instrument_reproduces_a_known_product() {
     let op = matmul_opspec(384, 384, 64, 16, "Tensor0", "Tensor1", "Tensor2").expect("a matmul");
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    let e = superdsc::emit_sdsc("MatMul_0", &op, &folds, None).expect("emits");
+    let (e, _) = superdsc::emit_sdsc("MatMul_0", &op, &folds, None).expect("emits");
     let j = serde_json::to_value(&e).unwrap();
     let (dsc, node) = dsc_and_node(&j, "MatMul_0", 0);
 
@@ -116,195 +116,96 @@ fn the_instrument_reproduces_a_known_product() {
     );
 }
 
-/// ⭐⭐⭐⭐⭐ THE SHIPPED GATHER-COPY'S `skip_addr` **IS ONE POOL STICK BLOCK** — dxp's own derivation, run
-/// over our own emitted JSON, against the pool's own `stick_block_elems`.
+/// ⭐⭐⭐⭐⭐ `skip_addr` OVER THE **SHIPPED** COPY — `batched_gathered::copy_opspecs`, the copy legs the
+/// batched gathered dot emits for every decode attention's gathered K/V (and the MoE gather-dot), at
+/// the pool's own entry unit.
 ///
-/// ⛔ THIS IS THE ONE NUMBER THE WHOLE GATHER HANGS ON AND THE CARD CANNOT CHECK IT. `skip_addr` is the
-/// HBM distance between consecutive index entries; the host stages entries as global stick-block numbers
-/// (`gather_entries_per_page` divides a page by `stick_block_bytes`), so if the derived distance is
-/// anything else, every index step lands a fraction of a block off — a clean bake producing fluent text
-/// from inside the previous block, with every counter green.
+/// Two facts, from the one emission, for EVERY leg:
+/// 1. `skip_addr` is ONE SLAB BLOCK (`POOL_STICK²` = 4096 elements) at EVERY head dim — the unit
+///    `GatherEntry::of_slab_block` counts the host's entries in and `gather_entries_per_page` divides a
+///    page by, so the host's entry and the card's address are one derivation rather than two. A copy
+///    whose derived stride is anything else lands every index step a fraction of a block off — a clean
+///    bake producing fluent text from another block, with every counter green.
+/// 2. The leg is planned onto MORE THAN ONE CORE, and one core's double-buffered chunk fits LX. A
+///    pinned axis holding one entry admits no core split, and dxp then measures that one core's
+///    double-buffered chunk against LX — the bake refusal 'The initial chunk parameters must fit in LX
+///    for SuperDSC' (`L3DlOpsScheduler.cpp:1534`, gated on `isDoubleBuffering`).
 ///
-/// ⛔ AND IT IS A FUNCTION OF THE WORK DIVISION, WHICH IS WHY THE GEOMETRY HERE IS THE REAL ONE. dxp
-/// clamps the pinned axis to `min(per_core_extent, page)`, so a split that hands a core fewer than `page`
-/// positions SHRINKS the entry. Measured at the two widths that bracket the effect: bs=8 (64 entries, the
-/// split lands on 32 cores at 2 entries each) and bs=2 (16 entries), where an `mb`-position split rather
-/// than an ENTRY split would halve `skip_addr`.
+/// ⭐ SWEPT OVER `nkvh` × `hd` AND THE BATCH, because the per-head-dim stick-block unit this file used
+/// to pin (`hd · POOL_STICK`) coincides with the slab block at exactly one point — hd 64 — which is how
+/// a hd-128 stride error stays invisible to a single-geometry measurement. Every leg of a multi-leg
+/// copy (an entry count past one index stick) must derive the same stride.
 #[test]
-fn the_shipped_gather_copys_skip_addr_is_one_pool_stick_block() {
-    use ktir_superdsc::sdsc_abstract::{
-        GatherScratch, PagedKvPool, QueryRowCount, SlotCount, SlotWindow,
-    };
-    let pool = PagedKvPool::new(NKVH as usize, HD as usize);
-    for mq in [2u32, 8] {
-        for swept in [64u32, 128, 256] {
-            let scratch = GatherScratch::of_fold_pass(
-                pool,
-                SlotWindow::count_in(SlotCount::new(swept)),
-                QueryRowCount::of_mq(mq),
-            )
-            .expect("granite's geometry admits the flat copy");
-            // ⭐ ONE COPY OF THE PASS, NOT THE PASS — `scratch.copies()` cuts it into one op per index
-            // stick and every one of them has the same `skip_addr`, because `skip_addr` is
-            // `page × the per-core extents of the UNPINNED dims` and the cut only shortens `mb`, the
-            // pinned one. Measuring the first run is therefore measuring all of them, and it is the only
-            // shape that exists: a whole-pass copy is refused at build (`CopyDims::ENTRIES_PER_OP`).
-            let cp = scratch
-                .copies()
-                .next()
-                .expect("a pass has at least one run");
-            let op = ktir_superdsc::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
-                "Tensor0",
-                "Tensor2",
-                ktir_superdsc::superdsc_opspec::GatherIndex::of_scratch_rows(
-                    "BlockTable".to_string(),
-                    PageExtent::of_positions(scratch.entry_page()),
-                    cp.index_base(),
-                ),
-                ktir_superdsc::sdsc_abstract::GatherCopySpec {
-                    rows: cp.dims().mb(),
-                    cols: ktir_superdsc::sdsc_abstract::POOL_STICK,
-                    df: ktir_superdsc::superdsc_opspec::Df::Fp16,
-                    // Global block numbers — no source base.
-                    run: ktir_superdsc::superdsc_opspec::GatherRun::split(
-                        ktir_superdsc::superdsc_opspec::DestEntry::of_entries(cp.dest_entry()),
-                        0,
-                    ),
-                    // The copy's own stated destination — the mint bounds this run's window against it.
-                    dest: cp.dest(),
-                },
-            )
-            .expect("the gather-copy op builds");
-            let value_idx = op.indirect.expect("a declared gather").value;
-            let folds = SdscFoldSet::new(op.iter.cores_used());
-            let e = superdsc::emit_sdsc("Gather_0", &op, &folds, None).expect("emits");
-            let j = serde_json::to_value(&e).unwrap();
-            let (dsc, node) = dsc_and_node(&j, "Gather_0", value_idx);
-            let got = skip_addr_elems(dsc, node).expect("derivable");
-            assert_eq!(
-                got,
-                pool.stick_block_elems() as i64,
-                "mq={mq} swept={swept}: skip_addr must be ONE pool stick block \
-                 ({} elems) — the unit the host's entries are counted in. Got {got}, so every index \
-                 step would land {} of a block off.",
-                pool.stick_block_elems(),
-                got as f64 / pool.stick_block_elems() as f64,
-            );
-            // And the entry is exactly the scratch's row, which is what the matmul's `y` steps.
-            assert_eq!(
-                got as u32,
-                scratch.cols(),
-                "the entry and the scratch's block must be one number"
-            );
-        }
-    }
-}
-
-/// ⭐⭐⭐⭐⭐ THE SAME DERIVATION OVER THE **SHIPPED** DOOR — [`PageScratch`], the one the decode batch
-/// actually emits.
-///
-/// ⛔⛔⛔ AND THIS IS THE TEST THAT WAS MISSING, WHICH IS WHY A PLANE-SIZED PIN SHIPPED. The measurement
-/// above is over [`GatherScratch`] — the window-granular door, which the batched path stopped emitting
-/// when the gather went page-granular. It stayed GREEN while the live door's pin was a whole page PLANE,
-/// i.e. `nkvh * PAGE_SLOTS / POOL_STICK` = 32× the unit the host's entries are counted in. A green test
-/// over a dead door is not coverage; it is a divergence pinned as correct.
-///
-/// Two facts, from the one emission:
-/// 1. `skip_addr` is ONE POOL STICK BLOCK — the unit `gather_entries_per_page` counts in, so the host's
-///    entry and the card's address are one derivation rather than two.
-/// 2. The op's work division admits MORE THAN ONE CORE. That is not a performance property: a pinned axis
-///    with one entry gives dxp one core, whose double-buffered chunk is then measured against LX and
-///    refused at bake (`L3DlOpsScheduler.cpp:1534`, `isDoubleBuffering`).
-#[test]
-fn the_shipped_page_gather_copys_skip_addr_is_one_pool_stick_block() {
-    use ktir_superdsc::sdsc_abstract::{PageScratch, PagedKvPool, QueryRowCount};
-    // ⭐⭐⭐⭐⭐ SWEPT OVER `nkvh` x `hd`, BECAUSE `skip_addr` IS `hd * POOL_STICK` AND THE PIN IS `hd`
-    // SUB-ROWS — two quantities that are BOTH `POOL_STICK` at hd=64 and neither of them at hd=128. This
-    // measurement was taken at the single point (nkvh=8, hd=64) where the pin, the stick and the IBR
-    // width all read 64/32, which is precisely how "the pin is one stick" and "the pin is `hd`" stayed
-    // indistinguishable. `nkvh` is swept too: at nkvh>8 a request's run exceeds one IBR stick, so the
-    // pass is several ops per request and EVERY one of them must still derive this same `skip_addr`.
+fn the_shipped_gather_copys_skip_addr_is_one_slab_block() {
+    use ktir_superdsc::emit::batched_gathered::{BatchedGathered, copy_opspecs};
+    use ktir_superdsc::sdsc_abstract::{POOL_STICK, PagedKvPool};
     for (nkvh, hd) in [
-        (8i64, 64i64),
+        (8u32, 64u32),
         (8, 128),
         (8, 256),
         (4, 128),
         (16, 128),
         (32, 64),
     ] {
-        let pool = PagedKvPool::new(nkvh as usize, hd as usize);
-        for mq in [2u32, 8] {
-            let scratch = PageScratch::of_pass(pool, QueryRowCount::of_mq(mq))
-                .expect("granite's geometry admits the page copy");
-            for cp in scratch.copies() {
-                let op = ktir_superdsc::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
-                    "Tensor0",
-                    "Tensor2",
-                    ktir_superdsc::superdsc_opspec::GatherIndex::of_scratch_rows(
-                        "BlockTable".to_string(),
-                        PageExtent::of_positions(
-                            u32::try_from(scratch.entry_page()).expect("a stick-sized pin"),
-                        ),
-                        cp.index_base(),
-                    ),
-                    ktir_superdsc::sdsc_abstract::GatherCopySpec {
-                        rows: cp.dims().mb(),
-                        cols: ktir_superdsc::sdsc_abstract::POOL_STICK,
-                        df: ktir_superdsc::superdsc_opspec::Df::Fp16,
-                        // Global block numbers — no source base.
-                        run: ktir_superdsc::superdsc_opspec::GatherRun::split(
-                            ktir_superdsc::superdsc_opspec::DestEntry::of_entries(cp.dest_entry()),
-                            0,
-                        ),
-                        // The copy's own stated destination — the mint bounds this run's window against it.
-                        dest: cp.dest(),
-                    },
-                )
-                .expect("the page gather-copy op builds");
+        let pool = PagedKvPool::new(nkvh, hd);
+        let block = pool.slab_block_elems() as u32;
+        assert_eq!(
+            block,
+            POOL_STICK * POOL_STICK,
+            "the slab block is POOL_STICK² at hd={hd}"
+        );
+        // A decode-attention gathered operand: one gathered row per (entry, batch row), each a
+        // `[STK, STK]` slab block — the batched frame `[batch, STK, STK]` over `entries` entries.
+        for entries in [32u32, 64, 96] {
+            let bg = BatchedGathered::of(
+                &[entries as i64, 4, POOL_STICK as i64],
+                &[entries as i64, POOL_STICK as i64, POOL_STICK as i64],
+                entries,
+                block,
+            )
+            .expect("a slab-block gathered dot is a batched gathered geometry");
+            let legs = copy_opspecs(
+                &bg,
+                "Tensor0",
+                "BlockTable",
+                "Tensor2",
+                ktir_superdsc::superdsc_opspec::EntryBase::ZERO,
+            )
+            .expect("the shipped copy builds");
+            assert_eq!(
+                legs.len() as u32,
+                entries.div_ceil(ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP),
+                "one leg per index stick"
+            );
+            for (leg, op) in legs.iter().enumerate() {
+                let name = format!("Gather_{leg}");
                 let value_idx = op.indirect.expect("a declared gather").value;
                 let cores = op.iter.cores_used().get();
                 let folds = SdscFoldSet::new(op.iter.cores_used());
-                let e = superdsc::emit_sdsc("PageGather_0", &op, &folds, None).expect("emits");
+                let (e, _) = superdsc::emit_sdsc(&name, op, &folds, None).expect("emits");
                 let j = serde_json::to_value(&e).unwrap();
-                let (dsc, node) = dsc_and_node(&j, "PageGather_0", value_idx);
+                let (dsc, node) = dsc_and_node(&j, &name, value_idx);
                 let got = skip_addr_elems(dsc, node).expect("derivable");
                 assert_eq!(
                     got,
-                    pool.stick_block_elems() as i64,
-                    "nkvh={nkvh} hd={hd} mq={mq}: the SHIPPED copy's skip_addr must be ONE pool stick \
-                 block ({} elems) — the unit the host's entries are counted in. Got {got}, i.e. {}× \
-                 off, which lands every index step inside a different page with a clean bake.",
-                    pool.stick_block_elems(),
-                    got as f64 / pool.stick_block_elems() as f64,
-                );
-                // ⭐ AND IT IS `hd * POOL_STICK`, SPELLED AGAINST `hd` — the pin is `hd` sub-rows and the
-                // derived stride is `pin * out`, so at hd=128 both DOUBLE and neither is the stick.
-                assert_eq!(
-                    got,
-                    hd * ktir_superdsc::sdsc_abstract::POOL_STICK as i64,
-                    "nkvh={nkvh} hd={hd} mq={mq}: skip_addr is `hd * POOL_STICK`, a quantity that MOVES \
-                 with the head dim — it equals POOL_STICK² only at hd=64"
+                    i64::from(block),
+                    "nkvh={nkvh} hd={hd} entries={entries} leg={leg}: the shipped copy's skip_addr must \
+                     be ONE slab block ({block} elems) — the unit the host's entries are counted in. \
+                     Got {got}, i.e. {}x off, which lands every index step inside another block.",
+                    got as f64 / f64::from(block),
                 );
                 assert!(
                     cores > 1,
-                    "nkvh={nkvh} hd={hd} mq={mq}: the copy is planned onto {cores} core(s). A pinned axis \
-                 holding ONE entry admits no core split, and dxp then measures that one core's \
-                 double-buffered chunk against LX — which is the bake refusal 'The initial chunk \
-                 parameters must fit in LX for SuperDSC' (L3DlOpsScheduler.cpp:1534)."
+                    "nkvh={nkvh} hd={hd} entries={entries} leg={leg}: the copy is planned onto {cores} \
+                     core(s); a pinned axis holding one entry admits no core split, and dxp then \
+                     refuses the one core's double-buffered chunk at bake"
                 );
-                // ⭐ AND THE PER-CORE DOUBLE-BUFFERED CHUNK FITS LX, measured from the op's OWN planned core
-                // count rather than from the 2048-sub-row ceiling the LX refusal was once read as. Source +
-                // destination, twice over for double buffering.
-                let per_core_bytes = (cp.dims().mb() as u64 / cores as u64)
-                    * ktir_superdsc::sdsc_abstract::POOL_STICK as u64
-                    * 2
-                    * 4;
+                let per_core_bytes =
+                    (op.iter.extent("mb") as u64 / cores as u64) * POOL_STICK as u64 * 2 * 4;
                 assert!(
                     per_core_bytes <= ktir_superdsc::superdsc_opspec::USABLE_LX_BYTES,
-                    "nkvh={nkvh} hd={hd} mq={mq}: one core's double-buffered chunk is {per_core_bytes} B \
-                 over {} cores, against LX's {} B. `getInitialChunkParams` starts from the CORE data \
-                 stage, so this — not the op's whole footprint — is what dxp measures.",
-                    cores,
+                    "nkvh={nkvh} hd={hd} entries={entries} leg={leg}: one core's double-buffered chunk \
+                     is {per_core_bytes} B over {cores} cores, against LX's {} B",
                     ktir_superdsc::superdsc_opspec::USABLE_LX_BYTES,
                 );
             }
@@ -363,7 +264,7 @@ fn pinning_the_entry_dim_makes_skip_addr_one_entrys_size() {
     .expect("the gather-copy op builds");
     let value_idx = op.indirect.expect("a declared gather").value;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    let e = superdsc::emit_sdsc("Gather_0", &op, &folds, None).expect("emits");
+    let (e, _) = superdsc::emit_sdsc("Gather_0", &op, &folds, None).expect("emits");
     let j = serde_json::to_value(&e).unwrap();
     let (dsc, node) = dsc_and_node(&j, "Gather_0", value_idx);
 
@@ -455,7 +356,7 @@ fn the_two_pins_hd_128_needs_derive_the_two_window_strides_the_pool_has() {
     use ktir_superdsc::superdsc_opspec::{EntryBase, GatherIndex};
 
     const HD_8B: i64 = 128;
-    let pool = PagedKvPool::new(NKVH as usize, HD_8B as usize);
+    let pool = PagedKvPool::new(NKVH as u32, HD_8B as u32);
     // The two strides, from the pool — not spelled as 8192/4096.
     let kt_window = pool.stick_block_elems() as i64;
     let v_window = (POOL_STICK * POOL_STICK) as i64;
@@ -499,7 +400,7 @@ fn the_two_pins_hd_128_needs_derive_the_two_window_strides_the_pool_has() {
         .expect("the gather-copy op builds at both pins");
         let value_idx = op.indirect.expect("a declared gather").value;
         let folds = SdscFoldSet::new(op.iter.cores_used());
-        let e = superdsc::emit_sdsc("Gather_0", &op, &folds, None).expect("emits");
+        let (e, _) = superdsc::emit_sdsc("Gather_0", &op, &folds, None).expect("emits");
         let j = serde_json::to_value(&e).unwrap();
         let (dsc, node) = dsc_and_node(&j, "Gather_0", value_idx);
         let got = skip_addr_elems(dsc, node).expect("derivable");

@@ -129,6 +129,12 @@ pub const NUM_SEGMENTS: usize = 7;
 /// `audit_layout_addresses`.
 pub const MAX_SEGMENT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
+/// ⭐ THE PAGE-PART LAW'S TYPES — which page of a multi-page window a launch group addresses
+/// ([`PagePart`]), and the slot count it carries ([`Slots`], the newtype no raw scalar crosses).
+/// Re-exported here because the proc-macro's generated literal rebuilds a part through
+/// [`PagePart::at_slots`] under this crate's path, and because [`KvShifts::part`] is public in
+/// it: a field's type is part of the crate's surface whether or not it is named.
+pub use ktir_superdsc::page_part::{PagePart, Slots};
 /// ⭐ THE OPERAND IDENTITY — declared in the lowering's own scratchy-free leaf and re-exported here,
 /// so every `bundle::PlaceId` / `bundle::SynthRole` path in the tree resolves unchanged. See
 /// [`ktir_superdsc::place`] for both types and for why a [`SynthRole`] belongs to the lowering that
@@ -140,6 +146,10 @@ pub const MAX_SEGMENT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 /// Recorded rather than reworded: the rule stands as written, and this note is the exception it does
 /// not name.
 pub use ktir_superdsc::place::{PlaceId, SynthRole};
+/// ⭐ The write-cover law — what a bind may leave unwritten in its placement. Declared beside
+/// [`PlaceId`] for the same reason: the bake mints it where the placement's geometry is computed,
+/// and every runtime bind door reads it. See [`ktir_superdsc::placement::BindCover`] for the law.
+pub use ktir_superdsc::placement::BindCover;
 /// The segment budget's verdict on the weight tail, declared beside the producer's layout for the
 /// same reason as [`PlaceId`]: both ends read the one type.
 pub use ktir_superdsc::placement::WeightTail;
@@ -173,6 +183,9 @@ pub struct Placement {
     pub offset: u64,
     /// Byte size.
     pub size: u64,
+    /// ⭐ WHAT A BIND MAY LEAVE UNWRITTEN — the write-cover law, minted at the placement's
+    /// construction and consulted by every runtime bind door. See [`BindCover`].
+    pub cover: BindCover,
     /// This is the graph result read back each step (`SegRole::Logits`).
     pub is_logits: bool,
 }
@@ -194,6 +207,61 @@ pub struct KernelWeight<'a> {
     pub stick_size: u32,
     /// Bytes per element (2 for fp16, 1 for fp8/int8).
     pub word_length: u32,
+}
+
+/// ⭐ HOW one step input's host bytes become the device's — the staging law, baked as DATA.
+///
+/// One variant per staging channel the runtime actually has; the bake maps the program's own
+/// element-format statement onto this and REFUSES a format with no channel (fail-closed: a new
+/// format gains a variant only when its channel exists, in the same commit).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepInputStage {
+    /// IEEE f16 bytes, narrowed to SEN169 by the shadow write — the `bind_input` channel.
+    IeeeF16,
+    /// Little-endian u32 entries copied verbatim, no conversion — the `bind_input_raw` channel
+    /// (a gather's index table: an int32 tensor has no fp16 encoding to survive the narrowing).
+    RawU32,
+}
+
+/// One host-staged step input as the bake states it: WHICH tensor, addressed by WHICH slot, and
+/// staged through WHICH channel. The slot is the caller's handle — the one numbering law
+/// (`step_input_tid(n_graph_tensors, slot)`) minted the tid, and the runtime never re-derives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StepInput {
+    /// The device tensor id — its placement is in [`BundleLayout::places`].
+    pub tid: u32,
+    /// The slot the numbering law gave that tid; the runtime's ADDRESS for this input.
+    pub slot: u32,
+    pub stage: StepInputStage,
+}
+
+/// The fill's own answer for one step input: everything a launch needs to stage it, measured
+/// against the program's own statements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StepInputFill {
+    /// The tensor to bind — resolved through the discovery table, never recomputed.
+    pub place: PlaceId,
+    /// The placement's byte extent — the program's own `construct_memory_view` statement, sized
+    /// by the placement pass from that same view.
+    pub size: u64,
+    pub stage: StepInputStage,
+}
+
+/// ⭐ HOW one scale slot's host value becomes the device's — the staging law, baked as DATA.
+///
+/// One variant per staging channel the runtime actually has; the bake maps the registry's own
+/// df column onto this and REFUSES a format with no channel (fail-closed: a new format gains a
+/// variant only when its channel exists, in the same commit).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScaleStage {
+    /// One IEEE f16, the `f16(v)` image of the registry entry, narrowed by the const fill's
+    /// existing encode — the `[1,1]` `dynamic` channel `spyre_forward` has always written (the
+    /// staging-twin law: the value the card applies is `f16(v)`).
+    IeeeF16,
+    /// The registry entry's RAW little-endian IEEE f32 word (4 B), staged verbatim — the
+    /// `TensorBytes` channel the f32 m-merge's constants need (an f32 value the f16 fill would
+    /// silently narrow to its image, which is wrong bits at a word-length-4 slot).
+    IeeeF32,
 }
 
 /// The whole-bundle memory plan.
@@ -223,6 +291,12 @@ pub struct BundleLayout<'a> {
     /// `scalarmul_scale_tid(i)`, which the worker binds as a `[1,1]` const so the on-device
     /// pointwise `mul` gets its real multiplier (unbound = 0 = wrong output).
     pub scalarmul_scales: Cow<'a, [f32]>,
+    /// ⭐ EACH SCALE SLOT'S STAGING CHANNEL, parallel to [`Self::scalarmul_scales`]: entry `i`
+    /// says HOW the worker stages `scalarmul_scales[i]` at `scalarmul_scale_tid(i)` — the f16
+    /// `[1,1]` const fill or the raw f32 word. The bake maps the registry's own df column onto
+    /// this, so the runtime never re-derives what a program stated; the two lists are parallel
+    /// by construction and one length.
+    pub scalarmul_scales_stage: Cow<'a, [ScaleStage]>,
     /// ⭐ THE SCALARMUL WEIGHT FOLDS — `(weight tensor id, multiplier)`: the compile-time
     /// multipliers that commuted into their matmul's weight and so never became device ops.
     /// The worker multiplies each listed weight's STAGED fp16 bytes by its multiplier at load
@@ -251,6 +325,58 @@ pub struct BundleLayout<'a> {
     /// pins, and `chunk_gather_index_table` passes it beside [`Self::lx_op_local_bytes`] so the
     /// host refuses exactly what the bake refused. 0 for a bundle whose chunk form mints none.
     pub lx_prob_pin_bytes: u64,
+    /// ⭐ THE HOST-STAGED STEP INPUTS — the discovery table, baked as data: which tid each slot
+    /// took, and which staging channel narrows its bytes. The runtime resolves a slot through
+    /// THIS table ([`Self::step_input_fill`]) and never recomputes the producer's
+    /// `tensors.len()+k` numbering; the placements the tids carry are in [`Self::places`],
+    /// beside every other placement. Empty for every bundle no spliced program stated inputs
+    /// past the graph for, which keeps those bundles byte-identical.
+    pub step_inputs: Cow<'a, [StepInput]>,
+}
+
+impl<'a> BundleLayout<'a> {
+    /// ⭐⭐⭐ THE FILL'S OWN ANSWER for step-input `slot`, measured against `len` host bytes.
+    ///
+    /// This is the runtime half of the host-staged step inputs, and it is ONE question with
+    /// three refusals, all naming the buffer:
+    /// - the slot must be one this bundle's discovery table DECLARES — a caller asking for an
+    ///   input the bake never stated is a caller/bake disagreement, not an empty buffer;
+    /// - the table's tid must be one this bundle PLACED — the placement pass wrote both halves
+    ///   from one statement, so a tid with a row and no placement is a bake desync;
+    /// - the bytes must fill the placement EXACTLY — `==`, deliberately stricter than the
+    ///   over-bind `>` law the other channels keep: a per-step input is staged whole every step
+    ///   (there is no broadcast form of a page table), so a short fill leaves the PREVIOUS
+    ///   step's entries for the program to read — stale block numbers, silently valid.
+    pub fn step_input_fill(&self, slot: u32, len: usize) -> Result<StepInputFill, String> {
+        let Some(si) = self.step_inputs.iter().find(|s| s.slot == slot) else {
+            let declared: Vec<u32> = self.step_inputs.iter().map(|s| s.slot).collect();
+            return Err(format!(
+                "step input slot {slot}: this bundle's discovery table declares slots \
+                 {declared:?} — the caller asked for a per-step input this bake never stated"
+            ));
+        };
+        let Some(p) = self.place_of_tid(si.tid) else {
+            return Err(format!(
+                "step input slot {slot} (t{}): the discovery table names a tid this bundle \
+                 never placed — the placement pass records both halves from one statement, so \
+                 this is a bake desync",
+                si.tid
+            ));
+        };
+        if len as u64 != p.size {
+            return Err(format!(
+                "step input slot {slot} (t{}): {len} B staged for a {} B placement — a \
+                 per-step input is staged WHOLE every step, so a short fill leaves the previous \
+                 step's entries for the program to read",
+                si.tid, p.size
+            ));
+        }
+        Ok(StepInputFill {
+            place: PlaceId::Act(si.tid),
+            size: p.size,
+            stage: si.stage,
+        })
+    }
 }
 
 impl<'a> BundleLayout<'a> {
@@ -343,11 +469,13 @@ pub struct KvShifts {
     pub page_slots: u32,
     /// Which request's KV this group addresses (batched decode). `0` when unbatched.
     pub request: u32,
-    /// Slots past the launch's write cursor where this group's KV starts — a whole number of pages,
-    /// non-zero only for a later PAGE PART of a prefill window wider than one page. The runtime resolves
-    /// the group's page at `cursor + slot_offset` through the request's block table, and SKIPS the group
-    /// when the request holds no such page. `0` for every other group.
-    pub slot_offset: u32,
+    /// ⭐ WHICH PAGE OF A MULTI-PAGE WINDOW THIS GROUP ADDRESSES — a
+    /// [`PagePart`](ktir_superdsc::page_part::PagePart), read off the group's own first trip by
+    /// the launch index (the value the fusion walk compared), never off the owner op, so the
+    /// group's shift and its members' parts are ONE value. The runtime resolves the group's page
+    /// at `cursor + part` through the request's block table, and SKIPS the group when the request
+    /// holds no such page. The cursor part for every other group.
+    pub part: ktir_superdsc::page_part::PagePart,
     /// This is the group the runtime re-launches once per page of resident KV.
     pub page_fold: bool,
     /// The fold's kernels carry the request axis, so one pass per PAGE suffices instead of one per
@@ -360,6 +488,15 @@ pub struct KvShifts {
     /// also lets the passes collapse with no single pool stride (with [`Self::batched_requests`]); on a
     /// non-fold group it is the split-KV chunk's gather copies, launched once.
     pub gathered: bool,
+    /// ⭐ The STAGING CHANNEL — this group's gathered table is the FILL-STAGED REGION FORM
+    /// (`fill_attn_step_inputs`), not the composer's page-list table. `gathered` alone carries
+    /// both the addressing consequence (the zero shift) and the staging consequence (stage an
+    /// index table); a region-form group answers yes to the first and no to the second's
+    /// page-list spelling — its table is already staged by the host fill, and the composer must
+    /// not drive it as a chunk body. Both channels' entries are ABSOLUTE, so the zero shift is
+    /// correct for both; the page-list answer is `gathered && !region_form`. Meaningful only
+    /// when [`Self::gathered`].
+    pub region_form: bool,
     /// What one fold pass covers — see [`FoldRows`]. Meaningful only when [`Self::page_fold`].
     pub fold_rows: FoldRows,
 }
@@ -910,6 +1047,7 @@ mod tests {
                     bank: 0,
                     offset: 0,
                     size: 98304,
+                    cover: BindCover::Full,
                     is_logits: true,
                 },
                 Placement {
@@ -918,6 +1056,7 @@ mod tests {
                     bank: 0,
                     offset: 4096,
                     size: 2048,
+                    cover: BindCover::Full,
                     is_logits: false,
                 },
             ]),
@@ -938,6 +1077,146 @@ mod tests {
             "a synthetic must not answer for the tensor it derives from"
         );
         assert_eq!(l.places.iter().filter(|p| !p.id.is_bindable()).count(), 1);
+    }
+
+    /// ⭐⭐⭐ THE FILL RESOLVES A SLOT THROUGH THE BAKED TABLE — identity, extent, and staging
+    /// channel, all of them the bundle's own answers. The runtime never recomputes the producer's
+    /// numbering; it asks this one question and binds what comes back.
+    #[test]
+    fn a_step_input_fill_resolves_through_the_discovery_table() {
+        let l = BundleLayout {
+            places: Cow::Owned(vec![
+                Placement {
+                    id: PlaceId::Act(7),
+                    segment: 3,
+                    bank: 0,
+                    offset: 0,
+                    size: 1024,
+                    cover: BindCover::Full,
+                    is_logits: false,
+                },
+                Placement {
+                    id: PlaceId::Act(8),
+                    segment: 3,
+                    bank: 0,
+                    offset: 1024,
+                    size: 128,
+                    cover: BindCover::Full,
+                    is_logits: false,
+                },
+            ]),
+            step_inputs: Cow::Owned(vec![
+                StepInput {
+                    tid: 7,
+                    slot: 0,
+                    stage: StepInputStage::IeeeF16,
+                },
+                StepInput {
+                    tid: 8,
+                    slot: 1,
+                    stage: StepInputStage::RawU32,
+                },
+            ]),
+            ..BundleLayout::default()
+        };
+        assert_eq!(
+            l.step_input_fill(0, 1024),
+            Ok(StepInputFill {
+                place: PlaceId::Act(7),
+                size: 1024,
+                stage: StepInputStage::IeeeF16,
+            }),
+            "slot 0 answers with its own tid, extent and channel"
+        );
+        assert_eq!(
+            l.step_input_fill(1, 128),
+            Ok(StepInputFill {
+                place: PlaceId::Act(8),
+                size: 128,
+                stage: StepInputStage::RawU32,
+            }),
+            "slot 1 answers with its own tid, extent and channel"
+        );
+    }
+
+    /// ⛔ A SLOT THE BUNDLE NEVER DECLARED IS A REFUSAL THAT NAMES IT — a caller asking for an
+    /// input the bake never stated is a caller/bake disagreement, not an empty buffer, and the
+    /// refusal prints the slots that ARE declared so the disagreement is legible at the launch.
+    #[test]
+    fn an_undeclared_slot_is_refused_by_name() {
+        let l = BundleLayout {
+            step_inputs: Cow::Owned(vec![StepInput {
+                tid: 7,
+                slot: 0,
+                stage: StepInputStage::IeeeF16,
+            }]),
+            ..BundleLayout::default()
+        };
+        let Err(e) = l.step_input_fill(2, 8) else {
+            panic!("an undeclared slot is a refusal, not an empty answer");
+        };
+        assert!(
+            e.contains("slot 2") && e.contains("[0]"),
+            "the refusal names the slot asked for and the slots declared: {e}"
+        );
+    }
+
+    /// ⛔ A ROW WHOSE TID THE BUNDLE NEVER PLACED IS A BAKE DESYNC REFUSAL. The placement pass
+    /// writes the row and the placement from one statement, so a tid with a row and no placement
+    /// means the two halves of one bake disagreed — refused here rather than binding onto an
+    /// address nothing owns.
+    #[test]
+    fn a_row_without_its_placement_is_a_desync_refusal() {
+        let l = BundleLayout {
+            step_inputs: Cow::Owned(vec![StepInput {
+                tid: 7,
+                slot: 0,
+                stage: StepInputStage::IeeeF16,
+            }]),
+            ..BundleLayout::default()
+        };
+        let Err(e) = l.step_input_fill(0, 8) else {
+            panic!("a discovery row with no placement is a refusal, not a guess");
+        };
+        assert!(
+            e.contains("t7") && e.contains("desync"),
+            "the refusal names the tid and the defect: {e}"
+        );
+    }
+
+    /// ⛔ THE BYTES FILL THE PLACEMENT EXACTLY — `==`, deliberately stricter than the over-bind
+    /// `>` law the other channels keep. A per-step input is staged whole every step: a SHORT fill
+    /// leaves the previous step's entries for the program to read (stale block numbers, silently
+    /// valid), and a LONG one is the next tensor's bytes. Both directions refuse, naming the slot,
+    /// the tid, and both numbers.
+    #[test]
+    fn a_partial_fill_is_refused_in_both_directions() {
+        let l = BundleLayout {
+            places: Cow::Owned(vec![Placement {
+                id: PlaceId::Act(7),
+                segment: 3,
+                bank: 0,
+                offset: 0,
+                size: 128,
+                cover: BindCover::Full,
+                is_logits: false,
+            }]),
+            step_inputs: Cow::Owned(vec![StepInput {
+                tid: 7,
+                slot: 0,
+                stage: StepInputStage::RawU32,
+            }]),
+            ..BundleLayout::default()
+        };
+        for len in [64usize, 256] {
+            let Err(e) = l.step_input_fill(0, len) else {
+                panic!("a {len} B fill of a 128 B placement is a refusal");
+            };
+            assert!(
+                e.contains("staged WHOLE") && e.contains(&format!("{len} B")),
+                "the refusal names the law and the given number: {e}"
+            );
+        }
     }
 }
 
@@ -1028,8 +1307,6 @@ mod place_id_tests {
             Acc(0),
             LBlk(0),
             LAcc(0),
-            GatherKtLx(0),
-            GatherVLx(0),
             GatherKt,
             GatherV,
             ChunkSc,

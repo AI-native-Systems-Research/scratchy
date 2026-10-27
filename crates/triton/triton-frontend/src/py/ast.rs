@@ -236,14 +236,33 @@ impl Expr {
 /// [`crate::target::Target`], which is the compilation TARGET's policy switches.
 #[derive(Clone, Debug)]
 pub enum AssignTarget {
-    Name { id: String, pos: Pos },
-    Tuple { elts: Vec<AssignTarget>, pos: Pos },
+    Name {
+        id: String,
+        pos: Pos,
+    },
+    Tuple {
+        elts: Vec<AssignTarget>,
+        pos: Pos,
+    },
+    /// `name[expr]` — a COMPILE-TIME SEQUENCE SLOT, the one subscript form assignment
+    /// takes. Upstream Triton kernels accumulate split state this way (`accs[s] = ...`
+    /// inside a `tl.static_range`, the list-accumulator idiom the Python frontend traces
+    /// for free); the index must lower to a constant, and the base must resolve to a
+    /// `Val::Seq`, so the assignment is a REBIND of the whole sequence with one slot
+    /// replaced — never a tensor scatter.
+    Subscript {
+        base: Box<AssignTarget>,
+        index: Expr,
+        pos: Pos,
+    },
 }
 
 impl AssignTarget {
     pub fn pos(&self) -> Pos {
         match self {
-            AssignTarget::Name { pos, .. } | AssignTarget::Tuple { pos, .. } => *pos,
+            AssignTarget::Name { pos, .. }
+            | AssignTarget::Tuple { pos, .. }
+            | AssignTarget::Subscript { pos, .. } => *pos,
         }
     }
 }

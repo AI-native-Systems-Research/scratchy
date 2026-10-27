@@ -260,9 +260,17 @@ fn the_restickify_door_carries_a_one_dim_output_stick_for_the_same_relayout() {
         feats,
         // TRUE handles for the whole buffers the mint bounds each tile's flat run against — here a
         // `[64, 64]` pair, the exact tile.
-        &ktir_superdsc::emit::rb("k_nat", 64, 64),
+        &ktir_superdsc::emit::rb(
+            "k_nat",
+            ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(64),
+            ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(64),
+        ),
         DevOff::ZERO,
-        &ktir_superdsc::emit::rb("k_t", 64, 64),
+        &ktir_superdsc::emit::rb(
+            "k_t",
+            ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(64),
+            ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(64),
+        ),
         DevOff::ZERO,
         &mut sid,
         None,
@@ -315,8 +323,16 @@ fn the_rerouted_ktir_door_transposes_with_a_one_dim_output_stick_at_every_shape(
             out,
             // TRUE whole-buffer handles — the mint bounds the flat `[mb, out]`/`[out, mb]` runs
             // against exactly these.
-            &ktir_superdsc::emit::rb("t_in", mb, out),
-            &ktir_superdsc::emit::rb("t_out", out, mb),
+            &ktir_superdsc::emit::rb(
+                "t_in",
+                ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(mb),
+                ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(out),
+            ),
+            &ktir_superdsc::emit::rb(
+                "t_out",
+                ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(out),
+                ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(mb),
+            ),
             &mut sid,
             None,
         )
@@ -390,8 +406,16 @@ fn an_over_lx_transpose_is_refused_and_the_half_size_control_is_accepted() {
         "big",
         4096,
         4096,
-        &ktir_superdsc::emit::rb("t_in", 4096, 4096),
-        &ktir_superdsc::emit::rb("t_out", 4096, 4096),
+        &ktir_superdsc::emit::rb(
+            "t_in",
+            ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(4096),
+            ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(4096),
+        ),
+        &ktir_superdsc::emit::rb(
+            "t_out",
+            ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(4096),
+            ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(4096),
+        ),
         &mut sid,
         None,
     ) {
@@ -413,8 +437,16 @@ fn an_over_lx_transpose_is_refused_and_the_half_size_control_is_accepted() {
         "ctl",
         4096,
         2048,
-        &ktir_superdsc::emit::rb("t_in", 4096, 2048),
-        &ktir_superdsc::emit::rb("t_out", 2048, 4096),
+        &ktir_superdsc::emit::rb(
+            "t_in",
+            ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(4096),
+            ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(2048),
+        ),
+        &ktir_superdsc::emit::rb(
+            "t_out",
+            ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(2048),
+            ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(4096),
+        ),
         &mut sid,
         None,
     )

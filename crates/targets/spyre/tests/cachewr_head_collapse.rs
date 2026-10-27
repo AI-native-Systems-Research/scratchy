@@ -70,9 +70,9 @@ fn cachewr_op(mq: u32, hd: u32, per_request: bool, req: u32, s: u32) -> emit::Em
         )
         .unwrap(),
         a_place,
-        &Stk::<KernelTag>::kernel(STICK as usize, STICK as usize, "t_ident"),
+        &Stk::<KernelTag>::one_stick_identity("t_ident"),
         DevOff::ZERO,
-        &Stk::<KernelTag>::kernel(PLANE_SLOTS as usize, hd as usize, "t_kc"),
+        &Stk::<KernelTag>::resident_kv_plane(hd, "t_kc"),
         o_place,
         &mut sym,
         None,

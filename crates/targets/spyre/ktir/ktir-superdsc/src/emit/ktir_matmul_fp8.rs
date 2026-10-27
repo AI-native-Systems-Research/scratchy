@@ -14,8 +14,9 @@
 //! through the KTIR, from facts the KTIR itself states.
 
 use super::{
-    EmittedOp, In, assemble_convert, assemble_convert_col, assemble_pointwise_broadcast_off,
-    bmm_site, emit_sdsc_tiled, op_func_from_str, pw1, pw2, rb, rb_df, rbo,
+    EmittedOp, In, PointwiseFacts, assemble_convert, assemble_convert_col,
+    assemble_pointwise_broadcast_off, bmm_site, emit_sdsc_tiled, op_func_from_str, pw1, pw2, rb,
+    rb_df, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::reduce::{
     assemble_reduce_off, assemble_reduce_seeded, reduce_opspec, win_reduce_accum, win_reduce_data,
@@ -23,6 +24,7 @@ use crate::ir::bridge::tiled_op_sdsc_op::reduce::{
 use crate::place::{PlaceId, SynthRole};
 use crate::placement::{BundleLayout, syn};
 use crate::reserved_tids::{FP8_INV448_TID, FP8_NEG448_TID, FP8_POS448_TID};
+use crate::sdsc_abstract::{BlockCols, Lanes, RowCount};
 use crate::superdsc_error::SuperDscError;
 use crate::superdsc_opspec::{DataFormat, Df, Fp16, Role, SdscFoldSet};
 
@@ -224,8 +226,16 @@ pub(crate) fn fp8_quantize_descriptors(
             // in place deliberately for this first measurement so the bundle's ADDRESS ASSIGNMENT does
             // not move — `BundleLayout::synth` is a bump allocator, so dropping entries would shift
             // every later tensor and confound a coherence comparison with the baseline.
-            let ascale_h = rb(&ascale, m, stk);
-            let a_h = rb(&a_name, m, k);
+            let ascale_h = rb(
+                &ascale,
+                RowCount::of_token_rows(m),
+                BlockCols::of_one_stick(Lanes::FP16),
+            );
+            let a_h = rb(
+                &a_name,
+                RowCount::of_token_rows(m),
+                BlockCols::of_feature_cols(k),
+            );
             // ⛔ ASK THE TILER FIRST — the SAME `reduce_opspec` the emission below builds, never a
             // second LX formula. A time-tiled reduce is UNEMITTABLE for this op class: the DDL's
             // accumulator has OVERWRITE semantics while `rewrite_op_for_time_tile`'s tiled predicate
@@ -296,9 +306,17 @@ pub(crate) fn fp8_quantize_descriptors(
                 }
                 for j in 0..qspt_time {
                     let accum_h = if j == 0 {
-                        rb(&ascale, m, stk)
+                        rb(
+                            &ascale,
+                            RowCount::of_token_rows(m),
+                            BlockCols::of_one_stick(Lanes::FP16),
+                        )
                     } else {
-                        rb(&partials[(j - 1) as usize], m, stk)
+                        rb(
+                            &partials[(j - 1) as usize],
+                            RowCount::of_token_rows(m),
+                            BlockCols::of_one_stick(Lanes::FP16),
+                        )
                     };
                     let op_name = if j == 0 {
                         opn("fq_qspt_op")
@@ -338,7 +356,11 @@ pub(crate) fn fp8_quantize_descriptors(
                 // old amax chain's own law). Lands in the SAME `ascale` name every downstream op
                 // (`fq_invs_op` on) already reads, so nothing below changes.
                 for (i, p) in partials.iter().enumerate() {
-                    let p_h = rb(p, m, stk);
+                    let p_h = rb(
+                        p,
+                        RowCount::of_token_rows(m),
+                        BlockCols::of_one_stick(Lanes::FP16),
+                    );
                     ops.push(pw2(
                         &opn(&format!("fq_qspt_c{}_op", i + 1)),
                         "maximum",
@@ -368,7 +390,11 @@ pub(crate) fn fp8_quantize_descriptors(
             // premise (fixing K-cache inf) is already fixed elsewhere is unjustified risk with no
             // upside. Reverted to the simple, single unblocked reduce — decode already proves this form
             // works (m=1 always takes this path); prefill (m>1) now takes it too.
-            let invs_h = rb(&invs, m, stk);
+            let invs_h = rb(
+                &invs,
+                RowCount::of_token_rows(m),
+                BlockCols::of_one_stick(Lanes::FP16),
+            );
             ops.push(pw1(
                 &opn("fq_invs_op"),
                 "reciprocal",
@@ -380,13 +406,21 @@ pub(crate) fn fp8_quantize_descriptors(
                 layout,
             ));
             // scaled = act·invs; clamp to [-448,448] (torch-spyre's `quantize_fp8_with_scale` ALWAYS clamps).
-            let sc_h = rb(&sc, m, k);
+            let sc_h = rb(
+                &sc,
+                RowCount::of_token_rows(m),
+                BlockCols::of_feature_cols(k),
+            );
             ops.push(pw2(
                 &opn("fq_sc_op"),
                 "mul",
                 m_rows,
                 k_cols,
-                In::full(&rb(&a_name, m, k)),
+                In::full(&rb(
+                    &a_name,
+                    RowCount::of_token_rows(m),
+                    BlockCols::of_feature_cols(k),
+                )),
                 In::col(&invs_h),
                 &sc_h,
                 sym_id_base,
@@ -408,7 +442,11 @@ pub(crate) fn fp8_quantize_descriptors(
             // `absx`/`amax`/`amaxfl`'s do above: `BundleLayout::synth` is a bump allocator, so
             // dropping entries would shift every later tensor and confound a coherence comparison
             // with the baseline.
-            let cl_h = rb(&cl, m, cl_reach);
+            let cl_h = rb(
+                &cl,
+                RowCount::of_token_rows(m),
+                BlockCols::of_feature_cols(cl_reach),
+            );
             ops.push(pw1(
                 &opn("fq_clip_op"),
                 "clip",
@@ -434,23 +472,29 @@ pub(crate) fn fp8_quantize_descriptors(
             // clamped lanes (finite, and inert × the packed weight's host-zero-filled pad K
             // rows); only the LAST pair's window reaches past `k` into the fill.
             if cl_reach != k {
-                let zf_h = rb(&cl, m, cl_reach);
+                let zf_h = rb(
+                    &cl,
+                    RowCount::of_token_rows(m),
+                    BlockCols::of_feature_cols(cl_reach),
+                );
                 ops.push(assemble_pointwise_broadcast_off(
-                    &opn("fq_zfpad_op"),
-                    "sub",
-                    m_rows,
-                    // ⭐ ONE STICK WIDE (the pad width, not `cl_reach`): the write is aimed at the
-                    // pad WINDOW via the output offset, so the op's own width is the window's
-                    // 64 elements — a `[m, cl_reach]` op would rewrite the logical window too
-                    // (reading `sc`'s unpad-ded bytes at the pad position).
-                    crate::sdsc_abstract::BlockCols::of_one_stick(
-                        crate::sdsc_abstract::Lanes::FP16,
-                    ),
-                    &[In::scalar(&pos448).ew(), In::scalar(&pos448).ew()],
-                    &zf_h,
-                    // The RowBlocked stick-group law aims the write at the pad window: stick-
-                    // group `k/64` of every row (whole — see the fill comment above).
-                    crate::addr::col_of(m, cl_reach, k, Df::Fp16),
+                    PointwiseFacts {
+                        op_name: &opn("fq_zfpad_op"),
+                        op_func: "sub",
+                        rows: m_rows,
+                        // ⭐ ONE STICK WIDE (the pad width, not `cl_reach`): the write is aimed at the
+                        // pad WINDOW via the output offset, so the op's own width is the window's
+                        // 64 elements — a `[m, cl_reach]` op would rewrite the logical window too
+                        // (reading `sc`'s unpad-ded bytes at the pad position).
+                        cols: crate::sdsc_abstract::BlockCols::of_one_stick(
+                            crate::sdsc_abstract::Lanes::FP16,
+                        ),
+                        inputs: &[In::scalar(&pos448).ew(), In::scalar(&pos448).ew()],
+                        o: &zf_h,
+                        // The RowBlocked stick-group law aims the write at the pad window: stick-
+                        // group `k/64` of every row (whole — see the fill comment above).
+                        out_offset: crate::addr::col_of(m, cl_reach, k, Df::Fp16).into(),
+                    },
                     sym_id_base,
                     layout,
                 ));
@@ -470,8 +514,17 @@ pub(crate) fn fp8_quantize_descriptors(
                     "qfp8ch",
                     m,
                     k_pad,
-                    &rb(&cl, m, k_pad),
-                    &rb_df(&afp8, m, k_pad, Df::Fp8),
+                    &rb(
+                        &cl,
+                        RowCount::of_token_rows(m),
+                        BlockCols::of_feature_cols(k_pad),
+                    ),
+                    &rb_df(
+                        &afp8,
+                        RowCount::of_token_rows(m),
+                        BlockCols::of_feature_cols(k_pad),
+                        Df::Fp8,
+                    ),
                     sym_id_base,
                     layout,
                 ));
@@ -515,9 +568,18 @@ pub(crate) fn fp8_quantize_descriptors(
                         "qfp8ch",
                         m,
                         inn_pad,
-                        &rb(&cl, m, cl_reach),
+                        &rb(
+                            &cl,
+                            RowCount::of_token_rows(m),
+                            BlockCols::of_feature_cols(cl_reach),
+                        ),
                         crate::addr::col_of(m, cl_reach, s * inn, Df::Fp16),
-                        &rb_df(&afp8, m, k_pad, Df::Fp8),
+                        &rb_df(
+                            &afp8,
+                            RowCount::of_token_rows(m),
+                            BlockCols::of_feature_cols(k_pad),
+                            Df::Fp8,
+                        ),
                         crate::addr::col_of(m, k_pad, s * inn_pad, Df::Fp8),
                         sym_id_base,
                         layout,
@@ -544,7 +606,6 @@ pub(crate) fn matmul_fp8_descriptors(
     quantized: &mut std::collections::HashSet<String>,
 ) -> Result<Vec<EmittedOp>, SuperDscError> {
     let mut ops = fp8_quantize_descriptors(facts, m, k, 1, sym_id_base, layout, quantized)?;
-    let stk = Fp16::ELEMS_PER_STICK; // 64
     // ⭐ THE 26b K-PAD (dense form) — the contraction width the packed weight was staged at.
     let k_pad = crate::work::fp8_k_pad(k);
     let m_rows = crate::sdsc_abstract::RowCount::of_token_rows(m);
@@ -619,9 +680,13 @@ pub(crate) fn matmul_fp8_descriptors(
     // byte-identical at decode m=1. `w_scale` is [1,n] per-CHANNEL; for m>1 it broadcasts over the m
     // query rows (`mb`, mirroring rmsnorm's gamma multiply) — a plain `full` would demand m distinct
     // rows from the 1-row w_scale.
-    let ascale_h = rb(&ascale, m, stk);
-    let raw_h = rb(&raw, m, n);
-    let dqa_h = rb(&dqa, m, n);
+    let ascale_h = rb(
+        &ascale,
+        RowCount::of_token_rows(m),
+        BlockCols::of_one_stick(Lanes::FP16),
+    );
+    let raw_h = rb(&raw, m_rows, n_cols);
+    let dqa_h = rb(&dqa, m_rows, n_cols);
     ops.push(pw2(
         &opn("fq_dqa_op"),
         "mul",
@@ -633,8 +698,8 @@ pub(crate) fn matmul_fp8_descriptors(
         sym_id_base,
         layout,
     ));
-    let out_h = rb(&out, m, n);
-    let ws_h = rb(&ws_name, 1, n);
+    let out_h = rb(&out, m_rows, n_cols);
+    let ws_h = rb(&ws_name, RowCount::of_broadcast_row(), n_cols);
     let w_scale_in = if m > 1 {
         In::mb(&ws_h)
     } else {
@@ -681,6 +746,7 @@ mod tests {
                     bank: 0,
                     offset: off,
                     size,
+                    cover: crate::placement::BindCover::Full,
                 },
             );
             l.segment_bytes[seg] = crate::placement::align128(off + size);

@@ -47,12 +47,14 @@ use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
 use ktir_core::opkind::OpKind;
 
 use super::lower_ktir_to_superdsc::{Error, Gather, Region, err, gathers_of, regions};
-use crate::ktir_node::{Elementwise, KtirNode, Program, ReduceKind};
+use crate::ktir_node::{Elementwise, KtirNode, Program, ReduceAxes, ReduceKind};
 // The broadcast AXIS is the emission door's own vocabulary — `elementwise` selects the `In` builder
 // from it — so it lives beside that door and this recogniser names the same type rather than a
 // parallel one that would have to be mapped across the boundary.
 use super::lower_ktir_to_superdsc::BcastAxis;
 use crate::placement::BundleLayout;
+use crate::sdsc_abstract::{BlockCols, Lanes, RowCount};
+use crate::superdsc_opspec::Df;
 use crate::work::DeviceWidth;
 
 /// THE SILU LONGHAND, as the ONE fused op it is — `out = silu(gate) · up`.
@@ -938,6 +940,95 @@ pub fn program_of(op: OpKind) -> Option<Program> {
     })
 }
 
+/// ⭐⭐⭐ WALL 13's ISLAND — the dtype CAST an op states, as the (from, to) pair the vendor's
+/// convert binds name. `None` for every non-cast op.
+///
+/// The pair is read off the op's OWN operand/result types — the one statement of the transition —
+/// never re-derived at the door. Only the two pairs the closed inventory vendor-binds are admitted
+/// (`dl16tofp32`/`fp32todl16`, `quantization_double_pad.ddl:58/:59`); a cast stating any other
+/// pair is REFUSED BY NAME rather than routed through a nearest-neighbor opfunc, because a convert
+/// that changes the wrong format is a silent byte re-interpretation, not a loud failure.
+///
+/// ⛔ THE CAST'S DIRECTION IS ITS KIND'S OWN SEMANTICS, CHECKED: `arith.extf` widens and
+/// `arith.truncf` narrows — a program stating the reverse is mistyped (its value's bytes would
+/// re-interpret at the WRONG width), and naming that here is cheaper than diagnosing the garbage
+/// it would bake. `arith.convertf` states no direction of its own, so both pairs are legal at it.
+fn cast_of(f: &IRFunction<'_>, op: &Operation<'_>) -> Result<Option<Lowering>, Error> {
+    if !matches!(
+        op.op_type,
+        OpKind::ArithExtf | OpKind::ArithTruncf | OpKind::ArithConvertf
+    ) {
+        return Ok(None);
+    }
+    let kind = op.op_type;
+    let name = f.name;
+    let refuse = |msg: String| Error {
+        message: format!("{name}: `{kind:?}` {msg}"),
+    };
+    let elem_of = |v: Ssa, role: &str| -> Result<crate::superdsc_opspec::Df, Error> {
+        let t = type_of(f, v).ok_or_else(|| Error {
+            message: format!(
+                "{name}: `{kind:?}`'s {role} states no type, so the format transition is \
+                     unknown and no convert can be chosen for it"
+            ),
+        })?;
+        df_of_dtype(match t {
+            ktir_core::irtype::IrType::Tensor { elem, .. }
+            | ktir_core::irtype::IrType::MemRef { elem, .. }
+            | ktir_core::irtype::IrType::Scalar(elem) => elem,
+            ktir_core::irtype::IrType::AccessTile { .. } | ktir_core::irtype::IrType::Index => {
+                return Err(refuse(format!(
+                    "{role} is an address type, not a value a dtype convert reads"
+                )));
+            }
+        })
+        .ok_or_else(|| Error {
+            message: format!(
+                "{name}: `{kind:?}`'s {role} states an element type with no stick geometry \
+                     (bool/i64), which no convert bind in the vendor's DDLs addresses"
+            ),
+        })
+    };
+    let src = *op.operands.first().ok_or_else(|| Error {
+        message: format!("{name}: `{kind:?}` states no operand to convert"),
+    })?;
+    let res = op.result.ok_or_else(|| Error {
+        message: format!("{name}: `{kind:?}` states no result"),
+    })?;
+    let from = elem_of(src, "input")?;
+    let to = elem_of(res, "result")?;
+    // The direction check: extf widens, truncf narrows — in the f16/f32 lattice the vendor binds.
+    let widens = matches!((from, to), (Df::Fp16, Df::Fp32));
+    let narrows = matches!((from, to), (Df::Fp32, Df::Fp16));
+    match kind {
+        OpKind::ArithExtf if !widens => {
+            return Err(refuse(format!(
+                "states a WIDENING cast whose types are {from:?} → {to:?} — `arith.extf` extends, \
+                 so this program is mistyped: the value's bytes would re-interpret at the wrong \
+                 width no matter which convert emits them"
+            )));
+        }
+        OpKind::ArithTruncf if !narrows => {
+            return Err(refuse(format!(
+                "states a NARROWING cast whose types are {from:?} → {to:?} — `arith.truncf` \
+                 truncates, so this program is mistyped: the value's bytes would re-interpret at \
+                 the wrong width no matter which convert emits them"
+            )));
+        }
+        _ => {}
+    }
+    match (from, to) {
+        (Df::Fp16, Df::Fp32) | (Df::Fp32, Df::Fp16) => Ok(Some(Lowering::Convert { from, to })),
+        _ => Err(refuse(format!(
+            "states the format transition {from:?} → {to:?}, and the closed convert inventory \
+             vendor-binds only the fp16↔fp32 pair (`dl16tofp32`/`fp32todl16`, \
+             quantization_double_pad.ddl:58/:59). Every other transition is refused BY NAME rather \
+             than routed through a nearest-neighbor opfunc — a convert that changes the wrong \
+             format is a silent byte re-interpretation, not a loud failure"
+        ))),
+    }
+}
+
 /// WHAT THIS DOOR WILL LOWER ONE OP AS — a `Program` the crate already has, or one of the two kinds
 /// that are reachable ONLY from here.
 ///
@@ -953,11 +1044,28 @@ enum Lowering {
     /// The five-op silu longhand, PROVEN by [`program_silu_mul_chains`] and lowered as one
     /// `silumul`.
     Silu,
-    /// A bare `linalg.reduce`, whose combiner is an attribute rather than an op kind.
-    Reduce(ReduceKind),
+    /// A bare `linalg.reduce`, whose combiner is an attribute rather than an op kind. Carries
+    /// the op's own axis facts (wall 12): the `Dimensions` it reduces and the rank it states
+    /// them against, read at the same place the combiner is and threaded as a value — never
+    /// re-derived, never defaulted — because the door classifies trailing-vs-leading off them
+    /// and a frame that has already merged the leading dims into rows cannot.
+    Reduce { kind: ReduceKind, axes: ReduceAxes },
     /// `tile * <splatted constant>` — the multiplier read off THIS op, not the whole function. See
     /// [`splat_scale_of`] for the discriminator and why it cannot be per-function here.
     ScalarMul(f32),
+    /// `maximum(tile, C)` / `minimum(tile, C)` with `C` a splatted constant — the extremum's own
+    /// scalar form, the same tiebreak [`ScalarMul`] states for multiply, applied to the two ops
+    /// whose identity lives at the range's edge (the online softmax's running-max initial, any
+    /// clamp against a stated bound). See [`splat_scale_of`] for the discriminator and
+    /// `scalarextremum_at` for the body it lowers through.
+    ScalarExtremum { value: f32, max: bool },
+    /// `tile − C` / `C − tile` with `C` a splatted constant — the non-commutative member of the
+    /// constant-operand pointwise class. The ORDER is the program's own statement and is carried
+    /// here (`const_first`: the splat is the op's first input), because subtraction is the one op
+    /// of the class whose two orders are DIFFERENT functions: the emission derives its operand
+    /// layout from this fact (see [`SplatFact`]) rather than assuming one. The online softmax's
+    /// running-max rescale at trip 0 — `m − m_new` against the `tl.full` initial — is the shape.
+    ScalarSub { value: f32, const_first: bool },
     /// `tile * <splatted runtime scalar>` — rung 3 of the address-provenance ladder: the multiplier
     /// is a `[1,1]` PARAMETER the launch binds (`const:t<id>`), so the emission names its binding by
     /// tid rather than looking a value up in the registry. See [`bound_scale_of`] for the
@@ -968,6 +1076,19 @@ enum Lowering {
     /// for the Scale convention. See [`program_rmsnorm_chains`] for why fusing it is the fix and
     /// filling the scale registry was not.
     RmsNorm(f32, Option<f32>),
+    /// ⭐⭐⭐ WALL 13's ISLAND — a dtype CAST (`arith.extf` / `arith.truncf` / `arith.convertf`),
+    /// lowered as a FIRST-CLASS CONVERT op through the vendor's own pair (`dl16tofp32` /
+    /// `fp32todl16`, `quantization_double_pad.ddl:58/:59`). The cast's whole purpose is to CHANGE
+    /// df, so the (from, to) pair is a property of the op's own operand/result types — read once
+    /// here, never re-derived at the door.
+    ///
+    /// ⛔ THE MIXED-df PIN (the auditor's law, enforced here at the walk): a mixed-df TTIR op
+    /// NEVER emits as ONE op. The casts are the ONLY ops whose operands may differ in df, and
+    /// they surface as these convert ops — so the DD2 mixed-op refusal ("Unsupported result
+    /// precision conversion", the `reduce.rs` const law's sibling) is UNREACHABLE by our
+    /// emission: every elementwise/reduce op the walk emits states one df on every operand, and
+    /// every df transition is one of these converts.
+    Convert { from: Df, to: Df },
 }
 
 /// THE `Elementwise(Mul)` / `ScalarMul` TIEBREAK, read off ONE op rather than the whole function.
@@ -986,16 +1107,37 @@ enum Lowering {
 /// multipliers). The whole-function reader returns `None` there by construction, so the scale has to
 /// be read from the op that uses it.
 ///
-/// Returns `(scale, the tensor operand)`. `None` when this is not a scalar multiply at all:
+/// Returns the constant-operand pointwise's stated shape: the constant's VALUE, the TENSOR
+/// operand, and WHICH INPUT the constant occupies — the ORDER fact. `None` when this op does
+/// not state exactly one splatted-constant operand:
 ///
-/// * NEITHER operand is a splat — an ordinary two-tensor `Elementwise(Mul)`, which the 1:1 map handles.
+/// * NEITHER operand is a splat — an ordinary two-tensor `Elementwise` op, which the 1:1 map handles.
 /// * BOTH are splats — a multiply of two compile-time constants. That is not a scalarmul (there is no
 ///   tensor to scale) and emitting one would invent an operand; it belongs to constant folding
 ///   upstream, so it falls through to be refused by name.
+///
+/// ⛔ THE ORDER IS STRUCTURAL, NOT COSMETIC. For a COMMUTATIVE op (`multiply`, `maximum`,
+/// `minimum`) the two orders lower to the same function and the emission may swap operands for
+/// its own placement laws. For a NON-commutative one (`subtract`) the two orders are DIFFERENT
+/// functions — `C − tile` is not `tile − C` — so the emission derives its operand layout from
+/// this fact and never assumes one.
+#[derive(Clone, Copy, Debug)]
+pub struct SplatFact {
+    pub value: f32,
+    pub tensor: Ssa,
+    /// The splatted constant is the op's FIRST input (`C ∘ tile`); `false` means `tile ∘ C`.
+    pub const_first: bool,
+    /// THE SPLAT OP ITSELF — the SSA whose `result_type` states the element format the constant
+    /// is splatted at. The scale-registry completion reads the slot's df from THIS op (the
+    /// splat's own result, the same seat the value came from), so the registry's format column
+    /// cannot drift from the value column: one fact, one matcher.
+    pub splat: Ssa,
+}
+
 pub fn splat_scale_of(
     f: &IRFunction<'static>,
     op: &ktir_core::ir::Operation<'static>,
-) -> Option<(f32, Ssa)> {
+) -> Option<SplatFact> {
     let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
     // A splatted compile-time FLOAT. `arith.constant` → `tensor.splat` is the only spelling this
     // crate's producers use, and it is the one `program_scalarmul_scale` already reads.
@@ -1015,11 +1157,64 @@ pub fn splat_scale_of(
     };
     let [a, b] = op.operands[..] else { return None };
     match (splat_value(a), splat_value(b)) {
-        (Some(v), None) => Some((v as f32, b)),
-        (None, Some(v)) => Some((v as f32, a)),
+        (Some(v), None) => Some(SplatFact {
+            value: v as f32,
+            tensor: b,
+            const_first: true,
+            splat: a,
+        }),
+        (None, Some(v)) => Some(SplatFact {
+            value: v as f32,
+            tensor: a,
+            const_first: false,
+            splat: b,
+        }),
         // Both or neither: not a scalar multiply. See the doc above.
         _ => None,
     }
+}
+
+/// ⭐⭐⭐ A `ktdp.store` WHOSE VALUE IS A SPLATTED CONSTANT — the FILL's own discriminator, the
+/// store-side twin of [`splat_scale_of`]'s operand test. A store of `tensor.splat` over an
+/// `arith.constant` writes one stated value across its whole window; no load feeds it and no
+/// compute op consumes it, so the walk's compute loop would never reach it and the program it
+/// belongs to would die at "no compute op in the function" — a pure-fill program being the
+/// shape the online-softmax carry's seed states (max at the finite −65504 sentinel, sum and
+/// accumulator at zero).
+///
+/// The constant is resolved through the SAME registry the constant-operand pointwise class uses
+/// ([`program_stated_scales`] collects these stores beside the mulf/subf/extrema splats), so the
+/// fill and the scale ops share one staging channel: a worker-bound `[1,1]` const, broadcast over
+/// the store's own window by the identity pointwise — the same descriptor shape
+/// [`super::lower_ktir_to_superdsc::scalarmul_scaled`] gives a scalar op, with the broadcast
+/// const as the only input.
+///
+/// Returns the VALUE and the splat's own SSA (the seat the value and its element format both
+/// came from — the same provenance [`SplatFact::splat`] carries). `None` when the store's value
+/// is not exactly a splatted compile-time float (a loaded or computed value; those belong to the
+/// compute ops that produce them).
+pub fn stored_splat_of(
+    f: &IRFunction<'static>,
+    op: &ktir_core::ir::Operation<'static>,
+) -> Option<(f32, Ssa)> {
+    let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
+    // The same `arith.constant` → `tensor.splat` spelling [`splat_scale_of`]'s `splat_value`
+    // reads — the only spelling this crate's producers use, read at the store instead of at a
+    // constant-operand op.
+    let v = *op.operands.first()?;
+    let sp = def_of(v)?;
+    if sp.op_type != OpKind::TensorSplat {
+        return None;
+    }
+    let c = def_of(*sp.operands.first()?)?;
+    if c.op_type != OpKind::ArithConstant {
+        return None;
+    }
+    let value = c.attributes.iter().find_map(|(k, val)| match (k, val) {
+        (AttrKey::Value, Attr::Float(x)) => Some(*x),
+        _ => None,
+    })?;
+    Some((value as f32, v))
 }
 
 /// A rung-3 bound scale: the `[1,1]` parameter a `tensor.splat` reads through its load, and the
@@ -1131,6 +1326,80 @@ pub fn reduce_kind_of(op: &ktir_core::ir::Operation<'static>) -> Option<ReduceKi
     })
 }
 
+/// ⭐⭐⭐ WALL 12 — a `linalg.reduce`'s own [`ReduceAxes`], read off its `Dimensions` and result
+/// `Shape` attributes the same way [`reduce_kind_of`] reads its combiner: the axes are the OP's
+/// statement, not the walk's frame, and the door classifies the block from them
+/// ([`crate::emit::lower_ktir_to_superdsc::reduce_axis_block`]).
+///
+/// ⛔ FAIL-CLOSED on a missing or oversized statement: a reduce stating no `Dimensions` cannot
+/// be classified (trailing and leading are indistinguishable without it), and one stating more
+/// than four reduced dims has no bind in the template's own vocabulary (`summeanmaxexx2.ddl:9`
+/// declares exactly `%reduce_dim:4`). Both are named here, at the read, rather than guessed at
+/// the door — the same refusal discipline [`reduce_kind_of`]'s caller applies to the combiner.
+pub(crate) fn reduce_axes_of(
+    f_name: &str,
+    op: &ktir_core::ir::Operation<'static>,
+) -> Result<ReduceAxes, Error> {
+    let dims: &[i64] = op
+        .attributes
+        .iter()
+        .find_map(|(k, v)| match (k, v) {
+            (AttrKey::Dimensions, Attr::IntList(d)) => Some(*d),
+            _ => None,
+        })
+        .ok_or_else(|| Error {
+            message: format!(
+                "{f_name}: a `linalg.reduce` states no `Dimensions`, so which axes it reduces is \
+                 unknown and the door cannot classify it (a trailing reduce is the row-reduce form, \
+                 a leading prefix is the nonstick form — they are indistinguishable without the \
+                 op's own statement)"
+            ),
+        })?;
+    if dims.is_empty() {
+        return Err(Error {
+            message: format!(
+                "{f_name}: a `linalg.reduce` states an EMPTY `Dimensions` list — a reduce over \
+                 no axes is the identity, and TTIR never states one; defensively refused rather \
+                 than guessed at the door"
+            ),
+        });
+    }
+    if dims.len() > 4 {
+        return Err(Error {
+            message: format!(
+                "{f_name}: a `linalg.reduce` stating {} reduced dims has no bind to match — the \
+                 reduce template's own dimension vocabulary is four reduce symbols \
+                 (`summeanmaxexx2.ddl:9`, `%reduce_dim:4`)",
+                dims.len()
+            ),
+        });
+    }
+    // The rank the dims are stated against: the result `Shape`'s rank plus the reduced count
+    // (a reduce removes exactly the axes it names). A reduce stating no result `Shape` cannot
+    // be ranked — fail-closed, same discipline as the missing `Dimensions` above.
+    let out_rank: usize = op
+        .attributes
+        .iter()
+        .find_map(|(k, v)| match (k, v) {
+            (AttrKey::Shape, Attr::IntList(s)) => Some(s.len()),
+            _ => None,
+        })
+        .ok_or_else(|| Error {
+            message: format!(
+                "{f_name}: a `linalg.reduce` states no result `Shape`, so the rank its \
+                 `Dimensions` are stated against is unknown and the door cannot classify the \
+                 block"
+            ),
+        })?;
+    let mut padded = [0i64; 4];
+    padded[..dims.len()].copy_from_slice(dims);
+    Ok(ReduceAxes {
+        dims: padded,
+        n_dims: dims.len() as u8,
+        in_rank: (out_rank + dims.len()) as u8,
+    })
+}
+
 /// Is this op addressing or bookkeeping rather than computation?
 fn is_plumbing(op: OpKind) -> bool {
     matches!(
@@ -1169,6 +1438,63 @@ fn is_plumbing(op: OpKind) -> bool {
             | OpKind::ArithCeildivui
             | OpKind::ArithFloordivsi
     )
+}
+
+/// ⭐⭐⭐⭐⭐ IS THIS RESULT READ BY ANYTHING OTHER THAN ITS STORE? The store arm binds a store to
+/// its producing op only when the result is the store's ALONE — that arm emits the op writing the
+/// store's window IN PLACE, at the op's own program position, which is correct only while no later
+/// op still reads the value the window held BEFORE. The online-softmax fold body's running max is
+/// the first value this door has seen that is BOTH stored (the carry's write-back at the trip's
+/// end) and consumed on the way there (`m − m_new`, `qk − m_new[.., .., None]`): binding it would
+/// overwrite the old max before the subtraction reads it (`m_new − m_new = 0` — a descriptor reads
+/// at ITS OWN program position, never at the load's). When this returns true the walk mints the
+/// result as the intermediate it already is to those consumers, and the STORE lowers at its own
+/// position as the write-back copy (`mintcopy_at`).
+///
+/// The walk is FORWARD over users: a STORE user is the binder (or a second store of the same value
+/// — also a binder); a user that only REFRAMES the value without computing on it (the reshape and
+/// broadcast/expand plumbing the store's own value chain runs through) hands its result to the
+/// frontier; anything else — a compute op, a yield, a return — is a consumer. The yields and
+/// returns are consumers rather than reframes on purpose: they carry real dataflow, and treating
+/// one as a reframe would silently drop it from the frontier.
+fn result_consumed_beyond_store(f: &IRFunction<'static>, res: Ssa) -> bool {
+    let carries = |c: &ktir_core::ir::Operation<'static>| {
+        (is_plumbing(c.op_type)
+            && !matches!(
+                c.op_type,
+                OpKind::KtdpStore | OpKind::FuncReturn | OpKind::LinalgYield | OpKind::ScfYield
+            ))
+            || matches!(
+                c.op_type,
+                OpKind::TensorReshape
+                    | OpKind::LinalgBroadcast
+                    | OpKind::TensorExpandShape
+                    | OpKind::TensorCollapseShape
+            )
+    };
+    let mut frontier = vec![res];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(v) = frontier.pop() {
+        if !seen.insert(v) {
+            continue;
+        }
+        for c in f.operations.iter() {
+            if !c.operands.contains(&v) {
+                continue;
+            }
+            if c.op_type == OpKind::KtdpStore {
+                continue; // the binder itself
+            }
+            if carries(c) {
+                if let Some(r) = c.result {
+                    frontier.push(r);
+                }
+                continue;
+            }
+            return true;
+        }
+    }
+    false
 }
 
 /// ONE recognised broadcast: the value a consumer reads, resolved back to the rank-2 SOURCE the
@@ -1310,7 +1636,8 @@ fn program_broadcast_chains(
                      row vector (`In::mb`, one row addressed once); neither states an address that \
                      advances every k rows, and no descriptor in this door's vocabulary does, so \
                      this is named rather than half-addressed. The door-proven statement of the \
-                     same math is `attn.py`'s own mask law: the host stages the mask at the score \
+                     same math is the paged-decode kernel's own mask law (`batched_decode.py`):
+                     the host stages the mask at the score \
                      tile's own rows and the kernel adds it at base — no broadcast at all",
                     f.name
                 ));
@@ -1737,6 +2064,190 @@ fn presented_flat(r: &Region, axis: BcastAxis) -> Result<Region, String> {
     Ok(f)
 }
 
+/// One reshape's FLAT-PRESENTATION verdict — the #741 re-row law
+/// ([`crate::sdsc_abstract::RegionFrame::reframe`], the door
+/// [`crate::sdsc_abstract::Access::reframe`] states for a reshape over a minted access) run at
+/// the forward, from the source's own type to the reshape target's flat presentation.
+#[derive(Clone, Debug)]
+enum ReshapeFlat {
+    /// The target's flat `[rows', cols']` is byte-faithful over the source's frame (the
+    /// identity, or a pad-up inside one stick): every consumer that reads the value flat or at
+    /// the source's own framing reads the bytes the source holds. Every reshape of the batched
+    /// paged-decode kernel's flat values is this — `[1024, 64] -> [256, 4, 64]` is flat
+    /// `[1024, 64]`, the identity.
+    Admitted,
+    /// The re-row law REFUSES the flat presentation — the target's framing moves bytes the
+    /// source's frame does not (`[32, 131072] -> [256, 64, 256]` is flat `[16384, 256]`, and the
+    /// inter-stick stride is the ROW count, so the re-row moves every element past the first
+    /// stick column). The value is still FORWARDED — the bytes are the source's, and the ONE
+    /// consumer that states its own affine access over the source may lawfully read it (the
+    /// gathered matmul's B, the `Access::gathered` mint) — but a consumer that reads it at the
+    /// target's framing without stating that access is refused at the resolution site, naming
+    /// the law's own clause.
+    Refused(String),
+}
+
+/// The stick law's element format — the [`crate::superdsc_opspec::Df`] whose `elems_per_stick`
+/// is the frame's lane count, from the value's own element type. `None` for the formats with no
+/// stick geometry in this dialect (bool, i64): a reshape over those states no frame law this
+/// door can check, which the verdict refuses by name.
+pub(crate) fn df_of_dtype(elem: ktir_core::dtypes::DType) -> Option<crate::superdsc_opspec::Df> {
+    use ktir_core::dtypes::DType;
+    Some(match elem {
+        DType::F16 => crate::superdsc_opspec::Df::Fp16,
+        DType::F32 => crate::superdsc_opspec::Df::Fp32,
+        DType::Fp8E4m3 => crate::superdsc_opspec::Df::Fp8,
+        DType::I32 => crate::superdsc_opspec::Df::SenUint32,
+        DType::Bool | DType::I64 => return None,
+    })
+}
+
+/// A value's own type — the argument list's entry, or the defining operation's `result_type`.
+/// Every SSA in a TTIR function carries one; `None` says the program did not state it.
+fn type_of<'f>(f: &IRFunction<'f>, v: Ssa) -> Option<ktir_core::irtype::IrType<'f>> {
+    if let Some(&(_, t)) = f.arguments.iter().find(|&&(s, _)| s == v) {
+        return Some(t);
+    }
+    f.ops_deep()
+        .into_iter()
+        .find(|o| o.result == Some(v))
+        .and_then(|o| o.result_type)
+}
+
+/// A shape's FLAT `[rows, cols]` presentation — the leading product over the last dim, the
+/// frame a whole-value flat read addresses. `None` for an empty or negative shape.
+fn flat_of(dims: &[i64]) -> Option<(usize, usize)> {
+    let (&last, lead) = dims.split_last()?;
+    if last < 0 || lead.iter().any(|&d| d < 0) {
+        return None;
+    }
+    let mut rows: u64 = 1;
+    for &d in lead {
+        rows = rows.checked_mul(d as u64)?;
+    }
+    usize::try_from(rows).ok().map(|r| (r, last as usize))
+}
+
+/// The re-row law for ONE reshape — the target's flat presentation against the source's own
+/// frame, both stated from the program's own types (the source's defining type, the reshape's
+/// `result_type`). A reshape whose flat law cannot be stated (either side unshaped, an element
+/// format with no stick law, a target that changes the element type) is the REFUSED verdict's
+/// sibling: this walk does not forward a lens it cannot vouch for, so the consumer-side check
+/// refuses it by name rather than passing it blind.
+fn reshape_flat_law(f: &IRFunction<'_>, op: &Operation<'_>, src: Ssa) -> ReshapeFlat {
+    let refuse = |what: &str| {
+        ReshapeFlat::Refused(format!(
+            "the reshape of t{} states {what}, so its flat presentation's byte law cannot be \
+             stated — the #741 re-row law this forward checks needs both frames",
+            src.0
+        ))
+    };
+    let Some(tt) = op.result_type else {
+        return refuse("no result type");
+    };
+    let Some(target) = tt.dims().and_then(flat_of) else {
+        return refuse("a result shape the flat presentation cannot read");
+    };
+    let Some(st) = type_of(f, src) else {
+        return refuse("no type on the value it reshapes");
+    };
+    let Some(source) = st.dims().and_then(flat_of) else {
+        return refuse("a source shape the flat presentation cannot read");
+    };
+    let Some(df) = st.elem().and_then(df_of_dtype) else {
+        return refuse("an element format with no stick law");
+    };
+    if tt.elem().is_some_and(|e| Some(e) != st.elem()) {
+        return refuse("a different element type than the value it reshapes");
+    }
+    match crate::sdsc_abstract::RegionFrame::stick_blocked(source.0, source.1, df)
+        .reframe(target.0, target.1)
+    {
+        Ok(_) => ReshapeFlat::Admitted,
+        Err(msg) => ReshapeFlat::Refused(msg),
+    }
+}
+
+/// ⭐⭐⭐ THE `tensor.reshape` FORWARDS — every reshape result maps to the value it reshapes, and
+/// every consumer of a reshape reads THROUGH it to that value.
+///
+/// `tl.reshape` is numpy semantics: the result preserves the source's flat C-order index exactly
+/// (element at flat index `i` stays at flat index `i`), never permuting. So a reshape moves no
+/// byte and states no computation — it is a LENS the consumer reads the same bytes through. The
+/// walk therefore treats the op as plumbing (no descriptor, nothing minted) and resolves every
+/// value a consumer names through the chain to the value underneath: a load (the region is the
+/// parameter's), a gathered load (the identity join finds its tile), a compute op's result (the
+/// minted intermediate). Reshape-of-reshape resolves transitively — the map records the
+/// ULTIMATE source, built in definition order so a later reshape reads the earlier one's entry.
+///
+/// ⭐⭐⭐⭐⭐ AND THE SAME LENS COVERS A `tensor.expand_shape`/`tensor.collapse_shape` NO BROADCAST
+/// CHAIN CONSUMED. The three op kinds are one class by MLIR's own semantics — a
+/// numel-preserving C-order reframe (an expand splits axes and may insert `1`s, a collapse
+/// merges them, a reshape restates them; none moves an element) — so a producer that spells a
+/// reframe WITHOUT a `linalg.broadcast` behind it (the merge tail's `merged[None, :, :]` when
+/// the inserted axis is the output's own `1`: nothing needs spraying, so no broadcast op exists)
+/// still states only a lens, and the consumer must read through it or nothing lowers the op at
+/// all. The BROADCAST-CHAIN case is unchanged and exclusive: a chain's expand is consumed by its
+/// `linalg.broadcast` ([`program_broadcast_chains`]'s `consumed` set) and never reaches a
+/// consumer as itself, so the two doors cannot both claim one op. The #741 re-row verdict below
+/// is the same law for all three kinds — it reads only the op's `result_type` and the source's
+/// own type, so a degenerate insert that keeps the flat frame (`[256, 4] -> [1, 256, 4]`) is
+/// the identity verdict and any reframe that moves bytes is refused at the consumer by name.
+///
+/// ⭐⭐⭐ AND THE LENS IS LAW-CHECKED AT THE REFRAME — [`reshape_flat_law`] runs the #741 re-row
+/// law at the forward itself, the same law [`crate::sdsc_abstract::Access::reframe`] states for
+/// a reshape over a minted access: the target's flat presentation is admitted only when every
+/// element addresses the byte it did (`rows' == rows`, the stick-column count unchanged). A
+/// refused reshape does not stop the forward — the bytes are the source's either way — but it
+/// marks the value CARRIED: only the consumer that states its own affine access over the source
+/// (the gathered matmul's B, the `Access::gathered` mint) may read that framing, and the
+/// consumer-side check refuses every other reader by name. Without that check a `[1024, 64]`
+/// value reshaped `[64, 1024]` and consumed by a row-framed op would read the source's frame at
+/// the target's extents — a clean bake of wrong bytes, exactly what the re-row law exists to
+/// refuse.
+///
+/// The reshape forwards' maps: (result → ultimate source), (result → the reshape's own input,
+/// for the per-hop law walk), each result's law verdict, and the set of every reshape result
+/// (the plumbing the walk's op loop skips).
+type ReshapeForwards = (
+    std::collections::HashMap<Ssa, Ssa>,
+    std::collections::HashMap<Ssa, Ssa>,
+    std::collections::HashMap<Ssa, ReshapeFlat>,
+    std::collections::HashSet<Ssa>,
+);
+
+/// Returns the forwards map (result → ultimate source), the immediate-source map (result → the
+/// reshape's own input, for the per-hop law walk), each result's law verdict, and the set of
+/// every reshape result — the values the walk's op loop skips as plumbing.
+fn reshape_forwards(f: &IRFunction<'_>) -> ReshapeForwards {
+    let mut forwards = std::collections::HashMap::new();
+    let mut hops = std::collections::HashMap::new();
+    let mut verdicts = std::collections::HashMap::new();
+    let mut consumed = std::collections::HashSet::new();
+    for op in f.ops_deep() {
+        // The C-order reframe class: `tensor.reshape`, and an `expand_shape`/`collapse_shape` no
+        // broadcast chain consumed (see the doc above — one lens law, three spellings).
+        if !matches!(
+            op.op_type,
+            OpKind::TensorReshape | OpKind::TensorExpandShape | OpKind::TensorCollapseShape
+        ) {
+            continue;
+        }
+        let Some(res) = op.result else { continue };
+        let Some(src) = op.operands.first().copied() else {
+            continue;
+        };
+        // The ultimate source: a reshape of a reshape reads the earlier entry, so the map is
+        // transitively closed by construction (definitions precede uses in straight-line SSA).
+        let ultimate = forwards.get(&src).copied().unwrap_or(src);
+        forwards.insert(res, ultimate);
+        hops.insert(res, src);
+        verdicts.insert(res, reshape_flat_law(f, op, src));
+        consumed.insert(res);
+    }
+    (forwards, hops, verdicts, consumed)
+}
+
 /// The [`Region`] one OPERAND names, by walking back from the value to the parameter it reads.
 ///
 /// `ktdp.load <- ktdp.construct_access_tile <- ktdp.construct_memory_view <- parameter`, and the
@@ -1978,10 +2489,75 @@ fn windowed_region(k: &KtirNode, mut r: Region, tile: &Operation<'_>) -> Result<
 
 /// The rows a banded op's minted intermediate must hold: a WINDOWED input's band (`r_len`), or
 /// `logical` when every input is whole-view. See the mint's own doc for the full argument.
-fn band_rows_of(ins: &[Region], logical: u32) -> u32 {
+///
+/// ⛔⭐⭐⭐ A BROADCAST OPERAND's WINDOW IS NOT A BAND THE OP SWEEPS, so it states nothing here.
+/// The band law reads the sweep off an input the op addresses ROW BY ROW — a dense operand of a
+/// banded program (the per-core uniform rope copy). A broadcast operand is addressed at its
+/// MODE's own extent, never at the output's rows: `Col` one lane per row, `Mb` one row once,
+/// and `Y` one spray's worth (`rows/y`) at a per-trip window whose corner rides `In::y_at` —
+/// the prefill mask law, where the window is exactly the thing that is NOT the sweep (the op
+/// sweeps the output's whole `[B·mq, 64]` while the mask window holds one `[mq, 64]` slice).
+/// Reading the band off a broadcast operand mints the output at the SOURCE's window height and
+/// refuses the dense operand beside it as an extent mismatch. MEASURED (wall 18, build 9, the
+/// granite-2b prefill re-roll at `prefill_mq=256`): the fold statement threads the ladder's
+/// 8-page region into every rung's mask view (`[8192, 64]`) while the one-shot twin's own
+/// 1-page walk hulls its load windows to `(0, 1024)` — the mask became the first "banded"
+/// input, the add's output minted at the mask window's `[256, 64]`, and qk (`[8192, 64]`,
+/// dense) was refused against it. `bcast` is indexed by input position exactly as `ins` is
+/// ([`lower_function`]'s region loop pushes one region per `in_values` entry in order); the
+/// gathered-index regions appended past the inputs have no flag and keep the verbatim law.
+fn band_rows_of(ins: &[Region], bcast: &[Option<BcastAxis>], logical: u32) -> u32 {
     ins.iter()
-        .find(|x| x.r_cover != (0, x.v_rows))
-        .map_or(logical, |x| x.r_len)
+        .enumerate()
+        .find(|(i, x)| bcast.get(*i).is_none() && x.r_cover != (0, x.v_rows))
+        .map_or(logical, |(_, x)| x.r_len)
+}
+
+/// ⭐⭐⭐⭐⭐ THE ROW SWEEP A RANK-2 RESULT RESPELLS — `None` keeps the stated shape verbatim.
+///
+/// A row reduce writes ONE VALUE PER DATA ROW: the accum is `Scale::RedStick` (one whole stick
+/// per row, value k at stick k — `win_reduce_accum`'s own law), so the reduce's result, however
+/// the program SPELLS it, is the data's row-sweep vector in the accumulator's frame. A `[256, 4]`
+/// result of a reduce over `[256, 4, 64]` (flat data rows 1024, the last axis one stick) IS the
+/// `[1024, 1]` accumulator respelled — while the STICK-BLOCKED `[256, 4]` reading (value (i, j)
+/// at stick i, lane j) is a DIFFERENT BYTE LAYOUT, not a respelling of it, so the verbatim mint
+/// and the accumulator cannot describe one buffer. MEASURED (wall 11, the spliced online
+/// softmax, `attn_s1` geom=(32,8,64) mq=1): the verbatim mint placed the reduce's output at
+/// `[256, 4]` — a 256-stick footprint — while the accum writes 1024 sticks, and the door refused
+/// correctly ("a row reduction along the stick axis writes ONE value per row — `[1024, 1]`").
+///
+/// The discriminator is the NUMEL, and it is exact in both directions:
+///
+/// * THE REDUCE's OWN RESULT (`reduce_rows`, the data's `r_len` — the door's own `rows`
+///   derivation, read off the data rather than the output): one value per row means the result
+///   holds exactly `r_len` values, so the respelling fires iff the stated numel EQUALS it. A
+///   `[4, 64]` result of an axis-0 reduce (numel 256 ≠ 1024) keeps its shape and the door
+///   refuses it by name — the right answer, that reduce is not the row-reduce form.
+/// * EVERY OTHER MEMBER of the family: an op READING a one-column tile is on the reduction's
+///   side of the program (the rank-1 arm's own discriminator, one rank up), and a rank-2 result
+///   whose numel equals that input's `r_len` is the same value vector respelled — elementwise
+///   TTIR semantics preserve the flat index map, so the frame is byte-true. The online
+///   softmax's `[256, 4]` add of two `[1024, 1]` intermediates is the measured shape.
+///
+/// ⛔ AND ONLY THOSE TWO: a WIDE input's row count is not a frame fact for anything but a
+/// reduce (a `[32, 64]` gather copy over a `[2048, 64]` table has numel 2048 == the table's
+/// rows — minting it `[2048, 1]` would reframe the copy the matmul reads as an activation), and
+/// a result whose numel matches NO family input keeps its stated shape and meets its own door's
+/// law — fail-closed there, never silently re-framed here.
+pub(crate) fn respelled_frame_rows(
+    per_op: &[Region],
+    numel: u64,
+    reduce_rows: Option<u32>,
+) -> Option<u32> {
+    if let Some(r) = reduce_rows
+        && r as u64 == numel
+    {
+        return Some(r);
+    }
+    per_op
+        .iter()
+        .find(|r| !r.is_out && r.c_len == 1 && r.r_len as u64 == numel)
+        .map(|r| r.r_len)
 }
 
 /// The [`Region`] of the parameter that operand `slot` of a TILE op reinterprets — the tail both the
@@ -2041,6 +2617,16 @@ enum RowFoldKind {
     /// `tile · const` — the multiplier is part of the kind: two blocks of one scalarmul carry the
     /// same scale, and a family whose blocks did not would compute different functions per block.
     ScalarMul(f32),
+    /// `maximum(tile, C)` / `minimum(tile, C)` with `C` a splatted constant — the extremum's own
+    /// scalar form. The bound AND the direction are part of the kind, for the same reason the
+    /// multiplier is part of [`RowFoldKind::ScalarMul`]: a family whose blocks clamped at
+    /// different bounds (or in different directions) computes different functions per block.
+    ScalarExtremum { value: f32, max: bool },
+    /// `tile − C` / `C − tile` with `C` a splatted constant — the subtraction's own scalar form. The
+    /// bound AND the ORDER are part of the kind, for the same reason the multiplier is part of
+    /// [`RowFoldKind::ScalarMul`]: subtraction is not commutative, so a family whose blocks stated
+    /// different orders computes different functions per block.
+    ScalarSub { value: f32, const_first: bool },
     /// `tile · loaded [1,1] parameter` — the same launch-bound multiplier.
     BoundScalarMul,
 }
@@ -2076,8 +2662,8 @@ fn classify_row_fold(
         if rmsnorms.iter().any(|c| op.result == Some(c.out)) {
             return None;
         }
-        if let Some((v, _)) = splat_scale_of(f, op) {
-            return Some(RowFoldKind::ScalarMul(v));
+        if let Some(sf) = splat_scale_of(f, op) {
+            return Some(RowFoldKind::ScalarMul(sf.value));
         }
         if let Ok(Some(_)) = bound_scale_of(k, op) {
             return Some(RowFoldKind::BoundScalarMul);
@@ -2093,6 +2679,28 @@ fn classify_row_fold(
         .any(|c| c.up.is_none() && Some(c.mul) == op.result)
     {
         return Some(RowFoldKind::BareSilu);
+    }
+    // The extremum's scalar tiebreak, the same precedence the loop states — BEFORE the 1:1 map,
+    // which would otherwise call a clamp-with-constant `Elementwise(Maximum/Minimum)` and address
+    // the splat as a second input.
+    if matches!(op.op_type, OpKind::ArithMaxnumf | OpKind::ArithMinnumf)
+        && let Some(sf) = splat_scale_of(f, op)
+    {
+        return Some(RowFoldKind::ScalarExtremum {
+            value: sf.value,
+            max: op.op_type == OpKind::ArithMaxnumf,
+        });
+    }
+    // The subtraction's scalar tiebreak, the same precedence and for the same reason — and the
+    // ORDER rides the kind, because `C − tile` and `tile − C` are different functions a merge
+    // must not average over.
+    if op.op_type == OpKind::ArithSubf
+        && let Some(sf) = splat_scale_of(f, op)
+    {
+        return Some(RowFoldKind::ScalarSub {
+            value: sf.value,
+            const_first: sf.const_first,
+        });
     }
     match program_of(op.op_type) {
         Some(Program::Elementwise(_)) => Some(RowFoldKind::Elementwise(op.op_type)),
@@ -2302,13 +2910,31 @@ fn row_tiled_family(
                 term.operands.iter().copied().take(leader_n_in).collect()
             }
             RowFoldKind::ScalarMul(_) => {
-                let Some((_, t)) = splat_scale_of(f, term) else {
+                let Some(sf) = splat_scale_of(f, term) else {
                     return err(format!(
                         "{}: a scalar-multiply family member whose multiplier is not a splat",
                         f.name
                     ));
                 };
-                vec![t]
+                vec![sf.tensor]
+            }
+            RowFoldKind::ScalarExtremum { .. } => {
+                let Some(sf) = splat_scale_of(f, term) else {
+                    return err(format!(
+                        "{}: an extremum family member whose bound is not a splat",
+                        f.name
+                    ));
+                };
+                vec![sf.tensor]
+            }
+            RowFoldKind::ScalarSub { .. } => {
+                let Some(sf) = splat_scale_of(f, term) else {
+                    return err(format!(
+                        "{}: a scalar-subtract family member whose subtrahend is not a splat",
+                        f.name
+                    ));
+                };
+                vec![sf.tensor]
             }
             RowFoldKind::BoundScalarMul => {
                 let Ok(Some(b)) = bound_scale_of(k, term) else {
@@ -2509,6 +3135,14 @@ pub fn lower_function(
 ) -> Result<Vec<super::EmittedOp>, Error> {
     let f = &k.func;
     let mut out = Vec::new();
+    // ⭐ THE EMITTER CONTEXT, MINTED ONCE AT THIS DOOR — the sink this walk owns, with its own pair
+    // parameters as the counter and the placement authority (the mint-once-at-door pattern). Every
+    // push, sub-door call and materialization below goes through the ONE `&mut ctx`.
+    let mut ctx = super::EmitCtx {
+        ops: &mut out,
+        sym_id_base,
+        layout,
+    };
     let mut lowered = 0usize;
 
     // INTERMEDIATES, BY THE VALUE THAT PRODUCED THEM.
@@ -2548,6 +3182,28 @@ pub fn lower_function(
         .filter(|t| !crate::reserved_tids::is_reserved(*t))
         .max()
         .map_or(0, |m| m + 1);
+    // ⛔ A BOUND PARAMETER THE BUNDLE DOES NOT PLACE IS REFUSED HERE, BY NAME. A placement is
+    // a promise the WORKER fills: the program's `ktdp.construct_memory_view` states the
+    // extent, but nothing states who writes the bytes. A per-step input (an index table, a
+    // mask) synth-declared into the Intermediate segment would bake a buffer no runtime step
+    // ever writes, and the bundle would read garbage on card — so the walk declares nothing
+    // itself. The two honest fixes live at the producer: a graph tensor is placed by the tape
+    // walk, and a per-step input needs an Activation placement plus a forward-tape fill step.
+    if let Some(l) = ctx.layout {
+        for r in regions(k)?.iter() {
+            if l.placements.contains_key(&r.tid) || crate::reserved_tids::is_reserved(r.tid) {
+                continue;
+            }
+            return err(format!(
+                "{}: the bound parameter t{} (its view states [{}, {}]) has no placement in \
+                 this bundle — no step is promised to fill it. A graph tensor is placed by the \
+                 tape walk; a per-step input needs an Activation placement plus a forward-tape \
+                 fill step at its producer. The walk declares nothing itself: a walk-side synth \
+                 would bake a buffer nothing writes.",
+                f.name, r.tid, r.v_rows, r.v_cols
+            ));
+        }
+    }
     let mut inter: std::collections::HashMap<Ssa, Region> = std::collections::HashMap::new();
     // THE fp8 SCALE MULFS THE DOT ABSORBED. The walk lowers each op once, and an absorbed epilogue
     // (`p * ws`, see the absorption at the `stored` lookup) already rode into its dot's emission —
@@ -2579,6 +3235,14 @@ pub fn lower_function(
     // THE BROADCAST PLUMBING, read before the walk for the same reason: these ops lower to NOTHING and
     // the consumer carries the broadcast as an operand mode. See [`program_broadcast_chains`].
     let (bcasts, bcast_consumed) = program_broadcast_chains(f)?;
+    // ⭐⭐⭐ THE RESHAPE FORWARDS, read before the walk for the same reason the broadcast plumbing
+    // is: a `tensor.reshape` moves no byte (numpy semantics — the flat C-order index is
+    // preserved), so the op lowers to NOTHING and every consumer reads through it to the value
+    // underneath. See [`reshape_forwards`] for the law: the re-row verdict at the forward and
+    // the consumer-side check below together are the `Access::reframe` instance — a refused
+    // lens is readable only by the consumer that states its own affine access.
+    let (reshapes, reshape_hops, reshape_verdicts, reshape_consumed) = reshape_forwards(f);
+    let through = |v: Ssa| reshapes.get(&v).copied().unwrap_or(v);
     // ⭐⭐⭐ THE GATHERS THE PROGRAM STATES, read ONCE and from [`gathers_of`] — the same joins the
     // per-`Program` door's `gather_of` makes, so the two doors cannot disagree about which parameter
     // is the table or which is the index. A program with ONE indirect tile reads identically to
@@ -2604,6 +3268,8 @@ pub fn lower_function(
         .map(|(i, g)| (g.load, i))
         .collect();
     let mut gather_carried = vec![false; gathers.len()];
+    // The indexed WRITES the program states ([`scatters_of`]), lowered at their stores below.
+    let scatters = super::lower_ktir_to_superdsc::scatters_of(k)?;
     // The row fold's own view of the same analyses — built once here so its helpers read ONE
     // value rather than threading three slices each (see [`FoldAnalyses`]).
     let analyses = FoldAnalyses {
@@ -2613,6 +3279,149 @@ pub fn lower_function(
     };
 
     for op in f.operations.iter() {
+        // ⭐ AN INDEXED STORE — a `ktdp.store` through a scatter tile — lowers HERE, at its own
+        // program position, so a later gather of the same table reads what it wrote (dxp program
+        // order is call order). The copied rows come from a parameter load OR from a value this
+        // walk MINTED (the compute arm declines to bind a scattered producer's window — the rows
+        // land at the index's chosen rows, not the producer's own — so the producer minted an
+        // intermediate and the copy reads it): the value reads through reshape hops exactly as
+        // the write-back copy's does, then the mint lookup is the walk's own map, never a second
+        // derivation.
+        if op.op_type == OpKind::KtdpStore
+            && let Some(sc) = scatters
+                .iter()
+                .find(|s| op.operands.get(1) == Some(&s.tile))
+        {
+            let mut cur = sc.value;
+            while let Some(&next) = reshape_hops.get(&cur) {
+                cur = next;
+            }
+            let minted = inter.get(&cur).copied();
+            let mut legs = lower_indexed_write(k, sc, minted, ctx.sym_id_base, ctx.layout)?;
+            ctx.ops.append(&mut legs);
+            continue;
+        }
+        // ⭐⭐⭐ A STORE OF A SPLATTED CONSTANT — a FILL, the store-side member of the
+        // constant-operand class the `scalar`/`extremum`/`scalar_sub` tiebreaks above state for
+        // compute ops. A store of `tensor.splat` over an `arith.constant` is lowered HERE, at its
+        // own program position, as the identity broadcast of the value's `[1,1]` registry const
+        // over the store's own window (the window resolved through the store's tile exactly as
+        // the compute store arm below resolves its output — the load-side law "the window is the
+        // tile's own", stated for a store with no compute op to carry it). A program whose stores
+        // are ALL fills is then not the "no compute op" refusal's shape but a legitimate program:
+        // `lowered` counts these, so the online-softmax carry's seed (three constant stores, one
+        // program) lowers as three descriptors instead of dying at the door.
+        if op.op_type == OpKind::KtdpStore
+            && let Some((value, _splat)) = stored_splat_of(f, op)
+        {
+            let out_tile = op.operands.get(1).copied();
+            let tile = f
+                .operations
+                .iter()
+                .find(|o| o.op_type == OpKind::KtdpConstructAccessTile && o.result == out_tile);
+            let Some(tile) = tile else {
+                return err(format!(
+                    "{}: a constant store names no access tile — nothing states the window it fills",
+                    f.name
+                ));
+            };
+            let Some(mut o) = region_of_view_operand(k, tile, 0)? else {
+                return err(format!(
+                    "{}: a constant store names no parameter — a fill with no bound buffer has \
+                     no window to write",
+                    f.name
+                ));
+            };
+            // ⭐⭐⭐ THE CARRY SEED'S CROSS-CHECK — the sentinel pair's own door, fired where the
+            // program's stated fill and the buffer it targets are both in hand. The paged fold's
+            // max carry ([`crate::reserved_tids::PagedFoldCarry::Max`]) is seeded by the kernel's
+            // own `tl.full` constant, and the validity lanes the HOST stages carry
+            // [`crate::sdsc_abstract::ATTN_SEED_FLOOR`] — ONE value by the seed-safety law (a
+            // masked lane's score saturates at the floor, so its `p` is 0 only while `m` sits
+            // above the seed the lanes name). The two spellings are independent producers, and a
+            // drift on one side only changes the expunge margins in the dangerous direction —
+            // fluent output, never a fault — so the walk refuses the desync, naming both values.
+            // The Sum/Acc carries seed at the additive identity 0, a value only the kernel
+            // spells: no second spelling exists to desync from, so no door fires there.
+            if o.tid == crate::reserved_tids::PagedFoldCarry::Max.tid()
+                && value != crate::sdsc_abstract::ATTN_SEED_FLOOR.to_f32_const()
+            {
+                return err(format!(
+                    "{}: the fill of the paged-fold carry's max seeds at {value}, but the \
+                     validity lanes the host stages carry the finite f16 floor {} — the seed and \
+                     the lanes are ONE value (a masked lane's p is 0 only because its score \
+                     saturates at the floor the seed holds). Align the kernel's seed constant \
+                     with ATTN_SEED_FLOOR.",
+                    f.name,
+                    crate::sdsc_abstract::ATTN_SEED_FLOOR.to_f32_const()
+                ));
+            }
+            o = windowed_region(k, o, tile)?;
+            o.is_out = true;
+            ctx.ops
+                .append(&mut super::lower_ktir_to_superdsc::scalarfill_at(
+                    f.name,
+                    value,
+                    &o,
+                    ctx.sym_id_base,
+                    ctx.layout,
+                )?);
+            lowered += 1;
+            continue;
+        }
+        // ⭐⭐⭐⭐⭐ A STORE OF A VALUE THIS FUNCTION MINTED — the write-back copy. A result other
+        // compute ops still read is not the store's to bind (the unbind at the `stored` find
+        // states the law), so its producer minted it an intermediate above; the STORE lowers
+        // HERE, at its own program position, as an identity copy from the mint to the store's
+        // window — the same window resolution the compute store arm and the fill above take.
+        // Order is the whole point: the copy is the ONLY write to the buffer, and it lands at
+        // the position the store occupies (dxp program order is call order), so every consumer
+        // before it read the bytes the program says they read. The value reads through reshape
+        // hops exactly as the `stored` find does — the store's operand may be spelled through a
+        // lens — and a store whose value is neither scattered, filled, minted, nor bound to its
+        // producer below keeps the walk's own named refusal rather than a silent unwritten
+        // window.
+        if op.op_type == OpKind::KtdpStore
+            && let Some(v) = op.operands.first().copied()
+        {
+            let mut cur = v;
+            while let Some(&next) = reshape_hops.get(&cur) {
+                cur = next;
+            }
+            if let Some(src) = inter.get(&cur).copied() {
+                let out_tile = op.operands.get(1).copied();
+                let tile = f
+                    .operations
+                    .iter()
+                    .find(|o| o.op_type == OpKind::KtdpConstructAccessTile && o.result == out_tile);
+                let Some(tile) = tile else {
+                    return err(format!(
+                        "{}: a store of a minted value names no access tile — nothing states \
+                         the window it writes back to",
+                        f.name
+                    ));
+                };
+                let Some(mut o) = region_of_view_operand(k, tile, 0)? else {
+                    return err(format!(
+                        "{}: a store of a minted value names no parameter — a write-back with \
+                         no bound buffer has no window to write",
+                        f.name
+                    ));
+                };
+                o = windowed_region(k, o, tile)?;
+                o.is_out = true;
+                ctx.ops
+                    .append(&mut super::lower_ktir_to_superdsc::mintcopy_at(
+                        f.name,
+                        &src,
+                        &o,
+                        ctx.sym_id_base,
+                        ctx.layout,
+                    )?);
+                lowered += 1;
+                continue;
+            }
+        }
         if is_plumbing(op.op_type) {
             continue;
         }
@@ -2625,6 +3434,9 @@ pub fn lower_function(
                 || rmsnorms.iter().any(|c| c.consumed.contains(&r))
                 // The expand/collapse/broadcast chain itself: no descriptor, the consumer states it.
                 || bcast_consumed.contains(&r)
+                // A `tensor.reshape` result: no descriptor, no minted buffer — the consumer
+                // reads through it to the value underneath ([`reshape_forwards`]).
+                || reshape_consumed.contains(&r)
                 // An fp8 dot's absorbed scale mulf: it rode into the dot's emission above.
                 || fp8_epilogue.contains(&r)
                 // A row-folded family's non-leader block: the leader's one whole-view descriptor
@@ -2642,15 +3454,41 @@ pub fn lower_function(
         // beside the 1:1 map rather than from it — and it is carried HERE rather than as a `Program`
         // variant, because `Program` is matched exhaustively by consumers outside this crate and a bare
         // reduce is reachable only through this door. An unrecognised combiner falls through to the
-        // refusal below and is named there.
-        let reduce = (op.op_type == OpKind::LinalgReduce)
-            .then(|| reduce_kind_of(op))
-            .flatten();
+        // refusal below and is named there. The AXIS FACTS ride beside the kind (wall 12): read off
+        // the op's own `Dimensions`/`Shape` attrs, fail-closed on a statement the door cannot
+        // classify — a missing or oversized one is a producer defect to name, not a frame fact to
+        // guess.
+        let reduce = match (op.op_type == OpKind::LinalgReduce, reduce_kind_of(op)) {
+            (true, Some(kind)) => Some(Lowering::Reduce {
+                kind,
+                axes: reduce_axes_of(f.name, op)?,
+            }),
+            _ => None,
+        };
         // `arith.mulf` by a SPLATTED CONSTANT is a scalar multiply, not an `Elementwise(Mul)` — the
         // tiebreak `Program`'s own doc names. Read per-op, because one decoder layer states four
         // different multipliers. Checked BEFORE the 1:1 map, which would otherwise route it to
         // `Elementwise(Mul)` and then fail on the splat operand having no `Region`.
         let scalar = (op.op_type == OpKind::ArithMulf)
+            .then(|| splat_scale_of(f, op))
+            .flatten();
+        // ⭐ THE EXTREMUM'S OWN SCALAR TIEBREAK — `maximum(x, C)`/`minimum(x, C)` with `C` a splatted
+        // constant. The same discriminator the mulf arm applies, on the two ops whose identity lives
+        // at the range's edge: the online softmax's running-max initial (−65504, the f16 floor),
+        // any clamp against a stated bound. Checked before the 1:1 map, which would otherwise
+        // route it to `Elementwise(Maximum/Minimum)` — a two-TENSOR op — and refuse the splat
+        // operand at the input collection, because a splat states no `Region`. The MoE kernel's
+        // fp8 clamps carry both bounds as f16 TILES and keep the two-tensor arm; only the stated
+        // constant takes this one.
+        let extremum = matches!(op.op_type, OpKind::ArithMaxnumf | OpKind::ArithMinnumf)
+            .then(|| splat_scale_of(f, op))
+            .flatten();
+        // ⭐ THE NON-COMMUTATIVE MEMBER of the same class: `arith.subf` against a splatted
+        // constant. Same discriminator, and the fact the others could drop is the one this op
+        // cannot: WHICH input the constant occupies, since `C − tile` and `tile − C` are
+        // different functions. Checked before the 1:1 map for the same reason as the others —
+        // `Elementwise(Sub)` would refuse the splat at the input collection.
+        let scalar_sub = (op.op_type == OpKind::ArithSubf)
             .then(|| splat_scale_of(f, op))
             .flatten();
         // ⭐ RUNG 3: a mulf by a splat of a LOADED `[1,1]` PARAMETER is the SAME tiebreak with the
@@ -2668,6 +3506,13 @@ pub fn lower_function(
         // An rmsnorm chain's TERMINAL gain multiply becomes the one fused program. Checked before the
         // splat arm and before the 1:1 map, both of which would otherwise claim it.
         let rms = rmsnorms.iter().find(|c| op.result == Some(c.out));
+        // ⭐ WALL 13's ISLAND — a dtype CAST is a FIRST-CLASS CONVERT, read here off the op's own
+        // operand/result types (the (from, to) pair the vendor's `dl16tofp32`/`fp32todl16` binds
+        // state). Checked beside the reduce, before the 1:1 map — `program_of` has no cast arm
+        // because a cast is not an elementwise kind; without this arm every `arith.extf`/
+        // `arith.truncf` in an f32 island fell to the refusal below and named itself as needing a
+        // `Program` variant, which is exactly wrong: the convert door already exists.
+        let cast = cast_of(f, op)?;
         let Some(program) = terminal
             .map(|c| {
                 if c.up.is_some() {
@@ -2681,8 +3526,17 @@ pub fn lower_function(
                 }
             })
             .or(rms.map(|c| Lowering::RmsNorm(c.eps, c.ones)))
-            .or(reduce.map(Lowering::Reduce))
-            .or(scalar.map(|(v, _)| Lowering::ScalarMul(v)))
+            .or(reduce)
+            .or(cast)
+            .or(scalar.map(|sf| Lowering::ScalarMul(sf.value)))
+            .or(extremum.map(|sf| Lowering::ScalarExtremum {
+                value: sf.value,
+                max: op.op_type == OpKind::ArithMaxnumf,
+            }))
+            .or(scalar_sub.map(|sf| Lowering::ScalarSub {
+                value: sf.value,
+                const_first: sf.const_first,
+            }))
             .or(bound_scale.map(Lowering::BoundScalarMul))
             .or_else(|| program_of(op.op_type).map(Lowering::Node))
         else {
@@ -2713,10 +3567,18 @@ pub fn lower_function(
             Lowering::Silu => 2,
             // `linalg.reduce`'s operands are `(data, init)`: the init is the SEED, which the reduce
             // op-func carries itself, so only the data is an input.
-            Lowering::Reduce(_) => 1,
+            Lowering::Reduce { .. } => 1,
+            // A dtype convert reads ONE tensor; the format pair rides the op (`Lowering::Convert`).
+            Lowering::Convert { .. } => 1,
             // The splat is not an operand of the descriptor — it rides in the op as a bound `[1,1]`
-            // const — so a scalar multiply reads ONE tensor.
-            Lowering::ScalarMul(_) | Lowering::BoundScalarMul(_) => 1,
+            // const — so a scalar multiply reads ONE tensor. The extremum's scalar form is the
+            // same: the clamp's bound rides the op, the tile is the one operand. And so is the
+            // subtraction's: whichever SIDE the constant was stated on, the tile is the one
+            // tensor the descriptor reads.
+            Lowering::ScalarMul(_)
+            | Lowering::ScalarExtremum { .. }
+            | Lowering::ScalarSub { .. }
+            | Lowering::BoundScalarMul(_) => 1,
             // x and gamma; the epsilon, `1/cols` and the oneplus offset are the fused body's own.
             Lowering::RmsNorm(..) => 2,
             Lowering::Node(Program::Matmul) => 2,
@@ -2731,14 +3593,14 @@ pub fn lower_function(
         };
 
         // A fused chain's inputs are the ones the RECOGNISER proved, not the terminal op's operands.
-        let in_values: Vec<Ssa> = match (terminal, scalar, bound_scale) {
+        let in_values: Vec<Ssa> = match (terminal, scalar, bound_scale, extremum, scalar_sub) {
             // The two tensors the rmsnorm recogniser proved, walked back through the rank plumbing to
             // values a `Region` exists for.
             _ if rms.is_some() => {
                 let c = rms.expect("just matched");
                 vec![c.x, c.gamma]
             }
-            (Some(c), _, _) => match c.up {
+            (Some(c), _, _, _, _) => match c.up {
                 Some(up) => vec![c.gate, up],
                 // The bare form's one input is the gate; the divide's other operand is the
                 // chain-interior `1 + e^-x`, which the fused op never materialises.
@@ -2746,11 +3608,17 @@ pub fn lower_function(
             },
             // The TENSOR operand the recogniser proved, not operand 0 — the splat sits on either side
             // (`ms * INV_D` has it second, and nothing obliges a producer to put it there).
-            (None, Some((_, tensor)), _) => vec![tensor],
+            (None, Some(sf), _, _, _) => vec![sf.tensor],
             // RUNG 3: same rule, the splat's other side. The bound scale is a `[1,1]` parameter, not
             // an operand of the descriptor.
-            (None, None, Some(b)) => vec![b.tensor],
-            (None, None, None) => op.operands.iter().copied().take(n_in).collect(),
+            (None, None, Some(b), _, _) => vec![b.tensor],
+            // The extremum's scalar form: the TENSOR operand, the clamp's other side — the same
+            // rule the mulf arm states.
+            (None, None, None, Some(sf), _) => vec![sf.tensor],
+            // The subtraction's: same rule again — the constant rides the op whatever side it was
+            // stated on, and the tile is the one operand.
+            (None, None, None, None, Some(sf)) => vec![sf.tensor],
+            (None, None, None, None, None) => op.operands.iter().copied().take(n_in).collect(),
         };
 
         // A BROADCAST OPERAND READS ITS SOURCE. The chain minted no buffer (it emitted no op), so the
@@ -2776,6 +3644,47 @@ pub fn lower_function(
             .iter()
             .map(|v| bcasts.get(v).map_or(*v, |b| b.src))
             .collect();
+        // ⭐⭐⭐ AND THROUGH THE RESHAPES — the last rewrite before any consumer-side lookup, so
+        // every join downstream (the region loop, the `inter` mint lookup, the gather identity
+        // join, the row fold) names the value UNDERNEATH the lens and not the lens. A reshape
+        // result is never a load, never a minted intermediate, and never a gathered load's
+        // identity — without this rewrite every one of those lookups fails on it; with it, the
+        // region/gather/mint of the SOURCE answers, and the consumer's own extent guards are
+        // what say whether the split it reads through is one its math can use.
+        let pre_through: Vec<Ssa> = in_values.clone();
+        let in_values: Vec<Ssa> = in_values.iter().map(|v| through(*v)).collect();
+        // ⭐⭐⭐ AND THE LENS IS LAW-CHECKED AT THE CONSUMER — every hop the consumer's own
+        // operand spelling reads through must be flat-ADMITTED (the #741 re-row law the forward
+        // ran), unless this op is the ONE consumer that states its own affine access over the
+        // source: a matmul whose B is the gathered load, whose presentation is the
+        // `Access::gathered` mint over the ultimate source — a DIFFERENT set of byte laws (the
+        // total bound, the gather's own), stated where that access is minted. Anything else
+        // reading a refused reshape takes the target's framing on the source's bytes — the
+        // clean-bake wrong-byte class the re-row law exists to refuse, so it is a build error
+        // here, naming the law's own clause.
+        let states_own_access =
+            matches!(op.op_type, OpKind::LinalgMatmul | OpKind::LinalgBatchMatmul)
+                && gathers
+                    .iter()
+                    .any(|g| Some(g.load) == in_values.get(1).copied());
+        for (i, v) in pre_through.iter().enumerate() {
+            let mut cur = *v;
+            while let Some(&next) = reshape_hops.get(&cur) {
+                if let Some(ReshapeFlat::Refused(msg)) = reshape_verdicts.get(&cur)
+                    && !(states_own_access && i == 1)
+                {
+                    return err(format!(
+                        "{}: operand {i} reads t{} through a reshape whose flat presentation \
+                         the re-row law refuses — {msg}. A consumer may take that framing only \
+                         by stating its own affine access over the source (the gathered \
+                         matmul's B does); this op does not, so it would read the source's \
+                         bytes at a framing that moves them",
+                        f.name, cur.0
+                    ));
+                }
+                cur = next;
+            }
+        }
 
         // ⭐⭐⭐⭐⭐ THE ROW-TILED FAMILY FOLD'S CANDIDACY GATE. Only the foldable pointwise kinds
         // (the same `program` this loop just derived — never re-derived here, so the gate cannot
@@ -2788,6 +3697,8 @@ pub fn lower_function(
                 program,
                 Lowering::Silu
                     | Lowering::ScalarMul(_)
+                    | Lowering::ScalarExtremum { .. }
+                    | Lowering::ScalarSub { .. }
                     | Lowering::BoundScalarMul(_)
                     | Lowering::Node(Program::Elementwise(_))
             )
@@ -2922,39 +3833,39 @@ pub fn lower_function(
         // ⛔ APPENDED AFTER the inputs and BEFORE the output, which both orders below rely on.
         // `bcast_axes` is indexed by input position, so the index may not sit among them; a
         // `ScalarMul`'s gathered table is its one tensor input, so it may not come first either.
-        let op_gather = 'g: {
-            for (i, v) in in_values.iter().enumerate() {
-                if let Some(&ti) = gathered_loads.get(v) {
-                    let g = gathers[ti];
-                    let idx_r = f
-                        .arguments
-                        .iter()
-                        .zip(k.bindings.iter())
-                        .position(|(_, b)| b.get() == g.index_tid)
-                        .and_then(|i| regions(k).ok().and_then(|all| all.get(i).copied()));
-                    let Some(mut idx_r) = idx_r else {
-                        return err(format!(
-                            "{}: the program gathers through t{}, which is not one of this function's \
-                             bound parameters — an index buffer with no binding has no placement and no \
-                             stated length, and the descriptor makes dbo's idx→address program iterate \
-                             one entry per row of the node",
-                            f.name, g.index_tid
-                        ));
-                    };
-                    idx_r.is_out = false;
-                    per_op.push(idx_r);
-                    gather_carried[ti] = true;
-                    // ⭐ THE OP'S FIRST GATHERED INPUT, by identity. A second gathered input of the
-                    // same op is NOT checked here: this loop takes the first match, and the whole-
-                    // function consumer counting that refuses a gathered load with two consumers is
-                    // the matmul materializer's own (`gathered_matmul_materializes`). An op whose
-                    // SECOND input is also a gathered load of another tile reaches that refusal, or
-                    // the ScalarMul-only rule below — not a mid-walk one.
-                    break 'g Some((g, ti, i));
-                }
-            }
-            None
-        };
+        // ⭐⭐⭐ LAW (a) — A CONTRACTION MATERIALIZES **EVERY** GATHERED OPERAND. The join below
+        // collects ALL of this op's gathered inputs, in input order. The single-gathered-input
+        // admission this replaced took the FIRST match only, so a contraction whose A and B are
+        // both gathered (the decode attention's dot: A gathers Q through its repetition table,
+        // B gathers the pool's blocks) materialized one side and left the other reading the
+        // walk's raw gathered load — right shape, right dtype, wrong rows, from a clean bake.
+        // Each gathered input now takes its own materialization below; an input that cannot
+        // materialize is refused by name at the door that used to admit only the first.
+        let op_gathers: Vec<(Gather, usize, usize)> = in_values
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| gathered_loads.get(v).map(|&ti| (gathers[ti], ti, i)))
+            .collect();
+        for &(g, ti, _gi) in &op_gathers {
+            let idx_r = f
+                .arguments
+                .iter()
+                .zip(k.bindings.iter())
+                .position(|(_, b)| b.get() == g.index_tid)
+                .and_then(|i| regions(k).ok().and_then(|all| all.get(i).copied()));
+            let Some(mut idx_r) = idx_r else {
+                return err(format!(
+                    "{}: the program gathers through t{}, which is not one of this function's \
+                     bound parameters — an index buffer with no binding has no placement and no \
+                     stated length, and the descriptor makes dbo's idx→address program iterate \
+                     one entry per row of the node",
+                    f.name, g.index_tid
+                ));
+            };
+            idx_r.is_out = false;
+            per_op.push(idx_r);
+            gather_carried[ti] = true;
+        }
         // ⛔⛔⛔ A GATHERED OPERAND MAY ONLY REACH A BODY THAT DECLARES THE INDEX. `ScalarMul` is the
         // one — `scalarmul_at` takes the [`Gather`] and routes to
         // `assemble_pointwise_broadcast_gather`. Every other arm of [`emit_one`] would emit an
@@ -2962,74 +3873,111 @@ pub fn lower_function(
         // ids: right shape, right dtype, right distribution, wrong rows, and nothing downstream
         // compares the two. So it is refused by name rather than lowered as the nearest thing.
         //
-        // ⭐⭐⭐ THE ONE EXCEPTION — RUNG 4: A MATMUL WHOSE **B** IS THE GATHERED TABLE. The
+        // ⭐⭐⭐ THE ONE EXCEPTION — RUNG 4: A CONTRACTION WHOSE OPERAND IS THE GATHERED TABLE. The
         // materialization is synthesized HERE, before the refusal can fire, because the vendor's own
         // gathered fixtures and IBM's paged attention both spell a gathered contraction exactly one
         // way and this is it: a KERNEL-less gathered copy writing a minted intermediate, the matmul
-        // reading the intermediate as plain-B. See [`gathered_matmul_materializes`], which states the
-        // whole argument and does the work.
-        let gathered_b = if let Some((g, _ti, gi)) = op_gather
-            && matches!(program, Lowering::Node(Program::Matmul))
-        {
-            gathered_matmul_materializes(
-                k,
-                layout,
-                &mut GatherEmit {
-                    sym_id_base,
-                    out: &mut out,
-                    floor,
-                    inter: &mut inter,
-                },
-                g,
-                gi,
-                &in_values,
-            )?
-        } else {
-            false
-        };
-        if op_gather.is_some()
-            && !gathered_b
-            && !matches!(
-                program,
-                Lowering::ScalarMul(_) | Lowering::BoundScalarMul(_)
-            )
-        {
+        // reading the intermediate as a plain activation. See [`gathered_matmul_materializes`], which
+        // states the whole argument and does the work.
+        // ⭐⭐⭐⭐⭐ AND THE BATCHED FORM IS ADMITTED AT THE SAME DOOR — a `linalg.batch_matmul`
+        // whose B is the gathered table read through its reshape states its geometry in its OWN
+        // operand types, and the materializer's batch branch writes the C-order copy the
+        // per-batch bmm reads (see [`emit::batched_gathered`]). A rank-2 gathered dot never
+        // enters it: it keeps rung 4's card-proven `[k, n]` path, byte for byte.
+        // ⭐⭐⭐⭐⭐ AND LAW (a) MAKES IT **EVERY** GATHERED OPERAND, NOT ONLY B — the loop below
+        // materializes each gathered input in turn, so a dot whose A and B are both gathered
+        // (the decode attention's) serves both sides through the same door instead of leaving
+        // the second reading the walk's raw gathered load. The frame each side takes is stated
+        // by the operand's own geometry, never by its position: see the loop's doc.
+        let scalar_body = matches!(
+            program,
+            Lowering::ScalarMul(_)
+                | Lowering::ScalarExtremum { .. }
+                | Lowering::ScalarSub { .. }
+                | Lowering::BoundScalarMul(_)
+        );
+        let mut gathered_forms: Vec<(usize, GatheredB)> = Vec::new();
+        if !scalar_body {
+            for &(g, _ti, gi) in &op_gathers {
+                gathered_forms.push((
+                    gi,
+                    gathered_matmul_materializes(
+                        k,
+                        GatherEmit {
+                            ctx: &mut ctx,
+                            floor,
+                            inter: &mut inter,
+                        },
+                        g,
+                        gi,
+                        &in_values,
+                        GatherConsumer {
+                            op,
+                            pre_through: &pre_through,
+                        },
+                    )?,
+                ));
+            }
+        }
+        let gathered_b = gathered_forms
+            .iter()
+            .any(|(_, f)| !matches!(f, GatheredB::No));
+        let batched_geo = gathered_forms.iter().find_map(|(_, f)| match f {
+            GatheredB::Batched(bg) => Some(*bg),
+            _ => None,
+        });
+        // The FIRST gathered input that did not materialize, by input position — the refusal
+        // names it, so a program with two gathered operands is told which one failed and not
+        // only that "the op reads a tile".
+        let unmaterialized = op_gathers.iter().find_map(|&(g, _ti, gi)| {
+            let materialized = gathered_forms
+                .iter()
+                .any(|&(fgi, ref f)| fgi == gi && !matches!(f, GatheredB::No));
+            (!materialized).then_some((g, gi))
+        });
+        if !scalar_body && let Some((g, gi)) = unmaterialized {
             return err(format!(
-                "{}: `{:?}` reads a `ktdp.construct_indirect_access_tile` (t{} gathered through \
-                 t{}), and this door declares an index operand only for `Program::ScalarMul` — \
-                 `scalarmul_at` is the one body that carries a `Gather`. Every other assembler here \
-                 would emit a descriptor reading the table DIRECTLY at its base, which is the right \
-                 shape and the wrong rows, from a clean bake. Give the gathered operand its own \
-                 `ScalarMul` node, or add the index to the assembler this op needs.",
+                "{}: `{:?}` reads a `ktdp.construct_indirect_access_tile` at input {gi} (t{} \
+                 gathered through t{}), and this door declares an index operand only for the \
+                 constant-operand pointwise bodies (`Program::ScalarMul`, the extremum's and the \
+                 subtraction's own scalar forms) — `scalarmul_scaled` is the one body that carries a \
+                 `Gather`. Every other assembler here would emit a descriptor reading the table \
+                 DIRECTLY at its base, which is the right shape and the wrong rows, from a clean \
+                 bake. Give the gathered operand its own `ScalarMul` node, or add the index to the \
+                 assembler this op needs.",
                 f.name,
                 op.op_type,
-                op_gather.map_or(0, |(g, _, _)| g.value_tid),
-                op_gather.map_or(0, |(g, _, _)| g.index_tid),
+                g.source.tid(),
+                g.index_tid,
             ));
         }
 
         // ⭐⭐⭐ RUNG 4'S SECOND HALF — THE MATMUL READS THE INTERMEDIATE, NOT THE TABLE. The copy was
-        // emitted above and the region recorded under the GATHERED VALUE; this swaps `per_op`'s B slot
-        // for it, so the matmul's own assembler sees a plain `[k, n]` activation. The index region
-        // appended by the gather join is DROPPED from the list at the same time (truncate to `n_in`):
-        // the matmul's descriptor carries no index operand (the copy declared it), and
-        // `matmul_oriented`'s `ins.len() != 2` arity check would read a three-input list as the fp8
+        // emitted above and the region recorded under the GATHERED VALUE; this swaps each gathered
+        // operand's `per_op` slot for it (LAW (a): every one of them, not only the first), so the
+        // matmul's own assembler sees plain activations. The index regions appended by the gather
+        // join are DROPPED from the list at the same time (truncate to `n_in`): the matmul's
+        // descriptor carries no index operand (the copies declared them), and
+        // `matmul_oriented`'s `ins.len() != 2` arity check would read a longer list as the fp8
         // W8A8 form and refuse it.
         if gathered_b {
-            let Some((_, _, gi)) = op_gather else {
-                unreachable!("gathered_b implies op_gather")
-            };
-            let b_value = in_values[gi];
-            let Some(r) = inter.get(&b_value) else {
-                return err(format!(
-                    "{}: the gathered B's materialized intermediate is missing from the walk's own \
-                     map — the copy was emitted but its region was not recorded",
-                    f.name
-                ));
-            };
-            let mut r = *r;
-            r.is_out = false;
-            per_op[1] = r;
+            for &(gi, ref form) in &gathered_forms {
+                if matches!(form, GatheredB::No) {
+                    continue;
+                }
+                let b_value = in_values[gi];
+                let Some(r) = inter.get(&b_value) else {
+                    return err(format!(
+                        "{}: the gathered operand at input {gi} has no materialized intermediate \
+                         in the walk's own map — the copy was emitted but its region was not \
+                         recorded",
+                        f.name
+                    ));
+                };
+                let mut r = *r;
+                r.is_out = false;
+                per_op[gi] = r;
+            }
             per_op.truncate(n_in);
         }
 
@@ -3096,11 +4044,59 @@ pub fn lower_function(
             transposed_b_is_placeable(f.name, b, b_from_parameter)?;
         }
 
-        // THIS OP'S OUTPUT: the parameter a `ktdp.store` writes from this op's result.
-        let mut stored = f
-            .operations
-            .iter()
-            .find(|s| s.op_type == OpKind::KtdpStore && s.operands.first().copied() == op.result);
+        // THIS OP'S OUTPUT: the parameter a `ktdp.store` writes from this op's result. ⭐⭐⭐ THE
+        // STORE'S VALUE READS THROUGH RESHAPES — the producer's own spelling ends
+        // `o_desc.store([0, 0], tl.reshape(o, [rows, cols]))`, so the store's operand is the
+        // LENS, not the value: the find resolves it through [`reshape_forwards`] to the op's
+        // result, exactly as the input-side rewrites above do, and a store whose value no
+        // through-reshape resolution matches keeps the not-stored arm below (mint + named
+        // refusal if nothing consumes it) rather than a silent unwritten output.
+        let mut stored = f.operations.iter().find(|s| {
+            s.op_type == OpKind::KtdpStore
+                && s.operands
+                    .first()
+                    .copied()
+                    .is_some_and(|v| Some(through(v)) == op.result)
+        });
+        // ⭐⭐⭐ AND THE STORE IS A FLAT CONSUMER OF THE SAME LAW — it writes the value's whole
+        // flat content at its window, so the chain it reads through must be flat-ADMITTED like
+        // every other consumer's: a store whose value arrives through a REFUSED reshape would
+        // take the target's framing on the source's bytes, and the window's rows are the
+        // producer's own statement. There is no store-side exemption — the one access-stating
+        // consumer is the gathered matmul's B.
+        if let Some(s) = stored
+            && let Some(v) = s.operands.first().copied()
+        {
+            let mut cur = v;
+            while let Some(&next) = reshape_hops.get(&cur) {
+                if let Some(ReshapeFlat::Refused(msg)) = reshape_verdicts.get(&cur) {
+                    return err(format!(
+                        "{}: the `ktdp.store` of t{} reads t{} through a reshape whose flat \
+                         presentation the re-row law refuses — {msg}. The store writes the \
+                         value's whole flat content at its window, so a framing that moves \
+                         bytes is not one it can write",
+                        f.name, v.0, cur.0
+                    ));
+                }
+                cur = next;
+            }
+        }
+        // ⭐⭐⭐⭐⭐ AND NOT WHEN THE RESULT IS STILL READ. The arm below emits this op writing the
+        // store's window IN PLACE at this op's own position — honest only while the result is the
+        // store's alone. A result other compute ops still read (the fold body's running max:
+        // stored at the trip's end, read by `m − m_new` and `qk − m_new[.., .., None]` on the way
+        // there) would have its old value overwritten before those consumers read it — a
+        // descriptor reads at ITS OWN program position, never at the load's. Such a result is
+        // minted as the intermediate it already is to those consumers, and the store itself
+        // lowers at its own position as the write-back copy the `mintcopy` arm at the top of the
+        // walk states. This runs BEFORE the fp8 epilogue arm so that absorption (whose absorbed
+        // `arith.mulf` has exactly the one dot consumer) is untouched by it.
+        if let Some(res) = op.result
+            && stored.is_some()
+            && result_consumed_beyond_store(f, res)
+        {
+            stored = None;
+        }
         // ⭐⭐⭐ THE fp8 WEIGHT-SCALE EPILOGUE, ABSORBED AT THE DOT. `matmul_fp8.py` spells the W8A8
         // contraction's scale multiply IN THE KERNEL — `p * ws` between the dot and the store — so
         // the dot's result is never stored directly: without this arm the walk would mint it an
@@ -3216,6 +4212,25 @@ pub fn lower_function(
             fp8_epilogue.insert(mulf_res);
             stored = Some(mulf_store);
         }
+        // ⭐⭐⭐⭐⭐ AND NOT THROUGH AN INDEXED WRITE. A `ktdp.store` through an indirect tile (a
+        // scatter) is not this op's window: its rows land at the rows the INDEX names, not at the
+        // op's own, so binding the producer's output to the indexed table would emit the body
+        // sweeping the whole table in row order — the permutation silently undone. The value is
+        // minted as the intermediate it is (the not-stored arm below), and the indexed write
+        // itself lowers at the STORE's own program position (the `scatters` arm at the top of the
+        // walk), copying the mint's rows into the table through the index — the same
+        // mint-then-copy-at-the-store law the write-back copy below states for a result other ops
+        // still read. This runs AFTER the fp8 epilogue arm so that arm's `stored.is_none()` gate
+        // is untouched: an fp8 contraction's scale multiply stores through a plain tile today,
+        // and a producer that scatters it is a new form for THAT arm to refuse by name.
+        if op.result.is_some()
+            && let Some(s) = stored
+            && scatters
+                .iter()
+                .any(|sc| s.operands.get(1) == Some(&sc.tile))
+        {
+            stored = None;
+        }
         let Some(store) = stored else {
             // NOT STORED => AN INTERMEDIATE. Mint a buffer for it, declare it to the layout, and
             // record it so the consuming op finds it as an input.
@@ -3225,7 +4240,45 @@ pub fn lower_function(
                     f.name, op.op_type
                 ));
             };
+            // ⭐⭐⭐ WALL 13 — THE INTERMEDIATE MINTS AT THE VALUE'S OWN `df`. The result type's
+            // element dtype is the one statement of the value's format, so the synth reservation
+            // prices an f32 intermediate at 4 B/elem (`synth_df`, the island's footprint law) and
+            // the region carries the same `df` every door this value reaches classifies at. Every
+            // f16 intermediate is byte-identical (`synth` IS `synth_df(Df::Fp16)`), and a dtype
+            // with no stick geometry (bool, i64) keeps the fp16 basis — inert for the DDL families
+            // this value can reach, the same honest fallback `regions()` states for a parameter.
+            let df = op
+                .result_type
+                .and_then(|t| match t {
+                    ktir_core::irtype::IrType::Tensor { elem, .. }
+                    | ktir_core::irtype::IrType::MemRef { elem, .. } => Some(elem),
+                    ktir_core::irtype::IrType::Scalar(d) => Some(d),
+                    ktir_core::irtype::IrType::AccessTile { .. }
+                    | ktir_core::irtype::IrType::Index => None,
+                })
+                .and_then(df_of_dtype)
+                .unwrap_or(Df::Fp16);
             let dims = match op.result_type {
+                // ⭐⭐⭐⭐⭐ A RANK-2 RESULT THAT RESPELLS A REDUCE-FAMILY VECTOR IS MINTED IN THAT
+                // FAMILY's FRAME — `[rows, 1]`, the accumulator's own — not in its stated spelling.
+                // The placement and the region every consumer reads are minted HERE, before the
+                // door runs, so the frame is decided at the one site that owns both (`layout.synth`
+                // below, `inter.insert` below) — a door-side respell could not reach the consumers
+                // and would leave the placement at the wrong footprint. [`respelled_frame_rows`]
+                // is the law and carries the wall-11 measurement; `None` falls through to the
+                // verbatim arm below, so every non-family shape is byte-identical to before.
+                Some(ktir_core::irtype::IrType::Tensor { dims, .. })
+                    if dims.len() == 2
+                        && let Some(rows) = respelled_frame_rows(
+                            &per_op,
+                            dims[0] as u64 * dims[1] as u64,
+                            (matches!(program, Lowering::Reduce { .. }))
+                                .then(|| per_op.iter().find(|r| !r.is_out).map(|r| r.r_len))
+                                .flatten(),
+                        ) =>
+                {
+                    [rows, 1]
+                }
                 Some(ktir_core::irtype::IrType::Tensor { dims, .. }) if dims.len() == 2 => {
                     [dims[0] as u32, dims[1] as u32]
                 }
@@ -3259,7 +4312,7 @@ pub fn lower_function(
                 // it has no such input to consult.
                 Some(ktir_core::irtype::IrType::Tensor { dims, .. })
                     if dims.len() == 1
-                        && (matches!(program, Lowering::Reduce(_))
+                        && (matches!(program, Lowering::Reduce { .. })
                             || per_op.iter().any(|r| !r.is_out && r.c_len == 1)) =>
                 {
                     [dims[0] as u32, 1]
@@ -3278,15 +4331,19 @@ pub fn lower_function(
             // positions), but [`windowed_region`] resolves each operand as the BAND (`[1024, 64]`
             // — the launch's own tiles, flush), and the op sweeps the band: a mint at the tile's
             // height would be a buffer the emission overruns by `positions − 1` tiles on every
-            // core past the first. The band is read off the inputs the same way
-            // [`pointwise_rows`] reads the sweep off the output — a WINDOWED input states it as
-            // its `r_len` — while a function whose inputs are all whole-view keeps the result
-            // type's own rows, so every mint this door has ever made is byte-identical. (A chain
-            // whose every input is a minted band intermediate states no windowed input; its mint
-            // stays at the tile and the extents law refuses the sweep mismatch by name — refused
-            // at the op that could have extended it, not silently mis-sized.)
-            let dims = [band_rows_of(&per_op, dims[0]), dims[1]];
-            let Some(layout) = layout else {
+            // core past the first. The band is read off the DENSE inputs the same way
+            // [`pointwise_rows`] reads the sweep off the output — a WINDOWED dense input states
+            // it as its `r_len` — while a function whose inputs are all whole-view keeps the
+            // result type's own rows, so every mint this door has ever made is byte-identical.
+            // (A chain whose every input is a minted band intermediate states no windowed input;
+            // its mint stays at the tile and the extents law refuses the sweep mismatch by name —
+            // refused at the op that could have extended it, not silently mis-sized.) ⛔ AND A
+            // BROADCAST OPERAND DOES NOT STATE THE BAND even when its region is windowed: its
+            // mode addresses it at the mode's own extent (`Col` a lane per row, `Mb` one row,
+            // `Y` one spray at a per-trip window), so its `r_len` is the source's slice height,
+            // never the sweep — [`band_rows_of`]'s own law, with the wall-18 measurement.
+            let dims = [band_rows_of(&per_op, &bcast_axes, dims[0]), dims[1]];
+            let Some(layout) = ctx.layout else {
                 return err(format!(
                     "{}: `{:?}`'s result is an intermediate, which needs a `BundleLayout` to hold \
                      its buffer -- `layout: None` is the unit-test arm and cannot place one",
@@ -3327,9 +4384,11 @@ pub fn lower_function(
             // producer wrote (weight columns past the window; never read at corner 0) stay
             // numerically inert.
             let dev_dims = match program {
-                // The producer's own rule, with `k` from the A operand's region (the same
-                // `k = a.c_len` the emitter itself reads; A is `per_op`'s first input).
-                Lowering::Node(Program::Matmul) => {
+                // ⛔ NOT THE BATCHED DOT: its per-stick cut addresses the output at the LOGICAL
+                // `n` (one stick column block at a time), so the reservation IS the logical dims
+                // — `for_matmul`'s util-floor bump is the ORIENTED emitter's own law and rides
+                // only the arm that addresses at the bumped width.
+                Lowering::Node(Program::Matmul) if batched_geo.is_none() => {
                     let k = per_op.first().map_or(dims[1], |a| a.c_len);
                     // The SAME `for_matmul` the emitter's `n_dev` takes — one decision for the
                     // buffer this mint reserves and the width the emit writes, so they cannot
@@ -3342,7 +4401,7 @@ pub fn lower_function(
                 }
                 _ => dims,
             };
-            layout.synth(crate::place::PlaceId::Act(tid), &dev_dims);
+            layout.synth_df(crate::place::PlaceId::Act(tid), &dev_dims, df);
             let r = Region {
                 tid,
                 v_rows: dims[0],
@@ -3355,6 +4414,9 @@ pub fn lower_function(
                 c_cover: (0, dims[1]),
                 is_out: true,
                 is_fp8: false,
+                // The value's OWN element type (wall 13): an f32 intermediate is reserved and
+                // classified at IEEE_FP32; every f16 one keeps the fp16 mint byte-identical.
+                df,
             };
             inter.insert(res, r);
             per_op.push(r);
@@ -3363,16 +4425,17 @@ pub fn lower_function(
                 name,
                 program,
                 &per_op,
-                sym_id_base,
+                ctx.sym_id_base,
                 Some(layout),
                 headmajor,
                 WalkProof {
                     b_orient,
-                    gather: op_gather.map(|(g, _, _)| g),
+                    gather: op_gathers.first().map(|&(g, _, _)| g),
                     bcast: &bcast_axes,
+                    batched: batched_geo,
                 },
             )?;
-            out.append(&mut emitted);
+            ctx.ops.append(&mut emitted);
             lowered += 1;
             continue;
         };
@@ -3409,16 +4472,17 @@ pub fn lower_function(
             f.name,
             program,
             &per_op,
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
             headmajor,
             WalkProof {
                 b_orient,
-                gather: op_gather.map(|(g, _, _)| g),
+                gather: op_gathers.first().map(|&(g, _, _)| g),
                 bcast: &bcast_axes,
+                batched: batched_geo,
             },
         )?;
-        out.append(&mut emitted);
+        ctx.ops.append(&mut emitted);
         lowered += 1;
     }
 
@@ -3440,7 +4504,7 @@ pub fn lower_function(
             ));
         }
         let r = regions(k)?;
-        return super::lower_ktir_to_superdsc::lmlast(f.name, k, &r, sym_id_base, layout);
+        return super::lower_ktir_to_superdsc::lmlast(f.name, k, &r, ctx.sym_id_base, ctx.layout);
     }
     if lowered == 0 {
         return err(format!("{}: no compute op in the function", f.name));
@@ -3467,11 +4531,97 @@ pub fn lower_function(
                  consulted. That is the right shape and the wrong rows, from a clean bake, and \
                  nothing downstream compares the two. The gathered value must be an input of an op \
                  this door lowers.",
-                f.name, ti, g.value_tid, g.index_tid,
+                f.name,
+                ti,
+                g.source.tid(),
+                g.index_tid,
             ));
         }
     }
     Ok(out)
+}
+
+/// ⭐ ONE INDEXED WRITE — [`super::assemble_indexed_write`] over the scatter's own facts. The
+/// stored rows come from a LOAD of a parameter (a value this walk has a region for at a
+/// whole-tensor corner) or from a value the walk MINTED — the intermediate a scattered producer's
+/// result became (the compute arm's indexed-write law: the rows land at the index's chosen rows,
+/// so the producer's window is never the table's) — resolved by the caller through the walk's own
+/// reshape hops and mint map; the table and the index are the tile's own parameters. Returns the
+/// LEGS the emitter cuts (one op per index stick), in order.
+fn lower_indexed_write(
+    k: &KtirNode,
+    sc: &super::lower_ktir_to_superdsc::Scatter,
+    minted: Option<Region>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<super::EmittedOp>, Error> {
+    let f = &k.func;
+    let src = match region_for_operand(k, sc.value)? {
+        Some(r) => r,
+        None => minted.ok_or_else(|| Error {
+            message: format!(
+                "{}: the indexed store's value is neither a load of a parameter nor a value this \
+                 walk minted — an indexed write copies rows a parameter holds or rows a minted \
+                 intermediate holds, and anything else is a producer form it cannot source",
+                f.name
+            ),
+        })?,
+    };
+    // ⛔ THE SOURCE IS READ FROM ITS BASE, so a row window elsewhere is refused by name rather
+    // than copied from row 0.
+    if src.r_start != 0 || src.c_start != 0 {
+        return err(format!(
+            "{}: the indexed store's rows start at ({}, {}) of t{} — this door copies a source read \
+             from its base",
+            f.name, src.r_start, src.c_start, src.tid
+        ));
+    }
+    if src.r_len != sc.entries {
+        return err(format!(
+            "{}: the indexed store writes {} rows but its tile states {} entries",
+            f.name, src.r_len, sc.entries
+        ));
+    }
+    let all = regions(k)?;
+    let region_of = |tid: u32| -> Result<Region, Error> {
+        k.bindings
+            .iter()
+            .position(|b| b.get() == tid)
+            .and_then(|i| all.get(i).copied())
+            .ok_or_else(|| Error {
+                message: format!("{}: t{tid} is not a bound parameter", f.name),
+            })
+    };
+    let table = region_of(sc.value_tid)?;
+    let _ = region_of(sc.index_tid)?;
+    if table.v_cols != src.c_len {
+        return err(format!(
+            "{}: the indexed store writes {}-wide rows into a {}-wide table",
+            f.name, src.c_len, table.v_cols
+        ));
+    }
+    let run = crate::superdsc_opspec::StickRun::covering(sc.first_entry.entries(), sc.entries)
+        .map_err(|m| Error {
+            message: format!("{}: {m}", f.name),
+        })?;
+    let name = format!("{}_scatter_t{}", f.name, sc.value_tid);
+    // The legs carry the emitter's own `_s{k}` names and stay in cut order; the walk appends them
+    // at the store's own program position (dxp program order is call order).
+    super::assemble_indexed_write(
+        super::IndexedWrite {
+            op_name: &name,
+            rows: sc.entries,
+            cols: src.c_len,
+            src: &src.name(),
+            table: &table.name(),
+            table_rows: table.v_rows,
+            index_name: &crate::place::act_name(sc.index_tid),
+            run,
+        },
+        sym_id_base,
+        layout,
+    )
+    .map_err(Error::from)
 }
 
 /// WHAT ONLY THE WALK CAN STATE about one op. Threaded rather than re-derived, because [`emit_one`]
@@ -3493,6 +4643,11 @@ struct WalkProof<'a> {
     /// [`program_broadcast_chains`]) — positional with `per_op`'s inputs, empty when no operand is
     /// broadcast.
     bcast: &'a [Option<BcastAxis>],
+    /// ⭐ THE BATCHED GATHERED DOT'S GEOMETRY — `Some` for exactly a `linalg.batch_matmul` whose
+    /// B is a gathered table (its B in `per_op` is then the C-order copy the materializer wrote,
+    /// not a `[k, n]` window). `None` everywhere else, and then the matmul arm is byte-identical
+    /// to what it was: a rank-2 gathered dot keeps rung 4's own frame.
+    batched: Option<super::batched_gathered::BatchedGathered>,
 }
 
 /// Hand ONE op's regions to the body its `Program` names.
@@ -3513,6 +4668,7 @@ fn emit_one(
         b_orient,
         gather,
         bcast,
+        batched,
     } = proof;
     // THE FUSED SILU. Reached only through [`program_silu_mul_chains`], which PROVED the five-op
     // longhand; `per_op` is `[gate, up, out]`, which is the parameter order `silumul`'s own
@@ -3523,8 +4679,28 @@ fn emit_one(
         }
         // A BARE ROW REDUCTION. The entry point refuses a multi-row `max` by name — see its doc for
         // the measured device defect that makes that a correctness matter rather than a limitation.
-        Lowering::Reduce(kind) => {
-            return super::lower_ktir_to_superdsc::reduce(name, kind, per_op, sym_id_base, layout);
+        Lowering::Reduce { kind, axes } => {
+            return super::lower_ktir_to_superdsc::reduce(
+                name,
+                kind,
+                axes,
+                per_op,
+                sym_id_base,
+                layout,
+            );
+        }
+        // ⭐ WALL 13's ISLAND — a dtype CAST as a first-class convert. `per_op` is `[data, out]`,
+        // and the door checks the regions' own dfs against the (from, to) pair the op stated —
+        // the mixed-df pin's convert-side seat (an elementwise op is the other).
+        Lowering::Convert { from, to } => {
+            return super::lower_ktir_to_superdsc::convert(
+                name,
+                from,
+                to,
+                per_op,
+                sym_id_base,
+                layout,
+            );
         }
         // `tile * <constant>`, with the multiplier this op's own — `scalarmul_at` is the shared body
         // the per-`Program` door reaches through `scalarmul`, so the two cannot drift about what a
@@ -3539,6 +4715,36 @@ fn emit_one(
             return super::lower_ktir_to_superdsc::scalarmul_at(
                 name,
                 scale,
+                gather,
+                per_op,
+                sym_id_base,
+                layout,
+            );
+        }
+        // `maximum(tile, C)` / `minimum(tile, C)` — the extremum's scalar form, through the ONE
+        // shared body the mulf arm reaches (`scalarmul_scaled` with the op's own `opFuncName`),
+        // so the two tiebreaks cannot drift about what a constant-operand pointwise emits.
+        // The program's own gather, threaded for the same reason the mulf arm threads it.
+        Lowering::ScalarExtremum { value, max } => {
+            return super::lower_ktir_to_superdsc::scalarextremum_at(
+                name,
+                value,
+                max,
+                gather,
+                per_op,
+                sym_id_base,
+                layout,
+            );
+        }
+        // `tile − C` / `C − tile` — the non-commutative member, through the same ONE shared body,
+        // with the ORDER the program stated. The body derives its operand layout from that fact
+        // (and refuses the one gathered shape no order can serve), so the two sides of a
+        // subtraction are distinguishable all the way into the descriptor.
+        Lowering::ScalarSub { value, const_first } => {
+            return super::lower_ktir_to_superdsc::scalarsub_at(
+                name,
+                value,
+                const_first,
                 gather,
                 per_op,
                 sym_id_base,
@@ -3575,6 +4781,14 @@ fn emit_one(
         Lowering::Node(p) => p,
     };
     Ok(match program {
+        // ⭐⭐⭐ THE BATCHED GATHERED DOT — the entry axis as the batch axis. Its B in `per_op`
+        // is the C-order copy the materializer wrote, NOT a `[k, n]` window, so the oriented
+        // matmul's own frame (and its B-orientation proof) does not apply: the per-batch bmm
+        // states its own. `None` everywhere else — the arm below is byte-identical to what it
+        // was.
+        Program::Matmul if let Some(bg) = batched => {
+            super::batched_gathered::emit_dot(name, &bg, per_op, sym_id_base, layout)?
+        }
         Program::Matmul => {
             // The fp8 activation-quantize dedup set is per-BUNDLE. One op at a time here, so a
             // fresh set is correct for an fp16 program; an fp8 one needs it threaded across ops and
@@ -3652,7 +4866,7 @@ fn emit_one(
 /// # WHAT THIS FUNCTION DOES
 ///
 /// For a `linalg.matmul` whose B is the program's gathered table (the join `op_gather` already
-/// proved — B's region `tid == g.value_tid`):
+/// proved — B's region `tid == g.source.tid()`):
 ///
 /// 1. checks the program's own arithmetic stays the plain gathered copy the fixtures spell — the
 ///    matmul's SECOND operand resolves to the table's region, and the ONLY other consumer of the
@@ -3674,50 +4888,66 @@ fn emit_one(
 /// `false` is not an error: a matmul whose B is NOT the gathered table still falls to the
 /// fail-closed refusal below, with its own name in the message.
 ///
-/// The emission's mutable scratch (`sym_id_base`, `out`, `inter`) travels in
-/// [`GatherEmit`] rather than as three more arguments — the walk owns one of these, threading it
-/// to every materialization. `floor` is [`lower_function`]'s node-derived tid bound, carried so
-/// this mint honors it like the walk's own does.
-struct GatherEmit<'a> {
-    sym_id_base: &'a mut i64,
-    out: &'a mut Vec<super::EmittedOp>,
+/// The emission context and the walk's own scratch travel in [`GatherEmit`] rather than as more
+/// arguments: the ONE emission context (`super::EmitCtx` — sink, counter, placement authority)
+/// by re-borrow from the door that minted it, beside the two facts only this walk states.
+/// `floor` is [`lower_function`]'s node-derived tid bound, carried so this mint honors it like
+/// the walk's own does; `inter` is the same walk's intermediates.
+struct GatherEmit<'a, 'b> {
+    ctx: &'b mut super::EmitCtx<'a>,
     floor: u32,
-    inter: &'a mut std::collections::HashMap<Ssa, Region>,
+    inter: &'b mut std::collections::HashMap<Ssa, Region>,
+}
+
+/// THE CONSUMER'S OWN ROW IN THE WALK — the two facts the batched form's admission reads that
+/// rung 4's 2-D path ignores: the op itself (its kind names the batched form) and its PRE-LENS
+/// operand spellings (A's and B's stated types, through their reshapes). Carried as one value so
+/// the materializer's parameter list stays the size its siblings' are.
+struct GatherConsumer<'a> {
+    op: &'a Operation<'a>,
+    pre_through: &'a [Ssa],
+}
+
+/// What [`gathered_matmul_materializes`] did for one op: nothing (the walk's fail-closed refusal
+/// owns the op), rung 4's 2-D `[k, n]` materialization, or the batched C-order copy together with
+/// the geometry the program stated for it.
+enum GatheredB {
+    No,
+    TwoD,
+    Batched(super::batched_gathered::BatchedGathered),
 }
 
 fn gathered_matmul_materializes(
     k: &KtirNode,
-    layout: Option<&BundleLayout>,
-    emit: &mut GatherEmit<'_>,
+    emit: GatherEmit<'_, '_>,
     g: Gather,
     gathered_input: usize,
     in_values: &[Ssa],
-) -> Result<bool, Error> {
-    let GatherEmit {
-        sym_id_base,
-        out,
-        floor,
-        inter,
-    } = emit;
+    consumer: GatherConsumer<'_>,
+) -> Result<GatheredB, Error> {
+    let GatherEmit { ctx, floor, inter } = emit;
     let f = &k.func;
-    // ⛔ THE GATHERED OPERAND MUST BE THE MATMUL'S **B** (input 1) — rung 4's own rule, unchanged
-    // by the multi-tile reading. A gather feeding **A** is not this exception's shape: the
-    // materialization below mints a `[k, n]` intermediate for a contraction's B leg, and an
-    // A-side gather (a row-gathered activation) is a different program the walk's own fail-closed
-    // refusal owns. Returning `false` here hands it back to that refusal, whose message names the
-    // arch reason — the control in `zz_the_gathered_matmul_materializes` pins this exact path.
-    if gathered_input != 1 {
-        return Ok(false);
-    }
-    // ⛔ AND B MUST BE THE GATHERED **LOAD**, proven by identity: the matmul's gathered input IS the
-    // value this tile's load produced. A TID comparison cannot prove this — a plain load of the
-    // same table resolves to the same tid, and a program whose gather feeds A while B reads the
-    // table directly would otherwise materialize an intermediate for a B that is not the gathered
-    // value (and then fail looking it up in `inter`, naming the wrong cause). A gather feeding A,
-    // or a transposed K leg (B through a `tt.trans` — refused at the Triton door with the arch
-    // reason), never matches; the walk's own refusal names them.
+    // ⛔ THE GATHERED OPERAND MUST BE THE OP'S OWN GATHERED INPUT, proven by identity — the
+    // input at `gathered_input` IS the value this tile's load produced. A TID comparison cannot
+    // prove this — a plain load of the same table resolves to the same tid, and a program whose
+    // gather feeds input 0 while input 1 reads the table directly would otherwise materialize an
+    // intermediate for an operand that is not the gathered value (and then fail looking it up in
+    // `inter`, naming the wrong cause). A transposed K leg (input 1 through a `tt.trans` —
+    // refused at the Triton door with the arch reason) never matches; the walk's own refusal
+    // names it.
+    // ⭐ LAW (a): WHICH SIDE OF THE CONTRACTION THE GATHER FEEDS IS STATED BY THE OPERAND'S OWN
+    // GEOMETRY, NEVER BY AN INPUT-POSITION RULE. A rank-3 B read through its reshape lens
+    // states the batched form's `[batch, k, n]` frame and takes the batch branch below; every
+    // other shape — a contraction's A above all, rung 4's rank-2 B — takes the raw 2-D
+    // `[entries, width]` identity copy this function's tail mints, the flat frame a dot's
+    // corner-0 A sweep reads. The single-gathered-input admission this replaces (B only, first
+    // match only) is gone, not branched beside: no "if input 1" special case survives here, and
+    // the caller materializes EVERY gathered input through this one door.
+    // ⭐ ANY CONSUMER OF A GATHERED LOAD READS THE MATERIALIZED ROWS — the copy is the gather, and
+    // what reads its result (a contraction's B, a transpose, an elementwise op) reads an ordinary
+    // activation. The one exception keeps its own body: `ScalarMul` carries the index itself.
     let Some(b_value) = in_values.get(gathered_input).copied() else {
-        return Ok(false);
+        return Ok(GatheredB::No);
     };
     // ⭐⭐⭐ THIS TILE, BY IDENTITY — `g.tile` is the tile's own result SSA, read once by the same
     // walk (`gathers_of`) that built the join, so the walk and this materializer cannot disagree
@@ -3733,7 +4963,7 @@ fn gathered_matmul_materializes(
     // ⛔ AND THE MATMUL'S GATHERED INPUT IS THE GATHERED LOAD — the identity check the tid check
     // cannot make. `g.load` is the `ktdp.load` over this tile, found by the walk.
     if b_value != g.load {
-        return Ok(false);
+        return Ok(GatheredB::No);
     }
     let gathered_result = g.load;
     let consumers = f
@@ -3751,13 +4981,144 @@ fn gathered_matmul_materializes(
     }
     // ⛔ A `BundleLayout` IS REQUIRED — the mint is the second party that makes the intermediate's
     // buffer real (`layout: None` is the unit-test arm and cannot place one).
-    let Some(layout) = layout else {
+    let Some(layout) = ctx.layout else {
         return err(format!(
             "{}: a gathered matmul's B needs a `BundleLayout` to hold its materialized \
              intermediate -- `layout: None` is the unit-test arm and cannot place one",
             f.name
         ));
     };
+    // ⭐⭐⭐⭐⭐ THE BATCHED FORM — the gather's ENTRY AXIS AS THE DOT'S BATCH AXIS. The seals above
+    // (B is the gathered load by identity, one consumer, a layout) are the same ones the 2-D frame
+    // runs; only the intermediate's frame and the copy that writes it differ. See
+    // [`super::batched_gathered`] for the frame law and its byte gate — the entry-size authority
+    // is the gathered load's own row width, checked against the reshape's `[batch, k, n]` by
+    // [`batched_geometry_of`] at one door.
+    let GatherConsumer { op, pre_through } = consumer;
+    if let Some(bg) = batched_geometry_of(f, op, pre_through, gathered_input, g)? {
+        // ── THE GATHERED SOURCE'S WINDOW, ONE LAW (b) WITH THE POINTWISE FAMILY MINT
+        // ([`BundleLayout::gathered_source_rows`], through [`super::pooled_reach_of`]'s
+        // unit-checked reach lookup): a sweep that fits the placement keeps its window; an
+        // over-sweep REQUIRES a declared reach — the typed bound on the index values — and is
+        // refused, fail-closed, without one; with one, the family is read from the placement
+        // (a placement holding the whole reach is a source extent, `min(swept, ceiling)`; a
+        // slice is a pool, one entry's direct coverage). The values' bound is the reach's
+        // ceiling, enforced where the values are born — the staging family's law, not this
+        // door's.
+        let table_name = crate::place::act_name(g.source.tid());
+        let index_name = crate::place::act_name(g.index_tid);
+        let what = format!(
+            "{}: the batched gathered dot's copy of '{table_name}'",
+            f.name
+        );
+        let src_window = |rows: u32| {
+            crate::sdsc_abstract::StickLayout::row_blocked_df(
+                rows as usize,
+                bg.entry_elems() as usize,
+                crate::superdsc_opspec::Df::Fp16,
+            )
+        };
+        let reach = super::pooled_reach_of(&what, Some(layout), &table_name, bg.entry_elems())
+            .map_err(Error::from)?;
+        let rows = layout
+            .gathered_source_rows(
+                &table_name,
+                bg.entries,
+                bg.entry_elems(),
+                crate::superdsc_opspec::Df::Fp16,
+                reach,
+            )
+            .map_err(|message| Error { message })?;
+        layout
+            .check_window(
+                &table_name,
+                src_window(rows),
+                0,
+                rows,
+                bg.entry_elems(),
+                &what,
+            )
+            .map_err(|message| Error { message })?;
+        // ── THE C-ORDER SCRATCH, minted the way the walk mints its own unstored results: one
+        // stick wide, `copy_rows` sub-rows — the contiguous `[batch, k, n]` buffer the reshape
+        // names (see the module doc for why the bmm's row-major walk and this buffer are one
+        // fact). NOT rung 4's `[entries, head]`: that frame is stick-major at multi-stick width,
+        // and reading it row-major moves every byte past the first stick column.
+        let rows = bg.copy_rows();
+        let stick = crate::work::FP16_ELEMS_PER_STICK;
+        let tid = mint_inter(k, layout, floor, gathered_result);
+        layout.synth(crate::place::PlaceId::Act(tid), &[rows, stick]);
+        let r = Region {
+            tid,
+            v_rows: rows,
+            v_cols: stick,
+            r_start: 0,
+            c_start: 0,
+            r_len: rows,
+            c_len: stick,
+            r_cover: (0, rows),
+            c_cover: (0, stick),
+            is_out: true,
+            is_fp8: false,
+            df: Df::Fp16,
+        };
+        let inter_name = r.name();
+        let copies = super::batched_gathered::copy_opspecs(
+            &bg,
+            &table_name,
+            &index_name,
+            &inter_name,
+            g.first_entry,
+        )
+        .map_err(|msg| Error {
+            message: format!("{}: {msg}", f.name),
+        })?;
+        for (leg, cop) in copies.into_iter().enumerate() {
+            // THE PLACEMENT HALF of the destination's two-door mint (`gather_copy_opspec` ran
+            // the declared-shape half layout-free): the run's window against the synth this mint
+            // declared. Both numbers read off the BUILT op — the leg's `mb` extent and the
+            // output operand's own base — so the check cannot disagree with the emission about
+            // which window the leg writes.
+            let mut cop = cop;
+            let leg_rows = cop.iter.extent("mb");
+            let dest_base = cop.args.last().map_or(0, |a| a.view().offset_elems) as u64;
+            super::mint_full_window(
+                &what,
+                &super::rb(
+                    &inter_name,
+                    RowCount::of_token_rows(rows),
+                    BlockCols::of_one_stick(Lanes::FP16),
+                ),
+                dest_base,
+                leg_rows,
+                stick,
+                Some(layout),
+            )
+            .map_err(|message| Error { message })?;
+            super::apply_lx_residency(&mut cop, Some(layout));
+            let folds = crate::superdsc_opspec::SdscFoldSet::new(cop.iter.cores_used());
+            // 🅿️ PARKED — NO STAMP ON THE BATCHED DOOR'S COPY LEGS. These legs are the
+            // INNER ops of a door-lowered carrier program; the addressing fact is stated at
+            // the CARRIER's mint (`EmittedOp::paged_region` / `paged_fold`, the one doors)
+            // and stamped by the walk onto every op it lowers from that carrier — so a door
+            // stamp here would be a SECOND writer for the same fact on the same ops, which
+            // the one-stamping-site law forbids. A pool-reach table in a NON-carrier program
+            // (none exists in the tree's models today) is the parked general-door class; see
+            // the parked note at the pointwise door's reach binding (`emit/mod.rs`).
+            ctx.ops.push(
+                super::emit_sdsc_tiled(
+                    &format!("{inter_name}_g{leg}"),
+                    &cop,
+                    &folds,
+                    ctx.sym_id_base,
+                    Some(layout),
+                )
+                .map_err(Error::from)?,
+            );
+        }
+        inter.insert(gathered_result, r);
+        return Ok(GatheredB::Batched(bg));
+    }
     // ── (2) THE INTERMEDIATE, minted the same way the walk mints its own unstored results.
     //
     // Rows: the indirect tile's own `Shape` — the program's statement of how many rows are
@@ -3770,7 +5131,43 @@ fn gathered_matmul_materializes(
             f.name
         ));
     };
-    let tid = mint_inter(k, layout, *floor, gathered_result);
+    // ⭐⭐⭐ LAW (a)'s CHECKED HALF — THE MINTED `[entries, width]` FRAME MUST FLAT-EQUAL THE
+    // SWEEP THE CONSUMER ITSELF STATES FOR THIS OPERAND. The tile's `Shape` (the walk's
+    // authority) and the consumer's own operand type (the program's) are two statements of the
+    // same bytes; a disagreement means the copy writes a frame its consumer cannot address —
+    // right count, wrong shape — so it is refused here, by name, with both numbers. Stated
+    // generically over the consumer's OWN type, never over an input position: a batched dot's
+    // A states `[batch, m, k]`, so this is exactly `batch·m·k == entries·k` with the width the
+    // reduction's own; rung 4's rank-2 B states `[k, n]`; an elementwise consumer states the
+    // swept `[rows, cols]` itself and the check holds trivially.
+    {
+        let dims = type_of(f, op.operands[gathered_input])
+            .and_then(|t| t.dims().map(|d| d.to_vec()))
+            .ok_or_else(|| Error {
+                message: format!(
+                    "{}: the gathered operand at input {gathered_input} of `{:?}` states no tensor \
+                     type, so the sweep its materialized copy must serve is unknown",
+                    f.name, op.op_type,
+                ),
+            })?;
+        let flat: i64 = dims.iter().product();
+        if flat != i64::from(rows) * i64::from(head)
+            || dims.last().copied() != Some(i64::from(head))
+        {
+            return err(format!(
+                "{}: the gathered operand at input {gathered_input} of `{:?}` states a sweep of \
+                 {dims:?} ({flat} elements, innermost {}), but its tile gathers [{rows}, {head}] \
+                 ({} elements). The materialized copy would write a frame the consumer cannot \
+                 address — the two authorities must state the same bytes. Fix the tile's shape or \
+                 the consumer's operand type; they disagree here.",
+                f.name,
+                op.op_type,
+                dims.last().copied().unwrap_or(0),
+                i64::from(rows) * i64::from(head),
+            ));
+        }
+    }
+    let tid = mint_inter(k, layout, floor, gathered_result);
     layout.synth(crate::place::PlaceId::Act(tid), &[rows, head]);
     let r = Region {
         tid,
@@ -3784,12 +5181,13 @@ fn gathered_matmul_materializes(
         c_cover: (0, head),
         is_out: true,
         is_fp8: false,
+        df: Df::Fp16,
     };
     // ── (3) THE GATHERED IDENTITY COPY — the `test_gather_1core` shape, through the one body
     // that declares an index operand. One input (the table), `identity`, the intermediate as
     // output; `assemble_pointwise_broadcast_gather` owns the one-index-stick ceiling and the
     // per-stick legs, so nothing here counts entries.
-    let table_name = crate::place::act_name(g.value_tid);
+    let table_name = crate::place::act_name(g.source.tid());
     let index_name = crate::place::act_name(g.index_tid);
     let inter_name = r.name();
     // ⭐ TRUE SHAPES, not `rbo`'s `1×64` annotation: the table and the intermediate declare the
@@ -3797,9 +5195,13 @@ fn gathered_matmul_materializes(
     // table, so the read window is the bound; the placement door still holds the window against
     // the table's real footprint). The intermediate's `synth` above states the same pair. The
     // builder reads name + kind only, so the dims are the mint's bound and nothing else.
-    let x_h = super::rb(&table_name, rows, head);
+    let x_h = super::rb(
+        &table_name,
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(head),
+    );
     let inputs = [super::In::full(&x_h).ew()];
-    let tile_op = super::lower_ktir_to_superdsc::pointwise_tile_op(rows, head, 1, 2);
+    let tile_op = super::lower_ktir_to_superdsc::pointwise_tile_op(rows, head, 1, 2, Df::Fp16);
     // ⭐ THE RUN — the program's stick-checked anchor plus the whole sticks these rows span
     // ([`StickRun::covering`]). The constructor's start half re-states `gathers_of`'s anchor
     // check at the door that builds the legs, so a mid-stick anchor has no path around it.
@@ -3819,18 +5221,87 @@ fn gathered_matmul_materializes(
             gathered_input: 0,
             index_name: &index_name,
             run,
-            o: &super::rb(&inter_name, rows, head),
+            o: &super::rb(
+                &inter_name,
+                RowCount::of_token_rows(rows),
+                BlockCols::of_feature_cols(head),
+            ),
         },
-        sym_id_base,
+        ctx.sym_id_base,
         Some(layout),
     )
     .map_err(Error::from)?;
-    out.extend(copied);
+    ctx.ops.extend(copied);
     // ── (4) THE MATMUL'S B, REWRITTEN TO THE INTERMEDIATE — recorded under the GATHERED VALUE
     // so the walk's `inter` lookup hands the matmul the intermediate's region for that operand,
     // and the caller REPLACES `per_op`'s B slot with it before `emit_one` runs.
     inter.insert(gathered_result, r);
-    Ok(true)
+    Ok(GatheredB::TwoD)
+}
+
+/// ⭐ THE BATCHED FORM'S STATED GEOMETRY — read from the program's OWN statements, at one door,
+/// before any copy leg or dot op is built.
+///
+/// The admission is: the consumer is a `linalg.batch_matmul` whose GATHERED operand is its **B**
+/// (input 1 — A-side gathers are not this form, same rule as rung 4), and B's stated type THROUGH
+/// its reshape lens is rank-3. Everything else is the geometry door's own arithmetic: A's type
+/// `[batch, m, k]`, the reshape's `[batch, k, n]`, and the gathered load's own `[entries, row]`
+/// pair — the row width being the ENTRY-SIZE AUTHORITY, cross-checked against the tile's own
+/// entry count. A rank-2 B never enters (it is the 2-D frame's own form and keeps rung 4's path
+/// below); a batched form whose numbers disagree refuses HERE, by name, rather than materializing
+/// a copy whose bytes the dot cannot address.
+fn batched_geometry_of(
+    f: &IRFunction<'_>,
+    op: &Operation<'_>,
+    pre_through: &[Ssa],
+    gathered_input: usize,
+    g: Gather,
+) -> Result<Option<super::batched_gathered::BatchedGathered>, Error> {
+    if gathered_input != 1 || op.op_type != OpKind::LinalgBatchMatmul {
+        return Ok(None);
+    }
+    let dims_of = |v: Option<&Ssa>, what: &str| -> Result<Vec<i64>, Error> {
+        v.and_then(|v| type_of(f, *v))
+            .and_then(|t| t.dims().map(|d| d.to_vec()))
+            .ok_or_else(|| Error {
+                message: format!(
+                    "{}: the batched gathered dot's {what} states no tensor type, so its \
+                     [batch, ·, ·] frame is unknown",
+                    f.name
+                ),
+            })
+    };
+    // A rank-2 B is the 2-D frame's own form — the batched arm does not take it.
+    let b = dims_of(pre_through.get(1), "B")?;
+    if b.len() != 3 {
+        return Ok(None);
+    }
+    let a = dims_of(pre_through.first(), "A")?;
+    let load = dims_of(Some(&g.load), "gathered load")?;
+    let [load_rows, entry_elems] = load[..] else {
+        return err(format!(
+            "{}: the gathered load t{} states {load:?}, not the [entries, row] pair a whole-row \
+             gather fetches",
+            f.name, g.load.0
+        ));
+    };
+    if load_rows != g.entries as i64 {
+        return err(format!(
+            "{}: the gathered load states {load_rows} rows but its tile gathers {} entries",
+            f.name, g.entries
+        ));
+    }
+    let entry_elems = u32::try_from(entry_elems).map_err(|_| Error {
+        message: format!(
+            "{}: the gathered row width {entry_elems} is not a u32",
+            f.name
+        ),
+    })?;
+    super::batched_gathered::BatchedGathered::of(&a, &b, g.entries, entry_elems)
+        .map(Some)
+        .map_err(|msg| Error {
+            message: format!("{}: {msg}", f.name),
+        })
 }
 
 /// THE SILU RECOGNISER'S FAIL-CLOSED HALF, which no fixture exercises.
@@ -4195,8 +5666,9 @@ mod broadcast_chain_tests {
     /// Row-major, spraying the middle axis repeats each of the source's flat rows down the
     /// merged row axis (`result[b, g, j] = source[b, 0, j]`: flat row `b·4 + g` reads flat row
     /// `b` — the row index ADVANCES every G rows), and no operand mode in this door's vocabulary
-    /// addresses that. The refusal must NAME the shape and `attn.py`'s door-proven restatement —
-    /// the host stages the mask at the score tile's own rows and the kernel adds it at base —
+    /// addresses that. The refusal must NAME the shape and the paged-decode kernel's restatement
+    /// (`batched_decode.py`: the host stages the mask at the score tile's own rows and the kernel
+    /// adds it at base) —
     /// because that restatement is the kernel's move, not a lowering fix.
     #[test]
     fn the_rank3_middle_axis_is_row_replication_and_refused() {
@@ -4216,7 +5688,7 @@ mod broadcast_chain_tests {
             "names the data movement the device cannot address: {m}"
         );
         assert!(
-            m.contains("attn.py"),
+            m.contains("batched_decode.py"),
             "names the door-proven restatement so the kernel side knows the move: {m}"
         );
     }
@@ -4352,6 +5824,7 @@ mod presented_flat_tests {
             c_cover: (0, cols),
             is_out: false,
             is_fp8: false,
+            df: Df::Fp16,
         }
     }
 
@@ -4404,6 +5877,232 @@ mod presented_flat_tests {
     fn the_row_split_mode_presents_nothing() {
         let p = presented_flat(&reg(64, 4), BcastAxis::Y(4)).expect("the identity");
         assert_eq!((p.v_rows, p.v_cols), (64, 4));
+    }
+}
+
+#[cfg(test)]
+/// ⭐⭐⭐ THE RESHAPE FORWARDS' LAW, at the batched paged-decode kernel's own geometry — the
+/// verdicts the consumer-side check reads, pinned so the #741 re-row law's application to
+/// `tensor.reshape` (the `Access::reframe` instance) cannot drift silently.
+mod reshape_forward_tests {
+    use super::*;
+    use ktir_core::arena::Arena;
+    use ktir_core::dtypes::DType;
+    use ktir_core::irtype::IrType;
+
+    /// One straight-line function: the argument `Ssa(0)` of type `src_dims` reframed to
+    /// `target_dims` by `kind`, the result `Ssa(1)`.
+    fn reframed(
+        kind: OpKind,
+        src_dims: &[i64],
+        target_dims: &[i64],
+    ) -> &'static IRFunction<'static> {
+        let a: &'static Arena = Arena::global();
+        let f16 = |dims: &[i64]| IrType::Tensor {
+            dims: a.ints(dims.to_vec()),
+            elem: DType::F16,
+        };
+        let op = Operation {
+            result: Some(Ssa(1)),
+            op_type: kind,
+            operands: a.ssa(vec![Ssa(0)]),
+            attributes: &[],
+            result_type: Some(f16(target_dims)),
+            regions: &[],
+        };
+        let f = IRFunction {
+            name: "reshape_probe",
+            arguments: a.args(vec![(Ssa(0), f16(src_dims))]),
+            operations: a.ops(vec![op]),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        Box::leak(Box::new(f))
+    }
+
+    /// One straight-line function: the argument `Ssa(0)` of type `src_dims` reshaped to
+    /// `target_dims`, the result `Ssa(1)`.
+    fn reshaped(src_dims: &[i64], target_dims: &[i64]) -> &'static IRFunction<'static> {
+        reframed(OpKind::TensorReshape, src_dims, target_dims)
+    }
+
+    /// ⭐ EVERY FLAT RESHAPE OF THE KERNEL IS THE IDENTITY at its flat presentation — q's
+    /// `[1024, 64] -> [256, 4, 64]`, the mask's, the merge section's and the final store's —
+    /// so the forward admits them and every consumer reads the bytes the source holds.
+    #[test]
+    fn the_kernels_flat_reshapes_are_admitted() {
+        for (src, target) in [
+            // q, pre-repeated in entry order, restated per [batch, gqa, hd].
+            (&[1024, 64][..], &[256, 4, 64][..]),
+            // the additive mask, staged at the score tile's own rows.
+            (&[1024, 256][..], &[256, 4, 256][..]),
+            // the merge section: the running max, l and acc restated [j, b·nkvh, gqa(, hd)].
+            (&[256, 4][..], &[4, 64, 4][..]),
+            (&[1024, 64][..], &[4, 64, 4, 64][..]),
+            // the final store's [b·nkvh·gqa, hd].
+            (&[64, 4, 64][..], &[256, 64][..]),
+        ] {
+            let (forwards, _hops, verdicts, consumed) = reshape_forwards(reshaped(src, target));
+            assert_eq!(
+                forwards.get(&Ssa(1)),
+                Some(&Ssa(0)),
+                "forwards to the source"
+            );
+            assert!(
+                consumed.contains(&Ssa(1)),
+                "the reshape result is plumbing the walk skips"
+            );
+            assert!(
+                matches!(verdicts.get(&Ssa(1)), Some(ReshapeFlat::Admitted)),
+                "{src:?} -> {target:?} is the identity at the flat presentation"
+            );
+        }
+    }
+
+    /// ⭐⭐⭐ THE GATHERED OPERANDS' RESHAPES ARE CARRIED, NOT FLAT — kt's
+    /// `[32, 131072] -> [256, 64, 256]` and v's `[32, 131072] -> [256, 256, 64]` are flat
+    /// `[16384, 256]` / `[65536, 64]` against a 32-row source, and the inter-stick stride is
+    /// the ROW count, so the re-row law refuses them: only the gathered matmul's B (the
+    /// `Access::gathered` mint) may read that framing. The refusal names the law's own clause.
+    #[test]
+    fn the_gathered_reshapes_are_carried_not_flat() {
+        for (src, target) in [
+            (&[32, 131072][..], &[256, 64, 256][..]),
+            (&[32, 131072][..], &[256, 256, 64][..]),
+        ] {
+            let (forwards, hops, verdicts, _) = reshape_forwards(reshaped(src, target));
+            assert_eq!(forwards.get(&Ssa(1)), Some(&Ssa(0)), "still forwards");
+            assert_eq!(hops.get(&Ssa(1)), Some(&Ssa(0)), "one hop to the source");
+            let Some(ReshapeFlat::Refused(msg)) = verdicts.get(&Ssa(1)) else {
+                panic!("{src:?} -> {target:?} must be refused as a flat presentation");
+            };
+            assert!(
+                msg.contains("stride BETWEEN stick columns"),
+                "names the re-row law's own clause: {msg}"
+            );
+        }
+    }
+
+    /// ⛔ A FLAT FRAMING THAT MOVES BYTES — `[1024, 64] -> [64, 1024]`: same numel, but the
+    /// rows (the inter-stick stride) and the stick-column count both change, so a row-framed
+    /// consumer would read the source's frame at the target's extents. This is the clean-bake
+    /// wrong-byte class the consumer-side check refuses.
+    #[test]
+    fn a_row_swapped_flat_target_is_refused() {
+        let (_, _, verdicts, _) = reshape_forwards(reshaped(&[1024, 64], &[64, 1024]));
+        assert!(
+            matches!(verdicts.get(&Ssa(1)), Some(ReshapeFlat::Refused(_))),
+            "a row swap is not a re-row"
+        );
+    }
+
+    /// ⛔ AND A RESHAPE THAT STATES NO LAW IS NOT FORWARDED BLIND — no result type means the
+    /// flat presentation cannot be stated, and the verdict refuses by name so the
+    /// consumer-side check fails closed.
+    #[test]
+    fn an_untyped_reshape_is_refused_not_forwarded() {
+        let a: &'static Arena = Arena::global();
+        let op = Operation {
+            result: Some(Ssa(1)),
+            op_type: OpKind::TensorReshape,
+            operands: a.ssa(vec![Ssa(0)]),
+            attributes: &[],
+            result_type: None,
+            regions: &[],
+        };
+        let f = IRFunction {
+            name: "reshape_probe",
+            arguments: a.args(vec![(
+                Ssa(0),
+                IrType::Tensor {
+                    dims: a.ints(vec![1024, 64]),
+                    elem: DType::F16,
+                },
+            )]),
+            operations: a.ops(vec![op]),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let f: &'static IRFunction<'static> = Box::leak(Box::new(f));
+        let (_, _, verdicts, _) = reshape_forwards(f);
+        let Some(ReshapeFlat::Refused(msg)) = verdicts.get(&Ssa(1)) else {
+            panic!("an untyped reshape must be refused, not forwarded blind");
+        };
+        assert!(msg.contains("no result type"), "names the cause: {msg}");
+    }
+
+    /// ⭐⭐⭐ A DEGENERATE `expand_shape` NO BROADCAST CONSUMED IS THE SAME LENS — the merge tail's
+    /// `merged[None, :, :]` at the one-block batch: `[256, 4] -> [1, 256, 4]` inserts the output's
+    /// own `1`, nothing sprays, so no `linalg.broadcast` exists and the op stands alone. It
+    /// forwards to the source at the identity verdict, exactly as the reshape spelling of the same
+    /// reframe does — and the re-row law still polices the class: an expand that splits the
+    /// single-stick column (`[1024] -> [16, 64]`) is a framing that moves bytes and is refused.
+    #[test]
+    fn a_degenerate_expand_no_broadcast_consumed_is_the_same_lens() {
+        let (forwards, hops, verdicts, consumed) =
+            reshape_forwards(reframed(OpKind::TensorExpandShape, &[256, 4], &[1, 256, 4]));
+        assert_eq!(
+            forwards.get(&Ssa(1)),
+            Some(&Ssa(0)),
+            "forwards to the source"
+        );
+        assert_eq!(hops.get(&Ssa(1)), Some(&Ssa(0)), "one hop to the source");
+        assert!(
+            consumed.contains(&Ssa(1)),
+            "the expand result is plumbing the walk skips"
+        );
+        assert!(
+            matches!(verdicts.get(&Ssa(1)), Some(ReshapeFlat::Admitted)),
+            "[256, 4] -> [1, 256, 4] is the identity at the flat presentation"
+        );
+
+        let (_, _, verdicts, _) =
+            reshape_forwards(reframed(OpKind::TensorExpandShape, &[1024], &[16, 64]));
+        assert!(
+            matches!(verdicts.get(&Ssa(1)), Some(ReshapeFlat::Refused(_))),
+            "a column split is not a re-row"
+        );
+    }
+
+    /// ⭐ A CHAIN RESOLVES TRANSITIVELY — reshape of reshape reads the earlier entry, so the
+    /// forwards map names the ULTIMATE source while the hops stay per-reshape for the law walk.
+    #[test]
+    fn a_reshape_chain_resolves_to_the_ultimate_source() {
+        let a: &'static Arena = Arena::global();
+        let f16 = |dims: Vec<i64>| IrType::Tensor {
+            dims: a.ints(dims),
+            elem: DType::F16,
+        };
+        let one = Operation {
+            result: Some(Ssa(1)),
+            op_type: OpKind::TensorReshape,
+            operands: a.ssa(vec![Ssa(0)]),
+            attributes: &[],
+            result_type: Some(f16(vec![256, 4, 64])),
+            regions: &[],
+        };
+        let two = Operation {
+            result: Some(Ssa(2)),
+            op_type: OpKind::TensorReshape,
+            operands: a.ssa(vec![Ssa(1)]),
+            attributes: &[],
+            result_type: Some(f16(vec![1024, 64])),
+            regions: &[],
+        };
+        let f = IRFunction {
+            name: "reshape_probe",
+            arguments: a.args(vec![(Ssa(0), f16(vec![1024, 64]))]),
+            operations: a.ops(vec![one, two]),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let f: &'static IRFunction<'static> = Box::leak(Box::new(f));
+        let (forwards, hops, verdicts, _) = reshape_forwards(f);
+        assert_eq!(forwards.get(&Ssa(1)), Some(&Ssa(0)));
+        assert_eq!(forwards.get(&Ssa(2)), Some(&Ssa(0)), "the ultimate source");
+        assert_eq!(hops.get(&Ssa(2)), Some(&Ssa(1)), "hops stay per-reshape");
+        assert!(matches!(verdicts.get(&Ssa(1)), Some(ReshapeFlat::Admitted)));
+        assert!(matches!(verdicts.get(&Ssa(2)), Some(ReshapeFlat::Admitted)));
     }
 }
 

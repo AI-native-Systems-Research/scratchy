@@ -205,6 +205,13 @@ pub struct ResidentExecutor {
     /// verbatim arm must keep the packed 1-byte layout instead of re-encoding
     /// it as F16.
     view_dtype: HashMap<u64, DType>,
+    /// ⭐ SEAT (i) — the BUNDLE-STATED stage of each reserved scale slot (`tid → dtype`),
+    /// declared as DATA by [`Self::declare_scale_stages`] (the bake's registry column, handed
+    /// over by the worker, never a code path keyed on the tid's identity). This is the runner's
+    /// dispatch query ([`Self::scale_stage_dtype`]); the WRITE half of the same declaration is
+    /// the `view_dtype` insert beside it, which makes the verbatim arm of `set_source_bytes`
+    /// land the f32 word UNCHANGED — no new arm, no changed arm.
+    scale_stages: HashMap<u64, DType>,
     /// Per-segment plan-cache key (`comm_sched::plan_key`), memoized by the ops
     /// slice address. The deep ops-tree hash that keys the scheduler's Metal/
     /// liveness plan caches is otherwise recomputed every forward pass (~7% of a
@@ -287,6 +294,66 @@ impl ResidentExecutor {
         Self::build(programs, false)
     }
 
+    /// ⭐⭐⭐⭐⭐ SEAT (i): THE BUNDLE-STATED df OF A SCALE SLOT, DECLARED AS DATA.
+    ///
+    /// The bake's scale registry carries each reserved `[1,1]` const slot's own df (the element
+    /// format the constant's `tensor.splat` states — the same seat the value came from), and the
+    /// runtime hands it to the session here: a `(tid → dtype)` table, baked data, never a code
+    /// path keyed on the tid's identity. The declaration is two halves of ONE fact:
+    ///
+    /// * the tid gains a VIEW DTYPE, so the EXISTING verbatim arm of `set_source_bytes` fires on
+    ///   `view_dt == F32` unchanged — no new arm, no changed arm; the same law that lands fp8
+    ///   weights byte-for-byte lands the f32 word;
+    /// * the tid is recorded in the staged map the runner's source dispatch asks
+    ///   ([`Self::scale_stage_dtype`]), so a slot the bundle states at f32 is staged as
+    ///   `Arg::TensorBytes` (raw IEEE bits) while every unlisted source keeps the incumbent
+    ///   `Arg::Tensor` f16 fill — byte-identical for every model whose slots are all f16.
+    ///
+    /// ⛔ THE COLLISION GUARD IS THE POINT, not a nicety. A reserved scale tid that ALSO carries
+    /// a module view is a bundle stating two dtypes for one tensor; an `or_insert` here would
+    /// let whichever writer ran first win silently, so this REFUSES naming both dtypes — the
+    /// same fail-closed shape the collector's cross-program refusal takes at the bake.
+    pub fn declare_scale_stages(&mut self, stages: &[(u32, DType)]) -> Result<(), String> {
+        for &(tid, dt) in stages {
+            if let Some(&prev) = self.view_dtype.get(&(u64::from(tid))) {
+                return Err(format!(
+                    "the scale slot t{tid} carries a module view at {prev:?} AND a bundle-stated \
+                     stage at {dt:?} — one tensor cannot hold both declarations, and which writer \
+                     ran first is not a fact anything should depend on. This is a bundle/bake \
+                     desync: the registry's reserved tids and the programs' own views disagree."
+                ));
+            }
+            self.view_dtype.insert(u64::from(tid), dt);
+            self.scale_stages.insert(u64::from(tid), dt);
+        }
+        Ok(())
+    }
+
+    /// The bundle-stated stage of one scale slot, if the bundle stated one — the runner's
+    /// per-source dispatch asks THIS (never the module views): `Some(F32)` stages the raw IEEE
+    /// word, `None` keeps the incumbent f16 `Arg::Tensor` fill.
+    pub fn scale_stage_dtype(&self, tid: u64) -> Option<DType> {
+        self.scale_stages.get(&tid).copied()
+    }
+
+    /// The staged byte extent of one tensor — `numel` priced at the tensor's OWN view dtype
+    /// (Wall 13's law: the same basis the stick was allocated at), `None` for a tid no program
+    /// of this session binds. This is the emulator's answer to the card session's
+    /// `step_input_extent`: the discovery table's own number, asked of the session, never
+    /// re-derived from a spelling — the numeric gate queries it for the attention family's
+    /// step-input slots before it stages them, so the staging is checked against the placement
+    /// the programs actually declare.
+    pub fn source_extent_bytes(&self, tensor: u64) -> Option<u64> {
+        let n = self.numel.get(&tensor)?;
+        let bpe = self
+            .view_dtype
+            .get(&tensor)
+            .copied()
+            .unwrap_or(self.dtype)
+            .bytes_per_elem();
+        Some(*n as u64 * bpe as u64)
+    }
+
     /// Like [`new`](Self::new), but plan EVERY node as a [`Segment::Native`] run at
     /// its OWN grid (no fusion to `[1,1]`). This is the faithful way to run a
     /// hand-written SPMD-tiled example kernel — whose multi-tile grid (`[2,16]`
@@ -314,7 +381,6 @@ impl ResidentExecutor {
             return Err("resident: new_multi needs at least one program".into());
         }
         let dtype = DType::F16;
-        let bpe = dtype.bytes_per_elem();
 
         // Union of shapes + sources across programs; per-program planned segments.
         // A stick is allocated for EVERY referenced tensor id so its address is
@@ -360,10 +426,19 @@ impl ResidentExecutor {
                 // First view wins; a disagreement is an error the collector raises.
                 view_dtypes.entry(id).or_insert(*dt);
             }
-            // Plan segments under the LX live-set budget (per program).
+            // Plan segments under the LX live-set budget (per program). The bytes
+            // are priced at each tensor's OWN view dtype (`prog_dtypes`) — the
+            // same df-true law as the stick allocation below; pricing an int32
+            // index table at the model's 2 B halves its live-set footprint too.
             let tensor_bytes: HashMap<u64, usize> = prog_shapes
                 .iter()
-                .map(|(&id, shp)| (id, shp.iter().product::<usize>() * bpe))
+                .map(|(&id, shp)| {
+                    (
+                        id,
+                        shp.iter().product::<usize>()
+                            * prog_dtypes.get(&id).unwrap_or(&dtype).bytes_per_elem(),
+                    )
+                })
                 .collect();
             let segments = if force_native {
                 // Force every node to run at its native grid (no [1,1] fusion):
@@ -431,7 +506,21 @@ impl ResidentExecutor {
                     .cloned()
                     .ok_or_else(|| format!("no shape derivable for tensor t{tid}"))?;
                 let n: usize = shape.iter().product();
-                let s = hbm.allocate((n * bpe).max(bpe) as i64);
+                // ⭐⭐⭐ WALL 13 — THE STICK BASIS IS THE DATA'S OWN `df`, AND THE ALLOCATION IS ITS
+                // SECOND CONSUMER. Every OTHER dtype decision here already follows the view:
+                // `ptr_for` binds the element index in the tensor's OWN view dtype (RFC #110) and
+                // `set_source_bytes`'s verbatim arm matches against it. This allocation was the one
+                // holdout, pricing EVERY tensor at the model dtype's 2 B — so an int32 index table
+                // (`[128]` entries, 512 B true) was allocated 256 B, and the view over it refused at
+                // the extent check the moment the door started stating view dtypes honestly
+                // (MEASURED, the granite numeric gate: `view [128] of I32 ... spans 512 bytes but
+                // the tensor allocated at byte 454541824 holds only 256`). An f32 tensor
+                // under-allocated the same way reads its back half out of the NEXT tensor's sticks —
+                // fluent, wrong, and invisible until a view names the extent. `view_dtypes` carries
+                // each tensor's first view's dtype (the collector refuses a two-dtype tensor), so
+                // this is the same one law the pointer binding already states, not a new channel.
+                let bpe_t = view_dtypes.get(&tid).unwrap_or(&dtype).bytes_per_elem();
+                let s = hbm.allocate((n * bpe_t).max(bpe_t) as i64);
                 stick.insert(tid, s);
                 numel.insert(tid, n);
             }
@@ -454,6 +543,7 @@ impl ResidentExecutor {
             stick,
             numel,
             view_dtype: view_dtypes,
+            scale_stages: HashMap::new(),
             sources,
             forward_written,
             dtype,
@@ -1417,7 +1507,6 @@ impl ResidentExecutor {
     /// Cheap: these are activations (kB) not weights (GB).
     fn zero_non_sources(&mut self) {
         let hbm = self.mem.hbm.borrow_mut();
-        let bpe = self.dtype.bytes_per_elem();
         for (&tid, &s) in &self.stick {
             if self.sources.contains(&tid) {
                 continue;
@@ -1426,15 +1515,23 @@ impl ResidentExecutor {
             if n == 0 {
                 continue;
             }
+            // The tensor's OWN view dtype — the allocation above prices the stick
+            // at it, so zeroing at the model dtype's 2 B would leave the back
+            // half of an int32/f32 tensor carrying the previous pass's bytes.
+            let bpe_t = self
+                .view_dtype
+                .get(&tid)
+                .unwrap_or(&self.dtype)
+                .bytes_per_elem();
             // Zero the existing backing bytes IN PLACE — every non-source stick is
             // already allocated (the stick base is its exact allocation base), so
             // fill its bytes rather than allocating a fresh zero `Vec` +
             // `copy_from_slice` per stick every pass.
             if let Some((buf, off)) = hbm.allocation_at_mut(s * STICK_BYTES) {
-                let end = (off + n * bpe).min(buf.len());
+                let end = (off + n * bpe_t).min(buf.len());
                 buf[off..end].fill(0);
             } else {
-                hbm.write_bytes(s * STICK_BYTES, &vec![0u8; n * bpe]);
+                hbm.write_bytes(s * STICK_BYTES, &vec![0u8; n * bpe_t]);
             }
         }
     }

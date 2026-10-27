@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """THE DOUBLE-UNROLL COUNT TWIN — attention's M=1 one-pass body at two grid depths.
 
-This is `kernels/attn.py`'s paged-decode arm with exactly the machinery the count wall
+This is the deleted hand-written attention kernel's paged-decode arm with exactly the
+machinery the count wall
 does not need removed: no mask (`HAS_MASK` and its descriptor are gone), no segment
 corners, no Kᵀ/V pooling beyond the one sweep. What is kept verbatim is everything the
 wall lives in:

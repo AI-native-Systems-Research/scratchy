@@ -133,6 +133,7 @@ pub const OP_SET: &[&str] = &[
     "tt.descriptor_load",
     "tt.descriptor_store",
     "tt.descriptor_gather",
+    "tt.descriptor_scatter",
     // The routed expert id of `expert_slab.ttir.mlir`: one SCALAR read through a pointer,
     // `tt.addptr %ids, %p : !tt.ptr<i32>, i32` then `tt.load %ptr : !tt.ptr<i32>` -- no
     // mask, no other, no attributes (the default `isVolatile` prints as nothing). Both

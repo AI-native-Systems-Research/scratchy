@@ -6,12 +6,14 @@
 //! single `[mq, hd]` copy of a 512-row chunk would run off its page into the next kv head's block. Each
 //! `(kv head, slab)` copy is therefore cut into parts of `PAGE_SLOTS` rows: part `p` reads the chunk's
 //! rows from `p·PAGE_SLOTS`, writes the SAME baked destination, and carries
-//! `kv_slot_offset = p·PAGE_SLOTS` so the runtime aims it at its own page. The Kᵀ re-transpose is cut
+//! its `PagePart` (minted by the cut itself, `write_parts`) so the runtime aims it at its own page. The Kᵀ re-transpose is cut
 //! the same way. A window that fits one page is one part at offset 0 and emits exactly what it did.
 
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::emit::lower_ktir_to_superdsc::{KvCacheWrite, kv_cache_write};
-use ktir_superdsc::sdsc_abstract::PagedKvPool;
+use ktir_superdsc::page_part::Slots;
+use ktir_superdsc::score_scale::NewK;
+use ktir_superdsc::sdsc_abstract::{PagedKvPool, QueryRowCount};
 
 const NKVH: u32 = 8;
 const PAGE: u32 = PagedKvPool::PAGE_SLOTS as u32;
@@ -21,12 +23,13 @@ fn write(mq: u32, hd: u32, rows_are_requests: bool) -> Vec<EmittedOp> {
     let mut sym = 0i64;
     kv_cache_write(
         KvCacheWrite {
-            t: 7,
-            mq,
-            nkvh: NKVH,
-            hd,
+            t: ktir_superdsc::place::PlaceId::Act(7),
+            mq: QueryRowCount::of_mq(mq),
+            pool: PagedKvPool::new(NKVH, hd),
             rows_are_requests,
-            new_k: "t_newk",
+            // The door's own main-call spelling: the window starts at the cursor's row 0.
+            row_start: ktir_superdsc::sdsc_abstract::WriteRowStart::at_cursor(),
+            new_k: NewK::reader_stated("t_newk"),
             new_v: "t_newv",
             kc: "t_kc",
             vc: "t_vc",
@@ -89,7 +92,10 @@ fn a_two_page_chunk_writes_two_parts_per_kv_head_and_slab() {
                             .unwrap_or_else(|| panic!("hd={hd}: {} is emitted", name(p)))
                     };
                     let (p0, p1) = (part(0), part(1));
-                    assert_eq!((p0.kv_slot_offset, p1.kv_slot_offset), (0, PAGE));
+                    assert_eq!(
+                        (p0.kv_part.slots(), p1.kv_part.slots()),
+                        (Slots::of(0), Slots::of(PAGE))
+                    );
                     assert_eq!((rows(p0), rows(p1)), (256, 256), "{}", name(1));
                     assert_eq!(
                         base_elems(p1, 0) - base_elems(p0, 0),
@@ -128,7 +134,7 @@ fn a_part_past_the_first_page_copies_only_the_rows_left() {
             };
             assert_eq!(rows(find(0)), 256);
             assert_eq!(rows(find(1)), 128);
-            assert_eq!(find(1).kv_slot_offset, PAGE);
+            assert_eq!(find(1).kv_part.slots(), Slots::of(PAGE));
         }
     }
 }
@@ -140,15 +146,18 @@ fn the_parts_are_emitted_part_major_and_the_kt_re_transpose_follows_them() {
     for hd in [64u32, 128] {
         let ops = write(512, hd, false);
         for stem in ["cachewr_", "attn_kctpost"] {
-            let offs: Vec<u32> = ops
+            let offs: Vec<Slots> = ops
                 .iter()
                 .filter(|e| e.op_name.starts_with(stem))
-                .map(|e| e.kv_slot_offset)
+                .map(|e| e.kv_part.slots())
                 .collect();
-            let first_p1 = offs.iter().position(|&o| o == PAGE).expect("a part 1");
+            let first_p1 = offs
+                .iter()
+                .position(|o| *o == Slots::of(PAGE))
+                .expect("a part 1");
             assert!(
-                offs[..first_p1].iter().all(|&o| o == 0)
-                    && offs[first_p1..].iter().all(|&o| o == PAGE),
+                offs[..first_p1].iter().all(|o| *o == Slots::ZERO)
+                    && offs[first_p1..].iter().all(|o| *o == Slots::of(PAGE)),
                 "hd={hd} {stem}*: offsets {offs:?} interleave the parts"
             );
         }
@@ -159,7 +168,7 @@ fn the_parts_are_emitted_part_major_and_the_kt_re_transpose_follows_them() {
                     .iter()
                     .find(|e| e.op_name == name)
                     .unwrap_or_else(|| panic!("hd={hd}: {name} is emitted"));
-                assert_eq!(e.kv_slot_offset, p * PAGE, "{name}");
+                assert_eq!(e.kv_part.slots(), Slots::of(p * PAGE), "{name}");
             }
         }
     }
@@ -172,7 +181,7 @@ fn a_window_inside_one_page_is_one_part_with_its_old_names() {
     for (mq, rows_are_requests) in [(256u32, false), (128, false), (1, false), (4, true)] {
         let ops = write(mq, 128, rows_are_requests);
         assert!(
-            ops.iter().all(|e| e.kv_slot_offset == 0),
+            ops.iter().all(|e| e.kv_part.is_cursor()),
             "mq={mq}: a one-page window has no page part"
         );
         assert!(

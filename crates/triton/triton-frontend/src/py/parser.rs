@@ -1434,7 +1434,8 @@ impl Parser {
     }
 
     /// Turn a parsed expression into an assignment target, refusing anything that is
-    /// not a name or a tuple of names.
+    /// not a name, a tuple of names, or a subscripted name (a compile-time sequence
+    /// slot).
     fn expr_to_target(&self, e: &Expr) -> Result<AssignTarget> {
         match e {
             Expr::Name { id, pos } => Ok(AssignTarget::Name {
@@ -1451,10 +1452,15 @@ impl Parser {
                     pos: *pos,
                 })
             }
+            Expr::Subscript { value, index, pos } => Ok(AssignTarget::Subscript {
+                base: Box::new(self.expr_to_target(value)?),
+                index: *index.clone(),
+                pos: *pos,
+            }),
             other => Err(err_at(
                 format!(
-                    "assignment to a {} is not supported (only a name or a tuple of \
-                     names)",
+                    "assignment to a {} is not supported (only a name, a tuple of \
+                     names, or a subscripted name)",
                     other.kind_name()
                 ),
                 other.pos().line,

@@ -319,7 +319,7 @@ mod private {
 /// (`word_length_for` / `stick_elems_for` / `dataformat_for`): a missing or mistyped name suffix can
 /// no longer silently downgrade a tensor to fp16 (½-residency weight read as 2-byte, `matmulfp8` read
 /// as `matmul`) — the dtype is declared once, at the arg, and checked by the compiler.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Df {
     /// SEN169_FP16 — the default storage/compute format (matmul PE + activations). 2-byte / 64-stick.
     Fp16,
@@ -348,6 +348,19 @@ impl Df {
             Df::SenInt8 => <SenInt8 as DataFormat>::ELEMS_PER_STICK,
             Df::Bf16 => <Fp16 as DataFormat>::ELEMS_PER_STICK, // BF16E shares fp16 geometry (2-byte / 64-stick)
             Df::SenUint32 => <SenUint32 as DataFormat>::ELEMS_PER_STICK,
+        }
+    }
+    /// The format's own name — the same constant [`StickExtent::new`]'s refusal text states —
+    /// for a refusal that names the basis it measured against (wall 13: the sub-stick verdict
+    /// is meaningless until the survivor count is read against the DATA's own stick).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Df::Fp16 => <Fp16 as DataFormat>::NAME,
+            Df::Fp32 => <Fp32 as DataFormat>::NAME,
+            Df::Fp8 => <Fp8 as DataFormat>::NAME,
+            Df::SenInt8 => <SenInt8 as DataFormat>::NAME,
+            Df::Bf16 => <Fp16 as DataFormat>::NAME,
+            Df::SenUint32 => <SenUint32 as DataFormat>::NAME,
         }
     }
     /// Bytes per element (`wordLength`) — from the type-level [`DataFormat`] impl.
@@ -1478,6 +1491,28 @@ pub enum OpFunc {
     Sum,
     Max,
     Mean,
+    /// ⭐⭐⭐ WALL 12 — the NONSTICK twins of [`Sum`]/[`Max`]: the same `summeanmaxexx2.ddl`
+    /// template's `sumnonstick`/`maxnonstick` binds (`:39`, `:45`), for a reduce whose REDUCED
+    /// axis is a leading prefix and whose SURVIVORS are the stick. The stick binds key the
+    /// lane roles on `%reduce_dim#0` (the reduced axis IS the lane axis — the SFP REDUCE modes
+    /// exist for it); the nonstick binds key them on `%outer_dim#0` (a SURVIVOR is the lane
+    /// axis), so the reduce rides the loop nest over the outer+reduce dims with per-lane PE
+    /// accumulators and NO SFP REDUCE mode — the auditor's mechanism correction, carried here
+    /// because it is the one fact that separates the families on device.
+    ///
+    /// The vendor ships a structural fixture for the max twin
+    /// (`ddc/ddl_templates/test/sdsc_maxnonstick.json`): `exUnit "sfp"`, TWO inputs
+    /// (`[data-idx0, accum-idx1]`), ONE output (`accum-idx1`) — the seeded convention verbatim —
+    /// the accum's scale `-1` on the reduced dim, the stick dim Active on both operands, the
+    /// SURVIVOR core-split (`mb:8`) with the reduced dim UNSPLIT, `coordinateMasking_ {}`, and
+    /// no `genericpartialreduction` anywhere (ringless). NAMES AND THE SOLVER: the fixture's
+    /// own `out` is its stick SURVIVOR while this crate's reduce vocabulary names the REDUCED
+    /// dim `out` (the DDL's own `%reduce_dim:4` is the "OUT dimension", and the wall-11 pins'
+    /// `N_.out_` follow it) — the names do not reach `matchDdl2Dsc`, which binds dims by the
+    /// layout constraint walk, but the collision is stated here so refusal-text readers are
+    /// not misled.
+    SumNonStick,
+    MaxNonStick,
     /// ⭐ `exx2` — the machine's OWN fused `mean(x²)` reduce: the same `summeanmaxexx2.ddl` template
     /// [`Mean`] rides (its `%exx2_op` bind, `:50`), computing the square INSIDE the reduce's SFP
     /// accumulate loop (`SFP_FMA src0=lxlu src1=lxlu src2=R4`, exx2_fwd.smc) so `x` is read ONCE and
@@ -1684,6 +1719,8 @@ impl OpFunc {
             OpFunc::Sum => "sum",
             OpFunc::Max => "max",
             OpFunc::Mean => "mean",
+            OpFunc::SumNonStick => "sumnonstick",
+            OpFunc::MaxNonStick => "maxnonstick",
             // The ONLY runtime-supported spelling: plain `exx2` maps to OpFuncs::EXX2 →
             // exx2_fwd.smc (updatelibrary.cpp's libMapping). The `exx2_zeromean` spelling ddc
             // rewrites to at useZeroMean=1 is a distinct enum with NO smc-table entry — see
@@ -1830,6 +1867,16 @@ impl OpFunc {
             // state is internal, so passing an accumulator makes it unmatchable exactly like the
             // fused scale above.
             OpFunc::TopKIndex | OpFunc::TopKValue => Some(1),
+            // ⭐ WALL 12 — the nonstick twins carry the SEEDED convention: `summeanmaxexx2.ddl`
+            // binds each nonstick op as `([%input_tensor_nonstick, %output_tensor_nonstick],
+            // [%output_tensor_nonstick], [%output_tensor_reduce_nonstick])` — TWO inputs (data +
+            // accumulator), ONE output — and the vendor's own structural fixture states it
+            // (`ddc/ddl_templates/test/sdsc_maxnonstick.json`: `inputLabeledDs` of two, indices
+            // `[0, 1]`, the accumulator at index 1 also the sole output, the seeded convention
+            // verbatim). `None` here is that convention — `reduce_tile_kind` picks the nonstick
+            // kind BEFORE this row is consulted, so this entry exists to keep the emitter's
+            // build-time arity check honest about the two operands it will see.
+            OpFunc::SumNonStick | OpFunc::MaxNonStick => None,
             _ => None,
         }
     }
@@ -1852,7 +1899,20 @@ impl OpFunc {
     /// `mean` is deliberately absent: its `1/N` scaling const is applied per core, so a split mean is a
     /// sum of per-core means. Not a combine this crate has a use for or a test of.
     pub fn template_combines_a_core_split_reduction(self) -> bool {
-        matches!(self, OpFunc::Sum | OpFunc::Max)
+        // ⭐ WALL 12 — the nonstick twins are DDL-TRUE here: the `%psum_op` bind
+        // (`summeanmaxexx2.ddl:64`) sits on the tensors `alias_one_tensor_of` UNIFIED across the
+        // stick and nonstick variants, and the psum ring's compute arms are union-gated over
+        // both forms, so a nonstick reduce whose REDUCED axis were core-split would ring its
+        // partials exactly like the stick form's. The vendor's own nonstick fixture never uses
+        // it (`sdsc_maxnonstick.json` is ringless: `numWkSlicesPerDim_ {"mb": 8}` splits the
+        // SURVIVOR, the reduced dim unsplit), and this crate's nonstick arm matches that —
+        // `ReduceDivision::Rows`, survivor-only splitting; the reduced axis is the accumulation
+        // axis and is never split. The row states the TEMPLATE's fact so a future split caller
+        // is not refused on a false premise; it does not license the split.
+        matches!(
+            self,
+            OpFunc::Sum | OpFunc::Max | OpFunc::SumNonStick | OpFunc::MaxNonStick
+        )
     }
 
     /// ⭐⭐⭐ THE ONE OP PAIR WHOSE SHIPPED `constantInfo_` IS NOT THE GENERIC FORM. Both
@@ -1992,7 +2052,15 @@ pub struct TensorArg<const D: usize> {
     /// torch-spyre's `dev_dim_size > it_dim_size` case — so address/stride derivation for that dim must use
     /// `phys`, not the op's logical extent, mirroring torch-spyre's `strides[dim] = strides[dim] //
     /// dev_dim_size * it_dim_size` rescale exactly. Set via [`TensorArg::with_device_extent`].
+    /// Per-dim physical device extent override (torch-spyre `arg.device_size`) — `None` means
+    /// "physical extent == this op's own iteration extent for that dim". See
+    /// [`ArgView::dxp_innermost_first`] for the wire-order flag's law.
     device_extent: [Option<u32>; D],
+    /// ⭐ SERIALIZE THIS VIEW'S DIM ORDER INNERMOST-FIRST — see [`ArgView::dxp_innermost_first`]
+    /// for the law (dxp reads `layoutDimOrder_` idx 0 as innermost and honours a wider physical
+    /// extent only as a `backGapCore_` gap). Set only by [`TensorArg::with_dxp_innermost_first`],
+    /// read only by the wire serialization; the address model never sees it.
+    dxp_innermost_first: bool,
 }
 
 impl<const D: usize> TensorArg<D> {
@@ -2040,6 +2108,7 @@ impl<const D: usize> TensorArg<D> {
             df: Df::Fp16,
             row_blocked: false,
             device_extent: [None; D],
+            dxp_innermost_first: false,
         })
     }
 
@@ -2084,6 +2153,13 @@ impl<const D: usize> TensorArg<D> {
         self.device_extent[idx] = Some(phys_extent);
         Ok(self)
     }
+
+    /// Serialize this view's dim order innermost-first — see [`ArgView::dxp_innermost_first`]
+    /// for the law. Chains off [`TensorArg::new`]; the address model is untouched.
+    pub fn with_dxp_innermost_first(mut self) -> TensorArg<D> {
+        self.dxp_innermost_first = true;
+        self
+    }
 }
 
 /// Rank-erased tensor arg (ranks ≤ 4 in practice), so `OpSpec.args` can hold a
@@ -2123,6 +2199,20 @@ pub struct ArgView<'a> {
     /// Per-`layout`-dim physical device extent override (torch-spyre `arg.device_size`) — `None` means
     /// "physical extent == this op's own iteration extent for that dim" (see [`TensorArg::device_extent`]).
     pub device_extent: &'a [Option<u32>],
+    /// ⭐ SERIALIZE THIS VIEW'S DIM ORDER THE WAY DXP READS IT — INNERMOST FIRST. `layout` is
+    /// this crate's address model, OUTERMOST-first row-major over the device extents
+    /// ([`crate::sdsc_abstract::StickLayout::for_view_df`] → `Flat`, `off_view`), and every
+    /// address this crate computes (`per_core_addr`, the byte gates) reads it in that order,
+    /// flag or no flag. But dxp reads `layoutDimOrder_` INNERMOST-first — stated on the field
+    /// itself (`perfdsc/perfLdsInfo.h:29`, `dsc/dataOpDsc.h:347`: "idx 0 means innermost") —
+    /// and honours a physical extent wider than the sweep ONLY as a back gap
+    /// (`backGapCore_`, `sizesWithGaps_` at `dsc2.cpp:2899`; a pinned `maxDimSizes_` entry is
+    /// not a stride). A view carrying this flag is serialized with its per-dim wire fields
+    /// REVERSED (`layoutDimOrder_`, `scale_`, `maxDimSizes_`) and each declared `device_extent`
+    /// becomes a back gap of `phys − swept` on its dim; the address model reads `layout`
+    /// unchanged, so the two orders are one fact stated at each end. `false` — every view
+    /// built before this flag — serializes exactly as before, byte for byte.
+    pub dxp_innermost_first: bool,
 }
 
 impl AnyTensorArg {
@@ -2217,6 +2307,18 @@ impl AnyTensorArg {
             AnyTensorArg::R2(t) => set(t, dim, phys_extent),
             AnyTensorArg::R3(t) => set(t, dim, phys_extent),
             AnyTensorArg::R4(t) => set(t, dim, phys_extent),
+        }
+    }
+
+    /// Rank-erased [`TensorArg::with_dxp_innermost_first`] setter — flips the wire-order flag on
+    /// an arg a builder already assembled. Only the batched gathered dot's operands carry it;
+    /// every other builder's args serialize in the stated order, byte for byte.
+    pub fn set_dxp_innermost_first(&mut self) {
+        match self {
+            AnyTensorArg::R1(t) => t.dxp_innermost_first = true,
+            AnyTensorArg::R2(t) => t.dxp_innermost_first = true,
+            AnyTensorArg::R3(t) => t.dxp_innermost_first = true,
+            AnyTensorArg::R4(t) => t.dxp_innermost_first = true,
         }
     }
 
@@ -2322,6 +2424,7 @@ impl AnyTensorArg {
                 df: t.df,
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
+                dxp_innermost_first: t.dxp_innermost_first,
             },
             AnyTensorArg::R2(t) => ArgView {
                 is_input: t.is_input,
@@ -2336,6 +2439,7 @@ impl AnyTensorArg {
                 df: t.df,
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
+                dxp_innermost_first: t.dxp_innermost_first,
             },
             AnyTensorArg::R3(t) => ArgView {
                 is_input: t.is_input,
@@ -2350,6 +2454,7 @@ impl AnyTensorArg {
                 df: t.df,
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
+                dxp_innermost_first: t.dxp_innermost_first,
             },
             AnyTensorArg::R4(t) => ArgView {
                 is_input: t.is_input,
@@ -2364,6 +2469,7 @@ impl AnyTensorArg {
                 df: t.df,
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
+                dxp_innermost_first: t.dxp_innermost_first,
             },
         }
     }
@@ -3373,6 +3479,57 @@ impl OpSpec {
         if value_idx >= self.args.len() || value_idx == out_idx {
             return None;
         }
+        self.attach_index_operand(
+            index_name,
+            entry_dim,
+            page,
+            per_position,
+            first_entry,
+            value_idx,
+        )
+    }
+
+    /// ⭐⭐⭐ THE SCATTER'S DECLARATION — the OUTPUT is written THROUGH the index. The store twin of
+    /// [`Self::attach_gather_index`], and the vendor's own `dxp/test/test_scatter_1core/sdsc_1.json`
+    /// shape: an `identity` whose `value_tensor` node is the OUTPUT (`Tensor2`), the index sitting
+    /// between it and the input (`[input, index, output]`), the cross-link and
+    /// `indirectAccessIndexLabeledDs` exactly as for a gather. The index is inserted before the
+    /// output, so the value position is the output's position AFTER the insertion.
+    pub fn attach_scatter_index(&mut self, gather: GatherIndex) -> Option<IndirectAccess> {
+        let GatherIndex {
+            name: index_name,
+            entry_dim,
+            page,
+            per_position,
+            first_entry,
+        } = gather;
+        if self.args.len() < 2 {
+            return None;
+        }
+        // The output's position once the index slides it right by one.
+        let value_idx = self.args.len();
+        self.attach_index_operand(
+            index_name,
+            entry_dim,
+            page,
+            per_position,
+            first_entry,
+            value_idx,
+        )
+    }
+
+    /// The index operand both [`Self::attach_gather_index`] and [`Self::attach_scatter_index`]
+    /// declare — inserted at the output's slot, shaped by the paged dims, `SenUint32`, HBM-only.
+    fn attach_index_operand(
+        &mut self,
+        index_name: String,
+        entry_dim: KernelAxis,
+        page: PageExtent,
+        per_position: Option<KernelAxis>,
+        first_entry: EntryBase,
+        value_idx: usize,
+    ) -> Option<IndirectAccess> {
+        let out_idx = self.args.len().saturating_sub(1);
         // ⭐⭐⭐ THE INDEX IS SHAPED BY THE PAGED DIMS, NOT BY THE VALUE.
         //
         // Both vendor fixtures give the index the value's PINNED dims only, in the value's own order —

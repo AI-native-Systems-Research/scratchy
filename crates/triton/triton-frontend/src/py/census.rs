@@ -92,7 +92,7 @@ pub const TL_FUNCTIONS: &[&str] = &[
 ///
 /// `gather` is the one entry NOT in the original five-fixture census: it is
 /// `embedding.py`'s indirect read (`tt.descriptor_gather`), added with that fixture.
-pub const VALUE_METHODS: &[&str] = &["load", "store", "to", "gather"];
+pub const VALUE_METHODS: &[&str] = &["load", "store", "to", "gather", "scatter"];
 
 /// Python builtins the kernels call. `float(x)` is a constexpr cast in
 /// `attention_flash.py`'s `sm_scale` handling.
@@ -233,7 +233,7 @@ fn check_fn(f: &FunctionDef, module: &PyModule, errs: &mut Vec<Error>) {
 fn check_stmt(s: &Stmt, module: &PyModule, errs: &mut Vec<Error>) {
     match s {
         Stmt::Assign { target, value, .. } => {
-            check_target(target);
+            check_target(target, module, errs);
             check_expr(value, module, errs);
         }
         Stmt::AnnAssign {
@@ -242,14 +242,14 @@ fn check_stmt(s: &Stmt, module: &PyModule, errs: &mut Vec<Error>) {
             value,
             ..
         } => {
-            check_target(target);
+            check_target(target, module, errs);
             check_expr(annotation, module, errs);
             if let Some(v) = value {
                 check_expr(v, module, errs);
             }
         }
         Stmt::AugAssign { target, value, .. } => {
-            check_target(target);
+            check_target(target, module, errs);
             check_expr(value, module, errs);
         }
         Stmt::For {
@@ -309,16 +309,17 @@ fn check_stmt(s: &Stmt, module: &PyModule, errs: &mut Vec<Error>) {
     }
 }
 
-/// Both assignment-target kinds are in-census by construction, so this walk exists only to
+/// All assignment-target kinds are in-census by construction, so this walk exists only to
 /// keep the recursion uniform -- it collects nothing.
-fn check_target(t: &AssignTarget) {
+fn check_target(t: &AssignTarget, module: &PyModule, errs: &mut Vec<Error>) {
     match t {
         AssignTarget::Name { .. } => {}
         AssignTarget::Tuple { elts, .. } => {
             for e in elts {
-                check_target(e);
+                check_target(e, module, errs);
             }
         }
+        AssignTarget::Subscript { index, .. } => check_expr(index, module, errs),
     }
 }
 

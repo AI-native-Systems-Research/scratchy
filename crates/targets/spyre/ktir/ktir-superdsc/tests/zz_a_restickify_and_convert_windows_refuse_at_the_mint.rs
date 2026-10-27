@@ -30,12 +30,17 @@ use ktir_superdsc::emit::{
 use ktir_superdsc::place::PlaceId;
 use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
 use ktir_superdsc::sdsc_abstract::{
-    KtTileFeats, KtTileSlots, RowBlockedTag, RowWindow, StickLayout, Stk,
+    BlockCols, KtTileFeats, KtTileSlots, Lanes, RowBlockedTag, RowCount, RowWindow, StickLayout,
+    Stk,
 };
 use ktir_superdsc::superdsc_opspec::Df;
 
-fn rbl(name: &str, rows: u32, cols: u32) -> Stk<RowBlockedTag> {
-    Stk::<RowBlockedTag>::new(name, StickLayout::row_blocked(rows as usize, cols as usize)).unwrap()
+fn rbl(name: &str, rows: RowCount, cols: BlockCols) -> Stk<RowBlockedTag> {
+    Stk::<RowBlockedTag>::new(
+        name,
+        StickLayout::row_blocked(rows.get() as usize, cols.get() as usize),
+    )
+    .unwrap()
 }
 
 /// A layout placing `t{tid}` as an activation of `size` bytes — the same rig
@@ -56,6 +61,7 @@ fn layout_placing(entries: &[(u32, u64)]) -> BundleLayout {
                 bank: 0,
                 offset: 0,
                 size,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
     }
@@ -105,7 +111,18 @@ fn kt_2d(
 /// as keys. The control is the same op at corner 0 over the TRUE `[64, 64]` buffers: it builds.
 #[test]
 fn a_kt_tile_past_its_input_handle_refuses() {
-    let (k_nat, k_t) = (rbl("k_nat", 64, 64), rbl("k_t", 64, 64));
+    let (k_nat, k_t) = (
+        rbl(
+            "k_nat",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(64),
+        ),
+        rbl(
+            "k_t",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(64),
+        ),
+    );
     let built = kt_2d(&k_nat, DevOff::ZERO, &k_t, DevOff::ZERO, None);
     assert!(built.op.is_some(), "the true handles build — the control");
 
@@ -127,7 +144,18 @@ fn a_kt_tile_past_its_input_handle_refuses() {
 /// reads keys nobody restickified. The control is the same op at corner 0: it builds.
 #[test]
 fn a_kt_tile_past_its_output_handle_refuses() {
-    let (k_nat, k_t) = (rbl("k_nat", 64, 64), rbl("k_t", 64, 64));
+    let (k_nat, k_t) = (
+        rbl(
+            "k_nat",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(64),
+        ),
+        rbl(
+            "k_t",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(64),
+        ),
+    );
     let past = ktir_superdsc::addr::col_of(1, 8192, 4096, Df::Fp16);
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         kt_2d(&k_nat, DevOff::ZERO, &k_t, past, None)
@@ -145,7 +173,18 @@ fn a_kt_tile_past_its_output_handle_refuses() {
 /// tensor's bytes. The control is the same op against the placement the handle states: it builds.
 #[test]
 fn a_kt_tile_past_its_placement_refuses() {
-    let (k_nat, k_t) = (rbl("t7", 64, 64), rbl("t8", 64, 64));
+    let (k_nat, k_t) = (
+        rbl(
+            "t7",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(64),
+        ),
+        rbl(
+            "t8",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(64),
+        ),
+    );
     let small = layout_placing(&[(7, 4096), (8, 8192)]);
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         kt_2d(&k_nat, DevOff::ZERO, &k_t, DevOff::ZERO, Some(&small))
@@ -173,7 +212,19 @@ fn a_kt_tile_past_its_placement_refuses() {
 fn the_last_slots_convert_fits_exactly_through_the_column_door() {
     let (m, inn, inn_pad, pairs) = (1u32, 64u32, 128u32, 2u32);
     let (cl_reach, k_pad) = ((pairs - 1) * inn + inn_pad, pairs * inn_pad);
-    let (cl, afp8) = (rbl("cl", m, cl_reach), rb_df("afp8", m, k_pad, Df::Fp8));
+    let (cl, afp8) = (
+        rbl(
+            "cl",
+            RowCount::of_token_rows(m),
+            BlockCols::of_feature_cols(cl_reach),
+        ),
+        rb_df(
+            "afp8",
+            RowCount::of_token_rows(m),
+            BlockCols::of_feature_cols(k_pad),
+            Df::Fp8,
+        ),
+    );
     let mut sym = 0i64;
     for s in 0..pairs {
         let op = assemble_convert_col(
@@ -204,7 +255,11 @@ fn the_last_slots_convert_fits_exactly_through_the_column_door() {
 fn a_piece_convert_handle_refuses_the_last_slot() {
     let (m, inn, inn_pad, pairs) = (1u32, 64u32, 128u32, 2u32);
     let cl_reach = (pairs - 1) * inn + inn_pad;
-    let piece = rbl("cl", m, inn_pad);
+    let piece = rbl(
+        "cl",
+        RowCount::of_token_rows(m),
+        BlockCols::of_feature_cols(inn_pad),
+    );
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut sym = 0i64;
         assemble_convert_col(
@@ -214,7 +269,12 @@ fn a_piece_convert_handle_refuses_the_last_slot() {
             inn_pad,
             &piece,
             ktir_superdsc::addr::col_of(m, cl_reach, inn, Df::Fp16),
-            &rb_df("afp8", m, pairs * inn_pad, Df::Fp8),
+            &rb_df(
+                "afp8",
+                RowCount::of_token_rows(m),
+                BlockCols::of_feature_cols(pairs * inn_pad),
+                Df::Fp8,
+            ),
             ktir_superdsc::addr::col_of(m, pairs * inn_pad, inn_pad, Df::Fp8),
             &mut sym,
             None,
@@ -240,9 +300,22 @@ fn an_fp16_annotated_fp8_output_overstates_its_window_and_refuses() {
     let (cl_reach, k_pad) = ((pairs - 1) * inn + inn_pad, pairs * inn_pad);
     let layout = layout_placing(&[(8, cl_reach as u64 * 2), (9, k_pad as u64)]);
     let (cl, afp8_true, afp8_annotated) = (
-        rbl("t8", m, cl_reach),
-        rb_df("t9", m, k_pad, Df::Fp8),
-        rbl("t9", m, k_pad),
+        rbl(
+            "t8",
+            RowCount::of_token_rows(m),
+            BlockCols::of_feature_cols(cl_reach),
+        ),
+        rb_df(
+            "t9",
+            RowCount::of_token_rows(m),
+            BlockCols::of_feature_cols(k_pad),
+            Df::Fp8,
+        ),
+        rbl(
+            "t9",
+            RowCount::of_token_rows(m),
+            BlockCols::of_feature_cols(k_pad),
+        ),
     );
     let mut sym = 0i64;
     let built = assemble_convert_col(
@@ -289,12 +362,28 @@ fn an_fp16_annotated_fp8_output_overstates_its_window_and_refuses() {
 /// builds.
 #[test]
 fn a_whole_tensor_convert_past_its_handle_refuses() {
-    let (act, afp8) = (rbl("act", 1, 128), rb_df("afp8", 1, 128, Df::Fp8));
+    let (act, afp8) = (
+        rbl(
+            "act",
+            RowCount::of_broadcast_row(),
+            BlockCols::of_feature_cols(128),
+        ),
+        rb_df(
+            "afp8",
+            RowCount::of_broadcast_row(),
+            BlockCols::of_feature_cols(128),
+            Df::Fp8,
+        ),
+    );
     let mut sym = 0i64;
     let built = assemble_convert("fq", "qfp8ch", 1, 128, &act, &afp8, &mut sym, None);
     assert!(built.op.is_some(), "the true handles build — the control");
 
-    let small = rbl("act", 1, 64);
+    let small = rbl(
+        "act",
+        RowCount::of_broadcast_row(),
+        BlockCols::of_one_stick(Lanes::FP16),
+    );
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut sym = 0i64;
         assemble_convert("fq", "qfp8ch", 1, 128, &small, &afp8, &mut sym, None)
@@ -317,8 +406,16 @@ fn a_transpose_over_a_handle_smaller_than_its_view_refuses() {
         "tr",
         128,
         128,
-        &rbl("t_in", 128, 128),
-        &rbl("t_out", 128, 128),
+        &rbl(
+            "t_in",
+            RowCount::of_token_rows(128),
+            BlockCols::of_feature_cols(128),
+        ),
+        &rbl(
+            "t_out",
+            RowCount::of_token_rows(128),
+            BlockCols::of_feature_cols(128),
+        ),
         &mut sym,
         None,
     );
@@ -329,8 +426,16 @@ fn a_transpose_over_a_handle_smaller_than_its_view_refuses() {
         "tr",
         128,
         128,
-        &rbl("t_in", 64, 64),
-        &rbl("t_out", 128, 128),
+        &rbl(
+            "t_in",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(64),
+        ),
+        &rbl(
+            "t_out",
+            RowCount::of_token_rows(128),
+            BlockCols::of_feature_cols(128),
+        ),
         &mut sym,
         None,
     ) {

@@ -30,6 +30,7 @@
 
 use std::collections::HashMap;
 
+use crate::dtypes::DType;
 use crate::interpreter::{Arg, Output};
 use crate::ir::IRFunction;
 use ktir_optimizer::fusion::ProgramSpec;
@@ -106,6 +107,38 @@ impl Session {
     /// Sources you don't pass keep their resident bytes — so weights stay put.
     pub fn set_sources(&mut self, args: &[(u64, Arg)]) -> Result<(), String> {
         self.exec.set_sources(args)
+    }
+
+    /// The bundle-stated scale-slot stages, declared as DATA — see
+    /// [`crate::resident::ResidentExecutor::declare_scale_stages`] (seat (i): the bake's
+    /// registry column handed over by the worker, both halves of the write law).
+    pub fn declare_scale_stages(&mut self, stages: &[(u32, DType)]) -> Result<(), String> {
+        self.exec.declare_scale_stages(stages)
+    }
+
+    /// The bundle-stated stage of one scale slot — the runner's per-source dispatch query
+    /// (`Some(F32)` stages the raw IEEE word; `None` keeps the incumbent f16 fill).
+    pub fn scale_stage_dtype(&self, tid: u64) -> Option<DType> {
+        self.exec.scale_stage_dtype(tid)
+    }
+
+    /// Write one tensor's already-typed bytes into its resident HBM stick — the raw staging
+    /// channel the numeric gate uses for the attention family's step inputs (id tables as
+    /// I32, the validity mask as F16 wire bytes), verbatim under the same law
+    /// [`crate::resident::ResidentExecutor::set_source_bytes_owned`] always states.
+    pub fn set_source_bytes(
+        &mut self,
+        tensor: u64,
+        bytes: Vec<u8>,
+        dtype: DType,
+    ) -> Result<(), String> {
+        self.exec.set_source_bytes_owned(tensor, bytes, dtype)
+    }
+
+    /// The staged byte extent of one tensor at its own view dtype — see
+    /// [`crate::resident::ResidentExecutor::source_extent_bytes`].
+    pub fn source_extent_bytes(&self, tensor: u64) -> Option<u64> {
+        self.exec.source_extent_bytes(tensor)
     }
 
     /// Run one forward pass of program 0 and read back `outputs` (empty = results).

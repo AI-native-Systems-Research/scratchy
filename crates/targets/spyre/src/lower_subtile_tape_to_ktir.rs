@@ -18,6 +18,7 @@
 use crate::lower_subtile_tape_to_superdsc::*;
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ktir_node::ActiveCap;
+use ktir_superdsc::score_scale::ScoreScaleLaw;
 use ktir_superdsc::sdsc_abstract::POOL_STICK;
 use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR, SubtileId, SubtileNode, TensorId};
 use scratchy_subtile::superdsc_opspec::{DataFormat, DeviceTileLayout};
@@ -571,10 +572,8 @@ fn attn_pools<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<ktir_superdsc::sdsc_abstrac
     let mut pools = Vec::new();
     for n in &ir.nodes {
         if let SubOp::AttnDecode { geom, .. } = &n.op {
-            let pool = ktir_superdsc::sdsc_abstract::PagedKvPool::new(
-                geom.nkvh().get() as usize,
-                geom.hd().get() as usize,
-            );
+            let pool =
+                ktir_superdsc::sdsc_abstract::PagedKvPool::new(geom.nkvh().get(), geom.hd().get());
             if !pools.contains(&pool) {
                 pools.push(pool);
             }
@@ -660,6 +659,61 @@ pub fn chunk_swept_per_request<F: RopeForm>(
 ///
 /// `None` when the graph has no attention node: there is then nothing for the facts to be facts
 /// of, and an attention program arriving at the door without them is that door's own build error.
+/// ⭐⭐⭐ THE GRAPH'S ONE SCORE-SCALE LAW — the conjunction over every attention node, as ONE
+/// derivation shared by every consumer: [`attn_bundle_params`] (the door's
+/// `BundleAttnParams::scale_law`, which the write mint and the door's read cross-check read)
+/// AND the walks that thread the law to the splice's SCALE site — so the fold's program
+/// states its multiplier from the same proof the pool's write derived its bytes' law from.
+///
+/// MINTED WHERE EACH PROOF EXISTS, never a bare bool: the fold's own list
+/// ([`attn_scale_weight_folds`]) IS the receipt for `CommutedIntoWeights` (its gates — fp8
+/// payload, shared readers, the f16 floor, pair-wise — are the proof, and a refused fold
+/// mints nothing); the IR node's own payload is the arch's statement (`&SubtileIR` is
+/// shared-immutable and every fold rewrite happens on a clone, so a `1.0` read here is the
+/// model's and never a rewrite's residue), and a `1.0` there is `UnitByModel`; everything
+/// else states its multiplier in the program.
+///
+/// `None` when the graph has no attention node at all. Refuses — never chooses — a graph
+/// whose attention nodes carry different laws: one bundle is one model.
+pub(crate) fn score_scale_law<F: RopeForm>(
+    ir: &SubtileIR<F>,
+) -> Result<Option<ScoreScaleLaw>, SuperDscError> {
+    let folded: std::collections::HashSet<SubtileId> = attn_scale_weight_folds(ir)
+        .into_iter()
+        .map(|(id, ..)| id)
+        .collect();
+    let mut first: Option<(u32, ScoreScaleLaw)> = None;
+    for n in &ir.nodes {
+        let SubOp::AttnDecode { scale, .. } = &n.op else {
+            continue;
+        };
+        let n_law = if folded.contains(&n.id) {
+            ScoreScaleLaw::CommutedIntoWeights
+        } else if *scale == 1.0 {
+            ScoreScaleLaw::UnitByModel
+        } else {
+            ScoreScaleLaw::StatedByProgram
+        };
+        let t = n.output.tensor.index() as u32;
+        match first {
+            None => first = Some((t, n_law)),
+            Some((t0, f0)) => {
+                if f0 != n_law {
+                    return Err(SuperDscError(format!(
+                        "AttnDecode t{t0} carries its attention scale {f0:?} while AttnDecode t{t} \
+                         carries {n_law:?}. One bundle is one model, and every consumer of the law \
+                         (the door's pool write, its read cross-check, the splice's SCALE) takes \
+                         ONE such law for the whole bundle; a graph carrying both cannot lower one \
+                         attention without mislowering the other, so this refuses instead of \
+                         choosing."
+                    )));
+                }
+            }
+        }
+    }
+    Ok(first.map(|(_, law)| law))
+}
+
 pub(crate) fn attn_bundle_params<F: RopeForm>(
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
@@ -676,17 +730,17 @@ pub(crate) fn attn_bundle_params<F: RopeForm>(
     // attention-fold recognition named it, OR the node states a UNIT scale — `√1.0` leaves the
     // weights carrying the whole scale with nothing folded, which is the gemma-4 arch's own
     // default (`attention_multiplier` 1.0). The two are disjoint by the recognition's own skip
-    // (a node at scale 1.0 folds nothing), which is also why the door's `scale_in_weights` is a
-    // fact about what the program cannot state, not a restatement of one of its values — see
-    // `BundleAttnParams::scale_in_weights`.
-    let folded: std::collections::HashSet<SubtileId> = attn_scale_weight_folds(ir)
-        .into_iter()
-        .map(|(id, ..)| id)
-        .collect();
+    // (a node at scale 1.0 folds nothing), which is also why the door's `scale_law` is a fact
+    // about what the program cannot state, not a restatement of one of its values — see
+    // `BundleAttnParams::scale_law`.
+    //
+    // ⭐ THE LAW ITSELF IS MINTED BY [`score_scale_law`] — the one derivation, shared by this
+    // mint and by every walk that threads the law to the splice's SCALE site (the fold's
+    // program states its multiplier from the same proof the door's cross-check reads).
+    let scale_law = score_scale_law(ir)?;
     let mut found: Option<(u32, u32)> = None;
-    let mut first_in_weights: Option<bool> = None;
     for n in &ir.nodes {
-        let SubOp::AttnDecode { scale, .. } = &n.op else {
+        let SubOp::AttnDecode { .. } = &n.op else {
             continue;
         };
         let t = n.output.tensor.index() as u32;
@@ -694,31 +748,8 @@ pub(crate) fn attn_bundle_params<F: RopeForm>(
         // the request count (`lower_attn` reads this same `region.rows.len` as its `mq`). The
         // head-major handoff is minted exactly where this is ONE row.
         let rows = n.output.region.rows.len;
-        let n_in_weights = folded.contains(&n.id) || *scale == 1.0;
-        match (found, first_in_weights) {
-            (None, _) => {
-                found = Some((t, rows));
-                first_in_weights = Some(n_in_weights);
-            }
-            (Some((t0, _r0)), Some(f0)) => {
-                // ⛔ THE GEOMETRY CHECK IS GONE, AND THE HYBRID MODEL IS THE REASON: gemma-4's
-                // sliding layers and every-sixth global layer carry TWO attention classes in one
-                // graph, and the door MINTS each program's geometry from its own views (the same
-                // reading rope takes for its head dim) — so no per-bundle geometry exists to agree
-                // on, and two classes in one graph is legitimate. The in-weights fact below keeps
-                // the one-value-per-bundle law.
-                if f0 != n_in_weights {
-                    return Err(SuperDscError(format!(
-                        "AttnDecode t{t0} carries its attention scale in its staged weights while \
-                         AttnDecode t{t} states a device score multiply. One bundle is one model, \
-                         and the door takes ONE such fact for the whole bundle; a graph carrying \
-                         both cannot lower one attention without mislowering the other, so this \
-                         refuses instead of choosing."
-                    )));
-                }
-            }
-            // `found` and `first_in_weights` are set in the same arm and never apart.
-            (Some(_), None) => unreachable!("first_in_weights tracks found"),
+        if found.is_none() {
+            found = Some((t, rows));
         }
     }
     let oproj = oproj_edges(ir)?;
@@ -790,7 +821,7 @@ pub(crate) fn attn_bundle_params<F: RopeForm>(
         // cannot feed (see `BundleAttnParams::gathers_kv`).
         gathers_kv: rows_are_requests || chunk_pages.is_some(),
         chunk_pages,
-        scale_in_weights: first_in_weights.unwrap_or(false),
+        scale_law: scale_law.unwrap_or(ScoreScaleLaw::StatedByProgram),
         headmajor_handoff,
         // The CANONICAL o_proj — the first edge's weight, the rolled body's layer-0
         // representative. `Some` whenever the dataflow found the o matmul, whatever the
@@ -816,6 +847,23 @@ pub(crate) fn lower_one_node<F: RopeForm>(
     active_cap: ActiveCap,
     // See main's `lower_attn_node`: whether this bundle's rows are separate requests.
     rows_are_requests: bool,
+    // ⭐ THE PAGED-FOLD RUNG, expanded by the walk from the rung's statement and the layout's
+    // region ceiling — `None` on every non-fold walk (the unrolled graph walk, the wiring
+    // walk), `Some` on every rung of a chunked one-request ladder. The splice states the
+    // family only when `fold_body` holds; the other rungs take only the region threading.
+    paged_fold: Option<&scratchy_triton_splice::PagedFoldRung>,
+    // ⭐⭐⭐ THE BUNDLE'S SCORE-SCALE LAW ([`score_scale_law`]'s one derivation) — threaded so the
+    // splice's SCALE site derives its multiplier by EXHAUSTIVE MATCH over the law instead of a
+    // naked read off the node. `None` only when the graph has no attention node at all (the
+    // AttnDecode arm below never runs); the arm refuses a `None` arriving with an AttnDecode —
+    // a law the walk did not mint over a node that needs one is a walk/splice desync.
+    scale_law: Option<ScoreScaleLaw>,
+    // ⭐ THE HEAD-MAJOR o_proj HANDOFF of the bundle this node bakes into
+    // (`BundleAttnParams::headmajor_handoff`) — under it the attention output stays in the
+    // kernels' per-head row frame, the bytes the permuted o_proj copy is derived for, so the
+    // splice's head relayout drops its from-rows copy. `false` on every walk that zeroes the
+    // handoff (the unrolled body, the wiring walk).
+    out_stays_head_rows: bool,
 ) -> NodeLowering {
     use NodeLowering::{HostRouted, Ops, Unhandled};
     // ⭐⭐⭐ A FOLDED SCALARMUL'S READERS BIND THE PRODUCER'S OUTPUT. The fold takes the node
@@ -988,12 +1036,23 @@ pub(crate) fn lower_one_node<F: RopeForm>(
                 Err(reason) => Unhandled(reason),
             }
         }
-        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => {
+        // ⭐ THE TWO ROPE FORMS ROUTE SEPARATELY. `RopeRotate` is the q stream's rotation —
+        // one op. `RopeAppend` is the K/V stream's WRITE-BEARING form: one node lowers to
+        // TWO programs through the splice's own entry (the wall-22 ruling) — the rotation
+        // (`Program::Rope`, the door's `rope_at` P-table matmul) and the arity-6 carrier
+        // (`Program::RopeAppend`, whose door arm lowers the write through main's
+        // `kv_cache_write` recipe) — the write the arity-3 port dropped, back through the
+        // mechanism main's own attention path proved on card.
+        SubOp::RopeRotate { .. } => {
             match scratchy_triton_splice::lower(node, ir, rows_are_requests) {
                 Ok(e) => Ops(vec![e]),
                 Err(reason) => Unhandled(reason),
             }
         }
+        SubOp::RopeAppend { .. } => match scratchy_triton_splice::lower_rope_append(node, ir) {
+            Ok(ops) => Ops(ops),
+            Err(reason) => Unhandled(reason),
+        },
         // ⭐ THE LOGITS SCALARMUL RIDES `lower_all` WITH THE MATMUL — the vocab-wide
         // tail folds BOTH halves to m=1 (main's `is_prefill_lm_head_tail` covers this
         // arm too), and the fold is the splice's `lower_all` now. Every other
@@ -1021,7 +1080,7 @@ pub(crate) fn lower_one_node<F: RopeForm>(
             // same read main's builder control makes (`ir.tensors[kv.cache_tensor()].rows`),
             // and the swept rung rides the walk's own `active_cap`. Everything else main's
             // `lower_attn_node` threaded is either read off the program by the
-            // door (`attn_at`: the swept extent, the scale, the span guard, the row laws)
+            // door (the swept extent, the scale, the span guard, the row laws)
             // or is a constexpr the kernel states from the node's own payload.
             let cap = ir.tensors[kv.cache_tensor().index() as u32 as usize].rows;
             // ⭐⭐⭐ THE SCALE, REWRITTEN TO 1.0 WHEN ITS FOLD APPLIES. The program is the ONE
@@ -1045,8 +1104,19 @@ pub(crate) fn lower_one_node<F: RopeForm>(
             } else {
                 node
             };
-            match scratchy_triton_splice::lower_attn(node_ref, ir, cap, active_cap) {
-                Ok(e) => Ops(vec![e]),
+            match scratchy_triton_splice::lower_attn(
+                node_ref,
+                ir,
+                cap,
+                active_cap,
+                rows_are_requests,
+                paged_fold,
+                scratchy_triton_splice::AttnBundleFacts {
+                    scale_law,
+                    out_stays_head_rows,
+                },
+            ) {
+                Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
         }
@@ -1094,7 +1164,7 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
     // layer boundary to split the weight segment on. An empty map is what tells the layout that
     // banking is not expressible here, leaving the tail spill as the only lever (`&Default::default()`
     // rather than a bool, so there is one spelling of "the layer structure" and not two).
-    let bundle_layout =
+    let mut bundle_layout =
         compute_bundle_layout(ir, weight_ids, rows_are_requests, rows_are_requests, &[])?;
     let mut ops: Vec<EmittedOp> = Vec::with_capacity(ir.nodes.len());
     // Collect EVERY distinct unhandled op kind (the full worklist) in one pass —
@@ -1109,8 +1179,19 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
     // RE-ROLLED tape-driven path reuses the SAME helper, walking only the loop body
     // once — see `lower_subtile_tape_to_superdsc`.) MatmulTile's Err is still a hard
     // stop; everything else collects into the worklist/host-routed sets below.
+    // ⭐ THE LAW, MINTED ONCE FOR THE WHOLE WALK — the splice's SCALE site derives every
+    // attention program's multiplier from it ([`score_scale_law`]'s one derivation).
+    let scale_law = score_scale_law(ir)?;
     for node in &ir.nodes {
-        match lower_one_node(node, ir, active_cap, rows_are_requests) {
+        match lower_one_node(
+            node,
+            ir,
+            active_cap,
+            rows_are_requests,
+            None,
+            scale_law,
+            false,
+        ) {
             NodeLowering::Ops(v) => ops.extend(v),
             NodeLowering::Unhandled(s) => {
                 // A MALFORMED matmul is an immediate hard stop (it must never bake);
@@ -1135,6 +1216,10 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
             unhandled.into_iter().collect::<Vec<_>>().join(", "),
         )));
     }
+    // ⭐⭐⭐ THE REGISTRY'S PROGRAM-STATED HALF, completed over the programs this walk just built,
+    // before the caller's door pass can resolve a scale — the door looks a folded constant up by
+    // bits and refuses without a slot.
+    complete_program_scales(&mut bundle_layout, &[&ops]);
     Ok((ops, bundle_layout))
 }
 
@@ -1156,6 +1241,25 @@ pub fn lower_graph_to_superdsc<F: RopeForm>(
 ) -> Result<(Vec<EmittedOp>, BundleLayout), SuperDscError> {
     let (programs, mut bundle_layout) =
         lower_graph_to_ktir(ir, weight_ids, active_cap, rows_are_requests)?;
+    // ⭐⭐⭐ THE PER-STEP INPUT PLACEMENTS, before the door pass below can ask for them — the
+    // re-rolled walk places them ahead of its declare pass for the same reason (see
+    // [`place_step_inputs`]).
+    place_step_inputs(&mut bundle_layout, &[&programs], ir.tensors.len() as u32)?;
+    place_head_rows(&mut bundle_layout, &[&programs])?;
+    // ⭐⭐⭐ THE KV BLOCK INDEX GOES LAST OF ALL — after `complete_program_scales` (which ran
+    // inside `lower_graph_to_ktir`, before the step inputs) and after `place_step_inputs`,
+    // i.e. past the last host-staged placement this walk makes. Same law as the re-rolled
+    // walk's call: the index is the one activation whose presence may differ between a
+    // session's bodies, so it must move nothing the host stages. See
+    // [`BundleLayout::place_kv_block_index_last`].
+    bundle_layout.place_kv_block_index_last();
+    // ⭐⭐⭐ THE REP TABLE GOES LAST OF ALL AFTER IT — the batched decode row's rep slot is the
+    // one STEP INPUT whose presence may differ (the paged-fold body and every one-request or
+    // prefill row state none), so it too must sit past every offset
+    // `ladder_stages_one_layout` compares. See [`BundleLayout::place_rep_table_last`] for the
+    // law; before the door pass below, so a batched score read resolving `t{rep}` finds its
+    // placement.
+    bundle_layout.place_rep_table_last();
     // The four facts no KTIR states, read off the graph's own `AttnDecode` nodes and this walk's own
     // parameters — the same call `lower_subtile_tape_to_ktir`'s re-rolled walk makes.
     //
@@ -1220,6 +1324,11 @@ pub fn lower_graph_to_superdsc<F: RopeForm>(
 /// reading someone else's tensor.
 pub struct BundleWiring {
     pub nodes: Vec<NodeArgs>,
+    /// Each attention layer's own wiring facts — the sealed cache pair and the node's new-K/new-V
+    /// inputs — one row per `SubOp::AttnDecode` node, in node order. Read where the roles are
+    /// needed (the wiring scan); ⛔ never re-derived from the programs' parameter lists — see
+    /// [`AttnWiring`]'s doc for the positional disease this replaces.
+    pub attn: Vec<AttnWiring>,
     pub num_sources: u32,
     pub result_tensor: u32,
     /// `tensor_shapes[id] = (rows, cols)` for every tensor. When `attn_mask` is set, the LAST entry
@@ -1245,6 +1354,11 @@ pub struct BundleWiring {
     /// must fill them, the card path through `wiring::constant_steps` and the emulator through its
     /// own source binding. This is the one list they read, so they cannot disagree about it.
     pub scalarmul_scales: Vec<f32>,
+    /// EACH SCALE SLOT'S OWN `df`, parallel to [`Self::scalarmul_scales`]: the staging channel
+    /// the runtime must write entry `i` through — `Fp16` (the existing f16 `[1,1]` const fill)
+    /// or `Fp32` (the raw IEEE word, 4 B). Collected at the programs' own splats, the same seat
+    /// the values came from, so the two columns cannot disagree about what a program stated.
+    pub scalarmul_scales_df: Vec<ktir_superdsc::superdsc_opspec::Df>,
     /// The weight folds this graph admits: `(tensor id, multiplier)` for each matmul weight the
     /// worker must scale at load instead of the tape applying the multiplier at runtime —
     /// EITHER a `ScalarMul` fold ([`scalar_mul_weight_folds`], whose refusal set — sliced reads,
@@ -1290,6 +1404,39 @@ pub struct NodeArgs {
     pub args: Vec<usize>,
 }
 
+/// ⭐ ONE ATTENTION LAYER'S OWN FACTS — each from its ONE owner, never re-derived downstream.
+///
+/// The wiring used to carry each program's parameter list alone ([`NodeArgs`]) and let the
+/// consumer re-derive these roles POSITIONALLY from it — "the argument after the prefix-K
+/// argument is the new-K output". That was a second implementation of the AttnDecode contract,
+/// correct only while a program's parameter order happened to spell it: the paged fold binds
+/// `[q, m, l, acc, Kᵀ, V, kt_ids, v_ids, mask]` — no new-K/new-V parameter at all — so the
+/// positional read handed out the V cache tensor as "new K" and an id table as "new V", and no
+/// extent law could notice. The facts live here instead, read off the same seats every other
+/// consumer already reads:
+///
+/// - `prefix_k`/`prefix_v` off the node's SEALED `KvCacheLayout` — the witness that exists to
+///   make producer/consumer cache drift structurally impossible;
+/// - `new_k`/`new_v` off the AttnDecode input contract `[q, prefix_k, prefix_v, new_k, new_v]`
+///   (`inputs[3]`/`inputs[4]`) — the same spelling the door reads (`ops_in.new_k_id`) and the
+///   placement pass re-places at the padded size.
+///
+/// The layer index is NOT here: it is the source registry's fact (`SourceBinding::PrefixK
+/// { layer }`), joined at the one seat that holds both — the wiring scan. ⛔ NOTHING DOWNSTREAM
+/// MAY RE-DERIVE A ROLE FROM A PROGRAM'S PARAMETER ORDER; the scan joins programs to rows by
+/// VALUE (the reserved Kᵀ name's own source key), never by position.
+pub struct AttnWiring {
+    /// The layer's prefix-K cache source tid — the sealed pair's K tensor, the `PrefixK`
+    /// source the host/pool binds.
+    pub prefix_k: u32,
+    /// The layer's prefix-V cache source tid — the sealed pair's V tensor.
+    pub prefix_v: u32,
+    /// The node's new-K input (`inputs[3]`): this step's roped K rows, the readback target.
+    pub new_k: u32,
+    /// The node's new-V input (`inputs[4]`).
+    pub new_v: u32,
+}
+
 /// ⭐ THE WIRING'S REGISTRIES — the layout facts [`graph_wiring`] rebuilds as pure functions of
 /// `ir`, in the wiring's own shapes. ⛔ NO `Default`, and the literal in `graph_wiring` is
 /// EXHAUSTIVE: a registry added to this struct (or to [`BundleWiring`]) is a MISSING FIELD at
@@ -1303,6 +1450,11 @@ pub struct NodeArgs {
 /// registries stand alone here, exhaustively built.
 pub(crate) struct WiringRegistries {
     pub scalarmul_scales: Vec<f32>,
+    /// The registry's format column, parallel to [`Self::scalarmul_scales`] — the census half all
+    /// `Fp16` (the staging-twin law), the program-stated half completed below with each
+    /// constant's own df. The two walks' one-registry law extends to it: the bake's and the
+    /// wiring's completions append the same bits-sorted dfs beside the same bits-sorted values.
+    pub scalarmul_scales_df: Vec<ktir_superdsc::superdsc_opspec::Df>,
     pub weight_scale_folds: Vec<(u32, f32)>,
     pub weight_copies: Vec<(u32, u32)>,
     pub rope_class_hds: Vec<u32>,
@@ -1331,8 +1483,13 @@ pub fn graph_wiring<F: RopeForm>(
     // registry added later is a missing field at the literal, not a silent `Default` on the
     // card.
     let _ = weight_ids;
-    let registries = WiringRegistries {
-        scalarmul_scales: scalar_registry(ir),
+    // `mut` for the program-stated completion below (the same append the bake's walks run).
+    let census_scales = scalar_registry(ir);
+    let mut registries = WiringRegistries {
+        scalarmul_scales: census_scales.clone(),
+        // The format column of the same census: ALL Fp16, the staging-twin law (the value the
+        // card applies is f16(v)) — parallel by construction, one length.
+        scalarmul_scales_df: vec![ktir_superdsc::superdsc_opspec::Df::Fp16; census_scales.len()],
         // Same rule as the placement pass's own field: the fold list the worker applies to
         // staged bytes at load, keyed by weight tid (the `SubtileId` half is a placement-pass
         // fact and does not ship).
@@ -1367,14 +1524,35 @@ pub fn graph_wiring<F: RopeForm>(
     // UNROLLED graph: on granite-2b it was two thirds of the models build script, serially, for one
     // fact per program — its bindings — and one per mask. The fold below sees the results in node
     // order, so the first error and the mask check read exactly as the serial walk did.
-    // One program's binding order, and the `(mask tid, capacity)` it reads, when it reads one.
     type WiredProgram = (NodeArgs, Option<(u32, u32)>);
-    let per_node: Vec<Result<Vec<WiredProgram>, SuperDscError>> = {
+    // One node's whole contribution: its wired programs plus the scale-registry values its own
+    // ops state — the program-stated half this walk completes below, so the wiring binds every
+    // `[1,1]` const the bake's door resolves. Each stated value rides its PROGRAM'S OWN NAME and
+    // df, so the completion below can name both staters of a slot two walks disagreed about.
+    type WiredNode = Result<
+        (
+            Vec<WiredProgram>,
+            Vec<(&'static str, f32, ktir_superdsc::superdsc_opspec::Df)>,
+        ),
+        SuperDscError,
+    >;
+    let per_node: Vec<WiredNode> = {
         use rayon::prelude::*;
         ir.nodes
             .par_iter()
             .map(|node| {
-                let ops = match lower_one_node(node, ir, ActiveCap::FULL, false) {
+                let ops = match lower_one_node(
+                    node,
+                    ir,
+                    ActiveCap::FULL,
+                    false,
+                    None,
+                    // The walk's OWN law mint — the same derivation the bake's
+                    // `attn_bundle_params` runs, so the wiring's programs and the
+                    // shipped bundle's state one multiplier spelling.
+                    score_scale_law(ir)?,
+                    false,
+                ) {
                     NodeLowering::Ops(v) => v,
                     // A host-routed op runs off the device, so it has no program and binds nothing. It
                     // still occupies a position in the node order, so it contributes an empty entry.
@@ -1382,8 +1560,19 @@ pub fn graph_wiring<F: RopeForm>(
                     NodeLowering::Unhandled(why) => return Err(SuperDscError(why)),
                 };
                 let mut out = Vec::with_capacity(ops.len());
+                let mut stated = Vec::new();
                 for e in ops {
                     let Some(k) = e.ktir else { continue };
+                    // ⭐ THE DOOR'S OWN READER, run here so the wiring's registry carries every
+                    // value the door resolves by bits — the same `program_stated_scales` the bake's
+                    // completion pass collects, appended bits-sorted below, so the two walks cannot
+                    // disagree about a slot (the one-census law, extended to the folded half). The
+                    // df rides the same read, at the splat the value came from.
+                    for (v, df) in
+                        ktir_superdsc::emit::lower_ktir_to_superdsc::program_stated_scales(&k.func)
+                    {
+                        stated.push((k.func.name, v, df));
+                    }
                     let mask = match k.mask {
                         // ⭐ THE CAPACITY COMES OFF THE PROGRAM, not off the node: the resident cache's
                         // own `ktdp.construct_memory_view` states `[capacity, kv_width]`, so the number
@@ -1395,7 +1584,7 @@ pub fn graph_wiring<F: RopeForm>(
                         // decode; a multi-row continuation binds one `[mq, capacity + mq]` tile (the
                         // prefix's length mask beside the new block's row mask), whose columns are not
                         // the capacity. The resident K is the program's third parameter in every arm
-                        // (q, out, kc, kd, vc, vd — `attn_operands`'s order).
+                        // (q, out, kc, kd, vc, vd — the program's parameter order).
                         Some(mid) => {
                             let regs = ktir_superdsc::emit::lower_ktir_to_superdsc::regions(&k)
                                 .map_err(|e| SuperDscError(e.message))?;
@@ -1427,14 +1616,24 @@ pub fn graph_wiring<F: RopeForm>(
                         mask,
                     ));
                 }
-                Ok(out)
+                Ok((out, stated))
             })
             .collect()
     };
     let mut nodes = Vec::with_capacity(ir.nodes.len());
     let mut mask: Option<(u32, u32)> = None;
-    for lowered in per_node {
-        for (args, m) in lowered? {
+    let mut stated_scales = Vec::new();
+    for (node_ordinal, lowered) in per_node.into_iter().enumerate() {
+        let (wired, stated) = lowered?;
+        for (name, v, df) in stated {
+            stated_scales.push(ktir_superdsc::emit::lower_ktir_to_superdsc::StatedScale {
+                walk: node_ordinal,
+                name,
+                value: v,
+                df,
+            });
+        }
+        for (args, m) in wired {
             if let Some(m) = m {
                 if mask.is_some_and(|prev| prev != m) {
                     return Err(SuperDscError(format!(
@@ -1466,13 +1665,48 @@ pub fn graph_wiring<F: RopeForm>(
         }
         None => None,
     };
+    // ⭐⭐⭐ THE WIRING'S COPY OF THE PROGRAM-STATED HALF — the same completion the bake's walks
+    // run, over the same nodes this walk just lowered, so the worker's `[1,1]` const binds and
+    // the door's scale lookups resolve the IDENTICAL slots (bits-sorted appends: node order here
+    // and prefix→bodies→suffix in the bake compute the same list).
+    ktir_superdsc::emit::lower_ktir_to_superdsc::complete_scale_registry(
+        &mut registries.scalarmul_scales,
+        &mut registries.scalarmul_scales_df,
+        stated_scales,
+    );
+    // ⭐ THE ATTENTION ROWS — each AttnDecode node's own facts, read where the door and the
+    // placement pass read them. A pure function of `ir.nodes`, like every registry here; the
+    // programs' parameter lists (`NodeArgs`) no longer carry roles for anyone to re-derive.
+    let mut attn: Vec<AttnWiring> = Vec::new();
+    for n in &ir.nodes {
+        let SubOp::AttnDecode { layout, .. } = &n.op else {
+            continue;
+        };
+        if n.inputs.len() < 5 {
+            return Err(SuperDscError(format!(
+                "AttnDecode t{} states {} inputs — the contract is [q, prefix_k, prefix_v, \
+                 new_k, new_v], and a node that does not state it has no fact for the wiring \
+                 to carry",
+                n.output.tensor.index(),
+                n.inputs.len()
+            )));
+        }
+        attn.push(AttnWiring {
+            prefix_k: layout.cache_tensor().index() as u32,
+            prefix_v: layout.v_cache_tensor().index() as u32,
+            new_k: n.inputs[3].tensor.index() as u32,
+            new_v: n.inputs[4].tensor.index() as u32,
+        });
+    }
     Ok(BundleWiring {
         nodes,
+        attn,
         num_sources: ir.num_sources,
         result_tensor: ir.result.index() as u32,
         tensor_shapes,
         attn_mask,
         scalarmul_scales: registries.scalarmul_scales,
+        scalarmul_scales_df: registries.scalarmul_scales_df,
         weight_scale_folds: registries.weight_scale_folds,
         weight_copies: registries.weight_copies,
         // The class sets, off the SAME registries the two lists above come from — the
@@ -1498,6 +1732,566 @@ pub struct RungFacts {
     /// The split-KV chunk this rung bakes — see `BundleAttnParams::chunk_pages` (a
     /// one-request or prompt-chunk rung; `None` for the whole-cap rungs).
     pub chunk_pages: Option<u32>,
+    /// ⭐ THE PAGED-FOLD STATEMENT — present on every rung of a chunked ONE-REQUEST decode
+    /// ladder (the shape whose fallback the proof demands): [`PagedFoldStatement`] says
+    /// whether THIS rung is the per-page body. The region's page ceiling is NOT stated here —
+    /// it is the layout's own ONE derivation (`BundleLayout::paged_fold_region_pages`), which
+    /// the walk expands the statement against.
+    pub paged_fold: Option<PagedFoldStatement>,
+}
+
+/// Which role a rung plays in a paged-fold ladder — the fold rung's own statement. `true`
+/// ONLY on the `(FULL, None)` rung: the one whose one-shot attention program the fold family
+/// (seed, per-page body, finalize) replaces. Every other rung of the same ladder states
+/// `false`, which threads the region's page ceiling into its prefill kernel's step-input
+/// extents (the one-layout guard compares Activation placements across rungs) without
+/// minting a fold.
+#[derive(Clone, Copy, Debug)]
+pub struct PagedFoldStatement {
+    pub fold_body: bool,
+}
+
+/// ⭐⭐⭐⭐⭐ THE SCALE-REGISTRY COMPLETION PASS — the program-stated half of
+/// `BundleLayout::scalarmul_scales`, appended at the seam where the programs exist.
+///
+/// The registry's payload half is the census ([`scalar_registry`]): a pure walk of `ir.nodes`,
+/// run by BOTH the bake's layout and the wiring's registries. But a program minted by the splice
+/// can state a constant no payload names — a front-end FOLD of two config constants into one
+/// (`qk * (SCALE * LOG2E)`, the exp2 restatement) — and the door resolves every such value BY
+/// BITS (`scale_slot`) and refuses without a slot. This pass completes the registry from the
+/// programs the walk just built, using the door's own readers
+/// ([`program_stated_scales`](ktir_superdsc::emit::lower_ktir_to_superdsc::program_stated_scales)),
+/// so the collector cannot drift from the door.
+///
+/// ⛔ RUN AT THE SEAM, BEFORE ANY DOOR PASS. The completion must precede the first lowering that
+/// resolves a scale (the declare pass, the door loop) and run over the SAME programs the bake
+/// lowers — which is why it sits beside [`place_step_inputs`] at every walk site, and why
+/// [`graph_wiring`] completes its own copy over the same nodes. The appended half is bits-sorted
+/// ([`complete_scale_registry`](ktir_superdsc::emit::lower_ktir_to_superdsc::complete_scale_registry)),
+/// so the bake's prefix→bodies→suffix order and the wiring's node order compute the IDENTICAL
+/// list — two walks, one registry, the same law `scalarmul_scales`'s one-census rule states.
+///
+/// ⭐ A NO-OP FOR A GRAPH WITH NO FOLDED CONSTANTS: every value the census registered is dropped
+/// by the door's own lookup (bits, then f16 image), so existing registries stay byte-identical —
+/// pinned by test in the door crate. The appended slots take the census loop's own placement law
+/// (a `[1,1]` worker-bound const in seg0), minted at the END of the segment so no existing offset
+/// moves.
+pub fn complete_program_scales(layout: &mut BundleLayout, op_lists: &[&[EmittedOp]]) {
+    let mut stated = Vec::new();
+    // The walk's ordinal for each program — one per ktir program, in walk order — so a format
+    // disagreement at one reserved slot names BOTH stating programs (the completion's refusal).
+    let mut walk = 0usize;
+    for ops in op_lists {
+        for e in ops.iter() {
+            if let Some(k) = e.ktir.as_ref() {
+                for (v, df) in
+                    ktir_superdsc::emit::lower_ktir_to_superdsc::program_stated_scales(&k.func)
+                {
+                    stated.push(ktir_superdsc::emit::lower_ktir_to_superdsc::StatedScale {
+                        walk,
+                        name: k.func.name,
+                        value: v,
+                        df,
+                    });
+                }
+                walk += 1;
+            }
+        }
+    }
+    let before = layout.scalarmul_scales.len();
+    ktir_superdsc::emit::lower_ktir_to_superdsc::complete_scale_registry(
+        &mut layout.scalarmul_scales,
+        &mut layout.scalarmul_scales_df,
+        stated,
+    );
+    // ⭐ THE PLACEMENTS — the census loop's own law, minted for the appended half: one `[1,1]`
+    // worker-bound const per NEW slot in seg0 (ACTIVATION), appended at the segment's end
+    // so no existing tensor's offset moves, sized at the SLOT'S OWN df (2 B f16, 4 B f32 —
+    // the same word length the slot's staging channel writes). Without the placement the door's
+    // window check refuses the const's operand ("windowed but never declared"); without the
+    // identity row the placement is invisible to `resolve_seg_base` — the same two rows
+    // `place_step_inputs` writes for its own mints, and the same placement
+    // `compute_bundle_layout` mints for the payload half.
+    for i in before..layout.scalarmul_scales.len() {
+        let tid = ktir_superdsc::reserved_tids::scalarmul_scale_tid(i);
+        let seg = SegRole::Activation.segment();
+        let off = layout.segment_bytes[seg];
+        let size = layout.scalarmul_scales_df[i].word_length() as u64;
+        layout.placements.insert(
+            tid,
+            TensorPlacement {
+                tid,
+                bank: 0,
+                role: SegRole::Activation,
+                segment: seg,
+                offset: off,
+                size,
+                cover: ktir_superdsc::placement::BindCover::Full,
+            },
+        );
+        layout.segment_bytes[seg] = align128(off + size);
+        layout.ids.borrow_mut().insert(
+            ktir_superdsc::place::act_name(tid),
+            ktir_superdsc::place::PlaceId::Act(tid),
+        );
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ THE PER-STEP INPUT PLACEMENT PASS — one generic law, stated once, consumed by every
+/// program of the bundle.
+///
+/// A spliced program can bind a parameter no graph tensor names — a buffer the runtime stages
+/// every step (an index table, a validity mask). The whole-function door refuses such a binding
+/// until something PLACES it, and that is this pass: for every [`StepInput`] every program of the
+/// bundle states, mint a seg-ACTIVATION placement sized from the program's OWN view
+/// (`construct_memory_view` extent, element format from the view's own dtype) — never from a
+/// re-derivation here, which is how a placement and the bytes a kernel reads drift apart.
+///
+/// ⛔ THE LAW IS CHECKED, NOT TRUSTED. Each stated binding must be numbered exactly as
+/// [`step_input_tid`](ktir_superdsc::ktir_node::step_input_tid)`(n_graph_tensors, slot)` says — the
+/// producer that stated it numbered it through that same law, and a binding numbered any other way
+/// is refused by name, because a hand-picked tid is one collision away from silently aliasing a
+/// graph tensor's placement. Same shape as `gather_entry_ceiling`: both halves mint through one
+/// door, disagreement is refused, never repaired.
+///
+/// ⛔⛔ ZERO KERNEL VOCABULARY HERE, AND THAT IS THE DESIGN CONSTRAINT, NOT A LUCK. This pass asks
+/// three questions of a program — WHICH bindings are host-staged (the producer stated it), WHAT the
+/// kernel's own view says (extent + dtype), and WHICH slot each took (the numbering law) — and none
+/// of the three can mention what the input IS. A second kernel family stating per-step inputs
+/// flows through this pass unchanged; that is not a hope but the acceptance test
+/// (`a_non_attention_program_with_step_inputs_places_them`). WHAT the runtime writes into a placed
+/// buffer is the caller's; HOW its bytes become the device's is the staging law, which never
+/// enters this crate: the discovery row this pass records carries the program's own element
+/// format, and the bake maps that format to the staging channel — data beside data, the same
+/// channel `weight_copies` and `scalarmul_scales` established.
+///
+/// ⛔ IDEMPOTENT AND CONFLICT-REFUSING ACROSS PROGRAMS. Every layer of a graph states the same
+/// inputs, so a tid already placed is checked for agreement — same segment, same role, same size —
+/// and a second program stating a DIFFERENT view for one tid is refused by name, because the two
+/// would share one buffer while disagreeing about its extent. A stated slot that disagrees with a
+/// recorded one is the same refusal.
+pub fn place_step_inputs(
+    layout: &mut BundleLayout,
+    op_lists: &[&[EmittedOp]],
+    n_graph_tensors: u32,
+) -> Result<(), SuperDscError> {
+    use ktir_superdsc::ktir_node::step_input_tid;
+    for ops in op_lists {
+        for e in ops.iter() {
+            let Some(k) = e.ktir.as_ref() else { continue };
+            if k.step_inputs.is_empty() {
+                continue;
+            }
+            // The program's own parameter rows — one `regions` walk per program that states
+            // anything, not per entry.
+            let regs = ktir_superdsc::emit::lower_ktir_to_superdsc::regions(k)
+                .map_err(|err| SuperDscError(format!("{}: {}", e.op_name, err.message)))?;
+            for s in &k.step_inputs {
+                let tid = s.buffer.get();
+                // ⛔ THE LAW CHECK. The stating producer numbered this binding through
+                // `step_input_tid`; anything else is a hand-picked tid.
+                let expected = step_input_tid(n_graph_tensors, s.slot);
+                if tid != expected {
+                    return Err(SuperDscError(format!(
+                        "{}: the host-staged input bound as t{tid} took slot {}, which the \
+                         numbering law states as t{expected} for a {}-tensor graph — a binding \
+                         numbered any other way can collide with a placement it did not state",
+                        e.op_name, s.slot, n_graph_tensors
+                    )));
+                }
+                if ktir_superdsc::reserved_tids::is_reserved(tid) {
+                    return Err(SuperDscError(format!(
+                        "{}: the host-staged input t{tid} landed on a reserved tid — the numbering \
+                         law's slot space walked into the reserved regions, which no real graph's \
+                         tensor count reaches",
+                        e.op_name
+                    )));
+                }
+                // The program's own view of this binding: extent and element format, stated by the
+                // kernel itself.
+                let binding = k
+                    .bindings
+                    .iter()
+                    .position(|b| b.get() == tid)
+                    .ok_or_else(|| {
+                        SuperDscError(format!(
+                            "{}: the host-staged input t{tid} is stated but not among this \
+                             program's bindings — the producer declared an input its own program \
+                             never takes",
+                            e.op_name
+                        ))
+                    })?;
+                let region = regs.iter().find(|r| r.tid == tid).ok_or_else(|| {
+                    SuperDscError(format!(
+                        "{}: the host-staged input t{tid} states no view — nothing says how \
+                             wide the buffer it addresses is",
+                        e.op_name
+                    ))
+                })?;
+                let df = ktir_superdsc::emit::lower_ktir_to_superdsc::param_df(k, binding)
+                    .ok_or_else(|| {
+                        SuperDscError(format!(
+                            "{}: the host-staged input t{tid}'s view states a dtype with no stick \
+                             geometry, so this ladder cannot size the buffer the program reads",
+                            e.op_name
+                        ))
+                    })?;
+                let size = region.v_rows as u64 * region.v_cols as u64 * df.word_length() as u64;
+                // The row the discovery table bakes: the slot (the numbering law's own answer,
+                // checked above) and the element format the program's own view states — the fact
+                // the bake maps to the staging law, recorded HERE because this is the one
+                // statement that already resolved the view's dtype.
+                let row = ktir_superdsc::placement::StepInputRow { slot: s.slot, df };
+                let seg = SegRole::Activation.segment();
+                match layout.placements.get(&tid) {
+                    // Every layer states the same input: the second sighting must AGREE.
+                    Some(p) => {
+                        if p.role != SegRole::Activation || p.segment != seg || p.size != size {
+                            return Err(SuperDscError(format!(
+                                "{}: t{tid} is stated as a host-staged input of {} B, but the \
+                                 bundle already places it as {} B in segment {} — two programs \
+                                 disagree about one buffer's extent",
+                                e.op_name, size, p.size, p.segment
+                            )));
+                        }
+                    }
+                    None => {
+                        // ⭐⭐⭐ THE REP SLOT DEFERS TO THE TAIL — `attn_step_slots::REP` is the
+                        // one step input whose PRESENCE differs between a session's bodies (a
+                        // batched decode row states it; the paged-fold body and every
+                        // one-request or prefill row state none), and the host binds each step
+                        // at the CEILING's placements. Placed inline it shifts every later
+                        // host-staged tensor in exactly the bodies that lack it, which the
+                        // one-layout guard refuses. Held as a reservation, spent by the ONE
+                        // door `BundleLayout::place_rep_table_last` after the KV block index —
+                        // the kv-block-index law, restated for a law-numbered tid. The
+                        // identity row mints at the door, with the placement, never here.
+                        if s.slot == ktir_superdsc::sdsc_abstract::attn_step_slots::REP {
+                            // ⭐⭐⭐ AND THE RESERVATION IS SIZED AT THE IDX2ADDR REACH, NOT THE
+                            // VIEW'S OWN BYTES — the card's index→address conversion reads a
+                            // TABLE-SIZED contiguous run of index words from each gather/scatter
+                            // leg's own stick base (dxp's `createIdx2AddrSdsc` takes its `N_`
+                            // from the OP's, which the leg cuts state at the table's row count),
+                            // so the slot must cover `(2·sticks − 1)` sticks or the last leg's
+                            // run crosses the segment's end — the rep is placed at that tail.
+                            // The law, its C++ cites, and the measured fault live on
+                            // [`RepTableReservation::reach_bytes`]; the host stages the same
+                            // number whole, padding the tail with zeros.
+                            let reach = ktir_superdsc::placement::RepTableReservation::reach_bytes(
+                                size,
+                                df.word_length() as u64,
+                            );
+                            match layout.rep_table {
+                                Some(prev) if prev.tid != tid || prev.bytes != reach => {
+                                    return Err(SuperDscError(format!(
+                                        "{}: t{tid} is stated as a host-staged rep table of \
+                                         {size} B (idx2addr reach {reach} B), but the bundle \
+                                         already reserves it as {} B at t{} — two programs \
+                                         disagree about one buffer's extent",
+                                        e.op_name, prev.bytes, prev.tid
+                                    )));
+                                }
+                                Some(_) => {}
+                                None => {
+                                    layout.rep_table =
+                                        Some(ktir_superdsc::placement::RepTableReservation {
+                                            tid,
+                                            bytes: reach,
+                                        });
+                                }
+                            }
+                        } else {
+                            let off = layout.segment_bytes[seg];
+                            layout.placements.insert(
+                                tid,
+                                TensorPlacement {
+                                    tid,
+                                    bank: 0,
+                                    role: SegRole::Activation,
+                                    segment: seg,
+                                    offset: off,
+                                    size,
+                                    // ⭐ FULL — a spliced step input is filled through
+                                    // `fill_step_input`, whose extent law is `==` exactly; a
+                                    // short fill is refused there and would be refused here.
+                                    cover: ktir_superdsc::placement::BindCover::Full,
+                                },
+                            );
+                            layout.segment_bytes[seg] = align128(off + size);
+                            // THE IDENTITY ROW, the same one `compute_bundle_layout` writes for
+                            // every tensor it places: a placement without it is INVISIBLE to
+                            // `resolve_seg_base`, which would then treat the program's own
+                            // parameter as an undeclared synthetic. The numbering law already
+                            // put this tid above every graph tensor's, so the name is this
+                            // buffer's alone.
+                            layout.ids.borrow_mut().insert(
+                                ktir_superdsc::place::act_name(tid),
+                                ktir_superdsc::place::PlaceId::Act(tid),
+                            );
+                        }
+                    }
+                }
+                match layout.step_inputs.get(&tid) {
+                    Some(prev) if *prev != row => {
+                        return Err(SuperDscError(format!(
+                            "{}: t{tid} is stated as (slot {}, {:?}) here but (slot {}, {:?}) \
+                             earlier — one buffer cannot answer to two slots, nor to two element \
+                             formats",
+                            e.op_name, row.slot, row.df, prev.slot, prev.df
+                        )));
+                    }
+                    _ => {
+                        layout.step_inputs.insert(tid, row);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// ⭐ THE PAGED FOLD'S CARRY PLACEMENTS — the (max, sum, accumulator) buffers the fold family
+/// threads between its programs, placed the way [`place_step_inputs`] places host-staged inputs:
+/// from the programs' OWN views, refusing conflicts, before the declare pass can ask for them.
+///
+/// The carry rides the INTERMEDIATE segment (seg0), not the activation segment: it is per-layer
+/// scratch whose lifetime is the three sequential launches of one fold statement, never
+/// host-staged, and for the whole-batch m=1 fold the runtime's per-pass intermediate delta is
+/// zero — so an UNshifted seg0 placement is exactly the one the passes need. It is also the
+/// role `ladder_stages_one_layout` does NOT compare across rungs (only Activation placements
+/// are compared), so the carry may exist in the fold rung's bundle alone without failing the
+/// one-layout guard — the fold rung is the only one whose programs bind these tids at all.
+///
+/// Only the fold family's programs ever bind a [`PagedFoldCarry`] tid (the reserved region is
+/// minted by the splice and by nobody else), so binding presence is the trigger: no fold
+/// statement, no placement, byte-identical bundle.
+pub fn place_paged_fold_carry(
+    layout: &mut BundleLayout,
+    op_lists: &[&[EmittedOp]],
+) -> Result<(), SuperDscError> {
+    use ktir_superdsc::reserved_tids::{PagedFoldCarry, is_paged_fold_carry};
+    for ops in op_lists {
+        for e in ops.iter() {
+            let Some(k) = e.ktir.as_ref() else { continue };
+            // The carry tids THIS program binds — most programs bind none, and the regs walk
+            // below only runs for the fold family's three.
+            let carries: Vec<u32> = k
+                .bindings
+                .iter()
+                .map(|b| b.get())
+                .filter(|tid| is_paged_fold_carry(*tid))
+                .collect();
+            if carries.is_empty() {
+                continue;
+            }
+            // The program's own parameter rows — one `regions` walk per program that binds a carry.
+            let regs = ktir_superdsc::emit::lower_ktir_to_superdsc::regions(k)
+                .map_err(|err| SuperDscError(format!("{}: {}", e.op_name, err.message)))?;
+            for tid in carries {
+                let binding = k
+                    .bindings
+                    .iter()
+                    .position(|b| b.get() == tid)
+                    .ok_or_else(|| {
+                        SuperDscError(format!(
+                            "{}: the carry t{tid} is filtered from this program's own bindings — \
+                             the filter and the search disagree, which cannot happen",
+                            e.op_name
+                        ))
+                    })?;
+                let region = regs.iter().find(|r| r.tid == tid).ok_or_else(|| {
+                    SuperDscError(format!(
+                        "{}: the carry t{tid} is bound but states no view — nothing says how \
+                             wide the buffer it addresses is",
+                        e.op_name
+                    ))
+                })?;
+                let df = ktir_superdsc::emit::lower_ktir_to_superdsc::param_df(k, binding)
+                    .ok_or_else(|| {
+                        SuperDscError(format!(
+                            "{}: the carry t{tid}'s view states a dtype with no stick geometry, so \
+                             this ladder cannot size the buffer the program reads",
+                            e.op_name
+                        ))
+                    })?;
+                // ⭐ THE STICK PAD — the seed's fill writes this window with a POINTWISE op, and a
+                // pointwise emission sweeps whole sticks of the window's own df (the fill's
+                // `DeviceWidth::for_pointwise` floor, dropped by `pointwise_width_the_output_holds`
+                // to what this placement holds). A half-stick carry ([BATCH*MQ] = 32 f16 at this
+                // geometry) reserved at its raw 64 B would hold 0 whole sticks per row and the
+                // fill's width law would refuse the placement it cannot read a stick from — so
+                // the reservation is the PADDED extent, and the pad columns are inert: nothing
+                // loads them (the body reads the view's own 32), they only complete the stick.
+                let cols = region
+                    .v_cols
+                    .next_multiple_of(df.elems_per_stick())
+                    .max(df.elems_per_stick());
+                let size = region.v_rows as u64 * cols as u64 * df.word_length() as u64;
+                let seg = SegRole::Intermediate.segment();
+                match layout.placements.get(&tid) {
+                    // Every layer's fold statement states the same carry: the second sighting
+                    // must AGREE.
+                    Some(p) => {
+                        if p.role != SegRole::Intermediate || p.segment != seg || p.size != size {
+                            return Err(SuperDscError(format!(
+                                "{}: t{tid} is stated as a carry of {} B, but the bundle already \
+                                 places it as {} B in segment {} — two programs disagree about one \
+                                 buffer's extent",
+                                e.op_name, size, p.size, p.segment
+                            )));
+                        }
+                    }
+                    None => {
+                        let off = layout.segment_bytes[seg];
+                        layout.placements.insert(
+                            tid,
+                            TensorPlacement {
+                                tid,
+                                bank: 0,
+                                role: SegRole::Intermediate,
+                                segment: seg,
+                                offset: off,
+                                size,
+                                cover: ktir_superdsc::placement::BindCover::Full,
+                            },
+                        );
+                        layout.segment_bytes[seg] = align128(off + size);
+                        // ⛔ THE SYNTH CURSOR RIDES ABOVE THE CARRY. The synth allocator was
+                        // seeded at the seg0 head `compute_bundle_layout` left (synthetics are
+                        // the only role-packed residents of this segment), and this pass just
+                        // spent that head — a synthetic minted after this point must start
+                        // ABOVE the carry, or the two silently share bytes (the exact defect
+                        // the identity row below exists to prevent, on the other side).
+                        let mut synth = layout.synth.borrow_mut();
+                        synth.next = synth.next.max(layout.segment_bytes[seg]);
+                        // THE IDENTITY ROW, the same one every placement pass writes: without it
+                        // `resolve_seg_base` treats the program's own parameter as an undeclared
+                        // synthetic. The reserved region's tids collide with nothing — the
+                        // regions are proven disjoint.
+                        layout.ids.borrow_mut().insert(
+                            ktir_superdsc::place::act_name(tid),
+                            ktir_superdsc::place::PlaceId::Act(tid),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // ⛔ EVERY CARRY SLOT HAS A PLACEMENT OR NONE OF THEM DO: the three are one thread of
+    // execution (seed writes all three, the body reads and writes all three, finalize reads
+    // two). A family that places only some of its carry would run a pass against a placement
+    // the door refuses — a bound parameter with no view-backed bytes.
+    let placed = [
+        PagedFoldCarry::Max.tid(),
+        PagedFoldCarry::Sum.tid(),
+        PagedFoldCarry::Acc.tid(),
+    ]
+    .into_iter()
+    .filter(|tid| layout.placements.contains_key(tid))
+    .count();
+    if placed != 0 && placed != 3 {
+        return Err(SuperDscError(format!(
+            "the paged fold's carry is placed for {} of its 3 parts — the (max, sum, accumulator) \
+             are one thread of execution and only a partial placement could produce this, which \
+             means some fold program stated a view the others did not",
+            placed
+        )));
+    }
+    Ok(())
+}
+
+/// ⭐ THE HEAD-ROW BUFFERS' PLACEMENT — the attention kernels' per-head row frame at a multi-slab
+/// head dim ([`ktir_superdsc::reserved_tids::HeadRows`]), written and read on-card by the splice's
+/// head relayout copies and the attention programs between them. Sized from the binding
+/// programs' OWN views (every program that binds one states the same `[nqh·rows, hd]`), placed in
+/// the Intermediate segment like the fold carry, and a second sighting must agree. No head-row
+/// binding, no placement: a single-slab bundle is byte-identical.
+pub fn place_head_rows(
+    layout: &mut BundleLayout,
+    op_lists: &[&[EmittedOp]],
+) -> Result<(), SuperDscError> {
+    use ktir_superdsc::reserved_tids::is_head_rows;
+    for ops in op_lists {
+        for e in ops.iter() {
+            let Some(k) = e.ktir.as_ref() else { continue };
+            let rows: Vec<u32> = k
+                .bindings
+                .iter()
+                .map(|b| b.get())
+                .filter(|tid| is_head_rows(*tid))
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
+            let regs = ktir_superdsc::emit::lower_ktir_to_superdsc::regions(k)
+                .map_err(|err| SuperDscError(format!("{}: {}", e.op_name, err.message)))?;
+            for tid in rows {
+                let binding = k
+                    .bindings
+                    .iter()
+                    .position(|b| b.get() == tid)
+                    .ok_or_else(|| {
+                        SuperDscError(format!(
+                            "{}: the head-row buffer t{tid} is filtered from this program's own \
+                             bindings — the filter and the search disagree, which cannot happen",
+                            e.op_name
+                        ))
+                    })?;
+                let region = regs.iter().find(|r| r.tid == tid).ok_or_else(|| {
+                    SuperDscError(format!(
+                        "{}: the head-row buffer t{tid} is bound but states no view",
+                        e.op_name
+                    ))
+                })?;
+                let df = ktir_superdsc::emit::lower_ktir_to_superdsc::param_df(k, binding)
+                    .ok_or_else(|| {
+                        SuperDscError(format!(
+                            "{}: the head-row buffer t{tid}'s view states a dtype with no stick \
+                             geometry",
+                            e.op_name
+                        ))
+                    })?;
+                let size = region.v_rows as u64 * region.v_cols as u64 * df.word_length() as u64;
+                let seg = SegRole::Intermediate.segment();
+                match layout.placements.get(&tid) {
+                    Some(p) => {
+                        if p.role != SegRole::Intermediate || p.segment != seg || p.size != size {
+                            return Err(SuperDscError(format!(
+                                "{}: t{tid} is stated as a head-row buffer of {} B, but the bundle \
+                                 already places it as {} B in segment {} — two programs disagree \
+                                 about one buffer's extent",
+                                e.op_name, size, p.size, p.segment
+                            )));
+                        }
+                    }
+                    None => {
+                        let off = layout.segment_bytes[seg];
+                        layout.placements.insert(
+                            tid,
+                            TensorPlacement {
+                                tid,
+                                bank: 0,
+                                role: SegRole::Intermediate,
+                                segment: seg,
+                                offset: off,
+                                size,
+                                cover: ktir_superdsc::placement::BindCover::Full,
+                            },
+                        );
+                        layout.segment_bytes[seg] = align128(off + size);
+                        // The synth cursor rides above the buffer — the fold carry's own law.
+                        let mut synth = layout.synth.borrow_mut();
+                        synth.next = synth.next.max(layout.segment_bytes[seg]);
+                        layout.ids.borrow_mut().insert(
+                            ktir_superdsc::place::act_name(tid),
+                            ktir_superdsc::place::PlaceId::Act(tid),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// RE-ROLLED tape-driven SuperDSC lowering — the mirror of `lower_subtile_tape_to_tk_tape`
@@ -1525,12 +2319,25 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     let RungFacts {
         one_request: one_request_decode,
         chunk_pages,
+        paged_fold,
     } = rung;
     let _pc = crate::pc::Pc::start("producer");
+    // ⭐ THE LAW, MINTED ONCE FOR THE WHOLE BUNDLE — every attention program this walk mints
+    // (the fold family included) derives its SCALE from it: [`score_scale_law`]'s one
+    // derivation, the same one the door's `BundleAttnParams::scale_law` and the write mint
+    // read, so the fold's stated multiplier and the pool's written bytes cannot disagree
+    // about where the scale lives.
+    let scale_law = score_scale_law(ir)?;
     // ⭐ THE CHUNK THIS GRAPH'S EVERY ATTENTION CLASS CAN EXPRESS, decided ONCE for both of its
     // consumers — the index placement (`compute_bundle_layout`'s `gathers_kv`) and the door's
     // `BundleAttnParams` — so an index is reserved exactly where a chunk gathers through it.
     let chunk_pages = admitted_chunk(ir, chunk_pages);
+    // ⭐ THE HANDOFF, READ BEFORE THE BODIES LOWER — the same `attn_bundle_params` the door pass
+    // below mints (a pure function of the graph and this rung's facts), so the splice's head
+    // relayout and the door's o_proj swap read one fact.
+    let out_stays_head_rows =
+        attn_bundle_params(ir, rows_are_requests, one_request_decode, chunk_pages)?
+            .is_some_and(|p| p.headmajor_handoff);
     // ⛔ THE `set_rows_are_requests` / `RestoreRar` DANCE IS DELETED. It pushed the row KIND into a
     // thread-local for the duration of one bundle's lowering, with a `Drop` guard to restore it, purely
     // so the matmul splitter would not need the fact in its signature. That made the kind ambient: no
@@ -1562,6 +2369,23 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         rows_are_requests || chunk_pages.is_some(),
         &per_layer_ext,
     )?;
+    // ⭐ THE PAGED-FOLD RUNG STATEMENT, expanded against the layout's ONE `max_pages` derivation
+    // (`BundleLayout::paged_fold_region_pages`, recorded beside the prefix mask it sizes) — the
+    // walk never re-derives the ceiling, and a statement without a derivation is a REFUSAL,
+    // because a fold family whose tables state a region the bundle never sized is a bundle whose
+    // step-input extents answer a question nobody asked.
+    let paged_fold: Option<scratchy_triton_splice::PagedFoldRung> = match paged_fold {
+        None => None,
+        Some(stmt) => Some(scratchy_triton_splice::PagedFoldRung {
+            region_pages: bundle_layout.paged_fold_region_pages.ok_or_else(|| {
+                SuperDscError(
+                    "reroll-superdsc: this rung states a paged fold but the bundle layout                      carries no region page ceiling — a graph with no attention placement                      cannot be a fold rung"
+                        .to_string(),
+                )
+            })?,
+            fold_body: stmt.fold_body,
+        }),
+    };
     // ── THE TAPE'S SEGMENTS: prefix, ONE RANGE PER LOOP (an attention class's body), suffix ──
     // The rolled tape is `prefix; [OpenLoop(body₀) CloseLoop]…[OpenLoop(bodyₙ) CloseLoop]; suffix`
     // — sibling loops, never nested (the TapeBuilder typestate forbids nesting). One `(range,
@@ -1916,27 +2740,28 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
                         }
                     }
                     // RESIDENT kct per-layer registration (kill-the-restickify residency): the score reads a
-                    // per-layer RESIDENT Kᵀ kernel `kct_resident_tid(k_id)`. It's neither an External nor a node
+                    // per-layer RESIDENT Kᵀ kernel `KctResident::of(k_id)`. It's neither an External nor a node
                     // output, so the loops above never add it — insert it manually: map each layer's
-                    // K-cache source tid k_Lv → kct_resident_tid(k_Lv), keyed under the layer-0 kct tid.
+                    // K-cache source tid k_Lv → the layer's Kᵀ plane name, keyed under the layer-0 name.
                     // REQUIRED so the launch-table guard validates kct's per-layer offset matches k/v — the
                     // executor shifts seg2 by the launch's kv_off for every op, so a kct packed out of step
                     // with k/v would SILENTLY read the wrong layer (runtime-errors-need-compile-
                     // time-checks). per_layer[k_id] was just inserted by the External loop above.
+                    // ⭐ NAMED THROUGH THE TYPE: the per-layer key is the plane's WIRE NAME (one door),
+                    // and the source tid stays inside `KctResident`, where only a scan can read it.
                     if let SubOp::AttnDecode { layout: kv, .. } = &n.op
                         && iters > 1
                         && let Some(k_layers) =
                             per_layer.get(&(kv.cache_tensor().index() as u32)).cloned()
                         && k_layers.len() as u32 == iters
                     {
-                        let kct_tids: Vec<u32> = k_layers
-                            .iter()
-                            .map(|&k_lv| kct_resident_tid(k_lv))
-                            .collect();
-                        body_representatives[bi]
-                            .push(kct_resident_tid(kv.cache_tensor().index() as u32));
+                        let kct_of =
+                            |k: u32| ktir_superdsc::reserved_tids::KctResident::of(k).wire_tid();
+                        let kct_tids: Vec<u32> =
+                            k_layers.iter().map(|&k_lv| kct_of(k_lv)).collect();
+                        body_representatives[bi].push(kct_of(kv.cache_tensor().index() as u32));
                         per_layer
-                            .entry(kct_resident_tid(kv.cache_tensor().index() as u32))
+                            .entry(kct_of(kv.cache_tensor().index() as u32))
                             .or_insert(kct_tids);
                     }
                     // ⭐ THE CLASS'S LAYER IDS, from its OWN rope table: the body's RopeAppend node
@@ -1973,7 +2798,15 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
                         group_weight_banks[seg].insert(p.bank);
                     }
                 }
-                match lower_one_node(n, ir, active_cap, rows_are_requests) {
+                match lower_one_node(
+                    n,
+                    ir,
+                    active_cap,
+                    rows_are_requests,
+                    paged_fold.as_ref(),
+                    scale_law,
+                    out_stays_head_rows,
+                ) {
                     NodeLowering::Ops(v) => {
                         if seg == 0 {
                             prefix.extend(v);
@@ -2073,17 +2906,66 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // The SAME four facts the real consumer pass is handed — read once here, off the graph's own
     // `AttnDecode` nodes and this walk's own parameters. See [`attn_bundle_params`].
     let attn_params = attn_bundle_params(ir, rows_are_requests, one_request_decode, chunk_pages)?;
+    // ⭐⭐⭐ THE PER-STEP INPUT PLACEMENTS, MINTED BEFORE ANY PASS CAN ASK FOR THEM. The declare pass
+    // below lowers prefix → body → suffix through the door, and the door REFUSES a bound parameter
+    // with no placement — which is exactly what a host-staged input is until this pass places it.
+    // The pass runs after the bodies are lowered (it sizes from the programs' own views) and before
+    // the shared plan is completed (so every bundle's snapshot carries the placements): the one
+    // window in this walk where both halves are in hand.
+    let body_op_lists: Vec<&Vec<EmittedOp>> = bodies.iter().map(|b| &b.ops).collect();
+    let mut step_input_lists: Vec<&[EmittedOp]> = vec![&prefix];
+    step_input_lists.extend(body_op_lists.iter().map(|v| v.as_slice()));
+    step_input_lists.push(&suffix);
+    place_step_inputs(
+        &mut bundle_layout,
+        &step_input_lists,
+        ir.tensors.len() as u32,
+    )?;
+    // ⭐ THE FOLD'S CARRY, placed from the fold family's own views the same pass — seg0
+    // Intermediate, guard-invisible across rungs (only Activation placements are compared), so
+    // the fold rung's bundle may carry it alone. Before the declare pass, for the same reason
+    // the step inputs are.
+    place_paged_fold_carry(&mut bundle_layout, &step_input_lists)?;
+    place_head_rows(&mut bundle_layout, &step_input_lists)?;
+    // ⭐⭐⭐ THE SAME COMPLETION, over the SAME program lists the declare pass below lowers —
+    // before that pass, because the door resolves a folded constant by bits. Bits-sorted
+    // appends, so this walk's prefix→bodies→suffix order and `graph_wiring`'s node order
+    // compute the identical registry.
+    complete_program_scales(&mut bundle_layout, &step_input_lists);
+    // ⭐⭐⭐ THE KV BLOCK INDEX GOES LAST OF ALL — after the step inputs and the program-stated
+    // scales, the last host-staged placements this walk makes. One session runs bodies that
+    // gather (the chunked ceiling) and bodies that do not (the unchunked sweep rungs), and the
+    // host binds each step at the CEILING's placements — so the index, the one activation
+    // whose presence may differ, must sit past every offset `ladder_stages_one_layout`
+    // compares. See [`BundleLayout::place_kv_block_index_last`] for the law; before the
+    // declare pass, so a gathered read resolving `t{KV_BLOCK_INDEX_TID}` finds its placement.
+    bundle_layout.place_kv_block_index_last();
+    // ⭐⭐⭐ THE REP TABLE GOES LAST OF ALL AFTER IT — the same law the unrolled walk's call
+    // above states: the rep slot is the one STEP INPUT whose presence may differ between a
+    // session's bodies (the batched decode row states it; the paged-fold body minted at this
+    // ladder's `(FULL, None)` rung and every one-request or prefill row state none), so it
+    // must sit past every offset `ladder_stages_one_layout` compares. Before the declare pass,
+    // so a batched score read resolving `t{rep}` finds its placement. See
+    // [`BundleLayout::place_rep_table_last`].
+    bundle_layout.place_rep_table_last();
     // The declare pass walks prefix → EVERY body → suffix, the same order the tape walk
     // declared them in, so every synthetic's first-one-wins offset is fixed identically.
-    let body_op_lists: Vec<&Vec<EmittedOp>> = bodies.iter().map(|b| &b.ops).collect();
-    for ops in std::iter::once(&prefix)
+    // The lowered ops are KEPT (the pass computed them and used to drop them): they are
+    // the one place one forward's full op list exists with the SHARED layout beside it —
+    // exactly what the read-before-write walk needs. The declare pass's per-list symbol
+    // counter does not touch a binding's placement or footprint, so the intervals this
+    // captures are the ones the real per-bundle pass mints.
+    let declare_lists: Vec<&Vec<EmittedOp>> = std::iter::once(&prefix)
         .chain(body_op_lists.iter().copied())
         .chain(std::iter::once(&suffix))
-    {
+        .collect();
+    let mut lowered: Vec<Vec<EmittedOp>> = Vec::with_capacity(declare_lists.len());
+    for ops in &declare_lists {
         let mut declare_syms: i64 = 0;
+        let mut lowered_list: Vec<EmittedOp> = Vec::new();
         for e in ops.iter() {
             let Some(k) = e.ktir.as_ref() else { continue };
-            crate::ktir_superdsc_door::lower(
+            let lowered_ops = crate::ktir_superdsc_door::lower(
                 k,
                 &mut declare_syms,
                 Some(&bundle_layout),
@@ -2095,7 +2977,44 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
                     e.op_name, err.message
                 ))
             })?;
+            lowered_list.extend(lowered_ops);
         }
+        lowered.push(lowered_list);
+    }
+    // Index routing, the same order the chain visited in: lowered[0] is the
+    // prefix, the LAST entry is the suffix, and lowered[1 + b] is body class
+    // b's list (body_op_lists is built by class index, so the offsets align).
+    // A list that lowers to nothing still occupies its slot.
+    let lowered_prefix: &[EmittedOp] = lowered.first().map(|v| v.as_slice()).unwrap_or(&[]);
+    let lowered_suffix: &[EmittedOp] = lowered.last().map(|v| v.as_slice()).unwrap_or(&[]);
+    let body_lowered = |b: u8| -> &[EmittedOp] {
+        lowered
+            .get(1 + b as usize)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    };
+    // ⭐⭐⭐⭐⭐ THE READ-BEFORE-WRITE WALK — the forward's own op list, in the
+    // TRUE LAUNCH ORDER the sort above computed, against the shared plan. One
+    // instance per body launch (the op list is the same value replayed; the
+    // walk checks it once per launch because the table must see every layer's
+    // writes the same way the device runs them). A refusal names the op, the
+    // buffer and the unwritten interval, and fails the bake — reading
+    // never-written memory is not an emission this walk lets through. See
+    // `read_before_write`'s module doc for the honest set, both pool
+    // limitations, and the three stated premises.
+    {
+        let tag = format!(
+            "rows_are_requests={rows_are_requests} one_request={one_request_decode} \
+             chunk_pages={chunk_pages:?}"
+        );
+        let mut seq: Vec<(String, &[EmittedOp])> = vec![(format!("{tag} prefix"), lowered_prefix)];
+        for &(b, i) in &launches {
+            seq.push((format!("{tag} body {b} launch {i}"), body_lowered(b)));
+        }
+        seq.push((format!("{tag} suffix"), lowered_suffix));
+        let seq: Vec<(&str, &[EmittedOp])> = seq.iter().map(|(l, o)| (l.as_str(), *o)).collect();
+        crate::read_before_write::walk_read_before_write(&seq)
+            .map_err(|e| SuperDscError(format!("read-before-write: {e}")))?;
     }
     // Device re-tile manifest: each matmul kernel weight (layer 0) + its per-layer
     // copies → a RetileDescriptor built SOLELY from the DeviceTileLayout witness (the
@@ -3234,7 +4153,7 @@ mod attn_scale_weight_fold_tests {
             .expect("the bundle states its attention params")
             .expect("the graph has an attention node");
         assert!(
-            p.scale_in_weights,
+            matches!(p.scale_law, ScoreScaleLaw::UnitByModel),
             "a unit scale is carried by the weights trivially — √1.0 — so the program states \
              no multiplier and the door must take the skip arm"
         );
@@ -3250,14 +4169,14 @@ mod attn_scale_weight_fold_tests {
             .expect("the bundle states its attention params")
             .expect("the graph has an attention node");
         assert!(
-            p.scale_in_weights,
+            matches!(p.scale_law, ScoreScaleLaw::CommutedIntoWeights),
             "the fold puts √scale into W_q/W_k — no device multiply is left to state"
         );
     }
 
     /// A scale the fold refused STRUCTURALLY (here: an unroped query — the gate permits the
     /// up-multiplier, so the refusal is the chain's own) must state its multiplier in the
-    /// program — the weights carry none of it, so the door fact stays false.
+    /// program — the weights carry none of it, so the law stays `StatedByProgram`.
     #[test]
     fn an_unfolded_real_scale_states_no_door_fact() {
         let ir = attn_graph(4.0, true, false, false, false, false);
@@ -3265,7 +4184,7 @@ mod attn_scale_weight_fold_tests {
             .expect("the bundle states its attention params")
             .expect("the graph has an attention node");
         assert!(
-            !p.scale_in_weights,
+            matches!(p.scale_law, ScoreScaleLaw::StatedByProgram),
             "an unfolded node at a real scale must have its multiplier stated by the program"
         );
     }
@@ -3434,20 +4353,20 @@ mod attn_scale_weight_fold_tests {
 
     /// ⭐ THE DISAGREEMENT, WIDENED: one graph whose attentions disagree about WHERE the score
     /// scale lives — one carries it in its staged weights (here: a unit multiplier), the other
-    /// states a device score multiply — is a build error at the recognition, naming both nodes,
-    /// because the door takes ONE such fact per bundle and either choice mislowers one layer.
+    /// states a device score multiply — is a build error at the recognition, naming both nodes
+    /// AND both laws, because the door takes ONE such law per bundle and either choice
+    /// mislowers one layer.
     #[test]
     fn a_graph_mixing_in_weights_and_stated_scales_refuses_to_choose() {
         let ir = two_attn_graph(1.0, 4.0, true);
         let err = attn_bundle_params(&ir, false, false, None).expect_err("a mixed graph refuses");
         assert!(
-            err.0
-                .contains("carries its attention scale in its staged weights"),
-            "the refusal names the in-weights side: {err:?}"
+            err.0.contains("carries its attention scale UnitByModel"),
+            "the refusal names the unit side by its law: {err:?}"
         );
         assert!(
-            err.0.contains("states a device score multiply"),
-            "the refusal names the stated side: {err:?}"
+            err.0.contains("carries StatedByProgram"),
+            "the refusal names the stated side by its law: {err:?}"
         );
     }
 
@@ -3639,36 +4558,37 @@ mod attn_scale_weight_fold_tests {
 
     /// The UNIFORM twin of [`two_class_fp8_oproj_graph`]: ONE attention class, multi-slab
     /// (hd 128 > `POOL_STICK`), fp8 W8A8 o projection closed by exactly one matmul —
-    /// granite-8b's geometry at fixture size, and the exact shape every term of
+    /// granite-8b's own geometry (32 q / 8 kv / hd 128, a config-declared triple the
+    /// geometry door arms) at fixture size, and the exact shape every term of
     /// [`OprojEdges::geometry_applies`] demands.
     fn uniform_fp8_oproj_graph() -> SubtileIR {
         let geom = scratchy_subtile::model_geometry::ModelAttnGeometry::mint(
-            scratchy_subtile::model_geometry::QueryHeads::new(2),
-            scratchy_subtile::model_geometry::KvHeads::new(1),
+            scratchy_subtile::model_geometry::QueryHeads::new(32),
+            scratchy_subtile::model_geometry::KvHeads::new(8),
             scratchy_subtile::model_geometry::HeadDim::new(128),
         )
-        .expect("2 query heads over 1 kv head, head_dim 128, mints");
+        .expect("granite-8b's 32 query heads over 8 kv heads, head_dim 128, mints");
         let hd = scratchy_subtile::model_geometry::HeadDim::new(128);
         let shape = |rows: u32, cols: u32| scratchy_subtile::subtile_ir::SourceShape { rows, cols };
         let sources = vec![
-            shape(1, 8),    // 0: x (hidden 8)
-            shape(8, 256),  // 1: W_q — q width 2·128
-            shape(8, 128),  // 2: W_k — kv width 1·128
-            shape(1, 128),  // 3: v
-            shape(32, 128), // 4: prefix_k cache
-            shape(32, 128), // 5: prefix_v cache
-            shape(1, 256),  // 6: cos (q side — one per q head pair)
-            shape(1, 256),  // 7: sin (q side)
-            shape(256, 16), // 8: W_o — fp8, k = 2·128
-            shape(1, 16),   // 9: o_scale
-            shape(1, 128),  // 10: cos (k side — kv width 1·128)
-            shape(1, 128),  // 11: sin (k side)
+            shape(1, 8),     // 0: x (hidden 8)
+            shape(8, 4096),  // 1: W_q — q width 32·128
+            shape(8, 1024),  // 2: W_k — kv width 8·128
+            shape(1, 1024),  // 3: v
+            shape(32, 1024), // 4: prefix_k cache
+            shape(32, 1024), // 5: prefix_v cache
+            shape(1, 4096),  // 6: cos (q side — one per q head pair)
+            shape(1, 4096),  // 7: sin (q side)
+            shape(4096, 16), // 8: W_o — fp8, k = 32·128
+            shape(1, 16),    // 9: o_scale
+            shape(1, 1024),  // 10: cos (k side — kv width 8·128)
+            shape(1, 1024),  // 11: sin (k side)
         ];
         let ops = vec![
             // 0: q = x · W_q; 1: q_rot = rope_rotate(q, cos, sin)
             OpDesc {
                 op: SubOp::MatmulTile {
-                    n: 256,
+                    n: 4096,
                     weight: GemmWeight::Dense,
                 },
                 m: 1,
@@ -3682,7 +4602,7 @@ mod attn_scale_weight_fold_tests {
             // 2: k = x · W_k; 3: k_rot = rope_append(k, cos_k, sin_k, v, caches)
             OpDesc {
                 op: SubOp::MatmulTile {
-                    n: 128,
+                    n: 1024,
                     weight: GemmWeight::Dense,
                 },
                 m: 1,
@@ -3709,7 +4629,8 @@ mod attn_scale_weight_fold_tests {
             OpDesc {
                 op: SubOp::attn_decode(
                     geom,
-                    0.015625,
+                    // granite-8b's config-declared attention multiplier (1/128).
+                    0.0078125,
                     33,
                     scratchy_subtile::subtile_ir::AttnMask::Causal,
                 ),

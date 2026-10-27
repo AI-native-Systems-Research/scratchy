@@ -239,6 +239,7 @@ fn pv_program(acc: Acc) -> KtirNode {
         program: Program::Matmul,
         bindings: vec![BufferId::new(101), BufferId::new(102), BufferId::new(103)],
         mask: None,
+        step_inputs: Vec::new(),
         node_out_tid: None,
         minted: Default::default(),
     }

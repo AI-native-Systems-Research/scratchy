@@ -160,19 +160,28 @@ fn two_pair_program() -> KtirNode {
         Operation::new(a, Some(v_i), OpKind::KtdpConstructMemoryView, &[p_ids])
             .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![64])))
             .with_attr(a, AttrKey::Dtype, Attr::Dtype(DType::I32)),
-        // Each table's tile and load.
+        // Each table's tile and load. The gathered loads state their OWN types too — the
+        // flat-law check's second authority (every SSA in a real TTIR function carries one).
         indirect(ind_kt, v_kt),
-        shape(
-            Operation::new(a, Some(load_kt), OpKind::KtdpLoad, &[ind_kt]),
-            64,
-            64,
-        ),
+        {
+            let mut op = shape(
+                Operation::new(a, Some(load_kt), OpKind::KtdpLoad, &[ind_kt]),
+                64,
+                64,
+            );
+            op.result_type = ty(64, 64);
+            op
+        },
         indirect(ind_v, v_v),
-        shape(
-            Operation::new(a, Some(load_v), OpKind::KtdpLoad, &[ind_v]),
-            64,
-            64,
-        ),
+        {
+            let mut op = shape(
+                Operation::new(a, Some(load_v), OpKind::KtdpLoad, &[ind_v]),
+                64,
+                64,
+            );
+            op.result_type = ty(64, 64);
+            op
+        },
         // OUT: [8, 64].
         shape(
             Operation::new(a, Some(v_o), OpKind::KtdpConstructMemoryView, &[p_out]),
@@ -250,6 +259,7 @@ fn two_pair_program() -> KtirNode {
             BufferId::new(305),
         ],
         mask: None,
+        step_inputs: Vec::new(),
         node_out_tid: None,
         minted: Default::default(),
     }
@@ -280,6 +290,7 @@ fn layout_for(k: &KtirNode) -> BundleLayout {
                 bank: 0,
                 offset: (i as u64) * 0x10000,
                 size: bytes,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
     }
