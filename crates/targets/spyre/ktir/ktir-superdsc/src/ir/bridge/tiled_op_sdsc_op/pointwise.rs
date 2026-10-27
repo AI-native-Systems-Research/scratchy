@@ -782,28 +782,13 @@ pub fn pointwise_broadcast_opspec_from_tile(
         CoreDivision::Gathered(g) => tile_op
             .tile(MaxCores::<MAX_CORES>, |_, _| g.splits().clone(), "out")
             .map_err(|e| e.0)?,
-        CoreDivision::Ew(d) => {
-            // ⭐⭐⭐ THE REDSTICK BOTH-SPLIT LAW — an out-broadcast (RedStick) operand never
-            // shares a division that splits BOTH `mb` and `out` (the intmr measurement; the
-            // law's own doc and citation live at [`crate::work::apply_redstick_both_split_law`]).
-            // `out_broadcast` is the typed RedStick fact — set only by the `In` doors that build
-            // one (`In::col`/`In::col_at`/`In::scalar`), carried IN the operand so the form
-            // cannot outlive the handle that swept it. When it rides a both-split, the law drops
-            // the `mb` split: `out` keeps the cores it fills, the operand's row advances within
-            // a core — the card-proven form. A division splitting at most one of the two (every
-            // production form: out-only, mb-only, rows=1) passes through byte-identical.
-            let redstick = inputs.iter().any(|i| i.out_broadcast());
-            let splitter = d.resolve(stickmajor, core_local).splitter();
-            tile_op
-                .tile(
-                    MaxCores::<MAX_CORES>,
-                    move |dims, budget| {
-                        crate::work::apply_redstick_both_split_law(splitter(dims, budget), redstick)
-                    },
-                    "out",
-                )
-                .map_err(|e| e.0)?
-        }
+        CoreDivision::Ew(d) => tile_op
+            .tile(
+                MaxCores::<MAX_CORES>,
+                d.resolve(stickmajor, core_local).splitter(),
+                "out",
+            )
+            .map_err(|e| e.0)?,
     };
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
     // Y-MAJOR in the row-split mode (`ymajor` above): the syms are picked by NAME in the order
