@@ -1594,6 +1594,19 @@ fn load_tasks(args: &BenchServeArgs, tokenizer: &Tokenizer) -> Result<Loaded> {
             format!("longbench-v2-{}", args.longbench_length),
             crate::longbench::tasks(&args.longbench_length, args.output_len)?,
         ),
+        ServeDataset::Polyglot => (
+            "polyglot-python".to_string(),
+            crate::coding::polyglot_tasks()?,
+        ),
+        #[cfg(feature = "datasets")]
+        ServeDataset::SweBench => (
+            "swe-bench-lite".to_string(),
+            crate::coding::swe_bench_tasks()?,
+        ),
+        #[cfg(not(feature = "datasets"))]
+        ServeDataset::SweBench => anyhow::bail!(
+            "--dataset-name swe-bench needs scr built with the bench crate's `datasets` feature"
+        ),
         _ => match args.rag_source {
             RagSource::Musique => ("musique".to_string(), crate::musique::tasks(pool)?),
             #[cfg(feature = "datasets")]
@@ -1769,13 +1782,23 @@ fn run_tasks(
     if let Some(pb) = pb {
         pb.finish_and_clear();
     }
+    // A coding exercise's answers, run against its tests once each, after timing: None where the
+    // machine cannot run them.
+    let tested = run_task_tests(args, &results, &tasks);
     if let Some(path) = &args.save_answers {
-        let rows: Vec<serde_json::Value> = (results.iter().zip(tasks.iter()))
-            .map(|(r, t)| {
+        let rows: Vec<serde_json::Value> = (results.iter().zip(tasks.iter()).enumerate())
+            .map(|(i, (r, t))| {
+                let score = match (&t.score, &tested) {
+                    (crate::workloads::Score::Tests(_), Some(passed)) => {
+                        passed[i].map(|p| if p { 1.0 } else { 0.0 })
+                    }
+                    (crate::workloads::Score::Tests(_), None) => None,
+                    _ => r.success.then(|| t.score.score(&r.generated_text)),
+                };
                 serde_json::json!({
                     "reference": t.score.reference(),
                     "answer": r.generated_text,
-                    "score": r.success.then(|| t.score.score(&r.generated_text)),
+                    "score": score,
                     "answer_tokens": r.output_tokens,
                 })
             })
@@ -1789,7 +1812,16 @@ fn run_tasks(
     let mut json = task_metrics(&results, &tasks, &count, total_time, &dataset, args.seed);
     add_task_percentiles(&mut json, &results, &tasks, &count, &pcts);
     add_task_requests(&mut json, &results, args.request_rate);
-    // Forced answers are no reading of accuracy, and every one ran to its length by design.
+    if tasks
+        .iter()
+        .any(|t| matches!(t.score, crate::workloads::Score::Tests(_)))
+    {
+        let accuracy = tested_accuracy(&json, tested.as_deref());
+        json["accuracy"] = serde_json::json!(accuracy);
+        json["tests_run"] = serde_json::json!(tested.is_some());
+    }
+    // Forced answers are no reading of accuracy, and every one ran to its length by design: a
+    // timed coding answer is cut off at its length, so its tests are no reading either.
     json["timed_answers"] = serde_json::json!(args.timed_answers);
     if args.timed_answers {
         json["accuracy"] = serde_json::Value::Null;
@@ -1797,6 +1829,66 @@ fn run_tasks(
     }
     print_task_summary(&dataset, &json);
     write_results(args, model, &json)
+}
+
+/// Each coding answer run against its exercise's tests (`polyglot`), in order: Some(passed), or
+/// None for a task that is not a coding exercise or a request that did not answer. None as a
+/// whole where the machine has no Python or no sandbox to run them in.
+fn run_task_tests(
+    args: &BenchServeArgs,
+    results: &[RequestResult],
+    tasks: &[crate::workloads::Task],
+) -> Option<Vec<Option<bool>>> {
+    use crate::workloads::Score;
+    // Forced answers are cut off at their length: no reading to run.
+    if args.timed_answers || !tasks.iter().any(|t| matches!(t.score, Score::Tests(_))) {
+        return None;
+    }
+    let Some(runner) = crate::coding::TestRunner::find(&args.coding_python) else {
+        eprintln!(
+            "No {} or sandbox-exec: the answers' tests are not run, and accuracy is not recorded",
+            args.coding_python
+        );
+        return None;
+    };
+    eprintln!("Running each answer's tests...");
+    // An answer that ran to its cap is wrong without running it, as for the text-scored workloads:
+    // a file cut off mid-way is no answer, whatever of it passes.
+    let capped = |r: &RequestResult, t: &crate::workloads::Task| match r.finish_reason.as_deref() {
+        Some(why) => why == "length",
+        None => r.output_tokens >= t.max_tokens,
+    };
+    Some(
+        (results.iter().zip(tasks))
+            .map(|(r, t)| match &t.score {
+                Score::Tests(_) if r.success && capped(r, t) => Some(false),
+                Score::Tests(e) if r.success => match runner.passes(e, &r.generated_text) {
+                    Ok(p) => Some(p),
+                    Err(err) => {
+                        eprintln!("  {}: tests did not run: {err:#}", e.name);
+                        None
+                    }
+                },
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
+/// A coding cell's accuracy: the share of every task sent whose answer passed its tests, a
+/// request that failed or an answer that ran to its cap scoring wrong, as [`task_metrics`]
+/// scores the others. None where the tests were not run, or one could not start (a broken
+/// harness, not a wrong answer).
+fn tested_accuracy(json: &serde_json::Value, tested: Option<&[Option<bool>]>) -> Option<f64> {
+    let tested = tested?;
+    let sent = json["num_tasks"].as_u64()? as usize;
+    let failed = json["failed"].as_u64().unwrap_or(0) as usize;
+    let judged = tested.iter().flatten().count();
+    if judged + failed < sent {
+        return None;
+    }
+    let passed = tested.iter().flatten().filter(|&&p| p).count();
+    Some(passed as f64 / sent.max(1) as f64)
 }
 
 /// One task's request body: a streamed chat request, or for `rag-spans` a span query.
@@ -2502,6 +2594,27 @@ mod tests {
         ])
         .unwrap();
         assert!(shared_prefix_workload(&none, &text).1.is_none());
+    }
+
+    /// A coding cell's accuracy is over every task sent, a failed request scoring wrong; it is
+    /// none where the tests did not run, or one of them could not start.
+    #[test]
+    fn a_coding_cells_accuracy_is_over_every_task_sent() {
+        let j = |failed: u64| serde_json::json!({"num_tasks": 4, "failed": failed});
+        let all = [Some(true), Some(false), Some(true), Some(true)];
+        assert_eq!(tested_accuracy(&j(0), Some(&all)), Some(0.75));
+        let one_failed = [Some(true), None, Some(true), Some(false)];
+        assert_eq!(
+            tested_accuracy(&j(1), Some(&one_failed)),
+            Some(0.5),
+            "failed is wrong"
+        );
+        assert_eq!(
+            tested_accuracy(&j(0), Some(&one_failed)),
+            None,
+            "a test did not start"
+        );
+        assert_eq!(tested_accuracy(&j(0), None), None, "no Python: no accuracy");
     }
 
     /// A streamed chat answer comes back with its text and the server's cached and prompt token

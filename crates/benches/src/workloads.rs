@@ -40,6 +40,9 @@ pub(crate) enum Score {
     },
     /// LongBench v2: the letter the response picks, A to D.
     Choice(String),
+    /// A coding exercise: the answer's code passes the exercise's unit tests, run apart
+    /// ([`crate::coding::TestRunner`]); [`Score::score`] cannot read it from the text.
+    Tests(Box<crate::coding::Exercise>),
     /// Nothing to score: a chat turn or a synthetic question with no single right answer.
     None,
 }
@@ -57,6 +60,7 @@ impl Score {
                 format!("{answer} (or {})", aliases.join(", "))
             }
             Score::Choice(letter) => letter.clone(),
+            Score::Tests(e) => format!("{}'s tests", e.name),
             Score::None => String::new(),
         }
     }
@@ -71,6 +75,8 @@ impl Score {
     pub(crate) fn score(&self, response: &str) -> f64 {
         match self {
             Score::None => 0.0,
+            // Run apart, by `run_tasks`: never reached through here.
+            Score::Tests(_) => 0.0,
             // Each source scored as its own benchmark scores it ([`crate::scoring`]), whether or
             // not this task has aliases.
             Score::Contains {
