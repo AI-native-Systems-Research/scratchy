@@ -6,6 +6,18 @@ multi-row cells: a broadcast defect that sprays row 0's word across row 1, or
 an addressing defect that reads either row at the wrong stick, must land on a
 mismatch, never a coincidental pass.
 
+⭐ THE DEVICE LAYOUT (auditor ruling 2026-10-27, citing forward_tape.rs:299):
+the card lays a `[rows, width]` tensor STICK-MAJOR — stick k of row r at flat
+stick `k*rows + r` — so every multi-row input is STAGED through that scatter
+and every output UN-SCATTERED from it. (The Rust law's 64 counts fp16-sized
+slots: 64 halves = 32 fp32/u32 words = ONE 128 B stick, so at fp32/u32 the
+granule is 32 words.) The first legs staged and read ROW-MAJOR; a
+position-wise op commutes with a consistent permutation, so the DENSE
+controls passed, while every row-sensitive cell failed with the s-mod-rows
+signature that IS the scatter, not a device defect. The `[rows,1]` Col tables
+are fixed points of the scatter (one stick per row), which is why the card's
+per-row Col semantics were right all along.
+
   * `a` — `[2, 512]` u32: row 0 is wrapping multiples of 0x9E3779B1 with the
     boundary words pinned at the head (0, 1, INT_MIN, INT_MAX — the wrap
     cases staged on card); row 1 is wrapping multiples of 0x85EBCA77 with the
@@ -29,7 +41,8 @@ mismatch, never a coincidental pass.
 
 The stats script IMPORTS this module, so the host compare and the card run
 consume the SAME statement of the inputs (the B1 leg's own law: the generators
-ARE the input definition).
+ARE the input definition). The `.bin` files carry the STICK-SCATTERED bytes;
+`stick_unscatter` recovers the logical tile for the host compare.
 
 Files land in ./in/ beside this script (never /tmp), per cell in the kernel's
 parameter order: `<cell>_t00_a` and `<cell>_t01_b`.
@@ -43,6 +56,25 @@ ROWS = 2  # B — the multi-row width
 
 HERE = pathlib.Path(__file__).resolve().parent
 INDIR = HERE / "in"
+
+# One 128 B stick at fp32/u32: 32 words (the forward_tape law's 64 counts
+# fp16-sized slots — 64 halves = 32 words).
+WORDS_PER_STICK = 32
+
+
+def stick_scatter(arr: np.ndarray) -> np.ndarray:
+    """The device's stick-scattered stage of a `[rows, width]` tile
+    (forward_tape.rs:299): stick k of row r lands at flat stick `k*rows + r`.
+    A `[rows, 1]` table (one stick per row) is its own scatter."""
+    rows, width = arr.shape
+    sticks = arr.reshape(rows, width // WORDS_PER_STICK, WORDS_PER_STICK)
+    return sticks.transpose(1, 0, 2).reshape(-1)
+
+
+def stick_unscatter(flat: np.ndarray, rows: int, width: int) -> np.ndarray:
+    """The inverse: flat stick `k*rows + r` back to `[rows, width]` row-major."""
+    sticks = flat.reshape(width // WORDS_PER_STICK, rows, WORDS_PER_STICK)
+    return sticks.transpose(1, 0, 2).reshape(rows, width)
 
 # The per-row words for the Col cells — different odd constants per row.
 COL_WORDS = [0x85EBCA77, 0xC2B2AE3D]
@@ -119,25 +151,27 @@ def a_f32wide() -> np.ndarray:
 
 
 def tables() -> list[tuple[str, np.ndarray]]:
+    """The staged files: every multi-row tile through `stick_scatter` (the
+    device's own layout); the `[rows,1]` Col tables are scatter fixed points,
+    so their bytes are unchanged by the law."""
     a = a_tile()
     dense = b_dense()
     col = b_col()
     out: list[tuple[str, np.ndarray]] = []
     for cell in ("intmr_dense_add", "intmr_dense_mul"):
-        out.append((f"{cell}_t00_a", a))
-        out.append((f"{cell}_t01_b", dense))
+        out.append((f"{cell}_t00_a", stick_scatter(a)))
+        out.append((f"{cell}_t01_b", stick_scatter(dense)))
     for cell in ("intmr_col_add", "intmr_col_mul"):
-        out.append((f"{cell}_t00_a", a))
-        out.append((f"{cell}_t01_b", col))
-    out.append(("intmr_f32col_add_t00_a", a_f32()))
-    out.append(("intmr_f32col_add_t01_b", b_f32col()))
-    out.append(("intmr_f32wide_add_t00_a", a_f32wide()))
-    out.append(("intmr_f32wide_add_t01_b", b_f32col()))
+        out.append((f"{cell}_t00_a", stick_scatter(a)))
+        out.append((f"{cell}_t01_b", stick_scatter(col)))
+    out.append(("intmr_f32col_add_t00_a", stick_scatter(a_f32())))
+    out.append(("intmr_f32col_add_t01_b", stick_scatter(b_f32col())))
+    out.append(("intmr_f32wide_add_t00_a", stick_scatter(a_f32wide())))
+    out.append(("intmr_f32wide_add_t01_b", stick_scatter(b_f32col())))
     # The reduce-chain twin: the same wide tile (row maxima 65535 / 296605 —
-    # DISTINCT, exact), fed to `max → expand_dims → add` — the addend the card
-    # delivers per (row, stick) names the buffer word the Col read picked, and
-    # the pass/fail names whether the device-written pair is self-consistent.
-    out.append(("intmr_f32maxadd_t00_a", a_f32wide()))
+    # DISTINCT, exact), fed to `max -> expand_dims -> add` — the card's own
+    # writer->reader pair, now staged in the device's layout.
+    out.append(("intmr_f32maxadd_t00_a", stick_scatter(a_f32wide())))
     return out
 
 
