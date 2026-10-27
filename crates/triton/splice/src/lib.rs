@@ -949,7 +949,12 @@ fn lower_sandwich_node<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// The ROW-LOCAL op set: ops whose output row `r` depends only on input row `r` (plus
 /// weights and per-row tables). The prefill lm-head fold is sound only inside this set —
 /// see [`tensor_feeds_result_through_row_local_ops`].
-fn row_local_tail_op<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> bool {
+///
+/// Pub for the spyre numeric gate, which closes its fold-law set with this same
+/// classifier — every compared tid whose producer is row-local, consumes a
+/// fold-family tensor and feeds the result rides the fold's one-row compare —
+/// so the gate states the fold the program carries, never a re-derived set.
+pub fn row_local_tail_op<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> bool {
     matches!(
         op,
         SubOp::MatmulTile { .. }
@@ -3353,7 +3358,7 @@ mod production_ktir_dump {
             v.push((
                 entry,
                 ELEMENTWISE,
-                ew("elementwise.py", entry, &ptrs, live),
+                ew("elementwise.py", entry, ptrs, live),
                 vec![1],
             ));
         }

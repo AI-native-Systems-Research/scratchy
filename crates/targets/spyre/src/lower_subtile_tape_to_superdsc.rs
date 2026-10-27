@@ -4595,33 +4595,58 @@ pub fn numeric_gate<F: RopeForm>(
     } else {
         Default::default()
     };
-    // ⭐ THE RESULT RIDES THE FOLD — keyed on the structural fact, not set
-    // membership: the result joins the folded law iff the splice's own
-    // `tensor_feeds_result_through_row_local_ops` holds from a FOLDED node's
-    // output to the result — the same predicate that admitted the fold, so
-    // nothing un-folded can ride in. The front end column-chunks a wide
-    // pointwise tail op past the predicate's width conjunct
-    // (`n_blocks(out_cols, nb)` chunks Silu/Mul/Add/ScalarMul/SiluMul —
-    // measured: granite's 49155-wide logits ScalarMul is 7 region-slice
-    // nodes of 8192 cols, so none matches and the tail op stays un-folded,
-    // the splice's documented cost-only shape: "row 0 is still right ...
-    // the device pays mq−1 rows of reads of unwritten logits for
-    // nothing"). Those chunks still scale the folded matmul's row-0 (=
-    // LAST-row) product — row-locally, guaranteed by this same walk — so
-    // the RESULT's row 0 is the fold's product and its rows 1+ are the
-    // dead stick: it takes the same last-row-vs-row-0 law (measured on the
-    // granite refusal dump: last-row rel 0.00049 at the fp8 floor, rows
-    // 1-30 exactly zero; the plain law reads 1.0136). A no-op when the
-    // tail's own op matched whole-region (gemma's TanhSoftCap already put
-    // the result in the set).
-    if ir.nodes.iter().any(|n| {
-        folded.contains(&(n.output.tensor.index() as u64))
-            && scratchy_triton_splice::tensor_feeds_result_through_row_local_ops(
-                ir,
-                n.output.tensor,
-            )
-    }) {
-        folded.insert(ir.result.index() as u64);
+    // ⭐ EVERY TID ON THE ROW-LOCAL PATH FROM A FOLDED OUTPUT TO THE RESULT
+    // RIDES THE FOLD — a forward closure to a fixpoint, keyed on the
+    // structural facts, not set membership: a tid joins iff its producer is
+    // one of the splice's own row-local tail ops (`row_local_tail_op` — the
+    // same classifier that admits the fold), it consumes a fold-family
+    // tensor, and it feeds the result through the same row-local walk
+    // (`tensor_feeds_result_through_row_local_ops`) — so nothing un-folded
+    // can ride in. The front end column-chunks a wide pointwise tail op past
+    // the predicate's width conjunct (`n_blocks(out_cols, nb)` chunks
+    // Silu/Mul/Add/ScalarMul/SiluMul — measured: granite's 49155-wide logits
+    // ScalarMul is 7 region-slice nodes of 8192 cols, so none matches and the
+    // tail op stays un-folded, the splice's documented cost-only shape:
+    // "row 0 is still right ... the device pays mq−1 rows of reads of
+    // unwritten logits for nothing"). Those chunks still scale the folded
+    // matmul's row-0 (= LAST-row) product — row-locally, guaranteed by this
+    // same walk — so each path tid's row 0 is the fold's product and its
+    // rows 1+ are the dead stick: it takes the same last-row-vs-row-0 law
+    // (measured on the granite refusal dump: last-row rel 0.00049 at the fp8
+    // floor, rows 1-30 exactly zero; the plain law reads 1.0136). The
+    // sampler mint re-points the rung's RESULT to the idx stick, so the
+    // scaled logits between the fold and the draw are a compared
+    // INTERMEDIATE, not the result — without the closure they took the
+    // plain law and refused (measured: bundle 55d6eadfdf521a5c, t1155's
+    // seven chunk locals 1.008-1.014). A no-op when the tail's own op
+    // matched whole-region (gemma's TanhSoftCap already put the result in
+    // the set). The result itself rides when its own producer walks in, and
+    // the idx stick's compare stays EXACT (`result_is_index`, tolerance 0):
+    // the idx readback is one row, `tail_fold`'s shape conjunct turns it
+    // down and it falls to the plain exact compare below.
+    loop {
+        let mut grew = false;
+        for n in &ir.nodes {
+            let out = n.output.tensor.index() as u64;
+            if folded.contains(&out) {
+                continue;
+            }
+            if n.inputs
+                .iter()
+                .any(|i| folded.contains(&(i.tensor.index() as u64)))
+                && scratchy_triton_splice::row_local_tail_op(&n.op)
+                && scratchy_triton_splice::tensor_feeds_result_through_row_local_ops(
+                    ir,
+                    n.output.tensor,
+                )
+            {
+                folded.insert(out);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
     }
     // ⭐ THE RESULT'S OWN DTYPE — the same fact the wiring ships
     // (`result_dtype_of_ir`). An INTEGER result is an INDEX stick, and a
