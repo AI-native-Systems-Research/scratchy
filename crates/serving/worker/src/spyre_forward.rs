@@ -115,7 +115,14 @@ pub(crate) fn run_prefill_batch(
     // pmask reserve (`SuperDscSession::pmask_slots`) and a decode batch's is the DECLARED fold grid, so
     // neither can be handed a page count computed at a call site. Deleting the parameter is what stops the
     // next caller from reaching for `ctx.host.len()` or a pool size again.
-    toks: &[usize],
+    // ⛔ THE SEED LAW, NOT A TOKEN LIST. This used to be `toks: &[usize]` — one token per live
+    // row, read from the token pool — which made every decode step's embed-head bind depend on
+    // the PREVIOUS step's collected pick and forced a drain before every submit. The device
+    // writes the seeds itself (each step's ChainStage decomposes its pick into the persistent
+    // sticks), so the host binds seeds ONLY where the card cannot have: a request's first step on
+    // a rung session, a churned or padded seat, a rung switch. `SeedSource::OnCard` is that
+    // statement — a stable seating — and binds nothing.
+    seeds: scratchy_subtile::sdsc_abstract::SeedSource<'_>,
     // The width the bundle being run was BAKED at — the launch binds exactly this many rows,
     // live or padding, and every extent below (embeddings, masks, `run_step`'s m) is sized by it.
     prefill_m: scratchy_subtile::sdsc_abstract::RungWidth,
@@ -162,16 +169,29 @@ pub(crate) fn run_prefill_batch(
     //
     // A DECODE BATCH's pad row replicates LIVE 0 instead, all four aspects, because its cache write is
     // not its own slot's: it is live 0's cell. See `LaunchRows` below.
-    let real = toks.len();
     // The kind of a launch WITHOUT `per_request` — a prompt chunk, whose rows are consecutive positions
     // of one prompt. Its laws (the pad-row clamp, the causal triangle) hang off this type and nothing
     // else can reach them.
     let chunk = ChunkRows::chunk(prefill_m.rows());
     // The rung width as a host-side extent, taken once — every loop and buffer below is `mq`-sized.
     let mq = prefill_m.count();
-    if real == 0 || real > mq {
+    // ⛔ A PROMPT CHUNK'S ROWS ARE THE PROMPT'S OWN TOKENS — the host owns every one of them, so
+    // `OnCard` is not a spelling a chunk can take: its head kernel is the host-pushed `EmbedRow`,
+    // and "the card's own ChainStage writes" is a decode-chain fact a prefill forward does not
+    // have. Refused here rather than silently read as an empty token list.
+    let host_toks: &[usize] = match (&per_request, seeds) {
+        (_, scratchy_subtile::sdsc_abstract::SeedSource::Host(t)) => t,
+        (None, scratchy_subtile::sdsc_abstract::SeedSource::OnCard) => {
+            return Err(werr(
+                "run_prefill_batch: a prompt chunk cannot seed from the card — every prompt row's \
+                 token is a host fact and the EmbedRow push reads it",
+            ));
+        }
+    };
+    if per_request.is_none() && (host_toks.is_empty() || host_toks.len() > mq) {
         return Err(werr(format!(
-            "run_prefill_batch: real={real} not in 1..={mq}"
+            "run_prefill_batch: real={} not in 1..={mq}",
+            host_toks.len()
         )));
     }
     // ONE TOKEN PER LIVE ROW. Both come from the same walk of the slot map at the call site, so this
@@ -197,23 +217,23 @@ pub(crate) fn run_prefill_batch(
         scratchy_subtile::sdsc_abstract::BatchPrefix,
     )> = match per_request {
         Some((rows, fold)) => {
-            if rows.live() != real {
-                return Err(werr(format!(
-                    "run_prefill_batch: {} live row(s) but {real} token(s) — a decode batch carries \
-                     exactly one token per live request",
-                    rows.live()
-                )));
-            }
-            let laid = rows.launch_rows(toks, prefill_m).ok_or_else(|| {
+            let laid = rows.launch_rows(seeds, prefill_m).ok_or_else(|| {
                 werr(format!(
-                    "run_prefill_batch: {} live row(s) / {} token(s) do not lay into a {mq}-row rung",
-                    rows.live(),
-                    toks.len()
+                    "run_prefill_batch: {} live row(s) do not lay into a {mq}-row rung with this \
+                     seed source — a Host source carries exactly one token per live row",
+                    rows.live()
                 ))
             })?;
             Some((laid, fold))
         }
         None => None,
+    };
+    // `real` — how many rows carry their OWN input. A prompt chunk's is its token count (checked
+    // above); a decode batch's is its LIVE count, which `launch_rows` already validated against
+    // the Host token list, so the two cannot disagree here.
+    let real = match &per_request {
+        Some((rows, _)) => rows.live(),
+        None => host_toks.len(),
     };
     // Pad rows REPLICATE — whom is a kind question, and the kind is which of these two arms exists. A
     // decode batch's pad rows take LIVE 0's token, because a pad row's forward becomes its cache write
@@ -221,10 +241,33 @@ pub(crate) fn run_prefill_batch(
     // token: the emitter reads the lm-head input from the last baked row, which must carry the last
     // real token (and a chunk's pad KV writes append at the row's own slot, past n_computed — no
     // shared cell).
-    let tok_at = |i: usize| match &per_request {
-        Some((rows, _)) => rows.row(i).expect("i < mq").token().get() as usize,
-        None if i < real => toks[i],
-        None => toks[real - 1],
+    //
+    // ⭐⭐⭐ AND ON AN `OnCard` DECODE LAUNCH THERE ARE NO HOST TOKENS AT ALL — every row's seed is
+    // the card's own ChainStage write, bound by nobody. The vec is EMPTY then, the tape's ChainSeed
+    // steps stage nothing (the launcher's skip, below), and the gather reads the sticks as the
+    // previous step's stage left them. `Host` on a decode launch carries the SEEDS: the full
+    // per-row clamp `launch_rows` laid, one entry per BOUND row (live rows' own, pads replicating),
+    // because the seed fns (`chain_s_seed`/`chain_l_seed`) take the launch's own width.
+    let tokens: Vec<usize> = match (&per_request, seeds) {
+        (Some((rows, _)), scratchy_subtile::sdsc_abstract::SeedSource::Host(_)) => (0..mq)
+            .map(|i| {
+                rows.row(i)
+                    .expect("i < mq")
+                    .token()
+                    .expect("a Host-seeded launch carries every row's token")
+                    .get() as usize
+            })
+            .collect(),
+        (Some(_), scratchy_subtile::sdsc_abstract::SeedSource::OnCard) => Vec::new(),
+        (None, _) => (0..mq)
+            .map(|i| {
+                if i < real {
+                    host_toks[i]
+                } else {
+                    host_toks[real - 1]
+                }
+            })
+            .collect(),
     };
     // ⭐⭐⭐⭐⭐ THE HEAD COUNT FROM THE BAKE, NOT `h / hd`. The quotient is the head count only for a
     // SQUARE Q projection; gemma-4's is not (hidden 3840 against nqh·hd 4096/8192 — and the
@@ -348,7 +391,10 @@ pub(crate) fn run_prefill_batch(
         // site for what the difference cost.
         &b.facts.constant_env(b.wiring, mq_pad, launch_rows),
     );
-    let tokens: Vec<usize> = (0..mq).map(tok_at).collect();
+    // ⛔ THE VOCAB GATE COVERS WHAT THE HOST BINDS. An `OnCard` decode launch binds no token, so
+    // there is nothing to check — its seeds are the card's own draws, which the sampler's own
+    // vocab-width table produced. A `Host` launch's entries are prompt tokens or collected picks,
+    // and an out-of-range one would gather past the embedding table.
     for &tok in &tokens {
         if tok >= vocab {
             return Err(werr(format!("prefill token {tok} >= vocab {vocab}")));
@@ -455,6 +501,14 @@ pub(crate) fn run_prefill_batch(
         causal_heads_per_block: b.wiring.causal_heads_per_block(causal),
         embed_tokens: sh.embed_tokens,
         tokens: &tokens,
+        // ⭐ THE SEED LAW'S WIRE SPELLING: a decode launch seeds the sticks only in the `Host`
+        // arm (the caller-owned tokens above, already clamp-laid per bound row); an `OnCard`
+        // launch passes `None` and the launcher's ChainSeed steps stage nothing. A prefill launch
+        // has no ChainSeed step at all, so `None` there is inert by the tape's own shape.
+        chain_seeds: match (&per_request, seeds) {
+            (Some(_), scratchy_subtile::sdsc_abstract::SeedSource::Host(_)) => Some(&tokens[..]),
+            _ => None,
+        },
         positions: &positions,
         causal,
         prefix: prefix_src,
@@ -858,6 +912,18 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
             self.staged = None;
             return Ok(());
         }
+        // ⭐⭐ THE CHAIN'S SEED SKIP — THE `OnCard` ARM, the same shape as the held causal key. A
+        // stable seating's seeds are the card's own ChainStage writes (the previous step's pick,
+        // decomposed into the persistent sticks at its tail), so this launch stages NO seed and
+        // the device's gather reads the sticks as they were left. Binding a host seed here would
+        // need the PREVIOUS step's pick before this launch's submit — the drain fence the seed
+        // law exists to delete.
+        if step.kernel == scratchy_target_spyre::forward_tape::ForwardKernel::ChainSeed
+            && self.inputs.chain_seeds.is_none()
+        {
+            self.staged = None;
+            return Ok(());
+        }
         let staged =
             scratchy_target_spyre::forward_tape::kernel_values(step, self.shape, self.inputs)?;
         // A `Const` step's TENSOR comes from the constant list the kernel index addresses, not
@@ -881,8 +947,19 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
     fn h2d(&mut self, t: scratchy_subtile::host_tape::TensorId) -> Result<(), Self::Error> {
         let causal_tid = scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_CAUSAL_TID;
         let Some((tensor, staged)) = self.staged.take() else {
-            // The one step that stages nothing: the causal mask, when the session holds its key.
-            return if t.0 == causal_tid && self.causal_held == Some(self.inputs.causal) {
+            // The two steps that stage nothing: the causal mask when the session holds its key,
+            // and the chain's seed when the seeds are the card's own (`OnCard` — the two stick
+            // sources the phase's chain names).
+            let chain_skip = match self.shape.phase {
+                scratchy_target_spyre::forward_tape::ForwardPhase::Decode { chain } => {
+                    self.inputs.chain_seeds.is_none()
+                        && (t.0 == chain.s_src || t.0 == chain.l_src)
+                }
+                scratchy_target_spyre::forward_tape::ForwardPhase::Prefill => false,
+            };
+            return if (t.0 == causal_tid && self.causal_held == Some(self.inputs.causal))
+                || chain_skip
+            {
                 Ok(())
             } else {
                 Err("h2d with nothing staged".to_string())
@@ -1902,7 +1979,7 @@ pub(crate) fn superdsc_forward_chunk(
                     pmeta,
                     // ⭐ FROM THE REQUEST, AT ABSOLUTE POSITIONS — not from this step's window. A chunk
                     // that stepped back needs tokens an earlier step was given, and the request holds them.
-                    &chunk_toks,
+                    scratchy_subtile::sdsc_abstract::SeedSource::Host(&chunk_toks),
                     // The LADDER entry's baked width — the rung this chunk actually runs on, of
                     // which `chunk_len` rows carry real tokens.
                     scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(rung_m as u32)
@@ -2210,6 +2287,13 @@ pub(crate) fn superdsc_forward_chunk(
             causal_heads_per_block: b.wiring.causal_heads_per_block(causal),
             embed_tokens: sh.embed_tokens,
             tokens: &[tok],
+            // THE SOLO STEP SEEDS EVERY TIME, and that is the solo driver's own law: it collects
+            // in-call (the pick is in hand before the next step is built), and its session is
+            // chosen per CAP BUCKET — a mid-generation bucket switch lands on a session whose
+            // sticks were never seeded, so "first step on this session" is not a fact the caller
+            // can name cheaply. The bind is the idempotent restatement of the card's own stage
+            // write when the session did chain, and the required first seed when it did not.
+            chain_seeds: Some(&[tok]),
             positions: &[p as u32],
             causal,
             prefix: prefix_src,

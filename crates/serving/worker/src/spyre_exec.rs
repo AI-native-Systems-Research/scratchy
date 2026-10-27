@@ -232,13 +232,7 @@ impl SpyreWorker {
         requests: &mut HashMap<String, ReqState>,
         input_batch: &mut scratchy_serving_engine::input_batch::InputBatch,
     ) -> ExecutorResult<Vec<u32>> {
-        let InFlightDecode {
-            cell,
-            sub,
-            rung,
-            rows,
-            write_slot,
-        } = infl;
+        let InFlightDecode { cell, sub, rung, rows } = infl;
         // Only the submitting rung's session can finish the read — each rung owns its own
         // executor and stream.
         let SendnnSession::SuperDsc(sb) = &mut model.session;
@@ -267,15 +261,14 @@ impl SpyreWorker {
                     toks.len()
                 ))
             })?;
-            let req = requests
+            requests
                 .get_mut(&id)
                 .ok_or_else(|| werr(format!("unknown in-flight req {id}")))?;
             input_batch.push_generated(&id, tok);
             input_batch.set_tokens_in_pool(&id, start + 1);
-            // The launch wrote this request's key AT THE SHARED SLOT, so that is what its
-            // history records — and the next step's mask, built from the history, then says
-            // valid on exactly the slots the card wrote and −∞ on the hole.
-            req.record_kv(write_slot, SlotCount::new(1));
+            // ⭐ THE KV HISTORY WAS RECORDED AT SUBMIT (c4b) — the write slot is a position fact
+            // the host knew when it launched, and the next step's geometry reads it before this
+            // drain on a stable seating. The drain owns the PICK; the history was never its fact.
             out.push(tok);
         }
         cell.fill(Ok(out.clone()));
@@ -507,20 +500,17 @@ impl Worker for SpyreWorker {
         &mut self,
         scheduler_output: &SchedulerOutput,
     ) -> ExecutorResult<ModelRunnerOutput> {
-        // ⭐ #32 (c4) — DRAIN THE PREVIOUS STEP BEFORE THIS ONE BUILDS ITS LAUNCH. A step's
-        // picked tokens feed the next step's embedding (`token_at`), so the queue must be
-        // empty before `toks` is read; on a deferring driver this fence is the one the
-        // previous step's overlap was riding. The SAME pop the knock takes — never a second
-        // path — and it runs BEFORE the finished-request cleanup so a step's bookkeeping
-        // still finds the requests it named.
-        #[cfg(feature = "spyre-hw")]
-        while let Some(infl) = self.in_flight.pop_front() {
-            let model = self
-                .model
-                .as_mut()
-                .ok_or_else(|| werr("model not loaded"))?;
-            Self::drain_one(infl, model, &mut self.requests, &mut self.input_batch)?;
-        }
+        // ⭐ #32 (c4b) — THE ENTRY-DRAIN IS GONE, AND THE SEED LAW IS WHY. It existed because a
+        // decode step's launch read `input_batch.token_at` — step j's pick — to seed step j+1's
+        // embed head, so the queue had to be empty before every launch. The device writes the
+        // seeds itself (each step's ChainStage decomposes its pick into the persistent sticks),
+        // so a step on an UNCHANGED seating binds nothing and needs nothing drained: it submits
+        // while the previous step is still in flight — depth 2. A CHURNED seating (below, at the
+        // rung) still drains in-call, through the same pop the knock takes, because a re-seated
+        // row's seed is the previous step's pick and only the drain holds it. Deferred steps that
+        // neither churn nor block are drained by their own resolver's knock — the engine resolves
+        // a step before the schedule two later can clean up the requests it named, so no drain
+        // races the finished-request cleanup.
         let Self {
             model,
             requests,
@@ -817,6 +807,24 @@ impl Worker for SpyreWorker {
             } else {
                 None
             };
+            // ⭐⭐⭐ #32 (c4b) — THE SEATING DISSOLVES whenever a decoder runs OUTSIDE the batched
+            // rung (`rung` is `None` with decoders live — the batch fell to one request, or no
+            // ladder was baked). Two things must happen, and both are the seed law's own:
+            // the per-request path reads the token POOL (`token_at` = the previous pick), so the
+            // queue drains first — the same pop, never a second path; and the stored seating is
+            // DISCARDED, because a solo interlude advances a request's pick on another session
+            // while the rung's sticks still hold its pick from the last BATCHED step — a later
+            // batched step that compared equal against the stale seating would read a STALE seed,
+            // silently. `None` makes the next batched step churn: drain (a no-op here) and seed
+            // from the pool. A step with NO decoders (pure prefill) dissolves nothing — no
+            // decoder's pick advanced, so the sticks still hold every seat's own seed.
+            #[cfg(feature = "spyre-hw")]
+            if rung.is_none() && !decode_ids.is_empty() {
+                self.seating = None;
+                while let Some(infl) = self.in_flight.pop_front() {
+                    Self::drain_one(infl, model, requests, input_batch)?;
+                }
+            }
             if let Some(ri) = rung {
                 // Grow pages BEFORE the forward, for every request: one crossing into a new page
                 // needs it bound when its own row writes, not after.
@@ -873,6 +881,33 @@ impl Worker for SpyreWorker {
                     hidden: model.hidden,
                     vocab: model.vocab,
                 };
+                // ⭐⭐⭐ #32 (c4b) — THE SEED LAW'S CHURN TEST, taken before the rung's session is
+                // borrowed (the drain needs `&mut model.session`). The seating is the rung plus
+                // which request sits in each launch slot, dense in `decode_ids` order; the pad set
+                // is decided by the same pair (rung width minus live count), so the pair IS the
+                // seating. IDENTICAL to the previous step's ⇒ the card's own ChainStage writes are
+                // every seat's seed and this step binds none — it submits with the previous step
+                // still in flight (depth 2). Any difference — a join, a leave, a rung switch, a
+                // changed pad count — re-seats rows onto sticks holding the PREVIOUS occupant's
+                // pick (or none at all, on a fresh session), so those steps DRAIN FIRST, through
+                // the same pop the knock takes, and seed from the collected picks: a fresh row's
+                // `token_at` is its prompt's final token, a continuing row's is the pick the drain
+                // just wrote into the pool. Churn is a SCHEDULER fact, known before submit — the
+                // host never waits on a card result to learn it.
+                let seating_now: Vec<String> =
+                    decode_ids.iter().map(|(id, _)| id.clone()).collect();
+                let churned = match &self.seating {
+                    None => true,
+                    Some((last_rung, last_ids)) => {
+                        *last_rung != ri || last_ids.as_slice() != seating_now.as_slice()
+                    }
+                };
+                self.seating = Some((ri, seating_now));
+                if churned {
+                    while let Some(infl) = self.in_flight.pop_front() {
+                        Self::drain_one(infl, model, requests, input_batch)?;
+                    }
+                }
                 let SendnnSession::SuperDsc(sb) = &mut model.session;
                 // The pool's owner split, once for this launch — the same derivation the host's block
                 // count came from, so a derived page map cannot name a block the host may also hand out.
@@ -1219,14 +1254,20 @@ impl Worker for SpyreWorker {
                 } else {
                     None
                 };
-                // THE LIVE ROWS ONLY, built by the slot map's own walk — one token and one
-                // `BatchRow` per LIVE slot, in slot order, and nothing invented for the padding
-                // slots. `run_prefill_batch` widens this to the rung (`LaunchRows`), where a padding
+                // THE LIVE ROWS ONLY, built by the slot map's own walk — one `BatchRow` per LIVE
+                // slot, in slot order, and nothing invented for the padding slots.
+                // `run_prefill_batch` widens this to the rung (`LaunchRows`), where a padding
                 // slot runs LIVE 0 ENTIRE — same token, rotation, new-block column and prefix
                 // history — so the cache write it cannot help making carries live 0's exact bytes
                 // into the racing same-cell write (see the page-map note above). Its logits are
                 // never read. The launch geometry is still the RUNG's: `seqs` rows are bound and
                 // run, live or padding.
+                //
+                // ⭐⭐⭐ THE TOKEN IS READ ONLY ON A CHURNED SEATING. A stable step's seeds are the
+                // card's own ChainStage writes — `token_at` here would be the PREVIOUS step's
+                // pick, uncollected, and reading it is exactly the fence the seed law deletes. On
+                // churn the drain above has already collected, so `token_at(id, start)` answers:
+                // a FRESH row's prompt-final token, or a continuing row's just-collected pick.
                 let mut toks: Vec<usize> = Vec::with_capacity(slots.live());
                 // ⭐ THE LIVE ROWS' DRAWS, collected by the SAME walk that lays
                 // the rows — one per live slot, in slot order, so a law can
@@ -1242,15 +1283,17 @@ impl Worker for SpyreWorker {
                         .get(id)
                         .ok_or_else(|| werr(format!("unknown cached req {id}")))?;
                     draws.push(req.draw.as_ref());
-                    let tok = input_batch.token_at(id, *start).ok_or_else(|| {
-                        werr(format!("decode batch: req {id} has no token at {start}"))
-                    })? as usize;
-                    toks.push(tok);
+                    if churned {
+                        let tok = input_batch.token_at(id, *start).ok_or_else(|| {
+                            werr(format!("decode batch: req {id} has no token at {start}"))
+                        })? as usize;
+                        toks.push(tok);
+                    }
                     // The row's ROTARY position is still its own token count — sharing a write slot
                     // moves where the key is stored, not where the request is in its conversation.
                     Ok::<_, ExecutorError>(scratchy_subtile::sdsc_abstract::BatchRow {
-                        // `*start` is THIS REQUEST's own token index (it came from `decode_ids[live]` and
-                        // was just used as `input_batch.token_at(id, *start)`), which is why it is a position and not
+                        // `*start` is THIS REQUEST's own token index (it came from `decode_ids[live]`),
+                        // which is why it is a position and not
                         // the `write_slot` above. Those were both bare integers in this scope until now.
                         rope_pos: scratchy_subtile::sdsc_abstract::SeqPos::new(*start as u32),
                         hist: req.kv_hist.clone(),
@@ -1576,7 +1619,15 @@ impl Worker for SpyreWorker {
                     // A batched rung sweeps the whole pool, so it runs on the widest decode
                     // bucket. (The sendnn path bakes exactly one, so this is that one.)
                     model.decode.last().expect("at least one decode bucket"),
-                    &toks,
+                    // ⭐⭐⭐ THE SEED LAW AT THE CALL: a churned seating seeds from the collected
+                    // picks (`toks`, one per live row, pads clamped by `launch_rows`); a stable
+                    // seating seeds from the card — `OnCard`, no bind, no drain, submit while the
+                    // previous step is still in flight.
+                    if churned {
+                        scratchy_subtile::sdsc_abstract::SeedSource::Host(&toks)
+                    } else {
+                        scratchy_subtile::sdsc_abstract::SeedSource::OnCard
+                    },
                     seqs,
                     // ⭐ THE RUNG'S OWN ANSWER, riding with the rung's own `seqs` for the same reason:
                     // the meta above is borrowed for tensor ids and describes neither.
@@ -1597,6 +1648,22 @@ impl Worker for SpyreWorker {
                         ))
                     }
                 };
+                // ⭐⭐⭐ #32 (c4b) — THE KV HISTORY IS RECORDED AT SUBMIT, NOT AT THE DRAIN. The
+                // next step's launch geometry — its own `write_slot` (`BatchSlot::of` over the
+                // requests' histories), its page growth, its prefix mask — is built BEFORE the
+                // previous step's collect on a stable seating, and every one of those reads
+                // `kv_hist`. The write slot is a POSITION fact the host knows at submit (the
+                // launch is the one that writes it), so recording it there is not a guess: it is
+                // the same number the launch below binds. The PICK still lands at the drain —
+                // only the drain holds it. (A launch that fails after this record leaves the
+                // history claiming a slot nobody wrote, and the step's error kills the stream
+                // anyway — the sticky-death law, never a silent divergence.)
+                for (id, _) in &decode_ids {
+                    let req = requests
+                        .get_mut(id)
+                        .ok_or_else(|| werr(format!("unknown cached req {id}")))?;
+                    req.record_kv(write_slot, SlotCount::new(1));
+                }
                 // ⭐ #32 (c4) — THE STEP IS SUBMITTED; its collect is QUEUED, not run.
                 // Everything the drain needs rides in `InFlightDecode` — per live row, in
                 // `decode_ids` order, the request, its pool start and the launch slot its
@@ -1631,7 +1698,6 @@ impl Worker for SpyreWorker {
                     sub,
                     rung: ri,
                     rows: laid,
-                    write_slot,
                 });
                 if pure && self.drain_door.is_some() {
                     // THE DEFERRED OUTPUT: knock, THEN wait — in that order, because a

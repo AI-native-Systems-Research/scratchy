@@ -10022,6 +10022,40 @@ impl SlotMap {
     }
 }
 
+/// ⭐⭐⭐ WHERE A LAUNCH'S EMBED-HEAD SEED COMES FROM — the seed law, as a type.
+///
+/// Every row a decode launch binds FEEDS one token to the chained head's gather: the persistent
+/// sticks the `EmbedRowGather` reads. The DEVICE writes those sticks itself — each step's
+/// `ChainStage` decomposes the pick that step drew into them — so on a seating that has not
+/// changed since the step that wrote them, the card's own write IS each seat's seed and the host
+/// binds nothing. A host bind is needed exactly when a seat's sticks are NOT the card's own
+/// current seed for their occupant:
+///
+/// - a request's FIRST step on a rung's session (its prompt's final token, host-known);
+/// - a CHURNED seat — slots are dense in the live list (`live i runs in slot i`), so any join or
+///   leave re-seats requests onto sticks that hold the PREVIOUS occupant's pick;
+/// - a PADDING seat at a changed live count — the pad must clamp to the last live row's token,
+///   and the card's stage writes the pad row's OWN drawn pick, not the clamp;
+/// - a RUNG SWITCH — a different session, whose sticks were never seeded.
+///
+/// A prompt chunk is always [`SeedSource::Host`]: its rows are the prompt's own tokens and the
+/// tape's head kernel is the host-pushed `EmbedRow` — the same arm, because "the host knows every
+/// row's token" is the one fact both regimes share.
+///
+/// ⛔ `OnCard` IS NOT "BIND NOTHING AND HOPE". It states the seating is stable — the host's
+/// assertion that every seat's sticks were written by this session's own previous step for the
+/// request now sitting there. The launch it widens to carries no token ([`RowInputs::token`] is
+/// `None`), so a consumer cannot accidentally stage a seed it does not have: the only way to
+/// bind a seed is the `Host` arm.
+#[derive(Clone, Copy)]
+pub enum SeedSource<'a> {
+    /// One token per LIVE row, host-known — seeded through the raw u32 channel this launch.
+    Host(&'a [usize]),
+    /// The device's own `ChainStage` writes are each seat's seed — a stable seating. Nothing is
+    /// bound, and no row's token is a host fact.
+    OnCard,
+}
+
 /// ⭐⭐⭐ THE LIVE ROWS OF A BATCHED LAUNCH — one [`BatchRow`] per LIVE slot, in slot order, and
 /// NOTHING for the padding slots.
 ///
@@ -10051,29 +10085,46 @@ impl LiveBatch {
     /// with a COMPLETE set of row inputs. This is the one door from "who is live" to "what every row
     /// runs", and the only constructor of [`LaunchRows`].
     ///
-    /// `toks` is the launch's own token list, ONE PER LIVE ROW, from the same walk that minted `self`;
-    /// any other length refuses, so no caller can pair a row with another slot's token. Live 0 is
-    /// picked HERE and not by the caller, because the replicated row is not a choice: live 0 is the row
-    /// whose page map every padding slot borrows, so live 0's write cell is the cell a padding write
-    /// races.
+    /// `seeds` is the launch's seed law ([`SeedSource`]). `Host` carries one token per live row,
+    /// from the same walk that minted `self`; any other length refuses, so no caller can pair a row
+    /// with another slot's token. Live 0 is picked HERE and not by the caller, because the
+    /// replicated row is not a choice: live 0 is the row whose page map every padding slot borrows,
+    /// so live 0's write cell is the cell a padding write races. `OnCard` widens with no tokens at
+    /// all — the card's own `ChainStage` writes are every seat's seed — and every row's
+    /// [`RowInputs::token`] is `None`, so a seed cannot be half-staged.
     ///
-    /// `None` when the batch is empty (no live 0 to replicate), when the tokens do not match the live
-    /// rows, when a token is not a `u32`, or when more requests are live than the rung is wide.
-    pub fn launch_rows<'a>(&'a self, toks: &[usize], width: RungWidth) -> Option<LaunchRows<'a>> {
-        if toks.len() != self.rows.len() || self.rows.len() > width.count() {
-            return None;
-        }
+    /// `None` when the batch is empty (no live 0 to replicate), when host-known tokens do not match
+    /// the live rows, when a token is not a `u32`, or when more requests are live than the rung is
+    /// wide.
+    pub fn launch_rows<'a>(&'a self, seeds: SeedSource<'_>, width: RungWidth) -> Option<LaunchRows<'a>> {
+        let ids: Option<Vec<TokenId>> = match seeds {
+            SeedSource::Host(toks) => {
+                if toks.len() != self.rows.len() || self.rows.len() > width.count() {
+                    return None;
+                }
+                Some(
+                    toks.iter()
+                        .map(|&t| u32::try_from(t).ok().map(TokenId))
+                        .collect::<Option<_>>()?,
+                )
+            }
+            SeedSource::OnCard => {
+                if self.rows.len() > width.count() {
+                    return None;
+                }
+                None
+            }
+        };
         let live0 = self.rows.first()?;
-        let ids: Vec<TokenId> = toks
-            .iter()
-            .map(|&t| u32::try_from(t).ok().map(TokenId))
-            .collect::<Option<_>>()?;
         // ⭐ ALL FOUR ASPECTS, IN ONE EXPRESSION. There is no way to build a replica that mirrors
         // live 0's token but not its history, because there is no other constructor and no field is
         // optional — which is the whole lock: the two previous attempts at this each mirrored one
         // aspect and left another, and a partial replica writes different bytes into live 0's cell.
+        // (In the `OnCard` arm the token aspect is the CARD's seed, mirrored by its own stage write
+        // rather than by this value — the replica still carries the other three, which the host
+        // DOES own: the rotation, the column and the history.)
         let pad = PadRowReplica {
-            token: *ids.first()?,
+            token: ids.as_ref().and_then(|i| i.first().copied()),
             rope_pos: live0.rope_pos,
             // Live 0's launch slot, which under the diagonal new-block law IS the column its query row
             // attends. `SlotMap::of_live` hands slots out densely from live 0, so it is slot 0.
@@ -10121,7 +10172,7 @@ impl LiveBatch {
 /// expression: a replica that mirrors some aspects and not others is a value with no way to exist.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct PadRowReplica {
-    token: TokenId,
+    token: Option<TokenId>,
     rope_pos: SeqPos,
     new_block_col: LaunchSlot,
     hist: KvHistory,
@@ -10137,7 +10188,9 @@ pub struct LaunchRows<'a> {
     live: &'a LiveBatch,
     pad: PadRowReplica,
     width: RungWidth,
-    toks: Vec<TokenId>,
+    /// `None` in the [`SeedSource::OnCard`] arm — no row's token is a host fact there, so none can
+    /// be staged as one. See [`SeedSource`] for the seed law.
+    toks: Option<Vec<TokenId>>,
 }
 
 /// ⭐⭐ ONE ROW'S COMPLETE INPUTS — the token it gathers, the position it rotates at, the new-block
@@ -10153,15 +10206,17 @@ pub struct LaunchRows<'a> {
 /// No public constructor: the only way to one is [`LaunchRows::row`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RowInputs<'a> {
-    token: TokenId,
+    token: Option<TokenId>,
     rope_pos: SeqPos,
     new_block_col: LaunchSlot,
     hist: &'a KvHistory,
 }
 
 impl<'a> RowInputs<'a> {
-    /// The token this row's embedding gathers.
-    pub fn token(self) -> TokenId {
+    /// The token this row's embedding gathers — `None` on an [`SeedSource::OnCard`] launch, where
+    /// the seed is the card's own `ChainStage` write and staging one from the host is exactly what
+    /// the seed law forbids.
+    pub fn token(self) -> Option<TokenId> {
         self.token
     }
 
@@ -10207,7 +10262,7 @@ impl<'a> LaunchRows<'a> {
         }
         Some(match self.live.row(slot) {
             Some(b) => RowInputs {
-                token: self.toks[slot],
+                token: self.toks.as_ref().and_then(|t| t.get(slot).copied()),
                 rope_pos: b.rope_pos,
                 new_block_col: LaunchSlot(slot),
                 hist: &b.hist,

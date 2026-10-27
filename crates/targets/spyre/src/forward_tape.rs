@@ -106,6 +106,14 @@ pub struct ForwardInputs<'a, Valid: Fn(usize) -> bool> {
     pub embed_tokens: &'a [f32],
     /// Token id per row.
     pub tokens: &'a [usize],
+    /// ⭐ THE CHAIN'S SEED DECISION — `Some(per-row token ids)` when this launch RE-SEEDS the
+    /// persistent sticks (a request's first step on a rung session, a churned or padded seat, a
+    /// rung switch), `None` when the card's own `ChainStage` writes are every seat's seed and the
+    /// launcher binds NOTHING (a stable seating — see `SeedSource` in
+    /// `scratchy-subtile`'s `sdsc_abstract` for the law). Mirrors [`Self::tokens`] on the decode
+    /// phase: prefill's `EmbedRow` reads `tokens`, decode's `ChainSeed` reads these, and neither
+    /// phase's tape carries the other's step.
+    pub chain_seeds: Option<&'a [usize]>,
     /// ABSOLUTE rotary position per row — a row's real position in ITS sequence, which for a
     /// decode batch is not its row index.
     pub positions: &'a [u32],
@@ -226,13 +234,19 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
                     .to_string(),
             );
         };
-        if inp.tokens.is_empty() {
+        let toks = inp.chain_seeds.ok_or_else(|| {
+            "ChainSeed step on a forward whose seeds are the card's own — the launcher skips the \
+             bind on an OnCard launch, so reaching kernel_values with none is a tape/launcher desync"
+                .to_string()
+        })?;
+        if toks.is_empty() {
             return Err(
                 "ChainSeed step on a forward with no token to seed from — the sticks are the \
                  gather's only index, and an unstaged one gathers the wrong row silently"
                     .to_string(),
             );
         }
+        let toks = &toks[..];
         let is_s = step.tensor == PlaceId::Act(chain.s_src);
         if !is_s && step.tensor != PlaceId::Act(chain.l_src) {
             return Err(format!(
@@ -254,7 +268,7 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
         // index reads whatever was there, a fluent wrong row). At `rows == 1`
         // the per-row spelling IS the solo one byte-for-byte, so the W=1
         // byte-identity rides the same construction rather than a width branch.
-        let toks: Vec<u32> = inp.tokens.iter().map(|&t| t as u32).collect();
+        let toks: Vec<u32> = toks.iter().map(|&t| t as u32).collect();
         let words = if is_s {
             scratchy_subtile::subtile_ir::chain_s_seed(chain.k, &toks, rows)
         } else {
@@ -928,6 +942,7 @@ mod tests {
             causal_heads_per_block: 1,
             embed_tokens: &[],
             tokens: &[],
+            chain_seeds: None,
             positions: &[],
             causal: one_row_key(),
             prefix: None,
@@ -1116,6 +1131,7 @@ mod tests {
             causal_heads_per_block: 1,
             embed_tokens: &[0.0; 64],
             tokens: &[0],
+            chain_seeds: None,
             positions: &[0],
             causal: one_row_key(),
             prefix: Some(PrefixSource::Broadcast {

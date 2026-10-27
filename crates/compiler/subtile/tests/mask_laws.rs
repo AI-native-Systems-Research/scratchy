@@ -542,7 +542,7 @@ fn padding_row_replicates_live_0(real: usize) {
         })
         .expect("the builder never fails here");
     let rows = live
-        .launch_rows(&toks, width)
+        .launch_rows(scratchy_subtile::sdsc_abstract::SeedSource::Host(&toks), width)
         .expect("a live batch lays into its rung");
     assert_eq!(
         rows.live(),
@@ -555,7 +555,11 @@ fn padding_row_replicates_live_0(real: usize) {
     let live0 = rows.row(0).expect("live 0");
     for pad in real..mq {
         let p = rows.row(pad).expect("a bound slot");
-        assert_eq!(p.token(), live0.token(), "pad row {pad}: token");
+        assert_eq!(
+            p.token().expect("host-seeded"),
+            live0.token().expect("host-seeded"),
+            "pad row {pad}: token"
+        );
         assert_eq!(p.rope_pos(), live0.rope_pos(), "pad row {pad}: rotation");
         assert_eq!(
             p.new_block_col().index(),
@@ -566,7 +570,10 @@ fn padding_row_replicates_live_0(real: usize) {
         );
         assert_eq!(p.hist(), live0.hist(), "pad row {pad}: prefix history");
         // And live 0's own aspects are not degenerate — otherwise every equality above is vacuous.
-        assert_eq!(live0.token().get() as usize, toks[0]);
+        assert_eq!(
+            live0.token().expect("host-seeded").get() as usize,
+            toks[0]
+        );
         assert_eq!(live0.new_block_col().index(), 0);
         assert!(
             !live0.hist().runs().is_empty(),
@@ -577,7 +584,7 @@ fn padding_row_replicates_live_0(real: usize) {
     for i in 1..real {
         let r = rows.row(i).expect("a live slot");
         assert_eq!(
-            r.token().get() as usize,
+            r.token().expect("host-seeded").get() as usize,
             toks[i],
             "live row {i} keeps its own token"
         );
@@ -841,12 +848,12 @@ fn a_padding_slot_has_no_request_of_its_own_and_runs_live_0s() {
     // launch position, so "took live 0's" is distinguishable from every wrong answer that has shipped.
     let toks = [101usize, 202, 303];
     let rows = live
-        .launch_rows(&toks, width)
+        .launch_rows(scratchy_subtile::sdsc_abstract::SeedSource::Host(&toks), width)
         .expect("a live batch lays into its rung");
     let pad = rows.row(3).expect("every bound slot runs something");
     let live0 = rows.row(0).expect("live 0");
     assert_eq!(
-        pad.token().get(),
+        pad.token().expect("host-seeded").get(),
         101,
         "the pad row's token is LIVE 0's, not the last live token"
     );
@@ -865,19 +872,74 @@ fn a_padding_slot_has_no_request_of_its_own_and_runs_live_0s() {
     // ⭐ THE DOOR REFUSES A PARTIAL OR MISPAIRED LAUNCH. One token per LIVE row, never per bound row: a
     // rung-width list is how a padding row came to be paired with some other slot's token.
     assert!(
-        live.launch_rows(&[101, 202, 303, 303], width).is_none(),
+        live.launch_rows(
+            scratchy_subtile::sdsc_abstract::SeedSource::Host(&[101, 202, 303, 303]),
+            width
+        )
+        .is_none(),
         "a rung-width token list cannot lay a live batch into its rung"
     );
     assert!(
-        live.launch_rows(&[101, 202], width).is_none(),
+        live.launch_rows(
+            scratchy_subtile::sdsc_abstract::SeedSource::Host(&[101, 202]),
+            width
+        )
+        .is_none(),
         "nor can a list shorter than the live rows"
     );
     // Nor can more requests be laid in than the rung binds.
     let narrow = RungWidth::of_baked_rows(2).expect("a 2-row rung");
     assert!(
-        live.launch_rows(&toks, narrow).is_none(),
+        live.launch_rows(
+            scratchy_subtile::sdsc_abstract::SeedSource::Host(&toks),
+            narrow
+        )
+        .is_none(),
         "3 live rows do not lay into a 2-row rung"
     );
+}
+
+/// ⭐⭐⭐ THE `OnCard` ARM — the seed law's stable-seating spelling. A launch widened with the
+/// card's own seeds carries NO token for any row (live or padding), so nothing downstream can
+/// stage a seed the host does not have; and the three aspects the host DOES own — the rotation,
+/// the new-block column and the prefix history — still resolve exactly as the `Host` arm lays
+/// them, pad rows mirroring live 0, because the racing KV write is unchanged by whose hand wrote
+/// the seed.
+#[test]
+fn an_on_card_launch_carries_no_token_and_keeps_the_row_laws() {
+    use scratchy_subtile::sdsc_abstract::{BatchRow, SeqPos, SlotMap};
+    let width = RungWidth::of_baked_rows(4).expect("a 4-row rung");
+    let hists: Vec<_> = (0..3).map(|i| KvHistory::contiguous(8 + i)).collect();
+    let live = SlotMap::of_live(3, width)
+        .expect("3 live rows fit")
+        .live_rows(|i| {
+            Ok::<_, ()>(BatchRow {
+                rope_pos: SeqPos::new(10 + i as u32),
+                hist: hists[i].clone(),
+            })
+        })
+        .expect("the builder never fails here");
+    let rows = live
+        .launch_rows(scratchy_subtile::sdsc_abstract::SeedSource::OnCard, width)
+        .expect("an OnCard batch lays into its rung");
+    for slot in 0..4 {
+        let r = rows.row(slot).expect("every bound slot runs something");
+        assert!(
+            r.token().is_none(),
+            "slot {slot}: an OnCard launch's token is the card's own seed, never a host fact"
+        );
+    }
+    let pad = rows.row(3).expect("the padding slot");
+    let live0 = rows.row(0).expect("live 0");
+    assert_eq!(pad.rope_pos(), live0.rope_pos(), "the pad still mirrors live 0's rotation");
+    assert_eq!(pad.new_block_col().index(), 0, "and live 0's new-block column");
+    assert_eq!(pad.hist(), live0.hist(), "and live 0's prefix history");
+    for i in 1..3 {
+        let r = rows.row(i).expect("a live slot");
+        assert_eq!(r.rope_pos(), SeqPos::new(10 + i as u32), "live row {i} keeps its own rotation");
+        assert_eq!(r.new_block_col().index(), i, "and its own column");
+        assert_eq!(r.hist(), &hists[i], "and its own history");
+    }
 }
 
 /// ⭐⭐⭐⭐⭐ THE BLOCKS THE MASK IS STAGED WITH AND THE PASSES THE FOLD WALKS ARE **ONE NUMBER**.
