@@ -304,8 +304,16 @@ These favour one side or the other and must travel with any published number.
   `engine_declined` with the engine's own message and that engine's cells
   skipped for the model — the page says "Declined before serving" instead of
   ‡'d cells that never ran. `--engines all` adds mlx-lm,
-  vllm-metal, ollama, llama.cpp and mistral.rs.
-- **Not every engine serves the same files.** oMLX, mlx-lm and vllm-metal load
+  vllm-metal, ollama, llama.cpp, mistral.rs and Splash.
+- **Splash runs on the Qwen models only, and only when asked.** It is not one
+  of a full run's defaults: `--engines all` times it, or naming it. Inco AI's
+  engine serves the Qwen family and nothing else in the matrix, so such a run
+  times it on those and leaves its column empty elsewhere. It runs as it ships: with the DFlash
+  draft model it pairs with each checkpoint (it has no switch to turn the
+  draft off), its INT8 KV and its own batching, the way a user gets it. Its
+  speed with one user is speculative decoding's, as scratchy's is with an
+  MTP head; TPOT, from the server's token count, covers both the same way.
+- **Not every engine serves the same files.** oMLX, mlx-lm, vllm-metal and Splash load
   the same mlx-community checkpoint as scratchy; ollama's `-mlx` tags are
   ollama's own MLX builds (`gemma4:26b-mlx` is NVFP4, not 4-bit affine); llama.cpp
   and mistral.rs run a Q4_K_M GGUF. The run records each engine's quantization

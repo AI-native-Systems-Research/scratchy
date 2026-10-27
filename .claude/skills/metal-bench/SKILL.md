@@ -1,6 +1,6 @@
 ---
 name: metal-bench
-description: Metal benchmark matrix runs on a Mac. Use to run scripts/bench_metal_matrix.sh against mlx-lm, ollama, llama.cpp, vllm-metal, oMLX and mistral.rs on this Mac (a full run, or a quick smoke run to check the setup), or to add a finished run's JSON to the site's Metal page (site/data/metal).
+description: Metal benchmark matrix runs on a Mac. Use to run scripts/bench_metal_matrix.sh against mlx-lm, ollama, llama.cpp, vllm-metal, oMLX, mistral.rs and Splash on this Mac (a full run, or a quick smoke run to check the setup), or to add a finished run's JSON to the site's Metal page (site/data/metal).
 ---
 
 # Metal benchmark run (one Mac → one JSON → the site)
@@ -92,7 +92,16 @@ command -v vllm || { brew tap vllm-project/vllm-metal https://github.com/vllm-pr
                      && brew install vllm-project/vllm-metal/vllm-metal; }
 command -v mistralrs || curl --proto '=https' --tlsv1.2 -sSf \
   https://raw.githubusercontent.com/EricLBuehler/mistral.rs/master/install.sh | MISTRALRS_INSTALL_TAG=<tag> sh
+command -v splash || brew install incoai/tap/splash   # for --engines all; needs an M3 or newer, macOS 26.4+
 ```
+
+Splash (Inco AI) is not one of a full run's defaults: it adds about an hour to
+each Mac's run. `--engines all` times it, as does naming it (`--engines
+omlx,omlx_tq,splash`). It serves the Qwen family only, so such a run times it
+on the Qwen models and prints `nothing to serve` for the others. It loads the same
+MLX checkpoint as scratchy and downloads the draft model it pairs with it
+into the Hugging Face cache on first use, so the first full run needs
+internet for that too.
 
 oMLX goes in from source, with its native kernels: a plain install (Homebrew
 included) skips them, and the Qwen3.5/3.6 family then falls back to much
@@ -131,8 +140,8 @@ sudo -k && sudo -n -l /usr/sbin/purge >/dev/null && echo "rule works"
 no frozen rung, so treat it like any partial run in step 5.
 
 **Done when:** `~/.venvs/mlx/bin/python -c 'import mlx_lm'` exits 0,
-`command -v` prints a path for `ollama`, `llama-server`, `vllm`, `omlx` and
-`mistralrs` (or the user has chosen to leave one out), oMLX's kernel status
+`command -v` prints a path for `ollama`, `llama-server`, `vllm`, `omlx`,
+`mistralrs` and `splash` (or the user has chosen to leave one out), oMLX's kernel status
 shows them available, and the check prints `rule works` without asking for a
 password, or the user has chosen to run without the frozen rung.
 
@@ -154,7 +163,7 @@ pmset -g batt | head -1
 sysctl -n hw.memsize | awk '{print $1/2^30 " GB"}'
 osascript -e 'quit app "Ollama"' 2>/dev/null   # the desktop app competes for memory
 sleep 2; pkill -f '/Applications/Ollama.app/'  # quitting the app leaves its `ollama serve` on :11434
-pgrep -fl 'bench_metal_matrix|scr bench|scr-|mlx_lm.(server|generate)|llama-server|vllm serve|omlx|mistralrs serve|caffeinate -dims'   # leftovers from an earlier run
+pgrep -fl 'bench_metal_matrix|scr bench|scr-|mlx_lm.(server|generate)|llama-server|vllm serve|omlx|mistralrs serve|splash serve|caffeinate -dims'   # leftovers from an earlier run
 lsof -nP -iTCP:8751 -sTCP:LISTEN               # the script's --port
 ```
 
@@ -213,7 +222,8 @@ echo "exit ${PIPESTATUS[0]}"
 ```
 
 With `--engines all`, pin the others too: `--pin mlx-lm=<v> --pin ollama=<v>
---pin llama.cpp=b<build> --pin vllm-metal=<v> --pin mistral.rs=<v>`. oMLX
+--pin llama.cpp=b<build> --pin vllm-metal=<v> --pin mistral.rs=<v> --pin
+Splash=<v>`. oMLX
 TurboQuant shares oMLX's pin.
 
 `--unpinned` runs without pins and records that in the JSON (`pinned:
@@ -255,11 +265,13 @@ act on each one as it appears:
 
 - the engine lines in the header, one per engine (`llama.cpp : <path>
   (<version>)`): a `skipped` line under one means it isn't installed or
-  isn't selected (by default only oMLX and oMLX TurboQuant run). If it's an
+  isn't selected (by default a full run times oMLX and oMLX TurboQuant). If it's an
   engine the user meant to run, stop the run and go back to step 1.
 - `skipped: needs N GB`: expected for glm-4.5-air on a Mac under 64 GB.
 - `--- mistral.rs: nothing to serve`: expected for every MoE model; it runs
   only the dense ones, since it runs out of memory on MoE GGUFs on Metal.
+- `--- Splash: nothing to serve`, in a run that selected Splash: expected for
+  every model but the Qwen ones; Splash serves only the Qwen family.
 - `N FAILED` on a cell, then `requests failed`, or `timed out after 600s`:
   that engine ran out of memory (or errored, or was too slow) at that size.
   The server is restarted and the next cell runs (`(server restarted)`); the
@@ -340,10 +352,10 @@ steps, and the `scr bench` and server it started keep running. Stop all of
 them:
 
 ```bash
-pkill -TERM -f 'bench_metal_matrix.sh|scr bench (startup|serve)|mlx_lm.(server|generate)|llama-server|vllm serve|omlx|mistralrs serve|caffeinate -dims'
+pkill -TERM -f 'bench_metal_matrix.sh|scr bench (startup|serve)|mlx_lm.(server|generate)|llama-server|vllm serve|omlx|mistralrs serve|splash serve|caffeinate -dims'
 pkill -TERM -f ' chat -m .* --device metal'    # the parity gate's scratchy side
 sleep 10
-pgrep -fl 'bench_metal_matrix|scr bench|scr-|mlx_lm.(server|generate)|llama-server|vllm serve|omlx|mistralrs serve|caffeinate -dims'
+pgrep -fl 'bench_metal_matrix|scr bench|scr-|mlx_lm.(server|generate)|llama-server|vllm serve|omlx|mistralrs serve|splash serve|caffeinate -dims'
 lsof -nP -iTCP:8751 -sTCP:LISTEN -t | xargs kill 2>/dev/null   # whatever server the run started
 ```
 

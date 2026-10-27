@@ -652,8 +652,9 @@ fn about() -> Element {
         rsx! {
             "Prompts are made up, a fixed size, and unique per request so no cache can answer them (warmups use \
              prompts of their own), with greedy decoding (temperature 0) on every engine. oMLX (as shipped, and \
-             with 4-bit TurboQuant KV), mlx-lm and vllm-metal run the same MLX checkpoint as scratchy; ollama, \
-             llama.cpp and mistral.rs run their own quantizations, named on their rows. Engine versions, and \
+             with 4-bit TurboQuant KV), mlx-lm, vllm-metal and Splash run the same MLX checkpoint as scratchy \
+             (Splash on the Qwen models only, with the draft model it ships); ollama, llama.cpp and mistral.rs run \
+             their own quantizations, named on their rows. Engine versions, and \
              whether a run was pinned, are in each machine's runs table. scratchy's build time is shown per model \
              and is never part of startup. The (i) buttons next to a column explain it."
         },
@@ -2376,7 +2377,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                          from before the grid had its own users counts measured it at the base count only. \
                                          Colour is how many times faster scratchy is than the engine named under the \
                                          grid: oMLX TurboQuant where the run has it, else the next of oMLX, mlx-lm, vllm-metal, ollama, \
-                                         llama.cpp, mistral.rs. Blue faster, red slower, the middle step within noise. \
+                                         llama.cpp, mistral.rs, Splash. Blue faster, red slower, the middle step within noise. \
                                          Hover a square for its ratio."
                                     }
                                     for (set, rows) in &sets {
@@ -3213,6 +3214,38 @@ mod tests {
         let run: Run = serde_json::from_value(capped).unwrap();
         let map = super::ShapeGrid::of(&run.models[0], &run, super::Slice::Answer(64)).unwrap();
         assert_eq!(map.across, vec![128, 1024, 4096]);
+    }
+
+    /// Splash serves the Qwen models only: its cells are read on the one model that has them, and
+    /// never make it the headline rival over oMLX.
+    #[test]
+    fn splash_cells_are_read_where_it_ran_and_omlx_stays_the_rival() {
+        use super::data::Run;
+        use super::numbers::Engine;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/data/metal/history/apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"
+        );
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let qwen = (v["models"].as_array().unwrap().iter())
+            .position(|m| m["stem"] == "qwen3.6-35b-a3b")
+            .unwrap();
+        let cells = v["models"][qwen]["scaling_omlx"].clone();
+        v["models"][qwen]["scaling_splash"] = cells;
+        let run: Run = serde_json::from_value(v).unwrap();
+        for m in &run.models {
+            assert_eq!(
+                Engine::Splash.ran(m),
+                m.stem == "qwen3.6-35b-a3b",
+                "{}",
+                m.stem
+            );
+        }
+        let m = &run.models[qwen];
+        assert!(!Engine::Splash.cells(m).is_empty());
+        assert_eq!(Engine::RIVALS.last().map(|e| e.key()), Some("splash"));
+        assert_eq!(Engine::Splash.key(), "splash");
     }
 
     /// Machines read up from the smallest: a 32 GB base M5 before the 36 GB M3 Pro, the 64 GB
