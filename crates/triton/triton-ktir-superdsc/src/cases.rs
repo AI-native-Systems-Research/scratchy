@@ -784,10 +784,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                     ("ui_ptr", "*i32"),
                     ("gi_ptr", "*i32"),
                 ],
-                &[
-                    ("PAD_V", Val::Int(1048576)),
-                    ("B", Val::Int(1)),
-                ],
+                &[("PAD_V", Val::Int(1048576)), ("B", Val::Int(1))],
             ),
             vec![1],
             Program::Sample,

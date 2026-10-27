@@ -232,7 +232,12 @@ impl SpyreWorker {
         requests: &mut HashMap<String, ReqState>,
         input_batch: &mut scratchy_serving_engine::input_batch::InputBatch,
     ) -> ExecutorResult<Vec<u32>> {
-        let InFlightDecode { cell, sub, rung, rows } = infl;
+        let InFlightDecode {
+            cell,
+            sub,
+            rung,
+            rows,
+        } = infl;
         // Only the submitting rung's session can finish the read — each rung owns its own
         // executor and stream, and the W=1 seat is the owner session itself.
         let SendnnSession::SuperDsc(sb) = &mut model.session;
@@ -582,8 +587,7 @@ impl Worker for SpyreWorker {
                     // the batch's. Cached steps never see sampling params again, so this is the one
                     // door. A request this path cannot serve honestly (a knob with no card leg) is
                     // refused here, naming the knob.
-                    draw: SampledDraw::of(&nr.req_id, nr.sampling_params.as_ref())
-                        .map_err(werr)?,
+                    draw: SampledDraw::of(&nr.req_id, nr.sampling_params.as_ref()).map_err(werr)?,
                     #[cfg(not(feature = "spyre-hw"))]
                     kv_k: vec![Vec::new(); nlayers],
                     #[cfg(not(feature = "spyre-hw"))]
@@ -960,31 +964,31 @@ impl Worker for SpyreWorker {
                     if let Ok(mut g) = seen.lock()
                         && g.insert((decode_ids.len(), seqs.count()))
                     {
-                            // The one place the two widths are COMPARED on purpose: reporting how
-                            // much of the rung is padding.
-                            if seqs.count() == decode_ids.len() {
-                                // ⛔ `debug!`, NOT `eprintln!`. This fires on EVERY DECODE STEP —
-                                // once per generated token, straight to stderr, where no
-                                // `RUST_LOG` can turn it off and it interleaves untimestamped with
-                                // the tracing output anyone is actually reading.
-                                tracing::debug!(
-                                    "[spyre-worker] decode batch: {} live on the {}-row rung (exact)",
-                                    decode_ids.len(),
-                                    seqs.count()
-                                );
-                            } else {
-                                tracing::debug!(
-                                    "[spyre-worker] decode batch: {} live but running the {}-row rung \
+                        // The one place the two widths are COMPARED on purpose: reporting how
+                        // much of the rung is padding.
+                        if seqs.count() == decode_ids.len() {
+                            // ⛔ `debug!`, NOT `eprintln!`. This fires on EVERY DECODE STEP —
+                            // once per generated token, straight to stderr, where no
+                            // `RUST_LOG` can turn it off and it interleaves untimestamped with
+                            // the tracing output anyone is actually reading.
+                            tracing::debug!(
+                                "[spyre-worker] decode batch: {} live on the {}-row rung (exact)",
+                                decode_ids.len(),
+                                seqs.count()
+                            );
+                        } else {
+                            tracing::debug!(
+                                "[spyre-worker] decode batch: {} live but running the {}-row rung \
                                      — {} padded row(s), {:.0}% of the work is padding. The exact rung is \
                                      missing; look for 'decode batch rung seqs={} ... SKIPPED' at startup.",
-                                    decode_ids.len(),
-                                    seqs.count(),
-                                    seqs.count() - decode_ids.len(),
-                                    100.0 * (seqs.count() - decode_ids.len()) as f64
-                                        / seqs.count() as f64,
-                                    decode_ids.len()
-                                );
-                            }
+                                decode_ids.len(),
+                                seqs.count(),
+                                seqs.count() - decode_ids.len(),
+                                100.0 * (seqs.count() - decode_ids.len()) as f64
+                                    / seqs.count() as f64,
+                                decode_ids.len()
+                            );
+                        }
                     }
                 }
                 // THE MASK'S PER-FOLD-PASS STRIDE. A pass reads one request's page, so the mask is
@@ -1476,12 +1480,7 @@ impl Worker for SpyreWorker {
                             part,
                         };
                         crate::spyre_forward::owner_chunk_index_table(
-                            pool,
-                            sess,
-                            step,
-                            req0,
-                            ctx0,
-                            launch_pos,
+                            pool, sess, step, req0, ctx0, launch_pos,
                         )?
                     } else if bake_gathers_kv && batch_chunk.is_none() {
                         let per_page = sess.gather_entries_per_page(pool).ok_or_else(|| {
@@ -1628,7 +1627,7 @@ impl Worker for SpyreWorker {
                         )
                     }
                     _ => kv_blocks,
-                };                // ⭐ THE PREFIX LAYOUT THE SELECTED BODY READS: the batch chunk's one row block, the
+                }; // ⭐ THE PREFIX LAYOUT THE SELECTED BODY READS: the batch chunk's one row block, the
                 // gathered fold's declared pass grid — or, on the OWNER seat, the one-request
                 // broadcast row every body of that session reads (the solo law; see
                 // [`BatchPrefix::OneRequest`]).
@@ -1645,49 +1644,48 @@ impl Worker for SpyreWorker {
                 // stick's raw D2H is enqueued and comes back through the SAME collect door
                 // whether this schedule defers it to the drain or collects it right here —
                 // no logits are ever read, and there is no synchronous second arm.
-                let sub = match run_prefill_batch(
-                    BatchLaunch {
-                        per_request: Some((&rows_in, prefix)),
-                        kv_blocks: kv_blocks.as_deref(),
-                    },
-                    &sh,
-                    sess,
-                    // A batched rung sweeps the whole pool, so it runs on the widest decode
-                    // bucket. (The sendnn path bakes exactly one, so this is that one.)
-                    model.decode.last().expect("at least one decode bucket"),
-                    RungShape {
-                        prefill_m: seqs,
-                        // ⭐ THE RUNG'S OWN ANSWER, riding with the rung's own `seqs` for the same reason:
-                        // the meta above is borrowed for tensor ids and describes neither.
-                        gathers: gathers_kv,
-                    },
-                    launch_pos,
-                    SamplerLaws {
-                        // ⭐⭐⭐ THE SEED LAW AT THE CALL: a churned seating seeds from the collected
-                        // picks (`toks`, one per live row, pads clamped by `launch_rows`); a stable
-                        // seating seeds from the card — `OnCard`, no bind, no drain, submit while the
-                        // previous step is still in flight.
-                        seeds: if churned {
-                            scratchy_subtile::sdsc_abstract::SeedSource::Host(&toks)
-                        } else {
-                            scratchy_subtile::sdsc_abstract::SeedSource::OnCard
+                let sub =
+                    match run_prefill_batch(
+                        BatchLaunch {
+                            per_request: Some((&rows_in, prefix)),
+                            kv_blocks: kv_blocks.as_deref(),
                         },
-                        want_logits: LogitsWanted::PerRequestDeferred,
-                        // ⭐ EACH LIVE ROW ITS OWN REQUEST'S DRAW, laid by the same
-                        // walk that laid the rows (the staging arm pairs them by
-                        // slot and gives every padding slot the greedy law).
-                        laws: SeatLaws::Batch { draws: &draws },
-                    },
-                )? {
-                    BatchOut::Deferred(sub) => sub,
-                    BatchOut::Done(_) => {
-                        return Err(werr(
+                        &sh,
+                        sess,
+                        // A batched rung sweeps the whole pool, so it runs on the widest decode
+                        // bucket. (The sendnn path bakes exactly one, so this is that one.)
+                        model.decode.last().expect("at least one decode bucket"),
+                        RungShape {
+                            prefill_m: seqs,
+                            // ⭐ THE RUNG'S OWN ANSWER, riding with the rung's own `seqs` for the same reason:
+                            // the meta above is borrowed for tensor ids and describes neither.
+                            gathers: gathers_kv,
+                        },
+                        launch_pos,
+                        SamplerLaws {
+                            // ⭐⭐⭐ THE SEED LAW AT THE CALL: a churned seating seeds from the collected
+                            // picks (`toks`, one per live row, pads clamped by `launch_rows`); a stable
+                            // seating seeds from the card — `OnCard`, no bind, no drain, submit while the
+                            // previous step is still in flight.
+                            seeds: if churned {
+                                scratchy_subtile::sdsc_abstract::SeedSource::Host(&toks)
+                            } else {
+                                scratchy_subtile::sdsc_abstract::SeedSource::OnCard
+                            },
+                            want_logits: LogitsWanted::PerRequestDeferred,
+                            // ⭐ EACH LIVE ROW ITS OWN REQUEST'S DRAW, laid by the same
+                            // walk that laid the rows (the staging arm pairs them by
+                            // slot and gives every padding slot the greedy law).
+                            laws: SeatLaws::Batch { draws: &draws },
+                        },
+                    )? {
+                        BatchOut::Deferred(sub) => sub,
+                        BatchOut::Done(_) => return Err(werr(
                             "decode batch: the rung finished in-call — the deferred arm is the \
                              only decode path"
                                 .to_string(),
-                        ))
-                    }
-                };
+                        )),
+                    };
                 // ⭐⭐⭐ #32 (c4b) — THE KV HISTORY IS RECORDED AT SUBMIT, NOT AT THE DRAIN. The
                 // next step's launch geometry — its own `write_slot` (`BatchSlot::of` over the
                 // requests' histories), its page growth, its prefix mask — is built BEFORE the
@@ -1730,9 +1728,7 @@ impl Worker for SpyreWorker {
                         .req_ids
                         .iter()
                         .all(|id| decode_ids.iter().any(|(d, _)| d == id));
-                let cell = std::sync::Arc::new(
-                    scratchy_serving_engine::executor::DrainCell::new(),
-                );
+                let cell = std::sync::Arc::new(scratchy_serving_engine::executor::DrainCell::new());
                 self.in_flight.push_back(InFlightDecode {
                     cell: cell.clone(),
                     sub,
@@ -1755,8 +1751,7 @@ impl Worker for SpyreWorker {
                     // THE SAME KV REPORT THE SYNC TAIL RUNS — positional facts, known at
                     // submit: the span the scheduler's next allocation must cover and the
                     // pool-wide reach, over every live request, not just the decoding ones.
-                    let prompt_of =
-                        |id: &String| SlotCount::new(input_batch.prompt_len(id) as u32);
+                    let prompt_of = |id: &String| SlotCount::new(input_batch.prompt_len(id) as u32);
                     let pool_reach = requests
                         .iter()
                         .map(|(id, r)| r.kv_reach(prompt_of(id)))
@@ -1771,10 +1766,7 @@ impl Worker for SpyreWorker {
                     return Ok(out);
                 }
                 // NOT DEFERRABLE — drain it right here, through the same pop the knock takes.
-                let infl = self
-                    .in_flight
-                    .pop_back()
-                    .expect("queued just above");
+                let infl = self.in_flight.pop_back().expect("queued just above");
                 let rows = Self::drain_one(infl, model, requests, input_batch)?;
                 // ── KCACHE PROBE (SCRATCHY_KCACHE_PROBE), BATCHED STEP ── the batched counterpart of the
                 // solo `[kcache]` probe: after the fold's forward (cache write included), read back the
@@ -1950,11 +1942,11 @@ impl Worker for SpyreWorker {
                 Some(model) => {
                     let _ = Self::drain_one(infl, model, &mut self.requests, &mut self.input_batch);
                 }
-                None => infl.cell.fill(Err(
-                    scratchy_serving_engine::error::EngineError::Executor(
+                None => infl
+                    .cell
+                    .fill(Err(scratchy_serving_engine::error::EngineError::Executor(
                         "shutdown: the model was dropped before this step landed".into(),
-                    ),
-                )),
+                    ))),
             }
         }
         self.is_shutdown = true;
@@ -1972,10 +1964,7 @@ impl Worker for SpyreWorker {
     /// deferred output's resolver asking — it runs on the engine thread while THIS thread owns
     /// the queue, which is why the answer is a cell and not a return value.
     #[cfg(feature = "spyre-hw")]
-    fn drain_until(
-        &mut self,
-        cell: &std::sync::Arc<scratchy_serving_engine::executor::DrainCell>,
-    ) {
+    fn drain_until(&mut self, cell: &std::sync::Arc<scratchy_serving_engine::executor::DrainCell>) {
         while !cell.is_filled() {
             let Some(infl) = self.in_flight.pop_front() else {
                 // A verdict computed over nothing must FAIL, never invent tokens.
@@ -1988,9 +1977,10 @@ impl Worker for SpyreWorker {
                 let e = scratchy_serving_engine::error::EngineError::Executor(
                     "drain: the model is not loaded".into(),
                 );
-                infl.cell.fill(Err(scratchy_serving_engine::error::EngineError::Executor(
-                    "drain: the model is not loaded".into(),
-                )));
+                infl.cell
+                    .fill(Err(scratchy_serving_engine::error::EngineError::Executor(
+                        "drain: the model is not loaded".into(),
+                    )));
                 cell.fill(Err(e));
                 return;
             };

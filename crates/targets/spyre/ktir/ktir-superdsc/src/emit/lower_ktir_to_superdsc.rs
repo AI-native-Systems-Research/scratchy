@@ -2070,7 +2070,15 @@ fn elementwise_broadcast(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
-    let BcastReq { name, what, op_func, ins, out, bcast, df } = req;
+    let BcastReq {
+        name,
+        what,
+        op_func,
+        ins,
+        out,
+        bcast,
+        df,
+    } = req;
     // THE OP FUNC IS THE CALLER'S OWN FACT, handed over rather than re-derived: the elementwise
     // door holds it from [`elementwise_op_func`] already, and the INTEGER door holds the same
     // class of fact from [`IntBinary::op_func`] — a descriptor name that feeds the bundle
@@ -2113,15 +2121,11 @@ fn elementwise_broadcast(
     });
     let split = match ymode {
         Some(y) => Some(
-            crate::sdsc_abstract::RegionFrame::stick_blocked(
-                rows as usize,
-                out.c_len as usize,
-                df,
-            )
-            .split_rows(y as usize, (rows / y) as usize)
-            .map_err(|e| Error {
-                message: format!("{what} {name}: output t{}: {e}", out.tid),
-            })?,
+            crate::sdsc_abstract::RegionFrame::stick_blocked(rows as usize, out.c_len as usize, df)
+                .split_rows(y as usize, (rows / y) as usize)
+                .map_err(|e| Error {
+                    message: format!("{what} {name}: output t{}: {e}", out.tid),
+                })?,
         ),
         None => None,
     };
@@ -6441,7 +6445,10 @@ pub fn embed_row_gather(
              lane index is [{}, {ustk}] SENUINT32: row r's {l_sticks} sticks then row r+1's, one \
              stick per op of the per-stick cut, every entry of every row named (the mint states \
              this count; a stale payload is refused here, never half-gathered on the card)",
-            l_idx.tid, l_idx.v_rows, l_idx.v_cols, width * l_sticks
+            l_idx.tid,
+            l_idx.v_rows,
+            l_idx.v_cols,
+            width * l_sticks
         ));
     }
     // ⭐ THE SCRATCH IDENTITIES, minted through the placement's own synth join — the same
@@ -6474,7 +6481,8 @@ pub fn embed_row_gather(
     // when it does not, leg 3 writes the `[W, hidden]` ChainRow synth AT THE SCATTER
     // LAW (its stick-blocked residency, `GatherDest::Scatter`) and a pointwise-identity
     // memcpy carries it into the out's RowBlocked placement.
-    let rows_coincide = crate::sdsc_abstract::row_major_is_stick_major(width as usize, hidden as usize);
+    let rows_coincide =
+        crate::sdsc_abstract::row_major_is_stick_major(width as usize, hidden as usize);
     let rowg_dest_name = if rows_coincide {
         out.name()
     } else {
@@ -6666,13 +6674,11 @@ pub fn embed_row_gather(
                             // (`first_entry·1 + 0 = first_entry`, the SAME descriptor the
                             // elision's own arm takes — but the elision already took r=0 out of
                             // this arm, so the W=1 emission never reaches it).
-                            crate::superdsc_opspec::DestEntry::of_entries(
-                                if rows_coincide {
-                                    r * row_entries + first_entry
-                                } else {
-                                    first_entry * width + r
-                                },
-                            ),
+                            crate::superdsc_opspec::DestEntry::of_entries(if rows_coincide {
+                                r * row_entries + first_entry
+                            } else {
+                                first_entry * width + r
+                            }),
                             slabt_request_base(r, stk, hidden),
                         ),
                         dest: if rows_coincide {
@@ -6903,7 +6909,10 @@ pub fn chain_stage(
              [{table_rows}, {}] SENUINT32, the payload's own stated extent PAIRED to the l \
              stick's own per-request [{l_n}, {ustk}] (one WHOLE l index per answerable pick — \
              the pair law, so the table's rows and the placement they fill cannot drift)",
-            l_tab.tid, l_tab.v_rows, l_tab.v_cols, l_n * ustk
+            l_tab.tid,
+            l_tab.v_rows,
+            l_tab.v_cols,
+            l_n * ustk
         ));
     }
     // WHOLE VIEWS, EVERY OPERAND: the gathers name buffers, not windows.
@@ -8523,8 +8532,7 @@ mod proofs {
         let ins = [reg(5, arow, acol, false), reg(6, brow, bcol, false)];
         // The sweep basis is the OUTPUT's own row count here (a whole-view output's
         // `pointwise_rows`), so the admission law the proof states is unchanged.
-        let admitted =
-            pointwise_extents_agree("p", "Elementwise(Add)", &ins, &out, orow).is_ok();
+        let admitted = pointwise_extents_agree("p", "Elementwise(Add)", &ins, &out, orow).is_ok();
         assert_eq!(
             admitted,
             (arow, acol) == (orow, ocol) && (brow, bcol) == (orow, ocol)
@@ -8544,8 +8552,7 @@ mod proofs {
         let out = reg(7, orow, ocol, true);
         let ins = [reg(5, arow, acol, false)];
         // Same sweep basis as the binary proof: the whole-view output's own row count.
-        let admitted =
-            pointwise_extents_agree("p", "Elementwise(Silu)", &ins, &out, orow).is_ok();
+        let admitted = pointwise_extents_agree("p", "Elementwise(Silu)", &ins, &out, orow).is_ok();
         assert_eq!(admitted, (arow, acol) == (orow, ocol));
     }
 }

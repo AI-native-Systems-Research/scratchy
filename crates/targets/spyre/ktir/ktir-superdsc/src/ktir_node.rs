@@ -314,7 +314,9 @@ pub enum Program {
     /// number that keeps the gather's per-core LX charge under the vendor budget. Stated
     /// by the lowering that builds this payload — the one derivation's spelling, called
     /// once off this op's own `hidden` — and read here by the door, never re-derived.
-    EmbedRowGather { k: u32 },
+    EmbedRowGather {
+        k: u32,
+    },
     /// The chained head's pick decompose (#603) — the pick, staged into the persistent s/l
     /// placements through TWO STAGED TABLES, as THREE one-entry u32 table gathers the door
     /// assembles (`gather_copy_opspec`, the same copy door): `s_tab[pick] → s_stick`,

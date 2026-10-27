@@ -728,10 +728,7 @@ pub fn program_silu_mul_chains(f: &IRFunction<'static>) -> Result<Vec<SiluMulCha
         // fusion's negf, and `silu_mul_chain_from` below is never entered for it.
         let Some(neg_v) = neg.result else { continue };
         let deep = f.ops_deep();
-        let mut readers = deep
-            .iter()
-            .copied()
-            .filter(|o| o.operands.contains(&neg_v));
+        let mut readers = deep.iter().copied().filter(|o| o.operands.contains(&neg_v));
         let head = readers.next();
         if readers.next().is_some() || head.is_none_or(|o| o.op_type != OpKind::MathExp) {
             continue;
@@ -1451,9 +1448,8 @@ fn is_plumbing(op: OpKind) -> bool {
 /// before — so for every kernel that bakes today this set's membership among their integer ops
 /// is empty and the walk below is byte-identical.
 fn integer_compute_of(f: &IRFunction<'static>) -> std::collections::HashSet<Ssa> {
-    let is_int_arith = |k: OpKind| {
-        matches!(k, OpKind::ArithMuli | OpKind::ArithAddi | OpKind::ArithSubi)
-    };
+    let is_int_arith =
+        |k: OpKind| matches!(k, OpKind::ArithMuli | OpKind::ArithAddi | OpKind::ArithSubi);
     // result → the ops naming it as an operand.
     let mut consumers: std::collections::HashMap<Ssa, Vec<&ktir_core::ir::Operation<'static>>> =
         std::collections::HashMap::new();
@@ -3118,7 +3114,9 @@ pub fn staggered_sources(
                         Ok(Some(r)) => r.c_len == 1,
                         // A value this function computed: its own result type's shape decides —
                         // `[·, 1]` or rank-1 `[rows]` is the per-row vector a reduce produces.
-                        _ => matches!(dims_of(v), Some(d) if d.len() == 1 || *d.last().unwrap_or(&0) == 1),
+                        _ => {
+                            matches!(dims_of(v), Some(d) if d.len() == 1 || *d.last().unwrap_or(&0) == 1)
+                        }
                     };
                     (v, per_row)
                 }
@@ -3126,10 +3124,7 @@ pub fn staggered_sources(
         };
         // `arr` is mutated inside the marking loop below, so this is a fn taking the map rather
         // than a closure borrowing it.
-        fn staggered(
-            arr: &std::collections::HashMap<Ssa, ElementArrangement>,
-            v: Ssa,
-        ) -> bool {
+        fn staggered(arr: &std::collections::HashMap<Ssa, ElementArrangement>, v: Ssa) -> bool {
             arr.get(&v) == Some(&ElementArrangement::Dl16ToFp32)
         }
         let out_arr = match program {
@@ -3137,10 +3132,10 @@ pub fn staggered_sources(
             // reduction's answer is a function of the multiset, so the stagger ends here.
             Lowering::Reduce(_) => ElementArrangement::Standard,
             // THE ONLY PLACE AN ARRANGEMENT IS DECIDED: the convert's own const-table row.
-            Lowering::Convert(kind) => crate::element_arrangement::output_arrangement_of(
-                kind.op_func(),
-            )
-            .unwrap_or(ElementArrangement::Standard),
+            Lowering::Convert(kind) => {
+                crate::element_arrangement::output_arrangement_of(kind.op_func())
+                    .unwrap_or(ElementArrangement::Standard)
+            }
             // POINTWISE — the stagger propagates through it, and every same-width operand that
             // is read lane-for-lane must agree with the output's arrangement.
             Lowering::Silu
@@ -3371,8 +3366,10 @@ pub fn lower_function(
         // Every other plumbing op — including every integer op of every kernel that bakes today,
         // whose consumers are all tiles and splats — keeps the skip verbatim.
         if is_plumbing(op.op_type)
-            && !(matches!(op.op_type, OpKind::ArithMuli | OpKind::ArithAddi | OpKind::ArithSubi)
-                && op.result.is_some_and(|r| int_compute.contains(&r)))
+            && !(matches!(
+                op.op_type,
+                OpKind::ArithMuli | OpKind::ArithAddi | OpKind::ArithSubi
+            ) && op.result.is_some_and(|r| int_compute.contains(&r)))
         {
             continue;
         }
@@ -5345,7 +5342,10 @@ mod broadcast_chain_tests {
             )
             .with_attr(a, AttrKey::TargetShape, Attr::IntList(&[1])),
         );
-        ops.push(sh(Operation::new(a, Some(emp), OpKind::TensorEmpty, &[]), res));
+        ops.push(sh(
+            Operation::new(a, Some(emp), OpKind::TensorEmpty, &[]),
+            res,
+        ));
         ops.push(
             sh(
                 Operation::new(a, Some(bc), OpKind::LinalgBroadcast, &[col, emp]),
@@ -5372,7 +5372,9 @@ mod broadcast_chain_tests {
             .err()
             .map(|e| e.message)
             .unwrap_or_else(|| {
-                panic!("expected a convert-chain refusal for load={load_shape:?} conv={conv_shape:?}")
+                panic!(
+                    "expected a convert-chain refusal for load={load_shape:?} conv={conv_shape:?}"
+                )
             })
     }
 
@@ -5952,10 +5954,16 @@ mod equal_mask_tests {
         let a: &'static Arena = Arena::global();
         let (x, y, i1, m) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
         let mut ops = vec![
-            Operation::new(a, Some(i1), OpKind::ArithCmpf, &[x, y])
-                .with_attr(a, AttrKey::Predicate, Attr::Str(pred)),
+            Operation::new(a, Some(i1), OpKind::ArithCmpf, &[x, y]).with_attr(
+                a,
+                AttrKey::Predicate,
+                Attr::Str(pred),
+            ),
             Operation {
-                result_type: Some(IrType::Tensor { dims: &[4, 256], elem }),
+                result_type: Some(IrType::Tensor {
+                    dims: &[4, 256],
+                    elem,
+                }),
                 ..Operation::new(a, Some(m), OpKind::ArithUitofp, &[i1])
             },
         ];

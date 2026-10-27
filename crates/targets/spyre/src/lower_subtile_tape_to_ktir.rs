@@ -19,8 +19,8 @@ use crate::lower_subtile_tape_to_superdsc::*;
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ktir_node::ActiveCap;
 use ktir_superdsc::sdsc_abstract::POOL_STICK;
-use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR, SubtileId, SubtileNode, TensorId};
 use scratchy_subtile::subtile_ir::chain_slab_entries;
+use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR, SubtileId, SubtileNode, TensorId};
 use scratchy_subtile::superdsc_opspec::{DataFormat, DeviceTileLayout};
 
 /// The stable name of a HOST-ROUTED (data-movement) SubOp, for the host-routed
@@ -1165,12 +1165,10 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         // BY NAME, so a node reaching it is a routing change, not a missing kernel.
         // `replaces` is metadata for the wiring's chain fact — the ktir
         // Program payload stays k-only (the stamp reads the SubOp fact).
-        SubOp::EmbedRowGather { hidden, .. } => {
-            match embed_row_gather_emitted(node, ir, *hidden) {
-                Ok(e) => Ops(vec![e]),
-                Err(reason) => Unhandled(reason),
-            }
-        }
+        SubOp::EmbedRowGather { hidden, .. } => match embed_row_gather_emitted(node, ir, *hidden) {
+            Ok(e) => Ops(vec![e]),
+            Err(reason) => Unhandled(reason),
+        },
         // The payload's three u32s copy out of the borrowed op (the match is on
         // `&node.op`, so the bindings are references) — the pair-at-construction
         // call states all three, dereferenced at the call.
@@ -1731,7 +1729,6 @@ pub(crate) fn tensor_shapes_of_ir<F: RopeForm>(
     Ok(shapes)
 }
 
-
 /// Lower `ir` for its WIRING alone — the same per-node arms a bake runs, read for the parameter
 /// pairings rather than for the programs.
 ///
@@ -2008,7 +2005,10 @@ pub struct RungFacts {
 /// two scans would stage two sticks and the worker could read either.
 pub fn load_consts_of_ir<F: RopeForm>(
     ir: &SubtileIR<F>,
-    staggered: &std::collections::BTreeMap<u32, ktir_superdsc::element_arrangement::ElementArrangement>,
+    staggered: &std::collections::BTreeMap<
+        u32,
+        ktir_superdsc::element_arrangement::ElementArrangement,
+    >,
 ) -> Result<Vec<(u32, crate::wiring::LoadConst)>, SuperDscError> {
     // ⭐ THE SAMPLER'S MINT — the twenty operand tables (built by the shared
     // `sample_staged_tables` derivation the kind names; the ten UNIFORM tables
@@ -2032,7 +2032,7 @@ pub fn load_consts_of_ir<F: RopeForm>(
                 "two Sample nodes in one graph — the mint appends exactly one to a rung; a second \
                  means two mints ran over one graph"
                     .to_string(),
-            ))
+            ));
         }
         (Some(node), None) => {
             let SubOp::Sample { vocab, rows } = node.op else {
@@ -2065,8 +2065,8 @@ pub fn load_consts_of_ir<F: RopeForm>(
                                 .get(&(tr.tensor.index() as u32))
                                 .copied()
                                 .unwrap_or(
-                                    ktir_superdsc::element_arrangement::ElementArrangement::Standard,
-                                ),
+                                ktir_superdsc::element_arrangement::ElementArrangement::Standard,
+                            ),
                         },
                     )
                 })
@@ -2089,15 +2089,10 @@ pub fn load_consts_of_ir<F: RopeForm>(
                 "two ChainStage nodes in one graph — the mint splices exactly one pair into a \
                  rung; a second means two mints ran over one graph"
                     .to_string(),
-            ))
+            ));
         }
         (Some(node), None) => {
-            let SubOp::ChainStage {
-                pad_vocab,
-                k,
-                ..
-            } = node.op
-            else {
+            let SubOp::ChainStage { pad_vocab, k, .. } = node.op else {
                 unreachable!("the filter matched a ChainStage")
             };
             assert_eq!(
@@ -2311,10 +2306,12 @@ pub fn sample_seat_of_ir<F: RopeForm>(
                 let word_tid = node.inputs[1 + k].tensor;
                 let word_shape = ir.tensors[word_tid.index()];
                 assert_eq!(
-                    word_shape.cols, 1,
+                    word_shape.cols,
+                    1,
                     "the seed word table t{} is {} wide, not the one word of its own \
                      `[rows, 1]` class — the mint and the seat disagree on the seed's shape",
-                    word_tid.index(), word_shape.cols
+                    word_tid.index(),
+                    word_shape.cols
                 );
                 *tid = word_tid.index() as u32;
             }
@@ -2322,8 +2319,7 @@ pub fn sample_seat_of_ir<F: RopeForm>(
             // table is a `[rows, 1]` SenUint32 tensor, and its row stride is
             // the footprint's own width. `u32` cast is lossless (the footprint
             // is 32 words at every admitted shape — a whole 32-element stick).
-            let seed_row_words =
-                (row_footprint_bytes(1, Df::SenUint32) / 4) as u32;
+            let seed_row_words = (row_footprint_bytes(1, Df::SenUint32) / 4) as u32;
             // ⭐⭐⭐ THE GATE'S OWN STRIDE — the β ruling (front-b-noise, auditor
             // 2026-10-27): the quadruple's fourth table (inputs[4]) crosses the
             // i32→f32 convert, so its reservation is the convert's own device

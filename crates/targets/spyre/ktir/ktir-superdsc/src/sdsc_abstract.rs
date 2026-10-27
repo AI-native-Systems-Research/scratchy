@@ -10112,7 +10112,11 @@ impl LiveBatch {
     /// `None` when the batch is empty (no live 0 to replicate), when host-known tokens do not match
     /// the live rows, when a token is not a `u32`, or when more requests are live than the rung is
     /// wide.
-    pub fn launch_rows<'a>(&'a self, seeds: SeedSource<'_>, width: RungWidth) -> Option<LaunchRows<'a>> {
+    pub fn launch_rows<'a>(
+        &'a self,
+        seeds: SeedSource<'_>,
+        width: RungWidth,
+    ) -> Option<LaunchRows<'a>> {
         let ids: Option<Vec<TokenId>> = match seeds {
             SeedSource::Host(toks) => {
                 if toks.len() != self.rows.len() || self.rows.len() > width.count() {

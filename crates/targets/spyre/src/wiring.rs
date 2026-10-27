@@ -23,7 +23,7 @@
 use crate::bundle_code as bundle;
 use crate::lower_subtile_tape_to_superdsc::{DeviceWidth, row_footprint_bytes};
 pub use ktir_superdsc::element_arrangement::{
-    ElementArrangement, dl16tofp32_stagger, DL16TOFP32_PERMUTATION,
+    DL16TOFP32_PERMUTATION, ElementArrangement, dl16tofp32_stagger,
 };
 use ktir_superdsc::superdsc_opspec::Df;
 use scratchy_tensors::GpuTensor;
@@ -1028,7 +1028,12 @@ pub enum LoadConst {
     /// at the mint beside it — the l-tab's LANE RAMP
     /// `64·(i mod (hidden/64)) + (t&63)` reads its entry count from it), so
     /// the staging is self-contained: the fill never re-derives either.
-    ChainStageTable { pad_vocab: u32, k: u32, hidden: u32, operand: u8 },
+    ChainStageTable {
+        pad_vocab: u32,
+        k: u32,
+        hidden: u32,
+        operand: u8,
+    },
 }
 
 impl LoadConst {
@@ -1070,7 +1075,12 @@ impl LoadConst {
             }
             // The fill reads the kind's own `hidden` — the ramp's entry
             // count, the mint's own statement — never re-derived here.
-            LoadConst::ChainStageTable { pad_vocab, k, hidden, operand } => {
+            LoadConst::ChainStageTable {
+                pad_vocab,
+                k,
+                hidden,
+                operand,
+            } => {
                 let (bytes, dt, shape) = chain_staged_tables(pad_vocab, k, hidden)
                     .into_iter()
                     .nth((operand - 1) as usize)
@@ -1140,12 +1150,18 @@ impl LoadConst {
             let bytes = match dt {
                 scratchy_tensors::DType::I32 | scratchy_tensors::DType::F32 => {
                     stage_col_stick_heads::<4>(rows as usize, stride, |r| {
-                        bytes[r * 4..r * 4 + 4].try_into().expect("a whole i32/f32 element")
+                        bytes[r * 4..r * 4 + 4]
+                            .try_into()
+                            .expect("a whole i32/f32 element")
                     })
                 }
-                scratchy_tensors::DType::F16 => stage_col_stick_heads::<2>(rows as usize, stride, |r| {
-                    bytes[r * 2..r * 2 + 2].try_into().expect("a whole f16 element")
-                }),
+                scratchy_tensors::DType::F16 => {
+                    stage_col_stick_heads::<2>(rows as usize, stride, |r| {
+                        bytes[r * 2..r * 2 + 2]
+                            .try_into()
+                            .expect("a whole f16 element")
+                    })
+                }
                 other => panic!(
                     "the sampler's uniform col table (operand {operand}) builds as {other:?} \
                      — no `[rows, 1]` card spelling is stated for that dtype"
@@ -1320,16 +1336,8 @@ pub fn chain_staged_tables(
         }
     }
     vec![
-        (
-            stab,
-            scratchy_tensors::DType::I32,
-            [rows, lanes],
-        ),
-        (
-            ltab,
-            scratchy_tensors::DType::I32,
-            [rows, l_words],
-        ),
+        (stab, scratchy_tensors::DType::I32, [rows, lanes]),
+        (ltab, scratchy_tensors::DType::I32, [rows, l_words]),
     ]
 }
 
@@ -1599,17 +1607,11 @@ pub fn sample_staged_tables(
     // every row's stick head, so the `Col` operand mode reads row r's word
     // exactly as it reads a seed word, at every band height (a `[1, 1]` table
     // at a multi-row rung would demand a scalar broadcast no door states).
-    let i32_col = |x: i32| -> Vec<u8> {
-        (0..rows as usize)
-            .flat_map(|_| x.to_le_bytes())
-            .collect()
-    };
+    let i32_col =
+        |x: i32| -> Vec<u8> { (0..rows as usize).flat_map(|_| x.to_le_bytes()).collect() };
     // A whole-row f32 splat's per-row form — the fold's constants, the same law.
-    let f32_col = |x: f32| -> Vec<u8> {
-        (0..rows as usize)
-            .flat_map(|_| x.to_le_bytes())
-            .collect()
-    };
+    let f32_col =
+        |x: f32| -> Vec<u8> { (0..rows as usize).flat_map(|_| x.to_le_bytes()).collect() };
     vec![
         // bramp: GROUP_BLOCKS - (b % GROUP_BLOCKS), periodic, pads 0.
         (
@@ -1637,9 +1639,7 @@ pub fn sample_staged_tables(
         ),
         // ones: [1, BLOCK] of 1.0.
         (
-            (0..block)
-                .flat_map(|_| 1.0f32.to_le_bytes())
-                .collect(),
+            (0..block).flat_map(|_| 1.0f32.to_le_bytes()).collect(),
             scratchy_tensors::DType::F32,
             [1, block],
         ),
@@ -1713,9 +1713,7 @@ pub fn sample_staged_tables(
         // every lane its own index, pads included (the hash runs per lane;
         // the pad lanes lose on the pad law, never on the noise).
         (
-            (0..pad_v)
-                .flat_map(|i| (i as f32).to_le_bytes())
-                .collect(),
+            (0..pad_v).flat_map(|i| (i as f32).to_le_bytes()).collect(),
             scratchy_tensors::DType::F32,
             [1, pad_v],
         ),

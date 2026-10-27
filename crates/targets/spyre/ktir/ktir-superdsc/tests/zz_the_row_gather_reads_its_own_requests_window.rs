@@ -37,7 +37,7 @@
 
 use ktir_core::arena::Arena;
 use ktir_core::ir::IRFunction;
-use ktir_superdsc::emit::lower_ktir_to_superdsc::{embed_row_gather, Region};
+use ktir_superdsc::emit::lower_ktir_to_superdsc::{Region, embed_row_gather};
 use ktir_superdsc::ktir_node::{BufferId, KtirNode, Program};
 use ktir_superdsc::place::PlaceId;
 use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
@@ -82,7 +82,12 @@ fn node() -> KtirNode {
             return_type: None,
         },
         program: Program::EmbedRowGather { k: K },
-        bindings: vec![BufferId::new(301), BufferId::new(302), BufferId::new(303), BufferId::new(304)],
+        bindings: vec![
+            BufferId::new(301),
+            BufferId::new(302),
+            BufferId::new(303),
+            BufferId::new(304),
+        ],
         mask: None,
         node_out_tid: None,
         minted: Default::default(),
@@ -94,18 +99,17 @@ fn node() -> KtirNode {
 fn layout() -> BundleLayout {
     let mut l = BundleLayout::default();
     for (i, (tid, bytes)) in [
-        (301u32, (W * 32 * 4) as u64), // s stick [W, 32] u32
-        (302, (W * 32 * 4) as u64),    // l stick [W·l_sticks, 32] u32
+        (301u32, (W * 32 * 4) as u64),      // s stick [W, 32] u32
+        (302, (W * 32 * 4) as u64),         // l stick [W·l_sticks, 32] u32
         (303, (HIDDEN * VOCAB * 2) as u64), // weight [hidden, vocab] fp16
-        (304, (W * HIDDEN * 2) as u64), // out [W, hidden] fp16
+        (304, (W * HIDDEN * 2) as u64),     // out [W, hidden] fp16
     ]
     .into_iter()
     .enumerate()
     {
-        l.ids.borrow_mut().insert(
-            ktir_superdsc::place::act_name(tid),
-            PlaceId::Act(tid),
-        );
+        l.ids
+            .borrow_mut()
+            .insert(ktir_superdsc::place::act_name(tid), PlaceId::Act(tid));
         l.placements.insert(
             tid,
             TensorPlacement {
@@ -176,7 +180,10 @@ fn core_starts(dsc: &serde_json::Value, i: usize) -> std::collections::BTreeMap<
         .and_then(|d| d.as_object())
         .expect("per-core starts")
     {
-        let a = v.as_str().and_then(|s| s.parse::<i64>().ok()).or(v.as_i64());
+        let a = v
+            .as_str()
+            .and_then(|s| s.parse::<i64>().ok())
+            .or(v.as_i64());
         if let Some(a) = a {
             out.insert(k.clone(), a);
         }
@@ -185,9 +192,7 @@ fn core_starts(dsc: &serde_json::Value, i: usize) -> std::collections::BTreeMap<
 }
 
 /// Every `(name, dsc)` the emitted ops carry.
-fn dscs_of(
-    ops: &[ktir_superdsc::emit::EmittedOp],
-) -> Vec<(String, serde_json::Value)> {
+fn dscs_of(ops: &[ktir_superdsc::emit::EmittedOp]) -> Vec<(String, serde_json::Value)> {
     let mut out = Vec::new();
     for op in ops {
         let j = serde_json::to_value(&op.op).expect("serializes");
@@ -203,10 +208,10 @@ fn dscs_of(
 #[test]
 fn the_row_gather_reads_its_own_requests_window() {
     let regions = [
-        region(301, W, 32, false),          // s stick
-        region(302, W, 32, false),          // l stick: [W·l_sticks, 32] at l_sticks = 1
-        region(303, HIDDEN, VOCAB, false),  // weight
-        region(304, W, HIDDEN, true),       // out
+        region(301, W, 32, false),         // s stick
+        region(302, W, 32, false),         // l stick: [W·l_sticks, 32] at l_sticks = 1
+        region(303, HIDDEN, VOCAB, false), // weight
+        region(304, W, HIDDEN, true),      // out
     ];
     let l = layout();
     let mut sym = 0i64;
@@ -266,7 +271,10 @@ fn the_row_gather_reads_its_own_requests_window() {
     );
     let xpose_out = |i: usize| -> i64 {
         let dsc = &xpose[i].1;
-        let tree = dsc.get("scheduleTree_").and_then(|t| t.as_array()).expect("a tree");
+        let tree = dsc
+            .get("scheduleTree_")
+            .and_then(|t| t.as_array())
+            .expect("a tree");
         let last = tree.last().expect("the output is the tree's last node");
         min_start(last).expect("the output node carries a start address")
     };
@@ -301,10 +309,10 @@ fn the_row_gather_reads_its_own_requests_window() {
 #[test]
 fn the_row_gather_writes_the_chain_row_scatter() {
     let regions = [
-        region(301, W, 32, false),          // s stick
-        region(302, W, 32, false),          // l stick: [W·l_sticks, 32] at l_sticks = 1
-        region(303, HIDDEN, VOCAB, false),  // weight
-        region(304, W, HIDDEN, true),       // out
+        region(301, W, 32, false),         // s stick
+        region(302, W, 32, false),         // l stick: [W·l_sticks, 32] at l_sticks = 1
+        region(303, HIDDEN, VOCAB, false), // weight
+        region(304, W, HIDDEN, true),      // out
     ];
     let l = layout();
     let mut sym = 0i64;
@@ -359,7 +367,11 @@ fn the_row_gather_writes_the_chain_row_scatter() {
             w[1] - w[0]
         );
     }
-    assert_eq!(d1[1] - d1[0], scatter_stride, "request 1 strides the scatter too");
+    assert_eq!(
+        d1[1] - d1[0],
+        scatter_stride,
+        "request 1 strides the scatter too"
+    );
 
     // ⛔ AND THE COLUMN CORNER: request 1's entries sit exactly `lanes` ELEMENTS
     // (128 bytes) past request 0's, per entry — `(first_entry·W + r)` against

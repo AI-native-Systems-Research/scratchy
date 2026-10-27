@@ -68,7 +68,6 @@ static PRIOR_READ: std::sync::Mutex<Option<scratchy_target_spyre::runtime::ReadP
 #[cfg(feature = "spyre-hw")]
 static OUTSTANDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-
 /// Bind the m=N batched-prefill activations + the mq>1 attention consts into `pf` and run ONE
 /// forward over prompt tokens `toks` at positions `[start..start+mq)`. This populates `pf`'s resident
 /// seg2 KV (mq slots, via the mq>1 cachewr) on-card. Mirrors the per-token decode binding but for mq
@@ -480,10 +479,9 @@ pub(crate) fn run_prefill_batch(
     // history is another request's keys, so `col < start` would be the defect), and a prompt
     // chunk reads the position law (its rows share one contiguous prefix).
     let solo_hist = match (&per_request, &histories) {
-        (
-            Some((_, scratchy_subtile::sdsc_abstract::BatchPrefix::OneRequest)),
-            Some(hs),
-        ) => hs.first(),
+        (Some((_, scratchy_subtile::sdsc_abstract::BatchPrefix::OneRequest)), Some(hs)) => {
+            hs.first()
+        }
         _ => None,
     };
     let broadcast_holds = |c: usize| match solo_hist {
@@ -520,12 +518,12 @@ pub(crate) fn run_prefill_batch(
         // the live rows occupy the first slots). Every body of that seat reads this form (see
         // [`BatchPrefix::OneRequest`]); the fold's blocks staged here were the W=1 text defect.
         (Some((_, scratchy_subtile::sdsc_abstract::BatchPrefix::OneRequest)), Some(_)) => {
-            pf.pmask_slots.map(|cap| {
-                scratchy_target_spyre::forward_tape::PrefixSource::Broadcast {
+            pf.pmask_slots.map(
+                |cap| scratchy_target_spyre::forward_tape::PrefixSource::Broadcast {
                     cap,
                     holds: broadcast_holds,
-                }
-            })
+                },
+            )
         }
         // ⛔ THE EXTENT IS THE BAKE'S RESERVE, NEVER THE SESSION'S `cap`. The ops sweep the
         // placement's whole width and an additive byte the host never wrote reads as ZERO = VALID,
@@ -696,9 +694,7 @@ pub(crate) fn run_prefill_batch(
             // A DECODE BATCH: live slot `s` runs its own request's draw at its
             // own rotary position (`rope_pos` IS that request's token count);
             // a padding slot runs LIVE 0'S LAW — [`pad_law_of`], the pad clamp.
-            (SeatLaws::Batch { draws }, Some(live)) => {
-                batch_seat_laws(draws, live, seat_rows)?
-            }
+            (SeatLaws::Batch { draws }, Some(live)) => batch_seat_laws(draws, live, seat_rows)?,
             (SeatLaws::Batch { .. }, None) => {
                 return Err(werr(
                     "run_prefill_batch: decode-batch seat laws for a launch with no \
@@ -817,9 +813,7 @@ pub(crate) fn run_prefill_batch(
             // ⭐ THE DEPTH ROW'S OWN COUNT: submissions outstanding at this submit,
             // process-wide, incremented here and decremented at the collect — the
             // same population the worker's in-flight queue holds, stated once.
-            let depth = OUTSTANDING
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                + 1;
+            let depth = OUTSTANDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             let t_defer = std::time::Instant::now();
             // ⭐ THE COPY IS THE PLACEMENT'S TRUTH on this path: a decode-batch
             // rung is the same tape baked at `mq` rows but addressed by
@@ -1108,8 +1102,7 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
             // sources the phase's chain names).
             let chain_skip = match self.shape.phase {
                 scratchy_target_spyre::forward_tape::ForwardPhase::Decode { chain } => {
-                    self.inputs.chain_seeds.is_none()
-                        && (t.0 == chain.s_src || t.0 == chain.l_src)
+                    self.inputs.chain_seeds.is_none() && (t.0 == chain.s_src || t.0 == chain.l_src)
                 }
                 scratchy_target_spyre::forward_tape::ForwardPhase::Prefill => false,
             };
@@ -1405,7 +1398,10 @@ fn batch_seat_laws<'a>(
                 Some(live0) => pad_law_of(live0),
                 // A launch with no live row at all: nothing replicates, and
                 // the greedy law stands.
-                None => RowLaw { draw: None, step: 0 },
+                None => RowLaw {
+                    draw: None,
+                    step: 0,
+                },
             }),
         }
     }
@@ -1426,9 +1422,7 @@ pub(crate) enum SeatLaws<'a> {
     /// and the CONSUMED pick is the last baked row's, so the pad row must carry
     /// the same draw the last real row would, or an unfilled rung would pick
     /// greedy for a sampled request).
-    Prompt {
-        draw: Option<&'a SampledDraw>,
-    },
+    Prompt { draw: Option<&'a SampledDraw> },
     /// A decode batch: one law per LIVE row, in slot order — that row's
     /// request's draw at that request's own position. A padding slot runs
     /// LIVE 0'S LAW ([`pad_law_of`], the pad clamp): its pick is never read,
@@ -1493,10 +1487,7 @@ fn sample_binds(
         laws.iter()
             .enumerate()
             .map(|(r, law)| match law.draw {
-                Some(d) => format!(
-                    "r{r}:seed={}@step{}:inv_t{}",
-                    d.seed, law.step, d.inv_t
-                ),
+                Some(d) => format!("r{r}:seed={}@step{}:inv_t{}", d.seed, law.step, d.inv_t),
                 None => format!("r{r}:greedy@step{}", law.step),
             })
             .collect::<Vec<_>>()
@@ -1633,12 +1624,9 @@ pub(crate) fn collect_decode_tokens(
     // count's other half — the submit incremented it, this decrements it, so the
     // depth row counts exactly the submissions still uncollected.
     let t_fence = std::time::Instant::now();
-    let bytes = session.finish_deferred_read_raw(&sub.read).map_err(|e| {
-        werr(format!(
-            "sampler idx readback (t{}): {e}",
-            sub.result_id
-        ))
-    })?;
+    let bytes = session
+        .finish_deferred_read_raw(&sub.read)
+        .map_err(|e| werr(format!("sampler idx readback (t{}): {e}", sub.result_id)))?;
     let t_pick = std::time::Instant::now();
     let toks = decode_idx_stick(&bytes, sub.rows as usize, sub.vocab);
     OUTSTANDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -1795,16 +1783,16 @@ fn log_seat_readback(
                 // one-word stream leaves rows past 0 reading ZERO).
                 let trows = trows.max(rows);
                 match le_words(session, tid, trows * 32) {
-                Ok(ws) => {
-                    let w0 = ws.first().copied().unwrap_or(-1);
-                    let r1 = if trows > 1 {
-                        format!("/r1=0x{:08X}", ws.get(32).copied().unwrap_or(-1))
-                    } else {
-                        String::new()
-                    };
-                    hash.push_str(&format!("{name}(t{tid})=0x{w0:08X}{r1} "));
-                }
-                Err(e) => hash.push_str(&format!("{name}: READ-FAIL({e}) ")),
+                    Ok(ws) => {
+                        let w0 = ws.first().copied().unwrap_or(-1);
+                        let r1 = if trows > 1 {
+                            format!("/r1=0x{:08X}", ws.get(32).copied().unwrap_or(-1))
+                        } else {
+                            String::new()
+                        };
+                        hash.push_str(&format!("{name}(t{tid})=0x{w0:08X}{r1} "));
+                    }
+                    Err(e) => hash.push_str(&format!("{name}: READ-FAIL({e}) ")),
                 }
             }
             None => hash.push_str(&format!("{name}: NOT-IN-CONSTS ")),
@@ -1841,7 +1829,10 @@ fn log_seat_readback(
                 let mut best = (0usize, f32::NEG_INFINITY);
                 for j in 0..vocab {
                     let e = scratchy_subtile::sdsc_abstract::dev_off_stk(
-                        &[rows, pad_v], 1, &[r, j], stk,
+                        &[rows, pad_v],
+                        1,
+                        &[r, j],
+                        stk,
                     );
                     let o = e * 2;
                     if let Some(v) = b.get(o..o + 2) {
@@ -1855,7 +1846,10 @@ fn log_seat_readback(
             }
         }
         Err(e) => {
-            tracing::debug!("SEAT_READBACK {ctx}: logits row t{} read failed: {e}", seat.row);
+            tracing::debug!(
+                "SEAT_READBACK {ctx}: logits row t{} read failed: {e}",
+                seat.row
+            );
         }
     }
     let per_row: Vec<String> = report
@@ -2229,8 +2223,7 @@ pub(crate) fn superdsc_forward_chunk(
                 // like a decode launch's. Every other chunk's suffix never runs
                 // (`LogitsWanted::None`) and reads nothing back.
                 let is_last_chunk = tok + chunk_len == tok_end;
-                let is_prompt_final_chunk =
-                    is_last_chunk && tok_end >= tokens.prompt_len(id);
+                let is_prompt_final_chunk = is_last_chunk && tok_end >= tokens.prompt_len(id);
                 let chunk_pick = run_prefill_batch(
                     // A prompt chunk: these rows are consecutive positions of one sequence, so they
                     // share both the causal triangle and one resident-prefix validity row. `None` IS
@@ -2248,14 +2241,15 @@ pub(crate) fn superdsc_forward_chunk(
                     RungShape {
                         // The LADDER entry's baked width — the rung this chunk actually runs on, of
                         // which `chunk_len` rows carry real tokens.
-                        prefill_m:
-                            scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(rung_m as u32)
-                                .ok_or_else(|| {
-                                    werr(
-                                        "superdsc batched prefill: the selected rung has zero rows"
-                                            .to_string(),
-                                    )
-                                })?,
+                        prefill_m: scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(
+                            rung_m as u32,
+                        )
+                        .ok_or_else(|| {
+                            werr(
+                                "superdsc batched prefill: the selected rung has zero rows"
+                                    .to_string(),
+                            )
+                        })?,
                         // ⛔ THE RUNNING BODY'S OWN ANSWER, not the bundle's: the prefix bundle's ladder
                         // mixes the per-page body (gathers nothing) with split-KV chunks (gather every
                         // page), and its `KV_BLOCK_INDEX` placement is the chunk ceiling's.
@@ -2287,8 +2281,9 @@ pub(crate) fn superdsc_forward_chunk(
                     BatchOut::Done(p) => p,
                     BatchOut::Deferred(_) => {
                         return Err(werr(
-                            "a prompt chunk deferred its read — only a decode batch can".to_string(),
-                        ))
+                            "a prompt chunk deferred its read — only a decode batch can"
+                                .to_string(),
+                        ));
                     }
                 };
                 // UNCONDITIONAL truth-signal per chunk: `chunk_len` prompt tokens went through ONE
@@ -2609,11 +2604,9 @@ pub(crate) fn forward_chunk(
                 // At `rows == 1` both pushes are the solo spelling
                 // byte-for-byte.
                 let lanes = scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK as usize;
-                let l_sticks =
-                    scratchy_subtile::subtile_ir::chain_l_sticks(chain.hidden) as usize;
+                let l_sticks = scratchy_subtile::subtile_ir::chain_l_sticks(chain.hidden) as usize;
                 let toks32: Vec<u32> = toks.iter().map(|&t| t as u32).collect();
-                let s_words =
-                    scratchy_subtile::subtile_ir::chain_s_seed(chain.k, &toks32, rows);
+                let s_words = scratchy_subtile::subtile_ir::chain_s_seed(chain.k, &toks32, rows);
                 let l_words =
                     scratchy_subtile::subtile_ir::chain_l_seed(&toks32, chain.hidden, rows);
                 dynamic.push((
@@ -2810,8 +2803,7 @@ pub(crate) fn run_request_step(
     // The host's block list for this request, read from `InputBatch` by the caller, and the pool's owner
     // split, in one context. Passed in rather than looked up here so there is one read of the store per
     // step.
-    #[cfg(feature = "spyre-hw")]
-    pages: PageMapCtx<'_>,
+    #[cfg(feature = "spyre-hw")] pages: PageMapCtx<'_>,
 ) -> ExecutorResult<Option<u32>> {
     if n == 0 {
         return Ok(None);
@@ -3014,10 +3006,7 @@ pub(crate) fn run_request_step(
         // sampler, read back as its idx stick. A `None` here means the final
         // chunk never asked for its draw — a wiring bug, never a silent skip.
         prompt_pick.ok_or_else(|| {
-            werr(
-                "the prompt-final chunk picked no token — its minted draw never ran"
-                    .to_string(),
-            )
+            werr("the prompt-final chunk picked no token — its minted draw never ran".to_string())
         })?
     } else {
         // THE PICK — on the card, through the decode bundle's sampler. No host
@@ -3046,7 +3035,7 @@ pub(crate) fn run_request_step(
                 return Err(werr(
                     "the pick step ran no decode launch — this build has no device sampler"
                         .to_string(),
-                ))
+                ));
             }
         }
     };
@@ -3083,9 +3072,7 @@ mod pad_clamp_tests {
     /// Two live rows in a 4-row rung — slots 2 and 3 are padding — with the
     /// live batch handed to `f` while the histories it borrows are alive.
     fn with_two_of_four<R>(f: impl FnOnce(&scratchy_subtile::sdsc_abstract::LiveBatch) -> R) -> R {
-        use scratchy_subtile::sdsc_abstract::{
-            BatchRow, KvHistory, RungWidth, SeqPos, SlotMap,
-        };
+        use scratchy_subtile::sdsc_abstract::{BatchRow, KvHistory, RungWidth, SeqPos, SlotMap};
         let width = RungWidth::of_baked_rows(4).expect("a 4-row rung");
         let hists: Vec<_> = (0..2).map(|i| KvHistory::contiguous(8 + i)).collect();
         let live = SlotMap::of_live(2, width)
@@ -3134,9 +3121,7 @@ mod pad_clamp_tests {
         // rows, EVERY row runs its own request's draw — no row is classed as
         // a pad (the non-pipelined tree seated a 4-request launch's fourth
         // row greedy; this pin refuses that class of defect here).
-        use scratchy_subtile::sdsc_abstract::{
-            BatchRow, KvHistory, RungWidth, SeqPos, SlotMap,
-        };
+        use scratchy_subtile::sdsc_abstract::{BatchRow, KvHistory, RungWidth, SeqPos, SlotMap};
         let width = RungWidth::of_baked_rows(4).expect("a 4-row rung");
         let hists: Vec<_> = (0..4).map(|i| KvHistory::contiguous(8 + i)).collect();
         let live = SlotMap::of_live(4, width)
@@ -3158,11 +3143,15 @@ mod pad_clamp_tests {
         let laws = batch_seat_laws(&draws, &live, 4).expect("the full laws lay");
         assert_eq!(laws.len(), 4);
         for s in 0..4 {
-            let law = laws[s]
-                .draw
-                .unwrap_or_else(|| panic!("row {s} of a FULL rung staged greedy — no row is a pad"));
+            let law = laws[s].draw.unwrap_or_else(|| {
+                panic!("row {s} of a FULL rung staged greedy — no row is a pad")
+            });
             assert_eq!(law.seed, 1000 + s as u64, "row {s} runs its OWN draw");
-            assert_eq!(laws[s].step, 10 + s as u32, "row {s} keeps its own step salt");
+            assert_eq!(
+                laws[s].step,
+                10 + s as u32,
+                "row {s} keeps its own step salt"
+            );
         }
     }
 
@@ -3170,8 +3159,8 @@ mod pad_clamp_tests {
     fn a_greedy_live_0_clamps_its_pads_to_greedy() {
         let seat = seat_of(4);
         let draws: [Option<&SampledDraw>; 2] = [None, None];
-        let laws = with_two_of_four(|live| batch_seat_laws(&draws, live, 4))
-            .expect("the greedy laws lay");
+        let laws =
+            with_two_of_four(|live| batch_seat_laws(&draws, live, 4)).expect("the greedy laws lay");
         // The law itself: pads 2 and 3 carry live 0's law — greedy, at live
         // 0's own step salt (the word the gate's 0 makes inert).
         assert!(laws[2].draw.is_none() && laws[3].draw.is_none());
@@ -3193,7 +3182,9 @@ mod pad_clamp_tests {
         let laws = with_two_of_four(|live| batch_seat_laws(&draws, live, 4))
             .expect("the sampled laws lay");
         for r in [2usize, 3] {
-            let pad = laws[r].draw.expect("the pad clamps live 0's draw, not greedy");
+            let pad = laws[r]
+                .draw
+                .expect("the pad clamps live 0's draw, not greedy");
             assert_eq!(pad.seed, draw.seed, "pad {r}: live 0's seed");
             assert_eq!(
                 pad.inv_t.to_bits(),
@@ -3218,9 +3209,9 @@ mod pad_clamp_tests {
     /// the mask.
     #[test]
     fn an_oncard_launch_names_its_sticks_and_a_host_launch_names_none() {
-        use scratchy_subtile::host_tape::{play, HostTape};
+        use scratchy_subtile::host_tape::{HostTape, play};
         use scratchy_target_spyre::forward_tape::{
-            tape_steps, operands, ForwardInputs, ForwardShape,
+            ForwardInputs, ForwardShape, operands, tape_steps,
         };
 
         let chain = scratchy_target_spyre::wiring::ChainWiring {
@@ -3279,13 +3270,9 @@ mod pad_clamp_tests {
                 card_owned_sticks: Vec::new(),
                 launched: false,
             };
-            play(&HostTape { steps: &ftape }, &mut launcher)
-                .expect("the decode tape plays");
+            play(&HostTape { steps: &ftape }, &mut launcher).expect("the decode tape plays");
             assert!(launcher.launched, "the tape must reach its device step");
-            (
-                launcher.card_owned_sticks,
-                launcher.acts_i32,
-            )
+            (launcher.card_owned_sticks, launcher.acts_i32)
         };
 
         // OnCard: the two ChainSeed steps stage nothing and the skip names EXACTLY the

@@ -800,7 +800,8 @@ pub(crate) fn mint_scatter_window(
         &rb_df(name, interleave, row_width, df),
         base_elems,
         1,
-        u32::try_from(span).map_err(|_| format!("{what}: the scatter span {span} overflows a 32-bit window"))?,
+        u32::try_from(span)
+            .map_err(|_| format!("{what}: the scatter span {span} overflows a 32-bit window"))?,
         layout,
     )
 }

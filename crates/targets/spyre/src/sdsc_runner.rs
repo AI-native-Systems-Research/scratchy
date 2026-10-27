@@ -202,7 +202,15 @@ impl SuperDscSession {
         borrowed: &[i64],
         spilled_tail: &[u32],
     ) -> Result<Self> {
-        Self::new_borrowing_with_consts(code, vocab, kv_dim, num_blocks, borrowed, &[], spilled_tail)
+        Self::new_borrowing_with_consts(
+            code,
+            vocab,
+            kv_dim,
+            num_blocks,
+            borrowed,
+            &[],
+            spilled_tail,
+        )
     }
 
     /// [`new_borrowing`](Self::new_borrowing) for a session that ALSO binds its own staged

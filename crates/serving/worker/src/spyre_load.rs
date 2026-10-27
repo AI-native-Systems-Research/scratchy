@@ -2532,9 +2532,7 @@ impl SpyreWorker {
                     let logits = rcode
                         .layout
                         .place_of_tid(logits_tid)
-                        .and_then(|p| {
-                            LogitsGeom::from_placement(p.size, rung_width, vocab)
-                        });
+                        .and_then(|p| LogitsGeom::from_placement(p.size, rung_width, vocab));
                     let logits = logits.unwrap_or_else(|| {
                         panic!(
                             "decode batch rung seqs={rn}: its baked logits placement (t{}) is \
@@ -2561,8 +2559,9 @@ impl SpyreWorker {
                         // chain's decompose tables are functions of the vocab
                         // alone (`chain_staged_tables`), never the rung's
                         // width, so they carry no `rows` to check.
-                        if let scratchy_target_spyre::wiring::LoadConst::SampleTable { rows, .. } =
-                            kind
+                        if let scratchy_target_spyre::wiring::LoadConst::SampleTable {
+                            rows, ..
+                        } = kind
                             && rows != rung_n.get()
                         {
                             panic!(
@@ -2686,19 +2685,18 @@ impl SpyreWorker {
                             ),
                         )
                     });
-                let owner_fold_rows =
-                    match code.fold_rows() {
-                        Ok(scratchy_target_spyre::bundle_code::FoldRows::PerRequest) => {
-                            scratchy_subtile::sdsc_abstract::FoldRowRegime::PerRequest
-                        }
-                        Ok(scratchy_target_spyre::bundle_code::FoldRows::WholeBatch) => {
-                            scratchy_subtile::sdsc_abstract::FoldRowRegime::WholeBatch
-                        }
-                        Err(e) => panic!(
-                            "decode owner (the W=1 rung): {e} — every bundle the bake shipped \
+                let owner_fold_rows = match code.fold_rows() {
+                    Ok(scratchy_target_spyre::bundle_code::FoldRows::PerRequest) => {
+                        scratchy_subtile::sdsc_abstract::FoldRowRegime::PerRequest
+                    }
+                    Ok(scratchy_target_spyre::bundle_code::FoldRows::WholeBatch) => {
+                        scratchy_subtile::sdsc_abstract::FoldRowRegime::WholeBatch
+                    }
+                    Err(e) => panic!(
+                        "decode owner (the W=1 rung): {e} — every bundle the bake shipped \
                              must load"
-                        ),
-                    };
+                    ),
+                };
                 let sb = SuperDscBundle {
                     // Every page starts free: no request holds one yet.
                     pool_pages: num_blocks,

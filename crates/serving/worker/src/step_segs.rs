@@ -181,7 +181,8 @@ impl Stats {
 
 fn stats() -> std::sync::MutexGuard<'static, Stats> {
     static S: Mutex<Stats> = Mutex::new(Stats::ZERO);
-    S.lock().expect("step_segs: the probe's own lock, never held across a panic")
+    S.lock()
+        .expect("step_segs: the probe's own lock, never held across a panic")
 }
 
 /// Flush one step's submit-half segments. Called once per pipelined step, after the
@@ -223,16 +224,28 @@ pub fn step_segment_table() -> Option<String> {
         t.steps
     );
     let rows = [
-        (
-            "bind",
-            "keyed causal bind + act diff + seed build",
-            &t.bind,
-        ),
+        ("bind", "keyed causal bind + act diff + seed build", &t.bind),
         ("submit", "submit_step (the doorbell + refill)", &t.submit),
-        ("defer", "stick D2H defer (the enqueue, ring slot)", &t.defer),
-        ("stage", "j+1 staging (pure host, overlaps step j)", &t.stage),
-        ("total", "whole submit body (residual = total - the four)", &t.total),
-        ("fence", "THE fence (collect half: wait + stick D2H)", &t.fence),
+        (
+            "defer",
+            "stick D2H defer (the enqueue, ring slot)",
+            &t.defer,
+        ),
+        (
+            "stage",
+            "j+1 staging (pure host, overlaps step j)",
+            &t.stage,
+        ),
+        (
+            "total",
+            "whole submit body (residual = total - the four)",
+            &t.total,
+        ),
+        (
+            "fence",
+            "THE fence (collect half: wait + stick D2H)",
+            &t.fence,
+        ),
         ("pick", "pick decode (stick word to token)", &t.pick),
     ];
     for (name, what, a) in rows {

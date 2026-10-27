@@ -542,7 +542,10 @@ fn padding_row_replicates_live_0(real: usize) {
         })
         .expect("the builder never fails here");
     let rows = live
-        .launch_rows(scratchy_subtile::sdsc_abstract::SeedSource::Host(&toks), width)
+        .launch_rows(
+            scratchy_subtile::sdsc_abstract::SeedSource::Host(&toks),
+            width,
+        )
         .expect("a live batch lays into its rung");
     assert_eq!(
         rows.live(),
@@ -570,10 +573,7 @@ fn padding_row_replicates_live_0(real: usize) {
         );
         assert_eq!(p.hist(), live0.hist(), "pad row {pad}: prefix history");
         // And live 0's own aspects are not degenerate — otherwise every equality above is vacuous.
-        assert_eq!(
-            live0.token().expect("host-seeded").get() as usize,
-            toks[0]
-        );
+        assert_eq!(live0.token().expect("host-seeded").get() as usize, toks[0]);
         assert_eq!(live0.new_block_col().index(), 0);
         assert!(
             !live0.hist().runs().is_empty(),
@@ -848,7 +848,10 @@ fn a_padding_slot_has_no_request_of_its_own_and_runs_live_0s() {
     // launch position, so "took live 0's" is distinguishable from every wrong answer that has shipped.
     let toks = [101usize, 202, 303];
     let rows = live
-        .launch_rows(scratchy_subtile::sdsc_abstract::SeedSource::Host(&toks), width)
+        .launch_rows(
+            scratchy_subtile::sdsc_abstract::SeedSource::Host(&toks),
+            width,
+        )
         .expect("a live batch lays into its rung");
     let pad = rows.row(3).expect("every bound slot runs something");
     let live0 = rows.row(0).expect("live 0");
@@ -931,12 +934,24 @@ fn an_on_card_launch_carries_no_token_and_keeps_the_row_laws() {
     }
     let pad = rows.row(3).expect("the padding slot");
     let live0 = rows.row(0).expect("live 0");
-    assert_eq!(pad.rope_pos(), live0.rope_pos(), "the pad still mirrors live 0's rotation");
-    assert_eq!(pad.new_block_col().index(), 0, "and live 0's new-block column");
+    assert_eq!(
+        pad.rope_pos(),
+        live0.rope_pos(),
+        "the pad still mirrors live 0's rotation"
+    );
+    assert_eq!(
+        pad.new_block_col().index(),
+        0,
+        "and live 0's new-block column"
+    );
     assert_eq!(pad.hist(), live0.hist(), "and live 0's prefix history");
     for i in 1..3 {
         let r = rows.row(i).expect("a live slot");
-        assert_eq!(r.rope_pos(), SeqPos::new(10 + i as u32), "live row {i} keeps its own rotation");
+        assert_eq!(
+            r.rope_pos(),
+            SeqPos::new(10 + i as u32),
+            "live row {i} keeps its own rotation"
+        );
         assert_eq!(r.new_block_col().index(), i, "and its own column");
         assert_eq!(r.hist(), &hists[i], "and its own history");
     }

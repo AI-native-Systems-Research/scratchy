@@ -32,7 +32,7 @@
 
 use ktir_core::arena::Arena;
 use ktir_core::ir::IRFunction;
-use ktir_superdsc::emit::lower_ktir_to_superdsc::{embed_row_gather, Region};
+use ktir_superdsc::emit::lower_ktir_to_superdsc::{Region, embed_row_gather};
 use ktir_superdsc::ktir_node::{BufferId, KtirNode, Program};
 use ktir_superdsc::place::PlaceId;
 use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
@@ -72,7 +72,12 @@ fn node() -> KtirNode {
             return_type: None,
         },
         program: Program::EmbedRowGather { k: K },
-        bindings: vec![BufferId::new(301), BufferId::new(302), BufferId::new(303), BufferId::new(304)],
+        bindings: vec![
+            BufferId::new(301),
+            BufferId::new(302),
+            BufferId::new(303),
+            BufferId::new(304),
+        ],
         mask: None,
         node_out_tid: None,
         minted: Default::default(),
@@ -84,18 +89,17 @@ fn node() -> KtirNode {
 fn layout(w: u32) -> BundleLayout {
     let mut l = BundleLayout::default();
     for (i, (tid, bytes)) in [
-        (301u32, (w * 32 * 4) as u64), // s stick [W, 32] u32
-        (302, (w * 32 * 4) as u64),    // l stick [W·l_sticks, 32] u32
+        (301u32, (w * 32 * 4) as u64),      // s stick [W, 32] u32
+        (302, (w * 32 * 4) as u64),         // l stick [W·l_sticks, 32] u32
         (303, (HIDDEN * VOCAB * 2) as u64), // weight [hidden, vocab] fp16
-        (304, (w * HIDDEN * 2) as u64), // out [W, hidden] fp16
+        (304, (w * HIDDEN * 2) as u64),     // out [W, hidden] fp16
     ]
     .into_iter()
     .enumerate()
     {
-        l.ids.borrow_mut().insert(
-            ktir_superdsc::place::act_name(tid),
-            PlaceId::Act(tid),
-        );
+        l.ids
+            .borrow_mut()
+            .insert(ktir_superdsc::place::act_name(tid), PlaceId::Act(tid));
         l.placements.insert(
             tid,
             TensorPlacement {
@@ -160,7 +164,10 @@ fn core_starts(dsc: &serde_json::Value, i: usize) -> std::collections::BTreeMap<
         .and_then(|d| d.as_object())
         .expect("per-core starts")
     {
-        let a = v.as_str().and_then(|s| s.parse::<i64>().ok()).or(v.as_i64());
+        let a = v
+            .as_str()
+            .and_then(|s| s.parse::<i64>().ok())
+            .or(v.as_i64());
         if let Some(a) = a {
             out.insert(k.clone(), a);
         }
@@ -172,10 +179,10 @@ fn core_starts(dsc: &serde_json::Value, i: usize) -> std::collections::BTreeMap<
 /// exactly the corners its input's flat walk names.
 fn the_out_is_minted_stick_blocked(w: u32) {
     let regions = [
-        region(301, w, 32, false),           // s stick
-        region(302, w, 32, false),           // l stick: [W·l_sticks, 32] at l_sticks = 1
-        region(303, HIDDEN, VOCAB, false),   // weight
-        region(304, w, HIDDEN, true),        // out
+        region(301, w, 32, false),         // s stick
+        region(302, w, 32, false),         // l stick: [W·l_sticks, 32] at l_sticks = 1
+        region(303, HIDDEN, VOCAB, false), // weight
+        region(304, w, HIDDEN, true),      // out
     ];
     let l = layout(w);
     let mut sym = 0i64;
@@ -222,7 +229,11 @@ fn the_out_is_minted_stick_blocked(w: u32) {
             .get("maxDimSizes_")
             .and_then(|v| v.as_array())
             .expect("maxDimSizes_");
-        assert_eq!(max_dims.len(), 2, "W = {w}: operand {operand}'s maxDimSizes_ is rank-2");
+        assert_eq!(
+            max_dims.len(),
+            2,
+            "W = {w}: operand {operand}'s maxDimSizes_ is rank-2"
+        );
         assert!(
             max_dims.iter().all(|x| x.as_i64() == Some(-1)),
             "W = {w}: operand {operand}'s maxDimSizes_ is -1 per dim — dxp reconstructs the stick-blocked walk"
@@ -244,7 +255,10 @@ fn the_out_is_minted_stick_blocked(w: u32) {
     );
     let inp = core_starts(&dsc, 0);
     let out = core_starts(&dsc, 1);
-    assert!(!inp.is_empty() && !out.is_empty(), "both operands carry starts");
+    assert!(
+        !inp.is_empty() && !out.is_empty(),
+        "both operands carry starts"
+    );
     let inp_min = *inp.values().min().unwrap();
     let out_min = *out.values().min().unwrap();
     for (core, &i0) in &inp {

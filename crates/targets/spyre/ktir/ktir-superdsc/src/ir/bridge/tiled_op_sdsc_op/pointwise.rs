@@ -175,8 +175,7 @@ pub fn gather_copy_opspec(
         // `MAX_CORES` (32) cores — so a core owning two entries is not a shape this arm can be
         // handed, and the bound below is the whole of the address law.
         crate::sdsc_abstract::GatherDest::Scatter {
-            rows: interleave,
-            ..
+            rows: interleave, ..
         } => {
             if page != 1 {
                 return Err(format!(
@@ -844,12 +843,9 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // row-split mode — the Y-MAJOR rank-3 operand (`["y", "mb", "out"]`, the caller passing the
     // scale in the same order via [`EwOperand::scale_ymajor`]). rank-2 drops the size-1 `y` dim +
     // its scale so `for_view_df` classifies it RowBlocked (stick-major), matching the matmul I/O.
-    let mk = |is_input: bool,
-              name: &str,
-              scale: [Scale; 3],
-              off: u32|
-     -> Result<AnyTensorArg, String> {
-        if stickmajor {
+    let mk =
+        |is_input: bool, name: &str, scale: [Scale; 3], off: u32| -> Result<AnyTensorArg, String> {
+            if stickmajor {
                 Ok(AnyTensorArg::R2(
                     TensorArg::<2>::new(
                         is_input,

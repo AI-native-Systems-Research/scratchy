@@ -1128,10 +1128,8 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
         // storage at rows = 1, a legal prefix view — and every operand the draw
         // binds (the per-row pair, the nine tables, the idx stick) is whole at
         // corner 0.
-        let states_neither_corner = matches!(
-            &node.op,
-            SubOp::TanhSoftCap { .. } | SubOp::Sample { .. }
-        );
+        let states_neither_corner =
+            matches!(&node.op, SubOp::TanhSoftCap { .. } | SubOp::Sample { .. });
         if states_neither_corner {
             let corner0 = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
                 tr.region.rows.start == 0 && tr.region.cols.start == 0
@@ -2474,12 +2472,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 "logits_ptr".to_string(),
                 ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
             );
-            for p in [
-                "slo_ptr",
-                "shi_ptr",
-                "stp_ptr",
-                "sgate_ptr",
-            ] {
+            for p in ["slo_ptr", "shi_ptr", "stp_ptr", "sgate_ptr"] {
                 signature.insert(
                     p.to_string(),
                     ArgSpec::parse("*i32").map_err(|e| e.to_string())?,
@@ -3175,12 +3168,7 @@ mod production_ktir_dump {
 
     /// The case table's `spec` shape: pointer parameters by stated dtype, then the
     /// constexprs — every constexpr is BOTH a signature entry and a binding.
-    fn spec(
-        file: &str,
-        kernel: &str,
-        ptrs: &[(&str, &str)],
-        ces: &[(&str, Val)],
-    ) -> KernelSpec {
+    fn spec(file: &str, kernel: &str, ptrs: &[(&str, &str)], ces: &[(&str, Val)]) -> KernelSpec {
         let mut signature = HashMap::new();
         for (k, v) in ptrs {
             signature.insert(
@@ -3251,7 +3239,11 @@ mod production_ktir_dump {
                 spec(
                     "rmsnorm.py",
                     entry,
-                    &[("desc_x", "*fp16"), ("desc_w", "*fp16"), ("desc_o", "*fp16")],
+                    &[
+                        ("desc_x", "*fp16"),
+                        ("desc_w", "*fp16"),
+                        ("desc_o", "*fp16"),
+                    ],
                     &ces,
                 ),
                 vec![1],
@@ -3265,7 +3257,11 @@ mod production_ktir_dump {
             spec(
                 "matmul.py",
                 "matmul_fwd",
-                &[("desc_a", "*fp16"), ("desc_w", "*fp16"), ("desc_o", "*fp16")],
+                &[
+                    ("desc_a", "*fp16"),
+                    ("desc_w", "*fp16"),
+                    ("desc_o", "*fp16"),
+                ],
                 &[
                     ("M", Val::Int(1)),
                     ("K", Val::Int(2048)),
@@ -3308,17 +3304,29 @@ mod production_ktir_dump {
         for (entry, ptrs, live) in [
             (
                 "add_fwd",
-                &[("desc_a", "*fp16"), ("desc_b", "*fp16"), ("desc_o", "*fp16")][..],
+                &[
+                    ("desc_a", "*fp16"),
+                    ("desc_b", "*fp16"),
+                    ("desc_o", "*fp16"),
+                ][..],
                 EW_BINARY_LIVE_TILES,
             ),
             (
                 "mul_fwd",
-                &[("desc_a", "*fp16"), ("desc_b", "*fp16"), ("desc_o", "*fp16")][..],
+                &[
+                    ("desc_a", "*fp16"),
+                    ("desc_b", "*fp16"),
+                    ("desc_o", "*fp16"),
+                ][..],
                 EW_BINARY_LIVE_TILES,
             ),
             (
                 "sub_fwd",
-                &[("desc_a", "*fp16"), ("desc_b", "*fp16"), ("desc_o", "*fp16")][..],
+                &[
+                    ("desc_a", "*fp16"),
+                    ("desc_b", "*fp16"),
+                    ("desc_o", "*fp16"),
+                ][..],
                 EW_BINARY_LIVE_TILES,
             ),
             (
@@ -3346,7 +3354,11 @@ mod production_ktir_dump {
             ew(
                 "silumul.py",
                 "silumul_fwd",
-                &[("desc_g", "*fp16"), ("desc_u", "*fp16"), ("desc_o", "*fp16")],
+                &[
+                    ("desc_g", "*fp16"),
+                    ("desc_u", "*fp16"),
+                    ("desc_o", "*fp16"),
+                ],
                 SILU_MUL_LIVE_TILES,
             ),
             vec![1],
@@ -3486,9 +3498,7 @@ mod production_ktir_dump {
                     ("HIDDEN", Val::Int(2048)),
                     (
                         "ROW",
-                        Val::Int(
-                            scratchy_subtile::sdsc_abstract::selector_lastrow_col(5) as i128,
-                        ),
+                        Val::Int(scratchy_subtile::sdsc_abstract::selector_lastrow_col(5) as i128),
                     ),
                     ("N_STICKS", Val::Int(32)),
                 ],
@@ -3502,7 +3512,11 @@ mod production_ktir_dump {
             ("windowedrmsnorm_unit_fwd", false, false),
         ] {
             let ptrs: &[(&str, &str)] = if gained {
-                &[("desc_x", "*fp16"), ("desc_gamma", "*fp16"), ("desc_o", "*fp16")]
+                &[
+                    ("desc_x", "*fp16"),
+                    ("desc_gamma", "*fp16"),
+                    ("desc_o", "*fp16"),
+                ]
             } else {
                 &[("desc_x", "*fp16"), ("desc_o", "*fp16")]
             };
@@ -3773,13 +3787,19 @@ mod production_ktir_dump {
                 None => serde_json::Value::Null,
             },
         );
-        obj.insert("arg_bindings".into(), serde_json::json!(format!("{:?}", op.arg_bindings)));
+        obj.insert(
+            "arg_bindings".into(),
+            serde_json::json!(format!("{:?}", op.arg_bindings)),
+        );
         obj.insert("time".into(), serde_json::json!(op.time));
         obj.insert(
             "affine_strides".into(),
             serde_json::json!(format!("{:?}", op.affine_strides)),
         );
-        obj.insert("slot_stride_bytes".into(), serde_json::json!(op.slot_stride_bytes));
+        obj.insert(
+            "slot_stride_bytes".into(),
+            serde_json::json!(op.slot_stride_bytes),
+        );
         obj.insert("slab_write".into(), serde_json::json!(op.slab_write));
         obj.insert(
             "slab_stride_bytes".into(),
@@ -3801,8 +3821,7 @@ mod production_ktir_dump {
         use ktir_superdsc::emit::whole_function::lower_function;
 
         let lk_name = node.func.name;
-        let regions =
-            lk::regions(node).map_err(|e| format!("{name}: regions: {e:?}"))?;
+        let regions = lk::regions(node).map_err(|e| format!("{name}: regions: {e:?}"))?;
         let layout = triton_ktir_superdsc::layout::for_regions(node, &regions)
             .map_err(|e| format!("{name}: layout: {e}"))?;
         let windowed = |ops: Result<Vec<ktir_superdsc::emit::EmittedOp>, lk::Error>| {
@@ -3820,32 +3839,38 @@ mod production_ktir_dump {
             | Program::ScalarMul
             | Program::Sample => windowed(lower_function(node, Some(&layout), &mut sym, None)),
             // The door's unwrapped whole-function kinds.
-            Program::Matmul | Program::LmLast => Ok(lower_function(
-                node,
-                Some(&layout),
-                &mut sym,
-                None,
-            )
-            .map_err(|e| format!("{name}: {e:?}"))?),
-            Program::RmsNormUnit => {
-                windowed(lk::rmsnorm_unit(lk_name, node, &regions, &mut sym, Some(&layout)))
+            Program::Matmul | Program::LmLast => {
+                Ok(lower_function(node, Some(&layout), &mut sym, None)
+                    .map_err(|e| format!("{name}: {e:?}"))?)
             }
-            Program::TanhSoftCap => {
-                windowed(lk::tanhsoftcap(lk_name, node, &regions, &mut sym, Some(&layout)))
-            }
-            Program::ScalarWeightMul => {
-                windowed(lk::scalarweightmul(lk_name, &regions, &mut sym, Some(&layout)))
-            }
-            Program::Reshape => Ok(lk::reshape(lk_name, &regions, &mut sym, Some(&layout))
-                .map_err(|e| format!("{name}: {e:?}"))?),
-            Program::WindowedRmsNorm { .. } => Ok(lk::windowed_rmsnorm(
+            Program::RmsNormUnit => windowed(lk::rmsnorm_unit(
                 lk_name,
                 node,
                 &regions,
                 &mut sym,
                 Some(&layout),
-            )
-            .map_err(|e| format!("{name}: {e:?}"))?),
+            )),
+            Program::TanhSoftCap => windowed(lk::tanhsoftcap(
+                lk_name,
+                node,
+                &regions,
+                &mut sym,
+                Some(&layout),
+            )),
+            Program::ScalarWeightMul => windowed(lk::scalarweightmul(
+                lk_name,
+                &regions,
+                &mut sym,
+                Some(&layout),
+            )),
+            Program::Reshape => Ok(lk::reshape(lk_name, &regions, &mut sym, Some(&layout))
+                .map_err(|e| format!("{name}: {e:?}"))?),
+            Program::WindowedRmsNorm { .. } => {
+                Ok(
+                    lk::windowed_rmsnorm(lk_name, node, &regions, &mut sym, Some(&layout))
+                        .map_err(|e| format!("{name}: {e:?}"))?,
+                )
+            }
             // `program_of` states none of these and `sdsc_skip_of` names the ones that
             // reach this far — a geometry-door or MoE name here means the two tables
             // disagree, which is a defect in the driver, not a skip.
@@ -3884,7 +3909,11 @@ mod production_ktir_dump {
             let path = dir.join(format!("{name}.ktir"));
             std::fs::write(&path, &text)
                 .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
-            eprintln!("dumped {name} -> {} ({} lines)", path.display(), text.lines().count());
+            eprintln!(
+                "dumped {name} -> {} ({} lines)",
+                path.display(),
+                text.lines().count()
+            );
 
             // THE SDSC LEG — the emitted-descriptor half of the same proof: the grid-[B]
             // fix changes `Region`/`windowed_region`/the mint, so the byte-identity bar

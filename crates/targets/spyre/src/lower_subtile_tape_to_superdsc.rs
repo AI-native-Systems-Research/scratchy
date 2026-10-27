@@ -3242,9 +3242,7 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
             // own order — request-owned, identical in every row.
             const GREEDY_QUAD: [f32; 4] = [0.0, 0.0, 7.0, 0.0];
             for (k, &tid) in seat.seed_words.iter().enumerate() {
-                let word: Vec<f32> = (0..seat.rows)
-                    .map(|_| GREEDY_QUAD[k])
-                    .collect();
+                let word: Vec<f32> = (0..seat.rows).map(|_| GREEDY_QUAD[k]).collect();
                 seat_vals.insert(tid, word);
             }
             seat_vals.insert(seat.invt, vec![1.0; seat.rows as usize]);
@@ -8543,9 +8541,9 @@ mod tests {
         let wiring_tids: Vec<u32> =
             crate::lower_subtile_tape_to_ktir::load_consts_of_ir(&minted, &Default::default())
                 .expect("the minted graph's load-const list derives")
-            .into_iter()
-            .map(|(tid, _)| tid)
-            .collect();
+                .into_iter()
+                .map(|(tid, _)| tid)
+                .collect();
         assert_eq!(
             l_minted.resident_source_tids, wiring_tids,
             "the layout's resident stamp and the wiring's load-const list are one derivation"
@@ -8565,7 +8563,9 @@ mod tests {
     #[test]
     fn the_minted_inv_t_reserves_its_true_bytes_unpadded() {
         use scratchy_subtile::lower::{GemmWeight, InputRef, OpDesc};
-        use scratchy_subtile::subtile_ir::{SampleRows, SourceShape, SubOp, lower_region, mint_sample};
+        use scratchy_subtile::subtile_ir::{
+            SampleRows, SourceShape, SubOp, lower_region, mint_sample,
+        };
 
         // Four request rows over the K=1, vocab-5 lm-head shape the mint admits, so the
         // per-row stride is pinned by DIVISION at a batched row count, not by one row's total.
@@ -8624,9 +8624,15 @@ mod tests {
         for k in 0..4u32 {
             let word = layout.placements[&(plain.num_sources + k)];
             let want = if k == 3 {
-                (4 * 256, "the gate table reserves the convert's 64-element device sweep — two u32 sticks per row")
+                (
+                    4 * 256,
+                    "the gate table reserves the convert's 64-element device sweep — two u32 sticks per row",
+                )
             } else {
-                (4 * 128, "seed word table {k} reserves one 128 B u32 stick per row — invt's own class")
+                (
+                    4 * 128,
+                    "seed word table {k} reserves one 128 B u32 stick per row — invt's own class",
+                )
             };
             assert_eq!(word.size, want.0, "{}", want.1);
             if k == 3 {

@@ -48,6 +48,10 @@
 /// (`softmax(q·kᵀ·scale+mask)·v`) over the real device addresses — a translation bug is a
 /// `cargo build` panic, locking the math at compile time instead of discovering it on-card.
 pub mod addr;
+/// ⭐ THE `dl16tofp32` LANE STAGGER as TARGET-ABI CONST TABLES — `ElementArrangement`, the
+/// 64-entry permutation, the opcode→arrangement table the bake-side propagation takes as input,
+/// and the one staging derivation every stager calls. See the module header for the measurement.
+pub mod element_arrangement;
 /// ⭐⭐⭐ THE LOWERING ITSELF — the SuperDSC emitter (`emit_sdsc`, the `assemble_*` family, `pw1`/`pw2`)
 /// and `ibm/main`'s eight `lower_*_node` bodies re-driven by the KTIR. This is what the whole
 /// extraction was for: any KTIR producer can reach the proven lowering, bringing nothing but its
@@ -58,10 +62,6 @@ pub mod addr;
 /// and `ir::bridge::tiled_op_sdsc_op::attn` — which its doc always said could not — now really
 /// cannot.
 pub mod emit;
-/// ⭐ THE `dl16tofp32` LANE STAGGER as TARGET-ABI CONST TABLES — `ElementArrangement`, the
-/// 64-entry permutation, the opcode→arrangement table the bake-side propagation takes as input,
-/// and the one staging derivation every stager calls. See the module header for the measurement.
-pub mod element_arrangement;
 /// THE TileIR PIPELINE — the assemblers' INPUT type (`TileOp`/`TileOpKind`/`TiledOp`) and the tiler
 /// between them, plus the span-overflow refusal. Came in as an audit correction: the extraction filed
 /// the lowering's input as `KtirNode`, but every assembler under it takes a `&TileOp`.

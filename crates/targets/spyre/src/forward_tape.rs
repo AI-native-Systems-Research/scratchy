@@ -615,9 +615,7 @@ pub struct ForwardShape {
 pub enum ForwardPhase {
     /// DECODE — the chained head's own device gather: the host's one
     /// contribution is the sticks' seed, and the chain names the sticks.
-    Decode {
-        chain: crate::wiring::ChainWiring,
-    },
+    Decode { chain: crate::wiring::ChainWiring },
     /// PREFILL — the host's own embed-row gather; there is no chain to carry.
     Prefill,
 }
@@ -1149,9 +1147,9 @@ mod tests {
             }
             Staged::F16(_) => panic!("a broadcast row is f32; the bind loop narrows it"),
             Staged::I32(_) => panic!("a broadcast row is a MASK, not an index tensor"),
-            Staged::U32(_) => panic!(
-                "a broadcast row is f32 — the u32 lanes are the chain seeds' own variant"
-            ),
+            Staged::U32(_) => {
+                panic!("a broadcast row is f32 — the u32 lanes are the chain seeds' own variant")
+            }
         }
         let _ = sa::POOL_STICK; // the Blocks variant's shape params come from here
     }

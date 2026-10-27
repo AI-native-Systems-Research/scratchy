@@ -9404,12 +9404,8 @@ fn emit_superdsc_wiring(
                     ));
                 }
             }
-            let seat_all: std::collections::HashSet<u32> = seat
-                .seed_words
-                .iter()
-                .copied()
-                .chain([seat.invt])
-                .collect();
+            let seat_all: std::collections::HashSet<u32> =
+                seat.seed_words.iter().copied().chain([seat.invt]).collect();
             if seat_all.len() != 1 + seat.seed_words.len() {
                 fail.push(
                     "the sample seat names one tid twice — the mint mints one source per seat \
@@ -9830,11 +9826,7 @@ fn emit_superdsc_wiring(
     // THIS step.
     let sample_seat_tok = match &gk.sample_seat {
         Some(seat) => {
-            let seed_words = seat
-                .seed_words
-                .iter()
-                .map(|&t| u32l(t))
-                .collect::<Vec<_>>();
+            let seed_words = seat.seed_words.iter().map(|&t| u32l(t)).collect::<Vec<_>>();
             let invt = u32l(seat.invt);
             let rows = u32l(seat.rows);
             let row = u32l(seat.row);
@@ -12985,7 +12977,12 @@ fn dump_wavefront_mega(
                         }
                     }
                     BakeEffect::PrefillFp(fp) => *superdsc_prefill_fp.borrow_mut() = Some(fp),
-                    BakeEffect::DecodeRung { rows, cap, fp, consts } => {
+                    BakeEffect::DecodeRung {
+                        rows,
+                        cap,
+                        fp,
+                        consts,
+                    } => {
                         let mut r = superdsc_decode_rungs.borrow_mut();
                         if !r.iter().any(|(n, _, _, _)| *n == rows) {
                             r.push((rows, cap, fp, consts));
@@ -13491,9 +13488,9 @@ fn dump_wavefront_mega(
                     commit_bake(&lwd_p, fx);
                     prefill = Some(r);
                 }
-                Err((pl, e)) => panic!(
-                    "[spyre-superdsc] {stem}: prefill ladder rung m={pl} NOT LOWERED — {e}"
-                ),
+                Err((pl, e)) => {
+                    panic!("[spyre-superdsc] {stem}: prefill ladder rung m={pl} NOT LOWERED — {e}")
+                }
             }
         }
         // ⛔⛔⛔ AND THE LADDER THAT LOWERED MUST REACH THE POOL'S WINDOW, for a model that admits it — on

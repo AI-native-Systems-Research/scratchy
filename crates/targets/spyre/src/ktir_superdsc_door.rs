@@ -196,9 +196,7 @@ pub fn lower(
         // and [`ktir_superdsc::ktir_node::Program::EmbedRowGather`] for the laws (the
         // weight read in place, the one-entry index law, the sentinel living with the
         // producer).
-        Program::EmbedRowGather { .. } => {
-            lk::embed_row_gather(name, k, &r, sym_id_base, layout)
-        }
+        Program::EmbedRowGather { .. } => lk::embed_row_gather(name, k, &r, sym_id_base, layout),
         // ⭐ THE CHAINED HEAD'S PICK DECOMPOSE — three one-entry u32 table gathers the
         // same copy door assembles (`lk::chain_stage`): the pick's word 0 indexes the
         // two staged decompose tables, landing the persistent s/l sticks and the fresh

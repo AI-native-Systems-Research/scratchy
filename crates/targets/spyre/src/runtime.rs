@@ -476,9 +476,7 @@ impl ReadSignal {
             if *guard {
                 return true;
             }
-            let (guard_next, _timeout) = cv
-                .wait_timeout(guard, READ_SIGNAL_DEAD_TICK)
-                .unwrap();
+            let (guard_next, _timeout) = cv.wait_timeout(guard, READ_SIGNAL_DEAD_TICK).unwrap();
             guard = guard_next;
             if *guard {
                 return true;

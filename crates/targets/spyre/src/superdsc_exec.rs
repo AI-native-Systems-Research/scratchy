@@ -4874,7 +4874,10 @@ impl Executor {
                         .ok_or_else(|| anyhow!("seg{i} window {a}..{b} unaddressable"))?;
                     last_h2d = Some(
                         stream
-                            .h2d_on_compute_signaled(&self.seg_host[i][a as usize..b as usize], &win)
+                            .h2d_on_compute_signaled(
+                                &self.seg_host[i][a as usize..b as usize],
+                                &win,
+                            )
                             .map_err(|e| anyhow!("preamble H2D seg{i} window: {e}"))?,
                     );
                 }
@@ -5604,10 +5607,7 @@ impl Executor {
             }
             (&mut s[..need], Some(slot))
         } else {
-            (
-                &mut self.seg_host[seg.get()][a as usize..b as usize],
-                None,
-            )
+            (&mut self.seg_host[seg.get()][a as usize..b as usize], None)
         };
         let done = self
             .stream

@@ -450,10 +450,7 @@ impl CoreContext {
             charges.push((bytes, format!("{names}{shape} x{rc}")));
         }
         charges.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        let mut out = format!(
-            "live LX charges on core {} (bytes desc):\n",
-            self.core_id
-        );
+        let mut out = format!("live LX charges on core {} (bytes desc):\n", self.core_id);
         for (bytes, name) in &charges {
             out.push_str(&format!("  {name} bytes={bytes}\n"));
         }

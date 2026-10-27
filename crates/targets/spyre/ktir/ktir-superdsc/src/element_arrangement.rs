@@ -74,9 +74,8 @@ const fn dl16tofp32_permutation() -> [u8; 64] {
 /// program that would need its staging rather than guessing a table for it. The row exists so
 /// the ABI fact is stated where the ABI facts live; the day a card probe measures it, the
 /// refusal is replaced by the measured table and nothing else moves.
-pub const OP_OUTPUT_ARRANGEMENT: &[(&str, ElementArrangement)] = &[
-    ("dl16tofp32", ElementArrangement::Dl16ToFp32),
-];
+pub const OP_OUTPUT_ARRANGEMENT: &[(&str, ElementArrangement)] =
+    &[("dl16tofp32", ElementArrangement::Dl16ToFp32)];
 
 /// The arrangement an op-func's output carries, or `None` when the op-func is not in the table
 /// (an op not in the table addresses its operands and output standard — the default every

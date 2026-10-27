@@ -262,12 +262,7 @@ pub struct SengraphBundleGroup {
     /// at its stick head, so a rows=1 kind's bytes leave every row past 0
     /// reading ZERO on a wider rung (Finding 1, 2026-10-27). The worker
     /// refuses at load if a rung's kind rows ≠ the rung's rows.
-    pub decode_rungs: &'static [(
-        RungSeqs,
-        SweptCols,
-        BundleSentinel,
-        RungLoadConsts,
-    )],
+    pub decode_rungs: &'static [(RungSeqs, SweptCols, BundleSentinel, RungLoadConsts)],
     /// PREFIX-CAPABLE PREFILL LADDER `[(mq, sentinel)]`, ascending — the bundles baked with a full
     /// resident-prefix sweep, for chunks with `start > 0`. EMPTY ⇒ none baked.
     ///

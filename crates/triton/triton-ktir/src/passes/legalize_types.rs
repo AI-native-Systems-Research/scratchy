@@ -558,24 +558,89 @@ fn red_stop_on_genuine_f32(module: &Module, protected: &HashSet<Ssa>) -> Result<
 /// element type.
 const FP32_CARD_BINDS: &[(&str, DType, DType, &str)] = &[
     // broadcast_ops.ddl — the two-tensor pointwise family, instantiated fp32.
-    ("arith.addf", DType::F32, DType::F32, "broadcast_ops.ddl:25 add [%type_fp16, %type_fp32]"),
-    ("arith.subf", DType::F32, DType::F32, "broadcast_ops.ddl:26 sub [%type_fp16, %type_fp32]"),
-    ("arith.mulf", DType::F32, DType::F32, "broadcast_ops.ddl:27 mul [%type_fp16, %type_fp32]"),
-    ("arith.divf", DType::F32, DType::F32, "broadcast_ops.ddl:44 realdiv [%type_fp16, %type_fp32]"),
-    ("arith.maxnumf", DType::F32, DType::F32, "broadcast_ops.ddl:45 maximum [%type_fp16, %type_fp32]"),
-    ("arith.minnumf", DType::F32, DType::F32, "broadcast_ops.ddl:46 minimum [%type_fp16, %type_fp32]"),
+    (
+        "arith.addf",
+        DType::F32,
+        DType::F32,
+        "broadcast_ops.ddl:25 add [%type_fp16, %type_fp32]",
+    ),
+    (
+        "arith.subf",
+        DType::F32,
+        DType::F32,
+        "broadcast_ops.ddl:26 sub [%type_fp16, %type_fp32]",
+    ),
+    (
+        "arith.mulf",
+        DType::F32,
+        DType::F32,
+        "broadcast_ops.ddl:27 mul [%type_fp16, %type_fp32]",
+    ),
+    (
+        "arith.divf",
+        DType::F32,
+        DType::F32,
+        "broadcast_ops.ddl:44 realdiv [%type_fp16, %type_fp32]",
+    ),
+    (
+        "arith.maxnumf",
+        DType::F32,
+        DType::F32,
+        "broadcast_ops.ddl:45 maximum [%type_fp16, %type_fp32]",
+    ),
+    (
+        "arith.minnumf",
+        DType::F32,
+        DType::F32,
+        "broadcast_ops.ddl:46 minimum [%type_fp16, %type_fp32]",
+    ),
     // unary_parallel.ddl — the one-input family and the integer convert.
-    ("math.absf", DType::F32, DType::F32, "unary_parallel.ddl:36 abs [%type_fp16, %type_fp32]"),
-    ("arith.negf", DType::F32, DType::F32, "unary_parallel.ddl:37 neg [%type_fp16, %type_fp32]"),
-    ("arith.sitofp", DType::I32, DType::F32, "unary_parallel.ddl:49 int32tofp32 [%type_fp32]"),
-    ("math.exp", DType::F32, DType::F32, "unary_parallel.ddl:39 exp [%type_fp32]"),
-    ("math.tanh", DType::F32, DType::F32, "unary_parallel.ddl:35 tanhfp32 [%type_fp32]"),
-    ("math.rsqrt", DType::F32, DType::F32, "unary_parallel.ddl:43 rsqrt [%type_fp16, %type_fp32]"),
+    (
+        "math.absf",
+        DType::F32,
+        DType::F32,
+        "unary_parallel.ddl:36 abs [%type_fp16, %type_fp32]",
+    ),
+    (
+        "arith.negf",
+        DType::F32,
+        DType::F32,
+        "unary_parallel.ddl:37 neg [%type_fp16, %type_fp32]",
+    ),
+    (
+        "arith.sitofp",
+        DType::I32,
+        DType::F32,
+        "unary_parallel.ddl:49 int32tofp32 [%type_fp32]",
+    ),
+    (
+        "math.exp",
+        DType::F32,
+        DType::F32,
+        "unary_parallel.ddl:39 exp [%type_fp32]",
+    ),
+    (
+        "math.tanh",
+        DType::F32,
+        DType::F32,
+        "unary_parallel.ddl:35 tanhfp32 [%type_fp32]",
+    ),
+    (
+        "math.rsqrt",
+        DType::F32,
+        DType::F32,
+        "unary_parallel.ddl:43 rsqrt [%type_fp16, %type_fp32]",
+    ),
     // `tt.broadcast` MOVES DATA, so it is dtype-free: its result is its input's
     // dtype verbatim (no DDL op, no opfunc — the emitter copies the lanes), and
     // an f32 result is an f32 input arriving intact. It is the one non-DDL row:
     // the general table's MOVES-DATA class (auditor ruling 2026-10-26).
-    ("tt.broadcast", DType::F32, DType::F32, "moves data — dtype-free, no DDL op"),
+    (
+        "tt.broadcast",
+        DType::F32,
+        DType::F32,
+        "moves data — dtype-free, no DDL op",
+    ),
     // NOTE, deliberately NO row for math.log: unary_pipeline.ddl:22 binds it to
     // [%type_fp16] ALONE — the one bind this gate exists to keep refusing.
 ];
@@ -669,7 +734,10 @@ module {
         let e = run(&mut m).unwrap_err();
         assert!(e.message.contains("genuine f32 compute remains"), "got {e}");
         assert!(e.message.contains("owner decision"), "got {e}");
-        assert!(e.message.contains("math.log"), "the refusal names the op: {e}");
+        assert!(
+            e.message.contains("math.log"),
+            "the refusal names the op: {e}"
+        );
     }
 
     /// The auditor's fp32-binding gate (ruling 2026-10-26), reduced to the

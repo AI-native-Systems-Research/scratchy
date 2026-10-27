@@ -41,7 +41,10 @@ fn the_8b_gate_up_keeps_its_unpadded_split() {
         cur * 2 >= MAX_CORES,
         "25 of 32 cores is past half the machine"
     );
-    assert_eq!(bump_sticks_to_splittable(Fp16Sticks::from_elems(12800)), 12800);
+    assert_eq!(
+        bump_sticks_to_splittable(Fp16Sticks::from_elems(12800)),
+        12800
+    );
     assert_eq!(DeviceWidth::for_output(1, 12800, 4096).get(), 12800);
 }
 

@@ -64,7 +64,10 @@ fn lower_s690(df: Df) -> Vec<ktir_superdsc::emit::EmittedOp> {
         None,
     )
     .unwrap_or_else(|e| {
-        panic!("Mul [dense, Col] at {df:?}: the door must lower it: {}", e.message)
+        panic!(
+            "Mul [dense, Col] at {df:?}: the door must lower it: {}",
+            e.message
+        )
     })
 }
 
@@ -82,7 +85,9 @@ fn the_fp32_broadcast_operand_lowers() {
     // The multiply itself: two input labeledDs, one compute op.
     assert_eq!(v["computeOp_"][0]["opFuncName"], "mul");
     assert_eq!(
-        v["computeOp_"][0]["inputLabeledDs"].as_array().map(|a| a.len()),
+        v["computeOp_"][0]["inputLabeledDs"]
+            .as_array()
+            .map(|a| a.len()),
         Some(2)
     );
     // The iteration space walks the full tile.
@@ -93,13 +98,20 @@ fn the_fp32_broadcast_operand_lowers() {
     // descriptor over fp32 buffers would mis-stripe every stick, right shape, wrong
     // `dataFormat_`, silently).
     for lds in v["labeledDs_"].as_array().expect("labeledDs_") {
-        assert_eq!(lds["wordLength"].as_u64(), Some(4), "fp32 word length: {lds}");
+        assert_eq!(
+            lds["wordLength"].as_u64(),
+            Some(4),
+            "fp32 word length: {lds}"
+        );
         assert_eq!(lds["dataFormat_"], "IEEE_FP32", "fp32 data format: {lds}");
     }
     // And the stick basis is the fp32 one (32 elements, not 64) — `primaryDsInfo_` carries the
     // OUTPUT role's layout (the EwOperand builder emits every operand under the OUTPUT dsType,
     // the same at fp16, so INPUT has no entry of its own to read).
-    assert_eq!(v["primaryDsInfo_"]["OUTPUT"]["stickSize_"].to_string(), "[32]");
+    assert_eq!(
+        v["primaryDsInfo_"]["OUTPUT"]["stickSize_"].to_string(),
+        "[32]"
+    );
     // ⭐ THE Col OPERAND IS READ REDSTICK (scale `-2`): one value per row, swept at its own
     // 32-element stick — the operand mode is a broadcast flag plus a column offset, df-agnostic,
     // so the mode survives the generalization verbatim.
@@ -132,10 +144,17 @@ fn the_fp16_control_keeps_the_fp16_numbers() {
     // expression in the arm reduces to the fp16 constant it replaced.
     let v = dsc(&lower_s690(Df::Fp16), "multiply_o3");
     for lds in v["labeledDs_"].as_array().expect("labeledDs_") {
-        assert_eq!(lds["wordLength"].as_u64(), Some(2), "fp16 word length: {lds}");
+        assert_eq!(
+            lds["wordLength"].as_u64(),
+            Some(2),
+            "fp16 word length: {lds}"
+        );
         assert_eq!(lds["dataFormat_"], "SEN169_FP16", "fp16 data format: {lds}");
     }
-    assert_eq!(v["primaryDsInfo_"]["OUTPUT"]["stickSize_"].to_string(), "[64]");
+    assert_eq!(
+        v["primaryDsInfo_"]["OUTPUT"]["stickSize_"].to_string(),
+        "[64]"
+    );
     assert!(
         v["labeledDs_"][1]["scale_"]
             .as_array()

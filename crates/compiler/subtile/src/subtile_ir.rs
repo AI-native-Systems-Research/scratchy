@@ -1441,10 +1441,7 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// the matrix — the refusal the host readback's `idx > vocab` check
     /// performed, moved into the op, so an already-broken chat cannot also
     /// fault the device bus.
-    EmbedRowGather {
-        hidden: u32,
-        replaces: TensorId,
-    },
+    EmbedRowGather { hidden: u32, replaces: TensorId },
     /// ⭐ THE PICK STAGED INTO THE CHAIN — the persistent placements' writer:
     /// `inputs` = `[idx_stick, s_stick, l_stick, s_tab, l_tab]`, where the
     /// sticks are the persistent SOURCES the mint inserted (the same
@@ -1486,11 +1483,7 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
 /// disagree.
 pub fn sample_pad_vocab(vocab: u32) -> u32 {
     let pad = vocab.max(1).next_power_of_two();
-    if pad == vocab {
-        pad * 2
-    } else {
-        pad
-    }
+    if pad == vocab { pad * 2 } else { pad }
 }
 
 /// The token draw's stick width — the idx stick's own lane count and the
@@ -1703,10 +1696,7 @@ pub enum SampleRows {
 /// rung mints at the FOLDED row's 1 whatever its `mq` (the suffix computes one
 /// logits row; a draw at `mq` would read rows nobody wrote and break the
 /// kernel's grid law).
-pub fn mint_sample<F: RopeForm>(
-    graph: &mut SubtileIR<F>,
-    suffix: SampleRows,
-) -> SampleMint {
+pub fn mint_sample<F: RopeForm>(graph: &mut SubtileIR<F>, suffix: SampleRows) -> SampleMint {
     let result_rows = graph.tensors[graph.result.index()].rows;
     let vocab = graph.tensors[graph.result.index()].cols;
     let pad_vocab = sample_pad_vocab(vocab);
@@ -1750,19 +1740,46 @@ pub fn mint_sample<F: RopeForm>(
         // invt — [rows, 1] f32, staged every step with the seed words.
         TensorShape { rows, cols: 1 },
         // bramp, lramp — the periodic decreasing ramps.
-        TensorShape { rows: 1, cols: pad_vocab },
-        TensorShape { rows: 1, cols: pad_vocab },
+        TensorShape {
+            rows: 1,
+            cols: pad_vocab,
+        },
+        TensorShape {
+            rows: 1,
+            cols: pad_vocab,
+        },
         // binc, linc — the periodic increasing index tables.
-        TensorShape { rows: 1, cols: pad_vocab },
-        TensorShape { rows: 1, cols: pad_vocab },
+        TensorShape {
+            rows: 1,
+            cols: pad_vocab,
+        },
+        TensorShape {
+            rows: 1,
+            cols: pad_vocab,
+        },
         // ones, sixtyfour — the [1, BLOCK] widen tables.
-        TensorShape { rows: 1, cols: SAMPLE_BLOCK },
-        TensorShape { rows: 1, cols: SAMPLE_BLOCK },
+        TensorShape {
+            rows: 1,
+            cols: SAMPLE_BLOCK,
+        },
+        TensorShape {
+            rows: 1,
+            cols: SAMPLE_BLOCK,
+        },
         // padoff — the pad law's offset row.
-        TensorShape { rows: 1, cols: pad_vocab },
+        TensorShape {
+            rows: 1,
+            cols: pad_vocab,
+        },
         // gramp, ginc — the two-level ramp's group pair.
-        TensorShape { rows: 1, cols: pad_vocab },
-        TensorShape { rows: 1, cols: pad_vocab },
+        TensorShape {
+            rows: 1,
+            cols: pad_vocab,
+        },
+        TensorShape {
+            rows: 1,
+            cols: pad_vocab,
+        },
         // hc1, hc2, hc3, c256 — the i32 hash and wrap-fold constants,
         // `[rows, 1]`: the same word at every row's stick head, the seed
         // words' own class (baked by the bake at the rung's rows; the worker
@@ -1773,7 +1790,10 @@ pub fn mint_sample<F: RopeForm>(
         TensorShape { rows, cols: 1 },
         // lane — the per-lane index row, staged f32 (the fptosi exit reads
         // it as an integer-valued f32).
-        TensorShape { rows: 1, cols: pad_vocab },
+        TensorShape {
+            rows: 1,
+            cols: pad_vocab,
+        },
         // fm8, ftop, fzero, fhalf, fm22 — the fold's f32 constants,
         // `[rows, 1]` (the seeds' own class, broadcast operands).
         TensorShape { rows, cols: 1 },
@@ -1814,9 +1834,8 @@ pub fn mint_sample<F: RopeForm>(
     //    ROWS are untouched: the rung keeps its own row count.
     graph.tensors.splice(n_src as usize..n_src as usize, tables);
     graph.num_sources += shift;
-    let seed_words: [TensorId; SAMPLE_SEED_WORDS as usize] = core::array::from_fn(|k| {
-        TensorId(n_src + k as u32)
-    });
+    let seed_words: [TensorId; SAMPLE_SEED_WORDS as usize] =
+        core::array::from_fn(|k| TensorId(n_src + k as u32));
     let invt = TensorId(n_src + SAMPLE_SEED_WORDS);
     let mut t = graph.result;
     // Widen the RESULT TAIL CHAIN to the padded width — the whole chain, per
@@ -1894,7 +1913,6 @@ pub fn mint_sample<F: RopeForm>(
     }
 }
 
-
 // ── The chained head's laws (the constants every reader shares) ─────
 
 /// The chained head's index-stick width — the SENUINT32 stick (32 four-byte
@@ -1923,8 +1941,7 @@ pub const CHAIN_IDX_BLOCK: u32 = 32;
 /// SAMPLE_BLOCK` = 4160. The sampler's own sentinel law (the host
 /// reference's `None` arm) stated as the offset the chain's table range
 /// reads — ONE derivation, no argmax twin.
-pub const SAMPLE_SENTINEL_OFFSET: u32 =
-    SAMPLE_GROUP_BLOCKS * SAMPLE_BLOCK + SAMPLE_BLOCK;
+pub const SAMPLE_SENTINEL_OFFSET: u32 = SAMPLE_GROUP_BLOCKS * SAMPLE_BLOCK + SAMPLE_BLOCK;
 
 /// The chained slab's fp16 stick width — the `[hidden, 64]` slab's one-stick
 /// sub-rows. COINCIDENT with [`SAMPLE_BLOCK`] (both 64) but a DIFFERENT fact:
@@ -1985,7 +2002,10 @@ pub const CHAIN_SLAB_LX_BUDGET: u64 = 406_323;
 /// entry is `page` WHOLE sticks for every `page` — the only constraints are
 /// the two ceilings above.
 pub const fn chain_slab_entries(hidden: u64) -> u64 {
-    assert!(hidden > 0, "chain_slab_entries: hidden is 0 — no slab to split");
+    assert!(
+        hidden > 0,
+        "chain_slab_entries: hidden is 0 — no slab to split"
+    );
     // The per-core LX charge per entry POSITION: 4 buffers (allocAllMem:
     // 2 × value + 2 × output) × one fp16 stick's bytes.
     const CHARGE_PER_POSITION: u64 = 4 * 2 * CHAIN_SLAB_STICK_ELEMS as u64;
@@ -2073,7 +2093,10 @@ pub fn chain_s_stick_pattern(k: u32, s: u32, lanes: usize) -> Vec<u32> {
 /// ramp's length. At every hidden ≤ 2048 it is 1: the whole law degenerates
 /// to today's single-stick index byte-for-byte.
 pub const fn chain_l_sticks(hidden: u32) -> u32 {
-    assert!(hidden > 0, "chain_l_sticks: hidden is zero — no row to name");
+    assert!(
+        hidden > 0,
+        "chain_l_sticks: hidden is zero — no row to name"
+    );
     hidden
         .div_ceil(CHAIN_SLAB_STICK_ELEMS)
         .div_ceil(CHAIN_IDX_BLOCK)
@@ -2495,7 +2518,8 @@ pub fn mint_embed_chain<F: RopeForm>(
          lm-head weight's row count"
     );
     assert_eq!(
-        graph.shape(pick_stick).rows, width,
+        graph.shape(pick_stick).rows,
+        width,
         "mint_embed_chain: the pick stick must carry one row per request row (the \
          batch width this graph serves)"
     );
@@ -2944,10 +2968,7 @@ pub fn eval_node<F: RopeForm>(
                 let score = |i: usize| {
                     let lane = i as i32;
                     let h = lane.wrapping_mul(HC1).wrapping_add(slo);
-                    let h = h
-                        .wrapping_mul(HC2)
-                        .wrapping_add(shi)
-                        .wrapping_add(stp);
+                    let h = h.wrapping_mul(HC2).wrapping_add(shi).wrapping_add(stp);
                     let h = h.wrapping_mul(h);
                     let h = h.wrapping_mul(HC1).wrapping_add(slo);
                     let h = h.wrapping_mul(h);
@@ -3029,8 +3050,7 @@ pub fn eval_node<F: RopeForm>(
             let hidden = hidden as usize;
             let width = out_rows as usize;
             assert_eq!(
-                out_cols as usize,
-                hidden,
+                out_cols as usize, hidden,
                 "the chained rows are [width, hidden], one row per stick row"
             );
             let mut out = vec![0f32; width * hidden];
@@ -3070,18 +3090,14 @@ pub fn eval_node<F: RopeForm>(
             let k = k as usize;
             let width = out_rows as usize;
             assert_eq!(
-                out_cols as usize,
-                CHAIN_IDX_BLOCK as usize,
+                out_cols as usize, CHAIN_IDX_BLOCK as usize,
                 "the stage's fresh output is the s-value stick, [width, CHAIN_IDX_BLOCK]"
             );
             let mut out = Vec::with_capacity(width * CHAIN_IDX_BLOCK as usize);
             for r in 0..width {
                 let t = pick[r * pick_cols as usize] as u32;
                 let s = if t < pad_vocab { t >> 6 } else { 0 };
-                out.extend(
-                    (0..CHAIN_IDX_BLOCK as usize)
-                        .map(|i| (k * s as usize + i % k) as f32),
-                );
+                out.extend((0..CHAIN_IDX_BLOCK as usize).map(|i| (k * s as usize + i % k) as f32));
             }
             out
         }
@@ -5528,7 +5544,11 @@ mod tests {
                 .iter()
                 .map(|tr| tr.tensor.0)
                 .collect::<Vec<_>>();
-            assert_eq!(tids, vec![2, 3, 1], "the s stick, the l stick, the weight source");
+            assert_eq!(
+                tids,
+                vec![2, 3, 1],
+                "the s stick, the l stick, the weight source"
+            );
             assert_eq!(gather.output.tensor.0, 8);
             assert_eq!((g.tensors[8].rows, g.tensors[8].cols), (width, 2));
 
@@ -5582,7 +5602,10 @@ mod tests {
         widen_tied_embed_weight(&mut g).expect("the toy's tail admits the widening");
         let mint = mint_embed_chain(&mut g, TensorId(0), TensorId(3), FIXTURE_VOCAB);
         assert_eq!(
-            (g.tensors[mint.l_stick.index()].rows, g.tensors[mint.l_stick.index()].cols),
+            (
+                g.tensors[mint.l_stick.index()].rows,
+                g.tensors[mint.l_stick.index()].cols
+            ),
             (4, 32),
             "the l stick is ONE STICK WIDE — [width·l_sticks, 32]: row r's l_sticks sticks \
              contiguous (stick r·l_sticks + b), never a stick-scattered [width, 64]"
@@ -5597,7 +5620,10 @@ mod tests {
             g.nodes.last().unwrap().op,
             SubOp::ChainStage { k: 8, .. }
         ));
-        assert!(validate(&g).is_ok(), "the multi-stick chained graph validates");
+        assert!(
+            validate(&g).is_ok(),
+            "the multi-stick chained graph validates"
+        );
     }
 
     /// ⭐ THE CHAIN IS THE ROW, TWO-ENDED — the graph-level parity the
@@ -5635,16 +5661,11 @@ mod tests {
         let w_wide: Vec<f32> = (0..hidden as usize * pad)
             .map(|i| {
                 let (h, c) = (i / pad, i % pad);
-                if c < voc {
-                    w_raw[h * voc + c]
-                } else {
-                    0.0
-                }
+                if c < voc { w_raw[h * voc + c] } else { 0.0 }
             })
             .collect();
-        let col = |t: usize| -> Vec<f32> {
-            (0..hidden as usize).map(|h| w_wide[h * pad + t]).collect()
-        };
+        let col =
+            |t: usize| -> Vec<f32> { (0..hidden as usize).map(|h| w_wide[h * pad + t]).collect() };
         for width in [1u32, 2, 8] {
             // Row r's seeded pick: a distinct in-vocab token per row, past
             // the first slab so the s join is non-trivial.
@@ -5715,7 +5736,8 @@ mod tests {
             for r in 0..width as usize {
                 let expect = vec![(picks[r] >> 6) as f32; CHAIN_IDX_BLOCK as usize];
                 assert_eq!(
-                    &bufs_chained[9][r * CHAIN_IDX_BLOCK as usize..(r + 1) * CHAIN_IDX_BLOCK as usize],
+                    &bufs_chained[9]
+                        [r * CHAIN_IDX_BLOCK as usize..(r + 1) * CHAIN_IDX_BLOCK as usize],
                     &expect[..],
                     "the stage's row is the pick's s-value stick, row {r}"
                 );
@@ -5748,9 +5770,8 @@ mod tests {
                 }
             })
             .collect();
-        let col = |t: usize| -> Vec<f32> {
-            (0..hidden as usize).map(|h| w_wide[h * pad + t]).collect()
-        };
+        let col =
+            |t: usize| -> Vec<f32> { (0..hidden as usize).map(|h| w_wide[h * pad + t]).collect() };
         let width = 3u32;
         let mut g = lower_region(&chained_head_fixture(width, hidden), nz(64));
         widen_tied_embed_weight(&mut g).expect("the toy's tail admits the widening");
@@ -5773,7 +5794,8 @@ mod tests {
         .iter()
         .flat_map(|ramp| ramp.iter().map(|&x| x as f32))
         .collect();
-        let tab_len = |tid: u32| (g.tensors[tid as usize].rows * g.tensors[tid as usize].cols) as usize;
+        let tab_len =
+            |tid: u32| (g.tensors[tid as usize].rows * g.tensors[tid as usize].cols) as usize;
         let bufs = eval_dag(
             &g,
             &[
@@ -5788,8 +5810,7 @@ mod tests {
         let mut expect = col(5);
         expect.extend(vec![0f32; hidden as usize * 2]);
         assert_eq!(
-            bufs[8],
-            expect,
+            bufs[8], expect,
             "the sentinel ramp and the pad-region pick both stage zero rows — and \
              only their rows"
         );
@@ -5808,7 +5829,10 @@ mod tests {
         let pad = 4096usize;
         let voc = FIXTURE_VOCAB as usize;
         let k = chain_slab_entries(u64::from(hidden)) as u32;
-        assert_eq!(k, 4, "granite-3.1-2b's own geometry: the LX law splits k = 4");
+        assert_eq!(
+            k, 4,
+            "granite-3.1-2b's own geometry: the LX law splits k = 4"
+        );
         let w_wide: Vec<f32> = (0..hidden as usize * pad)
             .map(|i| {
                 let (h, c) = (i / pad, i % pad);
@@ -5819,9 +5843,8 @@ mod tests {
                 }
             })
             .collect();
-        let col = |t: usize| -> Vec<f32> {
-            (0..hidden as usize).map(|h| w_wide[h * pad + t]).collect()
-        };
+        let col =
+            |t: usize| -> Vec<f32> { (0..hidden as usize).map(|h| w_wide[h * pad + t]).collect() };
         let width = 2u32;
         // Slab 5 lane 33 and slab 7 lane 60: word 0 = 4·s, the pattern's
         // first lane; the re-join divides it back.
@@ -5839,13 +5862,10 @@ mod tests {
             .collect();
         let l_seed: Vec<f32> = picks
             .iter()
-            .flat_map(|&(_, l)| {
-                chain_l_stick_ramp(l, hidden)
-                    .into_iter()
-                    .map(|x| x as f32)
-            })
+            .flat_map(|&(_, l)| chain_l_stick_ramp(l, hidden).into_iter().map(|x| x as f32))
             .collect();
-        let tab_len = |tid: u32| (g.tensors[tid as usize].rows * g.tensors[tid as usize].cols) as usize;
+        let tab_len =
+            |tid: u32| (g.tensors[tid as usize].rows * g.tensors[tid as usize].cols) as usize;
         let bufs = eval_dag(
             &g,
             &[
@@ -5860,8 +5880,7 @@ mod tests {
         let mut expect = col((64 * 5 + 33) as usize);
         expect.extend(col((64 * 7 + 60) as usize));
         assert_eq!(
-            bufs[8],
-            expect,
+            bufs[8], expect,
             "the patterned slab re-joins: word0/k is the slab, the ramp's word0 the lane"
         );
     }
