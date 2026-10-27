@@ -18,6 +18,14 @@ mismatch, never a coincidental pass.
     128 B-per-row law the seed table's own rows obey): row 0 carries
     0x85EBCA77, row 1 carries 0xC2B2AE3D, DIFFERENT odd constants with bits in
     both halves so each row's carry pattern is its own.
+  * `a_f32` / `b_f32col` — the FP32 TWIN cell's tables (`intmr_f32col_add`,
+    the wall-9 diagnosis leg): the same `[2, 512]`-against-`[2, 1]` Col form
+    at IEEE_FP32, in exactly-representable integers (every staged word and
+    every sum < 2^24), so the bit-for-bit compare is exact arithmetic on both
+    sides. Row 0 of `a_f32` is `j`, row 1 is `100000 + 3j`; the Col words are
+    +4096.0 (row 0) and -8192.0 (row 1) at word 0 of each row's own stick,
+    distinct signs so a row-swap or a wrong-stick read is a mismatch, never a
+    coincidental pass.
 
 The stats script IMPORTS this module, so the host compare and the card run
 consume the SAME statement of the inputs (the B1 leg's own law: the generators
@@ -38,6 +46,9 @@ INDIR = HERE / "in"
 
 # The per-row words for the Col cells — different odd constants per row.
 COL_WORDS = [0x85EBCA77, 0xC2B2AE3D]
+
+# The fp32 twin's Col words — distinct signs, exactly representable.
+F32_COL_WORDS = [4096.0, -8192.0]
 
 
 def a_tile() -> np.ndarray:
@@ -72,6 +83,25 @@ def b_col() -> np.ndarray:
     return stick
 
 
+def a_f32() -> np.ndarray:
+    """The fp32 twin's [2, 512] dense tile: exactly-representable integers,
+    each row its own pattern (row 0 = j, row 1 = 100000 + 3j — max 203533,
+    every sum with the Col word < 2^24)."""
+    out = np.zeros((ROWS, N), dtype=np.float32)
+    for r in range(ROWS):
+        out[r] = (np.arange(N) * (1 if r == 0 else 3) + (0 if r == 0 else 100000)).astype(np.float32)
+    return out
+
+
+def b_f32col() -> np.ndarray:
+    """The fp32 twin's [2, 1] Col table at its IEEE_FP32 one-stick footprint:
+    32 words per row, the row's own word in word 0 of its own stick."""
+    stick = np.zeros((ROWS, 32), dtype=np.float32)
+    for r, w in enumerate(F32_COL_WORDS):
+        stick[r, 0] = np.float32(w)
+    return stick
+
+
 def tables() -> list[tuple[str, np.ndarray]]:
     a = a_tile()
     dense = b_dense()
@@ -83,6 +113,8 @@ def tables() -> list[tuple[str, np.ndarray]]:
     for cell in ("intmr_col_add", "intmr_col_mul"):
         out.append((f"{cell}_t00_a", a))
         out.append((f"{cell}_t01_b", col))
+    out.append(("intmr_f32col_add_t00_a", a_f32()))
+    out.append(("intmr_f32col_add_t01_b", b_f32col()))
     return out
 
 

@@ -114,3 +114,27 @@ def intmr_col_mul_probe(a_ptr, b_ptr, o_ptr,  #
     o_d = tl.make_tensor_descriptor(o_ptr, shape=[B, PAD_V], strides=[PAD_V, 1],
                                     block_shape=[1, PAD_V])
     o_d.store([pid, 0], o)
+
+
+@triton.jit
+def intmr_f32col_add_probe(a_ptr, b_ptr, o_ptr,  #
+                           PAD_V: tl.constexpr, B: tl.constexpr):
+    # THE FP32 TWIN of `intmr_col_add_probe`, for the wall-9 emission diff: the
+    # same shapes, the same pid-cornered spelling, the same operand order —
+    # fp32 alone differs. This is `invt`'s own production class (the score add
+    # `x·inv_t + g·gate` reads inv_t as a `[B, 1]` fp32 Col operand), the form
+    # the auditor states is card-proven at rows > 1 (batched greedy's equality
+    # rides the same Col addressing). Baking this cell beside the int cell and
+    # diffing the two Col-operand TensorArgs field by field isolates the
+    # emission defect: everything but the dataFormat must agree.
+    pid = tl.program_id(0)
+    a_d = tl.make_tensor_descriptor(a_ptr, shape=[B, PAD_V], strides=[PAD_V, 1],
+                                    block_shape=[1, PAD_V])
+    a = a_d.load([pid, 0])
+    b_d = tl.make_tensor_descriptor(b_ptr, shape=[B, 1], strides=[1, 1],
+                                    block_shape=[1, 1])
+    b = b_d.load([pid, 0])
+    o = a + b
+    o_d = tl.make_tensor_descriptor(o_ptr, shape=[B, PAD_V], strides=[PAD_V, 1],
+                                    block_shape=[1, PAD_V])
+    o_d.store([pid, 0], o)

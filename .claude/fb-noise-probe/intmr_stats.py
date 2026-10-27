@@ -33,6 +33,11 @@ CELLS = [
     ("intmr_dense_mul", "mul", "dense"),
     ("intmr_col_add", "add", "col"),
     ("intmr_col_mul", "mul", "col"),
+    # The FP32 TWIN (wall-9 diagnosis): the same [2,512]+[2,1] Col form at
+    # IEEE_FP32 — the dataFormat is the ONLY variable against intmr_col_add.
+    # Its verdict decides whether the measured-wrong addressing is int-specific
+    # or the form's own (the emissions are field-identical besides the df).
+    ("intmr_f32col_add", "add", "f32col"),
 ]
 
 
@@ -42,9 +47,42 @@ def read_u32(name: str) -> np.ndarray:
 
 def main() -> int:
     a = read_u32("intmr_dense_add_t00_a").reshape(G.ROWS, G.N)
-    report = {"probe": "intmr", "rows": G.ROWS, "lanes": G.N, "cells": {}}
+    a32 = np.fromfile(IN / "intmr_f32col_add_t00_a.bin", dtype=np.float32).reshape(G.ROWS, G.N)
+    report = {"probe": "intmr+f32col", "rows": G.ROWS, "lanes": G.N, "cells": {}}
     ok = True
     for cell, op, mode in CELLS:
+        if mode == "f32col":
+            b = np.fromfile(IN / f"{cell}_t01_b.bin", dtype=np.float32)
+            # The card run's read-back, written beside this script by the leg.
+            o = np.fromfile(HERE / f"out_{cell}_o.bin", dtype=np.float32).reshape(G.ROWS, G.N)
+            # Each row's own word: word 0 of its own 32-word stick. All staged
+            # words and sums are exact integers < 2^24, so the f32 add is exact
+            # on both sides — any mismatch is addressing, never numerics.
+            bm = b.reshape(G.ROWS, 32)[:, :1]
+            want = a32 + bm
+            diff = o != want
+            mismatches = int(diff.sum())
+            cell_report = {
+                "form": "add, [2,512] dense IEEE_FP32 + [2,1] Col (the intmr_col_add twin)",
+                "mismatches": mismatches,
+                "pass": mismatches == 0,
+            }
+            if mismatches:
+                idx = np.nonzero(diff)
+                cell_report["first_mismatches"] = [
+                    {
+                        "row": int(r),
+                        "lane": int(j),
+                        "card": float(o[r, j]),
+                        "host": float(want[r, j]),
+                        "a": float(a32[r, j]),
+                    }
+                    for r, j in zip(idx[0][:10], idx[1][:10])
+                ]
+            report["cells"][cell] = cell_report
+            ok = ok and mismatches == 0
+            print(f"{cell}: {mismatches} differing lanes of {G.ROWS * G.N}")
+            continue
         b = read_u32(f"{cell}_t01_b")
         # The card run's read-back, written beside this script by the leg.
         o = np.fromfile(HERE / f"out_{cell}_o.bin", dtype=np.uint32).reshape(G.ROWS, G.N)

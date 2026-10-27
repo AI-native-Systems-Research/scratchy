@@ -878,6 +878,20 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
             vec![2],
             Program::Sample,
         ),
+        // ⭐ THE FP32 TWIN of `intmr_col_add` (wall-9 emission diff, auditor order
+        // 2026-10-27): the same shapes and pid-cornered spelling, fp32 alone differs —
+        // `invt`'s own production class, the Col addressing the auditor states is
+        // card-proven at rows > 1. NOT a production configuration: delete with the probe.
+        "intmr_f32col_add" => (
+            spec(
+                "intmr_probe",
+                "intmr_f32col_add_probe",
+                &[("a_ptr", "*fp32"), ("b_ptr", "*fp32"), ("o_ptr", "*fp32")],
+                &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
         _ => return None,
     })
 }

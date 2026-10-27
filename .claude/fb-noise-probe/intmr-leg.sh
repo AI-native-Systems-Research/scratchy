@@ -3,7 +3,10 @@
 # measurement, four cells for attribution — auditor GO 2026-10-27: "[2,512]
 # dense + [2,512] dense (the control), then [2,512] + [2,1] Col, for add AND
 # mul", all in the production pid-cornered spelling (grid [B]=2, [1, ·]
-# blocks, the per-row loads at [pid, 0]). Tree: /work/front-b-noise — THIS
+# blocks, the per-row loads at [pid, 0]) — PLUS the FP32 TWIN
+# (intmr_f32col_add, the wall-9 diagnosis order): the same Col form at
+# IEEE_FP32, making the dataFormat the only variable against intmr_col_add.
+# Tree: /work/front-b-noise — THIS
 # session's worktree, rsynced from the Mac (never cloned: nothing is pushed).
 # Bake: ON THE POD, from that tree, KTIR_WHOLE=1 through the whole-function
 # door, WITH the integer door's multi-row Col admission (the probe measures
@@ -11,7 +14,8 @@
 # dir /work/pr916/head/target (one target dir, shared; nothing else runs).
 # Outputs read back VERBATIM through the tree's own `raw:` output spelling.
 # Verdict ON THE POD (intmr_stats.py: bit-for-bit, per row and lane, against
-# the host wrapping op — dense control vs Col, add vs mul); the numbers land
+# the host wrapping op — dense control vs Col, add vs mul; fp32 twin against
+# the exact-integer f32 add); the numbers land
 # in intmr-verdict.json. Markers: INTMR-DONE / INTMR-FAILED. Log:
 # /work/intmr-leg.log
 set -u
@@ -23,7 +27,7 @@ PROBE=/work/fb-noise-probe
 BIN=$TDIR/release/examples/bundle_run_dev
 DXP=/opt/ibm/spyre/deeptools/bin/dxp_standalone
 
-CELLS="intmr_dense_add intmr_dense_mul intmr_col_add intmr_col_mul"
+CELLS="intmr_dense_add intmr_dense_mul intmr_col_add intmr_col_mul intmr_f32col_add"
 
 if [ "${BG:-0}" != "1" ]; then
   BG=1 setsid nohup bash "$0" >>"$LOG" 2>&1 &
