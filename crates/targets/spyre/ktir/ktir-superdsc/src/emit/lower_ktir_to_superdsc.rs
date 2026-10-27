@@ -1856,16 +1856,29 @@ impl IntBinary {
 /// `.claude/fb-noise-probe/intm-leg.sh`). The `Add` leg measured the operand
 /// mode for the add; this leg measured it for the mul. The admission stands.
 ///
-/// ⭐ THE MULTI-ROW `Col` ADMISSION — MEASUREMENT IN FLIGHT (front-b-noise, auditor GO
-/// 2026-10-27): the batched decode seat needs it — the granite-3.1-2b decode rerung's
-/// pod build (2026-10-27T01:19Z) refused here, naming this exact form, because a
-/// band-typed rung mints its per-request seed words as `[rows, 1]` against a
-/// `[rows, cols]` tile at `rows > 1`. The intmr leg measures it on nickm2 in two
-/// cells for attribution — `[2, 512]` dense + `[2, 512]` dense (the multi-row dense
-/// control, itself unmeasured) then `[2, 512]` dense + `[2, 1]` `Col` — for `Add`
-/// AND `Mul`, in the production pid-cornered spelling (grid `[B]`, `[1, ·]` blocks,
-/// the per-row loads at `[pid, 0]`). ON PASS this doc becomes the citation; ON FAIL
-/// the admission is deleted and the refusal returns.
+/// ⭐ THE MULTI-ROW `Col` ADMISSION IS CARD-PROVEN (front-b-noise, scatter-harness
+/// re-leg, nickm2, 2026-10-27T03:30Z, verdict saved
+/// `.claude/fb-noise-probe/verdicts/intmr-scatter-verdict-20261027T0330Z.json`): the
+/// batched decode seat needs it — a band-typed rung mints its per-request seed words
+/// as `[rows, 1]` against a `[rows, cols]` tile at `rows > 1`. The first intmr legs
+/// (2026-10-27T02:02Z, verdict banked beside the scatter one) measured the form
+/// WRONG with an `s mod rows` signature — which the auditor's ruling identified as
+/// the DEVICE'S OWN STICK-MAJOR LAYOUT (forward_tape.rs:299: stick k of row r at
+/// flat stick `k*rows + r`; the Rust law's 64 counts fp16-sized slots, so at
+/// fp32/u32 the granule is 32 words) seen through a ROW-MAJOR harness: a
+/// position-wise op commutes with a consistent permutation, so the dense controls
+/// passed while every row-sensitive cell failed with the scatter's own signature.
+/// The `[rows, 1]` `Col` tables are fixed points of the scatter (one stick per
+/// row), so the card's per-row semantics were never wrong. The corrected leg —
+/// every multi-row input staged through `stick_scatter`, every output
+/// un-scattered, each staged input cross-checked against its own generator —
+/// measured FIVE cells bit-for-bit at rows=2: `[2,512]` dense+dense `add` and
+/// `mul` (0/1024 each), `[2,512]`+`[2,1]` fp32 `Col` `add` (0/1024), the
+/// production-width `[2,65536]`+`[2,1]` fp32 `Col` `add` (0/131072), and the
+/// reduce-chain twin `max(axis=1) → expand_dims → add` (0/131072, distinct row
+/// maxima 65535/296605 — the equality's own writer→reader pair). Front A's
+/// batched b2/b4 card cells (distinct prompts, per-row correct tokens) corroborate.
+/// The admission stands at every row count, citing these legs.
 ///
 /// ⛔ NO `Y`, NO `Mb`, NO CORNER, NO PER-ROW FORM — the row-split mode, the row-vector
 /// mode and every corner are refused by name below: none is measured, none is ordered, and
@@ -1936,13 +1949,16 @@ pub fn int_binary(
         }
         // ⭐ AND `Col` IS ADMITTED AT EVERY ROW COUNT — the multi-row column vector
         // (`[rows > 1, 1]` against a `[rows > 1, cols]` tile) is the batched decode
-        // seat's own form (the band-typed rung's per-request seed words), measured by
-        // the intmr legs — see the door's own doc for the in-flight citation. The want
-        // loop below still demands a `Col` operand carry the op's FULL row count (one
-        // value per row), so a short operand cannot run off its end.
+        // seat's own form (the band-typed rung's per-request seed words),
+        // CARD-PROVEN by the scatter-harness re-leg (nickm2, 2026-10-27T03:30Z,
+        // five cells bit-for-bit at rows=2 — see the door's own doc for the full
+        // citation). The want loop below still demands a `Col` operand carry the
+        // op's FULL row count (one value per row), so a short operand cannot run
+        // off its end.
         // ⭐ THE PROBE ADMISSION — the SAME broadcast body the fp16/fp32 doors reach, at the
         // integer's own stick basis, with the INTEGER op_func (the descriptor name that feeds
-        // the bundle fingerprint). See the door's own doc for the measurement in flight.
+        // the bundle fingerprint). Measured by the intb/intm one-row legs and the intmr
+        // scatter re-leg; see the door's own doc for the citations.
         return elementwise_broadcast(
             name,
             &format!("IntBinary({kind:?})"),
@@ -7651,11 +7667,19 @@ mod elementwise_tests {
         );
     }
 
-    /// ⭐ THE MULTI-ROW `Col` IS ADMITTED (auditor GO 2026-10-27; the intmr legs, measurement
-    /// in flight): the batched decode seat's band-typed rung hands this door `[2, 1]` against
-    /// `[2, 512]` — the per-request seed words of a two-row decode rung. It lowers through the
-    /// SAME broadcast body as the one-row form, one op, the same descriptor name. ON FAIL of
-    /// the legs, this admission (and this test) revert to the by-name refusal.
+    /// ⭐ THE MULTI-ROW `Col` IS ADMITTED AND CARD-PROVEN (scatter-harness re-leg,
+    /// nickm2, 2026-10-27T03:30Z, verdict banked at
+    /// `.claude/fb-noise-probe/verdicts/intmr-scatter-verdict-20261027T0330Z.json`):
+    /// the batched decode seat's band-typed rung hands this door `[2, 1]` against
+    /// `[2, 512]` — the per-request seed words of a two-row decode rung. It lowers
+    /// through the SAME broadcast body as the one-row form, one op, the same
+    /// descriptor name. The first intmr legs measured the form WRONG with an
+    /// `s mod rows` signature that was the device's own STICK-MAJOR layout
+    /// (forward_tape.rs:299) seen through a row-major harness; the corrected
+    /// harness (every multi-row input staged through `stick_scatter`, every
+    /// output un-scattered) measured five cells bit-for-bit at rows=2 — the
+    /// dense add/mul controls, the fp32 `Col` at [2,512] and [2,65536], and the
+    /// reduce-chain twin with distinct per-row maxima.
     #[test]
     fn an_int_multi_row_col_broadcast_lowers_as_one_op() {
         let r = node(
