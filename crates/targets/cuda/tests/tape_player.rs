@@ -17,6 +17,7 @@ pub mod common {
     pub mod gemma_attn;
     pub mod gemma_mlp;
     pub mod gemma_moe;
+    pub mod gemma_moe_block;
     pub mod gemma_rows;
     pub mod mlp;
     pub mod moe_block;
@@ -2953,52 +2954,276 @@ fn gemma_moe_buckets() -> &'static [CudaTape] {
     })
 }
 
-/// A Gemma tape is refused with `NotLaunched` at its first new step (the 64-column router GEMM, step 1),
-/// before anything is uploaded or enqueued: the result colour keeps every byte it had, and the
-/// host result buffer is untouched. Synthetic zero weights of the declared sizes.
-#[test]
-fn a_gemma_tape_is_refused_not_launched_before_anything_is_enqueued() {
-    let device = h100();
-    let tapes = gemma_moe_buckets();
-    let tape = &tapes[0];
-    let kinds: Vec<String> = (tape.steps.iter())
-        .map(|s| format!("{s:?}").split('(').next().unwrap_or("").to_owned())
-        .collect();
-    eprintln!("gemma m=512 step kinds: {kinds:?}");
-    assert!(
-        matches!(tape.steps[1], CudaStep::RouterLogits(r) if r.kernel == MatmulKernel::Col64),
-        "the first unlaunched step is the 64-column router GEMM: {:?}",
-        tape.steps[1]
+// ── Gemma 4's MoE block, played (#924) ─────────────────────────────
+
+use common::gemma_moe_block::{
+    GEMMA_MOE_BLOCK_FACTS, GEMMA_MUTATIONS, GemmaMoeWeights, Geometry, REAL, SMALL, gemma_judge,
+    gemma_moe_block, gemma_moe_weights, gemma_moe_x, gemma_references,
+};
+
+/// The real block's buckets: one gathered row, a sorted bucket, and the long run.
+const GEMMA_MOE_MS: [u32; 3] = [1, 512, 4096];
+/// `cuda_tapes_gemma4`'s `ARENAS` MoE scratch bytes of Gemma 4 26B-A4B at m = 512 and 4,096: the
+/// block's own, its geometry being the model's.
+const GEMMA_MOE_SCRATCH: [(u32, u64); 2] = [(512, 318_285_824), (4096, 783_862_528)];
+
+/// The real Gemma MoE block at each of [`GEMMA_MOE_MS`], as CUDA's compiler lowers it.
+fn gemma_moe_block_buckets() -> &'static [CudaTape] {
+    static TAPES: std::sync::OnceLock<Vec<CudaTape>> = std::sync::OnceLock::new();
+    TAPES.get_or_init(|| {
+        (GEMMA_MOE_MS.iter())
+            .map(|&m| {
+                let at = CanonicalAt {
+                    stem: "gemma_moe_block",
+                    m: u64::from(m),
+                };
+                let c = lower_canonical(&gemma_moe_block(m), GEMMA_MOE_BLOCK_FACTS, at)
+                    .unwrap_or_else(|e| panic!("the Gemma MoE block lowers at m={m}: {e}"));
+                static_tape(&c)
+            })
+            .collect()
+    })
+}
+
+/// [`gemma_moe`]'s small block at m = 1, then [`gemma_moe_buckets`]' m = 512.
+fn gemma_moe_small_buckets() -> &'static [CudaTape] {
+    static TAPES: std::sync::OnceLock<Vec<CudaTape>> = std::sync::OnceLock::new();
+    TAPES.get_or_init(|| {
+        let at = CanonicalAt {
+            stem: "gemma_moe",
+            m: 1,
+        };
+        let c = lower_canonical(&gemma_moe(1), GEMMA_MOE_FACTS, at)
+            .unwrap_or_else(|e| panic!("the Gemma MoE block lowers at m=1: {e}"));
+        vec![static_tape(&c), gemma_moe_buckets()[0]]
+    })
+}
+
+/// The weight table of a Gemma block: per source index, its host bits. The gate, up and down
+/// expert steps each name their own source (`steps_from_tape`'s `weight_operand`), and each reads
+/// the whole expert bank at its own part (`ExpertProjection::slab`), so each holds the bank.
+fn gemma_moe_table(device: &CudaDevice, w: &GemmaMoeWeights, tape: &CudaTape) -> Vec<DeviceBuffer> {
+    let bank = &w.bank;
+    let host: Vec<&[u16]> = match w.geometry.dense {
+        Some(_) => vec![
+            &[],
+            &w.g,
+            &w.wg,
+            &w.wu,
+            &w.wd,
+            &w.g2,
+            &w.rscale,
+            &w.router,
+            &w.pes,
+            bank,
+            bank,
+            bank,
+        ],
+        None => vec![&[], &w.rscale, &w.router, &w.pes, bank, bank, bank],
+    };
+    assert_eq!(
+        host.len(),
+        tape.weight_bytes.len(),
+        "one host weight per source"
     );
-    let table: Vec<DeviceBuffer> = (tape.weight_bytes.iter())
-        .map(|&b| match b {
-            0 => DeviceBuffer::empty(),
-            b => DeviceBuffer::upload_bytes(&device, &vec![0u8; b as usize]).expect("upload"),
-        })
-        .collect();
-    let table: &'static [DeviceBuffer] = Box::leak(table.into_boxed_slice());
-    let mut worker = CudaWorker::new(&device, tapes, table, None, None).expect("worker");
-    let m = tape.bucket_m as usize;
-    let x = vec![0x3F80u16; m * common::gemma_moe::H as usize];
-    let result = colour(tape, tape.arena.colour_offsets.len() - 1);
-    let mut y = vec![0xBEEFu16; tape.result.bytes as usize / 2];
-    let before = read(&mut worker, result);
-    let e = worker
-        .forward(0, Input::Hidden(&x), &[], None, None, &mut y)
-        .expect_err("a Gemma step is not launched");
-    eprintln!("gemma m=512: {e}");
-    assert!(
-        matches!(
-            e,
-            ForwardError::NotLaunched {
-                step: 1,
-                op: "RouterLogits"
+    (host.iter().zip(tape.weight_bytes))
+        .map(|(h, &bytes)| {
+            assert_eq!(h.len() as u64 * 2, bytes, "a weight's declared bytes");
+            match h.len() {
+                0 => DeviceBuffer::empty(),
+                _ => DeviceBuffer::upload(device, h).expect("upload a weight"),
             }
-        ),
-        "{e:?}"
+        })
+        .collect()
+}
+
+/// The routing's picks after a forward of `tape`, `[m, 8]` i32 read as u32.
+fn gemma_moe_picks(worker: &mut CudaWorker<'_>, tape: &CudaTape) -> Vec<u32> {
+    moe_picks(worker, tape)
+}
+
+/// The MoE scratch bytes of `tape`, from `logits` to the end of the router-norm rows.
+fn gemma_moe_scratch(tape: &CudaTape) -> u64 {
+    tape.moe.expect("a MoE scratch").span().bytes
+}
+
+/// Play every bucket of `tapes` on each routing case, and judge each against the f64 block.
+fn gemma_moe_play(
+    device: &CudaDevice,
+    tapes: &'static [CudaTape],
+    geometry: Geometry,
+    what: &str,
+) -> bool {
+    let w = gemma_moe_weights(geometry);
+    let table = gemma_moe_table(device, &w, &tapes[0]);
+    let table: &'static [DeviceBuffer] = Box::leak(table.into_boxed_slice());
+    let mut worker = CudaWorker::new(device, tapes, table, None, None).expect("worker");
+    let mut pass = true;
+    for (b, tape) in tapes.iter().enumerate() {
+        let m = tape.bucket_m as usize;
+        // The router's GEMM: the one-row GEMV at m = 1, the 64-column GEMM above.
+        let router = (tape.steps.iter()).find_map(|s| match s {
+            CudaStep::RouterLogits(r) => Some(r.kernel),
+            _ => None,
+        });
+        let want_router = if m == 1 {
+            MatmulKernel::Gemv
+        } else {
+            MatmulKernel::Col64
+        };
+        let router_ok = router == Some(want_router);
+        let scratch = gemma_moe_scratch(tape);
+        let want =
+            (GEMMA_MOE_SCRATCH.iter()).find(|&&(wm, _)| wm as usize == m && geometry == REAL);
+        let scratch_ok = want.is_none_or(|&(_, bytes)| bytes == scratch);
+        eprintln!(
+            "{what} m={m}: arena_bytes={} colour_bytes={:?} moe_scratch_bytes={scratch} \
+             (cuda_tapes_gemma4 {:?}) max_tiles={} sorted={} router={router:?} {}",
+            tape.arena.total_bytes,
+            tape.arena.colour_bytes,
+            want.map(|w| w.1),
+            tape.moe.expect("a MoE scratch").max_tiles,
+            tape.moe.expect("a MoE scratch").sort.is_some(),
+            verdict(scratch_ok && router_ok)
+        );
+        pass &= scratch_ok && router_ok;
+        for routing in [Routing::Random, Routing::Skewed, Routing::Half] {
+            let x = gemma_moe_x(&w, routing, m, 0x6E_5EED ^ m as u64);
+            let y = moe_forward(&mut worker, b, &x);
+            let picks = gemma_moe_picks(&mut worker, tape);
+            let tokens = moe_tokens(m);
+            let refs = gemma_references(&w, &x, &tokens);
+            let j = gemma_judge(&refs, &tokens, geometry.h, &y, &picks);
+            eprintln!(
+                "{what} m={m} {routing:?}: tokens={} routing_noise={:.4e} near_ties={} \
+                 rms_err={:.4e} (emulation {:.4e}) max_err={:.4e} (emulation {:.4e}) \
+                 out_of_bound={} nonfinite={} picks_differ={} {}",
+                j.tokens,
+                j.routing_noise,
+                j.near_ties,
+                j.gpu.0,
+                j.emu.0,
+                j.gpu.1,
+                j.emu.1,
+                j.out_of_bound,
+                j.nonfinite,
+                j.picks_differ,
+                verdict(j.pass())
+            );
+            for (name, &(changed, out)) in GEMMA_MUTATIONS.iter().zip(&j.mutations) {
+                eprintln!(
+                    "{what} m={m} {routing:?} self-check {name}: out_of_bound={out}/{changed} \
+                     ({:.1}%) {}",
+                    100.0 * out as f64 / changed.max(1) as f64,
+                    verdict(changed > 0 && 2 * out >= changed)
+                );
+            }
+            pass &= j.pass() && j.mutations_caught();
+        }
+    }
+    pass
+}
+
+/// The Gemma MoE block at its real geometry (H 2816, 128 experts, top-8, I 704, the dense GeGLU
+/// MLP beside it and the residual) at m = 1 (gathered: the expert GEMV), 512 (sorted: the sort,
+/// the grouped GEMM at both column tiles, the 64-column router and dense GEMMs) and 4,096 (the
+/// long run), on each routing case, against the f64 block on about 64 tokens per case: CUDA's RMS
+/// and max error each at most twice a bf16 emulation's (which rounds where the tape stores), the
+/// picks the emulation's on every token that is not a router near-tie (the 8th and 9th f64 logits
+/// within twice the measured routing noise, #859's P9 rule), and each of #924's seven mutated
+/// references out of bound on at least half the tokens it changes. The near-tie and out-of-bound
+/// counts and the MoE scratch bytes are printed. Then [`gemma_moe`]'s small block at m = 1 and 512,
+/// the same way. Replaces #885's `NotLaunched` test on this tape family: every step now launches.
+#[test]
+fn gemma_moe_block_matches_the_f64_block() {
+    let device = h100();
+    let real = gemma_moe_play(&device, gemma_moe_block_buckets(), REAL, "gemma_moe_block");
+    let small = gemma_moe_play(&device, gemma_moe_small_buckets(), SMALL, "gemma_moe small");
+    assert!(
+        real && small,
+        "the Gemma MoE block is out of bound, a self-check fell short, or its scratch moved"
     );
-    assert!(y.iter().all(|&v| v == 0xBEEF), "the result is untouched");
-    assert_eq!(read(&mut worker, result), before, "nothing was enqueued");
+}
+
+/// The real block's m = 1 and 512 buckets, then [`whole_arena_tape`] over the larger arena.
+fn gemma_moe_block_buckets_and_fill() -> &'static [CudaTape] {
+    static TAPES: std::sync::OnceLock<Vec<CudaTape>> = std::sync::OnceLock::new();
+    TAPES.get_or_init(|| {
+        let mut t = gemma_moe_block_buckets()[..2].to_vec();
+        let bytes = (t.iter().map(|t| t.arena.total_bytes))
+            .max()
+            .expect("tapes");
+        t.push(whole_arena_tape(bytes));
+        t
+    })
+}
+
+/// The real Gemma MoE block's invariants at m = 1 and 512 (random routing): a forward after the
+/// whole arena, MoE scratch included, was poisoned with bf16 NaN (`0x7FC0`) gives finite output,
+/// bit-identical to one after a zero-filled arena; a repeat is bit-identical; at m = 512,
+/// permuting the 512 input rows permutes the output rows bit for bit; and five forwards allocate
+/// nothing.
+#[test]
+fn gemma_moe_block_invariants() {
+    let device = h100();
+    let w = gemma_moe_weights(REAL);
+    let tapes = gemma_moe_block_buckets_and_fill();
+    let table = gemma_moe_table(&device, &w, &tapes[0]);
+    let mut worker = CudaWorker::new(&device, tapes, &table, None, None).expect("worker");
+    let h = REAL.h;
+    let fill = tapes.len() - 1;
+    let bytes = tapes[fill].arena.total_bytes;
+    let mut pass = true;
+    for (b, tape) in tapes[..2].iter().enumerate() {
+        let m = tape.bucket_m as usize;
+        let x = gemma_moe_x(&w, Routing::Random, m, 0x6E1A_0000 ^ m as u64);
+        fill_arena(&mut worker, fill, bytes, 0);
+        let after_zero = moe_forward(&mut worker, b, &x);
+        fill_arena(&mut worker, fill, bytes, 0x7FC0);
+        let after_nan = moe_forward(&mut worker, b, &x);
+        let repeat = moe_forward(&mut worker, b, &x);
+        let nonfinite = (after_nan.iter())
+            .filter(|&&v| !half::bf16::from_bits(v).is_finite())
+            .count();
+        let poison = mismatched_bits(&after_nan, &after_zero);
+        let rep = mismatched_bits(&repeat, &after_nan);
+        let ok = nonfinite == 0 && poison == 0 && rep == 0;
+        eprintln!(
+            "gemma_moe_block m={m}: nan_poison_vs_zero_mismatched_bits={poison} \
+             nonfinite={nonfinite} repeat_mismatched_bits={rep} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+        if m > 1 {
+            // Row t of the permuted input is row (37·t + 11) mod m of `x`: 37 is odd and m a
+            // power of two, so it is a bijection of 0..m.
+            let src = |t: usize| (37 * t + 11) % m;
+            let mut xp = vec![0u16; x.len()];
+            let mut want = vec![0u16; x.len()];
+            for t in 0..m {
+                xp[t * h..][..h].copy_from_slice(&x[src(t) * h..][..h]);
+                want[t * h..][..h].copy_from_slice(&after_nan[src(t) * h..][..h]);
+            }
+            let perm = mismatched_bits(&moe_forward(&mut worker, b, &xp), &want);
+            eprintln!(
+                "gemma_moe_block m={m}: permuted_rows_mismatched_bits={perm} {}",
+                verdict(perm == 0)
+            );
+            pass &= perm == 0;
+        }
+    }
+    let before = device.allocations();
+    let x = gemma_moe_x(&w, Routing::Half, 512, 0x6E1A_0001);
+    for _ in 0..5 {
+        moe_forward(&mut worker, 1, &x);
+    }
+    let allocations = device.allocations() - before;
+    eprintln!(
+        "gemma_moe_block five forwards: allocations={allocations} (expect 0) {}",
+        verdict(allocations == 0)
+    );
+    assert!(pass, "a Gemma MoE block invariant does not hold");
+    assert_eq!(allocations, 0, "a Gemma MoE forward allocated");
 }
 
 // ── Gemma 4's row steps, played (#921) ─────────────────────────────

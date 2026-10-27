@@ -825,18 +825,22 @@ unsafe fn col64_and_wait(
     launched
 }
 
+/// A GEMM launch on the default stream that waits for it: [`launch_and_wait`] or
+/// [`col64_and_wait`].
+type LaunchAndWait = unsafe fn(
+    &DeviceBuffer,
+    &DeviceBuffer,
+    &DeviceBuffer,
+    (u32, u32, u32),
+) -> Result<(), KernelError>;
+
 /// `C` of one launch of `gemm` on `a` and `b` (`(m, n, k)`), from a sentinel, with [`TAIL`] past
 /// its end.
 fn run_c(
     device: &CudaDevice,
     (a, b): (&DeviceBuffer, &DeviceBuffer),
     (m, n, k): (u32, u32, u32),
-    gemm: unsafe fn(
-        &DeviceBuffer,
-        &DeviceBuffer,
-        &DeviceBuffer,
-        (u32, u32, u32),
-    ) -> Result<(), KernelError>,
+    gemm: LaunchAndWait,
 ) -> Vec<u16> {
     let len = m as usize * n as usize;
     let c = DeviceBuffer::upload(device, &vec![SENTINEL; len + TAIL]).expect("upload C");
