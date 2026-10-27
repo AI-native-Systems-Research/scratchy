@@ -25,8 +25,11 @@ use scratchy_target_cuda::runtime::{
     CudaDevice, CudaWorker, DeviceBuffer, GdnPoolConfig, GdnSequence, Input, KvPoolConfig,
     KvSequence, load_weights,
 };
-use scratchy_target_cuda::step::gdn_bundle;
+use scratchy_target_cuda::step::{MoeRouteBf16, gdn_bundle};
 use scratchy_target_cuda::weights::{CudaWeight, open_checkpoint};
+
+// The goldens' routing dump and P9's rule, for P1's and P3's route-explained rows (#933).
+include!("cuda_route_rule.rs");
 
 /// The smallest bucket; every prompt and greedy sequence fits it.
 const M: u32 = 512;
@@ -276,6 +279,160 @@ fn top_k(row: &[f32], k: usize) -> Vec<usize> {
 
 fn rows(v: &[f32]) -> impl Iterator<Item = &[f32]> {
     v.chunks(VOCAB)
+}
+
+/// The m=512 tape cut just after each `MoeRoute` step, its result that layer's `topk_idx`, the
+/// MoE layers' picks per token (the route test's capture, `cuda_route_parity_body.rs`), and the
+/// picks per token; empty for a dense model, whose tape has no routing.
+fn route_cut_tapes() -> (&'static [scratchy_target_cuda::tape::CudaTape], usize) {
+    static CUTS: OnceLock<(&'static [scratchy_target_cuda::tape::CudaTape], usize)> = OnceLock::new();
+    *CUTS.get_or_init(|| {
+        let full = &CUDA_TAPES[bucket()];
+        let mut top_k = 0;
+        let cuts: Vec<scratchy_target_cuda::tape::CudaTape> = (full.steps.iter().enumerate())
+            .filter_map(|(i, s)| match *s {
+                scratchy_target_cuda::step::CudaStep::MoeRoute(MoeRouteBf16 {
+                    top_k: k, ..
+                }) => {
+                    let moe = full.moe.expect("a routing tape has a MoE scratch");
+                    top_k = k as usize;
+                    Some(scratchy_target_cuda::tape::CudaTape {
+                        steps: Box::leak(full.steps[..=i].to_vec().into_boxed_slice()),
+                        result: moe.topk_idx,
+                        ..*full
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        (Box::leak(cuts.into_boxed_slice()), top_k)
+    })
+}
+
+/// One row's expert picks against HF-f32's, walked over every layer under P9's rule: the layers
+/// where CUDA's pick differs, and whether P9 accepts every one of those differences.
+struct RowRoute {
+    differs: Vec<usize>,
+    accepted: bool,
+}
+
+impl RowRoute {
+    /// Route-explained (the user's decision 2026-10-27, P1 and P3): CUDA's pick differs from
+    /// HF-f32's at one or more layers, and P9's rule accepts every one of those differences.
+    fn explained(&self) -> bool {
+        !self.differs.is_empty() && self.accepted
+    }
+}
+
+/// Every row of a prompt under P9's rule, from CUDA's picks per layer (`cuda[layer][row]`) and
+/// the prompt's routing dump: per row, the layers where its pick differs and whether every such
+/// difference is accepted. A difference is accepted exactly as `p9_expert_picks_match_hf_f32`
+/// accepts it: inside a router tie (layers ≥ 1, and layer 0); outside one, at a layer ≥ 1, when
+/// the same token flipped at an earlier layer or HF-bf16 flips at least as many tokens as CUDA in
+/// that layer ([`layer_rule`]'s excuses, per row).
+fn row_routes(cuda: &[Vec<BTreeSet<i32>>], route: &Route) -> Vec<RowRoute> {
+    let n = route.rows;
+    let mut rows: Vec<RowRoute> = (0..n)
+        .map(|_| RowRoute {
+            differs: Vec::new(),
+            accepted: true,
+        })
+        .collect();
+    let mut flipped = vec![false; n];
+    for (layer, picks) in cuda.iter().enumerate() {
+        let tau = route.tau(layer);
+        let differs: Vec<bool> = (0..n)
+            .map(|row| picks[row] != route.f32.set(n, layer, row))
+            .collect();
+        let flips = differs.iter().filter(|&&d| d).count();
+        let bf16_flips = (0..n)
+            .filter(|&row| route.bf16.set(n, layer, row) != route.f32.set(n, layer, row))
+            .count();
+        for row in (0..n).filter(|&row| differs[row]) {
+            let (tie, _) = route.tie(layer, row, tau);
+            // The row's own difference under `layer_rule`: inside a tie it is no outside flip;
+            // outside one it is excused by its earlier flip, or else counted not excused.
+            let outside = usize::from(!tie);
+            let (excused, unexcused) = match (tie, flipped[row]) {
+                (true, _) => (0, 0),
+                (false, true) => (1, 0),
+                (false, false) => (0, 1),
+            };
+            let (ok, ..) = layer_rule(layer, (outside, excused, unexcused), (flips, bf16_flips));
+            rows[row].differs.push(layer);
+            rows[row].accepted &= ok;
+        }
+        for (row, &d) in differs.iter().enumerate() {
+            flipped[row] |= d;
+        }
+    }
+    rows
+}
+
+/// Per prompt, every row under P9's rule (the user's decision 2026-10-27, P1 and P3): CUDA's
+/// picks at each MoE layer from one fresh forward of the cut tape, against the prompt's routing
+/// dump `route_<p>.bin`. Empty for a dense model, which routes nothing, so the rule changes
+/// nothing there.
+fn prompt_routes(r: &Rig) -> Vec<Vec<RowRoute>> {
+    let (cuts, top_k) = route_cut_tapes();
+    if cuts.is_empty() {
+        return prompts().iter().map(|_| Vec::new()).collect();
+    }
+    let mut w = CudaWorker::new(&r.device, cuts, &r.weights, Some(KV_POOL), GDN_POOL)
+        .unwrap_or_else(|e| panic!("CudaWorker::new over the {} route cuts: {e}", cuts.len()));
+    (prompts().iter())
+        .map(|p| {
+            let n = p.ids.len();
+            let route = read_route_of(&format!("route_{}.bin", p.p), n, (cuts.len(), top_k));
+            let picks: Vec<Vec<BTreeSet<i32>>> = (0..cuts.len())
+                .map(|layer| {
+                    let out = run_cut(&mut w, (cuts, layer), &p.ids);
+                    let idx: Vec<i32> = (out.as_chunks::<2>().0.iter())
+                        .map(|&[lo, hi]| (u32::from(lo) | u32::from(hi) << 16) as i32)
+                        .collect();
+                    (idx.chunks(top_k).take(n))
+                        .map(|row| row.iter().copied().collect())
+                        .collect()
+                })
+                .collect();
+            row_routes(&picks, &route)
+        })
+        .collect()
+}
+
+/// One fresh forward of `ids` through tape `b` of `tapes` (a cut worker's own list) in
+/// [`SEAT_A`]: the whole result, as u16 halves.
+fn run_cut(
+    w: &mut CudaWorker<'_>,
+    (tapes, b): (&[scratchy_target_cuda::tape::CudaTape], usize),
+    ids: &[u32],
+) -> Vec<u16> {
+    let tape = &tapes[b];
+    let q = ids.len() as u32;
+    let mut padded = vec![0u32; M as usize];
+    padded[..ids.len()].copy_from_slice(ids);
+    let positions: Vec<u32> = (0..M).collect();
+    let kv = KvSequence {
+        block_table: SEAT_A.0,
+        prefix_len: 0,
+        q_len: q,
+    };
+    let gdn = GDN_POOL.map(|_| GdnSequence {
+        slot: SEAT_A.1,
+        q_len: q,
+        fresh: true,
+    });
+    let mut out = vec![0u16; tape.result.bytes as usize / 2];
+    w.forward(
+        b,
+        Input::TokenIds(&padded),
+        &positions,
+        Some(&kv),
+        gdn.as_ref(),
+        &mut out,
+    )
+    .unwrap_or_else(|e| panic!("the forward cut after MoE layer {b}'s routing: {e}"));
+    out
 }
 
 /// The prompts' CUDA logits, one forward each from fresh state: computed once per test binary.
@@ -674,13 +831,53 @@ fn memory_fits() {
 fn p1_to_p4_one_forward_per_prompt() {
     let r = rig();
     let cuda = cuda_logits(&r);
+    let routes = prompt_routes(&r);
     let (mut p1, mut p2, mut p3, mut p4) = (true, true, true, true);
     let (mut agree, mut total) = (0usize, 0usize);
-    for (p, got) in prompts().iter().zip(&cuda) {
+    for ((p, got), route) in prompts().iter().zip(&cuda).zip(&routes) {
         let n = p.ids.len();
-        // P1.
-        let min_cos = (rows(got).zip(rows(&p.f32)))
-            .map(|(a, b)| cosine(a, b))
+        // A route-explained row: its CUDA picks differ from HF-f32's at some layer, and P9's rule
+        // accepts every such difference (the user's decision 2026-10-27). Empty for a dense model.
+        let explained = |row: usize| route.get(row).is_some_and(RowRoute::explained);
+        let excused: Vec<usize> = (0..n).filter(|&row| explained(row)).collect();
+        if !route.is_empty() {
+            eprintln!(
+                "P1/P3 prompt {}: {} of {n} rows route-explained (picks differ from HF-f32's \
+                 only where P9 accepts it; the user's decision 2026-10-27) {:?}",
+                p.p,
+                excused.len(),
+                excused
+            );
+        }
+        for &row in &excused {
+            let (c, f, b) = (
+                &got[row * VOCAB..][..VOCAB],
+                &p.f32[row * VOCAB..][..VOCAB],
+                &p.bf16[row * VOCAB..][..VOCAB],
+            );
+            eprintln!(
+                "P1/P3 prompt {} row {row}: route-explained, cosine(CUDA, f32)={:.6} \
+                 cosine(HF-bf16, f32)={:.6}, picks differ at layers {:?} (excused from P1's min \
+                 and P3)",
+                p.p,
+                cosine(c, f),
+                cosine(b, f),
+                route[row].differs
+            );
+        }
+        // P1, over the rows that are not route-explained (all of a dense model's).
+        if !route.is_empty() {
+            eprintln!(
+                "P1 prompt {}: min cosine over the {} rows not route-explained, {} excused (the \
+                 user's decision 2026-10-27)",
+                p.p,
+                n - excused.len(),
+                excused.len()
+            );
+        }
+        let min_cos = (rows(got).zip(rows(&p.f32)).enumerate())
+            .filter(|&(row, _)| !explained(row))
+            .map(|(_, (a, b))| cosine(a, b))
             .fold(f64::INFINITY, f64::min);
         let noise_cos = (rows(&p.bf16).zip(rows(&p.f32)))
             .map(|(a, b)| cosine(a, b))
@@ -731,6 +928,9 @@ fn p1_to_p4_one_forward_per_prompt() {
         // `ties`: the rows whose f32 margin is at most twice their noise, counted whether or not
         // CUDA agrees; `near`: those of them CUDA disagrees on.
         let (mut ties, mut near, mut wrong, mut last_ok) = (Vec::new(), 0usize, Vec::new(), true);
+        // Top-1 disagreements outside near-ties on route-explained rows: accepted (the user's
+        // decision 2026-10-27), printed.
+        let mut routed = Vec::new();
         for (row, ((c, f), b)) in rows(got).zip(rows(&p.f32)).zip(rows(&p.bf16)).enumerate() {
             let top = top_k(f, 2);
             let margin = f64::from(f[top[0]] - f[top[1]]);
@@ -745,21 +945,36 @@ fn p1_to_p4_one_forward_per_prompt() {
             if !same && tie {
                 near += 1;
             }
-            if !same && !tie {
+            if !same && !tie && explained(row) {
+                routed.push(row);
+            } else if !same && !tie {
                 wrong.push(row);
             }
             if row == n - 1 && !same {
-                last_ok = tie;
+                last_ok = tie || explained(row);
                 eprintln!(
                     "P3 prompt {}: last row disagrees, f32 margin {margin:.4e} vs 2x noise \
                      {:.4e}: {}",
                     p.p,
                     2.0 * noise,
-                    if tie { "near-tie" } else { "NOT a near-tie" }
+                    match (tie, explained(row)) {
+                        (true, _) => "near-tie",
+                        (false, true) => "NOT a near-tie, route-explained",
+                        (false, false) => "NOT a near-tie",
+                    }
                 );
             }
         }
         let ok3 = wrong.is_empty() && last_ok;
+        if !route.is_empty() {
+            eprintln!(
+                "P3 prompt {}: top-1 disagreements outside near-ties accepted as route-explained \
+                 (the user's decision 2026-10-27)={} {:?}",
+                p.p,
+                routed.len(),
+                routed
+            );
+        }
         eprintln!(
             "P3 prompt {}: top-1 disagreements outside near-ties={} {:?}, near-tie rows={} {:?} \
              (of them CUDA disagrees on {near}) {}",
@@ -808,6 +1023,14 @@ fn p1_to_p4_one_forward_per_prompt() {
             ),
         }
     );
+    if routes.iter().any(|r| !r.is_empty()) {
+        eprintln!(
+            "P1/P3 route-explained rows: a row whose CUDA picks differ from HF-f32's at one or \
+             more layers, every difference accepted by P9's rule, is left out of P1's min and \
+             its top-1 disagreement outside a near-tie is accepted by P3 (the user's decision \
+             2026-10-27); a row with any difference P9 does not accept stays fully gated"
+        );
+    }
     assert!(p1 && p2 && p3 && p4, "P1 {p1} P2 {p2} P3 {p3} P4 {p4}");
 }
 
