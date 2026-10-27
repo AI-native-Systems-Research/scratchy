@@ -1122,6 +1122,30 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
             vec![2],
             Program::Sample,
         ),
+        // ⭐ THE α CELL BASE (front-b-noise convert-door wall, auditor order
+        // 2026-10-27): a dense i32 add at `[2, 32]` — ONE STICK PER ROW — baked
+        // only as the GEOMETRY base for the card cell that decides the
+        // convert door's device law. The baked SDSC is mutated OFF-TREE (the
+        // kit's alpha_cell.py, the B1 `i2f_g1` recipe verbatim) to
+        // `int32tofp32` unary with Tensor2 at IEEE_FP32, asking the DEVICE
+        // whether a 32-ELEMENT slab per row is scheduler-legal — the tension
+        // convert_opspec's own comment states (a whole stick of the WIDER
+        // format = 32 elems for the i32→f32 pair) against its hardcoded
+        // 64-elem `StickExtent::<Fp16>` basis (reduce.rs:41-44's scheduler
+        // citation). The kernel is the dense add verbatim — the door CANNOT
+        // bake the convert at this width (that refusal IS the wall), so the
+        // base bakes the add and the mutation swaps only the op. NOT a
+        // production configuration: delete with the probe.
+        "intmr_alpha_base" => (
+            spec(
+                "intmr_probe",
+                "intmr_dense_add_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(32)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
         _ => return None,
     })
 }
