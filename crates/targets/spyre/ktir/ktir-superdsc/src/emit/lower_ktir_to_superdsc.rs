@@ -6314,7 +6314,8 @@ pub fn embed_row_gather(
     // byte-for-byte, `i mod 1 = 0`), at one entry's per-core LX charge instead of the
     // slab's. The run's `rows = hidden` is `k` entries by construction (the
     // entry-count law above). Row r's index is its OWN stick of the `[W, 32]` s
-    // buffer (`EntryBase::of_sticks(r)` — ZERO at r = 0) and its destination is its
+    // buffer (`EntryBase::of_scattered_row(r, W)` — flat stick r, ZERO at r = 0) and its
+    // destination is its
     // own patch of the one widened slab (`DestEntry::of_entries(r·hidden)` — ZERO at
     // r = 0: the W=1 descriptors are byte-identical). Leg 2 (the transpose): the
     // per-request `_at` form, row r's windows at element bases `r·hidden·stk` (slab)
@@ -6330,7 +6331,10 @@ pub fn embed_row_gather(
                 entry_dim: crate::superdsc_opspec::KernelAxis::Batch,
                 page: crate::superdsc_opspec::PageExtent::of_positions(page),
                 per_position: None,
-                first_entry: crate::superdsc_opspec::EntryBase::of_sticks(r),
+                // Row r's stick of the one-stick-wide `[width, ustk]` s buffer,
+                // at the scatter law's own spelling (flat stick r; ZERO at
+                // r = 0, the W=1 byte-identity).
+                first_entry: crate::superdsc_opspec::EntryBase::of_scattered_row(r, width),
             },
             crate::sdsc_abstract::GatherCopySpec {
                 rows: hidden,
@@ -6401,8 +6405,8 @@ pub fn embed_row_gather(
     // of one op WRAP — another core's pages gathered with a clean bake. The KV fold's own
     // remedy (`GatherScratch::copies`), verbatim: op `(r, b)` runs
     // `min(cap, row_entries − cap·b)` entries, reads the index at
-    // `EntryBase::of_sticks(r·l_sticks + b)` (row r's stick b of the one-stick-wide
-    // lane buffer), and lands at `DestEntry::of_entries(r·row_entries + cap·b)` — the
+    // `EntryBase::of_scattered_row(r·l_sticks + b, width·l_sticks)` (row r's stick b of the
+    // one-stick-wide lane buffer, at the scatter law's own spelling), and lands at `DestEntry::of_entries(r·row_entries + cap·b)` — the
     // dest entry and the index base in the WINDOW-GRANULAR LOCKSTEP, stated at both
     // sites rather than derived so their agreement is visible. The index VALUES carry no
     // source base — they are ABSOLUTE slabt stick numbers, the KV pool's own
@@ -6430,8 +6434,12 @@ pub fn embed_row_gather(
                         entry_dim: crate::superdsc_opspec::KernelAxis::Batch,
                         page: crate::superdsc_opspec::PageExtent::of_positions(1),
                         per_position: None,
-                        first_entry: crate::superdsc_opspec::EntryBase::of_sticks(
+                        // Row (r, b)'s stick of the one-stick-wide
+                        // `[width·l_sticks, ustk]` lane buffer, at the scatter
+                        // law's own spelling (flat stick r·l_sticks + b).
+                        first_entry: crate::superdsc_opspec::EntryBase::of_scattered_row(
                             r * l_sticks + b,
+                            width * l_sticks,
                         ),
                     },
                     crate::sdsc_abstract::GatherCopySpec {
@@ -6599,9 +6607,10 @@ pub fn chain_stage(
     // ⛔ THE PICK-STICK CLASS: [W, 64] — the sampler idx stick's own shape (i32
     // lanes, every lane of row r equal to pick_r, the value below 2^24 so the
     // u32 read is the same number). Each gather spends ONE entry of row r's
-    // first u32 stick — word 64·r of the flat index read, a whole u32-stick
-    // multiple (64 = 2·32), so the IBR's one-stick load starts on a stick at
-    // every row.
+    // first u32 stick — flat stick `r` under the scatter law (a `[rows, cols]`
+    // device tensor lays element `(r, c)` at stick `(c/32)·width + r`, so row
+    // r's first stick is `r` and its second `width + r`; a 64-word row is never
+    // contiguous), reached through `EntryBase::of_scattered_row` below.
     if pick.v_cols != 64 {
         return err(format!(
             "{name}: the pick stick t{} states [{}, {}] — the chain stage reads the sampler \
@@ -6691,7 +6700,8 @@ pub fn chain_stage(
     // `page = of_positions(1)` (one u32 stick per page, `skip_addr` = one
     // s-table row per index step), `rows = 1`, `cols = ustk` — the u32
     // one-stick law — and the index is the pick's own name at row r's first
-    // u32 stick (`EntryBase::of_sticks(2r)` — word 64·r; ZERO at r = 0),
+    // u32 stick (`EntryBase::of_scattered_row(r, width)` — flat stick r under
+    // the scatter law; ZERO at r = 0),
     // landing at `DestEntry::of_entries(r)` of the `[width, ustk]` destination
     // (ZERO at r = 0: the W=1 descriptors are byte-identical). The tables are
     // the graph's own sources, named by their regions. The l leg is ONE entry
@@ -6712,7 +6722,18 @@ pub fn chain_stage(
     let ltab_name = l_tab.name();
     let lname = l_stick.name();
     for r in 0..width {
-        let pick_base = crate::superdsc_opspec::EntryBase::of_sticks(2 * r);
+        // ⭐ ROW r'S PICK, AT THE SCATTER LAW'S OWN SPELLING — the pick stick is a
+        // `[width, 64]` i32 tensor, and a `[rows, cols]` device tensor is
+        // STICK-SCATTERED: element `(r, c)` lands at stick `(c/32)·width + r`, so
+        // row r's FIRST u32 stick is flat stick `r` and its second sits at
+        // `width + r` — a 64-word row is never contiguous on the device. The old
+        // `of_sticks(2·r)` assumed row-major-contiguous rows: at width 1 the two
+        // spellings coincide (2r = r = 0), and at every wider width row 1 read
+        // ROW 0's lanes 32..63 — which hold pick_0 (the sampler splats the pick
+        // across all 64 lanes), so both rows staged row 0's decompose with a
+        // clean bake. `of_scattered_row` takes the row and the tensor's own row
+        // count, so the row-major stride cannot be expressed.
+        let pick_base = crate::superdsc_opspec::EntryBase::of_scattered_row(r, width);
         let s_table_gather = |table: &str, dest: &str| {
             crate::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
                 table,

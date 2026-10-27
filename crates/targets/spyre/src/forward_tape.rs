@@ -226,25 +226,15 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
                     .to_string(),
             );
         };
-        let tok = inp
-            .tokens
-            .first()
-            .copied()
-            .ok_or_else(|| {
-                "ChainSeed step on a forward with no token to seed from".to_string()
-            })?
-            // The host's token ids are usize; the seed is a u32 WORD. The cast
-            // is the same boundary the worker's twin makes (`toks[n-1] as u32`)
-            // — the one place the id crosses into the stick's lane-value world,
-            // before the decompose, so the arithmetic runs in the width the
-            // device's own ChainStage writes.
-            as u32;
+        if inp.tokens.is_empty() {
+            return Err(
+                "ChainSeed step on a forward with no token to seed from — the sticks are the \
+                 gather's only index, and an unstaged one gathers the wrong row silently"
+                    .to_string(),
+            );
+        }
         let is_s = step.tensor == PlaceId::Act(chain.s_src);
-        let v = if is_s {
-            tok >> 6
-        } else if step.tensor == PlaceId::Act(chain.l_src) {
-            tok & 63
-        } else {
+        if !is_s && step.tensor != PlaceId::Act(chain.l_src) {
             return Err(format!(
                 "ChainSeed step on t{} — the chain names t{} (s) and t{} (l), and a seed landing \
                  anywhere else is a stick the gather never reads",
@@ -252,25 +242,23 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
                 chain.s_src,
                 chain.l_src
             ));
-        };
-        // ⭐ THE S STICK CARRIES THE LANE PATTERN — lane `i` stages
-        // `k·s + (i mod k)` (`chain_s_stick_pattern`, the ONE spelling, shared
-        // with the worker's twin push): the same bytes the device's own
-        // ChainStage writes for the same pick, which is what keeps this seed
-        // idempotent with the device's writes at every k (the claim the
-        // comment above this arm makes). The l stick carries the LANE RAMP —
-        // word `i` stages `64·(i mod (hidden/64)) + l`
-        // (`chain_l_stick_ramp`, the ONE spelling, shared with the worker's
-        // twin push, SELF-SIZED at the stick count): the transposed row's
-        // own sticks, the whole multi-stick index the row gather's per-stick
-        // cut walks, the same ramp the device's l_tab writes for the same
-        // pick. At one entry (hidden 64) the ramp IS the splat
-        // (`i mod 1 = 0`): the degenerate's seed is the old byte-for-byte.
-        let lanes = scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK as usize;
+        }
+        // ⭐ THE SEEDS ARE PER-REQUEST-ROW AT THE LAUNCH'S OWN WIDTH — the ONE
+        // per-row spelling (`chain_s_seed` / `chain_l_seed`, the same fns the
+        // emulator's twin push calls): row r carries ITS OWN token's decompose,
+        // pad rows repeat the last real token's, and the s seed is
+        // `[rows, lanes]` while the l seed is `[rows·l_sticks, lanes]` — the
+        // placement shapes the mint states and the doors cross-check. The OLD
+        // solo spelling staged `tokens.first()` and ONE stick — row 0's — at
+        // every width, leaving every later row's sticks unstaged (an unstaged
+        // index reads whatever was there, a fluent wrong row). At `rows == 1`
+        // the per-row spelling IS the solo one byte-for-byte, so the W=1
+        // byte-identity rides the same construction rather than a width branch.
+        let toks: Vec<u32> = inp.tokens.iter().map(|&t| t as u32).collect();
         let words = if is_s {
-            scratchy_subtile::subtile_ir::chain_s_stick_pattern(chain.k, v, lanes)
+            scratchy_subtile::subtile_ir::chain_s_seed(chain.k, &toks, rows)
         } else {
-            scratchy_subtile::subtile_ir::chain_l_stick_ramp(v, chain.hidden)
+            scratchy_subtile::subtile_ir::chain_l_seed(&toks, chain.hidden, rows)
         };
         return Ok(Staged::U32(std::borrow::Cow::Owned(words)));
     }

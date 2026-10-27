@@ -2028,55 +2028,24 @@ pub(crate) fn forward_chunk(
         match b.phase {
             scratchy_target_spyre::forward_tape::ForwardPhase::Decode { chain } => {
                 // ⭐ THE SEEDS ARE PER-REQUEST-ROW AT THE FORWARD'S OWN WIDTH —
-                // row i carries ITS OWN token's decompose (`toks[i.min(n-1)]`,
-                // the same clamp the embed fill above uses: pad rows repeat the
-                // last real token's seed, idempotent with the device's own
-                // ChainStage writes exactly as the solo push was). The s seed
-                // is `[rows, lanes]` — one whole pattern stick per row — and
-                // the l seed is `[rows·l_sticks, lanes]`, row i's ramp sticks
-                // then row i+1's, the placement shape the mint states. At
-                // `rows == 1` both pushes are the solo spelling byte-for-byte.
+                // the ONE per-row spelling (`chain_s_seed` / `chain_l_seed`,
+                // the same fns the card path's ChainSeed tape arm calls): row i
+                // carries ITS OWN token's decompose, pad rows repeat the last
+                // real token's (the same clamp the embed fill above uses,
+                // idempotent with the device's own ChainStage writes). The s
+                // seed is `[rows, lanes]` — one whole pattern stick per row —
+                // and the l seed is `[rows·l_sticks, lanes]`, row i's ramp
+                // sticks then row i+1's, the placement shape the mint states.
+                // At `rows == 1` both pushes are the solo spelling
+                // byte-for-byte.
                 let lanes = scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK as usize;
                 let l_sticks =
                     scratchy_subtile::subtile_ir::chain_l_sticks(chain.hidden) as usize;
-                // ⭐ THE S SEED CARRIES THE LANE PATTERN — lane `i` stages
-                // `k·(last>>6) + (i mod k)` (`chain_s_stick_pattern`, the ONE
-                // spelling, shared with the tape seed the card path's ChainSeed
-                // steps state): the same bytes the device's own ChainStage
-                // writes for the same pick, which is what keeps the idempotence
-                // claim above true at k > 1. The pattern words stay in the
-                // splat's own magnitude class (granite: s ≤ 49154>>6 = 768, so
-                // the words ≤ 4·768 + 3 = 3075, far under 2^24), so the
-                // bit-preserving `f32::from_bits` carrying round-trips them
-                // exactly. At k = 1 the pattern IS the splat.
-                let mut s_words = Vec::with_capacity(rows * lanes);
-                // ⭐ THE L SEED CARRIES THE LANE RAMP — word `i` stages
-                // `64·(i mod (hidden/64)) + (last&63)` (`chain_l_stick_ramp`,
-                // the ONE spelling, shared with the tape seed and the
-                // device's l_tab, SELF-SIZED at the stick count): the
-                // transposed row's own sticks, the WHOLE multi-stick index
-                // the row gather's per-stick cut walks, the same ramp the
-                // device's tables write for the same pick. The ramp words stay
-                // in the splat's own magnitude class (the largest names stick
-                // `hidden − 1`, 4095 at 8b, far under 2^24), so the
-                // bit-preserving `f32::from_bits` carrying round-trips them
-                // exactly.
-                let mut l_words = Vec::with_capacity(rows * l_sticks * lanes);
-                for row in 0..rows {
-                    let t = toks[row.min(n - 1)] as u32;
-                    s_words.extend(
-                        scratchy_subtile::subtile_ir::chain_s_stick_pattern(
-                            chain.k,
-                            t >> 6,
-                            lanes,
-                        )
-                        .into_iter(),
-                    );
-                    l_words.extend(
-                        scratchy_subtile::subtile_ir::chain_l_stick_ramp(t & 63, chain.hidden)
-                            .into_iter(),
-                    );
-                }
+                let toks32: Vec<u32> = toks.iter().map(|&t| t as u32).collect();
+                let s_words =
+                    scratchy_subtile::subtile_ir::chain_s_seed(chain.k, &toks32, rows);
+                let l_words =
+                    scratchy_subtile::subtile_ir::chain_l_seed(&toks32, chain.hidden, rows);
                 dynamic.push((
                     chain.s_src as u64,
                     s_words.iter().map(|w| f32::from_bits(*w)).collect(),

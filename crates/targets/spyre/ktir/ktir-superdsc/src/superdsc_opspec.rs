@@ -2668,6 +2668,33 @@ impl EntryBase {
         EntryBase(sticks * <SenUint32 as DataFormat>::ELEMS_PER_STICK)
     }
 
+    /// ⭐ THE FIRST STICK OF ONE ROW OF A STICK-SCATTERED `[rows, …]` TENSOR — the scatter
+    /// law's own spelling of "row `r`'s index starts here", and the ONLY spelling a per-row
+    /// index base may take.
+    ///
+    /// ⛔ A `[rows, cols]` DEVICE TENSOR IS STICK-SCATTERED: element `(r, c)` lands at stick
+    /// `(c/EPS)·rows + r`, so row `r`'s first stick is flat stick `r` and its LATER sticks sit
+    /// at `b·rows + r`, interleaved with every other row's — a multi-stick row is NEVER
+    /// contiguous on the device. A base spelled as a WORD offset of a row-major layout
+    /// (`64·r` for a 64-word row) compiles at `rows == 1`, where the two spellings coincide,
+    /// and at every wider width reads ANOTHER ROW's lanes with a clean bake — the exact
+    /// W=1-hidden defect this constructor removes. It takes the ROW and the tensor's own row
+    /// count and nothing else, so a word count or a row-major stride cannot be expressed as
+    /// one: `row` must name a real row of a `rows`-row tensor, and the scatter law answers
+    /// the stick.
+    pub const fn of_scattered_row(row: u32, rows: u32) -> EntryBase {
+        assert!(
+            rows > 0,
+            "of_scattered_row: a 0-row tensor has no row to name"
+        );
+        assert!(
+            row < rows,
+            "of_scattered_row: the row is past the tensor's own row count — the scatter law \
+             names only real rows"
+        );
+        EntryBase::of_sticks(row)
+    }
+
     /// A base stated directly in ENTRIES — the program's own anchor for a gather whose run starts
     /// past its index buffer's first word (an unrolled sweep's trip `b` states `b · BLOCK_N`).
     ///
@@ -3605,6 +3632,34 @@ mod tests {
         // And the starts that ARE whole sticks build.
         assert!(StickRun::covering(0, 8).is_ok());
         assert!(StickRun::covering(32, 8).is_ok());
+    }
+
+    /// ⭐ A ROW-MAJOR PICK BASE CANNOT BE BUILT — `of_scattered_row` takes the ROW and the
+    /// tensor's own row count, so the `2·r` word-offset spelling that read row 0's lanes as
+    /// row 1's pick at every width past one (the W=1-hidden b2 defect) has no expression:
+    /// only a real row of a real row count goes in, and the scatter law answers the stick.
+    #[test]
+    fn a_row_major_pick_base_cannot_be_built() {
+        // Row r's first stick IS flat stick r at every width — the scatter law.
+        for rows in [1u32, 2, 4, 8] {
+            for r in 0..rows {
+                assert_eq!(
+                    EntryBase::of_scattered_row(r, rows),
+                    EntryBase::of_sticks(r),
+                    "row {r} of a {rows}-row tensor starts at its own flat stick"
+                );
+            }
+        }
+        // A row past the tensor's own row count is refused, never wrapped onto
+        // another row's sticks — the `2·r` shape dies here at every width > 1.
+        let err = std::panic::catch_unwind(|| EntryBase::of_scattered_row(2, 2))
+            .expect_err("row 2 of a 2-row tensor is not a row");
+        let err = err.downcast_ref::<&str>().copied().unwrap_or_default();
+        assert!(
+            err.contains("scatter law names only real rows"),
+            "the refusal must name the scatter law. Got: {err}"
+        );
+        assert!(std::panic::catch_unwind(|| EntryBase::of_scattered_row(1, 0)).is_err());
     }
 
     /// ⭐ THE RUN IS THE STICKS THE ENTRIES OCCUPY, NOT THE ENTRIES — the span half of `covering`

@@ -2101,6 +2101,54 @@ pub fn chain_l_sentinel_ramp(hidden: u32) -> Vec<u32> {
     (0..words).map(|j| hidden + j as u32 % entries).collect()
 }
 
+// ── The seeds at the launch's own width (the ONE per-row spelling) ──
+
+/// ⭐⭐⭐ THE S SEED AT THE LAUNCH'S OWN WIDTH — `[rows, CHAIN_IDX_BLOCK]` u32 words,
+/// row `r` carrying ITS OWN token's pattern (`chain_s_stick_pattern` of
+/// `toks[r.min(n-1)] >> 6`): the seed a batched decode's every row gathers with,
+/// and the same bytes the device's own [`ChainStage`]-table gathers write for the
+/// same picks — which is what keeps a host seed idempotent with the device's
+/// writes at every width.
+///
+/// ⛔ THE CLAMP IS THE PAD-ROW LAW, not a convenience: the seed's rows are the
+/// LAUNCH's rows (`rows`, the baked rung width) while `toks` names the REAL rows
+/// (`n ≤ rows`), and a pad row repeats the last real token's decompose — the same
+/// law the embedding staging and `ChunkRows::row_logical_pos` pin, so the sticks
+/// and the rows they feed cannot disagree at a pad row.
+///
+/// At `rows == 1` this is the solo spelling byte-for-byte (one stick, the one
+/// token's pattern) — the degenerate every W=1 rung rode before the batched rung
+/// existed, kept exact by construction rather than by a width branch.
+pub fn chain_s_seed(k: u32, toks: &[u32], rows: usize) -> Vec<u32> {
+    assert!(
+        !toks.is_empty(),
+        "chain_s_seed: no token to seed from — a chain with no token names no slab"
+    );
+    let lanes = CHAIN_IDX_BLOCK as usize;
+    let last = toks.len() - 1;
+    (0..rows)
+        .flat_map(|r| chain_s_stick_pattern(k, toks[r.min(last)] >> 6, lanes))
+        .collect()
+}
+
+/// ⭐⭐⭐ THE L SEED AT THE LAUNCH'S OWN WIDTH — `[rows·l_sticks, CHAIN_IDX_BLOCK]`
+/// u32 words, row `r`'s `l_sticks` ramp sticks (`chain_l_stick_ramp` of
+/// `toks[r.min(n-1)] & 63`) then row `r+1`'s — the placement shape the mint
+/// states and the row gather's per-stick cut walks.
+///
+/// The clamp is the pad-row law [`chain_s_seed`] states; at `rows == 1` this is
+/// the solo spelling byte-for-byte.
+pub fn chain_l_seed(toks: &[u32], hidden: u32, rows: usize) -> Vec<u32> {
+    assert!(
+        !toks.is_empty(),
+        "chain_l_seed: no token to seed from — a chain with no token names no lane"
+    );
+    let last = toks.len() - 1;
+    (0..rows)
+        .flat_map(|r| chain_l_stick_ramp(toks[r.min(last)] & 63, hidden))
+        .collect()
+}
+
 // ── The tied embed weight's pad widening (the chained head's extent law) ──
 
 /// What [`widen_tied_embed_weight`] stated, for the caller's bake log.
@@ -5663,5 +5711,61 @@ mod tests {
             expect,
             "the patterned slab re-joins: word0/k is the slab, the ramp's word0 the lane"
         );
+    }
+
+    /// ⭐ THE SEEDS ARE PER-ROW AT THE LAUNCH'S OWN WIDTH — row r carries ITS OWN token's
+    /// decompose, pad rows repeat the last real token's, and `rows == 1` is the solo
+    /// spelling byte-for-byte. This is the pin for the W=1-hidden b2 defect: the card
+    /// path's tape arm staged `tokens.first()` and ONE stick at every width, so row 1's
+    /// index never landed and its slab gather read whatever was there.
+    #[test]
+    fn the_chain_seeds_carry_every_row_at_the_launch_width() {
+        let hidden = 2048u32;
+        let k = 4u32;
+        let lanes = CHAIN_IDX_BLOCK as usize;
+        let toks = [64u32 * 5 + 33, 64 * 7 + 60, 64 * 9 + 12];
+        // PER-ROW: row r's stick is its own token's pattern/ramp, not row 0's.
+        let s = chain_s_seed(k, &toks, 2);
+        assert_eq!(
+            s,
+            [
+                chain_s_stick_pattern(k, toks[0] >> 6, lanes),
+                chain_s_stick_pattern(k, toks[1] >> 6, lanes)
+            ]
+            .concat(),
+            "row 1's s stick carries row 1's token, not row 0's"
+        );
+        let l = chain_l_seed(&toks, hidden, 2);
+        assert_eq!(
+            l,
+            [
+                chain_l_stick_ramp(toks[0] & 63, hidden),
+                chain_l_stick_ramp(toks[1] & 63, hidden)
+            ]
+            .concat(),
+            "row 1's l sticks carry row 1's token, not row 0's"
+        );
+        // THE PAD-ROW CLAMP: rows past the real tokens repeat the last real
+        // token's seed — the same law the embedding staging pins.
+        let s_pad = chain_s_seed(k, &toks, 5);
+        assert_eq!(
+            s_pad[4 * lanes..],
+            chain_s_stick_pattern(k, toks[2] >> 6, lanes),
+            "a pad row repeats the last real token's pattern"
+        );
+        // THE SOLO DEGENERATE: at one row the seed IS the one stick, byte for
+        // byte — the W=1 rung's own spelling, kept exact by construction.
+        assert_eq!(
+            chain_s_seed(k, &toks, 1),
+            chain_s_stick_pattern(k, toks[0] >> 6, lanes)
+        );
+        assert_eq!(
+            chain_l_seed(&toks, hidden, 1),
+            chain_l_stick_ramp(toks[0] & 63, hidden)
+        );
+        // An empty token list is a refusal, never a zero stick (zero is a valid
+        // entry and a valid lane).
+        assert!(std::panic::catch_unwind(|| chain_s_seed(k, &[], 1)).is_err());
+        assert!(std::panic::catch_unwind(|| chain_l_seed(&[], hidden, 1)).is_err());
     }
 }
