@@ -120,6 +120,10 @@ pub enum Refused {
     /// metal tape carries no Sample node by construction — one that does is a wiring bug named
     /// here, not a missing lowering to write.
     DeviceSampler,
+    /// The spyre chain mint's cross-step pair — metal's pick never left the host, so
+    /// there is no metal lowering to write; a node here is a wiring bug (a chain-minted
+    /// graph handed to the metal tape), never a missing kernel.
+    ChainedHead,
 }
 
 impl std::fmt::Display for StepRefusal {
@@ -2416,6 +2420,11 @@ impl Recording<'_> {
             L::Sample { .. } => {
                 return Err(self.no(i, Refused::DeviceSampler));
             }
+            // The chained head's pair — the spyre chain mint's cross-step chain has no
+            // metal lowering to write (metal's pick never left the host), so a node here
+            // is the same wiring bug under the mint that constructs them.
+            L::EmbedRowGather { .. } | L::ChainStage { .. } => {
+                return Err(self.no(i, Refused::ChainedHead));
         }))
     }
 }

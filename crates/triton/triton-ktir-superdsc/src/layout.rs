@@ -699,11 +699,20 @@ fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
         // rather than `_` so a new `Program` variant is E0004 here, not a silent `None` that
         // pretends to have read a body it never had. (The MoE programs are no longer variants at
         // all — the MoE lowers only from `kernels/moe.py` through KTIR.)
+        //
+        // `EmbedRowGather` and `ChainStage` are HERE and only here: their bodies (the slab
+        // gather, the restickify transpose, the row gather, the relayout; the three one-entry
+        // table gathers) are the SPYRE door's — `ktir_superdsc_door`'s `lk::embed_row_gather`
+        // and `lk::chain_stage`, the `#603` chained head — minted by the spyre-side emitter and
+        // refused by name at the splice's registry, so a node carrying either into THIS crate is
+        // a routing change, not a missing arm.
         Program::RmsNormUnit
         | Program::TanhSoftCap
         | Program::ScalarWeightMul
         | Program::Reshape
-        | Program::WindowedRmsNorm { .. } => None,
+        | Program::WindowedRmsNorm { .. }
+        | Program::EmbedRowGather { .. }
+        | Program::ChainStage { .. } => None,
     }
 }
 
@@ -966,7 +975,12 @@ fn scales_for(
         | Program::Rope
         // The sampler's tables are tensor operands, never `scalarmul_scales` lookups —
         // a value registered for it would occupy a slot nothing asks for.
-        | Program::Sample => Vec::new(),
+        | Program::Sample
+        // `EmbedRowGather` and `ChainStage` are the spyre door's `#603` bodies (see the
+        // same note at `reserved_consts_for`); on THIS ladder they are refused at both
+        // the splice and the door, so there is no body to ask.
+        | Program::EmbedRowGather { .. }
+        | Program::ChainStage { .. } => Vec::new(),
         // ⭐ EMPTY FOR THE SAME REASON, ONE STEP EARLIER: `scalarweightmul`'s weight is a
         // RUNTIME fp16 scalar parameter (the program's own operand, staged by the host)
         // and `reshape` is a pure copy — neither resolves a registry value. Enumerated

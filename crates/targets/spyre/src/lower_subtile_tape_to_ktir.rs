@@ -20,6 +20,7 @@ use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ktir_node::ActiveCap;
 use ktir_superdsc::sdsc_abstract::POOL_STICK;
 use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR, SubtileId, SubtileNode, TensorId};
+use scratchy_subtile::subtile_ir::chain_slab_entries;
 use scratchy_subtile::superdsc_opspec::{DataFormat, DeviceTileLayout};
 
 /// The stable name of a HOST-ROUTED (data-movement) SubOp, for the host-routed
@@ -800,7 +801,244 @@ pub(crate) fn attn_bundle_params<F: RopeForm>(
     }))
 }
 
-/// Lower ONE [`SubtileNode`] to its SuperDSC op(s) — the single source of the
+// ════════════════════════════════════════════════════════════════════════════════════
+//  THE CHAINED HEAD'S HAND-MINTED PROGRAMS (#603)
+// ════════════════════════════════════════════════════════════════════════════════════
+//
+// ⭐⭐⭐ NO TRITON KERNEL, SO NO SPLICE — the chained head's pair is the `Transpose`
+// precedent class the other way round: a computed-value op whose body the DOOR assembles
+// (`lk::embed_row_gather`'s three legs; `lk::chain_stage`'s three one-entry table
+// gathers), so the producer's whole job is to state the DOOR-SHAPED SKELETON the door's
+// `regions()` walk reads — one `ktdp.construct_memory_view` per parameter (the TENSOR's
+// own extent), one `ktdp.construct_access_tile` over it (the NODE's own region: a slice
+// reaches the door as a stated window and the door's whole-view law refuses it BY NAME,
+// never silently widened), one load and one store through the output's tile. The
+// persistent s/l writes are GATHER DESTINATIONS the door names — no store states them,
+// which is exactly the KV-pool law (a placement the device owns, written by the body's
+// own ops, not by the program's output).
+
+/// One door-shaped KTIR skeleton for a chained-head node: the node's operands (inputs in
+/// order, the output LAST) as parameters, each with its view and its window, one load off
+/// the first input's tile and one store through the output's tile. The program kind and
+/// its payload are the caller's; the shapes are the graph's own.
+fn chain_skeleton<F: RopeForm>(
+    stem: &str,
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    program: ktir_superdsc::ktir_node::Program,
+) -> Result<ktir_superdsc::ktir_node::KtirNode, String> {
+    use ktir_core::arena::Arena;
+    use ktir_core::attrkey::AttrKey;
+    use ktir_core::ir::{Attr, Operation, Ssa};
+    use ktir_core::irtype::IrType;
+    use ktir_core::opkind::OpKind;
+
+    let a: &'static Arena = Arena::global();
+    // The operand list: the node's inputs, then the output — the splice's own
+    // `default_bindings` law, so the door's `regions()` and the placement census read
+    // the same order every other producer states.
+    let mut operands: Vec<scratchy_subtile::subtile_ir::TensorRegion> = node.inputs.clone();
+    operands.push(node.output);
+    let n = operands.len();
+    // ⭐ THE VIEW STATES THE TENSOR, THE TILE STATES THE REGION — the buffer extent is
+    // the tensor's own `[rows, cols]`, the window is the node's region of it, so a
+    // sliced operand arrives at the door as a stated window (refused there by name)
+    // and a whole one as `(0, 0)` over the full extent.
+    let extent = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
+        let s = ir.tensors[tr.tensor.index()];
+        (
+            (s.rows as i64, s.cols as i64),
+            (
+                tr.region.rows.start as i64,
+                tr.region.cols.start as i64,
+                tr.region.rows.len as i64,
+                tr.region.cols.len as i64,
+            ),
+        )
+    };
+    let mut ops: Vec<Operation<'static>> = Vec::with_capacity(3 * n + 3);
+    let mut fresh = 0u32;
+    let mut ssa = || {
+        fresh += 1;
+        Ssa(fresh + n as u32)
+    };
+    let shape_of = |op: Operation<'static>, rows: i64, cols: i64| {
+        op.with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![rows, cols])))
+    };
+    // One tile per operand, in operand order — the load reads the FIRST input's
+    // tile and the store writes the output's (the LAST) tile. No Option legs:
+    // the operand list is nonempty by construction (both callers check the
+    // mint's arity — three inputs plus the output — before minting).
+    let mut tiles = Vec::with_capacity(n);
+    for (i, tr) in operands.iter().enumerate() {
+        let p = Ssa(i as u32);
+        let ((rows, cols), (r0, c0, rlen, clen)) = extent(tr);
+        let v = ssa();
+        ops.push(shape_of(
+            Operation::new(a, Some(v), OpKind::KtdpConstructMemoryView, &[p]),
+            rows,
+            cols,
+        ));
+        // The tile's corner operands are CONSTANTS the door's `index_constants` walk
+        // reads — one pair per operand, minted even when both are zero, so the window
+        // is always STATED and never fallen back to the whole-view default.
+        let rc = ssa();
+        ops.push(
+            Operation::new(a, Some(rc), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Int(r0),
+            ),
+        );
+        let cc = ssa();
+        ops.push(
+            Operation::new(a, Some(cc), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Int(c0),
+            ),
+        );
+        let t = ssa();
+        ops.push(shape_of(
+            Operation::new(a, Some(t), OpKind::KtdpConstructAccessTile, &[v, rc, cc]),
+            rlen,
+            clen,
+        ));
+        tiles.push(t);
+    }
+    let first_tile = tiles[0];
+    let last_tile = tiles[tiles.len() - 1];
+    let val = ssa();
+    ops.push(Operation::new(
+        a,
+        Some(val),
+        OpKind::KtdpLoad,
+        &[first_tile],
+    ));
+    ops.push(Operation::new(
+        a,
+        None,
+        OpKind::KtdpStore,
+        &[val, last_tile],
+    ));
+    let bindings = operands
+        .iter()
+        .map(|tr| ktir_superdsc::ktir_node::BufferId::new(tr.tensor.index() as u32))
+        .collect();
+    Ok(ktir_superdsc::ktir_node::KtirNode {
+        func: ktir_core::ir::IRFunction {
+            name: a.str(format!("{stem}_s{}", node.id.index())),
+            arguments: a.args(
+                (0..n)
+                    .map(|i| (Ssa(i as u32), IrType::Index))
+                    .collect::<Vec<_>>(),
+            ),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        },
+        program,
+        bindings,
+        mask: None,
+        node_out_tid: None,
+        minted: Default::default(),
+    })
+}
+
+/// The gathered row's program — `Program::EmbedRowGather { k }`, `[s_stick, l_stick, weight]`
+/// in and the `[1, hidden]` row out, hand-minted over the node's own regions. `k` is the
+/// ONE SPELLING'S spyre-side call: this node carries no k of its own (the ChainStage's
+/// payload does), so the emitter asks [`chain_slab_entries`] at THIS node's own `hidden`
+/// — the same pure fn the mint stated, called on the same hidden, the ruled third site.
+fn embed_row_gather_emitted<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    hidden: u32,
+) -> Result<EmittedOp, String> {
+    if node.inputs.len() != 3 {
+        return Err(format!(
+            "embed_row_gather t{}: {} input(s) — the mint's shape is exactly three (the \
+             s stick, the l stick, the tied weight)",
+            node.output.tensor.index() as u32,
+            node.inputs.len()
+        ));
+    }
+    // `entries`, not `k` — the skeleton's own result binding is `k` (the
+    // KtirNode, the door's node-as-`k` idiom); a same-named entry count here
+    // would shadow it.
+    let entries = chain_slab_entries(u64::from(hidden)) as u32;
+    let k = chain_skeleton(
+        "embed_row_gather",
+        node,
+        ir,
+        ktir_superdsc::ktir_node::Program::EmbedRowGather { k: entries },
+    )?;
+    Ok(ktir_only(k))
+}
+
+/// The pick decompose's program — `Program::ChainStage { pad_vocab, table_rows, k, hidden }`,
+/// `[pick, s_stick, l_stick, s_tab, l_tab]` in and the fresh s-value stick out, hand-minted
+/// over the node's own regions. The two tables are ORDINARY TENSOR OPERANDS — the argmax
+/// nine's own idiom — staged once at load through [`crate::wiring::LoadConst::ChainStageTable`],
+/// never synths. `pad_vocab`, `table_rows`, and `k` arrive as PARAMETERS, paired at
+/// construction in the caller's own `SubOp::ChainStage` arm — the match that
+/// dispatches the node is the match that reads its payload, so no second dispatch exists
+/// here, and the door's extent check reads the stated `table_rows` rather than re-deriving
+/// it from `pad_vocab` in a second crate. `k` is the mint's own stated entry count, read
+/// from the same payload — never a derivation here. `hidden` is read off the PAIRED
+/// gather's own `hidden` payload — the same single statement `load_consts_of_ir` stages
+/// the `ChainStageTable`s from — never a second derivation: the mint splices the pair
+/// together, so the find cannot miss.
+fn chain_stage_emitted<F: RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+    pad_vocab: u32,
+    table_rows: u32,
+    k: u32,
+) -> Result<EmittedOp, String> {
+    if node.inputs.len() != 5 {
+        return Err(format!(
+            "chain_stage t{}: {} input(s) — the mint's shape is exactly five (the pick \
+             stick, the persistent s stick, the persistent l stick, the two decompose \
+             tables)",
+            node.output.tensor.index() as u32,
+            node.inputs.len()
+        ));
+    }
+    let hidden = ir
+        .nodes
+        .iter()
+        .find_map(|n| match n.op {
+            SubOp::EmbedRowGather { hidden, .. } => Some(hidden),
+            _ => None,
+        })
+        .expect(
+            "chain_stage_emitted: a ChainStage with no EmbedRowGather — the mint splices \
+             the pair together, so a stage with no gather is a graph the mint never made",
+        );
+    let k = chain_skeleton(
+        "chain_stage",
+        node,
+        ir,
+        ktir_superdsc::ktir_node::Program::ChainStage {
+            pad_vocab,
+            table_rows,
+            k,
+            hidden,
+        },
+    )?;
+    Ok(ktir_only(k))
+}
+
+/// One [`EmittedOp`] carrying ONLY its KTIR program — the splice's own `bare` law: the
+/// door is the body, so the producer states the program and nothing else.
+fn ktir_only(k: ktir_superdsc::ktir_node::KtirNode) -> EmittedOp {
+    let mut e = EmittedOp::bare(k.func.name.to_string());
+    e.ktir = Some(k);
+    e
+}
+
+/// Lower ONE [`SubtileNode`] to its SuperDSC op(s) — the single source of the the
 /// per-`SubOp` match. `ir` is needed only for `AttnDecode`'s cache-capacity lookup.
 /// ⭐⭐⭐ ONE NODE, ONE PROGRAM.
 ///
@@ -918,6 +1156,32 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         | SubOp::SampleRowsGather
         | SubOp::SampleRowsScatter
         | SubOp::AllRowsMatmul => Unhandled(format!("{:?} has no SuperDSC kernel", node.op)),
+        // ⭐ THE CHAINED HEAD'S PAIR — HAND-MINTED KTIR, never spliced: these are the
+        // `Transpose` precedent class (a computed-value op whose body the DOOR
+        // assembles), so the producer's whole statement is the door-shaped skeleton
+        // (`chain_skeleton`) plus the program kind. The door bodies are
+        // `lk::embed_row_gather` (the three legs) and `lk::chain_stage` (the three
+        // one-entry table gathers); the splice's registry routes these kinds back here
+        // BY NAME, so a node reaching it is a routing change, not a missing kernel.
+        // `replaces` is metadata for the wiring's chain fact — the ktir
+        // Program payload stays k-only (the stamp reads the SubOp fact).
+        SubOp::EmbedRowGather { hidden, .. } => {
+            match embed_row_gather_emitted(node, ir, *hidden) {
+                Ok(e) => Ops(vec![e]),
+                Err(reason) => Unhandled(reason),
+            }
+        }
+        // The payload's three u32s copy out of the borrowed op (the match is on
+        // `&node.op`, so the bindings are references) — the pair-at-construction
+        // call states all three, dereferenced at the call.
+        SubOp::ChainStage {
+            pad_vocab,
+            table_rows,
+            k,
+        } => match chain_stage_emitted(node, ir, *pad_vocab, *table_rows, *k) {
+            Ok(e) => Ops(vec![e]),
+            Err(reason) => Unhandled(reason),
+        },
         // ── THE 2a KINDS — every one through `lower_all`: the TanhSoftCap logits fold
         // and the head-norm sandwich's three seats (Reshape split / norm middle /
         // Reshape flatten) are `lower_all`'s interceptions, and every other node of
@@ -1322,6 +1586,14 @@ pub struct BundleWiring {
     /// as filled only when bound THIS step, never a held default (the class's
     /// own law, on [`crate::wiring::SampleSeat`]).
     pub sample_seat: Option<crate::wiring::SampleSeat>,
+    /// ⭐ THE CHAINED HEAD'S STICK FACT — [`crate::wiring::ChainFact::Chained`]
+    /// iff the mint spliced the EmbedRowGather/ChainStage pair into this
+    /// graph, naming the two persistent stick sources (derived by
+    /// [`chain_of_ir`], the one derivation). The worker's seed binds these
+    /// ids — staged per step in the per-step path (idempotent with the
+    /// device's own ChainStage writes) and once per block in the block
+    /// path; `Unchained` is every graph the mint did not touch.
+    pub chain: crate::wiring::ChainFact,
 }
 
 /// One program's parameter order: `args[i]` is the tensor the i-th parameter addresses.
@@ -1347,6 +1619,118 @@ pub(crate) struct WiringRegistries {
     pub rope_class_hds: Vec<u32>,
     pub attn_class_hds: Vec<u32>,
 }
+/// ⭐ THE HOST PAIR FOR A GEMM WEIGHT IS THE UNION OF ITS MATMUL CONSUMERS' VIEW REGIONS
+/// — never the tensor's STATED shape. The pair is what the host STAGES: the wiring's
+/// static `tensor_shapes` and the JSON tensors manifest are emitted from it (codegen's
+/// `shapes` tokens and the per-tensor `{"rows","cols"}` entries), and the worker's
+/// `stage_bound_weights` sizes everything off it — the disk guard (`rows·cols·elem`
+/// against the checkpoint bytes), the re-tile, the `DeviceWidth` N-pad, and the fp8
+/// K-pad rebuild. The STATED shape is what the placement RESERVES:
+/// `widen_tied_embed_weight` widens the tied embed weight's stated cols to the pick's
+/// pad so the chained head's gather is in extent BY TYPE, while every matmul's weight
+/// view keeps the region the lower baked from the OP DESCRIPTOR'S OWN `n`
+/// (`Range::new(0, n)` — never the tensor's stated cols), a partial view over the
+/// widened tensor. Pre-widen no source ever had stated ≠ region, so a stated-driven
+/// pair was indistinguishable from a region-driven one; the widen is the first, and
+/// the three-width-laws check caught the divergence at bake (2026-10-24: "the manifest
+/// declares 51200, the worker's N-pad law says 65536").
+///
+/// ONE WALK, ONE MAP, every stager reads: `graph_wiring`'s `tensor_shapes` and the
+/// three-width-laws check's worker law both take their pairs from HERE, so the host
+/// pair cannot drift between the wiring and the check — structurally, not by
+/// convention. Consumer-less tids deliberately miss the map and keep their stated
+/// pairs: per-layer copies have no node of their own in the rolled graph (the class's
+/// representative carries the consumer, and no copy tid is ever at a node's inputs).
+///
+/// THE UNION LAW — a B operand is read WHOLE, from zero: every MatmulTile consuming
+/// the weight at `inputs[1]` (arity 2 or 3 — the same gate the kernel0 collection
+/// walks) contributes its view's rows and cols spans, and each axis merges to ONE
+/// interval that must START AT ZERO (a lone consumer at [100, 200) is refused as
+/// firmly as a gap — the host pair would under-state the checkpoint and the failure
+/// would move to load), carry NO GAP between consecutive consumers (an NK-split's
+/// column blocks and a K-slice's row blocks tile exactly — `split_oversized_loads_pass`'s
+/// contract, stated where the lower bakes its regions), and NOT EXCEED the tensor's
+/// stated shape on either axis (the typed view-overrun guard; the merged end is the
+/// max consumer end, so one check covers every consumer). For every landed weight the
+/// One axis's consumer spans — each consumer's `(start, end)` on that axis.
+type WeightSpans = Vec<(u32, u32)>;
+
+/// union equals the stated shape — whole gemms by their single consumer, splits by
+/// their tiling — byte-identical to a stated-driven pair; for the widened tied embed
+/// it is the REAL vocab while the stated cols carry the pad.
+pub(crate) fn gemm_weight_host_pairs<F: RopeForm>(
+    ir: &SubtileIR<F>,
+) -> Result<std::collections::BTreeMap<u32, (u32, u32)>, SuperDscError> {
+    // Per weight tid: the consumers' (start, end) spans, rows and cols separately.
+    let mut views: std::collections::BTreeMap<u32, (WeightSpans, WeightSpans)> =
+        std::collections::BTreeMap::new();
+    for n in &ir.nodes {
+        if !matches!(n.op, SubOp::MatmulTile { .. }) || (n.inputs.len() != 2 && n.inputs.len() != 3)
+        {
+            continue;
+        }
+        let w = n.inputs[1].tensor.index() as u32;
+        let r = &n.inputs[1].region;
+        let entry = views.entry(w).or_default();
+        entry.0.push((r.rows.start, r.rows.end()));
+        entry.1.push((r.cols.start, r.cols.end()));
+    }
+    let mut pairs = std::collections::BTreeMap::new();
+    for (w, (row_spans, col_spans)) in views {
+        let stated = ir.tensors[w as usize];
+        let merge = |axis: &str,
+                     mut spans: Vec<(u32, u32)>,
+                     stated_len: u32|
+         -> Result<u32, SuperDscError> {
+            spans.sort_unstable();
+            if spans[0].0 != 0 {
+                return Err(SuperDscError(format!(
+                    "gemm weight t{w}: its matmul consumers' {axis} views start at {}, not 0 — \
+                     a B operand is read whole from zero, so the host pair would under-state \
+                     the checkpoint and the failure would move to load",
+                    spans[0].0
+                )));
+            }
+            let mut end = 0;
+            for &(start, span_end) in &spans {
+                if start > end {
+                    return Err(SuperDscError(format!(
+                        "gemm weight t{w}: its matmul consumers' {axis} views leave a gap \
+                         {end}..{start} — an NK or K split tiles exactly, so this is a \
+                         lowering defect, not a staging fact"
+                    )));
+                }
+                end = end.max(span_end);
+            }
+            if end > stated_len {
+                return Err(SuperDscError(format!(
+                    "gemm weight t{w}: its matmul consumers' {axis} views reach {end} past the \
+                     tensor's stated extent {stated_len} — a view OVERRUNNING its own tensor, \
+                     which no downstream law can catch"
+                )));
+            }
+            Ok(end)
+        };
+        let rows = merge("rows", row_spans, stated.rows)?;
+        let cols = merge("cols", col_spans, stated.cols)?;
+        pairs.insert(w, (rows, cols));
+    }
+    Ok(pairs)
+}
+
+/// The wiring's `tensor_shapes` — every tensor's HOST pair: the stated shape, with every
+/// gemm weight's entry replaced by the union of its matmul consumers' view regions
+/// ([`gemm_weight_host_pairs`]' law). The caller appends the mask's synthetic entry.
+pub(crate) fn tensor_shapes_of_ir<F: RopeForm>(
+    ir: &SubtileIR<F>,
+) -> Result<Vec<(u32, u32)>, SuperDscError> {
+    let mut shapes: Vec<(u32, u32)> = ir.tensors.iter().map(|t| (t.rows, t.cols)).collect();
+    for (&w, &(rows, cols)) in &gemm_weight_host_pairs(ir)? {
+        shapes[w as usize] = (rows, cols);
+    }
+    Ok(shapes)
+}
+
 
 /// Lower `ir` for its WIRING alone — the same per-node arms a bake runs, read for the parameter
 /// pairings rather than for the programs.
@@ -1512,7 +1896,10 @@ pub fn graph_wiring<F: RopeForm>(
             nodes.push(args);
         }
     }
-    let mut tensor_shapes: Vec<(u32, u32)> = ir.tensors.iter().map(|t| (t.rows, t.cols)).collect();
+    // ⭐ THE HOST PAIRS, NOT THE STATED SHAPES: every gemm weight's entry is the
+    // union of its matmul consumers' view regions (the widen keeps the tied embed
+    // weight's STATED cols at the pad while the host stages the real vocab region).
+    let mut tensor_shapes: Vec<(u32, u32)> = tensor_shapes_of_ir(ir)?;
     let attn_mask = match mask {
         Some((mid, cap)) => {
             // The mask tensor sits at id == ir.tensors.len(); append its `[1, capacity]` shape so
@@ -1535,6 +1922,9 @@ pub fn graph_wiring<F: RopeForm>(
     // disagree (the `weight_copies` one-mint law).
     let load_consts = load_consts_of_ir(ir, &staggered)?;
     let sample_seat = sample_seat_of_ir(ir, &staggered)?;
+    // ⭐ THE CHAIN FACT, off the same minted nodes — after `load_consts` so
+    // the one-node law's error propagates before the first-wins read.
+    let chain = chain_of_ir(ir);
     // ⛔ EVERY MARKED PARAMETER HAS A STAGER. The arrangement rides exactly two staging
     // channels — the load-const builders (pure in the arrangement) and the seat's per-step
     // noise bind — so a propagation mark on any OTHER parameter (a weight, an activation,
@@ -1577,6 +1967,10 @@ pub fn graph_wiring<F: RopeForm>(
         // reads — the one derivation, so the wiring's seat and the mint's
         // facts cannot disagree (the `weight_copies` one-mint law).
         sample_seat,
+        // ⭐ THE CHAIN FACT, off the same minted nodes the load-const list
+        // reads — the one derivation, so the wiring's seeds and the mint's
+        // facts cannot disagree (the `weight_copies` one-mint law).
+        chain,
     })
 }
 
@@ -1629,13 +2023,15 @@ pub fn load_consts_of_ir<F: RopeForm>(
         .nodes
         .iter()
         .filter(|n| matches!(n.op, SubOp::Sample { .. }));
-    match (mints.next(), mints.next()) {
-        (None, _) => Ok(Vec::new()),
-        (Some(_), Some(_)) => Err(SuperDscError(
-            "two Sample nodes in one graph — the mint appends exactly one to a rung; a second \
-             means two mints ran over one graph"
-                .to_string(),
-        )),
+    let sample: Vec<_> = match (mints.next(), mints.next()) {
+        (None, _) => Vec::new(),
+        (Some(_), Some(_)) => {
+            return Err(SuperDscError(
+                "two Sample nodes in one graph — the mint appends exactly one to a rung; a second \
+                 means two mints ran over one graph"
+                    .to_string(),
+            ))
+        }
         (Some(node), None) => {
             let SubOp::Sample { vocab, .. } = node.op else {
                 unreachable!("the filter matched a Sample")
@@ -1646,7 +2042,7 @@ pub fn load_consts_of_ir<F: RopeForm>(
                 "the Sample node's arity is the registry's own row (logits + noise + inv_t + \
                  nine tables)"
             );
-            Ok(node.inputs[3..]
+            node.inputs[3..]
                 .iter()
                 .enumerate()
                 .map(|(i, tr)| {
@@ -1667,8 +2063,128 @@ pub fn load_consts_of_ir<F: RopeForm>(
                         },
                     )
                 })
-                .collect())
+                .collect()
         }
+    };
+    // ⭐ THE CHAINED HEAD'S PAIR — the two decompose tables the mint spliced
+    // past the pick and the sticks (inputs 3 and 4 of the ChainStage node,
+    // operands 1 and 2 of the kind), staged ONCE at load exactly like the
+    // sampler's nine. A second ChainStage is a build error, not a
+    // last-write-wins — the same one-node law the Sample arm states.
+    let mut stages = ir
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.op, SubOp::ChainStage { .. }));
+    let chain: Vec<(u32, crate::wiring::LoadConst)> = match (stages.next(), stages.next()) {
+        (None, _) => Vec::new(),
+        (Some(_), Some(_)) => {
+            return Err(SuperDscError(
+                "two ChainStage nodes in one graph — the mint splices exactly one pair into a \
+                 rung; a second means two mints ran over one graph"
+                    .to_string(),
+            ))
+        }
+        (Some(node), None) => {
+            let SubOp::ChainStage {
+                pad_vocab,
+                k,
+                ..
+            } = node.op
+            else {
+                unreachable!("the filter matched a ChainStage")
+            };
+            assert_eq!(
+                node.inputs.len(),
+                5,
+                "the ChainStage node's arity is the registry's own row (pick + two sticks + \
+                 two tables)"
+            );
+            // The graph's own hidden, read from the gather the mint spliced
+            // beside this stage — the same one statement `chain_of_ir` reads
+            // below, so the tables' `hidden` and the wiring's can never
+            // disagree about the graph's width.
+            let hidden = ir
+                .nodes
+                .iter()
+                .find_map(|n| match n.op {
+                    SubOp::EmbedRowGather { hidden, .. } => Some(hidden),
+                    _ => None,
+                })
+                .expect(
+                    "load_consts_of_ir: a ChainStage with no EmbedRowGather — the mint splices \
+                     the pair together, so a stage with no gather is a graph the mint never made",
+                );
+            node.inputs[3..5]
+                .iter()
+                .enumerate()
+                .map(|(i, tr)| {
+                    (
+                        tr.tensor.index() as u32,
+                        crate::wiring::LoadConst::ChainStageTable {
+                            pad_vocab,
+                            k,
+                            hidden,
+                            operand: (i + 1) as u8,
+                        },
+                    )
+                })
+                .collect()
+        }
+    };
+    let mut consts = sample;
+    consts.extend(chain);
+    Ok(consts)
+}
+
+/// ⭐ THE CHAINED HEAD'S STICK FACT — the two persistent `[1, CHAIN_IDX_BLOCK]`
+/// SENUINT32 sources the ChainStage WRITES each step and the EmbedRowGather
+/// READS the next, read off the minted node's own inputs (inputs 1 and 2,
+/// past the pick), plus the node's own stated entry count `k` (the seeds'
+/// lane-pattern modulus), the gather's own stated `hidden` (the l seed's LANE
+/// RAMP modulus — `64·(i mod (hidden/64)) + l`), and the gather's own stated
+/// `replaces` (the row the chain replaced — the stamp's resident excuse and
+/// the binding check's truth read the SAME id the mint stated) — all read
+/// from the SAME payload the mint stated, never re-derived here. THE ONE
+/// DERIVATION: the wiring's seed and the mint's reference answer the same
+/// ids, the same k, the same hidden, and the same replaced row, so the
+/// host's one-time stick write, the device's per-step rewrite, and the
+/// stamp's excuse cannot disagree about where the state lives, how it is
+/// patterned, or which row lost its host filler. `Unchained` is every graph
+/// the mint did not touch — the pre-mint behavior, byte-identical.
+///
+/// Call after [`load_consts_of_ir`]: that fn's one-node law errors on a second
+/// ChainStage, so this first-wins read is never asked to break a tie.
+pub fn chain_of_ir<F: RopeForm>(ir: &SubtileIR<F>) -> crate::wiring::ChainFact {
+    // The two minted nodes each state their half of the fact — the stage's
+    // inputs name the sticks and the entry count, the gather's payload names
+    // the hidden, the row it replaced — and both halves are the mint's own
+    // statements, read here once, never re-derived.
+    let Some((stage, k)) = ir.nodes.iter().find_map(|n| match &n.op {
+        SubOp::ChainStage { k, .. } => Some((n, *k)),
+        _ => None,
+    }) else {
+        // No stage, no mint — the graph's own state, spelled by name.
+        return crate::wiring::ChainFact::Unchained;
+    };
+    let (hidden, replaces) = ir
+        .nodes
+        .iter()
+        .find_map(|n| match &n.op {
+            SubOp::EmbedRowGather { hidden, replaces } => Some((*hidden, *replaces)),
+            _ => None,
+        })
+        .expect(
+            "chain_of_ir: a ChainStage with no EmbedRowGather — the mint splices the pair \
+             together, so a stage with no gather is a graph the mint never made",
+        );
+    crate::wiring::ChainFact::Chained {
+        chain: crate::wiring::ChainWiring {
+            s_src: stage.inputs[1].tensor.index() as u32,
+            l_src: stage.inputs[2].tensor.index() as u32,
+            k,
+            hidden,
+            replaces: replaces.index() as u32,
+        },
     }
 }
 
@@ -1891,6 +2407,11 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         chunk_pages,
     } = rung;
     let _pc = crate::pc::Pc::start("producer");
+    // ⭐ THE GEMM WEIGHTS' HOST PAIRS — the union of each weight's matmul consumers'
+    // view regions, computed ONCE here: the wiring's `tensor_shapes` and the
+    // three-width-laws check's worker law both read this map, so the host pair
+    // cannot drift between them (see [`gemm_weight_host_pairs`]' law).
+    let host_pairs = gemm_weight_host_pairs(ir)?;
     // ⭐ THE CHUNK THIS GRAPH'S EVERY ATTENTION CLASS CAN EXPRESS, decided ONCE for both of its
     // consumers — the index placement (`compute_bundle_layout`'s `gathers_kv`) and the door's
     // `BundleAttnParams` — so an index is reserved exactly where a chunk gathers through it.
@@ -2566,6 +3087,19 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         //      emulator could not witness it — see the gate at the collection above).
         {
             let wl = desc.word_length as u64;
+            // ⛔ THE DESYNC GUARD — the collection pushes only MatmulTile-consumed
+            // primaries, and the map's key set is exactly that same set (the two walks
+            // share one gate), so a primary missing from the map is a two-walk
+            // disagreement, refused by name. Per-layer copies never reach this refusal:
+            // they enter through the `tids` chain below and are never at any node's
+            // inputs, so no copy tid can be in the map.
+            if !host_pairs.contains_key(w_tid) {
+                return Err(SuperDscError(format!(
+                    "reroll-superdsc: gemm weight t{w_tid} was collected from a MatmulTile \
+                     but the host-pair walk finds no consumer for it — the collection and \
+                     the walk disagree, and the host pair law has no region to read"
+                )));
+            }
             let manifest_bytes = desc.device_size.iter().product::<u64>() * wl;
             let mut tids = std::iter::once(*w_tid)
                 .chain(per_layer.get(w_tid).into_iter().flatten().copied())
@@ -2582,7 +3116,19 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
                     Some(n) => n.op.name(),
                     None => "gemm",
                 };
-                let worker_w = DeviceWidth::for_pointwise(ir.tensors[t as usize].cols).get();
+                // ⭐ THE WORKER'S LAW READS THE HOST PAIR — the union of the matmul
+                // consumers' view regions (the same one map the wiring's `tensor_shapes`
+                // states) — never the tensor's stated cols: the widen states the pad
+                // extent for the placement and the gather while the host stages the
+                // region. A per-layer copy has no MatmulTile of its own in the rolled
+                // graph, so it deliberately misses the map and keeps its stated pair.
+                let worker_w = DeviceWidth::for_pointwise(
+                    host_pairs
+                        .get(&t)
+                        .map(|&(_, cols)| cols)
+                        .unwrap_or(ir.tensors[t as usize].cols),
+                )
+                .get();
                 let slot = bundle_layout.placements.get(&t);
                 let slot_desc = match slot {
                     Some(p) => format!("{} bytes (expected at least {manifest_bytes})", p.size),

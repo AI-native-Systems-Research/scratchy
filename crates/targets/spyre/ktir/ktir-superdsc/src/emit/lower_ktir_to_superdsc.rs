@@ -1372,7 +1372,18 @@ pub fn elementwise_df(
             ));
         }
         if bcast.iter().any(Option::is_some) {
-            return elementwise_broadcast(name, kind, &ins, &out, bcast, df, sym_id_base, layout);
+            return elementwise_broadcast(
+                name,
+                kind,
+                BcastForm {
+                    ins: &ins,
+                    out: &out,
+                    bcast,
+                },
+                df,
+                sym_id_base,
+                layout,
+            );
         }
         if out.c_start != 0
             || ins.iter().any(|x| x.c_start != 0)
@@ -1422,7 +1433,18 @@ pub fn elementwise_df(
         // `df` is `Fp16` here (the non-fp16 gate above returned or routed already), so this is
         // the proven arm verbatim — the `df` parameter exists for the gate's fp32 route, which
         // lands in the same body with the stick basis stated at `df.elems_per_stick()`.
-        return elementwise_broadcast(name, kind, &ins, &out, bcast, df, sym_id_base, layout);
+        return elementwise_broadcast(
+            name,
+            kind,
+            BcastForm {
+                ins: &ins,
+                out: &out,
+                bcast,
+            },
+            df,
+            sym_id_base,
+            layout,
+        );
     }
     // ⭐⭐⭐ THE PER-ROW CHAIN TAKES THE ONE-STICK ARM — see [`elementwise_per_row`]. A `[rows, 1]`
     // output is the running-max/alpha/denominator chain of an online softmax, which the
@@ -1787,16 +1809,25 @@ fn elementwise_per_row(
 /// attributes; this door proves it from the operand's REGION. The two are independent, and the
 /// emission is only correct when both hold — a `Col` flag over an operand that is really `[m, n]`
 /// would read one lane and spray it over the whole output, silently.
+/// The broadcast door's operand form — the split inputs, the output, and the positional
+/// broadcast flags, ONE value: the three are one fact about the op (which operand sprays
+/// which axis, at which output extent), and bundling them is what keeps the door's own
+/// parameter list under the arity lint without an `#[allow]`.
+struct BcastForm<'a> {
+    ins: &'a [Region],
+    out: &'a Region,
+    bcast: &'a [Option<BcastAxis>],
+}
+
 fn elementwise_broadcast(
     name: &str,
     kind: Elementwise,
-    ins: &[Region],
-    out: &Region,
-    bcast: &[Option<BcastAxis>],
+    form: BcastForm<'_>,
     df: Df,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
+    let BcastForm { ins, out, bcast } = form;
     // THE OP FUNC IS A FUNCTION OF THE KIND, so it is named here rather than passed. The caller holds
     // it already, but [`elementwise_op_func`] is that one `match` and nothing else, so handing it over
     // as well would buy a parameter and no fact — and the call already proved it Ok for this `kind`.
@@ -5842,6 +5873,936 @@ pub fn transpose(
     .map_err(|message| Error {
         message: format!("{name}: {message}"),
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ⭐⭐⭐⭐⭐ THE CHAINED HEAD'S W>1 RELAYOUT (#603, 3b-3) — the composed address map as a Kani
+// property, written BEFORE the door that realizes it (Kani first: the proof owns the law the
+// door must emit).
+//
+// THE FINDING THIS MODULE IS THE PERMANENT RECORD OF: the chained head's out replaces the
+// EmbeddedHidden source, and the emission reads the m>1 residual stream rank-2 STICK-MAJOR
+// (`spyre_forward.rs:228-235`: "element (r,c) lands at (c/64)*(mq*64) + r*64 + (c%64)"), so at
+// width > 1 sub-row j of request r must sit at flat stick `j·W + r` — the requests INTERLEAVED
+// per column block. The per-request row gather lands REQUEST-MAJOR bytes instead (one
+// contiguous dest window per entry — the gather's own law, `gather_copy_opspec`), which is the
+// body's layout only while `row_major_is_stick_major` holds (width == 1, or hidden == one
+// stick). Past that, NO cut of the three-leg chain lands the stick-major activation: the
+// interleaved-dest cut needs a transposed l index no card-proven u32 producer writes, and
+// forcing the gather's dest to Flat is card-refuted (the recorded `RAS::PCI::BusFence` 0xa35e
+// measurement, `emit::mod`'s (a) note at the gather cut). So the door's leg 4 is a
+// pointwise-IDENTITY RELAYOUT — a Flat `[width, hidden]` read of the request-major scratch, a
+// RowBlocked `[width, hidden]` write of the activation — through `pw1`, whose per-operand walk
+// law (`emit::mod:3766-3782`, and dxp's own `buildUnitView`, `dsc/dsc2.cpp:2752-2810`: each
+// operand's walk from ITS OWN allocation's `layoutDimOrder_`/`maxDimSizes_`) makes the mixed
+// walk a per-operand fact. Leg 4 exists exactly when `row_major_is_stick_major(width, hidden)`
+// is FALSE — a derived layout fact, never a width branch.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(kani)]
+mod embed_row_relayout_proofs {
+    use crate::sdsc_abstract::{CopyDims, StickLayout, row_major_is_stick_major};
+
+    /// The per-request row-gather cut's DESTINATION map, composed exactly as the door emits it:
+    /// op (r, b) of the cut reads request r's l-index stick `r·l_sticks + b` and runs
+    /// `min(cap, row_entries − b·cap)` one-stick entries, entry e writing dest stick
+    /// `r·row_entries + b·cap + e` of the one-stick-wide `[width·row_entries, 64]` scratch —
+    /// element (r, c) at sub-row `j = c/64`, lane `c%64`.
+    fn row_gather_lands(row_entries: usize, r: usize, c: usize) -> usize {
+        let cap = CopyDims::ENTRIES_PER_OP as usize;
+        let j = c / 64;
+        let lane = c % 64;
+        let b = j / cap;
+        let e = j % cap;
+        (r * row_entries + b * cap + e) * 64 + lane
+    }
+
+    /// LEG 4'S READ — the Flat `[width, hidden]` handle over the request-major scratch:
+    /// row-major, element (r, c) at `r·hidden + c`.
+    fn relayout_reads(hidden: usize, r: usize, c: usize) -> usize {
+        r * hidden + c
+    }
+
+    /// THE BODY'S READ (and leg 4's write — one layout, one formula, which is the point): the
+    /// stick-major `[width, hidden]` activation law, computed through the REAL
+    /// `StickLayout::dev_off` — `stick_scatter`'s own `(c/64)·(rows·64) + r·64 + c%64`, never
+    /// restated here.
+    fn body_reads(width: usize, hidden: usize, r: usize, c: usize) -> usize {
+        StickLayout::row_blocked(width, hidden).dev_off(r, c)
+    }
+
+    /// The auditor's geometry: every ladder width against every hidden the door admits
+    /// (1..=64 sticks = 64..=4096 columns).
+    fn geometry() -> (usize, usize, usize, usize) {
+        let width: usize = kani::any();
+        let row_entries: usize = kani::any();
+        kani::assume(width >= 1 && width <= 8);
+        kani::assume(row_entries >= 1 && row_entries <= 64);
+        let r: usize = kani::any();
+        let c: usize = kani::any();
+        kani::assume(r < width);
+        kani::assume(c < row_entries * 64);
+        (width, row_entries, r, c)
+    }
+
+    /// ⭐ THE CUT COMPOSES TO REQUEST-MAJOR: the per-stick cut's `r·row_entries + b·cap + e`
+    /// dest-stick arithmetic lands element (r, c) at flat `r·hidden + c` — the one-stick-wide
+    /// scratch's bytes, the layout leg 4's Flat handle reads.
+    #[kani::proof]
+    fn the_per_request_cut_lands_request_major() {
+        let (_, row_entries, r, c) = geometry();
+        assert_eq!(row_gather_lands(row_entries, r, c), r * row_entries * 64 + c);
+    }
+
+    /// ⭐ LEG 4 READS EXACTLY WHERE THE GATHER WROTE: the Flat read of the scratch is the
+    /// identity on the cut's bytes — no element is picked up from another request's run.
+    #[kani::proof]
+    fn the_relayout_reads_where_the_gather_wrote() {
+        let (_, row_entries, r, c) = geometry();
+        assert_eq!(
+            relayout_reads(row_entries * 64, r, c),
+            row_gather_lands(row_entries, r, c)
+        );
+    }
+
+    /// ⭐⭐⭐ THE ELISION: while the layouts coincide (`row_major_is_stick_major`), the
+    /// request-major scratch already IS the activation — the direct cut lands what the body
+    /// reads, and leg 4 is not emitted. Fail-first: spelling the gather's dest as the
+    /// RowBlocked activation DIRECTLY (the 3b-2 form this module replaced) makes this the only
+    /// one of these properties that holds — `past_the_coincidence_…_row_one_lane_zero` below is
+    /// the witness that it does not hold past the coincidence.
+    #[kani::proof]
+    fn the_elided_form_lands_what_the_body_reads() {
+        let (width, row_entries, r, c) = geometry();
+        let hidden = row_entries * 64;
+        if row_major_is_stick_major(width, hidden) {
+            assert_eq!(
+                row_gather_lands(row_entries, r, c),
+                body_reads(width, hidden, r, c)
+            );
+        }
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE COMPOSED MAP — the door's law as ONE property: elided or relayouted,
+    /// element (r, c) lands at the body's stick-major address. The else arm is leg 4's write
+    /// law (a RowBlocked `[width, hidden]` output handle writes at its own `dev_off` — the SAME
+    /// formula the body reads by, which is why the relayout is a pointwise IDENTITY); the then
+    /// arm is the elision above. GREEN where the 3b-2 direct cut was RED.
+    #[kani::proof]
+    fn the_composed_chain_lands_what_the_body_reads() {
+        let (width, row_entries, r, c) = geometry();
+        let hidden = row_entries * 64;
+        let landed = if row_major_is_stick_major(width, hidden) {
+            row_gather_lands(row_entries, r, c)
+        } else {
+            body_reads(width, hidden, r, c)
+        };
+        assert_eq!(landed, body_reads(width, hidden, r, c));
+    }
+
+    /// ⭐ PAST THE COINCIDENCE THE DIRECT CUT IS WRONG — the permanent witness that the elision
+    /// is exactly the coincidence and not a width branch: at every width ≥ 2 and hidden ≥ two
+    /// sticks, request 1's lane 0 lands at `hidden` request-major but `64` stick-major, and
+    /// those differ at every admitted geometry. (The 3b-2 direct-cut claim — `row_gather_lands
+    /// == body_reads` unconditionally — was run as a Kani proof and FAILED at
+    /// `embed_row_relayout_proofs`'s own `row_gather_lands == body_reads` assertion,
+    /// `VERIFICATION:- FAILED` in 0.15 s, its counterexample at width ≥ 2; this witness is
+    /// that verdict's permanent form.)
+    #[kani::proof]
+    fn past_the_coincidence_the_direct_cut_misses_row_one_lane_zero() {
+        let width: usize = kani::any();
+        let row_entries: usize = kani::any();
+        kani::assume(width >= 2 && width <= 8);
+        kani::assume(row_entries >= 2 && row_entries <= 64);
+        let hidden = row_entries * 64;
+        assert_ne!(
+            row_gather_lands(row_entries, 1, 0),
+            body_reads(width, hidden, 1, 0),
+            "request 1 lane 0: request-major {} vs stick-major {}",
+            row_gather_lands(row_entries, 1, 0),
+            body_reads(width, hidden, 1, 0)
+        );
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ THE CHAINED HEAD'S ROW PRODUCTION (#603) — `table[pick]` off the lm-head's own TIED
+/// weight, read IN PLACE, as THREE door-assembled legs. See [`crate::ktir_node::Program::EmbedRowGather`]
+/// for why this is a Program kind and not a Triton kernel (the column read is not
+/// kernel-expressible: a descriptor gather requires contiguous rows, and the token's row in the
+/// kernel slot is lane `pick % 64` across `hidden` sticks — the slab-major law, `dev_off_stk`).
+///
+/// THE THREE LEGS, each an existing card-proven door:
+///
+/// 1. **THE SLAB GATHER** — `gather_copy_opspec`, the MoE expert-bank precedent
+///    (`stage_weight`: "one gather entry = one expert's whole packed slab"). The kernel slot's
+///    device layout is slab-major `[vocab/64, hidden, 64]`, so slab `s = pick >> 6` is ONE
+///    CONTIGUOUS `[hidden, 64]` range, and the payload's `k` entries tile it — one
+///    `[page, 64]` chunk per entry, `page = hidden/k` positions, `cols` = one 64-element fp16
+///    stick — into the per-step scratch. `skip_addr = page × out = (hidden/k) · 64` — one
+///    index step moves exactly one chunk; the FLAT-ADDRESS LAW (stated at the leg) keeps the
+///    split's bytes and addresses identical to the one-entry splat's, at one entry's per-core
+///    LX charge instead of the slab's.
+/// 2. **THE TRANSPOSE** — [`super::try_assemble_restickify_transpose_2d`], the `#128` door:
+///    `[hidden, 64] → [64, hidden]`, both extents whole 64-sticks (checked below, and `hidden`
+///    is a 64-multiple in every model this crate serves). The transposed slab's rows are
+///    SCATTERED at a 64-stick stride — the door's own stick law `[rows/64, cols, 64]` puts
+///    row `r`'s elements at sticks `{64·j + r}`, element `(out, y)` at stick `64·⌊y/64⌋ +
+///    out` — which is what makes the third leg a RAMP-ADDRESSED row gather: the entry that
+///    reads sub-row `i` must name stick `64·i + l`, never a flat `i`.
+/// 3. **THE ROW GATHER** — the same copy door over the transposed slab: `hidden/64`
+///    ONE-STICK entries (`page` = 1 position, `cols` = one stick, `skip_addr = 64`
+///    elements), lane `i` of the l stick carrying the ramp `64·i + l` — row `l = pick & 63`'s
+///    `i`-th source stick — landing each as stick `i` of the `[1, hidden]` output, which at
+///    one stick of `out` is row-major by the `GatherScratch::sub_rows` law, i.e. exactly the
+///    `[1, hidden]` row-major activation every entry op of the body reads.
+///
+/// ⛔ THE WEIGHT IS READ IN PLACE — the one source this op names. The `[hidden, 64]` slab
+/// scratch and the `[64, hidden]` transposed placement plus the sentinel's reserved zero
+/// tail (the unwritten sticks `[hidden, hidden + hidden/64)`, never written by any op — [`SynthRole::ChainSlabT`](crate::place::SynthRole)) are
+/// per-step arena activations sized at expansion, minted through the placement's own
+/// synth identities (`t{out}_cslab` / `t{out}_cslabt` — the one lawful join, never a
+/// `format!`-spelled name matched at another site); a second staging of the embedding
+/// matrix anywhere in this realization is the dead hack, and the geometry below refuses
+/// to state one (nothing here names any weight-sized destination).
+///
+/// ⛔ THE INDICES ARE READ, NOT DERIVED. `s` and `l` arrive as SENUINT32 sticks
+/// (`[1, 32]` — one u32 stick, the class the chain's own index carrying is: a staged
+/// table's gathered destination must be exactly one stick of its format, and a u32 stick
+/// is 32 lanes) whatever produced them — the `ChainStage` node or the host's one-time
+/// seed. The s stick carries the LANE PATTERN `k·s + (i mod k)` (lane `i` names entry
+/// `i mod k` of slab `s`; the extra lanes repeat the first `k`, so whatever word
+/// discipline the IBR takes, the entry named stays inside the picked slab). The sentinel
+/// law is therefore the PRODUCER's: `s`'s clamp is bus safety (the past-`pad_vocab`
+/// rows stage the s=0 pattern `i mod k` — every entry a chunk of slab 0, never past the
+/// weight's region), and `idx ≥ vocab` must yield
+/// the zero row (the producer maps the sentinel range to the SENTINEL RAMP — lanes naming
+/// the transposed placement's unwritten zero tail `[hidden, hidden + hidden/64)`, word 0 =
+/// `hidden`), with the loud host refusal at the readback unchanged —
+/// both legs, `E-1c` note 1.
+///
+/// ⛔ THE TWO-CEILING LAW, STATED AT THE GATHERS IT GOVERNS: the slab gather's
+/// entry count must clear the LIVE-ENTRY ceiling (`k ≤ CopyDims::ENTRIES_PER_OP` = 32,
+/// the IBR stick cap — enforced at the raw door, whose wrap refusal is rung 8's) and the
+/// PER-CORE CHARGE ceiling (`4 × one entry's bytes = 512·(hidden/k) ≤
+/// [`VENDOR_LX_SCHED_BYTES`](crate::superdsc_opspec::VENDOR_LX_SCHED_BYTES) — dxp charges a
+/// gathered op two double-buffered pairs at its minimum chunk candidate). The row gather
+/// (leg 3) runs `hidden/64` one-stick entries — its own charge is `4 ×` one stick's `128`
+/// B per core, far under the budget at every admitted hidden — and its entry count is the
+/// THIRD ceiling, `hidden/64 ≤ CopyDims::ENTRIES_PER_OP` (refused by name below: a row
+/// wider than one index stick cannot be named at all). The door's own `rows % page == 0`
+/// check holds exactly (the entry count divides the hidden), and the payload's count is
+/// checked against the geometry below.
+pub fn embed_row_gather(
+    name: &str,
+    k: &crate::ktir_node::KtirNode,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // The payload's own stated entry count — the mint's one computation of it
+    // (the same read chain_stage makes of `table_rows`): the door does NOT
+    // re-derive the count from hidden (the divisor-window search is the mint's
+    // law, and this leaf crate carries none of it); it reads the stated count
+    // and refuses a geometry the count cannot name. The binding is `entries`,
+    // never `k` — the node parameter is `k` (the door's node-as-`k` idiom), and
+    // a same-named pattern field would shadow it.
+    let entries = match k.program {
+        crate::ktir_node::Program::EmbedRowGather { k: entries, .. } => entries,
+        other => {
+            return err(format!(
+                "{name}: embed_row_gather rode a {other:?} — the door arm and the body disagree \
+                 on the program kind"
+            ));
+        }
+    };
+    let (ins, out) = split_out(name, r, layout, 3)?;
+    let (s_idx, l_idx, weight) = match ins.as_slice() {
+        [s, l, w] => (s, l, w),
+        _ => {
+            return err(format!(
+                "{name}: an embedding-row program states {} tensor input(s); the chained head's \
+                 shape is exactly three (the slab index stick, the lane index stick, the weight)",
+                ins.len()
+            ));
+        }
+    };
+    let stk = Fp16::ELEMS_PER_STICK;
+    let ustk = crate::superdsc_opspec::Df::SenUint32.elems_per_stick();
+    // ⭐⭐⭐ THE REQUEST WIDTH — the out's own row count, the one fact every leg
+    // of this door cuts over. W = 1 is the solo decode rung (byte-identity:
+    // every per-row base below degenerates to ZERO and every name to the
+    // one-row spelling); W > 1 is the batched rung, where the mint states the
+    // sticks per request and the legs run once per (row, stick).
+    let width = out.v_rows;
+    if width == 0 {
+        return err(format!(
+            "{name}: the row out t{} states [0, {}] — a chained head with no request rows",
+            out.tid, out.v_cols
+        ));
+    }
+    // ⛔ THE IDX-STICK CLASS, THE SLAB INDEX: [W, 32] SENUINT32 — one u32 stick
+    // PER REQUEST, the class `ChainStage`'s table gathers write and the host's
+    // seed stages (row r's pattern in stick r). The LANE index is checked
+    // beside the row gather's own law below: its class is [W·l_sticks, 32] —
+    // one stick per op of the per-stick cut, every entry of every row named.
+    if (s_idx.v_rows, s_idx.v_cols) != (width, ustk) {
+        return err(format!(
+            "{name}: the slab index t{} states [{}, {}] — the chained head reads the \
+             u32 index-stick class, [{}, {ustk}] SENUINT32 (one stick per request: the pick's \
+             decompose is patterned across the stick's lanes by the table gather that wrote it)",
+            s_idx.tid, s_idx.v_rows, s_idx.v_cols, width
+        ));
+    }
+    // ⭐ THE TIE'S OWN SHAPE, cross-checked the way the mint asserted it: the weight is
+    // `[hidden, vocab]` and the rows out are `[W, hidden]` — the same hidden on both sides.
+    let hidden = out.v_cols;
+    let vocab = weight.v_cols;
+    if out.v_cols != weight.v_rows {
+        return err(format!(
+            "{name}: the row out t{} states [{}, {}] against a weight t{} of [{}, {}] — the \
+             chained head's rows are [width, hidden] with hidden = the weight's own row count \
+             (the tied-embedding shape the mint asserted at insertion)",
+            out.tid, out.v_rows, out.v_cols, weight.tid, weight.v_rows, weight.v_cols
+        ));
+    }
+    // ⛔ THE STICK LAWS BOTH EXTENTS MUST CARRY: `vocab` a whole number of 64-element sticks
+    // (the kernel slot's slab axis — a partial slab is an address), `hidden` a 64-multiple (the
+    // transpose door's own law, restated here so the refusal names the chain and not only the
+    // leg).
+    if vocab == 0 || !vocab.is_multiple_of(stk) {
+        return err(format!(
+            "{name}: the weight t{} carries vocab {vocab}, not a whole multiple of the \
+             {stk}-element fp16 stick — the kernel slot's slab axis is vocab/{stk}, and a \
+             partial slab is an address",
+            weight.tid
+        ));
+    }
+    if hidden == 0 || !hidden.is_multiple_of(stk) {
+        return err(format!(
+            "{name}: hidden {hidden} is not a whole multiple of the {stk}-element fp16 stick — \
+             the transpose leg [{hidden}, {stk}] → [{stk}, {hidden}] requires both extents \
+             stick-aligned (the transpose door's own law)",
+        ));
+    }
+    // WHOLE VIEWS, EVERY OPERAND: the gathers and the transpose name buffers, not windows —
+    // the same whole-view law [`transpose`] states, applied to all four.
+    for (x, role) in [
+        (s_idx, "slab index"),
+        (l_idx, "lane index"),
+        (weight, "weight"),
+        (&out, "row out"),
+    ] {
+        if x.c_start != 0 || x.c_len != x.v_cols {
+            return err(format!(
+                "{name}: the {role} t{} takes columns {}..{} of its [{}, {}] view — the chain's \
+                 legs name whole buffers (the gather and transpose doors take a name and \
+                 extents, no corner), so a stated window is refused rather than widened",
+                x.tid,
+                x.c_start,
+                x.c_start + x.c_len,
+                x.v_rows,
+                x.v_cols
+            ));
+        }
+    }
+    // ⛔ THE ENTRY-COUNT LAW, STATED AT THE SLAB GATHER IT GOVERNS: the payload's
+    // `k` must DIVIDE the hidden (a partial page is an address — the same law the
+    // stick checks above state), and the split it names must clear BOTH ceilings:
+    // the LIVE-ENTRY ceiling — `k` entries against the 32-entry IBR stick cap
+    // (`CopyDims::ENTRIES_PER_OP`), enforced at the raw door, whose wrap refusal
+    // fires on any payload past it — and the PER-CORE CHARGE ceiling: dxp's
+    // `allocAllMem` charges a gathered op `2 buffers × value-capacity + 2 buffers
+    // × output-capacity` at its minimum chunk candidate, i.e. 4 × one entry's
+    // bytes, against the vendor LX scheduler budget
+    // ([`VENDOR_LX_SCHED_BYTES`](crate::superdsc_opspec::VENDOR_LX_SCHED_BYTES),
+    // the frontend fence's complement). The mint's entry-count law answers the
+    // smallest divisor that clears both at expansion; these checks are the door's
+    // backstop, so a stale payload is a named refusal at bake — never the card's
+    // `Expect valid chunk size that fits in LX`.
+    if entries == 0 || hidden % entries != 0 {
+        return err(format!(
+            "{name}: the payload states {entries} slab entries against hidden {hidden} — the \
+             entry count must DIVIDE the hidden (a partial page is an address); the mint's \
+             entry-count law answers only divisors of the hidden"
+        ));
+    }
+    let page = hidden / entries;
+    let charge = 4 * u64::from(page) * u64::from(stk) * crate::superdsc_opspec::FP16_BYTES;
+    if charge > crate::superdsc_opspec::VENDOR_LX_SCHED_BYTES {
+        return err(format!(
+            "{name}: the slab gather's {entries} entries of {page} positions each charge one \
+             core {charge} B of LX (4 × one entry's {} B), over the vendor LX scheduler budget \
+             (VENDOR_LX_SCHED_BYTES = {} B) — the mint's entry-count law answers the smallest \
+             divisor that fits; a payload stating fewer entries is stale",
+            charge / 4,
+            crate::superdsc_opspec::VENDOR_LX_SCHED_BYTES
+        ));
+    }
+    // ⭐⭐⭐⭐⭐ THE ROW GATHER'S OWN WIDTH — the entry-count law's THIRD check, now a
+    // SHAPE law instead of a ceiling. Leg 3 runs `hidden/stk` ONE-STICK entries, one per
+    // word of the lane index, and the IBR is loaded ONE 32-word stick at a time with each
+    // core's read offset inside it taken MODULO that stick (rung 8's corruption law,
+    // `CopyDims::ENTRIES_PER_OP`) — so the pass is ONE OP PER INDEX STICK, the KV fold's
+    // own cut (`GatherScratch::copies`), and the lane index carries EVERY entry of EVERY
+    // request: `[width·l_sticks, ustk]` — row r's `l_sticks` sticks, then row r+1's, so op
+    // (r, b) reads its index at stick `r·l_sticks + b`. A `[width, ustk·l_sticks]`
+    // spelling is stick-scattered on the device (the stick-scatter law: element (r, c)
+    // lands at stick `(c/64)·width + r`), so row r's stick b would sit at flat stick
+    // `b·width + r` — a different buffer than this door reads; one stick wide, row-major
+    // and stick-major coincide and the address cannot be ambiguous. At l_sticks = 1 the
+    // two spellings are identical. The MINT states the count; this is the door's
+    // cross-check of the stated shape against the geometry it derives.
+    let row_entries = hidden / stk;
+    let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
+    let l_sticks = row_entries.div_ceil(cap);
+    if (l_idx.v_rows, l_idx.v_cols) != (width * l_sticks, ustk) {
+        return err(format!(
+            "{name}: the lane index t{} states [{}, {}] — the row gather runs {row_entries} \
+             one-stick entries per request against an IBR loaded {cap} words per stick, so the \
+             lane index is [{}, {ustk}] SENUINT32: row r's {l_sticks} sticks then row r+1's, one \
+             stick per op of the per-stick cut, every entry of every row named (the mint states \
+             this count; a stale payload is refused here, never half-gathered on the card)",
+            l_idx.tid, l_idx.v_rows, l_idx.v_cols, width * l_sticks
+        ));
+    }
+    // ⭐ THE SCRATCH IDENTITIES, minted through the placement's own synth join — the same
+    // one-call mint-and-register every door here takes (`syn` + `BundleLayout::synth`), so
+    // `resolve_seg_base` recovers the identity by LOOKUP and the footprint is reserved up
+    // front at the TRUE extents. ONE WIDENED LAYOUT, REQUEST-MAJOR, not per-request
+    // scratch: the slab is `[W·hidden, stk]` (request r's block at rows
+    // `[r·hidden, (r+1)·hidden)`), and the transposed placement is `[W·(stk + 1), hidden]`
+    // — request r's window at rows `[r·(stk+1), (r+1)·(stk+1))`, each carrying ONE EXTRA
+    // ROW for the sentinel: the real transpose writes exactly `[0, hidden)` of its window
+    // (element `(out, y)` at stick `64·⌊y/64⌋ + out` tops out at `hidden − 1`), and the
+    // leg-3 SENTINEL ramp names the unwritten zero tail `[hidden, hidden + hidden/stk)` —
+    // `l_tab`'s past-`pad_vocab` mapping, never written by any op, the same bytes the old
+    // flat read reached. At W = 1 these are the tip's own `[hidden, stk]` / `[stk+1, hidden]`.
+    let out_id = crate::place::PlaceId::Act(out.tid);
+    let slab_id = out_id.synth(crate::place::SynthRole::ChainSlab);
+    let slabt_id = out_id.synth(crate::place::SynthRole::ChainSlabT);
+    let slab_name = crate::placement::syn(layout, slab_id);
+    let slabt_name = crate::placement::syn(layout, slabt_id);
+    if let Some(l) = layout {
+        l.synth(slab_id, &[width * hidden, stk]);
+        l.synth(slabt_id, &[width * (stk + 1), hidden]);
+    }
+    // ⭐⭐⭐⭐⭐ THE LEG-4 ELISION — the row gather's request-major scratch IS the
+    // `[W, hidden]` activation, byte for byte, exactly while
+    // `row_major_is_stick_major(W, hidden)` holds (one row, or one stick's worth of
+    // columns — nothing to interleave); the relayout leg exists exactly when it does
+    // not. A WIDTH BRANCH IS NOT PERMITTED HERE: the elision is that derived layout
+    // fact, never `if width == 1`. While it holds, leg 3 writes the OUT's own name;
+    // when it does not, leg 3 writes a FLAT `[W, hidden]` ChainRow synth and a
+    // pointwise-identity relayout carries it into the out's RowBlocked placement.
+    let rows_coincide = crate::sdsc_abstract::row_major_is_stick_major(width as usize, hidden as usize);
+    let rowg_dest_name = if rows_coincide {
+        out.name()
+    } else {
+        let row_id = out_id.synth(crate::place::SynthRole::ChainRow);
+        let row_name = crate::placement::syn(layout, row_id);
+        if let Some(l) = layout {
+            l.synth(row_id, &[width, hidden]);
+        }
+        row_name
+    };
+    // ── LEGS 1 AND 2, PER REQUEST ROW. Leg 1 (the slab gather): the payload's `k`
+    // entries tile row r's `[hidden, 64]` slab patch — `page = hidden/k` positions per
+    // entry, `skip_addr = page × out = (hidden/k) · 64` — and the s stick's pattern
+    // word `q` (value `k·s + (q mod k)`) names entry `k·s + (q mod k)`: source offset
+    // `(k·s+q)·(page·64) = s·(hidden·64) + q·(page·64)`, dest offset `q·(page·64)` —
+    // the SAME BYTES AT THE SAME ADDRESSES the one-entry splat produced (the
+    // FLAT-ADDRESS LAW; the k=1 degenerate is the one-row descriptor
+    // byte-for-byte, `i mod 1 = 0`), at one entry's per-core LX charge instead of the
+    // slab's. The run's `rows = hidden` is `k` entries by construction (the
+    // entry-count law above). Row r's index is its OWN stick of the `[W, 32]` s
+    // buffer (`EntryBase::of_sticks(r)` — ZERO at r = 0) and its destination is its
+    // own patch of the one widened slab (`DestEntry::of_entries(r·hidden)` — ZERO at
+    // r = 0: the W=1 descriptors are byte-identical). Leg 2 (the transpose): the
+    // per-request `_at` form, row r's windows at element bases `r·hidden·stk` (slab)
+    // and `r·(stk+1)·hidden` (slabt) — both ZERO at r = 0.
+    let mut legs: Vec<(String, crate::superdsc_opspec::OpSpec)> = Vec::new();
+    let mut xposes: Vec<super::EmittedOp> = Vec::with_capacity(width as usize);
+    for r in 0..width {
+        let slab_op = crate::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
+            &weight.name(),
+            &slab_name,
+            crate::superdsc_opspec::GatherIndex {
+                name: s_idx.name(),
+                entry_dim: crate::superdsc_opspec::KernelAxis::Batch,
+                page: crate::superdsc_opspec::PageExtent::of_positions(page),
+                per_position: None,
+                first_entry: crate::superdsc_opspec::EntryBase::of_sticks(r),
+            },
+            crate::sdsc_abstract::GatherCopySpec {
+                rows: hidden,
+                cols: stk,
+                df: crate::superdsc_opspec::Df::Fp16,
+                run: crate::superdsc_opspec::GatherRun::split(
+                    // ⭐ IN ENTRIES, NOT ROWS: `DestEntry::of_entries` counts this
+                    // gather's OWN entries (each `page × cols` elements), and row
+                    // r's patch is `hidden·stk` elements = `entries` whole entries
+                    // (an entry is `hidden/entries` rows) — so the base is
+                    // `r·entries`, ZERO at r = 0 (the W=1 byte-identity). A
+                    // `r·hidden` here is a 2^26-element offset that the raw door's
+                    // window bound refuses at bake.
+                    crate::superdsc_opspec::DestEntry::of_entries(r * entries),
+                    0,
+                ),
+                dest: crate::sdsc_abstract::GatherDest::Scratch {
+                    rows: width * hidden,
+                    cols: stk,
+                },
+            },
+        )
+        .map_err(|m| Error {
+            message: format!("{name}: the slab gather: {m}"),
+        })?;
+        let slab_leg = if width == 1 {
+            format!("{name}_slabg")
+        } else {
+            format!("{name}_slabg{r}")
+        };
+        legs.push((slab_leg, slab_op));
+        let xpose = super::try_assemble_restickify_transpose_2d_at(
+            &format!("{name}_xpose"),
+            hidden,
+            stk,
+            super::RestickifySide {
+                h: &rb(&slab_name, width * hidden, stk),
+                off: r * hidden * stk,
+            },
+            super::RestickifySide {
+                h: &rb(&slabt_name, width * (stk + 1), hidden),
+                off: r * (stk + 1) * hidden,
+            },
+            sym_id_base,
+            layout,
+        )
+        .map_err(|message| Error {
+            message: format!("{name}: the slab transpose: {message}"),
+        })?;
+        xposes.push(xpose);
+    }
+    // ── LEG 3: the row gather, ONE OP PER (REQUEST, INDEX STICK) — the cut. `hidden/stk`
+    // ONE-STICK entries per request: the l index's ramp word `j` (value
+    // `64·(j mod entries) + l`, the seed and table laws' own spelling — the words
+    // continue the SAME ramp between the ops of the cut, never wrapping there) names
+    // the SOURCE STICK of the transposed row's `j`-th sub-row — the restickify writes
+    // row `l`'s elements at sticks `{64·j + l}` (its slab-major output law), so entry
+    // `j` reads exactly stick `64·j + l` (`skip_addr = page × out = 64` elements, one
+    // stick) and lands it as dest stick `j` of the request's `[1, hidden]` row. A FLAT
+    // entry — the old one-entry read, `page = hidden/stk` — walks the `hidden/stk`
+    // consecutive sticks `[l·(hidden/stk), …)`, a patch of raw weight bytes, not the
+    // row. The per-core charge is 4 × one stick's bytes = 512 B, far under the vendor
+    // budget at every admitted hidden — only the slab gather splits.
+    //
+    // ⛔ WHY `l_sticks` OPS AND NOT ONE WIDER OP: the IBR is loaded ONE 32-word stick at
+    // a time and each core's read offset inside it is taken MODULO that stick (rung 8's
+    // law, the same one the raw door's cap refusal states), so entries past the first 32
+    // of one op WRAP — another core's pages gathered with a clean bake. The KV fold's own
+    // remedy (`GatherScratch::copies`), verbatim: op `(r, b)` runs
+    // `min(cap, row_entries − cap·b)` entries, reads the index at
+    // `EntryBase::of_sticks(r·l_sticks + b)` (row r's stick b of the one-stick-wide
+    // lane buffer), and lands at `DestEntry::of_entries(r·row_entries + cap·b)` — the
+    // dest entry and the index base in the WINDOW-GRANULAR LOCKSTEP, stated at both
+    // sites rather than derived so their agreement is visible. The index VALUES carry no
+    // source base — they are ABSOLUTE slabt stick numbers, the KV pool's own
+    // "source base stays ZERO" shape — and a short tail (a partial last stick, the 65th
+    // entry of a 4160 hidden) spends part of its last loaded stick, the vendor's own
+    // gather tests' shape.
+    for r in 0..width {
+        for b in 0..l_sticks {
+            let first_entry = b * cap;
+            let rows = row_entries.saturating_sub(first_entry).min(cap);
+            let leg_name = if width == 1 && l_sticks == 1 {
+                format!("{name}_rowg")
+            } else if width == 1 {
+                format!("{name}_rowg{b}")
+            } else {
+                format!("{name}_rowg{r}x{b}")
+            };
+            legs.push((
+                leg_name,
+                crate::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
+                    &slabt_name,
+                    &rowg_dest_name,
+                    crate::superdsc_opspec::GatherIndex {
+                        name: l_idx.name(),
+                        entry_dim: crate::superdsc_opspec::KernelAxis::Batch,
+                        page: crate::superdsc_opspec::PageExtent::of_positions(1),
+                        per_position: None,
+                        first_entry: crate::superdsc_opspec::EntryBase::of_sticks(
+                            r * l_sticks + b,
+                        ),
+                    },
+                    crate::sdsc_abstract::GatherCopySpec {
+                        rows,
+                        cols: stk,
+                        df: crate::superdsc_opspec::Df::Fp16,
+                        run: crate::superdsc_opspec::GatherRun::split(
+                            crate::superdsc_opspec::DestEntry::of_entries(
+                                r * row_entries + first_entry,
+                            ),
+                            0,
+                        ),
+                        dest: crate::sdsc_abstract::GatherDest::Scratch {
+                            rows: width * hidden,
+                            cols: stk,
+                        },
+                    },
+                )
+                .map_err(|m| Error {
+                    message: format!("{name}: the row gather: {m}"),
+                })?,
+            ));
+        }
+    }
+    // ⭐⭐⭐ LEG 4 — THE RELAYOUT, exactly when the layouts do NOT coincide (the
+    // elision's own derived fact, never a width branch): a pointwise-identity copy of
+    // the flat `[W, hidden]` ChainRow synth into the out's own name, the device's own
+    // restickifying. While they coincide this leg mints NOTHING and leg 3 wrote the
+    // out's name directly — the W=1 (and one-stick-wide) byte-identity claim rides
+    // that elision.
+    // ⭐⭐⭐ LEG 4 — THE RELAYOUT, exactly when the layouts do NOT coincide (the
+    // elision's own derived fact, never a width branch): a POINTWISE IDENTITY
+    // through the existing `pw1` door (the C1 ruling — zero new emitter
+    // surface; the dsc2.cpp per-operand walk law supports the mix), a FLAT
+    // `[W, hidden]` ChainRow handle in, the OUT's own RowBlocked handle out.
+    // While they coincide this leg mints NOTHING and leg 3 wrote the out's
+    // name directly — the W=1 (and one-stick-wide) byte-identity claim rides
+    // that elision.
+    let relayout: Option<super::EmittedOp> = if rows_coincide {
+        None
+    } else {
+        Some(super::pw1(
+            &format!("{name}_rowflat"),
+            "identity",
+            crate::sdsc_abstract::RowCount::of_token_rows(width),
+            crate::sdsc_abstract::BlockCols::of_feature_cols(hidden),
+            super::In::full(&super::fl(&rowg_dest_name, width, hidden)),
+            &rb(&out.name(), width, hidden),
+            sym_id_base,
+            layout,
+        ))
+    };
+    // ── THE EMISSION, in chain order: per request the slab gather then the transpose
+    // (the transpose reads what the gather wrote), then the row gather's ops (request
+    // major, op b after op b−1, the cut's own row order), then the relayout if it
+    // exists. Each gather goes out through `emit_sdsc_tiled` — the same emission every
+    // `gather_copy_opspec` caller takes (the fold's and the tests'), so the descriptor
+    // the card sees is the same construction the MoE slab copy and the KV fold already
+    // proved. The leg names SAY THE CUT OUT LOUD (the KV fold's own law): the W=1
+    // spellings are byte-for-byte the one-row door's.
+    let mut ops = Vec::with_capacity(legs.len() + xposes.len() + usize::from(!rows_coincide));
+    for (i, (leg_name, op)) in legs.into_iter().enumerate() {
+        let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
+        ops.push(
+            super::emit_sdsc_tiled(&leg_name, &op, &folds, sym_id_base, layout).map_err(|e| {
+                Error {
+                    message: format!("{name}: {leg_name}: {e}"),
+                }
+            })?,
+        );
+        // The transpose for request `i` follows its slab gather — at W = 1 this
+        // is the one-row door's `ops.insert(1, xpose)` order exactly.
+        if (i as u32) < width {
+            ops.push(xposes[i].clone());
+        }
+    }
+    if let Some(relayout) = relayout {
+        ops.push(relayout);
+    }
+    Ok(ops)
+}
+
+/// ⭐⭐⭐⭐⭐ THE CHAINED HEAD'S PICK DECOMPOSE (#603) — the pick staged into the persistent
+/// s/l placements as THREE one-entry u32 table gathers, the ruled shape. See
+/// [`crate::ktir_node::Program::ChainStage`] for the decompose's arithmetic (why tables and
+/// not fp16 compute; why one level and not two) and the sentinel laws.
+///
+/// THE THREE LEGS, each the SAME copy door [`embed_row_gather`]'s gathers takes
+/// (`gather_copy_opspec`, ONE entry, the index the pick's own stick):
+///
+/// 1. **THE S GATHER, PERSISTENT** — `stab[pick] → s_stick`: the destination is the
+///    persistent s placement's OWN NAME (the KV-pool law — a placement the device owns
+///    across steps; the gather destination is the one u32 carrier the doors provide).
+///    `page` = one 32-lane u32 stick, `skip_addr` = one s-table row.
+/// 2. **THE S GATHER, FRESH** — the same table, the same index, onto the node's own output
+///    region: the s-value stick the host reference states, so the two ends agree on what
+///    the node produced.
+/// 3. **THE L GATHER, PERSISTENT** — `ltab[pick] → l_stick`: the l placement's own name,
+///    ONE entry at the ROW'S OWN WIDTH — the l table's rows are WHOLE l indices
+///    (`[table_rows, ustk·l_sticks]`, one full multi-stick index per answerable pick), so
+///    the gather runs `l_sticks` one-stick sub-rows under `page = l_sticks` and
+///    `skip_addr` = one FULL l-table row, landing the whole index in one op.
+///
+/// ⭐ THE TABLES ARE ORDINARY GRAPH SOURCES — the argmax nine's own idiom: the mint inserts
+/// `stab`/`ltab` below the `SourceBinding` layer and the worker stages their bytes ONCE at
+/// load through the load-const registry (the `ChainStageTable` kind names the one shared
+/// table derivation), never a per-step push, never a second staging of the matrix. The door
+/// cross-checks each table's stated extent against the payload's own `table_rows` — stated
+/// ONCE at the mint, which is the only site that computes it — so a mismatched pair cannot
+/// gather past the staged bytes, and the door never re-derives the extent from `pad_vocab`
+/// (a leaf crate carries no sentinel arithmetic). Their cost is the decompose's own:
+/// ~67.6 MB per table at `pad_vocab` 524288, ~135 MB for the pair — named at the mint's
+/// emission, not hidden here.
+///
+/// ⛔ THE ONE-ENTRY LAW, STATED AT EACH GATHER: `rows / page == 1` — one live entry against
+/// the 32-entry IBR stick cap. The s destinations are exactly one u32 stick (the
+/// full-window law, `[1, 32]`); the l destination is the l index's OWN width
+/// `[l_sticks, 32]` — one whole multi-stick index, the pair law below tying the table's
+/// row width to it — and its gather's ONE entry covers all of it (`page = l_sticks`
+/// sub-rows). The s side never widens: `k ≤ 32` always, one stick names every slab entry.
+pub fn chain_stage(
+    name: &str,
+    k: &crate::ktir_node::KtirNode,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // The payload's own stated table extent — the mint's one computation of
+    // it. The door does NOT know `pad_vocab` (the group law that makes the
+    // extent safe is asserted at the mint, where `pad_vocab` lives; this
+    // leaf crate re-derives nothing).
+    let table_rows = match k.program {
+        crate::ktir_node::Program::ChainStage { table_rows, .. } => table_rows,
+        other => {
+            return err(format!(
+                "{name}: chain_stage rode a {other:?} — the door arm and the body disagree on \
+                 the program kind"
+            ));
+        }
+    };
+    let (ins, out) = split_out(name, r, layout, 5)?;
+    let (pick, s_stick, l_stick, s_tab, l_tab) = match ins.as_slice() {
+        [p, s, l, st, lt] => (p, s, l, st, lt),
+        _ => {
+            return err(format!(
+                "{name}: a chain-stage program states {} tensor input(s); the chained head's \
+                 producer shape is exactly five (the pick stick, the persistent s stick, the \
+                 persistent l stick, the s decompose table, the l decompose table)",
+                ins.len()
+            ));
+        }
+    };
+    let ustk = crate::superdsc_opspec::Df::SenUint32.elems_per_stick();
+    // ⭐⭐⭐ THE REQUEST WIDTH — the pick's own row count, the one fact this
+    // door's gathers cut over (W = 1 is the solo rung: every per-row base
+    // below degenerates to ZERO and every name to the one-row spelling,
+    // byte-identical to the tip's descriptors).
+    let width = pick.v_rows;
+    if width == 0 {
+        return err(format!(
+            "{name}: the pick stick t{} states [0, {}] — a chain stage with no request rows",
+            pick.tid, pick.v_cols
+        ));
+    }
+    // ⛔ THE PICK-STICK CLASS: [W, 64] — the sampler idx stick's own shape (i32
+    // lanes, every lane of row r equal to pick_r, the value below 2^24 so the
+    // u32 read is the same number). Each gather spends ONE entry of row r's
+    // first u32 stick — word 64·r of the flat index read, a whole u32-stick
+    // multiple (64 = 2·32), so the IBR's one-stick load starts on a stick at
+    // every row.
+    if pick.v_cols != 64 {
+        return err(format!(
+            "{name}: the pick stick t{} states [{}, {}] — the chain stage reads the sampler \
+             idx-stick class, [width, 64] (one live entry per row; the pick is splatted across \
+             the stick's lanes by the kernel that wrote it)",
+            pick.tid, pick.v_rows, pick.v_cols
+        ));
+    }
+    // ⛔ THE U32-STICK CLASS, THE S DESTINATIONS: [W, 32] SENUINT32 — the
+    // full-window law's own shape at the request width (a staged table's
+    // gathered destination is exactly one stick of its format per request,
+    // and a u32 stick is 32 lanes).
+    for (x, role) in [(s_stick, "persistent s stick"), (&out, "s-value output")] {
+        if (x.v_rows, x.v_cols) != (width, ustk) {
+            return err(format!(
+                "{name}: the {role} t{} states [{}, {}] — the chain stage writes the \
+                 u32 index-stick class, [{}, {ustk}] SENUINT32 (one whole stick per request, \
+                 the gather destination's full-window law)",
+                x.tid, x.v_rows, x.v_cols, width
+            ));
+        }
+    }
+    // ⛔ THE L DESTINATION'S OWN CLASS: whole u32 sticks, one per op of the row
+    // gather's per-stick cut, row r's l_sticks then row r+1's — read off the
+    // operand the mint stated (`[W·l_sticks, 32]`; this door knows no `hidden`
+    // and re-derives nothing). The PAIR LAW below ties the l table's row width
+    // to it, and the row-gather door cross-checks the same placement against
+    // the hidden it derives — two doors, one stated fact, no second derivation.
+    if l_stick.v_cols != ustk || l_stick.v_rows == 0 || l_stick.v_rows % width != 0 {
+        return err(format!(
+            "{name}: the persistent l stick t{} states [{}, {}] — the chain stage writes \
+             the l index's OWN width, [width·l_sticks, {ustk}] SENUINT32 (whole u32 sticks, \
+             row r's l_sticks then row r+1's, one per op of the row gather's per-stick cut)",
+            l_stick.tid, l_stick.v_rows, l_stick.v_cols
+        ));
+    }
+    let l_n = l_stick.v_rows / width;
+    // ⛔ THE TABLE OPERANDS' OWN EXTENT — the extent the PAYLOAD states (the mint's one
+    // computation, the sentinel's row included), cross-checked against the tables the
+    // graph actually carries so a mismatched pair (a table staged at another model's
+    // vocab, a truncated splice) cannot gather past the staged bytes. The s table is
+    // `[table_rows, 32]` — one splatted row per answerable pick; the l table is
+    // `[table_rows, 32·l_sticks]` — one WHOLE l index per pick, the pair law stated as
+    // the extent itself so the table and the placement it fills cannot drift. The door
+    // checks the stated extents and NOTHING else: the arithmetic that derives them is
+    // the mint's, asserted there, never re-stated here.
+    if (s_tab.v_rows, s_tab.v_cols) != (table_rows, ustk) {
+        return err(format!(
+            "{name}: the s decompose table t{} states [{}, {}] — the chained head reads \
+             [{table_rows}, {ustk}] SENUINT32, the payload's own stated extent (one \
+             splatted row per answerable pick)",
+            s_tab.tid, s_tab.v_rows, s_tab.v_cols
+        ));
+    }
+    if (l_tab.v_rows, l_tab.v_cols) != (table_rows, l_n * ustk) {
+        return err(format!(
+            "{name}: the l decompose table t{} states [{}, {}] — the chained head reads \
+             [{table_rows}, {}] SENUINT32, the payload's own stated extent PAIRED to the l \
+             stick's own per-request [{l_n}, {ustk}] (one WHOLE l index per answerable pick — \
+             the pair law, so the table's rows and the placement they fill cannot drift)",
+            l_tab.tid, l_tab.v_rows, l_tab.v_cols, l_n * ustk
+        ));
+    }
+    // WHOLE VIEWS, EVERY OPERAND: the gathers name buffers, not windows.
+    for (x, role) in [
+        (pick, "pick stick"),
+        (s_stick, "persistent s stick"),
+        (l_stick, "persistent l stick"),
+        (s_tab, "s decompose table"),
+        (l_tab, "l decompose table"),
+        (&out, "s-value output"),
+    ] {
+        if x.c_start != 0 || x.c_len != x.v_cols {
+            return err(format!(
+                "{name}: the {role} t{} takes columns {}..{} of its [{}, {}] view — the \
+                 chain's legs name whole buffers (the gather doors take a name and extents, \
+                 no corner), so a stated window is refused rather than widened",
+                x.tid,
+                x.c_start,
+                x.c_start + x.c_len,
+                x.v_rows,
+                x.v_cols
+            ));
+        }
+    }
+    // ── THE GATHERS, PER REQUEST ROW. The s legs are ONE entry each per row:
+    // `page = of_positions(1)` (one u32 stick per page, `skip_addr` = one
+    // s-table row per index step), `rows = 1`, `cols = ustk` — the u32
+    // one-stick law — and the index is the pick's own name at row r's first
+    // u32 stick (`EntryBase::of_sticks(2r)` — word 64·r; ZERO at r = 0),
+    // landing at `DestEntry::of_entries(r)` of the `[width, ustk]` destination
+    // (ZERO at r = 0: the W=1 descriptors are byte-identical). The tables are
+    // the graph's own sources, named by their regions. The l leg is ONE entry
+    // at the ROW'S OWN WIDTH per request: the l table's row `t` is pick `t`'s
+    // WHOLE l index (`l_n` one-stick sub-rows), so the gather runs `rows =
+    // l_n` sub-rows under `page = l_n` — still ONE entry per request
+    // (`rows / page == 1`, the one-entry law restated at the row's own
+    // width), `skip_addr` = one FULL l-table row per index step, `entry_elems
+    // = l_n·ustk` = the whole index — landing it at
+    // `DestEntry::of_entries(r·l_n)` of the persistent `[width·l_n, ustk]`
+    // placement, the full-window law at the placement's own extents. The s
+    // side never needs the width: `k ≤ 32` always, one stick names every slab
+    // entry.
+    let mut ops = Vec::with_capacity(3 * width as usize);
+    let s_name = s_stick.name();
+    let stab_name = s_tab.name();
+    let out_name = out.name();
+    let ltab_name = l_tab.name();
+    let lname = l_stick.name();
+    for r in 0..width {
+        let pick_base = crate::superdsc_opspec::EntryBase::of_sticks(2 * r);
+        let s_table_gather = |table: &str, dest: &str| {
+            crate::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
+                table,
+                dest,
+                crate::superdsc_opspec::GatherIndex {
+                    name: pick.name(),
+                    entry_dim: crate::superdsc_opspec::KernelAxis::Batch,
+                    page: crate::superdsc_opspec::PageExtent::of_positions(1),
+                    per_position: None,
+                    first_entry: pick_base,
+                },
+                crate::sdsc_abstract::GatherCopySpec {
+                    rows: 1,
+                    cols: ustk,
+                    df: crate::superdsc_opspec::Df::SenUint32,
+                    run: crate::superdsc_opspec::GatherRun::split(
+                        crate::superdsc_opspec::DestEntry::of_entries(r),
+                        0,
+                    ),
+                    dest: crate::sdsc_abstract::GatherDest::Scratch {
+                        rows: width,
+                        cols: ustk,
+                    },
+                },
+            )
+        };
+        let l_table_gather = crate::ir::bridge::tiled_op_sdsc_op::gather_copy_opspec(
+            ltab_name.as_str(),
+            lname.as_str(),
+            crate::superdsc_opspec::GatherIndex {
+                name: pick.name(),
+                entry_dim: crate::superdsc_opspec::KernelAxis::Batch,
+                page: crate::superdsc_opspec::PageExtent::of_positions(l_n),
+                per_position: None,
+                first_entry: pick_base,
+            },
+            crate::sdsc_abstract::GatherCopySpec {
+                rows: l_n,
+                cols: ustk,
+                df: crate::superdsc_opspec::Df::SenUint32,
+                run: crate::superdsc_opspec::GatherRun::split(
+                    // ⭐ IN ENTRIES, NOT ROWS: this gather's entry is `l_n` whole
+                    // u32 sticks (`page × cols` elements), and row r's l block is
+                    // exactly one entry — so the base is `r`, ZERO at r = 0 (the
+                    // W=1 byte-identity). The ELEMENT base of row r's block is
+                    // `r·l_n·ustk`; the entry count and the element offset advance
+                    // together at `l_n·ustk` per step, never one-for-one.
+                    crate::superdsc_opspec::DestEntry::of_entries(r),
+                    0,
+                ),
+                dest: crate::sdsc_abstract::GatherDest::Scratch {
+                    rows: width * l_n,
+                    cols: ustk,
+                },
+            },
+        );
+        // The leg names SAY THE ROW out loud at W > 1 (the KV fold's own
+        // law); at W = 1 they are the one-row door's byte-for-byte.
+        let (sg, so, lg) = if width == 1 {
+            (
+                format!("{name}_sg"),
+                format!("{name}_so"),
+                format!("{name}_lg"),
+            )
+        } else {
+            (
+                format!("{name}_sg{r}"),
+                format!("{name}_so{r}"),
+                format!("{name}_lg{r}"),
+            )
+        };
+        for (leg_name, op) in [
+            (sg, s_table_gather(stab_name.as_str(), s_name.as_str())),
+            (so, s_table_gather(stab_name.as_str(), out_name.as_str())),
+            (lg, l_table_gather),
+        ] {
+            let op = op.map_err(|m| Error {
+                message: format!("{name}: {leg_name}: {m}"),
+            })?;
+            let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
+            ops.push(
+                super::emit_sdsc_tiled(&leg_name, &op, &folds, sym_id_base, layout).map_err(
+                    |e| Error {
+                        message: format!("{name}: {leg_name}: {e}"),
+                    },
+                )?,
+            );
+        }
+    }
+    Ok(ops)
 }
 
 /// A program's TENSOR inputs (in parameter order) and its output.

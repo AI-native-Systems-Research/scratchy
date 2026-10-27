@@ -190,6 +190,20 @@ pub fn lower(
         // multiplies over generic ops, whole-tensor at corner 0 (the splice's own
         // region guard refuses a windowed one). No door fact is read off the program.
         Program::Sample => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
+        // ⭐ THE CHAINED HEAD'S ROW PRODUCTION — the same no-door-to-cross shape as the
+        // transpose: the three legs (slab gather, restickify transpose, row gather) are
+        // parameterised by the extents its own regions state. See [`lk::embed_row_gather`]
+        // and [`ktir_superdsc::ktir_node::Program::EmbedRowGather`] for the laws (the
+        // weight read in place, the one-entry index law, the sentinel living with the
+        // producer).
+        Program::EmbedRowGather { .. } => {
+            lk::embed_row_gather(name, k, &r, sym_id_base, layout)
+        }
+        // ⭐ THE CHAINED HEAD'S PICK DECOMPOSE — three one-entry u32 table gathers the
+        // same copy door assembles (`lk::chain_stage`): the pick's word 0 indexes the
+        // two staged decompose tables, landing the persistent s/l sticks and the fresh
+        // s-value stick.
+        Program::ChainStage { .. } => lk::chain_stage(name, k, &r, sym_id_base, layout),
         Program::RmsNormUnit => {
             windowed(name, &r, lk::rmsnorm_unit(name, k, &r, sym_id_base, layout))
         }

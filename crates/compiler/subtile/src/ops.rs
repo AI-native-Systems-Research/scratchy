@@ -27,6 +27,9 @@
 //!   - `[in0]` — shape-preserving: output width = `inputs[0]` width;
 //!   - `[in1]` — output width = `inputs[1]` width (GDN's z operand);
 //!   - `[one]` — one column per row (a row reduction);
+//!   - `[ustick]` — the SENUINT32 index stick's width (`CHAIN_IDX_BLOCK`,
+//!     the chained head's out-stick class — one derivation with the mint and
+//!     the host reference, so the stick width cannot drift between them);
 //!   - `[field f]` — output width is the op's own field `f`;
 //!   - `[nz f]` — the op's own non-zero count field `f` (`.get()`);
 //!   - `[pairs in0 k]` / `[pairs f k]` — `(token, expert)` pair rows laid out `[m, k·w]`, `w` the
@@ -144,14 +147,20 @@ macro_rules! for_each_subop {
             Mamba2 [SubOp::Mamba2 { .. }] arity = (|n| n == 2), cols = [field inner],
                 rows = [in0], gemm_w = [none];
             Mean [SubOp::Mean] arity = (|n| n == 1), cols = [one], rows = [in0], gemm_w = [none];
-            // The token draw: one `[rows, PAD_V]` logits block, its per-row noise block
-            // and per-row temperature reciprocals, plus the nine staged tables
-            // (functions of the vocab alone — the periodic block pair, the lane pair,
-            // the two widen tables, the pad law's offset row, and the two-level ramp's
-            // group pair), out ONE `[rows, 64]` idx stick — the output width is the
-            // device's own stick, never a shape read (the whole row is one tile in,
-            // one stick out, every lane equal).
             Sample [SubOp::Sample { .. }] arity = (|n| n == 12), cols = [stick],
+                rows = [in0], gemm_w = [none];
+            // The chained head's row gather: `[s_stick, l_stick, embed_matrix]` —
+            // the s stick's rows out (one per request), `hidden` wide (the op's
+            // own field, never a shape read). The matrix is read as DATA already
+            // staged as the lm-head's gemm weight; classifying it gemm_w here
+            // would double-stage it.
+            EmbedRowGather [SubOp::EmbedRowGather { .. }] arity = (|n| n == 3),
+                cols = [field hidden], rows = [in0], gemm_w = [none];
+            // The pick staged into the persistent chain placements through the
+            // decompose tables: the fresh s-value stick out, one u32 stick wide
+            // (`[ustick]` — CHAIN_IDX_BLOCK, the SENUINT32 stick), one row per
+            // pick row (the write-through is GPU-only, RopeAppend's law).
+            ChainStage [SubOp::ChainStage { .. }] arity = (|n| n == 5), cols = [ustick],
                 rows = [in0], gemm_w = [none];
             // The ops one construct expands to (a MoE block, a KV codec's steps, sampled rows) —
             // also generating `expansion_ops!()`, the pattern a target without them refuses by.
@@ -253,6 +262,9 @@ macro_rules! __out_cols_body {
     };
     ($w:ident, [stick]) => {
         crate::subtile_ir::SAMPLE_BLOCK
+    };
+    ($w:ident, [ustick]) => {
+        $crate::subtile_ir::CHAIN_IDX_BLOCK
     };
     ($w:ident, [field $f:ident]) => {
         *$f

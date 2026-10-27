@@ -240,11 +240,20 @@ fn emit_regions(
         // a missing arm — the day the splice learns to produce one, its arm moves out of this
         // group and takes a real entry point with it. (The MoE programs are no longer variants at
         // all — the MoE lowers only from `kernels/moe.py` through KTIR.)
+        //
+        // `EmbedRowGather` and `ChainStage` are HERE and only here: their bodies (the slab
+        // gather, the restickify transpose, the row gather, the relayout; the three one-entry
+        // table gathers) are the SPYRE door's — `ktir_superdsc_door`'s `lk::embed_row_gather`
+        // and `lk::chain_stage`, the `#603` chained head — minted by the spyre-side emitter and
+        // refused by name at the splice's registry, so a node carrying either into THIS crate is
+        // a routing change, not a missing arm.
         Program::RmsNormUnit
         | Program::TanhSoftCap
         | Program::ScalarWeightMul
         | Program::Reshape
-        | Program::WindowedRmsNorm { .. } => {
+        | Program::WindowedRmsNorm { .. }
+        | Program::EmbedRowGather { .. }
+        | Program::ChainStage { .. } => {
             return Err(Error {
                 stage: "program",
                 message: format!(

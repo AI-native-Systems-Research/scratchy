@@ -786,6 +786,17 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
                 }
                 self.acts_i32.push((tensor, bytes));
             }
+            // ⭐ THE CHAIN'S SEED — raw u32 lane values, LE words verbatim through
+            // the same raw-integer bind the index table rides (the staging door's
+            // law: LE bytes are the device encoding for raw integer words), never
+            // the IEEE→SEN convert an f16 arm would run.
+            scratchy_target_spyre::forward_tape::Staged::U32(v) => {
+                let mut bytes = Vec::with_capacity(v.len() * 4);
+                for w in v.iter() {
+                    bytes.extend_from_slice(&w.to_le_bytes());
+                }
+                self.acts_i32.push((tensor, bytes));
+            }
         }
         Ok(())
     }
@@ -2005,8 +2016,83 @@ pub(crate) fn forward_chunk(
     let mut dynamic: Vec<(u64, Vec<f32>, Vec<usize>)> = {
         let mut dynamic =
             Vec::with_capacity(1 + b.cos_srcs.len() + b.sin_srcs.len() + 2 * b.layers.len());
-        // The embedding is this chunk's rows of the hidden state.
-        dynamic.push((b.embed_src as u64, emb, vec![rows, sh.hidden]));
+        // ⭐ THE CHAIN REPLACES THE EMBED ROW PUSH here too — a chained wiring's
+        // gather reads the two persistent sticks, so the host's contribution is
+        // their seed: the LAST REAL token's decompose (the token this forward
+        // feeds — the same value the card path's ChainSeed steps state, and
+        // idempotent with the device's own ChainStage writes for the same
+        // reason: step t feeds the token step t-1 picked). The sticks carry u32
+        // lane values, so the seed rides this f32 list as BIT-PRESERVING WORDS
+        // (`f32::from_bits`) — the same carrying the reference legs use — and
+        // the gather's eval arm converts them back with `to_bits`.
+        match b.phase {
+            scratchy_target_spyre::forward_tape::ForwardPhase::Decode { chain } => {
+                // ⭐ THE SEEDS ARE PER-REQUEST-ROW AT THE FORWARD'S OWN WIDTH —
+                // row i carries ITS OWN token's decompose (`toks[i.min(n-1)]`,
+                // the same clamp the embed fill above uses: pad rows repeat the
+                // last real token's seed, idempotent with the device's own
+                // ChainStage writes exactly as the solo push was). The s seed
+                // is `[rows, lanes]` — one whole pattern stick per row — and
+                // the l seed is `[rows·l_sticks, lanes]`, row i's ramp sticks
+                // then row i+1's, the placement shape the mint states. At
+                // `rows == 1` both pushes are the solo spelling byte-for-byte.
+                let lanes = scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK as usize;
+                let l_sticks =
+                    scratchy_subtile::subtile_ir::chain_l_sticks(chain.hidden) as usize;
+                // ⭐ THE S SEED CARRIES THE LANE PATTERN — lane `i` stages
+                // `k·(last>>6) + (i mod k)` (`chain_s_stick_pattern`, the ONE
+                // spelling, shared with the tape seed the card path's ChainSeed
+                // steps state): the same bytes the device's own ChainStage
+                // writes for the same pick, which is what keeps the idempotence
+                // claim above true at k > 1. The pattern words stay in the
+                // splat's own magnitude class (granite: s ≤ 49154>>6 = 768, so
+                // the words ≤ 4·768 + 3 = 3075, far under 2^24), so the
+                // bit-preserving `f32::from_bits` carrying round-trips them
+                // exactly. At k = 1 the pattern IS the splat.
+                let mut s_words = Vec::with_capacity(rows * lanes);
+                // ⭐ THE L SEED CARRIES THE LANE RAMP — word `i` stages
+                // `64·(i mod (hidden/64)) + (last&63)` (`chain_l_stick_ramp`,
+                // the ONE spelling, shared with the tape seed and the
+                // device's l_tab, SELF-SIZED at the stick count): the
+                // transposed row's own sticks, the WHOLE multi-stick index
+                // the row gather's per-stick cut walks, the same ramp the
+                // device's tables write for the same pick. The ramp words stay
+                // in the splat's own magnitude class (the largest names stick
+                // `hidden − 1`, 4095 at 8b, far under 2^24), so the
+                // bit-preserving `f32::from_bits` carrying round-trips them
+                // exactly.
+                let mut l_words = Vec::with_capacity(rows * l_sticks * lanes);
+                for row in 0..rows {
+                    let t = toks[row.min(n - 1)] as u32;
+                    s_words.extend(
+                        scratchy_subtile::subtile_ir::chain_s_stick_pattern(
+                            chain.k,
+                            t >> 6,
+                            lanes,
+                        )
+                        .into_iter(),
+                    );
+                    l_words.extend(
+                        scratchy_subtile::subtile_ir::chain_l_stick_ramp(t & 63, chain.hidden)
+                            .into_iter(),
+                    );
+                }
+                dynamic.push((
+                    chain.s_src as u64,
+                    s_words.iter().map(|w| f32::from_bits(*w)).collect(),
+                    vec![rows, lanes],
+                ));
+                dynamic.push((
+                    chain.l_src as u64,
+                    l_words.iter().map(|w| f32::from_bits(*w)).collect(),
+                    vec![rows * l_sticks, lanes],
+                ));
+            }
+            scratchy_target_spyre::forward_tape::ForwardPhase::Prefill => {
+                // The embedding is this chunk's rows of the hidden state.
+                dynamic.push((b.embed_src as u64, emb, vec![rows, sh.hidden]));
+            }
+        }
         // ⭐ THE COMPILE-TIME SCALARS, AT THEIR RESERVED TIDS. The programs read each
         // model constant (a ScalarMul multiplier, an RMSNorm epsilon or divisor) and the algebraic
         // identities `0`/`1` from a bound `[1,1]` tile rather than a KTIR immediate, so that ONE

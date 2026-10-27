@@ -149,7 +149,13 @@ pub fn metal_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRul
         // buffer, never an alias of any operand. Metal never mints the sampler (the mint
         // is the spyre bake's), but the rule table is exhaustive by law, and the stick's
         // colour is FRESH whichever target runs it.
-        | L::Sample { .. } => FRESH,
+        | L::Sample { .. }
+        // The chained head's pair (the spyre chain mint's; metal never constructs
+        // them): the gather writes its own [1, hidden] row, the stage its own stick
+        // copy — fresh buffers both, the persistent placement is not an arena colour
+        // at all.
+        | L::EmbedRowGather { .. }
+        | L::ChainStage { .. } => FRESH,
         // The rest of a MoE block lives in the op scratch (`moe_write`), not the arena.
         L::RouterNorm { .. }
         | L::RouterLogits { .. }

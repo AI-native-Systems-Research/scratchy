@@ -432,7 +432,15 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         | SubOp::ExpertAct { .. }
         | SubOp::SampleRowsGather
         | SubOp::SampleRowsScatter
-        | SubOp::AllRowsMatmul => TritonKernelRow::Refused(
+        | SubOp::AllRowsMatmul
+        // ⛔ THE CHAINED HEAD'S PAIR — its by-name refusals DIED with the
+        // chained-head emission rung: both ops are HAND-MINTED KTIR programs
+        // (`lower_one_node`'s chain arms, the spyre emitter — the door bodies
+        // `lk::embed_row_gather`/`lk::chain_stage`, never Triton kernels), so
+        // they are ordinary members of the "not a spliced kind" class: reaching
+        // the splice means the routing changed, not that a kernel is missing.
+        | SubOp::EmbedRowGather { .. }
+        | SubOp::ChainStage { .. } => TritonKernelRow::Refused(
             "not a spliced kind — `lower_one_node` owns this op's lowering (its own arm, a \
              host routing, or its own by-name refusal); reaching the splice means the \
              routing changed, and the fix is a family function plus a kernel",
@@ -2862,6 +2870,48 @@ pub fn operand_dfs<F: scratchy_subtile::subtile_ir::RopeForm>(
     // statement. This names the ROUTING, not a format.
     if matches!(node.op, SubOp::AttnDecode { .. }) {
         return Ok(None);
+    }
+    // ⭐ THE CHAINED HEAD'S PAIR — HAND-MINTED KTIR, NOT SPLICED, but its
+    // operand formats are still THIS census's to state, because the placement
+    // widths read no other seat: the door's own u32-stick law (a staged
+    // table's gathered destination is exactly one `[1, 32]` SENUINT32 stick,
+    // and the pick's `[1, 64]` i32 lanes are the same bytes at the argmax's
+    // own SenUint32 statement) sizes those tensors at FOUR bytes an element.
+    // Left to the fp16 default the placement under-reserves by half and the
+    // footprint guard refuses the CORRECT descriptor — the exact defect this
+    // census exists to prevent. The formats are the DOOR's law
+    // (`lk::embed_row_gather`'s idx-stick class check, `lk::chain_stage`'s
+    // destination class check), stated here because the emitter that mints
+    // the programs has no kernel signature to read them from.
+    if matches!(
+        node.op,
+        SubOp::EmbedRowGather { .. } | SubOp::ChainStage { .. }
+    ) {
+        let bindings = default_bindings(node);
+        let dfs = match &node.op {
+            // `[s_stick, l_stick, weight, out]`: the two index sticks are
+            // SENUINT32; the weight and the `[1, hidden]` row are fp16.
+            SubOp::EmbedRowGather { .. } if bindings.len() == 4 => vec![
+                (bindings[0].get(), Df::SenUint32),
+                (bindings[1].get(), Df::SenUint32),
+            ],
+            // `[pick, s_stick, l_stick, s_tab, l_tab, out]`: every operand is
+            // a u32 stick or a u32 table — all SENUINT32.
+            SubOp::ChainStage { .. } if bindings.len() == 6 => {
+                bindings.iter().map(|b| (b.get(), Df::SenUint32)).collect()
+            }
+            // A chain node off the mint's arity — the operand-order contract
+            // this function's own zip law states below.
+            _ => {
+                return Err(format!(
+                    "triton splice: a chained-head node states {} operand(s) — the mint's \
+                     shape is exactly four for the gather and six for the stage (see \
+                     `mint_embed_chain`)",
+                    bindings.len()
+                ));
+            }
+        };
+        return Ok(Some(dfs));
     }
     let row = row(&node.op);
     let TritonKernelRow::Spliced {

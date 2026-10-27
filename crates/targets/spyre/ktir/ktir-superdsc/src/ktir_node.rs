@@ -250,6 +250,127 @@ pub enum Program {
     /// REFUSES that shape by name rather than emitting it; the shipped attention's answer — pad the
     /// row count to a stick multiple and loop whole 64×64 tiles — is named in the refusal.
     Transpose,
+    /// The chained head's embedding-row production (#603) — `table[pick]` off the lm-head's own
+    /// TIED weight, read IN PLACE in its kernel slot, as three door-assembled legs: a slab
+    /// gather (`gather_copy_opspec`, the MoE expert-bank precedent — one entry is one whole
+    /// contiguous `[page, 64]` chunk of the slot's slab-major device layout, `page = hidden/k`;
+    /// the `k` entries tile the slab), the
+    /// restickify-transpose of that slab `[hidden, 64] → [64, hidden]`
+    /// ([`transpose`](crate::emit::lower_ktir_to_superdsc::transpose)'s own door), and a row
+    /// gather off the transposed slab (`hidden/64` one-stick entries, the ramp lane `i`
+    /// naming source stick `64·i + l` — the same copy door). THREE tensor inputs plus the
+    /// out, in mint order: the slab index stick `[width, 32]` (row r's lanes the LANE
+    /// PATTERN `k·s_r + (i mod k)`, `s_r = pick_r >> 6`), the lane index stick
+    /// `[width, 32·l_sticks]` (row r's stick b at flat index stick `r·l_sticks + b`, its
+    /// lanes the LANE RAMP `64·i + (pick_r & 63)` — the transposed row's own sticks), the
+    /// weight `[hidden, pad_vocab]`, and the `[width, hidden]` row out.
+    ///
+    /// ⭐ IT IS A PROGRAM KIND AND NOT A TRITON KERNEL BECAUSE THE READ IS NOT
+    /// KERNEL-EXPRESSIBLE, AND THAT IS A CITED FACT, NOT A PREFERENCE. A descriptor gather
+    /// requires contiguous rows (`strides=[D, 1]`, `test-fixtures/embedding.py`'s own contract
+    /// and Triton `semantic.py`'s asserts at the definition), while the token's row in the
+    /// kernel slot is lane `pick % 64` across `hidden` sticks — stride 64, never contiguous
+    /// (the slab-major law, [`crate::sdsc_abstract`]'s `dev_off_stk`). And the whole-slab row
+    /// a gather would need instead is `hidden · 64` elements (512 KB at hidden 4096), past
+    /// every tile budget. The `Transpose` kind is the precedent class: a computed-value op
+    /// with no Triton home, door-assembled, its stick law stated in its doc.
+    ///
+    /// ⛔ THE DECOMPOSE (`s`, `l`) IS NOT THIS OP'S. The indices arrive as STICKS this op
+    /// reads — SENUINT32, one row of the `[width, ·]` sticks per request, whatever produced
+    /// them (the `ChainStage` node, or the host's one-time seed). Producing them is the
+    /// chain's consumption fact and lives with its producer; if the chain's realization ever
+    /// changes geometry, this op must not change with it.
+    ///
+    /// ⛔ THE WEIGHT IS READ IN PLACE — ONE source, the lm-head's own operand. Any second
+    /// staging of the embedding matrix anywhere in this op's realization is the dead hack,
+    /// refused on sight. The `[width·hidden, 64]` slab scratch and the
+    /// `[width·(64+1), hidden]` transposed PLACEMENT (each request's `[64, hidden]`
+    /// transpose plus the sentinel's reserved zero tail — the unwritten sticks
+    /// `[hidden, hidden + hidden/64)` per request, never written by any op, staged zero
+    /// once at prepare) are per-step activations of the step's arena, sized at expansion —
+    /// never runtime allocations, never weight-sized.
+    ///
+    /// `k` — the SLAB-GATHER ENTRY COUNT: the s stick's LANE PATTERN modulus
+    /// (`k·s + (i mod k)`) and the slab gather's page split (`page = hidden/k`), the
+    /// number that keeps the gather's per-core LX charge under the vendor budget. Stated
+    /// by the lowering that builds this payload — the one derivation's spelling, called
+    /// once off this op's own `hidden` — and read here by the door, never re-derived.
+    EmbedRowGather { k: u32 },
+    /// The chained head's pick decompose (#603) — the pick, staged into the persistent s/l
+    /// placements through TWO STAGED TABLES, as THREE one-entry u32 table gathers the door
+    /// assembles (`gather_copy_opspec`, the same copy door): `s_tab[pick] → s_stick`,
+    /// `s_tab[pick] → s_out` (the node's fresh output — the s-value stick the host
+    /// reference states, so the two ends agree on what the node produced), and
+    /// `l_tab[pick] → l_stick`. FIVE tensor inputs plus the out, in mint order: the pick
+    /// stick `[width, 64]` (the argmax idx stick's own class, i32 lanes, every lane of row
+    /// r equal to `pick_r` — read as ONE SENUINT32 entry per request, the value is below
+    /// 2^24 so the bytes are the same number), the persistent s-stick `[width, 32]`, the
+    /// persistent l-stick `[width, 32·l_sticks]`, the two decompose tables, and the fresh
+    /// `[width, 32]` s-value stick out.
+    ///
+    /// ⭐ THE TABLES ARE THE ARGMAX NINE'S OWN IDIOM, RULED — staged tables, exact by
+    /// construction where fp16 arithmetic is not: the pick reaches `pad_vocab + 4160`,
+    /// past fp16's RANGE entirely, and integers past 2048 are not fp16-exact anyway.
+    /// `s_tab`'s row `t` is the LANE PATTERN — lane `i` stages `k·(t>>6) + (i mod k)`,
+    /// clamped to the s=0 pattern `i mod k` past `pad_vocab` (the s-clamp is BUS
+    /// SAFETY — the only pick past `pad_vocab` the argmax can answer is the all-NaN
+    /// sentinel, and it reads slab 0's pattern harmlessly); `l_tab[t]` carries the LANE
+    /// RAMP at `t & 63` (lane `i` = `64·(i mod (hidden/64)) + (t & 63)`), mapping
+    /// past-`pad_vocab` picks to the SENTINEL RAMP (lanes naming the transposed placement's
+    /// unwritten zero tail, word 0 = `hidden` — a real pick's word 0 is a lane `≤ 63`, so
+    /// the mark never collides). `s_tab` is `[table_rows, 32]` SENUINT32 and `l_tab` is
+    /// `[table_rows, 32·l_sticks]` — the payload's own stated `table_rows`, one patterned
+    /// row per answerable pick, a function of `pad_vocab`, `k`, and `hidden`, staged once
+    /// at prepare.
+    /// ⛔ A TWO-LEVEL SPLIT IS DEAD BY ARITHMETIC, NOT PREFERENCE: `t = a·2¹² + b` ⇒
+    /// `s = a·64 + (b >> 6)` needs a u32 add no door emits, and `l = t & 63` has no
+    /// small-table form (any table indexed by `t` is range-sized).
+    ///
+    /// ⛔ THE PERSISTENT WRITES ARE GATHER DESTINATIONS, the one carrier the doors provide
+    /// for u32 data (a plain u32 copy door does not exist — `reshape`'s identity copies
+    /// are fp16-only), and the placement's own name is the destination's name: the KV
+    /// write's identity-matmul form was for fp16 GEOMETRY, not a gather prohibition. The
+    /// sticks are PLACEMENTS the device owns across steps (the KV pool's law), never node
+    /// outputs — a node output with no in-graph consumer is a free slot the coloring
+    /// reuses, and the body would clobber the chain's state between steps.
+    ///
+    /// ⛔ ONE OP PER ROW IS FORCED BY THE PICK'S OWN SHAPE, not chosen: the pick is splat
+    /// per row, so a single contiguous run of `width` entries from word 0 would read row
+    /// 0's lanes `width` times (every one of them `pick_0`). The door cuts one op per
+    /// request, each reading its row's own index stick — the KV fold's per-stick cut
+    /// (`GatherScratch::copies`), which at width 1 is the single whole-buffer op
+    /// byte-for-byte.
+    ///
+    /// `pad_vocab` — the table range's derivation, stated once at the mint from the pick's
+    /// own argmax (`sample_pad_vocab`) so producer and consumer can never disagree on the
+    /// range the decompose is exact over. The mint asserts the group law on it (a whole
+    /// multiple of the sampler group) beside the extent; nothing derives it twice.
+    ///
+    /// `table_rows` — the tables' OWN row count, stated ONCE at the mint as
+    /// `pad_vocab + SAMPLE_SENTINEL_OFFSET + 1` (the sentinel row included). The door's
+    /// extent check reads THIS payload, never a re-derivation: this leaf crate carries no
+    /// sentinel arithmetic, and the one mint that computed the extent is the one statement
+    /// of it.
+    ///
+    /// `k` — the SLAB-GATHER ENTRY COUNT, the s table's LANE PATTERN modulus
+    /// (`k·(t>>6) + (i mod k)` per row `t`, the s=0 pattern `i mod k` past `pad_vocab`)
+    /// and the consumer gather's page split (`page = hidden/k`). The fill stages it and
+    /// the door reads it, both off THIS payload — the mint's own stated entry count,
+    /// carried here so no consumer re-derives it.
+    ///
+    /// `hidden` — the MODEL'S OWN hidden width, the l table's LANE RAMP modulus
+    /// (`64·(i mod (hidden/64)) + (t & 63)` per row `t`) and the sentinel ramp's mark
+    /// (its word 0 is `hidden` itself). Stated ONCE at the mint off the paired gather's
+    /// own `hidden` payload — the same single statement `load_consts_of_ir` stages the
+    /// `ChainStageTable`s from — and carried here so no consumer re-derives it: the
+    /// index stick's width (`CHAIN_IDX_BLOCK`, 32 for EVERY model) is not a statement
+    /// of hidden, and `lanes·64` is one model's hidden by coincidence, never a law.
+    ChainStage {
+        pad_vocab: u32,
+        table_rows: u32,
+        k: u32,
+        hidden: u32,
+    },
     /// `Reshape{Times(H>1)} → RmsNorm{eps, gain}/RmsNormUnit{eps} →
     /// Reshape{Times(1)}` — the per-head q/k norm SANDWICH, fused to per-head
     /// windows over the ORIGINAL tensor. The flatten-back restores exactly the

@@ -1635,6 +1635,26 @@ pub fn dev_off_stk(dims: &[usize], stick_idx: usize, idx: &[usize], stk: usize) 
     }
 }
 
+/// ⭐⭐ DOES A ROW-MAJOR STAGING AND THE STICK-BLOCKED READ OF THE SAME `[rows, cols]` fp16
+/// ACTIVATION COINCIDE IN BYTES? One predicate, TWO consumers that must not drift:
+///
+/// * `lower_ktir_to_superdsc`'s chained-head door (`embed_row_gather`, #603) uses it as the
+///   LEG-4 ELISION — the row gather's request-major scratch IS the `[rows, cols]` activation,
+///   byte for byte, exactly while this holds, and the relayout leg exists exactly when it does
+///   not. A WIDTH BRANCH IS NOT PERMITTED THERE: the elision is this derived layout fact, never
+///   `if width == 1`.
+/// * `forward_tape::stick_scatter`'s one-row identity lemma rests on the same fact — decode's
+///   row-major staging and prefill's stick-scattered staging are the same bytes exactly while
+///   this holds.
+///
+/// The law is [`StickLayout::addr_eq`]'s same-shape branch, not a second formula: `rows == 1`
+/// (one row — nothing to interleave) or `cols <= lanes` (one stick's worth of columns — no
+/// blocking to differ). `cols` is a whole number of fp16 sticks at every caller (the
+/// activations' own law), so `cols <= lanes` is `cols == 64` there.
+pub fn row_major_is_stick_major(rows: usize, cols: usize) -> bool {
+    StickLayout::flat(rows, cols).addr_eq(&StickLayout::row_blocked(rows, cols))
+}
+
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 //  SYSTOLIC LAYOUT vocabulary — the typed core that makes "wrong layout" unexpressible. `StickLayout`
 //  OWNS `dev_off` (delegates to the free fn above, byte-identical — Kani `dev_off_method_equals_free_fn`

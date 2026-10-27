@@ -9350,6 +9350,42 @@ fn emit_superdsc_wiring(
                 ));
             }
         }
+        // ⭐ THE CHAINED HEAD'S STICKS — the seat's own class law, stated for the
+        // chain: the two persistent `[1, CHAIN_IDX_BLOCK]` u32 sources are minted
+        // below the `LoweredDecode` binding layer, so they carry no
+        // `SourceBinding`, and the CLASS declares their filler — the tape's
+        // ChainSeed steps bind both (the s stick's lane pattern, the l stick's
+        // ramp), fresh every step, idempotent with the device's own ChainStage
+        // writes. The two decompose TABLES ride `load_consts` like the sampler's
+        // nine (staged once at load) and need no class of their own.
+        let chain_sticks: Option<(u32, u32)> = match &gk.chain {
+            scratchy_target_spyre::wiring::ChainFact::Chained { chain } => {
+                for (name, tid) in [("s", chain.s_src), ("l", chain.l_src)] {
+                    if tid >= gk.num_sources {
+                        fail.push(format!(
+                            "the chain's {name} stick t{tid} is not inside `num_sources` ({}) — \
+                             nothing can ever bind it",
+                            gk.num_sources
+                        ));
+                    }
+                    if gk.load_consts.iter().any(|&(ltid, _)| ltid == tid) {
+                        fail.push(format!(
+                            "the chain's {name} stick t{tid} is ALSO a load-time const — the \
+                             sticks are per-step state the device rewrites, never load-staged"
+                        ));
+                    }
+                }
+                if chain.s_src == chain.l_src {
+                    fail.push(
+                        "the chain names one tid as both the s and the l stick — the mint mints \
+                         two sources, so a shared tid means two mints disagree"
+                            .to_string(),
+                    );
+                }
+                Some((chain.s_src, chain.l_src))
+            }
+            scratchy_target_spyre::wiring::ChainFact::Unchained => None,
+        };
         let mut embeds = 0usize;
         for id in 0..gk.num_sources {
             let Some(b) = lwd.bindings.get(id as usize) else {
@@ -9374,6 +9410,15 @@ fn emit_superdsc_wiring(
                         continue;
                     }
                 }
+                // ⭐ THE CHAIN'S OWN ARM — the per-step class the block above
+                // declares: covered BY CLASS (the tape's ChainSeed steps bind
+                // both sticks every step), which is why this is a `continue`
+                // and not a refusal.
+                if let Some((s_src, l_src)) = chain_sticks {
+                    if s_src == id || l_src == id {
+                        continue;
+                    }
+                }
                 fail.push(format!(
                     "source t{id} is inside `num_sources` but has NO binding — nothing fills it"
                 ));
@@ -9384,6 +9429,18 @@ fn emit_superdsc_wiring(
                 // The generated weight loader binds these once, before prepare.
                 SB::Weight { .. } | SB::WeightScale { .. } | SB::BundleTensor { .. } => {}
                 SB::EmbeddedHidden => {
+                    // ⭐ THE CHAIN'S RESIDENT EXCUSE — the replaced row's host
+                    // filler is gone (the tape's ChainSeed steps replaced the
+                    // embed-row push), but the row is not unbound: the device's
+                    // own EmbedRowGather writes it every step. The chain names
+                    // the replaced id at the mint; this gate reads the same
+                    // statement, never a re-derivation.
+                    if let scratchy_target_spyre::wiring::ChainFact::Chained { chain } = &gk.chain
+                    {
+                        if id == chain.replaces {
+                            continue;
+                        }
+                    }
                     embeds += 1;
                     if id != embed_src {
                         fail.push(format!(
@@ -9407,7 +9464,10 @@ fn emit_superdsc_wiring(
                 SB::PrefixK { .. } | SB::PrefixV { .. } => {}
             }
         }
-        if embeds != 1 {
+        // A chained decode carries its EmbeddedHidden row as DEVICE-WRITTEN
+        // (excused above), so the tape-side count is legitimately zero there.
+        let embed_floor = if chain_sticks.is_some() { 0 } else { 1 };
+        if embeds < embed_floor {
             fail.push(format!(
                 "{embeds} EmbeddedHidden sources; the tape gathers exactly one row"
             ));
@@ -9707,6 +9767,21 @@ fn emit_superdsc_wiring(
                         }
                     }
                 }
+                scratchy_target_spyre::wiring::LoadConst::ChainStageTable {
+                    pad_vocab,
+                    k,
+                    hidden,
+                    operand,
+                } => {
+                    quote! {
+                        ::scratchy_target_spyre::wiring::LoadConst::ChainStageTable {
+                            pad_vocab: #pad_vocab,
+                            k: #k,
+                            hidden: #hidden,
+                            operand: #operand,
+                        }
+                    }
+                }
             };
             quote! { (#tid, #kind) }
         })
@@ -9756,6 +9831,34 @@ fn emit_superdsc_wiring(
         }
         None => quote! { ::core::option::Option::None },
     };
+    // ⭐ THE FORWARD'S OWN PHASE — a projection of the wiring's own chain
+    // fact, never a second derivation: a rung the mint chained is a DECODE
+    // rung (the mint runs on decode slots only, and it refuses — panics — a
+    // decode slot it cannot chain), so `Chained` ⇒ `Decode { chain }` and
+    // `Unchained` ⇒ `Prefill`, byte-identical to the pre-mint behavior.
+    let phase_tok = match &gk.chain {
+        scratchy_target_spyre::wiring::ChainFact::Chained { chain } => {
+            let s_src = u32l(chain.s_src);
+            let l_src = u32l(chain.l_src);
+            let k = u32l(chain.k);
+            let hidden = u32l(chain.hidden);
+            let replaces = u32l(chain.replaces);
+            quote! {
+                ::scratchy_target_spyre::forward_tape::ForwardPhase::Decode {
+                    chain: ::scratchy_target_spyre::wiring::ChainWiring {
+                        s_src: #s_src,
+                        l_src: #l_src,
+                        k: #k,
+                        hidden: #hidden,
+                        replaces: #replaces,
+                    },
+                }
+            }
+        }
+        scratchy_target_spyre::wiring::ChainFact::Unchained => {
+            quote! { ::scratchy_target_spyre::forward_tape::ForwardPhase::Prefill }
+        }
+    };
     quote! {
         ::scratchy_target_spyre::wiring::Wiring {
             result: #result,
@@ -9786,6 +9889,7 @@ fn emit_superdsc_wiring(
             fp8_k_pads: &[#(#fp8_k_pad_toks),*],
             load_consts: &[#(#load_const_toks),*],
             sample_seat: #sample_seat_tok,
+            phase: #phase_tok,
         }
     }
 }
@@ -9967,6 +10071,12 @@ fn synth_role_tokens(
     let b = quote! { ::scratchy_target_spyre::bundle_code::SynthRole };
     match r {
         R::Rot => quote! { #b::Rot },
+        // The chained head's synthetics (Front C): the per-request slabs the
+        // gather walks, their leg-2 transposes with the sentinel's reserved
+        // zero row, and the request-major leg-3 rows.
+        R::ChainSlab => quote! { #b::ChainSlab },
+        R::ChainSlabT => quote! { #b::ChainSlabT },
+        R::ChainRow => quote! { #b::ChainRow },
         R::Xc => quote! { #b::Xc },
         R::Rs => quote! { #b::Rs },
         R::Silu => quote! { #b::Silu },
@@ -11167,6 +11277,29 @@ fn dump_wavefront_mega(
                 let mut prefill_fp_stamped = false;
                 let fused = scratchy_subtile::lower::fuse_silu_mul(&lwd.input);
                 let mut krg = scratchy_subtile::subtile_ir::lower_region(&fused, knb);
+                // ⭐⭐⭐ THE CHAINED HEAD'S WIDENING PASS — ABOVE every mint, tie-gated
+                // at the model: the tied embed weight's STATED cols widen to the pick's
+                // pad (`sample_pad_vocab`), so the gather's stride-`pad` walk and the
+                // decompose's clamp boundary are ONE width by construction. It must run
+                // BEFORE the mints — both passes walk the result tail back to the
+                // lm-head, and after the draw the result IS the idx stick, a tail the
+                // widen walk cannot read. Non-admitting tails return None and touch
+                // nothing; every admitting bundle of a tied model reserves the same
+                // widened bytes (the weight-segment parity ledger's law).
+                let tied = tie_word_embeddings(model);
+                let widen = if tied {
+                    scratchy_subtile::subtile_ir::widen_tied_embed_weight(&mut krg)
+                } else {
+                    None
+                };
+                if let Some(w) = &widen {
+                    eprintln!(
+                        "[spyre-superdsc] {base}: the tied embed weight widened — vocab {} \
+                         (stated cols {}), reservation grown, FLOPs untouched (the matmul's \
+                         region stays 0..vocab)",
+                        w.vocab, w.pad_vocab
+                    );
+                }
                 // ⭐⭐⭐ THE TOKEN DRAW'S MINT — EVERY rung this closure bakes: the
                 // solo m=1 bake, every emulator cap bucket, every batch-ladder rung,
                 // AND every prefill rung (the general mint — no prefill-specific
@@ -11208,6 +11341,63 @@ fn dump_wavefront_mega(
                         mint.invt.index(),
                         if is_prefill { " (prefill rung)" } else { "" },
                     );
+                    // ⭐⭐⭐ THE CHAINED HEAD'S MINT (#603) — the second splice onto the
+                    // same DECODE rung (prefill keeps the host-staged embed rows — its
+                    // input row is prompt tokens the host owns, never a device pick):
+                    // the EmbedRowGather at the entry (every whole-tensor consumer of
+                    // the embed row re-pointed onto its output), the ChainStage at the
+                    // tail (the pick decomposed into the persistent s/l sticks through
+                    // the two staged tables), the four-source insert below the
+                    // SourceBinding layer. THE PICK IS THE DRAW'S OWN OUTPUT — the
+                    // by-kind find the A-seam refused on: `mint_sample` re-pointed the
+                    // rung's result to the idx stick, so `krg.result` IS the device
+                    // pick, and the vocab the tables decompose over is the mint's own
+                    // emitted vocab. GATED ADDITIONALLY ON THE TIE (the gather's matrix
+                    // operand is the lm-head's weight source, the embedding matrix IFF
+                    // the model ties): an untied decode rung REFUSES here — the chained
+                    // head is the only decode path, and there is no host-pick arm to
+                    // fall to. Every width mints (the solo rung, every batch-ladder
+                    // rung, the symbolic CB batch alike): the chain is the decode path,
+                    // not a wide-batch extra.
+                    if !is_prefill {
+                        if !tied {
+                            panic!(
+                                "[spyre-superdsc] {base}: the decode rung's chained head \
+                                 requires a tied embedding head — this model does not tie \
+                                 word embeddings. The chained head is the only decode path \
+                                 (there is no host-pick arm to fall to); the untied \
+                                 admission is not implemented."
+                            );
+                        }
+                        use crate::to_wavefront::SourceBinding;
+                        let embed_row = lwd
+                            .bindings
+                            .iter()
+                            .position(|b| matches!(b, SourceBinding::EmbeddedHidden))
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "[spyre-superdsc] {base}: no EmbeddedHidden source — the \
+                                     chained head's gather has no row to replace"
+                                )
+                            });
+                        let pick = krg.result;
+                        let chain = scratchy_subtile::subtile_ir::mint_embed_chain(
+                            &mut krg,
+                            scratchy_subtile::subtile_ir::TensorId::from_index(embed_row),
+                            pick,
+                            mint.vocab,
+                        );
+                        eprintln!(
+                            "[spyre-superdsc] {base}: the chained head minted — the embed row \
+                             gather spliced over source t{embed_row} (hidden {}, vocab {}), the \
+                             persistent s/l sticks at t{}/t{}, the two decompose tables staged \
+                             once at load, and the pick decomposed into the sticks at the tail",
+                            chain.hidden,
+                            chain.vocab,
+                            chain.s_stick.index(),
+                            chain.l_stick.index()
+                        );
+                    }
                 }
                 if let Err(e) = scratchy_subtile::subtile_ir::ValidatedGraph::new(&krg) {
                     eprintln!("[spyre-ktir] {stem}: SubtileIR rejected by validate() — {e:?}");

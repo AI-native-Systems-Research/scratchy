@@ -223,7 +223,9 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | O::RopeAppend { .. }
             | O::KvAppend { .. }
             | O::AttnDecode { .. }
-            | O::Sample { .. } => None,
+            | O::Sample { .. }
+            | O::EmbedRowGather { .. }
+            | O::ChainStage { .. } => None,
         }
     }
 }

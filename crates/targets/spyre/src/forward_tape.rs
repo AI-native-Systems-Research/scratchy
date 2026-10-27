@@ -49,6 +49,13 @@ pub enum Staged {
     /// [`GatherEntry`]: scratchy_subtile::sdsc_abstract::GatherEntry
     /// [`GatherEntry::of_page_block`]: scratchy_subtile::sdsc_abstract::GatherEntry::of_page_block
     I32(std::borrow::Cow<'static, [scratchy_subtile::sdsc_abstract::GatherEntry]>),
+    /// ⭐ RAW u32 LANE VALUES — the chained head's stick seeds and nothing
+    /// else. The sticks carry the decompose's own words (`k·s + (i mod k)`
+    /// lane patterns, stick ramps), which an f32 arm would round and an
+    /// i32-arm would mistype; they are VALUE words the device's own
+    /// ChainStage rewrites every step, never addresses-in-waiting, so they
+    /// get their own variant rather than borrowing [`GatherEntry`].
+    U32(std::borrow::Cow<'static, [u32]>),
 }
 
 /// Where prefix validity comes from — the one genuinely two-regime input.
@@ -203,6 +210,70 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
         })?;
         return Ok(Staged::I32(std::borrow::Cow::Owned(blocks.to_vec())));
     }
+    // ⭐⭐⭐ THE CHAINED HEAD'S SEED — also raw u32 words served before the f32
+    // tail: the sticks carry u32 lane values an f32 arm would round, and the
+    // seed is the ONE decompose derivation's host half (`t>>6` / `t&63` off
+    // the token this step feeds — the same arithmetic the staged tables and
+    // the mint's reference state). A ChainSeed step on a prefill forward, or
+    // a step naming a tensor the chain does not, is a refusal: the sticks are
+    // the gather's only index, and an unstaged or mis-staged one gathers the
+    // wrong row silently.
+    if let ForwardKernel::ChainSeed = step.kernel {
+        let ForwardPhase::Decode { chain } = shape.phase else {
+            return Err(
+                "ChainSeed step on a prefill forward — the sticks are the gather's only index, so \
+                 a step the phase does not back is a tape/wiring desync"
+                    .to_string(),
+            );
+        };
+        let tok = inp
+            .tokens
+            .first()
+            .copied()
+            .ok_or_else(|| {
+                "ChainSeed step on a forward with no token to seed from".to_string()
+            })?
+            // The host's token ids are usize; the seed is a u32 WORD. The cast
+            // is the same boundary the worker's twin makes (`toks[n-1] as u32`)
+            // — the one place the id crosses into the stick's lane-value world,
+            // before the decompose, so the arithmetic runs in the width the
+            // device's own ChainStage writes.
+            as u32;
+        let is_s = step.tensor == PlaceId::Act(chain.s_src);
+        let v = if is_s {
+            tok >> 6
+        } else if step.tensor == PlaceId::Act(chain.l_src) {
+            tok & 63
+        } else {
+            return Err(format!(
+                "ChainSeed step on t{} — the chain names t{} (s) and t{} (l), and a seed landing \
+                 anywhere else is a stick the gather never reads",
+                step.tensor.tid(),
+                chain.s_src,
+                chain.l_src
+            ));
+        };
+        // ⭐ THE S STICK CARRIES THE LANE PATTERN — lane `i` stages
+        // `k·s + (i mod k)` (`chain_s_stick_pattern`, the ONE spelling, shared
+        // with the worker's twin push): the same bytes the device's own
+        // ChainStage writes for the same pick, which is what keeps this seed
+        // idempotent with the device's writes at every k (the claim the
+        // comment above this arm makes). The l stick carries the LANE RAMP —
+        // word `i` stages `64·(i mod (hidden/64)) + l`
+        // (`chain_l_stick_ramp`, the ONE spelling, shared with the worker's
+        // twin push, SELF-SIZED at the stick count): the transposed row's
+        // own sticks, the whole multi-stick index the row gather's per-stick
+        // cut walks, the same ramp the device's l_tab writes for the same
+        // pick. At one entry (hidden 64) the ramp IS the splat
+        // (`i mod 1 = 0`): the degenerate's seed is the old byte-for-byte.
+        let lanes = scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK as usize;
+        let words = if is_s {
+            scratchy_subtile::subtile_ir::chain_s_stick_pattern(chain.k, v, lanes)
+        } else {
+            scratchy_subtile::subtile_ir::chain_l_stick_ramp(v, chain.hidden)
+        };
+        return Ok(Staged::U32(std::borrow::Cow::Owned(words)));
+    }
     // ⭐ SERVED BEFORE THE OWNED TAIL, because a constant is not COMPUTED here — it is a table
     // the macro put in the binary, and the arms below all build their rows. Routing it through
     // them cost a copy of `2·hd²` floats per token for the identity and rope-P kernels alone.
@@ -279,6 +350,7 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
         ForwardKernel::PrefixMask => unreachable!("served above, where its dtype is decided"),
         ForwardKernel::Const(_) => unreachable!("served above, where it is borrowed not built"),
         ForwardKernel::KvBlockIndex => unreachable!("served above, where it stays an INTEGER"),
+        ForwardKernel::ChainSeed => unreachable!("served above, where it stays a raw word"),
         ForwardKernel::Decode => {
             return Err("Decode is a device step, not a host call".to_string());
         }
@@ -463,6 +535,20 @@ pub enum ForwardKernel {
     KvBlockIndex,
     /// Baked constant `i` (see [`crate::wiring::synthetic_constants`]).
     Const(usize),
+    /// ⭐⭐⭐ THE CHAINED HEAD'S SEED — the decompose of the token this step FEEDS
+    /// (`t>>6` / `t&63`, splatted across the 32 u32 lanes of one stick),
+    /// bound through the raw u32 channel into one of the two persistent sticks.
+    ///
+    /// Present only on a decode forward ([`ForwardShape::phase`]'s
+    /// [`ForwardPhase::Decode`] variant), where it
+    /// REPLACES the embed-row push: the device's own `EmbedRowGather`
+    /// reads the row out of the sticks, so the host no longer pushes an embed
+    /// row. The seed's value is IDEMPOTENT with the device's own writes — step
+    /// `t` feeds the token step `t-1` picked, which is exactly what step `t-1`'s
+    /// `ChainStage` wrote into the sticks — so the first play (the prompt's
+    /// final token, which no stage has written yet) is the one that matters, and
+    /// every later play re-states the device's own answer.
+    ChainSeed,
     /// The device program itself.
     Decode,
 }
@@ -510,6 +596,29 @@ pub struct ForwardShape {
     /// One artifact-derived question answers both.
     pub kv_block_index: bool,
     pub n_consts: usize,
+    /// ⭐⭐⭐ THE FORWARD'S OWN PHASE — which head the tape opens with, carried
+    /// BY TYPE ([`ForwardPhase`]). DECODE opens with the chained head's two
+    /// [`ForwardKernel::ChainSeed`] steps, the chain wiring riding the variant
+    /// (a decode forward without a chained head is refused at expansion, E0004,
+    /// so the runtime type carries what the bake proved — never an Option);
+    /// PREFILL opens with the host's own embed-row gather
+    /// ([`ForwardKernel::EmbedRow`]) and carries no chain. A projection
+    /// of the wiring's chain fact, like every other field here.
+    pub phase: ForwardPhase,
+}
+
+/// The forward's phase — the head its tape opens with, BY TYPE. See
+/// [`ForwardShape::phase`]. `Copy` like its payload ([`ChainWiring`]): the
+/// wiring projects it into shapes by plain field copy, never a clone site.
+#[derive(Clone, Copy)]
+pub enum ForwardPhase {
+    /// DECODE — the chained head's own device gather: the host's one
+    /// contribution is the sticks' seed, and the chain names the sticks.
+    Decode {
+        chain: crate::wiring::ChainWiring,
+    },
+    /// PREFILL — the host's own embed-row gather; there is no chain to carry.
+    Prefill,
 }
 
 impl ForwardShape {
@@ -517,10 +626,29 @@ impl ForwardShape {
     /// device program runs, then the logits come back.
     pub fn steps(&self) -> Vec<ForwardStep> {
         let mut v = Vec::new();
-        v.push(ForwardStep {
-            kernel: ForwardKernel::EmbedRow,
-            tensor: PlaceId::Act(self.embed_src),
-        });
+        match self.phase {
+            // ⭐ THE CHAIN REPLACES THE EMBED ROW PUSH — the device's own
+            // EmbedRowGather reads the row out of the persistent sticks, so the
+            // host's one contribution is the sticks' seed (the decompose of the
+            // token this step feeds). Two steps, one per stick, both before
+            // everything else the row used to precede.
+            ForwardPhase::Decode { chain } => {
+                v.push(ForwardStep {
+                    kernel: ForwardKernel::ChainSeed,
+                    tensor: PlaceId::Act(chain.s_src),
+                });
+                v.push(ForwardStep {
+                    kernel: ForwardKernel::ChainSeed,
+                    tensor: PlaceId::Act(chain.l_src),
+                });
+            }
+            // ⭐ PREFILL'S OWN HEAD — the chunk's token rows, gathered on the
+            // host: prefill's input staging is this gather and nothing else.
+            ForwardPhase::Prefill => v.push(ForwardStep {
+                kernel: ForwardKernel::EmbedRow,
+                tensor: PlaceId::Act(self.embed_src),
+            }),
+        }
         for (i, &(t, ..)) in self.cos_srcs.iter().enumerate() {
             v.push(ForwardStep {
                 kernel: ForwardKernel::Cos(i),
@@ -659,6 +787,7 @@ mod tests {
             // existing bundle plays. The gathering variant is asserted separately.
             kv_block_index: false,
             n_consts: 3,
+            phase: ForwardPhase::Prefill,
         }
     }
 
@@ -1216,6 +1345,13 @@ mod tests {
     /// the decode path is not a separately-maintained convention. Fail-first: change the `rows*64`
     /// term to a constant `64` and this still passes (rows==1), which is why the multi-row case
     /// below is asserted too — the identity must hold at 1 and must NOT be assumed past it.
+    /// ⭐⭐ THEY ARE THE SAME BYTES EXACTLY WHILE THE LAYOUTS COINCIDE — the one predicate
+    /// (`sdsc_abstract::row_major_is_stick_major`) both this lemma and the chained head's leg-4
+    /// elision (`embed_row_gather`, #603) rest on, so the two cannot drift: decode's row-major
+    /// staging and the stick-scattered read agree exactly while it holds, and the door's
+    /// relayout leg exists exactly when it does not (a derived layout fact, never a width
+    /// branch). The identity-at-one-row cases below are its `rows == 1` arm; the multi-row
+    /// test below them is its failure.
     #[test]
     fn stick_scatter_is_the_identity_at_one_row() {
         let src: Vec<f32> = (0..256).map(|i| i as f32).collect();
@@ -1223,6 +1359,17 @@ mod tests {
         for w in [64usize, 128, 512, 2048] {
             let x: Vec<f32> = (0..w).map(|i| (i * 7 % 13) as f32).collect();
             assert_eq!(stick_scatter(1, w, &x), x, "width {w}");
+            assert!(
+                scratchy_subtile::sdsc_abstract::row_major_is_stick_major(1, w),
+                "one row coincides at every width"
+            );
+        }
+        // One stick's worth of columns coincides at EVERY row count — the predicate's other arm.
+        for r in [1usize, 2, 4, 8] {
+            assert!(
+                scratchy_subtile::sdsc_abstract::row_major_is_stick_major(r, 64),
+                "one-stick columns coincide at every row count"
+            );
         }
     }
 
@@ -1233,6 +1380,11 @@ mod tests {
         let src: Vec<f32> = (0..rows * width).map(|i| i as f32).collect();
         let got = stick_scatter(rows, width, &src);
         assert_ne!(got, src, "two rows must interleave");
+        assert!(
+            !scratchy_subtile::sdsc_abstract::row_major_is_stick_major(rows, width),
+            "past the coincidence the row-major staging is NOT the scattered bytes — the \
+             chained head's leg 4 exists exactly here"
+        );
         // Row 1, column 64 → stick 1, so (1)*(2*64) + 1*64 + 0 = 192.
         assert_eq!(got[192], src[width + 64]);
         // Every element still appears exactly once.

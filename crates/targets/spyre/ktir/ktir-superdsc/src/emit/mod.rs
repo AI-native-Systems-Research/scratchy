@@ -6116,17 +6116,22 @@ pub fn assemble_restickify_kt_2d(
 /// The extents are plain `u32` here rather than the paged-KV
 /// [`KtTileSlots`](crate::sdsc_abstract::KtTileSlots)/[`KtTileFeats`](crate::sdsc_abstract::KtTileFeats)
 /// newtypes [`assemble_restickify_kt_2d`] takes: this door serves an arbitrary producer-stated shape,
-/// which is exactly the thing those newtypes exist to forbid for the cache. Offsets are zero — a
-/// `linalg.transpose` names whole buffers (its caller refuses a window).
+/// which is exactly the thing those newtypes exist to forbid for the cache. Offsets are zero for a
+/// `linalg.transpose` (whole buffers — its caller refuses a window); the chained head's per-request
+/// form ([`try_assemble_restickify_transpose_2d_at`]) passes each request's element bases. The
+/// offsets change only where each side's window sits, never the per-core tile, so the LX guard
+/// below is the SAME guard at every base.
 fn restickify_transpose_opspec_2d(
     rows: u32,
     cols: u32,
     in_name: &str,
     o_name: &str,
+    in_off: u32,
+    out_off: u32,
 ) -> Result<OpSpec, String> {
     // The Kᵀ builder IS this descriptor: `cap`→`y` is the row axis, `hd`→`out` the column axis, and
     // both stick laws are checked there. Sharing it means the two doors cannot drift apart.
-    let op = restickify_kt_opspec_2d(rows, cols, in_name, o_name, 0, 0)?;
+    let op = restickify_kt_opspec_2d(rows, cols, in_name, o_name, in_off, out_off)?;
     // ⛔⛔⛔ AND IT MUST FAIL CLOSED ON LX, BECAUSE THIS DOOR CANNOT TIME-TILE ITS WAY OUT.
     //
     // `transpose_opspec` reached `TileOp::tile`, which splits the `out` stick dim in TIME when the
@@ -6173,23 +6178,78 @@ pub fn try_assemble_restickify_transpose_2d(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<EmittedOp, String> {
+    try_assemble_restickify_transpose_2d_at(
+        op_name,
+        rows,
+        cols,
+        RestickifySide::whole(in_),
+        RestickifySide::whole(o),
+        sym_id_base,
+        layout,
+    )
+}
+
+/// ONE SIDE of a windowed restickify — the handle AND the element base of its window, handed
+/// over together because they advance together (the per-request form below) and a caller that
+/// supplies one without deciding the other has not stated the transpose it wants. The
+/// whole-buffer form is `off: 0`, stated by [`RestickifySide::whole`] so the delegation below
+/// reads as the law it is.
+pub struct RestickifySide<'a> {
+    /// The side's whole-buffer handle — the mint bounds the window against the handle's
+    /// declared (and, when a layout is at hand, PLACED) extent, never against the window.
+    pub h: &'a Stk<RowBlockedTag>,
+    /// Where this side's window sits, in ELEMENTS of the handle's own format.
+    pub off: u32,
+}
+
+impl<'a> RestickifySide<'a> {
+    /// The whole-buffer window — base 0, the `linalg.transpose` caller's own law (its door
+    /// refuses a windowed transpose, so the flat run at 0 IS the op's whole access).
+    pub fn whole(h: &'a Stk<RowBlockedTag>) -> Self {
+        Self { h, off: 0 }
+    }
+}
+
+/// [`try_assemble_restickify_transpose_2d`] AT A BASE — the per-request form the chained head's
+/// widened scratch needs (#603): ONE `[width·rows, cols]` slab placement holds every request's
+/// block request-major, and request `r`'s transpose reads its `[rows, cols]` window at element
+/// base `in_off` and writes its `[cols, rows]` window at `out_off`. The whole-buffer form above
+/// is this door at `(0, 0)`, and delegates to it — one construction, so the two callers' emitted
+/// descriptors cannot drift.
+///
+/// ⛔ THE OFFSETS ARE ELEMENT COUNTS INTO THE CALLER'S OWN HANDLES, and the mint is what makes
+/// that safe: each side's window is bounded (base + window inside the handle's declared — and,
+/// when a layout is at hand, PLACED — extent), so an offset past the request's block is a build
+/// `Err` here, never a clean bake writing the next request's rows. The output side's handle
+/// states the PLACEMENT's extents — for the chain that is `[width·(cols + 1), rows]`, the
+/// sentinel's reserved zero row inside the accounted extent — while the WINDOW minted is the real
+/// `[cols, rows]` transpose, exactly as the whole-buffer form mints it.
+pub fn try_assemble_restickify_transpose_2d_at(
+    op_name: &str,
+    rows: u32,
+    cols: u32,
+    in_: RestickifySide<'_>,
+    o: RestickifySide<'_>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
     mint_full_window(
-        &format!("{op_name}: operand '{}'", in_.name()),
-        in_,
-        0,
+        &format!("{op_name}: operand '{}'", in_.h.name()),
+        in_.h,
+        in_.off as u64,
         rows,
         cols,
         layout,
     )?;
     mint_full_window(
-        &format!("{op_name}: output '{}'", o.name()),
-        o,
-        0,
+        &format!("{op_name}: output '{}'", o.h.name()),
+        o.h,
+        o.off as u64,
         cols,
         rows,
         layout,
     )?;
-    let op = restickify_transpose_opspec_2d(rows, cols, in_.name(), o.name())?;
+    let op = restickify_transpose_opspec_2d(rows, cols, in_.h.name(), o.h.name(), in_.off, o.off)?;
     let folds = SdscFoldSet::new(op.iter.cores_used());
     emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| e.0)
 }

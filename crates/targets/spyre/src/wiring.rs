@@ -502,6 +502,9 @@ impl Wiring {
             prefix_mask: owns_prefix,
             kv_block_index: gathers.get(),
             n_consts,
+            // The phase projects straight off the wiring's own field — the
+            // tip's law: `phase: self.phase`, never a second derivation.
+            phase: self.phase,
         }
     }
 }
@@ -911,6 +914,70 @@ pub struct Wiring {
     /// emulators), and a `None` on a rung the worker samples through is a
     /// wiring/consumer mismatch the launch gate names.
     pub sample_seat: Option<SampleSeat>,
+    /// ⭐ THE FORWARD'S OWN PHASE — the same
+    /// [`crate::forward_tape::ForwardPhase`] the tape's shape carries, spelled
+    /// once here and projected into the shape (`phase: self.phase`, never a
+    /// second derivation). `Decode` carries the chained head's stick sources
+    /// ([`ChainWiring`], the mint's payload); `Prefill` is every unchained
+    /// program, byte-identical behavior to before the mint existed.
+    ///
+    /// ⛔ THIS ONE FIELD IS THE WORKER'S WHOLE CONTRACT with the chain: on
+    /// `Decode`, the per-step embed-row push is REPLACED by the sticks' seed
+    /// (the decompose of the token the step feeds, bound through the raw u32
+    /// channel) — the gather reads the sticks, never a host-pushed row. The
+    /// per-step path STAGES the seed every step: an idempotent restatement of
+    /// what the device's own ChainStage wrote (step t feeds the token step
+    /// t-1 picked, which is exactly what step t-1's stage wrote into the
+    /// sticks), so the first play — the prompt's final token, which no stage
+    /// has written yet — is the one that matters. The block path stages the
+    /// seed once per block; the device's own stage writes carry every step
+    /// after.
+    ///
+    /// A decode wiring that reaches this field carries `Decode` BY
+    /// CONSTRUCTION: the expansion's mint refuses any decode-slot rung that
+    /// would not mint (untied embedding, no EmbeddedHidden source), so no
+    /// emitted decode wiring exists without the chain.
+    pub phase: crate::forward_tape::ForwardPhase,
+}
+
+/// The chained head's stick sources — the persistent state the mint threaded
+/// between steps ([`Wiring::phase`]'s `Decode` payload). `s_src`/`l_src` are the
+/// `[1, CHAIN_IDX_BLOCK]` SENUINT32 sources the ChainStage WRITES each step
+/// and the EmbedRowGather READS the next: the slab-gather entry words and the
+/// transposed row's own stick ramp. `k` is the entry count
+/// (`chain_slab_entries`' answer for the graph's hidden, stated once at the
+/// mint): both host seeds compute the s stick's lane pattern
+/// `k·(t>>6) + (i mod k)` from it. `hidden` is the graph's own hidden width
+/// (the EmbedRowGather node's own field, stated once at the mint): the l
+/// seed's LANE RAMP `64·(i mod (hidden/64)) + (t&63)` reads its entry count
+/// from it — the one spelling every l-law site shares, never re-derived
+/// downstream. `replaces` is the row the chain REPLACED —
+/// the caller-filled `[1, hidden]` source whose host filler the chain removed
+/// (the tape's ChainSeed steps replaced the EmbedRow push), stated once at
+/// the mint and read by the layout stamp's resident excuse and the bake's
+/// binding-check arm; the worker never names it.
+#[derive(Clone, Copy, Debug)]
+pub struct ChainWiring {
+    pub s_src: u32,
+    pub l_src: u32,
+    pub k: u32,
+    pub hidden: u32,
+    pub replaces: u32,
+}
+
+/// ⭐ THE GRAPH'S OWN CHAIN FACT — read once off the mint by `chain_of_ir`
+/// (lower_subtile_tape_to_ktir), the one derivation. `Chained` carries the
+/// payload BY TYPE; `Unchained` is every graph the mint did not touch —
+/// prefill walks, batch ladder rungs, the symbolic CB batch, the emulator
+/// tapes — not a missing anything, the graph's own state: a graph landing
+/// there is one of those or a defect to investigate, never a silent
+/// fallback. The EMITTER derives the forward phase from the SLOT
+/// ([`Wiring::phase`]); this fact is the payload, and the two disagreeing is
+/// the E0004 belt at emission.
+#[derive(Clone, Copy)]
+pub enum ChainFact {
+    Chained { chain: ChainWiring },
+    Unchained,
 }
 
 /// ⭐ A LOAD-TIME CONSTANT'S KIND — the shared builder that makes its bytes.
@@ -936,6 +1003,19 @@ pub enum LoadConst {
         operand: u8,
         arrangement: ElementArrangement,
     },
+    /// One of the chained head's two decompose tables, by the ChainStage's
+    /// operand order (1-based over the stage's table inputs, past the pick
+    /// and the two sticks — the same convention as the sampler's nine).
+    /// Bytes from [`chain_staged_tables`] — the one derivation every stager
+    /// reads, so a table defect cannot hide on one leg only. `k` is the
+    /// slab-gather entry count the mint stated into the node
+    /// (scratchy-subtile's `chain_slab_entries` — the lane pattern's
+    /// modulus; cited not linked, the leaf-crate law), and `hidden` is the
+    /// graph's own hidden width (the EmbedRowGather node's own field, stated
+    /// at the mint beside it — the l-tab's LANE RAMP
+    /// `64·(i mod (hidden/64)) + (t&63)` reads its entry count from it), so
+    /// the staging is self-contained: the fill never re-derives either.
+    ChainStageTable { pad_vocab: u32, k: u32, hidden: u32, operand: u8 },
 }
 
 impl LoadConst {
@@ -974,9 +1054,161 @@ impl LoadConst {
                 };
                 (bytes, dt, shape)
             }
+            // The fill reads the kind's own `hidden` — the ramp's entry
+            // count, the mint's own statement — never re-derived here.
+            LoadConst::ChainStageTable { pad_vocab, k, hidden, operand } => {
+                let (bytes, dt, shape) = chain_staged_tables(pad_vocab, k, hidden)
+                    .into_iter()
+                    .nth((operand - 1) as usize)
+                    .expect("the mint emits operand 1..=2 — the registry's own row");
+                (bytes, dt, shape)
+            }
         }
     }
 }
+
+/// ⭐ THE CHAINED HEAD'S TWO DECOMPOSE TABLES — the ChainStage's own host
+/// contract, stated ONCE for every stager (the same law as
+/// [`sample_staged_tables`]): the bake-time numeric gate and the worker's
+/// load-time staging read this same fn, so a table defect cannot hide on one
+/// leg only. In the stage's OPERAND ORDER — `stab, ltab` — each entry is
+/// `(bytes, dtype, [rows, cols])`:
+///
+/// * `stab` — row `t`'s LANE PATTERN: lane `i` stages the slab-gather entry
+///   word `k·(t>>6) + (i mod k)`, the picked token's quarter of its
+///   superword index under the door's K-way page split (core `q` of the
+///   gather reads word `q` as entry `q`'s index — the IBR's single-stick
+///   modulo law). `k` arrives as the mint's stated entry count, never
+///   re-derived here. `k = 1` degenerates to the splat byte-for-byte
+///   (`i mod 1 = 0`).
+/// * `ltab` — row `t`'s LANE RAMP: the pick's WHOLE l index,
+///   `32·chain_l_sticks(hidden)` words, word `i` staging SOURCE STICK
+///   `64·(i mod (hidden/64)) + (t&63)` of the transposed row
+///   (`chain_l_stick_ramp`, the ONE spelling — self-sized at the stick
+///   count, the row gather's `hidden/64` one-stick entries spread over the
+///   per-stick cut's index sticks), never a splat. `hidden` arrives as the
+///   mint's stated width, never re-derived here.
+///
+/// The decompose is ONE derivation shared by host and device: the sticks
+/// staged here, the mint's reference eval, and the worker's seed (staged per
+/// step in the per-step path — idempotent with the device's own writes — and
+/// once per block in the block path) all compute `s = t>>6` / `l = t&63`
+/// from the same pick and encode `s` in the same `k·s + (i mod k)` lane
+/// pattern. Tables are functions of `pad_vocab`, `k`, and `hidden`, constant
+/// across decode steps, staged ONCE.
+///
+/// The SENTINEL (all-NaN row, #666): the device answers `PAD_V + 4160`, so
+/// the tables run to `pad_vocab + SAMPLE_SENTINEL_OFFSET + 1` rows to keep
+/// that pick's gather IN EXTENT. Past `pad_vocab` every row stages the
+/// sentinel's own values — `stab` = the s=0 LANE PATTERN (every lane names a
+/// quarter of slab 0, the clamp's bus safety: no special-cased row class),
+/// `ltab` = the SENTINEL RAMP (`chain_l_sentinel_ramp` — lanes naming the
+/// transposed placement's unwritten zero tail, word 0 = `hidden` the mark: a
+/// real pick's word 0 is a lane `≤ 63 < 64 ≤ hidden`, so the mark never
+/// collides): the readback refusal (`checked_picked_token`) errors the step
+/// BEFORE any consumer of the sentinel rows runs, so those rows are bus
+/// safety, never a value the forward reads.
+///
+/// ⛔ THE WORDS ARE THE DEVICE ENCODING — SENUINT32 lane values as u32 LE
+/// words, `DType::I32`. The staging door for I32 consts is the VERBATIM
+/// one (`raw_ids`' law: LE bytes are the device encoding for raw integer
+/// words), never the IEEE→SEN convert `bind_weight` would run.
+pub fn chain_staged_tables(
+    pad_vocab: u32,
+    k: u32,
+    hidden: u32,
+) -> Vec<(Vec<u8>, scratchy_tensors::DType, [usize; 2])> {
+    // The mint stated k; the fill TRUSTS it — and a k outside the law's
+    // window would not mis-fill, it would UNNAME (k = 0 dies a divide-by-
+    // zero at `i % k`; a k past CHAIN_IDX_BLOCK wraps the entry words past
+    // the stick's own lane count). The law's one refusal site is the mint;
+    // this guard re-states the window so a caller defect is a named
+    // refusal, never an arithmetic casualty.
+    assert!(
+        (1..=scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK).contains(&k),
+        "chain_staged_tables: k is {k} — the entry count must sit in \
+         [1, CHAIN_IDX_BLOCK = {}], the window chain_slab_entries answers in \
+         (the mint's stated k; a fill outside the window is a caller defect)",
+        scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK
+    );
+    let rows =
+        pad_vocab as usize + scratchy_subtile::subtile_ir::SAMPLE_SENTINEL_OFFSET as usize + 1;
+    let lanes = scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK as usize;
+    // The stab row is the LANE PATTERN, not a splat: lane i names entry
+    // k·(t>>6) + (i mod k) of the weight's slab-major staging. Past
+    // pad_vocab the base clamps to s = 0, so every lane stays a quarter of
+    // slab 0 — the clamp's bus safety under the entry-word encoding.
+    let mut stab = Vec::with_capacity(rows * lanes * 4);
+    for t in 0..rows as u32 {
+        let base = if t < pad_vocab { k * (t >> 6) } else { 0 };
+        for i in 0..lanes as u32 {
+            stab.extend_from_slice(&(base + i % k).to_le_bytes());
+        }
+    }
+    // The ltab row is the pick's WHOLE LANE RAMP, not a splat: word `i` names
+    // SOURCE STICK `64·(i mod (hidden/64)) + (t&63)` of the transposed row
+    // (`chain_l_stick_ramp`, the ONE spelling the tape seed, the worker's
+    // twin push, and this fill all share — SELF-SIZED at the stick count, so
+    // one row is the whole multi-stick l index the row gather's per-stick cut
+    // walks). Past pad_vocab the row is the SENTINEL RAMP
+    // (`chain_l_sentinel_ramp`) — words naming the transposed placement's
+    // unwritten zero tail, word 0 = `hidden` the mark.
+    let l_sticks = scratchy_subtile::subtile_ir::chain_l_sticks(hidden) as usize;
+    let l_words = l_sticks * lanes;
+    let mut ltab = Vec::with_capacity(rows * l_words * 4);
+    for t in 0..rows as u32 {
+        let row = if t < pad_vocab {
+            scratchy_subtile::subtile_ir::chain_l_stick_ramp(t & 63, hidden)
+        } else {
+            scratchy_subtile::subtile_ir::chain_l_sentinel_ramp(hidden)
+        };
+        // The fill and the shape are ONE law: the ramp is self-sized at the
+        // stick count, so a row's length IS the placement's word count —
+        // asserted here, never trusted, so the two cannot drift by a silent
+        // edit in either spelling.
+        assert_eq!(
+            row.len(),
+            l_words,
+            "chain_staged_tables: the l ramp answered {} words for hidden {hidden} — \
+             chain_l_sticks says {l_sticks} sticks = {l_words} words; the ONE spelling has \
+             drifted",
+            row.len()
+        );
+        for w in row {
+            ltab.extend_from_slice(&w.to_le_bytes());
+        }
+    }
+    vec![
+        (
+            stab,
+            scratchy_tensors::DType::I32,
+            [rows, lanes],
+        ),
+        (
+            ltab,
+            scratchy_tensors::DType::I32,
+            [rows, l_words],
+        ),
+    ]
+}
+
+// ⭐ THE TWO CROSS-PINS — the move of `chain_slab_entries` down to
+// scratchy-subtile (the leaf-crate law: the mint and both reference arms are
+// unconditional subtile code) spells the budget and the cap in a second
+// crate. These close the two-spelling hole: a drift in EITHER crate is a
+// cargo-build failure of this one.
+const _: () = assert!(
+    scratchy_subtile::subtile_ir::CHAIN_SLAB_LX_BUDGET
+        == ktir_superdsc::superdsc_opspec::VENDOR_LX_SCHED_BYTES,
+    "the slab-gather LX budget: scratchy-subtile's spelled const must equal \
+     ktir-superdsc's VENDOR_LX_SCHED_BYTES"
+);
+const _: () = assert!(
+    scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK as u64
+        == ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP as u64,
+    "the entry cap: CHAIN_IDX_BLOCK (the u32 index stick's width) must equal \
+     CopyDims::ENTRIES_PER_OP (the IBR ceiling) — one stick, two spellings"
+);
 
 /// ⭐ THE SAMPLER'S PER-STEP SEAT — the named class of the two sources the
 /// token draw reads FRESH EVERY DECODE STEP. Derived ONCE off the minted
@@ -2091,6 +2323,7 @@ mod constant_tape_tests {
             weight_copies: &[],
             load_consts: &[],
             sample_seat: None,
+            phase: crate::forward_tape::ForwardPhase::Prefill,
         }
     }
 

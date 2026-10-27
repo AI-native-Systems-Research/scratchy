@@ -122,6 +122,23 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
              [1, 64] stick), not a spyre standard tile op",
             n.op
         )),
+        // The chained head's pair is not a standard tile either: the gather is a
+        // stride-vocab column walk (one operand a [hidden, vocab] matrix — no
+        // [mb, out_active, y] tile states that iteration domain), and the stage is
+        // a device copy into a persistent placement (its write target is an INPUT
+        // region, which no standard tile declares). Both are mint-only until the
+        // chained-head lowering rung; a node here before it means the mint was
+        // wired without its lowering.
+        SubOp::EmbedRowGather { .. } => Err(format!(
+            "{:?} is a stride-vocab column walk over the embedding matrix, not a spyre \
+             standard tile op",
+            n.op
+        )),
+        SubOp::ChainStage { .. } => Err(format!(
+            "{:?} is a device copy into the persistent chain placement (a write-through \
+             input region), not a spyre standard tile op",
+            n.op
+        )),
         crate::op_abi::spyre_standard_tile_pat!() => {
             let n_operands = match crate::op_abi::spyre_standard_operands(&n.op)
                 .expect("spyre_standard_tile_pat member without an operand row")
