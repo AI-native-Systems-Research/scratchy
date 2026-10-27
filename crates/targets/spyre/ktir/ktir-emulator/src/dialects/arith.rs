@@ -598,10 +598,53 @@ fn constant(
 fn extf(
     op: &Operation,
     ctx: &mut CoreContext,
-    _env: &ExecutionEnv,
+    env: &ExecutionEnv,
 ) -> Result<Option<Value>, String> {
-    // Widen float (e.g. f16 -> f32). Storage is already f32; relabel tiles.
-    cast_to_float(op, ctx, "arith.extf", DType::F32)
+    // Widen float (e.g. f16 -> f32). Storage is already f32; relabel tiles —
+    // EXCEPT the f16→f32 pair on the CARD, which IS `dl16tofp32`: that opcode
+    // writes value-exact but LANE-PERMUTED output (the target-ABI fact
+    // `ktir_superdsc::element_arrangement` states as const tables; the 1:1
+    // naming of the pair is `convert_kind_of`'s, whole_function.rs). The staged
+    // tables a bundle binds are EMITTED in that arrangement, so an emulator
+    // that relabels without permuting reads them at wrong lanes — the W=1 pick
+    // flip (golden 12040, emulator 12048: the ramp's lane 16 read at lane 8's
+    // buffer, Δ8 exactly). The arrangement is read from the same table the
+    // bake reads, never re-derived here: the row says `Standard`, nothing
+    // permutes.
+    //
+    // ⭐ WHICH runs permute is a MODE, not a set (auditor ruling 2026-10-27):
+    // the bake maps the pair 1:1 to `dl16tofp32` and refuses a staggered input
+    // entering any convert, so every f16→f32 extf of a bake-accepted program
+    // staggers UNCONDITIONALLY — the only fact needed is whether this run is a
+    // card-modeling fused segment (`ConvertModel::Card`, armed solely by the
+    // pinned comm-scheduler entry) or anything else (a raw IRFunction, the
+    // direct-dispatch paths), which stays IEEE — the vendor oracle's own
+    // semantics.
+    let v = unary_operand(op, ctx, "arith.extf")?;
+    let out_f32 = op.result_type.and_then(|t| t.elem()) == Some(DType::F32);
+    match v {
+        Value::Tile(t) => {
+            let data = t.as_f32().to_vec();
+            let data = if out_f32
+                && t.dtype == DType::F16
+                && env.convert_model == crate::env::ConvertModel::Card
+                && ktir_superdsc::element_arrangement::output_arrangement_of("dl16tofp32")
+                    == Some(ktir_superdsc::element_arrangement::ElementArrangement::Dl16ToFp32)
+            {
+                ktir_superdsc::element_arrangement::dl16tofp32_stagger(&data)
+            } else {
+                data
+            };
+            Ok(Some(Value::Tile(Tile::compute(data, DType::F32, t.shape))))
+        }
+        Value::Scalar(s) => {
+            let x = s
+                .as_f32()
+                .ok_or_else(|| "arith.extf: non-float scalar".to_string())?;
+            Ok(Some(Value::Scalar(Scalar::F32(x))))
+        }
+        other => Err(format!("arith.extf: bad operand {other:?}")),
+    }
 }
 
 fn truncf(
@@ -1168,29 +1211,6 @@ fn elementwise_data(v: &Value, n: usize, name: &str) -> Result<Vec<f32>, String>
 // ===========================================================================
 // Cast helpers
 // ===========================================================================
-
-fn cast_to_float(
-    op: &Operation,
-    ctx: &mut CoreContext,
-    name: &str,
-    dtype: DType,
-) -> Result<Option<Value>, String> {
-    let v = unary_operand(op, ctx, name)?;
-    match v {
-        Value::Tile(t) => Ok(Some(Value::Tile(Tile::compute(
-            t.as_f32().to_vec(),
-            dtype,
-            t.shape,
-        )))),
-        Value::Scalar(s) => {
-            let x = s
-                .as_f32()
-                .ok_or_else(|| format!("{name}: non-float scalar"))?;
-            Ok(Some(Value::Scalar(Scalar::F32(x))))
-        }
-        other => Err(format!("{name}: bad operand {other:?}")),
-    }
-}
 
 fn cast_to_int(
     op: &Operation,

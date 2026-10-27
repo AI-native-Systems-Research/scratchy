@@ -24,7 +24,7 @@ use crate::attrkey::AttrKey;
 use crate::comm::{CommOp, CommStep, RecvRequest};
 use crate::context::CoreContext;
 use crate::dialects::Dispatch;
-use crate::env::{ExecutionEnv, GridExecutor};
+use crate::env::{ConvertModel, ExecutionEnv, GridExecutor};
 use crate::interpreter::execute_op;
 use crate::ir::{Attr, Operation, Ssa, TileFuture, Value};
 use crate::irtype::IrType;
@@ -1990,6 +1990,11 @@ pub fn execute_with_communication(
 /// a window that did not fit, so if this ever refuses, the two budgets
 /// disagree — a defect either way, and the error names it. No `tracker`: the
 /// pinned path is the resident decode/prefill hot loop, which never meters.
+///
+/// ⭐ AND THE CARD's WIDEN MODEL: this entry — fused segments of BAKED bundles
+/// only — arms [`ConvertModel::Card`], the lane-permuted `dl16tofp32` (see the
+/// enum's doc for why every such extf staggers unconditionally). Every other
+/// run stays IEEE.
 pub fn execute_with_communication_pinned(
     grid: &GridExecutor,
     mem: &SpyreMemoryHierarchy,
@@ -2018,6 +2023,8 @@ pub fn execute_with_communication_pinned(
 /// (whole-tile accounting) and `Some(bytes)` only through
 /// [`execute_with_communication_pinned`] (pin-window accounting) — the public
 /// functions ARE the mode, and nothing else in the crate passes this through.
+/// The widen model rides the same mode: the pinned entry is the card-modeling
+/// fused-segment path, so it alone arms [`ConvertModel::Card`].
 fn execute_with_communication_impl(
     run: &CommRun,
     tracker: Option<&std::cell::RefCell<crate::latency::LatencyTracker>>,
@@ -2035,9 +2042,20 @@ fn execute_with_communication_impl(
     // for the very ops this run executes, so fused-segment SSA renames cannot
     // detach the set from the values it names.
     let dlf16_sticks = rmsnorm_scalar_sticks(ops);
+    // The card's widen model rides the entry's mode (see the impl doc): the
+    // pinned entry — fused segments of baked bundles — is the card path.
+    let convert_model = if pin_window.is_some() {
+        ConvertModel::Card
+    } else {
+        ConvertModel::Ieee
+    };
     let env = match tracker {
-        Some(t) => ExecutionEnv::with_tracker(dispatch, grid, t).with_dlf16_sticks(&dlf16_sticks),
-        None => ExecutionEnv::new(dispatch, grid).with_dlf16_sticks(&dlf16_sticks),
+        Some(t) => ExecutionEnv::with_tracker(dispatch, grid, t)
+            .with_dlf16_sticks(&dlf16_sticks)
+            .with_convert_model(convert_model),
+        None => ExecutionEnv::new(dispatch, grid)
+            .with_dlf16_sticks(&dlf16_sticks)
+            .with_convert_model(convert_model),
     };
     let num_cores = grid.num_cores.max(1);
 

@@ -63,6 +63,34 @@ impl GridExecutor {
     }
 }
 
+/// WHICH widen semantics a run's `arith.extf` f16→f32 applies — the vendor
+/// oracle's IEEE relabel, or the card's lane-permuted `dl16tofp32`.
+///
+/// The choice needs no per-convert set, by the bake's own laws: the bake maps
+/// (ArithExtf, F16→F32) 1:1 to `dl16tofp32`
+/// (`ktir_superdsc`'s `convert_kind_of`), whose const-table row states the
+/// output is lane-permuted; the bake REFUSES a staggered input entering any
+/// convert, so in every bake-accepted program every `dl16tofp32`'s operand IS
+/// standard; and the bake refuses a staggered value reaching a store or meeting
+/// a computed standard one. So on the card EVERY f16→f32 extf of a baked
+/// program staggers, unconditionally, and nothing compared is ever staggered —
+/// the set is "all of them" for a baked program and "none" for a raw
+/// IRFunction. The only fact the emulator needs is WHICH KIND of program is
+/// running, and the entry points state it: [`ConvertModel::Card`] is armed only
+/// by the pinned comm-scheduler entry (the resident's fused segments of baked
+/// bundles); every other run — the direct-dispatch paths and a raw IRFunction
+/// (triton-numeric's conformance suite) — stays [`ConvertModel::Ieee`], the
+/// vendor oracle's own semantics.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ConvertModel {
+    /// IEEE widen: value-exact relabel, no lane permutation. The default.
+    #[default]
+    Ieee,
+    /// The card's `dl16tofp32`: value-exact but LANE-PERMUTED output, read from
+    /// the same const table the bake reads (`element_arrangement`).
+    Card,
+}
+
 /// Resources passed to every handler. Mirrors `ExecutionEnv`. Borrows the
 /// dispatch table (handlers run nested regions through it) and grid metadata.
 ///
@@ -84,6 +112,9 @@ pub struct ExecutionEnv<'a> {
     /// harnesses — which keeps those on `Tile::compute`'s IEEE grid, the vendor
     /// oracle's own semantics.
     pub dlf16_sticks: Option<&'a std::collections::HashSet<crate::ir::Ssa>>,
+    /// Which widen semantics this run's f16→f32 extfs apply (see the enum's
+    /// doc for why a mode, not a set, is the whole fact).
+    pub convert_model: ConvertModel,
 }
 
 impl<'a> ExecutionEnv<'a> {
@@ -94,6 +125,7 @@ impl<'a> ExecutionEnv<'a> {
             grid,
             tracker: None,
             dlf16_sticks: None,
+            convert_model: ConvertModel::Ieee,
         }
     }
 
@@ -108,6 +140,7 @@ impl<'a> ExecutionEnv<'a> {
             grid,
             tracker: Some(tracker),
             dlf16_sticks: None,
+            convert_model: ConvertModel::Ieee,
         }
     }
 
@@ -118,6 +151,13 @@ impl<'a> ExecutionEnv<'a> {
         sticks: &'a std::collections::HashSet<crate::ir::Ssa>,
     ) -> Self {
         self.dlf16_sticks = Some(sticks);
+        self
+    }
+
+    /// Arm the widen model (see [`ConvertModel`]). Consumes and returns the env
+    /// so it chains after `new`/`with_tracker`.
+    pub fn with_convert_model(mut self, model: ConvertModel) -> Self {
+        self.convert_model = model;
         self
     }
 
