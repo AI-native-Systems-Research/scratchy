@@ -2422,18 +2422,18 @@ impl SpyreWorker {
                     // skip: the bake that produced the manifest and the ladder vocabulary have
                     // drifted, and every width past this one would address slots the pool never
                     // seated.
-                    let rung_width =
-                        match scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(rung_n.get())
-                        {
-                            Some(w) => w,
-                            None => {
-                                return Err(werr(format!(
-                                    "decode batch rung seqs={rn}: the manifest names a row count \
+                    let rung_width = match scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(
+                        rung_n.get(),
+                    ) {
+                        Some(w) => w,
+                        None => {
+                            return Err(werr(format!(
+                                "decode batch rung seqs={rn}: the manifest names a row count \
                                      no ladder width holds — inventory desync between the bake \
                                      and the rung vocabulary, never a skip"
-                                )));
-                            }
-                        };
+                            )));
+                        }
+                    };
                     let rcode = match sentinel
                         .as_str()
                         .strip_prefix(SUPERDSC_SENTINEL)

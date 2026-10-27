@@ -475,18 +475,12 @@ pub(crate) fn run_prefill_batch(
         // the folded tail), so it cannot serve this case. Run with a null out-pointer and read the
         // whole `[rows, width]` result tensor back instead — the same single D2H, then de-interleave.
         LogitsWanted::PerRequest(geom) => {
-            pf.run_step_f16_logits(
-                mq,
-                start,
-                &acts,
-                &acts_f16,
-                StepLogits::LeftOnDevice,
-            )
-            .map_err(|e| {
-                werr(format!(
-                    "superdsc decode batch run_step (mq={mq}, start={start}): {e}"
-                ))
-            })?;
+            pf.run_step_f16_logits(mq, start, &acts, &acts_f16, StepLogits::LeftOnDevice)
+                .map_err(|e| {
+                    werr(format!(
+                        "superdsc decode batch run_step (mq={mq}, start={start}): {e}"
+                    ))
+                })?;
             // ⭐⭐ THE OBSERVATION, not another argument: read the mask BACK off the device and diff it
             // against the bytes we staged. Identical ⇒ the mask is exonerated and the fault is in the KV
             // path. Different ⇒ the fault is placement, the H2D window, or the staging, and the first
@@ -547,18 +541,12 @@ pub(crate) fn run_prefill_batch(
             Some(gathered)
         }
         LogitsWanted::None => {
-            pf.run_step_f16_logits(
-                mq,
-                start,
-                &acts,
-                &acts_f16,
-                StepLogits::Discarded,
-            )
-            .map_err(|e| {
-                werr(format!(
-                    "superdsc prefill run_step (mq={mq}, start={start}): {e}"
-                ))
-            })?;
+            pf.run_step_f16_logits(mq, start, &acts, &acts_f16, StepLogits::Discarded)
+                .map_err(|e| {
+                    werr(format!(
+                        "superdsc prefill run_step (mq={mq}, start={start}): {e}"
+                    ))
+                })?;
             None
         }
     };
@@ -1652,7 +1640,7 @@ pub(crate) fn superdsc_forward_chunk(
             staged: None,
             acts: Vec::with_capacity(fsteps.len()),
             acts_f16: Vec::new(),
-                causal_held: session.keyed_holds(scratchy_target_spyre::bundle_code::PlaceId::Act(
+            causal_held: session.keyed_holds(scratchy_target_spyre::bundle_code::PlaceId::Act(
                 scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_CAUSAL_TID,
             )),
             causal_keyed: None,

@@ -7645,7 +7645,9 @@ impl GatherEntry {
         if e >= ceiling.get() {
             return None;
         }
-        i32::try_from(e).ok().map(|value| GatherEntry { plane, value })
+        i32::try_from(e)
+            .ok()
+            .map(|value| GatherEntry { plane, value })
     }
 
     /// The plane this entry names blocks of — the value's own fact, checked at the one encoding
@@ -7678,8 +7680,6 @@ impl PassStride {
         self.0
     }
 }
-
-
 
 /// ⭐⭐⭐⭐⭐ ONE WHOLE PAGE PLANE — the gather granularity IBM's own reference uses, and the reason three
 /// of this module's "hardware constraints" are not constraints at all.
@@ -7902,7 +7902,6 @@ impl PagePlaneExtent {
         self.hd / POOL_STICK
     }
 }
-
 
 /// ⭐⭐⭐ HOW A LAUNCH'S CAUSAL NEW-TOKEN BLOCK IS EMITTED — one law, read by the emitter
 /// and by the host that tiles the causal mask (`forward_tape::causal_tiled`), so the mask's layout and the
@@ -8197,7 +8196,6 @@ impl ChunkScratch {
         Some(kvh * self.entries_per_head_page() + q)
     }
 
-
     /// ⭐ HOW THE CHUNK's WIDE INTERMEDIATES ARE CUT INTO ROW BLOCKS — see [`ChunkRowBlocks`].
     pub const fn row_blocks(self, gqa: u32, mq: u32) -> ChunkRowBlocks {
         ChunkRowBlocks::of_group(self.nkvh(), gqa, mq, self.plane.slabs(), self.slots())
@@ -8213,7 +8211,6 @@ impl ChunkScratch {
         Some(ChunkRowBlocks::of_query_groups(q, self.slots()))
     }
 }
-
 
 /// ⭐⭐⭐ THE ROW BLOCKS A CHUNK's WIDE INTERMEDIATES ARE CUT INTO — one per KV HEAD at one feature slab,
 /// one per QUERY HEAD above it.
@@ -8542,7 +8539,6 @@ impl ChunkPart {
     }
 }
 
-
 /// ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK OVER A DECODE BATCH — one [`ChunkScratch`] holding EVERY request's pages
 /// end to end, and the per-row mask that keeps each request on its own keys.
 ///
@@ -8769,8 +8765,6 @@ pub enum BatchPrefix {
     Fold(DeclaredFold),
 }
 
-
-
 /// ⭐⭐⭐⭐⭐ THE GATHER COPY'S `mb`, `out` AND ENTRY `page` — ONE VALUE, because all three describe one
 /// cut of one run and the op is correct only if they agree with each other.
 ///
@@ -8947,7 +8941,6 @@ pub struct GatherCopySpec {
     /// the mint.
     pub dest: GatherDest,
 }
-
 
 // ⛔⛔⛔ WHAT WAS HERE, AND WHY IT IS GONE: `RequestAxis` — the three `y` steps a per-batch-kernel
 // request-axis matmul would take, differenced out of the three buffers that have them, checked against
@@ -10672,7 +10665,9 @@ impl PagedKvPool {
     /// slab-block grid at all (the same law [`AttnGeometry::slabs`] asserts at the splice,
     /// refused here at the value side — the declaring model's own build failure either way).
     pub fn window_slabs(&self) -> Option<u32> {
-        self.hd().checked_div(POOL_STICK).filter(|&s| s > 0 && (s * POOL_STICK == self.hd()))
+        self.hd()
+            .checked_div(POOL_STICK)
+            .filter(|&s| s > 0 && (s * POOL_STICK == self.hd()))
     }
 
     /// ⭐ WHICH 64-SLOT STICK BLOCK OF A PAGE'S PLANE a (kv head, window) is — the STICK-block
@@ -10750,7 +10745,8 @@ impl SplicedAttnRegion {
         // mask's own row stride, the ONE per-(window, query-row) advance the ids tables and
         // the mask share, so the fold's single per-pass Activation shift walks both by one
         // number.
-        let pitch = pool.window_slabs()? as u64 * u64::from(pitch_at(pool.nkvh().checked_mul(gqa.get())?));
+        let pitch =
+            pool.window_slabs()? as u64 * u64::from(pitch_at(pool.nkvh().checked_mul(gqa.get())?));
         let block = u64::from(w4) * mq.count() as u64 * pitch;
         if block == 0 || !extent_bytes.is_multiple_of(block) {
             return None;
@@ -11004,9 +11000,8 @@ pub fn spliced_attn_ids_table(
     let w4 = region.w4();
     let slabs = region.slabs()?;
     let per_trip = slabs as usize * pitch_at(ktb) as usize / 4;
-    let mut out = Vec::with_capacity(
-        region.pages() as usize * region.sticks_per_page() as usize * per_trip,
-    );
+    let mut out =
+        Vec::with_capacity(region.pages() as usize * region.sticks_per_page() as usize * per_trip);
     for s in 0..region.pages() {
         let phys = map.get(s as usize).copied().unwrap_or(last);
         for k in 0..region.sticks_per_page() {
@@ -11017,7 +11012,13 @@ pub fn spliced_attn_ids_table(
                 for b in 0..ktb {
                     let kvh = b / region.gqa.get();
                     out.push(GatherEntry::of_slab_block(
-                        plane, region.pool, ceiling, phys, kvh, window, slab,
+                        plane,
+                        region.pool,
+                        ceiling,
+                        phys,
+                        kvh,
+                        window,
+                        slab,
                     )?);
                 }
             }
@@ -11228,7 +11229,9 @@ impl SplicedBatchRegion {
     /// otherwise, so this never re-refuses.
     pub fn mq(self) -> Option<u32> {
         let per_window = self.slabs()? as u64 * u64::from(self.table_pitch());
-        Some((u64::from(self.first_window_rows().get()) * POOL_STICK as u64 * 2 / per_window) as u32)
+        Some(
+            (u64::from(self.first_window_rows().get()) * POOL_STICK as u64 * 2 / per_window) as u32,
+        )
     }
 
     /// The trip slots one page block of the table states — `W4 · MQ`.
@@ -11307,8 +11310,7 @@ pub fn spliced_batched_ids_table(
         <crate::superdsc_opspec::SenUint32 as crate::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
             as usize;
     let ktb_pad = ktb.next_multiple_of(index_stick as u32) as usize;
-    let mut out =
-        Vec::with_capacity(region.pages() as usize * sticks as usize * per_trip);
+    let mut out = Vec::with_capacity(region.pages() as usize * sticks as usize * per_trip);
     for s in 0..region.pages() {
         for k in 0..sticks {
             // The first W4 slots are the page's own windows; the pad tail repeats the last
@@ -11325,7 +11327,13 @@ pub fn spliced_batched_ids_table(
                         .copied()
                         .or_else(|| map.last().copied())?;
                     out.push(GatherEntry::of_slab_block(
-                        plane, region.pool, ceiling, phys, kvh, window, slab,
+                        plane,
+                        region.pool,
+                        ceiling,
+                        phys,
+                        kvh,
+                        window,
+                        slab,
                     )?);
                 }
                 // The per-slab pad to the whole-stick spacing — unread, and repeating the

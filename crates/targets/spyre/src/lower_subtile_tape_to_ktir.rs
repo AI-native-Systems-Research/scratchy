@@ -1181,7 +1181,15 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
     // attention program's multiplier from it ([`score_scale_law`]'s one derivation).
     let scale_law = score_scale_law(ir)?;
     for node in &ir.nodes {
-        match lower_one_node(node, ir, active_cap, rows_are_requests, None, scale_law, false) {
+        match lower_one_node(
+            node,
+            ir,
+            active_cap,
+            rows_are_requests,
+            None,
+            scale_law,
+            false,
+        ) {
             NodeLowering::Ops(v) => ops.extend(v),
             NodeLowering::Unhandled(s) => {
                 // A MALFORMED matmul is an immediate hard stop (it must never bake);
@@ -1967,11 +1975,10 @@ pub fn place_step_inputs(
                             // The law, its C++ cites, and the measured fault live on
                             // [`RepTableReservation::reach_bytes`]; the host stages the same
                             // number whole, padding the tail with zeros.
-                            let reach =
-                                ktir_superdsc::placement::RepTableReservation::reach_bytes(
-                                    size,
-                                    df.word_length() as u64,
-                                );
+                            let reach = ktir_superdsc::placement::RepTableReservation::reach_bytes(
+                                size,
+                                df.word_length() as u64,
+                            );
                             match layout.rep_table {
                                 Some(prev) if prev.tid != tid || prev.bytes != reach => {
                                     return Err(SuperDscError(format!(
@@ -1984,12 +1991,11 @@ pub fn place_step_inputs(
                                 }
                                 Some(_) => {}
                                 None => {
-                                    layout.rep_table = Some(
-                                        ktir_superdsc::placement::RepTableReservation {
+                                    layout.rep_table =
+                                        Some(ktir_superdsc::placement::RepTableReservation {
                                             tid,
                                             bytes: reach,
-                                        },
-                                    );
+                                        });
                                 }
                             }
                         } else {

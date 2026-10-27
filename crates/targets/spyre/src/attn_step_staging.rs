@@ -302,8 +302,7 @@ pub fn build_attn_step_inputs<const NQH: u32, const NKVH: u32, const HD: u32>(
         AttnStepRows::Batch { rows, maps, write } => {
             slot_pattern(what, extents)?;
             let num_seqs = rows.width().rows();
-            let region =
-                batch_region(what, extents.mask.unwrap_or(0), pool, gqa, num_seqs)?;
+            let region = batch_region(what, extents.mask.unwrap_or(0), pool, gqa, num_seqs)?;
             let ceiling = ceiling.ok_or_else(|| {
                 format!(
                     "{what}: this bundle's attention gathers, but a physical page is not a whole \
@@ -386,7 +385,10 @@ pub fn build_attn_step_inputs<const NQH: u32, const NKVH: u32, const HD: u32>(
                      idx2addr reach of the {slabs} slab(s) x {pg} score row(s) of i32 the \
                      bridge states ({} B) — the bake and the host disagree about the batch's \
                      row order",
-                    extents.rep.map(|e| e.to_string()).unwrap_or_else(|| "NONE".into()),
+                    extents
+                        .rep
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "NONE".into()),
                     rep.len()
                 ));
             }

@@ -1887,7 +1887,12 @@ struct HeadRelayout {
 }
 
 impl HeadRelayout {
-    fn of<F: scratchy_subtile::subtile_ir::RopeForm, const NQH: u32, const NKVH: u32, const HD: u32>(
+    fn of<
+        F: scratchy_subtile::subtile_ir::RopeForm,
+        const NQH: u32,
+        const NKVH: u32,
+        const HD: u32,
+    >(
         geom: ktir_superdsc::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
         node: &SubtileNode<F>,
         out_stays_head_rows: bool,
@@ -1927,7 +1932,13 @@ impl HeadRelayout {
     }
 
     /// One relayout copy program, bound `[src, dst]`.
-    fn copy(&self, entry: &'static str, name: String, src: u32, dst: u32) -> Result<EmittedOp, String> {
+    fn copy(
+        &self,
+        entry: &'static str,
+        name: String,
+        src: u32,
+        dst: u32,
+    ) -> Result<EmittedOp, String> {
         let (k_src, program) = match head_relayout_row(entry) {
             TritonKernelRow::Spliced { src, program, .. } => (src, program),
             TritonKernelRow::Refused(why) => return Err(why.to_string()),
@@ -1993,12 +2004,7 @@ impl HeadRelayout {
         }
         let id = node.id.index();
         let mut wrapped = Vec::with_capacity(ops.len() + 2);
-        wrapped.push(self.copy(
-            "to_head_rows_fwd",
-            format!("blkcp_q_s{id}"),
-            q,
-            q_rows,
-        )?);
+        wrapped.push(self.copy("to_head_rows_fwd", format!("blkcp_q_s{id}"), q, q_rows)?);
         wrapped.extend(ops);
         if !self.out_stays_head_rows {
             wrapped.push(self.copy(
@@ -2373,20 +2379,18 @@ fn batched_decode_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
     let region_pages = region_pages.unwrap_or(pages);
     // The pitch law, refused rather than floored: the per-window mask bytes (`PG·STK·2`)
     // over the per-window table block (`SLABS·PITCH`) must be a whole trip-slot count.
-    let pitch = ktir_superdsc::sdsc_abstract::batched_table_pitch(num_seqs, NKVH).ok_or_else(
-        || {
+    let pitch =
+        ktir_superdsc::sdsc_abstract::batched_table_pitch(num_seqs, NKVH).ok_or_else(|| {
             format!(
                 "triton splice: batched_decode_hm at {num_seqs} sequence(s) x {NKVH} kv head(s) \
                  overflows the table pitch — no u32 states this batched stick"
             )
-        },
-    )?;
+        })?;
     let ktb = u64::from(num_seqs) * u64::from(NKVH);
     let pg = ktb * u64::from(geom.gqa());
     let per_window = u64::from(geom.slabs()) * u64::from(pitch);
-    if per_window == 0 || (pg * u64::from(ktir_superdsc::sdsc_abstract::POOL_STICK) * 2)
-        % per_window
-        != 0
+    if per_window == 0
+        || (pg * u64::from(ktir_superdsc::sdsc_abstract::POOL_STICK) * 2) % per_window != 0
     {
         return Err(format!(
             "triton splice: batched_decode_hm at {num_seqs} sequence(s) x {NKVH} kv head(s) x \
@@ -2946,9 +2950,7 @@ struct PagedFoldBatchedFacts<const NQH: u32, const NKVH: u32, const HD: u32> {
 fn paged_fold_batched_seed_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
     f: &PagedFoldBatchedFacts<NQH, NKVH, HD>,
 ) -> Result<KernelSpec, String> {
-    let PagedFoldBatchedFacts {
-        geom, num_seqs, ..
-    } = *f;
+    let PagedFoldBatchedFacts { geom, num_seqs, .. } = *f;
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
     for (p, ty) in [
@@ -3002,20 +3004,18 @@ fn paged_fold_batched_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
         region_pages,
         scale,
     } = *f;
-    let pitch = ktir_superdsc::sdsc_abstract::batched_table_pitch(num_seqs, NKVH).ok_or_else(
-        || {
+    let pitch =
+        ktir_superdsc::sdsc_abstract::batched_table_pitch(num_seqs, NKVH).ok_or_else(|| {
             format!(
                 "triton splice: paged_fold_batched_hm at {num_seqs} sequence(s) x {NKVH} kv \
                  head(s) overflows the table pitch — no u32 states this batched stick"
             )
-        },
-    )?;
+        })?;
     let ktb = u64::from(num_seqs) * u64::from(NKVH);
     let pg = ktb * u64::from(geom.gqa());
     let per_window = u64::from(geom.slabs()) * u64::from(pitch);
-    if per_window == 0 || (pg * u64::from(ktir_superdsc::sdsc_abstract::POOL_STICK) * 2)
-        % per_window
-        != 0
+    if per_window == 0
+        || (pg * u64::from(ktir_superdsc::sdsc_abstract::POOL_STICK) * 2) % per_window != 0
     {
         return Err(format!(
             "triton splice: paged_fold_batched_hm at {num_seqs} sequence(s) x {NKVH} kv head(s) \
@@ -3082,9 +3082,7 @@ fn paged_fold_batched_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
 fn paged_fold_batched_finalize_spec<const NQH: u32, const NKVH: u32, const HD: u32>(
     f: &PagedFoldBatchedFacts<NQH, NKVH, HD>,
 ) -> Result<KernelSpec, String> {
-    let PagedFoldBatchedFacts {
-        geom, num_seqs, ..
-    } = *f;
+    let PagedFoldBatchedFacts { geom, num_seqs, .. } = *f;
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
     for (p, ty) in [

@@ -255,4 +255,3 @@ fn the_batch_invariant_matmul_form_is_refused_at_build_time() {
         "and the shape that WORKS, or the reader is sent back to the card (got: {err})"
     );
 }
-

@@ -841,7 +841,16 @@ mod byte_gate {
     fn the_dot_refuses_mismatched_flat_frame_rows() {
         let bg = pooled();
         assert!(dot_opspecs(&bg, "a", bg.batch * bg.m, 0, "w", "o", bg.batch * bg.m, 0).is_ok());
-        let Err(m) = dot_opspecs(&bg, "a", bg.batch * bg.m + 64, 0, "w", "o", bg.batch * bg.m, 0) else {
+        let Err(m) = dot_opspecs(
+            &bg,
+            "a",
+            bg.batch * bg.m + 64,
+            0,
+            "w",
+            "o",
+            bg.batch * bg.m,
+            0,
+        ) else {
             panic!("an A wider than batch·m must refuse");
         };
         assert!(m.contains("flat frame"), "{m}");

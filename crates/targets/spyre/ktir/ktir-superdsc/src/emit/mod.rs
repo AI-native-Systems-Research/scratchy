@@ -1946,7 +1946,8 @@ pub fn assemble_indexed_write(
             "{op_name}: an indexed write into a {cols}-wide table ({table_rows} rows) — wider than \
              one {}-element stick, so the table's stick-plane stride would be reconstructed from \
              a leg's own row count instead of the table's {}",
-            Fp16::ELEMS_PER_STICK, table_rows
+            Fp16::ELEMS_PER_STICK,
+            table_rows
         )));
     }
     // The cut: `cap` rows per leg, one index stick each, the run's own leg `k` naming the stick.

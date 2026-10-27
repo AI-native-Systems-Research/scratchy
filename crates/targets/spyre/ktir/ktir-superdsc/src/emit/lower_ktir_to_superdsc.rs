@@ -8620,7 +8620,11 @@ pub fn block_copy(
         dst.df,
     );
     let mut ops = Vec::new();
-    for st in f.operations.iter().filter(|o| o.op_type == OpKind::KtdpStore) {
+    for st in f
+        .operations
+        .iter()
+        .filter(|o| o.op_type == OpKind::KtdpStore)
+    {
         let value = st.operands.first().copied();
         let load = f
             .operations

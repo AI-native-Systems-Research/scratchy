@@ -3297,8 +3297,7 @@ pub fn lower_function(
                 cur = next;
             }
             let minted = inter.get(&cur).copied();
-            let mut legs =
-                lower_indexed_write(k, sc, minted, ctx.sym_id_base, ctx.layout)?;
+            let mut legs = lower_indexed_write(k, sc, minted, ctx.sym_id_base, ctx.layout)?;
             ctx.ops.append(&mut legs);
             continue;
         }
@@ -4226,7 +4225,9 @@ pub fn lower_function(
         // and a producer that scatters it is a new form for THAT arm to refuse by name.
         if op.result.is_some()
             && let Some(s) = stored
-            && scatters.iter().any(|sc| s.operands.get(1) == Some(&sc.tile))
+            && scatters
+                .iter()
+                .any(|sc| s.operands.get(1) == Some(&sc.tile))
         {
             stored = None;
         }
@@ -6040,7 +6041,11 @@ mod reshape_forward_tests {
     fn a_degenerate_expand_no_broadcast_consumed_is_the_same_lens() {
         let (forwards, hops, verdicts, consumed) =
             reshape_forwards(reframed(OpKind::TensorExpandShape, &[256, 4], &[1, 256, 4]));
-        assert_eq!(forwards.get(&Ssa(1)), Some(&Ssa(0)), "forwards to the source");
+        assert_eq!(
+            forwards.get(&Ssa(1)),
+            Some(&Ssa(0)),
+            "forwards to the source"
+        );
         assert_eq!(hops.get(&Ssa(1)), Some(&Ssa(0)), "one hop to the source");
         assert!(
             consumed.contains(&Ssa(1)),

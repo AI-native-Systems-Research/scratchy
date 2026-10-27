@@ -267,4 +267,3 @@ fn the_two_planes_block_numbering_coincides_exactly_at_one_slab() {
         );
     }
 }
-
