@@ -1323,7 +1323,29 @@ pub(crate) enum ChunkOut {
     Prompt,
     /// TOKENS THE CARD PICKED, one per decode launch this chunk ran, in step order.
     /// The minted sampler's idx stick, read back raw — the only pick that exists.
+    ///
+    /// ⛔ CARD-ONLY, `cfg`-ed out rather than never-constructed: the mint is a
+    /// decode-bundle CARD fact, and the emulator runs no minted sampler — every
+    /// emulator chunk is a `Prompt` by construction. The shared readers go through
+    /// [`ChunkOut::minted_pick`], which carries that law inside so no reader names
+    /// the variant.
+    #[cfg(feature = "spyre-hw")]
     Tokens(Vec<u32>),
+}
+
+impl ChunkOut {
+    /// ⭐ THE CHUNK'S OWN MINTED PICKS, one per launch that ran a sampler — the
+    /// single door both shared pick readers go through. `None` is every chunk
+    /// that picked nothing: a mid-prompt chunk (its suffix never runs), or any
+    /// chunk of a build with no minted sampler, where the pick step's own
+    /// refusal — not a silent `Prompt` match — is what the caller meets.
+    pub(crate) fn minted_pick(&self) -> Option<&[u32]> {
+        #[cfg(feature = "spyre-hw")]
+        if let ChunkOut::Tokens(ts) = self {
+            return Some(ts);
+        }
+        None
+    }
 }
 
 /// ⭐ ONE ROW'S LAW FOR THE SEAT — what the launch's row `r` draws. `None` is
@@ -2979,7 +3001,7 @@ pub(crate) fn run_request_step(
     let mut pos = start;
     let mut prompt_pick: Option<u32> = None;
     for chunk in toks[..prefill_n].chunks(chunk_w) {
-        if let ChunkOut::Tokens(ts) = forward_chunk(
+        if let Some(ts) = forward_chunk(
             &sh,
             &mut model.session,
             b,
@@ -2993,7 +3015,9 @@ pub(crate) fn run_request_step(
             },
             #[cfg(feature = "spyre-hw")]
             ChunkPaging { ctx, pool },
-        )? {
+        )?
+        .minted_pick()
+        {
             prompt_pick = ts.last().copied();
         }
         pos += chunk.len();
@@ -3027,11 +3051,13 @@ pub(crate) fn run_request_step(
             },
             #[cfg(feature = "spyre-hw")]
             ChunkPaging { ctx, pool },
-        )? {
-            ChunkOut::Tokens(ts) => *ts
+        )?
+        .minted_pick()
+        {
+            Some(ts) => *ts
                 .last()
                 .ok_or_else(|| werr("the pick step's decode launch picked no token".to_string()))?,
-            ChunkOut::Prompt => {
+            None => {
                 return Err(werr(
                     "the pick step ran no decode launch — this build has no device sampler"
                         .to_string(),

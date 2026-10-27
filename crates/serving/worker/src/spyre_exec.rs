@@ -586,7 +586,9 @@ impl Worker for SpyreWorker {
                     // request's rows run through — the prompt-final chunk's, the solo decode loop's,
                     // the batch's. Cached steps never see sampling params again, so this is the one
                     // door. A request this path cannot serve honestly (a knob with no card leg) is
-                    // refused here, naming the knob.
+                    // refused here, naming the knob. Card-only with the field it writes: the
+                    // emulator runs no minted sampler, so it carries no draw (see ReqState::draw).
+                    #[cfg(feature = "spyre-hw")]
                     draw: SampledDraw::of(&nr.req_id, nr.sampling_params.as_ref()).map_err(werr)?,
                     #[cfg(not(feature = "spyre-hw"))]
                     kv_k: vec![Vec::new(); nlayers],
