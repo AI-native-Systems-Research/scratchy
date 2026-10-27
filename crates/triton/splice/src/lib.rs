@@ -1214,19 +1214,20 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
         // refuses them before the splice — the MoE lowers only from
         // `kernels/moe.py` through KTIR.
         SubOp::ScalarWeightMul => 2,
-        // ⭐ THE SAMPLER'S ARITY IS 27: the logits row, its per-row seed
-        // quintuple's FIVE `[rows, 1]` word tables and its per-row temperature
+        // ⭐ THE SAMPLER'S ARITY IS 26: the logits row, its per-row seed
+        // quadruple's FOUR `[rows, 1]` word tables and its per-row temperature
         // reciprocals, then the twenty staged tables (two decreasing ramps,
         // two increasing index tables, two widen tables, the pad law's offset
         // row, the two-level ramp's group pair, then the noise section's own
         // eleven — the four i32 hash/fold constants, the lane table, the
         // fold's five f32 constants, the fp16 clamp) — every kernel parameter
         // but the output is a tape operand, per the splice's own positional
-        // law. (Five word tables, not one `[rows, 5]` table: the Col operand
+        // law. (Four word tables, not one `[rows, 4]` table: the Col operand
         // mode addresses the stick head alone — the int-bcast leg's measured
         // law — so each word rides its own corner-free table, the auditor's
-        // wall-4 ruling (a).)
-        SubOp::Sample { .. } => 27,
+        // wall-4 ruling (a); the row word is GONE from the key — the P3
+        // localization ruling, 2026-10-27, request-owned noise alone.)
+        SubOp::Sample { .. } => 26,
         SubOp::TanhSoftCap { .. } | SubOp::RmsNormUnit { .. } | SubOp::Reshape { .. } => 1,
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without an arity here is
         // an unreachable — the same discipline `lower_one_node`'s match holds.
@@ -2453,12 +2454,14 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // ramp's lane width and the output stick), B the row count this
             // rung serves (the grid's own width). The signature states every
             // kernel parameter's dtype: the fp16 row, the PER-ROW SEED WORD
-            // TABLES in i32 — five `[rows, 1]` tables, one per word of the
-            // quintuple (seed_lo, seed_hi, step, greedy_gate, row), each
+            // TABLES in i32 — four `[rows, 1]` tables, one per word of the
+            // quadruple (seed_lo, seed_hi, step, greedy_gate), each
             // loaded corner-free at `[pid, 0]` (the Col operand mode reads
             // the stick head alone — the int-bcast leg's measured law — so
             // no word rides a windowed column; the auditor's wall-4 ruling
-            // (a)); the noise is computed on the card, no f32 noise staging
+            // (a); the row word is gone from the key — the P3 localization
+            // ruling, request-owned noise alone); the noise is computed on
+            // the card, no f32 noise staging
             // rides — then the per-row temperature reciprocals in f32,
             // the nine selection tables in f32 (the selection is f32 — a sum
             // the f16 grid would round), the noise section's own tables — the
@@ -2476,7 +2479,6 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 "shi_ptr",
                 "stp_ptr",
                 "sgate_ptr",
-                "srow_ptr",
             ] {
                 signature.insert(
                     p.to_string(),
@@ -3639,7 +3641,7 @@ mod production_ktir_dump {
         // ── sample_fwd.py: the token draw at solo and batched grids — the sampler this
         // proof guards, and the ONE kernel the grid-[B] fix is allowed to move. The
         // spec mirrors the `SubOp::Sample` arm of `kernel_spec`'s registry row: the
-        // logits row, its per-row seed quintuple's five word tables and temperature
+        // logits row, its per-row seed quadruple's four word tables and temperature
         // reciprocal, the twenty staged tables (the nine of the selection cascade and
         // the noise section's own eleven), and the `[B, 64]` idx stick out. ──
         {
@@ -3649,7 +3651,6 @@ mod production_ktir_dump {
                 ("shi_ptr", "*i32"),
                 ("stp_ptr", "*i32"),
                 ("sgate_ptr", "*i32"),
-                ("srow_ptr", "*i32"),
                 ("invt_ptr", "*fp32"),
                 ("bramp_ptr", "*fp32"),
                 ("lramp_ptr", "*fp32"),

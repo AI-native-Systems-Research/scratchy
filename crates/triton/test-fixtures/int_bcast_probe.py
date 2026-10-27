@@ -5,9 +5,10 @@ Col-broadcast i32 word, the exact card form the integer door's broadcast
 admission names as its measurement in flight (`int_binary`'s own doc).
 
 WHY THIS KERNEL EXISTS: the production fold's hash adds its per-row seed words
-(`slo`/`shi`/`stp`/`srow`, each a `[rows, 1]` i32 window of the seed table)
-against the `[rows, PAD_V]` hash tile — `h = h*C2 + shi + stp + srow` spells
-four Col-broadcast `addi32toi32` ops. B1 measured the DENSE SENUINT32 form
+(`slo`/`shi`/`stp`, each a `[rows, 1]` i32 window of the seed table)
+against the `[rows, PAD_V]` hash tile — `h = h*C2 + shi + stp` spells
+three Col-broadcast `addi32toi32` ops (the row word is gone from the key —
+the P3 localization ruling, 2026-10-27). B1 measured the DENSE SENUINT32 form
 only, so the door refused the broadcast by name (the fold's third wall), and
 the auditor ruled (b): measure the form on card rather than move 786 KB/row of
 host traffic to dodge it. This kernel is the measurement's specimen — the

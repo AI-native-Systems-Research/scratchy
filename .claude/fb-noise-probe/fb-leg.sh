@@ -73,24 +73,23 @@ if ! "$DXP" -d "$BAKE" -b sentient > "$BAKE/dxp.log" 2>&1; then
 fi
 echo "FB-DXP-OK ($(stat -c%s "$BAKE/spyreCodeDir/init_binary.bin") B image)"
 
-# ── leg 5: the card run — all 15 tables staged raw, all 4 outs read raw ──
+# ── leg 5: the card run — all 14 tables staged raw, all 4 outs read raw ──
 echo "==== FB-RUN-START $(date -u +%FT%TZ) ===="
 SCRATCHY_SUPERDSC_DBG=1 "$BIN" "$BAKE" \
   t0="$PROBE/in/t00_slo.bin" raw:t0 \
   t1="$PROBE/in/t01_shi.bin" raw:t1 \
   t2="$PROBE/in/t02_stp.bin" raw:t2 \
-  t3="$PROBE/in/t03_srow.bin" raw:t3 \
-  t4="$PROBE/in/t04_c1.bin" raw:t4 \
-  t5="$PROBE/in/t05_c2.bin" raw:t5 \
-  t6="$PROBE/in/t06_c3.bin" raw:t6 \
-  t7="$PROBE/in/t07_c256.bin" raw:t7 \
-  t8="$PROBE/in/t08_lane.bin" raw:t8 \
-  t9="$PROBE/in/t09_fm8.bin" raw:t9 \
-  t10="$PROBE/in/t10_ftop.bin" raw:t10 \
-  t11="$PROBE/in/t11_fzero.bin" raw:t11 \
-  t12="$PROBE/in/t12_fhalf.bin" raw:t12 \
-  t13="$PROBE/in/t13_fm22.bin" raw:t13 \
-  t14="$PROBE/in/t14_cmin.bin" raw:t14 \
+  t3="$PROBE/in/t03_c1.bin" raw:t3 \
+  t4="$PROBE/in/t04_c2.bin" raw:t4 \
+  t5="$PROBE/in/t05_c3.bin" raw:t5 \
+  t6="$PROBE/in/t06_c256.bin" raw:t6 \
+  t7="$PROBE/in/t07_lane.bin" raw:t7 \
+  t8="$PROBE/in/t08_fm8.bin" raw:t8 \
+  t9="$PROBE/in/t09_ftop.bin" raw:t9 \
+  t10="$PROBE/in/t10_fzero.bin" raw:t10 \
+  t11="$PROBE/in/t11_fhalf.bin" raw:t11 \
+  t12="$PROBE/in/t12_fm22.bin" raw:t12 \
+  t13="$PROBE/in/t13_cmin.bin" raw:t13 \
   --out raw:t15="$PROBE/out_u.bin" \
   --out raw:t16="$PROBE/out_g.bin" \
   --out raw:t17="$PROBE/out_ui.bin" \

@@ -1927,7 +1927,7 @@ pub fn graph_wiring<F: RopeForm>(
     let chain = chain_of_ir(ir);
     // ⛔ EVERY MARKED PARAMETER HAS A STAGER. The arrangement rides exactly one staging
     // channel here — the load-const builders (pure in the arrangement) — and the seat's
-    // per-step staging (the seed quintuple and the inverse temperature) binds fresh words
+    // per-step staging (the seed quadruple and the inverse temperature) binds fresh words
     // with NO arrangement of its own, so a propagation mark on any parameter other than a
     // load-const table (a weight, an activation, another kernel's source, or one of the
     // seat's own per-step tids) is a staggered buffer nothing can stage: a build error
@@ -2016,8 +2016,8 @@ pub fn load_consts_of_ir<F: RopeForm>(
     // per-lane tables are functions of the vocab alone; `padoff` is the pad
     // law's offset row, which the kernel adds
     // to the score LAST, after its two roundings — the row's own pad bytes are
-    // never its contract). The node's FIRST SIX seats after the row — the
-    // seed quintuple's five `[rows, 1]` word tables and the temperature
+    // never its contract). The node's FIRST FIVE seats after the row — the
+    // seed quadruple's four `[rows, 1]` word tables and the temperature
     // reciprocal — are PER-STEP operands the runtime binds every decode step;
     // they are deliberately NOT in this list (a load-time constant staged
     // over them would freeze one draw's seed into every step).
@@ -2040,11 +2040,11 @@ pub fn load_consts_of_ir<F: RopeForm>(
             };
             assert_eq!(
                 node.inputs.len(),
-                27,
-                "the Sample node's arity is the registry's own row (logits + the five seed word \
+                26,
+                "the Sample node's arity is the registry's own row (logits + the four seed word \
                  tables + inv_t + twenty tables)"
             );
-            Ok(node.inputs[7..]
+            Ok(node.inputs[6..]
                 .iter()
                 .enumerate()
                 .map(|(i, tr)| {
@@ -2263,7 +2263,7 @@ pub fn staggered_of_ir<F: RopeForm>(
 /// mode reads (the int-bcast leg's measured law). The emulator is
 /// memref-faithful (each table packed `rows × 1` words); the card seat writes
 /// each word at its own table's stick head, the reservation's own stride.
-/// ⭐⭐ THE GATE ALONE (`seed_words[3]`, the quintuple's fourth word) reserves
+/// ⭐⭐ THE GATE ALONE (`seed_words[3]`, the quadruple's fourth word) reserves
 /// the CONVERT's device sweep instead — `gate_row_words` = 64 words, the β
 /// ruling's own stride ([`crate::wiring::SampleSeat::gate_row_words`]) —
 /// because its chain crosses the i32→f32 convert and the sweep, not the
@@ -2291,19 +2291,22 @@ pub fn sample_seat_of_ir<F: RopeForm>(
             };
             assert_eq!(
                 node.inputs.len(),
-                27,
-                "the Sample node's arity is the registry's own row (logits + five seed word \
+                26,
+                "the Sample node's arity is the registry's own row (logits + four seed word \
                  tables + inv_t + twenty tables)"
             );
-            // ⭐ FIVE SEED WORD TABLES, each `[rows, 1]` i32 — the auditor's
-            // wall-4 ruling (a). The Col operand mode that broadcasts a
+            // ⭐ FOUR SEED WORD TABLES, each `[rows, 1]` i32 — the auditor's
+            // wall-4 ruling (a), the row word dropped from the key by the P3
+            // localization ruling (2026-10-27): the hash is request-owned
+            // alone, so a request draws the same noise in any row. The Col
+            // operand mode that broadcasts a
             // per-row word reads the STICK HEAD ALONE (the int-bcast card
             // leg's measured law: a word at stick word k would be mis-read as
             // word 0), so the cornered `[1, 1]`-window-of-`[rows, 5]`
             // spelling the fold first carried is unpronounceable — every word
             // rides its own one-stick-per-row table, `invt`'s own class,
             // loaded corner-free at `[pid, 0]`.
-            let mut seed_words = [0u32; 5];
+            let mut seed_words = [0u32; 4];
             for (k, tid) in seed_words.iter_mut().enumerate() {
                 let word_tid = node.inputs[1 + k].tensor;
                 let word_shape = ir.tensors[word_tid.index()];
@@ -2322,16 +2325,16 @@ pub fn sample_seat_of_ir<F: RopeForm>(
             let seed_row_words =
                 (row_footprint_bytes(1, Df::SenUint32) / 4) as u32;
             // ⭐⭐⭐ THE GATE'S OWN STRIDE — the β ruling (front-b-noise, auditor
-            // 2026-10-27): the quintuple's fourth table (inputs[4]) crosses the
+            // 2026-10-27): the quadruple's fourth table (inputs[4]) crosses the
             // i32→f32 convert, so its reservation is the convert's own device
             // sweep — `DeviceWidth::for_convert(1)` = 64 words, TWO u32 sticks
-            // per row — against the other four's one. The SAME one decision the
+            // per row — against the other three's one. The SAME one decision the
             // layout's `nbytes` reserves and the door sweeps, stated here on the
             // seat so the worker's staging and the placement cannot drift.
             let gate_row_words = DeviceWidth::for_convert(1).get();
             Ok(Some(crate::wiring::SampleSeat {
                 seed_words,
-                invt: node.inputs[6].tensor.index() as u32,
+                invt: node.inputs[5].tensor.index() as u32,
                 rows,
                 // inputs[0] is the LOGITS row — kept placed by the mint while
                 // the RESULT is re-pointed at the idx stick (the struct's own

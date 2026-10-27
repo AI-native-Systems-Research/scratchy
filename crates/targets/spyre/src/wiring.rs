@@ -1352,7 +1352,7 @@ const _: () = assert!(
 /// [`stage_col_stick_heads`] ever wrote, the Col operand mode's own address) followed by
 /// the sweep's second sticks, ZERO: the widened words are converted and never read, and a
 /// zero-filled reservation is deterministic — no uninitialized tail for the sweep to
-/// consume. `head_stride` is the quintuple's own one-stick stride
+/// consume. `head_stride` is the seed words' own one-stick stride
 /// ([`col_row_stride_bytes`]); `sweep_stride` is the gate's own reservation
 /// ([`gate_row_stride_bytes`]) — both passed in so this fn stages LAWS, never
 /// recomputations.
@@ -1381,8 +1381,8 @@ pub fn gate_row_stride_bytes() -> usize {
     DeviceWidth::for_convert(1).get() as usize * 4
 }
 
-/// ⭐ THE SAMPLER'S PER-STEP SEAT — the named class of the six sources the
-/// token draw reads FRESH EVERY DECODE STEP (the seed quintuple's five word
+/// ⭐ THE SAMPLER'S PER-STEP SEAT — the named class of the five sources the
+/// token draw reads FRESH EVERY DECODE STEP (the seed quadruple's four word
 /// tables and inv_t). Derived ONCE off the minted
 /// `Sample` node ([`lower_subtile_tape_to_ktir::sample_seat_of_ir`], the same
 /// one-derivation law [`LoadConst`] rides) and carried on
@@ -1401,15 +1401,19 @@ pub fn gate_row_stride_bytes() -> usize {
 /// refuse.
 #[derive(Clone, Copy, Debug)]
 pub struct SampleSeat {
-    /// The SEED WORD sources' tids — the five `[rows, 1]` i32 per-row word
-    /// tables of the quintuple `(seed_lo, seed_hi, step, greedy_gate, row)`,
+    /// The SEED WORD sources' tids — the four `[rows, 1]` i32 per-row word
+    /// tables of the quadruple `(seed_lo, seed_hi, step, greedy_gate)`,
     /// in that order, each `invt`'s own class (one stick per row, the word
     /// at the stick head), staged EVERY STEP by the worker (the noise itself
-    /// is computed on the card from them). Five tables, not one `[rows, 5]`:
-    /// the Col operand mode that broadcasts a word reads the stick head
-    /// ALONE (the int-bcast card leg's measured law), so every word rides
-    /// its own corner-free table — the auditor's wall-4 ruling (a).
-    pub seed_words: [u32; 5],
+    /// is computed on the card from them). ⭐ NO ROW WORD (auditor ruling
+    /// 2026-10-27, the P3 localization): the hash key is request-owned
+    /// alone — the seed and the request's own step count — so a request
+    /// draws the same noise in any baked row of any batched launch. Four
+    /// tables, not one `[rows, 4]`: the Col operand mode that broadcasts a
+    /// word reads the stick head ALONE (the int-bcast card leg's measured
+    /// law), so every word rides its own corner-free table — the
+    /// auditor's wall-4 ruling (a).
+    pub seed_words: [u32; 4],
     /// The temperature reciprocal's tid — the rung's `[rows, 1]` f32 inv_t
     /// column, staged every step with the seed words.
     pub invt: u32,
@@ -1439,11 +1443,11 @@ pub struct SampleSeat {
     /// table's region — the STICK HEAD the Col operand mode reads.
     pub seed_row_words: u32,
     /// ⭐⭐⭐ THE GATE TABLE'S OWN ROW STRIDE in i32 words — the ONE table of
-    /// the quintuple whose chain crosses the i32→f32 convert
+    /// the quadruple whose chain crosses the i32→f32 convert
     /// (`sgate.to(tl.float32)`), so the β ruling (front-b-noise, auditor
     /// 2026-10-27) reserves it at the convert's own device sweep:
     /// `DeviceWidth::for_convert(1)` = 64 words = TWO u32 sticks per row,
-    /// against the other four tables' one. The GATE ITSELF still lands at
+    /// against the other three tables' one. The GATE ITSELF still lands at
     /// row r's stick HEAD — byte `r · 128`, the same address the one-stick
     /// law ever stated, because the convert's `[rows, 64]` addressing is
     /// stick-blocked (row r's first stick is flat stick `r`) — and the

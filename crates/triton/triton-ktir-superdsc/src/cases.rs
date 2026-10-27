@@ -752,7 +752,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
         // whole row — B=1, PAD_V=2^20 (2^20 lanes in width, not in rows: a B>1 grid
         // mismatches the band/extent laws, see the kernel's docstring). Every
         // constant is a staged table in the kernel's own parameter order: the seed
-        // quad + hash constants (8 full-width i32 rows), the lane + fold constants
+        // triple + hash constants (7 full-width i32 rows), the lane + fold constants
         // (6 full-width f32 rows), the fp16 FEST-domain clamp cmin (2^-14, full-width
         // fp16 row — the card's log is fp16-only, so the draw narrows for each log
         // and clamps at fp16's smallest normal), then the four outs — u, g
@@ -768,7 +768,6 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                     ("slo_ptr", "*i32"),
                     ("shi_ptr", "*i32"),
                     ("stp_ptr", "*i32"),
-                    ("srow_ptr", "*i32"),
                     ("c1_ptr", "*i32"),
                     ("c2_ptr", "*i32"),
                     ("c3_ptr", "*i32"),
@@ -1007,7 +1006,6 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                     ("shi_ptr", "*i32"),
                     ("stp_ptr", "*i32"),
                     ("sgate_ptr", "*i32"),
-                    ("srow_ptr", "*i32"),
                     ("invt_ptr", "*fp32"),
                     ("ones_ptr", "*fp32"),
                     ("padoff_ptr", "*fp32"),
@@ -1044,7 +1042,6 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
                     ("shi_ptr", "*i32"),
                     ("stp_ptr", "*i32"),
                     ("sgate_ptr", "*i32"),
-                    ("srow_ptr", "*i32"),
                     ("invt_ptr", "*fp32"),
                     ("ones_ptr", "*fp32"),
                     ("padoff_ptr", "*fp32"),

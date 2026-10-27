@@ -46,7 +46,6 @@ PAIR9999_JSON = HERE / "p3-loc-pair9999.json"
 SEED = 1234
 SEED_B = 9999
 WORD_NAMES = ["seed_lo", "seed_hi", "step", "gate", "row"]
-
 BIND_RE = re.compile(
     r"SEAT_BIND rows=(\d+) seed_words=\[([^\]]*)\] invt=t(\d+) laws=(.*)")
 LAW_RE = re.compile(r"r(\d+):(?:(seed=\d+)|greedy)@step(\d+):inv_t([0-9.]+)")
@@ -241,9 +240,12 @@ def main():
     }.get(branch, "No divergence found in the common steps.")
 
     # The second request's seat in the pair — its row word vs any solo run's
-    # (a solo launch is always row 0; this run's solo slice shows it).
+    # (a solo launch is always row 0; this run's solo slice shows it). The
+    # row word is GONE from the key (the 2026-10-27 drop): readbacks carry
+    # FOUR words now, so the row-word counter reads only pre-drop logs.
     pair_b_rows = Counter(e["row"] for e in pair_b)
-    pair_b_row_words = Counter(e["words"][4] for e in pair_b)
+    pair_b_row_words = Counter(e["words"][4] for e in pair_b
+                               if len(e["words"]) > 4)
 
     def solo_index_of(st):
         return next((i for i, e in enumerate(solo) if e["words"][2] == st), None)

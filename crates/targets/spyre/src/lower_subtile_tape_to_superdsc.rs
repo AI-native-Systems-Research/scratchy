@@ -755,7 +755,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
         }
         m
     };
-    // ⭐⭐⭐ THE SEAT'S GATE TABLE (the quintuple's fourth word, the `SubOp::Sample` node's
+    // ⭐⭐⭐ THE SEAT'S GATE TABLE (the quadruple's fourth word, the `SubOp::Sample` node's
     // `inputs[4]`) IS RESERVED AT THE CONVERT'S OWN DEVICE WIDTH — the β ruling
     // (front-b-noise, auditor 2026-10-27). The gate's chain crosses the i32→f32 convert
     // (`sgate.to(tl.float32)`, every sampler's own spelling), and the convert door's β
@@ -765,7 +765,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // `resolve_seg_base` refuses the op for addressing past its tensor. TOLERANT like the
     // kernel-dfs census above: a graph with no `Sample` node reserves nothing wide, and a
     // graph the seat derivation would refuse (two mints) keeps these rules — the refusal is
-    // the lowering's to raise, never the layout's. The OTHER four seed tables and `invt`
+    // the lowering's to raise, never the layout's. The OTHER three seed tables and `invt`
     // keep the one-stick `[rows, 1]` reservation: their chains cross no convert, and the
     // Col operand mode reads the stick head alone.
     let gate_tid: Option<u32> = {
@@ -774,7 +774,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
             .iter()
             .filter(|n| matches!(n.op, SubOp::Sample { .. }));
         match (samples.next(), samples.next()) {
-            (Some(n), None) if n.inputs.len() == 27 => Some(n.inputs[4].tensor.index() as u32),
+            (Some(n), None) if n.inputs.len() == 26 => Some(n.inputs[4].tensor.index() as u32),
             _ => None,
         }
     };
@@ -3221,8 +3221,8 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
         weights.scale_rows.contains(&(id as u32)) || weights.bytes.iter().any(|(t, ..)| *t == id)
     };
     // ⭐ THE SEAT'S OWN STAGING — THE GREEDY LAW, stated for the golden the
-    // way `staged_rope` states the rope rows: the seed quintuple
-    // `(0, 0, step, 0, row)` — one word per `[rows, 1]` table, the GATE lane
+    // way `staged_rope` states the rope rows: the seed quadruple
+    // `(0, 0, step, 0)` — one word per `[rows, 1]` table, the GATE lane
     // 0 and inv_t 1.0, so the reference's draw is the plain first-max
     // (`g·0 = 0` exact) — the gate's own coverage decision, stated here
     // where it lives: the emulator's f32 tiles cannot hold the bit-exact
@@ -3230,19 +3230,20 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
     // NOT this gate's to check — that fidelity is the card probe's verdict
     // (FB-NOISE-DONE). The step word is a small constant (7, f16-exact), so
     // the f16-stick rounding hop below leaves every seat image exact; the
-    // row word is the row's own index.
+    // row word is GONE from the key (the P3 localization ruling,
+    // 2026-10-27 — the noise is request-owned alone).
     let sample_seat = crate::lower_subtile_tape_to_ktir::sample_seat_of_ir(ir)
         .expect("the golden's seat derivation — the graph is validated, one mint at most");
     let staged_seat: std::collections::HashMap<u32, Vec<f32>> = match &sample_seat {
         None => Default::default(),
         Some(seat) => {
             let mut seat_vals = std::collections::HashMap::new();
-            // The greedy quintuple, one word per table in the quintuple's
-            // own order — the row word is the row's own index.
-            const GREEDY_QUINT: [f32; 5] = [0.0, 0.0, 7.0, 0.0, 0.0];
+            // The greedy quadruple, one word per table in the quadruple's
+            // own order — request-owned, identical in every row.
+            const GREEDY_QUAD: [f32; 4] = [0.0, 0.0, 7.0, 0.0];
             for (k, &tid) in seat.seed_words.iter().enumerate() {
                 let word: Vec<f32> = (0..seat.rows)
-                    .map(|r| if k == 4 { r as f32 } else { GREEDY_QUINT[k] })
+                    .map(|_| GREEDY_QUAD[k])
                     .collect();
                 seat_vals.insert(tid, word);
             }
@@ -4291,7 +4292,7 @@ pub fn numeric_gate<F: RopeForm>(
     // ⭐ THE SEAT'S OWN STAGING, TYPED — the same greedy law the golden
     // states (`eval_golden_buffers`' seat block), staged into the session at
     // the operands' TRUE dtypes so neither rides `run_step`'s f16-only
-    // source channel: the five seed word tables as i32 LE words (each view
+    // source channel: the four seed word tables as i32 LE words (each view
     // is si32, so `set_source_bytes` lands them verbatim through
     // `weight_arg`'s I32 arm), the inv_t as f32 bytes at [rows, 1] (verbatim
     // at its own view — the f16 channel would encode it into half the bytes
@@ -4302,12 +4303,13 @@ pub fn numeric_gate<F: RopeForm>(
     // own law, `seed_row_words`).
     let sample_seat = crate::lower_subtile_tape_to_ktir::sample_seat_of_ir(ir).map_err(|e| e.0)?;
     if let Some(seat) = &sample_seat {
-        // The greedy law's quintuple `(0, 0, 7, 0, r)` — one word per table,
-        // in the quintuple's own order (the GATE table's 0 IS the law).
-        const GREEDY_QUINT: [i32; 5] = [0, 0, 7, 0, 0];
+        // The greedy law's quadruple `(0, 0, 7, 0)` — one word per table,
+        // in the quadruple's own order (the GATE table's 0 IS the law); the
+        // row word is gone from the key (the P3 localization ruling).
+        const GREEDY_QUAD: [i32; 4] = [0, 0, 7, 0];
         for (k, &tid) in seat.seed_words.iter().enumerate() {
             let word_bytes: Vec<u8> = (0..seat.rows)
-                .map(|r| if k == 4 { r as i32 } else { GREEDY_QUINT[k] })
+                .map(|_| GREEDY_QUAD[k])
                 .flat_map(i32::to_le_bytes)
                 .collect();
             emu_weights.push((
@@ -8507,20 +8509,20 @@ mod tests {
         assert_eq!(l_minted.num_sources, minted.num_sources);
         assert_eq!(
             l_minted.num_sources,
-            l_plain.num_sources + 26,
-            "the mint's twenty-six seats (the per-row seed quintuple's five word tables, the \
+            l_plain.num_sources + 25,
+            "the mint's twenty-five seats (the per-row seed quadruple's four word tables, the \
              temperature, and the twenty tables) are the whole difference between the two \
              graphs' source counts — the ids an unminted rung was handed and did not have"
         );
         // The unminted graph has no resident source (no prefix-KV, no load-const tables), and
         // the minted graph's resident list is EXACTLY the twenty tables, at
-        // `[plain's count + 6, minted's count)` — past the seat's per-row word tables and
+        // `[plain's count + 5, minted's count)` — past the seat's per-row word tables and
         // inv_t, which the worker binds fresh every step and never stages at load.
         assert!(
             l_plain.resident_source_tids.is_empty(),
             "an unminted graph's layout stamps no resident source"
         );
-        let tables: Vec<u32> = (l_plain.num_sources + 6..l_minted.num_sources).collect();
+        let tables: Vec<u32> = (l_plain.num_sources + 5..l_minted.num_sources).collect();
         assert_eq!(
             l_minted.resident_source_tids, tables,
             "the minted graph's resident stamp is its twenty tables and nothing else"
@@ -8591,10 +8593,10 @@ mod tests {
         let layout = compute_bundle_layout(&minted, &weight_ids, false, false, &[])
             .expect("the minted graph lays out");
 
-        // inv_t is the mint's sixth staged source (the seed quintuple's five word
-        // tables first, at n_src), so its tid is five past the PRE-mint source
+        // inv_t is the mint's fifth staged source (the seed quadruple's four word
+        // tables first, at n_src), so its tid is four past the PRE-mint source
         // count — `plain`'s, the graph the mint spliced into.
-        let invt = plain.num_sources + 5;
+        let invt = plain.num_sources + 4;
         let p = layout.placements[&invt];
         assert_eq!(
             p.size,
@@ -8609,7 +8611,9 @@ mod tests {
         // ⭐ AND EVERY SEED WORD TABLE RESERVES THE SAME — each is a `[rows, 1]`
         // i32 table, invt's own class, and the stick head the Col operand mode
         // reads is the word's only address: the auditor's wall-4 ruling (a)
-        // spelled the seed as five such tables, so each must reserve one whole
+        // spelled the seed as four such tables (the row word dropped from
+        // the key by the P3 localization ruling), so each must reserve one
+        // whole
         // 32-word u32 stick per row (128 B), the stride the worker writes at.
         // ⭐⭐ EXCEPT THE GATE (k=3) — the β ruling (front-b-noise, auditor
         // 2026-10-27): its chain crosses the i32→f32 convert, whose sweep is
@@ -8617,7 +8621,7 @@ mod tests {
         // table alone reserves TWO sticks per row (256 B) — the convert's
         // `resolve_seg_base` window — with the gate still at row r's stick
         // HEAD, the same byte the one-stick law ever stated.
-        for k in 0..5u32 {
+        for k in 0..4u32 {
             let word = layout.placements[&(plain.num_sources + k)];
             let want = if k == 3 {
                 (4 * 256, "the gate table reserves the convert's 64-element device sweep — two u32 sticks per row")

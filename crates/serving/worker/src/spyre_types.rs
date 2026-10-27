@@ -643,7 +643,7 @@ pub(crate) struct ReqState {
     /// per-step staging is a pure function of this value plus the row's absolute position, the
     /// step salt). `None` is the greedy law — temperature ≤ 0, or a request that arrived with no
     /// sampling params at all — and stages the exact bytes the pre-sampler path did
-    /// (quintuple `(0, 0, 0, 0, r)`, `inv_t = 1.0`).
+    /// (quadruple `(0, 0, 0, 0)`, `inv_t = 1.0`).
     ///
     /// ⛔ WHAT IT DOES NOT CARRY IS REFUSED AT THE DERIVATION ([`SampledDraw::of`]), not silently
     /// dropped here: this path's draw is temperature alone, so a request asking for `top_p`,
@@ -676,10 +676,12 @@ pub(crate) struct ReqState {
 /// step by the seat's binders.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SampledDraw {
-    /// The seed of the row's quintuple `(seed_lo, seed_hi, step, 1, r)` — the
+    /// The seed of the row's quadruple `(seed_lo, seed_hi, step, 1)` — the
     /// request's own when it arrived seeded, else the FNV-1a of its id (the
     /// `fnv_seed` law: deterministic within a run, no process RNG, so an
-    /// unseeded draw is still a reproducible function of the request).
+    /// unseeded draw is still a reproducible function of the request). The
+    /// key is request-owned alone (the P3 localization ruling): no row word,
+    /// so a request draws the same noise in any baked row.
     pub(crate) seed: u64,
     /// `1 / T` as f32 — the sampler's own scaling (`score = x·inv_t + g·gate`),
     /// so temperature 1.0 stages the same `1.0` the greedy law does and only

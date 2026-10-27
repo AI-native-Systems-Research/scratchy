@@ -225,9 +225,11 @@ pub enum Program {
     Matmul,
     /// The token draw — `kernels/sample_fwd.py`: the FIRST-maximum index of
     /// `xm·inv_T + g·gate` over each row's `[1, PAD_V]` padded span, as that
-    /// row's `[1, 64]` i32 idx stick. TWENTY-FOUR tensor parameters — the row,
-    /// its SEED quintuple and its temperature reciprocal (the three PER-ROW
-    /// operands: `[B, PAD_V]` f32, `[B, 5]` si32, `[B, 1]` f32), the twenty
+    /// row's `[1, 64]` i32 idx stick. TWENTY-SEVEN tensor parameters — the row,
+    /// its SEED quadruple's four word tables and its temperature reciprocal
+    /// (the per-row operand classes: `[B, PAD_V]` f32, four `[B, 1]` si32
+    /// words — request-owned alone, no row word, the P3 localization ruling —
+    /// and `[B, 1]` f32), the twenty
     /// staged tables that are functions of the vocab alone (the pad law's
     /// offset row, the two-level ramp's three decreasing tables, the three
     /// increasing index tables, the ones and sixtyfour widen tables, then the

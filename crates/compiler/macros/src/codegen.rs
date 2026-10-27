@@ -9371,7 +9371,7 @@ fn emit_superdsc_wiring(
         let cos_ids: std::collections::HashSet<u32> = cos_v.iter().map(|&(i, ..)| i).collect();
         let sin_ids: std::collections::HashSet<u32> = sin_v.iter().map(|&(i, ..)| i).collect();
         // ⭐ THE SAMPLER'S PER-STEP SEAT — ITS OWN CLASS AT THIS GATE. The seat's
-        // six tids (the seed quintuple's five word tables and inv_t) are minted
+        // five tids (the seed quadruple's four word tables and inv_t) are minted
         // below the `LoweredDecode` binding layer (the mint's own law), so they
         // carry no `SourceBinding`, and the CLASS declares their filler: the
         // worker binds every one FRESH EVERY DECODE STEP, and the runtime launch
@@ -9812,7 +9812,7 @@ fn emit_superdsc_wiring(
     // shared builder that makes the bytes, so the worker and the gate stage
     // identical bytes by construction. The sampler's TWENTY staged tables
     // ride this list (the selection's f32, the noise section's i32/f32/fp16
-    // — each entry's own dtype); its five seed word tables and inv_t do NOT —
+    // — each entry's own dtype); its four seed word tables and inv_t do NOT —
     // they are per-step seats the worker binds fresh every decode, and a
     // load-time constant staged over them would freeze one draw's seed into
     // every step.
@@ -9821,8 +9821,8 @@ fn emit_superdsc_wiring(
         .iter()
         .map(load_const_entry_tokens)
         .collect::<Vec<_>>();
-    // ⭐ THE SAMPLER'S PER-STEP SEAT — the named class of the six sources the
-    // token draw binds FRESH EVERY DECODE STEP (the seed quintuple's five
+    // ⭐ THE SAMPLER'S PER-STEP SEAT — the named class of the five sources the
+    // token draw binds FRESH EVERY DECODE STEP (the seed quadruple's four
     // `[rows, 1]` word tables and inv_t), straight off the bake's one
     // derivation (`sample_seat_of_ir`, the mint's own facts), never
     // recomputed here. `None` on every rung that mints no draw; `Some` names
@@ -11358,7 +11358,7 @@ fn dump_wavefront_mega(
                 // draw is a rung whose answer must still come back as logits for a
                 // host argmax, which is exactly the readback this front deletes).
                 // The splice is the kernel's ONLY entry — the mint appends the node,
-                // its per-row per-step seat (the seed quintuple's five word tables,
+                // its per-row per-step seat (the seed quadruple's four word tables,
                 // inv_t) and its twenty staged-table
                 // sources to the graph, and everything downstream (the splice's row,
                 // the door's whole-function walk, the placement pass, the wiring's
@@ -11388,7 +11388,7 @@ fn dump_wavefront_mega(
                         mint.pad_vocab,
                         mint.rows,
                         mint.seed_words[0].index(),
-                        mint.seed_words[4].index(),
+                        mint.seed_words[3].index(),
                         mint.invt.index(),
                         if is_prefill { " (prefill rung)" } else { "" },
                     );

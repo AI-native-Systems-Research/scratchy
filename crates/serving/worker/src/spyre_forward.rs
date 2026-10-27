@@ -1041,7 +1041,7 @@ pub(crate) enum ChunkOut {
 }
 
 /// ⭐ ONE ROW'S LAW FOR THE SEAT — what the launch's row `r` draws. `None` is
-/// the greedy law: the seed quintuple `(0, 0, 0, 0, r)` and `inv_t = 1.0`,
+/// the greedy law: the seed quadruple `(0, 0, 0, 0)` and `inv_t = 1.0`,
 /// byte-identical to the bind this path staged before any request asked for a
 /// draw. `Some` is that row's request's draw, and the STEP SALT is the row's
 /// ABSOLUTE position — the one input that changes every launch of one
@@ -1084,18 +1084,22 @@ pub(crate) enum SeatLaws<'a> {
 
 /// ⭐ THE SEAT BINDS EVERY LAUNCH STAGES — the seat's per-step operands at
 /// their baked offsets, one law per baked row. Spelled so the greedy law is
-/// the plain first-max: the seed quintuple `(0, 0, 0, 0, r)` — the GATE
+/// the plain first-max: the seed quadruple `(0, 0, 0, 0)` — the GATE
 /// table's 0 IS the greedy law, `score = xm·inv_t + g·0 = xm·inv_t` exactly
 /// (the fold's clamps keep g FINITE for any seed bytes, so `g·0` is +0, never
 /// NaN) — and inv_t = 1.0. A sampled row stages its request's draw instead:
-/// `(seed_lo, seed_hi, step, 1, r)` and that draw's own inverse temperature —
+/// `(seed_lo, seed_hi, step, 1)` and that draw's own inverse temperature —
 /// the gate's 1 turns the noise on, and the step salt is the row's absolute
-/// position. FIVE `[rows, 1]` i32 word tables, one per member of the
-/// quintuple (the auditor's wall-4 ruling (a)): each is `invt`'s own class —
+/// position. ⭐ THE KEY IS REQUEST-OWNED ALONE (the P3 localization ruling,
+/// auditor 2026-10-27): the seed and the request's own step count, never the
+/// slot the request happens to land in — a request draws the same noise in
+/// any baked row of any batched launch (the row word the first spelling
+/// carried is GONE). FOUR `[rows, 1]` i32 word tables, one per member of the
+/// quadruple (the auditor's wall-4 ruling (a)): each is `invt`'s own class —
 /// one 128-B stick per row, the word at the STICK HEAD (`r · seed_row_words`,
 /// the seat's baked stride — the Col operand mode reads the head alone, the
-/// int-bcast leg's measured law) — and the worker writes the five words of
-/// row r at the five tables' stick heads and nothing else (the sticks' zero
+/// int-bcast leg's measured law) — and the worker writes the four words of
+/// row r at the four tables' stick heads and nothing else (the sticks' zero
 /// padding is the reservation's own, exactly inv_t's bind). ⭐⭐ THE GATE
 /// TABLE ALONE (`seed_words[3]`) carries the β reservation (front-b-noise,
 /// auditor 2026-10-27): its chain crosses the i32→f32 convert, so the table
@@ -1140,10 +1144,11 @@ fn sample_binds(
             .collect::<Vec<_>>()
             .join(" ")
     );
-    // (seed_lo, seed_hi, step, greedy_gate, row) — the greedy row is zeros and
-    // its own index (the gate word's 0 is what makes the draw greedy); a
-    // sampled row is its request's seed split low/high, its step salt, and the
-    // gate's 1. One word per table, at each row's stick head.
+    // (seed_lo, seed_hi, step, greedy_gate) — the greedy row is zeros
+    // (the gate word's 0 is what makes the draw greedy); a sampled row is its
+    // request's seed split low/high, its step salt, and the gate's 1. One word
+    // per table, at each row's stick head. ⭐ NO ROW WORD (the P3 localization
+    // ruling): the key is request-owned alone, identical in every row.
     let word_of = |k: usize, r: usize| -> i32 {
         let law = &laws[r];
         match (k, law.draw) {
@@ -1151,16 +1156,14 @@ fn sample_binds(
             (1, Some(d)) => (d.seed >> 32) as u32 as i32,
             (2, Some(_)) => law.step as i32,
             (3, Some(_)) => 1,
-            // The row's own index — every law, greedy or sampled.
-            (4, _) => r as i32,
             // A greedy row: zeros for the seed, the step and the gate.
             (_, None) => 0,
-            // The quintuple is FIVE words (the seat's own `[u32; 5]`); a sixth
+            // The quadruple is FOUR words (the seat's own `[u32; 4]`); a fifth
             // staged word has no law anywhere — refuse rather than stage a
             // word nobody defined.
             (_, Some(_)) => panic!(
-                "seed word {k}: the seat's quintuple is five words, indexed 0..=4 — a \
-                 sixth is a mint/seat disagreement, never a staged guess"
+                "seed word {k}: the seat's quadruple is four words, indexed 0..=3 — a \
+                 fifth is a mint/seat disagreement, never a staged guess"
             ),
         }
     };
@@ -1284,9 +1287,9 @@ fn read_sampled_tokens(
 /// 2026-10-27): after a launch that drew, read the seat's OWN staged bytes
 /// back off the card and state them beside the pick, so ONE served run names
 /// the broken stage. Three byte-groups, one debug line per launch:
-///   * THE SEAT — the five seed words and inv_t, each row at its stick head,
+///   * THE SEAT — the four seed words and inv_t, each row at its stick head,
 ///     through the same scatter law `sample_binds` staged (zeros or a greedy
-///     quintuple on a sampled row ⇒ the seat path: the worker binds greedy
+///     quadruple on a sampled row ⇒ the seat path: the worker binds greedy
 ///     whatever the params);
 ///   * THE HASH CHAIN'S UNIFORM TABLES — hc1/hc2/hc3/c256 (`[rows, 1]`,
 ///     staged at LOAD) at row 0's and row 1's stick heads, and the lane
@@ -1345,11 +1348,11 @@ fn log_seat_readback(
         })
     }
     let rows = seat.rows as usize;
-    // The five word tables + inv_t — the full reservation, each row's word at
+    // The four word tables + inv_t — the full reservation, each row's word at
     // its stick head (`sample_binds`' own law, read back through the same
     // stride it staged).
-    let mut words: Vec<[i32; 5]> = vec![[0; 5]; rows];
-    for k in 0..5 {
+    let mut words: Vec<[i32; 4]> = vec![[0; 4]; rows];
+    for k in 0..4 {
         match le_words(
             session,
             seat.seed_words[k],

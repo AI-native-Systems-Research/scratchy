@@ -57,20 +57,19 @@ def host_u() -> np.ndarray:
     SIGNED interpretation for the convert (B1's i2f law), and IEEE f32 for
     the fold (all operands are integers <= 2^23 or powers of two).
     """
-    lane = np.fromfile(IN / "t08_lane.bin", dtype=np.float32)
+    lane = np.fromfile(IN / "t07_lane.bin", dtype=np.float32)
     # The fptosi of the staged f32 lane recovers the integer bit for bit.
     lanei = lane.astype(np.int32).astype(np.uint32)
     slo = read_u32("t00_slo")[0]
     shi = read_u32("t01_shi")[0]
     stp = read_u32("t02_stp")[0]
-    srow = read_u32("t03_srow")[0]
-    c1 = read_u32("t04_c1")[0]
-    c2 = read_u32("t05_c2")[0]
-    c3 = read_u32("t06_c3")[0]
-    c256 = read_u32("t07_c256")[0]
+    c1 = read_u32("t03_c1")[0]
+    c2 = read_u32("t04_c2")[0]
+    c3 = read_u32("t05_c3")[0]
+    c256 = read_u32("t06_c256")[0]
 
     h = lanei * c1 + slo
-    h = h * c2 + shi + stp + srow
+    h = h * c2 + shi + stp
     h = h * h
     h = h * c1 + slo
     h = h * h

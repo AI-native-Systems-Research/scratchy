@@ -5,8 +5,13 @@ Five parts, read from the leg's own artifacts (a verdict is never computed
 over runs that did not happen):
   1. same seed (1234) twice at temp 1.0        -> texts identical.
   2. a different seed (9999)                    -> text differs.
-  3. 2-concurrent (1234 + 9999)                 -> each request's text equals
-     its own SOLO seeded text.
+  3. 2-concurrent (1234 + 9999), run TWICE      -> each request's text is
+     IDENTICAL across the two pair runs (auditor ruling (b), 2026-10-27:
+     the batched-numerics class — the rows=2 rung is a different baked
+     tape than the solo one, the same class main's own batched greedy
+     shows, and main has no seeded-batched reference — so the pair is
+     gated against ITSELF, never equated with solo; the pair-vs-solo
+     comparison is reported as information only).
   4. greedy (temp 0)                            -> equals MAIN's greedy text
      (main-ref-leg: main e63c6f8ac8, same prompt, same max-tokens), and the
      in-process `scr chat` greedy equals the server's.
@@ -113,23 +118,50 @@ def main() -> int:
     a = content("chat-p1-seed1234-a.json")
     b = content("chat-p1-seed1234-b.json")
     c = content("chat-p2-seed9999.json")
-    d = content("chat-p3-seed1234.json")
-    e = content("chat-p3-seed9999.json")
+    # The pair, run TWICE (ruling (b)): run a and run b, one file each.
+    da = content("chat-p3-seed1234-a.json")
+    db = content("chat-p3-seed1234-b.json")
+    ea = content("chat-p3-seed9999-a.json")
+    eb = content("chat-p3-seed9999-b.json")
     p1 = a == b
     p2 = a != c
-    p3a = d == a
-    p3b = e == c
+    # THE GATE: the pair against ITSELF, deterministic across the two runs.
+    p3a = da == db
+    p3b = ea == eb
+    # INFORMATION ONLY (never gated, ruling (b)): the pair vs the solo texts.
+    info1234 = da == a
+    info9999 = ea == c
     report["p1_same_seed_identical"] = p1
     report["p2_diff_seed_different"] = p2
-    report["p3_concurrent"] = {"seed1234_equals_solo": p3a, "seed9999_equals_solo": p3b}
+    report["p3_concurrent_pair_deterministic"] = {
+        "seed1234_run_a_equals_run_b": p3a,
+        "seed9999_run_a_equals_run_b": p3b,
+        "gate": "the concurrent pair against itself across two runs (ruling "
+                "(b), 2026-10-27 — batched numerics, never equated with solo)",
+        "informational_vs_solo": {
+            "seed1234_pair_equals_solo": info1234,
+            "seed9999_pair_equals_solo": info9999,
+            "note": "information only — the rows=2 rung is a different baked "
+                    "tape than the solo one (the batched-numerics class)",
+        },
+    }
     report["texts"] = {
         "solo_seed1234_a": a, "solo_seed1234_b": b, "solo_seed9999": c,
-        "concurrent_seed1234": d, "concurrent_seed9999": e,
+        "concurrent_seed1234_run_a": da, "concurrent_seed1234_run_b": db,
+        "concurrent_seed9999_run_a": ea, "concurrent_seed9999_run_b": eb,
     }
     if not p1:
         i = next((i for i in range(min(len(a), len(b))) if a[i] != b[i]), min(len(a), len(b)))
         report["p1_first_divergence"] = {"at_char": i, "a": a[max(0, i - 20):i + 20],
                                          "b": b[max(0, i - 20):i + 20]}
+    if not (p3a and p3b):
+        for name, x, y in (("seed1234", da, db), ("seed9999", ea, eb)):
+            if x != y:
+                i = next((i for i in range(min(len(x), len(y))) if x[i] != y[i]),
+                         min(len(x), len(y)))
+                report.setdefault("p3_first_divergence", {})[name] = {
+                    "at_char": i, "run_a": x[max(0, i - 20):i + 20],
+                    "run_b": y[max(0, i - 20):i + 20]}
     ok = ok and p1 and p2 and p3a and p3b
 
     # ── part 4: greedy vs main ──
@@ -260,8 +292,8 @@ def main() -> int:
         report["phaseB_no_prefix_caching"] = {
             "note": "server restarted with --no-prefix-caching; diagnostics, not gates",
             "p1_same_seed_identical": ba == bb,
-            "p3_seed1234_equals_solo": bd == ba,
-            "p3_seed9999_equals_solo": be == bb,
+            "p3_seed1234_pair_vs_solo_info": bd == ba,
+            "p3_seed9999_pair_vs_solo_info": be == bb,
             "both_seeds_one_launch": any("seed=1234" in l and "seed=9999" in l
                                          for l in seat_b),
             "seat_bind_lines": len(seat_b),

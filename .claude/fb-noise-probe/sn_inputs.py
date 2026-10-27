@@ -118,17 +118,17 @@ def stick_unscatter(flat: np.ndarray, rows: int, width: int, eps: int) -> np.nda
 
 
 def seed_words(rows: int) -> dict[str, np.ndarray]:
-    """The per-row seed QUINTUPLE — every row DIFFERENT, so a broadcast defect
+    """The per-row seed QUADRUPLE — every row DIFFERENT, so a broadcast defect
     that sprays row 0's words across row 1, or reads either row at the wrong
     stick, lands on a u mismatch, never a coincidental pass. `sgate` is 1 on
-    every row (the sampled spelling)."""
+    every row (the sampled spelling). NO ROW WORD (the P3 localization
+    ruling, 2026-10-27): the key is request-owned alone."""
     r = np.arange(rows, dtype=np.uint64)
     return {
         "slo": ((0x12345678 + 0x01010101 * r) & 0xFFFFFFFF).astype(np.uint32),
         "shi": ((0x9ABCDEF0 - 0x00FEFEFE * r) & 0xFFFFFFFF).astype(np.uint32),
         "stp": (r + 1).astype(np.uint32),
         "sgate": np.full(rows, 1, dtype=np.uint32),
-        "srow": r.astype(np.uint32),
     }
 
 
@@ -227,18 +227,19 @@ def pre_stagger_fp16(x: np.ndarray) -> np.ndarray:
 # ── The host reference ──────────────────────────────────────────────────────
 
 
-def emulate_u(slo: int, shi: int, stp: int, srow: int) -> np.ndarray:
+def emulate_u(slo: int, shi: int, stp: int) -> np.ndarray:
     """The uniform `u`, BIT-EXACT: the counter hash in wrapping u32, the
     wrap-fold, the abs fold and the strict-interior folds — every op exact by
     representability, so numpy f32 at the card's own op sequence reproduces
     the card bit for bit (the free check of the whole integer chain + every
     `[rows, 1]` staging: a wrong stick-head word or a wrong row's seed lands
-    on a named mismatch)."""
+    on a named mismatch). NO ROW WORD (the P3 localization ruling): the key
+    is the seed and the step alone."""
     with np.errstate(over="ignore"):
         lane = np.arange(PAD_V, dtype=np.uint32)
         u32 = np.uint32
         h = lane * u32(HC1) + u32(slo)
-        h = h * u32(HC2) + u32(shi) + u32(stp) + u32(srow)
+        h = h * u32(HC2) + u32(shi) + u32(stp)
         h = h * h
         h = h * u32(HC1) + u32(slo)
         h = h * h
@@ -302,7 +303,6 @@ def staged(case: str) -> list[tuple[str, np.ndarray]]:
         # ⭐ β: the gate rides the 64-element device width — NOT the [rows, 1]
         # one-stick law the other seed tables keep (see gate_table).
         (f"sn_{case}_sgate", gate_table(sw["sgate"])),
-        (f"sn_{case}_srow", col_table(sw["srow"], np.uint32)),
         (f"sn_{case}_invt", col_table(np.full(rows, 1.0), np.float32)),
         (f"sn_{case}_ones", col_table(np.full(rows, 1.0), np.float32)),
         (f"sn_{case}_padoff", padoff_row()),
@@ -342,7 +342,7 @@ def expected(case: str) -> list[dict]:
     return [
         ins("logits", rows * PAD_V * 2, "fp16"),
         ins("slo", col), ins("shi", col), ins("stp", col),
-        ins("sgate", gate), ins("srow", col),
+        ins("sgate", gate),
         ins("invt", col),
         ins("ones", col),
         ins("padoff", PAD_V * 4),

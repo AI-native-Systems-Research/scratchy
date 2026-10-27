@@ -82,7 +82,7 @@ def main() -> int:
     u_card = read_out(case, "u", rows)
     u_host = np.stack([
         sn_inputs.emulate_u(int(sw["slo"][r]), int(sw["shi"][r]),
-                            int(sw["stp"][r]), int(sw["srow"][r]))
+                            int(sw["stp"][r]))
         for r in range(rows)
     ])
     u_first = first_mismatch(u_card, u_host)

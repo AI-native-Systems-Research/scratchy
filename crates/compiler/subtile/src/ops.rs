@@ -147,7 +147,7 @@ macro_rules! for_each_subop {
             Mamba2 [SubOp::Mamba2 { .. }] arity = (|n| n == 2), cols = [field inner],
                 rows = [in0], gemm_w = [none];
             Mean [SubOp::Mean] arity = (|n| n == 1), cols = [one], rows = [in0], gemm_w = [none];
-            // The token draw: one `[rows, PAD_V]` logits block, its five
+            // The token draw: one `[rows, PAD_V]` logits block, its four
             // per-row `[rows, 1]` seed word tables and per-row temperature
             // reciprocals, plus the twenty staged tables (functions of the
             // vocab alone — the periodic block pair, the lane pair, the two
@@ -157,8 +157,9 @@ macro_rules! for_each_subop {
             // constants, the fp16 clamp), out ONE `[rows, 64]` idx stick —
             // the output width is the device's own stick, never a shape read
             // (the whole row is one tile in, one stick out, every lane
-            // equal).
-            Sample [SubOp::Sample { .. }] arity = (|n| n == 27), cols = [stick],
+            // equal). ⭐ NO ROW WORD in the key (the P3 localization
+            // ruling, 2026-10-27): the seed quadruple is request-owned.
+            Sample [SubOp::Sample { .. }] arity = (|n| n == 26), cols = [stick],
                 rows = [in0], gemm_w = [none];
                 rows = [in0], gemm_w = [none];
             // The chained head's row gather: `[s_stick, l_stick, embed_matrix]` —

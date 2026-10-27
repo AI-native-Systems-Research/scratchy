@@ -3,9 +3,13 @@
 # parts, through `scr serve` so the server log carries the evidence:
 #   1. temp 1.0, the SAME seed (1234) twice          -> texts identical.
 #   2. a DIFFERENT seed (9999)                       -> text differs.
-#   3. 2-CONCURRENT, seeds 1234 + 9999               -> each request's text
-#      equals its own solo seeded text (the batched decode rung at rows=2 —
-#      wall 9's multi-row Col seat).
+#   3. 2-CONCURRENT, seeds 1234 + 9999, TWICE  -> each request's text is
+#      IDENTICAL across the two pair runs (auditor ruling (b), 2026-10-27:
+#      the batched-numerics class — the rows=2 decode rung is a different
+#      baked tape than solo, the same class main's own batched greedy shows,
+#      and there is no main reference for seeded batched; so the gate is the
+#      pair against ITSELF, deterministic across two runs — the pair vs the
+#      solo texts is reported as INFORMATION ONLY, never equated).
 #   4. greedy (temp 0)                               -> equals main's greedy
 #      text (main-ref-leg's main-greedy.run; the fold must not move greedy).
 #   5. 200 seeded single-token draws at temp 1.0     -> each token's frequency
@@ -114,14 +118,18 @@ echo "==== CHAT-P2-START $(date -u +%FT%TZ) ===="
 ask 9999 1.0 64 "$PROBE/chat-p2-seed9999.json"
 echo "==== CHAT-P2-DONE $(date -u +%FT%TZ) ===="
 
-# ── part 3: 2-CONCURRENT, the two seeds at once ──
+# ── part 3: 2-CONCURRENT, the two seeds at once — the pair run TWICE
+#    (ruling (b)): the gate is pair-run-a == pair-run-b per request; the
+#    pair vs the solo texts (P1/P2) is information only. ──
 echo "==== CHAT-P3-START $(date -u +%FT%TZ) ===="
-ask 1234 1.0 64 "$PROBE/chat-p3-seed1234.json" &
-P3A=$!
-ask 9999 1.0 64 "$PROBE/chat-p3-seed9999.json" &
-P3B=$!
-wait $P3A $P3B
-echo "==== CHAT-P3-DONE $(date -u +%FT%TZ) ===="
+for RUN in a b; do
+  ask 1234 1.0 64 "$PROBE/chat-p3-seed1234-$RUN.json" &
+  P3A=$!
+  ask 9999 1.0 64 "$PROBE/chat-p3-seed9999-$RUN.json" &
+  P3B=$!
+  wait $P3A $P3B
+done
+echo "==== CHAT-P3-DONE (pair x2, $(date -u +%FT%TZ)) ===="
 
 # ── part 4: greedy (temp 0) via the server (the in-process twin runs after
 #    the server is down — two processes must not hold the card at once) ──
@@ -176,7 +184,8 @@ echo "==== CHAT-P4B-RC rc=$? $(date -u +%FT%TZ) ===="
 
 # ── phase B (DIAGNOSTIC, never a gate): the same parts 1 and 3 with prefix
 #    caching OFF — separates a cache-path first-token salt difference from a
-#    seat-law (row word) one. The verdict reads these as diagnostics only. ──
+#    seat-law one (historically the row word; now any residual seat defect).
+#    The verdict reads these as diagnostics only. ──
 echo "==== CHAT-B-SERVE-START $(date -u +%FT%TZ) ===="
 SRVLOGB=$PROBE/chatb-server.log
 setsid nohup "$SCR" serve -m RedHatAI/granite-3.1-2b-instruct-FP8-dynamic --device spyre \

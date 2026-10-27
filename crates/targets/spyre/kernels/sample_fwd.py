@@ -14,14 +14,21 @@ computed on the card, below).
 
 THE DRAW: `idx = first-max over (logits·inv_T + g)` with `g ~ Gumbel(0, 1)`,
 which samples exactly `softmax(logits/T)`. THE NOISE IS COMPUTED ON THE CARD:
-a counter hash over `(seed_lo, seed_hi, step, row, lane)` in the card's
+a counter hash over `(seed_lo, seed_hi, step, lane)` in the card's
 bit-exact integer class — i32 mul/add ONLY (card leg B1; the vocabulary has
 no xor and no shift, `arch_enums.cpp` `opFuncsToString`: 180 entries, neither
 op present — so the mix is odd-constant multiplies and squarings, built to
 never need them), closed by a LANE RE-INJECTION after the last square (a
 square's low bits are structurally non-uniform — x² mod 8 ∈ {0, 1, 4}, and
 every mul/add finalizer is a bijection mod 8, so no chain of them heals it;
-a per-lane term after the square does, by construction). The hash lands a
+a per-lane term after the square does, by construction). ⭐ THE KEY IS
+REQUEST-OWNED ALONE (auditor ruling 2026-10-27, the P3 localization): the
+seed and the step salt are functions of the request itself, and NOTHING
+slot-dependent enters — a request draws the same noise in any baked row of
+any batched launch (the row word the first spelling carried is GONE; it
+made a concurrent request's noise a function of the slot it happened to
+land in, so the pair's second request could never equal its own solo
+text). The hash lands a
 uniform `u` STRICTLY INSIDE `(0, 1)` by the WRAP-FOLD, the compare-free
 extraction the front-b probe proved bit-exact on card (0/2²⁰ lanes):
 multiply by 2⁸ in wrapping i32 — `r = h·2⁸ mod 2³² = (h mod 2²⁴)·2⁸`, the
@@ -54,9 +61,9 @@ an exact sign-flip — so the island's error stays RELATIVE (~5e-4 absolute
 on g; the probe measured the card's g at mean 0.576039 / var 1.632352
 against Gumbel 0.5772157 / 1.6449341, with the FEST log costing ~0.0018
 mean / ~0.015 var against the fp16-ideal). The host's `SplitMix64`
-staging is gone: what rides the old noise operand is a FIVE-TABLE PER-ROW
-SEED — five `[B, 1]` i32 word tables, one per member of the quintuple
-`(seed_lo, seed_hi, step, greedy_gate, row)`, each loaded corner-free at
+staging is gone: what rides the old noise operand is a FOUR-TABLE PER-ROW
+SEED — four `[B, 1]` i32 word tables, one per member of the quadruple
+`(seed_lo, seed_hi, step, greedy_gate)`, each loaded corner-free at
 `[pid, 0]` (the Col operand mode reads the stick head alone — the
 int-bcast leg's measured law) — one tiny per-row word write where
 `[B, PAD_V]` f32 noise rows rode before. Temperature 0
@@ -68,17 +75,17 @@ multiply, the `invt` broadcast's own class).
 THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this
 kernel):
 
-* PARAMETERS, IN ORDER: `logits`, the FIVE SEED WORD TABLES `slo`, `shi`,
-  `stp`, `sgate`, `srow` (each `[B, 1]` i32 — one word per row, one per
-  member of the seed quintuple), `invt`, `bramp`, `lramp`, `binc`, `linc`,
+* PARAMETERS, IN ORDER: `logits`, the FOUR SEED WORD TABLES `slo`, `shi`,
+  `stp`, `sgate` (each `[B, 1]` i32 — one word per row, one per
+  member of the seed quadruple), `invt`, `bramp`, `lramp`, `binc`, `linc`,
   `ones`, `sixtyfour`, `padoff`, `gramp`, `ginc`, then the noise section's
   own tables — `hc1`, `hc2`, `hc3`, `c256` (i32: the hash multipliers, the
   signed spellings of 0x9E3779B1 / 0x85EBCA77 / 0xC2B2AE3D, and the
   wrap-fold's 2⁸), `lane` (f32: the per-lane index), `fm8`, `ftop`, `fzero`,
   `fhalf`, `fm22` (f32: the fold's 2⁻⁸ / 2²³−1 / 0 / 0.5 / 2⁻²²), `cmin`
   (fp16: 2⁻¹⁴, the FEST-domain clamp) — then `idx`, the node's operand
-  order then the output. The registry does not permute. The first six are
-  PER-ROW (the row, its seed quintuple, its temperature); the twenty
+  order then the output. The registry does not permute. The first five are
+  PER-ROW (the row, its seed quadruple, its temperature); the twenty
   tables after them are STAGED buffers the host owns, constant across
   decode steps, functions of the vocab alone. ⭐ TEN OF THE TWENTY ARE
   `[1, 1]` ONE-WORD TABLES (the wall-5 measured law): the hash multipliers
@@ -92,15 +99,15 @@ kernel):
   the per-lane index), `padoff`, and the cascade's ramps and index tables —
   their values vary by lane, and only a load can state them (the no-arange
   law). ⭐ THE SEED WORDS
-  RIDE FIVE SEPARATE `[B, 1]` TABLES, NOT ONE `[B, 5]` TABLE: the Col
+  RIDE FOUR SEPARATE `[B, 1]` TABLES, NOT ONE `[B, 4]` TABLE: the Col
   operand mode that broadcasts a per-row word reads the STICK HEAD ALONE
   (the int-bcast card leg's measured law — a word at stick word k would be
   mis-read as word 0), so each word rides its own one-stick-per-row table
   loaded corner-free at `[pid, 0]`, `invt`'s own class — the auditor's
   wall-4 ruling (a); the fold's first spelling (one `[B, 5]` table read
   through five `[1, 1]` windows) carried the column corners the integer
-  door refuses by name. The worker writes the five words of each row at
-  the five tables' stick heads and nothing else.
+  door refuses by name. The worker writes the four words of each row at
+  the four tables' stick heads and nothing else.
 * CONSTEXPRS: `V` (the model's real vocab), `PAD_V` (V rounded up to a
   power-of-two whole row, STRICTLY above V — the descriptor block's law and
   the sentinel's), `NB = PAD_V // BLOCK`, `BLOCK = 64`, `B` (the row count
@@ -193,7 +200,7 @@ import triton.language as tl
 
 
 @triton.jit
-def sample_fwd(logits_ptr, slo_ptr, shi_ptr, stp_ptr, sgate_ptr, srow_ptr,  #
+def sample_fwd(logits_ptr, slo_ptr, shi_ptr, stp_ptr, sgate_ptr,  #
                invt_ptr,  #
                bramp_ptr, lramp_ptr, binc_ptr, linc_ptr,  #
                ones_ptr, sixtyfour_ptr, padoff_ptr, gramp_ptr, ginc_ptr,  #
@@ -228,7 +235,7 @@ def sample_fwd(logits_ptr, slo_ptr, shi_ptr, stp_ptr, sgate_ptr, srow_ptr,  #
     i_desc = tl.make_tensor_descriptor(invt_ptr, shape=[B, 1], strides=[1, 1],
                                        block_shape=[1, 1])
     invt = i_desc.load([pid, 0])
-    # THE SEED WORDS, ONE TABLE PER MEMBER OF THE QUINTUPLE: five `[B, 1]`
+    # THE SEED WORDS, ONE TABLE PER MEMBER OF THE QUADRUPLE: four `[B, 1]`
     # i32 tables, each `invt`'s own idiom — a `[1, 1]` block loaded at this
     # program's own row, corner-free. (The fold's first spelling read all
     # five words through `[1, 1]` windows of one `[B, 5]` view; a window at
@@ -238,8 +245,13 @@ def sample_fwd(logits_ptr, slo_ptr, shi_ptr, stp_ptr, sgate_ptr, srow_ptr,  #
     # path. The auditor's wall-4 ruling (a): one word, one table, at the
     # stick head.) The host writes one word per row per table, every step:
     # the step lane is what makes the hash a fresh draw per decode step
-    # without restaging anything else, and the row lane is the row's own key
-    # fact, STAGED -- the program id is a load offset, never a value (a
+    # without restaging anything else. ⭐ THE KEY IS REQUEST-OWNED ALONE
+    # (auditor ruling 2026-10-27): seed_lo, seed_hi and the step salt are
+    # functions of the request itself — the ROW WORD the first spelling
+    # staged here is GONE, because a request's noise must not depend on the
+    # slot it happens to land in (the P3 localization: a concurrent pair's
+    # second request sat at row 1 and could never equal its own solo
+    # text). The program id stays a load offset, never a value (a
     # tt.splat of an interior scalar has no contract on this path).
     slo_d = tl.make_tensor_descriptor(slo_ptr, shape=[B, 1], strides=[1, 1],
                                       block_shape=[1, 1])
@@ -253,9 +265,6 @@ def sample_fwd(logits_ptr, slo_ptr, shi_ptr, stp_ptr, sgate_ptr, srow_ptr,  #
     sgate_d = tl.make_tensor_descriptor(sgate_ptr, shape=[B, 1], strides=[1, 1],
                                         block_shape=[1, 1])
     sgate = sgate_d.load([pid, 0])
-    srow_d = tl.make_tensor_descriptor(srow_ptr, shape=[B, 1], strides=[1, 1],
-                                       block_shape=[1, 1])
-    srow = srow_d.load([pid, 0])
 
     # THE LANE'S OWN INDEX, staged as its own f32 table (0..PAD_V-1, exact
     # in f32 below 2^24) and ingested by the index-cast law -- the f32 value
@@ -322,8 +331,9 @@ def sample_fwd(logits_ptr, slo_ptr, shi_ptr, stp_ptr, sgate_ptr, srow_ptr,  #
 
     # THE COUNTER HASH -- i32 mul/add ONLY, wrapping (the card's bit-exact
     # integer class, card leg B1). Key: the row's seed table (seed_lo,
-    # seed_hi, step, row) and the lane. Multiplication by an odd constant
-    # is a bijection mod 2^32 and each square breaks the linear structure
+    # seed_hi, step) and the lane — REQUEST-OWNED ALONE, never the baked
+    # row the request happens to land in (auditor ruling 2026-10-27). Multiplication by an odd
+    # constant is a bijection mod 2^32 and each square breaks the linear structure
     # an xor-shift mix would break on a richer vocabulary; the constants
     # are the staged spellings of 0x9E3779B1 / 0x85EBCA77 / 0xC2B2AE3D.
     # seed_hi enters additively -- high bits of a product cannot reach low
@@ -331,7 +341,7 @@ def sample_fwd(logits_ptr, slo_ptr, shi_ptr, stp_ptr, sgate_ptr, srow_ptr,  #
     # bounds the effective seed width, a stated fact for the auditor, not a
     # hidden one.
     h = lane * hc1 + slo
-    h = h * hc2 + shi + stp + srow
+    h = h * hc2 + shi + stp
     h = h * h
     h = h * hc1 + slo
     h = h * h

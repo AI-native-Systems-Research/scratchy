@@ -1366,14 +1366,14 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// as the `[rows, BLOCK]` i32 idx stick the device's index ingestion
     /// reads — one program per row, at EVERY decode rung (the solo m=1 rung
     /// and every batched rung alike; a batched rung without the sampler does
-    /// not build). `inputs` = `[logits, slo, shi, stp, sgate, srow, invt,
+    /// not build). `inputs` = `[logits, slo, shi, stp, sgate, invt,
     /// bramp, lramp, binc, linc, ones, sixtyfour, padoff, gramp, ginc, hc1,
     /// hc2, hc3, c256, lane, fm8, ftop, fzero, fhalf, fm22, cmin]`: the
     /// `[rows, PAD_V]` fp16 block (whose pad bytes are NOT this op's
     /// contract — the lm-head's zero-pad columns write 0.0 there every
-    /// step), the SIX PER-ROW, PER-STEP staged operands (the seed
-    /// quintuple's five `[rows, 1]` i32 word tables — seed_lo, seed_hi,
-    /// step, greedy_gate, row — from which the card computes the noise
+    /// step), the FIVE PER-ROW, PER-STEP staged operands (the seed
+    /// quadruple's four `[rows, 1]` i32 word tables — seed_lo, seed_hi,
+    /// step, greedy_gate — from which the card computes the noise
     /// itself, zeros
     /// at the greedy temperature 0 — and the `[rows, 1]` f32 temperature
     /// reciprocals), then the twenty staged tables, functions of `vocab`
@@ -1517,20 +1517,25 @@ pub fn sample_groups(pad_vocab: u32) -> u32 {
     pad_vocab / (SAMPLE_BLOCK * SAMPLE_GROUP_BLOCKS)
 }
 
-/// The token draw's SEED WORD COUNT — the per-row quintuple
-/// `(seed_lo, seed_hi, step, greedy_gate, row)`, minted as FIVE separate
+/// The token draw's SEED WORD COUNT — the per-row quadruple
+/// `(seed_lo, seed_hi, step, greedy_gate)`, minted as FOUR separate
 /// `[rows, 1]` i32 word tables (each `invt`'s own class: one stick per row,
 /// the word at the stick head, loaded corner-free at `[pid, 0]` — the
 /// int-bcast card leg's measured Col form, and the only spelling the Col
 /// operand mode can address: it reads the stick's word 0 and has no
-/// within-stick offset). ONE derivation for the mint's five word sources,
-/// the kernel's own five `[B, 1]` descriptors (`sample_fwd.py`'s
-/// signature), and the host reference's quintuple read — sites that must
+/// within-stick offset). ONE derivation for the mint's four word sources,
+/// the kernel's own four `[B, 1]` descriptors (`sample_fwd.py`'s
+/// signature), and the host reference's quadruple read — sites that must
 /// all move together. (The fold's first spelling — one `[rows, 5]` table
 /// read through five `[1, 1]` windows — carried column corners the integer
 /// door refuses by name; the auditor's wall-4 ruling (a) re-spelled it as
-/// five corner-free tables.)
-pub const SAMPLE_SEED_WORDS: u32 = 5;
+/// corner-free tables. ⭐ THE ROW WORD IS GONE FOR GOOD — auditor ruling
+/// 2026-10-27, the P3 localization: the first spelling keyed the hash on
+/// the quintuple's fifth word, the LAUNCH row index, so a concurrent
+/// request's noise depended on the slot it happened to land in and could
+/// never equal its own solo text. The key is request-owned alone — the
+/// seed and the request's own step count.)
+pub const SAMPLE_SEED_WORDS: u32 = 4;
 
 // ── Nodes & graph ──────────────────────────────────────────────────
 
@@ -1607,9 +1612,9 @@ pub struct SampleMint {
     /// tensor: the solo m=1 rung mints at 1, every batched rung at its own
     /// width.
     pub rows: u32,
-    /// The minted SEED WORD sources' tids — the FIVE `[rows, 1]` i32 per-row
-    /// word tables of the quintuple `(seed_lo, seed_hi, step, greedy_gate,
-    /// row)`, in that order, each `invt`'s own class (one stick per row, the
+    /// The minted SEED WORD sources' tids — the FOUR `[rows, 1]` i32 per-row
+    /// word tables of the quadruple `(seed_lo, seed_hi, step, greedy_gate)`,
+    /// in that order, each `invt`'s own class (one stick per row, the
     /// word at the stick head) and staged EVERY STEP by the worker (the
     /// noise itself is computed on the card from them). The wiring names them
     /// to the worker through the mint's facts; they are never load-time
@@ -1639,8 +1644,8 @@ pub enum SampleRows {
 }
 
 /// Append the token draw to a graph — every rung's own row count, the solo m=1
-/// decode rung, every batched rung, and every prefill rung alike: six per-row
-/// per-step staged sources (the seed quintuple's five `[rows, 1]` i32 word
+/// decode rung, every batched rung, and every prefill rung alike: five per-row
+/// per-step staged sources (the seed quadruple's four `[rows, 1]` i32 word
 /// tables, invt), twenty staged-table sources, the result tail chain's
 /// tensors widened to `[rows, PAD_V]`, the `Sample` node
 /// reading the widened block (every row on a decode rung; the folded row alone
@@ -1661,16 +1666,16 @@ pub enum SampleRows {
 /// of the row it was drawn from (the test oracle's logits readback is that
 /// row's own reader, and it is why the row must survive the mint).
 ///
-/// ⭐ THE TWENTY-SIX SOURCES ARE INSERTED AT `[num_sources,
-/// num_sources+26)`, NOT APPENDED: sources must hold
+/// ⭐ THE TWENTY-FIVE SOURCES ARE INSERTED AT `[num_sources,
+/// num_sources+25)`, NOT APPENDED: sources must hold
 /// `tensors[0..num_sources]`, so the insert renumbers every op-output
-/// `TensorId` up by twenty-six — nodes' input/output regions, `op_output`,
+/// `TensorId` up by twenty-five — nodes' input/output regions, `op_output`,
 /// and `result` (validate demands the result is an op output, so it always
 /// moves). Source ids below the old `num_sources` are UNTOUCHED, which is
 /// what keeps the caller's `weight_ids` and the wiring's binding scan valid
 /// against the minted graph. The twenty tables carry NO `SourceBinding` and
 /// stage at LOAD through the wiring's `load_consts` (the rope tables' law);
-/// the five seed word tables and invt carry none either but stage EVERY STEP
+/// the four seed word tables and invt carry none either but stage EVERY STEP
 /// through the worker's sampler seat (the mint's facts name their tids) —
 /// they are minted below the `LoweredDecode` layer like the tables (the
 /// `embed_src` law: the answer, not the data to compute it from).
@@ -1713,8 +1718,8 @@ pub fn mint_sample<F: RopeForm>(
         rows >= 1,
         "the sampler serves at least one row; this graph's result tensor has {result_rows} rows"
     );
-    // The twenty-six staged sources, in the kernel's operand order after the
-    // row: the per-row per-step word tables first (the seed quintuple's FIVE
+    // The twenty-five staged sources, in the kernel's operand order after the
+    // row: the per-row per-step word tables first (the seed quadruple's FOUR
     // `[rows, 1]` i32 tables and the temperature reciprocals), then the
     // twenty load-time tables — the two decreasing ramps and the two
     // increasing index tables (whole-row `[1, PAD_V]`, shared by every row),
@@ -1732,10 +1737,12 @@ pub fn mint_sample<F: RopeForm>(
     // eleven, whole-row. The array's LENGTH is the single derivation of
     // the renumber shift below.
     let tables = [
-        // The seed quintuple's five word tables — each `[rows, 1]` i32,
+        // The seed quadruple's four word tables — each `[rows, 1]` i32,
         // invt's own class, staged EVERY STEP by the worker (one stick per
         // row, the word at the stick head; the auditor's wall-4 ruling (a)).
-        TensorShape { rows, cols: 1 },
+        // ⭐ NO ROW WORD (auditor ruling 2026-10-27, the P3 localization):
+        // the hash key is request-owned alone — the seed and the request's
+        // own step count — never the baked row the request lands in.
         TensorShape { rows, cols: 1 },
         TensorShape { rows, cols: 1 },
         TensorShape { rows, cols: 1 },
@@ -1802,7 +1809,7 @@ pub fn mint_sample<F: RopeForm>(
     if graph.result.0 >= n_src {
         graph.result.0 += shift;
     }
-    // 2) Insert the twenty-six sources and widen the RESULT TAIL CHAIN to
+    // 2) Insert the twenty-five sources and widen the RESULT TAIL CHAIN to
     //    the padded width — the whole chain, per the mint's own law above. The
     //    ROWS are untouched: the rung keeps its own row count.
     graph.tensors.splice(n_src as usize..n_src as usize, tables);
@@ -1849,7 +1856,7 @@ pub fn mint_sample<F: RopeForm>(
             cols: Range::new(0, graph.tensors[t.index()].cols),
         },
     };
-    let mut inputs = Vec::with_capacity(27);
+    let mut inputs = Vec::with_capacity(26);
     // The logits the draw reads: the whole result block on an All graph, and
     // the ONE row the folded tail writes on a Folded graph — row 0, the row
     // `lower_prefill_lm_head_fold`'s m=1 matmul writes (the result tensor's
@@ -2852,7 +2859,8 @@ pub fn eval_node<F: RopeForm>(
             // backend's argmax tie promise: per row, FIRST-maximum over
             // `score_i = (x_i·inv_t + g_i·gate) + padoff_i` in f32, with `g` the card's
             // own noise — the wrapping-i32 counter hash over the row's seed
-            // quintuple and the lane, the multiply-by-2^8 wrap-fold, the
+            // quadruple and the lane (request-owned alone — no row word,
+            // the auditor's 2026-10-27 ruling), the multiply-by-2^8 wrap-fold, the
             // strict-interior folds, and the fp16-island Gumbel, every
             // constant at its staged value (the kernel's exact sequence).
             // The pad law (`padoff` 0.0 on the real lanes, f32::MIN
@@ -2883,12 +2891,11 @@ pub fn eval_node<F: RopeForm>(
             let (shi_t, _, _) = gather(&node.inputs[2], graph, bufs);
             let (stp_t, _, _) = gather(&node.inputs[3], graph, bufs);
             let (sgate_t, _, _) = gather(&node.inputs[4], graph, bufs);
-            let (srow_t, _, _) = gather(&node.inputs[5], graph, bufs);
-            let (invt, _, _) = gather(&node.inputs[6], graph, bufs);
+            let (invt, _, _) = gather(&node.inputs[5], graph, bufs);
             assert!(
                 wcols == 1,
                 "the seed word tables are {wcols} wide, not the one word of their own \
-                 `[rows, 1]` class (the mint mints five of them, the quintuple's own)"
+                 `[rows, 1]` class (the mint mints four of them, the quadruple's own)"
             );
             let vocab = vocab as usize;
             assert!(
@@ -2919,7 +2926,6 @@ pub fn eval_node<F: RopeForm>(
                 let shi = shi_t[r] as i32;
                 let stp = stp_t[r] as i32;
                 let gate = sgate_t[r] as i32 as f32;
-                let srow = srow_t[r] as i32;
                 let base = r * cols;
                 // `+ 0.0` is the pad law's own offset, applied LAST — the
                 // kernel adds the staged `padoff` after the score's two
@@ -2941,8 +2947,7 @@ pub fn eval_node<F: RopeForm>(
                     let h = h
                         .wrapping_mul(HC2)
                         .wrapping_add(shi)
-                        .wrapping_add(stp)
-                        .wrapping_add(srow);
+                        .wrapping_add(stp);
                     let h = h.wrapping_mul(h);
                     let h = h.wrapping_mul(HC1).wrapping_add(slo);
                     let h = h.wrapping_mul(h);

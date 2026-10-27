@@ -1833,8 +1833,9 @@ impl IntBinary {
 /// `Col` operand mode — the production form, since the sampler is one program per row. The
 /// specimen is `int_bcast_probe.py` (case `int_bcast`), the runner kit
 /// `.claude/fb-noise-probe/intb-leg.sh`.
-/// The sampler's own hash needs `Col`: its per-row seed words (`slo`/`shi`/`stp`/`srow`) are
-/// `[rows, 1]` i32 tables added against the `[rows, PAD_V]` hash tile. The sampler's PROGRAM
+/// The sampler's own hash needs `Col`: its per-row seed words (`slo`/`shi`/`stp`) are
+/// `[rows, 1]` i32 tables added against the `[rows, PAD_V]` hash tile (the row word is
+/// gone from the key — the P3 localization ruling, 2026-10-27). The sampler's PROGRAM
 /// is one row at a time (`sample_fwd.py`'s own grid law), but the batched rung's mint types
 /// the chain at the BAND's height (the flush-band law: every intermediate of a banded chain
 /// mints at the band's height), so a decode rung at `rows > 1` hands this door `[rows, 1]`
@@ -7622,8 +7623,9 @@ mod elementwise_tests {
     // ── THE INTEGER BROADCAST ADMISSION (front-b-noise, auditor order 2026-10-26) ───────────────
     //
     // ⭐⭐⭐ THE PROBE'S OWN SHAPE. The sampler's hash adds its per-row seed words against the
-    // `[rows, PAD_V]` hash tile: `h = h*C2 + shi + stp + srow` spells four `Col`-broadcast
-    // `addi32toi32` ops over SENUINT32, the form this door refused until the int-bcast card leg
+    // `[rows, PAD_V]` hash tile: `h = h*C2 + shi + stp` spells three `Col`-broadcast
+    // `addi32toi32` ops over SENUINT32 (the row word is gone from the key — the P3
+    // localization ruling, 2026-10-27), the form this door refused until the int-bcast card leg
     // (a single `[1, 512]` dense i32 + a `[1, 1]` Col-broadcast i32, host-compared bit for bit
     // on nickm2) measures it. The admission routes through the SAME `elementwise_broadcast`
     // body the fp doors reach — the want loop, the `In::col`/`In::mb` operand modes, the TileOp

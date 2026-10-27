@@ -27,16 +27,16 @@ with near-tie logits staged for exactly that question.
 FIDELITY — every op is the production noise section's own, verbatim from
 `sample_fwd.py`: the fp16 logits row loaded `[1, PAD_V]` at `[pid, 0]` of a
 `[B, PAD_V]` view and widened exactly; the per-row temperature reciprocal and
-the seed QUINTUPLE `(seed_lo, seed_hi, step, greedy_gate, row)` as FIVE
+the seed QUADRUPLE `(seed_lo, seed_hi, step, greedy_gate)` as FOUR
 `[B, 1]` i32 tables read through `[1, 1]` tiles at `[pid, 0]` (the stick
-head); the lane as its own `[1, PAD_V]` f32 table (the no-arange law); the
+head; no row word — the P3 localization ruling, request-owned alone); the lane as its own `[1, PAD_V]` f32 table (the no-arange law); the
 ten uniform constants in the seeds' OWN class — `[B, 1]` tables at the rung's
 own row count, the same word at every row's stick head, broadcast by their
 consuming ops (the 2026-10-27 ruling); the counter hash in wrapping i32; the
 compare-free wrap-fold; the strict-interior uniform; the Gumbel draw through
 the card's only log (the fp16 FEST bind via `LegalizeTypes`' own
 widening-island collapse, both entries clamped at 2^-14); `gate` from the
-quintuple's greedy_gate word; the three-rounding score; and the pad law
+quadruple's greedy_gate word; the three-rounding score; and the pad law
 applied last (`padoff`, 0.0 on the real lanes, -FLT_MAX on the pads). What is
 NOT here: the two-level ramp selection, the one-hot, and the idx stick.
 
@@ -54,7 +54,7 @@ zero, numerically inert, read only as a liveness witness). No pass touched,
 nothing degraded, and every f32 component exits through production's own
 mechanism.
 
-PARAMETERS, IN ORDER: the fp16 `[B, PAD_V]` logits row; the quintuple's five
+PARAMETERS, IN ORDER: the fp16 `[B, PAD_V]` logits row; the quadruple's four
 `[B, 1]` i32 word tables; the `[B, 1]` f32 temperature reciprocals; the
 `[B, 1]` f32 ones word (the score terminal's widen — see the body); the
 `[1, PAD_V]` f32 pad-law offset row; the four `[B, 1]` i32 hash/fold
@@ -83,7 +83,7 @@ import triton.language as tl
 
 
 @triton.jit
-def sample_noise_probe(logits_ptr, slo_ptr, shi_ptr, stp_ptr, sgate_ptr, srow_ptr,  #
+def sample_noise_probe(logits_ptr, slo_ptr, shi_ptr, stp_ptr, sgate_ptr,  #
                        invt_ptr, ones_ptr, padoff_ptr,  #
                        hc1_ptr, hc2_ptr, hc3_ptr, c256_ptr,  #
                        lane_ptr, fm8_ptr, ftop_ptr, fzero_ptr, fhalf_ptr, fm22_ptr,  #
@@ -105,9 +105,12 @@ def sample_noise_probe(logits_ptr, slo_ptr, shi_ptr, stp_ptr, sgate_ptr, srow_pt
     i_desc = tl.make_tensor_descriptor(invt_ptr, shape=[B, 1], strides=[1, 1],
                                        block_shape=[1, 1])
     invt = i_desc.load([pid, 0])
-    # THE SEED WORDS, ONE TABLE PER MEMBER OF THE QUINTUPLE — five [B, 1] i32
+    # THE SEED WORDS, ONE TABLE PER MEMBER OF THE QUADRUPLE — four [B, 1] i32
     # tables, each loaded corner-free at this program's own row (`sample_fwd`'s
     # own spelling; the host writes one word per row per table, every step).
+    # NO ROW WORD (the P3 localization ruling, 2026-10-27): the key is
+    # request-owned alone, so the noise a row draws cannot depend on the slot
+    # the request happens to land in.
     slo_d = tl.make_tensor_descriptor(slo_ptr, shape=[B, 1], strides=[1, 1],
                                       block_shape=[1, 1])
     slo = slo_d.load([pid, 0])
@@ -120,9 +123,6 @@ def sample_noise_probe(logits_ptr, slo_ptr, shi_ptr, stp_ptr, sgate_ptr, srow_pt
     sgate_d = tl.make_tensor_descriptor(sgate_ptr, shape=[B, 1], strides=[1, 1],
                                         block_shape=[1, 1])
     sgate = sgate_d.load([pid, 0])
-    srow_d = tl.make_tensor_descriptor(srow_ptr, shape=[B, 1], strides=[1, 1],
-                                       block_shape=[1, 1])
-    srow = srow_d.load([pid, 0])
     # THE LANE'S OWN INDEX, staged as its own f32 table (0..PAD_V-1, exact in
     # f32 below 2^24) and ingested by the index-cast law — the no-arange law's
     # own reading, the shared row every program reads.
@@ -168,9 +168,9 @@ def sample_noise_probe(logits_ptr, slo_ptr, shi_ptr, stp_ptr, sgate_ptr, srow_pt
     cmin = cmin_d.load([pid, 0])
 
     # THE COUNTER HASH — i32 mul/add ONLY, wrapping (the card's bit-exact
-    # integer class, card leg B1). Key: the row's seed quintuple and the lane.
+    # integer class, card leg B1). Key: the row's seed quadruple and the lane.
     h = lane * hc1 + slo
-    h = h * hc2 + shi + stp + srow
+    h = h * hc2 + shi + stp
     h = h * h
     h = h * hc1 + slo
     h = h * h
@@ -192,7 +192,7 @@ def sample_noise_probe(logits_ptr, slo_ptr, shi_ptr, stp_ptr, sgate_ptr, srow_pt
     nm = tl.minimum(n, t)
     np = tl.maximum(nm, fzero)
     # THE UNIFORM, STRICTLY INSIDE (0, 1): (np + 0.5) * 2^-22 — every value an
-    # exact f32, so u is bit-emulable on the host given the seed quintuple.
+    # exact f32, so u is bit-emulable on the host given the seed quadruple.
     u = (np + fhalf) * fm22
     # THE GUMBEL DRAW through the card's ONLY log — the fp16 FEST bind, via
     # `LegalizeTypes`' own widening-island collapse; the arithmetic between

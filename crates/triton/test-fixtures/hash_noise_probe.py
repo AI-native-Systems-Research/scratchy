@@ -113,10 +113,11 @@ to the boundary biases the mean by < 1e-3 and the variance by < 0.003 —
 both under the 2^20-lane sampling noise, and both reported by the stats
 script as clamped-lane counts, never gated.
 
-PARAMETERS, IN ORDER: the seed quad `slo`, `shi`, `stp`, `srow` and the
+PARAMETERS, IN ORDER: the seed triple `slo`, `shi`, `stp` and the
 hash constants `c1`, `c2`, `c3`, `c256` (all `[1, PAD_V]` i32, the seed
-quad's value duplicated down every lane -- one program, one seed); the f32
-tables `lane`, `fm8` (2^-8), `ftop` (8388607.0), `fzero` (0.0), `fhalf`
+triple's value duplicated down every lane -- one program, one seed; NO ROW
+WORD, the auditor's 2026-10-27 P3 localization ruling -- the key is
+request-owned alone); the f32 tables `lane`, `fm8` (2^-8), `ftop` (8388607.0), `fzero` (0.0), `fhalf`
 (0.5), `fm22` (2^-22), and the fp16 table `cmin` (2^-14 — the FEST-domain
 clamp, fp16 so the maximum never leaves the fp16 stick); then the four outs
 `u`, `g` (`[1, PAD_V]` f32) and `ui`, `gi` (`[1, PAD_V]` i32, the island's
@@ -130,7 +131,7 @@ import triton.language as tl
 
 
 @triton.jit
-def hash_noise_probe(slo_ptr, shi_ptr, stp_ptr, srow_ptr,  #
+def hash_noise_probe(slo_ptr, shi_ptr, stp_ptr,  #
                      c1_ptr, c2_ptr, c3_ptr, c256_ptr,  #
                      lane_ptr, fm8_ptr, ftop_ptr, fzero_ptr, fhalf_ptr, fm22_ptr,  #
                      cmin_ptr,  #
@@ -138,7 +139,7 @@ def hash_noise_probe(slo_ptr, shi_ptr, stp_ptr, srow_ptr,  #
                      PAD_V: tl.constexpr, B: tl.constexpr):
     # THE STAGED TABLES, all [1, PAD_V] whole-row blocks at corner (0, 0) --
     # the shared-table idiom inside a one-program grid. Every per-lane fact
-    # is host-staged (the no-arange law): the seed quad, the hash constants,
+    # is host-staged (the no-arange law): the seed triple, the hash constants,
     # the lane, and the fold's constants. Nothing is a splat, so nothing
     # routes to the fp16 scalar-multiply door.
     slo_d = tl.make_tensor_descriptor(slo_ptr, shape=[1, PAD_V], strides=[PAD_V, 1],
@@ -150,9 +151,6 @@ def hash_noise_probe(slo_ptr, shi_ptr, stp_ptr, srow_ptr,  #
     stp_d = tl.make_tensor_descriptor(stp_ptr, shape=[1, PAD_V], strides=[PAD_V, 1],
                                       block_shape=[1, PAD_V])
     stp = stp_d.load([0, 0])
-    srow_d = tl.make_tensor_descriptor(srow_ptr, shape=[1, PAD_V], strides=[PAD_V, 1],
-                                       block_shape=[1, PAD_V])
-    srow = srow_d.load([0, 0])
     c1_d = tl.make_tensor_descriptor(c1_ptr, shape=[1, PAD_V], strides=[PAD_V, 1],
                                      block_shape=[1, PAD_V])
     c1 = c1_d.load([0, 0])
@@ -201,13 +199,13 @@ def hash_noise_probe(slo_ptr, shi_ptr, stp_ptr, srow_ptr,  #
 
     # THE COUNTER HASH -- i32 mul/add ONLY, wrapping (the card's bit-exact
     # integer class, card leg B1: muli32toi32/addi32toi32 over SENUINT32).
-    # Key: the row's seed quad and the lane. Multiplication by an odd
+    # Key: the row's seed triple and the lane. Multiplication by an odd
     # constant is a bijection mod 2^32 and each square breaks the linear
     # structure an xor-shift mix would break on a richer vocabulary; the
     # constants are the staged spellings of 0x9E3779B1 / 0x85EBCA77 /
     # 0xC2B2AE3D.
     h = lane * c1 + slo
-    h = h * c2 + shi + stp + srow
+    h = h * c2 + shi + stp
     h = h * h
     h = h * c1 + slo
     h = h * h
