@@ -22,6 +22,12 @@ law: the generators ARE the input definition).
     raw path takes the bytes exactly as staged and f32 has no codec. The
     `[rows, 1]` tables are fixed points of the scatter (one 128 B stick per
     row — fp32/u32 32 words), each row's word in word 0 of its own stick.
+    ⭐ THE GATE IS THE ONE EXCEPTION (β, auditor ruling 2026-10-27): the
+    crossed sitofp is swept at the 64-element DEVICE width (for_convert(1)
+    = 64 — the width our own PlanCorelets demands of a tile, the α cell's
+    measured refusal), so `sgate` stages as a stick-SCATTERED `[rows, 64]`
+    u32 tile (2 sticks per row, gate at word 0, zero pad words) at a
+    rows·256 B reservation — see `gate_table`.
   * fp16 MAGNITUDE tensors (the logits tile, the fp16 clamp) stage through
     the RUNNER's own path — `t<id>=<path> stick:t<id>=<rows>` over a
     ROW-MAJOR file: the runner applies the IEEE→SEN169 codec (the card's
@@ -74,6 +80,11 @@ CASES = {"b2": 2, "b8": 8}
 # The stick granules: 128 B per stick — 64 fp16 slots or 32 fp32/u32 words.
 F16_STICK = 64
 F32_STICK = 32
+# The gate's DEVICE width (β, auditor ruling 2026-10-27): DeviceWidth::for_convert(1)
+# = one whole 64-element device stick — the width our own PlanCorelets demands of a
+# tile (the α cell's base bake measured the 32-element refusal), so the crossed gate
+# sitofp is staged/swept at 64 elements per row, gate at word 0, reservation rows·256 B.
+GATE_DEV_COLS = 64
 
 # The noise section's constants — the same words the bake stages.
 HC1 = 0x9E3779B1
@@ -158,6 +169,22 @@ def col_table(words: np.ndarray, dtype) -> np.ndarray:
     t = np.zeros((rows, F32_STICK), dtype=dtype)
     t[:, 0] = words.astype(dtype)
     return t
+
+
+def gate_table(words: np.ndarray) -> np.ndarray:
+    """The gate's β staging (auditor ruling 2026-10-27): the crossed sitofp is
+    swept at the 64-element DEVICE width (for_convert(1) = 64; the α cell's
+    base bake measured our own PlanCorelets refusing a 32-element tile), and
+    the placement reserves rows·256 B for it. The gate word sits at logical
+    [r, 0] of a `[rows, 64]` u32 tile, the widened pad words are ZEROS (the
+    convert reads them and writes 0.0 — the consumer's Col window never reads
+    past word 0), and the tile is STICK-SCATTERED — 2 sticks per row, so NOT a
+    fixed point of the scatter like every other `[rows, 1]` table. The image
+    is the old one-stick head staging followed by rows·128 B of zeros."""
+    rows = len(words)
+    t = np.zeros((rows, GATE_DEV_COLS), dtype=np.uint32)
+    t[:, 0] = words.astype(np.uint32)
+    return stick_scatter(t, F32_STICK)
 
 
 def cmin_table(rows: int) -> np.ndarray:
@@ -272,7 +299,9 @@ def staged(case: str) -> list[tuple[str, np.ndarray]]:
         (f"sn_{case}_slo", col_table(sw["slo"], np.uint32)),
         (f"sn_{case}_shi", col_table(sw["shi"], np.uint32)),
         (f"sn_{case}_stp", col_table(sw["stp"], np.uint32)),
-        (f"sn_{case}_sgate", col_table(sw["sgate"], np.uint32)),
+        # ⭐ β: the gate rides the 64-element device width — NOT the [rows, 1]
+        # one-stick law the other seed tables keep (see gate_table).
+        (f"sn_{case}_sgate", gate_table(sw["sgate"])),
         (f"sn_{case}_srow", col_table(sw["srow"], np.uint32)),
         (f"sn_{case}_invt", col_table(np.full(rows, 1.0), np.float32)),
         (f"sn_{case}_ones", col_table(np.full(rows, 1.0), np.float32)),
@@ -308,11 +337,12 @@ def expected(case: str) -> list[dict]:
         return {"name": name, "size": size, "out": True, "how": "raw"}
 
     col = rows * 128  # the [rows, 1] fp32/u32 one-stick-per-row footprint
+    gate = rows * GATE_DEV_COLS * 4  # β: the gate's 64-element device-width reservation
     wide32 = rows * PAD_V * 4  # a [rows, PAD_V] fp32/i32 row-block tile
     return [
         ins("logits", rows * PAD_V * 2, "fp16"),
         ins("slo", col), ins("shi", col), ins("stp", col),
-        ins("sgate", col), ins("srow", col),
+        ins("sgate", gate), ins("srow", col),
         ins("invt", col),
         ins("ones", col),
         ins("padoff", PAD_V * 4),
