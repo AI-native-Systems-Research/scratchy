@@ -1128,6 +1128,13 @@ fn sample_binds(
             (4, _) => r as i32,
             // A greedy row: zeros for the seed, the step and the gate.
             (_, None) => 0,
+            // The quintuple is FIVE words (the seat's own `[u32; 5]`); a sixth
+            // staged word has no law anywhere — refuse rather than stage a
+            // word nobody defined.
+            (_, Some(_)) => panic!(
+                "seed word {k}: the seat's quintuple is five words, indexed 0..=4 — a \
+                 sixth is a mint/seat disagreement, never a staged guess"
+            ),
         }
     };
     let mut binds = Vec::with_capacity(1 + seat.seed_words.len());

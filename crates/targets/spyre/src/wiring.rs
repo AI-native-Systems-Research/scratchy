@@ -1258,6 +1258,14 @@ pub struct SampleSeat {
     /// 1, every batched rung at its baked width), the row count of both
     /// per-row operands and of the draw's grid.
     pub rows: u32,
+    /// ⭐ THE LOGITS ROW's tid — the Sample node's `inputs[0]`, the tensor the
+    /// mint keeps placed and readable by tid even as it re-points the rung's
+    /// RESULT at the idx stick (the pick is `[rows, BLOCK]`, not `rows` rows
+    /// of vocab, so reading the result as logits refused every rung at load).
+    /// The worker reads the launch's logits through this tid — the same fact
+    /// the solo launch reads the pick through; a bake without a draw keeps the
+    /// result AS the logits, so that consumer falls back to `result_id`.
+    pub row: u32,
     /// The EMITTED vocab — the row's own width, the sentinel threshold the
     /// consumer refuses past.
     pub vocab: u32,

@@ -2320,6 +2320,10 @@ pub fn sample_seat_of_ir<F: RopeForm>(
                 seed_words,
                 invt: node.inputs[6].tensor.index() as u32,
                 rows,
+                // inputs[0] is the LOGITS row — kept placed by the mint while
+                // the RESULT is re-pointed at the idx stick (the struct's own
+                // doc): the tid the worker reads the launch's logits through.
+                row: node.inputs[0].tensor.index() as u32,
                 vocab,
                 pad_vocab: scratchy_subtile::subtile_ir::sample_pad_vocab(vocab),
                 seed_row_words,

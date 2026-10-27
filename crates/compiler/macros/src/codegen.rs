@@ -9821,6 +9821,7 @@ fn emit_superdsc_wiring(
                 .collect::<Vec<_>>();
             let invt = u32l(seat.invt);
             let rows = u32l(seat.rows);
+            let row = u32l(seat.row);
             let vocab = u32l(seat.vocab);
             let pad_vocab = u32l(seat.pad_vocab);
             let seed_row_words = u32l(seat.seed_row_words);
@@ -9830,6 +9831,7 @@ fn emit_superdsc_wiring(
                         seed_words: [#(#seed_words),*],
                         invt: #invt,
                         rows: #rows,
+                        row: #row,
                         vocab: #vocab,
                         pad_vocab: #pad_vocab,
                         seed_row_words: #seed_row_words,
