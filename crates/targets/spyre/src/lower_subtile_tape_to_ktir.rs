@@ -1935,6 +1935,9 @@ pub fn graph_wiring<F: RopeForm>(
     {
         let staged: std::collections::BTreeSet<u32> =
             load_consts.iter().map(|&(tid, _)| tid).collect();
+        if let Some(seat) = &sample_seat {
+            staged.insert(seat.noise);
+        }
         for &tid in staggered.keys() {
             if !staged.contains(&tid) {
                 return Err(SuperDscError(format!(
