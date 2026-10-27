@@ -920,9 +920,6 @@ impl Worker for SpyreWorker {
                     mask_cap,
                     fold_rows,
                     sess,
-                    // The rung's own logits geometry — a bake fact, no longer read: the
-                    // sampler picks on the card and the idx stick is the only readback.
-                    logits: _,
                 } = &mut sb.decode_rungs[ri];
                 let seqs = *seqs;
                 let fold_rows = *fold_rows;
