@@ -1456,8 +1456,34 @@ impl Worker for SpyreWorker {
                 // ⛔ AND A REFUSAL, NEVER A ZERO TABLE, when the factor does not exist: an entry of 0 is
                 // block 0, a REAL address (row 0's first page), so a fallback would give the whole batch
                 // row 0's keys — fluent and wrong, which is the corruption this path exists to remove.
+                // ⭐⭐⭐ THE OWNER SEAT STAGES THE SOLO LAW — a one-request session's bodies read the
+                // prefix mask as ONE BROADCAST ROW and gather only as a ONE-REQUEST chunk
+                // (`ktir_superdsc_door`'s `gathers_kv` law), so neither the fold's block mask nor
+                // the batch chunk's `ChunkRowKind::Batch` table may be staged for them. Staging
+                // the fold's blocks was the W=1 text defect: the broadcast read of the block
+                // buffer is row 0's true bytes for the first stick and OTHER HEAD ROWS' blocks
+                // past it — mostly VALID — so the first step past a 64-column rung attended ~64
+                // phantom columns and flipped one near-tie per prompt (measured 3/3).
+                let owner_seat = matches!(ri, crate::spyre_types::RungId::Owner);
                 let kv_blocks: Option<Vec<scratchy_subtile::sdsc_abstract::GatherEntry>> =
-                    if bake_gathers_kv && batch_chunk.is_none() {
+                    if owner_seat {
+                        let (id0, _) = &decode_ids[0];
+                        let req0 = requests
+                            .get(id0)
+                            .ok_or_else(|| werr(format!("unknown cached req {id0}")))?;
+                        let ctx0 = PageMapCtx {
+                            host: hosts.get(id0).map_or(&[], |v| v.as_slice()),
+                            part,
+                        };
+                        crate::spyre_forward::owner_chunk_index_table(
+                            pool,
+                            sess,
+                            step,
+                            req0,
+                            ctx0,
+                            launch_pos,
+                        )?
+                    } else if bake_gathers_kv && batch_chunk.is_none() {
                         let per_page = sess.gather_entries_per_page(pool).ok_or_else(|| {
                         werr(
                             "decode batch: this bundle emits a GATHERED KV read, but a physical page \
@@ -1570,9 +1596,11 @@ impl Worker for SpyreWorker {
                     };
                 // ⭐⭐⭐ A BATCH CHUNK BODY's TABLE: every row's page map laid end to end at the chunk's
                 // `J` pages each — the same law its mask is staged by. The entry factor is the
-                // session's, exactly as for the fold's table above.
-                let kv_blocks = match batch_chunk {
-                    Some(bc) => {
+                // session's, exactly as for the fold's table above. NEVER taken on the owner seat:
+                // the owner's chunk bodies gather at `ChunkRowKind::OneRequest` (the spelling the
+                // `owner_seat` arm above staged), whose value-leg entry order this one does not lay.
+                let kv_blocks = match (batch_chunk, owner_seat) {
+                    (Some(bc), false) => {
                         let per_page = sess.gather_entries_per_page(pool).ok_or_else(|| {
                             werr(
                                 "decode batch: this body gathers its chunk, but a physical page is not \
@@ -1599,13 +1627,18 @@ impl Worker for SpyreWorker {
                             })?,
                         )
                     }
-                    None => kv_blocks,
-                };
-                // ⭐ THE PREFIX LAYOUT THE SELECTED BODY READS: the batch chunk's one row block, or the
-                // gathered fold's declared pass grid.
-                let prefix = match batch_chunk {
-                    Some(bc) => scratchy_subtile::sdsc_abstract::BatchPrefix::Chunk(bc),
-                    None => scratchy_subtile::sdsc_abstract::BatchPrefix::Fold(fold),
+                    _ => kv_blocks,
+                };                // ⭐ THE PREFIX LAYOUT THE SELECTED BODY READS: the batch chunk's one row block, the
+                // gathered fold's declared pass grid — or, on the OWNER seat, the one-request
+                // broadcast row every body of that session reads (the solo law; see
+                // [`BatchPrefix::OneRequest`]).
+                let prefix = if owner_seat {
+                    scratchy_subtile::sdsc_abstract::BatchPrefix::OneRequest
+                } else {
+                    match batch_chunk {
+                        Some(bc) => scratchy_subtile::sdsc_abstract::BatchPrefix::Chunk(bc),
+                        None => scratchy_subtile::sdsc_abstract::BatchPrefix::Fold(fold),
+                    }
                 };
                 // ⭐ THE ONE DECODE PATH, SUBMITTED: every row is a different request and
                 // every row is sampled ON THE CARD by the rung's minted sampler; the idx

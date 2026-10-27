@@ -8956,6 +8956,22 @@ pub enum BatchPrefix {
     Fold(DeclaredFold),
     /// One row block every row block reads — [`batch_chunk_mask_f16`].
     Chunk(BatchChunk),
+    /// ⭐⭐⭐⭐⭐ THE ONE-REQUEST SEAT'S OWN FORM — ONE BROADCAST ROW over the bake's reserve, staged
+    /// by the same law the deleted solo loop staged (an f32 row the bind narrows, validity the
+    /// request's own [`KvHistory`]). The owner session's bodies are ONE-REQUEST bodies: the door
+    /// rules they may take the per-page gather only as a CHUNK "whose read IS the broadcast row"
+    /// (`ktir_superdsc_door`'s `gathers_kv` law), and a body that does not gather reads the row
+    /// broadcast too — so EVERY body of that seat reads this form, fused rung or chunk rung.
+    ///
+    /// ⛔⛔⛔ STAGING THE FOLD'S BLOCKS FOR ONE OF THESE BODIES IS SILENT AND WRONG, and it was the
+    /// W=1 text defect (auditor ruling 2026-10-27): the broadcast read of the block buffer is
+    /// `dev_off(0, c) = (c/64)·(rows·64) + c%64`, which is the TRUE row-0 bytes for `c < 64` and
+    /// ROW `c/64`'s FIRST BLOCK past it — the head rows' own validity, mostly VALID. A step whose
+    /// sweep stays inside one stick is byte-identical either way (the defect hid there), and the
+    /// first step past it — the rung 64→128 switch, on card — attends ~64 PHANTOM COLUMNS of
+    /// unwritten keys: a small deterministic logits perturbation that flips the first near-tie,
+    /// fluent on both sides. Measured 3/3 prompts, one token each at valid_len 67/72/68.
+    OneRequest,
 }
 
 /// ⭐⭐⭐ THE BATCH CHUNK's PER-ROW MASK, in the device's own f16 — one [`BatchChunk::mask_rows`] ×

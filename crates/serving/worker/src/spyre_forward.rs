@@ -473,6 +473,23 @@ pub(crate) fn run_prefill_batch(
     // bake's reserve; a decode BATCH wants one f16 block per fold pass, because the fold takes a
     // pass per (request, page) and `fold_delta` steps the mask one block per pass.
     let histories = per_request.as_ref().map(|(rows, _)| rows.mask_histories());
+    // ⭐ ONE BROADCAST PREDICATE, ONE TYPE — `PrefixSource` is generic over its validity closure,
+    // so two arms spelling two closures are two types and the match cannot unify. The predicate
+    // carries its law as DATA (which regime it is in) rather than as a second closure: a
+    // one-request seat reads its single live row's own history (the solo law — a hole in that
+    // history is another request's keys, so `col < start` would be the defect), and a prompt
+    // chunk reads the position law (its rows share one contiguous prefix).
+    let solo_hist = match (&per_request, &histories) {
+        (
+            Some((_, scratchy_subtile::sdsc_abstract::BatchPrefix::OneRequest)),
+            Some(hs),
+        ) => hs.first(),
+        _ => None,
+    };
+    let broadcast_holds = |c: usize| match solo_hist {
+        Some(h) => h.contains(c),
+        None => decode_prefix_col_valid(c, start),
+    };
     let prefix_src = match (&per_request, &histories) {
         // ⭐ A BATCH CHUNK BODY: one per-row block, from the law the emitter baked the read with.
         (Some((_, scratchy_subtile::sdsc_abstract::BatchPrefix::Chunk(bc))), Some(hs)) => {
@@ -498,6 +515,18 @@ pub(crate) fn run_prefill_batch(
                 histories: hs,
             })
         }
+        // ⭐⭐⭐ THE ONE-REQUEST SEAT — the deleted solo loop's own law, verbatim: ONE BROADCAST ROW
+        // over the bake's reserve, validity the single live row's own history (row 0 IS live 0 —
+        // the live rows occupy the first slots). Every body of that seat reads this form (see
+        // [`BatchPrefix::OneRequest`]); the fold's blocks staged here were the W=1 text defect.
+        (Some((_, scratchy_subtile::sdsc_abstract::BatchPrefix::OneRequest)), Some(_)) => {
+            pf.pmask_slots.map(|cap| {
+                scratchy_target_spyre::forward_tape::PrefixSource::Broadcast {
+                    cap,
+                    holds: broadcast_holds,
+                }
+            })
+        }
         // ⛔ THE EXTENT IS THE BAKE'S RESERVE, NEVER THE SESSION'S `cap`. The ops sweep the
         // placement's whole width and an additive byte the host never wrote reads as ZERO = VALID,
         // so every swept column gets an explicit value; WHICH value is the request's business.
@@ -505,7 +534,7 @@ pub(crate) fn run_prefill_batch(
             pf.pmask_slots.map(
                 |cap| scratchy_target_spyre::forward_tape::PrefixSource::Broadcast {
                     cap,
-                    holds: |c: usize| decode_prefix_col_valid(c, start),
+                    holds: broadcast_holds,
                 },
             )
         }
@@ -1259,6 +1288,36 @@ fn chunk_index_table(
                  — the map is empty or an entry overflows int32"
         ))
     })
+}
+
+/// ⭐ THE OWNER SEAT'S INDEX TABLE — the deleted solo loop's own spelling, exposed for the exec's
+/// W=1 arm: the one-request chunk gather at [`ChunkKeys`] `{ resident: pos, mapped: pos + 1,
+/// rows: OneRequest }`. The BATCH spelling ([`batch_chunk_index_table`]) lays the same pages at
+/// `ChunkRowKind::Batch`, which orders the value leg's entries differently
+/// ([`ChunkScratch::lx_form`]) — one more staged input the two arms may not disagree on. `None`
+/// when this body gathers nothing (the fused rungs), exactly as the solo loop read it.
+#[cfg(feature = "spyre-hw")]
+pub(crate) fn owner_chunk_index_table(
+    pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
+    session: &SuperDscSession,
+    step: scratchy_target_spyre::superdsc_exec::StepBody,
+    req: &ReqState,
+    ctx: PageMapCtx<'_>,
+    pos: usize,
+) -> ExecutorResult<Option<Vec<scratchy_subtile::sdsc_abstract::GatherEntry>>> {
+    chunk_index_table(
+        "decode owner",
+        pool,
+        session,
+        step,
+        req,
+        ctx,
+        ChunkKeys {
+            resident: pos,
+            mapped: pos as u32 + 1,
+            rows: scratchy_subtile::sdsc_abstract::ChunkRowKind::OneRequest,
+        },
+    )
 }
 
 /// ⭐ WHAT ONE CHUNK'S FORWARD PRODUCED — the per-row logits the host sampler
