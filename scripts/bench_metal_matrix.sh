@@ -299,7 +299,9 @@ WORKLOADS="sharegpt,rag,sharegpt-multi-turn"
 # LongBench is not among them: its shortest prompts run to 32k tokens, past the grid's 8k
 # (#939), so not one of its tasks fits. `--workloads longbench --scale-grid-input ...,32768`
 # still runs it.
-(( FULL )) && WORKLOADS="sharegpt,rag,sharegpt-multi-turn,shared-prefix,shared-prefix-control"
+# And the coding pair: Polyglot's Python exercises, each answer run against its unit tests in a
+# sandbox (pass@1), and SWE-bench Lite's prompts, unscored.
+(( FULL )) && WORKLOADS="sharegpt,rag,sharegpt-multi-turn,shared-prefix,shared-prefix-control,polyglot,swe-bench"
 WORKLOADS_SCRATCHY="rag-spans"
 # --full: one more RAG cell, for accuracy alone: ACCURACY_TASKS tasks at the largest users count,
 # where a task is 1 point of accuracy rather than a quick cell's 12.5. Its timing is not compared.
@@ -1310,6 +1312,10 @@ run_task_cell() { # prefix workload load
         longbench)             extra=(--dataset-name longbench --output-len 256) ;;
         shared-prefix)         extra=(--dataset-name shared-prefix) ;;
         shared-prefix-control) extra=(--dataset-name shared-prefix --no-reuse) ;;
+        # The tests need only the standard library: the system python3, not the mlx venv, so a Mac
+        # without mlx still scores them.
+        polyglot)              extra=(--dataset-name polyglot --coding-python /usr/bin/python3) ;;
+        swe-bench)             extra=(--dataset-name swe-bench) ;;
         *)                     echo "    unknown workload ${w}, skipped" >&2; return 0 ;;
     esac
     # sharegpt single-turn stays a completions request, timed as every suite times it; the others
