@@ -1838,8 +1838,9 @@ impl IntBinary {
 /// is one row at a time (`sample_fwd.py`'s own grid law), but the batched rung's mint types
 /// the chain at the BAND's height (the flush-band law: every intermediate of a banded chain
 /// mints at the band's height), so a decode rung at `rows > 1` hands this door `[rows, 1]`
-/// `Col` operands against a `[rows, cols]` tile — production's own form, measured by the
-/// multi-row legs below.
+/// `Col` operands against a `[rows, cols]` tile — the form the intmr leg measured WRONG
+/// (see the block below); the door refuses it by name until the emission is fixed and
+/// re-legged.
 ///
 /// ⭐ THE `Mul` HALF OF THE `Col` ADMISSION IS CARD-PROVEN (int-mul-bcast leg,
 /// nickm2, verdict saved `.claude/fb-noise-probe/verdicts/intm-verdict-20261027T0002Z.json`):
@@ -1854,21 +1855,32 @@ impl IntBinary {
 /// measured exactly that broadcast form (the specimen
 /// `int_mul_bcast_probe.py`, case `intmul_bcast`, the runner kit
 /// `.claude/fb-noise-probe/intm-leg.sh`). The `Add` leg measured the operand
-/// mode for the add; this leg measured it for the mul. The admission stands.
+/// mode for the add; this leg measured it for the mul. The admission stands —
+/// at ONE ROW (both legs baked `[1, ·]`); the restaged `[rows, 1]` uniform
+/// multipliers ride the one-row admission on the solo rung and the multi-row
+/// door only after the intmr-named emission defect is fixed and re-legged.
 ///
-/// ⭐ THE MULTI-ROW `Col` ADMISSION — MEASUREMENT IN FLIGHT (front-b-noise, auditor GO
-/// 2026-10-27): the batched decode seat needs it — the granite-3.1-2b decode rerung's
-/// pod build (2026-10-27T01:19Z) refused here, naming this exact form, because a
-/// band-typed rung mints its per-request seed words as `[rows, 1]` against a
-/// `[rows, cols]` tile at `rows > 1`. The intmr leg measures it on nickm2 in two
-/// cells for attribution — `[2, 512]` dense + `[2, 512]` dense (the multi-row dense
-/// control, itself unmeasured) then `[2, 512]` dense + `[2, 1]` `Col` — for `Add`
-/// AND `Mul`, in the production pid-cornered spelling (grid `[B]`, `[1, ·]` blocks,
-/// the per-row loads at `[pid, 0]`). ON PASS this doc becomes the citation; ON FAIL
-/// the admission is deleted and the refusal returns.
+/// ⛔ THE MULTI-ROW `Col` IS MEASURED WRONG AND REFUSED (front-b-noise, intmr leg, nickm2,
+/// 2026-10-27T02:02Z, the verdict banked at `.claude/fb-noise-probe/verdicts/` as
+/// `intmr-verdict.json`): the leg the auditor's GO ordered — `[2, 512]` dense + `[2, 512]`
+/// dense (the control) then `[2, 512]` + `[2, 1]` `Col`, for `Add` AND `Mul`, in the
+/// production pid-cornered spelling (grid `[B]`, `[1, ·]` blocks, per-row loads at
+/// `[pid, 0]`) — came back with the DENSE cells bit-for-bit (0/1024 mismatches, add and
+/// mul) and BOTH `Col` cells wrong (`[2,512]`+`[2,1]` add 512/1024 lanes off, mul 510/1024,
+/// the two coincidental matches the pinned `a = 0`/`a = 1` lanes). The per-stick analysis of
+/// the card bytes pinned the addressing law: the operand's per-row word is selected by the
+/// OUTPUT'S STICK INDEX — output stick `k` (within the row) reads operand row `k mod rows`,
+/// for EVERY output row — `mb` frozen, the out-stick advancing. The one-row legs (intb,
+/// intm) could not see this: `k mod 1` is always 0, so the one-row `Col` admission STANDS.
+/// The defect is the `Col` operand addressing alone (the dense control of the same leg
+/// passed), in the shared [`elementwise_broadcast`] body's `In::col` emission at
+/// `rows > 1`. The batched decode seat needs exactly this form (the band-typed rung's
+/// per-request seed words, `[rows, 1]` against `[rows, cols]`), so wall 9 stays CLOSED
+/// until the emission is fixed and re-legged; the refusal below fail-closes the build on
+/// it, naming this measurement.
 ///
-/// ⛔ NO `Y`, NO `Mb`, NO CORNER, NO PER-ROW FORM — the row-split mode, the row-vector
-/// mode and every corner are refused by name below: none is measured, none is ordered, and
+/// ⛔ NO `Y`, NO `Mb`, NO MULTI-ROW `Col`, NO CORNER, NO PER-ROW FORM — the row-split mode, the
+/// row-vector mode, the multi-row column-vector mode and every corner are refused by name below: none is measured, none is ordered, and
 /// this door states only what a leg has measured. A program wanting one is a producer form
 /// refused BY NAME here, not lowered as the nearest measured thing. Order a specimen and
 /// the refusal opens.
@@ -1934,15 +1946,36 @@ pub fn int_binary(
                  door refuses it by name rather than emit an unproven addressing"
             ));
         }
-        // ⭐ AND `Col` IS ADMITTED AT EVERY ROW COUNT — the multi-row column vector
-        // (`[rows > 1, 1]` against a `[rows > 1, cols]` tile) is the batched decode
-        // seat's own form (the band-typed rung's per-request seed words), measured by
-        // the intmr legs — see the door's own doc for the in-flight citation. The want
-        // loop below still demands a `Col` operand carry the op's FULL row count (one
-        // value per row), so a short operand cannot run off its end.
-        // ⭐ THE PROBE ADMISSION — the SAME broadcast body the fp16/fp32 doors reach, at the
-        // integer's own stick basis, with the INTEGER op_func (the descriptor name that feeds
-        // the bundle fingerprint). See the door's own doc for the measurement in flight.
+        // ⛔ AND `Col` IS ADMITTED AT ONE ROW ONLY — the multi-row column vector
+        // (`[rows > 1, 1]` against a `[rows > 1, cols]` tile) is MEASURED WRONG: the intmr
+        // leg (nickm2, 2026-10-27T02:02Z, `.claude/fb-noise-probe/verdicts/` /
+        // `intmr-verdict.json`) pinned the emitted addressing — the operand's per-row word
+        // is selected by the OUTPUT'S STICK INDEX (stick `k` reads operand row `k mod rows`),
+        // never by the output's row: `mb` frozen, the out-stick advancing. The DENSE control
+        // cells of the same leg passed bit-for-bit ([2,512]+[2,512], add and mul), so the
+        // defect is the `Col` operand addressing alone. The one-row legs (intb, intm) could
+        // not see it: `k mod 1` is always 0. See the door's own doc for the full citation.
+        // The want loop below still demands a `Col` operand carry the op's FULL row count
+        // (one value per row), so a short operand cannot run off its end.
+        if bcast
+            .iter()
+            .zip(ins.iter())
+            .any(|(b, x)| matches!(b, Some(BcastAxis::Col)) && x.v_rows > 1)
+        {
+            return err(format!(
+                "IntBinary({kind:?}) {name}: a multi-row `Col` integer broadcast (a \
+                 `[rows > 1, 1]` operand against a `[rows > 1, cols]` tile) — a card form the \
+                 intmr leg MEASURED WRONG (nickm2, 2026-10-27T02:02Z: the operand's word is \
+                 selected by the output's stick index, not its row — `[2,512]`+`[2,1]` add \
+                 512/1024 lanes off, mul 510/1024, while the `[2,512]`+`[2,512]` dense control \
+                 of the same leg passed bit-for-bit), so this door refuses it by name rather \
+                 than emit the measured-wrong addressing"
+            ));
+        }
+        // ⭐ THE PROBE ADMISSION (ONE ROW ONLY) — the SAME broadcast body the fp16/fp32
+        // doors reach, at the integer's own stick basis, with the INTEGER op_func (the
+        // descriptor name that feeds the bundle fingerprint). The one-row legs measured it
+        // (intb, intm); the multi-row form is refused above, measured wrong by intmr.
         return elementwise_broadcast(
             name,
             &format!("IntBinary({kind:?})"),
@@ -7651,33 +7684,39 @@ mod elementwise_tests {
         );
     }
 
-    /// ⭐ THE MULTI-ROW `Col` IS ADMITTED (auditor GO 2026-10-27; the intmr legs, measurement
-    /// in flight): the batched decode seat's band-typed rung hands this door `[2, 1]` against
-    /// `[2, 512]` — the per-request seed words of a two-row decode rung. It lowers through the
-    /// SAME broadcast body as the one-row form, one op, the same descriptor name. ON FAIL of
-    /// the legs, this admission (and this test) revert to the by-name refusal.
+    /// ⛔ THE MULTI-ROW `Col` IS MEASURED WRONG AND REFUSED (intmr leg, nickm2,
+    /// 2026-10-27T02:02Z): `[2,512]`+`[2,1]` add 512/1024 lanes off, mul 510/1024, while
+    /// the same leg's `[2,512]`+`[2,512]` dense control passed bit-for-bit — the defect is
+    /// the `Col` operand addressing alone (the operand's word selected by the output's
+    /// stick index, `k mod rows`, never by the output's row). The batched decode seat's
+    /// band-typed rung hands this door exactly `[2, 1]` against `[2, 512]` (the
+    /// per-request seed words), so the door fail-closes on it until the emission is fixed
+    /// and re-legged. The one-row `Col` admission stands (intb, intm).
     #[test]
-    fn an_int_multi_row_col_broadcast_lowers_as_one_op() {
+    fn an_int_multi_row_col_is_refused_by_name_measured_wrong() {
         let r = node(
             reg(5, 2, 512, false),
             reg(6, 2, 1, false),
             reg(7, 2, 512, true),
         );
         let mut sym = 0i64;
-        let ops = int_binary(
+        let Err(e) = int_binary(
             "add_s3",
             IntBinary::Add,
             &r,
             &[None, Some(BcastAxis::Col)],
             &mut sym,
             None,
-        )
-        .expect("the two-row Col form is the batched seat's own shape");
-        assert_eq!(ops.len(), 1, "an operand mode is not a decomposition");
-        assert_eq!(
-            ops[0].op_name, "addi32toi32_o7",
-            "the descriptor NAME must not change with the row count — it feeds the bundle \
-             fingerprint, and the broadcast arm is the same op",
+        ) else {
+            panic!(
+                "a multi-row Col integer broadcast was ACCEPTED — the intmr leg measured the \
+                 form WRONG (stick-indexed operand word); the door must refuse it by name"
+            )
+        };
+        assert!(
+            e.message.contains("multi-row") && e.message.contains("MEASURED WRONG"),
+            "names the mode and the measurement that closed it: {}",
+            e.message
         );
     }
 
