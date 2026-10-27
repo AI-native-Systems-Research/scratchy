@@ -640,6 +640,24 @@ pub fn pointwise_broadcast_opspec_from_tile(
         });
     // ⭐ THE DIVISION FOLLOWS THE LAYOUT JUST DECIDED for an ungathered op — the same
     // `stickmajor`, so the operands' rank and the cores' cut are one decision. See `EwDivision`.
+    // ⛔ EXCEPT A MIXED OP (a flat-declared input beside the stick-major output — `mixed`
+    // below): it takes the ROWS-FIRST division. dxp strides a non-stick dim by the product
+    // of the PER-CORE extents after it in the layout order (measured twice on card,
+    // 2026-10-27: under the sticks-first cut — one out-stick per core, both rows in-core —
+    // the flat input's `mb` walked at ONE STICK, wherever it sat in the order, so row 1
+    // read a contiguous run one stick past row 0). The full row width only appears when
+    // `mb` itself is split, so a mixed op's cores cut `mb` first (`distribute_cores`):
+    // each core then owns ONE row × a column band — the flat input's per-core window is
+    // that row's contiguous band (its own read law), and the output's stick fold
+    // (`StickLayout::group_stride` = rows·eps) steps the core's sticks at the scatter's
+    // own stride from its row_blocked corner. W=1 ops are never `stickmajor`, so solo is
+    // untouched.
+    let mixed = stickmajor
+        && inputs.iter().any(|i| {
+            !i.out_broadcast()
+                && !i.mb_broadcast()
+                && matches!(i.declared().kind, crate::sdsc_abstract::StickKind::Flat)
+        });
     let core_local = layout.is_some_and(|l| {
         l.lx_core_local(o_name) || inputs.iter().any(|i| l.lx_core_local(i.name()))
     });
@@ -656,7 +674,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
         CoreDivision::Ew(d) => tile_op
             .tile(
                 MaxCores::<MAX_CORES>,
-                d.resolve(stickmajor, core_local).splitter(),
+                d.resolve(stickmajor && !mixed, core_local).splitter(),
                 "out",
             )
             .map_err(|e| e.0)?,
@@ -723,16 +741,14 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // op's own rank-2 stick-major walk makes the identity a MEMCPY — both sides spell one
     // walk, the producer's row-major bytes land in the OUT unchanged, and the body's
     // stick-major read scrambles every row (W=1 byte-identical, which is how it hid). The
-    // flat spelling is `["mb", "y", "out"]` with `y = 1` BETWEEN the rows and the stick: the
-    // classifier stays Flat (a TRAILING `y = 1` would fold into the rank-2 stick-blocked
-    // law; a LEADING one keeps Flat but seats `mb` right before the stick), and the seating
-    // is the load-bearing half — dxp strides the dim IMMEDIATELY BEFORE the stick dim by
-    // ONE STICK (measured twice on card, 2026-10-27: the OUT's `["mb", "out", ...]` write
-    // walks mb at one stick — the scatter law itself — and a leading-y flat input read mb
-    // at one stick too, so row 1 of the chained embedding read a contiguous run one stick
-    // past row 0). With `y` on the pre-stick seat, `mb`'s stride is the row-major product
-    // `y·out` — the full row width — so the walk stays contiguous row-major, the producer's
-    // own write law, while the output keeps the RowBlocked walk the consumer reads.
+    // flat spelling is `["mb", "y", "out"]` with `y = 1`: any rank-3 order whose stick is
+    // not at index 1 keeps `for_view_df`'s classifier at Flat (a TRAILING `y = 1` folds
+    // into the rank-2 stick-blocked law), so the walk stays contiguous row-major — the
+    // producer's own write law — while the output keeps the RowBlocked walk the consumer
+    // reads. The WALK ITSELF is carried by the DIVISION, not the spelling (see `mixed` at
+    // the resolution above): dxp strides a non-stick dim by the per-core extents after it,
+    // so the row width only appears once `mb` is split — the rows-first cut a mixed op
+    // takes.
     //
     // ⛔ AND THE WHOLE OP SPELLS ONE RANK (the `mixed` flag): dxp derives per-op structure
     // from the args' rank — a rank-3 operand beside a rank-2 one is the mixed-rank op the
@@ -746,12 +762,6 @@ pub fn pointwise_broadcast_opspec_from_tile(
     // keep the rank-2 form unchanged. The row-split (`ymajor`) mode never coincides with
     // `stickmajor` (its `cols` is one stick), so its head-outermost spelling and the flat
     // input's `["mb", "y", "out"]` never meet in one op.
-    let mixed = stickmajor
-        && inputs.iter().any(|i| {
-            !i.out_broadcast()
-                && !i.mb_broadcast()
-                && matches!(i.declared().kind, crate::sdsc_abstract::StickKind::Flat)
-        });
     let mk = |is_input: bool,
               name: &str,
               scale: [Scale; 3],
@@ -777,9 +787,9 @@ pub fn pointwise_broadcast_opspec_from_tile(
                 ))
             } else if stickmajor && flat {
                 // The flat-declared input's OWN walk, in a stick-major op: rank-3
-                // `["mb", "y", "out"]` with `y` a unit dim SEATED BEFORE the stick, so the
-                // classifier stays Flat and `mb` strides the full row width (see the
-                // comment above — the pre-stick seat is the one dxp strides by a stick).
+                // `["mb", "y", "out"]` with `y` a unit dim, so the classifier stays
+                // Flat and the walk is contiguous row-major (the division above is
+                // what carries the row width — see the comment above).
                 Ok(AnyTensorArg::R3(
                     TensorArg::<3>::new(
                         is_input,
