@@ -210,7 +210,8 @@ pub(crate) fn run_prefill_batch(
     // mirrored in some aspects and not others.
     // The LIVE rows by slot, kept past the widening below — the seat's laws are indexed by LAUNCH
     // slot, and only the live batch says which slot is a request's own (a padding slot's law is
-    // greedy: its pick is never read, and its forward is live 0's by the replica law).
+    // LIVE 0'S OWN — [`pad_law_of`], the pad clamp: its pick is never read, and its forward is
+    // live 0's by the replica law).
     let live_batch = per_request.as_ref().map(|(rows, _)| *rows);
     let per_request: Option<(
         scratchy_subtile::sdsc_abstract::LaunchRows<'_>,
@@ -594,32 +595,9 @@ pub(crate) fn run_prefill_batch(
                 .collect(),
             // A DECODE BATCH: live slot `s` runs its own request's draw at its
             // own rotary position (`rope_pos` IS that request's token count);
-            // a padding slot runs greedy — its pick is never read, and greedy
-            // over live 0's replicated forward is always a real token, never
-            // the sentinel.
+            // a padding slot runs LIVE 0'S LAW — [`pad_law_of`], the pad clamp.
             (SeatLaws::Batch { draws }, Some(live)) => {
-                if draws.len() != live.live() {
-                    return Err(werr(format!(
-                        "run_prefill_batch: {} seat law(s) for {} live row(s) — one law per \
-                         live request, in slot order",
-                        draws.len(),
-                        live.live()
-                    )));
-                }
-                let mut next_live = 0usize;
-                (0..seat_rows)
-                    .map(|s| match live.row(s) {
-                        Some(b) => {
-                            let law = RowLaw {
-                                draw: draws[next_live],
-                                step: b.rope_pos.get(),
-                            };
-                            next_live += 1;
-                            law
-                        }
-                        None => RowLaw { draw: None, step: 0 },
-                    })
-                    .collect()
+                batch_seat_laws(draws, live, seat_rows)?
             }
             (SeatLaws::Batch { .. }, None) => {
                 return Err(werr(
@@ -1162,6 +1140,70 @@ pub(crate) struct RowLaw<'a> {
     pub(crate) step: u32,
 }
 
+/// ⭐⭐⭐ A PAD SLOT'S LAW IS LIVE 0'S OWN (the pad clamp, auditor ruling
+/// 2026-10-27). A decode pad row's whole forward is live 0's — the replica
+/// law: it borrows live 0's token, rotation, page map and prefix history, so
+/// its LOGITS ROW is live 0's byte for byte — and the draw is a deterministic
+/// function of (logits row, seed words) alone, the hash key being
+/// request-owned with no row term. So the pad row's pick equals live 0's pick
+/// exactly when its staged seat words are live 0's, and they must be: the
+/// pad's [`crate::ktir_node::Program::ChainStage`] decompose feeds its s/l
+/// stick, whose next-step embed row writes into LIVE 0'S POOL CELL (the
+/// racing write — the pad's cachewr and live 0's land on the same physical
+/// bytes), so only live 0's decompose keeps that write identical. The greedy
+/// case falls out whole: a greedy live 0 stages the gate's 0, and the pad
+/// draws greedy over live 0's replicated logits exactly as before — ONE
+/// mechanism for greedy and sampled, no kernel change, no emission movement.
+/// Called by every staging walk that lays pad rows (the decode batch's and
+/// the solo rung's), never spelled twice.
+#[cfg(feature = "spyre-hw")]
+fn pad_law_of(live0: &RowLaw<'_>) -> RowLaw<'_> {
+    RowLaw {
+        draw: live0.draw,
+        step: live0.step,
+    }
+}
+
+/// ⭐ THE DECODE BATCH'S OWN LAW WALK — one law per baked row of the seat:
+/// live slot `s` runs its request's draw at that request's own rotary
+/// position, and a padding slot runs live 0's ([`pad_law_of`]). Extracted
+/// from the staging arm so the pad clamp is pinnable without a launch.
+#[cfg(feature = "spyre-hw")]
+fn batch_seat_laws<'a>(
+    draws: &[Option<&'a SampledDraw>],
+    live: &scratchy_subtile::sdsc_abstract::LaunchRows<'_>,
+    seat_rows: usize,
+) -> ExecutorResult<Vec<RowLaw<'a>>> {
+    if draws.len() != live.live() {
+        return Err(werr(format!(
+            "run_prefill_batch: {} seat law(s) for {} live row(s) — one law per live request, \
+             in slot order",
+            draws.len(),
+            live.live()
+        )));
+    }
+    let mut next_live = 0usize;
+    let mut laws: Vec<RowLaw<'_>> = Vec::with_capacity(seat_rows);
+    for s in 0..seat_rows {
+        match live.row(s) {
+            Some(b) => {
+                laws.push(RowLaw {
+                    draw: draws[next_live],
+                    step: b.rope_pos.get(),
+                });
+                next_live += 1;
+            }
+            None => laws.push(match laws.first() {
+                Some(live0) => pad_law_of(live0),
+                // A launch with no live row at all: nothing replicates, and
+                // the greedy law stands.
+                None => RowLaw { draw: None, step: 0 },
+            }),
+        }
+    }
+    Ok(laws)
+}
+
 /// ⭐ THE SEAT LAWS ONE LAUNCH RUNS ITS ROWS UNDER — the two shapes a caller
 /// can know them in, and ONLY those two: a prompt-final chunk serves ONE
 /// request whose rows are consecutive positions of one sequence, and a decode
@@ -1180,10 +1222,11 @@ pub(crate) enum SeatLaws<'a> {
         draw: Option<&'a SampledDraw>,
     },
     /// A decode batch: one law per LIVE row, in slot order — that row's
-    /// request's draw at that request's own position. Padding slots run greedy:
-    /// their picks are never read (the caller maps live slots only), and the
-    /// greedy pick of live 0's replicated forward is always a real token, never
-    /// the sentinel.
+    /// request's draw at that request's own position. A padding slot runs
+    /// LIVE 0'S LAW ([`pad_law_of`], the pad clamp): its pick is never read,
+    /// but its ChainStage decompose feeds the s/l stick whose embed row races
+    /// live 0's pool cell, so it must draw live 0's pick — greedy when live 0
+    /// is greedy, live 0's own draw when it is sampled.
     Batch {
         draws: &'a [Option<&'a SampledDraw>],
     },
@@ -2378,8 +2421,12 @@ pub(crate) fn superdsc_forward_chunk(
             draw: req.draw.as_ref(),
             step: p as u32,
         });
+        // The rung's further baked rows are PADDING this single-request session
+        // never lays — LIVE 0'S LAW, the pad clamp ([`pad_law_of`]): their
+        // forward is row 0's by the replica law, so their seat words and their
+        // ChainStage decompose must be row 0's too.
         for _ in 1..seat.rows as usize {
-            solo_laws.push(RowLaw { draw: None, step: 0 });
+            solo_laws.push(pad_law_of(&solo_laws[0]));
         }
         acts_i32.extend(sample_binds(seat, &solo_laws)?);
         {
@@ -3113,4 +3160,125 @@ pub(crate) fn run_request_step(
     };
     tokens.push_generated(id, tok);
     Ok(Some(tok))
+}
+
+/// ⭐ THE PAD CLAMP'S OWN PIN (auditor ruling 2026-10-27): a pad row's staged
+/// seat words are LIVE 0'S — for a greedy live 0 and a sampled one — because
+/// the pad's ChainStage decompose feeds the s/l stick whose embed row races
+/// live 0's pool cell, and only live 0's law keeps those bytes identical.
+#[cfg(all(test, feature = "spyre-hw"))]
+mod pad_clamp_tests {
+    use super::*;
+
+    /// A seat at `rows` baked rows whose strides agree with the placement's own
+    /// derivations (the staging's own refusal contract), so `sample_binds`
+    /// stages for real.
+    fn seat_of(rows: u32) -> scratchy_target_spyre::wiring::SampleSeat {
+        scratchy_target_spyre::wiring::SampleSeat {
+            seed_words: [901, 902, 903, 904],
+            invt: 905,
+            rows,
+            row: 0,
+            vocab: 100,
+            pad_vocab: 128,
+            seed_row_words: (scratchy_target_spyre::wiring::col_row_stride_bytes(
+                scratchy_tensors::DType::I32,
+            ) / 4) as u32,
+            gate_row_words: (scratchy_target_spyre::wiring::gate_row_stride_bytes() / 4) as u32,
+        }
+    }
+
+    /// Two live rows in a 4-row rung — slots 2 and 3 are padding — with the
+    /// launch rows handed to `f` while the batch they borrow is alive.
+    fn with_two_of_four<R>(f: impl FnOnce(&scratchy_subtile::sdsc_abstract::LaunchRows<'_>) -> R) -> R {
+        use scratchy_subtile::sdsc_abstract::{
+            BatchRow, KvHistory, RungWidth, SeedSource, SeqPos, SlotMap,
+        };
+        let width = RungWidth::of_baked_rows(4).expect("a 4-row rung");
+        let hists: Vec<_> = (0..2).map(|i| KvHistory::contiguous(8 + i)).collect();
+        let live = SlotMap::of_live(2, width)
+            .expect("2 live rows fit")
+            .live_rows(|i| {
+                Ok::<_, ()>(BatchRow {
+                    rope_pos: SeqPos::new(10 + i as u32),
+                    hist: hists[i].clone(),
+                })
+            })
+            .expect("the builder never fails here")
+            .launch_rows(SeedSource::OnCard, width)
+            .expect("the batch lays into its rung");
+        f(&live)
+    }
+
+    /// Every staged bind's pad-row words equal row 0's — the four seed tables
+    /// (the gate at its own β-reservation stride) and inv_t alike.
+    fn assert_pads_stage_live_0(
+        seat: &scratchy_target_spyre::wiring::SampleSeat,
+        laws: &[RowLaw<'_>],
+        ctx: &str,
+    ) {
+        let binds = sample_binds(seat, laws).expect("the seat stages");
+        let seed_stride =
+            scratchy_target_spyre::wiring::col_row_stride_bytes(scratchy_tensors::DType::I32);
+        let gate_stride = scratchy_target_spyre::wiring::gate_row_stride_bytes();
+        assert_eq!(binds.len(), 5, "{ctx}: four seed tables and inv_t");
+        for (tid, bytes) in &binds {
+            let stride = if *tid
+                == scratchy_target_spyre::bundle_code::PlaceId::Act(seat.seed_words[3])
+            {
+                gate_stride
+            } else {
+                seed_stride
+            };
+            for r in [2usize, 3] {
+                assert_eq!(
+                    &bytes[r * stride..r * stride + 4],
+                    &bytes[0..4],
+                    "{ctx}: bind t{tid:?} row {r} (a padding slot) staged words row 0's own \
+                     are not — the pad clamp broke",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_greedy_live_0_clamps_its_pads_to_greedy() {
+        let seat = seat_of(4);
+        let draws: [Option<&SampledDraw>; 2] = [None, None];
+        let laws = with_two_of_four(|live| batch_seat_laws(&draws, live, 4))
+            .expect("the greedy laws lay");
+        // The law itself: pads 2 and 3 carry live 0's law — greedy, at live
+        // 0's own step salt (the word the gate's 0 makes inert).
+        assert!(laws[2].draw.is_none() && laws[3].draw.is_none());
+        assert_eq!(laws[2].step, laws[0].step, "the pad clamps live 0's step");
+        assert_eq!(laws[3].step, laws[0].step, "every pad clamps live 0's step");
+        assert_pads_stage_live_0(&seat, &laws, "greedy live 0");
+    }
+
+    #[test]
+    fn a_sampled_live_0_clamps_its_pads_to_its_draw() {
+        let seat = seat_of(4);
+        let draw = SampledDraw {
+            seed: 0x0123_4567_89AB_CDEF,
+            inv_t: 0.5,
+        };
+        // Live 0 sampled, live 1 greedy: the pads clamp LIVE 0'S law, not the
+        // last live row's and not the greedy one.
+        let draws: [Option<&SampledDraw>; 2] = [Some(&draw), None];
+        let laws = with_two_of_four(|live| batch_seat_laws(&draws, live, 4))
+            .expect("the sampled laws lay");
+        for r in [2usize, 3] {
+            let pad = laws[r].draw.expect("the pad clamps live 0's draw, not greedy");
+            assert_eq!(pad.seed, draw.seed, "pad {r}: live 0's seed");
+            assert_eq!(
+                pad.inv_t.to_bits(),
+                draw.inv_t.to_bits(),
+                "pad {r}: live 0's inv_t"
+            );
+            assert_eq!(laws[r].step, laws[0].step, "pad {r}: live 0's step salt");
+        }
+        // Live 1 keeps its OWN greedy law — the clamp touches pads alone.
+        assert!(laws[1].draw.is_none());
+        assert_pads_stage_live_0(&seat, &laws, "sampled live 0");
+    }
 }
