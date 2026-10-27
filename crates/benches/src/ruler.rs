@@ -6,6 +6,7 @@
 //! Tests long-context retrieval and reasoning. Runs both plain (chat) and span
 //! (SPNL query) modes, comparing accuracy and latency.
 
+use crate::scoring::token_len;
 use std::io::Write;
 use std::time::Instant;
 
@@ -71,13 +72,6 @@ fn fetch_pg_essays() -> Result<String> {
 // ---------------------------------------------------------------------------
 // Tokenizer helpers
 // ---------------------------------------------------------------------------
-
-fn token_len(text: &str, tokenizer: &Tokenizer) -> usize {
-    tokenizer
-        .encode(text, false)
-        .map(|ids| ids.len())
-        .unwrap_or(0)
-}
 
 fn encode_and_trim(text: &str, max_tokens: usize, tokenizer: &Tokenizer) -> Result<String> {
     let ids = tokenizer

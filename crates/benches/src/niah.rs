@@ -14,6 +14,7 @@
 //! 3. **Spans** — `llm.execute_query()` with `cross` + `plus` wrapping each
 //!    chunk as a relocatable block. Cache populated once, then reused.
 
+use crate::scoring::token_len;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
@@ -83,13 +84,6 @@ fn fetch_pg_essays() -> Result<String> {
 // ---------------------------------------------------------------------------
 // Tokenizer helpers
 // ---------------------------------------------------------------------------
-
-fn token_len(text: &str, tokenizer: &Tokenizer) -> usize {
-    tokenizer
-        .encode(text, false)
-        .map(|ids| ids.len())
-        .unwrap_or(0)
-}
 
 fn encode_and_trim(text: &str, max_tokens: usize, tokenizer: &Tokenizer) -> Result<String> {
     let ids = tokenizer

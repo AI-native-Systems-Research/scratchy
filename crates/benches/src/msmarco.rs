@@ -15,6 +15,7 @@
 //! 2. **Spans** — `llm.execute_query()` with `cross` + `plus`, passages as
 //!    relocatable blocks.
 
+use crate::scoring::token_len;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -22,7 +23,7 @@ use std::time::Instant;
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use scratchy_core_config::{CudaGraphConfig, CudaGraphMode};
-use scratchy_serving_api::llm::{ChatMessage, LLM, LLMBuilder, SamplingParams};
+use scratchy_serving_api::llm::{LLM, LLMBuilder, SamplingParams};
 use scratchy_serving_api::tokenizer::Tokenizer;
 
 use crate::args::BenchMsmarcoArgs;
@@ -80,6 +81,18 @@ fn fetch_dataset(num_queries: usize) -> Result<Dataset> {
     };
 
     Ok(build_dataset(&raw, num_queries))
+}
+
+/// A query as a dataset task ([`crate::workloads`]): its passages by URL, every accepted answer.
+fn task(q: &Query, max_tokens: usize) -> crate::workloads::Task {
+    crate::workloads::rag_task(
+        &crate::workloads::PASSAGES,
+        &q.passages,
+        &q.question,
+        &q.answers,
+        crate::workloads::Rule::AnyAnswer,
+        max_tokens,
+    )
 }
 
 /// Build queries and corpus stats from the dataset's JSON rows, keeping only
@@ -166,13 +179,6 @@ fn build_dataset(raw: &[serde_json::Value], num_queries: usize) -> Dataset {
 // Tokenizer helpers
 // ---------------------------------------------------------------------------
 
-fn token_len(text: &str, tokenizer: &Tokenizer) -> usize {
-    tokenizer
-        .encode(text, false)
-        .map(|ids| ids.len())
-        .unwrap_or(0)
-}
-
 // ---------------------------------------------------------------------------
 // Evaluation
 // ---------------------------------------------------------------------------
@@ -185,56 +191,17 @@ fn evaluate(response: &str, answers: &[String], debug: bool) -> f64 {
         eprintln!("  answers: {:?}", answers);
         eprintln!("  response: {response}");
     }
-
-    let resp_lower = response.to_lowercase();
-
-    for ans in answers {
-        let ans_lower = ans.to_lowercase();
-
-        if resp_lower.contains(&ans_lower) {
-            return 1.0;
-        }
-
-        let f1 = compute_token_f1(&ans_lower, &resp_lower);
-        if f1 >= 0.5 {
-            return 1.0;
-        }
+    let all: Vec<&str> = answers.iter().map(String::as_str).collect();
+    if crate::scoring::any_contains_or_f1(response, &all) {
+        1.0
+    } else {
+        0.0
     }
-
-    0.0
-}
-
-fn normalize_tokens(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
-}
-
-fn compute_token_f1(expected: &str, actual: &str) -> f64 {
-    let et = normalize_tokens(expected);
-    let at = normalize_tokens(actual);
-    if et.is_empty() && at.is_empty() {
-        return 1.0;
-    }
-    if et.is_empty() || at.is_empty() {
-        return 0.0;
-    }
-    let common: usize = et.iter().filter(|t| at.contains(t)).count();
-    if common == 0 {
-        return 0.0;
-    }
-    let p = common as f64 / at.len() as f64;
-    let r = common as f64 / et.len() as f64;
-    2.0 * p * r / (p + r)
 }
 
 /// Compute best token F1 across all acceptable answers.
 fn token_f1(answers: &[String], actual: &str) -> f64 {
-    answers
-        .iter()
-        .map(|ans| compute_token_f1(&ans.to_lowercase(), &actual.to_lowercase()))
-        .fold(0.0_f64, f64::max)
+    crate::scoring::best_token_f1(answers, actual)
 }
 
 // ---------------------------------------------------------------------------
@@ -414,8 +381,6 @@ pub(crate) fn run_bench_msmarco(args: BenchMsmarcoArgs) -> Result<()> {
         ..SamplingParams::default()
     };
 
-    let system_prompt = "You are a helpful assistant. Answer the question based only on the provided passages. Be concise — answer with just the entity, date, number, or fact requested.";
-
     let plain_style = ProgressStyle::default_bar()
         .template("  plain {bar:40.yellow/yellow} {pos:>4}/{len} {msg}")
         .unwrap();
@@ -435,11 +400,7 @@ pub(crate) fn run_bench_msmarco(args: BenchMsmarcoArgs) -> Result<()> {
         let debug = args.debug && i == 0;
         llm.reset_prefix_cache()?;
 
-        let mut msgs = vec![ChatMessage::system(system_prompt)];
-        for (j, (url, text)) in query.passages.iter().enumerate() {
-            msgs.push(ChatMessage::user(format!("Passage {j} ({url}): {text}")));
-        }
-        msgs.push(ChatMessage::user(&query.question));
+        let msgs = task(query, args.max_tokens).chat_messages();
 
         let start = Instant::now();
         let result = llm.chat(&msgs, Some(sampling.clone()))?;
@@ -484,15 +445,6 @@ pub(crate) fn run_bench_msmarco(args: BenchMsmarcoArgs) -> Result<()> {
     for (i, query) in dataset.queries.iter().enumerate() {
         let debug = args.debug && i == 0;
 
-        let passage_json: Vec<serde_json::Value> = query
-            .passages
-            .iter()
-            .enumerate()
-            .map(|(j, (url, text))| {
-                serde_json::json!({ "user": format!("Passage {j} ({url}): {text}") })
-            })
-            .collect();
-
         // Track cache hit stats by passage text content.
         for (_, text) in &query.passages {
             total_passage_refs += 1;
@@ -503,20 +455,9 @@ pub(crate) fn run_bench_msmarco(args: BenchMsmarcoArgs) -> Result<()> {
             }
         }
 
-        let span_query = serde_json::json!({
-            "g": {
-                "model": model_name,
-                "max_tokens": args.max_tokens,
-                "temperature": 0.0,
-                "input": {
-                    "cross": [
-                        { "system": system_prompt },
-                        { "plus": passage_json },
-                        { "user": &query.question }
-                    ]
-                }
-            }
-        });
+        let span_query = task(query, args.max_tokens)
+            .span_query(&model_name, args.max_tokens, 0.0)
+            .expect("a multi-document task has its span query");
 
         let start = Instant::now();
         let results = llm.execute_query(
@@ -605,6 +546,7 @@ pub(crate) fn run_bench_msmarco(args: BenchMsmarcoArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scoring::normalize_tokens;
     use arrow::datatypes::{DataType, Field, Fields, Schema};
     use serde_json::json;
 

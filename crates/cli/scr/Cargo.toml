@@ -48,6 +48,9 @@ claude = ["serve"]
 
 otel = ["scratchy-serving-api?/otel"]
 bench = ["scratchy-bench"]
+# The bench dataset loaders that read parquet (2WikiMQA, HotpotQA, MS MARCO), for `scr bench
+# serve --dataset-name rag --rag-source two-wiki|hotpotqa`.
+bench-datasets = ["bench", "scratchy-bench/datasets"]
 cuda = ["scratchy-serving-api/cuda", "scratchy-bench?/cuda", "dep:scratchy-forward-compiler", "scratchy-forward-compiler/cuda", "dep:scratchy-target-cuda"]
 nccl = ["cuda", "scratchy-target-cuda/nccl", "scratchy-serving-api/nccl"]
 profiling = ["cuda"]

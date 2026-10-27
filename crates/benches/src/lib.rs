@@ -23,18 +23,20 @@ mod niah;
 mod parquet_records;
 mod ragcsv;
 mod ruler;
+pub(crate) mod scoring;
 mod serve;
 mod spans;
 mod startup;
 mod startup_exec;
 mod sweep;
 mod throughput;
+pub(crate) mod workloads;
 
 pub use args::{
     BenchCommand, BenchCommands, BenchHotpotqaArgs, BenchLatencyArgs, BenchLongbenchArgs,
     BenchMsmarcoArgs, BenchMultihopArgs, BenchMusiqueArgs, BenchNiahArgs, BenchRagcsvArgs,
     BenchRulerArgs, BenchServeArgs, BenchSpansArgs, BenchStartupArgs, BenchThroughputArgs,
-    SweepCommand, SweepCommands, SweepServeArgs, SweepStartupArgs,
+    RagSource, SweepCommand, SweepCommands, SweepServeArgs, SweepStartupArgs,
 };
 
 /// UTC `YYYYMMDD<sep>HHMMSS` tag for auto-generated result filenames.
