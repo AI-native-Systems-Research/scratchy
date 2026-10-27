@@ -131,10 +131,10 @@ MODELS_ALL=(
 LARGE_GB=64
 CLASSES=(
   # class | small | large
-  "sliding window|gpt-oss-20b|gpt-oss-120b-3bit"
+  "Sliding window|gpt-oss-20b|gpt-oss-120b-3bit"
   "Mamba-2|nemotron-3-nano-30b-a3b|nemotron-3-super-120b-a12b"
   "Gated DeltaNet|qwen3.6-35b-a3b|qwen3.5-122b-a10b"
-  "dense|granite-4.2-3b|granite-4.2-30b"
+  "Dense|granite-4.2-3b|granite-4.2-30b"
 )
 MODELS_SMALL="$(for c in "${CLASSES[@]}"; do IFS='|' read -r _ s _ <<<"${c}"; echo "${s}"; done | paste -sd, -)"
 MODELS_LARGE="$(for c in "${CLASSES[@]}"; do IFS='|' read -r _ _ l <<<"${c}"; echo "${l}"; done | paste -sd, -)"
