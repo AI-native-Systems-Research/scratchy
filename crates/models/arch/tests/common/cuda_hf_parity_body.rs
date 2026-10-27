@@ -28,7 +28,7 @@ use scratchy_target_cuda::runtime::{
 use scratchy_target_cuda::step::{MoeRouteBf16, gdn_bundle};
 use scratchy_target_cuda::weights::{CudaWeight, open_checkpoint};
 
-// The goldens' routing dump and P9's rule, for P1's and P3's route-explained rows (#933).
+// The goldens' routing dump and P9's rule, for the route-explained rows P1 and P3 print (#933).
 include!("cuda_route_rule.rs");
 
 /// The smallest bucket; every prompt and greedy sequence fits it.
@@ -317,7 +317,7 @@ struct RowRoute {
 }
 
 impl RowRoute {
-    /// Route-explained (the user's decision 2026-10-27, P1 and P3): CUDA's pick differs from
+    /// Route-explained (printed only, never gated): CUDA's pick differs from
     /// HF-f32's at one or more layers, and P9's rule accepts every one of those differences.
     fn explained(&self) -> bool {
         !self.differs.is_empty() && self.accepted
@@ -369,7 +369,7 @@ fn row_routes(cuda: &[Vec<BTreeSet<i32>>], route: &Route) -> Vec<RowRoute> {
     rows
 }
 
-/// Per prompt, every row under P9's rule (the user's decision 2026-10-27, P1 and P3): CUDA's
+/// Per prompt, every row under P9's rule (printed by P1 and P3, never gated): CUDA's
 /// picks at each MoE layer from one fresh forward of the cut tape, against the prompt's routing
 /// dump `route_<p>.bin`. Empty for a dense model, which routes nothing, so the rule changes
 /// nothing there.
@@ -837,13 +837,15 @@ fn p1_to_p4_one_forward_per_prompt() {
     for ((p, got), route) in prompts().iter().zip(&cuda).zip(&routes) {
         let n = p.ids.len();
         // A route-explained row: its CUDA picks differ from HF-f32's at some layer, and P9's rule
-        // accepts every such difference (the user's decision 2026-10-27). Empty for a dense model.
+        // accepts every such difference. Printed only, never gated (#933's diagnosis; the
+        // excusal 712dd08e made of it excused nearly every row and was backed out). Empty for a
+        // dense model.
         let explained = |row: usize| route.get(row).is_some_and(RowRoute::explained);
         let excused: Vec<usize> = (0..n).filter(|&row| explained(row)).collect();
         if !route.is_empty() {
             eprintln!(
                 "P1/P3 prompt {}: {} of {n} rows route-explained (picks differ from HF-f32's \
-                 only where P9 accepts it; the user's decision 2026-10-27) {:?}",
+                 only where P9 accepts it) {:?} (information only, not gated)",
                 p.p,
                 excused.len(),
                 excused
@@ -857,27 +859,17 @@ fn p1_to_p4_one_forward_per_prompt() {
             );
             eprintln!(
                 "P1/P3 prompt {} row {row}: route-explained, cosine(CUDA, f32)={:.6} \
-                 cosine(HF-bf16, f32)={:.6}, picks differ at layers {:?} (excused from P1's min \
-                 and P3)",
+                 cosine(HF-bf16, f32)={:.6}, picks differ at layers {:?} (information only: P1 and \
+                 P3 gate it)",
                 p.p,
                 cosine(c, f),
                 cosine(b, f),
                 route[row].differs
             );
         }
-        // P1, over the rows that are not route-explained (all of a dense model's).
-        if !route.is_empty() {
-            eprintln!(
-                "P1 prompt {}: min cosine over the {} rows not route-explained, {} excused (the \
-                 user's decision 2026-10-27)",
-                p.p,
-                n - excused.len(),
-                excused.len()
-            );
-        }
-        let min_cos = (rows(got).zip(rows(&p.f32)).enumerate())
-            .filter(|&(row, _)| !explained(row))
-            .map(|(_, (a, b))| cosine(a, b))
+        // P1.
+        let min_cos = (rows(got).zip(rows(&p.f32)))
+            .map(|(a, b)| cosine(a, b))
             .fold(f64::INFINITY, f64::min);
         let noise_cos = (rows(&p.bf16).zip(rows(&p.f32)))
             .map(|(a, b)| cosine(a, b))
@@ -928,8 +920,8 @@ fn p1_to_p4_one_forward_per_prompt() {
         // `ties`: the rows whose f32 margin is at most twice their noise, counted whether or not
         // CUDA agrees; `near`: those of them CUDA disagrees on.
         let (mut ties, mut near, mut wrong, mut last_ok) = (Vec::new(), 0usize, Vec::new(), true);
-        // Top-1 disagreements outside near-ties on route-explained rows: accepted (the user's
-        // decision 2026-10-27), printed.
+        // Top-1 disagreements outside near-ties on route-explained rows: printed only; each is
+        // also in `wrong`, which gates.
         let mut routed = Vec::new();
         for (row, ((c, f), b)) in rows(got).zip(rows(&p.f32)).zip(rows(&p.bf16)).enumerate() {
             let top = top_k(f, 2);
@@ -945,13 +937,14 @@ fn p1_to_p4_one_forward_per_prompt() {
             if !same && tie {
                 near += 1;
             }
-            if !same && !tie && explained(row) {
-                routed.push(row);
-            } else if !same && !tie {
+            if !same && !tie {
+                if explained(row) {
+                    routed.push(row);
+                }
                 wrong.push(row);
             }
             if row == n - 1 && !same {
-                last_ok = tie || explained(row);
+                last_ok = tie;
                 eprintln!(
                     "P3 prompt {}: last row disagrees, f32 margin {margin:.4e} vs 2x noise \
                      {:.4e}: {}",
@@ -968,8 +961,8 @@ fn p1_to_p4_one_forward_per_prompt() {
         let ok3 = wrong.is_empty() && last_ok;
         if !route.is_empty() {
             eprintln!(
-                "P3 prompt {}: top-1 disagreements outside near-ties accepted as route-explained \
-                 (the user's decision 2026-10-27)={} {:?}",
+                "P3 prompt {}: of the top-1 disagreements outside near-ties, route-explained={} \
+                 {:?} (information only, not gated)",
                 p.p,
                 routed.len(),
                 routed
@@ -1025,10 +1018,9 @@ fn p1_to_p4_one_forward_per_prompt() {
     );
     if routes.iter().any(|r| !r.is_empty()) {
         eprintln!(
-            "P1/P3 route-explained rows: a row whose CUDA picks differ from HF-f32's at one or \
-             more layers, every difference accepted by P9's rule, is left out of P1's min and \
-             its top-1 disagreement outside a near-tie is accepted by P3 (the user's decision \
-             2026-10-27); a row with any difference P9 does not accept stays fully gated"
+            "P1/P3 route-explained rows (a row whose CUDA picks differ from HF-f32's at one or \
+             more layers, every difference accepted by P9's rule) are printed only: P1 and P3 \
+             gate every row"
         );
     }
     assert!(p1 && p2 && p3 && p4, "P1 {p1} P2 {p2} P3 {p3} P4 {p4}");
