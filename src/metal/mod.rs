@@ -2038,7 +2038,7 @@ impl Lineup<'_> {
 }
 
 /// The overview's [`Lineup`]: the classes and cut-off of the newest run that records a lineup, and
-/// the grid of the newest such run that has one, so a `--no-scaling` run (no grid) after it does
+/// every users count and prompt any of those runs measured, so a `--no-scaling` run (no grid) does
 /// not empty every map. None before any run records a lineup.
 fn lineup<'a>(machines: &BTreeMap<&str, MachineRuns<'a>>) -> Option<Lineup<'a>> {
     let mut with_lineup: Vec<&Run> = (machines.values())
@@ -2047,18 +2047,21 @@ fn lineup<'a>(machines: &BTreeMap<&str, MachineRuns<'a>>) -> Option<Lineup<'a>> 
         .collect();
     with_lineup.sort_by(|a, b| b.generated_utc.cmp(&a.generated_utc));
     let newest = with_lineup.first()?;
-    let grid = (with_lineup.iter())
-        .find_map(|r| {
-            let sc = r.config.scaling.as_ref()?;
-            Some((sc.grid_conc.clone()?, sc.grid_input.clone()?))
-        })
-        .unwrap_or_default();
+    // Every run's users counts and prompts: a Mac below `large_from_gb` runs fewer users than one
+    // above it, and neither's rows may drop off the other's map.
+    let (mut users, mut prompts) = (BTreeSet::new(), BTreeSet::new());
+    for sc in with_lineup.iter().filter_map(|r| r.config.scaling.as_ref()) {
+        if let (Some(c), Some(i)) = (&sc.grid_conc, &sc.grid_input) {
+            users.extend(c.iter().copied());
+            prompts.extend(i.iter().copied());
+        }
+    }
     Some(Lineup {
         classes: newest.config.classes.as_deref()?,
         // Runs from before `large_from_gb` split the sets at 64 GB.
         large_from_gb: newest.config.large_from_gb.unwrap_or(64),
-        users: grid.0,
-        prompts: grid.1,
+        users: users.into_iter().collect(),
+        prompts: prompts.into_iter().collect(),
     })
 }
 
@@ -3114,6 +3117,8 @@ mod tests {
         let mut base = read("apple-m3-pro-2026-10-21T145041Z-a7820fbc.json");
         base["machine"]["chip"] = "Apple M5".into();
         base["machine"]["memory_gb"] = 32.into();
+        // Below 64 GB the grid runs 1, 2 and 4 users; the 36 GB M3 Pro's run is from before that.
+        base["config"]["scaling"]["grid_conc"] = serde_json::json!([1, 2, 4]);
         let runs: Vec<Run> = [
             base,
             read("apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"),
@@ -3128,9 +3133,10 @@ mod tests {
             super::in_order(&machines),
             ["Apple M5", "Apple M3 Pro", "Apple M4 Max", "Apple M5 Max"]
         );
-        // The overview's columns are the full run's recorded lineup, each Mac on its set.
+        // The overview's columns are the full run's recorded lineup, each Mac on its set, and its
+        // rows every users count any Mac ran.
         let lineup = super::lineup(&machines).expect("the M3 Pro's run records its lineup");
-        assert_eq!(lineup.users, [1, 4, 8, 16]);
+        assert_eq!(lineup.users, [1, 2, 4, 8, 16]);
         assert_eq!(lineup.prompts, [128, 1024, 4096, 32768]);
         let dense = lineup.classes.iter().find(|c| c.class == "dense").unwrap();
         assert_eq!(dense.model(32, lineup.large_from_gb), "granite-4.2-8b");
