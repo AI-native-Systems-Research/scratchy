@@ -218,6 +218,71 @@ pub(crate) fn solo_step_is_decode(
 ///     query rows of ONE `predict_perrow` (sub-batched at mq when B>mq) — the CB
 ///     win. Each row attends only its own request's blocks (PROVEN: per-row
 ///     block_table honored; rows don't cross-contaminate).
+#[cfg(feature = "spyre-hw")]
+impl SpyreWorker {
+    /// ⭐ #32 (c4) — THE DRAIN'S ONE POP: collect one in-flight step and own its whole
+    /// bookkeeping. The same body runs for every caller — the knock (`drain_until`), the
+    /// in-call drain of a schedule that could not defer, and the entry-drain that empties the
+    /// queue before the next step builds its launch — so there is one collect path, not one
+    /// per driver. The step's cell is filled here (with the step's own error if the collect
+    /// failed) so a parked resolver can never hang.
+    fn drain_one(
+        infl: InFlightDecode,
+        model: &mut Loaded,
+        requests: &mut HashMap<String, ReqState>,
+        input_batch: &mut scratchy_serving_engine::input_batch::InputBatch,
+    ) -> ExecutorResult<Vec<u32>> {
+        let InFlightDecode {
+            cell,
+            sub,
+            rung,
+            rows,
+            write_slot,
+        } = infl;
+        // Only the submitting rung's session can finish the read — each rung owns its own
+        // executor and stream.
+        let SendnnSession::SuperDsc(sb) = &mut model.session;
+        let sess = &mut sb.decode_rungs[rung].sess;
+        let toks = match collect_decode_tokens(sess, &sub) {
+            Ok(t) => t,
+            Err(e) => {
+                let msg = e.to_string();
+                cell.fill(Err(scratchy_serving_engine::error::EngineError::Executor(
+                    msg.clone(),
+                )));
+                return Err(werr(msg));
+            }
+        };
+        // A REQUEST'S TOKEN COMES BACK IN THE SLOT THE LAUNCH PUT IT IN — the slot was resolved
+        // at submit and rides in `rows`, so the drain cannot re-derive (and mis-derive) it.
+        // The sentinel check already happened at the decode law (`collect_decode_tokens`);
+        // this guard is the slice's own bound.
+        let n_req = rows.len();
+        let mut out = Vec::with_capacity(n_req);
+        for (id, start, slot) in rows {
+            let tok = toks.get(slot).copied().ok_or_else(|| {
+                werr(format!(
+                    "decode batch: {} token(s) for {n_req} request(s) — the rung's sampler did \
+                     not pick one per launch slot",
+                    toks.len()
+                ))
+            })?;
+            let req = requests
+                .get_mut(&id)
+                .ok_or_else(|| werr(format!("unknown in-flight req {id}")))?;
+            input_batch.push_generated(&id, tok);
+            input_batch.set_tokens_in_pool(&id, start + 1);
+            // The launch wrote this request's key AT THE SHARED SLOT, so that is what its
+            // history records — and the next step's mask, built from the history, then says
+            // valid on exactly the slots the card wrote and −∞ on the hole.
+            req.record_kv(write_slot, SlotCount::new(1));
+            out.push(tok);
+        }
+        cell.fill(Ok(out.clone()));
+        Ok(out)
+    }
+}
+
 impl Worker for SpyreWorker {
     /// The Spyre worker applies no grammar.
     fn set_stop_token_ids(&mut self, _stop_token_ids: &[u32]) {}
@@ -442,6 +507,20 @@ impl Worker for SpyreWorker {
         &mut self,
         scheduler_output: &SchedulerOutput,
     ) -> ExecutorResult<ModelRunnerOutput> {
+        // ⭐ #32 (c4) — DRAIN THE PREVIOUS STEP BEFORE THIS ONE BUILDS ITS LAUNCH. A step's
+        // picked tokens feed the next step's embedding (`token_at`), so the queue must be
+        // empty before `toks` is read; on a deferring driver this fence is the one the
+        // previous step's overlap was riding. The SAME pop the knock takes — never a second
+        // path — and it runs BEFORE the finished-request cleanup so a step's bookkeeping
+        // still finds the requests it named.
+        #[cfg(feature = "spyre-hw")]
+        while let Some(infl) = self.in_flight.pop_front() {
+            let model = self
+                .model
+                .as_mut()
+                .ok_or_else(|| werr("model not loaded"))?;
+            Self::drain_one(infl, model, &mut self.requests, &mut self.input_batch)?;
+        }
         let Self {
             model,
             requests,
@@ -1518,7 +1597,79 @@ impl Worker for SpyreWorker {
                         ))
                     }
                 };
-                let rows = collect_decode_tokens(sess, &sub)?;
+                // ⭐ #32 (c4) — THE STEP IS SUBMITTED; its collect is QUEUED, not run.
+                // Everything the drain needs rides in `InFlightDecode` — per live row, in
+                // `decode_ids` order, the request, its pool start and the launch slot its
+                // token lands in — so the drain never re-derives this step's slot map.
+                let laid: Vec<(String, usize, usize)> = decode_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(di, (id, start))| {
+                        let slot = slots.slot_of(di).ok_or_else(|| {
+                            werr(format!(
+                                "decode batch: request {id} was not laid into the {}-row launch",
+                                seqs.count()
+                            ))
+                        })?;
+                        Ok((id.clone(), *start, slot.index()))
+                    })
+                    .collect::<ExecutorResult<_>>()?;
+                // A step defers only when it is THE WHOLE STEP — a pure batched decode, on a
+                // driver whose engine can drain it. A mixed schedule (a prefill chunk ran, or
+                // a per-request forward will run after this) collects in-call through the SAME
+                // pop, because its output has to carry the other rows' tokens with it.
+                let pure = scheduler_output.scheduled_new_reqs.is_empty()
+                    && cr
+                        .req_ids
+                        .iter()
+                        .all(|id| decode_ids.iter().any(|(d, _)| d == id));
+                let cell = std::sync::Arc::new(
+                    scratchy_serving_engine::executor::DrainCell::new(),
+                );
+                self.in_flight.push_back(InFlightDecode {
+                    cell: cell.clone(),
+                    sub,
+                    rung: ri,
+                    rows: laid,
+                    write_slot,
+                });
+                if pure && self.drain_door.is_some() {
+                    // THE DEFERRED OUTPUT: knock, THEN wait — in that order, because a
+                    // resolver that waited first would block the one thread that can fill
+                    // the cell.
+                    let door = self.drain_door.clone().expect("checked above");
+                    let waiting = cell.clone();
+                    let resolver = move || -> Result<Vec<u32>, String> {
+                        door.knock(waiting.clone()).map_err(|e| e.to_string())?;
+                        waiting.wait().map_err(|e| e.to_string())
+                    };
+                    let req_ids: Vec<String> =
+                        decode_ids.iter().map(|(id, _)| id.clone()).collect();
+                    let mut out = ModelRunnerOutput::deferred(req_ids, Box::new(resolver));
+                    // THE SAME KV REPORT THE SYNC TAIL RUNS — positional facts, known at
+                    // submit: the span the scheduler's next allocation must cover and the
+                    // pool-wide reach, over every live request, not just the decoding ones.
+                    let prompt_of =
+                        |id: &String| SlotCount::new(input_batch.prompt_len(id) as u32);
+                    let pool_reach = requests
+                        .iter()
+                        .map(|(id, r)| r.kv_reach(prompt_of(id)))
+                        .max()
+                        .unwrap_or(SlotCount::new(0));
+                    out.kv_extent = requests
+                        .iter()
+                        .map(|(id, r)| (id.clone(), r.kv_extent(pool_reach, prompt_of(id))))
+                        .collect();
+                    out.kv_pool_reach =
+                        Some(scratchy_core_common::KvSlotSpan::new(pool_reach.get()));
+                    return Ok(out);
+                }
+                // NOT DEFERRABLE — drain it right here, through the same pop the knock takes.
+                let infl = self
+                    .in_flight
+                    .pop_back()
+                    .expect("queued just above");
+                let rows = Self::drain_one(infl, model, requests, input_batch)?;
                 // ── KCACHE PROBE (SCRATCHY_KCACHE_PROBE), BATCHED STEP ── the batched counterpart of the
                 // solo `[kcache]` probe: after the fold's forward (cache write included), read back the
                 // layer-0 resident Kᵀ plane and print, per live request row, its launch slot, its pool
@@ -1536,7 +1687,7 @@ impl Worker for SpyreWorker {
                 // where a request's KV is written and where its token is picked, so the two cannot
                 // drift apart. The sentinel check already happened at the readback
                 // (`read_sampled_tokens`); this guard is the slice's own bound.
-                for (di, (id, start)) in decode_ids.iter().enumerate() {
+                for (di, (id, _start)) in decode_ids.iter().enumerate() {
                     let slot = slots
                         .slot_of(di)
                         .ok_or_else(|| {
@@ -1554,16 +1705,9 @@ impl Worker for SpyreWorker {
                             decode_ids.len()
                         ))
                     })?;
-                    let req = requests.get_mut(id).expect("bound above");
-                    input_batch.push_generated(id, tok);
-                    input_batch.set_tokens_in_pool(id, start + 1);
-                    // The launch wrote this request's key AT THE SHARED SLOT, so that is what its
-                    // history records — and the next step's mask, built from the history, then says
-                    // valid on exactly the slots the card wrote and −∞ on the hole.
-                    req.record_kv(
-                        write_slot,
-                        scratchy_subtile::sdsc_abstract::SlotCount::new(1),
-                    );
+                    // The pool bookkeeping (push_generated, set_tokens_in_pool, record_kv)
+                    // already ran in the drain — this loop only carries the step's answer into
+                    // the output the sync tail assembles.
                     order.push(id.clone());
                     sampled.push(Some(tok));
                     batched.insert(id.clone());
@@ -1676,7 +1820,67 @@ impl Worker for SpyreWorker {
     }
 
     fn shutdown(&mut self) {
+        // ⭐ #32 (c4) — NO DEFERRED STEP OUTLIVES THE WORKER: drain the queue so a resolver
+        // still holding a cell gets an answer rather than a hang. Teardown reaches the drain
+        // thread as a MESSAGE (`PipelineMsg::Shutdown`), which is why this runs there and not
+        // on the client's drop.
+        #[cfg(feature = "spyre-hw")]
+        while let Some(infl) = self.in_flight.pop_front() {
+            match self.model.as_mut() {
+                Some(model) => {
+                    let _ = Self::drain_one(infl, model, &mut self.requests, &mut self.input_batch);
+                }
+                None => infl.cell.fill(Err(
+                    scratchy_serving_engine::error::EngineError::Executor(
+                        "shutdown: the model was dropped before this step landed".into(),
+                    ),
+                )),
+            }
+        }
         self.is_shutdown = true;
+    }
+
+    /// ⭐ #32 (c4) — THE DOOR LANDS: this worker's steps may now hand their collect to the
+    /// engine's drain thread. Every step still runs the same submit → defer → drain; the door
+    /// only decides WHERE the drain runs.
+    #[cfg(feature = "spyre-hw")]
+    fn set_drain_door(&mut self, door: scratchy_serving_engine::core_client::DrainDoor) {
+        self.drain_door = Some(door);
+    }
+
+    /// ⭐ #32 (c4) — A KNOCK: drain in-flight steps until the named cell lands. The knock is a
+    /// deferred output's resolver asking — it runs on the engine thread while THIS thread owns
+    /// the queue, which is why the answer is a cell and not a return value.
+    #[cfg(feature = "spyre-hw")]
+    fn drain_until(
+        &mut self,
+        cell: &std::sync::Arc<scratchy_serving_engine::executor::DrainCell>,
+    ) {
+        while !cell.is_filled() {
+            let Some(infl) = self.in_flight.pop_front() else {
+                // A verdict computed over nothing must FAIL, never invent tokens.
+                cell.fill(Err(scratchy_serving_engine::error::EngineError::Executor(
+                    "drain: the in-flight queue emptied before this step landed".into(),
+                )));
+                return;
+            };
+            let Some(model) = self.model.as_mut() else {
+                let e = scratchy_serving_engine::error::EngineError::Executor(
+                    "drain: the model is not loaded".into(),
+                );
+                infl.cell.fill(Err(scratchy_serving_engine::error::EngineError::Executor(
+                    "drain: the model is not loaded".into(),
+                )));
+                cell.fill(Err(e));
+                return;
+            };
+            if Self::drain_one(infl, model, &mut self.requests, &mut self.input_batch).is_err() {
+                // The step's own cell carries its error to its resolver. A failed collect
+                // leaves the stream sticky-dead, so every later step fails the same way —
+                // stop rather than hand each one the same dead fence.
+                break;
+            }
+        }
     }
 
     fn rank(&self) -> usize {

@@ -41,6 +41,26 @@ pub(crate) fn werr(msg: impl Into<String>) -> ExecutorError {
     ExecutorError::WorkerExecution(msg.into())
 }
 
+/// ⭐ #32 (c4) — ONE SUBMITTED, UNCOLLECTED BATCHED DECODE STEP. The drain pops this and owns
+/// the whole collect half: the fence (`collect_decode_tokens`), the per-request bookkeeping,
+/// and the cell fill. `rows` is per LIVE request in `decode_ids` order — the request, its pool
+/// start, and the launch slot its token comes back in — so the drain never re-derives the
+/// step's slot map.
+#[cfg(feature = "spyre-hw")]
+pub(crate) struct InFlightDecode {
+    /// The cell this step's deferred output parks on; filled by whichever drain pops this.
+    pub(crate) cell: std::sync::Arc<scratchy_serving_engine::executor::DrainCell>,
+    /// The submitted step: its deferred idx-stick read and the decode law's inputs.
+    pub(crate) sub: crate::spyre_forward::SubmittedDecode,
+    /// Which rung's session owns this step's executor — every rung is its own session/stream,
+    /// and only the submitting session can finish the read.
+    pub(crate) rung: usize,
+    /// Per live row, in `decode_ids` order: `(request id, pool start, launch slot)`.
+    pub(crate) rows: Vec<(String, usize, usize)>,
+    /// The shared write slot the launch wrote every row's KV at — what `record_kv` names.
+    pub(crate) write_slot: scratchy_subtile::sdsc_abstract::BatchSlot,
+}
+
 /// Host-only KTIR serving worker.
 pub struct SpyreWorker {
     pub(crate) config: WorkerConfig,
@@ -49,6 +69,18 @@ pub struct SpyreWorker {
     pub(crate) is_shutdown: bool,
     pub(crate) model: Option<Loaded>,
     pub(crate) requests: HashMap<String, ReqState>,
+    /// ⭐ #32 (c4) — THE IN-FLIGHT DECODE QUEUE: submitted-but-uncollected batched decode
+    /// steps, oldest first. Every decode step goes through submit → defer → drain; a step
+    /// whose schedule can defer waits here for the drain (its output's resolver knocks the
+    /// drain door), and one that cannot is drained in-call through the SAME pop — the door
+    /// decides WHERE the drain runs, never WHETHER the step is submitted.
+    #[cfg(feature = "spyre-hw")]
+    pub(crate) in_flight: std::collections::VecDeque<InFlightDecode>,
+    /// ⭐ #32 (c4) — THE ENGINE'S DRAIN DOOR, handed down by the pipeline's `start_pipeline`.
+    /// `None` on every synchronous driver (no pipelined engine thread), which is exactly the
+    /// "cannot defer" case: those steps still submit and defer, then drain themselves in-call.
+    #[cfg(feature = "spyre-hw")]
+    pub(crate) drain_door: Option<scratchy_serving_engine::core_client::DrainDoor>,
     /// ⭐ THE HOST'S PER-REQUEST BLOCK TABLE, IN THE STRUCT THE ENGINE ALREADY DEFINES FOR IT.
     ///
     /// `InputBatch` (`crates/serving/engine/src/input_batch.rs`) is backend-neutral and is what cuda and
@@ -98,6 +130,10 @@ impl SpyreWorker {
             is_shutdown: false,
             model: None,
             requests: HashMap::new(),
+            #[cfg(feature = "spyre-hw")]
+            in_flight: Default::default(),
+            #[cfg(feature = "spyre-hw")]
+            drain_door: None,
             input_batch: scratchy_serving_engine::input_batch::InputBatch::new(),
             admitted: None,
             declared_context: None,
