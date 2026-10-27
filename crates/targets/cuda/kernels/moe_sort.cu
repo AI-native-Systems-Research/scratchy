@@ -1,30 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// The qwen3-5-moe block's sort for the H100 (MoE step M2 of #857): the `P = m · top_k` (token,
+// The MoE block's sort for the H100 (MoE step M2 of #857): the `P = m · top_k` (token,
 // pick) pairs, pair `p` naming expert `topk_idx[p]`, sorted by expert, stably (equal experts keep
 // pair order). Each expert's run starts at `offsets[e]` and is padded to a whole number of the
 // grouped GEMM's 128-row tiles, so a tile belongs to one expert. Out:
 //   - `rows[pos[p], :] = x[p / top_k, :]` (the pair's token row, its bits copied), and every
 //     padding row of every live tile `+0.0`; no row outside a live tile is written;
-//   - `counts[e]` (the expert's pairs), `offsets[0..=256]` (the padded exclusive scan of
-//     `counts`), `tile_expert[t]` for every live tile `t < offsets[256] / 128`, and `pos[p]`;
-//   - `chunk_hist [⌈P / 256⌉, 256]`, scratch: the chunks' counts, then their bases.
-// The region layout is `step::SortLayout` / `step::sort_index_regions` (#841).
+//   - `counts[e]` (the expert's pairs), `offsets[0..=E]` (the padded exclusive scan of
+//     `counts`), `tile_expert[t]` for every live tile `t < offsets[E] / 128`, and `pos[p]`;
+//   - `chunk_hist [⌈P / 256⌉, E]`, scratch: the chunks' counts, then their bases.
+// The region layout is `step::SortLayout` / `step::sort_index_regions` (#841). `E` is the expert
+// count, a template parameter instantiated at both of `op_abi::MOE_EXPERT_COUNTS`: 256
+// (qwen3-5-moe) and 128 (Gemma 4 26B-A4B, #924). Nothing else depends on it.
 //
 // A stable counting sort in three stream-ordered launches, with no atomics, shuffles or ballots
 // (PLAN-tk100 §3.M M2): where order matters the work is serial, so the result is the same bits on
 // every run.
 //   (a) One warp per chunk of 256 pairs (`step::MOE_SORT_CHUNK`). The counters are a shared
-//       `sv<int, 256>`, zeroed by `warp::zero`. Lane 0 walks the chunk's pairs in pair order:
+//       `sv<int, E>`, zeroed by `warp::zero`. Lane 0 walks the chunk's pairs in pair order:
 //       `pos[p] = cnt[e]` (the pair's rank in its chunk, scratch until (c)), then `cnt[e] += 1`,
 //       through `sv::operator[]` and `gl::operator[]`. The counters go to `chunk_hist`'s row by
 //       `warp::store`.
 //   (b) One warp. For each chunk in order, its counts row is loaded (`warp::load`, an
-//       `rv<int, 256>`), the running sum stored over it as the chunk's base, and the row added in
-//       (`warp::add`). The last sum is `counts`. Moved into a shared `sv<int, 256>`, it is scanned
+//       `rv<int, E>`), the running sum stored over it as the chunk's base, and the row added in
+//       (`warp::add`). The last sum is `counts`. Moved into a shared `sv<int, E>`, it is scanned
 //       by the `TK-GAP(exclusive_scan_sv)` helper of `scratchy_ops.cuh` (one lane, serial, each
-//       count padded by `scratchy::ops::tile_pad`), giving `offsets[0..256)` and the total,
-//       `offsets[256]`. Lane 0 then writes `tile_expert` for the live tiles, expert by expert.
+//       count padded by `scratchy::ops::tile_pad`), giving `offsets[0..E)` and the total,
+//       `offsets[E]`. Lane 0 then writes `tile_expert` for the live tiles, expert by expert.
 //   (c) One warp per pair, 8 warps per CTA: `pos[p] = offsets[e] + base[c][e] + rank[p]` (integer
 //       scalars), and the token row bulk-copied into `rows[pos[p]]` through the warp's
 //       `sv_bf<2048>` (PLAN-tk100 §2 S3, as `embed_bf16.cu`), bit-exact, NaN payloads included.
@@ -53,8 +55,10 @@ using namespace kittens;
 
 namespace {
 
-// `step::MOE_ROUTE_EXPERTS`: the one expert count, one counter per expert.
-constexpr int EXPERTS = 256;
+// `op_abi::MOE_EXPERT_COUNTS`: the expert counts the sort is instantiated at, one counter per
+// expert.
+constexpr int EXPERTS_SMALL = 128;
+constexpr int EXPERTS_LARGE = 256;
 // `step::MOE_SORT_CHUNK`: pairs per `chunk_hist` row, one warp of (a) each.
 constexpr int CHUNK = 256;
 // `step::MOE_ROUTE_MAX_TOP_K`.
@@ -70,6 +74,7 @@ constexpr int ROW_CHUNK = 2048;
 constexpr int WARPS = 8;
 constexpr int NUM_THREADS = WARPS * kittens::WARP_THREADS;
 
+template <int EXPERTS>
 using count_rv = rv<int, EXPERTS>;
 using idx_gl = gl<int, 1, 1, -1, -1>;
 using row_gl = gl<bf16, 1, 1, -1, -1>;
@@ -79,11 +84,11 @@ struct sort_globals {
     row_gl x;
     // `[1, P]`.
     idx_gl topk_idx;
-    // `[chunks, 256]`.
+    // `[chunks, E]`.
     idx_gl chunk_hist;
-    // `[1, 256]`.
+    // `[1, E]`.
     idx_gl counts;
-    // `[1, 257]`.
+    // `[1, E + 1]`.
     idx_gl offsets;
     // `[1, max_tiles]`.
     idx_gl tile_expert;
@@ -100,6 +105,7 @@ struct sort_globals {
 };
 
 // (a): one warp per chunk.
+template <int EXPERTS>
 __global__ __launch_bounds__(kittens::WARP_THREADS) void moe_sort_count_ker(
     const __grid_constant__ sort_globals g) {
     __shared__ sv_int<EXPERTS> cnt;
@@ -120,10 +126,11 @@ __global__ __launch_bounds__(kittens::WARP_THREADS) void moe_sort_count_ker(
 }
 
 // (b): one warp.
+template <int EXPERTS>
 __global__ __launch_bounds__(kittens::WARP_THREADS) void moe_sort_offsets_ker(
     const __grid_constant__ sort_globals g) {
     __shared__ sv_int<EXPERTS> scan;
-    count_rv run, h;
+    count_rv<EXPERTS> run, h;
     warp::zero(run);
     for (int c = 0; c < g.chunks; ++c) {
         // Each lane loads and stores the same elements of the row, so the store over the row it
@@ -149,7 +156,8 @@ __global__ __launch_bounds__(kittens::WARP_THREADS) void moe_sort_offsets_ker(
     warp::store(g.offsets, scan, {0, 0, 0, 0});
 }
 
-// (c): one warp per pair, then one warp per expert's padding.
+// (c): one warp per pair, then one warp per expert's padding. Only the grid depends on the expert
+// count (`launch_sort`), so one instance serves both.
 __global__ __launch_bounds__(NUM_THREADS, 1) void moe_sort_scatter_ker(
     const __grid_constant__ sort_globals g) {
     __shared__ sv_bf<ROW_CHUNK> buf[WARPS];
@@ -206,6 +214,25 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void moe_sort_scatter_ker(
     warp::tma::store_async_wait();
 }
 
+// The three launches at `EXPERTS`, the shape already checked: the counts, the offsets, then the
+// scatter, whose grid is the pairs' CTAs plus one warp per expert's padding.
+template <int EXPERTS>
+int launch_sort(const sort_globals& G, uint32_t chunks, uint32_t pair_ctas, cudaStream_t s) {
+    static_assert(EXPERTS % WARPS == 0, "the padding CTAs hold whole warps of experts");
+    void* args[] = {const_cast<sort_globals*>(&G)};
+    const dim3 warp(kittens::WARP_THREADS);
+    cudaError_t err = cudaLaunchKernel(moe_sort_count_ker<EXPERTS>, dim3(chunks), warp, args, 0, s);
+    if (err != cudaSuccess) {
+        return static_cast<int>(err);
+    }
+    err = cudaLaunchKernel(moe_sort_offsets_ker<EXPERTS>, dim3(1), warp, args, 0, s);
+    if (err != cudaSuccess) {
+        return static_cast<int>(err);
+    }
+    const dim3 grid(pair_ctas + uint32_t(EXPERTS / WARPS)), block(NUM_THREADS);
+    return static_cast<int>(cudaLaunchKernel(moe_sort_scatter_ker, grid, block, args, 0, s));
+}
+
 }  // namespace
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
@@ -213,14 +240,14 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void moe_sort_scatter_ker(
 // cudaLaunchKernel returned for the first of the three launches that failed (the ones after it
 // are not launched). Nothing here reads or clears the runtime's last-error state.
 //
-// `m` non-zero, `experts` 256 (`step::MOE_ROUTE_EXPERTS`), `top_k` in 1..=32
+// `m` non-zero, `experts` `E` one of 128 and 256 (`op_abi::MOE_EXPERT_COUNTS`), `top_k` in 1..=32
 // (`step::MOE_ROUTE_MAX_TOP_K`), `hidden` a non-zero multiple of 8, `m · top_k` and
 // `m · hidden` at most INT_MAX, and `max_tiles` at least `tape::moe_tiles`' bound
-// `(P + 127 · min(256, P)) / 128` with `max_tiles · 128 · hidden` at most INT_MAX; all are
+// `(P + 127 · min(E, P)) / 128` with `max_tiles · 128 · hidden` at most INT_MAX; all are
 // checked before any pointer is touched. The bound is the most tiles any routing pads to, so every
 // row and tile index the kernels form is in its region. `x` is `[m, hidden]` bf16 and `rows`
-// `[max_tiles · 128, hidden]` bf16, 16-byte aligned; `topk_idx` `[P]` i32, each in `[0, 256)`;
-// `chunk_hist` `[⌈P / 256⌉, 256]`, `counts` `[256]`, `offsets` `[257]`, `tile_expert`
+// `[max_tiles · 128, hidden]` bf16, 16-byte aligned; `topk_idx` `[P]` i32, each in `[0, E)`;
+// `chunk_hist` `[⌈P / 256⌉, E]`, `counts` `[E]`, `offsets` `[E + 1]`, `tile_expert`
 // `[max_tiles]` and `pos` `[P]` u32, each 16-byte aligned; no output overlaps another or an input.
 // Static shared memory only, so no one-time setup. The launches are asynchronous on `stream`, in
 // order.
@@ -230,9 +257,10 @@ extern "C" int scratchy_cuda_moe_sort(const void* x, const void* topk_idx, void*
                                       uint32_t hidden, uint32_t max_tiles,
                                       void* stream /* cudaStream_t; null = default */) {
     const uint64_t pairs = uint64_t(m) * uint64_t(top_k);
-    const uint64_t runs = pairs < uint64_t(EXPERTS) ? pairs : uint64_t(EXPERTS);
+    const uint64_t runs = pairs < uint64_t(experts) ? pairs : uint64_t(experts);
     const uint64_t bound = (pairs + uint64_t(TILE_ROWS - 1) * runs) / uint64_t(TILE_ROWS);
-    if (m == 0 || experts != uint32_t(EXPERTS) || top_k == 0 || top_k > MAX_TOP_K ||
+    const bool counted = experts == uint32_t(EXPERTS_SMALL) || experts == uint32_t(EXPERTS_LARGE);
+    if (m == 0 || !counted || top_k == 0 || top_k > MAX_TOP_K ||
         hidden == 0 || hidden % VEC != 0 || pairs > uint64_t(INT_MAX) ||
         uint64_t(m) * uint64_t(hidden) > uint64_t(INT_MAX) || uint64_t(max_tiles) < bound ||
         uint64_t(max_tiles) * uint64_t(TILE_ROWS) * uint64_t(hidden) > uint64_t(INT_MAX)) {
@@ -248,28 +276,20 @@ extern "C" int scratchy_cuda_moe_sort(const void* x, const void* topk_idx, void*
         idx_gl ig{static_cast<int*>(const_cast<void*>(topk_idx)), nullptr, nullptr, size_t(1),
                   size_t(pairs)};
         idx_gl hg{static_cast<int*>(chunk_hist), nullptr, nullptr, size_t(chunks),
-                  size_t(EXPERTS)};
-        idx_gl cg{static_cast<int*>(counts), nullptr, nullptr, size_t(1), size_t(EXPERTS)};
-        idx_gl og{static_cast<int*>(offsets), nullptr, nullptr, size_t(1), size_t(EXPERTS + 1)};
+                  size_t(experts)};
+        idx_gl cg{static_cast<int*>(counts), nullptr, nullptr, size_t(1), size_t(experts)};
+        idx_gl og{static_cast<int*>(offsets), nullptr, nullptr, size_t(1), size_t(experts + 1)};
         idx_gl tg{static_cast<int*>(tile_expert), nullptr, nullptr, size_t(1), size_t(max_tiles)};
         idx_gl pg{static_cast<int*>(pos), nullptr, nullptr, size_t(1), size_t(pairs)};
         row_gl rg{static_cast<bf16*>(rows), nullptr, nullptr,
                   size_t(max_tiles) * size_t(TILE_ROWS), size_t(hidden)};
         sort_globals G{xg, ig, hg, cg, og, tg, pg, rg, int(pairs), int(chunks), int(top_k),
                        int(hidden), int(pair_ctas)};
-        void* args[] = {&G};
         const cudaStream_t s = static_cast<cudaStream_t>(stream);
-        const dim3 warp(kittens::WARP_THREADS);
-        cudaError_t err = cudaLaunchKernel(moe_sort_count_ker, dim3(chunks), warp, args, 0, s);
-        if (err != cudaSuccess) {
-            return static_cast<int>(err);
+        if (experts == uint32_t(EXPERTS_SMALL)) {
+            return launch_sort<EXPERTS_SMALL>(G, chunks, pair_ctas, s);
         }
-        err = cudaLaunchKernel(moe_sort_offsets_ker, dim3(1), warp, args, 0, s);
-        if (err != cudaSuccess) {
-            return static_cast<int>(err);
-        }
-        const dim3 grid(pair_ctas + uint32_t(EXPERTS / WARPS)), block(NUM_THREADS);
-        return static_cast<int>(cudaLaunchKernel(moe_sort_scatter_ker, grid, block, args, 0, s));
+        return launch_sort<EXPERTS_LARGE>(G, chunks, pair_ctas, s);
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }

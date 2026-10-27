@@ -41,6 +41,16 @@ unsafe extern "C" {
         k: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_gemm_col64_bf16_abt_prepare() -> i32;
+    fn scratchy_cuda_gemm_col64_bf16_abt(
+        a: *const c_void,
+        b: *const c_void,
+        c: *mut c_void,
+        m: u32,
+        n: u32,
+        k: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_rms_norm_bf16_prepare() -> i32;
     fn scratchy_cuda_rms_norm_bf16(
         x: *const c_void,
@@ -372,6 +382,8 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_expert_gemm_bf16_prepare() -> i32;
+    fn scratchy_cuda_expert_gemm_e128_bf16_prepare() -> i32;
+    fn scratchy_cuda_expert_gemm_e128_col64_bf16_prepare() -> i32;
     fn scratchy_cuda_expert_gemm_bf16(
         a: *const c_void,
         b: *const c_void,
@@ -383,6 +395,7 @@ unsafe extern "C" {
         k: u32,
         experts: u32,
         expert_rows: u32,
+        n_tile: u32,
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_expert_gemv_bf16_prepare() -> i32;
@@ -608,6 +621,10 @@ impl std::error::Error for KernelError {}
 /// row.
 const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("gemm_bf16_abt", scratchy_cuda_gemm_bf16_abt_prepare),
+    (
+        "gemm_col64_bf16_abt",
+        scratchy_cuda_gemm_col64_bf16_abt_prepare,
+    ),
     ("attn_prefill_bf16", scratchy_cuda_attn_prefill_bf16_prepare),
     (
         "gemm_narrow_bf16_abt",
@@ -630,6 +647,14 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
         scratchy_cuda_attn_decode_d512_bf16_prepare,
     ),
     ("expert_gemm_bf16", scratchy_cuda_expert_gemm_bf16_prepare),
+    (
+        "expert_gemm_e128_bf16",
+        scratchy_cuda_expert_gemm_e128_bf16_prepare,
+    ),
+    (
+        "expert_gemm_e128_col64_bf16",
+        scratchy_cuda_expert_gemm_e128_col64_bf16_prepare,
+    ),
     ("expert_gemv_bf16", scratchy_cuda_expert_gemv_bf16_prepare),
 ];
 
@@ -721,6 +746,30 @@ pub unsafe fn gemm_bf16_abt(
     // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
     // shape and catches every C++ exception before returning.
     let code = unsafe { scratchy_cuda_gemm_bf16_abt(a, b, c, m, n, k, stream) };
+    check(code, KernelError::Shape { m, n, k })
+}
+
+/// Launch the bf16 GEMM `C = A · Bᵀ` on 64-column tiles (`kernels/gemm_bf16.cu`'s template at one
+/// 64-column B block): the operands and the contract of [`gemm_bf16_abt`], for an `n` that is a
+/// multiple of 64 (Gemma 4's 128, 704 and 2112). On an `n` both take, each output element is the
+/// bits [`gemm_bf16_abt`] gives: the same WGMMA K order. Asynchronous.
+///
+/// `m`, `n` and `k` must be non-zero multiples of 128, 64 and 64 (`step::GEMM_COL64_TILE`), none
+/// above `i32::MAX`; any other shape returns [`KernelError::Shape`] before any pointer is touched,
+/// and launches nothing.
+///
+/// # Safety
+///
+/// As [`gemm_bf16_abt`]'s.
+pub unsafe fn gemm_col64_bf16_abt(
+    a: *const c_void,
+    b: *const c_void,
+    c: *mut c_void,
+    (m, n, k): (u32, u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `gemm_bf16_abt`'s.
+    let code = unsafe { scratchy_cuda_gemm_col64_bf16_abt(a, b, c, m, n, k, stream) };
     check(code, KernelError::Shape { m, n, k })
 }
 
@@ -1904,12 +1953,12 @@ pub struct SortRegions {
 /// pairs, pair `p` naming expert `topk_idx[p]`, sorted by expert stably, each expert's run padded
 /// to whole 128-row tiles. Writes `rows[pos[p], :] = x[p / top_k, :]` (bit-exact) and `+0.0` on
 /// every padding row of every live tile, and the index regions: `counts`, `offsets` (the padded
-/// exclusive scan, `offsets[256]` the total), `tile_expert` for each live tile, `pos`, and
+/// exclusive scan, `offsets[experts]` the total), `tile_expert` for each live tile, `pos`, and
 /// `chunk_hist` as scratch. No row outside a live tile is written. Asynchronous.
 ///
 /// Refused with [`KernelError::MoeShape`] `{ kernel: "moe_sort", dims: [m, top_k, hidden,
-/// max_tiles] }`, before any pointer is touched, unless `m` is non-zero, `experts` 256
-/// (`step::MOE_ROUTE_EXPERTS`), `top_k` in `1..=32`, `hidden` a non-zero multiple of 8, `m ·
+/// max_tiles] }`, before any pointer is touched, unless `m` is non-zero, `experts` one of
+/// `op_abi::MOE_EXPERT_COUNTS` (128, 256), `top_k` in `1..=32`, `hidden` a non-zero multiple of 8, `m ·
 /// top_k` and `m · hidden` at most `i32::MAX`, and `max_tiles` at least `tape::moe_tiles`' bound
 /// with `max_tiles · 128 · hidden` at most `i32::MAX`. A failed launch returns the first failing
 /// launch's own `cudaError_t`, the ones after it not launched. No one-time setup, so it is not in
@@ -1918,7 +1967,7 @@ pub struct SortRegions {
 /// # Safety
 ///
 /// `x` must be a device pointer to `m · hidden` bf16, `topk_idx` to `m · top_k` i32 each in
-/// `0..256`, `rows` to `max_tiles · 128 · hidden` bf16, and `regions` to the sort's regions of
+/// `0..experts`, `rows` to `max_tiles · 128 · hidden` bf16, and `regions` to the sort's regions of
 /// [`crate::step::SortLayout`] for this geometry, all 16-byte aligned and valid for the whole
 /// kernel, no output overlapping another or an input. `stream` must be a live `cudaStream_t` of
 /// the current device, or null for the default stream.
@@ -1957,31 +2006,63 @@ pub unsafe fn moe_sort(
     )
 }
 
-/// Launch the grouped expert GEMM (`kernels/expert_gemm_bf16.cu`): `c[128t .. 128t + 128, :] =
-/// a[128t .. 128t + 128, :] · B_eᵀ` for every live tile `t < offsets[256] / 128` of the sorted
-/// rows, `e = tile_expert[t]`, `B_e` the first `n` rows of expert `e`'s `[expert_rows, k]` block
-/// at `b`. A tile past the live ones is never read or written. Every live tile's rows are
-/// bit-identical to [`gemm_bf16_abt`] on the same rows and expert slice. Asynchronous.
-///
-/// Refused with [`KernelError::MoeShape`] `{ kernel: "expert_gemm_bf16", dims: [max_tiles, n, k,
-/// expert_rows] }`, before any pointer is touched, unless `max_tiles` is non-zero, `n` a non-zero
-/// multiple of 256 and `k` of 64, `experts` 256, `expert_rows` at least `n`, and `max_tiles · 128
-/// · max(n, k)` and `experts · expert_rows · k` at most `i32::MAX`. A failed launch returns the
-/// launch's own `cudaError_t`.
+/// Launch the grouped expert GEMM (`kernels/expert_gemm_bf16.cu`) on 256-column blocks:
+/// [`expert_gemm_tiled_bf16`] at `n_tile` 256, the qwen3-5-moe tapes' one tile.
 ///
 /// # Safety
 ///
-/// `a` must be a device pointer to `max_tiles · 128 · k` bf16, `b` to `experts · expert_rows · k`
-/// bf16, `offsets` and `tile_expert` to the sort's regions (`257` and `max_tiles` u32, the live
-/// tiles each naming an expert below 256), and `c` to `max_tiles · 128 · n` bf16, all 16-byte
-/// aligned and valid for the whole kernel, `c` overlapping no input. The kernel's setup in
-/// [`PREPARE`] must have run on the current device. `stream` must be a live `cudaStream_t` of the
-/// current device, or null for the default stream.
+/// As [`expert_gemm_tiled_bf16`]'s.
 pub unsafe fn expert_gemm_bf16(
     (a, b): (*const c_void, *const c_void),
     (offsets, tile_expert): (*const c_void, *const c_void),
     c: *mut c_void,
     (max_tiles, n, k, experts, expert_rows): (u32, u32, u32, u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds `expert_gemm_tiled_bf16`'s contract.
+    unsafe {
+        expert_gemm_tiled_bf16(
+            (a, b),
+            (offsets, tile_expert),
+            c,
+            (max_tiles, n, k, experts, expert_rows),
+            EXPERT_GEMM_WIDE_TILE,
+            stream,
+        )
+    }
+}
+
+/// [`crate::step::EXPERT_GEMM_N_TILES`]' wide tile, every Qwen tape's.
+const EXPERT_GEMM_WIDE_TILE: u32 = crate::step::EXPERT_GEMM_N_TILES[1];
+
+/// Launch the grouped expert GEMM (`kernels/expert_gemm_bf16.cu`): `c[128t .. 128t + 128, :] =
+/// a[128t .. 128t + 128, :] · B_eᵀ` for every live tile `t < offsets[experts] / 128` of the
+/// sorted rows, `e = tile_expert[t]`, `B_e` the first `n` rows of expert `e`'s `[expert_rows, k]`
+/// block at `b`, in column blocks of `n_tile`. A tile past the live ones is never read or written.
+/// Every live tile's rows are bit-identical to [`gemm_bf16_abt`] (`n_tile` 256) or
+/// [`gemm_col64_bf16_abt`] (`n_tile` 64) on the same rows and expert slice. Asynchronous.
+///
+/// Refused with [`KernelError::MoeShape`] `{ kernel: "expert_gemm_bf16", dims: [max_tiles, n, k,
+/// expert_rows] }`, before any pointer is touched, unless `max_tiles` is non-zero, `(experts,
+/// n_tile)` one of (256, 256), (128, 256) and (128, 64) (`op_abi::MOE_EXPERT_COUNTS`,
+/// `step::EXPERT_GEMM_N_TILES`), `n` a non-zero multiple of `n_tile` and `k` of 64, `expert_rows`
+/// at least `n`, and `max_tiles · 128 · max(n, k)` and `experts · expert_rows · k` at most
+/// `i32::MAX`. A failed launch returns the launch's own `cudaError_t`.
+///
+/// # Safety
+///
+/// `a` must be a device pointer to `max_tiles · 128 · k` bf16, `b` to `experts · expert_rows · k`
+/// bf16, `offsets` and `tile_expert` to the sort's regions (`experts + 1` and `max_tiles` u32,
+/// the live tiles each naming an expert below `experts`), and `c` to `max_tiles · 128 · n` bf16,
+/// all 16-byte aligned and valid for the whole kernel, `c` overlapping no input. The kernel's
+/// setup in [`PREPARE`] must have run on the current device. `stream` must be a live
+/// `cudaStream_t` of the current device, or null for the default stream.
+pub unsafe fn expert_gemm_tiled_bf16(
+    (a, b): (*const c_void, *const c_void),
+    (offsets, tile_expert): (*const c_void, *const c_void),
+    c: *mut c_void,
+    (max_tiles, n, k, experts, expert_rows): (u32, u32, u32, u32, u32),
+    n_tile: u32,
     stream: *mut c_void,
 ) -> Result<(), KernelError> {
     // SAFETY: as `gemm_bf16_abt`'s.
@@ -1997,6 +2078,7 @@ pub unsafe fn expert_gemm_bf16(
             k,
             experts,
             expert_rows,
+            n_tile,
             stream,
         )
     };
@@ -2017,14 +2099,16 @@ pub unsafe fn expert_gemm_bf16(
 ///
 /// Refused with [`KernelError::MoeShape`] `{ kernel: "expert_gemv_bf16", dims: [m, top_k, n, k]
 /// }`, before any pointer is touched, unless `m` is non-zero, `top_k` in `1..=32`, `m · top_k` at
-/// most 65,535, `n` and `k` non-zero multiples of 64, `experts` 256, `expert_rows` at least `n`,
+/// most 65,535, `n` and `k` non-zero multiples of 64, `experts` one of
+/// `op_abi::MOE_EXPERT_COUNTS` (128, 256), `expert_rows` at least `n`,
 /// and the operands' element counts at most `i32::MAX`. A failed launch returns the launch's own
 /// `cudaError_t`.
 ///
 /// # Safety
 ///
 /// `a` must be a device pointer to `a_rows · k` bf16 (`a_rows` `m · top_k` when `pair_rows`, else
-/// `m`), `b` to `experts · expert_rows · k` bf16, `topk_idx` to `m · top_k` i32 each in `0..256`
+/// `m`), `b` to `experts · expert_rows · k` bf16, `topk_idx` to `m · top_k` i32 each in
+/// `0..experts`
 /// and `c` to `m · top_k · n` bf16, all 16-byte aligned and valid for the whole kernel, `c`
 /// overlapping no input. The kernel's setup in [`PREPARE`] must have run on the current device.
 /// `stream` must be a live `cudaStream_t` of the current device, or null for the default stream.

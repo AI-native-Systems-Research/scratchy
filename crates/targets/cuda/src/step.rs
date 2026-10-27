@@ -109,7 +109,8 @@ pub enum CudaStep {
     RouterNorm(RmsNormBf16),
     /// The bf16 GEMM on 64-column tiles, lowered from `SubOp::MatmulTile` when `n` is a multiple
     /// of [`GEMM_COL64_TILE`]'s and not of [`GEMM_BF16_TILE`]'s, above
-    /// [`GEMM_NARROW_BF16_MAX_N`]: the operands of [`Self::Gemm`], another kernel (#885's 13b).
+    /// [`GEMM_NARROW_BF16_MAX_N`]: the operands of [`Self::Gemm`], `kernels/gemm_bf16.cu`'s
+    /// template at one 64-column B block (`scratchy_cuda_gemm_col64_bf16_abt`, #924).
     GemmCol64(GemmBf16),
 }
 
@@ -120,7 +121,8 @@ pub enum CudaStep {
 pub const GEMM_COL64_TILE: (u32, u32, u32) = (128, 64, 64);
 
 /// The expert GEMM's column tiles: 256 (`kernels/expert_gemm_bf16.cu`, Qwen's 512 and 2048) or 64
-/// (Gemma's 704, #885's 13b), chosen at expansion by the projection's `n`.
+/// (Gemma's 704, #924), chosen at expansion by the projection's `n`: `expert_gemm_bf16.cu`'s
+/// template at four or one 64-column B blocks.
 pub const EXPERT_GEMM_N_TILES: &[u32] = &[64, 256];
 
 /// The head dims the attention, rope-append and KV-append kernels take: 256 (every Qwen layer,
@@ -763,7 +765,8 @@ impl GatedDeltaNetBf16 {
 pub enum MatmulKernel {
     Tiled,
     Gemv,
-    /// The 64-column GEMM ([`GEMM_COL64_TILE`]): Gemma's 128-expert router at m ≥ 2. #885's 13b.
+    /// The 64-column GEMM ([`GEMM_COL64_TILE`]): Gemma's 128-expert router at m ≥ 2
+    /// (`scratchy_cuda_gemm_col64_bf16_abt`, #924).
     Col64,
 }
 

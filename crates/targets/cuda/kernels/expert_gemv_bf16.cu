@@ -1,14 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// The qwen3-5-moe block's gathered expert GEMV for the H100 (MoE step M4 of #857): for each of the
+// The MoE block's gathered expert GEMV for the H100 (MoE step M4 of #857): for each of the
 // `P = m · top_k` (token, pick) pairs, with `e = topk_idx[p]`,
 //
 //     c[p, :] = a[row(p), :] · B_eᵀ          (bf16, f32 accumulate, rounded once)
 //
 // `row(p)` is the pair's token row `p / top_k` (the gate and up, over the token rows) or its own
 // row `p` (the down, over the activation rows). `B_e` is rows `0 .. n` of expert `e`'s
-// `[expert_rows, k]` block of the bundle part `b` points at, as `expert_gemm_bf16.cu`'s. It runs
-// at m = 1 (decode), where the pairs are not sorted: each reads its own expert's weights.
+// `[expert_rows, k]` block of the bundle part `b` points at, as `expert_gemm_bf16.cu`'s (qwen3-5-moe's
+// bundle, or Gemma 4's expert bank). It runs at m = 1 (decode), where the pairs are not sorted:
+// each reads its own expert's weights.
+//
+// The expert count is B's depth, a runtime `gl` dimension, and `topk_idx[p]` the only index into
+// it: no part of the kernel depends on the count, so one instance serves both of
+// `op_abi::MOE_EXPERT_COUNTS` (256, qwen3-5-moe; 128, Gemma 4 26B-A4B, #924), and only the
+// launcher's check names them.
 //
 // Built from `kernels/gemv_bf16.cu` (ThunderKittens' GEMM structure at 64×64, PLAN-tk100 §3.1,
 // §3.M M4): one producer warp loads tiles with TMA, `tma::expect_bytes` before every load, into a
@@ -43,8 +49,9 @@ using namespace kittens;
 
 namespace {
 
-// `step::MOE_ROUTE_EXPERTS`: the depth of B.
-constexpr int EXPERTS = 256;
+// `op_abi::MOE_EXPERT_COUNTS`: the depths of B the launcher takes.
+constexpr uint32_t EXPERTS_SMALL = 128;
+constexpr uint32_t EXPERTS_LARGE = 256;
 // `step::MOE_ROUTE_MAX_TOP_K`.
 constexpr uint32_t MAX_TOP_K = 32;
 // The grid's y extent: one CTA row per pair.
@@ -172,11 +179,11 @@ extern "C" int scratchy_cuda_expert_gemv_bf16_prepare(void) {
 // runtime's last-error state.
 //
 // `m` non-zero, `top_k` in 1..=32, `m · top_k` at most 65,535 (the grid's y), `n` and `k`
-// non-zero multiples of 64, `experts` 256, `expert_rows` at least `n`, and `a_rows · k`,
+// non-zero multiples of 64, `experts` 128 or 256, `expert_rows` at least `n`, and `a_rows · k`,
 // `m · top_k · n` and `experts · expert_rows · k` at most INT_MAX, with `a_rows` `m · top_k`
 // when `pair_rows`, else `m`; all are checked before any pointer is touched. `a` is
 // `[a_rows, k]` bf16; `b` points at expert 0's block of `[experts, expert_rows, k]` bf16 (only
-// the first `n` rows of each are read); `topk_idx` `[m · top_k]` i32, each below 256; `c`
+// the first `n` rows of each are read); `topk_idx` `[m · top_k]` i32, each below `experts`; `c`
 // `[m · top_k, n]` bf16. All 16-byte aligned, `c` overlapping no input.
 // `scratchy_cuda_expert_gemv_bf16_prepare` must have succeeded on the current device. The launch
 // is asynchronous on `stream`.
@@ -189,7 +196,7 @@ extern "C" int scratchy_cuda_expert_gemv_bf16(const void* a, const void* b, cons
     const uint64_t a_rows = pair_rows != 0 ? pairs : uint64_t(m);
     if (m == 0 || top_k == 0 || top_k > MAX_TOP_K || pairs > uint64_t(MAX_GRID_Y) || n == 0 ||
         n % uint32_t(TILE) != 0 || k == 0 || k % uint32_t(TILE) != 0 ||
-        experts != uint32_t(EXPERTS) || expert_rows < n ||
+        (experts != EXPERTS_SMALL && experts != EXPERTS_LARGE) || expert_rows < n ||
         a_rows * uint64_t(k) > uint64_t(INT_MAX) || pairs * uint64_t(n) > uint64_t(INT_MAX) ||
         uint64_t(experts) * uint64_t(expert_rows) * uint64_t(k) > uint64_t(INT_MAX)) {
         return SCRATCHY_CUDA_ERR_SHAPE;

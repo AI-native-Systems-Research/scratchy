@@ -307,9 +307,9 @@ pub enum ForwardError {
     SpanOutsideArena { span: ArenaSpan, arena_bytes: u64 },
     /// The `step`-th launch failed; nothing after it was enqueued, and the stream was drained.
     Launch { step: usize, error: KernelError },
-    /// The `step`-th step is `op`, a step the lowering emits for Gemma 4 26B-A4B and no kernel
-    /// launches yet (#885's 13b-1 to 13b-4 remove this piece by piece; 13b-4 deletes it). Checked over
-    /// the whole tape before anything is uploaded or enqueued.
+    /// The `step`-th step is `op`, a step no kernel launches: a Qwen routing at another count than
+    /// [`MOE_ROUTE_EXPERTS`], the Qwen program's one instance (#921). Checked over the whole tape
+    /// before anything is uploaded or enqueued.
     NotLaunched { step: usize, op: &'static str },
     /// A copy or the stream wait failed; the stream was drained.
     Cuda(CudaError),
@@ -441,7 +441,7 @@ impl fmt::Display for ForwardError {
             ),
             Self::Launch { step, error } => write!(f, "step {step} did not launch: {error}"),
             Self::NotLaunched { step, op } => {
-                write!(f, "step {step} is {op}, which no kernel launches yet")
+                write!(f, "step {step} is {op}, which no kernel launches")
             }
             Self::Cuda(e) => write!(f, "the forward failed: {e}"),
         }
@@ -578,38 +578,21 @@ fn gdn_pool_layout(layout: &GdnStateLayout, layers: usize) -> Option<(Vec<(u64, 
     Some((offsets, per_layer.checked_mul(layers as u64)?))
 }
 
-/// The name of `s` when it is a step the lowering emits and no kernel launches yet (#885's
-/// 13b-4): the 64-column GEMM, the router GEMM on it, and an expert step at another count than
-/// 256, on 64-column tiles or reading Gemma's own tensors. Every rope, rope append and attention
-/// launches: the pool holds each layer at its class's layout, and the head-dim-512 class runs the
-/// column-split kernels. Also the Qwen routing at another count than [`MOE_ROUTE_EXPERTS`]: the
-/// routing kernel's Qwen program is instantiated at 256 only (its launcher refuses any other
-/// count), so such a tape is refused here, before anything is enqueued, rather than at its routing
-/// step. `None` for every step a Qwen tape holds.
+/// The name of `s` when no kernel launches it: the Qwen routing at another count than
+/// [`MOE_ROUTE_EXPERTS`]. The routing kernel's Qwen program is instantiated at 256 only (its
+/// launcher refuses any other count), so such a tape is refused before anything is enqueued,
+/// rather than at its routing step. `None` for every other step.
 fn not_launched(s: &CudaStep) -> Option<&'static str> {
-    match *s {
-        CudaStep::GemmCol64(_) => Some("GemmCol64"),
-        CudaStep::RouterLogits(r) if r.kernel == MatmulKernel::Col64 => Some("RouterLogits"),
-        CudaStep::MoeRoute(MoeRouteBf16 {
-            program: RouteProgram::QwenSoftmax,
-            experts,
-            ..
-        }) if experts != MOE_ROUTE_EXPERTS => Some("MoeRoute"),
-        CudaStep::ExpertSort(e) if e.experts != MOE_ROUTE_EXPERTS => Some("ExpertSort"),
-        CudaStep::ExpertGemm(e)
-            if e.experts != MOE_ROUTE_EXPERTS
-                || e.n_tile != 256
-                || e.weight != MoeWeight::Bundle =>
-        {
-            Some("ExpertGemm")
-        }
-        CudaStep::ExpertGemv(e)
-            if e.experts != MOE_ROUTE_EXPERTS || e.weight != MoeWeight::Bundle =>
-        {
-            Some("ExpertGemv")
-        }
-        _ => None,
+    if let CudaStep::MoeRoute(MoeRouteBf16 {
+        program: RouteProgram::QwenSoftmax,
+        experts,
+        ..
+    }) = *s
+        && experts != MOE_ROUTE_EXPERTS
+    {
+        return Some("MoeRoute");
     }
+    None
 }
 
 /// The one GDN geometry of `tapes`: the first GDN tape's, which every other GDN tape must share.
@@ -1340,10 +1323,12 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         // `forward` checked is inside the pool.
         for (step, s) in tape.steps.iter().enumerate() {
             let launched = match *s {
-                // Refused above, before anything was enqueued (`not_launched`).
-                CudaStep::GemmCol64(_) => {
-                    let op = not_launched(s).unwrap_or("a Gemma step");
-                    return Err(ForwardError::NotLaunched { step, op });
+                CudaStep::GemmCol64(GemmBf16 { a, b, c, m, n, k }) => {
+                    let b = weights[b.0 as usize].ptr();
+                    // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`).
+                    unsafe {
+                        kernels::gemm_col64_bf16_abt(slot(a), b, slot(c), (m, n, k), stream.0)
+                    }
                 }
                 CudaStep::Scale(ScaleBf16 {
                     x,
@@ -1481,17 +1466,11 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     kernel,
                     ..
                 }) => {
-                    // Gemma's 64-column router GEMM: refused above, before anything was enqueued
-                    // (`not_launched`).
-                    if kernel == MatmulKernel::Col64 {
-                        let op = not_launched(s).unwrap_or("RouterLogits");
-                        return Err(ForwardError::NotLaunched { step, op });
-                    }
                     // The router is the bundle's first tensor, at byte 0 (`moe_bundle`), or Gemma's
                     // own projection, whole (`MoeWeight::router_bytes`).
                     let b = weights[bundle.0 as usize].ptr();
                     // SAFETY: as above, for `x` (`m*hidden`), the router (`experts*hidden`, the
-                    // bundle's first bytes) and `logits` (`m*experts`).
+                    // weight's first bytes) and `logits` (`m*experts`).
                     unsafe {
                         match kernel {
                             MatmulKernel::Tiled => kernels::gemm_bf16_abt(
@@ -1510,7 +1489,14 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 (experts, hidden),
                                 stream.0,
                             ),
-                            MatmulKernel::Col64 => unreachable!("returned NotLaunched above"),
+                            // Gemma's 128-expert router at m ≥ 2, its own projection.
+                            MatmulKernel::Col64 => kernels::gemm_col64_bf16_abt(
+                                slot(x),
+                                b,
+                                slot(logits),
+                                (m, experts, hidden),
+                                stream.0,
+                            ),
                         }
                     }
                 }
@@ -2010,8 +1996,9 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         }
     }
 
-    /// Expert 0's `[n, k]` of `proj` in the MoE bundle `bundle` of `weights`, and the rows of each
-    /// expert's block (the expert stride in rows of `k`), or `None` on overflow.
+    /// Expert 0's `[n, k]` of `proj` in the MoE bundle or expert bank `bundle` of `weights` (its
+    /// layout `weight`'s: [`MoeWeight::experts`]), and the rows of each expert's block (the expert
+    /// stride in rows of `k`), or `None` on overflow.
     fn expert_slab(
         weights: &[DeviceBuffer],
         (bundle, weight): (WeightIx, MoeWeight),
@@ -2028,8 +2015,9 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         Some((b.cast_const(), rows))
     }
 
-    /// Enqueue the grouped expert GEMM (`kernels::expert_gemm_bf16`) over the sorted rows, B at
-    /// [`ExpertProjection::slab`]'s part of the bundle.
+    /// Enqueue the grouped expert GEMM (`kernels::expert_gemm_tiled_bf16`) over the sorted rows at
+    /// the step's expert count and column tile, B at [`ExpertProjection::slab`]'s part of the
+    /// bundle or bank.
     fn expert_gemm(
         g: &ExpertGemmBf16,
         slot: impl Fn(ArenaOffset) -> *mut c_void,
@@ -2053,7 +2041,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         // bytes, which `new` checked the buffer holds; every expert's `[n, k]` lies inside its
         // part).
         unsafe {
-            kernels::expert_gemm_bf16(
+            kernels::expert_gemm_tiled_bf16(
                 (slot(g.a).cast_const(), b),
                 (
                     slot(g.offsets).cast_const(),
@@ -2061,13 +2049,14 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 ),
                 slot(g.c),
                 (g.max_tiles, n, k, g.experts, expert_rows),
+                g.n_tile,
                 stream.0,
             )
         }
     }
 
-    /// Enqueue the gathered expert GEMV (`kernels::expert_gemv_bf16`) over every pair, B at
-    /// [`ExpertProjection::slab`]'s part of the bundle.
+    /// Enqueue the gathered expert GEMV (`kernels::expert_gemv_bf16`) over every pair at the step's
+    /// expert count, B at [`ExpertProjection::slab`]'s part of the bundle or bank.
     fn expert_gemv(
         g: &ExpertGemvBf16,
         slot: impl Fn(ArenaOffset) -> *mut c_void,
