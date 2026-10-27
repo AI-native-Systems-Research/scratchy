@@ -102,3 +102,121 @@ fn diag_prompt_3_row_9_picks_per_layer() {
         outside.len()
     );
 }
+
+/// The vocabulary of the goldens' logits, for test B's minimum-row search.
+const DIAG_VOCAB: usize = 262_144;
+/// The P1 prompt whose minimum-cosine row test B reads.
+const DIAG_P1_PROMPT: usize = 6;
+
+/// #933's diagnosis, test B (`/tmp/v933-diag2.md:73-87`), printed only, nothing gated: at every
+/// layer, CUDA's top-8 against HF-f32's top-8 for prompt 3 row 9 and for prompt 6's row of CUDA's
+/// minimum logits cosine against HF-f32 (found here from one fresh m=512 forward of prompt 6 and the
+/// goldens' `ref_f32_6.bin`), including flips inside a router tie, and the f32 router gap (rank-8
+/// minus rank-9) at each layer, as [`diag_prompt_3_row_9_picks_per_layer`] prints them.
+#[test]
+fn diag_picks_per_layer_at_the_bad_rows() {
+    let (device, weights) = rig();
+    // The cut tapes, then the full m=512 tape, one worker: the last index is the full forward.
+    let full = (CUDA_TAPES.iter().position(|t| t.bucket_m == M)).expect("the m=512 tape");
+    let tapes: &'static [CudaTape] = Box::leak(
+        (cut_tapes().iter().copied())
+            .chain([CUDA_TAPES[full]])
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    let mut w = CudaWorker::new(&device, tapes, &weights, Some(KV_POOL), GDN_POOL)
+        .unwrap_or_else(|e| panic!("CudaWorker::new over the cut tapes and the m=512 tape: {e}"));
+    let prompt = |n: usize| {
+        (prompts().into_iter().find(|p| p.p == n))
+            .unwrap_or_else(|| panic!("prompt {n} in meta.json"))
+    };
+    // Prompt 6's minimum-cosine row.
+    let p6 = prompt(DIAG_P1_PROMPT);
+    let n6 = p6.ids.len();
+    let logits = {
+        let tape = &tapes[LAYERS];
+        let mut padded = vec![0u32; M as usize];
+        padded[..n6].copy_from_slice(&p6.ids);
+        let positions: Vec<u32> = (0..M).collect();
+        let kv = KvSequence {
+            block_table: SEAT.0,
+            prefix_len: 0,
+            q_len: n6 as u32,
+        };
+        let mut out = vec![0u16; tape.result.bytes as usize / 2];
+        w.forward(
+            LAYERS,
+            Input::TokenIds(&padded),
+            &positions,
+            Some(&kv),
+            None,
+            &mut out,
+        )
+        .unwrap_or_else(|e| panic!("prompt {}'s m=512 forward: {e}", p6.p));
+        out
+    };
+    let path = goldens_dir().join(format!("ref_f32_{}.bin", p6.p));
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert_eq!(bytes.len(), n6 * DIAG_VOCAB * 4, "ref_f32: [L, vocab] f32");
+    let f32s: Vec<f32> = (bytes.as_chunks::<4>().0.iter())
+        .map(|&q| f32::from_le_bytes(q))
+        .collect();
+    let cosine = |a: &[f32], b: &[f32]| {
+        let (mut ab, mut aa, mut bb) = (0f64, 0f64, 0f64);
+        for (&x, &y) in a.iter().zip(b) {
+            let (x, y) = (f64::from(x), f64::from(y));
+            ab += x * y;
+            aa += x * x;
+            bb += y * y;
+        }
+        ab / (aa.sqrt() * bb.sqrt())
+    };
+    let (min_row, min_cos) = (0..n6)
+        .map(|row| {
+            let c: Vec<f32> = (logits[row * DIAG_VOCAB..][..DIAG_VOCAB].iter())
+                .map(|&h| half::bf16::from_bits(h).to_f32())
+                .collect();
+            (row, cosine(&c, &f32s[row * DIAG_VOCAB..][..DIAG_VOCAB]))
+        })
+        .fold((0, f64::INFINITY), |m, x| if x.1 < m.1 { x } else { m });
+    eprintln!(
+        "diag B prompt {} minimum CUDA row: row {min_row} (token {}) cosine(CUDA, f32)={min_cos:.6} \
+         (information only)",
+        p6.p, p6.ids[min_row]
+    );
+    for (want, row) in [(DIAG_PROMPT, DIAG_ROW), (DIAG_P1_PROMPT, min_row)] {
+        let p = prompt(want);
+        let n = p.ids.len();
+        assert!(row < n, "prompt {want} has row {row}");
+        let route = read_route(&format!("route_{}.bin", p.p), n);
+        let (mut inside, mut outside) = (Vec::new(), Vec::new());
+        for layer in 0..LAYERS {
+            let got = &cuda_picks(&mut w, layer, &p.ids)[row];
+            let f32_pick = route.f32.set(n, layer, row);
+            let tau = route.tau(layer);
+            let (tie, gap) = route.tie(layer, row, tau);
+            let only_cuda: Vec<i32> = got.difference(&f32_pick).copied().collect();
+            let only_f32: Vec<i32> = f32_pick.difference(got).copied().collect();
+            if *got != f32_pick {
+                match tie {
+                    true => inside.push(layer),
+                    false => outside.push(layer),
+                }
+            }
+            eprintln!(
+                "diag B prompt {want} row {row} (id {}) layer {layer}: f32 router gap (rank-8 \
+                 minus rank-9) {gap:.4e}, router tie={tie} (tau {tau:.4e}); CUDA top-8={got:?} \
+                 HF-f32 top-8={f32_pick:?} same={} CUDA-only={only_cuda:?} f32-only={only_f32:?} \
+                 (information only)",
+                p.ids[row],
+                *got == f32_pick
+            );
+        }
+        eprintln!(
+            "diag B prompt {want} row {row}: CUDA's top-8 differs from HF-f32's at {} layers inside \
+             a router tie {inside:?} and {} outside {outside:?} (information only)",
+            inside.len(),
+            outside.len()
+        );
+    }
+}

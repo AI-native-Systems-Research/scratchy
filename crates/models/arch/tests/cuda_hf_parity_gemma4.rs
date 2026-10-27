@@ -614,3 +614,87 @@ fn diag_decode_at_the_bad_rows() {
         }
     }
 }
+
+// ── #933's diagnosis prints, part 3: P1 prompt 6 under option (a) ──
+
+/// The bad rows test A reruns besides prompt 6's minimum row: prompt 6's rows 25, 30, 37, 41, 71
+/// and 148, and prompt 3's row 9 (`/tmp/v933-diag2.md:73-87`).
+const DIAG_A_ROWS: [(usize, usize); 7] = DIAG_DECODE_ROWS;
+
+/// #933's diagnosis, test A (`/tmp/v933-diag2.md:73-87`), printed only, nothing gated. First,
+/// prompt 6's row of CUDA's minimum cosine against HF-f32 (P1's line prints only the value), from
+/// one fresh m=512 forward of the prompt. Then, for that row and each of [`DIAG_A_ROWS`], the
+/// row `r` as a decode ((k)'s machinery, `DecodeCheck`: a fresh prefill of rows `0..r` in m=512,
+/// then one decode of token `r` at P = `r`): cosine(decode, CUDA one-shot row r), cosine(decode,
+/// HF-f32 row r), cosine(one-shot, HF-f32 row r), cosine(HF-bf16, HF-f32 row r), and the layers
+/// whose decode picks differ from the one-shot's. Decode closer to HF-f32 than one-shot names a
+/// prefill-only kernel; decode equal to one-shot clears them.
+#[test]
+fn diag_decode_vs_one_shot_at_bad_rows() {
+    let r = rig();
+    let prompt = |n: usize| {
+        (prompts().iter().find(|p| p.p == n)).unwrap_or_else(|| panic!("prompt {n} in meta.json"))
+    };
+    // Prompt 6's minimum-cosine row, from one fresh forward.
+    let p6 = prompt(DIAG_P1_PROMPT);
+    let got = {
+        let mut w = r.worker();
+        forward(&mut w, &p6.ids, 0, SEAT_A)
+    };
+    let (min_row, min_cos) = (rows(&got).zip(rows(&p6.f32)).enumerate())
+        .map(|(row, (c, f))| (row, cosine(c, f)))
+        .fold((0, f64::INFINITY), |m, x| if x.1 < m.1 { x } else { m });
+    let bf16_at_min = cosine(
+        &p6.bf16[min_row * VOCAB..][..VOCAB],
+        &p6.f32[min_row * VOCAB..][..VOCAB],
+    );
+    eprintln!(
+        "diag A prompt {} minimum CUDA row: row {min_row} (token {}) cosine(CUDA, f32)={min_cos:.6} \
+         cosine(HF-bf16, f32) on that row={bf16_at_min:.6} (information only)",
+        p6.p, p6.ids[min_row]
+    );
+    let rows_of = |want: usize| -> Vec<usize> {
+        let mut v: Vec<usize> = (DIAG_A_ROWS.iter())
+            .filter(|(q, _)| *q == want)
+            .map(|&(_, row)| row)
+            .collect();
+        if want == DIAG_P1_PROMPT && !v.contains(&min_row) {
+            v.insert(0, min_row);
+        }
+        v
+    };
+    for want in [DIAG_P1_PROMPT, DIAG_P3_PROMPT] {
+        let p = prompt(want);
+        let picks = rows_of(want);
+        let mut c = DecodeCheck::new(&r, M, &p.ids);
+        for row in picks {
+            if row == 0 || row >= p.ids.len() {
+                eprintln!(
+                    "diag A prompt {want} row {row}: no prefix to prefill before it, SKIPPED \
+                     (information only)"
+                );
+                continue;
+            }
+            c.prefill(M, &p.ids[..row]);
+            let (first, count, decode) = c.decode(p.ids[row], row);
+            let at = |v: &[f32]| v[row * VOCAB..][..VOCAB].to_vec();
+            let (one_shot, f, b) = (at(&c.one_shot), at(&p.f32), at(&p.bf16));
+            eprintln!(
+                "diag A prompt {want} row {row} (token {}){}: cosine(decode, one-shot)={:.6} \
+                 cosine(decode, f32)={:.6} cosine(one-shot, f32)={:.6} cosine(HF-bf16, f32)={:.6}; \
+                 first layer whose decode picks differ from the one-shot's={first:?}, layers that \
+                 differ={count} of {LAYERS} (information only)",
+                p.ids[row],
+                if want == DIAG_P1_PROMPT && row == min_row {
+                    " [CUDA's minimum row]"
+                } else {
+                    ""
+                },
+                cosine(&decode, &one_shot),
+                cosine(&decode, &f),
+                cosine(&one_shot, &f),
+                cosine(&b, &f)
+            );
+        }
+    }
+}
