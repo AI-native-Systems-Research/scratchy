@@ -2425,6 +2425,7 @@ impl Recording<'_> {
             // is the same wiring bug under the mint that constructs them.
             L::EmbedRowGather { .. } | L::ChainStage { .. } => {
                 return Err(self.no(i, Refused::ChainedHead));
+            }
         }))
     }
 }
