@@ -16,7 +16,7 @@ use hf_hub_downloader::{self as hfdl, Progress};
 use tracing::{info, warn};
 
 use crate::error::ModelError;
-use crate::weight::{DiskSpaceError, SafeTensorsIndex};
+use crate::weight::{DiskSpaceError, SafeTensorsIndex, unindexed_shards, unindexed_shards_in};
 
 use bar::{Bar, Bars};
 
@@ -109,7 +109,7 @@ pub enum DownloadError {
     /// The Hub reported neither weights layout present.
     #[error(
         "no safetensors weights found for {repo} \
-         (neither model.safetensors nor model.safetensors.index.json)"
+         (no model.safetensors, model.safetensors.index.json or model-*-of-*.safetensors)"
     )]
     NoWeights { repo: String },
 }
@@ -173,16 +173,42 @@ pub fn download(
         Err(e) if e.is_not_found() => {}
         Err(e) => return Err(failed(repo_id, SINGLE_FILE)(e)),
     }
-    let index = match repo.get(SHARD_INDEX) {
-        Ok(index) => index,
+    let shards = match repo.get(SHARD_INDEX) {
+        Ok(index) => {
+            let index =
+                SafeTensorsIndex::from_file(index).map_err(|source| DownloadError::Index {
+                    repo: repo_id.to_string(),
+                    source,
+                })?;
+            // Fail fast on a full disk rather than starting a doomed multi-GB
+            // download (and burning the downloader's retry budget on ENOSPC,
+            // which never recovers). A disk-full download is what leaves the
+            // partial cache `fully_cached` detects and resumes.
+            index
+                .ensure_disk_space(&dir)
+                .map_err(|source| DownloadError::DiskSpace {
+                    repo: repo_id.to_string(),
+                    source,
+                })?;
+            index.shard_files()
+        }
+        // Some repos (ibm-granite/granite-4.2-30b-q4-mlx) ship
+        // `model-NNNNN-of-MMMMM.safetensors` shards with no index.
         Err(e) if e.is_not_found() => {
-            return Err(DownloadError::NoWeights {
-                repo: repo_id.to_string(),
-            });
+            let files = repo
+                .files()
+                .map_err(failed(repo_id, "the repo's file list"))?;
+            let shards = unindexed_shards(files);
+            if shards.is_empty() {
+                return Err(DownloadError::NoWeights {
+                    repo: repo_id.to_string(),
+                });
+            }
+            shards
         }
         Err(e) => return Err(failed(repo_id, SHARD_INDEX)(e)),
     };
-    download_shards(&repo, repo_id, &index, &dir, &display)?;
+    download_shards(&repo, repo_id, &shards, &dir, &display)?;
     Ok(dir)
 }
 
@@ -242,7 +268,7 @@ fn weights_present(dir: &Path) -> bool {
             .shard_files()
             .iter()
             .all(|shard| dir.join(shard).exists()),
-        Err(_) => false,
+        Err(_) => !unindexed_shards_in(dir).is_empty(),
     }
 }
 
@@ -292,30 +318,14 @@ fn fetch_tokenizer(repo: &hfdl::Repo<'_>) {
 fn download_shards(
     repo: &hfdl::Repo<'_>,
     repo_id: &str,
-    index: &Path,
+    shards: &[String],
     dir: &Path,
     display: &Display,
 ) -> Result<(), DownloadError> {
-    let index = SafeTensorsIndex::from_file(index).map_err(|source| DownloadError::Index {
-        repo: repo_id.to_string(),
-        source,
-    })?;
-    let shards = index.shard_files();
     let needed: Vec<&String> = shards
         .iter()
         .filter(|shard| !dir.join(shard).exists())
         .collect();
-
-    // Fail fast on a full disk rather than starting a doomed multi-GB
-    // download (and burning the downloader's retry budget on ENOSPC, which
-    // never recovers). A disk-full download is what leaves the partial cache
-    // `fully_cached` detects and resumes.
-    index
-        .ensure_disk_space(dir)
-        .map_err(|source| DownloadError::DiskSpace {
-            repo: repo_id.to_string(),
-            source,
-        })?;
 
     if needed.is_empty() {
         info!("All {} shard files already cached", shards.len());
@@ -477,6 +487,15 @@ mod tests {
 
         std::fs::write(path.join("model-00002-of-00002.safetensors"), b"").unwrap();
         assert!(weights_present(path), "both shards");
+    }
+
+    #[test]
+    fn index_less_shards_are_complete_only_as_a_full_set() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("model-00001-of-00002.safetensors"), b"").unwrap();
+        assert!(!weights_present(dir.path()), "one of two shards");
+        std::fs::write(dir.path().join("model-00002-of-00002.safetensors"), b"").unwrap();
+        assert!(weights_present(dir.path()), "both shards");
     }
 
     #[test]
