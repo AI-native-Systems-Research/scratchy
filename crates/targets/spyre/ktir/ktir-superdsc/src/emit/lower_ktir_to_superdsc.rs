@@ -6320,6 +6320,23 @@ pub fn embed_row_gather(
     // r = 0: the W=1 descriptors are byte-identical). Leg 2 (the transpose): the
     // per-request `_at` form, row r's windows at element bases `r·hidden·stk` (slab)
     // and `r·(stk+1)·hidden` (slabt) — both ZERO at r = 0.
+    // ⭐⭐⭐ THE PER-REQUEST BASE of request r's window in the widened slabt — the ONE
+    // spelling leg 2's transpose WRITES at and leg 3's row gather READS from, so the
+    // write and the read cannot disagree. `(stk + 1)` rows of `hidden` elements: the
+    // transpose's own window, sentinel row included. ZERO at r = 0, so the W = 1
+    // descriptors stay byte-identical.
+    //
+    // ⛔ THE ROW GATHER'S SOURCE BASE IS THIS, NOT ZERO — the 3b-2 ruling's
+    // expert-bank shape (`GatherRun::split`'s src_elems). The l-ramp's index values
+    // are window-RELATIVE absolute sticks (`64·j + l`, max `hidden − 1` at l_sticks
+    // = 1), so a run that reads slabt from element 0 at every r gathers REQUEST 0's
+    // window for every row: W = 1 stays exact (r = 0, base 0) while every batched
+    // rung hands request r ≥ 1 request 0's slab at row lᵣ — MEASURED on the card,
+    // granite-3.1-2b fp8 b2, row 1's gathered bytes exactly the embedding row of
+    // token `s₀·64 + l₁` at every step (row 0 exact, row 1 wrong, clean bake).
+    const fn slabt_request_base(r: u32, stk: u32, hidden: u32) -> u32 {
+        r * (stk + 1) * hidden
+    }
     let mut legs: Vec<(String, crate::superdsc_opspec::OpSpec)> = Vec::new();
     let mut xposes: Vec<super::EmittedOp> = Vec::with_capacity(width as usize);
     for r in 0..width {
@@ -6376,7 +6393,7 @@ pub fn embed_row_gather(
             },
             super::RestickifySide {
                 h: &rb(&slabt_name, width * (stk + 1), hidden),
-                off: r * (stk + 1) * hidden,
+                off: slabt_request_base(r, stk, hidden),
             },
             sym_id_base,
             layout,
@@ -6409,8 +6426,9 @@ pub fn embed_row_gather(
     // one-stick-wide lane buffer, at the scatter law's own spelling), and lands at `DestEntry::of_entries(r·row_entries + cap·b)` — the
     // dest entry and the index base in the WINDOW-GRANULAR LOCKSTEP, stated at both
     // sites rather than derived so their agreement is visible. The index VALUES carry no
-    // source base — they are ABSOLUTE slabt stick numbers, the KV pool's own
-    // "source base stays ZERO" shape — and a short tail (a partial last stick, the 65th
+    // source base — they are sticks RELATIVE TO THE REQUEST'S OWN slabt window, and the
+    // run's `src_elems` carries that window's base (`slabt_request_base`, the one
+    // spelling leg 2 wrote it at) — and a short tail (a partial last stick, the 65th
     // entry of a 4160 hidden) spends part of its last loaded stick, the vendor's own
     // gather tests' shape.
     for r in 0..width {
@@ -6446,11 +6464,17 @@ pub fn embed_row_gather(
                         rows,
                         cols: stk,
                         df: crate::superdsc_opspec::Df::Fp16,
+                        // ⭐ THE SOURCE BASE IS THE REQUEST'S OWN SLABT WINDOW —
+                        // the same `slabt_request_base` leg 2's transpose wrote
+                        // the window at, so the read cannot name a window the
+                        // write did not fill. ZERO at r = 0 (the W = 1
+                        // byte-identity); at r ≥ 1 the l-ramp's window-relative
+                        // sticks resolve inside request r's own window.
                         run: crate::superdsc_opspec::GatherRun::split(
                             crate::superdsc_opspec::DestEntry::of_entries(
                                 r * row_entries + first_entry,
                             ),
-                            0,
+                            slabt_request_base(r, stk, hidden),
                         ),
                         dest: crate::sdsc_abstract::GatherDest::Scratch {
                             rows: width * hidden,
