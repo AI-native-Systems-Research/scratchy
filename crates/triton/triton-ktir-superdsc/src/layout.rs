@@ -911,7 +911,7 @@ fn scales_for(
     use ktir_superdsc::emit::lower_ktir_to_superdsc as L;
     // The OnePlusScale gain offset the rmsnorm bodies resolve by value — read off the SAME
     // chains the emitter dispatches on, deduped by bits like every push above.
-    let mut ones = Vec::new();
+    let mut ones: Vec<f32> = Vec::new();
     for c in chains {
         if let Some(v) = c.ones {
             if !ones.iter().any(|x| x.to_bits() == v.to_bits()) {
