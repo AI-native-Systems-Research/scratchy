@@ -16,14 +16,25 @@ law: the generators ARE the input definition).
 
 ⭐ THE DEVICE LAYOUT (the intmr kit's measured law, forward_tape.rs:299): a
 `[rows, width]` tensor stages STICK-MAJOR — stick k of row r at flat stick
-`k*rows + r` — so the logits tile is staged through that scatter and the six
-outputs are UN-SCATTERED from it on read. The `[rows, 1]` tables are fixed
-points of the scatter (one 128 B stick per row — fp32/u32 32 words, fp16 64
-slots — this door's own `synth_footprint` law), each row's word in word 0 of
-its own stick; the bake's `placements.json` states every size and the binds
-helper verifies each one, so the staging and the door cannot disagree. The
-`[1, PAD_V]` shared tables (lane, padoff) are rows=1 — the scatter is the
-identity.
+`k*rows + r` — with ONE LAW PER ELEMENT CLASS:
+  * f32/u32 tensors (the word tables, the wide outs) stage `raw:` — bytes
+    verbatim through the kit's OWN scatter (`stick_scatter`), because the
+    raw path takes the bytes exactly as staged and f32 has no codec. The
+    `[rows, 1]` tables are fixed points of the scatter (one 128 B stick per
+    row — fp32/u32 32 words), each row's word in word 0 of its own stick.
+  * fp16 MAGNITUDE tensors (the logits tile, the fp16 clamp) stage through
+    the RUNNER's own path — `t<id>=<path> stick:t<id>=<rows>` over a
+    ROW-MAJOR file: the runner applies the IEEE→SEN169 codec (the card's
+    fp16 is SEN169, not IEEE — a `raw:` bind hands it IEEE bits where it
+    reads SEN, a different, valid, arbitrary number; measured: round 2's
+    score came back as ±18432-scale garbage with u still bit-exact, because
+    u never reads an fp16 tensor) and the stick-major map itself
+    (`dev_order`/`restick`, 64 fp16 per stick — the same law the kit's
+    scatter states, so a pre-scattered file would DOUBLE-scatter). Every
+    staged fp16 value here is exact in both formats (multiples of 0.25 up
+    to 200, 2^-14, 0.0 — ≤ 9 mantissa bits at their magnitudes).
+The bake's `placements.json` states every size and the binds helper
+verifies each one, so the staging and the door cannot disagree.
 
 ⭐ THE GEOMETRY IS GRANITE-3.1-2B'S OWN: V 49155, PAD_V 65536 — the vocab
 the chat leg serves, so the probe's noise is the production noise at the
@@ -209,13 +220,15 @@ def emulate_score(x: np.ndarray, g: np.ndarray, invt: float = 1.0,
 
 
 def staged(case: str) -> list[tuple[str, np.ndarray]]:
-    """The staged files in the kernel's PARAMETER ORDER, each already in the
-    device's own layout (scattered tiles, stick-head word tables)."""
+    """The staged files in the kernel's PARAMETER ORDER. The f32/u32 tables
+    are already in the device's own layout (the kit's scatter); the two fp16
+    tensors stay ROW-MAJOR — the runner's `stick:` path applies the SEN codec
+    and the stick map itself (see the device-layout law above)."""
     rows = CASES[case]
     sw = seed_words(rows)
     x = logits(rows)
     tables: list[tuple[str, np.ndarray]] = [
-        (f"sn_{case}_logits", stick_scatter(x, F16_STICK)),
+        (f"sn_{case}_logits", x),  # fp16: row-major, staged via stick:t<id>
         (f"sn_{case}_slo", col_table(sw["slo"], np.uint32)),
         (f"sn_{case}_shi", col_table(sw["shi"], np.uint32)),
         (f"sn_{case}_stp", col_table(sw["stp"], np.uint32)),
@@ -241,21 +254,23 @@ def staged(case: str) -> list[tuple[str, np.ndarray]]:
 
 def expected(case: str) -> list[dict]:
     """The kernel's tensors in PARAMETER ORDER with the placement size each
-    must carry — the binds helper verifies every one against the bake's own
-    placements.json before a single byte is staged, so a door that numbers or
-    sizes differently FAILS LOUDLY (never a silent misbind)."""
+    must carry and its STAGING CLASS (`fp16`: the runner's codec+stick path;
+    `raw`: the kit's own scatter, bytes verbatim) — the binds helper verifies
+    every one against the bake's own placements.json before a single byte is
+    staged, so a door that numbers or sizes differently FAILS LOUDLY (never a
+    silent misbind)."""
     rows = CASES[case]
 
-    def ins(name: str, size: int) -> dict:
-        return {"name": name, "size": size, "out": False}
+    def ins(name: str, size: int, how: str = "raw") -> dict:
+        return {"name": name, "size": size, "out": False, "how": how}
 
     def out(name: str, size: int) -> dict:
-        return {"name": name, "size": size, "out": True}
+        return {"name": name, "size": size, "out": True, "how": "raw"}
 
     col = rows * 128  # the [rows, 1] fp32/u32 one-stick-per-row footprint
     wide32 = rows * PAD_V * 4  # a [rows, PAD_V] fp32/i32 row-block tile
     return [
-        ins("logits", rows * PAD_V * 2),
+        ins("logits", rows * PAD_V * 2, "fp16"),
         ins("slo", col), ins("shi", col), ins("stp", col),
         ins("sgate", col), ins("srow", col),
         ins("invt", col),
@@ -265,7 +280,7 @@ def expected(case: str) -> list[dict]:
         ins("lane", PAD_V * 4),
         ins("fm8", col), ins("ftop", col), ins("fzero", col),
         ins("fhalf", col), ins("fm22", col),
-        ins("cmin", rows * 128),  # this door's fp16 [rows, 1] footprint: 1 stick/row
+        ins("cmin", rows * 128, "fp16"),  # this door's fp16 [rows, 1] footprint: 1 stick/row
         out("u", wide32), out("g", wide32), out("score", wide32),
         out("ui", wide32), out("gi", wide32), out("si", wide32),
     ]

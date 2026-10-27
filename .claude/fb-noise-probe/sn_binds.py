@@ -6,10 +6,12 @@ PARAMETER ORDER (the door's own numbering law — hash_noise's and the intmr
 kit's measured t0..tN), and VERIFIES every tensor's placement size and the
 outputs' Logits role against `sn_inputs.expected()` BEFORE a single byte is
 staged: a door that numbers, sizes, or roles differently fails loudly with
-both tables printed, never a silent misbind. On success prints one line of
-space-separated `bundle_run_dev` arguments — the input binds and one
-`--out raw:t<id>=<path>` PER OUTPUT (the runner's parser takes exactly one
-argument per `--out` flag) — for the leg to word-split.
+both tables printed, never a silent misbind. Each input is staged at its own
+class — f32/u32 through the kit's scatter as `raw:`, fp16 magnitudes through
+the runner's `stick:` codec path — and each output is one
+`--out raw:t<id>=<path>` (the runner's parser takes exactly one argument per
+`--out` flag). On success prints one line of space-separated `bundle_run_dev`
+arguments for the leg to word-split.
 
 use: sn_binds.py <bake-dir> <case>
 """
@@ -51,6 +53,7 @@ def main() -> int:
         )
     args: list[str] = []
     outs: list[str] = []
+    rows = sn_inputs.CASES[case]
     for tid, e in zip(tids, exp):
         p = by_tid[tid]
         if p["size"] != e["size"]:
@@ -63,6 +66,13 @@ def main() -> int:
                     f"t{tid} ({e['name']}): role {p['role']}, expected Logits"
                 )
             outs.append(f"raw:t{tid}={HERE / ('out_sn_' + case + '_' + e['name'] + '.bin')}")
+        elif e["how"] == "fp16":
+            # AN fp16 MAGNITUDE TENSOR: the runner's own path — the IEEE→SEN169
+            # codec and the stick-major map. `raw:` here would hand the card
+            # IEEE bits where it reads SEN169 (a different, valid, arbitrary
+            # number), and a pre-scattered file would double-scatter.
+            args.append(f"t{tid}={sn_inputs.INDIR / ('sn_' + case + '_' + e['name'] + '.bin')}")
+            args.append(f"stick:t{tid}={rows}")
         else:
             args.append(f"t{tid}={sn_inputs.INDIR / ('sn_' + case + '_' + e['name'] + '.bin')}")
             args.append(f"raw:t{tid}")
