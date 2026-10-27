@@ -980,6 +980,97 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
             vec![2],
             Program::Sample,
         ),
+        // ⭐ PROBE-ONLY (front-b-noise, auditor order 2026-10-27, ruling (a)): the
+        // PRODUCTION NOISE ISLAND at the batched rung's own rows — the sampler's
+        // noise-and-score section of `sample_fwd.py` VERBATIM (op for op, staging
+        // class for staging class), the selection DROPPED, and the three f32 values
+        // the auditor named STORED as outputs: `u` (bit-exact on the host), `g` (the
+        // Gumbel draw) and `score`, each closed through its own `fptosi` exit
+        // (`hash_noise`'s own island law). At granite-3.1-2b's REAL geometry —
+        // PAD_V 65536, the vocab the pad law bounds at 49155. The `b2` row is the
+        // intmr-proven width (the multi-row Col admission's own cell geometry); the
+        // `b8` row is the batched defect geometry — the rows whose ten uniform
+        // `[B, 1]` tables read ZERO at their stick heads before the `d99c3d750f`
+        // fix, collapsing the noise to a lane-constant and the pick onto the
+        // argmax. (NO `b1` row: at B=1 the `[B, 1]` views are `[1, 1]`, which this
+        // door sizes as a 2 B launcher-bound scalar — the solo case is the chat
+        // leg's own seat readback, not this probe's.) Reads `g` and `score` OFF THE
+        // CARD per row and lane. NOT production configurations: delete with the
+        // probe.
+        "sample_noise_b2" => (
+            spec(
+                "sample_noise_probe",
+                "sample_noise_probe",
+                &[
+                    ("logits_ptr", "*fp16"),
+                    ("slo_ptr", "*i32"),
+                    ("shi_ptr", "*i32"),
+                    ("stp_ptr", "*i32"),
+                    ("sgate_ptr", "*i32"),
+                    ("srow_ptr", "*i32"),
+                    ("invt_ptr", "*fp32"),
+                    ("ones_ptr", "*fp32"),
+                    ("padoff_ptr", "*fp32"),
+                    ("hc1_ptr", "*i32"),
+                    ("hc2_ptr", "*i32"),
+                    ("hc3_ptr", "*i32"),
+                    ("c256_ptr", "*i32"),
+                    ("lane_ptr", "*fp32"),
+                    ("fm8_ptr", "*fp32"),
+                    ("ftop_ptr", "*fp32"),
+                    ("fzero_ptr", "*fp32"),
+                    ("fhalf_ptr", "*fp32"),
+                    ("fm22_ptr", "*fp32"),
+                    ("cmin_ptr", "*fp16"),
+                    ("u_ptr", "*fp32"),
+                    ("g_ptr", "*fp32"),
+                    ("score_ptr", "*fp32"),
+                    ("ui_ptr", "*i32"),
+                    ("gi_ptr", "*i32"),
+                    ("si_ptr", "*i32"),
+                ],
+                &[("PAD_V", Val::Int(65536)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        "sample_noise_b8" => (
+            spec(
+                "sample_noise_probe",
+                "sample_noise_probe",
+                &[
+                    ("logits_ptr", "*fp16"),
+                    ("slo_ptr", "*i32"),
+                    ("shi_ptr", "*i32"),
+                    ("stp_ptr", "*i32"),
+                    ("sgate_ptr", "*i32"),
+                    ("srow_ptr", "*i32"),
+                    ("invt_ptr", "*fp32"),
+                    ("ones_ptr", "*fp32"),
+                    ("padoff_ptr", "*fp32"),
+                    ("hc1_ptr", "*i32"),
+                    ("hc2_ptr", "*i32"),
+                    ("hc3_ptr", "*i32"),
+                    ("c256_ptr", "*i32"),
+                    ("lane_ptr", "*fp32"),
+                    ("fm8_ptr", "*fp32"),
+                    ("ftop_ptr", "*fp32"),
+                    ("fzero_ptr", "*fp32"),
+                    ("fhalf_ptr", "*fp32"),
+                    ("fm22_ptr", "*fp32"),
+                    ("cmin_ptr", "*fp16"),
+                    ("u_ptr", "*fp32"),
+                    ("g_ptr", "*fp32"),
+                    ("score_ptr", "*fp32"),
+                    ("ui_ptr", "*i32"),
+                    ("gi_ptr", "*i32"),
+                    ("si_ptr", "*i32"),
+                ],
+                &[("PAD_V", Val::Int(65536)), ("B", Val::Int(8))],
+            ),
+            vec![8],
+            Program::Sample,
+        ),
         // ⭐ THE FP32 TWIN of `intmr_col_add` (wall-9 emission diff, auditor order
         // 2026-10-27): the same shapes and pid-cornered spelling, fp32 alone differs —
         // `invt`'s own production class, the Col addressing the auditor states is
