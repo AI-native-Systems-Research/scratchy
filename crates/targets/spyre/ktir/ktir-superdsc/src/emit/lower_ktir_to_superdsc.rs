@@ -2309,6 +2309,13 @@ impl ConvertKind {
 /// basis is [`pointwise_rows`]' reading, and `cols` must be a whole stick of the WIDER format —
 /// a core's slab is cut at that basis ([`convert_opspec`]'s own law), so a sub-stick width is a
 /// dxp scheduler refusal at bake, named here one rung earlier.
+///
+/// ⛔ A SUB-STICK COLUMN WINDOW (the minted `[B, 1]` intermediate the broadcast-chain walk now
+/// binds for a crossed convert, front-b-noise) KEEPS THIS REFUSAL for now: the [B, 1] gate
+/// table holds one 32-word stick per row, and whether the device runs a 4-byte convert at a
+/// 32-ELEMENT slab — [`convert_opspec`]'s own comment says the WIDER stick binds (32 for the
+/// i32→f32 pair) while its code hardcodes the 64-elem fp16 basis — is an open device fact
+/// (card cell α, auditor order 2026-10-27). The refusal names the shape rather than guessing.
 pub fn convert(
     name: &str,
     kind: ConvertKind,

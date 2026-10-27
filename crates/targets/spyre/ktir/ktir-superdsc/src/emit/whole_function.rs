@@ -1655,8 +1655,10 @@ fn program_broadcast_chains(
         // WALK BACK to the rank-2 value the chain started from, through the same op kinds and the
         // SAME depth `program_rmsnorm_chains` walks, plus the shape-preserving elementwise converts
         // (a convert is one-for-one on elements, so the extent the broadcast must prove is
-        // unchanged across it — the arm's own comment states the proof). The `tensor.empty` second
-        // operand is the broadcast's `outs` init and carries no data, so only operand 0 is followed.
+        // unchanged across it — the arm's own comment states the proof, and the law the binding
+        // obeys: the convert EMITS and the consumer binds its result, never its operand). The
+        // `tensor.empty` second operand is the broadcast's `outs` init and carries no data, so only
+        // operand 0 is followed.
         let Some(mut cursor) = bc.operands.first().copied() else {
             return err(format!(
                 "{}: `linalg.broadcast` has no source operand",
@@ -1665,8 +1667,15 @@ fn program_broadcast_chains(
         };
         let mut chain = vec![res];
         let mut saw_degenerate_expand = false;
+        // ⭐⭐⭐ THE OUTERMOST CONVERT THE WALK CROSSED, if it crossed one — the value the
+        // consumer's operand BINDS (see the convert arm). `None` until a convert is crossed,
+        // and then never overwritten: the loop walks OUTWARD from the broadcast, so the FIRST
+        // convert crossed is the outermost — the one whose result the collapse/broadcast chain
+        // actually sprays.
+        let mut crossed_convert: Option<Ssa> = None;
         for _ in 0..3 {
             let Some(d) = def_of(cursor) else { break };
+            let mut convert_hop = false;
             match d.op_type {
                 OpKind::TensorExpandShape => {
                     // ⛔ THE DEGENERATE DIM IS WHAT MAKES THIS A BROADCAST. `TargetShape` states the
@@ -1784,24 +1793,35 @@ fn program_broadcast_chains(
                         None => break,
                     }
                 }
-                // ⭐ A SHAPE-PRESERVING ELEMENTWISE CONVERT IS THE SAME ELEMENTS UNDER A DIFFERENT
-                // POINT TYPE, SO THE WALK TRAVERSES IT. `arith.sitofp`/`extf`/`truncf` are
-                // elementwise — one result element per operand element, converted — so the extent
-                // the broadcast has to prove is unchanged across the hop. The sampler's own gate
-                // chain is exactly this sandwich: the kernel loads the per-row gate as a `[1, 1]`
-                // i32 window of the seed table (the hash's own law makes that table i32), Triton's
-                // implicit promotion converts it to f32 (`sgate.to(tl.float32)`), and the
-                // collapse-broadcast follows; stopping at the convert would hide the LOAD whose
-                // own window has extent 1 on the sprayed axis — the second proof below — and
-                // refuse a chain whose vector-ness that load states. The proof is the same class
-                // the reshape hop takes: an equality stated by the IR itself, with the convert's
-                // own shape (its `Shape`, which `to_ktir_emit`'s `state_shape_and_dtype`
-                // post-pass stamps from the result type) on one side and its operand's (the
-                // producer's own statement — the next hop out, which the loop is about to walk to
-                // anyway) on the other. A convert whose two stated shapes disagree is a real data
-                // movement this door cannot express, named rather than traversed; one that states
-                // either side not at all stops the walk AT the convert's result, where the
-                // load-window proof below honestly fails, rather than guessing the traversal.
+                // ⭐⭐⭐⭐⭐ A SHAPE-PRESERVING ELEMENTWISE CONVERT IS TRAVERSED ONLY TO PROVE THE
+                // EXTENT — IT IS NEVER PLUMBING, AND THE CONSUMER NEVER BINDS ITS OPERAND.
+                // `arith.sitofp`/`extf`/`truncf` are elementwise — one result element per
+                // operand element, converted — so the EXTENT the broadcast has to prove is
+                // unchanged across the hop and the walk keeps going to the load whose own
+                // window states the vector-ness (the second proof below). But a convert
+                // changes the value's ENCODING, not just its shape: the bytes on the two
+                // sides of the hop are NOT the same value, so the consumer binds the
+                // OUTERMOST crossed convert's RESULT — a minted intermediate the main walk
+                // emits through `Lowering::Convert` — and never the load the convert reads.
+                //
+                // ⛔ MEASURED ON THE CARD (front-b-noise, round 3, nickm2): binding the load
+                // made the sampler's `noise·gate` multiply read the per-row gate's RAW
+                // SENUINT32 placement as IEEE_FP32 — the staged u32 word 1 read as the
+                // denormal 2^-149, an effective gate of 2^-127 — so score lost its noise
+                // term entirely (score = the dl16-staggered x to denormal precision, t2 =
+                // fl(g·2^-127) bit-proven) and the pick collapsed to argmax at every
+                // temperature: greedy accidentally correct, sampling silently greedy.
+                //
+                // The proof the hop itself takes is the same class the reshape hop takes:
+                // an equality stated by the IR itself, with the convert's own shape (its
+                // `Shape`, which `to_ktir_emit`'s `state_shape_and_dtype` post-pass stamps
+                // from the result type) on one side and its operand's (the producer's own
+                // statement — the next hop out, which the loop is about to walk to anyway)
+                // on the other. A convert whose two stated shapes disagree is a real data
+                // movement this door cannot express, named rather than traversed; one that
+                // states either side not at all stops the walk AT the convert's result,
+                // where the load-window proof below honestly fails, rather than guessing
+                // the traversal.
                 OpKind::ArithSitofp | OpKind::ArithExtf | OpKind::ArithTruncf => {
                     let dims_of = |o: &Operation<'static>| {
                         o.attributes
@@ -1823,7 +1843,17 @@ fn program_broadcast_chains(
                         .and_then(|&s| def_of(s))
                         .and_then(dims_of);
                     match (result_dims, operand_dims) {
-                        (Some(r), Some(o)) if r == o => {}
+                        (Some(r), Some(o)) if r == o => {
+                            // The hop is proven shape-preserving, so the walk continues to
+                            // the load for the extent proofs — and the convert EMITS: its
+                            // result leaves `chain` (below), so the main walk lowers it, and
+                            // the FIRST convert crossed is the outermost whose result the
+                            // consumer binds.
+                            if crossed_convert.is_none() {
+                                crossed_convert = Some(cursor);
+                            }
+                            convert_hop = true;
+                        }
                         (Some(r), Some(o)) => {
                             return err(format!(
                                 "{}: `{:?}` converts a {o:?}-shaped operand to {r:?} — an \
@@ -1843,7 +1873,12 @@ fn program_broadcast_chains(
                 }
                 _ => break,
             }
-            chain.push(cursor);
+            // ⭐ A CROSSED CONVERT'S RESULT IS NOT PLUMBING — it emits through the main walk's
+            // `Lowering::Convert` arm — so it never enters `chain`, whose every member is
+            // "lowered by nothing". The consumer binds it through `crossed_convert` instead.
+            if !convert_hop {
+                chain.push(cursor);
+            }
             let Some(next) = d.operands.first().copied() else {
                 break;
             };
@@ -2026,7 +2061,14 @@ fn program_broadcast_chains(
         map.insert(
             res,
             Bcast {
-                src: cursor,
+                // ⭐⭐⭐ THE CONSUMER BINDS THE OUTERMOST CROSSED CONVERT'S RESULT when the walk
+                // crossed one — the minted intermediate that convert emits into — and the
+                // final cursor otherwise. The extent proofs above read the CURSOR (the load)
+                // either way: the convert is traversed to PROVE the extent, never to bind. A
+                // consumer binding the load would read the convert's OPERAND with the
+                // consumer's own format — the raw-encoding defect the round-3 card leg
+                // measured (see the convert arm).
+                src: crossed_convert.unwrap_or(cursor),
                 axis,
                 flat,
             },
@@ -5321,10 +5363,19 @@ mod broadcast_chain_tests {
     /// ⭐⭐⭐ THE SAMPLER'S GATE CHAIN — load `[1, 1]` i32 → `sitofp` `[1, 1]` f32 → collapse →
     /// broadcast `Dimensions=[1]`. The walk crosses the SHAPE-PRESERVING convert (the IR's own
     /// `[1, 1] == [1, 1]` is the proof) and the LOAD's own window supplies the vector-ness: extent
-    /// 1 on the sprayed axis, the second proof. The consumer reads the LOAD, not the plumbing —
-    /// this is the chain whose refusal was the fold's second wall.
+    /// 1 on the sprayed axis, the second proof.
+    ///
+    /// ⭐⭐⭐⭐⭐ THE PIN REVERSED (front-b-noise, round 3, measured on the card): the consumer
+    /// binds the CONVERT'S RESULT — the minted `[B, 1]` intermediate the convert emits into —
+    /// never the load. The earlier pin (`b.src ==` the load, the convert "plumbing and lowered
+    /// by nothing") was WRONG: a convert changes the value's ENCODING, and binding the load made
+    /// the card read the per-row gate's raw SENUINT32 placement as IEEE_FP32 — the staged u32
+    /// word 1 as the denormal 2^-149, an effective gate of 2^-127 — so score lost its noise
+    /// term and the pick collapsed to argmax at every temperature (greedy accidentally
+    /// correct). The convert now EMITS through the main walk's `Lowering::Convert` arm; only
+    /// the collapse and the broadcast remain plumbing.
     #[test]
-    fn the_gate_chain_crosses_its_sitofp_and_resolves_to_the_load() {
+    fn the_gate_chain_crosses_its_sitofp_and_binds_the_converts_result() {
         let f = chain_conv(&[1, 1], &[1, 1], false, &[1, 64]);
         let (map, consumed) = program_broadcast_chains(&f).expect("the gate's own chain");
         let b = map
@@ -5337,15 +5388,19 @@ mod broadcast_chain_tests {
         );
         assert_eq!(
             b.src,
-            Ssa(0),
-            "the walk crossed the convert to the LOAD whose window proves the extent"
+            Ssa(1),
+            "the consumer binds the CONVERT'S result — the minted intermediate it emits into"
         );
-        for v in [Ssa(1), Ssa(2), Ssa(4)] {
+        for v in [Ssa(2), Ssa(4)] {
             assert!(
                 consumed.contains(&v),
                 "{v:?} is plumbing and must be lowered by nothing"
             );
         }
+        assert!(
+            !consumed.contains(&Ssa(1)),
+            "the sitofp EMITS (`Lowering::Convert`) — a convert is never plumbing"
+        );
     }
 
     /// ⛔ A CONVERT WHOSE TWO STATED SHAPES DISAGREE — load `[1, 1]`, convert `[2, 1]`: an
