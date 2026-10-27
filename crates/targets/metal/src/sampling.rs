@@ -1734,6 +1734,97 @@ mod tests {
         }
     }
 
+    /// Frequency penalties scale with the exact count, so a long, repetitive
+    /// history at a production vocab must count every occurrence: 16k ids drawn
+    /// from 300 tokens (~55 each, some at slice edges), rows 1 and 8, many steps
+    /// on one arena. With rep = 1 and pres = 0 the golden is exact:
+    /// `logit - 0.5 * count`.
+    #[test]
+    fn penalty_counts_are_exact_for_long_repetitive_histories() {
+        let Some(device) = crate::device::detect_device() else {
+            eprintln!("skipping: no metal device");
+            return;
+        };
+        let device = device.device.clone();
+        if Mtl4DispatchBatch::begin(&device).is_none() {
+            eprintln!("skipping: no MTL4 queue");
+            return;
+        }
+        let (vocab, hist) = (248_320usize, 16_384usize);
+        let kernels = baked(&device, vocab, CastDtype::F32);
+        let mut rng = Rng(0xC0_0047_5EED);
+        for njobs in [1u32, 8] {
+            let n = njobs as usize;
+            let set = MetalResidencySet::new(&device);
+            let arena = SamplerArena::new(&device, &set, njobs, &kernels, hist as u32);
+            set.commit();
+            let nslices = arena.slicing.nslices(njobs) as usize;
+            // The tokens: spread over the row, plus each slice's first and last id.
+            let mut tokens: Vec<i32> = (0..300).map(|_| rng.usize(0, vocab) as i32).collect();
+            for s in 0..nslices {
+                let lo = s * vocab / nslices;
+                tokens.push(lo as i32);
+                tokens.push(lo.saturating_sub(1) as i32);
+            }
+            let mut mismatched_steps = 0;
+            for _step in 0..12 {
+                let logits: Vec<f32> = (0..n * vocab).map(|_| rng.range(-8.0, 8.0)).collect();
+                let prompt: Vec<i32> = (0..n * hist)
+                    .map(|_| tokens[rng.usize(0, tokens.len())])
+                    .collect();
+                let params = scratchy_core_common::GpuSampleParams {
+                    row_indices: (0..njobs).collect(),
+                    rep_penalties: vec![1.0; n],
+                    freq_penalties: vec![0.5; n],
+                    pres_penalties: vec![0.0; n],
+                    prompt_token_ids: prompt.clone(),
+                    max_prompt_len: hist as u32,
+                    any_penalty: true,
+                    temperatures: vec![1.0; n],
+                    top_ks: vec![0; n],
+                    top_ps: vec![1.0; n],
+                    min_ps: vec![0.0; n],
+                    uniforms: vec![0.5; n],
+                    ..Default::default()
+                };
+                let got = reduce_step(&device, &kernels, &arena, &set, &params, &logits, njobs)
+                    .expect("MTL4 queue");
+                let mut bad = 0usize;
+                for r in 0..n {
+                    let mut count = vec![0u32; vocab];
+                    for &t in &prompt[r * hist..(r + 1) * hist] {
+                        count[t as usize] += 1;
+                    }
+                    for v in 0..vocab {
+                        let mut want = logits[r * vocab + v];
+                        if count[v] > 0 {
+                            want -= 0.5 * count[v] as f32;
+                        }
+                        if got[r * vocab + v].to_bits() != want.to_bits() {
+                            if bad < 5 {
+                                eprintln!(
+                                    "rows {njobs}: row {r} token {v} (count {}): got {} want {}",
+                                    count[v],
+                                    got[r * vocab + v],
+                                    want
+                                );
+                            }
+                            bad += 1;
+                        }
+                    }
+                }
+                if bad > 0 {
+                    mismatched_steps += 1;
+                    eprintln!("rows {njobs}: {bad} entries off this step");
+                }
+            }
+            assert_eq!(
+                mismatched_steps, 0,
+                "rows {njobs}: steps with a wrong count"
+            );
+        }
+    }
+
     /// Radix-select + softmax at production-scale vocabularies (up to qwen3.5's
     /// 248320) — exercises the byte-histogram descent and the full-vocab
     /// softmax passes far past the 4096 used elsewhere. A dominant peak makes
