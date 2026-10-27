@@ -1878,7 +1878,14 @@ fn median(mut v: Vec<f64>) -> f64 {
 /// At the attention, each path's output against an f64 attention of its own query and cache, the
 /// cache rows of the two seats, and the per-head top-1 minus top-2 score gap and score spread.
 /// Then the first step whose output drifts (rel L2 above 1e-2 and 10 times its input's): where a
-/// real defect would show. Asserted: only that every forward ran.
+/// real defect would show.
+///
+/// Gated, the decode check that holds on these synthetic weights (#925's GKE diagnosis: the
+/// whole-model cosine is the near-hard softmax's, not a defect): (i) every step up to and
+/// including the `RopeAppend` bit-identical, input and output, and the K and V cache rows of both
+/// seats (0..=300) too; (ii) no step drifts; (iii) the decode attention's rel L2 against the f64 of
+/// its own query and cache at most twice the prefill attention's against its own; (iv) the same
+/// expert picks at the routing.
 #[test]
 fn k_diag_layer0_step_by_step_decode_against_one_shot() {
     let r = rig();
@@ -1902,6 +1909,13 @@ fn k_diag_layer0_step_by_step_decode_against_one_shot() {
     forward(&mut w, 512, &rows[..p], 0, SEAT_A).expect("the prefill");
     let top_k = one.moe.expect("a MoE scratch").top_k as usize;
     let mut first = None;
+    // The gates: (i) through the K/V write, (i) the cache rows, (iii) the attention, (iv) the
+    // picks; the last three `None` until their step ran.
+    let append = (s1.iter())
+        .position(|&i| matches!(one.steps[i], CudaStep::RopeAppend(_)))
+        .expect("layer 0's RopeAppend");
+    let mut through_append = true;
+    let (mut cache_same, mut attention_ok, mut picks_same) = (None, None, None);
     for (j, (&i1, &i5)) in s1.iter().zip(&s512).enumerate() {
         let (a, b) = (one.steps[i1], many.steps[i5]);
         let (ea, eb) = (extents(one, i1), extents(many, i5));
@@ -1943,6 +1957,12 @@ fn k_diag_layer0_step_by_step_decode_against_one_shot() {
             false => drift("in", pair(0), matches!(a, CudaStep::Embed(_))),
         };
         let (out_line, out_rel) = drift("out", pair(1), route);
+        if j <= append {
+            // Both regions present and equal: a region that is not one row per token, or an
+            // in-place step's input, is not proven bit-identical.
+            let same = |k: usize| pair(k).is_some_and(|(x, y)| x == y);
+            through_append &= same(1) && (ea.in_place || same(0));
+        }
         eprintln!(
             "(k-diag0) step {j} (m=1 step {i1} {}, m=512 step {i5} {}): {in_line}; {out_line}",
             kinds(&a).0,
@@ -1958,10 +1978,11 @@ fn k_diag_layer0_step_by_step_decode_against_one_shot() {
             let score = (gs.iter().zip(&ws))
                 .map(|(x, y)| (x - y).abs())
                 .fold(0f32, f32::max);
+            let same = picks(&gi, 0, top_k) == picks(&wi, 0, top_k);
+            picks_same = Some(picks_same.unwrap_or(true) && same);
             eprintln!(
-                "(k-diag0) step {j} routing: picks same={} decode {:?} one-shot {:?}; scores \
+                "(k-diag0) step {j} routing: picks same={same} decode {:?} one-shot {:?}; scores \
                  max|diff|={score:e}; one-shot logits rank-8 minus rank-9 gap={:e}",
-                picks(&gi, 0, top_k) == picks(&wi, 0, top_k),
                 picks(&gi, 0, top_k),
                 picks(&wi, 0, top_k),
                 sorted[top_k - 1] - sorted[top_k]
@@ -1981,6 +2002,8 @@ fn k_diag_layer0_step_by_step_decode_against_one_shot() {
                     .zip(&y[..p * width])
                     .filter(|(u, v)| u != v)
                     .count();
+                let row_same = x[p * width..] == y[p * width..];
+                cache_same = Some(cache_same.unwrap_or(true) && prefix == 0 && row_same);
                 eprintln!(
                     "(k-diag0) step {j} cache layer {layer} {name}: seat A against seat B rows \
                      0..{p} mismatched_bits={prefix}; row {p} {}",
@@ -1996,13 +2019,15 @@ fn k_diag_layer0_step_by_step_decode_against_one_shot() {
             let (ro, stats) = attention_row(&wq, &cb, at, p);
             let gaps: Vec<f64> = stats.iter().map(|s| s.0).collect();
             let sds: Vec<f64> = stats.iter().map(|s| s.1).collect();
+            let (dec, pre) = (rel_l2_f64(&go, &rd), rel_l2_f64(&wo, &ro));
+            attention_ok = Some(attention_ok.unwrap_or(true) && dec <= 2.0 * pre);
             eprintln!(
                 "(k-diag0) step {j} attention: decode against the f64 of its own query and cache \
                  rel L2={:.3e}; one-shot against the f64 of its own rel L2={:.3e}; the two f64 \
                  references' rel L2={:.3e}; per-head top-1 minus top-2 score gap min={:e} \
                  median={:e}; score sd median={:e} (scale {})",
-                rel_l2_f64(&go, &rd),
-                rel_l2_f64(&wo, &ro),
+                dec,
+                pre,
                 rel_l2_f64(&wo, &rd),
                 gaps.iter().copied().fold(f64::INFINITY, f64::min),
                 median(gaps.clone()),
@@ -2020,7 +2045,37 @@ fn k_diag_layer0_step_by_step_decode_against_one_shot() {
     }
     eprintln!(
         "(k-diag0) first layer-0 step whose output drifts (rel L2 > 1e-2 and > 10x its input's): \
-         {first:?} (printed)"
+         {first:?} (gated: expect None) {}",
+        verdict(first.is_none())
+    );
+    let gates = [
+        (
+            "(i) steps 0..={append} (through the RopeAppend) bit-identical, input and output",
+            Some(through_append),
+        ),
+        (
+            "(i) the K and V cache rows 0..=300 of both seats bit-identical",
+            cache_same,
+        ),
+        ("(ii) no step drifts", Some(first.is_none())),
+        (
+            "(iii) the decode attention's rel L2 against its own f64 at most 2x the prefill's",
+            attention_ok,
+        ),
+        ("(iv) the same expert picks at the routing", picks_same),
+    ];
+    let mut pass = true;
+    for (what, ok) in gates {
+        eprintln!(
+            "(k-diag0) gate {what}: {} {}",
+            ok.map_or("not reached".to_string(), |b| b.to_string()),
+            verdict(ok == Some(true))
+        );
+        pass &= ok == Some(true);
+    }
+    assert!(
+        pass,
+        "layer 0's decode is out of agreement with the prefill's row: see the gate lines above"
     );
 }
 
