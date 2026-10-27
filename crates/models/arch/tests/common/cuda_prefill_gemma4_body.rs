@@ -1668,3 +1668,447 @@ fn r_window_self_check_the_window_drops_key_0() {
         "the window-off decode chain does not differ exactly from P = 1024: stop and report"
     );
 }
+
+// ── (k) diagnostics: layer 0 step by step, and the attention regime (#925) ──
+
+use numerics::f32_from_halves;
+use scratchy_target_cuda::tape::ArenaOffset;
+
+/// The decode position the layer-0 diagnostic follows: (k)'s first step.
+const DIAG_P: usize = 300;
+
+/// A step's kind, and the kind of its m=1 counterpart: the m=512 tape's GEMMs are the m=1 tape's
+/// GEMVs, its prefill attention the decode's, its grouped expert GEMM the gathered GEMV.
+fn kinds(s: &CudaStep) -> (&'static str, &'static str) {
+    match s {
+        CudaStep::Embed(_) => ("Embed", "Embed"),
+        CudaStep::Gemm(_) => ("Gemm", "Gemv"),
+        CudaStep::GemmNarrow(_) => ("GemmNarrow", "GemmNarrow"),
+        CudaStep::GemmCol64(_) => ("GemmCol64", "Gemv"),
+        CudaStep::Gemv(_) => ("Gemv", "Gemv"),
+        CudaStep::RmsNorm(_) => ("RmsNorm", "RmsNorm"),
+        CudaStep::Add(_) => ("Add", "Add"),
+        CudaStep::SiluMul(_) => ("SiluMul", "SiluMul"),
+        CudaStep::Rope(_) => ("Rope", "Rope"),
+        CudaStep::GateSplit(_) => ("GateSplit", "GateSplit"),
+        CudaStep::GateApply(_) => ("GateApply", "GateApply"),
+        CudaStep::RopeAppend(_) => ("RopeAppend", "RopeAppend"),
+        CudaStep::AttnPrefill(_) => ("AttnPrefill", "AttnDecode"),
+        CudaStep::AttnDecode(_) => ("AttnDecode", "AttnDecode"),
+        CudaStep::GatedDeltaNet(_) => ("GatedDeltaNet", "GatedDeltaNet"),
+        CudaStep::RouterLogits(_) => ("RouterLogits", "RouterLogits"),
+        CudaStep::MoeRoute(_) => ("MoeRoute", "MoeRoute"),
+        CudaStep::ExpertSort(_) => ("ExpertSort", "ExpertSort"),
+        CudaStep::ExpertGemm(_) => ("ExpertGemm", "ExpertGemv"),
+        CudaStep::ExpertGemv(_) => ("ExpertGemv", "ExpertGemv"),
+        CudaStep::ExpertCombine(_) => ("ExpertCombine", "ExpertCombine"),
+        CudaStep::GateScale(_) => ("GateScale", "GateScale"),
+        CudaStep::Scale(_) => ("Scale", "Scale"),
+        CudaStep::RmsNormUnit(_) => ("RmsNormUnit", "RmsNormUnit"),
+        CudaStep::GeluMul(_) => ("GeluMul", "GeluMul"),
+        CudaStep::LayerScale(_) => ("LayerScale", "LayerScale"),
+        CudaStep::SoftCap(_) => ("SoftCap", "SoftCap"),
+        CudaStep::RouterNorm(_) => ("RouterNorm", "RouterNorm"),
+    }
+}
+
+/// Layer 0's steps of `tape`, from the embed to the layer's scale, the sort left out (the m=1
+/// tape gathers its pairs instead): their indices.
+fn layer0_steps(tape: &CudaTape) -> Vec<usize> {
+    let end = (tape.steps.iter())
+        .position(|s| matches!(s, CudaStep::LayerScale(_)))
+        .expect("a layer scale");
+    (0..=end)
+        .filter(|&i| !matches!(tape.steps[i], CudaStep::ExpertSort(_)))
+        .collect()
+}
+
+/// Row `p`'s part of an m-row tape's span `many` when it holds `m` times the m=1 span `one`'s
+/// bytes (one row per token); `None` otherwise (the sorted or padded expert rows, the KV
+/// regions), and when either is absent.
+fn row_of(
+    one: Option<ArenaSpan>,
+    many: Option<ArenaSpan>,
+    m: u32,
+    p: usize,
+) -> Option<(ArenaSpan, ArenaSpan)> {
+    let (one, many) = (one?, many?);
+    (many.bytes == u64::from(m) * one.bytes).then_some((
+        one,
+        ArenaSpan {
+            offset: ArenaOffset(many.offset.0 + p as u64 * one.bytes),
+            bytes: one.bytes,
+        },
+    ))
+}
+
+/// An arena span's bytes after a forward.
+fn read_span(worker: &mut CudaWorker<'_>, span: ArenaSpan) -> Vec<u16> {
+    let mut v = vec![0u16; span.bytes as usize / 2];
+    worker.read_arena(span, &mut v).expect("read_arena");
+    v
+}
+
+/// `‖a − b‖₂ / ‖b‖₂` of two bf16 rows, in f64; infinite when either holds a non-finite value.
+fn rel_l2(a: &[u16], b: &[u16]) -> f64 {
+    rel_l2_f64(a, &widen(b))
+}
+
+/// `‖a − r‖₂ / ‖r‖₂` of a bf16 row against an f64 one; infinite on a non-finite value.
+fn rel_l2_f64(a: &[u16], r: &[f64]) -> f64 {
+    let (mut d2, mut r2) = (0f64, 0f64);
+    for (x, &y) in widen(a).into_iter().zip(r) {
+        if !(x.is_finite() && y.is_finite()) {
+            return f64::INFINITY;
+        }
+        d2 += (x - y) * (x - y);
+        r2 += y * y;
+    }
+    (d2 / r2.max(f64::MIN_POSITIVE)).sqrt()
+}
+
+/// One region's drift, decode against one-shot, as printed, and its rel L2 (0 or infinite for
+/// a region of words, by whether any differs); `n/a` when the region is not one row per token.
+fn drift(name: &str, pair: Option<(Vec<u16>, Vec<u16>)>, words: bool) -> (String, Option<f64>) {
+    let Some((got, want)) = pair else {
+        return (format!("{name}=n/a (not one row per token)"), None);
+    };
+    let mismatched = got.iter().zip(&want).filter(|(x, y)| x != y).count();
+    if words {
+        let rel = if mismatched == 0 { 0.0 } else { f64::INFINITY };
+        return (
+            format!("{name} words mismatched_halves={mismatched}/{}", got.len()),
+            Some(rel),
+        );
+    }
+    let rel = rel_l2(&got, &want);
+    (
+        format!(
+            "{name} max|diff|={:e} rel L2={rel:.3e} mismatched_bits={mismatched}/{}",
+            max_diff(&got, &want),
+            got.len()
+        ),
+        Some(rel),
+    )
+}
+
+/// One KV layer's K and V of `seat`'s first `tokens` positions, at the layer's own class
+/// layout: `[tokens, kv_heads · head_dim]` bf16 each.
+fn layer_kv(worker: &mut CudaWorker<'_>, seat: Seat, layer: usize, tokens: usize) -> [Vec<u16>; 2] {
+    let kv = CUDA_TAPES[bucket(1)].kv.expect("a KV cache");
+    let bs = kv.block_size as usize;
+    let class = kv.classes[usize::from(kv.layer_class[layer])];
+    let (heads, hd) = (class.kv_heads as usize, class.head_dim as usize);
+    [KvHalf::K, KvHalf::V].map(|half| {
+        let mut rows = vec![0u16; tokens * heads * hd];
+        for b in 0..tokens.div_ceil(bs) {
+            let mut block = vec![0u16; heads * bs * hd];
+            (worker.read_kv(layer, half, seat.blocks[b], &mut block)).expect("read_kv");
+            for t in b * bs..((b + 1) * bs).min(tokens) {
+                for h in 0..heads {
+                    rows[(t * heads + h) * hd..][..hd]
+                        .copy_from_slice(&block[(h * bs + t % bs) * hd..][..hd]);
+                }
+            }
+        }
+        rows
+    })
+}
+
+/// Row `p`'s attention in f64 from its query row `q` (`[q_heads, head_dim]`) and a cache's keys
+/// and values (`[tokens, kv_heads · head_dim]`) at `a`'s scale and window: the output
+/// `[q_heads · head_dim]` and, per head, the top-1 minus top-2 score and the scores' standard
+/// deviation.
+fn attention_row(
+    q: &[u16],
+    [k, v]: &[Vec<u16>; 2],
+    a: AttnPrefillBf16,
+    p: usize,
+) -> (Vec<f64>, Vec<(f64, f64)>) {
+    let (qh, kh, hd) = (a.q_heads as usize, a.kv_heads as usize, a.head_dim as usize);
+    let lo = a.window.map_or(0, |w| (p + 1).saturating_sub(w as usize));
+    let (q, k, v) = (widen(q), widen(k), widen(v));
+    let scale = f64::from(a.scale());
+    let mut out = vec![0f64; qh * hd];
+    let mut stats = Vec::with_capacity(qh);
+    for h in 0..qh {
+        let g = h / (qh / kh);
+        let qr = &q[h * hd..][..hd];
+        let s: Vec<f64> = (lo..=p)
+            .map(|t| {
+                scale
+                    * qr.iter()
+                        .zip(&k[(t * kh + g) * hd..][..hd])
+                        .map(|(x, y)| x * y)
+                        .sum::<f64>()
+            })
+            .collect();
+        let max = s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let e: Vec<f64> = s.iter().map(|x| (x - max).exp()).collect();
+        let z: f64 = e.iter().sum();
+        for (j, t) in (lo..=p).enumerate() {
+            for d in 0..hd {
+                out[h * hd + d] += e[j] / z * v[(t * kh + g) * hd + d];
+            }
+        }
+        let mut sorted = s.clone();
+        sorted.sort_by(|x, y| y.total_cmp(x));
+        let mean = s.iter().sum::<f64>() / s.len() as f64;
+        let sd = (s.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / s.len() as f64).sqrt();
+        stats.push((
+            sorted[0] - sorted.get(1).copied().unwrap_or(f64::NEG_INFINITY),
+            sd,
+        ));
+    }
+    (out, stats)
+}
+
+/// The median of `v`.
+fn median(mut v: Vec<f64>) -> f64 {
+    v.sort_by(f64::total_cmp);
+    v[v.len() / 2]
+}
+
+/// (k)'s diagnostic, layer 0 step by step (#925): 300 tokens prefilled at m=512 in seat A, then per
+/// step of layer 0 the m=1 tape cut after it, decoding token 300 at P = 300 in seat A, against row
+/// 300 of the m=512 tape cut after the matching step, 301 tokens fresh in seat B. Per step it
+/// prints the kind, the input's (read 0) and the output's max |difference| and rel L2, decode
+/// against one-shot; a region that is not one row per token (the sorted and padded expert rows) is
+/// `n/a`. At the routing, the picks and scores, and the one-shot logits' rank-8 minus rank-9 gap.
+/// At the attention, each path's output against an f64 attention of its own query and cache, the
+/// cache rows of the two seats, and the per-head top-1 minus top-2 score gap and score spread.
+/// Then the first step whose output drifts (rel L2 above 1e-2 and 10 times its input's): where a
+/// real defect would show. Asserted: only that every forward ran.
+#[test]
+fn k_diag_layer0_step_by_step_decode_against_one_shot() {
+    let r = rig();
+    let (one, many) = (&CUDA_TAPES[bucket(1)], &CUDA_TAPES[bucket(512)]);
+    let (s1, s512) = (layer0_steps(one), layer0_steps(many));
+    let k1: Vec<&str> = s1.iter().map(|&i| kinds(&one.steps[i]).0).collect();
+    let k512: Vec<&str> = s512.iter().map(|&i| kinds(&many.steps[i]).1).collect();
+    eprintln!("(k-diag0) layer 0's m=1 steps {k1:?}");
+    assert_eq!(
+        k1, k512,
+        "layer 0's m=512 steps, as their m=1 kinds, pair one to one"
+    );
+    let extents = |t: &CudaTape, i: usize| t.steps[i].extents().expect("the step's extents");
+    let mut list = CUDA_TAPES.to_vec();
+    list.extend(s1.iter().map(|&i| cut(one, i, extents(one, i).writes)));
+    list.extend(s512.iter().map(|&i| cut(many, i, extents(many, i).writes)));
+    let tapes: &'static [CudaTape] = Box::leak(list.into_boxed_slice());
+    let mut w = r.worker_over(tapes);
+    let rows = sequence_rows(DIAG_P + 1);
+    let p = DIAG_P;
+    forward(&mut w, 512, &rows[..p], 0, SEAT_A).expect("the prefill");
+    let top_k = one.moe.expect("a MoE scratch").top_k as usize;
+    let mut first = None;
+    for (j, (&i1, &i5)) in s1.iter().zip(&s512).enumerate() {
+        let (a, b) = (one.steps[i1], many.steps[i5]);
+        let (ea, eb) = (extents(one, i1), extents(many, i5));
+        let input = row_of(ea.reads[0], eb.reads[0], 512, p);
+        let output = row_of(Some(ea.writes), Some(eb.writes), 512, p);
+        let second = row_of(ea.second_write, eb.second_write, 512, p);
+        let spans = [input, output, second];
+        run(
+            &mut w,
+            (tapes, CUDA_TAPES.len() + j),
+            &rows[p..=p],
+            p as u32,
+            SEAT_A,
+        )
+        .expect("the m=1 cut");
+        let got: Vec<Option<Vec<u16>>> = spans
+            .iter()
+            .map(|s| s.map(|(x, _)| read_span(&mut w, x)))
+            .collect();
+        run(
+            &mut w,
+            (tapes, CUDA_TAPES.len() + s1.len() + j),
+            &rows[..=p],
+            0,
+            SEAT_B,
+        )
+        .expect("the m=512 cut");
+        let want: Vec<Option<Vec<u16>>> = spans
+            .iter()
+            .map(|s| s.map(|(_, y)| read_span(&mut w, y)))
+            .collect();
+        let pair = |k: usize| got[k].clone().zip(want[k].clone());
+        let route = matches!(a, CudaStep::MoeRoute(_));
+        let (in_line, in_rel) = match ea.in_place {
+            true => (
+                "in=in place (read after the step: the output)".to_string(),
+                None,
+            ),
+            false => drift("in", pair(0), matches!(a, CudaStep::Embed(_))),
+        };
+        let (out_line, out_rel) = drift("out", pair(1), route);
+        eprintln!(
+            "(k-diag0) step {j} (m=1 step {i1} {}, m=512 step {i5} {}): {in_line}; {out_line}",
+            kinds(&a).0,
+            kinds(&b).0
+        );
+        if route
+            && let (Some((gi, wi)), Some((gs, ws)), Some((_, wl))) = (pair(1), pair(2), pair(0))
+        {
+            let (gi, wi) = (words(&gi), words(&wi));
+            let (gs, ws) = (f32_from_halves(&gs), f32_from_halves(&ws));
+            let mut sorted: Vec<f32> = wl.iter().map(|&x| bf16::from_bits(x).to_f32()).collect();
+            sorted.sort_by(|x, y| y.total_cmp(x));
+            let score = (gs.iter().zip(&ws))
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
+            eprintln!(
+                "(k-diag0) step {j} routing: picks same={} decode {:?} one-shot {:?}; scores \
+                 max|diff|={score:e}; one-shot logits rank-8 minus rank-9 gap={:e}",
+                picks(&gi, 0, top_k) == picks(&wi, 0, top_k),
+                picks(&gi, 0, top_k),
+                picks(&wi, 0, top_k),
+                sorted[top_k - 1] - sorted[top_k]
+            );
+        }
+        if let (CudaStep::AttnDecode(at), Some((gq, wq)), Some((go, wo))) = (a, pair(0), pair(1)) {
+            let layer = at.layer as usize;
+            let (ca, cb) = (
+                layer_kv(&mut w, SEAT_A, layer, p + 1),
+                layer_kv(&mut w, SEAT_B, layer, p + 1),
+            );
+            let width = ca[0].len() / (p + 1);
+            for (h, name) in [(0, "K"), (1, "V")] {
+                let (x, y) = (&ca[h], &cb[h]);
+                let prefix = x[..p * width]
+                    .iter()
+                    .zip(&y[..p * width])
+                    .filter(|(u, v)| u != v)
+                    .count();
+                eprintln!(
+                    "(k-diag0) step {j} cache layer {layer} {name}: seat A against seat B rows \
+                     0..{p} mismatched_bits={prefix}; row {p} {}",
+                    drift(
+                        "row",
+                        Some((x[p * width..].to_vec(), y[p * width..].to_vec())),
+                        false
+                    )
+                    .0
+                );
+            }
+            let (rd, _) = attention_row(&gq, &ca, at, p);
+            let (ro, stats) = attention_row(&wq, &cb, at, p);
+            let gaps: Vec<f64> = stats.iter().map(|s| s.0).collect();
+            let sds: Vec<f64> = stats.iter().map(|s| s.1).collect();
+            eprintln!(
+                "(k-diag0) step {j} attention: decode against the f64 of its own query and cache \
+                 rel L2={:.3e}; one-shot against the f64 of its own rel L2={:.3e}; the two f64 \
+                 references' rel L2={:.3e}; per-head top-1 minus top-2 score gap min={:e} \
+                 median={:e}; score sd median={:e} (scale {})",
+                rel_l2_f64(&go, &rd),
+                rel_l2_f64(&wo, &ro),
+                rel_l2_f64(&wo, &rd),
+                gaps.iter().copied().fold(f64::INFINITY, f64::min),
+                median(gaps.clone()),
+                median(sds),
+                at.scale()
+            );
+        }
+        if first.is_none()
+            && let Some(o) = out_rel
+            && o > 1e-2
+            && o > 10.0 * in_rel.unwrap_or(0.0)
+        {
+            first = Some((j, kinds(&a).0));
+        }
+    }
+    eprintln!(
+        "(k-diag0) first layer-0 step whose output drifts (rel L2 > 1e-2 and > 10x its input's): \
+         {first:?} (printed)"
+    );
+}
+
+/// The q_norm and k_norm gains: every `RmsNorm` whose row is one attention head (256 or 512
+/// columns), 2 per layer.
+fn qk_norm_gains() -> BTreeSet<usize> {
+    (CUDA_TAPES[bucket(1)].steps.iter())
+        .filter_map(|s| match *s {
+            CudaStep::RmsNorm(n) if n.cols == 256 || n.cols == 512 => Some(n.gain.0 as usize),
+            _ => None,
+        })
+        .collect()
+}
+
+/// (k)'s regime test (#925): the teacher-forced (k) at P = 300..307 and (n) at P = 319, 320, rerun
+/// with ONLY the q_norm and k_norm gains scaled by 1/4 (exact in bf16), as #922's layer test did,
+/// so the scores at Gemma's scale 1 stay near unit size; every other weight is the body's. Per step
+/// it prints the decode line ([`decode_line`]) and the first layer whose expert picks are not the
+/// one-shot's. If the cosine returns to 0.95 or more, the decode has no defect and (k)'s cosines
+/// near 0 are the synthetic weights' near-hard softmax. Asserted: only finiteness.
+#[test]
+fn k_regime_quarter_qk_norm_gains_decode_against_one_shot() {
+    let mut r = rig();
+    let qk = qk_norm_gains();
+    assert_eq!(qk.len(), 2 * LAYERS, "a q_norm and a k_norm gain per layer");
+    for &ix in &qk {
+        let w = host_weights()[ix].as_ref().expect("a gain");
+        let quarter: Vec<u16> = (w.iter())
+            .map(|&b| numerics::bits(bf16::from_bits(b).to_f32() * 0.25))
+            .collect();
+        r.table[ix] = DeviceBuffer::upload(&r.device, &quarter).expect("upload a quartered gain");
+    }
+    eprintln!("(k-regime) q_norm and k_norm gains scaled by 1/4: weights {qk:?}");
+    let tapes = with_cuts(&[512, 1], route_cuts);
+    let mut w = r.worker_over(tapes);
+    let mut pass = true;
+    let mut cosines = Vec::new();
+    // The teacher-forced (k).
+    let rows = sequence_rows((Q + DECODES) as usize);
+    let scan = PickScan::new(&mut w, tapes, &rows, SEAT_B);
+    let one_shot = forward(&mut w, 512, &rows, 0, SEAT_B).expect("308 tokens in one forward");
+    for p in Q as usize..(Q + DECODES) as usize {
+        forward(&mut w, 512, &rows[..p], 0, SEAT_A).expect("the prefill");
+        let (first, count) = scan.flips(&mut w, rows[p], p, SEAT_A);
+        let row = forward(&mut w, 1, &[rows[p]], p as u32, SEAT_A).expect("the decode");
+        let want = &one_shot[p * VOCAB..][..VOCAB];
+        let (finite, _) = decode_line(
+            &format!(
+                "(k-regime teacher-forced) {p} tokens prefilled, decode at {p}, against row {p} of one 308-token forward"
+            ),
+            &row,
+            want,
+        );
+        eprintln!(
+            "(k-regime teacher-forced) decode at {p}: first layer whose picks differ from the \
+             one-shot row's={first:?}, layers whose picks differ={count} of {LAYERS} (printed)"
+        );
+        cosines.push(cosine(&row, want));
+        pass &= finite;
+    }
+    // (n): 319 prefilled, then decodes at 319 and 320.
+    let rows = sequence_rows(321);
+    let scan = PickScan::new(&mut w, tapes, &rows, SEAT_B);
+    let one_shot = forward(&mut w, 512, &rows, 0, SEAT_B).expect("321 tokens in one forward");
+    forward(&mut w, 512, &rows[..319], 0, SEAT_A).expect("the prefill");
+    for p in 319..321 {
+        let (first, count) = scan.flips(&mut w, rows[p], p, SEAT_A);
+        let row = forward(&mut w, 1, &[rows[p]], p as u32, SEAT_A).expect("the decode");
+        let want = &one_shot[p * VOCAB..][..VOCAB];
+        let (finite, _) = decode_line(
+            &format!(
+                "(k-regime n) decode at P={p} (kv_len {}) against row {p} of one 321-token forward",
+                p + 1
+            ),
+            &row,
+            want,
+        );
+        eprintln!(
+            "(k-regime n) decode at P={p}: first layer whose picks differ from the one-shot \
+             row's={first:?}, layers whose picks differ={count} of {LAYERS} (printed)"
+        );
+        cosines.push(cosine(&row, want));
+        pass &= finite;
+    }
+    let worst = cosines.iter().copied().fold(f64::INFINITY, f64::min);
+    eprintln!(
+        "(k-regime) worst cosine over the 10 decodes={worst:.6} (>= 0.95: {}; printed, not gated)",
+        worst >= 0.95
+    );
+    assert!(pass, "a decode gave a non-finite logit");
+}
