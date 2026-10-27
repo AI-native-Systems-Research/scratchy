@@ -21,9 +21,11 @@
 //! role breaks every match that must learn it, at build time, in one place.
 
 use crate::bundle_code as bundle;
+use crate::lower_subtile_tape_to_superdsc::row_footprint_bytes;
 pub use ktir_superdsc::element_arrangement::{
     ElementArrangement, dl16tofp32_stagger, DL16TOFP32_PERMUTATION,
 };
+use ktir_superdsc::superdsc_opspec::Df;
 use scratchy_tensors::GpuTensor;
 
 // ⭐ `act_name` MOVED TO `ktir_superdsc::place`, BESIDE THE `PlaceId` WHOSE `Display` IT CALLS. Its
@@ -1077,6 +1079,125 @@ impl LoadConst {
             }
         }
     }
+
+    /// The ten UNIFORM `[rows, 1]` tables — the seeds' own class, by the
+    /// kernel's operand order: `hc1`/`hc2`/`hc3`/`c256` (10..=13) and
+    /// `fm8`/`ftop`/`fzero`/`fhalf`/`fm22` (15..=19) are 4-byte words, `cmin`
+    /// (20) is the fp16 clamp. Every other operand is whole-row (`lane` is
+    /// 14) or `[1, BLOCK]` — their staging is verbatim, never spread.
+    pub fn is_uniform_col(&self) -> bool {
+        match *self {
+            LoadConst::SampleTable { operand, .. } => {
+                (10..=13).contains(&operand) || (15..=20).contains(&operand)
+            }
+        }
+    }
+
+    /// ⭐ THE CARD FORM of this const's bytes — [`Self::build`]'s VALUES
+    /// arranged the way the card's placements read them. The ten UNIFORM
+    /// `[rows, 1]` tables spread to each row's stick head through
+    /// [`stage_col_stick_heads`] — the seat's own law, ONE function for every
+    /// card stager of the class — and every other table is verbatim (a
+    /// whole-row table places exactly its bytes). The worker's
+    /// `bind_load_consts` stages THIS form; the emulator's legs stage
+    /// [`Self::build`]'s dense form, the same split the seat already states
+    /// (card: stick heads; emulator: packed at `[rows, 1]`).
+    ///
+    /// ⛔ A UNIFORM COL TABLE NEVER CARRIES THE STAGGER. The `Dl16ToFp32`
+    /// arrangement is a lane-for-lane fact of a whole-row table the staggered
+    /// pointwise island reads; a one-word-per-row table has no lane stream to
+    /// permute, and a mark on one is a mint/propagation disagreement — refuse
+    /// it, never permute the rows' words.
+    pub fn card_bytes(&self) -> (Vec<u8>, scratchy_tensors::DType, [usize; 2]) {
+        let (bytes, dt, shape) = self.build();
+        // The enum's one variant today; a second kind that is not a sampler
+        // table falls through VERBATIM by this destructure failing to compile.
+        let LoadConst::SampleTable {
+            rows,
+            operand,
+            arrangement,
+            ..
+        } = *self;
+        if self.is_uniform_col() {
+            if matches!(arrangement, ElementArrangement::Dl16ToFp32) {
+                panic!(
+                    "the sampler's uniform col table (operand {operand}) carries the \
+                     Dl16ToFp32 stagger — a `[rows, 1]` table has no lane stream to permute; \
+                     the propagation marked a table the mint knows is per-row"
+                );
+            }
+            let stride = col_row_stride_bytes(dt);
+            // The dense form carries row r's word at `r · elem` — the spread
+            // reads exactly that element and lands it at the row's stick head.
+            let bytes = match dt {
+                scratchy_tensors::DType::I32 | scratchy_tensors::DType::F32 => {
+                    stage_col_stick_heads::<4>(rows as usize, stride, |r| {
+                        bytes[r * 4..r * 4 + 4].try_into().expect("a whole i32/f32 element")
+                    })
+                }
+                scratchy_tensors::DType::F16 => stage_col_stick_heads::<2>(rows as usize, stride, |r| {
+                    bytes[r * 2..r * 2 + 2].try_into().expect("a whole f16 element")
+                }),
+                other => panic!(
+                    "the sampler's uniform col table (operand {operand}) builds as {other:?} \
+                     — no `[rows, 1]` card spelling is stated for that dtype"
+                ),
+            };
+            return (bytes, dt, shape);
+        }
+        (bytes, dt, shape)
+    }
+}
+
+/// ⭐ THE CARD'S ROW STRIDE for a `[rows, 1]` table of dtype `dt` — the
+/// placement's own reservation, [`row_footprint_bytes`] at one column, so the
+/// stager and the reservation cannot drift (the same derivation the seat's
+/// `seed_row_words` states in words: 128 B, a whole 32-element u32 stick, for
+/// the i32/f32 tables; the fp16 col table's own footprint for `cmin`).
+pub fn col_row_stride_bytes(dt: scratchy_tensors::DType) -> usize {
+    let df = match dt {
+        scratchy_tensors::DType::F32 => Df::Fp32,
+        scratchy_tensors::DType::I32 => Df::SenUint32,
+        scratchy_tensors::DType::F16 => Df::Fp16,
+        other => panic!(
+            "no `[rows, 1]` card table of {other:?} — the sampler's col class is i32, f32 and \
+             the one fp16 clamp alone"
+        ),
+    };
+    row_footprint_bytes(1, df) as usize
+}
+
+/// ⭐⭐⭐ ONE STAGING FUNCTION FOR EVERY `[rows, 1]` CARD TABLE — the seed
+/// words' own class (the auditor's 2026-10-27 ruling, Finding 1). A
+/// `[rows, 1]` placement reserves ONE WHOLE STICK FOOTPRINT PER ROW
+/// ([`col_row_stride_bytes`]), and the Col operand mode reads row r's word at
+/// its STICK HEAD — byte `r · stride`. The worker's per-step seat
+/// (`sample_binds`) and the bake's ten UNIFORM tables
+/// ([`LoadConst::card_bytes`]) stage through THIS fn, so the seat's words and
+/// the uniform tables can never disagree about where a row's word lives.
+///
+/// ⛔ THE DEFECT THIS REPLACES was measured in the code, not on the card: the
+/// uniform tables were staged DENSE — `rows` words, row 0's stick alone — so
+/// at any rung with `rows > 1` every row past 0 read ZERO at its stick head
+/// (a zero hash multiplier folds every row's noise to the same value). The
+/// seat already staged the correct `r · seed_row_words` form; this fn is that
+/// law, stated once for both stagers.
+pub fn stage_col_stick_heads<const N: usize>(
+    rows: usize,
+    stride_bytes: usize,
+    elem: impl Fn(usize) -> [u8; N],
+) -> Vec<u8> {
+    assert!(
+        stride_bytes >= N,
+        "a `[rows, 1]` row stride of {stride_bytes} B cannot hold a {N}-byte element — the \
+         placement's own reservation law and the element's dtype disagree"
+    );
+    let mut out = vec![0u8; rows * stride_bytes];
+    for r in 0..rows {
+        let head = r * stride_bytes;
+        out[head..head + N].copy_from_slice(&elem(r));
+    }
+    out
 }
 
 /// ⭐ THE CHAINED HEAD'S TWO DECOMPOSE TABLES — the ChainStage's own host
@@ -1377,6 +1498,14 @@ pub struct SampleSeat {
 /// gate; `padoff` stages only 0.0 and −inf); every noise value is either an
 /// exact i32 constant or an exact f32/fp16 power of two, so the staging round
 /// trips bit-exactly.
+///
+/// ⭐ THE COL ENTRIES ARE THE VALUE FORM — `rows` words, memref-dense, the
+/// spelling the emulator's legs stage (a `[rows, 1]` view over these bytes
+/// reads row r's word at `r`). The CARD's placements reserve a whole stick
+/// footprint per row and the Col operand mode reads the STICK HEAD, so the
+/// worker stages [`LoadConst::card_bytes`] — these same values spread through
+/// [`stage_col_stick_heads`], the seat's own law (Finding 1, 2026-10-27: the
+/// dense form staged onto the card left every row past 0 reading ZERO).
 pub fn sample_staged_tables(
     vocab: u32,
     rows: u32,

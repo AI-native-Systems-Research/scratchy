@@ -1495,8 +1495,8 @@ impl SpyreWorker {
                     .sum::<u64>()
                     + g0.decode_rungs
                         .iter()
-                        .filter(|(rn, _, _)| rn.get() > 1)
-                        .filter_map(|(_, _, sent)| sent.as_str().strip_prefix(SUPERDSC_SENTINEL))
+                        .filter(|(rn, _, _, _)| rn.get() > 1)
+                        .filter_map(|(_, _, sent, _)| sent.as_str().strip_prefix(SUPERDSC_SENTINEL))
                         .filter_map(scratchy_target_spyre::bundle_code::bundle)
                         .map(|rc| non_resident(&rc.layout))
                         .sum::<u64>()
@@ -2378,7 +2378,7 @@ impl SpyreWorker {
                 // one number per BATCH WIDTH — and the two host decisions that used to read it are
                 // per-BODY (see `DecodeRung`). Binding it to `_` rather than to a name is the point: a
                 // named ceiling sitting in this loop is what got copied onto the rung three times.
-                for (rung_n, _ceiling_swept, sentinel) in g0.decode_rungs {
+                for (rung_n, _ceiling_swept, sentinel, rung_consts) in g0.decode_rungs {
                     // ⛔ `RungSeqs::get`, so this reads a BATCH WIDTH and says so. The sibling ladder
                     // (`sk_bucket_rungs`) is keyed by the SWEEP EXTENT `active_cap`; selecting over it with
                     // `>= live` would bind a body baked for a 64-column sweep because four requests are
@@ -2522,13 +2522,33 @@ impl SpyreWorker {
                             dparsed.result_id
                         )
                     });
+                    // ⛔ THE RUNG'S OWN KINDS, AND EVERY KIND'S ROWS ARE THE RUNG'S OWN —
+                    // the auditor's Finding-1 refusal. A kind whose `rows` is
+                    // not this rung's width is a manifest that describes a
+                    // different rung than the one it rides (the mint's own
+                    // `rows` fact is the rung's bake width), and staging it
+                    // would leave some rows' stick heads reading ZERO — a
+                    // zero hash multiplier folds every row's noise to one
+                    // value. Refuse by name, never serve.
+                    for &(tid, kind) in rung_consts {
+                        let scratchy_target_spyre::wiring::LoadConst::SampleTable { rows, .. } =
+                            kind;
+                        if rows != rung_n.get() {
+                            panic!(
+                                "decode batch rung seqs={rn}: its staged constant t{tid} carries \
+                                 rows={rows}, not the rung's own {rn} — the kind and the rung \
+                                 disagree about the bake width, and the short side's rows would \
+                                 read ZERO at their stick heads. REFUSING"
+                            );
+                        }
+                    }
                     let mut rs = SuperDscSession::new_borrowing_with_consts(
                         rcode,
                         vocab,
                         kv_dim,
                         num_blocks,
                         &[1, 2],
-                        wirings.decode.load_consts,
+                        rung_consts,
                         &spill_tids,
                     )
                     .unwrap_or_else(|e| {

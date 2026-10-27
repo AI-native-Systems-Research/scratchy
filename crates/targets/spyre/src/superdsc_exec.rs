@@ -1818,6 +1818,20 @@ impl Executor {
     /// output's initial bytes into its own placement — the ops that
     /// overwrite it per step do so over these bytes, exactly as the card
     /// behaves.
+    ///
+    /// ⭐ THE BYTES ARE THE CARD FORM ([`LoadConst::card_bytes`]): the ten
+    /// UNIFORM `[rows, 1]` tables spread to each row's stick head — the seat's
+    /// own law — and every other table is verbatim. The emulator's gate legs
+    /// stage the dense value form instead; the two memory models are each
+    /// leg's own stated law, one value derivation.
+    ///
+    /// ⛔ AND A UNIFORM COL TABLE MUST EXACTLY FILL ITS PLACEMENT. The general
+    /// over-bind law permits a short bind (a placement's zero tail is a valid
+    /// constant image), but a `[rows, 1]` table short of its placement means
+    /// the KIND'S rows and the RUNG'S placement rows disagree — some row's
+    /// stick head was never staged and reads ZERO (Finding 1: a rows=1 kind
+    /// staged into a rows=N rung left every row past 0 with a zero hash
+    /// multiplier). Refuse it by name, both directions, never serve it.
     pub fn bind_load_consts(&mut self, consts: &[(u32, crate::wiring::LoadConst)]) -> Result<()> {
         if self.prepared {
             bail!(
@@ -1826,8 +1840,27 @@ impl Executor {
             );
         }
         for &(tid, kind) in consts {
-            let (bytes, dt, _shape) = kind.build();
+            let (bytes, dt, _shape) = kind.card_bytes();
             let id = bundle::PlaceId::Act(tid);
+            if kind.is_uniform_col() {
+                let placed = self.places.get(&id).map(|p| p.size);
+                match placed {
+                    Some(size) if bytes.len() as u64 != size => bail!(
+                        "bind_load_consts(t{tid}): the uniform `[rows, 1]` table stages {} B \
+                         against its own {} B placement — the kind's rows and the rung's \
+                         placement rows disagree, and the short side's rows read ZERO at their \
+                         stick heads (Finding 1). REFUSING",
+                        bytes.len(),
+                        size
+                    ),
+                    None => bail!(
+                        "bind_load_consts(t{tid}): the uniform `[rows, 1]` table has NO placement \
+                         in this bundle — the layout did not place the const the wiring stages. \
+                         REFUSING"
+                    ),
+                    _ => {}
+                }
+            }
             if matches!(
                 dt,
                 scratchy_tensors::DType::F32 | scratchy_tensors::DType::I32

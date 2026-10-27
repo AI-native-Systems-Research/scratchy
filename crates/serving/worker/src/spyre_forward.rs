@@ -1159,26 +1159,40 @@ fn sample_binds(
             ),
         }
     };
+    // ⭐ THE SEAT STAGES THROUGH THE ONE COL LAW — `stage_col_stick_heads`,
+    // the same fn the bake's ten UNIFORM tables spread through
+    // (`LoadConst::card_bytes`), so the seat's words and the uniform tables
+    // can never disagree about where a row's word lives. The stride is the
+    // placement's own reservation; `seed_row_words` is its word form, and a
+    // seat that disagrees with the derivation refuses here rather than stage
+    // a word at a stride nobody placed.
+    let stride_bytes =
+        scratchy_target_spyre::wiring::col_row_stride_bytes(scratchy_tensors::DType::I32);
+    if seat.seed_row_words as usize * 4 != stride_bytes {
+        return Err(werr(format!(
+            "the sampler seat's seed_row_words is {} but the `[rows, 1]` reservation derives {} \
+             — the seat and the placement's own law disagree, refusing to stage the seed words",
+            seat.seed_row_words,
+            stride_bytes / 4
+        )));
+    }
     let mut binds = Vec::with_capacity(1 + seat.seed_words.len());
     for (k, &tid) in seat.seed_words.iter().enumerate() {
-        let mut table = vec![0i32; rows * seat.seed_row_words as usize];
-        for r in 0..rows {
-            table[r * seat.seed_row_words as usize] = word_of(k, r);
-        }
-        let le: Vec<u8> = table.iter().flat_map(|w| w.to_le_bytes()).collect();
-        binds.push((scratchy_target_spyre::bundle_code::PlaceId::Act(tid), le));
+        let table = scratchy_target_spyre::wiring::stage_col_stick_heads::<4>(rows, stride_bytes, |r| {
+            word_of(k, r).to_le_bytes()
+        });
+        binds.push((scratchy_target_spyre::bundle_code::PlaceId::Act(tid), table));
     }
     // inv_t per row: the greedy law's 1.0, or the draw's own 1/T — at
     // temperature 1.0 the two are the same bytes and only the seed and gate
-    // words differ.
-    let mut invt = vec![0.0f32; rows * 32];
-    for r in 0..rows {
-        invt[r * 32] = laws[r].draw.map_or(1.0, |d| d.inv_t);
-    }
-    let invt_le: Vec<u8> = invt.iter().flat_map(|f| f.to_le_bytes()).collect();
+    // words differ. The same col law and the same stride (an f32 word shares
+    // the u32 stick geometry).
+    let invt = scratchy_target_spyre::wiring::stage_col_stick_heads::<4>(rows, stride_bytes, |r| {
+        laws[r].draw.map_or(1.0, |d| d.inv_t).to_le_bytes()
+    });
     binds.push((
         scratchy_target_spyre::bundle_code::PlaceId::Act(seat.invt),
-        invt_le,
+        invt,
     ));
     Ok(binds)
 }

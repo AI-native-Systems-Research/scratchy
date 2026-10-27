@@ -9026,6 +9026,70 @@ fn superdsc_rotary_kind(
     }
 }
 
+/// One load-const entry `(tid, kind)` as a token stream — the ONE renderer,
+/// shared by the wiring static (`emit_superdsc_wiring`) and every decode
+/// batch rung's OWN consts in the manifest (`decode_rung_lits`), so the two
+/// can never disagree about how a kind is spelled.
+#[cfg(feature = "spyre")]
+fn load_const_entry_tokens(
+    entry: &(u32, scratchy_target_spyre::wiring::LoadConst),
+) -> proc_macro2::TokenStream {
+    let &(tid, ref kind) = entry;
+    let tid = proc_macro2::Literal::u32_unsuffixed(tid);
+    let kind = match *kind {
+        scratchy_target_spyre::wiring::LoadConst::SampleTable {
+            vocab,
+            rows,
+            operand,
+            arrangement,
+        } => {
+            let vocab = proc_macro2::Literal::u32_unsuffixed(vocab);
+            let rows = proc_macro2::Literal::u32_unsuffixed(rows);
+            let operand = proc_macro2::Literal::u8_unsuffixed(operand);
+            let arrangement = match arrangement {
+                scratchy_target_spyre::wiring::ElementArrangement::Standard => {
+                    quote! {
+                        ::scratchy_target_spyre::wiring::ElementArrangement::Standard
+                    }
+                }
+                scratchy_target_spyre::wiring::ElementArrangement::Dl16ToFp32 => {
+                    quote! {
+                        ::scratchy_target_spyre::wiring::ElementArrangement::Dl16ToFp32
+                    }
+                }
+            };
+            quote! {
+                ::scratchy_target_spyre::wiring::LoadConst::SampleTable {
+                    vocab: #vocab,
+                    rows: #rows,
+                    operand: #operand,
+                    arrangement: #arrangement,
+                }
+            }
+        }
+        scratchy_target_spyre::wiring::LoadConst::ChainStageTable {
+            pad_vocab,
+            k,
+            hidden,
+            operand,
+        } => {
+            let pad_vocab = proc_macro2::Literal::u32_unsuffixed(pad_vocab);
+            let k = proc_macro2::Literal::u32_unsuffixed(k);
+            let hidden = proc_macro2::Literal::u32_unsuffixed(hidden);
+            let operand = proc_macro2::Literal::u8_unsuffixed(operand);
+            quote! {
+                ::scratchy_target_spyre::wiring::LoadConst::ChainStageTable {
+                    pad_vocab: #pad_vocab,
+                    k: #k,
+                    hidden: #hidden,
+                    operand: #operand,
+                }
+            }
+        }
+    };
+    quote! { (#tid, #kind) }
+}
+
 #[cfg(feature = "spyre")]
 fn emit_superdsc_wiring(
     gk: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::BundleWiring,
@@ -9755,54 +9819,7 @@ fn emit_superdsc_wiring(
     let load_const_toks = gk
         .load_consts
         .iter()
-        .map(|&(tid, kind)| {
-            let tid = u32l(tid);
-            let kind = match kind {
-                scratchy_target_spyre::wiring::LoadConst::SampleTable {
-                    vocab,
-                    rows,
-                    operand,
-                    arrangement,
-                } => {
-                    let arrangement = match arrangement {
-                        scratchy_target_spyre::wiring::ElementArrangement::Standard => {
-                            quote! {
-                                ::scratchy_target_spyre::wiring::ElementArrangement::Standard
-                            }
-                        }
-                        scratchy_target_spyre::wiring::ElementArrangement::Dl16ToFp32 => {
-                            quote! {
-                                ::scratchy_target_spyre::wiring::ElementArrangement::Dl16ToFp32
-                            }
-                        }
-                    };
-                    quote! {
-                        ::scratchy_target_spyre::wiring::LoadConst::SampleTable {
-                            vocab: #vocab,
-                            rows: #rows,
-                            operand: #operand,
-                            arrangement: #arrangement,
-                        }
-                    }
-                }
-                scratchy_target_spyre::wiring::LoadConst::ChainStageTable {
-                    pad_vocab,
-                    k,
-                    hidden,
-                    operand,
-                } => {
-                    quote! {
-                        ::scratchy_target_spyre::wiring::LoadConst::ChainStageTable {
-                            pad_vocab: #pad_vocab,
-                            k: #k,
-                            hidden: #hidden,
-                            operand: #operand,
-                        }
-                    }
-                }
-            };
-            quote! { (#tid, #kind) }
-        })
+        .map(|entry| load_const_entry_tokens(entry))
         .collect::<Vec<_>>();
     // ⭐ THE SAMPLER'S PER-STEP SEAT — the named class of the six sources the
     // token draw binds FRESH EVERY DECODE STEP (the seed quintuple's five
@@ -11160,10 +11177,20 @@ fn dump_wavefront_mega(
         // DECODE BATCH LADDER `[(seqs, body_fp)]` — one entry per width that actually LOWERED, never
         // an assumed list. The one-request rung is the bundle already stamped into `superdsc_fp`, so
         // every path that predates the ladder is unchanged; wider rungs only ever add entries.
-        // (seqs, active_cap, body_fp) — the swept extent rides along so the worker can tighten its
-        // mask-coverage guard from `PAGE_SLOTS * pages` to the real `active_cap * pages`.
-        let superdsc_decode_rungs: std::cell::RefCell<Vec<(u32, u32, String)>> =
-            std::cell::RefCell::new(Vec::new());
+        // (seqs, active_cap, body_fp, OWN load_consts) — the swept extent rides along so the worker
+        // can tighten its mask-coverage guard from `PAGE_SLOTS * pages` to the real
+        // `active_cap * pages`, and the consts are THIS RUNG'S OWN KINDS (staged at the rung's own
+        // `rows` — the ten uniform `[rows, 1]` tables' stick heads are per-width, Finding 1's
+        // compounding half: the single-request wiring's rows=1 kinds staged into a rows=N rung
+        // left every row past 0 reading zero).
+        let superdsc_decode_rungs: std::cell::RefCell<
+            Vec<(
+                u32,
+                u32,
+                String,
+                Vec<(u32, scratchy_target_spyre::wiring::LoadConst)>,
+            )>,
+        > = std::cell::RefCell::new(Vec::new());
         // The PREFIX-CAPABLE ladder `[(mq, body_fp)]` — the prefill bundles baked with a full
         // resident-prefix sweep. Every prefix-free rung is baked ActiveCap::NONE because a start==0 chunk
         // has nothing resident to attend, which drops 308 of 710 ops/layer. A CONTINUATION chunk (start>0)
@@ -11195,10 +11222,16 @@ fn dump_wavefront_mega(
                 fp: String,
             },
             PrefillFp(String),
+            // ⭐ THE RUNG'S OWN KINDS ride the effect: the decode batch rung's
+            // load_consts at ITS OWN `rows`, from THIS bake's wiring (`gk`) —
+            // the one derivation, carried to the manifest so the worker never
+            // stages the single-request wiring's rows=1 kinds into a wider
+            // rung (Finding 1's compounding half).
             DecodeRung {
                 rows: u32,
                 cap: u32,
                 fp: String,
+                consts: Vec<(u32, scratchy_target_spyre::wiring::LoadConst)>,
             },
             DecodeFp(String),
             FoldCensus {
@@ -11466,6 +11499,22 @@ fn dump_wavefront_mega(
                 // COMPILE-gated on `superdsc`: the sdsc emitter module only exists under that feature, so a
                 // `spyre`-only (ktir) build must not compile this block at all (`sendnn_superdsc` alone is a
                 // runtime bool and would still require the module to resolve).
+                // ⭐ THE WIRING COMES OFF THE LOWERING THAT EMITS THE PROGRAMS. Its parameter
+                // pairings are the ones the bundle's launches bind, so there is one lowering and
+                // the wiring cannot describe a different program than the one that ships.
+                // ⭐ HOISTED ABOVE THE REROLL BAKE: the decode batch rung's effect (pushed inside
+                // that bake) carries THIS bake's own `load_consts` — the kinds at the rung's own
+                // `rows`, never the single-request wiring's (Finding 1's compounding half) — so
+                // the derivation must exist before the push. `krg` is minted and validated above
+                // and only ever borrowed below, so computing the wiring here is the same value at
+                // an earlier point, nothing more.
+                let gk = match scratchy_target_spyre::lower_subtile_tape_to_superdsc::graph_wiring(
+                    &krg,
+                    &weight_ids,
+                ) {
+                    Ok(w) => w,
+                    Err(e) => panic!("[spyre] {base}: wiring not lowerable — {}", e.0),
+                };
                 if sendnn_superdsc && seq_sym.is_none() {
                     use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
                     // ── GATE-1 de-risk: when `SCRATCHY_SUPERDSC_GATE1=1`, also drop a
@@ -12584,6 +12633,13 @@ fn dump_wavefront_mega(
                                                     rows: decode_rows,
                                                     cap,
                                                     fp: bfp.clone(),
+                                                    // THIS rung's own kinds — the wiring `gk`
+                                                    // derived from THIS bake's `krg`, whose
+                                                    // mint ran at `decode_rows`. Not the
+                                                    // single-request wiring's list: the ten
+                                                    // uniform `[rows, 1]` tables stage at the
+                                                    // rung's own rows.
+                                                    consts: gk.load_consts.clone(),
                                                 });
                                             }
                                             // The one-request bundle stays THE decode bundle for
@@ -12655,16 +12711,9 @@ fn dump_wavefront_mega(
                 // overridden by the SUPERDSC_BUNDLE sentinel downstream. `group_graphs` stays empty
                 // (a placeholder group is synthesized by the caller to carry the sentinel).
                 let sengraph_json = String::new();
-                // ⭐ THE WIRING COMES OFF THE LOWERING THAT EMITS THE PROGRAMS. Its parameter
-                // pairings are the ones the bundle's launches bind, so there is one lowering and
-                // the wiring cannot describe a different program than the one that ships.
-                let gk = match scratchy_target_spyre::lower_subtile_tape_to_superdsc::graph_wiring(
-                    &krg,
-                    &weight_ids,
-                ) {
-                    Ok(w) => w,
-                    Err(e) => panic!("[spyre] {base}: wiring not lowerable — {}", e.0),
-                };
+                // (the wiring `gk` was already derived above the reroll bake — the decode batch
+                // rung's effect carries this bake's own load_consts, so the derivation precedes
+                // the bake)
                 // The census entry for this program: the fold set the wiring just recognized,
                 // sorted by tid so two walks that found the same folds in a different node
                 // order still compare equal.
@@ -12931,10 +12980,10 @@ fn dump_wavefront_mega(
                         }
                     }
                     BakeEffect::PrefillFp(fp) => *superdsc_prefill_fp.borrow_mut() = Some(fp),
-                    BakeEffect::DecodeRung { rows, cap, fp } => {
+                    BakeEffect::DecodeRung { rows, cap, fp, consts } => {
                         let mut r = superdsc_decode_rungs.borrow_mut();
-                        if !r.iter().any(|(n, _, _)| *n == rows) {
-                            r.push((rows, cap, fp));
+                        if !r.iter().any(|(n, _, _, _)| *n == rows) {
+                            r.push((rows, cap, fp, consts));
                         }
                     }
                     BakeEffect::DecodeFp(fp) => *superdsc_fp.borrow_mut() = Some(fp),
@@ -13941,12 +13990,12 @@ fn dump_wavefront_mega(
             // slice and the worker keeps its one-request-per-forward path untouched.
             let decode_rung_lits: Vec<proc_macro2::TokenStream> = {
                 let mut rungs = superdsc_decode_rungs.borrow().clone();
-                rungs.sort_by_key(|(n, _, _)| *n);
-                rungs.dedup_by_key(|(n, _, _)| *n);
+                rungs.sort_by_key(|(n, _, _, _)| *n);
+                rungs.dedup_by_key(|(n, _, _, _)| *n);
                 if rungs.len() > 1 {
                     rungs
                         .iter()
-                        .map(|(n, swept, fp)| {
+                        .map(|(n, swept, fp, consts)| {
                             // ⛔ `RungSeqs`, NOT a bare u32: `superdsc_decode_rungs` is keyed by
                             // `decode_rows` (the BATCH WIDTH), while the sibling `sk_bucket_rungs` list is
                             // keyed by `active_cap` (the SWEEP EXTENT). Both were `(u32, String)`, and the
@@ -13956,11 +14005,21 @@ fn dump_wavefront_mega(
                             let sw = proc_macro2::Literal::u32_unsuffixed(*swept);
                             let sfp =
                                 proc_macro2::Literal::string(&format!("SUPERDSC_BUNDLE:{fp}"));
+                            // ⭐ THE RUNG'S OWN KINDS — staged by the worker into THIS rung's
+                            // session, never the single-request wiring's list: the ten uniform
+                            // `[rows, 1]` tables' stick heads are per-width (Finding 1's
+                            // compounding half). Rendered by the ONE load-const renderer the
+                            // wiring static itself uses, so the spellings cannot drift.
+                            let consts = consts
+                                .iter()
+                                .map(|entry| load_const_entry_tokens(entry))
+                                .collect::<Vec<_>>();
                             quote! {
                                 (
                                     ::scratchy_target_spyre::manifest::RungSeqs::new(#n),
                                     ::scratchy_target_spyre::manifest::SweptCols::new(#sw),
                                     ::scratchy_target_spyre::manifest::BundleSentinel::new(#sfp),
+                                    &[#(#consts),*],
                                 )
                             }
                         })
