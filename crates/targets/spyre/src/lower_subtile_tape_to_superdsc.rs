@@ -3829,10 +3829,18 @@ fn teacher_forced_walk<F: RopeForm>(
                 // stick above it is sized by the IR and never written), so the
                 // row compares the emulator's row 0 against this walk's LAST
                 // row (the `selector_lastrow_col` extraction the lowering
-                // pins) and the teacher's pin is skipped: every row-bearing
-                // consumer of a folded tid is itself folded (row-less by the
-                // readback-length check above), so there is nothing
-                // downstream to teacher-force with the emu's value.
+                // pins). The teacher still pins — the fold's own pin: the
+                // program wrote ONE row, row 0, the row the fold's consumers
+                // read (the Sample's `SampleRows::Folded` region is rows
+                // 0..1), so the emulator's row 0 is pinned there and rows 1..
+                // stay as the walk computed them (the program never wrote
+                // them, and the fold law of every downstream folded tid reads
+                // the walk's LAST row). Without this pin the walk's Sample
+                // re-drew from the WALK's row 0 — the FIRST prompt
+                // position's logits, not the fold's product — and the draw's
+                // local read golden-draw-vs-emu-draw (measured: granite
+                // 1771-vs-12660 = 6.1485, llama 113360-vs-67129 = 0.4078,
+                // both exactly |g−e|/g).
                 let rcols = node.output.region.cols.len as usize;
                 if lm_head_folded.contains(&tid)
                     && rcols > 0
@@ -3850,6 +3858,17 @@ fn teacher_forced_walk<F: RopeForm>(
                         local: rel_l1(e_row, tf_row),
                         inherited: rel_l1(tf_row, g_row),
                     });
+                    let row0 = scratchy_subtile::subtile_ir::Region {
+                        rows: scratchy_subtile::subtile_ir::Range::new(0, 1),
+                        cols: node.output.region.cols,
+                    };
+                    scratchy_subtile::subtile_ir::scatter(
+                        &mut tf,
+                        node.output.tensor,
+                        row0,
+                        e_row,
+                        shape,
+                    );
                 } else {
                     rows.push(TeacherForcedRow {
                         tid,
