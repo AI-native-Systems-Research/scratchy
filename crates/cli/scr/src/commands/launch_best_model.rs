@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project
 
-//! `scr launch claude --auto-mode` (`-A`) — pick the model to serve from this
+//! `scr launch claude --best-model` (`-A`) — pick the model to serve from this
 //! Mac's memory class instead of naming one. Metal only.
 //!
 //! The pick is the biggest quantized checkpoint in [`TIERS`] whose memory floor
@@ -17,8 +17,8 @@
 //! fits and be refused. The compressed TurboQuant KV cache a `metal` build
 //! compiles in is what stretches that window.
 //!
-//! `-a <MODEL>` keeps the auto-mode settings but serves `<MODEL>` instead of the
-//! pick.
+//! `-a <MODEL>` keeps the `--best-model` settings but serves `<MODEL>` instead
+//! of the pick.
 
 use std::process::Command;
 
@@ -146,38 +146,38 @@ fn detect() -> Result<Gpu> {
     let out = Command::new("sysctl")
         .args(["-n", "hw.memsize", "machdep.cpu.brand_string"])
         .output()
-        .context("--auto-mode could not run `sysctl` to size the GPU")?;
+        .context("--best-model could not run `sysctl` to size the GPU")?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     parse_sysctl(&stdout).with_context(|| {
         format!(
-            "--auto-mode could not read this Mac's memory from `sysctl` (got {:?}); name a \
+            "--best-model could not read this Mac's memory from `sysctl` (got {:?}); name a \
              model instead: `scr launch claude <MODEL>`",
             stdout.trim()
         )
     })
 }
 
-/// Resolve auto mode for `args`: `None` when neither `-A` nor `-a` was given,
-/// otherwise the model to serve.
+/// Resolve `--best-model` for `args`: `None` when neither `-A` nor `-a` was
+/// given, otherwise the model to serve.
 pub(crate) fn resolve(args: &LaunchClaudeArgs) -> Result<Option<String>> {
-    if !args.auto_mode && args.auto_model.is_none() {
+    if !args.best_model && args.best_model_override.is_none() {
         return Ok(None);
     }
     if !cfg!(feature = "metal") {
         bail!(
-            "--auto-mode picks a model for this Mac's GPU, and this build has no metal backend. \
+            "--best-model picks a model for this Mac's GPU, and this build has no metal backend. \
              Rebuild with `--features metal`."
         );
     }
     if args.device == "cpu" {
-        bail!("--auto-mode sizes the model to the GPU; it has nothing to size with --device cpu");
+        bail!("--best-model sizes the model to the GPU; it has nothing to size with --device cpu");
     }
     let gpu = detect()?;
     let mem_gib = gpu.mem_bytes as f64 / GIB as f64;
 
-    if let Some(model) = &args.auto_model {
+    if let Some(model) = &args.best_model_override {
         eprintln!(
-            "scratchy auto mode: {} ({mem_gib:.0} GiB) → {model} (from -a; context sized by the \
+            "scratchy best model: {} ({mem_gib:.0} GiB) → {model} (from -a; context sized by the \
              server to what the KV cache holds)",
             gpu.name
         );
@@ -187,7 +187,7 @@ pub(crate) fn resolve(args: &LaunchClaudeArgs) -> Result<Option<String>> {
     let compiled = super::model::compiled_variant_stems();
     let pick = pick(gpu.mem_bytes, &compiled).map_err(|tier| {
         anyhow::anyhow!(
-            "--auto-mode picked {} for {} ({mem_gib:.0} GiB), but this binary does not compile \
+            "--best-model picked {} for {} ({mem_gib:.0} GiB), but this binary does not compile \
              it in. Build it with:\n  {}\nor name a model this build has: `scr launch claude \
              -a <MODEL>`.",
             tier.model,
@@ -203,7 +203,7 @@ pub(crate) fn resolve(args: &LaunchClaudeArgs) -> Result<Option<String>> {
         );
     }
     eprintln!(
-        "scratchy auto mode: {} ({mem_gib:.0} GiB) → {} ({} weights; context sized by the server \
+        "scratchy best model: {} ({mem_gib:.0} GiB) → {} ({} weights; context sized by the server \
          to what the KV cache holds)",
         gpu.name, pick.tier.model, pick.tier.weights
     );

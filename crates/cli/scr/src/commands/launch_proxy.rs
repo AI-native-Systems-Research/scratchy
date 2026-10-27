@@ -112,15 +112,18 @@ pub(crate) async fn start(routes: Routes) -> Result<ProxyHandle> {
         // A non-2xx answer is the gateway's to give Claude Code, not an error
         // here.
         .http_status_as_error(false)
-        // Ask for an uncompressed body. ureq decodes a gzip body whatever it
-        // asked for, so `forward` also drops `content-encoding`, which would
-        // otherwise describe bytes the client never receives.
-        .accept_encoding("")
         .max_redirects(0)
         .build()
         .into();
     let state = Arc::new(Proxy { routes, agent });
-    let app = axum::Router::new().fallback(handle).with_state(state);
+    let app = axum::Router::new()
+        .fallback(handle)
+        // axum caps a `Bytes` body at 2 MB by default. A long Claude Code
+        // session carries the whole conversation (file contents, tool output,
+        // images) in every request, and would get a 413 from here instead of
+        // reaching the gateway.
+        .layer(axum::extract::DefaultBodyLimit::disable())
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -262,11 +265,15 @@ fn forward<'a>(
         .run(req)
         .with_context(|| format!("{method} {url} failed"))?;
 
+    // The body and its `content-encoding` pass through as the upstream sent
+    // them: this build's ureq has no gzip or brotli decoder, so a compressed
+    // body Claude Code asked for (it sends `accept-encoding: gzip, …`) reaches
+    // it still compressed and still labelled. `forwards_a_compressed_body_untouched`
+    // fails if a decoder is ever compiled in.
     let (parts, body) = resp.into_parts();
     let mut out = Response::builder().status(parts.status.as_u16());
     for (k, v) in parts.headers.iter() {
-        // ureq hands over a decoded body, so its encoding no longer applies.
-        if HOP_BY_HOP.contains(&k.as_str()) || k.as_str() == "content-encoding" {
+        if HOP_BY_HOP.contains(&k.as_str()) {
             continue;
         }
         if let (Ok(k), Ok(v)) = (
@@ -388,5 +395,142 @@ mod tests {
         );
         assert!(classifier_body(&Method::POST, "/v1/models", &classifier, "m").is_none());
         assert!(classifier_body(&Method::POST, "/v1/messages", b"not json", "m").is_none());
+    }
+
+    /// What a stand-in upstream received: one entry per request.
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<(axum::http::HeaderMap, Vec<u8>)>>>;
+
+    /// A stand-in upstream: records each request and answers with a gzip-labelled
+    /// body, the way a gateway compresses a reply Claude Code accepted gzip for.
+    async fn upstream(reply: &'static [u8]) -> (String, Seen) {
+        use axum::body::Bytes;
+        use axum::http::HeaderMap;
+        let seen: Seen = Default::default();
+        let log = seen.clone();
+        let app = axum::Router::new()
+            .fallback(move |headers: HeaderMap, body: Bytes| {
+                let log = log.clone();
+                async move {
+                    log.lock().unwrap().push((headers, body.to_vec()));
+                    ([("content-encoding", "gzip")], reply)
+                }
+            })
+            .layer(axum::extract::DefaultBodyLimit::disable());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, seen)
+    }
+
+    /// A proxy in front of two stand-ins, and a blocking POST through it.
+    async fn proxy_with_upstreams() -> (super::ProxyHandle, Seen, Seen) {
+        let (gateway, gateway_seen) = upstream(b"\x1f\x8bgateway").await;
+        let (local, local_seen) = upstream(b"\x1f\x8blocal").await;
+        let proxy = super::start(super::Routes {
+            gateway,
+            local,
+            local_model: "local-model".to_string(),
+        })
+        .await
+        .unwrap();
+        (proxy, gateway_seen, local_seen)
+    }
+
+    /// POST `body` through the proxy at `addr`; the reply's status, its
+    /// `content-encoding`, and its raw bytes.
+    async fn post(addr: std::net::SocketAddr, body: Vec<u8>) -> (u16, Option<String>, Vec<u8>) {
+        tokio::task::spawn_blocking(move || {
+            let agent: ureq::Agent = ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .build()
+                .into();
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("http://{addr}/v1/messages?beta=true"))
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer user-token")
+                .header("accept-encoding", "gzip")
+                .body(body)
+                .unwrap();
+            let resp = agent.run(req).unwrap();
+            let status = resp.status().as_u16();
+            let encoding = resp
+                .headers()
+                .get("content-encoding")
+                .map(|v| v.to_str().unwrap().to_string());
+            let bytes = resp.into_body().read_to_vec().unwrap();
+            (status, encoding, bytes)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A classifier check goes to the local server with Claude Code's
+    /// credentials dropped; anything else goes to the gateway with them intact.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn routes_each_request_to_its_upstream() {
+        let (proxy, gateway, local) = proxy_with_upstreams().await;
+
+        let check = json!({ "model": CLASSIFIER_MODEL, "max_tokens": 8, "messages": [
+            { "role": "user", "content": [{ "type": "text", "text": "x" }] }
+        ]});
+        post(proxy.addr, serde_json::to_vec(&check).unwrap()).await;
+        let main = json!({ "model": "claude-opus-5-5", "max_tokens": 8, "messages": [] });
+        post(proxy.addr, serde_json::to_vec(&main).unwrap()).await;
+        post(proxy.addr, b"not json".to_vec()).await;
+
+        let local = local.lock().unwrap();
+        assert_eq!(local.len(), 1, "only the classifier check goes local");
+        let (headers, body) = &local[0];
+        assert!(
+            headers.get("authorization").is_none(),
+            "credentials stay off the local server"
+        );
+        let body: Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(body["model"], "local-model");
+
+        let gateway = gateway.lock().unwrap();
+        assert_eq!(
+            gateway.len(),
+            2,
+            "the session and the malformed body go to the gateway"
+        );
+        for (headers, _) in gateway.iter() {
+            assert_eq!(headers["authorization"], "Bearer user-token");
+            assert_eq!(headers["accept-encoding"], "gzip");
+        }
+        assert_eq!(
+            gateway[0].1,
+            serde_json::to_vec(&main).unwrap(),
+            "byte for byte"
+        );
+        assert_eq!(gateway[1].1, b"not json");
+    }
+
+    /// A compressed reply reaches Claude Code exactly as the upstream sent it,
+    /// still labelled `content-encoding: gzip`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forwards_a_compressed_body_untouched() {
+        let (proxy, _, _) = proxy_with_upstreams().await;
+        let main = json!({ "model": "claude-opus-5-5", "max_tokens": 8, "messages": [] });
+        let (status, encoding, bytes) = post(proxy.addr, serde_json::to_vec(&main).unwrap()).await;
+        assert_eq!(status, 200);
+        assert_eq!(encoding.as_deref(), Some("gzip"));
+        assert_eq!(bytes, b"\x1f\x8bgateway");
+    }
+
+    /// A request past axum's 2 MB default reaches the gateway instead of a 413.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forwards_a_body_past_two_megabytes() {
+        let (proxy, gateway, _) = proxy_with_upstreams().await;
+        let big = json!({
+            "model": "claude-opus-5-5",
+            "max_tokens": 8,
+            "messages": [{ "role": "user", "content": "x".repeat(5 << 20) }]
+        });
+        let body = serde_json::to_vec(&big).unwrap();
+        let (status, _, _) = post(proxy.addr, body.clone()).await;
+        assert_eq!(status, 200);
+        assert_eq!(gateway.lock().unwrap()[0].1.len(), body.len());
     }
 }

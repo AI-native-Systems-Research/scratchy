@@ -21,7 +21,7 @@ pub mod convert;
 #[cfg(feature = "claude")]
 pub mod launch;
 #[cfg(feature = "claude")]
-pub mod launch_auto;
+pub mod launch_best_model;
 #[cfg(feature = "claude")]
 pub mod launch_proxy;
 pub mod model;

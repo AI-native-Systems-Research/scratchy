@@ -194,6 +194,12 @@ async fn run_auto_mode_only(
     server: Option<ServerProcess>,
     inject: SessionInject,
 ) -> Result<()> {
+    // A server launch did not start may still think before it answers, and a
+    // check whose verdict comes late or never is denied (`serve_argv` turns
+    // thinking off only for a server launch starts).
+    if let Some(warning) = external_classifier_warning(server.is_none()) {
+        eprintln!("{warning}");
+    }
     // The served id, not the one launch was given: a local path or an alias
     // serves under a name of the server's own.
     let local_model =
@@ -227,16 +233,7 @@ async fn run_auto_mode_only(
     if !mode_in_args {
         cmd.arg("--permission-mode").arg("auto");
     }
-    match &inject {
-        SessionInject::Resume(id) => {
-            cmd.arg("--resume").arg(id);
-        }
-        SessionInject::New(id) => {
-            cmd.arg("--session-id").arg(id);
-        }
-        SessionInject::AlreadyInArgs | SessionInject::Continue => {}
-    }
-    cmd.args(&args.claude_args);
+    add_session_args(&mut cmd, &inject, &args.claude_args);
 
     eprintln!(
         "Launching `{}` in auto mode: session → {gateway}, safety checks → {local_url} \
@@ -263,13 +260,51 @@ async fn run_auto_mode_only(
     drop(server);
 
     eprintln!("{}", auto_mode_report(served_before, served_after));
-    if !status.success() {
-        if let Some(code) = status.code() {
-            bail!("`{}` exited with status {code}", args.claude_bin);
+    claude_exit(&args.claude_bin, status)
+}
+
+/// The session flag launch adds to the `claude` command line, then the user's
+/// own passed-through args. Shared by both launch paths so they cannot drift.
+fn add_session_args(
+    cmd: &mut std::process::Command,
+    inject: &SessionInject,
+    claude_args: &[String],
+) {
+    match inject {
+        SessionInject::Resume(id) => {
+            cmd.arg("--resume").arg(id);
         }
-        bail!("`{}` terminated by signal", args.claude_bin);
+        SessionInject::New(id) => {
+            cmd.arg("--session-id").arg(id);
+        }
+        // Already on the command line, or `--continue` picks the session.
+        SessionInject::AlreadyInArgs | SessionInject::Continue => {}
     }
-    Ok(())
+    cmd.args(claude_args);
+}
+
+/// `claude`'s exit status as launch's own result.
+fn claude_exit(claude_bin: &str, status: std::process::ExitStatus) -> Result<()> {
+    if status.success() {
+        return Ok(());
+    }
+    match status.code() {
+        Some(code) => bail!("`{claude_bin}` exited with status {code}"),
+        None => bail!("`{claude_bin}` terminated by signal"),
+    }
+}
+
+/// The warning `--auto-mode-only` prints when the local server is one launch did
+/// not start (`--server-url`), so its thinking setting is not launch's to set.
+fn external_classifier_warning(external: bool) -> Option<String> {
+    external.then(|| {
+        "Warning: --server-url uses a server launch did not start, so launch cannot turn its \
+         thinking off. A model that reasons before answering (Qwen3.6, for one) is slow on safety \
+         checks and Claude Code denies the action when no verdict comes back. Start that server \
+         with `--default-chat-template-kwargs '{\"enable_thinking\": false}'`, or drop \
+         --server-url and let launch start one."
+            .to_string()
+    })
 }
 
 /// What the local server's request count says about the safety checks. Zero is
@@ -747,13 +782,13 @@ fn continues_latest_session(args: &[String]) -> bool {
 }
 
 pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
-    let model = match super::launch_auto::resolve(&args)? {
+    let model = match super::launch_best_model::resolve(&args)? {
         Some(model) => model,
         None => args
             .model_tag
             .clone()
             .or_else(|| args.model.clone())
-            .context("a model is required: `scr launch claude <MODEL>`, or `--auto-mode`/`-A`")?,
+            .context("a model is required: `scr launch claude <MODEL>`, or `--best-model`/`-A`")?,
     };
 
     // Launch owns `--settings`: it is how the server under test is made to
@@ -931,16 +966,7 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
     // "slower and cost more" warning without any benefit.
     // Forward the session flag to claude — except when it's already in the
     // passed-through `-- …` args (case 3), where re-adding would duplicate it.
-    match &inject {
-        SessionInject::Resume(id) => {
-            cmd.arg("--resume").arg(id);
-        }
-        SessionInject::New(id) => {
-            cmd.arg("--session-id").arg(id);
-        }
-        SessionInject::AlreadyInArgs | SessionInject::Continue => {}
-    }
-    cmd.args(&args.claude_args);
+    add_session_args(&mut cmd, &inject, &args.claude_args);
 
     eprintln!(
         "Launching `{}` against {base_url} (model: {model}{window_label}{budget_label})",
@@ -985,11 +1011,8 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
     // is the more specific explanation of why nothing was served.
     if !status.success() {
         eprintln!("{report}");
-        if let Some(code) = status.code() {
-            bail!("`{}` exited with status {code}", args.claude_bin);
-        }
-        bail!("`{}` terminated by signal", args.claude_bin);
     }
+    claude_exit(&args.claude_bin, status)?;
 
     // A non-interactive run that served nothing fails the command even though
     // `claude` exited 0, so a harness learns it from the exit status instead of
@@ -1405,9 +1428,10 @@ mod tests {
         ClaudeCodeLimits, LaunchClaudeArgs, PROVIDER_SELECTION_VARS, SessionInject,
         SmallWindowOrigin, asked_max_model_len, auto_mode_only_env, claude_code_floor_warning,
         claude_code_output_budget, claude_code_window, claude_settings_json,
-        context_window_from_models, context_window_warning, gen_uuid_v4, ignored_with_server_url,
-        is_print_mode, launch_env, provenance_report, resolve_session_inject, serve_argv,
-        session_id_from_args, settings_flag_in_args, user_gateway,
+        context_window_from_models, context_window_warning, external_classifier_warning,
+        gen_uuid_v4, ignored_with_server_url, is_print_mode, launch_env, provenance_report,
+        resolve_session_inject, serve_argv, session_id_from_args, settings_flag_in_args,
+        user_gateway,
     };
 
     fn s(v: &[&str]) -> Vec<String> {
@@ -1425,21 +1449,24 @@ mod tests {
     }
 
     /// `-A` and `-a <MODEL>` / `-a=<MODEL>` parse with no positional model, and
-    /// both refuse one: auto mode picks the model, so a second source is a typo.
+    /// both refuse one: `--best-model` picks the model, so a second source is a
+    /// typo. The old `--auto-mode` spelling is gone, so "auto mode" means only
+    /// Claude Code's permission mode.
     #[test]
-    fn auto_mode_flags_parse_without_a_model() {
+    fn best_model_flags_parse_without_a_model() {
         use clap::Parser as _;
         let parse = |argv: &[&str]| LaunchClaudeArgs::try_parse_from(argv);
 
-        assert!(parse(&["claude", "-A"]).unwrap().auto_mode);
-        assert!(parse(&["claude", "--auto-mode"]).unwrap().auto_mode);
+        assert!(parse(&["claude", "-A"]).unwrap().best_model);
+        assert!(parse(&["claude", "--best-model"]).unwrap().best_model);
+        assert!(parse(&["claude", "--auto-mode"]).is_err());
         for argv in [
             &["claude", "-a", "mlx-community/Qwen3.5-9B-4bit"][..],
             &["claude", "-a=mlx-community/Qwen3.5-9B-4bit"][..],
         ] {
             let args = parse(argv).unwrap();
             assert_eq!(
-                args.auto_model.as_deref(),
+                args.best_model_override.as_deref(),
                 Some("mlx-community/Qwen3.5-9B-4bit")
             );
             assert_eq!(args.model_tag, None);
@@ -1455,6 +1482,7 @@ mod tests {
         use clap::Parser as _;
         let parse = |argv: &[&str]| LaunchClaudeArgs::try_parse_from(argv).unwrap();
         assert!(parse(&["claude", "--auto-mode-only", "-A"]).auto_mode_only);
+        assert!(parse(&["claude", "--auto-mode-only", "--best-model"]).auto_mode_only);
         assert!(parse(&["claude", "--auto-mode-only", "-a=m"]).auto_mode_only);
         assert!(parse(&["claude", "--auto-mode-only", "m"]).auto_mode_only);
         assert!(!parse(&["claude", "m"]).auto_mode_only);
@@ -1491,6 +1519,16 @@ mod tests {
                 "{untouched} is the user's, not launch's"
             );
         }
+    }
+
+    /// A server launch did not start gets a warning naming the flag that turns
+    /// its thinking off; one launch started (thinking already off) gets none.
+    #[test]
+    fn auto_mode_only_warns_about_an_external_servers_thinking() {
+        let warning = external_classifier_warning(true).expect("external server warns");
+        assert!(warning.contains("--default-chat-template-kwargs"));
+        assert!(warning.contains("enable_thinking"));
+        assert_eq!(external_classifier_warning(false), None);
     }
 
     /// The gateway comes from the user's own `ANTHROPIC_BASE_URL`; without one
