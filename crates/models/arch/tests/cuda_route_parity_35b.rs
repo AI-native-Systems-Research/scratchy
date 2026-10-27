@@ -27,8 +27,11 @@
 //! - Gate, layers 1-39: a flip inside a router tie (the same τ as layer 0) is accepted, with no
 //!   count limit; a flip outside one is accepted only when the same token flipped at an earlier
 //!   layer (inside a tie or not), since its input then legitimately differs; a flip outside a tie
-//!   on a token with no earlier flip fails (the user's decision 2026-10-27, option (a)). Per
-//!   layer, the outside-tie flips an earlier flip excuses and those it does not are printed.
+//!   on a token with no earlier flip fails (the user's decision 2026-10-27, option (a)), unless
+//!   HF-bf16 flips at least as many tokens as CUDA in that layer (the user's decision 2026-10-27,
+//!   option (a) amended: rounding demonstrably flips picks there, and CUDA is no worse than HF's
+//!   bf16). Per layer, the outside-tie flips an earlier flip excuses, those it does not, and which
+//!   excuse applied are printed.
 //! - Attribution for P5/P7, printed: per greedy step of prompts 1-5 (HF-f32's sequence), the
 //!   first layer at which the step's last token's CUDA pick differs from HF-f32's.
 //!
