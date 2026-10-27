@@ -33,6 +33,16 @@ law: the generators ARE the input definition).
     scatter states, so a pre-scattered file would DOUBLE-scatter). Every
     staged fp16 value here is exact in both formats (multiples of 0.25 up
     to 200, 2^-14, 0.0 — ≤ 9 mantissa bits at their magnitudes).
+  * ⭐ THE LOGITS TILE ALONE carries the dl16→fp32 STAGGER, PRE-APPLIED
+    (round 3, auditor ruling item 4): the door's dl16tofp32 load writes its
+    output lane-permuted (DL16TOFP32_PERMUTATION, per 64-lane block), and
+    the EMPIRICAL law — with a row-major file y on the runner's stick: path,
+    the door's output lane l reads y[perm^-1(l)] — is undone by staging
+    y[j] = x[perm(j)] per 64-lane block. Production never host-stages the
+    logits tile (it is the lm-head matmul's on-card output), so this is the
+    kit's own gap, same class as the SEN codec above. The fp16 `[rows, 1]`
+    clamp table carries NO stagger (wiring.rs: an f16 table never carries
+    it — no lane stream to permute).
 The bake's `placements.json` states every size and the binds helper
 verifies each one, so the staging and the door cannot disagree.
 
@@ -160,6 +170,33 @@ def cmin_table(rows: int) -> np.ndarray:
     return t
 
 
+def dl16_perm() -> np.ndarray:
+    """DL16TOFP32_PERMUTATION (element_arrangement.rs): perm[g*4+r] =
+    rot(g)*4 + r, rot(g) = (g>>1) | ((g&1)<<3) — the 1-bit right rotation of
+    the 4-bit group index, per 64-lane block."""
+    perm = np.empty(64, dtype=np.int64)
+    for g in range(16):
+        rot = (g >> 1) | ((g & 1) << 3)
+        for r in range(4):
+            perm[g * 4 + r] = rot * 4 + r
+    return perm
+
+
+def pre_stagger_fp16(x: np.ndarray) -> np.ndarray:
+    """The logits tile staged so the door's dl16→fp32 stagger lands it
+    STANDARD: the empirical law (round 3, card-measured) is that with a
+    row-major file y on the runner's stick: path, the door's output lane l
+    reads y[perm^-1(l)] — so staging y[j] = x[perm(j)] per 64-lane block puts
+    x[l] on output lane l. Blockwise per row; PAD_V is a 64-multiple, so
+    every lane is covered and the tail law never engages."""
+    perm = dl16_perm()
+    blocks = x.reshape(x.shape[0], -1, 64)
+    # y[b, i] = x[b, perm[i]] per 64-lane block  <=>  y[j] = x[perm(j)] — a
+    # right-side gather; a left-side assignment would invert the direction.
+    y = blocks[:, :, perm]
+    return y.reshape(x.shape)
+
+
 # ── The host reference ──────────────────────────────────────────────────────
 
 
@@ -228,7 +265,10 @@ def staged(case: str) -> list[tuple[str, np.ndarray]]:
     sw = seed_words(rows)
     x = logits(rows)
     tables: list[tuple[str, np.ndarray]] = [
-        (f"sn_{case}_logits", x),  # fp16: row-major, staged via stick:t<id>
+        # fp16: row-major, staged via stick:t<id> — PRE-STAGGERED per the
+        # dl16→fp32 law above (the runner's stick: path then re-applies the
+        # permutation, landing the tile STANDARD on the card).
+        (f"sn_{case}_logits", pre_stagger_fp16(x)),
         (f"sn_{case}_slo", col_table(sw["slo"], np.uint32)),
         (f"sn_{case}_shi", col_table(sw["shi"], np.uint32)),
         (f"sn_{case}_stp", col_table(sw["stp"], np.uint32)),
