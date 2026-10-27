@@ -9,7 +9,6 @@
 //! it, and this is the invoking.
 
 // The pool/slot vocabulary is CARD-ONLY, so its imports carry the cfg of the blocks that use it.
-#[cfg(feature = "spyre-hw")]
 // The KTIR-emulator twin below (mask/rope pad-row clamping) — the card's twin shares the laws
 // through `ChunkRows` already.
 #[cfg(not(feature = "spyre-hw"))]

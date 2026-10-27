@@ -107,6 +107,15 @@ pub(crate) struct BundleMeta {
     /// binds the same list through `wiring::constant_steps`; this is the emulator's copy of it.
     #[cfg(not(feature = "spyre-hw"))]
     pub(crate) scalarmul_scales: &'static [f32],
+    /// ⭐ THE WIRING'S OWN PHASE — decode's chained head vs prefill — projected
+    /// from `Wiring::phase` at load (`phase: wiring.phase`, never a second
+    /// derivation), so the emulator forward's chain-seed staging decides off
+    /// the same fact the tape's `ForwardShape` carries. On `Decode` the
+    /// per-step embed-row push is REPLACED by the sticks' seed; on `Prefill`
+    /// the host pushes the row. Emulator-only: the card path reads the phase
+    /// straight off its own `wiring` field below.
+    #[cfg(not(feature = "spyre-hw"))]
+    pub(crate) phase: scratchy_target_spyre::forward_tape::ForwardPhase,
     /// What the bake placed — asked ONCE, in the target crate, off the generated layout.
     /// Read only by the card launch path, so it carries that cfg like `prog`/`output_ids` above.
     #[cfg(feature = "spyre-hw")]

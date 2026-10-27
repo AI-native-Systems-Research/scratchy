@@ -2800,6 +2800,8 @@ impl SpyreWorker {
                 output_ids: p.output_ids,
                 #[cfg(not(feature = "spyre-hw"))]
                 scalarmul_scales: p.scalarmul_scales,
+                #[cfg(not(feature = "spyre-hw"))]
+                phase: wiring.phase,
                 #[cfg(feature = "spyre-hw")]
                 facts,
                 #[cfg(feature = "spyre-hw")]
