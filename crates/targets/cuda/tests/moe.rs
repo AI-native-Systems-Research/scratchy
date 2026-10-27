@@ -1525,3 +1525,683 @@ fn gemma_route_kernel_times_are_recorded() {
         );
     }
 }
+
+// ── Gemma 4's sort, grouped GEMM and GEMV at 128 experts (#924) ────
+
+use scratchy_target_cuda::kernels::{expert_gemm_tiled_bf16, gemm_col64_bf16_abt};
+use scratchy_target_cuda::step::{ExpertProjection, MoeBundle, expert_bank};
+
+/// Gemma 4 26B-A4B's hidden size and expert width (`gemma-4-26b-a4b-it`'s config).
+const GEMMA_H: usize = 2816;
+const GEMMA_I: usize = 704;
+
+/// `m` tokens' picks over Gemma's 128 experts: 8 distinct each, from `pick(t, j)` (deduplicated by
+/// stepping on).
+fn gemma_picks(m: usize, pick: impl Fn(usize, usize) -> usize) -> Vec<u32> {
+    let mut out = Vec::with_capacity(m * TOP_K);
+    for t in 0..m {
+        let mut row: Vec<u32> = Vec::with_capacity(TOP_K);
+        for j in 0..TOP_K {
+            let mut e = pick(t, j) % GEMMA_EXPERTS;
+            while row.contains(&(e as u32)) {
+                e = (e + 1) % GEMMA_EXPERTS;
+            }
+            row.push(e as u32);
+        }
+        out.extend(row);
+    }
+    out
+}
+
+/// The sort's routing cases at 128 experts and `m` tokens: every token to the same 8 experts (every
+/// other expert empty), uniform random picks, and runs of exactly 128 and 129 pairs.
+fn gemma_sort_cases(m: usize) -> Vec<(&'static str, Vec<u32>)> {
+    let mut r = mix(0x6E50_0000 ^ m as u64);
+    let random: Vec<usize> = (0..m * TOP_K).map(|_| r() as usize).collect();
+    vec![
+        ("skewed", gemma_picks(m, |_, j| 100 + j)),
+        ("uniform", gemma_picks(m, |t, j| random[t * TOP_K + j])),
+        // Expert 7 gets tokens 0..128 (a run of exactly 128), expert 9 tokens 0..129; the rest
+        // spread over 16..123, so never 7 or 9.
+        (
+            "runs_128_129",
+            gemma_picks(m, |t, j| match j {
+                0 if t < 128 => 7,
+                1 if t < 129 => 9,
+                _ => 16 + random[t * TOP_K + j] % 100,
+            }),
+        ),
+    ]
+}
+
+/// The exact host counting sort of `topk_idx` over Gemma's 128 experts, as [`sort_reference`] over
+/// 256: stable, each run padded to 128 rows, `u32::MAX` and `SENTINEL` where no live tile reaches.
+fn gemma_sort_reference(topk_idx: &[u32], x: &[u16], max_tiles: usize) -> Sorted {
+    let (experts, hidden) = (GEMMA_EXPERTS, GEMMA_H);
+    let mut counts = vec![0u32; experts];
+    for &e in topk_idx {
+        counts[e as usize] += 1;
+    }
+    let mut offsets = vec![0u32; experts + 1];
+    for e in 0..experts {
+        offsets[e + 1] = offsets[e] + ((counts[e] as usize).div_ceil(TILE_ROWS) * TILE_ROWS) as u32;
+    }
+    let mut tile_expert = vec![u32::MAX; max_tiles];
+    for e in 0..experts {
+        let tiles = offsets[e] as usize / TILE_ROWS..offsets[e + 1] as usize / TILE_ROWS;
+        tile_expert[tiles].fill(e as u32);
+    }
+    let mut next = offsets.clone();
+    let mut pos = vec![0u32; topk_idx.len()];
+    let mut rows = vec![SENTINEL; max_tiles * TILE_ROWS * hidden];
+    for (p, &e) in topk_idx.iter().enumerate() {
+        let r = next[e as usize] as usize;
+        next[e as usize] += 1;
+        pos[p] = r as u32;
+        let t = p / TOP_K;
+        rows[r * hidden..(r + 1) * hidden].copy_from_slice(&x[t * hidden..(t + 1) * hidden]);
+    }
+    for e in 0..experts {
+        for r in next[e] as usize..offsets[e + 1] as usize {
+            rows[r * hidden..(r + 1) * hidden].fill(0);
+        }
+    }
+    Sorted {
+        counts,
+        offsets,
+        tile_expert,
+        pos,
+        rows,
+    }
+}
+
+/// Upload a 128-expert sort's inputs (`m` tokens' rows `x`, `[m, 2816]`, and `topk_idx`) and its
+/// sentinel outputs, at the tape's `max_tiles` for `m` (`tape::moe_tiles`).
+fn gemma_sort_buffers(device: &CudaDevice, x: &[u16], topk_idx: &[u32], m: usize) -> SortBuffers {
+    let (pairs, max_tiles, _) =
+        moe_tiles(m as u32, GEMMA_EXPERTS as u32, TOP_K as u32).expect("tiles");
+    let regions = sort_index_regions(pairs, GEMMA_EXPERTS as u32, max_tiles)
+        .expect("regions")
+        .map(|b| b as usize);
+    SortBuffers {
+        x: up(device, x),
+        topk_idx: up_u32(device, topk_idx),
+        index: up_u32(device, &vec![u32::MAX; regions[5] / 4]),
+        rows: up(
+            device,
+            &vec![SENTINEL; max_tiles as usize * TILE_ROWS * GEMMA_H],
+        ),
+        regions,
+        max_tiles: max_tiles as usize,
+    }
+}
+
+/// Launch the 128-expert sort on `b` (`m` tokens), asynchronously on the default stream.
+fn gemma_launch_sort(b: &SortBuffers, m: usize) {
+    let at = |i: usize| b.index.ptr().wrapping_byte_add(b.regions[i]);
+    let regions = SortRegions {
+        chunk_hist: at(0),
+        counts: at(1),
+        offsets: at(2),
+        tile_expert: at(3),
+        pos: at(4),
+    };
+    // SAFETY: as `launch_sort`'s, at 128 experts and 2,816 columns: every region of
+    // `sort_index_regions(_, 128, _)` is 256-aligned inside `index`, `x` holds m·2816 bf16,
+    // `topk_idx` m·8 u32 below 128, `rows` max_tiles·128·2816 bf16.
+    unsafe {
+        moe_sort(
+            (b.x.ptr(), b.topk_idx.ptr()),
+            regions,
+            b.rows.ptr(),
+            (
+                m as u32,
+                GEMMA_EXPERTS as u32,
+                TOP_K as u32,
+                GEMMA_H as u32,
+                b.max_tiles as u32,
+            ),
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("moe_sort launch at 128 experts");
+}
+
+/// Launch the 128-expert sort on `b` (`m` tokens), wait, and download what it wrote.
+fn gemma_run_sort(b: &SortBuffers, m: usize) -> Sorted {
+    gemma_launch_sort(b, m);
+    let index = down_u32(&b.index);
+    let region = |i: usize, len: usize| index[b.regions[i] / 4..][..len].to_vec();
+    Sorted {
+        counts: region(1, GEMMA_EXPERTS),
+        offsets: region(2, GEMMA_EXPERTS + 1),
+        tile_expert: region(3, b.max_tiles),
+        pos: region(4, m * TOP_K),
+        rows: b.rows.download().expect("rows"),
+    }
+}
+
+/// The sort at 128 experts and Gemma's 2,816 columns (two bulk-copy chunks a row, the second 768
+/// wide), at P = 4,096 (m = 512) and P = 32,768 (m = 4,096), on each routing case: every index
+/// region and every live row bit-exact against the host counting sort, padding rows `+0.0`, rows
+/// past the live tiles never written, and a repeat bit-identical.
+#[test]
+fn gemma_sort_matches_the_host_counting_sort() {
+    let device = h100();
+    let mut pass = true;
+    for m in [512usize, 4096] {
+        let x = bf16_inputs(m * GEMMA_H, 0x6E50 ^ m as u64);
+        for (name, topk_idx) in gemma_sort_cases(m) {
+            let b = gemma_sort_buffers(&device, &x, &topk_idx, m);
+            let got = gemma_run_sort(&b, m);
+            let want = gemma_sort_reference(&topk_idx, &x, b.max_tiles);
+            let live = want.offsets[GEMMA_EXPERTS] as usize / TILE_ROWS;
+            let regions_ok = got.counts == want.counts
+                && got.offsets == want.offsets
+                && got.tile_expert[..live] == want.tile_expert[..live]
+                && got.pos == want.pos;
+            let rows_bad = mismatched_bits(&got.rows, &want.rows);
+            let repeat = gemma_run_sort(&b, m);
+            let same = repeat == got;
+            let ok = regions_ok && rows_bad == 0 && same;
+            eprintln!(
+                "gemma moe_sort experts=128 m={m} pairs={} {name}: live_tiles={live}/{} \
+                 regions_exact={regions_ok} rows_mismatched_bits={rows_bad} \
+                 repeat_identical={same} {}",
+                m * TOP_K,
+                b.max_tiles,
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    assert!(pass, "the 128-expert sort failed: see the lines above");
+}
+
+/// Gemma 4 26B-A4B's expert bank layout at its real geometry (`step::expert_bank(128, 2816, 704)`):
+/// the fused gate and up `[128, 1408, 2816]` at byte 0, then the down `[128, 2816, 704]`.
+fn gemma_bank_layout() -> MoeBundle {
+    expert_bank(GEMMA_EXPERTS as u32, GEMMA_H as u32, GEMMA_I as u32).expect("bank layout")
+}
+
+/// A synthetic expert bank of [`gemma_bank_layout`]'s bytes, bf16 in [-1, 1], built once.
+fn gemma_bank() -> &'static [u16] {
+    static BANK: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+    BANK.get_or_init(|| bf16_inputs(gemma_bank_layout().bytes as usize / 2, 0x6E3B_A4C0))
+}
+
+/// Projection `proj`'s `(n, k)`, its part's first element in the bank, its expert stride in
+/// elements and in rows of `k` (the launchers' `expert_rows`): [`ExpertProjection::slab`]'s, as the
+/// worker reads the bank.
+fn gemma_slab(proj: ExpertProjection) -> ((usize, usize), usize, usize, u32) {
+    let (h, i) = (GEMMA_H as u32, GEMMA_I as u32);
+    let (n, k) = proj.n_k(h, i);
+    let (part, stride) = proj.slab(gemma_bank_layout(), h, i).expect("slab");
+    let (part, stride) = (part as usize / 2, stride as usize / 2);
+    (
+        (n as usize, k as usize),
+        part,
+        stride,
+        (stride / k as usize) as u32,
+    )
+}
+
+/// The grouped GEMM at 128 experts on the sort's skewed and uniform outputs at m = 512 and 4,096,
+/// for Gemma's gate and up (`n` 704, `k` 2,816, `n_tile` 64, the sorted rows) and its down (`n`
+/// 2,816, `k` 704, `n_tile` 256, fresh activations), B the synthetic expert bank at the slab's
+/// offsets: every live tile's rows bit-identical to the 64-column GEMM (`n_tile` 64) or
+/// `gemm_bf16` (`n_tile` 256) on the same 128 rows against the same expert's `[n, k]`, within the
+/// #761 GEMM bound against f64 (one tile per case, sampled), and every dead tile's rows still at
+/// the sentinel.
+#[test]
+fn gemma_expert_gemm_is_the_dense_gemm_per_expert_tile() {
+    let device = h100();
+    let bank_bits = gemma_bank();
+    let bank = up(&device, bank_bits);
+    let mut pass = true;
+    for m in [512usize, 4096] {
+        for (name, topk_idx) in gemma_sort_cases(m).into_iter().take(2) {
+            let x = bf16_inputs(m * GEMMA_H, 0x6E33 ^ m as u64);
+            let sb = gemma_sort_buffers(&device, &x, &topk_idx, m);
+            let sorted = gemma_run_sort(&sb, m);
+            let live = sorted.offsets[GEMMA_EXPERTS] as usize / TILE_ROWS;
+            let max_tiles = sb.max_tiles;
+            let (ob, tb) = (
+                up_u32(&device, &sorted.offsets),
+                up_u32(&device, &sorted.tile_expert),
+            );
+            for (proj, n_tile) in [
+                (ExpertProjection::Gate, 64u32),
+                (ExpertProjection::Up, 64),
+                (ExpertProjection::Down, 256),
+            ] {
+                let ((n, k), part, stride, expert_rows) = gemma_slab(proj);
+                let a_bits = if k == GEMMA_H {
+                    sorted.rows.clone()
+                } else {
+                    bf16_inputs(max_tiles * TILE_ROWS * k, 0x6EAC ^ m as u64)
+                };
+                let a = up(&device, &a_bits);
+                let b = bank.ptr().wrapping_byte_add(part * 2);
+                let c = up(&device, &vec![SENTINEL; max_tiles * TILE_ROWS * n]);
+                // SAFETY: cudaMalloc pointers are 256-byte aligned; `a` holds max_tiles·128·k bf16;
+                // `b` is the bank's part, every expert's `[n, k]` inside the bank; `offsets` 129
+                // u32 and `tile_expert` max_tiles (the live ones below 128); `c` its own
+                // allocation of max_tiles·128·n; null is the default stream, which the download
+                // waits for.
+                unsafe {
+                    expert_gemm_tiled_bf16(
+                        (a.ptr(), b),
+                        (ob.ptr(), tb.ptr()),
+                        c.ptr(),
+                        (
+                            max_tiles as u32,
+                            n as u32,
+                            k as u32,
+                            GEMMA_EXPERTS as u32,
+                            expert_rows,
+                        ),
+                        n_tile,
+                        std::ptr::null_mut(),
+                    )
+                }
+                .expect("expert_gemm_tiled_bf16 launch at 128 experts");
+                let gpu = c.download().expect("download C");
+                let (mut bits_bad, mut bound_bad, mut worst) = (0usize, 0usize, 0.0f64);
+                let tile_len = TILE_ROWS * n;
+                let mut sampled = false;
+                for t in 0..live {
+                    let e = sorted.tile_expert[t] as usize;
+                    let at = t * TILE_ROWS;
+                    let a_t = up(&device, &a_bits[at * k..(at + TILE_ROWS) * k]);
+                    let b_e = bank.ptr().wrapping_byte_add((part + e * stride) * 2);
+                    let c_t = up(&device, &vec![SENTINEL; tile_len]);
+                    let shape = (TILE_ROWS as u32, n as u32, k as u32);
+                    // SAFETY (both): `a_t` holds 128·k bf16, `b_e` expert e's n·k inside the bank,
+                    // `c_t` its own allocation of 128·n; null is the default stream.
+                    let dense = if n_tile == 64 {
+                        unsafe {
+                            gemm_col64_bf16_abt(
+                                a_t.ptr(),
+                                b_e,
+                                c_t.ptr(),
+                                shape,
+                                std::ptr::null_mut(),
+                            )
+                        }
+                    } else {
+                        let (tm, tn, tk) = shape;
+                        unsafe {
+                            gemm_bf16_abt(
+                                a_t.ptr(),
+                                b_e,
+                                c_t.ptr(),
+                                tm,
+                                tn,
+                                tk,
+                                std::ptr::null_mut(),
+                            )
+                        }
+                    };
+                    dense.expect("dense GEMM launch");
+                    let tiled = c_t.download().expect("download");
+                    bits_bad += mismatched_bits(&gpu[at * n..][..tile_len], &tiled);
+                    // One tile per case against f64, the first that is not all padding.
+                    if !sampled && sorted.counts[e] > 0 {
+                        sampled = true;
+                        let w = part + e * stride;
+                        let cmp = common::numerics::compare(
+                            &gpu[at * n..][..tile_len],
+                            &a_bits[at * k..(at + TILE_ROWS) * k],
+                            &bank_bits[w..w + n * k],
+                            TILE_ROWS,
+                            n,
+                            k,
+                        );
+                        bound_bad += cmp.out_of_bound;
+                        let (_, _, g, r, bd) = cmp.worst;
+                        worst = (g - r).abs() / bd.max(f64::MIN_POSITIVE);
+                    }
+                }
+                let dead_untouched = gpu[live * tile_len..].iter().all(|&v| v == SENTINEL);
+                let ok = bits_bad == 0 && bound_bad == 0 && dead_untouched;
+                eprintln!(
+                    "gemma expert_gemm_bf16 experts=128 m={m} {name} {proj:?} n={n} k={k} \
+                     n_tile={n_tile}: live_tiles={live}/{max_tiles} mismatched_bits={bits_bad} \
+                     sampled_out_of_bound={bound_bad} sampled_worst_ratio={worst:.4} \
+                     dead_tiles_untouched={dead_untouched} {}",
+                    verdict(ok)
+                );
+                pass &= ok;
+            }
+        }
+    }
+    assert!(
+        pass,
+        "the 128-expert grouped GEMM failed: see the lines above"
+    );
+}
+
+/// The gathered expert GEMV at 128 experts and m = 1 on the synthetic expert bank: Gemma's gate
+/// and up (token rows, `n` 704, `k` 2,816) and its down (pair rows, `n` 2,816, `k` 704), with the
+/// 8 pairs on 8 distinct experts and on one repeated expert: each pair's row bit-identical to
+/// `gemv_bf16` on the same row and expert slab, within the #761 GEMM bound against f64, the tail
+/// intact.
+#[test]
+fn gemma_expert_gemv_is_gemv_bf16_per_pair() {
+    let device = h100();
+    let bank_bits = gemma_bank();
+    let bank = up(&device, bank_bits);
+    let mut pass = true;
+    let pairs = TOP_K;
+    for (case, topk_idx) in [
+        ("distinct", vec![3u32, 120, 17, 64, 0, 127, 99, 42]),
+        ("repeated", vec![42u32; TOP_K]),
+    ] {
+        for proj in [
+            ExpertProjection::Gate,
+            ExpertProjection::Up,
+            ExpertProjection::Down,
+        ] {
+            let ((n, k), part, stride, expert_rows) = gemma_slab(proj);
+            let pair_rows = proj.reads_pairs();
+            let a_rows = if pair_rows { pairs } else { 1 };
+            let a_bits = bf16_inputs(a_rows * k, 0x6E6E ^ n as u64);
+            let a = up(&device, &a_bits);
+            let ib = up_u32(&device, &topk_idx);
+            let c = up(&device, &vec![SENTINEL; pairs * n + TAIL]);
+            // SAFETY: cudaMalloc pointers are 256-byte aligned; `a` holds a_rows·k bf16, the
+            // bank's part every expert's `[n, k]`, `topk_idx` 8 u32 below 128, `c` its own
+            // allocation of 8·n and the tail; null is the default stream, which the download
+            // waits for.
+            unsafe {
+                expert_gemv_bf16(
+                    (a.ptr(), bank.ptr().wrapping_byte_add(part * 2), ib.ptr()),
+                    c.ptr(),
+                    (1, TOP_K as u32, n as u32, k as u32),
+                    (GEMMA_EXPERTS as u32, expert_rows),
+                    pair_rows,
+                    std::ptr::null_mut(),
+                )
+            }
+            .expect("expert_gemv_bf16 launch at 128 experts");
+            let mut gpu = c.download().expect("download");
+            let tail = gpu[pairs * n..].iter().all(|&v| v == SENTINEL);
+            gpu.truncate(pairs * n);
+            let (mut bits_bad, mut bound_bad, mut worst) = (0usize, 0usize, 0.0f64);
+            for (p, &e) in topk_idx.iter().enumerate() {
+                let (e, row) = (e as usize, if pair_rows { p } else { 0 });
+                let a_p = &a_bits[row * k..(row + 1) * k];
+                let a_up = up(&device, a_p);
+                let w = part + e * stride;
+                let c_p = up(&device, &vec![SENTINEL; n]);
+                // SAFETY: `a_up` holds k bf16, the bank at `w` expert e's n·k, `c_p` its own
+                // allocation of n; null is the default stream.
+                unsafe {
+                    gemv_bf16_abt(
+                        a_up.ptr(),
+                        bank.ptr().wrapping_byte_add(w * 2),
+                        c_p.ptr(),
+                        (n as u32, k as u32),
+                        std::ptr::null_mut(),
+                    )
+                }
+                .expect("gemv_bf16_abt launch");
+                let gemv = c_p.download().expect("download");
+                bits_bad += mismatched_bits(&gpu[p * n..(p + 1) * n], &gemv);
+                let cmp = common::numerics::compare(
+                    &gpu[p * n..(p + 1) * n],
+                    a_p,
+                    &bank_bits[w..w + n * k],
+                    1,
+                    n,
+                    k,
+                );
+                bound_bad += cmp.out_of_bound;
+                let (_, _, g, r, bd) = cmp.worst;
+                worst = worst.max((g - r).abs() / bd.max(f64::MIN_POSITIVE));
+            }
+            let ok = bits_bad == 0 && bound_bad == 0 && tail;
+            eprintln!(
+                "gemma expert_gemv_bf16 experts=128 m=1 {case} {proj:?} n={n} k={k}: \
+                 mismatched_bits={bits_bad} out_of_bound={bound_bad} worst_ratio={worst:.4} \
+                 tail_intact={tail} {}",
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    assert!(
+        pass,
+        "the 128-expert gathered GEMV failed: see the lines above"
+    );
+}
+
+/// The three MoE launchers refuse what no instance takes, before touching any pointer, the output
+/// untouched: an expert count of 64 or 129 (the sort, the grouped GEMM and the GEMV); for the
+/// grouped GEMM an `n_tile` of 128, the 64-column tile at 256 experts (no such instance), an `n`
+/// off its `n_tile` and a `k` off 64; for the GEMV an `n` and a `k` off 64.
+#[test]
+fn gemma_expert_launchers_refuse_bad_shapes() {
+    let device = h100();
+    let mut pass = true;
+    let buf = up(&device, &vec![SENTINEL; 1 << 16]);
+    let kept = || (buf.download().expect("buf").iter()).all(|&b| b == SENTINEL);
+    let (h, i) = (GEMMA_H as u32, GEMMA_I as u32);
+    // `tape::moe_tiles(512, 128, 8)`'s 159.
+    for (m, e, tiles) in [(512u32, 64u32, 159u32), (512, 129, 160)] {
+        let none = SortRegions {
+            chunk_hist: buf.ptr(),
+            counts: buf.ptr(),
+            offsets: buf.ptr(),
+            tile_expert: buf.ptr(),
+            pos: buf.ptr(),
+        };
+        // SAFETY: the launcher refuses these shapes before it touches any pointer.
+        let got = unsafe {
+            moe_sort(
+                (buf.ptr(), buf.ptr()),
+                none,
+                buf.ptr(),
+                (m, e, TOP_K as u32, h, tiles),
+                std::ptr::null_mut(),
+            )
+        };
+        let want = Err(KernelError::MoeShape {
+            kernel: "moe_sort",
+            dims: [m, TOP_K as u32, h, tiles],
+        });
+        let untouched = kept();
+        let ok = got == want && untouched;
+        eprintln!(
+            "gemma moe_sort refusal experts={e}: {got:?} out_unchanged={untouched} {}",
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    for (what, n, k, e, rows, n_tile) in [
+        ("experts 64", i, h, 64u32, 2 * i, 64u32),
+        ("experts 129", i, h, 129, 2 * i, 64),
+        ("n_tile 128", i, h, 128, 2 * i, 128),
+        ("n_tile 64 at 256 experts", i, h, 256, 2 * i, 64),
+        ("n off n_tile 256", i, h, 128, 2 * i, 256),
+        ("n off n_tile 64", 96, h, 128, 2 * i, 64),
+        ("k off 64", i, 700, 128, 2 * i, 64),
+    ] {
+        // SAFETY: the launcher refuses these shapes before it touches any pointer.
+        let got = unsafe {
+            expert_gemm_tiled_bf16(
+                (buf.ptr(), buf.ptr()),
+                (buf.ptr(), buf.ptr()),
+                buf.ptr(),
+                (4, n, k, e, rows),
+                n_tile,
+                std::ptr::null_mut(),
+            )
+        };
+        let want = Err(KernelError::MoeShape {
+            kernel: "expert_gemm_bf16",
+            dims: [4, n, k, rows],
+        });
+        let untouched = kept();
+        let ok = got == want && untouched;
+        eprintln!(
+            "gemma expert_gemm_bf16 refusal {what} {:?}: {got:?} out_unchanged={untouched} {}",
+            [4, n, k, e, rows, n_tile],
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    for (what, n, k, e, rows) in [
+        ("experts 64", i, h, 64u32, 2 * i),
+        ("experts 129", i, h, 129, 2 * i),
+        ("n off 64", 100, h, 128, 2 * i),
+        ("k off 64", i, 700, 128, 2 * i),
+    ] {
+        // SAFETY: the launcher refuses these shapes before it touches any pointer.
+        let got = unsafe {
+            expert_gemv_bf16(
+                (buf.ptr(), buf.ptr(), buf.ptr()),
+                buf.ptr(),
+                (1, TOP_K as u32, n, k),
+                (e, rows),
+                false,
+                std::ptr::null_mut(),
+            )
+        };
+        let want = Err(KernelError::MoeShape {
+            kernel: "expert_gemv_bf16",
+            dims: [1, TOP_K as u32, n, k],
+        });
+        let untouched = kept();
+        let ok = got == want && untouched;
+        eprintln!(
+            "gemma expert_gemv_bf16 refusal {what} {:?}: {got:?} out_unchanged={untouched} {}",
+            [1, TOP_K as u32, n, k, e, rows],
+            verdict(ok)
+        );
+        pass &= ok;
+    }
+    assert!(
+        pass,
+        "a 128-expert launcher took a bad shape: see the lines above"
+    );
+}
+
+/// Gemma's MoE kernels' time per launch on the buckets each runs on: the GEMV at m = 1 (gate and
+/// down), and at m = 4,096 the router's 64-column GEMM, the sort and the grouped GEMM (gate at
+/// `n_tile` 64, down at 256). Printed, not asserted.
+#[test]
+fn gemma_moe_kernel_times_are_recorded() {
+    let device = h100();
+    let bank = up(&device, gemma_bank());
+    let gate = gemma_slab(ExpertProjection::Gate);
+    let down = gemma_slab(ExpertProjection::Down);
+    let b_of = |part: usize| bank.ptr().wrapping_byte_add(part * 2);
+    for m in [1usize, 4096] {
+        let topk_idx = gemma_picks(m, |t, j| t * 31 + j * 7);
+        if m == 1 {
+            let ib = up_u32(&device, &topk_idx);
+            for (what, ((n, k), part, _, rows), pair_rows) in
+                [("gate", gate, false), ("down", down, true)]
+            {
+                let a_rows = if pair_rows { TOP_K } else { 1 };
+                let a = up(&device, &bf16_inputs(a_rows * k, 0x6E71));
+                let c = up(&device, &vec![0; TOP_K * n]);
+                let (med, min) = median_us(
+                    // SAFETY: as `gemma_expert_gemv_is_gemv_bf16_per_pair`'s.
+                    || {
+                        unsafe {
+                            expert_gemv_bf16(
+                                (a.ptr(), b_of(part), ib.ptr()),
+                                c.ptr(),
+                                (1, TOP_K as u32, n as u32, k as u32),
+                                (GEMMA_EXPERTS as u32, rows),
+                                pair_rows,
+                                std::ptr::null_mut(),
+                            )
+                        }
+                        .expect("gemv")
+                    },
+                    || drop(c.download()),
+                );
+                eprintln!(
+                    "gemma expert_gemv_bf16 time m=1 {what} n={n} k={k}: median={med:.1}us \
+                     min={min:.1}us (not asserted)"
+                );
+            }
+            continue;
+        }
+        let x = bf16_inputs(m * GEMMA_H, 0x6E72);
+        let router = up(&device, &bf16_inputs(GEMMA_EXPERTS * GEMMA_H, 0x6E73));
+        let xd = up(&device, &x);
+        let logits = up(&device, &vec![0; m * GEMMA_EXPERTS]);
+        let shape = (m as u32, GEMMA_EXPERTS as u32, GEMMA_H as u32);
+        let (med, min) = median_us(
+            // SAFETY: as `gemm_bf16.rs`'s 64-column cases: `xd` m·2816, `router` 128·2816,
+            // `logits` m·128 bf16, null the default stream.
+            || {
+                unsafe {
+                    gemm_col64_bf16_abt(
+                        xd.ptr(),
+                        router.ptr(),
+                        logits.ptr(),
+                        shape,
+                        std::ptr::null_mut(),
+                    )
+                }
+                .expect("router gemm")
+            },
+            || drop(logits.download()),
+        );
+        eprintln!(
+            "gemma gemm_col64_bf16_abt (router) time m={m} n=128 k={GEMMA_H}: median={med:.1}us \
+             min={min:.1}us (not asserted)"
+        );
+        let sb = gemma_sort_buffers(&device, &x, &topk_idx, m);
+        let (med, min) = median_us(|| gemma_launch_sort(&sb, m), || drop(sb.index.download()));
+        eprintln!(
+            "gemma moe_sort experts=128 time m={m}: median={med:.1}us min={min:.1}us \
+             (not asserted)"
+        );
+        let sorted = gemma_run_sort(&sb, m);
+        let ob = up_u32(&device, &sorted.offsets);
+        let tb = up_u32(&device, &sorted.tile_expert);
+        for (what, ((n, k), part, _, rows), n_tile) in [("gate", gate, 64u32), ("down", down, 256)]
+        {
+            let a = if k == GEMMA_H {
+                up(&device, &sorted.rows)
+            } else {
+                up(&device, &bf16_inputs(sb.max_tiles * TILE_ROWS * k, 0x6E74))
+            };
+            let c = up(&device, &vec![0; sb.max_tiles * TILE_ROWS * n]);
+            let (med, min) = median_us(
+                // SAFETY: as `gemma_expert_gemm_is_the_dense_gemm_per_expert_tile`'s.
+                || {
+                    unsafe {
+                        expert_gemm_tiled_bf16(
+                            (a.ptr(), b_of(part)),
+                            (ob.ptr(), tb.ptr()),
+                            c.ptr(),
+                            (
+                                sb.max_tiles as u32,
+                                n as u32,
+                                k as u32,
+                                GEMMA_EXPERTS as u32,
+                                rows,
+                            ),
+                            n_tile,
+                            std::ptr::null_mut(),
+                        )
+                    }
+                    .expect("grouped gemm")
+                },
+                || drop(c.download()),
+            );
+            eprintln!(
+                "gemma expert_gemm_bf16 experts=128 time m={m} {what} n={n} k={k} \
+                 n_tile={n_tile}: median={med:.1}us min={min:.1}us (not asserted)"
+            );
+        }
+    }
+}
