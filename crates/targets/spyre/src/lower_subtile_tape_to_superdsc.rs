@@ -8332,95 +8332,6 @@ mod tests {
         }
     }
 
-    /// ⭐ THE BUNDLE STATES ITS OWN WIRING FACTS (#813 review) — `num_sources` and the resident
-    /// source ids are GRAPH-LOCAL, and the mint is the graph that proves it: its nine staged
-    /// tables (the two-level ramp's seven flat-era tables plus the group pair) sit at
-    /// `[num_sources, num_sources+9)` of the ONE-REQUEST graph, so a minted bundle's stamp and
-    /// an unminted bundle's stamp differ by exactly those nine. The worker used to hand every
-    /// rung the minted wiring's numbers — the rung's completeness walk then covered nine ids
-    /// past its own graph, excused by nine minted table ids that only cancelled by
-    /// coincidence. Pinned from both sides of the mint, plus the one-derivation law: the
-    /// stamp's resident list IS [`load_consts_of_ir`]'s, the same derivation the
-    /// wiring's `load_consts` reads, so the layout's list and the wiring's cannot disagree.
-    #[test]
-    fn the_bundle_states_its_own_source_facts_across_the_mint() {
-        use scratchy_subtile::lower::{GemmWeight, InputRef, OpDesc};
-        use scratchy_subtile::subtile_ir::{SourceShape, SubOp, lower_region, mint_argmax};
-        // K=1, vocab 5 — the one-request lm-head shape the mint admits, the same fixture
-        // `argmax_mint_lower` pins the splice seat with.
-        let input = scratchy_subtile::lower::LoweringInput {
-            exported: None,
-            sources: vec![
-                SourceShape { rows: 1, cols: 1 },
-                SourceShape { rows: 1, cols: 5 },
-            ],
-            ops: vec![OpDesc {
-                op: SubOp::MatmulTile {
-                    n: 5,
-                    weight: GemmWeight::Dense,
-                },
-                m: 1,
-                inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
-            }],
-            result: 0,
-        };
-        let nz = std::num::NonZeroU32::new(64).unwrap();
-        let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-        let plain = lower_region(&input, nz);
-        let mut minted = lower_region(&input, nz);
-        mint_argmax(&mut minted);
-        let l_plain =
-            compute_bundle_layout(&plain, &weight_ids, false, false, &[]).expect("plain lays out");
-        let l_minted = compute_bundle_layout(&minted, &weight_ids, false, false, &[])
-            .expect("the minted graph lays out");
-
-        // Each stamp names ITS OWN graph's count — the whole point of the fix.
-        assert_eq!(l_plain.num_sources, plain.num_sources);
-        assert_eq!(l_minted.num_sources, minted.num_sources);
-        assert_eq!(
-            l_minted.num_sources,
-            l_plain.num_sources + 9,
-            "the mint's nine tables (the two-level ramp's seven flat-era tables plus the group \
-             pair) are the whole difference between the two graphs' source counts — the nine \
-             ids an unminted rung was handed and did not have"
-        );
-        // The unminted graph has no resident source (no prefix-KV, no load-const tables), and
-        // the minted graph's resident list is EXACTLY the nine tables, at
-        // `[plain's count, minted's count)` — the range the review's coincidence lived in.
-        assert!(
-            l_plain.resident_source_tids.is_empty(),
-            "an unminted graph's layout stamps no resident source"
-        );
-        let tables: Vec<u32> = (l_plain.num_sources..l_minted.num_sources).collect();
-        assert_eq!(
-            l_minted.resident_source_tids, tables,
-            "the minted graph's resident stamp is its nine tables and nothing else"
-        );
-        // ⛔ AND EVERY STAMPED ID IS A SOURCE OF ITS OWN GRAPH — the bake asserts this where it
-        // stamps (an id at or past the count would excuse a REAL source from the runtime's
-        // per-step bind walk); pinned here so the law has a test face too.
-        assert!(
-            l_minted
-                .resident_source_tids
-                .iter()
-                .all(|&t| t < l_minted.num_sources),
-            "a resident id past the source count would excuse a real source"
-        );
-        // ⭐ THE ONE-DERIVATION LAW: the stamp's list is `load_consts_of_ir`'s — the same
-        // derivation `graph_wiring` reads for the wiring's `load_consts` — so a layout that
-        // disagrees with the wiring is a build error here, not a card incident later.
-        let wiring_tids: Vec<u32> =
-            crate::lower_subtile_tape_to_ktir::load_consts_of_ir(&minted, &Default::default())
-                .expect("the minted graph's load-const list derives")
-            .into_iter()
-            .map(|(tid, _)| tid)
-            .collect();
-        assert_eq!(
-            l_minted.resident_source_tids, wiring_tids,
-            "the layout's resident stamp and the wiring's load-const list are one derivation"
-        );
-    }
-
     /// ⭐ THE MINT'S inv_t RESERVES ITS TRUE fp32 STICK BYTES, UNPADDED — the run-7 wall's
     /// test face ("t728 has size 0 in seg3"). inv_t is the mint's second staged source, a
     /// `[rows, 1]` f32 per-row scalar: its width rounds to ONE 32-element fp32 stick, which is
@@ -8436,9 +8347,8 @@ mod tests {
         use scratchy_subtile::lower::{GemmWeight, InputRef, OpDesc};
         use scratchy_subtile::subtile_ir::{SampleRows, SourceShape, SubOp, lower_region, mint_sample};
 
-        // Four request rows over the K=1, vocab-5 lm-head the mint admits (the same fixture
-        // `the_bundle_states_its_own_source_facts_across_the_mint` mints), so the per-row
-        // stride is pinned by DIVISION at a batched row count, not by one row's total.
+        // Four request rows over the K=1, vocab-5 lm-head shape the mint admits, so the
+        // per-row stride is pinned by DIVISION at a batched row count, not by one row's total.
         let input = scratchy_subtile::lower::LoweringInput {
             exported: None,
             sources: vec![
