@@ -107,12 +107,18 @@ fn diag_prompt_3_row_9_picks_per_layer() {
 const DIAG_VOCAB: usize = 262_144;
 /// The P1 prompt whose minimum-cosine row test B reads.
 const DIAG_P1_PROMPT: usize = 6;
+/// Prompt 6's rows test B reads besides its minimum row: the rows 25-41 that decode clears of a
+/// prefill-only kernel (`/tmp/v933-diag3.md` §2).
+const DIAG_P1_ROWS: [usize; 4] = [25, 30, 37, 41];
 
 /// #933's diagnosis, test B (`/tmp/v933-diag2.md:73-87`), printed only, nothing gated: at every
-/// layer, CUDA's top-8 against HF-f32's top-8 for prompt 3 row 9 and for prompt 6's row of CUDA's
+/// layer, CUDA's top-8 against HF-f32's top-8 for prompt 3 row 9, for prompt 6's row of CUDA's
 /// minimum logits cosine against HF-f32 (found here from one fresh m=512 forward of prompt 6 and the
-/// goldens' `ref_f32_6.bin`), including flips inside a router tie, and the f32 router gap (rank-8
-/// minus rank-9) at each layer, as [`diag_prompt_3_row_9_picks_per_layer`] prints them.
+/// goldens' `ref_f32_6.bin`) and for prompt 6's rows [`DIAG_P1_ROWS`], including flips inside a
+/// router tie, and the f32 router gap (rank-8 minus rank-9) at each layer, as
+/// [`diag_prompt_3_row_9_picks_per_layer`] prints them. Per row, a summary: CUDA's layers that
+/// differ from f32's inside and outside a tie and the experts swapped in all, beside HF-bf16's own
+/// against f32 from the routing dump's bf16 run.
 #[test]
 fn diag_picks_per_layer_at_the_bad_rows() {
     let (device, weights) = rig();
@@ -184,15 +190,25 @@ fn diag_picks_per_layer_at_the_bad_rows() {
          (information only)",
         p6.p, p6.ids[min_row]
     );
-    for (want, row) in [(DIAG_PROMPT, DIAG_ROW), (DIAG_P1_PROMPT, min_row)] {
+    let mut rows: Vec<(usize, usize)> = vec![(DIAG_PROMPT, DIAG_ROW), (DIAG_P1_PROMPT, min_row)];
+    rows.extend(
+        (DIAG_P1_ROWS.iter())
+            .filter(|&&r| r != min_row)
+            .map(|&r| (DIAG_P1_PROMPT, r)),
+    );
+    for (want, row) in rows {
         let p = prompt(want);
         let n = p.ids.len();
         assert!(row < n, "prompt {want} has row {row}");
         let route = read_route(&format!("route_{}.bin", p.p), n);
         let (mut inside, mut outside) = (Vec::new(), Vec::new());
+        // Experts swapped against f32's (CUDA's, HF-bf16's), and HF-bf16's layers that differ.
+        let (mut swapped, mut bf16_swapped) = (0usize, 0usize);
+        let (mut bf16_inside, mut bf16_outside) = (Vec::new(), Vec::new());
         for layer in 0..LAYERS {
             let got = &cuda_picks(&mut w, layer, &p.ids)[row];
             let f32_pick = route.f32.set(n, layer, row);
+            let bf16_pick = route.bf16.set(n, layer, row);
             let tau = route.tau(layer);
             let (tie, gap) = route.tie(layer, row, tau);
             let only_cuda: Vec<i32> = got.difference(&f32_pick).copied().collect();
@@ -201,6 +217,15 @@ fn diag_picks_per_layer_at_the_bad_rows() {
                 match tie {
                     true => inside.push(layer),
                     false => outside.push(layer),
+                }
+            }
+            swapped += only_cuda.len();
+            let bf16_only = bf16_pick.difference(&f32_pick).count();
+            bf16_swapped += bf16_only;
+            if bf16_pick != f32_pick {
+                match tie {
+                    true => bf16_inside.push(layer),
+                    false => bf16_outside.push(layer),
                 }
             }
             eprintln!(
@@ -217,6 +242,15 @@ fn diag_picks_per_layer_at_the_bad_rows() {
              a router tie {inside:?} and {} outside {outside:?} (information only)",
             inside.len(),
             outside.len()
+        );
+        eprintln!(
+            "diag B prompt {want} row {row} summary: CUDA vs f32 {} inside a tie, {} outside, \
+             {swapped} experts swapped; HF-bf16 vs f32 {} inside a tie {bf16_inside:?}, {} outside \
+             {bf16_outside:?}, {bf16_swapped} experts swapped (information only)",
+            inside.len(),
+            outside.len(),
+            bf16_inside.len(),
+            bf16_outside.len()
         );
     }
 }
