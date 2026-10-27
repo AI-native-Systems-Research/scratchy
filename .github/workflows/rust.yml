@@ -592,6 +592,26 @@ jobs:
       - name: Test (triton re-host crates)
         run: cargo test -p triton-frontend -p triton-ktir -p triton-ktir-superdsc -p triton-numeric -p scratchy-triton-splice
 
+  # The `#[kani::proof]` harnesses compile only under the model checker, and no other job runs it, so
+  # for a month every proof in a crate depending on ktir-core was unbuildable and nothing said so
+  # (#618: Kani 0.67's nightly is rustc 1.93, below ktir-core's rust-version 1.94). Kani 0.68.0's
+  # nightly meets the pin; `scripts/kani_roster.sh` runs one proof per crate, so a toolchain gap or a
+  # harness that stops building turns this job red.
+  kani:
+    name: linux-amd64 (kani proofs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: kani
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install Kani 0.68.0
+        run: cargo install --locked kani-verifier --version 0.68.0 && cargo kani setup
+      - name: Kani (one proof per crate)
+        run: scripts/kani_roster.sh
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
