@@ -1001,6 +1001,16 @@ pub enum LoadConst {
     /// nothing.
     SampleTable {
         vocab: u32,
+        /// The RUNG'S OWN ROW COUNT — the mint's own `rows` fact (the solo rung
+        /// at 1, every batched rung at its baked width). The ten UNIFORM tables
+        /// (the hash multipliers, the wrap-fold's 2^8, the fold's five f32
+        /// constants, the FEST clamp) stage the SAME word at EVERY row of a
+        /// `[rows, 1]` table — the seed words' own class, so the door's `Col`
+        /// operand mode reads row r's stick head like it does a seed word, at
+        /// every band height (the auditor's 2026-10-27 ruling). The per-lane
+        /// tables ignore it (their shapes are whole-row, functions of the vocab
+        /// alone).
+        rows: u32,
         operand: u8,
         arrangement: ElementArrangement,
     },
@@ -1030,10 +1040,11 @@ impl LoadConst {
         match *self {
             LoadConst::SampleTable {
                 vocab,
+                rows,
                 operand,
                 arrangement,
             } => {
-                let (bytes, dt, shape) = sample_staged_tables(vocab)
+                let (bytes, dt, shape) = sample_staged_tables(vocab, rows)
                     .into_iter()
                     .nth((operand - 1) as usize)
                     .expect("the mint emits operand 1..=20 — the registry's own row");
@@ -1325,26 +1336,29 @@ pub struct SampleSeat {
 ///   spellings of `0x9E3779B1` / `0x85EBCA77` / `0xC2B2AE3D` (multiplication
 ///   by an odd constant is a bijection mod 2^32; the squares between them
 ///   break the linear structure an xor-shift mix would break on a richer
-///   vocabulary). ⭐ ONE WORD each at `[1, 1]` — uniform constants broadcast
-///   by their consuming multiplies (the int-bcast operand mode), never
-///   whole-row splats (the wall-5 measured law: a `[1, PAD_V]` splat burns
-///   PAD_V·4 B of local store to carry one repeated word).
+///   vocabulary). ⭐ `[rows, 1]` — the same word at every row's stick head,
+///   THE SEEDS' OWN CLASS (auditor ruling 2026-10-27): the bake stages them
+///   at the rung's own rows, so the worker writes nothing for them, and the
+///   consuming multiplies read them through the int-bcast operand mode like
+///   seed words at every band height — never whole-row splats (the wall-5
+///   measured law: a `[1, PAD_V]` splat burns PAD_V·4 B of local store to
+///   carry one repeated word).
 /// * `c256` — the wrap-fold's 2^8: `h·2^8 mod 2^32` extracts the low 24 bits
-///   with no compare (the device has no lane-wise integer compare). ONE WORD
-///   at `[1, 1]`, broadcast.
+///   with no compare (the device has no lane-wise integer compare). `[rows, 1]`,
+///   one word per row — the seeds' own class.
 /// * `lane` — the per-lane index `0..PAD_V-1` as f32 (exact below 2^24),
 ///   ingested by the index-cast law — the no-arange law's own reading: a
 ///   per-lane fact is host-staged, never a splatted interior value. The one
 ///   GENUINELY per-lane fact of the noise section's eleven: whole-row.
 /// * `fm8` / `ftop` / `fzero` / `fhalf` / `fm22` — the fold's constants
-///     `2^-8`, `2^23 - 1`, `0`, `0.5`, `2^-22`: the abs fold's scale, the
+///   `2^-8`, `2^23 - 1`, `0`, `0.5`, `2^-22`: the abs fold's scale, the
 ///   strict-interior reflect point, the floor catch, and the uniform grid's
 ///   half-ulp and scale — `u = (np + 0.5)·2^-22` lands strictly inside
-///   `(0, 1)` on every attainable `np`. ONE WORD each at `[1, 1]`, broadcast
-///   by their consuming ops (invt's own class).
+///   `(0, 1)` on every attainable `np`. `[rows, 1]` each — the seeds' own
+///   class, broadcast by their consuming ops.
 /// * `cmin` — the fp16 island's clamp `2^-14`, the FEST log's domain guard on
-///   both entries (subnormal/FTZ behavior never reached). ONE WORD at
-///   `[1, 1]` — the `maximum`'s broadcast operand.
+///   both entries (subnormal/FTZ behavior never reached). `[rows, 1]` — the
+///   `maximum`'s broadcast operand, the seeds' own class.
 ///
 /// The SENTINEL (all-NaN row, #666): the one-hot falls on the pad lanes,
 /// where the tables stage `ginc = G`, `binc = GROUP_BLOCKS`, `linc = BLOCK`,
@@ -1355,7 +1369,10 @@ pub struct SampleSeat {
 /// gate; `padoff` stages only 0.0 and −inf); every noise value is either an
 /// exact i32 constant or an exact f32/fp16 power of two, so the staging round
 /// trips bit-exactly.
-pub fn sample_staged_tables(vocab: u32) -> Vec<(Vec<u8>, scratchy_tensors::DType, [usize; 2])> {
+pub fn sample_staged_tables(
+    vocab: u32,
+    rows: u32,
+) -> Vec<(Vec<u8>, scratchy_tensors::DType, [usize; 2])> {
     let pad_v = scratchy_subtile::subtile_ir::sample_pad_vocab(vocab) as usize;
     let block = scratchy_subtile::subtile_ir::SAMPLE_BLOCK as usize;
     let group_blocks = scratchy_subtile::subtile_ir::SAMPLE_GROUP_BLOCKS as usize;
@@ -1371,15 +1388,27 @@ pub fn sample_staged_tables(vocab: u32) -> Vec<(Vec<u8>, scratchy_tensors::DType
             })
             .collect()
     };
-    // A whole-row i32 splat's ONE-WORD form — the hash constants' own value
+    // A whole-row i32 splat's per-row form — the hash constants' own value
     // (SenUint32, the same 4-byte geometry as f32; the LE words ARE the device
-    // encoding). ⭐ THE WALL-5 MEASURED LAW: a uniform constant is staged as
-    // ONE WORD at `[1, 1]`, broadcast by its consuming op — never a whole-row
-    // splat, which burns PAD_V·4 B of local store to carry one repeated word
-    // (ten of them tip the 2 MiB LX).
-    let i32_word = |x: i32| -> Vec<u8> { x.to_le_bytes().to_vec() };
-    // A whole-row f32 splat's ONE-WORD form — the fold's constants.
-    let f32_word = |x: f32| -> Vec<u8> { x.to_le_bytes().to_vec() };
+    // encoding), ONE WORD PER ROW of a `[rows, 1]` table. ⭐ THE WALL-5 MEASURED
+    // LAW holds — a uniform constant is never a whole-row splat (which burns
+    // PAD_V·4 B of local store to carry one repeated word; ten of them tip the
+    // 2 MiB LX) — and ⭐ THE 2026-10-27 RULING restages it as the SEED WORDS'
+    // OWN CLASS: `[rows, 1]` at the rung's own row count, the same word at
+    // every row's stick head, so the `Col` operand mode reads row r's word
+    // exactly as it reads a seed word, at every band height (a `[1, 1]` table
+    // at a multi-row rung would demand a scalar broadcast no door states).
+    let i32_col = |x: i32| -> Vec<u8> {
+        (0..rows as usize)
+            .flat_map(|_| x.to_le_bytes())
+            .collect()
+    };
+    // A whole-row f32 splat's per-row form — the fold's constants, the same law.
+    let f32_col = |x: f32| -> Vec<u8> {
+        (0..rows as usize)
+            .flat_map(|_| x.to_le_bytes())
+            .collect()
+    };
     vec![
         // bramp: GROUP_BLOCKS - (b % GROUP_BLOCKS), periodic, pads 0.
         (
@@ -1454,29 +1483,30 @@ pub fn sample_staged_tables(vocab: u32) -> Vec<(Vec<u8>, scratchy_tensors::DType
             [1, pad_v],
         ),
         // hc1 / hc2 / hc3: the counter hash's multipliers, i32 — the
-        // staged spellings of 0x9E3779B1 / 0x85EBCA77 / 0xC2B2AE3D. ONE WORD
-        // each at [1, 1]: uniform constants broadcast by their consuming
-        // multiplies (the int-bcast operand mode), never whole-row splats.
+        // staged spellings of 0x9E3779B1 / 0x85EBCA77 / 0xC2B2AE3D. `[rows, 1]`,
+        // the same word at every row's stick head (the seeds' own class): uniform
+        // constants broadcast by their consuming multiplies through the int-bcast
+        // operand mode, never whole-row splats.
         (
-            i32_word(-1640531535),
+            i32_col(-1640531535),
             scratchy_tensors::DType::I32,
-            [1, 1],
+            [rows as usize, 1],
         ),
         (
-            i32_word(-2048144777),
+            i32_col(-2048144777),
             scratchy_tensors::DType::I32,
-            [1, 1],
+            [rows as usize, 1],
         ),
         (
-            i32_word(-1028477379),
+            i32_col(-1028477379),
             scratchy_tensors::DType::I32,
-            [1, 1],
+            [rows as usize, 1],
         ),
-        // c256: the wrap-fold's 2^8, i32 — one word, broadcast.
+        // c256: the wrap-fold's 2^8, i32 — `[rows, 1]`, one word per row.
         (
-            i32_word(256),
+            i32_col(256),
             scratchy_tensors::DType::I32,
-            [1, 1],
+            [rows as usize, 1],
         ),
         // lane: the per-lane index 0..PAD_V-1 as f32 (exact below 2^24) —
         // every lane its own index, pads included (the hash runs per lane;
@@ -1489,41 +1519,45 @@ pub fn sample_staged_tables(vocab: u32) -> Vec<(Vec<u8>, scratchy_tensors::DType
             [1, pad_v],
         ),
         // fm8 / ftop / fzero / fhalf / fm22: the fold's f32 constants —
-        // 2^-8, 2^23 - 1, 0, 0.5, 2^-22. ONE WORD each at [1, 1], broadcast
-        // by their consuming ops (invt's own class).
+        // 2^-8, 2^23 - 1, 0, 0.5, 2^-22. `[rows, 1]`, the same word at every
+        // row's stick head (the seeds' own class): uniform constants broadcast
+        // by their consuming ops, never whole-row splats.
         (
-            f32_word(0.00390625),
+            f32_col(0.00390625),
             scratchy_tensors::DType::F32,
-            [1, 1],
+            [rows as usize, 1],
         ),
         (
-            f32_word(8388607.0),
+            f32_col(8388607.0),
             scratchy_tensors::DType::F32,
-            [1, 1],
+            [rows as usize, 1],
         ),
         (
-            f32_word(0.0),
+            f32_col(0.0),
             scratchy_tensors::DType::F32,
-            [1, 1],
+            [rows as usize, 1],
         ),
         (
-            f32_word(0.5),
+            f32_col(0.5),
             scratchy_tensors::DType::F32,
-            [1, 1],
+            [rows as usize, 1],
         ),
         (
-            f32_word(2.384185791015625e-7),
+            f32_col(2f32.powi(-22)),
             scratchy_tensors::DType::F32,
-            [1, 1],
+            [rows as usize, 1],
         ),
         // cmin: the fp16 island's clamp 2^-14 (fp16's smallest normal) —
         // fp16, the FEST log's domain guard; staged through the SEN convert
         // like every fp16 weight (a REAL conversion: SEN169 ≠ IEEE binary16).
-        // ONE WORD at [1, 1] — the `maximum`'s broadcast operand.
+        // `[rows, 1]` — the same word at every row's stick head, the
+        // `maximum`'s broadcast operand in the seeds' own class.
         (
-            half::f16::from_f32(2f32.powi(-14)).to_le_bytes().to_vec(),
+            (0..rows as usize)
+                .flat_map(|_| half::f16::from_f32(2f32.powi(-14)).to_le_bytes())
+                .collect(),
             scratchy_tensors::DType::F16,
-            [1, 1],
+            [rows as usize, 1],
         ),
     ]
 }

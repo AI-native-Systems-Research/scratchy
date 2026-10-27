@@ -1721,12 +1721,15 @@ pub fn mint_sample<F: RopeForm>(
     // the two per-lane widen tables (`[1, BLOCK]`), the pad law's offset row,
     // the two-level ramp's group pair, then the noise section's own eleven:
     // the four i32 hash/fold constants, the fold's five f32 constants and
-    // the fp16 island's clamp — ⭐ TEN `[1, 1]` ONE-WORD TABLES (the wall-5
-    // measured law: a uniform value broadcast by its consuming op, `invt`'s
-    // own class, never a whole-row splat — ten `[1, PAD_V]` splats are
-    // PAD_V·4 B each of local store for one repeated word, 2.5 MiB against
-    // the 2 MiB LX) — and the lane table, the one GENUINELY per-lane fact of
-    // the eleven, whole-row. The array's LENGTH is the single derivation of
+    // the fp16 island's clamp — ⭐ TEN `[rows, 1]` TABLES, the SEED WORDS'
+    // OWN CLASS (the auditor's 2026-10-27 ruling): the same word at every
+    // row's stick head, baked by the bake at the rung's own rows, so the
+    // worker writes nothing for them and the consuming ops read them through
+    // the broadcast operand modes at every band height — never whole-row
+    // splats (the wall-5 measured law: ten `[1, PAD_V]` splats are PAD_V·4 B
+    // each of local store for one repeated word, 2.5 MiB against the 2 MiB
+    // LX) — and the lane table, the one GENUINELY per-lane fact of the
+    // eleven, whole-row. The array's LENGTH is the single derivation of
     // the renumber shift below.
     let tables = [
         // The seed quintuple's five word tables — each `[rows, 1]` i32,
@@ -1753,26 +1756,28 @@ pub fn mint_sample<F: RopeForm>(
         // gramp, ginc — the two-level ramp's group pair.
         TensorShape { rows: 1, cols: pad_vocab },
         TensorShape { rows: 1, cols: pad_vocab },
-        // hc1, hc2, hc3, c256 — the i32 hash and wrap-fold constants, ONE
-        // WORD each: uniform values broadcast by their consuming ops (the
-        // int-bcast operand mode), never whole-row splats.
-        TensorShape { rows: 1, cols: 1 },
-        TensorShape { rows: 1, cols: 1 },
-        TensorShape { rows: 1, cols: 1 },
-        TensorShape { rows: 1, cols: 1 },
+        // hc1, hc2, hc3, c256 — the i32 hash and wrap-fold constants,
+        // `[rows, 1]`: the same word at every row's stick head, the seed
+        // words' own class (baked by the bake at the rung's rows; the worker
+        // writes nothing for them), broadcast by their consuming ops.
+        TensorShape { rows, cols: 1 },
+        TensorShape { rows, cols: 1 },
+        TensorShape { rows, cols: 1 },
+        TensorShape { rows, cols: 1 },
         // lane — the per-lane index row, staged f32 (the fptosi exit reads
         // it as an integer-valued f32).
         TensorShape { rows: 1, cols: pad_vocab },
-        // fm8, ftop, fzero, fhalf, fm22 — the fold's f32 constants, ONE WORD
-        // each (broadcast operands, invt's own class).
-        TensorShape { rows: 1, cols: 1 },
-        TensorShape { rows: 1, cols: 1 },
-        TensorShape { rows: 1, cols: 1 },
-        TensorShape { rows: 1, cols: 1 },
-        TensorShape { rows: 1, cols: 1 },
-        // cmin — the fp16 island's clamp (2^-14, the smallest normal), ONE
-        // WORD: the `maximum`'s broadcast operand.
-        TensorShape { rows: 1, cols: 1 },
+        // fm8, ftop, fzero, fhalf, fm22 — the fold's f32 constants,
+        // `[rows, 1]` (the seeds' own class, broadcast operands).
+        TensorShape { rows, cols: 1 },
+        TensorShape { rows, cols: 1 },
+        TensorShape { rows, cols: 1 },
+        TensorShape { rows, cols: 1 },
+        TensorShape { rows, cols: 1 },
+        // cmin — the fp16 island's clamp (2^-14, the smallest normal),
+        // `[rows, 1]`: the `maximum`'s broadcast operand, the seeds' own
+        // class.
+        TensorShape { rows, cols: 1 },
     ];
     let shift = tables.len() as u32;
     let n_src = graph.num_sources;
@@ -2903,8 +2908,10 @@ pub fn eval_node<F: RopeForm>(
             const FTOP: f32 = 8388607.0; // 2^23 - 1
             const FZERO: f32 = 0.0;
             const FHALF: f32 = 0.5;
-            const FM22: f32 = 2.384185791015625e-7; // 2^-22
-            const CMIN: f32 = 6.103515625e-5; // 2^-14
+            // 2^-22 and 2^-14, spelled as the division they are (exact in f32 —
+            // powers of two, no rounding anywhere in the fold).
+            const FM22: f32 = 1.0 / 4194304.0; // 2^-22
+            const CMIN: f32 = 1.0 / 16384.0; // 2^-14
             let mut out = Vec::with_capacity((out_rows * out_cols) as usize);
             for r in 0..out_rows as usize {
                 let inv_t = invt[r];

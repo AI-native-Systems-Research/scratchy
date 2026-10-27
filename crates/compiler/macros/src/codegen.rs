@@ -9760,6 +9760,7 @@ fn emit_superdsc_wiring(
             let kind = match kind {
                 scratchy_target_spyre::wiring::LoadConst::SampleTable {
                     vocab,
+                    rows,
                     operand,
                     arrangement,
                 } => {
@@ -9778,6 +9779,7 @@ fn emit_superdsc_wiring(
                     quote! {
                         ::scratchy_target_spyre::wiring::LoadConst::SampleTable {
                             vocab: #vocab,
+                            rows: #rows,
                             operand: #operand,
                             arrangement: #arrangement,
                         }

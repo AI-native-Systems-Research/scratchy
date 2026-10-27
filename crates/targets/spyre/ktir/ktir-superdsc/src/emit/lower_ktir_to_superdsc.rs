@@ -1834,9 +1834,12 @@ impl IntBinary {
 /// specimen is `int_bcast_probe.py` (case `int_bcast`), the runner kit
 /// `.claude/fb-noise-probe/intb-leg.sh`.
 /// The sampler's own hash needs `Col`: its per-row seed words (`slo`/`shi`/`stp`/`srow`) are
-/// `[rows, 1]` i32 windows of the seed table added against the `[rows, PAD_V]` hash tile —
-/// and the sampler is ONE PROGRAM PER ROW (one-row blocks throughout, `sample_fwd.py`'s own
-/// grid law), so the production form is always `Col` at ONE row: the probe's exact shape.
+/// `[rows, 1]` i32 tables added against the `[rows, PAD_V]` hash tile. The sampler's PROGRAM
+/// is one row at a time (`sample_fwd.py`'s own grid law), but the batched rung's mint types
+/// the chain at the BAND's height (the flush-band law: every intermediate of a banded chain
+/// mints at the band's height), so a decode rung at `rows > 1` hands this door `[rows, 1]`
+/// `Col` operands against a `[rows, cols]` tile — production's own form, measured by the
+/// multi-row legs below.
 ///
 /// ⭐ THE `Mul` HALF OF THE `Col` ADMISSION IS CARD-PROVEN (int-mul-bcast leg,
 /// nickm2, verdict saved `.claude/fb-noise-probe/verdicts/intm-verdict-20261027T0002Z.json`):
@@ -1844,22 +1847,31 @@ impl IntBinary {
 /// `Col`-broadcast i32 word 0x85EBCA77 — 512/512 lanes BIT-FOR-BIT against the
 /// host `(a[j] * b[0]) mod 2^32`, 0 mismatches, 2026-10-27T00:02:55Z. The
 /// wall-5 fold's uniform multipliers (`hc1`/`hc2`/`hc3`, the wrap-fold's
-/// `c256`) are `[1, 1]` one-word tables — broadcast OPERANDS of `muli32toi32`
+/// `c256`) are `[rows, 1]` tables — the seed words' own class (the auditor's
+/// 2026-10-27 restage ruling), the same word at every row's stick head —
+/// broadcast OPERANDS of `muli32toi32`
 /// through this door's shared body at the same stick basis — and the leg
-/// measured exactly that production form (the specimen
+/// measured exactly that broadcast form (the specimen
 /// `int_mul_bcast_probe.py`, case `intmul_bcast`, the runner kit
 /// `.claude/fb-noise-probe/intm-leg.sh`). The `Add` leg measured the operand
 /// mode for the add; this leg measured it for the mul. The admission stands.
 ///
-/// ⛔ NO `Y`, NO `Mb`, NO MULTI-ROW `Col`, NO CORNER, NO PER-ROW FORM — the row-split mode,
-/// the row-vector mode, the multi-row column-vector mode and every corner are refused by
-/// name below: none is measured, none is ordered, and this door states only what a leg has
-/// measured. A program wanting one is a producer form refused BY NAME here, not lowered as
-/// the nearest measured thing. (The auditor's go contemplated measuring the multi-row forms
-/// in the same run "if trivial"; they are not — a `[2, 512]` two-row dense SENUINT32 tile is
-/// itself unmeasured, so a failure could not be attributed to the operand mode rather than
-/// the dense operand, and no production program spells one. Order a specimen and the
-/// refusal opens.)
+/// ⭐ THE MULTI-ROW `Col` ADMISSION — MEASUREMENT IN FLIGHT (front-b-noise, auditor GO
+/// 2026-10-27): the batched decode seat needs it — the granite-3.1-2b decode rerung's
+/// pod build (2026-10-27T01:19Z) refused here, naming this exact form, because a
+/// band-typed rung mints its per-request seed words as `[rows, 1]` against a
+/// `[rows, cols]` tile at `rows > 1`. The intmr leg measures it on nickm2 in two
+/// cells for attribution — `[2, 512]` dense + `[2, 512]` dense (the multi-row dense
+/// control, itself unmeasured) then `[2, 512]` dense + `[2, 1]` `Col` — for `Add`
+/// AND `Mul`, in the production pid-cornered spelling (grid `[B]`, `[1, ·]` blocks,
+/// the per-row loads at `[pid, 0]`). ON PASS this doc becomes the citation; ON FAIL
+/// the admission is deleted and the refusal returns.
+///
+/// ⛔ NO `Y`, NO `Mb`, NO CORNER, NO PER-ROW FORM — the row-split mode, the row-vector
+/// mode and every corner are refused by name below: none is measured, none is ordered, and
+/// this door states only what a leg has measured. A program wanting one is a producer form
+/// refused BY NAME here, not lowered as the nearest measured thing. Order a specimen and
+/// the refusal opens.
 pub fn int_binary(
     name: &str,
     kind: IntBinary,
@@ -1922,26 +1934,12 @@ pub fn int_binary(
                  door refuses it by name rather than emit an unproven addressing"
             ));
         }
-        // ⛔ AND `Col` IS ADMITTED AT ONE ROW ONLY — the multi-row column vector
-        // (`[rows > 1, 1]` against a `[rows > 1, cols]` tile) is unmeasured as well: measuring
-        // it needs a multi-row dense SENUINT32 tile no leg has baked, so a failure there could
-        // not be attributed to the operand mode rather than the dense operand. The want loop
-        // below makes a `Col` operand's `v_rows` the op's own row count, so checking the
-        // operand here IS checking the op.
-        if bcast
-            .iter()
-            .zip(ins.iter())
-            .any(|(b, x)| matches!(b, Some(BcastAxis::Col)) && x.v_rows > 1)
-        {
-            return err(format!(
-                "IntBinary({kind:?}) {name}: a multi-row `Col` integer broadcast (a \
-                 `[rows > 1, 1]` operand against a `[rows > 1, cols]` tile) — a card form no \
-                 leg has measured (the int-bcast leg measures the one-row `Col` form only, and \
-                 the multi-row form needs a multi-row dense SENUINT32 tile that is itself \
-                 unmeasured), so this door refuses it by name rather than emit an unproven \
-                 addressing"
-            ));
-        }
+        // ⭐ AND `Col` IS ADMITTED AT EVERY ROW COUNT — the multi-row column vector
+        // (`[rows > 1, 1]` against a `[rows > 1, cols]` tile) is the batched decode
+        // seat's own form (the band-typed rung's per-request seed words), measured by
+        // the intmr legs — see the door's own doc for the in-flight citation. The want
+        // loop below still demands a `Col` operand carry the op's FULL row count (one
+        // value per row), so a short operand cannot run off its end.
         // ⭐ THE PROBE ADMISSION — the SAME broadcast body the fp16/fp32 doors reach, at the
         // integer's own stick basis, with the INTEGER op_func (the descriptor name that feeds
         // the bundle fingerprint). See the door's own doc for the measurement in flight.
@@ -7653,36 +7651,33 @@ mod elementwise_tests {
         );
     }
 
-    /// ⛔ AND THE MULTI-ROW `Col` STAYS REFUSED TOO — the auditor's contemplated second probe
-    /// form (`[2, 512]` dense + `[2, 1]`) is this door's `Col` at TWO rows, and it is not
-    /// trivial to measure: it needs a two-row dense SENUINT32 tile that is itself unmeasured,
-    /// so a failure could not be attributed to the operand mode. The sampler is one program
-    /// per row, so no production program spells it either.
+    /// ⭐ THE MULTI-ROW `Col` IS ADMITTED (auditor GO 2026-10-27; the intmr legs, measurement
+    /// in flight): the batched decode seat's band-typed rung hands this door `[2, 1]` against
+    /// `[2, 512]` — the per-request seed words of a two-row decode rung. It lowers through the
+    /// SAME broadcast body as the one-row form, one op, the same descriptor name. ON FAIL of
+    /// the legs, this admission (and this test) revert to the by-name refusal.
     #[test]
-    fn an_int_multi_row_col_flag_is_refused_by_name() {
+    fn an_int_multi_row_col_broadcast_lowers_as_one_op() {
         let r = node(
             reg(5, 2, 512, false),
             reg(6, 2, 1, false),
             reg(7, 2, 512, true),
         );
         let mut sym = 0i64;
-        let Err(e) = int_binary(
+        let ops = int_binary(
             "add_s3",
             IntBinary::Add,
             &r,
             &[None, Some(BcastAxis::Col)],
             &mut sym,
             None,
-        ) else {
-            panic!(
-                "a multi-row Col integer broadcast was ACCEPTED — the two-row form is unmeasured \
-                 and unordered"
-            )
-        };
-        assert!(
-            e.message.contains("multi-row") && e.message.contains("no leg has measured"),
-            "names the mode and why it stays refused: {}",
-            e.message
+        )
+        .expect("the two-row Col form is the batched seat's own shape");
+        assert_eq!(ops.len(), 1, "an operand mode is not a decomposition");
+        assert_eq!(
+            ops[0].op_name, "addi32toi32_o7",
+            "the descriptor NAME must not change with the row count — it feeds the bundle \
+             fingerprint, and the broadcast arm is the same op",
         );
     }
 

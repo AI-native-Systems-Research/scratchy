@@ -2010,9 +2010,11 @@ pub fn load_consts_of_ir<F: RopeForm>(
     ir: &SubtileIR<F>,
     staggered: &std::collections::BTreeMap<u32, ktir_superdsc::element_arrangement::ElementArrangement>,
 ) -> Result<Vec<(u32, crate::wiring::LoadConst)>, SuperDscError> {
-    // ⭐ THE SAMPLER'S MINT — the twenty operand tables (functions of the
-    // vocab alone, built by the shared `sample_staged_tables` derivation the
-    // kind names; `padoff` is the pad law's offset row, which the kernel adds
+    // ⭐ THE SAMPLER'S MINT — the twenty operand tables (built by the shared
+    // `sample_staged_tables` derivation the kind names; the ten UNIFORM tables
+    // stage at the rung's own `[rows, 1]` — the seed words' own class — and the
+    // per-lane tables are functions of the vocab alone; `padoff` is the pad
+    // law's offset row, which the kernel adds
     // to the score LAST, after its two roundings — the row's own pad bytes are
     // never its contract). The node's FIRST SIX seats after the row — the
     // seed quintuple's five `[rows, 1]` word tables and the temperature
@@ -2033,7 +2035,7 @@ pub fn load_consts_of_ir<F: RopeForm>(
             ))
         }
         (Some(node), None) => {
-            let SubOp::Sample { vocab, .. } = node.op else {
+            let SubOp::Sample { vocab, rows } = node.op else {
                 unreachable!("the filter matched a Sample")
             };
             assert_eq!(
@@ -2050,6 +2052,11 @@ pub fn load_consts_of_ir<F: RopeForm>(
                         tr.tensor.index() as u32,
                         crate::wiring::LoadConst::SampleTable {
                             vocab,
+                            // The rung's own row count — the mint's own fact, so
+                            // the ten uniform tables bake as [rows, 1] (the seed
+                            // words' own class) and the worker writes nothing for
+                            // them. The per-lane tables ignore it.
+                            rows,
                             operand: (i + 1) as u8,
                             // The bake's own arrangement fact: a table the sampler's staggered
                             // pointwise island reads lane-for-lane is staged ALREADY permuted —

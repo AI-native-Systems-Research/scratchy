@@ -271,52 +271,54 @@ def sample_fwd(logits_ptr, slo_ptr, shi_ptr, stp_ptr, sgate_ptr, srow_ptr,  #
                                         block_shape=[1, PAD_V])
     lanef = la_desc.load([0, 0])
     lane = lanef.to(tl.int32)
-    # THE NOISE SECTION'S CONSTANTS — ONE WORD EACH, at `[1, 1]`, `invt`'s own
-    # class: a `[1, 1]` block loaded at `[0, 0]` and broadcast by its consuming
-    # op (the operand mode), never materialized at row width. ⚠ THE WALL-5
-    # MEASURED LAW: a uniform constant staged as a whole-row `[1, PAD_V]`
-    # splat burns PAD_V·4 B of local store to carry ONE repeated word — at
-    # PAD_V=65536 that is 256 KiB per constant, and ten of them (the three
-    # hash multipliers and the wrap-fold's 2^8 in i32, the fold's five f32
-    # constants, the FEST-domain clamp in fp16) are 2.5 MiB against the 2 MiB
-    # LX, tipped over at the seventh charge. The `[1, 1]` spelling keeps every
-    # value bit-identical — the broadcast IS the value — and the hash
-    # multipliers ride the int-bcast operand mode the int-bcast card leg
-    # measured (word 0 of the stick); the f32 constants ride the same
-    # broadcast class `invt` itself uses. Per-lane tables (the lane index, the
-    # pad law's offset row, the cascade's ramps) stay whole-row: their values
-    # genuinely vary by lane, and only a load can state them (the no-arange
-    # law).
-    hc1_d = tl.make_tensor_descriptor(hc1_ptr, shape=[1, 1], strides=[1, 1],
+    # THE NOISE SECTION'S CONSTANTS — `[B, 1]` tables, the SEED WORDS' OWN
+    # CLASS (the auditor's 2026-10-27 ruling): a `[1, 1]` block loaded at
+    # `[pid, 0]` -- this row's stick head, exactly where a seed word sits --
+    # and broadcast by its consuming op (the operand mode), never materialized
+    # at row width. The bake stages the same word at every row, so the worker
+    # writes nothing for them. ⚠ THE WALL-5 MEASURED LAW still holds: a
+    # uniform constant staged as a whole-row `[1, PAD_V]` splat burns PAD_V·4 B
+    # of local store to carry ONE repeated word -- at PAD_V=65536 that is
+    # 256 KiB per constant, and ten of them (the three hash multipliers and
+    # the wrap-fold's 2^8 in i32, the fold's five f32 constants, the
+    # FEST-domain clamp in fp16) are 2.5 MiB against the 2 MiB LX, tipped
+    # over at the seventh charge. The `[B, 1]` spelling keeps every value
+    # bit-identical -- the broadcast IS the value -- and the hash multipliers
+    # ride the int-bcast operand mode the int-bcast card leg measured (word 0
+    # of the stick); the f32 constants ride the same broadcast class `invt`
+    # itself uses. Per-lane tables (the lane index, the pad law's offset row,
+    # the cascade's ramps) stay whole-row: their values genuinely vary by
+    # lane, and only a load can state them (the no-arange law).
+    hc1_d = tl.make_tensor_descriptor(hc1_ptr, shape=[B, 1], strides=[1, 1],
                                       block_shape=[1, 1])
-    hc1 = hc1_d.load([0, 0])
-    hc2_d = tl.make_tensor_descriptor(hc2_ptr, shape=[1, 1], strides=[1, 1],
+    hc1 = hc1_d.load([pid, 0])
+    hc2_d = tl.make_tensor_descriptor(hc2_ptr, shape=[B, 1], strides=[1, 1],
                                       block_shape=[1, 1])
-    hc2 = hc2_d.load([0, 0])
-    hc3_d = tl.make_tensor_descriptor(hc3_ptr, shape=[1, 1], strides=[1, 1],
+    hc2 = hc2_d.load([pid, 0])
+    hc3_d = tl.make_tensor_descriptor(hc3_ptr, shape=[B, 1], strides=[1, 1],
                                       block_shape=[1, 1])
-    hc3 = hc3_d.load([0, 0])
-    c256_d = tl.make_tensor_descriptor(c256_ptr, shape=[1, 1], strides=[1, 1],
+    hc3 = hc3_d.load([pid, 0])
+    c256_d = tl.make_tensor_descriptor(c256_ptr, shape=[B, 1], strides=[1, 1],
                                        block_shape=[1, 1])
-    c256 = c256_d.load([0, 0])
-    fm8_d = tl.make_tensor_descriptor(fm8_ptr, shape=[1, 1], strides=[1, 1],
+    c256 = c256_d.load([pid, 0])
+    fm8_d = tl.make_tensor_descriptor(fm8_ptr, shape=[B, 1], strides=[1, 1],
                                       block_shape=[1, 1])
-    fm8 = fm8_d.load([0, 0])
-    ftop_d = tl.make_tensor_descriptor(ftop_ptr, shape=[1, 1], strides=[1, 1],
+    fm8 = fm8_d.load([pid, 0])
+    ftop_d = tl.make_tensor_descriptor(ftop_ptr, shape=[B, 1], strides=[1, 1],
                                        block_shape=[1, 1])
-    ftop = ftop_d.load([0, 0])
-    fzero_d = tl.make_tensor_descriptor(fzero_ptr, shape=[1, 1], strides=[1, 1],
+    ftop = ftop_d.load([pid, 0])
+    fzero_d = tl.make_tensor_descriptor(fzero_ptr, shape=[B, 1], strides=[1, 1],
                                         block_shape=[1, 1])
-    fzero = fzero_d.load([0, 0])
-    fhalf_d = tl.make_tensor_descriptor(fhalf_ptr, shape=[1, 1], strides=[1, 1],
+    fzero = fzero_d.load([pid, 0])
+    fhalf_d = tl.make_tensor_descriptor(fhalf_ptr, shape=[B, 1], strides=[1, 1],
                                         block_shape=[1, 1])
-    fhalf = fhalf_d.load([0, 0])
-    fm22_d = tl.make_tensor_descriptor(fm22_ptr, shape=[1, 1], strides=[1, 1],
+    fhalf = fhalf_d.load([pid, 0])
+    fm22_d = tl.make_tensor_descriptor(fm22_ptr, shape=[B, 1], strides=[1, 1],
                                        block_shape=[1, 1])
-    fm22 = fm22_d.load([0, 0])
-    cmin_d = tl.make_tensor_descriptor(cmin_ptr, shape=[1, 1], strides=[1, 1],
+    fm22 = fm22_d.load([pid, 0])
+    cmin_d = tl.make_tensor_descriptor(cmin_ptr, shape=[B, 1], strides=[1, 1],
                                        block_shape=[1, 1])
-    cmin = cmin_d.load([0, 0])
+    cmin = cmin_d.load([pid, 0])
 
     # THE COUNTER HASH -- i32 mul/add ONLY, wrapping (the card's bit-exact
     # integer class, card leg B1). Key: the row's seed table (seed_lo,
