@@ -550,11 +550,14 @@ impl<A: DeviceAllocator> GpuWeights<A> {
         let dir = dir.as_ref();
         let index_path = dir.join("model.safetensors.index.json");
         let single_path = dir.join("model.safetensors");
+        let shards = scratchy_core_model::weight::unindexed_shards_in(dir);
 
         let mut gw = if index_path.exists() {
             Self::from_index(&index_path, allocator)
         } else if single_path.exists() {
             Self::from_single_file(&single_path, allocator)
+        } else if !shards.is_empty() {
+            Self::from_shards(dir, &shards, allocator)
         } else {
             anyhow::bail!("No safetensors files found in {}", dir.display());
         }?;
@@ -609,7 +612,11 @@ impl<A: DeviceAllocator> GpuWeights<A> {
             .collect();
         shard_files.sort();
         shard_files.dedup();
+        Self::from_shards(dir, &shard_files, allocator)
+    }
 
+    /// Load these shard files of `dir`, in parallel when there are several.
+    fn from_shards(dir: &Path, shard_files: &[String], allocator: A) -> Result<Self> {
         let total = shard_files.len();
 
         if total <= 1 {

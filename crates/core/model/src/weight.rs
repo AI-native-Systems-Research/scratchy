@@ -54,17 +54,72 @@ pub fn checkpoint_holds(dir: &Path, prefix: &str) -> ModelResult<bool> {
             .keys()
             .any(|n| under_prefix(n, prefix).is_some()));
     }
-    // A single file opens with its header's length (u64, little-endian), then the header: a JSON
-    // object of the tensors by name, beside `__metadata__`.
+    let mut files = unindexed_shards_in(dir);
+    if files.is_empty() {
+        files.push("model.safetensors".to_string());
+    }
+    for file in files {
+        if header_names(&dir.join(file))?.any(|n| under_prefix(&n, prefix).is_some()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The tensor names in a safetensors file's header (plus `__metadata__`). The file opens with
+/// the header's length (u64, little-endian), then the header: a JSON object keyed by name.
+fn header_names(path: &Path) -> ModelResult<impl Iterator<Item = String>> {
     use std::io::Read;
-    let mut file = std::fs::File::open(dir.join("model.safetensors"))?;
+    let mut file = std::fs::File::open(path)?;
     let mut len = [0u8; 8];
     file.read_exact(&mut len)?;
     let len = usize::try_from(u64::from_le_bytes(len)).unwrap_or(usize::MAX);
     let mut header = Vec::new();
     file.take(len as u64).read_to_end(&mut header)?;
     let header: HashMap<String, serde_json::Value> = serde_json::from_slice(&header)?;
-    Ok(header.keys().any(|n| under_prefix(n, prefix).is_some()))
+    Ok(header.into_keys())
+}
+
+/// The `model-NNNNN-of-MMMMM.safetensors` shards among `names`, sorted, for a checkpoint
+/// shipped without `model.safetensors.index.json`. Empty unless all M shards are there.
+pub fn unindexed_shards<S: AsRef<str>>(names: impl IntoIterator<Item = S>) -> Vec<String> {
+    let mut shards: Vec<(u32, u32, String)> = names
+        .into_iter()
+        .filter_map(|name| {
+            let name = name.as_ref();
+            let (i, n) = name
+                .strip_prefix("model-")?
+                .strip_suffix(".safetensors")?
+                .split_once("-of-")?;
+            Some((i.parse().ok()?, n.parse().ok()?, name.to_string()))
+        })
+        .collect();
+    shards.sort();
+    shards.dedup();
+    let total = shards.first().map_or(0, |s| s.1);
+    let complete = shards
+        .iter()
+        .enumerate()
+        .all(|(k, (i, n, _))| *n == total && *i as usize == k + 1)
+        && shards.len() == total as usize;
+    if !complete {
+        return Vec::new();
+    }
+    shards.into_iter().map(|(_, _, name)| name).collect()
+}
+
+/// [`unindexed_shards`] among the files in `dir`.
+pub fn unindexed_shards_in(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    // `exists` follows the HF cache's symlinks, so a dangling one (evicted blob) is not a shard.
+    unindexed_shards(
+        entries
+            .flatten()
+            .filter(|e| e.path().exists())
+            .map(|e| e.file_name().to_string_lossy().into_owned()),
+    )
 }
 
 impl SafeTensorsIndex {
@@ -655,6 +710,48 @@ mod tests {
             under_prefix("language_model.mtp.fc.weight", head),
             Some("fc.weight")
         );
+    }
+
+    /// ibm-granite/granite-4.2-30b-q4-mlx ships four shards and no index.
+    #[test]
+    fn shards_without_an_index_count_only_as_a_full_set() {
+        let full = [
+            "config.json",
+            "model-00002-of-00002.safetensors",
+            "model-00001-of-00002.safetensors",
+        ];
+        assert_eq!(
+            unindexed_shards(full),
+            [
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors"
+            ]
+        );
+        assert!(unindexed_shards(["model-00001-of-00002.safetensors"]).is_empty());
+        assert!(unindexed_shards(["model.safetensors", "model-mtp.safetensors"]).is_empty());
+        assert!(
+            unindexed_shards([
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00003.safetensors"
+            ])
+            .is_empty()
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        for (name, tensor) in [
+            ("model-00001-of-00002.safetensors", "lm_head.weight"),
+            (
+                "model-00002-of-00002.safetensors",
+                "language_model.mtp.fc.weight",
+            ),
+        ] {
+            let header = format!(r#"{{"{tensor}": {{}}}}"#);
+            let mut file = (header.len() as u64).to_le_bytes().to_vec();
+            file.extend_from_slice(header.as_bytes());
+            std::fs::write(dir.path().join(name), file).unwrap();
+        }
+        assert!(checkpoint_holds(dir.path(), "language_model.mtp").unwrap());
+        assert!(!checkpoint_holds(dir.path(), "language_model.vision").unwrap());
     }
 
     #[test]
