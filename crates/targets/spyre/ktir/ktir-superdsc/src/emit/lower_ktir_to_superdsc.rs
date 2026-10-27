@@ -5876,11 +5876,9 @@ pub fn transpose(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ⭐⭐⭐⭐⭐ THE CHAINED HEAD'S W>1 RELAYOUT (#603, 3b-3) — the composed address map as a Kani
-// property, written BEFORE the door that realizes it (Kani first: the proof owns the law the
-// door must emit).
+// ⭐⭐⭐⭐⭐ THE CHAINED HEAD'S W>1 RELAYOUT (#603, 3b-3).
 //
-// THE FINDING THIS MODULE IS THE PERMANENT RECORD OF: the chained head's out replaces the
+// THE FINDING THIS COMMENT IS THE PERMANENT RECORD OF: the chained head's out replaces the
 // EmbeddedHidden source, and the emission reads the m>1 residual stream rank-2 STICK-MAJOR
 // (`spyre_forward.rs:228-235`: "element (r,c) lands at (c/64)*(mq*64) + r*64 + (c%64)"), so at
 // width > 1 sub-row j of request r must sit at flat stick `j·W + r` — the requests INTERLEAVED
@@ -5893,136 +5891,24 @@ pub fn transpose(
 // measurement, `emit::mod`'s (a) note at the gather cut). So the door's leg 4 is a
 // pointwise-IDENTITY RELAYOUT — a Flat `[width, hidden]` read of the request-major scratch, a
 // RowBlocked `[width, hidden]` write of the activation — through `pw1`, whose per-operand walk
-// law (`emit::mod:3766-3782`, and dxp's own `buildUnitView`, `dsc/dsc2.cpp:2752-2810`: each
-// operand's walk from ITS OWN allocation's `layoutDimOrder_`/`maxDimSizes_`) makes the mixed
-// walk a per-operand fact. Leg 4 exists exactly when `row_major_is_stick_major(width, hidden)`
-// is FALSE — a derived layout fact, never a width branch.
+// law (each operand's walk from ITS OWN allocation's `layoutDimOrder_`/`maxDimSizes_`) makes
+// the mixed walk a per-operand fact. Leg 4 exists exactly when `row_major_is_stick_major(width,
+// hidden)` is FALSE — a derived layout fact, never a width branch.
+//
+// ⛔ THE RECORD OF THE FALSE CLAIM THIS DOOR ONCE CARRIED (deleted 2026-10-27, auditor order):
+// a `#[cfg(kani)]` module here (`embed_row_relayout_proofs`) claimed — in comments, never run —
+// that the composed chain "lands what the body reads" ("GREEN where the 3b-2 direct cut was
+// RED"). That claim was FALSE about the emission it described: the pointwise family presented
+// BOTH of leg 4's operands at the op's own rank-2 stick-major walk, so the identity was a
+// MEMCPY — the gather's request-major bytes reached the OUT unchanged and the body's
+// stick-major read scrambled every row (measured on card, granite-3.1-2b fp8 b2: the full
+// two-row row-major embedding found byte-exact in BOTH the ChainRow synth and the OUT;
+// nothing anywhere scattered). The fix lives in `pointwise_broadcast_opspec_from_tile`: a
+// FLAT-DECLARED input keeps its own flat walk in a stick-major op. The law is pinned where a
+// claim must be earned — the emitted wire:
+// `tests/zz_the_chain_out_is_minted_stick_blocked.rs` (per-core pairing of the flat read and
+// the row_blocked write at W = 2 and W = 4, the elision at W = 1).
 // ─────────────────────────────────────────────────────────────────────────────
-#[cfg(kani)]
-mod embed_row_relayout_proofs {
-    use crate::sdsc_abstract::{CopyDims, StickLayout, row_major_is_stick_major};
-
-    /// The per-request row-gather cut's DESTINATION map, composed exactly as the door emits it:
-    /// op (r, b) of the cut reads request r's l-index stick `r·l_sticks + b` and runs
-    /// `min(cap, row_entries − b·cap)` one-stick entries, entry e writing dest stick
-    /// `r·row_entries + b·cap + e` of the one-stick-wide `[width·row_entries, 64]` scratch —
-    /// element (r, c) at sub-row `j = c/64`, lane `c%64`.
-    fn row_gather_lands(row_entries: usize, r: usize, c: usize) -> usize {
-        let cap = CopyDims::ENTRIES_PER_OP as usize;
-        let j = c / 64;
-        let lane = c % 64;
-        let b = j / cap;
-        let e = j % cap;
-        (r * row_entries + b * cap + e) * 64 + lane
-    }
-
-    /// LEG 4'S READ — the Flat `[width, hidden]` handle over the request-major scratch:
-    /// row-major, element (r, c) at `r·hidden + c`.
-    fn relayout_reads(hidden: usize, r: usize, c: usize) -> usize {
-        r * hidden + c
-    }
-
-    /// THE BODY'S READ (and leg 4's write — one layout, one formula, which is the point): the
-    /// stick-major `[width, hidden]` activation law, computed through the REAL
-    /// `StickLayout::dev_off` — `stick_scatter`'s own `(c/64)·(rows·64) + r·64 + c%64`, never
-    /// restated here.
-    fn body_reads(width: usize, hidden: usize, r: usize, c: usize) -> usize {
-        StickLayout::row_blocked(width, hidden).dev_off(r, c)
-    }
-
-    /// The auditor's geometry: every ladder width against every hidden the door admits
-    /// (1..=64 sticks = 64..=4096 columns).
-    fn geometry() -> (usize, usize, usize, usize) {
-        let width: usize = kani::any();
-        let row_entries: usize = kani::any();
-        kani::assume(width >= 1 && width <= 8);
-        kani::assume(row_entries >= 1 && row_entries <= 64);
-        let r: usize = kani::any();
-        let c: usize = kani::any();
-        kani::assume(r < width);
-        kani::assume(c < row_entries * 64);
-        (width, row_entries, r, c)
-    }
-
-    /// ⭐ THE CUT COMPOSES TO REQUEST-MAJOR: the per-stick cut's `r·row_entries + b·cap + e`
-    /// dest-stick arithmetic lands element (r, c) at flat `r·hidden + c` — the one-stick-wide
-    /// scratch's bytes, the layout leg 4's Flat handle reads.
-    #[kani::proof]
-    fn the_per_request_cut_lands_request_major() {
-        let (_, row_entries, r, c) = geometry();
-        assert_eq!(row_gather_lands(row_entries, r, c), r * row_entries * 64 + c);
-    }
-
-    /// ⭐ LEG 4 READS EXACTLY WHERE THE GATHER WROTE: the Flat read of the scratch is the
-    /// identity on the cut's bytes — no element is picked up from another request's run.
-    #[kani::proof]
-    fn the_relayout_reads_where_the_gather_wrote() {
-        let (_, row_entries, r, c) = geometry();
-        assert_eq!(
-            relayout_reads(row_entries * 64, r, c),
-            row_gather_lands(row_entries, r, c)
-        );
-    }
-
-    /// ⭐⭐⭐ THE ELISION: while the layouts coincide (`row_major_is_stick_major`), the
-    /// request-major scratch already IS the activation — the direct cut lands what the body
-    /// reads, and leg 4 is not emitted. Fail-first: spelling the gather's dest as the
-    /// RowBlocked activation DIRECTLY (the 3b-2 form this module replaced) makes this the only
-    /// one of these properties that holds — `past_the_coincidence_…_row_one_lane_zero` below is
-    /// the witness that it does not hold past the coincidence.
-    #[kani::proof]
-    fn the_elided_form_lands_what_the_body_reads() {
-        let (width, row_entries, r, c) = geometry();
-        let hidden = row_entries * 64;
-        if row_major_is_stick_major(width, hidden) {
-            assert_eq!(
-                row_gather_lands(row_entries, r, c),
-                body_reads(width, hidden, r, c)
-            );
-        }
-    }
-
-    /// ⭐⭐⭐⭐⭐ THE COMPOSED MAP — the door's law as ONE property: elided or relayouted,
-    /// element (r, c) lands at the body's stick-major address. The else arm is leg 4's write
-    /// law (a RowBlocked `[width, hidden]` output handle writes at its own `dev_off` — the SAME
-    /// formula the body reads by, which is why the relayout is a pointwise IDENTITY); the then
-    /// arm is the elision above. GREEN where the 3b-2 direct cut was RED.
-    #[kani::proof]
-    fn the_composed_chain_lands_what_the_body_reads() {
-        let (width, row_entries, r, c) = geometry();
-        let hidden = row_entries * 64;
-        let landed = if row_major_is_stick_major(width, hidden) {
-            row_gather_lands(row_entries, r, c)
-        } else {
-            body_reads(width, hidden, r, c)
-        };
-        assert_eq!(landed, body_reads(width, hidden, r, c));
-    }
-
-    /// ⭐ PAST THE COINCIDENCE THE DIRECT CUT IS WRONG — the permanent witness that the elision
-    /// is exactly the coincidence and not a width branch: at every width ≥ 2 and hidden ≥ two
-    /// sticks, request 1's lane 0 lands at `hidden` request-major but `64` stick-major, and
-    /// those differ at every admitted geometry. (The 3b-2 direct-cut claim — `row_gather_lands
-    /// == body_reads` unconditionally — was run as a Kani proof and FAILED at
-    /// `embed_row_relayout_proofs`'s own `row_gather_lands == body_reads` assertion,
-    /// `VERIFICATION:- FAILED` in 0.15 s, its counterexample at width ≥ 2; this witness is
-    /// that verdict's permanent form.)
-    #[kani::proof]
-    fn past_the_coincidence_the_direct_cut_misses_row_one_lane_zero() {
-        let width: usize = kani::any();
-        let row_entries: usize = kani::any();
-        kani::assume(width >= 2 && width <= 8);
-        kani::assume(row_entries >= 2 && row_entries <= 64);
-        let hidden = row_entries * 64;
-        assert_ne!(
-            row_gather_lands(row_entries, 1, 0),
-            body_reads(width, hidden, 1, 0),
-            "request 1 lane 0: request-major {} vs stick-major {}",
-            row_gather_lands(row_entries, 1, 0),
-            body_reads(width, hidden, 1, 0)
-        );
-    }
-}
 
 /// ⭐⭐⭐⭐⭐ THE CHAINED HEAD'S ROW PRODUCTION (#603) — `table[pick]` off the lm-head's own TIED
 /// weight, read IN PLACE, as THREE door-assembled legs. See [`crate::ktir_node::Program::EmbedRowGather`]
