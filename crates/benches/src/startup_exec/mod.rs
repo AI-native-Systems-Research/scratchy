@@ -1203,24 +1203,28 @@ fn normalize(s: &str, backend: Backend) -> String {
         .join(" ")
 }
 
-/// The largest logit gap, from the reference's top token to the one scratchy picked, that still
-/// counts as a near-tie two correct stacks break differently. Measured on gpt-oss-20b and
-/// Nemotron-3-Nano-30B, whose thought preambles tie on every prompt (M3 Pro, mlx-lm 0.31.3): each
-/// token where they part from mlx-lm is 0.0 to 0.75 logits behind its top, and every other token
-/// is its top. A wrong computation is nowhere near: the same answer with its token ids shifted
-/// by one is 28.1 behind, on 34 of its 35 later tokens.
-const TIE_LOGITS: f64 = 1.0;
+/// How far below the reference's own greedy answer scratchy's may score, in mean log-probability
+/// per token under the reference, teacher-forced. A correct stack that breaks a near-tie
+/// differently writes text the reference finds about as likely as its own; a wrong computation
+/// writes text it finds far less likely, at nearly every token. Measured on granite-4.2-3b's
+/// count answer (base M5, mlx-lm 0.31.4): the reference's greedy answer -0.079 a token,
+/// scratchy's under TurboQuant 4-bit KV -0.141 (0.06 below, though one of its tokens sits 1.5
+/// logits behind the reference's top), and the same answer with its ids shifted by one -12.17
+/// (12.1 below). The bar sits about 8x above that noise and 24x below that defect. Judging the
+/// whole answer, not its worst token, is what keeps a single drifted near-tie inside a thought
+/// preamble from failing a model whose load path is exact.
+const SCORE_NATS: f64 = 0.5;
 
-/// How many of an answer's tokens may be near-ties. The measured answers part on at most 3 of
-/// 12; a load path that drifts many tokens each a little off is no tie.
-const MAX_TIES: usize = 4;
-
-/// What the score command found on one answer ([`TIE_LOGITS`]).
+/// What the score command found on one answer ([`SCORE_NATS`]).
 #[derive(serde::Deserialize)]
 struct Ties {
     tokens: usize,
     differ: Vec<Tie>,
     max_gap: f64,
+    /// Scratchy's answer: mean log-probability per token under the reference, teacher-forced.
+    mean_logprob: f64,
+    /// The reference's own greedy answer of the same length, scored the same way.
+    reference_mean_logprob: f64,
 }
 
 #[derive(serde::Deserialize)]
@@ -1232,24 +1236,24 @@ struct Tie {
 }
 
 impl Ties {
-    /// None when the answer is the reference's up to near-ties, else why not. No token
-    /// differing is the reference's own greedy answer, whose text differs only in how the two
-    /// print it (mlx_lm.generate shows gpt-oss's special tokens, `scr chat` drops them).
+    /// How far below the reference's own answer scratchy's scores, in nats a token.
+    fn shortfall(&self) -> f64 {
+        self.reference_mean_logprob - self.mean_logprob
+    }
+
+    /// None when the reference finds the answer about as likely as its own, else why not. No
+    /// token differing is the reference's own greedy answer, whose text differs only in how the
+    /// two print it (mlx_lm.generate shows gpt-oss's special tokens, `scr chat` drops them).
     fn defect(&self) -> Option<String> {
-        if self.max_gap > TIE_LOGITS {
-            return Some(format!(
-                "a token {:.3} logits behind the reference's top (a near-tie is at most {TIE_LOGITS})",
-                self.max_gap
-            ));
-        }
-        if self.differ.len() > MAX_TIES {
-            return Some(format!(
-                "{} of {} tokens differ (at most {MAX_TIES} near-ties)",
-                self.differ.len(),
-                self.tokens
-            ));
-        }
-        None
+        (self.shortfall() > SCORE_NATS).then(|| {
+            format!(
+                "the reference scores it {:.3} nats a token below its own answer ({:.3} vs {:.3}; \
+                 at most {SCORE_NATS})",
+                self.shortfall(),
+                self.mean_logprob,
+                self.reference_mean_logprob
+            )
+        })
     }
 }
 
@@ -1363,7 +1367,9 @@ fn parity_gate(
         match verdict {
             Ok(t) => {
                 println!(
-                    "  {name:<9} TIE   agree {agree}/{common} chars; {} near-tie token(s), at most {:.3} logits",
+                    "  {name:<9} TIE   agree {agree}/{common} chars; {:.3} nats a token below the \
+                     reference's own answer; {} token(s) not its top, at most {:.3} logits",
+                    t.shortfall(),
                     t.differ.len(),
                     t.max_gap
                 );
@@ -1923,39 +1929,41 @@ mod tests {
         assert_eq!(diag_token_ids("INFO nothing here"), None);
     }
 
-    /// A near-tie is a token at most TIE_LOGITS behind the reference's top, on few tokens; a
-    /// token far behind, or many a little behind, is a defect.
+    /// The answer passes when the reference scores it within SCORE_NATS of its own, whatever
+    /// its single worst token; it fails when the reference finds it far less likely.
     #[test]
-    fn a_near_tie_passes_and_a_far_or_many_token_difference_fails() {
+    fn an_answer_the_reference_finds_as_likely_passes_and_a_wrong_one_fails() {
         let tie = |at, gap| Tie {
             at,
-            scratchy: "We".into(),
-            mlx_lm: "The".into(),
+            scratchy: " seems".into(),
+            mlx_lm: "'s".into(),
             gap,
         };
-        // gpt-oss-20b's arith answer, as mlx-lm scored it on the M3 Pro.
-        let gpt_oss = Ties {
-            tokens: 12,
-            differ: vec![tie(3, 0.375), tie(4, 0.0), tie(7, 0.75)],
-            max_gap: 0.75,
-        };
-        assert!(gpt_oss.defect().is_none());
-        let far = Ties {
+        // granite-4.2-3b's count answer under TurboQuant KV, as mlx-lm scored it on the base M5:
+        // one token 1.5 logits behind, the whole answer 0.06 nats a token below the reference's.
+        let granite = Ties {
             tokens: 40,
-            differ: vec![tie(5, 28.125)],
-            max_gap: 28.125,
+            differ: vec![tie(17, 1.5), tie(26, 0.25), tie(31, 1.0)],
+            max_gap: 1.5,
+            mean_logprob: -0.141,
+            reference_mean_logprob: -0.079,
         };
-        assert!(far.defect().unwrap().contains("28.125 logits"));
-        let many = Ties {
+        assert!(granite.defect().is_none());
+        // The same answer with its ids shifted by one.
+        let shifted = Ties {
             tokens: 40,
-            differ: (0..5).map(|i| tie(i, 0.5)).collect(),
-            max_gap: 0.5,
+            differ: (0..40).map(|i| tie(i, 28.0)).collect(),
+            max_gap: 49.7,
+            mean_logprob: -12.17,
+            reference_mean_logprob: -0.079,
         };
-        assert!(many.defect().unwrap().contains("5 of 40"));
+        assert!(shifted.defect().unwrap().contains("12.091 nats"));
         let none = Ties {
             tokens: 12,
             differ: vec![],
             max_gap: 0.0,
+            mean_logprob: -0.2,
+            reference_mean_logprob: -0.2,
         };
         assert!(
             none.defect().is_none(),
@@ -1973,7 +1981,7 @@ mod tests {
         let scored = |json: &str| sh(&format!("cat {{tokens}} >/dev/null && echo '{json}'"));
         let model = "mlx-community/some-model-4bit";
         let near = scored(
-            r#"{"tokens": 3, "differ": [{"at": 0, "scratchy": "We", "mlx_lm": "The", "gap": 0.375}], "max_gap": 0.375}"#,
+            r#"{"tokens": 3, "differ": [{"at": 0, "scratchy": "We", "mlx_lm": "The", "gap": 1.5}], "max_gap": 1.5, "mean_logprob": -0.141, "reference_mean_logprob": -0.079}"#,
         );
         parity_gate(
             &scratchy,
@@ -1983,9 +1991,9 @@ mod tests {
             model,
             Some(&near),
         )
-        .expect("a near-tie passes");
+        .expect("an answer the reference finds as likely as its own passes");
         let far = scored(
-            r#"{"tokens": 3, "differ": [{"at": 0, "scratchy": "We", "mlx_lm": "The", "gap": 9.5}], "max_gap": 9.5}"#,
+            r#"{"tokens": 3, "differ": [{"at": 0, "scratchy": "We", "mlx_lm": "The", "gap": 9.5}], "max_gap": 9.5, "mean_logprob": -6.2, "reference_mean_logprob": -0.1}"#,
         );
         let err = parity_gate(
             &scratchy,
@@ -1995,7 +2003,7 @@ mod tests {
             model,
             Some(&far),
         )
-        .expect_err("a token far behind fails");
+        .expect_err("an answer the reference finds far less likely fails");
         assert!(format!("{err:#}").contains("load path"));
         parity_gate(
             &scratchy,

@@ -24,7 +24,8 @@ runs everything else.
   **Quick run** below. The script with no flags but `--unpinned`: this Mac's
   four models (the small set below 64 GB, the large set at 64 GB), scratchy
   alone, cold and warm, one rep, the users × prompt grid at 1, 4, 8 and 16
-  users and 64-token answers, two rounds of each users count a cell.
+  users and prompts to 32k at 64 GB (1, 2 and 4 users and prompts to 8k
+  below it) and 64-token answers, two rounds of each users count a cell.
   scratchy runs at its defaults on every Mac, and every cell runs: one
   that runs out of memory is recorded as failed. The page keeps every
   other engine's numbers, and scratchy's frozen launches, from the last full
@@ -44,7 +45,7 @@ runs everything else.
 **The rounds:** one model per class, a small one for 36 GB and a large one
 for 64 GB. Sliding window: gpt-oss-20b / gpt-oss-120b-3bit. Mamba-2:
 nemotron-3-nano-30b-a3b / nemotron-3-super-120b-a12b. Gated DeltaNet:
-qwen3.6-35b-a3b / qwen3.5-122b-a10b. Dense: granite-4.2-8b / granite-4.2-30b. The large set is 2- and 3-bit (OptiQ or 3-bit), since no 4-bit 120B fits 64 GB: its numbers aren't comparable with the 4-bit small set on quality.
+qwen3.6-35b-a3b / qwen3.5-122b-a10b. Dense: granite-4.2-3b / granite-4.2-30b. The large set is 2- and 3-bit (OptiQ or 3-bit), since no 4-bit 120B fits 64 GB: its numbers aren't comparable with the 4-bit small set on quality.
 `--models small`, `large` or `full` picks a set; glm-4.5-air and the gemma
 and qwen3.6-27b models run by name. The run file records the class table
 (`config.classes`), and the page's overview reads its columns from it.

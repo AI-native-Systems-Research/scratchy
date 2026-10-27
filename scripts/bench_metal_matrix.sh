@@ -35,8 +35,9 @@
 # later cell, shared across engines so all see the same prompts. Concurrency is
 # offered (--max-concurrency), not the effective decode batch. The default
 # sweep is the grid: prompt x answer x users, at --scale-grid-conc's user
-# counts (1, 4, 8 and 16 by default), so neither the separate users sweep
-# (conc) nor the prompt sweep (input) is needed: the grid's prompts reach 32k
+# counts (1, 4, 8 and 16 by default at 64 GB and above; 1, 2 and 4 below,
+# where one 32k-prompt cell at 16 users takes half an hour), so neither the separate users sweep
+# (conc) nor the prompt sweep (input) is needed: the grid's prompts reach 32k (8k below 64 GB)
 # and its 1-user row is the prompt sweep. One user at a time is what most Macs
 # see (#349). --scale-axes conc,grid,input adds the other sweeps back. A cell
 # sends --scale-rounds rounds of its users count (4; a quick run, 2), and at least
@@ -92,6 +93,10 @@
 # --fail-fast stops at the first scratchy build or parity-gate failure instead
 # of going on to the next model. Either way, a model with no scratchy numbers
 # fails the run (exit 1).
+# --resume, with the same --out-dir and flags as a run that died (a full disk, a
+# crash, a kill), keeps every scaling cell that run finished cleanly and measures
+# only the rest; the build, parity gate and startup ladder run again (minutes).
+# Without it a rerun measures, and overwrites, every cell. The JSON records it.
 set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -107,6 +112,7 @@ MODELS_ALL=(
   "nemotron-3-super-120b-a12b=mlx-community/NVIDIA-Nemotron-3-Super-120B-A12B-OptiQ-2bit:mlx-affine-b4-g64-qembed" # 47.5 GB, latent MoE, Mamba-2 hybrid, OptiQ 2-bit
   "qwen3.6-35b-a3b=mlx-community/Qwen3.6-35B-A3B-4bit:mlx-affine-b4-g64-qembed"        # 20.4 GB, MoE, GDN hybrid
   "qwen3.5-122b-a10b=scratchery/Qwen3.5-122B-A10B-OptiQ-2bit-mtp:mlx-affine-b4-g64-qembed" # 48.3 GB, MoE, GDN hybrid, OptiQ 2-bit, MTP head
+  "granite-4.2-3b=ibm-granite/granite-4.2-3b-q4-mlx:mlx-affine-b4-g64-qembed"             # 2.1 GB, dense
   "granite-4.2-8b=ibm-granite/granite-4.2-8b-q4-mlx:mlx-affine-b4-g64-qembed"             # 4.9 GB, dense
   "granite-4.2-30b=ibm-granite/granite-4.2-30b-q4-mlx:mlx-affine-b4-g64-qembed"           # 16.5 GB, dense
   # By name only (--models <stem>): the earlier rounds' models.
@@ -128,7 +134,7 @@ CLASSES=(
   "sliding window|gpt-oss-20b|gpt-oss-120b-3bit"
   "Mamba-2|nemotron-3-nano-30b-a3b|nemotron-3-super-120b-a12b"
   "Gated DeltaNet|qwen3.6-35b-a3b|qwen3.5-122b-a10b"
-  "dense|granite-4.2-8b|granite-4.2-30b"
+  "dense|granite-4.2-3b|granite-4.2-30b"
 )
 MODELS_SMALL="$(for c in "${CLASSES[@]}"; do IFS='|' read -r _ s _ <<<"${c}"; echo "${s}"; done | paste -sd, -)"
 MODELS_LARGE="$(for c in "${CLASSES[@]}"; do IFS='|' read -r _ _ l <<<"${c}"; echo "${l}"; done | paste -sd, -)"
@@ -243,6 +249,7 @@ WARM_REQUESTS=20
 OFFLINE=0
 SKIP_BUILD=0
 FAIL_FAST=0
+RESUME=0
 PARITY_GIVEN=0          # --parity: force the mlx-lm parity gate in a scratchy-only run
 OUT_DIR=""
 KV_CACHE_DTYPE=""
@@ -269,10 +276,11 @@ SCALE_AXES="grid"
 SCALE_CONC="1,4,16"
 SCALE_INPUT="128,512,2048,8192"
 SCALE_OUTPUT="16,64,256,1024"
-SCALE_GRID_INPUT="128,1024,4096,32768"
+# SCALE_GRID_INPUT, the grid's prompt lengths, defaults by this Mac's memory below.
 SCALE_GRID_OUTPUT="64"         # --full: 64,512,2048, the 1-user decode-vs-answer-length curve
 (( FULL )) && SCALE_GRID_OUTPUT="64,512,2048"
-SCALE_GRID_CONC="1,4,8,16"     # the grid's users dimension; empty: 1 and the base count
+# SCALE_GRID_CONC, the grid's users dimension (empty: 1 and the base count),
+# defaults by this Mac's memory once it is read, below.
 SCALE_GRID_USERS_OUTPUT="64"   # the answer lengths above 1 user; empty: every --scale-grid-output
 SCALE_BASE_INPUT=1024
 SCALE_BASE_OUTPUT=64
@@ -327,6 +335,7 @@ while [[ $# -gt 0 ]]; do
         --offline)           OFFLINE=1; shift ;;
         --skip-build)        SKIP_BUILD=1; shift ;;
         --fail-fast)         FAIL_FAST=1; shift ;;
+        --resume)            RESUME=1; shift ;;
         --parity)            PARITY_GIVEN=1; shift ;;
         --full)              shift ;;   # read before the defaults above
         --out-dir)           OUT_DIR="$2"; shift 2 ;;
@@ -337,6 +346,17 @@ done
 # This Mac's set: the large models need 64 GB, the small ones are the round below that.
 MEM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 if (( MEM_GB >= LARGE_GB )); then MODELS_DEFAULT="${MODELS_LARGE}"; else MODELS_DEFAULT="${MODELS_SMALL}"; fi
+# The same cut sizes the users dimension: a Mac below it reads a 32k prompt in
+# about half a minute, so 8 and 16 users there are mostly prefill queueing.
+if [[ -z "${SCALE_GRID_CONC+set}" ]]; then
+    if (( MEM_GB >= LARGE_GB )); then SCALE_GRID_CONC="1,4,8,16"; else SCALE_GRID_CONC="1,2,4"; fi
+fi
+# And its prompts: on a 32 GB base M5 a 32k prompt alone prefills in 25 s, but two at once did not
+# finish 12 requests in --cell-timeout-s (1200 s), so each 32k cell above 1 user was twenty
+# minutes that recorded only a timeout. Below the cut the longest prompt is 8k.
+if [[ -z "${SCALE_GRID_INPUT+set}" ]]; then
+    if (( MEM_GB >= LARGE_GB )); then SCALE_GRID_INPUT="128,1024,4096,32768"; else SCALE_GRID_INPUT="128,1024,4096,8192"; fi
+fi
 [[ ${#MODELS[@]} -eq 0 ]] && IFS=',' read -r -a MODELS <<<"${MODELS_DEFAULT}"
 case "${MODELS[*]}" in
     all)   MODELS=("${MODELS_ALL[@]}") ;;
@@ -555,7 +575,7 @@ CLASS_TABLE="$(printf '%s\n' "${CLASSES[@]}")"
 export ENGINE_INFO PIN_PROBLEMS UNPINNED CLASS_TABLE LARGE_GB
 export STARTED_UTC PRIME_LAUNCHES INPUT_LEN OUTPUT_LEN WARM_REQUESTS SCENARIOS SCALING SCALE_AXES SCALE_CONC SCALE_INPUT SCALE_OUTPUT SCALE_GRID_INPUT \
        SCALE_GRID_OUTPUT SCALE_GRID_CONC SCALE_GRID_USERS_OUTPUT SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS SCALE_ROUNDS \
-       MLX_PYTHON OLLAMA_BIN KV_CACHE_DTYPE SERVE_ARGS CELL_TIMEOUT_S MODELS_FULL
+       MLX_PYTHON OLLAMA_BIN KV_CACHE_DTYPE SERVE_ARGS CELL_TIMEOUT_S RESUME MODELS_FULL
 python3 - "${JSON}" "${chip}" <<'PY'
 import json, os, subprocess, sys
 out, chip = sys.argv[1:3]
@@ -602,6 +622,8 @@ json.dump({
              "kv_cache_dtype": e["KV_CACHE_DTYPE"] or "default (TurboQuant)",
              "scratchy_serve_args": e["SERVE_ARGS"] or None,
              "cell_timeout_s": int(e["CELL_TIMEOUT_S"]),
+             # --resume: cells an earlier run of this output finished are kept, not remeasured.
+             "resumed": e["RESUME"] == "1",
              # bench serve counts a request whose stream ended aborted or errored
              # as failed (#510), so the page takes each cell's `failed` as recorded.
              "failures_counted": True,
@@ -663,7 +685,11 @@ serve_down() {
     srv=""
 }
 kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "${c}"; done; kill -TERM "$1" 2>/dev/null || true; }
+# Out to /dev/null first, and write to it: a line the full disk refused stays in bash's output
+# buffer and otherwise comes back out of every $(pgrep ...) below, where its words became pids,
+# pgrep printed its usage on each and the exit never finished.
 cleanup() {
+    exec >/dev/null; echo
     serve_down
     local c; for c in $(pgrep -P $$); do kill_tree "${c}"; done
     # A killed subshell orphans its children, so also stop whatever is on this run's port.
@@ -807,6 +833,7 @@ footprint_bytes() { # pid -> bytes, or nothing if it has gone
 }
 mem_sampler() { # pid out
     local p b s
+    exec >/dev/null; echo   # a refused log line in the forked buffer must not reach tree_pids (cleanup)
     while kill -0 "$1" 2>/dev/null; do
         s=0
         for p in $(tree_pids "$1"); do b=$(footprint_bytes "${p}"); s=$(( s + ${b:-0} )); done
@@ -853,6 +880,13 @@ run_cell() { # prefix axis rung input output conc
     local n=$(( $6 * SCALE_ROUNDS > SCALE_NUM_PROMPTS ? $6 * SCALE_ROUNDS : SCALE_NUM_PROMPTS ))
     seed=$(printf '%s' "${SCALE_SEED_BASE}:${stem}:$2:$3" | cksum | cut -d' ' -f1)
     printf '    %-16s in %-5s out %-5s conc %-3s ' "$2=$3" "$4" "$5" "$6"
+    # --resume: a cell an earlier run of this output finished cleanly is kept, not measured again.
+    if (( RESUME )) && python3 -c 'import json, sys; j = json.load(open(sys.argv[1]))
+sys.exit(not j.get("completed") or any(j.get(k) for k in ("failed", "timed_out", "dead_server")))' \
+            "${out_json}" 2>/dev/null; then
+        echo "$(numbers "${out_json}") · kept (--resume)"
+        return 0
+    fi
     local mem="${out_json%.json}.mem" sampler=""
     rm -f "${mem}"
     [[ -n "${srv}" ]] && { mem_sampler "${srv}" "${mem}" & sampler=$!; }
@@ -977,9 +1011,17 @@ run_scale_cells() { # prefix restart-function full-length [axes]
 # One comparison engine on one model: a warm-up start (so a download never lands
 # inside a measurement, and to learn the name it serves the model under), the
 # startup ladder, then one server per scaling axis, sized for that axis.
-served_name() { # the first model the running server lists
-    curl -fsS -m 10 "http://127.0.0.1:${PORT}/v1/models" \
-        | python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print(d[0]["id"] if d else "")' 2>/dev/null
+# The name the running server lists MODEL under: its repo name, or the repo id with / as --
+# (oMLX lists its --model-dir entries by repo name, and every Hugging Face cache model besides,
+# by id). Never just the first listed: oMLX's list starts with whatever cache model sorts first,
+# and requests to that name failed every gpt-oss-20b and granite-4.2-3b cell on the base M5.
+served_name() { # MODEL
+    curl -fsS -m 10 "http://127.0.0.1:${PORT}/v1/models" | python3 -c '
+import json, sys
+model = sys.argv[1]
+ids = [m["id"] for m in json.load(sys.stdin)["data"]]
+want = [model.rsplit("/", 1)[-1], model.replace("/", "--"), model]
+print(next((w for w in want if w in ids), ""))' "$1" 2>/dev/null
 }
 prepare_failed() { serve_down; rm -rf "${RAW}/omlx-home-probe"; return 1; }
 engine_prepare() { # key label model -> prints the name requests carry; fails if it cannot serve
@@ -1014,8 +1056,9 @@ import json,sys; t=sys.argv[1]; t=t if ":" in t else t+":latest"
 print(next((m["digest"] for m in json.load(sys.stdin)["models"] if m["name"]==t), ""))' "${model}" 2>/dev/null || echo
             } >"${RAW}/served-ollama-${stem}"
             name="${model}" ;;
-        *)  name="$(served_name)" ;;
+        *)  name="$(served_name "${model}")" ;;
     esac
+    [[ -n "${name}" ]] || { echo "    ${label} does not list ${model} — not serving it" >&2; prepare_failed; return 1; }
     if [[ "${key}" == omlx || "${key}" == omlx_tq ]]; then
         # /v1/models naming the model proves nothing: oMLX loads lazily, so its
         # memory guard has not been asked yet. One tiny request makes it try,
@@ -1216,7 +1259,9 @@ PY
 
     # Every per-model file an earlier run into this directory left, a declined
     # engine's included: a decline is this run's finding, not a sticky one.
-    rm -f "${RAW}"/exec*-"${stem}".json "${RAW}"/scale*-"${stem}".*.json "${RAW}/serve-${stem}.json" "${RAW}"/served-*-"${stem}" "${RAW}"/declined-*-"${stem}"
+    # --resume keeps the scaling cells, the ones it is there to keep (run_cell).
+    rm -f "${RAW}"/exec*-"${stem}".json "${RAW}/serve-${stem}.json" "${RAW}"/served-*-"${stem}" "${RAW}"/declined-*-"${stem}"
+    (( RESUME )) || rm -f "${RAW}"/scale*-"${stem}".*.json
     cell_model=""; cell_tok=""
     for row in "${ENGINE_ROWS[@]}"; do IFS='|' read -r key _ _ <<<"${row}"; unset "M_${key}" "Q_${key}" "R_${key}"; done
 
@@ -1396,6 +1441,8 @@ def load(name):
     return json.load(open(p)) if os.path.exists(p) else None
 def metrics(j):
     return {k: j[k] for k in KEEP if k in j} if j else None
+grid_users = {int(x) for x in env["GRID_CONC_LIST"].split(",")}
+grid_inputs = {int(x) for x in env["SCALE_GRID_INPUT"].split(",") if x}
 def scaling(engine):
     cells = []
     for p in sorted(glob.glob(os.path.join(raw, f"scale{engine}-{stem}.*.json"))):
@@ -1403,6 +1450,11 @@ def scaling(engine):
         if not m or not (j := load(os.path.basename(p))):
             continue
         axis, a, b, users = m.groups()
+        # The output is shared across runs, so a cell at a users count or prompt this run did not
+        # ask for (an earlier run's, at another --scale-grid-conc or -input) is not this run's.
+        if axis == "grid" and (int(users or env["BASE_CONC"]) not in grid_users
+                               or int(a) not in grid_inputs):
+            continue
         where = ({"rung": f"{a}x{b}", "input_len": int(a), "output_len": int(b),
                   "conc": int(users or env["BASE_CONC"])}
                  if axis == "grid" else {"rung": int(a)})

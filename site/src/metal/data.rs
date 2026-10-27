@@ -475,7 +475,7 @@ impl Bytes {
 /// Each MLX checkpoint's weights: the `.safetensors` files scratchy and mlx-lm
 /// load, summed from the Hugging Face API (main, 2026-10-12). ollama runs its
 /// own build of the same model, named on its row.
-const WEIGHTS: [(&str, Bytes); 17] = [
+const WEIGHTS: [(&str, Bytes); 18] = [
     (
         "mlx-community/granite-3.3-2b-instruct-4bit",
         Bytes(1_425_458_043),
@@ -512,6 +512,7 @@ const WEIGHTS: [(&str, Bytes); 17] = [
     ),
     ("mlx-community/granite-4.1-8b-4bit", Bytes(5_238_406_779)),
     ("mlx-community/granite-4.1-30b-4bit", Bytes(18_041_976_573)),
+    ("ibm-granite/granite-4.2-3b-q4-mlx", Bytes(2_059_005_430)),
     ("ibm-granite/granite-4.2-8b-q4-mlx", Bytes(4_945_853_970)),
     ("ibm-granite/granite-4.2-30b-q4-mlx", Bytes(16_469_111_945)),
 ];
