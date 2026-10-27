@@ -25,9 +25,9 @@
 //!    because every bundle of a model shares ONE staged weight segment (a rows-gated
 //!    mint would hand the single-row body addresses no other bundle staged);
 //! 4. **the door A/B** — with the handoff, the o matmul's `matmulfp8` reads its weight
-//!    operand at the PERMUTED copy's placement and the finalize is 2 ops (one per slab);
-//!    without it, the same program reads the companion's placement and the finalize is
-//!    the shipped 64 ops (32 heads × 2 slabs). Same walk, same layout, one boolean;
+//!    operand at the PERMUTED copy's placement and the attention output stays in the
+//!    kernel's per-head row frame (the splice emits no from-rows copy); without it, the
+//!    same program reads the companion's placement. Same walk, same layout, one boolean;
 //! 5. **the desyncs refuse** — a handoff naming no weight, and a handoff naming a DENSE
 //!    projection's weight, are build errors naming the bundle's own statement, never a
 //!    half-restructured emission.
@@ -479,53 +479,36 @@ fn the_headmajor_oproj_handoff_runs_the_whole_walk() {
     );
 
     // ── 6. THE DOOR A/B — same walk, same layout, one boolean ─────────────────────────────────
-    // WITH the handoff: the finalize is one op per feature slab (2, not the shipped 64 =
-    // 32 heads × 2 slabs) and the o matmul's matmulfp8 reads its weight at the PERMUTED
-    // copy's placement. WITHOUT: the shipped 64-op finalize and the companion placement.
-    // The names are the door's own (the fp8 chain ends `…_fq_mm`; the finalize forms carry
-    // `attn_o_s{slab}` / `attn_o_h{head}s{slab}`), never a node index.
-    let attn_body = rolled
-        .bodies
+    // WITH the handoff: the attention output stays in the per-head row frame (no from-rows
+    // copy) and the o matmul's matmulfp8 reads its weight at the PERMUTED copy's placement.
+    // WITHOUT: the companion placement. The names are the door's and the splice's own (the
+    // fp8 chain ends `…_fq_mm`; the relayout copies carry `blkcp_q_s{id}` / `blkcp_o_s{id}`),
+    // never a node index.
+    // ⭐ THE ATTENTION HALF IS THE SPLICE'S HEAD RELAYOUT. The hand-written finalize this cell
+    // used to count (`attn_o_s{slab}` vs `attn_o_h{head}s{slab}`) went with the hand-written
+    // attention emission; the Triton kernels write their output in the per-head row frame, and
+    // the splice copies it back to the token stream (`blkcp_o_s{id}`) — EXCEPT under the
+    // handoff, whose permuted o_proj reads the row-frame bytes directly. So the A/B law is: the
+    // handoff bundle states the q copy and NO output copy, and the attention program writes the
+    // graph's own output tensor.
+    let body_ops: Vec<&EmittedOp> = rolled.bodies.iter().flat_map(|b| b.ops.iter()).collect();
+    let attn_body = body_ops
         .iter()
-        .flat_map(|b| b.ops.iter())
+        .copied()
         .find(|e| e.op_name.starts_with("attn_s"))
         .expect("the body's attention program");
-    let with = door_lower_op(&rolled, attn_body, Some(params))
-        .expect("the attention lowers under the handoff");
-    let slab_finalizes = with
-        .iter()
-        .filter(|o| o.op_name.contains("attn_o_s"))
-        .count();
-    let per_head = with
-        .iter()
-        .filter(|o| o.op_name.contains("attn_o_h"))
-        .count();
-    assert_eq!(
-        slab_finalizes, 2,
-        "one finalize op per feature slab (hd/POOL_STICK)"
+    assert!(
+        body_ops.iter().any(|e| e.op_name.starts_with("blkcp_q_s")),
+        "the multi-slab attention reads q through the head relayout's to-rows copy"
     );
-    assert_eq!(per_head, 0, "the per-head finalize loop is gone");
-
+    assert!(
+        !body_ops.iter().any(|e| e.op_name.starts_with("blkcp_o_s")),
+        "under the handoff the output stays in the per-head row frame — no from-rows copy"
+    );
+    door_lower_op(&rolled, attn_body, Some(params))
+        .expect("the attention lowers under the handoff");
     let mut shipped = params;
     shipped.headmajor_handoff = false;
-    let without = door_lower_op(&rolled, attn_body, Some(shipped))
-        .expect("the attention lowers without the handoff (the shipped emission)");
-    assert_eq!(
-        without
-            .iter()
-            .filter(|o| o.op_name.contains("attn_o_h"))
-            .count(),
-        64,
-        "the shipped per-head finalize: 32 heads × 2 slabs"
-    );
-    assert_eq!(
-        without
-            .iter()
-            .filter(|o| o.op_name.contains("attn_o_s"))
-            .count(),
-        0,
-        "the slab-major form is the handoff's alone"
-    );
 
     // The o matmul's program — identified by DATA (the only fp8 matmul in the graph, so
     // the only door-lowered group carrying a `matmulfp8`), not by node index.

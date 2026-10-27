@@ -2170,16 +2170,21 @@ fn spliced_attn_lowers_through_the_door() {
                     s.geom, s.mq, s.rung
                 )
             });
+            // ⭐ ONE PROGRAM AT ONE SLAB, THREE PAST IT: at a multi-slab head dim the token
+            // stream and the kernel's `[nqh·R, HD]` per-head rows are different bytes, so the
+            // splice wraps the one-shot program in the head relayout's two copies
+            // (`HeadRelayout`: q into the rows before it, the output back after it).
+            let multi_slab = s.geom.2 > ktir_superdsc::sdsc_abstract::POOL_STICK;
             assert_eq!(
                 spliced_ops.len(),
-                1,
-                "a foldless `lower_attn` returns exactly the one-shot program (geom={:?} mq={} \
-                 rung={})",
+                if multi_slab { 3 } else { 1 },
+                "a foldless `lower_attn` returns the one-shot program, wrapped in the head \
+                 relayout's two copies past one slab (geom={:?} mq={} rung={})",
                 s.geom,
                 s.mq,
                 s.rung
             );
-            let spliced = &spliced_ops[0];
+            let spliced = &spliced_ops[usize::from(multi_slab)];
 
             // ⛔ THE NAME LAW — `attn_s{id}`.
             assert_eq!(
@@ -2294,6 +2299,18 @@ fn spliced_attn_lowers_through_the_door() {
                     s.geom, s.mq, s.rung, e
                 )
             });
+            // The head relayout's row-frame buffers, placed from the programs' own views —
+            // the same pass the walks run beside `place_step_inputs` (a no-op at one slab).
+            scratchy_target_spyre::lower_subtile_tape_to_ktir::place_head_rows(
+                &mut layout,
+                &[spliced_ops.as_slice()],
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "head rows placed (geom={:?} mq={} rung={} r_ar={rows_are_requests}): {}",
+                    s.geom, s.mq, s.rung, e
+                )
+            });
 
             // The walk's own scale-registry completion, run at its own site (beside the
             // placement pass, before the door): the spliced program states its exp2-restated
@@ -2304,6 +2321,13 @@ fn spliced_attn_lowers_through_the_door() {
                 &mut layout,
                 &[std::slice::from_ref(spliced)],
             );
+            // The walk's own TAIL placements, in its own order (`lower_subtile_tape_to_ktir`'s
+            // re-rolled walk and `lower_subtile_tape_to_superdsc`'s unrolled one): the KV block
+            // index, then the batched arm's Q repetition table, which `place_step_inputs`
+            // defers because it is the one step input whose presence differs between a
+            // session's bodies. Both are no-ops when nothing was deferred.
+            layout.place_kv_block_index_last();
+            layout.place_rep_table_last();
 
             // The program lowers through the production door under the walk's own
             // layout, with the bundle facts stated exactly as the tape walk states
@@ -2325,78 +2349,41 @@ fn spliced_attn_lowers_through_the_door() {
                 oproj_wtid: None,
             };
             let mut sym = 0i64;
-            // ⛔ THE BATCHED-DECODE MERGE'S SUB-STICK CLASS — the door's own designed
-            // refusal, EXPECTED and PINNED here, never skipped.
-            //
-            // THE DIFFERENCE BETWEEN THIS FIXTURE AND PRODUCTION (the judgment-adjacent
-            // check): production bakes `rows_are_requests = !is_prefill && decode_rows > 1`
-            // (`codegen.rs`'s ceiling lowering and every ladder rung's), so its `r_ar=true`
-            // arm is BATCHED decode only — the batched kernel's slot merge leaves
-            // `num_seqs·nkvh·gqa` survivor lanes, a WHOLE stick at every batch ≥ 2 — while
-            // the judgment's own SOLO decode (`decode_rows == 1`) routes `r_ar=false` and
-            // lowers through the prefill arm at MQ=1: the `r_ar=false` cells below are that
-            // exact shape and MUST lower green. The `r_ar=true` cell at `mq == 1` is
-            // `batched_decode_hm` at `NUM_SEQS = 1` — a width production never bakes, and
-            // one the door refuses BY DESIGN: the kernel's slot merge
-            // (`batched_decode.py`: `mm = tl.reshape(m, [BLOCKS_PER_CHUNK, NUM_SEQS*NKVH,
-            // GQA])`, `merged = tl.max(mm, 0)`) reduces to `[NUM_SEQS*NKVH, GQA]` — 32
-            // survivors at this geometry, HALF a stick at the scores' own SEN169_FP16 (64
-            // lanes) — which is wall 13's refusal exactly as the corpus pins it
-            // (`a_sub_stick_survivor_refuses_by_name`: `[32, 8, 4] → [8, 4]`, "32 survivor
-            // lanes = HALF a stick", must refuse; its B=2 sibling
-            // `a_one_stick_survivor_set_lowers_at_the_batch_boundary`: `[16, 16, 4] →
-            // [16, 4]`, one whole stick, LOWERS). Pinning the refusal keeps the cell's
-            // teeth: a door that LOWERS this shape (re-layout the merge bytes) or refuses
-            // for any other reason fails here by name.
-            let (nqh, nkvh, _hd) = s.geom;
-            let gqa = nqh / nkvh;
-            let survivors = s.mq * nkvh * gqa;
-            let stick = ktir_superdsc::superdsc_opspec::Df::Fp16.elems_per_stick();
-            let sub_stick = rows_are_requests && survivors < stick;
-            let lowered = door_lower(
-                spliced
-                    .ktir
-                    .as_ref()
-                    .expect("spliced op carries its program"),
-                &mut sym,
-                Some(&layout),
-                Some(attn_params),
-            );
-            if sub_stick {
-                let Err(e) = lowered else {
+            // ⭐ THE BATCHED ARM LOWERS AT EVERY WIDTH, `NUM_SEQS = 1` INCLUDED. The old
+            // `batched_decode_hm` merged its slots with `tl.max(mm, 0)` down to
+            // `[NUM_SEQS·NKVH, GQA]` — 32 survivor lanes at this geometry, half a stick, wall
+            // 13's refusal site — and this cell pinned that refusal. The rework's landing is
+            // torch's `_merge_entry_local` at `J == 1` stated as the identity (weights
+            // `exp2(m − m) = 1`, the denominator the carry itself), so there is no survivor
+            // merge left to refuse: the `r_ar=true` cell now pins that the batched arm LOWERS
+            // with its repetition table placed at the tail. A reintroduced merge, or any other
+            // door refusal, fails here by name.
+            if rows_are_requests {
+                assert!(
+                    layout.step_inputs.values().any(|row| {
+                        row.slot == ktir_superdsc::sdsc_abstract::attn_step_slots::REP
+                    }),
+                    "the batched arm states its rep slot (geom={:?} mq={} rung={}) — the row \
+                     bridge `place_rep_table_last` spends",
+                    s.geom,
+                    s.mq,
+                    s.rung
+                );
+            }
+            // EVERY program the splice returned lowers — the relayout copies as well as the
+            // attention between them.
+            for op in &spliced_ops {
+                door_lower(
+                    op.ktir.as_ref().expect("spliced op carries its program"),
+                    &mut sym,
+                    Some(&layout),
+                    Some(attn_params),
+                )
+                .unwrap_or_else(|e| {
                     panic!(
-                        "the sub-stick merge refused (geom={:?} mq={} rung={} \
-                         r_ar={rows_are_requests}): the door LOWERED a {survivors}-survivor \
-                         merge the corpus pins as wall 13's refusal \
-                         (`a_sub_stick_survivor_refuses_by_name`)",
-                        s.geom, s.mq, s.rung
-                    );
-                };
-                let df = ktir_superdsc::superdsc_opspec::Df::Fp16;
-                for pin in [
-                    format!(
-                        "a leading-axis reduce with {survivors} survivor lanes, SUB-STICK at \
-                         the data's own format (a {} stick is {stick} lanes)",
-                        df.name()
-                    ),
-                    "one `is_stick` dim cannot state".to_string(),
-                    format!("a·{stick}+s ≠ a·{survivors}+s"),
-                ] {
-                    assert!(
-                        e.message.contains(&pin),
-                        "the refusal is wall 13's sub-stick law (geom={:?} mq={} rung={} \
-                         r_ar={rows_are_requests}); expected the pin {pin:?}, got: {}",
-                        s.geom,
-                        s.mq,
-                        s.rung,
-                        e.message
-                    );
-                }
-            } else {
-                lowered.unwrap_or_else(|e| {
-                    panic!(
-                        "spliced program lowered (geom={:?} mq={} rung={} r_ar={rows_are_requests}): {}",
-                        s.geom, s.mq, s.rung, e.message
+                        "spliced program {} lowered (geom={:?} mq={} rung={} \
+                         r_ar={rows_are_requests}): {}",
+                        op.op_name, s.geom, s.mq, s.rung, e.message
                     )
                 });
             }
