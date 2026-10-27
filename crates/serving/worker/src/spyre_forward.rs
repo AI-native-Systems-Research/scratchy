@@ -181,6 +181,11 @@ pub(crate) fn run_prefill_batch(
     // have. Refused here rather than silently read as an empty token list.
     let host_toks: &[usize] = match (&per_request, seeds) {
         (_, scratchy_subtile::sdsc_abstract::SeedSource::Host(t)) => t,
+        // A decode batch on a stable seating: the card's own ChainStage writes
+        // are every seat's seed — no host token exists, none is read, and the
+        // empty slice states exactly that (the tokens walk below builds
+        // nothing for it).
+        (Some(_), scratchy_subtile::sdsc_abstract::SeedSource::OnCard) => &[],
         (None, scratchy_subtile::sdsc_abstract::SeedSource::OnCard) => {
             return Err(werr(
                 "run_prefill_batch: a prompt chunk cannot seed from the card — every prompt row's \

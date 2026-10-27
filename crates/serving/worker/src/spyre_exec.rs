@@ -876,11 +876,6 @@ impl Worker for SpyreWorker {
                 // cache write. Each launch slot now binds its OWN block table (`set_block_table(slot, write
                 // slot, pages)`), so the launch order carries no meaning about where KV lives — which is the
                 // property the gate's permutation axis has been asserting all along.
-                let sh = Shared {
-                    embed_tokens: &model.embed_tokens,
-                    hidden: model.hidden,
-                    vocab: model.vocab,
-                };
                 // ⭐⭐⭐ #32 (c4b) — THE SEED LAW'S CHURN TEST, taken before the rung's session is
                 // borrowed (the drain needs `&mut model.session`). The seating is the rung plus
                 // which request sits in each launch slot, dense in `decode_ids` order; the pad set
@@ -908,6 +903,14 @@ impl Worker for SpyreWorker {
                         Self::drain_one(infl, model, requests, input_batch)?;
                     }
                 }
+                // ⭐ STAGED AFTER ANY DRAIN: the churn drain above takes `&mut model` (the
+                // session it collects through), so the shared immutable facts ride below it —
+                // created once, used at the launch below and nowhere before.
+                let sh = Shared {
+                    embed_tokens: &model.embed_tokens,
+                    hidden: model.hidden,
+                    vocab: model.vocab,
+                };
                 let SendnnSession::SuperDsc(sb) = &mut model.session;
                 // The pool's owner split, once for this launch — the same derivation the host's block
                 // count came from, so a derived page map cannot name a block the host may also hand out.
