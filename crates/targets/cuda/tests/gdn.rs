@@ -1865,3 +1865,106 @@ fn the_gdn_conv_gating_and_norm_times_are_recorded() {
         }
     }
 }
+
+// ── #931: the gating at every multiple of 16 ──────────────────────────
+
+/// The gating alone (no conv, scan or norm) at `nv` 16 and 32 (qwen3.5's 0.8b and 9b), 48
+/// (qwen3.6-27b), 64 (qwen3.5-122b-a10b) and 128, each at every length with `PAD` NaN padding
+/// rows: `g` and `β` within bound of the reference, no padding element written, and a repeat
+/// bit-identical.
+#[test]
+fn the_gating_takes_every_multiple_of_16() {
+    let device = h100();
+    let null = std::ptr::null_mut();
+    let mut pass = true;
+    for nv in [16usize, 32, 48, 64, 128] {
+        let a_log = f32_inputs(nv, 0x931A ^ nv as u64, (-1.0, 0.5));
+        let dt_bias = f32_inputs(nv, 0x931B ^ nv as u64, (-0.5, 0.5));
+        let (lg, dg) = (up_f32(&device, &a_log), up_f32(&device, &dt_bias));
+        for q_len in [1usize, 2, 63, 64, 65, 300, 2048] {
+            let (rows, n) = (q_len + PAD, q_len * nv);
+            let seed = 0x931C ^ ((nv as u64) << 16) ^ q_len as u64;
+            let padded = |mut v: Vec<u16>| {
+                v.resize(rows * nv, NAN_BF16);
+                v
+            };
+            let a = padded(bf16_in(n, seed ^ 0x03, (-2.0, 2.0)));
+            let b = padded(bf16_in(n, seed ^ 0x04, (-2.0, 2.0)));
+            let (ab, bb) = (up(&device, &a), up(&device, &b));
+            let seq = up_u32(&device, &[0, q_len as u32, 1, 0]);
+            let run = || {
+                let g = up_f32_bits(&device, rows * nv, NAN_F32);
+                let beta = up_f32_bits(&device, rows * nv, NAN_F32);
+                // SAFETY: cudaMalloc pointers are 256-byte aligned; `a`, `b`, `g`, `beta` hold
+                // `rows·nv` elements, `a_log` and `dt_bias` `nv`, `sequence` 4 u32 with
+                // `1 ≤ q_len ≤ rows`; `g` and `beta` overlap nothing; the download waits for the
+                // default stream.
+                unsafe {
+                    gdn_gating(
+                        (ab.ptr(), bb.ptr()),
+                        (lg.ptr(), dg.ptr()),
+                        seq.ptr(),
+                        (g.ptr(), beta.ptr()),
+                        (rows as u32, nv as u32),
+                        null,
+                    )
+                }
+                .expect("gdn_gating launches");
+                (down_f32(&g), down_f32(&beta))
+            };
+            let (g, beta) = run();
+            let (rg, rbeta) = gdn_gating_reference(
+                &widen(&a[..n]),
+                &widen(&b[..n]),
+                &to_f64(&a_log),
+                &to_f64(&dt_bias),
+                nv,
+                true,
+            );
+            let gc = compare_f32(&g, &rg, |i| gdn_gating_bound(rg[i]), |_| true);
+            let bc = compare_f32(&beta, &rbeta, |i| gdn_gating_bound(rbeta[i]), |_| true);
+            let padding = written_past(&g, n) + written_past(&beta, n);
+            let (g2, beta2) = run();
+            let repeat = bits_of(&g) == bits_of(&g2) && bits_of(&beta) == bits_of(&beta2);
+            let ok = gc.pass() && bc.pass() && padding == 0 && repeat;
+            eprintln!(
+                "gating nv={nv} L={q_len}: g {} beta {} padding_written={padding} \
+                 repeat_identical={repeat} {}",
+                gc.line(),
+                bc.line(),
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+    }
+    assert!(pass, "the gating failed at a multiple of 16");
+}
+
+/// The gating at `nv` 40, a multiple of 8 but not of 16: refused before a pointer is touched,
+/// its output unchanged.
+#[test]
+fn the_gating_refuses_a_width_off_16() {
+    let device = h100();
+    let small = |n: usize| up_f32_bits(&device, n, NAN_F32);
+    let (x, w, seq, out) = (small(1 << 12), small(1 << 12), small(4), small(1 << 12));
+    let unchanged = |b: &DeviceBuffer| down_f32(b).iter().all(|v| v.to_bits() == NAN_F32);
+    let (rows, nv) = (4u32, 40u32);
+    // SAFETY: the launcher refuses this shape before it touches a pointer.
+    let got = unsafe {
+        gdn_gating(
+            (x.ptr(), x.ptr()),
+            (w.ptr(), w.ptr()),
+            seq.ptr(),
+            (out.ptr(), out.ptr()),
+            (rows, nv),
+            std::ptr::null_mut(),
+        )
+    };
+    let kept = unchanged(&out);
+    let ok = got == Err(KernelError::GdnGatingShape { rows, nv }) && kept;
+    eprintln!(
+        "refused gating rows={rows} nv={nv}: {got:?} output_unchanged={kept} {}",
+        verdict(ok)
+    );
+    assert!(ok, "the gating took a width that is not a multiple of 16");
+}
