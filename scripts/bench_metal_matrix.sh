@@ -290,6 +290,9 @@ SCALE_ROUNDS=2           # and at least this many rounds of its users count; --f
 (( FULL )) && SCALE_ROUNDS=4
 SCALE_WARMUPS=2
 SCALE_SEED_BASE=20260927
+# The TTFT, TPOT and end-to-end percentiles every `bench serve` reports and the JSON keeps
+# (p<N>_<metric>_ms): the spread across a cell's requests, not just its middle and tail.
+PERCENTILES="25,50,75,90,99"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -573,7 +576,7 @@ done
 PIN_PROBLEMS="$(printf '%s\n' ${pin_problems[@]+"${pin_problems[@]}"})"
 CLASS_TABLE="$(printf '%s\n' "${CLASSES[@]}")"
 export ENGINE_INFO PIN_PROBLEMS UNPINNED CLASS_TABLE LARGE_GB
-export STARTED_UTC PRIME_LAUNCHES INPUT_LEN OUTPUT_LEN WARM_REQUESTS SCENARIOS SCALING SCALE_AXES SCALE_CONC SCALE_INPUT SCALE_OUTPUT SCALE_GRID_INPUT \
+export STARTED_UTC PERCENTILES PRIME_LAUNCHES INPUT_LEN OUTPUT_LEN WARM_REQUESTS SCENARIOS SCALING SCALE_AXES SCALE_CONC SCALE_INPUT SCALE_OUTPUT SCALE_GRID_INPUT \
        SCALE_GRID_OUTPUT SCALE_GRID_CONC SCALE_GRID_USERS_OUTPUT SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS SCALE_ROUNDS \
        MLX_PYTHON OLLAMA_BIN KV_CACHE_DTYPE SERVE_ARGS CELL_TIMEOUT_S RESUME MODELS_FULL
 python3 - "${JSON}" "${chip}" <<'PY'
@@ -633,6 +636,7 @@ json.dump({
                  "grid_input": ints("SCALE_GRID_INPUT"), "grid_output": ints("SCALE_GRID_OUTPUT"),
                  "grid_conc": ints("SCALE_GRID_CONC") or sorted({1, int(e["SCALE_BASE_CONC"])}),
                  "grid_users_output": ints("SCALE_GRID_USERS_OUTPUT") or ints("SCALE_GRID_OUTPUT"),
+                 "percentiles": ints("PERCENTILES"),
                  "base": {"input": int(e["SCALE_BASE_INPUT"]), "output": int(e["SCALE_BASE_OUTPUT"]),
                           "conc": int(e["SCALE_BASE_CONC"])},
                  "min_prompts_per_cell": int(e["SCALE_NUM_PROMPTS"]),
@@ -897,7 +901,7 @@ sys.exit(not j.get("completed") or any(j.get(k) for k in ("failed", "timed_out",
         ${cell_tok:+--tokenizer "${cell_tok}"} \
         --num-prompts "${n}" --input-len "$4" --output-len "$5" \
         --max-concurrency "$6" --temperature 0 --seed "${seed}" --num-warmups "${SCALE_WARMUPS}" \
-        --percentile-metrics ttft,tpot,e2el --metric-percentiles 50,99 \
+        --percentile-metrics ttft,tpot,e2el --metric-percentiles "${PERCENTILES}" \
         --output-json "${out_json}" --disable-tqdm >>"${RAW}/cells-${stem}.log" 2>&1; } 2>/dev/null || rc=$?
     [[ -n "${sampler}" ]] && { kill "${sampler}" 2>/dev/null; wait "${sampler}" 2>/dev/null; } || true
     [[ -s "${mem}" && -f "${out_json}" ]] && python3 - "${out_json}" "${mem}" <<'PY' || true
@@ -1383,7 +1387,7 @@ PY
                 --num-prompts "${NUM_PROMPTS}" --input-len "${INPUT_LEN}" --output-len "${OUTPUT_LEN}" \
                 --max-concurrency 1 --temperature 0 \
                 --seed "$(printf '%s' "${SCALE_SEED_BASE}:${stem}:warm" | cksum | cut -d' ' -f1)" \
-                --percentile-metrics ttft,tpot,e2el --metric-percentiles 50,99 \
+                --percentile-metrics ttft,tpot,e2el --metric-percentiles "${PERCENTILES}" \
                 --output-json "${RAW}/serve-${stem}.json" --disable-tqdm >>"${RAW}/cells-${stem}.log" 2>&1 \
                 && { printf '    '; numbers "${RAW}/serve-${stem}.json"; } \
                 || echo "    bench serve failed (see ${RAW}/cells-${stem}.log)" >&2
@@ -1427,7 +1431,7 @@ env = os.environ
 # Per-token speed is TPOT, from the server's token count, never ITL: ITL is
 # the gap between stream chunks, and once an engine streams several tokens a
 # chunk (multi-token prediction, speculative decoding) one gap spans several.
-KEEP = ["median_ttft_ms", "p99_ttft_ms", "median_tpot_ms", "p99_tpot_ms",
+KEEP = ["median_ttft_ms", "median_tpot_ms",
         "median_e2el_ms", "output_throughput", "request_throughput",
         "completed", "failed", "total_output_tokens", "duration", "unstreamed_requests",
         "server_mem_peak_mib", "server_mem_median_mib",
@@ -1439,8 +1443,11 @@ CELL = re.compile(r"\.(conc|input|output|grid)-(\d+)(?:x(\d+))?(?:@(\d+))?\.json
 def load(name):
     p = os.path.join(raw, name)
     return json.load(open(p)) if os.path.exists(p) else None
+# Every percentile --metric-percentiles asked for (PERCENTILES), so the spread across requests
+# reaches the site rather than its middle and its tail alone.
+PCT = re.compile(r"p[0-9.]+_(ttft|tpot|e2el)_ms")
 def metrics(j):
-    return {k: j[k] for k in KEEP if k in j} if j else None
+    return {k: v for k, v in j.items() if k in KEEP or PCT.fullmatch(k)} if j else None
 grid_users = {int(x) for x in env["GRID_CONC_LIST"].split(",")}
 grid_inputs = {int(x) for x in env["SCALE_GRID_INPUT"].split(",") if x}
 def scaling(engine):
