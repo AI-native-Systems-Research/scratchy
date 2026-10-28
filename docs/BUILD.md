@@ -13,62 +13,14 @@ exists, not adding to it.
 cargo build -p scratchy-cli --release --features metal,model/llama-3.2-3b
 ```
 
-`cuda` and `metal` are mutually exclusive. **On cuda this one-liner is not
-enough** — the kernels are a separate cargo invocation that has to run first;
-see [CUDA: build the kernels first](#cuda-build-the-kernels-first). Add
+`metal` and `spyre` are mutually exclusive. Add
 `serve` for the HTTP server
 (`chat` — the in-process engine — is on by default), `multimodal` for the
 image-decode stack, `bench` for `scr bench serve`. Tab completion over real
 HuggingFace model ids is on by default (`hf-completions`); pass
 `--no-default-features` to build with no network access at all. TurboQuant KV
-compression is on with `metal` (and off for cuda and spyre), fixed at build time — see
+compression is on with `metal` (and off for spyre), fixed at build time — see
 [`turboquant`](#turboquant--kv-cache-compression-fixed-at-build-time).
-
-## CUDA: build the kernels first
-
-A cuda build is **two cargo invocations, in this order**:
-
-```bash
-export SCRATCHY_GPU=h100 CUDA_ARCH=90 CUDA_COMPUTE_CAP=90   # see the table below
-
-# 1. nvcc kernels -> .a files in ~/.cache/cudaforge/scratchy-serving-cuda/
-#    No model or quant scope: nothing in forward expansion emits .cu, so the
-#    kernel set is scope-independent. Tens of minutes, several GB of RAM.
-cargo build --release -p scratchy-builder-cuda --features cuda
-
-# 2. the binary, which links those .a files
-cargo build --release -p scratchy-cli \
-    --features cuda,serve,bench,model/qwen2.5-14b,quant/fp8-dynamic-per-tensor
-```
-
-Step 1 cannot be folded into step 2. `scratchy-target-cuda`'s `build.rs` emits
-`rustc-link-lib=static=` for eleven archives that `scratchy-builder-cuda`'s
-`build.rs` produces, and rustc *bundles* static natives into an rlib — so those
-`.a` files must already exist when the rlib is built. There is no Cargo edge to
-order that: `scratchy-models` depends on `scratchy-target-cuda`, so an edge back
-from `target-cuda` to the builder would cycle. Skipping step 1 fails with
-`could not find native static library`, and it fails nondeterministically —
-whichever archive rustc reaches first.
-
-Three environment variables, none of them optional on a build host without a
-GPU:
-
-| var | read by | if unset |
-|---|---|---|
-| `SCRATCHY_GPU` | `#[forward]`, at expansion | probes `nvidia-smi`, else build error listing valid values |
-| `CUDA_ARCH` | kernel build + FA3 gating + the FA3 link | probes `nvidia-smi`, else **defaults to 89 and silently drops FlashAttention-3** |
-| `CUDA_COMPUTE_CAP` | `cudarc`'s build script | probes the local GPU |
-
-`CUDA_ARCH` is the one that bites: unset on a GPU-less builder it yields a
-binary that links and runs on Hopper with no FA3 decode path and no warning.
-Set it explicitly whenever you are not building on the target GPU.
-
-`git` must be on `PATH` at build time — `cudaforge` clones NVIDIA/cutlass at a
-pinned commit while compiling the scaled_mm kernels.
-
-`SCRATCHY_SKIP_CUDA_KERNELS=1` skips step 1's nvcc work for `cargo
-check`/`clippy` (this is what CI's cuda gate sets). Never set it for anything
-that links a binary.
 
 ## There is no default model, quant or drafter scope
 
@@ -131,7 +83,7 @@ cargo build -p scratchy-cli --features metal,model/qwen2.5-7b
   one thing.
 - A handful of stems are byte-identical files checked into two arch dirs at
   once (the same checkpoint, loadable via a vision arch or its non-vision
-  base arch — e.g. `gemma-3-12b-it` under both `gemma3/` and `gemma3-mm/`).
+  base arch — e.g. `qwen3.5-9b` under both `qwen3-5-vl/` and `qwen3-5/`).
   The vision arch keeps the bare stem; the base arch's copy is
   `<stem>-text-only`.
 
@@ -151,17 +103,16 @@ cargo build -p scratchy-cli --features metal,model/granite-3.1-2b-instruct,quant
 
 **A selected quant preset REPLACES a model's dense/bf16 emission — it does
 not add to it.** If any preset both survives Cargo-feature scoping and is
-claimable on the active backend (metal only claims `mlx-affine-*`/`nvfp4`;
-cuda is the mirror — see `quant_preset_active` in
-`crates/compiler/macros/src/config.rs`), every selected model in that arch
+claimable on the active backend (metal only claims `mlx-affine-*`/`nvfp4` —
+see `quant_preset_active` in `crates/compiler/macros/src/config.rs`), every selected model in that arch
 gets its quant variant(s) *instead of* dense. A preset that wouldn't
 actually synthesize on the active backend can never suppress dense, so a
 model never ends up with zero compiled variants.
 
 - **`quant/<preset>`** — one specific preset, e.g. `quant/fp8-dynamic-per-channel`.
 - **`quant/mlx`** — shorthand for every MLX affine (int4) preset at once —
-  the dominant use case on metal, but still opt-in (neither `metal` nor
-  `cuda` defaults any preset on; a default-on preset would silently kill
+  the dominant use case on metal, but still opt-in (no backend
+  defaults any preset on; a default-on preset would silently kill
   dense on every build using that backend).
 
 No `quant/*` feature named at all = every selected model compiles dense only.
@@ -209,15 +160,15 @@ cargo build -p scratchy-cli --features metal,serve,model/gemma-4-26b-a4b-it,spec
   QAT assistants).
 
 No `spec/*` feature named = only the heads inside their targets' checkpoints
-and the targets' default published drafters compile (with `metal`); a cuda or
-spyre build compiles none.
+and the targets' default published drafters compile (with `metal`); a spyre
+build compiles none.
 
 ## `turboquant` — KV cache compression, fixed at build time
 
 On metal, a model's KV cache is either dense (the model's own dtype) or
 TurboQuant codes (3-bit for the Llama family, 4-bit otherwise), and the build
 decides which: nothing chooses at runtime. `scratchy-cli`'s `metal` feature
-turns `turboquant` **on**; a cuda or spyre build does not have it. To build
+turns `turboquant` **on**; a spyre build does not have it. To build
 metal with a dense KV cache, name `metal-base` instead of `metal`: the same
 engine without scratchy-models' `turboquant` or `mtp-heads` (add
 `model/mtp-heads` back to keep MTP drafting):
@@ -366,7 +317,7 @@ via the `model`/`quant`/`spec` aliases. Building `-p scratchy-models` or
 
 ```bash
 cargo build -p scratchy-models --no-default-features \
-    --features cuda,llama-3.2-3b
-# → only llama-3.2-3b's solver runs; its config.json is the only one
+    --features metal,llama-3.2-3b
+# → only llama-3.2-3b's forward expands; its config.json is the only one
 #   even read out of crates/models/arch/configs/llama/
 ```

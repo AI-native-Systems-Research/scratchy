@@ -26,7 +26,7 @@
 //! Lifecycle methods ([`SpecDecodeBackend::load_secondary_model`],
 //! [`SpecDecodeBackend::allocate_kv_pool`]) let the draft-model proposer
 //! manage its second model + KV pool through the backend without leaking
-//! `cudaMalloc` / `MTLBuffer` details.
+//! `MTLBuffer` details.
 
 use std::error::Error;
 use std::fmt;
@@ -75,8 +75,7 @@ pub struct ForwardHandle(pub u64);
 #[derive(Debug)]
 pub enum BackendError {
     /// The method isn't yet implemented for this backend. Used by phase
-    /// 5.1's thin wrappers where a backend hasn't built out a method
-    /// (e.g. CUDA `load_secondary_model` before the cross-backend port).
+    /// 5.1's thin wrappers where a backend hasn't built out a method.
     NotImplemented(&'static str),
     /// A handle (`ModelHandle`, `KvPoolHandle`, `ForwardHandle`) doesn't
     /// match anything the backend registered.
@@ -103,7 +102,7 @@ impl Error for BackendError {}
 ///
 /// All fields are host-owned slices. The backend is responsible for
 /// uploading them to device buffers in whatever format its kernels expect
-/// (Metal `MTLBuffer` shared-storage, CUDA pinned-staged H2D, etc.). The
+/// (Metal `MTLBuffer` shared-storage, etc.). The
 /// engine never sees `ForwardCtx` or any other backend-specific input
 /// bundle.
 ///
@@ -237,8 +236,8 @@ pub trait SpecDecodeBackend {
     /// buffer with a single host wait. Returns `[k][num_reqs]` argmax
     /// IDs (iter-major).
     ///
-    /// Default impl loops `forward_argmax_blocking` so CUDA / future
-    /// backends remain correct without per-backend chain wiring — but
+    /// Default impl loops `forward_argmax_blocking` so future backends
+    /// remain correct without per-backend chain wiring — but
     /// each iter still pays one commit + one host wait. The Metal
     /// override (Phase 6) collapses both costs to one.
     ///

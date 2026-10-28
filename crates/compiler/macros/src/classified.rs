@@ -345,8 +345,7 @@ pub enum OpKind {
     /// pass that inserts one of these after every `Gemm` whose weight
     /// has shard-kind `ShardDim1` (row-parallel: `o_proj`,
     /// `down_proj`). At `tp_world_size = 1` the pass is a no-op so no
-    /// FUF carries this op kind. Lowers to `Instruction::AllReduce`
-    /// (gated under the `nccl` feature on `scratchy-forward-compiler`).
+    /// FUF carries this op kind (only tp = 1 is emitted).
     AllReduce,
     /// Tensor-parallel all-gather along the LAST dim of one input
     /// tile across `tp_world_size` ranks. Output shape is the input
@@ -378,7 +377,7 @@ pub enum OpKind {
     /// `Instruction::Embed::eval` inline splice.
     ///
     /// CONSTRUCTED ONLY by `tp_lowering::insert_mm_splices`, which is
-    /// cuda/metal-gated — under `spyre` alone this variant is reached
+    /// metal-gated — under `spyre` alone this variant is reached
     /// (matched, never built) and that is EXPECTED.
     #[cfg_attr(feature = "spyre", expect(dead_code))]
     MmEmbedSplice,
@@ -561,7 +560,6 @@ pub enum OpKind {
     AvgPool2d,
     /// CLIP-class CLS-token strip: `strip_cls(x) -> [L-1, e]`. Removes
     /// the leading CLS row that LLaVA-1.5's CLIP encoder produces.
-    /// Claimed by [`crate::impl_lib::StripClsImpl`].
     StripCls,
     /// Vision-tower learned positional embedding lookup:
     /// `pos_embed(position_ids, weight) -> [num_tokens, vision_embed_dim]`.

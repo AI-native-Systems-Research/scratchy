@@ -21,10 +21,9 @@ description = "`scr`: the scratchy inference engine CLI"
 #
 # `model?/...` is a WEAK dependency feature on purpose: it fires only when the
 # `model` dep is actually activated (i.e. the build named a `-Fmodel/<stem>`).
-# A build with no model scope compiles no registry to fill, and CI's
-# `--workspace --features cuda,scratchy-models/all` reaches scratchy-models
-# directly rather than through this edge, so neither pays for a Hub query it
-# has no use for.
+# A build with no model scope compiles no registry to fill, and a CI run that
+# enables `scratchy-models/all` directly reaches scratchy-models rather than
+# through this edge, so neither pays for a Hub query it has no use for.
 #
 # To build with NO network access at all (air-gapped), drop the defaults:
 #   cargo build -p scratchy-cli --no-default-features --features chat,metal,model/<stem>
@@ -51,20 +50,14 @@ bench = ["scratchy-bench"]
 # The bench dataset loaders that read parquet (2WikiMQA, HotpotQA, MS MARCO), for `scr bench
 # serve --dataset-name rag --rag-source two-wiki|hotpotqa`.
 bench-datasets = ["bench", "scratchy-bench/datasets"]
-cuda = ["scratchy-serving-api/cuda", "scratchy-bench?/cuda", "dep:scratchy-forward-compiler", "scratchy-forward-compiler/cuda", "dep:scratchy-target-cuda"]
-nccl = ["cuda", "scratchy-target-cuda/nccl", "scratchy-serving-api/nccl"]
-profiling = ["cuda"]
 # `dep:scratchy-forward-compiler` + `scratchy-forward-compiler/metal` surface
 # `BackboneDumpRegistration` + `Instruction::normalize` so
-# `scr model info` works on metal builds the same way it does on
-# cuda. `scratchy-target-cuda`'s target profiles stay cuda-only — the
-# `--cublas-analysis` flag is gated on the `cuda` feature inside
-# `commands/model_info.rs`. Backends enable the ENGINE (via scratchy-serving-api/
+# `scr model info` works on metal builds. Backends enable the ENGINE (via scratchy-serving-api/
 # <backend>), not the HTTP server — a backend is only meaningful with local
 # inference.
 #
 # `metal` is `metal-base` with two scratchy-models features on, both off for
-# cuda and spyre. They are named here, not as features of this crate:
+# spyre. They are named here, not as features of this crate:
 # `model/<feature>` already reaches every scratchy-models feature (see
 # `tests/arch_feature_passthrough.rs`).
 #
@@ -144,7 +137,6 @@ name = "scr"
 path = "src/main.rs"
 
 [dependencies]
-scratchy-target-cuda = { path = "../../targets/cuda", optional = true }
 # `scr bundle run` ONLY. Every other spyre path in this binary goes through the serving crates;
 # launching a bundle this binary did not bake needs the executor and the bundle types directly, and
 # those live in the target crate. Optional, and reachable only under `spyre-hw`.

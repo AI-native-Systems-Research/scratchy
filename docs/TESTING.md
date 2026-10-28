@@ -40,7 +40,7 @@ to the zone when it makes the zone's claim, wherever it lives.
   silicon: gemm, softmax, rmsnorm, rope, quantized matvec/matmul, dequantization, attention,
   the samplers. Floating-point agreement with a reference is an empirical claim about hardware.
   - Today: `crates/targets/metal/tests/` and the metal crate's own kernel unit tests;
-    `crates/targets/cuda/`; the `tools/vision_parity/` oracles;
+    the `tools/vision_parity/` oracles;
     `crates/targets/spyre/tests/element_torchspyre_parity.rs`.
 - **The wire surface.** What clients we don't control send and expect back: chat templates,
   tool and reasoning parsers, SSE streaming, the OpenAI- and Anthropic-compatible request and

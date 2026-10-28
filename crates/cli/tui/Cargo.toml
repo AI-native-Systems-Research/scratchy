@@ -17,7 +17,6 @@ description = "Standalone `scr-tui` binary: terminal UI driving goose's core Age
 [features]
 # Backend is chosen at build time — the TUI itself is backend-agnostic.
 metal = ["scratchy-serving-api/metal"]
-cuda = ["scratchy-serving-api/cuda"]
 
 [[bin]]
 name = "scr-tui"
@@ -32,7 +31,7 @@ goose-provider-types = { git = "https://github.com/aaif-goose/goose.git", rev = 
 # scratchy's engine, reached by path across the workspace boundary — this
 # crate gets its own Cargo.lock entry for it, independent of the root
 # workspace's lock. No backend feature here: the consumer selects
-# metal/cuda (see [features]). The telemetry features light up the
+# metal (see [features]). The telemetry features light up the
 # observability hooks throughout the engine.
 scratchy-serving-api = { path = "../../serving/api", features = [
     "forward-telemetry",

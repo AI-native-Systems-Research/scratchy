@@ -4,11 +4,8 @@
 //! [`Instruction`] is a closed enum over every kernel-call shape any
 //! solver-picked `Implementation` produces. It is pure data — every
 //! variant carries only scalar / `&'static str` fields — so it compiles
-//! under any feature combination and names no backend. The match in
-//! `Instruction::eval` (the CUDA interpreter) and the metal worker both
-//! live in the `scratchy-forward-compiler` crate, which adds the
-//! runtime methods on top of this neutral definition via extension
-//! traits.
+//! under any feature combination and names no backend. The metal
+//! lowering adds the runtime behaviour on top of this neutral definition.
 //!
 //! [`WeightAccessors`] is the per-arch weight-accessor dispatch trait.
 //! Its default-method return types name only the neutral layer/tensor
@@ -67,12 +64,8 @@ use scratchy_tensors::{MetalDtype, ScaleDtype};
 /// Default bodies all `unreachable!()` so per-arch impls only
 /// override the methods their generated tape actually calls.
 ///
-/// Cross-backend: both the cuda eval body and the metal worker call
-/// into the same per-arch impl emitted by
+/// The metal worker calls into the per-arch impl emitted by
 /// `scratchy-forward-compiler-macro::codegen::emit_weight_accessors_impl`.
-/// Gated on `any(cuda, metal)` because the return types reference
-/// `scratchy_layers::*` structs which only compile under
-/// one of those features.
 pub trait WeightAccessors {
     fn rms_norm_at(
         &self,
@@ -260,8 +253,7 @@ pub trait WeightAccessors {
 
 /// Universal opcode set. Tuple variants throughout — keeps each
 /// row in a per-canonical static slice on a single line of cargo
-/// expand. Field order per variant matches the per-Impl
-/// `OpcodeShape::fields` order in `impl_lib.rs`.
+/// expand.
 ///
 /// No longer generic over `W` — every variant lost its `WtFn<W, L>` /
 /// `CosSinFn<W>` field when fan_out moved weight resolution to the
@@ -286,8 +278,7 @@ pub enum Instruction {
     /// reducing `hidden_size` elements. Pre-Qwen3 the lowering
     /// hardcoded `(W::Q_SIZE, 1)` — correct for Llama (Q_SIZE ==
     /// hidden) but wrong for Qwen3 (Q_SIZE != hidden, q_norm has
-    /// per-head reduction). The cuda interpreter reads tile shape
-    /// directly and ignores both fields.
+    /// per-head reduction).
     RmsNorm(u32, u32, u32, u32, u32),
     /// CohereLayerNorm-flavored norm (subtracts mean before scaling).
     /// Claimed from the `(mean, sub, rmsnorm)` math trio in the DSL.
@@ -325,17 +316,6 @@ pub enum Instruction {
         u8,
     ),
     Add(u32, u32),
-    /// Tensor-parallel all-reduce-sum on the slot in place. Inserted
-    /// by the lowering pass after every gemm whose weight is
-    /// row-parallel (`ShardDim1`) and after the vocab-parallel embed.
-    /// At tp=1 the lowering pass emits zero of these.
-    #[cfg(feature = "nccl")]
-    AllReduce(u32),
-    /// Tensor-parallel all-gather along the last dim: `(in_slot, out_slot)`.
-    /// Inserted by the lowering pass after the lm_head Gemm at tp>1
-    /// (lm_head is vocab-parallel `ShardDim0`).
-    #[cfg(feature = "nccl")]
-    AllGather(u32, u32),
     /// Multimodal embed splice — D2D-copy projected vision-encoder
     /// rows into the placeholder positions of the post-embed hidden
     /// states in-place. Always inserted by `tp_lowering::insert_mm_splices`
@@ -390,8 +370,8 @@ pub enum Instruction {
     /// zero-centered form. `hidden_size` / `m_multiplier` mirror
     /// [`RmsNorm`](Instruction::RmsNorm): residual-stream norms are
     /// `(HIDDEN_SIZE, 1)`; per-head q/k norms are `(head_dim,
-    /// num_q/kv_heads)`. The cuda eval reads the tile shape and ignores
-    /// both; the metal lowering bakes them into the kernel fn-consts.
+    /// num_q/kv_heads)`. The metal lowering bakes them into the kernel
+    /// fn-consts.
     ScalarOffsetRmsNorm(u32, u32, u32, f32, u32, u32),
     /// Norm→Gemm fusion: `cutlass_gemm(rms_norm(in), gemm_w)`. The
     /// CUTLASS tile is bucket-pickable per `CUTLASS_TILE_ZOO` entry.
@@ -413,7 +393,7 @@ pub enum Instruction {
     /// fresh OwnedTensor.
     CutlassFusedAddRmsNormGemm(u32, u32, u32, u32, u32, u32, u32, u32, u32),
     Gemm(u32, u32, u32, u32, u32),
-    /// cuBLAS-side peer to `CutlassGemmAdd`. cuBLAS GEMM produces a
+    /// Dense-GEMM peer to `CutlassGemmAdd`. The GEMM produces a
     /// delta; `add_inplace` then folds it into the residual buffer.
     /// Output is the residual upstream's OwnedTensor (aliased via
     /// the codegen prelude); no `out_slot` payload.
@@ -423,8 +403,7 @@ pub enum Instruction {
     /// `MetalBiasAddImpl` when the synth-pre-attn megakernel doesn't
     /// claim the biased QKV chain (today: M ≥ 2 prefill, where the
     /// cost CSV picks unfused).
-    /// CUDA's analogue is `FusedGemmBias`, which folds the bias into
-    /// cuBLAS's gemm_bias epilog. On Metal the singleton path
+    /// On Metal the singleton path
     /// dispatches a separate `KernelId::BiasAdd` after the AffineQmm
     /// / Gemm; once the synth path absorbs biases the solver will
     /// prefer that over this singleton on decode workloads.
@@ -457,8 +436,7 @@ pub enum Instruction {
     /// caching, mixed prefill+decode batches, and multi-turn chat —
     /// scenarios `AttentionPrefillContiguous` cannot handle because
     /// its K-axis is bounded by `cu_seqlens_q` (new tokens only).
-    /// Currently emitted only by the metal adapter; cuda continues to
-    /// route prefill through `flash_attn_contiguous`.
+    /// Emitted by the metal adapter.
     AttentionPrefillPaged(u32, u32, u32, bool),
     /// Bidirectional / encoder attention. Reads contiguous Q/K/V from
     /// the upstream tile slots; calls `flash_attn_contiguous` with
@@ -476,9 +454,7 @@ pub enum Instruction {
     /// bakes `W::SLIDING_WINDOW` into the kernel's `ATTN_WINDOW`
     /// function constant and never routes to the steel kernel (steel
     /// has no window support). Emitted only by the metal adapter
-    /// (`metal::attention::fan_out`, sliding+multihead arm); cuda
-    /// routes sliding prefill through
-    /// [`Instruction::SlidingAttentionPrefillContiguous`].
+    /// (`metal::attention::fan_out`, sliding+multihead arm).
     SlidingAttentionPrefillPaged(u32, u32, u32, bool),
     /// Vision-tower variable-length attention: `(q_slot, k_slot,
     /// v_slot, out_slot, cu_seqlens_kind)`. The `cu_seqlens_kind`
@@ -574,14 +550,6 @@ pub enum Instruction {
     StripCls(u32, u32),
     FlashInferAttentionDecode(u32, u32, u32, u32, bool),
     FlashInferAttentionPrefill(u32, u32, u32, u32, u32, u32, bool),
-    /// Hopper-native FA3 paged decode. Selected by the solver when
-    /// `cuda_arch >= 90` and the cost CSV calibrated FA3 below FI for
-    /// this `(num_tokens, sk_bucket)` cell. No softcap field — the
-    /// vendored FA3 build excludes softcap variants
-    /// (`FLASHATTENTION_DISABLE_SOFTCAP`).
-    /// Args: (in_slot, out_slot, layer, head_dim).
-    #[cfg(fa3_built)]
-    FlashAttention3Decode(u32, u32, u32, u32),
     /// `(q_slot, k_slot, v_slot, q_out, k_out, v_out, layer,
     /// interleaved, is_global, kv_offsets)`. `is_global` selects the attention
     /// geometry class on hybrid sliding/global arches (Gemma4): the
@@ -643,8 +611,7 @@ pub enum Instruction {
     /// Softmax order is fixed by variant identity: Mixtral does
     /// `topk → softmax(scores)`, no renorm flag. (See `SharedFusedMoe`
     /// for the Qwen `softmax → topk → take_along_axis` order.)
-    /// CUDA-target macros keep emitting [`Instruction::FusedMoe`];
-    /// the Metal-target `MetalFusedMoeImpl` (in
+    /// The Metal-target `MetalFusedMoeImpl` (in
     /// `scratchy-forward-compiler-macro::metal::moe`) emits this variant when
     /// `profile.backend == Backend::Metal` and the per-expert weight
     /// storage is `Affine`.
@@ -728,8 +695,6 @@ pub enum Instruction {
     /// for the target profile. M < limit → qmv (decode-matvec);
     /// M ≥ limit → qmm_t (prefill-matmul, SplitK heuristic deferred
     /// to C3).
-    ///
-    /// CUDA eval is `unreachable!` — emit only on the metal forward.
     AffineQmm(u32, u32, u32, u32, u32, u32, u32, u32),
     /// NVIDIA ModelOpt NVFP4 int4 matmul (transpose=true). Metal-only.
     /// Identical shape and dispatch to `AffineQmm` — the only difference
@@ -744,8 +709,6 @@ pub enum Instruction {
     /// the matvec/matmul boundary baked at codegen time (same source as
     /// `AffineQmm`). M < limit → nvfp4_qmv (decode); M ≥ limit →
     /// nvfp4_qmm_t (prefill).
-    ///
-    /// CUDA eval is `unreachable!` — emit only on the metal forward.
     Nvfp4Qmm(u32, u32, u32, u32, u32, u32, u32, u32),
     /// Compiler-synthesized pre-attention chunk megakernel. Metal-only.
     /// Combines (Add → RmsNorm → 3×AffineQmv → RoPE → paged KV-cache
@@ -763,8 +726,6 @@ pub enum Instruction {
     /// at slots 0..3 of the same `(bucket, op_idx)` — avoiding the
     /// load-time packed-concat infrastructure that Phase 0's revert
     /// dropped.
-    ///
-    /// CUDA eval is `unreachable!`.
     SynthPreAttn(
         u32, // 0: residual_in_slot
         u32, // 1: delta_slot
@@ -813,8 +774,6 @@ pub enum Instruction {
     /// race cross-threadgroup). The coloring assigns it a slot distinct
     /// from `residual_in_slot` (fused-subgraph inputs stay live to the
     /// subgraph's end); downstream reads `residual_out_slot`.
-    ///
-    /// CUDA eval is `unreachable!`.
     SynthMlpPreDown(u32, u32, u32, u32, u32, u32, u32, &'static str),
     /// Fused elementwise `silu(gate) * up` for the decomposed q-MLP
     /// path (plan P12 branch (i)). The macro emits this after a pair
@@ -831,8 +790,7 @@ pub enum Instruction {
     /// model-level bound, because one model can carry SwiGLU blocks of
     /// different widths (e.g. Qwen3.5-MoE's 512-wide shared expert
     /// next to a dense `intermediate_size`-wide MLP in hybrid
-    /// configs). CUDA eval is `unreachable!` — metal-only (CUDA's
-    /// q-MLP routes through Marlin/Bnb/etc).
+    /// configs). Metal-only.
     SiluMul(u32, u32, u32, u32),
     /// GELU (tanh approx) sibling of [`Instruction::SiluMul`] for the
     /// decomposed GeGLU q-MLP path (Gemma2/3/4:
@@ -1062,9 +1020,7 @@ pub trait CanonicalParams: WeightAccessors {
     /// RmsNorm epsilon — read from `rms_norm_eps` in the model
     /// config at macro-expand time. The metal `rmsnorm_*_specialized`
     /// kernels consume this via `[[function_constant]]` baked into
-    /// the compiled pipeline; cuda's interpreter still reads it
-    /// from `RmsNorm.eps` on the loaded layer struct (same value,
-    /// same source). Default is the value Llama / Qwen / Phi
+    /// the compiled pipeline. Default is the value Llama / Qwen / Phi
     /// canonically use; per-canonical macro impls override.
     const RMS_NORM_EPS: f32 = 1e-5;
 
@@ -1124,11 +1080,10 @@ pub trait CanonicalParams: WeightAccessors {
     /// (`KvCachePool::max_blocks_per_seq`, the KV cap rung it runs on).
     const MAX_BLOCKS_PER_SEQ: u32 = 128;
 
-    /// Q-axis tile size for the cuda contiguous-prefill kernel — the
-    /// kernel processes this many query tokens per threadgroup.
-    /// Metal post-Phase B always emits `Instruction::AttentionPrefillPaged`
-    /// (1 Q per TG via `sdpa_vector` port) so this constant is
-    /// cuda-only; backend-fixed and tuning requires kernel co-evolution.
+    /// Q-axis tile size for a contiguous-prefill kernel — the kernel
+    /// processes this many query tokens per threadgroup. Metal always
+    /// emits `Instruction::AttentionPrefillPaged` (1 Q per TG via
+    /// `sdpa_vector` port), so it does not read this.
     const PREFILL_TILE_Q: u32 = 16;
 
     /// Partial-rope rotation dim — for models where only the first
@@ -1184,8 +1139,8 @@ pub trait CanonicalParams: WeightAccessors {
     /// Picks between the `_f16_specialized` / `_bf16_specialized`
     /// shader symbols and matching MPS GEMM data type. Default
     /// `MetalDtype::Bf16` matches every modern HF Llama / Qwen /
-    /// Phi / Mistral checkpoint (`torch_dtype: bfloat16` on disk)
-    /// and the cuda backend's native dtype. Per-canonical macro
+    /// Phi / Mistral checkpoint (`torch_dtype: bfloat16` on disk).
+    /// Per-canonical macro
     /// overrides set this from the model config's `torch_dtype`.
     ///
     /// Pre-bf16-rollout default was `F16`; that path lost exponent
@@ -1236,38 +1191,4 @@ pub trait CanonicalParams: WeightAccessors {
     /// flip it to BF16 (Qwen3 family). Sourced from the manifest's
     /// `scale_dtype` field on the matched `mlx-affine-*` preset.
     const SCALE_DTYPE: ScaleDtype = ScaleDtype::F16;
-
-    // ── Backend-capability flags ────────────────────────────────
-    //
-    // Each `HAS_*` flag tells `BackendCompat`
-    // whether the arch's DSL emits a tile that requires a particular
-    // backend-side `Impl`. The macro derives these by walking the
-    // classified `Program` at expansion time — they're never
-    // hand-set per canonical, and never read at runtime.
-    //
-    // Flags exist to make a missing-Impl-on-backend bug a compile
-    // error instead of silent garbage output. See
-    // `crates/scratchy-forward-compiler/src/backend_compat.rs`.
-
-    /// True iff the arch's DSL body emits `bias_add(...)` tile(s)
-    /// (Qwen-family QKV biases, ModernBERT-style LayerNorm post-add,
-    /// etc.). Set by the macro via DSL inspection; never written
-    /// by hand.
-    ///
-    /// On CUDA the `(Gemm, BiasAdd)` and `(AffineQmm, BiasAdd)`
-    /// fusions absorb every shipping pattern; on Metal the matching
-    /// fused Impls (`MetalBiasAddImpl::matches() → None`,
-    /// `FusedGemmBiasImpl` Affine-storage gate, missing
-    /// `FusedAffineQkvRopeCacheWithBias`) leave bias_add tiles
-    /// unclaimed, so a `true` value blocks
-    /// `BackendCompat<Metal>` at compile time.
-    const HAS_BIAS_ADD: bool = false;
-
-    /// True iff the arch's DSL emits `OpKind::Moe` (router softmax,
-    /// top-k, experts gather, and SwitchGLU bundled into one tile).
-    /// MoE-on-Metal isn't landed yet — the router prereqs (softmax,
-    /// argpartition, take_along_axis) are ported, but `gather_qmm_rhs`
-    /// and the pure-ICB SwitchGLU decomposition are open. MoE arches block
-    /// `BackendCompat<Metal>` until those land.
-    const HAS_MOE: bool = false;
 }

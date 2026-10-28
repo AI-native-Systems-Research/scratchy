@@ -297,7 +297,7 @@ pub fn insert_lm_head_allgather(fuf: &mut Fuf, program: &Program, tp_world_size:
 /// effect: image content is functionally invisible to the LM, so
 /// outputs are independent of which image was sent (R1 red and R2 blue
 /// produce byte-identical first-token logits when the bug is live).
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "metal")]
 pub fn insert_mm_splices(fuf: &mut Fuf, _program: &Program) {
     let mut insertions: Vec<TileId> = Vec::new();
     for node in &fuf.nodes {
@@ -342,7 +342,7 @@ pub fn insert_mm_splices(fuf: &mut Fuf, _program: &Program) {
 /// from `src_id` and one Scalar — i.e. the `x * scalar` pattern that
 /// `ScalarMulImpl` claims. Returns the Mul's TileId so the caller can
 /// place a splice after it. Returns `None` if no such consumer exists.
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "metal")]
 fn scalar_mul_consumer(fuf: &Fuf, src_id: TileId) -> Option<TileId> {
     fuf.nodes.iter().find_map(|n| {
         if n.op != OpKind::Mul || n.inputs.len() != 2 {
@@ -467,9 +467,8 @@ mod tests {
     /// At `tp_world_size = 1` the pass must be a strict no-op. The
     /// FUF is byte-identical to the input — same node count, same
     /// op kinds, same connectivity. This is the load-bearing
-    /// invariant that lets scratchy-models keep building under
-    /// `--features cuda` (no nccl) with zero behavior change after
-    /// the lowering pass is wired into `compile()` in task #5c.
+    /// invariant that lets scratchy-models build at tp = 1 with zero
+    /// behavior change from the lowering pass in `compile()`.
     #[test]
     fn lowering_no_allreduce_at_tp_eq_1() {
         let mut fuf = gemm_then_add_fuf();

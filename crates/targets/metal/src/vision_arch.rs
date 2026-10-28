@@ -10,10 +10,9 @@
 //! cos / sin / freqs from `grid_thw`, build [`ForwardCtx`], call the emitted
 //! forward, fill MRoPE grid info on each returned [`EmbedPatch`].
 //!
-//! Metal sibling of the cuda `vision_arch`: the f32 `freqs` angle table (read by
-//! the metal `vision_rope_2d` kernel) is always built, and the merger-output
-//! reshape that sizes the `mm_embeds` splice is unconditional. The cuda-only
-//! NeoxHw rope-style assert and the nccl `tp_group` field are absent.
+//! The f32 `freqs` angle table (read by the metal `vision_rope_2d` kernel) is
+//! always built, and the merger-output reshape that sizes the `mm_embeds`
+//! splice is unconditional.
 
 use crate::DType;
 use crate::GpuDevice;

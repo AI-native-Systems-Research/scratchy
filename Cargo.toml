@@ -17,8 +17,6 @@ members = [
     "crates/tensors",
     "crates/layers",
     "crates/compiler/ir",
-    "crates/targets/cuda",
-    "crates/targets/cuda/builder",
     "crates/targets/spyre",
     "crates/targets/spyre/bundle",
     "crates/targets/spyre/builder",
@@ -48,7 +46,6 @@ members = [
     "crates/compiler",
     "crates/compiler/macros",
     "crates/compiler/subtile",
-    "crates/targets/cuda/cost-sweep",
     "crates/targets/metal",
     "crates/targets/metal/compiler",
 ]
@@ -152,8 +149,6 @@ toktrie_hf_tokenizers = { version = "1.6" }
 byteorder = "1"
 
 # Tensor ops
-# CUDA (NVIDIA GPU)
-cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "f16"] }
 # BLAS source of choice (spyre-emu's cblas backend) — version centralized here
 # so a bump can't land on only one of the crate's several feature-gated
 # dependency sites (target-specific + non-default-features) like it did in
@@ -250,7 +245,7 @@ debug = "line-tables-only"
 # past 60GB RSS on a full rebuild. `debug = 0` here halves the RSS
 # without affecting optimization or the crate's debuggability at
 # the forward-fn / kernel boundary — gdb backtraces still resolve
-# in `scratchy-target-cuda` where the actual kernel calls live.
+# in the target crates where the actual kernel calls live.
 [profile.dev.package.scratchy-models]
 debug = 0
 

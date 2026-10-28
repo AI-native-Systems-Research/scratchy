@@ -18,19 +18,13 @@
 //! stdout is a tty, headers print in bold and trailing metadata in
 //! a dim style — set `NO_COLOR` to opt out.
 
-#![cfg(any(feature = "cuda", feature = "metal"))]
+#![cfg(feature = "metal")]
 
 use std::io::{self, BufWriter, IsTerminal, Write};
 
 use scratchy_forward_compiler::{
     BackboneDumpRegistration, BucketDump, NormalizedField, NormalizedStep,
 };
-// `attack_surface` builds against `scratchy_target_cuda::targets` for GPU
-// profile selection — kept cuda-only. The `--cublas-analysis` flag
-// is hidden on metal (see `args.rs`), so the surrounding body code
-// never reaches these types under `not(feature = "cuda")`.
-#[cfg(feature = "cuda")]
-use scratchy_forward_compiler::attack_surface::{AttackSurfaceReport, CostTable};
 
 use crate::args::{ColorWhen, ModelInfoArgs};
 
@@ -56,36 +50,15 @@ fn run_info_inner<W: Write>(out: &mut W, args: &ModelInfoArgs) -> io::Result<()>
     let needles: Vec<String> = args.filters.iter().map(|s| s.to_lowercase()).collect();
     let style = Style::resolve(args.color);
 
-    // Resolve the active GPU profile + parse its cost CSV ONCE before
-    // the per-arch walk. The `attack_surface` aggregator threads it
-    // through every bucket; the normal info dump ignores it.
-    // `--cublas-analysis` is cuda-only — the field doesn't exist on
-    // the metal flavor of `ModelInfoArgs`, so the surrounding code
-    // can't even reference it under `not(feature = "cuda")`.
-    #[cfg(feature = "cuda")]
-    let cost_table = if args.cublas_analysis {
-        let profile = scratchy_target_cuda::targets::detect()
-            .map(|p| (p.name, p.cost_csv))
-            .unwrap_or((
-                scratchy_target_cuda::targets::L4_SM89.name,
-                scratchy_target_cuda::targets::L4_SM89.cost_csv,
-            ));
-        Some((profile.0, CostTable::parse(profile.1)))
-    } else {
-        None
-    };
-    #[cfg(feature = "cuda")]
-    let mut surface = AttackSurfaceReport::new(3);
-
     let mut shown = 0usize;
     for reg in scratchy_forward_compiler::inventory::iter::<BackboneDumpRegistration> {
         let arch = reg.arch_name;
         for variant in (reg.dump_all)() {
             // Include `tp=N` in the substring-match key so callers can
             // filter on it the same way they filter on arch/variant
-            // (e.g. `scr model info qwen 2.5 3b tp=2`). At
-            // --features cuda (no nccl) every variant is tp=1, so
-            // including the token doesn't disturb existing filters.
+            // (e.g. `scr model info qwen 2.5 3b tp=2`). Every variant
+            // is tp=1 today, so including the token doesn't disturb
+            // existing filters.
             let key = format!(
                 "{arch}/{}/tp={}",
                 variant.variant_stem, variant.tp_world_size
@@ -94,13 +67,6 @@ fn run_info_inner<W: Write>(out: &mut W, args: &ModelInfoArgs) -> io::Result<()>
             if !needles.iter().all(|n| key.contains(n)) {
                 continue;
             }
-            // Backbone print is suppressed in --attack-surface mode so
-            // the analysis report isn't buried under tens of thousands
-            // of step lines. On metal the flag doesn't exist, so the
-            // print path is always taken.
-            #[cfg(feature = "cuda")]
-            let should_print_backbone = !args.cublas_analysis;
-            #[cfg(not(feature = "cuda"))]
             let should_print_backbone = true;
             if should_print_backbone {
                 print_variant(
@@ -111,16 +77,6 @@ fn run_info_inner<W: Write>(out: &mut W, args: &ModelInfoArgs) -> io::Result<()>
                     &variant.buckets,
                     &style,
                 )?;
-            }
-            #[cfg(feature = "cuda")]
-            if let Some((_, cost_table)) = &cost_table {
-                let arch_label = format!(
-                    "{arch} / {} · tp={}",
-                    variant.variant_stem, variant.tp_world_size
-                );
-                for bucket in &variant.buckets {
-                    surface.analyze_bucket(&arch_label, bucket, cost_table);
-                }
             }
             shown += 1;
         }
@@ -136,15 +92,6 @@ fn run_info_inner<W: Write>(out: &mut W, args: &ModelInfoArgs) -> io::Result<()>
                 args.filters
             )?;
         }
-    }
-    #[cfg(feature = "cuda")]
-    if let Some((profile_name, _)) = &cost_table {
-        writeln!(
-            out,
-            "\n(attack surface against profile `{profile_name}` — \
-             override with SCRATCHY_GPU=l4|l40s|h100)"
-        )?;
-        surface.print(out, args.per_arch)?;
     }
     out.flush()
 }
@@ -206,7 +153,7 @@ fn kind_family_color(kind: &str) -> Option<&'static str> {
         Some("36") // cyan
     } else if k.contains("Attention") || k.starts_with("Mla") || k == "RopeAppend" {
         Some("35") // magenta
-    } else if k == "Cublas"
+    } else if k == "Gemm"
         || k.starts_with("Cutlass")
         || k.starts_with("Marlin")
         || k.starts_with("Bnb4")
@@ -362,7 +309,7 @@ struct RowFields {
     kernels: String, // "<RmsNorm>" or "<LinearLayer+RmsNorm>" or ""
     rope: bool,
     /// "(N=128256,K=4096)" for GEMM-class steps, "" otherwise. Lives
-    /// in its own column so cuBLAS-vs-CUTLASS analyses can read shape
+    /// in its own column so GEMM analyses can read shape
     /// alongside slot pattern without cross-referencing model config.
     shape: String,
 }
@@ -419,17 +366,6 @@ fn measure_steps(
     }
 }
 
-/// Display-rename: `Gemm` (the unfused cublas path,
-/// `Instruction::Gemm`'s eval body calls `device.cublas.gemm`)
-/// reads more clearly as `Cublas` next to the Cutlass / Marlin /
-/// Bnb4 / Fp8 GEMM peers.
-fn display_kind(kind: &str) -> &str {
-    match kind {
-        "Gemm" => "Cublas",
-        other => other,
-    }
-}
-
 /// Format the cluster's M-range as it appears in shape annotations.
 /// Single-M clusters (`m_min + 1 == m_max_excl`) render as `M=N`;
 /// multi-M as `M=lo..hi` with `∞` for the open upper bound. Matches
@@ -482,7 +418,7 @@ fn render_fields(step: &NormalizedStep, m_range: Option<(u64, u64)>) -> RowField
         (None, _) => String::new(),
     };
     RowFields {
-        kind: display_kind(step.kind).to_string(),
+        kind: step.kind.to_string(),
         slots: slots_str,
         layer: layer_str,
         kernels: kernels_str,

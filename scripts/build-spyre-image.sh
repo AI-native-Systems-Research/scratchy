@@ -57,9 +57,6 @@ trap "rm -rf ${BUILD_CONTEXT}" EXIT
 cp tools/docker/Dockerfile.spyre "${BUILD_CONTEXT}/"
 cp Cargo.toml Cargo.lock build.rs "${BUILD_CONTEXT}/"
 cp -r crates "${BUILD_CONTEXT}/"
-# Copy third_party but exclude test directories
-mkdir -p "${BUILD_CONTEXT}/third_party"
-rsync -a --exclude='tests/' --exclude='test/' --exclude='build/' --exclude='*.o' --exclude='*.a' third_party/ "${BUILD_CONTEXT}/third_party/"
 
 # Start build
 echo "🔨 Starting build (uploading ~50MB instead of full repo)..."

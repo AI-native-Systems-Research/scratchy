@@ -8,16 +8,15 @@ license.workspace = true
 # (`parse_python_file` + `compile_carrier`) is driven directly from
 # the consolidated `scratchy-models` build.rs — there is no attribute macro.
 [features]
-# No default backend. Consumer must opt into exactly one of `cuda`
-# or `metal` via their own feature graph (see `scratchy-forward-compiler`'s
-# Cargo.toml — its `cuda` and `metal` features explicitly enable the
+# No default backend. Consumer must opt into exactly one of `metal`
+# or `spyre` via their own feature graph (see `scratchy-forward-compiler`'s
+# Cargo.toml — its `metal` and `spyre` features explicitly enable the
 # matching macro feature). Picking a default here was previously
 # convenient but made it impossible to build the macro under a pure
 # `--features metal` graph: cargo would unify `default` ∪ `metal`,
 # and the macro's `compile_error!` rejected having both at once.
 default = []
 # Backend selection: exactly one must be enabled
-cuda = ["dep:scratchy-target-cuda"]
 # Forwards into `scratchy-forward-compiler/metal` so the metal-only
 # `Instruction` variants (`SynthGateUpSiluMul`, `AffineEmbed`) are
 # visible to the macro's match arms — they're gated
@@ -44,16 +43,6 @@ spyre-hw = ["spyre", "scratchy-target-spyre/spyre-hw"]
 # model-crate → macro → target so a `-Fspyre-emu` CLI build gates every model
 # it expands.
 spyre-emu = ["spyre", "scratchy-target-spyre/spyre-emu"]
-# Tensor-parallel fanout. When any consumer crate forwards its `nccl`
-# feature into `scratchy-forward-compiler-macro/nccl` (every per-arch crate
-# does — see their `nccl = [..., "scratchy-forward-compiler-macro/nccl"]`),
-# `compile()` fans out the outer loop over the compile-time set
-# `{1, 2, 4, 8}` and emits per-(variant, tp) modules. Without this
-# feature the macro emits tp=1 only — byte-identical to single-rank
-# builds. Cargo recompiles the macro per-feature-set, so consumers
-# without nccl still get the fast tp=1-only macro and consumers with
-# it get the full fanout — no cross-talk.
-nccl = ["scratchy-forward-compiler/nccl"]
 # TurboQuant KV compression, fixed per model at build time. Read only under
 # `metal`, the one backend with the codec's kernels: every model whose geometry
 # the codec takes (`scratchy_layers::turboquant::codec_for`) is emitted
@@ -65,7 +54,6 @@ turboquant = []
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 scratchy-ir = { path = "../ir", optional = true }
-scratchy-target-cuda = { path = "../../targets/cuda", optional = true }
 # PD-wavefront (task T2b): the subtile-wavefront IR + lowering +
 # scheduler + host tape player live in this normal (Mac-testable) lib
 # crate. `to_wavefront.rs` here translates the solved FUF + `Assignment`

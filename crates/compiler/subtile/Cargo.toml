@@ -11,7 +11,7 @@ default = []
 # `spyre` (IBM Spyre target): gates the spyre-only pieces — the baked-bundle
 # crate, the SuperDSC device facts re-exported from `ktir-superdsc`, and the
 # attention-geometry door that hands the emitter its const witness — so a
-# cuda/metal-only build compiles none of them and has no Spyre crate in its graph.
+# metal-only build compiles none of them and has no Spyre crate in its graph.
 # Consumers forward their own `spyre` into `scratchy-subtile/spyre`.
 spyre = ["dep:scratchy-spyre-bundle", "dep:ktir-superdsc"]
 
@@ -21,16 +21,16 @@ spyre = ["dep:scratchy-spyre-bundle", "dep:ktir-superdsc"]
 # `addr`), in a leaf crate with no scratchy dependency so a third-party KTIR producer (IBM,
 # `triton-spyre`) can consume the `ktir -> superdsc` lowering without pulling scratchy in. `lib.rs`
 # re-exports the four modules from this crate's root. OPTIONAL and gated on `spyre`: the tape's
-# head geometry is `model_geometry`'s own, so a cuda/metal build names nothing in it.
+# head geometry is `model_geometry`'s own, so a metal build names nothing in it.
 ktir-superdsc = { path = "../../targets/spyre/ktir/ktir-superdsc", optional = true }
 # ⭐ THE BAKED-BUNDLE TYPE FAMILY, which the lowering CONSTRUCTS and hands to the
 # `#[forward]` macro — see that crate's header. A leaf below both ends of the Spyre pipeline, so this
 # edge does not make the generic scheduling layer depend on the Spyre target. OPTIONAL and gated on
-# `spyre` for the same reason every other Spyre-only piece here is: a cuda/metal build compiles
+# `spyre` for the same reason every other Spyre-only piece here is: a metal build compiles
 # none of it.
 scratchy-spyre-bundle = { path = "../../targets/spyre/bundle", optional = true }
 # `RowsExtern` — which host-staged buffer a `LoadRows` reads — is one type across every IR: the
-# cuda `Instruction`, this crate's `SubOp`, the metal step. scratchy-ir never reaches back here.
+# `Instruction`, this crate's `SubOp`, the metal step. scratchy-ir never reaches back here.
 scratchy-ir = { path = "../ir" }
 
 [build-dependencies]
@@ -48,7 +48,7 @@ serde_json = { workspace = true }
 # this crate (the GPU subtile Executor lives in its metal interpreter and
 # consumes `metal_tape`) without a cycle. Cargo permits the dev-only
 # back-edge. scratchy-forward-compiler builds backend-agnostic here (no
-# cuda/metal feature), so the tests stay host-runnable on any platform.
+# metal feature), so the tests stay host-runnable on any platform.
 scratchy-forward-compiler = { path = ".." }
 # `half::bf16` for the dev-side bf16 round-trip in the
 # `*_kernel_matches_cpu_golden` validation tests — the kernel reads

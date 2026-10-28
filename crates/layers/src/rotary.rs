@@ -5,11 +5,7 @@
 //! identical across backends, and the stream-free `*_from_gpuweights`
 //! constructors upload through the active [`scratchy_tensors::WeightSource`]
 //! (the `GpuWeights` allocator), naming no backend type. The YaRN host
-//! math ([`yarn_cos_sin_table`]) is shared: cuda's stream-based
-//! `new_yarn_from_stream` and this crate's `new_yarn_from_gpuweights`
-//! both build the table through it, so the two backends cannot drift.
-//! The cuda-only stream-based upload constructors (`*_from_stream`)
-//! live in `scratchy-target-cuda`'s `CudaRotaryExt` extension trait.
+//! math lives in [`yarn_cos_sin_table`].
 
 use crate::weights::GpuWeights;
 use anyhow::Result;
@@ -263,7 +259,7 @@ fn cos_sin_rows<const N: usize>(
 }
 
 // ---------------------------------------------------------------------------
-// YaRN host math (shared with the cuda `new_yarn_from_stream`)
+// YaRN host math
 // ---------------------------------------------------------------------------
 
 /// YaRN magnitude-scaling factor — the attention-temperature term
@@ -323,10 +319,7 @@ pub fn yarn_linear_ramp_mask(low: f64, high: f64, dim: usize) -> Vec<f64> {
 }
 
 /// The `[max_pos, rope_head_dim]` f32 combined cos|sin table for YaRN
-/// rope — the one shared host-math implementation behind BOTH the cuda
-/// `new_yarn_from_stream` and the neutral
-/// [`RotaryCache::new_yarn_from_gpuweights`], so the backends cannot
-/// drift. cos occupies `[0, half)`, sin `[half, rope_head_dim)` per
+/// rope, behind [`RotaryCache::new_yarn_from_gpuweights`]. cos occupies `[0, half)`, sin `[half, rope_head_dim)` per
 /// row, matching every other builder the rope kernels read.
 pub fn yarn_cos_sin_table(
     rope_head_dim: usize,
@@ -383,9 +376,8 @@ pub fn yarn_cos_sin_table(
 }
 
 impl RotaryCache {
-    /// Backend-neutral, stream-free counterpart to the cuda
-    /// `new_from_stream`. Computes the cos/sin tables on CPU (identical
-    /// math) and uploads them through `weights`' allocator
+    /// Backend-neutral, stream-free constructor. Computes the cos/sin
+    /// tables on CPU and uploads them through `weights`' allocator
     /// ([`GpuWeights::alloc_packed_with`]), one table per cache.
     ///
     /// Currently covers the basic case: full rotary
@@ -415,11 +407,9 @@ impl RotaryCache {
     }
 
     /// Partial-rotary (and full, when `rotary_dim == head_dim`) cos/sin
-    /// cache, built on CPU and uploaded through `weights`' allocator — the
-    /// backend-neutral, stream-free counterpart to the cuda
-    /// `new_partial_from_stream`. Builds a `[max_pos, rotary_dim]`
+    /// cache, built on CPU and uploaded through `weights`' allocator. Builds a `[max_pos, rotary_dim]`
     /// cache where `rotary_dim = partial_rotary_factor * head_dim` (e.g.
-    /// Qwen3.5: `0.25 * 256 = 64`). The cuda + metal rope kernels read it
+    /// Qwen3.5: `0.25 * 256 = 64`). The metal rope kernels read it
     /// with `ROT_DIM = rotary_dim` and pass the trailing
     /// `head_dim - rotary_dim` channels through unrotated. Covers
     /// no-scaling and Llama3 scaling; LongRoPE and YaRN have their own
@@ -460,11 +450,10 @@ impl RotaryCache {
 
         let cos_sin_cache = upload_cos_sin(weights, &inv_freqs, max_pos, rotary_dim, dtype)?;
 
-        // Split `cos_cache` / `sin_cache` are wgpu-only — every cuda
-        // and metal kernel reads the unified `cos_sin_cache` above.
-        // Building + uploading two ~32 MB caches that nothing reads
-        // costs ~30-50ms on Llama-3.2-3B at max_pos = 131072. Skip
-        // them under the cuda + metal feature combos.
+        // Split `cos_cache` / `sin_cache` are wgpu-only — every metal
+        // kernel reads the unified `cos_sin_cache` above. Building +
+        // uploading two ~32 MB caches that nothing reads costs ~30-50ms
+        // on Llama-3.2-3B at max_pos = 131072, so skip them.
         let (cos_cache, sin_cache) = (
             unsafe { GpuTensor::new(std::ptr::null_mut(), &[0usize], dtype) },
             unsafe { GpuTensor::new(std::ptr::null_mut(), &[0usize], dtype) },
@@ -481,9 +470,8 @@ impl RotaryCache {
 
     /// LongRoPE (Phi-3 `rope_scaling.type == "longrope"` / `"su"`)
     /// cos/sin cache, built on CPU and uploaded via the
-    /// [`WeightSource`] — the backend-neutral counterpart to cuda's
-    /// `new_longrope_from_stream`, and arithmetically identical to it
-    /// (f32 throughout, matching Python's float32 `inv_freq` path).
+    /// [`WeightSource`] (f32 throughout, matching Python's float32
+    /// `inv_freq` path).
     ///
     /// LongRoPE differs from the plain/Llama3 builder in exactly two
     /// places: a per-channel `factor[k]` divides into the frequency
@@ -559,9 +547,7 @@ impl RotaryCache {
 
     /// YaRN (`rope_scaling.type == "yarn"` — DeepSeek-V2 MLA, gpt-oss)
     /// cos/sin cache, built on CPU and uploaded via the
-    /// [`WeightSource`] — the backend-neutral counterpart to cuda's
-    /// `new_yarn_from_stream`, and arithmetically identical to it by
-    /// construction: both call the shared [`yarn_cos_sin_table`].
+    /// [`WeightSource`], through the shared [`yarn_cos_sin_table`].
     /// NTK-by-parts interpolation between the original frequencies and
     /// the ÷`factor` interpolated ones, ramped over the correction
     /// range; the cos/sin carry the mscale ratio, which is 1.0 for
@@ -571,7 +557,7 @@ impl RotaryCache {
     ///
     /// `rope_head_dim` is the rope-portion head dim: the full
     /// `head_dim` for standard attention, `qk_rope_head_dim` for MLA
-    /// models (the codegen arm mirrors cuda's override).
+    /// models.
     pub fn new_yarn_from_gpuweights<W: WeightSource + ?Sized>(
         weights: &mut W,
         rope_head_dim: usize,

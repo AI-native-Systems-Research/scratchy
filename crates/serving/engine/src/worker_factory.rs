@@ -3,8 +3,8 @@
 
 //! Backend-neutral worker construction via an `inventory` registry.
 //!
-//! Each backend (cuda, metal, future spyre) registers a `WorkerFactory`
-//! with `inventory::submit!` in [`crate::gpu_worker`]. `create_worker`
+//! Each backend (metal, spyre) registers a `WorkerFactory` with
+//! `inventory::submit!` in `scratchy-serving-worker`. `create_worker`
 //! (in `scratchy-serving-api`) selects the first factory whose
 //! [`WorkerFactory::matches`] accepts the device string, then calls
 //! [`WorkerFactory::create`] — no `#[cfg]` arms in the dispatch.
@@ -12,16 +12,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use scratchy_core_config::CudaGraphMode;
 use scratchy_core_model::hub;
 use scratchy_core_model::weight::HfModelConfig;
 
 use crate::error::{ExecutorError, ExecutorResult};
 use crate::worker::Worker;
 
-/// Configuration for a `CudaWorker` / `MetalWorker`.
+/// Configuration for a `MetalWorker` / `SpyreWorker`.
 ///
-/// Backend-neutral: lives in this neutral module (not the cuda|metal-gated
+/// Backend-neutral: lives in this neutral module (not the metal-gated
 /// `gpu_worker`) so the dispatch path — the `WorkerFactory` trait below and
 /// `create_worker` — compiles for every target, including ones without a GPU.
 #[derive(Debug, Clone)]
@@ -34,12 +33,6 @@ pub struct WorkerCreateConfig {
     pub hf_token: Option<String>,
     /// KV cache block size in tokens (must match the scheduler's block size).
     pub block_size: usize,
-    /// GPU device index.
-    pub device_id: i32,
-    /// Skip CUDA graph capture (--enforce-eager).
-    pub enforce_eager: bool,
-    /// CUDA graph mode: controls piecewise vs monolithic graph capture.
-    pub cuda_graph_mode: CudaGraphMode,
     /// Maximum tokens per scheduler iteration (controls arena pre-sizing).
     pub max_num_batched_tokens: usize,
     /// Maximum concurrently-resident sequences (scheduler `max_num_seqs`).
@@ -56,10 +49,6 @@ pub struct WorkerCreateConfig {
     /// honour it). A worker whose model carries recurrent state reserves the snapshots a prefix hit
     /// must restore only when this is set, so a run without caching does not pay their memory.
     pub enable_prefix_caching: bool,
-    /// Batch sizes to capture as CUDA graphs (sorted, deduplicated).
-    pub cuda_graph_sizes: Vec<usize>,
-    /// Run cublasLt algorithm benchmarking during warmup (--cublas-autotune).
-    pub cublas_autotune: bool,
     /// Fraction of GPU memory to use (0.0-1.0). Used to compute KV cache budget.
     pub gpu_memory_utilization: f64,
     /// Pooling strategy: "auto", "last", "cls", "mean".
@@ -141,10 +130,9 @@ pub type ProgressCallback = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
 /// A backend's worker constructor, registered via `inventory::submit!`.
 ///
-/// Exactly one backend factory compiles per build (cuda XOR metal — they
+/// Exactly one backend factory compiles per build (metal XOR spyre — they
 /// are `#[cfg]`-mutex), so `matches` overlap on `"auto"` carries no
-/// runtime ambiguity. A future spyre factory would match `"spyre"`,
-/// disjoint from both.
+/// runtime ambiguity.
 pub trait WorkerFactory: Sync {
     /// Whether this backend handles the given device string.
     fn matches(&self, device: &str) -> bool;
@@ -177,7 +165,7 @@ pub trait WorkerFactory: Sync {
     }
 
     /// Whether this backend supports the engine's cross-request prefix cache.
-    /// `true` for the paged-KV GPU backends (cuda/metal). A backend whose worker
+    /// `true` for the paged-KV GPU backend (metal). A backend whose worker
     /// keeps a per-request KV cache (spyre — no shared/paged KV) cannot honor a
     /// scheduler-reported cached prefix it has no KV for, so it returns `false`
     /// and the engine disables prefix caching for it.

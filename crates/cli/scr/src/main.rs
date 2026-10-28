@@ -67,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
     // same thing that happened when this process crashed here, except deterministic, with a truthful exit
     // code and no signal handler to hang in.
     //
-    // ⛔ GATED ON THE FEATURE THAT LOADS SENLIB. metal and cuda have no such library and their `atexit` is
+    // ⛔ GATED ON THE FEATURE THAT LOADS SENLIB. metal has no such library and its `atexit` is
     // fine; skipping it there would silence a real bug rather than route around someone else's.
     #[cfg(feature = "spyre-hw")]
     {
@@ -139,7 +139,7 @@ async fn run() -> anyhow::Result<()> {
                         commands::cache::run_cache_inspect(args).await
                     }
                 },
-                #[cfg(any(feature = "cuda", feature = "metal"))]
+                #[cfg(feature = "metal")]
                 ModelSubcommand::Info(args) => commands::model_info::run_info(args).await,
                 #[cfg(feature = "model")]
                 ModelSubcommand::Names(args) => commands::model::run_model_names(args).await,

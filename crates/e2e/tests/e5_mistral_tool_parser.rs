@@ -14,10 +14,7 @@
 //!
 //! Run with:
 //! ```bash
-//! # Metal/CPU:
-//! cargo test -p vllm-e2e --features e2e,metal --test e5_mistral_tool_parser -- --ignored --test-threads=1
-//! # CUDA:
-//! cargo test -p vllm-e2e --features e2e,cuda --test e5_mistral_tool_parser -- --ignored --test-threads=1
+//! cargo test -p scratchy-e2e --features e2e,metal --test e5_mistral_tool_parser -- --ignored --test-threads=1
 //! ```
 
 #![cfg(feature = "e2e")]
@@ -35,11 +32,7 @@ use scratchy_serving_api::protocol::{
 // ---------------------------------------------------------------------------
 
 fn test_model() -> &'static str {
-    if cfg!(feature = "cuda") {
-        TestModels::SMOLLM_135M_CUDA
-    } else {
-        TestModels::SMOLLM
-    }
+    TestModels::SMOLLM
 }
 
 fn user_msg(content: &str) -> ChatCompletionMessageParam {

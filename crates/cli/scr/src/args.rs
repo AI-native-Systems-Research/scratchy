@@ -107,7 +107,7 @@ pub struct LaunchClaudeArgs {
     #[arg(short = 'm', long, env = "VLLM_MODEL")]
     pub model: Option<String>,
 
-    /// Device: "cpu", "cuda:N", "metal", or "auto" (auto-detect best GPU).
+    /// Device: "cpu", "metal", "spyre", or "auto" (the backend this binary was built with).
     #[arg(long, default_value = "auto")]
     pub device: String,
 
@@ -233,7 +233,7 @@ pub enum ModelSubcommand {
     /// scratchy variants. Optional positional filters AND-substring
     /// match against `<arch>/<variant_stem>` — e.g.
     /// `scr model info llama 3.2 awq`.
-    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[cfg(feature = "metal")]
     Info(ModelInfoArgs),
     /// Print compiled-in HuggingFace model ids for shell tab completion
     /// (one per line), optionally filtered by prefix. Sourced from
@@ -293,7 +293,7 @@ pub enum NamesSource {
     Stems,
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "metal")]
 #[derive(Parser, Debug)]
 pub struct ModelInfoArgs {
     /// Color/style output. `auto` uses ANSI when stdout is a tty
@@ -301,26 +301,13 @@ pub struct ModelInfoArgs {
     /// piping into `less -R`); `never` disables.
     #[arg(long, value_enum, default_value_t = ColorWhen::Auto)]
     pub color: ColorWhen,
-    /// Run cuBLAS-pick analysis instead of the per-bucket backbone
-    /// dump: for every `Cublas` Gemm pick, classify by margin vs.
-    /// the best non-cuBLAS standalone-GEMM kernel and identify
-    /// fusion-gap reasons (Gemm→Add / Norm→Gemm / Gemm→ScalarMul /
-    /// lm_head). Uses the bundled cost CSV for exact-row lookups.
-    /// cuda-only — keyed off `scratchy_target_cuda::targets` profiles.
-    #[cfg(feature = "cuda")]
-    #[arg(short = 'c', long = "cublas-analysis")]
-    pub cublas_analysis: bool,
-    /// With `-c/--cublas-analysis`, also print a per-arch breakdown.
-    #[cfg(feature = "cuda")]
-    #[arg(long, requires = "cublas_analysis")]
-    pub per_arch: bool,
     /// Substring filters. A variant is shown when its
     /// `<arch>/<variant_stem>` contains every filter (case-
     /// insensitive). Empty = show every compiled variant.
     pub filters: Vec<String>,
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "metal")]
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default)]
 pub enum ColorWhen {
     #[default]
@@ -350,7 +337,7 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 8000)]
     pub port: u16,
 
-    /// Device: "cpu", "cuda:N", "metal", or "auto" (auto-detect best GPU).
+    /// Device: "cpu", "metal", "spyre", or "auto" (the backend this binary was built with).
     #[arg(long, default_value = "auto")]
     pub device: String,
 
@@ -491,33 +478,13 @@ pub struct ServeArgs {
     #[arg(long)]
     pub lora_adapter: Option<String>,
 
-    /// Number of GPUs for tensor parallelism (default: 1).
-    /// Splits model weights across N GPUs using NCCL all-reduce.
+    /// Tensor-parallel degree. Only 1 is supported (one device per model).
     #[arg(long, default_value_t = 1)]
     pub tensor_parallel_size: usize,
 
-    /// Number of GPU stages for pipeline parallelism (default: 1).
-    /// Splits model layers across N GPU stages using NCCL P2P send/recv.
-    /// Total GPUs used = tensor_parallel_size * pipeline_parallel_size.
+    /// Pipeline-parallel degree. Only 1 is supported (one device per model).
     #[arg(long, default_value_t = 1)]
     pub pipeline_parallel_size: usize,
-
-    /// Number of nodes for multi-node tensor parallelism (default: 1).
-    /// When > 1, GPUs are split across nodes using TCP rendezvous for NCCL.
-    #[arg(long, default_value_t = 1)]
-    pub num_nodes: usize,
-
-    /// This node's rank in the multi-node setup (0 = master, default: 0).
-    #[arg(long, default_value_t = 0)]
-    pub node_rank: usize,
-
-    /// Master node address for multi-node NCCL rendezvous (default: localhost).
-    #[arg(long, default_value = "localhost")]
-    pub master_addr: String,
-
-    /// Master port for multi-node NCCL rendezvous (default: 29500).
-    #[arg(long, default_value_t = 29500)]
-    pub master_port: u16,
 
     /// Disable async scheduling (overlap of GPU execution and CPU scheduling).
     /// By default, async scheduling is enabled for better throughput.
@@ -530,43 +497,10 @@ pub struct ServeArgs {
     #[arg(long, default_value = "generate")]
     pub runner: String,
 
-    /// Comma-separated CUDA graph capture batch sizes.
-    /// CUDA graphs accelerate decode steps by replaying a captured kernel
-    /// sequence in a single driver call.
-    #[arg(long, default_value = "auto")]
-    pub cuda_graph_sizes: String,
-
-    /// Disable CUDA graphs and run all steps eagerly.
-    /// Equivalent to Python vLLM's --enforce-eager flag.
-    /// Default: false (CUDA graphs enabled on CUDA devices).
-    #[arg(long)]
-    pub enforce_eager: bool,
-
-    /// Distributed executor backend: "auto" (default) or "external_launcher".
-    /// With "external_launcher", the job launcher (torchrun, mpirun, SLURM)
-    /// spawns N processes. Each reads RANK, LOCAL_RANK, WORLD_SIZE,
-    /// MASTER_ADDR, MASTER_PORT from env and runs its own engine instance.
-    #[arg(long, default_value = "auto")]
-    pub distributed_executor_backend: String,
-
-    /// CUDA graph mode: controls piecewise vs monolithic graph capture.
-    /// Options: "auto", "none", "full", "piecewise", "full-and-piecewise", "full-decode-only".
-    /// - "auto": Full for SM < 90 (Ampere/Ada), FullAndPiecewise for SM >= 90 (Hopper+)
-    /// - "none": No CUDA graphs (same as --enforce-eager)
-    ///
-    /// Default: "auto".
-    #[arg(long, default_value = "auto")]
-    pub cuda_graph_mode: String,
-
     /// Disable prefix caching (KV cache reuse for shared prompt prefixes).
     /// By default, prefix caching is enabled.
     #[arg(long)]
     pub no_prefix_caching: bool,
-
-    /// Benchmark cublasLt algorithms during warmup to find faster GEMM kernels.
-    /// Adds a few seconds to startup. Mainly benefits compute-bound prefill GEMMs.
-    #[arg(long)]
-    pub cublas_autotune: bool,
 
     /// KV cache data type: "auto" (use model dtype) or "fp8_e4m3" (FP8).
     /// FP8 halves KV cache memory, doubling capacity. On metal the KV codec is
@@ -653,7 +587,7 @@ pub struct ChatArgs {
     #[arg(long)]
     pub bench: bool,
 
-    /// Device: "cpu", "cuda:N", "metal", or "auto" (auto-detect best GPU).
+    /// Device: "cpu", "metal", "spyre", or "auto" (the backend this binary was built with).
     #[arg(long, default_value = "auto")]
     pub device: String,
 
@@ -681,13 +615,9 @@ pub struct ChatArgs {
     #[arg(long)]
     pub temperature: Option<f64>,
 
-    /// Number of GPUs for tensor parallelism (default: 1).
+    /// Tensor-parallel degree. Only 1 is supported (one device per model).
     #[arg(long, default_value_t = 1)]
     pub tensor_parallel_size: usize,
-
-    /// Disable CUDA graphs (use eager mode).
-    #[arg(long)]
-    pub enforce_eager: bool,
 
     /// Chat template override. Accepts either an inline Jinja string
     /// or a path to a `tokenizer_config.json` / `.jinja` file. Useful
@@ -753,7 +683,7 @@ pub struct BatchArgs {
     #[arg(short = 'o', long)]
     pub output: String,
 
-    /// Device: "cpu", "cuda:N", "metal", or "auto" (auto-detect best GPU).
+    /// Device: "cpu", "metal", "spyre", or "auto" (the backend this binary was built with).
     #[arg(long, default_value = "auto")]
     pub device: String,
 
@@ -1424,14 +1354,14 @@ mod tests {
             "-o",
             "out.jsonl",
             "--device",
-            "cuda:0",
+            "metal",
             "--dtype",
             "bfloat16",
         ]);
         match cli.command {
             Commands::RunBatch(args) => {
                 assert_eq!(args.resolved_model().unwrap(), "flag-model");
-                assert_eq!(args.device, "cuda:0");
+                assert_eq!(args.device, "metal");
                 assert_eq!(args.dtype, "bfloat16");
             }
             _ => panic!("expected RunBatch command"),
@@ -1539,53 +1469,12 @@ mod tests {
         assert!(matches!(cli.command, Commands::CollectEnv(_)));
     }
 
-    // -- distributed-executor-backend tests --
-
     #[cfg(feature = "serve")]
     #[test]
-    fn test_serve_distributed_backend_default() {
-        let cli = Cli::parse_from(["scr", "serve", "some-model"]);
+    fn test_serve_tensor_parallel_size_parses() {
+        let cli = Cli::parse_from(["scr", "serve", "some-model", "--tensor-parallel-size", "4"]);
         match cli.command {
             Commands::Serve(args) => {
-                assert_eq!(args.distributed_executor_backend, "auto");
-            }
-            _ => panic!("expected Serve command"),
-        }
-    }
-
-    #[cfg(feature = "serve")]
-    #[test]
-    fn test_serve_distributed_backend_external_launcher() {
-        let cli = Cli::parse_from([
-            "scr",
-            "serve",
-            "some-model",
-            "--distributed-executor-backend",
-            "external_launcher",
-        ]);
-        match cli.command {
-            Commands::Serve(args) => {
-                assert_eq!(args.distributed_executor_backend, "external_launcher");
-            }
-            _ => panic!("expected Serve command"),
-        }
-    }
-
-    #[cfg(feature = "serve")]
-    #[test]
-    fn test_serve_distributed_backend_with_tp() {
-        let cli = Cli::parse_from([
-            "scr",
-            "serve",
-            "some-model",
-            "--distributed-executor-backend",
-            "external_launcher",
-            "--tensor-parallel-size",
-            "4",
-        ]);
-        match cli.command {
-            Commands::Serve(args) => {
-                assert_eq!(args.distributed_executor_backend, "external_launcher");
                 assert_eq!(args.tensor_parallel_size, 4);
             }
             _ => panic!("expected Serve command"),

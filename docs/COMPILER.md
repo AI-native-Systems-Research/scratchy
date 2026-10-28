@@ -49,8 +49,8 @@ The compiler reasons about the **entire** forward pass — embedding through
 global dataflow, it can fuse across operation boundaries (e.g. folding a
 residual `add` into the preceding GEMM, or fusing add + RMSNorm + the next
 GEMM), reuse scratch slots across the whole tape, and schedule shared memory and
-streams with full-graph knowledge. Kernel selection is *solved*, not guessed at
-runtime.
+streams with full-graph knowledge. Kernel selection is fixed at compile time, not
+guessed at runtime.
 
 ## What it compiles to
 
@@ -67,11 +67,11 @@ The compiler runs these passes at macro-expansion time:
    verbatim HuggingFace `config.json` files in the crate's `configs/` directory.
 3. **Classify** operations into atoms (GEMM, RoPE, Attention, RMSNorm, …).
 4. **Build** the dataflow graph and **unroll** layer loops.
-5. **Solve** for the best kernel variant (CUTLASS / FlashInfer / …) at each
-   discrete workload point — this is the fusion-synthesis ("FUF") pass.
+5. **Fuse** across operation boundaries and lower each op to its target kernel
+   at each discrete workload point — this is the fusion-synthesis ("FUF") pass.
 6. **Schedule** registers, shared memory, and scratch-tile arenas.
 7. **Emit** monomorphic Rust dispatch code plus static instruction tables, and
-   for CUDA/Metal emit the kernel sources to be built into the binary.
+   for Metal emit the kernel sources to be built into the binary.
 
 ## Workload-aware bucket dispatch
 
@@ -88,14 +88,11 @@ to serve speculative-decoding draft chains efficiently.)
 
 ## Backends and hardware
 
-- **CUDA** — eager driver-side kernel dispatch via `cudarc` (no `nvcc` at
-  runtime). Target profiles with empirical cost tables for L4/L40S (sm_89) and
-  H100 (sm_90), including **Hopper-native FP8** GEMM (`cutlass_scaled_mm`).
-  Tensor parallelism via NCCL (feature-gated, world sizes 1/2/4/8) with
-  piecewise CUDA-graph capture across collective boundaries.
 - **Metal** — synthesized Metal Shading Language kernels with a command-buffer
-  worker pool, and target profiles for Apple M1–M4. The CUDA and Metal backends
-  are mutually exclusive build-time features.
+  worker pool, and target profiles for Apple M1–M4.
+- **Spyre** — KTIR for IBM Spyre AIU, run on the `spyre-emu` emulator or a
+  `spyre-hw` card. The Metal and Spyre backends are mutually exclusive
+  build-time features.
 
 ## Quantization
 
