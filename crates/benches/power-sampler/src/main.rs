@@ -31,7 +31,7 @@
 
 #[cfg(target_os = "macos")]
 mod ffi {
-    use std::ffi::{c_char, c_int, c_void, CStr, CString};
+    use std::ffi::{CStr, CString, c_char, c_int, c_void};
     use std::ptr;
 
     pub type CFAllocatorRef = *const u8;
@@ -81,7 +81,11 @@ mod ffi {
             capacity: CFIndex,
             dict: CFDictionaryRef,
         ) -> CFMutableDictionaryRef;
-        pub fn CFDictionarySetValue(the_dict: CFMutableDictionaryRef, key: CFTypeRef, value: CFTypeRef);
+        pub fn CFDictionarySetValue(
+            the_dict: CFMutableDictionaryRef,
+            key: CFTypeRef,
+            value: CFTypeRef,
+        );
         pub fn CFArrayGetCount(array: CFArrayRef) -> CFIndex;
         pub fn CFArrayGetValueAtIndex(array: CFArrayRef, idx: CFIndex) -> CFTypeRef;
         pub fn CFArrayCreateMutable(
@@ -209,7 +213,13 @@ mod ffi {
     }
 
     pub fn cfnum(v: i64) -> Owned {
-        Owned(unsafe { CFNumberCreate(ptr::null(), K_CF_NUMBER_S_INT_64, &v as *const i64 as *const c_void) })
+        Owned(unsafe {
+            CFNumberCreate(
+                ptr::null(),
+                K_CF_NUMBER_S_INT_64,
+                &v as *const i64 as *const c_void,
+            )
+        })
     }
 
     pub fn dict_new() -> OwnedMut {
@@ -240,10 +250,20 @@ mod ffi {
             return String::new();
         }
         let mut buf = [0 as c_char; 256];
-        if unsafe { CFStringGetCString(s, buf.as_mut_ptr(), buf.len() as CFIndex, K_CF_STRING_ENCODING_UTF8) } == 0 {
+        if unsafe {
+            CFStringGetCString(
+                s,
+                buf.as_mut_ptr(),
+                buf.len() as CFIndex,
+                K_CF_STRING_ENCODING_UTF8,
+            )
+        } == 0
+        {
             return String::new();
         }
-        unsafe { CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned()
+        unsafe { CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
     }
 
     /// kern.osproductversion, e.g. "27.0.1".
@@ -252,7 +272,13 @@ mod ffi {
         let mut buf = [0u8; 32];
         let mut len = buf.len();
         let rc = unsafe {
-            sysctlbyname(name.as_ptr(), buf.as_mut_ptr() as *mut c_void, &mut len, ptr::null(), 0)
+            sysctlbyname(
+                name.as_ptr(),
+                buf.as_mut_ptr() as *mut c_void,
+                &mut len,
+                ptr::null(),
+                0,
+            )
         };
         if rc != 0 {
             return String::new();
@@ -280,23 +306,108 @@ mod clpc {
     const INDICES_27: (u32, u32, u32) = (16, 25, 24); // (cpu, gpu, ane)
 
     const KEYS: &[Keys] = &[
-        Keys { bundle: "com.apple.driver.AppleT6000CLPCv3", cpu: 0x47479059, gpu: 0x4519bf1e, ane: 0x9aaa17f8 },
-        Keys { bundle: "com.apple.driver.AppleT6002CLPC", cpu: 0xb501816b, gpu: 0x9e2c3e8b, ane: 0x14d5a574 },
-        Keys { bundle: "com.apple.driver.AppleT6020CLPC", cpu: 0xe301cd75, gpu: 0x8f34cc7a, ane: 0x7415fb0f },
-        Keys { bundle: "com.apple.driver.AppleT6022CLPC", cpu: 0x76f5fd21, gpu: 0x90624499, ane: 0x3c097307 },
-        Keys { bundle: "com.apple.driver.AppleT6030CLPC", cpu: 0xbe03a01a, gpu: 0x472d6c9c, ane: 0xb8990c38 },
-        Keys { bundle: "com.apple.driver.AppleT6031CLPC", cpu: 0xd81e0084, gpu: 0x1085f98b, ane: 0x313a3be1 },
-        Keys { bundle: "com.apple.driver.AppleT6032CLPC", cpu: 0xf4a21308, gpu: 0x85e80513, ane: 0x63dc8e25 },
-        Keys { bundle: "com.apple.driver.AppleT6041CLPC", cpu: 0x263cf1f0, gpu: 0x22e4cf59, ane: 0x7849fb5c },
-        Keys { bundle: "com.apple.driver.AppleT6050CLPC", cpu: 0xd3ab60bb, gpu: 0x27cd4ce5, ane: 0x8c0f1c59 },
-        Keys { bundle: "com.apple.driver.AppleT6050dCLPC", cpu: 0x18b3010e, gpu: 0xedeca11a, ane: 0x188bd883 },
-        Keys { bundle: "com.apple.driver.AppleT8103CLPCv3", cpu: 0x2cdd31f2, gpu: 0x21becf42, ane: 0x0667fb81 },
-        Keys { bundle: "com.apple.driver.AppleT8112CLPC", cpu: 0xb5435137, gpu: 0x638d9d52, ane: 0xea089c36 },
-        Keys { bundle: "com.apple.driver.AppleT8122CLPC", cpu: 0x54b51c99, gpu: 0x0ce2d9dc, ane: 0x960afe2f },
-        Keys { bundle: "com.apple.driver.AppleT8132CLPC", cpu: 0x4a854d94, gpu: 0x3b3e3b79, ane: 0x1ff4a9ec },
-        Keys { bundle: "com.apple.driver.AppleT8140CLPC", cpu: 0x9bf54436, gpu: 0xef70589c, ane: 0x569d941b },
-        Keys { bundle: "com.apple.driver.AppleT8142CLPC", cpu: 0x43708744, gpu: 0x6a010933, ane: 0xbc5efdf0 },
-        Keys { bundle: "com.apple.driver.AppleT8152CLPC", cpu: 0x485d4bfc, gpu: 0x11784654, ane: 0x9380c6bb },
+        Keys {
+            bundle: "com.apple.driver.AppleT6000CLPCv3",
+            cpu: 0x47479059,
+            gpu: 0x4519bf1e,
+            ane: 0x9aaa17f8,
+        },
+        Keys {
+            bundle: "com.apple.driver.AppleT6002CLPC",
+            cpu: 0xb501816b,
+            gpu: 0x9e2c3e8b,
+            ane: 0x14d5a574,
+        },
+        Keys {
+            bundle: "com.apple.driver.AppleT6020CLPC",
+            cpu: 0xe301cd75,
+            gpu: 0x8f34cc7a,
+            ane: 0x7415fb0f,
+        },
+        Keys {
+            bundle: "com.apple.driver.AppleT6022CLPC",
+            cpu: 0x76f5fd21,
+            gpu: 0x90624499,
+            ane: 0x3c097307,
+        },
+        Keys {
+            bundle: "com.apple.driver.AppleT6030CLPC",
+            cpu: 0xbe03a01a,
+            gpu: 0x472d6c9c,
+            ane: 0xb8990c38,
+        },
+        Keys {
+            bundle: "com.apple.driver.AppleT6031CLPC",
+            cpu: 0xd81e0084,
+            gpu: 0x1085f98b,
+            ane: 0x313a3be1,
+        },
+        Keys {
+            bundle: "com.apple.driver.AppleT6032CLPC",
+            cpu: 0xf4a21308,
+            gpu: 0x85e80513,
+            ane: 0x63dc8e25,
+        },
+        Keys {
+            bundle: "com.apple.driver.AppleT6041CLPC",
+            cpu: 0x263cf1f0,
+            gpu: 0x22e4cf59,
+            ane: 0x7849fb5c,
+        },
+        Keys {
+            bundle: "com.apple.driver.AppleT6050CLPC",
+            cpu: 0xd3ab60bb,
+            gpu: 0x27cd4ce5,
+            ane: 0x8c0f1c59,
+        },
+        Keys {
+            bundle: "com.apple.driver.AppleT6050dCLPC",
+            cpu: 0x18b3010e,
+            gpu: 0xedeca11a,
+            ane: 0x188bd883,
+        },
+        Keys {
+            bundle: "com.apple.driver.AppleT8103CLPCv3",
+            cpu: 0x2cdd31f2,
+            gpu: 0x21becf42,
+            ane: 0x0667fb81,
+        },
+        Keys {
+            bundle: "com.apple.driver.AppleT8112CLPC",
+            cpu: 0xb5435137,
+            gpu: 0x638d9d52,
+            ane: 0xea089c36,
+        },
+        Keys {
+            bundle: "com.apple.driver.AppleT8122CLPC",
+            cpu: 0x54b51c99,
+            gpu: 0x0ce2d9dc,
+            ane: 0x960afe2f,
+        },
+        Keys {
+            bundle: "com.apple.driver.AppleT8132CLPC",
+            cpu: 0x4a854d94,
+            gpu: 0x3b3e3b79,
+            ane: 0x1ff4a9ec,
+        },
+        Keys {
+            bundle: "com.apple.driver.AppleT8140CLPC",
+            cpu: 0x9bf54436,
+            gpu: 0xef70589c,
+            ane: 0x569d941b,
+        },
+        Keys {
+            bundle: "com.apple.driver.AppleT8142CLPC",
+            cpu: 0x43708744,
+            gpu: 0x6a010933,
+            ane: 0xbc5efdf0,
+        },
+        Keys {
+            bundle: "com.apple.driver.AppleT8152CLPC",
+            cpu: 0x485d4bfc,
+            gpu: 0x11784654,
+            ane: 0x9380c6bb,
+        },
     ];
 
     /// One AppleCLPC service found in the IORegistry, with the counters its
@@ -312,8 +423,12 @@ mod clpc {
     /// Find every AppleCLPC service and the counters it carries.
     pub fn discover(version: &str) -> Vec<Service> {
         if !version.starts_with("27.") {
-            eprintln!("error: CLPC energy counter ids are known for macOS 27 only, this is {version}");
-            eprintln!("       (they are extracted per OS release; refusing to read ids that may be wrong)");
+            eprintln!(
+                "error: CLPC energy counter ids are known for macOS 27 only, this is {version}"
+            );
+            eprintln!(
+                "       (they are extracted per OS release; refusing to read ids that may be wrong)"
+            );
             std::process::exit(1);
         }
         let (cpu_i, gpu_i, ane_i) = INDICES_27;
@@ -359,7 +474,11 @@ mod clpc {
                     ]
                 })
                 .unwrap_or_default();
-            out.push(Service { driver_id, bundle, channels });
+            out.push(Service {
+                driver_id,
+                bundle,
+                channels,
+            });
         }
         out
     }
@@ -521,7 +640,10 @@ fn sample_csv(
         }
     }
     let selected_n = unsafe { ffi::CFArrayGetCount(selected.0) };
-    eprintln!("{selected_n} energy channels selected ({} CLPC counters)", clpc_wanted.len());
+    eprintln!(
+        "{selected_n} energy channels selected ({} CLPC counters)",
+        clpc_wanted.len()
+    );
     if selected_n == 0 {
         std::process::exit(1);
     }
@@ -534,7 +656,13 @@ fn sample_csv(
     unsafe { ffi::CFDictionarySetValue(chan, channels_key.0, selected.0 as ffi::CFTypeRef) };
     let mut subscribed: ffi::CFMutableDictionaryRef = std::ptr::null_mut();
     let subs = unsafe {
-        ffi::IOReportCreateSubscription(std::ptr::null(), chan, &mut subscribed, 0, std::ptr::null())
+        ffi::IOReportCreateSubscription(
+            std::ptr::null(),
+            chan,
+            &mut subscribed,
+            0,
+            std::ptr::null(),
+        )
     };
     if subs.is_null() || subscribed.is_null() {
         eprintln!("IOReportCreateSubscription failed");
@@ -573,7 +701,9 @@ fn sample_csv(
             let group = ffi::to_rust(unsafe { ffi::IOReportChannelGetGroup(ch) });
             let sub = ffi::to_rust(unsafe { ffi::IOReportChannelGetSubGroup(ch) });
             let name = ffi::to_rust(unsafe { ffi::IOReportChannelGetChannelName(ch) });
-            let unit = ffi::to_rust(unsafe { ffi::IOReportChannelGetUnitLabel(ch) }).trim().to_string();
+            let unit = ffi::to_rust(unsafe { ffi::IOReportChannelGetUnitLabel(ch) })
+                .trim()
+                .to_string();
             let v = unsafe { ffi::IOReportSimpleGetIntegerValue(ch, 0) } as f64;
             if group == "CLPC" {
                 // Our synthesized counters: the channel name is the rail.
@@ -619,7 +749,10 @@ fn sample_csv(
                 .map(|(rail, _)| rail)
                 .collect();
             if !missing.is_empty() {
-                eprintln!("warning: CLPC returned no samples for: {}", missing.join(", "));
+                eprintln!(
+                    "warning: CLPC returned no samples for: {}",
+                    missing.join(", ")
+                );
                 warned = true;
             }
         }
