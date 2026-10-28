@@ -673,7 +673,7 @@ pub fn glance_maps(
 ) -> Element {
     let grid = format!(
         "flex: 0 1 auto; min-width: 0; align-self: start; display: grid; \
-         grid-template-columns: repeat({}, {column_width}); gap: 1.5rem",
+         grid-template-columns: repeat({}, {column_width}); gap: 1.5rem 0",
         columns.len()
     );
     rsx! {
