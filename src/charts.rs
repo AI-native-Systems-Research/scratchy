@@ -148,6 +148,27 @@ pub enum Chart<'a> {
         data: Vec<SparkPoint>,
         options: ChartOptions<'a>,
     },
+    /// Carbon's ScatterChart: one dot a measurement.
+    Scatter {
+        data: Vec<DotPoint<'a>>,
+        options: ChartOptions<'a>,
+    },
+}
+
+/// One dot: its series, where along the bottom axis, and its value.
+#[derive(Serialize)]
+pub struct DotPoint<'a> {
+    pub group: &'a str,
+    pub key: f64,
+    pub value: f64,
+}
+
+/// A scatter chart's dots: Carbon's `points` option.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Points {
+    pub radius: f64,
+    pub fill_opacity: f64,
 }
 
 /// One point of a sparkline. On the two lines, a side's value; on the fills,
@@ -207,6 +228,8 @@ pub struct ChartOptions<'a> {
     pub combo: Option<Vec<ComboLayer>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bounds: Option<Bounds>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub points: Option<Points>,
     pub toolbar: Enabled,
 }
 
@@ -401,7 +424,8 @@ impl Chart<'_> {
         match self {
             Chart::GroupedBar { options, .. }
             | Chart::Heatmap { options, .. }
-            | Chart::Combo { options, .. } => options,
+            | Chart::Combo { options, .. }
+            | Chart::Scatter { options, .. } => options,
         }
     }
 }
@@ -562,6 +586,7 @@ pub fn mini_heatmap(
             locale: Locale::total(total_label),
             combo: None,
             bounds: None,
+            points: None,
             toolbar: Enabled { enabled: false },
         },
         ratio: true,
@@ -635,11 +660,13 @@ pub fn glance_mini(
 pub fn glance_maps(
     rows: &[&str],
     columns: &[&str],
+    column_width: &str,
+    scale: bool,
     cell: impl Fn(&str, &str) -> Element,
 ) -> Element {
     let grid = format!(
         "flex: 0 1 auto; min-width: 0; align-self: start; display: grid; \
-         grid-template-columns: 7rem repeat({}, minmax(0, 11.5rem)); gap: 1.5rem",
+         grid-template-columns: 7rem repeat({}, {column_width}); gap: 1.5rem",
         columns.len()
     );
     rsx! {
@@ -659,7 +686,7 @@ pub fn glance_maps(
                     }
                 }
             }
-            {ratio_scale(ScaleFit::Beside, GLANCE_SCALE)}
+            if scale { {ratio_scale(ScaleFit::Beside, GLANCE_SCALE)} }
         }
     }
 }
@@ -964,6 +991,7 @@ pub fn sparkline(
                 upper_bound_maps_to: "upper",
                 lower_bound_maps_to: "lower",
             }),
+            points: None,
             toolbar: Enabled { enabled: false },
         },
     };

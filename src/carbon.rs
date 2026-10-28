@@ -25,6 +25,7 @@ pub enum Module {
     Stack,
     Tag,
     Tile,
+    Toggle,
     ToggleTip,
     Tooltip,
     UiShell,
@@ -32,7 +33,7 @@ pub enum Module {
 
 /// Which module defines each `cds-*` tag family: the tag itself and every
 /// `<family>-...` tag.
-const FAMILIES: [(&str, Module); 23] = [
+const FAMILIES: [(&str, Module); 24] = [
     ("cds-accordion", Module::Accordion),
     ("cds-button", Module::Button),
     ("cds-clickable-tile", Module::Tile),
@@ -54,6 +55,7 @@ const FAMILIES: [(&str, Module); 23] = [
     ("cds-table", Module::DataTable),
     ("cds-tag", Module::Tag),
     ("cds-tile", Module::Tile),
+    ("cds-toggle", Module::Toggle),
     ("cds-toggletip", Module::ToggleTip),
     ("cds-unordered-list", Module::List),
 ];
@@ -106,6 +108,7 @@ impl Module {
             Module::Stack => "stack",
             Module::Tag => "tag",
             Module::Tile => "tile",
+            Module::Toggle => "toggle",
             Module::ToggleTip => "toggle-tip",
             Module::Tooltip => "tooltip",
             Module::UiShell => "ui-shell",
@@ -162,6 +165,27 @@ pub fn ContentSwitcherItem(target: String, selected: bool, children: Element) ->
 #[component]
 pub fn ContentPanel(id: String, shown: bool, children: Element) -> Element {
     rsx! { div { id, "data-panel": "", hidden: (!shown).then_some(true), {children} } }
+}
+
+/// A `cds-toggle` switching between two panels: `off`'s shown until it is toggled, then `on`'s.
+/// Each panel is a [`ContentPanel`], so a chart in the one hidden draws when it is shown.
+#[component]
+pub fn PanelToggle(
+    #[props(into)] label: String,
+    #[props(into)] off: String,
+    #[props(into)] on: String,
+) -> Element {
+    let script = format!(
+        "document.currentScript.previousElementSibling.addEventListener('cds-toggle-changed', function (e) {{\
+         var on = e.detail.toggled;\
+         document.getElementById({off:?}).hidden = on;\
+         document.getElementById({on:?}).hidden = !on;\
+         }});"
+    );
+    rsx! {
+        cds-toggle { "label-text": label, "label-a": "On", "label-b": "Off", size: "sm" }
+        script { dangerous_inner_html: script }
+    }
 }
 
 #[component]
