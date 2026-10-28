@@ -23,10 +23,10 @@ use crate::carbon::{
     PanelToggle, Section, Stack, Table, TableCell, TableRow, Tag, TagKind, Tile, Toggletip,
 };
 use crate::charts::{
-    Axes, Axis, AxisDomain, BarPoint, Better, Chart, ChartOptions, ColorLegend, Colour, DotPoint,
-    Enabled, Gradient, HeatPoint, HeatmapOptions, Locale, Points, RATIO_RANGE, RATIO_STEPS,
-    RatioSquare, ScaleFit, SparkAxes, Step, TableAxes, chart, colour, glance_maps, glance_mini,
-    highlight, log2_ratio, mini_heatmap, ratio_scale, ratio_step, sparkline,
+    Axes, Axis, AxisDomain, BarPoint, Better, BubblePoint, Bubbles, Chart, ChartOptions,
+    ColorLegend, Colour, Enabled, Gradient, HeatPoint, HeatmapOptions, Locale, RATIO_RANGE,
+    RATIO_STEPS, RatioSquare, ScaleFit, SparkAxes, Step, TableAxes, chart, colour, glance_maps,
+    glance_mini, highlight, log2_ratio, mini_heatmap, ratio_scale, ratio_step, sparkline,
 };
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab};
 use data::{At, Bytes, Cell, Model, RequestTiming, Run, Scenario};
@@ -904,7 +904,7 @@ fn bar_chart(
             locale: None,
             combo: None,
             bounds: None,
-            points: None,
+            bubble: None,
             toolbar: Enabled { enabled: false },
         },
     };
@@ -950,7 +950,7 @@ fn grid_heatmap(
             locale: Locale::total(total_label),
             combo: None,
             bounds: None,
-            points: None,
+            bubble: None,
             toolbar: Enabled { enabled: false },
         },
         ratio,
@@ -1831,15 +1831,17 @@ impl<'a> Latency<'a> {
         Some((padded(t0, t1), padded(p0, p1)))
     }
 
-    /// One cell's requests as a square scatter, TTFT up and TPOT across, both linear: on the
+    /// One cell's requests as a square bubble chart, TTFT up and TPOT across, both linear: on the
     /// cell's own ranges ([`Axes2::Own`]) or on `span`, its small multiple's ([`Axes2::Same`]).
+    /// Requests an engine landed within one dot of each other are one bubble, its area their
+    /// count, so a batch's identical TTFTs show as the crowd they are, not as one dot.
     /// Bare, no axis titles or tick labels: a panel of a dense grid, its axes the grid's to say.
     fn chart(
         &self,
         k: CellKey,
         span: Span,
         axes: Axes2,
-        side: &str,
+        side: Px,
         bare: bool,
         label: &str,
     ) -> Element {
@@ -1850,13 +1852,8 @@ impl<'a> Latency<'a> {
             Axes2::Own => own,
             Axes2::Same => span,
         };
-        let data: Vec<DotPoint> = (self.requests(k).into_iter())
-            .map(|(e, t, p)| DotPoint {
-                group: e.label(),
-                key: p,
-                value: t,
-            })
-            .collect();
+        let unit_radius = if bare { 2.5 } else { 3.5 };
+        let data = bubbles(&self.requests(k), (ttft, tpot), side, unit_radius);
         let axis = |maps_to, title, scale_type, domain| Axis {
             maps_to,
             // Kept on a bare chart's hidden axes: Carbon's tooltip names each timing by it.
@@ -1867,8 +1864,9 @@ impl<'a> Latency<'a> {
             visible: bare.then_some(false),
             domain: Some(AxisDomain::Values(domain)),
         };
-        let spec = Chart::Scatter {
+        let spec = Chart::Bubble {
             data,
+            unit_radius,
             options: ChartOptions {
                 title: String::new(),
                 axes: Axes {
@@ -1887,8 +1885,9 @@ impl<'a> Latency<'a> {
                 locale: None,
                 combo: None,
                 bounds: None,
-                points: Some(Points {
-                    radius: if bare { 2.5 } else { 3.5 },
+                bubble: Some(Bubbles {
+                    radius_maps_to: "radius",
+                    radius_label: "Requests",
                     fill_opacity: 0.6,
                 }),
                 toolbar: Enabled { enabled: false },
@@ -1912,7 +1911,7 @@ impl<'a> Latency<'a> {
 impl Latency<'_> {
     /// Every cell at one answer length as a dense grid of bare square scatters, users at once
     /// down and prompt size across, every panel on the same axes.
-    fn inner_grid(&self, o: u32, side: &str, axes: Axes2, label: &str) -> Element {
+    fn inner_grid(&self, o: u32, side: Px, axes: Axes2, label: &str) -> Element {
         let ks: Vec<CellKey> = self.keys.iter().copied().filter(|k| k.1 == o).collect();
         let Some(span) = self.span(&ks) else {
             return rsx! {};
@@ -1943,10 +1942,75 @@ impl Latency<'_> {
 }
 
 /// An inner grid's panel in the overview: small enough that a model's whole grid fits its column.
-const INNER_SIDE: &str = "80px";
+const INNER_SIDE: Px = Px(80);
 
 /// A small multiple's panel: square, so neither timing's spread looks wider by the chart's shape.
-const PANEL_SIDE: &str = "214px";
+const PANEL_SIDE: Px = Px(214);
+
+/// A length in CSS pixels; written as one ("80px").
+#[derive(Clone, Copy)]
+struct Px(u32);
+
+impl std::fmt::Display for Px {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}px", self.0)
+    }
+}
+
+/// An engine's requests as bubbles on a `side`-square plot of `span`: the requests within one
+/// `unit_radius` dot's width of each other, along both timings, are one bubble at their mean,
+/// its radius the square root of their count.
+fn bubbles(
+    requests: &[(Engine, f64, f64)],
+    ([t0, t1], [p0, p1]): Span,
+    side: Px,
+    unit_radius: f64,
+) -> Vec<BubblePoint<'static>> {
+    let dots = f64::from(side.0) / (2.0 * unit_radius);
+    let at = |v: f64, lo: f64, hi: f64| ((v - lo) / (hi - lo) * dots).floor() as i64;
+    let mut crowds: Vec<Crowd> = Vec::new();
+    for &(engine, t, p) in requests {
+        let dot = (at(t, t0, t1), at(p, p0, p1));
+        match crowds
+            .iter_mut()
+            .find(|c| c.engine == engine && c.dot == dot)
+        {
+            Some(c) => {
+                c.requests += 1;
+                c.ttft += t;
+                c.tpot += p;
+            }
+            None => crowds.push(Crowd {
+                engine,
+                dot,
+                requests: 1,
+                ttft: t,
+                tpot: p,
+            }),
+        }
+    }
+    (crowds.into_iter())
+        .map(|c| {
+            let n = f64::from(c.requests);
+            BubblePoint {
+                group: c.engine.label(),
+                key: c.tpot / n,
+                value: c.ttft / n,
+                radius: n.sqrt(),
+            }
+        })
+        .collect()
+}
+
+/// The requests one engine landed on one dot of a plot: how many, and their timings' sums.
+struct Crowd {
+    engine: Engine,
+    /// The dot, in dot widths up (TTFT) and across (TPOT).
+    dot: (i64, i64),
+    requests: u32,
+    ttft: f64,
+    tpot: f64,
+}
 
 /// The legend every latency chart shares, in the engines' colours.
 fn latency_legend(engines: &[Engine]) -> Element {
