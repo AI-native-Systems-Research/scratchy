@@ -516,15 +516,16 @@ fi
 Two people opening a round at once makes two issues: post to the lower
 number, and close the other.
 
-Post the run as a comment: one line, then the JSON, compact (no indents: a
-64 GB Mac's run with every cell is about 64 KB indented, at GitHub's comment
-limit), in a collapsed block:
+Post the run as a comment: one line, then the JSON gzipped and base64'd in a
+`json+gzip+base64` block, collapsed. A run keeps every request (50 a cell),
+and packed it is about a third of its compact size (`scripts/metal_round.py`
+unpacks it):
 
 ```bash
 {
   python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["machine"]["chip"], "quick run,", d["generated_utc"] + ", at", d["repo"]["sha"][:8])' "$f"
-  printf '\n<details><summary>run JSON</summary>\n\n```json\n'
-  python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), separators=(",", ":")))' "$f"
+  printf '\n<details><summary>run JSON (gzip, base64)</summary>\n\n```json+gzip+base64\n'
+  python3 -c 'import base64,gzip,json,sys,textwrap; print("\n".join(textwrap.wrap(base64.b64encode(gzip.compress(json.dumps(json.load(open(sys.argv[1])), separators=(",", ":")).encode(), 9)).decode(), 76)))' "$f"
   printf '```\n</details>\n'
 } > /tmp/metal-round-comment.md
 wc -c < /tmp/metal-round-comment.md
