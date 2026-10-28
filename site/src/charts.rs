@@ -656,14 +656,12 @@ pub fn glance_mini(
 
 /// A glance's heat maps beside their ratio scale: a row per `rows` (a
 /// machine on metal.html, a dtype on spyre.html), its name over its first
-/// cell's upper left, then a cell per `columns` (a model), each the column's
+/// tile's upper left, then a tile per `columns` (a model), each the column's
 /// name over `cell(row, column)`, that row's grids of that model as
 /// glance_minis. The cells are one width, `column_width` (metal.html shares
 /// the panel's width among them), and on a narrow screen shrink together
 /// rather than wrap: so every grid on the page is one size, the columns line
 /// up down the rows, and the scale stands beside them all.
-/// Each row's names share a track and its grids the next, so a name that
-/// wraps onto two lines leaves its grids level with their neighbours'.
 pub fn glance_maps(
     rows: &[&str],
     columns: &[&str],
@@ -681,21 +679,17 @@ pub fn glance_maps(
             div { style: "{grid}",
                 for row in rows {
                     div { style: "grid-column: 1 / -1; display: grid; grid-template-columns: subgrid; row-gap: 0.5rem",
-                        for (k, column) in columns.iter().enumerate() {
-                            // The row's name over its first cell's upper left, in no column of
-                            // its own; the names sit on the track's floor, so the first's
-                            // stays level with the rest.
-                            div { style: "align-self: end",
-                                if k == 0 { div { strong { "{row}" } } }
-                                div { style: "text-align: center", "{column}" }
-                            }
-                        }
+                        // The row's name over its first tile's upper left, in no column of its own.
+                        div { style: "grid-column: 1 / -1", strong { "{row}" } }
                         // Each model on a tile of the next layer, so neighbouring models read apart.
                         for column in columns {
                             Layer { level: 1,
                                 Tile { style: "height: 100%; box-sizing: border-box; min-width: 0",
-                                    div { style: "display: flex; gap: 0.5rem; align-items: flex-start",
-                                        {cell(row, column)}
+                                    Stack { gap: 3,
+                                        div { style: "text-align: center", "{column}" }
+                                        div { style: "display: flex; gap: 0.5rem; align-items: flex-start",
+                                            {cell(row, column)}
+                                        }
                                     }
                                 }
                             }
