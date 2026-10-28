@@ -14,12 +14,11 @@
 set -euo pipefail
 
 # One crate directory per line: the Spyre target and its triton re-host crates. Not ktir-core,
-# ktir-emulator or ktir-optimizer: the tests job runs those.
+# ktir-emulator, ktir-optimizer or ktir-superdsc: the tests job runs the first two, and both depend on the third.
 MACOS_UNBUILT='crates/targets/spyre
 crates/targets/spyre/builder
 crates/targets/spyre/bundle
 crates/targets/spyre/flex-rs
-crates/targets/spyre/ktir/ktir-superdsc
 crates/triton/splice
 crates/triton/triton-frontend
 crates/triton/triton-ktir
