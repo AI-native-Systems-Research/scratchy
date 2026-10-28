@@ -2792,17 +2792,21 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                             {latency_legend(&latency_engines(machines))}
                                             PanelToggle { label: "Same axes in every chart of a model", off: "latency-axes-own", on: "latency-axes-same" }
                                         }
-                                        for axes in Axes2::ALL {
-                                            ContentPanel { id: format!("latency-axes-{}", if axes == Axes2::Own { "own" } else { "same" }), shown: axes == Axes2::Own,
-                                                Stack { gap: 5,
-                                                    for (set, rows) in &sets {
-                                                        Stack { gap: 3,
-                                                            strong { "{set.title(lineup.large_from_gb)}" }
-                                                            // A model's grid at a readable size is wider than a heat map column.
-                                                            div { style: "overflow-x: auto",
-                                                                {glance_maps(rows, &classes, "max-content", false, |chip: &str, class: &str| {
-                                                                    model_of(chip, class).map_or(rsx! {}, |stem| latency_cell(machines, chip, stem, axes))
-                                                                })}
+                                        // One child of the Stack either way: a hidden panel keeps its place in the
+                                        // flow (styles.css), so two would leave the Stack's gap between them.
+                                        div {
+                                            for axes in Axes2::ALL {
+                                                ContentPanel { id: format!("latency-axes-{}", if axes == Axes2::Own { "own" } else { "same" }), shown: axes == Axes2::Own,
+                                                    Stack { gap: 5,
+                                                        for (set, rows) in &sets {
+                                                            Stack { gap: 3,
+                                                                strong { "{set.title(lineup.large_from_gb)}" }
+                                                                // A model's grid at a readable size is wider than a heat map column.
+                                                                div { style: "overflow-x: auto",
+                                                                    {glance_maps(rows, &classes, "max-content", false, |chip: &str, class: &str| {
+                                                                        model_of(chip, class).map_or(rsx! {}, |stem| latency_cell(machines, chip, stem, axes))
+                                                                    })}
+                                                                }
                                                             }
                                                         }
                                                     }
