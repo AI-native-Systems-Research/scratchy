@@ -252,9 +252,20 @@ pub struct Config {
     /// (`CLASSES` in the bench script); absent in runs from before it.
     #[serde(default)]
     pub classes: Option<Vec<Class>>,
-    /// The memory from which a Mac runs the large set of [`Config::classes`].
+    /// The memory from which a Mac runs the large set of [`Config::classes`], in runs from before
+    /// [`Config::default_set`]; in runs that record it, the memory from which the grid's prompts
+    /// reach 8192.
     #[serde(default)]
     pub large_from_gb: Option<u32>,
+    /// The set every Mac runs by default, whatever its memory (`small`), recorded by a run that took
+    /// it; None in a run that named its models ([`Config::models_given`]) and in runs from before
+    /// it, which took the large set from [`Config::large_from_gb`].
+    #[serde(default)]
+    pub default_set: Option<String>,
+    /// The run named its models (`--models`), so it says nothing about the default set; absent (so
+    /// false) in runs from before it.
+    #[serde(default)]
+    pub models_given: bool,
     #[serde(default)]
     pub default_models: Option<Vec<String>>,
 }
@@ -268,9 +279,11 @@ pub struct Class {
 }
 
 impl Class {
-    /// The class's model on a Mac with `memory_gb` of memory, the large one from `large_from_gb`.
-    pub fn model(&self, memory_gb: u32, large_from_gb: u32) -> &str {
-        if memory_gb >= large_from_gb {
+    /// The class's model on a Mac with `memory_gb` of memory: the small one on every Mac where the
+    /// lineup's runs say `small_everywhere` ([`Config::default_set`]), else the large one from
+    /// `large_from_gb`.
+    pub fn model(&self, memory_gb: u32, large_from_gb: u32, small_everywhere: bool) -> &str {
+        if !small_everywhere && memory_gb >= large_from_gb {
             &self.large
         } else {
             &self.small
