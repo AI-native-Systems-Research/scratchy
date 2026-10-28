@@ -2059,6 +2059,19 @@ impl Executor {
         }
     }
 
+    /// ⭐ WHETHER THIS SESSION BINDS ANYTHING INTO A RESIDENT SEGMENT — what "reserve only"
+    /// asks. NOT `bound.is_empty()`: a reserving or borrowing session still binds its own staged
+    /// constants (the sampler's tables, placed in the never-aliased activation segment), and
+    /// counting those made the prefill anchor stage and upload a full weight shadow it then
+    /// aliases away.
+    fn binds_resident(&self) -> bool {
+        self.bound.keys().any(|nm| {
+            self.places
+                .get(nm)
+                .is_some_and(|p| is_resident_seg(p.segment as usize))
+        })
+    }
+
     pub fn stage_weights(&mut self) -> Result<()> {
         if self.staged_host {
             return Ok(());
@@ -2068,7 +2081,7 @@ impl Executor {
         // placeholder skips a 2.6 GB memset for the weight segment — measured as 2.134s on the
         // batched-prefill session, which binds nothing precisely because its ALLOCATION is the
         // point and its bytes are not.
-        let reserve_only = self.bound.is_empty();
+        let reserve_only = !self.binds_resident();
         for i in 0..NUM_SEGMENTS {
             // A BORROWED segment is never staged or H2D'd by this session, so it gets the
             // placeholder rather than a zero-fill the width of the whole segment. ...but ONLY for
@@ -2524,7 +2537,7 @@ impl Executor {
         //    critical path. Then grow each seg_host to the device alloc's size (alignment pad,
         //    zero) so the H2D copies a full region. ──
         self.stage_weights()?;
-        let reserve_only = self.bound.is_empty();
+        let reserve_only = !self.binds_resident();
         for i in 0..NUM_SEGMENTS {
             // Same rule as the staging shadow: skip only what an alias replaces. Activation
             // segments still grow to the device extent, because this session fills them itself.
