@@ -127,11 +127,11 @@ MODELS_ALL=(
   "granite-4.1-8b=mlx-community/granite-4.1-8b-4bit:mlx-affine-b4-g32"                 # 5.2 GB, dense
   "granite-4.1-30b=mlx-community/granite-4.1-30b-4bit:mlx-affine-b4-g32"               # 18.0 GB, dense
 )
-# The default round is one model per class, sized to the Mac: the small set
-# below 64 GB of memory, the large set at 64 GB and above. --models small or
-# --models large names one; --models full runs both, where each fits. Each
-# run file records this table (config.classes) and the cut-off
-# (config.large_from_gb), and the page reads its overview's columns from them.
+# The default round is one model per class, the small set, on every Mac: a 64 GB Mac runs the same
+# models as a 36 GB one, so each column of the page is one model across every chip, and the full
+# run is the small set's length everywhere. --models large names the large set (64 GB only),
+# --models full runs both, where each fits. Each run file records this table (config.classes) and
+# the cut-off (config.large_from_gb), which now sizes only the grid's prompts (SCALE_GRID_INPUT_*).
 LARGE_GB=64
 CLASSES=(
   # class | small | large
@@ -224,6 +224,7 @@ mlx_parity_config() {
 }
 
 MODELS=()
+MODELS_GIVEN=0           # --models was passed: the run did not take the default set
 # Two kinds of run. By default a quick one, aimed at about 25 minutes (not yet
 # measured as it now runs):
 # scratchy alone, cold and warm, one rep, 64-token answers. The page
@@ -317,7 +318,7 @@ PERCENTILES="25,50,75,90,99"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --models)            IFS=',' read -r -a MODELS <<<"$2"; shift 2 ;;
+        --models)            IFS=',' read -r -a MODELS <<<"$2"; MODELS_GIVEN=1; shift 2 ;;
         --scenarios)         SCENARIOS="$2"; shift 2 ;;
         --reps)              REPS="$2"; shift 2 ;;
         --prime)             PRIME="$2"; shift 2 ;;
@@ -369,9 +370,9 @@ while [[ $# -gt 0 ]]; do
         *)                   echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
-# This Mac's set: the large models need 64 GB, the small ones are the round below that.
+# Every Mac runs the small set; its memory picks only the grid's prompts (below).
 MEM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
-if (( MEM_GB >= LARGE_GB )); then MODELS_DEFAULT="${MODELS_LARGE}"; else MODELS_DEFAULT="${MODELS_SMALL}"; fi
+MODELS_DEFAULT="${MODELS_SMALL}"   # the large set runs by name (--models large)
 if [[ -z "${SCALE_GRID_INPUT}" ]]; then
     if (( MEM_GB >= LARGE_GB )); then SCALE_GRID_INPUT="${SCALE_GRID_INPUT_LARGE}"; else SCALE_GRID_INPUT="${SCALE_GRID_INPUT_SMALL}"; fi
 fi
@@ -596,7 +597,7 @@ for row in "${ENGINE_ROWS[@]}"; do
 done
 PIN_PROBLEMS="$(printf '%s\n' ${pin_problems[@]+"${pin_problems[@]}"})"
 CLASS_TABLE="$(printf '%s\n' "${CLASSES[@]}")"
-export ENGINE_INFO PIN_PROBLEMS UNPINNED CLASS_TABLE LARGE_GB
+export ENGINE_INFO PIN_PROBLEMS UNPINNED CLASS_TABLE LARGE_GB MODELS_GIVEN
 export STARTED_UTC PERCENTILES PRIME_LAUNCHES INPUT_LEN OUTPUT_LEN WARM_REQUESTS SCENARIOS SCALING SCALE_AXES SCALE_CONC SCALE_INPUT SCALE_OUTPUT SCALE_GRID_INPUT \
        SCALE_GRID_OUTPUT SCALE_GRID_CONC SCALE_GRID_USERS_OUTPUT SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS SCALE_ROUNDS SCALE_REPEATS \
        MLX_PYTHON OLLAMA_BIN KV_CACHE_DTYPE SERVE_ARGS CELL_TIMEOUT_S CELL_HANG_TOK_S RESUME MODELS_FULL
@@ -638,8 +639,17 @@ json.dump({
              # overview columns.
              "classes": [dict(zip(("class", "small", "large"), row.split("|")))
                          for row in e["CLASS_TABLE"].splitlines()],
-             # The memory from which a Mac runs the large set.
+             # The memory from which a Mac's grid runs to 8192-token prompts (below it, 4096).
              "large_from_gb": int(e["LARGE_GB"]),
+             # The set every Mac runs by default, small, whatever its memory, recorded only by a
+             # run that took it (no --models): the page reads the overview's column models from the
+             # newest run that records a lineup, so a --models large, full or by-name run must not
+             # say small. None there, as in runs from before it, which took the large set from
+             # large_from_gb.
+             "default_set": None if e["MODELS_GIVEN"] == "1" else "small",
+             # The run named its models (--models): it took no default set, and the page takes the
+             # lineup's rule from the newest run that did.
+             "models_given": e["MODELS_GIVEN"] == "1",
              "cold_priming_launches": int(e["PRIME_LAUNCHES"]),
              "startup_request": {"input_len": int(e["INPUT_LEN"]), "output_len": int(e["OUTPUT_LEN"]),
                                  "warm_requests": int(e["WARM_REQUESTS"])},
@@ -871,6 +881,11 @@ footprint_bytes() { # pid -> bytes, or nothing if it has gone
     taskpolicy -b footprint -f bytes -p "$1" 2>/dev/null \
         | awk '{ for (i = 1; i < NF; i++) if ($i == "Footprint:") { print $(i + 1); exit } }' || true
 }
+# The Mac's thermal state as pmset reports it, one "Name = N" a line: nothing on a cool Mac (its
+# "No ... recorded" notes), a CPU speed limit and warning levels on a throttled one. Taken around
+# every repeat, so a cell measured on a throttled Mac can be told from one that was not.
+# A pmset that fails prints "unread" instead, so it is not taken for a cool Mac.
+therm_now() { pmset -g therm 2>/dev/null || echo unread; }
 mem_sampler() { # pid out
     local p b s
     exec >/dev/null; echo   # a refused log line in the forked buffer must not reach tree_pids (cleanup)
@@ -939,8 +954,9 @@ sys.exit(not j.get("completed") or any(j.get(k) for k in ("failed", "timed_out",
         echo "$(numbers "${out_json}") · kept (--resume)"
         return 0
     fi
-    local mem="${out_json%.json}.mem" sampler=""
+    local mem="${out_json%.json}.mem" sampler="" therm_before therm_after
     rm -f "${mem}"
+    therm_before="$(therm_now)"
     [[ -n "${srv}" ]] && { mem_sampler "${srv}" "${mem}" & sampler=$!; }
     # The cell's limit: the flat one, plus its answers decoded at a hang's rate, its users at once.
     local limit=$(( CELL_TIMEOUT_S + ((n + SCALE_WARMUPS + $6 - 1) / $6) * $5 / CELL_HANG_TOK_S ))
@@ -953,6 +969,7 @@ sys.exit(not j.get("completed") or any(j.get(k) for k in ("failed", "timed_out",
         --max-concurrency "$6" --temperature 0 --seed "${seed}" --num-warmups "${warmups}" \
         --percentile-metrics ttft,tpot,e2el --metric-percentiles "${PERCENTILES}" --save-detailed \
         --output-json "${out_json}" --disable-tqdm >>"${RAW}/cells-${stem}.log" 2>&1; } 2>/dev/null || rc=$?
+    therm_after="$(therm_now)"
     [[ -n "${sampler}" ]] && { kill "${sampler}" 2>/dev/null; wait "${sampler}" 2>/dev/null; } || true
     [[ -s "${mem}" && -f "${out_json}" ]] && python3 - "${out_json}" "${mem}" <<'PY' || true
 import json, statistics, sys
@@ -1010,6 +1027,21 @@ PY2
             echo "    ${why} (see ${RAW}/cells-${stem}.log)"
         fi
     fi
+    # Every repeat's file now exists, a failed or timed-out one's too: the Mac's thermal state
+    # around it goes in, so a cell measured on a throttled Mac can be told from one that was not.
+    [[ -f "${out_json}" ]] && python3 - "${out_json}" "${therm_before}" "${therm_after}" <<'PY' || true
+import json, re, sys
+p, before, after = sys.argv[1:4]
+def therm(text):
+    """pmset -g therm as numbers, each "Name = N" line: {} where it reports no warning, None where
+    pmset could not be read (therm_now's "unread")."""
+    if text.strip() == "unread":
+        return None
+    return {k.strip(): int(v) for k, v in re.findall(r"^\s*([A-Za-z0-9_ ]+?)\s*=\s*(\d+)\s*$", text, re.M)}
+j = json.load(open(p))
+j["thermal"] = {"before": therm(before), "after": therm(after)}
+json.dump(j, open(p, "w"), indent=2)
+PY
 }
 run_scale_cells() { # prefix restart-function full-length [axes]
     # full-length: 1 where the engine serves ignore_eos to full length (scratchy), so a short
@@ -1488,7 +1520,11 @@ KEEP = ["median_ttft_ms", "median_tpot_ms",
         # A cell the client never finished (--cell-timeout-s), so its requests count as failed.
         "timed_out",
         # A cell whose server answered with almost nothing (run_cell): no measurement.
-        "dead_server"]
+        "dead_server",
+        # The Mac's thermal state around the cell (run_rep): {} where pmset reports no warning, a
+        # CPU speed limit where the Mac was throttled. Over repeats, the first's before and the
+        # last's after (pooled).
+        "thermal"]
 CELL = re.compile(r"\.(conc|input|output|grid)-(\d+)(?:x(\d+))?(?:@(\d+))?\.json$")
 def load(name):
     p = os.path.join(raw, name)
@@ -1535,6 +1571,10 @@ def pooled(reps):
     for k in ("timed_out", "dead_server"):
         if any(j.get(k) for j in reps):
             m[k] = True
+    # The Mac's thermal state around the whole cell: before its first repeat, after its last.
+    if any("thermal" in j for j in reps):
+        m["thermal"] = {"before": (reps[0].get("thermal") or {}).get("before"),
+                        "after": (reps[-1].get("thermal") or {}).get("after")}
     return m
 grid_users = {int(x) for x in env["GRID_CONC_LIST"].split(",")}
 grid_inputs = {int(x) for x in env["SCALE_GRID_INPUT"].split(",") if x}
