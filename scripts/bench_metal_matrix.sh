@@ -20,6 +20,8 @@
 #   warm: send -> first token, median over unique prompts to a resident server
 #   peak RSS, major faults             scr bench startup --exec (per child, wait4)
 #   TTFT/TPOT/ITL p50+p99, tok/s       scr bench serve (warm, conc 1)
+#   energy: J per rail, Wh + avg/peak W scratchy-power-sampler (CLPC counters,
+#                                        1 Hz, whole run, all engines)
 #   prompt x answer x users grid       scr bench serve (1, 2, 4 users;
 #     (heat maps, every curve)           128 to 8192 in;
 #                                        64 out, --full adds 512 and 2048 at 1)
@@ -28,6 +30,8 @@
 #
 # Needs: passwordless `sudo purge` for the frozen rung (a sudoers rule for
 # /usr/sbin/purge; see the Metal bench skill), or pass --scenarios cold,warm.
+# Energy needs macOS 27+ (the sampler's CLPC counter ids are per-OS-release
+# constants; it refuses loudly on anything else and the run dies there).
 # Weights download on first use unless --offline.
 #
 # Scaling (--no-scaling skips it; --scale-axes picks from conc,input,output,grid):
@@ -718,6 +722,10 @@ kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "${c}"; done; kil
 cleanup() {
     exec >/dev/null; echo
     serve_down
+    # While the processes it measured are still ours to stop: folds the CSV and
+    # prints nothing (stdout is already gone); the happy path folds again, loudly,
+    # after the final summary — fold_power itself only runs once.
+    fold_power
     local c; for c in $(pgrep -P $$); do kill_tree "${c}"; done
     # A killed subshell orphans its children, so also stop whatever is on this run's port.
     pkill -TERM -f "bench (startup|serve) .*(--port ${PORT}|127\.0\.0\.1:${PORT})" 2>/dev/null || true
@@ -725,6 +733,56 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
+
+# Whole-run energy, one number. The workspace's own zero-dependency sampler
+# reads Apple's CLPC cpu/gpu/ane energy counters (IOReport, no root) once a
+# second into RAW; fold_power sums them into the run JSON at the end. It runs
+# from before the first build to after the last server is down, so the number
+# covers everything the run cost — the same window for every engine.
+POWER_LOG="${RAW}/power.csv"
+POWER_FOLDED=0
+fold_power() { # stop the sampler and fold its CSV into the run JSON, once
+    [[ ${POWER_FOLDED} -eq 0 && -n "${POWER_PID:-}" ]] || return 0
+    POWER_FOLDED=1
+    { kill -TERM "${POWER_PID}" 2>/dev/null || true; wait "${POWER_PID}" 2>/dev/null || true; } 2>/dev/null
+    [[ -s "${POWER_LOG}" ]] || die "power sampler wrote nothing to ${POWER_LOG} (see ${RAW}/power-sampler.log)"
+    python3 - "${JSON}" "${POWER_LOG}" <<'PY'
+import csv, json, sys
+js, power_log = sys.argv[1], sys.argv[2]
+rows = [r for r in csv.reader(open(power_log)) if len(r) == 4]
+cpu = sum(float(r[1]) for r in rows)
+gpu = sum(float(r[2]) for r in rows)
+ane = sum(float(r[3]) for r in rows)
+t0, t1 = float(rows[0][0]), float(rows[-1][0])
+window = t1 - t0
+# Peak power: the highest single interval's energy over its own duration.
+peak = max((float(r[1]) + float(r[2]) + float(r[3])) / max(float(rows[i + 1][0]) - float(rows[i][0]), 1e-9)
+           for i, r in enumerate(rows[:-1])) if len(rows) > 1 else 0.0
+soc = cpu + gpu + ane
+d = json.load(open(js))
+d["power"] = {
+    "source": "scratchy-power-sampler (Apple CLPC energy counters, IOReport)",
+    "csv": power_log,
+    "samples": len(rows),
+    "window_s": round(window, 1),
+    "cpu_j": round(cpu, 1), "gpu_j": round(gpu, 1), "ane_j": round(ane, 1),
+    "soc_j": round(soc, 1), "soc_wh": round(soc / 3600, 3),
+    "soc_avg_w": round(soc / window, 2) if window else None,
+    "soc_peak_w": round(peak, 2),
+}
+json.dump(d, open(js, "w"), indent=2)
+print(f"power   : {soc / 3600:.2f} Wh soc ({cpu / 3600:.2f} cpu, {gpu / 3600:.2f} gpu, {ane / 3600:.2f} ane)"
+      f" over {window:.0f}s, peak {peak:.1f} W -> {js}")
+PY
+}
+cargo build --release -p scratchy-power-sampler >"${RAW}/power-build.log" 2>&1 \
+    || die "scratchy-power-sampler build failed: see ${RAW}/power-build.log"
+"${ROOT}/target/release/scratchy-power-sampler" --interval-ms 1000 \
+    >"${POWER_LOG}" 2>"${RAW}/power-sampler.log" &
+POWER_PID=$!
+sleep 1
+kill -0 "${POWER_PID}" 2>/dev/null \
+    || die "power sampler died at startup: $(tail -2 "${RAW}/power-sampler.log" 2>/dev/null)"
 
 max_of() { local m=0 x; IFS=',' read -r -a _xs <<<"$1"; for x in "${_xs[@]}"; do (( x > m )) && m=${x}; done; echo "${m}"; }
 
@@ -1644,6 +1702,7 @@ done
 
 echo; echo "================================================================"
 summary
+fold_power
 
 # A model scratchy never served must fail the run, not sit in the table as a
 # row of dashes: a preset that matches no checkpoint looks exactly like that.
