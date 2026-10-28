@@ -3113,7 +3113,7 @@ mod tests {
         use super::numbers::Engine;
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/data/metal/apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"
+            "/data/metal/history/apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"
         );
         let text = std::fs::read_to_string(path).expect("the M3 Pro's full run");
         let mut quick: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -3225,7 +3225,12 @@ mod tests {
             let p = format!("{}/data/metal/{name}", env!("CARGO_MANIFEST_DIR"));
             serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
         };
-        let mut base = read("apple-m3-pro-2026-10-21T145041Z-a7820fbc.json");
+        // The M3 Pro's 2026-10-21 run, the round's first full run, a newer one replaced.
+        let old = |name: &str| -> serde_json::Value {
+            let p = format!("{}/data/metal/history/{name}", env!("CARGO_MANIFEST_DIR"));
+            serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+        };
+        let mut base = old("apple-m3-pro-2026-10-21T145041Z-a7820fbc.json");
         base["machine"]["chip"] = "Apple M5".into();
         base["machine"]["memory_gb"] = 32.into();
         // Below 64 GB the grid runs 1, 2 and 4 users; the 36 GB M3 Pro's run is from before that.
@@ -3233,7 +3238,7 @@ mod tests {
         base["generated_utc"] = "2026-10-26T20:05:50Z".into();
         let runs: Vec<Run> = [
             base,
-            read("apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"),
+            old("apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"),
             read("apple-m4-max-2026-10-13T221900Z-2683d8c3.json"),
             read("apple-m5-max-2026-10-14T111352Z-987b06a2.json"),
         ]
@@ -3324,7 +3329,9 @@ mod tests {
         use super::numbers::{DASH, Engine, FAILED, Metric, cfmt, failed, failed_note, partial};
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut runs: Vec<Run> = Vec::new();
-        for dir in [DATA, TESTDATA] {
+        // Every published run: the page's, the ones a newer run replaced (history/), and the
+        // earlier rounds only tests read.
+        for dir in [DATA, "data/metal/history", TESTDATA] {
             let mut files: Vec<_> = (std::fs::read_dir(root.join(dir)).expect(dir))
                 .map(|e| e.unwrap().path())
                 .filter(|p| p.extension().is_some_and(|x| x == "json"))
@@ -3431,7 +3438,7 @@ mod tests {
         use super::numbers::{Metric, failed_note, timing};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/data/metal/apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"
+            "/data/metal/history/apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"
         );
         let mut json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
@@ -3548,7 +3555,7 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let file = root
             .join(DATA)
-            .join("apple-m3-pro-2026-10-21T145041Z-a7820fbc.json");
+            .join("history/apple-m3-pro-2026-10-21T145041Z-a7820fbc.json");
         let mut json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&file).expect("a published run"))
                 .expect("json");
