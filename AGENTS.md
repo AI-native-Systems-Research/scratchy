@@ -35,7 +35,8 @@ Invariants, model-crate features, build and CI gates: see `CLAUDE.md`. This file
 | Arch build pipeline / feature tables | `crates/models/arch/scratchy-forwards.rs` | `CUDA_ONLY`/`METAL_ONLY`/`SPYRE_CAPABLE` |
 | Quant preset | `crates/models/quantization/presets/`, `configs/<arch>/quantizations.json` | |
 | Forward codegen | `crates/compiler/macros/src/` | quick check: `scripts/emit-arch.sh` |
-| New opcode | `crates/compiler/ir/src/lib.rs` `Instruction` | + one emitter arm per target |
+| New tape op (metal/spyre) | `crates/compiler/subtile/src/subtile_ir.rs` `SubOp` + one row in `ops.rs` | then the exhaustive matches in metal `compiler/src/steps_from_tape.rs`, `src/op_abi.rs` and spyre `lower_subtile_tape_to_{ktir,superdsc}.rs`; the build lists any you missed |
+| New CUDA interpreter op | `crates/compiler/ir/src/lib.rs` `Instruction` | + its arm in `crates/targets/cuda/src/eval.rs`, emitted by `crates/compiler/macros/src/impl_lib.rs` |
 | Shared passes (reroll, colouring, KV codec) | `crates/compiler/subtile/` | target ABI = const tables |
 | Metal lowering / runtime / shaders | `crates/targets/metal/src/tape/`, `src/interpreter/metal/`, `shaders/` | |
 | Metal macro-time tapes | `crates/targets/metal/compiler/` | |
@@ -51,7 +52,8 @@ Invariants, model-crate features, build and CI gates: see `CLAUDE.md`. This file
 | Symbol | Type | Location | Role |
 |--------|------|----------|------|
 | `compile_carrier` | fn | crates/compiler/macros/src/lib.rs | pipeline entry, called from the models build script |
-| `Instruction` | enum | crates/compiler/ir/src/lib.rs | closed opcode set shared by every target |
+| `Instruction` | enum | crates/compiler/ir/src/lib.rs | closed opcode set of the CUDA interpreter (`eval.rs`) |
+| `SubOp` | enum | crates/compiler/subtile/src/subtile_ir.rs | op vocabulary metal and spyre lower; facts in `ops.rs` |
 | `try_load` / `ScratchyArchRegistration` | fn/struct | crates/compiler/src/arch_registry.rs | inventory-based arch loading |
 | `reroll_subtile_tape` | fn | crates/compiler/subtile/src/subtile_tape.rs | shared layer reroll |
 | `lower_subtile_tape_to_metal` | fn | crates/targets/metal/src/tape/lowering.rs | SubtileTape -> LoweredMetalTape |

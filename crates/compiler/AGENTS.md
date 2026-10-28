@@ -23,7 +23,7 @@ compiler/
 ## WHERE TO LOOK
 | Task | Location |
 |------|----------|
-| New opcode | `ir/src/lib.rs` `Instruction` (closed, scalar-only fields) |
+| New CUDA interpreter op | `ir/src/lib.rs` `Instruction` (closed, scalar-only fields). Metal/spyre tape ops are `SubOp` in `subtile/` |
 | KV offsets / layer stride | `ir/src/lib.rs` `KvOffsets` - stride is NOT always 1 |
 | Weight trait emitted code impls | `src/dispatcher.rs` `ScratchyWeights`, `BoundWeight`, `HfFingerprint` |
 | Metal chain/followup surface | `src/dispatcher.rs` `MetalForwardOnto`, `MetalChainBody` (cfg metal) |
@@ -44,7 +44,7 @@ compiler/
 
 ## ANTI-PATTERNS
 - Do not add a dep from here to the macro crate or to `scratchy-target-metal`.
-- Do not widen `Instruction` fields beyond scalars (both targets and the macro share it).
+- Do not widen `Instruction` fields beyond scalars (it must compile under every feature set, and the macro emits it as const data).
 
 ## COMMANDS
 ```bash
