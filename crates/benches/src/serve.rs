@@ -35,7 +35,7 @@ struct RequestResult {
     e2el: f64,
     /// Number of output tokens generated.
     output_tokens: usize,
-    /// SSE chunks that carried text (what the timing clocks saw); 1 for a
+    /// SSE chunks that carried output (`is_progress`: what the timing clocks saw); 1 for a
     /// request whose only chunk was an empty final one (see `is_unstreamed`).
     chunks: usize,
     /// Timestamp (seconds since benchmark start) when request was sent.
@@ -256,13 +256,14 @@ fn send_body(
                 if let Some(data) = line.strip_prefix("data: ")
                     && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data)
                 {
-                    // Python's TTFT/ITL logic, counting only chunks that carry text:
-                    // - First chunk with text → TTFT
-                    // - Every subsequent chunk with text → ITL
-                    // - `most_recent_timestamp` updated on every chunk with text
-                    // An empty chunk is not a token: oMLX streams empty keepalive
-                    // chunks while it prefills, and llama.cpp closes with one, so
-                    // timing any chunk put TTFT before the prefill was done.
+                    // Python's TTFT/ITL logic, counting every chunk that carries output
+                    // (`is_progress`), text or not:
+                    // - First such chunk → TTFT
+                    // - Every subsequent one → ITL
+                    // - `most_recent_timestamp` updated on every one
+                    // Not only those with text: oMLX streams gpt-oss's reasoning as
+                    // chunks whose text it strips, so a text-only clock started at the
+                    // answer's end (TTFT 1.65 s where its first chunk came at 0.2 s).
                     if has_choices(&parsed) {
                         last_choices_time = Some(Instant::now());
                     }
@@ -275,9 +276,11 @@ fn send_body(
                         prompt_tokens = Some(n as usize);
                     }
                     if let Some(text) = chunk_text(&parsed) {
+                        generated_text.push_str(text);
+                    }
+                    if is_progress(&parsed) {
                         let now = Instant::now();
                         chunks += 1;
-                        generated_text.push_str(text);
                         if first_token_time.is_none() {
                             first_token_time = Some(now);
                         } else {
@@ -370,6 +373,18 @@ fn chunk_failure(chunk: &serde_json::Value) -> Option<String> {
         .filter_map(|c| c["finish_reason"].as_str())
         .find(|r| matches!(*r, "abort" | "error"))
         .map(|r| format!("finish_reason {r}"))
+}
+
+/// Whether a streamed chunk is output: it carries a choice, and is neither a keepalive (oMLX's,
+/// `"model": "keepalive"`, sent while it prefills) nor an empty closing chunk (llama.cpp ends
+/// with one: no text, a `finish_reason`). Its text may be empty: oMLX streams gpt-oss's
+/// reasoning tokens as chunks with their text stripped, and they are still the decode.
+fn is_progress(chunk: &serde_json::Value) -> bool {
+    if !has_choices(chunk) || chunk["model"] == "keepalive" {
+        return false;
+    }
+    let closing = chunk["choices"][0]["finish_reason"].is_string();
+    !(closing && chunk_text(chunk).is_none())
 }
 
 /// The generated text a streamed chunk carries: `text` on the completions API;
@@ -2423,6 +2438,34 @@ mod tests {
                 "chunks": [3, 0],
             })
         );
+    }
+
+    #[test]
+    fn output_chunks_count_with_or_without_text_and_keepalives_and_closers_do_not() {
+        let c = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        // Text: output, as before.
+        assert!(is_progress(&c(
+            r#"{"model":"m","choices":[{"text":"Hi","finish_reason":null}]}"#
+        )));
+        // oMLX's gpt-oss reasoning: its text stripped, still the decode.
+        assert!(is_progress(&c(
+            r#"{"model":"gpt-oss","choices":[{"text":"","finish_reason":null}]}"#
+        )));
+        // oMLX's keepalive while it prefills: not output.
+        assert!(!is_progress(&c(
+            r#"{"model":"keepalive","choices":[{"text":"","finish_reason":null}]}"#
+        )));
+        // llama.cpp's empty closing chunk, and a usage-only chunk: not output.
+        assert!(!is_progress(&c(
+            r#"{"model":"m","choices":[{"text":"","finish_reason":"stop"}]}"#
+        )));
+        assert!(!is_progress(&c(
+            r#"{"choices":[],"usage":{"completion_tokens":64}}"#
+        )));
+        // A last token that comes with its finish_reason is output.
+        assert!(is_progress(&c(
+            r#"{"model":"m","choices":[{"text":".","finish_reason":"length"}]}"#
+        )));
     }
 
     #[test]
