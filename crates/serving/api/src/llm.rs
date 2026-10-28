@@ -1631,6 +1631,8 @@ mod tests {
                 max_new_tokens: None,
             },
             interrupt: Arc::default(),
+            // No backend's sampling check: the scripted executor takes any sampling.
+            backend: None,
         }
     }
 
