@@ -564,6 +564,9 @@ pub struct Cell {
     /// The answer tokens its requests delivered; None in runs from before
     /// the run file kept it.
     pub total_output_tokens: Option<u64>,
+    /// How many requests the engine decoded at once, on average while any was decoding
+    /// (`bench serve`'s `mean_decode_concurrency`); None in runs from before it was recorded.
+    pub decode_users: Option<f64>,
     /// Whether the server it measured had stopped answering, in a run from before the bench
     /// counted that itself ([`Run::mark_dead`]).
     pub dead: bool,
@@ -635,6 +638,8 @@ struct RawCell {
     #[serde(default)]
     total_output_tokens: Option<u64>,
     #[serde(default)]
+    mean_decode_concurrency: Option<f64>,
+    #[serde(default)]
     timed_out: bool,
     #[serde(default)]
     dead_server: bool,
@@ -673,6 +678,7 @@ impl TryFrom<RawCell> for Cell {
             server_mem_peak_mib: c.server_mem_peak_mib,
             users: c.conc,
             total_output_tokens: c.total_output_tokens,
+            decode_users: c.mean_decode_concurrency,
             dead: false,
             mem_below_weights: false,
             timed_out: c.timed_out,

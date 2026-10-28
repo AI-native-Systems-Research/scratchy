@@ -286,6 +286,8 @@ pub const PARTIAL: &str = "†";
 pub const FAILED: &str = "‡";
 /// Marks any number from a cell whose answers came back short of the tokens asked for.
 pub const SHORT: &str = "§";
+/// Marks any number from a cell where the engine decoded fewer users at once than were offered.
+pub const QUEUED: &str = "¶";
 /// Stands in for a peak RSS below the model's own weights ([`peak_rss`]).
 pub const BELOW_WEIGHTS: &str = "below weights";
 
@@ -431,7 +433,26 @@ pub fn marks(c: Option<&Cell>, metric: Metric) -> String {
     if short(c).is_some() {
         m += SHORT;
     }
+    if queued(c).is_some() {
+        m += QUEUED;
+    }
     m
+}
+
+/// How many users a cell's engine decoded at once, where that fell half a user or more short of
+/// the users offered: it held requests back, so its TPOT is a smaller batch's than the users
+/// count says. A batch of 2 reads about 1.9 for its ramp-up and drain; a queue of 2 reads 1.0.
+pub fn queued(c: Option<&Cell>) -> Option<f64> {
+    let c = c?;
+    let (users, got) = (f64::from(c.users?), c.decode_users?);
+    (users > 1.0 && got <= users - 0.5).then_some(got)
+}
+
+pub fn queued_note(c: Option<&Cell>) -> String {
+    match (queued(c), c.and_then(|c| c.users)) {
+        (Some(got), Some(users)) => format!("decoded {got:.1} of {users} users at once"),
+        _ => String::new(),
+    }
 }
 
 /// The share of the answer tokens asked for that a cell delivered, where its answers came back
@@ -461,6 +482,9 @@ pub fn marks_note(c: Option<&Cell>, metric: Metric) -> String {
     if short(c).is_some() {
         parts.push(short_note(c));
     }
+    if queued(c).is_some() {
+        parts.push(queued_note(c));
+    }
     parts.join("; ")
 }
 
@@ -487,3 +511,35 @@ pub fn cfmt(c: Option<&Cell>, metric: Metric) -> String {
 /// Run-to-run spread on one machine at one commit: two M1 Max runs of af009bf1
 /// agreed within about 2%, so a smaller change is noise, not a result.
 pub const NOISE: f64 = 0.03;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cell(users: u32, decode_users: Option<f64>) -> Cell {
+        serde_json::from_value(serde_json::json!({
+            "axis": "grid", "rung": "1024x64", "conc": users,
+            "median_ttft_ms": 900.0, "median_tpot_ms": 20.0, "output_throughput": 50.0,
+            "completed": 12, "unstreamed_requests": 0,
+            "mean_decode_concurrency": decode_users,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_queue_is_marked_and_a_batch_is_not() {
+        // A batch of 2 reads under 2 for its ramp-up and drain, and is no queue.
+        assert_eq!(queued(Some(&cell(2, Some(1.9)))), None);
+        assert!(!marks(Some(&cell(2, Some(1.9))), Metric::Tpot).contains(QUEUED));
+        // 4 offered, one decoded at a time.
+        assert_eq!(queued(Some(&cell(4, Some(1.0)))), Some(1.0));
+        assert!(marks(Some(&cell(4, Some(1.0))), Metric::Tpot).contains(QUEUED));
+        assert_eq!(
+            queued_note(Some(&cell(4, Some(1.0)))),
+            "decoded 1.0 of 4 users at once"
+        );
+        // One user is never a queue, and a run from before the metric says nothing.
+        assert_eq!(queued(Some(&cell(1, Some(1.0)))), None);
+        assert_eq!(queued(Some(&cell(4, None))), None);
+    }
+}

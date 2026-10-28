@@ -31,8 +31,9 @@ use crate::charts::{
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab};
 use data::{At, Bytes, Cell, Model, Run, Scenario};
 use numbers::{
-    BELOW_WEIGHTS, DASH, Engine, FAILED, Metric, NO_STREAM, NOISE, SHORT, Startup, cfmt,
-    failed_note, fmt, lfmt, marks, marks_note, med, peak_rss, rss_fmt, served, timing,
+    BELOW_WEIGHTS, DASH, Engine, FAILED, Metric, NO_STREAM, NOISE, QUEUED, SHORT, Startup, cfmt,
+    failed_note, fmt, lfmt, marks, marks_note, med, peak_rss, queued, queued_note, rss_fmt, served,
+    timing,
 };
 
 /// The run files, relative to site/; copied to the same place under _site/,
@@ -622,7 +623,9 @@ fn timing_info() -> Element {
             strong { "{SHORT}" } ": the answers came back short of the tokens asked for. Every request asks the \
                        engine to ignore EOS and answer to length; oMLX, ollama and sometimes mlx-lm stop at EOS \
                        anyway, so the cell measured less decode than its label says, which flatters tok/s (the \
-                       table views say what share)."
+                       table views say what share). "
+            strong { "{QUEUED}" } ": the engine decoded fewer users at once than were offered, holding the \
+                       rest back, so its TPOT is a smaller batch's; the TPOT comparison is left blank there."
         },
     )
 }
@@ -1372,6 +1375,14 @@ impl<'a> ShapeGrid<'a> {
             self.at(Some(rival), rung),
         );
         let s = timing(cs, metric);
+        // A TPOT from an engine that queued its users is a smaller batch's: no like-for-like ratio.
+        if metric == Metric::Tpot
+            && let Some((c, name)) = [(cs, "scratchy"), (cr, rival.label())]
+                .into_iter()
+                .find(|(c, _)| queued(*c).is_some())
+        {
+            return (None, format!("{name}: {}", queued_note(c)));
+        }
         match metric.faster(s, timing(cr, metric)) {
             Some(r) => (Some(r), format!("×{r:.2}{}", mark(metric, &[cs, cr]))),
             None if s.is_none() => (None, why(cs, "scratchy")),

@@ -627,6 +627,7 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
     let peak_output_tps = compute_peak_output_tps(&successful, total_time);
     // Peak concurrent requests.
     let peak_concurrent = compute_peak_concurrent(&successful);
+    let decode_concurrency = mean_decode_concurrency(&timed);
 
     let selected_metrics: Vec<&str> = args.percentile_metrics.split(',').collect();
     let selected_pcts: Vec<f64> = args
@@ -678,6 +679,9 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
         "{:<40} {:<10}",
         "Peak concurrent requests:", peak_concurrent
     );
+    if let Some(c) = decode_concurrency {
+        println!("{:<40} {:<10.2}", "Mean decode concurrency:", c);
+    }
     if num_unstreamed > 0 {
         println!(
             "{:<40} {:<10}",
@@ -747,6 +751,7 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
         "total_token_throughput": (total_input_tokens + total_output_tokens) as f64 / total_time,
         "peak_output_throughput": peak_output_tps,
         "peak_concurrent_requests": peak_concurrent,
+        "mean_decode_concurrency": decode_concurrency,
         "unstreamed_requests": num_unstreamed,
     });
     let obj = json.as_object_mut().unwrap();
@@ -1901,9 +1906,66 @@ fn compute_peak_concurrent(results: &[&RequestResult]) -> usize {
     peak as usize
 }
 
+/// How many requests were decoding at once, on average over the time any was: each timed
+/// request decodes from its first token to its last. `--max-concurrency` only offers a users
+/// count; a server that admits one prefill at a time, or holds requests back under memory
+/// pressure, serves fewer, and its TPOT is then a smaller batch's. `None` with nothing timed.
+fn mean_decode_concurrency(results: &[&RequestResult]) -> Option<f64> {
+    let mut spans: Vec<(f64, f64)> = (results.iter())
+        .map(|r| (r.start_time + r.ttft, r.start_time + r.e2el))
+        .filter(|(a, b)| b > a)
+        .collect();
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let busy: f64 = spans.iter().map(|(a, b)| b - a).sum();
+    let mut covered = 0.0;
+    let mut open: Option<(f64, f64)> = None;
+    for (a, b) in spans {
+        open = match open {
+            Some((oa, ob)) if a <= ob => Some((oa, ob.max(b))),
+            Some((oa, ob)) => {
+                covered += ob - oa;
+                Some((a, b))
+            }
+            None => Some((a, b)),
+        };
+    }
+    covered += open.map_or(0.0, |(a, b)| b - a);
+    (covered > 0.0).then(|| busy / covered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decoding(start_time: f64, ttft: f64, e2el: f64) -> RequestResult {
+        RequestResult {
+            ttft,
+            itl: Vec::new(),
+            e2el,
+            output_tokens: 2,
+            chunks: 2,
+            start_time,
+            success: true,
+            generated_text: String::new(),
+            error: String::new(),
+            cached_tokens: None,
+            prompt_tokens: None,
+        }
+    }
+
+    #[test]
+    fn decode_concurrency_tells_a_batch_from_a_queue() {
+        // Two users offered, both decoding over the same second: a batch of 2.
+        let (a, b) = (decoding(0.0, 1.0, 2.0), decoding(0.0, 1.0, 2.0));
+        assert_eq!(mean_decode_concurrency(&[&a, &b]), Some(2.0));
+        // Two users offered, the second held back until the first finished: a batch of 1.
+        let (a, b) = (decoding(0.0, 1.0, 2.0), decoding(0.0, 3.0, 4.0));
+        assert_eq!(mean_decode_concurrency(&[&a, &b]), Some(1.0));
+        // Half overlapped: 3 s of decoding over 2 s covered.
+        let (a, b) = (decoding(0.0, 0.0, 2.0), decoding(0.0, 1.0, 2.0));
+        assert_eq!(mean_decode_concurrency(&[&a, &b]), Some(1.5));
+        assert_eq!(mean_decode_concurrency(&[]), None);
+    }
 
     #[test]
     fn usage_keeps_the_largest_count_from_any_chunk() {
