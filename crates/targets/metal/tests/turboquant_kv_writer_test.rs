@@ -265,16 +265,12 @@ fn run(c: &Case, fused: bool) -> Option<Written> {
     let slots = shared(&device, c.slots);
 
     let quant = PolarQuantizer::new(hd, c.bits, SEED);
-    let boundaries: Vec<f32> = quant
-        .centroids()
-        .windows(2)
-        .map(|w| (w[0] + w[1]) / 2.0)
-        .collect();
+    let encode_table = quant.encode_table();
     let (signs, centroids) = (
         shared(&device, quant.signs()),
         shared(&device, quant.centroids()),
     );
-    let bounds = shared(&device, &boundaries);
+    let bounds = shared(&device, &encode_table);
     let n_rows = N_BLOCKS * BLOCK_SIZE * nkv;
     let pdim = packed_dim(hd, c.bits);
     // Stale codes and norms in every row (a reused block): a row neither run writes stays as is.
