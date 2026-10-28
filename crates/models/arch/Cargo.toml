@@ -23,12 +23,8 @@ default = []
 # the build script to emit it. Vision arches also pull their shared text decoder + the
 # vision host crate. (The build script scans dsl/*.py.)
 arch-commandr = []
-arch-deepseek-v2 = []
-arch-deepseek-v3 = []
-arch-deepseek-v3-flat = []
 arch-gemma2 = []
 arch-gemma3 = []
-arch-gemma3-mm = ["arch-gemma3", "vision", "dep:scratchy-vision", "dep:half", "scratchy-forward-compiler/vision", "scratchy-target-metal?/vision"]
 arch-gemma4 = []
 arch-gemma4-moe = []
 arch-glm4-moe = []
@@ -62,12 +58,8 @@ vision = ["scratchy-forward-compiler/vision"]
 
 all-arches = [
     "arch-commandr",
-    "arch-deepseek-v2",
-    "arch-deepseek-v3",
-    "arch-deepseek-v3-flat",
     "arch-gemma2",
     "arch-gemma3",
-    "arch-gemma3-mm",
     "arch-gemma4",
     "arch-gemma4-moe",
     "arch-glm4-moe",
@@ -125,20 +117,6 @@ all-arches = [
 "c4ai-command-r-v01-parity-tiny" = ["arch-commandr"]
 "command-r-1-layer" = ["arch-commandr"]
 
-# deepseek-v2 (1 configs)
-"deepseek-v2-lite" = ["arch-deepseek-v2"]
-"deepseek-v2-lite-parity-tiny" = ["arch-deepseek-v2"]
-
-# deepseek-v3 (4 configs)
-"deepseek-v3-academic-9b-fp8-block" = ["arch-deepseek-v3"]
-"deepseek-v3-academic-9b" = ["arch-deepseek-v3"]
-"deepseek-v3-tiny" = ["arch-deepseek-v3"]
-"kimi-k2-tiny" = ["arch-deepseek-v3"]
-
-# deepseek-v3-flat (2 configs)
-"moonlight-16b-a3b-instruct-fp8-block" = ["arch-deepseek-v3-flat"]
-"moonlight-16b-a3b-instruct" = ["arch-deepseek-v3-flat"]
-
 # gemma2 (3 configs)
 "gemma2-27b" = ["arch-gemma2"]
 "gemma2-27b-parity-tiny" = ["arch-gemma2"]
@@ -147,16 +125,10 @@ all-arches = [
 
 # gemma3 (4 configs)
 "gemma-3-12b-it-parity-tiny" = ["arch-gemma3"]
-"gemma-3-12b-it-text-only" = ["arch-gemma3"]
+"gemma-3-12b-it" = ["arch-gemma3"]
 "gemma-3-1b-it" = ["arch-gemma3"]
-"gemma-3-27b-it-text-only" = ["arch-gemma3"]
-"gemma-3-4b-it-text-only" = ["arch-gemma3"]
-
-# gemma3-mm (3 configs)
-"gemma-3-12b-it" = ["arch-gemma3-mm"]
-"gemma-3-27b-it" = ["arch-gemma3-mm"]
-"gemma-3-4b-it" = ["arch-gemma3-mm"]
-"gemma-3-4b-it-parity-tiny" = ["arch-gemma3-mm"]
+"gemma-3-27b-it" = ["arch-gemma3"]
+"gemma-3-4b-it" = ["arch-gemma3"]
 
 # gemma4 (2 configs)
 "gemma-4-12b-it" = ["arch-gemma4"]
@@ -344,20 +316,6 @@ all-arches = [
     "c4ai-command-r-v01-parity-tiny",
     "command-r-1-layer",
 ]
-"deepseek-v2" = [
-    "deepseek-v2-lite",
-    "deepseek-v2-lite-parity-tiny",
-]
-"deepseek-v3" = [
-    "deepseek-v3-academic-9b-fp8-block",
-    "deepseek-v3-academic-9b",
-    "deepseek-v3-tiny",
-    "kimi-k2-tiny",
-]
-"deepseek-v3-flat" = [
-    "moonlight-16b-a3b-instruct-fp8-block",
-    "moonlight-16b-a3b-instruct",
-]
 "gemma2" = [
     "gemma2-27b",
     "gemma2-27b-parity-tiny",
@@ -366,16 +324,10 @@ all-arches = [
 ]
 "gemma3" = [
     "gemma-3-12b-it-parity-tiny",
-    "gemma-3-12b-it-text-only",
-    "gemma-3-1b-it",
-    "gemma-3-27b-it-text-only",
-    "gemma-3-4b-it-text-only",
-]
-"gemma3-mm" = [
     "gemma-3-12b-it",
+    "gemma-3-1b-it",
     "gemma-3-27b-it",
     "gemma-3-4b-it",
-    "gemma-3-4b-it-parity-tiny",
 ]
 "gemma4" = [
     "gemma-4-12b-it",
@@ -559,27 +511,15 @@ all = [
     "c4ai-command-r-v01",
     "c4ai-command-r-v01-parity-tiny",
     "command-r-1-layer",
-    "deepseek-v2-lite",
-    "deepseek-v2-lite-parity-tiny",
-    "deepseek-v3-academic-9b-fp8-block",
-    "deepseek-v3-academic-9b",
-    "deepseek-v3-tiny",
-    "kimi-k2-tiny",
-    "moonlight-16b-a3b-instruct-fp8-block",
-    "moonlight-16b-a3b-instruct",
     "gemma2-27b",
     "gemma2-27b-parity-tiny",
     "gemma2-2b",
     "gemma2-9b",
     "gemma-3-12b-it-parity-tiny",
-    "gemma-3-12b-it-text-only",
-    "gemma-3-1b-it",
-    "gemma-3-27b-it-text-only",
-    "gemma-3-4b-it-text-only",
     "gemma-3-12b-it",
+    "gemma-3-1b-it",
     "gemma-3-27b-it",
     "gemma-3-4b-it",
-    "gemma-3-4b-it-parity-tiny",
     "gemma-4-12b-it",
     "gemma-4-12b-it-parity-tiny",
     "gemma-4-12b-it-parity-tiny-allglobal",
@@ -740,25 +680,23 @@ mtp = ["mtp-heads"]
 # The build-dep pipeline lib gets the backend so its emit matches; the runtime
 # compiler + target crates get it so the emitted code compiles; quant defaults
 # ride the backend.
-cuda = [
-    "scratchy-forward-compiler-macro/cuda",
-    "scratchy-forward-compiler/cuda",
-    "scratchy-target-cuda/cuda",
-    "scratchy-vision?/cuda",
-]
 metal = [
     "scratchy-forward-compiler-macro/metal",
     "scratchy-forward-compiler/metal",
     "dep:scratchy-target-metal",
     "scratchy-vision?/metal",
 ]
-nccl = [
-    "cuda",
-    "scratchy-forward-compiler-macro/nccl",
-    "scratchy-forward-compiler/nccl",
-    "scratchy-target-cuda/nccl",
-    "scratchy-vision?/nccl",
+# NVIDIA CUDA. Builds the arches `CUDA_CAPABLE` in scratchy-forwards.rs lists, each model with its
+# per-bucket `static` CUDA prefill tapes (`CUDA_TAPES`); the build script refuses any other arch by
+# name. Toolchain-free: no nvcc, no GPU.
+cuda = [
+    "scratchy-forward-compiler-macro/cuda",
+    "scratchy-forward-compiler/cuda",
+    "dep:scratchy-target-cuda",
 ]
+# `cuda` plus the kernels and the runtime that plays a tape (`scratchy-target-cuda`'s `nvcc`): needs
+# nvcc from CUDA 12.8+ on PATH to build, and an sm_90 GPU (H100) to run the tests that use it.
+nvcc = ["cuda", "scratchy-target-cuda/nvcc"]
 # A CARD: the macro compiles the device image from the bundle's KTIR at bake time.
 spyre-hw = ["spyre", "scratchy-forward-compiler-macro/spyre-hw"]
 # THE EMULATOR + the bake-time numeric gate (see the macro crate's `spyre-emu`):
@@ -791,9 +729,9 @@ hf-completions = ["dep:ureq"]
 scratchy-layers = { path = "../../layers" }
 scratchy-quantizations = { path = "../quantization" }
 scratchy-forward-compiler = { path = "../../compiler" }
-scratchy-target-cuda = { path = "../../targets/cuda", optional = true }
 scratchy-target-metal = { path = "../../targets/metal", optional = true }
 scratchy-target-spyre = { path = "../../targets/spyre", optional = true }
+scratchy-target-cuda = { path = "../../targets/cuda", optional = true }
 scratchy-vision = { path = "../vision", optional = true }
 half = { workspace = true, optional = true }
 anyhow = { workspace = true }
@@ -830,6 +768,19 @@ rayon = { workspace = true }
 # the build script at all and cannot reach the network even by accident.
 ureq = { workspace = true, optional = true }
 
+[dev-dependencies]
+# tests/cuda_tapes.rs and tests/cuda_prefill.rs: the canonicals `#[forward]` hands the
+# target-emitter seam (`target_model_inputs`), recaptured to check the emitted tapes against what
+# CUDA's compiler lowers from them, and the cuda target's own test helpers (`#[path]`, not a copy:
+# `chains.rs`, `numerics.rs`), which name these crates.
+scratchy-forward-compiler-macro = { path = "../../compiler/macros" }
+scratchy-subtile = { path = "../../compiler/subtile" }
+scratchy-target-cuda-compiler = { path = "../../targets/cuda/compiler" }
+half = { workspace = true }
+# tests/cuda_hf_parity.rs reads the HF reference's `meta.json` and `greedy_<p>.json` goldens. It
+# runs on Linux (the H100), so not under the macOS-only section below.
+serde_json = { workspace = true }
+
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLAllocation", "MTLBuffer", "MTLDevice", "MTLResource"] }
 # bf16 logits readback in the qwen3 py-carrier parity test
@@ -858,4 +809,93 @@ tokenizers = { workspace = true }
 [[test]]
 name = "qwen3_py_parity"
 required-features = ["metal", "qwen3-0.6b"]
+
+# The carrier parity gate runs a carrier on Metal (its `imp` is macOS-only, and names the metal
+# target). Built under `metal`: a `cuda` build on a Mac, which now expands a model, has no Metal
+# target to link it against.
+[[test]]
+name = "carrier_parity"
+required-features = ["metal"]
+
+# qwen3.5-0.8b's emitted CUDA tapes against what CUDA's compiler lowers, and the issue's numbers.
+# No toolchain needed.
+[[test]]
+name = "cuda_tapes"
+required-features = ["cuda", "qwen3.5-0.8b"]
+
+# One whole-model prefill forward of qwen3.5-0.8b's emitted tapes on the GPU, synthetic weights.
+# Needs nvcc to build and an H100 to run.
+[[test]]
+name = "cuda_prefill"
+required-features = ["nvcc", "qwen3.5-0.8b"]
+
+# qwen3.5-0.8b's prefill from the real checkpoint against HF transformers' logits
+# (tests/cuda_hf_reference.py's goldens). Needs nvcc to build, and an H100, the checkpoint and the
+# goldens to run.
+[[test]]
+name = "cuda_hf_parity"
+required-features = ["nvcc", "qwen3.5-0.8b"]
+
+# The same three for qwen3.5-9b, sharing their bodies with the 0.8b's (tests/common/). The 9b is
+# `qwen3.5-9b-text-only`: the bare `qwen3.5-9b` feature selects the vision arch `qwen3-5-vl`.
+[[test]]
+name = "cuda_tapes_9b"
+required-features = ["cuda", "qwen3.5-9b-text-only"]
+
+# Qwen3.6-35B-A3B's emitted CUDA tapes (#841): the MoE block's steps, MoE scratch and bundles,
+# checked with no toolchain. The model's MoE steps have no kernels yet (#857).
+[[test]]
+name = "cuda_tapes_35b"
+required-features = ["cuda", "qwen3.6-35b-a3b"]
+
+# Gemma 4 26B-A4B's emitted CUDA tapes (#885): its two attention classes, two rotary tables,
+# Gemma routing, 64-column GEMMs and weight table, checked with no toolchain. Its new steps have
+# no kernels yet (#885's 13b and 13c).
+[[test]]
+name = "cuda_tapes_gemma4"
+required-features = ["cuda", "gemma-4-26b-a4b-it"]
+
+# Gemma 4 26B-A4B's whole-model synthetic-weight forward on the H100 (#925): the qwen checks (a)-(o)
+# where they apply, plus the sliding window's (p)-(r), in its own body
+# (tests/common/cuda_prefill_gemma4_body.rs). Needs nvcc to build, and an H100 and about 51 GB of
+# host RAM to run.
+[[test]]
+name = "cuda_prefill_gemma4"
+required-features = ["nvcc", "gemma-4-26b-a4b-it"]
+
+[[test]]
+name = "cuda_prefill_9b"
+required-features = ["nvcc", "qwen3.5-9b-text-only"]
+
+[[test]]
+name = "cuda_hf_parity_9b"
+required-features = ["nvcc", "qwen3.5-9b-text-only"]
+
+# Qwen3.6-35B-A3B on the H100 from its real checkpoint (#859): the memory gate and P1-P8 against
+# HF transformers (the 9b's body, tests/common/), P9 the expert picks against HF's routing dump,
+# and the synthetic-weight whole-model body. Need nvcc to build, and an H100, the 26-shard
+# checkpoint and the goldens to run.
+[[test]]
+name = "cuda_hf_parity_35b"
+required-features = ["nvcc", "qwen3.6-35b-a3b"]
+
+[[test]]
+name = "cuda_route_parity_35b"
+required-features = ["nvcc", "qwen3.6-35b-a3b"]
+
+[[test]]
+name = "cuda_prefill_35b"
+required-features = ["nvcc", "qwen3.6-35b-a3b"]
+
+# Gemma 4 26B-A4B on the H100 from its real checkpoint (#933): the memory gate and P1-P8 against
+# HF transformers (the shared body, tests/common/), plus the decode checks (k), (n) and (r) on real
+# weights; and P9, the expert picks against HF's routing dump (the 35B's body, shared). Need nvcc
+# to build, and an H100, the 2-shard checkpoint and the goldens to run.
+[[test]]
+name = "cuda_hf_parity_gemma4"
+required-features = ["nvcc", "gemma-4-26b-a4b-it"]
+
+[[test]]
+name = "cuda_route_parity_gemma4"
+required-features = ["nvcc", "gemma-4-26b-a4b-it"]
 

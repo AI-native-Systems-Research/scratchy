@@ -203,7 +203,6 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
         builder = builder.gpu_memory_utilization(f);
     }
     builder = builder.tensor_parallel_size(args.tensor_parallel_size);
-    builder = builder.enforce_eager(args.enforce_eager);
     if let Some(ref tpl) = args.chat_template {
         builder = builder.chat_template(tpl.clone());
     }
@@ -306,8 +305,10 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
 
             // DIAGNOSTIC: print token IDs + finish reason so we can
             // see what the model actually produced (vs garbage tokens
-            // or EOS).
+            // or EOS), and the prompt ids it was fed (the chat-templated
+            // prompt as this path tokenized it).
             if std::env::var_os("VLLM_PRINT_TOKEN_IDS").is_some() {
+                eprintln!("[diag] prompt_token_ids={:?}", output.prompt_token_ids);
                 eprintln!(
                     "[diag] token_ids={:?} text={:?} finish_reason={:?}",
                     output.outputs[0].token_ids,

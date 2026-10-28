@@ -38,8 +38,7 @@ pub use kv::{
 };
 pub use multimodal::MultimodalData;
 pub use request::{
-    BlockAnnotations, BlockKind, Request, RequestStatus, compute_block_flags,
-    compute_block_flags_rope_on_read,
+    BlockAnnotations, BlockKind, Request, RequestStatus, compute_block_flags_rope_on_read,
 };
 pub use sampling::{
     GpuSampleParams, LogprobsOutput, RequestOutputKind, SamplingParams, SamplingType, TokenLogprob,

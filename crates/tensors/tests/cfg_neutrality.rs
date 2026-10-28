@@ -4,7 +4,7 @@
 //! Principle, not a file list: a backend is selected by which target crate the
 //! binary links (unconditional `dep:` + a feature on the *binary*), and dispatch
 //! happens through neutral trait/registry seams — NOT by sprinkling
-//! `#[cfg(feature = "cuda")]` / `#[cfg(any(cuda, metal))]` through neutral code
+//! `#[cfg(feature = "metal")]` / `#[cfg(any(metal, spyre))]` through neutral code
 //! or even inside the target crates (which are unconditionally their target).
 //!
 //! These tests walk whole directory zones and fail listing every violation, so
@@ -164,9 +164,8 @@ fn no_target_cfg_in_tensors() {
     assert_zone_clean("crates/tensors");
 }
 
-// NOTE: `crates/targets/cuda/{builder,cost-sweep}`, `crates/targets/metal/cost-sweep`,
-// `crates/targets/{cuda,metal}`, and `crates/serving/cuda` are split per-target
-// — they ARE a specific backend and may name it freely. They are deliberately
+// NOTE: `crates/targets/{metal,spyre}` are split per-target — they ARE a
+// specific backend and may name it freely. They are deliberately
 // NOT in the agnostic zone list above. (A per-target crate must still pull its
 // deps unconditionally rather than cfg-gate them, but that is a Cargo concern,
 // not a source-cfg one.)
@@ -221,9 +220,9 @@ const AGNOSTIC_ZONES: [&str; 6] = [
     "crates/core",
 ];
 
-/// Hardware-agnostic code must not name a backend at all — not the cuda-named
-/// crate (its neutral facade belongs in a neutral crate), not the cuda serving
-/// crate, and not backend-specific concepts like CUDA graphs. Dispatch goes
+/// Hardware-agnostic code must not name a backend at all — including the
+/// removed CUDA backend's crates and concepts (CUDA graphs), so they do not
+/// creep back in. Dispatch goes
 /// through neutral seams.
 fn agnostic_symbol_violations(symbol: &str) -> Vec<String> {
     let mut v = Vec::new();

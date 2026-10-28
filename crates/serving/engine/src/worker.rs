@@ -49,7 +49,7 @@ pub struct WorkerConfig {
 ///
 /// Port of: `vllm/v1/worker/worker_base.py::WorkerBase`
 pub trait Worker: Send {
-    /// Initialize the device (e.g., set CUDA device, init distributed).
+    /// Initialize the device.
     fn init_device(&mut self) -> ExecutorResult<()>;
 
     /// Load the model onto the device.
@@ -82,7 +82,7 @@ pub trait Worker: Send {
 
     /// Compile or warm up the model for inference.
     ///
-    /// This may include CUDA graph capture, JIT compilation, etc.
+    /// This may include JIT compilation, etc.
     fn compile_or_warm_up_model(&mut self) -> ExecutorResult<()> {
         Ok(())
     }
@@ -118,7 +118,7 @@ pub trait Worker: Send {
     /// the scheduler's block allocator MUST NOT hand out a block id ≥ `nblk` (it
     /// would index past the pool → silent KV corruption / on-card fault). When this
     /// returns `Some(n)` the engine sets `num_gpu_blocks = min(computed, n)`. `None`
-    /// = no cap (cuda/metal size the pool from the memory budget). Valid after
+    /// = no cap (metal sizes the pool from the memory budget). Valid after
     /// `load_model`.
     fn kv_cache_num_blocks_override(&self) -> Option<usize> {
         None
@@ -138,21 +138,18 @@ pub trait Worker: Send {
     /// HARD CAP on the scheduler's `max_num_seqs`, if the backend can only DECODE a bounded number of
     /// sequences in one batched step.
     ///
-    /// ⛔ IT EXISTS BECAUSE cuda's LADDER IS DERIVED AND SPYRE'S IS BAKED. Both backends pick a decode
-    /// width from a discrete ladder (cuda: captured graph sizes, spyre: `BATCH_RUNGS`), both take the
-    /// smallest entry `>= live`, and both fall back to a slower correct path when nothing is wide enough.
-    /// cuda holds the invariant *"the fast path always covers the configured concurrency"* by building its
-    /// ladder FROM `max_num_seqs` (`auto_capture_sizes`), so no configured width can miss it. A backend
-    /// whose ladder is fixed at BAKE time cannot grow it to meet `max_num_seqs`, so it holds the same
-    /// invariant from the other end: it reports the widest width it can batch and the scheduler admits no
-    /// more than that.
+    /// ⛔ IT EXISTS BECAUSE SPYRE'S LADDER IS BAKED. Spyre picks a decode width from a discrete ladder
+    /// (`BATCH_RUNGS`), takes the smallest entry `>= live`, and falls back to a slower correct path when
+    /// nothing is wide enough. A ladder fixed at BAKE time cannot grow to meet `max_num_seqs`, so the
+    /// backend holds *"the fast path always covers the configured concurrency"* from the other end: it
+    /// reports the widest width it can batch and the scheduler admits no more than that.
     ///
-    /// It also ANSWERS an unset `--max-num-seqs`, which is why cuda and metal report here too: when the
+    /// It also ANSWERS an unset `--max-num-seqs`, which is why metal reports here too: when the
     /// caller named nothing, a worker that resolved a memory-affordable default (the GDN slot count, the
     /// device tier) hands the scheduler the value it actually built its pools at, so
     /// `WorkerCreateConfig::max_num_seqs = None` never resolves to two different numbers in one process.
     ///
-    /// ⭐ CAPPING, NOT REFUSING — cuda refuses no `max_num_seqs` and neither should anyone else. Exceeding
+    /// ⭐ CAPPING, NOT REFUSING — no backend should refuse a `max_num_seqs`. Exceeding
     /// the ladder is a THROUGHPUT cliff, not a correctness bound: spyre's own fallback is one launch per
     /// request (~93 µs each) and stays correct. The cap keeps a run on the batched path instead of
     /// silently dropping it onto the slow one; it is not protecting against corruption.
@@ -182,7 +179,7 @@ pub trait Worker: Send {
 
     /// ⭐⭐⭐ HOW THIS WORKER ADDRESSES ITS KV — a CAPABILITY, declared before it runs a step.
     ///
-    /// `ByToken` (the default) is every backend whose key `n` sits at slot `n`: cuda, metal. A worker whose
+    /// `ByToken` (the default) is every backend whose key `n` sits at slot `n`: metal. A worker whose
     /// batched step appends EVERY row at one shared slot returns `OneSharedWriteSlot`, and the scheduler then
     /// sizes each request by the step's reach rather than by its own token count — which is what lets the host
     /// own every page the launch writes instead of the worker covering them from a reserve of its own.
@@ -225,7 +222,7 @@ pub trait Worker: Send {
     /// needs to know how they share the KV budget: how the worker maps and releases KV and
     /// snapshot memory, and how many slots it can address. `None` (the default) means this worker
     /// cannot snapshot one: every worker without recurrent state, and every backend whose
-    /// recurrent kernels do not save and restore snapshots (CUDA today). For a recurrent-hybrid
+    /// recurrent kernels do not save and restore snapshots. For a recurrent-hybrid
     /// model that keeps prefix caching off, which is the only correct answer a backend without
     /// snapshots has.
     fn snapshot_budget(&self) -> Option<SnapshotBudget> {
@@ -234,10 +231,10 @@ pub trait Worker: Send {
 
     /// Whether this worker's DECODE path implements the hybrid sliding-window
     /// KV layout — separate paged cache groups per sliding window, addressed by
-    /// the `sliding_groups` per-request block tables. Metal wires this; the CUDA
-    /// decode currently reads a single block table for EVERY layer, so it must
-    /// run on the uniform single-pool layout instead (correct for any context
-    /// up to the sliding window). When this returns false the scheduler keeps
+    /// the `sliding_groups` per-request block tables. Metal wires this; a
+    /// decode that reads a single block table for EVERY layer must run on the
+    /// uniform single-pool layout instead (correct for any context up to the
+    /// sliding window). When this returns false the scheduler keeps
     /// gemma4 (and other hybrid-SWA arches) on the uniform pool so the worker's
     /// single-block-table decode never reads a sliding layer's KV from the
     /// global group's blocks. Default true (metal + uniform arches).
@@ -468,7 +465,7 @@ mod tests {
     use super::*;
 
     /// A worker that answers an unset `--max-num-seqs` with a fixed width
-    /// and tracks what `align_max_num_seqs` told it — the shape metal/cuda
+    /// and tracks what `align_max_num_seqs` told it — the shape metal workers
     /// present after `load_model` resolves the flag.
     struct WidthWorker {
         width: Option<usize>,

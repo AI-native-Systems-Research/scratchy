@@ -33,7 +33,6 @@ COPY --chown=senuser:senuser Cargo.toml Cargo.toml
 COPY --chown=senuser:senuser Cargo.lock Cargo.lock
 COPY --chown=senuser:senuser build.rs build.rs
 COPY --chown=senuser:senuser crates crates
-COPY --chown=senuser:senuser third_party/ third_party/
 RUN cargo chef prepare --recipe-path recipe.json
 
 # =============================================================================
@@ -46,7 +45,6 @@ USER root
 RUN chown -R senuser:senuser /build
 USER senuser
 COPY --from=planner /build/recipe.json recipe.json
-COPY --chown=senuser:senuser third_party/ third_party/
 RUN cargo chef cook --profile release-dist --bin scr \
     --features "superdsc,serve,${SCRATCHY_MODEL_FEATURES}" --recipe-path recipe.json
 
@@ -63,7 +61,6 @@ COPY --chown=senuser:senuser Cargo.toml Cargo.toml
 COPY --chown=senuser:senuser Cargo.lock Cargo.lock
 COPY --chown=senuser:senuser build.rs build.rs
 COPY --chown=senuser:senuser crates crates
-COPY --chown=senuser:senuser third_party/ third_party/
 COPY --from=dependencies /build/target target
 COPY --from=dependencies /home/senuser/.cargo /home/senuser/.cargo
 

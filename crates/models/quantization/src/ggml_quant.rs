@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-//! GGML quantized data types — pure data, no CUDA calls.
+//! GGML quantized data types — pure data, no device calls.
 //!
-//! These were lifted out of `scratchy-target-cuda::ggml` so `GpuWeights`
-//! (which lives in this crate) can hold a `quantized:
-//! HashMap<String, GgmlStorage>` field. The CUDA kernels that
-//! consume `GgmlStorage` (mul_mat_vec, dequantize_to_tensor, …) stay
-//! in `scratchy-target-cuda`. `scratchy-target-cuda::ggml` re-exports
-//! `GgmlDType` and `GgmlStorage` from here for backward compat.
+//! `GpuWeights` holds a `quantized: HashMap<String, GgmlStorage>` field
+//! and the layer types name `GgmlStorage`, so the types live here.
 
 /// GGML quantization data types.
 ///
@@ -182,7 +178,6 @@ impl std::fmt::Display for GgmlDType {
 /// Raw GGML-quantized weight data on GPU.
 ///
 /// The bytes are in the exact same format as the GGUF file — no dequantization.
-/// The CUDA kernels read quantized blocks directly and do fused dequant+matvec.
 #[derive(Clone, Copy)]
 pub struct GgmlStorage {
     /// Raw GPU pointer to quantized block data.

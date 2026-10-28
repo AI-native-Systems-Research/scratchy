@@ -21,27 +21,19 @@
 //!
 //! The caller's entire integration is two calls: `Weights::load(...)`
 //! at startup and `forward(...)` per step.
-//!
-//! Emission-per-subgraph is delegated to
-//! [`crate::impl_lib::Implementation::emit_call`]: codegen walks
-//! the LOOP's waves and asks each subgraph's bound impl to emit
-//! its own tokens. New kernels / new ops extend the library, not
-//! this file.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::Ident;
 
-use crate::assignment::WorkloadAssignments;
 use crate::classified::{OpKind, Program, UnrollIndex, WeightId};
 use crate::config::ModelParams;
 use crate::fuf::{Fuf, FufInput, TileId};
-use crate::impl_lib::ImplementationLibrary;
-use crate::interpreter_codegen::{ArchOpcodes, emit_bucket_static_slice, lower_bucket};
-use crate::schedule::WorkloadLoops;
+use crate::interpreter_codegen::emit_bucket_static_slice;
 use crate::weight_vocab::{SlotMap, WeightAccessor, WeightSlot};
+use crate::workload::{WorkloadPoint, WorkloadPoints};
 
 // ── Weights struct + loader emission ─────────────────────────────
 
@@ -698,22 +690,6 @@ fn compress_affine_rows(rows: Vec<(String, u32, u32)>) -> Vec<(String, u32, u32)
     out.sort();
     out.dedup();
     out
-}
-
-/// Emit the `GptqLayout` token stream that selects the loader's
-/// on-disk branch (native `.qweight` vs compressed-tensors
-/// `.weight_packed`). Used by both the single and concat GPTQ
-/// FieldLoad arms; the generated `MarlinLinear::load_gptq{,_concat}`
-/// consume it directly.
-fn gptq_layout_ts(layout: crate::quantization::GptqLayout) -> TokenStream {
-    match layout {
-        crate::quantization::GptqLayout::Qweight => {
-            quote! { crate::__gpu::layers_quant::GptqLayout::Qweight }
-        }
-        crate::quantization::GptqLayout::WeightPacked => {
-            quote! { crate::__gpu::layers_quant::GptqLayout::WeightPacked }
-        }
-    }
 }
 
 /// Per-storage-format parameters carried on a [`FieldLoad::MarlinLinear`].
@@ -1409,7 +1385,7 @@ fn plan_field_load(
         // shared tensors and the DSL leaf accessors keep sole ownership.
         let moe_base = program.weights.path(only_src).first().cloned();
         let shared_expert_intermediate_size = match &moe_base {
-            Some(b) if program.weights.has_subtree(&[b.as_str(), "shared_expert"]) => 0,
+            Some(b) if program.weights.shared_expert_bases().contains(b) => 0,
             _ => shared_expert_intermediate_size,
         };
         let (affine, gate_bits) = moe_affine_plan(program, fuf, model, &prefix, accessor);
@@ -2045,6 +2021,97 @@ fn plan_field_load(
     }
 }
 
+/// The rope base frequency the config DECLARES: `scalars["rope_theta"]`, else
+/// `bounds["rope_theta"]`, and `None` when it declares neither — no default is invented here
+/// (a caller that needs one picks it, and says why).
+pub(crate) fn declared_rope_theta(model: &ModelParams) -> Option<f64> {
+    model
+        .scalars
+        .get("rope_theta")
+        .copied()
+        .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
+}
+
+/// The global attention class's geometry: a hybrid sliding/global arch's full-attention layers
+/// (`GLOBAL_HEAD_DIM`, `NUM_GLOBAL_KV_HEADS`, `GLOBAL_ROT_DIM`, `ROPE_PROPORTIONAL`), the base
+/// class's on a uniform model. One derivation, read by metal's `CanonicalParams` impl and by the
+/// target-emitter seam's attention classes.
+pub(crate) struct GlobalAttnClass {
+    pub head_dim: u32,
+    pub kv_heads: u32,
+    pub rot_dim: u32,
+    /// Proportional rope: lane `i` pairs with `i + head_dim/2`, not `i + rot_dim/2`.
+    pub proportional: bool,
+}
+
+/// [`GlobalAttnClass`] from the config, the base class's `(head_dim, kv_heads, rot_dim)` beside it
+/// (`kv_heads` already divided by `tp`).
+///
+/// Per-layer-class geometry for hybrid sliding/global arches whose classes differ in dims
+/// (Gemma4: sliding 256×8kv full-rope vs global 512×1kv proportional-rope-128). Config keys
+/// `global_head_dim` / `num_global_key_value_heads` / `global_partial_rotary_factor` feed it;
+/// absent keys fall back to the base values (uniform models unchanged).
+pub(crate) fn global_attn_class(
+    model: &ModelParams,
+    tp: u32,
+    (head_dim, num_kv_heads, rot_dim_val): (u32, u32, u32),
+) -> GlobalAttnClass {
+    let global_head_dim: u32 = model
+        .bounds
+        .get("global_head_dim")
+        .map(|&v| v as u32)
+        .unwrap_or(head_dim);
+    let num_global_kv_heads: u32 = model
+        .bounds
+        .get("num_global_key_value_heads")
+        .map(|&v| (v as u32) / tp)
+        .unwrap_or(num_kv_heads);
+    let global_rot_dim: u32 = model
+        .scalars
+        .get("global_partial_rotary_factor")
+        .copied()
+        .filter(|&f| (f - 1.0).abs() > 1e-9)
+        .map(|f| (f * global_head_dim as f64).round() as u32)
+        // Fallback must honor the BASE partial factor on uniform
+        // models (global_head_dim == head_dim): Qwen3.5's full-
+        // attention layers lower through the is_global arm, and the
+        // old `global_head_dim` fallback rotated the FULL 256-dim
+        // head against the 64-wide partial cos/sin table — rows past
+        // the table read zeros and zeroed Q/K for every token beyond
+        // ~4 (the "rambling, input-blind thinker" failure). Hybrid
+        // arches with distinct global dims and genuinely full global
+        // rope (no factor) keep the old fallback.
+        .unwrap_or(if global_head_dim == head_dim {
+            rot_dim_val
+        } else {
+            global_head_dim
+        });
+    // Proportional rope marker — same predicate that routes the
+    // rotary cache builder to `new_proportional_from_gpuweights`.
+    // Drives the metal rope kernel's pairing offset (lane i pairs
+    // with i + head_dim/2, not i + rot_dim/2).
+    let proportional = global_rot_dim != global_head_dim
+        && model.scalars.contains_key("global_partial_rotary_factor");
+    GlobalAttnClass {
+        head_dim: global_head_dim,
+        kv_heads: num_global_kv_heads,
+        rot_dim: global_rot_dim,
+        proportional,
+    }
+}
+
+/// The rotated lanes of a `head_dim`-wide head: `partial_rotary_factor · head_dim` for a
+/// partial-rope arch (Qwen3.5: 0.25 · 256 = 64), else the full `head_dim`.
+pub(crate) fn rot_dim(model: &ModelParams, head_dim: u32) -> u32 {
+    model
+        .scalars
+        .get("partial_rotary_factor")
+        .copied()
+        .filter(|&f| (f - 1.0).abs() > 1e-9)
+        .map(|f| (f * head_dim as f64).round() as u32)
+        .unwrap_or(head_dim)
+}
+
 pub(crate) fn rms_norm_eps(model: &ModelParams) -> f32 {
     // HF configs carry `rms_norm_eps` (RMSNorm convention used by
     // Llama/Qwen2/Mistral/etc.) or `layer_norm_eps` (CohereLayerNorm
@@ -2113,52 +2180,6 @@ fn tie_word_embeddings(model: &ModelParams) -> bool {
     // loader from the HF JSON; read directly rather than re-parsing
     // the file here.
     model.tie_word_embeddings
-}
-
-/// Aggregate every unique WeightAccessor across every workload
-/// tape_index's SFUF. Errors on name collisions with conflicting
-/// `rust_type`s.
-fn collect_accessors(
-    program: &Program,
-    fuf: &Fuf,
-    sfufs: &WorkloadAssignments,
-    lib: &ImplementationLibrary,
-    _model_for_trace: &ModelParams,
-) -> Result<Vec<WeightAccessor>, TokenStream> {
-    // name → (first-seen accessor, rust_type string for collision check).
-    let mut by_name: BTreeMap<String, (WeightAccessor, String)> = BTreeMap::new();
-    let mut conflicts: Vec<String> = Vec::new();
-
-    for sfuf in sfufs.per_workload.values() {
-        for sg in sfuf.subgraphs() {
-            let imp_id = sfuf
-                .impl_of(sg)
-                .expect("solver committed an impl for every subgraph");
-            let claimed = sfuf.tiles_in_subgraph(sg);
-            let imp = lib.get(imp_id);
-            for acc in imp.required_weights(&claimed, fuf, program) {
-                let key = acc.name.to_string();
-                let ty_str = acc.rust_type.to_string();
-                by_name
-                    .entry(key.clone())
-                    .and_modify(|(_, existing_ty)| {
-                        if *existing_ty != ty_str {
-                            conflicts.push(format!(
-                                "Weights field `{key}` declared with \
-                                 conflicting types: `{existing_ty}` vs `{ty_str}`"
-                            ));
-                        }
-                    })
-                    .or_insert((acc.clone(), ty_str));
-            }
-        }
-    }
-
-    if !conflicts.is_empty() {
-        let msg = conflicts.join("\n");
-        return Err(quote! { compile_error!(#msg); });
-    }
-    Ok(by_name.into_values().map(|(a, _)| a).collect())
 }
 
 /// The routed experts' input width an ungated bank is packed at, probed at the last MoE
@@ -2510,7 +2531,7 @@ fn emit_fingerprint_check(
     let hidden_lit = proc_macro2::Literal::usize_unsuffixed(hidden_size as usize);
     // GGUF's on-disk loader (`GgufGpuWeights::load`) pre-shards
     // `ShardDim0` tensors — including `embed_tokens` — at file-read
-    // time (`scratchy-target-cuda/src/ggml.rs::gguf_shard_kind_for_hf_name`).
+    // time.
     // At tp>1 the per-rank embed shape is `[vocab_size / tp, hidden]`,
     // so the fingerprint's vocab literal must match the sharded dim-0.
     // Safetensors variants keep the full tensor in memory (sharding
@@ -2599,12 +2620,7 @@ fn emit_fingerprint_check(
     // code is a single compare against two literals — and so a config spelling
     // `1000000` where the checkpoint spells `1000000.0` cannot trip it. It is far
     // tighter than any real theta gap (the closest in-tree pair differs by 2×).
-    let rope_theta_check: TokenStream = match model
-        .scalars
-        .get("rope_theta")
-        .copied()
-        .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
-    {
+    let rope_theta_check: TokenStream = match declared_rope_theta(model) {
         Some(theta) => {
             let theta_lit = proc_macro2::Literal::f64_unsuffixed(theta);
             let tol_lit = proc_macro2::Literal::f64_unsuffixed(theta.abs() * 1e-9);
@@ -3133,7 +3149,7 @@ fn emit_fingerprint_check(
         /// Backend-neutral — `gw` reads tensor shapes via the
         /// shared `GpuWeights` API, so the same body sniffs cuda,
         /// metal, and spyre (host) checkpoints identically.
-        #[cfg(any(feature = "cuda", feature = "metal", feature = "spyre"))]
+        #[cfg(any(feature = "metal", feature = "spyre"))]
         pub fn fingerprint_matches(
             gw: &crate::__gpu::weights::GpuWeights,
             hf: ::scratchy_forward_compiler::HfFingerprint<'_>,
@@ -3202,11 +3218,10 @@ pub(crate) enum WeightsEmitMode<'a> {
 
 /// The affine rows a variant's fingerprint gate should carry. A shim's
 /// `load` delegates to its canonical's body, where the affine
-/// bit-widths are baked in — and on metal the shim's own accessor set
-/// is ISel's, which is empty there, so a rowless shim would otherwise
-/// gate on nothing and select anything. A shim with no rows of its own
-/// inherits its canonical's; own rows always win when present (cuda
-/// runs ISel, so the shim's own recipe is what its load reads there).
+/// bit-widths are baked in — and a shim lowers no tape, so its own
+/// accessor set is empty and a rowless shim would otherwise gate on
+/// nothing and select anything. A shim with no rows of its own
+/// inherits its canonical's; own rows always win when present.
 fn effective_fingerprint_rows<'a>(
     mode: &WeightsEmitMode<'_>,
     own: &'a [(String, u32, u32)],
@@ -3227,13 +3242,10 @@ fn effective_fingerprint_rows<'a>(
 fn emit_weights_struct(
     program: &Program,
     fuf: &Fuf,
-    sfufs: &WorkloadAssignments,
-    // M2b: when the arch is tape-scheduled, the accessor set comes
-    // from the SHARED TAPE. Both sets are still computed and the
-    // emitted field/type/source signature asserted equal — the
-    // transition gate; the tape's is what gets emitted.
+    // The accessor set, from the SHARED TAPE. `None` (no tape lowered
+    // for this variant — a shim, or metal's first pass before the
+    // front-end swap) emits a `Weights` with no accessor fields.
     tape_accessors: Option<&[WeightAccessor]>,
-    lib: &ImplementationLibrary,
     model: &ModelParams,
     manifest: &crate::weights_manifest::WeightsManifest,
     mode: WeightsEmitMode<'_>,
@@ -3241,39 +3253,7 @@ fn emit_weights_struct(
     emit_fingerprint: bool,
     canonical_affine_rows: Option<&[(String, u32, u32)]>,
 ) -> (TokenStream, Vec<(String, u32, u32)>) {
-    let isel_accessors = match collect_accessors(program, fuf, sfufs, lib, model) {
-        Ok(a) => a,
-        Err(err) => return (err, Vec::new()),
-    };
-    let accessors = match tape_accessors {
-        Some(tape) => {
-            let sig = |accs: &[WeightAccessor]| {
-                group_accessors_by_base(accs)
-                    .iter()
-                    .map(|g| {
-                        (
-                            g.base.clone(),
-                            g.rust_type.to_string().replace(' ', ""),
-                            g.entries.len(),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            };
-            assert_eq!(
-                sig(tape),
-                if isel_accessors.is_empty() {
-                    sig(tape)
-                } else {
-                    sig(&isel_accessors)
-                },
-                "model `{}`: tape accessor set emits a DIFFERENT Weights struct than \
-                 instruction selection",
-                model.source_stem,
-            );
-            tape.to_vec()
-        }
-        None => isel_accessors,
-    };
+    let accessors: Vec<WeightAccessor> = tape_accessors.map(<[_]>::to_vec).unwrap_or_default();
 
     // Storage-format guard: a given accessor's `rust_type` must be
     // compatible with every one of its source weights' storage
@@ -3398,10 +3378,10 @@ fn emit_weights_struct(
                     ),
                 );
             // The storage/accessor match only matters for backends that emit a
-            // concrete per-accessor host FieldLoad (cuda + metal). A target that
+            // concrete per-accessor host FieldLoad (metal). A target that
             // runs an embedded fused program loads + dequantizes weights itself
             // (no host FieldLoad), so the dense accessor is fine for any storage.
-            if !ok && cfg!(any(feature = "cuda", feature = "metal")) {
+            if !ok && cfg!(feature = "metal") {
                 let dotted = program.weights.path(*wid).join(".");
                 let msg = format!(
                     "model `{stem}`: weight `{dotted}` has storage ({fmt:?}) that \
@@ -3782,75 +3762,10 @@ fn emit_weights_struct(
         })
     });
 
-    // Compute dtype the rotary cache must match the model's compute dtype:
-    // the rope kernel dispatches on Q/K activation dtype but reinterprets
-    // cos/sin bytes through that same plan, so a BF16 cos/sin against F16
-    // activations reads the table through the wrong exponent width
-    // (5 vs 8 bits).
-    //
-    // Read at RUNTIME from `embed_tokens.weight`'s on-disk dtype — that
-    // tensor is always present and always in the model's compute dtype
-    // (never quantized). Baking from the manifest's `torch_dtype` is
-    // unsafe: AWQ checkpoints frequently override the base model's dtype
-    // (Qwen2.5 base ships as bf16; the `*-Instruct-AWQ` variants ship as
-    // f16), and the per-AWQ-variant `quant_config.json` does not change
-    // the manifest's compile-time `torch_dtype` literal. Mismatch produces
-    // grammatical-but-incoherent output (rope rotations applied through
-    // the wrong exponent layout). The manifest's `torch_dtype` survives
-    // only as the fallback when the embed tensor isn't visible in the
-    // weights table — same pattern used by the BNB4 / FP8 preludes above.
-    let rope_dtype_fallback: TokenStream = match model.torch_dtype.as_deref() {
-        Some("float16" | "fp16" | "f16" | "half") => {
-            quote! { crate::__gpu::dtype::DType::F16 }
-        }
-        _ => quote! { crate::__gpu::dtype::DType::BF16 },
-    };
-    let rotary_prelude: TokenStream = quote! {
-        let __rope_dtype = gw
-            .tensor_info(#embed_tokens_weight_path)
-            .map(|(_, dt)| dt)
-            .unwrap_or(#rope_dtype_fallback);
-    };
-    let _rope_dtype: TokenStream = quote! { __rope_dtype };
-
-    // The RoPE tables are `OnceLock`s: cuda and spyre build them at load, metal when its pool is
+    // The RoPE tables are `OnceLock`s: spyre builds them at load, metal when its pool is
     // built (`build_rope_tables`), for the positions the KV cache's block table reaches.
     let rotary_local_field: TokenStream = if uses_rotary_local {
         quote! { pub rotary_local: ::std::sync::OnceLock<crate::__gpu::rotary::RotaryCache>, }
-    } else {
-        quote! {}
-    };
-
-    let rotary_local_load: TokenStream = if uses_rotary_local {
-        let head_dim = *model
-            .bounds
-            .get("head_dim")
-            .expect("model must have head_dim for RotaryLocal") as usize;
-        let max_pos = *model
-            .bounds
-            .get("max_position_embeddings")
-            .expect("model must have max_position_embeddings for RotaryLocal")
-            as usize;
-        let local_theta = model
-            .scalars
-            .get("rope_local_base_freq")
-            .copied()
-            .or_else(|| model.bounds.get("rope_local_base_freq").map(|&v| v as f64))
-            .or_else(|| model.scalars.get("rope_theta").copied())
-            .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
-            .expect("model must have rope_local_base_freq for RotaryLocal");
-        quote! {
-            let rotary_local = unsafe {
-                crate::__gpu::rotary::RotaryCache::new_from_stream(
-                    #head_dim,
-                    #max_pos,
-                    #local_theta,
-                    None,
-                    crate::__gpu::dtype::DType::BF16,
-                    stream,
-                )
-            }?;
-        }
     } else {
         quote! {}
     };
@@ -3909,227 +3824,6 @@ fn emit_weights_struct(
 
     let rotary_field: TokenStream = if uses_rotary {
         quote! { pub rotary: ::std::sync::OnceLock<crate::__gpu::rotary::RotaryCache>, }
-    } else {
-        quote! {}
-    };
-
-    let rotary_load: TokenStream = if uses_rotary {
-        let head_dim = *model
-            .bounds
-            .get("head_dim")
-            .expect("model must have head_dim for Rotary") as usize;
-        let max_pos = *model
-            .bounds
-            .get("max_position_embeddings")
-            .expect("model must have max_position_embeddings for Rotary")
-            as usize;
-        // HF's implicit default when `rope_theta` is omitted (e.g.
-        // `llama-2-70b.json`). Matches transformers' LlamaConfig.
-        let rope_theta = model
-            .scalars
-            .get("rope_theta")
-            .copied()
-            .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
-            .unwrap_or(10000.0);
-        // `partial_rotary_factor == 1.0` is the full-rotary identity;
-        // route it through `new_from_stream` instead of
-        // `new_partial_from_stream` with `rotary_dim == head_dim`
-        // so models that spell this out (Phi-4-reasoning) don't
-        // exercise the partial-rotary kernel path unnecessarily.
-        let partial = model
-            .scalars
-            .get("partial_rotary_factor")
-            .copied()
-            .filter(|&f| (f - 1.0).abs() > 1e-9);
-        let rotary_dim_lit: Option<TokenStream> = partial.map(|f| {
-            let rd = f * head_dim as f64;
-            assert!(
-                (rd - rd.round()).abs() < 1e-9,
-                "partial_rotary_factor {f} * head_dim {head_dim} = {rd} is not integer",
-            );
-            let rd = rd.round() as usize;
-            quote! { #rd }
-        });
-        // For YaRN (DeepSeek V2 MLA), the rope portion uses `qk_rope_head_dim`
-        // rather than the full `head_dim`. Pull it from bounds if present.
-        let yarn_rope_head_dim: Option<usize> =
-            model.bounds.get("qk_rope_head_dim").map(|&v| v as usize);
-        let scaling = model.rope_scaling.clone();
-        // For MLA models (DeepSeek V2/V3 flat), the rope portion uses
-        // `qk_rope_head_dim` rather than the full `head_dim`. YaRN already
-        // uses `yarn_rope_head_dim`; apply the same override to standard RoPE.
-        let rope_cache_head_dim = yarn_rope_head_dim.unwrap_or(head_dim);
-        let rope_cache_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(rope_cache_head_dim);
-
-        let body = match (rotary_dim_lit, scaling) {
-            (None, None) => quote! {
-                crate::__gpu::rotary::RotaryCache::new_from_stream(
-                    #rope_cache_head_dim_lit,
-                    #max_pos,
-                    #rope_theta,
-                    None,
-                    crate::__gpu::dtype::DType::BF16,
-                    stream,
-                )
-            },
-            (
-                None,
-                Some(crate::config::RopeScaling::Llama3 {
-                    factor,
-                    low_freq_factor,
-                    high_freq_factor,
-                    original_max_position_embeddings,
-                }),
-            ) => {
-                let orig = original_max_position_embeddings as usize;
-                quote! {
-                    crate::__gpu::rotary::RotaryCache::new_from_stream(
-                        #head_dim,
-                        #max_pos,
-                        #rope_theta,
-                        Some(&crate::__gpu::rotary::Llama3RopeScaling {
-                            factor: #factor,
-                            low_freq_factor: #low_freq_factor,
-                            high_freq_factor: #high_freq_factor,
-                            original_max_position_embeddings: #orig,
-                        }),
-                        crate::__gpu::dtype::DType::BF16,
-                        stream,
-                    )
-                }
-            }
-            (
-                None,
-                Some(crate::config::RopeScaling::LongRope {
-                    short_factor,
-                    long_factor,
-                    original_max_position_embeddings,
-                    short_mscale,
-                    long_mscale,
-                }),
-            ) => {
-                let orig = original_max_position_embeddings as usize;
-                quote! {
-                    crate::__gpu::rotary::RotaryCache::new_longrope_from_stream(
-                        #head_dim,
-                        #max_pos,
-                        max_model_len,
-                        #rope_theta,
-                        &crate::__gpu::rotary::LongRopeScaling {
-                            short_factor: vec![ #(#short_factor),* ],
-                            long_factor: vec![ #(#long_factor),* ],
-                            original_max_position_embeddings: #orig,
-                            short_mscale: #short_mscale,
-                            long_mscale: #long_mscale,
-                        },
-                        crate::__gpu::dtype::DType::BF16,
-                        stream,
-                    )
-                }
-            }
-            (
-                _,
-                Some(crate::config::RopeScaling::Yarn {
-                    factor,
-                    beta_fast,
-                    beta_slow,
-                    mscale,
-                    mscale_all_dim,
-                    original_max_position_embeddings,
-                }),
-            ) => {
-                let orig = original_max_position_embeddings as usize;
-                let rope_hd = yarn_rope_head_dim.unwrap_or(head_dim);
-                quote! {
-                    crate::__gpu::rotary::RotaryCache::new_yarn_from_stream(
-                        #rope_hd,
-                        #max_pos,
-                        #rope_theta,
-                        &crate::__gpu::rotary::YarnRopeScaling {
-                            factor: #factor,
-                            beta_fast: #beta_fast,
-                            beta_slow: #beta_slow,
-                            mscale: #mscale,
-                            mscale_all_dim: #mscale_all_dim,
-                            original_max_position_embeddings: #orig,
-                        },
-                        crate::__gpu::dtype::DType::BF16,
-                        stream,
-                    )
-                }
-            }
-            (Some(rotary_dim), None) => quote! {
-                crate::__gpu::rotary::RotaryCache::new_partial_from_stream(
-                    #head_dim,
-                    #rotary_dim,
-                    #max_pos,
-                    #rope_theta,
-                    None,
-                    crate::__gpu::dtype::DType::BF16,
-                    stream,
-                )
-            },
-            (
-                Some(rotary_dim),
-                Some(crate::config::RopeScaling::Llama3 {
-                    factor,
-                    low_freq_factor,
-                    high_freq_factor,
-                    original_max_position_embeddings,
-                }),
-            ) => {
-                let orig = original_max_position_embeddings as usize;
-                quote! {
-                    crate::__gpu::rotary::RotaryCache::new_partial_from_stream(
-                        #head_dim,
-                        #rotary_dim,
-                        #max_pos,
-                        #rope_theta,
-                        Some(&crate::__gpu::rotary::Llama3RopeScaling {
-                            factor: #factor,
-                            low_freq_factor: #low_freq_factor,
-                            high_freq_factor: #high_freq_factor,
-                            original_max_position_embeddings: #orig,
-                        }),
-                        crate::__gpu::dtype::DType::BF16,
-                        stream,
-                    )
-                }
-            }
-            (
-                Some(rotary_dim),
-                Some(crate::config::RopeScaling::LongRope {
-                    short_factor,
-                    long_factor,
-                    original_max_position_embeddings,
-                    short_mscale,
-                    long_mscale,
-                }),
-            ) => {
-                let orig = original_max_position_embeddings as usize;
-                quote! {
-                    crate::__gpu::rotary::RotaryCache::new_partial_longrope_from_stream(
-                        #head_dim,
-                        #rotary_dim,
-                        #max_pos,
-                        max_model_len,
-                        #rope_theta,
-                        &crate::__gpu::rotary::LongRopeScaling {
-                            short_factor: vec![ #(#short_factor),* ],
-                            long_factor: vec![ #(#long_factor),* ],
-                            original_max_position_embeddings: #orig,
-                            short_mscale: #short_mscale,
-                            long_mscale: #long_mscale,
-                        },
-                        crate::__gpu::dtype::DType::BF16,
-                        stream,
-                    )
-                }
-            }
-        };
-        quote! {
-            let rotary = unsafe { #body }?;
-        }
     } else {
         quote! {}
     };
@@ -4502,7 +4196,7 @@ fn emit_weights_struct(
     // and ignores the layer arg.
     // Weight-getter `impl Weights` (reads `self.<field>`). Emitted unconditionally
     // for every target — `crate::__gpu` resolves the field types per backend
-    // (cuda/metal/spyre target crate, or `scratchy-layers` with no backend), so
+    // (metal/spyre target crate, or `scratchy-layers` with no backend), so
     // the same accessors compile everywhere. No backend is special-cased.
     let accessor_methods = emit_weights_accessor_methods(&accessors);
 
@@ -4512,7 +4206,7 @@ fn emit_weights_struct(
     // shared across every claim of an Impl on this arch, so it
     // can't directly write `wm.rotary_local.cos_sin_cache` (Llama
     // would fail to type-check). Per-claim selection rides on a
-    // `cos_sin_fn: for<'a> fn(&'a Weights, u32) -> scratchy_target_cuda::tensor::GpuTensor`
+    // `cos_sin_fn: for<'a> fn(&'a Weights, u32) -> scratchy_tensors::GpuTensor`
     // OpInstance field; `fan_out` resolves it to one of these
     // accessor names. Llama's interpreter never sees `Weights::rotary_local_cos_sin`
     // because `RotaryLocal` extern doesn't appear in its FUF.
@@ -4565,10 +4259,10 @@ fn emit_weights_struct(
 
     // The `Weights` struct: one field per weight handle, emitted UNCONDITIONALLY
     // for every target. The field types are written through `crate::__gpu::…`,
-    // which each backend crate (cuda/metal/spyre) provides — and `scratchy-layers`
+    // which each backend crate (metal/spyre) provides — and `scratchy-layers`
     // provides in the no-backend default build. So the same struct compiles under
     // every target with no backend special-cased: spyre carries the same real
-    // `Weights` cuda and metal do, differing only in which crate `__gpu` names.
+    // `Weights` metal does, differing only in which crate `__gpu` names.
     let weights_def: TokenStream = match &mode {
         WeightsEmitMode::Canonical => quote! {
             /// Every weight the forward needs, packed for the solver-picked Impls.
@@ -4611,8 +4305,6 @@ fn emit_weights_struct(
         WeightsEmitMode::Shim { canonical } => quote! { super::#canonical::Weights },
     };
 
-    let marlin_fmt = marlin_format_literal(model);
-
     // Canonical emits the full `load_with(marlin_storage)` body +
     // a thin `load()` wrapper that passes this variant's Marlin
     // format literal. Shim variants skip `load_with` entirely —
@@ -4633,79 +4325,12 @@ fn emit_weights_struct(
 
             #fingerprint_method
 
-            /// Canonical load body. `marlin_storage` lets AWQ/GPTQ/CT
-            /// variants share one compiled copy; ignored elsewhere.
-            /// `tp_rank` is the runtime rank-id (0..tp_world_size);
-            /// the bake `tp_world_size` literal lives on `<W as
-            /// CanonicalParams>::…` divisor constants and on the
-            /// per-(model, tp) emitted `_sharded` loader call sites
-            /// (task #5).
-            #[cfg(feature = "cuda")]
-            #[allow(clippy::too_many_lines, clippy::not_unsafe_ptr_arg_deref, unused_variables)]
-            pub fn load_with(
-                gw: &mut crate::__gpu::weights::GpuWeights,
-                stream: crate::__gpu::CUstream,
-                max_model_len: usize,
-                marlin_storage: crate::__gpu::layers_quant::MarlinFormat,
-                tp_rank: u8,
-            ) -> ::anyhow::Result<Weights> {
-                // Bring the relocated `load*` extension traits into scope so
-                // the path-syntax `LinearLayer::load_dense_or_ggml(...)`,
-                // `RmsNorm::load(...)`, `MarlinLinear::load(...)`, … calls the
-                // body emits below resolve (the `load*` methods moved off the
-                // neutral type defs into `*Ops` traits in targets/cuda).
-                use crate::__gpu::layers::{
-                    LinearLayerOps as _, EmbeddingOps as _, RmsNormOps as _, LayerNormOps as _,
-                    GatedDeltaNetOps as _,
-                };
-                use crate::__gpu::layers_quant::{
-                    MarlinLoadOps as _, Fp8LoadOps as _, Fp8BlockLoadOps as _, Bnb4bitLoadOps as _,
-                };
-                use crate::__gpu::layers_moe::{
-                    DeepSeekV2MoEOps as _, DeepSeekV2Fp8BlockMoEOps as _, DeepSeekV2GgmlMoEOps as _,
-                    FusedMoEOps as _, SharedFusedMoEOps as _,
-                    Gemma4RouterOps as _, SwitchGluExpertsOps as _,
-                };
-                // Stream-based RotaryCache constructors moved off the neutral
-                // scratchy-layers type into this cuda extension trait.
-                use crate::__gpu::rotary::CudaRotaryExt as _;
-                #packed_splits_prelude
-                #marlin_prelude
-                #bnb4_prelude
-                #fp8_prelude
-                #rotary_prelude
-                #(#lets)*
-                #rotary_load
-                #rotary_local_load
-                Ok(#weights_ctor {
-                    #(#field_shorthand,)*
-                    #rotary_init
-                    #rotary_local_init
-                    #rope_context_init
-                    #[cfg(feature = "metal")]
-                    metal_pool: ::std::sync::OnceLock::new(),
-                    #[cfg(feature = "metal")]
-                    metal_guest: ::std::sync::OnceLock::new(),
-                })
-            }
 
-            /// Variant entry — threads this variant's MarlinFormat.
-            #[cfg(feature = "cuda")]
-            #[inline]
-            #[allow(clippy::not_unsafe_ptr_arg_deref)]
-            pub fn load(
-                gw: &mut crate::__gpu::weights::GpuWeights,
-                stream: crate::__gpu::CUstream,
-                max_model_len: usize,
-                tp_rank: u8,
-            ) -> ::anyhow::Result<Weights> {
-                load_with(gw, stream, max_model_len, #marlin_fmt, tp_rank)
-            }
 
-            /// Metal entry — same signature as cuda's `load` so the
-            /// top-level dispatching `Weights::load` walks both
-            /// backends through the same arms. `stream` is an alias
-            /// for `()` under metal (`scratchy_target_cuda::CUstream`)
+            /// Metal entry — same signature as the shared `load` so the
+            /// top-level dispatching `Weights::load` walks every
+            /// backend through the same arms. `stream` is an alias
+            /// for `()` under metal (`CUstream`)
             /// and is unused; the body shares the canonical's `lets`
             /// and `field_shorthand` — `LinearConcat` arms route
             /// through `LinearLayer::load_dense_concat_packed`. The
@@ -4757,7 +4382,7 @@ fn emit_weights_struct(
                 })
             }
 
-            /// Spyre load — same shape as the cuda/metal `load`: it builds the
+            /// Spyre load — same shape as the metal `load`: it builds the
             /// real `Weights` through `crate::__gpu`'s loader `*Ops`, which
             /// `scratchy-target-spyre` provides (backed by the neutral
             /// allocator-generic loaders + `SpyreAllocator`). `stream` is `()`
@@ -4786,7 +4411,7 @@ fn emit_weights_struct(
                 };
                 use crate::__gpu::rotary::CudaRotaryExt as _;
                 #packed_splits_prelude
-                // ⛔ THE SAME QUANT PRELUDES THE CUDA BODY GETS, because the
+                // ⛔ THE SAME QUANT PRELUDES THE SHARED BODY GETS, because the
                 // `#lets` below are the SAME per-accessor load plans and they
                 // REFERENCE these bindings (`__fp8_dtype`, `__marlin_ws`,
                 // `__bnb_code`). Omitting them here does not disable quant on
@@ -4815,18 +4440,6 @@ fn emit_weights_struct(
 
             #fingerprint_method
 
-            /// Shim — delegates to canonical's `load_with`.
-            #[cfg(feature = "cuda")]
-            #[inline]
-            #[allow(clippy::not_unsafe_ptr_arg_deref)]
-            pub fn load(
-                gw: &mut crate::__gpu::weights::GpuWeights,
-                stream: crate::__gpu::CUstream,
-                max_model_len: usize,
-                tp_rank: u8,
-            ) -> ::anyhow::Result<Weights> {
-                super::#canonical::load_with(gw, stream, max_model_len, #marlin_fmt, tp_rank)
-            }
 
             /// Metal shim — delegates to canonical's metal `load`.
             /// Same signature as cuda's shim above; `stream` is `()`
@@ -5092,7 +4705,7 @@ fn layer_templated_prefix_expr(
 
 /// Strip the `model.layers.0.` prefix to recover the per-layer
 /// suffix string the `load_layered_*` helpers in
-/// `scratchy_target_cuda::loaders` take. E.g. `"model.layers.0.input_layernorm"`
+/// `scratchy_layers::loaders` take. E.g. `"model.layers.0.input_layernorm"`
 /// → `"input_layernorm"`. Panics on prefixes that don't start with
 /// `model.layers.0.` — every layered accessor's L=0 prefix carries
 /// that prefix by construction (see [`safetensors_prefix`]); a
@@ -5232,10 +4845,9 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             // Fused QKV / gate_up are always column-parallel — no
             // row-parallel concat exists in any current arch. Under
             // metal the macro emits a stream-free `_concat_packed`
-            // path (CPU-concat then one allocator call); cuda keeps
-            // the GGUF/safetensors `_or_ggml` path with stream-based
-            // async DMA. Sharded variants stay cuda-only — single-
-            // GPU is the only metal target initially.
+            // path (CPU-concat then one allocator call); other builds
+            // keep the GGUF/safetensors `_or_ggml` path. Metal is
+            // single-GPU, so it emits no sharded variant.
             if cfg!(feature = "metal") {
                 quote! {
                     let #name = crate::__gpu::layers::LinearLayer::load_dense_concat_packed(
@@ -6025,7 +5637,7 @@ fn emit_group_let(
 /// only attaches to the `lm_head` accessor, which is unindexed.
 /// `DeepSeekV2Moe` falls through to a layered-MoE helper still
 /// emitted inline (only DeepSeek arches use it; not worth a helper
-/// crossing the scratchy-forward-compiler / scratchy-target-cuda seam).
+/// crossing the scratchy-forward-compiler / target-crate seam).
 fn emit_layered_load_body(
     plan: &FieldLoad,
     n_layers: u32,
@@ -7024,10 +6636,7 @@ pub(crate) fn weight_kind_accessor_method(kind: &crate::weight_vocab::WeightKind
 /// the matching `Instruction<W>` variants migrate off
 /// `WtFn`/`CosSinFn`.
 fn emit_weight_accessors_impl(
-    canonical_lowered: &BTreeMap<
-        crate::assignment::WorkloadPoint,
-        (CanonicalLowered, u32, u32, u32, SlotMap),
-    >,
+    canonical_lowered: &BTreeMap<WorkloadPoint, (CanonicalLowered, u32, u32, u32, SlotMap)>,
     variant_name: &str,
 ) -> TokenStream {
     use crate::weight_vocab::WeightKind;
@@ -7366,11 +6975,11 @@ fn emit_weight_accessors_impl(
     // Emit the impl unconditionally — `CanonicalParams: WeightAccessors`
     // is an unconditional bound, so leaving this behind a feature gate
     // would surface as `Weights: WeightAccessors not satisfied` in any
-    // arch whose own `metal`/`cuda` feature is empty
+    // arch whose own `metal` feature is empty
     // or absent (e.g. phi3 which declares `metal = []`).
     // The trait methods all return cross-backend types from
-    // `scratchy_target_cuda::layers{,_moe}` plus `GpuTensor` from
-    // `scratchy-target-cuda` — both available regardless of backend feature.
+    // `scratchy_layers::layers{,_moe}` plus `GpuTensor` from
+    // `scratchy-tensors` — both available regardless of backend feature.
     quote! {
         impl ::scratchy_forward_compiler::WeightAccessors for Weights {
             #rms_norm
@@ -7395,47 +7004,6 @@ fn emit_weight_accessors_impl(
     }
 }
 
-/// Emit the `MarlinFormat` const this variant's `load` passes into
-/// the (canonical or shared) `load_with` body. For non-Marlin
-/// variants (dense / BNB4 / FP8 later) the value is still a valid
-/// `MarlinFormat` — the `load_with` body just doesn't reference
-/// `marlin_storage`, so the const is never read.
-fn marlin_format_literal(model: &ModelParams) -> TokenStream {
-    use crate::quantization::QuantMethod;
-    match model.quantization.as_ref().map(|qc| &qc.method) {
-        Some(QuantMethod::Awq { group_size, .. }) => {
-            let gs = proc_macro2::Literal::u32_unsuffixed(*group_size);
-            quote! {
-                crate::__gpu::layers_quant::MarlinFormat::Awq { group_size: #gs }
-            }
-        }
-        Some(QuantMethod::Gptq {
-            group_size,
-            desc_act,
-            layout,
-            ..
-        }) => {
-            let gs = proc_macro2::Literal::u32_unsuffixed(*group_size);
-            let da = *desc_act;
-            let layout_ts = gptq_layout_ts(*layout);
-            quote! {
-                crate::__gpu::layers_quant::MarlinFormat::Gptq {
-                    group_size: #gs,
-                    desc_act: #da,
-                    layout: #layout_ts,
-                }
-            }
-        }
-        // Dense / BNB4 / other: emit a placeholder; `load_with` in
-        // those equivalence classes never reads the param. Keeping
-        // a non-unit value here means the emitted const is well-
-        // typed regardless of arch / quant family.
-        _ => quote! {
-            crate::__gpu::layers_quant::MarlinFormat::Awq { group_size: 128 }
-        },
-    }
-}
-
 // ── Forward fn emission ──────────────────────────────────────────
 //
 // The macro lowers each canonical tape_index's solved FUF into a flat
@@ -7448,15 +7016,14 @@ fn marlin_format_literal(model: &ModelParams) -> TokenStream {
 // 3. calls `__interpret(&FORWARD_M_<N>, &mut __tiles, …)`,
 // 4. takes ownership of the slot the lowering tagged as final.
 //
-// Buckets in the same SFUF equivalence class as a canonical share
-// the canonical's body via thin `#[inline(always)]` wrappers — same
-// dedup the previous codegen path used.
+// Buckets that fold onto a canonical share the canonical's body via
+// the bucket table.
 
 /// Ident for a per-workload-tape_index `static <PREFIX>_<m>: &[Op]`.
 /// Mirrors [`bucket_fn_ident`] in shape but uses upper-case so the
 /// emitted module reads naturally — `FORWARD_M_64` /
 /// `BACKBONE_M_64_SK_2048`.
-fn bucket_static_ident(prefix: &str, wp: crate::assignment::WorkloadPoint) -> proc_macro2::Ident {
+fn bucket_static_ident(prefix: &str, wp: WorkloadPoint) -> proc_macro2::Ident {
     if wp.sk_bucket == 0 {
         format_ident!("{}_{}", prefix, wp.num_tokens)
     } else {
@@ -7504,10 +7071,8 @@ fn last_non_splice_node(fuf: &Fuf) -> Option<&crate::fuf::FufNode> {
 ///
 /// - [`BackboneLayout::Decoder`] — the FUF ends in `gemm(<tile>,
 ///   lm_head)` (or that gemm followed by an `AllGather` at tp>1).
-///   The backbone is everything except the terminal subgraph; the
-///   `(TileId, u8)` it carries is the lm_head Gemm's hidden-state
-///   input — the slot `forward_backbone` returns and the slot the
-///   lm_head slice reads.
+///   The backbone is everything except the lm_head Gemm, whose
+///   hidden-state input is what `forward_backbone` returns.
 /// - [`BackboneLayout::Encoder`] — the FUF's terminal is NOT
 ///   `gemm(_, lm_head)`. Covers text-side encoders (ModernBERT)
 ///   AND every `#[vision_forward]` body (Qwen2-VL / Qwen2.5-VL /
@@ -7517,7 +7082,7 @@ fn last_non_splice_node(fuf: &Fuf) -> Option<&crate::fuf::FufNode> {
 ///   directly.
 #[derive(Clone, Copy, Debug)]
 enum BackboneLayout {
-    Decoder { backbone_out: (TileId, u8) },
+    Decoder,
     Encoder,
 }
 
@@ -7801,20 +7366,17 @@ fn backbone_layout(fuf: &Fuf, program: &Program) -> BackboneLayout {
         return BackboneLayout::Encoder;
     }
     match lm_head_node.inputs.first() {
-        Some(FufInput::Tile { id, slot }) => BackboneLayout::Decoder {
-            backbone_out: (*id, *slot),
-        },
+        Some(FufInput::Tile { .. }) => BackboneLayout::Decoder,
         _ => BackboneLayout::Encoder,
     }
 }
 
-/// Build the workload-point bounds map `lower_bucket` and Impls
-/// consume — model.bounds + the workload-specific `num_tokens` and
-/// `sk_bucket` overrides. Mirrors what `solve_workloads` does before
-/// each per-point solve.
+/// Build the workload-point bounds map the tape lowering consumes —
+/// model.bounds + the workload-specific `num_tokens` and `sk_bucket`
+/// overrides.
 fn bounds_for_wp(
     model: &ModelParams,
-    wp: crate::assignment::WorkloadPoint,
+    wp: WorkloadPoint,
     tp_world_size: u8,
 ) -> BTreeMap<String, u64> {
     let mut bounds = model.bounds.clone();
@@ -7840,6 +7402,212 @@ fn bounds_for_wp(
         }
     }
     bounds
+}
+
+/// The model as the target-emitter seam takes it: the shared front end's canonical at every
+/// workload point (or its refusal), and the config facts a target reads beside a canonical.
+/// Target-neutral: every value is a fact about the model.
+#[cfg(feature = "target-emitter")]
+fn target_model_input(
+    program: &Program,
+    model: &ModelParams,
+    fuf: &Fuf,
+    inferred: &crate::shape::Inferred,
+    workloads: &WorkloadPoints,
+    tp_world_size: u8,
+) -> scratchy_subtile::handoff::TargetModelInput {
+    use scratchy_subtile::handoff::{
+        TargetBucket, TargetGdnFacts, TargetModelFacts, TargetModelInput, TargetPoint,
+    };
+    let stem = &model.source_stem;
+    let point = |wp: &WorkloadPoint| {
+        let fit = |what: &str, v: u64| {
+            u32::try_from(v).unwrap_or_else(|_| panic!("[target-emitter] {stem}: {what} {v}"))
+        };
+        TargetPoint {
+            m: fit("num_tokens", wp.num_tokens),
+            sk: fit("sk_bucket", wp.sk_bucket),
+        }
+    };
+    let mut buckets = Vec::new();
+    let mut unlowered = Vec::new();
+    for wp in workloads.iter() {
+        let bounds = bounds_for_wp(model, *wp, tp_world_size);
+        let prefix =
+            crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap());
+        let at = point(wp);
+        match crate::to_wavefront::lower_decode_to_wavefront(
+            fuf,
+            inferred,
+            &bounds,
+            model,
+            prefix,
+            at.m,
+            crate::to_wavefront::DenseExperts::Lower,
+        ) {
+            Ok(lowered) => buckets.push(TargetBucket { point: at, lowered }),
+            Err(e) => unlowered.push((at, e.to_string())),
+        }
+    }
+    let bound = |k: &str| model.bounds.get(k).map(|&v| v as u32);
+    let head_dim = bound("head_dim").unwrap_or(0);
+    let gdn = fuf
+        .nodes
+        .iter()
+        .any(|n| n.op == OpKind::GatedDeltaNet)
+        .then(|| {
+            let need = |k: &str| {
+                bound(k).unwrap_or_else(|| {
+                    panic!("[target-emitter] {stem}: a Gated-DeltaNet model with no `{k}`")
+                })
+            };
+            TargetGdnFacts {
+                num_k_heads: need("linear_num_key_heads"),
+                head_k: need("linear_key_head_dim"),
+                conv_kernel: need("linear_conv_kernel_dim"),
+            }
+        });
+    // Every weight a canonical binds, named as the checkpoint names it. A tied lm_head is lent the
+    // embedding table's prefix, as every target's loader reads it.
+    use scratchy_forward_compiler::LentWeight;
+    let lm_head = program.weights.find(&["lm_head"]);
+    let weights: std::collections::BTreeSet<(u32, Option<UnrollIndex>)> = (buckets.iter())
+        .flat_map(|b| b.lowered.bindings.iter())
+        .filter_map(|b| match *b {
+            scratchy_subtile::handoff::SourceBinding::Weight { id, index } => Some((id, index)),
+            _ => None,
+        })
+        .collect();
+    let weight_prefixes = (weights.into_iter())
+        .map(|(id, index)| {
+            let own =
+                || safetensors_prefix(program.weight_naming(), &model.arch, WeightId(id), index);
+            let prefix = match (lm_head, index) {
+                (Some(head), None) if head == WeightId(id) => {
+                    lent_weight_prefix(program, fuf, model, LentWeight::LmHead).unwrap_or_else(own)
+                }
+                _ => own(),
+            };
+            (id, index, prefix)
+        })
+        .collect();
+    // Every bundle tensor a canonical binds that has a checkpoint leaf, named in full: the
+    // bundle's own prefix, its suffix rewritten as the shared table says, then the leaf.
+    let bundle_tensors: std::collections::BTreeMap<_, _> = (buckets.iter())
+        .flat_map(|b| b.lowered.bindings.iter())
+        .filter_map(|b| match *b {
+            scratchy_subtile::handoff::SourceBinding::BundleTensor { id, index, tensor } => {
+                Some(((id, index, tensor.name()), tensor))
+            }
+            _ => None,
+        })
+        .collect();
+    let bundle_tensor_names = (bundle_tensors.into_iter())
+        .filter_map(|((id, index, _), tensor)| {
+            use scratchy_subtile::handoff::{BUNDLE_PREFIX_REWRITES, BUNDLE_TENSOR_LEAVES};
+            let leaf =
+                (BUNDLE_TENSOR_LEAVES.iter()).find_map(|&(t, l)| (t == tensor).then_some(l))?;
+            let prefix =
+                safetensors_prefix(program.weight_naming(), &model.arch, WeightId(id), index);
+            let prefix = (BUNDLE_PREFIX_REWRITES.iter())
+                .find_map(|&(from, to)| {
+                    let base = prefix.strip_suffix(from)?;
+                    (base.is_empty() || base.ends_with('.')).then(|| format!("{base}{to}"))
+                })
+                .unwrap_or(prefix);
+            Some((id, index, tensor, format!("{prefix}.{leaf}")))
+        })
+        .collect();
+    let sliding = (fuf.nodes.iter()).any(|n| {
+        matches!(
+            n.op,
+            OpKind::SlidingAttention | OpKind::SinkSlidingAttention
+        )
+    });
+    let attn_classes = target_attn_classes(model, tp_world_size, head_dim, sliding);
+    // The arch is the config's directory (`configs/<arch>/<stem>.json`), the name the build
+    // scopes by; `model.arch` is the declared arch spec, not its name.
+    let arch = (model.source_path.parent())
+        .and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or_else(|| panic!("[target-emitter] {stem}: no arch directory"))
+        .to_string();
+    TargetModelInput {
+        stem: stem.clone(),
+        arch,
+        buckets,
+        unlowered,
+        weight_prefixes,
+        embed_prefix: lent_weight_prefix(program, fuf, model, LentWeight::EmbedTokens),
+        bundle_tensor_names,
+        facts: TargetModelFacts {
+            head_dim,
+            rot_dim: rot_dim(model, head_dim),
+            rope_theta: declared_rope_theta(model),
+            rms_norm_eps: rms_norm_eps(model),
+            vocab_size: bound("vocab_size").unwrap_or(0),
+            gdn,
+            dsl_shared_expert_bases: program.weights.shared_expert_bases(),
+            attn_classes,
+        },
+    }
+}
+
+/// The model's attention classes, for the target-emitter seam: the base class (its rope base
+/// frequency `rope_local_base_freq` on a hybrid arch, which rotates its sliding layers by the
+/// local table, else `rope_theta`; its window `sliding_window` when the DSL has a sliding
+/// attention, `sliding`), then the global class ([`global_attn_class`]) when its geometry is not
+/// the base's.
+#[cfg(feature = "target-emitter")]
+fn target_attn_classes(
+    model: &ModelParams,
+    tp_world_size: u8,
+    head_dim: u32,
+    sliding: bool,
+) -> Vec<scratchy_subtile::handoff::TargetAttnClass> {
+    use scratchy_subtile::handoff::{RopePairing, TargetAttnClass};
+    let tp = u32::from(tp_world_size);
+    let kv_heads = model
+        .bounds
+        .get("num_key_value_heads")
+        .map_or(0, |&v| v as u32)
+        / tp;
+    let base_rot = rot_dim(model, head_dim);
+    let global = global_attn_class(model, tp, (head_dim, kv_heads, base_rot));
+    let theta = declared_rope_theta(model);
+    let local_theta = (model.scalars.get("rope_local_base_freq").copied())
+        .or_else(|| model.bounds.get("rope_local_base_freq").map(|&v| v as f64));
+    let window = (model.bounds.get("sliding_window"))
+        .and_then(|&w| u32::try_from(w).ok())
+        .and_then(std::num::NonZeroU32::new);
+    let hybrid =
+        (global.head_dim, global.kv_heads, global.rot_dim) != (head_dim, kv_heads, base_rot);
+    let base = TargetAttnClass {
+        head_dim,
+        kv_heads,
+        rot_dim: base_rot,
+        rope_theta: match hybrid {
+            true => local_theta.or(theta),
+            false => theta,
+        },
+        pairing: RopePairing::HalfRotated,
+        window: window.filter(|_| sliding),
+    };
+    let mut classes = vec![base];
+    if hybrid {
+        classes.push(TargetAttnClass {
+            head_dim: global.head_dim,
+            kv_heads: global.kv_heads,
+            rot_dim: global.rot_dim,
+            rope_theta: theta,
+            pairing: match global.proportional {
+                true => RopePairing::HalfHead,
+                false => RopePairing::HalfRotated,
+            },
+            window: None,
+        });
+    }
+    classes
 }
 
 /// Whether this model uses rotary position embeddings — any `Rotary` extern
@@ -8174,13 +7942,7 @@ fn emit_canonical_params_impl(
     // the full `head_dim`. Without this the impl falls back to the trait
     // default `ROT_DIM = HEAD_DIM`, so the kernel rotates head_dim dims
     // against a rotary_dim-wide cos/sin cache → partial-rope arches break.
-    let rot_dim_val: u32 = model
-        .scalars
-        .get("partial_rotary_factor")
-        .copied()
-        .filter(|&f| (f - 1.0).abs() > 1e-9)
-        .map(|f| (f * head_dim as f64).round() as u32)
-        .unwrap_or(head_dim);
+    let rot_dim_val: u32 = rot_dim(model, head_dim);
     let rot_dim_lit = proc_macro2::Literal::u32_unsuffixed(rot_dim_val);
     // Per-layer-class geometry for hybrid sliding/global arches whose
     // classes differ in dims (Gemma4: sliding 256×8kv full-rope vs
@@ -8189,36 +7951,12 @@ fn emit_canonical_params_impl(
     // `global_partial_rotary_factor` feed the GLOBAL_* consts read by
     // the full-attention metal lowering arms; absent keys fall back to
     // the base values (uniform models unchanged).
-    let global_head_dim: u32 = model
-        .bounds
-        .get("global_head_dim")
-        .map(|&v| v as u32)
-        .unwrap_or(head_dim);
-    let num_global_kv_heads: u32 = model
-        .bounds
-        .get("num_global_key_value_heads")
-        .map(|&v| (v as u32) / tp)
-        .unwrap_or(num_kv_heads);
-    let global_rot_dim: u32 = model
-        .scalars
-        .get("global_partial_rotary_factor")
-        .copied()
-        .filter(|&f| (f - 1.0).abs() > 1e-9)
-        .map(|f| (f * global_head_dim as f64).round() as u32)
-        // Fallback must honor the BASE partial factor on uniform
-        // models (global_head_dim == head_dim): Qwen3.5's full-
-        // attention layers lower through the is_global arm, and the
-        // old `global_head_dim` fallback rotated the FULL 256-dim
-        // head against the 64-wide partial cos/sin table — rows past
-        // the table read zeros and zeroed Q/K for every token beyond
-        // ~4 (the "rambling, input-blind thinker" failure). Hybrid
-        // arches with distinct global dims and genuinely full global
-        // rope (no factor) keep the old fallback.
-        .unwrap_or(if global_head_dim == head_dim {
-            rot_dim_val
-        } else {
-            global_head_dim
-        });
+    let GlobalAttnClass {
+        head_dim: global_head_dim,
+        kv_heads: num_global_kv_heads,
+        rot_dim: global_rot_dim,
+        proportional: rope_proportional,
+    } = global_attn_class(model, tp, (head_dim, num_kv_heads, rot_dim_val));
     // GUARD: the rope cos/sin table is
     // rotary_dim wide; a kernel-side rot const that disagrees reads
     // past the table into zeros and silently zeroes Q/K for every
@@ -8239,12 +7977,6 @@ fn emit_canonical_params_impl(
     let num_global_kv_heads_lit = proc_macro2::Literal::u32_unsuffixed(num_global_kv_heads);
     let global_rot_dim_lit = proc_macro2::Literal::u32_unsuffixed(global_rot_dim);
     let global_q_size_lit = proc_macro2::Literal::usize_unsuffixed(global_q_size);
-    // Proportional rope marker — same predicate that routes the
-    // rotary cache builder to `new_proportional_from_gpuweights`.
-    // Drives the metal rope kernel's pairing offset (lane i pairs
-    // with i + head_dim/2, not i + rot_dim/2).
-    let rope_proportional = global_rot_dim != global_head_dim
-        && model.scalars.contains_key("global_partial_rotary_factor");
     let rope_proportional_tokens: proc_macro2::TokenStream = if rope_proportional {
         quote! { const ROPE_PROPORTIONAL: bool = true; }
     } else {
@@ -8505,10 +8237,8 @@ fn emit_canonical_params_impl(
         // `CanonicalParams` is backend-agnostic — the trait, its
         // associated `const`s, and every callsite (`<W as
         // CanonicalParams>::HEAD_DIM`) live in `scratchy-forward-compiler` with
-        // no cuda gating. So this impl applies under either
-        // `cfg(feature = "cuda")` (where `Weights` is the loader
-        // struct) or `cfg(feature = "metal")` (where `Weights` is
-        // the ZST emitted in `emit_weights_struct`).
+        // no backend gating. So this impl applies under every
+        // backend feature.
         impl ::scratchy_forward_compiler::CanonicalParams for Weights {
             const HEAD_DIM: u32 = #head_dim_lit;
             const NUM_Q_HEADS: u32 = #num_q_heads_lit;
@@ -10621,14 +10351,13 @@ fn dump_wavefront_mega(
     program: &Program,
     model: &ModelParams,
     fuf: &Fuf,
-    decode_asn: &crate::assignment::Assignment,
     inferred: &crate::shape::Inferred,
     decode_bounds: &BTreeMap<String, u64>,
     backbone_slots: &[Vec<WeightSlot>],
     lm_head_slots: &[Vec<WeightSlot>],
     bb_bucket_id: u32,
     // Out: under `-Fspyre` the embedded `pub const KTIR_BUNDLE` token stream
-    // (spliced into the per-model module); empty under cuda/metal.
+    // (spliced into the per-model module); empty under metal.
     ktir_bundle_out: &mut proc_macro2::TokenStream,
 ) {
     use crate::to_wavefront;
@@ -10643,8 +10372,8 @@ fn dump_wavefront_mega(
     // — see `lower_subtile_tape_to_ktir`).
     //
     // The default is the model's own context length, capped at `PREFIX_CAP_DEFAULT`
-    // so a plain `cargo build -Fspyre` produces a usable chat binary (the cuda/metal
-    // targets need no such knob — their kernels take `decode_position` as a runtime
+    // so a plain `cargo build -Fspyre` produces a usable chat binary (the metal
+    // target needs no such knob — their kernels take `decode_position` as a runtime
     // arg over a host-allocated cache; a KTIR bundle is a static-shape graph, so the
     // prefix cache is a baked dimension). The cap is deliberately modest: the
     // ktir-emulator decode is O(capacity) per token — it masks over the WHOLE prefix
@@ -10673,22 +10402,6 @@ fn dump_wavefront_mega(
     // Primary bundle row count: 1 = decode (default), >1 = the mq golden-gate
     // knob. The worker's batched-prefill bundle is emitted separately below
     // (default m = prefix_len; `KTIR_PREFILL_LEN` overrides).
-    // Tape-scheduled targets skip instruction selection, so there is no solve
-    // to cross-check the bridge against.
-    #[cfg(any(feature = "metal", feature = "spyre"))]
-    let tape_pilot_arch_wf = true;
-    #[cfg(not(any(feature = "metal", feature = "spyre")))]
-    let tape_pilot_arch_wf = false;
-    // The bridge takes the assignment ONLY to cross-check that the solve
-    // covered every tile (to_wavefront.rs, the `subgraph_of` guard); it reads
-    // nothing else from it. A tape-scheduled build never solves, so there is
-    // no coverage to check and passing `None` skips a check that would
-    // otherwise fail against a deliberately-empty assignment.
-    let decode_asn_check = if tape_pilot_arch_wf {
-        None
-    } else {
-        Some(decode_asn)
-    };
     let primary_m: u32 = std::env::var("KTIR_M")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -10696,12 +10409,12 @@ fn dump_wavefront_mega(
         .unwrap_or(1);
     let lowered = match crate::to_wavefront::lower_decode_to_wavefront(
         fuf,
-        decode_asn_check,
         inferred,
         decode_bounds,
         model,
         crate::to_wavefront::PrefixCapacity::new(prefix_len),
         primary_m,
+        crate::to_wavefront::DenseExperts::Refuse,
     ) {
         // A quant weight scheme the wavefront/superdsc lowering does not emit (int4/ggml, or fp8 until
         // wired) genuinely has NO superdsc bundle — skip THIS preset (return no bundle). This
@@ -10744,17 +10457,11 @@ fn dump_wavefront_mega(
             panic!("[wavefront] {stem}: superdsc decode NOT LOWERED — {e}");
         }
     };
-    let st = to_wavefront::stats(fuf, decode_asn, &lowered);
+    let st = to_wavefront::stats(fuf, &lowered);
     eprintln!(
-        "[wavefront] {stem}: {} fuf tiles, {} subgraphs → {} sources ({} weights, \
+        "[wavefront] {stem}: {} fuf tiles → {} sources ({} weights, \
          {} prefix-kv), {} ops; ops {:?}",
-        st.fuf_tiles,
-        st.subgraphs,
-        st.sources,
-        st.weight_sources,
-        st.prefix_sources,
-        st.ops,
-        st.op_histogram,
+        st.fuf_tiles, st.sources, st.weight_sources, st.prefix_sources, st.ops, st.op_histogram,
     );
 
     let base_to_loc = to_wavefront::build_base_to_loc(backbone_slots, lm_head_slots, bb_bucket_id);
@@ -12647,7 +12354,6 @@ fn dump_wavefront_mega(
             for cap in caps {
                 let lwd = match crate::to_wavefront::lower_decode_to_wavefront(
                     fuf,
-                    decode_asn_check,
                     inferred,
                     decode_bounds,
                     model,
@@ -12655,6 +12361,7 @@ fn dump_wavefront_mega(
                         std::num::NonZeroU32::new(cap).expect("cap bucket is non-zero"),
                     ),
                     primary_m,
+                    crate::to_wavefront::DenseExperts::Refuse,
                 ) {
                     Ok(l) => l,
                     Err(e) => panic!("[wavefront] {stem}: decode (cap={cap}) NOT LOWERED — {e}"),
@@ -12718,12 +12425,12 @@ fn dump_wavefront_mega(
             {
                 match crate::to_wavefront::lower_decode_to_wavefront(
                     fuf,
-                    decode_asn_check,
                     inferred,
                     decode_bounds,
                     model,
                     crate::to_wavefront::PrefixCapacity::new(prefix_len),
                     seqs,
+                    crate::to_wavefront::DenseExperts::Refuse,
                 ) {
                     Ok(lwd_b) => {
                         emit_bundle(
@@ -12953,7 +12660,6 @@ fn dump_wavefront_mega(
             prefill_rung_widths.par_iter().map(|&pl| -> Result<RungBake, (u32, String)> {
             let lowered = to_wavefront::lower_decode_to_wavefront(
                 fuf,
-                decode_asn_check,
                 inferred,
                 decode_bounds,
                 model,
@@ -12974,6 +12680,7 @@ fn dump_wavefront_mega(
                 // causally, and chunk k attends the k*mq rows written so far.
                 crate::to_wavefront::PrefixCapacity::new(prefix_len),
                 pl,
+                crate::to_wavefront::DenseExperts::Refuse,
             );
             match lowered {
                 Ok(lwd_p) => {
@@ -13083,12 +12790,12 @@ fn dump_wavefront_mega(
             for &m in &asked {
                 match crate::to_wavefront::lower_decode_to_wavefront(
                     fuf,
-                    decode_asn_check,
                     inferred,
                     decode_bounds,
                     model,
                     crate::to_wavefront::PrefixCapacity::new(prefix_len),
                     m,
+                    crate::to_wavefront::DenseExperts::Refuse,
                 ) {
                     Ok(lwd_p) => {
                         emit_bundle(
@@ -13190,12 +12897,12 @@ fn dump_wavefront_mega(
         let (_cb_decode_graph, mut cb_decode_groups): (String, GroupGraphs) =
             match crate::to_wavefront::lower_decode_to_wavefront(
                 fuf,
-                decode_asn_check,
                 inferred,
                 decode_bounds,
                 model,
                 crate::to_wavefront::PrefixCapacity::new(prefix_len),
                 decode_mq,
+                crate::to_wavefront::DenseExperts::Refuse,
             ) {
                 Ok(lwd_cb) => {
                     let (_m, _n, sg, groups) = emit_bundle(
@@ -13627,9 +13334,7 @@ pub fn emit_model(
     program: &Program,
     model: &ModelParams,
     fuf: &Fuf,
-    sfufs: &WorkloadAssignments,
-    loops: &WorkloadLoops,
-    lib: &ImplementationLibrary,
+    workloads: &WorkloadPoints,
     manifest: &crate::weights_manifest::WeightsManifest,
     // Shape inference for this arch — threaded only so the PD-wavefront
     // macro-emission (`dump_wavefront_mega`) can resolve weight shapes;
@@ -13639,7 +13344,7 @@ pub fn emit_model(
     tp_world_size: u8,
     emit_fingerprint: bool,
     // The canonical's affine rows, for a shim whose own accessor set
-    // yields none (metal: the shim's set is ISel's, empty there) — its
+    // yields none (a shim lowers no tape, so it has no accessors) — its
     // delegated load reads the canonical's widths, so its fingerprint
     // gate must too. `None` for canonicals themselves.
     canonical_affine_rows: Option<&[(String, u32, u32)]>,
@@ -13653,17 +13358,10 @@ pub fn emit_model(
     // Encoder when the terminal isn't `gemm(_, lm_head)`. No
     // separate vision flag needed.
 
-    // Backend dispatch: route to Metal codegen if target is Metal
-    // Note: target_profile is not passed to emit_model, so we infer from lib
-    // For now, emit CUDA code (Metal codegen integration is Phase 3.2+)
-    // TODO: Add target_profile parameter and dispatch based on backend
-
     if let Some(canonical) = canonical_override {
         return emit_shim_model(
             program,
             fuf,
-            sfufs,
-            lib,
             model,
             manifest,
             canonical,
@@ -13672,19 +13370,16 @@ pub fn emit_model(
             canonical_affine_rows,
         );
     }
-    // The struct emitter, callable twice: once with instruction
-    // selection's accessors and — for a tape-scheduled arch, after
-    // the front-end swap has produced them — once with the tape's.
-    // Returns the emitted tokens alongside the affine rows its
+    // The struct emitter. Metal calls it twice: once with no accessors
+    // and — after the front-end swap has produced them — once with the
+    // tape's. Returns the emitted tokens alongside the affine rows its
     // fingerprint gate carries (the tape call's rows are what survive
     // — `weights_affine_rows` is overwritten alongside `weights`).
     let emit_struct = |tape_accs: Option<&[WeightAccessor]>| {
         emit_weights_struct(
             program,
             fuf,
-            sfufs,
             tape_accs,
-            lib,
             model,
             manifest,
             WeightsEmitMode::Canonical,
@@ -13699,33 +13394,22 @@ pub fn emit_model(
     let (mut weights, mut weights_affine_rows) = emit_struct(None);
     // THE MODEL'S WEIGHT BINDING, from the tape both backends lower.
     //
-    // Instruction selection (cuda's solver) and metal's instruction-stream
-    // bridge are the only other producers of this set, and each is locked to
-    // its target — so under spyre BOTH are empty and the emitted `Weights`
-    // carried no weight fields at all. That absence is the whole reason the
-    // spyre worker re-finds every tensor at runtime by string-formatting
-    // `"{disk}.weight"`: there was no field for a binding to name.
-    //
     // `accessors_from_tape` reads only `LoweredDecode.bindings` + the op that
     // consumes each one, so it is a fact about the MODEL. The struct it feeds
     // is already target-neutral (`crate::__gpu::layers::*`, where `__gpu` is
     // the per-target alias), so the same fields compile and load on any
     // backend.
-    #[cfg(all(feature = "spyre", not(feature = "metal")))]
+    #[cfg(not(feature = "metal"))]
     let (weights, weights_affine_rows) = {
-        let lowered = sfufs
-            .per_workload
-            .keys()
+        let lowered = workloads
+            .iter()
             .find(|w| w.num_tokens == 1)
-            .or_else(|| sfufs.per_workload.keys().next())
+            .or_else(|| workloads.iter().next())
             .copied()
             .and_then(|wp| {
                 let bounds = bounds_for_wp(model, wp, tp_world_size);
-                // Tape-authoritative: no assignment (there is no solve under
-                // spyre), exactly as the bucket-folding lowering below.
                 crate::to_wavefront::lower_decode_to_wavefront(
                     fuf,
-                    None,
                     inferred,
                     &bounds,
                     model,
@@ -13733,6 +13417,7 @@ pub fn emit_model(
                         std::num::NonZeroU32::new(8192).expect("8192 != 0"),
                     ),
                     wp.num_tokens as u32,
+                    crate::to_wavefront::DenseExperts::Refuse,
                 )
                 .ok()
             });
@@ -13772,7 +13457,10 @@ pub fn emit_model(
         // The id → FIELD binding, emitted INTO THE SAME MODULE as the struct so
         // its arms can name `w.self_attn_q_proj[3]` directly. This is what the
         // worker's `"{disk}.weight"` lookup is replaced by; only generated code
-        // can name a generated field.
+        // can name a generated field. Spyre's alone: no other backend binds through it.
+        #[cfg(not(feature = "spyre"))]
+        let bindings = quote! {};
+        #[cfg(feature = "spyre")]
         let bindings = match (lowered.as_ref(), tw.as_ref()) {
             (Some(l), Some(t)) => crate::weight_bindings::emit_weight_bindings(l, program, t)
                 .unwrap_or_else(|e| panic!("[weight-bindings] {}: {e}", model.source_stem)),
@@ -13799,56 +13487,35 @@ pub fn emit_model(
         };
         (quote! { #struct_tokens #bindings }, struct_affine_rows)
     };
-    #[cfg(not(any(feature = "metal", feature = "spyre")))]
-    let (weights, weights_affine_rows) = emit_struct(None);
 
-    // Group workload points by SFUF signature (sorted subgraph → impl).
-    // Buckets with identical impl picks produce byte-identical fn
-    // bodies, so we lower the canonical ONCE and emit duplicates as
-    // thin `#[inline(always)]` shims that delegate to the canonical
-    // fn. Public API (every `forward_m_<M>[_sk_<SK>]` /
+    // Group workload points by TAPE fingerprint. Buckets that lower to
+    // the same tape produce byte-identical fn bodies, so the canonical
+    // is lowered ONCE and duplicates delegate to it through the bucket
+    // table. Public API (every `forward_m_<M>[_sk_<SK>]` /
     // `forward_backbone_m_<M>[_sk_<SK>]` name a user might take a
     // fn-pointer to) is preserved. Dedup runs over `(num_tokens,
-    // sk_bucket)` 2-D points so models with `sk_buckets` declared get
-    // the same compile-time win.
-    // Metal and spyre both lower from the shared tape; cuda is the instruction-selection path.
-    #[cfg(any(feature = "metal", feature = "spyre"))]
-    let tape_pilot_arch = true;
-    #[cfg(not(any(feature = "metal", feature = "spyre")))]
-    let tape_pilot_arch = false;
-    let bucket_points: Vec<crate::assignment::WorkloadPoint> =
-        sfufs.per_workload.keys().copied().collect();
-    let mut sfuf_to_canonical: HashMap<Vec<(u32, u32)>, crate::assignment::WorkloadPoint> =
-        HashMap::new();
-    let mut bucket_canonical: Vec<crate::assignment::WorkloadPoint> =
-        Vec::with_capacity(bucket_points.len());
-    for wp in &bucket_points {
-        let sfuf = &sfufs.per_workload[wp];
-        let mut sig: Vec<(u32, u32)> = sfuf.impls.iter().map(|(sg, imp)| (sg.0, imp.0)).collect();
-        sig.sort();
-        let canonical = *sfuf_to_canonical.entry(sig).or_insert(*wp);
-        bucket_canonical.push(canonical);
-    }
-    // M2b step 3 (second half, transition): fold buckets by TAPE
-    // fingerprint — the tape lowered per point with its `m` fields
-    // normalized to a sentinel — and ASSERT it reproduces the
-    // solve's impl-signature folding for pilot arches. When this
-    // gate has held across the fleet, the tape folding replaces the
-    // solve as the bucket authority and the per-arch solve dies.
+    // sk_bucket)` 2-D points.
+    //
+    // Spyre folds every point onto the FIRST point: its per-bucket host
+    // tapes are all empty (the model runs from the embedded KTIR bundle).
+    let bucket_points: Vec<WorkloadPoint> = workloads.iter().copied().collect();
+    #[cfg(not(feature = "metal"))]
+    let bucket_canonical: Vec<WorkloadPoint> =
+        bucket_points.iter().map(|_| bucket_points[0]).collect();
     #[cfg(feature = "metal")]
-    if tape_pilot_arch {
-        let mut tape_to_canonical: HashMap<String, crate::assignment::WorkloadPoint> =
-            HashMap::new();
-        for (bi, wp) in bucket_points.iter().enumerate() {
+    let bucket_canonical: Vec<WorkloadPoint> = {
+        let mut tape_to_canonical: HashMap<String, WorkloadPoint> = HashMap::new();
+        let mut bucket_canonical = Vec::with_capacity(bucket_points.len());
+        for wp in &bucket_points {
             let bounds = bounds_for_wp(model, *wp, tp_world_size);
             let fp = match crate::to_wavefront::lower_decode_to_wavefront(
                 fuf,
-                None,
                 inferred,
                 &bounds,
                 model,
                 crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap()),
                 wp.num_tokens as u32,
+                crate::to_wavefront::DenseExperts::Refuse,
             ) {
                 Ok(l) => {
                     let m = wp.num_tokens as u32;
@@ -13893,21 +13560,10 @@ pub fn emit_model(
                 }
                 Err(e) => format!("REFUSED:{e:?}"),
             };
-            let tape_canonical = *tape_to_canonical.entry(fp).or_insert(*wp);
-            // The solve no longer runs for a pilot arch, so there is
-            // nothing to compare against — the tape IS the folding.
-            // (The equality this once asserted was proven across the
-            // pilot fleet before the solve was switched off; runtime
-            // bit-exactness is the standing gate now, per PLAN §M2b.)
-            let _unused_compare = (tape_canonical, bucket_canonical[bi]);
-            // The tape IS the bucket authority for a pilot arch now:
-            // assigned from its own folding. Byte-identical today (the
-            // assert above says so) — the point is that the solve's
-            // folding is no longer the SOURCE, which is what deleting
-            // the solve requires.
-            bucket_canonical[bi] = tape_canonical;
+            bucket_canonical.push(*tape_to_canonical.entry(fp).or_insert(*wp));
         }
-    }
+        bucket_canonical
+    };
 
     // Lower every canonical tape_index once, backbone-shaped: skip the
     // terminal subgraph (the `gemm(<final_norm>, lm_head)` row) and
@@ -13915,9 +13571,8 @@ pub fn emit_model(
     // forward_backbone share the backbone slice; forward additionally
     // runs LM_HEAD; forward_backbone DtoD-copies the backbone-output
     // slot. No more pair of near-identical full slices per tape_index.
-    let mut arch_opcodes = ArchOpcodes::new();
     let mut canonical_lowered: BTreeMap<
-        crate::assignment::WorkloadPoint,
+        WorkloadPoint,
         (
             CanonicalLowered,
             /* num_slots */ u32,
@@ -13931,269 +13586,43 @@ pub fn emit_model(
             crate::weight_vocab::SlotMap,
         ),
     > = BTreeMap::new();
-    // `last_node_id` must be the lm_head Gemm (tp=1) or the post-lm_head
-    // AllGather (tp>1), not one of the post-Embed `MmEmbedSplice` nodes
-    // that `tp_lowering::insert_mm_splices` appends. Those sit at fuf-
-    // array-tail but semantically belong near the Embed; walking past
-    // them with `last_non_splice_node` recovers the real terminal.
+    // `last_node_id` must be the lm_head Gemm, not one of the post-Embed `MmEmbedSplice` nodes
+    // that sit at fuf-array-tail but semantically belong near the Embed; walking past them with
+    // `last_non_splice_node` recovers the real terminal. The metal bucket facts walk the logits
+    // chain from it (#784).
     let last_node_id = last_non_splice_node(fuf)
         .expect("non-empty FUF expected")
         .id;
     let layout = backbone_layout(fuf, program);
-    // For encoder layouts (text-side encoders like ModernBERT AND
-    // every `#[vision_forward]` body) the FUF's terminal IS the
-    // backbone output; decoder layouts carry the lm_head Gemm's
-    // hidden-state input as the backbone output.
-    let backbone_out = match layout {
-        BackboneLayout::Decoder { backbone_out } => backbone_out,
-        BackboneLayout::Encoder => (last_node_id, 0),
-    };
-    // M2b step 3: a tape-scheduled pilot arch never runs the metal
-    // instruction-selection lowering — no colored_slot_map, no
-    // lower_bucket, no fan_out. The canonical tuple starts as an
-    // empty placeholder and the front-end swap below fills every
-    // field from the shared tape (a pilot whose swap then refuses
-    // panics loudly there — an empty stream cannot ship silently
-    // because the bucket table still reads these fields).
+    // The canonical tuple starts as an empty placeholder and the
+    // front-end swap below fills every field from the shared tape (a
+    // swap that then refuses panics loudly there — an empty stream
+    // cannot ship silently because the bucket table still reads these
+    // fields).
     for (i, wp) in bucket_points.iter().enumerate() {
         if bucket_canonical[i] != *wp {
             continue;
         }
-        if tape_pilot_arch {
-            canonical_lowered.insert(
-                *wp,
-                (
-                    CanonicalLowered {
-                        backbone: crate::interpreter_codegen::LoweredBucket {
-                            instances: Vec::new(),
-                            weight_slots: Vec::new(),
-                            barriers: Vec::new(),
-                        },
-                        lm_head: crate::interpreter_codegen::LoweredBucket {
-                            instances: Vec::new(),
-                            weight_slots: Vec::new(),
-                            barriers: Vec::new(),
-                        },
-                    },
-                    0,
-                    0,
-                    0,
-                    crate::weight_vocab::SlotMap::new(),
-                ),
-            );
-            continue;
-        }
-        let sfuf = &sfufs.per_workload[wp];
-        let loop_ir = loops
-            .per_workload
-            .get(wp)
-            .expect("schedule populated every key");
-        let bounds = bounds_for_wp(model, *wp, tp_world_size);
-        // Decoder mode skips the terminal subgraph in the backbone
-        // lowering and emits it as a separate LM_HEAD slice. Encoder
-        // mode lowers the entire pipeline as the backbone (no split).
-        let skip_subgraph = match layout {
-            BackboneLayout::Decoder { .. } => Some(
-                sfuf.subgraph_of(last_node_id)
-                    .expect("terminal tile must be in a subgraph"),
-            ),
-            BackboneLayout::Encoder => None,
-        };
-
-        // Protect the backbone output (`take_owned` reads it). For
-        // decoder we additionally protect the terminal slot so the
-        // backbone's drop pass leaves it free for lm_head to write.
-        let mut protected_bb: HashSet<(TileId, u8)> = HashSet::new();
-        protected_bb.insert(backbone_out);
-        if matches!(layout, BackboneLayout::Decoder { .. }) {
-            protected_bb.insert((last_node_id, 0));
-        }
-
-        // Per-tape_index colored slot map. Computed once and shared
-        // between backbone lowering and the lm_head fan_out so they
-        // agree on slot indices.
-        let slots = crate::interpreter_codegen::colored_slot_map(
-            fuf,
-            sfuf,
-            loop_ir,
-            lib,
-            None,
-            &protected_bb,
-        );
-        let backbone_slot = slots.of(backbone_out.0, backbone_out.1);
-        // In encoder mode `take_owned` of the backbone-output slot is
-        // also the terminal — the same slot index plays both roles.
-        let terminal_slot = match layout {
-            BackboneLayout::Decoder { .. } => slots.of(last_node_id, 0),
-            BackboneLayout::Encoder => backbone_slot,
-        };
-        let num_slots = slots.total();
-
-        // Decoder: skip the terminal subgraph so it emits as a
-        // separate lm_head slice. Encoder (text encoders OR vision
-        // bodies): pass `None` so the whole FUF lowers as backbone.
-        let lowered_bb = lower_bucket(
-            fuf,
-            sfuf,
-            loop_ir,
-            program,
-            model,
-            lib,
-            &bounds,
-            skip_subgraph,
-            &protected_bb,
-            &mut arch_opcodes,
-            &slots,
-        );
-
-        // LM_HEAD — only emitted in decoder mode. One row, computed
-        // by directly invoking the terminal subgraph's `fan_out`
-        // against the same slot map. Encoder mode (text encoders OR
-        // vision bodies) emits an empty slice — the whole pipeline
-        // already ran in the backbone.
-        let lowered_lm = match layout {
-            BackboneLayout::Decoder { .. } => {
-                let terminal_sg =
-                    skip_subgraph.expect("decoder layout always has a terminal subgraph");
-                let term_imp_id = sfuf
-                    .impl_of(terminal_sg)
-                    .expect("terminal subgraph has an Impl assignment");
-                let term_imp = lib.get(term_imp_id);
-                if !term_imp.emits_host_instruction() {
-                    // Claim-only terminal (e.g. spyre's `ktir_gemm` lm_head):
-                    // its real lowering is the embedded bundle, not a host
-                    // `Instruction`. The host-interpreter lm_head slice is not
-                    // emitted for such a target, so produce an empty bucket
-                    // (mirrors `lower_bucket`'s skip of claim-only impls).
-                    crate::interpreter_codegen::LoweredBucket {
-                        instances: Vec::new(),
-                        barriers: Vec::new(),
-                        weight_slots: Vec::new(),
-                    }
-                } else {
-                    let term_claimed = sfuf.tiles_in_subgraph(terminal_sg);
-                    let term_match = crate::impl_lib::MatchInfo {
-                        claimed_tiles: term_claimed.clone(),
-                        boundary_inputs: crate::interpreter_codegen::collect_boundary_inputs(
-                            fuf,
-                            &term_claimed,
-                        ),
-                        boundary_outputs: term_claimed,
-                    };
-                    let term_emits = term_imp
-                        .fan_out(&term_match, fuf, program, &bounds, &slots)
-                        .expect("terminal subgraph's Impl must implement fan_out");
-                    let term_accs =
-                        term_imp.required_weights(&term_match.claimed_tiles, fuf, program);
-                    let term_slots =
-                        crate::interpreter_codegen::weight_accessors_to_slots(&term_accs);
-                    let term_weight_slots: Vec<Vec<WeightSlot>> =
-                        term_emits.iter().map(|_| term_slots.clone()).collect();
-                    // Eval body lives in `scratchy_forward_compiler::Instruction::eval`
-                    // — `arch_opcodes` keeps the shape registration for
-                    // `emit_bucket_static_slice`'s shape-checking pass.
-                    // `extra_opcode_shapes` covers storage-polymorphic
-                    // impls (see the comment in `lower_bucket`).
-                    arch_opcodes.register(term_imp.opcode_shape());
-                    for extra in term_imp.extra_opcode_shapes() {
-                        arch_opcodes.register(extra);
-                    }
-                    let n = term_emits.len();
-                    crate::interpreter_codegen::LoweredBucket {
-                        instances: term_emits,
-                        // Terminal Impl (lm_head) is emitted ad-hoc here
-                        // outside the FUF walker, so we don't have its
-                        // dataflow. Conservative all-barriers — runtime
-                        // serializes the lm_head dispatches. Upgrading
-                        // this to a proper analysis means running the
-                        // same walker against the terminal Impl's
-                        // claimed tiles.
-                        barriers: vec![true; n],
-                        weight_slots: term_weight_slots,
-                    }
-                }
-            }
-            BackboneLayout::Encoder => crate::interpreter_codegen::LoweredBucket {
-                instances: Vec::new(),
-                barriers: Vec::new(),
-                weight_slots: Vec::new(),
-            },
-        };
-
         canonical_lowered.insert(
             *wp,
             (
                 CanonicalLowered {
-                    backbone: lowered_bb,
-                    lm_head: lowered_lm,
+                    backbone: crate::interpreter_codegen::LoweredBucket {
+                        instances: Vec::new(),
+                        weight_slots: Vec::new(),
+                        barriers: Vec::new(),
+                    },
+                    lm_head: crate::interpreter_codegen::LoweredBucket {
+                        instances: Vec::new(),
+                        weight_slots: Vec::new(),
+                        barriers: Vec::new(),
+                    },
                 },
-                num_slots,
-                backbone_slot,
-                terminal_slot,
-                slots,
+                0,
+                0,
+                0,
+                crate::weight_vocab::SlotMap::new(),
             ),
-        );
-    }
-
-    // Layer-template detection: collapse the contiguous repeating
-    // sub-sequence of the slice (the per-layer transformer body)
-    // into one `Instruction::Loop(N, body_len)` row + one
-    // iteration's body. Fused boundary effects (e.g., FusedAddRmsNorm
-    // absorbing layer L's final add into layer L+1's first norm)
-    // leave layer 0 / the last layer structurally distinct, so the
-    // detection picks the largest CONTIGUOUS run that genuinely
-    // repeats — middle layers — and keeps the boundary residues as
-    // straight-line code in prelude/suffix.
-    // Pre-attention chain synthesis (compiler-driven). Detect the
-    // contiguous `(FusedAddRmsNorm, AffineQmm × 3, RopeAppend)` chain
-    // that spans the K→K+1 layer boundary in the unrolled per-claim
-    // op list and replace each match with one `SynthPreAttn` op
-    // backed by the synthesized MSL kernel emitted via
-    // `emit_synthesized_kernel_sources_override`. Must run BEFORE
-    // `apply_loop_compression` — once the loop body collapses we
-    // can't see the boundary chain anymore.
-    #[cfg(not(any(feature = "metal", feature = "spyre")))]
-    let synth_t_act: Option<&'static str> = {
-        use crate::quantization::QuantMethod;
-        match model.quantization.as_ref().map(|q| &q.method) {
-            Some(QuantMethod::Affine { bits: 4, .. }) => Some("bfloat"),
-            _ => None,
-        }
-    };
-    // Skip the synth fusion at bucket_m >= 2: the synth's
-    // `(M, num_heads_total)` threadgroup grid makes its AddRmsNorm
-    // phase redundantly process the residual+delta read once per
-    // (token, head) — work that scales as M*num_heads instead of M.
-    // At M=1 the redundancy is cheap relative to the saved qmv
-    // dispatch overhead and the synth wins. At M>=2 the redundant
-    // device reads dominate; the unfused chain (one norm dispatch
-    // per token + per-head qmv) is strictly cheaper.
-    //
-    // TODO: replace this hardcoded threshold with a solver-driven
-    // pick — `SynthPreAttnImpl::cost_us` vs `(FusedAddRmsNorm + 3
-    // AffineQmm)::cost_us` from the swept CSV.
-    // ⛔ CUDA ONLY. This searches the instruction-SELECTION stream for a repeating run, because
-    // that stream has no tape to read the loop off. A tape-scheduled target HAS one — the shared
-    // re-roll already found it — and its rolled stream replaces `cl` further down, so running
-    // this under metal/spyre re-derived a fact that was then thrown away. Two searches over two
-    // representations, free to disagree, is the arrangement this line of work exists to remove.
-    #[cfg(not(any(feature = "metal", feature = "spyre")))]
-    for (wp, (cl, _, _, _, _)) in canonical_lowered.iter_mut() {
-        let _ = synth_t_act;
-        let _ = wp;
-        crate::interpreter_codegen::apply_loop_compression(
-            &arch_opcodes,
-            &mut cl.backbone,
-            "layer",
-            crate::interpreter_codegen::LoopSource::LocalSearch,
-            &model.source_stem,
-        );
-        crate::interpreter_codegen::apply_loop_compression(
-            &arch_opcodes,
-            &mut cl.lm_head,
-            "layer",
-            crate::interpreter_codegen::LoopSource::LocalSearch,
-            &model.source_stem,
         );
     }
 
@@ -14220,15 +13649,12 @@ pub fn emit_model(
     // The `__I` alias and the variant glob-import are backend-agnostic
     // — `Instruction<W>` is defined in `scratchy-forward-compiler` without a
     // backend gate. The per-tape_index static slices reference both, so
-    // they compile under either `cfg(feature = "cuda")` (linking the
-    // cuda `Weights` struct) or `cfg(feature = "metal")` (linking the
-    // metal `Weights` ZST emitted in `emit_weights_struct`).
+    // they compile under every backend feature.
     let instruction_alias = quote! {
         #[allow(non_camel_case_types, dead_code)]
         type __I = ::scratchy_forward_compiler::Instruction;
         use ::scratchy_forward_compiler::Instruction::*;
     };
-    let shapes_by_name = arch_opcodes.shapes_by_name();
 
     // Static slices: BACKBONE_M_<wp> + LM_HEAD_M_<wp> per CANONICAL
     // tape_index only. Non-canonical buckets share their canonical
@@ -14243,16 +13669,14 @@ pub fn emit_model(
         let lm_head_static_ident = bucket_static_ident("LM_HEAD_M", *wp);
         static_slices.push(emit_bucket_static_slice(
             &backbone_static_ident,
-            &shapes_by_name,
             &lowered.backbone.instances,
         ));
         static_slices.push(emit_bucket_static_slice(
             &lm_head_static_ident,
-            &shapes_by_name,
             &lowered.lm_head.instances,
         ));
         // Metal MTL4 barrier flags, computed at FUF/SlotMap level
-        // by `lower_bucket` (one bool per `OpInstance`). Length
+        // (one bool per `OpInstance`). Length
         // tracks the corresponding instructions static. Runtime
         // consumes via `MetalBucketSpec.{backbone,lm_head}_barriers`.
         // The dataflow helper lives under `crate::metal`, which is
@@ -14281,10 +13705,10 @@ pub fn emit_model(
     // `sk_axis_active`: true when the model declared `sk_buckets`;
     // otherwise every wp has sk_bucket==0 and the table emits
     // `[0, u64::MAX)` for sk on every entry.
-    let sk_axis_active = sfufs.per_workload.keys().any(|wp| wp.sk_bucket != 0);
-    let num_tokens_points: Vec<u64> = sfufs.num_tokens_points();
+    let sk_axis_active = workloads.iter().any(|wp| wp.sk_bucket != 0);
+    let num_tokens_points: Vec<u64> = workloads.num_tokens_points();
     let mut sk_by_m: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
-    for wp in sfufs.per_workload.keys() {
+    for wp in workloads.iter() {
         sk_by_m.entry(wp.num_tokens).or_default().push(wp.sk_bucket);
     }
     for v in sk_by_m.values_mut() {
@@ -14337,7 +13761,7 @@ pub fn emit_model(
     // match the very match table `emit_weight_accessors_impl` builds from this
     // same `canonical_lowered`.
     // Wavefront-emitting builds only — spyre lowers the decode to a single
-    // fused KTIR/SuperDSC bundle. Plain cuda/metal dispatch per-op and skip
+    // fused KTIR/SuperDSC bundle. Plain metal dispatches per-op and skips
     // this; the expensive lowering + its hard panic on un-lowerable models
     // must not run for them.
 
@@ -14348,7 +13772,7 @@ pub fn emit_model(
     // writes back what the bucket table, the arena statics, the accessor table and the bake read.
     #[cfg(feature = "metal")]
     let mut metal_steps: BTreeMap<
-        crate::assignment::WorkloadPoint,
+        WorkloadPoint,
         scratchy_target_metal_compiler::canonical::ClassedCanonical,
     > = BTreeMap::new();
     // THE MODEL'S SOURCE MANIFEST: every weight family its tapes bind, interned as the canonicals
@@ -14383,7 +13807,13 @@ pub fn emit_model(
         let prefix =
             crate::to_wavefront::PrefixCapacity::new(std::num::NonZeroU32::new(8192).unwrap());
         let l = match crate::to_wavefront::lower_decode_to_wavefront(
-            fuf, None, inferred, &bounds, model, prefix, m as u32,
+            fuf,
+            inferred,
+            &bounds,
+            model,
+            prefix,
+            m as u32,
+            crate::to_wavefront::DenseExperts::Refuse,
         ) {
             Ok(l) => l,
             // METAL HAS NO KERNEL (dense MoE) is not a front-end gap: the canonical gets no steps,
@@ -14425,13 +13855,7 @@ pub fn emit_model(
             .map(|p| p.join("_"))
             .find(|p| p.contains("embed"));
         let embed_base = embed_base.unwrap_or_else(|| "embed_tokens".into());
-        let dsl_shared_expert_bases: Vec<String> = weight_paths
-            .iter()
-            .filter_map(|p| p.first().cloned())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .filter(|b| program.weights.has_subtree(&[b, "shared_expert"]))
-            .collect();
+        let dsl_shared_expert_bases = program.weights.shared_expert_bases();
         let quant = model.quantization.as_ref();
         let widths = |base: &str, layer: st::LayerId, body| {
             let qc = quant.expect("MoE widths are read for a quantized model only");
@@ -14464,9 +13888,7 @@ pub fn emit_model(
             m,
             buckets: &buckets,
             rows: match layout {
-                BackboneLayout::Decoder { .. } => {
-                    scratchy_subtile::sample_rows::ResultRows::Sampled
-                }
+                BackboneLayout::Decoder => scratchy_subtile::sample_rows::ResultRows::Sampled,
                 BackboneLayout::Encoder => scratchy_subtile::sample_rows::ResultRows::Every,
             },
         };
@@ -14502,9 +13924,9 @@ pub fn emit_model(
             .unwrap_or_else(|e| panic!("[weight-bindings] {stem}: {e}"));
         tape_accessors_for_struct = Some(synth.accessors);
     }
-    // Instruction selection's `(bucket, op_idx, slot)` accessor table (cuda); on metal no stream
-    // records a slot, so it is the trait's defaults, and the model's tensors resolve through the
-    // source manifest's resolver instead.
+    // The `(bucket, op_idx, slot)` accessor table. No stream records a slot, so it is the
+    // trait's defaults; on metal the model's tensors resolve through the source manifest's
+    // resolver instead.
     let weight_accessors_impl =
         emit_weight_accessors_impl(&canonical_lowered, model.source_stem.as_str());
     #[cfg(feature = "metal")]
@@ -14519,9 +13941,7 @@ pub fn emit_model(
             #resolver
         }
     };
-    // M2b: for a tape-scheduled arch the Weights struct is emitted
-    // from the TAPE's accessor set (asserted to produce the same
-    // struct as instruction selection's inside `emit_weights_struct`).
+    // The Weights struct is emitted from the TAPE's accessor set.
     // Re-emitted HERE because the tape accessors only exist after the
     // front-end swap has lowered the canonical.
     #[cfg(feature = "metal")]
@@ -14532,36 +13952,27 @@ pub fn emit_model(
     }
 
     if cfg!(feature = "spyre") {
-        match sfufs.get_nt(1) {
-            Some(decode_asn) => {
-                // The canonical the decode (num_tokens=1) point folded into,
-                // and its `2*ci` backbone bucket id.
-                let decode_wp = bucket_points.iter().find(|wp| wp.num_tokens == 1).copied();
-                match decode_wp {
-                    Some(decode_wp) => {
-                        let idx = bucket_points.iter().position(|w| *w == decode_wp).unwrap();
-                        let canonical = bucket_canonical[idx];
-                        let bb_bucket_id = canonical_to_bucket_id[&canonical];
-                        let (cl, ..) = &canonical_lowered[&canonical];
-                        let decode_bounds = bounds_for_wp(model, decode_wp, tp_world_size);
-                        dump_wavefront_mega(
-                            program,
-                            model,
-                            fuf,
-                            decode_asn,
-                            inferred,
-                            &decode_bounds,
-                            &cl.backbone.weight_slots,
-                            &cl.lm_head.weight_slots,
-                            bb_bucket_id,
-                            &mut ktir_bundle_const,
-                        );
-                    }
-                    None => eprintln!(
-                        "[wavefront] {}: no decode (num_tokens=1) workload point",
-                        model.source_stem
-                    ),
-                }
+        // The canonical the decode (num_tokens=1) point folded into,
+        // and its `2*ci` backbone bucket id.
+        let decode_wp = bucket_points.iter().find(|wp| wp.num_tokens == 1).copied();
+        match decode_wp {
+            Some(decode_wp) => {
+                let idx = bucket_points.iter().position(|w| *w == decode_wp).unwrap();
+                let canonical = bucket_canonical[idx];
+                let bb_bucket_id = canonical_to_bucket_id[&canonical];
+                let (cl, ..) = &canonical_lowered[&canonical];
+                let decode_bounds = bounds_for_wp(model, decode_wp, tp_world_size);
+                dump_wavefront_mega(
+                    program,
+                    model,
+                    fuf,
+                    inferred,
+                    &decode_bounds,
+                    &cl.backbone.weight_slots,
+                    &cl.lm_head.weight_slots,
+                    bb_bucket_id,
+                    &mut ktir_bundle_const,
+                );
             }
             None => eprintln!(
                 "[wavefront] {}: no decode (num_tokens=1) workload point",
@@ -14651,13 +14062,11 @@ pub fn emit_model(
 
     // FORWARD_TABLE — one row per tape_index. `__B` aliases the
     // `BucketEntry` tuple-struct constructor so each row stays on a
-    // single line in expanded source. Available under either backend
-    // — `scr model info`'s per-variant `dump()` walks it on both
-    // cuda and metal. The cuda runtime additionally drives `forward`
-    // / `forward_backbone` from it; metal's pool uses `METAL_BUCKETS`
-    // instead and ignores the runtime fields here.
+    // single line in expanded source. `scr model info`'s per-variant
+    // `dump()` walks it; metal's pool uses `METAL_BUCKETS` for the
+    // forward and ignores the runtime fields here.
     let forward_table = quote! {
-        #[cfg(any(feature = "cuda", feature = "metal"))]
+        #[cfg(feature = "metal")]
         static FORWARD_TABLE: &[::scratchy_forward_compiler::BucketEntry<__I>] = {
             use ::scratchy_forward_compiler::BucketEntry as __B;
             &[
@@ -14769,7 +14178,7 @@ pub fn emit_model(
                 (slots.iter()).any(|(at, colour)| at == (id, slot) && colour == terminal_slot)
             };
             let logits_tiles: Vec<(TileId, u8)> = match layout {
-                BackboneLayout::Decoder { .. } if cfg!(feature = "metal") => {
+                BackboneLayout::Decoder if cfg!(feature = "metal") => {
                     let mut chain = vec![(last_node_id, 0u8)];
                     while let Some(&(tile, _)) = chain.last() {
                         let under = fuf.get(tile).inputs.iter().find_map(|i| match *i {
@@ -14785,7 +14194,7 @@ pub fn emit_model(
                     }
                     chain
                 }
-                BackboneLayout::Decoder { .. } | BackboneLayout::Encoder => Vec::new(),
+                BackboneLayout::Decoder | BackboneLayout::Encoder => Vec::new(),
             };
             let mut bucket_arena_bytes: Vec<u64> = vec![0u64; num_slots as usize];
             let mut logits_row_bytes: u64 = 0;
@@ -15074,14 +14483,14 @@ pub fn emit_model(
     // slot. Vision-only encoders carry no vocab at all and would get
     // 0. Cuda builds skip the constant entirely.
     let logits_width = match layout {
-        BackboneLayout::Decoder { .. } => model.bounds.get("vocab_size").copied().unwrap_or(0),
+        BackboneLayout::Decoder => model.bounds.get("vocab_size").copied().unwrap_or(0),
         BackboneLayout::Encoder => model.bounds.get("hidden_size").copied().unwrap_or(0),
     };
     let vocab_size_lit = proc_macro2::Literal::u64_unsuffixed(logits_width);
     // The rows of the terminal slot a forward leaves for its caller: a decoder's logits of the
     // rows its step samples, at the front; an encoder's hidden state at every row.
     let terminal_rows = match layout {
-        BackboneLayout::Decoder { .. } => quote! { inputs.sampled_rows.len() },
+        BackboneLayout::Decoder => quote! { inputs.sampled_rows.len() },
         BackboneLayout::Encoder => quote! { n },
     };
 
@@ -16272,51 +15681,19 @@ pub fn emit_model(
     // backbone slot. Both shapes are dispatched via the same
     // `FORWARD_TABLE` row.
     let forward_backbone_fn = match layout {
-        BackboneLayout::Decoder { .. } => quote! {
-            /// Backbone-only dispatch (no lm_head). Returns a fresh
-            /// OwnedTensor (memcpy of the backbone tile).
-            #[cfg(feature = "cuda")]
-            #[allow(clippy::too_many_arguments)]
-            pub unsafe fn forward_backbone(
-                wm: &Weights,
-                ctx: &crate::__gpu::ForwardCtx,
-                device: &mut crate::__gpu::GpuDevice,
-                num_tokens: u64,
-            ) -> crate::__gpu::OwnedTensor {
-                let e = ::scratchy_forward_compiler::find_bucket(
-                    FORWARD_TABLE, num_tokens, ctx.max_seqlen_k as u64,
-                );
-                unsafe {
-                    crate::__gpu::run_backbone(e.4, e.9, wm, ctx, device, e.6, e.7)
-                }
-            }
-        },
-        BackboneLayout::Encoder => quote! {
-            /// Backbone-only dispatch — for encoder architectures the
-            /// whole pipeline IS the backbone, so this delegates to
-            /// `forward` (no lm_head, no DtoD memcpy).
-            #[cfg(feature = "cuda")]
-            #[allow(clippy::too_many_arguments)]
-            pub unsafe fn forward_backbone(
-                wm: &Weights,
-                ctx: &crate::__gpu::ForwardCtx,
-                device: &mut crate::__gpu::GpuDevice,
-                num_tokens: u64,
-            ) -> crate::__gpu::OwnedTensor {
-                unsafe { forward(wm, ctx, device, num_tokens) }
-            }
-        },
+        BackboneLayout::Decoder => quote! {},
+        BackboneLayout::Encoder => quote! {},
     };
 
     // The per-arch device-runtime emit (weight-accessor impl, the static `Op`
     // tapes, `FORWARD_TABLE`) is the per-op host-dispatch surface — it exists
     // only for backends that dispatch each op through a host-emitted table
-    // (cuda + metal). A target that runs an embedded fused program instead
+    // (metal). A target that runs an embedded fused program instead
     // (e.g. KTIR on the host) emits none of it. The macro is built per-backend,
     // so gate the EMISSION via `cfg!` rather than per-item `#[cfg]` attrs (the
     // static-slice repetition can't take one).
     let (canonical_params_impl, weight_accessors_impl, static_slices_emit, forward_table) =
-        if cfg!(any(feature = "cuda", feature = "metal")) {
+        if cfg!(feature = "metal") {
             (
                 canonical_params_impl,
                 weight_accessors_impl,
@@ -16327,10 +15704,24 @@ pub fn emit_model(
             (quote! {}, quote! {}, quote! {}, quote! {})
         };
 
+    // ⭐ THE TARGET-EMITTER SEAM. The target compiler Cargo linked under the `target-emitter` key
+    // gets the model as neutral data and hands back the items it emits for it; they are spliced
+    // into the module as they come. Nothing here knows which target that is.
+    #[cfg(feature = "target-emitter")]
+    let target_tokens = {
+        let input = target_model_input(program, model, fuf, inferred, workloads, tp_world_size);
+        crate::record_target_input(&input);
+        target_emitter::emit::emit_model(&input)
+    };
+    #[cfg(not(feature = "target-emitter"))]
+    let target_tokens = TokenStream::new();
+
     let tokens = quote! {
         #weights
 
         #ktir_bundle_const
+
+        #target_tokens
 
         #canonical_params_impl
 
@@ -16344,46 +15735,7 @@ pub fn emit_model(
 
         #metal_emission
 
-        /// Dispatch on (num_tokens, sk_bucket) → tape_index entry, then
-        /// run the universal interpreter.
-        #[cfg(feature = "cuda")]
-        #[allow(clippy::too_many_arguments)]
-        pub unsafe fn forward(
-            wm: &Weights,
-            ctx: &crate::__gpu::ForwardCtx,
-            device: &mut crate::__gpu::GpuDevice,
-            num_tokens: u64,
-        ) -> crate::__gpu::OwnedTensor {
-            let e = ::scratchy_forward_compiler::find_bucket(
-                FORWARD_TABLE, num_tokens, ctx.max_seqlen_k as u64,
-            );
-            unsafe {
-                crate::__gpu::run(e.4, e.9, e.5, e.10, wm, ctx, device, e.6, e.8)
-            }
-        }
 
-        /// Piecewise CUDA-graph capture for the bucket `(num_tokens,
-        /// max_seqlen_k)` selects. Caller MUST have called
-        /// `device.caching.begin_allocate_to_pool()` before this fn so
-        /// the captured addresses come from a private pool that stays
-        /// alive for the runner's lifetime.
-        #[cfg(feature = "cuda")]
-        #[allow(clippy::too_many_arguments)]
-        pub unsafe fn forward_piecewise_capture(
-            wm: &Weights,
-            ctx: &crate::__gpu::ForwardCtx,
-            device: &mut crate::__gpu::GpuDevice,
-            num_tokens: u64,
-        ) -> ::anyhow::Result<crate::__gpu::piecewise::PiecewiseRunner> {
-            let e = ::scratchy_forward_compiler::find_bucket(
-                FORWARD_TABLE, num_tokens, ctx.max_seqlen_k as u64,
-            );
-            unsafe {
-                crate::__gpu::piecewise::run_piecewise_capture(
-                    e.4, e.9, e.5, e.10, wm, ctx, device, e.6, e.8,
-                )
-            }
-        }
 
         #forward_backbone_fn
 
@@ -16393,7 +15745,7 @@ pub fn emit_model(
         /// `scr model info` via the inventory registry. Available
         /// under either backend so the CLI subcommand can dump
         /// metal-compiled arches too.
-        #[cfg(any(feature = "cuda", feature = "metal"))]
+        #[cfg(feature = "metal")]
         pub fn dump() -> ::std::vec::Vec<::scratchy_forward_compiler::BucketDump> {
             FORWARD_TABLE
                 .iter()
@@ -16431,7 +15783,7 @@ fn _unused(_: OpKind) {}
 ///   CT `.weight_packed` vs BNB4 `.weight.absmax`) differs per
 ///   variant, so each ships its own sniff. The affine bit-map gate
 ///   inherits the CANONICAL's rows when the shim's own accessor set
-///   yields none (metal: that set is ISel's, empty there) — the
+///   yields none (a shim lowers no tape, so it is empty) — the
 ///   shim's `load` delegates to the canonical's body, so the
 ///   canonical's widths are what a selected shim actually reads.
 /// - `pub fn load` — VARIANT-specific. The loader calls
@@ -16449,8 +15801,6 @@ fn _unused(_: OpKind) {}
 fn emit_shim_model(
     program: &Program,
     fuf: &Fuf,
-    sfufs: &WorkloadAssignments,
-    lib: &ImplementationLibrary,
     model: &ModelParams,
     manifest: &crate::weights_manifest::WeightsManifest,
     canonical: &Ident,
@@ -16463,9 +15813,7 @@ fn emit_shim_model(
     let (weights, shim_affine_rows) = emit_weights_struct(
         program,
         fuf,
-        sfufs,
         None,
-        lib,
         model,
         manifest,
         WeightsEmitMode::Shim { canonical },
@@ -16480,7 +15828,6 @@ fn emit_shim_model(
     // canonical's `METAL_BUCKETS` static + `metal_pool()` constructor
     // — variant-specific differences (quant format, fingerprint) are
     // load-time only; static tape_index plans are byte-identical.
-    let _ = sfufs;
     let tokens = quote! {
         #weights
 
@@ -16497,11 +15844,9 @@ fn emit_shim_model(
         // `dump` is the per-variant `scr model info` accessor —
         // available under either backend so shim variants register
         // under metal too.
-        #[cfg(any(feature = "cuda", feature = "metal"))]
+        #[cfg(feature = "metal")]
         pub use super::#canonical::dump;
 
-        #[cfg(feature = "cuda")]
-        pub use super::#canonical::{forward, forward_backbone, forward_piecewise_capture};
 
         #[cfg(feature = "metal")]
         pub use super::#canonical::{
@@ -16557,7 +15902,6 @@ mod tests {
             rope_scaling_hash: None,
             mrope_section: None,
             arch: Default::default(),
-            torch_dtype: None,
             expert_activation: crate::config::ExpertActivation::Silu,
         }
     }
@@ -17193,8 +16537,8 @@ mod fingerprint_tests {
     }
 
     /// A shim's `load` delegates to its canonical's body — the affine
-    /// bit-widths are baked into THAT body, and on metal the shim's own
-    /// accessor set is ISel's, which is empty there. So a rowless shim
+    /// bit-widths are baked into THAT body, and the shim's own accessor
+    /// set is empty (a shim lowers no tape). So a rowless shim
     /// must inherit its canonical's rows or its fingerprint gate is
     /// vacuous and it selects any affine-compatible checkpoint (the
     /// gpt-oss b2/b3-attn4 collision: the b2 shim passed selection and
@@ -17221,7 +16565,7 @@ mod fingerprint_tests {
             effective_fingerprint_rows(&shim, &empty, Some(&canonical_rows)),
             canonical_rows.as_slice()
         );
-        // Shim with its own rows (cuda: ISel runs) keeps them.
+        // Shim with its own rows keeps them.
         let own = vec![("model.layers.*.mlp.router".to_string(), 2, 64)];
         assert_eq!(
             effective_fingerprint_rows(&shim, &own, Some(&canonical_rows)),
@@ -17623,6 +16967,7 @@ mod fingerprint_tests {
     /// heads x 128 are 6 and 8 KiB/token, below `MIN_KV_BYTES_PER_TOKEN`, where every one of
     /// their 52 / 88 layers would read as 52 / 88 KiB. Layers that all hold KV are no subset.
     #[test]
+    #[cfg(feature = "metal")]
     fn a_recurrent_hybrids_kv_layers_are_its_attention_layers() {
         use scratchy_ir::{DenseReason, KvGeometry, TqBits, codec_for};
         let preset = "mlx-affine-b4-g64-qembed";
@@ -18271,13 +17616,7 @@ mod fingerprint_tests {
             ],
         };
         match backbone_layout(&fuf, &program) {
-            BackboneLayout::Decoder { backbone_out } => {
-                assert_eq!(
-                    backbone_out,
-                    (TileId(0), 0),
-                    "decoder backbone-out must be the lm_head Gemm's first tile input",
-                );
-            }
+            BackboneLayout::Decoder => {}
             BackboneLayout::Encoder => panic!("expected Decoder layout, got Encoder"),
         }
     }
@@ -18354,11 +17693,7 @@ mod fingerprint_tests {
             }
             let fuf = Fuf { nodes };
             match backbone_layout(&fuf, &program) {
-                BackboneLayout::Decoder { backbone_out } => assert_eq!(
-                    backbone_out,
-                    (TileId(0), 0),
-                    "{name}: backbone-out must be the lm_head Gemm's tile input",
-                ),
+                BackboneLayout::Decoder => {}
                 BackboneLayout::Encoder => {
                     panic!("{name}: a decoder with logits post-ops was read as an ENCODER")
                 }
@@ -18460,7 +17795,7 @@ mod fingerprint_tests {
             ],
         };
         match backbone_layout(&fuf, &program) {
-            BackboneLayout::Decoder { backbone_out } => assert_eq!(backbone_out, (TileId(0), 0)),
+            BackboneLayout::Decoder => {}
             BackboneLayout::Encoder => panic!("expected Decoder past AllGather"),
         }
     }

@@ -26,9 +26,9 @@ use anyhow::Result;
 
 use scratchy_core_common::EngineCoreRequest;
 pub use scratchy_core_common::SamplingParams;
-use scratchy_core_config::CudaGraphConfig;
 use scratchy_serving_engine::core_client::{EngineCoreClient, InprocClient};
 use scratchy_serving_engine::engine_core::StepOutcome;
+use scratchy_serving_engine::worker_factory::WorkerFactory;
 
 use crate::chat_template::ChatTemplate;
 use crate::detokenizer::IncrementalDetokenizer;
@@ -224,7 +224,7 @@ impl LLMBuilder {
         }
     }
 
-    /// Set the device ("cpu", "cuda:0", "metal", "auto").
+    /// Set the device ("cpu", "metal", "spyre", "auto").
     pub fn device(mut self, device: impl Into<String>) -> Self {
         self.config.device = device.into();
         self
@@ -295,39 +295,15 @@ impl LLMBuilder {
         self
     }
 
-    /// Set the number of GPUs for tensor parallelism.
+    /// Set the tensor-parallel degree (only 1 is supported).
     pub fn tensor_parallel_size(mut self, n: usize) -> Self {
         self.config.tensor_parallel_size = n;
         self
     }
 
-    /// Set the number of GPU stages for pipeline parallelism.
+    /// Set the pipeline-parallel degree (only 1 is supported).
     pub fn pipeline_parallel_size(mut self, n: usize) -> Self {
         self.config.pipeline_parallel_size = n;
-        self
-    }
-
-    /// Set the number of nodes for multi-node TP.
-    pub fn num_nodes(mut self, n: usize) -> Self {
-        self.config.num_nodes = n;
-        self
-    }
-
-    /// Set this node's rank (0 = master).
-    pub fn node_rank(mut self, rank: usize) -> Self {
-        self.config.node_rank = rank;
-        self
-    }
-
-    /// Set the master address for multi-node NCCL rendezvous.
-    pub fn master_addr(mut self, addr: &str) -> Self {
-        self.config.master_addr = addr.to_string();
-        self
-    }
-
-    /// Set the master port for multi-node NCCL rendezvous.
-    pub fn master_port(mut self, port: u16) -> Self {
-        self.config.master_port = port;
         self
     }
 
@@ -337,24 +313,12 @@ impl LLMBuilder {
         self
     }
 
-    /// Disable CUDA graph capture and run all steps eagerly.
-    pub fn enforce_eager(mut self, eager: bool) -> Self {
-        self.config.enforce_eager = eager;
-        self
-    }
-
     /// Set an explicit chat template override. Accepts either inline
     /// Jinja or a path to a `tokenizer_config.json` / `.jinja` file.
     /// Used to inject a template for GGUFs (e.g. mmnga's Moonlight)
     /// whose metadata dropped the field.
     pub fn chat_template(mut self, tpl: impl Into<String>) -> Self {
         self.config.chat_template = Some(tpl.into());
-        self
-    }
-
-    /// Set the CUDA graph configuration for decode acceleration.
-    pub fn cuda_graph_config(mut self, config: CudaGraphConfig) -> Self {
-        self.config.cuda_graph_config = Some(config);
         self
     }
 
@@ -406,6 +370,9 @@ pub struct LLM {
     generation_defaults: scratchy_core_common::sampling::GenerationDefaults,
     /// Set by [`Interrupter::interrupt`]; the running generation reads it between steps.
     interrupt: Arc<AtomicBool>,
+    /// The factory serving `--device`, whose sampling limit every request is checked against
+    /// before it is added ([`WorkerFactory::check_sampling`]).
+    backend: Option<&'static dyn WorkerFactory>,
 }
 
 /// Stops an [`LLM`]'s generation from another thread: the one running, or — when none is — the
@@ -489,7 +456,20 @@ impl LLM {
             block_size: stack.block_size,
             generation_defaults: stack.generation_defaults,
             interrupt: Arc::default(),
+            backend: scratchy_serving_engine::worker_factory::factory_for(&config.device),
         })
+    }
+
+    /// `params` checked as [`SamplingParams::validate`] does, and against what the backend can
+    /// serve ([`WorkerFactory::check_sampling`]), before any request is added.
+    fn check_params(&self, params: &SamplingParams) -> Result<()> {
+        params
+            .validate()
+            .map_err(|e| anyhow::anyhow!("invalid sampling params: {e}"))?;
+        if let Some(backend) = self.backend {
+            backend.check_sampling(params).map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
     }
 
     /// A handle that stops this LLM's running generation from another thread (a signal
@@ -804,9 +784,7 @@ impl LLM {
     ) -> Result<Vec<RequestOutput>> {
         let _generation = self.generation();
         let params = params.unwrap_or_else(|| self.generation_defaults.as_base());
-        params
-            .validate()
-            .map_err(|e| anyhow::anyhow!("invalid sampling params: {e}"))?;
+        self.check_params(&params)?;
 
         let n = params.n.max(1) as usize;
         let detokenize = params.detokenize;
@@ -1112,9 +1090,7 @@ impl LLM {
         let _d_render = _t_render.elapsed();
 
         let params = params.unwrap_or_else(|| self.generation_defaults.as_base());
-        params
-            .validate()
-            .map_err(|e| anyhow::anyhow!("invalid sampling params: {e}"))?;
+        self.check_params(&params)?;
 
         // Tokenize the rendered prompt.
         let _t_tok = std::time::Instant::now();
@@ -1670,6 +1646,8 @@ mod tests {
                 max_new_tokens: None,
             },
             interrupt: Arc::default(),
+            // No backend's sampling check: the scripted executor takes any sampling.
+            backend: None,
         }
     }
 

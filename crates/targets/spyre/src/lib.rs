@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //! IBM Spyre (KTIR) backend target for scratchy — the `-Fspyre` peer of
-//! `crates/targets/{cuda,metal}`.
+//! `crates/targets/metal`.
 //!
 //! The Spyre AIU executes per-bundle KTIR; there is no GPU device memory in the
-//! CUDA/Metal sense, and the hardware-free path runs the same KTIR on the
+//! Metal sense, and the hardware-free path runs the same KTIR on the
 //! `ktir-emulator` emulator. So the platform-specific seam the rest of scratchy needs
 //! from a target — "allocate device memory and put these host bytes on it" — is,
 //! for Spyre, a host malloc + memcpy. [`SpyreAllocator`] provides that as the
 //! host impl of [`scratchy_tensors::DeviceAllocator`], so `GpuWeights` loads
-//! weights through the exact same disk→host pipeline cuda/metal use, with no GPU
+//! weights through the exact same disk→host pipeline metal uses, with no GPU
 //! toolchain pulled in.
 
 pub mod allocator;
@@ -101,20 +101,18 @@ pub use allocator::SpyreAllocator;
 // ── `__gpu` facade for the `#[forward]` macro's spyre path ──
 //
 // The macro aliases `crate::__gpu` to this crate under `-Fspyre` (the way it
-// aliases to scratchy-target-cuda under cuda) and emits `crate::__gpu::…` for
+// aliases to scratchy-target-metal under metal) and emits `crate::__gpu::…` for
 // the neutral surface its per-arch `Weights::load` / `fingerprint_matches` name.
 // We re-export the neutral pieces (NEVER another `targets/` crate — only the
 // cfg-free `scratchy-layers` / `scratchy-tensors` leaves):
-//   - `weights::GpuWeights<A = SpyreAllocator>` mirrors target-cuda's defaulted
-//     alias, so `crate::__gpu::weights::GpuWeights` resolves with no `<A>`;
+//   - `weights::GpuWeights<A = SpyreAllocator>` is a defaulted alias, so `crate::__gpu::weights::GpuWeights` resolves with no `<A>`;
 //   - `LoadStream` (= `()` host) for the load signatures;
 //   - `BackendAllocator` = the host `SpyreAllocator`.
 pub use scratchy_tensors::LoadStream;
 /// The active backend allocator under `-Fspyre` — the host `SpyreAllocator`.
 pub type BackendAllocator = SpyreAllocator;
 pub mod weights {
-    /// `GpuWeights` defaulted to the host `SpyreAllocator`, mirroring
-    /// `scratchy_target_cuda::weights::GpuWeights<A = CudaAllocator>`.
+    /// `GpuWeights` defaulted to the host `SpyreAllocator`.
     pub type GpuWeights<A = crate::SpyreAllocator> = scratchy_layers::weights::GpuWeights<A>;
 }
 

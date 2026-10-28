@@ -13,8 +13,8 @@
 //! By default it removes entries not used in the last 30 days (`--days N`
 //! overrides). `--nuke` ignores the age filter and targets everything;
 //! `--force` skips the interactive y/N confirmation. This is pure
-//! filesystem work, so the command is available on every build (cuda,
-//! metal, cpu) regardless of which backend produced the caches.
+//! filesystem work, so the command is available on every build (metal,
+//! spyre, cpu) regardless of which backend produced the caches.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

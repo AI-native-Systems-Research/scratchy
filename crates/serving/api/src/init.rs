@@ -8,10 +8,9 @@
 //! and call [`initialize_stack`].
 
 // Anchor the worker crate into the link so its `WorkerFactory`
-// `inventory::submit!` registrations (CudaWorkerFactory / MetalWorkerFactory
-// in scratchy_serving_worker::gpu_worker) are NOT garbage-collected by the
-// linker. After the dispatch rewrite, `create_worker` no longer NAMES
-// CudaWorker/MetalWorker, so without this explicit reference the registry
+// `inventory::submit!` registrations (MetalWorkerFactory / SpyreWorkerFactory
+// in scratchy_serving_worker) are NOT garbage-collected by the
+// linker. `create_worker` never NAMES a concrete worker, so without this explicit reference the registry
 // could come up empty at runtime. `create_worker` still bails loudly if it
 // does (empty-registry assertion) — this anchor is the belt to that bail's
 // suspenders.
@@ -22,7 +21,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use scratchy_core_config::{CudaGraphConfig, CudaGraphMode, SchedulerConfig, SchedulerPolicy};
+use scratchy_core_config::{SchedulerConfig, SchedulerPolicy};
 use scratchy_core_model::weight::HfModelConfig;
 use scratchy_serving_engine::core_client::InprocClient;
 use scratchy_serving_engine::engine_core::{EngineCoreConfig, HybridKvConfig};
@@ -32,9 +31,6 @@ use scratchy_serving_engine::spec_decode::{
 };
 use scratchy_serving_worker::uniproc::UniProcExecutor;
 use scratchy_serving_worker::worker::Worker;
-// TP rank-alignment helpers — used only on the nccl-gated TP paths below.
-#[cfg(feature = "nccl")]
-use scratchy_serving_worker::worker::{align_all_max_num_seqs, min_max_num_seqs};
 use tracing::info;
 
 use crate::chat_template::ChatTemplate;
@@ -61,7 +57,7 @@ pub use scratchy_serving_engine::worker_factory::DownloadObserver;
 pub struct VllmConfig {
     /// Model path or HuggingFace model ID (required).
     pub model: String,
-    /// Device: "cpu", "cuda:N", "metal", or "auto" (auto-detect best GPU).
+    /// Device: "cpu", "metal", "spyre", or "auto" (the backend this binary was built with).
     pub device: String,
     /// Weight dtype: "auto", "float16", "bfloat16", "float32".
     pub dtype: String,
@@ -100,48 +96,25 @@ pub struct VllmConfig {
     pub lora_adapter: Option<String>,
     /// Pooling strategy for embeddings: "auto", "last", "cls", "mean".
     pub pooling_strategy: String,
-    /// Number of GPUs for tensor parallelism (1 = single GPU, no TP).
+    /// Tensor-parallel degree. Only 1 is supported (one device per model).
     pub tensor_parallel_size: usize,
-    /// Number of GPU stages for pipeline parallelism (1 = no PP).
+    /// Pipeline-parallel degree. Only 1 is supported (one device per model).
     pub pipeline_parallel_size: usize,
-    /// Number of nodes for multi-node TP (1 = single node).
-    pub num_nodes: usize,
-    /// This node's rank (0 = master).
-    pub node_rank: usize,
-    /// Master address for multi-node NCCL rendezvous.
-    pub master_addr: String,
-    /// Master port for multi-node NCCL rendezvous.
-    pub master_port: u16,
     /// Whether to disable async scheduling (overlap GPU/CPU work).
     /// Default false — async scheduling is enabled by default.
     pub disable_async_scheduling: bool,
     /// Runner type: "generate" (default) or "pooling".
     pub runner: String,
-    /// CUDA graph configuration. When `Some`, CUDA graphs may be captured
-    /// for decode-step acceleration.
-    pub cuda_graph_config: Option<CudaGraphConfig>,
     /// Whether prefix caching is enabled (KV cache reuse for shared prompts).
     /// Default: true.
     pub enable_prefix_caching: bool,
-    /// Disable CUDA graph capture and run all steps eagerly.
-    /// Default: false.
-    pub enforce_eager: bool,
-    /// CUDA graph mode: controls piecewise vs monolithic graph capture.
-    /// Default: "full" (maintains current behavior).
-    pub cuda_graph_mode: String,
     /// Maximum number of tokens processed in a single scheduler iteration.
     /// None = auto (min(max_model_len, 8192)).
     pub max_num_batched_tokens: Option<usize>,
-    /// Benchmark cublasLt algorithms during warmup.
-    pub cublas_autotune: bool,
     /// KV cache data type: "auto" (use model dtype) or "fp8_e4m3".
     pub kv_cache_dtype: String,
     /// Compute KV scales dynamically from the first forward pass.
     pub calculate_kv_scales: bool,
-    /// Distributed executor backend: "auto" or "external_launcher".
-    /// "external_launcher" reads RANK/LOCAL_RANK/WORLD_SIZE/MASTER_ADDR/MASTER_PORT
-    /// from env and uses TCP-based NCCL init for inter-process TP.
-    pub distributed_executor_backend: String,
     /// Optional chat template override.
     ///
     /// If `Some`, takes precedence over every auto-detected source
@@ -186,21 +159,12 @@ impl Default for VllmConfig {
             pooling_strategy: "auto".to_string(),
             tensor_parallel_size: 1,
             pipeline_parallel_size: 1,
-            num_nodes: 1,
-            node_rank: 0,
-            master_addr: "localhost".to_string(),
-            master_port: 29500,
-            cuda_graph_mode: "auto".to_string(),
             disable_async_scheduling: false,
             runner: "generate".to_string(),
-            cuda_graph_config: None,
             enable_prefix_caching: true,
-            enforce_eager: true, // TODO: debug multi-turn — disable CUDA graphs to isolate
             max_num_batched_tokens: None,
-            cublas_autotune: false,
             kv_cache_dtype: "auto".to_string(),
             calculate_kv_scales: false,
-            distributed_executor_backend: "auto".to_string(),
             chat_template: None,
             download_observer: None,
         }
@@ -434,8 +398,8 @@ use scratchy_serving_worker::worker_factory::{
 /// Builds the shared [`WorkerCreateConfig`] once, then selects the first
 /// registered backend factory whose `matches` accepts `config.device` and
 /// calls its `create`. The per-backend construct→init→load→extract logic
-/// lives in `scratchy_serving_worker::gpu_worker` (`CudaWorkerFactory` /
-/// `MetalWorkerFactory`); there are no `#[cfg]` backend arms here.
+/// lives in `scratchy_serving_worker` (`MetalWorkerFactory` /
+/// `SpyreWorkerFactory`); there are no `#[cfg]` backend arms here.
 ///
 /// Returns `(worker, hf_config, model_dir, dtype)`.
 fn create_worker(
@@ -448,14 +412,6 @@ fn create_worker(
 
     let is_pooling = config.runner == "pooling";
 
-    // Parse device ID generically (e.g. "cuda:1" → 1, "cuda"/"auto"/"metal" → 0).
-    // Harmless for metal, which is always device 0.
-    let device_id = if config.device.starts_with("cuda:") {
-        config.device[5..].parse::<i32>().unwrap_or(0)
-    } else {
-        0
-    };
-
     let worker_config = WorkerCreateConfig {
         model_path: model_path.clone(),
         dtype: config.dtype.clone(),
@@ -463,29 +419,12 @@ fn create_worker(
         // The backend's own page size when it has one (see `effective_block_size`); a mismatch
         // between this and the scheduler's block size silently corrupts KV slots.
         block_size: effective_block_size(config.block_size, &config.device),
-        device_id,
         // The REQUEST, not a resolved number: `None` lets the worker resolve
         // the width itself (device tier / memory-affordable GDN slots), while
         // `Some(n)` pins every worker-side consumer to the caller's ask.
         max_num_seqs: config.max_num_seqs,
         enable_prefix_caching: requested_prefix_caching(config),
-        enforce_eager: config.enforce_eager,
-        cuda_graph_mode: config
-            .cuda_graph_mode
-            .parse()
-            .unwrap_or(CudaGraphMode::Auto),
-        // Default 1024 (not 8192 like Python). Our worker splits mixed
-        // batches into a decode CUDA-graph pass + a prefill eager pass.
-        // Smaller prefill chunks keep the eager pass fast (~25ms for 1024
-        // tokens) while decode runs through the captured graph (~5ms).
-        // Benchmarked: 1024 → 21.8 req/s vs 8192 → 12.1 req/s on Qwen2.5-3B.
         max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
-        cuda_graph_sizes: config
-            .cuda_graph_config
-            .as_ref()
-            .map(|c| c.capture_sizes.clone())
-            .unwrap_or_default(),
-        cublas_autotune: config.cublas_autotune,
         gpu_memory_utilization: config.gpu_memory_utilization,
         pooling_strategy: config.pooling_strategy.clone(),
         is_pooling,
@@ -504,7 +443,7 @@ fn create_worker(
         draft_model_dtype: config.draft_model_dtype.clone(),
     };
 
-    // Progress closure (the former cuda-arm body). For now it just observes
+    // Progress closure. For now it just observes
     // the message; layer-by-layer progress would require deeper integration
     // into model loading. Backends that don't wire progress ignore it.
     let progress_cb: Option<ProgressCallback> = progress.map(|pb| {
@@ -524,9 +463,9 @@ fn create_worker(
     // cause is the linker GC'ing the registration.
     if inventory::iter::<&dyn WorkerFactory>().next().is_none() {
         anyhow::bail!(
-            "No inference backend is compiled into this binary. Rebuild with a GPU \
+            "No inference backend is compiled into this binary. Rebuild with a \
              backend feature:\n    --features metal   (Apple Silicon)\n    --features \
-             cuda    (NVIDIA GPU)\ne.g. `cargo build --release \
+             spyre   (IBM Spyre)\n    --features nvcc    (NVIDIA H100, Linux)\ne.g. `cargo build --release \
              -p scratchy-cli --features metal`.\n(If you DID build with a \
              backend, an empty registry instead means the linker GC'd its \
              `inventory::submit!` — ensure scratchy-serving-worker stays linked via \
@@ -539,7 +478,8 @@ fn create_worker(
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "No backend available for device '{}'. \
-                 Build with --features metal (Apple Silicon) or --features cuda (NVIDIA GPU).",
+                 Build with --features metal (Apple Silicon), --features spyre (IBM Spyre) or \
+                 --features nvcc (NVIDIA H100, Linux).",
                 config.device
             )
         })?;
@@ -575,7 +515,7 @@ fn init_cache(
         .determine_available_memory()
         .context("failed to determine available memory")?;
 
-    // For CUDA AND Metal workers, determine_available_memory already returns
+    // For Metal workers, determine_available_memory already returns
     // the KV cache budget with gpu_memory_utilization baked in (matching
     // Python vLLM: total * util - non_kv_cache). On Metal `total` is further
     // capped at `maxBufferLength` (the real wireable ceiling) and util is
@@ -618,7 +558,7 @@ fn init_cache(
     // exactly `nblk` blocks, so the scheduler's block allocator must not exceed it
     // (else it hands out a block id past the pool → silent KV corruption). The
     // uniform `compute_num_blocks` sizes from the memory budget and can be larger;
-    // clamp it. `None` for cuda/metal (budget-sized pools).
+    // clamp it. `None` for metal (budget-sized pools).
     if let Some(cap) = worker.kv_cache_num_blocks_override()
         && cap < num_gpu_blocks
     {
@@ -1376,7 +1316,7 @@ fn prefix_caching(
 /// resolved per device (mirrors Python vLLM `EngineArgs.get_batch_defaults`):
 /// an H100-class GPU on the offline path gets 16384 rather than the base 2048.
 /// Falls back to the base `SchedulerConfig` constant when the device cannot be
-/// queried or on non-CUDA builds. Only the batched-tokens value is consumed
+/// queried. Only the batched-tokens value is consumed
 /// here; `max_num_seqs` keeps its existing default for now.
 fn resolve_default_max_num_batched_tokens(is_offline: bool) -> usize {
     if let Some((total_bytes, name)) = backend_device_total_bytes_and_name() {
@@ -1451,7 +1391,7 @@ fn resolve_max_num_seqs(
 }
 
 /// Total device memory + name from whichever backend factory is registered in
-/// this build (cuda XOR metal XOR …), without naming a specific backend crate.
+/// this build (metal XOR spyre), without naming a specific backend crate.
 fn backend_device_total_bytes_and_name() -> Option<(u64, String)> {
     inventory::iter::<&dyn WorkerFactory>().find_map(|f| f.device_total_bytes_and_name())
 }
@@ -1465,12 +1405,7 @@ fn initialize_core(
     progress: Option<&Arc<crate::progress::StartupProgress>>,
     is_offline: bool,
 ) -> Result<InitializedCore> {
-    let tp_size = config.tensor_parallel_size;
-
-    // TP > 1: multi-GPU path with NCCL.
-    if tp_size > 1 {
-        return initialize_core_tp(config, speculation);
-    }
+    refuse_multi_device(config)?;
 
     let model_path = config.model.clone();
     let model_name = extract_model_name(&model_path).into_owned();
@@ -1487,9 +1422,7 @@ fn initialize_core(
     // it does the download once, then `worker.load_model` re-resolves
     // the same cached path (cheap). Returns `None` for `.gguf` sources
     // (no sibling tokenizer.json) — that path falls through to the
-    // worker's `take_preloaded_tokenizer` (cuda/mlx GGUF builds the
-    // tokenizer from file metadata via `scratchy_quantizations::gguf::gguf_tokenizer`,
-    // the only reason any worker still touches tokenizers).
+    // worker's `take_preloaded_tokenizer`.
     let prefetched_model_dir = scratchy_serving_worker::worker_factory::resolve_model_path(
         &model_path,
         config.hf_token.as_deref(),
@@ -1621,9 +1554,8 @@ fn initialize_core(
     // backend. On backends that prune a compiled prefill-bucket ladder
     // target-reactively (Metal today), the largest resident bucket the device
     // just selected IS the right per-device default, and a single forward can
-    // never exceed it (no NoBucketFits). On backends without ladder pruning
-    // (CUDA), fall back to the existing device-aware default (queries GPU
-    // mem/name; e.g. 16384 on an H100-class offline part). An explicit
+    // never exceed it (no NoBucketFits). On backends without ladder pruning,
+    // fall back to the device-aware default (queries device mem/name). An explicit
     // `--max-num-batched-tokens` always wins, clamped to the resident bucket
     // where one exists so the user can't overflow it.
     let max_num_batched_tokens = match (config.max_num_batched_tokens, worker_prefill_bucket_max_m)
@@ -1666,16 +1598,15 @@ fn initialize_core(
         max_num_batched_tokens
     };
     // The concurrency the scheduler will actually admit under. A backend whose decode-width ladder is
-    // BAKED (spyre's `BATCH_RUNGS`) cannot grow it to cover `max_num_seqs` the way cuda's captured-graph
-    // ladder does, so it reports its widest batchable width and the scheduler is held to it — the same
-    // "fast path covers the configured concurrency" invariant cuda gets for free, enforced from the other
-    // end. Past the ladder a backend still runs CORRECTLY (spyre degrades to one launch per request), so
+    // BAKED (spyre's `BATCH_RUNGS`) cannot grow it to cover `max_num_seqs`, so it
+    // reports its widest batchable width and the scheduler is held to it, so the fast path covers the
+    // configured concurrency. Past the ladder a backend still runs CORRECTLY (spyre degrades to one launch per request), so
     // this is a throughput guard, never a correctness one — which is why it caps rather than refusing.
     let max_num_seqs = resolve_max_num_seqs(config.max_num_seqs, worker_max_num_seqs, is_offline);
     let engine_config = EngineCoreConfig {
         scheduler_config: SchedulerConfig {
             // Resolved above: the device-selected prefill bucket on pruning
-            // backends (Metal), else the device-aware CUDA default.
+            // backends (Metal), else the device-aware default.
             max_num_batched_tokens,
             max_num_seqs,
             policy: SchedulerPolicy::Fcfs,
@@ -1729,297 +1660,18 @@ fn initialize_core(
     })
 }
 
-/// TP variant of `initialize_core`: spawns one worker per GPU, sets up NCCL,
-/// profiles memory, warms up, and returns an `InitializedCore` with a
-/// `ThreadPoolExecutor`-backed `InprocClient`.
-fn initialize_core_tp(config: &VllmConfig, speculation: &Speculation) -> Result<InitializedCore> {
-    #[cfg(not(feature = "nccl"))]
-    {
-        let _ = (config, speculation);
+/// Metal, spyre and cuda each run a model on exactly one device: refuse tensor /
+/// pipeline parallelism up front rather than silently serving on one device.
+fn refuse_multi_device(config: &VllmConfig) -> Result<()> {
+    if config.tensor_parallel_size > 1 || config.pipeline_parallel_size > 1 {
         anyhow::bail!(
-            "Tensor parallelism requires the `nccl` feature; \
-             rebuild with --features nccl"
+            "multi-device serving is not supported: metal, spyre and cuda run on one device \
+             (got --tensor-parallel-size {}, --pipeline-parallel-size {})",
+            config.tensor_parallel_size,
+            config.pipeline_parallel_size,
         );
     }
-
-    #[cfg(feature = "nccl")]
-    {
-        use scratchy_serving_worker::gpu_worker::CudaWorker;
-        use scratchy_serving_worker::parallel::ResolvedParallelConfig;
-        use scratchy_serving_worker::threadpool::ThreadPoolExecutor;
-        use scratchy_serving_worker::worker_factory::WorkerCreateConfig;
-
-        let tp_size = config.tensor_parallel_size;
-        let model_name = extract_model_name(&config.model).into_owned();
-        let is_pooling = config.runner == "pooling";
-
-        info!("Tensor parallelism: {} GPUs", tp_size);
-
-        let nccl_id =
-            scratchy_target_cuda::NcclId::new().context("failed to generate NCCL unique ID")?;
-
-        let worker_configs: Vec<WorkerCreateConfig> = (0..tp_size)
-            .map(|rank| WorkerCreateConfig {
-                model_path: config.model.clone(),
-                dtype: config.dtype.clone(),
-                hf_token: config.hf_token.clone(),
-                block_size: config.block_size,
-                device_id: rank as i32,
-                // The request, not a resolved number: `None` lets the worker
-                // resolve the width itself, `Some(n)` pins worker-side
-                // consumers to the ask.
-                max_num_seqs: config.max_num_seqs,
-                enable_prefix_caching: requested_prefix_caching(config),
-                enforce_eager: config.enforce_eager,
-                max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
-                cuda_graph_sizes: config
-                    .cuda_graph_config
-                    .as_ref()
-                    .map(|c| c.capture_sizes.clone())
-                    .unwrap_or_default(),
-                cublas_autotune: config.cublas_autotune,
-                gpu_memory_utilization: config.gpu_memory_utilization,
-                pooling_strategy: config.pooling_strategy.clone(),
-                is_pooling,
-                tp_rank: rank,
-                tp_world_size: tp_size,
-                pp_rank: 0,
-                pp_size: 1,
-                gguf_file: config.gguf_file.clone(),
-                lora_adapter: config.lora_adapter.clone(),
-                kv_cache_dtype: config.kv_cache_dtype.clone(),
-                calculate_kv_scales: config.calculate_kv_scales,
-                cuda_graph_mode: config
-                    .cuda_graph_mode
-                    .parse()
-                    .unwrap_or(CudaGraphMode::Auto),
-                eos_token_ids: vec![],
-                max_model_len: config.max_model_len,
-                draft: speculation.worker_draft(),
-                verify_seqs: speculation.verify_seqs(config),
-                draft_model_dtype: config.draft_model_dtype.clone(),
-            })
-            .collect();
-
-        let download_barrier = std::sync::Arc::new(std::sync::Barrier::new(tp_size));
-
-        let handles: Vec<_> = worker_configs
-            .into_iter()
-            .enumerate()
-            .map(|(local_rank, cfg)| {
-                let barrier = download_barrier.clone();
-                std::thread::spawn(move || -> Result<CudaWorker> {
-                    let mut worker = CudaWorker::new(cfg);
-                    worker.init_device().context("init_device failed")?;
-                    if local_rank == 0 {
-                        worker.load_model().context("load_model failed")?;
-                        barrier.wait();
-                    } else {
-                        barrier.wait();
-                        worker.load_model().context("load_model failed")?;
-                    }
-                    Ok(worker)
-                })
-            })
-            .collect();
-
-        let mut scratchy_workers: Vec<CudaWorker> = Vec::with_capacity(tp_size);
-        let mut hf_config = None;
-        let mut model_dir = None;
-        let mut dtype_elem_bytes: usize = 2;
-        // GGUF sources carry the tokenizer in the file's metadata, not as
-        // a sibling `tokenizer.json` on disk. `MetalWorker::load_model`
-        // reconstructs it and stashes it in `preloaded_tokenizer`. The
-        // tp=1 path (`initialize_core`) harvests this via
-        // `take_preloaded_tokenizer()` and falls back to
-        // `try_load_tokenizer(dir)` only when there's no preloaded one.
-        // The tp>1 path previously skipped this and went straight to
-        // `try_load_tokenizer` — which returns `None` for GGUF (no
-        // sibling tokenizer.json) and silently dropped the real
-        // tokenizer, leaving the engine with a byte-level fallback that
-        // tokenized `<|begin_of_text|>` as literal ASCII bytes (prompt
-        // became 235 garbage tokens, all downstream inference followed).
-        let mut preloaded_tokenizer: Option<tokenizers::Tokenizer> = None;
-
-        for (rank, handle) in handles.into_iter().enumerate() {
-            let mut worker = handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("worker thread {rank} panicked"))?
-                .with_context(|| format!("worker {rank} init failed"))?;
-            if rank == 0 {
-                hf_config = worker.hf_config().cloned();
-                model_dir = worker.model_dir().map(|p| p.to_path_buf());
-                dtype_elem_bytes = worker.resolved_dtype_elem_bytes();
-                preloaded_tokenizer = worker.take_preloaded_tokenizer();
-            }
-            scratchy_workers.push(worker);
-        }
-
-        let hf_config = hf_config.context("model config not available after load")?;
-        let max_model_len = config
-            .max_model_len
-            .or(hf_config.max_position_embeddings())
-            .unwrap_or(4096);
-
-        info!(
-            "Model: {}, max_model_len={}, tp={}",
-            model_name, max_model_len, tp_size
-        );
-
-        // NCCL init + memory profiling on persistent threads.
-        let init_results: Vec<Result<(usize, CudaWorker)>> = std::thread::scope(|s| {
-            let handles: Vec<_> = scratchy_workers
-                .into_iter()
-                .enumerate()
-                .map(|(rank, mut worker)| {
-                    s.spawn(move || -> Result<(usize, CudaWorker)> {
-                        let device = worker.device_ref().expect("device not initialized");
-                        unsafe {
-                            scratchy_target_cuda::driver::ctx_set_current(device.ctx).unwrap();
-                        }
-                        let nccl_group = scratchy_target_cuda::NcclGroup::new(
-                            rank,
-                            tp_size,
-                            nccl_id,
-                            device.compute_stream,
-                        )
-                        .context("NCCL comm init failed")?;
-                        worker.set_tp_group(std::sync::Arc::new(nccl_group));
-                        let avail = worker.determine_available_memory().map_err(|e| {
-                            anyhow::anyhow!("determine_available_memory rank {rank}: {e}")
-                        })?;
-                        Ok((avail, worker))
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-
-        let mut workers: Vec<Box<dyn Worker>> = Vec::with_capacity(tp_size);
-        let mut min_avail = usize::MAX;
-        let mut supports_hybrid_swa_kv = true;
-        for res in init_results {
-            let (avail, worker) = res?;
-            min_avail = min_avail.min(avail);
-            supports_hybrid_swa_kv = worker.supports_hybrid_swa_kv();
-            workers.push(Box::new(worker));
-        }
-        // The narrowest rank's answer when the flag was unset (each rank
-        // clamps on its own memory query); the caller's ask — already built
-        // into every rank — when it was not. Align every rank to it BEFORE
-        // initialize_cache / warmup so ladders and pools all build at one
-        // width. (Engine-level helpers — one implementation, tested there.)
-        let worker_max_num_seqs = min_max_num_seqs(&workers);
-        align_all_max_num_seqs(&mut workers);
-
-        let (num_gpu_blocks, swa_hybrid_kv) = compute_kv_blocks(
-            min_avail,
-            config.block_size,
-            &hf_config,
-            dtype_elem_bytes,
-            config.gpu_memory_utilization,
-            &config.kv_cache_dtype,
-            workers
-                .first()
-                .and_then(|w| w.kv_block_bytes(config.block_size)),
-            supports_hybrid_swa_kv,
-        );
-
-        for w in &mut workers {
-            w.initialize_cache(num_gpu_blocks, 0)
-                .context("initialize_cache")?;
-        }
-
-        info!(
-            "TP: min available memory across ranks: {:.1} GB, num_gpu_blocks={}",
-            min_avail as f64 / (1024.0 * 1024.0 * 1024.0),
-            num_gpu_blocks,
-        );
-
-        // Warm up concurrently (NCCL collectives need all ranks).
-        let warmup_results: Vec<Result<()>> = std::thread::scope(|s| {
-            let handles: Vec<_> = workers
-                .iter_mut()
-                .enumerate()
-                .map(|(rank, w)| {
-                    s.spawn(move || {
-                        w.compile_or_warm_up_model()
-                            .with_context(|| format!("compile_or_warm_up_model rank {rank}"))
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-        for res in warmup_results {
-            res?;
-        }
-
-        let parallel_config = ResolvedParallelConfig::tensor_parallel(tp_size, 0);
-        let executor = ThreadPoolExecutor::new(workers, parallel_config);
-
-        let use_async_scheduling = !config.disable_async_scheduling && !speculation.requires_sync();
-        let enable_prefix_caching = prefix_caching(
-            config,
-            &hf_config.architectures,
-            scratchy_serving_engine::executor::Executor::snapshot_budget(&executor),
-        );
-
-        // Prefer the GGUF-preloaded tokenizer harvested from rank 0's
-        // worker above. Falls back to `try_load_tokenizer(dir)` for
-        // safetensors where a sibling `tokenizer.json` lives next to
-        // the weights. Mirrors `initialize_core`'s tp=1 flow.
-        let tokenizer = preloaded_tokenizer
-            .map(Tokenizer::from_hf_tokenizer)
-            .or_else(|| {
-                model_dir
-                    .as_ref()
-                    .and_then(|dir| try_load_tokenizer(dir).ok())
-            })
-            .map(|tok| {
-                info!("Tokenizer loaded");
-                Arc::new(tok)
-            });
-
-        let eos_token_ids =
-            resolve_eos_token_ids(&hf_config, model_dir.as_deref(), tokenizer.as_deref());
-
-        let engine_config = EngineCoreConfig {
-            scheduler_config: SchedulerConfig {
-                max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
-                // The narrowest rank's answer when the flag was unset; the
-                // caller's ask (already built into every rank's pools)
-                // when it was not.
-                max_num_seqs: resolve_max_num_seqs(config.max_num_seqs, worker_max_num_seqs, false),
-                policy: SchedulerPolicy::Fcfs,
-                enable_chunked_prefill: true,
-                async_scheduling: Some(use_async_scheduling),
-                num_lookahead_tokens: speculation.drafts(config),
-                ..Default::default()
-            },
-            max_model_len,
-            num_gpu_blocks,
-            block_size: config.block_size,
-            engine_index: 0,
-            async_scheduling: use_async_scheduling,
-            use_spec_decode: speculation.is_on(),
-            proposer_config: None,
-            eos_token_ids,
-            is_pooling: config.runner == "pooling",
-            enable_prefix_caching,
-            hybrid_kv: swa_hybrid_kv,
-        };
-
-        let client = InprocClient::new(engine_config, Box::new(executor));
-
-        Ok(InitializedCore {
-            client,
-            tokenizer,
-            model_name,
-            max_model_len,
-            model_dir,
-            hf_config,
-        })
-    }
+    Ok(())
 }
 
 /// Initialize the sync stack for offline batch inference (no async overhead).
@@ -2161,36 +1813,6 @@ pub fn initialize_stack(
         Arc::new(crate::progress::StartupProgress::new(show_progress))
     });
 
-    let tp_size = config.tensor_parallel_size;
-    let model_name = extract_model_name(&config.model).into_owned();
-
-    // External launcher: each process is a separate rank with its own GPU.
-    if config.distributed_executor_backend == "external_launcher" {
-        return initialize_stack_external(config, &speculation, model_name, init_start);
-    }
-
-    // Multi-node TP ("mp" backend): leader runs engine+scheduler, followers
-    // run headless. TCP for control plane, NCCL for data plane.
-    // Followers (node_rank > 0) should use `initialize_and_run_follower` instead.
-    if (config.num_nodes > 1 || config.distributed_executor_backend == "mp")
-        && config.node_rank == 0
-    {
-        return initialize_stack_multinode(config, &speculation, model_name, init_start);
-    }
-
-    let pp_size = config.pipeline_parallel_size;
-
-    // TP+PP or PP-only: multi-GPU path with NCCL P2P for PP and all-reduce for TP.
-    if pp_size > 1 {
-        return initialize_stack_tp_pp(config, &speculation, model_name, init_start);
-    }
-
-    // TP > 1: multi-GPU path with NCCL (in-process, thread-per-GPU).
-    if tp_size > 1 {
-        return initialize_stack_tp(config, &speculation, model_name, init_start);
-    }
-
-    // TP=1: single-GPU path.
     progress.set_stage("Initializing backend");
     // Online-server context → keep the (smaller) server batch defaults.
     let core = initialize_core(config, &speculation, Some(&progress), false)?;
@@ -2211,6 +1833,10 @@ pub fn initialize_stack(
         config.chat_template.as_deref(),
     )?;
     engine.set_generation_defaults(load_generation_defaults(core.model_dir.as_deref()));
+    // The backend's sampling limit, checked as each request is submitted.
+    if let Some(backend) = scratchy_serving_engine::worker_factory::factory_for(&config.device) {
+        engine.set_sampling_check(backend);
+    }
     if !config.disable_async_scheduling && !speculation.requires_sync() {
         engine.set_async_scheduling(true);
     }
@@ -2256,1560 +1882,6 @@ pub fn initialize_stack(
         model_name,
         max_model_len,
     })
-}
-
-/// Multi-node init flow ("mp" backend): leader creates engine+scheduler and
-/// broadcasts scheduler output via TCP. Follower runs headless, receiving
-/// commands via TCP and participating in NCCL collectives during forward.
-///
-/// - Leader (node_rank=0): Creates CudaWorker, NCCL comm, cache init,
-///   warmup, wraps in `MultiNodeExecutor`, returns `InitializedStack`.
-/// - Follower (node_rank>0): Handled by [`initialize_and_run_follower`].
-fn initialize_stack_multinode(
-    config: &VllmConfig,
-    speculation: &Speculation,
-    model_name: String,
-    init_start: Instant,
-) -> Result<InitializedStack> {
-    #[cfg(not(feature = "nccl"))]
-    {
-        let _ = (config, speculation, model_name, init_start);
-        anyhow::bail!(
-            "Multi-node TP requires the `nccl` feature; \
-             rebuild with --features nccl"
-        );
-    }
-
-    #[cfg(feature = "nccl")]
-    {
-        use scratchy_serving_worker::gpu_worker::CudaWorker;
-        use scratchy_serving_worker::multinode::MultiNodeExecutor;
-        use scratchy_serving_worker::worker_factory::WorkerCreateConfig;
-
-        let tp_size = config.tensor_parallel_size;
-        let node_rank = config.node_rank;
-        let num_nodes = config.num_nodes;
-        let is_pooling = config.runner == "pooling";
-
-        if node_rank != 0 {
-            anyhow::bail!(
-                "initialize_stack_multinode called on follower (node_rank={}). \
-                 Use initialize_and_run_follower instead.",
-                node_rank
-            );
-        }
-
-        info!(
-            "Multi-node TP: leader node, tp_size={}, num_nodes={}, master={}:{}",
-            tp_size, num_nodes, config.master_addr, config.master_port
-        );
-
-        // Step 1: Exchange NCCL unique ID via TCP store.
-        let nccl_id_bytes = scratchy_target_cuda::tcp_store::exchange_nccl_id(
-            0,
-            tp_size,
-            &config.master_addr,
-            config.master_port,
-        )
-        .context("failed to exchange NCCL ID via TCP store")?;
-        let nccl_id = scratchy_target_cuda::NcclId::from_raw(nccl_id_bytes);
-        info!("Leader: NCCL ID exchanged");
-
-        // Step 2: Create CudaWorker for this node's GPU (rank 0).
-        let cuda_config = WorkerCreateConfig {
-            model_path: config.model.clone(),
-            dtype: config.dtype.clone(),
-            hf_token: config.hf_token.clone(),
-            block_size: config.block_size,
-            device_id: 0,
-            // The request, not a resolved number: `None` lets the worker
-            // resolve the width itself, `Some(n)` pins worker-side
-            // consumers to the ask.
-            max_num_seqs: config.max_num_seqs,
-            enable_prefix_caching: requested_prefix_caching(config),
-            enforce_eager: config.enforce_eager,
-            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
-            cuda_graph_sizes: config
-                .cuda_graph_config
-                .as_ref()
-                .map(|c| c.capture_sizes.clone())
-                .unwrap_or_default(),
-            cublas_autotune: config.cublas_autotune,
-            gpu_memory_utilization: config.gpu_memory_utilization,
-            pooling_strategy: config.pooling_strategy.clone(),
-            is_pooling,
-            tp_rank: 0,
-            tp_world_size: tp_size,
-            pp_rank: 0,
-            pp_size: 1,
-            gguf_file: config.gguf_file.clone(),
-            lora_adapter: config.lora_adapter.clone(),
-            kv_cache_dtype: config.kv_cache_dtype.clone(),
-            calculate_kv_scales: config.calculate_kv_scales,
-            cuda_graph_mode: config
-                .cuda_graph_mode
-                .parse()
-                .unwrap_or(CudaGraphMode::Auto),
-            eos_token_ids: vec![],
-            max_model_len: config.max_model_len,
-            draft: speculation.worker_draft(),
-            verify_seqs: speculation.verify_seqs(config),
-            draft_model_dtype: config.draft_model_dtype.clone(),
-        };
-
-        let mut worker = CudaWorker::new(cuda_config);
-        worker
-            .init_device()
-            .context("failed to initialize CUDA device")?;
-        worker.load_model().context("failed to load model")?;
-
-        let hf_config = worker
-            .hf_config()
-            .context("model config not available after load")?
-            .clone();
-        let model_dir = worker.model_dir().map(|p| p.to_path_buf());
-        let dtype_elem_bytes = worker.resolved_dtype_elem_bytes();
-
-        // Step 3: Create NCCL communicator (collective — all ranks participate).
-        let device = worker.device_ref().expect("device not initialized");
-        unsafe {
-            scratchy_target_cuda::driver::ctx_set_current(device.ctx).unwrap();
-        }
-        let nccl_group =
-            scratchy_target_cuda::NcclGroup::new(0, tp_size, nccl_id, device.compute_stream)
-                .context("NCCL comm init failed")?;
-        worker.set_tp_group(std::sync::Arc::new(nccl_group));
-        info!("Leader: NCCL communicator created");
-
-        // Step 4: Profile available memory.
-        let available_memory = worker
-            .determine_available_memory()
-            .context("failed to determine available memory")?;
-
-        // Step 5: All-reduce MIN across ranks via TCP store.
-        let min_memory = scratchy_serving_transport::tcp_store::allreduce_min(
-            0,
-            tp_size,
-            available_memory,
-            &config.master_addr,
-            config.master_port,
-        )
-        .context("failed to allreduce memory")?;
-
-        let max_model_len = config
-            .max_model_len
-            .or(hf_config.max_position_embeddings())
-            .unwrap_or(4096);
-
-        info!(
-            "Leader: available_memory={:.1} GB, min_across_ranks={:.1} GB",
-            available_memory as f64 / (1024.0 * 1024.0 * 1024.0),
-            min_memory as f64 / (1024.0 * 1024.0 * 1024.0),
-        );
-
-        // Step 6: Compute block count.
-        let (num_gpu_blocks, swa_hybrid_kv) = compute_kv_blocks(
-            min_memory,
-            config.block_size,
-            &hf_config,
-            dtype_elem_bytes,
-            config.gpu_memory_utilization,
-            &config.kv_cache_dtype,
-            worker.kv_block_bytes(config.block_size),
-            worker.supports_hybrid_swa_kv(),
-        );
-
-        info!(
-            "Leader: num_gpu_blocks={}, kv_cache_tokens={}",
-            num_gpu_blocks,
-            num_gpu_blocks * config.block_size,
-        );
-
-        // Step 7: All-reduce the resolved width MIN across every node and
-        // align to it BEFORE `establish` (the control-channel listener) —
-        // every follower takes the matching side in its Step 5b, which also
-        // runs before its connect; a call placed after `establish` deadlocks
-        // (the leader sits in `accept()` while the follower retries a
-        // port+1 listener that does not exist yet). With both sides aligned
-        // from the SAME allreduce, no AlignWidth broadcast is needed — the
-        // InitCache broadcast below is the first thing to cross the channel.
-        let mut worker: Box<dyn Worker> = Box::new(worker);
-        // The width this rank resolved (unset flag → device tier / memory-
-        // affordable GDN slots) or the caller's ask.
-        let min_worker_width = worker
-            .max_num_seqs_override()
-            .map(|w| {
-                scratchy_serving_transport::tcp_store::allreduce_min(
-                    0,
-                    tp_size,
-                    w,
-                    &config.master_addr,
-                    config.master_port,
-                )
-                .context("failed to allreduce max_num_seqs")
-            })
-            .transpose()?;
-        if let Some(w) = min_worker_width {
-            worker.align_max_num_seqs(w);
-        }
-        let worker_max_num_seqs = min_worker_width.or_else(|| worker.max_num_seqs_override());
-
-        // Step 7b: Establish TCP control channel (persistent connections).
-        let mut channel = scratchy_serving_transport::TcpControlChannel::establish(
-            0,
-            tp_size,
-            &config.master_addr,
-            config.master_port,
-        )
-        .context("failed to establish TCP control channel")?;
-        info!("Leader: TCP control channel established");
-
-        // Step 8: Initialize cache — broadcast command to followers first,
-        // then run locally. Both sides participate in any NCCL collectives.
-        // Both sides are already at the aligned width (Step 7 / follower
-        // Step 5b), so pools and ladders build at one width everywhere.
-        {
-            use scratchy_serving_worker::multinode::ControlMessage;
-            ControlMessage::InitCache {
-                num_gpu_blocks,
-                num_cpu_blocks: 0,
-            }
-            .broadcast(&mut channel)
-            .context("broadcast InitCache")?;
-        }
-        worker
-            .initialize_cache(num_gpu_blocks, 0)
-            .context("failed to initialize cache")?;
-
-        // Step 9: Warm up — broadcast to followers, then run locally.
-        // Both sides' forward passes hit NCCL collectives simultaneously.
-        {
-            use scratchy_serving_worker::multinode::ControlMessage;
-            ControlMessage::Warmup
-                .broadcast(&mut channel)
-                .context("broadcast Warmup")?;
-        }
-        worker
-            .compile_or_warm_up_model()
-            .context("failed to compile or warm up model")?;
-
-        // Step 10: Wrap in UniProcExecutor → MultiNodeExecutor.
-        let executor = UniProcExecutor::new_pre_initialized(worker);
-        let multi_executor = MultiNodeExecutor::new(Box::new(executor), channel);
-
-        // Step 11: Build engine.
-        // Load tokenizer and build engine.
-        let tokenizer = model_dir
-            .as_ref()
-            .and_then(|dir| try_load_tokenizer(dir).ok());
-
-        let eos_token_ids =
-            resolve_eos_token_ids(&hf_config, model_dir.as_deref(), tokenizer.as_ref());
-
-        let use_async_scheduling = !config.disable_async_scheduling && !speculation.requires_sync();
-        let enable_prefix_caching = prefix_caching(
-            config,
-            &hf_config.architectures,
-            scratchy_serving_engine::executor::Executor::snapshot_budget(&multi_executor),
-        );
-        let engine_config = EngineCoreConfig {
-            scheduler_config: SchedulerConfig {
-                max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
-                // The caller's ask, or (unset) this rank's resolved width.
-                max_num_seqs: resolve_max_num_seqs(config.max_num_seqs, worker_max_num_seqs, false),
-                policy: SchedulerPolicy::Fcfs,
-                enable_chunked_prefill: true,
-                async_scheduling: Some(use_async_scheduling),
-                num_lookahead_tokens: speculation.drafts(config),
-                ..Default::default()
-            },
-            max_model_len,
-            num_gpu_blocks,
-            block_size: config.block_size,
-            engine_index: 0,
-            async_scheduling: use_async_scheduling,
-            use_spec_decode: speculation.is_on(),
-            proposer_config: None,
-            eos_token_ids,
-            is_pooling: config.runner == "pooling",
-            enable_prefix_caching,
-            hybrid_kv: swa_hybrid_kv,
-        };
-
-        let client: Box<dyn scratchy_serving_engine::core_client::EngineCoreClient + Send> =
-            Box::new(InprocClient::new(engine_config, Box::new(multi_executor)));
-
-        let mut engine = build_engine(
-            client,
-            model_name.clone(),
-            max_model_len,
-            tokenizer.map(Arc::new),
-            model_dir.as_deref(),
-            config.chat_template.as_deref(),
-        )?;
-
-        if !config.disable_async_scheduling && !speculation.requires_sync() {
-            engine.set_generation_defaults(load_generation_defaults(model_dir.as_deref()));
-            engine.set_async_scheduling(true);
-        }
-        if config.runner == "pooling" {
-            engine.set_is_pooling(true);
-        }
-
-        info!(
-            "Leader: stack initialized in {:.1}s (multi-node, tp_size={})",
-            init_start.elapsed().as_secs_f64(),
-            tp_size,
-        );
-
-        auto_install_tool_parser(&mut engine, model_arch(&hf_config));
-        auto_install_reasoning_parser(&mut engine, model_arch(&hf_config));
-        Ok(InitializedStack {
-            engine: Arc::new(engine),
-            model_name,
-            max_model_len,
-        })
-    }
-}
-
-/// Initialize a follower node and run the headless worker loop.
-///
-/// This function does NOT return (blocks forever in the headless loop)
-/// until the leader sends a Shutdown command or the connection drops.
-///
-/// Called from the CLI when `node_rank > 0` and `num_nodes > 1`.
-#[cfg(feature = "nccl")]
-pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
-    use scratchy_serving_worker::gpu_worker::CudaWorker;
-    use scratchy_serving_worker::worker_factory::WorkerCreateConfig;
-
-    let speculation = resolve_speculative_decoding(config)?;
-
-    let tp_size = config.tensor_parallel_size;
-    let node_rank = config.node_rank;
-    let is_pooling = config.runner == "pooling";
-
-    info!(
-        "Multi-node TP: follower node_rank={}, tp_size={}, master={}:{}",
-        node_rank, tp_size, config.master_addr, config.master_port
-    );
-
-    // Step 1: Exchange NCCL unique ID via TCP store.
-    let nccl_id_bytes = scratchy_target_cuda::tcp_store::exchange_nccl_id(
-        node_rank,
-        tp_size,
-        &config.master_addr,
-        config.master_port,
-    )
-    .context("failed to exchange NCCL ID via TCP store")?;
-    let nccl_id = scratchy_target_cuda::NcclId::from_raw(nccl_id_bytes);
-    info!("Follower {}: NCCL ID exchanged", node_rank);
-
-    // Step 2: Create CudaWorker for this node's GPU.
-    let cuda_config = WorkerCreateConfig {
-        model_path: config.model.clone(),
-        dtype: config.dtype.clone(),
-        hf_token: config.hf_token.clone(),
-        block_size: config.block_size,
-        device_id: 0, // Each node has 1 GPU at device 0.
-        max_num_seqs: config.max_num_seqs,
-        enable_prefix_caching: requested_prefix_caching(config),
-        enforce_eager: config.enforce_eager,
-        max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
-        cuda_graph_sizes: config
-            .cuda_graph_config
-            .as_ref()
-            .map(|c| c.capture_sizes.clone())
-            .unwrap_or_default(),
-        cublas_autotune: config.cublas_autotune,
-        gpu_memory_utilization: config.gpu_memory_utilization,
-        pooling_strategy: config.pooling_strategy.clone(),
-        is_pooling,
-        tp_rank: node_rank,
-        tp_world_size: tp_size,
-        gguf_file: config.gguf_file.clone(),
-        lora_adapter: config.lora_adapter.clone(),
-        kv_cache_dtype: config.kv_cache_dtype.clone(),
-        calculate_kv_scales: config.calculate_kv_scales,
-        pp_rank: 0,
-        pp_size: 1,
-        cuda_graph_mode: config
-            .cuda_graph_mode
-            .parse()
-            .unwrap_or(CudaGraphMode::Auto),
-        eos_token_ids: vec![],
-        max_model_len: config.max_model_len,
-        draft: speculation.worker_draft(),
-        verify_seqs: speculation.verify_seqs(config),
-        draft_model_dtype: config.draft_model_dtype.clone(),
-    };
-
-    let mut worker = CudaWorker::new(cuda_config);
-    worker
-        .init_device()
-        .context("failed to initialize CUDA device")?;
-    worker.load_model().context("failed to load model")?;
-
-    // Step 3: Create NCCL communicator (collective — all ranks participate).
-    let device = worker.device_ref().expect("device not initialized");
-    unsafe {
-        scratchy_target_cuda::driver::ctx_set_current(device.ctx).unwrap();
-    }
-    let nccl_group =
-        scratchy_target_cuda::NcclGroup::new(node_rank, tp_size, nccl_id, device.compute_stream)
-            .context("NCCL comm init failed")?;
-    worker.set_tp_group(std::sync::Arc::new(nccl_group));
-    info!("Follower {}: NCCL communicator created", node_rank);
-
-    // Step 4: Profile available memory.
-    let available_memory = worker
-        .determine_available_memory()
-        .context("failed to determine available memory")?;
-
-    // Step 5: All-reduce MIN across ranks via TCP store.
-    let min_memory = scratchy_serving_transport::tcp_store::allreduce_min(
-        node_rank,
-        tp_size,
-        available_memory,
-        &config.master_addr,
-        config.master_port,
-    )
-    .context("failed to allreduce memory")?;
-
-    // Step 5b: All-reduce the resolved width MIN too, and align locally from
-    // it — the leader takes the matching side BEFORE its `establish`/listener
-    // and aligns to the same number, so this ordering cannot deadlock. No
-    // AlignWidth broadcast follows: both sides hold the same allreduce answer.
-    let worker_width = worker.max_num_seqs_override();
-    let min_width = worker_width
-        .map(|w| {
-            scratchy_serving_transport::tcp_store::allreduce_min(
-                node_rank,
-                tp_size,
-                w,
-                &config.master_addr,
-                config.master_port,
-            )
-            .context("failed to allreduce max_num_seqs")
-        })
-        .transpose()?;
-
-    info!(
-        "Follower {}: available_memory={:.1} GB, min_across_ranks={:.1} GB",
-        node_rank,
-        available_memory as f64 / (1024.0 * 1024.0 * 1024.0),
-        min_memory as f64 / (1024.0 * 1024.0 * 1024.0),
-    );
-
-    // Step 6: Establish TCP control channel.
-    let channel = scratchy_serving_transport::TcpControlChannel::establish(
-        node_rank,
-        tp_size,
-        &config.master_addr,
-        config.master_port,
-    )
-    .context("failed to establish TCP control channel")?;
-    info!("Follower {}: TCP control channel established", node_rank);
-
-    // Step 7: Wrap in UniProcExecutor and enter headless loop.
-    // The headless loop receives InitCache, Warmup, ExecuteModel,
-    // and Shutdown commands from the leader via TCP. NCCL collectives in the
-    // forward pass synchronize with the leader automatically. `min_width` is
-    // the same number the leader all-reduced in its Step 8; align locally so
-    // this rank's pools and ladders build at it before InitCache arrives.
-    if let Some(w) = min_width {
-        worker.align_max_num_seqs(w);
-    }
-    let executor = UniProcExecutor::new_pre_initialized(Box::new(worker));
-
-    info!("Follower {}: entering headless loop", node_rank,);
-    crate::headless::run_headless(executor, channel)?;
-
-    info!(
-        "Follower {}: headless loop exited, shutting down",
-        node_rank
-    );
-    Ok(())
-}
-
-/// Multi-GPU init flow: creates N workers (one per GPU rank), inits NCCL,
-/// and wraps them in a ThreadPoolExecutor.
-///
-/// Each worker loads the full model weights and keeps only its shard
-/// Initialize full stack for TP+PP or PP-only (pipeline parallelism).
-///
-/// Creates `tp_size * pp_size` workers, each with a TP NCCL comm and a PP
-/// NCCL comm. Workers load only their PP stage's layers.
-fn initialize_stack_tp_pp(
-    config: &VllmConfig,
-    speculation: &Speculation,
-    model_name: String,
-    init_start: Instant,
-) -> Result<InitializedStack> {
-    let _ = (config, speculation, model_name, init_start);
-    anyhow::bail!(
-        "Pipeline parallelism is not supported on the scratchy-forward-compiler forwards \
-         (the previous PP path lived in `scratchy_target_cuda::model::*` and has been \
-         removed). Run with `--pipeline-parallel-size 1`."
-    );
-    #[allow(unreachable_code)]
-    {
-        #[cfg(not(feature = "nccl"))]
-        {
-            let _ = (config, speculation, model_name, init_start);
-            anyhow::bail!(
-                "Pipeline parallelism requires the `nccl` feature; \
-             rebuild with --features nccl"
-            );
-        }
-
-        #[cfg(feature = "nccl")]
-        {
-            use scratchy_serving_worker::gpu_worker::CudaWorker;
-            use scratchy_serving_worker::parallel::ResolvedParallelConfig;
-            use scratchy_serving_worker::threadpool::ThreadPoolExecutor;
-            use scratchy_serving_worker::worker_factory::WorkerCreateConfig;
-
-            let tp_size = config.tensor_parallel_size;
-            let pp_size = config.pipeline_parallel_size;
-            let world_size = tp_size * pp_size;
-            let is_pooling = config.runner == "pooling";
-
-            info!(
-                "Pipeline parallelism: {} PP stages × {} TP ranks = {} GPUs",
-                pp_size, tp_size, world_size
-            );
-
-            // Generate NCCL unique IDs:
-            // - One TP NcclId per PP stage (pp_size total — ranks in same stage share it).
-            // - One PP NcclId per TP position (tp_size total — ranks with same tp_rank share it).
-            let tp_nccl_ids: Vec<scratchy_target_cuda::NcclId> = (0..pp_size)
-                .map(|_| {
-                    scratchy_target_cuda::NcclId::new().context("failed to generate TP NCCL ID")
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let pp_nccl_ids: Vec<scratchy_target_cuda::NcclId> = (0..tp_size)
-                .map(|_| {
-                    scratchy_target_cuda::NcclId::new().context("failed to generate PP NCCL ID")
-                })
-                .collect::<Result<Vec<_>>>()?;
-
-            // Build per-rank configs.
-            // Rank layout: global_rank = pp_rank * tp_size + tp_rank.
-            let worker_configs: Vec<WorkerCreateConfig> = (0..world_size)
-                .map(|global_rank| {
-                    let tp_rank = global_rank % tp_size;
-                    let pp_rank = global_rank / tp_size;
-                    WorkerCreateConfig {
-                        model_path: config.model.clone(),
-                        dtype: config.dtype.clone(),
-                        hf_token: config.hf_token.clone(),
-                        block_size: config.block_size,
-                        device_id: global_rank as i32,
-                        // The request, not a resolved number: `None` lets
-                        // the worker resolve the width itself, `Some(n)` pins
-                        // worker-side consumers to the ask.
-                        max_num_seqs: config.max_num_seqs,
-                        enable_prefix_caching: requested_prefix_caching(config),
-                        enforce_eager: config.enforce_eager,
-                        max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
-                        cuda_graph_sizes: config
-                            .cuda_graph_config
-                            .as_ref()
-                            .map(|c| c.capture_sizes.clone())
-                            .unwrap_or_default(),
-                        cublas_autotune: config.cublas_autotune,
-                        gpu_memory_utilization: config.gpu_memory_utilization,
-                        pooling_strategy: config.pooling_strategy.clone(),
-                        is_pooling,
-                        tp_rank,
-                        tp_world_size: tp_size,
-                        pp_rank,
-                        pp_size,
-                        gguf_file: config.gguf_file.clone(),
-                        lora_adapter: config.lora_adapter.clone(),
-                        kv_cache_dtype: config.kv_cache_dtype.clone(),
-                        calculate_kv_scales: config.calculate_kv_scales,
-                        cuda_graph_mode: config
-                            .cuda_graph_mode
-                            .parse()
-                            .unwrap_or(CudaGraphMode::Auto),
-                        eos_token_ids: vec![],
-                        max_model_len: config.max_model_len,
-                        draft: speculation.worker_draft(),
-                        verify_seqs: speculation.verify_seqs(config),
-                        draft_model_dtype: config.draft_model_dtype.clone(),
-                    }
-                })
-                .collect();
-
-            // Download barrier: rank 0 downloads first, others wait.
-            let download_barrier = std::sync::Arc::new(std::sync::Barrier::new(world_size));
-
-            // Phase 1: Spawn one thread per GPU — init device + load model (PP-aware).
-            let handles: Vec<_> = worker_configs
-                .into_iter()
-                .enumerate()
-                .map(|(global_rank, cfg)| {
-                    let barrier = download_barrier.clone();
-                    std::thread::spawn(move || -> Result<CudaWorker> {
-                        let mut worker = CudaWorker::new(cfg);
-                        worker.init_device().context("init_device failed")?;
-
-                        // Rank 0 loads first (downloads model files to cache).
-                        if global_rank == 0 {
-                            worker.load_model().context("load_model failed")?;
-                            barrier.wait();
-                        } else {
-                            barrier.wait();
-                            worker.load_model().context("load_model failed")?;
-                        }
-
-                        Ok(worker)
-                    })
-                })
-                .collect();
-
-            // Collect workers.
-            let mut scratchy_workers: Vec<CudaWorker> = Vec::with_capacity(world_size);
-            let mut hf_config = None;
-            let mut model_dir = None;
-            let mut dtype_elem_bytes: usize = 2; // BF16 default
-
-            for (rank, handle) in handles.into_iter().enumerate() {
-                let worker = handle
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("worker thread {rank} panicked"))?
-                    .with_context(|| format!("worker {rank} init failed"))?;
-
-                if rank == 0 {
-                    hf_config = worker.hf_config().cloned();
-                    model_dir = worker.model_dir().map(|p| p.to_path_buf());
-                    dtype_elem_bytes = worker.resolved_dtype_elem_bytes();
-                }
-                scratchy_workers.push(worker);
-            }
-
-            let hf_config = hf_config.context("model config not available after load")?;
-
-            let max_model_len = config
-                .max_model_len
-                .or(hf_config.max_position_embeddings())
-                .unwrap_or(4096);
-            let num_layers = resolve_num_layers(&hf_config);
-
-            info!(
-                "Model: {}, max_model_len={}, num_layers={}, tp={}, pp={}",
-                model_name, max_model_len, num_layers, tp_size, pp_size
-            );
-
-            // Phase 2: Create NCCL comms (TP + PP) + profile memory + warmup.
-            // All NCCL init calls require ranks in the same group to participate
-            // simultaneously, so we use scoped threads.
-            //
-            // We create TP comms first (all ranks in each TP group sync), then PP
-            // comms (all ranks in each PP group sync). This ordering ensures no
-            // deadlock since all ranks follow the same order.
-            let init_results: Vec<Result<(usize, CudaWorker)>> = std::thread::scope(|s| {
-                let handles: Vec<_> = scratchy_workers
-                    .into_iter()
-                    .enumerate()
-                    .map(|(global_rank, mut worker)| {
-                        let tp_nccl_ids = &tp_nccl_ids;
-                        let pp_nccl_ids = &pp_nccl_ids;
-                        s.spawn(move || -> Result<(usize, CudaWorker)> {
-                            let tp_rank = global_rank % tp_size;
-                            let pp_rank = global_rank / tp_size;
-
-                            // Set CUDA context.
-                            let device = worker.device_ref().expect("device not initialized");
-                            unsafe {
-                                scratchy_target_cuda::driver::ctx_set_current(device.ctx).unwrap();
-                            }
-
-                            // Create TP NCCL comm (ranks in the same PP stage).
-                            if tp_size > 1 {
-                                let tp_nccl_id = tp_nccl_ids[pp_rank];
-                                let nccl_group = scratchy_target_cuda::NcclGroup::new(
-                                    tp_rank,
-                                    tp_size,
-                                    tp_nccl_id,
-                                    device.compute_stream,
-                                )
-                                .with_context(|| {
-                                    format!("TP NCCL comm init failed for rank {global_rank}")
-                                })?;
-                                worker.set_tp_group(std::sync::Arc::new(nccl_group));
-                            }
-
-                            // Create PP NCCL comm (ranks with the same TP rank).
-                            let pp_nccl_id = pp_nccl_ids[tp_rank];
-                            let device = worker.device_ref().unwrap();
-                            let pp_group = scratchy_target_cuda::NcclGroup::new(
-                                pp_rank,
-                                pp_size,
-                                pp_nccl_id,
-                                device.compute_stream,
-                            )
-                            .with_context(|| {
-                                format!("PP NCCL comm init failed for rank {global_rank}")
-                            })?;
-                            worker.set_pp_group(std::sync::Arc::new(pp_group));
-
-                            // Allocate PP recv buffers on non-first stages.
-                            worker.allocate_pp_recv_buffers();
-
-                            // Profile activation memory with dummy forward.
-                            let avail = worker.determine_available_memory().map_err(|e| {
-                                anyhow::anyhow!(
-                                    "determine_available_memory rank {global_rank}: {e}"
-                                )
-                            })?;
-
-                            Ok((avail, worker))
-                        })
-                    })
-                    .collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            });
-
-            let mut workers: Vec<Box<dyn Worker>> = Vec::with_capacity(world_size);
-            let mut min_avail = usize::MAX;
-            let mut supports_hybrid_swa_kv = true;
-            for res in init_results {
-                let (avail, worker) = res?;
-                min_avail = min_avail.min(avail);
-                supports_hybrid_swa_kv = worker.supports_hybrid_swa_kv();
-                workers.push(Box::new(worker));
-            }
-            // The narrowest rank's answer when the flag was unset; the
-            // caller's ask — already built into every rank — when it was
-            // not. Align every rank to it BEFORE initialize_cache / warmup
-            // so ladders and pools all build at one width. (Engine-level
-            // helpers — one implementation, tested there.)
-            let worker_max_num_seqs = min_max_num_seqs(&workers);
-            align_all_max_num_seqs(&mut workers);
-
-            // num_gpu_blocks = min across ALL workers (matches Python).
-            let (num_gpu_blocks, swa_hybrid_kv) = compute_kv_blocks(
-                min_avail,
-                config.block_size,
-                &hf_config,
-                dtype_elem_bytes,
-                config.gpu_memory_utilization,
-                &config.kv_cache_dtype,
-                workers
-                    .first()
-                    .and_then(|w| w.kv_block_bytes(config.block_size)),
-                supports_hybrid_swa_kv,
-            );
-
-            // Initialize cache: each worker allocates KV for its layer count only.
-            for w in &mut workers {
-                w.initialize_cache(num_gpu_blocks, 0)
-                    .context("initialize_cache")?;
-            }
-
-            info!(
-                "TP+PP: min available memory across ranks: {:.1} GB, num_gpu_blocks={}",
-                min_avail as f64 / (1024.0 * 1024.0 * 1024.0),
-                num_gpu_blocks,
-            );
-
-            // Warm up (CUDA graph capture) concurrently — forwards use NCCL collectives.
-            let warmup_results: Vec<Result<()>> = std::thread::scope(|s| {
-                let handles: Vec<_> = workers
-                    .iter_mut()
-                    .enumerate()
-                    .map(|(rank, w)| {
-                        s.spawn(move || {
-                            w.compile_or_warm_up_model()
-                                .with_context(|| format!("compile_or_warm_up_model rank {rank}"))
-                        })
-                    })
-                    .collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            });
-            for res in warmup_results {
-                res?;
-            }
-
-            // Wrap in ThreadPoolExecutor with TP+PP config.
-            let parallel_config =
-                ResolvedParallelConfig::tensor_pipeline_parallel(tp_size, pp_size, 0);
-            let executor = ThreadPoolExecutor::new(workers, parallel_config);
-
-            // Build engine (same as TP-only path).
-            // Load tokenizer and build engine.
-            let tokenizer = model_dir
-                .as_ref()
-                .and_then(|dir| try_load_tokenizer(dir).ok());
-
-            let eos_token_ids =
-                resolve_eos_token_ids(&hf_config, model_dir.as_deref(), tokenizer.as_ref());
-
-            // PP: force sync scheduling — async scheduling with PP requires token broadcast
-            // from last stage to non-last stages, which is not yet implemented.
-            let use_async_scheduling = false;
-            let enable_prefix_caching = prefix_caching(
-                config,
-                &hf_config.architectures,
-                scratchy_serving_engine::executor::Executor::snapshot_budget(&executor),
-            );
-            let engine_config = EngineCoreConfig {
-                scheduler_config: SchedulerConfig {
-                    max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
-                    // The narrowest rank's answer when the flag was unset; the
-                    // caller's ask (already built into every rank's pools)
-                    // when it was not.
-                    max_num_seqs: resolve_max_num_seqs(
-                        config.max_num_seqs,
-                        worker_max_num_seqs,
-                        false,
-                    ),
-                    policy: SchedulerPolicy::Fcfs,
-                    enable_chunked_prefill: true,
-                    async_scheduling: Some(use_async_scheduling),
-                    num_lookahead_tokens: speculation.drafts(config),
-                    use_pp: true,
-                    ..Default::default()
-                },
-                max_model_len,
-                num_gpu_blocks,
-                block_size: config.block_size,
-                engine_index: 0,
-                async_scheduling: use_async_scheduling,
-                use_spec_decode: speculation.is_on(),
-                proposer_config: None,
-                eos_token_ids,
-                is_pooling: config.runner == "pooling",
-                enable_prefix_caching,
-                hybrid_kv: swa_hybrid_kv,
-            };
-
-            let client: Box<dyn scratchy_serving_engine::core_client::EngineCoreClient + Send> =
-                Box::new(InprocClient::new(engine_config, Box::new(executor)));
-
-            let mut engine = build_engine(
-                client,
-                model_name.clone(),
-                max_model_len,
-                tokenizer.map(Arc::new),
-                model_dir.as_deref(),
-                config.chat_template.as_deref(),
-            )?;
-
-            if false {
-                // PP: sync scheduling forced
-                engine.set_generation_defaults(load_generation_defaults(model_dir.as_deref()));
-                engine.set_async_scheduling(true);
-            }
-            if config.runner == "pooling" {
-                engine.set_is_pooling(true);
-            }
-
-            auto_install_tool_parser(&mut engine, model_arch(&hf_config));
-            auto_install_reasoning_parser(&mut engine, model_arch(&hf_config));
-            let engine = Arc::new(engine);
-
-            info!(
-                "Stack initialized with TP={}, PP={} in {:.1}s",
-                tp_size,
-                pp_size,
-                init_start.elapsed().as_secs_f64()
-            );
-
-            Ok(InitializedStack {
-                engine,
-                model_name,
-                max_model_len,
-            })
-        }
-    } // close `#[allow(unreachable_code)] {` wrapper
-}
-
-/// (via ColumnParallelLinear/RowParallelLinear sharding at load time).
-///
-/// TODO: Port to CudaWorker.
-fn initialize_stack_tp(
-    config: &VllmConfig,
-    speculation: &Speculation,
-    model_name: String,
-    init_start: Instant,
-) -> Result<InitializedStack> {
-    #[cfg(not(feature = "nccl"))]
-    {
-        let _ = (config, speculation, model_name, init_start);
-        anyhow::bail!(
-            "Tensor parallelism requires the `nccl` feature; \
-             rebuild with --features nccl"
-        );
-    }
-
-    #[cfg(feature = "nccl")]
-    {
-        use scratchy_serving_worker::gpu_worker::CudaWorker;
-        use scratchy_serving_worker::parallel::ResolvedParallelConfig;
-        use scratchy_serving_worker::threadpool::ThreadPoolExecutor;
-        use scratchy_serving_worker::worker_factory::WorkerCreateConfig;
-
-        let tp_size = config.tensor_parallel_size;
-        let is_pooling = config.runner == "pooling";
-
-        info!("Tensor parallelism: {} GPUs", tp_size);
-
-        // Generate NCCL unique ID on rank 0.
-        let nccl_id =
-            scratchy_target_cuda::NcclId::new().context("failed to generate NCCL unique ID")?;
-
-        // Build per-rank configs.
-        let worker_configs: Vec<WorkerCreateConfig> = (0..tp_size)
-            .map(|rank| WorkerCreateConfig {
-                model_path: config.model.clone(),
-                dtype: config.dtype.clone(),
-                hf_token: config.hf_token.clone(),
-                block_size: config.block_size,
-                device_id: rank as i32,
-                // The request, not a resolved number: `None` lets the worker
-                // resolve the width itself, `Some(n)` pins worker-side
-                // consumers to the ask.
-                max_num_seqs: config.max_num_seqs,
-                enable_prefix_caching: requested_prefix_caching(config),
-                enforce_eager: config.enforce_eager,
-                max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
-                cuda_graph_sizes: config
-                    .cuda_graph_config
-                    .as_ref()
-                    .map(|c| c.capture_sizes.clone())
-                    .unwrap_or_default(),
-                cublas_autotune: config.cublas_autotune,
-                gpu_memory_utilization: config.gpu_memory_utilization,
-                pooling_strategy: config.pooling_strategy.clone(),
-                is_pooling,
-                tp_rank: rank,
-                tp_world_size: tp_size,
-                pp_rank: 0,
-                pp_size: 1,
-                gguf_file: config.gguf_file.clone(),
-                lora_adapter: config.lora_adapter.clone(),
-                kv_cache_dtype: config.kv_cache_dtype.clone(),
-                calculate_kv_scales: config.calculate_kv_scales,
-                cuda_graph_mode: config
-                    .cuda_graph_mode
-                    .parse()
-                    .unwrap_or(CudaGraphMode::Auto),
-                eos_token_ids: vec![],
-                max_model_len: config.max_model_len,
-                draft: speculation.worker_draft(),
-                verify_seqs: speculation.verify_seqs(config),
-                draft_model_dtype: config.draft_model_dtype.clone(),
-            })
-            .collect();
-
-        // Download barrier: rank 0 downloads first, others wait.
-        let download_barrier = std::sync::Arc::new(std::sync::Barrier::new(tp_size));
-
-        // Spawn one thread per GPU. Each: init device → load model → create NCCL comm.
-        let handles: Vec<_> = worker_configs
-            .into_iter()
-            .enumerate()
-            .map(|(local_rank, cfg)| {
-                let barrier = download_barrier.clone();
-
-                std::thread::spawn(move || -> Result<CudaWorker> {
-                    let mut worker = CudaWorker::new(cfg);
-                    worker.init_device().context("init_device failed")?;
-
-                    // Rank 0 loads first (downloads model files to cache).
-                    if local_rank == 0 {
-                        worker.load_model().context("load_model failed")?;
-                        barrier.wait();
-                    } else {
-                        barrier.wait();
-                        worker.load_model().context("load_model failed")?;
-                    }
-
-                    Ok(worker)
-                })
-            })
-            .collect();
-
-        // Collect concrete CudaWorkers (not yet boxed as dyn Worker).
-        let mut scratchy_workers: Vec<CudaWorker> = Vec::with_capacity(tp_size);
-        let mut hf_config = None;
-        let mut model_dir = None;
-        let mut dtype_elem_bytes: usize = 2; // BF16 default
-
-        for (rank, handle) in handles.into_iter().enumerate() {
-            let worker = handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("worker thread {rank} panicked"))?
-                .with_context(|| format!("worker {rank} init failed"))?;
-
-            if rank == 0 {
-                hf_config = worker.hf_config().cloned();
-                model_dir = worker.model_dir().map(|p| p.to_path_buf());
-                dtype_elem_bytes = worker.resolved_dtype_elem_bytes();
-            }
-            scratchy_workers.push(worker);
-        }
-
-        let hf_config = hf_config.context("model config not available after load")?;
-
-        let max_model_len = config
-            .max_model_len
-            .or(hf_config.max_position_embeddings())
-            .unwrap_or(4096);
-        let num_layers = resolve_num_layers(&hf_config);
-
-        info!(
-            "Model: {}, max_model_len={}, num_layers={}, tp={}",
-            model_name, max_model_len, num_layers, tp_size
-        );
-
-        // Create NCCL comms + profile memory + warmup all on persistent threads.
-        // NCCL collectives require all ranks to participate simultaneously, so all
-        // TP operations (NCCL init, profiling forward, CUDA graph capture) run on
-        // dedicated per-rank threads that persist throughout init.
-        let init_results: Vec<Result<(usize, CudaWorker)>> = std::thread::scope(|s| {
-            let handles: Vec<_> = scratchy_workers
-                .into_iter()
-                .enumerate()
-                .map(|(rank, mut worker)| {
-                    s.spawn(move || -> Result<(usize, CudaWorker)> {
-                        // Create NCCL communicator (collective — all ranks participate).
-                        let device = worker.device_ref().expect("device not initialized");
-                        unsafe {
-                            scratchy_target_cuda::driver::ctx_set_current(device.ctx).unwrap();
-                        }
-                        let nccl_group = scratchy_target_cuda::NcclGroup::new(
-                            rank,
-                            tp_size,
-                            nccl_id,
-                            device.compute_stream,
-                        )
-                        .context("NCCL comm init failed")?;
-                        worker.set_tp_group(std::sync::Arc::new(nccl_group));
-
-                        // Profile activation memory with dummy forward.
-                        let avail = worker.determine_available_memory().map_err(|e| {
-                            anyhow::anyhow!("determine_available_memory rank {rank}: {e}")
-                        })?;
-
-                        Ok((avail, worker))
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-
-        let mut workers: Vec<Box<dyn Worker>> = Vec::with_capacity(tp_size);
-        let mut min_avail = usize::MAX;
-        let mut supports_hybrid_swa_kv = true;
-        for res in init_results {
-            let (avail, worker) = res?;
-            min_avail = min_avail.min(avail);
-            supports_hybrid_swa_kv = worker.supports_hybrid_swa_kv();
-            workers.push(Box::new(worker));
-        }
-        // The narrowest rank's answer when the flag was unset (each rank
-        // clamps on its own memory query); the caller's ask — already built
-        // into every rank — when it was not. Align every rank to it BEFORE
-        // initialize_cache / warmup so ladders and pools all build at one
-        // width. (Engine-level helpers — one implementation, tested there.)
-        let worker_max_num_seqs = min_max_num_seqs(&workers);
-        align_all_max_num_seqs(&mut workers);
-
-        let (num_gpu_blocks, swa_hybrid_kv) = compute_kv_blocks(
-            min_avail,
-            config.block_size,
-            &hf_config,
-            dtype_elem_bytes,
-            config.gpu_memory_utilization,
-            &config.kv_cache_dtype,
-            workers
-                .first()
-                .and_then(|w| w.kv_block_bytes(config.block_size)),
-            supports_hybrid_swa_kv,
-        );
-
-        // initialize_cache doesn't run forwards, safe to call sequentially.
-        for w in &mut workers {
-            w.initialize_cache(num_gpu_blocks, 0)
-                .context("initialize_cache")?;
-        }
-
-        info!(
-            "TP: min available memory across ranks: {:.1} GB, num_gpu_blocks={}",
-            min_avail as f64 / (1024.0 * 1024.0 * 1024.0),
-            num_gpu_blocks,
-        );
-
-        // Warm up (CUDA graph capture) concurrently — forwards use NCCL collectives.
-        let warmup_results: Vec<Result<()>> = std::thread::scope(|s| {
-            let handles: Vec<_> = workers
-                .iter_mut()
-                .enumerate()
-                .map(|(rank, w)| {
-                    s.spawn(move || {
-                        w.compile_or_warm_up_model()
-                            .with_context(|| format!("compile_or_warm_up_model rank {rank}"))
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-        for res in warmup_results {
-            res?;
-        }
-
-        // Wrap in ThreadPoolExecutor.
-        let parallel_config = ResolvedParallelConfig::tensor_parallel(tp_size, 0);
-        let executor = ThreadPoolExecutor::new(workers, parallel_config);
-
-        // Build engine.
-        // Load tokenizer. Apply the same `additional_special_tokens`
-        // patch as the single-rank path — Qwen2-VL chat templates
-        // reference `<|image_pad|>` / `<|video_pad|>` which live on
-        // `tokenizer_config.json::additional_special_tokens` but are
-        // missing from `tokenizer.json` for some HF mirrors, so the
-        // chat renderer errors out without this patch.
-        let tokenizer = model_dir.as_ref().and_then(|dir| {
-            try_load_tokenizer(dir).ok().map(|mut tok| {
-                patch_additional_special_tokens(&mut tok, dir);
-                tok
-            })
-        });
-
-        let eos_token_ids =
-            resolve_eos_token_ids(&hf_config, model_dir.as_deref(), tokenizer.as_ref());
-
-        let use_async_scheduling = !config.disable_async_scheduling && !speculation.requires_sync();
-        let enable_prefix_caching = prefix_caching(
-            config,
-            &hf_config.architectures,
-            scratchy_serving_engine::executor::Executor::snapshot_budget(&executor),
-        );
-        let engine_config = EngineCoreConfig {
-            scheduler_config: SchedulerConfig {
-                max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
-                // The narrowest rank's answer when the flag was unset; the
-                // caller's ask (already built into every rank's pools)
-                // when it was not.
-                max_num_seqs: resolve_max_num_seqs(config.max_num_seqs, worker_max_num_seqs, false),
-                policy: SchedulerPolicy::Fcfs,
-                enable_chunked_prefill: true,
-                async_scheduling: Some(use_async_scheduling),
-                num_lookahead_tokens: speculation.drafts(config),
-                ..Default::default()
-            },
-            max_model_len,
-            num_gpu_blocks,
-            block_size: config.block_size,
-            engine_index: 0,
-            async_scheduling: use_async_scheduling,
-            use_spec_decode: speculation.is_on(),
-            proposer_config: None,
-            eos_token_ids,
-            is_pooling: config.runner == "pooling",
-            enable_prefix_caching,
-            hybrid_kv: swa_hybrid_kv,
-        };
-
-        let client: Box<dyn scratchy_serving_engine::core_client::EngineCoreClient + Send> =
-            Box::new(InprocClient::new(engine_config, Box::new(executor)));
-
-        let mut engine = build_engine(
-            client,
-            model_name.clone(),
-            max_model_len,
-            tokenizer.map(Arc::new),
-            model_dir.as_deref(),
-            config.chat_template.as_deref(),
-        )?;
-
-        if !config.disable_async_scheduling && !speculation.requires_sync() {
-            engine.set_generation_defaults(load_generation_defaults(model_dir.as_deref()));
-            engine.set_async_scheduling(true);
-        }
-        if config.runner == "pooling" {
-            engine.set_is_pooling(true);
-        }
-
-        // Multimodal config — generic scratchy-vision inventory lookup.
-        // See the single-rank `initialize_stack` path for the rationale;
-        // this is the same call shape, threaded through the TP-init
-        // engine instead.
-        #[cfg(feature = "multimodal")]
-        if let Some(processor) = crate::multimodal::resolve(
-            &hf_config.architectures,
-            &hf_config.extra,
-            model_dir.as_deref(),
-        ) {
-            info!(
-                "Multimodal config: arch={:?}, image_token_id={}, image_size={}, tokens_per_image={}",
-                hf_config.architectures,
-                processor.image_token_id,
-                processor.image_size,
-                processor.mm_tokens_per_image,
-            );
-            engine.set_mm_processor(Some(processor));
-        }
-
-        auto_install_tool_parser(&mut engine, model_arch(&hf_config));
-        auto_install_reasoning_parser(&mut engine, model_arch(&hf_config));
-        let engine = Arc::new(engine);
-
-        info!(
-            "Stack initialized with TP={} in {:.1}s",
-            tp_size,
-            init_start.elapsed().as_secs_f64()
-        );
-
-        Ok(InitializedStack {
-            engine,
-            model_name,
-            max_model_len,
-        })
-    }
-}
-
-/// Parsed distributed environment variables for external launcher mode.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalLauncherEnv {
-    pub rank: usize,
-    pub local_rank: usize,
-    pub world_size: usize,
-    pub master_addr: String,
-    pub master_port: u16,
-}
-
-impl ExternalLauncherEnv {
-    /// Parse distributed env vars (RANK, LOCAL_RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT).
-    ///
-    /// Falls back to `config` values for MASTER_ADDR and MASTER_PORT if not set in env.
-    pub fn from_env(config: &VllmConfig) -> Result<Self> {
-        let rank: usize = std::env::var("RANK")
-            .context("RANK env var not set (required for external_launcher)")?
-            .parse()
-            .context("RANK must be an integer")?;
-        let local_rank: usize = std::env::var("LOCAL_RANK")
-            .context("LOCAL_RANK env var not set (required for external_launcher)")?
-            .parse()
-            .context("LOCAL_RANK must be an integer")?;
-        let world_size: usize = std::env::var("WORLD_SIZE")
-            .context("WORLD_SIZE env var not set (required for external_launcher)")?
-            .parse()
-            .context("WORLD_SIZE must be an integer")?;
-        let master_addr =
-            std::env::var("MASTER_ADDR").unwrap_or_else(|_| config.master_addr.clone());
-        let master_port: u16 = std::env::var("MASTER_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(config.master_port);
-
-        // Validate consistency.
-        if config.tensor_parallel_size > 1 && config.tensor_parallel_size != world_size {
-            anyhow::bail!(
-                "--tensor-parallel-size ({}) does not match WORLD_SIZE ({})",
-                config.tensor_parallel_size,
-                world_size
-            );
-        }
-
-        Ok(Self {
-            rank,
-            local_rank,
-            world_size,
-            master_addr,
-            master_port,
-        })
-    }
-}
-
-/// External launcher init path: one process per GPU, NCCL via TCP store.
-///
-/// Used when `--distributed-executor-backend external_launcher`. The job launcher
-/// (torchrun, mpirun, SLURM) spawns N processes, each calling this function.
-/// Each process:
-/// 1. Reads RANK, LOCAL_RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT from env.
-/// 2. Sets CUDA device to LOCAL_RANK.
-/// 3. Exchanges NCCL unique ID via TCP store (rank 0 serves, others connect).
-/// 4. Creates a single CudaWorker with TP sharding for this rank.
-/// 5. Coordinates memory allocation via TCP all-reduce MIN.
-/// 6. Wraps in UniProcExecutor (one worker per process).
-/// 7. Builds AsyncEngine and returns the stack.
-///
-/// Each process runs its own HTTP server on a different port (set via --port).
-fn initialize_stack_external(
-    config: &VllmConfig,
-    speculation: &Speculation,
-    model_name: String,
-    init_start: Instant,
-) -> Result<InitializedStack> {
-    #[cfg(not(feature = "nccl"))]
-    {
-        let _ = (config, speculation, model_name, init_start);
-        anyhow::bail!(
-            "External launcher requires the `nccl` feature; \
-             rebuild with --features nccl"
-        );
-    }
-
-    #[cfg(feature = "nccl")]
-    {
-        use scratchy_serving_worker::gpu_worker::CudaWorker;
-        use scratchy_serving_worker::worker_factory::WorkerCreateConfig;
-
-        let env = ExternalLauncherEnv::from_env(config)
-            .context("failed to read external launcher env vars")?;
-        let rank = env.rank;
-        let local_rank = env.local_rank;
-        let world_size = env.world_size;
-        let master_addr = env.master_addr;
-        let master_port = env.master_port;
-
-        let is_pooling = config.runner == "pooling";
-
-        info!(
-            "External launcher: rank={}, local_rank={}, world_size={}, master={}:{}",
-            rank, local_rank, world_size, master_addr, master_port
-        );
-
-        // Step 1: Exchange NCCL unique ID via TCP store.
-        let nccl_id_bytes = scratchy_target_cuda::tcp_store::exchange_nccl_id(
-            rank,
-            world_size,
-            &master_addr,
-            master_port,
-        )
-        .context("failed to exchange NCCL ID via TCP store")?;
-        let nccl_id = scratchy_target_cuda::NcclId::from_raw(nccl_id_bytes);
-        info!("Rank {}: NCCL ID exchanged", rank);
-
-        // Step 2: Create CudaWorker for this rank's GPU.
-        let cuda_config = WorkerCreateConfig {
-            model_path: config.model.clone(),
-            dtype: config.dtype.clone(),
-            hf_token: config.hf_token.clone(),
-            block_size: config.block_size,
-            device_id: local_rank as i32,
-            // The request, not a resolved number: `None` lets the worker
-            // resolve the width itself, `Some(n)` pins worker-side consumers
-            // to the ask.
-            max_num_seqs: config.max_num_seqs,
-            enable_prefix_caching: requested_prefix_caching(config),
-            enforce_eager: config.enforce_eager,
-            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
-            cuda_graph_sizes: config
-                .cuda_graph_config
-                .as_ref()
-                .map(|c| c.capture_sizes.clone())
-                .unwrap_or_default(),
-            cublas_autotune: config.cublas_autotune,
-            gpu_memory_utilization: config.gpu_memory_utilization,
-            pooling_strategy: config.pooling_strategy.clone(),
-            is_pooling,
-            tp_rank: rank,
-            tp_world_size: world_size,
-            pp_rank: 0,
-            pp_size: 1,
-            gguf_file: config.gguf_file.clone(),
-            lora_adapter: config.lora_adapter.clone(),
-            kv_cache_dtype: config.kv_cache_dtype.clone(),
-            calculate_kv_scales: config.calculate_kv_scales,
-            cuda_graph_mode: config
-                .cuda_graph_mode
-                .parse()
-                .unwrap_or(CudaGraphMode::Auto),
-            eos_token_ids: vec![],
-            max_model_len: config.max_model_len,
-            draft: speculation.worker_draft(),
-            verify_seqs: speculation.verify_seqs(config),
-            draft_model_dtype: config.draft_model_dtype.clone(),
-        };
-
-        let mut worker = CudaWorker::new(cuda_config);
-        worker
-            .init_device()
-            .context("failed to initialize CUDA device")?;
-        worker.load_model().context("failed to load model")?;
-
-        let hf_config = worker
-            .hf_config()
-            .context("model config not available after load")?
-            .clone();
-        let model_dir = worker.model_dir().map(|p| p.to_path_buf());
-        let dtype_elem_bytes = worker.resolved_dtype_elem_bytes();
-
-        // Step 3: Create NCCL communicator.
-        let device = worker.device_ref().expect("device not initialized");
-        unsafe {
-            scratchy_target_cuda::driver::ctx_set_current(device.ctx).unwrap();
-        }
-        let nccl_group =
-            scratchy_target_cuda::NcclGroup::new(rank, world_size, nccl_id, device.compute_stream)
-                .context("NCCL comm init failed")?;
-        worker.set_tp_group(std::sync::Arc::new(nccl_group));
-        info!("Rank {}: NCCL communicator created", rank);
-
-        // Step 4: Profile available memory.
-        let available_memory = worker
-            .determine_available_memory()
-            .context("failed to determine available memory")?;
-
-        // Step 5: All-reduce MIN across ranks via TCP store.
-        let min_memory = scratchy_serving_transport::tcp_store::allreduce_min(
-            rank,
-            world_size,
-            available_memory,
-            &master_addr,
-            master_port,
-        )
-        .context("failed to allreduce memory")?;
-
-        let max_model_len = config
-            .max_model_len
-            .or(hf_config.max_position_embeddings())
-            .unwrap_or(4096);
-
-        info!(
-            "Rank {}: available_memory={:.1} GB, min_across_ranks={:.1} GB",
-            rank,
-            available_memory as f64 / (1024.0 * 1024.0 * 1024.0),
-            min_memory as f64 / (1024.0 * 1024.0 * 1024.0),
-        );
-
-        // Step 6: Compute block count and initialize cache.
-        let (num_gpu_blocks, swa_hybrid_kv) = compute_kv_blocks(
-            min_memory,
-            config.block_size,
-            &hf_config,
-            dtype_elem_bytes,
-            config.gpu_memory_utilization,
-            &config.kv_cache_dtype,
-            worker.kv_block_bytes(config.block_size),
-            worker.supports_hybrid_swa_kv(),
-        );
-
-        let mut worker: Box<dyn Worker> = Box::new(worker);
-        // The width this rank resolved (unset flag → device tier / memory-
-        // affordable GDN slots) or the caller's ask. All-reduce MIN across
-        // every node's answer, then ALIGN this worker to it BEFORE
-        // initialize_cache / warmup — a rank that clamped lower than another
-        // must still build the same ladder shape the scheduler admits.
-        let min_worker_width = worker
-            .max_num_seqs_override()
-            .map(|w| {
-                scratchy_serving_transport::tcp_store::allreduce_min(
-                    rank,
-                    world_size,
-                    w,
-                    &master_addr,
-                    master_port,
-                )
-                .context("failed to allreduce max_num_seqs")
-            })
-            .transpose()?;
-        if let Some(w) = min_worker_width {
-            worker.align_max_num_seqs(w);
-        }
-        let worker_max_num_seqs = min_worker_width.or_else(|| worker.max_num_seqs_override());
-        worker
-            .initialize_cache(num_gpu_blocks, 0)
-            .context("failed to initialize cache")?;
-
-        info!(
-            "Rank {}: num_gpu_blocks={}, kv_cache_tokens={}",
-            rank,
-            num_gpu_blocks,
-            num_gpu_blocks * config.block_size,
-        );
-
-        // Step 7: Warm up / CUDA graph capture.
-        worker
-            .compile_or_warm_up_model()
-            .context("failed to compile or warm up model")?;
-
-        // Step 8: Wrap in UniProcExecutor (single worker per process).
-        let executor = UniProcExecutor::new_pre_initialized(worker);
-
-        // Step 9: Build engine.
-        // Load tokenizer and build engine.
-        let tokenizer = model_dir
-            .as_ref()
-            .and_then(|dir| try_load_tokenizer(dir).ok());
-
-        let eos_token_ids =
-            resolve_eos_token_ids(&hf_config, model_dir.as_deref(), tokenizer.as_ref());
-
-        let use_async_scheduling = !config.disable_async_scheduling && !speculation.requires_sync();
-        let enable_prefix_caching = prefix_caching(
-            config,
-            &hf_config.architectures,
-            scratchy_serving_engine::executor::Executor::snapshot_budget(&executor),
-        );
-        let engine_config = EngineCoreConfig {
-            scheduler_config: SchedulerConfig {
-                max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
-                // The narrowest rank's answer when the flag was unset; the
-                // caller's ask (already built into every rank's pools)
-                // when it was not.
-                max_num_seqs: resolve_max_num_seqs(config.max_num_seqs, worker_max_num_seqs, false),
-                policy: SchedulerPolicy::Fcfs,
-                enable_chunked_prefill: true,
-                async_scheduling: Some(use_async_scheduling),
-                num_lookahead_tokens: speculation.drafts(config),
-                ..Default::default()
-            },
-            max_model_len,
-            num_gpu_blocks,
-            block_size: config.block_size,
-            engine_index: 0,
-            async_scheduling: use_async_scheduling,
-            use_spec_decode: speculation.is_on(),
-            proposer_config: None,
-            eos_token_ids,
-            is_pooling: config.runner == "pooling",
-            enable_prefix_caching,
-            hybrid_kv: swa_hybrid_kv,
-        };
-
-        let client: Box<dyn scratchy_serving_engine::core_client::EngineCoreClient + Send> =
-            Box::new(InprocClient::new(engine_config, Box::new(executor)));
-
-        let mut engine = build_engine(
-            client,
-            model_name.clone(),
-            max_model_len,
-            tokenizer.map(Arc::new),
-            model_dir.as_deref(),
-            config.chat_template.as_deref(),
-        )?;
-
-        if !config.disable_async_scheduling && !speculation.requires_sync() {
-            engine.set_generation_defaults(load_generation_defaults(model_dir.as_deref()));
-            engine.set_async_scheduling(true);
-        }
-        if config.runner == "pooling" {
-            engine.set_is_pooling(true);
-        }
-
-        info!(
-            "Rank {}: stack initialized in {:.1}s (external launcher, world_size={})",
-            rank,
-            init_start.elapsed().as_secs_f64(),
-            world_size,
-        );
-
-        auto_install_tool_parser(&mut engine, model_arch(&hf_config));
-        auto_install_reasoning_parser(&mut engine, model_arch(&hf_config));
-        Ok(InitializedStack {
-            engine: Arc::new(engine),
-            model_name,
-            max_model_len,
-        })
-    }
 }
 
 /// Try to load a HuggingFace tokenizer from a model directory.
@@ -4081,7 +2153,7 @@ fn blocks_within(available_bytes: usize, bytes_per_block: usize) -> usize {
 }
 
 /// ⭐ DOES THIS RUN'S WORKER HAND `init_cache` A FINAL KV BUDGET — one with utilization
-/// already baked in (cuda, metal: `total × util − non_kv_cache`), or one where utilization
+/// already baked in (metal: `total × util − non_kv_cache`), or one where utilization
 /// is deliberately absent (spyre: the card tier's region-capped pool budget, the emulator
 /// tier's flat host-RAM allowance — different shapes, but the triage question is the same
 /// one: is the worker's number final? For both spyre tiers it is)? For those the returned
@@ -4096,20 +2168,14 @@ fn blocks_within(available_bytes: usize, bytes_per_block: usize) -> usize {
 /// tier at once; the call site passes the api crate's plain `spyre` feature — the common
 /// parent of `spyre-hw` and `spyre-emu`, so BOTH tiers trip it, never only the card.
 fn kv_budget_is_prebaked(device: &str, spyre_backend: bool) -> bool {
-    (cfg!(feature = "cuda") && device != "cpu" && (device == "auto" || device.starts_with("cuda")))
-        || (cfg!(feature = "metal") && device != "cpu")
-        || (spyre_backend && device != "cpu")
+    (cfg!(feature = "metal") && device != "cpu") || (spyre_backend && device != "cpu")
 }
 
 /// Is this run on the CPU worker, whose `determine_available_memory` is raw free memory
 /// the engine scales by utilization? `device == "auto"` is CPU only when NO gpu backend
 /// was compiled in.
 fn device_is_cpu(device: &str, spyre_backend: bool) -> bool {
-    device == "cpu"
-        || (device == "auto"
-            && !cfg!(feature = "cuda")
-            && !cfg!(feature = "metal")
-            && !spyre_backend)
+    device == "cpu" || (device == "auto" && !cfg!(feature = "metal") && !spyre_backend)
 }
 
 /// Compute the KV-cache block count AND the hybrid SWA layout, if any.
@@ -4150,11 +2216,9 @@ fn compute_kv_blocks(
             kv_cache_dtype,
         ),
     };
-    // The CUDA decode reads a single block table for every layer (no grouped
-    // sliding-window KV); only metal wires the `sliding_groups` decode. A CUDA
-    // worker passes `allow_hybrid=false` so gemma4 (and any hybrid-SWA arch)
-    // stays on the uniform single pool — the worker's single-block-table decode
-    // then reads each sliding layer's KV from the correct (single) block space.
+    // Only metal wires the `sliding_groups` decode. A worker that reads a single
+    // block table for every layer passes `allow_hybrid=false` so gemma4 (and any
+    // hybrid-SWA arch) stays on the uniform single pool.
     if !allow_hybrid {
         return (uniform, None);
     }
@@ -4543,266 +2607,6 @@ mod tests {
             ..VllmConfig::default()
         };
         assert_eq!(config.max_num_batched_tokens, Some(4096));
-    }
-
-    #[test]
-    fn test_scratchy_core_config_default_distributed_backend() {
-        let config = VllmConfig::default();
-        assert_eq!(config.distributed_executor_backend, "auto");
-    }
-
-    #[test]
-    fn test_scratchy_core_config_external_launcher() {
-        let config = VllmConfig {
-            distributed_executor_backend: "external_launcher".to_string(),
-            ..VllmConfig::default()
-        };
-        assert_eq!(config.distributed_executor_backend, "external_launcher");
-    }
-
-    // -- ExternalLauncherEnv tests --
-    // Note: these tests manipulate env vars, which is inherently global state.
-    // We use a mutex to serialize them and restore original values.
-
-    use std::sync::Mutex;
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
-
-    /// Helper: set env vars, run closure, restore originals.
-    fn with_env_vars<F, R>(vars: &[(&str, Option<&str>)], f: F) -> R
-    where
-        F: FnOnce() -> R,
-    {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        let mut originals = Vec::new();
-        for &(key, val) in vars {
-            originals.push((key, std::env::var(key).ok()));
-            // SAFETY: we hold ENV_MUTEX, serializing all env var access in tests.
-            unsafe {
-                match val {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-        let result = f();
-        for (key, original) in originals {
-            // SAFETY: same mutex guard still held.
-            unsafe {
-                match original {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-        result
-    }
-
-    #[test]
-    fn test_external_launcher_env_all_vars_set() {
-        with_env_vars(
-            &[
-                ("RANK", Some("1")),
-                ("LOCAL_RANK", Some("1")),
-                ("WORLD_SIZE", Some("4")),
-                ("MASTER_ADDR", Some("10.0.0.1")),
-                ("MASTER_PORT", Some("29600")),
-            ],
-            || {
-                let config = VllmConfig::default();
-                let env = ExternalLauncherEnv::from_env(&config).unwrap();
-                assert_eq!(env.rank, 1);
-                assert_eq!(env.local_rank, 1);
-                assert_eq!(env.world_size, 4);
-                assert_eq!(env.master_addr, "10.0.0.1");
-                assert_eq!(env.master_port, 29600);
-            },
-        );
-    }
-
-    #[test]
-    fn test_external_launcher_env_fallback_master_addr() {
-        with_env_vars(
-            &[
-                ("RANK", Some("0")),
-                ("LOCAL_RANK", Some("0")),
-                ("WORLD_SIZE", Some("2")),
-                ("MASTER_ADDR", None),
-                ("MASTER_PORT", None),
-            ],
-            || {
-                let config = VllmConfig {
-                    master_addr: "my-host".to_string(),
-                    master_port: 12345,
-                    ..VllmConfig::default()
-                };
-                let env = ExternalLauncherEnv::from_env(&config).unwrap();
-                assert_eq!(env.master_addr, "my-host");
-                assert_eq!(env.master_port, 12345);
-            },
-        );
-    }
-
-    #[test]
-    fn test_external_launcher_env_missing_rank() {
-        with_env_vars(
-            &[
-                ("RANK", None),
-                ("LOCAL_RANK", Some("0")),
-                ("WORLD_SIZE", Some("2")),
-            ],
-            || {
-                let config = VllmConfig::default();
-                let err = ExternalLauncherEnv::from_env(&config).unwrap_err();
-                assert!(
-                    err.to_string().contains("RANK"),
-                    "error should mention RANK: {}",
-                    err
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn test_external_launcher_env_missing_local_rank() {
-        with_env_vars(
-            &[
-                ("RANK", Some("0")),
-                ("LOCAL_RANK", None),
-                ("WORLD_SIZE", Some("2")),
-            ],
-            || {
-                let config = VllmConfig::default();
-                let err = ExternalLauncherEnv::from_env(&config).unwrap_err();
-                assert!(
-                    err.to_string().contains("LOCAL_RANK"),
-                    "error should mention LOCAL_RANK: {}",
-                    err
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn test_external_launcher_env_missing_world_size() {
-        with_env_vars(
-            &[
-                ("RANK", Some("0")),
-                ("LOCAL_RANK", Some("0")),
-                ("WORLD_SIZE", None),
-            ],
-            || {
-                let config = VllmConfig::default();
-                let err = ExternalLauncherEnv::from_env(&config).unwrap_err();
-                assert!(
-                    err.to_string().contains("WORLD_SIZE"),
-                    "error should mention WORLD_SIZE: {}",
-                    err
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn test_external_launcher_env_invalid_rank() {
-        with_env_vars(
-            &[
-                ("RANK", Some("not_a_number")),
-                ("LOCAL_RANK", Some("0")),
-                ("WORLD_SIZE", Some("2")),
-            ],
-            || {
-                let config = VllmConfig::default();
-                let err = ExternalLauncherEnv::from_env(&config).unwrap_err();
-                assert!(
-                    err.to_string().contains("integer"),
-                    "error should mention integer: {}",
-                    err
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn test_external_launcher_env_tp_mismatch() {
-        with_env_vars(
-            &[
-                ("RANK", Some("0")),
-                ("LOCAL_RANK", Some("0")),
-                ("WORLD_SIZE", Some("4")),
-                ("MASTER_ADDR", Some("127.0.0.1")),
-                ("MASTER_PORT", Some("29500")),
-            ],
-            || {
-                let config = VllmConfig {
-                    tensor_parallel_size: 2, // mismatch with WORLD_SIZE=4
-                    ..VllmConfig::default()
-                };
-                let err = ExternalLauncherEnv::from_env(&config).unwrap_err();
-                assert!(
-                    err.to_string().contains("does not match"),
-                    "error should mention mismatch: {}",
-                    err
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn test_external_launcher_env_tp_size_one_no_mismatch() {
-        // tp_size=1 (default) should NOT conflict with any WORLD_SIZE.
-        with_env_vars(
-            &[
-                ("RANK", Some("0")),
-                ("LOCAL_RANK", Some("0")),
-                ("WORLD_SIZE", Some("8")),
-                ("MASTER_ADDR", Some("127.0.0.1")),
-                ("MASTER_PORT", Some("29500")),
-            ],
-            || {
-                let config = VllmConfig::default(); // tp_size=1
-                let env = ExternalLauncherEnv::from_env(&config).unwrap();
-                assert_eq!(env.world_size, 8);
-            },
-        );
-    }
-
-    #[test]
-    fn test_external_launcher_env_tp_matches_world_size() {
-        with_env_vars(
-            &[
-                ("RANK", Some("0")),
-                ("LOCAL_RANK", Some("0")),
-                ("WORLD_SIZE", Some("4")),
-                ("MASTER_ADDR", Some("127.0.0.1")),
-                ("MASTER_PORT", Some("29500")),
-            ],
-            || {
-                let config = VllmConfig {
-                    tensor_parallel_size: 4, // matches WORLD_SIZE=4
-                    ..VllmConfig::default()
-                };
-                let env = ExternalLauncherEnv::from_env(&config).unwrap();
-                assert_eq!(env.world_size, 4);
-            },
-        );
-    }
-
-    #[test]
-    fn test_external_launcher_env_rank0() {
-        with_env_vars(
-            &[
-                ("RANK", Some("0")),
-                ("LOCAL_RANK", Some("0")),
-                ("WORLD_SIZE", Some("1")),
-            ],
-            || {
-                let config = VllmConfig::default();
-                let env = ExternalLauncherEnv::from_env(&config).unwrap();
-                assert_eq!(env.rank, 0);
-                assert_eq!(env.local_rank, 0);
-                assert_eq!(env.world_size, 1);
-            },
-        );
     }
 
     /// A template that will not compile, in each place one comes from.

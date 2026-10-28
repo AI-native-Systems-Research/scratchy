@@ -159,7 +159,6 @@ fn test_relocatable_annotations_produce_same_output_gemma4() {
 ///
 /// NOTE: This test currently fails on MLX because the MLX worker does not
 /// have annotation-aware block hashing or per-block KV cache reuse.
-/// It should pass on CUDA once the paged rotation path is exercised.
 #[test]
 #[ignore]
 fn test_relocatable_cache_hit_produces_same_output() {

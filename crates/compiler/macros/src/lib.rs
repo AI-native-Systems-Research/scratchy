@@ -19,13 +19,6 @@
 
 use std::path::Path;
 
-// Backends are mutually exclusive — the emit is single-backend (one `__gpu`
-// alias, one `Weights` shape, one impl-library target). Enabling two at once
-// produces conflicting dual-emit (duplicate `__gpu`, missing `metal_pool`, a
-// solver with no impl for the other backend's ops). `impl_lib.rs` already
-// assumes this guard exists ("no model crate ever builds with both backends
-// on; the macro's own `compile_error!` upstream rejects the combo"). Fail here,
-// with a clear message, rather than mid-build.
 #[cfg(all(feature = "cuda", feature = "metal"))]
 compile_error!("features 'cuda' and 'metal' are mutually exclusive — enable exactly one backend");
 #[cfg(all(feature = "cuda", feature = "spyre"))]
@@ -37,26 +30,19 @@ use proc_macro2::Span;
 use quote::quote;
 use syn::Ident;
 
-mod alias_rules;
 mod arch_spec;
 mod ast;
 mod cfg;
 mod classified;
 mod classify;
 mod codegen;
-#[cfg(feature = "cuda")]
-mod concurrency;
 mod config;
 /// The baked program, as const tokens — see its own header.
 #[cfg(feature = "spyre")]
 mod ktir_tokens;
 pub use config::{selected_config_paths, total_models_emitted, unmatched_build_filter_tags};
-mod assignment;
-#[cfg(feature = "cuda")]
-mod cost;
 mod emit;
 mod fuf;
-mod impl_lib;
 mod interpreter_codegen;
 // The DSL front end: a `dsl/<arch>.py` carrier → `Ast`.
 mod parse_python;
@@ -78,11 +64,7 @@ pub use render::render_tokens;
 #[cfg(feature = "metal")]
 pub use scratchy_target_metal_compiler::static_tape::bake_module as metal_bake_module;
 mod rows_lowering;
-mod schedule;
 mod shape;
-#[cfg(feature = "cuda")]
-mod solver;
-mod target;
 mod to_wavefront;
 mod tp_lowering;
 // ⭐ THE ONE PRODUCER OF THE MODEL'S WEIGHT ACCESSOR SET, for every target.
@@ -92,30 +74,21 @@ mod tp_lowering;
 // both. The target being a compile-time singleton is what makes ONE body viable: there is no
 // second target in the build to compromise for. Packing gate/up into a single `__fused__`
 // buffer is metal's kernel ABI, so it arrives as a bool argument rather than a second walk.
-//
-// Gated to the targets that consume it: metal (via `emit_weight_bindings` /
-// `from_tape` in the `#[cfg(feature = "metal")]` arm of `emit_model`) and
-// spyre (the `all(feature = "spyre", not(feature = "metal"))` arm). cuda
-// derives its accessor set through ISel and calls nothing here, so without
-// the gate every item in the module is dead code under `-Fcuda`.
-#[cfg(any(feature = "metal", feature = "spyre"))]
 mod weight_bindings;
 mod weight_vocab;
 mod weights_manifest;
 
 mod vision_glue;
+mod workload;
 
 // ── Carrier decorator arguments ───────────────────────────────────
 
 struct ForwardArgs {
-    /// Discrete `num_tokens` points to solve at. Non-empty.
+    /// Discrete `num_tokens` points to compile at. Non-empty.
     workloads: Vec<u64>,
-    /// Discrete `sk_bucket` (KV-cache span in tokens) points to solve
-    /// at. Empty ⇒ the solver sweeps only the `num_tokens` axis with
-    /// `sk_bucket = 0` (the sentinel "sk axis unused"). Declare this
-    /// for models where attention dispatch wants to pick different
-    /// kernels at different KV spans — e.g. FlashInfer decode wins on
-    /// long sk, FA2 wins at small prefill.
+    /// Discrete `sk_bucket` (KV-cache span in tokens) points to compile
+    /// at. Empty ⇒ only the `num_tokens` axis is swept, with
+    /// `sk_bucket = 0` (the sentinel "sk axis unused").
     sk_buckets: Vec<u64>,
     /// Path to the per-arch CPU pixel-pack fn. Optional for
     /// `@vision_forward`, ignored by `@forward`. The fn signature
@@ -173,13 +146,7 @@ impl ForwardArgs {
 ///    `ctx.bound(...)` and the unroll trip counts).
 /// 3. The variant's float `scalars` (baked as literals in
 ///    `attention_scale_for` / similar).
-/// 4. The SFUF per workload point (which `Impl` runs at each
-///    subgraph → whose `emit_call` output lands in the body).
-///
-/// Among AWQ / GPTQ / CT variants of the same dense base, items
-/// 1-3 are identical and item 4 collapses because they all resolve
-/// to `Marlin*Impl`. Dense + BNB4 stay separate because their
-/// `Impl` picks differ from Marlin's and from each other's.
+/// 4. The variant's workload points (one emitted bucket each).
 ///
 /// Canonical selection: the variant with the earliest
 /// `source_stem` in the equivalence class wins. Deterministic
@@ -234,8 +201,7 @@ trait HasSolvedSig {
 /// Threaded into `dedup_signature` so equivalence-class hashing
 /// keeps FP8 block / std variants in separate canonicals. Without
 /// this discriminator, qwen3's `fp8-block-128x128` and
-/// `fp8-dynamic-per-tensor` hash identical (Impl picks match,
-/// bounds match), `block` wins canonical alphabetically, the
+/// `fp8-dynamic-per-tensor` hash identical (bounds match), `block` wins canonical alphabetically, the
 /// `dynamic` shim calls `Fp8BlockLinear::load` on a 1D scale, and
 /// the kernel panics during graph capture with `FP8 block scale
 /// must be 2D, got 1D`.
@@ -289,21 +255,6 @@ fn dedup_quant_sig(method: Option<&crate::quantization::QuantMethod>) -> String 
     }
 }
 
-/// Truthy when `SCRATCHY_DEBUG` is set to anything non-empty other
-/// than "0". Gates the noisier solver-internals output (per-phase
-/// timings, per-model solve time) at proc-macro time.
-///
-/// Caveat: cargo doesn't track plain env vars across proc-macro
-/// invocations (the rebuild-tracking variant `tracked_env::var` is
-/// nightly-only), so flipping `SCRATCHY_DEBUG` between cached builds
-/// won't re-run the macro on its own — touch a model source file or
-/// run `cargo clean -p scratchy-models` to force re-expansion.
-pub(crate) fn scratchy_debug() -> bool {
-    std::env::var("SCRATCHY_DEBUG")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
-}
-
 /// Stable per-tp-world-size discriminator threaded into
 /// `dedup_signature` so the canonical-equivalence-class hash splits
 /// the (variant × tp) fanout — a model compiled at tp=1 cannot share
@@ -320,30 +271,13 @@ fn dedup_tp_sig(tp_world_size: u8) -> String {
     format!("tp:{tp_world_size}")
 }
 
-/// Adaptive µs-to-string formatter for build-log scoring lines.
-/// Used by the per-M score emission landed in the activation phase
-/// (`889c44b2f`); kept as `#[allow(dead_code)]` for the foundation
-/// commits that introduce it before the consumer lands during
-/// the rebase replay.
-#[allow(dead_code)]
-fn fmt_us(us: f64) -> String {
-    if us < 1000.0 {
-        format!("{us:.0}µs")
-    } else if us < 100_000.0 {
-        format!("{:.1}ms", us / 1000.0)
-    } else {
-        format!("{:.0}ms", us / 1000.0)
-    }
-}
-
 // ── Pipeline entry point ──────────────────────────────────────────
 
 /// Global, target-reactive prefill/decode bucket ladder. Every `#[forward]`
 /// arch that does not explicitly override `workloads` compiles THIS ladder
-/// (for both the CUDA and Metal codegen). The full ladder is always emitted;
+/// (for the Metal codegen). The full ladder is always emitted;
 /// the affordable subset is chosen per device at load time by
-/// `select_prefill_bucket` (Metal prunes its colored arena, CUDA its captured
-/// graph shapes). Mirrors the llama arch's historical ladder.
+/// `select_prefill_bucket` (Metal prunes its colored arena). Mirrors the llama arch's historical ladder.
 ///
 /// Flat 8 → 64 on purpose: filling 16/32 rungs in here helped MoE (gemma-4:
 /// conc-12 TPOT 140.8 → 85.1 ms, dead expert compute at padded rows) but
@@ -525,14 +459,10 @@ struct CompileMode {
     /// True for `#[forward]`, false for `#[vision_forward]`. Gates
     /// the post-Embed multimodal splice pass — that splice belongs
     /// on the decoder's text-side hidden states, not the encoder's
-    /// patch hidden states. Only consulted under `cuda` (the splice
-    /// pass is cuda-specific); declared cuda-only so non-cuda builds
-    /// don't carry a dead field.
-    #[cfg(any(feature = "cuda", feature = "metal"))]
+    /// patch hidden states. Only consulted under `metal`; declared
+    /// metal-only so other builds don't carry a dead field.
+    #[cfg(feature = "metal")]
     apply_mm_splice: bool,
-    /// True for `#[forward]` (which fans out over `{1, 2, 4, 8}` at
-    /// nccl-enabled), false for `#[vision_forward]` (always tp=1).
-    enable_tp_fanout: bool,
     /// True for `#[forward]`, false for `#[vision_forward]`. Gates
     /// emission of the arch-level dispatcher (`enum Weights`,
     /// `ScratchyArchRegistration` inventory submission, per-variant
@@ -551,19 +481,54 @@ impl CompileMode {
     const DECODER: Self = Self {
         prelude: classified::Prelude::Decoder,
         apply_tp_lowering: true,
-        #[cfg(any(feature = "cuda", feature = "metal"))]
+        #[cfg(feature = "metal")]
         apply_mm_splice: true,
-        enable_tp_fanout: true,
         emit_arch_dispatch: true,
     };
     const VISION: Self = Self {
         prelude: classified::Prelude::Vision,
         apply_tp_lowering: false,
-        #[cfg(any(feature = "cuda", feature = "metal"))]
+        #[cfg(feature = "metal")]
         apply_mm_splice: false,
-        enable_tp_fanout: false,
         emit_arch_dispatch: false,
     };
+}
+
+/// What the target-emitter seam was handed, while [`target_model_inputs`] is collecting it.
+#[cfg(feature = "target-emitter")]
+static TARGET_INPUTS: std::sync::Mutex<Option<Vec<scratchy_subtile::handoff::TargetModelInput>>> =
+    std::sync::Mutex::new(None);
+
+/// Keep a copy of `input` when [`target_model_inputs`] is collecting; nothing otherwise.
+#[cfg(feature = "target-emitter")]
+pub(crate) fn record_target_input(input: &scratchy_subtile::handoff::TargetModelInput) {
+    let mut inputs = TARGET_INPUTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(inputs) = inputs.as_mut() {
+        inputs.push(input.clone());
+    }
+}
+
+/// [`compile_carrier`], returning every [`scratchy_subtile::handoff::TargetModelInput`] it
+/// handed the target-emitter seam, one per emitted model, instead of the tokens: so a test can
+/// check what a target emitted against what that target lowers from the same canonicals.
+#[cfg(feature = "target-emitter")]
+pub fn target_model_inputs(
+    carrier: PythonCarrier,
+    models_dir: &std::path::Path,
+) -> syn::Result<Vec<scratchy_subtile::handoff::TargetModelInput>> {
+    let collecting = |on: bool| {
+        let mut inputs = TARGET_INPUTS.lock().unwrap_or_else(|e| e.into_inner());
+        if on {
+            *inputs = Some(Vec::new());
+            Vec::new()
+        } else {
+            inputs.take().unwrap_or_default()
+        }
+    };
+    collecting(true);
+    let compiled = compile_carrier(carrier, models_dir);
+    let inputs = collecting(false);
+    compiled.map(|_| inputs)
 }
 
 /// The whole pipeline: a parsed `dsl/<arch>.py` carrier, compiled against
@@ -841,14 +806,6 @@ pub fn compile_carrier(
         }
     }
 
-    // Backend selection via feature flags (compile-time, not runtime)
-    #[cfg(feature = "cuda")]
-    let target_profile = {
-        let target_def =
-            scratchy_target_cuda::targets::detect().map_err(|e| syn::Error::new(name_span, e))?;
-        target::from_profile_def(target_def)
-    };
-
     // ⛔ DETECTION ONLY, AND THAT IS THE WHOLE POINT. A metal build runs no solver, so the
     // `TargetProfile` this used to convert the probe into was built and dropped — a cost model
     // for a search that is not compiled in. What still has to happen is the PROBE: it fails the
@@ -864,32 +821,10 @@ pub fn compile_carrier(
         )
     })?;
 
-    // Spyre/KTIR is a host backend with no GPU cost model. The solver only
-    // needs a profile to cover the FUF with spyre's own claim impls, which the
-    // KTIR emitter then lowers — so the profile is honestly `Backend::Spyre`
-    // (no Cuda masquerade), carries no GPU hardware spec, and uses the universal
-    // cost table (analytic fallback). The op set is driven by spyre's registered
-    // impls, not by the backend discriminant.
-    // Spyre is tape-scheduled too, so nothing consumes a cost profile there;
-    // the binding is kept (and unused) so the shape stays visible next to the
-    // cuda and metal arms.
-    #[cfg(feature = "spyre")]
-    let _target_profile = target::TargetProfile {
-        name: "spyre".to_string(),
-        source_path: std::path::PathBuf::new(),
-        backend: target::Backend::Spyre,
-        peak_tflops_fp16: 100.0,
-        memory_bandwidth_gbps: 1000.0,
-        backend_spec: target::BackendSpec::Spyre,
-        cost_table: target::CostTable::universal(),
-    };
-
     #[cfg(not(any(feature = "cuda", feature = "metal", feature = "spyre")))]
     compile_error!(
         "scratchy-forward-compiler-macro requires a backend feature: 'cuda', 'metal', or 'spyre'"
     );
-
-    let library = impl_lib::starter_library();
 
     // Stable rebuild-on-JSON-change: emit `const _: &str =
     // include_str!("<abs path>");` for every file the macro read.
@@ -922,9 +857,7 @@ pub fn compile_carrier(
     // directory for EVERY backend and could silently track nothing
     // on a read error — the stale-bake bug it existed to prevent.)
     // De-dupe before emitting; multiple variants share preset /
-    // override paths. Target profile is no longer a separate file —
-    // it's compiled into scratchy-target-cuda, so cargo's normal
-    // dep edge invalidates this crate when the profile changes.
+    // override paths.
     for p in &tracked_paths {
         let s = p.to_string_lossy().into_owned();
         let lit = syn::LitStr::new(&s, proc_macro2::Span::call_site());
@@ -933,8 +866,8 @@ pub fn compile_carrier(
 
     // ── Per-model × per-workload pipeline ─────────────────────────
     //
-    // Two passes: solve every variant first (gather fuf + sfufs + loops
-    // per variant), then group variants whose emitted forward-fn
+    // Two passes: lower every variant first (gather fuf + workload
+    // points per variant), then group variants whose emitted forward-fn
     // bodies would be byte-identical and emit each group's canonical
     // variant in full. Non-canonical variants emit `pub use`
     // re-exports of the canonical's forward fns + their own variant-
@@ -942,14 +875,10 @@ pub fn compile_carrier(
     //
     // The dedup key captures every input that flows into the emitted
     // forward fn body: model bounds (baked as int literals in emit),
-    // scalars (baked as float literals), and the SFUF-per-workload-
-    // point (which Impl runs at each subgraph → which `emit_call`
-    // output ends up in the body). Two variants that share this
-    // tuple compile to byte-identical forward fns — across AWQ /
-    // GPTQ / CT of the same (arch, size), for instance, because
-    // they all resolve to the same `Marlin*Impl` family and the
-    // quant knobs (`desc_act`, `sym`, etc.) only change the
-    // per-variant `load`, never the forward.
+    // scalars (baked as float literals), and the workload points
+    // (one bucket each). Two variants that share this tuple compile
+    // to byte-identical forward fns; quant knobs that only change the
+    // per-variant `load` never split them.
     struct SolvedModel<'a> {
         model: &'a config::ModelParams,
         /// Shapes inferred from THIS model's bounds — never the
@@ -960,13 +889,12 @@ pub fn compile_carrier(
         /// same program the FUF was built from.
         prog: classified::Program,
         fuf: fuf::Fuf,
-        sfufs: crate::assignment::WorkloadAssignments,
-        loops: schedule::WorkloadLoops,
+        workloads: crate::workload::WorkloadPoints,
         stub_items: proc_macro2::TokenStream,
         /// Tensor-parallel world size this model was solved at. The
         /// (variant × tp) fanout constructs one SolvedModel per
-        /// (model, tp_world_size) pair. At `tp_world_size = 1` (every
-        /// emission when `CARGO_FEATURE_NCCL` is unset) sharding is
+        /// (model, tp_world_size) pair. At `tp_world_size = 1` (the
+        /// only tp emitted) sharding is
         /// identity. Threaded into `dedup_signature` so the
         /// canonical-equivalence-class hash keeps each tp on its own
         /// canonical, and into the `tp_lowering::insert_all_reduces`
@@ -1040,17 +968,10 @@ pub fn compile_carrier(
             // canonicals — pinned by `tp_world_sizes_pick_separate_
             // canonicals`.
             parts.push(dedup_tp_sig(self.tp_world_size));
-            // SFUF per (num_tokens, sk_bucket) point: which Impl runs
-            // at each subgraph. Identical SFUFs → each impl's
-            // `emit_call` produces identical output at identical
-            // positions in the body.
-            let mut wps: Vec<_> = self.sfufs.per_workload.iter().collect();
-            wps.sort_by_key(|(wp, _)| (wp.num_tokens, wp.sk_bucket));
-            for (wp, sf) in wps {
-                let mut impls: Vec<(u32, u32)> =
-                    sf.impls.iter().map(|(sg, i)| (sg.0, i.0)).collect();
-                impls.sort();
-                parts.push(format!("w:{}-{}-{:?}", wp.num_tokens, wp.sk_bucket, impls));
+            // Workload points: every (num_tokens, sk_bucket) bucket the
+            // variant compiles at.
+            for wp in self.workloads.iter() {
+                parts.push(format!("w:{}-{}", wp.num_tokens, wp.sk_bucket));
             }
             parts.join("|")
         }
@@ -1062,25 +983,8 @@ pub fn compile_carrier(
         }
     }
 
-    // Compile-time tp set. The per-arch
-    // crate's `nccl` cargo feature transitively enables
-    // `scratchy-forward-compiler-macro/nccl`, recompiling THIS proc-macro with
-    // its own `nccl` feature on. `cfg!(feature = "nccl")` then reads
-    // `true` at expand time and the macro fans out every variant
-    // over `{1, 2, 4, 8}`. Without it, only tp=1 emits —
-    // byte-identical to the pre-fanout build. (Cargo caches the
-    // proc-macro per-feature-set, so consumers without nccl still
-    // get the fast tp=1-only macro.)
-    let nccl_enabled = cfg!(feature = "nccl");
-    // Vision macros opt out of the tp fanout entirely — the encoder
-    // is replicated in v1 (no AllReduce / AllGather lowering, no
-    // sharded weight surface). Decoder macros keep the existing
-    // {1, 2, 4, 8} set under nccl-enabled, [1] otherwise.
-    let tp_set: &[u8] = if mode.enable_tp_fanout && nccl_enabled {
-        &[1, 2, 4, 8]
-    } else {
-        &[1]
-    };
+    // Single-rank only: no backend shards a model across devices.
+    let tp_set: &[u8] = &[1];
 
     let mut solved: Vec<SolvedModel<'_>> = Vec::with_capacity(models.len() * tp_set.len());
 
@@ -1183,7 +1087,7 @@ pub fn compile_carrier(
             }
             // Tensor-parallel lowering pass. At tp=1 (every existing
             // SolvedModel until task #7's canonical fanout lands) this is
-            // a strict no-op — the FUF flowing into the solver is
+            // a strict no-op — the FUF flowing into emission is
             // byte-identical to single-rank builds. Vision encoders
             // skip the pass entirely (no AllReduce/AllGather; replicated
             // in v1 per the G.3 handoff resolution).
@@ -1199,16 +1103,11 @@ pub fn compile_carrier(
             // splice inside `Instruction::Embed::eval` mistakenly
             // overwrote). Vision encoders skip — splice belongs on
             // the decoder side, not the encoder side.
-            // MmEmbedSplice's only matcher is the CUDA-only
-            // `MmEmbedSpliceImpl` (D2D-copy via cuMemcpyDtoDAsync). Under
-            // `--features metal` the impl pool can't claim the synthesized
-            // splice node, so the solver explodes with "no Impl matched
-            // Inserts a post-Embed `OpKind::MmEmbedSplice` that D2D-copies
+            // Inserts a post-Embed `OpKind::MmEmbedSplice` that copies
             // the vision-encoder embeddings into the image-placeholder
-            // rows. Text-only batches make it a runtime no-op
-            // (`embed_patches` empty) on both backends. Now wired on metal
-            // too (metal `MmEmbedSpliceImpl` + `SpliceMmEmbeds` lowering).
-            #[cfg(any(feature = "cuda", feature = "metal"))]
+            // rows (metal's `SpliceMmEmbeds` lowering). Text-only batches
+            // make it a runtime no-op (`embed_patches` empty).
+            #[cfg(feature = "metal")]
             if mode.apply_mm_splice {
                 tp_lowering::insert_mm_splices(&mut model_fuf, &model_prog);
             }
@@ -1218,473 +1117,34 @@ pub fn compile_carrier(
             // read its slot 0. No-op for a body that reads none.
             rows_lowering::materialize_rows(&mut model_fuf);
 
-            // At tp>1, the runtime weight tensors are per-rank shards
-            // (column-parallel q/k/v/gate/up halve dim 0; row-parallel
-            // o/down halve dim 1). The codegen-baked weight shapes
-            // (`assert_weight_shape` checks them at every Gemm-class
-            // eval) must match those per-rank shapes, so the solver
-            // and `gemm_nk_from_fuf` (which evaluates symbolic
-            // `Shape` against bounds) need a sharded view of
-            // `num_attention_heads / num_key_value_heads /
-            // intermediate_size`. tp=1 keeps the unsharded bounds
-            // verbatim — byte-identical to the pre-fanout build.
-            #[cfg(feature = "cuda")]
-            let solve_bounds = if tp_world_size > 1 {
-                let mut b = model.bounds.clone();
-                let tp = tp_world_size as u64;
-                for k in [
-                    "num_attention_heads",
-                    "num_key_value_heads",
-                    "intermediate_size",
-                ] {
-                    if let Some(v) = b.get_mut(k) {
-                        *v = (*v / tp).max(1);
-                    }
-                }
-                b
-            } else {
-                model.bounds.clone()
-            };
-            let t_solve = std::time::Instant::now();
-            // M2b step 3: a tape-scheduled arch does not run the
-            // solver at all. Its emitted artifacts — stream,
-            // schedule, coloring, accessors, Weights struct, bucket
-            // folding — all come from the shared tape (each gated
-            // equal to instruction selection's before this switch).
-            // The workload POINTS are still needed as map keys, so
-            // an empty `Assignment` per point stands in; nothing on
-            // the pilot path reads their contents.
-            #[cfg(any(feature = "metal", feature = "spyre"))]
-            let tape_pilot = true;
-            #[cfg(not(any(feature = "metal", feature = "spyre")))]
-            let tape_pilot = false;
-            let workloads = model_workloads(&args.workloads, model);
-            let sfufs = if tape_pilot {
-                let sk_eff: Vec<u64> = if args.sk_buckets.is_empty() {
-                    vec![0]
-                } else {
-                    args.sk_buckets.clone()
-                };
-                let mut per_workload = std::collections::BTreeMap::new();
-                for m in &workloads {
-                    for sk in &sk_eff {
-                        per_workload.insert(
-                            crate::assignment::WorkloadPoint {
-                                num_tokens: *m,
-                                sk_bucket: *sk,
-                            },
-                            crate::assignment::Assignment {
-                                cover: Default::default(),
-                                impls: Default::default(),
-                                predicted_us: 0.0,
-                            },
-                        );
-                    }
-                }
-                crate::assignment::WorkloadAssignments { per_workload }
-            } else {
-                #[cfg(feature = "cuda")]
-                {
-                    solver::solve_with_arch_filter(
-                        &model_fuf,
-                        &library,
-                        &target_profile,
-                        Some((&model_prog, model)),
-                        &model_inferred,
-                        &solve_bounds,
-                        &workloads,
-                        &args.sk_buckets,
-                        tp_world_size,
-                    )
-                    .map_err(|e| {
-                        syn::Error::new(args.span, format!("solve [{}]: {e}", model.source_stem))
-                    })?
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    // Unreachable on metal and spyre: `tape_pilot` above is
-                    // unconditionally true there, so this arm never runs — which
-                    // is what lets the solver be absent from the build entirely.
-                    unreachable!("metal builds are always tape-scheduled")
-                }
-            };
-            // Only `cost::refresh_predicted_us` mutates this, and it is not
-            // compiled on a metal-only build.
-            #[cfg(feature = "cuda")]
-            let mut sfufs = sfufs;
-            let d_solve = t_solve.elapsed();
-
-            let loops = schedule::schedule_workloads(&model_fuf, &sfufs);
-            #[cfg(feature = "cuda")]
-            cost::refresh_predicted_us(
-                &model_fuf,
-                &mut sfufs,
-                &loops,
-                &library,
-                &target_profile,
-                &solve_bounds,
+            // The workload POINTS a tape-scheduled build compiles at: one
+            // bucket per (num_tokens, sk_bucket).
+            let workloads = crate::workload::WorkloadPoints::grid(
+                &model_workloads(&args.workloads, model),
+                &args.sk_buckets,
             );
 
-            // PD-wavefront macro-emission moved into `codegen::emit_model`
+            // PD-wavefront macro-emission lives in `codegen::emit_model`
             // (`dump_wavefront_mega`): the decode bucket's `weight_slots` —
             // the real weight-locator source — only exists after lowering +
             // loop compression, which happens inside `emit_model`, not in
-            // this pre-emit solve drive.
+            // this pre-emit drive.
 
-            let max_waves = loops
-                .per_workload
-                .values()
-                .map(|l| l.num_waves())
-                .max()
-                .unwrap_or(0);
-            // Kernel-class summary lifted from HEAD (`9189c3147`).
-            // Classification must be TOTAL: any impl name that doesn't
-            // map to a known class fails the build, prompting us to
-            // add the kernel to the explicit table.
-            //
-            // Three semantic axes:
-            //   - attention backend: fa2 / fi / mla
-            //   - GEMM backend (pure or fused-with-GEMM): cublas /
-            //     cutlass / marlin. fp8 folds into cutlass (uses
-            //     `cutlass_scaled_mm_with_bias`); bnb4 folds into
-            //     cublas (dequant + cuBLAS matmul).
-            //   - non-gemm: kernels that are neither attention nor
-            //     GEMM-bearing — element-wise, reshapes, residual
-            //     adds, standalone norms. Surfaced because their
-            //     existence is usually a "why didn't we fuse this?"
-            //     signal.
-            const CLASS_LABELS: [&str; 8] = [
-                "fa2", "fi", "mla", "cublas", "cutlass", "marlin", "non-gemm", "comm",
-            ];
-            // Names that are non-gemm despite a `fused_` prefix
-            // (norm-side fusions with no matmul).
-            const NON_GEMM_NAMES: &[&str] = &[
-                "embed_ref",
-                "rmsnorm_ref",
-                "add_ref",
-                "reshape_ref",
-                "rope_append_ref",
-                "silu_ref",
-                "elem_mul_ref",
-                "scalar_mul_inplace",
-                "scalar_offset_rms_norm",
-                "tanh_softcap_inplace",
-                // Gemma4 singletons: unit-gain rmsnorm (v_norm) and
-                // the per-layer [1]-weight multiply (layer_scalar).
-                "rmsnorm_unit",
-                "scalar_weight_mul",
-                // Gemma4 post-FFN tail fusion (rmsnorm+add+scalar_mul
-                // in one kernel — norm-side, no matmul).
-                "metal_norm_add_scalar_mul_f16",
-                "metal_norm_add_scalar_mul_bf16",
-                // Gemma4 pre-attn tail fusion (q/k norms + v unit-norm
-                // inside the rope dispatch — norm-side, no matmul).
-                "metal_rope_append_normed_f16",
-                "metal_rope_append_normed_bf16",
-                "softcap",
-                "nosoftcap",
-                "deepseek_moe_ref",
-                "deepseek_moe_fp8_block",
-                "deepseek_moe_ggml",
-                "fused_moe_ref",
-                "shared_fused_moe_ref",
-                "cuda_gemma_moe",
-                // Qwen3.5 hybrid ops — host-callback dispatch wrappers whose
-                // internals (conv1d / recurrent scan / deinterleave / sigmoid
-                // gate) carry no matmul; the projections are separate DSL
-                // gemms. Same accounting class as the `*_ref` MoE siblings.
-                "gated_delta_net_ref",
-                "gate_split_ref",
-                "gate_apply_ref",
-                "gate_scale_ref",
-                // An MTP head's input fusion: two pitched copies, no matmul.
-                "concat_ref",
-                // Metal MoE Impls. Same "host-callback dispatch
-                // wrapper, internal compute steps already classified
-                // (Gemm via metal_gemm_, gather_qmv via
-                // metal_affine_qmm_)" shape as the cuda *_ref
-                // siblings — bucket them under non-gemm for
-                // accounting.
-                #[cfg(feature = "metal")]
-                "metal_fused_moe",
-                #[cfg(feature = "metal")]
-                "metal_shared_fused_moe",
-                #[cfg(feature = "metal")]
-                "metal_gemma_moe",
-                "fused_add_rms_norm",
-                "fused_add_rms_norm_with_offset",
-                "mean_sub_rms_norm",
-                "mean_sub_rms_norm_bias_add",
-                // Vision-side unary elementwise ops (G.4). Shape-
-                // preserving, no matmul — same class as the text-side
-                // `scalar_mul_inplace` / `tanh_softcap_inplace` lines.
-                "quick_gelu_inplace",
-                "gelu_erf_inplace",
-                "gelu_tanh_inplace",
-                // Metal kernels (Phase 5.F: the proc-macro now runs
-                // under `--features metal`, so the classifier sees
-                // these names alongside the CUDA ones). Hand-rolled
-                // norm / elementwise / fused-MLP / RoPE — same shape
-                // class as the CUDA `*_ref` siblings, just emitting
-                // MSL instead of CUDA. `metal_attention_*` and
-                // `metal_gemm_*` get their own prefix arms below
-                // (fa2 / cutlass-equivalent). Gated on `metal` so the
-                // CUDA build doesn't carry dead names in its classifier.
-                #[cfg(feature = "metal")]
-                "metal_add_f16",
-                #[cfg(feature = "metal")]
-                "metal_add_bf16",
-                #[cfg(feature = "metal")]
-                "metal_embed_f16",
-                #[cfg(feature = "metal")]
-                "metal_embed_bf16",
-                #[cfg(feature = "metal")]
-                "metal_affine_embed_f16",
-                #[cfg(feature = "metal")]
-                "metal_affine_embed_bf16",
-                #[cfg(feature = "metal")]
-                "metal_reshape",
-                #[cfg(feature = "metal")]
-                "metal_bias_add_f16",
-                #[cfg(feature = "metal")]
-                "metal_bias_add_bf16",
-                #[cfg(feature = "metal")]
-                "metal_rmsnorm_f16",
-                #[cfg(feature = "metal")]
-                "metal_rmsnorm_bf16",
-                #[cfg(feature = "metal")]
-                "metal_fused_add_rmsnorm_f16",
-                #[cfg(feature = "metal")]
-                "metal_fused_add_rmsnorm_bf16",
-                #[cfg(feature = "metal")]
-                "metal_fused_gate_up_silu_mul_f16",
-                #[cfg(feature = "metal")]
-                "metal_fused_gate_up_silu_mul_bf16",
-                #[cfg(feature = "metal")]
-                "metal_fused_gate_up_gelu_mul_f16",
-                #[cfg(feature = "metal")]
-                "metal_fused_gate_up_gelu_mul_bf16",
-                #[cfg(feature = "metal")]
-                "metal_rope_append_f16",
-                #[cfg(feature = "metal")]
-                "metal_rope_append_bf16",
-                // CommandR and other models use the interleaved rope
-                // variant; same shape class as the regular rope_append.
-                #[cfg(feature = "metal")]
-                "metal_rope_append_interleaved_f16",
-                #[cfg(feature = "metal")]
-                "metal_rope_append_interleaved_bf16",
-                #[cfg(feature = "metal")]
-                "metal_fatrelu_f16",
-                // Metal counterparts of the CUDA `scalar_mul_inplace`
-                // and `tanh_softcap_inplace` non-gemm in-place
-                // mutators. Same kernel class — bandwidth-bound
-                // elementwise unary.
-                #[cfg(feature = "metal")]
-                "metal_scalar_mul_f16",
-                #[cfg(feature = "metal")]
-                "metal_scalar_mul_bf16",
-                #[cfg(feature = "metal")]
-                "metal_tanh_softcap_f16",
-                #[cfg(feature = "metal")]
-                "metal_tanh_softcap_bf16",
-                // Host-staged rows materialization. Synthesized by
-                // `rows_lowering::materialize_rows`; emits a single D2D copy that wraps the
-                // source's `ForwardCtx` view into a tile-table OwnedTensor. Not a compute kernel.
-                "load_rows",
-                // Vision-side varlen attention + vision rope.
-                // Shape-preserving non-gemm primitives.
-                "varlen_attention",
-                "vision_rope",
-                // Row-permutation gather (G.6.4). Used by Qwen2.5-VL's
-                // window-attention dispatch — same class as the other
-                // memory-bound vision primitives.
-                "embedding_gather",
-                // 2-D average pool over the patch grid (G.7(b)). Used
-                // by Gemma3-MM's SigLIP→text projector to reduce the
-                // 64×64 patch grid down to 16×16 = 256 tokens. Memory-
-                // bound with one thread per output cell; non-gemm.
-                "avg_pool_2d",
-                // Vision learned positional embedding lookup (G.7(c.1)).
-                // Reuses the decoder's `embedding_gather_masked` kernel;
-                // same memory-bound class as `embed_ref`.
-                "pos_embed_ref",
-            ];
-            let mut classes_used = [false; 8];
-            let mut unknown_names: std::collections::BTreeSet<&'static str> =
-                std::collections::BTreeSet::new();
-            for assignment in sfufs.per_workload.values() {
-                for impl_id in assignment.impls.values() {
-                    let name = library.get(*impl_id).name();
-                    // Most kernel-name prefixes here are CUDA-specific
-                    // (flashinfer/mla/cutlass/marlin/fp8/bnb4/ggml/cublas-via-fused_/
-                    // NCCL collectives + the multimodal D2D splice).
-                    // Gating each behind `cfg!(feature = "cuda")` keeps
-                    // the metal-only build's classifier from carrying
-                    // dead arms and prevents a hypothetical
-                    // metal-emitted impl that happens to start with
-                    // `cutlass` etc. from being silently mis-classed.
-                    let bucket = if cfg!(feature = "cuda") && name.starts_with("flashinfer") {
-                        Some(1) // fi
-                    } else if cfg!(feature = "cuda") && name.starts_with("flash_attention_3") {
-                        // FA3 paged decode (Hopper-native, sm_90+).
-                        // Same class as FlashInfer for the cost-model
-                        // mix line — both are persistent-scheduler
-                        // attention kernels and exclude each other in
-                        // the per-cell solver pick.
-                        Some(1) // fi
-                    } else if name.starts_with("mla_") {
-                        // MLA singletons (`mla_split_ref`, `mla_attention_ref`)
-                        // and `DeepSeekMoeRefImpl`-family are registered under
-                        // both backends — runtime support diverges, but the
-                        // classifier just buckets by name for the build-time
-                        // mix line.
-                        Some(2) // mla
-                    } else if name.starts_with("attention_")
-                        || name.starts_with("sliding_attention_")
-                        || name.starts_with("fa2_")
-                        || name == "encoder_attention"
-                        || (cfg!(feature = "metal") && name.starts_with("metal_attention_"))
-                        || (cfg!(feature = "metal") && name.starts_with("metal_sliding_attention_"))
-                    {
-                        Some(0) // fa2
-                    } else if cfg!(feature = "cuda") && name.starts_with("marlin") {
-                        Some(5) // marlin
-                    } else if cfg!(feature = "cuda") && name.starts_with("fp8") {
-                        Some(4) // cutlass (fp8 uses cutlass_scaled_mm)
-                    } else if cfg!(feature = "cuda")
-                        && (name.starts_with("bnb4") || name.starts_with("ggml"))
-                    {
-                        // cublas: bnb4 dequant + cuBLAS matmul; ggml
-                        // dequant_mul_mat_vec at decode + cuBLAS at prefill.
-                        Some(3)
-                    } else if (cfg!(feature = "cuda") && name.starts_with("cutlass"))
-                        || (cfg!(feature = "metal") && name.starts_with("metal_gemm_"))
-                        || (cfg!(feature = "metal") && name.starts_with("metal_affine_qmm_"))
-                        || (cfg!(feature = "metal") && name.starts_with("metal_nvfp4_qmm_"))
-                        || (cfg!(feature = "metal") && name.starts_with("metal_synth_"))
-                    {
-                        // Metal GEMM is currently routed through MPS
-                        // matmul2d (see scratchy-target-metal::gemm);
-                        // metal int4 GEMM routes through the
-                        // qmv/qmm_t kernels (see scratchy-target-metal::
-                        // quantized). Both treated as cutlass-equivalent
-                        // for class accounting — same "specialized
-                        // matmul tile" shape from the cost-model's
-                        // perspective.
-                        Some(4) // cutlass
-                    } else if NON_GEMM_NAMES.contains(&name) {
-                        Some(6) // non-gemm
-                    } else if name.starts_with("ktir_") {
-                        // `ktir_*` claim impls are host-callback placeholders that
-                        // let the solver cover each op; the real kernel is the
-                        // embedded KTIR bundle, so there is no host GEMM/attention
-                        // kernel to account for in this build-time mix line. (No
-                        // cuda/metal impl uses this prefix, so the arm is inert
-                        // under those backends — no need to name a target.)
-                        Some(6) // non-gemm
-                    } else if cfg!(feature = "cuda")
-                        && (name == "all_reduce" || name == "all_gather")
-                    {
-                        // Tensor-parallel collectives inserted by
-                        // `tp_lowering` at tp>1 (AllReduce after
-                        // row-parallel gemms + vocab-parallel embed;
-                        // AllGather after lm_head). Maps to NCCL —
-                        // semantically distinct from compute kernels.
-                        Some(7) // comm
-                    } else if (cfg!(feature = "cuda") || cfg!(feature = "metal"))
-                        && name == "mm_embed_splice"
-                    {
-                        // Multimodal post-Embed D2D splice inserted by
-                        // `tp_lowering::insert_mm_splices`. Not a
-                        // compute kernel — runs a sequence of
-                        // memcpy_dtod_async calls per image placeholder.
-                        // Bucketed alongside the comm kernels since
-                        // they share the "not a GEMM / not a normal
-                        // per-token kernel" shape.
-                        Some(7) // comm
-                    } else if name.starts_with("fused_") || name == "gemm_ref" {
-                        // `fused_gemm_bias` (qwen2 K/V) and the gemma
-                        // fusion families (`fused_add_rms_norm`,
-                        // `fused_add_rms_norm_with_offset`,
-                        // `scalar_offset_rms_norm`) live in both backends
-                        // now. cuda routes through cuBLAS gemm_bias; metal
-                        // routes through its own GEMM path. Same
-                        // build-time class for accounting.
-                        Some(3) // cublas / cublas-equivalent
-                    } else {
-                        None
-                    };
-                    match bucket {
-                        Some(b) => classes_used[b] = true,
-                        None => {
-                            unknown_names.insert(name);
-                        }
-                    }
-                }
-            }
-            if !unknown_names.is_empty() {
-                return Err(syn::Error::new(
-                    args.span,
-                    format!(
-                        "[{}] kernel-class summary: no class assigned for impl name(s): {}. \
-                         Add a class (or extend an existing prefix) in lib.rs.",
-                        model.source_stem,
-                        unknown_names.iter().copied().collect::<Vec<_>>().join(", "),
-                    ),
-                ));
-            }
-            let kernel_mix: String = classes_used
-                .iter()
-                .zip(CLASS_LABELS.iter())
-                .filter(|(seen, _)| **seen)
-                .map(|(_, label)| format!(" {label}"))
-                .collect();
-            // Per-M scoring: gated on SCRATCHY_DEBUG so the default
-            // build log stays terse (one line per (variant, tp)).
-            let per_m_part: String = if scratchy_debug() {
-                let sk_axis_active = sfufs.per_workload.keys().any(|wp| wp.sk_bucket != 0);
-                sfufs
-                    .per_workload
-                    .iter()
-                    .map(|(wp, a)| {
-                        if sk_axis_active {
-                            format!(
-                                " M={}sk={}→{}",
-                                wp.num_tokens,
-                                wp.sk_bucket,
-                                fmt_us(a.predicted_us)
-                            )
-                        } else {
-                            format!(" M={}→{}", wp.num_tokens, fmt_us(a.predicted_us))
-                        }
-                    })
-                    .collect()
-            } else {
-                String::new()
-            };
-            let solve_ms_part = if scratchy_debug() {
-                format!(" · {:>3} ms", d_solve.as_millis())
-            } else {
-                String::new()
-            };
             eprintln!(
-                "  scratchy · {variant:<30} · {tiles:>4} tiles · {waves:>3} waves{solve_ms_part} · tp={tp:<1} ·{kernel_mix}{per_m_part}",
+                "  scratchy · {variant:<30} · {tiles:>4} tiles · tp={tp:<1}",
                 variant = canon_stem,
                 tp = tp_world_size,
                 tiles = model_fuf.len(),
-                waves = max_waves,
             );
 
-            let stub_items = emit_model_stub_items(&model_fuf, &sfufs, &loops);
+            let stub_items = emit_model_stub_items(&model_fuf);
 
             solved.push(SolvedModel {
                 model,
                 inferred: model_inferred,
                 prog: model_prog,
                 fuf: model_fuf,
-                sfufs,
-                loops,
+                workloads,
                 stub_items,
                 tp_world_size,
                 mod_name,
@@ -1694,7 +1154,7 @@ pub fn compile_carrier(
     }
 
     // Cross-variant forward-fn dedup. Key each variant by its
-    // (bounds, scalars, SFUF-per-workload-point) tuple and pick the
+    // (bounds, scalars, workload points) tuple and pick the
     // earliest-by-source_stem variant in each equivalence class as
     // the canonical. Non-canonical variants emit thin shims that
     // `pub use` the canonical's forward fns (one-line re-exports —
@@ -1706,8 +1166,8 @@ pub fn compile_carrier(
 
     // The affine rows each emitted variant's fingerprint gate carries,
     // keyed by module name. Populated as canonicals emit and read when
-    // a shim's own accessor set yields no rows (metal: the shim's set
-    // is ISel's, empty there) — the shim's `load` delegates to the
+    // a shim's own accessor set yields no rows (a shim lowers no tape,
+    // so its set is empty) — the shim's `load` delegates to the
     // canonical's body, so its fingerprint must gate on the canonical's
     // widths. Ordering law: `config::load_dir` returns its final list
     // sorted by source_stem (synthesized fans included), and
@@ -1742,9 +1202,7 @@ pub fn compile_carrier(
             &sm.prog,
             sm.model,
             &sm.fuf,
-            &sm.sfufs,
-            &sm.loops,
-            &library,
+            &sm.workloads,
             &manifest,
             &sm.inferred,
             canonical_override.as_ref(),
@@ -2196,21 +1654,6 @@ pub fn compile_carrier(
     // `scratchy_models::llama::Weights` directly (no
     // `::arch::` / `::llama::` / etc.).
     Ok(quote! {
-        // Backend crate alias. Every emitted reference to the active
-        // GPU runtime goes through `crate::__gpu::…` so the macro's
-        // output is hardware-agnostic — the cfg selects which target
-        // crate `__gpu` resolves to: the cuda runtime under `cuda`, the
-        // metal runtime under `metal`. The third (backend-less) arm
-        // matters because some arch crates are pulled into a backend's
-        // workspace build WITHOUT a backend feature (e.g. phi3 is not
-        // metal-capable, so it compiles feature-less under `--features
-        // metal`): it still emits ungated `crate::__gpu::…` field types
-        // (the `Weights` struct), so the alias must resolve there too —
-        // every arch crate deps `scratchy-target-cuda` unconditionally,
-        // so the cuda crate is the safe backend-less target.
-        #[cfg(feature = "cuda")]
-        #[allow(unused_imports)]
-        use ::scratchy_target_cuda as __gpu;
         #[cfg(feature = "metal")]
         #[allow(unused_imports)]
         use ::scratchy_target_metal as __gpu;
@@ -2220,7 +1663,7 @@ pub fn compile_carrier(
         #[cfg(feature = "spyre")]
         #[allow(unused_imports)]
         use ::scratchy_target_spyre as __gpu;
-        #[cfg(not(any(feature = "cuda", feature = "metal", feature = "spyre")))]
+        #[cfg(not(any(feature = "metal", feature = "spyre")))]
         #[allow(unused_imports)]
         use ::scratchy_layers as __gpu;
 
@@ -2302,7 +1745,7 @@ fn lent_weight_tokens(w: scratchy_forward_compiler::LentWeight) -> proc_macro2::
 /// from each model's config.json.
 ///
 /// Also emits the auto-registration with
-/// `scratchy_target_cuda::try_load`: an `impl ScratchyWeights for Weights`
+/// `scratchy_forward_compiler::try_load`: an `impl ScratchyWeights for Weights`
 /// that routes the trait methods to the just-emitted accessors +
 /// `forward` / `forward_backbone`, and an `inventory::submit!` block
 /// carrying the union of HF `architectures` strings this arch
@@ -2361,7 +1804,7 @@ fn emit_arch_dispatcher(
     // Per-variant spyre arms for `ScratchyWeights::ktir_bundle()`: each variant
     // returns its module's embedded `KTIR_BUNDLE` const as a neutral `&dyn Any`
     // (the worker downcasts it). Emitted inside the `#[cfg(feature = "spyre")]`
-    // `ktir_bundle` override, so under cuda/metal these tokens are cfg'd out.
+    // `ktir_bundle` override, so under metal these tokens are cfg'd out.
     let ktir_bundle_arms: Vec<proc_macro2::TokenStream> = arms
         .iter()
         .map(|a| {
@@ -2431,8 +1874,7 @@ fn emit_arch_dispatcher(
 
     // Distinct tp values across all arms, in ascending order. One
     // `inventory::submit!` per value; one match arm in `Weights::load`
-    // per value. At nccl-disabled this is just `[1]` and the dispatcher
-    // is byte-identical to the pre-fanout build.
+    // per value. Only tp = 1 is emitted, so this is just `[1]`.
     let mut tp_values: Vec<u8> = arms.iter().map(|a| a.tp_world_size).collect();
     tp_values.sort_unstable();
     tp_values.dedup();
@@ -2466,30 +1908,6 @@ fn emit_arch_dispatcher(
             quote! {
                 Weights::#variant_ident(w) => unsafe {
                     #model_ident::forward(w, ctx, device, num_tokens)
-                },
-            }
-        })
-        .collect();
-    let forward_backbone_arms: Vec<proc_macro2::TokenStream> = arms
-        .iter()
-        .map(|a| {
-            let variant_ident = pascal_case(&a.model_ident);
-            let model_ident = &a.model_ident;
-            quote! {
-                Weights::#variant_ident(w) => unsafe {
-                    #model_ident::forward_backbone(w, ctx, device, num_tokens)
-                },
-            }
-        })
-        .collect();
-    let forward_piecewise_capture_arms: Vec<proc_macro2::TokenStream> = arms
-        .iter()
-        .map(|a| {
-            let variant_ident = pascal_case(&a.model_ident);
-            let model_ident = &a.model_ident;
-            quote! {
-                Weights::#variant_ident(w) => unsafe {
-                    #model_ident::forward_piecewise_capture(w, ctx, device, num_tokens)
                 },
             }
         })
@@ -2719,9 +2137,9 @@ fn emit_arch_dispatcher(
     // initializer — N submissions at compile time, walked once at
     // runtime by `scratchy_forward_compiler::try_load(arch_hint, tp_world_size)`.
     // The registration's `ktir_bundle` accessor — spyre's forward representation
-    // (the peer of the cuda/metal `FORWARD_TABLE`). Under spyre it returns the
+    // (the peer of the metal `FORWARD_TABLE`). Under spyre it returns the
     // embedded `KTIR_BUNDLE` const as a neutral `&dyn Any` (the cfg-free registry
-    // can't name the spyre `KtirBundle`); under cuda/metal the forward runs
+    // can't name the spyre `KtirBundle`); under metal the forward runs
     // through device kernels, so there's no bundle and the field is `None`.
     //
     // An arch registers MANY distinct base models (llama-2-13b … llama-3.2-3b),
@@ -2730,7 +2148,7 @@ fn emit_arch_dispatcher(
     // sniff `Weights::load` uses (read-only, so the worker keeps its tensors).
     // Quant variants of one base model share that base's bundle (shims re-export
     // it), so any matching arm returns the right const. Own-target gating
-    // (parallel to how cuda/metal gate their `FORWARD_TABLE` / `METAL_BUCKETS`):
+    // (parallel to how metal gates its `FORWARD_TABLE` / `METAL_BUCKETS`):
     // `KTIR_BUNDLE` / `fingerprint_matches` only exist under this arch's spyre
     // feature, so the `Some` arm can only compile there; other backends emit `None`.
     #[cfg(feature = "spyre")]
@@ -2812,7 +2230,7 @@ fn emit_arch_dispatcher(
         .map(|tp| {
             let tp_lit = proc_macro2::Literal::u8_unsuffixed(*tp);
             quote! {
-                #[cfg(any(feature = "cuda", feature = "metal", feature = "spyre"))]
+                #[cfg(any(feature = "metal", feature = "spyre"))]
                 ::scratchy_forward_compiler::inventory::submit! {
                     ::scratchy_forward_compiler::ScratchyArchRegistration {
                         arch_name: #arch_name_lit,
@@ -2843,98 +2261,18 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
-    // GGUF spec registration. Conditional on (a) the arch having a
-    // `"ggml"` entry in `quantizations.json` AND (b) `register_spec`
-    // being true (default). Non-canonical owners of a gguf tag set
-    // `register_spec: false` so only one crate per gguf_arch supplies
-    // the inventory-side spec data — find_spec stays deterministic.
-    // The arch is still routed for that tag via the `gguf_archs`
-    // field of its `ScratchyArchRegistration` above.
-    let gguf_register_emit: proc_macro2::TokenStream = match gguf_spec {
-        None => quote! {},
-        Some(ref spec) if !spec.register_spec => quote! {},
-        Some(spec) => {
-            let gguf_arch_lit = proc_macro2::Literal::string(
-                &spec.gguf_arch.unwrap_or_else(|| arch_ident.to_string()),
-            );
-            let qk = spec.qk_permute;
-            let rope = spec.llama3_rope_scaling_inference;
-            let nwo = proc_macro2::Literal::f32_suffixed(spec.norm_weight_offset);
-            let renames: Vec<proc_macro2::TokenStream> = spec
-                .tensor_renames
-                .iter()
-                .map(|(g, h)| {
-                    let g = proc_macro2::Literal::string(g);
-                    let h = proc_macro2::Literal::string(h);
-                    quote! { (#g, #h) }
-                })
-                .collect();
-            let m_u32: Vec<proc_macro2::TokenStream> = spec
-                .metadata_u32
-                .iter()
-                .map(|(g, e)| {
-                    let g = proc_macro2::Literal::string(g);
-                    let e = proc_macro2::Literal::string(e);
-                    quote! { (#g, #e) }
-                })
-                .collect();
-            let m_f32: Vec<proc_macro2::TokenStream> = spec
-                .metadata_f32
-                .iter()
-                .map(|(g, e)| {
-                    let g = proc_macro2::Literal::string(g);
-                    let e = proc_macro2::Literal::string(e);
-                    quote! { (#g, #e) }
-                })
-                .collect();
-            let d_u32: Vec<proc_macro2::TokenStream> = spec
-                .metadata_defaults_u32
-                .iter()
-                .map(|(k, v)| {
-                    let k = proc_macro2::Literal::string(k);
-                    let v = proc_macro2::Literal::u32_suffixed(*v);
-                    quote! { (#k, #v) }
-                })
-                .collect();
-            let d_f32: Vec<proc_macro2::TokenStream> = spec
-                .metadata_defaults_f32
-                .iter()
-                .map(|(k, v)| {
-                    let k = proc_macro2::Literal::string(k);
-                    let v = proc_macro2::Literal::f32_suffixed(*v);
-                    quote! { (#k, #v) }
-                })
-                .collect();
-            quote! {
-                #[cfg(feature = "cuda")]
-                ::scratchy_quantizations::register! {
-                    gguf_arch = #gguf_arch_lit,
-                    qk_permute = #qk,
-                    tensor_renames = [ #(#renames),* ],
-                    metadata_u32 = [ #(#m_u32),* ],
-                    metadata_f32 = [ #(#m_f32),* ],
-                    metadata_defaults_u32 = [ #(#d_u32),* ],
-                    metadata_defaults_f32 = [ #(#d_f32),* ],
-                    llama3_rope_scaling_inference = #rope,
-                    norm_weight_offset = #nwo,
-                }
-            }
-        }
-    };
-
     Ok(quote! {
         /// One variant per compiled model config. Holds that
         /// model's specialized `Weights`. Same shape under both
         /// backends — the variant's per-canonical `Weights` struct
-        /// itself is cfg-mutex'd internally (cuda fields gated
-        /// `cfg(feature = "cuda")`, metal fields gated
+        /// itself is cfg-mutex'd internally (metal fields gated
         /// `cfg(feature = "metal")`).
-        #[cfg(any(feature = "cuda", feature = "metal", feature = "spyre"))]
+        #[cfg(any(feature = "metal", feature = "spyre"))]
         pub enum Weights {
             #(#variants),*
         }
 
-        #[cfg(any(feature = "cuda", feature = "metal", feature = "spyre"))]
+        #[cfg(any(feature = "metal", feature = "spyre"))]
         impl Weights {
             #(#accessor_methods)*
 
@@ -2974,7 +2312,7 @@ fn emit_arch_dispatcher(
         /// # Safety
         /// All tensors in `ctx` must be valid GPU memory; `device`
         /// must be the live backend device.
-        #[cfg(any(feature = "cuda", feature = "metal"))]
+        #[cfg(feature = "metal")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward(
             w: &Weights,
@@ -3051,46 +2389,7 @@ fn emit_arch_dispatcher(
             }
         }
 
-        /// Dispatching backbone-only forward (no lm_head). Returns
-        /// `[num_tokens, hidden_size]` as an independently-owned
-        /// `OwnedTensor`. For pipeline-parallel intermediate ranks
-        /// that hand hidden states to the next rank — cuda-only
-        /// today; metal has no PP fanout, so the per-canonical
-        /// `forward_backbone` is cfg(cuda)-gated and this dispatcher
-        /// matches.
-        ///
-        /// # Safety
-        /// All tensors in `ctx` must be valid GPU memory; `device`
-        /// must be the live CUDA device.
-        #[cfg(feature = "cuda")]
-        #[allow(clippy::too_many_arguments)]
-        pub unsafe fn forward_backbone(
-            w: &Weights,
-            ctx: &crate::__gpu::ForwardCtx,
-            device: &mut crate::__gpu::GpuDevice,
-            num_tokens: u64,
-        ) -> crate::__gpu::OwnedTensor {
-            match w {
-                #(#forward_backbone_arms)*
-            }
-        }
 
-        /// Dispatching piecewise CUDA-graph capture. Matches the
-        /// `Weights` variant and calls the per-canonical
-        /// `forward_piecewise_capture`. cuda-only; metal has no
-        /// piecewise path because nccl isn't a metal concept.
-        #[cfg(feature = "cuda")]
-        #[allow(clippy::too_many_arguments)]
-        pub unsafe fn forward_piecewise_capture(
-            w: &Weights,
-            ctx: &crate::__gpu::ForwardCtx,
-            device: &mut crate::__gpu::GpuDevice,
-            num_tokens: u64,
-        ) -> ::anyhow::Result<crate::__gpu::piecewise::PiecewiseRunner> {
-            match w {
-                #(#forward_piecewise_capture_arms)*
-            }
-        }
 
         // ── Auto-registration with scratchy_forward_compiler::try_load ──────
         //
@@ -3099,7 +2398,7 @@ fn emit_arch_dispatcher(
         // `inventory::submit!` adds this arch to the global registry.
         // No hand-written central list anywhere.
 
-        #[cfg(any(feature = "cuda", feature = "metal", feature = "spyre"))]
+        #[cfg(any(feature = "metal", feature = "spyre"))]
         impl ::scratchy_forward_compiler::ScratchyWeights for Weights {
             fn arch_name(&self) -> &'static str { #arch_name_lit }
             fn num_hidden_layers(&self) -> u64 { self.num_hidden_layers() }
@@ -3109,13 +2408,13 @@ fn emit_arch_dispatcher(
             fn num_key_value_heads(&self) -> u64 { self.num_key_value_heads() }
             fn head_dim(&self) -> u64 { self.head_dim() }
             fn vocab_size(&self) -> u64 { self.vocab_size() }
-            #[cfg(any(feature = "cuda", feature = "metal"))]
+            #[cfg(feature = "metal")]
             fn kv_codec(&self) -> ::scratchy_forward_compiler::KvCodec {
                 match self {
                     #(#kv_codec_arms)*
                 }
             }
-            #[cfg(any(feature = "cuda", feature = "metal"))]
+            #[cfg(feature = "metal")]
             fn kv_cache_layers(&self) -> ::core::option::Option<&'static [u32]> {
                 match self {
                     #(#kv_cache_layers_arms)*
@@ -3187,13 +2486,13 @@ fn emit_arch_dispatcher(
                 })
             }
 
-            // Device-runtime forward methods — cuda/metal only (the trait gates
+            // Device-runtime forward methods — metal only (the trait gates
             // them off under spyre, whose forward runs through the KTIR bundle).
             // The cfg-free trait takes the neutral `ForwardCtxHandle` /
-            // `ForwardDeviceHandle` (so it names no cuda/metal type); recover
+            // `ForwardDeviceHandle` (so it names no metal type); recover
             // the concrete `&ForwardCtx` / `&mut GpuDevice` here before
             // delegating to the per-arch free fns, which keep concrete types.
-            #[cfg(any(feature = "cuda", feature = "metal"))]
+            #[cfg(feature = "metal")]
             unsafe fn forward(
                 &self,
                 ctx: crate::__gpu::ForwardCtxHandle<'_>,
@@ -3205,19 +2504,13 @@ fn emit_arch_dispatcher(
                 unsafe { forward(self, ctx, device, num_tokens) }
             }
 
-            #[cfg(any(feature = "cuda", feature = "metal"))]
+            #[cfg(feature = "metal")]
             unsafe fn forward_backbone(
                 &self,
                 ctx: crate::__gpu::ForwardCtxHandle<'_>,
                 device: crate::__gpu::ForwardDeviceHandle<'_>,
                 num_tokens: u64,
             ) -> crate::__gpu::OwnedTensor {
-                #[cfg(feature = "cuda")]
-                {
-                    let ctx: &crate::__gpu::ForwardCtx = unsafe { ctx.as_ref() };
-                    let device: &mut crate::__gpu::GpuDevice = unsafe { device.as_mut() };
-                    unsafe { forward_backbone(self, ctx, device, num_tokens) }
-                }
                 #[cfg(feature = "metal")]
                 {
                     let _ = (ctx, device, num_tokens);
@@ -3228,21 +2521,6 @@ fn emit_arch_dispatcher(
                 }
             }
 
-            #[cfg(feature = "cuda")]
-            unsafe fn forward_piecewise_capture(
-                &self,
-                ctx: crate::__gpu::ForwardCtxHandle<'_>,
-                device: crate::__gpu::ForwardDeviceHandle<'_>,
-                num_tokens: u64,
-            ) -> ::anyhow::Result<::std::boxed::Box<dyn ::core::any::Any + ::core::marker::Send>> {
-                let ctx: &crate::__gpu::ForwardCtx = unsafe { ctx.as_ref() };
-                let device: &mut crate::__gpu::GpuDevice = unsafe { device.as_mut() };
-                // The concrete `PiecewiseRunner` is boxed as a neutral
-                // `dyn Any + Send` (the trait can't name a cuda type); the cuda
-                // worker downcasts it back.
-                let runner = unsafe { forward_piecewise_capture(self, ctx, device, num_tokens) }?;
-                ::core::result::Result::Ok(::std::boxed::Box::new(runner))
-            }
 
             #[cfg(feature = "metal")]
             fn metal_dtype(&self) -> ::scratchy_target_metal::interpreter::metal::MetalDtype {
@@ -3341,9 +2619,9 @@ fn emit_arch_dispatcher(
         // One `ScratchyArchRegistration` per distinct tp value across
         // the compiled (variant, tp) tuples. Each closure passes its
         // own tp constant into `Weights::load(...)` so the matching
-        // arm there walks only the tp-N variants. At nccl-disabled
-        // this expands to a single submission with `tp_world_size:
-        // 1u8` — byte-identical to the pre-fanout build.
+        // arm there walks only the tp-N variants. Only tp = 1 is
+        // emitted, so this expands to a single submission with
+        // `tp_world_size: 1u8`.
         #(#inventory_submits)*
 
         // One `BackboneDumpRegistration` per arch, fanning out over
@@ -3352,7 +2630,7 @@ fn emit_arch_dispatcher(
         // info` walks this registry separately, with no runtime GPU
         // or weight loading. Gated on either backend feature so the
         // metal CLI sees compiled-in metal arches too.
-        #[cfg(any(feature = "cuda", feature = "metal"))]
+        #[cfg(feature = "metal")]
         ::scratchy_forward_compiler::inventory::submit! {
             ::scratchy_forward_compiler::BackboneDumpRegistration {
                 arch_name: #arch_name_lit,
@@ -3364,7 +2642,6 @@ fn emit_arch_dispatcher(
         // `quantizations.json` has no `"ggml"` entry; otherwise one
         // `scratchy_quantizations::gguf::register! { ... }` block. All per-arch GGUF
         // data flows through `quantizations.json`.
-        #gguf_register_emit
     })
 }
 
@@ -3392,19 +2669,7 @@ fn pascal_case(ident: &Ident) -> Ident {
 /// observability surface that catches a real regression — if the
 /// FUF lowering or fusion logic changes the tile count, the test
 /// `assert_eq!(llama_3_2_1b::NUM_TILES, 243)` fires.
-///
-/// Per-bucket `m_X[_sk_Y]::{NUM_SUBGRAPHS, NUM_WAVES, PREDICTED_US}`
-/// modules used to live here too — they were brittle (PREDICTED_US
-/// drifts every time `target_profiles/*.csv` is regenerated; the
-/// other two were probed without an assertion). The test invariant
-/// they really cared about (prefill cost ≫ decode cost) lives in
-/// `solver::tests` now, calling `solve()` directly. ~9k lines off
-/// cargo expand workspace-wide.
-fn emit_model_stub_items(
-    fuf: &fuf::Fuf,
-    _sfufs: &crate::assignment::WorkloadAssignments,
-    _loops: &schedule::WorkloadLoops,
-) -> proc_macro2::TokenStream {
+fn emit_model_stub_items(fuf: &fuf::Fuf) -> proc_macro2::TokenStream {
     let num_tiles = fuf.len();
     quote! {
         pub const NUM_TILES: usize = #num_tiles;
@@ -3632,7 +2897,7 @@ mod tests {
             }
         }
         // All four share every other dedup key (bounds, scalars,
-        // rope, SFUF) and differ only in the q-sig — exactly the
+        // rope, workload points) and differ only in the q-sig — exactly the
         // qwen3 case the bug surfaced on.
         let solved = vec![
             Fake {

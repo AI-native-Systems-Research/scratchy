@@ -57,37 +57,7 @@ impl BlockKind {
 /// Sparse map of block index to [`BlockKind`] for span-aware block hashing.
 pub type BlockAnnotations = BTreeMap<usize, BlockKind>;
 
-/// Compute per-block RoPE rotation flags for a single block.
-///
-/// Returns `(is_relocatable, is_unrotated)`:
-/// - `is_relocatable`: true if the block is annotated as [`BlockKind::Relocatable`].
-///   Post-attention un-rotation will remove RoPE from this block.
-/// - `is_unrotated`: true if the block was written in a prior step (its K is
-///   currently stored without RoPE). Pre-attention rotation will apply RoPE.
-///
-/// `block_idx`: logical block index in the sequence.
-/// `block_size`: tokens per block.
-/// `seq_len`: total sequence length.
-/// `tokens_before`: number of tokens computed before this step.
-pub fn compute_block_flags(
-    annotations: &BlockAnnotations,
-    block_idx: usize,
-    _block_size: usize,
-    _seq_len: usize,
-    _tokens_before: usize,
-) -> (bool, bool) {
-    let is_relocatable = annotations
-        .get(&block_idx)
-        .is_some_and(BlockKind::is_relocatable);
-    // NOTE: is_unrotated is always false because there is no post-attention
-    // inverse-RoPE pass. K values in the cache are always stored WITH RoPE
-    // from the QKV projection. Setting is_unrotated=true would cause the
-    // attention kernel to double-rotate K on reuse, destroying attention.
-    let is_unrotated = false;
-    (is_relocatable, is_unrotated)
-}
-
-/// Metal spans (rope-on-read) variant of [`compute_block_flags`].
+/// Per-block RoPE flags for metal spans (rope-on-read).
 ///
 /// Returns `(is_relocatable, is_unrotated)` where **`is_unrotated ==
 /// is_relocatable`**: under rope-on-read, a `BlockKind::Relocatable`
@@ -95,12 +65,6 @@ pub fn compute_block_flags(
 /// paged attention kernels re-rope it to each reader's position on read.
 /// So a relocatable block IS an unrotated block — the flag the metal KV
 /// pool mirrors to the GPU (`block_is_unrotated`) for the kernels' gate.
-///
-/// This is DISTINCT from [`compute_block_flags`], which is consumed by
-/// the CUDA worker's rotate-on-write design (K stored WITH RoPE,
-/// `is_unrotated` always false) and MUST stay byte-identical — hence a
-/// separate function rather than a parameter on the shared one. Only the
-/// metal worker calls this.
 pub fn compute_block_flags_rope_on_read(
     annotations: &BlockAnnotations,
     block_idx: usize,
@@ -514,7 +478,7 @@ pub struct Request {
     pub cache_breakpoints: Vec<u32>,
 
     /// ⭐ WHAT THE WORKER'S KV LOOKS LIKE FOR THIS REQUEST — reported back every step by backends whose
-    /// keys do not sit at their token positions, and `None` for the ones where they do (cuda/metal).
+    /// keys do not sit at their token positions, and `None` for the ones where they do (metal).
     ///
     /// Two things depend on it, and both are wrong-output bugs when it is missing on a backend that
     /// needs it:
@@ -870,107 +834,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // compute_block_flags tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_block_flags_unannotated_block() {
-        // No annotations → never flagged, regardless of position or timing.
-        let ann = BTreeMap::new();
-        let (is_reloc, is_unrot) = compute_block_flags(&ann, 0, 16, 64, 32);
-        assert!(!is_reloc);
-        assert!(!is_unrot);
-    }
-
-    #[test]
-    fn test_block_flags_relocatable_freshly_written() {
-        // Relocatable block written THIS step: is_relocatable=true,
-        // is_unrotated=false (K has RoPE from QKV projection).
-        let mut ann = BTreeMap::new();
-        ann.insert(0, BlockKind::Relocatable { first_token: 0 });
-        // block 0, block_size=4, seq_len=8, tokens_before=0 (all new)
-        let (is_reloc, is_unrot) = compute_block_flags(&ann, 0, 4, 8, 0);
-        assert!(is_reloc);
-        assert!(!is_unrot); // freshly written → still has RoPE
-    }
-
-    #[test]
-    fn test_block_flags_relocatable_previously_cached() {
-        // ⛔ CACHE STATE DOES NOT MOVE `is_unrotated` — there is no post-attention inverse-RoPE pass, so K
-        // in the cache always carries the RoPE the QKV projection gave it, prior step or not. This test
-        // asserted the opposite (`is_unrot` on a cached block) and encoded the rotate-on-read design that
-        // `compute_block_flags` deliberately does NOT implement; `compute_block_flags_rope_on_read` is where
-        // `is_unrotated == is_relocatable` holds, and only metal calls it.
-        let mut ann = BTreeMap::new();
-        ann.insert(0, BlockKind::Relocatable { first_token: 0 });
-        // block 0, block_size=4, seq_len=8, tokens_before=4 (block 0 fully cached)
-        let (is_reloc, is_unrot) = compute_block_flags(&ann, 0, 4, 8, 4);
-        assert!(is_reloc);
-        assert!(
-            !is_unrot,
-            "cached or fresh, rotate-on-write K is never unrotated"
-        );
-    }
-
-    #[test]
-    fn test_block_flags_prefixed_never_flagged() {
-        // Prefixed blocks are NOT Relocatable — they should never be
-        // flagged for rotation, regardless of cache state.
-        let mut ann = BTreeMap::new();
-        ann.insert(2, BlockKind::Prefixed { first_token: 0 });
-        let (is_reloc, is_unrot) = compute_block_flags(&ann, 2, 4, 16, 12);
-        assert!(!is_reloc);
-        assert!(!is_unrot);
-    }
-
-    #[test]
-    fn test_block_flags_mixed_annotations() {
-        // Sequence: [Relocatable, Relocatable, Prefixed]
-        // All previously cached (tokens_before covers all).
-        let mut ann = BTreeMap::new();
-        ann.insert(0, BlockKind::Relocatable { first_token: 0 });
-        ann.insert(1, BlockKind::Relocatable { first_token: 0 });
-        ann.insert(2, BlockKind::Prefixed { first_token: 0 });
-
-        let block_size = 4;
-        let seq_len = 12;
-        let tokens_before = 12; // all cached
-
-        // Block 0: Relocatable — flagged relocatable, NEVER unrotated (see the cached-block test above).
-        let (r, u) = compute_block_flags(&ann, 0, block_size, seq_len, tokens_before);
-        assert!(r);
-        assert!(!u);
-
-        // Block 1: Relocatable — same.
-        let (r, u) = compute_block_flags(&ann, 1, block_size, seq_len, tokens_before);
-        assert!(r);
-        assert!(!u);
-
-        // Block 2: Prefixed → not flagged
-        let (r, u) = compute_block_flags(&ann, 2, block_size, seq_len, tokens_before);
-        assert!(!r);
-        assert!(!u);
-    }
-
-    #[test]
-    fn test_block_flags_partially_written_block() {
-        // Block is being written this step (block_end > tokens_before).
-        let mut ann = BTreeMap::new();
-        ann.insert(1, BlockKind::Relocatable { first_token: 0 });
-        // block 1 spans positions 4..8, tokens_before=6 → partially written
-        let (is_reloc, is_unrot) = compute_block_flags(&ann, 1, 4, 8, 6);
-        assert!(is_reloc);
-        assert!(!is_unrot); // not fully cached → freshly written
-    }
-
-    // -----------------------------------------------------------------------
     // compute_block_flags_rope_on_read (metal spans) tests
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_rope_on_read_flags_relocatable_is_unrotated() {
         // Rope-on-read: a Relocatable block is stored unrotated, so
-        // is_unrotated == is_relocatable == true (unlike the CUDA fn).
+        // is_unrotated == is_relocatable == true.
         let mut ann = BTreeMap::new();
         ann.insert(0, BlockKind::Relocatable { first_token: 0 });
         let (is_reloc, is_unrot) = compute_block_flags_rope_on_read(&ann, 0);
@@ -988,17 +858,5 @@ mod tests {
         assert!(!r0 && !u0);
         let (r1, u1) = compute_block_flags_rope_on_read(&ann, 1); // Prefixed
         assert!(!r1 && !u1);
-    }
-
-    #[test]
-    fn test_rope_on_read_does_not_change_cuda_fn() {
-        // Guard: the CUDA-consumed compute_block_flags still returns
-        // is_unrotated=false for a relocatable block (rotate-on-write).
-        let mut ann = BTreeMap::new();
-        ann.insert(0, BlockKind::Relocatable { first_token: 0 });
-        let (_, cuda_unrot) = compute_block_flags(&ann, 0, 4, 8, 0);
-        assert!(!cuda_unrot);
-        let (_, metal_unrot) = compute_block_flags_rope_on_read(&ann, 0);
-        assert!(metal_unrot); // metal path differs by design
     }
 }

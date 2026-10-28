@@ -7,7 +7,6 @@ description = "Benchmarking tools for vLLM Rust inference engine"
 
 [features]
 default = []
-cuda = ["scratchy-serving-api/cuda"]
 metal = ["scratchy-serving-api/metal"]
 # Parquet-backed RAG accuracy datasets (hotpotqa / multihop / msmarco).
 # Off by default so the ~18-crate arrow/parquet columnar subtree only

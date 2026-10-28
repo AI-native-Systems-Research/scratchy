@@ -10,7 +10,7 @@
 //! own `configs/<name>/`, and writes the emitted modules to
 //! `$OUT_DIR/<mod>.rs`, which `src/lib.rs` wraps in `pub mod <mod>` and
 //! `include!`s. The pipeline lib is a build-dependency; the backend feature
-//! (metal/cuda/…) is forwarded onto it so the emit matches what we then compile.
+//! (metal/spyre/…) is forwarded onto it so the emit matches what we then compile.
 use proc_macro2::{Group, Ident, Punct, Spacing, Span, TokenStream, TokenTree};
 use rayon::prelude::*;
 use scratchy_forward_compiler_macro::{compile_carrier, parse_python_file, render_tokens};
@@ -194,19 +194,8 @@ fn write_if_changed(out: &Path, text: &str) {
     }
 }
 
-/// Arches whose emit only compiles under cuda (no metal surface). Under a pure
-/// `--features metal` build we must NOT run their pipeline (it would emit metal
-/// code for ops metal doesn't implement). Kept in sync with src/lib.rs gates.
-const CUDA_ONLY: &[&str] = &[
-    "deepseek-v2",
-    "deepseek-v3",
-    "deepseek-v3-flat",
-    "gemma3-mm",
-];
-/// Arches whose emit only compiles under metal (no cuda surface — no ISel
-/// claims for their ops). Under a cuda build we must NOT run their pipeline
-/// (the solver would find tile claims missing and panic). Kept in sync with
-/// src/lib.rs gates.
+/// Arches whose emit only compiles under metal. Kept in sync with src/lib.rs
+/// gates.
 const METAL_ONLY: &[&str] = &[
     "gemma4-assistant",
     "glm4-moe",
@@ -220,6 +209,21 @@ const METAL_ONLY: &[&str] = &[
 /// Must agree with the arches `Cargo.toml`'s `spyre` feature enables; an arch listed there but not here
 /// is dropped by the `supported` gate below before its configs are read.
 const SPYRE_CAPABLE: &[&str] = &["llama", "granite", "gemma4", "gemma4-moe"];
+/// Arches the cuda backend lowers: every op of their prefill canonicals has a CUDA kernel. Each
+/// model of one emits its per-bucket `static` CUDA tapes (`CUDA_TAPES`).
+///
+/// Listed per arch, built per stem: not every config of a listed arch lowers. qwen3-5's
+/// `qwen3.5-0.8b-parity-tiny` has GEMMs of n = 128, off the bf16 GEMM's 256-column tile, so the
+/// arch-wide `model/qwen3-5` panics at build time naming that refusal; build `model/qwen3.5-0.8b`
+/// (CLAUDE.md asks for a per-stem build anyway). qwen3-5-moe's `qwen3.5-35b-a3b-parity-tiny`
+/// (hidden 128, head_dim 32) is refused the same way, so the arch-wide `model/qwen3-5-moe`
+/// panics too; build `model/qwen3.6-35b-a3b`. gemma4-moe's tiny configs (`-class-tiny`,
+/// `-parity-tiny*`: GEMMs off the tiles, head dims 64 and 128) are refused the same way, so the
+/// arch-wide `model/gemma4-moe` panics; build `model/gemma-4-26b-a4b-it`.
+///
+/// Must agree with src/lib.rs gates; an arch selected under `cuda` but not listed here is refused
+/// by name below rather than silently dropped.
+const CUDA_CAPABLE: &[&str] = &["qwen3-5", "qwen3-5-moe", "gemma4-moe"];
 
 /// A checkpoint config's identity for matching: its architecture and shape (hidden size, layers,
 /// vocab size; the text decoder's when `text_config` nests it).
@@ -318,7 +322,6 @@ fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     for name in [
-        "SCRATCHY_GPU",
         // Spyre/KTIR bundle knobs read at emit time by `dump_wavefront_mega`:
         // they bake the prefix cap, decode row count, and prefill width into the
         // embedded KTIR bundle, so a change must re-run this build script (which
@@ -342,9 +345,11 @@ fn main() {
     ] {
         println!("cargo:rerun-if-env-changed={name}");
     }
-    let cuda = std::env::var("CARGO_FEATURE_CUDA").is_ok();
     let metal = std::env::var("CARGO_FEATURE_METAL").is_ok();
     let spyre = std::env::var("CARGO_FEATURE_SPYRE").is_ok();
+    let cuda = std::env::var("CARGO_FEATURE_CUDA").is_ok();
+    // Every arch whose `arch-<name>` feature is on, whether or not a selected backend emits it.
+    let mut selected: Vec<String> = Vec::new();
 
     // Each arch is a `dsl/<arch>.py` DSL carrier paired with a
     // `configs/<arch>/` dir; emit the ones whose `arch-<name>` feature is on AND
@@ -392,17 +397,16 @@ fn main() {
             if std::env::var(format!("CARGO_FEATURE_ARCH_{}", envify(&arch))).is_err() {
                 return None;
             }
+            selected.push(arch.clone());
             // Backend gate: mirror the `pub mod <name>` cfg in src/lib.rs, so we
             // never run the pipeline for an arch whose mod won't be compiled.
-            let supported = if CUDA_ONLY.contains(&arch.as_str()) {
-                cuda
-            } else if METAL_ONLY.contains(&arch.as_str()) {
+            let supported = (if METAL_ONLY.contains(&arch.as_str()) {
                 metal
             } else if SPYRE_CAPABLE.contains(&arch.as_str()) {
-                cuda || metal || spyre
+                metal || spyre
             } else {
-                cuda || metal
-            };
+                metal
+            }) || (cuda && CUDA_CAPABLE.contains(&arch.as_str()));
             if !supported {
                 return None;
             }
@@ -481,6 +485,16 @@ fn main() {
     let unmatched = scratchy_forward_compiler_macro::unmatched_build_filter_tags();
     if !unmatched.is_empty() {
         panic!("SCRATCHY_BUILD_FILTER tag(s) matched no config in any arch: {unmatched:?}");
+    }
+
+    // Under `cuda`, a build that named models none of which the cuda backend lowers would
+    // otherwise reach the "no models selected" panic below, which blames the wrong thing.
+    if cuda && !selected.is_empty() && !selected.iter().any(|a| CUDA_CAPABLE.contains(&a.as_str()))
+    {
+        panic!(
+            "the cuda backend lowers none of the selected architectures \
+             (CUDA_CAPABLE = {CUDA_CAPABLE:?}); selected: {selected:?}"
+        );
     }
 
     // scratchy-models has no default model features (deliberately — see

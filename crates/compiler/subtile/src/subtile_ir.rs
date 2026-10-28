@@ -795,6 +795,76 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
         }
     }
 
+    /// The `(rows, cols)` of a two-output op's SECOND buffer, given its first output's `out` and
+    /// its operands' shapes (`operand(k)`, `k` below the op's arity); `None` for an op with one
+    /// output.
+    ///
+    /// `GateSplit`'s gate is the query's shape: both halves of the doubled `q_proj` row are
+    /// `[T, heads·head_dim]`. `VisionRope`'s k' is its k's (operand 1). The match lists every
+    /// variant with no wildcard, as a target's colour rule does, so a new two-output op states
+    /// its second shape here or does not compile.
+    pub fn second_output_shape(
+        &self,
+        out: (u32, u32),
+        operand: impl Fn(usize) -> (u32, u32),
+    ) -> Option<(u32, u32)> {
+        use SubOp as L;
+        match self {
+            L::GateSplit { .. } => Some(out),
+            L::VisionRope => Some(operand(1)),
+            L::MatmulTile { .. }
+            | L::SumReduce { .. }
+            | L::Reshape { .. }
+            | L::Elementwise(_)
+            | L::SiluMul
+            | L::ScalarMul { .. }
+            | L::RmsNorm { .. }
+            | L::RmsNormReduce { .. }
+            | L::RmsNormApply { .. }
+            | L::RopeRotate { .. }
+            | L::RopeAppend { .. }
+            | L::KvAppend { .. }
+            | L::AttnDecode { .. }
+            | L::TanhSoftCap { .. }
+            | L::RmsNormUnit { .. }
+            | L::ScalarWeightMul
+            | L::GateApply
+            | L::Concat { .. }
+            | L::GateScale
+            | L::LoadRows { .. }
+            | L::EmbeddingGather { .. }
+            | L::VarlenAttention { .. }
+            | L::EncoderAttn { .. }
+            | L::GatedDeltaNet
+            | L::Mamba2 { .. }
+            | L::Mean
+            | L::RouterNorm { .. }
+            | L::RouterLogits { .. }
+            | L::RouteSoftmax
+            | L::RouteSigmoidBias { .. }
+            | L::RouteBias { .. }
+            | L::RouteArgsort
+            | L::RouteTopK { .. }
+            | L::RouteGatherScores
+            | L::RouteScale { .. }
+            | L::RouteRenorm
+            | L::RouteExpertScale { .. }
+            | L::ExpertSort { .. }
+            | L::ExpertMatmul { .. }
+            | L::ExpertGatedAct { .. }
+            | L::ExpertAct { .. }
+            | L::ExpertUnsort
+            | L::ExpertCombine { .. }
+            | L::KvEncode { .. }
+            | L::KvStage { .. }
+            | L::RotateRows { .. }
+            | L::AttnPackedKv
+            | L::SampleRowsGather
+            | L::SampleRowsScatter
+            | L::AllRowsMatmul => None,
+        }
+    }
+
     /// [`Self::reroll_class_key`] with the weight STORAGE masked: two nodes hash equal iff they
     /// are the same program at any bit width / group size.
     ///
@@ -815,7 +885,7 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
                 proj,
                 n,
                 k,
-                quant: _,
+                weight: _,
                 bundle,
             } => {
                 std::mem::discriminant(self).hash(h);
@@ -869,9 +939,14 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
                 proj,
                 n,
                 k,
-                quant,
+                weight,
                 bundle,
-            } => (proj, n, k, quant.group().get(), quant.bits().get(), bundle).hash(h),
+            } => match weight {
+                crate::lower::ExpertWeight::Affine(quant) => {
+                    (proj, n, k, quant.group().get(), quant.bits().get(), bundle).hash(h)
+                }
+                crate::lower::ExpertWeight::Dense => (proj, n, k, bundle).hash(h),
+            },
             SubOp::ExpertGatedAct { act } => act.hash(h),
             SubOp::ExpertAct { act } => act.hash(h),
             SubOp::ExpertCombine { hidden, shared } => (hidden, shared).hash(h),
@@ -1290,12 +1365,13 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
         k: TopK,
         bundle: ExpertBundle,
     },
-    /// One projection of each pair's expert, `n` wide. `inputs` = `[rows, routing, experts]`.
+    /// One projection of each pair's expert, `n` wide. `inputs` = `[rows, routing, experts]`,
+    /// with a 4th, the bank's scale source, for an affine bank whose front end binds one.
     ExpertMatmul {
         proj: ExpertProj,
         n: u32,
         k: TopK,
-        quant: crate::lower::ExpertQuant,
+        weight: crate::lower::ExpertWeight,
         bundle: ExpertBundle,
     },
     /// `act(gate) * up` over the pair rows. `inputs` = `[gate, up]`.
@@ -2532,13 +2608,13 @@ pub fn lower_region(
                 proj,
                 n,
                 k,
-                quant,
+                weight,
                 bundle,
             } => SubOp::ExpertMatmul {
                 proj,
                 n,
                 k,
-                quant,
+                weight,
                 bundle,
             },
             SubOp::ExpertGatedAct { act } => SubOp::ExpertGatedAct { act },

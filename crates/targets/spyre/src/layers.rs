@@ -9,7 +9,7 @@
 //! Spyre is a HOST backend (fp16) — loading a weight is "read the bytes out of
 //! `GpuWeights<SpyreAllocator>` and construct the neutral struct". Every dense
 //! load is therefore allocator-generic: it delegates to the shared neutral free
-//! fns in `scratchy_layers::layers` (the same ones cuda/metal share) or builds
+//! fns in `scratchy_layers::layers` (the same ones metal uses) or builds
 //! the packed buffer through the allocator-generic `take_cpu` /
 //! `alloc_packed_from_host` host pipeline — no GPU kernels, no stream.
 //!
@@ -34,7 +34,7 @@ pub use scratchy_layers::layers::*;
 // The quant payload TYPES live in `scratchy-quantizations` (a neutral leaf,
 // NOT a `targets/` crate). Re-export them under `crate::__gpu::layers::…` so the
 // macro-emitted `AffineQuant*` / `Nvfp4Linear` constructor + field paths keep
-// resolving against the same type the cuda/metal arms use.
+// resolving against the same type the metal arms use.
 pub use scratchy_quantizations::{AffineQuantEmbedding, AffineQuantLinear, Nvfp4Linear};
 
 // ---------------------------------------------------------------------------
@@ -640,8 +640,8 @@ pub trait GatedDeltaNetOps: Sized {
 
 impl GatedDeltaNetOps for GatedDeltaNetLayer {
     /// Load the linear-attn bundle. Tensors keep their on-disk dtype except
-    /// `norm.weight` (upcast to f32) — same neutral logic the cuda/metal arms
-    /// share.
+    /// `norm.weight` (upcast to f32) — same neutral logic the metal arms
+    /// use.
     fn load(weights: &mut GpuWeights, prefix: &str) -> Result<Self> {
         scratchy_layers::layers::gated_delta_net_load(weights, prefix)
     }

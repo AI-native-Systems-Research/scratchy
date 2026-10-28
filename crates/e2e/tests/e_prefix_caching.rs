@@ -8,7 +8,6 @@
 //! prefix lookup) → worker (token slicing) → model → response.
 //!
 //! MLX tests use `device=metal` with the worker-level prefix cache pool.
-//! CUDA tests use `device=cuda` with paged KV cache.
 //!
 //! Run with: `cargo test -p vllm-e2e --features e2e --test e_prefix_caching -- --ignored`
 

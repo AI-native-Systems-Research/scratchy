@@ -17,7 +17,6 @@ pub mod baked_tokenizer;
 pub mod embedding;
 pub mod hub;
 pub mod lora;
-pub mod process_group;
 pub mod tensor;
 pub mod weight;
 

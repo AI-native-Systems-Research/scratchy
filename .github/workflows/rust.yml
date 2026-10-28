@@ -22,89 +22,38 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Linux / amd64 — CUDA backend.
+  # Linux / amd64 — whole-workspace lint (spyre backend).
   #
   # The workspace can't build featureless (the layer `load(&mut GpuWeights)`
-  # methods consume a backend allocator), and `vllm-cuda` hard-depends on
-  # `cudarc` (nvcc), so a GPU backend feature is required. We install only the
-  # nvcc + cudart sub-packages via the network installer and cache them.
-  #
-  # Compile + lint only where a GPU is required: the hosted runner has none, so
-  # kernel tests can't run here. What needs no GPU is tested — see the
-  # bench-harness steps at the end of the job.
+  # methods consume a backend allocator), and metal is Apple-only, so this job
+  # lints every Linux-buildable member under `spyre`. The runner has no Spyre
+  # card, so nothing here runs on hardware. What needs no hardware is tested —
+  # see the steps after the clippy.
   #
   # linux-arm64 is intentionally absent: nothing this job covers branches on
   # architecture. The bench harness is the case in point — six `target_os` cfgs
   # and zero `target_arch` ones, because the axis that divides it is Linux vs
-  # macOS, and both sides already have a job. CUDA has no aarch64 story in this
-  # build either, so a fifth job would re-run identical tests on identical code.
+  # macOS, and both sides already have a job.
   # ---------------------------------------------------------------------------
-  linux-cuda:
-    name: linux-amd64 (cuda)
+  linux-workspace:
+    name: linux-amd64 (workspace)
     runs-on: ubuntu-latest
-    # The runner has no GPU, so codegen can't probe `nvidia-smi` for the
-    # target SM. Pin it explicitly (H100 = SM90): SCRATCHY_GPU for
-    # codegen, CUDA_COMPUTE_CAP for the cuda build script.
-    #
-    # SCRATCHY_SKIP_CUDA_KERNELS skips scratchy-builder-cuda's nvcc compile
-    # (cutlass + FlashAttention-3 + flashinfer) — tens of minutes and several
-    # GB of RAM that OOM the runner. check/clippy don't link the kernels, so
-    # the full Rust surface still type-checks. The kernels can't run here
-    # anyway (no GPU); they're validated on real hardware.
     env:
-      SCRATCHY_GPU: h100
-      CUDA_COMPUTE_CAP: "90"
-      SCRATCHY_SKIP_CUDA_KERNELS: "1"
-      # Same idea for the spyre side: `--workspace` also builds
-      # scratchy-target-spyre (and its flex-rs path dep), whose build script
-      # compiles C++ against the IBM Spyre SDK headers. The runner has no SDK,
-      # so skip the C++ shim compile — check/clippy don't link it. This is the
-      # escape hatch that build script documents for exactly this case.
+      # `--workspace` builds scratchy-target-spyre (and its flex-rs path dep),
+      # whose build script compiles C++ against the IBM Spyre SDK headers. The
+      # runner has no SDK, so skip the C++ shim compile — check/clippy don't
+      # link it. This is the escape hatch that build script documents for
+      # exactly this case.
       SCRATCHY_SKIP_SENDNN_CXX: "1"
     steps:
       - uses: actions/checkout@v7
-
-      - name: Cache CUDA toolkit
-        uses: actions/cache@v6
-        with:
-          path: /usr/local/cuda-12.6
-          key: ${{ runner.os }}-cuda-12.6
-
-      # Gate the install on whether nvcc actually exists on disk, not on the
-      # cache-hit flag: a partial/empty cache entry (common under `act`) reports
-      # a hit but leaves no toolkit, so a flag-based skip would never install it.
-      - name: Probe CUDA toolkit
-        id: cuda
-        run: |
-          if [ -x /usr/local/cuda-12.6/bin/nvcc ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Install CUDA toolkit
-        if: steps.cuda.outputs.present != 'true'
-        uses: Jimver/cuda-toolkit@v0.2.36
-        with:
-          cuda: "12.6.0"
-          method: "network"
-          sub-packages: '["nvcc", "cudart"]'
-
-      # The cuda-toolkit action only puts nvcc on PATH and sets CUDA_PATH when
-      # it actually runs; when the install is skipped the env is left unset.
-      # Export them explicitly so `cudarc`'s build script (`nvcc --version`)
-      # finds the toolkit on every run.
-      - name: Export CUDA toolkit env
-        run: |
-          echo "/usr/local/cuda-12.6/bin" >> "$GITHUB_PATH"
-          echo "CUDA_PATH=/usr/local/cuda-12.6" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          key: linux-cuda
+          key: linux-workspace
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Clippy is a superset of `cargo check`, so we run only clippy. The
@@ -112,7 +61,7 @@ jobs:
       # compile on Linux — exclude them.
       #
       # BOTH of them: every consumer's edge to metal is already `optional` and
-      # gated on a `metal` feature, so `-Fcuda` pulls in neither via the
+      # gated on a `metal` feature, so `-Fspyre` pulls in neither via the
       # dependency graph. `--workspace` is what reaches them — it builds every
       # MEMBER as its own root, before features are ever consulted. Listing
       # only `scratchy-target-metal` left `scratchy-target-metal-compiler` (a
@@ -120,53 +69,59 @@ jobs:
       # depends unconditionally on `scratchy-target-metal`, so `objc2` came
       # back in through the side door.
       #
-      # `mtp` compiles the multi-token-prediction head of every model in `all`
-      # whose checkpoint carries one (heads have no configs of their own).
+      # One model, not `scratchy-models/all`: under `spyre` the build script
+      # bakes a card bundle for every selected config, and some spyre-capable
+      # configs (llama-2-13b, a gemma-4 MoE) don't lower to the card yet, so
+      # `all` panics at bake. Every arch's forward is linted by the macOS job;
+      # granite is the one the card builds use.
       - name: Clippy
-        run: cargo clippy --workspace --features cuda,scratchy-models/all,scratchy-models/mtp
+        run: cargo clippy --workspace --features spyre,scratchy-models/granite-3.1-8b-instruct
           --exclude scratchy-target-metal
           --exclude scratchy-target-metal-compiler
           -- -D warnings
 
-      # Multi-node tensor parallelism (the TCP control plane + NCCL bootstrap
-      # in serving-api/-worker) compiles only under `nccl`, which the clippy
-      # above never enables. Its own step, not a feature added above: `nccl`
-      # changes the forward macro's codegen and has `not(nccl)` paths of its
-      # own, so swapping it in would drop coverage, and every model expanded
-      # twice would double that step. One small model is the whole Rust
-      # surface here. `--all-targets` lints both crates' test builds too (the
-      # tests themselves run featureless, below: a `cuda` test binary can't
-      # link without the kernels SCRATCHY_SKIP_CUDA_KERNELS skips). The model
-      # feature resolves through the worker's dependency, so scratchy-models
-      # is built, not selected: its own test targets stay out of this step.
-      - name: Clippy (nccl)
-        run: cargo clippy -p scratchy-serving-api -p scratchy-serving-worker --all-targets
-          --features scratchy-serving-api/nccl,scratchy-models/smollm2-135m
-          -- -D warnings
-
-      # The e2e tests' cuda half, type-checked and linted: the macOS e2e step
-      # compiles their cuda-only files empty, and the workspace clippy above has
-      # no `--tests`, so no other step builds them. `otel` is on so e_otel.rs,
-      # which needs it and runs on any backend, compiles too: here rather than
-      # on macOS, whose tests job is the longer one. `--keep-going` reports
-      # every failing test target, not just those in flight at the first failure.
-      - name: Lint the cuda e2e tests
+      # e_otel.rs, which needs `otel` and runs on any backend, type-checked
+      # and linted: the macOS e2e step builds without `otel`. Here rather than
+      # on macOS, whose tests job is the longer one. Under spyre, the backend
+      # this job builds, at the clippy step's model.
+      - name: Lint the otel e2e test
         run: cargo clippy -p scratchy-e2e -p scratchy-models
-          --features e2e,cuda,otel,scratchy-models/smollm2-135m
-          --tests --keep-going -- -D warnings
+          --features e2e,spyre,otel,scratchy-models/granite-3.1-8b-instruct
+          --test e_otel -- -D warnings
 
       # scratchy-cli's own test targets (its unit tests and
       # tests/arch_feature_passthrough.rs), type-checked and linted: no other
       # step builds them. None is backend-specific, so they're linted here
       # rather than on macOS, whose tests job is the longer one.
       - name: Lint scratchy-cli's test targets
-        run: cargo clippy -p scratchy-cli --features cuda,claude,model/smollm2-135m
+        run: cargo clippy -p scratchy-cli --features spyre,claude,model/granite-3.1-8b-instruct
           --all-targets -- -D warnings
+
+      # The CUDA scaffold: no nvcc, no GPU. Lints the target crates and the
+      # macro under `cuda`, runs the lowering tests, and expands qwen3.5-0.8b
+      # and qwen3.5-9b (`qwen3.5-9b-text-only`: the bare stem selects the
+      # vision arch), Qwen3.6-35B-A3B (the MoE block, #841) and Gemma 4
+      # 26B-A4B (two attention classes, #885) to their static CUDA tapes,
+      # checked against what CUDA's compiler lowers.
+      - name: CUDA scaffold (no toolchain)
+        run: |
+          cargo clippy -p scratchy-target-cuda -p scratchy-target-cuda-compiler --all-targets -- -D warnings
+          cargo clippy -p scratchy-forward-compiler-macro --features cuda -- -D warnings
+          cargo clippy -p scratchy-models --features cuda,qwen3.5-0.8b --all-targets -- -D warnings
+          cargo clippy -p scratchy-models --features cuda,qwen3.5-9b-text-only --all-targets -- -D warnings
+          cargo clippy -p scratchy-models --features cuda,qwen3.6-35b-a3b --all-targets -- -D warnings
+          cargo clippy -p scratchy-models --features cuda,gemma-4-26b-a4b-it --all-targets -- -D warnings
+          cargo test -p scratchy-target-cuda -p scratchy-target-cuda-compiler
+          cargo test -p scratchy-target-cuda --test kernels_use_thunderkittens
+          cargo test -p scratchy-models --features cuda,qwen3.5-0.8b --test cuda_tapes
+          cargo test -p scratchy-models --features cuda,qwen3.5-9b-text-only --test cuda_tapes_9b
+          cargo test -p scratchy-models --features cuda,qwen3.6-35b-a3b --test cuda_tapes_35b
+          cargo test -p scratchy-models --features cuda,gemma-4-26b-a4b-it --test cuda_tapes_gemma4
 
       # The multi-node control plane, the rank rendezvous and the channel
       # that carries `ControlMessage` to followers, is plain TCP + serde: no
-      # backend, no GPU. Only NCCL's own collectives need the hardware.
-      # Featureless, these are the same crate builds the bench steps use.
+      # backend, no hardware. Featureless, these are the same crate builds the
+      # bench steps use.
       - name: Multi-node control plane tests (no backend feature)
         run: cargo test -p scratchy-serving-transport -p scratchy-serving-worker
           --lib -- tcp_store multinode
@@ -198,7 +153,7 @@ jobs:
       # Hence a `-p`-scoped step instead.
       #
       # No backend feature, deliberately. scratchy-bench is `default = []` with
-      # `cuda`/`metal` as pure pass-throughs to scratchy-serving-api and no
+      # `metal` as a pure pass-through to scratchy-serving-api and no
       # backend cfg of its own, so the one feature that changes what compiles
       # is `datasets` (the parquet RAG subcommands), and neither side of it
       # needs a GPU. Each side has code only it compiles: featureless, the arm
@@ -300,9 +255,9 @@ jobs:
   # macOS / arm64 — Metal backend.
   #
   # `scratchy-models` (built here with `all-arches`) is the umbrella that
-  # compiles the whole Metal inference stack plus every per-arch model crate. The full
-  # `--workspace` is not buildable here because cuda-only crates (vllm-cuda)
-  # require nvcc. The runner has a real Apple GPU, so kernel tests run.
+  # compiles the whole Metal inference stack plus every per-arch model crate.
+  # The Linux-only workspace members are linted by linux-workspace. The runner
+  # has a real Apple GPU, so kernel tests run.
   #
   # macos-26 (Tahoe) is required: the metal kernels target Metal 4 and the
   # `scratchy-target-metal` build script compiles shaders against the
@@ -464,11 +419,11 @@ jobs:
       # GPU. This runner's paravirtual GPU has none, so each test would return
       # early (`skip_if_no_gpu!`) and pass without running. What CI can check
       # here is that the files compile and lint clean; run them on a real GPU.
-      # `--tests` type-checks every e2e test target (a cuda-only file compiles
-      # empty here), and, since `-p scratchy-models` is what names the model,
-      # scratchy-models' own lib and integration tests at that model. e_otel.rs
-      # and scratchy-cli's test targets are linted in the cuda job. `--keep-going`
-      # as in the cuda e2e lint.
+      # `--tests` type-checks every e2e test target, and, since `-p
+      # scratchy-models` is what names the model, scratchy-models' own lib and
+      # integration tests at that model. e_otel.rs and scratchy-cli's test
+      # targets are linted in the linux-workspace job. `--keep-going` reports
+      # every failing test target, not just those in flight at the first failure.
       - name: Lint the metal e2e tests
         run: cargo clippy -p scratchy-e2e -p scratchy-models
           --features e2e,metal,scratchy-models/smollm2-135m
@@ -483,7 +438,7 @@ jobs:
   #
   # ktir-emulator's `blis`/`mkl`/`openblas` features (the real IBM Spyre
   # deployment's BLAS choices, run on Linux) are otherwise never built or
-  # tested anywhere: linux-cuda only compiles ktir-emulator with default
+  # tested anywhere: linux-workspace only compiles ktir-emulator with default
   # (no-BLAS) features, and on the macOS jobs its `[target.'cfg(target_os =
   # "macos")'.dependencies.blas-src]` block is unconditional (always
   # Accelerate) — selecting `openblas`/`mkl` there collides with it. This job
@@ -530,7 +485,7 @@ jobs:
   # job documents.
   #
   # The re-hosted triton crates (frontend, ktir, ktir-superdsc, numeric, splice)
-  # are pure Rust — no hardware — but the linux-cuda job's workspace clippy has
+  # are pure Rust — no hardware — but the linux-workspace job's clippy has
   # no `--all-targets`, so nothing else in CI compiled their tests or examples:
   # the 141 ktir tests, the stale-golden pins PROVENANCE.md leans on, and the
   # splice's own cache-probe example were all local-only until this step. A
@@ -565,12 +520,17 @@ jobs:
         run: cargo clippy -p scratchy-target-spyre -p flex-rs --features scratchy-target-spyre/spyre-hw -- -D warnings
       - name: Test (spyre triton golden + emu execution)
         run: cargo test -p scratchy-target-spyre --features spyre-emu --lib --tests
-      # The worker's spyre modules compile under no other CI job (the linux-cuda
-      # workspace steps build the worker with default features only), so their
-      # unit tests run here on the emu stack this job already builds — including
-      # the decode-routing predicate that keeps 1-token slices of unfinished
-      # prompts out of batched decode. A model feature must be named (zero-model
-      # is a build-time panic); granite is the one the card builds use.
+      # The worker's spyre modules compile under no other CI job:
+      # linux-workspace builds plain `spyre`, which carries no spyre worker
+      # runtime (that needs an executor: `spyre-emu` or `spyre-hw`). So they
+      # are linted and their unit tests run here, on the emu stack this job
+      # already builds — including the decode-routing predicate that keeps
+      # 1-token slices of unfinished prompts out of batched decode. A model
+      # feature must be named (zero-model is a build-time panic); granite is
+      # the one the card builds use.
+      - name: Clippy (spyre worker, all targets)
+        run: cargo clippy -p scratchy-serving-worker --all-targets
+          --features spyre-emu,scratchy-models/granite-3.1-8b-instruct -- -D warnings
       - name: Test (spyre worker unit tests)
         run: cargo test -p scratchy-serving-worker
           --features spyre-emu,scratchy-models/granite-3.1-8b-instruct --lib
@@ -582,7 +542,7 @@ jobs:
           --features spyre-emu,scratchy-models/llama-3.2-1b --all-targets -- -D warnings
       # The spyre-side ktir-superdsc and spyre-bundle crates' TEST targets compile
       # under no other CI step: this job's clippy above is -p scratchy-target-spyre,
-      # the triton clippy below is the five re-host crates, and the linux-cuda job's
+      # the triton clippy below is the five re-host crates, and the linux-workspace job's
       # workspace clippy has no --all-targets, so workspace members' test builds
       # never happen there. #714's dangling `Df::Fp8` sat in exactly that gap (the
       # import deleted with MatmulStaging, the usage left in

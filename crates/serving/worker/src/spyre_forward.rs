@@ -1738,6 +1738,7 @@ pub(crate) fn forward_chunk(
     // `superdsc_forward_chunk`'s chunk paths (see `run_request_step`, where it is built).
     pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
 ) -> ExecutorResult<ChunkOut> {
+    let ChunkRequest { req, id, tokens } = rq;
     {
         let SendnnSession::SuperDsc(sb) = session;
         // Split the borrow: the prompt runs through the m=N `prefill` session (if present),

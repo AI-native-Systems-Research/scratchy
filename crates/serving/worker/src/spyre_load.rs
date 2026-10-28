@@ -804,7 +804,7 @@ impl SpyreWorker {
 
         // Load on-disk weights into a host GpuWeights, then resolve the compiled
         // arch through scratchy's registry (fingerprint) — exactly like the
-        // cuda/metal workers. NO stem-glob, NO ~/.cache read: the matched
+        // metal worker. NO stem-glob, NO ~/.cache read: the matched
         // ScratchyWeights carries the macro-embedded KTIR bundle.
         let _t_gw = std::time::Instant::now();
         let mut gw = GpuWeights::from_dir(&model_dir, SpyreAllocator::new())
@@ -834,7 +834,7 @@ impl SpyreWorker {
         // Fetch the embedded KTIR bundle (spyre's forward representation) for THIS
         // checkpoint — READ-ONLY (fingerprint sniff), leaving every tensor in `gw`
         // for the destructive byte extraction below. spyre's typed `Weights::load`
-        // is real (it builds the same fielded struct cuda/metal do), but the KTIR
+        // is real (it builds the same fielded struct metal does), but the KTIR
         // runner streams raw weights, so the worker takes spyre's forward path
         // here instead. The fingerprint (`gw` shapes + `hf_fp`) discriminates
         // variants: an arch registers many distinct base models (llama-2-13b …
@@ -850,7 +850,7 @@ impl SpyreWorker {
         // bundle could come from one and the weights from another.
         //
         // `try_load` runs the GENERATED `Weights::load` — the same loader
-        // cuda/metal use — and the bundle, the weight binding and the embed
+        // metal uses — and the bundle, the weight binding and the embed
         // table are all read off THAT model.
         let _t_try = std::time::Instant::now();
         let model = scratchy_forward_compiler::try_load(
@@ -1210,11 +1210,10 @@ impl SpyreWorker {
                 // and every request takes the per-request path (~93 µs of launch each) — correct output,
                 // much slower.
                 //
-                // ⭐⭐ SO IT IS REPORTED AS A CAP AND THE SCHEDULER IS HELD TO IT — the cuda rule.
-                // cuda refuses no `max_num_seqs`: it derives its captured-graph ladder FROM it
-                // (`auto_capture_sizes(max_num_seqs)`), so its fast path always covers the configured
-                // concurrency. A BAKED ladder cannot grow to meet the flag, so this backend holds the same
-                // invariant from the other end via `Worker::max_num_seqs_override`. A bare `scr serve` and
+                // ⭐⭐ SO IT IS REPORTED AS A CAP AND THE SCHEDULER IS HELD TO IT. No backend refuses a
+                // `max_num_seqs`, and the fast path should always cover the configured concurrency. A
+                // BAKED ladder cannot grow to meet the flag, so this backend holds that invariant from
+                // the other end via `Worker::max_num_seqs_override`. A bare `scr serve` and
                 // an explicit `--max-num-seqs 256` then behave IDENTICALLY (both 32-wide, batched), which
                 // the refusal made incoherent: it rejected the explicit spelling of the very default it
                 // was silently substituting.
@@ -1263,11 +1262,9 @@ impl SpyreWorker {
                 // placeholder and repeated the bug.
                 //
                 // ⭐ AND THE FORMULA IS THE SHARED ONE, NOT A THIRD SPELLING OF IT.
-                // `scratchy_serving_engine::gpu_budget::compute_available_kv_bytes` is documented
-                // "backend-neutral ... shared by the CUDA and Metal Worker implementations" and lives in a
-                // crate this file already depends on. cuda calls it; metal calls it; spyre had a constant.
-                // Three backends, one law, and the only one that opted out is the one that then could not
-                // start.
+                // `scratchy_serving_engine::gpu_budget::compute_available_kv_bytes` is the backend-neutral
+                // budget law and lives in a crate this file already depends on. Metal calls it; spyre had a
+                // constant, and the one that opted out is the one that then could not start.
                 //
                 // ⭐⭐⭐ THE POOL'S OWN DEMAND, DERIVED ONCE, HERE — above the budget on purpose: the
                 // census below needs it (the prefill anchor's spare includes a SECOND pool exactly

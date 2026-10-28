@@ -491,7 +491,7 @@ impl SuperDscBundle {
 // The pages a request holds now come from `NewRequestData::block_ids` / `CachedRequestData::new_block_ids`
 // through [`BlockTable`], whose only constructor takes host ids. With no free-list search left there is
 // nothing to derive a held-set FOR, and a page two requests share stops being unrepresentable and starts
-// being the ordinary case — which is what a block table has always been on metal and cuda.
+// being the ordinary case — which is what a block table has always been on metal.
 
 // ⛔⛔⛔ THERE IS NO `free_row` EITHER, AND ITS ABSENCE IS THE SAME LOCK ONE LEVEL UP.
 //
@@ -626,7 +626,7 @@ pub(crate) struct ReqState {
     //
     // "Positions already forwarded" is this request's TOKEN count, hence its RoPE position, and the engine's
     // store has held exactly that number for every backend since before this worker used it — seeded at
-    // admission from the scheduler's `num_computed_tokens` and advanced by `commit_step` on cuda/metal. This
+    // admission from the scheduler's `num_computed_tokens` and advanced by `commit_step` on metal. This
     // path does not call `commit_step` (it chunks its own prefill and knows how far it got only after the
     // loop), so it writes through `set_tokens_in_pool` instead. One store, one writer per step.
     //

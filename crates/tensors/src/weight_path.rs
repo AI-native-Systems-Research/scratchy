@@ -3,7 +3,7 @@
 //!
 //! Pure `String`-building helpers shared by the forward-compiler codegen and the
 //! per-target layered-load helpers. They live in the universal leaf crate so
-//! both `targets/{cuda,metal}` and the compiler can name them without a
+//! both `targets/{metal,spyre}` and the compiler can name them without a
 //! dependency cycle (metal cannot depend on the compiler).
 
 /// Multimodal-aware decoder layered key. `root` is the per-arch

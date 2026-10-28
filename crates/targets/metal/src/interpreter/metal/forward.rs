@@ -391,7 +391,7 @@ impl InFlight {
 /// Returns `[n_tokens, rot_dim]` rows in `dtype` (the rope kernel's
 /// element type), laid out `[cos(0..half) | sin(half..rot_dim)]` per row —
 /// byte-identical to a single row of the static
-/// `scratchy_target_cuda::rotary::RotaryCache` cos/sin cache, so binding it
+/// `scratchy_layers::rotary::RotaryCache` cos/sin cache, so binding it
 /// in place of that cache (with `positions[t] = t`) is a no-op for the
 /// kernel math. The angle math is
 /// `RotaryCache::new_partial_from_gpuweights`'s

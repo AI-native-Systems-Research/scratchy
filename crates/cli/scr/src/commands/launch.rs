@@ -615,18 +615,18 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
     // (full system prompt + tool schemas, easily 10k+ tokens) can take tens of
     // seconds per turn — long enough to hit the engine's 60s no-progress abort
     // before the first token.
-    // A build with no compiled GPU backend (neither `cuda` nor `metal`) runs on
-    // CPU. macOS no longer auto-enables metal — you build `--features metal`
-    // explicitly, same as cuda on Linux — so the CLI crate's own `metal` feature
-    // is an accurate signal here on every platform.
-    let no_gpu_backend = !cfg!(feature = "cuda") && !cfg!(feature = "metal");
+    // A build with no compiled GPU backend (no `metal`) runs on CPU. macOS no
+    // longer auto-enables metal — you build `--features metal` explicitly — so
+    // the CLI crate's own `metal` feature is an accurate signal here on every
+    // platform.
+    let no_gpu_backend = !cfg!(feature = "metal");
     if args.server_url.is_none()
         && (args.device == "cpu" || (args.device == "auto" && no_gpu_backend))
     {
         eprintln!(
             "Warning: no GPU backend is compiled into this binary, so the server will run on \
-             CPU and may be very slow. Rebuild with `--features metal` (Mac) or `--features \
-             cuda` and run that binary, or pass --device <metal|cuda:N> if your build supports it."
+             CPU and may be very slow. Rebuild with `--features metal` (Mac) and run that \
+             binary, or pass --device metal if your build supports it."
         );
     }
 

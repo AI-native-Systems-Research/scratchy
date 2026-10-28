@@ -137,7 +137,7 @@ the evidence, and `major_faults` is not gated on.** That ordering is deliberate:
 
 `ru_majflt` only counts faults on *memory-mapped* pages, and on Linux readahead
 plus fault-around will satisfy a sequential scan of a fully-evicted mmap'd file
-from within a single major fault. Measured on an H100 node: a `Cached` drop of
+from within a single major fault. Measured on a Linux H100 node: a `Cached` drop of
 511,560 kB for a 512,000 kB file — a 99.9% eviction — produced `majflt=1`, against
 `majflt=0` warm. Gating on `1 > 0` would be gating on noise, and tightening the
 threshold instead would reject correctly-evicted Linux runs.
@@ -359,7 +359,7 @@ Any backend is named by `--child-cmd`, using the same shell-words convention as
 ```bash
 # scratchy, cold + warm, 3 reps each
 scr bench startup --exec -m "$MODEL" \
-    --child-cmd "scr serve $MODEL --device cuda:0 --port 8731 --no-prefix-caching" \
+    --child-cmd "scr serve $MODEL --device spyre --port 8731 --no-prefix-caching" \
     --scenarios cold,warm --reps 3 --output-json out/scratchy.json
 
 # the same measurement against vLLM — no new code, just a different child
@@ -369,7 +369,7 @@ scr bench startup --exec -m "$MODEL" \
 
 # FROZEN on Linux: evict the weights and the binary, and prove it happened
 scr bench startup --exec -m "$MODEL" \
-    --child-cmd "scr serve $MODEL --device cuda:0 --port 8731" \
+    --child-cmd "scr serve $MODEL --device spyre --port 8731" \
     --scenarios frozen,cold --reps 3 \
     --evict fadvise \
     --evict-path "$HF_HOME/hub/models--org--name/snapshots" \
@@ -455,7 +455,7 @@ Everything above assumes real hardware, but the harness itself is process
 management, not inference: it spawns a child, waits for a port or a line of
 stdout, samples `getrusage`, and tears the process group down afterwards. None of
 that needs a backend, and the crate is built so that it doesn't — `default = []`,
-`cuda`/`metal` are pure pass-throughs to `scratchy-serving-api`, and there is no
+`metal` is a pure pass-through to `scratchy-serving-api`, and there is no
 backend `cfg` in the crate. So the full test suite and the `scr` binary carrying
 `bench startup --exec` both build on any Linux or macOS box:
 
@@ -469,7 +469,7 @@ cargo build -p scratchy-cli --no-default-features --features bench
 `hotpotqa`/`multihop`/`msmarco` subcommands, and it needs no GPU either.
 Featureless (`cargo test -p scratchy-bench`) drops only the tests of their
 parquet readers — nothing that touches the startup harness, whose process
-handling these tests are the only executable coverage of. `linux-cuda` in
+handling these tests are the only executable coverage of. `linux-workspace` in
 `.github/workflows/rust.yml` runs the same test command and lints the crate
 both with and without `datasets`, so reviewing the harness on a laptop runs the
 same gate CI does.
@@ -490,4 +490,4 @@ behaviour and publishing a number are different activities:
 - **Which rungs a GPU-less box may publish: none.** COLD and WARM still want a
   real loader touching real weights, and FROZEN additionally wants the eviction
   to have demonstrably taken effect. The reference figures stay the runs recorded
-  on real hardware — an H100 node for CUDA, an M5 Max for Metal.
+  on real hardware — an M5 Max for Metal.

@@ -3,13 +3,12 @@
 //!
 //! Weights are stored as `GpuTensor` (raw GPU pointers / metadata only). The
 //! struct/enum definitions and their *pure* shape/accessor methods live here so
-//! both `targets/{cuda,metal}` can name them without a circular dependency. The
+//! both `targets/{metal,spyre}` can name them without a circular dependency. The
 //! kernel-calling `forward` passes live in the target crates as `*Ops`
 //! extension traits; the **backend-neutral** `GpuWeights`-bound `load_*` logic
 //! (which names only neutral `GpuWeights` access methods) lives here as shared
 //! free fns both targets delegate to — only genuinely backend-divergent loads
-//! (cuda-stream sharded/concat, metal direct-write packing, the RmsNorm
-//! keep-dtype split) stay in the target crates.
+//! (metal direct-write packing, the RmsNorm keep-dtype split) stay in the target crates.
 
 use anyhow::Result;
 use scratchy_tensors::{DType, DeviceAllocator, GpuTensor};
@@ -24,9 +23,8 @@ use scratchy_quantizations::layers_quant::{AffineQuantLinear, Nvfp4Linear};
 
 /// Dense linear layer: y = x @ W^T + b
 ///
-/// Weight is stored in `[out_features, in_features]` layout (NOT pre-transposed).
-/// cuBLAS GEMM handles the transpose internally via `CUBLAS_OP_T`, which is
-/// more efficient than a separate transpose copy.
+/// Weight is stored in `[out_features, in_features]` layout (NOT pre-transposed);
+/// the GEMM kernel handles the transpose, which is cheaper than a separate copy.
 pub struct Linear {
     pub weight: GpuTensor,       // [out_features, in_features]
     pub bias: Option<GpuTensor>, // [out_features]
@@ -109,7 +107,7 @@ impl MarlinLinear {
 
 /// BitsAndBytes 4-bit quantized linear layer.
 ///
-/// Forward: dequantize packed NF4/FP4 weights to BF16 scratch buffer, then cuBLAS GEMM.
+/// Forward: dequantize packed NF4/FP4 weights to a BF16 scratch buffer, then GEMM.
 /// Matches Python `bitsandbytes.matmul_4bit` behavior.
 pub struct Bnb4bitLinear {
     /// Packed NF4/FP4 nibbles `[num_packed_bytes]` U8 (2 values per byte).
@@ -167,7 +165,7 @@ impl GgmlLinear {
 }
 
 // ---------------------------------------------------------------------------
-// Fp8Linear (FP8 E4M3 quantized via cublasLt FP8 GEMM)
+// Fp8Linear (FP8 E4M3 quantized)
 // ---------------------------------------------------------------------------
 
 /// FP8 (E4M3) quantized linear layer.
@@ -206,7 +204,7 @@ impl Fp8Linear {
 // LinearLayer (enum dispatch: Dense, Marlin, Ggml, Bnb4bit, Fp8, AffineQuant)
 // ---------------------------------------------------------------------------
 
-/// Unified linear layer — dense (cuBLAS), Marlin INT4, GGML quantized,
+/// Unified linear layer — dense, Marlin INT4, GGML quantized,
 /// BNB 4-bit, FP8, or MLX-affine INT4 (Metal-only).
 ///
 /// Models use this everywhere they currently use `Linear`. The factory decides
@@ -228,10 +226,7 @@ pub enum LinearLayer {
     Bnb4bit(Box<Bnb4bitLinear>),
     Fp8(Box<Fp8Linear>),
     Fp8Block(Box<Fp8BlockLinear>),
-    /// MLX-native int4 affine quantization (Metal-only). The CUDA
-    /// stack uses Marlin/AWQ/GPTQ/Bnb/Fp8 instead — affine is exclusive
-    /// to the Metal backend, so this variant is never constructed on cuda
-    /// (its loader is metal-gated in targets/cuda). The variant itself
+    /// MLX-native int4 affine quantization (Metal-only). The variant
     /// is unconditional here so this enum stays backend-neutral.
     AffineQuant(Box<AffineQuantLinear>),
     /// NVIDIA ModelOpt NVFP4 4-bit quantization (Metal-only). Like
@@ -243,9 +238,8 @@ pub enum LinearLayer {
 impl LinearLayer {
     /// Access the raw dense weight tensor. Panics if quantized —
     /// CUTLASS standalone GEMM only works with dense bf16 weights.
-    /// Quant variants are unreachable under metal (the macro only
-    /// emits Dense `LinearLayer`s on that path), so the panic arms
-    /// matter only on cuda.
+    /// The macro only emits Dense `LinearLayer`s where this is
+    /// called, so the panic arms are unreachable in practice.
     pub fn dense_weight(&self) -> GpuTensor {
         match self {
             Self::Dense(l) => l.weight,
@@ -467,14 +461,7 @@ impl From<Fp8BlockLinear> for LinearLayer {
 /// FP8 block-quantized linear layer with per-block weight scales.
 ///
 /// Weights are stored as FP8 `[out_features, in_features]` with per-block
-/// scales `[ceil(N/block_n), ceil(K/block_k)]`. Forward dequantizes to BF16
-/// then uses standard cuBLAS GEMM.
-///
-/// PERF GAP: Python uses CUTLASS block-scaled FP8 GEMM (one fused kernel)
-/// or deep_gemm (Hopper). We dequant + cuBLAS which adds an extra memory
-/// round-trip. Functionally correct, but slower for block-quantized models
-/// like DeepSeek-V3. To close: port CUTLASS block-scaled kernel from
-/// `vllm/csrc/quantization/cutlass_w8a8/`.
+/// scales `[ceil(N/block_n), ceil(K/block_k)]`.
 ///
 /// Matches Python vLLM's `Fp8LinearMethod` with `weight_block_size`.
 pub struct Fp8BlockLinear {
@@ -512,8 +499,8 @@ impl Fp8BlockLinear {
 /// (`Std`) or per-block scales (`Block`).
 ///
 /// `forward` matches both inner `forward`s' signature, so the
-/// per-arch interpreter arm calls `(weight_fn)(wm, layer).forward(x,
-/// cublas, alloc, stream)` without caring which variant is inside.
+/// per-arch interpreter arm calls `(weight_fn)(wm, layer).forward(..)`
+/// without caring which variant is inside.
 pub enum Fp8AnyLinear {
     Std(Fp8Linear),
     Block(Fp8BlockLinear),
@@ -706,8 +693,8 @@ pub struct GatedDeltaNetLayer {
 // Backend-agnostic weight-load logic shared by both targets' `*Ops` trait
 // impls. They name only the neutral `GpuWeights<A>` access methods, so the
 // load logic lives once here instead of being copied into each target crate.
-// Genuinely-divergent loads (cuda-stream sharded/concat, metal direct-write
-// packing, the RmsNorm keep-dtype split) stay in the target crates.
+// Genuinely-divergent loads (metal direct-write packing, the RmsNorm
+// keep-dtype split) stay in the target crates.
 
 /// Packed-source fallback: when `{prefix}.weight` is missing, detect the
 /// packed-source convention (`qkv_proj` / `gate_up_proj`) by `prefix`'s last
@@ -852,8 +839,8 @@ pub fn gated_delta_net_load<A: DeviceAllocator>(
 /// `in_features` (`hidden`) and `dtype`. Returns
 /// `(total_out_features, hidden, dtype, total_bytes)` for the packed buffer.
 /// The neutral preamble shared by both backends' direct-pack loaders (only the
-/// per-tensor byte-copy into the packed buffer differs: cuda pinned `take_cpu`
-/// + `alloc_packed_from_host`, metal direct-write via `take_into_metal`).
+/// per-tensor byte-copy into the packed buffer differs, e.g. metal's
+/// direct-write via `take_into_metal`).
 pub fn concat_packed_plan<A: DeviceAllocator>(
     weights: &mut GpuWeights<A>,
     prefixes: &[&str],

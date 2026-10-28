@@ -11,7 +11,7 @@
 //!
 //! Run with:
 //! ```bash
-//! cargo test --release -p vllm-e2e --features e2e,cuda \
+//! cargo test --release -p scratchy-e2e --features e2e,metal \
 //!     --test e_qwen2_5_vl -- --ignored --test-threads=1
 //! ```
 

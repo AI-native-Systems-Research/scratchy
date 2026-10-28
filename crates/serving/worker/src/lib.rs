@@ -14,28 +14,33 @@
 //! * [`error`] -- Executor-specific error types.
 
 pub mod error;
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "metal")]
 pub mod gpu_worker;
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "metal")]
 pub mod gpu_worker_base;
 pub mod input_batch;
 #[cfg(feature = "metal")]
 pub mod metal_info;
 pub mod multinode;
 pub mod parallel;
-#[cfg(any(feature = "spyre", feature = "spyre-hw"))]
+#[cfg(any(feature = "spyre-emu", feature = "spyre-hw"))]
 pub mod spyre_exec;
-#[cfg(any(feature = "spyre", feature = "spyre-hw"))]
+#[cfg(any(feature = "spyre-emu", feature = "spyre-hw"))]
 pub mod spyre_forward;
-#[cfg(any(feature = "spyre", feature = "spyre-hw"))]
+#[cfg(any(feature = "spyre-emu", feature = "spyre-hw"))]
 pub mod spyre_load;
-#[cfg(any(feature = "spyre", feature = "spyre-hw"))]
+#[cfg(any(feature = "spyre-emu", feature = "spyre-hw"))]
 pub mod spyre_pool;
-#[cfg(any(feature = "spyre", feature = "spyre-hw"))]
+#[cfg(any(feature = "spyre-emu", feature = "spyre-hw"))]
 pub mod spyre_types;
-#[cfg(any(feature = "spyre", feature = "spyre-hw"))]
+#[cfg(any(feature = "spyre-emu", feature = "spyre-hw"))]
 pub mod spyre_worker;
 pub mod threadpool;
 pub mod uniproc;
 pub mod worker;
 pub mod worker_factory;
+
+// Keep the backend worker crate linked: its `WorkerFactory` registration (`inventory::submit!`) is
+// all this crate needs of it, and nothing here names it.
+#[cfg(feature = "backend-worker")]
+extern crate backend_worker as _;

@@ -10,7 +10,7 @@ description = "IBM Spyre (KTIR) backend for scratchy: host allocator + KTIR targ
 # only present/linked on a Spyre host. Pulls in `scratchy-subtile` because the session setters take
 # its `sdsc_abstract` law types (mask stride / fold pages / mask blocks / int stride) rather than
 # u64s, and owns the `flex-rs` dependency — flex-rs's build.rs cc-compiles its senlib shim, which
-# only exists on a Spyre host, so flex-rs must NOT be pulled into a cuda/metal/emit-only build.
+# only exists on a Spyre host, so flex-rs must NOT be pulled into a metal/emit-only build.
 # `runtime`, the only module that touches flex-rs, is gated on this same feature.
 #
 # THE FEATURE TIERS. Cargo features are ADDITIVE, so a device is chosen by naming it, never by

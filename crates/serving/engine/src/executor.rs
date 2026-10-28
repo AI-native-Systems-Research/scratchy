@@ -80,7 +80,7 @@ pub struct ModelRunnerOutput {
     /// ⭐ WHAT THE WORKER'S KV ACTUALLY LOOKS LIKE, per request — the slots its blocks must cover and
     /// the leading tokens a token-indexed prefix cache may claim ([`scratchy_core_common::KvExtent`]).
     ///
-    /// Empty for every backend whose KV sits at its token positions (cuda/metal): there the span IS the
+    /// Empty for every backend whose KV sits at its token positions (metal): there the span IS the
     /// token count and the whole computed prefix is cacheable, so the scheduler's own arithmetic is
     /// already right and reporting would be a second source for it.
     ///
@@ -100,7 +100,7 @@ pub struct ModelRunnerOutput {
     /// already deep, its write page is past every block the host gave it, and the worker must serve that
     /// page from a reserve of its own. This number is what lets the HOST own that page instead.
     ///
-    /// `None` for every backend whose KV is token-addressed (cuda/metal): there the write slot IS the token
+    /// `None` for every backend whose KV is token-addressed (metal): there the write slot IS the token
     /// count and a new request's own allocation already covers it.
     pub kv_pool_reach: Option<scratchy_core_common::KvSlotSpan>,
     /// HOW MANY BLOCKS OF EACH KV STORE THE WORKER HAS BACKED WITH MEMORY after this step. `Some` only from
@@ -113,8 +113,8 @@ pub struct ModelRunnerOutput {
     /// populate the real token IDs — or learn the step failed on the device.
     ///
     /// Matches Python's `AsyncOutput` pattern: the GPU enqueues a D2H copy
-    /// on a transfer stream and returns immediately. The closure syncs the
-    /// CUDA event and reads from a pinned host buffer.
+    /// on a transfer stream and returns immediately. The closure waits for
+    /// the device and reads the sampled tokens back.
     pub d2h_resolver: Option<D2hResolve>,
 }
 
@@ -170,8 +170,7 @@ impl ModelRunnerOutput {
 
     /// Resolve the deferred D2H transfer, populating `sampled_token_ids`.
     ///
-    /// Synchronizes the CUDA D2H event and reads token IDs from the pinned
-    /// host buffer. No-op if the output is already resolved. `Err`: the step
+    /// Waits for the device and reads the sampled token IDs back. No-op if the output is already resolved. `Err`: the step
     /// failed on the device, and its tokens are not to be used.
     pub fn resolve(&mut self) -> Result<(), String> {
         match self.d2h_resolver.take() {
@@ -268,7 +267,7 @@ impl ModelRunnerOutput {
     /// Build a deferred output whose token IDs will be resolved lazily.
     ///
     /// The `resolver` closure is called by `resolve()` to synchronize the
-    /// D2H CUDA event and read token IDs from a pinned host buffer.
+    /// device and read the sampled token IDs back.
     /// Until resolved, `sampled_token_ids` is empty.
     pub fn deferred(req_ids: Vec<String>, resolver: D2hResolver) -> Self {
         let req_id_to_index: HashMap<String, usize> = req_ids
@@ -349,7 +348,7 @@ pub trait Executor: Send {
 
     /// ⭐⭐⭐ HOW THE WORKER ADDRESSES ITS KV — asked ONCE, when the engine builds the block tracker.
     ///
-    /// Forwarded from [`crate::worker::Worker::kv_addressing`]. `ByToken` for cuda/metal; the spyre paged
+    /// Forwarded from [`crate::worker::Worker::kv_addressing`]. `ByToken` for metal; the spyre paged
     /// path shares one write slot per batched step, and the scheduler must know that BEFORE it allocates for
     /// the first step. Asked of the executor rather than passed through `EngineCoreConfig` because the
     /// worker is the thing that knows, and a config field is one more place for the answer to be wrong.

@@ -11,7 +11,7 @@ use scratchy_tensors::{DeviceAllocator, PoolMemory};
 /// contract — "allocate `bytes` and copy `src_host` onto it" — is a host
 /// allocation + `memcpy`. The allocator owns every buffer it hands out and frees
 /// them on drop; the returned pointers stay valid for the allocator's lifetime
-/// (the same ownership model as the CUDA/Metal allocators).
+/// (the same ownership model as the Metal allocator).
 #[derive(Default)]
 pub struct SpyreAllocator {
     /// Owns the host buffers backing the pointers returned below.

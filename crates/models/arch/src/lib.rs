@@ -37,45 +37,24 @@ mod __metal_bake {
     include!(concat!(env!("OUT_DIR"), "/metal_bake.rs"));
 }
 
-#[cfg(all(feature = "arch-commandr", any(feature = "cuda", feature = "metal")))]
+#[cfg(all(feature = "arch-commandr", feature = "metal"))]
 #[path = "arch/commandr.rs"]
 pub mod commandr;
 
-#[cfg(all(feature = "arch-deepseek-v2", feature = "cuda"))]
-#[path = "arch/deepseek_v2.rs"]
-pub mod deepseek_v2;
-
-#[cfg(all(feature = "arch-deepseek-v3", feature = "cuda"))]
-#[path = "arch/deepseek_v3.rs"]
-pub mod deepseek_v3;
-
-#[cfg(all(feature = "arch-deepseek-v3-flat", feature = "cuda"))]
-#[path = "arch/deepseek_v3_flat.rs"]
-pub mod deepseek_v3_flat;
-
-#[cfg(all(feature = "arch-gemma2", any(feature = "cuda", feature = "metal")))]
+#[cfg(all(feature = "arch-gemma2", feature = "metal"))]
 #[path = "arch/gemma2.rs"]
 pub mod gemma2;
 
-#[cfg(all(feature = "arch-gemma3", any(feature = "cuda", feature = "metal")))]
+#[cfg(all(feature = "arch-gemma3", feature = "metal"))]
 #[path = "arch/gemma3.rs"]
 pub mod gemma3;
 
-#[cfg(all(feature = "arch-gemma3-mm", feature = "cuda"))]
-#[path = "arch/gemma3_mm.rs"]
-pub mod gemma3_mm;
-
-#[cfg(all(
-    feature = "arch-gemma4",
-    any(feature = "cuda", feature = "metal", feature = "spyre")
-))]
+#[cfg(all(feature = "arch-gemma4", any(feature = "metal", feature = "spyre")))]
 #[path = "arch/gemma4.rs"]
 pub mod gemma4;
 
-#[cfg(all(
-    feature = "arch-gemma4-moe",
-    any(feature = "cuda", feature = "metal", feature = "spyre")
-))]
+#[cfg(feature = "arch-gemma4-moe")]
+#[cfg(any(feature = "metal", feature = "spyre", feature = "cuda"))]
 #[path = "arch/gemma4_moe.rs"]
 pub mod gemma4_moe;
 
@@ -87,36 +66,27 @@ pub mod glm4_moe;
 #[path = "arch/gpt_oss.rs"]
 pub mod gpt_oss;
 
-#[cfg(all(
-    feature = "arch-granite",
-    any(feature = "cuda", feature = "metal", feature = "spyre")
-))]
+#[cfg(all(feature = "arch-granite", any(feature = "metal", feature = "spyre")))]
 #[path = "arch/granite.rs"]
 pub mod granite;
 
-#[cfg(all(
-    feature = "arch-llama",
-    any(feature = "cuda", feature = "metal", feature = "spyre")
-))]
+#[cfg(all(feature = "arch-llama", any(feature = "metal", feature = "spyre")))]
 #[path = "arch/llama.rs"]
 pub mod llama;
 
-#[cfg(all(
-    feature = "arch-locateanything",
-    any(feature = "cuda", feature = "metal")
-))]
+#[cfg(all(feature = "arch-locateanything", feature = "metal"))]
 #[path = "arch/locateanything.rs"]
 pub mod locateanything;
 
-#[cfg(all(feature = "arch-mistral", any(feature = "cuda", feature = "metal")))]
+#[cfg(all(feature = "arch-mistral", feature = "metal"))]
 #[path = "arch/mistral.rs"]
 pub mod mistral;
 
-#[cfg(all(feature = "arch-mixtral", any(feature = "cuda", feature = "metal")))]
+#[cfg(all(feature = "arch-mixtral", feature = "metal"))]
 #[path = "arch/mixtral.rs"]
 pub mod mixtral;
 
-#[cfg(all(feature = "arch-modernbert", any(feature = "cuda", feature = "metal")))]
+#[cfg(all(feature = "arch-modernbert", feature = "metal"))]
 #[path = "arch/modernbert.rs"]
 pub mod modernbert;
 
@@ -132,39 +102,39 @@ pub mod nemotron_h_latent;
 #[path = "arch/nemotron_h_mtp.rs"]
 pub mod nemotron_h_mtp;
 
-#[cfg(all(feature = "arch-phi3", any(feature = "cuda", feature = "metal")))]
+#[cfg(all(feature = "arch-phi3", feature = "metal"))]
 #[path = "arch/phi3.rs"]
 pub mod phi3;
 
-#[cfg(all(feature = "arch-qwen2", any(feature = "cuda", feature = "metal")))]
+#[cfg(all(feature = "arch-qwen2", feature = "metal"))]
 #[path = "arch/qwen2.rs"]
 pub mod qwen2;
 
-#[cfg(all(feature = "arch-qwen2-5-vl", any(feature = "cuda", feature = "metal")))]
+#[cfg(all(feature = "arch-qwen2-5-vl", feature = "metal"))]
 #[path = "arch/qwen2_5_vl.rs"]
 pub mod qwen2_5_vl;
 
-#[cfg(all(feature = "arch-qwen2-moe", any(feature = "cuda", feature = "metal")))]
+#[cfg(all(feature = "arch-qwen2-moe", feature = "metal"))]
 #[path = "arch/qwen2_moe.rs"]
 pub mod qwen2_moe;
 
-#[cfg(all(feature = "arch-qwen2-vl", any(feature = "cuda", feature = "metal")))]
+#[cfg(all(feature = "arch-qwen2-vl", feature = "metal"))]
 #[path = "arch/qwen2_vl.rs"]
 pub mod qwen2_vl;
 
-#[cfg(all(feature = "arch-qwen3", any(feature = "cuda", feature = "metal")))]
+#[cfg(all(feature = "arch-qwen3", feature = "metal"))]
 #[path = "arch/qwen3.rs"]
 pub mod qwen3;
 
-#[cfg(all(feature = "arch-qwen3-5", any(feature = "cuda", feature = "metal")))]
+#[cfg(all(feature = "arch-qwen3-5", any(feature = "metal", feature = "cuda")))]
 #[path = "arch/qwen3_5.rs"]
 pub mod qwen3_5;
 
-#[cfg(all(feature = "arch-qwen3-5-moe", any(feature = "cuda", feature = "metal")))]
+#[cfg(all(feature = "arch-qwen3-5-moe", any(feature = "metal", feature = "cuda")))]
 #[path = "arch/qwen3_5_moe.rs"]
 pub mod qwen3_5_moe;
 
-#[cfg(all(feature = "arch-qwen3-5-mtp", any(feature = "cuda", feature = "metal")))]
+#[cfg(all(feature = "arch-qwen3-5-mtp", feature = "metal"))]
 #[path = "arch/qwen3_5_mtp.rs"]
 pub mod qwen3_5_mtp;
 
@@ -172,11 +142,11 @@ pub mod qwen3_5_mtp;
 #[path = "arch/gemma4_assistant.rs"]
 pub mod gemma4_assistant;
 
-#[cfg(all(feature = "arch-qwen3-5-vl", any(feature = "cuda", feature = "metal")))]
+#[cfg(all(feature = "arch-qwen3-5-vl", feature = "metal"))]
 #[path = "arch/qwen3_5_vl.rs"]
 pub mod qwen3_5_vl;
 
-#[cfg(all(feature = "arch-qwen3-moe", any(feature = "cuda", feature = "metal")))]
+#[cfg(all(feature = "arch-qwen3-moe", feature = "metal"))]
 #[path = "arch/qwen3_moe.rs"]
 pub mod qwen3_moe;
 
@@ -190,25 +160,18 @@ pub mod qwen3_moe;
 // every image and a VL model answers as if it were text-only. Referencing each
 // vision arch's `PROCESSOR` from a `#[used]` anchor forces the module object
 // into the final link, so its `inventory::submit!`s actually register.
-#[cfg(all(feature = "arch-qwen2-vl", any(feature = "cuda", feature = "metal")))]
+#[cfg(all(feature = "arch-qwen2-vl", feature = "metal"))]
 #[used]
 static _FORCE_MM_QWEN2_VL: &scratchy_vision::MmMetadata = &qwen2_vl::PROCESSOR;
 
-#[cfg(all(feature = "arch-qwen2-5-vl", any(feature = "cuda", feature = "metal")))]
+#[cfg(all(feature = "arch-qwen2-5-vl", feature = "metal"))]
 #[used]
 static _FORCE_MM_QWEN2_5_VL: &scratchy_vision::MmMetadata = &qwen2_5_vl::PROCESSOR;
 
-#[cfg(all(feature = "arch-qwen3-5-vl", any(feature = "cuda", feature = "metal")))]
+#[cfg(all(feature = "arch-qwen3-5-vl", feature = "metal"))]
 #[used]
 static _FORCE_MM_QWEN3_5_VL: &scratchy_vision::MmMetadata = &qwen3_5_vl::PROCESSOR;
 
-#[cfg(all(feature = "arch-gemma3-mm", feature = "cuda"))]
-#[used]
-static _FORCE_MM_GEMMA3_MM: &scratchy_vision::MmMetadata = &gemma3_mm::PROCESSOR;
-
-#[cfg(all(
-    feature = "arch-locateanything",
-    any(feature = "cuda", feature = "metal")
-))]
+#[cfg(all(feature = "arch-locateanything", feature = "metal"))]
 #[used]
 static _FORCE_MM_LOCATEANYTHING: &scratchy_vision::MmMetadata = &locateanything::PROCESSOR;

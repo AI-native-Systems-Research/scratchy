@@ -282,7 +282,7 @@ impl Default for SamplingParams {
 
 /// Backend-neutral per-row inputs for a GPU sampler: the sampling params +
 /// host-drawn uniforms + (optional) penalty token histories for one step's
-/// non-greedy rows. Identical for cuda and metal — only the kernel dispatch that
+/// non-greedy rows. Identical for every backend — only the kernel dispatch that
 /// consumes it differs. The worker gathers it from request state (see the GPU
 /// worker base) and hands it to the backend's sampler (e.g.
 /// `scratchy_target_metal::sampling::PendingSampler::prepare`). Every `Vec` is
@@ -308,8 +308,8 @@ pub struct GpuSampleParams {
 
 /// Deterministic per-request seed for an UNSEEDED GPU-sampling request:
 /// FNV-1a(req_id bytes, then `position` LE bytes) with a fixed basis. Backend-
-/// AND TP-rank-independent (no process RNG, no per-rank state) so the cuda and
-/// metal samplers derive the identical seed for the same `(req_id, position)`.
+/// AND TP-rank-independent (no process RNG, no per-rank state) so every
+/// sampler derives the identical seed for the same `(req_id, position)`.
 /// `position` is the request's generated-token count at this step (advances each
 /// decode step so the seed — and thus the sample — varies). Seeded requests draw
 /// from their own `StdRng` instead and never call this.
@@ -329,8 +329,8 @@ pub fn fnv_seed(req_id: &str, position: u32) -> u32 {
 }
 
 /// Convert a `u32` seed to a uniform in `[0, 1)` by stuffing its top 23 bits into
-/// an IEEE-754 f32 mantissa — matches cuda's `gen_seed → uniform` conversion so
-/// the metal and cuda samplers turn the same seed into the same uniform.
+/// an IEEE-754 f32 mantissa, so every sampler turns the same seed into the same
+/// uniform.
 #[inline]
 pub fn seed_to_uniform(seed: u32) -> f32 {
     f32::from_bits((seed >> 9) | 0x3F80_0000) - 1.0
@@ -355,7 +355,7 @@ impl SamplingParams {
     /// Whether plain argmax decoding is exactly correct for these params — no
     /// sampling transform (temperature, top-k / top-p / min-p, or a repetition /
     /// presence / frequency penalty) would move the argmax token. Backend-neutral:
-    /// both the cuda and metal workers use this to route a row to the argmax fast
+    /// the workers use this to route a row to the argmax fast
     /// path vs the on-GPU sampler. Stricter than `sampling_type() == Greedy`,
     /// which only looks at temperature.
     pub fn is_greedy(&self) -> bool {

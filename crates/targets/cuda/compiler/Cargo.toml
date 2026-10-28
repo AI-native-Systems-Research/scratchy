@@ -1,0 +1,33 @@
+[package]
+name = "scratchy-target-cuda-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CUDA's compile-time lowering: SubtileTape -> CUDA step tape"
+
+# ⭐ WHY THIS CRATE EXISTS.
+#
+# CUDA's expansion-time lowering cannot live in `crates/targets/cuda/` itself, for the same reason
+# metal's could not (`crates/targets/metal/compiler/Cargo.toml`): `scratchy-forward-compiler-macro`
+# depends on the target, and the runtime target crate will depend UP on `scratchy-forward-compiler`
+# (metal's does — "the inverted edge"), so lowering inside the runtime crate would close a cycle.
+#
+# The fix is a crate on the target's side of that edge:
+#
+#   scratchy-subtile          (handoff types + the shared SubtileIR/SubtileTape and passes)
+#        |                 \
+#   scratchy-target-cuda     scratchy-target-cuda-compiler   <- CUDA's codegen lives HERE
+#        |                  /
+#   scratchy-forward-compiler-macro
+#
+# This is a COMPILE-TIME crate, never linked into the runtime. The macro reaches it through its
+# neutral `target-emitter` dependency key (`emit::emit_model`), so the macro's source never names
+# it; everything CUDA decides about a model is here.
+[dependencies]
+scratchy-subtile = { path = "../../../compiler/subtile" }
+scratchy-target-cuda = { path = ".." }
+# The tokens of the `static` tapes `emit` hands back, rendered by the shared serializer under
+# CUDA's module table.
+scratchy-const-tokens = { path = "../../../compiler/const-tokens" }
+proc-macro2 = "1"
+quote = "1"

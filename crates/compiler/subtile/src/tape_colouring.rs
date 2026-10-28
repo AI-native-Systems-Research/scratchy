@@ -213,6 +213,8 @@ pub struct TapeColouring {
     by_slot: HashMap<SlotId, (Colour, Option<Colour>)>,
     count: ColourCount,
     result: Colour,
+    /// The `(rows, cols)` of every colour the scan minted: the one shape every holder of it has.
+    colour_shape: HashMap<Colour, (u32, u32)>,
 }
 
 impl TapeColouring {
@@ -233,6 +235,15 @@ impl TapeColouring {
     /// The colour holding the forward's result.
     pub fn result(&self) -> Colour {
         self.result
+    }
+
+    /// The `(rows, cols)` of every value colour `c` holds: a colour is reused only by a value of
+    /// the same shape, so this is exact. A two-output step's second colour has the shape its op
+    /// states ([`SubOp::second_output_shape`]); it is never reused. `None` for colour 0, which is
+    /// the colour-zero source's buffer and sized by that source, and for a second colour whose op
+    /// states no second shape.
+    pub fn shape_of(&self, c: Colour) -> Option<(u32, u32)> {
+        self.colour_shape.get(&c).copied()
     }
 }
 
@@ -271,6 +282,14 @@ pub enum ColourError {
         first: Holder,
         second: Holder,
     },
+    /// A two-output step's second shape reads operand `operand`, and the step has no such
+    /// operand. A validated graph gives every op its registry arity, so only a tape built around
+    /// the validator reaches this.
+    MissingOperand {
+        step: StepPos,
+        op: &'static str,
+        operand: OperandIx,
+    },
 }
 
 impl std::fmt::Display for ColourError {
@@ -303,6 +322,10 @@ impl std::fmt::Display for ColourError {
                 "colour {} is held by {} ({}, live to {}) and {} ({}, live to {}) AT THE SAME \
                  TIME — one kernel would write over a buffer the other still owns",
                 colour.0, first.step, first.op, first.last, second.step, second.op, second.last,
+            ),
+            Self::MissingOperand { step, op, operand } => write!(
+                f,
+                "{step} ({op}) has no operand {operand}, which its second output's shape reads"
             ),
         }
     }
@@ -594,20 +617,55 @@ pub fn colour_tape(
         });
     }
 
-    // A second output is a distinct allocation with no tracked lifetime: never reused.
+    // A second output is a distinct allocation with no tracked lifetime: never reused. Its shape
+    // is the op's (`SubOp::second_output_shape`), recorded for the arena; minted after the scan,
+    // it never enters a free pool, so recording it moves no colouring.
+    // A missing operand is refused, not sized: the first one `second_output_shape` asks for is
+    // recorded, and the step fails after the call.
+    let operand_shape = |s: &Step<'_>, k: usize, missing: &std::cell::Cell<Option<usize>>| match s
+        .operands
+        .get(k)
+    {
+        Some(Operand::Step(q)) => steps[*q].shape,
+        Some(Operand::Source(t)) => {
+            let shape = graph.shape(*t);
+            (shape.rows, shape.cols)
+        }
+        None => {
+            missing.set(missing.get().or(Some(k)));
+            (0, 0)
+        }
+    };
     let mut by_slot = HashMap::with_capacity(n);
-    for (s, c) in steps.iter().zip(&colour) {
+    for (p, (s, c)) in steps.iter().zip(&colour).enumerate() {
         let Some(c) = *c else { continue };
-        let second = (s.rule.outputs == Outputs::Two).then(|| {
+        let second = if s.rule.outputs == Outputs::Two {
+            let second = Colour(next);
             next += 1;
-            Colour(next - 1)
-        });
+            let missing = std::cell::Cell::new(None);
+            let shape =
+                s.op.second_output_shape(s.shape, |k| operand_shape(s, k, &missing));
+            if let Some(k) = missing.get() {
+                return Err(ColourError::MissingOperand {
+                    step: pos(p),
+                    op: name(p),
+                    operand: OperandIx(k as u8),
+                });
+            }
+            if let Some(shape) = shape {
+                colour_shape.insert(second, shape);
+            }
+            Some(second)
+        } else {
+            None
+        };
         by_slot.insert(s.writes, (c, second));
     }
     Ok(TapeColouring {
         by_slot,
         count: ColourCount(next),
         result: colour[result_owner].expect("the scan colours every step"),
+        colour_shape,
     })
 }
 
@@ -953,6 +1011,133 @@ mod tests {
         assert_ne!(peeled[0], peeled[2]);
     }
 
+    /// Every fresh step's colour reports that step's output shape; colour 0 and a second colour
+    /// report none.
+    #[test]
+    fn shape_of_is_each_colours_value_shape() {
+        // The neutral table, with the product declared two-output.
+        fn two_output_rule(op: &SubOp) -> ColourRule {
+            match op {
+                SubOp::Elementwise(EwKind::Mul) => ColourRule::FRESH.two_outputs(),
+                _ => rule(op),
+            }
+        }
+        let facts = ColourFacts {
+            rule: two_output_rule,
+            colour_zero: SourceBinding::EmbeddedHidden,
+        };
+        let ops = vec![
+            gemm(64, vec![Ext(0), Ext(1)]),
+            op(ADD, 1, vec![Op(0), Ext(0)]),
+            gemm(128, vec![Op(1), Ext(2)]),
+            op(MUL, 1, vec![Op(2), Op(2)]),
+            gemm(64, vec![Op(3), Ext(3)]),
+            gemm(128, vec![Op(4), Ext(2)]),
+        ];
+        let input = LoweringInput {
+            sources: [(1, 64), (64, 64), (64, 128), (128, 64)]
+                .iter()
+                .map(|&(rows, cols)| SourceShape { rows, cols })
+                .collect(),
+            result: ops.len() - 1,
+            exported: None,
+            ops,
+        };
+        let mut bindings = weights(4);
+        bindings[0] = SourceBinding::EmbeddedHidden;
+        let graph = lower_region(&input, std::num::NonZeroU32::MAX);
+        let tape = lower_dag_to_tape(&ValidatedGraph::new(&graph).expect("a valid fixture"));
+        let c = colour_tape(&graph, &tape, &bindings, &FoldFacts::default(), &facts).unwrap();
+        let steps: Vec<(SlotId, &SubOp, (u32, u32))> = (tape.instrs().iter())
+            .filter_map(|i| match i {
+                Instr::Compute { node, writes, .. } => {
+                    let node = &graph.nodes[node.index()];
+                    let shape = graph.shape(node.output.tensor);
+                    Some((*writes, &node.op, (shape.rows, shape.cols)))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut fresh = 0;
+        for &(slot, op, shape) in &steps {
+            let colour = c.colour_of(slot).unwrap();
+            if matches!(op, SubOp::Elementwise(EwKind::Add)) {
+                // Written over the colour-zero source.
+                assert_eq!(colour, Colour::ZERO);
+            } else {
+                assert_eq!(c.shape_of(colour), Some(shape), "{}", op.name());
+                fresh += 1;
+            }
+        }
+        assert_eq!(fresh, 5);
+        // The last projection reuses the first `[1, 128]` colour, whose shape stays its own.
+        assert_eq!(c.colour_of(steps[5].0), c.colour_of(steps[2].0));
+        assert_eq!(c.shape_of(Colour::ZERO), None);
+        let second = c
+            .second_colour_of(steps[3].0)
+            .expect("the product writes two buffers");
+        assert_eq!(c.shape_of(second), None);
+    }
+
+    /// A `GateSplit`'s second colour, the gate, has the query's shape `[M, half_cols]`, and is
+    /// a colour of its own that no other value takes.
+    #[test]
+    fn a_gate_splits_second_colour_has_the_querys_shape() {
+        fn gate_rule(op: &SubOp) -> ColourRule {
+            match op {
+                SubOp::GateSplit { .. } => ColourRule::FRESH.reads_across().two_outputs(),
+                _ => rule(op),
+            }
+        }
+        let facts = ColourFacts {
+            rule: gate_rule,
+            colour_zero: SourceBinding::EmbeddedHidden,
+        };
+        let (m, half) = (4, 128);
+        let ops = vec![
+            OpDesc {
+                op: SubOp::MatmulTile {
+                    n: 2 * half,
+                    weight: GemmWeight::Dense,
+                },
+                m,
+                inputs: vec![Ext(0), Ext(1)],
+            },
+            op(SubOp::GateSplit { half_cols: half }, m, vec![Op(0)]),
+            op(SubOp::GateApply, m, vec![Op(1), Op(1)]),
+        ];
+        let input = LoweringInput {
+            sources: [(m, 64), (64, 2 * half)]
+                .iter()
+                .map(|&(rows, cols)| SourceShape { rows, cols })
+                .collect(),
+            result: ops.len() - 1,
+            exported: None,
+            ops,
+        };
+        let mut bindings = weights(2);
+        bindings[0] = SourceBinding::EmbeddedHidden;
+        let graph = lower_region(&input, std::num::NonZeroU32::MAX);
+        let tape = lower_dag_to_tape(&ValidatedGraph::new(&graph).expect("a valid fixture"));
+        let c = colour_tape(&graph, &tape, &bindings, &FoldFacts::default(), &facts).unwrap();
+        let slots: Vec<SlotId> = (tape.instrs().iter())
+            .filter_map(|i| match i {
+                Instr::Compute { writes, .. } => Some(*writes),
+                _ => None,
+            })
+            .collect();
+        let split = slots[1];
+        let gate = c
+            .second_colour_of(split)
+            .expect("the split writes two buffers");
+        assert_eq!(c.shape_of(gate), Some((m, half)));
+        assert_eq!(c.shape_of(c.colour_of(split).unwrap()), Some((m, half)));
+        for &s in &slots {
+            assert_ne!(c.colour_of(s), Some(gate), "the gate's colour is its own");
+        }
+        assert_eq!(c.count().get(), gate.index() + 1, "the gate is minted last");
+    }
+
     #[test]
     fn a_colour_held_by_two_live_values_is_refused() {
         let held = |v: Vec<(usize, usize)>| BTreeMap::from([(Colour(1), v)]);
@@ -967,7 +1152,7 @@ mod tests {
     /// projection, the weighted sum, then a projection of it. `x` is read by the router and the
     /// sort only — off-arena steps both.
     fn moe_block(tail: bool) -> (Vec<(u32, u32)>, Vec<OpDesc>) {
-        use crate::lower::ExpertQuant;
+        use crate::lower::{ExpertQuant, ExpertWeight};
         use crate::subtile_ir::{
             ExpertBundle, ExpertProj, NumExperts, RouterBundle, SharedExpertBound, TopK,
         };
@@ -977,7 +1162,7 @@ mod tests {
             TopK::new(nz(2)),
             ExpertBundle::Fused,
         );
-        let quant = ExpertQuant::declared(64, 4);
+        let weight = ExpertWeight::Affine(ExpertQuant::declared(64, 4));
         let proj = ExpertProj::Gate;
         let router = RouterBundle::Fused;
         let (sort, combine) = (
@@ -1003,7 +1188,7 @@ mod tests {
                     proj,
                     n: 64,
                     k,
-                    quant,
+                    weight,
                     bundle,
                 },
                 1,
@@ -1048,5 +1233,69 @@ mod tests {
         ops.push(gemm(64, vec![Op(7), Ext(1)]));
         let refused = coloured(&src, weights(3), ops, no_folds);
         assert!(matches!(refused, Err(ColourError::AliasUncoloured { .. })));
+    }
+
+    /// A two-output step whose second shape reads an operand the step does not have is refused,
+    /// naming the step and the operand, rather than sized `(0, 0)`. The validator never lets such
+    /// a graph through, so the tape is built by hand around it: a `VisionRope` (whose second
+    /// output is operand 1's shape) given only its operand 0.
+    #[test]
+    fn a_second_output_reading_a_missing_operand_is_refused() {
+        use crate::subtile_tape::{ComputeInputBuild, TapeBuilder};
+        fn two_output_rope(op: &SubOp) -> ColourRule {
+            match op {
+                SubOp::VisionRope => ColourRule::FRESH.reads_across().two_outputs(),
+                _ => rule(op),
+            }
+        }
+        let facts = ColourFacts {
+            rule: two_output_rope,
+            colour_zero: SourceBinding::EmbeddedHidden,
+        };
+        let input = LoweringInput {
+            sources: [(1, 64), (64, 64), (1, 64)]
+                .iter()
+                .map(|&(rows, cols)| SourceShape { rows, cols })
+                .collect(),
+            result: 1,
+            exported: None,
+            ops: vec![
+                gemm(64, vec![Ext(0), Ext(1)]),
+                op(SubOp::VisionRope, 1, vec![Op(0), Ext(2)]),
+            ],
+        };
+        let mut bindings = weights(3);
+        bindings[0] = SourceBinding::EmbeddedHidden;
+        let graph = lower_region(&input, std::num::NonZeroU32::MAX);
+        let external = |r: &crate::subtile_ir::TensorRegion| ComputeInputBuild::External {
+            tensor: r.tensor,
+            region: r.region,
+            per_layer: Vec::new(),
+        };
+        let (mm, rope) = (&graph.nodes[0], &graph.nodes[1]);
+        let mut b = TapeBuilder::new();
+        let slot = b.alloc_slot();
+        let product = b.compute_to(
+            mm.id,
+            slot,
+            &[external(&mm.inputs[0]), external(&mm.inputs[1])],
+        );
+        let slot = b.alloc_slot();
+        let _ = b.compute_to(
+            rope.id,
+            slot,
+            &[ComputeInputBuild::Computed(vec![&product])],
+        );
+        let tape = b.finish();
+        let got = colour_tape(&graph, &tape, &bindings, &FoldFacts::default(), &facts);
+        let Err(e @ ColourError::MissingOperand { op, operand, .. }) = got else {
+            panic!("expected MissingOperand, got {got:?}");
+        };
+        assert_eq!((op, operand), ("VisionRope", OperandIx(1)));
+        let msg = e.to_string();
+        assert!(
+            msg.contains("VisionRope") && msg.contains("operand 1"),
+            "{msg}"
+        );
     }
 }

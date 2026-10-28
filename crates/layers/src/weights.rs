@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 
-use scratchy_tensors::{DType, DeviceAllocator, GpuTensor, PrecastEntry, PrecastPipeline};
+use scratchy_tensors::{DType, DeviceAllocator, GpuTensor};
 
 // ---------------------------------------------------------------------------
 // DType conversion
@@ -180,7 +180,7 @@ fn load_shard_into_map(path: &Path) -> Result<(HashMap<String, CpuTensorRef>, Ar
 
     // OS readahead prefault (MADV_WILLNEED) is backend-specific and now runs
     // through `DeviceAllocator::prefault_mmap` at the call sites that hold the
-    // allocator (cuda hints here; metal prefaults per-shard in register_mmap).
+    // allocator (metal prefaults per-shard in register_mmap).
 
     // Parse safetensors header to find tensor offsets.
     let _t_des = std::time::Instant::now();
@@ -286,72 +286,23 @@ fn load_shard_into_map(path: &Path) -> Result<(HashMap<String, CpuTensorRef>, Ar
     Ok((tensors, mmap))
 }
 
-/// Locate a dim-0 shard inside a pre-staged entry's device bytes.
-/// Returns `(src_dev_ptr, shard_shape, shard_bytes)`, or `None` when
-/// the shard isn't a contiguous range of the entry (dim != 0, scalar
-/// shape, or a non-divisible leading dim) and the caller must use
-/// the gather slow path.
-fn shard_of_entry(
-    entry: &PrecastEntry,
-    shape: &[usize],
-    dim: usize,
-    rank: usize,
-    world_size: usize,
-) -> Option<(*const u8, Vec<usize>, usize)> {
-    if dim != 0 || shape.is_empty() || world_size == 0 || !shape[0].is_multiple_of(world_size) {
-        return None;
-    }
-    let elem = entry.dtype.size_bytes();
-    let row_elems: usize = shape[1..].iter().product();
-    let shard_size = shape[0] / world_size;
-    let shard_bytes = shard_size * row_elems * elem;
-    // Sanity: the staged bytes must cover exactly world_size shards.
-    if shard_bytes * world_size != entry.size_bytes || rank >= world_size {
-        return None;
-    }
-    let mut shard_shape = shape.to_vec();
-    shard_shape[0] = shard_size;
-    let src = unsafe { entry.gpu.ptr().add(rank * shard_bytes) as *const u8 };
-    Some((src, shard_shape, shard_bytes))
+/// The host bytes for a device upload, returned by [`GpuWeights::take_upload_src`]
+/// so a backend extension trait can issue the copy without touching
+/// `GpuWeights`' private loader state (mmap map, cast scratch).
+pub struct UploadSrc {
+    pub ptr: *const u8,
+    pub bytes: usize,
+    pub dtype: DType,
+    pub shape: Vec<usize>,
+    /// The bytes live in the shared cast scratch (sync before the next take
+    /// to avoid an overwrite).
+    pub from_scratch: bool,
 }
 
-// `PrecastEntry` (the staged device buffer) is the neutral
-// `scratchy_tensors::PrecastEntry` — its `gpu: RawGpuMem` is backend-neutral, so
-// the pipeline can hand entries back to a `GpuWeights` that names no cuda type.
-
-/// Where the bytes for a device upload come from, returned by
-/// [`GpuWeights::take_upload_src`] / [`GpuWeights::take_shard_upload_src`] so a
-/// backend extension trait can issue the D2D/H2D copy without touching
-/// `GpuWeights`' private loader state (mmap map, cast scratch, precast).
-pub enum UploadSrc {
-    /// A whole tensor already device-resident (precast staged). The neutral
-    /// [`PrecastEntry`] owns the device buffer until the caller drops it.
-    Device(PrecastEntry),
-    /// A contiguous device sub-range of a staged entry (a dim-0 TP shard).
-    /// `src` points into `_keep`'s buffer — hold `_keep` until the copy ends.
-    DeviceSlice {
-        src: *const u8,
-        bytes: usize,
-        _keep: PrecastEntry,
-    },
-    /// Host bytes to H2D. `from_scratch` = the bytes live in the shared cast
-    /// scratch (sync the stream before the next take to avoid an overwrite).
-    Host {
-        ptr: *const u8,
-        bytes: usize,
-        dtype: DType,
-        shape: Vec<usize>,
-        from_scratch: bool,
-    },
-}
-
-/// Model weights loaded from CPU (mmap) to GPU with pipelined pre-casting.
+/// Model weights loaded from CPU (mmap) to the device.
 ///
 /// Weights are memory-mapped on CPU with madvise(WILLNEED) to trigger OS
-/// readahead. When `start_precast()` is called, a background thread pool
-/// pre-faults mmap pages and casts float tensors into pinned host buffers.
-/// `take()` checks for pre-cast data first — if ready, it just enqueues an
-/// async H2D DMA without blocking on page faults or CPU casting.
+/// readahead; `take()` casts (if needed) and copies each tensor up.
 ///
 /// GPU memory allocated by `take()` is NOT freed on drop — ownership transfers
 /// to the caller (model layers).
@@ -367,32 +318,14 @@ pub struct GpuWeights<A: DeviceAllocator> {
     /// on-disk dtype). Set once per model from `W::SCALE_DTYPE`;
     /// [`take_as_dtype`](Self::take_as_dtype) honors it, converting only when
     /// the on-disk gain dtype differs (so the mlx zero-copy path is preserved).
-    /// `None` leaves the gain at its on-disk dtype (cuda/spyre, which cast the
+    /// `None` leaves the gain at its on-disk dtype (spyre, which casts the
     /// gain themselves, never set it).
     rmsnorm_scale_dtype: Option<DType>,
-    /// Reusable host scratch for the synchronous-cast slow path
-    /// (fallback when the precast pipeline hasn't processed a
-    /// tensor yet). Pageable; CUDA's `memcpy_htod_async` from
-    /// pageable memory blocks the CPU but correctness is fine, and
-    /// the slow path is rare (precast handles the hot path).
+    /// Reusable host scratch for casting a tensor before upload.
     /// Grows as needed, never shrinks.
     cast_scratch: Vec<u8>,
-    /// Directory the safetensors shards were loaded from. Feeds the
-    /// QD-sidecar key (the filesystem device backing the weights);
-    /// `None` for GGUF/`empty()`-constructed instances.
-    source_dir: Option<std::path::PathBuf>,
-    /// Pre-stage pipeline, behind the neutral [`PrecastPipeline`] trait so this
-    /// struct names no cuda type. CUDA-only optimization (the impl uses pinned
-    /// host memory + driver DMAs); `None` under non-CUDA backends, which never
-    /// call `start_precast`.
-    precast: Option<Arc<dyn PrecastPipeline>>,
-    /// Join handles for the background pre-stage workers (empty unless cuda's
-    /// `start_precast` spawned them).
-    precast_handles: Vec<std::thread::JoinHandle<()>>,
-    /// Backend allocator: device memory + H2D primitive. The
-    /// concrete type is `CudaAllocator` under cuda or
-    /// `MetalAllocator` under metal — see [`BackendAllocator`]
-    /// (`crate::BackendAllocator`).
+    /// Backend allocator: device memory + H2D primitive (`MetalAllocator`
+    /// under metal, `SpyreAllocator` under spyre).
     allocator: A,
     /// Keep mmaps alive for the lifetime of GpuWeights.
     ///
@@ -521,10 +454,8 @@ impl<A: DeviceAllocator> GpuWeights<A> {
         Ok(lent)
     }
 
-    /// Construct an empty `GpuWeights` — used by the GGUF loader in
-    /// `scratchy-target-cuda`, which then populates `quantized` and
-    /// `gguf_dense` directly via `quantized_map_mut` /
-    /// `gguf_dense_map_mut`. Safetensors callers should use
+    /// Construct an empty `GpuWeights` with no tensors — for loads that
+    /// populate nothing from disk. Safetensors callers should use
     /// `from_dir` / `from_index` / `from_single_file` instead.
     pub fn empty(allocator: A) -> Self {
         Self {
@@ -532,9 +463,6 @@ impl<A: DeviceAllocator> GpuWeights<A> {
             target_dtype: None,
             rmsnorm_scale_dtype: None,
             cast_scratch: Vec::new(),
-            source_dir: None,
-            precast: None,
-            precast_handles: Vec::new(),
             allocator,
             _mmaps: Vec::new(),
             quantized: HashMap::new(),
@@ -552,7 +480,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
         let single_path = dir.join("model.safetensors");
         let shards = scratchy_core_model::weight::unindexed_shards_in(dir);
 
-        let mut gw = if index_path.exists() {
+        if index_path.exists() {
             Self::from_index(&index_path, allocator)
         } else if single_path.exists() {
             Self::from_single_file(&single_path, allocator)
@@ -560,9 +488,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
             Self::from_shards(dir, &shards, allocator)
         } else {
             anyhow::bail!("No safetensors files found in {}", dir.display());
-        }?;
-        gw.source_dir = Some(dir.to_path_buf());
-        Ok(gw)
+        }
     }
 }
 
@@ -575,9 +501,6 @@ impl<A: DeviceAllocator> GpuWeights<A> {
             target_dtype: None,
             rmsnorm_scale_dtype: None,
             cast_scratch: Vec::new(),
-            source_dir: None,
-            precast: None,
-            precast_handles: Vec::new(),
             allocator,
             _mmaps: Vec::new(),
             quantized: HashMap::new(),
@@ -626,9 +549,6 @@ impl<A: DeviceAllocator> GpuWeights<A> {
                 target_dtype: None,
                 rmsnorm_scale_dtype: None,
                 cast_scratch: Vec::new(),
-                source_dir: None,
-                precast: None,
-                precast_handles: Vec::new(),
                 allocator,
                 _mmaps: Vec::new(),
                 quantized: HashMap::new(),
@@ -669,8 +589,9 @@ impl<A: DeviceAllocator> GpuWeights<A> {
             // (zero-copy weight load). `register_mmap` dispatches
             // background `pread`s to populate a 16-aligned per-tensor
             // layout; per-tensor join happens at `take()` time inside
-            // `alloc_and_copy_host`. Cuda's `register_mmap` is a no-op default;
-            // its `prefault_mmap` issues the readahead hint instead.
+            // `alloc_and_copy_host`. A backend that keeps the no-op
+            // `register_mmap` default issues the readahead hint via
+            // `prefault_mmap` instead.
             allocator.register_mmap(&dir.join(shard_name), Arc::clone(&mmap))?;
             allocator.prefault_mmap(&mmap);
             mmaps.push(mmap);
@@ -681,9 +602,6 @@ impl<A: DeviceAllocator> GpuWeights<A> {
             target_dtype: None,
             rmsnorm_scale_dtype: None,
             cast_scratch: Vec::new(),
-            source_dir: None,
-            precast: None,
-            precast_handles: Vec::new(),
             allocator,
             _mmaps: mmaps,
             quantized: HashMap::new(),
@@ -696,8 +614,8 @@ impl<A: DeviceAllocator> GpuWeights<A> {
         let (shard_tensors, mmap) = load_shard_into_map(path)?;
         self.tensors.extend(shard_tensors);
         // Register the mmap with the allocator so metal `take()` can alias the
-        // safetensors pages directly (cuda register_mmap is a no-op); cuda's
-        // prefault_mmap issues the readahead hint.
+        // safetensors pages directly; `prefault_mmap` issues the readahead hint
+        // where the backend wants one.
         self.allocator.register_mmap(path, Arc::clone(&mmap))?;
         self.allocator.prefault_mmap(&mmap);
         self._mmaps.push(mmap);
@@ -876,15 +794,15 @@ impl<A: DeviceAllocator> GpuWeights<A> {
     }
 
     /// The pinned RMSNorm gain dtype, if any. Metal's RMSNorm loader uses it
-    /// to decide whether the on-disk gain needs converting; `None` (cuda /
-    /// spyre, GGUF) means keep the on-disk dtype.
+    /// to decide whether the on-disk gain needs converting; `None` (spyre,
+    /// GGUF) means keep the on-disk dtype.
     pub fn rmsnorm_scale_dtype(&self) -> Option<DType> {
         self.rmsnorm_scale_dtype
     }
 
     // ---- Accessors for backend extension traits ------------------------------
-    // GpuWeights itself is backend-neutral; the cuda/metal upload + precast
-    // methods live in extension traits in `targets/{cuda,metal}` and reach the
+    // GpuWeights itself is backend-neutral; the backend upload methods live in
+    // extension traits in `targets/{metal,spyre}` and reach the
     // private loader state through these.
 
     /// The backend allocator (device memory + H2D primitive).
@@ -892,59 +810,21 @@ impl<A: DeviceAllocator> GpuWeights<A> {
         &self.allocator
     }
 
-    /// Mutable backend allocator — for the cuda alloc-tracking passthroughs
-    /// (`record_alloc` / `take_gpu_allocs` / …).
+    /// Mutable backend allocator.
     pub fn allocator_mut(&mut self) -> &mut A {
         &mut self.allocator
     }
 
-    /// Model source directory (the per-disk QD-sidecar key for the precast ramp).
-    pub fn source_dir(&self) -> Option<&std::path::Path> {
-        self.source_dir.as_deref()
-    }
-
-    /// Whether a precast pipeline has been installed.
-    pub fn precast_started(&self) -> bool {
-        self.precast.is_some()
-    }
-
-    /// Install the backend-built precast pipeline.
-    pub fn set_precast(&mut self, pipeline: Arc<dyn PrecastPipeline>) {
-        self.precast = Some(pipeline);
-    }
-
-    /// Register a precast worker thread handle (joined on drop).
-    pub fn push_precast_handle(&mut self, handle: std::thread::JoinHandle<()>) {
-        self.precast_handles.push(handle);
-    }
-
-    /// Per-tensor `(mmap, data_offset, size_bytes, dtype)` for every tensor
-    /// backed by an mmap — the precast pipeline's work-list source.
-    pub fn mmap_tensor_refs(&self) -> Vec<(Arc<memmap2::Mmap>, usize, usize, DType)> {
-        self.tensors
-            .values()
-            .filter_map(|r| {
-                r.mmap
-                    .as_ref()
-                    .map(|m| (m.clone(), r.data_offset, r.size_bytes, r.dtype))
-            })
-            .collect()
-    }
-
-    /// Remove `name` and resolve where its (cast) bytes live for a device
-    /// upload — a staged device buffer (precast) or host bytes. The backend
-    /// extension issues the actual D2D/H2D copy.
+    /// Remove `name` and resolve where its (cast) host bytes live for a device
+    /// upload. The backend extension issues the actual copy.
     pub fn take_upload_src(&mut self, name: &str) -> Result<UploadSrc> {
         let cpu_ref = self
             .tensors
             .remove(name)
             .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
-        if let Some(entry) = self.take_precast(&cpu_ref) {
-            return Ok(UploadSrc::Device(entry));
-        }
         let (ptr, bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
         let from_scratch = std::ptr::eq(ptr, self.cast_scratch.as_ptr());
-        Ok(UploadSrc::Host {
+        Ok(UploadSrc {
             ptr,
             bytes,
             dtype,
@@ -953,52 +833,11 @@ impl<A: DeviceAllocator> GpuWeights<A> {
         })
     }
 
-    /// Like [`Self::take_upload_src`] but for a TP shard (`dim`/`rank`/`world_size`).
-    /// A staged entry yields a `DeviceSlice` for a dim-0 contiguous shard;
-    /// otherwise the host slow path (strided gather for dim-1) is used.
-    pub fn take_shard_upload_src(
-        &mut self,
-        name: &str,
-        dim: usize,
-        rank: usize,
-        world_size: usize,
-    ) -> Result<UploadSrc> {
-        let cpu_ref = self
-            .tensors
-            .remove(name)
-            .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
-        if let Some(entry) = self.take_precast(&cpu_ref)
-            && let Some((src, _shard_shape, bytes)) =
-                shard_of_entry(&entry, &cpu_ref.shape, dim, rank, world_size)
-        {
-            return Ok(UploadSrc::DeviceSlice {
-                src,
-                bytes,
-                _keep: entry,
-            });
-        }
-        let (data, shard_shape, dtype) = self.shard_cpu_data(&cpu_ref, dim, rank, world_size);
-        let bytes = shard_shape.iter().product::<usize>() * dtype.size_bytes();
-        let from_scratch = std::ptr::eq(data, self.cast_scratch.as_ptr());
-        Ok(UploadSrc::Host {
-            ptr: data,
-            bytes,
-            dtype,
-            shape: shard_shape,
-            from_scratch,
-        })
-    }
-
     /// Remove a tensor by name and copy it to GPU. Returns a GPU tensor.
-    ///
-    /// If the pre-cast pipeline has already processed this tensor, the H2D
-    /// DMA uses the pre-cast pinned buffer (fast path — no page faults or
-    /// CPU casting on the hot path). Otherwise falls back to synchronous
-    /// cast from the mmap.
     ///
     /// GGUF backing: if the tensor is in `gguf_dense` (already on GPU,
     /// dequantized at load), this short-circuits and returns it
-    /// directly — no upload, no precast.
+    /// directly — no upload.
     pub fn take(&mut self, name: &str) -> Result<GpuTensor> {
         // GGUF fast-path: norms / embeddings / lm_head are
         // pre-uploaded and dequantized by `load_gguf_into_weights`.
@@ -1011,18 +850,6 @@ impl<A: DeviceAllocator> GpuWeights<A> {
             .remove(name)
             .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
 
-        // Fast path: the pre-stage pipeline already uploaded this
-        // tensor (blocking per-chunk H2D — no sync needed). Transfer
-        // the device buffer into the allocator's lifetime tracker and
-        // wrap it. Cuda-only — Metal has no precast.
-        if let Some(entry) = self.take_precast(&cpu_ref) {
-            let ptr = entry.gpu.ptr();
-            let dtype = entry.dtype;
-            self.allocator.adopt_raw(entry.gpu);
-            return Ok(unsafe { GpuTensor::new(ptr, &cpu_ref.shape, dtype) });
-        }
-
-        // Slow path: synchronous pre-fault + cast + DMA.
         let (data, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
         let gpu_ptr = unsafe { self.allocator.alloc_and_copy_host(data, size_bytes)? };
         Ok(unsafe { GpuTensor::new(gpu_ptr, &cpu_ref.shape, dtype) })
@@ -1043,9 +870,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
     /// mmap-zero-copy fast path for F16/BF16 scales/biases/RMSNorm
     /// gains in `mlx-community` 4bit safetensors (whose data section
     /// lands at file-offset `mod 16 = 2`, permanently failing the
-    /// strict 16-byte `MetalAllocator::MIN_BIND_ALIGN` gate). On
-    /// CUDA the call is forwarded to `alloc_and_copy_host` — the
-    /// alignment hint is a no-op there.
+    /// strict 16-byte `MetalAllocator::MIN_BIND_ALIGN` gate).
     ///
     /// [`take`]: Self::take
     /// [`alloc_and_copy_host_aligned`]: crate::device_allocator::DeviceAllocator::alloc_and_copy_host_aligned
@@ -1057,20 +882,6 @@ impl<A: DeviceAllocator> GpuWeights<A> {
             .tensors
             .remove(name)
             .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
-        // Consume the pre-stage slot so it's not leaked. When the entry
-        // holds a byte-identical staged copy (no cast — entry dtype ==
-        // on-disk dtype), hand its device buffer over directly
-        // (cuMemAlloc alignment satisfies any scalar `min_align`); a
-        // cast entry's bytes are ignored — dropping it frees the
-        // staging — and the on-disk view is uploaded instead. (Metal
-        // has no precast.)
-        if let Some(entry) = self.take_precast(&cpu_ref)
-            && entry.dtype == cpu_ref.dtype
-        {
-            let ptr = entry.gpu.ptr();
-            self.allocator.adopt_raw(entry.gpu);
-            return Ok(unsafe { GpuTensor::new(ptr, &cpu_ref.shape, cpu_ref.dtype) });
-        }
         let gpu_ptr = unsafe {
             self.allocator.alloc_and_copy_host_aligned(
                 cpu_ref.data().as_ptr(),
@@ -1091,8 +902,8 @@ impl<A: DeviceAllocator> GpuWeights<A> {
     /// Metal's RMSNorm gain load uses this: the `_s_<scale>_` kernel binds the
     /// gain through a `device const T_scale*` chosen at compile time from
     /// `W::SCALE_DTYPE`, so the gain buffer's dtype must match `T_scale`
-    /// regardless of what the checkpoint shipped. cuda/spyre don't need it —
-    /// they cast the gain at load unconditionally.
+    /// regardless of what the checkpoint shipped. Spyre doesn't need it — it
+    /// casts the gain at load unconditionally.
     pub fn take_as_dtype(&mut self, name: &str, target: DType) -> Result<GpuTensor> {
         // Inspect the on-disk dtype without consuming the entry. GGUF dense
         // tensors are already device-resident in compute dtype — keep_dtype
@@ -1181,13 +992,6 @@ impl<A: DeviceAllocator> GpuWeights<A> {
             shape,
         );
 
-        if let Some(entry) = self.take_precast(&cpu_ref) {
-            let ptr = entry.gpu.ptr();
-            let dtype = entry.dtype;
-            self.allocator.adopt_raw(entry.gpu);
-            return Ok(unsafe { GpuTensor::new(ptr, shape, dtype) });
-        }
-
         let (data, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
         let gpu_ptr = unsafe { self.allocator.alloc_and_copy_host(data, size_bytes)? };
         Ok(unsafe { GpuTensor::new(gpu_ptr, shape, dtype) })
@@ -1197,8 +1001,7 @@ impl<A: DeviceAllocator> GpuWeights<A> {
     /// active [`DeviceAllocator`]. Returns a fresh `GpuTensor` of the
     /// given `shape` and `dtype` over that buffer.
     ///
-    /// Backend-neutral: under cuda this does `mem_alloc` + sync H2D;
-    /// under metal it allocates a `StorageModeShared` arena slice and
+    /// Backend-neutral: under metal it allocates a `StorageModeShared` arena slice and
     /// memcpys into it. Used by stream-free fused loaders (e.g.
     /// `LinearLayer::load_dense_concat_packed`) that pre-concatenate
     /// CPU bytes and need a single packed device buffer.
@@ -1272,25 +1075,6 @@ impl<A: DeviceAllocator> GpuWeights<A> {
             std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
         };
         self.alloc_packed_from_host(bytes, &shape, DType::F32)
-    }
-
-    /// Try to take a pre-staged entry for the given tensor's bytes.
-    /// CUDA-only.
-    ///
-    /// Keyed by data identity, so aliased names resolve to the same
-    /// entry. If a worker is mid-copy on this key, waits for it (the
-    /// wait is bounded by one tensor's copy). If no worker has
-    /// started it, marks the key consumed — so no worker wastes a
-    /// pinned buffer on bytes the caller is about to upload via the
-    /// slow path — and returns `None`.
-    fn take_precast(&self, cpu_ref: &CpuTensorRef) -> Option<PrecastEntry> {
-        let pipeline = self.precast.as_ref()?;
-        let mmap = cpu_ref.mmap.as_ref()?;
-        pipeline.take(
-            mmap.as_ptr() as usize,
-            cpu_ref.data_offset,
-            cpu_ref.size_bytes,
-        )
     }
 
     /// Take a tensor and return its data as a CPU `Vec<f32>`.
@@ -1563,11 +1347,10 @@ impl<A: DeviceAllocator> GpuWeights<A> {
     /// slice. Subsequent loads see the padded shape directly. No-op
     /// when the axis is already a multiple of `mult`.
     ///
-    /// Used by the vision encoder to work around cuBLAS bf16 GEMM
-    /// failing on K=3420 (Qwen2.5-VL-3B `vision_intermediate_size`):
-    /// padding K (or N on the producing weights) to the next mult of
-    /// 8 lands every gemm on an algo cuBLAS supports, with zero-fill
-    /// columns/rows preserving math (`silu(0)·0 = 0` on the activation
+    /// Used by the vision encoder to keep K=3420 (Qwen2.5-VL-3B
+    /// `vision_intermediate_size`) GEMMs on a multiple-of-8 K: padding K
+    /// (or N on the producing weights) to the next mult of 8, with
+    /// zero-fill columns/rows preserving math (`silu(0)·0 = 0` on the activation
     /// side, weight-side zero rows contract to zero in the next gemm).
     pub fn pad_axis_to_mult8(&mut self, name: &str, dim: usize, mult: usize) -> Result<()> {
         let cpu_ref = self
@@ -1721,9 +1504,8 @@ impl<A: DeviceAllocator> GpuWeights<A> {
     // GGUF backing-store accessors
     // ----------------------------------------------------------------------
     //
-    // Populated by `from_gguf` (in `scratchy-target-cuda`, since it depends on
-    // GGUF-specific kernels for dequantizing norms / embeddings). The
-    // safetensors construction paths leave these maps empty.
+    // No in-tree loader populates these maps; the safetensors construction
+    // paths leave them empty.
 
     /// Get a quantized linear weight by HF tensor name. Returns
     /// `None` when the backing store is safetensors or the tensor
@@ -2401,30 +2183,6 @@ impl<A: DeviceAllocator> GpuWeights<A> {
             .remove(name)
             .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
 
-        // Pre-staged fast path: a dim-0 shard is a contiguous row range
-        // of the staged (possibly cast) device-resident full tensor.
-        // world==1 hands the whole staged buffer over zero-copy; world>1
-        // D2D-copies the slice out and frees the staging. A dim-1 shard
-        // needs a strided gather on host bytes — the staged entry is
-        // unusable there and just dropped (tp>1 row-parallel only).
-        if let Some(entry) = self.take_precast(&cpu_ref)
-            && let Some((src, shard_shape, shard_bytes)) =
-                shard_of_entry(&entry, &cpu_ref.shape, dim, rank, world_size)
-        {
-            let dtype = entry.dtype;
-            if shard_bytes == entry.size_bytes {
-                // world == 1: the staged buffer IS the tensor.
-                let ptr = entry.gpu.ptr();
-                self.allocator.adopt_raw(entry.gpu);
-                return Ok(unsafe { GpuTensor::new(ptr, &shard_shape, dtype) });
-            }
-            // world > 1: D2D the strided slice out of the staged buffer into a
-            // fresh tracked allocation (syncs before we drop the staging src).
-            let dev = unsafe { self.allocator.alloc_and_copy_device(src, shard_bytes)? };
-            drop(entry);
-            return Ok(unsafe { GpuTensor::new(dev, &shard_shape, dtype) });
-        }
-
         let (data, shard_shape, dtype) = self.shard_cpu_data(&cpu_ref, dim, rank, world_size);
 
         let size_bytes = shard_shape.iter().product::<usize>() * dtype.size_bytes();
@@ -2504,11 +2262,9 @@ impl<A: DeviceAllocator> GpuWeights<A> {
     /// Returns (data_bytes, shape, dtype).
     ///
     /// Routes through [`Self::maybe_cast_cpu`] so the bytes match
-    /// `target_dtype` when one is set — same cast surface cuda's
-    /// `take_into` uses, so callers don't have to track the dtype
-    /// drift between disk and target separately. Under metal this is
-    /// the only on-the-way-in cast path; under cuda it's available to
-    /// pre-allocated-host loaders that don't run on a stream.
+    /// `target_dtype` when one is set, so callers don't have to track
+    /// the dtype drift between disk and target separately. Under metal
+    /// this is the only on-the-way-in cast path.
     pub fn take_cpu(&mut self, name: &str) -> Result<(Vec<u8>, Vec<usize>, DType)> {
         let cpu_ref = self
             .tensors
@@ -2520,29 +2276,6 @@ impl<A: DeviceAllocator> GpuWeights<A> {
         // We immediately copy out before either source is reused.
         let data = unsafe { std::slice::from_raw_parts(ptr, size_bytes) }.to_vec();
         Ok((data, cpu_ref.shape, dtype))
-    }
-}
-
-impl<A: DeviceAllocator> Drop for GpuWeights<A> {
-    fn drop(&mut self) {
-        // Signal pre-stage workers to stop, then wait for them. After the
-        // join the workers' `Arc<dyn PrecastPipeline>` clones are gone, so when
-        // `self.precast` (this struct's field) drops it is the last ref and the
-        // pipeline's own `Drop` frees any unconsumed pre-staged device buffers
-        // (`RawGpuMem`s in its ready-map) on this thread, which holds the
-        // load-time CUDA context. No-op when no pipeline was started (metal).
-        if let Some(pipeline) = &self.precast {
-            pipeline.shutdown();
-        }
-        for handle in self.precast_handles.drain(..) {
-            handle.join().ok();
-        }
-        // `cast_scratch: Vec<u8>` drops itself.
-        // `allocator` drops itself (CUDA: frees GPU mem; Metal: frees MTLBuffers).
-        // GPU memory allocated by take()/take_into() is owned by model layers
-        //   on the cuda path (transferred via take_gpu_allocs); on metal it's
-        //   held by the allocator's MetalBuffer arenas.
-        // CPU mmaps are dropped automatically when Arc<Mmap> refcounts reach zero.
     }
 }
 

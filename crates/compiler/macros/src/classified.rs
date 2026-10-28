@@ -345,8 +345,7 @@ pub enum OpKind {
     /// pass that inserts one of these after every `Gemm` whose weight
     /// has shard-kind `ShardDim1` (row-parallel: `o_proj`,
     /// `down_proj`). At `tp_world_size = 1` the pass is a no-op so no
-    /// FUF carries this op kind. Lowers to `Instruction::AllReduce`
-    /// (gated under the `nccl` feature on `scratchy-forward-compiler`).
+    /// FUF carries this op kind (only tp = 1 is emitted).
     AllReduce,
     /// Tensor-parallel all-gather along the LAST dim of one input
     /// tile across `tp_world_size` ranks. Output shape is the input
@@ -378,9 +377,9 @@ pub enum OpKind {
     /// `Instruction::Embed::eval` inline splice.
     ///
     /// CONSTRUCTED ONLY by `tp_lowering::insert_mm_splices`, which is
-    /// cuda/metal-gated — under `spyre` alone this variant is reached
+    /// metal-gated — under `spyre` alone this variant is reached
     /// (matched, never built) and that is EXPECTED.
-    #[cfg_attr(feature = "spyre", expect(dead_code))]
+    #[cfg_attr(not(feature = "metal"), expect(dead_code))]
     MmEmbedSplice,
     /// Broadcast-add of a learned per-feature bias vector across the
     /// batch/token dimensions: `bias_add(x: [..., D], b: [D]) -> [..., D]`.
@@ -561,7 +560,6 @@ pub enum OpKind {
     AvgPool2d,
     /// CLIP-class CLS-token strip: `strip_cls(x) -> [L-1, e]`. Removes
     /// the leading CLS row that LLaVA-1.5's CLIP encoder produces.
-    /// Claimed by [`crate::impl_lib::StripClsImpl`].
     StripCls,
     /// Vision-tower learned positional embedding lookup:
     /// `pos_embed(position_ids, weight) -> [num_tokens, vision_embed_dim]`.
@@ -887,6 +885,19 @@ impl WeightTable {
         self.entries
             .iter()
             .any(|p| p.len() > prefix.len() && p.iter().zip(prefix).all(|(s, t)| s == t))
+    }
+
+    /// The weight bases the DSL declares a `shared_expert` subtree under (`mlp` for
+    /// `mlp.shared_expert.gate_proj`): the bundles whose shared expert the DSL states as ops of
+    /// its own, so neither a MoE struct loader nor a target's expert combine may add it again (the
+    /// single-owner rule). Ascending.
+    pub fn shared_expert_bases(&self) -> Vec<String> {
+        (self.entries.iter())
+            .filter_map(|p| p.first().cloned())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|b| self.has_subtree(&[b, "shared_expert"]))
+            .collect()
     }
 
     pub fn len(&self) -> usize {
