@@ -18,7 +18,7 @@ use std::num::NonZeroU32;
 
 use scratchy_subtile::handoff::SourceBinding;
 use scratchy_subtile::ops::SubOpKind;
-use scratchy_subtile::sample_rows::SampleRowsFacts;
+use scratchy_subtile::sample_rows::{ResultRows, SampleRowsFacts};
 use scratchy_subtile::subtile_ir::{EwKind, ExpertBundle, ExpertProj, OpStage, RopeForm, SubOp};
 use scratchy_subtile::tape_colouring::{ColourFacts, ColourRule, OutputAlias};
 use scratchy_subtile::tape_folding::{FoldPattern, FusionTable, GatedKernel};
@@ -130,6 +130,11 @@ pub fn cuda_colour_rule<F: RopeForm, S: OpStage>(op: &SubOp<F, S>) -> ColourRule
 /// CUDA's sampled rows: none. The `lm_head` computes every row (bf16 only, no sliced matmul yet),
 /// so `sample_rows::expand_sample_rows` inserts nothing.
 pub const CUDA_SAMPLE_ROWS: SampleRowsFacts = SampleRowsFacts { weights: &[] };
+
+/// The rows of a CUDA tape's result its caller reads: every row, in order. The worker downloads
+/// the whole result colour (no row is sampled to the front), so the shared sample-rows pass leaves
+/// the canonical as it is.
+pub const CUDA_RESULT_ROWS: ResultRows = ResultRows::Every;
 
 // ── The fusions ─────────────────────────────────────────────────────
 

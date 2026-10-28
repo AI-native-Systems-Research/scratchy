@@ -30,8 +30,8 @@ use scratchy_subtile::subtile_tape::{Instr, SubtileTape, lower_dag_to_tape};
 use scratchy_subtile::tape_colouring::{Colour, ColourError, TapeColouring, colour_tape};
 use scratchy_subtile::tape_folding::{FoldError, ModelFoldFacts, StepRole, TapeFolds, fold_tape};
 use scratchy_target_cuda::op_abi::{
-    CUDA_COLOUR_FACTS, CUDA_COLUMN_BLOCK, CUDA_EXPERT_TILE_ROWS, CUDA_FUSIONS, CUDA_SAMPLE_ROWS,
-    CUDA_SORTED_PAIRS, CudaFusion,
+    CUDA_COLOUR_FACTS, CUDA_COLUMN_BLOCK, CUDA_EXPERT_TILE_ROWS, CUDA_FUSIONS, CUDA_RESULT_ROWS,
+    CUDA_SAMPLE_ROWS, CUDA_SORTED_PAIRS, CudaFusion,
 };
 use scratchy_target_cuda::step::{
     CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep, GDN_SEQUENCE_BYTES, gdn_scratch,
@@ -1362,7 +1362,8 @@ pub fn plan_canonical(
     let CanonicalAt { stem, m } = at;
     // CUDA's lm_head slice: none is declared, so this inserts nothing — but it runs, so a row
     // added to the table takes effect without touching this function.
-    let lowered = expand_sample_rows(l, &CUDA_SAMPLE_ROWS).map_err(CanonicalRefusal::SampleRows)?;
+    let lowered = expand_sample_rows(l, &CUDA_SAMPLE_ROWS, CUDA_RESULT_ROWS)
+        .map_err(CanonicalRefusal::SampleRows)?;
     let graph = lower_region(&lowered.input, CUDA_COLUMN_BLOCK);
     let tape = {
         let valid = ValidatedGraph::new(&graph)
