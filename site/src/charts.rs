@@ -655,8 +655,8 @@ pub fn glance_mini(
 }
 
 /// A glance's heat maps beside their ratio scale: a row per `rows` (a
-/// machine on metal.html, a dtype on spyre.html), its name, then a cell per
-/// `columns` (a model), each the column's
+/// machine on metal.html, a dtype on spyre.html), its name over its first
+/// cell's upper left, then a cell per `columns` (a model), each the column's
 /// name over `cell(row, column)`, that row's grids of that model as
 /// glance_minis. The cells are one width, 11.5rem (two 88px grids and the 8px
 /// between them), and on a narrow screen shrink together rather than wrap, as
@@ -673,7 +673,7 @@ pub fn glance_maps(
 ) -> Element {
     let grid = format!(
         "flex: 0 1 auto; min-width: 0; align-self: start; display: grid; \
-         grid-template-columns: 7rem repeat({}, {column_width}); gap: 1.5rem",
+         grid-template-columns: repeat({}, {column_width}); gap: 1.5rem",
         columns.len()
     );
     rsx! {
@@ -681,9 +681,14 @@ pub fn glance_maps(
             div { style: "{grid}",
                 for row in rows {
                     div { style: "grid-column: 1 / -1; display: grid; grid-template-columns: subgrid; row-gap: 0.5rem",
-                        div { style: "grid-row: span 2", "{row}" }
-                        for column in columns {
-                            div { style: "align-self: end; text-align: center", "{column}" }
+                        for (k, column) in columns.iter().enumerate() {
+                            // The row's name over its first cell's upper left, in no column of
+                            // its own; the names sit on the track's floor, so the first's
+                            // stays level with the rest.
+                            div { style: "align-self: end",
+                                if k == 0 { div { strong { "{row}" } } }
+                                div { style: "text-align: center", "{column}" }
+                            }
                         }
                         for column in columns {
                             div { style: "display: flex; gap: 0.5rem; align-items: flex-start",

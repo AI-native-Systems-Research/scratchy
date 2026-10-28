@@ -2899,13 +2899,11 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
     }
 }
 
-/// The glance's sparkline grids, every panel's, so every sparkline is one
-/// size: the machine, a row label, then `columns` equal columns. The label
-/// column has a width of its own rather than its labels', so a panel without
-/// row labels gives its sparklines the same width as one with them.
+/// The glance's sparkline grids: `columns` equal columns, each machine's name
+/// a line of its own over its row's upper left rather than a column.
 fn spark_grid(columns: usize) -> String {
     format!(
-        "display: grid; grid-template-columns: 7rem 4rem repeat({columns}, minmax(0, 1fr)); \
+        "display: grid; grid-template-columns: repeat({columns}, minmax(0, 1fr)); \
          gap: 0.25rem 2rem; align-items: center"
     )
 }
@@ -3240,13 +3238,9 @@ fn startup_panel(machines: &BTreeMap<&str, MachineRuns>, columns: usize) -> Elem
                  send to first token. Each sparkline is one run: the newest that timed both engines for the most models."
             }
             div { style: spark_grid(columns.max(STARTUP_COLUMNS.len())),
-                div {}
-                div {}
                 for col in &STARTUP_COLUMNS { div { style: "text-align: center", "{col.title}" } }
                 for chip in in_order(machines) {
-                    // Column 1 starts a row, past any columns this panel leaves empty.
-                    div { style: "grid-column: 1; align-self: start", "{chip}" }
-                    div {}
+                    div { style: "grid-column: 1 / -1; margin-top: 0.5rem", strong { "{chip}" } }
                     for (k, col) in STARTUP_COLUMNS.iter().enumerate() {
                         div {
                             match &sparks[&(chip, k)] {
