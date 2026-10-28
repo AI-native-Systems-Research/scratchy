@@ -148,26 +148,33 @@ pub enum Chart<'a> {
         data: Vec<SparkPoint>,
         options: ChartOptions<'a>,
     },
-    /// Carbon's ScatterChart: one dot a measurement.
-    Scatter {
-        data: Vec<DotPoint<'a>>,
+    /// Carbon's BubbleChart: a bubble per spot measurements share, its area their count.
+    Bubble {
+        data: Vec<BubblePoint<'a>>,
         options: ChartOptions<'a>,
+        /// A one-measurement bubble's radius in px: charts.js scales every other from it, by
+        /// [`BubblePoint::radius`].
+        unit_radius: f64,
     },
 }
 
-/// One dot: its series, where along the bottom axis, and its value.
+/// One bubble: its series, where along the bottom axis, its value, and the square root of how
+/// many measurements it stands for (Carbon maps `radius` linearly onto px, so its area counts
+/// them; charts.js prints the count back in the tooltip).
 #[derive(Serialize)]
-pub struct DotPoint<'a> {
+pub struct BubblePoint<'a> {
     pub group: &'a str,
     pub key: f64,
     pub value: f64,
+    pub radius: f64,
 }
 
-/// A scatter chart's dots: Carbon's `points` option.
+/// A bubble chart's bubbles: Carbon's `bubble` option.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Points {
-    pub radius: f64,
+pub struct Bubbles {
+    pub radius_maps_to: &'static str,
+    pub radius_label: &'static str,
     pub fill_opacity: f64,
 }
 
@@ -229,7 +236,7 @@ pub struct ChartOptions<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bounds: Option<Bounds>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub points: Option<Points>,
+    pub bubble: Option<Bubbles>,
     pub toolbar: Enabled,
 }
 
@@ -425,7 +432,7 @@ impl Chart<'_> {
             Chart::GroupedBar { options, .. }
             | Chart::Heatmap { options, .. }
             | Chart::Combo { options, .. }
-            | Chart::Scatter { options, .. } => options,
+            | Chart::Bubble { options, .. } => options,
         }
     }
 }
@@ -586,7 +593,7 @@ pub fn mini_heatmap(
             locale: Locale::total(total_label),
             combo: None,
             bounds: None,
-            points: None,
+            bubble: None,
             toolbar: Enabled { enabled: false },
         },
         ratio: true,
@@ -991,7 +998,7 @@ pub fn sparkline(
                 upper_bound_maps_to: "upper",
                 lower_bound_maps_to: "lower",
             }),
-            points: None,
+            bubble: None,
             toolbar: Enabled { enabled: false },
         },
     };
