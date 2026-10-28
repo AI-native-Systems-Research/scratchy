@@ -43,8 +43,10 @@ chat = ["dep:scratchy-serving-api"]
 # which is pinned to tokenizers 0.21 upstream while we're on 0.23).
 serve = ["dep:scratchy-serving-api", "scratchy-serving-api/serve", "guided-decoding"]
 # `scr launch claude` spawns `<this binary> serve` as a child, so it needs the
-# server compiled in.
-claude = ["serve"]
+# server compiled in. `--auto-mode-only` also runs a small local proxy in front
+# of the user's gateway, on axum and tokio's listener, both of which `serve`
+# already brings into the build.
+claude = ["serve", "dep:axum", "dep:tokio-stream", "tokio/net"]
 
 otel = ["scratchy-serving-api?/otel"]
 bench = ["scratchy-bench"]
@@ -173,6 +175,9 @@ libc = { workspace = true }
 # and `scr complete` are always built, and ureq is already in the tree via
 # hf-hub-downloader, so they cost no additional crates.
 ureq = { workspace = true }
+# The `launch claude --auto-mode-only` proxy (see commands/launch_proxy.rs).
+axum = { workspace = true, optional = true }
+tokio-stream = { workspace = true, optional = true }
 
 # Purely for CLI feature-reachability — nothing here calls into
 # scratchy-quantizations directly. Quant-preset build scope (no `quant-`

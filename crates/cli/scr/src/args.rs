@@ -107,6 +107,29 @@ pub struct LaunchClaudeArgs {
     #[arg(short = 'm', long, env = "VLLM_MODEL")]
     pub model: Option<String>,
 
+    /// Pick the best model for this Mac (metal only): the biggest quantized MLX
+    /// checkpoint its memory class fits and this binary compiles in, served with
+    /// the widest context its KV cache holds. Prints the build line when the
+    /// pick is not compiled in.
+    #[arg(short = 'A', long, conflicts_with_all = ["model_tag", "model"])]
+    pub best_model: bool,
+
+    /// --best-model's settings, serving this model instead of the pick: `-a
+    /// mlx-community/Qwen3.5-9B-4bit` or `-a=<MODEL>`. Implies --best-model.
+    #[arg(short = 'a', value_name = "MODEL", conflicts_with_all = ["model_tag", "model"])]
+    pub best_model_override: Option<String>,
+
+    /// Keep the session on your own gateway and send only Claude Code's
+    /// auto-mode safety checks to the local model. Claude Code starts in auto
+    /// mode against a local proxy that forwards everything to
+    /// `ANTHROPIC_BASE_URL`, untouched and with your credentials, except the
+    /// checks, which a local scratchy server answers. Needs `ANTHROPIC_BASE_URL`
+    /// set to that gateway. The local model is whatever the other flags name:
+    /// `--best-model`/`-A` picks one for this Mac, `-a`/`-m`/the positional names
+    /// one.
+    #[arg(long)]
+    pub auto_mode_only: bool,
+
     /// Device: "cpu", "cuda:N", "metal", or "auto" (auto-detect best GPU).
     #[arg(long, default_value = "auto")]
     pub device: String,

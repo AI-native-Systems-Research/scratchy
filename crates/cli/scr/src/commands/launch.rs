@@ -144,6 +144,184 @@ fn launch_env(
     .collect()
 }
 
+/// What `--auto-mode-only` tells Claude Code: send everything to the local
+/// proxy, and send the auto-mode safety checks under the one model name the
+/// proxy routes to the local server.
+///
+/// Unlike [`launch_env`], it leaves the session's own models and credentials
+/// alone — they are the user's, for their gateway, and the proxy forwards them
+/// there untouched — so no model tier is pinned, no token replaced and no
+/// window or reply budget sized to a local model.
+fn auto_mode_only_env(proxy_url: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("ANTHROPIC_BASE_URL", proxy_url.to_string()),
+        // Claude Code's own classifier requests, not the gateway-side review
+        // it asks for by default behind a gateway: that review happens inside
+        // the session's model requests, where a local model cannot answer it.
+        // Claude Code marks this variable as temporary; it is read on 2.1.311.
+        ("CLAUDE_CODE_AUTO_MODE_SERVER", "0".to_string()),
+        // The routing key: no other request Claude Code sends names this model.
+        (
+            "CLAUDE_CODE_AUTO_MODE_MODEL",
+            super::launch_proxy::CLASSIFIER_MODEL.to_string(),
+        ),
+    ]
+}
+
+/// The gateway an `--auto-mode-only` session keeps talking to, from the user's
+/// `ANTHROPIC_BASE_URL`. Refused when unset: the proxy would have nowhere to send
+/// the session, and Claude Code's default endpoint is Anthropic's own API,
+/// which a claude.ai login does not reach through a proxy.
+fn user_gateway(base_url: Option<&str>) -> Result<String> {
+    match base_url.map(str::trim).filter(|u| !u.is_empty()) {
+        Some(url) => Ok(url.trim_end_matches('/').to_string()),
+        None => bail!(
+            "--auto-mode-only keeps your session on your own gateway and needs it in \
+             ANTHROPIC_BASE_URL (with its token in ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY). \
+             A claude.ai login cannot go through a local proxy."
+        ),
+    }
+}
+
+/// The `--auto-mode-only` half of [`run_launch_claude`]: start the proxy in
+/// front of `gateway`, run Claude Code in auto mode against it, and report what
+/// the local server answered.
+async fn run_auto_mode_only(
+    args: LaunchClaudeArgs,
+    model: &str,
+    gateway: String,
+    local_url: String,
+    server: Option<ServerProcess>,
+    inject: SessionInject,
+) -> Result<()> {
+    // A server launch did not start may still think before it answers, and a
+    // check whose verdict comes late or never is denied (`serve_argv` turns
+    // thinking off only for a server launch starts).
+    if let Some(warning) = external_classifier_warning(server.is_none()) {
+        eprintln!("{warning}");
+    }
+    // The served id, not the one launch was given: a local path or an alias
+    // serves under a name of the server's own.
+    let local_model =
+        served_model_id(&local_url, &args.auth_token).unwrap_or_else(|| model.to_string());
+    let proxy = super::launch_proxy::start(super::launch_proxy::Routes {
+        gateway: gateway.clone(),
+        local: local_url.clone(),
+        local_model: local_model.clone(),
+    })
+    .await?;
+    let proxy_url = format!("http://{}", proxy.addr);
+
+    // A delta, like the full launch: `/v1/models` above was launch's own.
+    let served_before = requests_served(&local_url, &args.auth_token);
+
+    let env = auto_mode_only_env(&proxy_url);
+    let mut cmd = std::process::Command::new(&args.claude_bin);
+    for (key, value) in &env {
+        cmd.env(key, value);
+    }
+    // `--settings` for the same reason as the full launch: a settings file's
+    // `env` block outranks the process environment, and one carrying its own
+    // `ANTHROPIC_BASE_URL` would send the session around the proxy.
+    cmd.arg("--settings").arg(claude_settings_json(&env));
+    // Auto mode is the point, but a mode passed through after `--` is the
+    // user's to choose (plan mode also sends shell commands to the classifier).
+    let mode_in_args = args
+        .claude_args
+        .iter()
+        .any(|a| a == "--permission-mode" || a.starts_with("--permission-mode="));
+    if !mode_in_args {
+        cmd.arg("--permission-mode").arg("auto");
+    }
+    add_session_args(&mut cmd, &inject, &args.claude_args);
+
+    eprintln!(
+        "Launching `{}` in auto mode: session → {gateway}, safety checks → {local_url} \
+         (model: {local_model}) via {proxy_url}",
+        args.claude_bin
+    );
+    // Blocking on the child here would starve nothing — the runtime has other
+    // workers — but say so: the proxy runs on those workers while claude runs.
+    let status = tokio::task::block_in_place(|| cmd.status()).with_context(|| {
+        format!(
+            "failed to launch `{}` — is Claude Code installed and on PATH?",
+            args.claude_bin
+        )
+    })?;
+
+    let served_after = requests_served(&local_url, &args.auth_token);
+    drop(proxy);
+    if let SessionInject::New(id) = &inject {
+        eprintln!(
+            "\nscratchy: resume this session with:\n  \
+             scr launch claude --auto-mode-only {model} --resume {id}\n"
+        );
+    }
+    drop(server);
+
+    eprintln!("{}", auto_mode_report(served_before, served_after));
+    claude_exit(&args.claude_bin, status)
+}
+
+/// The session flag launch adds to the `claude` command line, then the user's
+/// own passed-through args. Shared by both launch paths so they cannot drift.
+fn add_session_args(
+    cmd: &mut std::process::Command,
+    inject: &SessionInject,
+    claude_args: &[String],
+) {
+    match inject {
+        SessionInject::Resume(id) => {
+            cmd.arg("--resume").arg(id);
+        }
+        SessionInject::New(id) => {
+            cmd.arg("--session-id").arg(id);
+        }
+        // Already on the command line, or `--continue` picks the session.
+        SessionInject::AlreadyInArgs | SessionInject::Continue => {}
+    }
+    cmd.args(claude_args);
+}
+
+/// `claude`'s exit status as launch's own result.
+fn claude_exit(claude_bin: &str, status: std::process::ExitStatus) -> Result<()> {
+    if status.success() {
+        return Ok(());
+    }
+    match status.code() {
+        Some(code) => bail!("`{claude_bin}` exited with status {code}"),
+        None => bail!("`{claude_bin}` terminated by signal"),
+    }
+}
+
+/// The warning `--auto-mode-only` prints when the local server is one launch did
+/// not start (`--server-url`), so its thinking setting is not launch's to set.
+fn external_classifier_warning(external: bool) -> Option<String> {
+    external.then(|| {
+        "Warning: --server-url uses a server launch did not start, so launch cannot turn its \
+         thinking off. A model that reasons before answering (Qwen3.6, for one) is slow on safety \
+         checks and Claude Code denies the action when no verdict comes back. Start that server \
+         with `--default-chat-template-kwargs '{\"enable_thinking\": false}'`, or drop \
+         --server-url and let launch start one."
+            .to_string()
+    })
+}
+
+/// What the local server's request count says about the safety checks. Zero is
+/// not an error: a session that only read files and edited inside the project
+/// sends Claude Code no checks at all.
+fn auto_mode_report(before: Option<u64>, after: Option<u64>) -> String {
+    match (before, after) {
+        (Some(b), Some(a)) => format!(
+            "scratchy: the local server answered {} auto-mode safety check(s) this session.",
+            a.saturating_sub(b)
+        ),
+        _ => "Note: could not read a request count from the local server, so this run carries \
+              no server-side count of the safety checks it answered."
+            .to_string(),
+    }
+}
+
 /// The variables that choose a provider other than the plain Anthropic API.
 /// Set, they bypass `ANTHROPIC_BASE_URL` entirely.
 const PROVIDER_SELECTION_VARS: &[&str] = &[
@@ -197,6 +375,20 @@ fn served_context_window(base_url: &str, auth_token: &str) -> Option<usize> {
     let client = crate::http::RemoteClient::with_timeout(auth_token, CONTEXT_WINDOW_TIMEOUT);
     let models = client.get_json(&format!("{base_url}/v1/models")).ok()?;
     context_window_from_models(&models)
+}
+
+/// The id the server serves its model under, from `/v1/models`, or `None` when
+/// it cannot say.
+fn served_model_id(base_url: &str, auth_token: &str) -> Option<String> {
+    let client = crate::http::RemoteClient::with_timeout(auth_token, CONTEXT_WINDOW_TIMEOUT);
+    let models = client.get_json(&format!("{base_url}/v1/models")).ok()?;
+    let id = models
+        .get("data")?
+        .as_array()?
+        .first()?
+        .get("id")?
+        .as_str()?;
+    Some(id.to_string())
 }
 
 /// `max_model_len` from a `GET /v1/models` body. A scratchy server lists its one
@@ -590,11 +782,14 @@ fn continues_latest_session(args: &[String]) -> bool {
 }
 
 pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
-    let model = args
-        .model_tag
-        .clone()
-        .or_else(|| args.model.clone())
-        .context("a model is required: `scr launch claude <MODEL>`")?;
+    let model = match super::launch_best_model::resolve(&args)? {
+        Some(model) => model,
+        None => args
+            .model_tag
+            .clone()
+            .or_else(|| args.model.clone())
+            .context("a model is required: `scr launch claude <MODEL>`, or `--best-model`/`-A`")?,
+    };
 
     // Launch owns `--settings`: it is how the server under test is made to
     // outrank the user's own settings files, so a second occurrence could put
@@ -650,6 +845,16 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
     )
     .unwrap_or_else(|| SessionInject::New(gen_uuid_v4()));
 
+    // `--auto-mode-only`: read the user's own gateway before anything else, so a
+    // launch that cannot route the session anywhere fails before a model loads.
+    let gateway = if args.auto_mode_only {
+        Some(user_gateway(
+            std::env::var("ANTHROPIC_BASE_URL").ok().as_deref(),
+        )?)
+    } else {
+        None
+    };
+
     // Either reuse a running server, or spawn one we own (and tear down on exit).
     let (base_url, server) = match args.server_url.clone() {
         Some(url) => {
@@ -684,6 +889,14 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
             (url, Some(server))
         }
     };
+
+    // `--auto-mode-only` keeps the session on the user's gateway, so the window
+    // and reply budget below — sized to the local model — do not apply; only
+    // the classifier traffic reaches the local server. Launch runs the proxy
+    // that splits the two and hands Claude Code its environment.
+    if let Some(gateway) = gateway {
+        return run_auto_mode_only(args, &model, gateway, base_url, server, inject).await;
+    }
 
     // The window Claude Code compacts against has to be no larger than the one
     // the server serves, or the session dies the first time the conversation
@@ -753,16 +966,7 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
     // "slower and cost more" warning without any benefit.
     // Forward the session flag to claude — except when it's already in the
     // passed-through `-- …` args (case 3), where re-adding would duplicate it.
-    match &inject {
-        SessionInject::Resume(id) => {
-            cmd.arg("--resume").arg(id);
-        }
-        SessionInject::New(id) => {
-            cmd.arg("--session-id").arg(id);
-        }
-        SessionInject::AlreadyInArgs | SessionInject::Continue => {}
-    }
-    cmd.args(&args.claude_args);
+    add_session_args(&mut cmd, &inject, &args.claude_args);
 
     eprintln!(
         "Launching `{}` against {base_url} (model: {model}{window_label}{budget_label})",
@@ -807,11 +1011,8 @@ pub async fn run_launch_claude(args: LaunchClaudeArgs) -> Result<()> {
     // is the more specific explanation of why nothing was served.
     if !status.success() {
         eprintln!("{report}");
-        if let Some(code) = status.code() {
-            bail!("`{}` exited with status {code}", args.claude_bin);
-        }
-        bail!("`{}` terminated by signal", args.claude_bin);
     }
+    claude_exit(&args.claude_bin, status)?;
 
     // A non-interactive run that served nothing fails the command even though
     // `claude` exited 0, so a harness learns it from the exit status instead of
@@ -904,6 +1105,21 @@ fn serve_argv(
     }
     if args.no_prefix_caching && !taken.contains(&"--no-prefix-caching") {
         argv.push("--no-prefix-caching".to_string());
+    }
+    // A safety check wants a verdict, not a chain of thought. Claude Code asks
+    // for that with `thinking: {"type": "disabled"}`, which the Messages API
+    // honours only by dropping the reasoning from the reply: a model like
+    // Qwen3.6 still thinks first, so the verdict comes late or never, and
+    // Claude Code denies the action. The template flag stops the thinking
+    // itself (Qwen3.6-35B: a 7-token `<block>no` answer, against several
+    // hundred tokens of reasoning without it).
+    if args.auto_mode_only {
+        pair(
+            &mut argv,
+            &taken,
+            "--default-chat-template-kwargs",
+            r#"{"enable_thinking": false}"#,
+        );
     }
     argv.extend(args.serve_arg.iter().cloned());
     Ok(argv)
@@ -1210,11 +1426,12 @@ fn gen_uuid_v4() -> String {
 mod tests {
     use super::{
         ClaudeCodeLimits, LaunchClaudeArgs, PROVIDER_SELECTION_VARS, SessionInject,
-        SmallWindowOrigin, asked_max_model_len, claude_code_floor_warning,
+        SmallWindowOrigin, asked_max_model_len, auto_mode_only_env, claude_code_floor_warning,
         claude_code_output_budget, claude_code_window, claude_settings_json,
-        context_window_from_models, context_window_warning, gen_uuid_v4, ignored_with_server_url,
-        is_print_mode, launch_env, provenance_report, resolve_session_inject, serve_argv,
-        session_id_from_args, settings_flag_in_args,
+        context_window_from_models, context_window_warning, external_classifier_warning,
+        gen_uuid_v4, ignored_with_server_url, is_print_mode, launch_env, provenance_report,
+        resolve_session_inject, serve_argv, session_id_from_args, settings_flag_in_args,
+        user_gateway,
     };
 
     fn s(v: &[&str]) -> Vec<String> {
@@ -1229,6 +1446,129 @@ mod tests {
         let mut argv = vec!["claude", "my-model"];
         argv.extend_from_slice(extra);
         LaunchClaudeArgs::try_parse_from(argv).expect("launch args should parse")
+    }
+
+    /// `-A` and `-a <MODEL>` / `-a=<MODEL>` parse with no positional model, and
+    /// both refuse one: `--best-model` picks the model, so a second source is a
+    /// typo. The old `--auto-mode` spelling is gone, so "auto mode" means only
+    /// Claude Code's permission mode.
+    #[test]
+    fn best_model_flags_parse_without_a_model() {
+        use clap::Parser as _;
+        let parse = |argv: &[&str]| LaunchClaudeArgs::try_parse_from(argv);
+
+        assert!(parse(&["claude", "-A"]).unwrap().best_model);
+        assert!(parse(&["claude", "--best-model"]).unwrap().best_model);
+        assert!(parse(&["claude", "--auto-mode"]).is_err());
+        for argv in [
+            &["claude", "-a", "mlx-community/Qwen3.5-9B-4bit"][..],
+            &["claude", "-a=mlx-community/Qwen3.5-9B-4bit"][..],
+        ] {
+            let args = parse(argv).unwrap();
+            assert_eq!(
+                args.best_model_override.as_deref(),
+                Some("mlx-community/Qwen3.5-9B-4bit")
+            );
+            assert_eq!(args.model_tag, None);
+        }
+
+        assert!(parse(&["claude", "my-model", "-A"]).is_err());
+        assert!(parse(&["claude", "-m", "my-model", "-a", "other"]).is_err());
+    }
+
+    /// `--auto-mode-only` combines with every way of naming the local model.
+    #[test]
+    fn auto_mode_only_combines_with_each_model_source() {
+        use clap::Parser as _;
+        let parse = |argv: &[&str]| LaunchClaudeArgs::try_parse_from(argv).unwrap();
+        assert!(parse(&["claude", "--auto-mode-only", "-A"]).auto_mode_only);
+        assert!(parse(&["claude", "--auto-mode-only", "--best-model"]).auto_mode_only);
+        assert!(parse(&["claude", "--auto-mode-only", "-a=m"]).auto_mode_only);
+        assert!(parse(&["claude", "--auto-mode-only", "m"]).auto_mode_only);
+        assert!(!parse(&["claude", "m"]).auto_mode_only);
+    }
+
+    /// Claude Code is pointed at the proxy, told to send its own classifier
+    /// requests, and told the one model name the proxy routes locally — and
+    /// nothing about the session's own models or credentials, which stay the
+    /// user's.
+    #[test]
+    fn auto_mode_only_env_routes_only_the_classifier() {
+        let env = auto_mode_only_env("http://127.0.0.1:4321");
+        let get = |k: &str| {
+            env.iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("ANTHROPIC_BASE_URL"), Some("http://127.0.0.1:4321"));
+        assert_eq!(get("CLAUDE_CODE_AUTO_MODE_SERVER"), Some("0"));
+        assert_eq!(
+            get("CLAUDE_CODE_AUTO_MODE_MODEL"),
+            Some(crate::commands::launch_proxy::CLASSIFIER_MODEL)
+        );
+        for untouched in [
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+        ] {
+            assert_eq!(
+                get(untouched),
+                None,
+                "{untouched} is the user's, not launch's"
+            );
+        }
+    }
+
+    /// A server launch did not start gets a warning naming the flag that turns
+    /// its thinking off; one launch started (thinking already off) gets none.
+    #[test]
+    fn auto_mode_only_warns_about_an_external_servers_thinking() {
+        let warning = external_classifier_warning(true).expect("external server warns");
+        assert!(warning.contains("--default-chat-template-kwargs"));
+        assert!(warning.contains("enable_thinking"));
+        assert_eq!(external_classifier_warning(false), None);
+    }
+
+    /// The gateway comes from the user's own `ANTHROPIC_BASE_URL`; without one
+    /// there is nowhere to send the session.
+    #[test]
+    fn auto_mode_only_needs_the_users_gateway() {
+        assert_eq!(
+            user_gateway(Some("https://gw.example.com/")).unwrap(),
+            "https://gw.example.com"
+        );
+        assert!(user_gateway(None).is_err());
+        assert!(user_gateway(Some("  ")).is_err());
+    }
+
+    /// The local server starts with thinking off when it answers safety checks,
+    /// and an explicit passthrough still wins.
+    #[test]
+    fn auto_mode_only_starts_the_server_with_thinking_off() {
+        let argv = serve_argv("m", 1, &launch_args(&["--auto-mode-only"]), None).unwrap();
+        assert_eq!(
+            last_val(&argv, "--default-chat-template-kwargs"),
+            Some(r#"{"enable_thinking": false}"#)
+        );
+        let plain = serve_argv("m", 1, &launch_args(&[]), None).unwrap();
+        assert_eq!(last_val(&plain, "--default-chat-template-kwargs"), None);
+
+        let overridden = serve_argv(
+            "m",
+            1,
+            &launch_args(&[
+                "--auto-mode-only",
+                "--serve-arg=--default-chat-template-kwargs={}",
+            ]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            last_val(&overridden, "--default-chat-template-kwargs"),
+            None
+        );
     }
 
     /// The value after the LAST occurrence of `flag` — clap's own

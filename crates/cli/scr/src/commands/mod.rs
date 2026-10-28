@@ -20,6 +20,10 @@ pub mod completions;
 pub mod convert;
 #[cfg(feature = "claude")]
 pub mod launch;
+#[cfg(feature = "claude")]
+pub mod launch_best_model;
+#[cfg(feature = "claude")]
+pub mod launch_proxy;
 pub mod model;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod model_info;
