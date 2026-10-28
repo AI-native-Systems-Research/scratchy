@@ -68,6 +68,10 @@ fn push_rope_on_read_bindings(
 
 // ── AttentionPrefillSdpaPaged (both sdpa_vector and steel variants) ─
 
+/// The slot a paged prefill attention binds its rotary table at, re-roping K as it reads. Its
+/// one model source besides gpt-oss's sinks (slot 9): what tells a re-roping twin from a plain one.
+pub const PREFILL_ROPE_ON_READ_SLOT: u8 = 7;
+
 /// Bindings for `KernelId::AttentionPrefillSdpaPaged`. Seven slots:
 /// 0 = output (arena), 1 = Q (arena), 2 = CuSeqlensQ (runtime),
 /// 3 = SeqUsedK (runtime), 4 = BlockTable (runtime),
@@ -131,7 +135,7 @@ impl From<AttentionPrefillPagedBindingSet> for Vec<Binding> {
             // NAX spans: pre-roped K from the scratch at slot 7.
             v.push(Binding::RopedKScratch { binding_index: 7 });
         } else if let Some(table) = s.rope_on_read {
-            push_rope_on_read_bindings(&mut v, s.kv_layer, table, 7);
+            push_rope_on_read_bindings(&mut v, s.kv_layer, table, PREFILL_ROPE_ON_READ_SLOT);
         }
         // Block-diagonal span attention: the per-block span-label buffer at slot
         // 8, bound whenever spans/rope-on-read is active (the kernel reads it

@@ -973,11 +973,14 @@ fn route_by_sequence_count(
     let per_row = |c: &LoweredCommand| {
         c.kernel == KernelId::AttentionPrefillSdpaPaged && c.seq_scope() == AllRows
     };
-    // A paged attention's only model source is its rotary table (cos_sin).
+    // A paged attention re-ropes where it binds its rotary table (cos_sin) — not wherever it binds a
+    // model source: gpt-oss's sinks are one too (slot 9), and counting them made its plain twin read
+    // as re-roping, so a step of several sequences ran both twins, the sdpa-paged one ~35x the NAX's.
     let reropes = |c: &LoweredCommand| {
-        c.bindings
-            .iter()
-            .any(|b| matches!(b, Binding::Source { .. }))
+        c.bindings.iter().any(|b| {
+            matches!(b, Binding::Source { binding_index, .. }
+                if *binding_index == super::kernel_bindings::PREFILL_ROPE_ON_READ_SLOT)
+        })
     };
     let twins = || cmds.iter().map(|c| &c.command).filter(|c| per_row(c));
     if !twins().any(reropes) {
@@ -11270,6 +11273,73 @@ mod tests {
             assert_eq!(
                 own[3].command.function,
                 "attention_prefill_sdpa_v2_paged_bf16_specialized"
+            );
+        }
+    }
+
+    /// gpt-oss's prefill attention binds its sinks weight, a model source like the rotary table: its
+    /// plain twin still runs only on steps without unrotated blocks and its re-roping twin only on
+    /// steps with them. Told apart by any source, both read as re-roping and a step of several
+    /// sequences ran both, the sdpa-paged one ~35x the NAX one (a base-M5 2x800-token step: 1.63 s
+    /// against 0.80 s for one 1600-token prompt).
+    #[test]
+    fn a_sinks_prefill_attention_keeps_its_plain_twin_plain() {
+        use crate::tape::lowered::RuntimeGate::{
+            OnlyIfUnrotatedBlocks, UnlessDecodeStep, UnlessOneSequence, UnlessUnrotatedBlocks,
+        };
+        let p = MetalModelConsts {
+            rope_on_read: true,
+            sliding_window: 512,
+            ..tq_consts()
+        };
+        let plain = RuntimeGate::All(&[UnlessDecodeStep, UnlessOneSequence, UnlessUnrotatedBlocks]);
+        let reroping =
+            RuntimeGate::All(&[UnlessDecodeStep, UnlessOneSequence, OnlyIfUnrotatedBlocks]);
+        for attention in [
+            attention(MetalStep::AttentionPrefillPaged, 0, NeoX),
+            attention(MetalStep::SlidingAttentionPrefillPaged, 0, NeoX),
+        ] {
+            let mut tape = row_tape(coded(tq_writer(0, Causal, LLAMA_KV), attention.clone()));
+            let mut site = TEST_SITE.clone();
+            site.push(RowSource {
+                kind: WeightKind::AttnSinks,
+                ix: SINKS_IX,
+            });
+            for (row, row_site) in tape.backbone.iter().zip(&mut tape.backbone_sources) {
+                if let StepRow::Step(
+                    MetalStep::AttentionPrefillPaged(..)
+                    | MetalStep::SlidingAttentionPrefillPaged(..),
+                    _,
+                ) = row
+                {
+                    *row_site = site.clone();
+                }
+            }
+            let lowered = lower_subtile_tape_to_metal(&tape, &p, bake_point(64, None))
+                .expect("lower_subtile_tape_to_metal");
+            let twins: Vec<&GatedCommand> = (lowered.commands.iter())
+                .filter(|c| c.command.kernel == KernelId::AttentionPrefillSdpaPaged)
+                .filter(|c| [plain, reroping].iter().any(|g| c.gate == Some(*g)))
+                .collect();
+            assert_eq!(
+                twins.iter().map(|c| c.gate).collect::<Vec<_>>(),
+                [Some(plain), Some(reroping)],
+                "{attention:?}"
+            );
+            let sinks = |c: &GatedCommand| {
+                (c.command.bindings.iter()).any(|b| {
+                    matches!(
+                        b,
+                        Binding::Source {
+                            binding_index: 9,
+                            ..
+                        }
+                    )
+                })
+            };
+            assert!(
+                sinks(twins[0]) && sinks(twins[1]),
+                "both twins keep the sinks"
             );
         }
     }
