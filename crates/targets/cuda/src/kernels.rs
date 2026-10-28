@@ -13,6 +13,8 @@
 use std::ffi::c_void;
 use std::fmt;
 
+use crate::step::RopePairing;
+
 /// `SCRATCHY_CUDA_ERR_SHAPE` in the `.cu` launchers: the shape was refused, nothing launched.
 const ERR_SHAPE: i32 = -1;
 /// `SCRATCHY_CUDA_ERR_HOST` in the `.cu` launchers: a C++ exception was caught on the host side
@@ -39,6 +41,16 @@ unsafe extern "C" {
         k: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_gemm_col64_bf16_abt_prepare() -> i32;
+    fn scratchy_cuda_gemm_col64_bf16_abt(
+        a: *const c_void,
+        b: *const c_void,
+        c: *mut c_void,
+        m: u32,
+        n: u32,
+        k: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_rms_norm_bf16_prepare() -> i32;
     fn scratchy_cuda_rms_norm_bf16(
         x: *const c_void,
@@ -48,6 +60,39 @@ unsafe extern "C" {
         cols: u32,
         eps: f32,
         gain_offset: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_rms_norm_unit_bf16(
+        x: *const c_void,
+        y: *mut c_void,
+        rows: u32,
+        cols: u32,
+        eps: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_pointwise_bf16_prepare() -> i32;
+    fn scratchy_cuda_scale_bf16(
+        x: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        cols: u32,
+        scale: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_layer_scale_bf16(
+        x: *const c_void,
+        w: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        cols: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_soft_cap_bf16(
+        x: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        cols: u32,
+        cap: f32,
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_add_bf16_prepare() -> i32;
@@ -68,6 +113,14 @@ unsafe extern "C" {
         cols: u32,
         stream: *mut c_void,
     ) -> i32;
+    fn scratchy_cuda_gelu_mul_bf16(
+        gate: *const c_void,
+        up: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        cols: u32,
+        stream: *mut c_void,
+    ) -> i32;
     fn scratchy_cuda_rope_bf16(
         x: *const c_void,
         table: *const c_void,
@@ -76,6 +129,17 @@ unsafe extern "C" {
         cols: u32,
         head_dim: u32,
         rot_dim: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_rope_paired_bf16(
+        x: *const c_void,
+        table: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        cols: u32,
+        head_dim: u32,
+        rot_dim: u32,
+        pairing: u32,
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_gate_split_bf16(
@@ -134,6 +198,25 @@ unsafe extern "C" {
         block_size: u32,
         num_blocks: u32,
         scale: f32,
+        window: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_attn_prefill_d512_bf16_prepare() -> i32;
+    fn scratchy_cuda_attn_prefill_d512_bf16(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        block_table: *const c_void,
+        sequence: *const c_void,
+        out: *mut c_void,
+        rows: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        num_blocks: u32,
+        scale: f32,
+        window: u32,
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_gemm_narrow_bf16_abt_prepare() -> i32;
@@ -190,6 +273,24 @@ unsafe extern "C" {
         block_size: u32,
         num_blocks: u32,
         scale: f32,
+        window: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    fn scratchy_cuda_attn_decode_d512_bf16_prepare() -> i32;
+    fn scratchy_cuda_attn_decode_d512_bf16(
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        block_table: *const c_void,
+        sequence: *const c_void,
+        out: *mut c_void,
+        q_heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        num_blocks: u32,
+        scale: f32,
+        window: u32,
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_gdn_conv1d(
@@ -241,12 +342,15 @@ unsafe extern "C" {
     ) -> i32;
     fn scratchy_cuda_moe_route_bf16(
         logits: *const c_void,
+        expert_scale: *const c_void,
         topk_idx: *mut c_void,
         scores: *mut c_void,
         m: u32,
         experts: u32,
         top_k: u32,
         renorm: u32,
+        program: u32,
+        scale: f32,
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_moe_combine_bf16(
@@ -278,6 +382,8 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_expert_gemm_bf16_prepare() -> i32;
+    fn scratchy_cuda_expert_gemm_e128_bf16_prepare() -> i32;
+    fn scratchy_cuda_expert_gemm_e128_col64_bf16_prepare() -> i32;
     fn scratchy_cuda_expert_gemm_bf16(
         a: *const c_void,
         b: *const c_void,
@@ -289,6 +395,7 @@ unsafe extern "C" {
         k: u32,
         experts: u32,
         expert_rows: u32,
+        n_tile: u32,
         stream: *mut c_void,
     ) -> i32;
     fn scratchy_cuda_expert_gemv_bf16_prepare() -> i32;
@@ -327,8 +434,8 @@ pub enum KernelError {
     EmbedShape { rows: u32, hidden: u32, vocab: u32 },
     /// The GEMM does not take this shape; nothing was launched.
     Shape { m: u32, n: u32, k: u32 },
-    /// A row kernel (RMSNorm, add, SiluMul, GateApply) does not take this shape; nothing was
-    /// launched.
+    /// A row kernel (RMSNorm, add, SiluMul, GateApply, and Gemma's unit RMSNorm, GeluMul, scale,
+    /// layer scale and soft-cap) does not take this shape; nothing was launched.
     RowShape { rows: u32, cols: u32 },
     /// The rope does not take this shape; nothing was launched.
     RopeShape {
@@ -350,7 +457,7 @@ pub enum KernelError {
         head_dim: u32,
         block_size: u32,
     },
-    /// The prefill attention does not take this shape or scale; nothing was launched.
+    /// The prefill attention does not take this shape, scale or window; nothing was launched.
     AttnShape {
         rows: u32,
         q_heads: u32,
@@ -363,7 +470,7 @@ pub enum KernelError {
     NarrowShape { m: u32, n: u32, k: u32 },
     /// The GEMV does not take this shape; nothing was launched.
     GemvShape { n: u32, k: u32 },
-    /// The decode attention does not take this shape or scale; nothing was launched.
+    /// The decode attention does not take this shape, scale or window; nothing was launched.
     AttnDecodeShape {
         q_heads: u32,
         kv_heads: u32,
@@ -454,7 +561,7 @@ impl fmt::Display for KernelError {
                 f,
                 "prefill attention refused shape rows={rows} q_heads={q_heads} \
                  kv_heads={kv_heads} head_dim={head_dim} block_size={block_size} \
-                 num_blocks={num_blocks}, or its scale"
+                 num_blocks={num_blocks}, or its scale or window"
             ),
             KernelError::NarrowShape { m, n, k } => {
                 write!(f, "narrow GEMM refused shape m={m} n={n} k={k}")
@@ -469,7 +576,8 @@ impl fmt::Display for KernelError {
             } => write!(
                 f,
                 "decode attention refused shape q_heads={q_heads} kv_heads={kv_heads} \
-                 head_dim={head_dim} block_size={block_size} num_blocks={num_blocks}, or its scale"
+                 head_dim={head_dim} block_size={block_size} num_blocks={num_blocks}, or its scale \
+                 or window"
             ),
             KernelError::GdnConvShape {
                 rows,
@@ -513,6 +621,10 @@ impl std::error::Error for KernelError {}
 /// row.
 const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("gemm_bf16_abt", scratchy_cuda_gemm_bf16_abt_prepare),
+    (
+        "gemm_col64_bf16_abt",
+        scratchy_cuda_gemm_col64_bf16_abt_prepare,
+    ),
     ("attn_prefill_bf16", scratchy_cuda_attn_prefill_bf16_prepare),
     (
         "gemm_narrow_bf16_abt",
@@ -522,10 +634,27 @@ const PREPARE: &[(&str, unsafe extern "C" fn() -> i32)] = &[
     ("rms_norm_bf16", scratchy_cuda_rms_norm_bf16_prepare),
     ("add_bf16", scratchy_cuda_add_bf16_prepare),
     ("silu_mul_bf16", scratchy_cuda_silu_mul_bf16_prepare),
+    ("pointwise_bf16", scratchy_cuda_pointwise_bf16_prepare),
     ("gate_apply_bf16", scratchy_cuda_gate_apply_bf16_prepare),
     ("gate_scale_bf16", scratchy_cuda_gate_scale_bf16_prepare),
     ("attn_decode_bf16", scratchy_cuda_attn_decode_bf16_prepare),
+    (
+        "attn_prefill_d512_bf16",
+        scratchy_cuda_attn_prefill_d512_bf16_prepare,
+    ),
+    (
+        "attn_decode_d512_bf16",
+        scratchy_cuda_attn_decode_d512_bf16_prepare,
+    ),
     ("expert_gemm_bf16", scratchy_cuda_expert_gemm_bf16_prepare),
+    (
+        "expert_gemm_e128_bf16",
+        scratchy_cuda_expert_gemm_e128_bf16_prepare,
+    ),
+    (
+        "expert_gemm_e128_col64_bf16",
+        scratchy_cuda_expert_gemm_e128_col64_bf16_prepare,
+    ),
     ("expert_gemv_bf16", scratchy_cuda_expert_gemv_bf16_prepare),
 ];
 
@@ -620,6 +749,30 @@ pub unsafe fn gemm_bf16_abt(
     check(code, KernelError::Shape { m, n, k })
 }
 
+/// Launch the bf16 GEMM `C = A · Bᵀ` on 64-column tiles (`kernels/gemm_bf16.cu`'s template at one
+/// 64-column B block): the operands and the contract of [`gemm_bf16_abt`], for an `n` that is a
+/// multiple of 64 (Gemma 4's 128, 704 and 2112). On an `n` both take, each output element is the
+/// bits [`gemm_bf16_abt`] gives: the same WGMMA K order. Asynchronous.
+///
+/// `m`, `n` and `k` must be non-zero multiples of 128, 64 and 64 (`step::GEMM_COL64_TILE`), none
+/// above `i32::MAX`; any other shape returns [`KernelError::Shape`] before any pointer is touched,
+/// and launches nothing.
+///
+/// # Safety
+///
+/// As [`gemm_bf16_abt`]'s.
+pub unsafe fn gemm_col64_bf16_abt(
+    a: *const c_void,
+    b: *const c_void,
+    c: *mut c_void,
+    (m, n, k): (u32, u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `gemm_bf16_abt`'s.
+    let code = unsafe { scratchy_cuda_gemm_col64_bf16_abt(a, b, c, m, n, k, stream) };
+    check(code, KernelError::Shape { m, n, k })
+}
+
 // THE ROW KERNELS (RMSNorm, add, SiluMul). Each launcher takes `(rows, cols)` and applies one
 // shape rule: `rows` and `cols` non-zero, `cols` a multiple of 8 (one 16-byte vector of bf16:
 // `step::RMS_NORM_BF16_COLS`, `ADD_BF16_COLS`, `SILU_MUL_BF16_COLS`), and `rows · cols` at most
@@ -695,6 +848,107 @@ pub unsafe fn silu_mul_bf16(
     check(code, KernelError::RowShape { rows, cols })
 }
 
+/// Launch the bf16 RMSNorm with no gain (Gemma's `v_norm`, `kernels/rms_norm_bf16.cu`'s unit
+/// instantiation): `y[r, c] = x[r, c] / sqrt(mean(x[r, :]²) + eps)`, `x` and `y` `[rows, cols]`,
+/// the bits of [`rms_norm_bf16`] with a gain of all ones and offset 0. Asynchronous; the shape rule
+/// is the row kernels'.
+///
+/// # Safety
+///
+/// `x` and `y` must be 16-byte-aligned device pointers to at least `rows·cols` bf16 elements,
+/// valid for the whole kernel, with `y` not overlapping `x`. `stream` must be a live
+/// `cudaStream_t` of the current device, or null for the default stream.
+pub unsafe fn rms_norm_unit_bf16(
+    x: *const c_void,
+    y: *mut c_void,
+    (rows, cols): (u32, u32),
+    eps: f32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe { scratchy_cuda_rms_norm_unit_bf16(x, y, rows, cols, eps, stream) };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
+/// Launch the bf16 `out = 0.5 · gate · (1 + tanh(√(2/π) · (gate + 0.044715 · gate³))) · up` (GeGLU,
+/// `kernels/silu_mul_bf16.cu`'s GELU instantiation) over `[rows, cols]`, in f32 with one bf16
+/// rounding per element. Asynchronous; the shape rule is the row kernels'.
+///
+/// # Safety
+///
+/// As [`silu_mul_bf16`]'s.
+pub unsafe fn gelu_mul_bf16(
+    gate: *const c_void,
+    up: *const c_void,
+    out: *mut c_void,
+    (rows, cols): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe { scratchy_cuda_gelu_mul_bf16(gate, up, out, rows, cols, stream) };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
+// GEMMA'S ONE-OPERAND ROW MAPS (`kernels/pointwise_bf16.cu`): the row kernels' shape rule
+// (`step::SCALE_BF16_COLS`, `SOFT_CAP_BF16_COLS`), one setup in `PREPARE`. `out` may equal `x`
+// exactly (the same bits as out of place), and may overlap it in no other way.
+
+/// Launch the bf16 `out = x · scale` over `[rows, cols]` (Gemma's embedding scale): one f32
+/// multiply of the exact input, one bf16 rounding. Asynchronous.
+///
+/// # Safety
+///
+/// `x` and `out` must be 16-byte-aligned device pointers to at least `rows·cols` bf16 elements,
+/// valid for the whole kernel, `out` equal to `x` or overlapping it nowhere. `stream` must be a
+/// live `cudaStream_t` of the current device, or null for the default stream.
+pub unsafe fn scale_bf16(
+    x: *const c_void,
+    out: *mut c_void,
+    (rows, cols): (u32, u32),
+    scale: f32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe { scratchy_cuda_scale_bf16(x, out, rows, cols, scale, stream) };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
+/// Launch the bf16 `out = x · w[0]` over `[rows, cols]`, `w` a `[1]` bf16 weight (Gemma's
+/// `layer_scalar`) widened exactly: one f32 multiply, one bf16 rounding. Asynchronous.
+///
+/// # Safety
+///
+/// As [`scale_bf16`]'s, and `w` a device pointer to one bf16, overlapping neither `x` nor `out`.
+pub unsafe fn layer_scale_bf16(
+    x: *const c_void,
+    w: *const c_void,
+    out: *mut c_void,
+    (rows, cols): (u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe { scratchy_cuda_layer_scale_bf16(x, w, out, rows, cols, stream) };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
+/// Launch the bf16 `out = cap · tanh(x / cap)` over `[rows, cols]` (Gemma's final-logit
+/// soft-cap), in f32 with one bf16 rounding. Asynchronous.
+///
+/// # Safety
+///
+/// As [`scale_bf16`]'s.
+pub unsafe fn soft_cap_bf16(
+    x: *const c_void,
+    out: *mut c_void,
+    (rows, cols): (u32, u32),
+    cap: f32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe { scratchy_cuda_soft_cap_bf16(x, out, rows, cols, cap, stream) };
+    check(code, KernelError::RowShape { rows, cols })
+}
+
 /// Launch the bf16 partial rotary embedding over `x` and `out` `[rows, cols]`, `cols = heads ·
 /// head_dim`: per head, the first `rot_dim` lanes rotated in NeoX pairing within that width
 /// (`(d, d + rot_dim/2)`) by `table`'s row for the token, `[cos(0..R/2) | sin(0..R/2)]`, in f32
@@ -702,10 +956,10 @@ pub unsafe fn silu_mul_bf16(
 /// Asynchronous.
 ///
 /// Refused with [`KernelError::RopeShape`], before any pointer is touched, unless `rows`, `cols`
-/// and `head_dim` are non-zero, `rot_dim` is 64 (`step::ROPE_BF16_KERNEL_ROT_DIM`, the one width
-/// the kernel is instantiated for), `head_dim` a multiple of 64
-/// (`step::ROPE_BF16_KERNEL_HEAD_MULTIPLE`), `cols` a multiple of `head_dim`, and `rows · cols`
-/// at most `i32::MAX`. A failed launch returns the launch's own `cudaError_t`.
+/// and `head_dim` are non-zero, `rot_dim` is 64 or 256 (the half-rotated entries of
+/// `step::ROPE_BF16_KERNEL_SHAPES`, the widths the kernel is instantiated for), `head_dim` a multiple of 64
+/// (`step::ROPE_BF16_KERNEL_HEAD_MULTIPLE`) and of `rot_dim`, `cols` a multiple of `head_dim`, and
+/// `rows · cols` at most `i32::MAX`. A failed launch returns the launch's own `cudaError_t`.
 ///
 /// # Safety
 ///
@@ -724,6 +978,45 @@ pub unsafe fn rope_bf16(
     // SAFETY: as `rms_norm_bf16`'s.
     let code =
         unsafe { scratchy_cuda_rope_bf16(x, table, out, rows, cols, head_dim, rot_dim, stream) };
+    check(
+        code,
+        KernelError::RopeShape {
+            rows,
+            cols,
+            head_dim,
+            rot_dim,
+        },
+    )
+}
+
+/// [`rope_bf16`] in either pairing: `HalfRotated` is [`rope_bf16`] itself, the same launch; in
+/// `HalfHead` (Gemma 4's proportional rope) lane `d < rot_dim/2` pairs with lane `d + head_dim/2`,
+/// and every other lane is copied bit for bit. Asynchronous.
+///
+/// Refused with [`KernelError::RopeShape`] as [`rope_bf16`], except that `(rot_dim, pairing)` must
+/// be an entry of `step::ROPE_BF16_KERNEL_SHAPES`, and a `HalfHead` `head_dim` must be 512
+/// (`step::ROPE_BF16_HALF_HEAD_DIM`).
+///
+/// # Safety
+///
+/// As [`rope_bf16`]'s.
+pub unsafe fn rope_paired_bf16(
+    x: *const c_void,
+    table: *const c_void,
+    out: *mut c_void,
+    (rows, cols): (u32, u32),
+    (head_dim, rot_dim, pairing): (u32, u32, RopePairing),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // The launcher's pairing codes, `kernels/rope_bf16.cu`'s `PAIRING_*`.
+    let code = match pairing {
+        RopePairing::HalfRotated => 0,
+        RopePairing::HalfHead => 1,
+    };
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_rope_paired_bf16(x, table, out, rows, cols, head_dim, rot_dim, code, stream)
+    };
     check(
         code,
         KernelError::RopeShape {
@@ -821,8 +1114,8 @@ pub unsafe fn gate_scale_bf16(
 /// block is at or past `num_blocks` writes nothing. Asynchronous.
 ///
 /// Refused with [`KernelError::KvAppendShape`], before any pointer is touched, unless `rows` and
-/// `kv_heads` are non-zero, `head_dim` is 256 (`step::KV_APPEND_BF16_HEAD_DIM`, the one head dim
-/// the kernel is instantiated for), `block_size` 64 (`step::CUDA_KV_BLOCK_SIZE`), and
+/// `kv_heads` are non-zero, `head_dim` is 256 or 512 (`step::KV_APPEND_BF16_HEAD_DIMS`, the head
+/// dims the kernel is instantiated for), `block_size` 64 (`step::CUDA_KV_BLOCK_SIZE`), and
 /// `rows · kv_heads · head_dim` at most `i32::MAX`. A `num_blocks` of 0 writes nothing and
 /// launches nothing. A failed
 /// launch returns the launch's own `cudaError_t`.
@@ -872,7 +1165,8 @@ pub unsafe fn kv_append_bf16(
 /// paged `k_cache` and `v_cache` (`[num_blocks, kv_heads, 64, 256]`) into `out`, the keys read
 /// through `block_table`, `P` and `L` read from `sequence`: query row `i` attends to keys `0 ..=
 /// P + i` below `P + L`, query head `g` to kv head `g / (q_heads / kv_heads)`, the softmax scaled
-/// by `scale`. Asynchronous.
+/// by `scale`. Asynchronous. The full causal attention: [`attn_prefill_windowed_bf16`] at a
+/// window of 0, with its contract.
 ///
 /// Refused with [`KernelError::AttnShape`], before any pointer is touched, unless `head_dim` is
 /// 256 (`step::ATTN_PREFILL_BF16_HEAD_DIM`), `rows` a non-zero multiple of 128
@@ -898,8 +1192,44 @@ pub unsafe fn attn_prefill_bf16(
     scale: f32,
     stream: *mut c_void,
 ) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the contract above, which is the windowed launch's.
+    unsafe {
+        attn_prefill_windowed_bf16(
+            (q, out),
+            (k_cache, v_cache),
+            (block_table, sequence),
+            (rows, q_heads, kv_heads, head_dim),
+            (block_size, num_blocks),
+            (scale, 0),
+            stream,
+        )
+    }
+}
+
+/// [`attn_prefill_bf16`] under a sliding window: query row `i` also drops the keys `j ≤ P + i −
+/// window`, so it sees its own key and the `window − 1` before it (Gemma 4's sliding layers,
+/// `window` 1024); `window` 0 is the full causal attention, the same launch. The KV tiles wholly
+/// below every row's window in a CTA are never read, so the blocks there may hold anything.
+/// Asynchronous.
+///
+/// Refused with [`KernelError::AttnShape`] as [`attn_prefill_bf16`], and also unless `window` is
+/// a multiple of 64 (`step::ATTN_WINDOW_MULTIPLE`).
+///
+/// # Safety
+///
+/// As [`attn_prefill_bf16`]'s, but `block_table` need only name valid blocks from the window's
+/// first tile on: an entry below it is never read.
+pub unsafe fn attn_prefill_windowed_bf16(
+    (q, out): (*const c_void, *mut c_void),
+    (k_cache, v_cache): (*const c_void, *const c_void),
+    (block_table, sequence): (*const c_void, *const c_void),
+    (rows, q_heads, kv_heads, head_dim): (u32, u32, u32, u32),
+    (block_size, num_blocks): (u32, u32),
+    (scale, window): (f32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
     // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
-    // shape and scale before it touches a pointer and catches every C++ exception.
+    // shape, scale and window before it touches a pointer and catches every C++ exception.
     let code = unsafe {
         scratchy_cuda_attn_prefill_bf16(
             q,
@@ -915,6 +1245,61 @@ pub unsafe fn attn_prefill_bf16(
             block_size,
             num_blocks,
             scale,
+            window,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::AttnShape {
+            rows,
+            q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+        },
+    )
+}
+
+/// [`attn_prefill_windowed_bf16`] at head dim 512 (Gemma 4's global layers,
+/// `kernels/attn_prefill_d512_bf16.cu`): `q` and `out` are `[rows, q_heads · 512]`, the caches
+/// `[num_blocks, kv_heads, 64, 512]`. Each of a CTA's two consumer warpgroups keeps one
+/// 256-column half of the output over the same 64 query rows; the masks and the online softmax are
+/// the head-dim-256 kernel's. Asynchronous.
+///
+/// Refused with [`KernelError::AttnShape`] as [`attn_prefill_windowed_bf16`], except that
+/// `head_dim` must be 512 (`step::ATTN_D512_BF16_HEAD_DIM`).
+///
+/// # Safety
+///
+/// As [`attn_prefill_windowed_bf16`]'s, with 512 for 256 in every size.
+pub unsafe fn attn_prefill_d512_bf16(
+    (q, out): (*const c_void, *mut c_void),
+    (k_cache, v_cache): (*const c_void, *const c_void),
+    (block_table, sequence): (*const c_void, *const c_void),
+    (rows, q_heads, kv_heads, head_dim): (u32, u32, u32, u32),
+    (block_size, num_blocks): (u32, u32),
+    (scale, window): (f32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `attn_prefill_windowed_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_attn_prefill_d512_bf16(
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            sequence,
+            out,
+            rows,
+            q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+            scale,
+            window,
             stream,
         )
     };
@@ -1080,7 +1465,8 @@ pub unsafe fn tma_box_probe_store(
 /// `0 .. P + L` read through `block_table`, `P` and `L` read from `sequence`; query head `g` reads
 /// kv head `g / (q_heads / kv_heads)`, the softmax scaled by `scale`. Whole 64-slot blocks are
 /// loaded; the slots at or past `P + L` are neutralised before use (their scores set to −inf,
-/// their V rows zeroed), so no unwritten slot reaches the output. Asynchronous.
+/// their V rows zeroed), so no unwritten slot reaches the output. Asynchronous. Every key:
+/// [`attn_decode_windowed_bf16`] at a window of 0, with its contract.
 ///
 /// Refused with [`KernelError::AttnDecodeShape`], before any pointer is touched, unless
 /// `head_dim` is 256 (`step::ATTN_DECODE_BF16_HEAD_DIM`), `q_heads` and `kv_heads` non-zero with
@@ -1104,8 +1490,43 @@ pub unsafe fn attn_decode_bf16(
     scale: f32,
     stream: *mut c_void,
 ) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds the contract above, which is the windowed launch's.
+    unsafe {
+        attn_decode_windowed_bf16(
+            (q, out),
+            (k_cache, v_cache),
+            (block_table, sequence),
+            (q_heads, kv_heads, head_dim),
+            (block_size, num_blocks),
+            (scale, 0),
+            stream,
+        )
+    }
+}
+
+/// [`attn_decode_bf16`] under a sliding window: the one query, at `P + L − 1`, sees only the keys
+/// from `max(0, P + L − window)` on (Gemma 4's sliding layers, `window` 1024); `window` 0 is every
+/// key, the same launch. The KV tiles wholly below the window are never read, so the blocks there
+/// may hold anything. Asynchronous.
+///
+/// Refused with [`KernelError::AttnDecodeShape`] as [`attn_decode_bf16`], and also unless
+/// `window` is a multiple of 64 (`step::ATTN_WINDOW_MULTIPLE`).
+///
+/// # Safety
+///
+/// As [`attn_decode_bf16`]'s, but `block_table` need only name valid blocks from the window's
+/// first tile on: an entry below it is never read.
+pub unsafe fn attn_decode_windowed_bf16(
+    (q, out): (*const c_void, *mut c_void),
+    (k_cache, v_cache): (*const c_void, *const c_void),
+    (block_table, sequence): (*const c_void, *const c_void),
+    (q_heads, kv_heads, head_dim): (u32, u32, u32),
+    (block_size, num_blocks): (u32, u32),
+    (scale, window): (f32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
     // SAFETY: the caller upholds the pointer and stream contract above; the launcher checks the
-    // shape and scale before it touches a pointer.
+    // shape, scale and window before it touches a pointer.
     let code = unsafe {
         scratchy_cuda_attn_decode_bf16(
             q,
@@ -1120,6 +1541,58 @@ pub unsafe fn attn_decode_bf16(
             block_size,
             num_blocks,
             scale,
+            window,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::AttnDecodeShape {
+            q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+        },
+    )
+}
+
+/// [`attn_decode_windowed_bf16`] at head dim 512 (Gemma 4's global layers,
+/// `kernels/attn_decode_d512_bf16.cu`): `q` and `out` are `[1, q_heads · 512]`, the caches
+/// `[num_blocks, kv_heads, 64, 512]`. Both consumer warpgroups walk every KV tile in ascending
+/// order, each keeping one 256-column half of the output, so there is no merge. Asynchronous.
+///
+/// Refused with [`KernelError::AttnDecodeShape`] as [`attn_decode_windowed_bf16`], except that
+/// `head_dim` must be 512 (`step::ATTN_D512_BF16_HEAD_DIM`).
+///
+/// # Safety
+///
+/// As [`attn_decode_windowed_bf16`]'s, with 512 for 256 in every size.
+pub unsafe fn attn_decode_d512_bf16(
+    (q, out): (*const c_void, *mut c_void),
+    (k_cache, v_cache): (*const c_void, *const c_void),
+    (block_table, sequence): (*const c_void, *const c_void),
+    (q_heads, kv_heads, head_dim): (u32, u32, u32),
+    (block_size, num_blocks): (u32, u32),
+    (scale, window): (f32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `attn_decode_windowed_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_attn_decode_d512_bf16(
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            sequence,
+            out,
+            q_heads,
+            kv_heads,
+            head_dim,
+            block_size,
+            num_blocks,
+            scale,
+            window,
             stream,
         )
     };
@@ -1344,16 +1817,19 @@ pub unsafe fn moe_route_bf16(
     renorm: bool,
     stream: *mut c_void,
 ) -> Result<(), KernelError> {
-    // SAFETY: as `rms_norm_bf16`'s.
+    // SAFETY: as `rms_norm_bf16`'s; the Qwen program reads no per-expert scale.
     let code = unsafe {
         scratchy_cuda_moe_route_bf16(
             logits,
+            std::ptr::null(),
             topk_idx,
             scores,
             m,
             experts,
             top_k,
             u32::from(renorm),
+            ROUTE_QWEN,
+            0.0,
             stream,
         )
     };
@@ -1361,7 +1837,62 @@ pub unsafe fn moe_route_bf16(
         code,
         KernelError::MoeShape {
             kernel: "moe_route_bf16",
-            dims: [m, experts, top_k, 0],
+            dims: [m, experts, top_k, ROUTE_QWEN],
+        },
+    )
+}
+
+/// `kernels/moe_route_bf16.cu`'s `program`: the Qwen routing.
+const ROUTE_QWEN: u32 = 0;
+/// `kernels/moe_route_bf16.cu`'s `program`: the Gemma routing.
+const ROUTE_GEMMA: u32 = 1;
+
+/// Launch Gemma's MoE routing (`kernels/moe_route_bf16.cu`'s Gemma program): per token row of
+/// `logits` (`[m, experts]` bf16), the `top_k` largest RAW logits picked (equal logits by the
+/// higher expert index, a NaN lowest; always `top_k` distinct indices in `0..experts`), each
+/// scaled by `scale` (`hidden^-0.5`), a softmax over the picks in f32, then each times its
+/// expert's `expert_scale` entry; stored ascending (slot `top_k − 1` the best) as i32 into
+/// `topk_idx` and f32 into `scores` (`[m, top_k]` each). Asynchronous.
+///
+/// Refused with [`KernelError::MoeShape`] `{ kernel: "moe_route_bf16", dims: [m, experts, top_k,
+/// 1] }`, before any pointer is touched, unless `m` is non-zero and at most `i32::MAX`, `experts`
+/// one of `op_abi::MOE_EXPERT_COUNTS` (128, 256), `top_k` in `1..=32`
+/// (`step::MOE_ROUTE_MAX_TOP_K`), and `expert_scale` non-null.
+///
+/// # Safety
+///
+/// `logits` must be a device pointer to `m · experts` bf16, `expert_scale` to `experts` bf16,
+/// `topk_idx` to `m · top_k` i32 and `scores` to `m · top_k` f32, 16-byte aligned and valid for
+/// the whole kernel, the outputs overlapping nothing. `stream` must be a live `cudaStream_t` of the
+/// current device, or null for the default stream.
+pub unsafe fn gemma_route_bf16(
+    (logits, expert_scale): (*const c_void, *const c_void),
+    (topk_idx, scores): (*mut c_void, *mut c_void),
+    (m, experts, top_k): (u32, u32, u32),
+    scale: f32,
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: as `rms_norm_bf16`'s.
+    let code = unsafe {
+        scratchy_cuda_moe_route_bf16(
+            logits,
+            expert_scale,
+            topk_idx,
+            scores,
+            m,
+            experts,
+            top_k,
+            0,
+            ROUTE_GEMMA,
+            scale,
+            stream,
+        )
+    };
+    check(
+        code,
+        KernelError::MoeShape {
+            kernel: "moe_route_bf16",
+            dims: [m, experts, top_k, ROUTE_GEMMA],
         },
     )
 }
@@ -1422,12 +1953,12 @@ pub struct SortRegions {
 /// pairs, pair `p` naming expert `topk_idx[p]`, sorted by expert stably, each expert's run padded
 /// to whole 128-row tiles. Writes `rows[pos[p], :] = x[p / top_k, :]` (bit-exact) and `+0.0` on
 /// every padding row of every live tile, and the index regions: `counts`, `offsets` (the padded
-/// exclusive scan, `offsets[256]` the total), `tile_expert` for each live tile, `pos`, and
+/// exclusive scan, `offsets[experts]` the total), `tile_expert` for each live tile, `pos`, and
 /// `chunk_hist` as scratch. No row outside a live tile is written. Asynchronous.
 ///
 /// Refused with [`KernelError::MoeShape`] `{ kernel: "moe_sort", dims: [m, top_k, hidden,
-/// max_tiles] }`, before any pointer is touched, unless `m` is non-zero, `experts` 256
-/// (`step::MOE_ROUTE_EXPERTS`), `top_k` in `1..=32`, `hidden` a non-zero multiple of 8, `m ·
+/// max_tiles] }`, before any pointer is touched, unless `m` is non-zero, `experts` one of
+/// `op_abi::MOE_EXPERT_COUNTS` (128, 256), `top_k` in `1..=32`, `hidden` a non-zero multiple of 8, `m ·
 /// top_k` and `m · hidden` at most `i32::MAX`, and `max_tiles` at least `tape::moe_tiles`' bound
 /// with `max_tiles · 128 · hidden` at most `i32::MAX`. A failed launch returns the first failing
 /// launch's own `cudaError_t`, the ones after it not launched. No one-time setup, so it is not in
@@ -1436,7 +1967,7 @@ pub struct SortRegions {
 /// # Safety
 ///
 /// `x` must be a device pointer to `m · hidden` bf16, `topk_idx` to `m · top_k` i32 each in
-/// `0..256`, `rows` to `max_tiles · 128 · hidden` bf16, and `regions` to the sort's regions of
+/// `0..experts`, `rows` to `max_tiles · 128 · hidden` bf16, and `regions` to the sort's regions of
 /// [`crate::step::SortLayout`] for this geometry, all 16-byte aligned and valid for the whole
 /// kernel, no output overlapping another or an input. `stream` must be a live `cudaStream_t` of
 /// the current device, or null for the default stream.
@@ -1475,31 +2006,63 @@ pub unsafe fn moe_sort(
     )
 }
 
-/// Launch the grouped expert GEMM (`kernels/expert_gemm_bf16.cu`): `c[128t .. 128t + 128, :] =
-/// a[128t .. 128t + 128, :] · B_eᵀ` for every live tile `t < offsets[256] / 128` of the sorted
-/// rows, `e = tile_expert[t]`, `B_e` the first `n` rows of expert `e`'s `[expert_rows, k]` block
-/// at `b`. A tile past the live ones is never read or written. Every live tile's rows are
-/// bit-identical to [`gemm_bf16_abt`] on the same rows and expert slice. Asynchronous.
-///
-/// Refused with [`KernelError::MoeShape`] `{ kernel: "expert_gemm_bf16", dims: [max_tiles, n, k,
-/// expert_rows] }`, before any pointer is touched, unless `max_tiles` is non-zero, `n` a non-zero
-/// multiple of 256 and `k` of 64, `experts` 256, `expert_rows` at least `n`, and `max_tiles · 128
-/// · max(n, k)` and `experts · expert_rows · k` at most `i32::MAX`. A failed launch returns the
-/// launch's own `cudaError_t`.
+/// Launch the grouped expert GEMM (`kernels/expert_gemm_bf16.cu`) on 256-column blocks:
+/// [`expert_gemm_tiled_bf16`] at `n_tile` 256, the qwen3-5-moe tapes' one tile.
 ///
 /// # Safety
 ///
-/// `a` must be a device pointer to `max_tiles · 128 · k` bf16, `b` to `experts · expert_rows · k`
-/// bf16, `offsets` and `tile_expert` to the sort's regions (`257` and `max_tiles` u32, the live
-/// tiles each naming an expert below 256), and `c` to `max_tiles · 128 · n` bf16, all 16-byte
-/// aligned and valid for the whole kernel, `c` overlapping no input. The kernel's setup in
-/// [`PREPARE`] must have run on the current device. `stream` must be a live `cudaStream_t` of the
-/// current device, or null for the default stream.
+/// As [`expert_gemm_tiled_bf16`]'s.
 pub unsafe fn expert_gemm_bf16(
     (a, b): (*const c_void, *const c_void),
     (offsets, tile_expert): (*const c_void, *const c_void),
     c: *mut c_void,
     (max_tiles, n, k, experts, expert_rows): (u32, u32, u32, u32, u32),
+    stream: *mut c_void,
+) -> Result<(), KernelError> {
+    // SAFETY: the caller upholds `expert_gemm_tiled_bf16`'s contract.
+    unsafe {
+        expert_gemm_tiled_bf16(
+            (a, b),
+            (offsets, tile_expert),
+            c,
+            (max_tiles, n, k, experts, expert_rows),
+            EXPERT_GEMM_WIDE_TILE,
+            stream,
+        )
+    }
+}
+
+/// [`crate::step::EXPERT_GEMM_N_TILES`]' wide tile, every Qwen tape's.
+const EXPERT_GEMM_WIDE_TILE: u32 = crate::step::EXPERT_GEMM_N_TILES[1];
+
+/// Launch the grouped expert GEMM (`kernels/expert_gemm_bf16.cu`): `c[128t .. 128t + 128, :] =
+/// a[128t .. 128t + 128, :] · B_eᵀ` for every live tile `t < offsets[experts] / 128` of the
+/// sorted rows, `e = tile_expert[t]`, `B_e` the first `n` rows of expert `e`'s `[expert_rows, k]`
+/// block at `b`, in column blocks of `n_tile`. A tile past the live ones is never read or written.
+/// Every live tile's rows are bit-identical to [`gemm_bf16_abt`] (`n_tile` 256) or
+/// [`gemm_col64_bf16_abt`] (`n_tile` 64) on the same rows and expert slice. Asynchronous.
+///
+/// Refused with [`KernelError::MoeShape`] `{ kernel: "expert_gemm_bf16", dims: [max_tiles, n, k,
+/// expert_rows] }`, before any pointer is touched, unless `max_tiles` is non-zero, `(experts,
+/// n_tile)` one of (256, 256), (128, 256) and (128, 64) (`op_abi::MOE_EXPERT_COUNTS`,
+/// `step::EXPERT_GEMM_N_TILES`), `n` a non-zero multiple of `n_tile` and `k` of 64, `expert_rows`
+/// at least `n`, and `max_tiles · 128 · max(n, k)` and `experts · expert_rows · k` at most
+/// `i32::MAX`. A failed launch returns the launch's own `cudaError_t`.
+///
+/// # Safety
+///
+/// `a` must be a device pointer to `max_tiles · 128 · k` bf16, `b` to `experts · expert_rows · k`
+/// bf16, `offsets` and `tile_expert` to the sort's regions (`experts + 1` and `max_tiles` u32,
+/// the live tiles each naming an expert below `experts`), and `c` to `max_tiles · 128 · n` bf16,
+/// all 16-byte aligned and valid for the whole kernel, `c` overlapping no input. The kernel's
+/// setup in [`PREPARE`] must have run on the current device. `stream` must be a live
+/// `cudaStream_t` of the current device, or null for the default stream.
+pub unsafe fn expert_gemm_tiled_bf16(
+    (a, b): (*const c_void, *const c_void),
+    (offsets, tile_expert): (*const c_void, *const c_void),
+    c: *mut c_void,
+    (max_tiles, n, k, experts, expert_rows): (u32, u32, u32, u32, u32),
+    n_tile: u32,
     stream: *mut c_void,
 ) -> Result<(), KernelError> {
     // SAFETY: as `gemm_bf16_abt`'s.
@@ -1515,6 +2078,7 @@ pub unsafe fn expert_gemm_bf16(
             k,
             experts,
             expert_rows,
+            n_tile,
             stream,
         )
     };
@@ -1535,14 +2099,16 @@ pub unsafe fn expert_gemm_bf16(
 ///
 /// Refused with [`KernelError::MoeShape`] `{ kernel: "expert_gemv_bf16", dims: [m, top_k, n, k]
 /// }`, before any pointer is touched, unless `m` is non-zero, `top_k` in `1..=32`, `m · top_k` at
-/// most 65,535, `n` and `k` non-zero multiples of 64, `experts` 256, `expert_rows` at least `n`,
+/// most 65,535, `n` and `k` non-zero multiples of 64, `experts` one of
+/// `op_abi::MOE_EXPERT_COUNTS` (128, 256), `expert_rows` at least `n`,
 /// and the operands' element counts at most `i32::MAX`. A failed launch returns the launch's own
 /// `cudaError_t`.
 ///
 /// # Safety
 ///
 /// `a` must be a device pointer to `a_rows · k` bf16 (`a_rows` `m · top_k` when `pair_rows`, else
-/// `m`), `b` to `experts · expert_rows · k` bf16, `topk_idx` to `m · top_k` i32 each in `0..256`
+/// `m`), `b` to `experts · expert_rows · k` bf16, `topk_idx` to `m · top_k` i32 each in
+/// `0..experts`
 /// and `c` to `m · top_k · n` bf16, all 16-byte aligned and valid for the whole kernel, `c`
 /// overlapping no input. The kernel's setup in [`PREPARE`] must have run on the current device.
 /// `stream` must be a live `cudaStream_t` of the current device, or null for the default stream.

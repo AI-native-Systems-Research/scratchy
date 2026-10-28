@@ -1,43 +1,60 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""HuggingFace transformers' qwen3.5 logits: the reference `cuda_hf_parity.rs` (qwen3.5-0.8b),
-`cuda_hf_parity_9b.rs` (qwen3.5-9b) and `cuda_hf_parity_35b.rs` (qwen3.6-35b-a3b) check the CUDA
-forward against.
+"""HuggingFace transformers' logits: the reference `cuda_hf_parity.rs` (qwen3.5-0.8b),
+`cuda_hf_parity_9b.rs` (qwen3.5-9b), `cuda_hf_parity_35b.rs` (qwen3.6-35b-a3b) and
+`cuda_hf_parity_gemma4.rs` (gemma-4-26b-a4b-it) check the CUDA forward against.
 
-Runs the model's class (`MODEL_CLASS`: `Qwen3_5ForConditionalGeneration`, or
-`Qwen3_5MoeForConditionalGeneration` for the MoE model) from a local checkpoint on the CPU, twice:
+Runs the model's class (`MODEL_CLASS`: `Qwen3_5ForConditionalGeneration`,
+`Qwen3_5MoeForConditionalGeneration` for the qwen MoE model, or `Gemma4ForConditionalGeneration`)
+from a local checkpoint on the CPU, twice:
 in float32 (the reference) and in bfloat16 (the noise yardstick: how far a bf16 forward of the same
 weights lands from the float32 one). Text only (`input_ids`), `use_cache=False`, `torch.no_grad()`,
 `eval()`. One model is resident at a time: every float32 forward (the prompts and their greedy
 steps) runs first, that model is freed, then the bfloat16 one runs the same inputs. The outputs are
 those of loading both at once; the peak is one model's (the 35B's f32 alone is about 140 GB).
 
-The MoE model's experts run HF's per-expert loop, `experts_implementation="eager"`, passed
+The MoE models' experts run HF's per-expert loop, `experts_implementation="eager"`, passed
 explicitly (the default is `grouped_mm`, whose CPU summation order differs) and recorded in
-`meta.json`; and every layer's router (`mlp.gate`) is hooked for the routing dump below.
+`meta.json`; and every layer's router (the row's attribute: qwen's `mlp.gate`, Gemma's `router`) is
+hooked for the routing dump below.
 
-Tokenization happens here, once: raw text, no chat template, no special tokens. The ids are written
-to `meta.json`, and both this script and the Rust test read those ids, so a tokenizer difference
-cannot make a false mismatch.
+Tokenization happens here, once: raw text, no chat template, no special tokens but the row's
+beginning-of-sequence id (`bos`: Gemma's `<bos>`, 2, which its chat template emits first and its
+tokenizer does not add; none for qwen). The ids are written to `meta.json`, and both this script
+and the Rust test read those ids, so a tokenizer difference cannot make a false mismatch.
 
 Prompts: the first 5 lines of `--prompts`, and prompt 6, all its lines joined with a newline.
 
-`--model` names the checkpoint (`qwen3.5-0.8b`, `qwen3.5-9b` or `qwen3.6-35b-a3b`) and picks its
-row of `PINNED` and `MODEL_CLASS`.
+`--model` names the checkpoint (`qwen3.5-0.8b`, `qwen3.5-9b`, `qwen3.6-35b-a3b` or
+`gemma-4-26b-a4b-it`) and picks its row of `PINNED` and `MODEL_CLASS`.
 
 Writes to `--out`:
-  meta.json          model, checkpoint dir, revision, safetensors sha256, versions, and per prompt its
-                     text, ids, and the bf16-vs-f32 statistics (minimum row cosine, RMS, max)
+  meta.json          model, checkpoint dir, revision, safetensors sha256, versions (and the row's
+                     recorded attention implementation), and per prompt its text, ids, and the
+                     bf16-vs-f32 statistics (minimum row cosine, RMS, max)
   ref_f32_<p>.bin    logits of every row, [L, vocab] float32 little-endian
   ref_bf16_<p>.bin   the same, from the bfloat16 run
   greedy_<p>.json    prompts 1-5: 8 greedy tokens, each from a fresh full forward (no cache) of the
                      prompt plus the tokens so far, in float32, with each step's float32 top-1 minus
                      top-2 margin and the bfloat16 run's max |error| on that step's last row
-  route_<p>.bin      the MoE model only, `cuda_route_parity_35b.rs`'s P9: per layer and row, the
-                     router's top-8 expert indices and the rank-8 and rank-9 router probabilities
-                     (softmax of the router logits in f32): the f32 run's [layers, L, 8] int32 then
-                     [layers, L, 2] float32, then the bf16 run's, little-endian
+  route_<p>.bin      the MoE models only, `cuda_route_parity_35b.rs`'s and
+                     `cuda_route_parity_gemma4.rs`'s P9: per layer and row, the router's top-8
+                     expert indices and the rank-8 and rank-9 router probabilities (softmax of the
+                     router logits in f32): the f32 run's [layers, L, 8] int32 then [layers, L, 2]
+                     float32, then the bf16 run's, little-endian
   route_greedy_<p>.bin  prompts 1-5, the same for each greedy step's last row ([layers, 8, ...])
+
+With `--hidden-states P,P,...` (#933's diagnosis, `cuda_hf_parity_gemma4.rs`'s
+`diag_hidden_per_layer`), it writes nothing above and writes instead, to `--out` (a directory of its
+own, so the goldens' files and their shas are untouched):
+  hidden_<p>.bin     for each listed prompt, the residual stream at every layer boundary: the
+                     scaled embedding (entry 0), then each decoder layer's output, layer by layer
+                     ([layers + 1, L, hidden]); the f32 run's, then the bf16 run's, float32
+                     little-endian. HF's own `hidden_states`, recorded with forward hooks on the
+                     embedding and every `Gemma4TextDecoderLayer` (`output_hidden_states=True`
+                     would end with the final norm's output, not the last layer's)
+  hidden.json        the model, checkpoint, revision, safetensors sha256, versions, the prompts'
+                     ids and per file its shape and sha256
 
 Needs only torch and transformers. The plain-torch path must be the one that runs, so this refuses
 to start when `fla`, `causal_conv1d` or `kernels` is importable (so no hub kernel, such as the MoE
@@ -111,15 +128,41 @@ PINNED = {
             ]
         ),
     ),
+    # google/gemma-4-26B-A4B-it: 2 shards, model-0000{1,2}-of-00002.safetensors (AI-native-Systems-
+    # Research/scratchy#933's table, the LFS oids at the revision; #885's).
+    "gemma-4-26b-a4b-it": (
+        "4d7ae4984b7db7de8f8457170b3f1a419ee76d52",
+        sorted(
+            [
+                "1127684971bbca40465435a5cad69d67ad603bf5e61c6dfd5561fae4a3bcfdb3",
+                "aab47033e1e8a492ef8e581efae1cf36478d0433567e7729b3c1728bc8970db7",
+            ]
+        ),
+    ),
 }
-# Per `--model`: the transformers class, the `from_pretrained` keywords beyond `dtype`, and
-# whether its layers' routers are dumped (`route_<p>.bin`). The dense models load exactly as before.
+# Per `--model`: the transformers class; the `from_pretrained` keywords beyond `dtype`; the router
+# dumped (`route_<p>.bin`), as the layer's attribute and what its output 0 is (`"logits"`, softmaxed
+# here in f32, or `"probabilities"`, HF's own f32 softmax), or `None`; the beginning-of-sequence id
+# put before every prompt's ids, or `None`; and whether `meta.json` records the attention
+# implementation. The qwen models load and tokenize exactly as before.
 MODEL_CLASS = {
-    "qwen3.5-0.8b": ("Qwen3_5ForConditionalGeneration", {}, False),
-    "qwen3.5-9b": ("Qwen3_5ForConditionalGeneration", {}, False),
+    "qwen3.5-0.8b": ("Qwen3_5ForConditionalGeneration", {}, None, None, False),
+    "qwen3.5-9b": ("Qwen3_5ForConditionalGeneration", {}, None, None, False),
     "qwen3.6-35b-a3b": (
         "Qwen3_5MoeForConditionalGeneration",
         {"experts_implementation": "eager"},
+        ("mlp.gate", "logits"),
+        None,
+        False,
+    ),
+    # `Gemma4TextRouter` (`layer.router`) returns `(router_probabilities, top_k_weights,
+    # top_k_index)`, the first already softmaxed in f32 (`modeling_gemma4.py:1320-1341` in
+    # transformers 5.20.2). Its chat template emits `<bos>` first.
+    "gemma-4-26b-a4b-it": (
+        "Gemma4ForConditionalGeneration",
+        {"experts_implementation": "eager"},
+        ("router", "probabilities"),
+        2,
         True,
     ),
 }
@@ -220,29 +263,107 @@ def stats(torch, bf16, f32):
     }
 
 
+class HiddenDump:
+    """Forward hooks on the text model's embedding and every decoder layer: each forward's residual
+    stream at every layer boundary, `[layers + 1, L, hidden]` float32 (the scaled embedding, then
+    each layer's output)."""
+
+    def __init__(self, torch, model):
+        self.torch = torch
+        text = model.model.language_model
+        self.layers = list(text.layers[: text.config.num_hidden_layers])
+        self.seen = []
+        self.handles = [text.embed_tokens.register_forward_hook(self.hook)]
+        self.handles += [layer.register_forward_hook(self.hook) for layer in self.layers]
+
+    def hook(self, _module, _inputs, out):
+        h = out[0] if isinstance(out, tuple) else out
+        self.seen.append(h[0].detach().float())
+
+    def take(self):
+        n = len(self.layers) + 1
+        assert len(self.seen) == n, f"{len(self.seen)} recorded, {n} boundaries"
+        out, self.seen = self.torch.stack(self.seen), []
+        return out
+
+    def remove(self):
+        for h in self.handles:
+            h.remove()
+
+
+def hidden_states_only(args, model_class, load_kwargs, ids, shas, revision, torch, transformers):
+    """`--hidden-states`: each listed prompt's residual stream at every layer boundary, in float32
+    then bfloat16, to `hidden_<p>.bin` and `hidden.json` in `--out`. Nothing else is written."""
+    wanted = [int(p) for p in args.hidden_states.split(",")]
+    missing = [p for p in wanted if p not in ids]
+    if missing:
+        sys.exit(f"cuda_hf_reference: --hidden-states names prompts {missing} the file lacks")
+    runs = {p: [] for p in wanted}
+    for dtype in (torch.float32, torch.bfloat16):
+        model = model_class.from_pretrained(args.checkpoint, dtype=dtype, **load_kwargs)
+        model.eval()
+        dump = HiddenDump(torch, model)
+        for p in wanted:
+            t = time.time()
+            logits(model, torch, ids[p])
+            runs[p].append(dump.take())
+            print(f"prompt {p}: {dtype} hidden states {time.time() - t:.1f}s", flush=True)
+        dump.remove()
+        del model, dump
+        gc.collect()
+    meta = {
+        "model": args.model,
+        "checkpoint": os.path.abspath(args.checkpoint),
+        "revision": revision,
+        "safetensors_sha256": shas,
+        "torch": torch.__version__,
+        "transformers": transformers.__version__,
+        "layout": "per file: the f32 run's [layers + 1, L, hidden] float32, then the bf16 run's; "
+        "entry 0 the scaled embedding, entry l + 1 decoder layer l's output",
+        "prompts": [],
+    }
+    for p in wanted:
+        path = os.path.join(args.out, f"hidden_{p}.bin")
+        f32, bf16 = runs[p]
+        write_bin(path, torch.cat([f32, bf16]))
+        meta["prompts"].append(
+            {"prompt": p, "ids": ids[p], "shape": list(f32.shape), "sha256": sha256(path)}
+        )
+    with open(os.path.join(args.out, "hidden.json"), "w") as f:
+        json.dump(meta, f, indent=1)
+
+
 def write_bin(path, t):
     t.contiguous().numpy().astype("<f4").tofile(path)
 
 
 class RouteDump:
-    """Forward hooks on every layer's router (`Qwen3_5MoeTopKRouter`, which returns
-    `(router_logits, router_scores, router_indices)`): after a forward, `take()` is the run's
-    top-8 indices `[layers, L, 8]` int32 and its rank-8 and rank-9 probabilities `[layers, L, 2]`
-    float32, from `softmax(router_logits)` in f32."""
+    """Forward hooks on every layer's router (the row's `(attribute, output 0)`: qwen's `mlp.gate`,
+    `Qwen3_5MoeTopKRouter`, returns `(router_logits, router_scores, router_indices)`; Gemma's
+    `router`, `Gemma4TextRouter`, returns `(router_probabilities, top_k_weights, top_k_index)`):
+    after a forward, `take()` is the run's top-8 indices `[layers, L, 8]` int32 and its rank-8 and
+    rank-9 probabilities `[layers, L, 2]` float32, from `softmax(router_logits)` in f32 (HF's own,
+    when output 0 is already the probabilities)."""
 
-    def __init__(self, torch, model):
+    def __init__(self, torch, model, router):
         self.torch = torch
         self.layers = []
+        attribute, self.output = router
         self.handles = [
-            layer.mlp.gate.register_forward_hook(self.hook)
+            layer.get_submodule(attribute).register_forward_hook(self.hook)
             for layer in model.model.language_model.layers
         ]
         self.n = len(self.handles)
 
     def hook(self, _module, _inputs, out):
         torch = self.torch
-        logits, _, indices = out
-        probs = torch.softmax(logits.float(), dim=-1)
+        first, _, indices = out
+        if self.output == "logits":
+            probs = torch.softmax(first.float(), dim=-1)
+        elif self.output == "probabilities":
+            probs = first.float()
+        else:
+            raise ValueError(f"router output 0 is {self.output!r}, not logits or probabilities")
         p89 = torch.topk(probs, ROUTE_TOP_K + 1, dim=-1).values[:, ROUTE_TOP_K - 1 :]
         self.layers.append((indices.to(torch.int32), p89.float()))
 
@@ -273,6 +394,11 @@ def main():
     ap.add_argument("--prompts", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--revision", help="default: the model's pinned revision")
+    ap.add_argument(
+        "--hidden-states",
+        help="comma-separated prompt numbers: write only their per-layer residual streams "
+        "(hidden_<p>.bin, hidden.json) to --out, nothing else",
+    )
     args = ap.parse_args()
     revision = args.revision or PINNED[args.model][0]
     refuse_kernel_packages()
@@ -285,13 +411,24 @@ def main():
     import transformers
     from transformers import AutoTokenizer
 
-    class_name, load_kwargs, route = MODEL_CLASS[args.model]
+    class_name, load_kwargs, route, bos, record_attn = MODEL_CLASS[args.model]
     model_class = getattr(transformers, class_name)
     torch.manual_seed(0)
     os.makedirs(args.out, exist_ok=True)
     tok = AutoTokenizer.from_pretrained(args.checkpoint)
     texts = list(enumerate(prompts(args.prompts), start=1))
     ids = {p: tok(text, add_special_tokens=False)["input_ids"] for p, text in texts}
+    if bos is not None:
+        doubled = [p for p, i in ids.items() if i[:1] == [bos]]
+        if doubled:
+            sys.exit(f"cuda_hf_reference: prompts {doubled} already start with bos {bos}")
+        ids = {p: [bos] + i for p, i in ids.items()}
+    os.makedirs(args.out, exist_ok=True)
+    if args.hidden_states:
+        hidden_states_only(
+            args, model_class, load_kwargs, ids, shas, revision, torch, transformers
+        )
+        return
 
     def load(dtype):
         m = model_class.from_pretrained(args.checkpoint, dtype=dtype, **load_kwargs)
@@ -318,7 +455,9 @@ def main():
     }
     if "experts_implementation" in load_kwargs:
         meta["experts_implementation"] = load_kwargs["experts_implementation"]
-    dump = RouteDump(torch, model) if route else None
+    if record_attn:
+        meta["attn_implementation"] = model.config.text_config._attn_implementation
+    dump = RouteDump(torch, model, route) if route else None
     f32, greedy, f32_route = {}, {}, {}
     for p, _ in texts:
         t = time.time()
@@ -346,7 +485,7 @@ def main():
 
     # Bfloat16: the same inputs, each greedy step's sequence the float32 run's.
     model = load(torch.bfloat16)
-    dump = RouteDump(torch, model) if route else None
+    dump = RouteDump(torch, model, route) if route else None
     for p, text in texts:
         t = time.time()
         bf16 = logits(model, torch, ids[p])

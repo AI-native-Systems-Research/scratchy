@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 
-use scratchy_subtile::handoff::{LoweredDecode, SourceBinding};
+use scratchy_subtile::handoff::{LoweredDecode, RopePairing, SourceBinding};
 use scratchy_subtile::lower::GemmWeightKind;
 use scratchy_subtile::sample_rows::{SampleRowsError, expand_sample_rows};
 use scratchy_subtile::subtile_ir::ExpertProj;
@@ -37,8 +37,8 @@ use scratchy_target_cuda::step::{
     CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, CudaStep, GDN_SEQUENCE_BYTES, gdn_scratch,
 };
 use scratchy_target_cuda::tape::{
-    ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, MoeSortTape, MoeTape, RotaryTable,
-    TapeInput, WeightIx, moe_region_bytes, moe_tiles,
+    ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, KvClass, MoeSortTape, MoeTape,
+    RotaryTable, TapeInput, WeightIx, moe_region_bytes, moe_tiles,
 };
 
 use crate::steps_from_tape::{StepCx, TapeStep, embed, gdn_bundle_layer, lower_fused, lower_step};
@@ -64,6 +64,77 @@ pub struct CudaModelFacts {
     /// (`metal/compiler/src/steps_from_tape.rs`, `shared_expert_owned`), read off the handoff's
     /// `dsl_shared_expert_bases` by [`crate::emit::shared_expert_owner`].
     pub shared_expert: SharedExpertOwner,
+    /// The model's two attention classes, when it has two (Gemma 4's sliding and global layers):
+    /// the handoff's `attn_classes`. `None` for a uniform model, whose one class is `head_dim`,
+    /// `rot_dim` and `rope_theta`, with no window and the half-rotated pairing.
+    pub classes: Option<CudaAttnClasses>,
+    /// Which column tiles the model's GEMMs take: the 256-column tile only, or the 64-column tile
+    /// too (`op_abi::CUDA_GEMM_COL64_ARCHS`).
+    pub gemm_col_tile: GemmColTile,
+}
+
+/// Which column tiles a model's GEMMs take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GemmColTile {
+    /// The tiled GEMM's 256 columns only (every Qwen model).
+    Tile256Only,
+    /// Also the 64-column GEMM: an `n` above the narrow GEMM's that is a multiple of 64 and not of
+    /// 256 lowers to `CudaStep::GemmCol64`, and an expert GEMM's `n_tile` is 64 when `n` is not a
+    /// multiple of 256 (Gemma 4).
+    Col64,
+}
+
+/// A two-class model's attention classes. `base` is `head_dim`, `rot_dim` and `rope_theta`'s, and
+/// the `Cos { local: true }` table's; `global` the `Cos { local: false }` table's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CudaAttnClasses {
+    pub base: CudaAttnClass,
+    pub global: CudaAttnClass,
+}
+
+/// One attention class: what a layer of it rotates (`rot_dim` of `head_dim` lanes, paired as
+/// `pairing`, by a table of `rope_theta`), caches (`kv_heads` heads) and masks (`window`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CudaAttnClass {
+    pub head_dim: u32,
+    pub kv_heads: u32,
+    pub rot_dim: u32,
+    pub rope_theta: f64,
+    pub pairing: RopePairing,
+    pub window: Option<u32>,
+}
+
+impl CudaAttnClass {
+    /// The class's table's frequency denominator ([`RotaryTable::freq_dim`]): the rotated width
+    /// for the half-rotated pairing, the head dim for the half-head (proportional) one.
+    pub const fn freq_dim(&self) -> u32 {
+        match self.pairing {
+            RopePairing::HalfRotated => self.rot_dim,
+            RopePairing::HalfHead => self.head_dim,
+        }
+    }
+}
+
+impl CudaModelFacts {
+    /// The class whose rotary table is the `Cos { local }` one: the global table is a uniform
+    /// model's one class, or a two-class model's global class; the local table is a two-class
+    /// model's base class, and `None` for a uniform model. A uniform class's `kv_heads` is 0: its
+    /// pool's are its `PrefixK` sources' (`kv_cache`).
+    pub fn table_class(&self, local: bool) -> Option<CudaAttnClass> {
+        match (self.classes, local) {
+            (Some(c), true) => Some(c.base),
+            (Some(c), false) => Some(c.global),
+            (None, true) => None,
+            (None, false) => Some(CudaAttnClass {
+                head_dim: self.head_dim,
+                kv_heads: 0,
+                rot_dim: self.rot_dim,
+                rope_theta: self.rope_theta,
+                pairing: RopePairing::HalfRotated,
+                window: None,
+            }),
+        }
+    }
 }
 
 /// Who computes a MoE bundle's shared expert.
@@ -139,6 +210,9 @@ pub struct CudaCanonical {
     /// The rotary table, after every colour: `Some` exactly when the canonical binds a
     /// `Cos { local: false }` source.
     pub rotary: Option<RotaryTable>,
+    /// The second rotary table, the `Cos { local: true }` one, after the first: `Some` exactly
+    /// when the canonical binds a `Cos { local: true }` source.
+    pub rotary_local: Option<RotaryTable>,
     /// The paged KV cache and its regions, after the rotary table: `Some` exactly when the
     /// canonical binds a `PrefixK` source. The fields of a `scratchy_target_cuda::tape::KvTape`.
     pub kv: Option<CanonicalKv>,
@@ -177,6 +251,10 @@ pub struct CanonicalKv {
     pub block_table: ArenaSpan,
     pub slot_mapping: ArenaSpan,
     pub sequence: ArenaSpan,
+    /// The attention classes, class 0 `kv_heads` and `head_dim`'s.
+    pub classes: Vec<KvClass>,
+    /// Per entry of `layers`, its class.
+    pub layer_class: Vec<u8>,
 }
 
 /// Why a canonical could not be lowered.
@@ -230,6 +308,13 @@ pub enum CanonicalRefusal {
     NormEps {
         step: usize,
         eps: f32,
+    },
+    /// The `step`-th `Compute` is a scale or a soft-cap whose compile-time scalar `value` is not
+    /// finite, or (a soft-cap's cap, which divides) not above 0.
+    Scalar {
+        step: usize,
+        op: &'static str,
+        value: f32,
     },
     /// The `step`-th `Compute` is an RmsNorm whose gain is `[rows, cols]`, not `[1, want]`.
     GainShape {
@@ -302,14 +387,14 @@ pub enum CanonicalRefusal {
     RopePairing {
         step: usize,
     },
-    /// The `step`-th `Compute` is a `RopeAppend` or attention of a sliding-window layer; CUDA's
-    /// kernels mask causally only.
+    /// The `step`-th `Compute` is a `RopeAppend` or attention whose window is not its attention
+    /// class's (a uniform model's has none).
     SlidingWindow {
         step: usize,
         op: &'static str,
     },
-    /// The `step`-th `Compute` is a `RopeAppend` or attention whose head dim is not the model's,
-    /// which is the KV cache's.
+    /// The `step`-th `Compute` is a `RopeAppend` or attention whose head dim is not its attention
+    /// class's (a uniform model's is the model's), which is the KV cache's.
     KvHeadDim {
         step: usize,
         op: &'static str,
@@ -434,7 +519,7 @@ pub enum MoeShapeRule {
     Bundle,
     /// The expert bank is affine; CUDA's expert kernels take dense bf16 only.
     Affine,
-    /// The gated activation is not SiLU, the one `silu_mul_bf16.cu` computes.
+    /// The gated activation is neither SiLU (`silu_mul_bf16.cu`) nor GELU (the `GeluMul` step).
     Activation,
     /// The routing is not the fold of a softmax, an argsort and a gather (and a renorm).
     Routing,
@@ -444,10 +529,9 @@ pub enum MoeShapeRule {
     /// The op's rows are not the bucket's tokens.
     Rows,
     /// A dimension the expert GEMMs tile is off their tile: `hidden` or `inter` not a multiple of
-    /// 256, or of 64 as `k`.
+    /// 256 (or, for a 64-column-tile model, of 64), or of 64 as `k`.
     OffTile { dim: &'static str, value: u32 },
-    /// The router's experts are not the 256 the routing kernel's warp holds (8 per lane), or the
-    /// top-k is above 32.
+    /// The router's experts are not one of `op_abi::MOE_EXPERT_COUNTS`, or the top-k is above 32.
     Experts { experts: u32, top_k: u32 },
 }
 
@@ -541,6 +625,9 @@ pub enum AttnShapeRule {
     /// A one-row bucket's GQA group `q_heads / kv_heads` is `group`, above `max`, the query rows
     /// the decode kernel merges per kv head.
     GroupAboveMax { group: u32, max: u32 },
+    /// The class's window is not a non-zero multiple of `multiple` keys, the KV block: a KV tile
+    /// would sit across the window's lower edge.
+    WindowOffBlock { window: u32, multiple: u32 },
 }
 
 /// Why an attention's new K or V is not its layer's `RopeAppend`'s.
@@ -608,6 +695,13 @@ pub enum GemmShapeRule {
     /// `m = 1` and `n` is not the narrow GEMM's, and the GEMV's `k` is zero or not a multiple of
     /// its `multiple`.
     GemvOffVector { value: u32, multiple: u32 },
+    /// A 64-column-tile model's `n` is a multiple of 64 and not of 256 (the 64-column GEMM's), and
+    /// `dim` is zero or not a multiple of its `tile`.
+    Col64OffTile {
+        dim: &'static str,
+        value: u32,
+        tile: u32,
+    },
 }
 
 /// Why an operand cannot be bound.
@@ -707,6 +801,10 @@ impl std::fmt::Display for CanonicalRefusal {
                 f,
                 "step {step} (RmsNorm) has eps = {eps}; it must be finite and above 0"
             ),
+            Self::Scalar { step, op, value } => write!(
+                f,
+                "step {step} ({op}) has a scalar of {value}; it must be finite, and a cap above 0"
+            ),
             Self::GainShape {
                 step,
                 rows,
@@ -788,8 +886,8 @@ impl std::fmt::Display for CanonicalRefusal {
             ),
             Self::SlidingWindow { step, op } => write!(
                 f,
-                "step {step} ({op}) is a sliding-window layer's; the cuda kernels mask causally \
-                 only"
+                "step {step} ({op}) is a sliding-window layer's, and its attention class has \
+                 another window or none"
             ),
             Self::KvHeadDim {
                 step,
@@ -927,7 +1025,7 @@ impl std::fmt::Display for MoeShapeRule {
                  GEMM for"
             ),
             Self::Affine => write!(f, "its experts are affine; CUDA's take dense bf16 only"),
-            Self::Activation => write!(f, "its gated activation is not SiLU"),
+            Self::Activation => write!(f, "its gated activation is neither SiLU nor GELU"),
             Self::Routing => write!(
                 f,
                 "its routing is not a softmax, then the top-k, then an optional renorm"
@@ -943,8 +1041,9 @@ impl std::fmt::Display for MoeShapeRule {
             ),
             Self::Experts { experts, top_k } => write!(
                 f,
-                "{experts} experts, top-{top_k}: the routing kernel takes 256 experts (8 per \
-                 lane of a warp) and a top-k of 1 to 32"
+                "{experts} experts, top-{top_k}: the MoE steps take {:?} experts and a top-k of \
+                 1 to 32",
+                scratchy_target_cuda::op_abi::MOE_EXPERT_COUNTS
             ),
         }
     }
@@ -1093,6 +1192,11 @@ impl std::fmt::Display for AttnShapeRule {
                 "q_heads / kv_heads = {group} must be at most {max}, the query rows the decode \
                  kernel merges per kv head"
             ),
+            Self::WindowOffBlock { window, multiple } => write!(
+                f,
+                "the window of {window} keys must be a non-zero multiple of {multiple}, the KV \
+                 block"
+            ),
         }
     }
 }
@@ -1185,6 +1289,10 @@ impl std::fmt::Display for GemmShapeRule {
                 f,
                 "k = {value} must be a non-zero multiple of {multiple}, the bf16 GEMV's 16-byte \
                  vector"
+            ),
+            Self::Col64OffTile { dim, value, tile } => write!(
+                f,
+                "{dim} = {value} must be a non-zero multiple of {tile} (the 64-column GEMM)"
             ),
         }
     }
@@ -1327,6 +1435,9 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
             Err(e) => Err(*e),
         },
         rotary: arena.as_ref().ok().and_then(|a| a.rotary).map(|t| t.offset),
+        rotary_local: (arena.as_ref().ok())
+            .and_then(|a| a.rotary_local)
+            .map(|t| t.offset),
         kv: match &kv {
             Ok(k) => Ok(k.as_ref()),
             Err(e) => Err(*e),
@@ -1386,13 +1497,15 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
         .collect();
     let weight_bytes = (plan.lowered.bindings.iter().enumerate())
         .map(|(t, binding)| match binding {
-            SourceBinding::Weight { .. } => match bundles.get(&(t as u32)) {
-                Some(&bytes) => Ok(bytes),
-                None => {
-                    let shape = plan.graph.tensors[t];
-                    elements_bytes(shape.rows, shape.cols).ok_or(ArenaRefusal::TooLarge)
+            SourceBinding::Weight { .. } | SourceBinding::BundleTensor { .. } => {
+                match bundles.get(&(t as u32)) {
+                    Some(&bytes) => Ok(bytes),
+                    None => {
+                        let shape = plan.graph.tensors[t];
+                        elements_bytes(shape.rows, shape.cols).ok_or(ArenaRefusal::TooLarge)
+                    }
                 }
-            },
+            }
             // The embedded hidden's source holds the embedding table the head gathers from.
             SourceBinding::EmbeddedHidden => match head {
                 Some((e, _, vocab, hidden)) if e == t => {
@@ -1430,15 +1543,26 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
         result,
         weight_bytes,
         steps,
-        rotary: arena.rotary.map(|span| RotaryTable {
-            span,
-            rot_dim: plan.facts.rot_dim,
-            theta_bits: plan.facts.rope_theta.to_bits(),
+        rotary: arena
+            .rotary
+            .zip(plan.facts.table_class(false))
+            .map(|(span, c)| RotaryTable {
+                span,
+                rot_dim: c.rot_dim,
+                freq_dim: c.freq_dim(),
+                theta_bits: c.rope_theta.to_bits(),
+            }),
+        rotary_local: (arena.rotary_local.zip(plan.facts.table_class(true))).map(|(span, c)| {
+            RotaryTable {
+                span,
+                rot_dim: c.rot_dim,
+                freq_dim: c.freq_dim(),
+                theta_bits: c.rope_theta.to_bits(),
+            }
         }),
         // The arena placed the regions exactly when a `PrefixK` is bound, and `kv_cache` found
         // the pool exactly then.
         kv: kv.zip(arena.kv).map(|(k, r)| CanonicalKv {
-            layers: k.layers,
             kv_heads: k.kv_heads,
             head_dim: k.head_dim,
             block_size: CUDA_KV_BLOCK_SIZE,
@@ -1446,19 +1570,28 @@ pub fn lower_plan(plan: CudaPlan) -> Result<CudaCanonical, CanonicalRefusal> {
             block_table: r.block_table,
             slot_mapping: r.slot_mapping,
             sequence: r.sequence,
+            layer_class: k.layer_class,
+            classes: k.classes,
+            layers: k.layers,
         }),
         gdn,
         moe,
     })
 }
 
-/// The KV pool of one canonical: its layers, ascending, and its geometry.
+/// The KV pool of one canonical: its layers, ascending, its geometry (class 0's), and each
+/// layer's attention class.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KvPool {
     /// The model layer ids of the `PrefixK` sources: a step's `layer` is an index into this.
     pub layers: Vec<u32>,
     pub kv_heads: u32,
     pub head_dim: u32,
+    /// The attention classes: one for a uniform model (`kv_heads` and `head_dim`, no window), the
+    /// base then the global class for a two-class one.
+    pub classes: Vec<KvClass>,
+    /// Per entry of `layers`, its class.
+    pub layer_class: Vec<u8>,
 }
 
 impl KvPool {
@@ -1467,12 +1600,38 @@ impl KvPool {
         let layer = u32::try_from(layer).ok()?;
         (self.layers.iter().position(|&l| l == layer)).map(|i| i as u32)
     }
+
+    /// The class of pool index `index`.
+    pub fn class_of(&self, index: u32) -> Option<KvClass> {
+        let c = *self.layer_class.get(index as usize)?;
+        self.classes.get(usize::from(c)).copied()
+    }
+}
+
+/// The class a two-class model's KV layers are of, by the window of their `RopeAppend`'s mask (as
+/// its lowering reads it): the base class's window is class 0, any other class 1. A layer no
+/// `RopeAppend` writes is the base class's.
+fn kv_layer_classes(plan: &CudaPlan, classes: CudaAttnClasses) -> BTreeMap<u64, u8> {
+    (tape_steps(plan))
+        .filter_map(|s| match s.node.op {
+            SubOp::RopeAppend { layer, attn, .. } => {
+                let window = attn.window().map(std::num::NonZeroU32::get);
+                Some((u64::from(layer), u8::from(window != classes.base.window)))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// The KV pool the canonical's `PrefixK` / `PrefixV` sources describe, or `None` when it binds
-/// none. Every layer binds both; every source is `kv_heads · head_dim` columns, the model's head
-/// dim and one width for the whole pool.
+/// none. Every layer binds both. A uniform model's every source is `kv_heads · head_dim` columns,
+/// the model's head dim and one width for the whole pool. A two-class model's every source is its
+/// layer's class's `kv_heads · head_dim` ([`kv_layer_classes`]), and the pool's geometry is the
+/// base class's.
 fn kv_cache(plan: &CudaPlan) -> Result<Option<KvPool>, KvCacheRefusal> {
+    if let Some(classes) = plan.facts.classes {
+        return kv_cache_of_classes(plan, classes);
+    }
     let head_dim = plan.facts.head_dim;
     let mut k_layers = BTreeMap::new();
     let mut v_layers = BTreeMap::new();
@@ -1512,10 +1671,88 @@ fn kv_cache(plan: &CudaPlan) -> Result<Option<KvPool>, KvCacheRefusal> {
     let layers = (k_layers.keys())
         .map(|&layer| u32::try_from(layer).map_err(|_| KvCacheRefusal::LayerTooLarge { layer }))
         .collect::<Result<Vec<_>, _>>()?;
+    let kv_heads = want / head_dim;
+    Ok(Some(KvPool {
+        layer_class: vec![0; layers.len()],
+        layers,
+        kv_heads,
+        head_dim,
+        classes: vec![KvClass {
+            kv_heads,
+            head_dim,
+            window: None,
+        }],
+    }))
+}
+
+/// [`kv_cache`] of a two-class model: each layer's K and V sources `kv_heads · head_dim` columns
+/// of its class.
+fn kv_cache_of_classes(
+    plan: &CudaPlan,
+    classes: CudaAttnClasses,
+) -> Result<Option<KvPool>, KvCacheRefusal> {
+    let of_layer = kv_layer_classes(plan, classes);
+    let class = |c: u8| match c {
+        0 => classes.base,
+        _ => classes.global,
+    };
+    let mut k_layers = BTreeMap::new();
+    let mut v_layers = BTreeMap::new();
+    for (t, binding) in plan.lowered.bindings.iter().enumerate() {
+        let cols = plan.graph.tensors[t].cols;
+        match *binding {
+            SourceBinding::PrefixK { layer } => {
+                k_layers.insert(layer, cols);
+            }
+            SourceBinding::PrefixV { layer } => {
+                v_layers.insert(layer, cols);
+            }
+            _ => {}
+        }
+    }
+    if let Some(&layer) = (k_layers.keys())
+        .find(|l| !v_layers.contains_key(l))
+        .or_else(|| v_layers.keys().find(|l| !k_layers.contains_key(l)))
+    {
+        return Err(KvCacheRefusal::Unpaired { layer });
+    }
+    if k_layers.is_empty() {
+        return Ok(None);
+    }
+    for (&layer, &cols) in k_layers.iter().chain(&v_layers) {
+        let c = of_layer.get(&layer).copied().unwrap_or(0);
+        let CudaAttnClass {
+            head_dim, kv_heads, ..
+        } = class(c);
+        if head_dim == 0 || cols == 0 || !cols.is_multiple_of(head_dim) {
+            return Err(KvCacheRefusal::OffHead {
+                layer,
+                cols,
+                head_dim,
+            });
+        }
+        let want = kv_heads.saturating_mul(head_dim);
+        if cols != want {
+            return Err(KvCacheRefusal::Width { layer, cols, want });
+        }
+    }
+    let layer_class = (k_layers.keys())
+        .map(|layer| of_layer.get(layer).copied().unwrap_or(0))
+        .collect();
+    let layers = (k_layers.keys())
+        .map(|&layer| u32::try_from(layer).map_err(|_| KvCacheRefusal::LayerTooLarge { layer }))
+        .collect::<Result<Vec<_>, _>>()?;
+    let kv_class = |c: CudaAttnClass| KvClass {
+        kv_heads: c.kv_heads,
+        head_dim: c.head_dim,
+        window: c.window,
+    };
     Ok(Some(KvPool {
         layers,
-        kv_heads: want / head_dim,
-        head_dim,
+        kv_heads: classes.base.kv_heads,
+        head_dim: classes.base.head_dim,
+        classes: vec![kv_class(classes.base), kv_class(classes.global)],
+        layer_class,
     }))
 }
 
@@ -1526,6 +1763,7 @@ struct Arena {
     bytes: Vec<u64>,
     offsets: Vec<u64>,
     rotary: Option<ArenaSpan>,
+    rotary_local: Option<ArenaSpan>,
     kv: Option<KvRegions>,
     gdn: Option<GdnRegions>,
     moe: Option<MoeTape>,
@@ -1584,6 +1822,9 @@ pub struct MoeGeometry {
     pub top_k: u32,
     pub hidden: u32,
     pub inter: u32,
+    /// Whether the block's router reads a pre-norm of its own (Gemma's `RouterNorm`), which the
+    /// scratch then holds in its router-norm rows.
+    pub router_norm: bool,
 }
 
 /// The canonical's MoE geometry, or `None` when it has no MoE op: the experts of its first
@@ -1604,16 +1845,19 @@ fn moe_geometry(plan: &CudaPlan) -> Option<MoeGeometry> {
         SubOp::ExpertCombine { hidden, .. } => Some(hidden),
         _ => None,
     })?;
+    let router_norm = tape_steps(plan).any(|s| matches!(s.node.op, SubOp::RouterNorm { .. }));
     Some(MoeGeometry {
         experts,
         top_k,
         hidden,
         inter,
+        router_norm,
     })
 }
 
 /// The MoE scratch of `geometry` at `bucket_m` rows, placed by `place`: its regions in
-/// `MoeTape`'s order, sorted when the bucket's pairs reach `op_abi::CUDA_SORTED_PAIRS`.
+/// `MoeTape`'s order, sorted when the bucket's pairs reach `op_abi::CUDA_SORTED_PAIRS`, then the
+/// router-norm rows (`[bucket_m, hidden]` bf16) when the block's router has a pre-norm.
 fn moe_scratch(
     bucket_m: u32,
     g: MoeGeometry,
@@ -1630,6 +1874,16 @@ fn moe_scratch(
             bytes: b,
         });
     }
+    let router_norm = match g.router_norm {
+        true => {
+            let b = elements_bytes(bucket_m, g.hidden).ok_or(ArenaRefusal::TooLarge)?;
+            Some(ArenaSpan {
+                offset: ArenaOffset(place(b)?),
+                bytes: b,
+            })
+        }
+        false => None,
+    };
     let (head, tail) = spans.split_at(3);
     let (sort, experts) = if sorted {
         let (s, e) = tail.split_at(6);
@@ -1660,6 +1914,7 @@ fn moe_scratch(
         up: experts[1],
         act: experts[2],
         down: experts[3],
+        router_norm,
     })
 }
 
@@ -1737,7 +1992,9 @@ fn embedded_hidden_source(plan: &CudaPlan) -> Result<(usize, TensorShape), Arena
 /// Size every colour from the shape its values share, and place the colours one after another in
 /// colour order, each at a multiple of [`CUDA_ARENA_ALIGN`]. Colour 0 is the embedded hidden's
 /// buffer, so it is sized from the source bound to it. When the canonical binds the global rotary
-/// `cos`, the rotary table (`[bucket_m, rot_dim]` bf16) follows the colours, aligned the same way;
+/// `cos`, the rotary table (`[bucket_m, rot_dim]` bf16, its class's `rot_dim`) follows the
+/// colours, aligned the same way, and a two-class model's local table after it when it binds the
+/// local `cos`;
 /// when it binds a `PrefixK`, the block table (`CUDA_MAX_BLOCKS_PER_SEQ` u32), the slot mapping
 /// (`bucket_m` u32) and the sequence (2 u32) follow, in that order, each aligned the same way;
 /// when a step is a `GatedDeltaNet`, the GDN sequence (4 u32) and the GDN scratch
@@ -1781,17 +2038,22 @@ fn arena_layout(plan: &CudaPlan) -> Result<Arena, ArenaRefusal> {
     for &b in &bytes {
         offsets.push(place(b)?);
     }
-    let rotary = (plan.lowered.bindings)
-        .contains(&SourceBinding::Cos { local: false })
-        .then(|| {
-            let bytes =
-                elements_bytes(hidden.rows, plan.facts.rot_dim).ok_or(ArenaRefusal::TooLarge)?;
-            Ok(ArenaSpan {
-                offset: ArenaOffset(place(bytes)?),
-                bytes,
+    let mut table = |local: bool| {
+        let class = plan.facts.table_class(local);
+        let bound = (plan.lowered.bindings).contains(&SourceBinding::Cos { local });
+        class
+            .filter(|_| bound)
+            .map(|c| {
+                let bytes = elements_bytes(hidden.rows, c.rot_dim).ok_or(ArenaRefusal::TooLarge)?;
+                Ok(ArenaSpan {
+                    offset: ArenaOffset(place(bytes)?),
+                    bytes,
+                })
             })
-        })
-        .transpose()?;
+            .transpose()
+    };
+    let rotary = table(false)?;
+    let rotary_local = table(true)?;
     let binds_prefix =
         (plan.lowered.bindings.iter()).any(|b| matches!(b, SourceBinding::PrefixK { .. }));
     let kv = binds_prefix
@@ -1843,6 +2105,7 @@ fn arena_layout(plan: &CudaPlan) -> Result<Arena, ArenaRefusal> {
         bytes,
         offsets,
         rotary,
+        rotary_local,
         kv,
         gdn,
         moe,

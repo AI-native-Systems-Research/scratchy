@@ -15,6 +15,13 @@
 // The kernel is ThunderKittens' `lcf` producer/consumer template: one producer warpgroup issues
 // TMA loads into a 4-stage ring of shared-memory input blocks, and two consumer warpgroups run
 // WGMMA on them, each owning 64 of the tile's 128 output rows and all 256 of its columns.
+//
+// The same template is instantiated twice: at `N_BLOCK = 4` (`scratchy_cuda_gemm_bf16_abt`, 256
+// output columns per tile) and at `N_BLOCK = 1` (`scratchy_cuda_gemm_col64_bf16_abt`, 64, for an
+// `n` that is a multiple of 64 and not of 256: Gemma 4's 128, 704 and 2112, `step::GEMM_COL64_TILE`).
+// The K loop, its 64-wide steps and the WGMMA K order are the same in both, so on an `n` both take
+// each output element is the same bits. No 64-column box crosses a column edge (`n` and `k` are
+// multiples of 64), so every tile stays swizzled (the TK-1 R1 rule).
 
 #include "kittens.cuh"
 #include "prototype.cuh"
@@ -132,6 +139,8 @@ struct matmul_template {
 };
 
 using gemm_bf16_abt_mmt = matmul_template<2, 4, 8>;
+// One 64-column B block: `rt_fl<16, 64>` accumulators, `a[2]` and `b[1]` input tiles, `c[2][1]`.
+using gemm_col64_bf16_abt_mmt = matmul_template<2, 1, 8>;
 
 // The dynamic shared memory every launch asks for, and the attribute `_prepare` raises the
 // kernel's limit to: the whole H100 budget minus the 1024 bytes `lcf` reserves for alignment.
@@ -148,21 +157,18 @@ extern "C" int scratchy_cuda_gemm_bf16_abt_prepare(void) {
                                                  GEMM_BF16_ABT_SMEM_BYTES));
 }
 
-// 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
-// SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode);
-// any other value = the cudaError_t cudaLaunchKernel returned for THIS launch. Nothing here reads
-// or clears the runtime's last-error state, so an error an earlier, unrelated call left behind is
-// never reported as this launch's.
-//
-// `m`, `n` and `k` must be non-zero multiples of 128, 256 and 64: the tile order truncates
-// (`C.rows() / (M_BLOCK*64)`), so a tail would silently be left unwritten. None may exceed INT_MAX:
-// ThunderKittens' `gl` stores each dimension as an `int`. Both are checked before any pointer is
-// touched. `scratchy_cuda_gemm_bf16_abt_prepare` must have succeeded on the current device. The
-// launch is asynchronous on `stream`; the caller owns it and synchronizes.
-extern "C" int scratchy_cuda_gemm_bf16_abt(const void* a, const void* b, void* c,
-                                           uint32_t m, uint32_t n, uint32_t k,
-                                           void* stream /* cudaStream_t; null = default stream */) {
-    using mmt = gemm_bf16_abt_mmt;
+// `scratchy_cuda_gemm_bf16_abt_prepare`'s, for the 64-column instance.
+extern "C" int scratchy_cuda_gemm_col64_bf16_abt_prepare(void) {
+    return static_cast<int>(cudaFuncSetAttribute(kittens::prototype::lcf::kernel<gemm_col64_bf16_abt_mmt>,
+                                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                 GEMM_BF16_ABT_SMEM_BYTES));
+}
+
+// The launch of `mmt`'s instance, the shape rule its tile's: `m`, `n` and `k` non-zero multiples
+// of `M_BLOCK·64`, `N_BLOCK·64` and 64, none above INT_MAX.
+template <typename mmt>
+static int launch_abt(const void* a, const void* b, void* c, uint32_t m, uint32_t n, uint32_t k,
+                      void* stream) {
     constexpr uint32_t M_TILE = mmt::M_BLOCK * 64, N_TILE = mmt::N_BLOCK * 64, K_TILE = 64;
     constexpr uint32_t DIM_MAX = static_cast<uint32_t>(INT_MAX);
     if (m == 0 || n == 0 || k == 0 || m % M_TILE != 0 || n % N_TILE != 0 || k % K_TILE != 0 ||
@@ -192,4 +198,31 @@ extern "C" int scratchy_cuda_gemm_bf16_abt(const void* a, const void* b, void* c
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }
+}
+
+// 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
+// SCRATCHY_CUDA_ERR_HOST = a C++ exception was caught (e.g. tensor-map encode);
+// any other value = the cudaError_t cudaLaunchKernel returned for THIS launch. Nothing here reads
+// or clears the runtime's last-error state, so an error an earlier, unrelated call left behind is
+// never reported as this launch's.
+//
+// `m`, `n` and `k` must be non-zero multiples of 128, 256 and 64: the tile order truncates
+// (`C.rows() / (M_BLOCK*64)`), so a tail would silently be left unwritten. None may exceed INT_MAX:
+// ThunderKittens' `gl` stores each dimension as an `int`. Both are checked before any pointer is
+// touched. `scratchy_cuda_gemm_bf16_abt_prepare` must have succeeded on the current device. The
+// launch is asynchronous on `stream`; the caller owns it and synchronizes.
+extern "C" int scratchy_cuda_gemm_bf16_abt(const void* a, const void* b, void* c,
+                                           uint32_t m, uint32_t n, uint32_t k,
+                                           void* stream /* cudaStream_t; null = default stream */) {
+    return launch_abt<gemm_bf16_abt_mmt>(a, b, c, m, n, k, stream);
+}
+
+// As `scratchy_cuda_gemm_bf16_abt`, on 64-column tiles: `m`, `n` and `k` must be non-zero
+// multiples of 128, 64 and 64 (`step::GEMM_COL64_TILE`), none above INT_MAX, checked before any
+// pointer is touched. `scratchy_cuda_gemm_col64_bf16_abt_prepare` must have succeeded on the
+// current device.
+extern "C" int scratchy_cuda_gemm_col64_bf16_abt(const void* a, const void* b, void* c,
+                                                 uint32_t m, uint32_t n, uint32_t k,
+                                                 void* stream /* cudaStream_t; null = default */) {
+    return launch_abt<gemm_col64_bf16_abt_mmt>(a, b, c, m, n, k, stream);
 }

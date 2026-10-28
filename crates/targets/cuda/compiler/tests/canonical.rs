@@ -26,6 +26,7 @@ use scratchy_target_cuda::step::{CudaStep, EmbedBf16, GemmBf16};
 use scratchy_target_cuda::tape::{ArenaOffset, ArenaSpan, TapeInput, WeightIx};
 use scratchy_target_cuda::weights::CudaWeight;
 use scratchy_target_cuda_compiler::canonical::AttnShapeRule;
+use scratchy_target_cuda_compiler::canonical::GemmColTile;
 use scratchy_target_cuda_compiler::canonical::{
     ArenaRefusal, CanonicalAt, CanonicalRefusal, CudaEmbedFacts, CudaModelFacts, CudaPlan,
     EmbedShapeRule, GateShapeRule, GemmShapeRule, OperandRefusal, RopeShapeRule, SharedExpertOwner,
@@ -53,6 +54,8 @@ const FACTS: CudaModelFacts = CudaModelFacts {
     gdn: None,
     embed: None,
     shared_expert: SharedExpertOwner::Undeclared,
+    classes: None,
+    gemm_col_tile: GemmColTile::Tile256Only,
 };
 
 fn fixtures() -> Vec<(&'static str, LoweringInput)> {
@@ -220,6 +223,8 @@ fn a_rope_on_the_hidden_with_the_global_table_lowers_to_one_rope() {
         gdn: None,
         embed: None,
         shared_expert: SharedExpertOwner::Undeclared,
+        classes: None,
+        gemm_col_tile: GemmColTile::Tile256Only,
     };
     let c = lower_canonical(&l, facts, AT).expect("the rope lowers");
     let [CudaStep::Rope(rope)] = c.steps.as_slice() else {
@@ -721,6 +726,7 @@ fn a_fold_whose_absorbed_step_is_not_on_the_tape_is_refused() {
         tokens: Some(256),
         offsets: Err(ArenaRefusal::TooLarge),
         rotary: None,
+        rotary_local: None,
         kv: Ok(None),
         kv_regions: None,
         gdn_layers: &[],
@@ -878,6 +884,7 @@ fn lower_second_add(
         tokens: Some(256),
         offsets: Ok(&[0, 1048576, 2097152]),
         rotary: None,
+        rotary_local: None,
         kv: Ok(None),
         kv_regions: None,
         gdn_layers: &[],
@@ -1026,6 +1033,7 @@ fn tied_head(m: u32) -> LoweredDecode {
 fn tied_model(ms: &[u32], head: &str, vocab: u32) -> TargetModelInput {
     TargetModelInput {
         stem: "fixture".to_string(),
+        arch: "fixture".to_string(),
         buckets: (ms.iter())
             .map(|&m| TargetBucket {
                 point: TargetPoint { m, sk: 1 },
@@ -1041,12 +1049,14 @@ fn tied_model(ms: &[u32], head: &str, vocab: u32) -> TargetModelInput {
             vocab_size: vocab,
             gdn: None,
             dsl_shared_expert_bases: Vec::new(),
+            attn_classes: Vec::new(),
         },
         weight_prefixes: vec![
             (1, None, "model.norm".to_string()),
             (2, None, head.to_string()),
         ],
         embed_prefix: Some("model.embed_tokens".to_string()),
+        bundle_tensor_names: Vec::new(),
     }
 }
 
@@ -1236,4 +1246,63 @@ fn a_weight_no_step_reads_is_refused() {
         matches!(e, ModelRefusal::UnreadWeight { ix: 3, bytes: 1024 }),
         "{e}"
     );
+}
+
+// ── Bundle tensors in the weight table (#885) ──────────────────────
+
+/// [`tied_model`] with the norm's gain (source 1) one tensor of a weight bundle, as Gemma's
+/// router scale is, and the handoff's `bundle_tensor_names` its full name when `named`.
+fn bundle_gain_model(named: bool) -> TargetModelInput {
+    use scratchy_subtile::handoff::{BundleTensor, UnrollIndex};
+    let mut input = tied_model(&[128], "lm_head", 256);
+    let binding = SourceBinding::BundleTensor {
+        id: 7,
+        index: Some(UnrollIndex(0)),
+        tensor: BundleTensor::RouterScale,
+    };
+    for b in &mut input.buckets {
+        b.lowered.bindings[1] = binding.clone();
+    }
+    if named {
+        input.bundle_tensor_names.push((
+            7,
+            Some(UnrollIndex(0)),
+            BundleTensor::RouterScale,
+            "model.layers.0.router.scale".to_string(),
+        ));
+    }
+    input
+}
+
+/// A bundle tensor read as a gain is one bf16 weight, named in full by the handoff, with no
+/// `.weight` added.
+#[test]
+fn a_bundle_tensor_is_named_by_the_handoff() {
+    let model = lower_model(&bundle_gain_model(true)).expect("lowers");
+    assert_eq!(
+        model.weights[1],
+        Some(CudaWeight::Bf16 {
+            tensor: "model.layers.0.router.scale",
+            shape: &[512],
+        })
+    );
+}
+
+/// A bundle tensor the handoff names no checkpoint tensor for is refused naming its binding.
+#[test]
+fn a_bundle_tensor_with_no_name_is_refused() {
+    let e = lower_model(&bundle_gain_model(false)).expect_err("refused");
+    assert!(e.to_string().contains("RouterScale"), "{e}");
+    assert!(matches!(e, ModelRefusal::NoPrefix { ix: 1, .. }), "{e:?}");
+}
+
+/// The 64-column GEMM is the archs `op_abi::CUDA_GEMM_COL64_ARCHS` names: gemma4-moe's, no
+/// other's.
+#[test]
+fn the_gemm_column_tile_is_the_archs() {
+    use scratchy_target_cuda_compiler::emit::gemm_col_tile;
+    assert_eq!(gemm_col_tile("gemma4-moe"), GemmColTile::Col64);
+    for arch in ["qwen3-5", "qwen3-5-moe", "fixture"] {
+        assert_eq!(gemm_col_tile(arch), GemmColTile::Tile256Only, "{arch}");
+    }
 }

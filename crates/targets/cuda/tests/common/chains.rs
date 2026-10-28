@@ -13,6 +13,7 @@ use scratchy_target_cuda::step::{CudaStep, GemmBf16};
 use scratchy_target_cuda::tape::{
     ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, GdnTape, KvTape, TapeInput, WeightIx,
 };
+use scratchy_target_cuda_compiler::canonical::GemmColTile;
 use scratchy_target_cuda_compiler::canonical::{
     CanonicalAt, CanonicalGdn, CanonicalKv, CudaCanonical, CudaGdnFacts, CudaModelFacts,
     SharedExpertOwner, lower_canonical,
@@ -28,6 +29,8 @@ pub const QWEN3_5_FACTS: CudaModelFacts = CudaModelFacts {
     gdn: None,
     embed: None,
     shared_expert: SharedExpertOwner::Undeclared,
+    classes: None,
+    gemm_col_tile: GemmColTile::Tile256Only,
 };
 
 /// [`QWEN3_5_FACTS`] with qwen3.5-0.8b's linear attention: 16 key heads of 128, a 4-tap conv,
@@ -39,6 +42,13 @@ pub const QWEN3_5_GDN_FACTS: CudaModelFacts = CudaModelFacts {
         conv_kernel: 4,
         eps: 1e-6,
     }),
+    ..QWEN3_5_FACTS
+};
+
+/// [`QWEN3_5_FACTS`] under Gemma 4's GEMM column tiles (`op_abi::CUDA_GEMM_COL64_ARCHS`): its
+/// GEMMs also take the 64-column tile. The fixtures that exercise that rule lower with them.
+pub const GEMMA4_FACTS: CudaModelFacts = CudaModelFacts {
+    gemm_col_tile: GemmColTile::Col64,
     ..QWEN3_5_FACTS
 };
 
@@ -84,6 +94,7 @@ pub fn assert_tape_is(name: &str, tape: &CudaTape, lowered: &CudaCanonical) {
         kv,
         gdn,
         moe,
+        rotary_local,
     } = *tape;
     let CudaCanonical {
         bucket_m: lowered_m,
@@ -98,6 +109,7 @@ pub fn assert_tape_is(name: &str, tape: &CudaTape, lowered: &CudaCanonical) {
         kv: lowered_kv,
         gdn: lowered_gdn,
         moe: lowered_moe,
+        rotary_local: lowered_rotary_local,
     } = lowered;
     assert_eq!(bucket_m, *lowered_m, "{name}: bucket_m");
     assert_eq!(colour_bytes, lowered_bytes, "{name}: colour bytes");
@@ -108,6 +120,7 @@ pub fn assert_tape_is(name: &str, tape: &CudaTape, lowered: &CudaCanonical) {
     assert_eq!(weight_bytes, lowered_weights, "{name}: weight_bytes");
     assert_eq!(steps, lowered_steps, "{name}: steps");
     assert_eq!(rotary, *lowered_rotary, "{name}: rotary");
+    assert_eq!(rotary_local, *lowered_rotary_local, "{name}: rotary_local");
     let kv = kv.map(
         |KvTape {
              layers,
@@ -118,6 +131,8 @@ pub fn assert_tape_is(name: &str, tape: &CudaTape, lowered: &CudaCanonical) {
              block_table,
              slot_mapping,
              sequence,
+             classes,
+             layer_class,
          }| CanonicalKv {
             layers: layers.to_vec(),
             kv_heads,
@@ -127,6 +142,8 @@ pub fn assert_tape_is(name: &str, tape: &CudaTape, lowered: &CudaCanonical) {
             block_table,
             slot_mapping,
             sequence,
+            classes: classes.to_vec(),
+            layer_class: layer_class.to_vec(),
         },
     );
     assert_eq!(kv.as_ref(), lowered_kv.as_ref(), "{name}: kv");
@@ -242,6 +259,7 @@ pub static TWO_GEMM_M128: CudaTape = CudaTape {
     kv: None,
     gdn: None,
     moe: None,
+    rotary_local: None,
 };
 
 /// [`two_gemm`]`(256)`: colours x, y1, y2.
@@ -263,6 +281,7 @@ pub static TWO_GEMM_M256: CudaTape = CudaTape {
     kv: None,
     gdn: None,
     moe: None,
+    rotary_local: None,
 };
 
 /// [`three_gemm`]: `y1` is dead after step 1, so `y3` takes its colour, and the arena is the
@@ -286,4 +305,5 @@ pub static THREE_GEMM_M256: CudaTape = CudaTape {
     kv: None,
     gdn: None,
     moe: None,
+    rotary_local: None,
 };

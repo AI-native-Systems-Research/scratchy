@@ -13,6 +13,7 @@ use std::path::Path;
 
 use half::bf16;
 use safetensors::tensor::{Dtype, TensorView};
+use scratchy_target_cuda::step::expert_bank;
 use scratchy_target_cuda::step::{gdn_bundle, moe_bundle};
 use scratchy_target_cuda::tape::{ArenaLayout, ArenaOffset, ArenaSpan, CudaTape, TapeInput};
 use scratchy_target_cuda::weights::{
@@ -151,6 +152,7 @@ fn tape(weight_bytes: &'static [u64]) -> CudaTape {
         kv: None,
         gdn: None,
         moe: None,
+        rotary_local: None,
     }
 }
 
@@ -583,4 +585,159 @@ fn a_tied_head_stages_its_tensor_once() {
     assert_eq!(staged, [256, 16, bundle_bytes() as usize]);
     let e = stage(4, &EMBED, &mut w).expect_err("the table's tensor was handed out twice");
     assert!(matches!(e, LoadError::Missing { ix: 4, .. }), "{e}");
+}
+
+// ── Gemma 4's router tensors and expert bank (#885) ────────────────
+
+/// The synthetic Gemma layer's five HF-layout bf16 tensors under `{root}.layers.0`, as (name
+/// after the root, shape, bytes): the router's projection, scale and per-expert scale, and the
+/// experts' fused gate and up and their down.
+fn gemma_tensors() -> Vec<(&'static str, Vec<usize>, Vec<u8>)> {
+    let (e, h, i) = (MOE_E as usize, MOE_H as usize, MOE_I as usize);
+    let bf16s = |n: usize, seed: u16| -> Vec<u8> {
+        (0..n)
+            .flat_map(|k| (seed.wrapping_add(k as u16) & 0x3FFF | 0x0400).to_le_bytes())
+            .collect()
+    };
+    vec![
+        (
+            "layers.0.router.proj.weight",
+            vec![e, h],
+            bf16s(e * h, 0x1100),
+        ),
+        ("layers.0.router.scale", vec![h], bf16s(h, 0x1200)),
+        (
+            "layers.0.router.per_expert_scale",
+            vec![e],
+            bf16s(e, 0x1300),
+        ),
+        (
+            "layers.0.experts.gate_up_proj",
+            vec![e, 2 * i, h],
+            bf16s(e * 2 * i * h, 0x2100),
+        ),
+        (
+            "layers.0.experts.down_proj",
+            vec![e, h, i],
+            bf16s(e * h * i, 0x0310),
+        ),
+    ]
+}
+
+/// The Gemma layer's checkpoint in a fresh `dir`, every tensor under `root`.
+fn gemma_checkpoint_dir(name: &str, root: &str) -> std::path::PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("weight_table_{name}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("make the checkpoint dir");
+    let all = gemma_tensors();
+    let views: Vec<(String, TensorView<'_>)> = (all.iter())
+        .map(|(name, shape, bytes)| {
+            let view = TensorView::new(Dtype::BF16, shape.clone(), bytes).expect("a tensor view");
+            (format!("{root}.{name}"), view)
+        })
+        .collect();
+    let bytes = safetensors::serialize(views, None).expect("serialize the checkpoint");
+    std::fs::write(dir.join("model.safetensors"), bytes).expect("write the checkpoint");
+    dir
+}
+
+/// The Gemma layer's table: the three router tensors as bf16 entries, and the expert bank.
+const GEMMA_TABLE: [CudaWeight; 4] = [
+    CudaWeight::Bf16 {
+        tensor: "language_model.model.layers.0.router.proj.weight",
+        shape: &[MOE_E as u64, MOE_H as u64],
+    },
+    CudaWeight::Bf16 {
+        tensor: "language_model.model.layers.0.router.scale",
+        shape: &[MOE_H as u64],
+    },
+    CudaWeight::Bf16 {
+        tensor: "language_model.model.layers.0.router.per_expert_scale",
+        shape: &[MOE_E as u64],
+    },
+    CudaWeight::ExpertBank {
+        gate_up: "language_model.model.layers.0.experts.gate_up_proj",
+        down: "language_model.model.layers.0.experts.down_proj",
+        experts: MOE_E,
+        hidden: MOE_H,
+        inter: MOE_I,
+    },
+];
+
+/// The Gemma layer (E = 4, H = 64, I = 32) packs to its three bf16 router tensors and one expert
+/// bank, byte for byte in both orderings: the bank is the fused gate and up then the down, back to
+/// back at `expert_bank`'s offsets, the bundle's experts with no router.
+#[test]
+fn a_gemma_expert_bank_is_packed_exactly() {
+    let bank = expert_bank(MOE_E, MOE_H, MOE_I).expect("the bank fits");
+    let (e, h, i) = (u64::from(MOE_E), u64::from(MOE_H), u64::from(MOE_I));
+    assert_eq!(
+        (bank.router, bank.gate_up, bank.down, bank.bytes),
+        (0, 0, e * 2 * i * h * 2, e * h * 2 * 3 * i),
+        "the synthetic bank's regions"
+    );
+    let bundle = moe_bundle(MOE_E, MOE_H, MOE_I).expect("the bundle fits");
+    assert_eq!(
+        bank.bytes,
+        bundle.bytes - bundle.gate_up,
+        "the bundle without its router"
+    );
+    assert_eq!(GEMMA_TABLE[3].packed_bytes(), Some(bank.bytes));
+    assert_eq!(
+        GEMMA_TABLE[3].lead(),
+        "language_model.model.layers.0.experts.gate_up_proj"
+    );
+    let all = gemma_tensors();
+    let want_bank: Vec<u8> = (all[3..].iter()).flat_map(|(.., b)| b.clone()).collect();
+    assert_eq!(want_bank.len() as u64, bank.bytes, "the bank's bytes");
+    for root in ORDERINGS {
+        let dir = gemma_checkpoint_dir(&format!("gemma_bank_{root}"), root);
+        for (ix, entry) in GEMMA_TABLE.iter().enumerate() {
+            let mut w = open_checkpoint(&dir).expect("open");
+            let staged = stage(ix, entry, &mut w).unwrap_or_else(|e| panic!("{root}: {e}"));
+            let want = match ix {
+                3 => want_bank.clone(),
+                _ => all[ix].2.clone(),
+            };
+            assert!(staged == want, "{root}: weight {ix}'s bytes");
+            assert_eq!(
+                Some(staged.len() as u64),
+                entry.packed_bytes(),
+                "{root}: {ix}"
+            );
+        }
+        let table = GEMMA_TABLE.map(Some);
+        let bytes: Vec<u64> = (GEMMA_TABLE.iter())
+            .map(|w| w.packed_bytes().expect("fits"))
+            .collect();
+        let bytes: &'static [u64] = Box::leak(bytes.into_boxed_slice());
+        let w = open_checkpoint(&dir).expect("open");
+        check(&table, &[tape(bytes)], &w).unwrap_or_else(|e| panic!("{root}: {e}"));
+    }
+}
+
+/// An expert bank whose fused tensor has another shape is refused naming it.
+#[test]
+fn a_gemma_expert_bank_of_another_shape_is_refused() {
+    let dir = gemma_checkpoint_dir("gemma_bank_shape", ROOT);
+    let wide = CudaWeight::ExpertBank {
+        gate_up: "language_model.model.layers.0.experts.gate_up_proj",
+        down: "language_model.model.layers.0.experts.down_proj",
+        experts: MOE_E,
+        hidden: MOE_H,
+        inter: 2 * MOE_I,
+    };
+    let mut w = open_checkpoint(&dir).expect("open");
+    let e = stage(0, &wide, &mut w).expect_err("a bank of another width");
+    assert!(
+        matches!(
+            e,
+            LoadError::Shape {
+                ix: 0,
+                tensor: "language_model.model.layers.0.experts.gate_up_proj",
+                ..
+            }
+        ),
+        "{e}"
+    );
 }

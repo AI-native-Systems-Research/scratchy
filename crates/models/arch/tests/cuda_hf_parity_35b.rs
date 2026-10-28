@@ -40,6 +40,10 @@ use scratchy_models::qwen3_5_moe::qwen3_6_35b_a3b::{CUDA_TAPES, CUDA_WEIGHTS};
 include!("common/cuda_hf_parity_body.rs");
 
 const HIDDEN: usize = 2048;
+const VOCAB: usize = 248_320;
+/// Two GDN slots, one per seat; the worker's allocations are the arena, the KV pool and the GDN pool.
+const GDN_POOL: Option<GdnPoolConfig> = Some(GdnPoolConfig { num_slots: 2 });
+const WORKER_ALLOCATIONS: u64 = 3;
 /// The weight buffers `load_weights` uploads: 523 (30 GDN bundles, 40 MoE bundles, the untied
 /// lm_head's among them).
 const WEIGHTS: u64 = 523;
@@ -52,3 +56,5 @@ const GOLDENS: &str = "tests/goldens/qwen3-5-moe-qwen3.6-35b-a3b-hf";
 /// P1's rule (#859, the user's 2026-10-26 decision): min cosine(CUDA, f32) at most 0.005 below
 /// HF-bf16's own min cosine on the same prompt.
 const P1: P1Rule = P1Rule::BelowHfBf16(0.005);
+/// P3 accepts no top-1 disagreement outside a near-tie (#816).
+const P3: P3Rule = P3Rule::Strict;

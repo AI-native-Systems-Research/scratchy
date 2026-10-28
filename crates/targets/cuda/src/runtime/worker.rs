@@ -36,16 +36,18 @@ use scratchy_subtile::gdn_state_layout::GdnStateLayout;
 use scratchy_subtile::paged_kv_layout::PagedKvLayout;
 
 use crate::kernels::{self, KernelError};
-use crate::rotary::fill_rotary_rows;
+use crate::rotary::fill_rotary_rows_with_freq_dim;
 use crate::step::{
-    AddBf16, AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16,
-    ExpertGemvBf16, ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16,
-    GatedDeltaNetBf16, GemmBf16, MatmulKernel, MoeRouteBf16, PairRows, RmsNormBf16, RopeAppendBf16,
-    RopeBf16, RouterLogitsBf16, SiluMulBf16, moe_bundle,
+    ATTN_D512_BF16_HEAD_DIM, ATTN_DECODE_BF16_HEAD_DIM, ATTN_PREFILL_BF16_HEAD_DIM, AddBf16,
+    AttnPrefillBf16, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16,
+    ExpertProjection, ExpertSortBf16, GateApplyBf16, GateScaleBf16, GateSplitBf16,
+    GatedDeltaNetBf16, GemmBf16, LayerScaleBf16, MOE_ROUTE_EXPERTS, MatmulKernel, MoeRouteBf16,
+    MoeWeight, PairRows, RmsNormBf16, RmsNormUnitBf16, RopeAppendBf16, RopeBf16, RouteProgram,
+    RouterLogitsBf16, ScaleBf16, SiluMulBf16, SoftCapBf16,
 };
 use crate::tape::{
-    ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape, TapeError,
-    TapeInput, WeightIx,
+    ArenaOffset, ArenaSpan, CUDA_ACT_BYTES, CUDA_ARENA_ALIGN, CudaTape, GdnTape, KvTape,
+    RotaryTable, TapeError, TapeInput, WeightIx,
 };
 
 /// A forward's input, of the kind its tape takes ([`TapeInput`]).
@@ -305,6 +307,10 @@ pub enum ForwardError {
     SpanOutsideArena { span: ArenaSpan, arena_bytes: u64 },
     /// The `step`-th launch failed; nothing after it was enqueued, and the stream was drained.
     Launch { step: usize, error: KernelError },
+    /// The `step`-th step is `op`, a step no kernel launches: a Qwen routing at another count than
+    /// [`MOE_ROUTE_EXPERTS`], the Qwen program's one instance (#921). Checked over the whole tape
+    /// before anything is uploaded or enqueued.
+    NotLaunched { step: usize, op: &'static str },
     /// A copy or the stream wait failed; the stream was drained.
     Cuda(CudaError),
 }
@@ -434,6 +440,9 @@ impl fmt::Display for ForwardError {
                 span.bytes, span.offset.0
             ),
             Self::Launch { step, error } => write!(f, "step {step} did not launch: {error}"),
+            Self::NotLaunched { step, op } => {
+                write!(f, "step {step} is {op}, which no kernel launches")
+            }
             Self::Cuda(e) => write!(f, "the forward failed: {e}"),
         }
     }
@@ -477,8 +486,13 @@ impl Drop for Stream {
 /// of the forward's KV regions.
 struct KvPool {
     buffer: DeviceBuffer,
-    /// One layer's K (or V) buffer's layout; every layer's is the same.
+    /// Class 0's K (or V) buffer's layout: the tapes' `kv_heads` and `head_dim`, and the pool's
+    /// block size and count, which every class shares.
     layout: PagedKvLayout,
+    /// Per KV layer, in [`KvTape::layers`] order: its class's layout and the element offset of
+    /// its K buffer in `buffer`, its V buffer right after. Computed once by [`KvTape::pool_layout`]
+    /// from the tapes' compile-time `classes` and `layer_class`.
+    per_layer: Vec<(PagedKvLayout, usize)>,
     /// The KV layers, as the tapes' [`KvTape::layers`].
     layers: usize,
     /// The host side of the block table, sized once: `max_blocks_per_seq` entries.
@@ -488,13 +502,19 @@ struct KvPool {
 }
 
 impl KvPool {
-    /// Element offset of layer index `layer`'s `half` buffer in the pool.
+    /// Element offset of layer index `layer`'s `half` buffer in the pool. For a tape of one class
+    /// (every Qwen tape) this is `(2 · layer + half) · buffer_elems`, as before the classes.
     fn half_elems(&self, layer: usize, half: KvHalf) -> usize {
-        let second = match half {
-            KvHalf::K => 0,
-            KvHalf::V => 1,
-        };
-        (2 * layer + second) * self.layout.buffer_elems()
+        let (layout, at) = self.per_layer[layer];
+        match half {
+            KvHalf::K => at,
+            KvHalf::V => at + layout.buffer_elems(),
+        }
+    }
+
+    /// Layer index `layer`'s layout: its class's `kv_heads` and `head_dim`.
+    fn layer_layout(&self, layer: usize) -> PagedKvLayout {
+        self.per_layer[layer].0
     }
 
     /// The device address of layer index `layer`'s `half` buffer. Computed, not dereferenced.
@@ -558,21 +578,21 @@ fn gdn_pool_layout(layout: &GdnStateLayout, layers: usize) -> Option<(Vec<(u64, 
     Some((offsets, per_layer.checked_mul(layers as u64)?))
 }
 
-/// The KV pool's bytes: `layers` layers of a K and a V buffer of `num_blocks` blocks of `kv_heads ·
-/// block_size · head_dim` bf16 each, or `None` when the count overflows `u64`. Every factor is
-/// widened and multiplied checked, so no step wraps.
-fn kv_pool_bytes(layers: usize, layout: &PagedKvLayout) -> Option<u64> {
-    [
-        layout.num_blocks,
-        layout.num_kv_heads,
-        layout.block_size,
-        layout.head_dim,
-    ]
-    .into_iter()
-    .try_fold(u64::try_from(layers).ok()?.checked_mul(2)?, |acc, f| {
-        acc.checked_mul(u64::from(f))
-    })?
-    .checked_mul(std::mem::size_of::<u16>() as u64)
+/// The name of `s` when no kernel launches it: the Qwen routing at another count than
+/// [`MOE_ROUTE_EXPERTS`]. The routing kernel's Qwen program is instantiated at 256 only (its
+/// launcher refuses any other count), so such a tape is refused before anything is enqueued,
+/// rather than at its routing step. `None` for every other step.
+fn not_launched(s: &CudaStep) -> Option<&'static str> {
+    if let CudaStep::MoeRoute(MoeRouteBf16 {
+        program: RouteProgram::QwenSoftmax,
+        experts,
+        ..
+    }) = *s
+        && experts != MOE_ROUTE_EXPERTS
+    {
+        return Some("MoeRoute");
+    }
+    None
 }
 
 /// The one GDN geometry of `tapes`: the first GDN tape's, which every other GDN tape must share.
@@ -621,14 +641,39 @@ pub struct CudaWorker<'a, W: AsRef<[DeviceBuffer]> = &'a [DeviceBuffer]> {
     borrow: PhantomData<&'a [DeviceBuffer]>,
     stream: Stream,
     arena: DeviceBuffer,
-    /// The host side of the rotary table, sized once for the largest tape's: each forward with a
-    /// table fills its rows from the positions and uploads them, so a forward allocates nothing.
+    /// The host side of the rotary tables, sized once for the largest tape's two: each forward
+    /// fills each of its tables' rows from the positions (the global table first, then the local
+    /// one after it) and uploads them, so a forward allocates nothing.
     rotary_host: Vec<u16>,
     /// The KV pool, when a tape has a KV cache.
     kv: Option<KvPool>,
     /// The GDN state pool, when a tape has GDN layers.
     gdn: Option<GdnPool>,
 }
+
+/// A prefill attention launcher: [`kernels::attn_prefill_windowed_bf16`]'s signature, which the
+/// head-dim-512 one shares.
+type PrefillLaunch = unsafe fn(
+    (*const c_void, *mut c_void),
+    (*const c_void, *const c_void),
+    (*const c_void, *const c_void),
+    (u32, u32, u32, u32),
+    (u32, u32),
+    (f32, u32),
+    *mut c_void,
+) -> Result<(), KernelError>;
+
+/// A decode attention launcher: [`kernels::attn_decode_windowed_bf16`]'s signature, which the
+/// head-dim-512 one shares.
+type DecodeLaunch = unsafe fn(
+    (*const c_void, *mut c_void),
+    (*const c_void, *const c_void),
+    (*const c_void, *const c_void),
+    (u32, u32, u32),
+    (u32, u32),
+    (f32, u32),
+    *mut c_void,
+) -> Result<(), KernelError>;
 
 /// The one KV geometry of `tapes`: the first KV tape's, which every other KV tape must share.
 fn kv_geometry(tapes: &[CudaTape]) -> Result<Option<KvTape>, WorkerError> {
@@ -638,19 +683,7 @@ fn kv_geometry(tapes: &[CudaTape]) -> Result<Option<KvTape>, WorkerError> {
         match first {
             None => first = Some(kv),
             Some(f) => {
-                if (
-                    f.layers,
-                    f.kv_heads,
-                    f.head_dim,
-                    f.block_size,
-                    f.max_blocks_per_seq,
-                ) != (
-                    kv.layers,
-                    kv.kv_heads,
-                    kv.head_dim,
-                    kv.block_size,
-                    kv.max_blocks_per_seq,
-                ) {
+                if !f.same_pool(&kv) {
                     return Err(WorkerError::KvGeometry { bucket });
                 }
             }
@@ -746,9 +779,10 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     block_size: kv.block_size,
                     head_dim: kv.head_dim,
                 };
-                let bytes = kv_pool_bytes(kv.layers.len(), &layout)
+                let (per_layer, bytes) = kv
+                    .pool_layout(num_blocks)
                     .ok_or(WorkerError::KvPoolTooLarge { num_blocks })?;
-                Some((kv, layout, bytes))
+                Some((kv, layout, per_layer, bytes))
             }
             (Some(_), _) => return Err(WorkerError::KvPoolMissing),
             (None, Some(_)) => return Err(WorkerError::KvPoolUnused),
@@ -774,16 +808,20 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         };
         let arena_bytes =
             (tapes.iter().map(|t| t.arena.total_bytes).max()).ok_or(WorkerError::NoTapes)?;
-        // Each table's span lies inside its arena (`validate`), so its byte count fits a usize.
+        // Each table's span lies inside its arena (`validate`), so its byte count fits a usize; a
+        // tape's two tables are filled side by side.
         let rotary_elements = (tapes.iter())
-            .filter_map(|t| t.rotary)
-            .map(|r| r.span.bytes as usize / std::mem::size_of::<u16>())
+            .map(|t| {
+                (t.rotary.iter().chain(&t.rotary_local))
+                    .map(|r| r.span.bytes as usize / std::mem::size_of::<u16>())
+                    .sum::<usize>()
+            })
             .max()
             .unwrap_or(0);
         let stream = Stream::new().map_err(WorkerError::Cuda)?;
         let arena = DeviceBuffer::alloc(device, arena_bytes).map_err(WorkerError::Cuda)?;
         let kv = match pool {
-            Some((kv, layout, bytes)) => {
+            Some((kv, layout, per_layer, bytes)) => {
                 let buffer = DeviceBuffer::alloc(device, bytes).map_err(WorkerError::Cuda)?;
                 let slots = (tapes.iter())
                     .filter(|t| t.kv.is_some())
@@ -791,6 +829,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 Some(KvPool {
                     buffer,
                     layout,
+                    per_layer,
                     layers: kv.layers.len(),
                     block_table_host: vec![NO_SLOT; kv.max_blocks_per_seq as usize],
                     slot_mapping_host: vec![NO_SLOT; slots.max().unwrap_or(0) as usize],
@@ -940,6 +979,11 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             bucket,
             buckets: self.tapes.len(),
         })?;
+        if let Some((step, op)) = (tape.steps.iter().enumerate())
+            .find_map(|(step, s)| not_launched(s).map(|op| (step, op)))
+        {
+            return Err(ForwardError::NotLaunched { step, op });
+        }
         let ids = match (tape.input, input) {
             (TapeInput::Hidden(_), Input::Hidden(_)) => None,
             (TapeInput::TokenIds { vocab, .. }, Input::TokenIds(ids)) => Some((ids, vocab)),
@@ -1021,14 +1065,17 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             (None, Some(_)) => return Err(ForwardError::GdnUnexpected),
             (None, None) => None,
         };
-        let table = match tape.rotary {
-            Some(r) => {
-                let rows = &mut self.rotary_host[..positions.len() * r.rot_dim as usize];
-                fill_rotary_rows(positions, r.rot_dim, r.theta(), rows);
-                Some((r.span, &*rows))
-            }
-            None => None,
-        };
+        // The global table's rows, then the local table's after them; each table is a plain rope
+        // at its own `rot_dim` and theta (the local table's `rot_dim` is its head dim, a full
+        // rope). `validate` refuses a local table without a global one.
+        let (global_host, local_host) = self.rotary_host.split_at_mut(
+            tape.rotary
+                .map_or(0, |r| positions.len() * r.rot_dim as usize),
+        );
+        let tables = [
+            fill_table(tape.rotary, positions, global_host),
+            fill_table(tape.rotary_local, positions, local_host),
+        ];
         let kv_upload = match (&sequence, &self.kv) {
             (Some((kv_tape, data)), Some(pool)) => Some(KvUpload {
                 tape: *kv_tape,
@@ -1050,7 +1097,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             tape,
             Uploads {
                 input,
-                table,
+                tables,
                 kv: kv_upload,
                 gdn: gdn_upload,
             },
@@ -1118,11 +1165,15 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         let Some(pool) = &self.kv else {
             return Err(refuse(0));
         };
-        let block_elems = pool.layout.kv_blk_stride();
-        if layer >= pool.layers || block >= pool.layout.num_blocks || out.len() != block_elems {
+        if layer >= pool.layers {
+            return Err(refuse(pool.layout.kv_blk_stride()));
+        }
+        let layout = pool.layer_layout(layer);
+        let block_elems = layout.kv_blk_stride();
+        if block >= layout.num_blocks || out.len() != block_elems {
             return Err(refuse(block_elems));
         }
-        let at = pool.half_elems(layer, half) + pool.layout.elem_offset(block, 0, 0);
+        let at = pool.half_elems(layer, half) + layout.elem_offset(block, 0, 0);
         let src = pool
             .buffer
             .ptr()
@@ -1161,7 +1212,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
     ) -> Result<(), ForwardError> {
         let Uploads {
             input,
-            table,
+            tables,
             kv: kv_upload,
             gdn: gdn_upload,
         } = uploads;
@@ -1182,7 +1233,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
             "cudaMemcpyAsync(host to device)",
         )
         .map_err(ForwardError::Cuda)?;
-        if let Some((span, rows)) = table {
+        for (span, rows) in tables.into_iter().flatten() {
             debug_assert_eq!(std::mem::size_of_val(rows) as u64, span.bytes);
             // SAFETY: the rotary span lies inside the tape's arena (`new` validated it), which is
             // at most `arena_bytes`; `rows` is `bucket_m · rot_dim` elements (`forward` checked
@@ -1272,6 +1323,99 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         // `forward` checked is inside the pool.
         for (step, s) in tape.steps.iter().enumerate() {
             let launched = match *s {
+                CudaStep::GemmCol64(GemmBf16 { a, b, c, m, n, k }) => {
+                    let b = weights[b.0 as usize].ptr();
+                    // SAFETY: as above, for `a` (`m*k`), `b` (`n*k`) and `c` (`m*n`).
+                    unsafe {
+                        kernels::gemm_col64_bf16_abt(slot(a), b, slot(c), (m, n, k), stream.0)
+                    }
+                }
+                CudaStep::Scale(ScaleBf16 {
+                    x,
+                    out,
+                    rows,
+                    cols,
+                    scale_bits,
+                }) => {
+                    // SAFETY: as above, for `x` and `out` (`rows*cols` each).
+                    unsafe {
+                        kernels::scale_bf16(
+                            slot(x),
+                            slot(out),
+                            (rows, cols),
+                            f32::from_bits(scale_bits),
+                            stream.0,
+                        )
+                    }
+                }
+                CudaStep::LayerScale(LayerScaleBf16 {
+                    x,
+                    scale,
+                    out,
+                    rows,
+                    cols,
+                }) => {
+                    let w = weights[scale.0 as usize].ptr();
+                    // SAFETY: as above, for `x` and `out` (`rows*cols` each) and `scale` (one
+                    // bf16).
+                    unsafe {
+                        kernels::layer_scale_bf16(slot(x), w, slot(out), (rows, cols), stream.0)
+                    }
+                }
+                CudaStep::SoftCap(SoftCapBf16 {
+                    x,
+                    out,
+                    rows,
+                    cols,
+                    cap_bits,
+                }) => {
+                    // SAFETY: as above, for `x` and `out` (`rows*cols` each).
+                    unsafe {
+                        kernels::soft_cap_bf16(
+                            slot(x),
+                            slot(out),
+                            (rows, cols),
+                            f32::from_bits(cap_bits),
+                            stream.0,
+                        )
+                    }
+                }
+                CudaStep::RmsNormUnit(RmsNormUnitBf16 {
+                    x,
+                    y,
+                    rows,
+                    cols,
+                    eps_bits,
+                }) => {
+                    // SAFETY: as above, for `x` and `y` (`rows*cols` each).
+                    unsafe {
+                        kernels::rms_norm_unit_bf16(
+                            slot(x),
+                            slot(y),
+                            (rows, cols),
+                            f32::from_bits(eps_bits),
+                            stream.0,
+                        )
+                    }
+                }
+                CudaStep::GeluMul(SiluMulBf16 {
+                    gate,
+                    up,
+                    out,
+                    rows,
+                    cols,
+                }) => {
+                    // SAFETY: as above, for `gate`, `up` and `out` (`rows*cols` each).
+                    unsafe {
+                        kernels::gelu_mul_bf16(
+                            slot(gate),
+                            slot(up),
+                            slot(out),
+                            (rows, cols),
+                            stream.0,
+                        )
+                    }
+                }
                 CudaStep::Embed(EmbedBf16 {
                     tokens,
                     table,
@@ -1322,10 +1466,11 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     kernel,
                     ..
                 }) => {
-                    // The router is the bundle's first tensor, at byte 0 (`moe_bundle`).
+                    // The router is the bundle's first tensor, at byte 0 (`moe_bundle`), or Gemma's
+                    // own projection, whole (`MoeWeight::router_bytes`).
                     let b = weights[bundle.0 as usize].ptr();
                     // SAFETY: as above, for `x` (`m*hidden`), the router (`experts*hidden`, the
-                    // bundle's first bytes) and `logits` (`m*experts`).
+                    // weight's first bytes) and `logits` (`m*experts`).
                     unsafe {
                         match kernel {
                             MatmulKernel::Tiled => kernels::gemm_bf16_abt(
@@ -1344,6 +1489,14 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                                 (experts, hidden),
                                 stream.0,
                             ),
+                            // Gemma's 128-expert router at m ≥ 2, its own projection.
+                            MatmulKernel::Col64 => kernels::gemm_col64_bf16_abt(
+                                slot(x),
+                                b,
+                                slot(logits),
+                                (m, experts, hidden),
+                                stream.0,
+                            ),
                         }
                     }
                 }
@@ -1355,10 +1508,12 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     experts,
                     top_k,
                     renorm,
-                }) => {
+                    program,
+                    expert_scale,
+                }) => match (program, expert_scale) {
                     // SAFETY: as above, for `logits` (`m*experts`), `topk_idx` and `scores`
                     // (`m*top_k` each).
-                    unsafe {
+                    (RouteProgram::QwenSoftmax, _) => unsafe {
                         kernels::moe_route_bf16(
                             slot(logits),
                             (slot(topk_idx), slot(scores)),
@@ -1366,8 +1521,23 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                             renorm,
                             stream.0,
                         )
+                    },
+                    (RouteProgram::GemmaScaledSoftmax { scale_bits }, pes) => {
+                        // A Gemma routing with no per-expert scale is the launcher's refusal (a
+                        // null pointer), before it touches any pointer.
+                        let pes = pes.map_or(std::ptr::null(), |w| weights[w.0 as usize].ptr());
+                        // SAFETY: as above, and `expert_scale` (`experts`).
+                        unsafe {
+                            kernels::gemma_route_bf16(
+                                (slot(logits), pes),
+                                (slot(topk_idx), slot(scores)),
+                                (m, experts, top_k),
+                                f32::from_bits(scale_bits),
+                                stream.0,
+                            )
+                        }
                     }
-                }
+                },
                 CudaStep::ExpertSort(sort) => Self::expert_sort(&sort, slot, stream),
                 CudaStep::ExpertGemm(g) => Self::expert_gemm(&g, slot, weights, stream),
                 CudaStep::ExpertGemv(g) => Self::expert_gemv(&g, slot, weights, stream),
@@ -1416,6 +1586,17 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     Self::gated_delta_net(&g, pool, slot, weights, stream)
                 }
                 CudaStep::RmsNorm(
+                    norm @ RmsNormBf16 {
+                        x,
+                        gain,
+                        y,
+                        rows,
+                        cols,
+                        convention,
+                        ..
+                    },
+                )
+                | CudaStep::RouterNorm(
                     norm @ RmsNormBf16 {
                         x,
                         gain,
@@ -1478,16 +1659,17 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     cols,
                     head_dim,
                     rot_dim,
+                    pairing,
                 }) => {
                     // SAFETY: as above, for `x` and `out` (`rows*cols`) and `table`
                     // (`rows*rot_dim`), whose rows this forward uploaded above.
                     unsafe {
-                        kernels::rope_bf16(
+                        kernels::rope_paired_bf16(
                             slot(x),
                             slot(table),
                             slot(out),
                             (rows, cols),
-                            (head_dim, rot_dim),
+                            (head_dim, rot_dim, pairing),
                             stream.0,
                         )
                     }
@@ -1543,21 +1725,24 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                     cols,
                     head_dim,
                     rot_dim,
+                    pairing,
                 }) => {
                     let pool = kv.expect("`new` made a pool for a KV tape");
                     let l = layer as usize;
-                    let layout = pool.layout;
+                    // Layer `l`'s class layout: its `kv_heads` and `head_dim` (`validate`
+                    // checked the step's are its class's).
+                    let layout = pool.layer_layout(l);
                     // SAFETY: as above, for `k`, `v` and `k_out` (`rows*cols`), `table`
                     // (`rows*rot_dim`) and `slot_mapping` (`rows` u32), uploaded above; the cache
-                    // halves are layer `l`'s, `num_blocks · kv_heads · 64 · head_dim` each, and
-                    // every slot uploaded is in a checked block or `u32::MAX`.
+                    // halves are layer `l`'s, `num_blocks · kv_heads · 64 · head_dim` of its
+                    // class each, and every slot uploaded is in a checked block or `u32::MAX`.
                     unsafe {
-                        kernels::rope_bf16(
+                        kernels::rope_paired_bf16(
                             slot(k),
                             slot(table),
                             slot(k_out),
                             (rows, cols),
-                            (head_dim, rot_dim),
+                            (head_dim, rot_dim, pairing),
                             stream.0,
                         )
                         .and_then(|()| {
@@ -1583,24 +1768,44 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         q_heads,
                         kv_heads,
                         head_dim,
+                        window,
                         ..
                     },
                 ) => {
                     let pool = kv.expect("`new` made a pool for a KV tape");
                     let l = layer as usize;
-                    let layout = pool.layout;
+                    let layout = pool.layer_layout(l);
+                    // The column-split kernel at head dim 512, the head-dim-256 one otherwise
+                    // (whose launcher refuses any other head dim).
+                    let launch: PrefillLaunch = match head_dim {
+                        ATTN_PREFILL_BF16_HEAD_DIM => kernels::attn_prefill_windowed_bf16,
+                        ATTN_D512_BF16_HEAD_DIM => kernels::attn_prefill_d512_bf16,
+                        // No prefill attention kernel at another head dim: refused, nothing
+                        // launched (`validate` already refuses it: `ATTN_BF16_HEAD_DIMS`).
+                        other => {
+                            let error = KernelError::AttnShape {
+                                rows,
+                                q_heads,
+                                kv_heads,
+                                head_dim: other,
+                                block_size: layout.block_size,
+                                num_blocks: layout.num_blocks,
+                            };
+                            return Err(ForwardError::Launch { step, error });
+                        }
+                    };
                     // SAFETY: as above, for `q` and `out` (`rows*q_heads*head_dim`), and the
                     // block table and sequence uploaded above, which `forward` checked: every
                     // block the keys `0 .. P + L` need is a table entry inside the pool, and
-                    // `1 ≤ L ≤ rows`. The cache halves are layer `l`'s.
+                    // `1 ≤ L ≤ rows`. The cache halves are layer `l`'s, of its class's layout.
                     unsafe {
-                        kernels::attn_prefill_bf16(
+                        launch(
                             (slot(q), slot(out)),
                             (pool.half_ptr(l, KvHalf::K), pool.half_ptr(l, KvHalf::V)),
                             (slot(block_table), slot(sequence)),
                             (rows, q_heads, kv_heads, head_dim),
                             (layout.block_size, layout.num_blocks),
-                            attn.scale(),
+                            (attn.scale(), window.unwrap_or(0)),
                             stream.0,
                         )
                     }
@@ -1615,24 +1820,42 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                         q_heads,
                         kv_heads,
                         head_dim,
+                        window,
                         ..
                     },
                 ) => {
                     let pool = kv.expect("`new` made a pool for a KV tape");
                     let l = layer as usize;
-                    let layout = pool.layout;
+                    let layout = pool.layer_layout(l);
+                    let launch: DecodeLaunch = match head_dim {
+                        ATTN_DECODE_BF16_HEAD_DIM => kernels::attn_decode_windowed_bf16,
+                        ATTN_D512_BF16_HEAD_DIM => kernels::attn_decode_d512_bf16,
+                        // No decode attention kernel at another head dim: refused, nothing
+                        // launched (`validate` already refuses it: `ATTN_BF16_HEAD_DIMS`).
+                        other => {
+                            let error = KernelError::AttnDecodeShape {
+                                q_heads,
+                                kv_heads,
+                                head_dim: other,
+                                block_size: layout.block_size,
+                                num_blocks: layout.num_blocks,
+                            };
+                            return Err(ForwardError::Launch { step, error });
+                        }
+                    };
                     // SAFETY: as the prefill attention's, for `q` and `out` (`q_heads*head_dim`,
                     // its rows are 1: `validate`), and the block table and sequence uploaded
                     // above, which `forward` checked: every block the keys `0 .. P + L` need is a
-                    // table entry inside the pool, and `L ≥ 1`. The cache halves are layer `l`'s.
+                    // table entry inside the pool, and `L ≥ 1`. The cache halves are layer `l`'s,
+                    // of its class's layout.
                     unsafe {
-                        kernels::attn_decode_bf16(
+                        launch(
                             (slot(q), slot(out)),
                             (pool.half_ptr(l, KvHalf::K), pool.half_ptr(l, KvHalf::V)),
                             (slot(block_table), slot(sequence)),
                             (q_heads, kv_heads, head_dim),
                             (layout.block_size, layout.num_blocks),
-                            attn.scale(),
+                            (attn.scale(), window.unwrap_or(0)),
                             stream.0,
                         )
                     }
@@ -1773,15 +1996,16 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         }
     }
 
-    /// Expert 0's `[n, k]` of `proj` in the MoE bundle `bundle` of `weights`, and the rows of each
-    /// expert's block (the expert stride in rows of `k`), or `None` on overflow.
+    /// Expert 0's `[n, k]` of `proj` in the MoE bundle or expert bank `bundle` of `weights` (its
+    /// layout `weight`'s: [`MoeWeight::experts`]), and the rows of each expert's block (the expert
+    /// stride in rows of `k`), or `None` on overflow.
     fn expert_slab(
         weights: &[DeviceBuffer],
-        bundle: WeightIx,
+        (bundle, weight): (WeightIx, MoeWeight),
         proj: ExpertProjection,
         (experts, hidden, inter): (u32, u32, u32),
     ) -> Option<(*const c_void, u32)> {
-        let layout = moe_bundle(experts, hidden, inter)?;
+        let layout = weight.experts(experts, hidden, inter)?;
         let (part, stride) = proj.slab(layout, hidden, inter)?;
         let (_, k) = proj.n_k(hidden, inter);
         let row_bytes = u64::from(k).checked_mul(CUDA_ACT_BYTES)?;
@@ -1791,8 +2015,9 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         Some((b.cast_const(), rows))
     }
 
-    /// Enqueue the grouped expert GEMM (`kernels::expert_gemm_bf16`) over the sorted rows, B at
-    /// [`ExpertProjection::slab`]'s part of the bundle.
+    /// Enqueue the grouped expert GEMM (`kernels::expert_gemm_tiled_bf16`) over the sorted rows at
+    /// the step's expert count and column tile, B at [`ExpertProjection::slab`]'s part of the
+    /// bundle or bank.
     fn expert_gemm(
         g: &ExpertGemmBf16,
         slot: impl Fn(ArenaOffset) -> *mut c_void,
@@ -1800,9 +2025,12 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         stream: &Stream,
     ) -> Result<(), KernelError> {
         let (n, k) = g.n_k();
-        let Some((b, expert_rows)) =
-            Self::expert_slab(weights, g.bundle, g.proj, (g.experts, g.hidden, g.inter))
-        else {
+        let Some((b, expert_rows)) = Self::expert_slab(
+            weights,
+            (g.bundle, g.weight),
+            g.proj,
+            (g.experts, g.hidden, g.inter),
+        ) else {
             return Err(KernelError::MoeShape {
                 kernel: "expert_gemm_bf16",
                 dims: [g.max_tiles, n, k, 0],
@@ -1813,7 +2041,7 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         // bytes, which `new` checked the buffer holds; every expert's `[n, k]` lies inside its
         // part).
         unsafe {
-            kernels::expert_gemm_bf16(
+            kernels::expert_gemm_tiled_bf16(
                 (slot(g.a).cast_const(), b),
                 (
                     slot(g.offsets).cast_const(),
@@ -1821,13 +2049,14 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
                 ),
                 slot(g.c),
                 (g.max_tiles, n, k, g.experts, expert_rows),
+                g.n_tile,
                 stream.0,
             )
         }
     }
 
-    /// Enqueue the gathered expert GEMV (`kernels::expert_gemv_bf16`) over every pair, B at
-    /// [`ExpertProjection::slab`]'s part of the bundle.
+    /// Enqueue the gathered expert GEMV (`kernels::expert_gemv_bf16`) over every pair at the step's
+    /// expert count, B at [`ExpertProjection::slab`]'s part of the bundle or bank.
     fn expert_gemv(
         g: &ExpertGemvBf16,
         slot: impl Fn(ArenaOffset) -> *mut c_void,
@@ -1835,9 +2064,12 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
         stream: &Stream,
     ) -> Result<(), KernelError> {
         let (n, k) = g.n_k();
-        let Some((b, expert_rows)) =
-            Self::expert_slab(weights, g.bundle, g.proj, (g.experts, g.hidden, g.inter))
-        else {
+        let Some((b, expert_rows)) = Self::expert_slab(
+            weights,
+            (g.bundle, g.weight),
+            g.proj,
+            (g.experts, g.hidden, g.inter),
+        ) else {
             return Err(KernelError::MoeShape {
                 kernel: "expert_gemv_bf16",
                 dims: [g.m, g.top_k, n, k],
@@ -1876,9 +2108,24 @@ impl<'a, W: AsRef<[DeviceBuffer]>> CudaWorker<'a, W> {
 /// when it has GDN layers.
 struct Uploads<'h> {
     input: Input<'h>,
-    table: Option<(ArenaSpan, &'h [u16])>,
+    /// The global rotary table's rows, then the local one's.
+    tables: [Option<(ArenaSpan, &'h [u16])>; 2],
     kv: Option<KvUpload<'h>>,
     gdn: Option<(ArenaSpan, &'h [u32; 4])>,
+}
+
+/// `table`'s rows for `positions` filled into the front of `host`, with its span: what the forward
+/// uploads for it. `None` for a tape without that table.
+fn fill_table<'h>(
+    table: Option<RotaryTable>,
+    positions: &[u32],
+    host: &'h mut [u16],
+) -> Option<(ArenaSpan, &'h [u16])> {
+    table.map(|r| {
+        let rows = &mut host[..positions.len() * r.rot_dim as usize];
+        fill_rotary_rows_with_freq_dim(positions, r.rot_dim, r.freq_dim, r.theta(), rows);
+        (r.span, &*rows)
+    })
 }
 
 /// One forward's KV regions, filled on the host: the tape's spans and the bytes for each.

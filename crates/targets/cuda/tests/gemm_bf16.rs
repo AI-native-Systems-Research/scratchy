@@ -12,6 +12,7 @@ pub mod common {
 }
 
 use common::numerics::{bf16_inputs, compare, mismatched_bits, reference, widen};
+use scratchy_target_cuda::kernels::gemm_col64_bf16_abt;
 use scratchy_target_cuda::kernels::{
     KernelError, gemm_bf16_abt, gemm_narrow_bf16_abt, gemv_bf16_abt,
 };
@@ -786,5 +787,178 @@ fn gemm_narrow_bf16_abt_at_one_column_matches_the_cpu_reference() {
     assert!(
         pass,
         "the narrow GEMM's one-column path failed: see the lines above"
+    );
+}
+
+// ── The 64-column GEMM (Gemma 4, #924) ─────────────────────────────
+
+/// `(M, N, K)` of Gemma 4 26B-A4B's 64-column GEMMs: the router's `[m, 128]` logits and the dense
+/// gate and up's 2112 columns, at m = 512 and 4096 (k = 2816, its hidden), and the smallest tile.
+const COL64_SHAPES: &[(u32, u32, u32, &str)] = &[
+    (512, 128, 2816, "Gemma's router logits at m=512"),
+    (512, 2112, 2816, "Gemma's dense gate/up at m=512"),
+    (4096, 2112, 2816, "Gemma's dense gate/up at m=4096"),
+    (4096, 128, 2816, "Gemma's router logits at m=4096"),
+    (128, 64, 64, "one output tile, one K step"),
+];
+
+/// Shapes the 64-column launcher must refuse, launching nothing: `n` 96 and 200 (off 64), `k` 100,
+/// `m` 100.
+const COL64_REFUSED: &[(u32, u32, u32)] =
+    &[(128, 96, 64), (128, 200, 64), (128, 64, 100), (100, 64, 64)];
+
+/// Launch the 64-column GEMM on the default stream, then wait for it.
+///
+/// # Safety
+///
+/// As [`gemm_col64_bf16_abt`]'s, for the default stream.
+unsafe fn col64_and_wait(
+    a: &DeviceBuffer,
+    b: &DeviceBuffer,
+    c: &DeviceBuffer,
+    (m, n, k): (u32, u32, u32),
+) -> Result<(), KernelError> {
+    // SAFETY: the caller's contract.
+    let launched =
+        unsafe { gemm_col64_bf16_abt(a.ptr(), b.ptr(), c.ptr(), (m, n, k), std::ptr::null_mut()) };
+    c.download().expect("waiting for the launch");
+    launched
+}
+
+/// A GEMM launch on the default stream that waits for it: [`launch_and_wait`] or
+/// [`col64_and_wait`].
+type LaunchAndWait = unsafe fn(
+    &DeviceBuffer,
+    &DeviceBuffer,
+    &DeviceBuffer,
+    (u32, u32, u32),
+) -> Result<(), KernelError>;
+
+/// `C` of one launch of `gemm` on `a` and `b` (`(m, n, k)`), from a sentinel, with [`TAIL`] past
+/// its end.
+fn run_c(
+    device: &CudaDevice,
+    (a, b): (&DeviceBuffer, &DeviceBuffer),
+    (m, n, k): (u32, u32, u32),
+    gemm: LaunchAndWait,
+) -> Vec<u16> {
+    let len = m as usize * n as usize;
+    let c = DeviceBuffer::upload(device, &vec![SENTINEL; len + TAIL]).expect("upload C");
+    // SAFETY: the buffers hold m*k, n*k and m*n + TAIL bf16, cudaMalloc pointers are 256-byte
+    // aligned, `c` overlaps neither input, and `CudaDevice::open` ran `prepare_all`.
+    unsafe { gemm(a, b, &c, (m, n, k)) }.expect("launch");
+    c.download().expect("download C")
+}
+
+/// Every Gemma shape against the CPU reference within the #761 GEMM bound (`out_of_bound=0`), the
+/// sentinel past `c`'s end intact.
+#[test]
+fn gemm_col64_bf16_matches_the_cpu_reference() {
+    let device = h100();
+    let mut pass = true;
+    for &(m, n, k, what) in COL64_SHAPES {
+        let (mu, nu, ku) = (m as usize, n as usize, k as usize);
+        let a_bits = bf16_inputs(mu * ku, 0xC064_0000 ^ (u64::from(m) << 32) ^ u64::from(k));
+        let b_bits = bf16_inputs(nu * ku, 0xC0B0_0000 ^ (u64::from(n) << 32) ^ u64::from(k));
+        let a = DeviceBuffer::upload(&device, &a_bits).expect("upload A");
+        let b = DeviceBuffer::upload(&device, &b_bits).expect("upload B");
+        let c_bits = run_c(&device, (&a, &b), (m, n, k), col64_and_wait);
+        let tail_intact = c_bits[mu * nu..].iter().all(|&x| x == SENTINEL);
+        let cmp = compare(&c_bits[..mu * nu], &a_bits, &b_bits, mu, nu, ku);
+        let ok = cmp.pass() && tail_intact;
+        eprintln!(
+            "gemm_col64_bf16_abt m={m} n={n} k={k}: {} tail_intact={tail_intact} {} ({what})",
+            cmp.line(),
+            if ok { "PASS" } else { "FAIL" }
+        );
+        pass &= ok;
+    }
+    assert!(pass, "the 64-column GEMM failed: see the lines above");
+}
+
+/// On an `n` that is also a multiple of 256, the 64-column GEMM is `gemm_bf16_abt` bit for bit: the
+/// same WGMMA K order, each output element one 64-wide WGMMA column chain (#924's G1 STOP rule).
+#[test]
+fn gemm_col64_bf16_is_gemm_bf16_on_the_256_grid() {
+    let device = h100();
+    let mut pass = true;
+    for (m, n, k) in [(512u32, 256u32, 2816u32), (4096, 1024, 2816)] {
+        let (mu, nu, ku) = (m as usize, n as usize, k as usize);
+        let a_bits = bf16_inputs(mu * ku, 0xC1D0_0000 ^ u64::from(m));
+        let b_bits = bf16_inputs(nu * ku, 0xC1D1_0000 ^ u64::from(n));
+        let a = DeviceBuffer::upload(&device, &a_bits).expect("upload A");
+        let b = DeviceBuffer::upload(&device, &b_bits).expect("upload B");
+        let col64 = run_c(&device, (&a, &b), (m, n, k), col64_and_wait);
+        let tiled = run_c(&device, (&a, &b), (m, n, k), launch_and_wait);
+        let bad = mismatched_bits(&col64[..mu * nu], &tiled[..mu * nu]);
+        let rows: Vec<usize> = (0..mu)
+            .filter(|&r| col64[r * nu..(r + 1) * nu] != tiled[r * nu..(r + 1) * nu])
+            .take(8)
+            .collect();
+        let ok = bad == 0;
+        eprintln!(
+            "gemm_col64_bf16_abt vs gemm_bf16_abt m={m} n={n} k={k}: mismatched_bits={bad} \
+             first_differing_rows={rows:?} {}",
+            if ok { "PASS" } else { "FAIL" }
+        );
+        pass &= ok;
+    }
+    assert!(
+        pass,
+        "the 64-column GEMM is not gemm_bf16_abt on the 256 grid: see the lines above"
+    );
+}
+
+/// A shape off the (128, 64, 64) grid returns `Shape`, and `C` is left as it was.
+#[test]
+fn gemm_col64_bf16_refuses_off_tile() {
+    let device = h100();
+    let mut pass = true;
+    for &(m, n, k) in COL64_REFUSED {
+        let len = |rows: u32, cols: u32| (rows as usize * cols as usize).min(REFUSED_BUFFER);
+        let a = DeviceBuffer::upload(&device, &vec![0; len(m, k)]).expect("upload A");
+        let b = DeviceBuffer::upload(&device, &vec![0; len(n, k)]).expect("upload B");
+        let c = DeviceBuffer::upload(&device, &vec![SENTINEL; len(m, n) + TAIL]).expect("upload C");
+        // SAFETY: the launcher refuses each of these shapes before it touches any pointer.
+        let got = unsafe { col64_and_wait(&a, &b, &c, (m, n, k)) };
+        let unchanged = (c.download().expect("download C").iter()).all(|&x| x == SENTINEL);
+        let ok = got == Err(KernelError::Shape { m, n, k }) && unchanged;
+        eprintln!(
+            "gemm_col64_bf16_abt m={m} n={n} k={k}: {got:?} c_unchanged={unchanged} {}",
+            if ok { "PASS" } else { "FAIL" }
+        );
+        pass &= ok;
+    }
+    assert!(
+        pass,
+        "the 64-column GEMM took a shape off its tile: see the lines above"
+    );
+}
+
+/// Two launches on the same inputs give the same bits, at the router's and the dense gate's
+/// shapes.
+#[test]
+fn gemm_col64_bf16_repeats_bit_identically() {
+    let device = h100();
+    let mut pass = true;
+    for (m, n, k) in [(512u32, 128u32, 2816u32), (512, 2112, 2816)] {
+        let (mu, nu, ku) = (m as usize, n as usize, k as usize);
+        let a_bits = bf16_inputs(mu * ku, 0xC2E0_0000 ^ u64::from(n));
+        let b_bits = bf16_inputs(nu * ku, 0xC2E1_0000 ^ u64::from(n));
+        let a = DeviceBuffer::upload(&device, &a_bits).expect("upload A");
+        let b = DeviceBuffer::upload(&device, &b_bits).expect("upload B");
+        let first = run_c(&device, (&a, &b), (m, n, k), col64_and_wait);
+        let second = run_c(&device, (&a, &b), (m, n, k), col64_and_wait);
+        let bad = mismatched_bits(&first, &second);
+        let ok = bad == 0;
+        eprintln!(
+            "gemm_col64_bf16_abt repeat m={m} n={n} k={k}: mismatched_bits={bad} {}",
+            if ok { "PASS" } else { "FAIL" }
+        );
+        pass &= ok;
+    }
+    assert!(
+        pass,
+        "the 64-column GEMM is not deterministic: see the lines above"
     );
 }

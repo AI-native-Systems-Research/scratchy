@@ -46,6 +46,10 @@ use scratchy_models::qwen3_5::qwen3_5_0_8b::{CUDA_TAPES, CUDA_WEIGHTS};
 include!("common/cuda_hf_parity_body.rs");
 
 const HIDDEN: usize = 1024;
+const VOCAB: usize = 248_320;
+/// Two GDN slots, one per seat; the worker's allocations are the arena, the KV pool and the GDN pool.
+const GDN_POOL: Option<GdnPoolConfig> = Some(GdnPoolConfig { num_slots: 2 });
+const WORKER_ALLOCATIONS: u64 = 3;
 /// The weight buffers `load_weights` uploads: 266 (the tied lm_head reads the embedding
 /// table's).
 const WEIGHTS: u64 = 266;
@@ -57,3 +61,5 @@ const CHECKPOINT: &str = "Qwen3.5-0.8B";
 const GOLDENS: &str = "tests/goldens/qwen3-5-qwen3.5-0.8b-hf";
 /// P1's rule (#859): min cosine(CUDA, f32) ≥ 0.999 on every real row (0.8b runs, #816).
 const P1: P1Rule = P1Rule::Floor(0.999);
+/// P3 accepts no top-1 disagreement outside a near-tie (#816).
+const P3: P3Rule = P3Rule::Strict;

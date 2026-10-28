@@ -82,6 +82,48 @@ __device__ inline float2 silu_mul::op<float2>(const float2& g, const float2& u) 
     return float2{silu_mul::op<float>(g.x, u.x), silu_mul::op<float>(g.y, u.y)};
 }
 
+// Gemma's GeGLU activation: `0.5 · g · (1 + tanh(√(2/π) · (g + 0.044715 · g³))) · u`, HF's
+// `gelu_pytorch_tanh` of the gate times `up` (TK's `flux_gelu.cu` uses the same two constants).
+// Under `--use_fast_math` (build.rs) `tanhf` is the intrinsic `__tanhf` (the CUDA programming
+// guide's table of functions `--use_fast_math` affects), whose maximum relative error is 2⁻¹¹.
+// No clamp: `tanh(±inf) = ±1`, so a finite gate whose cube overflows still gives a finite
+// result; `g = −inf` gives NaN, as HF does.
+struct gelu_tanh_mul {
+    static constexpr float SQRT_2_OVER_PI = 0.7978845608f;
+    static constexpr float CUBIC = 0.044715f;
+    template <typename T>
+    static __device__ inline T op(const T& g, const T& u) {
+        return 0.5f * g * (1.0f + tanhf(SQRT_2_OVER_PI * (g + CUBIC * g * g * g))) * u;
+    }
+};
+template <>
+__device__ inline float gelu_tanh_mul::op<float>(const float& g, const float& u) {
+    return 0.5f * g * (1.0f + tanhf(SQRT_2_OVER_PI * (g + CUBIC * g * g * g))) * u;
+}
+template <>
+__device__ inline float2 gelu_tanh_mul::op<float2>(const float2& g, const float2& u) {
+    return float2{gelu_tanh_mul::op<float>(g.x, u.x), gelu_tanh_mul::op<float>(g.y, u.y)};
+}
+
+// Gemma's final-logit soft-cap: `c · tanh(x / c)`, `c` the cap (30). `x / c` is the fast division
+// and `tanhf` the intrinsic `__tanhf` under `--use_fast_math` (see `gelu_tanh_mul`). `±0 → ±0`,
+// `±inf → ±c`, NaN → NaN. The `float2` form is the one TK's tile-and-scalar `bin_map` runs: it
+// packs `c` into both halves of a `float2`.
+struct soft_cap {
+    template <typename T>
+    static __device__ inline T op(const T& x, const T& c) {
+        return c * tanhf(x / c);
+    }
+};
+template <>
+__device__ inline float soft_cap::op<float>(const float& x, const float& c) {
+    return c * tanhf(x / c);
+}
+template <>
+__device__ inline float2 soft_cap::op<float2>(const float2& x, const float2& c) {
+    return float2{soft_cap::op<float>(x.x, c.x), soft_cap::op<float>(x.y, c.y)};
+}
+
 // The attention output gate: `a / (1 + e^(−g))`, the expression the plain-CUDA kernel computed.
 struct gate_apply {
     template <typename T>
@@ -220,6 +262,47 @@ __device__ inline float nan_to_neg_inf::op<float>(const float& x) {
 template <>
 __device__ inline float2 nan_to_neg_inf::op<float2>(const float2& x) {
     return float2{nan_to_neg_inf::op<float>(x.x), nan_to_neg_inf::op<float>(x.y)};
+}
+
+// The windowed online softmax's running max, before it is scaled: −inf as +0, every other value as
+// it is. With a window, a warp's first KV tile can lie wholly below every one of its rows'
+// windows, so its row max is −inf and `sub_row` would form `−inf − (−inf) = NaN`. Through this op
+// the tile's `p = exp2(−inf − 0)` is exactly 0 instead, and a finite max is unchanged. The
+// `float2` form serves the packed column vector of a row-layout tile (see `rescale_exact1`).
+struct neg_inf_to_zero {
+    template <typename T>
+    static __device__ inline T op(const T& x) {
+        return x == kittens::base_types::constants<T>::neg_infty() ? T(0.0f) : x;
+    }
+};
+template <>
+__device__ inline float neg_inf_to_zero::op<float>(const float& x) {
+    return x == kittens::base_types::constants<float>::neg_infty() ? 0.0f : x;
+}
+template <>
+__device__ inline float2 neg_inf_to_zero::op<float2>(const float2& x) {
+    return float2{neg_inf_to_zero::op<float>(x.x), neg_inf_to_zero::op<float>(x.y)};
+}
+
+// The windowed attention's softmax sum before the final division: 0 as 1, every other value as it
+// is. A padding row of a prefill bucket at least `window − 1` rows past the sequence's last key has
+// no key in its window, so its sum and its output are both 0 and `div_row` would form
+// `0 / 0 = NaN`; through this op it gives `0 / 1 = +0`, finite as the causal kernel's padding rows
+// are. A row with any allowed key has a sum of at least 1 (its max key's `p` is exactly 1), so this
+// is the identity there. The `float2` form as `neg_inf_to_zero`'s.
+struct zero_to_one {
+    template <typename T>
+    static __device__ inline T op(const T& x) {
+        return x == T(0.0f) ? T(1.0f) : x;
+    }
+};
+template <>
+__device__ inline float zero_to_one::op<float>(const float& x) {
+    return x == 0.0f ? 1.0f : x;
+}
+template <>
+__device__ inline float2 zero_to_one::op<float2>(const float2& x) {
+    return float2{zero_to_one::op<float>(x.x), zero_to_one::op<float>(x.y)};
 }
 
 // The MoE sort's run length: an expert's pair count rounded up to whole 128-row tiles of the

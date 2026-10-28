@@ -8,15 +8,16 @@
 //! analyses nothing. Plain `Copy` data with no pointer, so it builds in a `const` context and on a
 //! host with no CUDA toolchain.
 
+use scratchy_subtile::paged_kv_layout::PagedKvLayout;
 use serde::Serialize;
 
 use crate::op_abi::CUDA_EXPERT_TILE_ROWS;
 use crate::step::{
-    AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep, EmbedBf16, ExpertCombineBf16, ExpertGemmBf16,
-    ExpertGemvBf16, ExpertSortBf16, GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX,
-    GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES, GatedDeltaNetBf16, GemmBf16, MoeRouteBf16,
-    RopeAppendBf16, RopeBf16, RouterLogitsBf16, SiluMulBf16, gdn_conv_dim, gdn_scratch,
-    sort_index_regions,
+    ATTN_BF16_HEAD_DIMS, ATTN_WINDOW_MULTIPLE, AttnPrefillBf16, CUDA_KV_BLOCK_SIZE, CudaStep,
+    EmbedBf16, ExpertCombineBf16, ExpertGemmBf16, ExpertGemvBf16, ExpertSortBf16,
+    GDN_CONV_KERNEL_RANGE, GDN_HEAD_K, GDN_HEAD_V_MAX, GDN_HEAD_V_MULTIPLE, GDN_SEQUENCE_BYTES,
+    GatedDeltaNetBf16, GemmBf16, MoeRouteBf16, RmsNormBf16, RopeAppendBf16, RopeBf16,
+    RouterLogitsBf16, SiluMulBf16, gdn_conv_dim, gdn_scratch, sort_index_regions,
 };
 
 /// Bytes per activation element: CUDA's activations are bf16.
@@ -54,7 +55,7 @@ pub struct ArenaLayout {
 }
 
 /// The forward's rotary table: one row per token, `[bucket_m, rot_dim]` bf16, row `t` laid out
-/// `[cos θ_t,0..R/2 | sin θ_t,0..R/2]` with `θ_t,i = p_t · theta^(−2i/R)`.
+/// `[cos θ_t,0..R/2 | sin θ_t,0..R/2]` with `θ_t,i = p_t · theta^(−2i/F)`, `F` its `freq_dim`.
 ///
 /// Its place, size and constants are fixed at expansion; its contents are the forward's runtime
 /// data, built on the host from the token positions (`crate::rotary::rotary_rows`) and uploaded
@@ -66,6 +67,9 @@ pub struct RotaryTable {
     pub span: ArenaSpan,
     /// `R`, the rotated width of each head.
     pub rot_dim: u32,
+    /// `F`, the frequency exponent's denominator: `rot_dim` for a half-rotated class, the head dim
+    /// for a half-head (proportional) one, Gemma 4's global layers' 512. At least `rot_dim`.
+    pub freq_dim: u32,
     /// `rope_theta` as its bits (`f64::to_bits`), so the table is `Eq`; [`Self::theta`] reads it.
     pub theta_bits: u64,
 }
@@ -101,6 +105,82 @@ pub struct KvTape {
     pub slot_mapping: ArenaSpan,
     /// `[prefix_len, q_len]` u32: 8 bytes at an aligned offset of its own.
     pub sequence: ArenaSpan,
+    /// The attention classes of the layers: one for a uniform model (every Qwen tape: its
+    /// `kv_heads`, `head_dim`, no window), two for Gemma 4 (sliding, then global). Class 0 is
+    /// `kv_heads` and `head_dim`'s.
+    pub classes: &'static [KvClass],
+    /// Per entry of `layers`, its class: an index into `classes`.
+    pub layer_class: &'static [u8],
+}
+
+impl KvTape {
+    /// Whether a worker's one pool fits both this tape and `other`: the same layers, block size
+    /// and block-table length, the same class-0 geometry, and each layer at the same class
+    /// `(kv_heads, head_dim)`, the facts [`Self::pool_layout`] lays the pool out by. A class's
+    /// window is not one: it masks the attention, not the cache, so a tape and its unwindowed
+    /// twin share a pool. For one class this is exactly the comparison before the classes.
+    pub fn same_pool(&self, other: &KvTape) -> bool {
+        let base = |k: &KvTape| {
+            (
+                k.layers,
+                k.kv_heads,
+                k.head_dim,
+                k.block_size,
+                k.max_blocks_per_seq,
+            )
+        };
+        let shapes = |k: &KvTape| {
+            (k.layer_class.iter())
+                .map(|&c| (k.classes.get(usize::from(c))).map(|c| (c.kv_heads, c.head_dim)))
+        };
+        base(self) == base(other)
+            && self.layer_class.len() == other.layer_class.len()
+            && shapes(self).eq(shapes(other))
+    }
+
+    /// The KV pool of this tape's layers at `num_blocks` blocks: per layer, in [`Self::layers`] order,
+    /// its class's layout (`classes[layer_class[l]]`'s `kv_heads` and `head_dim`) and the
+    /// element offset of its K buffer, then its V buffer, back to back; and the pool's bytes. `None`
+    /// when a count overflows `u64` or the host's `usize`. For one class every layer's buffer is
+    /// `buffer_elems` and layer `l`'s K buffer is at `2 · l · buffer_elems`, the pool's layout before
+    /// the classes.
+    pub fn pool_layout(&self, num_blocks: u32) -> Option<(Vec<(PagedKvLayout, usize)>, u64)> {
+        let mut at = 0u64;
+        let mut per_layer = Vec::with_capacity(self.layers.len());
+        for &c in self.layer_class {
+            let class = self.classes.get(usize::from(c))?;
+            let layout = PagedKvLayout {
+                num_blocks,
+                num_kv_heads: class.kv_heads,
+                block_size: self.block_size,
+                head_dim: class.head_dim,
+            };
+            per_layer.push((layout, usize::try_from(at).ok()?));
+            at = at.checked_add(kv_buffer_elems(&layout)?.checked_mul(2)?)?;
+        }
+        let bytes = at.checked_mul(std::mem::size_of::<u16>() as u64)?;
+        usize::try_from(bytes).ok()?;
+        Some((per_layer, bytes))
+    }
+}
+
+/// One layer's K (or V) buffer's elements: `num_blocks · kv_heads · block_size · head_dim`, or
+/// `None` when the count overflows `u64`. Every factor is widened and multiplied checked.
+fn kv_buffer_elems(layout: &PagedKvLayout) -> Option<u64> {
+    [layout.num_kv_heads, layout.block_size, layout.head_dim]
+        .into_iter()
+        .try_fold(u64::from(layout.num_blocks), |acc, f| {
+            acc.checked_mul(u64::from(f))
+        })
+}
+
+/// One attention class's KV geometry: each layer of it caches `kv_heads` heads of `head_dim`,
+/// and its queries see their last `window` keys (`None`: every key).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct KvClass {
+    pub kv_heads: u32,
+    pub head_dim: u32,
+    pub window: Option<u32>,
 }
 
 /// Bytes of one u32 entry of a KV region.
@@ -170,6 +250,9 @@ pub struct MoeTape {
     pub up: ArenaSpan,
     pub act: ArenaSpan,
     pub down: ArenaSpan,
+    /// `[m, hidden]` bf16, Gemma's router pre-norm, after `down`; `None` for a block whose router
+    /// reads the hidden itself (every Qwen tape).
+    pub router_norm: Option<ArenaSpan>,
 }
 
 /// The sort's regions of a [`MoeTape`]: `chunk_hist` `[⌈P/256⌉, experts]` u32, `counts`
@@ -267,6 +350,7 @@ impl MoeTape {
             (Region::MoeAct, self.act),
             (Region::MoeDown, self.down),
         ]);
+        out.extend(self.router_norm.map(|r| (Region::MoeRouterNorm, r)));
         out
     }
 
@@ -274,7 +358,8 @@ impl MoeTape {
     /// (`CudaTape::validate` checks it), so it covers every one.
     pub fn span(&self) -> ArenaSpan {
         let start = self.logits.offset.0;
-        let end = self.down.offset.0.saturating_add(self.down.bytes);
+        let last = self.router_norm.unwrap_or(self.down);
+        let end = last.offset.0.saturating_add(last.bytes);
         ArenaSpan {
             offset: self.logits.offset,
             bytes: end.saturating_sub(start),
@@ -349,7 +434,11 @@ pub struct CudaTape {
     /// One step per launch, in launch order.
     pub steps: &'static [CudaStep],
     /// The rotary table the forward fills, when a step reads one; `None` for a tape with no rope.
+    /// It is the `Cos { local: false }` table: a uniform model's only one, Gemma's global layers'.
     pub rotary: Option<RotaryTable>,
+    /// The second rotary table, the `Cos { local: true }` one (Gemma's sliding layers), placed
+    /// after [`Self::rotary`]; `None` for every model with one rope class.
+    pub rotary_local: Option<RotaryTable>,
     /// The paged KV cache and its regions, when the canonical binds a `PrefixK` source; `None`
     /// for a tape with no attention.
     pub kv: Option<KvTape>,
@@ -384,6 +473,7 @@ pub enum Region {
     MoeUp,
     MoeAct,
     MoeDown,
+    MoeRouterNorm,
 }
 
 impl std::fmt::Display for Region {
@@ -409,6 +499,7 @@ impl std::fmt::Display for Region {
             Self::MoeUp => "the MoE up rows",
             Self::MoeAct => "the MoE activation rows",
             Self::MoeDown => "the MoE down rows",
+            Self::MoeRouterNorm => "the MoE router-norm rows",
         })
     }
 }
@@ -478,6 +569,8 @@ pub enum TapeError {
         bucket_m: u32,
         rot_dim: u32,
     },
+    /// A rotary table's `freq_dim` is below its `rot_dim`: its frequencies would pass 1 / theta.
+    RotaryFreqDim { rot_dim: u32, freq_dim: u32 },
     /// The `step`-th step reads weight `ix`, and the tape declares `weights` weights.
     WeightIndex {
         step: usize,
@@ -524,6 +617,10 @@ pub enum TapeError {
     /// The `step`-th step's kv heads or head dim are not the tape's KV geometry, so its kernel
     /// would address the pool with other strides than the worker allocated it with.
     KvStepGeometry { step: usize },
+    /// The KV attention classes are not a geometry the kernels take: none, class 0 not the
+    /// tape's `kv_heads` and `head_dim`, a head dim or window off the rules, a layer without a
+    /// class or naming one the tape lacks; or a local rotary table without a global one.
+    KvClasses,
     /// The `step`-th step is a one-row kernel's (a GEMV or the decode attention) and its rows are
     /// `rows`, not 1, or the tape's bucket is not one row.
     OneRowStep { step: usize, rows: u32 },
@@ -734,6 +831,10 @@ impl std::fmt::Display for TapeError {
                 span.bytes,
                 u64::from(*bucket_m) * u64::from(*rot_dim) * CUDA_ACT_BYTES
             ),
+            Self::RotaryFreqDim { rot_dim, freq_dim } => write!(
+                f,
+                "a rotary table's freq_dim = {freq_dim} is below its rot_dim = {rot_dim}"
+            ),
             Self::WeightIndex { step, ix, weights } => write!(
                 f,
                 "step {step} reads weight {ix}, and the tape declares {weights} weights"
@@ -802,6 +903,11 @@ impl std::fmt::Display for TapeError {
             Self::KvStepGeometry { step } => write!(
                 f,
                 "step {step}'s kv heads or head dim are not the tape's KV cache geometry"
+            ),
+            Self::KvClasses => write!(
+                f,
+                "the tape's KV attention classes are not a geometry the kernels take, or a layer \
+                 names no class"
             ),
             Self::OneRowStep { step, rows } => write!(
                 f,
@@ -1001,7 +1107,10 @@ impl CudaTape {
                 total,
             });
         }
-        if let Some(t) = self.rotary {
+        if self.rotary_local.is_some() && self.rotary.is_none() {
+            return Err(TapeError::KvClasses);
+        }
+        for t in self.rotary.into_iter().chain(self.rotary_local) {
             if !(t.span.offset.0.is_multiple_of(CUDA_ARENA_ALIGN) && inside(t.span, total)) {
                 return Err(TapeError::RotaryOutside {
                     span: t.span,
@@ -1017,6 +1126,12 @@ impl CudaTape {
                     span: t.span,
                     bucket_m: self.bucket_m,
                     rot_dim: t.rot_dim,
+                });
+            }
+            if t.freq_dim < t.rot_dim {
+                return Err(TapeError::RotaryFreqDim {
+                    rot_dim: t.rot_dim,
+                    freq_dim: t.freq_dim,
                 });
             }
         }
@@ -1042,10 +1157,8 @@ impl CudaTape {
                     return Err(TapeError::StepOutside { step, span, total });
                 }
             }
-            for &write in writes {
-                if let Some(&read) = reads.clone().find(|&&r| overlap(r, write)) {
-                    return Err(TapeError::WriteOverlapsRead { step, write, read });
-                }
+            if let Some((write, read)) = write_clash(&e) {
+                return Err(TapeError::WriteOverlapsRead { step, write, read });
             }
             if e.second_write.is_some_and(|w| overlap(w, e.writes)) {
                 return Err(TapeError::WritesOverlap { step });
@@ -1182,18 +1295,74 @@ impl CudaTape {
         }
     }
 
+    /// The KV classes: at least one, each a geometry the kernels take (non-zero heads, a head dim
+    /// of [`ATTN_BF16_HEAD_DIMS`] or the tape's own, a window a non-zero multiple of
+    /// [`ATTN_WINDOW_MULTIPLE`]) whose K (or V) row fits the pool's, `kv_heads · head_dim`, which
+    /// sizes every layer's region; and one class per layer naming a class the tape has.
+    fn kv_classes(&self, kv: &KvTape) -> Result<(), TapeError> {
+        if kv.classes.is_empty()
+            || kv.layer_class.len() != kv.layers.len()
+            || kv
+                .layer_class
+                .iter()
+                .any(|&c| usize::from(c) >= kv.classes.len())
+        {
+            return Err(TapeError::KvClasses);
+        }
+        for c in kv.classes {
+            let window_ok = c
+                .window
+                .is_none_or(|w| w != 0 && w.is_multiple_of(ATTN_WINDOW_MULTIPLE));
+            let head_ok = c.head_dim == kv.head_dim || ATTN_BF16_HEAD_DIMS.contains(&c.head_dim);
+            let row = u64::from(c.kv_heads) * u64::from(c.head_dim);
+            let fits = row <= u64::from(kv.kv_heads) * u64::from(kv.head_dim);
+            if c.kv_heads == 0 || c.head_dim == 0 || !head_ok || !window_ok || !fits {
+                return Err(TapeError::KvClasses);
+            }
+        }
+        Ok(())
+    }
+
+    /// The class of KV layer index `layer`, when the tape has it.
+    pub fn kv_class(&self, layer: u32) -> Option<KvClass> {
+        let kv = self.kv?;
+        let c = *kv.layer_class.get(layer as usize)?;
+        kv.classes.get(usize::from(c)).copied()
+    }
+
+    /// Whether a KV step of `(kv_heads, head_dim, window)` at KV layer index `layer` has its
+    /// layer's class geometry; a class-0 layer's is also the tape's `kv_heads` and `head_dim`, the
+    /// pool's. A layer the tape lacks is checked against class 0 here, and refused as `KvLayer`
+    /// by the extents check, which runs first.
+    fn kv_step_fits(&self, layer: u32, step: (u32, u32, Option<u32>)) -> bool {
+        let Some(kv) = self.kv else {
+            return false;
+        };
+        let c = (kv.layer_class.get(layer as usize)).map_or(0, |&c| usize::from(c));
+        let Some(class) = kv.classes.get(c) else {
+            return false;
+        };
+        step == (class.kv_heads, class.head_dim, class.window)
+            && (c != 0 || (step.0, step.1) == (kv.kv_heads, kv.head_dim))
+    }
+
     /// The regions the forward fills before the steps run: the rotary table and the KV regions,
     /// each checked to be aligned, inside the arena, and the size the forward writes. The rotary
     /// table's own checks ran before this.
     fn kv_regions(&self, total: u64) -> Result<Vec<(Region, ArenaSpan)>, TapeError> {
-        let mut regions: Vec<(Region, ArenaSpan)> = self
-            .rotary
+        let mut regions: Vec<(Region, ArenaSpan)> = (self.rotary.into_iter())
+            .chain(self.rotary_local)
             .map(|t| (Region::Rotary, t.span))
-            .into_iter()
             .collect();
+        if let [(_, a), (_, b)] = regions[..]
+            && overlap(a, b)
+        {
+            return Err(TapeError::RotaryOutside { span: b, total });
+        }
         let Some(kv) = self.kv else {
             return Ok(regions);
         };
+        self.kv_classes(&kv)?;
         if kv.block_size != CUDA_KV_BLOCK_SIZE {
             return Err(TapeError::KvBlockSize {
                 block_size: kv.block_size,
@@ -1292,7 +1461,7 @@ impl CudaTape {
     fn check_step_operands(&self, step: usize, s: &CudaStep) -> Result<(), TapeError> {
         let rotary = |table: ArenaOffset| {
             let tape = self.rotary.map(|t| t.span.offset);
-            if tape == Some(table) {
+            if tape == Some(table) || self.rotary_local.map(|t| t.span.offset) == Some(table) {
                 Ok(())
             } else {
                 Err(TapeError::RotaryMismatch { step, table, tape })
@@ -1315,6 +1484,7 @@ impl CudaTape {
             CudaStep::RopeAppend(RopeAppendBf16 {
                 table,
                 slot_mapping,
+                layer,
                 rows,
                 cols,
                 head_dim,
@@ -1326,28 +1496,31 @@ impl CudaTape {
                     bytes: u64::from(rows) * KV_ENTRY_BYTES,
                 };
                 region(Region::SlotMapping, span, self.kv.map(|k| k.slot_mapping))?;
-                match self.kv {
-                    Some(kv)
-                        if head_dim == kv.head_dim
-                            && Some(cols) == kv.kv_heads.checked_mul(kv.head_dim) =>
-                    {
-                        Ok(())
-                    }
-                    _ => Err(TapeError::KvStepGeometry { step }),
+                let kv_heads = cols.checked_div(head_dim).unwrap_or(0);
+                let window = self.kv_class(layer).and_then(|c| c.window);
+                match cols.is_multiple_of(head_dim.max(1))
+                    && self.kv_step_fits(layer, (kv_heads, head_dim, window))
+                {
+                    true => Ok(()),
+                    false => Err(TapeError::KvStepGeometry { step }),
                 }
             }
             CudaStep::AttnPrefill(AttnPrefillBf16 {
                 block_table,
                 sequence,
+                layer,
                 kv_heads,
                 head_dim,
+                window,
                 ..
             })
             | CudaStep::AttnDecode(AttnPrefillBf16 {
                 block_table,
                 sequence,
+                layer,
                 kv_heads,
                 head_dim,
+                window,
                 ..
             }) => {
                 self.one_row(step, s)?;
@@ -1362,9 +1535,9 @@ impl CudaTape {
                     bytes: 2 * KV_ENTRY_BYTES,
                 };
                 region(Region::Sequence, seq, kv.map(|k| k.sequence))?;
-                match kv {
-                    Some(kv) if (kv_heads, head_dim) == (kv.kv_heads, kv.head_dim) => Ok(()),
-                    _ => Err(TapeError::KvStepGeometry { step }),
+                match self.kv_step_fits(layer, (kv_heads, head_dim, window)) {
+                    true => Ok(()),
+                    false => Err(TapeError::KvStepGeometry { step }),
                 }
             }
             CudaStep::GatedDeltaNet(
@@ -1417,6 +1590,25 @@ impl CudaTape {
                 Ok(())
             }
             CudaStep::Gemv(_) => self.one_row(step, s),
+            // Gemma's router norm writes the scratch's router-norm region, whole.
+            CudaStep::RouterNorm(RmsNormBf16 { y, rows, cols, .. }) => match self.moe {
+                Some(moe)
+                    if Some(y) == moe.router_norm.map(|r| r.offset)
+                        && (rows, cols) == (self.bucket_m, moe.hidden) =>
+                {
+                    Ok(())
+                }
+                Some(moe) => Err(TapeError::MoeRegionMismatch {
+                    step,
+                    region: Region::MoeRouterNorm,
+                    span: ArenaSpan {
+                        offset: y,
+                        bytes: u64::from(rows) * u64::from(cols) * CUDA_ACT_BYTES,
+                    },
+                    tape: moe.router_norm.unwrap_or(moe.logits),
+                }),
+                None => Err(TapeError::MoeStepGeometry { step }),
+            },
             CudaStep::RouterLogits(_)
             | CudaStep::MoeRoute(_)
             | CudaStep::ExpertSort(_)
@@ -1431,7 +1623,13 @@ impl CudaTape {
             | CudaStep::SiluMul(_)
             | CudaStep::GateSplit(_)
             | CudaStep::GateApply(_)
-            | CudaStep::GateScale(_) => Ok(()),
+            | CudaStep::GateScale(_)
+            | CudaStep::Scale(_)
+            | CudaStep::RmsNormUnit(_)
+            | CudaStep::GeluMul(_)
+            | CudaStep::LayerScale(_)
+            | CudaStep::SoftCap(_)
+            | CudaStep::GemmCol64(_) => Ok(()),
         }
     }
 
@@ -1460,8 +1658,12 @@ impl CudaTape {
         {
             return Err(TapeError::MoeGeometry);
         }
-        let want =
+        let mut want =
             moe_region_bytes(self.bucket_m, geometry, sorted).ok_or(TapeError::MoeGeometry)?;
+        if moe.router_norm.is_some() {
+            let bytes = u64::from(self.bucket_m) * u64::from(moe.hidden) * CUDA_ACT_BYTES;
+            want.push(bytes);
+        }
         let mut next = 0u64;
         for (&(region, span), want) in moe.regions().iter().zip(want) {
             let outside = TapeError::MoeRegionOutside {
@@ -1497,6 +1699,7 @@ impl CudaTape {
         let moe_step = matches!(
             s,
             CudaStep::RouterLogits(_)
+                | CudaStep::RouterNorm(_)
                 | CudaStep::MoeRoute(_)
                 | CudaStep::ExpertSort(_)
                 | CudaStep::ExpertGemm(_)
@@ -1513,7 +1716,12 @@ impl CudaTape {
         let Some(&span) = touched else {
             return Ok(());
         };
-        if let (CudaStep::SiluMul(SiluMulBf16 { gate, up, out, .. }), Some(moe)) = (s, self.moe) {
+        if let (
+            CudaStep::SiluMul(SiluMulBf16 { gate, up, out, .. })
+            | CudaStep::GeluMul(SiluMulBf16 { gate, up, out, .. }),
+            Some(moe),
+        ) = (s, self.moe)
+        {
             let (g, u, a) = (e.reads[0], e.reads[1], e.writes);
             if (*gate, *up, *out) == (moe.gate.offset, moe.up.offset, moe.act.offset)
                 && g == Some(moe.gate)
@@ -1716,6 +1924,25 @@ fn inside(span: ArenaSpan, total: u64) -> bool {
 }
 
 /// Whether two spans share a byte. Both lie inside the arena, so neither end overflows.
+/// The first write of `e` that overlaps one of its reads, and that read; `None` when there is
+/// none. An in-place kernel's (`e.in_place`) write may equal its read 0 exactly: only that one
+/// read is exempt, and only for that exact span. Every other overlap, with read 0 or any other
+/// read, is a clash.
+fn write_clash(e: &crate::step::StepExtents) -> Option<(ArenaSpan, ArenaSpan)> {
+    let read0 = e.reads[0].filter(|_| e.in_place);
+    let writes = [Some(e.writes), e.second_write];
+    for &write in writes.iter().flatten() {
+        for (ix, &read) in e.reads.iter().enumerate() {
+            let Some(read) = read else { continue };
+            let exempt = ix == 0 && read0 == Some(read) && read == write;
+            if overlap(read, write) && !exempt {
+                return Some((write, read));
+            }
+        }
+    }
+    None
+}
+
 fn overlap(a: ArenaSpan, b: ArenaSpan) -> bool {
     let (a0, b0) = (a.offset.0, b.offset.0);
     a.bytes > 0 && b.bytes > 0 && a0 < b0 + b.bytes && b0 < a0 + a.bytes
@@ -1728,7 +1955,8 @@ mod tests {
     use super::*;
     use crate::step::{
         AddBf16, AttnPrefillBf16, CUDA_MAX_BLOCKS_PER_SEQ, GateSplitBf16, GatedDeltaNetBf16,
-        GemmBf16, KvUse, MoeRouteBf16, RmsNormBf16, RopeAppendBf16, RopeBf16, WeightRead,
+        GemmBf16, KvUse, MoeRouteBf16, RmsNormBf16, RopeAppendBf16, RopeBf16, RopePairing,
+        RouteProgram, WeightRead,
     };
 
     const fn span(offset: u64, bytes: u64) -> ArenaSpan {
@@ -1777,6 +2005,7 @@ mod tests {
         kv: None,
         gdn: None,
         moe: None,
+        rotary_local: None,
     };
 
     /// `GOOD` with its steps replaced by `step` alone.
@@ -2122,6 +2351,85 @@ mod tests {
         );
     }
 
+    /// A soft-cap over `[256, 1024]` at colour 1 (`[262144, 786432)`), writing at `out`.
+    fn soft_cap(out: u64) -> CudaStep {
+        CudaStep::SoftCap(crate::step::SoftCapBf16 {
+            x: ArenaOffset(262144),
+            out: ArenaOffset(out),
+            rows: 256,
+            cols: 1024,
+            cap_bits: 30.0f32.to_bits(),
+        })
+    }
+
+    #[test]
+    fn a_soft_cap_may_write_over_its_input_exactly() {
+        assert_eq!(with_step(soft_cap(262144)).validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_soft_cap_partly_over_its_input_is_refused() {
+        // One alignment step past `x`, and one before it: each overlaps `x` without equalling it.
+        for out in [262144 + 256, 262144 - 256] {
+            assert_eq!(
+                with_step(soft_cap(out)).validate(),
+                Err(TapeError::WriteOverlapsRead {
+                    step: 0,
+                    write: span(out, 524288),
+                    read: span(262144, 524288)
+                }),
+                "out at {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_soft_cap_may_write_over_its_input() {
+        // A `Scale` and a unit norm share the soft-cap's operand shape but not its contract.
+        let scale = CudaStep::Scale(crate::step::ScaleBf16 {
+            x: ArenaOffset(262144),
+            out: ArenaOffset(262144),
+            rows: 256,
+            cols: 1024,
+            scale_bits: 2.0f32.to_bits(),
+        });
+        let unit = CudaStep::RmsNormUnit(crate::step::RmsNormUnitBf16 {
+            x: ArenaOffset(262144),
+            y: ArenaOffset(262144),
+            rows: 256,
+            cols: 1024,
+            eps_bits: 1e-6f32.to_bits(),
+        });
+        let add = CudaStep::Add(AddBf16 {
+            a: ArenaOffset(262144),
+            b: ArenaOffset(786432),
+            out: ArenaOffset(262144),
+            rows: 256,
+            cols: 1024,
+        });
+        for step in [scale, unit, add] {
+            assert_eq!(
+                with_step(step).validate(),
+                Err(TapeError::WriteOverlapsRead {
+                    step: 0,
+                    write: span(262144, 524288),
+                    read: span(262144, 524288)
+                }),
+                "{step:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_soft_cap_is_the_one_in_place_step_with_one_read() {
+        // The in-place fact names read 0 only: the soft-cap has no other read and one write.
+        let e = soft_cap(262144).extents();
+        assert_eq!(
+            e.map(|e| (e.reads, e.second_write, e.in_place)),
+            Some(([Some(span(262144, 524288)), None, None, None], None, true))
+        );
+    }
+
     #[test]
     fn weight_index() {
         let t = with_step(gemm(0, 9, 262144, (256, 1024, 512)));
@@ -2160,6 +2468,7 @@ mod tests {
             rotary: Some(RotaryTable {
                 span: span(offset, bytes),
                 rot_dim: 64,
+                freq_dim: 64,
                 theta_bits: 1e7f64.to_bits(),
             }),
             ..GOOD
@@ -2234,6 +2543,7 @@ mod tests {
             cols: 2048,
             head_dim: 256,
             rot_dim: 64,
+            pairing: RopePairing::HalfRotated,
         })
     }
 
@@ -2306,6 +2616,7 @@ mod tests {
             cols: 512,
             head_dim: 256,
             rot_dim: 64,
+            pairing: RopePairing::HalfRotated,
         })
     }
 
@@ -2322,6 +2633,7 @@ mod tests {
             kv_heads,
             head_dim: 256,
             scale_bits: 0.0625f32.to_bits(),
+            window: None,
         })
     }
 
@@ -2334,6 +2646,12 @@ mod tests {
         block_table: span(KV_TABLE, 512),
         slot_mapping: span(KV_SLOTS, 1024),
         sequence: span(KV_SEQ, 8),
+        classes: &[KvClass {
+            kv_heads: 2,
+            head_dim: 256,
+            window: None,
+        }],
+        layer_class: &[0],
     };
 
     /// `GOOD`'s colours with the rotary table and the three KV regions after them, and `steps`.
@@ -2347,6 +2665,7 @@ mod tests {
             rotary: Some(RotaryTable {
                 span: span(KV_ROTARY, TABLE),
                 rot_dim: 64,
+                freq_dim: 64,
                 theta_bits: 1e7f64.to_bits(),
             }),
             kv: Some(kv),
@@ -2662,6 +2981,7 @@ mod tests {
             kv: None,
             gdn,
             moe: None,
+            rotary_local: None,
         }
     }
 
@@ -3017,6 +3337,10 @@ mod tests {
                 bucket_m: 1,
                 rot_dim: 64,
             },
+            TapeError::RotaryFreqDim {
+                rot_dim: 128,
+                freq_dim: 64,
+            },
             TapeError::WeightIndex {
                 step: 1,
                 ix: 9,
@@ -3147,6 +3471,7 @@ mod tests {
                 | TapeError::WritesOverlap { .. }
                 | TapeError::RotaryOutside { .. }
                 | TapeError::RotaryShape { .. }
+                | TapeError::RotaryFreqDim { .. }
                 | TapeError::WeightIndex { .. }
                 | TapeError::WeightShort { .. }
                 | TapeError::KvRegionOutside { .. }
@@ -3155,6 +3480,7 @@ mod tests {
                 | TapeError::KvLayer { .. }
                 | TapeError::KvRegionMismatch { .. }
                 | TapeError::KvStepGeometry { .. }
+                | TapeError::KvClasses
                 | TapeError::OneRowStep { .. }
                 | TapeError::RotaryMismatch { .. }
                 | TapeError::WriteOverRegion { .. }
@@ -3260,6 +3586,7 @@ mod tests {
         kv: None,
         gdn: None,
         moe: None,
+        rotary_local: None,
     };
 
     /// A one-row GEMV tape validates; a GEMV of more than one row, or one in a bucket of more
@@ -3338,6 +3665,7 @@ mod tests {
         up: span(1536, 128),
         act: span(1792, 128),
         down: span(2048, 256),
+        router_norm: None,
     };
     const MOE_TOTAL: u64 = 2304;
 
@@ -3350,6 +3678,8 @@ mod tests {
         experts: 4,
         top_k: 2,
         renorm: true,
+        expert_scale: None,
+        program: RouteProgram::QwenSoftmax,
     };
 
     fn moe_tape(moe: Option<MoeTape>, steps: &[CudaStep]) -> CudaTape {
@@ -3368,6 +3698,7 @@ mod tests {
             kv: None,
             gdn: None,
             moe,
+            rotary_local: None,
         }
     }
 
@@ -3508,5 +3839,530 @@ mod tests {
                 span: span(2048, 128)
             })
         );
+    }
+
+    // ── Gemma 4's KV classes, second rotary table and router norm (#885) ──
+
+    /// [`KV`] with two classes: class 0 its own (2 × 256), class 1 one KV head of 512 lanes (the
+    /// same pool row) with no window, and its one layer of `layer_class`.
+    const fn two_classes(layer_class: &'static [u8]) -> KvTape {
+        KvTape {
+            classes: &[
+                KvClass {
+                    kv_heads: 2,
+                    head_dim: 256,
+                    window: None,
+                },
+                KvClass {
+                    kv_heads: 1,
+                    head_dim: 512,
+                    window: None,
+                },
+            ],
+            layer_class,
+            ..KV
+        }
+    }
+
+    /// Each class of the KV tape is a geometry the kernels take, and each layer names one: no
+    /// class, a layer naming a class the tape lacks, a class count off the layers, a head dim off
+    /// [`ATTN_BF16_HEAD_DIMS`], a window off [`ATTN_WINDOW_MULTIPLE`] or of 0, and a class whose
+    /// row is wider than the pool's are each `KvClasses`.
+    #[test]
+    fn kv_classes() {
+        assert_eq!(kv_tape(two_classes(&[1]), &[]).validate(), Ok(()));
+        let class = |kv_heads, head_dim, window| KvClass {
+            kv_heads,
+            head_dim,
+            window,
+        };
+        let one = |c: KvClass| -> &'static [KvClass] { Box::leak(Box::new([c])) };
+        for (what, kv) in [
+            ("no class", KvTape { classes: &[], ..KV }),
+            ("a missing class", two_classes(&[2])),
+            (
+                "no layer's class",
+                KvTape {
+                    layer_class: &[],
+                    ..KV
+                },
+            ),
+            (
+                "head dim 128",
+                KvTape {
+                    classes: one(class(4, 128, None)),
+                    ..KV
+                },
+            ),
+            (
+                "a window of 1000",
+                KvTape {
+                    classes: one(class(2, 256, Some(1000))),
+                    ..KV
+                },
+            ),
+            (
+                "a window of 0",
+                KvTape {
+                    classes: one(class(2, 256, Some(0))),
+                    ..KV
+                },
+            ),
+            (
+                "a row wider than the pool's",
+                KvTape {
+                    classes: Box::leak(Box::new([class(2, 256, None), class(2, 512, None)])),
+                    layer_class: &[0],
+                    ..KV
+                },
+            ),
+            (
+                "no heads",
+                KvTape {
+                    classes: one(class(0, 256, None)),
+                    ..KV
+                },
+            ),
+        ] {
+            assert_eq!(
+                kv_tape(kv, &[]).validate(),
+                Err(TapeError::KvClasses),
+                "{what}"
+            );
+        }
+    }
+
+    /// A KV step's geometry is its layer's class: a class-1 layer's append and attention of one
+    /// 512-lane head validate; the class-0 geometry on that layer, or a window its class lacks, is
+    /// `KvStepGeometry`.
+    #[test]
+    fn a_kv_step_has_its_layers_class() {
+        let append = |cols, head_dim| match rope_append(0, KV_SLOTS) {
+            CudaStep::RopeAppend(r) => CudaStep::RopeAppend(RopeAppendBf16 {
+                cols,
+                head_dim,
+                ..r
+            }),
+            _ => unreachable!(),
+        };
+        let attend = |kv_heads, head_dim, window| match attn(KV_TABLE, KV_SEQ, kv_heads) {
+            CudaStep::AttnPrefill(a) => CudaStep::AttnPrefill(AttnPrefillBf16 {
+                head_dim,
+                window,
+                q_heads: 2,
+                ..a
+            }),
+            _ => unreachable!(),
+        };
+        let global = two_classes(&[1]);
+        assert_eq!(
+            kv_tape(global, &[append(512, 512), attend(1, 512, None)]).validate(),
+            Ok(())
+        );
+        for (what, step) in [
+            ("the class-0 append", append(512, 256)),
+            ("the class-0 attention", attend(2, 256, None)),
+            ("a window", attend(1, 512, Some(1024))),
+        ] {
+            assert_eq!(
+                kv_tape(global, &[step]).validate(),
+                Err(TapeError::KvStepGeometry { step: 0 }),
+                "{what}"
+            );
+        }
+    }
+
+    /// A rotary table whose `freq_dim` is below its `rot_dim` is `RotaryFreqDim`; equal to it, or
+    /// above (Gemma 4's proportional 512 over 128), it validates.
+    #[test]
+    fn a_rotary_table_with_freq_dim_below_rot_dim_is_refused() {
+        let with = |freq_dim| {
+            let t = with_rotary(TABLE_AT, TABLE);
+            CudaTape {
+                rotary: t.rotary.map(|r| RotaryTable { freq_dim, ..r }),
+                ..t
+            }
+        };
+        assert_eq!(with(64).validate(), Ok(()));
+        assert_eq!(with(512).validate(), Ok(()));
+        for freq_dim in [0, 2, 63] {
+            assert_eq!(
+                with(freq_dim).validate(),
+                Err(TapeError::RotaryFreqDim {
+                    rot_dim: 64,
+                    freq_dim
+                }),
+                "freq_dim {freq_dim}"
+            );
+        }
+    }
+
+    /// The local rotary table: one beside the global table validates and a rope may read it; one
+    /// without a global table is `KvClasses`; one over the global table, or outside the arena, is
+    /// `RotaryOutside`.
+    #[test]
+    fn the_local_rotary_table() {
+        let local = |offset| RotaryTable {
+            span: span(offset, TABLE),
+            rot_dim: 64,
+            freq_dim: 64,
+            theta_bits: 1e4f64.to_bits(),
+        };
+        let at = TABLE_AT + TABLE;
+        let grown = |t: CudaTape| CudaTape {
+            arena: ArenaLayout {
+                total_bytes: ROTARY_TOTAL + TABLE,
+                ..t.arena
+            },
+            ..t
+        };
+        let two = CudaTape {
+            rotary_local: Some(local(at)),
+            steps: Box::leak(Box::new([rope(at)])),
+            ..grown(with_rotary(TABLE_AT, TABLE))
+        };
+        assert_eq!(two.validate(), Ok(()));
+        let alone = CudaTape {
+            rotary: None,
+            ..two
+        };
+        assert_eq!(alone.validate(), Err(TapeError::KvClasses));
+        let over = CudaTape {
+            rotary_local: Some(local(TABLE_AT)),
+            steps: &[],
+            ..two
+        };
+        assert_eq!(
+            over.validate(),
+            Err(TapeError::RotaryOutside {
+                span: span(TABLE_AT, TABLE),
+                total: ROTARY_TOTAL + TABLE
+            })
+        );
+        let outside = CudaTape {
+            rotary_local: Some(local(ROTARY_TOTAL + TABLE)),
+            steps: &[],
+            ..two
+        };
+        assert!(
+            matches!(outside.validate(), Err(TapeError::RotaryOutside { .. })),
+            "{:?}",
+            outside.validate()
+        );
+    }
+
+    /// [`MOE`] with Gemma's router-norm rows (`[1, hidden]` bf16, 128 bytes at 2304) after its down.
+    const MOE_ROUTER_NORM: MoeTape = MoeTape {
+        router_norm: Some(span(2304, 128)),
+        ..MOE
+    };
+
+    /// The router norm into the scratch's router-norm rows validates; the rows sized off
+    /// `[m, hidden]` are `MoeRegionShape`; a router norm writing elsewhere, or with no rows in
+    /// the scratch, is `MoeRegionMismatch`, and on a tape with no scratch `MoeStepGeometry`.
+    #[test]
+    fn the_router_norm_writes_its_rows() {
+        let norm = |y| {
+            CudaStep::RouterNorm(RmsNormBf16 {
+                x: ArenaOffset(0),
+                gain: WeightIx(0),
+                y: ArenaOffset(y),
+                rows: 1,
+                cols: 64,
+                eps_bits: 1e-6f32.to_bits(),
+                convention: GainConvention::Scale,
+            })
+        };
+        let tape = |moe, steps: &[CudaStep]| CudaTape {
+            arena: ArenaLayout {
+                total_bytes: MOE_TOTAL + 256,
+                ..moe_tape(None, &[]).arena
+            },
+            weight_bytes: &[128],
+            ..moe_tape(moe, steps)
+        };
+        assert_eq!(
+            tape(Some(MOE_ROUTER_NORM), &[norm(2304)]).validate(),
+            Ok(())
+        );
+        let wide = MoeTape {
+            router_norm: Some(span(2304, 256)),
+            ..MOE
+        };
+        assert_eq!(
+            tape(Some(wide), &[]).validate(),
+            Err(TapeError::MoeRegionShape {
+                region: Region::MoeRouterNorm,
+                span: span(2304, 256),
+                want: 128
+            })
+        );
+        assert!(
+            matches!(
+                tape(Some(MOE_ROUTER_NORM), &[norm(512)]).validate(),
+                Err(TapeError::MoeRegionMismatch {
+                    step: 0,
+                    region: Region::MoeRouterNorm,
+                    ..
+                })
+            ),
+            "{:?}",
+            tape(Some(MOE_ROUTER_NORM), &[norm(512)]).validate()
+        );
+        assert!(
+            matches!(
+                tape(Some(MOE), &[norm(2304)]).validate(),
+                Err(TapeError::MoeRegionMismatch {
+                    region: Region::MoeRouterNorm,
+                    ..
+                }) | Err(TapeError::StepOutside { .. })
+            ),
+            "{:?}",
+            tape(Some(MOE), &[norm(2304)]).validate()
+        );
+        assert_eq!(
+            tape(None, &[norm(2304)]).validate(),
+            Err(TapeError::MoeStepGeometry { step: 0 })
+        );
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    const NO_SPAN: ArenaSpan = ArenaSpan {
+        offset: ArenaOffset(0),
+        bytes: 0,
+    };
+
+    /// A KV tape of `layer_class` over `classes`, one layer per entry; its regions are not read.
+    fn kv(classes: &'static [KvClass], layer_class: &'static [u8]) -> KvTape {
+        KvTape {
+            layers: Box::leak((0..layer_class.len() as u32).collect::<Vec<_>>().into()),
+            kv_heads: classes[0].kv_heads,
+            head_dim: classes[0].head_dim,
+            block_size: crate::step::CUDA_KV_BLOCK_SIZE,
+            max_blocks_per_seq: crate::step::CUDA_MAX_BLOCKS_PER_SEQ,
+            block_table: NO_SPAN,
+            slot_mapping: NO_SPAN,
+            sequence: NO_SPAN,
+            classes,
+            layer_class,
+        }
+    }
+
+    /// Gemma 4's 30 layers: sliding (8 × 256, window 1024) but every sixth, global (2 × 512). The
+    /// pool is 225,280 bytes a token (25 · 8 · 256 · 2 · 2 + 5 · 2 · 512 · 2 · 2, #885's 204,800 +
+    /// 20,480), each layer's K buffer right after the previous layer's V, at its class's size.
+    #[test]
+    fn the_per_class_pool_holds_gemmas_30_layers_back_to_back() {
+        const CLASSES: [KvClass; 2] = [
+            KvClass {
+                kv_heads: 8,
+                head_dim: 256,
+                window: Some(1024),
+            },
+            KvClass {
+                kv_heads: 2,
+                head_dim: 512,
+                window: None,
+            },
+        ];
+        let layer_class: Vec<u8> = (0..30).map(|l| u8::from(l % 6 == 5)).collect();
+        let kv = kv(&CLASSES, Box::leak(layer_class.clone().into()));
+        let num_blocks = 160;
+        let (per_layer, bytes) = kv.pool_layout(num_blocks).expect("the pool fits");
+        let tokens = u64::from(num_blocks) * 64;
+        eprintln!(
+            "gemma pool: {bytes} bytes at {num_blocks} blocks, {} a token",
+            bytes / tokens
+        );
+        assert_eq!(bytes, 225_280 * tokens);
+        let mut at = 0usize;
+        for (l, ((layout, offset), &c)) in per_layer.iter().zip(&layer_class).enumerate() {
+            let class = CLASSES[usize::from(c)];
+            assert_eq!(
+                (
+                    layout.num_kv_heads,
+                    layout.head_dim,
+                    layout.num_blocks,
+                    layout.block_size
+                ),
+                (class.kv_heads, class.head_dim, num_blocks, 64),
+                "layer {l}"
+            );
+            assert_eq!(
+                *offset, at,
+                "layer {l}: K right after the previous layer's V"
+            );
+            at += 2 * layout.buffer_elems();
+        }
+        assert_eq!(at * 2, bytes as usize, "the last V ends the pool");
+    }
+
+    /// One class (every Qwen tape): layer `l`'s K buffer is at `2 · l · buffer_elems`, and the
+    /// pool's bytes are `layers · 2 · buffer_elems · 2`, the pool before the classes.
+    #[test]
+    fn a_uniform_pool_is_the_pool_before_the_classes() {
+        const ONE: [KvClass; 1] = [KvClass {
+            kv_heads: 2,
+            head_dim: 256,
+            window: None,
+        }];
+        let kv = kv(&ONE, &[0; 6]);
+        let (per_layer, bytes) = kv.pool_layout(37).expect("the pool fits");
+        let buffer = PagedKvLayout {
+            num_blocks: 37,
+            num_kv_heads: 2,
+            block_size: 64,
+            head_dim: 256,
+        }
+        .buffer_elems();
+        let offsets: Vec<usize> = per_layer.iter().map(|&(_, at)| at).collect();
+        assert_eq!(offsets, (0..6).map(|l| 2 * l * buffer).collect::<Vec<_>>());
+        assert_eq!(bytes, (6 * 2 * buffer * 2) as u64);
+    }
+
+    /// A class index past `classes`, or a pool past `u64`, is `None`.
+    #[test]
+    fn a_pool_with_a_missing_class_or_too_many_bytes_is_refused() {
+        const ONE: [KvClass; 1] = [KvClass {
+            kv_heads: 2,
+            head_dim: 256,
+            window: None,
+        }];
+        assert_eq!(kv(&ONE, &[0, 1]).pool_layout(4), None);
+        const HUGE: [KvClass; 1] = [KvClass {
+            kv_heads: u32::MAX,
+            head_dim: u32::MAX,
+            window: None,
+        }];
+        assert_eq!(kv(&HUGE, &[0]).pool_layout(u32::MAX), None);
+    }
+}
+
+#[cfg(test)]
+mod pool_and_overlap_tests {
+    use super::*;
+    use crate::step::{CUDA_KV_BLOCK_SIZE, CUDA_MAX_BLOCKS_PER_SEQ, StepExtents};
+
+    const NO_SPAN: ArenaSpan = ArenaSpan {
+        offset: ArenaOffset(0),
+        bytes: 0,
+    };
+    const SLIDING: KvClass = KvClass {
+        kv_heads: 8,
+        head_dim: 256,
+        window: Some(1024),
+    };
+
+    fn kv(classes: &'static [KvClass], layer_class: &'static [u8]) -> KvTape {
+        KvTape {
+            layers: Box::leak((0..layer_class.len() as u32).collect::<Vec<_>>().into()),
+            kv_heads: classes[0].kv_heads,
+            head_dim: classes[0].head_dim,
+            block_size: CUDA_KV_BLOCK_SIZE,
+            max_blocks_per_seq: CUDA_MAX_BLOCKS_PER_SEQ,
+            block_table: NO_SPAN,
+            slot_mapping: NO_SPAN,
+            sequence: NO_SPAN,
+            classes,
+            layer_class,
+        }
+    }
+
+    /// #923's GKE regression (`KvGeometry { bucket: 2 }` in #922's sliding-layer tests): a
+    /// windowed one-class tape and its unwindowed twin differ only in the class's window, which
+    /// lays out no cache, so they share one pool, as they did before the classes. The pool is the
+    /// same for both.
+    #[test]
+    fn a_tape_and_its_unwindowed_twin_share_one_pool() {
+        const TWIN: KvClass = KvClass {
+            window: None,
+            ..SLIDING
+        };
+        let (a, b) = (kv(&[SLIDING], &[0]), kv(&[TWIN], &[0]));
+        assert!(a.same_pool(&b) && b.same_pool(&a));
+        assert_eq!(a.pool_layout(48), b.pool_layout(48));
+    }
+
+    /// What does change the pool is refused: another class shape for a layer, another class-0
+    /// geometry, another layer count; and each of the fields compared before the classes.
+    #[test]
+    fn a_tape_of_another_pool_is_not_the_same_pool() {
+        const GLOBAL: KvClass = KvClass {
+            kv_heads: 2,
+            head_dim: 512,
+            window: None,
+        };
+        let two = kv(&[SLIDING, GLOBAL], &[0, 1]);
+        assert!(two.same_pool(&two));
+        assert!(
+            !two.same_pool(&kv(&[SLIDING, GLOBAL], &[0, 0])),
+            "a layer's class"
+        );
+        assert!(!two.same_pool(&kv(&[SLIDING], &[0])), "the layer count");
+        let one = kv(&[SLIDING], &[0]);
+        for other in [
+            KvTape { kv_heads: 4, ..one },
+            KvTape {
+                head_dim: 512,
+                ..one
+            },
+            KvTape {
+                block_size: 16,
+                ..one
+            },
+            KvTape {
+                max_blocks_per_seq: 64,
+                ..one
+            },
+            KvTape {
+                layers: &[7],
+                ..one
+            },
+        ] {
+            assert!(!one.same_pool(&other), "{other:?}");
+        }
+    }
+
+    fn extents(reads: [Option<ArenaSpan>; 4], writes: ArenaSpan, in_place: bool) -> StepExtents {
+        StepExtents {
+            reads,
+            writes,
+            second_write: None,
+            weight: None,
+            kv: None,
+            gdn: None,
+            in_place,
+        }
+    }
+
+    const fn s(offset: u64, bytes: u64) -> ArenaSpan {
+        ArenaSpan {
+            offset: ArenaOffset(offset),
+            bytes,
+        }
+    }
+
+    /// The in-place exemption is read 0's exact span only: an in-place step with two reads whose
+    /// write equals read 0 and also overlaps read 1 is refused at read 1; whose write equals read
+    /// 1 (not read 0) is refused; and an exact out == read 0 with no other overlap passes.
+    #[test]
+    fn only_the_exact_read_0_overlap_of_an_in_place_step_is_exempt() {
+        let (x, w) = (s(0, 512), s(256, 512));
+        // Write == read 0, read 1 overlapping it.
+        let e = extents([Some(x), Some(s(256, 512)), None, None], x, true);
+        assert_eq!(write_clash(&e), Some((x, s(256, 512))));
+        // Write == read 1 exactly, read 0 elsewhere.
+        let e = extents([Some(s(1024, 512)), Some(w), None, None], w, true);
+        assert_eq!(write_clash(&e), Some((w, w)));
+        // Write == read 0, read 1 apart: exempt.
+        let e = extents([Some(x), Some(s(1024, 512)), None, None], x, true);
+        assert_eq!(write_clash(&e), None);
+        // The same exact overlap on a step that is not in place.
+        let e = extents([Some(x), None, None, None], x, false);
+        assert_eq!(write_clash(&e), Some((x, x)));
     }
 }

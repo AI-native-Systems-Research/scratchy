@@ -5,6 +5,13 @@
 // rounded once to bf16 (round-to-nearest-even) per output. `gain_offset` is the gain convention's
 // (`GainConvention::offset`: 0 for Llama's gain, 1 for qwen3.5's zero-centred one).
 //
+// The kernel is `template <bool UNIT>`. `rms_norm_bf16_ker<false>` is the norm above. Under `UNIT`
+// (`scratchy_cuda_rms_norm_unit_bf16`, Gemma's `v_norm`, Metal's `rmsnorm_unit_impl`) there is no
+// gain: `y = x · inv`, the gain vector neither loaded nor multiplied (its TMA load and
+// `warp::mul_col` are compiled out). Everything else, the two passes, the fixed reduction order
+// and `rms_inv`, is the same code, so the unit norm gives the bits of `<false>` with a gain of
+// all ones and offset 0 (a multiply by exactly 1.0 in f32 changes nothing).
+//
 // ThunderKittens' 16-row tile (PLAN-tk100 §2 S2, §3.3): one CTA per block of 16 rows, one
 // warpgroup of 4 warps. Warp `w` takes the 256-column tiles `w, w + 4, …` of the block, in two
 // passes over `x`, each tile TMA-loaded by the warp's lane 0 into a plain `st_bf<16, 256, false>`
@@ -88,6 +95,7 @@ constexpr size_t SMEM_USED =
 constexpr int RMS_SMEM_BYTES = int(SMEM_USED) + 1024;
 static_assert(RMS_SMEM_BYTES <= kittens::MAX_SHARED_MEMORY, "fits the H100's 227 KiB");
 
+template <bool UNIT>
 __global__ __launch_bounds__(NUM_THREADS, 1) void rms_norm_bf16_ker(
     const __grid_constant__ rms_globals g) {
     extern __shared__ int __shm[];
@@ -110,7 +118,7 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rms_norm_bf16_ker(
     __syncwarp();
     auto issue = [&](int i) {
         const int stage = i % STAGES, t = w + (i % mine) * WARPS;
-        const bool second = i >= mine;
+        const bool second = !UNIT && i >= mine;
         coord<tile> at = {0, 0, row_block, t};
         warp::tma::expect_bytes(arrived[w][stage], sizeof(tile) + (second ? sizeof(gain_vec) : 0));
         warp::tma::load_async(x_smem[w][stage], g.x, at, arrived[w][stage]);
@@ -163,12 +171,14 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rms_norm_bf16_ker(
         }
         wait(arrived[w][stage], (i / STAGES) % 2);
         acc_tile x;
-        col_values gain;
         warp::load(x, x_smem[w][stage]);
-        warp::load(gain, g_smem[w][stage]);
-        warp::add(gain, gain, g.gain_offset);
         warp::mul_row(x, x, inv);
-        warp::mul_col(x, x, gain);
+        if constexpr (!UNIT) {
+            col_values gain;
+            warp::load(gain, g_smem[w][stage]);
+            warp::add(gain, gain, g.gain_offset);
+            warp::mul_col(x, x, gain);
+        }
         warp::store(x_smem[w][stage], x);
         __syncwarp();
         coord<tile> at = {0, 0, row_block, t};
@@ -177,16 +187,43 @@ __global__ __launch_bounds__(NUM_THREADS, 1) void rms_norm_bf16_ker(
     warp::tma::store_async_wait();
 }
 
+// Build the views and launch `rms_norm_bf16_ker<UNIT>`. Can throw (a tensor-map encode); the
+// caller catches. `gain` is never read under `UNIT`, but its view is still built.
+template <bool UNIT>
+int launch(const void* x, const void* gain, void* y, uint32_t rows, uint32_t cols, float eps,
+           float gain_offset, cudaStream_t stream) {
+    bf16* xp = static_cast<bf16*>(const_cast<void*>(x));
+    bf16* gp = static_cast<bf16*>(const_cast<void*>(gain));
+    bf16* yp = static_cast<bf16*>(y);
+    // Building each `gl` encodes its tensor map into host memory; nothing is allocated on the
+    // device. Every row stride is `2·cols` bytes, a multiple of 16.
+    x_gl xg{xp, nullptr, nullptr, size_t(rows), size_t(cols)};
+    g_gl gg{gp, nullptr, nullptr, nullptr, size_t(cols)};
+    x_gl yg{yp, nullptr, nullptr, size_t(rows), size_t(cols)};
+    const int col_tiles = int((cols + uint32_t(COLS) - 1) / uint32_t(COLS));
+    rms_globals G{xg, gg, yg, col_tiles, float(cols), eps, gain_offset};
+    void* args[] = {&G};
+    const dim3 grid((rows + uint32_t(ROWS) - 1) / uint32_t(ROWS)), block(NUM_THREADS);
+    return static_cast<int>(
+        cudaLaunchKernel(rms_norm_bf16_ker<UNIT>, grid, block, args, RMS_SMEM_BYTES, stream));
+}
+
 }  // namespace
 
-// The kernel's one-time setup: allow it `RMS_SMEM_BYTES` of dynamic shared memory on the current
-// device (the default limit is 48 KB). Run once per device before any launch
+// The kernel's one-time setup: allow both instantiations `RMS_SMEM_BYTES` of dynamic shared memory
+// on the current device (the default limit is 48 KB). Run once per device before any launch
 // (`kernels::prepare_all`, called by `CudaDevice::open`), never per launch.
 //
-// 0 = done; any other value = the cudaError_t of setting the attribute.
+// 0 = done; any other value = the first cudaError_t of setting the attribute.
 extern "C" int scratchy_cuda_rms_norm_bf16_prepare(void) {
-    return static_cast<int>(cudaFuncSetAttribute(
-        rms_norm_bf16_ker, cudaFuncAttributeMaxDynamicSharedMemorySize, RMS_SMEM_BYTES));
+    for (auto ker : {rms_norm_bf16_ker<false>, rms_norm_bf16_ker<true>}) {
+        const cudaError_t e =
+            cudaFuncSetAttribute(ker, cudaFuncAttributeMaxDynamicSharedMemorySize, RMS_SMEM_BYTES);
+        if (e != cudaSuccess) {
+            return static_cast<int>(e);
+        }
+    }
+    return 0;
 }
 
 // 0 = launched; SCRATCHY_CUDA_ERR_SHAPE = shape refused, nothing launched;
@@ -208,21 +245,29 @@ extern "C" int scratchy_cuda_rms_norm_bf16(const void* x, const void* gain, void
     }
     // ThunderKittens' host code can throw; an exception must never unwind into Rust.
     try {
-        bf16* xp = static_cast<bf16*>(const_cast<void*>(x));
-        bf16* gp = static_cast<bf16*>(const_cast<void*>(gain));
-        bf16* yp = static_cast<bf16*>(y);
-        // Building each `gl` encodes its tensor map into host memory; nothing is allocated on
-        // the device. Every row stride is `2·cols` bytes, a multiple of 16.
-        x_gl xg{xp, nullptr, nullptr, size_t(rows), size_t(cols)};
-        g_gl gg{gp, nullptr, nullptr, nullptr, size_t(cols)};
-        x_gl yg{yp, nullptr, nullptr, size_t(rows), size_t(cols)};
-        const int col_tiles = int((cols + uint32_t(COLS) - 1) / uint32_t(COLS));
-        rms_globals G{xg, gg, yg, col_tiles, float(cols), eps, gain_offset};
-        void* args[] = {&G};
-        const dim3 grid((rows + uint32_t(ROWS) - 1) / uint32_t(ROWS)), block(NUM_THREADS);
-        return static_cast<int>(cudaLaunchKernel(rms_norm_bf16_ker, grid, block, args,
-                                                 RMS_SMEM_BYTES,
-                                                 static_cast<cudaStream_t>(stream)));
+        return launch<false>(x, gain, y, rows, cols, eps, gain_offset,
+                             static_cast<cudaStream_t>(stream));
+    } catch (...) {
+        return SCRATCHY_CUDA_ERR_HOST;
+    }
+}
+
+// `y = x / sqrt(mean(x²) + eps)`: the norm with no gain (`rms_norm_bf16_ker<true>`). Return codes,
+// shape rule and setup as `scratchy_cuda_rms_norm_bf16`'s; `x` and `y` must be 16-byte-aligned
+// device pointers to `rows·cols` bf16, `y` not overlapping `x`.
+extern "C" int scratchy_cuda_rms_norm_unit_bf16(const void* x, void* y, uint32_t rows,
+                                                uint32_t cols, float eps,
+                                                void* stream /* cudaStream_t; null = default */) {
+    if (rows == 0 || cols == 0 || cols % VEC != 0 ||
+        uint64_t(rows) * uint64_t(cols) > uint64_t(INT_MAX)) {
+        return SCRATCHY_CUDA_ERR_SHAPE;
+    }
+    // ThunderKittens' host code can throw; an exception must never unwind into Rust.
+    try {
+        // The gain view still encodes a tensor map, so it is given `x`, a valid 16-byte-aligned
+        // address of at least `cols` bf16; `<true>` never reads it.
+        return launch<true>(x, x, y, rows, cols, eps, 0.0f,
+                            static_cast<cudaStream_t>(stream));
     } catch (...) {
         return SCRATCHY_CUDA_ERR_HOST;
     }

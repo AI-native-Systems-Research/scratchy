@@ -9,6 +9,7 @@ mod common {
     pub mod attn_layer;
     pub mod chains;
     pub mod gdn_layer;
+    pub mod gemma_moe;
     pub mod mlp;
 }
 
@@ -18,6 +19,7 @@ use common::attn_gate::{ATTN_GATE_M128, ATTN_GATE_M256, attn_gate, attn_gate_inp
 use common::attn_layer::{
     ATTN_LAYER_M128, ATTN_LAYER_M256, LAYER, PREFIX_CAPACITY, attn_layer, attn_layer_input,
 };
+use common::chains::GEMMA4_FACTS;
 use common::chains::{
     QWEN3_5_FACTS, QWEN3_5_GDN_FACTS, THREE_GEMM_M256, TWO_GEMM_M128, TWO_GEMM_M256,
     assert_tape_is_lowered, assert_tape_is_lowered_with, chain_input, three_gemm, two_gemm,
@@ -2155,6 +2157,7 @@ fn a_gdn_op_is_checked_against_the_scratchs_geometry_not_its_bytes() {
             tokens: Some(256),
             offsets: Ok(&c.colour_offsets),
             rotary: None,
+            rotary_local: None,
             kv: Ok(None),
             kv_regions: None,
             gdn_layers: &[0],
@@ -2182,5 +2185,670 @@ fn a_gdn_op_is_checked_against_the_scratchs_geometry_not_its_bytes() {
     assert!(
         matches!(other, Err(CanonicalRefusal::GdnPool { step: 5 })),
         "{other:?}"
+    );
+}
+
+// ── The 64-column GEMM (Gemma 4) ───────────────────────────────────
+
+/// The one GEMM step `chain_input(m, k, &[n])` lowers to under `facts`.
+fn one_gemm(m: u32, k: u32, n: u32, facts: CudaModelFacts) -> CudaStep {
+    let c = lower_with(&with_hidden(chain_input(m, k, &[n])), facts)
+        .unwrap_or_else(|e| panic!("m={m} k={k} n={n}: {e}"));
+    let [step] = c.steps.as_slice() else {
+        panic!("expected one step, got {:?}", c.steps);
+    };
+    *step
+}
+
+/// Under Gemma 4's facts, Gemma's router (128), expert (704) and dense MLP (2112) widths, each a
+/// multiple of 64 and not of 256, lower to the 64-column GEMM at m = 256 (#885).
+#[test]
+fn a_gemma_gemm_off_the_256_tile_lowers_to_the_64_column_gemm() {
+    for n in [128, 704, 2112] {
+        let step = one_gemm(256, 2816, n, GEMMA4_FACTS);
+        let CudaStep::GemmCol64(g) = step else {
+            panic!("n = {n}: expected GemmCol64, got {step:?}");
+        };
+        assert_eq!((g.m, g.n, g.k), (256, n, 2816), "n = {n}");
+    }
+}
+
+/// Under Gemma 4's facts, an `n` that is a multiple of 64 and not of 256 but whose `k` is off the
+/// 64-column GEMM's 64 is refused under its own rule, naming the 64-column GEMM; an `n` off 64
+/// (200) or a multiple of 32 only (96) keeps today's tiled refusal, since it is not the 64-column
+/// GEMM's.
+#[test]
+fn a_gemma_gemm_off_the_64_column_tile_is_refused_by_its_rule() {
+    let e = refused_with(
+        &with_hidden(chain_input(256, 100, &[128])),
+        GEMMA4_FACTS,
+        &["k = 100", "multiple of 64 (the 64-column GEMM)"],
+    );
+    assert!(matches!(
+        e,
+        CanonicalRefusal::GemmShape {
+            step: 0,
+            k: 100,
+            rule: GemmShapeRule::Col64OffTile {
+                dim: "k",
+                value: 100,
+                tile: 64
+            },
+            ..
+        }
+    ));
+    let e = refused_with(
+        &with_hidden(chain_input(192, 1024, &[128])),
+        GEMMA4_FACTS,
+        &["m = 192", "multiple of 128 (the 64-column GEMM)"],
+    );
+    assert!(matches!(
+        e,
+        CanonicalRefusal::GemmShape {
+            rule: GemmShapeRule::Col64OffTile {
+                dim: "m",
+                value: 192,
+                tile: 128
+            },
+            ..
+        }
+    ));
+    for n in [200, 96] {
+        let e = refused_with(
+            &with_hidden(chain_input(256, 1024, &[n])),
+            GEMMA4_FACTS,
+            &[&format!("n = {n}"), "multiple of 256"],
+        );
+        assert!(
+            matches!(
+                e,
+                CanonicalRefusal::GemmShape {
+                    rule: GemmShapeRule::OffTile { dim: "n", .. },
+                    ..
+                }
+            ),
+            "n = {n}: {e:?}"
+        );
+    }
+}
+
+/// Under Gemma 4's facts the 64-column GEMM takes only m ≥ 2: one row is still the GEMV, and an
+/// `n` that is a multiple of 256 is still the tiled GEMM.
+#[test]
+fn a_gemma_gemm_of_one_row_or_on_the_256_tile_keeps_its_kernel() {
+    let step = one_gemm(1, 2816, 128, GEMMA4_FACTS);
+    assert!(matches!(step, CudaStep::Gemv(_)), "{step:?}");
+    let step = one_gemm(256, 2816, 1024, GEMMA4_FACTS);
+    assert!(matches!(step, CudaStep::Gemm(_)), "{step:?}");
+}
+
+/// The 64-column GEMM is Gemma 4's alone: under Qwen's facts, n = 128 is still refused as off the
+/// 256-column tile, beside the Gemma fixture that lowers it.
+#[test]
+fn the_64_column_gemm_is_off_under_qwen_facts() {
+    let l = with_hidden(chain_input(256, 1024, &[128]));
+    let e = refused_with(&l, QWEN3_5_FACTS, &["n = 128", "multiple of 256"]);
+    assert!(matches!(
+        e,
+        CanonicalRefusal::GemmShape {
+            n: 128,
+            rule: GemmShapeRule::OffTile { dim: "n", .. },
+            ..
+        }
+    ));
+    let step = one_gemm(256, 1024, 128, GEMMA4_FACTS);
+    assert!(matches!(step, CudaStep::GemmCol64(_)), "{step:?}");
+}
+
+// ── Gemma 4's MoE block ─────────────────────────────────────────────
+
+use common::gemma_moe::{GEMMA_MOE_FACTS, gemma_moe, gemma_moe_input};
+use scratchy_target_cuda::step::{MoeWeight, RouteProgram};
+use scratchy_target_cuda_compiler::canonical::MoeShapeRule;
+
+/// The Gemma block lowers at one row (gathered: no sort, expert GEMVs) and at 512 (sorted: the
+/// expert GEMM on 64-column tiles): the router norm writes the scratch's router-norm rows, the
+/// router reads them and its own projection, the routing runs Gemma's program with the
+/// per-expert scale, the activation is the GeGLU, and every expert step reads the bank.
+#[test]
+fn a_gemma_moe_block_lowers_in_both_modes() {
+    for m in [1, 512] {
+        let c = lower_with(&gemma_moe(m), GEMMA_MOE_FACTS).unwrap_or_else(|e| panic!("m={m}: {e}"));
+        let moe = c.moe.expect("the block has a MoE scratch");
+        let rows = moe.router_norm.expect("Gemma's router norm has its rows");
+        assert_eq!(
+            rows.bytes,
+            u64::from(m) * 256 * 2,
+            "m={m}: [m, hidden] bf16"
+        );
+        let (mut norms, mut routes, mut gelus, mut experts) = (0, 0, 0, 0);
+        for step in &c.steps {
+            match *step {
+                CudaStep::RouterNorm(n) => {
+                    norms += 1;
+                    assert_eq!(n.y, rows.offset, "m={m}: the norm writes its rows");
+                    assert_eq!(n.gain, WeightIx(1), "the router scale");
+                }
+                CudaStep::RouterLogits(r) => {
+                    assert_eq!(r.x, rows.offset, "m={m}: the router reads the norm's rows");
+                    assert_eq!((r.weight, r.bundle), (MoeWeight::Own, WeightIx(2)));
+                }
+                CudaStep::MoeRoute(r) => {
+                    routes += 1;
+                    let scale = (256f32).powf(-0.5).to_bits();
+                    assert_eq!(
+                        r.program,
+                        RouteProgram::GemmaScaledSoftmax { scale_bits: scale }
+                    );
+                    assert_eq!((r.renorm, r.expert_scale), (false, Some(WeightIx(3))));
+                }
+                CudaStep::GeluMul(_) => gelus += 1,
+                CudaStep::ExpertGemv(g) => {
+                    experts += 1;
+                    assert_eq!(g.weight, MoeWeight::Own, "m={m}");
+                }
+                CudaStep::ExpertGemm(g) => {
+                    experts += 1;
+                    // The gate and up (n = 128) take 64-column tiles; the down (n = 256) the 256.
+                    let tile = if g.n_k().0.is_multiple_of(256) {
+                        256
+                    } else {
+                        64
+                    };
+                    assert_eq!((g.weight, g.n_tile), (MoeWeight::Own, tile), "m={m}");
+                }
+                CudaStep::SiluMul(_) => panic!("m={m}: a SiLU in a GeGLU block"),
+                _ => {}
+            }
+        }
+        assert_eq!((norms, routes, gelus, experts), (1, 1, 1, 3), "m={m}");
+        let sorts = (c.steps.iter()).filter(|s| matches!(s, CudaStep::ExpertSort(_)));
+        assert_eq!(
+            sorts.count(),
+            usize::from(m > 1),
+            "m={m}: sorted from 64 pairs"
+        );
+    }
+}
+
+/// The expert counts are `op_abi::MOE_EXPERT_COUNTS`: 64 is refused, naming both counts.
+#[test]
+fn a_gemma_moe_of_another_expert_count_is_refused() {
+    let mut l = gemma_moe(512);
+    let nz = |n| std::num::NonZeroU32::new(n).expect("non-zero");
+    for op in &mut l.input.ops {
+        match &mut op.op {
+            SubOp::RouterLogits { experts, .. } | SubOp::ExpertSort { experts, .. } => {
+                *experts = scratchy_subtile::subtile_ir::NumExperts::new(nz(64));
+            }
+            _ => {}
+        }
+    }
+    l.input.sources[2].cols = 64;
+    l.input.sources[3].cols = 64;
+    let e = refused_with(&l, GEMMA_MOE_FACTS, &["64 experts", "[128, 256]"]);
+    assert!(
+        matches!(
+            e,
+            CanonicalRefusal::MoeShape {
+                rule: MoeShapeRule::Experts { experts: 64, .. },
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// The expert activation is SiLU or GELU; any other is refused by name.
+#[test]
+fn a_gemma_moe_of_another_activation_is_refused() {
+    let mut l = gemma_moe(512);
+    l.input.ops[11].op = SubOp::ExpertGatedAct {
+        act: scratchy_subtile::subtile_ir::GatedAct::SwigluOai,
+    };
+    let e = refused_with(
+        &l,
+        GEMMA_MOE_FACTS,
+        &["ExpertGatedAct", "neither SiLU nor GELU"],
+    );
+    assert!(
+        matches!(
+            e,
+            CanonicalRefusal::MoeShape {
+                op: "ExpertGatedAct",
+                rule: MoeShapeRule::Activation,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// Gemma's routing is the fold of the scale, the softmax and the per-expert scale: without its
+/// per-expert scale the fold's tail is neither program, and the scale it left is refused as a
+/// routing; a scale that is not finite is refused naming it.
+#[test]
+fn a_gemma_routing_off_its_program_is_refused() {
+    let mut input = gemma_moe_input(512);
+    // The combine reads the softmax: the per-expert scale is left out of the chain.
+    input.ops[14].inputs[1] = InputRef::Op(6);
+    let mut l = gemma_moe(512);
+    l.input = input;
+    let e = refused_with(&l, GEMMA_MOE_FACTS, &["MoE op"]);
+    assert!(
+        matches!(
+            e,
+            CanonicalRefusal::MoeShape {
+                rule: MoeShapeRule::Routing,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    let mut l = gemma_moe(512);
+    l.input.ops[5].op = SubOp::RouteScale {
+        scale: f32::INFINITY,
+    };
+    let e = refused_with(&l, GEMMA_MOE_FACTS, &["RouteScale", "inf"]);
+    assert!(
+        matches!(
+            e,
+            CanonicalRefusal::Scalar {
+                op: "RouteScale",
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// Only Gemma's router has a pre-norm: a router norm of another router is refused as its bundle.
+#[test]
+fn a_router_norm_of_another_router_is_refused() {
+    let mut l = gemma_moe(512);
+    l.input.ops[0].op = SubOp::RouterNorm {
+        eps: 1e-6,
+        router: scratchy_subtile::subtile_ir::RouterBundle::SharedFused,
+    };
+    let e = refused_with(&l, GEMMA_MOE_FACTS, &["RouterNorm"]);
+    assert!(
+        matches!(
+            e,
+            CanonicalRefusal::MoeShape {
+                op: "RouterNorm",
+                rule: MoeShapeRule::Bundle,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// Under Qwen's facts the Gemma block's 128-expert router GEMM is off the 256-column tile, so the
+/// block is refused at its router, before any expert step.
+#[test]
+fn a_gemma_moe_under_qwen_facts_is_off_the_256_tile() {
+    let e = refused_with(
+        &gemma_moe(512),
+        QWEN3_5_FACTS,
+        &["n = 128", "multiple of 256"],
+    );
+    assert!(
+        matches!(
+            e,
+            CanonicalRefusal::GemmShape {
+                step: 1,
+                n: 128,
+                rule: GemmShapeRule::OffTile { dim: "n", .. },
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+// ── Gemma 4's two attention classes ────────────────────────────────
+
+use scratchy_subtile::handoff::RopePairing;
+use scratchy_target_cuda_compiler::canonical::{CudaAttnClass, CudaAttnClasses};
+
+/// [`attn_layer`]'s layer as Gemma's base (sliding) class of a two-class model: 2 kv heads of
+/// 256, rotated in full (`rot_dim` 64 here, the fixture's), theta 1e4, a `window` of keys; the
+/// global class one kv head of 512 with no window.
+fn two_class_facts(window: Option<u32>) -> CudaModelFacts {
+    CudaModelFacts {
+        classes: Some(CudaAttnClasses {
+            base: CudaAttnClass {
+                head_dim: 256,
+                kv_heads: 2,
+                rot_dim: 64,
+                rope_theta: 1e4,
+                pairing: RopePairing::HalfRotated,
+                window,
+            },
+            global: CudaAttnClass {
+                head_dim: 512,
+                kv_heads: 1,
+                rot_dim: 128,
+                rope_theta: 1e6,
+                pairing: RopePairing::HalfHead,
+                window: None,
+            },
+        }),
+        ..GEMMA4_FACTS
+    }
+}
+
+/// [`attn_layer`] with its ropes reading the local table and its append and attention masked to
+/// the last `window` keys: a sliding layer.
+fn sliding_layer(m: u32, window: u32) -> LoweredDecode {
+    let mut l = attn_layer(m);
+    for (ix, binding) in [
+        (7, SourceBinding::Cos { local: true }),
+        (8, SourceBinding::Sin { local: true }),
+        (9, SourceBinding::Cos { local: true }),
+        (10, SourceBinding::Sin { local: true }),
+    ] {
+        l.bindings[ix] = binding;
+    }
+    let mask = AttnMask::SlidingWindow {
+        window: NonZeroU32::new(window).expect("a window"),
+    };
+    l.input.ops[12].op = rope_append_op(256, LAYER, mask, RopeFormTag::NeoX);
+    l.input.ops[13].op = SubOp::attn_decode(geom(8, 2, 256), 0.0625, PREFIX_CAPACITY, mask);
+    l
+}
+
+/// A sliding layer of a two-class model lowers: its ropes read the local table (the global one
+/// is not bound, so the canonical has only the local), its attention carries the window, and its
+/// KV layer is class 0, the window's.
+#[test]
+fn a_sliding_layer_lowers_with_its_class() {
+    for m in [1, 256] {
+        let l = sliding_layer(m, 1024);
+        let c = lower_with(&l, two_class_facts(Some(1024))).unwrap_or_else(|e| panic!("{e}"));
+        let local = c.rotary_local.expect("the local table");
+        assert!(c.rotary.is_none(), "m={m}: the global table is not bound");
+        assert_eq!((local.rot_dim, local.theta()), (64, 1e4), "m={m}");
+        let kv = c.kv.as_ref().expect("a KV pool");
+        assert_eq!(kv.layer_class, [0], "m={m}");
+        assert_eq!(kv.classes[0].window, Some(1024), "m={m}");
+        for step in &c.steps {
+            match *step {
+                CudaStep::Rope(r) => assert_eq!(r.table, local.span.offset, "m={m}"),
+                CudaStep::RopeAppend(r) => assert_eq!(r.table, local.span.offset, "m={m}"),
+                CudaStep::AttnPrefill(a) | CudaStep::AttnDecode(a) => {
+                    assert_eq!(a.window, Some(1024), "m={m}")
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A window no class has is refused as a sliding window; a class window off the KV block is
+/// refused naming the block.
+#[test]
+fn a_sliding_layer_off_its_class_is_refused() {
+    let l = sliding_layer(256, 512);
+    let e = refused_with(&l, two_class_facts(Some(1024)), &["sliding-window"]);
+    assert!(
+        matches!(e, CanonicalRefusal::SlidingWindow { step: 12, .. }),
+        "{e:?}"
+    );
+    let l = sliding_layer(256, 1000);
+    let e = refused_with(&l, two_class_facts(Some(1000)), &["1000 keys", "64"]);
+    assert!(
+        matches!(
+            e,
+            CanonicalRefusal::AttnShape {
+                rule: AttnShapeRule::WindowOffBlock {
+                    window: 1000,
+                    multiple: 64
+                },
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// The global class's head dim and kv heads are the cache's: a causal layer of the 256-wide base
+/// geometry reads as the global class (512) and is refused naming its head dim.
+#[test]
+fn a_global_layer_of_another_head_dim_is_refused() {
+    let e = refused_with(
+        &attn_layer(256),
+        two_class_facts(Some(1024)),
+        &["head_dim = 256", "512"],
+    );
+    assert!(
+        matches!(
+            e,
+            CanonicalRefusal::KvHeadDim {
+                head_dim: 256,
+                want: 512,
+                ..
+            } | CanonicalRefusal::KvCache(_)
+        ),
+        "{e:?}"
+    );
+}
+
+// ── Gemma 4's expert bank in the weight table (#885's amendment) ────
+
+/// [`gemma_moe`] at m = 512 as the macro hands it over: arch `gemma4-moe`, a 256-row embedding
+/// table, and each bundle tensor named in full. The down source is a tensor of bundle `down_bank`,
+/// whose names are `down_names`; the router and the gate and up are bundle `BANK`'s.
+fn gemma_moe_model(
+    down_bank: u32,
+    down_names: (&str, &str),
+) -> scratchy_subtile::handoff::TargetModelInput {
+    use common::gemma_moe::{BANK, LAYER, ROUTER};
+    use scratchy_subtile::handoff::{
+        BundleTensor as T, TargetBucket, TargetModelFacts, TargetModelInput, TargetPoint,
+    };
+    let mut lowered = gemma_moe(512);
+    let index = Some(UnrollIndex(LAYER));
+    lowered.bindings[6] = SourceBinding::BundleTensor {
+        id: down_bank,
+        index,
+        tensor: T::ExpertDownW,
+    };
+    let name = |id, tensor, n: &str| (id, index, tensor, n.to_string());
+    let mut names = vec![
+        name(ROUTER, T::RouterScale, "m.layers.0.router.scale"),
+        name(ROUTER, T::RouterGate, "m.layers.0.router.proj.weight"),
+        name(
+            ROUTER,
+            T::RouterPerExpertScale,
+            "m.layers.0.router.per_expert_scale",
+        ),
+        name(BANK, T::ExpertGateW, "m.layers.0.experts.gate_up_proj"),
+        name(BANK, T::ExpertUpW, "m.layers.0.experts.gate_up_proj"),
+        name(BANK, T::ExpertDownW, "m.layers.0.experts.down_proj"),
+    ];
+    if down_bank != BANK {
+        names.push(name(down_bank, T::ExpertGateW, down_names.0));
+        names.push(name(down_bank, T::ExpertDownW, down_names.1));
+    }
+    TargetModelInput {
+        stem: "gemma_moe".to_string(),
+        arch: "gemma4-moe".to_string(),
+        buckets: vec![TargetBucket {
+            point: TargetPoint { m: 512, sk: 1 },
+            lowered,
+        }],
+        unlowered: Vec::new(),
+        facts: TargetModelFacts {
+            head_dim: 0,
+            rot_dim: 0,
+            rope_theta: None,
+            rms_norm_eps: 1e-6,
+            vocab_size: 256,
+            gdn: None,
+            dsl_shared_expert_bases: Vec::new(),
+            attn_classes: Vec::new(),
+        },
+        weight_prefixes: Vec::new(),
+        embed_prefix: Some("m.embed_tokens".to_string()),
+        bundle_tensor_names: names,
+    }
+}
+
+/// The gate, up and down sources of one bank are one expert bank: the table names it once, and
+/// the down's index reads the gate's buffer.
+#[test]
+fn a_gemma_expert_bank_is_one_buffer() {
+    use scratchy_target_cuda::weights::CudaWeight;
+    use scratchy_target_cuda_compiler::emit::lower_model;
+    let model = lower_model(&gemma_moe_model(common::gemma_moe::BANK, ("", "")))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let banks: Vec<_> = (model.weights.iter().enumerate())
+        .filter(|(_, w)| matches!(w, Some(CudaWeight::ExpertBank { .. })))
+        .map(|(ix, _)| ix)
+        .collect();
+    assert_eq!(banks, [4], "one bank, at the gate's index");
+}
+
+/// An expert bank whose three sources name different checkpoint tensors (the down a bank of the
+/// same fused gate and up but another down) cannot be one buffer: refused as `SharedTensor`,
+/// naming the fused tensor and both indices.
+#[test]
+fn an_expert_bank_naming_different_tensors_is_refused() {
+    use scratchy_target_cuda_compiler::emit::{ModelRefusal, lower_model};
+    let input = gemma_moe_model(
+        22,
+        (
+            "m.layers.0.experts.gate_up_proj",
+            "m.layers.1.experts.down_proj",
+        ),
+    );
+    let e = lower_model(&input).expect_err("refused");
+    assert!(
+        e.to_string().contains("m.layers.0.experts.gate_up_proj"),
+        "{e}"
+    );
+    assert!(
+        matches!(
+            e,
+            ModelRefusal::SharedTensor {
+                ix: 6,
+                first: 4,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+/// An affine bank (its gate binding an `ExpertGateS` scale as operand 3) is refused at its first
+/// expert matmul: CUDA's expert steps take dense bf16 only.
+#[test]
+fn an_affine_expert_bank_is_refused() {
+    use scratchy_subtile::handoff::BundleTensor;
+    use scratchy_subtile::lower::{ExpertQuant, ExpertWeight};
+    let mut l = gemma_moe(512);
+    l.input.sources.push(SourceShape {
+        rows: common::gemma_moe::EXPERTS * common::gemma_moe::I,
+        cols: 1,
+    });
+    l.bindings.push(SourceBinding::BundleTensor {
+        id: common::gemma_moe::BANK,
+        index: Some(UnrollIndex(common::gemma_moe::LAYER)),
+        tensor: BundleTensor::ExpertGateS,
+    });
+    let scale = l.input.sources.len() - 1;
+    let SubOp::ExpertMatmul { weight, .. } = &mut l.input.ops[9].op else {
+        panic!("op 9 is the gate matmul");
+    };
+    *weight = ExpertWeight::Affine(ExpertQuant::declared(64, 4));
+    l.input.ops[9].inputs.push(InputRef::Ext(scale));
+    let e = refused_with(&l, GEMMA_MOE_FACTS, &["ExpertMatmul", "affine"]);
+    assert!(
+        matches!(
+            e,
+            CanonicalRefusal::MoeShape {
+                step: 9,
+                rule: MoeShapeRule::Affine,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+// ── Gemma 4's v_norm, per KV head (#921) ───────────────────────────
+
+/// Gemma 4 26B-A4B's two classes as its v_norm sees them: sliding 8 kv heads of 256, global 2 of
+/// 512.
+fn gemma_vnorm_facts() -> CudaModelFacts {
+    let class = |head_dim, kv_heads| CudaAttnClass {
+        head_dim,
+        kv_heads,
+        rot_dim: 64,
+        rope_theta: 1e4,
+        pairing: RopePairing::HalfRotated,
+        window: None,
+    };
+    CudaModelFacts {
+        classes: Some(CudaAttnClasses {
+            base: class(256, 8),
+            global: class(512, 2),
+        }),
+        ..GEMMA4_FACTS
+    }
+}
+
+/// `y = RmsNormUnit(x)` over `x [m, cols]`, the embedded hidden.
+fn vnorm(m: u32, cols: u32) -> LoweredDecode {
+    with_hidden(LoweringInput {
+        exported: None,
+        sources: vec![SourceShape { rows: m, cols }],
+        ops: vec![OpDesc {
+            op: SubOp::RmsNormUnit { eps: 1e-6 },
+            m,
+            inputs: vec![InputRef::Ext(0)],
+        }],
+        result: 0,
+    })
+}
+
+/// The v_norm's `(rows, cols)` as lowered.
+fn vnorm_shape(l: &LoweredDecode, facts: CudaModelFacts) -> (u32, u32) {
+    let at = CanonicalAt {
+        stem: "vnorm",
+        m: 1,
+    };
+    let c = lower_canonical(l, facts, at).unwrap_or_else(|e| panic!("the v_norm lowers: {e}"));
+    match static_tape(&c).steps {
+        [CudaStep::RmsNormUnit(n)] => (n.rows, n.cols),
+        other => panic!("one RmsNormUnit step: {other:?}"),
+    }
+}
+
+/// HF's `v_norm` is one RMS per KV head (`RMSNormNoScale(head_dim)`), as Metal's
+/// (`RmsNormUnitImpl::fan_out`) and the repo's reference (`golden_gen_carrier.py`'s
+/// `rmsnorm_unit`). A row that is one class's `kv_heads · head_dim` lowers to one launch row per
+/// head: Gemma's sliding `[m, 8 · 256]` to `(8m, 256)`, a global `[m, 2 · 512]` to `(2m, 512)`.
+/// A row already one head wide, or of a uniform model (no classes), stays whole.
+#[test]
+fn a_gemma_v_norm_lowers_one_row_per_kv_head() {
+    let facts = gemma_vnorm_facts();
+    for (m, cols, want) in [
+        (1, 2048, (8, 256)),
+        (512, 2048, (4096, 256)),
+        (1, 1024, (2, 512)),
+        (512, 1024, (1024, 512)),
+        (1024, 512, (1024, 512)),
+        (8, 256, (8, 256)),
+    ] {
+        let got = vnorm_shape(&vnorm(m, cols), facts);
+        assert_eq!(got, want, "a [{m}, {cols}] v_norm");
+    }
+    assert_eq!(
+        vnorm_shape(&vnorm(4, 2048), GEMMA4_FACTS),
+        (4, 2048),
+        "a uniform model's unit norm stays whole"
     );
 }

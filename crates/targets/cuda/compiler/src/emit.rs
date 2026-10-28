@@ -44,18 +44,21 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use scratchy_const_tokens::{ModuleRow, ModuleTable, const_tokens};
 use scratchy_subtile::handoff::{
-    SourceBinding, TargetModelFacts, TargetModelInput, TargetPoint, UnrollIndex,
+    BundleTensor, SourceBinding, TargetAttnClass, TargetModelFacts, TargetModelInput, TargetPoint,
+    UnrollIndex,
 };
+use scratchy_target_cuda::op_abi::CUDA_GEMM_COL64_ARCHS;
 use scratchy_target_cuda::step::{
-    CudaStep, EmbedBf16, ExpertGemmBf16, ExpertGemvBf16, GatedDeltaNetBf16, GemmBf16, RmsNormBf16,
-    RouterLogitsBf16, gdn_conv_dim,
+    CudaStep, EmbedBf16, ExpertGemmBf16, ExpertGemvBf16, GatedDeltaNetBf16, GemmBf16,
+    LayerScaleBf16, MoeRouteBf16, MoeWeight, RmsNormBf16, RouterLogitsBf16, gdn_conv_dim,
 };
 use scratchy_target_cuda::tape::{ArenaLayout, CudaTape, GdnTape, KvTape, TapeError, WeightIx};
 use scratchy_target_cuda::weights::CudaWeight;
 
 use crate::canonical::{
-    CanonicalAt, CanonicalGdn, CanonicalKv, CanonicalRefusal, CudaCanonical, CudaEmbedFacts,
-    CudaGdnFacts, CudaModelFacts, GemmShapeRule, SharedExpertOwner, lower_canonical,
+    CanonicalAt, CanonicalGdn, CanonicalKv, CanonicalRefusal, CudaAttnClass, CudaAttnClasses,
+    CudaCanonical, CudaEmbedFacts, CudaGdnFacts, CudaModelFacts, GemmColTile, GemmShapeRule,
+    SharedExpertOwner, lower_canonical,
 };
 
 /// The modules of the CUDA tape types, and the aliases the emitted tapes name them by: the one
@@ -74,6 +77,7 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "WeightIx",
                 "RotaryTable",
                 "KvTape",
+                "KvClass",
                 "GdnTape",
                 "MoeTape",
                 "MoeSortTape",
@@ -99,6 +103,7 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "RouterLogitsBf16",
                 "MatmulKernel",
                 "MoeRouteBf16",
+                "MoeWeight",
                 "ExpertSortBf16",
                 "ExpertGemmBf16",
                 "ExpertGemvBf16",
@@ -107,6 +112,12 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
                 "ExpertCombineBf16",
                 "GateScaleBf16",
                 "GainConvention",
+                "RopePairing",
+                "RouteProgram",
+                "ScaleBf16",
+                "RmsNormUnitBf16",
+                "LayerScaleBf16",
+                "SoftCapBf16",
             ],
         },
         ModuleRow {
@@ -123,7 +134,8 @@ pub const CUDA_MODULES: ModuleTable = ModuleTable {
 /// table is then refused ([`ModelRefusal::NoRopeTheta`]), and a tape with none reads no theta. A
 /// model's input is its token ids, embedded from a table of `vocab_size` rows; a config that
 /// declares none gets no embedding table here, and [`lower_model`] refuses it
-/// ([`ModelRefusal::NoVocab`]). The shared expert's owner is [`shared_expert_owner`]'s.
+/// ([`ModelRefusal::NoVocab`]). The shared expert's owner is [`shared_expert_owner`]'s. The GEMM
+/// column tile is the 256-column one here; [`lower_model`] sets the arch's ([`gemm_col_tile`]).
 pub fn model_facts(f: &TargetModelFacts) -> CudaModelFacts {
     CudaModelFacts {
         shared_expert: shared_expert_owner(f),
@@ -139,6 +151,27 @@ pub fn model_facts(f: &TargetModelFacts) -> CudaModelFacts {
             conv_kernel: g.conv_kernel,
             eps: f.rms_norm_eps,
         }),
+        classes: match f.attn_classes.as_slice() {
+            [base, global] => Some(CudaAttnClasses {
+                base: attn_class(base),
+                global: attn_class(global),
+            }),
+            _ => None,
+        },
+        gemm_col_tile: GemmColTile::Tile256Only,
+    }
+}
+
+/// One of the handoff's attention classes as CUDA's, its theta NaN when the config declares none
+/// (as [`model_facts`]' `rope_theta`).
+fn attn_class(c: &TargetAttnClass) -> CudaAttnClass {
+    CudaAttnClass {
+        head_dim: c.head_dim,
+        kv_heads: c.kv_heads,
+        rot_dim: c.rot_dim,
+        rope_theta: c.rope_theta.unwrap_or(f64::NAN),
+        pairing: c.pairing,
+        window: c.window.map(std::num::NonZeroU32::get),
     }
 }
 
@@ -151,6 +184,14 @@ pub fn shared_expert_owner(f: &TargetModelFacts) -> SharedExpertOwner {
     match f.dsl_shared_expert_bases.is_empty() {
         true => SharedExpertOwner::Undeclared,
         false => SharedExpertOwner::Dsl,
+    }
+}
+
+/// The column tiles `arch`'s GEMMs take: `op_abi::CUDA_GEMM_COL64_ARCHS` names it, or not.
+pub fn gemm_col_tile(arch: &str) -> GemmColTile {
+    match CUDA_GEMM_COL64_ARCHS.contains(&arch) {
+        true => GemmColTile::Col64,
+        false => GemmColTile::Tile256Only,
     }
 }
 
@@ -324,7 +365,10 @@ pub fn lower_model(input: &TargetModelInput) -> Result<CudaModel, ModelRefusal> 
     if input.facts.vocab_size == 0 {
         return Err(ModelRefusal::NoVocab);
     }
-    let facts = model_facts(&input.facts);
+    let facts = CudaModelFacts {
+        gemm_col_tile: gemm_col_tile(&input.arch),
+        ..model_facts(&input.facts)
+    };
     let mut by_m: BTreeMap<u32, Vec<(u32, Lowered)>> = BTreeMap::new();
     for b in &input.buckets {
         let at = CanonicalAt {
@@ -383,7 +427,8 @@ pub fn lower_model(input: &TargetModelInput) -> Result<CudaModel, ModelRefusal> 
                         bucket_m: tape.bucket_m,
                     });
                 }
-                if tape.rotary.is_some() && input.facts.rope_theta.is_none() {
+                let tables = tape.rotary.iter().chain(&tape.rotary_local);
+                if tables.into_iter().any(|t| t.theta().is_nan()) {
                     return Err(ModelRefusal::NoRopeTheta { m });
                 }
                 model.tapes.push(tape);
@@ -404,17 +449,22 @@ pub fn lower_model(input: &TargetModelInput) -> Result<CudaModel, ModelRefusal> 
 enum Role {
     /// One bf16 tensor of this shape.
     Bf16([u64; 2], usize),
+    /// One bf16 bare parameter of this shape: a tensor the checkpoint names by its prefix alone,
+    /// with no `.weight` leaf (Gemma's `layer_scalar`, an `nn.Parameter`).
+    Param([u64; 2], usize),
     /// One GDN layer's packed bundle of this geometry: `conv_dim`, `conv_kernel`, `nv`, `head_v`.
     Bundle([u32; 4]),
     /// One MoE layer's dense bundle of this geometry: `experts`, `hidden`, `inter`.
     MoeBundle([u32; 3]),
+    /// One Gemma layer's dense expert bank of this geometry: `experts`, `hidden`, `inter`.
+    ExpertBank([u32; 3]),
 }
 
 impl Role {
     fn shape(&self) -> &[u64] {
         match self {
-            Self::Bf16(dims, rank) => &dims[..*rank],
-            Self::Bundle(_) | Self::MoeBundle(_) => &[],
+            Self::Bf16(dims, rank) | Self::Param(dims, rank) => &dims[..*rank],
+            Self::Bundle(_) | Self::MoeBundle(_) | Self::ExpertBank(_) => &[],
         }
     }
 }
@@ -429,13 +479,21 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
             ..
         }) => Some((table, Role::Bf16([u64::from(vocab), u64::from(hidden)], 2))),
         CudaStep::Gemm(GemmBf16 { b, n, k, .. })
+        | CudaStep::GemmCol64(GemmBf16 { b, n, k, .. })
         | CudaStep::GemmNarrow(GemmBf16 { b, n, k, .. })
         | CudaStep::Gemv(GemmBf16 { b, n, k, .. }) => {
             Some((b, Role::Bf16([u64::from(n), u64::from(k)], 2)))
         }
-        CudaStep::RmsNorm(RmsNormBf16 { gain, cols, .. }) => {
+        CudaStep::RmsNorm(RmsNormBf16 { gain, cols, .. })
+        | CudaStep::RouterNorm(RmsNormBf16 { gain, cols, .. }) => {
             Some((gain, Role::Bf16([u64::from(cols), 0], 1)))
         }
+        CudaStep::LayerScale(LayerScaleBf16 { scale, .. }) => Some((scale, Role::Param([1, 0], 1))),
+        CudaStep::MoeRoute(MoeRouteBf16 {
+            expert_scale: Some(ix),
+            experts,
+            ..
+        }) => Some((ix, Role::Bf16([u64::from(experts), 0], 1))),
         CudaStep::GatedDeltaNet(GatedDeltaNetBf16 {
             bundle,
             num_k_heads,
@@ -456,6 +514,7 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         }
         CudaStep::RouterLogits(RouterLogitsBf16 {
             bundle,
+            weight: MoeWeight::Bundle,
             experts,
             hidden,
             inter,
@@ -463,6 +522,7 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         })
         | CudaStep::ExpertGemm(ExpertGemmBf16 {
             bundle,
+            weight: MoeWeight::Bundle,
             experts,
             hidden,
             inter,
@@ -470,11 +530,40 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         })
         | CudaStep::ExpertGemv(ExpertGemvBf16 {
             bundle,
+            weight: MoeWeight::Bundle,
             experts,
             hidden,
             inter,
             ..
         }) => Some((bundle, Role::MoeBundle([experts, hidden, inter]))),
+        // Gemma's router projection, one bf16 tensor.
+        CudaStep::RouterLogits(RouterLogitsBf16 {
+            bundle,
+            weight: MoeWeight::Own,
+            experts,
+            hidden,
+            ..
+        }) => Some((
+            bundle,
+            Role::Bf16([u64::from(experts), u64::from(hidden)], 2),
+        )),
+        // Gemma's expert bank: its gate, up and down sources name one bank.
+        CudaStep::ExpertGemm(ExpertGemmBf16 {
+            bundle,
+            weight: MoeWeight::Own,
+            experts,
+            hidden,
+            inter,
+            ..
+        })
+        | CudaStep::ExpertGemv(ExpertGemvBf16 {
+            bundle,
+            weight: MoeWeight::Own,
+            experts,
+            hidden,
+            inter,
+            ..
+        }) => Some((bundle, Role::ExpertBank([experts, hidden, inter]))),
         CudaStep::Add(_)
         | CudaStep::SiluMul(_)
         | CudaStep::Rope(_)
@@ -486,7 +575,11 @@ fn role(step: &CudaStep) -> Option<(WeightIx, Role)> {
         | CudaStep::MoeRoute(_)
         | CudaStep::ExpertSort(_)
         | CudaStep::ExpertCombine(_)
-        | CudaStep::GateScale(_) => None,
+        | CudaStep::GateScale(_)
+        | CudaStep::Scale(_)
+        | CudaStep::RmsNormUnit(_)
+        | CudaStep::GeluMul(_)
+        | CudaStep::SoftCap(_) => None,
     }
 }
 
@@ -559,6 +652,10 @@ pub fn weight_table(
     let prefixes: HashMap<(u32, Option<UnrollIndex>), &str> = (input.weight_prefixes.iter())
         .map(|(id, index, prefix)| ((*id, *index), prefix.as_str()))
         .collect();
+    let bundle_names: HashMap<(u32, Option<UnrollIndex>, BundleTensor), &str> =
+        (input.bundle_tensor_names.iter())
+            .map(|(id, index, tensor, name)| ((*id, *index, *tensor), name.as_str()))
+            .collect();
     let mut table: Vec<Option<CudaWeight>> = vec![None; n];
     for ix in 0..n {
         let Some(role) = roles[ix] else {
@@ -569,6 +666,31 @@ pub fn weight_table(
             continue;
         };
         let binding = &bindings[ix];
+        // A bundle tensor is named in full by the handoff, its leaf included.
+        if let SourceBinding::BundleTensor { id, index, tensor } = *binding {
+            let name = (bundle_names.get(&(id, index, tensor)).copied()).ok_or_else(|| {
+                ModelRefusal::NoPrefix {
+                    ix,
+                    binding: binding.clone(),
+                }
+            })?;
+            let entry = bundle_entry(role, name, input, (id, index)).ok_or_else(|| {
+                ModelRefusal::NoPrefix {
+                    ix,
+                    binding: binding.clone(),
+                }
+            })?;
+            let (packed, declared) = (entry.packed_bytes().unwrap_or(u64::MAX), declared(ix));
+            if packed != declared {
+                return Err(ModelRefusal::WeightBytes {
+                    ix,
+                    packed,
+                    declared,
+                });
+            }
+            table[ix] = Some(entry);
+            continue;
+        }
         let prefix = match *binding {
             SourceBinding::Weight { id, index } => prefixes.get(&(id, index)).copied(),
             SourceBinding::EmbeddedHidden => input.embed_prefix.as_deref(),
@@ -581,6 +703,10 @@ pub fn weight_table(
         let entry = match role {
             Role::Bf16(..) => CudaWeight::Bf16 {
                 tensor: baked_str(format!("{prefix}.weight")),
+                shape: baked(role.shape()),
+            },
+            Role::Param(..) => CudaWeight::Bf16 {
+                tensor: baked_str(prefix.to_string()),
                 shape: baked(role.shape()),
             },
             Role::Bundle([conv_dim, conv_kernel, nv, head_v]) => CudaWeight::GdnBundle {
@@ -601,6 +727,13 @@ pub fn weight_table(
                 hidden,
                 inter,
             },
+            // An expert bank is read only through bundle tensors, named above.
+            Role::ExpertBank(_) => {
+                return Err(ModelRefusal::NoPrefix {
+                    ix,
+                    binding: binding.clone(),
+                });
+            }
         };
         let (packed, declared) = (entry.packed_bytes().unwrap_or(u64::MAX), declared(ix));
         if packed != declared {
@@ -650,6 +783,37 @@ pub fn weight_table(
     Ok(table)
 }
 
+/// The entry of a bundle tensor read as `role`, named `name` (the handoff's full checkpoint name):
+/// a bf16 tensor, or (an expert step's) the expert bank whose `gate_up` and `down` are the
+/// bundle's `ExpertGateW` and `ExpertDownW` names. `None` when the bank's two names are not both
+/// in the handoff.
+fn bundle_entry(
+    role: Role,
+    name: &str,
+    input: &TargetModelInput,
+    (id, index): (u32, Option<UnrollIndex>),
+) -> Option<CudaWeight> {
+    let named = |want: BundleTensor| {
+        (input.bundle_tensor_names.iter()).find_map(|(i, x, t, n)| {
+            ((*i, *x, *t) == (id, index, want)).then(|| baked_str(n.clone()))
+        })
+    };
+    Some(match role {
+        Role::Bf16(..) | Role::Param(..) => CudaWeight::Bf16 {
+            tensor: baked_str(name.to_string()),
+            shape: baked(role.shape()),
+        },
+        Role::ExpertBank([experts, hidden, inter]) => CudaWeight::ExpertBank {
+            gate_up: named(BundleTensor::ExpertGateW)?,
+            down: named(BundleTensor::ExpertDownW)?,
+            experts,
+            hidden,
+            inter,
+        },
+        Role::Bundle(_) | Role::MoeBundle(_) => return None,
+    })
+}
+
 /// `v` as a `'static` slice, for a `CudaTape` built at expansion time only to be rendered as
 /// tokens. The build-script process exits after the expansion.
 fn baked<T: Clone>(v: &[T]) -> &'static [T] {
@@ -668,6 +832,7 @@ pub fn static_tape(c: &CudaCanonical) -> CudaTape {
         weight_bytes,
         steps,
         rotary,
+        rotary_local,
         kv,
         gdn,
         moe,
@@ -684,6 +849,7 @@ pub fn static_tape(c: &CudaCanonical) -> CudaTape {
         weight_bytes: baked(weight_bytes),
         steps: baked(steps),
         rotary: *rotary,
+        rotary_local: *rotary_local,
         kv: kv.as_ref().map(
             |CanonicalKv {
                  layers,
@@ -694,6 +860,8 @@ pub fn static_tape(c: &CudaCanonical) -> CudaTape {
                  block_table,
                  slot_mapping,
                  sequence,
+                 classes,
+                 layer_class,
              }| KvTape {
                 layers: baked(layers),
                 kv_heads: *kv_heads,
@@ -703,6 +871,8 @@ pub fn static_tape(c: &CudaCanonical) -> CudaTape {
                 block_table: *block_table,
                 slot_mapping: *slot_mapping,
                 sequence: *sequence,
+                classes: baked(classes),
+                layer_class: baked(layer_class),
             },
         ),
         gdn: gdn.as_ref().map(

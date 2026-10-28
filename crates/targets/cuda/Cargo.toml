@@ -98,6 +98,10 @@ required-features = ["nvcc"]
 [[test]]
 name = "tape_layout"
 
+# The worker's KV pool rule on lowered Gemma tapes (#923), with no CUDA toolchain.
+[[test]]
+name = "kv_pool"
+
 # The weight table's checks and host staging against a synthetic checkpoint, in both VL name
 # orderings. No toolchain needed.
 [[test]]

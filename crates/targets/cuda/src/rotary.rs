@@ -2,7 +2,10 @@
 //! THE ROTARY TABLE'S ROWS, BUILT ON THE HOST from the forward's token positions.
 //!
 //! One row per token, `rot_dim` bf16 wide, laid out `[cos θ(0..R/2) | sin θ(0..R/2)]` with
-//! `θ_i = p · inv_freq[i]` and `inv_freq[i] = 1 / theta^(2i/R)`: the rows metal's
+//! `θ_i = p · inv_freq[i]` and `inv_freq[i] = 1 / theta^(2i/F)`, `F` the table's `freq_dim`: `R`
+//! for every half-rotated class, the head dim for Gemma 4's proportional one (HF
+//! `_compute_proportional_rope_parameters`, `scratchy_layers::rotary`'s
+//! `new_proportional_from_gpuweights`). Otherwise the rows metal's
 //! `build_mrope_cos_sin_override` (`metal/src/interpreter/metal/forward.rs`) builds for a
 //! one-dimensional position. The angle is f64; `cos` and `sin` go f64 → f32 → bf16, each rounding
 //! to nearest even.
@@ -18,9 +21,10 @@
 
 use half::bf16;
 
-/// `rope_theta`'s inverse frequency for pair `i` of a rotated width `rot_dim`.
-fn inv_freq(i: usize, rot_dim: u32, theta: f64) -> f64 {
-    1.0 / theta.powf(2.0 * i as f64 / f64::from(rot_dim))
+/// `rope_theta`'s inverse frequency for pair `i` of a table whose exponent's denominator is
+/// `freq_dim` (the rotated width, or a proportional class's head dim).
+fn inv_freq(i: usize, freq_dim: u32, theta: f64) -> f64 {
+    1.0 / theta.powf(2.0 * i as f64 / f64::from(freq_dim))
 }
 
 /// `v` rounded f64 → f32 → bf16 (both round to nearest even), as its bits.
@@ -39,6 +43,31 @@ pub fn rotary_rows(positions: &[u32], rot_dim: u32, theta: f64) -> Vec<u16> {
 /// [`rotary_rows`] into `out`, which must hold exactly `positions.len() · rot_dim` elements: a
 /// worker fills a buffer it allocated once, so a forward allocates nothing.
 pub fn fill_rotary_rows(positions: &[u32], rot_dim: u32, theta: f64, out: &mut [u16]) {
+    fill_rotary_rows_with_freq_dim(positions, rot_dim, rot_dim, theta, out);
+}
+
+/// [`rotary_rows`] with the frequency exponent's denominator `freq_dim` (a table's
+/// [`crate::tape::RotaryTable::freq_dim`]): `rot_dim` gives [`rotary_rows`]' bits.
+pub fn rotary_rows_with_freq_dim(
+    positions: &[u32],
+    rot_dim: u32,
+    freq_dim: u32,
+    theta: f64,
+) -> Vec<u16> {
+    let mut out = vec![0; positions.len() * rot_dim as usize];
+    fill_rotary_rows_with_freq_dim(positions, rot_dim, freq_dim, theta, &mut out);
+    out
+}
+
+/// [`fill_rotary_rows`] with the frequency exponent's denominator `freq_dim`: `rot_dim` gives its
+/// bits.
+pub fn fill_rotary_rows_with_freq_dim(
+    positions: &[u32],
+    rot_dim: u32,
+    freq_dim: u32,
+    theta: f64,
+    out: &mut [u16],
+) {
     assert!(rot_dim.is_multiple_of(2), "rot_dim = {rot_dim} is not even");
     let width = rot_dim as usize;
     let half = width / 2;
@@ -50,7 +79,7 @@ pub fn fill_rotary_rows(positions: &[u32], rot_dim: u32, theta: f64, out: &mut [
     for (row, &p) in out.chunks_exact_mut(width).zip(positions) {
         let (cos, sin) = row.split_at_mut(half);
         for (i, (c, s)) in cos.iter_mut().zip(sin).enumerate() {
-            let angle = f64::from(p) * inv_freq(i, rot_dim, theta);
+            let angle = f64::from(p) * inv_freq(i, freq_dim, theta);
             *c = to_bf16(angle.cos());
             *s = to_bf16(angle.sin());
         }
@@ -164,6 +193,86 @@ mod tests {
         let differ = real.iter().zip(&wrong).filter(|(a, b)| a != b).count();
         eprintln!("head_dim exponent at position 1000: {differ} of {R} entries differ");
         assert!(differ * 10 > real.len() * 9, "{differ} of {}", real.len());
+    }
+
+    /// Gemma 4's sliding layers' table: a full rope on a 256-lane head (`rot_dim` 256) at theta
+    /// 1e4, within the bf16 bound of the f64 angle at positions {0, 1, 1023, 1024, 8191} (the
+    /// window's edge, and the last position of the prefix capacity).
+    #[test]
+    fn a_256_wide_table_at_theta_1e4_is_within_the_bound_of_the_f64_angle() {
+        const R256: u32 = 256;
+        const THETA_LOCAL: f64 = 1e4;
+        let positions = [0, 1, 1023, 1024, 8191];
+        let rows = rotary_rows(&positions, R256, THETA_LOCAL);
+        let (rows, rest) = rows.as_chunks::<{ R256 as usize }>();
+        assert!(rest.is_empty(), "the table is whole rows");
+        for (row, &p) in rows.iter().zip(&positions) {
+            let angles: Vec<f64> = (0..R256 as usize / 2)
+                .map(|i| f64::from(p) * inv_freq(i, R256, THETA_LOCAL))
+                .collect();
+            let exact = (angles.iter().map(|a| a.cos())).chain(angles.iter().map(|a| a.sin()));
+            let missed = (row.iter().zip(exact))
+                .filter(|&(&b, r)| (widen(b) - r).abs() > bound(r))
+                .count();
+            eprintln!("rot_dim {R256} theta {THETA_LOCAL} position {p}: {missed} entries miss");
+            assert_eq!(missed, 0, "position {p}");
+        }
+    }
+
+    /// Gemma 4's global class: head_dim 512, rot_dim 128, theta 1e6, proportional.
+    const G_HD: u32 = 512;
+    const G_ROT: u32 = 128;
+    const G_THETA: f64 = 1e6;
+
+    /// The shared builder's proportional frequencies, as `scratchy_layers::rotary`'s
+    /// `new_proportional_from_gpuweights` writes them (`crates/layers/src/rotary.rs:615-619`):
+    /// `1 / theta^(2i / head_dim)` for `2i < rotary_dim`. That builder cannot run here: it
+    /// allocates through `GpuWeights`, and CUDA's host allocator (`weights::HostStaging`) refuses
+    /// every allocation. So its formula is restated, in f64, and rounded as both builders round.
+    fn shared_proportional_row(p: u32) -> Vec<u16> {
+        let half = G_ROT as usize / 2;
+        let inv: Vec<f64> = (0..half)
+            .map(|i| 1.0 / G_THETA.powf(2.0 * i as f64 / G_HD as f64))
+            .collect();
+        let angles: Vec<f64> = inv.iter().map(|f| f64::from(p) * f).collect();
+        (angles.iter().map(|a| to_bf16(a.cos())))
+            .chain(angles.iter().map(|a| to_bf16(a.sin())))
+            .collect()
+    }
+
+    #[test]
+    fn the_proportional_rows_are_the_shared_builders_formula_bit_for_bit() {
+        let positions = [0, 1, 511, 4095, 8191];
+        let rows = rotary_rows_with_freq_dim(&positions, G_ROT, G_HD, G_THETA);
+        let (rows, rest) = rows.as_chunks::<{ G_ROT as usize }>();
+        assert!(rest.is_empty(), "the table is whole rows");
+        for (row, &p) in rows.iter().zip(&positions) {
+            let want = shared_proportional_row(p);
+            let mismatched = (row.iter().zip(&want)).filter(|(a, b)| a != b).count();
+            eprintln!("proportional p={p}: mismatched_bits={mismatched}");
+            assert_eq!(mismatched, 0, "position {p}");
+        }
+    }
+
+    #[test]
+    fn a_freq_dim_of_rot_dim_is_the_plain_table_and_the_proportional_one_differs() {
+        let positions = [0, 1, 1000, 8191];
+        for (r, theta) in [(R, THETA), (256, 1e4)] {
+            assert_eq!(
+                rotary_rows_with_freq_dim(&positions, r, r, theta),
+                rotary_rows(&positions, r, theta),
+                "rot_dim {r}"
+            );
+        }
+        // Pair 0's frequency is 1 either way; every later pair's differs.
+        let plain = rotary_rows(&[1000], G_ROT, G_THETA);
+        let prop = rotary_rows_with_freq_dim(&[1000], G_ROT, G_HD, G_THETA);
+        let differ = (1..G_ROT as usize / 2)
+            .filter(|&i| plain[i] != prop[i])
+            .count();
+        eprintln!("position 1000: {differ} of 63 cos entries differ");
+        assert!(differ >= 57, "{differ} of 63");
+        assert_eq!(plain[0], prop[0]);
     }
 
     /// bf16, not f16: 1.0 is `0x3F80` in bf16 and `0x3C00` in f16.
