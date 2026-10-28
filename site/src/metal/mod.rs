@@ -19,8 +19,8 @@ use dioxus::prelude::*;
 
 use crate::Site;
 use crate::carbon::{
-    Alignment, ContentPanel, ContentSwitcher, ContentSwitcherItem, Fold, Heading, Layer, Section,
-    Stack, Table, TableCell, TableRow, Tag, TagKind, Tile, Toggletip,
+    Alignment, ContentPanel, ContentSwitcher, ContentSwitcherItem, Fold, Heading, Layer,
+    PanelToggle, Section, Stack, Table, TableCell, TableRow, Tag, TagKind, Tile, Toggletip,
 };
 use crate::charts::{
     Axes, Axis, AxisDomain, BarPoint, Better, Chart, ChartOptions, ColorLegend, Colour, DotPoint,
@@ -1912,7 +1912,7 @@ impl<'a> Latency<'a> {
 impl Latency<'_> {
     /// Every cell at one answer length as a dense grid of bare square scatters, users at once
     /// down and prompt size across, every panel on the same axes.
-    fn inner_grid(&self, o: u32, side: &str, label: &str) -> Element {
+    fn inner_grid(&self, o: u32, side: &str, axes: Axes2, label: &str) -> Element {
         let ks: Vec<CellKey> = self.keys.iter().copied().filter(|k| k.1 == o).collect();
         let Some(span) = self.span(&ks) else {
             return rsx! {};
@@ -1932,7 +1932,7 @@ impl Latency<'_> {
                     for &i in &prompts {
                         div { style: "outline: 1px solid var(--cds-border-subtle-01, #e0e0e0); width: {side}; height: {side}",
                             if ks.contains(&(u, o, i)) {
-                                {self.chart((u, o, i), span, Axes2::Own, side, true, &format!("{label}, {i} in {u} at once"))}
+                                {self.chart((u, o, i), span, axes, side, true, &format!("{label}, {i} in {u} at once"))}
                             }
                         }
                     }
@@ -2781,22 +2781,31 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                         p {
                                             "Every request of every cell, a dot each, at the heat maps' answer length: in each \
                                              model's square, one tiny chart per cell, users at once down (fewest on top) and \
-                                             prompt size across (shortest on the left): time to first token up, on each \
-                                             chart's own range (hover a dot for its value), time per output token across, \
-                                             the same in every chart of a model. A request held back behind another \
+                                             prompt size across (shortest on the left): time to first token up, time per \
+                                             output token across, each chart on its own ranges (hover a dot for its \
+                                             values), or every chart of a model on the same with the toggle. A request held back behind another \
                                              lands high and left; one decoding beside others lands low and right; two clouds are \
                                              a cell that ran two ways. Each model's own section has every cell. A dash is a run \
                                              from before the runner kept every request."
                                         }
-                                        {latency_legend(&latency_engines(machines))}
-                                        for (set, rows) in &sets {
-                                            Stack { gap: 3,
-                                                strong { "{set.title(lineup.large_from_gb)}" }
-                                                // A model's grid at a readable size is wider than a heat map column.
-                                                div { style: "overflow-x: auto",
-                                                    {glance_maps(rows, &classes, "max-content", false, |chip: &str, class: &str| {
-                                                        model_of(chip, class).map_or(rsx! {}, |stem| latency_cell(machines, chip, stem))
-                                                    })}
+                                        div { style: "display: flex; gap: 2rem; align-items: center",
+                                            {latency_legend(&latency_engines(machines))}
+                                            PanelToggle { label: "Same axes in every chart of a model", off: "latency-axes-own", on: "latency-axes-same" }
+                                        }
+                                        for axes in Axes2::ALL {
+                                            ContentPanel { id: format!("latency-axes-{}", if axes == Axes2::Own { "own" } else { "same" }), shown: axes == Axes2::Own,
+                                                Stack { gap: 5,
+                                                    for (set, rows) in &sets {
+                                                        Stack { gap: 3,
+                                                            strong { "{set.title(lineup.large_from_gb)}" }
+                                                            // A model's grid at a readable size is wider than a heat map column.
+                                                            div { style: "overflow-x: auto",
+                                                                {glance_maps(rows, &classes, "max-content", false, |chip: &str, class: &str| {
+                                                                    model_of(chip, class).map_or(rsx! {}, |stem| latency_cell(machines, chip, stem, axes))
+                                                                })}
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -2828,7 +2837,12 @@ const LATENCY: &str = "Latency Distributions";
 /// One machine's one model in the overview's latency panel: its every request at the heat maps'
 /// answer length, a dense grid of its cells ([`Latency::inner_grid`]), its name under it; a dash
 /// for a run from before the run file kept requests.
-fn latency_cell(machines: &BTreeMap<&str, MachineRuns>, chip: &str, stem: &str) -> Element {
+fn latency_cell(
+    machines: &BTreeMap<&str, MachineRuns>,
+    chip: &str,
+    stem: &str,
+    axes: Axes2,
+) -> Element {
     let Some(Entry { run, m }) = machines[chip].latest(stem) else {
         return rsx! {};
     };
@@ -2838,6 +2852,7 @@ fn latency_cell(machines: &BTreeMap<&str, MachineRuns>, chip: &str, stem: &str) 
             l.inner_grid(
                 o,
                 INNER_SIDE,
+                axes,
                 &format!("TTFT against TPOT, every request, {stem} on {chip}, {o}-token answers"),
             )
         }
