@@ -510,6 +510,23 @@ pub struct BenchServeArgs {
     /// to check how the answers were scored.
     #[arg(long)]
     pub save_answers: Option<String>,
+
+    /// `shared-prefix`: tokens in each group's shared system prompt.
+    #[arg(long, default_value_t = 2048)]
+    pub shared_prefix_len: usize,
+
+    /// `shared-prefix`: questions per group.
+    #[arg(long, default_value_t = 4)]
+    pub shared_prefix_per_group: usize,
+
+    /// `shared-prefix`: tokens in each question.
+    #[arg(long, default_value_t = 64)]
+    pub shared_prefix_question_len: usize,
+
+    /// `shared-prefix`: the control. Every question gets a system prompt of its own of the same
+    /// length, so the cache saves nothing.
+    #[arg(long)]
+    pub no_reuse: bool,
 }
 
 impl BenchServeArgs {
@@ -522,7 +539,11 @@ impl BenchServeArgs {
     pub(crate) fn is_task_dataset(&self) -> bool {
         matches!(
             self.dataset_name,
-            ServeDataset::Rag | ServeDataset::RagSpans | ServeDataset::Longbench
+            ServeDataset::Rag
+                | ServeDataset::RagSpans
+                | ServeDataset::Longbench
+                | ServeDataset::SharegptMultiTurn
+                | ServeDataset::SharedPrefix
         )
     }
 
@@ -569,6 +590,12 @@ pub enum ServeDataset {
     /// LongBench v2's multiple-choice tasks of one length class (`--longbench-length`), streamed
     /// as a chat request, answers scored.
     Longbench,
+    /// Real ShareGPT conversations (`--dataset-path`), each turn streamed with the recorded turns
+    /// before it, a conversation's turns in order: measures reuse across a conversation.
+    SharegptMultiTurn,
+    /// Groups of short questions sharing one long system prompt (`--shared-prefix-len`); with
+    /// `--no-reuse`, the control, every question has a prompt of its own of the same length.
+    SharedPrefix,
 }
 
 /// Where `--dataset-name rag` takes its tasks from: the multi-document QA loaders.
@@ -1709,6 +1736,11 @@ mod tests {
         assert_eq!(a.rag_source, RagSource::Musique);
         assert_eq!(a.longbench_length, "short");
         assert!(!parse("sharegpt").unwrap().is_task_dataset());
+        for name in ["sharegpt-multi-turn", "shared-prefix"] {
+            let a = parse(name).unwrap();
+            assert!(a.is_task_dataset(), "{name}");
+            assert_eq!(a.endpoint(), "/v1/chat/completions", "{name}");
+        }
         let a = BenchServeArgs::try_parse_from([
             "serve",
             "--dataset-name",

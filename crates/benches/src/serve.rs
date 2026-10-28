@@ -1470,14 +1470,61 @@ fn run_prompts(args: &BenchServeArgs, client: &Arc<Client>, tokenizer: &Tokenize
     })
 }
 
+/// A dataset workload's units to sample from, and its warmups where it builds them apart (None:
+/// [`run_tasks`] draws them from the units).
+type Loaded = (
+    String,
+    Vec<Vec<crate::workloads::Task>>,
+    Option<Vec<crate::workloads::Task>>,
+);
+
 /// The tasks of a dataset workload ([`crate::workloads`]), loaded from its loader, those whose
 /// prompt fits `--max-prompt-tokens`, then `--num-prompts` of them sampled by `--seed` (and the
 /// warmups from a seed disjoint from it).
-fn load_tasks(
-    args: &BenchServeArgs,
-    tokenizer: &Tokenizer,
-) -> Result<(String, Vec<crate::workloads::Task>)> {
+fn load_tasks(args: &BenchServeArgs, tokenizer: &Tokenizer) -> Result<Loaded> {
     use crate::args::RagSource;
+    use crate::workloads::chat_tasks;
+    let count = |t: &str| datasets::token_count(tokenizer, t);
+    match args.dataset_name {
+        // Units of one conversation each: sampled whole, so no turn is sent without the ones
+        // before it.
+        ServeDataset::SharegptMultiTurn => {
+            let path = (args.dataset_path.as_ref()).ok_or_else(|| {
+                anyhow::anyhow!("--dataset-path is required for sharegpt-multi-turn")
+            })?;
+            let conversations = datasets::load_sharegpt_conversations(Path::new(path))?;
+            let reply = |t: &str| count(t).unwrap_or(0);
+            let units: Vec<Vec<_>> = (conversations.iter())
+                .map(|c| chat_tasks(c, &reply))
+                .collect();
+            return Ok((
+                "sharegpt-multi-turn".to_string(),
+                fitting_units(args, tokenizer, units),
+                None,
+            ));
+        }
+        // Built to size from the seed: no dataset to sample from, so --num-prompts questions in
+        // groups of --shared-prefix-per-group. The warmups are groups of their own, from streams
+        // the measured groups never use: drawn from the same groups, they cached a measured
+        // group's prompt before it was timed.
+        ServeDataset::SharedPrefix => {
+            let text = |stream: u64, len: usize| {
+                datasets::seeded_text(&count, args.seed, stream, len).unwrap_or_default()
+            };
+            let (tasks, warmups) = shared_prefix_workload(args, &text);
+            let name = if args.no_reuse {
+                "shared-prefix-control"
+            } else {
+                "shared-prefix"
+            };
+            return Ok((
+                name.to_string(),
+                tasks.into_iter().map(|t| vec![t]).collect(),
+                warmups,
+            ));
+        }
+        _ => {}
+    }
     // Loaders read the first N records; take enough that the sample is drawn from many.
     let pool = (args.num_prompts + args.num_warmups + 1).max(200);
     let (name, all) = match args.dataset_name {
@@ -1497,6 +1544,48 @@ fn load_tasks(
             ),
         },
     };
+    let units = all.into_iter().map(|t| vec![t]).collect();
+    Ok((name, fitting_units(args, tokenizer, units), None))
+}
+
+/// The shared-prefix workload's measured questions, and its warmups (None without any): the
+/// measured ones `--num-prompts` questions in groups of `--shared-prefix-per-group`, the warmups
+/// groups of their own from text streams the measured ones never use. `text(stream, len)` is
+/// seeded text of that stream.
+fn shared_prefix_workload(
+    args: &BenchServeArgs,
+    text: &dyn Fn(u64, usize) -> String,
+) -> (
+    Vec<crate::workloads::Task>,
+    Option<Vec<crate::workloads::Task>>,
+) {
+    let per = args.shared_prefix_per_group.max(1);
+    let build = |first: u64, n: usize| {
+        let prefix = |g: u64| text(first + g, args.shared_prefix_len);
+        let question = |q: u64| text(10_000_000 + first + q, args.shared_prefix_question_len);
+        let groups = n.div_ceil(per).max(1);
+        crate::workloads::shared_prefix_tasks(groups, per, !args.no_reuse, &prefix, &question)
+    };
+    let warmups = (args.num_warmups > 0).then(|| {
+        let mut w = build(SHARED_PREFIX_WARMUP_STREAMS, args.num_warmups);
+        w.truncate(args.num_warmups);
+        w
+    });
+    (build(0, args.num_prompts), warmups)
+}
+
+/// The shared-prefix warmups' streams start here. The measured ones take a group's prefix from 0
+/// up, the control's from 1,000,000 up and the questions' from 10,000,000 up; the warmups', each
+/// that plus this, never meet them at any size a run reaches.
+const SHARED_PREFIX_WARMUP_STREAMS: u64 = 5_000_000;
+
+/// The units whose every prompt fits `--max-prompt-tokens`: a conversation one of whose turns does
+/// not fit is left out whole.
+fn fitting_units(
+    args: &BenchServeArgs,
+    tokenizer: &Tokenizer,
+    units: Vec<Vec<crate::workloads::Task>>,
+) -> Vec<Vec<crate::workloads::Task>> {
     let fits = |t: &crate::workloads::Task| {
         args.max_prompt_tokens.is_none_or(|max| {
             let text: String = (t.messages.iter())
@@ -1506,8 +1595,7 @@ fn load_tasks(
             datasets::token_count(tokenizer, &text).is_ok_and(|n| n <= max)
         })
     };
-    let fitting: Vec<_> = all.into_iter().filter(fits).collect();
-    Ok((name, fitting))
+    units.into_iter().filter(|u| u.iter().all(fits)).collect()
 }
 
 /// A dataset workload: each task streamed as a chat request (or, for `rag-spans`, a span query),
@@ -1520,22 +1608,30 @@ fn run_tasks(
     model: &str,
     tokenizer: &Tokenizer,
 ) -> Result<()> {
-    let (dataset, fitting) = load_tasks(args, tokenizer)?;
+    let (dataset, fitting, built_warmups) = load_tasks(args, tokenizer)?;
     anyhow::ensure!(
         !fitting.is_empty(),
         "no {dataset} task fits --max-prompt-tokens {:?}",
         args.max_prompt_tokens
     );
-    // Warmups from a seed disjoint from --seed, so no measured task is cached before it is timed;
-    // drawn first so they never overlap the measured sample.
+    // Units, sampled: a task, or a conversation whole. Warmups from a seed disjoint from --seed,
+    // so no measured task is cached before it is timed; drawn first so they never overlap the
+    // measured sample. A warmup is one unit's first task. A workload that builds its warmups
+    // apart (shared-prefix) has them already.
     let mut pool =
         crate::workloads::sample(fitting, usize::MAX, datasets::throwaway_seed(args.seed));
-    let warmups: Vec<_> = pool
-        .drain(..args.num_warmups.min(pool.len().saturating_sub(1)))
-        .collect();
-    let tasks = crate::workloads::sample(pool, args.num_prompts, args.seed);
+    let warmups: Vec<crate::workloads::Task> = match built_warmups {
+        Some(w) => w,
+        None => pool
+            .drain(..args.num_warmups.min(pool.len().saturating_sub(1)))
+            .filter_map(|u| u.into_iter().next())
+            .collect(),
+    };
+    let units = crate::workloads::sample(pool, args.num_prompts, args.seed);
+    let tasks: Vec<crate::workloads::Task> = units.iter().flatten().map(Clone::clone).collect();
     eprintln!(
-        "{dataset}: {} tasks (seed {}), {} warmups",
+        "{dataset}: {} units, {} requests (seed {}), {} warmups",
+        units.len(),
         tasks.len(),
         args.seed,
         warmups.len()
@@ -1566,29 +1662,34 @@ fn run_tasks(
 
     let pb = progress_bar(args, tasks.len());
     let semaphore = args.max_concurrency.map(|n| Arc::new(Semaphore::new(n)));
-    let tasks = Arc::new(tasks);
     let start = Instant::now();
-    let mut handles = Vec::with_capacity(tasks.len());
-    for i in 0..tasks.len() {
-        let (client, tasks, pb) = (client.clone(), tasks.clone(), pb.clone());
-        let body = task_body(&client, args, &tasks[i], spans);
+    // A thread per unit, holding one concurrency slot: a conversation's turns go one after
+    // another, each once the one before it has answered.
+    let mut handles = Vec::with_capacity(units.len());
+    let mut first = 0;
+    for unit in &units {
+        let bodies: Vec<_> = unit
+            .iter()
+            .map(|t| task_body(&client, args, t, spans))
+            .collect();
+        let (client, pb, at) = (client.clone(), pb.clone(), first);
+        first += unit.len();
         let permit = semaphore.as_ref().map(|s| s.acquire_owned());
         handles.push(std::thread::spawn(move || {
             let _permit = permit;
-            let r = send_body(
-                &client,
-                &client.api_url,
-                &body,
-                &format!("bench-{i}"),
-                start,
-            );
-            if let Some(ref pb) = pb {
-                pb.inc(1);
-            }
-            r
+            (bodies.iter().enumerate())
+                .map(|(k, body)| {
+                    let id = format!("bench-{}", at + k);
+                    let r = send_body(&client, &client.api_url, body, &id, start);
+                    if let Some(ref pb) = pb {
+                        pb.inc(1);
+                    }
+                    r
+                })
+                .collect::<Vec<_>>()
         }));
     }
-    let results = join_all(handles)?;
+    let results: Vec<RequestResult> = join_all(handles)?.into_iter().flatten().collect();
     let total_time = start.elapsed().as_secs_f64();
     if let Some(pb) = pb {
         pb.finish_and_clear();
@@ -1680,12 +1781,14 @@ fn task_metrics(
     let out: Vec<usize> = ok.iter().map(|(r, _)| answer_tokens(r)).collect();
     let total_out: usize = out.iter().sum();
     let mean = |v: &[f64]| (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64);
-    // Over every task sent: a request that failed scores wrong, as does an answer that ran to its
-    // cap, whose text may hold the answer somewhere in a ramble that never gave it. Over the
-    // answered only, an engine that failed the hard tasks would score higher.
+    // Over every task sent that has a right answer (null for a workload with none: chat turns,
+    // the shared-prefix questions). A request that failed scores wrong, as does an answer that ran
+    // to its cap, whose text may hold the answer somewhere in a ramble that never gave it. Over
+    // the answered only, an engine that failed the hard tasks would score higher.
     let capped = |r: &RequestResult, t: &crate::workloads::Task| answer_tokens(r) >= t.max_tokens;
     let accuracy = mean(
         &(results.iter().zip(tasks))
+            .filter(|(_, t)| t.score.scored())
             .map(|(r, t)| {
                 if r.success && !capped(r, t) {
                     t.score.score(&r.generated_text)
@@ -2105,6 +2208,51 @@ mod tests {
         );
     }
 
+    /// The shared-prefix warmups share no prompt with a measured question: drawn from the same
+    /// groups, they cached up to two of the three measured prompts before timing began.
+    #[test]
+    fn shared_prefix_warmups_cache_no_measured_prompt() {
+        let text = |stream: u64, _len: usize| format!("text {stream}");
+        for reuse in [true, false] {
+            let mut flags = vec![
+                "serve",
+                "--dataset-name",
+                "shared-prefix",
+                "--num-prompts",
+                "8",
+                "--num-warmups",
+                "2",
+                "--shared-prefix-per-group",
+                "4",
+            ];
+            if !reuse {
+                flags.push("--no-reuse");
+            }
+            let args = <BenchServeArgs as clap::Parser>::try_parse_from(flags).unwrap();
+            let (measured, warmups) = shared_prefix_workload(&args, &text);
+            let warmups = warmups.expect("two warmups");
+            assert_eq!(measured.len(), 8, "two groups of four");
+            assert_eq!(warmups.len(), 2);
+            let content = |t: &crate::workloads::Task, i: usize| t.messages[i]["content"].clone();
+            let seen: std::collections::HashSet<_> = (measured.iter())
+                .flat_map(|t| [content(t, 0), content(t, 1)])
+                .collect();
+            for w in &warmups {
+                assert!(!seen.contains(&content(w, 0)), "a warmup's system prompt");
+                assert!(!seen.contains(&content(w, 1)), "a warmup's question");
+            }
+        }
+        let none = <BenchServeArgs as clap::Parser>::try_parse_from([
+            "serve",
+            "--dataset-name",
+            "shared-prefix",
+            "--num-warmups",
+            "0",
+        ])
+        .unwrap();
+        assert!(shared_prefix_workload(&none, &text).1.is_none());
+    }
+
     /// A streamed chat answer comes back with its text and the server's cached and prompt token
     /// counts, read from the usage chunk.
     #[test]
@@ -2146,7 +2294,7 @@ mod tests {
             Instant::now(),
         );
         server.join().unwrap();
-        assert!(r.success);
+        assert!(r.success, "failed: {}", r.error);
         assert_eq!(r.generated_text, "Paris");
         assert_eq!(r.output_tokens, 2);
         assert_eq!(r.cached_tokens, Some(96));
