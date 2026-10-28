@@ -260,7 +260,9 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
     };
     if !prompts.is_empty() {
         // In --bench mode, do a warmup first: untimed as a request, but its first token is the
-        // process's first, so `1st token` reports `t0` → that token.
+        // process's first, so `1st token` reports `t0` → that token. The instant comes from the
+        // returned output, NOT a text callback: a first token that decodes to no text (gpt-oss's
+        // special channel openers, with skip_special_tokens) never fires one.
         let mut first_token_ms = None;
         if args.bench {
             conversation.push(ChatMessage::user(&prompts[0]));
@@ -273,10 +275,12 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
             // here is the model failing, not a benchmark nicety that can be skipped. Discarding it
             // left the failed request RUNNING and the next prompt unschedulable, which reached the
             // user as a HANG instead of the message the executor had already written.
-            llm.chat_stream(&conversation, Some(warmup_params), |_| {
-                first_token_ms.get_or_insert_with(|| t0.elapsed().as_secs_f64() * 1000.0);
-            })
-            .context("bench warmup forward failed")?;
+            let warmup = llm
+                .chat_stream(&conversation, Some(warmup_params), |_| {})
+                .context("bench warmup forward failed")?;
+            if let Some(at) = warmup.first_token_at {
+                first_token_ms = Some(at.duration_since(t0).as_secs_f64() * 1000.0);
+            }
             eprintln!("done");
             conversation.pop();
         }
