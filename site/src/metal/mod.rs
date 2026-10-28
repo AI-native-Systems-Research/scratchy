@@ -2787,7 +2787,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                          llama.cpp, mistral.rs, Splash. Blue faster, red slower, the middle step within noise. \
                                          Hover a square for its ratio."
                                     }
-                                    {glance_maps(&rows, &classes, "minmax(0, 11.5rem)", true, cell)}
+                                    {glance_maps(&rows, &classes, "minmax(0, 1fr)", true, cell)}
                                 }
                             }
                             // Each a machine × model matrix, every cell its prefill
@@ -2799,7 +2799,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                     div { style: "contain: inline-size",
                                         Stack { gap: 5,
                                             p { "scratchy against oMLX TurboQuant (or the next engine a run has, in the order of the heat maps) along {along}. Blue fill where scratchy is ahead, red where it is behind." }
-                                            {glance_maps(&rows, &classes, "minmax(0, 14rem)", false, |chip: &str, class: &str| {
+                                            {glance_maps(&rows, &classes, "minmax(0, 1fr)", false, |chip: &str, class: &str| {
                                                         let Some(stem) = model_of(chip, class) else { return rsx! {} };
                                                         rsx! {
                                                             div { style: "flex: 1 1 0; min-width: 0",

@@ -658,10 +658,10 @@ pub fn glance_mini(
 /// machine on metal.html, a dtype on spyre.html), its name over its first
 /// cell's upper left, then a cell per `columns` (a model), each the column's
 /// name over `cell(row, column)`, that row's grids of that model as
-/// glance_minis. The cells are one width, 11.5rem (two 88px grids and the 8px
-/// between them), and on a narrow screen shrink together rather than wrap, as
-/// the sparkline panels' columns do: so every grid on the page is one size,
-/// the columns line up down the rows, and the scale stands beside them all.
+/// glance_minis. The cells are one width, `column_width` (metal.html shares
+/// the panel's width among them), and on a narrow screen shrink together
+/// rather than wrap: so every grid on the page is one size, the columns line
+/// up down the rows, and the scale stands beside them all.
 /// Each row's names share a track and its grids the next, so a name that
 /// wraps onto two lines leaves its grids level with their neighbours'.
 pub fn glance_maps(
@@ -672,7 +672,7 @@ pub fn glance_maps(
     cell: impl Fn(&str, &str) -> Element,
 ) -> Element {
     let grid = format!(
-        "flex: 0 1 auto; min-width: 0; align-self: start; display: grid; \
+        "flex: 1 1 auto; min-width: 0; align-self: start; display: grid; \
          grid-template-columns: repeat({}, {column_width}); gap: 1.5rem 0",
         columns.len()
     );
