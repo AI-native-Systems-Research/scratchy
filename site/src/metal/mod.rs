@@ -2419,8 +2419,9 @@ impl Shape {
 }
 
 /// The overview's shape: a column per class of the lineup (`config.classes`), each Mac on the
-/// class's small model or, from `large_from_gb`, its large one, and each [`Set`] its own map
-/// shape. A square its run did not measure (a run of an older shape, or a prompt the Mac's memory
+/// class's small model (every Mac, where the lineup's runs took the small set everywhere:
+/// `small_everywhere`) or, in a lineup from before that, its large one from `large_from_gb`, and
+/// each [`Set`] its own map shape. A square its run did not measure (a run of an older shape, or a prompt the Mac's memory
 /// did not hold) is blank.
 struct Lineup<'a> {
     classes: &'a [data::Class],
@@ -2470,7 +2471,12 @@ fn lineup<'a>(machines: &BTreeMap<&str, MachineRuns<'a>>) -> Option<Lineup<'a>> 
     Some(Lineup {
         classes: newest.config.classes.as_deref()?,
         large_from_gb,
-        small_everywhere: newest.config.default_set.as_deref() == Some("small"),
+        // From the newest run that took a default set: a run that named its models (`--models large`,
+        // `full`, or by name) says nothing about it, so it must not flip every Mac's column.
+        small_everywhere: (runs.iter())
+            .find(|r| r.config.classes.is_some() && !r.config.models_given)
+            .and_then(|r| r.config.default_set.as_deref())
+            == Some("small"),
         shapes,
     })
 }
@@ -2479,8 +2485,9 @@ fn lineup<'a>(machines: &BTreeMap<&str, MachineRuns<'a>>) -> Option<Lineup<'a>> 
 /// one table per metric: a machine per row, a model per column, each cell that
 /// model's grid as a tiny heatmap coloured like the full ones.
 fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
-    // A column per architecture class ([`Lineup`]); each machine's row shows the class's model
-    // for its memory, the small set below the lineup's `large_from_gb` and the large one from it,
+    // A column per architecture class ([`Lineup`]); each machine's row shows the class's model:
+    // the small one on every Mac where the lineup's newest default run took the small set
+    // everywhere, else the small set below the lineup's `large_from_gb` and the large one from it,
     // run or not yet. A model an older round ran stays in its machine's own section, not here.
     let Some(lineup) = lineup(machines) else {
         return rsx! {};
@@ -3824,6 +3831,35 @@ mod tests {
                 "{gb} GB"
             );
         }
+    }
+
+    /// A run that named its models (`--models large`) says nothing about the default set: published
+    /// after a default small-set run, it leaves every Mac's column on the small model, rather than
+    /// flipping the overview back to the large set from 64 GB.
+    #[test]
+    fn a_run_that_named_its_models_does_not_flip_the_lineup() {
+        use super::data::Run;
+        let read = |name: &str| -> serde_json::Value {
+            let p = format!("{}/data/metal/{name}", env!("CARGO_MANIFEST_DIR"));
+            serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+        };
+        let mut small = read("apple-m3-pro-2026-10-27T031941Z-f9739363.json");
+        small["config"]["default_set"] = "small".into();
+        // The 64 GB Mac's 120B round, run by name, a day later.
+        let mut large = small.clone();
+        large["machine"]["chip"] = "Apple M5 Max".into();
+        large["machine"]["memory_gb"] = 128.into();
+        large["generated_utc"] = "2026-10-28T12:00:00Z".into();
+        large["config"]["default_set"] = serde_json::Value::Null;
+        large["config"]["models_given"] = true.into();
+        let runs: Vec<Run> = [small, large]
+            .into_iter()
+            .map(|v| serde_json::from_value(v).unwrap())
+            .collect();
+        let machines = super::index(&runs);
+        let lineup = super::lineup(&machines).expect("a lineup");
+        assert!(lineup.small_everywhere);
+        assert_eq!(lineup.model("dense", 128), Some("granite-4.2-3b"));
     }
 
     /// Over every published run: a cell whose answers came back short of the tokens asked for

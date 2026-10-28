@@ -257,10 +257,15 @@ pub struct Config {
     /// reach 8192.
     #[serde(default)]
     pub large_from_gb: Option<u32>,
-    /// The set every Mac runs by default, whatever its memory (`small`); absent in runs from before
+    /// The set every Mac runs by default, whatever its memory (`small`), recorded by a run that took
+    /// it; None in a run that named its models ([`Config::models_given`]) and in runs from before
     /// it, which took the large set from [`Config::large_from_gb`].
     #[serde(default)]
     pub default_set: Option<String>,
+    /// The run named its models (`--models`), so it says nothing about the default set; absent (so
+    /// false) in runs from before it.
+    #[serde(default)]
+    pub models_given: bool,
     #[serde(default)]
     pub default_models: Option<Vec<String>>,
 }

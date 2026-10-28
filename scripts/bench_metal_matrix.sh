@@ -224,6 +224,7 @@ mlx_parity_config() {
 }
 
 MODELS=()
+MODELS_GIVEN=0           # --models was passed: the run did not take the default set
 # Two kinds of run. By default a quick one, aimed at about 25 minutes (not yet
 # measured as it now runs):
 # scratchy alone, cold and warm, one rep, 64-token answers. The page
@@ -317,7 +318,7 @@ PERCENTILES="25,50,75,90,99"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --models)            IFS=',' read -r -a MODELS <<<"$2"; shift 2 ;;
+        --models)            IFS=',' read -r -a MODELS <<<"$2"; MODELS_GIVEN=1; shift 2 ;;
         --scenarios)         SCENARIOS="$2"; shift 2 ;;
         --reps)              REPS="$2"; shift 2 ;;
         --prime)             PRIME="$2"; shift 2 ;;
@@ -596,7 +597,7 @@ for row in "${ENGINE_ROWS[@]}"; do
 done
 PIN_PROBLEMS="$(printf '%s\n' ${pin_problems[@]+"${pin_problems[@]}"})"
 CLASS_TABLE="$(printf '%s\n' "${CLASSES[@]}")"
-export ENGINE_INFO PIN_PROBLEMS UNPINNED CLASS_TABLE LARGE_GB
+export ENGINE_INFO PIN_PROBLEMS UNPINNED CLASS_TABLE LARGE_GB MODELS_GIVEN
 export STARTED_UTC PERCENTILES PRIME_LAUNCHES INPUT_LEN OUTPUT_LEN WARM_REQUESTS SCENARIOS SCALING SCALE_AXES SCALE_CONC SCALE_INPUT SCALE_OUTPUT SCALE_GRID_INPUT \
        SCALE_GRID_OUTPUT SCALE_GRID_CONC SCALE_GRID_USERS_OUTPUT SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS SCALE_ROUNDS SCALE_REPEATS \
        MLX_PYTHON OLLAMA_BIN KV_CACHE_DTYPE SERVE_ARGS CELL_TIMEOUT_S CELL_HANG_TOK_S RESUME MODELS_FULL
@@ -640,9 +641,15 @@ json.dump({
                          for row in e["CLASS_TABLE"].splitlines()],
              # The memory from which a Mac's grid runs to 8192-token prompts (below it, 4096).
              "large_from_gb": int(e["LARGE_GB"]),
-             # The set every Mac runs by default: small, whatever its memory. The page reads a
-             # Mac's column model by it; runs from before it took the large set from large_from_gb.
-             "default_set": "small",
+             # The set every Mac runs by default, small, whatever its memory, recorded only by a
+             # run that took it (no --models): the page reads the overview's column models from the
+             # newest run that records a lineup, so a --models large, full or by-name run must not
+             # say small. None there, as in runs from before it, which took the large set from
+             # large_from_gb.
+             "default_set": None if e["MODELS_GIVEN"] == "1" else "small",
+             # The run named its models (--models): it took no default set, and the page takes the
+             # lineup's rule from the newest run that did.
+             "models_given": e["MODELS_GIVEN"] == "1",
              "cold_priming_launches": int(e["PRIME_LAUNCHES"]),
              "startup_request": {"input_len": int(e["INPUT_LEN"]), "output_len": int(e["OUTPUT_LEN"]),
                                  "warm_requests": int(e["WARM_REQUESTS"])},
@@ -877,7 +884,8 @@ footprint_bytes() { # pid -> bytes, or nothing if it has gone
 # The Mac's thermal state as pmset reports it, one "Name = N" a line: nothing on a cool Mac (its
 # "No ... recorded" notes), a CPU speed limit and warning levels on a throttled one. Taken around
 # every repeat, so a cell measured on a throttled Mac can be told from one that was not.
-therm_now() { pmset -g therm 2>/dev/null || true; }
+# A pmset that fails prints "unread" instead, so it is not taken for a cool Mac.
+therm_now() { pmset -g therm 2>/dev/null || echo unread; }
 mem_sampler() { # pid out
     local p b s
     exec >/dev/null; echo   # a refused log line in the forked buffer must not reach tree_pids (cleanup)
@@ -1025,8 +1033,11 @@ PY2
 import json, re, sys
 p, before, after = sys.argv[1:4]
 def therm(text):
-    """pmset -g therm as numbers, each "Name = N" line: {} where it reports no warning."""
-    return {k.strip(): int(v) for k, v in re.findall(r"^\s*([A-Za-z_ ]+?)\s*=\s*(\d+)\s*$", text, re.M)}
+    """pmset -g therm as numbers, each "Name = N" line: {} where it reports no warning, None where
+    pmset could not be read (therm_now's "unread")."""
+    if text.strip() == "unread":
+        return None
+    return {k.strip(): int(v) for k, v in re.findall(r"^\s*([A-Za-z0-9_ ]+?)\s*=\s*(\d+)\s*$", text, re.M)}
 j = json.load(open(p))
 j["thermal"] = {"before": therm(before), "after": therm(after)}
 json.dump(j, open(p, "w"), indent=2)
