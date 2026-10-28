@@ -9,11 +9,8 @@
 //! it, and this is the invoking.
 
 // The pool/slot vocabulary is CARD-ONLY, so its imports carry the cfg of the blocks that use it.
-#[cfg(feature = "spyre-hw")]
-use scratchy_subtile::sdsc_abstract::{PoolPartition, SlotCount};
 // The KTIR-emulator twin below (mask/rope pad-row clamping) — the card's twin shares the laws
 // through `ChunkRows` already.
-use scratchy_target_spyre::manifest::argmax;
 #[cfg(not(feature = "spyre-hw"))]
 use std::num::NonZeroU32;
 // The runner type is cfg-selected: the KTIR emulator's session on the host, the sendnn one on
@@ -29,6 +26,47 @@ use crate::spyre_pool::*;
 use crate::spyre_types::*;
 use crate::spyre_worker::*;
 
+/// ⭐ #32 (c3) — A SUBMITTED DECODE STEP: the launch is on the card, the
+/// idx-stick read is enqueued, nothing collected. Everything the collect half
+/// needs to turn the ring slot back into tokens. The RUNG INDEX travels beside
+/// it in the caller, because each rung owns its own session and only that
+/// session's executor can finish the read.
+#[cfg(feature = "spyre-hw")]
+pub(crate) struct SubmittedDecode {
+    pub(crate) read: scratchy_target_spyre::superdsc_exec::DeferredRead,
+    /// The launch's row count — the seat's `rows` the submit half set.
+    pub(crate) rows: u32,
+    pub(crate) result_id: u32,
+    pub(crate) vocab: usize,
+}
+
+/// What `run_prefill_batch` hands back: a finished step's picks, or a
+/// submitted decode step whose read is deferred. A decode batch is ALWAYS the
+/// latter — one decode path — and a schedule that cannot defer collects it
+/// in-call through the same [`collect_decode_tokens`] door.
+#[cfg(feature = "spyre-hw")]
+pub(crate) enum BatchOut {
+    Done(Option<Vec<u32>>),
+    Deferred(SubmittedDecode),
+}
+
+/// ⭐ #32 (E) — THE OVERLAP PROBE'S PROCESS-WIDE STATE, in the same idiom
+/// `step_segs` states the reason for: the submit half's borrows (the session,
+/// `Shared`, the launcher) cannot thread a worker field, and the lock is
+/// uncontended against a ~24 ms step. Holds the PREVIOUS decode step's stick
+/// read as its peek handle — `fired()` is the whole of its surface, so asking
+/// "is the card still busy" is a latch read, never a wait.
+#[cfg(feature = "spyre-hw")]
+static PRIOR_READ: std::sync::Mutex<Option<scratchy_target_spyre::runtime::ReadPeek>> =
+    std::sync::Mutex::new(None);
+
+/// ⭐ THE DEPTH ROW'S OWN COUNT: decode submissions outstanding, incremented at
+/// each deferred submit and decremented at each collect — the same population
+/// the worker's in-flight queue holds, stated once, process-wide, so the depth
+/// row counts exactly the submissions the pipeline has not yet collected.
+#[cfg(feature = "spyre-hw")]
+static OUTSTANDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Bind the m=N batched-prefill activations + the mq>1 attention consts into `pf` and run ONE
 /// forward over prompt tokens `toks` at positions `[start..start+mq)`. This populates `pf`'s resident
 /// seg2 KV (mq slots, via the mq>1 cachewr) on-card. Mirrors the per-token decode binding but for mq
@@ -42,8 +80,12 @@ use crate::spyre_worker::*;
 /// forward instead of two, and the second one's ~29 ms weight-stream floor disappears. Every earlier
 /// chunk leaves it false and passes a NULL out-pointer, so the shim skips the ~3 MB logits D2H and the
 /// sen→IEEE convert. Returns `None` exactly when `want_logits` is false.
+/// ⭐ THE LAUNCH'S OWN FACTS, MINTED BY THE CALLER IN ONE LOOP: what the rows
+/// ARE, and the gather table those rows read through. One bundle because both
+/// describe the pool's live state at submit, which this function can neither
+/// see nor recompute.
 #[cfg(feature = "spyre-hw")]
-pub(crate) fn run_prefill_batch(
+pub(crate) struct BatchLaunch<'a> {
     // ⛔ THE NEW-BLOCK LAW IS NOT A PARAMETER ANY MORE. It was `causal_col_valid: fn(usize, usize) ->
     // bool` — the row KIND travelling as a runtime value, which is the shape `QueryRows` exists to
     // retire. The kind is now the type of `per_request` below: a decode batch has `LaunchRows` and
@@ -67,8 +109,8 @@ pub(crate) fn run_prefill_batch(
     // declares no fold, so there is no decode-shaped value for it to carry.
     // ⭐ AND WHEN THE STEP's BODY IS A BATCH CHUNK, ITS LAW INSTEAD OF THE FOLD's GRID: the mask is then
     // ONE per-row block every row block reads (`BatchPrefix::Chunk`), not a block per pass.
-    per_request: Option<(
-        &scratchy_subtile::sdsc_abstract::LiveBatch,
+    pub(crate) per_request: Option<(
+        &'a scratchy_subtile::sdsc_abstract::LiveBatch,
         scratchy_subtile::sdsc_abstract::BatchPrefix,
     )>,
     // ⭐⭐⭐⭐⭐ THE GATHER'S INDEX TABLE — global stick-block numbers, one per (launch row, logical page),
@@ -82,24 +124,20 @@ pub(crate) fn run_prefill_batch(
     // `None` for a launch that stages none — a prompt chunk, or a bundle that emitted no gather. The
     // pairing is checked at `kernel_values`, against the BUNDLE's own placement rather than against
     // this argument, so "table but no gather" is inert and "gather but no table" is a refusal.
-    kv_blocks: Option<&[scratchy_subtile::sdsc_abstract::GatherEntry]>,
-    sh: &Shared<'_>,
-    pf: &mut SuperDscSession,
-    b: &BundleMeta,
-    // ⛔ THERE IS NO `pages` PARAMETER, AND ITS ABSENCE IS THE LOCK. It was "pages this request holds", and
-    // it fed the prompt-chunk mask extent — but only through an arm that a PREFIX-FREE prefill rung never
-    // took (`page_slots == 0` ⇒ `pf.cap`, a pool number). A prompt chunk's extent is now the BAKE's own
-    // pmask reserve (`SuperDscSession::pmask_slots`) and a decode batch's is the DECLARED fold grid, so
-    // neither can be handed a page count computed at a call site. Deleting the parameter is what stops the
-    // next caller from reaching for `ctx.host.len()` or a pool size again.
-    toks: &[usize],
+    pub(crate) kv_blocks: Option<&'a [scratchy_subtile::sdsc_abstract::GatherEntry]>,
+}
+
+/// ⭐ THE RUNG'S OWN ANSWER, in one bundle with the rung's own width: a decode
+/// batch rung is addressed by FINGERPRINT, so `b` is the single-request meta
+/// borrowed for its tensor IDS and describes neither this launch's row count
+/// nor its placements — both facts ride here instead.
+#[cfg(feature = "spyre-hw")]
+pub(crate) struct RungShape {
     // The width the bundle being run was BAKED at — the launch binds exactly this many rows,
     // live or padding, and every extent below (embeddings, masks, `run_step`'s m) is sized by it.
-    prefill_m: scratchy_subtile::sdsc_abstract::RungWidth,
+    pub(crate) prefill_m: scratchy_subtile::sdsc_abstract::RungWidth,
     // ⭐⭐⭐⭐⭐ WHETHER THE BUNDLE BEING RUN GATHERS — the SECOND fact `b` cannot answer, and it rides
-    // beside `prefill_m` because it has exactly `prefill_m`'s provenance: a decode batch rung is
-    // addressed by FINGERPRINT, so `b` is the single-request meta borrowed for its tensor IDS and
-    // describes neither this launch's row count nor its placements. The gather is emitted only by
+    // beside `prefill_m` because it has exactly `prefill_m`'s provenance. The gather is emitted only by
     // the collapsed `mq > 1` bodies, so `GathersKv::of(&b.facts)` answers `false` for every rung
     // that places an index — which the card reports as `0xa35e RAS::PCI::BusFence`, a fence with no
     // `vars` raised on senlib's own monitor thread, from two gather copies resolving
@@ -109,10 +147,65 @@ pub(crate) fn run_prefill_batch(
     // "caller answers from a phase or a rung width" hazard that type exists to forbid; every caller
     // mints this from an artifact — `BakeFacts` for a prompt chunk, the rung's own layout for a
     // batched step.
-    gathers: scratchy_target_spyre::wiring::GathersKv,
+    pub(crate) gathers: scratchy_target_spyre::wiring::GathersKv,
+}
+
+/// ⭐ THE SUFFIX'S MINTED SAMPLER, ONE BUNDLE: where the seeds come from, whether
+/// the lm-head tail runs, and the per-row seat laws — the three facts that
+/// describe the launch's sampling half rather than its forward body.
+#[cfg(feature = "spyre-hw")]
+pub(crate) struct SamplerLaws<'a> {
+    // ⛔ THE SEED LAW, NOT A TOKEN LIST. This used to be `toks: &[usize]` — one token per live
+    // row, read from the token pool — which made every decode step's embed-head bind depend on
+    // the PREVIOUS step's collected pick and forced a drain before every submit. The device
+    // writes the seeds themselves (each step's ChainStage decomposes its pick into the persistent
+    // sticks), so the host binds seeds ONLY where the card cannot have: a request's first step on
+    // a rung session, a churned or padded seat, a rung switch. `SeedSource::OnCard` is that
+    // statement — a stable seating — and binds nothing.
+    pub(crate) seeds: scratchy_subtile::sdsc_abstract::SeedSource<'a>,
+    // `want_logits` asks for the NEXT token's logits from the bundle's lm-head tail, which the emitter
+    // folds to m=1 over the LAST baked row (see `LAST_HIDDEN_TID`). The caller sets it on the FINAL chunk
+    // and then has no separate decode-of-the-last-token to run — that is the whole point: TTFT becomes one
+    // forward instead of two, and the second one's ~29 ms weight-stream floor disappears. Every earlier
+    // chunk leaves it false and passes a NULL out-pointer, so the shim skips the ~3 MB logits D2H and the
+    // sen→IEEE convert. Returns `None` exactly when `want_logits` is false.
+    pub(crate) want_logits: LogitsWanted,
+    // ⭐ THE SEAT LAWS THIS LAUNCH'S ROWS RUN UNDER — one law per row the
+    // suffix's sampler picks for, staged before anything runs. The variant must
+    // match the launch's own arm: `Prompt` for a prompt-final chunk (whose rows
+    // are one request's consecutive positions), `Batch` for a decode batch (one
+    // law per live row). A middle prompt chunk stages nothing (its suffix never
+    // runs), so the value it passes is inert — but the arm/variant match is
+    // still refused wherever the seat IS staged, never silently resolved.
+    pub(crate) laws: SeatLaws<'a>,
+}
+
+#[cfg(feature = "spyre-hw")]
+pub(crate) fn run_prefill_batch(
+    launch: BatchLaunch<'_>,
+    sh: &Shared<'_>,
+    pf: &mut SuperDscSession,
+    b: &BundleMeta,
+    // ⛔ THERE IS NO `pages` PARAMETER, AND ITS ABSENCE IS THE LOCK. It was "pages this request holds", and
+    // it fed the prompt-chunk mask extent — but only through an arm that a PREFIX-FREE prefill rung never
+    // took (`page_slots == 0` ⇒ `pf.cap`, a pool number). A prompt chunk's extent is now the BAKE's own
+    // pmask reserve (`SuperDscSession::pmask_slots`) and a decode batch's is the DECLARED fold grid, so
+    // neither can be handed a page count computed at a call site. Deleting the parameter is what stops the
+    // next caller from reaching for `ctx.host.len()` or a pool size again.
+    rung: RungShape,
     start: usize,
-    want_logits: LogitsWanted<'_>,
-) -> ExecutorResult<Option<Vec<f32>>> {
+    sampler: SamplerLaws<'_>,
+) -> ExecutorResult<BatchOut> {
+    let BatchLaunch {
+        per_request,
+        kv_blocks,
+    } = launch;
+    let RungShape { prefill_m, gathers } = rung;
+    let SamplerLaws {
+        seeds,
+        want_logits,
+        laws: seat_laws,
+    } = sampler;
     use scratchy_subtile::sdsc_abstract::{ChunkRows, decode_prefix_col_valid};
     // ⭐ NO `hd` HERE ANY MORE. The one head-count question this function asked (`h / hd`) is now
     // the bake's own `Geometry::nqh` — the quotient was the head count only for a square Q
@@ -131,16 +224,34 @@ pub(crate) fn run_prefill_batch(
     //
     // A DECODE BATCH's pad row replicates LIVE 0 instead, all four aspects, because its cache write is
     // not its own slot's: it is live 0's cell. See `LaunchRows` below.
-    let real = toks.len();
     // The kind of a launch WITHOUT `per_request` — a prompt chunk, whose rows are consecutive positions
     // of one prompt. Its laws (the pad-row clamp, the causal triangle) hang off this type and nothing
     // else can reach them.
     let chunk = ChunkRows::chunk(prefill_m.rows());
     // The rung width as a host-side extent, taken once — every loop and buffer below is `mq`-sized.
     let mq = prefill_m.count();
-    if real == 0 || real > mq {
+    // ⛔ A PROMPT CHUNK'S ROWS ARE THE PROMPT'S OWN TOKENS — the host owns every one of them, so
+    // `OnCard` is not a spelling a chunk can take: its head kernel is the host-pushed `EmbedRow`,
+    // and "the card's own ChainStage writes" is a decode-chain fact a prefill forward does not
+    // have. Refused here rather than silently read as an empty token list.
+    let host_toks: &[usize] = match (&per_request, seeds) {
+        (_, scratchy_subtile::sdsc_abstract::SeedSource::Host(t)) => t,
+        // A decode batch on a stable seating: the card's own ChainStage writes
+        // are every seat's seed — no host token exists, none is read, and the
+        // empty slice states exactly that (the tokens walk below builds
+        // nothing for it).
+        (Some(_), scratchy_subtile::sdsc_abstract::SeedSource::OnCard) => &[],
+        (None, scratchy_subtile::sdsc_abstract::SeedSource::OnCard) => {
+            return Err(werr(
+                "run_prefill_batch: a prompt chunk cannot seed from the card — every prompt row's \
+                 token is a host fact and the EmbedRow push reads it",
+            ));
+        }
+    };
+    if per_request.is_none() && (host_toks.is_empty() || host_toks.len() > mq) {
         return Err(werr(format!(
-            "run_prefill_batch: real={real} not in 1..={mq}"
+            "run_prefill_batch: real={} not in 1..={mq}",
+            host_toks.len()
         )));
     }
     // ONE TOKEN PER LIVE ROW. Both come from the same walk of the slot map at the call site, so this
@@ -157,28 +268,33 @@ pub(crate) fn run_prefill_batch(
     // any one of them changes the hidden state at layer 1 and every layer after it writes different K/V
     // into live 0's cell. `LaunchRows` is the one value that answers all four, so a row cannot be
     // mirrored in some aspects and not others.
+    // The LIVE rows by slot, kept past the widening below — the seat's laws are indexed by LAUNCH
+    // slot, and only the live batch says which slot is a request's own (a padding slot's law is
+    // LIVE 0'S OWN — [`pad_law_of`], the pad clamp: its pick is never read, and its forward is
+    // live 0's by the replica law).
+    let live_batch = per_request.as_ref().map(|(rows, _)| *rows);
     let per_request: Option<(
         scratchy_subtile::sdsc_abstract::LaunchRows<'_>,
         scratchy_subtile::sdsc_abstract::BatchPrefix,
     )> = match per_request {
         Some((rows, fold)) => {
-            if rows.live() != real {
-                return Err(werr(format!(
-                    "run_prefill_batch: {} live row(s) but {real} token(s) — a decode batch carries \
-                     exactly one token per live request",
-                    rows.live()
-                )));
-            }
-            let laid = rows.launch_rows(toks, prefill_m).ok_or_else(|| {
+            let laid = rows.launch_rows(seeds, prefill_m).ok_or_else(|| {
                 werr(format!(
-                    "run_prefill_batch: {} live row(s) / {} token(s) do not lay into a {mq}-row rung",
-                    rows.live(),
-                    toks.len()
+                    "run_prefill_batch: {} live row(s) do not lay into a {mq}-row rung with this \
+                     seed source — a Host source carries exactly one token per live row",
+                    rows.live()
                 ))
             })?;
             Some((laid, fold))
         }
         None => None,
+    };
+    // `real` — how many rows carry their OWN input. A prompt chunk's is its token count (checked
+    // above); a decode batch's is its LIVE count, which `launch_rows` already validated against
+    // the Host token list, so the two cannot disagree here.
+    let real = match &per_request {
+        Some((rows, _)) => rows.live(),
+        None => host_toks.len(),
     };
     // Pad rows REPLICATE — whom is a kind question, and the kind is which of these two arms exists. A
     // decode batch's pad rows take LIVE 0's token, because a pad row's forward becomes its cache write
@@ -186,10 +302,33 @@ pub(crate) fn run_prefill_batch(
     // token: the emitter reads the lm-head input from the last baked row, which must carry the last
     // real token (and a chunk's pad KV writes append at the row's own slot, past n_computed — no
     // shared cell).
-    let tok_at = |i: usize| match &per_request {
-        Some((rows, _)) => rows.row(i).expect("i < mq").token().get() as usize,
-        None if i < real => toks[i],
-        None => toks[real - 1],
+    //
+    // ⭐⭐⭐ AND ON AN `OnCard` DECODE LAUNCH THERE ARE NO HOST TOKENS AT ALL — every row's seed is
+    // the card's own ChainStage write, bound by nobody. The vec is EMPTY then, the tape's ChainSeed
+    // steps stage nothing (the launcher's skip, below), and the gather reads the sticks as the
+    // previous step's stage left them. `Host` on a decode launch carries the SEEDS: the full
+    // per-row clamp `launch_rows` laid, one entry per BOUND row (live rows' own, pads replicating),
+    // because the seed fns (`chain_s_seed`/`chain_l_seed`) take the launch's own width.
+    let tokens: Vec<usize> = match (&per_request, seeds) {
+        (Some((rows, _)), scratchy_subtile::sdsc_abstract::SeedSource::Host(_)) => (0..mq)
+            .map(|i| {
+                rows.row(i)
+                    .expect("i < mq")
+                    .token()
+                    .expect("a Host-seeded launch carries every row's token")
+                    .get() as usize
+            })
+            .collect(),
+        (Some(_), scratchy_subtile::sdsc_abstract::SeedSource::OnCard) => Vec::new(),
+        (None, _) => (0..mq)
+            .map(|i| {
+                if i < real {
+                    host_toks[i]
+                } else {
+                    host_toks[real - 1]
+                }
+            })
+            .collect(),
     };
     // ⭐⭐⭐⭐⭐ THE HEAD COUNT FROM THE BAKE, NOT `h / hd`. The quotient is the head count only for a
     // SQUARE Q projection; gemma-4's is not (hidden 3840 against nqh·hd 4096/8192 — and the
@@ -313,7 +452,10 @@ pub(crate) fn run_prefill_batch(
         // site for what the difference cost.
         &b.facts.constant_env(b.wiring, mq_pad, launch_rows),
     );
-    let tokens: Vec<usize> = (0..mq).map(tok_at).collect();
+    // ⛔ THE VOCAB GATE COVERS WHAT THE HOST BINDS. An `OnCard` decode launch binds no token, so
+    // there is nothing to check — its seeds are the card's own draws, which the sampler's own
+    // vocab-width table produced. A `Host` launch's entries are prompt tokens or collected picks,
+    // and an out-of-range one would gather past the embedding table.
     for &tok in &tokens {
         if tok >= vocab {
             return Err(werr(format!("prefill token {tok} >= vocab {vocab}")));
@@ -329,6 +471,22 @@ pub(crate) fn run_prefill_batch(
     // bake's reserve; a decode BATCH wants one f16 block per fold pass, because the fold takes a
     // pass per (request, page) and `fold_delta` steps the mask one block per pass.
     let histories = per_request.as_ref().map(|(rows, _)| rows.mask_histories());
+    // ⭐ ONE BROADCAST PREDICATE, ONE TYPE — `PrefixSource` is generic over its validity closure,
+    // so two arms spelling two closures are two types and the match cannot unify. The predicate
+    // carries its law as DATA (which regime it is in) rather than as a second closure: a
+    // one-request seat reads its single live row's own history (the solo law — a hole in that
+    // history is another request's keys, so `col < start` would be the defect), and a prompt
+    // chunk reads the position law (its rows share one contiguous prefix).
+    let solo_hist = match (&per_request, &histories) {
+        (Some((_, scratchy_subtile::sdsc_abstract::BatchPrefix::OneRequest)), Some(hs)) => {
+            hs.first()
+        }
+        _ => None,
+    };
+    let broadcast_holds = |c: usize| match solo_hist {
+        Some(h) => h.contains(c),
+        None => decode_prefix_col_valid(c, start),
+    };
     let prefix_src = match (&per_request, &histories) {
         // ⭐ A BATCH CHUNK BODY: one per-row block, from the law the emitter baked the read with.
         (Some((_, scratchy_subtile::sdsc_abstract::BatchPrefix::Chunk(bc))), Some(hs)) => {
@@ -354,6 +512,18 @@ pub(crate) fn run_prefill_batch(
                 histories: hs,
             })
         }
+        // ⭐⭐⭐ THE ONE-REQUEST SEAT — the deleted solo loop's own law, verbatim: ONE BROADCAST ROW
+        // over the bake's reserve, validity the single live row's own history (row 0 IS live 0 —
+        // the live rows occupy the first slots). Every body of that seat reads this form (see
+        // [`BatchPrefix::OneRequest`]); the fold's blocks staged here were the W=1 text defect.
+        (Some((_, scratchy_subtile::sdsc_abstract::BatchPrefix::OneRequest)), Some(_)) => {
+            pf.pmask_slots.map(
+                |cap| scratchy_target_spyre::forward_tape::PrefixSource::Broadcast {
+                    cap,
+                    holds: broadcast_holds,
+                },
+            )
+        }
         // ⛔ THE EXTENT IS THE BAKE'S RESERVE, NEVER THE SESSION'S `cap`. The ops sweep the
         // placement's whole width and an additive byte the host never wrote reads as ZERO = VALID,
         // so every swept column gets an explicit value; WHICH value is the request's business.
@@ -361,7 +531,7 @@ pub(crate) fn run_prefill_batch(
             pf.pmask_slots.map(
                 |cap| scratchy_target_spyre::forward_tape::PrefixSource::Broadcast {
                     cap,
-                    holds: |c: usize| decode_prefix_col_valid(c, start),
+                    holds: broadcast_holds,
                 },
             )
         }
@@ -420,6 +590,14 @@ pub(crate) fn run_prefill_batch(
         causal_heads_per_block: b.wiring.causal_heads_per_block(causal),
         embed_tokens: sh.embed_tokens,
         tokens: &tokens,
+        // ⭐ THE SEED LAW'S WIRE SPELLING: a decode launch seeds the sticks only in the `Host`
+        // arm (the caller-owned tokens above, already clamp-laid per bound row); an `OnCard`
+        // launch passes `None` and the launcher's ChainSeed steps stage nothing. A prefill launch
+        // has no ChainSeed step at all, so `None` there is inert by the tape's own shape.
+        chain_seeds: match (&per_request, seeds) {
+            (Some(_), scratchy_subtile::sdsc_abstract::SeedSource::Host(_)) => Some(&tokens[..]),
+            _ => None,
+        },
         positions: &positions,
         causal,
         prefix: prefix_src,
@@ -447,6 +625,7 @@ pub(crate) fn run_prefill_batch(
             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_CAUSAL_TID,
         )),
         causal_keyed: None,
+        card_owned_sticks: Vec::new(),
         launched: false,
     };
     scratchy_subtile::host_tape::play(
@@ -455,9 +634,85 @@ pub(crate) fn run_prefill_batch(
     )
     .map_err(|e| werr(format!("prefill forward tape: {e}")))?;
     debug_assert!(launcher.launched, "the tape must reach its device step");
+    // ⭐⭐⭐ THE ONCARD HAND-OFF, BEFORE THIS LAUNCH'S REFILL. The sticks the skip named are
+    // the card's from this step on: dropping them from the executor's persistent maps here —
+    // ahead of `stage_step_acts`/`submit_step` below — is what stops THIS submit's preamble
+    // H2D from re-sending the last `Host` seed over the previous step's ChainStage pick. A
+    // later churned seating re-binds its seeds from the collected picks, re-inserting them.
+    for id in &launcher.card_owned_sticks {
+        pf.hand_to_card(*id);
+    }
     acts.extend(launcher.acts);
     acts_f16.extend(launcher.acts_f16);
     acts_i32.extend(launcher.acts_i32);
+    // ⭐ EVERY LAUNCH OF A BUNDLE THAT MINTS THE DRAW BINDS ITS SAMPLER SEAT, every row of it,
+    // before anything runs — a MIDDLE prompt chunk included. Its suffix is skipped, but the
+    // seat's five sources are placed in this bundle all the same, and the launch's
+    // completeness check (`require_sources_filled`) refuses a placed source nobody wrote:
+    // binding only on suffix-running launches refused every prompt longer than one chunk
+    // (`5 caller-filled source(s) were never written`, 2b at 1061 tokens, 2026-10-28). The
+    // laws a middle chunk stages are this request's own, so nothing is invented; a bundle
+    // with no seat still refuses where a pick needs one.
+    let suffix_runs = per_request.is_some() || matches!(want_logits, LogitsWanted::LastRow);
+    if suffix_runs && b.wiring.sample_seat.is_none() {
+        return Err(werr(format!(
+            "bundle has no sampler seat (result t{}) — a launch whose suffix runs cannot \
+             pick without the minted draw",
+            b.result_id
+        )));
+    }
+    if let Some(seat) = b.wiring.sample_seat.as_ref() {
+        // ⭐ A DECODE BATCH'S SEAT IS THE RUNG'S OWN WIDTH. `b` is the single-request meta
+        // borrowed for its tensor ids, so its seat states the SOLO rung's `rows = 1` — a
+        // launch at `mq` rows binds and reads `mq` rows of the per-step pair, or every row
+        // past the first draws from an unstaged seat (and the readback below returns one
+        // token for a `mq`-slot launch). A prompt-final chunk keeps the prefill rung's own
+        // seat verbatim: its draw is the FOLDED single row.
+        let mut seat = *seat;
+        if per_request.is_some() {
+            seat.rows = mq as u32;
+        }
+        // ⭐ THE ROWS' LAWS, built to the launch's own arm — the variant must
+        // match `per_request`, and a mismatch is refused here, never silently
+        // resolved into a sampled request served greedy or a row sampling a
+        // request that is not its own.
+        let seat_rows = seat.rows as usize;
+        let laws: Vec<RowLaw<'_>> = match (&seat_laws, live_batch) {
+            // A PROMPT-FINAL CHUNK: one request, real row `i` at its own
+            // absolute position `start + i`, and a pad row CLAMPED to the last
+            // real position (the `tok_at` law — its whole forward is the last
+            // real token's). The consumed pick is the LAST BAKED ROW's, so an
+            // unfilled rung's pad rows must carry the same draw at the same
+            // salt the last real row would: a greedy pad law would silently
+            // pick greedy for a sampled request whenever the chunk did not
+            // fill its rung.
+            (SeatLaws::Prompt { draw }, None) => (0..seat_rows)
+                .map(|r| RowLaw {
+                    draw: *draw,
+                    step: (start + r.min(real - 1)) as u32,
+                })
+                .collect(),
+            // A DECODE BATCH: live slot `s` runs its own request's draw at its
+            // own rotary position (`rope_pos` IS that request's token count);
+            // a padding slot runs LIVE 0'S LAW — [`pad_law_of`], the pad clamp.
+            (SeatLaws::Batch { draws }, Some(live)) => batch_seat_laws(draws, live, seat_rows)?,
+            (SeatLaws::Batch { .. }, None) => {
+                return Err(werr(
+                    "run_prefill_batch: decode-batch seat laws for a launch with no \
+                     per-request rows — the laws must match the launch's own arm"
+                        .to_string(),
+                ));
+            }
+            (SeatLaws::Prompt { .. }, Some(_)) => {
+                return Err(werr(
+                    "run_prefill_batch: prompt-chunk seat laws for a decode batch — the laws \
+                     must match the launch's own arm"
+                        .to_string(),
+                ));
+            }
+        };
+        acts_i32.extend(sample_binds(&seat, &laws)?);
+    }
     if let Some((id, key, vals)) = launcher.causal_keyed {
         pf.bind_keyed(id, key, &vals)
             .map_err(|e| werr(format!("prefill: keyed causal bind: {e}")))?;
@@ -502,103 +757,107 @@ pub(crate) fn run_prefill_batch(
             f16_elems,
         );
     }
-    // NO-LOGITS variant for every chunk but the last: only the FINAL chunk's lm-head tail produces a
-    // token, so the rest DISCARD their logits — the executor launches no suffix for them and reads
-    // nothing back (`StepLogits::Discarded`). A decode batch is NOT that case: it reads its whole
-    // `[rows, vocab]` result itself, so the suffix must run (`StepLogits::LeftOnDevice`).
+    // NO-LOGITS for every prompt chunk: the lm-head tail's D2H is gone with the host
+    // pick — a prompt chunk launches no suffix and reads nothing back
+    // (`StepLogits::Discarded`). A decode batch is the one exception: its suffix IS
+    // the sampler, and its answer is the idx stick read back raw
+    // (`StepLogits::LeftOnDevice`).
     log_binds(
         &format!("prefill mq={mq} start={start}"),
         b.wiring,
         &acts,
         &acts_f16,
     );
-    let logits = match want_logits {
-        LogitsWanted::LastRow => {
-            let l = pf
-                .run_step_i32(mq, start, &acts, &acts_f16, &acts_i32, StepLogits::ReadBack)
+    let picked = match want_logits {
+        // ⭐ THE ONE DECODE PATH, SUBMITTED: stage, launch, enqueue the idx-stick read,
+        // return. The minted sampler consumes the `[rows, vocab]` result on the card and
+        // leaves the idx stick in its place; this arm defers the ONE raw D2H of that
+        // stick — never a logits read, never a host argmax — and the caller collects it
+        // through `collect_decode_tokens`, in-call when the schedule cannot defer, from
+        // the drain when it can. There is no second, synchronous decode arm.
+        LogitsWanted::PerRequestDeferred => {
+            if b.wiring.sample_seat.is_none() {
+                return Err(werr("decode bundle has no sampler seat".to_string()));
+            }
+            // ⭐ #32 (E) — THE OVERLAP PROBE'S ASK, taken as this step's submit work
+            // begins: had the PREVIOUS step's stick read already landed? NOT-yet-landed
+            // is "card busy at submit" — the overlap fraction the depth row cannot prove
+            // on its own. The ask is the peek handle's one method (`ReadPeek::fired` —
+            // BY TYPE a latch read, never a wait), and the static is process-wide
+            // because the borrows here cannot thread a worker field; the lock is
+            // uncontended against a ~24 ms step. Single-process by the bench's own
+            // shape; a second decode process would cross-talk the row, which the
+            // row's doc names.
+            let card_busy_at_submit = PRIOR_READ
+                .lock()
+                .expect("the overlap probe's own lock")
+                .as_ref()
+                .is_some_and(|s| !s.fired());
+            // The probe's clocks: one read per segment boundary, flushed once after
+            // the defer (see `step_segs`). The reads sit BETWEEN the segments'
+            // statements; nothing measured is moved, and no numeric path changes.
+            let t_bind = std::time::Instant::now();
+            // The rung's own width, not the solo meta's (see the seat-bind site above),
+            // is what `mq` is here — and it rides out in `SubmittedDecode::rows`.
+            pf.stage_step_acts(&acts, &acts_f16, &acts_i32)
                 .map_err(|e| {
                     werr(format!(
-                        "superdsc prefill run_step (mq={mq}, start={start}): {e}"
+                        "superdsc decode batch stage (mq={mq}, start={start}): {e}"
                     ))
-                })?
-                .unwrap_or_default();
-            Some(l.get(..vocab).unwrap_or(&l).to_vec())
-        }
-        // The shim's own logits D2H converts ONE row from the placement's start (it was written for
-        // the folded tail), so it cannot serve this case. Run with a null out-pointer and read the
-        // whole `[rows, width]` result tensor back instead — the same single D2H, then de-interleave.
-        LogitsWanted::PerRequest(geom) => {
-            pf.run_step_i32(
-                mq,
-                start,
-                &acts,
-                &acts_f16,
-                &acts_i32,
-                StepLogits::LeftOnDevice,
-            )
-            .map_err(|e| {
+                })?;
+            let t_submit = std::time::Instant::now();
+            pf.submit_step(mq, start).map_err(|e| {
                 werr(format!(
-                    "superdsc decode batch run_step (mq={mq}, start={start}): {e}"
+                    "superdsc decode batch submit (mq={mq}, start={start}): {e}"
                 ))
             })?;
-            // ⭐⭐ THE OBSERVATION, not another argument: read the mask BACK off the device and diff it
-            // against the bytes we staged. Identical ⇒ the mask is exonerated and the fault is in the KV
-            // path. Different ⇒ the fault is placement, the H2D window, or the staging, and the first
-            // differing element names which. This is the one thing about the batched fold that has never
-            // been looked at, and it is why every emitter-side guard passes while the output is wrong.
-            //
-            // Gated because a per-step D2H of this buffer is not free. `read_tensor` yields f32 from the
-            // device's f16, so compare against the staged bytes reinterpreted the same way.
-            let name = scratchy_target_spyre::bundle_code::PlaceId::Act((b.result_id) as u32);
-            // TIMED, because `predict`'s own phase timer CANNOT see this. Moving the logits readback
-            // out of `predict` (the shim converts one row, so it cannot serve a batch) also moved it
-            // outside `logits_d2h`, which is why that column reads 0.00 for a batched decode while
-            // ~47 ms of a 182 ms step at 32 requests sits unaccounted for. `read_tensor` D2Hs the
-            // WHOLE segment holding the logits, and the logits are a few MB of it.
-            let _t_logits = std::time::Instant::now();
-            let flat = pf
-                .read_tensor(name, geom.len())
-                .map_err(|e| werr(format!("decode batch: read logits {name}: {e}")))?;
-            if flat.len() < geom.len() {
-                return Err(werr(format!(
-                    "decode batch: logits {name} read back {} of {} elems ([{}, {}]) — the baked \
-                     placement is smaller than the rung's row count says it is",
-                    flat.len(),
-                    geom.len(),
-                    geom.rows,
-                    geom.width
-                )));
-            }
-            if flags().phase_time {
-                let ms = _t_logits.elapsed().as_secs_f64() * 1e3;
-                eprintln!(
-                    "[sdsc-host] batch_logits_d2h={ms:.2} ms  ({} rows x {} wide = {} elems read; \
-                     {} sampled)",
-                    geom.rows,
-                    geom.width,
-                    geom.len(),
-                    mq * vocab,
-                );
-            }
-            let gathered = geom.rows_contiguous(&flat, vocab).ok_or_else(|| {
-                werr(format!(
-                    "decode batch: gathering [{}, {}] logits at vocab {vocab} addressed outside the \
-                     {} elems read back",
-                    geom.rows,
-                    geom.width,
-                    flat.len()
-                ))
-            })?;
-            // ⭐ ROW-vs-ROW LOGITS, for the one test that needs no ground truth: run N IDENTICAL prompts
-            // and every row's logits must be IDENTICAL. They are not — four identical prompts produced
-            // three `' B: The answer'` and one `' Madrid.'` — and with identical inputs any difference at
-            // all is a defect, so this print localises WHICH rows diverge and by HOW MUCH without any
-            // baseline to argue about.
-            //
-            // Compares every row against row 0: max |Δ|, the element where it occurs, and each row's
-            // argmax. Identical argmaxes with a tiny Δ means accumulation-order noise; a different argmax
-            // means the rows genuinely computed different things.
-            Some(gathered)
+            // ⭐ THE DEPTH ROW'S OWN COUNT: submissions outstanding at this submit,
+            // process-wide, incremented here and decremented at the collect — the
+            // same population the worker's in-flight queue holds, stated once.
+            let depth = OUTSTANDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let t_defer = std::time::Instant::now();
+            // ⭐ THE COPY IS THE PLACEMENT'S TRUTH on this path: a decode-batch
+            // rung is the same tape baked at `mq` rows but addressed by
+            // FINGERPRINT, so `b.wiring`'s seat is the single-request meta
+            // (rows=1) while the launch — the logits block, the word tables,
+            // the idx stick — is `mq` rows wide (`RowCapacity::of_baked_rung`
+            // takes `prefill_m` for exactly this reason, one screen up). The
+            // readback must read through the SAME rows the launch laid — the
+            // deferred collect below carries `rows: mq` for exactly this law.
+            let read = pf
+                .defer_read_tensor_ring(
+                    scratchy_target_spyre::bundle_code::PlaceId::Act(b.result_id as u32),
+                    mq * 64 * 4,
+                )
+                .map_err(|e| {
+                    werr(format!(
+                        "superdsc decode batch idx read (mq={mq}, start={start}): {e}"
+                    ))
+                })?;
+            let t_stage = std::time::Instant::now();
+            // ⭐ #32 (E) — AND THIS STEP'S READ BECOMES THE NEXT SUBMIT'S ASK:
+            // the read's peek handle (minted, not cloned — `fired` is the whole
+            // of its surface; see `DeferredRead::signal`'s law).
+            *PRIOR_READ.lock().expect("the overlap probe's own lock") = Some(read.signal());
+            // The probe's flush — one lock, the submit half of the step. `stage` is
+            // `None`: this tree's next-step staging happens in the caller, outside
+            // the segment it would have to be clocked in, and a zero would dilute
+            // the staging mean.
+            crate::step_segs::record_submit(crate::step_segs::SubmitSegs {
+                bind: t_submit.duration_since(t_bind),
+                submit: t_defer.duration_since(t_submit),
+                defer: t_stage.duration_since(t_defer),
+                stage: None,
+                total: t_bind.elapsed(),
+                depth,
+                busy: card_busy_at_submit,
+            });
+            return Ok(BatchOut::Deferred(SubmittedDecode {
+                read,
+                rows: mq as u32,
+                result_id: b.result_id as u32,
+                vocab,
+            }));
         }
         LogitsWanted::None => {
             pf.run_step_i32(
@@ -616,6 +875,39 @@ pub(crate) fn run_prefill_batch(
             })?;
             None
         }
+        // ⭐ THE PROMPT-FINAL CHUNK'S PICK — on the card, through the prefill rung's
+        // own minted sampler (the general mint): the suffix runs, the sampler consumes
+        // the folded lm-head row there, and the idx stick comes back raw, exactly like
+        // decode's. One raw D2H of the idx — never a logits read, never a host argmax.
+        LogitsWanted::LastRow => {
+            pf.run_step_i32(
+                mq,
+                start,
+                &acts,
+                &acts_f16,
+                &acts_i32,
+                StepLogits::LeftOnDevice,
+            )
+            .map_err(|e| {
+                werr(format!(
+                    "superdsc prefill run_step (mq={mq}, start={start}): {e}"
+                ))
+            })?;
+            let seat = b
+                .wiring
+                .sample_seat
+                .as_ref()
+                .ok_or_else(|| werr("prefill bundle has no sampler seat".to_string()))?;
+            let picked = read_sampled_tokens(pf, seat, b.result_id as u32, vocab)?;
+            log_seat_readback(
+                pf,
+                seat,
+                b.wiring.load_consts,
+                &picked,
+                &format!("prefill-final mq={mq} start={start}"),
+            );
+            Some(picked)
+        }
     };
     // PREFILL-ROW PROBE (SCRATCHY_KV_PROBE): read back the prefill session's EMBED input
     // (t{embed_src}, [mq,hidden]) + the layer-0 K cache (t9, natural [nqh,cap,hd]) and print
@@ -628,10 +920,9 @@ pub(crate) fn run_prefill_batch(
     // per-position K/V norms expose POSITIONAL scrambling (positions permuted/duplicated/zeroed ⇒
     // attention attends the wrong tokens ⇒ off-topic ramble). |x|>256 flags fp16 x²-overflow risk,
     // |x|>65504 flags actual fp16 overflow, zero-count flags uninitialized/underflow.
-    Ok(logits)
+    Ok(BatchOut::Done(picked))
 }
 #[cfg(feature = "spyre-hw")]
-
 /// Every activation a forward binds, against what the BAKE says that tensor is — one line, at
 /// `debug`, per launch.
 ///
@@ -715,6 +1006,13 @@ pub(crate) struct ForwardLauncher<'a, V: Fn(usize) -> bool> {
         scratchy_subtile::sdsc_abstract::CausalKey,
         std::borrow::Cow<'static, [f32]>,
     )>,
+    /// ⭐⭐⭐ THE STICKS THIS LAUNCH HANDS TO THE CARD — filled by the ChainSeed skip below.
+    /// An `OnCard` launch's sticks are the CARD'S: the previous step's ChainStage writes them,
+    /// and the executor's persistent bind maps must let them go, or every later submit's
+    /// refill re-uploads the last `Host` seed over the card's own pick before the gather
+    /// reads it (the stuck-seed repetition, pinned on card 2026-10-27). The caller walks
+    /// this list through [`SuperDscSession::hand_to_card`] after the tape plays.
+    pub(crate) card_owned_sticks: Vec<scratchy_target_spyre::bundle_code::PlaceId>,
     /// Set when the tape's device step runs; the caller reads the logits from there.
     pub(crate) launched: bool,
 }
@@ -734,6 +1032,46 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
         if step.kernel == scratchy_target_spyre::forward_tape::ForwardKernel::CausalMask
             && self.causal_held == Some(self.inputs.causal)
         {
+            self.staged = None;
+            return Ok(());
+        }
+        // ⭐⭐ THE CHAIN'S SEED SKIP — THE `OnCard` ARM, the same shape as the held causal key. A
+        // stable seating's seeds are the card's own ChainStage writes (the previous step's pick,
+        // decomposed into the persistent sticks at its tail), so this launch stages NO seed and
+        // the device's gather reads the sticks as they were left. Binding a host seed here would
+        // need the PREVIOUS step's pick before this launch's submit — the drain fence the seed
+        // law exists to delete.
+        //
+        // ⛔⛔⛔ AND THE SKIP MUST GO FURTHER THAN "STAGE NOTHING". A previous `Host` launch's
+        // seed bind sits in the executor's PERSISTENT maps (`bind_input_raw` lands in `bound`),
+        // and the refill re-sends every unkeyed `bound` entry on EVERY submit — so an `OnCard`
+        // launch that only skips staging would have its preamble H2D overwrite the sticks with
+        // the LAST host seed every step, erasing the card's own ChainStage pick before the
+        // gather reads it. The skip therefore NAMES the two sticks for the caller to hand to
+        // the card ([`Self::card_owned_sticks`]) — the same one-fact-per-launch spelling the
+        // held causal key takes.
+        if step.kernel == scratchy_target_spyre::forward_tape::ForwardKernel::ChainSeed
+            && self.inputs.chain_seeds.is_none()
+        {
+            match self.shape.phase {
+                scratchy_target_spyre::forward_tape::ForwardPhase::Decode { chain } => {
+                    let s = scratchy_target_spyre::bundle_code::PlaceId::Act(chain.s_src);
+                    let l = scratchy_target_spyre::bundle_code::PlaceId::Act(chain.l_src);
+                    // THIS STEP'S OWN STICK, once — the s step and the l step each name theirs.
+                    if step.tensor == s || step.tensor == l {
+                        self.card_owned_sticks.push(step.tensor);
+                    } else {
+                        return Err(format!(
+                            "ChainSeed step on t{} — the chain names t{} (s) and t{} (l), and a \
+                             seed landing anywhere else is a stick the gather never reads",
+                            step.tensor.tid(),
+                            chain.s_src,
+                            chain.l_src
+                        ));
+                    }
+                }
+                scratchy_target_spyre::forward_tape::ForwardPhase::Prefill => {}
+            }
             self.staged = None;
             return Ok(());
         }
@@ -760,8 +1098,18 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
     fn h2d(&mut self, t: scratchy_subtile::host_tape::TensorId) -> Result<(), Self::Error> {
         let causal_tid = scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_CAUSAL_TID;
         let Some((tensor, staged)) = self.staged.take() else {
-            // The one step that stages nothing: the causal mask, when the session holds its key.
-            return if t.0 == causal_tid && self.causal_held == Some(self.inputs.causal) {
+            // The two steps that stage nothing: the causal mask when the session holds its key,
+            // and the chain's seed when the seeds are the card's own (`OnCard` — the two stick
+            // sources the phase's chain names).
+            let chain_skip = match self.shape.phase {
+                scratchy_target_spyre::forward_tape::ForwardPhase::Decode { chain } => {
+                    self.inputs.chain_seeds.is_none() && (t.0 == chain.s_src || t.0 == chain.l_src)
+                }
+                scratchy_target_spyre::forward_tape::ForwardPhase::Prefill => false,
+            };
+            return if (t.0 == causal_tid && self.causal_held == Some(self.inputs.causal))
+                || chain_skip
+            {
                 Ok(())
             } else {
                 Err("h2d with nothing staged".to_string())
@@ -790,6 +1138,17 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
                     // ⭐ THE ONE PLACE A `GatherEntry` BECOMES A NUMBER AGAIN — the wire encoder, which
                     // is what `as_i32` exists for. Everything upstream of here carries the type.
                     bytes.extend_from_slice(&e.as_i32().to_le_bytes());
+                }
+                self.acts_i32.push((tensor, bytes));
+            }
+            // ⭐ THE CHAIN'S SEED — raw u32 lane values, LE words verbatim through
+            // the same raw-integer bind the index table rides (the staging door's
+            // law: LE bytes are the device encoding for raw integer words), never
+            // the IEEE→SEN convert an f16 arm would run.
+            scratchy_target_spyre::forward_tape::Staged::U32(v) => {
+                let mut bytes = Vec::with_capacity(v.len() * 4);
+                for w in v.iter() {
+                    bytes.extend_from_slice(&w.to_le_bytes());
                 }
                 self.acts_i32.push((tensor, bytes));
             }
@@ -925,98 +1284,707 @@ fn chunk_index_table(
     })
 }
 
+/// ⭐ THE OWNER SEAT'S INDEX TABLE — the deleted solo loop's own spelling, exposed for the exec's
+/// W=1 arm: the one-request chunk gather at [`ChunkKeys`] `{ resident: pos, mapped: pos + 1,
+/// rows: OneRequest }`. The BATCH spelling ([`batch_chunk_index_table`]) lays the same pages at
+/// `ChunkRowKind::Batch`, which orders the value leg's entries differently
+/// ([`ChunkScratch::lx_form`]) — one more staged input the two arms may not disagree on. `None`
+/// when this body gathers nothing (the fused rungs), exactly as the solo loop read it.
+#[cfg(feature = "spyre-hw")]
+pub(crate) fn owner_chunk_index_table(
+    pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
+    session: &SuperDscSession,
+    step: scratchy_target_spyre::superdsc_exec::StepBody,
+    req: &ReqState,
+    ctx: PageMapCtx<'_>,
+    pos: usize,
+) -> ExecutorResult<Option<Vec<scratchy_subtile::sdsc_abstract::GatherEntry>>> {
+    chunk_index_table(
+        "decode owner",
+        pool,
+        session,
+        step,
+        req,
+        ctx,
+        ChunkKeys {
+            resident: pos,
+            mapped: pos as u32 + 1,
+            rows: scratchy_subtile::sdsc_abstract::ChunkRowKind::OneRequest,
+        },
+    )
+}
+
 /// ⭐ WHAT ONE CHUNK'S FORWARD PRODUCED — the per-row logits the host sampler
 /// reads. One enum (not a bare `Vec<Vec<f32>>`) because the shape is a fact of the
 /// step the caller must not be able to confuse with the model's other outs.
 pub(crate) enum ChunkOut {
-    /// Per-row logits, the last row last — the host sampler's input.
-    Rows(Vec<Vec<f32>>),
+    /// A prompt-only forward: no launch in it picked, nothing to sample. The first
+    /// generated token is picked by the DECODE launch that runs the prompt's last
+    /// token — never by a host readback.
+    Prompt,
+    /// TOKENS THE CARD PICKED, one per decode launch this chunk ran, in step order.
+    /// The minted sampler's idx stick, read back raw — the only pick that exists.
+    ///
+    /// ⛔ CARD-ONLY, `cfg`-ed out rather than never-constructed: the mint is a
+    /// decode-bundle CARD fact, and the emulator runs no minted sampler — every
+    /// emulator chunk is a `Prompt` by construction. The shared readers go through
+    /// [`ChunkOut::minted_pick`], which carries that law inside so no reader names
+    /// the variant.
+    #[cfg(feature = "spyre-hw")]
+    Tokens(Vec<u32>),
+}
+
+impl ChunkOut {
+    /// ⭐ THE CHUNK'S OWN MINTED PICKS, one per launch that ran a sampler — the
+    /// single door both shared pick readers go through. `None` is every chunk
+    /// that picked nothing: a mid-prompt chunk (its suffix never runs), or any
+    /// chunk of a build with no minted sampler, where the pick step's own
+    /// refusal — not a silent `Prompt` match — is what the caller meets.
+    pub(crate) fn minted_pick(&self) -> Option<&[u32]> {
+        #[cfg(feature = "spyre-hw")]
+        if let ChunkOut::Tokens(ts) = self {
+            return Some(ts);
+        }
+        None
+    }
+}
+
+/// ⭐ ONE ROW'S LAW FOR THE SEAT — what the launch's row `r` draws. `None` is
+/// the greedy law: the seed quadruple `(0, 0, 0, 0)` and `inv_t = 1.0`,
+/// byte-identical to the bind this path staged before any request asked for a
+/// draw. `Some` is that row's request's draw, and the STEP SALT is the row's
+/// ABSOLUTE position — the one input that changes every launch of one
+/// generation, so the same seed draws different noise (hence, past rare ties,
+/// a different token) at every position instead of repeating one pick.
+#[cfg(feature = "spyre-hw")]
+pub(crate) struct RowLaw<'a> {
+    pub(crate) draw: Option<&'a SampledDraw>,
+    /// The row's absolute position — its request's own token count at this
+    /// step, or (a prompt chunk's pad row) the last real position it clamps to.
+    pub(crate) step: u32,
+}
+
+/// ⭐⭐⭐ A PAD SLOT'S LAW IS LIVE 0'S OWN (the pad clamp, auditor ruling
+/// 2026-10-27). A decode pad row's whole forward is live 0's — the replica
+/// law: it borrows live 0's token, rotation, page map and prefix history, so
+/// its LOGITS ROW is live 0's byte for byte — and the draw is a deterministic
+/// function of (logits row, seed words) alone, the hash key being
+/// request-owned with no row term. So the pad row's pick equals live 0's pick
+/// exactly when its staged seat words are live 0's, and they must be: the
+/// pad's [`crate::ktir_node::Program::ChainStage`] decompose feeds its s/l
+/// stick, whose next-step embed row writes into LIVE 0'S POOL CELL (the
+/// racing write — the pad's cachewr and live 0's land on the same physical
+/// bytes), so only live 0's decompose keeps that write identical. The greedy
+/// case falls out whole: a greedy live 0 stages the gate's 0, and the pad
+/// draws greedy over live 0's replicated logits exactly as before — ONE
+/// mechanism for greedy and sampled, no kernel change, no emission movement.
+/// Called by every staging walk that lays pad rows (the decode batch's and
+/// the solo rung's), never spelled twice.
+#[cfg(feature = "spyre-hw")]
+fn pad_law_of<'a>(live0: &RowLaw<'a>) -> RowLaw<'a> {
+    RowLaw {
+        draw: live0.draw,
+        step: live0.step,
+    }
+}
+
+/// ⭐ THE DECODE BATCH'S OWN LAW WALK — one law per baked row of the seat:
+/// live slot `s` runs its request's draw at that request's own rotary
+/// position, and a padding slot runs live 0's ([`pad_law_of`]). Extracted
+/// from the staging arm so the pad clamp is pinnable without a launch.
+#[cfg(feature = "spyre-hw")]
+fn batch_seat_laws<'a>(
+    draws: &[Option<&'a SampledDraw>],
+    live: &scratchy_subtile::sdsc_abstract::LiveBatch,
+    seat_rows: usize,
+) -> ExecutorResult<Vec<RowLaw<'a>>> {
+    if draws.len() != live.live() {
+        return Err(werr(format!(
+            "run_prefill_batch: {} seat law(s) for {} live row(s) — one law per live request, \
+             in slot order",
+            draws.len(),
+            live.live()
+        )));
+    }
+    let mut next_live = 0usize;
+    let mut laws: Vec<RowLaw<'_>> = Vec::with_capacity(seat_rows);
+    for s in 0..seat_rows {
+        match live.row(s) {
+            Some(b) => {
+                laws.push(RowLaw {
+                    draw: draws[next_live],
+                    step: b.rope_pos.get(),
+                });
+                next_live += 1;
+            }
+            None => laws.push(match laws.first() {
+                Some(live0) => pad_law_of(live0),
+                // A launch with no live row at all: nothing replicates, and
+                // the greedy law stands.
+                None => RowLaw {
+                    draw: None,
+                    step: 0,
+                },
+            }),
+        }
+    }
+    Ok(laws)
+}
+
+/// ⭐ THE SEAT LAWS ONE LAUNCH RUNS ITS ROWS UNDER — the two shapes a caller
+/// can know them in, and ONLY those two: a prompt-final chunk serves ONE
+/// request whose rows are consecutive positions of one sequence, and a decode
+/// batch serves one request PER LIVE ROW. The variant must match the launch's
+/// own arm (`per_request`); a mismatch is refused where the seat is staged,
+/// never silently resolved.
+#[cfg(feature = "spyre-hw")]
+pub(crate) enum SeatLaws<'a> {
+    /// A prompt-final chunk: every baked row runs `draw` — real row `i` at its
+    /// own position `start + i`, and a pad row at the last real position it
+    /// clamps to (the pad row replicates the last real token's entire forward,
+    /// and the CONSUMED pick is the last baked row's, so the pad row must carry
+    /// the same draw the last real row would, or an unfilled rung would pick
+    /// greedy for a sampled request).
+    Prompt { draw: Option<&'a SampledDraw> },
+    /// A decode batch: one law per LIVE row, in slot order — that row's
+    /// request's draw at that request's own position. A padding slot runs
+    /// LIVE 0'S LAW ([`pad_law_of`], the pad clamp): its pick is never read,
+    /// but its ChainStage decompose feeds the s/l stick whose embed row races
+    /// live 0's pool cell, so it must draw live 0's pick — greedy when live 0
+    /// is greedy, live 0's own draw when it is sampled.
+    Batch {
+        draws: &'a [Option<&'a SampledDraw>],
+    },
+}
+
+/// ⭐ THE SEAT BINDS EVERY LAUNCH STAGES — the seat's per-step operands at
+/// their baked offsets, one law per baked row. Spelled so the greedy law is
+/// the plain first-max: the seed quadruple `(0, 0, 0, 0)` — the GATE
+/// table's 0 IS the greedy law, `score = xm·inv_t + g·0 = xm·inv_t` exactly
+/// (the fold's clamps keep g FINITE for any seed bytes, so `g·0` is +0, never
+/// NaN) — and inv_t = 1.0. A sampled row stages its request's draw instead:
+/// `(seed_lo, seed_hi, step, 1)` and that draw's own inverse temperature —
+/// the gate's 1 turns the noise on, and the step salt is the row's absolute
+/// position. ⭐ THE KEY IS REQUEST-OWNED ALONE (the P3 localization ruling,
+/// auditor 2026-10-27): the seed and the request's own step count, never the
+/// slot the request happens to land in — a request draws the same noise in
+/// any baked row of any batched launch (the row word the first spelling
+/// carried is GONE). FOUR `[rows, 1]` i32 word tables, one per member of the
+/// quadruple (the auditor's wall-4 ruling (a)): each is `invt`'s own class —
+/// one 128-B stick per row, the word at the STICK HEAD (`r · seed_row_words`,
+/// the seat's baked stride — the Col operand mode reads the head alone, the
+/// int-bcast leg's measured law) — and the worker writes the four words of
+/// row r at the four tables' stick heads and nothing else (the sticks' zero
+/// padding is the reservation's own, exactly inv_t's bind). ⭐⭐ THE GATE
+/// TABLE ALONE (`seed_words[3]`) carries the β reservation (front-b-noise,
+/// auditor 2026-10-27): its chain crosses the i32→f32 convert, so the table
+/// reserves the convert's 64-element device sweep (two sticks per row,
+/// `gate_row_words`) — the gate still lands at row r's stick HEAD, the same
+/// byte, with the sweep's tail zero-filled by the staging. Emitted as LE
+/// words for the raw (`acts_i32`) channel, which binds verbatim — i32 words
+/// for the seed tables, IEEE f32 for inv_t; the f32 `Bind` channel converts
+/// to SEN169 and is NOT verbatim.
+#[cfg(feature = "spyre-hw")]
+fn sample_binds(
+    seat: &scratchy_target_spyre::wiring::SampleSeat,
+    laws: &[RowLaw<'_>],
+) -> ExecutorResult<Vec<(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)>> {
+    let rows = seat.rows as usize;
+    if laws.len() != rows {
+        return Err(werr(format!(
+            "the sampler seat holds {rows} baked row(s) but {} law(s) were staged — one law per \
+             baked row, never fewer, never more",
+            laws.len()
+        )));
+    }
+    // ⭐ THE SEAT'S OWN LINE — what this launch's rows draw, stated where the
+    // words are built. The chat leg's order requires the server log to SHOW
+    // the seat binding the seeds (a seeded request served greedy, or two
+    // requests' seeds sharing one batched launch, is invisible without it):
+    // one line per launch, every row's seed, step salt, gate and inv_t.
+    tracing::debug!(
+        "SEAT_BIND rows={} seed_words={:?} invt=t{} laws={}",
+        rows,
+        seat.seed_words,
+        seat.invt,
+        laws.iter()
+            .enumerate()
+            .map(|(r, law)| match law.draw {
+                Some(d) => format!("r{r}:seed={}@step{}:inv_t{}", d.seed, law.step, d.inv_t),
+                None => format!("r{r}:greedy@step{}", law.step),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    // (seed_lo, seed_hi, step, greedy_gate) — the greedy row is zeros
+    // (the gate word's 0 is what makes the draw greedy); a sampled row is its
+    // request's seed split low/high, its step salt, and the gate's 1. One word
+    // per table, at each row's stick head. ⭐ NO ROW WORD (the P3 localization
+    // ruling): the key is request-owned alone, identical in every row.
+    let word_of = |k: usize, r: usize| -> i32 {
+        let law = &laws[r];
+        match (k, law.draw) {
+            (0, Some(d)) => d.seed as u32 as i32,
+            (1, Some(d)) => (d.seed >> 32) as u32 as i32,
+            (2, Some(_)) => law.step as i32,
+            (3, Some(_)) => 1,
+            // A greedy row: zeros for the seed, the step and the gate.
+            (_, None) => 0,
+            // The quadruple is FOUR words (the seat's own `[u32; 4]`); a fifth
+            // staged word has no law anywhere — refuse rather than stage a
+            // word nobody defined.
+            (_, Some(_)) => panic!(
+                "seed word {k}: the seat's quadruple is four words, indexed 0..=3 — a \
+                 fifth is a mint/seat disagreement, never a staged guess"
+            ),
+        }
+    };
+    // ⭐ THE SEAT STAGES THROUGH THE ONE COL LAW — `stage_col_stick_heads`,
+    // the same fn the bake's ten UNIFORM tables spread through
+    // (`LoadConst::card_bytes`), so the seat's words and the uniform tables
+    // can never disagree about where a row's word lives. The stride is the
+    // placement's own reservation; `seed_row_words` is its word form, and a
+    // seat that disagrees with the derivation refuses here rather than stage
+    // a word at a stride nobody placed.
+    let stride_bytes =
+        scratchy_target_spyre::wiring::col_row_stride_bytes(scratchy_tensors::DType::I32);
+    if seat.seed_row_words as usize * 4 != stride_bytes {
+        return Err(werr(format!(
+            "the sampler seat's seed_row_words is {} but the `[rows, 1]` reservation derives {} \
+             — the seat and the placement's own law disagree, refusing to stage the seed words",
+            seat.seed_row_words,
+            stride_bytes / 4
+        )));
+    }
+    // ⭐⭐⭐ THE GATE ALONE STAGES THE β RESERVATION (front-b-noise, auditor
+    // ruling 2026-10-27): its chain crosses the i32→f32 convert, so its table
+    // reserves the convert's 64-element device sweep — `stage_gate_sweep`
+    // writes the gate at row r's stick HEAD (the same byte the one-stick law
+    // ever stated) and zero-fills the sweep's second sticks. The same
+    // refusal-on-disagreement contract as `seed_row_words` above.
+    let gate_stride_bytes = scratchy_target_spyre::wiring::gate_row_stride_bytes();
+    if seat.gate_row_words as usize * 4 != gate_stride_bytes {
+        return Err(werr(format!(
+            "the sampler seat's gate_row_words is {} but the gate table's `[rows, 1]` device-sweep \
+             reservation derives {} — the seat and the placement's own law disagree, refusing to \
+             stage the gate",
+            seat.gate_row_words,
+            gate_stride_bytes / 4
+        )));
+    }
+    let mut binds = Vec::with_capacity(1 + seat.seed_words.len());
+    for (k, &tid) in seat.seed_words.iter().enumerate() {
+        let table = if k == 3 {
+            scratchy_target_spyre::wiring::stage_gate_sweep::<4>(
+                rows,
+                stride_bytes,
+                gate_stride_bytes,
+                |r| word_of(k, r).to_le_bytes(),
+            )
+        } else {
+            scratchy_target_spyre::wiring::stage_col_stick_heads::<4>(rows, stride_bytes, |r| {
+                word_of(k, r).to_le_bytes()
+            })
+        };
+        binds.push((scratchy_target_spyre::bundle_code::PlaceId::Act(tid), table));
+    }
+    // inv_t per row: the greedy law's 1.0, or the draw's own 1/T — at
+    // temperature 1.0 the two are the same bytes and only the seed and gate
+    // words differ. The same col law and the same stride (an f32 word shares
+    // the u32 stick geometry).
+    let invt = scratchy_target_spyre::wiring::stage_col_stick_heads::<4>(rows, stride_bytes, |r| {
+        laws[r].draw.map_or(1.0, |d| d.inv_t).to_le_bytes()
+    });
+    binds.push((
+        scratchy_target_spyre::bundle_code::PlaceId::Act(seat.invt),
+        invt,
+    ));
+    Ok(binds)
+}
+
+/// Read the minted sampler's idx stick back and decode it: one i32 per row at
+/// lane 0 of a 64-lane padded row. Any word at or past `vocab` is the sampler's
+/// sentinel — refuse it, never sample it.
+///
+/// ⭐ THE STICK IS SCATTERED, NOT ROW-MAJOR. A `[rows, 64]` SENUINT32 placement
+/// stores rows INTERLEAVED at the format's own 32-element stick — `dev_off_stk`
+/// with `SenUint32::ELEMS_PER_STICK` — so row r's lane 0 is word `r·32`, NOT
+/// `r·64`: measured on the card (probe, 2-row rung: each 64-word physical block
+/// held `32×row0's idx` then `32×row1's idx`, both blocks identical), where the
+/// row-major stride handed EVERY row row 0's pick. At `rows = 1` the scattered
+/// offset is 0 and the solo readback is byte-identical.
+#[cfg(feature = "spyre-hw")]
+fn read_sampled_tokens(
+    session: &mut SuperDscSession,
+    seat: &scratchy_target_spyre::wiring::SampleSeat,
+    result_id: u32,
+    vocab: usize,
+) -> ExecutorResult<Vec<u32>> {
+    let rows = seat.rows as usize;
+    let bytes = session
+        .read_tensor_raw(
+            scratchy_target_spyre::bundle_code::PlaceId::Act(result_id),
+            rows * 64 * 4,
+        )
+        .map_err(|e| werr(format!("sampler idx readback (t{result_id}): {e}")))?;
+    decode_idx_stick(&bytes, rows, vocab)
+}
+
+/// ⭐ #32 (c3) — THE COLLECT HALF of a submitted decode step: park on the idx
+/// read's own completion (the loop's ONE fence — this read's D2H, then the
+/// shadow's quiet point, never a whole-stream sync), then apply the exact
+/// [`read_sampled_tokens`] decode law to the bytes the ring slot holds. The
+/// SAME door whether the caller collects in-call (a schedule that cannot
+/// defer) or from the drain — the only difference is when, never what.
+#[cfg(feature = "spyre-hw")]
+pub(crate) fn collect_decode_tokens(
+    session: &mut SuperDscSession,
+    sub: &SubmittedDecode,
+) -> ExecutorResult<Vec<u32>> {
+    // The probe's collect-half clocks: the fence is the wait (at depth ≥ 2 it waits
+    // everything enqueued behind the read too, which is the pipeline's own cadence,
+    // not an artifact), the pick is the decode. And this collect is the outstanding
+    // count's other half — the submit incremented it, this decrements it, so the
+    // depth row counts exactly the submissions still uncollected.
+    let t_fence = std::time::Instant::now();
+    let bytes = session
+        .finish_deferred_read_raw(&sub.read)
+        .map_err(|e| werr(format!("sampler idx readback (t{}): {e}", sub.result_id)))?;
+    let t_pick = std::time::Instant::now();
+    let toks = decode_idx_stick(&bytes, sub.rows as usize, sub.vocab);
+    OUTSTANDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    let toks = toks?;
+    crate::step_segs::record_collect(crate::step_segs::CollectSegs {
+        fence: t_pick.duration_since(t_fence),
+        pick: t_pick.elapsed(),
+    });
+    Ok(toks)
+}
+
+/// The idx stick's own decode law, shared by the sync readback and the deferred
+/// collect so the two cannot drift.
+#[cfg(feature = "spyre-hw")]
+fn decode_idx_stick(bytes: &[u8], rows: usize, vocab: usize) -> ExecutorResult<Vec<u32>> {
+    let words: Vec<i32> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    // The idx stick's own format decides the stride — the same law every device
+    // tensor's host-side address takes (`dev_off_stk`), never a guessed row pitch.
+    let stk = <scratchy_subtile::superdsc_opspec::SenUint32 as scratchy_subtile::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+        as usize;
+    (0..rows)
+        .map(|r| {
+            let off = scratchy_subtile::sdsc_abstract::dev_off_stk(&[rows, 64], 1, &[r, 0], stk);
+            let w = words.get(off).copied().unwrap_or(-1);
+            let t = u32::try_from(w).map_err(|_| {
+                werr(format!(
+                    "the card's token draw for row {r} is {w} — not a token id"
+                ))
+            })?;
+            if t as usize >= vocab {
+                return Err(werr(format!(
+                    "the card's token draw for row {r} is {t} >= vocab {vocab} — the sampler's \
+                     sentinel, never a token"
+                )));
+            }
+            Ok(t)
+        })
+        .collect()
+}
+
+/// ⭐ THE SEAT READBACK — the greedy-draw localization (auditor order
+/// 2026-10-27): after a launch that drew, read the seat's OWN staged bytes
+/// back off the card and state them beside the pick, so ONE served run names
+/// the broken stage. Three byte-groups, one debug line per launch:
+///   * THE SEAT — the four seed words and inv_t, each row at its stick head,
+///     through the same scatter law `sample_binds` staged (zeros or a greedy
+///     quadruple on a sampled row ⇒ the seat path: the worker binds greedy
+///     whatever the params);
+///   * THE HASH CHAIN'S UNIFORM TABLES — hc1/hc2/hc3/c256 (`[rows, 1]`,
+///     staged at LOAD) at row 0's and row 1's stick heads, and the lane
+///     table's first words. A noise CONSTANT across lanes is exactly the
+///     greedy signature — a per-lane constant added to every score cannot
+///     move the argmax — and the hash is the only lane-varying term in the
+///     noise (the seeds and the gate enter row-wise by design). Row 1's head
+///     reading 0 where row 0's holds the constant is the DENSE-STAGING
+///     signature: the table was staged `rows` words dense instead of one
+///     word at every row's stick head — the class law the seat's own binds
+///     follow.
+///   * THE PICK — the logits row's own argmax (host, f16, `dev_off_stk`)
+///     beside the card's pick; pick = argmax at temp 1.0 is the failure
+///     itself, and WHICH byte-group broke names the stage.
+///     The card's noise intermediate g is NOT addressable from the wiring (the
+///     draw's internals are lower-layer ktir synthetics, no tids), so the
+///     readback brackets it: the staged inputs on one side, the pick on the
+///     other. A failed read logs its tid and stops the line — the readback never
+///     gates the run.
+#[cfg(feature = "spyre-hw")]
+fn log_seat_readback(
+    session: &mut SuperDscSession,
+    seat: &scratchy_target_spyre::wiring::SampleSeat,
+    consts: &[(u32, scratchy_target_spyre::wiring::LoadConst)],
+    picked: &[u32],
+    ctx: &str,
+) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    // LE words of a placement's first `words` words — the error names the tid.
+    fn le_words(session: &mut SuperDscSession, tid: u32, words: usize) -> Result<Vec<i32>, String> {
+        session
+            .read_tensor_raw(
+                scratchy_target_spyre::bundle_code::PlaceId::Act(tid),
+                words * 4,
+            )
+            .map(|b| {
+                b.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|w| i32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                    .collect()
+            })
+            .map_err(|e| format!("t{tid}: {e}"))
+    }
+    // A staged table's `(tid, rows)` by its kernel operand number (1..=20,
+    // the doc order in `sample_staged_tables`).
+    fn uniform(
+        consts: &[(u32, scratchy_target_spyre::wiring::LoadConst)],
+        operand: u8,
+    ) -> Option<(u32, usize)> {
+        consts.iter().find_map(|&(tid, k)| match k {
+            scratchy_target_spyre::wiring::LoadConst::SampleTable {
+                operand: o, rows, ..
+            } if o == operand => Some((tid, rows as usize)),
+            _ => None,
+        })
+    }
+    let rows = seat.rows as usize;
+    // The four word tables + inv_t — the full reservation, each row's word at
+    // its stick head (`sample_binds`' own law, read back through the same
+    // stride it staged).
+    let mut words: Vec<[i32; 4]> = vec![[0; 4]; rows];
+    for (k, seed_tid) in seat.seed_words.iter().enumerate() {
+        match le_words(session, *seed_tid, rows * seat.seed_row_words as usize) {
+            Ok(ws) => {
+                for (r, row) in words.iter_mut().enumerate() {
+                    row[k] = ws
+                        .get(r * seat.seed_row_words as usize)
+                        .copied()
+                        .unwrap_or(-1);
+                }
+            }
+            Err(e) => {
+                tracing::debug!("SEAT_READBACK {ctx}: seat word table read failed ({e})");
+                return;
+            }
+        }
+    }
+    let invt: Vec<f32> = match le_words(session, seat.invt, rows * 32) {
+        Ok(ws) => (0..rows)
+            .map(|r| ws.get(r * 32).copied().unwrap_or(0))
+            .map(|w| f32::from_bits(w as u32))
+            .collect(),
+        Err(e) => {
+            tracing::debug!("SEAT_READBACK {ctx}: inv_t read failed ({e})");
+            return;
+        }
+    };
+    // The hash chain's uniform tables at row 0's and row 1's stick heads.
+    let mut hash = String::new();
+    for (name, operand) in [("hc1", 10u8), ("hc2", 11), ("hc3", 12), ("c256", 13)] {
+        match uniform(consts, operand) {
+            Some((tid, trows)) => {
+                // ⭐ THE PLACEMENT IS THE LAUNCH'S ROWS on a batched rung: the
+                // wiring's kind carries the single-request meta (rows=1)
+                // while the rung's graph mints the table at the baked width,
+                // and the STAGING follows the kind — so reading the seat's
+                // own rows is what measures whether every stick head the
+                // launch addresses actually holds the constant (a staged
+                // one-word stream leaves rows past 0 reading ZERO).
+                let trows = trows.max(rows);
+                match le_words(session, tid, trows * 32) {
+                    Ok(ws) => {
+                        let w0 = ws.first().copied().unwrap_or(-1);
+                        let r1 = if trows > 1 {
+                            format!("/r1=0x{:08X}", ws.get(32).copied().unwrap_or(-1))
+                        } else {
+                            String::new()
+                        };
+                        hash.push_str(&format!("{name}(t{tid})=0x{w0:08X}{r1} "));
+                    }
+                    Err(e) => hash.push_str(&format!("{name}: READ-FAIL({e}) ")),
+                }
+            }
+            None => hash.push_str(&format!("{name}: NOT-IN-CONSTS ")),
+        }
+    }
+    // The lane table's first words — DISTINCT values prove the hash's one
+    // per-lane input lives; a zero or constant table flattens the noise.
+    let lane = match uniform(consts, 14) {
+        Some((tid, _)) => match le_words(session, tid, 4) {
+            Ok(ws) => format!("lane(t{tid})={ws:?}"),
+            Err(e) => format!("lane: READ-FAIL({e})"),
+        },
+        None => "lane: NOT-IN-CONSTS".to_string(),
+    };
+    // The logits row's own argmax, host-side, f16 through the same stick law
+    // the idx readback uses — the REPORT rows only (every row of a wide
+    // prefill rung would be minutes of nothing).
+    let report: Vec<usize> = if rows > 5 {
+        (0..4).chain([rows - 1]).collect()
+    } else {
+        (0..rows).collect()
+    };
+    let pad_v = seat.pad_vocab as usize;
+    let vocab = seat.vocab as usize;
+    let stk = <scratchy_subtile::superdsc_opspec::Fp16 as scratchy_subtile::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+        as usize;
+    let mut argmax: Vec<(usize, u32)> = Vec::with_capacity(report.len());
+    match session.read_tensor_raw(
+        scratchy_target_spyre::bundle_code::PlaceId::Act(seat.row),
+        rows * pad_v * 2,
+    ) {
+        Ok(b) => {
+            for &r in &report {
+                let mut best = (0usize, f32::NEG_INFINITY);
+                for j in 0..vocab {
+                    let e = scratchy_subtile::sdsc_abstract::dev_off_stk(
+                        &[rows, pad_v],
+                        1,
+                        &[r, j],
+                        stk,
+                    );
+                    let o = e * 2;
+                    if let Some(v) = b.get(o..o + 2) {
+                        let x = half::f16::from_le_bytes([v[0], v[1]]).to_f32();
+                        if x > best.1 {
+                            best = (j, x);
+                        }
+                    }
+                }
+                argmax.push((r, best.0 as u32));
+            }
+        }
+        Err(e) => {
+            tracing::debug!(
+                "SEAT_READBACK {ctx}: logits row t{} read failed: {e}",
+                seat.row
+            );
+        }
+    }
+    let per_row: Vec<String> = report
+        .iter()
+        .map(|&r| {
+            let pick = picked.get(r).copied();
+            let am = argmax
+                .iter()
+                .copied()
+                .find(|(ar, _)| *ar == r)
+                .map(|(_, a)| a);
+            format!(
+                "r{r}:words={:?}:invt={}:pick={:?}:argmax={:?}:eq={}",
+                words[r],
+                invt[r],
+                pick,
+                am,
+                pick == am
+            )
+        })
+        .collect();
+    tracing::debug!(
+        "SEAT_READBACK {ctx} rows={} {} {} {}",
+        rows,
+        hash,
+        lane,
+        per_row.join(" ")
+    );
+}
+
+/// ⭐ THE PREFILL LADDERS THE CHUNK LOOP CLIMBS, ONE BUNDLE: the prefix-free
+/// width ladder a prompt's first chunks pick from, and the prefix-capable
+/// ladder its continuation chunks pick from — both live in the bundle, both
+/// borrowed mutably because the picked rung's session is run in place.
+#[cfg(feature = "spyre-hw")]
+pub(crate) struct PrefillLadders<'a> {
+    // The prefill WIDTH LADDER, ascending by baked mq (see `SuperDscBundle::prefill_rungs`). Each
+    // chunk runs on the SMALLEST rung that holds it, so a short prompt stops paying for padding rows
+    // and a long one still gets the widest chunk. Empty ⇒ no batched prefill.
+    pub(crate) rungs: &'a mut [(usize, SuperDscSession)],
+    // The prefix-capable ladder for continuation chunks (start>0); the rungs above are prefix-free.
+    // A continuation chunk's width is chosen by `PrefixLadder::rung_for` and nowhere else.
+    pub(crate) prefix: &'a mut PrefixLadder,
+}
+
+/// ⭐ THE CHUNK PATHS' PAGING FACTS, ONE BUNDLE: the map context (the host's
+/// block list + the pool's owner split) and the pool's geometry — every bind
+/// DERIVES a request's page map and its layout from exactly this pair.
+#[cfg(feature = "spyre-hw")]
+pub(crate) struct ChunkPaging<'a> {
+    // THE HOST'S LIST + THE POOL'S OWNER SPLIT — needed because every bind DERIVES this request's page
+    // map rather than reading a stored one, and the map's fully-masked and hole pages come from the
+    // reserved range.
+    pub(crate) ctx: PageMapCtx<'a>,
+    // The pool's geometry, threaded from the model — `chunk_index_table`'s law, ONE spelling (built in
+    // `run_request_step` off `Loaded`'s own two numbers).
+    pub(crate) pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
 }
 
 #[cfg(feature = "spyre-hw")]
 pub(crate) fn superdsc_forward_chunk(
     sh: &Shared<'_>,
-    session: &mut SuperDscSession,
-    // The prefill WIDTH LADDER, ascending by baked mq (see `SuperDscBundle::prefill_rungs`). Each
-    // chunk runs on the SMALLEST rung that holds it, so a short prompt stops paying for padding rows
-    // and a long one still gets the widest chunk. Empty ⇒ no batched prefill.
-    prefill_rungs: &mut Vec<(usize, SuperDscSession)>,
-    // The prefix-capable ladder for continuation chunks (start>0); the rungs above are prefix-free.
-    // A continuation chunk's width is chosen by `PrefixLadder::rung_for` and nowhere else.
-    prefill_prefix: &mut PrefixLadder,
-    b: &BundleMeta,
-    // The prefill meta bound by `run_prefill_batch` to `prefill_session` (its tensor ids match the prefill
-    // manifest, unlike `b`, which is the decode meta the generation steps below use).
+    ladders: PrefillLadders<'_>,
+    // The prefill meta bound by `run_prefill_batch` to `prefill_session` (its tensor ids match the
+    // prefill manifest). The DECODE meta is deliberately NOT an argument any more: the solo m=1
+    // arm that read it is deleted, a generation step runs on the decode OWNER through the shared
+    // decode path (which reads the decode meta itself), and the ladder — not a cap bucket — is
+    // what picks the session a prompt chunk runs on.
     prefill_meta: Option<&BundleMeta>,
-    req: &mut ReqState,
-    // ⛔ THE STORE, LIVE AND MUTABLE — the chunk loop slices this request's tokens out of it AND advances
-    // its `tokens_in_pool`, because how far a chunked prefill got is known only here, after the loop. `id`
-    // indexes it. Passed rather than snapshotted for the reason `b4856997` records: a snapshot taken
-    // upstream of this step's writes is a stale copy, and that cost every prompt past one scheduler step.
-    id: &str,
-    tokens: &mut scratchy_serving_engine::input_batch::InputBatch,
-    start: usize,
-    toks: &[usize],
-    // THE HOST'S LIST + THE POOL'S OWNER SPLIT — needed because every bind DERIVES this request's page
-    // map rather than reading a stored one, and the map's fully-masked and hole pages come from the
-    // reserved range.
-    ctx: PageMapCtx<'_>,
-    // The pool's geometry, threaded from the model — `chunk_index_table`'s law, ONE spelling (built in
-    // `run_request_step` off `Loaded`'s own two numbers).
-    pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
+    Chunk {
+        state: req,
+        // ⛔ THE STORE, LIVE AND MUTABLE — the chunk loop slices this request's tokens out of it AND advances
+        // its `tokens_in_pool`, because how far a chunked prefill got is known only here, after the loop. `id`
+        // indexes it. Passed rather than snapshotted for the reason `b4856997` records: a snapshot taken
+        // upstream of this step's writes is a stale copy, and that cost every prompt past one scheduler step.
+        id,
+        tokens,
+        start,
+        toks,
+    }: Chunk<'_>,
+    paging: ChunkPaging<'_>,
 ) -> ExecutorResult<ChunkOut> {
+    let PrefillLadders {
+        rungs: prefill_rungs,
+        prefix: prefill_prefix,
+    } = ladders;
+    let ChunkPaging { ctx, pool } = paging;
     let n = toks.len();
     if n == 0 {
         return Err(werr("superdsc_forward_chunk: n=0".to_string()));
     }
-    // ⭐ NO `hd` HERE EITHER — the solo-decode causal tile's head count is the bake's
-    // `Geometry::nqh` (see the `num_q_heads` site below), and nothing else in this
-    // function asks a head-dim question.
-    let (h, vocab) = (sh.hidden, sh.vocab);
-    // MASK EXTENT: one validity row PER PAGE, laid end to end. The fold is re-launched per page and
-    // walks along this buffer, so page `i`'s row sits `i * page_slots` in.
-    // ⛔⛔⛔ SIZED BY THE PAGES THE LAUNCH **WALKS**, NOT BY THE HOST'S BLOCK COUNT.
-    //
-    // Those two are the same number only for a request whose keys are still at their own token positions. A
-    // row that has shared a batched step carries a HOLE, so the LOGICAL pages the fold walks — and therefore
-    // the validity rows it reads — EXCEED the blocks the host granted for its tokens; the difference is
-    // served by `PoolPartition`'s scratch and hole pages. Sizing this buffer by `ctx.host.len()` under-
-    // allocates it and the fill runs off the end.
-    //
-    // MEASURED: `corrupted size vs. prev_size while consolidating`, a glibc heap abort raised while DROPPING
-    // the activation `Vec<(String, Vec<f32>)>` this buffer lives in — `addr2line` on the abort's own
-    // backtrace put it in THIS function. It fires after every answer is already computed and it is
-    // INTERMITTENT, which is why it read as a teardown property of `scr batch` for a day.
-    //
-    // ⭐ THE SAME SLOT-VS-TOKEN CONFUSION AS EVERY OTHER DEFECT IN THIS PATH, in its most dangerous form:
-    // the others produced a wrong token, a wrong SIZE corrupts the allocator.
-    let cap = if session.page_slots > 0 {
-        let walked = scratchy_subtile::sdsc_abstract::RowPages::holding(SlotCount::new(
-            req.kv_hist.end().get().max((start + n) as u32),
-        ));
-        session.page_slots * (walked.get() as usize).max(ctx.host.len()).max(1)
-    } else {
-        session.cap
-    };
+    // ⭐ NO `hd` AND NO SOLO MASK EXTENT HERE ANY MORE — the solo m=1 arm that sized a
+    // per-request validity buffer (`cap`) is DELETED; every prompt chunk sizes its mask
+    // from the ladder rung it runs on, and a generation step never reaches this function.
     // ── CHUNKED BATCHED PREFILL (whole prompt, any resident prefix length). ──
-    // When a distinct m=N `prefill` session exists AND there's >1 token, run the WHOLE prompt through
-    // it as a sequence of ≤prefill_m batched forwards (populating its resident seg2 KV on-card via the
-    // mq>1 cachewr, one ≤prefill_m chunk at a time). The FINAL chunk also returns the first generated
-    // token's logits: the emitter folds the vocab-wide lm-head tail to m=1 over that chunk's last row
-    // (see `LAST_HIDDEN_TID`), so there is nothing left for a decode step to compute.
+    // When a distinct m=N `prefill` session exists, run the WHOLE prompt through
+    // it as a sequence of ≤prefill_m batched forwards (populating its resident seg2 KV on-card
+    // via the mq>1 cachewr, one ≤prefill_m chunk at a time). The prompt's LAST token IS in this
+    // call, as on main — the prompt-final chunk's own minted sampler picks the first
+    // generated token on the card; `run_request_step` runs no decode launch for a prompt
+    // step.
     //
-    // This USED to stop at toks[0..n-1) and then decode toks[n-1] on the m=1 path purely to get those
-    // logits — a second whole forward that re-streamed every weight (~29 ms) to compute one row the
-    // prefill already had in hand. Now TTFT is ceil(n/prefill_m) forwards, not that plus one.
-    //
-    // Reaching the decode loop below therefore means this call is a single generation step (n == 1):
-    // a multi-token prompt either returns its logits from the batched prefill or is refused, so the
-    // loop runs on `start`/`toks` directly.
+    // ⭐ THE GATE IS THE LADDER, NOT `n > 1`: a ONE-token prompt is a chunk of one row and
+    // runs on the smallest rung with its padding rows, exactly as a longer prompt's final
+    // leftover chunk always did. The solo m=1 arm that used to take `n == 1` is DELETED —
+    // a single GENERATION step is a batch of one on the decode OWNER through the shared
+    // decode path, and there is no second forward here to serve it.
     // ── SEQUENTIAL mq=1 PREFILL IS NUKED (scripts/verify_prefill_real.sh is the SOLE authority) ──
     // A multi-token PROMPT either goes through the batched mq=N forward, or the request is REFUSED.
     // There is NO env escape, NO silent fallback, NO "walk the prompt one token at a time". Every
     // prompt prefill emits exactly one unconditional, machine-parseable truth line.
-    let n_entry = n; // rows at entry: >1 ⇒ a prompt PREFILL request; ==1 ⇒ a decode step
+    let n_entry = n; // rows at entry: a PROMPT chunk (any width, the ladder pads); decode never reaches here
     let prefill_top_m = prefill_rungs.last().map(|(m, _)| *m).unwrap_or(0);
     if !prefill_rungs.is_empty() {
         // CHUNKED BATCHED PREFILL: cover the WHOLE prompt (all but the last token) as a sequence of
@@ -1027,8 +1995,8 @@ pub(crate) fn superdsc_forward_chunk(
         // at the kernel level. The ONLY thing that was missing was this loop: the prior code called
         // run_prefill_batch ONCE and REFUSED any prompt longer than one prefill_m-sized chunk, even
         // though the exact same call already supported a nonzero `start` for continued generation.
-        if n > 1 {
-            let real_total = n; // the WHOLE prompt goes through prefill, last token included
+        {
+            let real_total = n; // every token THIS call was given (the whole prompt — no hold-back)
             // Bind with the PREFILL meta (its embed/cos/sin/ONES tensor ids match the prefill session);
             // `b` (decode meta) would SILENTLY bind the wrong ids. batched_prefill is Some whenever the
             // prefill session that got us here exists, so this never fires — but fail LOUD if that invariant
@@ -1056,7 +2024,9 @@ pub(crate) fn superdsc_forward_chunk(
             let mut chunk_start = start;
             let mut tok = start;
             let tok_end = start + real_total;
-            let mut prefill_logits: Option<Vec<f32>> = None;
+            // The final chunk's on-card pick, carried out of the loop (a mid-prompt
+            // wave's last chunk is NOT a prompt-final chunk and picks nothing).
+            let mut prompt_pick: Option<Vec<u32>> = None;
             while tok < tok_end {
                 // Cap the chunk at the WIDEST rung, then run it on the NARROWEST rung that holds it.
                 // Both halves matter: the cap keeps chunk count minimal (each extra chunk re-pays the
@@ -1232,12 +2202,6 @@ pub(crate) fn superdsc_forward_chunk(
                     )),
                     ctx,
                 )?;
-                // Only the chunk that FINISHES THE PROMPT feeds the sampler — its folded tail
-                // is the first generated token's distribution. Every other chunk skips the
-                // logits D2H, a mid-prompt wave's last chunk included: its tail belongs to a
-                // later wave, and `run_request_step`'s sample guard returns without reading it.
-                let is_last_chunk = tok + chunk_len == tok_end;
-                let is_prompt_final_chunk = is_last_chunk && tok_end >= tokens.prompt_len(id);
                 // The chunk's tokens, at ABSOLUTE positions. `?` on the bound rather than an index panic:
                 // a chunk past the request's own tokens is a wiring bug and should say so.
                 let chunk_toks: Vec<usize> = (tok..tok + chunk_len)
@@ -1276,43 +2240,75 @@ pub(crate) fn superdsc_forward_chunk(
                         rows: scratchy_subtile::sdsc_abstract::ChunkRowKind::Prompt,
                     },
                 )?;
-                prefill_logits = run_prefill_batch(
+                // The chunk that FINISHES the prompt runs its suffix — the rung's own
+                // minted sampler picks the first generated token on the card
+                // (`LogitsWanted::LastRow`), and the idx stick is read back exactly
+                // like a decode launch's. Every other chunk's suffix never runs
+                // (`LogitsWanted::None`) and reads nothing back.
+                let is_last_chunk = tok + chunk_len == tok_end;
+                let is_prompt_final_chunk = is_last_chunk && tok_end >= tokens.prompt_len(id);
+                let chunk_pick = run_prefill_batch(
                     // A prompt chunk: these rows are consecutive positions of one sequence, so they
                     // share both the causal triangle and one resident-prefix validity row. `None` IS
                     // that statement — there are no per-request rows, so the chunk laws are the only
-                    // ones reachable.
-                    None,
-                    // The chunk's index table — `None` for a body that gathers nothing (no prefix, or
-                    // a prefix within one page on the per-page body).
-                    kv_blocks.as_deref(),
+                    // ones reachable. The chunk's index table rides beside it — `None` for a body
+                    // that gathers nothing (no prefix, or a prefix within one page on the per-page
+                    // body).
+                    BatchLaunch {
+                        per_request: None,
+                        kv_blocks: kv_blocks.as_deref(),
+                    },
                     sh,
                     pf,
                     pmeta,
-                    // ⭐ FROM THE REQUEST, AT ABSOLUTE POSITIONS — not from this step's window. A chunk
-                    // that stepped back needs tokens an earlier step was given, and the request holds them.
-                    &chunk_toks,
-                    // The LADDER entry's baked width — the rung this chunk actually runs on, of
-                    // which `chunk_len` rows carry real tokens.
-                    scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(rung_m as u32)
+                    RungShape {
+                        // The LADDER entry's baked width — the rung this chunk actually runs on, of
+                        // which `chunk_len` rows carry real tokens.
+                        prefill_m: scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(
+                            rung_m as u32,
+                        )
                         .ok_or_else(|| {
                             werr(
                                 "superdsc batched prefill: the selected rung has zero rows"
                                     .to_string(),
                             )
                         })?,
-                    // ⛔ THE RUNNING BODY'S OWN ANSWER, not the bundle's: the prefix bundle's ladder
-                    // mixes the per-page body (gathers nothing) with split-KV chunks (gather every
-                    // page), and its `KV_BLOCK_INDEX` placement is the chunk ceiling's.
-                    step.gathers(),
+                        // ⛔ THE RUNNING BODY'S OWN ANSWER, not the bundle's: the prefix bundle's ladder
+                        // mixes the per-page body (gathers nothing) with split-KV chunks (gather every
+                        // page), and its `KV_BLOCK_INDEX` placement is the chunk ceiling's.
+                        gathers: step.gathers(),
+                    },
                     chunk_start,
-                    // A prompt's tail is FOLDED to one row by the emitter, so there is one row to
-                    // read however many rows this chunk ran at.
-                    if is_prompt_final_chunk {
-                        LogitsWanted::LastRow
-                    } else {
-                        LogitsWanted::None
+                    SamplerLaws {
+                        // ⭐ FROM THE REQUEST, AT ABSOLUTE POSITIONS — not from this step's window. A chunk
+                        // that stepped back needs tokens an earlier step was given, and the request holds them.
+                        seeds: scratchy_subtile::sdsc_abstract::SeedSource::Host(&chunk_toks),
+                        want_logits: if is_prompt_final_chunk {
+                            LogitsWanted::LastRow
+                        } else {
+                            LogitsWanted::None
+                        },
+                        // ⭐ THE CHUNK'S SEAT LAW — this request's draw, every row of
+                        // it (the staging arm clamps pad rows to the last real
+                        // position). Only the prompt-FINAL chunk's value is ever
+                        // staged; a middle chunk's suffix never runs, so its law is
+                        // inert — but it is still THIS request's, never invented.
+                        laws: SeatLaws::Prompt {
+                            draw: req.draw.as_ref(),
+                        },
                     },
                 )?;
+                // A prompt chunk never defers: it asked for `LastRow`/`None`, the two arms
+                // that return `Done`.
+                prompt_pick = match chunk_pick {
+                    BatchOut::Done(p) => p,
+                    BatchOut::Deferred(_) => {
+                        return Err(werr(
+                            "a prompt chunk deferred its read — only a decode batch can"
+                                .to_string(),
+                        ));
+                    }
+                };
                 // UNCONDITIONAL truth-signal per chunk: `chunk_len` prompt tokens went through ONE
                 // mq=N forward. This is the ONLY line that lets verify_prefill_real.sh print
                 // PREFILL_REAL=PASS. `prefill_m` is the rung actually RUN (not the ceiling), so the
@@ -1333,7 +2329,7 @@ pub(crate) fn superdsc_forward_chunk(
                     // readings need `tok_end`, which is the one number the line did not carry.
                     "PREFILL_PATH=batched keys_to={} m_used={chunk_len} prefill_m={rung_m} \
                      rung={} top_m={prefill_top_m} prefix={} start={chunk_start} tok={tok} \
-                     tok_end={tok_end} real_total={real_total} logits={is_prompt_final_chunk}",
+                     tok_end={tok_end} real_total={real_total}",
                     // ⛔ THIS WAS `row=`, THE KV ROW — the one identity in scope, and it is gone with the
                     // rows. `ReqState` still carries no id (the id is the map key three frames up), so what
                     // replaces it is the slot its own keys reach: distinct per request in a RAGGED batch,
@@ -1350,7 +2346,7 @@ pub(crate) fn superdsc_forward_chunk(
                     use_prefix,
                 );
                 // THIS CHUNK'S `chunk_len` KV SLOTS ARE NOW THIS REQUEST'S, recorded before the next
-                // chunk binds — `bind_request_pages` takes the write slot from the history, so a chunk
+                // chunk binds — `bind_chunk_pages` takes the write slot from the history, so a chunk
                 // that did not record would send the next one back to write over its own keys. (It used
                 // to bind at the request's token count, which this function only advances after the loop,
                 // so a multi-chunk prompt wrote every chunk at the same slot.)
@@ -1394,311 +2390,27 @@ pub(crate) fn superdsc_forward_chunk(
             // `n_computed` claims tokens the request does not have, and the next decode step asks for a
             // token past the end (measured: `decode batch: req … has no token at 2167`).
             tokens.set_tokens_in_pool(id, tok);
-            // The prompt is fully computed AND its next-token logits are in hand, so return them
-            // straight to the sampler. A mid-prompt wave asks for no logits (see
-            // `is_prompt_final_chunk`), so an empty hand with the prompt unfinished is the
-            // expected shape — `run_request_step`'s sample guard returns before reading it.
-            // `None` with the prompt DONE means the loop never ran — impossible under `n > 1`,
-            // but refuse loudly rather than fall through to a decode path that would now
-            // re-forward zero tokens.
-            let row = match prefill_logits {
-                Some(row) => row,
-                None if tok_end < tokens.prompt_len(id) => return Ok(ChunkOut::Rows(Vec::new())),
-                None => {
-                    return Err(werr(format!(
-                        "superdsc batched prefill: covered {real_total} tokens but produced no \
-                         logits — the final chunk did not run its folded lm-head tail \
-                         (chunk-loop wiring bug)"
-                    )));
-                }
-            };
-            return Ok(ChunkOut::Rows(vec![row]));
+            // A prompt-FINAL forward returns the final chunk's on-card pick; a
+            // mid-prompt wave picks nothing — its tail belongs to a later wave —
+            // and still returns Prompt.
+            return Ok(match prompt_pick {
+                Some(ts) => ChunkOut::Tokens(ts),
+                None => ChunkOut::Prompt,
+            });
         }
     }
-    if n_entry > 1 {
-        // Only reachable when there's no prefill bundle at all: chunking covers any prompt length, and
-        // a prefill that DOES run returns its logits above rather than falling through to here.
-        eprintln!(
-            "PREFILL_PATH=refused reason=no-prefill-bundle n={n_entry} start={start} prefill_top_m={prefill_top_m}"
-        );
-        return Err(werr(format!(
-            "batched prefill did not run for this {n_entry}-token prompt (no prefill bundle) — the \
-             sequential mq=1 prefill path is REMOVED; refusing to serve. Real batched prefill only."
-        )));
-    }
-    // KV-residency invariant: the device-resident cache holds exactly `start`
-    // positions; this forward appends contiguously starting at `start`.
-    if tokens.tokens_in_pool_for(id) != start {
-        return Err(werr(format!(
-            "superdsc: resident cache holds {} positions but forwarding from {start} — KV desync \
-             (positions must be contiguous per request)",
-            tokens.tokens_in_pool_for(id)
-        )));
-    }
-    // PAGED: point this session at the request's pages before anything launches. Omitting it runs
-    // the forward against whichever request went last.
-    bind_request_pages(session, req, ctx)?;
-    // The ceiling is what THIS request's pages hold — an allocator decision, not a baked constant.
-    let req_cap = if session.is_paged() {
-        session.context_for_pages(ctx.host.len())
-    } else {
-        cap
-    };
-    if start + n > req_cap {
-        return Err(werr(format!(
-            "superdsc: context {start}+{n} exceeds this request's {req_cap} positions ({} page(s) \
-             x {} slots) — the scheduler must allocate it another block",
-            ctx.host.len(),
-            session.page_slots.max(1)
-        )));
-    }
-
-    // ON-CARD WEIGHT ORACLE: read a few resident weight tids back (SEN169→f32) and print
-    // rms/max — compare to the disk [host-weight] dump (load_weights). rms/max is layout-
-    // invariant (re-tile is a permutation), so a mismatch ⇒ the bf16→SEN169 conversion or
-    // re-tile CORRUPTS the weight magnitude (a prime wrong-content-direction suspect the
-    // synthetic F32 selftest can't catch). Match ⇒ conversion magnitude OK → bug is op/perm.
-    // Per-position rotary row tiled across heads to a `[1, width]` source.
-
-    let mut logits_rows: Vec<Vec<f32>> = Vec::with_capacity(n);
-    // The step's own timing line, shared by every readback so the step is visible in
-    // the same instrument — print-only (`flags().timing`), changes nothing computed.
-    let step_timing = |pos: usize, t: std::time::Instant| {
-        if flags().timing {
-            let rss_gb = std::fs::read_to_string("/proc/self/statm")
-                .ok()
-                .and_then(|s| {
-                    s.split_whitespace()
-                        .nth(1)
-                        .and_then(|p| p.parse::<f64>().ok())
-                })
-                .map(|pages| pages * 4096.0 / 1e9)
-                .unwrap_or(0.0);
-            tracing::debug!(
-                "[timing] forward pos={pos} took {:.2}s rss={rss_gb:.2}GB",
-                t.elapsed().as_secs_f64()
-            );
-        }
-    };
-    for (i, &tok) in toks.iter().enumerate() {
-        if tok >= vocab {
-            return Err(werr(format!("token {tok} >= vocab {vocab}")));
-        }
-        let p = start + i; // absolute position = valid prefix count this step
-
-        // ⭐ THE FORWARD, AS A TAPE. What used to be ~110 lines of interleaved
-        // value-computation and `acts.push` is now: name the shape (which
-        // kernels this bundle needs), then play it. The kernels live in
-        // `forward_tape`; the launcher above supplies their INPUTS and does the
-        // h2d. Order is the tape's, and it is pinned by
-        // `a_forward_binds_then_launches_exactly_once`.
-        //
-        // Note what disappeared with the `if let Some(mask_cap)` guard: a bake
-        // fact no longer BRANCHES a bind, it decides whether the step exists.
-        // ⭐ ONE FILL SITE, and it is the same call prefill makes. This list used to be written
-        // out by hand in BOTH binders and the two drifted twice — `IDENTITY_TID` and
-        // `ATTN_ZERO_TID` were each placed, gated correctly, and then never filled on the decode
-        // path. Both found only on card.
-        let consts = scratchy_target_spyre::wiring::synthetic_constants(
-            // ⛔⛔⛔ ONE ROW — THE LAUNCH'S, NOT THE BUNDLE'S CAPACITY.
-            //
-            // `synthetic_constants` derives `reductions = rows > 1`, which decides whether
-            // `RMS_INVCOLS` and `ONES_REDUCE` are bound at all. Passing `b.m_cap` passed the
-            // bundle's BAKED row count, and granite's decode bundle is baked at 96 rows (a batched
-            // decode rung) — so `rows > 1` was TRUE on the decode path, and this bound two reduce
-            // constants that the pre-tape decode binder never bound.
-            //
-            // The commit that introduced it argued the row count was the honest replacement for a
-            // hand-passed `reductions: bool` phase flag, and asserted in its own comment that
-            // decode's baked count is "1 here". It is 96. The row count IS the right input; the
-            // bundle's capacity is not the row count. Identical mistake to the one fixed for
-            // `ForwardShape::rows` — made twice, in the same file, from the same wrong assumption.
-            &b.facts
-                .constant_env(b.wiring, 64, scratchy_target_spyre::wiring::StagedRows::ONE),
-        );
-        // ⛔ BUILT BEFORE THE SHAPE, so the step gate below can BE this value rather than a second
-        // spelling of it. See the prefill path's note: a step with no source refuses loudly, but a
-        // source with no step is a mask computed and never uploaded — read as all-zero, i.e. every
-        // column valid, which is fluent and wrong.
-        //
-        // NOT `0..p`: a request that has shared a batched step carries a HOLE, and calling that
-        // hole valid feeds it another request's keys.
-        let prefix_src = session.pmask_slots.map(|cap| {
-            scratchy_target_spyre::forward_tape::PrefixSource::Broadcast {
-                cap,
-                holds: |col: usize| req.kv_hist.contains(col),
-            }
-        });
-        // The body this launch RUNS: `step_body(p)` is the same selection `run_step(1, p, ..)` makes
-        // (same session, same `p`).
-        let step = session.step_body(p).map_err(|e| {
-            werr(format!(
-                "solo decode: the session could not say which body pos {p} runs: {e}"
-            ))
-        })?;
-        // ⭐ ONE ROW, and the SAME call prefill makes. Decode is the batched form at `rows == 1`;
-        // the lemmas in `forward_tape`'s tests are what make that exact rather than approximate.
-        let shape = b.wiring.forward_shape(
-            scratchy_target_spyre::wiring::StagedRows::ONE,
-            prefix_src.is_some(),
-            // ⛔ THE RUNNING BODY'S OWN ANSWER — not "solo decode never gathers", and not the
-            // bundle's. The one-request ladder mixes bodies under one bundle: the per-page bodies
-            // within one page gather nothing, the split-KV chunks past it gather every page, and
-            // the bundle's `KV_BLOCK_INDEX` placement is the chunk ceiling's. Asked of the bundle,
-            // a one-page context demanded a table its body never reads and the step refused.
-            step.gathers(),
-            consts.len(),
-        );
-        // fp16-safe attention "-inf": half the largest finite fp16 magnitude, negated —
-        // spec-derived from `half::f16::MAX`, so `exp(score + mask)` underflows to 0 and stays
-        // finite.
-        let mask_neg = -(half::f16::MAX.to_f32() / 2.0);
-        // The new token's causal block: the one-row, one-real-row prompt-chunk key — row 0 attends
-        // column 0, the same triu law a prompt chunk takes per row. One key for every solo step, so
-        // the mask is bound once per session and never again.
-        let causal = scratchy_subtile::sdsc_abstract::CausalKey::chunk(
-            scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1).expect("1 is a width"),
-            1,
-        )
-        .expect("one real row of a one-row rung");
-        // ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK'S INDEX — the one-request body attends EVERY resident page in one
-        // pass (see `chunk_index_table`): positions `0..p` are resident, and the map holds the new
-        // token's page too.
-        let kv_blocks = chunk_index_table(
-            "solo decode",
-            pool,
-            session,
-            step,
-            req,
-            ctx,
-            ChunkKeys {
-                resident: p,
-                mapped: p as u32 + 1,
-                rows: scratchy_subtile::sdsc_abstract::ChunkRowKind::OneRequest,
-            },
-        )?;
-        let inputs = scratchy_target_spyre::forward_tape::ForwardInputs {
-            hidden: h,
-            // ⭐⭐⭐⭐⭐ THE BAKED HEAD COUNT — the causal tile is `nqh` rows at mq==1, and
-            // `h / hd` is that count only for a square Q projection. Same defect class the
-            // prefill path recorded: a short tile leaves the upper head rows of the ADDITIVE
-            // mask unstaged, which reads as ZERO — no mask. `b` is the decode meta this step
-            // launches, so its wiring's geometry is the count the placement was sized by.
-            num_q_heads: b.wiring.geometry.nqh as usize,
-            mq_pad: 64,
-            // One row: always the sub-blocked form (`NewBlockForm::of(1, …)`), whose block is every
-            // head — the SAME baked count as `num_q_heads` above, never the `h / hd` quotient (that is
-            // the head count only for a square Q projection; see the site above).
-            causal_heads_per_block: b.wiring.causal_heads_per_block(causal),
-            embed_tokens: sh.embed_tokens,
-            tokens: &[tok],
-            positions: &[p as u32],
-            causal,
-            prefix: prefix_src,
-            consts: &consts,
-            mask_neg,
-            // Proven to be the identity at one row, so this is decode's existing row-major
-            // staging spelled as the general form.
-            stick_major: true,
-            // ⭐ THE GATHER'S TABLE, from this request's own installed page map — one row, one
-            // page per pass, the reference's walk. `None` when the bundle places no index, which
-            // `kernel_values` turns into a REFUSAL if the tape carries the step — never into an
-            // empty buffer, because an unstaged index reads as block 0 and block 0 is a real
-            // address (row 0's first page), so every pass would answer from row 0's keys.
-            kv_blocks: kv_blocks.as_deref(),
-        };
-        let fsteps = shape.steps();
-        let fops = scratchy_target_spyre::forward_tape::operands(&fsteps);
-        let ftape = scratchy_target_spyre::forward_tape::tape_steps(&fsteps, &fops);
-        let mut launcher = ForwardLauncher {
-            shape: &shape,
-            steps: &fsteps,
-            inputs: &inputs,
-            staged: None,
-            acts: Vec::with_capacity(fsteps.len()),
-            acts_f16: Vec::new(),
-            acts_i32: Vec::new(),
-            causal_held: session.keyed_holds(scratchy_target_spyre::bundle_code::PlaceId::Act(
-                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_CAUSAL_TID,
-            )),
-            causal_keyed: None,
-            launched: false,
-        };
-        scratchy_subtile::host_tape::play(
-            &scratchy_subtile::host_tape::HostTape { steps: &ftape },
-            &mut launcher,
-        )
-        .map_err(|e| werr(format!("forward tape: {e}")))?;
-        // ⛔ EVERY STAGED LIST IS NAMED, no `..`: this site took `launcher.acts` alone and called the
-        // f32-only `run_step`, so the chunk gather's int32 index table (`acts_i32`) was staged and then
-        // DROPPED — the device read an all-zero index and every gathered block was block 0 (measured on
-        // granite-3.1-2b fp8: 64 pages of every kv head byte-identical). A new staged list is now a
-        // missing field here, and an unbound one is an unused binding.
-        let ForwardLauncher {
-            shape: _,
-            steps: _,
-            inputs: _,
-            staged: _,
-            acts,
-            acts_f16,
-            acts_i32,
-            causal_held: _,
-            causal_keyed,
-            launched,
-        } = launcher;
-        debug_assert!(launched, "the tape must reach its device step");
-        if let Some((id, key, vals)) = causal_keyed {
-            session
-                .bind_keyed(id, key, &vals)
-                .map_err(|e| werr(format!("decode: keyed causal bind: {e}")))?;
-        }
-
-        // INCREMENTAL: write 1 new token at absolute slot `p`; KV stays device-resident.
-        let _t_fwd = std::time::Instant::now();
-        log_binds(&format!("decode pos={p}"), b.wiring, &acts, &acts_f16);
-        {
-            let logits = session
-                .run_step_i32(1, p, &acts, &acts_f16, &acts_i32, StepLogits::ReadBack)
-                .map_err(|e| werr(format!("superdsc run_step (pos {p}): {e}")))?
-                .unwrap_or_default();
-            step_timing(p, _t_fwd);
-            let row = logits.get(..vocab).unwrap_or(&logits).to_vec();
-            // ── KCACHE PROBE (SCRATCHY_KCACHE_PROBE): read the layer-0 K cache t9 (resident, Kᵀ [nqh,hd,cap])
-            //    and print per-slot K-vector norms for head 0 around the 64-slot STICK BOUNDARY. If slot 64
-            //    (start of stick 1) shows a discontinuity vs 62/63/65, the K WRITE/VALUE at the boundary is
-            //    wrong (the pos-64 divergence); if smooth, the residue is the device READ or fp16 accumulation.
-            // HOST lm_head ORACLE: recompute logits = t787 @ embed.T on the HOST from the
-            // ON-CARD final-norm output (t787) and the tied embedding (= the lm_head weight).
-            //   host_argmax == oncard t788 argmax ⇒ the on-card lm_head is FAITHFUL to t787,
-            //     so the bug is t787 (the residual DIRECTION the body produced);
-            //   host_argmax != oncard ⇒ the on-card (tiled) lm_head matmul itself is wrong.
-            // Also reveals what token the on-card t787 SHOULD produce under a correct lm_head.
-            // ATTENTION HOST ORACLE: verify layer-0 attention VALUES (the per-head fix made it
-            // finite + context-reading but never proved correct). After this step the K/V cache
-            // (t9/t10, natural [nqh,cap,hd], GQA-replicated) holds slots [0..=p] incl. the just-
-            // written new token, so host attention = softmax(q·kᵀ·scale)·v over [0..=p] — no
-            // separate new-token/GQA handling. cos(host, on-card t343)<1 ⇒ attention compute wrong
-            // (restickify/scores/softmax); cos≈1 ⇒ attention right → bug is MLP/accumulation.
-            logits_rows.push(row);
-        }
-    }
-    tokens.set_tokens_in_pool(id, start + n);
-    // The solo forward wrote its `n` keys at the slot `bind_request_pages` bound it at — this request's
-    // own end, since nobody else was in the launch. Recorded here rather than per token because this
-    // loop is only ever reached with n == 1 (a multi-token prompt returns from the batched path above).
-    // ⭐ THE SLOT IS NAMED HERE, not derived inside a helper: this forward wrote at this request's own
-    // end because nobody else was in the launch. A PREFILL chunk cannot say that (it may have stepped
-    // back), which is why it goes through `record_chunk` instead.
-    let at = scratchy_subtile::sdsc_abstract::BatchSlot::solo(&req.kv_hist);
-    req.record_kv(
-        at,
-        scratchy_subtile::sdsc_abstract::SlotCount::new(n as u32),
+    // ⛔ THE SOLO DECODE ARM IS DELETED. A single generation step is a batch of ONE on the
+    // decode OWNER session (the W=1 rung), submitted, deferred and collected by the same
+    // shared decode path every wider batch takes — there is no second forward here. A call
+    // that falls to this point is a prompt with no prefill ladder to run on; refuse it,
+    // exactly as this refusal always did for wide prompts.
+    eprintln!(
+        "PREFILL_PATH=refused reason=no-prefill-bundle n={n_entry} start={start} prefill_top_m={prefill_top_m}"
     );
-    // KV PROBE (SCRATCHY_KV_PROBE): dump decode's layer-0 K cache (t9, natural [nqh,cap,hd]) head-0
-    // per-slot L2 norms for the first few slots. Compare BATCHED vs SEQUENTIAL (same prompt): the
-    // sequential t9 is the golden KV. If the batched slot-0..(prompt-1) norms differ, the mq>1
-    // prefill computed the wrong KV (H3); if they match, the KV is right and the bug is elsewhere.
-    Ok(ChunkOut::Rows(logits_rows))
+    Err(werr(format!(
+        "batched prefill did not run for this {n_entry}-token prompt (no prefill bundle) — the \
+         sequential mq=1 prefill path is REMOVED; refusing to serve. Real batched prefill only."
+    )))
 }
 
 /// What a [`forward_chunk`] runs: one request's chunk, the tokens `toks` at absolute positions
@@ -1731,45 +2443,39 @@ pub(crate) fn forward_chunk(
         start,
         toks,
     }: Chunk<'_>,
-    // The host's list + the pool's owner split: every bind DERIVES this request's page map, and the map's
-    // fully-masked and hole pages come from the range the host is never told about.
-    ctx: PageMapCtx<'_>,
-    // The pool's geometry, threaded from the model — one spelling, handed to
-    // `superdsc_forward_chunk`'s chunk paths (see `run_request_step`, where it is built).
-    pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
+    // The host's list + the pool's owner split, and the pool's geometry — threaded together because
+    // every bind derives this request's page map from exactly that pair (see `run_request_step`,
+    // where it is built).
+    paging: ChunkPaging<'_>,
 ) -> ExecutorResult<ChunkOut> {
-    {
-        let SendnnSession::SuperDsc(sb) = session;
-        // Split the borrow: the prompt runs through the m=N `prefill` session (if present),
-        // then the last token + all generation run through the m=1 `decode` session.
-        let SuperDscBundle {
-            decode,
-            prefill_rungs,
-            prefill_prefix,
-            // Named rather than `..` so adding a field keeps failing here until someone decides
-            // whether this path needs it. The batch ladder is not needed: this is the ONE-request
-            // path and a batched step never reaches it. The pool is not needed either: the request
-            // already holds its pages and the forward only installs their map.
-            decode_rungs: _,
-            pool_pages: _,
-            pool_rows: _,
-        } = sb;
-        return superdsc_forward_chunk(
-            sh,
-            decode,
-            prefill_rungs,
-            prefill_prefix,
-            b,
-            prefill_meta,
-            req,
+    let SendnnSession::SuperDsc(sb) = session;
+    // ⭐ ONLY THE LADDERS: the prompt runs through the m=N `prefill` rungs, and the
+    // generation steps that used to run through the m=1 `decode` session here are
+    // DELETED — a single request decodes as a batch of ONE on the owner, through the
+    // shared decode path in `spyre_exec`. The cap-bucket meta `b` is not a fact this
+    // path reads any more either: the ladder picks the rung, never a bucket.
+    let SuperDscBundle {
+        prefill_rungs,
+        prefill_prefix,
+        ..
+    } = sb;
+    let _ = b;
+    superdsc_forward_chunk(
+        sh,
+        PrefillLadders {
+            rungs: prefill_rungs.as_mut_slice(),
+            prefix: prefill_prefix,
+        },
+        prefill_meta,
+        Chunk {
+            state: req,
             id,
             tokens,
             start,
             toks,
-            ctx,
-            pool,
-        );
-    }
+        },
+        paging,
+    )
 }
 
 /// The KTIR-emulator twin of [`forward_chunk`]: one fused forward through the resident session,
@@ -1898,8 +2604,50 @@ pub(crate) fn forward_chunk(
     let mut dynamic: Vec<(u64, Vec<f32>, Vec<usize>)> = {
         let mut dynamic =
             Vec::with_capacity(1 + b.cos_srcs.len() + b.sin_srcs.len() + 2 * b.layers.len());
-        // The embedding is this chunk's rows of the hidden state.
-        dynamic.push((b.embed_src as u64, emb, vec![rows, sh.hidden]));
+        // ⭐ THE CHAIN REPLACES THE EMBED ROW PUSH here too — a chained wiring's
+        // gather reads the two persistent sticks, so the host's contribution is
+        // their seed: the LAST REAL token's decompose (the token this forward
+        // feeds — the same value the card path's ChainSeed steps state, and
+        // idempotent with the device's own ChainStage writes for the same
+        // reason: step t feeds the token step t-1 picked). The sticks carry u32
+        // lane values, so the seed rides this f32 list as BIT-PRESERVING WORDS
+        // (`f32::from_bits`) — the same carrying the reference legs use — and
+        // the gather's eval arm converts them back with `to_bits`.
+        match b.phase {
+            scratchy_target_spyre::forward_tape::ForwardPhase::Decode { chain } => {
+                // ⭐ THE SEEDS ARE PER-REQUEST-ROW AT THE FORWARD'S OWN WIDTH —
+                // the ONE per-row spelling (`chain_s_seed` / `chain_l_seed`,
+                // the same fns the card path's ChainSeed tape arm calls): row i
+                // carries ITS OWN token's decompose, pad rows repeat the last
+                // real token's (the same clamp the embed fill above uses,
+                // idempotent with the device's own ChainStage writes). The s
+                // seed is `[rows, lanes]` — one whole pattern stick per row —
+                // and the l seed is `[rows·l_sticks, lanes]`, row i's ramp
+                // sticks then row i+1's, the placement shape the mint states.
+                // At `rows == 1` both pushes are the solo spelling
+                // byte-for-byte.
+                let lanes = scratchy_subtile::subtile_ir::CHAIN_IDX_BLOCK as usize;
+                let l_sticks = scratchy_subtile::subtile_ir::chain_l_sticks(chain.hidden) as usize;
+                let toks32: Vec<u32> = toks.iter().map(|&t| t as u32).collect();
+                let s_words = scratchy_subtile::subtile_ir::chain_s_seed(chain.k, &toks32, rows);
+                let l_words =
+                    scratchy_subtile::subtile_ir::chain_l_seed(&toks32, chain.hidden, rows);
+                dynamic.push((
+                    chain.s_src as u64,
+                    s_words.iter().map(|w| f32::from_bits(*w)).collect(),
+                    vec![rows, lanes],
+                ));
+                dynamic.push((
+                    chain.l_src as u64,
+                    l_words.iter().map(|w| f32::from_bits(*w)).collect(),
+                    vec![rows * l_sticks, lanes],
+                ));
+            }
+            scratchy_target_spyre::forward_tape::ForwardPhase::Prefill => {
+                // The embedding is this chunk's rows of the hidden state.
+                dynamic.push((b.embed_src as u64, emb, vec![rows, sh.hidden]));
+            }
+        }
         // ⭐ THE COMPILE-TIME SCALARS, AT THEIR RESERVED TIDS. The programs read each
         // model constant (a ScalarMul multiplier, an RMSNorm epsilon or divisor) and the algebraic
         // identities `0`/`1` from a bound `[1,1]` tile rather than a KTIR immediate, so that ONE
@@ -2026,7 +2774,6 @@ pub(crate) fn forward_chunk(
             req.kv_k[li].extend_from_slice(&out[&(lw.new_k_id as u64)][..n * kvw]);
             req.kv_v[li].extend_from_slice(&out[&(lw.new_v_id as u64)][..n * kvw]);
         }
-        let res = &out[&(b.result_id as u64)];
         // ⭐⭐⭐ ONE LOGITS ROW, AT ROW 0 — because that is what the bundle COMPUTES.
         //
         // A prefill bundle does not run its vocab-wide lm_head at `mq`. `lower_one_node`'s
@@ -2042,7 +2789,11 @@ pub(crate) fn forward_chunk(
         // chose. It coincided with row 0 only at n == 1, which is why decode looked correct and a
         // prompt that fit ONE chunk looked correct. MEASURED: the result tensor comes back with
         // ~one row of `vocab` nonzeros and every argmax below `vocab`, i.e. in row 0.
-        Ok(ChunkOut::Rows(vec![res[..vocab].to_vec()]))
+        //
+        // ⭐ THE HOST PICK IS GONE, so this row is read by NOBODY: the emulator has
+        // no minted sampler (the mint is a decode-bundle card fact), so an emulated
+        // forward produces no token. The card is the only judge.
+        Ok(ChunkOut::Prompt)
     }
 }
 
@@ -2073,9 +2824,9 @@ pub(crate) fn run_request_step(
     start: usize,
     n: usize,
     // The host's block list for this request, read from `InputBatch` by the caller, and the pool's owner
-    // split. Passed in rather than looked up here so there is one read of the store per step.
-    #[cfg(feature = "spyre-hw")] host: &[usize],
-    #[cfg(feature = "spyre-hw")] part: PoolPartition,
+    // split, in one context. Passed in rather than looked up here so there is one read of the store per
+    // step.
+    #[cfg(feature = "spyre-hw")] pages: PageMapCtx<'_>,
 ) -> ExecutorResult<Option<u32>> {
     if n == 0 {
         return Ok(None);
@@ -2083,7 +2834,7 @@ pub(crate) fn run_request_step(
     // The map context for this request's whole step: the host's list (read from `InputBatch` by the
     // caller) and the pool's owner split, derived once.
     #[cfg(feature = "spyre-hw")]
-    let ctx = PageMapCtx { host, part };
+    let ctx = pages;
     let toks: Vec<usize> = (start..start + n)
         .map(|p| {
             tokens.token_at(id, p).map(|t| t as usize).ok_or_else(|| {
@@ -2230,10 +2981,28 @@ pub(crate) fn run_request_step(
     // baseline path while batched mq=N prefill (task #33) is brought up in parallel. Decode (n==1) and
     // non-SuperDSC paths are unaffected; a batched prefill session (prefill.is_some) still takes the
     // fast prefill_m+1 chunk above.
-    let mut last: Vec<f32> = Vec::new();
+    // ⭐ THE PROMPT'S LAST TOKEN RUNS THROUGH PREFILL, exactly as on main. The
+    // prompt-final chunk's own minted sampler (the general mint — every prefill
+    // rung carries the draw) picks the first generated token ON THE CARD from
+    // the folded lm-head row, and the idx stick is read back exactly like a
+    // decode launch's. No decode launch runs a prompt step, so the last prompt
+    // position's KV is prefill-written, as main writes it. A generation step
+    // (n==1) prefills nothing and takes the DECODE pick launch below — every
+    // generated token past the first is the decode bundle's own draw. A
+    // mid-prompt wave (start+n still inside the prompt) forwards every token it
+    // was given and picks nothing: its chunks' suffixes never run.
+    let finishes = start + n >= tokens.prompt_len(id);
+    let prefill_n = if finishes && n > 1 {
+        n
+    } else if finishes {
+        0
+    } else {
+        n
+    };
     let mut pos = start;
-    for chunk in toks.chunks(chunk_w) {
-        match forward_chunk(
+    let mut prompt_pick: Option<u32> = None;
+    for chunk in toks[..prefill_n].chunks(chunk_w) {
+        if let Some(ts) = forward_chunk(
             &sh,
             &mut model.session,
             b,
@@ -2246,27 +3015,320 @@ pub(crate) fn run_request_step(
                 toks: chunk,
             },
             #[cfg(feature = "spyre-hw")]
-            ctx,
-            #[cfg(feature = "spyre-hw")]
-            pool,
-        )? {
-            ChunkOut::Rows(rows) => last = rows.into_iter().next_back().unwrap_or_default(),
+            ChunkPaging { ctx, pool },
+        )?
+        .minted_pick()
+        {
+            prompt_pick = ts.last().copied();
         }
         pos += chunk.len();
     }
-    let p_last = start + n - 1;
-    if p_last + 1 >= tokens.prompt_len(id) {
-        // The host `argmax` is the sampler.
-        let tok = argmax(&last) as u32;
-        // ⭐ THE SAME TOP-2 GAP AS THE BATCHED PATH, so a mixed run's steps are all visible in one log.
-        //
-        // Without this, `SCRATCHY_TOP2` covered only the batched sampling site — and a step with ONE live
-        // request comes down HERE, so two repeat runs printed 8 and 6 lines and the difference read as
-        // missing data rather than as "these steps were solo". A gap in an instrument is indistinguishable
-        // from a gap in the thing it measures.
-        tokens.push_generated(id, tok);
-        Ok(Some(tok))
+    if !finishes {
+        return Ok(None);
+    }
+    let tok = if n > 1 {
+        // The prompt-final chunk's on-card pick — the prefill rung's own minted
+        // sampler, read back as its idx stick. A `None` here means the final
+        // chunk never asked for its draw — a wiring bug, never a silent skip.
+        prompt_pick.ok_or_else(|| {
+            werr("the prompt-final chunk picked no token — its minted draw never ran".to_string())
+        })?
     } else {
-        Ok(None)
+        // THE PICK — on the card, through the decode bundle's sampler. No host
+        // logits, no host argmax, anywhere: the idx stick is the only answer that
+        // comes back.
+        let db = select_decode(&model.decode, start + n);
+        match forward_chunk(
+            &sh,
+            &mut model.session,
+            db,
+            model.batched_prefill.as_ref(),
+            Chunk {
+                state: req,
+                id,
+                tokens,
+                start: start + n - 1,
+                toks: &toks[n - 1..n],
+            },
+            #[cfg(feature = "spyre-hw")]
+            ChunkPaging { ctx, pool },
+        )?
+        .minted_pick()
+        {
+            Some(ts) => *ts
+                .last()
+                .ok_or_else(|| werr("the pick step's decode launch picked no token".to_string()))?,
+            None => {
+                return Err(werr(
+                    "the pick step ran no decode launch — this build has no device sampler"
+                        .to_string(),
+                ));
+            }
+        }
+    };
+    tokens.push_generated(id, tok);
+    Ok(Some(tok))
+}
+
+/// ⭐ THE PAD CLAMP'S OWN PIN (auditor ruling 2026-10-27): a pad row's staged
+/// seat words are LIVE 0'S — for a greedy live 0 and a sampled one — because
+/// the pad's ChainStage decompose feeds the s/l stick whose embed row races
+/// live 0's pool cell, and only live 0's law keeps those bytes identical.
+#[cfg(all(test, feature = "spyre-hw"))]
+mod pad_clamp_tests {
+    use super::*;
+
+    /// A seat at `rows` baked rows whose strides agree with the placement's own
+    /// derivations (the staging's own refusal contract), so `sample_binds`
+    /// stages for real.
+    fn seat_of(rows: u32) -> scratchy_target_spyre::wiring::SampleSeat {
+        scratchy_target_spyre::wiring::SampleSeat {
+            seed_words: [901, 902, 903, 904],
+            invt: 905,
+            rows,
+            row: 0,
+            vocab: 100,
+            pad_vocab: 128,
+            seed_row_words: (scratchy_target_spyre::wiring::col_row_stride_bytes(
+                scratchy_tensors::DType::I32,
+            ) / 4) as u32,
+            gate_row_words: (scratchy_target_spyre::wiring::gate_row_stride_bytes() / 4) as u32,
+        }
+    }
+
+    /// Two live rows in a 4-row rung — slots 2 and 3 are padding — with the
+    /// live batch handed to `f` while the histories it borrows are alive.
+    fn with_two_of_four<R>(f: impl FnOnce(&scratchy_subtile::sdsc_abstract::LiveBatch) -> R) -> R {
+        use scratchy_subtile::sdsc_abstract::{BatchRow, KvHistory, RungWidth, SeqPos, SlotMap};
+        let width = RungWidth::of_baked_rows(4).expect("a 4-row rung");
+        let hists: Vec<_> = (0..2).map(|i| KvHistory::contiguous(8 + i)).collect();
+        let live = SlotMap::of_live(2, width)
+            .expect("2 live rows fit")
+            .live_rows(|i| {
+                Ok::<_, ()>(BatchRow {
+                    rope_pos: SeqPos::new(10 + i as u32),
+                    hist: hists[i].clone(),
+                })
+            })
+            .expect("the builder never fails here");
+        f(&live)
+    }
+
+    /// Every staged bind's pad-row words equal row 0's — the four seed tables
+    /// and inv_t alike. EVERY word sits at its row's STICK HEAD
+    /// (`col_row_stride_bytes`): the gate table's reservation is wider (the
+    /// i32→f32 convert's device sweep, two sticks per row) but the sweep's
+    /// second sticks are the reservation's own zero tail — the word the
+    /// kernel reads is still the head, at the same stride as every other
+    /// table.
+    fn assert_pads_stage_live_0(
+        seat: &scratchy_target_spyre::wiring::SampleSeat,
+        laws: &[RowLaw<'_>],
+        ctx: &str,
+    ) {
+        let binds = sample_binds(seat, laws).expect("the seat stages");
+        let head_stride =
+            scratchy_target_spyre::wiring::col_row_stride_bytes(scratchy_tensors::DType::I32);
+        assert_eq!(binds.len(), 5, "{ctx}: four seed tables and inv_t");
+        for (tid, bytes) in &binds {
+            for r in [2usize, 3] {
+                assert_eq!(
+                    &bytes[r * head_stride..r * head_stride + 4],
+                    &bytes[0..4],
+                    "{ctx}: bind t{tid:?} row {r} (a padding slot) staged words row 0's own \
+                     are not — the pad clamp broke",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_full_rung_classes_no_row_as_a_pad() {
+        // ⭐ THE FULL-OCCUPANCY LAW (auditor order 2026-10-27): with live ==
+        // rows, EVERY row runs its own request's draw — no row is classed as
+        // a pad (the non-pipelined tree seated a 4-request launch's fourth
+        // row greedy; this pin refuses that class of defect here).
+        use scratchy_subtile::sdsc_abstract::{BatchRow, KvHistory, RungWidth, SeqPos, SlotMap};
+        let width = RungWidth::of_baked_rows(4).expect("a 4-row rung");
+        let hists: Vec<_> = (0..4).map(|i| KvHistory::contiguous(8 + i)).collect();
+        let live = SlotMap::of_live(4, width)
+            .expect("4 live rows fill the rung")
+            .live_rows(|i| {
+                Ok::<_, ()>(BatchRow {
+                    rope_pos: SeqPos::new(10 + i as u32),
+                    hist: hists[i].clone(),
+                })
+            })
+            .expect("the builder never fails here");
+        let owned: Vec<SampledDraw> = (0..4)
+            .map(|i| SampledDraw {
+                seed: 1000 + i as u64,
+                inv_t: 0.5,
+            })
+            .collect();
+        let draws: Vec<Option<&SampledDraw>> = owned.iter().map(Some).collect();
+        let laws = batch_seat_laws(&draws, &live, 4).expect("the full laws lay");
+        assert_eq!(laws.len(), 4);
+        for s in 0..4 {
+            let law = laws[s].draw.unwrap_or_else(|| {
+                panic!("row {s} of a FULL rung staged greedy — no row is a pad")
+            });
+            assert_eq!(law.seed, 1000 + s as u64, "row {s} runs its OWN draw");
+            assert_eq!(
+                laws[s].step,
+                10 + s as u32,
+                "row {s} keeps its own step salt"
+            );
+        }
+    }
+
+    #[test]
+    fn a_greedy_live_0_clamps_its_pads_to_greedy() {
+        let seat = seat_of(4);
+        let draws: [Option<&SampledDraw>; 2] = [None, None];
+        let laws =
+            with_two_of_four(|live| batch_seat_laws(&draws, live, 4)).expect("the greedy laws lay");
+        // The law itself: pads 2 and 3 carry live 0's law — greedy, at live
+        // 0's own step salt (the word the gate's 0 makes inert).
+        assert!(laws[2].draw.is_none() && laws[3].draw.is_none());
+        assert_eq!(laws[2].step, laws[0].step, "the pad clamps live 0's step");
+        assert_eq!(laws[3].step, laws[0].step, "every pad clamps live 0's step");
+        assert_pads_stage_live_0(&seat, &laws, "greedy live 0");
+    }
+
+    #[test]
+    fn a_sampled_live_0_clamps_its_pads_to_its_draw() {
+        let seat = seat_of(4);
+        let draw = SampledDraw {
+            seed: 0x0123_4567_89AB_CDEF,
+            inv_t: 0.5,
+        };
+        // Live 0 sampled, live 1 greedy: the pads clamp LIVE 0'S law, not the
+        // last live row's and not the greedy one.
+        let draws: [Option<&SampledDraw>; 2] = [Some(&draw), None];
+        let laws = with_two_of_four(|live| batch_seat_laws(&draws, live, 4))
+            .expect("the sampled laws lay");
+        for r in [2usize, 3] {
+            let pad = laws[r]
+                .draw
+                .expect("the pad clamps live 0's draw, not greedy");
+            assert_eq!(pad.seed, draw.seed, "pad {r}: live 0's seed");
+            assert_eq!(
+                pad.inv_t.to_bits(),
+                draw.inv_t.to_bits(),
+                "pad {r}: live 0's inv_t"
+            );
+            assert_eq!(laws[r].step, laws[0].step, "pad {r}: live 0's step salt");
+        }
+        // Live 1 keeps its OWN greedy law — the clamp touches pads alone.
+        assert!(laws[1].draw.is_none());
+        assert_pads_stage_live_0(&seat, &laws, "sampled live 0");
+    }
+
+    /// ⭐⭐⭐ THE ONCARD HAND-OFF'S OWN PIN (card-pinned 2026-10-27): an `OnCard` decode
+    /// launch must NAME its two sticks for the caller to hand to the card, because the
+    /// executor's refill re-sends every unkeyed `bound` entry on every submit — a
+    /// previous `Host` launch's seed bind left in the maps would overwrite the card's own
+    /// ChainStage pick before the gather reads it (the stuck-seed repetition: every
+    /// batched text from the third token on was the seed token re-emitted, while solo —
+    /// which re-seeds `Host` every step — stayed byte-identical). The skip is the launch's
+    /// ONE fact about the sticks, exactly as the held causal key is its one fact about
+    /// the mask.
+    #[test]
+    fn an_oncard_launch_names_its_sticks_and_a_host_launch_names_none() {
+        use scratchy_subtile::host_tape::{HostTape, play};
+        use scratchy_target_spyre::forward_tape::{
+            ForwardInputs, ForwardShape, operands, tape_steps,
+        };
+
+        let chain = scratchy_target_spyre::wiring::ChainWiring {
+            s_src: 41,
+            l_src: 43,
+            k: 3,
+            hidden: 2048,
+            replaces: 7,
+        };
+        let shape = ForwardShape {
+            rows: 1,
+            embed_src: 1,
+            cos_srcs: &[],
+            sin_srcs: &[],
+            prefix_mask: false,
+            kv_block_index: false,
+            n_consts: 0,
+            phase: scratchy_target_spyre::forward_tape::ForwardPhase::Decode { chain },
+        };
+        let steps = shape.steps();
+        let ops = operands(&steps);
+        let ftape = tape_steps(&steps, &ops);
+
+        // (the hand-off list, whether the seeds staged, and the tape's own launch flag)
+        let play_with = |chain_seeds: Option<&'static [usize]>| {
+            let inputs = ForwardInputs::<fn(usize) -> bool> {
+                hidden: 2048,
+                num_q_heads: 1,
+                mq_pad: 64,
+                causal_heads_per_block: 1,
+                embed_tokens: &[],
+                tokens: &[],
+                chain_seeds,
+                positions: &[],
+                causal: scratchy_subtile::sdsc_abstract::CausalKey::chunk(
+                    scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1).expect("a width"),
+                    1,
+                )
+                .expect("a key"),
+                prefix: None,
+                consts: &[],
+                mask_neg: scratchy_subtile::sdsc_abstract::ATTN_MASK_NEG,
+                stick_major: true,
+                kv_blocks: None,
+            };
+            let mut launcher = ForwardLauncher {
+                shape: &shape,
+                steps: &steps,
+                inputs: &inputs,
+                staged: None,
+                acts: Vec::new(),
+                acts_f16: Vec::new(),
+                acts_i32: Vec::new(),
+                causal_held: None,
+                causal_keyed: None,
+                card_owned_sticks: Vec::new(),
+                launched: false,
+            };
+            play(&HostTape { steps: &ftape }, &mut launcher).expect("the decode tape plays");
+            assert!(launcher.launched, "the tape must reach its device step");
+            (launcher.card_owned_sticks, launcher.acts_i32)
+        };
+
+        // OnCard: the two ChainSeed steps stage nothing and the skip names EXACTLY the
+        // chain's own sticks — the list the caller walks through `hand_to_card`.
+        let (oncard, oncard_i32) = play_with(None);
+        assert_eq!(
+            oncard,
+            vec![
+                scratchy_target_spyre::bundle_code::PlaceId::Act(chain.s_src),
+                scratchy_target_spyre::bundle_code::PlaceId::Act(chain.l_src),
+            ],
+            "the OnCard skip names the chain's own two sticks, once each"
+        );
+        assert!(
+            oncard_i32.is_empty(),
+            "an OnCard launch stages no seed words"
+        );
+
+        // Host: the seeds stage (per-row words through the raw channel) and NOTHING is
+        // handed to the card — a Host launch owns its sticks this step.
+        let (host, host_i32) = play_with(Some(&[1318]));
+        assert!(
+            host.is_empty(),
+            "a Host-seeded launch names no card-owned stick"
+        );
+        assert_eq!(
+            host_i32.len(),
+            2,
+            "the s and the l seed both stage through the raw channel"
+        );
     }
 }

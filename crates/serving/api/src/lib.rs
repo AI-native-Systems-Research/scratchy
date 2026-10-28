@@ -20,6 +20,7 @@ pub mod error;
 pub mod headless;
 pub mod init;
 pub use init::try_load_tokenizer;
+pub use scratchy_serving_worker::step_segs::step_segment_table;
 
 pub mod tokenizer;
 pub use tokenizer::Tokenizer;

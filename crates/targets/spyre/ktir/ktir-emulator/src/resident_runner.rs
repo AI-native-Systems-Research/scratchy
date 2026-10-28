@@ -34,6 +34,7 @@ use crate::ir::{Attr, IRFunction, Operation, Scalar, Ssa};
 use crate::irtype::IrType;
 use crate::opkind::OpKind;
 use ktir_optimizer::fusion::{Binding, NodeSpec, ProgramSpec};
+use ktir_superdsc::ktir_node::Program;
 use std::collections::{HashMap, HashSet};
 
 /// One tensor argument of an example kernel: the function arg name (no `%`), the
@@ -194,6 +195,13 @@ impl ResidentRunner {
         let spec = ProgramSpec {
             nodes: vec![NodeSpec {
                 func: original.name.to_string(),
+                // ⚠ INERT, AND THE FIELD LEFT IT NO CHOICE: the example runner drives
+                // ARBITRARY hand-written `.mlir` functions no mint ever classified, so
+                // no fact exists to state. The planner's door discriminator is this
+                // field's only reader and no example function is a door, so the value
+                // changes nothing here; a mint-stated kind rides LaunchProgram ->
+                // build_spec on the production path.
+                program: Program::Elementwise(ktir_superdsc::ktir_node::Elementwise::Add),
                 bindings,
             }],
             sources,

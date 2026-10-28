@@ -1,0 +1,62 @@
+{
+  "probe": "intmb-scatter",
+  "rows": 2,
+  "cells": {
+    "intmb_add": {
+      "width": 512,
+      "op": "add",
+      "form": "dense_mb",
+      "mismatches": 0,
+      "pass": true
+    },
+    "intmb_mul": {
+      "width": 512,
+      "op": "mul",
+      "form": "dense_mb",
+      "mismatches": 0,
+      "pass": true
+    },
+    "intmb_col_add": {
+      "width": 512,
+      "op": "add",
+      "form": "mb_col",
+      "mismatches": 0,
+      "pass": true
+    },
+    "intmb_col_mul": {
+      "width": 512,
+      "op": "mul",
+      "form": "mb_col",
+      "mismatches": 0,
+      "pass": true
+    },
+    "intmb_wide_add": {
+      "width": 65536,
+      "op": "add",
+      "form": "dense_mb",
+      "mismatches": 0,
+      "pass": true
+    },
+    "intmb_wide_mul": {
+      "width": 65536,
+      "op": "mul",
+      "form": "dense_mb",
+      "mismatches": 0,
+      "pass": true
+    },
+    "intmb_wide_col_add": {
+      "width": 65536,
+      "op": "add",
+      "form": "mb_col",
+      "mismatches": 0,
+      "pass": true
+    },
+    "intmb_wide_col_mul": {
+      "width": 65536,
+      "op": "mul",
+      "form": "mb_col",
+      "mismatches": 0,
+      "pass": true
+    }
+  }
+}

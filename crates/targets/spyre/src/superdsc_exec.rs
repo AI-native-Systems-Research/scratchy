@@ -727,6 +727,14 @@ enum SourceFiller {
     /// cannot be aliased: the slot also carries an intermediate color, so no two bundles agree on that
     /// segment's extent and [`Self::SegmentOwner`] is unavailable to it.
     DeclaredResident,
+    /// ⭐ THE DEVICE'S OWN CHAINSTAGE WROTE IT — the chain's s/l sticks on a stable (`OnCard`)
+    /// decode seating, handed over by [`Executor::hand_to_card`]. Not [`SourceFiller::DeclaredResident`]:
+    /// that is a LOADER's permanent statement about a source no launch ever binds, while this is a
+    /// PER-SEATING hand-off — the host takes the stick back the moment a `Host`-seeded launch
+    /// re-binds it (a churned seating's re-seed), which is why [`Executor::bind_input_raw`]
+    /// clears it. Baking it resident instead would mask exactly the refusal that catches a
+    /// forgotten seed bind on the first step of a seating.
+    ChainStage,
     /// Its segment is ALIASED onto another session's region, so the OWNER filled it. The prefill
     /// ladder rungs and the batched-prefill session are entirely this case for seg1 (weights) and
     /// seg2 (KV): they bind NOTHING, precisely so the 2.6 GB stage+H2D happens once.
@@ -813,6 +821,11 @@ pub struct Executor {
     /// but no `bind_input` ever names it, so a completeness check that does not know this refuses
     /// EVERY launch.
     resident_sources: std::collections::BTreeSet<u32>,
+    /// ⭐ THE STICKS A STABLE SEATING HANDED TO THE CARD ([`Executor::hand_to_card`]) — the chain's
+    /// s/l sources, written by the previous step's ChainStage on the device. A PER-SEATING set, not
+    /// a loader declaration: [`Executor::bind_input_raw`] clears an id from it the moment the host
+    /// binds that stick again.
+    card_owned: std::collections::BTreeSet<bundle::PlaceId>,
 
     // ── Programs ──
     rolled: Option<Rolled>,
@@ -857,6 +870,28 @@ pub struct Executor {
     weight_bank_aliased: Vec<bool>,
     /// Host staging (sen bytes) per segment.
     seg_host: [Vec<u8>; NUM_SEGMENTS],
+    /// ⭐ #32 (C) — THE DEFERRED PICKS' LANDING RING: one slot per outstanding deferred
+    /// read, allocated ONCE at first use at the read's own length and reused forever.
+    /// The shadow slice a deferred read lands in today is the PLACEMENT's own window in
+    /// `seg_host`, so two outstanding reads for the same stick race — the later transfer
+    /// clobbers the earlier pick before the host slices it out. The ring gives every
+    /// in-flight step its own bytes; the slot returns to `read_ring_free` at the finish
+    /// half, so the ring's live size IS the number of reads in flight, bounded by the
+    /// pipeline's own depth.
+    read_ring: Vec<Vec<u8>>,
+    read_ring_free: Vec<usize>,
+    /// ⭐ #32 — THE LAST H2D A SUBMIT ENQUEUED, signaled: the shadow's quiet
+    /// point. An H2D reads the HOST SHADOW at device-execution time, so a host
+    /// thread may only overwrite the shadow once every in-flight H2D has
+    /// executed; FIFO retires the whole prefix behind the last-enqueued one, so
+    /// waiting IT is waiting them all. EVERY door that writes the shadow takes
+    /// this latch first through [`Executor::quiet_shadow`] — the drain
+    /// ([`Executor::finish_deferred_read_raw`]) beside the read's own signal,
+    /// and every bind/write door on its own — so no writer and no drain can
+    /// disagree about when the shadow went quiet. In the pipelined cadence the
+    /// drain took the latch one message ago and the next door's take is free;
+    /// at startup and between back-to-back submits it costs one H2D.
+    last_h2d: Option<crate::runtime::ReadSignal>,
     /// This segment's device region is BORROWED from another session, so `seg_host` is NOT its
     /// authoritative shadow and must never be H2D'd over it.
     seg_aliased: [bool; NUM_SEGMENTS],
@@ -905,8 +940,8 @@ pub struct Executor {
     staged: BTreeMap<bundle::PlaceId, u64>,
     /// ⭐⭐⭐⭐⭐ IDS BOUND THROUGH [`Executor::bind_const_fp32`] — fp32 constants whose LE host
     /// bytes ARE the device encoding (`Df::Fp32` is IEEE_FP32), so staging copies them VERBATIM:
-    /// no IEEE→SEN re-encode, no tile walk. The composite argmax's descending ramp and scalar-V
-    /// stick (#603 PR3a), and nothing else today.
+    /// no IEEE→SEN re-encode, no tile walk. The spliced argmax kernel's staged f32 constants
+    /// (the one-request rung's exactness island), and nothing else today.
     ///
     /// A set for the same reason [`Self::raw_ids`] is one: the staging loop consults it, and a
     /// flag remembered by the bind call alone is a flag the loop can forget.
@@ -992,6 +1027,58 @@ pub struct RawBind {
     bytes: Vec<u8>,
 }
 
+/// ⭐ #32 — ONE DEFERRED READ, IN FLIGHT: the enqueue half
+/// ([`Executor::defer_read_tensor_raw`] / [`Executor::defer_read_tensor_ring`]) hands this
+/// back instead of the bytes, and the finish half ([`Executor::finish_deferred_read_raw`])
+/// parks on `done` and slices the landed bytes out. The pipelined decode loop holds the
+/// enqueue across its prep-ahead and drains at the token's own deadline.
+pub struct DeferredRead {
+    id: bundle::PlaceId,
+    seg: SegIdx,
+    /// The placement's offset into its segment.
+    offset: u64,
+    /// The window's END — the placement's offset plus the transfer's flit-rounded length on the
+    /// own-window arm, the whole region's size on the fallback. The shadow read never needs it
+    /// (its slice indexes the placement offset into the whole segment); the RING read does (its
+    /// slot holds only the window, so the placement's bytes start `offset − win_start` into the
+    /// slot).
+    end: u64,
+    /// The window's start — the placement's offset on the own-window arm,
+    /// 0 on the whole-region fallback.
+    win_start: u64,
+    /// The placement's own size — the return clamp.
+    size: u64,
+    /// The caller's cap — the return clamp.
+    cap: usize,
+    /// ⭐ #32 (C) — THE LANDING SLOT, when this read was deferred into the ring
+    /// (the in-flight spelling; `None` for the shadow spelling). The finish
+    /// half slices the slot and returns it to the free list — one slot out
+    /// per outstanding read, one slot back per finish, so the two lists can
+    /// never disagree about what is in flight.
+    ring: Option<usize>,
+    /// ⭐ #32 — THE READ'S OWN COMPLETION, armed at the enqueue (the D2H op's
+    /// user callback — the per-op hook the seat's `d2h_on_compute_signaled`
+    /// arms). The finish half parks on THIS, not on a stream synchronize: the
+    /// whole-stream wait retired every op behind the read, including the step
+    /// the pipelined loop had just submitted for overlap.
+    done: crate::runtime::ReadSignal,
+}
+
+impl DeferredRead {
+    /// ⭐ #32 (E) — THE OVERLAP PROBE'S HANDLE: this read's completion
+    /// signal, AS A PEEK HANDLE ([`crate::runtime::ReadSignal::peek_handle`]
+    /// — `fired` is the whole of its surface, BY TYPE: the handle cannot
+    /// wait, so the drain's park on the read's own signal stays its one
+    /// waiter, and nothing here reads a byte of the slot). The submit side
+    /// holds it for the NEXT submit's non-blocking ask, so the "card busy
+    /// at submit" row measures the pipeline's real overlap. The ring law is
+    /// untouched: the slot's bytes are still read exactly once, by the drain
+    /// that owns the read.
+    pub fn signal(&self) -> crate::runtime::ReadPeek {
+        self.done.peek_handle()
+    }
+}
+
 /// The timers and H2D accounting of a step's FORWARD HALF — everything upstream of the
 /// readback that [`Executor::predict`] (logits D2H) shares, held in one struct so the
 /// step's tails print from the
@@ -1070,6 +1157,7 @@ impl Executor {
             logits_id,
             num_sources: None,
             resident_sources: std::collections::BTreeSet::new(),
+            card_owned: std::collections::BTreeSet::new(),
             rolled: None,
             prefix_ops: Vec::new(),
             body_ops: Vec::new(),
@@ -1093,6 +1181,9 @@ impl Executor {
             weight_bank_bytes: code.layout.weight_bank_bytes.to_vec(),
             weight_bank_aliased: vec![false; code.layout.weight_bank_bytes.len()],
             seg_host: [const { Vec::new() }; NUM_SEGMENTS],
+            read_ring: Vec::new(),
+            read_ring_free: Vec::new(),
+            last_h2d: None,
             seg_aliased: [false; NUM_SEGMENTS],
             seg_borrowed: [false; NUM_SEGMENTS],
             bound: BTreeMap::new(),
@@ -1455,6 +1546,7 @@ impl Executor {
                 | SourceFiller::WeightLoader
                 | SourceFiller::TapeStep
                 | SourceFiller::DeclaredResident
+                | SourceFiller::ChainStage
                 | SourceFiller::SegmentOwner => false,
             })
             .collect();
@@ -1501,6 +1593,8 @@ impl Executor {
             SourceFiller::TapeStep
         } else if self.resident_sources.contains(&id.tid()) {
             SourceFiller::DeclaredResident
+        } else if self.card_owned.contains(id) {
+            SourceFiller::ChainStage
         } else if self.source_segment_is_aliased(id) {
             SourceFiller::SegmentOwner
         } else {
@@ -1594,9 +1688,15 @@ impl Executor {
                 p.offset
             );
         }
-        let dst = self.seg_host[seg.get()]
-            .get_mut(p.offset as usize..(p.offset + len) as usize)
-            .ok_or_else(|| anyhow!("bind: activation '{id}' overflows seg{}", p.segment))?;
+        // The shadow's quiet point, at the door: this write can arrive with no
+        // drain behind it (a request switch's fresh binds, a k>1 iteration).
+        // `p`'s fields copy out FIRST — the placement's borrow of `self` cannot
+        // live across a `&mut self` call.
+        let (segi, off) = (seg.get(), p.offset);
+        self.quiet_shadow()?;
+        let dst = self.seg_host[segi]
+            .get_mut(off as usize..(off + len) as usize)
+            .ok_or_else(|| anyhow!("bind: activation '{id}' overflows seg{}", segi))?;
         sen_convert::f32_to_sen_bytes(vals, dst);
         self.raw_ids.remove(&id);
         self.keyed.remove(&id);
@@ -1746,11 +1846,37 @@ impl Executor {
         self.raw_ids.insert(b.id);
         self.staged.remove(&b.id);
         self.bound.insert(b.id, b.bytes);
+        // ⭐ THE HOST TAKES THE STICK BACK. A bind is the opposite of [`Self::hand_to_card`]:
+        // a churned seating re-seeds from the collected picks, so the id leaves the card-owned
+        // set and counts as a `TapeStep` fill from here on.
+        self.card_owned.remove(&b.id);
+    }
+
+    /// ⭐⭐⭐ HAND AN ACTIVATION TO THE CARD — the sticks of a stable decode seating. The
+    /// previous step's ChainStage writes them on the device, and this step's gather reads
+    /// them there; a `Host`-seeded launch's raw seed bind sits in [`Self::bound`], and the
+    /// refill re-sends every unkeyed `bound` entry on EVERY submit — so without this door
+    /// each stable step's preamble H2D would overwrite the card's own pick with the last
+    /// host seed before the gather reads it (the stuck-seed repetition, pinned on card
+    /// 2026-10-27: every batched text from the third token on was the seed token
+    /// re-emitted). Removing the id from all three maps ends the re-send; a later `Host`
+    /// launch re-binds it (a churned seating re-seeds from the collected picks), which
+    /// re-inserts it exactly as a fresh bind would.
+    pub fn hand_to_card(&mut self, id: bundle::PlaceId) {
+        self.raw_ids.remove(&id);
+        self.staged.remove(&id);
+        self.bound.remove(&id);
+        // ⭐ AND THE COMPLETENESS WALK LEARNS THE NEW OWNER. Dropping the binds alone would
+        // leave `filler_of` reading the stick as `Nobody`-filled and refusing every stable
+        // launch (`predict: caller-filled source(s) were never written`); declaring it here,
+        // per seating, is what keeps the first step's refusal — the one that catches a
+        // forgotten `Host` seed bind — intact.
+        self.card_owned.insert(id);
     }
 
     /// ⭐⭐⭐⭐⭐ Bind a RESIDENT FP32 CONSTANT at load — staged VERBATIM, once, never re-bound.
-    /// The composite argmax's descending ramp and scalar-V stick (#603 PR3a), and nothing else
-    /// today.
+    /// The spliced argmax kernel's staged f32 constants (the one-request rung's
+    /// exactness island), and nothing else today.
     ///
     /// ⛔ THIS IS NOT [`Self::bind_input_raw`], AND NOT A LAZIER [`Self::bind_weight`]. The raw
     /// channel is PER-STEP (a raw id bound before prepare is exactly the raw+weight combination
@@ -1775,7 +1901,7 @@ impl Executor {
             bail!(
                 "bind_const_fp32({id}): NO placement in this bundle — the layout did not place \
                  this const, so the caller's bind and the bundle's layout disagree about the \
-                 composite argmax. REFUSING"
+                 staged constants. REFUSING"
             );
         };
         if !bytes.len().is_multiple_of(4) {
@@ -1797,6 +1923,79 @@ impl Executor {
         self.weight_ids.insert(id);
         self.const_fp32_ids.insert(id);
         self.bound.insert(id, bytes);
+        Ok(())
+    }
+
+    /// ⭐⭐⭐ STAGE THE LOAD-TIME CONSTANTS — every entry of the wiring's
+    /// [`load_consts`](crate::wiring::Wiring::load_consts) list, bound ONCE at
+    /// load, before prepare (each is a function of the graph alone, so
+    /// re-binding per step would re-upload constants). Must be called before
+    /// [`Executor::prepare`], exactly like [`Self::bind_weight`].
+    ///
+    /// The fp32-verbatim vs fp16-convert choice keys off the ENTRY'S OWN
+    /// dtype, never off the op that minted it: a resident fp32 constant's LE
+    /// bytes are the device's own (`Df::Fp32` = IEEE_FP32 —
+    /// [`Self::bind_const_fp32`]), and i32 rides the SAME verbatim channel
+    /// (`Df::SenUint32` shares IEEE_FP32's 4-byte/32-stick geometry, so the
+    /// LE words ARE the device encoding — the hash constants' own width),
+    /// while everything else rides the weight channel's IEEE→SEN convert
+    /// ([`Self::bind_weight`]), bit-exact for every value a staged table
+    /// states. An entry whose tid is a graph OUTPUT simply binds that
+    /// output's initial bytes into its own placement — the ops that
+    /// overwrite it per step do so over these bytes, exactly as the card
+    /// behaves.
+    ///
+    /// ⭐ THE BYTES ARE THE CARD FORM ([`LoadConst::card_bytes`]): the ten
+    /// UNIFORM `[rows, 1]` tables spread to each row's stick head — the seat's
+    /// own law — and every other table is verbatim. The emulator's gate legs
+    /// stage the dense value form instead; the two memory models are each
+    /// leg's own stated law, one value derivation.
+    ///
+    /// ⛔ AND A UNIFORM COL TABLE MUST EXACTLY FILL ITS PLACEMENT. The general
+    /// over-bind law permits a short bind (a placement's zero tail is a valid
+    /// constant image), but a `[rows, 1]` table short of its placement means
+    /// the KIND'S rows and the RUNG'S placement rows disagree — some row's
+    /// stick head was never staged and reads ZERO (Finding 1: a rows=1 kind
+    /// staged into a rows=N rung left every row past 0 with a zero hash
+    /// multiplier). Refuse it by name, both directions, never serve it.
+    pub fn bind_load_consts(&mut self, consts: &[(u32, crate::wiring::LoadConst)]) -> Result<()> {
+        if self.prepared {
+            bail!(
+                "bind_load_consts: session ALREADY PREPARED — load-time constants are resident, \
+                 staged once at load"
+            );
+        }
+        for &(tid, kind) in consts {
+            let (bytes, dt, _shape) = kind.card_bytes();
+            let id = bundle::PlaceId::Act(tid);
+            if kind.is_uniform_col() {
+                let placed = self.places.get(&id).map(|p| p.size);
+                match placed {
+                    Some(size) if bytes.len() as u64 != size => bail!(
+                        "bind_load_consts(t{tid}): the uniform `[rows, 1]` table stages {} B \
+                         against its own {} B placement — the kind's rows and the rung's \
+                         placement rows disagree, and the short side's rows read ZERO at their \
+                         stick heads (Finding 1). REFUSING",
+                        bytes.len(),
+                        size
+                    ),
+                    None => bail!(
+                        "bind_load_consts(t{tid}): the uniform `[rows, 1]` table has NO placement \
+                         in this bundle — the layout did not place the const the wiring stages. \
+                         REFUSING"
+                    ),
+                    _ => {}
+                }
+            }
+            if matches!(
+                dt,
+                scratchy_tensors::DType::F32 | scratchy_tensors::DType::I32
+            ) {
+                self.bind_const_fp32(id, bytes)?;
+            } else {
+                self.bind_weight(id, bytes);
+            }
+        }
         Ok(())
     }
 
@@ -1860,6 +2059,19 @@ impl Executor {
         }
     }
 
+    /// ⭐ WHETHER THIS SESSION BINDS ANYTHING INTO A RESIDENT SEGMENT — what "reserve only"
+    /// asks. NOT `bound.is_empty()`: a reserving or borrowing session still binds its own staged
+    /// constants (the sampler's tables, placed in the never-aliased activation segment), and
+    /// counting those made the prefill anchor stage and upload a full weight shadow it then
+    /// aliases away.
+    fn binds_resident(&self) -> bool {
+        self.bound.keys().any(|nm| {
+            self.places
+                .get(nm)
+                .is_some_and(|p| is_resident_seg(p.segment as usize))
+        })
+    }
+
     pub fn stage_weights(&mut self) -> Result<()> {
         if self.staged_host {
             return Ok(());
@@ -1869,7 +2081,7 @@ impl Executor {
         // placeholder skips a 2.6 GB memset for the weight segment — measured as 2.134s on the
         // batched-prefill session, which binds nothing precisely because its ALLOCATION is the
         // point and its bytes are not.
-        let reserve_only = self.bound.is_empty();
+        let reserve_only = !self.binds_resident();
         for i in 0..NUM_SEGMENTS {
             // A BORROWED segment is never staged or H2D'd by this session, so it gets the
             // placeholder rather than a zero-fill the width of the whole segment. ...but ONLY for
@@ -1904,9 +2116,20 @@ impl Executor {
         // placement pass kept placing, so every copy window sat never-written while the m=1 fp8 o
         // matmul read it: fluent garbage, card-only, granite-3.1-8b fp8 m=1 alone (every other
         // geometry never reads a copy, and the emulator executes the KTIR program, not the staging,
-        // so no bench caught it either). Scoped to sessions that stage weights — a borrower binds
-        // none by design and adopts the owner's populated regions.
-        let stages_weights = self.bound.keys().any(|nm| self.weight_ids.contains(nm));
+        // so no bench caught it either).
+        //
+        // ⛔ THE CHECK BELONGS TO THE WEIGHT-SEGMENT OWNER ALONE (2026-10-27, granite-3.1-8b fp8:
+        // the borrowing prefill anchor refused at load over 40 copies it never stages). A borrower
+        // BINDS NO WEIGHTS, whatever its `bound` holds: the load-const channel stages resident
+        // constants through the weight channel (`bind_const_fp32` and `bind_weight` both insert
+        // into `weight_ids`), so a borrowing rung or anchor that stages its own tables trips the
+        // `bound ∩ weight_ids` test below — while the copies it "fails" to bind are delivered by
+        // the owner's alias (`alias_seg_from` / `adopt_from_owner`), never by its own staging. The
+        // mint is bundle-invariant (one staged weight segment serves every bundle), so the owner's
+        // check covers every borrower's reads: a wiring list that lost the copies refuses at the
+        // OWNER, naming the same #299 class.
+        let stages_weights = !self.seg_borrowed[SEG_WEIGHT.get()]
+            && self.bound.keys().any(|nm| self.weight_ids.contains(nm));
         if stages_weights {
             let unbound: Vec<u32> = self
                 .code
@@ -2314,7 +2537,7 @@ impl Executor {
         //    critical path. Then grow each seg_host to the device alloc's size (alignment pad,
         //    zero) so the H2D copies a full region. ──
         self.stage_weights()?;
-        let reserve_only = self.bound.is_empty();
+        let reserve_only = !self.binds_resident();
         for i in 0..NUM_SEGMENTS {
             // Same rule as the staging shadow: skip only what an alias replaces. Activation
             // segments still grow to the device extent, because this session fills them itself.
@@ -4386,6 +4609,84 @@ impl Executor {
         Ok(())
     }
 
+    /// ⭐ #32 (A) — THE PIPELINED DECODE STEP'S SUBMIT HALF: one one-token
+    /// forward with NO trailing drain. `predict`'s readback tail runs a
+    /// full-stream synchronize after every step — the FIRST of the two
+    /// per-step drains the pipelined loop deletes (the second is
+    /// `read_tensor_raw`'s own, split into `defer_read_tensor_raw` +
+    /// `finish_deferred_read_raw`). The loop's ONE fence per step — taken
+    /// after its prep-ahead, inside the finish half — is what waits this
+    /// submission (and the stick D2H enqueued behind it) out. Everything
+    /// else is `predict`'s own one-token path BY CONSTRUCTION, not by copy:
+    /// the same `forward_half` (the same refill, the same ONE doorbell, the
+    /// same accounting), reached through the same private body `predict`
+    /// runs for `Logits::LeftOnDevice`.
+    ///
+    /// The step's epilogue (RB attribution, the leak probe) does not ride
+    /// this door: both bodies are Diag-gated, and every Diag instrument
+    /// disqualifies a forward from the emitted-row regime by the seat's
+    /// own `is_quiet` gate — on this path they have no reachable input.
+    /// Stated here rather than silently dropped.
+    pub fn submit_step(&mut self, n_new: NewTokens, seq_pos: SeqPos) -> Result<()> {
+        let d = Diag::get();
+        let _half = self.forward_half(n_new, seq_pos, SuffixLaunch::Launched, d)?;
+        Ok(())
+    }
+
+    /// ⭐ #32 — THE SHADOW'S QUIET POINT, TAKEN BY EVERY DOOR THAT WRITES IT.
+    /// An H2D reads the host shadow at DEVICE-EXECUTION time (the CB DMAs from
+    /// the shadow pointer when the card plays it), so a host write into
+    /// `seg_host` may only happen once every in-flight H2D has executed; FIFO
+    /// retires the whole prefix behind the last-enqueued one, so waiting IT is
+    /// waiting them all. The doors that write the shadow —
+    /// [`Self::bind_input_f32`], the refill's convert loop,
+    /// [`Self::write_seg_prefix`] (and through the convert
+    /// loop, every door whose bytes it writes: `stage_keyed`, the keyed and raw
+    /// bind channels) — all pass through here first. A wait in the drain alone
+    /// does not close the law: a bind can arrive with NO drain behind it
+    /// (a k>1 loop iteration, a request switch), and those writes race exactly
+    /// the same H2Ds.
+    ///
+    /// In the pipelined cadence this is FREE — the drain took the latch one
+    /// message ago and the take finds `None`; at startup and between
+    /// back-to-back submits it costs exactly one H2D's execution, which is the
+    /// price of the card not reading bytes the host already replaced.
+    ///
+    /// Device-side landings need no such wait: a D2H writes its host buffer
+    /// when IT executes, FIFO behind every earlier H2D, so the queue itself
+    /// orders those writes — only the HOST's own copies race, and only those
+    /// go through this door. `prepare`/`stage_weights` write the shadow before
+    /// any refill exists to arm a latch, so they are exempt by construction
+    /// (and the first refill re-sends every per-step range regardless).
+    ///
+    /// The dead arm is the same escape [`Self::finish_deferred_read_raw`]
+    /// runs: a failed op never fires its callback, the latch's timeout tick
+    /// hands the park back, the synchronize below rethrows the stream's
+    /// deferred error, and a stream that died is REFUSED rather than written
+    /// past.
+    fn quiet_shadow(&mut self) -> Result<()> {
+        let Some(h2d) = self.last_h2d.take() else {
+            return Ok(()); // nothing was ever enqueued — nothing to wait
+        };
+        let quiet = {
+            // Scoped: `dead` borrows `self` immutably for the park, and the
+            // take above was the one mutable touch — sequenced first, the two
+            // never overlap.
+            let dead = || self.stream_ref().map(|s| s.is_dead()).unwrap_or(true);
+            h2d.wait_or(dead)
+        };
+        if !quiet {
+            self.stream_ref()?
+                .synchronize()
+                .map_err(|e| anyhow!("shadow quiet point: sync: {e}"))?;
+            bail!(
+                "the stream died before the shadow went quiet — refusing to write bytes an \
+                 in-flight H2D may still read"
+            );
+        }
+        Ok(())
+    }
+
     /// Refill per-step ACTIVATIONS into their segment's host staging at the baked offset
     /// (IEEE→sen), and re-H2D the dirtied segments. Weights (seg1) and KV (seg2) stay RESIDENT —
     /// never re-uploaded, which is the whole perf point.
@@ -4474,6 +4775,13 @@ impl Executor {
         }
         // The convert cannot borrow `self.bound` and `self.seg_host` at once, so the sources move
         // out for the duration — a `Vec` swap, not a copy of the bytes.
+        //
+        // ⭐ AND THE QUIET POINT IS TAKEN AT THE DOOR, not assumed of the caller:
+        // a refill can run with the previous submit's H2Ds still in flight
+        // (a k>1 loop iteration with no drain between submits, or a request
+        // switch's fresh binds). The latch is free in the drained cadence (the
+        // drain took it one message ago) and costs one H2D otherwise.
+        self.quiet_shadow()?;
         let bound = std::mem::take(&mut self.bound);
         for (nm, src) in &bound {
             if self.weight_ids.contains(nm) {
@@ -4507,6 +4815,14 @@ impl Executor {
 
         let mut note = String::new();
         let mut total = 0u64;
+        // ⭐ #32 — THE LAST-ENQUEUED H2D'S SIGNAL, kept for the drain: FIFO
+        // retires every earlier H2D behind it, so this one latch is the whole
+        // submit's shadow-quiet point (see the `last_h2d` field's law). Every
+        // window is armed and the final overwrite wins — the dropped latches
+        // fire harmlessly into nothing (their own `Arc` keeps the callback
+        // sound), and tracking "only the last call" would re-derive the same
+        // fact the enqueue order already states.
+        let mut last_h2d: Option<crate::runtime::ReadSignal> = None;
         for i in 0..NUM_SEGMENTS {
             if !seg_dirty[i] {
                 continue; // only re-upload activation segments
@@ -4559,20 +4875,28 @@ impl Executor {
             // nothing, and the queue's own FIFO orders the preamble CB ahead of the step's
             // compute CBs — the whole step submits with no host-side waits.
             if runs.is_empty() {
-                stream
-                    .h2d_on_compute(whole_shadow(&self.seg_host[i], addr, i)?, addr)
-                    .map_err(|e| anyhow!("preamble H2D seg{i}: {e}"))?;
+                last_h2d = Some(
+                    stream
+                        .h2d_on_compute_signaled(whole_shadow(&self.seg_host[i], addr, i)?, addr)
+                        .map_err(|e| anyhow!("preamble H2D seg{i}: {e}"))?,
+                );
             } else {
                 for (a, b) in runs {
                     let win = addr
                         .window(ByteOffset(a), ByteSize(b - a))
                         .ok_or_else(|| anyhow!("seg{i} window {a}..{b} unaddressable"))?;
-                    stream
-                        .h2d_on_compute(&self.seg_host[i][a as usize..b as usize], &win)
-                        .map_err(|e| anyhow!("preamble H2D seg{i} window: {e}"))?;
+                    last_h2d = Some(
+                        stream
+                            .h2d_on_compute_signaled(
+                                &self.seg_host[i][a as usize..b as usize],
+                                &win,
+                            )
+                            .map_err(|e| anyhow!("preamble H2D seg{i} window: {e}"))?,
+                    );
                 }
             }
         }
+        self.last_h2d = last_h2d;
         Ok((note, total))
     }
 
@@ -5177,6 +5501,224 @@ impl Executor {
         Ok(out)
     }
 
+    /// ⭐ THE RAW TWIN OF [`Self::read_tensor`] — the placement's own bytes,
+    /// VERBATIM, no f16 convert: a rung whose result is not the f16 row (an
+    /// index stick, read at the dtype its producer's kernel signature stated)
+    /// is decoded by the CALLER, because only the wiring knows the dtype. Same
+    /// clamps: to `cap_bytes`, and to what the transfer actually brought back.
+    ///
+    /// ⭐ THE TRANSFER IS THE PLACEMENT'S OWN WINDOW, never its segment's
+    /// allocation — the same law [`Self::predict`] states for the row: this
+    /// sits on the TOKEN critical path (the answer re-point's whole point is
+    /// that the ~100 KB row readback collapses to the stick's own bytes), and
+    /// a whole-segment D2H would price the token by whatever else the segment
+    /// packs (measured: the whole-segment read held mean ITL at the row
+    /// readback's level — the collapse never reached the wire). Rides the
+    /// COMPUTE pipeline for the same #544 reason the row's readback does: its
+    /// CB queues behind the step's compute CBs and the FIFO carries the
+    /// ordering the host-side wait used to.
+    pub fn read_tensor_raw(&mut self, id: bundle::PlaceId, cap_bytes: usize) -> Result<Vec<u8>> {
+        let read = self.defer_read_tensor_raw(id, cap_bytes)?;
+        self.finish_deferred_read_raw(&read)
+    }
+
+    /// ⭐ #32 — THE ENQUEUE HALF of [`Self::read_tensor_raw`]: the same
+    /// placement law, the same window, but the transfer is ARMED
+    /// (`d2h_on_compute_signaled`) and the handle comes back UNRESOLVED — the
+    /// one-shot caller resolves it immediately (the pair above composes into
+    /// exactly the old one-shot contract), while the pipelined loop holds the
+    /// enqueue across its prep-ahead and drains at the token's own deadline.
+    pub fn defer_read_tensor_raw(
+        &mut self,
+        id: bundle::PlaceId,
+        cap_bytes: usize,
+    ) -> Result<DeferredRead> {
+        self.defer_read_into(id, cap_bytes, false)
+    }
+
+    /// ⭐ #32 (C) — THE RING TWIN of [`Self::defer_read_tensor_raw`]: the same
+    /// placement law, the same enqueue, a DIFFERENT landing — a persistent ring slot
+    /// instead of the placement's shadow window. The in-flight spelling: a step whose
+    /// pick is not consumed until a later drain lands here, because two outstanding
+    /// shadow reads for the same stick would race (the later transfer clobbers the
+    /// earlier pick before the host slices it out). The one-shot and the ring compose
+    /// into the SAME finish half — `finish_deferred_read_raw` reads whichever site the
+    /// handle names — so the two doors cannot drift apart.
+    pub fn defer_read_tensor_ring(
+        &mut self,
+        id: bundle::PlaceId,
+        cap_bytes: usize,
+    ) -> Result<DeferredRead> {
+        self.defer_read_into(id, cap_bytes, true)
+    }
+
+    /// The ONE body behind the two read doors: the placement table lookup, the bank
+    /// law, the flit round-up, the whole-region fallback — everything except WHERE the
+    /// transfer lands, which is the doors' only difference.
+    fn defer_read_into(
+        &mut self,
+        id: bundle::PlaceId,
+        cap_bytes: usize,
+        ring: bool,
+    ) -> Result<DeferredRead> {
+        let p = self
+            .places
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown tensor {id}"))?;
+        let seg = SegIdx::checked(p.segment as i64)
+            .ok_or_else(|| anyhow!("tensor '{id}' segment {} out of range", p.segment))?;
+        // The bank law is read_tensor's own: a segment read addresses bank 0's
+        // region only, and handing back another bank's bytes at this offset is
+        // worse than refusing.
+        if p.bank != 0 {
+            bail!(
+                "read_tensor_raw('{id}'): it is in weight bank {}, and a segment read addresses \
+                 only bank 0's region — REFUSING rather than returning another bank's bytes",
+                p.bank
+            );
+        }
+        let addr = self.seg_addr[seg.get()]
+            .as_ref()
+            .ok_or_else(|| anyhow!("seg{} has no region", seg.get()))?;
+        let tot = addr.total_size().as_u64();
+        let want = p.size.min(cap_bytes as u64);
+        // The round-up to a flit is not optional (`Flits::from_bytes` TRUNCATES),
+        // and the same two facts predict's window relies on hold here by the
+        // same cargo-build guard (`audit_layout_addresses`): the offset is
+        // 128-aligned and offset+size stays inside the region.
+        let len = crate::lower_subtile_tape_to_superdsc::align128(want).min(tot - p.offset);
+        // A multi-chunk region has no addressable sub-window; fall back to the
+        // whole-region read, exactly as predict does.
+        let win = (len < tot)
+            .then(|| addr.window(ByteOffset(p.offset), ByteSize(len)))
+            .flatten();
+        let (src, a, b) = match win.as_ref() {
+            Some(w) => (w, p.offset, p.offset + len),
+            None => (addr, 0, tot),
+        };
+        // The landing: the shadow window (one-shot law) or a ring slot (in-flight
+        // law). Field-direct on purpose — `addr`/`win` hold the shared borrow of
+        // `seg_addr` this whole body is written under, and the slot's take/grow is
+        // three field moves, not a method call.
+        let (host, ring_slot) = if ring {
+            let need = (b - a) as usize;
+            let slot = match self.read_ring_free.pop() {
+                Some(s) => s,
+                None => {
+                    self.read_ring.push(Vec::new());
+                    self.read_ring.len() - 1
+                }
+            };
+            let s = &mut self.read_ring[slot];
+            if s.len() < need {
+                // A wider stick than the slot has seen (a different bundle's cap):
+                // grow IN PLACE — the slot stays the same index, so outstanding
+                // handles naming it stay valid, and the allocation is paid once
+                // per width, not per read.
+                s.resize(need, 0);
+            }
+            (&mut s[..need], Some(slot))
+        } else {
+            (&mut self.seg_host[seg.get()][a as usize..b as usize], None)
+        };
+        let done = self
+            .stream
+            .as_ref()
+            .ok_or_else(|| anyhow!("no stream — prepare was not called"))?
+            .d2h_on_compute_signaled(host, src)
+            .map_err(|e| anyhow!("read_tensor_raw({id}) D2H: {e}"))?;
+        Ok(DeferredRead {
+            id,
+            seg,
+            offset: p.offset,
+            end: b,
+            win_start: a,
+            size: p.size,
+            cap: cap_bytes,
+            ring: ring_slot,
+            done,
+        })
+    }
+
+    /// ⭐ #32 — THE STICK READ'S FINISH HALF: the loop's ONE fence, now scoped
+    /// to THIS read — park on the transfer's own completion signal (armed at
+    /// the enqueue, `d2h_on_compute_signaled`), then slice the landed bytes out
+    /// of whichever site the handle names (the shadow window, one-shot, or the
+    /// ring slot, in-flight, returned to the free list here, the slot's
+    /// one-way-out) under `read_tensor_raw`'s own return clamps. The two halves
+    /// compose into exactly the old one-shot contract — `read_tensor_raw` above
+    /// IS this pair — so the one-shot caller keeps its behavior byte-for-byte
+    /// while the pipelined loop holds the enqueue across its prep-ahead.
+    ///
+    /// ⛔ THE WAIT IS TWO-SIGNALS, NOT THE STREAM. The whole-stream synchronize
+    /// this replaces retired EVERY op the stream held — including the step the
+    /// pipelined loop had just submitted for overlap — so each per-step drain
+    /// fenced a full step anyway and the depth-2 queue bought nothing
+    /// (measured 2026-10-25: fence mean = one step ≈ 23.8 ms, ≈ serial tok/s).
+    /// The two signals are the read's own D2H (the bytes this call returns)
+    /// and the LAST H2D a submit enqueued — the shadow's quiet point, taken
+    /// here through the SAME door ([`Self::quiet_shadow`]) every writer of the
+    /// shadow passes through, so the drain and any later bind cannot disagree
+    /// about when the shadow went quiet. Both sit adjacent in the queue at
+    /// depth 2 — the DMAs of the next step's preamble, microseconds behind
+    /// this read — so the park costs the read and not the step, and the steps'
+    /// COMPUTE behind them runs through the drain.
+    ///
+    /// The dead arm is the error escape, and it surfaces the SAME error the
+    /// whole-stream wait did by the SAME door: a failed op never fires its
+    /// user callback (the stream records a deferred error and goes
+    /// sticky-shutdown, `make_completion_callback`'s Err arm), so the signal's
+    /// timeout tick hands the park back and the synchronize below — which does
+    /// not wait a dead stream, it rethrows — carries the root cause out.
+    pub fn finish_deferred_read_raw(&mut self, read: &DeferredRead) -> Result<Vec<u8>> {
+        // The read's own landing, scoped so `dead`'s immutable borrow of `self`
+        // ends before the quiet point's mutable half begins.
+        let landed = {
+            let dead = || self.stream_ref().map(|s| s.is_dead()).unwrap_or(true);
+            read.done.wait_or(dead)
+        };
+        if !landed {
+            self.stream_ref()?
+                .synchronize()
+                .map_err(|e| anyhow!("read_tensor_raw({}) sync: {e}", read.id))?;
+            // A dead stream's synchronize rethrows its deferred error; if it
+            // returned anyway, the transfer never landed and the bytes below
+            // would be a lie — refuse rather than slice them. The ring slot is
+            // deliberately NOT returned on this path: only its own signal (or
+            // teardown) walks a slot back.
+            bail!(
+                "read_tensor_raw({}): the stream died before this read landed — no bytes to slice",
+                read.id
+            );
+        }
+        // And the shadow half — the shared door. In the drained cadence the
+        // latch has fired (or was never armed); this is where the drain
+        // HANDS the quiet point to the next writer by taking it.
+        self.quiet_shadow()?;
+        // May only return the bytes the transfer actually brought back.
+        let avail = (read.end - read.offset) as usize;
+        let n = (read.size as usize).min(read.cap).min(avail);
+        if n == 0 {
+            if let Some(slot) = read.ring {
+                self.read_ring_free.push(slot);
+            }
+            return Ok(Vec::new()); // a wholly-unreadable placement also has no valid base
+        }
+        match read.ring {
+            Some(slot) => {
+                // The slot holds the WINDOW; the placement's bytes start
+                // `offset − win_start` into it (0 on the own-window arm — the
+                // placement IS the window's start).
+                let start = (read.offset - read.win_start) as usize;
+                let bytes = self.read_ring[slot][start..][..n].to_vec();
+                self.read_ring_free.push(slot);
+                Ok(bytes)
+            }
+            None => Ok(self.seg_host[read.seg.get()][read.offset as usize..][..n].to_vec()),
+        }
+    }
+
     /// The host shadow's byte size for `seg` — what to size a [`Executor::read_seg`] buffer at.
     pub fn seg_bytes(&self, seg: SegIdx) -> usize {
         self.seg_host[seg.get()].len()
@@ -5226,12 +5768,11 @@ impl Executor {
 
     /// Overwrite the FIRST `data.len()` bytes of a tensor segment and H2D exactly that window.
     ///
-    /// ⛔ WHY NOT [`Executor::write_seg`]: that one is a WHOLE-segment copy, and the thing this
-    /// exists for — handing a BORROWING session its own copy of the spilled weight tail — crosses
-    /// two bundles whose extents for that segment DIFFER. The spill slot is also an intermediate
-    /// COLOR segment, and a prefill rung's intermediates are wider than decode's, so a whole-segment
-    /// copy is not merely wasteful but unrepresentable: MEASURED, 421,257,216 source bytes against a
-    /// 432,218,112 B segment, which `write_seg`'s equality guard correctly refuses.
+    /// ⛔ WHY A PREFIX AND NOT A WHOLE-SEGMENT COPY: the thing this exists for — handing a BORROWING
+    /// session its own copy of the spilled weight tail — crosses two bundles whose extents for that
+    /// segment DIFFER. The spill slot is also an intermediate COLOR segment, and a prefill rung's
+    /// intermediates are wider than decode's, so a whole-segment copy is not merely wasteful but
+    /// unrepresentable: MEASURED, 421,257,216 source bytes against a 432,218,112 B segment.
     ///
     /// The tail occupies `[0, len)` by construction (`spill_weight_tail` places it at offset 0 for
     /// exactly this reason), so writing that prefix and leaving the rest of the shadow as `prepare`
@@ -5245,6 +5786,9 @@ impl Executor {
                 self.seg_host[i].len()
             );
         }
+        // The shadow's quiet point, at the door — this copy overwrites the whole
+        // prefix while an earlier H2D may still be reading the shadow.
+        self.quiet_shadow()?;
         self.seg_host[i][..data.len()].copy_from_slice(data);
         let addr = self.seg_addr[i]
             .as_ref()
@@ -5259,25 +5803,6 @@ impl Executor {
         stream
             .synchronize()
             .map_err(|e| anyhow!("write_seg_prefix sync seg{i}: {e}"))
-    }
-
-    /// Overwrite the WHOLE tensor segment from raw sen-fp16 bytes + H2D it. The counterpart of
-    /// [`Executor::read_seg`].
-    pub fn write_seg(&mut self, seg: SegIdx, data: &[u8]) -> Result<()> {
-        let i = seg.get();
-        let n = data.len().min(self.seg_host[i].len());
-        self.seg_host[i][..n].copy_from_slice(&data[..n]);
-        let addr = self.seg_addr[i]
-            .as_ref()
-            .ok_or_else(|| anyhow!("seg{i} has no region"))?;
-        let src = whole_shadow(&self.seg_host[i], addr, i)?;
-        let stream = self.stream_ref()?;
-        stream
-            .h2d(src, addr)
-            .map_err(|e| anyhow!("write_seg H2D: {e}"))?;
-        stream
-            .synchronize()
-            .map_err(|e| anyhow!("write_seg sync: {e}"))
     }
 
     /// Point THIS session's segment `seg` at `owner`'s DEVICE region so the two SHARE it outright

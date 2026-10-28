@@ -9,7 +9,8 @@
 
 use ktir_superdsc::superdsc_opspec::MAX_CORES;
 use ktir_superdsc::work::{
-    DeviceWidth, FP16_ELEMS_PER_STICK, UTIL_FLOOR_CORES, bump_sticks_to_splittable, core_split,
+    DeviceWidth, FP16_ELEMS_PER_STICK, Fp16Sticks, UTIL_FLOOR_CORES, bump_sticks_to_splittable,
+    core_split,
 };
 
 const STICK: u32 = FP16_ELEMS_PER_STICK;
@@ -21,7 +22,7 @@ fn the_lm_head_keeps_its_full_occupancy_pad() {
     let n64 = 49155u32.next_multiple_of(STICK);
     assert_eq!(n64 / STICK, 769);
     assert_eq!(core_split(769, MAX_CORES), 1);
-    let padded = bump_sticks_to_splittable(n64);
+    let padded = bump_sticks_to_splittable(Fp16Sticks::from_elems(n64));
     assert_eq!(padded, 800 * STICK);
     assert_eq!(core_split(padded / STICK, MAX_CORES), MAX_CORES);
     // The lm_head is a [1, 49155] x [49155, 4096]-class gemm far past the util-floor MAC count.
@@ -40,7 +41,10 @@ fn the_8b_gate_up_keeps_its_unpadded_split() {
         cur * 2 >= MAX_CORES,
         "25 of 32 cores is past half the machine"
     );
-    assert_eq!(bump_sticks_to_splittable(12800), 12800);
+    assert_eq!(
+        bump_sticks_to_splittable(Fp16Sticks::from_elems(12800)),
+        12800
+    );
     assert_eq!(DeviceWidth::for_output(1, 12800, 4096).get(), 12800);
 }
 
@@ -49,7 +53,11 @@ fn the_8b_gate_up_keeps_its_unpadded_split() {
 #[test]
 fn the_other_granite_widths_are_untouched() {
     for n in [512u32, 1024, 2048, 4096, 8192] {
-        assert_eq!(bump_sticks_to_splittable(n), n, "width {n}");
+        assert_eq!(
+            bump_sticks_to_splittable(Fp16Sticks::from_elems(n)),
+            n,
+            "width {n}"
+        );
     }
 }
 
@@ -62,7 +70,7 @@ fn the_other_granite_widths_are_untouched() {
 fn the_pad_fires_only_below_half_the_machine() {
     for sticks in 1..=4096u32 {
         let cur = core_split(sticks, MAX_CORES);
-        let got = bump_sticks_to_splittable(sticks * STICK) / STICK;
+        let got = bump_sticks_to_splittable(Fp16Sticks::from_elems(sticks * STICK)) / STICK;
         let after = core_split(got, MAX_CORES);
         if cur * 2 >= MAX_CORES {
             assert_eq!(got, sticks, "{sticks} sticks split onto {cur}: unpadded");

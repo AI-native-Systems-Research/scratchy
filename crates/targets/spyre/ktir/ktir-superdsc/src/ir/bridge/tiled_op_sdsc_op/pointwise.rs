@@ -137,6 +137,10 @@ pub fn gather_copy_opspec(
             run.dest.entries()
         )
     })?;
+    // ⭐⭐⭐ THE SCATTER ARM'S OWN VIEW WIDTH — `Some(W)` only for the Scatter destination below, so
+    // the output arg's spelling is stated from the typed law that minted the destination and not by
+    // a second decision at the builder (the same one-fact-one-place discipline `dest_base` takes).
+    let mut out_scatter_interleave: Option<u32> = None;
     match dest {
         crate::sdsc_abstract::GatherDest::Scratch {
             rows: d_rows,
@@ -150,6 +154,47 @@ pub fn gather_copy_opspec(
                 cols,
                 None,
             )?;
+        }
+        // ⭐⭐⭐⭐⭐ THE SCATTER-LAW DESTINATION — entry `j` of request `r` lands at element
+        // `(j·W + r)·lanes` of the `[W, hidden]` ChainRow, the bytes `StickLayout::row_blocked(W,
+        // hidden)` places (see `GatherDest::Scatter`'s own doc for the law and its one construction
+        // site). The run's `dest_entry` carries the request's column corner (`first_entry·W + r`),
+        // and the OUTPUT ARG's physical `y` extent carries the row pitch — the two halves of one
+        // law, minted together here.
+        //
+        // ⛔ THE SCATTER'S ENTRY IS ONE STICK (`page == 1`): the stride the corner fold spells is
+        // per-ENTRY (`W·lanes` between consecutive entries), and the fold composes with the
+        // per-core `mb` cut — which `gather_copy_cores` keeps at WHOLE entries — only while one
+        // entry is one stick. A wider page is a different destination law, refused rather than
+        // silently re-derived.
+        //
+        // ⛔ AND ONE ENTRY PER CORE IS STRUCTURAL, NOT AN ASSUMPTION: the corner fold strides the
+        // CORE BASE by `W·lanes` while intra-core positions stay contiguous, so the law is exact
+        // exactly while no core owns two entries. The cap law above bounds one op to
+        // `ENTRIES_PER_OP` (32) entries and `gather_copy_cores` splits `mb` by whole entries over
+        // `MAX_CORES` (32) cores — so a core owning two entries is not a shape this arm can be
+        // handed, and the bound below is the whole of the address law.
+        crate::sdsc_abstract::GatherDest::Scatter {
+            rows: interleave, ..
+        } => {
+            if page != 1 {
+                return Err(format!(
+                    "gather_copy_opspec('{src}' -> '{dst}'): a scatter destination's entries are \
+                     ONE STICK (page = 1), and this run declares a {page}-position page — the \
+                     scatter stride is per one-stick entry, so a wider entry is a different \
+                     destination law, not this one"
+                ));
+            }
+            crate::emit::mint_scatter_window(
+                &format!("gather_copy_opspec('{src}' -> '{dst}'): the destination"),
+                dst,
+                &dest,
+                df,
+                dest_base as u64,
+                rows,
+                None,
+            )?;
+            out_scatter_interleave = Some(interleave);
         }
         crate::sdsc_abstract::GatherDest::CoreLocalLx => {
             if run.dest.entries() != 0 {
@@ -248,7 +293,13 @@ pub fn gather_copy_opspec(
         // into the next intermediate's bytes. Read as keys, clean bake, no fault. (Derived and bounded
         // once above — `dest_base` — so the base the op carries and the base the mint checks are one
         // number.)
-        dest_base,
+        // The output's own view: the derived `dest_base`, and the scatter's width exactly
+        // when the destination minted Scatter above — one law, one value, read by the
+        // builder's output arg.
+        match out_scatter_interleave {
+            Some(interleave) => OutView::scattered(dest_base, interleave),
+            None => OutView::at(dest_base),
+        },
     )?;
     // ⭐ THE VALUE OPERANDS' OWN df — `pointwise_opspec_from_tile_split` builds args at fp16 (the
     // residual default), so an fp8 copy re-states BOTH value args here. The index arg does not
@@ -360,6 +411,24 @@ pub fn assemble_gather_copy(
             )
             .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"));
         }
+        // ⭐ THE SCATTER DESTINATION'S PLACEMENT HALF — the same stride-aware mint the raw door
+        // ran, now with the layout at hand so the ChainRow's reservation answers for the bytes
+        // behind the name (see `GatherDest::Scatter`). No `GatherScratch` mints this arm today —
+        // the chained head's row gather takes `gather_copy_opspec` directly — so reaching here
+        // means a scratch claimed the scatter law; the mint still states it honestly rather than
+        // refusing by silence.
+        crate::sdsc_abstract::GatherDest::Scatter { .. } => {
+            crate::emit::mint_scatter_window(
+                &format!("assemble_gather_copy {op_name}: the destination"),
+                dst,
+                &copy.dest(),
+                Df::Fp16,
+                dest_base,
+                d.mb(),
+                layout,
+            )
+            .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"));
+        }
         crate::sdsc_abstract::GatherDest::CoreLocalLx => {
             if let Some(l) = layout
                 && !l.lx_core_local(dst)
@@ -440,8 +509,44 @@ pub fn pointwise_opspec_from_tile(
         head_major,
         EwDivision::Law.resolve(stick_major, core_local).splitter(),
         // Whole-tensor output — every caller but the gather copy, whose runs land at a base.
-        0,
+        OutView::whole(),
     )
+}
+
+/// The OUTPUT arg's own view — ONE value because it is one fact: where the output's window
+/// sits (`offset`, in elements), and — for the one gather form whose destination is the
+/// ChainRow's scatter — the scatter's width, which spells the output's residency law (see
+/// [`crate::sdsc_abstract::GatherDest::Scatter`]). `OutView::whole()` is every whole-tensor
+/// caller; the gather's run landing is `OutView::at(dest_base)` and its scatter form
+/// `OutView::scattered(dest_base, W)`.
+struct OutView {
+    offset: u32,
+    scatter_interleave: Option<u32>,
+}
+
+impl OutView {
+    fn whole() -> OutView {
+        OutView {
+            offset: 0,
+            scatter_interleave: None,
+        }
+    }
+
+    /// A windowed whole-tensor output at an element base — the gather's contiguous
+    /// Scratch destinations.
+    fn at(offset: u32) -> OutView {
+        OutView {
+            offset,
+            scatter_interleave: None,
+        }
+    }
+
+    fn scattered(offset: u32, interleave: u32) -> OutView {
+        OutView {
+            offset,
+            scatter_interleave: Some(interleave),
+        }
+    }
 }
 
 /// [`pointwise_opspec_from_tile`] with the WORK DIVISION as a parameter — for the one op whose entry
@@ -457,8 +562,9 @@ fn pointwise_opspec_from_tile_split(
         &[crate::superdsc_opspec::ItDim],
         u32,
     ) -> std::collections::BTreeMap<&'static str, u32>,
-    // The OUTPUT's base, in elements — see [`gather_copy_opspec`]'s `dst_off`. 0 = whole-tensor output.
-    out_offset: u32,
+    // The OUTPUT's own view — its base in elements and, for the gather's scatter destination,
+    // the scatter's width. See [`gather_copy_opspec`]'s `dst_off` and `OutView`.
+    out_view: OutView,
 ) -> Result<OpSpec, String> {
     let rows = tile_op
         .dims
@@ -518,7 +624,29 @@ fn pointwise_opspec_from_tile_split(
     for name in in_names {
         args.push(mk(true, name, 0)?);
     }
-    args.push(mk(false, o_name, out_offset)?);
+    // The scatter-row output (see `OutView`): `["mb", "y", "out"]`, stick innermost, the
+    // physical `y` extent carrying the scatter's width W. The scales stay all-Active so the
+    // `y` dim is scale-active — the one `DeviceExtents::of_view` keys on when it lifts the
+    // view's physical extent over the plan's iterated one.
+    args.push(match out_view.scatter_interleave {
+        None => mk(false, o_name, out_view.offset)?,
+        Some(interleave) => AnyTensorArg::R3(
+            TensorArg::<3>::new(
+                false,
+                o_name.to_string(),
+                Role::Output,
+                [Scale::Active, Scale::Active, Scale::Active],
+                plan.iter_syms(["mb", "y", "out"]),
+                ["mb", "y", "out"],
+                "out",
+                Allocation::Hbm,
+            )
+            .map_err(|e| e.0)?
+            .with_offset(out_view.offset)
+            .with_device_extent("y", interleave)
+            .map_err(|e| e.0)?,
+        ),
+    });
 
     let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
     Ok(OpSpec {

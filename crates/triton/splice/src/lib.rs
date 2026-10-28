@@ -96,6 +96,7 @@ use std::collections::HashMap;
 use ktir_core::arena::Arena;
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ktir_node::{BufferId, Elementwise, KtirNode, Program};
+use ktir_superdsc::superdsc_opspec::Df;
 use scratchy_subtile::lower::GemmWeight;
 use scratchy_subtile::subtile_ir::{EwKind, GainConvention, SubOp, SubtileIR, SubtileNode};
 
@@ -381,6 +382,18 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
             entry: "reshape_fwd",
             program: Program::Reshape,
         },
+        // ⭐ THE TOKEN DRAW — the whole vocab scan as ONE kernel per request
+        // row: the row, its per-row noise block and temperature reciprocals,
+        // the nine staged tables (functions of the vocab alone, host-staged at
+        // load — the seventh is the pad law's offset row), and the `[rows,
+        // 64]` i32 idx stick out. The vocab and the row count ride the node
+        // (never a model name); every constexpr below derives from them.
+        SubOp::Sample { .. } => TritonKernelRow::Spliced {
+            src: include_str!("../../../targets/spyre/kernels/sample_fwd.py"),
+            file: "sample_fwd.py",
+            entry: "sample_fwd",
+            program: Program::Sample,
+        },
         // ⛔⭐ THE OPS `lower_one_node` NEVER ROUTES HERE — enumerated by NAME, never
         // `_`, so adding a SubOp is an E0004 in this crate too. `lower_one_node`'s own
         // match is the gate: these kinds have their own arms there (attention's
@@ -419,7 +432,15 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         | SubOp::ExpertAct { .. }
         | SubOp::SampleRowsGather
         | SubOp::SampleRowsScatter
-        | SubOp::AllRowsMatmul => TritonKernelRow::Refused(
+        | SubOp::AllRowsMatmul
+        // ⛔ THE CHAINED HEAD'S PAIR — its by-name refusals DIED with the
+        // chained-head emission rung: both ops are HAND-MINTED KTIR programs
+        // (`lower_one_node`'s chain arms, the spyre emitter — the door bodies
+        // `lk::embed_row_gather`/`lk::chain_stage`, never Triton kernels), so
+        // they are ordinary members of the "not a spliced kind" class: reaching
+        // the splice means the routing changed, not that a kernel is missing.
+        | SubOp::EmbedRowGather { .. }
+        | SubOp::ChainStage { .. } => TritonKernelRow::Refused(
             "not a spliced kind — `lower_one_node` owns this op's lowering (its own arm, a \
              host routing, or its own by-name refusal); reaching the splice means the \
              routing changed, and the fix is a family function plus a kernel",
@@ -467,8 +488,38 @@ pub fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
 ) -> bool {
-    let result_cols = ir.tensors[ir.result.index()].cols;
-    node.output.region.cols.len == result_cols
+    // ⭐ THE MINTED DRAW STATES THE TAIL'S PRODUCT. A graph the sampler minted
+    // re-points its result at the idx stick and pads the tail's storage width,
+    // so the original width conjunct (the node's output region width equals the
+    // result tensor's cols) can no longer see the tail. The draw restates it:
+    // the lm-head's OWN full output width N equals the vocab the draw serves,
+    // and an elementwise tail node's region width equals that vocab — the same
+    // "this node is vocab-wide like the result" statement, read off the ops'
+    // own fields, immune to the re-point and the padding. A graph without a
+    // draw keeps the original conjunct verbatim. One predicate, read by every
+    // caller — the `lower_all` rewrite, the one-op routing echo, and the
+    // bake-time numeric gate — so all three state the SAME fold. (The width
+    // alone was never sufficient — the gemma-4 q-projection collision is what
+    // the feeds-walk conjunct below kills — and that protection is unchanged.)
+    let draw = ir
+        .nodes
+        .iter()
+        .find(|n| matches!(n.op, SubOp::Sample { .. }));
+    let feeds_the_tail_product = match (&draw, &node.op) {
+        (Some(sample), SubOp::MatmulTile { n, .. }) => match &sample.op {
+            SubOp::Sample { vocab, .. } => *n == *vocab,
+            _ => false,
+        },
+        (Some(sample), _) => match &sample.op {
+            SubOp::Sample { vocab, .. } => node.output.region.cols.len == *vocab,
+            _ => false,
+        },
+        (None, _) => {
+            let result_cols = ir.tensors[ir.result.index()].cols;
+            node.output.region.cols.len == result_cols
+        }
+    };
+    feeds_the_tail_product
         && node.output.region.rows.len > 1
         && !rows_are_requests
         && tensor_feeds_result_through_row_local_ops(ir, node.output.tensor)
@@ -534,6 +585,19 @@ pub fn lower_all<F: scratchy_subtile::subtile_ir::RopeForm>(
     // of mq rows of which mq−1 were never written.
     if let SubOp::TanhSoftCap { .. } = &node.op
         && is_prefill_lm_head_tail
+    {
+        let at_m1 = node_at_one_row(node);
+        return lower_one(&at_m1, ir, rows_are_requests).map(|e| vec![e]);
+    }
+    // ⭐ AND THE TOKEN DRAW'S ROW INPUT IS THE FOLDED TAIL'S ONE ROW — the same
+    // `node_at_one_row` law the tail's ScalarMul and TanhSoftCap get: the mint
+    // states the prefill draw at rows = 1 reading the result's row 0 (the row
+    // the fold writes), so the kernel is handed the whole one-row region at
+    // corner 0. The gate is the mint's own typed fact — a one-row region of a
+    // taller tensor — never a model name or a rung label.
+    if let SubOp::Sample { .. } = &node.op
+        && node.inputs[0].region.rows.len == 1
+        && ir.tensors[node.inputs[0].tensor.index()].rows > 1
     {
         let at_m1 = node_at_one_row(node);
         return lower_one(&at_m1, ir, rows_are_requests).map(|e| vec![e]);
@@ -885,7 +949,12 @@ fn lower_sandwich_node<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// The ROW-LOCAL op set: ops whose output row `r` depends only on input row `r` (plus
 /// weights and per-row tables). The prefill lm-head fold is sound only inside this set —
 /// see [`tensor_feeds_result_through_row_local_ops`].
-fn row_local_tail_op<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> bool {
+///
+/// Pub for the spyre numeric gate, which closes its fold-law set with this same
+/// classifier — every compared tid whose producer is row-local, consumes a
+/// fold-family tensor and feeds the result rides the fold's one-row compare —
+/// so the gate states the fold the program carries, never a re-derived set.
+pub fn row_local_tail_op<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> bool {
     matches!(
         op,
         SubOp::MatmulTile { .. }
@@ -899,6 +968,11 @@ fn row_local_tail_op<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -
             | SubOp::RmsNormUnit { .. }
             | SubOp::TanhSoftCap { .. }
             | SubOp::ScalarWeightMul
+            // ⭐ THE DRAW IS ROW-LOCAL IN THE TAIL'S OWN SENSE: it reads one
+            // row region of its input (the fold's product) and writes the idx
+            // stick — no row mixing — so a minted graph's feeds-walk traverses
+            // it from the tail to the re-pointed result.
+            | SubOp::Sample { .. }
     )
 }
 
@@ -1048,13 +1122,19 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
                     EwKind::Silu | EwKind::Gelu | EwKind::Add | EwKind::Mul | EwKind::Sub,
                 )
         );
-        // ⭐ THE TANH-SOFTCAP STATES NEITHER CORNER — its kernel's view IS the region
-        // (`[M, N]`, tiles from row 0 / column 0), so BOTH corners must be 0 while the
-        // extents are free: the prefill lm-head fold re-lowers the vocab-wide softcap
-        // at m=1 (row 0 of the `[mq, vocab]` logits storage, a legal prefix view), and
-        // the front end's chunker never tiles this op (its chunk set is the
-        // elementwise/scalarmul/silumul family), so a column window never arises.
-        let states_neither_corner = matches!(&node.op, SubOp::TanhSoftCap { .. });
+        // ⭐ THE TANH-SOFTCAP AND THE TOKEN DRAW STATE NEITHER CORNER — the softcap
+        // kernel's view IS the region (`[M, N]`, tiles from row 0 / column 0), so BOTH
+        // corners must be 0 while the extents are free: the prefill lm-head fold
+        // re-lowers the vocab-wide softcap at m=1 (row 0 of the `[mq, vocab]` logits
+        // storage, a legal prefix view), and the front end's chunker never tiles this
+        // op (its chunk set is the elementwise/scalarmul/silumul family), so a column
+        // window never arises. The draw's kernel is the same law: its view is the
+        // region — the minted prefill draw reads row 0 of the `[mq, pad_vocab]`
+        // storage at rows = 1, a legal prefix view — and every operand the draw
+        // binds (the per-row pair, the nine tables, the idx stick) is whole at
+        // corner 0.
+        let states_neither_corner =
+            matches!(&node.op, SubOp::TanhSoftCap { .. } | SubOp::Sample { .. });
         if states_neither_corner {
             let corner0 = |tr: &scratchy_subtile::subtile_ir::TensorRegion| {
                 tr.region.rows.start == 0 && tr.region.cols.start == 0
@@ -1137,6 +1217,20 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
         // refuses them before the splice — the MoE lowers only from
         // `kernels/moe.py` through KTIR.
         SubOp::ScalarWeightMul => 2,
+        // ⭐ THE SAMPLER'S ARITY IS 26: the logits row, its per-row seed
+        // quadruple's FOUR `[rows, 1]` word tables and its per-row temperature
+        // reciprocals, then the twenty staged tables (two decreasing ramps,
+        // two increasing index tables, two widen tables, the pad law's offset
+        // row, the two-level ramp's group pair, then the noise section's own
+        // eleven — the four i32 hash/fold constants, the lane table, the
+        // fold's five f32 constants, the fp16 clamp) — every kernel parameter
+        // but the output is a tape operand, per the splice's own positional
+        // law. (Four word tables, not one `[rows, 4]` table: the Col operand
+        // mode addresses the stick head alone — the int-bcast leg's measured
+        // law — so each word rides its own corner-free table, the auditor's
+        // wall-4 ruling (a); the row word is GONE from the key — the P3
+        // localization ruling, 2026-10-27, request-owned noise alone.)
+        SubOp::Sample { .. } => 26,
         SubOp::TanhSoftCap { .. } | SubOp::RmsNormUnit { .. } | SubOp::Reshape { .. } => 1,
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without an arity here is
         // an unreachable — the same discipline `lower_one_node`'s match holds.
@@ -1202,6 +1296,18 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
     }
     let row = scratchy_subtile::sdsc_abstract::selector_lastrow_col(mq as usize) as u32;
     let last_hidden = ktir_superdsc::reserved_tids::LAST_HIDDEN_TID;
+    // The bake-log proof the fold fired: every prefill rung's bake names its
+    // own LAST_HIDDEN extraction — the op, the row it takes, and the staging
+    // it lands in. A rung whose bake lacks this line folded nothing.
+    eprintln!(
+        "[spyre-superdsc] prefill lm-head tail folded — lmlast_s{} extracts row {} of {} \
+         (hidden {}) into LAST_HIDDEN t{}",
+        node.id.index(),
+        row,
+        mq,
+        hidden,
+        last_hidden
+    );
 
     // ── Half 1: the extraction, through the lmlast kernel. ──
     let src = match lmlast_row() {
@@ -2341,6 +2447,100 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             ce("C_OUT", Val::Int(i128::from(c_out)))?;
             ce("N_STICKS", Val::Int(i128::from(elems_in / u64::from(stk))))?;
         }
+        (SubOp::Sample { vocab, rows }, "sample_fwd") => {
+            // The token draw's own facts, all derived from the node's vocab and
+            // row count — never a model name: PAD_V is the power-of-two padded
+            // row, STRICTLY above the vocab (the descriptor block's law and the
+            // sentinel's — a power-of-two vocab still needs pad lanes), ONE
+            // derivation shared with the host reference and the load-time table
+            // staging), NB its block count, BLOCK the stick (the two-level
+            // ramp's lane width and the output stick), B the row count this
+            // rung serves (the grid's own width). The signature states every
+            // kernel parameter's dtype: the fp16 row, the PER-ROW SEED WORD
+            // TABLES in i32 — four `[rows, 1]` tables, one per word of the
+            // quadruple (seed_lo, seed_hi, step, greedy_gate), each
+            // loaded corner-free at `[pid, 0]` (the Col operand mode reads
+            // the stick head alone — the int-bcast leg's measured law — so
+            // no word rides a windowed column; the auditor's wall-4 ruling
+            // (a); the row word is gone from the key — the P3 localization
+            // ruling, request-owned noise alone); the noise is computed on
+            // the card, no f32 noise staging
+            // rides — then the per-row temperature reciprocals in f32,
+            // the nine selection tables in f32 (the selection is f32 — a sum
+            // the f16 grid would round), the noise section's own tables — the
+            // hash multipliers and the wrap-fold's 2^8 in i32, the lane and the
+            // fold's five f32 constants, the FEST-domain clamp in fp16 — and
+            // the i32 output stick (the index-ingestion law).
+            let pad_v = scratchy_subtile::subtile_ir::sample_pad_vocab(*vocab);
+            let nb = pad_v / scratchy_subtile::subtile_ir::SAMPLE_BLOCK;
+            signature.insert(
+                "logits_ptr".to_string(),
+                ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+            );
+            for p in ["slo_ptr", "shi_ptr", "stp_ptr", "sgate_ptr"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*i32").map_err(|e| e.to_string())?,
+                );
+            }
+            for p in [
+                "invt_ptr",
+                "bramp_ptr",
+                "lramp_ptr",
+                "binc_ptr",
+                "linc_ptr",
+                "ones_ptr",
+                "sixtyfour_ptr",
+                "padoff_ptr",
+                "gramp_ptr",
+                "ginc_ptr",
+            ] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp32").map_err(|e| e.to_string())?,
+                );
+            }
+            for p in ["hc1_ptr", "hc2_ptr", "hc3_ptr", "c256_ptr"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*i32").map_err(|e| e.to_string())?,
+                );
+            }
+            for p in [
+                "lane_ptr",
+                "fm8_ptr",
+                "ftop_ptr",
+                "fzero_ptr",
+                "fhalf_ptr",
+                "fm22_ptr",
+            ] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp32").map_err(|e| e.to_string())?,
+                );
+            }
+            signature.insert(
+                "cmin_ptr".to_string(),
+                ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+            );
+            signature.insert(
+                "idx_ptr".to_string(),
+                ArgSpec::parse("*i32").map_err(|e| e.to_string())?,
+            );
+            let mut ce = |k: &str, v: Val| -> Result<(), String> {
+                signature.insert(k.to_string(), ArgSpec::Constexpr);
+                constexprs.insert(k.to_string(), v);
+                Ok(())
+            };
+            ce("V", Val::Int(i128::from(*vocab)))?;
+            ce("PAD_V", Val::Int(i128::from(pad_v)))?;
+            ce("NB", Val::Int(i128::from(nb)))?;
+            ce(
+                "BLOCK",
+                Val::Int(i128::from(scratchy_subtile::subtile_ir::SAMPLE_BLOCK)),
+            )?;
+            ce("B", Val::Int(i128::from(*rows)))?;
+        }
         (op, entry) => {
             return Err(format!(
                 "triton splice: no kernel signature for {op:?} at entry `{entry}` — the row is \
@@ -2493,6 +2693,11 @@ fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
         | SubOp::RmsNormUnit { .. }
         | SubOp::ScalarWeightMul
         | SubOp::Reshape { .. } => Ok(vec![1]),
+        // ⭐ ONE PROGRAM PER REQUEST ROW: the sampler's grid is the rung's
+        // own row count — 1 on the solo rung, the batched rung's baked width
+        // on every batch rung. Every per-row operand is a `[B, ·]` descriptor
+        // this program's own row indexes (`[pid, 0]`).
+        SubOp::Sample { rows, .. } => Ok(vec![i64::from(*rows)]),
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without a grid here is
         // an unreachable — the same discipline the arity match holds.
         _ => Err("triton splice: no grid for this op kind — the row is incomplete".to_string()),
@@ -2677,6 +2882,168 @@ fn default_bindings<F: scratchy_subtile::subtile_ir::RopeForm>(
     bindings
 }
 
+/// ⭐⭐⭐ THE OPERAND FORMATS A SPLICED KERNEL STATES — every buffer parameter's
+/// element format, as `(tensor id, format)` pairs in the node's OPERAND ORDER
+/// ([`default_bindings`]' law: the node's inputs, the output LAST). This is the
+/// PLACEMENT PASS's width authority: a tensor whose consumer is a spliced
+/// kernel is sized at the format that kernel's signature states for it, never
+/// at a per-op width census — a `[1, 64]` f32 table or an i32 idx stick states
+/// its own element width in the kernel that reads it, and a placement sized at
+/// the fp16 default would under-reserve by half and the footprint guard would
+/// refuse the CORRECT descriptor.
+///
+/// The ORDER comes from the kernel's own declared parameter list — the
+/// signature map is keyed by NAME and unordered — and each entry is the
+/// SIGNATURE's stated pointer dtype, the same statement the compile itself
+/// reads. `Ok(None)` for a kind that is not a `lower_one` kernel: a `Refused`
+/// row's formats are another producer's statement, and attention — a Spliced
+/// row that lowers through `lower_attn`'s door-order bindings — states its
+/// widths at the door (the per-parameter view dtype), not here.
+///
+/// The device-format mapping is the door's own law: a stated dtype with no
+/// device format is refused BY NAME, because sizing it at some other format's
+/// bytes would turn the footprint guard into a rubber stamp for exactly the
+/// access it exists to catch. ⚠ AN `Err` HERE IS THE SEAT'S OWN REFUSAL — the
+/// same `kernel_spec` the compile runs — so a caller that does not itself
+/// compile the node (the placement pass's width census) treats it as "no
+/// formats from this seat" and leaves the refusal to the lowering, which
+/// raises it loudly on every node it actually mints; a caller that does
+/// compile should propagate it unchanged.
+pub fn operand_dfs<F: scratchy_subtile::subtile_ir::RopeForm>(
+    node: &SubtileNode<F>,
+    ir: &SubtileIR<F>,
+) -> Result<Option<Vec<(u32, Df)>>, String> {
+    // Attention is a Spliced ROW but not a `lower_one` kernel (its door-order
+    // bindings and mask slot are `lower_attn`'s); its widths are the door's
+    // statement. This names the ROUTING, not a format.
+    if matches!(node.op, SubOp::AttnDecode { .. }) {
+        return Ok(None);
+    }
+    // ⭐ THE CHAINED HEAD'S PAIR — HAND-MINTED KTIR, NOT SPLICED, but its
+    // operand formats are still THIS census's to state, because the placement
+    // widths read no other seat: the door's own u32-stick law (a staged
+    // table's gathered destination is exactly one `[1, 32]` SENUINT32 stick,
+    // and the pick's `[1, 64]` i32 lanes are the same bytes at the argmax's
+    // own SenUint32 statement) sizes those tensors at FOUR bytes an element.
+    // Left to the fp16 default the placement under-reserves by half and the
+    // footprint guard refuses the CORRECT descriptor — the exact defect this
+    // census exists to prevent. The formats are the DOOR's law
+    // (`lk::embed_row_gather`'s idx-stick class check, `lk::chain_stage`'s
+    // destination class check), stated here because the emitter that mints
+    // the programs has no kernel signature to read them from.
+    if matches!(
+        node.op,
+        SubOp::EmbedRowGather { .. } | SubOp::ChainStage { .. }
+    ) {
+        let bindings = default_bindings(node);
+        let dfs = match &node.op {
+            // `[s_stick, l_stick, weight, out]`: the two index sticks are
+            // SENUINT32; the weight and the `[1, hidden]` row are fp16. ⭐ The
+            // list is the COMPLETE operand census in `default_bindings` order,
+            // the output LAST — the ktir consumers (`node_output_on_f16_stick`,
+            // `result_dtype_of_ir`) read it as the node's full parameter list
+            // and refuse a node whose own output is absent (the check-8
+            // pre-scan catch: the u32-only partial list panicked the reference
+            // legs' stick walk at the gather). The Fp16 entries are inert for
+            // the placement census by its own skip law (`df != Df::Fp16`), so
+            // completion changes no sizing.
+            SubOp::EmbedRowGather { .. } if bindings.len() == 4 => vec![
+                (bindings[0].get(), Df::SenUint32),
+                (bindings[1].get(), Df::SenUint32),
+                (bindings[2].get(), Df::Fp16),
+                (bindings[3].get(), Df::Fp16),
+            ],
+            // `[pick, s_stick, l_stick, s_tab, l_tab, out]`: every operand is
+            // a u32 stick or a u32 table — all SENUINT32.
+            SubOp::ChainStage { .. } if bindings.len() == 6 => {
+                bindings.iter().map(|b| (b.get(), Df::SenUint32)).collect()
+            }
+            // A chain node off the mint's arity — the operand-order contract
+            // this function's own zip law states below.
+            _ => {
+                return Err(format!(
+                    "triton splice: a chained-head node states {} operand(s) — the mint's \
+                     shape is exactly four for the gather and six for the stage (see \
+                     `mint_embed_chain`)",
+                    bindings.len()
+                ));
+            }
+        };
+        return Ok(Some(dfs));
+    }
+    let row = row(&node.op);
+    let TritonKernelRow::Spliced {
+        src, file, entry, ..
+    } = &row
+    else {
+        return Ok(None);
+    };
+    let spec = kernel_spec(node, ir, file, entry)?;
+    let module = triton_frontend::py::parser::parse(src)
+        .map_err(|e| format!("triton splice: {file}: {e}"))?;
+    let f = module
+        .function(entry)
+        .ok_or_else(|| format!("triton splice: {file} declares no function {entry}"))?;
+    let mut dfs: Vec<Df> = Vec::new();
+    for p in &f.params {
+        if p.is_constexpr() {
+            continue;
+        }
+        let Some(arg) = spec.signature.get(&p.name) else {
+            return Err(format!(
+                "triton splice: {file}'s {entry} parameter `{}` is missing from the signature",
+                p.name
+            ));
+        };
+        match arg {
+            ArgSpec::Ptr(t) => dfs.push(df_of_stated_type(&p.name, t)?),
+            // A scalar parameter is not an operand buffer; the zip with the
+            // binding law below refuses any kernel whose parameters are not
+            // exactly its operands.
+            ArgSpec::Scalar(_) => {}
+            ArgSpec::Constexpr => unreachable!("is_constexpr filtered the parameter above"),
+        }
+    }
+    let bindings = default_bindings(node);
+    if bindings.len() != dfs.len() {
+        return Err(format!(
+            "triton splice: {file}'s {entry} states {} buffer parameter(s) for {} operand(s) — \
+             the registry's operand-order contract is violated",
+            dfs.len(),
+            bindings.len()
+        ));
+    }
+    Ok(Some(
+        bindings
+            .into_iter()
+            .zip(dfs)
+            .map(|(b, df)| (b.get(), df))
+            .collect(),
+    ))
+}
+
+/// One stated pointer dtype → its device format — the door's own mapping law
+/// (F16→Fp16, BF16→Bf16, F32→Fp32, F8E4M3FN→Fp8, i32→SenUint32): a dtype with
+/// no device format is refused BY NAME.
+fn df_of_stated_type(param: &str, t: &triton_frontend::ttir::Type) -> Result<Df, String> {
+    use triton_frontend::ttir::{FloatKind, Type};
+    Ok(match t {
+        Type::Float(FloatKind::F16) => Df::Fp16,
+        Type::Float(FloatKind::BF16) => Df::Bf16,
+        Type::Float(FloatKind::F32) => Df::Fp32,
+        Type::Float(FloatKind::F8E4M3FN) => Df::Fp8,
+        Type::Int(32, _) => Df::SenUint32,
+        other => {
+            return Err(format!(
+                "triton splice: parameter `{param}` states element type {other:?}, which has no \
+                 device format — the placement would be sized at some other format's bytes and \
+                 the footprint guard would then compare an access against a fiction. Give the \
+                 buffer a dtype the device has (f16, bf16, f32, f8E4M3FN, i32)."
+            ));
+        }
+    })
+}
+
 /// Mint the [`KtirNode`]: the adapter's `node_for` compilation, then RE-STATE the fields
 /// the tape owns — the name (the builder's naming law), the bindings (resolved by
 /// [`default_bindings`]: the tape's tensor indices, the output LAST), `mask` (none for
@@ -2760,6 +3127,849 @@ fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
         Program::TanhSoftCap => "tanhsoftcap",
         Program::ScalarWeightMul => "scalarwmul",
         Program::Reshape => "reshape",
+        // ⭐ THE SAMPLER'S OWN STEM — #813's argmax law: a spliced whole-function kernel
+        // keeps its own name (`argmax_s{id}`), never the generic `triton`, so a bake log
+        // names the draw's descriptors for what they are.
+        Program::Sample => "sample",
         _ => "triton",
+    }
+}
+
+#[cfg(test)]
+mod production_ktir_dump {
+    //! ⭐ THE LEGALIZE-TYPES BYTE-IDENTITY PROOF DRIVER (auditor order, 2026-10-26):
+    //! `LegalizeTypes` runs on EVERY kernel the ladder compiles, so a change that widens
+    //! what stays f32 could move bytes in kernels that work today. This test dumps the
+    //! post-`to_ktir` module text — `triton_ktir::text::print::print`, the deterministic
+    //! module printer — for EVERY production kernel in `crates/targets/spyre/kernels/`
+    //! except `sample_fwd.py` (the sampler this proof guards), each at one representative
+    //! admitted geometry, into `<workspace>/target/spyre-ktir-dump/`.
+    //!
+    //! The proof is the EXTERNAL DIFF, not this test: run once with the tree's
+    //! `legalize_types.rs`, once with the pre-change file swapped in, and diff the two dump
+    //! directories — byte-identical per kernel is the bar, and any nonzero diff names the
+    //! kernel it stopped on. That is why the test is `#[ignore]`d: it produces evidence,
+    //! asserts nothing about the numbers, and would be dead weight in every ordinary test
+    //! run. Run it explicitly with
+    //! `cargo test -p scratchy-triton-splice --lib production_ktir_dump -- --ignored`.
+    //!
+    //! Every spec below mirrors the `kernel_spec` arm (or `attn_kernel_spec` /
+    //! `lower_sandwich_node` / `lower_prefill_lm_head_fold` / the MoE numeric tests'
+    //! golden geometry) that the production bake states for that kernel — cited per entry
+    //! — at a whole-region decode-shaped geometry so every blocking law answers the
+    //! one-tile constants. The compile goes through the crate's own [`compile_kernel`]:
+    //! the exact memoized ladder (`codegen::compile` → `make_ttir` → `from_ttir` →
+    //! `make_ktir` → `to_ktir`) the bake runs, so the dump cannot drift from what
+    //! production emits.
+    use super::*;
+
+    const ATTN: &str = include_str!("../../../targets/spyre/kernels/attn.py");
+    const ELEMENTWISE: &str = include_str!("../../../targets/spyre/kernels/elementwise.py");
+    const LMLAST: &str = include_str!("../../../targets/spyre/kernels/lmlast.py");
+    const MATMUL: &str = include_str!("../../../targets/spyre/kernels/matmul.py");
+    const MATMUL_FP8: &str = include_str!("../../../targets/spyre/kernels/matmul_fp8.py");
+    const MOE: &str = include_str!("../../../targets/spyre/kernels/moe.py");
+    const MOE_PREFILL: &str = include_str!("../../../targets/spyre/kernels/moe_prefill.py");
+    const RESHAPE: &str = include_str!("../../../targets/spyre/kernels/reshape.py");
+    const SAMPLE: &str = include_str!("../../../targets/spyre/kernels/sample_fwd.py");
+    const RMSNORM: &str = include_str!("../../../targets/spyre/kernels/rmsnorm.py");
+    const RMSNORMUNIT: &str = include_str!("../../../targets/spyre/kernels/rmsnormunit.py");
+    const ROPE: &str = include_str!("../../../targets/spyre/kernels/rope.py");
+    const SCALARMUL: &str = include_str!("../../../targets/spyre/kernels/scalarmul.py");
+    const SCALARWMUL: &str = include_str!("../../../targets/spyre/kernels/scalarwmul.py");
+    const SILUMUL: &str = include_str!("../../../targets/spyre/kernels/silumul.py");
+    const TANHSOFTCAP: &str = include_str!("../../../targets/spyre/kernels/tanhsoftcap.py");
+    const WINDOWEDRMSNORM: &str = include_str!("../../../targets/spyre/kernels/windowedrmsnorm.py");
+
+    /// The case table's `spec` shape: pointer parameters by stated dtype, then the
+    /// constexprs — every constexpr is BOTH a signature entry and a binding.
+    fn spec(file: &str, kernel: &str, ptrs: &[(&str, &str)], ces: &[(&str, Val)]) -> KernelSpec {
+        let mut signature = HashMap::new();
+        for (k, v) in ptrs {
+            signature.insert(
+                (*k).to_string(),
+                ArgSpec::parse(v)
+                    .unwrap_or_else(|e| panic!("{file}:{kernel}: bad spec {k}={v}: {e}")),
+            );
+        }
+        let mut constexprs = HashMap::new();
+        for (k, v) in ces {
+            signature.insert((*k).to_string(), ArgSpec::Constexpr);
+            constexprs.insert((*k).to_string(), v.clone());
+        }
+        KernelSpec {
+            kernel: kernel.to_string(),
+            signature,
+            constexprs,
+            file: file.to_string(),
+        }
+    }
+
+    use ktir_superdsc::superdsc_opspec::{
+        EW_BINARY_LIVE_TILES, EW_SILU_LIVE_TILES, SILU_MUL_LIVE_TILES,
+    };
+
+    /// One entry per (kernel file, entry point) — the multi-entry files (`elementwise.py`,
+    /// `rmsnorm.py`, `windowedrmsnorm.py`, `matmul.py`, `attn.py`) state every entry, so a
+    /// guard that only one arm trips is itself covered.
+    fn entries() -> Vec<(&'static str, &'static str, KernelSpec, Vec<i64>)> {
+        // The whole-region pointwise constants every `blocks_of(1, c, live)` answers.
+        let ew = |file: &str, kernel: &str, ptrs: &[(&str, &str)], live: u32| {
+            let (block_m, n_blocks, tail_h) = blocks_of(1, 2048, live);
+            spec(
+                file,
+                kernel,
+                ptrs,
+                &[
+                    ("M", Val::Int(1)),
+                    ("N", Val::Int(2048)),
+                    ("BLOCK_M", Val::Int(i128::from(block_m))),
+                    ("BLOCK_N", Val::Int(2048)),
+                    ("N_TOTAL", Val::Int(2048)),
+                    ("C_START", Val::Int(0)),
+                    ("N_BLOCKS", Val::Int(i128::from(n_blocks))),
+                    ("TAIL_H", Val::Int(i128::from(tail_h))),
+                ],
+            )
+        };
+        let mut v: Vec<(&'static str, &'static str, KernelSpec, Vec<i64>)> = Vec::new();
+        // ── rmsnorm.py: the Scale arm and the (1 + w) form's own spec. ──
+        for entry in ["rmsnorm_fwd", "rmsnorm_oneplus_fwd"] {
+            let mut ces = vec![
+                ("M", Val::Int(1)),
+                ("D_MODEL", Val::Int(2048)),
+                ("BLOCK_M", Val::Int(1)),
+                ("EPS", Val::Float(1e-5)),
+                ("INV_D", Val::Float(1.0 / 2048.0)),
+            ];
+            if entry == "rmsnorm_oneplus_fwd" {
+                ces.push((
+                    "GAIN_OFFSET",
+                    Val::Float(f64::from(GainConvention::OnePlusScale.offset())),
+                ));
+            }
+            v.push((
+                entry,
+                RMSNORM,
+                spec(
+                    "rmsnorm.py",
+                    entry,
+                    &[
+                        ("desc_x", "*fp16"),
+                        ("desc_w", "*fp16"),
+                        ("desc_o", "*fp16"),
+                    ],
+                    &ces,
+                ),
+                vec![1],
+            ));
+        }
+        // ── matmul.py (Dense): N is the DEVICE width, the arm's own padding law. ──
+        let n_dev = ktir_superdsc::work::DeviceWidth::for_matmul(1, 2048, 2048, false).get();
+        v.push((
+            "matmul_fwd",
+            MATMUL,
+            spec(
+                "matmul.py",
+                "matmul_fwd",
+                &[
+                    ("desc_a", "*fp16"),
+                    ("desc_w", "*fp16"),
+                    ("desc_o", "*fp16"),
+                ],
+                &[
+                    ("M", Val::Int(1)),
+                    ("K", Val::Int(2048)),
+                    ("N", Val::Int(i128::from(n_dev))),
+                    ("BLOCK_M", Val::Int(1)),
+                    ("BLOCK_K", Val::Int(2048)),
+                    ("BLOCK_N", Val::Int(i128::from(n_dev))),
+                    ("M_TOTAL", Val::Int(1)),
+                ],
+            ),
+            vec![1],
+        ));
+        // ── matmul_fp8.py: the arity-3 twin, LOGICAL widths (the arm's own early-return
+        // door is not pad-idempotent), one whole-region tile. ──
+        v.push((
+            "matmul_fp8_fwd",
+            MATMUL_FP8,
+            spec(
+                "matmul_fp8.py",
+                "matmul_fp8_fwd",
+                &[
+                    ("desc_x", "*fp16"),
+                    ("desc_w", "*fp8e4nv"),
+                    ("desc_ws", "*fp16"),
+                    ("desc_o", "*fp16"),
+                ],
+                &[
+                    ("M", Val::Int(1)),
+                    ("K", Val::Int(2048)),
+                    ("N", Val::Int(2048)),
+                    ("BLOCK_M", Val::Int(1)),
+                    ("BLOCK_K", Val::Int(2048)),
+                    ("BLOCK_N", Val::Int(2048)),
+                    ("M_TOTAL", Val::Int(1)),
+                ],
+            ),
+            vec![1],
+        ));
+        // ── elementwise.py: every binary entry plus both unary acts. ──
+        for (entry, ptrs, live) in [
+            (
+                "add_fwd",
+                &[
+                    ("desc_a", "*fp16"),
+                    ("desc_b", "*fp16"),
+                    ("desc_o", "*fp16"),
+                ][..],
+                EW_BINARY_LIVE_TILES,
+            ),
+            (
+                "mul_fwd",
+                &[
+                    ("desc_a", "*fp16"),
+                    ("desc_b", "*fp16"),
+                    ("desc_o", "*fp16"),
+                ][..],
+                EW_BINARY_LIVE_TILES,
+            ),
+            (
+                "sub_fwd",
+                &[
+                    ("desc_a", "*fp16"),
+                    ("desc_b", "*fp16"),
+                    ("desc_o", "*fp16"),
+                ][..],
+                EW_BINARY_LIVE_TILES,
+            ),
+            (
+                "silu_fwd",
+                &[("desc_x", "*fp16"), ("desc_o", "*fp16")][..],
+                EW_SILU_LIVE_TILES,
+            ),
+            (
+                "gelu_fwd",
+                &[("desc_x", "*fp16"), ("desc_o", "*fp16")][..],
+                EW_SILU_LIVE_TILES,
+            ),
+        ] {
+            v.push((
+                entry,
+                ELEMENTWISE,
+                ew("elementwise.py", entry, ptrs, live),
+                vec![1],
+            ));
+        }
+        // ── silumul.py: the [M, N] gate·up product, whole-region single tile. ──
+        v.push((
+            "silumul_fwd",
+            SILUMUL,
+            ew(
+                "silumul.py",
+                "silumul_fwd",
+                &[
+                    ("desc_g", "*fp16"),
+                    ("desc_u", "*fp16"),
+                    ("desc_o", "*fp16"),
+                ],
+                SILU_MUL_LIVE_TILES,
+            ),
+            vec![1],
+        ));
+        // ── scalarmul.py: the WINDOW is the device width — `for_pointwise` on both N and
+        // N_TOTAL, the arm's own law. ──
+        {
+            let c_dev = ktir_superdsc::work::DeviceWidth::for_pointwise(2048).get();
+            let (_, n_blocks, tail_h) = blocks_of(1, c_dev, 3);
+            v.push((
+                "scalarmul_fwd",
+                SCALARMUL,
+                spec(
+                    "scalarmul.py",
+                    "scalarmul_fwd",
+                    &[("desc_x", "*fp16"), ("desc_o", "*fp16")],
+                    &[
+                        ("M", Val::Int(1)),
+                        ("N", Val::Int(i128::from(c_dev))),
+                        ("BLOCK_M", Val::Int(1)),
+                        ("BLOCK_N", Val::Int(i128::from(c_dev))),
+                        ("N_TOTAL", Val::Int(i128::from(c_dev))),
+                        ("C_START", Val::Int(0)),
+                        ("N_BLOCKS", Val::Int(i128::from(n_blocks))),
+                        ("TAIL_H", Val::Int(i128::from(tail_h))),
+                        ("SCALE", Val::Float(8.0)),
+                    ],
+                ),
+                vec![1],
+            ));
+        }
+        // ── rope.py: a whole-region node — R_START = 0, Y_TOTAL = MQ·H. ──
+        v.push((
+            "rope_fwd",
+            ROPE,
+            spec(
+                "rope.py",
+                "rope_fwd",
+                &[
+                    ("desc_x", "*fp16"),
+                    ("desc_cos", "*fp16"),
+                    ("desc_sin", "*fp16"),
+                    ("desc_o", "*fp16"),
+                ],
+                &[
+                    ("H", Val::Int(8)),
+                    ("MQ", Val::Int(1)),
+                    ("HEAD_DIM", Val::Int(128)),
+                    ("HALF", Val::Int(64)),
+                    ("Y_TOTAL", Val::Int(8)),
+                    ("R_START", Val::Int(0)),
+                ],
+            ),
+            vec![1],
+        ));
+        // ── tanhsoftcap.py: the vocab-wide cap, three live tiles. ──
+        {
+            let (_, n_blocks, tail_h) = blocks_of(1, 8192, 3);
+            v.push((
+                "tanhsoftcap_fwd",
+                TANHSOFTCAP,
+                spec(
+                    "tanhsoftcap.py",
+                    "tanhsoftcap_fwd",
+                    &[("desc_x", "*fp16"), ("desc_o", "*fp16")],
+                    &[
+                        ("M", Val::Int(1)),
+                        ("N", Val::Int(8192)),
+                        ("BLOCK_M", Val::Int(1)),
+                        ("BLOCK_N", Val::Int(8192)),
+                        ("CAP", Val::Float(30.0)),
+                        ("N_BLOCKS", Val::Int(i128::from(n_blocks))),
+                        ("TAIL_H", Val::Int(i128::from(tail_h))),
+                    ],
+                ),
+                vec![1],
+            ));
+        }
+        // ── rmsnormunit.py: the rmsnorm arm's constants minus the weight. ──
+        v.push((
+            "rmsnormunit_fwd",
+            RMSNORMUNIT,
+            spec(
+                "rmsnormunit.py",
+                "rmsnormunit_fwd",
+                &[("desc_x", "*fp16"), ("desc_o", "*fp16")],
+                &[
+                    ("M", Val::Int(1)),
+                    ("D_MODEL", Val::Int(128)),
+                    ("BLOCK_M", Val::Int(1)),
+                    ("EPS", Val::Float(1e-5)),
+                    ("INV_D", Val::Float(1.0 / 128.0)),
+                ],
+            ),
+            vec![1],
+        ));
+        // ── scalarwmul.py: `w` is a RUNTIME fp16 SCALAR, not a descriptor. ──
+        v.push((
+            "scalarwmul_fwd",
+            SCALARWMUL,
+            spec(
+                "scalarwmul.py",
+                "scalarwmul_fwd",
+                &[("desc_x", "*fp16"), ("w", "fp16"), ("desc_o", "*fp16")],
+                &[("M", Val::Int(1)), ("N", Val::Int(2048))],
+            ),
+            vec![1],
+        ));
+        // ── reshape.py: both sides whole sticks, element count preserved. ──
+        v.push((
+            "reshape_fwd",
+            RESHAPE,
+            spec(
+                "reshape.py",
+                "reshape_fwd",
+                &[("desc_src", "*fp16"), ("desc_dst", "*fp16")],
+                &[
+                    ("R_IN", Val::Int(1)),
+                    ("C_IN", Val::Int(1024)),
+                    ("R_OUT", Val::Int(2)),
+                    ("C_OUT", Val::Int(512)),
+                    ("N_STICKS", Val::Int(16)),
+                ],
+            ),
+            vec![1],
+        ));
+        // ── lmlast.py: the extraction, at the row the SSOT names for MQ=5. ──
+        v.push((
+            "lmlast_fwd",
+            LMLAST,
+            spec(
+                "lmlast.py",
+                "lmlast_fwd",
+                &[("desc_src", "*fp16"), ("desc_dst", "*fp16")],
+                &[
+                    ("MQ", Val::Int(5)),
+                    ("HIDDEN", Val::Int(2048)),
+                    (
+                        "ROW",
+                        Val::Int(scratchy_subtile::sdsc_abstract::selector_lastrow_col(5) as i128),
+                    ),
+                    ("N_STICKS", Val::Int(32)),
+                ],
+            ),
+            vec![1],
+        ));
+        // ── windowedrmsnorm.py: all three entries of the one body. ──
+        for (entry, gained, oneplus) in [
+            ("windowedrmsnorm_gained_fwd", true, false),
+            ("windowedrmsnorm_oneplus_fwd", true, true),
+            ("windowedrmsnorm_unit_fwd", false, false),
+        ] {
+            let ptrs: &[(&str, &str)] = if gained {
+                &[
+                    ("desc_x", "*fp16"),
+                    ("desc_gamma", "*fp16"),
+                    ("desc_o", "*fp16"),
+                ]
+            } else {
+                &[("desc_x", "*fp16"), ("desc_o", "*fp16")]
+            };
+            let mut ces = vec![
+                ("M", Val::Int(1)),
+                ("D", Val::Int(128)),
+                ("HEADS", Val::Int(8)),
+                ("EPS", Val::Float(1e-6)),
+                ("INV_D", Val::Float(1.0 / 128.0)),
+            ];
+            if oneplus {
+                ces.push((
+                    "GAIN_OFFSET",
+                    Val::Float(f64::from(GainConvention::OnePlusScale.offset())),
+                ));
+            }
+            v.push((
+                entry,
+                WINDOWEDRMSNORM,
+                spec("windowedrmsnorm.py", entry, ptrs, &ces),
+                vec![1],
+            ));
+        }
+        // ── attn.py: the three constexpr-selected arms — decode with a live masked
+        // prefix, the causal one-pass, and the whole-chunk continuation. The grid is the
+        // head count at MQ > 1 (`attn_positional`'s own law), [1] at decode. ──
+        let attn_ptrs: &[(&str, &str)] = &[
+            ("desc_q", "*fp16"),
+            ("desc_o", "*fp16"),
+            ("desc_kc", "*fp16"),
+            ("desc_kd", "*fp16"),
+            ("desc_vc", "*fp16"),
+            ("desc_vd", "*fp16"),
+            ("desc_mask", "*fp16"),
+        ];
+        for (name, mq, swept, new_len, one_pass, grid) in [
+            ("attn_decode", 1i128, 127i128, 1i128, false, vec![1i64]),
+            ("attn_one_pass", 64, 0, 64, true, vec![8]),
+            ("attn_continuation", 64, 64, 64, false, vec![8]),
+        ] {
+            v.push((
+                name,
+                ATTN,
+                spec(
+                    "attn.py",
+                    "attn_fwd",
+                    attn_ptrs,
+                    &[
+                        ("NQH", Val::Int(8)),
+                        ("NKVH", Val::Int(2)),
+                        ("HD", Val::Int(128)),
+                        ("GQA", Val::Int(4)),
+                        ("MQ", Val::Int(mq)),
+                        ("CAP", Val::Int(2048)),
+                        ("SWEPT", Val::Int(swept)),
+                        ("NEW_LEN", Val::Int(new_len)),
+                        ("KC_ROW", Val::Int(0)),
+                        ("KC_COL", Val::Int(0)),
+                        ("KD_ROW", Val::Int(0)),
+                        ("KD_COL", Val::Int(0)),
+                        ("SCALE", Val::Float(0.125)),
+                        ("HAS_MASK", Val::Bool(true)),
+                        ("ONE_PASS", Val::Bool(one_pass)),
+                    ],
+                ),
+                grid,
+            ));
+        }
+        // ── moe.py / moe_prefill.py: the MoE numeric tests' golden geometry — the
+        // smallest geometry the real-Triton compile admits — at grid [1]. ──
+        let h = 128.0f64;
+        let moe_ces = |rows: &'static str, m: i128| -> Vec<(&'static str, Val)> {
+            vec![
+                (rows, Val::Int(m)),
+                ("H", Val::Int(128)),
+                ("I", Val::Int(64)),
+                ("E", Val::Int(64)),
+                ("K", Val::Int(8)),
+                ("EPS", Val::Float(1e-6)),
+                ("INV_H", Val::Float(1.0 / h)),
+                ("TEMP", Val::Float(h.powf(-0.5))),
+                ("INV_QMAX", Val::Float(1.0 / 448.0)),
+                ("SCALE_FLOOR", Val::Float(1.0 / 448.0 / 448.0)),
+            ]
+        };
+        let moe_ptrs: &[(&str, &str)] = &[
+            ("desc_xr", "*fp16"),
+            ("desc_rg", "*fp16"),
+            ("desc_rw", "*fp16"),
+            ("desc_pes", "*fp16"),
+            ("desc_xe", "*fp16"),
+            ("desc_wg", "*fp8e4nv"),
+            ("desc_sg", "*fp16"),
+            ("desc_wu", "*fp8e4nv"),
+            ("desc_su", "*fp16"),
+            ("desc_wd", "*fp8e4nv"),
+            ("desc_sd", "*fp16"),
+            ("desc_o", "*fp16"),
+            ("desc_ids", "*i32"),
+            ("desc_rs", "*fp16"),
+            ("desc_act", "*fp16"),
+        ];
+        v.push((
+            "moe_fwd",
+            MOE,
+            spec("moe.py", "moe_fwd", moe_ptrs, &moe_ces("M", 1)),
+            vec![1],
+        ));
+        // `moe_prefill.py`'s signature: `moe.py`'s first twelve, then the dense route
+        // (`desc_dense`) — no id/scratch sticks, the route is dense in the prompt form.
+        v.push((
+            "moe_prefill_fwd",
+            MOE_PREFILL,
+            spec(
+                "moe_prefill.py",
+                "moe_prefill_fwd",
+                &[
+                    ("desc_xr", "*fp16"),
+                    ("desc_rg", "*fp16"),
+                    ("desc_rw", "*fp16"),
+                    ("desc_pes", "*fp16"),
+                    ("desc_xe", "*fp16"),
+                    ("desc_wg", "*fp8e4nv"),
+                    ("desc_sg", "*fp16"),
+                    ("desc_wu", "*fp8e4nv"),
+                    ("desc_su", "*fp16"),
+                    ("desc_wd", "*fp8e4nv"),
+                    ("desc_sd", "*fp16"),
+                    ("desc_o", "*fp16"),
+                    ("desc_dense", "*fp16"),
+                ],
+                &moe_ces("T", 16),
+            ),
+            vec![1],
+        ));
+        // ── sample_fwd.py: the token draw at solo and batched grids — the sampler this
+        // proof guards, and the ONE kernel the grid-[B] fix is allowed to move. The
+        // spec mirrors the `SubOp::Sample` arm of `kernel_spec`'s registry row: the
+        // logits row, its per-row seed quadruple's four word tables and temperature
+        // reciprocal, the twenty staged tables (the nine of the selection cascade and
+        // the noise section's own eleven), and the `[B, 64]` idx stick out. ──
+        {
+            let sample_ptrs: &[(&str, &str)] = &[
+                ("logits_ptr", "*fp16"),
+                ("slo_ptr", "*i32"),
+                ("shi_ptr", "*i32"),
+                ("stp_ptr", "*i32"),
+                ("sgate_ptr", "*i32"),
+                ("invt_ptr", "*fp32"),
+                ("bramp_ptr", "*fp32"),
+                ("lramp_ptr", "*fp32"),
+                ("binc_ptr", "*fp32"),
+                ("linc_ptr", "*fp32"),
+                ("ones_ptr", "*fp32"),
+                ("sixtyfour_ptr", "*fp32"),
+                ("padoff_ptr", "*fp32"),
+                ("gramp_ptr", "*fp32"),
+                ("ginc_ptr", "*fp32"),
+                ("hc1_ptr", "*i32"),
+                ("hc2_ptr", "*i32"),
+                ("hc3_ptr", "*i32"),
+                ("c256_ptr", "*i32"),
+                ("lane_ptr", "*fp32"),
+                ("fm8_ptr", "*fp32"),
+                ("ftop_ptr", "*fp32"),
+                ("fzero_ptr", "*fp32"),
+                ("fhalf_ptr", "*fp32"),
+                ("fm22_ptr", "*fp32"),
+                ("cmin_ptr", "*fp16"),
+                ("idx_ptr", "*i32"),
+            ];
+            for (name, b, grid) in [
+                ("sample_fwd_b1", 1i128, vec![1i64]),
+                ("sample_fwd_b2", 2, vec![2]),
+                ("sample_fwd_b32", 32, vec![32]),
+            ] {
+                v.push((
+                    name,
+                    SAMPLE,
+                    spec(
+                        "sample_fwd.py",
+                        "sample_fwd",
+                        sample_ptrs,
+                        &[
+                            ("V", Val::Int(49155)),
+                            ("PAD_V", Val::Int(65536)),
+                            ("NB", Val::Int(1024)),
+                            ("BLOCK", Val::Int(64)),
+                            ("B", Val::Int(b)),
+                        ],
+                    ),
+                    grid,
+                ));
+            }
+        }
+        v
+    }
+
+    /// The `Program` each dumped kernel's registry row states — the same fact
+    /// `TritonKernelRow::Spliced { program }` (or the attention/MoE producers) carries,
+    /// restated here because the entries table is keyed by kernel name.
+    /// ⛔ NO `_` ARM: a new entry without a program here is a panic naming it, never a
+    /// silent skip — the no-silent-skip law, applied to the dump driver itself.
+    fn program_of(name: &str) -> Program {
+        match name {
+            "rmsnorm_fwd" | "rmsnorm_oneplus_fwd" => Program::RmsNorm,
+            "matmul_fwd" | "matmul_fp8_fwd" => Program::Matmul,
+            "add_fwd" => Program::Elementwise(Elementwise::Add),
+            "mul_fwd" => Program::Elementwise(Elementwise::Mul),
+            "sub_fwd" => Program::Elementwise(Elementwise::Sub),
+            "silu_fwd" => Program::Elementwise(Elementwise::Silu),
+            "gelu_fwd" => Program::Elementwise(Elementwise::Gelu),
+            "silumul_fwd" => Program::SiluMul,
+            "scalarmul_fwd" => Program::ScalarMul,
+            "tanhsoftcap_fwd" => Program::TanhSoftCap,
+            "rmsnormunit_fwd" => Program::RmsNormUnit,
+            "scalarwmul_fwd" => Program::ScalarWeightMul,
+            "reshape_fwd" => Program::Reshape,
+            "lmlast_fwd" => Program::LmLast,
+            "windowedrmsnorm_gained_fwd" | "windowedrmsnorm_oneplus_fwd" => {
+                Program::WindowedRmsNorm { unit: false }
+            }
+            "windowedrmsnorm_unit_fwd" => Program::WindowedRmsNorm { unit: true },
+            "sample_fwd_b1" | "sample_fwd_b2" | "sample_fwd_b32" => Program::Sample,
+            other => panic!(
+                "`{other}` is in the dump table but `program_of` states no Program for it — \
+                 a dumped kernel with no program is a silent skip of the SDSC leg, which the \
+                 no-silent-skip law refuses. Add the row."
+            ),
+        }
+    }
+
+    /// The kernels whose SDSC this driver CANNOT emit, each for a stated reason — a
+    /// NAMED skip, never a silent one. Everything else must lower or the dump fails.
+    fn sdsc_skip_of(name: &str) -> Option<&'static str> {
+        match name {
+            // The geometry const door: `rope_at::<HD>` / `attn_at::<NQH, NKVH, HD>`
+            // monomorphise on head geometry the driver would have to state from the
+            // fixture's constexprs (`bake_py`'s rope arm) plus the bundle attention
+            // facts no single-kernel driver holds. The KTIR-text leg still covers them.
+            "rope_fwd" => Some("the model-geometry const door (rope_at::<HD>)"),
+            "attn_decode" | "attn_one_pass" | "attn_continuation" => {
+                Some("the model-geometry const door (attn_at::<NQH, NKVH, HD>)")
+            }
+            // No `Program` variant exists and none is inventable here: the MoE lowers
+            // only from `kernels/moe.py` through KTIR, and no per-op row names a
+            // program for it. Stating one in a dump driver would be routing invented
+            // outside the registry.
+            "moe_fwd" | "moe_prefill_fwd" => Some("no Program variant — the MoE has no door row"),
+            _ => None,
+        }
+    }
+
+    /// One emitted op as STABLE TEXT for the byte-identity diff: `wire::SdscOp` derives
+    /// `Serialize` (the wire format's own serializer — deterministic maps, no Debug
+    /// float spelling), and every non-serializable field rides as its `Debug` string.
+    /// `ktir` is dropped on purpose: it is the program the op CARRIES, not bytes the
+    /// device consumes, and the `.ktir` file beside this one already pins it.
+    fn sdsc_line(op: &ktir_superdsc::emit::EmittedOp) -> String {
+        let mut obj = serde_json::Map::new();
+        obj.insert("op_name".into(), serde_json::json!(op.op_name));
+        obj.insert(
+            "op".into(),
+            match &op.op {
+                Some(o) => serde_json::to_value(o)
+                    .unwrap_or_else(|e| panic!("serialize {}: {e}", op.op_name)),
+                // `None` is the answer for a KTIR op, not an empty descriptor.
+                None => serde_json::Value::Null,
+            },
+        );
+        obj.insert(
+            "arg_bindings".into(),
+            serde_json::json!(format!("{:?}", op.arg_bindings)),
+        );
+        obj.insert("time".into(), serde_json::json!(op.time));
+        obj.insert(
+            "affine_strides".into(),
+            serde_json::json!(format!("{:?}", op.affine_strides)),
+        );
+        obj.insert(
+            "slot_stride_bytes".into(),
+            serde_json::json!(op.slot_stride_bytes),
+        );
+        obj.insert("slab_write".into(), serde_json::json!(op.slab_write));
+        obj.insert(
+            "slab_stride_bytes".into(),
+            serde_json::json!(op.slab_stride_bytes),
+        );
+        serde_json::Value::Object(obj).to_string()
+    }
+
+    /// Emit one dumped kernel's SDSC through the SAME dispatch the production door
+    /// (`scratchy-target-spyre`'s `ktir_superdsc_door::lower`) states, arm for arm:
+    /// the pointwise kinds, the matmuls, the sampler and LmLast through
+    /// `whole_function::lower_function`; the leaf kinds through their own
+    /// `lower_ktir_to_superdsc` bodies; the column-window guard on exactly the kinds
+    /// the door wraps it around. This crate cannot call that door (the dependency runs
+    /// the other way — the target crate depends on the splice), so the arms are
+    /// mirrored here and the mirror is the dump's own cited limitation.
+    fn emit_sdsc(name: &str, node: &KtirNode) -> Result<Vec<String>, String> {
+        use ktir_superdsc::emit::lower_ktir_to_superdsc as lk;
+        use ktir_superdsc::emit::whole_function::lower_function;
+
+        let lk_name = node.func.name;
+        let regions = lk::regions(node).map_err(|e| format!("{name}: regions: {e:?}"))?;
+        let layout = triton_ktir_superdsc::layout::for_regions(node, &regions)
+            .map_err(|e| format!("{name}: layout: {e}"))?;
+        let windowed = |ops: Result<Vec<ktir_superdsc::emit::EmittedOp>, lk::Error>| {
+            let ops = ops.map_err(|e| format!("{name}: {e:?}"))?;
+            lk::column_windows_are_honoured(lk_name, &regions, &ops)
+                .map_err(|e| format!("{name}: {e:?}"))?;
+            Ok::<_, String>(ops)
+        };
+        let mut sym = 0i64;
+        let ops = match program_of(name) {
+            // The door's `windowed(...)`-wrapped whole-function kinds.
+            Program::Elementwise(_)
+            | Program::SiluMul
+            | Program::RmsNorm
+            | Program::ScalarMul
+            | Program::Sample => windowed(lower_function(node, Some(&layout), &mut sym, None)),
+            // The door's unwrapped whole-function kinds.
+            Program::Matmul | Program::LmLast => {
+                Ok(lower_function(node, Some(&layout), &mut sym, None)
+                    .map_err(|e| format!("{name}: {e:?}"))?)
+            }
+            Program::RmsNormUnit => windowed(lk::rmsnorm_unit(
+                lk_name,
+                node,
+                &regions,
+                &mut sym,
+                Some(&layout),
+            )),
+            Program::TanhSoftCap => windowed(lk::tanhsoftcap(
+                lk_name,
+                node,
+                &regions,
+                &mut sym,
+                Some(&layout),
+            )),
+            Program::ScalarWeightMul => windowed(lk::scalarweightmul(
+                lk_name,
+                &regions,
+                &mut sym,
+                Some(&layout),
+            )),
+            Program::Reshape => Ok(lk::reshape(lk_name, &regions, &mut sym, Some(&layout))
+                .map_err(|e| format!("{name}: {e:?}"))?),
+            Program::WindowedRmsNorm { .. } => {
+                Ok(
+                    lk::windowed_rmsnorm(lk_name, node, &regions, &mut sym, Some(&layout))
+                        .map_err(|e| format!("{name}: {e:?}"))?,
+                )
+            }
+            // `program_of` states none of these and `sdsc_skip_of` names the ones that
+            // reach this far — a geometry-door or MoE name here means the two tables
+            // disagree, which is a defect in the driver, not a skip.
+            other => {
+                return Err(format!(
+                    "`{name}` states {other:?}, which the dump's door mirror has no arm for — \
+                     `sdsc_skip_of` must name it or `program_of` must not state it"
+                ));
+            }
+        }?;
+        if ops.is_empty() {
+            return Err(format!(
+                "`{name}` emitted ZERO ops — a dump of nothing proves nothing (the \
+                 no-silent-skip law, applied to the SDSC leg)"
+            ));
+        }
+        Ok(ops.iter().map(sdsc_line).collect())
+    }
+
+    #[test]
+    #[ignore = "the LegalizeTypes byte-identity proof driver: dumps every production \
+                kernel's post-to_ktir module text and asserts nothing about the numbers — \
+                the proof is the diff of two runs (see the module docs)"]
+    fn dump_production_ktir() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target/spyre-ktir-dump");
+        std::fs::create_dir_all(&dir).expect("create the dump dir");
+        for (name, src, spec, grid) in entries() {
+            let module = compile_kernel(src, &spec, &grid)
+                .unwrap_or_else(|e| panic!("`{name}` did not compile: {e}"));
+            let text = triton_ktir::text::print::print(&module);
+            assert!(
+                !text.trim().is_empty(),
+                "`{name}` printed an empty module — a dump of nothing proves nothing"
+            );
+            let path = dir.join(format!("{name}.ktir"));
+            std::fs::write(&path, &text)
+                .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+            eprintln!(
+                "dumped {name} -> {} ({} lines)",
+                path.display(),
+                text.lines().count()
+            );
+
+            // THE SDSC LEG — the emitted-descriptor half of the same proof: the grid-[B]
+            // fix changes `Region`/`windowed_region`/the mint, so the byte-identity bar
+            // applies to what the doors EMIT, not only to the module text. Same law:
+            // the diff of two runs is the proof; a named skip (`sdsc_skip_of`) is the
+            // only kernel without an `.sdsc.jsonl`, and every other kernel must lower.
+            match sdsc_skip_of(name) {
+                Some(reason) => {
+                    eprintln!("SDSC-SKIP {name}: {reason}");
+                }
+                None => {
+                    let node = triton_ktir_superdsc::node_for(&module, program_of(name))
+                        .unwrap_or_else(|e| panic!("`{name}` did not mint a node: {e}"));
+                    let sdsc_path = dir.join(format!("{name}.sdsc.jsonl"));
+                    match emit_sdsc(name, &node) {
+                        Ok(lines) => {
+                            std::fs::write(&sdsc_path, format!("{}\n", lines.join("\n")))
+                                .unwrap_or_else(|e| panic!("write {}: {e}", sdsc_path.display()));
+                            eprintln!(
+                                "dumped {name} -> {} ({} ops)",
+                                sdsc_path.display(),
+                                lines.len()
+                            );
+                        }
+                        // ⭐ A KERNEL THE DOOR REFUSES IS A NAMED SKIP, CARRIED AS DATA — the
+                        // driver mirrors what the production door lowers and NOTHING wider
+                        // (auditor ruling 2026-10-27: never fix the door to suit the driver).
+                        // The refusal is the door's own message, written as the kernel's one
+                        // `.sdsc.jsonl` line, so the before/after diff still sees it: a kernel
+                        // that flips refused↔emitted, or whose refusal reason moves, is a diff.
+                        Err(reason) => {
+                            std::fs::write(
+                                &sdsc_path,
+                                format!("{{\"refused\": {}}}\n", serde_json::json!(reason)),
+                            )
+                            .unwrap_or_else(|e| panic!("write {}: {e}", sdsc_path.display()));
+                            eprintln!("SDSC-REFUSED {name}: {reason}");
+                        }
+                    }
+                }
+            }
+        }
     }
 }

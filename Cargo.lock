@@ -2044,6 +2044,7 @@ dependencies = [
  "cblas-sys",
  "ktir-core",
  "ktir-optimizer",
+ "ktir-superdsc",
  "objc2",
  "objc2-foundation",
  "objc2-metal",
@@ -2056,6 +2057,7 @@ name = "ktir-optimizer"
 version = "0.1.0"
 dependencies = [
  "ktir-core",
+ "ktir-superdsc",
 ]
 
 [[package]]
@@ -3951,6 +3953,7 @@ dependencies = [
  "ktir-core",
  "ktir-superdsc",
  "scratchy-subtile",
+ "serde_json",
  "triton-frontend",
  "triton-ktir",
  "triton-ktir-superdsc",

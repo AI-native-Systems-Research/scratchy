@@ -1,0 +1,105 @@
+[kani-safe] harness=the_one_row_fill_partitions_both_axes pkg=ktir-superdsc cap=50GiB (machine=64GiB, one harness only)
+Kani Rust Verifier 0.68.0 (cargo plugin)
+CBMC 6.11.0
+warning: use of an unstable feature
+ --> <crate attribute>:1:12
+  |
+1 | #![feature(register_tool)]
+  |            ^^^^^^^^^^^^^
+  |
+  = note: requested on the command line with `--force-warn unstable-features`
+
+   Compiling ktir-superdsc v0.1.0 (/Users/nickm/git/scratchy/.claude/worktrees/spyre-device-sampling/crates/targets/spyre/ktir/ktir-superdsc)
+warning: trailing semicolon in macro used in expression position
+   --> crates/targets/spyre/ktir/ktir-superdsc/src/addr/shape.rs:176:15
+    |
+176 |   const _: () = assert!(Shape::<128, 32, 8, 128>::head_major_collapse_valid_here(
+    |  _______________^
+177 | |     Df::Fp8
+178 | | ));
+    | |__^
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #79813 <https://github.com/rust-lang/rust/issues/79813>
+    = note: `#[warn(semicolon_in_expressions_from_non_local_macros)]` (part of `#[warn(future_incompatible)]`) on by default
+    = note: this warning originates in the macro `assert` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: trailing semicolon in macro used in expression position
+   --> crates/targets/spyre/ktir/ktir-superdsc/src/addr/shape.rs:179:15
+    |
+179 |   const _: () = assert!(!Shape::<64, 32, 8, 128>::head_major_collapse_valid_here(
+    |  _______________^
+180 | |     Df::Fp8
+181 | | ));
+    | |__^
+    |
+    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+    = note: for more information, see issue #79813 <https://github.com/rust-lang/rust/issues/79813>
+    = note: this warning originates in the macro `assert` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: trailing semicolon in macro used in expression position
+     --> crates/targets/spyre/ktir/ktir-superdsc/src/sdsc_abstract.rs:11101:24
+      |
+11101 |             Ok(map) => assert!(live >= 1 && live <= 4 && map.live() == live),
+      |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+      = note: for more information, see issue #79813 <https://github.com/rust-lang/rust/issues/79813>
+      = note: this warning originates in the macro `assert` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: trailing semicolon in macro used in expression position
+     --> crates/targets/spyre/ktir/ktir-superdsc/src/sdsc_abstract.rs:11102:49
+      |
+11102 |             Err(SlotMapError::NoLiveRequest) => assert!(live == 0),
+      |                                                 ^^^^^^^^^^^^^^^^^^
+      |
+      = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+      = note: for more information, see issue #79813 <https://github.com/rust-lang/rust/issues/79813>
+      = note: this warning originates in the macro `assert` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: trailing semicolon in macro used in expression position
+     --> crates/targets/spyre/ktir/ktir-superdsc/src/sdsc_abstract.rs:11104:17
+      |
+11104 |                 assert!(l == live && live > 4 && width == 4)
+      |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: macro invocations at the end of a block are treated as expressions
+      = note: to ignore the value produced by the macro, add a semicolon after the invocation of `assert`
+      = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+      = note: for more information, see issue #79813 <https://github.com/rust-lang/rust/issues/79813>
+      = note: this warning originates in the macro `assert` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `other`
+   --> crates/targets/spyre/ktir/ktir-superdsc/src/emit/lower_ktir_to_superdsc.rs:978:9
+    |
+978 |         other => unreachable!("elementwise_df refused the {other:?} pointwise form by name"),
+    |         ^^^^^    --------------------------------------------------------------------------- you might have meant to use string interpolation in this string literal
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+help: if this is intentional, prefix it with an underscore
+    |
+978 |         _other => unreachable!("elementwise_df refused the {other:?} pointwise form by name"),
+    |         +
+
+warning: use of an unstable feature
+ --> <crate attribute>:1:12
+  |
+1 | #![feature(register_tool)]
+  |            ^^^^^^^^^^^^^
+  |
+  = note: requested on the command line with `--force-warn unstable-features`
+
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.87s
+warning: the following packages contain code that will be rejected by a future version of Rust: ktir-superdsc v0.1.0 (/Users/nickm/git/scratchy/.claude/worktrees/spyre-device-sampling/crates/targets/spyre/ktir/ktir-superdsc)
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+Checking harness work::kani_proofs::the_one_row_fill_partitions_both_axes...
+
+VERIFICATION RESULT:
+ ** 0 of 109 failed (1 unreachable)
+
+VERIFICATION:- SUCCESSFUL
+Verification Time: 178.74817s
+
+Manual Harness Summary:
+Complete - 1 successfully verified harnesses, 0 failures, 1 total.
+[kani-safe] harness=the_one_row_fill_partitions_both_axes finished (rc=0)

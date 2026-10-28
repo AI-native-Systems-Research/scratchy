@@ -75,13 +75,16 @@ pub struct Session {
 impl Session {
     /// Build the session over a launch group's functions. `weights` is the full
     /// initial source set (weights + mask + first input), keyed by tensor id; it is
-    /// uploaded to resident HBM once here.
+    /// uploaded to resident HBM once here. `lx_pin_window_bytes` is the bundle's
+    /// stated LX pin window — see [`ResidentExecutor::new`]: `None` is refused at
+    /// load, naming the program.
     pub fn new(
         funcs: &[IRFunction<'static>],
         spec: &ProgramSpec,
         weights: &[(u64, Arg)],
+        lx_pin_window_bytes: Option<u64>,
     ) -> Result<Self, String> {
-        let mut exec = crate::resident::ResidentExecutor::new(funcs, spec)?;
+        let mut exec = crate::resident::ResidentExecutor::new(funcs, spec, lx_pin_window_bytes)?;
         exec.set_sources(weights)?;
         Ok(Self { exec })
     }
@@ -91,13 +94,39 @@ impl Session {
     /// shapes (M). The weight set is uploaded ONCE here; both programs run against
     /// it with no second load. `programs` are in declaration order: `run_program(0,
     /// ..)` runs the first, `run_program(1, ..)` the second, etc.
+    /// `lx_pin_windows[i]` is program `i`'s bundle-stated LX pin window — see
+    /// [`ResidentExecutor::new_multi`]: a `None` is refused at load, naming the
+    /// program.
     pub fn new_multi(
         programs: Vec<(&[IRFunction<'static>], &ProgramSpec)>,
         weights: Vec<(u64, Arg)>,
+        lx_pin_windows: Vec<Option<u64>>,
     ) -> Result<Self, String> {
-        let mut exec = crate::resident::ResidentExecutor::new_multi(programs)?;
+        let mut exec = crate::resident::ResidentExecutor::new_multi(programs, lx_pin_windows)?;
         // TAKEN, not borrowed: at construction the whole checkpoint is written once, so the
         // weight buffers can be moved into HBM rather than copied into it.
+        exec.set_sources_owned(weights)?;
+        Ok(Self { exec })
+    }
+
+    /// ⭐ [`new_multi`](Self::new_multi) WITH A SHAPE FLOOR — the tape's own
+    /// tensor-shape statement (element counts keyed by tensor id), which the
+    /// executor's sticks allocate at LEAST. For callers that hold the graph the
+    /// programs were lowered from: a widened reader whose view sits on an
+    /// interior edge of a fused function is invisible to the view walk, and the
+    /// floor is what keeps its tensor's stick large enough. Callers without the
+    /// graph keep [`new_multi`](Self::new_multi) and the view walk unchanged.
+    pub fn new_multi_floored(
+        programs: Vec<(&[IRFunction<'static>], &ProgramSpec)>,
+        weights: Vec<(u64, Arg)>,
+        shape_floor: &std::collections::HashMap<u64, usize>,
+        lx_pin_windows: Vec<Option<u64>>,
+    ) -> Result<Self, String> {
+        let mut exec = crate::resident::ResidentExecutor::new_multi_floored(
+            programs,
+            shape_floor,
+            lx_pin_windows,
+        )?;
         exec.set_sources_owned(weights)?;
         Ok(Self { exec })
     }
@@ -129,6 +158,18 @@ impl Session {
     /// [`crate::resident::ResidentExecutor::observable_tids`]).
     pub fn observable_tids(&self, idx: usize) -> Vec<u64> {
         self.exec.observable_tids(idx)
+    }
+
+    /// The LX residency high-water mark over everything this session has run
+    /// (see [`crate::resident::ResidentExecutor::lx_peak_used`]).
+    pub fn lx_peak_used(&self) -> i64 {
+        self.exec.lx_peak_used()
+    }
+
+    /// The per-core LX capacity (see
+    /// [`crate::resident::ResidentExecutor::lx_capacity`]).
+    pub fn lx_capacity(&self) -> i64 {
+        self.exec.lx_capacity()
     }
 }
 

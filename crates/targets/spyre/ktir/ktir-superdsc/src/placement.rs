@@ -328,6 +328,26 @@ pub struct BundleLayout {
     /// [`PagedKvPool::request_stride`]: crate::sdsc_abstract::PagedKvPool::request_stride
     #[serde(default)]
     pub kv_request_stride_bytes: u64,
+    /// ⭐ THE GRAPH'S OWN CALLER-FILLED SOURCE COUNT — ids `0..num_sources` are host-filled every
+    /// forward, and the runtime's completeness check (`Executor::require_sources_filled`) walks
+    /// exactly that range. Stamped on the LAYOUT because the count is GRAPH-LOCAL: the argmax
+    /// mint inserts its seven staged tables at `[num_sources, num_sources+7)` of the ONE-REQUEST
+    /// graph, so the minted wiring's count is seven higher than an unminted rung's, and a session
+    /// built on another graph's number walks ids its own bundle never defined — the seven extra
+    /// ids canceling against seven minted table ids is correctness by coincidence, the same class
+    /// as the `SegRole::Logits` re-point. Every session reads the count off the bundle it
+    /// actually runs.
+    #[serde(default)]
+    pub num_sources: u32,
+    /// ⭐ THE SOURCES NO PER-STEP BIND FILLS — the prefix-KV caches (the pool and the device's
+    /// own cachewr write them) and the load-time constant tables (the owner session binds them
+    /// once at load). The runtime's completeness check excuses exactly these ids, so the list is
+    /// stamped where the graph itself is: derived from the same nodes the wiring's `layers` and
+    /// `load_consts` lists derive from, and asserted inside `0..num_sources` at the stamp — an id
+    /// at or past the count would excuse a REAL source and turn a refused launch into a silent
+    /// read of unfilled memory.
+    #[serde(default)]
+    pub resident_source_tids: Vec<u32>,
 }
 
 /// Bump allocator for synthetic-intermediate offsets within the Intermediate
@@ -841,6 +861,20 @@ impl BundleLayout {
     /// quantity through [`lx_window_fits`].
     pub fn lx_op_local_slot_bytes(&self) -> u64 {
         self.lx.borrow().op_local_bytes
+    }
+
+    /// ⭐ THE PIN WINDOW ITSELF, as one number — the exact budget the bake's own
+    /// [`lx_window_fits`] guard proved for this layout: the core-local pin bytes
+    /// ([`Self::lx_core_local_bytes`], the up-cursor's whole distance from
+    /// [`LX_PIN_BASE`]) plus the op-local slot bytes
+    /// ([`Self::lx_op_local_slot_bytes`]). This is the number the emulator's
+    /// resident fused path charges per segment (auditor ruling 2026-10-27): the
+    /// card holds exactly these pins for a fused segment's run and nothing else
+    /// (its intermediates are HBM synth regions), so the emulator's LX guard
+    /// proves the same window the bake accepted. Read from the layout — never
+    /// recomputed from shapes.
+    pub fn lx_window_bytes(&self) -> u64 {
+        self.lx_core_local_bytes() + self.lx_op_local_slot_bytes()
     }
 
     /// Record the probability-part pins the chunk form mints beside its gathers

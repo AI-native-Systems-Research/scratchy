@@ -32,6 +32,10 @@ scratchy-spyre-bundle = { path = "../../targets/spyre/bundle", optional = true }
 # `RowsExtern` — which host-staged buffer a `LoadRows` reads — is one type across every IR: the
 # cuda `Instruction`, this crate's `SubOp`, the metal step. scratchy-ir never reaches back here.
 scratchy-ir = { path = "../ir" }
+# `half::f16` for the HOST REFERENCE's fp16-island round trips (the sampler's
+# Gumbel draw rounds through IEEE binary16 at each f16 boundary — eval_dag is
+# the bake-time numeric gate's own reference, non-test code).
+half = { workspace = true }
 
 [build-dependencies]
 # The build script reads every model `config.json` in the workspace and writes the head geometries
@@ -50,11 +54,6 @@ serde_json = { workspace = true }
 # back-edge. scratchy-forward-compiler builds backend-agnostic here (no
 # cuda/metal feature), so the tests stay host-runnable on any platform.
 scratchy-forward-compiler = { path = ".." }
-# `half::bf16` for the dev-side bf16 round-trip in the
-# `*_kernel_matches_cpu_golden` validation tests — the kernel reads
-# bf16 from HBM, so the host reference must apply the same lossy
-# conversion to compare on equal terms.
-half = { workspace = true }
 
 # ⛔⛔⛔ RUNNING THIS CRATE'S KANI PROOFS REQUIRES `--features spyre`. EVERY HARNESS IN
 # `sdsc_abstract.rs` LIVES BEHIND `#[cfg(feature = "spyre")] pub mod sdsc_abstract;`, and `default = []`,

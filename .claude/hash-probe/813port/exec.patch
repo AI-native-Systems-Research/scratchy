@@ -1,0 +1,1003 @@
+diff --git a/crates/targets/spyre/bundle/src/lib.rs b/crates/targets/spyre/bundle/src/lib.rs
+index b05712e16b..01a4f2b3d1 100644
+--- a/crates/targets/spyre/bundle/src/lib.rs
++++ b/crates/targets/spyre/bundle/src/lib.rs
+@@ -251,6 +251,21 @@ pub struct BundleLayout<'a> {
+     /// pins, and `chunk_gather_index_table` passes it beside [`Self::lx_op_local_bytes`] so the
+     /// host refuses exactly what the bake refused. 0 for a bundle whose chunk form mints none.
+     pub lx_prob_pin_bytes: u64,
++    /// ⭐ THE GRAPH'S OWN CALLER-FILLED SOURCE COUNT — ids `0..num_sources` are host-filled every
++    /// forward, and the runtime's completeness check walks exactly that range. Stamped by the
++    /// bake (the same `ir.num_sources` the placement pass packed from) because the count is
++    /// GRAPH-LOCAL: the argmax mint's seven tables live at `[num_sources, num_sources+7)` of the
++    /// one-request graph, so the minted wiring's count does not name an unminted rung's sources.
++    /// Every session — owner, ladder rung, batch rung — reads the count off the bundle it
++    /// actually runs, the `SegRole::Logits` law: a bundle-stated fact survives renumbering
++    /// because each bundle states its own.
++    pub num_sources: u32,
++    /// ⭐ THE SOURCES NO PER-STEP BIND FILLS — prefix-KV caches and load-time constant tables,
++    /// the ids the completeness check excuses. The bake derives them from the same nodes the
++    /// wiring's `layers`/`load_consts` lists derive from, and asserts each is a real source of
++    /// THIS graph (`< num_sources`). The worker chains the spilled weight tail on at load (a
++    /// copy decision the layout cannot make for it) and hands the union to the session.
++    pub resident_source_tids: Cow<'a, [u32]>,
+ }
+ 
+ impl<'a> BundleLayout<'a> {
+diff --git a/crates/targets/spyre/src/lower_subtile_tape_to_superdsc.rs b/crates/targets/spyre/src/lower_subtile_tape_to_superdsc.rs
+index 7814b054ba..756e56630a 100644
+--- a/crates/targets/spyre/src/lower_subtile_tape_to_superdsc.rs
++++ b/crates/targets/spyre/src/lower_subtile_tape_to_superdsc.rs
+@@ -720,13 +720,50 @@ pub fn compute_bundle_layout<F: RopeForm>(
+         .filter(|n| matches!(n.op, SubOp::MatmulTile { .. }) && n.inputs.len() == 3)
+         .map(|n| n.inputs[1].tensor.index() as u32)
+         .collect();
++    // ⭐ THE PER-TENSOR DEVICE FORMAT, FROM THE KERNEL SIGNATURES — a tensor whose
++    // consumer is a spliced kernel is sized at the format that kernel's signature
++    // states for it ([`scratchy_triton_splice::operand_dfs`], the registry's own
++    // operand order), never at a per-op width census: a `[1, 64]` f32 table or an
++    // i32 idx stick states its own element width in the kernel that reads it, and
++    // a placement sized at the fp16 default would under-reserve by half and the
++    // footprint guard would refuse the CORRECT descriptor (the `[1,64]` f32
++    // island reads 256 B against a 128 B fp16 placement). A kind that is not a
++    // `lower_one` kernel states no formats here (`None`), leaving its tensors to
++    // the fp8/fp16 rules below — the fp8 weight set keeps its own structural law
++    // (it also feeds the k-pad rows), and the two agree wherever they overlap.
++    // ⛔ AND A SEAT THAT REFUSES CONTRIBUTES NO WIDTHS — the refusal is the
++    // LOWERING's to raise: `lower_one_node` compiles this same seat and fails
++    // loudly there on every real bake, while THIS walk never compiles nodes, so
++    // a graph whose scope leaves a seat unlowered (measured: the door fixtures'
++    // K-side `rope_append`, whose hand-declared cos source is the whole q-width
++    // table — a shape #720's windowing law refuses and no production tape
++    // carries; granite's full graph passes this census strictly) must not fail
++    // the LAYOUT for a program it never mints. The refusing node's tensors keep
++    // the fp8/fp16 rules below — exactly the widths the pre-census layout gave
++    // them, and a node with no program states no kernel formats to honor.
++    let kernel_dfs: std::collections::BTreeMap<u32, Df> = {
++        let mut m: std::collections::BTreeMap<u32, Df> = Default::default();
++        for n in &ir.nodes {
++            let Some(dfs) = scratchy_triton_splice::operand_dfs(n, ir).ok().flatten() else {
++                continue;
++            };
++            for &(tid, df) in &dfs {
++                if df != Df::Fp16 {
++                    m.insert(tid, df);
++                }
++            }
++        }
++        m
++    };
+     let nbytes = |tid: u32| -> u64 {
+         let s = ir.tensors[tid as usize];
+         // Reserve the DEVICE footprint: a stick-last tensor pads its innermost stick dim up to a whole
+         // stick on-device — fp16 is a 64-elem / 2-byte stick, fp8 is a 128-elem / 1-byte stick (HALF the
+         // bytes). Width is DERIVED from the operand's `Df` (rung 1), never hardcoded. (granite lm_head
+         // vocab 49159 → 49216 padding stays in-bounds for the on-card write / weight staging.)
+-        let df = if fp8_weight_tids.contains(&tid) {
++        let df = if let Some(wide) = kernel_dfs.get(&tid) {
++            *wide
++        } else if fp8_weight_tids.contains(&tid) {
+             Df::Fp8
+         } else {
+             Df::Fp16
+@@ -1962,6 +1999,39 @@ pub fn compute_bundle_layout<F: RopeForm>(
+         // ONE source of truth for all three. Empty for a tape with no rope/attention nodes.
+         rope_class_hds,
+         attn_class_hds,
++        // ⭐ THE GRAPH'S OWN WIRING FACTS, STAMPED WHERE THE MINT'S RENUMBERING CANNOT REACH THEM
++        // (#813 review). `num_sources` and the resident source ids are GRAPH-LOCAL: the argmax
++        // mint's seven tables sit at `[num_sources, num_sources+7)` of the ONE-REQUEST graph, so
++        // the minted wiring's numbers name different tensors — or none — in an unminted rung, and
++        // a rung handed them walks seven ids past its own graph that its resident list happens to
++        // excuse. Each bundle states its own, the `SegRole::Logits` law: the runtime reads the
++        // facts off the bundle it actually runs, never off another graph's wiring.
++        num_sources: ir.num_sources,
++        resident_source_tids: {
++            // Prefix-KV (the set the wiring's `layers` derives its prefix_k/prefix_v from — the
++            // same `cache_tensor`/`v_cache_tensor` walk) plus the load-const tables (the one
++            // `load_consts_of_ir` derivation the wiring and the numeric gate read). Sorted and
++            // deduped so the stamp is a set, whatever order the walks found.
++            let mut tids: Vec<u32> = prefix_kv_tids.iter().copied().collect();
++            tids.extend(
++                crate::lower_subtile_tape_to_ktir::load_consts_of_ir(ir)?
++                    .into_iter()
++                    .map(|(tid, _)| tid),
++            );
++            tids.sort_unstable();
++            tids.dedup();
++            // ⛔ EVERY STAMPED ID IS A SOURCE OF THIS GRAPH. The runtime's completeness check
++            // excuses exactly these ids from its per-step bind walk, so an id at or past the
++            // source count would excuse a REAL source and turn a refused launch into a silent
++            // read of memory nobody filled.
++            assert!(
++                tids.iter().all(|&t| t < ir.num_sources),
++                "resident source ids {tids:?} reach past the graph's own source count {} — the \
++                 stamp would excuse a real source from the per-step bind walk",
++                ir.num_sources
++            );
++            tids
++        },
+     })
+ }
+ 
+@@ -2698,12 +2768,16 @@ pub(crate) struct StagedWeights {
+ }
+ 
+ impl StagedWeights {
+-    /// The reference legs' zero-copy window over this staging.
++    /// The reference legs' zero-copy window over this staging. The window owns
++    /// no load-consts (`&[]`): the synth-weight staging never minted any, and
++    /// the gate's own view — the one that judges a bundle with load-consts —
++    /// states them separately (see [`StagedWeightView::load_consts`]).
+     pub(crate) fn view(&self) -> StagedWeightView<'_> {
+         StagedWeightView {
+             bytes: &self.bytes,
+             gemm: &self.gemm,
+             scale_rows: &self.scale_rows,
++            load_consts: &[],
+         }
+     }
+ }
+@@ -2718,6 +2792,15 @@ pub(crate) struct StagedWeightView<'a> {
+     pub bytes: &'a [(usize, Vec<u8>, scratchy_tensors::DType, Vec<usize>)],
+     pub gemm: &'a std::collections::HashSet<u32>,
+     pub scale_rows: &'a std::collections::HashSet<u32>,
++    /// The load-time constants — the SAME `(tid, kind)` list the worker's
++    /// `bind_load_consts` stages. ⛔ DELIBERATELY NOT part of `bytes`: a weight
++    /// is a source whose bytes ARE its value (the per-node `materialize`
++    /// substitutes them at every read), while a load-const whose tid is a
++    /// graph OUTPUT stages that output's INITIAL bytes — the ops overwrite
++    /// them wherever they compute — so the reference legs take them through
++    /// [`Self::stage_load_consts`] at buffer init instead, never through the
++    /// read-time channel.
++    pub load_consts: &'a [(u32, crate::wiring::LoadConst)],
+ }
+ 
+ impl StagedWeightView<'_> {
+@@ -2762,6 +2845,60 @@ impl StagedWeightView<'_> {
+         }
+         Some(out)
+     }
++
++    /// ⭐ THE LOAD-CONSTS, STATED AS INITIAL BYTES — the reference legs'
++    /// statement of the worker's own `bind_load_consts` staging: the worker
++    /// writes each entry's built bytes at its tid's stick BEFORE the programs
++    /// run, and the programs overwrite whatever they compute, so the reference
++    /// writes the f32 image of the SAME builder's bytes (`LoadConst::build`,
++    /// the one derivation both legs call) into `bufs[tid]` once at buffer init
++    /// and lets the node walk overwrite it the same way. ⛔ NOT the
++    /// `bytes`/`materialize` channel — that substitutes a weight's bytes at
++    /// every READ, and an OUTPUT-tid entry reaching it would replace the
++    /// computed product with its own initial bytes at every consumer
++    /// (measured: the argmax mint's widened row read back as its staged
++    /// zeros, golden idx 0 against a true argmax of 12358 on both legs).
++    /// `floor` skips entries below it: the teacher-forced walk relays its
++    /// source slots from the golden per node, so only its non-source buffers
++    /// take initial bytes here; the golden passes 0. An entry whose buffer the
++    /// covering slice left unallocated is skipped with it — nothing bound
++    /// reads it.
++    pub(crate) fn stage_load_consts(&self, bufs: &mut [Vec<f32>], floor: usize) {
++        for &(tid, kind) in self.load_consts {
++            let i = tid as usize;
++            if i < floor || i >= bufs.len() || bufs[i].is_empty() {
++                continue;
++            }
++            let (bytes, dt, _shape) = kind.build();
++            let vals: Vec<f32> = match dt {
++                scratchy_tensors::DType::F16 => bytes
++                    .as_chunks::<2>()
++                    .0
++                    .iter()
++                    .map(|p| half::f16::from_le_bytes(*p).to_f32())
++                    .collect(),
++                scratchy_tensors::DType::F32 => bytes
++                    .as_chunks::<4>()
++                    .0
++                    .iter()
++                    .map(|p| f32::from_le_bytes(*p))
++                    .collect(),
++                other => panic!(
++                    "the reference legs have no f32 image for the load-const at t{tid} \
++                     staged as {other:?} — extend `stage_load_consts` with that dtype's decode"
++                ),
++            };
++            assert_eq!(
++                vals.len(),
++                bufs[i].len(),
++                "the load-const at t{tid} builds {} values against an IR shape of {} — \
++                 the builder and the mint disagree",
++                vals.len(),
++                bufs[i].len()
++            );
++            bufs[i] = vals;
++        }
++    }
+ }
+ 
+ /// Stage the synth weights (the loop `numeric_gate` ran inline before the
+@@ -3127,6 +3264,24 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
+             bufs[s].copy_from_slice(src);
+         }
+     }
++    // ⭐ THE LOAD-CONSTS' INITIAL BYTES — the same pre-program staging the
++    // resident performs (`stage_load_consts`' doc is the law): written once
++    // at buffer init, overwritten by the node walk wherever ops compute. A
++    // source-tid entry (the staged tables) lands here over its synth slot —
++    // its bytes are its value, and no op ever writes it.
++    weights.stage_load_consts(&mut bufs, 0);
++    // ⭐ THE OFF-f16 STICKS — the outputs whose writer's own kernel signature
++    // states a non-f16 stick (the argmax mint's i32 idx): the rounding hop
++    // below is the F16 STICK's law, and pushing a whole-number index through
++    // the f16 grid MOVES the value itself (12358 → 12360 at the grid's
++    // spacing 8 in [8192, 16384) — measured). Stated once here so the loop's
++    // guard is a set lookup, never a per-node signature read.
++    let off_f16_sticks: std::collections::HashSet<u64> = ir
++        .nodes
++        .iter()
++        .filter(|n| !crate::lower_subtile_tape_to_ktir::node_output_on_f16_stick(n, ir))
++        .map(|n| n.output.tensor.index() as u64)
++        .collect();
+     for node in &ir.nodes {
+         if folded_node(node.id) {
+             continue;
+@@ -3219,11 +3374,16 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
+             }
+         }
+         // The f16 stick the program stores this node's output through (see
+-        // the staging block above for the law). The fold's reader-half alias
+-        // below scatters the SAME rounded product — the folded tid holds the
+-        // producer's stick, grid included.
+-        for v in out.iter_mut() {
+-            *v = half::f16::from_f32(*v).to_f32();
++        // the staging block above for the law) — EXCEPT an output whose own
++        // signature states a non-f16 stick (`off_f16_sticks`): the idx stick
++        // is the kernel's i32 buffer, and its whole numbers are exact; the
++        // f16 hop would MOVE them (12358 → 12360, measured). The fold's
++        // reader-half alias below scatters the SAME product — the folded tid
++        // holds the producer's stick, grid included.
++        if !off_f16_sticks.contains(&(node.output.tensor.index() as u64)) {
++            for v in out.iter_mut() {
++                *v = half::f16::from_f32(*v).to_f32();
++            }
+         }
+         let shape = ir.shape(node.output.tensor);
+         scratchy_subtile::subtile_ir::scatter(
+@@ -3442,6 +3602,21 @@ fn teacher_forced_walk<F: RopeForm>(
+             }
+         })
+         .collect();
++    // The load-consts' initial bytes, same law as the golden's init call —
++    // floored at `nsrc`: this walk's source slots are relayed from the golden
++    // per node (they already carry their staged bytes there), so only its
++    // non-source buffers take initial bytes here.
++    weights.stage_load_consts(&mut tf, nsrc);
++    // The off-f16 sticks, the golden's own law verbatim (`eval_golden_buffers`'s
++    // set above is the statement): the rounding hop below must skip an output
++    // whose signature states a non-f16 stick, or the walk's OWN local leg lies
++    // about the op (the idx stick measured 12358 → 12360 through the grid).
++    let off_f16_sticks: std::collections::HashSet<u64> = ir
++        .nodes
++        .iter()
++        .filter(|n| !crate::lower_subtile_tape_to_ktir::node_output_on_f16_stick(n, ir))
++        .map(|n| n.output.tensor.index() as u64)
++        .collect();
+     let mut rows: Vec<TeacherForcedRow> = Vec::new();
+     for (ni, node) in ir.nodes.iter().enumerate() {
+         if folded_node(node.id) {
+@@ -3527,8 +3702,13 @@ fn teacher_forced_walk<F: RopeForm>(
+         for s in 0..nsrc {
+             std::mem::swap(&mut golden[s], &mut tf[s]);
+         }
+-        for v in tf_out.iter_mut() {
+-            *v = half::f16::from_f32(*v).to_f32();
++        // The f16 stick law, the golden's own hop verbatim — and the same
++        // exemption: a non-f16 output stick skips the grid (the idx stick's
++        // whole numbers are exact; the hop would move them).
++        if !off_f16_sticks.contains(&(node.output.tensor.index() as u64)) {
++            for v in tf_out.iter_mut() {
++                *v = half::f16::from_f32(*v).to_f32();
++            }
+         }
+         let shape = ir.shape(node.output.tensor);
+         scratchy_subtile::subtile_ir::scatter(
+@@ -3979,16 +4159,39 @@ pub fn numeric_gate<F: RopeForm>(
+     //    ~12 GB of codes, its 7-of-48 covering slice ~1.75 GB); the clone is
+     //    the one transient double, and the slice keeps both sides small. ──
+     let StagedWeights {
+-        bytes: emu_weights,
++        bytes: mut emu_weights,
+         gemm,
+         scale_rows,
+     } = stage_synth_weights(ir, weight_ids, covering);
++    // ⭐ THE LOAD-TIME CONSTANTS — resident bytes at their TRUE dtypes, staged
++    // into the session exactly as the worker stages them at load: each entry's
++    // kind names the ONE builder (`LoadConst::build`) both legs call, so a
++    // staging defect cannot hide on one leg only. A source the list names is
++    // minted below the `LoweredDecode` binding layer (no `SourceBinding`,
++    // absent from `weight_ids`), so the source loop below would otherwise hand
++    // it to `run_step`'s f16-only source channel — and an fp32 table would
++    // encode into half the bytes its f32 view spans. ⛔ THE REFERENCE LEGS TAKE
++    // THEM THROUGH THE VIEW'S OWN `stage_load_consts`, NOT `bytes`: the clone
++    // crosses BEFORE the entries join the session's staging, because
++    // `materialize` substitutes at every READ (a weight's bytes are its value)
++    // and an OUTPUT-tid entry reaching it would replace the computed product
++    // with its own initial bytes at every consumer (measured: the argmax
++    // mint's widened row read back as its staged zeros, golden idx 0 against
++    // a true argmax of 12358 on both legs).
++    let load_consts = crate::lower_subtile_tape_to_ktir::load_consts_of_ir(ir).map_err(|e| e.0)?;
++    let load_const_tids: std::collections::HashSet<u32> =
++        load_consts.iter().map(|&(tid, _)| tid).collect();
+     let weights_ref = emu_weights.clone();
+     let view = StagedWeightView {
+         bytes: &weights_ref,
+         gemm: &gemm,
+         scale_rows: &scale_rows,
++        load_consts: &load_consts,
+     };
++    for &(tid, kind) in &load_consts {
++        let (bytes, dt, shape) = kind.build();
++        emu_weights.push((tid as usize, bytes, dt, shape.to_vec()));
++    }
+     // ── The probe sources: synth at the IR shape, scales as ones, the mask
+     //    keeping the prefix region's rows valid (the reference's own key set) ──
+     // The rope cos/sin sources stage at their runtime contract — period-`half`,
+@@ -4010,7 +4213,10 @@ pub fn numeric_gate<F: RopeForm>(
+         // part of the graph under test. The reserved-tid sources appended
+         // below (the scalars, the mask) stay UNfiltered — the twin's programs
+         // bind them exactly as the full bundle does.
+-        if weight_ids.contains(&tid) || covering.is_some_and(|c| !c.contains(&(tid as u64))) {
++        if weight_ids.contains(&tid)
++            || load_const_tids.contains(&tid)
++            || covering.is_some_and(|c| !c.contains(&(tid as u64)))
++        {
+             continue;
+         }
+         let t = ir.tensors[tid as usize];
+@@ -4159,8 +4365,23 @@ pub fn numeric_gate<F: RopeForm>(
+         .filter(|t| bound.contains(t))
+         .collect();
+     let refs: Vec<(&[bundle::LaunchGroup<'static>], &[u64])> = vec![(groups, &results)];
+-    let mut session = crate::runner::SpyreSession::new_multi(&refs, emu_weights)
+-        .map_err(|e| format!("gate session: {e}"))?;
++    // ⭐ THE SHAPE FLOOR — the krg's own tensor shapes, the tape's statement
++    // the resident sticks allocate at LEAST. The emulator's view walk derives a
++    // tid's extent only from views its arg→tid mappings reach, and a widened
++    // reader whose view sits on an interior edge of a fused function is
++    // invisible to it (measured: the argmax mint's PAD_V-wide logits row over
++    // the lm-head matmul's narrower device-width out view). The floor is the
++    // same authority `compute_bundle_layout` reserves from — the minted krg —
++    // and it is a MAX, so it can only raise an allocation.
++    let shape_floor: std::collections::HashMap<u64, usize> = ir
++        .tensors
++        .iter()
++        .enumerate()
++        .map(|(i, t)| (i as u64, t.rows as usize * t.cols as usize))
++        .collect();
++    let mut session =
++        crate::runner::SpyreSession::new_multi_floored(&refs, emu_weights, &shape_floor)
++            .map_err(|e| format!("gate session: {e}"))?;
+     let observables = session.observable_tids(0);
+     let compare: Vec<(u64, usize)> = golden_tids
+         .iter()
+@@ -4198,6 +4419,24 @@ pub fn numeric_gate<F: RopeForm>(
+     // reference to every kernel's internals — the wrong direction for a shared
+     // `eval_node` law — so the slack IS the instrument for this class.
+     const FP8_TOL: f32 = 2e-2;
++
++    /// The tolerance one compared tensor grades at. ⭐ THE INDEX LAW IS ASKED
++    /// FIRST (#813 review, item 3): the re-pointed result is an i32 stick read
++    /// RAW, never fp8-quantized, so a stick that lands in a TAINTED (fp8)
++    /// graph still grades at 0 — asking `is_fp8` first graded the stick at
++    /// FP8_TOL on granite fp8-dynamic, where one whole wrong token is a
++    /// 1-in-vocab rel that passes the fp8 bucket. Any divergence on the stick
++    /// is a wrong token, whichever graph holds it.
++    fn compare_tol(is_result_stick: bool, is_fp8: bool) -> f32 {
++        if is_result_stick {
++            0.0
++        } else if is_fp8 {
++            FP8_TOL
++        } else {
++            CLEAN_TOL
++        }
++    }
++
+     let mut failures: Vec<String> = Vec::new();
+     let mut worst_clean = 0f32;
+     let mut worst_fp8 = 0f32;
+@@ -4250,6 +4489,18 @@ pub fn numeric_gate<F: RopeForm>(
+     }) {
+         folded.insert(ir.result.index() as u64);
+     }
++    // ⭐ THE RESULT'S OWN DTYPE — the same fact the wiring ships
++    // (`result_dtype_of_ir`). An INTEGER result is an INDEX stick, and a
++    // tolerance over indices is a category error: one lane off is a WRONG
++    // TOKEN, not accumulation noise, and its rel (1/40017 ≈ 2.5e-5 on
++    // granite) sails under CLEAN_TOL — the gate would certify an argmax that
++    // picked the wrong word. The numeric legs already pin the fixture's idx
++    // exactly (64/64 lanes); this states the same law for the rung's ANSWER,
++    // post-re-point: the result compares EXACTLY (tolerance 0).
++    let result_is_index = matches!(
++        crate::lower_subtile_tape_to_ktir::result_dtype_of_ir(ir),
++        Ok(scratchy_tensors::DType::I32) | Ok(scratchy_tensors::DType::U32)
++    );
+     for &(tid, _) in &compare {
+         let g_full = &eval_bufs[tid as usize];
+         let e = match out.get(&tid) {
+@@ -4299,7 +4550,9 @@ pub fn numeric_gate<F: RopeForm>(
+             .sum();
+         let rel = dsum / gsum.max(1e-6);
+         let is_fp8 = tainted.contains(&(tid as u32));
+-        let tol = if is_fp8 { FP8_TOL } else { CLEAN_TOL };
++        // The index stick's exact law above — and the index law is asked FIRST
++        // (#813 review, item 3): see [`compare_tol`].
++        let tol = compare_tol(result_is_index && tid == ir.result.index() as u64, is_fp8);
+         verdicts.push(ComparedVerdict {
+             tid,
+             n,
+@@ -5985,6 +6238,11 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
+         // it — the slot map is this layout's, gone when the bake returns.
+         lx,
+         kv_request_stride_bytes,
++        // ⭐ THE GRAPH'S OWN WIRING FACTS — carried verbatim: the source count and the resident
++        // ids are facts of the graph this layout packed, stated once here so every session built
++        // on this bundle reads them off the bundle (never off another graph's wiring).
++        num_sources,
++        resident_source_tids,
+         // EMIT-ONLY too: the class registries are build-time facts the door and the load-time bind
+         // resolve through; the baked artifact carries each class's PLACEMENT (in `places` above),
+         // which is all the runtime needs.
+@@ -6123,6 +6381,9 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
+         // `chunk_gather_index_table` read passes it beside `lx_op_local_bytes`, so it refuses
+         // exactly what the bake refused.
+         lx_prob_pin_bytes: lx.borrow().prob_pin_bytes,
++        // The graph's own wiring facts — see the destructure above.
++        num_sources: *num_sources,
++        resident_source_tids: std::borrow::Cow::Owned(resident_source_tids.clone()),
+     }
+ }
+ 
+@@ -8052,6 +8313,94 @@ mod tests {
+         }
+     }
+ 
++    /// ⭐ THE BUNDLE STATES ITS OWN WIRING FACTS (#813 review) — `num_sources` and the resident
++    /// source ids are GRAPH-LOCAL, and the mint is the graph that proves it: its nine staged
++    /// tables (the two-level ramp's seven flat-era tables plus the group pair) sit at
++    /// `[num_sources, num_sources+9)` of the ONE-REQUEST graph, so a minted bundle's stamp and
++    /// an unminted bundle's stamp differ by exactly those nine. The worker used to hand every
++    /// rung the minted wiring's numbers — the rung's completeness walk then covered nine ids
++    /// past its own graph, excused by nine minted table ids that only cancelled by
++    /// coincidence. Pinned from both sides of the mint, plus the one-derivation law: the
++    /// stamp's resident list IS [`load_consts_of_ir`]'s, the same derivation the
++    /// wiring's `load_consts` reads, so the layout's list and the wiring's cannot disagree.
++    #[test]
++    fn the_bundle_states_its_own_source_facts_across_the_mint() {
++        use scratchy_subtile::lower::{GemmWeight, InputRef, OpDesc};
++        use scratchy_subtile::subtile_ir::{SourceShape, SubOp, lower_region, mint_argmax};
++        // K=1, vocab 5 — the one-request lm-head shape the mint admits, the same fixture
++        // `argmax_mint_lower` pins the splice seat with.
++        let input = scratchy_subtile::lower::LoweringInput {
++            exported: None,
++            sources: vec![
++                SourceShape { rows: 1, cols: 1 },
++                SourceShape { rows: 1, cols: 5 },
++            ],
++            ops: vec![OpDesc {
++                op: SubOp::MatmulTile {
++                    n: 5,
++                    weight: GemmWeight::Dense,
++                },
++                m: 1,
++                inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
++            }],
++            result: 0,
++        };
++        let nz = std::num::NonZeroU32::new(64).unwrap();
++        let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
++        let plain = lower_region(&input, nz);
++        let mut minted = lower_region(&input, nz);
++        mint_argmax(&mut minted);
++        let l_plain =
++            compute_bundle_layout(&plain, &weight_ids, false, false, &[]).expect("plain lays out");
++        let l_minted = compute_bundle_layout(&minted, &weight_ids, false, false, &[])
++            .expect("the minted graph lays out");
++
++        // Each stamp names ITS OWN graph's count — the whole point of the fix.
++        assert_eq!(l_plain.num_sources, plain.num_sources);
++        assert_eq!(l_minted.num_sources, minted.num_sources);
++        assert_eq!(
++            l_minted.num_sources,
++            l_plain.num_sources + 9,
++            "the mint's nine tables (the two-level ramp's seven flat-era tables plus the group \
++             pair) are the whole difference between the two graphs' source counts — the nine \
++             ids an unminted rung was handed and did not have"
++        );
++        // The unminted graph has no resident source (no prefix-KV, no load-const tables), and
++        // the minted graph's resident list is EXACTLY the nine tables, at
++        // `[plain's count, minted's count)` — the range the review's coincidence lived in.
++        assert!(
++            l_plain.resident_source_tids.is_empty(),
++            "an unminted graph's layout stamps no resident source"
++        );
++        let tables: Vec<u32> = (l_plain.num_sources..l_minted.num_sources).collect();
++        assert_eq!(
++            l_minted.resident_source_tids, tables,
++            "the minted graph's resident stamp is its nine tables and nothing else"
++        );
++        // ⛔ AND EVERY STAMPED ID IS A SOURCE OF ITS OWN GRAPH — the bake asserts this where it
++        // stamps (an id at or past the count would excuse a REAL source from the runtime's
++        // per-step bind walk); pinned here so the law has a test face too.
++        assert!(
++            l_minted
++                .resident_source_tids
++                .iter()
++                .all(|&t| t < l_minted.num_sources),
++            "a resident id past the source count would excuse a real source"
++        );
++        // ⭐ THE ONE-DERIVATION LAW: the stamp's list is `load_consts_of_ir`'s — the same
++        // derivation `graph_wiring` reads for the wiring's `load_consts` — so a layout that
++        // disagrees with the wiring is a build error here, not a card incident later.
++        let wiring_tids: Vec<u32> = crate::lower_subtile_tape_to_ktir::load_consts_of_ir(&minted)
++            .expect("the minted graph's load-const list derives")
++            .into_iter()
++            .map(|(tid, _)| tid)
++            .collect();
++        assert_eq!(
++            l_minted.resident_source_tids, wiring_tids,
++            "the layout's resident stamp and the wiring's load-const list are one derivation"
++        );
++    }
++
+     #[test]
+     fn emit_sdsc_matmul_minimal_fields() {
+         // The matmul OpSpec lowers to the frontend-minimal field set.
+diff --git a/crates/targets/spyre/src/runner.rs b/crates/targets/spyre/src/runner.rs
+index a182084aed..f9b845e831 100644
+--- a/crates/targets/spyre/src/runner.rs
++++ b/crates/targets/spyre/src/runner.rs
+@@ -162,6 +162,26 @@ impl SpyreSession {
+     pub fn new_multi(
+         programs: &[(&[bundle::LaunchGroup<'static>], &[u64])],
+         weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
++    ) -> Result<Self> {
++        // An empty floor matches no tid, so every stick keeps its view-derived
++        // size — today's behavior, stated once instead of duplicated.
++        Self::new_multi_floored(programs, weights, &std::collections::HashMap::new())
++    }
++
++    /// ⭐ [`new_multi`](Self::new_multi) WITH A SHAPE FLOOR — the tape's own
++    /// tensor-shape statement (element counts keyed by tensor id), which the
++    /// resident sticks allocate at LEAST. For callers that hold the graph the
++    /// programs were lowered from — the bake-time numeric gate holds the
++    /// minted krg, the worker holds the wiring — because a widened reader
++    /// whose view sits on an interior edge of a fused function is invisible
++    /// to the emulator's view walk, and the krg's shape is the tape's own
++    /// statement of the tensor's extent (the same authority the bundle
++    /// layout reserves from). The floor is a MAX: it can only raise an
++    /// allocation, never shrink one the views already sized.
++    pub fn new_multi_floored(
++        programs: &[(&[bundle::LaunchGroup<'static>], &[u64])],
++        weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
++        shape_floor: &std::collections::HashMap<u64, usize>,
+     ) -> Result<Self> {
+         let mut funcs: Vec<Vec<ktir_core::ir::IRFunction<'static>>> =
+             Vec::with_capacity(programs.len());
+@@ -187,8 +207,8 @@ impl SpyreSession {
+             .map(|f| f.as_slice())
+             .zip(specs.iter())
+             .collect();
+-        let session =
+-            Session::new_multi(prog_refs, args).map_err(|e| anyhow!("Session::new_multi: {e}"))?;
++        let session = Session::new_multi_floored(prog_refs, args, shape_floor)
++            .map_err(|e| anyhow!("Session::new_multi: {e}"))?;
+         Ok(Self { session })
+     }
+ 
+diff --git a/crates/targets/spyre/src/runtime.rs b/crates/targets/spyre/src/runtime.rs
+index 20f5cf39fd..a6647b88d3 100644
+--- a/crates/targets/spyre/src/runtime.rs
++++ b/crates/targets/spyre/src/runtime.rs
+@@ -36,6 +36,7 @@ use flex_rs::scheduler::{
+     SchedulerBackendConfig, SchedulerFactoryError, SenlibHardwareSubmit, SenlibQueueCapacity,
+     build_compute_cb, create_scheduler,
+ };
++use flex_rs::shared_host_pool::{SharedHostPool, SharedHostPoolError};
+ use flex_rs::stream::{
+     RuntimeStream, RuntimeStreamError, RuntimeStreamMode, RuntimeStreamPriority, SchedulerError,
+     StreamId,
+@@ -304,6 +305,10 @@ pub enum HwError {
+     /// encoder cannot express an operand ([`Stream::render_compute_batch`]).
+     /// Never a submission: nothing was sent to the device.
+     CbRender(SchedulerError),
++    /// A #606 pooled copy ([`Stream::pooled_copy_on_compute`]) was refused by the
++    /// pool's own validation set — slot range, single-chunk device, the
++    /// slot-capacity transfer law — or the submission it built was rejected.
++    PooledCopy(SharedHostPoolError),
+ }
+ 
+ impl fmt::Display for HwError {
+@@ -325,6 +330,7 @@ impl fmt::Display for HwError {
+             Self::Alloc(e) => write!(f, "{e}"),
+             Self::Reset(e) => write!(f, "{e}"),
+             Self::CbRender(e) => write!(f, "CB image render (no submission): {e}"),
++            Self::PooledCopy(e) => write!(f, "pooled copy: {e}"),
+         }
+     }
+ }
+@@ -578,6 +584,36 @@ impl Stream {
+         )
+     }
+ 
++    /// ⭐ #603 PR3b — a #606-POOLED, pre-mapped copy on the COMPUTE pipeline: the decode
++    /// window's idx-stick D2H into (and any future preamble H2D out of) a
++    /// [`SharedHostPool`] slot. The compute shaping is [`Self::d2h_on_compute`]'s own law
++    /// (#544: the copy is the step's LAST op, FIFO-behind the step's compute CBs, its
++    /// barrier draining the empty DMA deques instead of host-blocking on compute); the
++    /// slot's STABLE IOVA is the pool's whole point — the copy rides the scheduler's
++    /// pre-mapped path with no per-step pin, no fresh mapping, no shadow buffer, which is
++    /// what keeps the per-step DMA a replay candidate instead of a re-render.
++    ///
++    /// The transfer length is the device object's own `total_size` (the pool door's law),
++    /// so the caller passes the PLACEMENT WINDOW, never the whole segment — a window that
++    /// cannot form must be refused by the caller, not papered over with the region.
++    ///
++    /// # Errors
++    /// [`HwError`]: [`HwError::StreamGone`] when the stream is no longer live, or
++    /// [`HwError::PooledCopy`] carrying the pool's own validation set (slot range,
++    /// single-chunk device, the slot-capacity transfer law) or the submission's
++    /// rejection.
++    pub fn pooled_copy_on_compute(
++        &self,
++        pool: &SharedHostPool,
++        slot: usize,
++        addr: &DevAddr,
++        to_device: bool,
++    ) -> Result<(), HwError> {
++        let stream = self.live()?;
++        pool.enqueue_copy_on_compute(&stream, slot, Some(addr.0.clone()), to_device)
++            .map_err(HwError::PooledCopy)
++    }
++
+     /// The one body behind [`Self::d2h`] and [`Self::d2h_on_compute`].
+     fn d2h_shaped(
+         &self,
+diff --git a/crates/targets/spyre/src/sdsc_runner.rs b/crates/targets/spyre/src/sdsc_runner.rs
+index a68cbde53d..7c89a3e573 100644
+--- a/crates/targets/spyre/src/sdsc_runner.rs
++++ b/crates/targets/spyre/src/sdsc_runner.rs
+@@ -144,15 +144,27 @@ pub struct SuperDscSession {
+ impl SuperDscSession {
+     /// Load the bundle, bind the weights, and prepare (allocate + upload the resident program,
+     /// weights and KV pool).
+-    #[allow(clippy::type_complexity)]
++    ///
++    /// ⭐ THE GRAPH'S OWN SOURCE FACTS ARE READ OFF `code`, NEVER ARGUED: the
++    /// source count and the resident source ids are stamped on the bundle's
++    /// layout at the bake, so a session built here walks exactly the source
++    /// range of the graph it runs — a caller cannot hand it another graph's
++    /// numbers. Only the spilled weight tail is an argument (a load-time copy
++    /// decision the layout cannot make for the caller).
++    ///
++    /// `load_consts` is the wiring's OWN staged-constant list — the tables a
++    /// spliced kernel declares as sources. They are bound ONCE here, before
++    /// prepare, resident like a weight (each is a function of the graph
++    /// alone); a session that binds none passes an empty slice, and every
++    /// borrowing session gets the owner's copy through the seg1 alias.
+     pub fn new(
+         code: &'static crate::bundle_code::BundleCode<'static>,
+         vocab: usize,
+         kv_dim: usize,
+         num_blocks: usize,
+-        num_sources: u32,
+-        resident_sources: &[u32],
+         weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
++        load_consts: &[(u32, crate::wiring::LoadConst)],
++        spilled_tail: &[u32],
+     ) -> Result<Self> {
+         Self::new_inner(
+             code,
+@@ -161,10 +173,10 @@ impl SuperDscSession {
+                 kv_dim,
+                 num_blocks,
+             },
+-            num_sources,
+-            resident_sources,
+             weights,
++            load_consts,
+             &[],
++            spilled_tail,
+         )
+     }
+ 
+@@ -182,9 +194,8 @@ impl SuperDscSession {
+         vocab: usize,
+         kv_dim: usize,
+         num_blocks: usize,
+-        num_sources: u32,
+-        resident_sources: &[u32],
+         borrowed: &[i64],
++        spilled_tail: &[u32],
+     ) -> Result<Self> {
+         Self::new_inner(
+             code,
+@@ -193,10 +204,10 @@ impl SuperDscSession {
+                 kv_dim,
+                 num_blocks,
+             },
+-            num_sources,
+-            resident_sources,
+             Vec::new(),
++            &[],
+             borrowed,
++            spilled_tail,
+         )
+     }
+ 
+@@ -213,11 +224,7 @@ impl SuperDscSession {
+         vocab: usize,
+         kv_dim: usize,
+         num_blocks: usize,
+-        // ⛔ REQUIRED, from the generated wiring. Ids `0..num_sources` are host-filled every
+-        // forward; the executor refuses to launch with one unwritten. Passing it as an ARGUMENT
+-        // rather than a setter is the lock: a new session site cannot forget it.
+-        num_sources: u32,
+-        resident_sources: &[u32],
++        spilled_tail: &[u32],
+     ) -> Result<Self> {
+         Self::new_inner(
+             code,
+@@ -226,22 +233,29 @@ impl SuperDscSession {
+                 kv_dim,
+                 num_blocks,
+             },
+-            num_sources,
+-            resident_sources,
+             Vec::new(),
+             &[],
++            &[],
++            spilled_tail,
+         )
+     }
+ 
+     fn new_inner(
+         code: &'static crate::bundle_code::BundleCode<'static>,
+         dims: SessionDims,
+-        num_sources: u32,
+-        // The prefix-KV source ids — placed and inside `0..num_sources`, but device-resident, so
+-        // no per-step bind names them.
+-        resident_sources: &[u32],
+         weights: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
++        // The wiring's staged-constant list — bound once before prepare by the
++        // OWNER only (see [`Self::new`]); borrowers pass none and read the
++        // owner's bytes through the alias.
++        load_consts: &[(u32, crate::wiring::LoadConst)],
+         borrowed: &[i64],
++        // The spilled weight tail's tids — the ONE resident slice the layout cannot state: the
++        // spill is a load-time copy decision (a weight whose slot also holds an m-dependent
++        // intermediate color cannot be aliased, so `adopt_from_owner` copies it into this
++        // session's own region), so the LOADER declares it resident here, exactly as it hands it
++        // over. Leaving it out is a REFUSED LAUNCH, not a silent wrong answer — the completeness
++        // check classifies the un-copied tail `SourceFiller::Nobody` and stops.
++        spilled_tail: &[u32],
+     ) -> Result<Self> {
+         let SessionDims {
+             vocab,
+@@ -255,7 +269,18 @@ impl SuperDscSession {
+             KvDim(kv_dim),
+             PoolPages(num_blocks as i64),
+         )?;
+-        exec.declare_sources(num_sources, resident_sources.iter().copied());
++        // ⭐ THE GRAPH'S OWN SOURCE FACTS — the count and the resident ids are stamped on the
++        // layout this session's `code` carries, so the completeness walk covers exactly the
++        // source range of the graph being run: prefix-KV caches and load-const tables excused
++        // by the bundle's own list, the spilled tail by the caller's, and nothing else.
++        exec.declare_sources(
++            code.layout.num_sources,
++            code.layout
++                .resident_source_tids
++                .iter()
++                .copied()
++                .chain(spilled_tail.iter().copied()),
++        );
+         // BORROWED segments must be declared BEFORE prepare — afterwards the full region is already
+         // allocated and transferred, so the flag would be a silent no-op (the executor refuses).
+         for &seg in borrowed {
+@@ -276,6 +301,15 @@ impl SuperDscSession {
+             };
+             exec.bind_weight(crate::bundle_code::PlaceId::Act(id as u32), bytes);
+         }
++        // ⭐ THE STAGED CONSTANTS ride the same law: bound once, before
++        // prepare, into the same weight channel `stage_weights` converts and
++        // uploads — a table the owner never binds reads as ZEROS on card, and
++        // the kernel composes its answer from zeros (measured: the argmax
++        // mint's first card run answered token 0 — EOS — on every decode
++        // step, while the build's own numeric gate passed, because the gate's
++        // emulator binds its own sources and never crosses this seat).
++        exec.bind_load_consts(load_consts)?;
++        let n_staged = n_bound + load_consts.len();
+         debug!(
+             "[timing] bind weights loop took {:.2}s",
+             t_bind.elapsed().as_secs_f64()
+@@ -288,7 +322,7 @@ impl SuperDscSession {
+         //
+         // NOTHING BOUND is the same situation as BORROWED: with no weights this call only zero-fills
+         // a host shadow of a segment that is about to be replaced by an alias.
+-        if !borrowed.is_empty() || n_bound == 0 {
++        if !borrowed.is_empty() || n_staged == 0 {
+             debug!(
+                 "[timing] weight bind + stage SKIPPED ({})",
+                 if borrowed.is_empty() {
+@@ -725,6 +759,19 @@ impl SuperDscSession {
+         Ok(f16_le_to_f32(&self.exec.read_tensor(id, cap)?))
+     }
+ 
++    /// ⭐ THE GENERIC RAW-READ VARIANT of [`Self::read_tensor`] — the tensor's
++    /// own bytes, VERBATIM, no f16 decode. A step whose rung's result is not
++    /// the f16 row runs `StepLogits::LeftOnDevice` and reads the result here:
++    /// the CALLER decodes at the dtype the wiring's `result_dtype` states (an
++    /// index stick's raw LE int32 words), because only the wiring knows it.
++    pub fn read_tensor_raw(
++        &mut self,
++        id: crate::bundle_code::PlaceId,
++        cap_bytes: usize,
++    ) -> Result<Vec<u8>> {
++        self.exec.read_tensor_raw(id, cap_bytes)
++    }
++
+     /// Zero a whole tensor segment ON THE DEVICE, without a host mirror of it.
+     ///
+     /// The KV pool must start zeroed (decode computes q·k over a whole page before the validity mask
+diff --git a/crates/targets/spyre/src/superdsc_exec.rs b/crates/targets/spyre/src/superdsc_exec.rs
+index d1516bdce1..33c400fcb9 100644
+--- a/crates/targets/spyre/src/superdsc_exec.rs
++++ b/crates/targets/spyre/src/superdsc_exec.rs
+@@ -905,8 +905,8 @@ pub struct Executor {
+     staged: BTreeMap<bundle::PlaceId, u64>,
+     /// ⭐⭐⭐⭐⭐ IDS BOUND THROUGH [`Executor::bind_const_fp32`] — fp32 constants whose LE host
+     /// bytes ARE the device encoding (`Df::Fp32` is IEEE_FP32), so staging copies them VERBATIM:
+-    /// no IEEE→SEN re-encode, no tile walk. The composite argmax's descending ramp and scalar-V
+-    /// stick (#603 PR3a), and nothing else today.
++    /// no IEEE→SEN re-encode, no tile walk. The spliced argmax kernel's staged f32 constants
++    /// (the one-request rung's exactness island), and nothing else today.
+     ///
+     /// A set for the same reason [`Self::raw_ids`] is one: the staging loop consults it, and a
+     /// flag remembered by the bind call alone is a flag the loop can forget.
+@@ -1749,8 +1749,8 @@ impl Executor {
+     }
+ 
+     /// ⭐⭐⭐⭐⭐ Bind a RESIDENT FP32 CONSTANT at load — staged VERBATIM, once, never re-bound.
+-    /// The composite argmax's descending ramp and scalar-V stick (#603 PR3a), and nothing else
+-    /// today.
++    /// The spliced argmax kernel's staged f32 constants (the one-request rung's
++    /// exactness island), and nothing else today.
+     ///
+     /// ⛔ THIS IS NOT [`Self::bind_input_raw`], AND NOT A LAZIER [`Self::bind_weight`]. The raw
+     /// channel is PER-STEP (a raw id bound before prepare is exactly the raw+weight combination
+@@ -1775,7 +1775,7 @@ impl Executor {
+             bail!(
+                 "bind_const_fp32({id}): NO placement in this bundle — the layout did not place \
+                  this const, so the caller's bind and the bundle's layout disagree about the \
+-                 composite argmax. REFUSING"
++                 staged constants. REFUSING"
+             );
+         };
+         if !bytes.len().is_multiple_of(4) {
+@@ -1800,6 +1800,40 @@ impl Executor {
+         Ok(())
+     }
+ 
++    /// ⭐⭐⭐ STAGE THE LOAD-TIME CONSTANTS — every entry of the wiring's
++    /// [`load_consts`](crate::wiring::Wiring::load_consts) list, bound ONCE at
++    /// load, before prepare (each is a function of the graph alone, so
++    /// re-binding per step would re-upload constants). Must be called before
++    /// [`Executor::prepare`], exactly like [`Self::bind_weight`].
++    ///
++    /// The fp32-verbatim vs fp16-convert choice keys off the ENTRY'S OWN
++    /// dtype, never off the op that minted it: a resident fp32 constant's LE
++    /// bytes are the device's own (`Df::Fp32` = IEEE_FP32 —
++    /// [`Self::bind_const_fp32`]), and everything else rides the weight
++    /// channel's IEEE→SEN convert ([`Self::bind_weight`]), bit-exact for every
++    /// value a staged table states. An entry whose tid is a graph OUTPUT
++    /// simply binds that output's initial bytes into its
++    /// own placement — the ops that overwrite it per step do so over these
++    /// bytes, exactly as the card behaves.
++    pub fn bind_load_consts(&mut self, consts: &[(u32, crate::wiring::LoadConst)]) -> Result<()> {
++        if self.prepared {
++            bail!(
++                "bind_load_consts: session ALREADY PREPARED — load-time constants are resident, \
++                 staged once at load"
++            );
++        }
++        for &(tid, kind) in consts {
++            let (bytes, dt, _shape) = kind.build();
++            let id = bundle::PlaceId::Act(tid);
++            if matches!(dt, scratchy_tensors::DType::F32) {
++                self.bind_const_fp32(id, bytes)?;
++            } else {
++                self.bind_weight(id, bytes);
++            }
++        }
++        Ok(())
++    }
++
+     /// Declare, BEFORE prepare, that `seg` will be BORROWED from another session via
+     /// [`Executor::alias_seg_from`]: prepare gives it a 128 B placeholder, skips its host staging
+     /// and skips its H2D, so the session never builds the copy the alias immediately discards.
+@@ -5177,6 +5211,77 @@ impl Executor {
+         Ok(out)
+     }
+ 
++    /// ⭐ THE RAW TWIN OF [`Self::read_tensor`] — the placement's own bytes,
++    /// VERBATIM, no f16 convert: a rung whose result is not the f16 row (an
++    /// index stick, read at the dtype its producer's kernel signature stated)
++    /// is decoded by the CALLER, because only the wiring knows the dtype. Same
++    /// clamps: to `cap_bytes`, and to what the transfer actually brought back.
++    ///
++    /// ⭐ THE TRANSFER IS THE PLACEMENT'S OWN WINDOW, never its segment's
++    /// allocation — the same law [`Self::predict`] states for the row: this
++    /// sits on the TOKEN critical path (the answer re-point's whole point is
++    /// that the ~100 KB row readback collapses to the stick's own bytes), and
++    /// a whole-segment D2H would price the token by whatever else the segment
++    /// packs (measured: the whole-segment read held mean ITL at the row
++    /// readback's level — the collapse never reached the wire). Rides the
++    /// COMPUTE pipeline for the same #544 reason the row's readback does: its
++    /// CB queues behind the step's compute CBs and the FIFO carries the
++    /// ordering the host-side wait used to.
++    pub fn read_tensor_raw(&mut self, id: bundle::PlaceId, cap_bytes: usize) -> Result<Vec<u8>> {
++        let p = self
++            .places
++            .get(&id)
++            .cloned()
++            .ok_or_else(|| anyhow!("unknown tensor {id}"))?;
++        let seg = SegIdx::checked(p.segment as i64)
++            .ok_or_else(|| anyhow!("tensor '{id}' segment {} out of range", p.segment))?;
++        // The bank law is read_tensor's own: a segment read addresses bank 0's
++        // region only, and handing back another bank's bytes at this offset is
++        // worse than refusing.
++        if p.bank != 0 {
++            bail!(
++                "read_tensor_raw('{id}'): it is in weight bank {}, and a segment read addresses \
++                 only bank 0's region — REFUSING rather than returning another bank's bytes",
++                p.bank
++            );
++        }
++        let addr = self.seg_addr[seg.get()]
++            .as_ref()
++            .ok_or_else(|| anyhow!("seg{} has no region", seg.get()))?;
++        let tot = addr.total_size().as_u64();
++        let want = p.size.min(cap_bytes as u64);
++        // The round-up to a flit is not optional (`Flits::from_bytes` TRUNCATES),
++        // and the same two facts predict's window relies on hold here by the
++        // same cargo-build guard (`audit_layout_addresses`): the offset is
++        // 128-aligned and offset+size stays inside the region.
++        let len = crate::lower_subtile_tape_to_superdsc::align128(want).min(tot - p.offset);
++        // A multi-chunk region has no addressable sub-window; fall back to the
++        // whole-region read, exactly as predict does.
++        let win = (len < tot)
++            .then(|| addr.window(ByteOffset(p.offset), ByteSize(len)))
++            .flatten();
++        let (src, a, b) = match win.as_ref() {
++            Some(w) => (w, p.offset, p.offset + len),
++            None => (addr, 0, tot),
++        };
++        let host = &mut self.seg_host[seg.get()][a as usize..b as usize];
++        self.stream
++            .as_ref()
++            .ok_or_else(|| anyhow!("no stream — prepare was not called"))?
++            .d2h_on_compute(host, src)
++            .map_err(|e| anyhow!("read_tensor_raw({id}) D2H: {e}"))?;
++        self.stream_ref()?
++            .synchronize()
++            .map_err(|e| anyhow!("read_tensor_raw({id}) sync: {e}"))?;
++        // May only return the bytes the transfer actually brought back.
++        let avail = (b - p.offset) as usize;
++        let n = (p.size as usize).min(cap_bytes).min(avail);
++        if n == 0 {
++            return Ok(Vec::new()); // a wholly-unreadable placement also has no valid base
++        }
++        Ok(self.seg_host[seg.get()][p.offset as usize..][..n].to_vec())
++    }
++
+     /// The host shadow's byte size for `seg` — what to size a [`Executor::read_seg`] buffer at.
+     pub fn seg_bytes(&self, seg: SegIdx) -> usize {
+         self.seg_host[seg.get()].len()

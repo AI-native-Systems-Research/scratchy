@@ -9026,6 +9026,70 @@ fn superdsc_rotary_kind(
     }
 }
 
+/// One load-const entry `(tid, kind)` as a token stream — the ONE renderer,
+/// shared by the wiring static (`emit_superdsc_wiring`) and every decode
+/// batch rung's OWN consts in the manifest (`decode_rung_lits`), so the two
+/// can never disagree about how a kind is spelled.
+#[cfg(feature = "spyre")]
+fn load_const_entry_tokens(
+    entry: &(u32, scratchy_target_spyre::wiring::LoadConst),
+) -> proc_macro2::TokenStream {
+    let &(tid, ref kind) = entry;
+    let tid = proc_macro2::Literal::u32_unsuffixed(tid);
+    let kind = match *kind {
+        scratchy_target_spyre::wiring::LoadConst::SampleTable {
+            vocab,
+            rows,
+            operand,
+            arrangement,
+        } => {
+            let vocab = proc_macro2::Literal::u32_unsuffixed(vocab);
+            let rows = proc_macro2::Literal::u32_unsuffixed(rows);
+            let operand = proc_macro2::Literal::u8_unsuffixed(operand);
+            let arrangement = match arrangement {
+                scratchy_target_spyre::wiring::ElementArrangement::Standard => {
+                    quote! {
+                        ::scratchy_target_spyre::wiring::ElementArrangement::Standard
+                    }
+                }
+                scratchy_target_spyre::wiring::ElementArrangement::Dl16ToFp32 => {
+                    quote! {
+                        ::scratchy_target_spyre::wiring::ElementArrangement::Dl16ToFp32
+                    }
+                }
+            };
+            quote! {
+                ::scratchy_target_spyre::wiring::LoadConst::SampleTable {
+                    vocab: #vocab,
+                    rows: #rows,
+                    operand: #operand,
+                    arrangement: #arrangement,
+                }
+            }
+        }
+        scratchy_target_spyre::wiring::LoadConst::ChainStageTable {
+            pad_vocab,
+            k,
+            hidden,
+            operand,
+        } => {
+            let pad_vocab = proc_macro2::Literal::u32_unsuffixed(pad_vocab);
+            let k = proc_macro2::Literal::u32_unsuffixed(k);
+            let hidden = proc_macro2::Literal::u32_unsuffixed(hidden);
+            let operand = proc_macro2::Literal::u8_unsuffixed(operand);
+            quote! {
+                ::scratchy_target_spyre::wiring::LoadConst::ChainStageTable {
+                    pad_vocab: #pad_vocab,
+                    k: #k,
+                    hidden: #hidden,
+                    operand: #operand,
+                }
+            }
+        }
+    };
+    quote! { (#tid, #kind) }
+}
+
 #[cfg(feature = "spyre")]
 fn emit_superdsc_wiring(
     gk: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::BundleWiring,
@@ -9306,9 +9370,130 @@ fn emit_superdsc_wiring(
         // ── every caller-filled source is covered by exactly one filler ──
         let cos_ids: std::collections::HashSet<u32> = cos_v.iter().map(|&(i, ..)| i).collect();
         let sin_ids: std::collections::HashSet<u32> = sin_v.iter().map(|&(i, ..)| i).collect();
+        // ⭐ THE SAMPLER'S PER-STEP SEAT — ITS OWN CLASS AT THIS GATE. The seat's
+        // five tids (the seed quadruple's four word tables and inv_t) are minted
+        // below the `LoweredDecode` binding layer (the mint's own law), so they
+        // carry no `SourceBinding`, and the CLASS declares their filler: the
+        // worker binds every one FRESH EVERY DECODE STEP, and the runtime launch
+        // gate refuses a decode without a fresh bind of all of them — the
+        // PrefixMask precedent, never a held default, because a held seed row is
+        // a held TOKEN. This block is the class's declaration at the expansion
+        // gate (the loop below counts the seat's tids as covered BY CLASS); the
+        // per-step enforcement is the runtime gate's own arm. Everything else
+        // about the seat is typed here, where the wiring is in hand:
+        if let Some(seat) = &gk.sample_seat {
+            let mut seat_tids: Vec<(String, u32)> = seat
+                .seed_words
+                .iter()
+                .enumerate()
+                .map(|(k, &tid)| (format!("seed word {k}"), tid))
+                .collect();
+            seat_tids.push(("invt".to_string(), seat.invt));
+            for (name, tid) in seat_tids {
+                if tid >= gk.num_sources {
+                    fail.push(format!(
+                        "the sample seat's {name} source t{tid} is not inside `num_sources` \
+                         ({}) — nothing can ever bind it",
+                        gk.num_sources
+                    ));
+                }
+                if gk.load_consts.iter().any(|&(ltid, _)| ltid == tid) {
+                    fail.push(format!(
+                        "the sample seat's {name} source t{tid} is ALSO a load-time const — a \
+                         tensor cannot both stage once at load and be the step's own freshness"
+                    ));
+                }
+            }
+            let seat_all: std::collections::HashSet<u32> =
+                seat.seed_words.iter().copied().chain([seat.invt]).collect();
+            if seat_all.len() != 1 + seat.seed_words.len() {
+                fail.push(
+                    "the sample seat names one tid twice — the mint mints one source per seat \
+                     operand, so a shared tid means two mints disagree"
+                        .to_string(),
+                );
+            }
+            if !matches!(
+                gk.result_dtype,
+                scratchy_target_spyre::DType::I32 | scratchy_target_spyre::DType::U32
+            ) {
+                fail.push(format!(
+                    "the rung carries the sample seat but its result dtype is {:?}, not an \
+                     index — the mint re-points the result to the idx stick, so a non-integer \
+                     result means the wiring and the mint disagree",
+                    gk.result_dtype
+                ));
+            }
+        }
+        // ⭐ THE CHAINED HEAD'S STICKS — the seat's own class law, stated for the
+        // chain: the two persistent `[1, CHAIN_IDX_BLOCK]` u32 sources are minted
+        // below the `LoweredDecode` binding layer, so they carry no
+        // `SourceBinding`, and the CLASS declares their filler — the tape's
+        // ChainSeed steps bind both (the s stick's lane pattern, the l stick's
+        // ramp), fresh every step, idempotent with the device's own ChainStage
+        // writes. The two decompose TABLES ride `load_consts` like the sampler's
+        // nine (staged once at load) and need no class of their own.
+        let chain_sticks: Option<(u32, u32)> = match &gk.chain {
+            scratchy_target_spyre::wiring::ChainFact::Chained { chain } => {
+                for (name, tid) in [("s", chain.s_src), ("l", chain.l_src)] {
+                    if tid >= gk.num_sources {
+                        fail.push(format!(
+                            "the chain's {name} stick t{tid} is not inside `num_sources` ({}) — \
+                             nothing can ever bind it",
+                            gk.num_sources
+                        ));
+                    }
+                    if gk.load_consts.iter().any(|&(ltid, _)| ltid == tid) {
+                        fail.push(format!(
+                            "the chain's {name} stick t{tid} is ALSO a load-time const — the \
+                             sticks are per-step state the device rewrites, never load-staged"
+                        ));
+                    }
+                }
+                if chain.s_src == chain.l_src {
+                    fail.push(
+                        "the chain names one tid as both the s and the l stick — the mint mints \
+                         two sources, so a shared tid means two mints disagree"
+                            .to_string(),
+                    );
+                }
+                Some((chain.s_src, chain.l_src))
+            }
+            scratchy_target_spyre::wiring::ChainFact::Unchained => None,
+        };
         let mut embeds = 0usize;
         for id in 0..gk.num_sources {
             let Some(b) = lwd.bindings.get(id as usize) else {
+                // ⭐ A LOAD-CONST SOURCE — minted below the `LoweredDecode`
+                // binding layer, so it carries NO `SourceBinding`: the wiring's
+                // `load_consts` list names it (BY MEMBERSHIP in the generic
+                // list, never by the op that minted it), and the worker stages
+                // its bytes once at load through the kind's builder — the rope
+                // tables' own law. This arm is that list's declaration; every
+                // other binding-less source is still the
+                // hang-or-silent-wrong refusal below.
+                if gk.load_consts.iter().any(|&(tid, _)| tid == id) {
+                    continue;
+                }
+                // ⭐ THE SEAT'S OWN ARM — the per-step class the block above declares:
+                // covered BY CLASS (the worker's fresh-every-step bind), which is why
+                // this is a `continue` and not a refusal. The loud refusal lives at the
+                // RUNTIME gate, per launch, where "this step" is a fact — an expansion
+                // cannot know it.
+                if let Some(seat) = &gk.sample_seat
+                    && (seat.seed_words.contains(&id) || seat.invt == id)
+                {
+                    continue;
+                }
+                // ⭐ THE CHAIN'S OWN ARM — the per-step class the block above
+                // declares: covered BY CLASS (the tape's ChainSeed steps bind
+                // both sticks every step), which is why this is a `continue`
+                // and not a refusal.
+                if let Some((s_src, l_src)) = chain_sticks
+                    && (s_src == id || l_src == id)
+                {
+                    continue;
+                }
                 fail.push(format!(
                     "source t{id} is inside `num_sources` but has NO binding — nothing fills it"
                 ));
@@ -9319,6 +9504,17 @@ fn emit_superdsc_wiring(
                 // The generated weight loader binds these once, before prepare.
                 SB::Weight { .. } | SB::WeightScale { .. } | SB::BundleTensor { .. } => {}
                 SB::EmbeddedHidden => {
+                    // ⭐ THE CHAIN'S RESIDENT EXCUSE — the replaced row's host
+                    // filler is gone (the tape's ChainSeed steps replaced the
+                    // embed-row push), but the row is not unbound: the device's
+                    // own EmbedRowGather writes it every step. The chain names
+                    // the replaced id at the mint; this gate reads the same
+                    // statement, never a re-derivation.
+                    if let scratchy_target_spyre::wiring::ChainFact::Chained { chain } = &gk.chain
+                        && id == chain.replaces
+                    {
+                        continue;
+                    }
                     embeds += 1;
                     if id != embed_src {
                         fail.push(format!(
@@ -9342,7 +9538,10 @@ fn emit_superdsc_wiring(
                 SB::PrefixK { .. } | SB::PrefixV { .. } => {}
             }
         }
-        if embeds != 1 {
+        // A chained decode carries its EmbeddedHidden row as DEVICE-WRITTEN
+        // (excused above), so the tape-side count is legitimately zero there.
+        let embed_floor = if chain_sticks.is_some() { 0 } else { 1 };
+        if embeds < embed_floor {
             fail.push(format!(
                 "{embeds} EmbeddedHidden sources; the tape gathers exactly one row"
             ));
@@ -9464,6 +9663,30 @@ fn emit_superdsc_wiring(
     // (Moved above the rotary-source emission: `hd` and `theta` are the base
     // class's facts, and each cos/sin source's `RotaryKind` reads them.)
     let result = u32l(gk.result_tensor);
+    // ⭐ THE RESULT'S OWN DTYPE — straight off the bake's one derivation
+    // (`result_dtype_of_ir`, the result producer's own kernel signature), never
+    // recomputed here: it is the fact that tells the worker whether the rung's
+    // answer is the f16 row (convert and sample on the host) or the i32 idx
+    // stick (read raw — the device already drew the token).
+    // `scratchy-tensors` is only a dev-dependency where this expands (the
+    // models crate), so the literal rides the spyre crate's own root re-export
+    // — the same `::scratchy_target_spyre::` prefix every other wiring type
+    // in this emission uses.
+    let result_dtype = match gk.result_dtype {
+        scratchy_target_spyre::DType::F16 => quote! { ::scratchy_target_spyre::DType::F16 },
+        scratchy_target_spyre::DType::BF16 => quote! { ::scratchy_target_spyre::DType::BF16 },
+        scratchy_target_spyre::DType::F32 => quote! { ::scratchy_target_spyre::DType::F32 },
+        scratchy_target_spyre::DType::U32 => quote! { ::scratchy_target_spyre::DType::U32 },
+        scratchy_target_spyre::DType::I32 => quote! { ::scratchy_target_spyre::DType::I32 },
+        // `result_dtype_of_ir` refuses every dtype the readback cannot name, so
+        // this arm is unreachable by construction — spelled out so a new DType
+        // variant fails HERE rather than silently lower in the wiring.
+        other => panic!(
+            "[superdsc-wiring] {}: the result's dtype {other:?} has no wiring literal — the \
+             readback cannot read it back",
+            model.source_stem
+        ),
+    };
     let num_sources = u32l(gk.num_sources);
     let dp = u32l(decode_position);
     let mask = match gk.attn_mask {
@@ -9578,9 +9801,88 @@ fn emit_superdsc_wiring(
             quote! { (#id, #k) }
         })
         .collect::<Vec<_>>();
+    // ⭐ THE LOAD-TIME CONSTANTS — straight off the bake's own one derivation
+    // (`load_consts_of_ir`, the same list the numeric gate stages), never
+    // recomputed here: each entry is `(tid, kind)` and the KIND names the
+    // shared builder that makes the bytes, so the worker and the gate stage
+    // identical bytes by construction. The sampler's TWENTY staged tables
+    // ride this list (the selection's f32, the noise section's i32/f32/fp16
+    // — each entry's own dtype); its four seed word tables and inv_t do NOT —
+    // they are per-step seats the worker binds fresh every decode, and a
+    // load-time constant staged over them would freeze one draw's seed into
+    // every step.
+    let load_const_toks = gk
+        .load_consts
+        .iter()
+        .map(load_const_entry_tokens)
+        .collect::<Vec<_>>();
+    // ⭐ THE SAMPLER'S PER-STEP SEAT — the named class of the five sources the
+    // token draw binds FRESH EVERY DECODE STEP (the seed quadruple's four
+    // `[rows, 1]` word tables and inv_t), straight off the bake's one
+    // derivation (`sample_seat_of_ir`, the mint's own facts), never
+    // recomputed here. `None` on every rung that mints no draw; `Some` names
+    // the seed word and inv_t tids the worker must bind before EVERY decode
+    // launch — the class the source gate counts as filled only when bound
+    // THIS step.
+    let sample_seat_tok = match &gk.sample_seat {
+        Some(seat) => {
+            let seed_words = seat.seed_words.iter().map(|&t| u32l(t)).collect::<Vec<_>>();
+            let invt = u32l(seat.invt);
+            let rows = u32l(seat.rows);
+            let row = u32l(seat.row);
+            let vocab = u32l(seat.vocab);
+            let pad_vocab = u32l(seat.pad_vocab);
+            let seed_row_words = u32l(seat.seed_row_words);
+            let gate_row_words = u32l(seat.gate_row_words);
+            quote! {
+                ::core::option::Option::Some(
+                    ::scratchy_target_spyre::wiring::SampleSeat {
+                        seed_words: [#(#seed_words),*],
+                        invt: #invt,
+                        rows: #rows,
+                        row: #row,
+                        vocab: #vocab,
+                        pad_vocab: #pad_vocab,
+                        seed_row_words: #seed_row_words,
+                        gate_row_words: #gate_row_words,
+                    }
+                )
+            }
+        }
+        None => quote! { ::core::option::Option::None },
+    };
+    // ⭐ THE FORWARD'S OWN PHASE — a projection of the wiring's own chain
+    // fact, never a second derivation: a rung the mint chained is a DECODE
+    // rung (the mint runs on decode slots only, and it refuses — panics — a
+    // decode slot it cannot chain), so `Chained` ⇒ `Decode { chain }` and
+    // `Unchained` ⇒ `Prefill`, byte-identical to the pre-mint behavior.
+    let phase_tok = match &gk.chain {
+        scratchy_target_spyre::wiring::ChainFact::Chained { chain } => {
+            let s_src = u32l(chain.s_src);
+            let l_src = u32l(chain.l_src);
+            let k = u32l(chain.k);
+            let hidden = u32l(chain.hidden);
+            let replaces = u32l(chain.replaces);
+            quote! {
+                ::scratchy_target_spyre::forward_tape::ForwardPhase::Decode {
+                    chain: ::scratchy_target_spyre::wiring::ChainWiring {
+                        s_src: #s_src,
+                        l_src: #l_src,
+                        k: #k,
+                        hidden: #hidden,
+                        replaces: #replaces,
+                    },
+                }
+            }
+        }
+        scratchy_target_spyre::wiring::ChainFact::Unchained => {
+            quote! { ::scratchy_target_spyre::forward_tape::ForwardPhase::Prefill }
+        }
+    };
     quote! {
         ::scratchy_target_spyre::wiring::Wiring {
             result: #result,
+            result_dtype: #result_dtype,
             num_sources: #num_sources,
             attn_mask: #mask,
             decode_position: #dp,
@@ -9605,6 +9907,9 @@ fn emit_superdsc_wiring(
             weight_scale_folds: &[#(#weight_scale_fold_lits),*],
             weight_copies: &[#(#weight_copy_lits),*],
             fp8_k_pads: &[#(#fp8_k_pad_toks),*],
+            load_consts: &[#(#load_const_toks),*],
+            sample_seat: #sample_seat_tok,
+            phase: #phase_tok,
         }
     }
 }
@@ -9786,6 +10091,12 @@ fn synth_role_tokens(
     let b = quote! { ::scratchy_target_spyre::bundle_code::SynthRole };
     match r {
         R::Rot => quote! { #b::Rot },
+        // The chained head's synthetics (Front C): the per-request slabs the
+        // gather walks, their leg-2 transposes with the sentinel's reserved
+        // zero row, and the request-major leg-3 rows.
+        R::ChainSlab => quote! { #b::ChainSlab },
+        R::ChainSlabT => quote! { #b::ChainSlabT },
+        R::ChainRow => quote! { #b::ChainRow },
         R::Xc => quote! { #b::Xc },
         R::Rs => quote! { #b::Rs },
         R::Silu => quote! { #b::Silu },
@@ -10024,6 +10335,9 @@ fn layout_tokens(
         kv_request_stride_bytes,
         lx_op_local_bytes,
         lx_prob_pin_bytes,
+        lx_pin_window_bytes,
+        num_sources,
+        resident_source_tids,
     } = l;
     let segs = segment_bytes
         .iter()
@@ -10058,6 +10372,23 @@ fn layout_tokens(
     // budget, summed beside the gathers at the bake's `lx_form` admission. 0 for a bundle whose
     // chunk form mints none.
     let lxpp = proc_macro2::Literal::u64_unsuffixed(*lx_prob_pin_bytes);
+    // ⭐ THE WHOLE PIN WINDOW — core-local pins + op-local slot classes, the budget the bake's
+    // `lx_window_fits` guard proved. Carried as an Option: `None` is "no window was ever proven",
+    // which the resident fused path refuses at load rather than charging a silent zero.
+    let lxpw = match lx_pin_window_bytes {
+        Some(b) => {
+            let lit = proc_macro2::Literal::u64_unsuffixed(*b);
+            quote! { ::core::option::Option::Some(#lit) }
+        }
+        None => quote! { ::core::option::Option::None },
+    };
+    // The graph's own wiring facts — the source count and the resident ids, so every session
+    // reads them off the bundle it runs rather than off another graph's wiring (the mint's
+    // renumbering makes the two differ; see the layout field's own doc).
+    let nsrc = proc_macro2::Literal::u32_unsuffixed(*num_sources);
+    let res = resident_source_tids
+        .iter()
+        .map(|t| proc_macro2::Literal::u32_unsuffixed(*t));
     // The segment budget's verdict, as a variant: every reader matches on it.
     let tail = match weight_tail {
         scratchy_target_spyre::bundle_code::WeightTail::InPlace => {
@@ -10087,6 +10418,9 @@ fn layout_tokens(
             kv_request_stride_bytes: #krs,
             lx_op_local_bytes: #lxol,
             lx_prob_pin_bytes: #lxpp,
+            lx_pin_window_bytes: #lxpw,
+            num_sources: #nsrc,
+            resident_source_tids: ::std::borrow::Cow::Borrowed(&[#(#res),*]),
         }
     }
 }
@@ -10334,9 +10668,8 @@ const PREFILL_LX_SAFE: u32 = 31;
 /// tape is CONCRETE (`seq_sym` is forced to `None` below), so `symbolicize_seq` never runs on
 /// it. That is why 128 may equal granite-8b's head_dim here.
 ///
-/// Rungs that fail to lower for a given model are logged and SKIPPED, so this list is an upper
-/// bound on the ladder, not a promise — a model whose FFN blows the LX budget at a wide rung
-/// simply gets a shorter ladder.
+/// Rungs that fail to lower for a given model FAIL THE BUILD, so this list is a promise:
+/// every admitted rung bakes or nothing does.
 /// DENSER AT THE LOW END on purpose: padding cost is `(rung − real) × slope`, so what hurts is
 /// the PROPORTION of the chunk that is padding, and that is worst for short prompts. A measured
 /// 19-token prompt landed on rung 31 and spent 12 of its 31 rows (39%) computing nothing — about
@@ -10849,9 +11182,19 @@ fn dump_wavefront_mega(
         // DECODE BATCH LADDER `[(seqs, body_fp)]` — one entry per width that actually LOWERED, never
         // an assumed list. The one-request rung is the bundle already stamped into `superdsc_fp`, so
         // every path that predates the ladder is unchanged; wider rungs only ever add entries.
-        // (seqs, active_cap, body_fp) — the swept extent rides along so the worker can tighten its
-        // mask-coverage guard from `PAGE_SLOTS * pages` to the real `active_cap * pages`.
-        let superdsc_decode_rungs: std::cell::RefCell<Vec<(u32, u32, String)>> =
+        // (seqs, active_cap, body_fp, OWN load_consts) — the swept extent rides along so the worker
+        // can tighten its mask-coverage guard from `PAGE_SLOTS * pages` to the real
+        // `active_cap * pages`, and the consts are THIS RUNG'S OWN KINDS (staged at the rung's own
+        // `rows` — the ten uniform `[rows, 1]` tables' stick heads are per-width, Finding 1's
+        // compounding half: the single-request wiring's rows=1 kinds staged into a rows=N rung
+        // left every row past 0 reading zero).
+        type DecodeRungEntry = (
+            u32,
+            u32,
+            String,
+            Vec<(u32, scratchy_target_spyre::wiring::LoadConst)>,
+        );
+        let superdsc_decode_rungs: std::cell::RefCell<Vec<DecodeRungEntry>> =
             std::cell::RefCell::new(Vec::new());
         // The PREFIX-CAPABLE ladder `[(mq, body_fp)]` — the prefill bundles baked with a full
         // resident-prefix sweep. Every prefix-free rung is baked ActiveCap::NONE because a start==0 chunk
@@ -10884,10 +11227,16 @@ fn dump_wavefront_mega(
                 fp: String,
             },
             PrefillFp(String),
+            // ⭐ THE RUNG'S OWN KINDS ride the effect: the decode batch rung's
+            // load_consts at ITS OWN `rows`, from THIS bake's wiring (`gk`) —
+            // the one derivation, carried to the manifest so the worker never
+            // stages the single-request wiring's rows=1 kinds into a wider
+            // rung (Finding 1's compounding half).
             DecodeRung {
                 rows: u32,
                 cap: u32,
                 fp: String,
+                consts: Vec<(u32, scratchy_target_spyre::wiring::LoadConst)>,
             },
             DecodeFp(String),
             FoldCensus {
@@ -10896,7 +11245,11 @@ fn dump_wavefront_mega(
             },
             Wiring {
                 slot: Option<WiringSlot>,
-                gk: scratchy_target_spyre::lower_subtile_tape_to_superdsc::BundleWiring,
+                // Boxed for the enum's variant-size budget only — `BakeEffect` rides a Vec
+                // through every bake, and this one field is five sixths of the largest
+                // variant; the box changes no ownership the arm below does not already
+                // borrow (`&gk` derefs through it where the wiring is built).
+                gk: Box<scratchy_target_spyre::lower_subtile_tape_to_superdsc::BundleWiring>,
                 decode_position: u32,
                 man: String,
             },
@@ -10956,9 +11309,9 @@ fn dump_wavefront_mega(
                     && active_cap
                         == scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL;
                 // ⛔ THE WIRING MUST NOT DESCRIBE A PROGRAM THAT DID NOT SHIP. A prefill
-                // rung whose reroll fails is SKIPPED per the rung contract ("a narrower
-                // rung still covers this width"), but this closure's KTIR emission and
-                // wiring stamp run AFTER the reroll and OUTLIVE its failure — so an
+                // rung whose reroll fails PANICS (no rung may fail to lower), but this
+                // closure's KTIR emission and wiring stamp run AFTER the reroll and
+                // OUTLIVE its failure — so an
                 // unqualified `slot.1 = Some(w)` shipped a wiring promising an m=31
                 // batched prefill no bundle carried. The worker keys `prefill_prog` on
                 // the wiring alone (`spyre_load.rs`, `pparsed.is_some() ⇒ Some(0)`) and
@@ -10970,12 +11323,136 @@ fn dump_wavefront_mega(
                 // whose m=31 rung DID bake, staged clean). This flag is the per-call
                 // record of "this prefill bundle actually baked", set at the only two
                 // sites that stamp a prefill fp and read at the wiring stamp below — a
-                // skipped rung leaves the wiring unstamped, `pparsed` parses nothing,
-                // and the worker falls to its sequential per-token prefill (slower,
-                // never wrong: the rung contract's own fallback).
+                // rung that did not bake leaves the wiring unstamped, `pparsed` parses
+                // nothing, and the worker falls to its sequential per-token prefill
+                // (slower, never wrong).
                 let mut prefill_fp_stamped = false;
                 let fused = scratchy_subtile::lower::fuse_silu_mul(&lwd.input);
-                let krg = scratchy_subtile::subtile_ir::lower_region(&fused, knb);
+                let mut krg = scratchy_subtile::subtile_ir::lower_region(&fused, knb);
+                // ⭐⭐⭐ THE CHAINED HEAD'S WIDENING PASS — ABOVE every mint, tie-gated
+                // at the model: the tied embed weight's STATED cols widen to the pick's
+                // pad (`sample_pad_vocab`), so the gather's stride-`pad` walk and the
+                // decompose's clamp boundary are ONE width by construction. It must run
+                // BEFORE the mints — both passes walk the result tail back to the
+                // lm-head, and after the draw the result IS the idx stick, a tail the
+                // widen walk cannot read. Non-admitting tails return None and touch
+                // nothing; every admitting bundle of a tied model reserves the same
+                // widened bytes (the weight-segment parity ledger's law).
+                let tied = tie_word_embeddings(model);
+                let widen = if tied {
+                    scratchy_subtile::subtile_ir::widen_tied_embed_weight(&mut krg)
+                } else {
+                    None
+                };
+                if let Some(w) = &widen {
+                    eprintln!(
+                        "[spyre-superdsc] {base}: the tied embed weight widened — vocab {} \
+                         (stated cols {}), reservation grown, FLOPs untouched (the matmul's \
+                         region stays 0..vocab)",
+                        w.vocab, w.pad_vocab
+                    );
+                }
+                // ⭐⭐⭐ THE TOKEN DRAW'S MINT — EVERY rung this closure bakes: the
+                // solo m=1 bake, every emulator cap bucket, every batch-ladder rung,
+                // AND every prefill rung (the general mint — no prefill-specific
+                // copy, no `one_request` gate, no lm-head admission walk here: #813
+                // minted only the one-request rung whose lm-head admitted, and what
+                // survived that front is the LAW, not the gate — a rung without the
+                // draw is a rung whose answer must still come back as logits for a
+                // host argmax, which is exactly the readback this front deletes).
+                // The splice is the kernel's ONLY entry — the mint appends the node,
+                // its per-row per-step seat (the seed quadruple's four word tables,
+                // inv_t) and its twenty staged-table
+                // sources to the graph, and everything downstream (the splice's row,
+                // the door's whole-function walk, the placement pass, the wiring's
+                // sampler facts) is the same machinery every other Triton kernel
+                // takes. The mint's own tail walk IS the admission: a graph whose
+                // result tail is not the lm-head chain it knows PANICS at expansion —
+                // a build error naming the op, never a silent fall back to the host
+                // readback. A prefill rung's result is the FOLDED lm-head row (the
+                // emitter folds the tail to the last baked row): its prompt-final
+                // chunk's pick is the idx stick, read back exactly like decode's;
+                // a middle chunk's suffix never runs, so its draw is never taken.
+                {
+                    let mint = scratchy_subtile::subtile_ir::mint_sample(
+                        &mut krg,
+                        if is_prefill {
+                            scratchy_subtile::subtile_ir::SampleRows::Folded
+                        } else {
+                            scratchy_subtile::subtile_ir::SampleRows::All
+                        },
+                    );
+                    eprintln!(
+                        "[spyre-superdsc] {base}: the token draw minted — vocab {} (padded row \
+                         {}), rows {}, the per-row seat (seed words t{}..t{}, inv_t t{}) + \
+                         twenty staged tables appended, and the rung's RESULT re-pointed to the \
+                         idx stick (the row stays placed and readable by tid){}",
+                        mint.vocab,
+                        mint.pad_vocab,
+                        mint.rows,
+                        mint.seed_words[0].index(),
+                        mint.seed_words[3].index(),
+                        mint.invt.index(),
+                        if is_prefill { " (prefill rung)" } else { "" },
+                    );
+                    // ⭐⭐⭐ THE CHAINED HEAD'S MINT (#603) — the second splice onto the
+                    // same DECODE rung (prefill keeps the host-staged embed rows — its
+                    // input row is prompt tokens the host owns, never a device pick):
+                    // the EmbedRowGather at the entry (every whole-tensor consumer of
+                    // the embed row re-pointed onto its output), the ChainStage at the
+                    // tail (the pick decomposed into the persistent s/l sticks through
+                    // the two staged tables), the four-source insert below the
+                    // SourceBinding layer. THE PICK IS THE DRAW'S OWN OUTPUT — the
+                    // by-kind find the A-seam refused on: `mint_sample` re-pointed the
+                    // rung's result to the idx stick, so `krg.result` IS the device
+                    // pick, and the vocab the tables decompose over is the mint's own
+                    // emitted vocab. GATED ADDITIONALLY ON THE TIE (the gather's matrix
+                    // operand is the lm-head's weight source, the embedding matrix IFF
+                    // the model ties): an untied decode rung REFUSES here — the chained
+                    // head is the only decode path, and there is no host-pick arm to
+                    // fall to. Every width mints (the solo rung, every batch-ladder
+                    // rung, the symbolic CB batch alike): the chain is the decode path,
+                    // not a wide-batch extra.
+                    if !is_prefill {
+                        if !tied {
+                            panic!(
+                                "[spyre-superdsc] {base}: the decode rung's chained head \
+                                 requires a tied embedding head — this model does not tie \
+                                 word embeddings. The chained head is the only decode path \
+                                 (there is no host-pick arm to fall to); the untied \
+                                 admission is not implemented."
+                            );
+                        }
+                        use crate::to_wavefront::SourceBinding;
+                        let embed_row = lwd
+                            .bindings
+                            .iter()
+                            .position(|b| matches!(b, SourceBinding::EmbeddedHidden))
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "[spyre-superdsc] {base}: no EmbeddedHidden source — the \
+                                     chained head's gather has no row to replace"
+                                )
+                            });
+                        let pick = krg.result;
+                        let chain = scratchy_subtile::subtile_ir::mint_embed_chain(
+                            &mut krg,
+                            scratchy_subtile::subtile_ir::TensorId::from_index(embed_row),
+                            pick,
+                            mint.vocab,
+                        );
+                        eprintln!(
+                            "[spyre-superdsc] {base}: the chained head minted — the embed row \
+                             gather spliced over source t{embed_row} (hidden {}, vocab {}), the \
+                             persistent s/l sticks at t{}/t{}, the two decompose tables staged \
+                             once at load, and the pick decomposed into the sticks at the tail",
+                            chain.hidden,
+                            chain.vocab,
+                            chain.s_stick.index(),
+                            chain.l_stick.index()
+                        );
+                    }
+                }
                 if let Err(e) = scratchy_subtile::subtile_ir::ValidatedGraph::new(&krg) {
                     eprintln!("[spyre-ktir] {stem}: SubtileIR rejected by validate() — {e:?}");
                     return ((String::new(), Vec::new(), String::new(), Vec::new()), fx);
@@ -11031,6 +11508,22 @@ fn dump_wavefront_mega(
                 // COMPILE-gated on `superdsc`: the sdsc emitter module only exists under that feature, so a
                 // `spyre`-only (ktir) build must not compile this block at all (`sendnn_superdsc` alone is a
                 // runtime bool and would still require the module to resolve).
+                // ⭐ THE WIRING COMES OFF THE LOWERING THAT EMITS THE PROGRAMS. Its parameter
+                // pairings are the ones the bundle's launches bind, so there is one lowering and
+                // the wiring cannot describe a different program than the one that ships.
+                // ⭐ HOISTED ABOVE THE REROLL BAKE: the decode batch rung's effect (pushed inside
+                // that bake) carries THIS bake's own `load_consts` — the kinds at the rung's own
+                // `rows`, never the single-request wiring's (Finding 1's compounding half) — so
+                // the derivation must exist before the push. `krg` is minted and validated above
+                // and only ever borrowed below, so computing the wiring here is the same value at
+                // an earlier point, nothing more.
+                let gk = match scratchy_target_spyre::lower_subtile_tape_to_superdsc::graph_wiring(
+                    &krg,
+                    &weight_ids,
+                ) {
+                    Ok(w) => w,
+                    Err(e) => panic!("[spyre] {base}: wiring not lowerable — {}", e.0),
+                };
                 if sendnn_superdsc && seq_sym.is_none() {
                     use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
                     // ── GATE-1 de-risk: when `SCRATCHY_SUPERDSC_GATE1=1`, also drop a
@@ -11266,25 +11759,16 @@ fn dump_wavefront_mega(
                                     // nobody emitted: the worker's body selector finds no bundle and
                                     // the first signal is a launch-time refusal with none of this
                                     // context. This is the site the oversized-dxp-group guard
-                                    // (`DxGroupCeiling`) reaches on a PRIMARY body bundle — a body
-                                    // is not a ladder rung, there is no narrower rung to fall back
-                                    // to, and log-and-skip here is exactly the swallow that would
-                                    // have turned the guard into an eprintln. A decode BATCH rung
-                                    // (`decode_rows > 1`) is the documented exception: "a rung that
-                                    // fails to lower is logged and SKIPPED; that batch runs on a
-                                    // narrower rung, in more than one forward, which is slower and
-                                    // never wrong" — the mq=32 gemma-4 rung is exactly that case
-                                    // (its gathered fold is 8,300 descriptors, over the ceiling;
-                                    // mq=16's 4,172 is not).
-                                    // `None` = errors are fatal (the primary body); on a batch rung
-                                    // (`decode_rows > 1`) they are skipped per the rung contract.
+                                    // (`DxGroupCeiling`) reaches — log-and-skip here is exactly the
+                                    // swallow that would have turned the guard into an eprintln, so
+                                    // an emit failure is FATAL for every rung alike: primary body,
+                                    // decode batch rung, prefill rung.
                                     // ONE BUNDLE PER CLASS, class 0 first — class 0 is the ANCHOR
                                     // (`RerollMeta::bodies[0]` names THIS bundle), and every other
                                     // class becomes a sibling fingerprint. The emulator's single
                                     // unrolled bundle stays ONE bundle: `unroll_layers` already
                                     // walks the launch sequence across classes.
                                     let mut body_fps: Vec<String> = Vec::new();
-                                    let mut body_err: Option<std::io::Error> = None;
                                     for (ci, b) in rolled.bodies.iter().enumerate() {
                                         let r = superdsc::emit_bundle(
                                             if card { &b.ops } else { &unrolled },
@@ -11298,21 +11782,17 @@ fn dump_wavefront_mega(
                                         );
                                         match r {
                                             Ok(fp) => body_fps.push(fp),
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "[spyre-superdsc] {base}: body class {ci} emit \
-                                                     failed: {e}"
-                                                );
-                                                if decode_rows <= 1 {
-                                                    body_err = body_err.or(Some(e));
-                                                }
-                                            }
+                                            Err(e) => panic!(
+                                                "[spyre-superdsc] {base}: body class {ci} emit \
+                                                 failed at decode_rows={decode_rows} \
+                                                 prefill_mq={prefill_mq:?} — {e}. A rung the bake \
+                                                 was asked for must ship its bundle; a skip here \
+                                                 ships a binary whose batch silently runs elsewhere"
+                                            ),
                                         }
                                     }
                                     let bod: Result<String, std::io::Error> =
-                                        body_err.map(Err).unwrap_or_else(|| {
-                                            Ok(body_fps.first().cloned().unwrap_or_default())
-                                        });
+                                        Ok(body_fps.first().cloned().unwrap_or_default());
                                     // The SAME body, with the per-page fold fused back into the
                                     // surrounding work instead of standing alone. Splitting the fold
                                     // costs one extra launch per layer (measured: 5 groups vs the
@@ -12029,6 +12509,20 @@ fn dump_wavefront_mega(
                                                 // `superdsc::GateRung`.
                                                 let gate_rung =
                                                     superdsc::GateRung { fp: &bfp, cap };
+                                                // ⭐ THE SHIPPED BUNDLE'S OWN PIN WINDOW — read
+                                                // from its emitted layout, so the twin's minted
+                                                // programs carry the SAME `lx_window_fits` budget
+                                                // the bake proved (auditor ruling 2026-10-27). A
+                                                // missing entry or an unstated window here is a
+                                                // defect the gate names, not a zero it charges.
+                                                let lx_pin_window = superdsc::emitted_lx_pin_window_bytes(&bfp).unwrap_or_else(|| {
+                                                    panic!(
+                                                        "[spyre-superdsc] {base}: bundle {bfp} has \
+                                                         no emitted layout stating its LX pin window \
+                                                         — the twin cannot mint programs without the \
+                                                         budget the bake proved"
+                                                    )
+                                                });
                                                 let run_gate =
                                                     |prefill: Option<&superdsc::PrefillGate>| {
                                                         // The twin's own groups, fresh from the
@@ -12036,15 +12530,17 @@ fn dump_wavefront_mega(
                                                         // programs the bundle's first K launches
                                                         // bind, so the emulator session runs
                                                         // exactly the classes under test.
-                                                        let twin =
-                                                            superdsc::covering_twin_groups(&rolled)
-                                                                .unwrap_or_else(|e| {
-                                                                    panic!(
-                                                                        "[spyre-superdsc] {base}: \
+                                                        let twin = superdsc::covering_twin_groups(
+                                                            &rolled,
+                                                            Some(lx_pin_window),
+                                                        )
+                                                        .unwrap_or_else(|e| {
+                                                            panic!(
+                                                                "[spyre-superdsc] {base}: \
                                                                          covering twin for {bfp} \
                                                                          failed to lower — {e}"
-                                                                    )
-                                                                });
+                                                            )
+                                                        });
                                                         match twin {
                                                             Some((twin_groups, trunc)) => {
                                                                 match superdsc::numeric_gate(
@@ -12140,18 +12636,18 @@ fn dump_wavefront_mega(
                                             fx.push(BakeEffect::PrefillFp(bfp));
                                             prefill_fp_stamped = true;
                                         } else {
-                                            // ⛔ AN EMPTY fp IS A SKIPPED RUNG, NOT A REGISTERED
-                                            // ONE: the batch-ladder contract is that a rung whose
-                                            // emit failed simply does not appear, so the worker
-                                            // falls to the next narrower rung. Registering it
-                                            // with `""` would hand the selector a bundle nobody
-                                            // emitted.
+                                            // ⛔ AN EMPTY fp IS A FAILED RUNG, NOT AN UNREGISTERED
+                                            // ONE: the batch ladder's contract is that every rung
+                                            // the bake was asked for SHIPS — an emit that failed
+                                            // above already panicked, and an empty fp reaching
+                                            // here means a bundle nobody emitted would otherwise be
+                                            // silently absent from the ladder.
                                             if bfp.is_empty() {
-                                                eprintln!(
+                                                panic!(
                                                     "[spyre-superdsc] {base}: decode batch rung \
-                                                     seqs={decode_rows} NOT BAKED (emit failed \
-                                                     above) — SKIPPED; that batch runs on a \
-                                                     narrower rung, in more than one forward"
+                                                     seqs={decode_rows} NOT BAKED (no body \
+                                                     fingerprint) — every rung the bake was asked \
+                                                     for must ship"
                                                 );
                                             } else {
                                                 // `cap` IS this body's swept extent: `bfp` is the
@@ -12162,6 +12658,13 @@ fn dump_wavefront_mega(
                                                     rows: decode_rows,
                                                     cap,
                                                     fp: bfp.clone(),
+                                                    // THIS rung's own kinds — the wiring `gk`
+                                                    // derived from THIS bake's `krg`, whose
+                                                    // mint ran at `decode_rows`. Not the
+                                                    // single-request wiring's list: the ten
+                                                    // uniform `[rows, 1]` tables stage at the
+                                                    // rung's own rows.
+                                                    consts: gk.load_consts.clone(),
                                                 });
                                             }
                                             // The one-request bundle stays THE decode bundle for
@@ -12203,36 +12706,19 @@ fn dump_wavefront_mega(
                                     }
                                 }
                                 Err(e) => {
-                                    // ⭐ THE RUNG CONTRACT: "a rung that fails to lower is logged and
-                                    // SKIPPED; that batch runs on a narrower rung, in more than one
-                                    // forward, which is slower and never wrong" (the decode batch
-                                    // ladder's own law, and the prefill rung handler's own promise
-                                    // at the wavefront level — `prefill ladder rung m={pl} NOT
-                                    // LOWERED … (SKIPPED; a narrower rung still covers this width)`).
-                                    // A BATCH rung (`decode_rows > 1`) or a PREFILL rung
-                                    // (`prefill_mq.is_some()`) is exactly that case: its callers
-                                    // already treat a missing rung as a fall-to-narrower, never as
-                                    // a build stop. Only the PRIMARY bodies (`decode_rows <= 1`,
-                                    // decode) have no narrower rung to fall to — for them the panic
-                                    // stands (a failed primary bake left `superdsc_fp` unset and
-                                    // shipped a ZERO-group bundle that only crashed at pod load —
-                                    // the swallow this panic replaced).
-                                    if decode_rows > 1 || prefill_mq.is_some() {
-                                        eprintln!(
-                                            "[spyre-superdsc] {base}: RE-ROLL NOT LOWERABLE at \
-                                             decode_rows={decode_rows} prefill_mq={prefill_mq:?} — \
-                                             {e} (SKIPPED per the rung contract; a narrower rung \
-                                             still covers this width)"
-                                        );
-                                    } else {
-                                        panic!(
-                                            "[spyre-superdsc] {base}: RE-ROLL NOT YET LOWERABLE — \
-                                         {e}. (Next worklist item for the re-rolled SuperDSC emitter — \
-                                         this failure was previously swallowed by an eprintln, leaving \
-                                         superdsc_fp unset and shipping a ZERO-group bundle that only \
-                                         crashed at pod load.)"
-                                        );
-                                    }
+                                    // ⛔ NO RUNG MAY FAIL TO LOWER. The old "rung contract" — a
+                                    // failed rung is skipped and the batch falls to a narrower one —
+                                    // shipped binaries whose batch decode silently ran elsewhere
+                                    // (measured: the sampler's grid defect skipped EVERY decode
+                                    // batch rung and nothing said so). A rung the bake was asked
+                                    // for is a build obligation: failure is a build failure, naming
+                                    // the rung and the error.
+                                    panic!(
+                                        "[spyre-superdsc] {base}: RE-ROLL NOT LOWERABLE at \
+                                         decode_rows={decode_rows} prefill_mq={prefill_mq:?} — {e}. \
+                                         Every rung the bake was asked for must lower; a skip ships \
+                                         a binary whose batch silently runs elsewhere"
+                                    );
                                 }
                             }
                         }
@@ -12250,16 +12736,9 @@ fn dump_wavefront_mega(
                 // overridden by the SUPERDSC_BUNDLE sentinel downstream. `group_graphs` stays empty
                 // (a placeholder group is synthesized by the caller to carry the sentinel).
                 let sengraph_json = String::new();
-                // ⭐ THE WIRING COMES OFF THE LOWERING THAT EMITS THE PROGRAMS. Its parameter
-                // pairings are the ones the bundle's launches bind, so there is one lowering and
-                // the wiring cannot describe a different program than the one that ships.
-                let gk = match scratchy_target_spyre::lower_subtile_tape_to_superdsc::graph_wiring(
-                    &krg,
-                    &weight_ids,
-                ) {
-                    Ok(w) => w,
-                    Err(e) => panic!("[spyre] {base}: wiring not lowerable — {}", e.0),
-                };
+                // (the wiring `gk` was already derived above the reroll bake — the decode batch
+                // rung's effect carries this bake's own load_consts, so the derivation precedes
+                // the bake)
                 // The census entry for this program: the fold set the wiring just recognized,
                 // sorted by tid so two walks that found the same folds in a different node
                 // order still compare equal.
@@ -12474,8 +12953,8 @@ fn dump_wavefront_mega(
                     // at B rows and is addressed by FINGERPRINT, not through this wiring.
                     // ⛔ AND A PREFILL WIRING SHIPS ONLY FOR A PREFILL THAT BAKED. The
                     // prefill walk's KTIR emission and wiring stamp survive their own
-                    // reroll's failure (the rung contract skips the rung, not the walk),
-                    // so `is_prefill` alone would promise a batched prefill no bundle
+                    // reroll's failure (a failed reroll panics after the walk has already
+                    // emitted), so `is_prefill` alone would promise a batched prefill no bundle
                     // carries — see the `prefill_fp_stamped` declaration above for the
                     // measured consequence. A rung that did not bake stamps NEITHER
                     // slot: falling through to the decode arm would ship the m=31
@@ -12499,7 +12978,7 @@ fn dump_wavefront_mega(
                     };
                     fx.push(BakeEffect::Wiring {
                         slot,
-                        gk,
+                        gk: Box::new(gk),
                         decode_position: cap.saturating_sub(1),
                         man: man.clone(),
                     });
@@ -12526,10 +13005,15 @@ fn dump_wavefront_mega(
                         }
                     }
                     BakeEffect::PrefillFp(fp) => *superdsc_prefill_fp.borrow_mut() = Some(fp),
-                    BakeEffect::DecodeRung { rows, cap, fp } => {
+                    BakeEffect::DecodeRung {
+                        rows,
+                        cap,
+                        fp,
+                        consts,
+                    } => {
                         let mut r = superdsc_decode_rungs.borrow_mut();
-                        if !r.iter().any(|(n, _, _)| *n == rows) {
-                            r.push((rows, cap, fp));
+                        if !r.iter().any(|(n, _, _, _)| *n == rows) {
+                            r.push((rows, cap, fp, consts));
                         }
                     }
                     BakeEffect::DecodeFp(fp) => *superdsc_fp.borrow_mut() = Some(fp),
@@ -12687,9 +13171,8 @@ fn dump_wavefront_mega(
         // being requests: one page map per request, and one prefix-validity row per request.
         //
         // Rungs share ONE resident weights+KV — no term in either placement depends on the row count,
-        // the same property that licenses the prefill ladder. A rung that fails to lower is logged
-        // and SKIPPED: the batch runs on a narrower rung, in more than one forward, which is slower
-        // and never wrong.
+        // the same property that licenses the prefill ladder. A rung that fails to lower FAILS THE
+        // BUILD, naming the rung and the error.
         // ⛔ CARD-ONLY, same reason as the prefill ladder below: the worker reaches a batch rung
         // through `superdsc_decode_rungs` / `BatchSlot`, which it consults under `spyre-hw` alone —
         // an emulator build sets `batched_prefill: None` (`spyre_load.rs:1713`) and never runs one.
@@ -12700,7 +13183,7 @@ fn dump_wavefront_mega(
             // +16 per further request — plus one launch per request. Measured 36 ms fixed + ~2 ms per
             // request, so the fixed part is what the ladder amortizes and wider rungs are close to
             // free: 8 requests reach ~2.4x the weight stream's worth of work, 32 should reach ~4x.
-            // A rung that fails to lower is logged and skipped, so adding them cannot break a build.
+            // A rung that fails to lower fails the build, so adding one cannot ship silently.
             //
             // THE LADDER COMES FROM THE POOL, not from a literal here. A page holds exactly
             // `PagedKvPool::ROWS` requests, and a rung wider than that would bake a launch whose
@@ -12738,9 +13221,10 @@ fn dump_wavefront_mega(
                             seqs,
                         );
                     }
-                    Err(e) => eprintln!(
-                        "[spyre-superdsc] {stem}: decode batch rung seqs={seqs} NOT LOWERED — {e} \
-                         (SKIPPED; that batch runs on a narrower rung, in more than one forward)"
+                    Err(e) => panic!(
+                        "[spyre-superdsc] {stem}: decode batch rung seqs={seqs} NOT LOWERED — {e}. \
+                         Every rung the bake was asked for must lower; a skip ships a binary whose \
+                         batch silently runs elsewhere"
                     ),
                 }
             }
@@ -12944,9 +13428,8 @@ fn dump_wavefront_mega(
         // rung by rung, ascending, exactly as the serial loop did (the last rung that lowered is still
         // the ceiling).
         //
-        // A rung that does not lower comes back as its `(width, reason)` instead, collected in the same
-        // ascending order at commit — what the window guard below names when the baked ladder stops
-        // short.
+        // A rung that does not lower PANICS inside its own bake — every entry that reaches
+        // the commit below is `Ok`, so the committed ladder is every rung asked for.
         type RungBake = (to_wavefront::LoweredDecode, PrefillPick, Vec<BakeEffect>);
         let per_rung: Vec<Result<RungBake, (u32, String)>> = {
             use rayon::prelude::*;
@@ -13015,24 +13498,27 @@ fn dump_wavefront_mega(
                     Ok((lwd_p, r, fx))
                 }
                 Err(e) if sendnn_superdsc => {
-                    eprintln!(
-                        "[spyre-superdsc] {stem}: prefill ladder rung m={pl} NOT LOWERED — {e} \
-                         (SKIPPED; a narrower rung still covers this width)"
-                    );
-                    Err((pl, e.to_string()))
+                    panic!(
+                        "[spyre-superdsc] {stem}: prefill ladder rung m={pl} NOT LOWERED — {e}. \
+                         Every rung the bake was asked for must lower; a skip ships a binary whose \
+                         chunks silently run elsewhere"
+                    )
                 }
                 Err(e) => panic!("[wavefront] {stem}: prefill (m={pl}) NOT LOWERED — {e}"),
             }
             }).collect()
         };
-        let mut refused_rungs: Vec<(u32, String)> = Vec::new();
+        // A rung that fails to lower panics inside the parallel bake above, so every
+        // entry here is `Ok` — the window guard below still runs, over what baked.
         for rung in per_rung {
             match rung {
                 Ok((lwd_p, r, fx)) => {
                     commit_bake(&lwd_p, fx);
                     prefill = Some(r);
                 }
-                Err(refused) => refused_rungs.push(refused),
+                Err((pl, e)) => {
+                    panic!("[spyre-superdsc] {stem}: prefill ladder rung m={pl} NOT LOWERED — {e}")
+                }
             }
         }
         // ⛔⛔⛔ AND THE LADDER THAT LOWERED MUST REACH THE POOL'S WINDOW, for a model that admits it — on
@@ -13050,7 +13536,7 @@ fn dump_wavefront_mega(
                     rung_admitted(window),
                     prefill_m,
                     &baked,
-                    &refused_rungs,
+                    &[],
                 )
             {
                 panic!("[spyre-superdsc] {stem}: {e}");
@@ -13079,7 +13565,6 @@ fn dump_wavefront_mega(
                 .map(|(m, _)| *m)
                 .collect();
             let asked = scratchy_subtile::sdsc_abstract::PagedKvPool::prefix_rungs(&baked);
-            let mut refused_prefix: Vec<(u32, String)> = Vec::new();
             for &m in &asked {
                 match crate::to_wavefront::lower_decode_to_wavefront(
                     fuf,
@@ -13101,7 +13586,10 @@ fn dump_wavefront_mega(
                             1, // a prompt chunk is one request
                         );
                     }
-                    Err(e) => refused_prefix.push((m, e.to_string())),
+                    Err(e) => panic!(
+                        "[spyre-superdsc] {stem}: prefix-capable prefill rung m={m} NOT LOWERED — \
+                         {e}. Every rung the bake was asked for must lower"
+                    ),
                 }
             }
             // ⛔⛔⛔ THE PREFIX LADDER MUST TOP OUT AT THE PREFIX-FREE LADDER's TOP. A mid-prompt continuation
@@ -13126,7 +13614,7 @@ fn dump_wavefront_mega(
                 scratchy_subtile::sdsc_abstract::PagedKvPool::prefix_ladder_bakes_every_rung(
                     &asked,
                     &prefix,
-                    &refused_prefix,
+                    &[],
                 )
             {
                 panic!("[spyre-superdsc] {stem}: {e}");
@@ -13532,12 +14020,12 @@ fn dump_wavefront_mega(
             // slice and the worker keeps its one-request-per-forward path untouched.
             let decode_rung_lits: Vec<proc_macro2::TokenStream> = {
                 let mut rungs = superdsc_decode_rungs.borrow().clone();
-                rungs.sort_by_key(|(n, _, _)| *n);
-                rungs.dedup_by_key(|(n, _, _)| *n);
+                rungs.sort_by_key(|(n, _, _, _)| *n);
+                rungs.dedup_by_key(|(n, _, _, _)| *n);
                 if rungs.len() > 1 {
                     rungs
                         .iter()
-                        .map(|(n, swept, fp)| {
+                        .map(|(n, swept, fp, consts)| {
                             // ⛔ `RungSeqs`, NOT a bare u32: `superdsc_decode_rungs` is keyed by
                             // `decode_rows` (the BATCH WIDTH), while the sibling `sk_bucket_rungs` list is
                             // keyed by `active_cap` (the SWEEP EXTENT). Both were `(u32, String)`, and the
@@ -13547,11 +14035,21 @@ fn dump_wavefront_mega(
                             let sw = proc_macro2::Literal::u32_unsuffixed(*swept);
                             let sfp =
                                 proc_macro2::Literal::string(&format!("SUPERDSC_BUNDLE:{fp}"));
+                            // ⭐ THE RUNG'S OWN KINDS — staged by the worker into THIS rung's
+                            // session, never the single-request wiring's list: the ten uniform
+                            // `[rows, 1]` tables' stick heads are per-width (Finding 1's
+                            // compounding half). Rendered by the ONE load-const renderer the
+                            // wiring static itself uses, so the spellings cannot drift.
+                            let consts = consts
+                                .iter()
+                                .map(load_const_entry_tokens)
+                                .collect::<Vec<_>>();
                             quote! {
                                 (
                                     ::scratchy_target_spyre::manifest::RungSeqs::new(#n),
                                     ::scratchy_target_spyre::manifest::SweptCols::new(#sw),
                                     ::scratchy_target_spyre::manifest::BundleSentinel::new(#sfp),
+                                    &[#(#consts),*],
                                 )
                             }
                         })

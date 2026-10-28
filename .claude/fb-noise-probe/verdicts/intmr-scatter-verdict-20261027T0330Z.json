@@ -1,0 +1,40 @@
+{
+  "probe": "intmr-scatter",
+  "rows": 2,
+  "cells": {
+    "intmr_dense_add": {
+      "width": 512,
+      "op": "add",
+      "mismatches": 0,
+      "pass": true
+    },
+    "intmr_dense_mul": {
+      "width": 512,
+      "op": "mul",
+      "mismatches": 0,
+      "pass": true
+    },
+    "intmr_f32col_add": {
+      "width": 512,
+      "op": "add",
+      "mismatches": 0,
+      "pass": true
+    },
+    "intmr_f32wide_add": {
+      "width": 65536,
+      "op": "add",
+      "mismatches": 0,
+      "pass": true
+    },
+    "intmr_f32maxadd": {
+      "width": 65536,
+      "op": "maxadd",
+      "row_max": [
+        65535,
+        296605
+      ],
+      "mismatches": 0,
+      "pass": true
+    }
+  }
+}

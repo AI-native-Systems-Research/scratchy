@@ -234,6 +234,14 @@ pub fn lx_capacity_mb() -> i64 {
 pub struct LXScratchpad {
     pub capacity: i64,
     pub used: i64,
+    /// ⭐ THE HIGH-WATER MARK of `used` — the maximum live charge this core's
+    /// LX reached since the scratchpad was built. [`Self::clear`] resets
+    /// `used` between execution rounds but PRESERVES this: the peak is the
+    /// residency model's own headroom statement (a run that fits must leave
+    /// headroom, not fit by zero — the wall-5 law), and it can only be stated
+    /// over a window that outlives the per-round clear. Read by the numeric
+    /// gate's success log and [`CoreContext::lx_peak_used`].
+    pub peak_used: i64,
     pub core_id: usize,
     allocations: FxHashMap<i64, Vec<u8>>,
     pub next_ptr: i64,
@@ -244,6 +252,7 @@ impl LXScratchpad {
         LXScratchpad {
             capacity: size_mb * 1024 * 1024,
             used: 0,
+            peak_used: 0,
             core_id,
             allocations: FxHashMap::default(),
             next_ptr: 0,
@@ -269,7 +278,9 @@ impl LXScratchpad {
         write_bytes(&mut self.allocations, ptr, data);
     }
 
-    /// Reset for the next execution round. Mirrors `clear`.
+    /// Reset for the next execution round. Mirrors `clear`. ⭐ `peak_used`
+    /// SURVIVES: `used` is this round's live charge, the peak is the
+    /// high-water statement over every round this scratchpad has served.
     pub fn clear(&mut self) {
         self.allocations.clear();
         self.next_ptr = 0;

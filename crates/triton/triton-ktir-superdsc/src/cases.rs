@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE TWENTY-EIGHT CONFIGURATIONS, STATED ONCE.
+//! THE THIRTY CONFIGURATIONS, STATED ONCE.
 //!
 //! A "configuration" is a `.py` fixture plus the `tl.constexpr` values and the launch grid it is
 //! compiled at. Three consumers need that tuple: `examples/bake_py` (the dxp bake),
@@ -78,6 +78,22 @@ pub const ALL: &[&str] = &[
     // core, where `unroll_grid_positions` must count `n * trips` tiles to see the
     // partitioned parameters. The `to_ktir.rs` count fix's gate.
     "attention_banded_fold",
+    // ⭐ PROBE-ONLY (front-b-noise, auditor order 2026-10-26): the on-card noise
+    // hash STANDALONE — the sampler's noise section verbatim with `u` and `g`
+    // stored as outputs instead of consumed by the draw. 2^20 lanes in ONE
+    // whole row (B=1, PAD_V=2^20), the sampler's per-program whole-row width
+    // class one power up from gemma-4's 2^19. Rides `Program::Sample`'s door
+    // so the probe lowers through the production walk. NOT a production
+    // configuration: delete with the probe.
+    "hash_noise",
+    // ⭐ PROBE-ONLY (front-b-noise, auditor order 2026-10-26, ruling (b)): the
+    // INT-BCAST leg — ONE `arith.addi` of a `[1, 512]` dense i32 and a
+    // `[1, 1]` Col-broadcast i32, the exact card form the integer door's
+    // broadcast admission names as its measurement in flight (see
+    // `int_binary`'s doc). B1's probe form at the sampler's own per-row word
+    // shape; the verdict is a host bit-for-bit compare of the `[1, 512]` sum.
+    // NOT a production configuration: delete with the probe.
+    "int_bcast",
     "attention_banded_batch",
 ];
 
@@ -731,6 +747,399 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
         // production kernel rides.
         "attention_banded_fold" => (banded_attn_spec(1), vec![1, 8, 4], Program::Attn),
         "attention_banded_batch" => (banded_attn_spec(2), vec![2, 8, 4], Program::Attn),
+        // ⭐ PROBE-ONLY (front-b-noise): the noise-hash standalone — see the ALL-list
+        // comment. `Program::Sample` rides the sampler's door arm; ONE program, ONE
+        // whole row — B=1, PAD_V=2^20 (2^20 lanes in width, not in rows: a B>1 grid
+        // mismatches the band/extent laws, see the kernel's docstring). Every
+        // constant is a staged table in the kernel's own parameter order: the seed
+        // triple + hash constants (7 full-width i32 rows), the lane + fold constants
+        // (6 full-width f32 rows), the fp16 FEST-domain clamp cmin (2^-14, full-width
+        // fp16 row — the card's log is fp16-only, so the draw narrows for each log
+        // and clamps at fp16's smallest normal), then the four outs — u, g
+        // ([1,2^20] f32) and ui, gi ([1,2^20] i32, the LegalizeTypes island's
+        // fptosi exits). No selection: the walk's Reduce arm cannot lower a wide
+        // f32 reduce (the partials law), and the auditor's statistics are
+        // host-side reads of u and g.
+        "hash_noise" => (
+            spec(
+                "hash_noise_probe",
+                "hash_noise_probe",
+                &[
+                    ("slo_ptr", "*i32"),
+                    ("shi_ptr", "*i32"),
+                    ("stp_ptr", "*i32"),
+                    ("c1_ptr", "*i32"),
+                    ("c2_ptr", "*i32"),
+                    ("c3_ptr", "*i32"),
+                    ("c256_ptr", "*i32"),
+                    ("lane_ptr", "*fp32"),
+                    ("fm8_ptr", "*fp32"),
+                    ("ftop_ptr", "*fp32"),
+                    ("fzero_ptr", "*fp32"),
+                    ("fhalf_ptr", "*fp32"),
+                    ("fm22_ptr", "*fp32"),
+                    ("cmin_ptr", "*fp16"),
+                    ("u_ptr", "*fp32"),
+                    ("g_ptr", "*fp32"),
+                    ("ui_ptr", "*i32"),
+                    ("gi_ptr", "*i32"),
+                ],
+                &[("PAD_V", Val::Int(1048576)), ("B", Val::Int(1))],
+            ),
+            vec![1],
+            Program::Sample,
+        ),
+        // ⭐ THE INT-BCAST PROBE (front-b-noise, ruling (b)): three pointers — `a` the
+        // `[1, 512]` dense i32 row, `b` the `[1, 1]` per-row word (the seed word's own
+        // shape), `o` the `[1, 512]` i32 sum — one program, one grid slot, no constants
+        // (nothing is a splat, so nothing routes to the fp16 scalar-multiply door). The
+        // kernel's single `a + b` is the Col-broadcast `addi32toi32` the door's admission
+        // measures; PAD_V=512 is the auditor's stated width, B=1 the one-row grid.
+        "int_bcast" => (
+            spec(
+                "int_bcast_probe",
+                "int_bcast_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(512)), ("B", Val::Int(1))],
+            ),
+            vec![1],
+            Program::Sample,
+        ),
+        // ⭐ THE INT-MUL-BCAST PROBE (front-b-noise, the wall-5 (B) ruling): the add
+        // leg's own shape with the multiply under measurement — `a` the `[1, 512]`
+        // dense i32 row, `b` the `[1, 1]` per-row word, `o` the `[1, 512]` i32
+        // product, one program, one grid slot, no constants. The kernel's single
+        // `a * b` is the Col-broadcast `muli32toi32` the door's `Mul` admission
+        // measures (the hash's restaged `[1, 1]` multipliers hc1/hc2/hc3/c256 ride
+        // exactly this form); PAD_V=512 the auditor's stated width, B=1 the
+        // one-row grid.
+        "intmul_bcast" => (
+            spec(
+                "intmul_bcast_probe",
+                "intmul_bcast_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(512)), ("B", Val::Int(1))],
+            ),
+            vec![1],
+            Program::Sample,
+        ),
+        // ⭐ THE INT MULTI-ROW PROBES (front-b-noise, auditor GO 2026-10-27): four cells
+        // for attribution, all in the PRODUCTION PID-CORNERED SPELLING — grid `[B]` at
+        // B=2, `[1, ·]` blocks, the per-row loads at `[pid, 0]`. The DENSE cells
+        // (`[2, 512]` + `[2, 512]`) are the multi-row dense CONTROL (B1 measured
+        // `[1, 512]` alone); the COL cells (`[2, 512]` + `[2, 1]`) measure the
+        // multi-row `Col` operand mode WALL 9 named — a band-typed rung mints its
+        // per-request seed words as `[rows, 1]` against a `[rows, cols]` tile at
+        // rows > 1 — for `Add` AND `Mul`, the door's in-flight admission's own
+        // measurement. The staged rows and per-row words all DIFFER, so a sprayed
+        // word or a wrong stick is a mismatch, never a coincidental pass.
+        // NOT production configurations: delete with the probe.
+        "intmr_dense_add" => (
+            spec(
+                "intmr_probe",
+                "intmr_dense_add_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        "intmr_col_add" => (
+            spec(
+                "intmr_probe",
+                "intmr_col_add_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        "intmr_dense_mul" => (
+            spec(
+                "intmr_probe",
+                "intmr_dense_mul_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        "intmr_col_mul" => (
+            spec(
+                "intmr_probe",
+                "intmr_col_mul_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        // ⭐ THE INT MB PROBES (front-b-noise wall 10, auditor GO 2026-10-27): the
+        // ROW-VECTOR operand mode the 32-row ceiling rung's bake refusal named —
+        // the whole-row `[1, PAD_V]` i32 table (the sampler's own `lane` idiom,
+        // loaded at `[0, 0]`, program-invariant) against the band-typed
+        // `[B, PAD_V]` tile, the hash's `h = lane * hc1 + slo` shape. `Add` and
+        // `Mul` at the auditor's width, plus the production-width `[2, 65536]`
+        // twins. The Mb flag can only arrive through the band's own derivation
+        // (no `linalg.broadcast` exists in-program for a table the shapes
+        // already agree on), so these cells measure the derivation AND the door
+        // arm together — the exact production path. NOT production
+        // configurations: delete with the probe.
+        "intmb_add" => (
+            spec(
+                "intmr_probe",
+                "intmb_add_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        "intmb_mul" => (
+            spec(
+                "intmr_probe",
+                "intmb_mul_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        // ⭐ THE WIDE TWINS — production PAD_V, the per-core slice width the
+        // card-proven b2 fold states (64 sticks per core at {mb:1, out:32}),
+        // against the narrow twins' 1 stick per core: decides whether the Mb
+        // spray is slice-width-safe exactly as the Col wide twin did at wall 9.
+        // NOT production configurations: delete with the probe.
+        "intmb_wide_add" => (
+            spec(
+                "intmr_probe",
+                "intmb_add_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(65536)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        "intmb_wide_mul" => (
+            spec(
+                "intmr_probe",
+                "intmb_mul_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(65536)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        // ⭐ THE MB×COL PROBES — the PRODUCTION form of the hash's multiply:
+        // `lane * hc1` has NO dense operand (the whole-row `[1, PAD_V]` table
+        // sprays against the per-row `[B, 1]` word), so these measure the two
+        // operand modes TOGETHER on top of the dense+Mb cells that isolate
+        // the spray. Narrow and production width. NOT production
+        // configurations: delete with the probe.
+        "intmb_col_add" => (
+            spec(
+                "intmr_probe",
+                "intmb_col_add_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        "intmb_col_mul" => (
+            spec(
+                "intmr_probe",
+                "intmb_col_mul_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        "intmb_wide_col_add" => (
+            spec(
+                "intmr_probe",
+                "intmb_col_add_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(65536)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        "intmb_wide_col_mul" => (
+            spec(
+                "intmr_probe",
+                "intmb_col_mul_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(65536)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        // ⭐ PROBE-ONLY (front-b-noise, auditor order 2026-10-27, ruling (a)): the
+        // PRODUCTION NOISE ISLAND at the batched rung's own rows — the sampler's
+        // noise-and-score section of `sample_fwd.py` VERBATIM (op for op, staging
+        // class for staging class), the selection DROPPED, and the three f32 values
+        // the auditor named STORED as outputs: `u` (bit-exact on the host), `g` (the
+        // Gumbel draw) and `score`, each closed through its own `fptosi` exit
+        // (`hash_noise`'s own island law). At granite-3.1-2b's REAL geometry —
+        // PAD_V 65536, the vocab the pad law bounds at 49155. The `b2` row is the
+        // intmr-proven width (the multi-row Col admission's own cell geometry); the
+        // `b8` row is the batched defect geometry — the rows whose ten uniform
+        // `[B, 1]` tables read ZERO at their stick heads before the `d99c3d750f`
+        // fix, collapsing the noise to a lane-constant and the pick onto the
+        // argmax. (NO `b1` row: at B=1 the `[B, 1]` views are `[1, 1]`, which this
+        // door sizes as a 2 B launcher-bound scalar — the solo case is the chat
+        // leg's own seat readback, not this probe's.) Reads `g` and `score` OFF THE
+        // CARD per row and lane. NOT production configurations: delete with the
+        // probe.
+        "sample_noise_b2" => (
+            spec(
+                "sample_noise_probe",
+                "sample_noise_probe",
+                &[
+                    ("logits_ptr", "*fp16"),
+                    ("slo_ptr", "*i32"),
+                    ("shi_ptr", "*i32"),
+                    ("stp_ptr", "*i32"),
+                    ("sgate_ptr", "*i32"),
+                    ("invt_ptr", "*fp32"),
+                    ("ones_ptr", "*fp32"),
+                    ("padoff_ptr", "*fp32"),
+                    ("hc1_ptr", "*i32"),
+                    ("hc2_ptr", "*i32"),
+                    ("hc3_ptr", "*i32"),
+                    ("c256_ptr", "*i32"),
+                    ("lane_ptr", "*fp32"),
+                    ("fm8_ptr", "*fp32"),
+                    ("ftop_ptr", "*fp32"),
+                    ("fzero_ptr", "*fp32"),
+                    ("fhalf_ptr", "*fp32"),
+                    ("fm22_ptr", "*fp32"),
+                    ("cmin_ptr", "*fp16"),
+                    ("u_ptr", "*fp32"),
+                    ("g_ptr", "*fp32"),
+                    ("score_ptr", "*fp32"),
+                    ("ui_ptr", "*i32"),
+                    ("gi_ptr", "*i32"),
+                    ("si_ptr", "*i32"),
+                ],
+                &[("PAD_V", Val::Int(65536)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        "sample_noise_b8" => (
+            spec(
+                "sample_noise_probe",
+                "sample_noise_probe",
+                &[
+                    ("logits_ptr", "*fp16"),
+                    ("slo_ptr", "*i32"),
+                    ("shi_ptr", "*i32"),
+                    ("stp_ptr", "*i32"),
+                    ("sgate_ptr", "*i32"),
+                    ("invt_ptr", "*fp32"),
+                    ("ones_ptr", "*fp32"),
+                    ("padoff_ptr", "*fp32"),
+                    ("hc1_ptr", "*i32"),
+                    ("hc2_ptr", "*i32"),
+                    ("hc3_ptr", "*i32"),
+                    ("c256_ptr", "*i32"),
+                    ("lane_ptr", "*fp32"),
+                    ("fm8_ptr", "*fp32"),
+                    ("ftop_ptr", "*fp32"),
+                    ("fzero_ptr", "*fp32"),
+                    ("fhalf_ptr", "*fp32"),
+                    ("fm22_ptr", "*fp32"),
+                    ("cmin_ptr", "*fp16"),
+                    ("u_ptr", "*fp32"),
+                    ("g_ptr", "*fp32"),
+                    ("score_ptr", "*fp32"),
+                    ("ui_ptr", "*i32"),
+                    ("gi_ptr", "*i32"),
+                    ("si_ptr", "*i32"),
+                ],
+                &[("PAD_V", Val::Int(65536)), ("B", Val::Int(8))],
+            ),
+            vec![8],
+            Program::Sample,
+        ),
+        // ⭐ THE FP32 TWIN of `intmr_col_add` (wall-9 emission diff, auditor order
+        // 2026-10-27): the same shapes and pid-cornered spelling, fp32 alone differs —
+        // `invt`'s own production class, the Col addressing the auditor states is
+        // card-proven at rows > 1. NOT a production configuration: delete with the probe.
+        "intmr_f32col_add" => (
+            spec(
+                "intmr_probe",
+                "intmr_f32col_add_probe",
+                &[("a_ptr", "*fp32"), ("b_ptr", "*fp32"), ("o_ptr", "*fp32")],
+                &[("PAD_V", Val::Int(512)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        // ⭐ THE WIDE TWIN (wall-9 width leg, auditor order 2026-10-27T02:5xZ): the
+        // same kernel at PRODUCTION WIDTH — PAD_V 65536, 2048 out-sticks, the fold
+        // the card-proven b2 equality states ({mb:1, out:32}, 64 sticks per core)
+        // against the narrow twin's 1 stick per core. The re-leg refuted the
+        // both-split diagnosis (the fold moved, the card output did not), and the
+        // field-by-field descriptor diff leaves PER-CORE SLICE WIDTH as the only
+        // variable: this cell decides whether the Col defect is narrow-slice only
+        // (production safe) or the equality passes by luck (urgent). NOT a
+        // production configuration: delete with the probe.
+        "intmr_f32wide_add" => (
+            spec(
+                "intmr_probe",
+                "intmr_f32col_add_probe",
+                &[("a_ptr", "*fp32"), ("b_ptr", "*fp32"), ("o_ptr", "*fp32")],
+                &[("PAD_V", Val::Int(65536)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        // ⭐ THE REDUCE-CHAIN TWIN (wall-9, auditor order after the wide leg
+        // failed identically): the sampler's own `max → expand_dims → add`
+        // chain at production width — the reduce's [2,1] output is DEVICE-
+        // written and consumed as the add's Col operand, the exact form of
+        // `max_o17` → `equal_o18` in the batched greedy bundle. Decides whether
+        // the device-written Col read is self-consistent (the greedy's safety)
+        // or row-blind like the host-staged twin (the equality passes by luck —
+        // urgent). NOT a production configuration: delete with the probe.
+        "intmr_f32maxadd" => (
+            spec(
+                "intmr_probe",
+                "intmr_f32maxadd_probe",
+                &[("a_ptr", "*fp32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(65536)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
+        // ⭐ THE α CELL BASE (front-b-noise convert-door wall, auditor order
+        // 2026-10-27): a dense i32 add at `[2, 32]` — ONE STICK PER ROW — baked
+        // only as the GEOMETRY base for the card cell that decides the
+        // convert door's device law. The baked SDSC is mutated OFF-TREE (the
+        // kit's alpha_cell.py, the B1 `i2f_g1` recipe verbatim) to
+        // `int32tofp32` unary with Tensor2 at IEEE_FP32, asking the DEVICE
+        // whether a 32-ELEMENT slab per row is scheduler-legal — the tension
+        // convert_opspec's own comment states (a whole stick of the WIDER
+        // format = 32 elems for the i32→f32 pair) against its hardcoded
+        // 64-elem `StickExtent::<Fp16>` basis (reduce.rs:41-44's scheduler
+        // citation). The kernel is the dense add verbatim — the door CANNOT
+        // bake the convert at this width (that refusal IS the wall), so the
+        // base bakes the add and the mutation swaps only the op. NOT a
+        // production configuration: delete with the probe.
+        "intmr_alpha_base" => (
+            spec(
+                "intmr_probe",
+                "intmr_dense_add_probe",
+                &[("a_ptr", "*i32"), ("b_ptr", "*i32"), ("o_ptr", "*i32")],
+                &[("PAD_V", Val::Int(32)), ("B", Val::Int(2))],
+            ),
+            vec![2],
+            Program::Sample,
+        ),
         _ => return None,
     })
 }
@@ -973,7 +1382,7 @@ mod tests {
         }
         assert_eq!(
             super::ALL.len(),
-            28,
+            30,
             "a configuration was added or removed: update ALL (and the module title) deliberately"
         );
     }

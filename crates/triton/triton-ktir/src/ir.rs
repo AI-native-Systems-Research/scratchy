@@ -81,6 +81,7 @@ pub enum OpKind {
     // --- math
     MathExp2,
     MathExp,
+    MathLog,
     MathLog2,
     MathSqrt,
 
@@ -176,6 +177,7 @@ impl OpKind {
             ArithSelect => "arith.select",
             MathExp2 => "math.exp2",
             MathExp => "math.exp",
+            MathLog => "math.log",
             MathLog2 => "math.log2",
             MathSqrt => "math.sqrt",
             TensorSplat => "tensor.splat",
@@ -254,6 +256,7 @@ impl OpKind {
             "arith.select" => ArithSelect,
             "math.exp2" => MathExp2,
             "math.exp" => MathExp,
+            "math.log" => MathLog,
             "math.log2" => MathLog2,
             "math.sqrt" => MathSqrt,
             "tensor.splat" => TensorSplat,
@@ -353,6 +356,7 @@ impl OpKind {
                 | ArithSelect
                 | MathExp2
                 | MathExp
+                | MathLog
                 | MathLog2
                 | MathSqrt
                 | TensorSplat

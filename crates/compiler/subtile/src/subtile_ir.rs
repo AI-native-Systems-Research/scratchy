@@ -855,6 +855,24 @@ impl<F: RopeForm, S: OpStage> SubOp<F, S> {
             | SubOp::RouteGatherScores
             | SubOp::RouteRenorm
             | SubOp::ExpertUnsort => {}
+            // The vocab and the row count are class: two vocab widths are
+            // different programs (every staged table and the whole row's tile
+            // shape key off it), and so are two batch widths (the grid and
+            // every per-row operand's shape key off it).
+            SubOp::Sample { vocab, rows } => (vocab, rows).hash(h),
+            // The gathered row's width AND the row it replaced are class: two
+            // hidden widths are different programs (the walk's stride and the
+            // row's extent key off them), and two replaced rows are different
+            // wirings (the stamp's resident excuse keys off the stated id).
+            SubOp::EmbedRowGather { hidden, replaces } => (hidden, replaces.0).hash(h),
+            // The table range and the entry split are class: two pad-vocabs
+            // or two entry counts are different programs (the staged tables'
+            // extents and lane patterns key off them).
+            SubOp::ChainStage {
+                pad_vocab,
+                table_rows,
+                k,
+            } => (pad_vocab, table_rows, k).hash(h),
             SubOp::Mamba2 { inner } => inner.hash(h),
             SubOp::RouterNorm { eps, router } => (eps.to_bits(), router).hash(h),
             SubOp::RouterLogits { experts, router } => (experts, router).hash(h),
@@ -1342,7 +1360,175 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// `inputs` = `[rows, over, weight…]`: the gathered activation, the output it replaces, and
     /// the matmul's weight operands.
     AllRowsMatmul,
+
+    // ── The token draw (see `kernels/sample_fwd.py`) ─────────────────
+    /// The FIRST-maximum Gumbel-max draw over a `[rows, PAD_V]` logits block,
+    /// as the `[rows, BLOCK]` i32 idx stick the device's index ingestion
+    /// reads — one program per row, at EVERY decode rung (the solo m=1 rung
+    /// and every batched rung alike; a batched rung without the sampler does
+    /// not build). `inputs` = `[logits, slo, shi, stp, sgate, invt,
+    /// bramp, lramp, binc, linc, ones, sixtyfour, padoff, gramp, ginc, hc1,
+    /// hc2, hc3, c256, lane, fm8, ftop, fzero, fhalf, fm22, cmin]`: the
+    /// `[rows, PAD_V]` fp16 block (whose pad bytes are NOT this op's
+    /// contract — the lm-head's zero-pad columns write 0.0 there every
+    /// step), the FIVE PER-ROW, PER-STEP staged operands (the seed
+    /// quadruple's four `[rows, 1]` i32 word tables — seed_lo, seed_hi,
+    /// step, greedy_gate — from which the card computes the noise
+    /// itself, zeros
+    /// at the greedy temperature 0 — and the `[rows, 1]` f32 temperature
+    /// reciprocals), then the twenty staged tables, functions of `vocab`
+    /// alone, constant across decode steps — the two decreasing ramps that
+    /// make the maxima first-max by monotonicity, the two increasing index
+    /// tables that read the selection back out, the two widen tables that
+    /// keep every broadcast a two-tensor multiply, the OFFSET row that
+    /// carries the pad law (0.0 on the real lanes, f32::MIN (−FLT_MAX,
+    /// 0xFF7FFFFF) on the pads — the fp32 reduce template's own "negInf",
+    /// NEVER IEEE −inf, which the card reads as NaN; the kernel adds it
+    /// LAST, after the score's two roundings, so a pad lane can never win
+    /// and an all-−FLT_MAX row still answers lane 0), the two-level
+    /// ramp's GROUP pair, and the noise section's own eleven (the four i32
+    /// hash/fold constants, the lane table, the fold's five f32 constants,
+    /// the fp16 island's clamp — ten of them ONE-WORD `[1, 1]` tables, the
+    /// wall-5 measured law). An all-NaN row answers past the last real lane (the
+    /// sentinel); the consumer refuses `idx > vocab` loudly rather than feed
+    /// a NaN-born index to the detokenizer.
+    Sample { vocab: u32, rows: u32 },
+    // ── The chained head (constructed only by the chain mint, `mint_embed_chain`) ──
+    /// ⭐ THE CHAINED INPUT ROWS — `[width, hidden]` embedding rows gathered out
+    /// of the (tied) embedding matrix at the indices the DEVICE picked, one row
+    /// per request: `inputs` = `[s_stick, l_stick, embed_matrix]`, out
+    /// `[width, hidden]`.
+    ///
+    /// ⛔ THIS IS NOT `EmbeddingGather`, AND THE DIFFERENCE IS THE CLASS:
+    /// `EmbeddingGather`'s index table is a HOST-STAGED extern (a runtime
+    /// input, not an operand — the vision window permutation); this op's
+    /// indices are OPERAND REGIONS over device-written placements — the
+    /// persistent s/l sticks the chain mint inserts, written by the previous
+    /// step's `ChainStage` through its staged tables. The gather cannot tell
+    /// host-staged bytes from device-written bytes (a placement is a
+    /// placement); what makes this the chain's op is that its indices NEVER
+    /// left the card.
+    ///
+    /// The pick DECOMPOSES across the two sticks, because the pick `t`
+    /// reaches `PAD_V + 4160` — past fp16 range, and the sticks' lanes must
+    /// stay fp16-exact (a staged u32 word re-encoded as fp16 would rewrite
+    /// the index). `t = s<<6 | l`: the s stick carries the SLAB index
+    /// `t >> 6` (clamped to 0 past `pad_vocab`) as the LANE PATTERN
+    /// [`chain_s_stick_pattern`] — lane `i` names entry `k·s + (i mod k)` of
+    /// the slab gather's `k`-entry tile — and the l stick carries the LANE
+    /// RAMP [`chain_l_stick_ramp`] — word `j` names source stick
+    /// `64·(j mod entries) + l`. Word 0 of each row re-joins the pick
+    /// exactly (`s = word0/k`, `l = word0`): the HOST reference's law, and
+    /// the doors' own first-word reads.
+    ///
+    /// The matrix operand is the lm-head's own weight source (embeddings
+    /// TIED — the admission's fact, checked where the model config lives):
+    /// `[hidden, PAD_V]` row-major with its stated cols WIDENED to the pick's
+    /// pad ([`widen_tied_embed_weight`]'s law), so token `t`'s embedding is
+    /// column `t` — `out[h] = W[h·pad + t]`, a stride-`pad` walk. `hidden` is
+    /// the op's own field, never a shape read: the emitted width is the law.
+    /// `replaces` is STATED METADATA, never an input: the host-bound embed
+    /// rows this gather replaces. A fourth input would fake a read edge on a
+    /// tensor nothing reads anymore (the re-point's own law) and falsify the
+    /// zero-consumers accounting; the stated id is what the resident stamp's
+    /// excuse keys off.
+    ///
+    /// The sentinel law: a broken logits row can answer an index PAST the
+    /// vocab (the pick op's sentinel contract); the l stick then carries the
+    /// SENTINEL RAMP ([`chain_l_sentinel_ramp`] — word 0 the mark `hidden`,
+    /// every word naming a stick in the transposed placement's never-written
+    /// zero tail), and the gather stages a ZERO row rather than read past
+    /// the matrix — the refusal the host readback's `idx > vocab` check
+    /// performed, moved into the op, so an already-broken chat cannot also
+    /// fault the device bus.
+    EmbedRowGather { hidden: u32, replaces: TensorId },
+    /// ⭐ THE PICK STAGED INTO THE CHAIN — the persistent placements' writer:
+    /// `inputs` = `[idx_stick, s_stick, l_stick, s_tab, l_tab]`, where the
+    /// sticks are the persistent SOURCES the mint inserted (the same
+    /// producer-writes/consumer-reads class as `RopeAppend`'s cache inputs —
+    /// placements the device owns after the host seeds them once) and the
+    /// tables are ORDINARY TENSOR OPERANDS staged once at load (the mint
+    /// states them, this node consumes them, the worker stages their bytes
+    /// through the same load-const list every staged table rides). The pick
+    /// `t` rides `idx_stick`'s word 0 per row; the decompose is two u32
+    /// table gathers — `s_tab[t] = t >> 6` clamped past `pad_vocab`,
+    /// `l_tab[t]` the lane ramp at `t & 63` (the sentinel rows past `pad`
+    /// carry the sentinel ramp) — written into the persistent sticks,
+    /// GPU-only (`KvAppend`'s law). The output is a fresh s-value stick
+    /// `[width, CHAIN_IDX_BLOCK]` (every op's output its own): the pattern
+    /// `k·s + (i mod k)` the device's own s-gather writes, so the two ends
+    /// agree on what the node produced.
+    ///
+    /// `pad_vocab` and `table_rows` state the DECOMPOSE'S OWN EXTENT —
+    /// `table_rows = pad_vocab + SAMPLE_SENTINEL_OFFSET + 1`, every
+    /// answerable pick up to the sentinel INCLUSIVE, the sentinel the LAST
+    /// row — the pick's own mint's derivation, never re-derived from
+    /// `pad_vocab` a second time. `k` is the SLAB-GATHER ENTRY COUNT
+    /// ([`chain_slab_entries`]'s answer at this graph's hidden), stated so
+    /// the fill, the doors, and both reference arms read one fact.
+    ChainStage {
+        pad_vocab: u32,
+        table_rows: u32,
+        k: u32,
+    },
 }
+
+/// The token draw's padded row: the vocab rounded up to a power-of-two whole
+/// row, STRICTLY ABOVE the vocab — the descriptor block's own law (the block
+/// must be a power of two) AND the sentinel law's (a power-of-two vocab still
+/// needs pad lanes to land its all-NaN one-hot on, so a vocab that is already
+/// a power of two rounds to the NEXT one up: gemma-4's 262144 pads to
+/// 524288). ONE derivation, read by the host reference, the splice's
+/// constexpr flow, and the load-time table staging, so no two of them can
+/// disagree.
+pub fn sample_pad_vocab(vocab: u32) -> u32 {
+    let pad = vocab.max(1).next_power_of_two();
+    if pad == vocab { pad * 2 } else { pad }
+}
+
+/// The token draw's stick width — the idx stick's own lane count and the
+/// per-lane tables' (`ones`, `sixtyfour`) width. ONE derivation for every
+/// reader: the registry's `[stick]` out-cols class, the splice's `NB`/`BLOCK`
+/// constexprs, the host reference's sentinel arithmetic, and the mint's
+/// output tensor — four sites that must all move together if the stick ever
+/// widens.
+pub const SAMPLE_BLOCK: u32 = 64;
+
+/// The token draw's GROUP width — the number of 64-lane blocks per group in
+/// the two-level ramp. The staged block ramp is PERIODIC with this period
+/// (strictly decreasing within each group, restarting per group), so its lane
+/// values top out at 64 — exact at ANY vocab — while the group ramp above it
+/// tops out at the group count, which the admission gate keeps ≤ 2048 (exact
+/// in the f32 selection). ONE derivation shared by the staged tables, the
+/// admission gate, and the sentinel arithmetic.
+pub const SAMPLE_GROUP_BLOCKS: u32 = 64;
+
+/// The token draw's group count — `pad_vocab` split into
+/// [`SAMPLE_GROUP_BLOCKS`]-block groups. The two-level ramp's outer level and
+/// the group index table's ceiling.
+pub fn sample_groups(pad_vocab: u32) -> u32 {
+    pad_vocab / (SAMPLE_BLOCK * SAMPLE_GROUP_BLOCKS)
+}
+
+/// The token draw's SEED WORD COUNT — the per-row quadruple
+/// `(seed_lo, seed_hi, step, greedy_gate)`, minted as FOUR separate
+/// `[rows, 1]` i32 word tables (each `invt`'s own class: one stick per row,
+/// the word at the stick head, loaded corner-free at `[pid, 0]` — the
+/// int-bcast card leg's measured Col form, and the only spelling the Col
+/// operand mode can address: it reads the stick's word 0 and has no
+/// within-stick offset). ONE derivation for the mint's four word sources,
+/// the kernel's own four `[B, 1]` descriptors (`sample_fwd.py`'s
+/// signature), and the host reference's quadruple read — sites that must
+/// all move together. (The fold's first spelling — one `[rows, 5]` table
+/// read through five `[1, 1]` windows — carried column corners the integer
+/// door refuses by name; the auditor's wall-4 ruling (a) re-spelled it as
+/// corner-free tables. ⭐ THE ROW WORD IS GONE FOR GOOD — auditor ruling
+/// 2026-10-27, the P3 localization: the first spelling keyed the hash on
+/// the quintuple's fifth word, the LAUNCH row index, so a concurrent
+/// request's noise depended on the slot it happened to land in and could
+/// never equal its own solo text. The key is request-owned alone — the
+/// seed and the request's own step count.)
+pub const SAMPLE_SEED_WORDS: u32 = 4;
 
 // ── Nodes & graph ──────────────────────────────────────────────────
 
@@ -1400,6 +1586,1165 @@ impl<F: RopeForm> SubtileIR<F> {
     /// construction (the const generic guarantees it).
     pub const fn rope_form(&self) -> RopeFormTag {
         F::TAG
+    }
+}
+
+// ── The token draw's mint (see `kernels/sample_fwd.py`) ───────────
+
+/// What [`mint_sample`] inserted, for the caller's bake log and the wiring.
+#[derive(Clone, Copy, Debug)]
+pub struct SampleMint {
+    /// The EMITTED vocab — the result row's own width, the sentinel threshold
+    /// the consumer refuses past. Never the model config's word for it.
+    pub vocab: u32,
+    /// `sample_pad_vocab(vocab)` — the width the result row was widened to
+    /// and the whole-row tables share.
+    pub pad_vocab: u32,
+    /// The row count the rung serves — the node's grid width and every
+    /// per-row operand's row count. The rung's OWN rows, read off its result
+    /// tensor: the solo m=1 rung mints at 1, every batched rung at its own
+    /// width.
+    pub rows: u32,
+    /// The minted SEED WORD sources' tids — the FOUR `[rows, 1]` i32 per-row
+    /// word tables of the quadruple `(seed_lo, seed_hi, step, greedy_gate)`,
+    /// in that order, each `invt`'s own class (one stick per row, the
+    /// word at the stick head) and staged EVERY STEP by the worker (the
+    /// noise itself is computed on the card from them). The wiring names them
+    /// to the worker through the mint's facts; they are never load-time
+    /// consts.
+    pub seed_words: [TensorId; SAMPLE_SEED_WORDS as usize],
+    /// The minted INVT source's tid — the `[rows, 1]` f32 temperature
+    /// reciprocals, staged every step with the seed words.
+    pub invt: TensorId,
+}
+
+/// The rows the suffix's lm-head computes — the FOLD LAW the splice already
+/// states (`is_prefill_lm_head_tail`), handed to the mint by the caller and
+/// never re-derived here. A DECODE graph computes every result row (the solo
+/// rung's one, a batch rung's one per request); a PREFILL graph's lm-head tail
+/// is FOLDED to one row (the emitter re-lowers the matmul at m=1 over the last
+/// prompt row, `lower_prefill_lm_head_fold`), so the draw serves that one row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SampleRows {
+    /// Every result row is computed and drawn — the decode rungs.
+    All,
+    /// The folded lm-head row alone — the prefill rungs. The Sample node reads
+    /// the region the fold writes (the tail matmul's own one-row output region,
+    /// the same `one_row` law the emitter's re-lowering keeps), and the seat,
+    /// the idx stick and every per-row operand sit at rows = 1 — the proven
+    /// solo-decode shape.
+    Folded,
+}
+
+/// Append the token draw to a graph — every rung's own row count, the solo m=1
+/// decode rung, every batched rung, and every prefill rung alike: five per-row
+/// per-step staged sources (the seed quadruple's four `[rows, 1]` i32 word
+/// tables, invt), twenty staged-table sources, the result tail chain's
+/// tensors widened to `[rows, PAD_V]`, the `Sample` node
+/// reading the widened block (every row on a decode rung; the folded row alone
+/// on a prefill rung — [`SampleRows`]), and the graph's RESULT re-pointed to
+/// the node's idx stick. Pure graph surgery — the GATE (which rungs mint, and
+/// which rows their suffix computes) is the caller's fact; this fn states only
+/// its own invariants and panics on their violation, which at expansion time
+/// is a build error, never a runtime one.
+///
+/// ⭐ THE ANSWER RE-POINT: `result` names the idx stick, so every seat keyed
+/// on the result — the wiring's `result` tid, the placement pass's
+/// `SegRole::Logits` classification, the worker's readback — addresses the
+/// picked tokens, and the dtype the kernel's own signature states for that
+/// output (`i32`) rides the wiring as the fact that tells the consumer to
+/// read it RAW instead of through the f16 convert. The ROW is NOT deleted:
+/// it stays exactly where the mint put it, a placed op output readable by
+/// tid — the re-point is the draw's redirect of the ANSWER, never a removal
+/// of the row it was drawn from (the test oracle's logits readback is that
+/// row's own reader, and it is why the row must survive the mint).
+///
+/// ⭐ THE TWENTY-FIVE SOURCES ARE INSERTED AT `[num_sources,
+/// num_sources+25)`, NOT APPENDED: sources must hold
+/// `tensors[0..num_sources]`, so the insert renumbers every op-output
+/// `TensorId` up by twenty-five — nodes' input/output regions, `op_output`,
+/// and `result` (validate demands the result is an op output, so it always
+/// moves). Source ids below the old `num_sources` are UNTOUCHED, which is
+/// what keeps the caller's `weight_ids` and the wiring's binding scan valid
+/// against the minted graph. The twenty tables carry NO `SourceBinding` and
+/// stage at LOAD through the wiring's `load_consts` (the rope tables' law);
+/// the four seed word tables and invt carry none either but stage EVERY STEP
+/// through the worker's sampler seat (the mint's facts name their tids) —
+/// they are minted below the `LoweredDecode` layer like the tables (the
+/// `embed_src` law: the answer, not the data to compute it from).
+///
+/// ⭐ THE WHOLE TAIL CHAIN IS WIDENED, NOT THE RESULT ALONE: the tail's
+/// writers are column-CHUNKED at production `nb` (granite's vocab 49155 is
+/// seven chunks), and a chunked pointwise node's window law demands every
+/// operand's TENSOR hold the same width — widening only the result made the
+/// epilogue's chunks disagree (output a PAD_V-wide storage, input a
+/// vocab-wide one) and the splice refused the node. The walk is the
+/// admission's own tail walk (single-input `ScalarMul`/`TanhSoftCap`
+/// epilogues back to the lm-head `MatmulTile`; anything else panics — the
+/// admission gate already refused it, so the mint was called outside its
+/// gate). Every writer keeps its own region — `[0, vocab)` exactly as before
+/// — so the pad tail `[vocab, PAD_V)` is written by no node below, and no
+/// staging covers it either: the pad law rides the OFFSET row (a staged
+/// table), which the kernel adds to the score LAST, after its two roundings,
+/// so the tail's raw bytes (the lm-head's zero-pad 0.0 columns) never reach a
+/// max.
+///
+/// ⭐ THE WIDENING IS THIS RUNG'S OWN: every decode rung mints at its own row
+/// count (the solo rung at 1, a batched rung at its baked width), so each
+/// graph (and its bundle's seg4) carries its own padded block — the mint
+/// reads the row count off the result tensor and never assumes one. A prefill
+/// rung mints at the FOLDED row's 1 whatever its `mq` (the suffix computes one
+/// logits row; a draw at `mq` would read rows nobody wrote and break the
+/// kernel's grid law).
+pub fn mint_sample<F: RopeForm>(graph: &mut SubtileIR<F>, suffix: SampleRows) -> SampleMint {
+    let result_rows = graph.tensors[graph.result.index()].rows;
+    let vocab = graph.tensors[graph.result.index()].cols;
+    let pad_vocab = sample_pad_vocab(vocab);
+    let rows = match suffix {
+        SampleRows::All => result_rows,
+        SampleRows::Folded => 1,
+    };
+    assert!(
+        rows >= 1,
+        "the sampler serves at least one row; this graph's result tensor has {result_rows} rows"
+    );
+    // The twenty-five staged sources, in the kernel's operand order after the
+    // row: the per-row per-step word tables first (the seed quadruple's FOUR
+    // `[rows, 1]` i32 tables and the temperature reciprocals), then the
+    // twenty load-time tables — the two decreasing ramps and the two
+    // increasing index tables (whole-row `[1, PAD_V]`, shared by every row),
+    // the two per-lane widen tables (`[1, BLOCK]`), the pad law's offset row,
+    // the two-level ramp's group pair, then the noise section's own eleven:
+    // the four i32 hash/fold constants, the fold's five f32 constants and
+    // the fp16 island's clamp — ⭐ TEN `[rows, 1]` TABLES, the SEED WORDS'
+    // OWN CLASS (the auditor's 2026-10-27 ruling): the same word at every
+    // row's stick head, baked by the bake at the rung's own rows, so the
+    // worker writes nothing for them and the consuming ops read them through
+    // the broadcast operand modes at every band height — never whole-row
+    // splats (the wall-5 measured law: ten `[1, PAD_V]` splats are PAD_V·4 B
+    // each of local store for one repeated word, 2.5 MiB against the 2 MiB
+    // LX) — and the lane table, the one GENUINELY per-lane fact of the
+    // eleven, whole-row. The array's LENGTH is the single derivation of
+    // the renumber shift below.
+    let tables = [
+        // The seed quadruple's four word tables — each `[rows, 1]` i32,
+        // invt's own class, staged EVERY STEP by the worker (one stick per
+        // row, the word at the stick head; the auditor's wall-4 ruling (a)).
+        // ⭐ NO ROW WORD (auditor ruling 2026-10-27, the P3 localization):
+        // the hash key is request-owned alone — the seed and the request's
+        // own step count — never the baked row the request lands in.
+        TensorShape { rows, cols: 1 },
+        TensorShape { rows, cols: 1 },
+        TensorShape { rows, cols: 1 },
+        TensorShape { rows, cols: 1 },
+        // invt — [rows, 1] f32, staged every step with the seed words.
+        TensorShape { rows, cols: 1 },
+        // bramp, lramp — the periodic decreasing ramps.
+        TensorShape {
+            rows: 1,
+            cols: pad_vocab,
+        },
+        TensorShape {
+            rows: 1,
+            cols: pad_vocab,
+        },
+        // binc, linc — the periodic increasing index tables.
+        TensorShape {
+            rows: 1,
+            cols: pad_vocab,
+        },
+        TensorShape {
+            rows: 1,
+            cols: pad_vocab,
+        },
+        // ones, sixtyfour — the [1, BLOCK] widen tables.
+        TensorShape {
+            rows: 1,
+            cols: SAMPLE_BLOCK,
+        },
+        TensorShape {
+            rows: 1,
+            cols: SAMPLE_BLOCK,
+        },
+        // padoff — the pad law's offset row.
+        TensorShape {
+            rows: 1,
+            cols: pad_vocab,
+        },
+        // gramp, ginc — the two-level ramp's group pair.
+        TensorShape {
+            rows: 1,
+            cols: pad_vocab,
+        },
+        TensorShape {
+            rows: 1,
+            cols: pad_vocab,
+        },
+        // hc1, hc2, hc3, c256 — the i32 hash and wrap-fold constants,
+        // `[rows, 1]`: the same word at every row's stick head, the seed
+        // words' own class (baked by the bake at the rung's rows; the worker
+        // writes nothing for them), broadcast by their consuming ops.
+        TensorShape { rows, cols: 1 },
+        TensorShape { rows, cols: 1 },
+        TensorShape { rows, cols: 1 },
+        TensorShape { rows, cols: 1 },
+        // lane — the per-lane index row, staged f32 (the fptosi exit reads
+        // it as an integer-valued f32).
+        TensorShape {
+            rows: 1,
+            cols: pad_vocab,
+        },
+        // fm8, ftop, fzero, fhalf, fm22 — the fold's f32 constants,
+        // `[rows, 1]` (the seeds' own class, broadcast operands).
+        TensorShape { rows, cols: 1 },
+        TensorShape { rows, cols: 1 },
+        TensorShape { rows, cols: 1 },
+        TensorShape { rows, cols: 1 },
+        TensorShape { rows, cols: 1 },
+        // cmin — the fp16 island's clamp (2^-14, the smallest normal),
+        // `[rows, 1]`: the `maximum`'s broadcast operand, the seeds' own
+        // class.
+        TensorShape { rows, cols: 1 },
+    ];
+    let shift = tables.len() as u32;
+    let n_src = graph.num_sources;
+    // 1) Renumber every op-output tid up by `shift`, so the insert below
+    //    leaves sources at [0, num_sources+shift) and op outputs above them.
+    let bump = |tr: &mut TensorRegion| {
+        if tr.tensor.0 >= n_src {
+            tr.tensor.0 += shift;
+        }
+    };
+    for node in &mut graph.nodes {
+        for inp in &mut node.inputs {
+            bump(inp);
+        }
+        bump(&mut node.output);
+    }
+    for t in &mut graph.op_output {
+        if t.0 >= n_src {
+            t.0 += shift;
+        }
+    }
+    if graph.result.0 >= n_src {
+        graph.result.0 += shift;
+    }
+    // 2) Insert the twenty-five sources and widen the RESULT TAIL CHAIN to
+    //    the padded width — the whole chain, per the mint's own law above. The
+    //    ROWS are untouched: the rung keeps its own row count.
+    graph.tensors.splice(n_src as usize..n_src as usize, tables);
+    graph.num_sources += shift;
+    let seed_words: [TensorId; SAMPLE_SEED_WORDS as usize] =
+        core::array::from_fn(|k| TensorId(n_src + k as u32));
+    let invt = TensorId(n_src + SAMPLE_SEED_WORDS);
+    let mut t = graph.result;
+    // Widen the RESULT TAIL CHAIN to the padded width — the whole chain, per
+    // the mint's own law above. The ROWS are untouched: the rung keeps its own
+    // row count, and the fold (the emitter's own `lower_prefill_lm_head_fold`)
+    // is the one that states the one-row tail on a prefill rung.
+    loop {
+        graph.tensors[t.index()].cols = pad_vocab;
+        let node = graph
+            .nodes
+            .iter()
+            .find(|n| n.output.tensor == t)
+            .expect("the result tail's writer");
+        match &node.op {
+            SubOp::ScalarMul { .. } | SubOp::TanhSoftCap { .. } if node.inputs.len() == 1 => {
+                t = node.inputs[0].tensor;
+            }
+            SubOp::MatmulTile { .. } => break,
+            other => panic!(
+                "the device sampling mint walked a {other:?} result tail — the admission \
+                 gate (an arity-2 Dense lm-head under single-input ScalarMul/TanhSoftCap) \
+                 refuses this graph, so the mint was called outside it"
+            ),
+        }
+    }
+    // 3) The idx stick's op-output tensor, then the node reading the whole
+    //    widened block, the per-row word tables, and the twenty tables.
+    let idx = TensorId(graph.tensors.len() as u32);
+    graph.tensors.push(TensorShape {
+        rows,
+        cols: SAMPLE_BLOCK,
+    });
+    let whole = |t: TensorId| TensorRegion {
+        tensor: t,
+        region: Region {
+            rows: Range::new(0, graph.tensors[t.index()].rows),
+            cols: Range::new(0, graph.tensors[t.index()].cols),
+        },
+    };
+    let mut inputs = Vec::with_capacity(26);
+    // The logits the draw reads: the whole result block on an All graph, and
+    // the ONE row the folded tail writes on a Folded graph — row 0, the row
+    // `lower_prefill_lm_head_fold`'s m=1 matmul writes (the result tensor's
+    // DECLARED shape stays [mq, vocab]; only this region states the fold).
+    inputs.push(match suffix {
+        SampleRows::All => whole(graph.result),
+        SampleRows::Folded => TensorRegion {
+            tensor: graph.result,
+            region: Region {
+                rows: Range::new(0, 1),
+                cols: Range::new(0, pad_vocab),
+            },
+        },
+    });
+    for s in n_src..graph.num_sources {
+        inputs.push(whole(TensorId(s)));
+    }
+    graph.nodes.push(SubtileNode {
+        id: SubtileId(graph.nodes.len() as u32),
+        op: SubOp::Sample { vocab, rows },
+        inputs,
+        output: whole(idx),
+    });
+    // 4) The answer re-point: the rung's result IS the stick. validate
+    //    demands the result is an op output — the Sample node's output
+    //    qualifies, and the row keeps its own placement and its own readers
+    //    either way.
+    graph.result = idx;
+    SampleMint {
+        vocab,
+        pad_vocab,
+        rows,
+        seed_words,
+        invt,
+    }
+}
+
+// ── The chained head's laws (the constants every reader shares) ─────
+
+/// The chained head's index-stick width — the SENUINT32 stick (32 four-byte
+/// lanes), the format a gather's INDEX tensor carries on the spyre device.
+/// The pick's own stick is [`SAMPLE_BLOCK`] (64 i32 lanes, the pick
+/// producer's output); the s/l sticks the chain reads are this NARROWER
+/// class because a staged table's gathered destination must be exactly one
+/// stick of its format (the one-stick law) and a u32 stick is 32 lanes.
+/// ONE derivation for every reader: the registry's `[ustick]` out-cols
+/// class, the mint's persistent sources and fresh output, and the host
+/// reference's stick width.
+pub const CHAIN_IDX_BLOCK: u32 = 32;
+
+// ⭐ THE PICK'S OWN LAWS ARE THE SAMPLER'S, NEVER A SECOND COPY: the pad
+// ([`sample_pad_vocab`]), the stick ([`SAMPLE_BLOCK`]), the group split
+// ([`sample_groups`]) and the sentinel arithmetic all live with the token
+// draw (Front A's card-proven op), and every chain reader points there. The
+// #603 tip carried `argmax_*` twins of these facts; they are deleted — two
+// copies of one fact WILL drift, and the sentinel arithmetic was checked
+// identical before the swap (the offset from the pad is
+// `SAMPLE_GROUP_BLOCKS * SAMPLE_BLOCK + SAMPLE_BLOCK` in both laws).
+
+/// The sampler's sentinel OFFSET from the padded row — the distance from
+/// `PAD_V` to the all-NaN row's answer `PAD_V + G·4096 + 4160`: the staged
+/// tables' `ginc`/`binc`/`linc` combine, `SAMPLE_GROUP_BLOCKS · SAMPLE_BLOCK +
+/// SAMPLE_BLOCK` = 4160. The sampler's own sentinel law (the host
+/// reference's `None` arm) stated as the offset the chain's table range
+/// reads — ONE derivation, no argmax twin.
+pub const SAMPLE_SENTINEL_OFFSET: u32 = SAMPLE_GROUP_BLOCKS * SAMPLE_BLOCK + SAMPLE_BLOCK;
+
+/// The chained slab's fp16 stick width — the `[hidden, 64]` slab's one-stick
+/// sub-rows. COINCIDENT with [`SAMPLE_BLOCK`] (both 64) but a DIFFERENT fact:
+/// this one is the fp16 elems-per-stick of the chained row's value operand on
+/// the spyre device, that one is the pick's idx-stick lane count. Stated
+/// separately so neither reader silently borrows the other's law.
+pub const CHAIN_SLAB_STICK_ELEMS: u32 = 64;
+
+/// The vendor dxp scheduler's per-core LX budget for one op —
+/// `floor((2 MiB − 64 KiB) × 0.2)`: the fraction `reserveFrontendLx` leaves
+/// for the scheduler to allocate ops into (the fence itself is the 0.8 carve
+/// from address 0; ProgramLayout.cpp:81-100). SPELLED HERE because this crate
+/// cannot see ktir-superdsc (the leaf-crate law: a third-party KTIR producer
+/// consumes the lowering without pulling scratchy in) while the mint and both
+/// reference arms — unconditional code in THIS crate — need the law. The same
+/// number lives beside its receipts as `VENDOR_LX_SCHED_BYTES` in
+/// ktir-superdsc's `superdsc_opspec.rs`; scratchy-target-spyre cross-pins the
+/// pair so a drift in either crate is a cargo-build failure.
+pub const CHAIN_SLAB_LX_BUDGET: u64 = 406_323;
+
+/// ⭐⭐⭐⭐⭐ THE CHAINED HEAD'S SLAB-GATHER ENTRY COUNT (#603) — how many
+/// entries leg 1 of the embed-row-gather door (ktir-superdsc's
+/// `embed_row_gather`, cited not linked — the leaf crate cannot see back
+/// here) splits the `[hidden, CHAIN_SLAB_STICK_ELEMS]` slab into. ONE
+/// SPELLING, called at three sites — the mint (which states it into the
+/// node), the EmbedRowGather reference arm (which re-joins `s = word0/k`),
+/// and the spyre emitter — and one spelling called on the same `hidden`
+/// always answers the same k.
+///
+/// THE LAW: the vendor scheduler charges a gathered op `4 × one entry's
+/// bytes` per core (allocAllMem: 2 buffers × value + 2 × output,
+/// L3DlOpsScheduler.cpp), and one entry is `hidden/K` positions × one fp16
+/// stick ([`CHAIN_SLAB_STICK_ELEMS`] elems × 2 B), so the per-core charge is
+/// `512 · (hidden/K)` B. K is the SMALLEST divisor of `hidden` with that
+/// charge ≤ [`CHAIN_SLAB_LX_BUDGET`] and `K ≤` [`CHAIN_IDX_BLOCK`] — the u32
+/// index stick's width, which is BOTH the lane pattern's home stick and the
+/// IBR entry ceiling (`CopyDims::ENTRIES_PER_OP`, the same 32 one layer up in
+/// ktir-superdsc; cross-pinned from scratchy-target-spyre). Smallest K ⇒
+/// largest page ⇒ the least core spread that fits. `K = 1` whenever
+/// `512 · hidden` itself fits (every hidden ≤ 793): the whole slab is ONE
+/// entry — today's geometry, and the fill's lane pattern degenerates to
+/// today's splat byte-for-byte (`i mod 1 = 0`). granite-3.1-2b (hidden 2048):
+/// K=1 charges 1,048,576 B and K=2 524,288 B — both over — K=4 charges
+/// 262,144 B ⇒ **K=4, page 512**: the pod-measured refusal this law answers
+/// (`Expect valid chunk size that fits in LX`, the class-0 body bundle's slab
+/// gather pinned at one plane-sized entry, 2026-10-25).
+///
+/// ⛔ A MISS IS LOUD, NEVER A CLAMP: an `hidden` whose divisor window is
+/// empty — no K ≤ [`CHAIN_IDX_BLOCK`] with `512·(hidden/K) ≤ CHAIN_SLAB_LX_BUDGET`
+/// — panics here, naming both ceilings and the divisor window; the offending
+/// `hidden`'s value is named by the CALLER'S context (the mint's own assert
+/// names the graph's hidden), because a const panic cannot format (E0015).
+/// The door's raw entries refusal stays as the backstop for a hand-minted
+/// program that bypasses this law.
+///
+/// ⛔ NO 64-MULTIPLE PAGE LAW: the door's `PageExtent::of_positions` takes
+/// any count, the row-gather leg already declares page 32 card-proven, and an
+/// entry is `page` WHOLE sticks for every `page` — the only constraints are
+/// the two ceilings above.
+pub const fn chain_slab_entries(hidden: u64) -> u64 {
+    assert!(
+        hidden > 0,
+        "chain_slab_entries: hidden is 0 — no slab to split"
+    );
+    // The per-core LX charge per entry POSITION: 4 buffers (allocAllMem:
+    // 2 × value + 2 × output) × one fp16 stick's bytes.
+    const CHARGE_PER_POSITION: u64 = 4 * 2 * CHAIN_SLAB_STICK_ELEMS as u64;
+    let mut k = 1u64;
+    while k <= CHAIN_IDX_BLOCK as u64 {
+        if hidden.is_multiple_of(k) && CHARGE_PER_POSITION * (hidden / k) <= CHAIN_SLAB_LX_BUDGET {
+            return k;
+        }
+        k += 1;
+    }
+    panic!(
+        "chain_slab_entries: this hidden has no divisor K <= 32 (CHAIN_IDX_BLOCK, the \
+         index stick's width) with 512*(hidden/K) <= 406,323 B (the vendor LX \
+         scheduler budget) — the per-core LX charge of the chained head's slab \
+         gather cannot fit at any admissible entry count; a build-time refusal, \
+         never a clamp"
+    );
+}
+
+// THE LAW'S PINS — compile-time first (a regression fails this crate's build
+// before any test runs; the types-not-comments law), the named tests below
+// riding the `chain` filter the cell already runs.
+const _: () = assert!(
+    chain_slab_entries(2048) == 4,
+    "granite-3.1-2b's hidden 2048: K=4, page 512 — the pod-measured LX refusal's answer"
+);
+const _: () = assert!(
+    chain_slab_entries(2) == 1,
+    "hidden 2 — the mint test's own toy — is one entry"
+);
+const _: () = assert!(
+    chain_slab_entries(128) == 1,
+    "the door tests' toy hidden 128 is one entry"
+);
+const _: () = assert!(
+    chain_slab_entries(793) == 1 && chain_slab_entries(794) == 2,
+    "the budget's boundary: 512*793 = 406,016 fits, 512*794 = 406,528 does not"
+);
+
+/// ⭐ THE S-STICK SEED'S LANE PATTERN — the one spelling of the chain's s-seed
+/// law, shared by BOTH host halves that push it (the card path's `ChainSeed`
+/// steps in scratchy-target-spyre's forward_tape and the worker's dynamic
+/// s-source push in scratchy-serving-worker): lane `i` of the stick carries
+/// `k·s + (i mod k)` — ENTRY `k·s + (i mod k)` of the slab gather's `k`-entry
+/// tile, the flat-address law's own addressing (the extra lanes repeat the
+/// first `k`, so whatever word discipline the IBR takes stays inside the
+/// picked slab). The device's own ChainStage writes the same pattern for the
+/// same pick, which is what keeps a host seed idempotent with the device's
+/// writes at every `k`.
+///
+/// At `k = 1` the pattern IS the splat (`i mod 1 = 0`): the degenerate's seed
+/// is today's one-word splat byte-for-byte — the k = 1 seed test pins that
+/// leg, the k > 1 patterned-seed test the other, both through this one
+/// spelling.
+///
+/// `k ≥ 1` is the mint's stated law (asserted at the mint, guarded at the
+/// `chain_staged_tables` fill in scratchy-target-spyre); a `k` of `0` panics
+/// the remainder here — loudly, never silently.
+pub fn chain_s_stick_pattern(k: u32, s: u32, lanes: usize) -> Vec<u32> {
+    (0..lanes).map(|i| k * s + (i as u32 % k)).collect()
+}
+
+/// ⭐⭐⭐⭐⭐ THE L INDEX'S OWN STICK COUNT — how many `[CHAIN_IDX_BLOCK]`-lane
+/// sticks the chained head's lane index carries. The row gather runs
+/// `entries = hidden/STICK_ELEMS` one-stick entries, and the IBR is loaded
+/// ONE [`CHAIN_IDX_BLOCK`]-word stick at a time with each core's read offset
+/// taken modulo that stick — so the pass is ONE OP PER INDEX STICK, the KV
+/// fold's own cut (`GatherScratch::copies`, the rung-8 remedy), and the l
+/// index must carry every entry: `ceil(entries / CHAIN_IDX_BLOCK)` sticks.
+///
+/// ⭐ A GEOMETRY COUNT, IN `div_ceil` AT BOTH LEVELS — a partial stick still
+/// occupies a stick of placement (the toy graphs the mint's surgery tests
+/// ride at sub-stick hiddens), so the count is `ceil(hidden/STICK_ELEMS)`
+/// entries over `ceil(·/CHAIN_IDX_BLOCK)` sticks. The ALIGNMENT law — hidden
+/// a whole number of fp16 sticks — is the RAMP'S and the SPYRE DOOR'S own
+/// ([`chain_l_stick_ramp`] refuses a sub-stick hidden; the door's transpose
+/// leg requires both extents stick-aligned), never this count's: at every
+/// width those laws admit (every real model's hidden), the two spellings of
+/// the entry count agree.
+///
+/// This is the count the MINT states as the l stick's row width and the l
+/// table's row width in sticks, the STAGED FILL derives for the l-tab's
+/// shape, both HOST SEEDS inherit through the self-sized ramp, and the DOORS
+/// read off the operands they are handed — one spelling, cross-pinned by the
+/// ramp's length. At every hidden ≤ 2048 it is 1: the whole law degenerates
+/// to today's single-stick index byte-for-byte.
+pub const fn chain_l_sticks(hidden: u32) -> u32 {
+    assert!(
+        hidden > 0,
+        "chain_l_sticks: hidden is zero — no row to name"
+    );
+    hidden
+        .div_ceil(CHAIN_SLAB_STICK_ELEMS)
+        .div_ceil(CHAIN_IDX_BLOCK)
+}
+
+// THE LAW'S PINS — compile-time first (a regression fails this crate's build
+// before any test runs; the types-not-comments law), the named tests below
+// riding the `chain` filter the cell already runs.
+const _: () = assert!(
+    chain_l_sticks(128) == 1 && chain_l_sticks(2048) == 1,
+    "every admitted hidden ≤ 2048 is ONE l stick — the degenerate the cut \
+     must keep byte-identical"
+);
+const _: () = assert!(
+    chain_l_sticks(4096) == 2,
+    "granite-3.1-8b's hidden 4096: 64 entries, TWO l index sticks — the \
+     per-stick cut the 8b build wall's fix rides"
+);
+const _: () = assert!(
+    chain_l_sticks(4160) == 3,
+    "a partial last stick is lawful: hidden 4160 is 65 entries over 3 sticks, \
+     the last op running one entry"
+);
+
+/// ⭐ THE L-STICK SEED'S LANE RAMP — the one spelling of the chain's l-seed
+/// law, shared by BOTH host halves that push it (the card path's `ChainSeed`
+/// steps in scratchy-target-spyre's forward_tape and the worker's dynamic
+/// l-source push in scratchy-serving-worker) AND the l-tab's fill: word `j`
+/// of the index carries `STICK_ELEMS·(j mod entries) + l` — the SOURCE STICK
+/// NUMBER of the transposed slab's row `l`, entry `j mod entries` of the row
+/// gather's `entries`-entry tile. The restickify transpose writes the
+/// transposed row's elements at sticks `{STICK_ELEMS·j + l}` — scattered at a
+/// 64-stick stride, the door's own slab-major output law — so the row
+/// gather's entry `j` must read exactly stick `STICK_ELEMS·j + l`; a flat
+/// `j` (the old splat's read) lands on a patch of raw weight bytes instead,
+/// the defect this law closes. Word 0 is `l` itself, so the reference's
+/// re-join (`l = word0`) is unchanged. The modulus is the gather's ENTRY
+/// COUNT `entries = hidden / STICK_ELEMS` — the s-pattern's own idiom: the
+/// extra lanes past the entry count repeat the row's first entries, so
+/// whatever word discipline the IBR takes stays inside the picked row.
+///
+/// ⭐ SELF-SIZED at [`chain_l_sticks`]'s own count — the ramp fills the WHOLE
+/// l index (every stick the per-stick cut walks), so its length IS the
+/// placement's word count and the two cannot drift. At `entries` past one
+/// stick (hidden > 2048) the words past the first stick continue the same
+/// law — the wrap engages only on the final stick's pad lanes, never between
+/// the ops of the cut.
+///
+/// ⛔ A MISS IS LOUD, NEVER A CLAMP: `hidden` must be a whole number of
+/// [`CHAIN_SLAB_STICK_ELEMS`]-elem sticks — a partial stick has no stick
+/// indices to name, and the ramp refuses it here rather than floor-divide
+/// its way to a silent wrong row.
+pub fn chain_l_stick_ramp(l: u32, hidden: u32) -> Vec<u32> {
+    assert!(
+        hidden > 0 && hidden.is_multiple_of(CHAIN_SLAB_STICK_ELEMS),
+        "chain_l_stick_ramp: hidden {hidden} is not a whole number of \
+         {}-elem sticks — the transposed row's stick indices are undefined",
+        CHAIN_SLAB_STICK_ELEMS
+    );
+    let entries = hidden / CHAIN_SLAB_STICK_ELEMS;
+    let words = chain_l_sticks(hidden) as usize * CHAIN_IDX_BLOCK as usize;
+    (0..words)
+        .map(|j| CHAIN_SLAB_STICK_ELEMS * (j as u32 % entries) + l)
+        .collect()
+}
+
+/// ⭐ THE L-STICK'S SENTINEL ROW — the zero-tail ramp the l-tab's sentinel
+/// rows (every `t ≥ PAD_V`) carry and NOTHING else: word `j` names tail
+/// stick `hidden + (j mod entries)` — the transposed placement's UNWRITTEN
+/// sticks past the real transpose. The real transpose tops out at stick
+/// `hidden − 1` (element `(out, y)` at stick `64·⌊y/64⌋ + out` with
+/// `out < 64`, `y < hidden`), and the `[STICK_ELEMS + 1, hidden]` placement
+/// reserves `hidden + entries` sticks — so the tail `[hidden, hidden +
+/// entries)` is exactly the sentinel's lanes, all zeros, the same bytes the
+/// old flat read reached. The `mod entries` wrap is the whole safety law at
+/// multi-stick widths: the l index carries `l_sticks·32` words but only
+/// `entries` sticks of tail exist, so the words past `entries` RE-BIND to
+/// the tail's own sticks — every read any op of the cut takes lands in the
+/// natural zero tail, in bounds at every width, never in the next tensor's
+/// bytes (the #717 class the shared-stick alternative could not avoid).
+/// Word 0 is `hidden`, the sentinel MARK the reference's re-join refuses on
+/// (a real ramp's word 0 is a lane, and `l ≤ 63 < 64 ≤ hidden` at every
+/// lawful hidden, so the mark is unambiguous). The seeds never push this
+/// stick — the host seeds real picks; the sentinel arises only when the
+/// device's own pick answers past the vocab and the stage gathers the
+/// table's sentinel row.
+///
+/// ⭐ SELF-SIZED at [`chain_l_sticks`]'s own count, same as the real ramp —
+/// the two fills share one word count and cannot drift.
+pub fn chain_l_sentinel_ramp(hidden: u32) -> Vec<u32> {
+    assert!(
+        hidden > 0 && hidden.is_multiple_of(CHAIN_SLAB_STICK_ELEMS),
+        "chain_l_sentinel_ramp: hidden {hidden} is not a whole number of \
+         {}-elem sticks — the zero tail has no stick indices to name",
+        CHAIN_SLAB_STICK_ELEMS
+    );
+    let entries = hidden / CHAIN_SLAB_STICK_ELEMS;
+    let words = chain_l_sticks(hidden) as usize * CHAIN_IDX_BLOCK as usize;
+    (0..words).map(|j| hidden + j as u32 % entries).collect()
+}
+
+// ── The seeds at the launch's own width (the ONE per-row spelling) ──
+
+/// ⭐⭐⭐ THE S SEED AT THE LAUNCH'S OWN WIDTH — `[rows, CHAIN_IDX_BLOCK]` u32 words,
+/// row `r` carrying ITS OWN token's pattern (`chain_s_stick_pattern` of
+/// `toks[r.min(n-1)] >> 6`): the seed a batched decode's every row gathers with,
+/// and the same bytes the device's own [`ChainStage`]-table gathers write for the
+/// same picks — which is what keeps a host seed idempotent with the device's
+/// writes at every width.
+///
+/// ⛔ THE CLAMP IS THE PAD-ROW LAW, not a convenience: the seed's rows are the
+/// LAUNCH's rows (`rows`, the baked rung width) while `toks` names the REAL rows
+/// (`n ≤ rows`), and a pad row repeats the last real token's decompose — the same
+/// law the embedding staging and `ChunkRows::row_logical_pos` pin, so the sticks
+/// and the rows they feed cannot disagree at a pad row.
+///
+/// At `rows == 1` this is the solo spelling byte-for-byte (one stick, the one
+/// token's pattern) — the degenerate every W=1 rung rode before the batched rung
+/// existed, kept exact by construction rather than by a width branch.
+pub fn chain_s_seed(k: u32, toks: &[u32], rows: usize) -> Vec<u32> {
+    assert!(
+        !toks.is_empty(),
+        "chain_s_seed: no token to seed from — a chain with no token names no slab"
+    );
+    let lanes = CHAIN_IDX_BLOCK as usize;
+    let last = toks.len() - 1;
+    (0..rows)
+        .flat_map(|r| chain_s_stick_pattern(k, toks[r.min(last)] >> 6, lanes))
+        .collect()
+}
+
+/// ⭐⭐⭐ THE L SEED AT THE LAUNCH'S OWN WIDTH — `[rows·l_sticks, CHAIN_IDX_BLOCK]`
+/// u32 words, row `r`'s `l_sticks` ramp sticks (`chain_l_stick_ramp` of
+/// `toks[r.min(n-1)] & 63`) then row `r+1`'s — the placement shape the mint
+/// states and the row gather's per-stick cut walks.
+///
+/// The clamp is the pad-row law [`chain_s_seed`] states; at `rows == 1` this is
+/// the solo spelling byte-for-byte.
+pub fn chain_l_seed(toks: &[u32], hidden: u32, rows: usize) -> Vec<u32> {
+    assert!(
+        !toks.is_empty(),
+        "chain_l_seed: no token to seed from — a chain with no token names no lane"
+    );
+    let last = toks.len() - 1;
+    (0..rows)
+        .flat_map(|r| chain_l_stick_ramp(toks[r.min(last)] & 63, hidden))
+        .collect()
+}
+
+// ── The tied embed weight's pad widening (the chained head's extent law) ──
+
+/// What [`widen_tied_embed_weight`] stated, for the caller's bake log.
+#[derive(Clone, Copy, Debug)]
+pub struct TiedEmbedWiden {
+    /// The widened weight's SOURCE id — the lm-head matmul's `inputs[1]`,
+    /// the tied embedding matrix.
+    pub weight: TensorId,
+    /// The weight's REAL column count — the vocab the walk read off the
+    /// tensor before widening. The number the bake log reports; never the
+    /// widened cols.
+    pub vocab: u32,
+    /// The widened column count — `sample_pad_vocab(vocab)`, the one width
+    /// the whole chain states.
+    pub pad_vocab: u32,
+}
+
+/// Widen the tied embed weight's STATED columns to the pick's pad — the
+/// extent law the chained head's gather addresses. ⭐ ONE WIDTH: the
+/// decompose tables, the sentinel's reserved row, the `s`-clamp's boundary,
+/// and (after this pass) the weight's stated columns are ALL `pad_vocab` —
+/// the clamp boundary IS the weight boundary by construction, so every
+/// answerable pick's slab gather is in extent because the unsafe window is
+/// UNWRITABLE, not because a derivation spanning three crates says it is
+/// unreachable. The door's stick law
+/// (`embed_row_gather`: vocab a whole 64-element fp16 multiple) checks the
+/// same fact at expansion — `pad_vocab` is a power of two ≥ 64, a whole
+/// stick multiple by construction, where the raw vocab (granite 49155 =
+/// 768·64 + 3) is not and the door refuses it as a partial-slab address.
+///
+/// ⭐ THE PAD DERIVES FROM THE WEIGHT'S OWN STATED COLS — the one fact every
+/// rung's graph carries — never from a pick node (only a device-sampling
+/// rung has one). That is what makes the pass UNIFORM BY CONSTRUCTION: it
+/// runs on every rung's graph of a tied model, and every bundle's placement
+/// reserves the same widened bytes (the weight-segment parity ledger refuses
+/// a model whose bundles disagree — a non-uniform widening is a build error,
+/// never a card failure).
+///
+/// ⭐ ONLY THE STATED SHAPE MOVES. The matmul's own weight REGION stays
+/// `0..vocab` — a partial view over the widened tensor, the exact situation
+/// an output-side widening created for the matmul's output — so the
+/// matmul's compute, its kernel manifest, and the worker's staging (all
+/// region-driven) are untouched: the reservation grows, the FLOPs do not.
+/// (On the spyre target that staging fact is stated in one place: the
+/// lowering's `gemm_weight_host_pairs`, the union of each gemm weight's
+/// matmul consumers' view regions, which the wiring's manifest shapes and
+/// the three-width-laws check both read as the host pair.) The pad columns
+/// past the worker's staged device width keep the segment's prepare-time
+/// zeros (weights stage once at load and are never reused), which makes
+/// `idx ≥ vocab` gather a ZERO row in value as well as in extent.
+///
+/// ⭐ NON-ADMITTING TAILS RETURN `None` AND TOUCH NOTHING: a rung whose
+/// result tail is not the admitting shape (an arity-2 Dense lm-head under
+/// single-input `ScalarMul`/`TanhSoftCap` epilogues, its `inputs[1]` a
+/// source) keeps the host-gather path — a tied model whose NO rung admits
+/// is byte-identical under this pass. The caller gates on the model's own
+/// tie fact; the pass itself states only the tail's structure.
+///
+/// ⛔ NOT IDEMPOTENT, BY DESIGN: `sample_pad_vocab` always exceeds its input
+/// (a power of two, doubled when the vocab already is one), so a second call
+/// on a widened graph would widen again. The pass runs ONCE per graph, and
+/// [`mint_embed_chain`]'s assert — the widened cols against the pad stated
+/// off the SAME vocab — is the typed proof it ran exactly right.
+pub fn widen_tied_embed_weight<F: RopeForm>(graph: &mut SubtileIR<F>) -> Option<TiedEmbedWiden> {
+    // The mints' own tail walk, None instead of panic at every non-admitting
+    // turn: this pass runs on every rung's graph, where the mints' admission
+    // gate has not run.
+    let mut t = graph.result;
+    let weight = loop {
+        let node = graph.nodes.iter().find(|n| n.output.tensor == t)?;
+        match &node.op {
+            SubOp::ScalarMul { .. } | SubOp::TanhSoftCap { .. } if node.inputs.len() == 1 => {
+                t = node.inputs[0].tensor;
+            }
+            SubOp::MatmulTile { .. } => break node.inputs[1].tensor,
+            _ => return None,
+        }
+    };
+    if !graph.is_source(weight) {
+        return None;
+    }
+    let vocab = graph.tensors[weight.index()].cols;
+    let pad_vocab = sample_pad_vocab(vocab);
+    graph.tensors[weight.index()].cols = pad_vocab;
+    Some(TiedEmbedWiden {
+        weight,
+        vocab,
+        pad_vocab,
+    })
+}
+
+// ── The chained head's mint (the pipelined decode's graph cut) ──────
+
+/// What [`mint_embed_chain`] inserted, for the caller's bake log and the
+/// wiring's seed fact.
+#[derive(Clone, Copy, Debug)]
+pub struct EmbedChainMint {
+    /// The gathered row's width — the op's own `hidden`.
+    pub hidden: u32,
+    /// The matrix's REAL column count — the vocab the caller stated, the
+    /// number the bake log reports. The weight's OWN stated width is the
+    /// PAD ([`widen_tied_embed_weight`]'s law), never this number.
+    pub vocab: u32,
+    /// The rung's row count — the batch width this graph serves; one chain
+    /// stick row and one gathered row per request row.
+    pub width: u32,
+    /// The persistent s-stick's SOURCE id — the placement holding the pick's
+    /// SLAB index (`t >> 6`, clamped to 0 past `pad_vocab`): the host's seed
+    /// lands here (the first play's seed is the prompt's final token, a fact
+    /// the host owns; the per-step path then re-states the seed each step,
+    /// idempotent with the device's own writes, and the block path stages it
+    /// once per block) and every step's `ChainStage` write keeps it current.
+    /// One row per request: the `[width, CHAIN_IDX_BLOCK]` placement, row
+    /// `r` request `r`'s pattern.
+    pub s_stick: TensorId,
+    /// The persistent l-stick's SOURCE id — the placement holding the pick's
+    /// LANE RAMP ([`chain_l_stick_ramp`] at `t & 63`; the sentinel ramp, the
+    /// transposed placement's zero tail, past the pad): the same
+    /// seed-then-device-owns law as `s_stick`. One row per request, each row
+    /// `chain_l_sticks(hidden)` sticks wide (`CHAIN_IDX_BLOCK` words per
+    /// stick, the per-stick cut's own addressing — stick `r·l_sticks + b`
+    /// of the placement).
+    pub l_stick: TensorId,
+}
+
+/// Append the CHAINED HEAD to a decode graph: the persistent s/l stick
+/// sources and the decompose's two staged tables, an `EmbedRowGather` at the
+/// entry (every whole-tensor consumer of `embed_row` re-pointed onto its
+/// output), and a `ChainStage` at the tail (the pick decomposed into the
+/// persistent placements through the tables, one row per request). Pure
+/// graph surgery — the GATE (which rungs mint, and the TIE the matrix
+/// operand assumes) is the caller's fact; this fn states only its
+/// own invariants and panics on their violation, which at expansion time is
+/// a build error, never a runtime one.
+///
+/// ⭐ THE PICK IS A NAMED OPERAND, AND THE CALLER NAMES IT — VOCAB INCLUDED:
+/// `pick_stick` is the device pick producer's output — the sampler op the
+/// emission finds and passes here — and `vocab` is that producer's own
+/// column count, the REAL vocab the tables' range decomposes over. This
+/// mint asserts the STRUCTURE (an op output, one row per request, the tail
+/// walk to the lm-head admits, the weight pre-widened to this vocab's pad);
+/// it cannot and does not check the producer's KIND — the caller that names
+/// a pick owns that it is one, and a caller with no producer to name does
+/// not call this fn: it REFUSES the bake (a host-staged pick is not a pick,
+/// and there is no fallback arm to hand it to).
+///
+/// ⭐ THE CHAIN IS CROSS-STEP, THE GRAPH IS PER-STEP: the gather cannot
+/// read this step's own pick (a cycle, and the wrong step's pick besides)
+/// — it reads the PERSISTENT source the PREVIOUS step's `ChainStage`
+/// wrote. The `RopeAppend`-writes/`AttnDecode`-reads law (the sealed
+/// `KvCacheLayout` pair) is the precedent: a placement the device owns
+/// across forwards. Step j-1's stick write → step j's gather read is
+/// therefore the SAME ordering class as step j-1's KV append → step j's
+/// `AttnDecode` — cross-submission ordering the ring already provides
+/// (per-CB fences; FIFO = program order). One law, two consumers.
+///
+/// ⭐ THE TIE IS THE CALLER'S FACT: the gather's matrix operand is the
+/// lm-head's own weight source, which is the embedding matrix IFF the
+/// model ties embeddings. This mint asserts the structure (the weight is
+/// a source of shape `[hidden, vocab]`, the embed rows a `[width, hidden]`
+/// source); the tie itself is checked where the model config lives, and
+/// an untied model does not mint (a named follow-up admission, not a
+/// silent scope).
+///
+/// ⭐ THE FOUR-SOURCE INSERT renumbers every op-output tid up by four
+/// (shift = 4); source ids below the old `num_sources` — the caller's
+/// `embed_row` and the lm-head's weight among them — are UNTOUCHED, which
+/// keeps the caller's `weight_ids` and the wiring's binding scan valid
+/// against the minted graph. The sticks are SOURCES, not node outputs,
+/// because they are CROSS-STEP CARRIERS: a node output with no in-graph
+/// consumer is a free slot the coloring reuses, and the body's tensors
+/// would clobber the chain's state between steps (the KV pool's own law —
+/// persistent state lives as a placement, never as a graph edge). The
+/// tables are sources because they are ORDINARY TENSOR OPERANDS: the mint
+/// states them, the node consumes them, and the worker stages their bytes
+/// once at load through the SAME load-const list every staged table rides
+/// (a second minted node of the kind is a build error, never a
+/// last-write-wins).
+///
+/// ⭐ THE GATHER NODE IS INSERTED AT NODE POSITION 0, not appended: the
+/// graph's nodes are topologically ordered and the gather's consumers are
+/// the body's entry ops, early in the list. The insert shifts every node
+/// id up by one; every `KvCacheProducer::SameForwardRopeAppend` producer
+/// index is remapped through the shift (the rewrites' own
+/// `new_id_for_old` discipline).
+pub fn mint_embed_chain<F: RopeForm>(
+    graph: &mut SubtileIR<F>,
+    embed_row: TensorId,
+    pick_stick: TensorId,
+    vocab: u32,
+) -> EmbedChainMint {
+    // 1) The pick: an OP OUTPUT (device-produced), one row per request. The
+    //    caller named it and its vocab; these asserts catch a caller that
+    //    named something else.
+    assert!(
+        !graph.is_source(pick_stick),
+        "mint_embed_chain: the pick stick must be an OP OUTPUT — a device-produced pick; \
+         a host-staged pick is not a pick"
+    );
+    let pick_node = graph
+        .nodes
+        .iter()
+        .position(|n| n.output.tensor == pick_stick)
+        .expect("mint_embed_chain: the pick stick's producer — the caller names a pick it owns");
+    let pad_vocab = sample_pad_vocab(vocab);
+
+    // 2) The lm-head matmul: the tail walk back from the pick's logits row —
+    //    the same walk the pick's own admission performs (single-input
+    //    ScalarMul/TanhSoftCap epilogues back to the MatmulTile; anything
+    //    else is a graph the admission already refused, so the mint was
+    //    called outside it). The loop breaks with the WEIGHT TID (a Copy), so
+    //    no borrow of the node list outlives the walk the surgery below
+    //    mutates.
+    let mut t = graph.nodes[pick_node].inputs[0].tensor;
+    let weight = loop {
+        let node = graph
+            .nodes
+            .iter()
+            .find(|n| n.output.tensor == t)
+            .expect("the result tail's writer");
+        match &node.op {
+            SubOp::ScalarMul { .. } | SubOp::TanhSoftCap { .. } if node.inputs.len() == 1 => {
+                t = node.inputs[0].tensor;
+            }
+            SubOp::MatmulTile { .. } => break node.inputs[1].tensor,
+            other => panic!(
+                "mint_embed_chain walked a {other:?} result tail — the admission gate \
+                 (an arity-2 Dense lm-head under single-input ScalarMul/TanhSoftCap) \
+                 refuses this graph, so the mint was called outside it"
+            ),
+        }
+    };
+    assert!(
+        graph.is_source(weight),
+        "mint_embed_chain: the lm-head's weight operand must be a source (the tied \
+         embedding matrix the gather reads)"
+    );
+    let (w_rows, w_cols) = {
+        let s = graph.shape(weight);
+        (s.rows, s.cols)
+    };
+    // ⭐ THE WIDENED-LAW ASSERT — the typed proof the per-graph widening pass
+    // ([`widen_tied_embed_weight`]) ran on THIS rung, once and exactly right:
+    // the weight's stated cols are the pad this mint derived off the caller's
+    // SAME vocab. The mint does NOT widen — the pass is per-graph and uniform
+    // (the weight-segment parity ledger's law), and this rung is only one of
+    // them. A raw-vocab weight here is a partial slab (the gather door's
+    // stick law would refuse it at expansion as an address); a wider one is
+    // a pass that ran twice; both fail HERE, at the mint, naming the pass.
+    assert_eq!(
+        w_cols,
+        pad_vocab,
+        "mint_embed_chain: the lm-head weight t{} states {} columns, not the pick's pad \
+         {pad_vocab} — the per-graph widening pass (widen_tied_embed_weight) did not run \
+         before this mint; the chain's tables, sentinel, and s-clamp are all keyed to the \
+         pad, and the gather addresses the weight at that width or not at all",
+        weight.index(),
+        w_cols
+    );
+    assert!(
+        graph.is_source(embed_row),
+        "mint_embed_chain: the embed rows must be a source (the host-bound rows being \
+         replaced by the chain)"
+    );
+    let embed_shape = graph.shape(embed_row);
+    let width = embed_shape.rows;
+    assert_eq!(
+        embed_shape.cols, w_rows,
+        "mint_embed_chain: the embed rows must be [width, hidden] with hidden = the \
+         lm-head weight's row count"
+    );
+    assert_eq!(
+        graph.shape(pick_stick).rows,
+        width,
+        "mint_embed_chain: the pick stick must carry one row per request row (the \
+         batch width this graph serves)"
+    );
+    let hidden = w_rows;
+
+    // 3) THE FOUR-SOURCE INSERT — the persistent s/l sticks AND the
+    //    decompose's two staged tables at `[num_sources, +4)`; every
+    //    op-output tid bumps up by four.
+    let n_src = graph.num_sources;
+    let bump = |tr: &mut TensorRegion| {
+        if tr.tensor.0 >= n_src {
+            tr.tensor.0 += 4;
+        }
+    };
+    for node in &mut graph.nodes {
+        for inp in &mut node.inputs {
+            bump(inp);
+        }
+        bump(&mut node.output);
+    }
+    for ot in &mut graph.op_output {
+        if ot.0 >= n_src {
+            ot.0 += 4;
+        }
+    }
+    if graph.result.0 >= n_src {
+        graph.result.0 += 4;
+    }
+    // The tables' row count: every answerable pick `t` up to the sentinel
+    // `pad_vocab + SAMPLE_SENTINEL_OFFSET` INCLUSIVE — the pick contract's
+    // whole range, one row per pick (the sentinel is the LAST row). THE
+    // GROUP LAW LIVES HERE, beside the one statement of the extent: the
+    // sentinel pick is `G·4096 + SAMPLE_SENTINEL_OFFSET` with
+    // `G = sample_groups(pad_vocab)`, which equals
+    // `pad_vocab + SAMPLE_SENTINEL_OFFSET` — the last table row — only
+    // when `pad_vocab` is a whole multiple of the pick group
+    // (`SAMPLE_BLOCK · SAMPLE_GROUP_BLOCKS`). A pad that is not a group
+    // multiple drops the sentinel pick SHORT of the last row — `G` is the
+    // rounded-DOWN group count, so `G·4096 ≤ pad_vocab` and the pick lands
+    // inside the past-pad marks, never past the staged bytes; what breaks
+    // is the ONE-TO-ONE law this extent states (the sentinel is the LAST
+    // row, the answerable range's own upper end) — so the mint refuses it
+    // here, at the single site that computes the extent, rather than
+    // letting a downstream door re-derive the arithmetic.
+    let group = SAMPLE_BLOCK * SAMPLE_GROUP_BLOCKS;
+    assert!(
+        pad_vocab != 0 && pad_vocab.is_multiple_of(group),
+        "mint_embed_chain: the padded vocab {pad_vocab} is not a whole multiple of the \
+         pick group {group} — the sentinel pick would land short of the last table row \
+         and the sentinel-is-the-last-row law would be false; the chain mints only \
+         group-multiple pads"
+    );
+    let table_rows = pad_vocab + SAMPLE_SENTINEL_OFFSET + 1;
+    // ⭐ THE L INDEX'S OWN STICK COUNT — chain_l_sticks' one STATEMENT call:
+    // the mint derives it and states the two l shapes from it, so the fill
+    // (wiring's staged tables), the door (both gather doors read the
+    // operands they are handed), and both host seeds (the self-sized ramp)
+    // all read one stated fact — never a second derivation from `hidden`.
+    // The count is `ceil((hidden/STICK_ELEMS)/CHAIN_IDX_BLOCK)`: 1 at every
+    // hidden ≤ 2048 (the degenerate the cut must keep byte-identical), 2 at
+    // granite-3.1-8b's 4096 (64 one-stick entries — the row gather runs one
+    // op per index stick, the KV fold's own cut).
+    let l_sticks = chain_l_sticks(hidden);
+    graph.tensors.splice(
+        n_src as usize..n_src as usize,
+        [
+            TensorShape {
+                rows: width,
+                cols: CHAIN_IDX_BLOCK,
+            },
+            // ⭐ THE L STICK IS ONE STICK WIDE — [width·l_sticks, 32], row r's
+            // l_sticks sticks then row r+1's (op (r, b) of the door's per-stick
+            // cut reads its index at stick r·l_sticks + b). A [width,
+            // 32·l_sticks] spelling would be stick-scattered on the device
+            // (the stick-scatter law: element (r, c) lands at stick
+            // (c/64)·width + r), so row r's stick b would sit at flat stick
+            // b·width + r — a different buffer than every reader states. At
+            // one stick wide, row-major and stick-major coincide, so the
+            // address cannot be ambiguous. At l_sticks = 1 (every hidden
+            // ≤ 2048) both forms are identical.
+            TensorShape {
+                rows: width * l_sticks,
+                cols: CHAIN_IDX_BLOCK,
+            },
+            TensorShape {
+                rows: table_rows,
+                cols: CHAIN_IDX_BLOCK,
+            },
+            TensorShape {
+                rows: table_rows,
+                cols: CHAIN_IDX_BLOCK * l_sticks,
+            },
+        ],
+    );
+    let s_stick = TensorId(n_src);
+    let l_stick = TensorId(n_src + 1);
+    let s_tab = TensorId(n_src + 2);
+    let l_tab = TensorId(n_src + 3);
+    graph.num_sources += 4;
+    // The pick stick is an op output (asserted above), so the bump moved it.
+    let pick_stick = TensorId(pick_stick.0 + 4);
+
+    // 4) THE GATHER — a fresh `[width, hidden]` output at the tensor table's
+    //    end; the node is INSERTED at position 0 (topologically safe: it
+    //    reads sources only), every node id and producer index shifts up.
+    let whole = |g: &SubtileIR<F>, t: TensorId| TensorRegion {
+        tensor: t,
+        region: Region {
+            rows: Range::new(0, g.tensors[t.index()].rows),
+            cols: Range::new(0, g.tensors[t.index()].cols),
+        },
+    };
+    let gather_out = TensorId(graph.tensors.len() as u32);
+    graph.tensors.push(TensorShape {
+        rows: width,
+        cols: hidden,
+    });
+    graph.nodes.insert(
+        0,
+        SubtileNode {
+            id: SubtileId(0),
+            op: SubOp::EmbedRowGather {
+                hidden,
+                replaces: embed_row,
+            },
+            inputs: vec![
+                whole(graph, s_stick),
+                whole(graph, l_stick),
+                whole(graph, weight),
+            ],
+            output: whole(graph, gather_out),
+        },
+    );
+    for (i, node) in graph.nodes.iter_mut().enumerate().skip(1) {
+        node.id = SubtileId(i as u32);
+        if let SubOp::AttnDecode {
+            producer:
+                KvCacheProducer::SameForwardRopeAppend {
+                    producer_node_idx, ..
+                },
+            ..
+        } = &mut node.op
+        {
+            *producer_node_idx += 1;
+        }
+    }
+
+    // 5) THE RE-POINT — every WHOLE-TENSOR consumer of the embed rows reads
+    //    the gather's output instead. The rows' source survives, placed and
+    //    readable by tid; the host simply stops seeding it.
+    for node in graph.nodes.iter_mut().skip(1) {
+        for inp in &mut node.inputs {
+            if inp.tensor == embed_row {
+                assert_eq!(
+                    (
+                        inp.region.rows.start,
+                        inp.region.rows.len,
+                        inp.region.cols.start,
+                        inp.region.cols.len
+                    ),
+                    (0, width, 0, hidden),
+                    "mint_embed_chain: a consumer reads a SLICE of the embed rows — the \
+                     chain replaces the WHOLE tensor only"
+                );
+                inp.tensor = gather_out;
+            }
+        }
+    }
+
+    // 6) THE STAGE — the pick decomposed into the persistent placements
+    //    through the staged tables; the output is a fresh s-value stick
+    //    (every op's output its own), one row per request. `pad_vocab` and
+    //    `table_rows` are stated from the caller's own vocab — the
+    //    decompose's one derivation and the tables' own extent — so producer
+    //    and consumer can never disagree on the range the decompose is exact
+    //    over, and no door re-derives the extent from `pad_vocab` a second
+    //    time. The tables ride the node as ORDINARY OPERANDS (inputs 3 and
+    //    4): the wiring's load-const list derives their `(tid, kind)` entries
+    //    from THIS node's inputs, so the worker's staging and the bake's
+    //    numeric gate read the same pair the door's gathers name.
+    // ⭐ THE SLAB-GATHER ENTRY COUNT — chain_slab_entries' one STATEMENT call:
+    // the mint computes k and carries it in the payload, so the fill, the
+    // door, both host seeds, and both reference arms read one stated fact.
+    // The law's miss panic cannot format the value (E0015); THIS is the
+    // caller context it names — the hidden that could miss is THIS graph's
+    // hidden, the lm-head weight's row count, and the assert below re-states
+    // the contract with both numbers should it ever break.
+    let k = chain_slab_entries(u64::from(hidden)) as u32;
+    assert!(
+        (1..=CHAIN_IDX_BLOCK).contains(&k) && hidden.is_multiple_of(k),
+        "mint_embed_chain: chain_slab_entries answered k = {k} for hidden \
+         {hidden} — the entry count must divide the hidden and sit inside the \
+         index stick (CHAIN_IDX_BLOCK)"
+    );
+    let stage_out = TensorId(graph.tensors.len() as u32);
+    graph.tensors.push(TensorShape {
+        rows: width,
+        cols: CHAIN_IDX_BLOCK,
+    });
+    graph.nodes.push(SubtileNode {
+        id: SubtileId(graph.nodes.len() as u32),
+        op: SubOp::ChainStage {
+            pad_vocab,
+            table_rows,
+            k,
+        },
+        inputs: vec![
+            whole(graph, pick_stick),
+            whole(graph, s_stick),
+            whole(graph, l_stick),
+            whole(graph, s_tab),
+            whole(graph, l_tab),
+        ],
+        output: whole(graph, stage_out),
+    });
+
+    EmbedChainMint {
+        hidden,
+        // The REAL vocab — the caller's own statement, the number the bake
+        // log reports; the weight's stated cols are the PAD by the widening
+        // pass's law, asserted above.
+        vocab,
+        width,
+        s_stick,
+        l_stick,
     }
 }
 
@@ -1530,6 +2875,229 @@ pub fn eval_node<F: RopeForm>(
                 for (o, v) in out.iter_mut().zip(&b) {
                     *o += *v;
                 }
+            }
+            out
+        }
+        SubOp::Sample { vocab, rows: _ } => {
+            // The HOST reference states the KERNEL'S OWN LAW, never a
+            // backend's argmax tie promise: per row, FIRST-maximum over
+            // `score_i = (x_i·inv_t + g_i·gate) + padoff_i` in f32, with `g` the card's
+            // own noise — the wrapping-i32 counter hash over the row's seed
+            // quadruple and the lane (request-owned alone — no row word,
+            // the auditor's 2026-10-27 ruling), the multiply-by-2^8 wrap-fold, the
+            // strict-interior folds, and the fp16-island Gumbel, every
+            // constant at its staged value (the kernel's exact sequence).
+            // The pad law (`padoff` 0.0 on the real lanes, f32::MIN
+            // (−FLT_MAX, 0xFF7FFFFF) on the pads — the fp32 reduce
+            // template's own "negInf", NEVER IEEE −inf, which the card
+            // reads as NaN — added LAST, after the score's two roundings)
+            // keeps the pad lanes lost, so the scan over `[0, vocab)` is the
+            // whole contest; a NaN score never wins the ordered max and
+            // never satisfies the equality, so an all-NaN row answers the
+            // sentinel past the last real lane — the consumer's
+            // `idx > vocab` refusal, #666's recorded divergence from
+            // host-argmax-over-NaN). The output is the `[rows, 64]` idx
+            // stick with every lane equal (the store is a whole stick per
+            // row); the values are whole numbers below 2^24, exact in f32.
+            // The greedy row (gate 0, inv_t 1) is the plain first-max —
+            // `g·0 = 0` exact, never a separate law.
+            //
+            // ⚠ COVERAGE, STATED: the host evaluator's buffers are f32, so
+            // the seed words ride as f32 IMAGES and this reference reads
+            // them back with `as i32` — exact while every word is below 2^24
+            // in magnitude, which the gate's own staging (zeros, the step
+            // counter, the row index) always satisfies. A noise-decided draw
+            // over full-width seed words is NOT this reference's to check:
+            // that fidelity is the card probe's verdict (FB-NOISE-DONE),
+            // never the gate's.
+            let (block, _, cols) = gather(&node.inputs[0], graph, bufs);
+            let (slo_t, _, wcols) = gather(&node.inputs[1], graph, bufs);
+            let (shi_t, _, _) = gather(&node.inputs[2], graph, bufs);
+            let (stp_t, _, _) = gather(&node.inputs[3], graph, bufs);
+            let (sgate_t, _, _) = gather(&node.inputs[4], graph, bufs);
+            let (invt, _, _) = gather(&node.inputs[5], graph, bufs);
+            assert!(
+                wcols == 1,
+                "the seed word tables are {wcols} wide, not the one word of their own \
+                 `[rows, 1]` class (the mint mints four of them, the quadruple's own)"
+            );
+            let vocab = vocab as usize;
+            assert!(
+                cols as usize >= vocab,
+                "the sample row is {cols} wide, narrower than the vocab {vocab}"
+            );
+            let cols = cols as usize;
+            // The noise section's constants at their staged values — the
+            // hash multipliers and the wrap-fold's 2^8 in i32, the fold's
+            // five f32 constants, the fp16 island's clamp (fp16's smallest
+            // normal). One citation for the whole chain: sample_fwd.py's
+            // noise section, whose sequence this reference states.
+            const HC1: i32 = -1640531535; // 0x9E3779B1
+            const HC2: i32 = -2048144777; // 0x85EBCA77
+            const HC3: i32 = -1028477379; // 0xC2B2AE3D
+            const FM8: f32 = 0.00390625; // 2^-8
+            const FTOP: f32 = 8388607.0; // 2^23 - 1
+            const FZERO: f32 = 0.0;
+            const FHALF: f32 = 0.5;
+            // 2^-22 and 2^-14, spelled as the division they are (exact in f32 —
+            // powers of two, no rounding anywhere in the fold).
+            const FM22: f32 = 1.0 / 4194304.0; // 2^-22
+            const CMIN: f32 = 1.0 / 16384.0; // 2^-14
+            let mut out = Vec::with_capacity((out_rows * out_cols) as usize);
+            for r in 0..out_rows as usize {
+                let inv_t = invt[r];
+                let slo = slo_t[r] as i32;
+                let shi = shi_t[r] as i32;
+                let stp = stp_t[r] as i32;
+                let gate = sgate_t[r] as i32 as f32;
+                let base = r * cols;
+                // `+ 0.0` is the pad law's own offset, applied LAST — the
+                // kernel adds the staged `padoff` after the score's two
+                // roundings, and the eval states the kernel's sequence
+                // exactly (adding 0.0 to a finite f32 changes nothing). The
+                // noise: the wrapping-i32 hash (the card's bit-exact integer
+                // class), then `r = h·2^8 mod 2^32` — a multiple of 2^8 with
+                // at most 24 significant bits, so `as f32` is exact — then
+                // the abs fold, the strict-interior folds, and the fp16
+                // island: each f16 boundary rounds through IEEE binary16
+                // (`half::f16::from_f32`), each log is the f32 `ln` of an
+                // f16-representable operand — exactly the emulator's
+                // semantics, the arrangement-blind elementwise law (the
+                // card's dl16tofp32 stagger is the arrangement table's fact,
+                // never a consumer's assumption).
+                let score = |i: usize| {
+                    let lane = i as i32;
+                    let h = lane.wrapping_mul(HC1).wrapping_add(slo);
+                    let h = h.wrapping_mul(HC2).wrapping_add(shi).wrapping_add(stp);
+                    let h = h.wrapping_mul(h);
+                    let h = h.wrapping_mul(HC1).wrapping_add(slo);
+                    let h = h.wrapping_mul(h);
+                    let h = h.wrapping_mul(HC3).wrapping_add(shi).wrapping_add(stp);
+                    let h = h.wrapping_mul(h);
+                    let h = h
+                        .wrapping_mul(HC1)
+                        .wrapping_add(lane.wrapping_mul(HC2))
+                        .wrapping_add(slo);
+                    let rf = h.wrapping_mul(256) as f32;
+                    let n = rf.abs() * FM8;
+                    let nm = n.min(FTOP - n);
+                    let np = nm.max(FZERO);
+                    let u = (np + FHALF) * FM22;
+                    let u16 = half::f16::from_f32(u);
+                    let c1 = u16.to_f32().max(CMIN);
+                    let lu = half::f16::from_f32(c1.ln());
+                    let c2 = (-lu.to_f32()).max(CMIN);
+                    let lt = half::f16::from_f32(c2.ln());
+                    let noise = (-lt).to_f32();
+                    (block[base + i] * inv_t + noise * gate) + 0.0
+                };
+                let mut m = f32::NEG_INFINITY;
+                for i in 0..vocab {
+                    let s = score(i);
+                    if s > m {
+                        m = s;
+                    }
+                }
+                let idx = match (0..vocab).position(|i| score(i) == m) {
+                    // A NaN score never wins the `>` scan and never
+                    // satisfies `==`, so the first lane equal to the running
+                    // max is the first-max; an all-−inf row ties every lane
+                    // at m = −inf and answers lane 0.
+                    Some(first) => first as u32,
+                    // The all-NaN sentinel: the pad lanes stage ginc = G,
+                    // binc = GROUP_BLOCKS and linc = BLOCK, so the combine
+                    // answers G·4096 + 64·64 + 64 — at every admitted
+                    // production shape (PAD_V a whole number of 4096-lane
+                    // groups) that is PAD_V + 4160, far past the last real
+                    // lane. The kernel's own arithmetic, not the flat
+                    // ramp's PAD_V + BLOCK.
+                    None => {
+                        sample_groups(sample_pad_vocab(vocab as u32))
+                            * (SAMPLE_BLOCK * SAMPLE_GROUP_BLOCKS)
+                            + SAMPLE_GROUP_BLOCKS * SAMPLE_BLOCK
+                            + SAMPLE_BLOCK
+                    }
+                };
+                out.extend(std::iter::repeat_n(idx as f32, out_cols as usize));
+            }
+            out
+        }
+        // `replaces` is metadata here: the reference walks the sticks and the
+        // matrix, never the replaced row (the re-point's own law — no reader).
+        SubOp::EmbedRowGather { hidden, .. } => {
+            // The HOST reference states the KERNEL'S OWN LAW: the two index
+            // sticks' first words PER ROW (whole numbers below 2^24, exact in
+            // f32 — the sticks' eval encoding) re-join into that row's pick —
+            // word 0 of the s stick's row is the LANE PATTERN's first lane
+            // `k·s + 0`, so `s = word0/k` EXACT for every k (`k` from
+            // [`chain_slab_entries`] at this graph's own hidden — the one
+            // spelling), word 0 of the l stick's row is the LANE RAMP's
+            // first lane, `l` itself ([`chain_l_stick_ramp`]'s word-0 law),
+            // then `t = s·64 + l` — and one stride-pad walk down the matrix's
+            // column. The two sentinel legs stay: the sentinel ramp's word 0
+            // is `hidden` (a real pick's ramp answers a lane
+            // `t & 63 ≤ 63 < 64 ≤ hidden`, so the mark can never name a real
+            // column), and every pick past the matrix's WIDENED width (the
+            // region's own extent — the pad the widening pass stated) clamps
+            // to a zero row, while a pick in `[vocab, pad)` reads the pad
+            // columns' own zeros — the device must never read past the matrix
+            // on an already-broken chat, and neither may the reference.
+            let (s_stick, _, s_cols) = gather(&node.inputs[0], graph, bufs);
+            let (l_stick, _, l_cols) = gather(&node.inputs[1], graph, bufs);
+            let k = chain_slab_entries(u64::from(hidden)) as usize;
+            let (w, _, wcols) = gather(&node.inputs[2], graph, bufs);
+            let pad = wcols as usize;
+            let hidden = hidden as usize;
+            let width = out_rows as usize;
+            assert_eq!(
+                out_cols as usize, hidden,
+                "the chained rows are [width, hidden], one row per stick row"
+            );
+            let mut out = vec![0f32; width * hidden];
+            for r in 0..width {
+                let s = s_stick[r * s_cols as usize] as usize / k;
+                let l = l_stick[r * l_cols as usize] as usize;
+                assert!(
+                    (l as u32) < CHAIN_SLAB_STICK_ELEMS || l as u32 == hidden as u32,
+                    "the lane stick answers {l}, neither a lane below the stick width \
+                     nor the sentinel mark hidden = {hidden} — a corrupted chain, not a pick"
+                );
+                let t = s * SAMPLE_BLOCK as usize + l;
+                if l != hidden && t < pad {
+                    for (h, o) in out[r * hidden..(r + 1) * hidden].iter_mut().enumerate() {
+                        *o = w[h * pad + t];
+                    }
+                }
+            }
+            out
+        }
+        SubOp::ChainStage { pad_vocab, k, .. } => {
+            // The persistent s/l writes are GPU-only (KvAppend's law); the
+            // reference is the S-VALUE STICK the device's own s-gather
+            // writes into this node's fresh output, so the two ends agree on
+            // what the node produced: the ruled table's law, `s = t >> 6`
+            // clamped to 0 past `pad_vocab`, stated as the LANE PATTERN
+            // `k·s + (i mod k)` over the stick's lanes — lane `i` names
+            // entry `i mod k` of slab `s` (the sentinel leg — a degenerate
+            // row answers a pick past `pad_vocab`, and the clamp keeps even
+            // that read on slab 0's pattern `i mod k`, the zero-slab form
+            // the k=1 splat's own zero already was). The pick rides word 0
+            // of each idx-stick row (the whole-stick store law).
+            // `table_rows` is unread here by the same law that leaves the
+            // table OPERANDS unread: the reference states the decompose's
+            // RESULT, never its walk, and the extent is the door's check.
+            let (pick, _, pick_cols) = gather(&node.inputs[0], graph, bufs);
+            let k = k as usize;
+            let width = out_rows as usize;
+            assert_eq!(
+                out_cols as usize, CHAIN_IDX_BLOCK as usize,
+                "the stage's fresh output is the s-value stick, [width, CHAIN_IDX_BLOCK]"
+            );
+            let mut out = Vec::with_capacity(width * CHAIN_IDX_BLOCK as usize);
+            for r in 0..width {
+                let t = pick[r * pick_cols as usize] as u32;
+                let s = if t < pad_vocab { t >> 6 } else { 0 };
+                out.extend((0..CHAIN_IDX_BLOCK as usize).map(|i| (k * s as usize + i % k) as f32));
             }
             out
         }
@@ -2376,6 +3944,19 @@ pub fn lower_region(
         // prefix-K input (desc.inputs[1] in the fused decode shape).
         let subop: SubOp<NeoX> = match desc.op {
             SubOp::MatmulTile { n, weight } => SubOp::MatmulTile { n, weight },
+            SubOp::Sample { vocab, rows } => SubOp::Sample { vocab, rows },
+            SubOp::EmbedRowGather { hidden, replaces } => {
+                SubOp::EmbedRowGather { hidden, replaces }
+            }
+            SubOp::ChainStage {
+                pad_vocab,
+                table_rows,
+                k,
+            } => SubOp::ChainStage {
+                pad_vocab,
+                table_rows,
+                k,
+            },
             SubOp::SumReduce { minted }
             | SubOp::RmsNormReduce { minted, .. }
             | SubOp::RmsNormApply { minted, .. } => match minted {},
@@ -3830,5 +5411,533 @@ mod tests {
             op_output: Vec::new(),
         };
         assert!(validate(&bad).is_err(), "use-before-def must be rejected");
+    }
+
+    // ── The chained head's mint ────────────────────────────────────────────
+    //
+    // ⛔ TEST FIXTURE, PER THE AUDITOR'S RULING: the synthetic pick producer
+    // below is a `ScalarMul` standing in for the device pick op the emission
+    // names (Front A's sampler). It exists ONLY in these `#[cfg(test)]`
+    // graphs — no non-test build constructs it, and the mint itself never
+    // checks a producer's KIND (the caller owns that fact; see
+    // `mint_embed_chain`'s docs). The stand-in needs exactly the structure
+    // the mint walks: an op output one row per request whose input 0 chains
+    // back to the lm-head matmul.
+    //
+    // The toy graph, per (width, hidden): sources `embed [width, hidden]`
+    // (t0) and the tied matrix `[hidden, VOCAB]` (t1); ops
+    // `MatmulTile(n=VOCAB, m=width)` then the stand-in `ScalarMul(m=width)`
+    // over its output. VOCAB 2048 pads to 4096 — a whole pick-group
+    // multiple, the mint's extent law — and the stand-in's `[width, VOCAB]`
+    // output stands in for the pick stick: the mint states the pick's ROWS,
+    // never its lane format (the producer's own contract, the doors' law).
+    // The value tests' matrix keeps TWO shape duties: column 0 is `e_0`
+    // (`W[0][0] = 1`, zeros below — so the stand-in's word 0 IS the pick
+    // `t`, feeding the stage's check) and row 0 is the column index
+    // (`W[0][j] = j`).
+    const FIXTURE_VOCAB: u32 = 2048;
+
+    fn chained_head_fixture(width: u32, hidden: u32) -> crate::lower::LoweringInput {
+        crate::lower::LoweringInput {
+            exported: None,
+            sources: vec![
+                SourceShape {
+                    rows: width,
+                    cols: hidden,
+                },
+                SourceShape {
+                    rows: hidden,
+                    cols: FIXTURE_VOCAB,
+                },
+            ],
+            ops: vec![
+                OpDesc {
+                    op: SubOp::MatmulTile {
+                        n: FIXTURE_VOCAB,
+                        weight: crate::lower::GemmWeight::Dense,
+                    },
+                    m: width,
+                    inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+                },
+                // THE SYNTHETIC PICK PRODUCER — test fixture only.
+                OpDesc {
+                    op: SubOp::ScalarMul { scale: 1.0 },
+                    m: width,
+                    inputs: vec![InputRef::Op(0)],
+                },
+            ],
+            result: 1,
+        }
+    }
+
+    /// ⭐ THE EMBED-CHAIN MINT'S SURGERY, stated as the graph's own
+    /// invariants, at every width the front serves (1 = the degenerate solo
+    /// case; 2 and 8 = batched): the four persistent/staged sources INSERTED
+    /// at `[num_sources, +4)` (shift four), every op-output tid — the result
+    /// included — renumbered up by four while the source ids below the old
+    /// boundary stay UNTOUCHED (the embed rows and the lm-head weight among
+    /// them), the `EmbedRowGather` node INSERTED at position 0 with every
+    /// whole-tensor consumer of the embed rows re-pointed onto its fresh
+    /// `[width, hidden]` output, and the `ChainStage` appended at the tail
+    /// reading the pick stick, both persistent sticks, and both tables. The
+    /// widening pass ran first (its pad is the mint's widened-law assert).
+    /// Pinned here so a surgery regression is a test failure, not a card
+    /// divergence. A second geometry — hidden 4096, `k = 8`,
+    /// `l_sticks = 2` — pins the multi-l-stick shapes the per-stick cut
+    /// walks.
+    #[test]
+    fn the_embed_chain_mint_inserts_the_stick_sources_and_repoints_the_entry() {
+        let nz = |k| std::num::NonZeroU32::new(k).unwrap();
+        for width in [1u32, 2, 8] {
+            let mut g = lower_region(&chained_head_fixture(width, 2), nz(64));
+            // Pre-widen: 2 sources; t2 the matmul out, t3 the pick stick (the
+            // result); op_output [t2, t3].
+            assert_eq!(g.num_sources, 2);
+            assert_eq!(g.result.0, 3);
+            let widen =
+                widen_tied_embed_weight(&mut g).expect("the toy's tail admits the widening");
+            assert_eq!(
+                (widen.vocab, widen.pad_vocab),
+                (FIXTURE_VOCAB, 4096),
+                "the pad is the pick-group multiple the mint's extent law demands"
+            );
+
+            let mint = mint_embed_chain(&mut g, TensorId(0), TensorId(3), FIXTURE_VOCAB);
+            assert_eq!(
+                (mint.hidden, mint.vocab, mint.width),
+                (2, FIXTURE_VOCAB, width),
+                "the gather's own law: hidden from the matrix rows, vocab from the \
+                 caller's statement, the width from the embed rows"
+            );
+            assert_eq!(
+                (mint.s_stick.0, mint.l_stick.0),
+                (2, 3),
+                "the persistent sticks are the NEW sources at the old boundary"
+            );
+            assert_eq!(g.num_sources, 6, "four sources were inserted");
+            let table_rows = 4096 + SAMPLE_SENTINEL_OFFSET + 1;
+            // hidden 2: k=1, l_sticks=1 — the degenerate's shapes.
+            assert_eq!((g.tensors[2].rows, g.tensors[2].cols), (width, 32));
+            assert_eq!((g.tensors[3].rows, g.tensors[3].cols), (width, 32));
+            assert_eq!((g.tensors[4].rows, g.tensors[4].cols), (table_rows, 32));
+            assert_eq!((g.tensors[5].rows, g.tensors[5].cols), (table_rows, 32));
+            // The old op outputs moved +4: the matmul out t2 -> t6, the pick
+            // stick (the result) t3 -> t7; the two real sources are untouched.
+            assert_eq!(g.result.0, 4 + 3, "the result re-point survived the bump");
+            assert_eq!(g.op_output, vec![TensorId(6), TensorId(7)]);
+            assert_eq!((g.tensors[0].rows, g.tensors[0].cols), (width, 2));
+            assert_eq!((g.tensors[1].rows, g.tensors[1].cols), (2, 4096));
+
+            // The gather node at position 0: the s stick, the l stick, then
+            // the WEIGHT SOURCE (untouched by the bump), the fresh
+            // [width, hidden] rows out at t8.
+            let gather = &g.nodes[0];
+            assert!(matches!(
+                gather.op,
+                SubOp::EmbedRowGather {
+                    hidden: 2,
+                    replaces: TensorId(0)
+                }
+            ));
+            let tids = gather
+                .inputs
+                .iter()
+                .map(|tr| tr.tensor.0)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                tids,
+                vec![2, 3, 1],
+                "the s stick, the l stick, the weight source"
+            );
+            assert_eq!(gather.output.tensor.0, 8);
+            assert_eq!((g.tensors[8].rows, g.tensors[8].cols), (width, 2));
+
+            // The matmul's activation is the gather's output now; its weight
+            // is the same source it always read.
+            let matmul = g
+                .nodes
+                .iter()
+                .find(|n| matches!(n.op, SubOp::MatmulTile { .. }))
+                .unwrap();
+            assert_eq!(
+                matmul.inputs[0].tensor.0, 8,
+                "the entry consumer re-pointed"
+            );
+            assert_eq!(matmul.inputs[1].tensor.0, 1, "the weight source untouched");
+
+            // The stage at the tail: the (bumped) pick stick, both persistent
+            // sticks, both tables; a fresh s-value stick out at t9.
+            let stage = g.nodes.last().unwrap();
+            assert!(matches!(
+                stage.op,
+                SubOp::ChainStage {
+                    pad_vocab: 4096,
+                    table_rows: 8257,
+                    k: 1
+                }
+            ));
+            let tids = stage
+                .inputs
+                .iter()
+                .map(|tr| tr.tensor.0)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                tids,
+                vec![7, 2, 3, 4, 5],
+                "the pick's stick, the s stick, the l stick, the two tables"
+            );
+            assert_eq!(stage.output.tensor.0, 9);
+            assert_eq!((g.tensors[9].rows, g.tensors[9].cols), (width, 32));
+
+            // Dense ids after the position-0 insert, and the graph validates.
+            for (i, node) in g.nodes.iter().enumerate() {
+                assert_eq!(node.id.0 as usize, i, "dense node ids after the insert");
+            }
+            assert!(validate(&g).is_ok(), "the chained graph must validate");
+        }
+
+        // The multi-l-stick geometry: hidden 4096 — k = 8 (the LX law), the l
+        // index TWO sticks wide, the l table two sticks per row.
+        let mut g = lower_region(&chained_head_fixture(2, 4096), nz(64));
+        widen_tied_embed_weight(&mut g).expect("the toy's tail admits the widening");
+        let mint = mint_embed_chain(&mut g, TensorId(0), TensorId(3), FIXTURE_VOCAB);
+        assert_eq!(
+            (
+                g.tensors[mint.l_stick.index()].rows,
+                g.tensors[mint.l_stick.index()].cols
+            ),
+            (4, 32),
+            "the l stick is ONE STICK WIDE — [width·l_sticks, 32]: row r's l_sticks sticks \
+             contiguous (stick r·l_sticks + b), never a stick-scattered [width, 64]"
+        );
+        let l_tab = TensorId(mint.s_stick.0 + 3);
+        assert_eq!(
+            (g.tensors[l_tab.index()].rows, g.tensors[l_tab.index()].cols),
+            (8257, 64),
+            "the l table's row width is the pair law: l_tab cols == the l stick's cols"
+        );
+        assert!(matches!(
+            g.nodes.last().unwrap().op,
+            SubOp::ChainStage { k: 8, .. }
+        ));
+        assert!(
+            validate(&g).is_ok(),
+            "the multi-stick chained graph validates"
+        );
+    }
+
+    /// ⭐ THE CHAIN IS THE ROW, TWO-ENDED — the graph-level parity the
+    /// lowering's parity descends from: evaluating the CHAINED graph with the
+    /// persistent sticks seeded the pick's decompose (`s` pattern, `l` ramp)
+    /// per row equals evaluating the PLAIN graph with the embed rows seeded
+    /// `W[:, t]` per row. The gather's own output buffer is the direct half
+    /// of the compare; the result is the end-to-end half. And the STAGE's
+    /// fresh output is the pick's own s-value stick — the pattern the
+    /// device's s-gather writes, `k·s + (i mod k)` — pinned through the
+    /// fixture's word-0 trick (column 0 = `e_0`, row 0 = the column index:
+    /// the stand-in's word 0 IS the pick).
+    #[test]
+    fn the_embed_chain_is_the_two_ended_row() {
+        let nz = |k| std::num::NonZeroU32::new(k).unwrap();
+        let hidden = 128u32;
+        let pad = 4096usize;
+        let voc = FIXTURE_VOCAB as usize;
+        // The tied matrix, RAW layout `[hidden, VOCAB]`: column 0 is `e_0`
+        // (row 0 a 1, the rest zeros) so the stand-in's word 0 is the pick;
+        // row 0 is the column index; every other entry distinct per (h, j).
+        let w_raw: Vec<f32> = (0..hidden as usize * voc)
+            .map(|i| {
+                let (h, j) = (i / voc, i % voc);
+                match (h, j) {
+                    (0, 0) => 1.0,
+                    (0, _) => j as f32,
+                    (_, 0) => 0.0,
+                    _ => h as f32 * 0.5 + j as f32 * 0.25 - 3.0,
+                }
+            })
+            .collect();
+        // The WIDENED layout `[hidden, pad]`: the real columns then the pad's
+        // prepare-time zeros — the bytes the staging reserves.
+        let w_wide: Vec<f32> = (0..hidden as usize * pad)
+            .map(|i| {
+                let (h, c) = (i / pad, i % pad);
+                if c < voc { w_raw[h * voc + c] } else { 0.0 }
+            })
+            .collect();
+        let col =
+            |t: usize| -> Vec<f32> { (0..hidden as usize).map(|h| w_wide[h * pad + t]).collect() };
+        for width in [1u32, 2, 8] {
+            // Row r's seeded pick: a distinct in-vocab token per row, past
+            // the first slab so the s join is non-trivial.
+            let picks: Vec<usize> = (0..width as usize).map(|r| 130 + 233 * r).collect();
+            let plain_rows: Vec<f32> = picks
+                .iter()
+                .flat_map(|&t| col(t).into_iter())
+                .collect::<Vec<_>>();
+
+            let plain = lower_region(&chained_head_fixture(width, hidden), nz(64));
+            let bufs_plain = eval_dag(&plain, &[&plain_rows, &w_raw]);
+
+            let mut chained = lower_region(&chained_head_fixture(width, hidden), nz(64));
+            widen_tied_embed_weight(&mut chained).expect("the toy's tail admits the widening");
+            mint_embed_chain(&mut chained, TensorId(0), TensorId(3), FIXTURE_VOCAB);
+            // The host no longer seeds the rows (zeros — nothing reads them);
+            // each stick row carries its request's decompose — the SEED laws
+            // the device's own ChainStage writes (idempotent with them).
+            let s_seed: Vec<f32> = picks
+                .iter()
+                .flat_map(|&t| {
+                    chain_s_stick_pattern(1, (t >> 6) as u32, CHAIN_IDX_BLOCK as usize)
+                        .into_iter()
+                        .map(|x| x as f32)
+                })
+                .collect();
+            let l_seed: Vec<f32> = picks
+                .iter()
+                .flat_map(|&t| {
+                    chain_l_stick_ramp((t & 63) as u32, hidden)
+                        .into_iter()
+                        .map(|x| x as f32)
+                })
+                .collect();
+            // The tables are unread by the reference (the door's check); the
+            // sizes come off the minted graph, never a second derivation.
+            let tab_len = |tid: u32| {
+                (chained.tensors[tid as usize].rows * chained.tensors[tid as usize].cols) as usize
+            };
+            let tabs = vec![vec![0f32; tab_len(4)]; 2];
+            let bufs_chained = eval_dag(
+                &chained,
+                &[
+                    &vec![0f32; (width * hidden) as usize],
+                    &w_wide,
+                    &s_seed,
+                    &l_seed,
+                    &tabs[0],
+                    &tabs[1],
+                ],
+            );
+
+            // The direct half: the gather produced exactly the rows the host
+            // used to seed.
+            assert_eq!(
+                bufs_chained[8], plain_rows,
+                "the gather's rows are the matrix's columns at the seeded picks"
+            );
+            // The end-to-end half: the chained graph answers what the
+            // host-seeded graph answers.
+            assert_eq!(
+                bufs_chained[chained.result.index()],
+                bufs_plain[plain.result.index()],
+                "the chained graph answers what the host-seeded graph answers"
+            );
+            // The stage's fresh output is the pick's own s-value stick: the
+            // pattern `k·s + (i mod k)` at k = 1 — the splat of `t >> 6`.
+            for r in 0..width as usize {
+                let expect = vec![(picks[r] >> 6) as f32; CHAIN_IDX_BLOCK as usize];
+                assert_eq!(
+                    &bufs_chained[9]
+                        [r * CHAIN_IDX_BLOCK as usize..(r + 1) * CHAIN_IDX_BLOCK as usize],
+                    &expect[..],
+                    "the stage's row is the pick's s-value stick, row {r}"
+                );
+            }
+        }
+    }
+
+    /// ⭐ THE SENTINEL AND THE PAD BOTH STAGE A ZERO ROW — the refusal the
+    /// host readback's `idx > vocab` check performed, moved into the op: a
+    /// degenerate logits row answers an index past the vocab, and the gather
+    /// must stage a zero row rather than read past the matrix (a fault on the
+    /// device bus is not a refusal). TWO legs per the op's own law: the
+    /// SENTINEL RAMP (word 0 the mark `hidden`, every word naming the
+    /// transposed placement's zero tail) and a pick INSIDE `[vocab, pad)` —
+    /// in extent, reading the pad columns' own zeros. Only the degenerate
+    /// row is zero; its neighbours still gather.
+    #[test]
+    fn the_embed_chain_gather_clamps_the_sentinel_to_a_zero_row() {
+        let nz = |k| std::num::NonZeroU32::new(k).unwrap();
+        let hidden = 128u32;
+        let pad = 4096usize;
+        let voc = FIXTURE_VOCAB as usize;
+        let w_wide: Vec<f32> = (0..hidden as usize * pad)
+            .map(|i| {
+                let (h, c) = (i / pad, i % pad);
+                if c < voc {
+                    h as f32 * 0.5 + c as f32 * 0.25 - 3.0
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let col =
+            |t: usize| -> Vec<f32> { (0..hidden as usize).map(|h| w_wide[h * pad + t]).collect() };
+        let width = 3u32;
+        let mut g = lower_region(&chained_head_fixture(width, hidden), nz(64));
+        widen_tied_embed_weight(&mut g).expect("the toy's tail admits the widening");
+        mint_embed_chain(&mut g, TensorId(0), TensorId(3), FIXTURE_VOCAB);
+        // Row 0 carries a real pick; row 1 the sentinel ramp (the mark);
+        // row 2 a pick inside [vocab, pad) — the pad columns' own zeros.
+        let s_seed: Vec<f32> = [0u32, 0, 3000 >> 6]
+            .iter()
+            .flat_map(|&s| {
+                chain_s_stick_pattern(1, s, CHAIN_IDX_BLOCK as usize)
+                    .into_iter()
+                    .map(|x| x as f32)
+            })
+            .collect();
+        let l_seed: Vec<f32> = [
+            chain_l_stick_ramp(5, hidden),
+            chain_l_sentinel_ramp(hidden),
+            chain_l_stick_ramp(3000 & 63, hidden),
+        ]
+        .iter()
+        .flat_map(|ramp| ramp.iter().map(|&x| x as f32))
+        .collect();
+        let tab_len =
+            |tid: u32| (g.tensors[tid as usize].rows * g.tensors[tid as usize].cols) as usize;
+        let bufs = eval_dag(
+            &g,
+            &[
+                &vec![0f32; (width * hidden) as usize],
+                &w_wide,
+                &s_seed,
+                &l_seed,
+                &vec![0f32; tab_len(4)],
+                &vec![0f32; tab_len(5)],
+            ],
+        );
+        let mut expect = col(5);
+        expect.extend(vec![0f32; hidden as usize * 2]);
+        assert_eq!(
+            bufs[8], expect,
+            "the sentinel ramp and the pad-region pick both stage zero rows — and \
+             only their rows"
+        );
+    }
+
+    /// ⭐ THE PATTERNED SLAB RE-JOINS AT k ABOVE ONE — the s stick's LANE
+    /// PATTERN (word 0 = `k·s + 0`) answers the pick through
+    /// `s = word0 / k`, EXACT at every k: at hidden 2048 the LX law splits
+    /// the slab k = 4, and the seeded pattern's first lane `4·s` re-joins
+    /// the slab the ramp's lane lands in. The direct half of the two-ended
+    /// compare at the split geometry, one row per request.
+    #[test]
+    fn the_embed_chain_rejoins_the_patterned_slab_at_k_above_one() {
+        let nz = |k| std::num::NonZeroU32::new(k).unwrap();
+        let hidden = 2048u32;
+        let pad = 4096usize;
+        let voc = FIXTURE_VOCAB as usize;
+        let k = chain_slab_entries(u64::from(hidden)) as u32;
+        assert_eq!(
+            k, 4,
+            "granite-3.1-2b's own geometry: the LX law splits k = 4"
+        );
+        let w_wide: Vec<f32> = (0..hidden as usize * pad)
+            .map(|i| {
+                let (h, c) = (i / pad, i % pad);
+                if c < voc {
+                    h as f32 * 0.125 + c as f32 * 0.0625 - 3.0
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let col =
+            |t: usize| -> Vec<f32> { (0..hidden as usize).map(|h| w_wide[h * pad + t]).collect() };
+        let width = 2u32;
+        // Slab 5 lane 33 and slab 7 lane 60: word 0 = 4·s, the pattern's
+        // first lane; the re-join divides it back.
+        let picks = [(5u32, 33u32), (7, 60)];
+        let mut g = lower_region(&chained_head_fixture(width, hidden), nz(64));
+        widen_tied_embed_weight(&mut g).expect("the toy's tail admits the widening");
+        mint_embed_chain(&mut g, TensorId(0), TensorId(3), FIXTURE_VOCAB);
+        let s_seed: Vec<f32> = picks
+            .iter()
+            .flat_map(|&(s, _)| {
+                chain_s_stick_pattern(k, s, CHAIN_IDX_BLOCK as usize)
+                    .into_iter()
+                    .map(|x| x as f32)
+            })
+            .collect();
+        let l_seed: Vec<f32> = picks
+            .iter()
+            .flat_map(|&(_, l)| chain_l_stick_ramp(l, hidden).into_iter().map(|x| x as f32))
+            .collect();
+        let tab_len =
+            |tid: u32| (g.tensors[tid as usize].rows * g.tensors[tid as usize].cols) as usize;
+        let bufs = eval_dag(
+            &g,
+            &[
+                &vec![0f32; (width * hidden) as usize],
+                &w_wide,
+                &s_seed,
+                &l_seed,
+                &vec![0f32; tab_len(4)],
+                &vec![0f32; tab_len(5)],
+            ],
+        );
+        let mut expect = col((64 * 5 + 33) as usize);
+        expect.extend(col((64 * 7 + 60) as usize));
+        assert_eq!(
+            bufs[8], expect,
+            "the patterned slab re-joins: word0/k is the slab, the ramp's word0 the lane"
+        );
+    }
+
+    /// ⭐ THE SEEDS ARE PER-ROW AT THE LAUNCH'S OWN WIDTH — row r carries ITS OWN token's
+    /// decompose, pad rows repeat the last real token's, and `rows == 1` is the solo
+    /// spelling byte-for-byte. This is the pin for the W=1-hidden b2 defect: the card
+    /// path's tape arm staged `tokens.first()` and ONE stick at every width, so row 1's
+    /// index never landed and its slab gather read whatever was there.
+    #[test]
+    fn the_chain_seeds_carry_every_row_at_the_launch_width() {
+        let hidden = 2048u32;
+        let k = 4u32;
+        let lanes = CHAIN_IDX_BLOCK as usize;
+        let toks = [64u32 * 5 + 33, 64 * 7 + 60, 64 * 9 + 12];
+        // PER-ROW: row r's stick is its own token's pattern/ramp, not row 0's.
+        let s = chain_s_seed(k, &toks, 2);
+        assert_eq!(
+            s,
+            [
+                chain_s_stick_pattern(k, toks[0] >> 6, lanes),
+                chain_s_stick_pattern(k, toks[1] >> 6, lanes)
+            ]
+            .concat(),
+            "row 1's s stick carries row 1's token, not row 0's"
+        );
+        let l = chain_l_seed(&toks, hidden, 2);
+        assert_eq!(
+            l,
+            [
+                chain_l_stick_ramp(toks[0] & 63, hidden),
+                chain_l_stick_ramp(toks[1] & 63, hidden)
+            ]
+            .concat(),
+            "row 1's l sticks carry row 1's token, not row 0's"
+        );
+        // THE PAD-ROW CLAMP: rows past the real tokens repeat the last real
+        // token's seed — the same law the embedding staging pins.
+        let s_pad = chain_s_seed(k, &toks, 5);
+        assert_eq!(
+            s_pad[4 * lanes..],
+            chain_s_stick_pattern(k, toks[2] >> 6, lanes),
+            "a pad row repeats the last real token's pattern"
+        );
+        // THE SOLO DEGENERATE: at one row the seed IS the one stick, byte for
+        // byte — the W=1 rung's own spelling, kept exact by construction.
+        assert_eq!(
+            chain_s_seed(k, &toks, 1),
+            chain_s_stick_pattern(k, toks[0] >> 6, lanes)
+        );
+        assert_eq!(
+            chain_l_seed(&toks, hidden, 1),
+            chain_l_stick_ramp(toks[0] & 63, hidden)
+        );
+        // An empty token list is a refusal, never a zero stick (zero is a valid
+        // entry and a valid lane).
+        assert!(std::panic::catch_unwind(|| chain_s_seed(k, &[], 1)).is_err());
+        assert!(std::panic::catch_unwind(|| chain_l_seed(&[], hidden, 1)).is_err());
     }
 }

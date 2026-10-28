@@ -30,18 +30,27 @@ use crate::spyre_pool::*;
 /// it fills, and the op-output tensors holding THIS position's roped-K / V to
 /// lift back into the cache.
 pub(crate) struct LayerWiring {
+    // ⛔ EVERY FIELD HERE IS EMULATOR-ONLY NOW (cfg'd like `prefix_v_src` below): the card
+    // keeps the KV cache RESIDENT and writes each step's new K/V device-side, so nothing
+    // on the spyre-hw arm reads a per-layer cache source or lift id. Deleted from the hw
+    // build by cfg rather than by removal — the emulator's host KV threading still reads
+    // all four, and the struct itself stays (its len is the layer count the load log prints).
     /// Source tensor id of `prefix_k[layer]` (filled with the KV cache).
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) prefix_k_src: usize,
     #[cfg(not(feature = "spyre-hw"))]
     pub(crate) prefix_v_src: usize,
     /// Op-output tensor id of the new token's roped K (AttnDecode's seg-1 K).
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) new_k_id: usize,
     /// Op-output tensor id of the new token's V (AttnDecode's seg-1 V).
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) new_v_id: usize,
     /// THIS layer's per-token KV width — `kv_heads * head_dim` off the baked
     /// prefix-K shape. A hybrid-attention arch (gemma-4) gives sliding and global
     /// layers different widths, so every per-layer buffer size, readback count and
     /// extend length reads THIS, never the model-wide `kv_dim`.
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) kv_width: usize,
 }
 
@@ -58,16 +67,26 @@ pub(crate) struct BundleMeta {
     /// ⭐ A FACT OF THE WIRING, NOT OF A MANIFEST. The prefix cache tensor spans the full
     /// structural capacity while only `decode_position` of its rows are valid at run time, so the
     /// host fills this `[1, capacity]` source per step and the masked columns leave the softmax.
+    ///
+    /// ⛔ EMULATOR-ONLY (cfg'd): the per-step host mask fill is the emulator arm's; the card's
+    /// prefix mask rides the forward tape's `PrefixMask` step straight off the wiring.
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) attn_mask_src: Option<usize>,
     /// Prefix capacity (mask cols) — max context length this bundle serves.
     pub(crate) capacity: usize,
     /// Baked query-row count: 1 (decode) or M (batched prefill).
     pub(crate) m_cap: usize,
+    // ⛔ THE FOUR BELOW ARE EMULATOR-ONLY (cfg'd): their one spyre-hw reader was the host
+    // readback/staging the forward tape replaced — the tape reads sources, rotary tables
+    // and the embed row straight off `wiring`, so no card launch consults these copies.
     /// Runtime source ids (shared id space across phases).
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) embed_src: usize,
     /// cos / sin sources as `(id, full width, rotary class)` — GQA gives >1
     /// width, and a hybrid-attention arch gives classes different tables.
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) cos_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
+    #[cfg(not(feature = "spyre-hw"))]
     pub(crate) sin_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
     pub(crate) result_id: usize,
     /// One per layer, in layer order.
@@ -88,6 +107,15 @@ pub(crate) struct BundleMeta {
     /// binds the same list through `wiring::constant_steps`; this is the emulator's copy of it.
     #[cfg(not(feature = "spyre-hw"))]
     pub(crate) scalarmul_scales: &'static [f32],
+    /// ⭐ THE WIRING'S OWN PHASE — decode's chained head vs prefill — projected
+    /// from `Wiring::phase` at load (`phase: wiring.phase`, never a second
+    /// derivation), so the emulator forward's chain-seed staging decides off
+    /// the same fact the tape's `ForwardShape` carries. On `Decode` the
+    /// per-step embed-row push is REPLACED by the sticks' seed; on `Prefill`
+    /// the host pushes the row. Emulator-only: the card path reads the phase
+    /// straight off its own `wiring` field below.
+    #[cfg(not(feature = "spyre-hw"))]
+    pub(crate) phase: scratchy_target_spyre::forward_tape::ForwardPhase,
     /// What the bake placed — asked ONCE, in the target crate, off the generated layout.
     /// Read only by the card launch path, so it carries that cfg like `prog`/`output_ids` above.
     #[cfg(feature = "spyre-hw")]
@@ -134,32 +162,18 @@ impl LogitsGeom {
     ) -> Option<LogitsGeom> {
         let elems = (size_bytes / 2) as usize;
         let rows = rung.count();
-        if size_bytes % 2 != 0 || elems % rows != 0 {
+        if !size_bytes.is_multiple_of(2) || !elems.is_multiple_of(rows) {
             return None;
         }
         let width = elems / rows;
         (width >= vocab).then_some(LogitsGeom { rows, width })
     }
-
-    /// Element count of the whole placement — what to ask [`SuperDscSession::read_tensor`] for.
-    pub(crate) fn len(&self) -> usize {
-        self.rows * self.width
-    }
-
-    /// De-interleave `flat` (the whole `[rows, width]` placement) into `rows` CONTIGUOUS `vocab`-wide
-    /// rows, so a caller can index request `r` at `r * vocab`. The gather runs through the SSOT
-    /// device-layout formula, never a copy of it, so it cannot drift from the addresses the emitter
-    /// baked.
-    pub(crate) fn rows_contiguous(&self, flat: &[f32], vocab: usize) -> Option<Vec<f32>> {
-        let lay = scratchy_subtile::sdsc_abstract::StickLayout::row_blocked(self.rows, self.width);
-        let mut out = Vec::with_capacity(self.rows * vocab);
-        for r in 0..self.rows {
-            for c in 0..vocab {
-                out.push(*flat.get(lay.dev_off(r, c))?);
-            }
-        }
-        Some(out)
-    }
+    // ⛔ THE HOST READBACK HALF IS GONE — `len` (the whole-placement element count for
+    // `read_tensor`) and `rows_contiguous` (the de-interleave into per-request rows) served
+    // the per-request logits readback the submit/collect split deleted: the sampler answers
+    // on the card now and the idx stick is the only readback. Both deleted with their
+    // readers, at the auditor's order — the struct stays for the load-time placement
+    // refusal and the rung's own log line.
 }
 
 /// What a forward should hand back from its lm-head tail. An enum rather than a `bool` because the
@@ -211,22 +225,53 @@ pub(crate) struct DecodeRung {
     // (`bundle::KvShifts::gathered`). Same authority as `latch_paged_geometry`'s `page_slots`: a bake
     // fact rides on the launch group it describes.
     pub(crate) sess: SuperDscSession,
-    /// THIS rung's logits geometry. It is per-rung, not per-model: the lm-head tail runs unfolded at
-    /// `m = seqs`, so the placement's row count — and therefore every gather address — differs
-    /// between rungs.
-    pub(crate) logits: LogitsGeom,
+    // ⛔ NO `logits` FIELD ANY MORE — the rung's LogitsGeom served the host per-request
+    // readback the submit/collect split deleted (the sampler answers on the card; the idx
+    // stick is the only readback). The LOAD-TIME refusal stays in spyre_load: a rung whose
+    // baked logits placement is missing or not whole rows still panics at load, off
+    // `LogitsGeom::from_placement` directly.
+}
+
+/// WHICH SESSION A DECODE STEP RUNS ON — the one-request OWNER, or one rung of the ladder.
+///
+/// The loader's `rn <= 1 → continue` means the W=1 rung IS the owner session (`decode`),
+/// not a ladder entry, so a single request is a batch of ONE on the owner — selected by the
+/// same `decode_rung_for` call every wider batch uses, never by a second branch.
+#[cfg(feature = "spyre-hw")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RungId {
+    /// The m=1 `decode` session every ladder rung aliases — the W=1 rung.
+    Owner,
+    /// Ladder rung `i` of `decode_rungs`.
+    Ladder(usize),
+}
+
+/// ONE DECODE SEAT: the launch-width facts plus the session they describe, whichever rung
+/// was chosen. The fields are exactly `DecodeRung`'s, so the launch reads one shape and
+/// never re-derives an owner fact it could get wrong — `seqs` is `1` on the owner.
+#[cfg(feature = "spyre-hw")]
+pub(crate) struct DecodeSeat<'a> {
+    pub(crate) seqs: scratchy_subtile::sdsc_abstract::RungWidth,
+    pub(crate) mask_cap: Option<scratchy_subtile::sdsc_abstract::BakedMaskBlocks>,
+    pub(crate) fold_rows: scratchy_subtile::sdsc_abstract::FoldRowRegime,
+    pub(crate) sess: &'a mut SuperDscSession,
 }
 
 #[cfg(feature = "spyre-hw")]
-pub(crate) enum LogitsWanted<'a> {
-    /// Nothing — every prompt chunk but the last, which launches no suffix and reads nothing back.
+pub(crate) enum LogitsWanted {
+    /// Nothing — every prompt chunk but the final one, which launches no suffix and reads
+    /// nothing back.
     None,
-    /// The FOLDED `[1, vocab]` tail: one row at placement offset 0, whatever `m` the bundle ran at.
-    /// This is a prompt's tail, where only the last row's logits are ever sampled.
+    /// The FINAL prompt chunk: its suffix runs, the rung's own minted sampler picks the
+    /// first generated token on the card from the folded lm-head row, and the idx stick
+    /// is read back exactly like a decode launch's.
     LastRow,
-    /// One row PER REQUEST: the tail ran unfolded at `m = geom.rows`, so every row is a different
-    /// request's next-token distribution and all of them are sampled.
-    PerRequest(&'a LogitsGeom),
+    /// A DECODE BATCH: one row per request, every row a different request. The
+    /// rung's sampler picks every token on the card; the idx stick's raw read is
+    /// deferred and comes back through the one collect door
+    /// (`collect_decode_tokens`) — in-call when the schedule cannot defer, from
+    /// the drain when it can. There is no synchronous decode arm.
+    PerRequestDeferred,
 }
 
 /// The sendnn run backend selected from the baked bundle shape. DEFAULT-mode
@@ -269,6 +314,12 @@ pub(crate) enum SendnnSession {
 #[cfg(feature = "spyre-hw")]
 pub(crate) struct SuperDscBundle {
     pub(crate) decode: SuperDscSession,
+    /// THE OWNER'S OWN LAUNCH FACTS — the W=1 rung's `mask_cap` and `fold_rows`, read from the
+    /// decode slot's own bundle at load exactly as each ladder rung's are. A single request is a
+    /// batch of ONE on the owner, so the shared decode launch reads these through
+    /// [`Self::decode_seat`] and never re-derives them (or hand-mirrors them as constants).
+    pub(crate) owner_mask_cap: Option<scratchy_subtile::sdsc_abstract::BakedMaskBlocks>,
+    pub(crate) owner_fold_rows: scratchy_subtile::sdsc_abstract::FoldRowRegime,
     /// PREFILL WIDTH LADDER — ASCENDING by baked query-row count `mq`; the last entry is the widest.
     /// EMPTY ⇒ no batched-prefill bundle at all (multi-token prompts fall back to the sequential
     /// mq=1 decode path).
@@ -421,9 +472,10 @@ impl SuperDscBundle {
         self.prefill_rungs.last().map(|(m, _)| *m).unwrap_or(0)
     }
 
-    /// Index of the SMALLEST decode rung that holds `live` requests, or `None` when the ladder is
-    /// empty or `live` exceeds the widest rung — the caller then falls back to one forward per
-    /// request, which is slower and never wrong.
+    /// THE RUNG A DECODE STEP RUNS ON — [`RungId::Owner`] when one request is live (the W=1
+    /// rung IS the owner session, by the loader's `rn <= 1 → continue`), else the index of the
+    /// SMALLEST ladder rung that holds `live` requests. `None` when `live` exceeds the widest
+    /// rung — the caller then refuses: there is no one-forward-per-request decode arm any more.
     ///
     /// 🛑 THE LIVE COUNT IS THE ONLY INPUT, and the launch must therefore be laid out from the live
     /// count too. `SlotMap` hands out slots densely for exactly this reason: any layout that reads a
@@ -434,8 +486,41 @@ impl SuperDscBundle {
     pub(crate) fn decode_rung_for(
         &self,
         live: scratchy_subtile::sdsc_abstract::LiveRows,
-    ) -> Option<usize> {
-        self.decode_rungs.iter().position(|r| r.seqs.holds(live))
+    ) -> Option<RungId> {
+        if live.get() <= 1 {
+            // The owner ALWAYS exists — it is the session every rung aliases — so the W=1
+            // seat is never absent and a single request never falls to a second path.
+            return Some(RungId::Owner);
+        }
+        self.decode_rungs
+            .iter()
+            .position(|r| r.seqs.holds(live))
+            .map(RungId::Ladder)
+    }
+
+    /// THE SEAT A DECODE STEP LAUNCHES THROUGH — the owner's facts and session for
+    /// [`RungId::Owner`], the rung's own for a ladder entry. ONE accessor, so a launch
+    /// cannot read one rung's width off another rung's session.
+    pub(crate) fn decode_seat(&mut self, id: RungId) -> DecodeSeat<'_> {
+        match id {
+            RungId::Owner => DecodeSeat {
+                // The owner is the m=1 bake; 1 is a baked width by `RungWidth`'s own law.
+                seqs: scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1)
+                    .expect("1 is a baked width"),
+                mask_cap: self.owner_mask_cap,
+                fold_rows: self.owner_fold_rows,
+                sess: &mut self.decode,
+            },
+            RungId::Ladder(i) => {
+                let r = &mut self.decode_rungs[i];
+                DecodeSeat {
+                    seqs: r.seqs,
+                    mask_cap: r.mask_cap,
+                    fold_rows: r.fold_rows,
+                    sess: &mut r.sess,
+                }
+            }
+        }
     }
 
     /// ⭐ THE CONTEXT CEILING EVERY PMASK IN THIS MODEL BAKED — the least of the decode rungs' own
@@ -636,6 +721,25 @@ pub(crate) struct ReqState {
     /// WHICH KV SLOTS THIS REQUEST'S KEYS OCCUPY. Its own `[0, prompt)` until it shares a step with a
     /// longer request, after which it holds a masked hole and its slot count exceeds `n_computed`.
     pub(crate) kv_hist: scratchy_subtile::sdsc_abstract::KvHistory,
+    /// ⭐ THE REQUEST'S DRAW — the seed and inverse temperature every launch this request's rows
+    /// run under, decided ONCE here at admission (nothing re-derives it mid-generation: the seat's
+    /// per-step staging is a pure function of this value plus the row's absolute position, the
+    /// step salt). `None` is the greedy law — temperature ≤ 0, or a request that arrived with no
+    /// sampling params at all — and stages the exact bytes the pre-sampler path did
+    /// (quadruple `(0, 0, 0, 0)`, `inv_t = 1.0`).
+    ///
+    /// ⛔ WHAT IT DOES NOT CARRY IS REFUSED AT THE DERIVATION ([`SampledDraw::of`]), not silently
+    /// dropped here: this path's draw is temperature alone, so a request asking for `top_p`,
+    /// `top_k`, `min_p`, penalties or `n > 1` is turned away at admission rather than served a
+    /// draw that ignores half of what it asked for.
+    ///
+    /// ⛔ CARD-ONLY, `cfg`-ed out like the `kv_k` mirror below rather than documented as unused:
+    /// every READER of this field stages the minted sampler's seat laws, and the mint is a
+    /// decode-bundle card fact — the emulator runs no minted sampler (its chunks pick nothing;
+    /// the pick step refuses naming the missing sampler), so under `spyre-emu` a request carries
+    /// no draw and the admission-time knob refusal moves to the pick step's own refusal.
+    #[cfg(feature = "spyre-hw")]
+    pub(crate) draw: Option<SampledDraw>,
     /// ⛔ A HOST MIRROR OF THE KV — and it does not exist on the sendnn path at all.
     ///
     /// Per-layer, row-major `[n_computed, kv_dim]`, grown one row per step by the KTIR EMULATOR's
@@ -653,6 +757,99 @@ pub(crate) struct ReqState {
     // scheduler allocates that page now, so a request's on-card KV is fully described by two things this
     // struct already has: `kv_hist` (which slots its keys occupy) and the host's block list in `InputBatch`.
     // The map one launch binds is derived from those on every bind and stored nowhere.
+}
+
+/// ⭐ ONE REQUEST'S DRAW, in the two numbers the card's noise kernel wants: a
+/// 64-bit seed (hashed on-card with the row's step salt and lane) and the
+/// inverse temperature the folded lm-head row is scaled by before the noise is
+/// added. Carried on [`ReqState::draw`] — one value per request, staged per
+/// step by the seat's binders.
+///
+/// ⛔ CARD-ONLY (the cfg of [`ReqState::draw`]): the draw exists to stage the
+/// minted sampler's seat laws, and the mint is a decode-bundle card fact — the
+/// emulator runs no minted sampler, so there is nothing on that build to stage
+/// a draw for.
+#[cfg(feature = "spyre-hw")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SampledDraw {
+    /// The seed of the row's quadruple `(seed_lo, seed_hi, step, 1)` — the
+    /// request's own when it arrived seeded, else the FNV-1a of its id (the
+    /// `fnv_seed` law: deterministic within a run, no process RNG, so an
+    /// unseeded draw is still a reproducible function of the request). The
+    /// key is request-owned alone (the P3 localization ruling): no row word,
+    /// so a request draws the same noise in any baked row.
+    pub(crate) seed: u64,
+    /// `1 / T` as f32 — the sampler's own scaling (`score = x·inv_t + g·gate`),
+    /// so temperature 1.0 stages the same `1.0` the greedy law does and only
+    /// the gate and seed words differ.
+    pub(crate) inv_t: f32,
+}
+
+#[cfg(feature = "spyre-hw")]
+impl SampledDraw {
+    /// ⭐ THE DRAW A REQUEST'S SAMPLING PARAMS ASK FOR — the ONE derivation, run
+    /// at admission. `Ok(None)` is the greedy law (no params, or temperature
+    /// ≤ 0 — the exact bytes the pre-sampler path staged). `Ok(Some)` is a draw:
+    /// the seeded-or-derived 64-bit seed and `1/T`. `Err` is a request this
+    /// path cannot serve honestly.
+    ///
+    /// ⛔ THE ERRORS ARE THE POINT. This path's on-card draw is TEMPERATURE
+    /// ALONE: `top_p`, `top_k`, `min_p`, the three penalties and `n > 1` have
+    /// no card leg here. Serving such a request anyway would answer a nucleus
+    /// ask with an unfiltered softmax sample — silently wrong in the one
+    /// direction nobody can see from the output — so the request is refused at
+    /// admission, naming every knob it asked for. The day a knob gains a card
+    /// leg, its arm moves from this refusal to the draw.
+    pub(crate) fn of(
+        req_id: &str,
+        sp: Option<&scratchy_core_common::SamplingParams>,
+    ) -> Result<Option<SampledDraw>, String> {
+        let Some(sp) = sp else {
+            // No params at all: nothing asked for a draw, and the greedy law is
+            // what the seat stages.
+            return Ok(None);
+        };
+        if sp.temperature <= 0.0 {
+            // Temperature 0 (and anything below it) is greedy by definition —
+            // the gate word's 0, `inv_t` irrelevant.
+            return Ok(None);
+        }
+        let refused: Vec<String> = [
+            (sp.top_p != 1.0, format!("top_p={}", sp.top_p)),
+            (sp.top_k > 0, format!("top_k={}", sp.top_k)),
+            (sp.min_p > 0.0, format!("min_p={}", sp.min_p)),
+            (
+                sp.presence_penalty != 0.0,
+                format!("presence_penalty={}", sp.presence_penalty),
+            ),
+            (
+                sp.frequency_penalty != 0.0,
+                format!("frequency_penalty={}", sp.frequency_penalty),
+            ),
+            (
+                sp.repetition_penalty != 1.0,
+                format!("repetition_penalty={}", sp.repetition_penalty),
+            ),
+            (sp.n > 1, format!("n={}", sp.n)),
+        ]
+        .into_iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, what)| what)
+        .collect();
+        if !refused.is_empty() {
+            return Err(format!(
+                "this Spyre path samples with temperature alone — request {req_id} also asked for \
+                 {}, which has no card leg here; refuse rather than serve a draw that ignores it",
+                refused.join(", ")
+            ));
+        }
+        Ok(Some(SampledDraw {
+            seed: sp
+                .seed
+                .unwrap_or_else(|| scratchy_core_common::fnv_seed64(req_id)),
+            inv_t: (1.0 / sp.temperature) as f32,
+        }))
+    }
 }
 
 #[allow(dead_code)]

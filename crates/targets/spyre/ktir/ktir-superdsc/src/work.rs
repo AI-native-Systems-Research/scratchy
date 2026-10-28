@@ -11,7 +11,7 @@
 //! ⛔ THE SPYRE MODEL, NOT THE KTIR EMITTER'S. 256 MB/core span and a 64-element fp16 stick; the
 //! `pick_k`/`n_block` formulas in the KTIR emitter are H100's and are the wrong hardware.
 
-use crate::superdsc_opspec::{ItDim, MAX_CORES, WorkPlan};
+use crate::superdsc_opspec::{Df, ItDim, MAX_CORES, WorkPlan};
 use std::collections::BTreeMap;
 
 pub const CORELETS_PER_CORE: u32 = 2;
@@ -169,15 +169,51 @@ impl CoreSplit {
     }
 }
 
-/// Pad a 64-aligned OUTPUT/KERNEL width `n64` so its STICK COUNT is core-splittable to the util floor
+/// ⭐ A WHOLE fp16-STICK COUNT — `bump_sticks_to_splittable`'s "`n64` MUST be a 64-multiple"
+/// contract was a doc comment a non-fp16-basis width could silently violate; it is the TYPE
+/// now. The pad's arithmetic (`sticks = n64 / 64`, `core_split`, the `<=` occupancy tests) is
+/// only meaningful over a whole-stick count: handed 32 — one fp32 stick, not a whole fp16
+/// one — it computed 0 sticks, `core_split(0)` = 1, and both pad arms' `<=` tests passed at
+/// zero, so the sampler's `[rows,1]` fp32 inv_t reserved 0 bytes ("t728 has size 0 in seg3",
+/// run 7) where the device would have read 2^27 flits. ONE CLASS, ONE LAW with the
+/// 2026-10-24 u32 chain-stick incident: a width that is not whole fp16 sticks is not the
+/// pad's to touch — it reserves its TRUE df-stick-whole bytes, unpadded.
+pub struct Fp16Sticks(u32);
+
+impl Fp16Sticks {
+    /// ⭐ SOME ONLY FOR A NONZERO 64-MULTIPLE — this constructor never rounds, so the bump's
+    /// zero-stick arm is unreachable by type: a caller cannot hand the pad a sub-stick width
+    /// and have it silently floor. `None` is not an error — it is the statement "this width is
+    /// not the pad's to touch," and the caller reserves the width's own bytes instead
+    /// ([`row_footprint_bytes`]' None arm).
+    pub fn exact(width: u32) -> Option<Self> {
+        if width != 0 && width.is_multiple_of(FP16_ELEMS_PER_STICK) {
+            Some(Self(width / FP16_ELEMS_PER_STICK))
+        } else {
+            None
+        }
+    }
+
+    /// The rounding constructor for callers that state a LOGICAL width: ceil to whole sticks.
+    /// A fixed point at every 64-multiple — `DeviceWidth::for_output`/`for_pointwise` already
+    /// round to 64 before calling, so their numbers do not move.
+    pub fn from_elems(elems: u32) -> Self {
+        Self(elems.div_ceil(FP16_ELEMS_PER_STICK))
+    }
+}
+
+/// Pad a whole-fp16-stick OUTPUT/KERNEL width so its STICK COUNT is core-splittable to the util floor
 /// (≥8 cores). A PRIME/awkward stick count (the granite lm_head: `49216/64 = 769`, prime) has
 /// `core_split(769, 32) = 1` ⇒ the gemm strands on ONE core (the util-floor #11 guard / the build-#3
 /// failure). Rounding the stick count UP to a multiple of 8 makes `core_split(8k, 32) ≥ 8` (8 | 8k). A
 /// no-op when the count is already splittable (all granite weights except the lm_head). SHARED by the
 /// emitter (applied when the matmul's MACs cross the util-floor) and the worker's weight zero-pad, so the
-/// staged buffer width matches the emitted device width by construction. `n64` MUST be a 64-multiple.
-pub fn bump_sticks_to_splittable(n64: u32) -> u32 {
-    let sticks = n64 / FP16_ELEMS_PER_STICK;
+/// staged buffer width matches the emitted device width by construction. The 64-multiple contract is
+/// [`Fp16Sticks`]'s type — a width that is not whole fp16 sticks never reaches this pad (see
+/// [`row_footprint_bytes`]).
+pub fn bump_sticks_to_splittable(sticks: Fp16Sticks) -> u32 {
+    let sticks = sticks.0;
+    let n64 = sticks * FP16_ELEMS_PER_STICK;
     let cur = core_split(sticks, MAX_CORES);
     if cur >= MAX_CORES {
         return n64; // already fills the machine
@@ -220,6 +256,27 @@ pub fn bump_sticks_to_splittable(n64: u32) -> u32 {
     } else {
         sticks.next_multiple_of(8) * FP16_ELEMS_PER_STICK
     }
+}
+
+/// ⭐ THE PER-ROW DEVICE FOOTPRINT — the single derivation the layout's `nbytes` multiplies by
+/// rows (the fp8 k-pad row widening stays at that call site: it is a ROWS fact, not a width
+/// one). Extracted pure so the reservation law is provable where the card constants live:
+///   * a tensor's width is stated at its OWN `Df`'s stick basis — whole sticks at that df,
+///     never a partial stick, never floored (Kani: `(a)`);
+///   * the reservation is whole 128 B sticks, whatever the df (Kani: `(b)`);
+///   * a width that IS whole fp16 sticks takes the occupancy pad — byte-identical to every
+///     fp16 and fp8 placement, whose stick multiples are 64-multiples (Kani: `(c)`);
+///   * a width that is NOT whole fp16 sticks (fp32's and u32's 32-element sticks) reserves
+///     its TRUE df-stick-whole bytes, UNPADDED — the pad is a core-split law for STREAMED
+///     widths, and a sub-stick column is never core-split (Kani: `(d)`). The exact
+///     reservation makes `size / rows` the row stride the staging writes at.
+pub fn row_footprint_bytes(cols: u32, df: Df) -> u64 {
+    let width = cols.next_multiple_of(df.elems_per_stick());
+    let body = match Fp16Sticks::exact(width) {
+        Some(sticks) => bump_sticks_to_splittable(sticks) as u64,
+        None => width as u64,
+    };
+    body * df.word_length() as u64
 }
 
 /// The contraction-K width of an fp8 W8A8 matmul's ACTIVATION and WEIGHT, rounded to a whole
@@ -318,7 +375,7 @@ impl DeviceWidth {
         let n64 = logical_n.next_multiple_of(FP16_ELEMS_PER_STICK);
         let macs = m as u64 * n64 as u64 * k as u64;
         DeviceWidth(if macs >= (1 << 20) {
-            bump_sticks_to_splittable(n64)
+            bump_sticks_to_splittable(Fp16Sticks::from_elems(n64))
         } else {
             n64
         })
@@ -330,9 +387,24 @@ impl DeviceWidth {
     /// producer of a padded tensor — lm_head/o_proj/down_proj), so a pointwise CONSUMER addresses the exact
     /// same device layout its matmul PRODUCER emitted. (Kani: `devwidth_pointwise_matches_matmul`.)
     pub fn for_pointwise(logical_n: u32) -> DeviceWidth {
-        DeviceWidth(bump_sticks_to_splittable(
+        DeviceWidth(bump_sticks_to_splittable(Fp16Sticks::from_elems(
             logical_n.next_multiple_of(FP16_ELEMS_PER_STICK),
-        ))
+        )))
+    }
+
+    /// The device width of a dtype-CONVERT's slab `[·, logical_cols]` — round up to a whole
+    /// 64-element device stick and STOP. ⭐ THE β LAW (front-b-noise, auditor ruling 2026-10-27):
+    /// a crossed convert's minted `[B, 1]` intermediate (the sampler's gate chain) sweeps the
+    /// 64-ELEMENT device width — the α cell's base bake measured our own `PlanCorelets` refusing a
+    /// 32-element tile ("innermost/stick dimension is a multiple of the 64-element stick width"),
+    /// and `convert_opspec`'s own basis is the 64-elem fp16 stick — so the ONE width the door
+    /// sweeps, the mint's reservation, and the gate table's placement all take is ceil-to-64.
+    /// A fixed point at every 64-multiple: byte-identical for every convert ever emitted (all
+    /// full-row-width). ⛔ NO splittable bump — the util floor is a matmul-OUTPUT occupancy law;
+    /// a convert's slab has no floor to meet, and `row_footprint_bytes`'s fp16 pad would bump a
+    /// one-stick sweep to 8 sticks (2048 B/row) for no device reason at all.
+    pub fn for_convert(logical_cols: u32) -> DeviceWidth {
+        DeviceWidth(logical_cols.next_multiple_of(FP16_ELEMS_PER_STICK))
     }
 
     pub fn get(self) -> u32 {
@@ -1319,7 +1391,8 @@ mod one_row_fill_tests {
 
 #[cfg(kani)]
 mod kani_proofs {
-    use super::one_row_core_fill;
+    use super::{DeviceWidth, FP16_ELEMS_PER_STICK, one_row_core_fill, row_footprint_bytes};
+    use crate::superdsc_opspec::Df;
 
     /// ⭐ THE FILL IS AN EXACT PARTITION OF BOTH AXES, AND NEVER WORSE THAN THE OUT-ONLY SPLIT.
     ///
@@ -1343,5 +1416,58 @@ mod kani_proofs {
             o * i >= super::core_split(os, 32),
             "never fewer cores than out-only"
         );
+    }
+
+    /// ⭐ THE PER-ROW FOOTPRINT NEVER FLOORS, AND PADS ONLY WHOLE fp16 STICKS.
+    ///
+    /// For every column count up to the bound, at every device format:
+    ///   (a) the reservation covers every element's bytes — never floored. The run-7 wall
+    ///       (`t728 has size 0 in seg3`): the sampler's `[rows,1]` fp32 inv_t rounded its width
+    ///       to one fp32 stick (32 elements), `bump_sticks_to_splittable` took those for ZERO
+    ///       fp16 sticks, `core_split(0)` = 1, and both pad arms' `<=` tests passed at zero —
+    ///       0 bytes reserved for a tensor the device then reads as 2^27 flits;
+    ///   (b) the reservation is whole 128 B sticks, whatever the df;
+    ///   (c) at a width that IS whole fp16 sticks, the reservation is exactly the occupancy
+    ///       pad's own result (`DeviceWidth::for_pointwise` — the emitter's device-width law,
+    ///       an independent production path), so every fp16/fp8 placement is byte-identical;
+    ///   (d) at a width that is NOT whole fp16 sticks (fp32's and u32's 32-element sticks),
+    ///       the reservation is the width's own true df-stick-whole bytes, UNPADDED — the pad
+    ///       is a core-split law for STREAMED widths, and a sub-stick column is never
+    ///       core-split (the 2026-10-24 u32 chain-stick class, one law for both incidents).
+    #[kani::proof]
+    #[kani::unwind(34)]
+    fn the_row_footprint_never_floors_and_pads_only_whole_fp16_sticks() {
+        let cols: u32 = kani::any();
+        kani::assume((1..=4096).contains(&cols));
+        for df in [
+            Df::Fp16,
+            Df::Fp32,
+            Df::Fp8,
+            Df::SenInt8,
+            Df::Bf16,
+            Df::SenUint32,
+        ] {
+            let fp = row_footprint_bytes(cols, df);
+            let wl = df.word_length() as u64;
+            assert!(
+                fp >= cols as u64 * wl,
+                "(a) never floored: every element's bytes are reserved"
+            );
+            assert!(fp % 128 == 0, "(b) whole 128 B sticks");
+            let width = cols.next_multiple_of(df.elems_per_stick());
+            if width % FP16_ELEMS_PER_STICK == 0 {
+                assert_eq!(
+                    fp,
+                    DeviceWidth::for_pointwise(width).get() as u64 * wl,
+                    "(c) whole-fp16-stick widths keep the occupancy pad's own bytes"
+                );
+            } else {
+                assert_eq!(
+                    fp,
+                    width as u64 * wl,
+                    "(d) a sub-fp16-stick width reserves its true df-stick bytes, unpadded"
+                );
+            }
+        }
     }
 }

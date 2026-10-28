@@ -1,0 +1,56 @@
+{
+  "probe": "8b-fp8-device-sampling",
+  "model": "RedHatAI/granite-3.1-8b-instruct-FP8-dynamic",
+  "prompt": "Write two sentences about the ocean.",
+  "g1_greedy_solo_equals_main": true,
+  "p1_same_seed_identical": true,
+  "p2_diff_seed_different": true,
+  "b2_concurrent_greedy": {
+    "gate_multiset_equals_main_batched": false,
+    "pairwise_by_file": false,
+    "note": "main's own 2-concurrent greedy texts are the reference (batched numerics), never solo",
+    "info_branch_b2_equals_branch_solo": false,
+    "info_main_b2_equals_main_solo": false
+  },
+  "b2_first_divergence": {
+    "branch_a_vs_main_a": {
+      "at_char": 9,
+      "x": "The oceanan, is a vast which ",
+      "y": "The ocean, covering over 70% "
+    },
+    "branch_b_vs_main_b": {
+      "at_char": 3,
+      "x": "TheThe,,,ly,\nThe me. Th",
+      "y": "The ocean, covering ove"
+    }
+  },
+  "log_evidence": {
+    "seat_bind_lines": 323,
+    "seat_bound_seed_1234": true,
+    "seat_bound_seed_9999": true,
+    "prefill_batched_lines": 6,
+    "decode_batch_lines": 1,
+    "two_row_rung_line": true,
+    "seat_readback_lines": 323,
+    "refusals_or_panics": [],
+    "sample_seat_lines": [
+      "2026-10-27T11:33:08.999016Z DEBUG SEAT_BIND rows=1 seed_words=[727, 728, 729, 730] invt=t731 laws=r0:greedy@step0",
+      "2026-10-27T11:33:09.166730Z DEBUG SEAT_BIND rows=1 seed_words=[727, 728, 729, 730] invt=t731 laws=r0:greedy@step67",
+      "2026-10-27T11:33:09.242819Z DEBUG SEAT_BIND rows=1 seed_words=[727, 728, 729, 730] invt=t731 laws=r0:greedy@step68",
+      "2026-10-27T11:33:09.316784Z DEBUG SEAT_BIND rows=1 seed_words=[727, 728, 729, 730] invt=t731 laws=r0:greedy@step69",
+      "2026-10-27T11:33:09.389975Z DEBUG SEAT_BIND rows=1 seed_words=[727, 728, 729, 730] invt=t731 laws=r0:greedy@step70",
+      "2026-10-27T11:33:09.463307Z DEBUG SEAT_BIND rows=1 seed_words=[727, 728, 729, 730] invt=t731 laws=r0:greedy@step71"
+    ]
+  },
+  "texts": {
+    "main_greedy_solo": "The ocean, covering over 70% of the Earth's surface, is the largest habitat on our planet, teeming with diverse marine life and playing a crucial role in regulating the climate. Its vastness and depth remain largely unexplored, revealing new",
+    "main_b2_a": "The ocean, covering over 70% of the Earth's surface, is the largest habitat on our planet, teeming with diverse marine life and playing a crucial role in regulating the climate. Its vastness and depth remain largely unexplored, revealing new",
+    "main_b2_b": "The ocean, covering over 70% of the Earth's surface, is the largest habitat on our planet, teeming with diverse marine life and playing a crucial role in regulating the global climate. Its depths remain largely unexplored, revealing new species",
+    "branch_greedy_solo": "The ocean, covering over 70% of the Earth's surface, is the largest habitat on our planet, teeming with diverse marine life and playing a crucial role in regulating the climate. Its vastness and depth remain largely unexplored, revealing new",
+    "branch_b2_a": "The oceanan, is a vast which is vast0 vast expansse, of salt.water,, covering about 7 7 7 of the Earth's surface,, plays home to a dive array of marine lifelife and ecosystems. The oceanan plays home to",
+    "branch_b2_b": "TheThe,,,ly,\nThe me. The:.:,how S\nly, masaselyless\nifiedingee\n\n\n\n\ng\n\n\n\n.\n be\nx,to\nance with with:ant\nly ar are\n,. may contain traces",
+    "branch_solo_seed1234_a": "1. The ocean, spanning vast distances across the Earth's surface, is home to a diverse array of marine life and plays a crucial role in climate regulation and the global carbon cycle.\n\n2. Covering more than 70% of the Earth's surface, the",
+    "branch_solo_seed1234_b": "1. The ocean, spanning vast distances across the Earth's surface, is home to a diverse array of marine life and plays a crucial role in climate regulation and the global carbon cycle.\n\n2. Covering more than 70% of the Earth's surface, the",
+    "branch_solo_seed9999": "The ocean, a vast and complex ecosystem, covers approximately 71% of the Earth's surface and hosts an incredible diversity of marine life. Its influence extends far beyond its physical boundaries, playing a crucial role in regulating the global climate, supporting human livelihoods"
+  }
+}

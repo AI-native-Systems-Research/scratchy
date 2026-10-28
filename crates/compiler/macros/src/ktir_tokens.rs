@@ -39,7 +39,8 @@ pub fn preamble() -> proc_macro2::TokenStream {
         };
         #[allow(unused_imports)]
         use ::scratchy_target_spyre::bundle_code::{
-            LaunchProgram as __KProg, PlaceId as __KPlace, SynthRole as __KRole,
+            Elementwise as __KElem, LaunchProgram as __KProg, PlaceId as __KPlace,
+            Program as __KProgram, SynthRole as __KRole,
         };
         #[allow(unused_imports)]
         use ::std::borrow::Cow::Borrowed as __KCow;
@@ -382,19 +383,93 @@ fn function_tokens(f: &ktir_core::ir::IRFunction<'static>) -> proc_macro2::Token
     }
 }
 
+/// ⭐ THE CARRIED KIND, AS TOKENS. [`LaunchProgram::program`] is a pure carry the hw runtime never
+/// reads, but the emitted `__KProg` literals must still FILL it — a struct literal with a missing
+/// field is an E0063 wall (2770 of them on the first compile that reached the emitted source).
+/// Unit variants ride the module's own Debug-name idiom; the three payload variants render their
+/// fields explicitly, unsuffixed, the same as every other literal here.
+///
+/// ⛔ NO `_` ARM: a new `Program` variant is a compile error at THIS match, the same
+/// completeness law `Elementwise::ALL`'s `declared_index` states — an emitter that silently
+/// dropped a new kind would lower it as nothing and the doors would never see it.
+fn program_kind_tokens(
+    p: &scratchy_target_spyre::bundle_code::Program,
+) -> proc_macro2::TokenStream {
+    use scratchy_target_spyre::bundle_code::Program;
+    match p {
+        Program::Elementwise(e) => {
+            let v = variant(format!("{e:?}"));
+            quote! { __KProgram::Elementwise(__KElem::#v) }
+        }
+        Program::SiluMul => quote! { __KProgram::SiluMul },
+        Program::RmsNorm => quote! { __KProgram::RmsNorm },
+        Program::RmsNormUnit => quote! { __KProgram::RmsNormUnit },
+        Program::TanhSoftCap => quote! { __KProgram::TanhSoftCap },
+        Program::ScalarWeightMul => quote! { __KProgram::ScalarWeightMul },
+        Program::Reshape => quote! { __KProgram::Reshape },
+        Program::ScalarMul => quote! { __KProgram::ScalarMul },
+        Program::Matmul => quote! { __KProgram::Matmul },
+        Program::Sample => quote! { __KProgram::Sample },
+        Program::LmLast => quote! { __KProgram::LmLast },
+        Program::Rope => quote! { __KProgram::Rope },
+        Program::Attn => quote! { __KProgram::Attn },
+        Program::Transpose => quote! { __KProgram::Transpose },
+        Program::EmbedRowGather { k } => {
+            let k = proc_macro2::Literal::u32_unsuffixed(*k);
+            quote! { __KProgram::EmbedRowGather { k: #k } }
+        }
+        Program::ChainStage {
+            pad_vocab,
+            table_rows,
+            k,
+            hidden,
+        } => {
+            let pad_vocab = proc_macro2::Literal::u32_unsuffixed(*pad_vocab);
+            let table_rows = proc_macro2::Literal::u32_unsuffixed(*table_rows);
+            let k = proc_macro2::Literal::u32_unsuffixed(*k);
+            let hidden = proc_macro2::Literal::u32_unsuffixed(*hidden);
+            quote! {
+                __KProgram::ChainStage {
+                    pad_vocab: #pad_vocab,
+                    table_rows: #table_rows,
+                    k: #k,
+                    hidden: #hidden,
+                }
+            }
+        }
+        Program::WindowedRmsNorm { unit } => {
+            quote! { __KProgram::WindowedRmsNorm { unit: #unit } }
+        }
+    }
+}
+
 pub fn program_tokens(
     p: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::LaunchProgram<'static>,
     interner: &mut ProgramInterner,
 ) -> proc_macro2::TokenStream {
     let func = interner.ident(&p.func);
+    let prog = program_kind_tokens(&p.program);
     let binds = p.args.iter().map(|(s, id)| {
         let (s, id) = (ssa(*s), place_id_tokens(*id));
         quote! { (#s, #id) }
     });
+    // ⭐ THE PIN WINDOW THIS PROGRAM RUNS UNDER — the bundle layout's own `lx_window_fits`
+    // budget, carried as `Some(bytes)` exactly as the bake stamped it. `None` (no window was
+    // ever proven) round-trips as `None`: the resident fused path refuses it at load, and the
+    // refusal must survive the bake → inventory → worker trip.
+    let lxpw = match p.lx_pin_window_bytes {
+        Some(b) => {
+            let lit = proc_macro2::Literal::u64_unsuffixed(b);
+            quote! { ::core::option::Option::Some(#lit) }
+        }
+        None => quote! { ::core::option::Option::None },
+    };
     quote! {
         __KProg {
             func: #func,
+            program: #prog,
             args: __KCow(&[#(#binds),*]),
+            lx_pin_window_bytes: #lxpw,
         }
     }
 }

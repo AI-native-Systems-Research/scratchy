@@ -129,6 +129,11 @@ pub const NUM_SEGMENTS: usize = 7;
 /// `audit_layout_addresses`.
 pub const MAX_SEGMENT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
+/// WHAT A LAUNCH'S PROGRAM COMPUTES, and the pointwise kinds it names — re-exported for the same
+/// reason as [`PlaceId`]: [`LaunchProgram::program`] carries the kind, so the token emitter
+/// (`ktir_tokens`) renders it through THIS crate's path into the generated source, and the macro
+/// crate depends on the target crate, never on `ktir-superdsc` directly.
+pub use ktir_superdsc::ktir_node::{Elementwise, Program};
 /// ⭐ THE OPERAND IDENTITY — declared in the lowering's own scratchy-free leaf and re-exported here,
 /// so every `bundle::PlaceId` / `bundle::SynthRole` path in the tree resolves unchanged. See
 /// [`ktir_superdsc::place`] for both types and for why a [`SynthRole`] belongs to the lowering that
@@ -251,6 +256,32 @@ pub struct BundleLayout<'a> {
     /// pins, and `chunk_gather_index_table` passes it beside [`Self::lx_op_local_bytes`] so the
     /// host refuses exactly what the bake refused. 0 for a bundle whose chunk form mints none.
     pub lx_prob_pin_bytes: u64,
+    /// ⭐ THE WHOLE PIN WINDOW, in bytes — core-local pins + op-local slot classes, the exact
+    /// budget the bake's own `lx_window_fits` guard proved for this bundle's layout. Stamped from
+    /// the placement layout's own two terms (one accessor, no recomputation) so the EMULATOR's
+    /// resident fused path can charge the same window per segment: the card holds exactly these
+    /// pins for a fused segment's run and nothing else (its intermediates are HBM synth regions),
+    /// so the emulator's LX guard and the bake's guard prove one budget. Each of this bundle's
+    /// `LaunchProgram`s carries the same number beside its func. `None` when no placement layout
+    /// was computed for this bundle — no window was ever proven, and the resident fused path
+    /// REFUSES such a program at load rather than charging nothing silently.
+    pub lx_pin_window_bytes: Option<u64>,
+    /// ⭐ THE GRAPH'S OWN CALLER-FILLED SOURCE COUNT — ids `0..num_sources` are host-filled every
+    /// forward, and the runtime's completeness check walks exactly that range. Stamped by the
+    /// bake (the same `ir.num_sources` the placement pass packed from) because the count is
+    /// GRAPH-LOCAL: the sample mint's eleven seats (the per-row noise and temperature plus the
+    /// nine tables) live at `[num_sources, num_sources+11)` of the minted graph, so the minted
+    /// wiring's count does not name an unminted rung's sources.
+    /// Every session — owner, ladder rung, batch rung — reads the count off the bundle it
+    /// actually runs, the `SegRole::Logits` law: a bundle-stated fact survives renumbering
+    /// because each bundle states its own.
+    pub num_sources: u32,
+    /// ⭐ THE SOURCES NO PER-STEP BIND FILLS — prefix-KV caches and load-time constant tables,
+    /// the ids the completeness check excuses. The bake derives them from the same nodes the
+    /// wiring's `layers`/`load_consts` lists derive from, and asserts each is a real source of
+    /// THIS graph (`< num_sources`). The worker chains the spilled weight tail on at load (a
+    /// copy decision the layout cannot make for it) and hands the union to the session.
+    pub resident_source_tids: Cow<'a, [u32]>,
 }
 
 impl<'a> BundleLayout<'a> {
@@ -392,9 +423,26 @@ impl KvShifts {
 pub struct LaunchProgram<'a> {
     /// The constructed program.
     pub func: ktir_core::ir::IRFunction<'a>,
+    /// WHAT THE PROGRAM COMPUTES — the node kind, carried from the minting KtirNode's own
+    /// non-optional `program` (the one statement of the fact, paired with the payload at
+    /// construction), so a consumer that dispatches on the kind reads a TYPE, never a name.
+    /// Pure carry: the hw runtime never reads it — `into_code`'s hw arm serializes no
+    /// `programs` — so it changes no emitted byte.
+    pub program: ktir_superdsc::ktir_node::Program,
     /// Parameter -> the tensor it carries, in parameter order. Carried from the construction that
     /// minted the parameter, never re-derived from a name.
     pub args: Cow<'a, [(ktir_core::ir::Ssa, PlaceId)]>,
+    /// ⭐ THE LX PIN WINDOW THIS PROGRAM RUNS UNDER — its bundle layout's own
+    /// `lx_window_fits` budget (core-local pins + op-local slot classes), stamped at the
+    /// construction that minted the program from that layout. The resident fused path's
+    /// ONLY LX charge (auditor ruling 2026-10-27): the card holds these pins and nothing
+    /// else for the run — intermediates are HBM — so the emulator charges this per
+    /// segment and never the tiles. Read from the bundle, never inferred from shape.
+    /// `None` = no window was ever proven for this program (minted without a placement
+    /// layout): the resident fused path REFUSES a `None` at load, naming the program —
+    /// a missing window must not pass the LX guard as a silent zero. A hand-built
+    /// program states its window explicitly, or it does not run.
+    pub lx_pin_window_bytes: Option<u64>,
 }
 
 /// ONE LAUNCH: a contiguous run of up to `group_size()` trips that dxp compiled into a single device
@@ -788,13 +836,22 @@ mod tests {
         grid: (2, 1, 1),
         return_type: None,
     };
+    // The kind is inert at these two consts (ordering fixtures over EMPTY functions — no ops, so
+    // the enum's own "only program with no compute op at all" class); the field's readers are the
+    // door discriminators, and no fixture here is a door.
     const PROGS_A: &[LaunchProgram<'static>] = &[LaunchProgram {
         func: F_A,
+        program: ktir_superdsc::ktir_node::Program::LmLast,
         args: Cow::Borrowed(&[]),
+        // Stated EXPLICITLY (auditor ruling 2026-10-27): a hand-built const program
+        // mints no LX pins, so its window is zero — stated, not defaulted.
+        lx_pin_window_bytes: Some(0),
     }];
     const PROGS_B: &[LaunchProgram<'static>] = &[LaunchProgram {
         func: F_B,
+        program: ktir_superdsc::ktir_node::Program::LmLast,
         args: Cow::Borrowed(&[]),
+        lx_pin_window_bytes: Some(0),
     }];
 
     #[test]

@@ -43,5 +43,5 @@ pub use request::{
 };
 pub use sampling::{
     GpuSampleParams, LogprobsOutput, RequestOutputKind, SamplingParams, SamplingType, TokenLogprob,
-    fnv_seed, seed_to_uniform,
+    fnv_seed, fnv_seed64, seed_to_uniform,
 };
