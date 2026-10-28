@@ -371,6 +371,8 @@ pub struct Model {
     pub cache_ladder_llama_cpp: Option<Vec<Rep>>,
     #[serde(default)]
     pub cache_ladder_mistralrs: Option<Vec<Rep>>,
+    #[serde(default)]
+    pub cache_ladder_splash: Option<Vec<Rep>>,
     pub scaling: Option<Vec<Cell>>,
     pub scaling_mlx_lm: Option<Vec<Cell>>,
     pub scaling_ollama: Option<Vec<Cell>>,
@@ -384,6 +386,8 @@ pub struct Model {
     pub scaling_llama_cpp: Option<Vec<Cell>>,
     #[serde(default)]
     pub scaling_mistralrs: Option<Vec<Cell>>,
+    #[serde(default)]
+    pub scaling_splash: Option<Vec<Cell>>,
     /// Per engine key, what it served: the ollama tag or GGUF file and its
     /// quantization, and the files' revision.
     #[serde(default)]
