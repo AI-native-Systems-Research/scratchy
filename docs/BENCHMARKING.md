@@ -128,6 +128,14 @@ nothing is self-reported.
   already pushed the mark to ~270 MiB.
 - **`evicted`** — KiB that left the page cache when a FROZEN repetition's
   eviction ran, from `/proc/meminfo` `Cached` sampled either side of it.
+- **`power`** — total energy across a whole Metal matrix run, not a per-request
+  metric: `macmon` (IOReport, no root) samples system, GPU and CPU power at
+  1 Hz for the run's life, and the runner integrates the trapezoid at exit
+  into the run JSON as `power.system_energy_j` (whole-system estimate) and
+  `power.gpu_energy_j` (the GPU rail). The CPU rail reads 0 through IOReport
+  on some chips (verified under load on an M5 Max), so the system estimate —
+  not a rail sum — is the total. Without `macmon` installed, no power is
+  sampled and the JSON carries no `power` key.
 
 ### Proving the eviction happened
 

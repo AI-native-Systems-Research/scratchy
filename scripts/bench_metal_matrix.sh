@@ -20,6 +20,8 @@
 #   warm: send -> first token, median over unique prompts to a resident server
 #   peak RSS, major faults             scr bench startup --exec (per child, wait4)
 #   TTFT/TPOT/ITL p50+p99, tok/s       scr bench serve (warm, conc 1)
+#   energy J, system estimate and      macmon (IOReport, no root) sampled 1 Hz
+#     GPU rail, over the whole run     for the run's life, folded in at exit
 #   prompt x answer x users grid       scr bench serve (1, 2, 4 users;
 #     (heat maps, every curve)           128 to 8192 in;
 #                                        64 out, --full adds 512 and 2048 at 1)
@@ -28,6 +30,8 @@
 #
 # Needs: passwordless `sudo purge` for the frozen rung (a sudoers rule for
 # /usr/sbin/purge; see the Metal bench skill), or pass --scenarios cold,warm.
+# macmon (brew) for the run's energy number — without it no power is sampled,
+# the JSON carries no "power" key, and the run says so at startup.
 # Weights download on first use unless --offline.
 #
 # Scaling (--no-scaling skips it; --scale-axes picks from conc,input,output,grid):
@@ -717,6 +721,7 @@ kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "${c}"; done; kil
 # pgrep printed its usage on each and the exit never finished.
 cleanup() {
     exec >/dev/null; echo
+    fold_power || true                # first, so its log is complete when folded
     serve_down
     local c; for c in $(pgrep -P $$); do kill_tree "${c}"; done
     # A killed subshell orphans its children, so also stop whatever is on this run's port.
@@ -725,6 +730,81 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
+
+# ---- power --------------------------------------------------------------------
+# Total energy across the run, one number in the run JSON: macmon (IOReport,
+# no root) samples system, GPU and CPU power once a second into
+# ${RAW}/power.csv. A python in the pipeline thins each sample to one csv
+# line — a full run at 1 Hz of macmon's whole JSON would be ~100 MB. It runs
+# at NORMAL priority, unlike mem_sampler's taskpolicy -b: measured under full
+# load, background QoS starves the sampler (1 sample in 6 s vs 11 at normal
+# priority), and a sampler that goes quiet exactly at peak draw undercounts
+# energy — the one bias that matters here. At 1 Hz its cost is milliseconds
+# of CPU a second. fold_power stops the sampler, integrates P over time and
+# writes d["power"]; the exit trap calls it too, so a run that dies still gets
+# its number. The CPU rail reads 0 through IOReport on some chips (this M5
+# Max included, verified under load) — where it does, the system estimate,
+# not a rail sum, is the total.
+POWER_LOG="${RAW}/power.csv"
+POWER_PID=""
+if command -v macmon >/dev/null 2>&1; then
+    macmon pipe -i 1000 2>/dev/null | python3 -u -c '
+import json, sys
+for line in sys.stdin:   # one macmon sample -> "timestamp,sys_w,gpu_w,cpu_w"
+    try: d = json.loads(line)
+    except ValueError: continue
+    print(d.get("timestamp"), d.get("sys_power"), d.get("gpu_power"), d.get("cpu_power"), sep=",", flush=True)
+' >"${POWER_LOG}" 2>/dev/null & POWER_PID=$!
+    echo "power   : macmon (IOReport), 1 Hz"
+else
+    echo "power   : not measured (macmon not installed)" >&2
+fi
+fold_power() {
+    [[ -n "${POWER_PID}" ]] || return 0
+    kill "${POWER_PID}" 2>/dev/null || true
+    wait "${POWER_PID}" 2>/dev/null || true
+    POWER_PID=""
+    [[ -s "${POWER_LOG}" && -f "${JSON}" ]] || return 0
+    python3 - "${POWER_LOG}" "${JSON}" <<'PY' || true
+import json, sys
+from datetime import datetime
+rows = []
+for line in open(sys.argv[1]):        # timestamp,sys_w,gpu_w,cpu_w
+    p = line.strip().split(",")
+    if len(p) != 4:
+        continue                      # a kill can cut the last line mid-write
+    try:
+        rows.append((datetime.fromisoformat(p[0]), *(float(x) for x in p[1:])))
+    except ValueError:
+        continue
+if len(rows) < 2:
+    sys.exit(0)
+t = [r[0] for r in rows]
+def energy(col):                      # trapezoid over the sample timestamps
+    return sum((rows[i - 1][col] + rows[i][col]) / 2 * (t[i] - t[i - 1]).total_seconds()
+               for i in range(1, len(rows)))
+def series(col):
+    return [r[col] for r in rows]
+d = json.load(open(sys.argv[2]))
+d["power"] = {
+    "source": "macmon pipe (IOReport), 1 Hz",
+    "samples": len(rows),
+    "window_s": round((t[-1] - t[0]).total_seconds(), 1),
+    "system_energy_j": round(energy(1), 1),
+    "gpu_energy_j": round(energy(2), 1),
+    "cpu_energy_j": round(energy(3), 1),
+    "system_avg_w": round(sum(series(1)) / len(rows), 2),
+    "system_peak_w": round(max(series(1)), 2),
+    "gpu_avg_w": round(sum(series(2)) / len(rows), 2),
+    "gpu_peak_w": round(max(series(2)), 2),
+    "note": "system_* is IOReport's whole-system estimate; the cpu rail reads 0 on chips that do not expose it, so the rail sum is not the total",
+}
+json.dump(d, open(sys.argv[2], "w"), indent=2)
+print(f"power   : {d['power']['system_energy_j'] / 3600:.2f} Wh system"
+      f" ({d['power']['gpu_energy_j'] / 3600:.2f} Wh on the gpu rail)"
+      f" over {d['power']['window_s']:.0f} s -> {sys.argv[2]}")
+PY
+}
 
 max_of() { local m=0 x; IFS=',' read -r -a _xs <<<"$1"; for x in "${_xs[@]}"; do (( x > m )) && m=${x}; done; echo "${m}"; }
 
@@ -1644,6 +1724,7 @@ done
 
 echo; echo "================================================================"
 summary
+fold_power
 
 # A model scratchy never served must fail the run, not sit in the table as a
 # row of dashes: a preset that matches no checkpoint looks exactly like that.
