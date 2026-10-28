@@ -102,12 +102,6 @@ pub struct RuntimeBindings {
     /// The packed code stores are the canonical KV (~4.7x smaller); the per-layer
     /// dequant fills the (reused) `kv_cache_k/v` scratch before each attention.
     pub tq: Option<TqRuntimeBuffers>,
-    /// `[1]` u32 — actual `num_tokens` of the in-flight forward.
-    /// The pool writes the current call's `num_tokens` into this
-    /// 4-byte buffer at the start of every `forward()` so kernels
-    /// that need M at runtime can read it without a function
-    /// constant (M varies per call).
-    pub num_tokens_u32: Buffer,
     /// `[1]` u32 — the in-flight forward's sampled rows' count
     /// ([`super::ForwardInputs::sampled_rows`]). Read by the
     /// `gather_sampled_rows`/`put_sampled_rows_back` kernels.
@@ -355,7 +349,6 @@ impl RuntimeBindings {
             RuntimeBindingKind::TqSigns => &self.tq().signs,
             RuntimeBindingKind::TqBoundaries => &self.tq().boundaries,
             RuntimeBindingKind::TqCentroids => &self.tq().centroids,
-            RuntimeBindingKind::NumTokensU32 => &self.num_tokens_u32,
             RuntimeBindingKind::NumSampleRowsU32 => &self.num_sample_rows_u32,
             RuntimeBindingKind::SampleIndices => &self.sample_indices,
             RuntimeBindingKind::GdnConvState { layer } => {
