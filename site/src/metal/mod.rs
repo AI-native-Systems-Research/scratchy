@@ -665,13 +665,6 @@ fn opt(v: Option<u32>) -> String {
     v.map_or("?".to_string(), |v| v.to_string())
 }
 
-/// Counts written as a list: `1, 2, 4`.
-fn counts(v: &[u32]) -> String {
-    (v.iter().map(u32::to_string))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 fn headers<const N: usize>(names: [&str; N]) -> Vec<String> {
     names.map(String::from).to_vec()
 }
@@ -2454,13 +2447,6 @@ impl Set {
             Set::Small
         }
     }
-
-    fn title(self, large_from_gb: u32) -> String {
-        match self {
-            Set::Small => format!("Below {large_from_gb} GB"),
-            Set::Large => format!("{large_from_gb} GB and up"),
-        }
-    }
 }
 
 /// A set's heat map shape: users at once down the side, prompt tokens across.
@@ -2742,14 +2728,12 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
     };
     let chips: Vec<&str> = in_order(machines);
     // The heat maps a matrix per set, each in its own shape: machines read up within it.
-    let sets: Vec<(Set, Vec<&str>)> = (Set::ALL.into_iter())
-        .map(|set| {
-            let rows = (chips.iter().copied())
-                .filter(|&chip| lineup.set(memory(chip)) == set)
-                .collect();
-            (set, rows)
+    // Every machine a row of one grid, the small set's first.
+    let rows: Vec<&str> = (Set::ALL.into_iter())
+        .flat_map(|set| {
+            let lineup = &lineup;
+            (chips.iter().copied()).filter(move |&chip| lineup.set(memory(chip)) == set)
         })
-        .filter(|(_, rows): &(Set, Vec<&str>)| !rows.is_empty())
         .collect();
     let cell = |chip: &str, class: &str| -> Element {
         let Some(stem) = model_of(chip, class) else {
@@ -2803,16 +2787,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                          llama.cpp, mistral.rs, Splash. Blue faster, red slower, the middle step within noise. \
                                          Hover a square for its ratio."
                                     }
-                                    for (set, rows) in &sets {
-                                        Stack { gap: 3,
-                                            div {
-                                                strong { "{set.title(lineup.large_from_gb)}" }
-                                                ": {counts(&lineup.shapes[set].users)} users at once by \
-                                                 {counts(&lineup.shapes[set].prompts)}-token prompts"
-                                            }
-                                            {glance_maps(rows, &classes, "minmax(0, 11.5rem)", true, cell)}
-                                        }
-                                    }
+                                    {glance_maps(&rows, &classes, "minmax(0, 1fr)", true, cell)}
                                 }
                             }
                             // Each a machine × model matrix, every cell its prefill
@@ -2824,10 +2799,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                     div { style: "contain: inline-size",
                                         Stack { gap: 5,
                                             p { "scratchy against oMLX TurboQuant (or the next engine a run has, in the order of the heat maps) along {along}. Blue fill where scratchy is ahead, red where it is behind." }
-                                            for (set, rows) in &sets {
-                                                Stack { gap: 3,
-                                                    strong { "{set.title(lineup.large_from_gb)}" }
-                                                    {glance_maps(rows, &classes, "minmax(0, 14rem)", false, |chip: &str, class: &str| {
+                                            {glance_maps(&rows, &classes, "minmax(0, 1fr)", false, |chip: &str, class: &str| {
                                                         let Some(stem) = model_of(chip, class) else { return rsx! {} };
                                                         rsx! {
                                                             div { style: "flex: 1 1 0; min-width: 0",
@@ -2841,8 +2813,6 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                                             }
                                                         }
                                                     })}
-                                                }
-                                            }
                                         }
                                     }
                                 }
@@ -2873,16 +2843,11 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                             for axes in Axes2::ALL {
                                                 ContentPanel { id: format!("latency-axes-{}", if axes == Axes2::Own { "own" } else { "same" }), shown: axes == Axes2::Own,
                                                     Stack { gap: 5,
-                                                        for (set, rows) in &sets {
-                                                            Stack { gap: 3,
-                                                                strong { "{set.title(lineup.large_from_gb)}" }
-                                                                // A model's grid at a readable size is wider than a heat map column.
-                                                                div { style: "overflow-x: auto",
-                                                                    {glance_maps(rows, &classes, "max-content", false, |chip: &str, class: &str| {
-                                                                        model_of(chip, class).map_or(rsx! {}, |stem| latency_cell(machines, chip, stem, axes))
-                                                                    })}
-                                                                }
-                                                            }
+                                                        // A model's grid at a readable size is wider than a heat map column.
+                                                        div { style: "overflow-x: auto",
+                                                            {glance_maps(&rows, &classes, "max-content", false, |chip: &str, class: &str| {
+                                                                model_of(chip, class).map_or(rsx! {}, |stem| latency_cell(machines, chip, stem, axes))
+                                                            })}
                                                         }
                                                     }
                                                 }
@@ -2899,13 +2864,11 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
     }
 }
 
-/// The glance's sparkline grids, every panel's, so every sparkline is one
-/// size: the machine, a row label, then `columns` equal columns. The label
-/// column has a width of its own rather than its labels', so a panel without
-/// row labels gives its sparklines the same width as one with them.
+/// The glance's sparkline grids: `columns` equal columns, each machine's name
+/// a line of its own over its row's upper left rather than a column.
 fn spark_grid(columns: usize) -> String {
     format!(
-        "display: grid; grid-template-columns: 7rem 4rem repeat({columns}, minmax(0, 1fr)); \
+        "display: grid; grid-template-columns: repeat({columns}, minmax(0, 1fr)); \
          gap: 0.25rem 2rem; align-items: center"
     )
 }
@@ -3240,13 +3203,9 @@ fn startup_panel(machines: &BTreeMap<&str, MachineRuns>, columns: usize) -> Elem
                  send to first token. Each sparkline is one run: the newest that timed both engines for the most models."
             }
             div { style: spark_grid(columns.max(STARTUP_COLUMNS.len())),
-                div {}
-                div {}
                 for col in &STARTUP_COLUMNS { div { style: "text-align: center", "{col.title}" } }
                 for chip in in_order(machines) {
-                    // Column 1 starts a row, past any columns this panel leaves empty.
-                    div { style: "grid-column: 1; align-self: start", "{chip}" }
-                    div {}
+                    div { style: "grid-column: 1 / -1; margin-top: 0.5rem", strong { "{chip}" } }
                     for (k, col) in STARTUP_COLUMNS.iter().enumerate() {
                         div {
                             match &sparks[&(chip, k)] {
