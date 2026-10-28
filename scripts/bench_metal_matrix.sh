@@ -85,8 +85,11 @@
 # --serve-args "..." adds extra `scr serve` flags (recorded in the JSON). None
 # by default: `scr serve` sizes --max-num-batched-tokens to the largest resident
 # prefill bucket, the same as any user gets.
-# --cell-timeout-s bounds each scaling cell. A cell that times out or has failed
-# requests is recorded as it ended, and the server is restarted for the next
+# --cell-timeout-s bounds each scaling cell, plus its answers' decode at a hang's
+# --cell-hang-tok-s (10 tok/s per user): a cell of 2048-token answers decodes 14
+# of them, past 600 s on a base M5, so a flat limit cut off every engine that
+# served them in full and kept the ones that stopped early at EOS. A cell that
+# times out or has failed requests is recorded as it ended, and the server is restarted for the next
 # cell: a server that ran out of memory on one cell has not measured the
 # others, and an engine's out-of-memory stays on the page as failed cells.
 # --fail-fast stops at the first scratchy build or parity-gate failure instead
@@ -260,6 +263,7 @@ READY_TIMEOUT_S=1800
 # A cell's limit. On a 36 GB M3 Pro 221 of 222 grid cells finished inside it, the slowest 2048-
 # token answers to 8k prompts near 10 minutes; a hung server would otherwise hold a cell forever.
 CELL_TIMEOUT_S=600
+CELL_HANG_TOK_S=10       # a user's decode slower than this is a hung server's
 SERVE_ARGS=""
 SEED=""
 MLX_PYTHON=""
@@ -315,6 +319,7 @@ while [[ $# -gt 0 ]]; do
         --settle-s)          SETTLE_S="$2"; shift 2 ;;
         --ready-timeout-s)   READY_TIMEOUT_S="$2"; shift 2 ;;
         --cell-timeout-s)    CELL_TIMEOUT_S="$2"; shift 2 ;;
+        --cell-hang-tok-s)   CELL_HANG_TOK_S="$2"; shift 2 ;;
         --serve-args)        SERVE_ARGS="$2"; shift 2 ;;
         --seed)              SEED="$2"; shift 2 ;;
         --mlx-python)        MLX_PYTHON="$2"; shift 2 ;;
@@ -571,7 +576,7 @@ CLASS_TABLE="$(printf '%s\n' "${CLASSES[@]}")"
 export ENGINE_INFO PIN_PROBLEMS UNPINNED CLASS_TABLE LARGE_GB
 export STARTED_UTC PERCENTILES PRIME_LAUNCHES INPUT_LEN OUTPUT_LEN WARM_REQUESTS SCENARIOS SCALING SCALE_AXES SCALE_CONC SCALE_INPUT SCALE_OUTPUT SCALE_GRID_INPUT \
        SCALE_GRID_OUTPUT SCALE_GRID_CONC SCALE_GRID_USERS_OUTPUT SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS SCALE_ROUNDS \
-       MLX_PYTHON OLLAMA_BIN KV_CACHE_DTYPE SERVE_ARGS CELL_TIMEOUT_S RESUME MODELS_FULL
+       MLX_PYTHON OLLAMA_BIN KV_CACHE_DTYPE SERVE_ARGS CELL_TIMEOUT_S CELL_HANG_TOK_S RESUME MODELS_FULL
 python3 - "${JSON}" "${chip}" <<'PY'
 import json, os, subprocess, sys
 out, chip = sys.argv[1:3]
@@ -618,6 +623,7 @@ json.dump({
              "kv_cache_dtype": e["KV_CACHE_DTYPE"] or "default (TurboQuant)",
              "scratchy_serve_args": e["SERVE_ARGS"] or None,
              "cell_timeout_s": int(e["CELL_TIMEOUT_S"]),
+             "cell_hang_tok_s": int(e["CELL_HANG_TOK_S"]),
              # --resume: cells an earlier run of this output finished are kept, not remeasured.
              "resumed": e["RESUME"] == "1",
              # bench serve counts a request whose stream ended aborted or errored
@@ -887,9 +893,11 @@ sys.exit(not j.get("completed") or any(j.get(k) for k in ("failed", "timed_out",
     local mem="${out_json%.json}.mem" sampler=""
     rm -f "${mem}"
     [[ -n "${srv}" ]] && { mem_sampler "${srv}" "${mem}" & sampler=$!; }
-    # perl's alarm survives exec: SIGALRM ends the client after CELL_TIMEOUT_S.
+    # The cell's limit: the flat one, plus its answers decoded at a hang's rate, its users at once.
+    local limit=$(( CELL_TIMEOUT_S + ((n + SCALE_WARMUPS + $6 - 1) / $6) * $5 / CELL_HANG_TOK_S ))
+    # perl's alarm survives exec: SIGALRM ends the client after the limit.
     # The client's output goes to a log; stderr off hides bash's job notice.
-    { perl -e 'alarm shift; exec @ARGV' "${CELL_TIMEOUT_S}" \
+    { perl -e 'alarm shift; exec @ARGV' "${limit}" \
         "${BIN}" bench serve --base-url "http://127.0.0.1:${PORT}" --model "${cell_model:-${id}}" \
         ${cell_tok:+--tokenizer "${cell_tok}"} \
         --num-prompts "${n}" --input-len "$4" --output-len "$5" \
@@ -905,7 +913,7 @@ json.dump(j, open(sys.argv[1], "w"), indent=2)
 PY
     if (( rc == 142 )); then
         cells_hung=1
-        echo "timed out after ${CELL_TIMEOUT_S}s"
+        echo "timed out after ${limit}s"
         # The client wrote nothing: record the cell as one whose every request failed.
         python3 - "${out_json}" "${n}" <<'PY2'
 import json, sys
