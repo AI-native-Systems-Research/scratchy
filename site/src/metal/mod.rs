@@ -1831,14 +1831,24 @@ impl<'a> Latency<'a> {
         Some((padded(t0, t1), padded(p0, p1)))
     }
 
-    /// One cell's requests as a square scatter: TTFT up on the cell's own range, TPOT across on
-    /// `span`'s, which its small multiple shares. TTFT spans a hundredfold across a grid (60 ms
-    /// to tens of seconds): a shared linear axis flattens the short prompts, a log one shrinks
-    /// every gap, so each panel reads its own. Bare, no axis titles or tick labels: a panel of a
-    /// dense grid, its axes the grid's to say.
-    fn chart(&self, k: CellKey, span: Span, side: &str, bare: bool, label: &str) -> Element {
-        let Some((ttft, _)) = self.span(&[k]) else {
+    /// One cell's requests as a square scatter, TTFT up and TPOT across, both linear: on the
+    /// cell's own ranges ([`Axes2::Own`]) or on `span`, its small multiple's ([`Axes2::Same`]).
+    /// Bare, no axis titles or tick labels: a panel of a dense grid, its axes the grid's to say.
+    fn chart(
+        &self,
+        k: CellKey,
+        span: Span,
+        axes: Axes2,
+        side: &str,
+        bare: bool,
+        label: &str,
+    ) -> Element {
+        let Some(own) = self.span(&[k]) else {
             return rsx! {};
+        };
+        let (ttft, tpot) = match axes {
+            Axes2::Own => own,
+            Axes2::Same => span,
         };
         let data: Vec<DotPoint> = (self.requests(k).into_iter())
             .map(|(e, t, p)| DotPoint {
@@ -1862,7 +1872,7 @@ impl<'a> Latency<'a> {
             options: ChartOptions {
                 title: String::new(),
                 axes: Axes {
-                    bottom: axis("key", "TPOT (ms)", None, span.1),
+                    bottom: axis("key", "TPOT (ms)", None, tpot),
                     left: axis("value", "TTFT (ms)", None, ttft),
                 },
                 color: Some(Colour::Scale {
@@ -1922,7 +1932,7 @@ impl Latency<'_> {
                     for &i in &prompts {
                         div { style: "outline: 1px solid var(--cds-border-subtle-01, #e0e0e0); width: {side}; height: {side}",
                             if ks.contains(&(u, o, i)) {
-                                {self.chart((u, o, i), span, side, true, &format!("{label}, {i} in {u} at once"))}
+                                {self.chart((u, o, i), span, Axes2::Own, side, true, &format!("{label}, {i} in {u} at once"))}
                             }
                         }
                     }
@@ -1952,9 +1962,30 @@ fn latency_legend(engines: &[Engine]) -> Element {
     }
 }
 
+/// Which ranges a small multiple's panels plot on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Axes2 {
+    /// Each panel its own, TTFT and TPOT: the shape of each cell's spread, which a shared range
+    /// flattens (TTFT spans a hundredfold across a grid, TPOT's two clouds sit 1 ms apart).
+    Own,
+    /// One range for every panel: where the cells sit against each other.
+    Same,
+}
+
+impl Axes2 {
+    const ALL: [Axes2; 2] = [Axes2::Own, Axes2::Same];
+
+    fn title(self) -> &'static str {
+        match self {
+            Axes2::Own => "Each its own axes",
+            Axes2::Same => "Same axes",
+        }
+    }
+}
+
 /// Every request of every grid cell, time to first token against time per output token, a dot
 /// each, scratchy against its rival: per answer length a small multiple, users at once down,
-/// prompt size across, every panel on the same axes.
+/// prompt size across, each panel on its own axes or every one on the same (a switch).
 fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
     let Some(l) = Latency::of(m, run) else {
         return rsx! {};
@@ -1964,7 +1995,7 @@ fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
     answers.dedup();
     answers.sort_unstable();
     answers.dedup();
-    let multiple = |o: u32| -> Element {
+    let multiple = |o: u32, axes: Axes2| -> Element {
         let ks: Vec<CellKey> = l.keys.iter().copied().filter(|k| k.1 == o).collect();
         let mut users: Vec<u32> = ks.iter().map(|k| k.0).collect();
         let mut prompts: Vec<u32> = ks.iter().map(|k| k.2).collect();
@@ -1986,7 +2017,7 @@ fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
                         for &i in &prompts {
                             div {
                                 if let (true, Some(span)) = (ks.contains(&(u, o, i)), span) {
-                                    {l.chart((u, o, i), span, PANEL_SIDE, false, &format!("TTFT against TPOT, every request, {i} in {o} out {u} at once, {mid}"))}
+                                    {l.chart((u, o, i), span, axes, PANEL_SIDE, false, &format!("TTFT against TPOT, every request, {i} in {o} out {u} at once, {mid}"))}
                                 }
                             }
                         }
@@ -2027,15 +2058,31 @@ fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
     part(
         "Latency distributions",
         rsx! {
-            "Every request, a dot each: time to first token up, on each panel's own range (its ticks say \
-             it); time per output token across, the same in every panel. A request held back behind another lands high and left; one decoding \
+            "Every request, a dot each: time to first token up, time per output token across, both \
+             linear. Each panel on its own ranges (its ticks say them), or every panel on the same: the \
+             switch below. A request held back behind another lands high and left; one decoding \
              beside others lands low and right; a cell that ran two ways shows two clouds. Requests that \
              failed, or whose answer arrived in one piece, have neither timing to plot."
         },
         rsx! {
             Stack { gap: 6,
                 {latency_legend(&l.engines)}
-                for o in answers { {multiple(o)} }
+                // Own axes first and shown; the same axes a switch away (Carbon draws a chart
+                // in a hidden panel when its panel is shown).
+                ContentSwitcher { selected: format!("{mid}-axes-{}", slug(Axes2::Own.title())),
+                    for axes in Axes2::ALL {
+                        ContentSwitcherItem { target: format!("{mid}-axes-{}", slug(axes.title())), selected: axes == Axes2::Own, "{axes.title()}" }
+                    }
+                }
+                div {
+                    for axes in Axes2::ALL {
+                        ContentPanel { id: format!("{mid}-axes-{}", slug(axes.title())), shown: axes == Axes2::Own,
+                            Stack { gap: 6,
+                                for &o in &answers { {multiple(o, axes)} }
+                            }
+                        }
+                    }
+                }
                 Fold { title: "Table view, every request",
                     Stack { gap: 4,
                         for t in RequestTiming::ALL { {table(t)} }
