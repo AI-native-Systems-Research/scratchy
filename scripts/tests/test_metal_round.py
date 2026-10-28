@@ -145,6 +145,21 @@ class Collect(unittest.TestCase):
         self.assertEqual([i for i, _ in rejected], [1, 2])
         self.assertEqual(replied, {1})
 
+    def test_a_packed_run_counts_like_a_plain_one(self):
+        import base64, gzip
+        packed = base64.b64encode(gzip.compress(json.dumps(run()).encode())).decode()
+        wrapped = "\n".join(packed[i:i + 76] for i in range(0, len(packed), 76))
+        newest, rejected, _, _ = metal_round.collect(
+            [comment(1, text=f"a run\n```json+gzip+base64\n{wrapped}\n```")], on_main)
+        self.assertEqual(rejected, [])
+        self.assertEqual(newest[run()["machine"]["chip"]][0], run())
+
+    def test_a_packed_block_that_does_not_unpack_is_rejected_not_a_crash(self):
+        _, rejected, _, _ = metal_round.collect(
+            [comment(1, text="```json+gzip+base64\nnot base64!\n```")], on_main)
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("does not unpack", rejected[0][1])
+
     def test_a_block_that_is_not_an_object_is_rejected_and_the_rest_still_counts(self):
         newest, rejected, _, _ = metal_round.collect(
             [comment(1, text="```json\n[]\n```"), comment(2, run())], on_main)

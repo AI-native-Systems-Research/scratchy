@@ -24,18 +24,22 @@ runs everything else.
   **Quick run** below. The script with no flags but `--unpinned`: this Mac's
   four models (the small set below 64 GB, the large set at 64 GB), scratchy
   alone, cold and warm, one rep, the users × prompt grid at 1, 2 and 4
-  users and prompts to 8k, the same on every Mac (its memory picks the models),
-  and 64-token answers, two rounds of each users count a cell.
+  users, 64-token answers and 50 requests a cell, every request kept (the
+  page plots each one). Prompts are 128, 512, 1024 and 4096 tokens below
+  64 GB, and 128, 1024, 4096 and 8192 from 64 GB; the memory also picks the
+  models.
   scratchy runs at its defaults on every Mac, and every cell runs: one
   that runs out of memory is recorded as failed. The page keeps every
   other engine's numbers, and scratchy's frozen launches, from the last full
   run, each tagged with its date. Its length is not measured yet in this
-  form: the one M3 Pro quick run took 43 minutes, before every cell ran and
-  at four rounds a cell. The aim is about 25 minutes. Report the run's length.
+  form: an estimated 1.5 hours on a base M5 (scratchy's share of the full
+  run's grid, plus builds and startup). Report the run's length.
 - A **full run** renews every number: `--full` adds the comparison engines
-  (oMLX and oMLX TurboQuant), frozen (needs `sudo purge`), three reps, four
-  rounds of each users count a cell, and the 512- and 2048-token answers at
-  1 user (the decode-vs-answer-length curve). It takes hours; run it when the engines or the grid change, or
+  (oMLX; oMLX TurboQuant is an ablation of its own, run by name), frozen
+  (needs `sudo purge`) and three reps of the startup ladder, on the same
+  grid as a quick run. On a base M5 that is an estimated 3 hours (50
+  requests a cell, measured per request in an earlier full run); a 64 GB
+  Mac's 8k prompts add more, not yet measured. It takes hours; run it when the engines or the grid change, or
   for a published study. It's pinned (`--pin`) and goes through every
   pre-flight question in step 2.
 - A **smoke run** checks the setup: `--models gpt-oss-20b --no-scaling
@@ -265,7 +269,7 @@ act on each one as it appears:
 
 - the engine lines in the header, one per engine (`llama.cpp : <path>
   (<version>)`): a `skipped` line under one means it isn't installed or
-  isn't selected (by default a full run times oMLX and oMLX TurboQuant). If it's an
+  isn't selected (by default a full run times only oMLX). If it's an
   engine the user meant to run, stop the run and go back to step 1.
 - `skipped: needs N GB`: expected for glm-4.5-air on a Mac under 64 GB.
 - `--- mistral.rs: nothing to serve`: expected for every MoE model; it runs
@@ -512,15 +516,16 @@ fi
 Two people opening a round at once makes two issues: post to the lower
 number, and close the other.
 
-Post the run as a comment: one line, then the JSON, compact (no indents: a
-64 GB Mac's run with every cell is about 64 KB indented, at GitHub's comment
-limit), in a collapsed block:
+Post the run as a comment: one line, then the JSON gzipped and base64'd in a
+`json+gzip+base64` block, collapsed. A run keeps every request (50 a cell),
+and packed it is about a third of its compact size (`scripts/metal_round.py`
+unpacks it):
 
 ```bash
 {
   python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["machine"]["chip"], "quick run,", d["generated_utc"] + ", at", d["repo"]["sha"][:8])' "$f"
-  printf '\n<details><summary>run JSON</summary>\n\n```json\n'
-  python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), separators=(",", ":")))' "$f"
+  printf '\n<details><summary>run JSON (gzip, base64)</summary>\n\n```json+gzip+base64\n'
+  python3 -c 'import base64,gzip,json,sys,textwrap; print("\n".join(textwrap.wrap(base64.b64encode(gzip.compress(json.dumps(json.load(open(sys.argv[1])), separators=(",", ":")).encode(), 9)).decode(), 76)))' "$f"
   printf '```\n</details>\n'
 } > /tmp/metal-round-comment.md
 wc -c < /tmp/metal-round-comment.md

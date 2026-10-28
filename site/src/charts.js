@@ -62,7 +62,7 @@
   }
   // Draws one chart in the theme `t`.
   function draw(el, t) {
-    var charts = { groupedbar: Charts.GroupedBarChart, combo: Charts.ComboChart, heatmap: Charts.HeatmapChart };
+    var charts = { groupedbar: Charts.GroupedBarChart, combo: Charts.ComboChart, heatmap: Charts.HeatmapChart, scatter: Charts.ScatterChart };
     var spec = JSON.parse(el.getAttribute('data-chart'));
     if (spec.ratio) {
       var total = spec.options.locale.translations.total;
@@ -83,6 +83,10 @@
         ? function (v) { var k = at.indexOf(v); return k >= 0 ? names[k] : String(v); }
         : String;
     }
+    // Carbon's own tooltip, its series called what they are: a server, not a "Group".
+    if (spec.kind === 'scatter') {
+      spec.options.tooltip = { groupLabel: 'Server' };
+    }
     var chart = new charts[spec.kind](el, { data: spec.data, options: themed(spec.options, t) });
     var scale = el.dataset.scale && document.getElementById(el.dataset.scale);
     if (scale) highlightSteps(chart, spec, scale);
@@ -94,11 +98,27 @@
         dashCarried(el);
       });
     }
+    if (spec.kind === 'scatter') {
+      squarePlot(el, chart);
+      chart.services.events.addEventListener('render-finished', function () { squarePlot(el, chart); });
+    }
     if (spec.ratio) {
       labelFactors(el, spec.data);
       chart.services.events.addEventListener('render-finished', function () { labelFactors(el, spec.data); });
     }
     return { chart: chart, options: spec.options };
+  }
+  // A scatter's plotting area square, whatever its axes take: Carbon fits the left axis into the
+  // mount's width and the bottom one into its height, and they take different amounts, so a
+  // square mount draws an oblong plot. Grow or shrink the mount's height by the difference,
+  // once it settles (a resize redraws, and this runs again; within a pixel it stops).
+  function squarePlot(el, chart) {
+    var grid = el.querySelector('rect.chart-grid-backdrop');
+    if (!grid) return;
+    var r = grid.getBoundingClientRect();
+    var diff = r.width - r.height;
+    if (Math.abs(diff) < 1) return;
+    el.style.height = (el.getBoundingClientRect().height + diff) + 'px';
   }
   // Writes the factor, "×2.4", in each square the build marked a highlight,
   // to two figures so it fits the overview's small squares; a quarter of the
