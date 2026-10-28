@@ -105,7 +105,7 @@ jobs:
           cargo run --release --manifest-path site/Cargo.toml
 
       - if: steps.collect.outputs.commit == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: round
           path: round/*.json
