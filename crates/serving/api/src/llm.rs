@@ -1208,7 +1208,8 @@ impl LLM {
                 if all_token_ids.is_empty() && !output.new_token_ids.is_empty() {
                     first_token_at.get_or_insert(std::time::Instant::now());
                 }
-                if ttft_phase && all_token_ids.is_empty() && !output.new_token_ids.is_empty() {                    // `to_first_token` is queue + prefill forward(s) + sample; the SDSC phase lines
+                if ttft_phase && all_token_ids.is_empty() && !output.new_token_ids.is_empty() {
+                    // `to_first_token` is queue + prefill forward(s) + sample; the SDSC phase lines
                     // sit inside it, so the difference is the engine/scheduler overhead around them.
                     eprintln!(
                         "[ttft-host] render={:.2}  tokenize={:.2}  submit={:.2}  to_first_token={:.2}  \
