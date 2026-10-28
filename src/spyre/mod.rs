@@ -567,7 +567,7 @@ fn bars(
             locale: None,
             combo: None,
             bounds: None,
-            points: None,
+            bubble: None,
             toolbar: Enabled { enabled: false },
         },
     };

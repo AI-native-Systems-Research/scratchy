@@ -62,7 +62,7 @@
   }
   // Draws one chart in the theme `t`.
   function draw(el, t) {
-    var charts = { groupedbar: Charts.GroupedBarChart, combo: Charts.ComboChart, heatmap: Charts.HeatmapChart, scatter: Charts.ScatterChart };
+    var charts = { groupedbar: Charts.GroupedBarChart, combo: Charts.ComboChart, heatmap: Charts.HeatmapChart, bubble: Charts.BubbleChart };
     var spec = JSON.parse(el.getAttribute('data-chart'));
     if (spec.ratio) {
       var total = spec.options.locale.translations.total;
@@ -83,9 +83,20 @@
         ? function (v) { var k = at.indexOf(v); return k >= 0 ? names[k] : String(v); }
         : String;
     }
-    // Carbon's own tooltip, its series called what they are: a server, not a "Group".
-    if (spec.kind === 'scatter') {
-      spec.options.tooltip = { groupLabel: 'Server' };
+    // Carbon's own tooltip, its series called what they are: a server, not a "Group", and a
+    // bubble's requests counted, not its radius (the square root of the count, so its area is
+    // the count). Carbon maps radius linearly onto its range, which it takes only as a function:
+    // the range ends at the unit radius times the extremes, so one request draws at the unit.
+    if (spec.kind === 'bubble') {
+      var unit = spec.unit_radius, label = spec.options.bubble.radiusLabel;
+      spec.options.tooltip = {
+        groupLabel: 'Server',
+        valueFormatter: function (value, l) { return l === label ? String(Math.round(value * value)) : value; },
+      };
+      spec.options.bubble.radiusRange = function (size, data) {
+        var rs = data.map(function (d) { return d.radius; });
+        return [unit * Math.min.apply(null, rs), unit * Math.max.apply(null, rs)];
+      };
     }
     var chart = new charts[spec.kind](el, { data: spec.data, options: themed(spec.options, t) });
     var scale = el.dataset.scale && document.getElementById(el.dataset.scale);
@@ -98,7 +109,7 @@
         dashCarried(el);
       });
     }
-    if (spec.kind === 'scatter') {
+    if (spec.kind === 'bubble') {
       squarePlot(el, chart);
       chart.services.events.addEventListener('render-finished', function () { squarePlot(el, chart); });
     }
@@ -108,7 +119,7 @@
     }
     return { chart: chart, options: spec.options };
   }
-  // A scatter's plotting area square, whatever its axes take: Carbon fits the left axis into the
+  // A bubble chart's plotting area square, whatever its axes take: Carbon fits the left axis into the
   // mount's width and the bottom one into its height, and they take different amounts, so a
   // square mount draws an oblong plot. Grow or shrink the mount's height by the difference,
   // once it settles (a resize redraws, and this runs again; within a pixel it stops).
