@@ -48,23 +48,35 @@ fn verdict(pass: bool) -> &'static str {
 }
 
 /// P1's rule (#859): a fixed floor on min cosine(CUDA, HF-f32), or at most `delta` below
-/// HF-bf16's own min cosine on the same prompt, or (gemma-4) at most HF-bf16's own measured
-/// scatter below it, the scatter at most `cap` ([`hf_bf16_scatter`]; the user's decision
-/// 2026-10-27, option (a)).
+/// HF-bf16's own min cosine on the same prompt, or (gemma-4) the distribution of a prompt's
+/// per-row cosines rather than its single worst row: at each of `quantiles` (by
+/// [`nearest_rank`]), CUDA's cosine at most HF-bf16's own measured scatter below HF-bf16's at the
+/// same quantile, the scatter at most `cap` ([`hf_bf16_scatter`]; the user's decisions
+/// 2026-10-27, option (a), and 2026-10-28, the distribution gate).
 enum P1Rule {
     Floor(f64),
     BelowHfBf16(f64),
-    BelowHfBf16Scatter { cap: f64 },
+    ScatterQuantiles { cap: f64, quantiles: &'static [f64] },
+}
+
+/// The `q` quantile of `v` by nearest rank: its `ceil(q * n)`-th smallest value (1-based, at least
+/// the first), so the 5th percentile of 15 rows is their minimum and of 159 rows their 8th
+/// smallest.
+fn nearest_rank(v: &[f64], q: f64) -> f64 {
+    let mut s = v.to_vec();
+    s.sort_by(f64::total_cmp);
+    let k = ((q * s.len() as f64).ceil() as usize).clamp(1, s.len());
+    s[k - 1]
 }
 
 /// Whether a cosine `cos` against HF-f32 passes `rule`, `hf_bf16_cos` HF-bf16's own cosine on the
-/// same rows: P1's and P8's cosine gate. A `BelowHfBf16Scatter` rule gates by [`p1_margin`]'s
-/// measured scatter.
+/// same rows: P1's and P8's cosine gate. A `ScatterQuantiles` rule gates by [`p1_margin`]'s
+/// measured scatter (P1 applies it at each quantile, P8 to its one row).
 fn p1_gate(rule: &P1Rule, cos: f64, hf_bf16_cos: f64) -> bool {
     match *rule {
         P1Rule::Floor(f) => cos >= f,
         P1Rule::BelowHfBf16(d) => cos >= hf_bf16_cos - d,
-        P1Rule::BelowHfBf16Scatter { .. } => cos >= hf_bf16_cos - p1_margin(),
+        P1Rule::ScatterQuantiles { .. } => cos >= hf_bf16_cos - p1_margin(),
     }
 }
 
@@ -117,7 +129,7 @@ fn hf_bf16_scatter() -> Option<((f64, usize, usize, usize), f32)> {
 }
 
 /// P1's margin below HF-bf16's min cosine under the binary's `P1`: its `delta`, or (a
-/// `BelowHfBf16Scatter` rule) HF-bf16's measured scatter, printed once with where it is, and
+/// `ScatterQuantiles` rule) HF-bf16's measured scatter, printed once with where it is, and
 /// asserted at most the rule's `cap` so a regenerated golden cannot widen it silently. 0 for a
 /// fixed floor.
 fn p1_margin() -> f64 {
@@ -125,7 +137,7 @@ fn p1_margin() -> f64 {
     *MARGIN.get_or_init(|| match P1 {
         P1Rule::Floor(_) => 0.0,
         P1Rule::BelowHfBf16(d) => d,
-        P1Rule::BelowHfBf16Scatter { cap } => {
+        P1Rule::ScatterQuantiles { cap, .. } => {
             let ((scatter, short, long, row), f32_diff) = hf_bf16_scatter()
                 .expect("P1's scatter rule needs a prompt that is a prefix of another");
             let ok = scatter <= cap;
@@ -159,12 +171,24 @@ fn p1_rules_gate_as_stated() {
         (&below, 0.980474, 0.983452, true),
         (&below, 0.977, 0.983452, false),
     ];
-    // `BelowHfBf16Scatter` reads its margin from the goldens, so its gate is checked where they
-    // are (`p1_to_p4_one_forward_per_prompt` prints it), not on fixed numbers; only its cap is
-    // read here.
-    let scatter = P1Rule::BelowHfBf16Scatter { cap: 0.013 };
-    assert!(matches!(scatter, P1Rule::BelowHfBf16Scatter { cap } if cap == 0.013));
-    let mut pass = true;
+    // `ScatterQuantiles` reads its margin from the goldens, so its gate is checked where they are
+    // (`p1_to_p4_one_forward_per_prompt` prints it), not on fixed numbers; its cap and quantiles
+    // are read here, and `nearest_rank` is checked on fixed numbers.
+    let scatter = P1Rule::ScatterQuantiles {
+        cap: 0.013,
+        quantiles: &[0.05, 0.5],
+    };
+    assert!(matches!(
+        scatter,
+        P1Rule::ScatterQuantiles { cap, quantiles } if cap == 0.013 && quantiles == [0.05, 0.5]
+    ));
+    let fifteen: Vec<f64> = (1..=15).map(f64::from).rev().collect();
+    let many: Vec<f64> = (1..=159).map(f64::from).collect();
+    let mut pass = nearest_rank(&fifteen, 0.05) == 1.0
+        && nearest_rank(&fifteen, 0.5) == 8.0
+        && nearest_rank(&many, 0.05) == 8.0
+        && nearest_rank(&many, 0.5) == 80.0
+        && nearest_rank(&[3.0], 0.05) == 3.0;
     for (rule, cos, noise, want) in cases {
         let got = p1_gate(rule, cos, noise);
         pass &= got == want;
@@ -1015,16 +1039,33 @@ fn p1_to_p4_one_forward_per_prompt() {
                 );
                 ok1
             }
-            P1Rule::BelowHfBf16Scatter { .. } => {
+            P1Rule::ScatterQuantiles { quantiles, .. } => {
                 let d = p1_margin();
-                let ok1 = p1_gate(&P1, min_cos, noise_cos);
+                let cuda: Vec<f64> = (rows(got).zip(rows(&p.f32)))
+                    .map(|(a, b)| cosine(a, b))
+                    .collect();
+                let hf: Vec<f64> = (rows(&p.bf16).zip(rows(&p.f32)))
+                    .map(|(a, b)| cosine(a, b))
+                    .collect();
+                let mut ok1 = true;
+                for &q in quantiles {
+                    let (c, h) = (nearest_rank(&cuda, q), nearest_rank(&hf, q));
+                    let ok = p1_gate(&P1, c, h);
+                    ok1 &= ok;
+                    eprintln!(
+                        "P1 prompt {}: {n} rows, cosine(CUDA, f32) at the {:.0}th percentile = \
+                         {c:.6} HF-bf16 {h:.6} CUDA - HF-bf16 = {:+.6} (need >= HF-bf16 - {d:.6}, \
+                         HF-bf16's measured scatter) {}",
+                        p.p,
+                        q * 100.0,
+                        c - h,
+                        verdict(ok)
+                    );
+                }
                 eprintln!(
-                    "P1 prompt {}: {n} rows, min cosine(CUDA, f32) = {min_cos:.6} HF-bf16 \
-                     {noise_cos:.6} CUDA - HF-bf16 = {:+.6} (need >= HF-bf16 - {d:.6}, HF-bf16's \
-                     measured scatter) {}",
-                    p.p,
-                    min_cos - noise_cos,
-                    verdict(ok1)
+                    "P1 prompt {}: min cosine(CUDA, f32) = {min_cos:.6} HF-bf16 {noise_cos:.6} \
+                     (information only: the distribution gate gates the percentiles)",
+                    p.p
                 );
                 ok1
             }
@@ -1153,9 +1194,11 @@ fn p1_to_p4_one_forward_per_prompt() {
                 "min cosine >= HF-bf16's - {d} per prompt, gated (the user's 2026-10-26 rule, \
                  #859)"
             ),
-            P1Rule::BelowHfBf16Scatter { cap } => format!(
-                "min cosine >= HF-bf16's - its measured scatter {:.6} (<= {cap}) per prompt, \
-                 gated (the user's decision 2026-10-27, option (a))",
+            P1Rule::ScatterQuantiles { cap, quantiles } => format!(
+                "cosine at each percentile {:?} >= HF-bf16's at the same percentile - its \
+                 measured scatter {:.6} (<= {cap}) per prompt, gated (the user's decisions \
+                 2026-10-27, option (a), and 2026-10-28, the distribution gate)",
+                quantiles.iter().map(|q| q * 100.0).collect::<Vec<_>>(),
                 p1_margin()
             ),
         }
@@ -1403,7 +1446,7 @@ fn p8_the_decode_row_matches_hf_f32() {
         let cos_need = match P1 {
             P1Rule::Floor(f) => format!("{f}"),
             P1Rule::BelowHfBf16(d) => format!("HF-bf16's {noise_cos:.6} - {d}"),
-            P1Rule::BelowHfBf16Scatter { .. } => {
+            P1Rule::ScatterQuantiles { .. } => {
                 format!("HF-bf16's {noise_cos:.6} - {:.6}", p1_margin())
             }
         };

@@ -53,11 +53,18 @@ const UNTIED_LM_HEAD: Option<&str> = None;
 const MODEL: &str = "gemma-4-26b-a4b-it";
 const CHECKPOINT: &str = "gemma-4-26B-A4B-it";
 const GOLDENS: &str = "tests/goldens/gemma4-moe-gemma-4-26b-a4b-it-hf";
-/// P1's rule (#933, the user's decision 2026-10-27, option (a)): min cosine(CUDA, f32) at most
-/// HF-bf16's own measured scatter below HF-bf16's own min cosine on the same prompt, the scatter
-/// measured on the goldens (prompt 1's rows are prompt 6's rows 0-20; the verifier measured 0.0126
-/// on row 4) and asserted at most 0.013, the figure the user approved.
-const P1: P1Rule = P1Rule::BelowHfBf16Scatter { cap: 0.013 };
+/// P1's rule (#933, the user's decisions 2026-10-27, option (a), and 2026-10-28, the distribution
+/// gate): on each prompt, cosine(CUDA, f32) at the 5th percentile and at the median of its rows at
+/// most HF-bf16's own measured scatter below HF-bf16's at the same percentile. The scatter is
+/// measured on the goldens (prompt 1's rows are prompt 6's rows 0-20; the verifier measured
+/// 0.0126 on row 4) and asserted at most 0.013, the figure the user approved. The distribution,
+/// not the single worst row, because which rows swap experts at a router near-tie late in the
+/// model, and so set a prompt's minimum, differs run to run in HF-bf16 as in CUDA, at the same
+/// rate (`/tmp/v933-diag4.md`: 657 against 646 swaps on prompt 6).
+const P1: P1Rule = P1Rule::ScatterQuantiles {
+    cap: 0.013,
+    quantiles: &[0.05, 0.5],
+};
 /// P3 accepts at most one top-1 disagreement outside a near-tie per prompt, on a route-explained
 /// row (the user's decision 2026-10-27, option (a)).
 const P3: P3Rule = P3Rule::RouteExplained { per_prompt: 1 };
