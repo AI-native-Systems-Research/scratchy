@@ -645,21 +645,23 @@ pub(crate) fn run_prefill_batch(
     acts.extend(launcher.acts);
     acts_f16.extend(launcher.acts_f16);
     acts_i32.extend(launcher.acts_i32);
-    // ⭐ EVERY LAUNCH WHOSE SUFFIX RUNS BINDS ITS SAMPLER SEAT, every row of it, before
-    // anything runs: the mint's noise/inv_t sources are per-session seg3 placements no
-    // alias covers, so an unbound seat reads ZEROS — which under the greedy law is
-    // exactly right. Greedy for every row until the on-card noise kernel fills this
-    // buffer. A decode batch (per_request) and a prompt-FINAL chunk (the prefill rung's
-    // own minted draw) both run their suffix; a middle prompt chunk discards it, so it
-    // binds nothing.
-    if per_request.is_some() || matches!(want_logits, LogitsWanted::LastRow) {
-        let seat = b.wiring.sample_seat.as_ref().ok_or_else(|| {
-            werr(format!(
-                "bundle has no sampler seat (result t{}) — a launch whose suffix runs cannot \
-                 pick without the minted draw",
-                b.result_id
-            ))
-        })?;
+    // ⭐ EVERY LAUNCH OF A BUNDLE THAT MINTS THE DRAW BINDS ITS SAMPLER SEAT, every row of it,
+    // before anything runs — a MIDDLE prompt chunk included. Its suffix is skipped, but the
+    // seat's five sources are placed in this bundle all the same, and the launch's
+    // completeness check (`require_sources_filled`) refuses a placed source nobody wrote:
+    // binding only on suffix-running launches refused every prompt longer than one chunk
+    // (`5 caller-filled source(s) were never written`, 2b at 1061 tokens, 2026-10-28). The
+    // laws a middle chunk stages are this request's own, so nothing is invented; a bundle
+    // with no seat still refuses where a pick needs one.
+    let suffix_runs = per_request.is_some() || matches!(want_logits, LogitsWanted::LastRow);
+    if suffix_runs && b.wiring.sample_seat.is_none() {
+        return Err(werr(format!(
+            "bundle has no sampler seat (result t{}) — a launch whose suffix runs cannot \
+             pick without the minted draw",
+            b.result_id
+        )));
+    }
+    if let Some(seat) = b.wiring.sample_seat.as_ref() {
         // ⭐ A DECODE BATCH'S SEAT IS THE RUNG'S OWN WIDTH. `b` is the single-request meta
         // borrowed for its tensor ids, so its seat states the SOLO rung's `rows = 1` — a
         // launch at `mq` rows binds and reads `mq` rows of the per-step pair, or every row
