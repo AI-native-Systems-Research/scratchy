@@ -11,7 +11,7 @@ use std::fmt;
 use dioxus::prelude::*;
 use serde::Serialize;
 
-use crate::carbon::{Alignment, Definition, Stack};
+use crate::carbon::{Alignment, Definition, Layer, Stack, Tile};
 
 /// Draws every chart from its rendered spec.
 pub const CHARTS_JS: &str = include_str!("charts.js");
@@ -690,9 +690,14 @@ pub fn glance_maps(
                                 div { style: "text-align: center", "{column}" }
                             }
                         }
+                        // Each model on a tile of the next layer, so neighbouring models read apart.
                         for column in columns {
-                            div { style: "display: flex; gap: 0.5rem; align-items: flex-start",
-                                {cell(row, column)}
+                            Layer { level: 1,
+                                Tile { style: "height: 100%; box-sizing: border-box; min-width: 0",
+                                    div { style: "display: flex; gap: 0.5rem; align-items: flex-start",
+                                        {cell(row, column)}
+                                    }
+                                }
                             }
                         }
                     }
