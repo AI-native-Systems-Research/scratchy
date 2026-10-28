@@ -112,7 +112,7 @@ both, scoped to the crate or area touched (`fix(metal): ...`).
 
 ### Issue tracker
 
-GitHub Issues on upstream `AI-native-Systems-Research/scratchy` (via `gh -R`). See `docs/agents/issue-tracker.md`.
+GitHub Issues on `AI-native-Systems-Research/scratchy`; always pass `gh -R`. Specs and plans are files under `docs/superpowers/`, not issues. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
@@ -120,4 +120,4 @@ Default five-role vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `
 
 ### Domain docs
 
-Single-context: root `GLOSSARY.md` + `docs/adr/` (created lazily). See `docs/agents/domain.md`.
+`CONTRIBUTING.md`, `docs/*.md`, and specs/plans under `docs/superpowers/`; root `GLOSSARY.md` + `docs/adr/` once `/domain-modeling` creates them. See `docs/agents/domain.md`.
