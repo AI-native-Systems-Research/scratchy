@@ -1814,7 +1814,7 @@ impl<'a> Latency<'a> {
             .collect()
     }
 
-    /// The extent of these cells' requests, padded, so charts sharing it compare at a glance.
+    /// The extent of these cells' requests along each timing, padded a tenth either side.
     fn span(&self, keys: &[CellKey]) -> Option<Span> {
         let rs: Vec<(Engine, f64, f64)> = keys.iter().flat_map(|&k| self.requests(k)).collect();
         let range = |vs: &mut dyn Iterator<Item = f64>| {
@@ -1824,13 +1824,22 @@ impl<'a> Latency<'a> {
         };
         let [t0, t1] = range(&mut rs.iter().map(|r| r.1))?;
         let [p0, p1] = range(&mut rs.iter().map(|r| r.2))?;
-        let pad = (p1 - p0).max(p1 * 0.05) * 0.1;
-        Some(([t0 / 1.2, t1 * 1.2], [(p0 - pad).max(0.0), p1 + pad]))
+        let padded = |lo: f64, hi: f64| {
+            let pad = (hi - lo).max(hi * 0.05) * 0.1;
+            [(lo - pad).max(0.0), hi + pad]
+        };
+        Some((padded(t0, t1), padded(p0, p1)))
     }
 
-    /// One cell's requests as a square scatter: TTFT up (log), TPOT across, on `span`. Bare, no
-    /// axis titles or tick labels: a panel of a dense grid, its axes the grid's to say.
+    /// One cell's requests as a square scatter: TTFT up on the cell's own range, TPOT across on
+    /// `span`'s, which its small multiple shares. TTFT spans a hundredfold across a grid (60 ms
+    /// to tens of seconds): a shared linear axis flattens the short prompts, a log one shrinks
+    /// every gap, so each panel reads its own. Bare, no axis titles or tick labels: a panel of a
+    /// dense grid, its axes the grid's to say.
     fn chart(&self, k: CellKey, span: Span, side: &str, bare: bool, label: &str) -> Element {
+        let Some((ttft, _)) = self.span(&[k]) else {
+            return rsx! {};
+        };
         let data: Vec<DotPoint> = (self.requests(k).into_iter())
             .map(|(e, t, p)| DotPoint {
                 group: e.label(),
@@ -1854,7 +1863,7 @@ impl<'a> Latency<'a> {
                 title: String::new(),
                 axes: Axes {
                     bottom: axis("key", "TPOT (ms)", None, span.1),
-                    left: axis("value", "TTFT (ms)", Some("log"), span.0),
+                    left: axis("value", "TTFT (ms)", None, ttft),
                 },
                 color: Some(Colour::Scale {
                     scale: (self.engines.iter().zip(["s1", "s2"]))
@@ -2018,8 +2027,8 @@ fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
     part(
         "Latency distributions",
         rsx! {
-            "Every request, a dot each: time to first token up (log), time per output token across, every \
-             panel on the same axes. A request held back behind another lands high and left; one decoding \
+            "Every request, a dot each: time to first token up, on each panel's own range (its ticks say \
+             it); time per output token across, the same in every panel. A request held back behind another lands high and left; one decoding \
              beside others lands low and right; a cell that ran two ways shows two clouds. Requests that \
              failed, or whose answer arrived in one piece, have neither timing to plot."
         },
@@ -2725,8 +2734,9 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                         p {
                                             "Every request of every cell, a dot each, at the heat maps' answer length: in each \
                                              model's square, one tiny chart per cell, users at once down (fewest on top) and \
-                                             prompt size across (shortest on the left), all on the same axes: time to first \
-                                             token up (log), time per output token across. A request held back behind another \
+                                             prompt size across (shortest on the left): time to first token up, on each \
+                                             chart's own range (hover a dot for its value), time per output token across, \
+                                             the same in every chart of a model. A request held back behind another \
                                              lands high and left; one decoding beside others lands low and right; two clouds are \
                                              a cell that ran two ways. Each model's own section has every cell. A dash is a run \
                                              from before the runner kept every request."
