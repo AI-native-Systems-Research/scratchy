@@ -2671,13 +2671,14 @@ impl SpyreWorker {
                         scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_MASK_TID,
                     )
                     .and_then(|pmask| {
-                        // The baked head count, by the same law the rung loop states: the
-                        // `hidden / head_dim` quotient is the head count only for a square Q
-                        // projection (gemma-4's is not).
-                        let nqh = wirings.decode.geometry.nqh.max(1) as u64;
+                        // ⛔ ONE ROW, NOT `nqh`: the one-request bundle places the BROADCAST mask
+                        // (`compute_bundle_layout`'s `rows_are_requests = false` arm, `[1, max_pages]`)
+                        // and the owner seat stages it broadcast (`BatchPrefix::OneRequest`).
+                        // Dividing by the head count read granite-2b's 545 pages as 17 and refused
+                        // every solo request past ~4,600 tokens.
                         scratchy_subtile::sdsc_abstract::BakedMaskBlocks::of_placement(
                             pmask.size,
-                            nqh as u32,
+                            1,
                             scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1)
                                 .expect("1 is a baked width"),
                             scratchy_subtile::sdsc_abstract::SlotCount::new(
