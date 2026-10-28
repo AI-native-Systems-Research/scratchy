@@ -36,16 +36,15 @@
 # offered (--max-concurrency), not the effective decode batch. The default
 # sweep is the grid: prompt x answer x users, at --scale-grid-conc's user
 # counts (1, 2 and 4 by default, on every Mac), so neither the separate
-# users sweep (conc) nor the prompt sweep (input) is needed: the grid's prompts reach 8k
-# and its 1-user row is the prompt sweep. One user at a time is what most Macs
-# see (#349). --scale-axes conc,grid,input adds the other sweeps back. A cell
-# sends --scale-rounds rounds of its users count (4; a quick run, 2), and at least
-# --scale-num-prompts requests (12): 12 at 1 user, 16 at 4, so its medians are
-# of the users count kept full, not one ramp-up and drain.
-# Above 1 user the grid runs only --scale-grid-users-output's answer lengths
-# (64): the users x prompt heat maps read 64-token answers, and long answers at
-# many users were half a sweep. With --full, 1 user runs every answer length
-# (64, 512 and 2048), the decode-vs-answer-length curve; a quick run, 64 alone.
+# users sweep (conc) nor the prompt sweep (input) is needed: the grid's prompts
+# reach 4k below 64 GB (128, 512, 1024, 4096) and 8k from it (128, 1024, 4096,
+# 8192), and its 1-user row is the prompt sweep. One user at a time is what most
+# Macs see (#349). --scale-axes conc,grid,input adds the other sweeps back. A
+# cell sends --scale-num-prompts requests (50) with 64-token answers, quick and
+# full alike, at least --scale-rounds rounds of its users count, so its
+# distribution is of the users count kept full, not one ramp-up and drain.
+# --scale-grid-output adds answer lengths; above 1 user the grid runs only
+# --scale-grid-users-output's (64).
 # --scale-grid-users-output "" runs the whole cube.
 #
 # With mlx-lm, a blocking parity gate runs first: `scr chat` vs mlx_lm.generate,
@@ -287,27 +286,30 @@ SCALE_AXES="grid"
 SCALE_CONC="1,2,4"
 SCALE_INPUT="128,512,2048,8192"
 SCALE_OUTPUT="16,64,256,1024"
-# The grid, the same on every Mac: a Mac's memory picks its models, not its cells, so each square
-# of the page means one thing on every machine. 32k prompts and 8 or 16 users cost more than they
-# showed: on a 32 GB base M5 two 32k prompts at once did not finish 12 requests in the cell
-# timeout, and the full run took about a day on the M4 and M5 Macs.
-SCALE_GRID_INPUT="128,1024,4096,8192"
-SCALE_GRID_OUTPUT="64"         # --full: 64,512,2048, the 1-user decode-vs-answer-length curve
-(( FULL )) && SCALE_GRID_OUTPUT="64,512,2048"
+# The grid, the same on every Mac of a memory set: its prompts by the set (below), 64-token
+# answers, 1, 2 and 4 users. 32k prompts and 8 or 16 users cost more than they showed: on a 32 GB
+# base M5 two 32k prompts at once did not finish 12 requests in the cell timeout, and the full run
+# took about a day on the M4 and M5 Macs. Long answers went too: on a base M5 the 512- and
+# 2048-token answers were 77% of a full run's 11 hours, for one curve.
+SCALE_GRID_INPUT=""            # unset: the memory set's (SCALE_GRID_INPUT_SMALL or _LARGE)
+# A small Mac's prompts stop at 4096: its 8k cells were 57% of its 64-token grid's time.
+SCALE_GRID_INPUT_SMALL="128,512,1024,4096"
+SCALE_GRID_INPUT_LARGE="128,1024,4096,8192"
+SCALE_GRID_OUTPUT="64"
 SCALE_GRID_CONC="1,2,4"        # the grid's users dimension; empty: 1 and the base count
 SCALE_GRID_USERS_OUTPUT="64"   # the answer lengths above 1 user; empty: every --scale-grid-output
 SCALE_BASE_INPUT=1024
 SCALE_BASE_OUTPUT=64
 SCALE_BASE_CONC=8
-SCALE_NUM_PROMPTS=12     # a cell's requests: at least this many,
+# A cell's requests, at least this many: 50 dots a cell on the page, a distribution and not
+# twelve points of one.
+SCALE_NUM_PROMPTS=50
 SCALE_ROUNDS=2           # and at least this many rounds of its users count; --full: 4
 (( FULL )) && SCALE_ROUNDS=4
 SCALE_WARMUPS=2
-# A cell's repeats, one after another on the same server, each with prompts of its own: a cell
-# whose engine behaves one way in one repeat and another way in the next shows both, request by
-# request. --full: 3.
+# A cell's repeats, one after another on the same server, each with prompts of its own (1: its
+# SCALE_NUM_PROMPTS requests are all of it).
 SCALE_REPEATS=1
-(( FULL )) && SCALE_REPEATS=3
 SCALE_SEED_BASE=20260927
 # The TTFT, TPOT and end-to-end percentiles every `bench serve` reports and the JSON keeps
 # (p<N>_<metric>_ms): the spread across a cell's requests, not just its middle and tail.
@@ -370,6 +372,9 @@ done
 # This Mac's set: the large models need 64 GB, the small ones are the round below that.
 MEM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 if (( MEM_GB >= LARGE_GB )); then MODELS_DEFAULT="${MODELS_LARGE}"; else MODELS_DEFAULT="${MODELS_SMALL}"; fi
+if [[ -z "${SCALE_GRID_INPUT}" ]]; then
+    if (( MEM_GB >= LARGE_GB )); then SCALE_GRID_INPUT="${SCALE_GRID_INPUT_LARGE}"; else SCALE_GRID_INPUT="${SCALE_GRID_INPUT_SMALL}"; fi
+fi
 [[ ${#MODELS[@]} -eq 0 ]] && IFS=',' read -r -a MODELS <<<"${MODELS_DEFAULT}"
 case "${MODELS[*]}" in
     all)   MODELS=("${MODELS_ALL[@]}") ;;
