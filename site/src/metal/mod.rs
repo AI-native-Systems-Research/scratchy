@@ -2425,6 +2425,9 @@ impl Shape {
 struct Lineup<'a> {
     classes: &'a [data::Class],
     large_from_gb: u32,
+    /// Every Mac runs the small set ([`data::Config::default_set`]), so a column is one model on
+    /// every chip; false for a lineup from before it, which ran the large set from 64 GB.
+    small_everywhere: bool,
     shapes: BTreeMap<Set, Shape>,
 }
 
@@ -2432,7 +2435,7 @@ impl Lineup<'_> {
     fn model(&self, class: &str, memory_gb: u32) -> Option<&str> {
         (self.classes.iter())
             .find(|c| c.class == class)
-            .map(|c| c.model(memory_gb, self.large_from_gb))
+            .map(|c| c.model(memory_gb, self.large_from_gb, self.small_everywhere))
     }
 
     fn set(&self, memory_gb: u32) -> Set {
@@ -2467,6 +2470,7 @@ fn lineup<'a>(machines: &BTreeMap<&str, MachineRuns<'a>>) -> Option<Lineup<'a>> 
     Some(Lineup {
         classes: newest.config.classes.as_deref()?,
         large_from_gb,
+        small_everywhere: newest.config.default_set.as_deref() == Some("small"),
         shapes,
     })
 }
@@ -3783,10 +3787,43 @@ mod tests {
             (&[1, 2, 4, 8, 16][..], &[128, 1024, 4096][..])
         );
         assert!(lineup.set(36) == super::Set::Small && lineup.set(64) == super::Set::Large);
-        let dense = lineup.classes.iter().find(|c| c.class == "Dense").unwrap();
-        assert_eq!(dense.model(32, lineup.large_from_gb), "granite-4.2-8b");
-        assert_eq!(dense.model(36, lineup.large_from_gb), "granite-4.2-8b");
-        assert_eq!(dense.model(64, lineup.large_from_gb), "granite-4.2-30b");
+        // A lineup from before `default_set`: the large set from 64 GB.
+        assert!(!lineup.small_everywhere);
+        assert_eq!(lineup.model("Dense", 32), Some("granite-4.2-8b"));
+        assert_eq!(lineup.model("Dense", 36), Some("granite-4.2-8b"));
+        assert_eq!(lineup.model("Dense", 64), Some("granite-4.2-30b"));
+    }
+
+    /// A lineup whose newest run records `default_set: "small"`: every Mac's column is the small
+    /// model, a 64 GB Mac's too, so the overview compares one model across every chip.
+    #[test]
+    fn a_small_set_lineup_puts_every_mac_on_the_small_models() {
+        use super::data::Run;
+        let read = |name: &str| -> serde_json::Value {
+            let p = format!("{}/data/metal/{name}", env!("CARGO_MANIFEST_DIR"));
+            serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+        };
+        let mut small = read("apple-m3-pro-2026-10-27T031941Z-f9739363.json");
+        small["config"]["default_set"] = "small".into();
+        let mut big = small.clone();
+        big["machine"]["chip"] = "Apple M5 Max".into();
+        big["machine"]["memory_gb"] = 128.into();
+        let runs: Vec<Run> = [small, big]
+            .into_iter()
+            .map(|v| serde_json::from_value(v).unwrap())
+            .collect();
+        let machines = super::index(&runs);
+        let lineup = super::lineup(&machines).expect("a lineup");
+        assert!(lineup.small_everywhere);
+        // This run's class table names them in lower case.
+        for gb in [36, 64, 128] {
+            assert_eq!(lineup.model("dense", gb), Some("granite-4.2-3b"), "{gb} GB");
+            assert_eq!(
+                lineup.model("sliding window", gb),
+                Some("gpt-oss-20b"),
+                "{gb} GB"
+            );
+        }
     }
 
     /// Over every published run: a cell whose answers came back short of the tokens asked for

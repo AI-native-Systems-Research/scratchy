@@ -21,13 +21,13 @@ runs everything else.
 **Three kinds of run:**
 - A **quick run** is the default, and what the user means by "run the
   benchmark" unless they say otherwise. **It asks no questions:** see
-  **Quick run** below. The script with no flags but `--unpinned`: this Mac's
-  four models (the small set below 64 GB, the large set at 64 GB), scratchy
+  **Quick run** below. The script with no flags but `--unpinned`: the small
+  set's four models, on every Mac whatever its memory, scratchy
   alone, cold and warm, one rep, the users × prompt grid at 1, 2 and 4
   users, 64-token answers and 50 requests a cell, every request kept (the
   page plots each one). Prompts are 128, 512, 1024 and 4096 tokens below
-  64 GB, and 128, 1024, 4096 and 8192 from 64 GB; the memory also picks the
-  models.
+  64 GB, and 128, 1024, 4096 and 8192 from 64 GB; the memory sizes only the
+  prompts. Every cell records the Mac's thermal state before and after it.
   scratchy runs at its defaults on every Mac, and every cell runs: one
   that runs out of memory is recorded as failed. The page keeps every
   other engine's numbers, and scratchy's frozen launches, from the last full
@@ -46,11 +46,13 @@ runs everything else.
   --parity --out-dir /tmp/metal-smoke`. Its JSON never goes on the site, so after
   step 4 you're done.
 
-**The rounds:** one model per class, a small one for 36 GB and a large one
-for 64 GB. Sliding window: gpt-oss-20b / gpt-oss-120b-3bit. Mamba-2:
+**The rounds:** one model per class, the small set on every Mac by default,
+so each overview column is one model across every chip; the large set (64 GB
+only) runs by name. Sliding window: gpt-oss-20b / gpt-oss-120b-3bit. Mamba-2:
 nemotron-3-nano-30b-a3b / nemotron-3-super-120b-a12b. Gated DeltaNet:
 qwen3.6-35b-a3b / qwen3.5-122b-a10b. Dense: granite-4.2-3b / granite-4.2-30b. The large set is 2- and 3-bit (OptiQ or 3-bit), since no 4-bit 120B fits 64 GB: its numbers aren't comparable with the 4-bit small set on quality.
-`--models small`, `large` or `full` picks a set; glm-4.5-air and the gemma
+`--models small`, `large` or `full` picks a set (`large` is the 120B round,
+on a 64 GB Mac; `full` runs both where each fits); glm-4.5-air and the gemma
 and qwen3.6-27b models run by name. The run file records the class table
 (`config.classes`), and the page's overview reads its columns from it.
 
