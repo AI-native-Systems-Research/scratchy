@@ -23,13 +23,13 @@ use crate::carbon::{
     Stack, Table, TableCell, TableRow, Tag, TagKind, Tile, Toggletip,
 };
 use crate::charts::{
-    Axes, Axis, AxisDomain, BarPoint, Better, Chart, ChartOptions, ColorLegend, Colour, Enabled,
-    Gradient, HeatPoint, HeatmapOptions, Locale, RATIO_RANGE, RATIO_STEPS, RatioSquare, ScaleFit,
-    SparkAxes, Step, TableAxes, chart, colour, glance_maps, glance_mini, highlight, log2_ratio,
-    mini_heatmap, ratio_scale, ratio_step, sparkline,
+    Axes, Axis, AxisDomain, BarPoint, Better, Chart, ChartOptions, ColorLegend, Colour, DotPoint,
+    Enabled, Gradient, HeatPoint, HeatmapOptions, Locale, Points, RATIO_RANGE, RATIO_STEPS,
+    RatioSquare, ScaleFit, SparkAxes, Step, TableAxes, chart, colour, glance_maps, glance_mini,
+    highlight, log2_ratio, mini_heatmap, ratio_scale, ratio_step, sparkline,
 };
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab};
-use data::{At, Bytes, Cell, Model, Run, Scenario};
+use data::{At, Bytes, Cell, Model, RequestTiming, Run, Scenario};
 use numbers::{
     BELOW_WEIGHTS, DASH, Engine, FAILED, Metric, NO_STREAM, NOISE, SHORT, Startup, cfmt,
     failed_note, fmt, lfmt, marks, marks_note, med, peak_rss, rss_fmt, served, timing,
@@ -904,6 +904,7 @@ fn bar_chart(
             locale: None,
             combo: None,
             bounds: None,
+            points: None,
             toolbar: Enabled { enabled: false },
         },
     };
@@ -949,6 +950,7 @@ fn grid_heatmap(
             locale: Locale::total(total_label),
             combo: None,
             bounds: None,
+            points: None,
             toolbar: Enabled { enabled: false },
         },
         ratio,
@@ -1754,6 +1756,295 @@ fn grid_maps(m: &Model, mid: &str, run: &Run) -> Element {
     )
 }
 
+/// A grid cell's place in the request plots: users at once, then answer tokens, then prompt
+/// tokens, each fewest first.
+type CellKey = (u32, u32, u32);
+
+fn cell_key(c: &Cell, base: u32) -> Option<CellKey> {
+    match c.at {
+        At::Grid { input, output } => Some((c.users.unwrap_or(base), output, input)),
+        At::Conc(_) | At::Input(_) | At::Output(_) => None,
+    }
+}
+
+/// One model's requests in one run: its grid cells that kept every request, scratchy's and the
+/// first rival's that did too.
+struct Latency<'a> {
+    m: &'a Model,
+    base: u32,
+    engines: Vec<Engine>,
+    keys: Vec<CellKey>,
+}
+
+/// A latency chart's extent along each timing, [from, to] in ms: (TTFT, TPOT).
+type Span = ([f64; 2], [f64; 2]);
+
+impl<'a> Latency<'a> {
+    /// None where scratchy kept no request (runs from before the run file kept them).
+    fn of(m: &'a Model, run: &Run) -> Option<Self> {
+        let base = base_of(run, m).2.unwrap_or(0);
+        let mut keys: Vec<CellKey> = (Engine::Scratchy.cells(m).iter())
+            .filter(|c| c.requests.is_some())
+            .filter_map(|c| cell_key(c, base))
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let rival =
+            (Engine::RIVALS.into_iter()).find(|e| e.cells(m).iter().any(|c| c.requests.is_some()));
+        (!keys.is_empty()).then(|| Latency {
+            m,
+            base,
+            engines: std::iter::once(Engine::Scratchy).chain(rival).collect(),
+            keys,
+        })
+    }
+
+    fn cell(&self, e: Engine, k: CellKey) -> Option<&'a Cell> {
+        (e.cells(self.m).iter()).find(|c| cell_key(c, self.base) == Some(k))
+    }
+
+    /// Each engine's requests at one cell that have both timings: (engine, TTFT, TPOT).
+    fn requests(&self, k: CellKey) -> Vec<(Engine, f64, f64)> {
+        (self.engines.iter())
+            .filter_map(|&e| self.cell(e, k)?.requests.as_ref().map(|rs| (e, rs)))
+            .flat_map(|(e, rs)| {
+                (rs.of(RequestTiming::Ttft).zip(rs.of(RequestTiming::Tpot)))
+                    .filter_map(move |((_, t), (_, p))| Some((e, t?, p?)))
+            })
+            .collect()
+    }
+
+    /// The extent of these cells' requests, padded, so charts sharing it compare at a glance.
+    fn span(&self, keys: &[CellKey]) -> Option<Span> {
+        let rs: Vec<(Engine, f64, f64)> = keys.iter().flat_map(|&k| self.requests(k)).collect();
+        let range = |vs: &mut dyn Iterator<Item = f64>| {
+            vs.fold(None, |r: Option<[f64; 2]>, v| {
+                Some(r.map_or([v, v], |[lo, hi]| [lo.min(v), hi.max(v)]))
+            })
+        };
+        let [t0, t1] = range(&mut rs.iter().map(|r| r.1))?;
+        let [p0, p1] = range(&mut rs.iter().map(|r| r.2))?;
+        let pad = (p1 - p0).max(p1 * 0.05) * 0.1;
+        Some(([t0 / 1.2, t1 * 1.2], [(p0 - pad).max(0.0), p1 + pad]))
+    }
+
+    /// One cell's requests as a square scatter: TTFT up (log), TPOT across, on `span`. Bare, no
+    /// axis titles or tick labels: a panel of a dense grid, its axes the grid's to say.
+    fn chart(&self, k: CellKey, span: Span, side: &str, bare: bool, label: &str) -> Element {
+        let data: Vec<DotPoint> = (self.requests(k).into_iter())
+            .map(|(e, t, p)| DotPoint {
+                group: e.label(),
+                key: p,
+                value: t,
+            })
+            .collect();
+        let axis = |maps_to, title, scale_type, domain| Axis {
+            maps_to,
+            // Kept on a bare chart's hidden axes: Carbon's tooltip names each timing by it.
+            title,
+            scale_type,
+            ticks: None,
+            include_zero: Some(false),
+            visible: bare.then_some(false),
+            domain: Some(AxisDomain::Values(domain)),
+        };
+        let spec = Chart::Scatter {
+            data,
+            options: ChartOptions {
+                title: String::new(),
+                axes: Axes {
+                    bottom: axis("key", "TPOT (ms)", None, span.1),
+                    left: axis("value", "TTFT (ms)", Some("log"), span.0),
+                },
+                color: Some(Colour::Scale {
+                    scale: (self.engines.iter().zip(["s1", "s2"]))
+                        .map(|(&e, class)| (e.label(), colour(class)))
+                        .collect(),
+                }),
+                heatmap: None,
+                height: side.to_string(),
+                width: Some(side.to_string()),
+                legend: Some(Enabled { enabled: false }),
+                locale: None,
+                combo: None,
+                bounds: None,
+                points: Some(Points {
+                    radius: if bare { 2.5 } else { 3.5 },
+                    fill_opacity: 0.6,
+                }),
+                toolbar: Enabled { enabled: false },
+            },
+        };
+        // Its title inside its plot, top left, letting the pointer through to the dots under it.
+        let (u, o, i) = k;
+        let size = if bare { "0.625rem" } else { "0.75rem" };
+        let inset = if bare { "2px 4px" } else { "4px 0 0 3.5rem" };
+        rsx! {
+            div { style: "position: relative; width: {side}",
+                {chart(&spec, label, &format!("width: {side}"), None)}
+                span { style: "position: absolute; top: 0; left: 0; padding: {inset}; font-size: {size}; pointer-events: none",
+                    if bare { "{i}·×{u}" } else { "{i} in, {o} out, {u} at once" }
+                }
+            }
+        }
+    }
+}
+
+impl Latency<'_> {
+    /// Every cell at one answer length as a dense grid of bare square scatters, users at once
+    /// down and prompt size across, every panel on the same axes.
+    fn inner_grid(&self, o: u32, side: &str, label: &str) -> Element {
+        let ks: Vec<CellKey> = self.keys.iter().copied().filter(|k| k.1 == o).collect();
+        let Some(span) = self.span(&ks) else {
+            return rsx! {};
+        };
+        let mut users: Vec<u32> = ks.iter().map(|k| k.0).collect();
+        let mut prompts: Vec<u32> = ks.iter().map(|k| k.2).collect();
+        users.dedup();
+        prompts.sort_unstable();
+        prompts.dedup();
+        let grid = format!(
+            "display: grid; grid-template-columns: repeat({}, {side}); gap: 2px",
+            prompts.len()
+        );
+        rsx! {
+            div { style: "{grid}",
+                for &u in &users {
+                    for &i in &prompts {
+                        div { style: "outline: 1px solid var(--cds-border-subtle-01, #e0e0e0); width: {side}; height: {side}",
+                            if ks.contains(&(u, o, i)) {
+                                {self.chart((u, o, i), span, side, true, &format!("{label}, {i} in {u} at once"))}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// An inner grid's panel in the overview: small enough that a model's whole grid fits its column.
+const INNER_SIDE: &str = "80px";
+
+/// A small multiple's panel: square, so neither timing's spread looks wider by the chart's shape.
+const PANEL_SIDE: &str = "214px";
+
+/// The legend every latency chart shares, in the engines' colours.
+fn latency_legend(engines: &[Engine]) -> Element {
+    rsx! {
+        div { style: "display: flex; gap: 1.5rem; align-items: center",
+            for (e, class) in engines.iter().zip(["s1", "s2"]) {
+                span { style: "display: inline-flex; gap: 0.4rem; align-items: center",
+                    span { style: "width: 10px; height: 10px; border-radius: 50%; background: {colour(class).light}" }
+                    "{e.label()}"
+                }
+            }
+        }
+    }
+}
+
+/// Every request of every grid cell, time to first token against time per output token, a dot
+/// each, scratchy against its rival: per answer length a small multiple, users at once down,
+/// prompt size across, every panel on the same axes.
+fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
+    let Some(l) = Latency::of(m, run) else {
+        return rsx! {};
+    };
+    let span = l.span(&l.keys);
+    let mut answers: Vec<u32> = l.keys.iter().map(|k| k.1).collect();
+    answers.dedup();
+    answers.sort_unstable();
+    answers.dedup();
+    let multiple = |o: u32| -> Element {
+        let ks: Vec<CellKey> = l.keys.iter().copied().filter(|k| k.1 == o).collect();
+        let mut users: Vec<u32> = ks.iter().map(|k| k.0).collect();
+        let mut prompts: Vec<u32> = ks.iter().map(|k| k.2).collect();
+        users.dedup();
+        prompts.sort_unstable();
+        prompts.dedup();
+        let columns = format!(
+            "display: grid; grid-template-columns: 4rem repeat({}, {PANEL_SIDE}); gap: 0.5rem; align-items: center",
+            prompts.len()
+        );
+        rsx! {
+            Stack { gap: 2,
+                strong { "{o}-token answers" }
+                div { style: "{columns}",
+                    div { "users ↓ prompt →" }
+                    for i in &prompts { div { style: "text-align: center", "{i}" } }
+                    for &u in &users {
+                        div { "{u}" }
+                        for &i in &prompts {
+                            div {
+                                if let (true, Some(span)) = (ks.contains(&(u, o, i)), span) {
+                                    {l.chart((u, o, i), span, PANEL_SIDE, false, &format!("TTFT against TPOT, every request, {i} in {o} out {u} at once, {mid}"))}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    let table = |t: RequestTiming| -> Element {
+        rsx! {
+            Table { headers: headers([t.title(), "engine", "requests", "min", "p25", "median", "p75", "max"]),
+                for &(u, o, i) in &l.keys {
+                    for &e in &l.engines {
+                        if let Some(rs) = l.cell(e, (u, o, i)).and_then(|c| c.requests.as_ref()) {
+                            {
+                                let mut vs: Vec<f64> = rs.of(t).filter_map(|(_, v)| v).collect();
+                                vs.sort_by(f64::total_cmp);
+                                let q = |p: f64| fmt(quantile(&vs, p), 1);
+                                rsx! {
+                                    TableRow {
+                                        TableCell { "{i}→{o} ×{u}" }
+                                        TableCell { "{e.label()}" }
+                                        TableCell { "{vs.len()}" }
+                                        TableCell { {q(0.0)} }
+                                        TableCell { {q(25.0)} }
+                                        TableCell { {q(50.0)} }
+                                        TableCell { {q(75.0)} }
+                                        TableCell { {q(100.0)} }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    part(
+        "Latency distributions",
+        rsx! {
+            "Every request, a dot each: time to first token up (log), time per output token across, every \
+             panel on the same axes. A request held back behind another lands high and left; one decoding \
+             beside others lands low and right; a cell that ran two ways shows two clouds. Requests that \
+             failed, or whose answer arrived in one piece, have neither timing to plot."
+        },
+        rsx! {
+            Stack { gap: 6,
+                {latency_legend(&l.engines)}
+                for o in answers { {multiple(o)} }
+                Fold { title: "Table view, every request",
+                    Stack { gap: 4,
+                        for t in RequestTiming::ALL { {table(t)} }
+                    }
+                }
+            }
+        },
+    )
+}
+
+/// numpy.percentile(method='linear') of sorted values, as the bench figures its own.
+fn quantile(sorted: &[f64], p: f64) -> Option<f64> {
+    let last = sorted.len().checked_sub(1)?;
+    let k = last as f64 * p / 100.0;
+    let (f, c) = (k.floor() as usize, (k.ceil() as usize).min(last));
+    Some(sorted[f] + (sorted[c] - sorted[f]) * (k - k.floor()))
+}
+
 fn commit(run: &Run) -> Element {
     rsx! { a { href: "{REPO}/commit/{run.repo.sha}", code { "{run.repo.sha8()}" } } }
 }
@@ -2360,6 +2651,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                     Stack { gap: 5,
                         ContentSwitcher { selected: slug(HEAT_MAPS),
                             ContentSwitcherItem { target: slug(HEAT_MAPS), selected: true, "{HEAT_MAPS}" }
+                            ContentSwitcherItem { target: slug(LATENCY), selected: false, "{LATENCY}" }
                             for (title, _, _) in SCALING {
                                 ContentSwitcherItem { target: slug(title), selected: false, "{title}" }
                             }
@@ -2387,7 +2679,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                                 ": {counts(&lineup.shapes[set].users)} users at once by \
                                                  {counts(&lineup.shapes[set].prompts)}-token prompts"
                                             }
-                                            {glance_maps(rows, &classes, cell)}
+                                            {glance_maps(rows, &classes, "minmax(0, 11.5rem)", true, cell)}
                                         }
                                     }
                                 }
@@ -2401,16 +2693,23 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                     div { style: "contain: inline-size",
                                         Stack { gap: 5,
                                             p { "scratchy against oMLX TurboQuant (or the next engine a run has, in the order of the heat maps) along {along}. Blue fill where scratchy is ahead, red where it is behind." }
-                                            div { style: spark_grid(stems.len()),
-                                                div {}
-                                                div {}
-                                                for stem in &stems { div { style: "text-align: center", "{stem}" } }
-                                                for chip in &chips {
-                                                    div { style: "grid-row: span 2; align-self: start", "{chip}" }
-                                                    div { "Prefill" }
-                                                    for stem in &stems { div { {spark(chip, stem, prefill)} } }
-                                                    div { "Decode" }
-                                                    for stem in &stems { div { {spark(chip, stem, decode)} } }
+                                            for (set, rows) in &sets {
+                                                Stack { gap: 3,
+                                                    strong { "{set.title(lineup.large_from_gb)}" }
+                                                    {glance_maps(rows, &classes, "minmax(0, 14rem)", false, |chip: &str, class: &str| {
+                                                        let Some(stem) = model_of(chip, class) else { return rsx! {} };
+                                                        rsx! {
+                                                            div { style: "flex: 1 1 0; min-width: 0",
+                                                                Stack { gap: 1,
+                                                                    span { style: "font-size: 0.75rem", "Prefill" }
+                                                                    {spark(chip, stem, prefill)}
+                                                                    span { style: "font-size: 0.75rem", "Decode" }
+                                                                    {spark(chip, stem, decode)}
+                                                                    div { style: "font-size: 0.75rem; text-align: center; overflow-wrap: anywhere", "{stem}" }
+                                                                }
+                                                            }
+                                                        }
+                                                    })}
                                                 }
                                             }
                                         }
@@ -2419,6 +2718,33 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                             }
                             ContentPanel { id: slug(STARTUP), shown: false,
                                 div { style: "contain: inline-size", {startup_panel(machines, stems.len())} }
+                            }
+                            ContentPanel { id: slug(LATENCY), shown: false,
+                                div { style: "contain: inline-size",
+                                    Stack { gap: 5,
+                                        p {
+                                            "Every request of every cell, a dot each, at the heat maps' answer length: in each \
+                                             model's square, one tiny chart per cell, users at once down (fewest on top) and \
+                                             prompt size across (shortest on the left), all on the same axes: time to first \
+                                             token up (log), time per output token across. A request held back behind another \
+                                             lands high and left; one decoding beside others lands low and right; two clouds are \
+                                             a cell that ran two ways. Each model's own section has every cell. A dash is a run \
+                                             from before the runner kept every request."
+                                        }
+                                        {latency_legend(&latency_engines(machines))}
+                                        for (set, rows) in &sets {
+                                            Stack { gap: 3,
+                                                strong { "{set.title(lineup.large_from_gb)}" }
+                                                // A model's grid at a readable size is wider than a heat map column.
+                                                div { style: "overflow-x: auto",
+                                                    {glance_maps(rows, &classes, "max-content", false, |chip: &str, class: &str| {
+                                                        model_of(chip, class).map_or(rsx! {}, |stem| latency_cell(machines, chip, stem))
+                                                    })}
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -2437,6 +2763,50 @@ fn spark_grid(columns: usize) -> String {
         "display: grid; grid-template-columns: 7rem 4rem repeat({columns}, minmax(0, 1fr)); \
          gap: 0.25rem 2rem; align-items: center"
     )
+}
+
+/// The glance's latency panel's name.
+const LATENCY: &str = "Latency Distributions";
+
+/// One machine's one model in the overview's latency panel: its every request at the heat maps'
+/// answer length, a dense grid of its cells ([`Latency::inner_grid`]), its name under it; a dash
+/// for a run from before the run file kept requests.
+fn latency_cell(machines: &BTreeMap<&str, MachineRuns>, chip: &str, stem: &str) -> Element {
+    let Some(Entry { run, m }) = machines[chip].latest(stem) else {
+        return rsx! {};
+    };
+    let body = match Latency::of(m, run) {
+        Some(l) => {
+            let o = glance_answer(run);
+            l.inner_grid(
+                o,
+                INNER_SIDE,
+                &format!("TTFT against TPOT, every request, {stem} on {chip}, {o}-token answers"),
+            )
+        }
+        None => rsx! { div { title: "this run did not keep its requests", "{DASH}" } },
+    };
+    rsx! {
+        Stack { gap: 1,
+            {body}
+            div { style: "font-size: 0.75rem; overflow-wrap: anywhere", "{stem}" }
+        }
+    }
+}
+
+/// The engines the overview's latency panel draws: scratchy, and the first rival any machine's
+/// newest run kept requests for.
+fn latency_engines(machines: &BTreeMap<&str, MachineRuns>) -> Vec<Engine> {
+    std::iter::once(Engine::Scratchy)
+        .chain((Engine::RIVALS.into_iter()).find(|e| {
+            (machines.values()).any(|mr| {
+                (mr.models.iter()).any(|(_, es)| {
+                    es.last()
+                        .is_some_and(|en| e.cells(en.m).iter().any(|c| c.requests.is_some()))
+                })
+            })
+        }))
+        .collect()
 }
 
 /// The glance's startup panel's name.
@@ -2865,6 +3235,7 @@ fn machine_section(chip: &str, mr: &MachineRuns) -> Element {
                                     {summary_table(m, run, prev)}
                                     {sweep_part(m, run, prev, Sweep::Users)}
                                     {grid_maps(m, &mid, run)}
+                                    {request_plots(m, &mid, run)}
                                     {sweep_part(m, run, prev, Sweep::Prompt)}
                                     {history(seen)}
                                 }
@@ -2991,6 +3362,44 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_cells_requests_read_per_repeat_and_untimed_ones_drop_out() {
+        use super::data::{Cell, RequestTiming};
+        let c: Cell = serde_json::from_value(serde_json::json!({
+            "axis": "grid", "rung": "1024x64", "conc": 2,
+            "median_ttft_ms": 900.0, "median_tpot_ms": 20.0, "output_throughput": 50.0,
+            "completed": 4, "unstreamed_requests": 1,
+            "requests": {"rep": [0, 0, 1, 1], "ttft_ms": [100.0, 200.0, 300.0, null],
+                         "tpot_ms": [15.0, 16.0, 17.0, null], "e2el_ms": [1.0, 2.0, 3.0, 4.0],
+                         "output_tokens": [64, 64, 64, 64]},
+        }))
+        .unwrap();
+        let rs = c.requests.as_ref().unwrap();
+        let ttft: Vec<_> = rs.of(RequestTiming::Ttft).collect();
+        assert_eq!(
+            ttft,
+            [
+                (0, Some(100.0)),
+                (0, Some(200.0)),
+                (1, Some(300.0)),
+                (1, None)
+            ]
+        );
+        let mut timed: Vec<f64> = ttft.iter().filter_map(|(_, v)| *v).collect();
+        timed.sort_by(f64::total_cmp);
+        assert_eq!(super::quantile(&timed, 50.0), Some(200.0));
+        assert_eq!(super::quantile(&timed, 25.0), Some(150.0));
+        assert_eq!(super::quantile(&[], 50.0), None);
+        // A run from before the run file kept requests reads as none.
+        let old: Cell = serde_json::from_value(serde_json::json!({
+            "axis": "grid", "rung": "1024x64", "conc": 2, "median_ttft_ms": 900.0,
+            "median_tpot_ms": 20.0, "output_throughput": 50.0, "completed": 4,
+            "unstreamed_requests": 0,
+        }))
+        .unwrap();
+        assert!(old.requests.is_none());
+    }
+
     use super::{DATA, Run, TESTDATA, size_name, slug};
 
     #[test]

@@ -59,8 +59,8 @@
 # comparison engine (every --full run), or --parity forcing it (the smoke
 # run's setup check). A scratchy-only run — the quick form — skips it and
 # records "parity_skipped" instead.
-# Comparison engines. By default oMLX and oMLX TurboQuant, the strongest MLX
-# rival, so the time goes into the users dimension of the grid instead
+# Comparison engines. By default oMLX, the strongest MLX rival (oMLX TurboQuant
+# is an ablation of its own, by name), so the time goes into the users dimension of the grid instead
 # (#349); --engines all runs every installed one, --engines a,b names some:
 #   mlx-lm      python with `import mlx_lm` ($VIRTUAL_ENV, python3, or --mlx-python)
 #   ollama      `ollama serve` on --port, its MLX engine (the -mlx tags); pulls
@@ -275,10 +275,11 @@ OLLAMA_AUTO=1
 ENGINES=""               # --engines: unset for DEFAULT_ENGINES, all for every installed one
 ENGINES_GIVEN=0          # --engines was passed (even as "": scratchy alone)
 LEGACY_NO=0              # --no-mlx / --no-ollama was passed
-DEFAULT_ENGINES=""       # scratchy alone; --full: oMLX and oMLX TurboQuant
-# Splash is not a default: it adds about an hour to each Mac's full run, on the Qwen models alone.
+DEFAULT_ENGINES=""       # scratchy alone; --full: oMLX
+# oMLX TurboQuant is not in a full run: its behaviour is an ablation of its own (--engines names it).
+# Splash is not a default either: it adds about an hour to each Mac's full run, on the Qwen models alone.
 # --engines all runs it, as does naming it (--engines omlx,omlx_tq,splash).
-(( FULL )) && DEFAULT_ENGINES="omlx,omlx_tq"
+(( FULL )) && DEFAULT_ENGINES="omlx"
 PINS=()
 UNPINNED=0
 SCALING=1
@@ -302,6 +303,11 @@ SCALE_NUM_PROMPTS=12     # a cell's requests: at least this many,
 SCALE_ROUNDS=2           # and at least this many rounds of its users count; --full: 4
 (( FULL )) && SCALE_ROUNDS=4
 SCALE_WARMUPS=2
+# A cell's repeats, one after another on the same server, each with prompts of its own: a cell
+# whose engine behaves one way in one repeat and another way in the next shows both, request by
+# request. --full: 3.
+SCALE_REPEATS=1
+(( FULL )) && SCALE_REPEATS=3
 SCALE_SEED_BASE=20260927
 # The TTFT, TPOT and end-to-end percentiles every `bench serve` reports and the JSON keeps
 # (p<N>_<metric>_ms): the spread across a cell's requests, not just its middle and tail.
@@ -341,6 +347,7 @@ while [[ $# -gt 0 ]]; do
         --scale-grid-conc)   SCALE_GRID_CONC="$2"; shift 2 ;;
         --scale-grid-users-output) SCALE_GRID_USERS_OUTPUT="$2"; shift 2 ;;
         --scale-num-prompts) SCALE_NUM_PROMPTS="$2"; shift 2 ;;
+        --scale-repeats)     SCALE_REPEATS="$2"; shift 2 ;;
         --scale-rounds)      SCALE_ROUNDS="$2"; shift 2 ;;
         --scale-warmups)     SCALE_WARMUPS="$2"; shift 2 ;;
         --scale-base-input)  SCALE_BASE_INPUT="$2"; shift 2 ;;
@@ -586,7 +593,7 @@ PIN_PROBLEMS="$(printf '%s\n' ${pin_problems[@]+"${pin_problems[@]}"})"
 CLASS_TABLE="$(printf '%s\n' "${CLASSES[@]}")"
 export ENGINE_INFO PIN_PROBLEMS UNPINNED CLASS_TABLE LARGE_GB
 export STARTED_UTC PERCENTILES PRIME_LAUNCHES INPUT_LEN OUTPUT_LEN WARM_REQUESTS SCENARIOS SCALING SCALE_AXES SCALE_CONC SCALE_INPUT SCALE_OUTPUT SCALE_GRID_INPUT \
-       SCALE_GRID_OUTPUT SCALE_GRID_CONC SCALE_GRID_USERS_OUTPUT SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS SCALE_ROUNDS \
+       SCALE_GRID_OUTPUT SCALE_GRID_CONC SCALE_GRID_USERS_OUTPUT SCALE_BASE_INPUT SCALE_BASE_OUTPUT SCALE_BASE_CONC SCALE_NUM_PROMPTS SCALE_ROUNDS SCALE_REPEATS \
        MLX_PYTHON OLLAMA_BIN KV_CACHE_DTYPE SERVE_ARGS CELL_TIMEOUT_S CELL_HANG_TOK_S RESUME MODELS_FULL
 python3 - "${JSON}" "${chip}" <<'PY'
 import json, os, subprocess, sys
@@ -651,6 +658,7 @@ json.dump({
                           "conc": int(e["SCALE_BASE_CONC"])},
                  "min_prompts_per_cell": int(e["SCALE_NUM_PROMPTS"]),
                  "min_rounds_per_cell": int(e["SCALE_ROUNDS"]),
+                 "repeats_per_cell": int(e["SCALE_REPEATS"]),
                  "concurrency_is": "offered (--max-concurrency), not the effective decode batch"},
              "comparison": {row.split("|")[0]: row.split("|")[2] == "1"
                             for row in e["ENGINE_INFO"].splitlines()[1:]},
@@ -886,6 +894,16 @@ print(f"{j['output_throughput']:7.1f} tok/s · TTFT p50 {f(j['median_ttft_ms'], 
 PY
 }
 run_cell() { # prefix axis rung input output conc
+    # Each repeat on the same server; a repeat that hung or failed ends the cell, and the next
+    # cell gets a fresh server (run_rep).
+    local r
+    for (( r = 0; r < SCALE_REPEATS; r++ )); do
+        run_rep "$@" "${r}"
+        (( cells_hung || cells_dead )) && break
+    done
+    return 0
+}
+run_rep() { # prefix axis rung input output conc repeat
     # The cell before this one timed out or had failed requests: a fresh server, so a server
     # that ran out of memory there is not what this cell measures. One that will not come back
     # leaves the rest of the sweep unmeasured.
@@ -901,12 +919,14 @@ run_cell() { # prefix axis rung input output conc
             return 0
         fi
     fi
-    local out_json="$1.$2-$3.json" seed rc=0
+    # Repeat 0 keeps the cell's own file and seed, so a run from before repeats reads the same.
+    local out_json="$1.$2-$3.json" seed rc=0 tag="" warmups="${SCALE_WARMUPS}"
+    (( $7 )) && { out_json="$1.$2-$3.r$7.json"; tag=":r$7"; warmups=0; }
     # Enough requests that the users count is kept full: one round alone is
     # a ramp-up and a drain, and fewer requests than users never fill it.
     local n=$(( $6 * SCALE_ROUNDS > SCALE_NUM_PROMPTS ? $6 * SCALE_ROUNDS : SCALE_NUM_PROMPTS ))
-    seed=$(printf '%s' "${SCALE_SEED_BASE}:${stem}:$2:$3" | cksum | cut -d' ' -f1)
-    printf '    %-16s in %-5s out %-5s conc %-3s ' "$2=$3" "$4" "$5" "$6"
+    seed=$(printf '%s' "${SCALE_SEED_BASE}:${stem}:$2:$3${tag}" | cksum | cut -d' ' -f1)
+    printf '    %-16s in %-5s out %-5s conc %-3s ' "$2=$3${tag#:}" "$4" "$5" "$6"
     # --resume: a cell an earlier run of this output finished cleanly is kept, not measured again.
     if (( RESUME )) && python3 -c 'import json, sys; j = json.load(open(sys.argv[1]))
 sys.exit(not j.get("completed") or any(j.get(k) for k in ("failed", "timed_out", "dead_server")))' \
@@ -925,8 +945,8 @@ sys.exit(not j.get("completed") or any(j.get(k) for k in ("failed", "timed_out",
         "${BIN}" bench serve --base-url "http://127.0.0.1:${PORT}" --model "${cell_model:-${id}}" \
         ${cell_tok:+--tokenizer "${cell_tok}"} \
         --num-prompts "${n}" --input-len "$4" --output-len "$5" \
-        --max-concurrency "$6" --temperature 0 --seed "${seed}" --num-warmups "${SCALE_WARMUPS}" \
-        --percentile-metrics ttft,tpot,e2el --metric-percentiles "${PERCENTILES}" \
+        --max-concurrency "$6" --temperature 0 --seed "${seed}" --num-warmups "${warmups}" \
+        --percentile-metrics ttft,tpot,e2el --metric-percentiles "${PERCENTILES}" --save-detailed \
         --output-json "${out_json}" --disable-tqdm >>"${RAW}/cells-${stem}.log" 2>&1; } 2>/dev/null || rc=$?
     [[ -n "${sampler}" ]] && { kill "${sampler}" 2>/dev/null; wait "${sampler}" 2>/dev/null; } || true
     [[ -s "${mem}" && -f "${out_json}" ]] && python3 - "${out_json}" "${mem}" <<'PY' || true
@@ -1473,6 +1493,44 @@ def load(name):
 PCT = re.compile(r"p[0-9.]+_(ttft|tpot|e2el)_ms")
 def metrics(j):
     return {k: v for k, v in j.items() if k in KEEP or PCT.fullmatch(k)} if j else None
+def pct(xs, p):
+    """numpy.percentile(method='linear'), as bench serve computes its own."""
+    if not xs:
+        return None
+    xs = sorted(xs); k = (len(xs) - 1) * p / 100; f = int(k)
+    return xs[f] + (xs[min(f + 1, len(xs) - 1)] - xs[f]) * (k - f)
+def requests(reps):
+    """Every request of a cell's repeats, from bench serve's --save-detailed: parallel arrays in
+    request order, ms. A timing is null where it was never seen: the request failed, or (TTFT
+    and TPOT) all its tokens came in one chunk, which bench serve leaves out of them too."""
+    out = {k: [] for k in ("rep", "ttft_ms", "tpot_ms", "e2el_ms", "output_tokens")}
+    for r, j in enumerate(reps):
+        for t, e2, n, ch, err in zip(j["ttfts"], j["latencies"], j["output_lens"], j["chunks"], j["errors"]):
+            ok, streamed = not err, not (n > 1 and ch <= 1)
+            out["rep"].append(r)
+            out["ttft_ms"].append(round(t * 1000, 1) if ok and streamed else None)
+            out["tpot_ms"].append(round((e2 - t) * 1000 / (n - 1), 2) if ok and streamed and n > 1 else None)
+            out["e2el_ms"].append(round(e2 * 1000, 1) if ok else None)
+            out["output_tokens"].append(n)
+    return out
+def pooled(reps):
+    """A cell's figures over every request of all its repeats, as bench serve figures one."""
+    if len(reps) == 1 or not all("errors" in j for j in reps):
+        return metrics(reps[0])
+    m = metrics(reps[0]) | {k: sum(j.get(k) or 0 for j in reps)
+                            for k in ("completed", "failed", "total_output_tokens", "duration", "unstreamed_requests")}
+    m["output_throughput"] = m["total_output_tokens"] / m["duration"] if m["duration"] else None
+    m["request_throughput"] = m["completed"] / m["duration"] if m["duration"] else None
+    q = requests(reps)
+    for name in ("ttft", "tpot", "e2el"):
+        xs = [x for x in q[f"{name}_ms"] if x is not None]
+        m[f"median_{name}_ms"] = pct(xs, 50)
+        for p in (int(x) for x in env["PERCENTILES"].split(",")):
+            m[f"p{p}_{name}_ms"] = pct(xs, p)
+    for k in ("timed_out", "dead_server"):
+        if any(j.get(k) for j in reps):
+            m[k] = True
+    return m
 grid_users = {int(x) for x in env["GRID_CONC_LIST"].split(",")}
 grid_inputs = {int(x) for x in env["SCALE_GRID_INPUT"].split(",") if x}
 def scaling(engine):
@@ -1490,7 +1548,14 @@ def scaling(engine):
         where = ({"rung": f"{a}x{b}", "input_len": int(a), "output_len": int(b),
                   "conc": int(users or env["BASE_CONC"])}
                  if axis == "grid" else {"rung": int(a)})
-        cells.append({"axis": axis, **where, **metrics(j)})
+        # Its repeats after the first (run_rep), in order, up to the first missing one.
+        reps = [j]
+        while len(reps) < int(env["SCALE_REPEATS"]) and (r := load(os.path.basename(p)[:-5] + f".r{len(reps)}.json")):
+            reps.append(r)
+        cell = {"axis": axis, **where, **pooled(reps), "repeats": len(reps)}
+        if all("errors" in r for r in reps):
+            cell["requests"] = requests(reps)
+        cells.append(cell)
     return cells or None
 def parity_ties():
     """From the gate's log: {prompt: [gap, ...]} for each prompt that passed as a near-tie."""

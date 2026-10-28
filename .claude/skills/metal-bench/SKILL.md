@@ -33,9 +33,11 @@ runs everything else.
   form: the one M3 Pro quick run took 43 minutes, before every cell ran and
   at four rounds a cell. The aim is about 25 minutes. Report the run's length.
 - A **full run** renews every number: `--full` adds the comparison engines
-  (oMLX and oMLX TurboQuant), frozen (needs `sudo purge`), three reps, four
-  rounds of each users count a cell, and the 512- and 2048-token answers at
-  1 user (the decode-vs-answer-length curve). It takes hours; run it when the engines or the grid change, or
+  (oMLX; oMLX TurboQuant is an ablation of its own, run by name), frozen
+  (needs `sudo purge`), three reps, four rounds of each users count a cell,
+  each cell three times on the same server with prompts of its own, every
+  request kept (the page plots each one), and the 512- and 2048-token answers
+  at 1 user (the decode-vs-answer-length curve). It takes hours; run it when the engines or the grid change, or
   for a published study. It's pinned (`--pin`) and goes through every
   pre-flight question in step 2.
 - A **smoke run** checks the setup: `--models gpt-oss-20b --no-scaling
@@ -265,7 +267,7 @@ act on each one as it appears:
 
 - the engine lines in the header, one per engine (`llama.cpp : <path>
   (<version>)`): a `skipped` line under one means it isn't installed or
-  isn't selected (by default a full run times oMLX and oMLX TurboQuant). If it's an
+  isn't selected (by default a full run times only oMLX). If it's an
   engine the user meant to run, stop the run and go back to step 1.
 - `skipped: needs N GB`: expected for glm-4.5-air on a Mac under 64 GB.
 - `--- mistral.rs: nothing to serve`: expected for every MoE model; it runs

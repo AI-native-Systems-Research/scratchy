@@ -583,6 +583,56 @@ pub struct Cell {
     /// The share of the answer tokens asked for that a live cell delivered, where its answers came
     /// back short ([`Run::mark_short`]); None where they ran to length or it can't say.
     pub short: Option<f64>,
+    /// Every request it sent, over all its repeats; None in runs from before the run file kept them.
+    pub requests: Option<Requests>,
+}
+
+/// A cell's requests, in the order each repeat sent them: parallel arrays, one entry a request.
+/// A timing is None where the request was not timed: it failed, or (TTFT and TPOT) its answer
+/// arrived in one piece.
+#[derive(Deserialize, Clone)]
+pub struct Requests {
+    /// Which of the cell's repeats it was in, from 0; each repeat ran on the same server.
+    pub rep: Vec<u32>,
+    pub ttft_ms: Vec<Option<f64>>,
+    pub tpot_ms: Vec<Option<f64>>,
+    pub e2el_ms: Vec<Option<f64>>,
+}
+
+impl Requests {
+    /// Each request's value of one timing, with its repeat.
+    pub fn of(&self, t: RequestTiming) -> impl Iterator<Item = (u32, Option<f64>)> + '_ {
+        let vs = match t {
+            RequestTiming::Ttft => &self.ttft_ms,
+            RequestTiming::Tpot => &self.tpot_ms,
+            RequestTiming::E2el => &self.e2el_ms,
+        };
+        self.rep.iter().copied().zip(vs.iter().copied())
+    }
+}
+
+/// A timing every request has its own value of.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RequestTiming {
+    Ttft,
+    Tpot,
+    E2el,
+}
+
+impl RequestTiming {
+    pub const ALL: [RequestTiming; 3] = [
+        RequestTiming::Ttft,
+        RequestTiming::Tpot,
+        RequestTiming::E2el,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            RequestTiming::Ttft => "time to first token",
+            RequestTiming::Tpot => "time per output token",
+            RequestTiming::E2el => "end-to-end time",
+        }
+    }
 }
 
 impl Cell {
@@ -642,6 +692,8 @@ struct RawCell {
     timed_out: bool,
     #[serde(default)]
     dead_server: bool,
+    #[serde(default)]
+    requests: Option<Requests>,
 }
 
 impl TryFrom<RawCell> for Cell {
@@ -682,6 +734,7 @@ impl TryFrom<RawCell> for Cell {
             timed_out: c.timed_out,
             dead_server: c.dead_server,
             short: None,
+            requests: c.requests,
         })
     }
 }

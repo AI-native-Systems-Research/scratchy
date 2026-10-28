@@ -567,6 +567,7 @@ fn bars(
             locale: None,
             combo: None,
             bounds: None,
+            points: None,
             toolbar: Enabled { enabled: false },
         },
     };
@@ -799,7 +800,7 @@ fn glance(sweep: &Sweep) -> Element {
                                          in; a decode grid's batch-8 square comes from the sweep's \
                                          throughput (tok/s) cell there, the unit batched decode measures."
                                     }
-                                    {glance_maps(&rows, &stems, |row, model| rsx! {
+                                    {glance_maps(&rows, &stems, "minmax(0, 11.5rem)", true, |row, model| rsx! {
                                         for (metric, name) in metrics {
                                             {mini(model, dtype_of(row), metric, name)}
                                         }
