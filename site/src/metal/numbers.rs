@@ -18,10 +18,11 @@ pub enum Engine {
     Ollama,
     LlamaCpp,
     Mistralrs,
+    Splash,
 }
 
 impl Engine {
-    pub const ALL: [Engine; 8] = [
+    pub const ALL: [Engine; 9] = [
         Engine::Scratchy,
         Engine::OmlxTq,
         Engine::Omlx,
@@ -30,12 +31,14 @@ impl Engine {
         Engine::Ollama,
         Engine::LlamaCpp,
         Engine::Mistralrs,
+        Engine::Splash,
     ];
     /// The engines scratchy is compared against, preferred first for the
     /// headline comparison: oMLX TurboQuant (4-bit KV, as scratchy's
     /// default), then oMLX as shipped, then the others. Runs from before oMLX
-    /// fall back to mlx-lm, then ollama, as they always did.
-    pub const RIVALS: [Engine; 7] = [
+    /// fall back to mlx-lm, then ollama, as they always did. Splash comes last:
+    /// it serves only the Qwen family, so it is never the headline rival.
+    pub const RIVALS: [Engine; 8] = [
         Engine::OmlxTq,
         Engine::Omlx,
         Engine::MlxLm,
@@ -43,6 +46,7 @@ impl Engine {
         Engine::Ollama,
         Engine::LlamaCpp,
         Engine::Mistralrs,
+        Engine::Splash,
     ];
 
     pub fn label(self) -> &'static str {
@@ -55,6 +59,7 @@ impl Engine {
             Engine::Ollama => "ollama",
             Engine::LlamaCpp => "llama.cpp",
             Engine::Mistralrs => "mistral.rs",
+            Engine::Splash => "Splash",
         }
     }
 
@@ -69,6 +74,7 @@ impl Engine {
             Engine::Ollama => "ollama ahead",
             Engine::LlamaCpp => "llama.cpp ahead",
             Engine::Mistralrs => "mistral.rs ahead",
+            Engine::Splash => "Splash ahead",
         }
     }
 
@@ -92,6 +98,7 @@ impl Engine {
             Engine::Ollama => "ollama",
             Engine::LlamaCpp => "llama_cpp",
             Engine::Mistralrs => "mistralrs",
+            Engine::Splash => "splash",
         }
     }
 
@@ -100,7 +107,8 @@ impl Engine {
     /// scratchy's live cells deliver 99% or more of them. mlx_lm.server has no `ignore_eos` and
     /// stops at EOS: granite-3.3-2b's 128x512 cell delivers 89% on it, 100% on scratchy. oMLX stops
     /// at EOS regardless (#479), as does ollama, at as little as 36% and 15%; vllm-metal, llama.cpp
-    /// and mistral.rs have no published cells to show either, so they are not judged.
+    /// and mistral.rs have no published cells to show either, so they are not judged. Splash takes
+    /// `ignore_eos` by its docs, but has no published cells yet, so it is not judged either.
     pub fn honours_ignore_eos(self) -> bool {
         match self {
             Engine::Scratchy => true,
@@ -110,7 +118,8 @@ impl Engine {
             | Engine::VllmMetal
             | Engine::Ollama
             | Engine::LlamaCpp
-            | Engine::Mistralrs => false,
+            | Engine::Mistralrs
+            | Engine::Splash => false,
         }
     }
 
@@ -131,6 +140,7 @@ impl Engine {
             Engine::Ollama => (&m.cache_ladder_ollama, &m.scaling_ollama),
             Engine::LlamaCpp => (&m.cache_ladder_llama_cpp, &m.scaling_llama_cpp),
             Engine::Mistralrs => (&m.cache_ladder_mistralrs, &m.scaling_mistralrs),
+            Engine::Splash => (&m.cache_ladder_splash, &m.scaling_splash),
         }
     }
 
@@ -145,19 +155,22 @@ impl Engine {
             Engine::Ollama => (&mut m.cache_ladder_ollama, &mut m.scaling_ollama),
             Engine::LlamaCpp => (&mut m.cache_ladder_llama_cpp, &mut m.scaling_llama_cpp),
             Engine::Mistralrs => (&mut m.cache_ladder_mistralrs, &mut m.scaling_mistralrs),
+            Engine::Splash => (&mut m.cache_ladder_splash, &mut m.scaling_splash),
         }
     }
 
     /// Whether it serves scratchy's own MLX checkpoint, the files [`Model::weights`] measures.
     /// ollama, llama.cpp and mistral.rs serve their own builds of the model (`served_as` names
-    /// them), so its weights say nothing about their memory.
+    /// them), so its weights say nothing about their memory. Splash loads scratchy's checkpoint,
+    /// with a draft model of its own beside it.
     pub fn serves_mlx_checkpoint(self) -> bool {
         match self {
             Engine::Scratchy
             | Engine::OmlxTq
             | Engine::Omlx
             | Engine::MlxLm
-            | Engine::VllmMetal => true,
+            | Engine::VllmMetal
+            | Engine::Splash => true,
             Engine::Ollama | Engine::LlamaCpp | Engine::Mistralrs => false,
         }
     }

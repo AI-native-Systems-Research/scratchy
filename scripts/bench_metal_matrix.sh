@@ -74,6 +74,9 @@
 #               ignore_eos, so its answers stop at EOS (§ on the page, #479)
 #   mistral.rs  `mistralrs serve`, the same Q4_K_M GGUF as llama.cpp; a Rust
 #               control: is scratchy fast because of its compiler, or Rust?
+#   Splash      `splash serve` (Inco AI), the same MLX checkpoint as scratchy;
+#               Qwen only (it serves the Qwen family and nothing else here),
+#               with the DFlash draft it ships for each model, as a user gets it
 # Every engine but mlx-lm is restarted per axis, sized for that axis (concurrent
 # requests x context), since most of them reserve KV for that up front.
 #
@@ -273,6 +276,8 @@ ENGINES=""               # --engines: unset for DEFAULT_ENGINES, all for every i
 ENGINES_GIVEN=0          # --engines was passed (even as "": scratchy alone)
 LEGACY_NO=0              # --no-mlx / --no-ollama was passed
 DEFAULT_ENGINES=""       # scratchy alone; --full: oMLX and oMLX TurboQuant
+# Splash is not a default: it adds about an hour to each Mac's full run, on the Qwen models alone.
+# --engines all runs it, as does naming it (--engines omlx,omlx_tq,splash).
 (( FULL )) && DEFAULT_ENGINES="omlx,omlx_tq"
 PINS=()
 UNPINNED=0
@@ -387,6 +392,7 @@ VLLM_BIN="$(command -v vllm || true)"
 OMLX_BIN="$(command -v omlx || true)"
 [[ -z "${OMLX_BIN}" && -x "${HOME}/.omlx/bin/omlx" ]] && OMLX_BIN="${HOME}/.omlx/bin/omlx"
 MISTRALRS_BIN="$(command -v mistralrs || true)"
+SPLASH_BIN="$(command -v splash || true)"
 
 # key|label|variable holding its binary: one row per comparison engine, in the
 # order the page shows them. key names its JSON fields (cache_ladder_<key>, ...).
@@ -398,6 +404,7 @@ ENGINE_ROWS=(
     "omlx|oMLX|OMLX_BIN"
     "omlx_tq|oMLX TurboQuant|OMLX_BIN"
     "mistralrs|mistral.rs|MISTRALRS_BIN"
+    "splash|Splash|SPLASH_BIN"
 )
 # --engines: run exactly these (by label or key), and refuse a name that is
 # unknown or not installed; all, every installed engine; scratchy, none or ""
@@ -492,6 +499,10 @@ engine_version() { # key
                              "${py[@]}" -c 'import importlib.metadata as m; print(m.version("vllm-metal"))'; } ;;
         omlx)       "${OMLX_BIN}" --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -1 ;;
         mistralrs)  "${MISTRALRS_BIN}" --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -1 ;;
+        splash)     # the Homebrew formula's version, else what the binary prints
+                    local v; v="$(brew list --versions splash 2>/dev/null | awk '{print $2}')"
+                    [[ -n "${v}" ]] && echo "${v}" \
+                        || "${SPLASH_BIN}" --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -1 ;;
     esac 2>/dev/null || true
 }
 pin_for() { # label -> its pinned version, or nothing; always succeeds (set -e). Any case.
@@ -778,6 +789,19 @@ mistralrs_cmd() { # --max-model-len is its context; --max-seq-len only sizes dev
 }
 mistralrs_ready() { echo /v1/models; }
 
+# Splash serves the Qwen family only, so other models get no column. It loads the
+# MLX checkpoint scratchy measures, with the DFlash draft it ships for that model
+# (there is no switch to turn the draft off), and batches concurrent requests by
+# itself: --queue-size is how many it admits at once, not a batch size, and its
+# default (32) is above every users count here. It plans memory as if it had the
+# whole Mac, which it does here, one server at a time.
+splash_model() { case "$1" in qwen*) echo "$2" ;; esac; }
+splash_cmd() { # --max-context is its context limit; its own default is the model's
+    local x=""; (( $3 )) && x+=" --max-context $3"
+    echo "${SPLASH_BIN} serve --model $1 --served-model-name $1 --host 127.0.0.1 --port ${PORT}${x}"
+}
+splash_ready() { echo /ready; }
+
 # The largest context any of this run's sweeps needs (0 without scaling).
 largest_ctx() {
     local m=0 a par ctx; local -a axs
@@ -1045,7 +1069,7 @@ engine_prepare() { # key label model -> prints the name requests carry; fails if
     fi
     serve_up "${log}" "$("${key}_ready")" bash -c "exec ${up}" || { prepare_failed; return 1; }
     case "${key}" in
-        mlx_lm|vllm_metal) name="${model}" ;;
+        mlx_lm|vllm_metal|splash) name="${model}" ;;   # splash: --served-model-name is the repo id
         ollama)
             show() { curl -fsS -m 10 "http://127.0.0.1:${PORT}/api/show" -d "{\"model\":\"${model}\"}"; }
             if ! show >/dev/null 2>&1; then
