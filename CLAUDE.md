@@ -107,3 +107,17 @@ See [`README.md`](README.md) (Building), [`docs/BUILD.md`](docs/BUILD.md), and
 ## Commits & PR titles
 Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for
 both, scoped to the crate or area touched (`fix(metal): ...`).
+
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues on `AI-native-Systems-Research/scratchy`; always pass `gh -R`. Specs and plans are files under `docs/superpowers/`, not issues. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default five-role vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+`CONTRIBUTING.md`, `docs/*.md`, and specs/plans under `docs/superpowers/`; root `GLOSSARY.md` + `docs/adr/` once `/domain-modeling` creates them. See `docs/agents/domain.md`.
