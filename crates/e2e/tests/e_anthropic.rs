@@ -303,11 +303,15 @@ async fn test_anthropic_missing_max_tokens() {
         .await
         .unwrap();
 
-    // Should fail with 422 (Unprocessable Entity) since max_tokens is required
-    assert!(
-        !resp.status().is_success(),
+    // A 400 in Anthropic's error shape, as Anthropic answers a request without max_tokens.
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
         "should fail without max_tokens"
     );
+    let error: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(error["type"], "error", "{error}");
+    assert_eq!(error["error"]["type"], "invalid_request_error", "{error}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -365,20 +369,6 @@ fn long_messages_body(stream: bool) -> serde_json::Value {
     })
 }
 
-/// Dense SmolLM2 on metal. `TestModels::SMOLLM` is MLX 4-bit there and will not
-/// load without a `quant/<preset>` feature; this stem matches
-/// `model/smollm2-135m`, which the metal CI job already builds.
-#[cfg(target_os = "macos")]
-async fn start_metal_smollm_dense() -> (TestServer, Client) {
-    let server = TestServer::builder("HuggingFaceTB/SmolLM2-135M-Instruct")
-        .with_device("metal")
-        .start()
-        .await
-        .expect("server should start");
-    let client = Client::new(server.base_url());
-    (server, client)
-}
-
 /// Non-streaming: the repeat must report the hit, and the input side must sum
 /// to the same prompt length on both requests.
 #[cfg(target_os = "macos")]
@@ -386,7 +376,7 @@ async fn start_metal_smollm_dense() -> (TestServer, Client) {
 #[ignore]
 async fn test_anthropic_usage_reports_cached_tokens_on_repeat() {
     scratchy_e2e::skip_if_no_gpu!();
-    let (_server, client) = start_metal_smollm_dense().await;
+    let (_server, client) = start_smollm().await;
     let body = long_messages_body(false);
 
     let read_usage = |v: &serde_json::Value| -> (u64, u64) {
@@ -448,7 +438,7 @@ async fn test_anthropic_usage_reports_cached_tokens_on_repeat() {
 #[ignore]
 async fn test_anthropic_streaming_reports_prompt_and_cached_tokens() {
     scratchy_e2e::skip_if_no_gpu!();
-    let (_server, client) = start_metal_smollm_dense().await;
+    let (_server, client) = start_smollm().await;
     let body = long_messages_body(true);
 
     let cold = client.anthropic_messages_stream(&body).await.unwrap();

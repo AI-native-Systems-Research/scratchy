@@ -476,8 +476,8 @@ async fn test_chat_missing_messages() {
     let resp = client.chat_completion_raw(&body).await.unwrap();
     assert_eq!(
         resp.status().as_u16(),
-        422,
-        "missing messages should return 422"
+        400,
+        "missing messages should return 400, as the OpenAI API answers it"
     );
 }
 
@@ -492,7 +492,7 @@ async fn test_chat_empty_messages() {
         ..default_chat_request()
     };
 
-    // Empty messages may return 422 or produce an error response.
+    // Empty messages may be refused with a 400 or produce an error response.
     // We just verify the server doesn't crash.
     let _resp = client.chat_completion(&request).await;
 }

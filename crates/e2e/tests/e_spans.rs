@@ -386,8 +386,8 @@ fn test_relocatable_recombination_reuse_matches_fresh() {
 /// SPANS_TTFT_LENS to override the lengths.
 fn run_first_ttft_bench(model: &str, default_lens: &[usize]) {
     scratchy_core_common::telemetry::init_tracing("off");
-    // SPANS_BENCH_MODEL overrides the model id — SmolLM-135M caps at a 2048-tok
-    // context (128 blocks), so measuring the asymptotic span win at 8k/16k needs
+    // SPANS_BENCH_MODEL overrides the model id — SmolLM2-135M's context is 8192
+    // tokens, so measuring the asymptotic span win at 8k/16k needs
     // a large-context model (e.g. Llama-3.2-1B = 128k, `llama-3.2-1b`,
     // on by default).
     let model_override = std::env::var("SPANS_BENCH_MODEL").ok();

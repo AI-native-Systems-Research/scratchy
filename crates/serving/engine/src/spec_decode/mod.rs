@@ -23,11 +23,12 @@ pub mod proposer;
 pub mod verify;
 
 pub use backend::{
-    BackendError, ForwardArgmaxRequest, ForwardHandle, KvPoolHandle, ModelHandle, SpecDecodeBackend,
+    BackendError, EmptySequence, ForwardArgmaxRequest, ForwardHandle, KvPoolHandle, ModelHandle,
+    SampledRows, SpecDecodeBackend,
 };
 pub use mtp::{
-    Chain, DraftBudget, Drafting, HeadPasses, MtpDrafter, MtpProposer, MtpProposerConfig, PassOne,
-    StepRows,
+    Chain, DraftBudget, DraftVocab, Drafting, HeadPasses, MtpDrafter, MtpProposer,
+    MtpProposerConfig, PassOne, StepRows,
 };
 pub use ngram::{NgramProposer, NgramProposerConfig};
 pub use proposer::{DraftModelProposer, DraftSeedInputs, Proposer, ProposerStepCtx};

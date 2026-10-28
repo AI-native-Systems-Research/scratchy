@@ -2284,6 +2284,413 @@ impl StickLayout {
     }
 }
 
+/// ⭐⭐⭐⭐⭐ A REGION'S DEVICE FRAME, AS A TYPE — the stick-blocked residency a `(rows, cols)`
+/// region names, and the LAW a re-presentation of that region must satisfy to keep addressing
+/// the same bytes.
+///
+/// A region's device storage is the stick-blocked `[cols/lanes, rows, lanes]` tiling: logical
+/// `(r, c)` sits at `(c/lanes)·(rows·lanes) + r·lanes + (c%lanes)` (the [`dev_off_stk`] law every
+/// `RowBlocked`/`Kernel` tensor addresses by). That formula is a function of THREE facts —
+/// `rows`, the stick-column count `ceil(cols/lanes)`, and `lanes` — so two frames place every
+/// element at the same byte **iff they agree on all three**. This type makes the re-presentation
+/// itself carry that law: [`reframe`](RegionFrame::reframe) is the re-row door (same rows, same
+/// stick-column count — pad-up and pad-down *inside one stick*), and
+/// [`split_rows`](RegionFrame::split_rows) is the row-split door (the `[y, mb, out]` frame a
+/// leading-axis broadcast reads). Everything else is a named refusal.
+///
+/// This is the door the mb re-row defect class needed. A `[256, 4]` region re-presented as
+/// `[4, 256]` "looks" like a mere reshape — same element count — but the frames disagree on both
+/// rows (256 vs 4) and stick columns (1 vs 4), so `(j, x)` at `(x/64)·256 + j·64 + x%64` is a
+/// DIFFERENT byte than the `(b, g)` the buffer holds at `b·64 + g`. That re-row was writable as
+/// a bare field assignment; through this type it is an `Err` at `cargo build` — a wrong-byte
+/// clean bake is exactly what cannot ship, so the frame check is a type, not a review.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RegionFrame {
+    pub rows: usize,
+    pub cols: usize,
+    pub df: Df,
+}
+
+/// The row-split presentation of a [`RegionFrame`] — the `[y, mb, out]` frame the leading-axis
+/// (row-split) broadcast mode addresses a region in. Minted only by
+/// [`RegionFrame::split_rows`], so its facts are the ones the law proved.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RowSplitFrame {
+    /// The spray count — the op's leading `y` iteration dim.
+    pub y: usize,
+    /// The rows each spray addresses — the op's `mb` dim. `y · mb == rows` by construction.
+    pub mb: usize,
+    /// The `out` dim: ONE FULL STICK (the frame law requires the region to be single-stick, so
+    /// the out dim *is* the stick; `real_cols` pads up to it, garbage lanes inert).
+    pub out: usize,
+    /// The region's REAL column extent — the elements that exist (`out - real_cols` are the
+    /// stick's pad lanes, addressed but never written by the producer).
+    pub real_cols: usize,
+    pub df: Df,
+}
+
+impl RegionFrame {
+    /// The stick-blocked frame of a `(rows, cols)` region at `df` — the residency every
+    /// `RowBlocked`/`Kernel` mint addresses by (see the type's own doc for the byte formula).
+    pub fn stick_blocked(rows: usize, cols: usize, df: Df) -> Self {
+        RegionFrame {
+            rows: rows.max(1),
+            cols: cols.max(1),
+            df,
+        }
+    }
+
+    /// Stick width in elements — derived from [`df`](Self::df), the same single source
+    /// [`StickLayout::lanes`] reads.
+    pub fn lanes(&self) -> usize {
+        self.df.elems_per_stick() as usize
+    }
+
+    /// The number of stick COLUMNS the frame spans — `ceil(cols / lanes)`. With `rows`, one of
+    /// the two facts (besides `lanes`) a frame's byte addresses are a function of.
+    pub fn stick_columns(&self) -> usize {
+        self.cols.div_ceil(self.lanes())
+    }
+
+    /// ⭐ THE RE-ROW LAW — re-present this frame as `(rows', cols')`, admitting it only when
+    /// every element addresses the SAME byte it did:
+    ///
+    /// - `rows' == rows`: the stride between stick columns is `rows·lanes`; a different row
+    ///   count moves every element past the first stick column (the mb re-row
+    ///   `[256, 4] → [4, 256]` fails here — and everywhere else, see below).
+    /// - `ceil(cols'/lanes) == ceil(cols/lanes)`: the same stick columns. A presentation that
+    ///   pads `cols` up within the region's last stick (the `[256, 4]` op at `out = 64`) or
+    ///   narrows it within that stick keeps every addressed byte; one that crosses a stick
+    ///   boundary changes the footprint the mint reserved.
+    ///
+    /// The mb re-row fails BOTH clauses; the head-major permutation `[64, 256] → [256, 64]`
+    /// fails both too (and moves elements even when the extents happen to match); the pad-up
+    /// inside one stick passes. `Err` names the clause and the byte arithmetic, so a re-row
+    /// that is not byte-faithful is a `cargo build` failure, not a review comment.
+    pub fn reframe(&self, rows: usize, cols: usize) -> Result<Self, String> {
+        let to = RegionFrame::stick_blocked(rows, cols, self.df);
+        if to.rows != self.rows {
+            return Err(format!(
+                "the region's device frame is [{}, {}] ({} stick column(s) at {} lanes): a \
+                 stick-blocked region addresses (r, c) at (c/{})*({}*{}) + r*{} + c%{}, so the \
+                 row count sets the stride BETWEEN stick columns. Re-rowing to [{}, {}] changes \
+                 the rows {} -> {}, which moves every element past the first stick column to a \
+                 different byte — the same element count is NOT the same bytes. A re-row is \
+                 byte-faithful only at an unchanged row count (pad the COLUMNS within one stick \
+                 instead)",
+                self.rows,
+                self.cols,
+                self.stick_columns(),
+                self.lanes(),
+                self.lanes(),
+                self.rows,
+                self.lanes(),
+                self.lanes(),
+                self.lanes(),
+                to.rows,
+                to.cols,
+                self.rows,
+                to.rows,
+            ));
+        }
+        if to.stick_columns() != self.stick_columns() {
+            return Err(format!(
+                "the region's device frame is [{}, {}] = {} stick column(s) at {} lanes, and the \
+                 re-row to [{}, {}] spans {} — the stick-blocking pads rows to {} lanes, so a \
+                 re-row that crosses a stick boundary changes both the bytes (column c lands at \
+                 (c/{})*({}*{}) + ...) and the footprint the region's mint reserved. A re-row is \
+                 byte-faithful only at an unchanged stick-column count (pad within the last \
+                 stick)",
+                self.rows,
+                self.cols,
+                self.stick_columns(),
+                self.lanes(),
+                to.rows,
+                to.cols,
+                to.stick_columns(),
+                self.lanes(),
+                self.lanes(),
+                self.rows,
+                self.lanes(),
+            ));
+        }
+        Ok(to)
+    }
+
+    /// ⭐ THE FLAT-COL PRESENTATION `[numel, 1]` — the frame the flat `Col` broadcast mode
+    /// addresses a source in (one element per row, at `f·lanes`). This IS a re-row
+    /// (`reframe(numel, 1)`): it is byte-faithful exactly when `cols == 1` (then `numel ==
+    /// rows` and the presentation is the identity), and the re-row law refuses every multi-col
+    /// source by name — a `[256, 4]` source presented as `[1024, 1]` would read element
+    /// `f = r·4 + c` at stick `f` (`f·64`) while the buffer holds it at `r·64 + c`, wrong for
+    /// every row past the first. `cols == 1` sources (the rank-1 reduce output minted
+    /// `[rows, 1]`) pass byte-identically.
+    pub fn flat_col(&self) -> Result<Self, String> {
+        self.reframe(self.rows * self.cols, 1)
+    }
+
+    /// ⭐ THE FLAT-MB PRESENTATION `[1, numel]` — the frame the flat `Mb` mode addresses a
+    /// source in (one flat row, read CONTIGUOUSLY: `[1, numel]` stick-blocked places flat
+    /// element `f` at `f`). NOT a re-row (it re-orders the frame into one row); its own law is
+    /// CONTIGUITY: the source's bytes must be one flat run in row-major `(r, c)` order, which a
+    /// stick-blocked frame gives exactly when it is flat-addressed — one row (`rows <= 1`) or
+    /// one stick column (`cols <= lanes`). A multi-stick multi-row frame is refused by name:
+    /// reading it as one flat row takes the stick-blocked bytes in the wrong order.
+    pub fn flat_mb(&self) -> Result<Self, String> {
+        if self.rows > 1 && self.cols > self.lanes() {
+            return Err(format!(
+                "the region's device frame is [{}, {}] — {} rows × {} stick column(s), which is \
+                 NOT one contiguous run: stick-blocking addresses (r, c) at (c/{})*({}*{}) + \
+                 r*{} + c%{}, so reading the frame as one flat row [1, {}] takes those bytes in \
+                 the WRONG ORDER (row r's second stick column sits a whole row-block away from \
+                 its first). The flat row presentation is byte-faithful only for a contiguous \
+                 frame — one row, or one stick column",
+                self.rows,
+                self.cols,
+                self.rows,
+                self.stick_columns(),
+                self.lanes(),
+                self.rows,
+                self.lanes(),
+                self.lanes(),
+                self.lanes(),
+                self.rows * self.cols,
+            ));
+        }
+        Ok(RegionFrame::stick_blocked(
+            1,
+            self.rows * self.cols,
+            self.df,
+        ))
+    }
+
+    /// ⭐⭐⭐ THE ROW-SPLIT LAW — the `[y, mb, out]` frame a leading-axis broadcast reads this
+    /// region in: the source's rows split into `y` sprays of `mb` rows each, the `out` dim IS
+    /// the one stick (`cols <= lanes` — the split's rows must share a single stick column, or
+    /// the sprayed rows would straddle stick boundaries at different strides than the source's
+    /// own rows do). Byte-faithful exactly when `rows == y·mb` (the split covers the rows,
+    /// exactly) and `cols <= lanes` (single stick column): then flat element `(j, b)` of the
+    /// split frame addresses `j·(mb·out) + b·out + c` — and at `out = lanes` that IS the
+    /// source's `(j·mb + b)·lanes + c`, the stick-blocked byte of row `j·mb + b`, column `c`.
+    ///
+    /// The batched paged-decode kernel's J-slot merge is exactly this shape: the merged running
+    /// max `[64, 4]` (the J-reduce's output) sprayed down a leading axis to `[4, 64, 4]`, read
+    /// by its consumer as the op `[mb = 64, out = 64, y = 4]` with the source at
+    /// `[mb, out, y = 1]` (scale `y = -1`, the vendor's own reduced-dim law).
+    pub fn split_rows(&self, y: usize, mb: usize) -> Result<RowSplitFrame, String> {
+        if y < 2 {
+            return Err(format!(
+                "a row split of {y} is not a split — a spray count of one leaves the frame \
+                 exactly as it was, and a leading dim of one is a reshape, not a broadcast"
+            ));
+        }
+        if y * mb != self.rows {
+            return Err(format!(
+                "the region's device frame is [{}, {}], which does not split into {y} sprays of \
+                 {mb} rows ({} != {}): the row split [y, mb, out] covers the source exactly when \
+                 rows == y*mb, and a partial cover either reads rows the source does not have or \
+                 leaves rows the op never addresses",
+                self.rows,
+                self.cols,
+                self.rows,
+                y * mb,
+            ));
+        }
+        if self.cols > self.lanes() {
+            return Err(format!(
+                "the region's device frame is [{}, {}] = {} stick column(s), but the row split \
+                 [y, mb, out] requires a SINGLE stick column (cols <= {}): the split's out dim IS \
+                 the stick — at out = lanes the split's flat (j, b) addresses j*(mb*{}) + b*{} \
+                 which is the source's own stick-blocked byte (j*mb + b)*{}, and a wider out dim \
+                 strides past the row-block the source's rows actually occupy",
+                self.rows,
+                self.cols,
+                self.stick_columns(),
+                self.lanes(),
+                self.lanes(),
+                self.lanes(),
+                self.lanes(),
+            ));
+        }
+        Ok(RowSplitFrame {
+            y,
+            mb,
+            out: self.lanes(),
+            real_cols: self.cols,
+            df: self.df,
+        })
+    }
+}
+
+/// The [`RegionFrame`] law's own pins — every clause of [`RegionFrame::reframe`],
+/// [`RegionFrame::flat_col`], [`RegionFrame::flat_mb`] and [`RegionFrame::split_rows`], stated
+/// on the exact shapes the batched paged-decode kernel's broadcast chains spell.
+#[cfg(test)]
+mod region_frame_tests {
+    use super::*;
+
+    fn frame(rows: usize, cols: usize) -> RegionFrame {
+        RegionFrame::stick_blocked(rows, cols, Df::Fp16)
+    }
+
+    /// ⛔ THE MB RE-ROW — `[256, 4] -> [4, 256]`, the exact spelling that was one writable field
+    /// assignment away from shipping wrong bytes: same element count, but the frames disagree on
+    /// BOTH rows (256 vs 4) and stick columns (1 vs 4), so every element past the origin moves.
+    /// This is the case the type exists to refuse at `cargo build`.
+    #[test]
+    fn the_mb_re_row_is_refused_by_name() {
+        let m = frame(256, 4)
+            .reframe(4, 256)
+            .expect_err("the mb re-row moves bytes");
+        assert!(
+            m.contains("stride BETWEEN stick columns"),
+            "names the clause that fires — the row count is the inter-stick stride: {m}"
+        );
+        assert!(
+            m.contains("[256, 4]") && m.contains("[4, 256]"),
+            "states both frames: {m}"
+        );
+    }
+
+    /// ⭐ THE PAD-UP INSIDE ONE STICK IS THE IDENTITY — `[256, 4]` at `out = 64`: same rows,
+    /// same single stick column, so every addressed byte is unchanged and the garbage lanes
+    /// (4..64) are inert. This is the presentation the row-split mode's op width is.
+    #[test]
+    fn pad_up_within_one_stick_is_admitted() {
+        assert_eq!(
+            frame(256, 4).reframe(256, 64),
+            Ok(frame(256, 64)),
+            "padding the columns within the region's one stick moves nothing"
+        );
+        assert_eq!(
+            frame(64, 4).reframe(64, 64),
+            Ok(frame(64, 64)),
+            "same law at the J-reduce output's own shape"
+        );
+    }
+
+    /// ⛔ THE HEAD-MAJOR PERMUTATION — `[64, 256] -> [256, 64]`: four stick columns become one,
+    /// four rows become 256. Refused (both clauses), which is what keeps a permute from being
+    /// spelled as a reframe.
+    #[test]
+    fn the_head_major_permutation_is_refused() {
+        assert!(
+            frame(64, 256).reframe(256, 64).is_err(),
+            "a permutation is not a re-row: rows AND stick columns both change"
+        );
+    }
+
+    /// ⛔ A RE-ROW THAT CROSSES A STICK BOUNDARY AT UNCHANGED ROWS — `[256, 70] -> [256, 64]`:
+    /// the rows agree but 2 stick columns become 1, so the footprint and the bytes both change.
+    #[test]
+    fn a_stick_column_count_change_is_refused_at_unchanged_rows() {
+        let m = frame(256, 70)
+            .reframe(256, 64)
+            .expect_err("dropping a whole stick column is not a pad-down");
+        assert!(
+            m.contains("stick column"),
+            "names the stick-column clause: {m}"
+        );
+    }
+
+    /// ⭐ THE FLAT-COL PRESENTATION OVER A COLUMN VECTOR IS THE IDENTITY — the rank-1 reduce
+    /// output minted `[rows, 1]`, presented `[numel, 1]`: `numel == rows`, byte-identical.
+    #[test]
+    fn flat_col_over_a_column_vector_is_the_identity() {
+        assert_eq!(
+            frame(1024, 1).flat_col(),
+            Ok(frame(1024, 1)),
+            "a [rows, 1] source IS the [numel, 1] column vector of the flat frame"
+        );
+    }
+
+    /// ⛔ THE FLAT-COL PRESENTATION OVER A MULTI-COL SOURCE IS BYTE-WRONG — `[256, 4]` presented
+    /// `[1024, 1]` reads element `f = r*4 + c` at stick `f` (`f*64`) while the buffer holds it at
+    /// `r*64 + c`: wrong for every row past the first. The latent wall-4 defect class, now a
+    /// named refusal.
+    #[test]
+    fn flat_col_over_a_multi_col_source_is_refused() {
+        let m = frame(256, 4).flat_col().expect_err("the bytes move");
+        assert!(
+            m.contains("row count sets the stride"),
+            "it is the re-row law that fires, naming the arithmetic: {m}"
+        );
+    }
+
+    /// ⭐ THE FLAT-MB PRESENTATION — contiguous frames read as one flat row: a single-stick
+    /// `[256, 4]` (bytes `r*64 + c`, one run) and a one-row `[1, 2048]` (the row collapse) both
+    /// pass; a `[2, 128]` (two stick columns) is refused.
+    #[test]
+    fn flat_mb_admits_contiguous_frames_only() {
+        assert_eq!(
+            frame(256, 4).flat_mb(),
+            Ok(frame(1, 1024)),
+            "a single-stick frame's bytes are one contiguous run"
+        );
+        assert_eq!(
+            frame(1, 2048).flat_mb(),
+            Ok(frame(1, 2048)),
+            "one row is contiguous however many sticks it spans"
+        );
+        let m = frame(2, 128).flat_mb().expect_err("the bytes reorder");
+        assert!(m.contains("WRONG ORDER"), "names the data movement: {m}");
+    }
+
+    /// ⭐⭐⭐ THE ROW SPLIT — the J-slot merge's own shape: `[256, 4]` split `[y=4, mb=64]` with
+    /// `out` the one 64-lane stick and `real_cols = 4`. The op frame `[mb, out, y]` this mints
+    /// is what the leading-axis broadcast's consumer addresses.
+    #[test]
+    fn the_j_slot_merge_row_split_is_admitted() {
+        assert_eq!(
+            frame(256, 4).split_rows(4, 64),
+            Ok(RowSplitFrame {
+                y: 4,
+                mb: 64,
+                out: 64,
+                real_cols: 4,
+                df: Df::Fp16,
+            })
+        );
+    }
+
+    /// ⛔ THE ROW SPLIT'S COVER LAW — `y*mb` must equal the rows exactly: a partial cover either
+    /// reads rows the source does not have or leaves rows unaddressed.
+    #[test]
+    fn a_row_split_that_does_not_cover_the_rows_is_refused() {
+        let m = frame(256, 4)
+            .split_rows(4, 60)
+            .expect_err("240 of 256 rows is not a cover");
+        assert!(m.contains("rows == y*mb"), "states the cover law: {m}");
+    }
+
+    /// ⛔ THE ROW SPLIT'S SINGLE-STICK LAW — `[64, 256]` (four stick columns) cannot split: the
+    /// split's out dim IS the stick, and a wider one strides past the row-block the source's
+    /// rows occupy.
+    #[test]
+    fn a_row_split_of_a_multi_stick_frame_is_refused() {
+        let m = frame(64, 256)
+            .split_rows(4, 16)
+            .expect_err("the out dim cannot be four sticks");
+        assert!(
+            m.contains("SINGLE stick column"),
+            "states the single-stick law: {m}"
+        );
+    }
+
+    /// ⛔ A SPRAY OF ONE — `y = 1` is a reshape, not a broadcast; the split refuses it so the
+    /// mode's leading dim is always a real spray.
+    #[test]
+    fn a_row_split_of_one_is_refused() {
+        let m = frame(256, 4)
+            .split_rows(1, 256)
+            .expect_err("a spray of one is no broadcast");
+        assert!(
+            m.contains("not a split"),
+            "names what a count of one is: {m}"
+        );
+    }
+}
+
 /// THE single host-staging path — the worker↔emitter layout-mismatch firewall. Stage a logical
 /// `[layout.rows, layout.cols]` tensor into its DEVICE byte order by placing `get(r, c)` at exactly
 /// `layout.dev_off(r, c)` — the SAME `dev_off` the emitter's descriptor reads through. A worker that
@@ -2884,10 +3291,12 @@ impl SlotCount {
 /// of the resident cache one fold pass's score/reduce group reads.
 ///
 /// The window holds [`Self::SLOTS`] slots — one POOL stick of them — NOT because a stick has 64 lanes
-/// but because reduce-MAX mis-combines partial maxima past one stick of COLUMNS (the documented
-/// hardware defect), so the sweep is blocked at exactly one stick of score columns, and a resident
-/// slot is one score column. Same value as [`Lanes::FP16`], different law: the lane count is the
-/// machine's, this is the reduce's.
+/// but because the fold sweep is BLOCKED at exactly one stick of score columns (the attention
+/// emitter's card-proven form, matching torch-spyre's own kv-block tiling of the online-softmax
+/// recurrence), and a resident slot is one score column. Same value as [`Lanes::FP16`], different
+/// law: the lane count is the machine's, this is the sweep's blocking. (The blocking used to be
+/// justified as a hardware reduce-MAX limit past one stick of columns — an attribution the
+/// template's own DDL refutes; see [`crate::emit::lower_ktir_to_superdsc::reduce`]'s law doc.)
 ///
 /// The index is two coordinates at once, aligned by construction: the KV window's first slot
 /// ([`Self::first_slot`]) and the prefix-mask SLAB whose columns are those slots
@@ -4723,36 +5132,6 @@ impl SeqPos {
     pub const fn get(self) -> u32 {
         self.0
     }
-}
-
-/// ⭐⭐⭐ THE SUB-PAGE INDEX BANK — the `[E, S]` const table the fine expert gather's index is
-/// minted from (see [`crate::reserved_tids::expert_subpage_bank_tid`]): stick `e` holds the `S`
-/// values `e·S + s`, `s < S`, one u32 each. A gather OF this bank by the router's raw expert-id
-/// index copies whole sticks, so the result's flat lane `j` is `e_{j/S}·S + j%S` — the fine
-/// entry that names (expert, sub-page), the composition the sub-paged weight gather addresses
-/// its cut pages by.
-///
-/// ⭐ A LAYOUT LAW SHARED BY THE EMITTER AND THE WORKER, like
-/// [`decode_batch_prefix_mask_f16`]: the placement pass mints the `[E, S]` footprint from the
-/// door's own `e_count`, and the worker's forward tape stages these bytes through the raw-i32
-/// bind — both sides must derive the same words from the same `e_count` or the fine gather
-/// addresses sub-pages that are not the router's experts'. Lives here (not the worker) because
-/// it is the door's own composition, stated once where both readers can see it.
-///
-/// `S` is [`CopyDims::ENTRIES_PER_OP`] — one u32 index stick — because the gather that copies
-/// this bank moves whole sticks (a sub-stick `out` extent would leave holes in the fine index's
-/// flat lane sequence). The values reach `E·S − 1` = 4095 at E=128, past fp16's exact-integer
-/// range of 2048, so the table is u32 and the bytes are the raw-i32 bind's own LITTLE-ENDIAN
-/// wire form.
-pub fn expert_subpage_index_bank(e_count: u32) -> Vec<u8> {
-    let sub = CopyDims::ENTRIES_PER_OP;
-    let mut out = Vec::with_capacity(e_count as usize * sub as usize * 4);
-    for e in 0..e_count {
-        for s in 0..sub {
-            out.extend_from_slice((e * sub + s).to_le_bytes().as_slice());
-        }
-    }
-    out
 }
 
 /// THE DECODE-BATCH PREFIX MASK, staged in the device's own f16 — the whole `ATTN_MASK_TID` buffer for
@@ -7131,6 +7510,12 @@ impl PageScratch {
                     // (32 words) while the destination advances only the `cut` entries the op covers.
                     // Deriving the destination from the index base puts op `r`'s rows `per_row`× off.
                     dest_entry: r * per_row + first,
+                    // The destination's own law — this scratch's `[rows, cols]`, the pair its synth
+                    // declared, so the run's window is bounded where it lands.
+                    dest: GatherDest::Scratch {
+                        rows: self.rows(),
+                        cols: self.cols() as u32,
+                    },
                     dims: CopyDims {
                         // THIS OP's RUN of the request's plane, in one-stick sub-rows — a whole cut, or
                         // the short tail. In ENTRIES first and then multiplied into sub-rows, so
@@ -7455,6 +7840,12 @@ impl ChunkScratch {
         (0..self.index_sticks()).map(move |j| GatherCopy {
             stick: j,
             dest_entry: j * stick,
+            // The destination's own law — the whole-chunk scratch's `[nkvh, head_chunk_elems]`,
+            // the pair its synth declared.
+            dest: GatherDest::Scratch {
+                rows: self.nkvh(),
+                cols: self.head_chunk_elems() as u32,
+            },
             dims: CopyDims {
                 mb: stick * page,
                 out: POOL_STICK,
@@ -7685,10 +8076,19 @@ impl ChunkKeysLx {
     /// The Kᵗ copies, one per (part, kv head), each with the core-local tensor it writes. Kᵗ's run starts
     /// at stick 0 and every stick of it is a whole part, so stick `j` writes tensor `j`.
     pub fn copies(self) -> impl Iterator<Item = (u32, GatherCopy)> {
-        self.lx
-            .chunk
-            .copies()
-            .map(|c| (c.stick, GatherCopy { dest_entry: 0, ..c }))
+        self.lx.chunk.copies().map(|c| {
+            (
+                c.stick,
+                GatherCopy {
+                    dest_entry: 0,
+                    // THE CORE-LOCAL WINDOW KIND — each copy lands in its own core-local tensor
+                    // (`ChunkKeysLx::tensor`), one entry per core at the pin, so the HBM scratch the
+                    // underlying copy carries is not this destination's law.
+                    dest: GatherDest::CoreLocalLx,
+                    ..c
+                },
+            )
+        })
     }
 }
 
@@ -7900,16 +8300,27 @@ impl ChunkLx {
         self.chunk.copies().map(move |c| {
             let j = c.stick;
             let dest = if j < lx { LxDest::Lx(j) } else { LxDest::Tail };
-            let dest_entry = if j < lx {
-                0
+            // The destination's law follows WHERE the copy lands, per branch: a whole part's copy
+            // writes its own core-local tensor (one entry per core at the pin — the CORE-LOCAL
+            // window kind), and a tail copy writes V's tail HBM scratch at its flat destination
+            // entry, whose bound is the tail's own `[nkvh, tail block]` footprint.
+            let (dest_entry, gdest) = if j < lx {
+                (0, GatherDest::CoreLocalLx)
             } else {
-                (j - lx) * CopyDims::ENTRIES_PER_OP
+                (
+                    (j - lx) * CopyDims::ENTRIES_PER_OP,
+                    GatherDest::Scratch {
+                        rows: self.tail_footprint_dims()[0],
+                        cols: self.tail_footprint_dims()[1],
+                    },
+                )
             };
             (
                 dest,
                 GatherCopy {
                     stick: j + base,
                     dest_entry,
+                    dest: gdest,
                     ..c
                 },
             )
@@ -8796,6 +9207,12 @@ impl GatherScratch {
                 // index's first entry are the same number. Stated rather than derived, so the page-granular
                 // form's divergence from it is visible at both sites.
                 dest_entry: first_entry,
+                // The destination's own law — this scratch's `[rows, cols]`, the pair its synth
+                // declared.
+                dest: GatherDest::Scratch {
+                    rows,
+                    cols: self.cols(),
+                },
                 dims: CopyDims {
                     // The run this op covers — a whole stick, or the short tail. In ENTRIES first,
                     // then multiplied into `mb` SUB-ROWS, so `page | mb` still holds by construction.
@@ -8978,6 +9395,97 @@ impl CopyDims {
     }
 }
 
+/// ⭐⭐⭐⭐⭐ WHERE A GATHERED COPY'S DESTINATION ENDS — the destination's own law, carried by the
+/// copy that writes it, because the copy is minted from the scratch it lands in.
+///
+/// 🛑 **THE DESTINATION'S BOUND WAS NOWHERE.** `gather_copy_opspec` derives the base
+/// (`entry_elems * dest_entry`) and hands it to the op, and nothing compared that base plus the
+/// run's extent against the scratch the copy writes — the #717 class exactly: a base whose run
+/// crosses the scratch's end bakes clean and overruns into the next intermediate's bytes, read
+/// back as keys or page numbers with no fault anywhere. The bound is the destination scratch's
+/// own extent, and the scratch is what `copies()` is minted from — so the COPY carries it, and
+/// the builder refuses a run whose window crosses it (`gather_copy_opspec`'s destination bound,
+/// plus the placement door at `assemble_gather_copy`).
+///
+/// ⭐ THE CORE-LOCAL LX FORMS ARE THEIR OWN KIND, NOT AN EXEMPTION. A copy landing in a core-local
+/// LX tensor writes EACH CORE'S SLICE at the pin: the whole-operand extent is not that
+/// destination's bound, the per-core slice is, and `emit`'s core-local read law already holds the
+/// op to the pin and to the division its consumers read. Carried as a variant so the door knows
+/// WHICH law applies — the core-local form is stated at the mint as itself, never exempted from
+/// it by silence or by an early return.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GatherDest {
+    /// The HBM scratch's own `[rows, cols]` — the pair its synth declared (the minting scratch's
+    /// `footprint_dims`). The copy's destination window is `mb × out` elements at
+    /// `entry_elems · dest_entry`, and the bound is that window inside `rows × cols` — the last
+    /// stick of a pass ends exactly at the scratch's end, so a caller that shrinks either side
+    /// without re-deriving the other is a build failure.
+    Scratch { rows: u32, cols: u32 },
+    /// A CORE-LOCAL LX tensor (`BundleLayout::synth_lx_core_local`): each core writes its slice
+    /// at the pin, so the run has no addressable offset (the destination entry must be 0) and
+    /// the per-core slice is the read law's bound, checked against the pin at emit.
+    CoreLocalLx,
+}
+
+/// ⭐⭐⭐⭐⭐ A HAND-BUILT COPY'S WHOLE DECLARED LAW AS ONE VALUE — the extents, the format, the run
+/// and the destination's bound, because they are one copy seen four ways and a builder that takes
+/// them as loose arguments can be handed three facts about one run and a fourth about another
+/// (the same "one value, not N reaches" law [`CopyDims`] states for the minted cut).
+/// [`GatherCopy`] is the MINTED form — its only constructors are the `copies()` iterators, from a
+/// scratch that owns every number; this is the spec a caller states when no scratch mints it for
+/// them: the descriptor test rigs, and the MoE expert-slab copy that states its own fp8 format
+/// at the raw door.
+///
+/// ⛔ `rows` IS SUB-ROWS OF **ONE STICK**, AND `cols` MUST BE ONE STICK. A `[mb, out]` operand
+/// sticked on a MULTI-stick `out` is `RowBlocked` (stick-major), whose address law
+/// `(c/64)*(rows*64) + r*64 + c%64` scatters each gathered block across the whole buffer — off by
+/// `rows` from the contiguous `[hd, 64]` block the score kernel then reads, from a clean bake. At
+/// one stick of `out` the same law collapses to `r*64 + c`, i.e. ROW-MAJOR, and a pool block is
+/// `hd` consecutive sub-rows. `GatherScratch::sub_rows`/`entry_page` carry that split, and the
+/// gather's `page` is what keeps ONE ENTRY equal to one whole block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GatherCopySpec {
+    /// The run's `mb`.
+    pub rows: u32,
+    /// The run's `out` — EXACTLY one stick of [`Self::df`] (the one-stick law above).
+    pub cols: u32,
+    /// ⭐⭐⭐ THE VALUE OPERANDS' FORMAT — fp16 for every gathered fold to date, fp8 for the MoE
+    /// expert slabs. The vendor's `identity` bind carries NO DDL type constraint
+    /// (unary_parallel.ddl:17 "identity and shuffle only move data, so their input and output
+    /// are free to arrange it differently"), so the copy's df is a property of the BANK it
+    /// copies, not of the op — and the ONE-STICK law transfers per-format: an fp8 copy's `cols`
+    /// is one 128-elem fp8 stick, and the RowBlocked-scatter refusal the fp16 law states is the
+    /// same law at its own width.
+    pub df: crate::superdsc_opspec::Df,
+    /// ⭐⭐⭐⭐⭐ WHERE THIS RUN'S COPY STARTS, AT EACH END — see `superdsc_opspec::GatherRun`. The
+    /// destination entry is separate from the index's `first_entry`, and it has to be. See
+    /// [`GatherCopy::dest_entry`]: the two were one number while a run's entries and its
+    /// destination rows advanced together (the window-granular cut, where one index stick IS 32
+    /// scratch rows), and a page-granular op breaks that — it names ONE entry but must sit at a
+    /// stick boundary, so entries advance 32 per op while rows advance 1. Both are minted from
+    /// the same request index by `copies()`, so they cannot drift; they simply are not equal any
+    /// more. The source base is the SECOND paged-axis half of `addr = idx·skip_addr + base_addr`,
+    /// for a source whose entries are RELATIVE to a base inside its own buffer. ZERO for every
+    /// gathered KV copy (the pool's entries are GLOBAL stick-block numbers, and a per-run base
+    /// would be added twice — see [`GatherCopy`]'s "source base stays ZERO" law). The expert
+    /// bank is the other shape: its entries are EXPERT IDS relative to the bank's base, and the
+    /// bank's packed device layout makes one expert's slab ONE CONTIGUOUS range, so a chunk of
+    /// that slab is the range `[src_off, src_off + mb·page·cols)` and the index term
+    /// `idx·skip_addr` still supplies the WHOLE-slab stride. Both base and index are added by
+    /// `ConvertData_gather_idx` — card-proven at the score leg ("the index supplies only the
+    /// PAGE term", `emit/mod.rs`'s isStartAddrSymbolic note) — so a nonzero base here survives
+    /// the gather and a zero one changes nothing on every existing caller.
+    pub run: crate::superdsc_opspec::GatherRun,
+    /// ⭐⭐⭐⭐⭐ WHERE THIS COPY'S DESTINATION ENDS — see [`GatherDest`]. Carried with the run
+    /// (minted by the same `copies()` that mints it, from the scratch the run lands in), because
+    /// the destination's bound is a fact about the SCRATCH, not about the op: a base whose run
+    /// crosses the scratch's end is the #717 class — a clean bake whose overrun is the next
+    /// intermediate's bytes, read back as keys or page numbers. The core-local LX forms state
+    /// their own window kind (each core's slice at the pin, no offset), never an exemption from
+    /// the mint.
+    pub dest: GatherDest,
+}
+
 /// ⭐⭐⭐⭐⭐ ONE GATHER COPY OP — the run of scratch rows it serves, its declared extents, and the two
 /// BASES that place that run. One value, because the three are the same cut seen three ways and an op
 /// built from two of them and a stale third writes one run's blocks into another run's rows.
@@ -9019,6 +9527,10 @@ pub struct GatherCopy {
     /// Both are minted from the SAME request index inside `copies()`, so they cannot drift; what they
     /// cannot be any more is the same number.
     dest_entry: u32,
+    /// ⭐ WHERE THIS COPY'S DESTINATION ENDS — see [`GatherDest`]. Minted by the same `copies()` that
+    /// mints the run, from the scratch the run lands in, so the bound and the base cannot come from
+    /// two different scratches.
+    dest: GatherDest,
 }
 
 impl GatherCopy {
@@ -9036,6 +9548,12 @@ impl GatherCopy {
     /// [`Self::index_base`].
     pub const fn dest_entry(self) -> u32 {
         self.dest_entry
+    }
+
+    /// Where this copy's destination ENDS — the law [`GatherDest`] states, minted from the scratch
+    /// the copy lands in.
+    pub const fn dest(self) -> GatherDest {
+        self.dest
     }
 
     /// ⭐ THE INDEX OPERAND'S BASE, AS A WHOLE NUMBER OF INDEX STICKS. Spelled as a stick count and not

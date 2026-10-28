@@ -49,8 +49,9 @@ macro_rules! skip_if_no_gpu {
 ///
 /// # Backend-portable constants
 ///
-/// Constants like `SMOLLM` resolve to the right model for the active backend
-/// (MLX 4-bit on `metal`).
+/// Constants like `QWEN2` resolve to the right model for the active backend
+/// (MLX 4-bit on `metal`). `SMOLLM` is the dense checkpoint the `smollm2-135m`
+/// stem, which every e2e CI job builds, compiles.
 ///
 /// Backend-specific constants (`*_4BIT`, etc.) are still available for tests
 /// that target a single backend.
@@ -61,8 +62,7 @@ impl TestModels {
     // Backend-portable models — use these in cross-platform tests
     // -----------------------------------------------------------------------
 
-    #[cfg(feature = "metal")]
-    pub const SMOLLM: &str = "mlx-community/SmolLM-135M-Instruct-4bit";
+    pub const SMOLLM: &str = "HuggingFaceTB/SmolLM2-135M-Instruct";
 
     #[cfg(feature = "metal")]
     pub const QWEN2: &str = "mlx-community/Qwen2.5-0.5B-Instruct-4bit";
@@ -117,7 +117,6 @@ impl TestModels {
     // -----------------------------------------------------------------------
 
     // Tier 1: Tiny (<500 MB) — run on every PR
-    pub const SMOLLM_135M_4BIT: &str = "mlx-community/SmolLM-135M-Instruct-4bit";
     pub const QWEN2_0_5B_4BIT: &str = "mlx-community/Qwen2.5-0.5B-Instruct-4bit";
     pub const QWEN3_0_6B_4BIT: &str = "mlx-community/Qwen3-0.6B-4bit";
 

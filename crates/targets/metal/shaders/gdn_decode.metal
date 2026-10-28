@@ -22,7 +22,9 @@
 // `qkv` row, the output goes to the model-dtype `out` row; no scratch.
 //
 // The state is laid out as `gdn_conv1d_varlen` and `gdn_scan_varlen` lay a slot out: its conv
-// entry and its ssm entry, a model's drafts kept apart in their draft lanes. This kernel runs only
+// entry and its ssm entry, a model's drafts kept apart in their draft lanes. The conv entry is
+// f32; the ssm entry is `half` — cast at its loads and stores, the arithmetic f32 (the store's
+// rounding is the state's per-step quantization). This kernel runs only
 // a plain step (`scratchy_layers::gdn_state::GdnStep::is_plain`: `gdn_step[seq]` starts from the
 // slot or from zero and carries no drafts), so it reads and writes the entries alone; a step that
 // replays runs the three commands. `state_indices[seq]` is the sequence's `GdnSeqSlots`
@@ -87,7 +89,7 @@ template <typename T>
     const device T*     b             [[buffer(4)]],
     const device T*     conv_w        [[buffer(5)]],
     device       float* conv_state    [[buffer(6)]],
-    device       float* ssm_state     [[buffer(7)]],
+    device       half*  ssm_state     [[buffer(7)]],
     const device int*   cu_seqlens    [[buffer(8)]],
     const device GdnSeqSlots* state_indices [[buffer(9)]],
     const device uint*  gdn_step      [[buffer(10)]],
@@ -118,8 +120,8 @@ template <typename T>
   const uint from = uint(gdn_start_slot(seq_slots, start));
   // The step's one row: a save stores the state after it when it runs through row 1.
   const int2 saves_through = gdn_saves_through(seq_slots);
-  device float* slot_ssm = ssm_state + uint(slot) * SSM_SLOT_LEN;
-  const device float* from_ssm = ssm_state + from * SSM_SLOT_LEN;
+  device half* slot_ssm = ssm_state + uint(slot) * SSM_SLOT_LEN;
+  const device half* from_ssm = ssm_state + from * SSM_SLOT_LEN;
   const uint t = uint(bos);
 
   // The conv, a thread a channel: q, k of key head h, then v of its value heads.
@@ -169,9 +171,9 @@ template <typename T>
     for (uint j = 0; j < BATCH && j0 + j < DIMS; j++) {
       const uint d = (j0 + j) * SIMDGROUPS + simd_gid;
       const uint i_hv = h * R + d / Vd;
-      device const float* row = from_ssm + (i_hv * Vd + d % Vd) * K;
+      device const half* row = from_ssm + (i_hv * Vd + d % Vd) * K;
       for (uint i = 0; i < NPT; i++) {
-        st[j][i] = fresh ? 0.0f : row[lane * NPT + i];
+        st[j][i] = fresh ? 0.0f : float(row[lane * NPT + i]);
       }
     }
     for (uint j = 0; j < BATCH && j0 + j < DIMS; j++) {
@@ -212,16 +214,16 @@ template <typename T>
         o[d] = od;
         sq[d] = od * od;
       }
-      device float* row = slot_ssm + (i_hv * Vd + d % Vd) * K;
+      device half* row = slot_ssm + (i_hv * Vd + d % Vd) * K;
       for (uint i = 0; i < NPT; i++) {
-        row[lane * NPT + i] = st[j][i];
+        row[lane * NPT + i] = half(st[j][i]);
       }
       for (uint sv = 0; sv < GDN_SAVES; sv++) {
         if (gdn_saves_after(saves_through, sv, 0)) {
-          device float* snap = ssm_state + uint(state_indices[n].saves[sv].y) * SSM_SLOT_LEN +
+          device half* snap = ssm_state + uint(state_indices[n].saves[sv].y) * SSM_SLOT_LEN +
                                (i_hv * Vd + d % Vd) * K;
           for (uint i = 0; i < NPT; i++) {
-            snap[lane * NPT + i] = st[j][i];
+            snap[lane * NPT + i] = half(st[j][i]);
           }
         }
       }

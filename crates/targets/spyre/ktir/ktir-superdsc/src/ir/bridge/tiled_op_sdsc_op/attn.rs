@@ -22,10 +22,14 @@
 //!
 //! torch-spyre's version tiles this over kv-blocks with an online-softmax running-max recurrence
 //! (for arbitrarily long `max_seqlen_kv`). This port does the SAME — blocked, ≤stick(64)-wide per
-//! reduce — not the untiled "whole active_cap in one reduce" joint form: that form is mathematically
-//! equivalent on paper but re-triggers a documented, real hardware defect where reduce-MAX over more
-//! than one stick of columns mis-combines partial per-tile maxima (see
-//! `reference_spyre_multirow_reduce_not_broken.md`).
+//! reduce — not the untiled "whole active_cap in one reduce" joint form: the blocked recurrence
+//! is this emitter's card-proven form and matches the vendor's own tiling. (The old text
+//! justified the blocking with "a documented, real hardware defect where reduce-MAX over more
+//! than one stick of columns mis-combines partial per-tile maxima" — an attribution the
+//! template's own DDL refutes: the one measured `mxp = 0` cell carried this crate's own
+//! row-mixing and unmasked-padding defects, both since fixed. See
+//! [`crate::emit::lower_ktir_to_superdsc::reduce`]'s law doc — the wide multi-row max now
+//! lowers through the KTIR door and is card-gated. The blocking here is unchanged.)
 //!
 //! BATCHED OVER HEADS (2026-07-27, matching `superdsc-batch-perf`'s hardware-proven flash decode
 //! exactly): the per-head score/value MATMULS stay separate (each head needs its own K/V slice —
@@ -60,7 +64,10 @@ use super::matmul::{
     assemble_matmul_off_phys_m_maybe_epilogue, assemble_matmul_off_phys_m_with_epilogue,
     assemble_matmul_off_with_epilogue,
 };
-use super::reduce::{ReduceDivided, assemble_reduce_off, assemble_reduce_off_divided};
+use super::reduce::{
+    ReduceDivided, assemble_reduce_off, assemble_reduce_off_divided, win_reduce_accum,
+    win_reduce_data,
+};
 use crate::addr::{Head, Idx, Nest};
 use crate::emit::{
     EmittedOp, In, PointwiseDivided, assemble_pointwise_broadcast_divided,
@@ -82,6 +89,16 @@ use crate::superdsc_opspec::{DataFormat, Df, Fp16};
 /// and `hm()`-wrapped at a pointwise call site with no conflict.
 fn hm(name: &str) -> Stk<FlatTag> {
     fl(name, 1, BlockCols::of_one_stick(Lanes::FP16).get())
+}
+
+/// `hm` at the buffer's TRUE row count — the handle a reduce's accumulator mints through
+/// ([`win_reduce_accum`]). The mint is the first reader of a handle's layout as a BOUND, so the
+/// one-stick-wide buffers declare their real `[rows, 64]` shape there instead of `hm`'s `1×64`
+/// annotation (the synth declarations are `[rows, 64]`, so the mint's shape door and footprint
+/// door agree exactly). Same kind (`FlatTag` — `head_major` unchanged) and annotation-only dims:
+/// the emit is byte-identical.
+fn hm_rows(name: &str, rows: u32) -> Stk<FlatTag> {
+    fl(name, rows, BlockCols::of_one_stick(Lanes::FP16).get())
 }
 
 /// The ONE-STICK-WIDE online-softmax buffers, IN DECLARATION ORDER.
@@ -1262,16 +1279,31 @@ fn assemble_attn_block(
     // reduce-MAX over MORE THAN ONE STICK OF COLUMNS (width>64), not row count. This per-row split was
     // based on a misapplied reading of that doc and is not needed -- confirmed harmless-but-pointless
     // (real hardware test showed zero behavioral change either way). Restored to the plain batched form.
-    let (run_m_h, bmax_h) = (hm(run_m), hm(bmax));
+    let bmax_op = format!("attn_{tag}bmax_o{t}");
     ops.push(assemble_reduce_off(
-        &format!("attn_{tag}bmax_o{t}"),
+        &bmax_op,
         "max",
         rows.swept(),
         width,
-        &hm(sc),
-        crate::addr::DevOff::ZERO,
-        if seed.seeds() { &run_m_h } else { &bmax_h },
-        crate::addr::DevOff::ZERO,
+        win_reduce_data(
+            layout,
+            // The score buffer's true `[rows_n, width_n]` — the same dims the score matmul's own
+            // output handle declares. `hm(sc)`'s `1×64` annotation was never the buffer's shape.
+            &fl(sc, rows_n, width_n),
+            crate::addr::DevOff::ZERO,
+            rows.swept(),
+            width,
+            &format!("{bmax_op}: scores"),
+        )
+        .map_err(SuperDscError)?,
+        win_reduce_accum(
+            layout,
+            &hm_rows(if seed.seeds() { run_m } else { bmax }, rows_n),
+            crate::addr::DevOff::ZERO,
+            rows.swept(),
+            &format!("{bmax_op}: accum"),
+        )
+        .map_err(SuperDscError)?,
         sym_id_base,
         layout,
     ));
@@ -1283,8 +1315,11 @@ fn assemble_attn_block(
             "maximum",
             rows.swept(),
             BlockCols::of_one_stick(Lanes::FP16),
-            &[In::full(&hm(run_m)).ew(), In::full(&hm(bmax)).ew()],
-            &hm(newm),
+            &[
+                In::full(&hm_rows(run_m, rows_n)).ew(),
+                In::full(&hm_rows(bmax, rows_n)).ew(),
+            ],
+            &hm_rows(newm, rows_n),
             crate::addr::DevOff::ZERO,
             sym_id_base,
             layout,
@@ -1297,8 +1332,11 @@ fn assemble_attn_block(
             "subtract",
             rows.swept(),
             BlockCols::of_one_stick(Lanes::FP16),
-            &[In::full(&hm(run_m)).ew(), In::full(&hm(newm)).ew()],
-            &hm(corrsubt),
+            &[
+                In::full(&hm_rows(run_m, rows_n)).ew(),
+                In::full(&hm_rows(newm, rows_n)).ew(),
+            ],
+            &hm_rows(corrsubt, rows_n),
             crate::addr::DevOff::ZERO,
             sym_id_base,
             layout,
@@ -1308,8 +1346,8 @@ fn assemble_attn_block(
             "exp",
             rows.swept(),
             BlockCols::of_one_stick(Lanes::FP16),
-            &[In::full(&hm(corrsubt)).ew()],
-            &hm(corr),
+            &[In::full(&hm_rows(corrsubt, rows_n)).ew()],
+            &hm_rows(corr, rows_n),
             crate::addr::DevOff::ZERO,
             sym_id_base,
             layout,
@@ -1319,8 +1357,8 @@ fn assemble_attn_block(
             "identity",
             rows.swept(),
             BlockCols::of_one_stick(Lanes::FP16),
-            &[In::full(&hm(newm)).ew()],
-            &hm(run_m),
+            &[In::full(&hm_rows(newm, rows_n)).ew()],
+            &hm_rows(run_m, rows_n),
             crate::addr::DevOff::ZERO,
             sym_id_base,
             layout,
@@ -1333,8 +1371,13 @@ fn assemble_attn_block(
         "subtract",
         rows.swept(),
         width,
-        &[In::full(&hm(sc)).ew(), In::col(&hm(run_m)).ew()],
-        &hm(esubt),
+        &[
+            // `sc`/`esubt` at the swept `[rows_n, width_n]` — the same dims the score matmul's
+            // own output handle declares, not `hm`'s `1×64` annotation.
+            In::full(&fl(sc, rows_n, width_n)).ew(),
+            In::col(&hm_rows(run_m, rows_n)).ew(),
+        ],
+        &fl(esubt, rows_n, width_n),
         crate::addr::DevOff::ZERO,
         sym_id_base,
         layout,
@@ -1344,24 +1387,38 @@ fn assemble_attn_block(
         "exp",
         rows.swept(),
         width,
-        &[In::full(&hm(esubt)).ew()],
-        &hm(expb),
+        &[In::full(&fl(esubt, rows_n, width_n)).ew()],
+        &fl(expb, rows_n, width_n),
         crate::addr::DevOff::ZERO,
         sym_id_base,
         layout,
     ));
     // FIRST block: write bsum/ov straight into run_l/run_o (no lset/oset copy needed — same reasoning
     // as run_m above). Saves 2 more "identity" ops per attention node.
-    let (run_l_h, bsum_h) = (hm(run_l), hm(bsum));
+    let bsum_op = format!("attn_{tag}bsum_o{t}");
     ops.push(assemble_reduce_off(
-        &format!("attn_{tag}bsum_o{t}"),
+        &bsum_op,
         "sum",
         rows.swept(),
         width,
-        &hm(expb),
-        crate::addr::DevOff::ZERO,
-        if seed.seeds() { &run_l_h } else { &bsum_h },
-        crate::addr::DevOff::ZERO,
+        win_reduce_data(
+            layout,
+            // `expb` at the same `[rows_n, width_n]` the `exp` pointwise above sweeps it at.
+            &fl(expb, rows_n, width_n),
+            crate::addr::DevOff::ZERO,
+            rows.swept(),
+            width,
+            &format!("{bsum_op}: probabilities"),
+        )
+        .map_err(SuperDscError)?,
+        win_reduce_accum(
+            layout,
+            &hm_rows(if seed.seeds() { run_l } else { bsum }, rows_n),
+            crate::addr::DevOff::ZERO,
+            rows.swept(),
+            &format!("{bsum_op}: accum"),
+        )
+        .map_err(SuperDscError)?,
         sym_id_base,
         layout,
     ));
@@ -1400,10 +1457,12 @@ fn assemble_attn_block(
             rows.swept(),
             BlockCols::of_head_dim(hd),
             &[
-                In::sliced(&hm(run_o), nests.head_major(0, 0)).ew(),
-                In::col(&hm(corr)).ew(),
+                // `run_o`/`otmp` at their true head-wide `[rows_n, hd]` — the HEAD_WIDE_BUFS synth
+                // dimensions, not `hm`'s `1×64` annotation.
+                In::sliced(&fl(run_o, rows_n, hd), nests.head_major(0, 0)).ew(),
+                In::col(&hm_rows(corr, rows_n)).ew(),
             ],
-            &hm(otmp),
+            &fl(otmp, rows_n, hd),
             nests.head_major(0, 0),
             sym_id_base,
             layout,
@@ -1412,7 +1471,7 @@ fn assemble_attn_block(
     // `Some(otmp)` = fold this block in via `stridedadd`; `None` = the seed block writes its own
     // result. The HANDLE is minted once here so the three value-matmul arms below cannot each decide
     // separately whether this block folds — they only choose WHERE in `otmp` their own slab sits.
-    let fold_addend = (!seed.seeds()).then_some(otmp).map(|b| hm(b));
+    let fold_addend = (!seed.seeds()).then_some(otmp).map(|b| fl(b, rows_n, hd));
     // KV-head-BATCHED value bmm — the mirror of the score leg above (same y-stride argument:
     // expb's is mb·in = gqa·mq·width, ov's is mb·out = gqa·mq·hd, kernel's is declared).
     // REQUEST-AXIS VALUE — the mirror of the score leg. V is `[PAGE_SLOTS, hd]` per request and this
@@ -1721,8 +1780,11 @@ fn assemble_attn_block(
             "multiply",
             rows.swept(),
             BlockCols::of_one_stick(Lanes::FP16),
-            &[In::full(&hm(run_l)).ew(), In::full(&hm(corr)).ew()],
-            &hm(ltmp),
+            &[
+                In::full(&hm_rows(run_l, rows_n)).ew(),
+                In::full(&hm_rows(corr, rows_n)).ew(),
+            ],
+            &hm_rows(ltmp, rows_n),
             crate::addr::DevOff::ZERO,
             sym_id_base,
             layout,
@@ -1732,8 +1794,11 @@ fn assemble_attn_block(
             "add",
             rows.swept(),
             BlockCols::of_one_stick(Lanes::FP16),
-            &[In::full(&hm(ltmp)).ew(), In::full(&hm(bsum)).ew()],
-            &hm(run_l),
+            &[
+                In::full(&hm_rows(ltmp, rows_n)).ew(),
+                In::full(&hm_rows(bsum, rows_n)).ew(),
+            ],
+            &hm_rows(run_l, rows_n),
             crate::addr::DevOff::ZERO,
             sym_id_base,
             layout,
@@ -2154,15 +2219,29 @@ fn assemble_new_block_chunk(
             sym_id_base,
             layout,
         ));
+        let ncbmax_op = format!("attn_ncbmax_{bn}_o{t}");
         ops.push(assemble_reduce_off(
-            &format!("attn_ncbmax_{bn}_o{t}"),
+            &ncbmax_op,
             "max",
             grp_rows,
             cols,
-            &rb(sc, g_rows, slots),
-            at_pin,
-            &hm(&bufs.run_m),
-            row_step(h0),
+            win_reduce_data(
+                layout,
+                &rb(sc, g_rows, slots),
+                at_pin,
+                grp_rows,
+                cols,
+                &format!("{ncbmax_op}: scores"),
+            )
+            .map_err(SuperDscError)?,
+            win_reduce_accum(
+                layout,
+                &hm_rows(&bufs.run_m, q_rows),
+                row_step(h0),
+                grp_rows,
+                &format!("{ncbmax_op}: accum"),
+            )
+            .map_err(SuperDscError)?,
             sym_id_base,
             layout,
         ));
@@ -2173,7 +2252,7 @@ fn assemble_new_block_chunk(
             cols,
             &[
                 In::sliced(&rb(sc, g_rows, slots), at_pin).ew(),
-                In::col_at(&hm(&bufs.run_m), row_step(h0)).ew(),
+                In::col_at(&hm_rows(&bufs.run_m, q_rows), row_step(h0)).ew(),
             ],
             &rb(esub, g_rows, slots),
             at_pin,
@@ -2191,15 +2270,29 @@ fn assemble_new_block_chunk(
             sym_id_base,
             layout,
         ));
+        let ncbsum_op = format!("attn_ncbsum_{bn}_o{t}");
         ops.push(assemble_reduce_off(
-            &format!("attn_ncbsum_{bn}_o{t}"),
+            &ncbsum_op,
             "sum",
             grp_rows,
             cols,
-            &rb(exp, g_rows, slots),
-            at_pin,
-            &hm(&bufs.run_l),
-            row_step(h0),
+            win_reduce_data(
+                layout,
+                &rb(exp, g_rows, slots),
+                at_pin,
+                grp_rows,
+                cols,
+                &format!("{ncbsum_op}: probabilities"),
+            )
+            .map_err(SuperDscError)?,
+            win_reduce_accum(
+                layout,
+                &hm_rows(&bufs.run_l, q_rows),
+                row_step(h0),
+                grp_rows,
+                &format!("{ncbsum_op}: accum"),
+            )
+            .map_err(SuperDscError)?,
             sym_id_base,
             layout,
         ));
@@ -2712,15 +2805,33 @@ fn assemble_attn_chunk(
             let into = if p == 0 { temps[0] } else { temps[1] };
             for b in 0..blocks.count() {
                 let pc = corner(part.probs_corner(blocks, b), "a row block's reduction part")?;
+                let part_op = format!("attn_c{stem}_{}_s{p}_o{t}", blk_name(b));
                 ops.push(assemble_reduce_off(
-                    &format!("attn_c{stem}_{}_s{p}_o{t}", blk_name(b)),
+                    &part_op,
                     func,
                     blk_rows,
                     BlockCols::of_chunk_part(*part),
-                    &rb(src, b_rows, part.slots()),
-                    pc,
-                    &hm(into),
-                    row_step(blocks.first_head(b) * mq),
+                    win_reduce_data(
+                        layout,
+                        // The FULL `[q_rows, slots]` score buffer — `pc` is the part's corner in
+                        // the whole buffer (ChunkPart::probs_corner's law), and the block's own
+                        // `b_rows` rows are a slice of it, so the part-sized and block-sized
+                        // annotations the raw form carried were never the window's bound.
+                        &rb(src, q_rows, slots),
+                        pc,
+                        blk_rows,
+                        BlockCols::of_chunk_part(*part),
+                        &format!("{part_op}: probabilities"),
+                    )
+                    .map_err(SuperDscError)?,
+                    win_reduce_accum(
+                        layout,
+                        &hm_rows(into, q_rows),
+                        row_step(blocks.first_head(b) * mq),
+                        blk_rows,
+                        &format!("{part_op}: partial"),
+                    )
+                    .map_err(SuperDscError)?,
                     sym_id_base,
                     layout,
                 ));
@@ -2738,8 +2849,11 @@ fn assemble_attn_chunk(
                     combine,
                     all_rows,
                     stick,
-                    &[In::full(&hm(acc)).ew(), In::full(&hm(temps[1])).ew()],
-                    &hm(out),
+                    &[
+                        In::full(&hm_rows(acc, q_rows)).ew(),
+                        In::full(&hm_rows(temps[1], q_rows)).ew(),
+                    ],
+                    &hm_rows(out, q_rows),
                     DevOff::ZERO,
                     sym_id_base,
                     layout,
@@ -2761,10 +2875,26 @@ fn assemble_attn_chunk(
                     op_func: "max",
                     rows: blk_rows,
                     cols: width,
-                    data: &rb(&cb.csc, b_rows, slots),
-                    data_off: rc,
-                    accum: &hm(&bufs.bmax),
-                    accum_off: row_step(h0),
+                    data: win_reduce_data(
+                        layout,
+                        // The FULL `[q_rows, slots]` chunk score buffer — the block's `rc` is a
+                        // corner in it, so the block-sized `b_rows` annotation the raw form
+                        // carried was never the window's bound.
+                        &rb(&cb.csc, q_rows, slots),
+                        rc,
+                        blk_rows,
+                        width,
+                        &format!("attn_cbmax_{}_o{t}: scores", blk_name(b)),
+                    )
+                    .map_err(SuperDscError)?,
+                    accum: win_reduce_accum(
+                        layout,
+                        &hm_rows(&bufs.bmax, q_rows),
+                        row_step(h0),
+                        blk_rows,
+                        &format!("attn_cbmax_{}_o{t}: accum", blk_name(b)),
+                    )
+                    .map_err(SuperDscError)?,
                     division: cb.red_division,
                 },
                 sym_id_base,
@@ -2798,8 +2928,11 @@ fn assemble_attn_chunk(
             func,
             all_rows,
             stick,
-            &[In::full(&hm(ins[0])).ew(), In::full(&hm(ins[1])).ew()],
-            &hm(out),
+            &[
+                In::full(&hm_rows(ins[0], q_rows)).ew(),
+                In::full(&hm_rows(ins[1], q_rows)).ew(),
+            ],
+            &hm_rows(out, q_rows),
             DevOff::ZERO,
             sym_id_base,
             layout,
@@ -2814,8 +2947,8 @@ fn assemble_attn_chunk(
             func,
             all_rows,
             stick,
-            &[In::full(&hm(inp)).ew()],
-            &hm(out),
+            &[In::full(&hm_rows(inp, q_rows)).ew()],
+            &hm_rows(out, q_rows),
             DevOff::ZERO,
             sym_id_base,
             layout,
@@ -2877,7 +3010,10 @@ fn assemble_attn_chunk(
                 format!("_s{p}")
             };
             // `esub` and `exp` write DIFFERENT buffers — an exp must never read and write one buffer.
-            // `cesub` is core-local LX, so both address it at its pin (no corner).
+            // `cesub` is core-local LX, so both address it at its pin (no corner). The score and
+            // probability blocks are read/written at CHUNK-FRAME corners (`pc`), so their handles
+            // declare the FULL `[q_rows, slots]` buffers — the block-shaped `b_rows` annotation the
+            // raw form carried was never the window's bound.
             ops.push(assemble_pointwise_broadcast_divided(
                 PointwiseDivided {
                     op_name: &format!("attn_cesub_{bn}{suffix}_o{t}"),
@@ -2885,8 +3021,8 @@ fn assemble_attn_chunk(
                     rows: blk_rows,
                     cols: pw,
                     inputs: &[
-                        In::sliced(&rb(&cb.csc, b_rows, ps), pc).ew(),
-                        In::col_at(&hm(&bufs.run_m), row_step(h0)).ew(),
+                        In::sliced(&rb(&cb.csc, q_rows, slots), pc).ew(),
+                        In::col_at(&hm_rows(&bufs.run_m, q_rows), row_step(h0)).ew(),
                     ],
                     o: &rb(&cb.cesub, b_rows, ps),
                     out_offset: DevOff::ZERO.into(),
@@ -2902,7 +3038,7 @@ fn assemble_attn_chunk(
                     rows: blk_rows,
                     cols: pw,
                     inputs: &[In::sliced(&rb(&cb.cesub, b_rows, ps), DevOff::ZERO).ew()],
-                    o: &rb(&cb.cexp, b_rows, ps),
+                    o: &rb(&cb.cexp, q_rows, slots),
                     out_offset: pc.into(),
                     division: cb.sm_division,
                 },
@@ -2920,10 +3056,24 @@ fn assemble_attn_chunk(
                     op_func: "sum",
                     rows: blk_rows,
                     cols: width,
-                    data: &rb(&cb.cexp, b_rows, slots),
-                    data_off: rc,
-                    accum: &hm(&bufs.bsum),
-                    accum_off: row_step(h0),
+                    data: win_reduce_data(
+                        layout,
+                        // The FULL `[q_rows, slots]` probability buffer (the bsum twin above).
+                        &rb(&cb.cexp, q_rows, slots),
+                        rc,
+                        blk_rows,
+                        width,
+                        &format!("attn_cbsum_{bn}_o{t}: probabilities"),
+                    )
+                    .map_err(SuperDscError)?,
+                    accum: win_reduce_accum(
+                        layout,
+                        &hm_rows(&bufs.bsum, q_rows),
+                        row_step(h0),
+                        blk_rows,
+                        &format!("attn_cbsum_{bn}_o{t}: accum"),
+                    )
+                    .map_err(SuperDscError)?,
                     division: cb.red_division,
                 },
                 sym_id_base,
@@ -2943,15 +3093,15 @@ fn assemble_attn_chunk(
         all_rows,
         BlockCols::of_head_dim(hd),
         &[
-            In::full(&hm(&bufs.run_o)).ew(),
-            In::col(&hm(&bufs.corr)).ew(),
+            In::full(&fl(&bufs.run_o, q_rows, hd)).ew(),
+            In::col(&hm_rows(&bufs.corr, q_rows)).ew(),
         ],
-        &hm(&bufs.otmp),
+        &fl(&bufs.otmp, q_rows, hd),
         DevOff::ZERO,
         sym_id_base,
         layout,
     ));
-    let (otmp_h, run_o_h) = (hm(&bufs.otmp), hm(&bufs.run_o));
+    let (otmp_h, run_o_h) = (fl(&bufs.otmp, q_rows, hd), fl(&bufs.run_o, q_rows, hd));
     // ⭐ THE VALUE LEG, IN K-PARTS (`ChunkScratch::value_parts`): ONE part at decode, 16 pages a part
     // for a prompt chunk, whose whole-chunk PV dxp refuses to verify. Each part folds onto the last
     // through the same `stridedadd` epilogue, PING-PONGING between `run_o` and `otmp` so no matmul reads
@@ -3077,10 +3227,10 @@ fn assemble_attn_chunk(
         all_rows,
         stick,
         &[
-            In::full(&hm(&bufs.run_l)).ew(),
-            In::full(&hm(&bufs.corr)).ew(),
+            In::full(&hm_rows(&bufs.run_l, q_rows)).ew(),
+            In::full(&hm_rows(&bufs.corr, q_rows)).ew(),
         ],
-        &hm(&bufs.ltmp),
+        &hm_rows(&bufs.ltmp, q_rows),
         DevOff::ZERO,
         sym_id_base,
         layout,
@@ -3091,10 +3241,10 @@ fn assemble_attn_chunk(
         all_rows,
         stick,
         &[
-            In::full(&hm(&bufs.ltmp)).ew(),
-            In::full(&hm(&bufs.bsum)).ew(),
+            In::full(&hm_rows(&bufs.ltmp, q_rows)).ew(),
+            In::full(&hm_rows(&bufs.bsum, q_rows)).ew(),
         ],
-        &hm(&bufs.run_l),
+        &hm_rows(&bufs.run_l, q_rows),
         DevOff::ZERO,
         sym_id_base,
         layout,
@@ -3173,15 +3323,15 @@ fn prompt_probabilities_in_lx(
         all_rows,
         BlockCols::of_head_dim(hd),
         &[
-            In::full(&hm(&bufs.run_o)).ew(),
-            In::col(&hm(&bufs.corr)).ew(),
+            In::full(&fl(&bufs.run_o, q_rows, hd)).ew(),
+            In::col(&hm_rows(&bufs.corr, q_rows)).ew(),
         ],
-        &hm(&bufs.otmp),
+        &fl(&bufs.otmp, q_rows, hd),
         DevOff::ZERO,
         sym_id_base,
         layout,
     ));
-    let (otmp_h, run_o_h) = (hm(&bufs.otmp), hm(&bufs.run_o));
+    let (otmp_h, run_o_h) = (fl(&bufs.otmp, q_rows, hd), fl(&bufs.run_o, q_rows, hd));
     let parts: Vec<crate::sdsc_abstract::ChunkPart> = chunk
         .slot_parts(prompt_lx_part_pages(chunk, g_rows))
         .collect();
@@ -3203,8 +3353,11 @@ fn prompt_probabilities_in_lx(
                 grp_rows,
                 pw,
                 &[
-                    In::sliced(&rb(&cb.csc, g_rows, ps), pc).ew(),
-                    In::col_at(&hm(&bufs.run_m), row_step(h0)).ew(),
+                    // The score block at its CHUNK-FRAME part corner — the FULL `[q_rows, slots]`
+                    // buffer, not the block-shaped `g_rows` annotation. `cesub` below is core-local
+                    // LX, addressed at its pin (offset 0), so ITS handle stays block-shaped.
+                    In::sliced(&rb(&cb.csc, q_rows, chunk.slots()), pc).ew(),
+                    In::col_at(&hm_rows(&bufs.run_m, q_rows), row_step(h0)).ew(),
                 ],
                 &rb(&cb.cesub, g_rows, ps),
                 DevOff::ZERO,
@@ -3224,15 +3377,29 @@ fn prompt_probabilities_in_lx(
             ));
             // One part: the whole chunk's sum, straight into the denominator.
             let sum_into = if n == 1 { &bufs.bsum } else { &cb.red[p] };
+            let cbsum_op = format!("attn_cbsum_{bn}_s{p}_o{t}");
             ops.push(assemble_reduce_off(
-                &format!("attn_cbsum_{bn}_s{p}_o{t}"),
+                &cbsum_op,
                 "sum",
                 grp_rows,
                 pw,
-                &rb(&cb.cexp, g_rows, ps),
-                DevOff::ZERO,
-                &hm(sum_into),
-                row_step(h0),
+                win_reduce_data(
+                    layout,
+                    &rb(&cb.cexp, g_rows, ps),
+                    DevOff::ZERO,
+                    grp_rows,
+                    pw,
+                    &format!("{cbsum_op}: probabilities"),
+                )
+                .map_err(SuperDscError)?,
+                win_reduce_accum(
+                    layout,
+                    &hm_rows(sum_into, q_rows),
+                    row_step(h0),
+                    grp_rows,
+                    &format!("{cbsum_op}: denominator"),
+                )
+                .map_err(SuperDscError)?,
                 sym_id_base,
                 layout,
             ));
@@ -3303,8 +3470,11 @@ fn prompt_probabilities_in_lx(
             "add",
             all_rows,
             stick,
-            &[In::full(&hm(acc)).ew(), In::full(&hm(&cb.red[p])).ew()],
-            &hm(out),
+            &[
+                In::full(&hm_rows(acc, q_rows)).ew(),
+                In::full(&hm_rows(&cb.red[p], q_rows)).ew(),
+            ],
+            &hm_rows(out, q_rows),
             DevOff::ZERO,
             sym_id_base,
             layout,
@@ -3318,10 +3488,10 @@ fn prompt_probabilities_in_lx(
         all_rows,
         stick,
         &[
-            In::full(&hm(&bufs.run_l)).ew(),
-            In::full(&hm(&bufs.corr)).ew(),
+            In::full(&hm_rows(&bufs.run_l, q_rows)).ew(),
+            In::full(&hm_rows(&bufs.corr, q_rows)).ew(),
         ],
-        &hm(&bufs.ltmp),
+        &hm_rows(&bufs.ltmp, q_rows),
         DevOff::ZERO,
         sym_id_base,
         layout,
@@ -3332,10 +3502,10 @@ fn prompt_probabilities_in_lx(
         all_rows,
         stick,
         &[
-            In::full(&hm(&bufs.ltmp)).ew(),
-            In::full(&hm(&bufs.bsum)).ew(),
+            In::full(&hm_rows(&bufs.ltmp, q_rows)).ew(),
+            In::full(&hm_rows(&bufs.bsum, q_rows)).ew(),
         ],
-        &hm(&bufs.run_l),
+        &hm_rows(&bufs.run_l, q_rows),
         DevOff::ZERO,
         sym_id_base,
         layout,
@@ -3532,7 +3702,13 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     // not two lane counts: the window's rows are the tile's K rows, the slab its features.
                     KtTileSlots::of_row_window(RowWindow::ROWS),
                     KtTileFeats::of_head_slab(FeatIdx::SLAB_FEATS),
-                    new_k_scaled,
+                    // ⭐ THE INPUT HANDLE, AT THE BUFFER'S OWN TRUTH: new_k_scaled is allocated
+                    // `[mq_pad, nkvh·hd]` (the padded rows — the scale multiply and RoPE's producer both
+                    // state it; the pad rows past `mq` hold the next head's masked lanes by the zero-fill
+                    // law, still INSIDE this tensor). The mint bounds every (kvh, slab, sub-block) tile's
+                    // flat run against THAT, so a corner arithmetic that walks past the last head's last
+                    // slab is a build failure here rather than a clean bake reading the next tensor.
+                    &rb(new_k_scaled, mq_pad_t.rows().row_axis_extent(), nkvh * hd),
                     // PER-KV-HEAD BASE = `kvh * mq * hd` (2026-07-28, CORRECTED from a briefly-committed
                     // `mq_pad` version that regressed decode). `new_k_scaled` inherits its kv-head stride from
                     // RoPE, this tensor family's producer, which writes head h row r at
@@ -3555,7 +3731,11 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                         .at(Idx::<Head>::n(kvh))
                         .slab(sl)
                         .dev(),
-                    &new_kt,
+                    // ⭐ THE OUTPUT HANDLE, likewise: `new_kt` is `nkvh` SEPARATE `[hd, mq_pad]` blocks
+                    // laid end to end (the synth above reserves exactly `[nkvh, hd, mq_pad]`), so the
+                    // handle states the whole flat run. The LAST sub-block's tile ends exactly at the
+                    // scratch's last element — fits with equality, which is what the mint checks.
+                    &rb(&new_kt, 1, nkvh * hd * mq_pad_t.slots().slot_axis_extent()),
                     // DEST: `[nkvh, hd, mq_pad]` with the stick on the SLOT axis, so kv head `kvh` and
                     // feature `sl*stick` are coordinates and the `j`-th sub-block is slot window `j*stick`.
                     // The law places the plane; the previous `sl*mq_pad*stick` guessed it and was wrong above
@@ -4926,10 +5106,14 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 RowCount::of_mask_rows(rows),
                 BlockCols::of_head_dim(hd),
                 &[
-                    In::full(&hm(&bufs.run_o)).ew(),
-                    In::col(&hm(&bufs.run_l)).ew(),
+                    // The accumulators at their true extents — `run_o` head-wide `[rows, hd]`,
+                    // `run_l` one-stick `[rows, 64]` — and `out` at the flat-equal `[rows, hd]`
+                    // view of its `[mq, nqh·hd]` token-stream buffer (same element count; the
+                    // mint's bound is flat).
+                    In::full(&fl(&bufs.run_o, rows.get(), hd)).ew(),
+                    In::col(&hm_rows(&bufs.run_l, rows.get())).ew(),
                 ],
-                &hm(out),
+                &fl(out, rows.get(), hd),
                 crate::addr::DevOff::ZERO,
                 sym_id_base,
                 layout,
@@ -4945,8 +5129,12 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     RowCount::of_query_rows(width.mq()),
                     BlockCols::of_head_dim(hd),
                     &[
-                        In::sliced(&hm(&bufs.run_o), nests.token_stream(hi, 0).off()).ew(),
-                        In::col_at(&hm(&bufs.run_l), nests.head_major(hi, 0)).ew(),
+                        In::sliced(
+                            &fl(&bufs.run_o, rows.get(), hd),
+                            nests.token_stream(hi, 0).off(),
+                        )
+                        .ew(),
+                        In::col_at(&hm_rows(&bufs.run_l, rows.get()), nests.head_major(hi, 0)).ew(),
                     ],
                     &rb(out, mq, nqh * hd),
                     nests.token_stream(hi, 0).off(),
@@ -4981,10 +5169,10 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 RowCount::of_mask_rows(rows),
                 BlockCols::of_head_slab(FeatIdx::SLAB_FEATS),
                 &[
-                    In::sliced(&hm(&bufs.run_o), nests.head_major(0, s)).ew(),
-                    In::col(&hm(&bufs.run_l)).ew(),
+                    In::sliced(&fl(&bufs.run_o, rows.get(), hd), nests.head_major(0, s)).ew(),
+                    In::col(&hm_rows(&bufs.run_l, rows.get())).ew(),
                 ],
-                &hm(out),
+                &fl(out, rows.get(), hd),
                 nests.head_major(0, s),
                 sym_id_base,
                 layout,
@@ -5044,8 +5232,8 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     RowCount::of_query_rows(width.mq()),
                     BlockCols::of_head_slab(FeatIdx::SLAB_FEATS),
                     &[
-                        In::sliced(&hm(&bufs.run_o), nests.head_major(hi, s)).ew(),
-                        In::col_at(&hm(&bufs.run_l), nests.head_major(hi, 0)).ew(),
+                        In::sliced(&fl(&bufs.run_o, rows.get(), hd), nests.head_major(hi, s)).ew(),
+                        In::col_at(&hm_rows(&bufs.run_l, rows.get()), nests.head_major(hi, 0)).ew(),
                     ],
                     &rb(out, mq, nqh * hd),
                     nests.token_stream(hi, s).off(),

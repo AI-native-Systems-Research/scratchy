@@ -112,7 +112,7 @@ fn encode_argmax_into_mtl4_inner(
     // the implicit cross-CB sync was lost and the race surfaced as
     // wrong first tokens for any forward whose tail writes target
     // the lm_head output slot — most visibly the lm_head slice
-    // (`scatter_first_to_last_row`) at single-seq prefill.
+    // (`put_sampled_rows_back`) at single-seq prefill.
     //
     // `Device` visibility (cache-coherent): the forward's last
     // store may live in L2 only; argmax loads from `device` address

@@ -95,34 +95,79 @@ impl Engine {
         }
     }
 
-    pub fn ladder(self, m: &Model) -> &[Rep] {
+    /// Whether it serves an `ignore_eos` request to its full length, so a live server delivers
+    /// every answer token asked for ([`super::data::Run::mark_dead`]). In every published run,
+    /// scratchy's live cells deliver 99% or more of them. mlx_lm.server has no `ignore_eos` and
+    /// stops at EOS: granite-3.3-2b's 128x512 cell delivers 89% on it, 100% on scratchy. oMLX stops
+    /// at EOS regardless (#479), as does ollama, at as little as 36% and 15%; vllm-metal, llama.cpp
+    /// and mistral.rs have no published cells to show either, so they are not judged.
+    pub fn honours_ignore_eos(self) -> bool {
         match self {
-            Engine::Scratchy => &m.cache_ladder,
-            Engine::OmlxTq => &m.cache_ladder_omlx_tq,
-            Engine::Omlx => &m.cache_ladder_omlx,
-            Engine::MlxLm => &m.cache_ladder_mlx_lm,
-            Engine::VllmMetal => &m.cache_ladder_vllm_metal,
-            Engine::Ollama => &m.cache_ladder_ollama,
-            Engine::LlamaCpp => &m.cache_ladder_llama_cpp,
-            Engine::Mistralrs => &m.cache_ladder_mistralrs,
+            Engine::Scratchy => true,
+            Engine::MlxLm
+            | Engine::OmlxTq
+            | Engine::Omlx
+            | Engine::VllmMetal
+            | Engine::Ollama
+            | Engine::LlamaCpp
+            | Engine::Mistralrs => false,
         }
-        .as_deref()
-        .unwrap_or_default()
+    }
+
+    /// Its scaling cells, to mark as a run loads ([`super::data::Run::mark_dead`]).
+    pub fn cells_mut(self, m: &mut Model) -> &mut [Cell] {
+        self.fields_mut(m).1.as_deref_mut().unwrap_or_default()
+    }
+
+    /// Its startup launches and its scaling cells in a run's model: the one table of which fields
+    /// are whose.
+    fn fields(self, m: &Model) -> (&Option<Vec<Rep>>, &Option<Vec<Cell>>) {
+        match self {
+            Engine::Scratchy => (&m.cache_ladder, &m.scaling),
+            Engine::OmlxTq => (&m.cache_ladder_omlx_tq, &m.scaling_omlx_tq),
+            Engine::Omlx => (&m.cache_ladder_omlx, &m.scaling_omlx),
+            Engine::MlxLm => (&m.cache_ladder_mlx_lm, &m.scaling_mlx_lm),
+            Engine::VllmMetal => (&m.cache_ladder_vllm_metal, &m.scaling_vllm_metal),
+            Engine::Ollama => (&m.cache_ladder_ollama, &m.scaling_ollama),
+            Engine::LlamaCpp => (&m.cache_ladder_llama_cpp, &m.scaling_llama_cpp),
+            Engine::Mistralrs => (&m.cache_ladder_mistralrs, &m.scaling_mistralrs),
+        }
+    }
+
+    /// [`Engine::fields`], to fill them from an earlier run ([`super::borrow_earlier`]).
+    pub fn fields_mut(self, m: &mut Model) -> (&mut Option<Vec<Rep>>, &mut Option<Vec<Cell>>) {
+        match self {
+            Engine::Scratchy => (&mut m.cache_ladder, &mut m.scaling),
+            Engine::OmlxTq => (&mut m.cache_ladder_omlx_tq, &mut m.scaling_omlx_tq),
+            Engine::Omlx => (&mut m.cache_ladder_omlx, &mut m.scaling_omlx),
+            Engine::MlxLm => (&mut m.cache_ladder_mlx_lm, &mut m.scaling_mlx_lm),
+            Engine::VllmMetal => (&mut m.cache_ladder_vllm_metal, &mut m.scaling_vllm_metal),
+            Engine::Ollama => (&mut m.cache_ladder_ollama, &mut m.scaling_ollama),
+            Engine::LlamaCpp => (&mut m.cache_ladder_llama_cpp, &mut m.scaling_llama_cpp),
+            Engine::Mistralrs => (&mut m.cache_ladder_mistralrs, &mut m.scaling_mistralrs),
+        }
+    }
+
+    /// Whether it serves scratchy's own MLX checkpoint, the files [`Model::weights`] measures.
+    /// ollama, llama.cpp and mistral.rs serve their own builds of the model (`served_as` names
+    /// them), so its weights say nothing about their memory.
+    pub fn serves_mlx_checkpoint(self) -> bool {
+        match self {
+            Engine::Scratchy
+            | Engine::OmlxTq
+            | Engine::Omlx
+            | Engine::MlxLm
+            | Engine::VllmMetal => true,
+            Engine::Ollama | Engine::LlamaCpp | Engine::Mistralrs => false,
+        }
+    }
+
+    pub fn ladder(self, m: &Model) -> &[Rep] {
+        self.fields(m).0.as_deref().unwrap_or_default()
     }
 
     pub fn cells(self, m: &Model) -> &[Cell] {
-        match self {
-            Engine::Scratchy => &m.scaling,
-            Engine::OmlxTq => &m.scaling_omlx_tq,
-            Engine::Omlx => &m.scaling_omlx,
-            Engine::MlxLm => &m.scaling_mlx_lm,
-            Engine::VllmMetal => &m.scaling_vllm_metal,
-            Engine::Ollama => &m.scaling_ollama,
-            Engine::LlamaCpp => &m.scaling_llama_cpp,
-            Engine::Mistralrs => &m.scaling_mistralrs,
-        }
-        .as_deref()
-        .unwrap_or_default()
+        self.fields(m).1.as_deref().unwrap_or_default()
     }
 
     /// Whether this run measured the engine for this model at all.
@@ -175,7 +220,7 @@ impl Metric {
             Metric::Ttft => c.median_ttft_ms,
             Metric::Tpot => c.median_tpot_ms,
             Metric::Throughput => c.output_throughput,
-            Metric::PeakMem => c.server_mem_peak_mib,
+            Metric::PeakMem => c.server_mem_peak_mib.filter(|_| !c.mem_below_weights),
         }
     }
 
@@ -239,6 +284,10 @@ pub const NO_STREAM: &str = "no stream";
 pub const PARTIAL: &str = "†";
 /// Marks any number from a cell where some requests failed.
 pub const FAILED: &str = "‡";
+/// Marks any number from a cell whose answers came back short of the tokens asked for.
+pub const SHORT: &str = "§";
+/// Stands in for a peak RSS below the model's own weights ([`peak_rss`]).
+pub const BELOW_WEIGHTS: &str = "below weights";
 
 pub fn fmt(v: Option<f64>, decimals: usize) -> String {
     v.map_or_else(|| DASH.to_string(), |v| thousands_f(v, decimals))
@@ -260,6 +309,53 @@ pub fn lfmt(
     fmt(v.map(|v| v * scale), decimals)
 }
 
+/// A memory reading of an engine serving a model: its MiB, below the model's own weights (so it
+/// can't be all the process holds), or not measured.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Memory {
+    Reading(f64),
+    BelowWeights,
+    NotMeasured,
+}
+
+impl Memory {
+    /// `mib` as read for engine `e` serving `m`: below its weights, for an engine that loads the
+    /// checkpoint they measure ([`Engine::serves_mlx_checkpoint`]), is not a reading.
+    pub fn of(m: &Model, e: Engine, mib: Option<f64>) -> Self {
+        match mib {
+            None => Memory::NotMeasured,
+            Some(mib) if below_weights(m, e, mib) => Memory::BelowWeights,
+            Some(mib) => Memory::Reading(mib),
+        }
+    }
+
+    /// The MiB, where it is a reading.
+    pub fn mib(self) -> Option<f64> {
+        match self {
+            Memory::Reading(mib) => Some(mib),
+            Memory::BelowWeights | Memory::NotMeasured => None,
+        }
+    }
+}
+
+/// Whether `mib` reads below `m`'s weights for an engine that loads them.
+pub fn below_weights(m: &Model, e: Engine, mib: f64) -> bool {
+    e.serves_mlx_checkpoint() && m.weights().is_some_and(|w| mib < w.mib())
+}
+
+/// An engine's median peak RSS over a model's launches of one scenario (#414).
+pub fn peak_rss(m: &Model, e: Engine, scenario: Scenario) -> Memory {
+    Memory::of(m, e, med(e.ladder(m), scenario, Startup::PeakRss))
+}
+
+/// [`peak_rss`] as text: says it reads below the weights rather than show the number.
+pub fn rss_fmt(m: &Model, e: Engine, scenario: Scenario) -> String {
+    match peak_rss(m, e, scenario) {
+        Memory::BelowWeights => BELOW_WEIGHTS.to_string(),
+        r => fmt(r.mib(), 0),
+    }
+}
+
 /// Whether scratchy produced any number for this model.
 pub fn served(m: &Model) -> bool {
     m.built
@@ -276,9 +372,10 @@ pub fn streamed(c: Option<&Cell>) -> bool {
     c.is_some_and(|c| c.median_tpot_ms.unwrap_or(0.0) > 0.0)
 }
 
-/// A cell's value, or None where it was not really measured.
+/// A cell's value, or None where it was not really measured: a timing from an answer that never
+/// streamed, or any number from a server that had stopped answering ([`Cell::dead`]).
 pub fn timing(c: Option<&Cell>, metric: Metric) -> Option<f64> {
-    let c = c?;
+    let c = c.filter(|c| !c.dead)?;
     if metric.is_timing() && !streamed(Some(c)) {
         return None;
     }
@@ -291,15 +388,28 @@ fn untimed(c: Option<&Cell>) -> u32 {
 
 /// Whether a timing is real but taken from only some of the cell's requests.
 pub fn partial(c: Option<&Cell>, metric: Metric) -> bool {
-    metric.is_timing() && streamed(c) && untimed(c) > 0
+    metric.is_timing() && c.is_some_and(|c| !c.dead) && streamed(c) && untimed(c) > 0
 }
 
-/// Requests in a cell that errored or timed out.
+/// Requests in a cell that errored or timed out; every one, where its server had stopped
+/// answering ([`Cell::dead`]).
 pub fn failed(c: Option<&Cell>) -> u32 {
-    c.and_then(|c| c.failed).unwrap_or(0)
+    match c {
+        Some(c) if c.dead => c.failed.unwrap_or(0) + c.completed.unwrap_or(0),
+        _ => c.and_then(|c| c.failed).unwrap_or(0),
+    }
 }
 
 pub fn failed_note(c: Option<&Cell>) -> String {
+    if let Some(c) = c.filter(|c| c.dead) {
+        return format!(
+            "the server had stopped answering: {} answer tokens in all",
+            c.total_output_tokens.unwrap_or(0)
+        );
+    }
+    if c.is_some_and(|c| c.timed_out) {
+        return "it did not finish within the run's cell timeout".to_string();
+    }
     let n = failed(c);
     format!(
         "{n} of {} requests failed",
@@ -308,7 +418,8 @@ pub fn failed_note(c: Option<&Cell>) -> String {
 }
 
 /// The marks a cell's value carries: † for a timing from only some of its
-/// requests, ‡ for any number from a cell where requests failed.
+/// requests, ‡ for any number from a cell where requests failed, § for any
+/// number from a cell whose answers came back short.
 pub fn marks(c: Option<&Cell>, metric: Metric) -> String {
     let mut m = String::new();
     if partial(c, metric) {
@@ -317,7 +428,25 @@ pub fn marks(c: Option<&Cell>, metric: Metric) -> String {
     if failed(c) > 0 {
         m += FAILED;
     }
+    if short(c).is_some() {
+        m += SHORT;
+    }
     m
+}
+
+/// The share of the answer tokens asked for that a cell delivered, where its answers came back
+/// short ([`Cell::short`]).
+pub fn short(c: Option<&Cell>) -> Option<f64> {
+    c.and_then(|c| c.short)
+}
+
+pub fn short_note(c: Option<&Cell>) -> String {
+    short(c).map_or_else(String::new, |share| {
+        format!(
+            "answers stopped early: {:.0}% of the answer tokens asked for",
+            share * 100.0
+        )
+    })
 }
 
 /// What a cell's marks mean, for a table view or a tooltip; "" without any.
@@ -328,6 +457,9 @@ pub fn marks_note(c: Option<&Cell>, metric: Metric) -> String {
     }
     if failed(c) > 0 {
         parts.push(failed_note(c));
+    }
+    if short(c).is_some() {
+        parts.push(short_note(c));
     }
     parts.join("; ")
 }
@@ -343,6 +475,9 @@ pub fn untimed_note(c: Option<&Cell>) -> String {
 /// engine never produced, and marks one taken from only some requests, or
 /// from a cell where requests failed.
 pub fn cfmt(c: Option<&Cell>, metric: Metric) -> String {
+    if c.is_some_and(|c| c.dead) {
+        return DASH.to_string() + FAILED;
+    }
     if c.is_some() && metric.is_timing() && !streamed(c) {
         return NO_STREAM.to_string() + if failed(c) > 0 { FAILED } else { "" };
     }

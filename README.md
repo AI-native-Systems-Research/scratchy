@@ -94,15 +94,15 @@ Note the convention for selecting models and quants:
   drafts with it (`--num-speculative-tokens 0` serves without). `spec/mtp`
   adds the other published drafters (the bf16 and QAT assistants, which draft
   when `--speculative-model` names them).
-- `hf-completions` — shell tab completion over the real HuggingFace ids this
-  build can actually run (`scr completions zsh --install`). **On by default**;
+- `model/hf-completions` — shell tab completion over the real HuggingFace ids
+  this build can actually run (`scr completions zsh --install`). **On by default**;
   it resolves that list against huggingface.co at build time, so an air-gapped
   build wants `--no-default-features`. See [`docs/BUILD.md`](docs/BUILD.md).
-- `turboquant` — TurboQuant KV-cache compression on metal, for every model
-  whose geometry takes it (the build names the ones that stay dense). **On with
-  `metal`**, off for spyre, and fixed at build time: `--kv-cache-dtype`
-  can only assert it. `metal-base` in place of `metal` builds the same engine
-  with a dense KV cache and no MTP heads (`metal-base,mtp-heads` keeps MTP).
+- TurboQuant KV-cache compression is **on with `metal`**, for every model
+  whose geometry takes it (the build names the ones that stay dense); off for
+  spyre, and fixed at build time: `--kv-cache-dtype` can only assert
+  it. `metal-base` in place of `metal` builds the same engine with a dense KV
+  cache and no MTP heads (`metal-base,model/mtp-heads` keeps MTP).
 
 ### Deep Dives
 
@@ -116,6 +116,7 @@ mechanics.
 fairness rules, and how to review the startup harness without a GPU.
 - See [`docs/spyre/KUBERNETES.md`](docs/spyre/KUBERNETES.md) for help using OpenShift to build an image for Spyre.
 - See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the PR workflow, CI gates, and architecture invariants.
+- See [`docs/TESTING.md`](docs/TESTING.md) for the five test tiers and the tests that must stay tests.
 
 ## License
 

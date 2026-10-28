@@ -112,8 +112,12 @@ pub trait EngineCoreClient {
         ))
     }
 
-    /// A step the executor failed, never to be finalized ([`EngineCore::abandon_step`]).
-    fn abandon_step(&mut self, _sched: &SchedulerOutput) {}
+    /// A step the executor failed, never to be finalized: it leads no more and its requests are
+    /// aborted, with any a step behind it admitted onto the KV it was to write
+    /// ([`EngineCore::abandon_step`]). Returns every request aborted. No default: the server's
+    /// step loop aborts a failed step's requests through it alone, so a client that took the
+    /// executor and kept a no-op here would leave them running.
+    fn abandon_step(&mut self, sched: &SchedulerOutput) -> Vec<String>;
 
     /// Whether async scheduling is enabled on the underlying engine.
     fn async_scheduling(&self) -> bool {
@@ -369,8 +373,17 @@ impl InprocClient {
             pipeline.gpu_in_flight -= 1;
             // The last batch queued is finalized here once none is in flight.
             pipeline.awaits_step &= pipeline.gpu_in_flight > 0;
-            let mut model_output = result?;
-            model_output.resolve().map_err(EngineError::Executor)?;
+            let resolved = result.and_then(|mut output| {
+                output.resolve().map_err(EngineError::Executor)?;
+                Ok(output)
+            });
+            let model_output = match resolved {
+                Ok(output) => output,
+                Err(e) => {
+                    engine.abandon_step(&sched);
+                    return Err(e);
+                }
+            };
             return Ok(StepOutcome::Progressed {
                 outputs: engine.finalize_step(&sched, &model_output),
                 model_executed: true,
@@ -511,8 +524,8 @@ impl EngineCoreClient for InprocClient {
         Ok(self.engine.schedule_next())
     }
 
-    fn abandon_step(&mut self, sched: &SchedulerOutput) {
-        self.engine.abandon_step(sched);
+    fn abandon_step(&mut self, sched: &SchedulerOutput) -> Vec<String> {
+        self.engine.abandon_step(sched)
     }
 
     fn async_scheduling(&self) -> bool {
@@ -707,5 +720,135 @@ mod tests {
         let (outputs, _) = client.get_output().unwrap().into_tuple();
         assert!(!outputs.outputs.is_empty());
         client.shutdown().unwrap();
+    }
+
+    /// An executor whose head drafts two tokens for every request it runs for, and that pipelines
+    /// speculative steps, so a verify step that drafts again leads. Its `fail_at`-th step fails.
+    struct DraftingExecutor {
+        inner: NoopExecutor,
+        steps: usize,
+        fail_at: usize,
+    }
+
+    impl Executor for DraftingExecutor {
+        fn set_stop_token_ids(&mut self, stop_token_ids: &[u32]) {
+            self.inner.set_stop_token_ids(stop_token_ids);
+        }
+
+        fn pipelines_speculative_steps(&self) -> bool {
+            true
+        }
+
+        fn execute_model(&mut self, sched: &SchedulerOutput) -> EngineResult<ModelRunnerOutput> {
+            self.steps += 1;
+            if self.steps == self.fail_at {
+                return Err(EngineError::Executor(
+                    "simulated forward pass failure".into(),
+                ));
+            }
+            let mut output = self.inner.execute_model(sched)?;
+            let drafts = sched.draft_req_ids.iter().map(|r| (r.clone(), vec![7, 8]));
+            output.draft_token_ids = Some(drafts.collect());
+            Ok(output)
+        }
+
+        fn initialize_cache(&mut self, gpu: usize, cpu: usize) -> EngineResult<()> {
+            self.inner.initialize_cache(gpu, cpu)
+        }
+
+        fn determine_available_memory(&mut self) -> EngineResult<Vec<usize>> {
+            self.inner.determine_available_memory()
+        }
+
+        fn shutdown(&mut self) {
+            self.inner.shutdown();
+        }
+    }
+
+    /// A step the pipeline fails is released: it leads no more, so a request added after it is
+    /// admitted, and the failed step's request is aborted, so a later call does not drive it on
+    /// (#575: an `LLM` reused after a failed call stopped admitting requests).
+    #[test]
+    fn a_failed_pipelined_step_is_released() {
+        let mut config = make_test_config();
+        config.async_scheduling = true;
+        config.scheduler_config.async_scheduling = Some(true);
+        config.use_spec_decode = true;
+        config.proposer_config = Some(crate::spec_decode::ProposerConfig::Mtp(
+            crate::spec_decode::MtpProposerConfig {
+                num_speculative_tokens: 2,
+                max_seqs: 2,
+                max_model_len: 4096,
+            },
+        ));
+        let greedy = |id: &str| EngineCoreRequest {
+            sampling_params: Some(SamplingParams {
+                max_tokens: Some(50),
+                temperature: 0.0,
+                ..Default::default()
+            }),
+            ..make_ec_request(id, 4)
+        };
+        // Step 1 is "a"'s prompt, which drafts; step 2 verifies those drafts and drafts again, so
+        // it leads.
+        let executor = DraftingExecutor {
+            inner: NoopExecutor::new(1024),
+            steps: 0,
+            fail_at: 2,
+        };
+        let mut client = InprocClient::new(config, Box::new(executor));
+        client.start_pipeline();
+
+        client.add_request(greedy("a")).unwrap();
+        let (outputs, _) = client.get_output().unwrap().into_tuple();
+        assert_eq!(outputs.outputs[0].request_id, "a", "the prompt step");
+        assert!(client.get_output().is_err(), "the leading verify fails");
+        for _ in 0..8 {
+            if !client.has_unfinished_requests() {
+                break;
+            }
+            let _ = client.get_output();
+        }
+        assert!(
+            !client.has_unfinished_requests(),
+            "the failed step's request is aborted"
+        );
+
+        client.add_request(greedy("b")).unwrap();
+        let outcome = client.get_output().unwrap();
+        let StepOutcome::Progressed { outputs, .. } = outcome else {
+            panic!("b is admitted: {outcome:?}");
+        };
+        assert_eq!(outputs.outputs[0].request_id, "b");
+    }
+
+    /// The synchronous path — an engine that never starts the pipeline, as one without async
+    /// scheduling — releases a failed step the same way: its request is aborted, so a later call
+    /// does not drive it on, and a request added after it runs.
+    #[test]
+    fn a_failed_sync_step_is_released() {
+        // Without a proposer, the executor's drafts go unread: it only fails its second step.
+        let executor = DraftingExecutor {
+            inner: NoopExecutor::new(1024),
+            steps: 0,
+            fail_at: 2,
+        };
+        let mut client = InprocClient::new(make_test_config(), Box::new(executor));
+
+        client.add_request(make_ec_request("a", 4)).unwrap();
+        let (outputs, _) = client.get_output().unwrap().into_tuple();
+        assert_eq!(outputs.outputs[0].request_id, "a", "the prompt step");
+        assert!(client.get_output().is_err(), "the decode step fails");
+        assert!(
+            !client.has_unfinished_requests(),
+            "the failed step's request is aborted"
+        );
+
+        client.add_request(make_ec_request("b", 4)).unwrap();
+        let outcome = client.get_output().unwrap();
+        let StepOutcome::Progressed { outputs, .. } = outcome else {
+            panic!("b runs: {outcome:?}");
+        };
+        assert_eq!(outputs.outputs[0].request_id, "b");
     }
 }

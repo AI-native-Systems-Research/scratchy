@@ -5,7 +5,8 @@
 // outcome and the device copies the one that happened, at the head of the step's command buffer.
 //
 // One threadgroup per op: `len` words of its source from word `*sel * stride` — variants `stride`
-// words apart, overlapping where `stride < len` — to `dst`. The source is an earlier step's output
+// words apart, overlapping where `stride < len` — to `dst`. `*sel` is clamped to its `variants`: it
+// is a word an earlier command buffer wrote, and one that failed leaves a stale one. The source is an earlier step's output
 // (`src`), or a table in the step's staged region, `src_at` bytes in (`src` null); `src`, `dst` and
 // `sel` are addresses of buffers the step's residency holds.
 //
@@ -20,7 +21,7 @@ struct SelectOp {
   uint src_at;
   uint stride;
   uint len;
-  uint pad;
+  uint variants;
   device const uint* src;
   device uint* dst;
   device const uint* sel;
@@ -35,7 +36,7 @@ kernel void select_rows(
 {
   const SelectOp o = ops[op];
   device const uint* base = o.src ? o.src : (device const uint*)(region + o.src_at);
-  device const uint* from = base + ulong(*o.sel) * o.stride;
+  device const uint* from = base + ulong(min(*o.sel, o.variants - 1)) * o.stride;
   for (uint i = tid; i < o.len; i += tg) {
     o.dst[i] = from[i];
   }

@@ -31,13 +31,17 @@ use crate::charts::{
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab};
 use data::{At, Bytes, Cell, Model, Run, Scenario};
 use numbers::{
-    DASH, Engine, FAILED, Metric, NO_STREAM, NOISE, Startup, cfmt, failed, fmt, lfmt, marks,
-    marks_note, med, served, timing,
+    BELOW_WEIGHTS, DASH, Engine, FAILED, Metric, NO_STREAM, NOISE, SHORT, Startup, cfmt,
+    failed_note, fmt, lfmt, marks, marks_note, med, peak_rss, rss_fmt, served, timing,
 };
 
 /// The run files, relative to site/; copied to the same place under _site/,
 /// where each run table links to its own.
 pub const DATA: &str = "data/metal";
+/// Runs only the tests read: earlier rounds the page no longer shows, kept for the cases they
+/// hold (a dead server's cells, a run before #510 counted failures).
+#[cfg(test)]
+const TESTDATA: &str = "testdata/metal";
 
 // --------------------------------------------------------------------- load
 
@@ -86,10 +90,14 @@ fn load(site: &Site) -> Result<Vec<Run>, String> {
                 m.model_id
             ));
         }
+        run.mark_dead();
+        run.mark_short();
+        run.mark_mem_below_weights();
         run.file = f;
         runs.push(run);
     }
     if errors.is_empty() {
+        borrow_earlier(&mut runs);
         Ok(runs)
     } else {
         Err(errors
@@ -97,6 +105,96 @@ fn load(site: &Site) -> Result<Vec<Run>, String> {
             .map(|e| format!("metal page: {e}"))
             .collect::<Vec<_>>()
             .join("\n"))
+    }
+}
+
+/// Prompts, users counts and answer lengths of a run's users × prompt maps, and its base cell.
+type Compared<'a> = (Vec<u32>, Vec<u32>, Vec<u32>, Option<&'a data::Base>);
+
+/// The cells two runs' heat maps and users curve compare scratchy at: the users × prompt map at
+/// each answer length run above 1 user, and the base cell. Equal for two runs whose numbers line
+/// up, whatever else either swept.
+fn compared_cells(run: &Run) -> Option<Compared<'_>> {
+    let sc = run.config.scaling.as_ref()?;
+    let users = sc.grid_conc.clone().unwrap_or_default();
+    // Runs from before `grid_users_output` ran every answer length at every users count.
+    let answers = (sc.grid_users_output.clone())
+        .or_else(|| sc.grid_output.clone())
+        .unwrap_or_default();
+    Some((
+        sc.grid_input.clone().unwrap_or_default(),
+        users,
+        answers,
+        sc.base.as_ref(),
+    ))
+}
+
+/// Fill each model's newest numbers on a machine from its earlier runs there, where a run left
+/// them out: a run of scratchy alone keeps the other engines' last numbers, and a run without the
+/// frozen rung keeps scratchy's last frozen launches. Each one filled in is recorded in
+/// [`Model::borrowed`] with the run it came from, which the page shows beside it.
+///
+/// Every run keeps what it measured. A later run that left an engine out shows that engine's
+/// newest earlier numbers, when that earlier run measured the cells this one compares
+/// ([`compared_cells`]): a run of another shape (other prompts, users counts or answer lengths
+/// across users) measured other cells, and its numbers stay with it. A full run's 512- and
+/// 2048-token answers at 1 user are not compared by a quick run, so they do not stop it
+/// borrowing. scratchy's own scaling cells and its cold and warm launches are never
+/// filled: they are always the run's own, so scratchy is only ever compared with itself across
+/// runs by the previous-run badges. Its frozen launches have no shape and are filled whatever the
+/// grid.
+fn borrow_earlier(runs: &mut [Run]) {
+    let mut order: Vec<usize> = (0..runs.len()).collect();
+    order.sort_by(|&a, &b| runs[a].generated_utc.cmp(&runs[b].generated_utc));
+    let shapes: Vec<_> = runs.iter().map(compared_cells).collect();
+    let shape_of: Vec<usize> = (0..runs.len())
+        .map(|i| (0..=i).find(|&j| shapes[j] == shapes[i]).unwrap_or(i))
+        .collect();
+    // Per (machine, model): each engine's numbers, with when and the shape they were measured at,
+    // and scratchy's frozen launches, with when, as last measured.
+    type Measured = (
+        Option<Vec<data::Rep>>,
+        Option<Vec<data::Cell>>,
+        data::Utc,
+        usize,
+    );
+    let mut engines: BTreeMap<(String, String, &str), Measured> = BTreeMap::new();
+    let mut frozen: BTreeMap<(String, String), (Vec<data::Rep>, data::Utc)> = BTreeMap::new();
+    for i in order {
+        let run = &mut runs[i];
+        let (chip, when) = (
+            run.machine.chip.as_str().to_string(),
+            run.generated_utc.clone(),
+        );
+        for m in &mut run.models {
+            let at = (chip.clone(), m.stem.clone());
+            for e in Engine::RIVALS {
+                let key = (at.0.clone(), at.1.clone(), e.key());
+                let (ladder, cells) = e.fields_mut(m);
+                let measured = ladder.as_ref().is_some_and(|l| !l.is_empty())
+                    || cells.as_ref().is_some_and(|c| !c.is_empty());
+                if measured {
+                    let mine = (ladder.clone(), cells.clone(), when.clone(), shape_of[i]);
+                    engines.insert(key, mine);
+                } else if let Some((l, c, from, shape)) = engines.get(&key)
+                    && *shape == shape_of[i]
+                {
+                    (*ladder, *cells) = (l.clone(), c.clone());
+                    m.borrowed.insert(e.key().to_string(), from.clone());
+                }
+            }
+            let own: Vec<data::Rep> = (Engine::Scratchy.ladder(m).iter())
+                .filter(|r| r.scenario == Scenario::Frozen)
+                .cloned()
+                .collect();
+            if !own.is_empty() {
+                frozen.insert(at, (own, when.clone()));
+            } else if let Some((reps, from)) = frozen.get(&at).filter(|_| served(m)) {
+                (m.cache_ladder.get_or_insert_with(Vec::new)).extend(reps.iter().cloned());
+                m.borrowed
+                    .insert(data::BORROWED_FROZEN.to_string(), from.clone());
+            }
+        }
     }
 }
 
@@ -182,7 +280,26 @@ fn index(runs: &[Run]) -> BTreeMap<&str, MachineRuns<'_>> {
     machines
 }
 
+/// The machines in page order: smallest memory first, then by chip name, so a row reads up from
+/// the small set's Macs to the large set's.
+fn in_order<'a>(machines: &BTreeMap<&'a str, MachineRuns<'a>>) -> Vec<&'a str> {
+    let memory = |chip: &str| {
+        machines[chip].runs[machines[chip].runs.len() - 1]
+            .machine
+            .memory_gb
+    };
+    let mut chips: Vec<&str> = machines.keys().copied().collect();
+    chips.sort_by_key(|&c| (memory(c), c));
+    chips
+}
+
 // ------------------------------------------------------------------- render
+
+/// A grey tag on a number an earlier run measured, saying when ([`Model::borrowed`]).
+fn from_run(when: &data::Utc) -> Element {
+    let day = when.month_day();
+    rsx! { Tag { kind: TagKind::Gray, title: "measured by an earlier run, on {day}: this run did not measure it", "from {day}" } }
+}
 
 /// A change badge against the previous run: a Carbon tag, green better, red
 /// worse, grey inside the noise band. The arrow and the tag's title say it
@@ -220,7 +337,7 @@ fn summary_raw(m: &Model, run: &Run) -> [(Option<f64>, bool); 8] {
         (timing(one, Metric::Ttft), false),
         (timing(one, Metric::Tpot), false),
         (timing(one, Metric::Throughput), true),
-        (med(ladder, Scenario::Cold, Startup::PeakRss), false),
+        (peak_rss(m, Engine::Scratchy, Scenario::Cold).mib(), false),
     ]
 }
 
@@ -262,7 +379,8 @@ fn base_of(run: &Run, m: &Model) -> (Option<u32>, Option<u32>, Option<u32>) {
 
 /// Where a model's users numbers come from: the separate users sweep at the
 /// base shape (older runs, or `--scale-axes conc`), else the grid's own users
-/// dimension at its middle cell (#349).
+/// dimension (#349), at the base prompt where the grid ran it (its middle one
+/// otherwise) and the answer length it ran at every users count.
 #[derive(Clone, Copy, PartialEq)]
 enum UsersFrom {
     Sweep,
@@ -279,10 +397,15 @@ fn users_from(m: &Model, run: &Run) -> UsersFrom {
     }
     let sc = run.config.scaling.as_ref();
     let mid = |v: Option<&Vec<u32>>| v.filter(|v| !v.is_empty()).map(|v| v[v.len() / 2]);
-    match (
-        mid(sc.and_then(|s| s.grid_input.as_ref())),
-        mid(sc.and_then(|s| s.grid_output.as_ref())),
-    ) {
+    let ins = sc.and_then(|s| s.grid_input.as_ref());
+    let base = base_of(run, m)
+        .0
+        .filter(|b| ins.is_some_and(|i| i.contains(b)));
+    let output = match sc.and_then(|s| s.grid_users_output.as_ref()) {
+        Some(_) => Some(glance_answer(run)),
+        None => mid(sc.and_then(|s| s.grid_output.as_ref())),
+    };
+    match (base.or_else(|| mid(ins)), output) {
         (Some(input), Some(output)) => UsersFrom::Grid { input, output },
         _ => UsersFrom::Sweep,
     }
@@ -420,13 +543,12 @@ fn served_as(m: &Model, e: Engine) -> Option<String> {
         }
         None => return None,
     };
-    // The MLX engines serve scratchy's own checkpoint: nothing to add.
+    // The MLX engines serve scratchy's own checkpoint (`Engine::serves_mlx_checkpoint`): nothing to
+    // add. The others serve their own build, named here.
     let model = match e {
+        _ if e.serves_mlx_checkpoint() => None,
         Engine::Ollama => model,
-        Engine::LlamaCpp | Engine::Mistralrs => {
-            model.map(|m| m.rsplit(':').next().unwrap_or_default().to_string())
-        }
-        _ => None,
+        _ => model.map(|m| m.rsplit(':').next().unwrap_or_default().to_string()),
     };
     let parts: Vec<String> = [model, quant]
         .into_iter()
@@ -439,11 +561,23 @@ fn served_as(m: &Model, e: Engine) -> Option<String> {
 /// The parity gate's verdict for the model line: scratchy and mlx-lm must
 /// give the same greedy answers before anything is timed. None for runs from
 /// before the gate.
-fn parity(m: &Model) -> Option<&'static str> {
-    m.parity_mlx_lm.map(|p| match p {
-        Some(true) => "output matches mlx-lm",
-        Some(false) => "output does not match mlx-lm",
-        None => "output not checked (no mlx-lm)",
+fn parity(m: &Model) -> Option<String> {
+    m.parity_mlx_lm.map(|p| match (p, &m.parity_skipped) {
+        (None, Some(why)) => format!("output not checked against mlx-lm: {why}"),
+        (Some(true), _) => match &m.parity_ties {
+            Some(ties) if !ties.is_empty() => {
+                let (n, max) = (ties.values().flatten())
+                    .fold((0, 0.0_f64), |(n, max), &g| (n + 1, max.max(g)));
+                format!(
+                    "output matches mlx-lm up to {n} near-tie token{} (at most {max:.2} logits \
+                     behind mlx-lm's top)",
+                    if n == 1 { "" } else { "s" }
+                )
+            }
+            _ => "output matches mlx-lm".to_string(),
+        },
+        (Some(false), _) => "output does not match mlx-lm".to_string(),
+        (None, None) => "output not checked (no mlx-lm)".to_string(),
     })
 }
 
@@ -452,8 +586,10 @@ fn parity_info() -> Element {
         "",
         rsx! {
             "Before anything is timed, scratchy and mlx-lm answer the same short prompts with greedy decoding, \
-             and the answers must match exactly. A mismatch points at a wrong load path (quant preset, group \
-             size, dequant), so that model is not timed at all."
+             and the answers must match. Where they part, mlx-lm is run over scratchy's own answer and judges \
+             each token scratchy picked: one within a logit of mlx-lm's top is a near-tie two correct stacks \
+             break differently, and passes. A token further behind points at a wrong load path (quant preset, \
+             group size, dequant), so that model is not timed at all."
         },
     )
 }
@@ -482,8 +618,11 @@ fn timing_info() -> Element {
             strong { "no stream" } ": the answer arrived in one piece, so TTFT and TPOT could not be timed. "
             strong { "†" } ": some answers did; the timing comes from the rest (the table views say how many). "
             strong { "{FAILED}" } ": some requests failed (an error or a timeout, usually the engine running out of \
-                       memory), so every number in that cell covers only the rest. mlx-lm and ollama can stop \
-                       answers early, which flatters tok/s."
+                       memory), so every number in that cell covers only the rest. "
+            strong { "{SHORT}" } ": the answers came back short of the tokens asked for. Every request asks the \
+                       engine to ignore EOS and answer to length; oMLX, ollama and sometimes mlx-lm stop at EOS \
+                       anyway, so the cell measured less decode than its label says, which flatters tok/s (the \
+                       table views say what share)."
         },
     )
 }
@@ -491,7 +630,12 @@ fn timing_info() -> Element {
 fn rss_info() -> Element {
     info(
         "",
-        rsx! { "The server process at its peak. For ollama, " code { "ollama serve" } " only; its runner process is not counted." },
+        rsx! {
+            "The server process at its peak. For ollama, " code { "ollama serve" } " only; its runner process is not counted. "
+            strong { "{BELOW_WEIGHTS}" } ": less than the model's own weights. A process serving the model holds at \
+                       least those, so the reading can't be all of its memory, and is left out (#414). The same rule \
+                       leaves out a peak-memory reading on the prompt-length chart."
+        },
     )
 }
 
@@ -518,6 +662,13 @@ fn about() -> Element {
 
 fn opt(v: Option<u32>) -> String {
     v.map_or("?".to_string(), |v| v.to_string())
+}
+
+/// Counts written as a list: `1, 2, 4`.
+fn counts(v: &[u32]) -> String {
+    (v.iter().map(u32::to_string))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn headers<const N: usize>(names: [&str; N]) -> Vec<String> {
@@ -570,8 +721,8 @@ fn summary_table(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
             lfmt(ladder, Scenario::Warm, Startup::FirstToken, 0, 1000.0),
             cfmt(one, Metric::Ttft),
             cfmt(one, Metric::Tpot),
-            fmt(timing(one, Metric::Throughput), 1) + if failed(one) > 0 { FAILED } else { "" },
-            fmt(med(ladder, Scenario::Cold, Startup::PeakRss), 0),
+            cfmt(one, Metric::Throughput),
+            rss_fmt(m, e, Scenario::Cold),
         ];
         let now = summary_raw(m, run);
         let then = prev
@@ -582,12 +733,21 @@ fn summary_table(m: &Model, run: &Run, prev: Option<Entry>) -> Element {
             None => e.label().to_string(),
             Some(s) => format!("{} ({s})", e.label()),
         };
+        // Numbers an earlier run measured say when; a borrowed value has no change to show.
+        let from = m.borrowed.get(e.key());
+        let frozen_from = (e == Engine::Scratchy)
+            .then(|| m.borrowed.get(data::BORROWED_FROZEN))
+            .flatten();
         Some(rsx! {
             TableRow {
-                TableCell { "{name}" }
+                TableCell { "{name}" if let Some(w) = from { " " {from_run(w)} } }
                 for (i, v) in vals.iter().enumerate() {
                     TableCell { "{v} "
-                        if let Some(then) = then { {delta(now[i].0, then[i].0, now[i].1)} }
+                        if i == 0 && let Some(w) = frozen_from {
+                            {from_run(w)}
+                        } else if let Some(then) = then {
+                            {delta(now[i].0, then[i].0, now[i].1)}
+                        }
                     }
                 }
             }
@@ -913,20 +1073,18 @@ fn sweep_part<'a>(m: &'a Model, run: &Run, prev: Option<Entry<'a>>, sweep: Sweep
             })
             .filter(|(_, ss)| ss.iter().any(|s| s.class != "prev"))
             .collect();
-        // Who has no line here, and why: no cells at this sweep (failed, or
-        // not measured), or cells that never streamed. Named for the side
-        // that is missing, scratchy included.
-        let (no_cells, no_stream): (Vec<&str>, Vec<&str>) = ran
-            .iter()
-            .filter(|(_, cs)| !plotted(cs))
-            .fold((Vec::new(), Vec::new()), |(mut nc, mut ns), (e, cs)| {
-                if cs.is_empty() {
-                    nc.push(e.label())
-                } else {
-                    ns.push(e.label())
-                }
-                (nc, ns)
-            });
+        // Each engine not plotted, by why: no cells at all, every cell from a server that had
+        // stopped answering, or cells whose answers never streamed.
+        let (mut no_cells, mut dead, mut no_stream) = (Vec::new(), Vec::new(), Vec::new());
+        for (e, cs) in ran.iter().filter(|(_, cs)| !plotted(cs)) {
+            if cs.is_empty() {
+                no_cells.push(e.label())
+            } else if cs.values().all(|c| c.dead) {
+                dead.push(e.label())
+            } else {
+                no_stream.push(e.label())
+            }
+        }
         rsx! {
             Stack { gap: 2,
                 strong { "{title}" }
@@ -936,6 +1094,9 @@ fn sweep_part<'a>(m: &'a Model, run: &Run, prev: Option<Entry<'a>>, sweep: Sweep
                             {bar_chart(ss, &xs, (t.as_str(), ylabel), sweep, "200px", &format!("{title}, scratchy {t}"))}
                         }
                     }
+                }
+                if !dead.is_empty() {
+                    p { "{dead.join(\", \")}: the server had stopped answering, so every request failed; not plotted." }
                 }
                 if !no_stream.is_empty() {
                     p { "{no_stream.join(\", \")}: {NO_STREAM}, not plotted." }
@@ -1071,7 +1232,7 @@ struct ShapeGrid<'a> {
     down: Vec<u32>,
     across: Vec<u32>,
     have: Vec<(Engine, ByShape<'a>)>,
-    /// The headline comparison: the first of Engine::RIVALS the run has.
+    /// The headline comparison: the first of Engine::RIVALS with a live cell here.
     rival: Option<Engine>,
     /// Every engine the run has a grid for, the rival first.
     present: Vec<Engine>,
@@ -1104,20 +1265,25 @@ fn glance_users(m: &Model, run: &Run) -> u32 {
     }
 }
 
-/// The answer length the overview's heat maps show every grid at: a
-/// typical reply's.
-const GLANCE_ANSWER: u32 = 128;
+/// The answer length the overview's heat maps show a run's grid at: the one it ran at every users
+/// count (`grid_users_output`, 64 tokens since that field), else the 128 of the runs before it.
+fn glance_answer(run: &Run) -> u32 {
+    (run.config.scaling.as_ref())
+        .and_then(|s| s.grid_users_output.as_ref())
+        .and_then(|os| os.first().copied())
+        .unwrap_or(128)
+}
 
-/// A run's grid answer lengths: the overview's first, then the rest,
-/// shortest first.
+/// A run's grid answer lengths across its users counts, each a users × prompt
+/// map: the overview's first, then the rest, shortest first. A run that ran
+/// some lengths only at 1 user (`grid_users_output`) has no map for those.
 fn grid_answers(run: &Run) -> Vec<u32> {
-    let mut os = run
-        .config
-        .scaling
-        .as_ref()
-        .and_then(|s| s.grid_output.clone())
+    let sc = run.config.scaling.as_ref();
+    let mut os = (sc.and_then(|s| s.grid_users_output.clone()))
+        .or_else(|| sc.and_then(|s| s.grid_output.clone()))
         .unwrap_or_default();
-    os.sort_unstable_by_key(|&o| (o != GLANCE_ANSWER, o));
+    let glance = glance_answer(run);
+    os.sort_unstable_by_key(|&o| (o != glance, o));
     os.dedup();
     os
 }
@@ -1128,7 +1294,9 @@ impl<'a> ShapeGrid<'a> {
         let base = base_of(run, m).2.unwrap_or(0);
         let sc = run.config.scaling.as_ref()?;
         let (ins, outs) = (
-            sc.grid_input.clone().unwrap_or_default(),
+            (sc.grid_input.iter().flatten().copied())
+                .filter(|&i| sc.max_prompt.is_none_or(|max| i <= max))
+                .collect::<Vec<_>>(),
             sc.grid_output.clone().unwrap_or_default(),
         );
         let (down, across) = match slice {
@@ -1161,8 +1329,13 @@ impl<'a> ShapeGrid<'a> {
             .into_iter()
             .filter(|&e| !g.cells(e).is_empty())
             .collect();
+        // The headline comparison is the first rival with a live cell: one whose server stopped
+        // answering for the whole slice has nothing to compare against, while a later one does.
+        let rival = (present.iter().copied())
+            .find(|&e| g.cells(e).values().any(|c| !c.dead))
+            .or(present.first().copied());
         Some(ShapeGrid {
-            rival: present.first().copied(),
+            rival,
             present,
             ..g
         })
@@ -1266,9 +1439,10 @@ impl Trend {
         match self {
             Trend::UsersDecode | Trend::UsersPrefill => {
                 let mine = by_users(m, run, Engine::Scratchy);
+                // The first rival with a live cell along users, as `ShapeGrid::of` picks.
                 let rival = Engine::RIVALS
                     .into_iter()
-                    .find(|&e| !by_users(m, run, e).is_empty())?;
+                    .find(|&e| by_users(m, run, e).values().any(|c| !c.dead))?;
                 let theirs = by_users(m, run, rival);
                 let pts = mine
                     .iter()
@@ -1293,15 +1467,20 @@ impl Trend {
                 let pts = along
                     .iter()
                     .map(|&a| {
-                        let at = |e: Engine| {
-                            geometric_mean(across.iter().filter_map(|&b| {
-                                timing(g.at(Some(e), if prompt { (a, b) } else { (b, a) }), metric)
-                            }))
-                        };
+                        // Only the rungs both engines measured: averaging each over its own would
+                        // compare different cells, and a dead or unstreamed cell left out of one
+                        // side would move that side's mean alone.
+                        let both: Vec<(f64, f64)> = (across.iter())
+                            .filter_map(|&b| {
+                                let at = if prompt { (a, b) } else { (b, a) };
+                                let value = |e: Engine| timing(g.at(Some(e), at), metric);
+                                Some((value(Engine::Scratchy)?, value(rival)?))
+                            })
+                            .collect();
                         Step {
                             x: f64::from(a),
-                            scratchy: at(Engine::Scratchy),
-                            rival: at(rival),
+                            scratchy: geometric_mean(both.iter().map(|&(s, _)| s)),
+                            rival: geometric_mean(both.iter().map(|&(_, r)| r)),
                             highlight: false,
                         }
                     })
@@ -1385,12 +1564,13 @@ fn mark(metric: Metric, cells: &[Option<&Cell>]) -> String {
     out
 }
 
-/// Why a cell has no ratio.
+/// Why a cell has no ratio: not measured, measured a server that had stopped answering, or never
+/// streamed.
 fn why(c: Option<&Cell>, name: &str) -> String {
-    if c.is_some() {
-        format!("{name}: {NO_STREAM}")
-    } else {
-        format!("no {name}")
+    match c {
+        None => format!("no {name}"),
+        Some(c) if c.dead => format!("{name}: {}", failed_note(Some(c))),
+        Some(_) => format!("{name}: {NO_STREAM}"),
     }
 }
 
@@ -1554,6 +1734,16 @@ fn grid_maps(m: &Model, mid: &str, run: &Run) -> Element {
         rsx! {
             "Users at once down the side, fewest first; prompt size across the bottom, shortest first. One grid \
              per answer length: {answers} tokens."
+            if let Some(max) = run.config.scaling.as_ref().and_then(|s| s.max_prompt) {
+                " Prompts longer than {max} tokens were not run: this Mac's memory does not hold them."
+            }
+            if let Some(max) = run.config.scaling.as_ref().and_then(|s| s.max_prompt_users) {
+                " Above 1 user, prompts longer than {max} tokens were not run either: their blank squares were \
+                 left out for memory, not measured."
+            }
+            if let Some(u) = run.config.scratchy_memory_util {
+                " scratchy ran at --gpu-memory-utilization {u} for this Mac's memory."
+            }
         },
         rsx! {
             Stack { gap: 6,
@@ -1565,6 +1755,151 @@ fn grid_maps(m: &Model, mid: &str, run: &Run) -> Element {
 
 fn commit(run: &Run) -> Element {
     rsx! { a { href: "{REPO}/commit/{run.repo.sha}", code { "{run.repo.sha8()}" } } }
+}
+
+/// The numbers a model's timeline follows across its runs on a machine: its one-user throughput
+/// and time to first token at the base cell, each run's own.
+const TIMELINE_METRICS: [(Metric, &str); 2] = [
+    (Metric::Throughput, "tok/s, 1 user"),
+    (Metric::Ttft, "TTFT ms, 1 user"),
+];
+
+/// A timeline's steps at one metric: a step a run, scratchy's value and the rival's where that
+/// run measured each itself.
+fn timeline_steps(kept: &[&Entry], rival: Option<Engine>, metric: Metric) -> Vec<Step> {
+    (kept.iter().enumerate())
+        // A power of two a run: the sparkline's x axis is a log one, so runs at 1, 2, 3, ...
+        // would crowd the newest to the right edge. The spyre timeline spaces its sweeps so too.
+        .map(|(i, e)| Step {
+            x: 2f64.powi(i as i32),
+            scratchy: timing(own_cell(e, Engine::Scratchy), metric),
+            rival: rival.and_then(|r| timing(own_cell(e, r), metric)),
+            highlight: false,
+        })
+        .collect()
+}
+
+/// A timeline's two labelled ×-factors. Where scratchy started: the first run that measured
+/// both, since a quick run's borrowed rival is no point of its own and the carry runs only
+/// forward. Where it stands: the newest run scratchy measured, against the rival carried to it.
+fn timeline_highlights(steps: &mut [Step]) {
+    let measured = |s: &Step| s.scratchy.is_some();
+    let both = |s: &Step| s.scratchy.is_some() && s.rival.is_some();
+    if let Some(first) = steps.iter().position(both) {
+        steps[first].highlight = true;
+    }
+    if let Some(last) = steps.iter().rposition(measured) {
+        steps[last].highlight = true;
+    }
+}
+
+/// An engine's one-user cell in a run, where that run measured it itself (not borrowed).
+fn own_cell<'a>(e: &Entry<'a>, engine: Engine) -> Option<&'a Cell> {
+    (engine == Engine::Scratchy || !e.m.borrowed.contains_key(engine.key()))
+        .then(|| by_users(e.m, e.run, engine).get(&1).copied())
+        .flatten()
+}
+
+/// A model's timelines over its runs on a machine, oldest first, one a metric
+/// ([`TIMELINE_METRICS`]): scratchy's line and the first rival any run measured, each a run's own
+/// measurement. A rival a run borrowed ([`Model::borrowed`]) is no measurement of that run's, so
+/// its line continues dotted there, carried from the last run that measured it. Runs whose
+/// one-user cell is at another shape (another answer length) measured something else, so a
+/// timeline keeps the newest run's shape. The fill carries its ×-factor at the first and the last
+/// run, as the spyre page's do: where scratchy started, and where it stands. Empty with fewer than
+/// two runs: one point is not a line.
+fn model_timelines(entries: &[Entry]) -> Vec<(&'static str, Element)> {
+    let Some(newest) = entries.last() else {
+        return Vec::new();
+    };
+    let shape = users_shape(newest.m, newest.run);
+    let kept: Vec<&Entry> = (entries.iter())
+        .filter(|e| users_shape(e.m, e.run) == shape)
+        .collect();
+    if kept.len() < 2 {
+        return Vec::new();
+    }
+    let rival = Engine::RIVALS
+        .into_iter()
+        .find(|&r| kept.iter().any(|e| own_cell(e, r).is_some()));
+    let names: Vec<String> = (kept.iter())
+        .map(|e| e.run.generated_utc.month_day().to_string())
+        .collect();
+    let rival_side = rival.unwrap_or(Engine::Scratchy).side();
+    let against = rival.map_or("alone".to_string(), |r| format!("against {}", r.label()));
+    TIMELINE_METRICS
+        .iter()
+        .map(|&(metric, value)| {
+            let mut steps = timeline_steps(&kept, rival, metric);
+            timeline_highlights(&mut steps);
+            let chart = sparkline(
+                &steps,
+                SparkAxes {
+                    better: metric.better(),
+                    along: "run",
+                    value,
+                    carry: true,
+                },
+                Engine::Scratchy.side(),
+                rival_side,
+                Some(names.clone()),
+                "5rem",
+                &format!("{value} over its runs, scratchy {against}"),
+            );
+            (value, chart)
+        })
+        .collect()
+}
+
+/// The Over time section's charts, titled: none until some model of the current lineup has two
+/// runs of one shape on one machine. Only the current lineup, as in the overview ([`lineup`]): a
+/// model an older round ran keeps its runs in its machine's own section.
+fn over_time_charts(machines: &BTreeMap<&str, MachineRuns>) -> Vec<(String, Element)> {
+    let classes = lineup(machines).map_or(&[][..], |l| l.classes);
+    let current = |stem: &str| classes.iter().any(|c| c.small == stem || c.large == stem);
+    let mut charts = Vec::new();
+    for chip in in_order(machines) {
+        for (stem, entries) in machines[chip].models.iter().filter(|(s, _)| current(s)) {
+            for (value, chart) in model_timelines(entries) {
+                charts.push((format!("{chip} · {stem} · {value}"), chart));
+            }
+        }
+    }
+    charts
+}
+
+/// The Over time section: every machine's models over their runs, a small timeline a machine,
+/// model and metric, as the spyre page shows its cells. Nothing until some model has two runs of
+/// one shape on one machine.
+fn over_time(charts: Vec<(String, Element)>) -> Element {
+    if charts.is_empty() {
+        return rsx! {};
+    }
+    let grid = "display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); \
+                column-gap: 1.5rem; row-gap: 1.25rem; align-items: start";
+    rsx! {
+        Section { id: "over-time", level: 2,
+            Stack { gap: 4,
+                Heading { "Over time" }
+                p {
+                    "Each model's one-user throughput and time to first token at its base cell, a \
+                     point a run on its Mac, oldest first, scratchy against the first engine any \
+                     run there measured. A run of scratchy alone (a quick run) takes the other \
+                     engine's line dotted, carried from the last run that measured it, and the fill \
+                     between the lines follows it. The fill is labelled with its ×-factor at the \
+                     first run and the newest: where scratchy started, and where it stands now."
+                }
+                div { style: "{grid}",
+                    for (title, chart) in charts {
+                        div {
+                            p { style: "font-size: 0.875rem; margin: 0 0 0.25rem", "{title}" }
+                            {chart}
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn history(entries: &[Entry]) -> Element {
@@ -1590,8 +1925,10 @@ fn history(entries: &[Entry]) -> Element {
                                     fmt(med(ladder, Scenario::Cold, Startup::Ready), 2),
                                     fmt(med(ladder, Scenario::Cold, Startup::FirstToken), 2),
                                     fmt(med(ladder, Scenario::Warm, Startup::FirstToken).map(|v| v * 1000.0), 0),
-                                    fmt(timing(one, Metric::Throughput), 1),
-                                    fmt(timing(many, Metric::Throughput), 1),
+                                    // Every cell's number through cfmt, so a dead or failed
+                                    // one carries its mark like the TPOT beside it.
+                                    cfmt(one, Metric::Throughput),
+                                    cfmt(many, Metric::Throughput),
                                     cfmt(many, Metric::Tpot),
                                 ];
                                 rsx! { for v in vals { TableCell { "{v}" } } }
@@ -1651,7 +1988,7 @@ struct Square<'a> {
     prompt: u32,
 }
 
-/// One overview heat map's ratios, at GLANCE_ANSWER: its prompt lengths, the
+/// One overview heat map's ratios, at its run's [`glance_answer`]: its prompt lengths, the
 /// rival, and each square's (users, prompt, how many times faster scratchy
 /// is).
 struct GlanceGrid {
@@ -1661,67 +1998,191 @@ struct GlanceGrid {
 }
 
 impl GlanceGrid {
-    /// A model's grid at a metric on a machine's latest run, with a row per
-    /// `users` count (those it did not run at left blank), or why none.
+    /// A model's grid at a metric on a machine's latest run, on the overview's users counts by
+    /// its prompts ([`Lineup`]), or why none.
     fn of(
         mr: &MachineRuns,
         stem: &str,
         metric: Metric,
         users: &[u32],
+        prompts: &[u32],
     ) -> Result<Self, &'static str> {
         let Entry { run, m } = mr.latest(stem).ok_or("not run")?;
-        let g = ShapeGrid::of(m, run, Slice::Answer(GLANCE_ANSWER)).ok_or("no grid")?;
-        let rival = g.rival.ok_or("nothing to compare")?;
-        let cells = users
-            .iter()
-            .flat_map(|&u| g.across.iter().map(move |&i| (u, i)))
+        let g = ShapeGrid::of(m, run, Slice::Answer(glance_answer(run))).ok_or("no grid")?;
+        let rival = g
+            .rival
+            .ok_or("scratchy alone so far: no engine to compare")?;
+        let cells = (users.iter())
+            .flat_map(|&u| prompts.iter().map(move |&i| (u, i)))
             .map(|(u, i)| (u, i, g.versus(metric, (u, i), rival).0))
             .collect();
         Ok(GlanceGrid {
-            prompts: g.across,
+            prompts: prompts.to_vec(),
             rival,
             cells,
         })
     }
 }
 
+/// The overview's two sets of Macs, by memory ([`Lineup`]): each runs its own models and its own
+/// users × prompt grid, so each gets heat maps of its own.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Set {
+    Small,
+    Large,
+}
+
+impl Set {
+    const ALL: [Set; 2] = [Set::Small, Set::Large];
+
+    fn of(memory_gb: u32, large_from_gb: u32) -> Set {
+        if memory_gb >= large_from_gb {
+            Set::Large
+        } else {
+            Set::Small
+        }
+    }
+
+    fn title(self, large_from_gb: u32) -> String {
+        match self {
+            Set::Small => format!("Below {large_from_gb} GB"),
+            Set::Large => format!("{large_from_gb} GB and up"),
+        }
+    }
+}
+
+/// A set's heat map shape: users at once down the side, prompt tokens across.
+#[derive(Default)]
+struct Shape {
+    users: Vec<u32>,
+    prompts: Vec<u32>,
+}
+
+impl Shape {
+    /// A run's users × prompt grid (`grid_conc`, `grid_input`), None for a run without one (a
+    /// `--no-scaling` run, or one from before the grid had its own users counts).
+    fn of(run: &Run) -> Option<Shape> {
+        let sc = run.config.scaling.as_ref()?;
+        Some(Shape {
+            users: sc.grid_conc.clone()?,
+            prompts: sc.grid_input.clone()?,
+        })
+    }
+}
+
+/// The overview's shape: a column per class of the lineup (`config.classes`), each Mac on the
+/// class's small model or, from `large_from_gb`, its large one, and each [`Set`] its own map
+/// shape. A square its run did not measure (a run of an older shape, or a prompt the Mac's memory
+/// did not hold) is blank.
+struct Lineup<'a> {
+    classes: &'a [data::Class],
+    large_from_gb: u32,
+    shapes: BTreeMap<Set, Shape>,
+}
+
+impl Lineup<'_> {
+    fn model(&self, class: &str, memory_gb: u32) -> Option<&str> {
+        (self.classes.iter())
+            .find(|c| c.class == class)
+            .map(|c| c.model(memory_gb, self.large_from_gb))
+    }
+
+    fn set(&self, memory_gb: u32) -> Set {
+        Set::of(memory_gb, self.large_from_gb)
+    }
+}
+
+/// The overview's [`Lineup`]: the classes and cut-off of the newest run that records a lineup, and
+/// per set the grid of the set's newest run that records a lineup too, else of its newest run with
+/// a grid at all, so a `--no-scaling` run does not empty the set's maps. None before any run
+/// records a lineup.
+fn lineup<'a>(machines: &BTreeMap<&str, MachineRuns<'a>>) -> Option<Lineup<'a>> {
+    let mut runs: Vec<&Run> = (machines.values())
+        .flat_map(|mr| mr.runs.iter().copied())
+        .collect();
+    runs.sort_by(|a, b| b.generated_utc.cmp(&a.generated_utc));
+    let newest = runs.iter().find(|r| r.config.classes.is_some())?;
+    // Runs from before `large_from_gb` split the sets at 64 GB.
+    let large_from_gb = newest.config.large_from_gb.unwrap_or(64);
+    let shapes = (Set::ALL.into_iter())
+        .map(|set| {
+            let mine = || {
+                (runs.iter()).filter(move |r| Set::of(r.machine.memory_gb, large_from_gb) == set)
+            };
+            let shape = (mine().filter(|r| r.config.classes.is_some()))
+                .find_map(|r| Shape::of(r))
+                .or_else(|| mine().find_map(|r| Shape::of(r)))
+                .unwrap_or_default();
+            (set, shape)
+        })
+        .collect();
+    Some(Lineup {
+        classes: newest.config.classes.as_deref()?,
+        large_from_gb,
+        shapes,
+    })
+}
+
 /// Every model's users-by-prompt grid on every machine as small multiples,
 /// one table per metric: a machine per row, a model per column, each cell that
 /// model's grid as a tiny heatmap coloured like the full ones.
 fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
-    let mut stems: Vec<&str> = Vec::new();
-    for mr in machines.values() {
-        for (stem, _) in &mr.models {
-            if !stems.contains(stem) {
-                stems.push(stem);
-            }
-        }
-    }
-    if stems.is_empty() {
+    // A column per architecture class ([`Lineup`]); each machine's row shows the class's model
+    // for its memory, the small set below the lineup's `large_from_gb` and the large one from it,
+    // run or not yet. A model an older round ran stays in its machine's own section, not here.
+    let Some(lineup) = lineup(machines) else {
+        return rsx! {};
+    };
+    let memory = |chip: &str| {
+        machines[chip].runs[machines[chip].runs.len() - 1]
+            .machine
+            .memory_gb
+    };
+    let model_of = |chip: &str, class: &str| lineup.model(class, memory(chip));
+    let classes: Vec<&str> = lineup.classes.iter().map(|c| c.class.as_str()).collect();
+    // Each machine's own row: (machine, model) for its set only, so another set's model it ran in
+    // an earlier round sets neither the intro's answer lengths nor the highlights.
+    let shown: Vec<(&str, &str)> = (machines.keys())
+        .flat_map(|&chip| {
+            (classes.iter()).filter_map(move |&class| Some((chip, model_of(chip, class)?)))
+        })
+        .collect();
+    if shown.is_empty() {
         return rsx! {};
     }
+    // The scaling and startup panels are a column per model: every model any row shows.
+    let mut stems: Vec<&str> = Vec::new();
+    for &(_, stem) in &shown {
+        if !stems.contains(&stem) {
+            stems.push(stem);
+        }
+    }
     let metrics = [(Metric::Ttft, "Prefill"), (Metric::Throughput, "Decode")];
-    // Every users count any shown grid ran at: every heat map rows by all of
-    // them, so the maps are one shape, and a run that measured fewer shows
-    // the rest blank, as not measured.
-    let users: Vec<u32> = machines
-        .values()
-        .flat_map(|mr| stems.iter().filter_map(|&stem| mr.latest(stem)))
-        .flat_map(|Entry { run, m }| grid_users(m, run))
-        .collect::<BTreeSet<u32>>()
-        .into_iter()
+    let shape = |chip: &str| &lineup.shapes[&lineup.set(memory(chip))];
+    // The answer lengths the maps are at: one, unless machines are on runs of different shapes.
+    let answers: BTreeSet<u32> = (shown.iter())
+        .filter_map(|&(chip, stem)| machines[chip].latest(stem))
+        .map(|Entry { run, .. }| glance_answer(run))
         .collect();
+    let answers = (answers.iter())
+        .map(|a| a.to_string())
+        .collect::<Vec<_>>()
+        .join("- and ");
     // Every grid's ratios first, keyed by machine, model and metric, or why
     // the grid has none: the highlights are picked from all of them.
     let mut grids: BTreeMap<(&str, &str, &str), Result<GlanceGrid, &str>> = BTreeMap::new();
-    for &chip in machines.keys() {
-        for &stem in &stems {
-            for (metric, name) in metrics {
-                grids.insert(
-                    (chip, stem, name),
-                    GlanceGrid::of(&machines[chip], stem, metric, &users),
-                );
-            }
+    for &(chip, stem) in &shown {
+        for (metric, name) in metrics {
+            grids.insert(
+                (chip, stem, name),
+                GlanceGrid::of(
+                    &machines[chip],
+                    stem,
+                    metric,
+                    &shape(chip).users,
+                    &shape(chip).prompts,
+                ),
+            );
         }
     }
     let squares: BTreeMap<Square, f64> = grids
@@ -1810,17 +2271,11 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
         let at = SparkAt { chip, stem, trend };
         trend_spark(at, &sparks[&at], "4.5rem")
     };
-    // Every prompt length any shown grid has: a grid with none of its own
-    // (the model not run on that machine, say) keeps its place as a map of
-    // blank squares this wide, over why it has nothing to show.
-    let prompts: Vec<u32> = grids
-        .values()
-        .filter_map(|g| g.as_ref().ok())
-        .flat_map(|g| g.prompts.iter().copied())
-        .collect::<BTreeSet<u32>>()
-        .into_iter()
-        .collect();
+    // A grid with nothing of its own (the model not run on that machine, say)
+    // keeps its place as a map of blank squares its set's shape, over why it
+    // has nothing to show.
     let mini = |chip: &str, stem: &str, name: &str| -> Element {
+        let Shape { users, prompts } = shape(chip);
         let (ins, cells, total_label, none) = match &grids[&(chip, stem, name)] {
             Ok(g) => (
                 &g.prompts,
@@ -1829,7 +2284,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                 "no ratios",
             ),
             Err(why) => (
-                &prompts,
+                prompts,
                 users
                     .iter()
                     .flat_map(|&u| prompts.iter().map(move |&i| (u, i, None)))
@@ -1854,7 +2309,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             })
             .collect();
         glance_mini(
-            Slice::Answer(GLANCE_ANSWER).axes(&users, ins),
+            Slice::Answer(0).axes(users, ins),
             squares,
             total_label,
             name,
@@ -1862,7 +2317,34 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             &format!("{stem} on {chip}"),
         )
     };
-    let chips: Vec<&str> = machines.keys().copied().collect();
+    let chips: Vec<&str> = in_order(machines);
+    // The heat maps a matrix per set, each in its own shape: machines read up within it.
+    let sets: Vec<(Set, Vec<&str>)> = (Set::ALL.into_iter())
+        .map(|set| {
+            let rows = (chips.iter().copied())
+                .filter(|&chip| lineup.set(memory(chip)) == set)
+                .collect();
+            (set, rows)
+        })
+        .filter(|(_, rows): &(Set, Vec<&str>)| !rows.is_empty())
+        .collect();
+    let cell = |chip: &str, class: &str| -> Element {
+        let Some(stem) = model_of(chip, class) else {
+            return rsx! {};
+        };
+        // The whole column's width, not its model name's: the maps fill it, so every map on the
+        // page is one size, and a name wider than the column wraps under them.
+        rsx! {
+            div { style: "flex: 1 1 0; min-width: 0",
+                Stack { gap: 1,
+                    div { style: "display: flex; gap: 0.5rem; align-items: flex-start",
+                        for (_, name) in metrics { {mini(chip, stem, name)} }
+                    }
+                    div { style: "text-align: center; font-size: 0.75rem; overflow-wrap: anywhere", "{stem}" }
+                }
+            }
+        }
+    };
     rsx! {
         Section { id: "glance", level: 2,
             Stack { gap: 4,
@@ -1886,7 +2368,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                             ContentPanel { id: slug(HEAT_MAPS), shown: true,
                                 Stack { gap: 5,
                                     p { style: "contain: inline-size",
-                                        "Every model's users × prompt size grid on every machine, at {GLANCE_ANSWER}-token answers: in \
+                                        "Every model's users × prompt size grid on every machine, at {answers}-token answers: in \
                                          each cell, the model's prefill (time to first token) grid, then its decode (throughput) grid \
                                          (rows: users at once, fewest first; columns: \
                                          prompt, short to long). A blank square has no ratio: scratchy or the engine it is compared with \
@@ -1897,9 +2379,16 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                          llama.cpp, mistral.rs. Blue faster, red slower, the middle step within noise. \
                                          Hover a square for its ratio."
                                     }
-                                    {glance_maps(&chips, &stems, |chip, stem| rsx! {
-                                        for (_, name) in metrics { {mini(chip, stem, name)} }
-                                    })}
+                                    for (set, rows) in &sets {
+                                        Stack { gap: 3,
+                                            div {
+                                                strong { "{set.title(lineup.large_from_gb)}" }
+                                                ": {counts(&lineup.shapes[set].users)} users at once by \
+                                                 {counts(&lineup.shapes[set].prompts)}-token prompts"
+                                            }
+                                            {glance_maps(rows, &classes, cell)}
+                                        }
+                                    }
                                 }
                             }
                             // Each a machine × model matrix, every cell its prefill
@@ -1915,7 +2404,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                                 div {}
                                                 div {}
                                                 for stem in &stems { div { style: "text-align: center", "{stem}" } }
-                                                for chip in machines.keys() {
+                                                for chip in &chips {
                                                     div { style: "grid-row: span 2; align-self: start", "{chip}" }
                                                     div { "Prefill" }
                                                     for stem in &stems { div { {spark(chip, stem, prefill)} } }
@@ -2232,7 +2721,7 @@ fn startup_panel(machines: &BTreeMap<&str, MachineRuns>, columns: usize) -> Elem
                 div {}
                 div {}
                 for col in &STARTUP_COLUMNS { div { style: "text-align: center", "{col.title}" } }
-                for &chip in machines.keys() {
+                for chip in in_order(machines) {
                     // Column 1 starts a row, past any columns this panel leaves empty.
                     div { style: "grid-column: 1; align-self: start", "{chip}" }
                     div {}
@@ -2284,12 +2773,12 @@ const HEAT_MAPS: &str = "Heat maps";
 const SCALING: [(&str, &str, [Trend; 2]); 2] = [
     (
         "Concurrency scaling",
-        "users at once: 1, 4 and 16 with 512-token prompts and 128-token answers, or, in runs whose grid has its own users (#349), 1 to 16 at the grid's middle cell, 1024-token prompts and 128-token answers",
+        "users at once, at the grid's one-user summary cell (1024-token prompts, and the answer length the heat maps use); runs from before the grid had its own users (#349) at 1, 4 and 16 users, 512-token prompts and 128-token answers",
         [Trend::UsersPrefill, Trend::UsersDecode],
     ),
     (
         "Length scaling",
-        "prompt length (128, 1024 and 4096 tokens) for prefill and answer length (16, 128 and 512 tokens) for decode, one user at a time where the grid ran at 1 (8 users at once in runs from before). Each prefill point is the geometric mean over the three answer lengths, and each decode point over the three prompt lengths",
+        "prompt length for prefill and answer length for decode, along the grid's prompt and answer lengths, one user at a time where the grid ran at 1 (8 users at once in runs from before). Each prefill point is the geometric mean over the answer lengths, and each decode point over the prompt lengths",
         [Trend::PromptPrefill, Trend::AnswerDecode],
     ),
 ];
@@ -2392,6 +2881,30 @@ fn machine_section(chip: &str, mr: &MachineRuns) -> Element {
     }
 }
 
+/// The engines the page compares scratchy with, in [`Engine::RIVALS`] order: those any machine's
+/// shown models measured (oMLX TurboQuant under oMLX), written as a list, or None for none.
+fn rivals_named(machines: &BTreeMap<&str, MachineRuns>) -> Option<String> {
+    let shown: Vec<&Model> = (machines.values())
+        .flat_map(|mr| mr.models.iter().filter_map(|(_, es)| es.last()))
+        .map(|e| e.m)
+        .collect();
+    let mut names: Vec<&str> = Vec::new();
+    for e in Engine::RIVALS {
+        let name = match e {
+            Engine::OmlxTq => Engine::Omlx.label(),
+            _ => e.label(),
+        };
+        if shown.iter().any(|m| e.ran(m)) && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    match names.as_slice() {
+        [] => None,
+        [one] => Some(one.to_string()),
+        [rest @ .., last] => Some(format!("{} and {last}", rest.join(", "))),
+    }
+}
+
 pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     let runs = load(site)?;
     let machines = index(&runs);
@@ -2405,13 +2918,22 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
         }
     } else {
         sections.push(("glance".to_string(), "At a glance".to_string()));
-        sections.extend(machines.keys().map(|chip| (slug(chip), chip.to_string())));
+        // No link to a section that is not there.
+        let timelines = over_time_charts(&machines);
+        if !timelines.is_empty() {
+            sections.push(("over-time".to_string(), "Over time".to_string()));
+        }
+        let order = in_order(&machines);
+        sections.extend(order.iter().map(|chip| (slug(chip), chip.to_string())));
         rsx! {
             {glance(&machines)}
-            for (chip, mr) in &machines { {machine_section(chip, mr)} }
+            {over_time(timelines)}
+            for chip in &order { {machine_section(chip, &machines[chip])} }
         }
     };
     let (count, n_machines) = (runs.len(), machines.len());
+    let against =
+        rivals_named(&machines).map_or("scratchy".to_string(), |r| format!("scratchy against {r}"));
     let page = rsx! {
         {chrome::header(Root(0), Some(Tab::Performance))}
         {chrome::perf_side_nav("metal.html", &sections)}
@@ -2421,7 +2943,7 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
                 Stack { gap: 4,
                     Heading { "Metal performance" }
                     p {
-                        "scratchy against oMLX, mlx-lm, vllm-metal, ollama, llama.cpp and mistral.rs on Apple \
+                        "{against} on Apple \
                          silicon: how long each takes to start, how fast it answers one user, and how it holds up as \
                          prompts, answers and users grow. \
                          {count} runs on {n_machines} machines, every number measured by "
@@ -2436,13 +2958,14 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
         }
         script { dangerous_inner_html: crate::charts::CHARTS_JS }
     };
+    let description = format!(
+        "{against} on Apple silicon: startup, single-user speed, and scaling, per machine."
+    );
     let html = chrome::document(
         Head {
             assets,
             title: "Metal performance — scratchy",
-            description: Some(
-                "scratchy against oMLX, mlx-lm, vllm-metal, ollama, llama.cpp and mistral.rs on Apple silicon: startup, single-user speed, and scaling, per machine.",
-            ),
+            description: Some(&description),
             og: None,
             root: Root(0),
             libraries: &[Library::CarbonCharts],
@@ -2467,7 +2990,7 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::size_name;
+    use super::{DATA, Run, TESTDATA, size_name, slug};
 
     #[test]
     fn a_models_name_gives_its_parameter_size() {
@@ -2475,5 +2998,624 @@ mod tests {
         assert_eq!(size_name("qwen2.5-7b").as_deref(), Some("7b"));
         assert_eq!(size_name("gemma-4-26b-a4b-it").as_deref(), Some("26b"));
         assert_eq!(size_name("smollm2-135m"), None);
+        // The one-model-per-class round.
+        assert_eq!(size_name("gpt-oss-20b").as_deref(), Some("20b"));
+        assert_eq!(size_name("gpt-oss-120b-3bit").as_deref(), Some("120b"));
+        assert_eq!(size_name("nemotron-3-nano-30b-a3b").as_deref(), Some("30b"));
+        assert_eq!(
+            size_name("nemotron-3-super-120b-a12b").as_deref(),
+            Some("120b")
+        );
+        assert_eq!(size_name("qwen3.5-122b-a10b").as_deref(), Some("122b"));
+        assert_eq!(size_name("granite-4.1-8b").as_deref(), Some("8b"));
+    }
+
+    /// A later run of scratchy alone, without the frozen rung, shows the engines and the frozen
+    /// launches of the run before it, each marked with that run's time, and only its own scratchy
+    /// cells and cold and warm launches.
+    #[test]
+    fn a_run_of_scratchy_alone_keeps_the_last_engines_and_frozen_launches() {
+        use super::data::{BORROWED_FROZEN, Run, Scenario};
+        use super::numbers::Engine;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/data/metal/apple-m5-max-2026-10-14T111352Z-987b06a2.json"
+        );
+        let text = std::fs::read_to_string(path).expect("the published M5 Max run");
+        let mut later: serde_json::Value = serde_json::from_str(&text).unwrap();
+        later["generated_utc"] = "2026-10-21T12:00:00Z".into();
+        for m in later["models"].as_array_mut().unwrap() {
+            let m = m.as_object_mut().unwrap();
+            m.retain(|k, _| !(k.starts_with("scaling_omlx") || k.starts_with("cache_ladder_omlx")));
+            m["cache_ladder"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|r| r["scenario"] != "frozen");
+            m["scaling"].as_array_mut().unwrap().truncate(3);
+        }
+        let earlier: Run = serde_json::from_str(&text).unwrap();
+        let later: Run = serde_json::from_value(later).unwrap();
+        let mut runs = vec![later, earlier];
+        super::borrow_earlier(&mut runs);
+        let [later, earlier] = &runs[..] else {
+            unreachable!()
+        };
+        for (new, old) in later.models.iter().zip(&earlier.models) {
+            let from = old.borrowed.is_empty().then_some(&earlier.generated_utc);
+            for e in [Engine::OmlxTq, Engine::Omlx] {
+                assert_eq!(
+                    e.cells(new).len(),
+                    e.cells(old).len(),
+                    "{} {}",
+                    new.stem,
+                    e.key()
+                );
+                assert_eq!(new.borrowed.get(e.key()), from);
+            }
+            let frozen = |m: &super::data::Model| {
+                (Engine::Scratchy.ladder(m).iter())
+                    .filter(|r| r.scenario == Scenario::Frozen)
+                    .count()
+            };
+            assert_eq!(frozen(new), frozen(old));
+            assert_eq!(new.borrowed.get(BORROWED_FROZEN), from);
+            // scratchy's own cells are the later run's three, never the earlier run's.
+            assert_eq!(Engine::Scratchy.cells(new).len(), 3);
+            assert!(
+                old.borrowed.is_empty(),
+                "{}: the earlier run measured its own",
+                old.stem
+            );
+        }
+    }
+
+    /// An engine measured at another shape (here, a run with other prompt lengths) is not
+    /// carried into a later run: its cells are other cells. scratchy's frozen launches still are.
+    #[test]
+    fn an_engine_measured_at_another_shape_is_not_carried() {
+        use super::data::{BORROWED_FROZEN, Run};
+        use super::numbers::Engine;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/data/metal/apple-m5-max-2026-10-14T111352Z-987b06a2.json"
+        );
+        let text = std::fs::read_to_string(path).expect("the published M5 Max run");
+        let mut later: serde_json::Value = serde_json::from_str(&text).unwrap();
+        later["generated_utc"] = "2026-10-21T12:00:00Z".into();
+        later["config"]["scaling"]["grid_input"] = serde_json::json!([128, 1024, 4096, 32768]);
+        for m in later["models"].as_array_mut().unwrap() {
+            let m = m.as_object_mut().unwrap();
+            m.retain(|k, _| !(k.starts_with("scaling_omlx") || k.starts_with("cache_ladder_omlx")));
+            m["cache_ladder"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|r| r["scenario"] != "frozen");
+        }
+        let earlier: Run = serde_json::from_str(&text).unwrap();
+        let later: Run = serde_json::from_value(later).unwrap();
+        let mut runs = vec![later, earlier];
+        super::borrow_earlier(&mut runs);
+        for m in &runs[0].models {
+            for e in [Engine::OmlxTq, Engine::Omlx] {
+                assert!(e.cells(m).is_empty(), "{} {}", m.stem, e.key());
+                assert!(!m.borrowed.contains_key(e.key()));
+            }
+            assert!(m.borrowed.contains_key(BORROWED_FROZEN), "{}", m.stem);
+        }
+    }
+
+    /// A quick run after a full run borrows the full run's engines: the quick run's 64-token
+    /// answers are the full run's users × prompt map, and the full run's 512- and 2048-token
+    /// answers ran at 1 user only, so they are not cells the quick run compares.
+    #[test]
+    fn a_quick_run_after_a_full_run_borrows_its_engines() {
+        use super::data::Run;
+        use super::numbers::Engine;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/data/metal/apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"
+        );
+        let text = std::fs::read_to_string(path).expect("the M3 Pro's full run");
+        let mut quick: serde_json::Value = serde_json::from_str(&text).unwrap();
+        quick["generated_utc"] = "2026-10-22T12:00:00Z".into();
+        quick["config"]["scaling"]["grid_output"] = serde_json::json!([64]);
+        for m in quick["models"].as_array_mut().unwrap() {
+            let m = m.as_object_mut().unwrap();
+            m.retain(|k, _| !(k.starts_with("scaling_omlx") || k.starts_with("cache_ladder_omlx")));
+        }
+        let full: Run = serde_json::from_str(&text).unwrap();
+        let quick: Run = serde_json::from_value(quick).unwrap();
+        let mut runs = vec![quick, full];
+        super::borrow_earlier(&mut runs);
+        let [quick, full] = &runs[..] else {
+            unreachable!()
+        };
+        let mut borrowed = 0;
+        for (q, f) in quick.models.iter().zip(&full.models) {
+            for e in [Engine::OmlxTq, Engine::Omlx] {
+                assert_eq!(e.cells(q).len(), e.cells(f).len(), "{} {}", q.stem, e.key());
+                if !e.cells(f).is_empty() {
+                    assert_eq!(q.borrowed.get(e.key()), Some(&full.generated_utc));
+                    borrowed += 1;
+                }
+            }
+        }
+        assert!(borrowed > 0, "the full run measured oMLX on some model");
+    }
+
+    /// A run in the quick-run shape: a 4x4 users x prompt grid at 64-token answers, out to 32k,
+    /// with 512- and 2048-token answers at 1 user only. The users curve reads all four users
+    /// counts at the base cell (1024 in / 64 out), the overview reads the 64-token map, and the
+    /// length curve has every answer length at 1 user.
+    #[test]
+    fn a_run_in_the_quick_shape_reads_every_view_from_its_own_grid() {
+        use super::data::{At, Run};
+        use super::numbers::Engine;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/data/metal/apple-m5-max-2026-10-14T111352Z-987b06a2.json"
+        );
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let (ins, users) = ([128u32, 1024, 4096, 32768], [1u32, 4, 8, 16]);
+        v["config"]["scaling"] = serde_json::json!({
+            "axes": ["grid"], "grid_input": ins, "grid_output": [64, 512, 2048],
+            "grid_conc": users, "grid_users_output": [64],
+            "base": {"input": 1024, "output": 64, "conc": 8},
+        });
+        let cell = |i: u32, o: u32, c: u32| {
+            serde_json::json!({"axis": "grid", "rung": format!("{i}x{o}"), "conc": c,
+                "median_ttft_ms": 100.0, "median_tpot_ms": 10.0, "output_throughput": 50.0,
+                "completed": 12, "total_output_tokens": 12 * o})
+        };
+        let mut cells = Vec::new();
+        for &c in &users {
+            for &i in &ins {
+                for o in [64u32, 512, 2048] {
+                    if c == 1 || o == 64 {
+                        cells.push(cell(i, o, c));
+                    }
+                }
+            }
+        }
+        let m = &mut v["models"][0];
+        m["scaling"] = cells.clone().into();
+        m["scaling_omlx"] = cells.into();
+        let v_capped = v.clone();
+        let run: Run = serde_json::from_value(v).unwrap();
+        let m = &run.models[0];
+        // The users curve: every users count, at the base cell.
+        assert!(matches!(
+            super::users_from(m, &run),
+            super::UsersFrom::Grid {
+                input: 1024,
+                output: 64
+            }
+        ));
+        let us = super::by_users(m, &run, Engine::Scratchy);
+        assert_eq!(us.keys().copied().collect::<Vec<_>>(), users);
+        // The overview's map: 64-token answers, 4 users counts x 4 prompts.
+        assert_eq!(super::glance_answer(&run), 64);
+        let map = super::ShapeGrid::of(m, &run, super::Slice::Answer(64)).expect("a map");
+        assert_eq!((map.down.len(), map.across.len()), (4, 4));
+        // The length curve: every answer length, at 1 user.
+        let one = super::ShapeGrid::of(m, &run, super::Slice::Users(1)).expect("the 1-user grid");
+        assert_eq!(one.across, vec![64, 512, 2048]);
+        assert!(
+            Engine::Scratchy
+                .cells(m)
+                .iter()
+                .all(|c| matches!(c.at, At::Grid { .. }))
+        );
+        // A Mac that held prompts up to 4096 shows a 4x3 map: no 32k column.
+        let mut capped = v_capped;
+        capped["config"]["scaling"]["max_prompt"] = 4096.into();
+        let run: Run = serde_json::from_value(capped).unwrap();
+        let map = super::ShapeGrid::of(&run.models[0], &run, super::Slice::Answer(64)).unwrap();
+        assert_eq!(map.across, vec![128, 1024, 4096]);
+    }
+
+    /// Machines read up from the smallest: a 32 GB base M5 before the 36 GB M3 Pro, the 64 GB
+    /// M4 Max and M5 Max after. Below 64 GB a Mac's overview row is the small set, at 64 GB the
+    /// large one.
+    #[test]
+    fn machines_order_by_memory_and_take_their_set_by_it() {
+        use super::data::Run;
+        let read = |name: &str| -> serde_json::Value {
+            let p = format!("{}/data/metal/{name}", env!("CARGO_MANIFEST_DIR"));
+            serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+        };
+        let mut base = read("apple-m3-pro-2026-10-21T145041Z-a7820fbc.json");
+        base["machine"]["chip"] = "Apple M5".into();
+        base["machine"]["memory_gb"] = 32.into();
+        // Below 64 GB the grid runs 1, 2 and 4 users; the 36 GB M3 Pro's run is from before that.
+        base["config"]["scaling"]["grid_conc"] = serde_json::json!([1, 2, 4]);
+        base["generated_utc"] = "2026-10-26T20:05:50Z".into();
+        let runs: Vec<Run> = [
+            base,
+            read("apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"),
+            read("apple-m4-max-2026-10-13T221900Z-2683d8c3.json"),
+            read("apple-m5-max-2026-10-14T111352Z-987b06a2.json"),
+        ]
+        .into_iter()
+        .map(|v| serde_json::from_value(v).unwrap())
+        .collect();
+        let machines = super::index(&runs);
+        assert_eq!(
+            super::in_order(&machines),
+            ["Apple M5", "Apple M3 Pro", "Apple M4 Max", "Apple M5 Max"]
+        );
+        // The overview's columns are the full run's recorded lineup, each Mac on its set, and each
+        // set's maps the grid of its own newest run: the small set the M5's, not the older M3
+        // Pro's, and the large set, with no lineup run of its own, the M5 Max's.
+        let lineup = super::lineup(&machines).expect("the M3 Pro's run records its lineup");
+        let small = &lineup.shapes[&super::Set::Small];
+        assert_eq!(
+            (&small.users[..], &small.prompts[..]),
+            (&[1, 2, 4][..], &[128, 1024, 4096, 32768][..])
+        );
+        let large = &lineup.shapes[&super::Set::Large];
+        assert_eq!(
+            (&large.users[..], &large.prompts[..]),
+            (&[1, 2, 4, 8, 16][..], &[128, 1024, 4096][..])
+        );
+        assert!(lineup.set(36) == super::Set::Small && lineup.set(64) == super::Set::Large);
+        let dense = lineup.classes.iter().find(|c| c.class == "Dense").unwrap();
+        assert_eq!(dense.model(32, lineup.large_from_gb), "granite-4.2-8b");
+        assert_eq!(dense.model(36, lineup.large_from_gb), "granite-4.2-8b");
+        assert_eq!(dense.model(64, lineup.large_from_gb), "granite-4.2-30b");
+    }
+
+    /// Over every published run: a cell whose answers came back short of the tokens asked for
+    /// carries § and says what share it delivered, and a dead cell never does (#479). Whether
+    /// scratchy answers to length is the matrix script's to judge as it measures (`run_cell`);
+    /// the page marks whatever it is given.
+    #[test]
+    fn published_cells_that_stopped_answers_early_are_marked_short() {
+        use super::numbers::{Engine, Metric, SHORT, cfmt, marks_note, short};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut by_engine = std::collections::BTreeMap::<&str, usize>::new();
+        let mut files: Vec<_> = (std::fs::read_dir(root.join(DATA)).expect(DATA))
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .collect();
+        files.sort();
+        for f in files {
+            let mut run: Run = serde_json::from_str(&std::fs::read_to_string(&f).unwrap())
+                .unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+            run.mark_dead();
+            run.mark_short();
+            for m in &run.models {
+                for e in Engine::ALL {
+                    for c in e.cells(m) {
+                        let Some(share) = short(Some(c)) else {
+                            assert!(!cfmt(Some(c), Metric::Tpot).contains(SHORT));
+                            continue;
+                        };
+                        assert!(!c.dead, "a dead cell is never also short");
+                        assert!(share < 0.99, "{share}");
+                        assert!(
+                            cfmt(Some(c), Metric::Tpot).contains(SHORT)
+                                || c.median_tpot_ms.is_none()
+                        );
+                        assert!(
+                            marks_note(Some(c), Metric::Tpot).contains("% of the answer tokens")
+                        );
+                        *by_engine.entry(e.key()).or_default() += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("short cells by engine: {by_engine:?}");
+        assert!(
+            by_engine.get("omlx").is_some_and(|&n| n > 0),
+            "#479's oMLX cells stop short: {by_engine:?}"
+        );
+    }
+
+    /// The published runs' cells a dead server measured (#413) are marked, and no other: the
+    /// glm-4.5-air and qwen3.6-35b-a3b cells of the M1 Max run in #472, and the M3 Pro's gemma
+    /// 4096-token cells from the one its OOM struck in (#412), 4096x16, which still streamed a
+    /// few tokens, on. Every engine that stops at EOS early (ollama, oMLX) keeps its numbers, and
+    /// so does scratchy's f378699e gemma cell at 16 users, live at 99% of its tokens. A marked
+    /// cell counts every request failed, says why, and shows no number.
+    #[test]
+    fn the_published_cells_of_a_dead_server_and_only_those_are_marked() {
+        use super::numbers::{DASH, Engine, FAILED, Metric, cfmt, failed, failed_note, partial};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut runs: Vec<Run> = Vec::new();
+        for dir in [DATA, TESTDATA] {
+            let mut files: Vec<_> = (std::fs::read_dir(root.join(dir)).expect(dir))
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                .collect();
+            files.sort();
+            for f in files {
+                let mut run: Run = serde_json::from_str(&std::fs::read_to_string(&f).unwrap())
+                    .unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+                run.mark_dead();
+                runs.push(run);
+            }
+        }
+        let mut dead = std::collections::BTreeMap::<(String, String, &str, &str), usize>::new();
+        for r in &runs {
+            for m in &r.models {
+                for e in Engine::ALL {
+                    for c in e.cells(m).iter().filter(|c| c.dead) {
+                        let all = c.completed.unwrap_or(0) + c.failed.unwrap_or(0);
+                        assert_eq!(failed(Some(c)), all, "every request of a dead cell failed");
+                        assert!(failed_note(Some(c)).contains("stopped answering"));
+                        assert_eq!(cfmt(Some(c), Metric::Ttft), format!("{DASH}{FAILED}"));
+                        assert!(!partial(Some(c), Metric::Ttft));
+                        let machine = slug(r.machine.chip.as_str());
+                        let key = (machine, r.repo.sha8().to_string(), m.stem.as_str(), e.key());
+                        *dead.entry(key).or_default() += 1;
+                    }
+                }
+            }
+        }
+        let want = [
+            // The M3 Pro's full run: gpt-oss-20b's server ran out of memory at 4096x2048 (#775),
+            // then answered its next two cells, 128x64 and 1024x64 at 4 users, almost empty.
+            ("apple-m3-pro", "a7820fbc", "gpt-oss-20b", "scratchy", 3),
+            (
+                "apple-m3-pro",
+                "649ebce2",
+                "gemma-4-26b-a4b-it",
+                "scratchy",
+                3,
+            ),
+            ("apple-m1-max", "c8860b1d", "glm-4.5-air", "scratchy", 22),
+            (
+                "apple-m1-max",
+                "c8860b1d",
+                "qwen3.6-35b-a3b",
+                "scratchy",
+                10,
+            ),
+            (
+                "apple-m3-pro",
+                "cc51e0d8",
+                "gemma-4-26b-a4b-it",
+                "scratchy",
+                3,
+            ),
+        ];
+        let want: std::collections::BTreeMap<_, _> = (want.iter())
+            .map(|&(mc, sha, stem, e, n)| ((mc.to_string(), sha.to_string(), stem, e), n))
+            .collect();
+        assert_eq!(dead, want);
+    }
+
+    /// A sparkline step compares the two engines on the rungs both measured. The M1 Max run in
+    /// #472 has glm-4.5-air's scratchy cells dead at 1024 and 4096 prompt tokens with 16-token
+    /// answers: averaged over each engine's own cells, scratchy read 1.86x oMLX TurboQuant's
+    /// throughput; on the one rung both have, it is 0.95x.
+    #[test]
+    fn a_sparkline_step_averages_only_the_rungs_both_engines_measured() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let file = root
+            .join(TESTDATA)
+            .join("apple-m1-max-2026-10-14T191550Z-c8860b1d.json");
+        let mut run: Run =
+            serde_json::from_str(&std::fs::read_to_string(&file).expect("the M1 Max run"))
+                .expect("a run");
+        run.mark_dead();
+        let m = run
+            .models
+            .iter()
+            .find(|m| m.stem == "glm-4.5-air")
+            .expect("glm-4.5-air");
+        let (rival, steps) = super::Trend::AnswerDecode
+            .points(m, &run)
+            .expect("a sparkline");
+        assert_eq!(rival.key(), "omlx_tq");
+        let step = steps
+            .iter()
+            .find(|s| s.x == 16.0)
+            .expect("the 16-token step");
+        let ratio = step.scratchy.expect("scratchy") / step.rival.expect("the rival");
+        assert!(
+            (ratio - 0.95).abs() < 0.01,
+            "scratchy against oMLX TurboQuant: {ratio:.3}x"
+        );
+    }
+
+    /// The bench's own verdict on a cell is the one the page takes: a scratchy cell it recorded as
+    /// a dead server's (`dead_server`, under half its answer tokens) shows no number, even in a
+    /// run that counted its failures itself, where the page judges no cell by its tokens. Without
+    /// it the dead server's ~0 tok/s went on the Decode heat map, and as the square furthest from
+    /// x1 it took a highlight. A cell the client never finished says so.
+    #[test]
+    fn the_benchs_dead_server_and_timeout_verdicts_reach_the_page() {
+        use super::numbers::{Metric, failed_note, timing};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/data/metal/apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"
+        );
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        json["config"]["failures_counted"] = true.into();
+        let cells = json["models"][0]["scaling"].as_array_mut().unwrap();
+        // As the bench writes them: a dead server's cell, and one that timed out.
+        cells[0]["dead_server"] = true.into();
+        cells[0]["failed"] = cells[0]["completed"].clone();
+        cells[0]["completed"] = 0.into();
+        cells[1] = serde_json::json!({"axis": "grid", "rung": cells[1]["rung"].clone(),
+            "conc": cells[1]["conc"].clone(), "completed": 0, "failed": 12, "timed_out": true});
+        let mut run: Run = serde_json::from_value(json).unwrap();
+        run.mark_dead();
+        let scaling = run.models[0].scaling.as_deref().unwrap();
+        let (dead, slow, live) = (&scaling[0], &scaling[1], &scaling[2]);
+        assert!(dead.dead, "the bench's dead-server verdict is taken");
+        assert_eq!(timing(Some(dead), Metric::Throughput), None);
+        assert!(failed_note(Some(dead)).contains("stopped answering"));
+        assert!(failed_note(Some(slow)).contains("did not finish"));
+        assert!(!live.dead && timing(Some(live), Metric::Throughput).is_some());
+    }
+
+    /// A run whose bench counted aborted and errored requests itself (#510) keeps what it
+    /// recorded: its cells are never re-judged by their answer tokens, however few.
+    #[test]
+    fn a_run_that_counted_its_failures_is_not_re_judged() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let file = root
+            .join(TESTDATA)
+            .join("apple-m3-pro-2026-10-13T010519Z-cc51e0d8.json");
+        let text = std::fs::read_to_string(&file).expect("the published M3 Pro run");
+        let mut json: serde_json::Value = serde_json::from_str(&text).expect("json");
+        let judged = |json: &serde_json::Value| {
+            let mut run: Run = serde_json::from_value(json.clone()).expect("a run");
+            run.mark_dead();
+            let m = run
+                .models
+                .iter()
+                .find(|m| m.stem == "gemma-4-26b-a4b-it")
+                .expect("gemma");
+            m.scaling.iter().flatten().filter(|c| c.dead).count()
+        };
+        assert_eq!(
+            judged(&json),
+            3,
+            "an older run is judged by its answer tokens"
+        );
+        json["config"]["failures_counted"] = true.into();
+        assert_eq!(judged(&json), 0, "a run that counted its failures is not");
+    }
+
+    /// A timeline steps through a machine's runs of one shape: scratchy at every run, the rival
+    /// only at the run that measured it, so a quick run's carried oMLX is no point of its own.
+    #[test]
+    fn a_timeline_takes_the_rival_only_from_the_runs_that_measured_it() {
+        use super::data::Run;
+        use super::numbers::{Engine, Metric};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/data/metal/apple-m5-max-2026-10-14T111352Z-987b06a2.json"
+        );
+        let full: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let quick = |when: &str| {
+            let mut v = full.clone();
+            v["generated_utc"] = when.into();
+            for m in v["models"].as_array_mut().unwrap() {
+                m.as_object_mut()
+                    .unwrap()
+                    .retain(|k, _| !(k.starts_with("scaling_") || k.starts_with("cache_ladder_")));
+            }
+            v
+        };
+        let mut runs: Vec<Run> = [
+            quick("2026-10-13T12:00:00Z"),
+            full.clone(),
+            quick("2026-10-15T12:00:00Z"),
+        ]
+        .into_iter()
+        .map(|v| serde_json::from_value(v).unwrap())
+        .collect();
+        super::borrow_earlier(&mut runs);
+        let machines = super::index(&runs);
+        let mr = &machines["Apple M5 Max"];
+        let (stem, entries) = &mr.models[0];
+        let kept: Vec<&super::Entry> = entries.iter().collect();
+        assert_eq!(kept.len(), 3, "{stem}");
+        let steps = super::timeline_steps(&kept, Some(Engine::OmlxTq), Metric::Throughput);
+        assert!(
+            steps.iter().all(|s| s.scratchy.is_some()),
+            "scratchy at every run"
+        );
+        let rival: Vec<bool> = steps.iter().map(|s| s.rival.is_some()).collect();
+        assert_eq!(
+            rival,
+            [false, true, false],
+            "oMLX only where it was measured"
+        );
+        // Evenly spaced on the sparkline's log axis.
+        let xs: Vec<f64> = steps.iter().map(|s| s.x).collect();
+        assert_eq!(xs, [1.0, 2.0, 4.0]);
+        // Where scratchy started is the first run with both engines, not the quick run before it.
+        let mut steps = steps;
+        super::timeline_highlights(&mut steps);
+        let labelled: Vec<bool> = steps.iter().map(|s| s.highlight).collect();
+        assert_eq!(labelled, [false, true, true]);
+        assert_eq!(super::model_timelines(entries).len(), 2);
+    }
+
+    /// A published run with one model's memory readings set to `rss` (every launch's peak RSS)
+    /// and `mem` (every scaling cell's peak memory), in MiB, for the rule tests below: the run's
+    /// other fields stay real, so it loads as one does. Returns the run and the model's index.
+    fn with_memory(rss: f64, mem: f64) -> (Run, usize) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let file = root
+            .join(DATA)
+            .join("apple-m3-pro-2026-10-21T145041Z-a7820fbc.json");
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).expect("a published run"))
+                .expect("json");
+        let at = (json["models"].as_array().expect("models").iter())
+            .position(|m| m["model_id"] == "mlx-community/Qwen3.6-35B-A3B-4bit")
+            .expect("qwen3.6-35b-a3b in the run");
+        let m = &mut json["models"][at];
+        for key in ["cache_ladder", "cache_ladder_omlx"] {
+            for rep in m[key].as_array_mut().into_iter().flatten() {
+                rep["peak_rss_mib"] = rss.into();
+            }
+        }
+        for key in ["scaling", "scaling_omlx"] {
+            for c in m[key].as_array_mut().into_iter().flatten() {
+                c["server_mem_peak_mib"] = mem.into();
+            }
+        }
+        let mut run: Run = serde_json::from_value(json).expect("a run");
+        run.mark_mem_below_weights();
+        (run, at)
+    }
+
+    /// A memory reading below the model's own weights is left out, and one at or above them is
+    /// kept: the comparison and its MiB-to-bytes conversion, on either side of the line (#414).
+    #[test]
+    fn a_memory_reading_below_the_weights_is_left_out_and_one_above_is_kept() {
+        use super::Scenario;
+        use super::numbers::{Engine, Memory, Metric, peak_rss};
+        let w = {
+            let (run, at) = with_memory(0.0, 0.0);
+            run.models[at].weights().expect("qwen's weights").mib()
+        };
+        for (mib, below) in [(w - 1.0, true), (w + 1.0, false)] {
+            let (run, at) = with_memory(mib, mib);
+            let m = &run.models[at];
+            let rss = peak_rss(m, Engine::Scratchy, Scenario::Cold);
+            assert_eq!(
+                rss == Memory::BelowWeights,
+                below,
+                "peak RSS {mib} MiB, weights {w}: {rss:?}"
+            );
+            for c in m.scaling.iter().flatten() {
+                let shown = super::numbers::timing(Some(c), Metric::PeakMem);
+                assert_eq!(
+                    shown.is_none(),
+                    below,
+                    "peak memory {mib} MiB, weights {w}: {shown:?}"
+                );
+            }
+        }
+    }
+
+    /// Only an engine that serves the MLX checkpoint is judged against its weights: ollama,
+    /// llama.cpp and mistral.rs serve their own builds, so a low reading of theirs is still one.
+    #[test]
+    fn only_an_engine_serving_the_mlx_checkpoint_is_judged_by_its_weights() {
+        use super::numbers::{Engine, below_weights};
+        let (run, at) = with_memory(0.0, 0.0);
+        let m = &run.models[at];
+        let low = m.weights().expect("qwen's weights").mib() - 1.0;
+        for e in Engine::ALL {
+            assert_eq!(
+                below_weights(m, e, low),
+                e.serves_mlx_checkpoint(),
+                "{}",
+                e.label()
+            );
+        }
     }
 }

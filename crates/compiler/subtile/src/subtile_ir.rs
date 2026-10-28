@@ -1403,10 +1403,14 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     AttnPackedKv,
 
     // ── The sampled rows of a result matmul (see `sample_rows`) ───
-    /// Each sequence's sampled row moved to the front of `x`, in place. `inputs` = `[x]`.
+    /// The step's sampled rows of `x` moved to its front, in order, in place: the result matmul's
+    /// activation, which the matmul then reads. `inputs` = `[x]`.
     SampleRowsGather,
-    /// The front rows of `x` moved back to their sequences' sampled rows, in place.
-    /// `inputs` = `[x]`.
+    /// What runs after the sampled matmul, in place over its output `x` — one of two, by how the
+    /// target ran the matmul: the gathered activation put back, where it ran over the sampled
+    /// rows alone (their logits already at the front); or every row's logits compacted to the
+    /// sampled rows', where it ran over every row. Either way the sampled rows' logits are at the
+    /// front of `x` after it. `inputs` = `[x]`.
     SampleRowsScatter,
     /// The sampled matmul over EVERY row, taking over its scattered output: the alternative a
     /// step that reads every row runs instead of the gather, the matmul and the scatter — never

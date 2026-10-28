@@ -313,9 +313,20 @@ impl std::fmt::Display for BakeDefect {
     }
 }
 
+/// The wide band's share of one bucket's lowering input: its step tape and the arena slot count
+/// that tape's colouring allocated — the bands colour differently, so each carries its own.
+pub struct WideBand<'a> {
+    pub steps: &'a MetalStepTape,
+    pub num_arena_slots: u32,
+}
+
 /// One bucket's lowering input: its step tape and the model's KV cap ladder.
 pub struct BucketLowerInput<'a> {
     pub steps: &'a MetalStepTape,
+    /// The wide band's input, when the bands fold differently at this bucket — `None` when they
+    /// fold the same, so `steps`/`num_arena_slots` serve every class. The bake lowers
+    /// [`GenClass::M5Wide`] under it and every other class under `steps`.
+    pub wide_band: Option<WideBand<'a>>,
     pub bucket_m: u32,
     pub num_arena_slots: u32,
     /// The model's class rotary tables (rope-on-read), from its source manifest.
@@ -357,7 +368,10 @@ fn profile_for(class: GenClass) -> MetalTargetProfile {
     match class {
         GenClass::M1 => M1_MAX,
         GenClass::Mid => M4_10CORE,
-        GenClass::M5 => M5_10CORE,
+        // The wide class lowers under every M5 fact — the lowering's only device-profile
+        // dependence is the generation, which M5Wide shares with M5; it differs in which step
+        // tape (the routed fold's band) it bakes, not in any fact the profile carries.
+        GenClass::M5 | GenClass::M5Wide => M5_10CORE,
     }
 }
 
@@ -378,6 +392,10 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
 /// One rung of a bucket's tape: its class, addressing and KV cap.
 struct Rung<'a> {
     profile: &'a MetalTargetProfile,
+    /// The step tape this rung lowers — the wide class's band when the bands fold differently —
+    /// and the arena slot count that tape's colouring allocated.
+    steps: &'a MetalStepTape,
+    num_arena_slots: u32,
     addressing: KvAddressing,
     cap: MaxBlocksPerSeq,
 }
@@ -390,12 +408,12 @@ fn run_lower(
     let at = tl::BakePoint {
         chunked: rung.addressing == KvAddressing::Chunked,
         bucket_m: input.bucket_m,
-        num_arena_slots: input.num_arena_slots,
+        num_arena_slots: rung.num_arena_slots,
         rotary: input.rotary,
         block_cap: rung.cap.get(),
         profile: Some(rung.profile),
     };
-    tl::lower_subtile_tape_to_metal(input.steps, mc, at)
+    tl::lower_subtile_tape_to_metal(rung.steps, mc, at)
 }
 
 /// Bake every `(gen class × KV addressing × KV cap × TurboQuant decode heads)` variant of one
@@ -416,7 +434,7 @@ pub fn bake_bucket_tapes(
     input: &BucketLowerInput<'_>,
     pool: &mut CommandPool,
 ) -> Result<TokenStream, BakeDefect> {
-    let classes = [GenClass::M1, GenClass::Mid, GenClass::M5];
+    let classes = [GenClass::M1, GenClass::Mid, GenClass::M5, GenClass::M5Wide];
     let candidates: Vec<TqDecodeHeads> = TqDecodeHeads::candidates(
         HeadDim(mc.global_head_dim),
         NumQHeads(mc.num_q_heads),
@@ -445,8 +463,14 @@ pub fn bake_bucket_tapes(
         .collect();
     let lowered = par_map(&points, |&(class, addressing, cap)| {
         let profile = profile_for(class);
+        let (steps, num_arena_slots) = match (class, input.wide_band.as_ref()) {
+            (GenClass::M5Wide, Some(wide)) => (wide.steps, wide.num_arena_slots),
+            _ => (input.steps, input.num_arena_slots),
+        };
         let rung = Rung {
             profile: &profile,
+            steps,
+            num_arena_slots,
             addressing,
             cap,
         };

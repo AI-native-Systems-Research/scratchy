@@ -20,6 +20,7 @@ use crate::interpreter::metal::__re::MTLCommandBufferStatus;
 
 use super::worker::WorkerError;
 use crate::tape::ids::MaxBlocksPerSeq;
+use scratchy_core_common::sampled_rows::{EmptySequence, SampledRows};
 
 /// One forward step's runtime inputs.
 ///
@@ -68,22 +69,11 @@ pub struct ForwardInputs<'a> {
     /// order; group 0 = full). Empty when no paged read. Same single-vs-N
     /// contract as [`Self::slot_mappings`].
     pub block_tables: Vec<&'a [u32]>,
-    /// `true` when this forward is a spec-decode verify batch (one
-    /// or more reqs carries `spec_token_ids`). Currently informational —
-    /// the lm_head slice trio reads `last_token_indices` for its row
-    /// list whether or not spec-decode is active, so this flag has no
-    /// effect on slice dispatch today. Retained for callers that pass
-    /// it; may be wired to additional gates in the future.
-    pub has_spec_tokens: bool,
-    /// `[num_sample_rows]` u32 — per-sample-row source index into the
-    /// `[num_tokens, hidden]` lm_head input. Mirrors Python vLLM's
-    /// `logits_indices = query_start_loc[1:] - 1` and the CUDA path's
-    /// `ForwardCtx.last_token_indices`. When `Some`, the lm_head slice
-    /// trio gathers these rows, runs the GEMM at `M = len`, scatters
-    /// back. `None` falls back to the full `M = bucket_m` lm_head
-    /// GEMM (used by chunked-prefill intermediate chunks that produce
-    /// no sampled tokens).
-    pub last_token_indices: Option<&'a [u32]>,
+    /// `[num_sample_rows]` u32 — the rows the forward samples, ascending: each sequence's last,
+    /// every row of a sequence verifying drafts. Python vLLM's `logits_indices`. The forward
+    /// leaves their logits at the front of its logits buffer, row `i` sampled row `i`'s. A caller
+    /// that names none samples each sequence's last ([`Self::last_rows`]).
+    pub sampled_rows: &'a [u32],
     /// `[num_seqs * 6]` i32 — a [`GdnSeqSlots`](crate::gdn_state::GdnSeqSlots) record per
     /// batched sequence (cu_seqlens order), flattened as `GdnSeqSlots::words`. `None` for
     /// non-hybrid arches; required for any bucket that runs `Instruction::GatedDeltaNet`.
@@ -154,6 +144,27 @@ pub struct ForwardInputs<'a> {
     pub deferred: Option<&'a Deferral>,
     /// What the caller reads of this forward.
     pub reads: ForwardReads,
+}
+
+impl ForwardInputs<'_> {
+    /// How many rows the forward samples ([`Self::sampled_rows`]).
+    pub fn sampled_row_count(&self) -> crate::tape::ids::SampledRowCount {
+        crate::tape::ids::SampledRowCount(self.sampled_rows.len() as u32)
+    }
+
+    /// The rows a forward samples when its caller names none: each sequence `cu_seqlens_q` bounds'
+    /// last row, as the serving engine's steps sample them ([`SampledRows::of`]) — every row of
+    /// `num_tokens`, a step that names no sequences being one token each. Refused for a sequence
+    /// of no rows, which has none to sample.
+    pub fn last_rows(
+        cu_seqlens_q: Option<&[u32]>,
+        num_tokens: u32,
+    ) -> Result<SampledRows, EmptySequence> {
+        match cu_seqlens_q {
+            Some(cu) => SampledRows::of(cu, |_| false),
+            None => SampledRows::of(&(0..=num_tokens).collect::<Vec<u32>>(), |_| false),
+        }
+    }
 }
 
 /// What a forward's caller reads of it.
@@ -280,12 +291,60 @@ pub enum DeviceInputInto {
     GdnSteps,
 }
 
+/// What one command buffer's commit feedback said, once it has said it. The handler sets it once
+/// and no wait consumes it, so every wait on the command buffer, and only on it, sees the same.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Delivered {
+    Ok,
+    Err(String),
+}
+
+/// One command buffer's commit feedback, which its handler delivers on a thread of Metal's own,
+/// not ordered against the shared event the queue signals after the command buffer. A wait that
+/// read it the moment that event fired could find it not yet delivered, and take a failed command
+/// buffer for a finished one.
+#[derive(Default)]
+pub struct CommitFeedback {
+    delivered: std::sync::Mutex<Option<Delivered>>,
+    arrived: std::sync::Condvar,
+}
+
+impl CommitFeedback {
+    /// Delivered: the handler's word, once.
+    pub fn deliver(&self, d: Delivered) {
+        *self.delivered.lock().expect("commit feedback mutex") = Some(d);
+        self.arrived.notify_all();
+    }
+
+    /// What it said, waiting for the handler to say it.
+    fn wait(&self) -> Delivered {
+        let started = std::time::Instant::now();
+        let mut d = self.delivered.lock().expect("commit feedback mutex");
+        loop {
+            if let Some(d) = d.as_ref() {
+                return d.clone();
+            }
+            let (next, timeout) = (self.arrived)
+                .wait_timeout(d, std::time::Duration::from_secs(60))
+                .expect("commit feedback mutex");
+            d = next;
+            if timeout.timed_out() && d.is_none() {
+                eprintln!(
+                    "[scratchy-target-metal] a command buffer's commit feedback is {:?} late; \
+                     waiting for it",
+                    started.elapsed(),
+                );
+            }
+        }
+    }
+}
+
 /// A committed command buffer the host has not waited for.
 pub struct InFlight {
     pub(super) event: super::__re::SharedEvent,
     pub(super) value: u64,
-    /// Its GPU execution error, recorded by its own commit feedback handler.
-    pub(super) error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Its GPU execution error, or none, delivered by its own commit feedback handler.
+    pub(super) error: std::sync::Arc<CommitFeedback>,
     /// The commit options carrying that handler, kept until the command buffer is done.
     pub(super) _feedback: objc2::rc::Retained<objc2_metal::MTL4CommitOptions>,
     /// Every registered kernel-time heap's cursor at this command buffer's
@@ -307,11 +366,12 @@ unsafe impl Sync for InFlight {}
 static KERNEL_TIME_CB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl InFlight {
-    /// Block until the GPU is done with it. `Err`: the execution error its commit feedback reported
-    /// — a failed command buffer otherwise yields all-zero outputs silently.
+    /// Block until the GPU is done with it and its commit feedback has said how it went. `Err`: the
+    /// execution error that feedback reported — a failed command buffer otherwise yields all-zero
+    /// outputs silently.
     pub fn wait(&self) -> Result<(), ForwardError> {
         crate::mtl4_dispatch::wait_drained(&self.event, self.value);
-        if let Some(msg) = &*self.error.lock().expect("commit error mutex") {
+        if let Delivered::Err(msg) = self.error.wait() {
             eprintln!("[scratchy-target-metal] GPU commit error surfaced: {msg}");
             return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
         }
@@ -447,6 +507,14 @@ pub enum ForwardError {
     /// through: its caller grows them first (`SparseRegistry::reach`), or the forward would read
     /// un-wired memory.
     KvNotMapped { block: u32, mapped: usize },
+    /// A step samples `sampled` rows, whose logits its tape writes past its bucket's logits buffer
+    /// (sized for the rows a step samples at most, `GpuDevice::max_decode_rows`).
+    TooManySampledRows {
+        sampled: crate::tape::ids::SampledRowCount,
+        overflow: crate::tape::lowered::LogitsOverflow,
+    },
+    /// A step's sequence of no rows, which has no last row to sample.
+    EmptySequence(EmptySequence),
 }
 
 impl std::fmt::Display for ForwardError {
@@ -493,6 +561,15 @@ impl std::fmt::Display for ForwardError {
                 "MetalWorkerPool::forward: block {block} is past the {mapped} blocks the \
                  TurboQuant KV stores are mapped through (`SparseRegistry::reach` them first)"
             ),
+            Self::TooManySampledRows { sampled, overflow } => write!(
+                f,
+                "MetalWorkerPool::forward: the step samples {} rows, whose logits fill {} rows, \
+                 past the {} its bucket's logits buffer holds",
+                sampled.get(),
+                overflow.writes,
+                overflow.holds
+            ),
+            Self::EmptySequence(e) => write!(f, "MetalWorkerPool::forward: {e}"),
         }
     }
 }
@@ -502,5 +579,29 @@ impl std::error::Error for ForwardError {}
 impl From<WorkerError> for ForwardError {
     fn from(e: WorkerError) -> Self {
         Self::Worker(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CommitFeedback, Delivered};
+
+    /// A wait that starts before the commit feedback arrives, as it can once the shared event has
+    /// fired, waits for it, and every wait after sees the same: a failed command buffer is never
+    /// taken for a finished one.
+    #[test]
+    fn a_wait_before_the_feedback_arrives_gets_its_answer() {
+        let feedback = std::sync::Arc::new(CommitFeedback::default());
+        let handler = std::thread::spawn({
+            let feedback = std::sync::Arc::clone(&feedback);
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                feedback.deliver(Delivered::Err("out of memory".into()));
+            }
+        });
+        let failed = Delivered::Err("out of memory".into());
+        assert_eq!(feedback.wait(), failed, "the first wait");
+        assert_eq!(feedback.wait(), failed, "a later wait");
+        handler.join().expect("the handler thread");
     }
 }

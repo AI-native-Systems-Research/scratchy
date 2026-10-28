@@ -30,6 +30,9 @@ use tracing::info;
 #[cfg(feature = "spyre-hw")]
 use tracing::{debug, warn};
 
+/// A weight staged for binding: its tensor id, bytes, dtype and shape.
+pub(crate) type StagedWeight = (usize, Vec<u8>, SDType, Vec<usize>);
+
 /// ⭐ THE RESIDENT SEGMENTS EVERY BORROWER ADOPTS, AS ONE LIST. Four sites alias these (the
 /// prefix-capable prefill, the prefill ladder rungs, the decode batch rungs, and the top prefill
 /// session), and a segment missing from ONE of them leaves that session pointing at a 128 B
@@ -176,9 +179,6 @@ use crate::spyre_pool::*;
 use crate::spyre_types::*;
 use crate::spyre_worker::*;
 use crate::worker_factory::resolve_model_path;
-
-/// One staged weight: `(tensor id, bytes, dtype, shape)`.
-type StagedWeight = (usize, Vec<u8>, SDType, Vec<usize>);
 
 /// Parsed per-program metadata + the owned manifest (kept alive for the shared
 /// session) + model-level dims. No weights, no session — the caller builds those
@@ -1044,12 +1044,16 @@ impl SpyreWorker {
         // ⚠️ ONE `allow` SURVIVES, DOWN FROM SIX, and it is a cfg artifact rather than a silenced
         // problem: a value computed inside `cfg(sendnn)` and consumed outside it must be declared
         // before the branch, so its initialiser is dead in exactly the build that assigns it.
-        // `NONE` IS read on the non-sendnn path, and what it feeds is one call away.
-        // ⛔ THE MUTABILITY IS THE CARD PATH'S, so it carries that cfg rather than an
-        // `#[allow(unused_mut)]`: only the branch below assigns these, and on the emulator the
-        // binding is a plain `None` that is read once.
+        // `None` IS read on the non-sendnn path, and what it feeds is one call away.
+        // ⛔ ON THE CARD, `decode_facts` HAS NO VALUE UNTIL THE DECODE BAKE GIVES IT ONE: the
+        // branch below that bakes the decode bundle assigns it, and every other card path returns
+        // an error first, so the compiler proves it is set before it is read (the
+        // `served_context_v` pattern below). `BakeFacts::NONE` is not a default for the card.
+        // `prefill_facts` is assigned only when a prefill bundle is baked, and is
+        // `BakeFacts::NONE` (a bundle that placed nothing) when there is none. On the emulator
+        // both are `NONE`, read once.
         #[cfg(feature = "spyre-hw")]
-        let mut decode_facts = scratchy_target_spyre::wiring::BakeFacts::NONE;
+        let decode_facts: scratchy_target_spyre::wiring::BakeFacts;
         #[cfg(not(feature = "spyre-hw"))]
         let decode_facts = scratchy_target_spyre::wiring::BakeFacts::NONE;
         #[cfg(feature = "spyre-hw")]

@@ -11,8 +11,10 @@
 //!   ssm_state  : [num_slots, num_v_heads, head_v_dim, head_k_dim] (recurrent delta-rule state)
 //! ```
 //!
-//! Both buffers are **f32** (the `gdn_*` kernels operate in f32, and the
-//! model's `mamba_ssm_dtype` is `float32`). The slot a sequence owns is
+//! The conv ring and the draft lanes' records are **f32** everywhere (every
+//! `gdn_*` kernel reads and writes them as `device float*`); the ssm state's
+//! element dtype is the worker's to declare (`ssm_dtype` — metal's kernels read
+//! and write it as `device half`), its arithmetic f32 either way. The slot a sequence owns is
 //! decided host-side by the forward compiler's `GdnSlotAllocator`;
 //! the per-step `state_indices` tensor (one slot id per batched sequence) is
 //! built by the worker and consumed by the kernels.
@@ -58,8 +60,9 @@ use std::num::NonZeroU16;
 use anyhow::Result;
 use scratchy_tensors::{DType, GpuTensor, PoolMemory, TensorView};
 
-/// GDN recurrent-state buffers are always f32 (kernels + `mamba_ssm_dtype`).
-pub const GDN_STATE_DTYPE: DType = DType::F32;
+/// The conv-state ring and the draft lanes' records are f32: every GDN kernel, metal's and
+/// cuda's, reads and writes them as `device float*`.
+pub const GDN_CONV_AND_RECORD_DTYPE: DType = DType::F32;
 
 /// The drafts a verify step carries: it checkpoints the conv state after, and records the ssm
 /// inputs of, each of its `drafts + 1` rows (module docs).
@@ -360,7 +363,7 @@ pub struct GdnStateDims {
 }
 
 impl GdnStateDims {
-    /// One ssm state entry, in f32s: a slot's.
+    /// One ssm state entry, in elements: a slot's.
     pub fn ssm_entry_len(self) -> usize {
         self.num_v_heads * self.head_v_dim * self.head_k_dim
     }
@@ -378,9 +381,9 @@ impl GdnStateDims {
     }
 
     /// One slot's conv and ssm bytes: the stride a slot index steps through each of a linear
-    /// layer's two slot buffers.
-    pub fn slot_bytes(self) -> (usize, usize) {
-        let ([conv, ssm], _) = self.bytes(1, None);
+    /// layer's two slot buffers — the ssm entry at `ssm_dtype`'s width.
+    pub fn slot_bytes(self, ssm_dtype: DType) -> (usize, usize) {
+        let ([conv, ssm], _) = self.bytes(1, None, ssm_dtype);
         (conv, ssm)
     }
 
@@ -413,23 +416,32 @@ impl GdnStateDims {
         )
     }
 
-    /// One layer's conv and ssm bytes: its slots', then its lanes' (zero without lanes).
-    fn bytes(self, slots: usize, lanes: Option<DraftLanes>) -> ([usize; 2], [usize; 2]) {
-        let sz = GDN_STATE_DTYPE.size_bytes();
+    /// One layer's conv and ssm bytes: its slots', then its lanes' (zero without lanes). The ssm
+    /// slot entry is `ssm_dtype`'s width; its lanes' records and every conv entry are f32 (the
+    /// kernels read them as `device float*`).
+    fn bytes(
+        self,
+        slots: usize,
+        lanes: Option<DraftLanes>,
+        ssm_dtype: DType,
+    ) -> ([usize; 2], [usize; 2]) {
+        let sz = GDN_CONV_AND_RECORD_DTYPE.size_bytes();
         let elems = |dims: &[usize]| dims.iter().product::<usize>() * sz;
         let (conv, ssm) = self.slot_shapes(slots);
+        let ssm_slot = ssm.iter().product::<usize>() * ssm_dtype.size_bytes();
         let lane = lanes.map_or([0; 2], |lanes| {
             let (conv, ssm) = self.lane_shapes(lanes);
             [elems(&conv), elems(&ssm)]
         });
-        ([elems(&conv), elems(&ssm)], lane)
+        ([elems(&conv), ssm_slot], lane)
     }
 }
 
 /// Recurrent-state pool for the GDN (linear-attention) layers of a hybrid model.
 ///
-/// Allocates persistent f32 GPU memory at init time for every linear-attention
-/// layer; full-attention layers hold `None`. Slot assignment/recycling is the
+/// Allocates persistent GPU memory at init time for every linear-attention
+/// layer — the conv ring f32, the ssm state at `ssm_dtype` — with
+/// full-attention layers holding `None`. Slot assignment/recycling is the
 /// host allocator's job — this struct just owns the storage and hands out
 /// lifetime-checked views.
 pub struct GdnStatePool<M: PoolMemory> {
@@ -478,6 +490,7 @@ impl<M: PoolMemory> GdnStatePool<M> {
         num_slots: usize,
         lanes: Option<DraftLanes>,
         dims: GdnStateDims,
+        ssm_dtype: DType,
         mut alloc_buffer: impl FnMut(usize) -> Result<M>,
     ) -> Result<Self> {
         assert_eq!(
@@ -489,10 +502,10 @@ impl<M: PoolMemory> GdnStatePool<M> {
             dims.conv_kernel >= 1,
             "GdnStatePool: conv_kernel must be >= 1"
         );
-        let dtype = GDN_STATE_DTYPE;
+        let dtype = GDN_CONV_AND_RECORD_DTYPE;
         let (conv_shape, ssm_shape) = dims.slot_shapes(num_slots);
         let ([conv_bytes, ssm_bytes], [conv_lane_bytes, ssm_lane_bytes]) =
-            dims.bytes(num_slots, lanes);
+            dims.bytes(num_slots, lanes, ssm_dtype);
 
         let mut conv_states = Vec::with_capacity(num_layers);
         let mut ssm_states = Vec::with_capacity(num_layers);
@@ -513,7 +526,7 @@ impl<M: PoolMemory> GdnStatePool<M> {
                     GpuTensor::new(conv_mem.ptr(), &conv_shape, dtype)
                 }));
                 ssm_states.push(Some(unsafe {
-                    GpuTensor::new(ssm_mem.ptr(), &ssm_shape, dtype)
+                    GpuTensor::new(ssm_mem.ptr(), &ssm_shape, ssm_dtype)
                 }));
                 conv_ptrs.push(Some(conv_mem));
                 ssm_ptrs.push(Some(ssm_mem));
@@ -538,9 +551,10 @@ impl<M: PoolMemory> GdnStatePool<M> {
         let total_mb = (num_linear * per_layer) as f64 / (1024.0 * 1024.0);
         tracing::info!(
             "GdnStatePool: {num_linear}/{num_layers} linear layers × {num_slots} slots, {} draft \
-             lanes of {} draft rows ({dims:?}) = {total_mb:.0} MB f32",
+             lanes of {} draft rows ({dims:?}, conv {:?} / ssm {ssm_dtype:?}) = {total_mb:.0} MB",
             lanes.map_or(0, DraftLanes::count),
             lanes.map_or(0, |l| l.rows().0),
+            GDN_CONV_AND_RECORD_DTYPE,
         );
 
         Ok(Self {
@@ -590,8 +604,9 @@ impl<M: PoolMemory> GdnStatePool<M> {
         num_slots: usize,
         lanes: Option<DraftLanes>,
         dims: GdnStateDims,
+        ssm_dtype: DType,
     ) -> usize {
-        let (slot, lane) = dims.bytes(num_slots, lanes);
+        let (slot, lane) = dims.bytes(num_slots, lanes, ssm_dtype);
         num_linear * (slot.iter().sum::<usize>() + lane.iter().sum::<usize>())
     }
 
@@ -724,10 +739,12 @@ mod tests {
             head_k_dim: 128,
         };
         let rows = CheckpointRows(2);
-        let pool = |slots, lanes| GdnStatePool::<NoMem>::reserve_bytes(30, slots, lanes, dims);
+        let pool =
+            |slots, lanes| GdnStatePool::<NoMem>::reserve_bytes(30, slots, lanes, dims, DType::F16);
         let plain = pool(128, None);
         let lanes = DraftLanes::new(rows, 4);
-        let entry = 4 * (dims.conv_entry_len() + dims.ssm_entry_len());
+        // A slot's entry: its f32 conv ring, its ssm state at the metal kernels' half width.
+        let entry = 4 * dims.conv_entry_len() + 2 * dims.ssm_entry_len();
         assert_eq!(plain, 30 * 128 * entry);
         // A lane is the draft area every slot used to carry: (k + 1) conv checkpoints and two
         // record areas, 14.1 MiB over the 30 layers.

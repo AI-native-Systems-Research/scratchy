@@ -233,7 +233,10 @@ fn takes_drafts(scheduler: &Scheduler, req_id: &str) -> bool {
 
 impl EngineCore {
     /// Create a new EngineCore.
-    pub fn new(config: EngineCoreConfig, executor: Box<dyn Executor>) -> Self {
+    pub fn new(config: EngineCoreConfig, mut executor: Box<dyn Executor>) -> Self {
+        // ⭐ A finished guided grammar ends on what stops a request here, not on a guess of
+        // the tokenizer's (`grammar::build_parser_factory`).
+        executor.set_stop_token_ids(&config.eos_token_ids);
         use scratchy_serving_scheduler::scheduler::core::SimpleBlockTracker;
 
         let kv_cache: Box<dyn scratchy_serving_scheduler::scheduler::core::KVCacheManagerOps> = {
@@ -554,12 +557,21 @@ impl EngineCore {
         //    when no tokens are scheduled).
         let _t_exec = std::time::Instant::now();
         let executor = self.executor.as_mut().expect("checked above");
-        let mut model_output = executor
-            .execute_model(&scheduler_output)
-            .map_err(|e| EngineError::Executor(e.to_string()))?;
-
         // Resolve deferred D2H if present (sync path — resolve immediately).
-        model_output.resolve().map_err(EngineError::Executor)?;
+        let executed = executor
+            .execute_model(&scheduler_output)
+            .map_err(|e| EngineError::Executor(e.to_string()))
+            .and_then(|mut output| {
+                output.resolve().map_err(EngineError::Executor)?;
+                Ok(output)
+            });
+        let model_output = match executed {
+            Ok(output) => output,
+            Err(e) => {
+                self.abandon_step(&scheduler_output);
+                return Err(e);
+            }
+        };
         let _d_exec = _t_exec.elapsed();
 
         // 3. Finalize: process outputs, aborts, ngram, and stats.
@@ -655,9 +667,16 @@ impl EngineCore {
         }
     }
 
-    /// A step the executor failed: it is never finalized, so it leads no more.
-    pub fn abandon_step(&mut self, sched: &SchedulerOutput) {
+    /// A step the executor failed: it is never finalized, so it leads no more, and its requests
+    /// are aborted — none has the output the step owed it, and left running, the next step (or
+    /// the next caller's) would drive them on. The KV it was to write is no prefix-cache hit
+    /// ([`Scheduler::forget_unwritten`]), and a request a step behind it admitted onto that KV is
+    /// aborted with them. Returns every request aborted.
+    pub fn abandon_step(&mut self, sched: &SchedulerOutput) -> Vec<String> {
         self.end_lead(sched);
+        let req_ids = self.scheduler.forget_unwritten(sched);
+        self.abort_requests(&req_ids);
+        req_ids
     }
 
     /// A step done — finalized or failed: the step behind it waits on it no more.
@@ -847,10 +866,10 @@ impl EngineCore {
         let mut client_outputs: StepOutputs = HashMap::new();
         let mut finished_ids: Vec<(String, RequestStatus)> = Vec::new();
 
-        // ⭐ THE STEP RAN, SO THE RECURRENT-STATE SNAPSHOTS IT SAVED HOLD THEIR STATE — committed
-        // here and not when they were scheduled, because a step that fails never gets here.
-        self.scheduler
-            .commit_state_saves(&scheduler_output.recurrent_state.saves);
+        // ⭐ THE STEP RAN, SO THE RECURRENT-STATE SNAPSHOTS IT SAVED HOLD THEIR STATE, AND THE KV
+        // BLOCKS REGISTERED WHILE IT WAS SCHEDULED HOLD THEIRS — committed here and not when they
+        // were scheduled, because a step that fails never gets here.
+        self.scheduler.commit_step(scheduler_output);
         // ⭐ THE WORKER'S KV REPORT, BEFORE ANY OF THE TOKEN BOOKKEEPING. Empty for every backend whose
         // keys sit at their token positions; on one where they do not, this is what the next step's block
         // allocation is sized by and what bounds the prefix it may cache. Over the whole report rather
@@ -2685,10 +2704,49 @@ mod tests {
         assert_eq!(engine.num_unfinished_requests(), 0);
     }
 
+    /// A [`NoopExecutor`] that keeps the stop tokens it is handed.
+    struct StopRecordingExecutor(NoopExecutor, std::sync::Arc<std::sync::Mutex<Vec<u32>>>);
+
+    impl Executor for StopRecordingExecutor {
+        fn execute_model(
+            &mut self,
+            scheduler_output: &SchedulerOutput,
+        ) -> EngineResult<ModelRunnerOutput> {
+            self.0.execute_model(scheduler_output)
+        }
+        fn initialize_cache(&mut self, gpu: usize, cpu: usize) -> EngineResult<()> {
+            self.0.initialize_cache(gpu, cpu)
+        }
+        fn determine_available_memory(&mut self) -> EngineResult<Vec<usize>> {
+            self.0.determine_available_memory()
+        }
+        fn shutdown(&mut self) {
+            self.0.shutdown()
+        }
+        fn set_stop_token_ids(&mut self, stop_token_ids: &[u32]) {
+            *self.1.lock().unwrap() = stop_token_ids.to_vec();
+        }
+    }
+
+    /// The engine hands the worker the tokens it stops a request on, as it is built, so a finished
+    /// guided grammar ends on those (`grammar::build_parser_factory`).
+    #[test]
+    fn the_engine_hands_its_stop_tokens_to_the_worker() {
+        let handed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut config = make_test_config();
+        config.eos_token_ids = vec![2, 0];
+        let executor = StopRecordingExecutor(NoopExecutor::new(1024), handed.clone());
+        let _engine = EngineCore::new(config, Box::new(executor));
+        assert_eq!(*handed.lock().unwrap(), [2, 0]);
+    }
+
     /// A [`NoopExecutor`] whose worker keeps recurrent-state snapshots (a GDN hybrid on metal).
     struct SnapshottingExecutor(NoopExecutor);
 
     impl Executor for SnapshottingExecutor {
+        fn set_stop_token_ids(&mut self, stop_token_ids: &[u32]) {
+            self.0.set_stop_token_ids(stop_token_ids)
+        }
         fn execute_model(
             &mut self,
             scheduler_output: &SchedulerOutput,

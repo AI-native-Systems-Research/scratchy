@@ -17,7 +17,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use axum::extract::{Query, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -31,6 +31,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{Span, error, info};
 
 use crate::engine::{AsyncEngine, StreamDelta, StreamUsage};
+use crate::error::ApiJson;
 use crate::protocol;
 
 // ---------------------------------------------------------------------------
@@ -133,8 +134,38 @@ async fn count_request(
 // Router
 // ---------------------------------------------------------------------------
 
+/// Bytes of request JSON a token of the model's context may take: about 4 for a token of text,
+/// and 8× that for what JSON adds around it. That covers escapes (`\uXXXX`, 6 bytes, for each
+/// non-ASCII character, as Python's `json.dumps` writes them by default), long tokens such as
+/// runs of spaces, and the structure of the messages and tools.
+const BODY_BYTES_PER_TOKEN: usize = 32;
+
+/// What a model that takes images reads on top of its text. An image's bytes don't follow its
+/// tokens: it is resized to the model's input, so a 12-megapixel phone photo, about 5 MB of
+/// base64, may be 256 tokens. This is about six of them.
+const IMAGE_BODY_BYTES: usize = 32 << 20;
+
+/// The least any model reads: axum's default, which every route had before #789, so a body read
+/// then is read now. Not all of a request is prompt (a `response_format` schema, a guided grammar,
+/// `logit_bias`), so not all of it is bounded by the context.
+const MIN_BODY_LIMIT: usize = 2 << 20;
+
+/// ⭐ THE LARGEST REQUEST BODY THE SERVER READS IS WHAT ITS MODEL CAN TAKE (#789): a context of
+/// `max_model_len` tokens at [`BODY_BYTES_PER_TOKEN`], and [`IMAGE_BODY_BYTES`] more when it
+/// `takes_images`, but never less than [`MIN_BODY_LIMIT`]. A larger body can't fit the context, so
+/// no more than this is ever buffered: the read stops there with a 413 in the API's own error
+/// JSON (`ServeError::PayloadTooLarge`). A request that truncates its prompt
+/// (`truncate_prompt_tokens`, which keeps its last tokens) is bounded here too, at about 8× the
+/// context, which the floor keeps from being stricter than before.
+fn body_limit(max_model_len: usize, takes_images: bool) -> usize {
+    let text = max_model_len.saturating_mul(BODY_BYTES_PER_TOKEN);
+    let images = if takes_images { IMAGE_BODY_BYTES } else { 0 };
+    text.saturating_add(images).max(MIN_BODY_LIMIT)
+}
+
 /// Build the axum router with all API routes.
 pub fn build_router(state: Arc<AppState>) -> Router {
+    let limit = body_limit(state.engine.max_model_len(), state.engine.takes_images());
     #[allow(unused_mut)]
     let mut router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
@@ -160,6 +191,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     if state.config.metrics_enabled {
         router = router.route("/metrics", get(metrics));
     }
+
+    router = router.layer(DefaultBodyLimit::max(limit));
 
     // Count arrivals before anything else runs, so a request that a handler
     // later rejects still counts as traffic that reached this server.
@@ -379,7 +412,7 @@ fn build_tls_config(
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(request): Json<protocol::ChatCompletionRequest>,
+    ApiJson(request): ApiJson<protocol::ChatCompletionRequest>,
 ) -> Response {
     info!(
         "POST /v1/chat/completions: model={:?}, max_tokens={:?}, max_completion_tokens={:?}, stream={}",
@@ -405,7 +438,7 @@ async fn chat_completions(
 /// POST /v1/chat/completions/render
 async fn render_chat_completion(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<protocol::ChatCompletionRequest>,
+    ApiJson(request): ApiJson<protocol::ChatCompletionRequest>,
 ) -> Response {
     info!(
         "POST /v1/chat/completions/render: model={:?}",
@@ -421,7 +454,7 @@ async fn render_chat_completion(
 async fn completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(request): Json<protocol::CompletionRequest>,
+    ApiJson(request): ApiJson<protocol::CompletionRequest>,
 ) -> Response {
     if request.stream {
         let include_usage = wants_usage(request.stream_options.as_ref());
@@ -442,7 +475,7 @@ async fn completions(
 /// POST /v1/embeddings
 async fn embeddings(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<protocol::EmbeddingRequest>,
+    ApiJson(request): ApiJson<protocol::EmbeddingRequest>,
 ) -> Response {
     match state.engine.embeddings(request).await {
         Ok(response) => Json(response).into_response(),
@@ -624,7 +657,7 @@ async fn server_info(
 /// POST /tokenize
 async fn tokenize(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<protocol::TokenizeRequest>,
+    ApiJson(request): ApiJson<protocol::TokenizeRequest>,
 ) -> Response {
     let tokenizer = match state.engine.tokenizer() {
         Some(t) => t,
@@ -638,33 +671,40 @@ async fn tokenize(
         }
     };
 
-    // Determine the text to tokenize: either from prompt or chat messages.
-    let text = if let Some(prompt) = &request.prompt {
-        prompt.clone()
+    // A prompt adds the special tokens unless told not to. A chat prompt is rendered and encoded
+    // as the prefill does (#214): the tools, the kwargs over the server's defaults, and the
+    // prefill's special tokens unless the client names its own.
+    let encoded = if let Some(prompt) = &request.prompt {
+        tokenizer.encode(prompt, request.add_special_tokens.unwrap_or(true))
     } else if let Some(messages) = &request.messages {
-        {
-            let template = match state.engine.chat_template() {
-                Some(t) => t,
-                None => {
-                    return Json(protocol::ErrorResponse::new(
-                        "Chat-style tokenize requires a chat template",
-                        "BadRequestError",
-                        400,
-                    ))
-                    .into_response();
-                }
-            };
-            match template.render_chat(messages, None, None, None, request.add_generation_prompt) {
-                Ok(text) => text,
-                Err(e) => {
-                    return Json(protocol::ErrorResponse::new(
-                        format!("Chat template rendering failed: {e}"),
-                        "BadRequestError",
-                        400,
-                    ))
-                    .into_response();
-                }
+        let rendered = state.engine.render_chat(
+            messages,
+            request.tools.as_deref(),
+            request.chat_template_kwargs.as_ref(),
+            request.add_generation_prompt,
+        );
+        let text = match rendered {
+            Some(Ok(text)) => text,
+            Some(Err(e)) => {
+                return Json(protocol::ErrorResponse::new(
+                    format!("Chat template rendering failed: {e}"),
+                    "BadRequestError",
+                    400,
+                ))
+                .into_response();
             }
+            None => {
+                return Json(protocol::ErrorResponse::new(
+                    "Chat-style tokenize requires a chat template",
+                    "BadRequestError",
+                    400,
+                ))
+                .into_response();
+            }
+        };
+        match request.add_special_tokens {
+            Some(add_special) => tokenizer.encode(&text, add_special),
+            None => tokenizer.encode_chat(&text, &[]).map(|(ids, _)| ids),
         }
     } else {
         return Json(protocol::ErrorResponse::new(
@@ -675,11 +715,7 @@ async fn tokenize(
         .into_response();
     };
 
-    let add_special = request
-        .add_special_tokens
-        .unwrap_or(request.prompt.is_some());
-
-    match tokenizer.encode(&text, add_special) {
+    match encoded {
         Ok(token_ids) => {
             let token_strs = if request.return_token_strs.unwrap_or(false) {
                 Some(
@@ -711,7 +747,7 @@ async fn tokenize(
 /// POST /detokenize
 async fn detokenize(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<protocol::DetokenizeRequest>,
+    ApiJson(request): ApiJson<protocol::DetokenizeRequest>,
 ) -> Response {
     let tokenizer = match state.engine.tokenizer() {
         Some(t) => t,
@@ -820,29 +856,63 @@ impl ChoiceUsage {
             .insert(delta.index, delta.usage);
     }
 
-    /// Output tokens across every choice.
-    fn completion_tokens(&self) -> u32 {
+    /// Usage across the stream, matching the non-streaming responses: each prompt's tokens and
+    /// cache hit count once, however many choices run it, and output adds up across choices.
+    /// Its cached tokens are part of its prompt tokens, so they never exceed them (#580). The
+    /// hit is the least any choice of the prompt had: what the cache held when the request came
+    /// in. A choice admitted after a sibling computed the prompt hits the sibling's fresh blocks,
+    /// and the largest hit would report that prefill as cached.
+    fn totals(&self) -> UsageTotals {
         let choices = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        choices.values().map(|u| u.completion_tokens).sum()
-    }
-
-    /// Usage for a chat stream, matching the non-streaming response: every choice shares one
-    /// prompt, so `prompt_tokens` is counted once, while output and cached tokens add up across
-    /// choices.
-    fn chat_usage(&self) -> protocol::UsageInfo {
-        let choices = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let prompt_tokens = choices.values().map(|u| u.prompt_tokens).max().unwrap_or(0);
-        let completion_tokens = choices.values().map(|u| u.completion_tokens).sum();
-        let cached_tokens: u32 = choices.values().map(|u| u.cached_tokens).sum();
-        protocol::UsageInfo {
-            prompt_tokens,
-            completion_tokens: Some(completion_tokens),
-            total_tokens: prompt_tokens + completion_tokens,
-            prompt_tokens_details: (cached_tokens > 0).then_some(protocol::PromptTokenUsageInfo {
-                cached_tokens: Some(cached_tokens),
-            }),
+        let mut prompts: std::collections::HashMap<crate::engine::PromptIndex, (u32, u32)> =
+            std::collections::HashMap::new();
+        for u in choices.values() {
+            let (tokens, cached) = prompts
+                .entry(u.prompt)
+                .or_insert((u.prompt_tokens, u.cached_tokens));
+            *tokens = (*tokens).max(u.prompt_tokens);
+            *cached = (*cached).min(u.cached_tokens);
+        }
+        UsageTotals {
+            prompt_tokens: prompts.values().map(|&(tokens, _)| tokens).sum(),
+            cached_tokens: prompts.values().map(|&(_, cached)| cached).sum(),
+            completion_tokens: choices.values().map(|u| u.completion_tokens).sum(),
         }
     }
+
+    /// Usage for a chat stream, with the prompt's cache hit in `prompt_tokens_details`.
+    fn chat_usage(&self) -> protocol::UsageInfo {
+        let t = self.totals();
+        protocol::UsageInfo {
+            prompt_tokens: t.prompt_tokens,
+            completion_tokens: Some(t.completion_tokens),
+            total_tokens: t.prompt_tokens + t.completion_tokens,
+            prompt_tokens_details: (t.cached_tokens > 0).then_some(
+                protocol::PromptTokenUsageInfo {
+                    cached_tokens: Some(t.cached_tokens),
+                },
+            ),
+        }
+    }
+
+    /// Usage for a completions stream: no `prompt_tokens_details`, as in the non-streaming
+    /// response.
+    fn completion_usage(&self) -> protocol::UsageInfo {
+        let t = self.totals();
+        protocol::UsageInfo {
+            prompt_tokens: t.prompt_tokens,
+            completion_tokens: Some(t.completion_tokens),
+            total_tokens: t.prompt_tokens + t.completion_tokens,
+            prompt_tokens_details: None,
+        }
+    }
+}
+
+/// A stream's token counts, each prompt counted once ([`ChoiceUsage::totals`]).
+struct UsageTotals {
+    prompt_tokens: u32,
+    cached_tokens: u32,
+    completion_tokens: u32,
 }
 
 /// Build an SSE stream for chat completions.
@@ -865,13 +935,21 @@ fn stream_chat_response(
         }
     });
 
+    // The choices that have sent a tool-call delta. The engine sends a tool call's finish as a
+    // delta of its own, with no tool-call pieces, so the finish reason reads the whole stream, as
+    // `/v1/messages` does. Only a call the model finished is `tool_calls`: one cut off by
+    // `max_tokens` stays `length`, and an engine failure stays `abort`, so no client runs a call
+    // whose arguments may be incomplete.
+    let mut called_tools = std::collections::HashSet::new();
     let stream = UnboundedReceiverStream::new(rx).map(move |delta| {
         recorder.record(&delta);
 
-        // Determine finish reason — override to "tool_calls" if tool call deltas present.
-        let has_tool_calls = delta.tool_call_deltas.is_some();
+        if delta.tool_call_deltas.is_some() {
+            called_tools.insert(delta.index);
+        }
         let finish_reason_str = delta.finish_reason.map(|r| {
-            if has_tool_calls {
+            if r == scratchy_core_common::FinishReason::Stop && called_tools.contains(&delta.index)
+            {
                 "tool_calls".to_string()
             } else {
                 r.to_string()
@@ -920,17 +998,8 @@ fn stream_chat_response(
         let (content, tool_calls) = if tool_calls_json.is_some() {
             (None, tool_calls_json)
         } else {
-            // Use detokenized text if available, otherwise fall back to placeholders.
-            let text = delta.text.unwrap_or_else(|| {
-                use std::fmt::Write;
-                let mut s = String::new();
-                for id in &delta.new_token_ids {
-                    let _ = write!(s, "<token_{id}>");
-                }
-                s
-            });
-            let content = if text.is_empty() { None } else { Some(text) };
-            (content, None)
+            // `None` is a delta with no content: reasoning only, or a finish.
+            (delta.text.filter(|text| !text.is_empty()), None)
         };
 
         let chunk = protocol::ChatCompletionStreamResponse::new(
@@ -999,15 +1068,8 @@ fn stream_completion_response(
     let usage_chunk = include_usage.then(|| {
         let (id, model) = (format!("cmpl-{}", request_id), model.clone());
         move || {
-            let completion_tokens = usage.completion_tokens();
             let mut chunk = protocol::CompletionStreamResponse::new(id, model, vec![]);
-            chunk.usage = Some(protocol::UsageInfo {
-                // Always 0, unlike chat's chunk: #557.
-                prompt_tokens: 0,
-                completion_tokens: Some(completion_tokens),
-                total_tokens: completion_tokens,
-                prompt_tokens_details: None,
-            });
+            chunk.usage = Some(usage.completion_usage());
             chunk
         }
     });
@@ -1017,14 +1079,8 @@ fn stream_completion_response(
 
         let finish_reason_str = delta.finish_reason.map(|r| r.to_string());
 
-        let text = delta.text.unwrap_or_else(|| {
-            use std::fmt::Write;
-            let mut s = String::new();
-            for id in &delta.new_token_ids {
-                let _ = write!(s, "<token_{id}>");
-            }
-            s
-        });
+        // `None` is a delta with no text: a finish.
+        let text = delta.text.unwrap_or_default();
 
         let chunk = protocol::CompletionStreamResponse::new(
             format!("cmpl-{}", req_id),
@@ -1068,6 +1124,11 @@ mod tests {
     use tower::ServiceExt;
 
     fn make_test_state() -> Arc<AppState> {
+        make_test_state_of(4096)
+    }
+
+    /// A test state whose model has `max_model_len` tokens of context.
+    fn make_test_state_of(max_model_len: usize) -> Arc<AppState> {
         let engine_config = EngineCoreConfig {
             hybrid_kv: None,
             scheduler_config: SchedulerConfig {
@@ -1079,7 +1140,7 @@ mod tests {
                 long_prefill_token_threshold: 0,
                 ..Default::default()
             },
-            max_model_len: 4096,
+            max_model_len,
             num_gpu_blocks: 1024,
             block_size: 16,
             engine_index: 0,
@@ -1092,10 +1153,10 @@ mod tests {
         };
         let executor = Box::new(NoopExecutor::new(1024));
         let client = Box::new(InprocClient::new(engine_config, executor));
-        let engine = Arc::new(AsyncEngine::new(client, "test-model".to_string(), 4096));
+        let engine = AsyncEngine::new(client, "test-model".to_string(), max_model_len);
 
         Arc::new(AppState {
-            engine,
+            engine: Arc::new(engine),
             config: ServerConfig::default(),
             is_pooling: false,
             scratchy_core_config: None,
@@ -1415,13 +1476,149 @@ mod tests {
             .unwrap();
 
         let response = app.oneshot(request).await.unwrap();
-        // Missing required field "messages" → 422
-        assert_eq!(
-            response.status(),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "actual status: {}",
-            response.status()
-        );
+        // Missing required field "messages": a 400 in the OpenAI error shape, naming the field.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error = error_body(response).await;
+        let message = error["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("messages"), "{error}");
+        assert_eq!(error["error"]["type"], "BadRequestError", "{error}");
+    }
+
+    /// The body of an error response, as JSON.
+    async fn error_body(response: axum::response::Response) -> serde_json::Value {
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&body).unwrap_or_else(|e| panic!("not JSON ({e}): {body:?}"))
+    }
+
+    /// The body limit follows the model's context (#789): 32 bytes a token, 32 MiB more for a
+    /// model that takes images, and never under axum's 2 MiB default.
+    #[test]
+    fn the_body_limit_is_what_the_models_context_takes() {
+        const MIB: usize = 1 << 20;
+        assert_eq!(body_limit(4096, false), 2 * MIB, "the floor");
+        assert_eq!(body_limit(65_536, false), 2 * MIB);
+        assert_eq!(body_limit(131_072, false), 4 * MIB);
+        assert_eq!(body_limit(262_144, false), 8 * MIB);
+        assert_eq!(body_limit(131_072, true), 36 * MIB, "and the images'");
+        assert_eq!(body_limit(4096, true), 32 * MIB + 128 * 1024);
+    }
+
+    /// Every route reads a body up to its model's limit and refuses one byte more, with a 413 in
+    /// the API's own error JSON (#789). The body at the limit is read, so it is refused for what it
+    /// says (a bad `tool_choice`, a 400). A model of a smaller context refuses a body the larger one
+    /// read.
+    #[tokio::test]
+    async fn a_body_is_read_up_to_its_models_limit_and_refused_past_it() {
+        let send = |max_model_len: usize, uri: &str, body: String| {
+            let request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            async move {
+                let response = build_router(make_test_state_of(max_model_len))
+                    .oneshot(request)
+                    .await
+                    .unwrap();
+                (response.status(), error_body(response).await)
+            }
+        };
+        // A body of exactly `bytes`, `content` padded to make it so.
+        let sized = |bytes: usize, body: &dyn Fn(&str) -> String| {
+            let body = body(&"x".repeat(bytes - body("").len()));
+            assert_eq!(body.len(), bytes);
+            body
+        };
+        let chat = |content: &str| {
+            format!(
+                r#"{{"messages": [{{"role": "user", "content": "{content}"}}],
+                    "tool_choice": "requried"}}"#
+            )
+        };
+        let messages = |content: &str| {
+            format!(
+                r#"{{"max_tokens": 8, "messages": [{{"role": "user", "content": "{content}"}}],
+                    "tool_choice": {{"type": "mystery"}}}}"#
+            )
+        };
+        let context = 131_072;
+        let limit = body_limit(context, false);
+        assert_eq!(limit, 4 << 20);
+
+        let (status, error) = send(context, "/v1/chat/completions", sized(limit, &chat)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        let (status, error) = send(context, "/v1/chat/completions", sized(limit + 1, &chat)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{error}");
+        assert_eq!(error["error"]["type"], "RequestTooLargeError", "{error}");
+
+        let (status, error) = send(context, "/v1/messages", sized(limit, &messages)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert_eq!(error["error"]["type"], "invalid_request_error", "{error}");
+        let (status, error) = send(context, "/v1/messages", sized(limit + 1, &messages)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{error}");
+        assert_eq!(error["type"], "error", "{error}");
+        assert_eq!(error["error"]["type"], "request_too_large", "{error}");
+
+        // The same 3 MiB body, read at a 128k context, is past an 8k one's limit.
+        let three_mib = sized(3 << 20, &chat);
+        let (status, error) = send(context, "/v1/chat/completions", three_mib.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        let (status, error) = send(8192, "/v1/chat/completions", three_mib).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{error}");
+    }
+
+    /// A body an endpoint can't read is a 400 in that API's error JSON, as the upstream APIs answer
+    /// it, not axum's plain-text 422 (#787): `/v1/responses` in the OpenAI shape, `/v1/messages`
+    /// in Anthropic's. `/v1/messages` answers the engine's own refusals in Anthropic's shape too.
+    #[tokio::test]
+    async fn an_unreadable_body_is_a_400_in_the_apis_error_shape() {
+        let post = |uri: &str, body: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let send = |request: Request<Body>| async move {
+            let response = build_router(make_test_state())
+                .oneshot(request)
+                .await
+                .unwrap();
+            (response.status(), error_body(response).await)
+        };
+
+        let responses = r#"{"input": "Hi", "tool_choice": "requried"}"#;
+        let (status, error) = send(post("/v1/responses", responses)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        let message = error["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("tool_choice"), "{error}");
+
+        let anthropic_error = |error: &serde_json::Value| {
+            assert_eq!(error["type"], "error", "{error}");
+            assert_eq!(error["error"]["type"], "invalid_request_error", "{error}");
+            error["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let messages = r#"{"max_tokens": 8, "messages": [{"role": "user", "content": "Hi"}],
+                           "tool_choice": {"type": "mystery"}}"#;
+        let (status, error) = send(post("/v1/messages", messages)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert!(anthropic_error(&error).contains("tool_choice"), "{error}");
+
+        let (status, error) = send(post("/v1/messages", "{invalid")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        anthropic_error(&error);
+
+        let undeclared = r#"{"max_tokens": 8, "messages": [{"role": "user", "content": "Hi"}],
+            "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "tool", "name": "Raed"}}"#;
+        let (status, error) = send(post("/v1/messages", undeclared)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert!(anthropic_error(&error).contains("Raed"), "{error}");
     }
 
     #[tokio::test]
@@ -1976,7 +2173,7 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(
             response.status(),
-            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::BAD_REQUEST,
             "actual status: {}",
             response.status()
         );
@@ -2024,7 +2221,10 @@ mod tests {
     fn buffered_tool_call_rx(
         choices: u32,
     ) -> (tokio::sync::mpsc::UnboundedReceiver<StreamDelta>, u32) {
-        let (deltas, generated) = crate::engine::test_support::buffered_tool_call_deltas(false);
+        let (deltas, generated) = crate::engine::test_support::buffered_tool_call_deltas(
+            false,
+            scratchy_core_common::FinishReason::Stop,
+        );
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         for index in 0..choices {
             for delta in &deltas {
@@ -2105,9 +2305,10 @@ mod tests {
                 "model": "m",
                 "choices": [],
                 "usage": {
-                    "prompt_tokens": 0,
+                    // One prompt, two choices of it: counted once.
+                    "prompt_tokens": 5,
                     "completion_tokens": generated,
-                    "total_tokens": generated,
+                    "total_tokens": 5 + generated,
                 },
             })
         );
@@ -2138,27 +2339,154 @@ mod tests {
         }
     }
 
-    /// Cached tokens add up across choices, as in the non-streaming response, and are reported
-    /// in `prompt_tokens_details`. Only one of the two choices hits the cache here.
+    /// Each choice's finish reason, in stream order.
+    fn chat_finishes(payloads: &[serde_json::Value]) -> Vec<(u64, String)> {
+        payloads
+            .iter()
+            .filter_map(|p| {
+                let choice = p["choices"].get(0)?;
+                let reason = choice["finish_reason"].as_str()?;
+                Some((choice["index"].as_u64().unwrap(), reason.to_string()))
+            })
+            .collect()
+    }
+
+    /// A choice that sent a tool call finishes with `tool_calls`, as OpenAI's API says, even
+    /// though the engine sends that finish as a delta of its own with no tool-call pieces.
+    #[tokio::test]
+    async fn test_chat_stream_tool_call_finishes_with_tool_calls() {
+        for choices in [1, 2] {
+            let (rx, _) = buffered_tool_call_rx(choices);
+            let response = stream_chat_response("r".into(), "m".into(), rx, false);
+            let payloads = sse_payloads(response.into_response()).await;
+            let finish = payloads
+                .iter()
+                .find(|p| !p["choices"][0]["finish_reason"].is_null())
+                .unwrap();
+            assert!(
+                finish["choices"][0]["delta"]["tool_calls"].is_null(),
+                "the finish carries no tool-call piece"
+            );
+            let expected: Vec<_> = (0..u64::from(choices))
+                .map(|i| (i, "tool_calls".to_string()))
+                .collect();
+            assert_eq!(chat_finishes(&payloads), expected, "n={choices}");
+        }
+    }
+
+    /// The reason follows each choice's own deltas: a choice that sent no tool call keeps its
+    /// own finish reason beside one that did.
+    #[tokio::test]
+    async fn test_chat_stream_finish_reason_is_per_choice() {
+        let (mut rx, _) = buffered_tool_call_rx(2);
+        let (tx, mixed_rx) = tokio::sync::mpsc::unbounded_channel();
+        while let Ok(delta) = rx.try_recv() {
+            if delta.index == 1 && delta.tool_call_deltas.is_some() {
+                continue;
+            }
+            tx.send(delta).unwrap();
+        }
+        drop(tx);
+        let response = stream_chat_response("r".into(), "m".into(), mixed_rx, false);
+        let payloads = sse_payloads(response.into_response()).await;
+        assert_eq!(
+            chat_finishes(&payloads),
+            [(0, "tool_calls".to_string()), (1, "stop".to_string())]
+        );
+    }
+
+    /// Only a tool call the model finished ends `tool_calls`: one cut off by `max_tokens` ends
+    /// `length`, and an engine failure partway through ends `abort`, so no client runs a call
+    /// whose arguments may be incomplete.
+    #[tokio::test]
+    async fn test_chat_stream_tool_call_cut_short_keeps_its_finish_reason() {
+        use scratchy_core_common::FinishReason;
+        for (finish, expected) in [
+            (FinishReason::Length, "length"),
+            (FinishReason::Abort, "abort"),
+        ] {
+            let (mut rx, _) = buffered_tool_call_rx(1);
+            let (tx, cut_rx) = tokio::sync::mpsc::unbounded_channel();
+            while let Ok(mut delta) = rx.try_recv() {
+                if delta.finish_reason.is_some() {
+                    delta.finish_reason = Some(finish);
+                }
+                tx.send(delta).unwrap();
+            }
+            drop(tx);
+            let response = stream_chat_response("r".into(), "m".into(), cut_rx, false);
+            let payloads = sse_payloads(response.into_response()).await;
+            assert_eq!(
+                chat_finishes(&payloads),
+                [(0, expected.to_string())],
+                "{finish:?}"
+            );
+        }
+    }
+
+    /// The prompt's cache hit is reported in `prompt_tokens_details`, as in the non-streaming
+    /// response: the least any choice had (2 of 2 and 6), what the cache held on arrival. A
+    /// larger hit is a choice reusing a sibling's prefill of the same prompt.
     #[tokio::test]
     async fn test_chat_stream_usage_reports_cached_tokens() {
         let (mut rx, _) = buffered_tool_call_rx(2);
         let (tx, cached_rx) = tokio::sync::mpsc::unbounded_channel();
         while let Ok(mut delta) = rx.try_recv() {
-            if delta.index == 1 {
-                delta.usage.cached_tokens = 3;
-            }
+            delta.usage.cached_tokens = [2, 6][delta.index as usize];
             tx.send(delta).unwrap();
         }
         drop(tx);
         let response = stream_chat_response("r".into(), "m".into(), cached_rx, true);
         let payloads = sse_payloads(response.into_response()).await;
         let usage = &payloads.last().expect("usage chunk")["usage"];
-        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 3);
+        assert_eq!(
+            usage["prompt_tokens_details"]["cached_tokens"], 2,
+            "the least hit: what the cache held when the request came in"
+        );
         assert_eq!(
             usage["prompt_tokens"], 5,
             "cached tokens are part of the prompt"
         );
+    }
+
+    /// Every choice runs the one prompt and records its own hit on it, so the hit counts once, as
+    /// the prompt does: cached tokens never exceed prompt tokens (#580).
+    #[tokio::test]
+    async fn test_chat_stream_usage_counts_the_prompts_cache_hit_once() {
+        let (mut rx, _) = buffered_tool_call_rx(2);
+        let (tx, cached_rx) = tokio::sync::mpsc::unbounded_channel();
+        while let Ok(mut delta) = rx.try_recv() {
+            delta.usage.cached_tokens = 4;
+            tx.send(delta).unwrap();
+        }
+        drop(tx);
+        let response = stream_chat_response("r".into(), "m".into(), cached_rx, true);
+        let payloads = sse_payloads(response.into_response()).await;
+        let usage = &payloads.last().expect("usage chunk")["usage"];
+        assert_eq!(usage["prompt_tokens"], 5);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 4);
+    }
+
+    /// A completions stream counts each of its prompts once, however many choices run it, as the
+    /// non-streaming response does (#557: it reported 0): two prompts of 5 and 9 tokens, two
+    /// choices each.
+    #[tokio::test]
+    async fn test_completion_stream_usage_counts_each_prompt_once() {
+        let (mut rx, generated) = buffered_tool_call_rx(4);
+        let (tx, prompts_rx) = tokio::sync::mpsc::unbounded_channel();
+        while let Ok(mut delta) = rx.try_recv() {
+            delta.usage.prompt = crate::engine::PromptIndex(delta.index / 2);
+            delta.usage.prompt_tokens = [5, 9][delta.usage.prompt.0 as usize];
+            tx.send(delta).unwrap();
+        }
+        drop(tx);
+        let response = stream_completion_response("r".into(), "m".into(), prompts_rx, true);
+        let payloads = sse_payloads(response.into_response()).await;
+        let usage = &payloads.last().expect("usage chunk")["usage"];
+        assert_eq!(usage["prompt_tokens"], 14);
+        assert_eq!(usage["completion_tokens"], generated);
+        assert_eq!(usage["total_tokens"], 14 + generated);
+        assert!(usage.get("prompt_tokens_details").is_none(), "{usage}");
     }
 
     /// No cache hit, no `prompt_tokens_details` — the non-streaming response leaves it out too.
@@ -2169,6 +2497,31 @@ mod tests {
         let payloads = sse_payloads(response.into_response()).await;
         let usage = &payloads.last().expect("usage chunk")["usage"];
         assert!(usage.get("prompt_tokens_details").is_none(), "{usage}");
+    }
+
+    /// A reasoning-only delta has no text, and streams no content: not its token ids as
+    /// `<token_N>` placeholders (#601: every gpt-oss reasoning delta did).
+    #[tokio::test]
+    async fn test_chat_stream_reasoning_delta_streams_no_content() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(StreamDelta {
+            index: 0,
+            new_token_ids: vec![2167],
+            text: None,
+            finish_reason: None,
+            stop_reason: None,
+            logprobs: None,
+            tool_call_deltas: None,
+            reasoning: Some("We".into()),
+            usage: Default::default(),
+        })
+        .unwrap();
+        drop(tx);
+        let response = stream_chat_response("r".into(), "m".into(), rx, false);
+        let payloads = sse_payloads(response.into_response()).await;
+        let delta = &payloads[0]["choices"][0]["delta"];
+        assert_eq!(delta["reasoning"], "We");
+        assert!(delta.get("content").is_none(), "{delta}");
     }
 
     #[tokio::test]

@@ -18,7 +18,7 @@ use crate::sparse_kv::{KvMapper, MapRange, PAGE, map_step};
 pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 
 /// One placement-sparse buffer and how far it is mapped. Every worker binding it holds the same
-/// one, so a borrower that reaches further than its lender maps for both.
+/// one, so a guest that reaches further than its host maps for both.
 pub struct SparseBuffer {
     buffer: Buffer,
     mapped: Mutex<Mapped>,

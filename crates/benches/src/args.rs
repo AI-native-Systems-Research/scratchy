@@ -432,6 +432,13 @@ pub struct BenchServeArgs {
     #[arg(long)]
     pub save_result: bool,
 
+    /// Also keep every request's own figures in the results JSON, in vLLM's `--save-detailed`
+    /// layout: `input_lens`, `output_lens`, `ttfts`, `itls`, `latencies`, `start_times`,
+    /// `generated_texts`, `errors` (seconds; parallel arrays in request order), plus `chunks`,
+    /// the text chunks each stream carried. Single-turn runs only.
+    #[arg(long)]
+    pub save_detailed: bool,
+
     /// Directory to save results in (used with --save-result).
     #[arg(long)]
     pub result_dir: Option<String>,
@@ -464,10 +471,28 @@ pub struct BenchServeArgs {
     #[arg(long, default_value_t = 256)]
     pub multi_turn_reply_len: usize,
 
-    /// JSON object sent as `chat_template_kwargs` on `multi-turn` requests,
+    /// JSON object sent as `chat_template_kwargs` on `multi-turn` and dataset requests,
     /// e.g. '{"enable_thinking":false}'. Not sent when unset.
     #[arg(long, value_parser = parse_json_object)]
     pub chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
+
+    /// `rag` and `rag-spans`: which multi-document QA dataset.
+    #[arg(long, value_enum, default_value_t = RagSource::Musique)]
+    pub rag_source: RagSource,
+
+    /// `longbench`: LongBench v2's length class (`short`, `medium` or `long`).
+    #[arg(long, default_value = "short")]
+    pub longbench_length: String,
+
+    /// Dataset workloads: the longest prompt sent, in tokens. A longer task is left out, so
+    /// every engine gets the same tasks.
+    #[arg(long)]
+    pub max_prompt_tokens: Option<usize>,
+
+    /// Dataset workloads: write each task's answer, its reference and its score to this JSON file,
+    /// to check how the answers were scored.
+    #[arg(long)]
+    pub save_answers: Option<String>,
 }
 
 impl BenchServeArgs {
@@ -476,11 +501,20 @@ impl BenchServeArgs {
         self.dataset_name == ServeDataset::MultiTurn
     }
 
+    /// A dataset workload: real tasks, sent as chat, answers ending on their own and scored.
+    pub(crate) fn is_task_dataset(&self) -> bool {
+        matches!(
+            self.dataset_name,
+            ServeDataset::Rag | ServeDataset::RagSpans | ServeDataset::Longbench
+        )
+    }
+
     /// `--endpoint`, or the dataset's own default.
     pub(crate) fn endpoint(&self) -> &str {
         match &self.endpoint {
             Some(endpoint) => endpoint,
-            None if self.is_multi_turn() => "/v1/chat/completions",
+            None if self.dataset_name == ServeDataset::RagSpans => "/v1/query/execute?stream=true",
+            None if self.is_multi_turn() || self.is_task_dataset() => "/v1/chat/completions",
             None => "/v1/completions",
         }
     }
@@ -509,6 +543,26 @@ pub enum ServeDataset {
     /// Closed-loop chats sharing one system prompt, sent non-streaming to the
     /// chat endpoint: measures prefix reuse from one turn to the next.
     MultiTurn,
+    /// Multi-document QA, retrieval-augmented: each task its question with its documents
+    /// (`--rag-source`), streamed as a chat request, answers scored.
+    Rag,
+    /// The `rag` tasks through scratchy's `POST /v1/query/execute`, each document a span its
+    /// cache can be reused from wherever it sits in a prompt. scratchy only.
+    RagSpans,
+    /// LongBench v2's multiple-choice tasks of one length class (`--longbench-length`), streamed
+    /// as a chat request, answers scored.
+    Longbench,
+}
+
+/// Where `--dataset-name rag` takes its tasks from: the multi-document QA loaders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum RagSource {
+    /// 2WikiMultihopQA (needs the `datasets` feature).
+    TwoWiki,
+    /// MuSiQue.
+    Musique,
+    /// HotpotQA, distractor setting (needs the `datasets` feature).
+    Hotpotqa,
 }
 
 /// Arguments for `scr bench startup`.
@@ -1576,6 +1630,33 @@ mod tests {
         assert_eq!(a.endpoint(), "/v1/completions");
         let a = BenchServeArgs::try_parse_from(["serve", "--dataset-name", "sharegpt"]).unwrap();
         assert_eq!(a.endpoint(), "/v1/completions");
+    }
+
+    /// A dataset workload is sent as chat; `rag-spans` as a span query, to scratchy's own
+    /// endpoint.
+    #[test]
+    fn dataset_workloads_take_the_chat_or_span_endpoint() {
+        let parse = |name| BenchServeArgs::try_parse_from(["serve", "--dataset-name", name]);
+        for name in ["rag", "longbench"] {
+            let a = parse(name).unwrap();
+            assert!(a.is_task_dataset(), "{name}");
+            assert_eq!(a.endpoint(), "/v1/chat/completions", "{name}");
+        }
+        let a = parse("rag-spans").unwrap();
+        assert!(a.is_task_dataset());
+        assert_eq!(a.endpoint(), "/v1/query/execute?stream=true");
+        assert_eq!(a.rag_source, RagSource::Musique);
+        assert_eq!(a.longbench_length, "short");
+        assert!(!parse("sharegpt").unwrap().is_task_dataset());
+        let a = BenchServeArgs::try_parse_from([
+            "serve",
+            "--dataset-name",
+            "rag",
+            "--rag-source",
+            "two-wiki",
+        ])
+        .unwrap();
+        assert_eq!(a.rag_source, RagSource::TwoWiki);
     }
 
     #[test]

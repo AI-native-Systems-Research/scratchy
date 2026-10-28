@@ -21,8 +21,8 @@ use crate::tape::constants::{ConstSlot, ConstantValue};
 use crate::tape::ids::{
     AttnDebugMode, AttnScale, AttnWindow, BlockSize, BlocksPerChunk, BucketM, ElementCount,
     HeadDim, HiddenSize, IntermediateSize, KDim, KDimI32, KPartitionSizeI32, MDimI32, NDim,
-    NDimI32, NumExperts, NumKvHeads, NumQHeads, QSize, RmsNormEps, RopePairOff, RotDim, SplitK,
-    TopK, TqCodeBits, TqDecodeHeads,
+    NDimI32, NumExperts, NumKvHeads, NumQHeads, QSize, RmsNormEps, RopePairOff, RotDim, RowStride,
+    SplitK, TopK, TqCodeBits, TqDecodeHeads,
 };
 use crate::tape::lowered::ActivationWidth;
 
@@ -1305,18 +1305,18 @@ impl From<AffineEmbedConstants> for Vec<ConstantValue> {
     }
 }
 
-// ── GatherLastToken / ScatterFirstToLastRow ───────────────────────
+// ── GatherSampledRows / PutSampledRowsBack ───────────────────────
 
-/// `KernelId::GatherLastToken` and `KernelId::ScatterFirstToLastRow`
+/// `KernelId::GatherSampledRows` and `KernelId::PutSampledRowsBack`
 /// share the single-`row_stride` constant layout
-/// (`gather_last_token_<dtype>_specialized` and
-/// `scatter_first_to_last_row_<dtype>_specialized`).
-pub struct GatherLastTokenConstants {
-    pub row_stride: HiddenSize,
+/// (`gather_sampled_rows_<dtype>_specialized` and
+/// `put_sampled_rows_back_<dtype>_specialized`).
+pub struct SampleRowsConstants {
+    pub row_stride: RowStride,
 }
 
-impl From<GatherLastTokenConstants> for Vec<ConstantValue> {
-    fn from(c: GatherLastTokenConstants) -> Self {
+impl From<SampleRowsConstants> for Vec<ConstantValue> {
+    fn from(c: SampleRowsConstants) -> Self {
         vec![ConstantValue::uint(ConstSlot(0), c.row_stride.get())]
     }
 }

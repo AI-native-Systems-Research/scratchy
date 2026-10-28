@@ -154,7 +154,7 @@ all-arches = [
 "gpt-oss-120b-parity-tiny" = ["arch-gpt-oss"]
 "gpt-oss-20b" = ["arch-gpt-oss"]
 
-# granite (21 configs)
+# granite (24 configs)
 "granite-3.0-2b-base" = ["arch-granite"]
 "granite-3.0-2b-base-parity-tiny" = ["arch-granite"]
 "granite-3.0-2b-instruct" = ["arch-granite"]
@@ -176,6 +176,9 @@ all-arches = [
 "granite-4.1-3b" = ["arch-granite"]
 "granite-4.1-8b-base" = ["arch-granite"]
 "granite-4.1-8b" = ["arch-granite"]
+"granite-4.2-30b" = ["arch-granite"]
+"granite-4.2-3b" = ["arch-granite"]
+"granite-4.2-8b" = ["arch-granite"]
 "micro-g3.3-8b-instruct-1b" = ["arch-granite"]
 
 # llama (12 configs)
@@ -369,6 +372,9 @@ all-arches = [
     "granite-4.1-3b",
     "granite-4.1-8b-base",
     "granite-4.1-8b",
+    "granite-4.2-30b",
+    "granite-4.2-3b",
+    "granite-4.2-8b",
     "micro-g3.3-8b-instruct-1b",
 ]
 "llama" = [
@@ -547,6 +553,9 @@ all = [
     "granite-4.1-3b",
     "granite-4.1-8b-base",
     "granite-4.1-8b",
+    "granite-4.2-30b",
+    "granite-4.2-3b",
+    "granite-4.2-8b",
     "micro-g3.3-8b-instruct-1b",
     "llama-2-13b",
     "llama-2-13b-parity-tiny",
@@ -792,12 +801,14 @@ sha2 = "0.11"
 tokenizers = { workspace = true }
 
 # The qwen3 py-parity test drives the real HF snapshot for the full
-# `qwen3-0.6b` stem directly (module path + goldens), so it only builds
-# when that stem is in scope. The universal gate (tests/carrier_parity.rs)
-# has no such requirement — it skips arches the build doesn't scope in.
+# `qwen3-0.6b` stem directly (module path + goldens) on the metal target
+# (`scratchy-target-metal`, an optional dependency `metal` turns on), so a
+# build without both that stem and `metal` skips it. The universal gate
+# (tests/carrier_parity.rs) has no stem requirement — it skips arches the
+# build doesn't scope in, and compiles empty without `metal`.
 [[test]]
 name = "qwen3_py_parity"
-required-features = ["qwen3-0.6b"]
+required-features = ["metal", "qwen3-0.6b"]
 
 # The carrier parity gate runs a carrier on Metal (its `imp` is macOS-only, and names the metal
 # target). Built under `metal`: a `cuda` build on a Mac, which now expands a model, has no Metal

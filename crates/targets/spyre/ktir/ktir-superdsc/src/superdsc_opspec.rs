@@ -2708,6 +2708,114 @@ impl EntryBase {
     pub const fn entries(self) -> u32 {
         self.0
     }
+
+    /// The base in whole INDEX STICKS — the unit [`StickRun`] counts its span in, so a run's start
+    /// and its length are stated in the SAME unit without an entry round-trip.
+    pub const fn sticks(self) -> u32 {
+        self.0 / <SenUint32 as DataFormat>::ELEMS_PER_STICK
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ A GATHER'S INDEX RUN — a stick-aligned START plus a COUNT OF WHOLE `SenUint32` STICKS.
+///
+/// ⛔ THE RUN IS NAMED IN STICKS, AND THAT IS THE WHOLE TYPE. The index tensor reaches the L3LU IBR
+/// as ONE transfer "in the granularity of one stick" (`L3DlOpsScheduler::fillTransferMulticastInfo`),
+/// so both facts that decide whether a run is loadable are STICK facts: where it starts (a whole
+/// stick in, or the 32-word load straddles two runs — [`EntryBase`]'s own law) and how many sticks
+/// it spans. Spelled as a `StickRun`, a MID-STICK run cannot be built: the fields are private, the
+/// constructors are [`Self::of_sticks`] (whole sticks by spelling) and [`Self::covering`] (checked —
+/// the start goes through [`EntryBase::of_entries`], whose refusal is the one that fired on the
+/// per-J merge form), so a kernel asking for four 8-entry runs at entries 0/8/16/24 fails at the
+/// walk, naming its source, before any descriptor exists — the run at entry 8 has no spelling.
+///
+/// ⭐ THE CONSUMED-ENTRY COUNT IS **NOT** THE RUN. An op may use fewer entries than its run spans —
+/// the vendor's own `dxp/test/test_gather_1core` runs 3 entries of one stick, an embedding at one
+/// token consumes 1, and a cut's short tail consumes part of its last stick — because the IBR load
+/// is whole sticks while the op's `mb` is the op's own work. The span is the whole number of sticks
+/// those entries occupy; what may not happen is a run STARTING between sticks, and the type is what
+/// makes that unstatable rather than merely checked at one walk.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StickRun {
+    /// The stick-aligned start — see [`EntryBase`].
+    start: EntryBase,
+    /// How many WHOLE sticks the run spans — at least one.
+    sticks: u32,
+}
+
+impl StickRun {
+    /// The run starting `start_sticks` whole sticks into the index buffer, spanning `sticks`
+    /// sticks. THE raw door: whole sticks by spelling, so nothing is checked and nothing can be
+    /// mis-stated — a caller holding stick counts (the serving path's `GatherCopy`, the leg cut's
+    /// per-stick legs) states the run exactly.
+    pub const fn of_sticks(start_sticks: u32, sticks: u32) -> Self {
+        StickRun {
+            start: EntryBase::of_sticks(start_sticks),
+            sticks,
+        }
+    }
+
+    /// The run COVERING `entries` consumed entries starting at `start_entries` — the constructor a
+    /// walk calls with the numbers the program states (an anchor in entries, a consumed count).
+    ///
+    /// ⛔ THE CONSTRUCTOR IS THE CHECK, IN ITS START HALF: `start_entries` goes through
+    /// [`EntryBase::of_entries`], so an anchor that is not a whole stick into the index buffer
+    /// refuses HERE with the IBR law's own text — the per-J merge form's run at entry 8 dies at
+    /// this door, not at the emitter. The span half is a CEILING by design (`covering`, not
+    /// `of_entries`): the consumed count may be short (the vendor's 3-entry fixture, a short
+    /// tail), and the run is the whole sticks those entries occupy — never a fractional stick,
+    /// which is the unstatable half.
+    pub fn covering(start_entries: u32, entries: u32) -> Result<Self, String> {
+        let start = EntryBase::of_entries(start_entries)?;
+        if entries == 0 {
+            return Err(
+                "a gather run covering 0 entries is not a run — an index operand with nothing to \
+                 convert names no rows and no sticks"
+                    .to_string(),
+            );
+        }
+        let per = <SenUint32 as DataFormat>::ELEMS_PER_STICK;
+        Ok(StickRun {
+            start,
+            sticks: entries.div_ceil(per),
+        })
+    }
+
+    /// The run's stick-aligned start.
+    pub const fn start(self) -> EntryBase {
+        self.start
+    }
+
+    /// How many WHOLE sticks the run spans.
+    pub const fn sticks(self) -> u32 {
+        self.sticks
+    }
+
+    /// The entries the run SPANS — `sticks × 32`. NOT the consumed count (see the type's doc):
+    /// this is the number of index words the IBR loads for the run, which is why it is a whole
+    /// number of sticks and never the op's `mb`.
+    pub const fn entries(self) -> u32 {
+        self.sticks * <SenUint32 as DataFormat>::ELEMS_PER_STICK
+    }
+
+    /// ⭐ LEG `k` OF THIS RUN — the run of ONE stick, `k` sticks in, that the per-stick cut emits.
+    /// The leg stride is one stick by construction (the cut exists because one op's index is one
+    /// stick), so the leg's start needs no `plus_entries` check: `of_sticks` states in the unit
+    /// the stride already is.
+    ///
+    /// ⛔ `k` MUST BE INSIDE the run — a leg past the span reads sticks the run never declared,
+    /// which is another run's words. Refused here rather than emitted, because the cut that
+    /// computes `k` is the same arithmetic that knows the bound.
+    pub fn leg(self, k: u32) -> Result<Self, String> {
+        if k >= self.sticks {
+            return Err(format!(
+                "gather leg {k} of a run spanning {} stick(s) starting at stick {} — the leg is \
+                 past the run, reading index sticks the run never declared",
+                self.sticks,
+                self.start.sticks(),
+            ));
+        }
+        Ok(StickRun::of_sticks(self.start.sticks() + k, 1))
+    }
 }
 
 /// ⭐⭐⭐⭐⭐ WHERE A GATHER RUN'S OUTPUT STARTS IN THE DESTINATION — **IN ENTRIES, AND DELIBERATELY NOT AN
@@ -3063,6 +3171,53 @@ pub enum IndirectRole {
 // OpSpec — the typed frontend op.
 // ───────────────────────────────────────────────────────────────────────────
 
+/// The SAMV COORDINATE MASKING on a seeded reduce's PADDED stick dim — the backend
+/// feature torch-spyre's `codegen/superdsc.py` emits and this crate did not:
+/// when the reduced stick dim's extent was rounded up to a whole stick, the
+/// padded lanes are substituted with a per-kind REDUCTION IDENTITY constant
+/// (`samv-maskvalue`) instead of reading whatever the buffer holds there.
+///
+/// Without it, a `max` over an unaligned width reduces the padding too: the
+/// padded lanes read whatever the allocation holds (a fresh buffer: zeros), so
+/// the result is `max(identity, data, 0)` — for non-positive data that is `0`,
+/// the exact `mxp = 0` signature once measured over `[nqh, cap]`. torch-spyre
+/// hit the same class and root-caused the SEED VALUE
+/// (`codegen/superdsc.py:244-264`): `float("-inf")` mis-encodes through
+/// `deeptools::FloatToFp16Bin` as a NaN bit pattern and `max(x, NaN) == NaN`
+/// poisons the whole reduction, so the identity is the FINITE fp16 limit —
+/// which on the wire is the template's own `negInf`/`posInf` words (below).
+///
+/// The wire fields (mirrored from torch-spyre `compute_ops.py:1357-1410`, and
+/// stated by the backend's own reduce fixture `ddc/ddl_templates/test/sdsc_max.json`:
+/// `coordinateMasking_ {"out": [[514, 62]]}`, `maskingConstId_ 8`,
+/// `constantInfo_ {"8": {name_: "samv-maskvalue", data_ "[0,0,0]": ["65534"]}}`):
+///   * `coordinateMasking_` — one `[[valid, pad]]` pair per masked dim, in
+///     ELEMENTS, `valid + pad` = the stick-padded extent;
+///   * a `samv-maskvalue` entry appended to `constantInfo_` AFTER the op's own
+///     constants (insertion order — mean's `scaling_factor` shifts it, #4390),
+///     with `maskingConstId_` = that entry's index.
+///
+/// `mask_bits` is a RAW SEN169 word, NOT `sen169_bits(f32)`: the identities are
+/// the DDL's own `ddl.define_constant` patterns (`summeanmaxexx2.ddl:69-72`:
+/// `zero 0x0`, `negInf 0xFFFE`, `posInf 0x7FFE`) — the same words the template
+/// seeds its PE accumulator LRFs from (`:209`, `:235`), so the padded lanes and
+/// the on-chip seed can never disagree. `sen169_bits(-65504.0)` would emit the
+/// VALUE-TRUE encoding of −65504 (a different word); the backend's fixture pins
+/// `0xFFFE` = 65534 and so does this crate's own SFP table (`negInf`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SamvCoordinateMask {
+    /// The reduced STICK dim's SDSC name (`"out"` for this crate's reduce family).
+    pub dim: &'static str,
+    /// The LOGICAL (pre-padding) extent, in elements.
+    pub valid: u32,
+    /// The pad amount, in elements (`stick_padded − valid`). Always > 0 — the
+    /// builder only states a mask when the stick extent actually padded.
+    pub pad: u32,
+    /// The identity's RAW SEN169 word — `0xFFFE` (negInf) for `max`, `0` for
+    /// every other reduce kind, per `_get_mask_value`'s table.
+    pub mask_bits: u32,
+}
+
 /// The TYPED FRONTEND op. Carries ONLY what the frontend decides; everything the
 /// L3 scheduler fills (corelet split, time fold, lx/hbm sizes, register-file
 /// residency) is ABSENT by construction. Faithful to op_spec.py `OpSpec`, but the
@@ -3095,6 +3250,11 @@ pub struct OpSpec {
     /// One `Option` for the whole op, never a flag per operand: see [`IndirectAccess`] for why a
     /// half-declared pair must be unrepresentable.
     pub indirect: Option<IndirectAccess>,
+    /// The SAMV coordinate masking on a seeded reduce's padded stick dim. `None` (every
+    /// stick-aligned reduce) emits `coordinateMasking_: {}`, `maskingConstId_: -1` and no
+    /// `samv-maskvalue` constant — byte-identical to before this field existed. See
+    /// [`SamvCoordinateMask`] for the wire fields and the identity-value law.
+    pub coordinate_mask: Option<SamvCoordinateMask>,
 }
 
 impl OpSpec {
@@ -3413,6 +3573,94 @@ mod tests {
         assert!(StickExtent::<Fp16>::new(65).is_err()); // not a multiple of 64
         assert!(StickExtent::<Fp16>::new(0).is_err());
         assert_eq!(StickExtent::<Fp16>::new(384).unwrap().stick_count(), 6);
+    }
+
+    /// ⭐ A MID-STICK RUN START CANNOT BE BUILT — `covering`'s start half IS the check, with the
+    /// IBR law's own text. This is the refusal that fired on the per-J merge form (four 8-entry
+    /// runs at entries 0/8/16/24); stated as the type, the run at entry 8 has no spelling at all,
+    /// and the kernel fails at the walk naming its source rather than at the emitter.
+    #[test]
+    fn a_mid_stick_run_start_cannot_be_built() {
+        let err = StickRun::covering(8, 8).expect_err("entry 8 is a quarter stick — refused");
+        assert!(
+            err.contains("a gather run starts at entry 8"),
+            "the refusal must name the entry the program stated. Got: {err}"
+        );
+        assert!(
+            err.contains("SenUint32"),
+            "the refusal must name the index format whose stick law it enforces. Got: {err}"
+        );
+        // The other mid-stick starts of the per-J form, so the refusal is the rule and not one
+        // lucky number.
+        assert!(StickRun::covering(16, 16).is_err());
+        assert!(StickRun::covering(24, 8).is_err());
+        // And the starts that ARE whole sticks build.
+        assert!(StickRun::covering(0, 8).is_ok());
+        assert!(StickRun::covering(32, 8).is_ok());
+    }
+
+    /// ⭐ THE RUN IS THE STICKS THE ENTRIES OCCUPY, NOT THE ENTRIES — the span half of `covering`
+    /// is a ceiling, because the consumed count may be short (the vendor's own
+    /// `dxp/test/test_gather_1core` runs 3 entries of one stick; an embedding at one token
+    /// consumes 1; a cut's short tail consumes part of its last stick). What is never statable is
+    /// a fractional stick, in either half.
+    #[test]
+    fn the_run_spans_whole_sticks_even_when_the_op_consumes_fewer_entries() {
+        let per = <SenUint32 as DataFormat>::ELEMS_PER_STICK;
+        // The vendor fixture's own shape: 3 entries, one stick.
+        let vendor = StickRun::covering(0, 3).unwrap();
+        assert_eq!(vendor.sticks(), 1);
+        assert_eq!(vendor.entries(), per);
+        assert_eq!(vendor.start().sticks(), 0);
+        // One entry past the stick boundary spans two.
+        let straddle = StickRun::covering(0, per + 1).unwrap();
+        assert_eq!(straddle.sticks(), 2);
+        assert_eq!(straddle.entries(), 2 * per);
+        // A start past the buffer's first word, stick-aligned (an unrolled sweep's `b · BLOCK_N`).
+        let later = StickRun::covering(2 * per, 3).unwrap();
+        assert_eq!(later.start().sticks(), 2);
+        assert_eq!(later.sticks(), 1);
+        // The raw door states sticks directly and agrees.
+        assert_eq!(later, StickRun::of_sticks(2, 1));
+    }
+
+    /// An index operand with nothing to convert names no rows and no sticks — refused rather than
+    /// emitting a gather leg with an empty index window.
+    #[test]
+    fn a_zero_entry_run_is_not_a_run() {
+        let err = StickRun::covering(0, 0).expect_err("0 entries — refused");
+        assert!(
+            err.contains("a gather run covering 0 entries"),
+            "the refusal must name the empty covering. Got: {err}"
+        );
+    }
+
+    /// ⭐ A LEG IS INSIDE THE RUN OR IT IS ANOTHER RUN'S WORDS — the cut computes `k` by the same
+    /// arithmetic that knows the bound, so a leg past the span refuses here rather than reading
+    /// index sticks the run never declared.
+    #[test]
+    fn a_gather_leg_must_be_inside_the_run() {
+        let run = StickRun::covering(0, 64).unwrap(); // 2 sticks
+        let leg0 = run.leg(0).unwrap();
+        assert_eq!(leg0, StickRun::of_sticks(0, 1));
+        let leg1 = run.leg(1).unwrap();
+        assert_eq!(leg1, StickRun::of_sticks(1, 1));
+        assert_eq!(leg1.start().entries(), 32);
+        let err = run
+            .leg(2)
+            .expect_err("leg 2 of a 2-stick run — past the span");
+        assert!(
+            err.contains("gather leg 2 of a run spanning 2 stick(s)"),
+            "the refusal must name the leg and the span. Got: {err}"
+        );
+        assert!(
+            err.contains("never declared"),
+            "the refusal must say what the leg would read. Got: {err}"
+        );
+        // A one-stick run has only leg 0 — the uncut gather's whole life.
+        let single = StickRun::of_sticks(0, 1);
+        assert!(single.leg(0).is_ok());
+        assert!(single.leg(1).is_err());
     }
 
     #[test]

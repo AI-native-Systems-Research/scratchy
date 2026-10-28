@@ -313,27 +313,22 @@ pub enum KernelId {
     /// `nn.QuantizedEmbedding.__call__`
     /// (`python/mlx/nn/layers/quantized.py:144`).
     AffineEmbed,
-    /// Slice the last-token row of a `[num_tokens, hidden]` activation
-    /// to row 0 of the same buffer, in place. Inserted by the lowering
-    /// pass before the lm_head GEMM so the GEMM runs at M=1 instead of
-    /// M=num_tokens — only the last token's logits are ever consumed
-    /// by the sampler. Maps to `gather_last_token_{f16,bf16}_specialized`
-    /// in `gather_last_token.metallib`. Reads num_tokens from a 4-byte
-    /// runtime buffer the worker re-writes each forward() — see
-    /// `RuntimeBindingKind::NumTokensU32`.
-    GatherLastToken,
-    /// Paired with [`KernelId::GatherLastToken`]: copies row 0 of a
-    /// `[num_tokens, vocab]` logits tensor BACK to row `num_tokens-1`
-    /// in place, after the lm_head GEMM ran on its shrunk
-    /// 1-m-tile grid. The worker's downstream
-    /// `embedding_gather(logits, last_token_indices=[num_tokens-1])`
-    /// then reads valid logits at row `num_tokens-1` without needing
-    /// to know about the slice. Reads num_tokens from the same 4-byte
-    /// runtime buffer the gather does
-    /// (`RuntimeBindingKind::NumTokensU32`). Maps to
-    /// `scatter_first_to_last_row_{f16,bf16}_specialized` in
-    /// `gather_last_token.metallib`.
-    ScatterFirstToLastRow,
+    /// Swap the step's sampled rows of a buffer to its front, in order,
+    /// in place: the lm_head input before the lm_head slice's matvec
+    /// runs at the sampled rows alone, or every row's logits compacted
+    /// to the sampled rows' where the lm_head ran over every row. Maps to
+    /// `gather_sampled_rows_{f16,bf16}_specialized` in
+    /// `sample_rows.metallib`. Reads the rows from the runtime
+    /// buffers the worker re-writes each forward() —
+    /// `RuntimeBindingKind::{SampleIndices, NumSampleRowsU32}`.
+    GatherSampledRows,
+    /// Paired with [`KernelId::GatherSampledRows`]: the gather undone, in
+    /// place — the lm_head input's sampled rows put back after the
+    /// slice's matvec read them, so the final hidden states read as the
+    /// backbone wrote them. Maps to
+    /// `put_sampled_rows_back_{f16,bf16}_specialized` in
+    /// `sample_rows.metallib`.
+    PutSampledRowsBack,
     /// Row-wise precise softmax (MoE router prerequisite). Faithful
     /// port of MLX `softmax_single_row` from
     /// `mlx/backend/metal/kernels/softmax.h:10-98`. Bindings:
@@ -582,8 +577,8 @@ impl KernelId {
             | Self::GatedDeltaNet
             | Self::SplitKReduceSum
             | Self::AffineEmbed
-            | Self::GatherLastToken
-            | Self::ScatterFirstToLastRow
+            | Self::GatherSampledRows
+            | Self::PutSampledRowsBack
             | Self::Softmax
             | Self::ArgPartitionTopK
             | Self::TakeAlongAxis
@@ -684,17 +679,24 @@ pub enum MScaleAxis {
 pub struct MScaling {
     pub axis: MScaleAxis,
     pub bucket_m: BucketM,
-    /// When `Some(ax)`, the worker SETS `threadgroups.{ax}` to the live
-    /// `num_seqs` at dispatch (not a proportional scale — an exact set).
-    /// Used by the steel paged prefill attention kernel, whose grid is
-    /// `(Q-blocks-per-seq, num_q_heads, num_seqs)`: it tiles queries in
-    /// BQ-sized blocks that must not straddle a sequence boundary, so it
-    /// needs one grid-Z layer per sequence (`tid.z = seq_idx`, indexing
-    /// `cu_seqlens_q` / `block_table`). `axis` still scales the Q-block
-    /// dimension by `num_tokens`; over-dispatched blocks early-out in the
-    /// kernel. `None` (every other kernel, incl. SDPA which is per-query-
-    /// token and self-attributes via `cu_seqlens_q`) leaves Z untouched.
-    pub seq_axis: Option<MScaleAxis>,
+    /// An axis the worker SETS to a live count at dispatch (not a proportional scale — an exact
+    /// set); `None` (most kernels, incl. SDPA, which is per-query-token and self-attributes via
+    /// `cu_seqlens_q`) sets none.
+    pub set_axis: Option<SetAxis>,
+}
+
+/// A grid axis set to a live count of the step at dispatch ([`MScaling::set_axis`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+pub enum SetAxis {
+    /// The step's sequences. The steel paged prefill attention's grid is
+    /// `(Q-blocks-per-seq, num_q_heads, num_seqs)`: it tiles queries in BQ-sized blocks that
+    /// must not straddle a sequence boundary, so it needs one grid-Z layer per sequence
+    /// (`tid.z = seq_idx`, indexing `cu_seqlens_q` / `block_table`); `axis` still scales the
+    /// Q-block dimension by `num_tokens`, and over-dispatched blocks early-out in the kernel.
+    Seqs(MScaleAxis),
+    /// The step's sampled rows: a command over the logits, one row of them a threadgroup row
+    /// (the sampled lm_head's matvec, the logit tail's caps and scales).
+    SampledRows(MScaleAxis),
 }
 
 /// Runtime gate evaluated per dispatch — when `Some`, the worker
@@ -708,27 +710,17 @@ pub struct MScaling {
 /// commands that aren't gated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum RuntimeGate {
-    /// Run only when `!has_spec_tokens` **and** the step has rows to
-    /// drop (`num_tokens > num_seqs`). Used by the lm_head slice
-    /// trio (gather/qmv/scatter) — the slice writes exactly the
-    /// `num_sample_rows` rows pointed at by `last_token_indices`,
-    /// which is correct for single-seq + multi-seq prefill, but wrong
-    /// for spec verify where rejection sampling needs every row of
-    /// logits, and pure overhead at decode (num_sample_rows ==
-    /// num_seqs) where the full-M fallback covers it with no extra
-    /// launches.
-    OnlyIfNoSpec,
-    /// Run when `has_spec_tokens` **or** the step is decode-only
-    /// (`num_tokens == num_seqs`). Used by the full `M=bucket_m`
-    /// lm_head fallback that populates every row of logits for greedy
-    /// rejection sampling at spec-decode verify — and as the only
-    /// lm_head a decode-only step runs, the slice being gated off
-    /// there. The two gates are complements: exactly one fires on
-    /// every step, so no step is left without an lm_head (issue #361:
-    /// before the decode-only term, a decode step in a bucket whose
-    /// lm_head lowers to one `qmm_t` computed no logits and every
-    /// row froze on its first token).
-    OnlyIfSpec,
+    /// Run only on a step that samples fewer rows than it runs (`sampled_rows < num_tokens`: a
+    /// prefill chunk, a mixed batch): the lm_head slice — the gather of the sampled rows, the
+    /// matvec at them, the activation put back — and the compaction of every row's logits to
+    /// the sampled ones.
+    UnlessEveryRowSampled,
+    /// Run only on a step that samples every row it runs (`sampled_rows == num_tokens`: a
+    /// decode step, a speculative verify step of drafting sequences alone): the lm_head over
+    /// every row, whose logits are already the sampled rows', in order. The complement of
+    /// [`Self::UnlessEveryRowSampled`]: exactly one fires on every step, so no step is left
+    /// without an lm_head (issue #361).
+    OnlyIfEveryRowSampled,
     /// Run only on a decode step — every sequence contributes exactly one
     /// token (`num_tokens == num_seqs`): a TurboQuant model's
     /// `AttentionViaCacheTq`, reading the packed store directly.
@@ -824,7 +816,7 @@ impl DispatchShape {
         // on lowering.rs, so the value is spelled here.
         let mut d = Self::dispatch_1d(eff_m * width.get(), 256);
         d.m_scaling = Some(MScaling {
-            seq_axis: None,
+            set_axis: None,
             axis: MScaleAxis::X,
             bucket_m,
         });
@@ -1276,22 +1268,16 @@ pub enum RuntimeBindingKind {
         layer: LayerId,
     },
     /// `[1]` u32 — actual `num_tokens` of this forward, written by
-    /// the worker at `forward()` entry. Consumed by
-    /// `KernelId::GatherLastToken` so the kernel can compute the
-    /// source row index `num_tokens - 1` at runtime without needing
-    /// a function constant (M varies per call).
+    /// the worker at `forward()` entry, for a kernel that needs M at
+    /// runtime without a function constant (M varies per call).
     NumTokensU32,
-    /// `[1]` u32 — actual `num_seqs` of the in-flight forward
-    /// (= `cu_seqlens_q.len() - 1`). Mirrors `NumTokensU32` but for
-    /// the per-seq-sample-row count the lm_head slice trio uses to
-    /// gate its inner loop (gather copies `num_seqs` rows, qmm runs
-    /// at M = num_seqs, scatter writes back `num_seqs` rows).
-    NumSeqsU32,
-    /// `[num_seqs]` u32 — per-sequence sample-row index
-    /// (`cu_seqlens_q[i+1] - 1` for seq `i`). Mirrors Python vLLM's
-    /// `logits_indices` and the CUDA path's `ForwardCtx.last_token_indices`.
-    /// Read by the index-driven `gather_last_token`/`scatter_first_to_last_row`
-    /// kernels — one row per sequence, in cu_seqlens_q order.
+    /// `[1]` u32 — the in-flight forward's sampled rows' count (`SampleIndices`' length): the
+    /// rows the lm_head slice gathers and puts back, and the logits rows a compaction keeps.
+    NumSampleRowsU32,
+    /// `[num_sample_rows]` u32 — the in-flight forward's sampled rows, ascending: each
+    /// sequence's last row, every row of a sequence verifying drafts. Python vLLM's
+    /// `logits_indices`. Read by [`KernelId::GatherSampledRows`] and
+    /// [`KernelId::PutSampledRowsBack`].
     SampleIndices,
     /// Gated-DeltaNet conv-state ring for a linear-attention layer
     /// (persistent f32 pool, mutated in place across forwards — the
@@ -1734,7 +1720,7 @@ impl RuntimeBindingKind {
             | Self::SeqUsedK
             | Self::SpanIds
             | Self::NumTokensU32
-            | Self::NumSeqsU32
+            | Self::NumSampleRowsU32
             | Self::SampleIndices
             | Self::GdnStateIndices
             | Self::GdnIsFresh
@@ -1875,6 +1861,75 @@ pub struct TapeLoop {
     pub layer_stride: u32,
 }
 
+/// What a scratch buffer a tape binds holds: one buffer a worker of each kind some tape needs.
+/// The last two scale with the KV cap rung ([`RungScratch`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScratchKind {
+    /// Split-K partial sums, reduced by the next command.
+    SplitK,
+    /// MoE routing and expert rows, and the TurboQuant decode split's partials.
+    Moe,
+    /// The rope-once pre-roped K.
+    RopedK,
+    /// The hd512 unfused attention's dense K/V, scores and per-head Q/O.
+    AttnUnfused,
+}
+
+impl ScratchKind {
+    pub const ALL: [Self; 4] = [Self::SplitK, Self::Moe, Self::RopedK, Self::AttnUnfused];
+
+    /// What a worker's buffer of this kind is called in an allocation failure.
+    pub const fn what(self) -> &'static str {
+        match self {
+            Self::SplitK => "splitk scratch",
+            Self::Moe => "moe scratch",
+            Self::RopedK => "roped-K scratch",
+            Self::AttnUnfused => "attn-unfused scratch",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::SplitK => 0,
+            Self::Moe => 1,
+            Self::RopedK => 2,
+            Self::AttnUnfused => 3,
+        }
+    }
+}
+
+/// One `T` per [`ScratchKind`], indexed by kind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PerScratch<T>([T; 4]);
+
+impl<T> PerScratch<T> {
+    pub fn from_fn(mut f: impl FnMut(ScratchKind) -> T) -> Self {
+        Self(ScratchKind::ALL.map(&mut f))
+    }
+
+    /// [`Self::from_fn`] for a fallible `f`: the first kind's error.
+    pub fn try_from_fn<E>(mut f: impl FnMut(ScratchKind) -> Result<T, E>) -> Result<Self, E> {
+        let [a, b, c, d] = ScratchKind::ALL.map(&mut f);
+        Ok(Self([a?, b?, c?, d?]))
+    }
+
+    pub fn map<U>(self, f: impl FnMut(T) -> U) -> PerScratch<U> {
+        PerScratch(self.0.map(f))
+    }
+
+    /// Each kind with its value.
+    pub fn iter(&self) -> impl Iterator<Item = (ScratchKind, &T)> {
+        ScratchKind::ALL.into_iter().zip(&self.0)
+    }
+}
+
+impl<T> std::ops::Index<ScratchKind> for PerScratch<T> {
+    type Output = T;
+    fn index(&self, kind: ScratchKind) -> &T {
+        &self.0[kind.index()]
+    }
+}
+
 impl LoweredMetalTape {
     /// The tape's commands with the layer loop played out: prologue, then the body once per
     /// iteration with every `LayerId` advanced, then the tail.
@@ -1887,18 +1942,48 @@ impl LoweredMetalTape {
     /// Exact because the only per-iteration input to the lowering is `layer_offset`, consumed
     /// in exactly one pattern (`LayerId(literal + layer_offset)`); a weight's source family
     /// does not vary.
-    /// The bytes of each scratch buffer the tape binds: split-K, MoE, roped K, hd512 unfused —
-    /// the MoE scratch holding the decode split's partials for at most `decode_rows` of the
-    /// bucket's rows (`None`: every row).
-    pub fn scratch_bytes(&self, decode_rows: Option<DecodeRows>) -> [u32; 4] {
-        let rows = decode_rows.map_or(self.bucket_m, |r| r.get().min(self.bucket_m));
-        let partials = self.decode_partials_row_bytes.saturating_mul(rows);
-        [
-            self.splitk_scratch_bytes,
-            self.moe_scratch_bytes.max(partials),
-            self.roped_k_scratch_bytes,
-            self.attn_unfused_scratch_bytes,
-        ]
+    /// The bytes of each scratch buffer the tape binds ([`ScratchKind`]), the MoE scratch holding
+    /// the decode split's partials for the rows its steps bring, of at most `decode_rows` a decode
+    /// step brings (`None`: every row) — [`DecodePartials::bytes`].
+    pub fn scratch_bytes(&self, decode_rows: Option<DecodeRows>) -> PerScratch<u32> {
+        let partials = self.decode_partials.bytes(self.bucket_m, decode_rows);
+        PerScratch::from_fn(|kind| match kind {
+            ScratchKind::SplitK => self.splitk_scratch_bytes,
+            ScratchKind::Moe => self.moe_scratch_bytes.max(partials),
+            ScratchKind::RopedK => self.roped_k_scratch_bytes,
+            ScratchKind::AttnUnfused => self.attn_unfused_scratch_bytes,
+        })
+    }
+
+    /// The rows the logits buffer holds when no step samples more than `sampled` rows (`None`:
+    /// every row of the bucket) — the bucket's rows at most ([`LogitsRows`]). A tiled grid bakes
+    /// `⌈bucket_m / tile⌉` threadgroups and runs [`scaled_groups`] of them, each writing a whole
+    /// tile; at most the bucket's rows, which its kernel clamps to.
+    pub fn logits_slot_rows(&self, sampled: Option<DecodeRows>) -> u32 {
+        match (self.logits_rows, sampled) {
+            (LogitsRows::Sampled { tile }, Some(rows)) => {
+                let (bucket_m, tile) = (u64::from(self.bucket_m), u64::from(tile.get()));
+                let groups =
+                    scaled_groups(bucket_m.div_ceil(tile), u64::from(rows.get()), bucket_m);
+                (groups.saturating_mul(tile)).min(bucket_m) as u32
+            }
+            (LogitsRows::Bucket, _) | (_, None) => self.bucket_m,
+        }
+    }
+
+    /// What a step sampling `sampled` rows writes of the logits past the buffer `decode_rows`
+    /// sizes (`None`: the buffer holds it). A command over every row of a step that samples each
+    /// writes whole tiles of them, so the step writes what a buffer for `sampled` rows holds
+    /// ([`Self::logits_slot_rows`] at them) — more than `sampled` where the bucket's rows are no
+    /// whole number of tiles, and more than the buffer when `sampled` passes `decode_rows`.
+    pub fn logits_overflow(
+        &self,
+        decode_rows: Option<DecodeRows>,
+        sampled: crate::tape::ids::SampledRowCount,
+    ) -> Option<LogitsOverflow> {
+        let holds = self.logits_slot_rows(decode_rows);
+        let writes = self.logits_slot_rows(Some(DecodeRows(sampled.get())));
+        (writes > holds).then_some(LogitsOverflow { writes, holds })
     }
 
     pub fn commands_expanded(&self) -> Vec<GatedCommand> {
@@ -1964,6 +2049,129 @@ impl LoweredMetalTape {
     }
 }
 
+/// The rows of the logits buffer a tape's commands write. A forward leaves the logits of the rows
+/// its step samples at the buffer's front, in order; what else it writes bounds the buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+pub enum LogitsRows {
+    /// The lm_head runs every row of a step and moves the sampled rows' logits to the front: the
+    /// buffer holds the bucket's rows.
+    Bucket,
+    /// Every command over the logits writes the step's sampled rows in whole `tile`s — the sampled
+    /// matvec and the logit tail one a row, the matmul over every row of a step that samples each
+    /// its own tile: the buffer holds the most rows a step samples, so tiled.
+    Sampled { tile: RowTile },
+}
+
+/// The TurboQuant decode split's partials a tape's steps write at the MoE scratch's front: a row's
+/// bytes, for the rows the steps that run the split bring ([`LoweredMetalTape::scratch_bytes`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
+pub struct DecodePartials {
+    /// One row's (`num_q_heads * splits * (2 + head_dim)` f32s); zero without the split.
+    pub row_bytes: u32,
+    pub steps: SplitSteps,
+}
+
+/// The steps a tape's TurboQuant decode split runs on, as its gate admits them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+pub enum SplitSteps {
+    /// Decode steps alone ([`RuntimeGate::OnlyIfDecodeStep`]): a row a sequence, at most the
+    /// device's decode rows.
+    #[default]
+    Decode,
+    /// Every step: a verify-sized bucket's packed-store attention, which a prefill of no more
+    /// tokens than its rows runs too, a row a token — the bucket's every row.
+    Every,
+}
+
+impl SplitSteps {
+    /// The steps a split command gated by `gate` runs on.
+    pub fn of(gate: Option<RuntimeGate>) -> Self {
+        fn decode_only(gate: RuntimeGate) -> bool {
+            match gate {
+                RuntimeGate::OnlyIfDecodeStep => true,
+                RuntimeGate::All(gates) => gates.iter().any(|&g| decode_only(g)),
+                RuntimeGate::Any(gates) => gates.iter().all(|&g| decode_only(g)),
+                _ => false,
+            }
+        }
+        match gate.is_some_and(decode_only) {
+            true => Self::Decode,
+            false => Self::Every,
+        }
+    }
+}
+
+impl DecodePartials {
+    /// One buffer for both: the wider row, on the steps either runs on.
+    pub fn max(self, other: Self) -> Self {
+        Self {
+            row_bytes: self.row_bytes.max(other.row_bytes),
+            steps: self.steps.max(other.steps),
+        }
+    }
+
+    /// The partials' bytes in a bucket of `bucket_m` rows whose decode steps bring at most
+    /// `decode_rows` (`None`: every row).
+    pub fn bytes(self, bucket_m: u32, decode_rows: Option<DecodeRows>) -> u32 {
+        let rows = match (self.steps, decode_rows) {
+            (SplitSteps::Decode, Some(rows)) => rows.get().min(bucket_m),
+            (SplitSteps::Every, _) | (_, None) => bucket_m,
+        };
+        self.row_bytes.saturating_mul(rows)
+    }
+}
+
+/// Logits rows a step writes (`writes`) past the rows its bucket's buffer holds (`holds`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LogitsOverflow {
+    pub writes: u32,
+    pub holds: u32,
+}
+
+/// The rows one threadgroup of a command over the logits writes along its row axis: the tile of
+/// the kernel ([`RowTile::of`]), never zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+pub enum RowTile {
+    /// A row a threadgroup: the sampled rows' matvec and logit tail, their grid SET to the rows.
+    Row,
+    /// 32: `qmm_t` (`BM`) and the W4A8 GEMM (`W4A8_TILE_ROWS`).
+    Rows32,
+    /// 64: the NAX `qmm_t` (`BM`).
+    Rows64,
+}
+
+impl RowTile {
+    /// The tile of `kernel` writing the logits over every row of a step, its grid scaled by the
+    /// step's rows (`None`: a kernel this table does not tile, whose logits the buffer holds for
+    /// the bucket's every row).
+    pub const fn of(kernel: KernelId) -> Option<Self> {
+        const _: () = assert!(crate::quantized::W4A8_TILE_ROWS == 32);
+        match kernel {
+            KernelId::AffineQmmT | KernelId::AffineQmmW4a8 => Some(Self::Rows32),
+            KernelId::AffineQmmTNax => Some(Self::Rows64),
+            _ => None,
+        }
+    }
+
+    pub const fn get(self) -> u32 {
+        match self {
+            Self::Row => 1,
+            Self::Rows32 => 32,
+            Self::Rows64 => 64,
+        }
+    }
+}
+
+/// The threadgroups a grid axis of `baseline` of them, baked for `bucket_m` rows, runs at `live`
+/// rows: `⌈baseline · live / bucket_m⌉`, `live` capped at the bucket — the scaling the worker
+/// dispatches with ([`MScaling`]), and so the rows a tiled command writes.
+pub fn scaled_groups(baseline: u64, live: u64, bucket_m: u64) -> u64 {
+    let bucket_m = bucket_m.max(1);
+    baseline
+        .saturating_mul(live.min(bucket_m))
+        .div_ceil(bucket_m)
+}
+
 /// One bucket's lowered tape — the input the `MetalWorker` walks at
 /// init time to record its per-bucket dispatch.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
@@ -2017,12 +2225,10 @@ pub struct LoweredMetalTape {
     /// one bucket execute serially through the dispatch, so they can share
     /// scratch). Zero when no MoE instruction was lowered.
     pub moe_scratch_bytes: u32,
-    /// Bytes one row of the TurboQuant decode split's partials takes at the MoE scratch's front
-    /// (`num_q_heads * splits * (2 + head_dim)` f32s). Only a decode or verify step runs the split
-    /// — a row a sequence, a verify step's drafts too — so the buffer holds them for the rows such
-    /// a step can bring, not for the bucket's every row ([`Self::scratch_bytes`]). Zero without
-    /// the split.
-    pub decode_partials_row_bytes: u32,
+    /// The TurboQuant decode split's partials at the MoE scratch's front: a decode-gated split's
+    /// for the rows a decode step can bring, an every-step one's — a verify-sized bucket's, which
+    /// a short prefill runs too — for the bucket's every row ([`Self::scratch_bytes`]).
+    pub decode_partials: DecodePartials,
     /// Byte size of the shared roped-K scratch buffer the worker
     /// allocates if any spans rope-on-read NAX prefill (`KernelId::
     /// RopeOnceNax` + `Binding::RopedKScratch`) was lowered. Computed as
@@ -2037,6 +2243,9 @@ pub struct LoweredMetalTape {
     /// q_head + Kdense + Vdense_T + scores + out_head regions. Zero when no
     /// hd512-unfused attention was lowered.
     pub attn_unfused_scratch_bytes: u32,
+    /// The rows of the logits buffer (the terminal slot) the tape's commands write: what the
+    /// buffer holds beyond the rows a step samples ([`Self::logits_slot_rows`]).
+    pub logits_rows: LogitsRows,
     /// Per command, whether a forward reading only its cache writes plays it
     /// ([`crate::interpreter::metal::ForwardReads::CacheWrites`]): what a KV or recurrent-state
     /// write needs, from the metal compiler's liveness walk over the rows. Off for the lm_head,
@@ -2112,16 +2321,17 @@ pub enum LoweringError {
     /// A scratch buffer the KV cap rung `block_cap` sizes exceeds the 32-bit byte sizes and
     /// offsets its kernels bind: the rung cannot exist for this tape.
     ScratchTooLarge {
-        scratch: ScratchKind,
+        scratch: RungScratch,
         block_cap: MaxBlocksPerSeq,
     },
     /// The tape lists more distinct commands than a [`CommandIx`] can index.
     TooManyCommands(TooManyCommands),
 }
 
-/// A scratch buffer whose size scales with the KV cap rung.
+/// A scratch buffer whose size scales with the KV cap rung: of the [`ScratchKind`]s, the ones a
+/// rung can outgrow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScratchKind {
+pub enum RungScratch {
     /// The rope-once pre-roped K.
     RopedK,
     /// The hd512 unfused attention's dense K/V, scores and per-head Q/O.
@@ -2221,8 +2431,11 @@ impl std::error::Error for LoweringError {}
 
 /// Device-generation class a baked tape variant targets. The lowering's
 /// only device-profile dependence is `AppleSiliconGen` (NAX capability
-/// and the M1 bf16-simdgroup slow path), so three classes cover every
-/// chip; variants that lower identically are deduped at expansion.
+/// and the M1 bf16-simdgroup slow path), so the generation classes cover
+/// every chip; variants that lower identically are deduped at expansion.
+/// [`M5Wide`](GenClass::M5Wide) splits the M5 generation by GPU-core
+/// width, the one fact the routed fold's band rides on — it lowers under
+/// every M5 fact and differs only in which step tape it bakes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum GenClass {
     /// M1 family (no NAX, bf16 simdgroup emulated).
@@ -2231,6 +2444,10 @@ pub enum GenClass {
     Mid,
     /// M5+ (NAX hardware MMA).
     M5,
+    /// Max-scale M5 (≥ [`M5_WIDE_MIN_CORES`] GPU cores): the M5 lowering
+    /// under the routed fold's wide band, whose per-threadgroup routing
+    /// has the cores to hide behind.
+    M5Wide,
 }
 
 impl GenClass {
@@ -2243,6 +2460,20 @@ impl GenClass {
         }
     }
 
+    /// The class a device with `generation` and `gpu_cores` runs: the generation class, widened
+    /// to [`M5Wide`](GenClass::M5Wide) when an M5 has the cores the routed fold's wide band
+    /// needs. `gpu_cores` comes from the IO registry (`device::gpu_cores`) — the chip's name does
+    /// not determine it.
+    pub fn for_device(
+        generation: crate::tape::targets::AppleSiliconGen,
+        gpu_cores: crate::tape::ids::GpuCores,
+    ) -> Self {
+        match Self::of(generation) {
+            GenClass::M5 if gpu_cores.get() >= M5_WIDE_MIN_CORES => GenClass::M5Wide,
+            class => class,
+        }
+    }
+
     /// Whether this class stores MLX-affine 4-bit weight codes XOR 0x88
     /// (signed q - 8): the matrix unit's int8 x int4 lane reads them as
     /// stored (the W4A8 GEMM). The weight loader flips them on load and the
@@ -2250,9 +2481,16 @@ impl GenClass {
     /// ([`AffineCodes`](super::kernel_constants::AffineCodes)) — one fact,
     /// read by both.
     pub fn stores_affine_b4_offset8(self) -> bool {
-        matches!(self, GenClass::M5)
+        matches!(self, GenClass::M5 | GenClass::M5Wide)
     }
 }
+
+/// The fewest GPU cores an M5 needs before the wide class serves it: the routed fold's wide
+/// band folds the routing into the expert command through the verify-sized rows, which pays
+/// only where the fold's per-threadgroup routing has cores to hide behind — measured on a
+/// 40-core M5 Max (PR #847: −4.1% TPOT) and lost on a 10-core base M5 (its review: +4.7%
+/// verify ITL). An unmeasured chip — the 20-core M5 Pro — stays narrow until benched.
+pub const M5_WIDE_MIN_CORES: u32 = 32;
 
 /// How a tape's KV readers address the paged cache: a workload fact the caller names when it
 /// picks a rung.

@@ -71,9 +71,6 @@ fn gather_copy(decl: (KernelAxis, PageExtent)) -> ktir_superdsc::superdsc_opspec
     gather_copy_opspec(
         "KtPool",
         "KtScratch",
-        8,
-        ktir_superdsc::sdsc_abstract::POOL_STICK,
-        Df::Fp16,
         GatherIndex {
             name: "BlockTable".to_string(),
             entry_dim: decl.0,
@@ -81,8 +78,19 @@ fn gather_copy(decl: (KernelAxis, PageExtent)) -> ktir_superdsc::superdsc_opspec
             per_position: None,
             first_entry: ktir_superdsc::superdsc_opspec::EntryBase::ZERO,
         },
-        // Global block numbers — no source base (the `GatherCopy` law).
-        ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+        ktir_superdsc::sdsc_abstract::GatherCopySpec {
+            rows: 8,
+            cols: ktir_superdsc::sdsc_abstract::POOL_STICK,
+            df: Df::Fp16,
+            // Global block numbers — no source base (the `GatherCopy` law).
+            run: ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+            // The destination's own law: this copy writes `mb × out` = 512 elements at entry 0, and
+            // the scratch states exactly that window — the dest-side bound the mint holds (#717's).
+            dest: ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
+                rows: 8,
+                cols: ktir_superdsc::sdsc_abstract::POOL_STICK,
+            },
+        },
     )
     .expect("the gather-copy op builds")
 }
@@ -299,9 +307,6 @@ fn the_declarations_own_refusals_survive_the_move() {
         gather_copy_opspec(
             "KtPool",
             "KtScratch",
-            8,
-            256,
-            Df::Fp16,
             GatherIndex {
                 name: "BlockTable".to_string(),
                 entry_dim: KernelAxis::Feature,
@@ -309,8 +314,15 @@ fn the_declarations_own_refusals_survive_the_move() {
                 per_position: None,
                 first_entry: ktir_superdsc::superdsc_opspec::EntryBase::ZERO,
             },
-            // Global block numbers — no source base (the `GatherCopy` law).
-            ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+            ktir_superdsc::sdsc_abstract::GatherCopySpec {
+                rows: 8,
+                cols: 256,
+                df: Df::Fp16,
+                // Global block numbers — no source base (the `GatherCopy` law).
+                run: ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+                // An exact-fit destination, so the refusal under test stays the axis one.
+                dest: ktir_superdsc::sdsc_abstract::GatherDest::Scratch { rows: 8, cols: 256 },
+            },
         )
         .is_err(),
         "an `in` axis is not a dim of the gather-copy op, and a silently-dropped pin is a gather with \
@@ -335,9 +347,6 @@ fn an_fp8_gathered_copy_builds_at_the_fp8_stick_and_carries_its_own_df() {
     let op = gather_copy_opspec(
         "ExpertBank",
         "PairScratch",
-        ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP * 4,
-        128,
-        Df::Fp8,
         GatherIndex {
             name: "ExpertTable".to_string(),
             entry_dim: KernelAxis::Batch,
@@ -345,8 +354,19 @@ fn an_fp8_gathered_copy_builds_at_the_fp8_stick_and_carries_its_own_df() {
             per_position: None,
             first_entry: ktir_superdsc::superdsc_opspec::EntryBase::ZERO,
         },
-        // Global block numbers — no source base (the `GatherCopy` law).
-        ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+        ktir_superdsc::sdsc_abstract::GatherCopySpec {
+            rows: ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP * 4,
+            cols: 128,
+            df: Df::Fp8,
+            // Global block numbers — no source base (the `GatherCopy` law).
+            run: ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+            // The expert slab's destination: 32 four-position entries × a 128-elem fp8 stick each —
+            // exactly this copy's `mb × out` window, in the entry frame the mint bounds.
+            dest: ktir_superdsc::sdsc_abstract::GatherDest::Scratch {
+                rows: ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP,
+                cols: 512,
+            },
+        },
     )
     .expect("the fp8 expert-slab copy builds");
     // Both VALUE operands carry the fp8 residency — 1-byte words, the bank's own format.
@@ -388,9 +408,6 @@ fn an_fp8_gathered_copy_builds_at_the_fp8_stick_and_carries_its_own_df() {
         gather_copy_opspec(
             "ExpertBank",
             "PairScratch",
-            32,
-            64,
-            Df::Fp8,
             GatherIndex {
                 name: "ExpertTable".to_string(),
                 entry_dim: KernelAxis::Batch,
@@ -398,8 +415,15 @@ fn an_fp8_gathered_copy_builds_at_the_fp8_stick_and_carries_its_own_df() {
                 per_position: None,
                 first_entry: ktir_superdsc::superdsc_opspec::EntryBase::ZERO,
             },
-            // Global block numbers — no source base (the `GatherCopy` law).
-            ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+            ktir_superdsc::sdsc_abstract::GatherCopySpec {
+                rows: 32,
+                cols: 64,
+                df: Df::Fp8,
+                // Global block numbers — no source base (the `GatherCopy` law).
+                run: ktir_superdsc::superdsc_opspec::GatherRun::CONTIGUOUS,
+                // An exact-fit destination, so the refusal under test stays the sub-stick one.
+                dest: ktir_superdsc::sdsc_abstract::GatherDest::Scratch { rows: 8, cols: 256 },
+            },
         )
         .is_err(),
         "a 64-elem `out` is HALF an fp8 stick — the sub-stick refusal, at the fp8 width"

@@ -187,6 +187,12 @@ pub struct ExecArgs {
     /// Which framework `--parity-cmd` is, for its banner rules.
     #[arg(long, value_enum, default_value_t = Backend::MlxLm)]
     pub parity_backend: Backend,
+
+    /// Where the two answers' text differs, a command that judges each token they disagree on
+    /// (scripts/parity_ties.py): `{prompt}` is the prompt and `{tokens}` a JSON file of the
+    /// `--child-cmd` side's answer token ids. Without it, any difference fails the gate.
+    #[arg(long, value_parser = ChildCommand::parse, requires = "parity_cmd")]
+    pub parity_score_cmd: Option<ChildCommand>,
 }
 
 /// A child command, already split into argv.

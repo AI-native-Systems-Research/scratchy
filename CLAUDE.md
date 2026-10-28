@@ -19,7 +19,8 @@
   arm per target plus one registry row.
 - **No instruction selection** — the tape comes straight from the fused
   forward.
-- No new env-var behavior toggles; no `#[allow]`; no weakening tests.
+- No new env-var behavior toggles; no `#[allow]`; no weakening tests
+  ([`docs/TESTING.md`](docs/TESTING.md) says which tests stay tests, and what weakening one means).
 
 ## The model crate
 All model architectures compile into ONE crate, **`scratchy-models`**

@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # The metal round's bot commit (metal-round.yml) starts no workflows by itself, so the bot
+  # starts this one on the round's branch.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -77,6 +80,23 @@ jobs:
           --exclude scratchy-target-metal-compiler
           -- -D warnings
 
+      # e_otel.rs, which needs `otel` and runs on any backend, type-checked
+      # and linted: the macOS e2e step builds without `otel`. Here rather than
+      # on macOS, whose tests job is the longer one. Under spyre, the backend
+      # this job builds, at the clippy step's model.
+      - name: Lint the otel e2e test
+        run: cargo clippy -p scratchy-e2e -p scratchy-models
+          --features e2e,spyre,otel,scratchy-models/granite-3.1-8b-instruct
+          --test e_otel -- -D warnings
+
+      # scratchy-cli's own test targets (its unit tests and
+      # tests/arch_feature_passthrough.rs), type-checked and linted: no other
+      # step builds them. None is backend-specific, so they're linted here
+      # rather than on macOS, whose tests job is the longer one.
+      - name: Lint scratchy-cli's test targets
+        run: cargo clippy -p scratchy-cli --features spyre,claude,model/granite-3.1-8b-instruct
+          --all-targets -- -D warnings
+
       # The CUDA scaffold: no nvcc, no GPU. Lints the target crates and the
       # macro under `cuda`, runs the lowering tests, and expands qwen3.5-0.8b
       # and qwen3.5-9b (`qwen3.5-9b-text-only`: the bare stem selects the
@@ -129,8 +149,8 @@ jobs:
       # `--all-targets` can't simply be added to the workspace clippy: it would
       # also build ktir-emulator's two known-broken examples (bench,
       # ktir_diff_run) — the pre-existing MTL3->MTL4 gap documented at the KTIR
-      # steps in macos-metal, which is why those use `--lib --tests`. Hence a
-      # `-p`-scoped step instead.
+      # steps in macos-metal-tests, which is why those use `--lib --tests`.
+      # Hence a `-p`-scoped step instead.
       #
       # No backend feature, deliberately. scratchy-bench is `default = []` with
       # `metal` as a pure pass-through to scratchy-serving-api and no
@@ -193,12 +213,24 @@ jobs:
         run: cargo test -p scratchy-serving-engine -p scratchy-core-model
           --features scratchy-serving-engine/guided-decoding
 
+      # The serving layer's unit tests with `guided-decoding`, as every `scr serve` build has it:
+      # its tests of a grammar the server builds, such as `tool_choice: "required"`'s (#765), run
+      # it through that guide. The macOS serving-layer step builds without the feature, so it
+      # compiles those tests out. No backend feature, as above.
+      - name: Serving-layer unit tests (guided-decoding)
+        run: cargo test -p scratchy-serving-api --features serve,guided-decoding --lib
+
   # ---------------------------------------------------------------------------
   # Whether this run needs the macOS jobs. A PR whose every changed file is in
   # a crate no macOS job compiles (the Spyre target and its triton re-host
   # crates) skips both; a push to main always runs them. The list, and the lock
   # each macOS job ends with that keeps it true, are in
   # scripts/ci-macos-scope.sh.
+  #
+  # Only a successful `macos=false` skips them. GitHub counts a skipped
+  # required check as passing, so their `if:` fails closed: `!cancelled()`
+  # drops the implicit `success()` that would otherwise skip them whenever
+  # this job fails.
   # ---------------------------------------------------------------------------
   macos-scope:
     name: macOS scope
@@ -236,13 +268,12 @@ jobs:
   # invocation over every stem (~13 min), longer than every other step
   # combined. The two share no build output: clippy writes check metadata,
   # and every `cargo test` step rebuilds the workspace in the `test` profile
-  # anyway. `macos-arm64 (metal)`, the branch rules' required check, is the
-  # gate job after them.
+  # anyway. Both are required checks in the branch rules.
   # ---------------------------------------------------------------------------
   macos-metal-clippy:
     name: macos-arm64 (metal clippy, all models)
     needs: macos-scope
-    if: needs.macos-scope.outputs.macos == 'true'
+    if: ${{ !cancelled() && !(needs.macos-scope.result == 'success' && needs.macos-scope.outputs.macos == 'false') }}
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
@@ -272,7 +303,7 @@ jobs:
   macos-metal-tests:
     name: macos-arm64 (metal tests)
     needs: macos-scope
-    if: needs.macos-scope.outputs.macos == 'true'
+    if: ${{ !cancelled() && !(needs.macos-scope.result == 'success' && needs.macos-scope.outputs.macos == 'false') }}
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
@@ -342,10 +373,11 @@ jobs:
       # proc-macro crate cannot set, so those tests select zero configs — the
       # `config_of` doc comment in codegen.rs spells this out). Same class of
       # rot as the KTIR suites above; fixing them is its own change. Widen this
-      # filter as they are fixed.
+      # filter as they are fixed. `head_ladder_tests`: the check the models'
+      # build runs that an MTP head reaches its target's top rung (#600).
       - name: Variant-selection gate tests (forward-compiler macro)
         run: cargo test -p scratchy-forward-compiler-macro --features metal --lib
-          -- quantization::tests codegen::fingerprint_tests
+          -- quantization::tests codegen::fingerprint_tests head_ladder_tests
           --skip fp8_block_disambiguation
 
       # Type-check scratchy-models' INTEGRATION tests (`tests/*.rs`). Nothing
@@ -356,15 +388,13 @@ jobs:
       # to repair two of them after `try_load` gained a typed result, and CI
       # would not have noticed.
       #
-      # Deliberately a NARROW model scope, not `all`: at `all,turboquant` two
-      # of these files are already rotted against APIs that moved out from
-      # under them (`MetalMem::from_buffer`, `MetalResidencySet::insert`, and
-      # `ForwardCtx`'s turboquant sliding-window fields). Pre-existing, same
-      # class as the KTIR rot above, and its own change to fix. Two stems is
-      # enough to compile all three files.
+      # Deliberately a NARROW model scope, not `all` (every config's expansion
+      # and bake). These three stems compile carrier_parity, metal_o2_logits
+      # and qwen3_py_parity (`qwen3-0.6b` is its `[[test]]` required feature:
+      # without it the file rotted unbuilt).
       - name: Model-crate integration tests type-check
         run: cargo clippy -p scratchy-models --tests
-          --features metal,qwen3.5-35b-a3b,qwen3.6-35b-a3b -- -D warnings
+          --features metal,qwen3.5-35b-a3b,qwen3.6-35b-a3b,qwen3-0.6b -- -D warnings
 
       # Serving-layer unit tests: tool-call parsers (Hermes / Llama / Kimi /
       # Mistral / Jamba / Granite / Gemma-4), chat-template rendering, the
@@ -389,35 +419,19 @@ jobs:
       # GPU. This runner's paravirtual GPU has none, so each test would return
       # early (`skip_if_no_gpu!`) and pass without running. What CI can check
       # here is that the files compile and lint clean; run them on a real GPU.
+      # `--tests` type-checks every e2e test target, and, since `-p
+      # scratchy-models` is what names the model, scratchy-models' own lib and
+      # integration tests at that model. e_otel.rs and scratchy-cli's test
+      # targets are linted in the linux-workspace job. `--keep-going` reports
+      # every failing test target, not just those in flight at the first failure.
       - name: Lint the metal e2e tests
         run: cargo clippy -p scratchy-e2e -p scratchy-models
           --features e2e,metal,scratchy-models/smollm2-135m
-          --test e1_basic_serving --test e_prefix_caching --test e_anthropic
-          --test e5_gemma4_tool_parser --test e_long_prompt_metal -- -D warnings
+          --tests --keep-going -- -D warnings
 
       # See the clippy job's last step.
       - name: Compiled no crate macos-scope skips for
         run: scripts/ci-macos-scope.sh lock
-
-  # The required check: the branch rules name `macos-arm64 (metal)`, so this
-  # passes only when both macOS jobs did, or when macos-scope found nothing
-  # they compile changed. `always()` is load-bearing: without it a failed
-  # dependency SKIPS this job, and GitHub counts a skipped required check as
-  # passing. A failed macos-scope has no `macos=false`, so it fails this too.
-  macos-metal:
-    name: macos-arm64 (metal)
-    needs: [macos-scope, macos-metal-clippy, macos-metal-tests]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Both macOS jobs passed, or neither was needed
-        run: |
-          echo "scope: ${{ needs.macos-scope.result }} macos=${{ needs.macos-scope.outputs.macos }}, clippy: ${{ needs.macos-metal-clippy.result }}, tests: ${{ needs.macos-metal-tests.result }}"
-          if [ "${{ needs.macos-scope.result }}" = success ] && [ "${{ needs.macos-scope.outputs.macos }}" = false ]; then
-            exit 0
-          fi
-          [ "${{ needs.macos-metal-clippy.result }}" = success ]
-          [ "${{ needs.macos-metal-tests.result }}" = success ]
 
   # ---------------------------------------------------------------------------
   # Linux / amd64 — Spyre emulator, non-Accelerate BLAS backends.
@@ -425,7 +439,7 @@ jobs:
   # ktir-emulator's `blis`/`mkl`/`openblas` features (the real IBM Spyre
   # deployment's BLAS choices, run on Linux) are otherwise never built or
   # tested anywhere: linux-workspace only compiles ktir-emulator with default
-  # (no-BLAS) features, and macos-metal's `[target.'cfg(target_os =
+  # (no-BLAS) features, and on the macOS jobs its `[target.'cfg(target_os =
   # "macos")'.dependencies.blas-src]` block is unconditional (always
   # Accelerate) — selecting `openblas`/`mkl` there collides with it. This job
   # is the only place a non-Accelerate BLAS backend actually links and runs.
@@ -509,6 +523,30 @@ jobs:
       - name: Test (spyre worker unit tests)
         run: cargo test -p scratchy-serving-worker
           --features spyre-emu,scratchy-models/granite-3.1-8b-instruct --lib
+      # The same modules at -D warnings, all targets: no other step lints them, so lint debt
+      # piled up unseen (#616's 9 errors). llama-3.2-1b is the smallest model whose bundles bake
+      # clean here.
+      - name: Clippy (spyre worker, emulator)
+        run: cargo clippy -p scratchy-serving-worker
+          --features spyre-emu,scratchy-models/llama-3.2-1b --all-targets -- -D warnings
+      # The spyre-side ktir-superdsc and spyre-bundle crates' TEST targets compile
+      # under no other CI step: this job's clippy above is -p scratchy-target-spyre,
+      # the triton clippy below is the five re-host crates, and the linux-workspace job's
+      # workspace clippy has no --all-targets, so workspace members' test builds
+      # never happen there. #714's dangling `Df::Fp8` sat in exactly that gap (the
+      # import deleted with MatmulStaging, the usage left in
+      # zz_a_one_row_matmul_fills_every_core.rs) — main could not compile that test
+      # binary and no check was red. This leg is the compile cover for that class.
+      - name: Test (spyre ktir-superdsc + bundle)
+        run: cargo test -p ktir-superdsc -p scratchy-spyre-bundle
+      # scratchy-subtile's lib and integration tests ran in no step, so they rotted unseen (#542:
+      # a missing initializer field kept the lib tests from compiling). Pure Rust, no device, on
+      # the ktir-superdsc build the step above leaves. Under `spyre`, which gates no test out; and
+      # featureless, the build metal links, whose test targets must compile too.
+      - name: Test (scratchy-subtile, spyre)
+        run: cargo test -p scratchy-subtile --features spyre
+      - name: Test (scratchy-subtile, featureless)
+        run: cargo test -p scratchy-subtile
       - name: Clippy (triton re-host crates, all targets)
         run: cargo clippy -p triton-frontend -p triton-ktir -p triton-ktir-superdsc -p triton-numeric -p scratchy-triton-splice --all-targets -- -D warnings
       - name: Test (triton re-host crates)

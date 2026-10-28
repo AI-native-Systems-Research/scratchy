@@ -21,4 +21,5 @@ pub mod to_ktir;
 /// bolt-on converter at the end. It is not a stage: it is how the KTDP -> KTIR stage states its
 /// output. `to_ktir::lower` is the door; nothing else should call into here.
 pub mod to_ktir_emit;
+pub mod uniform_grid_corners;
 pub mod walk;

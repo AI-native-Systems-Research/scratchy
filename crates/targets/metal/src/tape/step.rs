@@ -260,6 +260,9 @@ pub enum MetalStep {
     Activation(Slot, Slot, ActivationWidth, UnaryAct),
     /// `(in, out, width)`: final logit softcap.
     TanhSoftCap(Slot, Slot, ActivationWidth),
+    /// `(in, out, op, width)`: a row-wise op of the result's logit tail, over the sampled rows'
+    /// logits at the front of the buffer.
+    SampledLogits(Slot, Slot, LogitOp, ActivationWidth),
     /// `(delta, residual, width)`: `residual += delta`.
     Add(Slot, Slot, ActivationWidth),
     /// `(q, k, v, q_out, k_out, v_out, layer, pairing, class, kv_offsets, write)`: rope + paged KV
@@ -338,7 +341,7 @@ pub enum MetalStep {
     AttnPackedKv(Slot, Slot, LayerId, RopeFormTag, AttnMask, KvOffsets),
     /// One step of the result matmul's sampled rows: each lowers from how its matmul does (its
     /// site is the matmul's).
-    SampleRows(AffineMatmul, SampleRowsStep),
+    SampleRows(SampledMatmul, SampleRowsStep),
     /// A group of row-wise steps over one width as one command (`MetalFusion::RowProgram`).
     RowProgram(Box<RowProgram>),
     /// A one-row step's decode attention that runs its KV writer (`MetalFusion::RopedAttention`).
@@ -455,17 +458,54 @@ pub struct RowNorm {
     pub offset: GainOffset,
 }
 
-/// The steps of a result matmul's sampled rows, in tape order.
+/// The steps of a result matmul's sampled rows, in tape order. Together they leave the sampled
+/// rows' logits at the front of the output, in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SampleRowsStep {
-    /// Each sequence's sampled row to the front of the input, in place.
+    /// The sampled rows to the front of the input, in place.
     Gather,
     /// The matmul, of the gathered rows.
     Matmul,
-    /// The output's front rows back to the sampled rows, in place.
+    /// The gathered input put back, in place — or, where the matmul runs over every row, its
+    /// sampled rows' logits moved to the front.
     Scatter,
     /// The matmul of every row, over the output — on the steps the other three do not run on.
     AllRows,
+}
+
+/// The result matmul a sampled-rows step lowers from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SampledMatmul {
+    Affine(AffineMatmul),
+    /// `(in, out, layer, n, k)`: dense.
+    Dense(Slot, Slot, LayerId, NDim, KDim),
+}
+
+impl SampledMatmul {
+    /// The matmul's input and output.
+    pub fn slots(self) -> (Slot, Slot) {
+        match self {
+            Self::Affine(g) => (g.input, g.output),
+            Self::Dense(input, output, ..) => (input, output),
+        }
+    }
+
+    /// The matmul's input width (`k`) and output width (`n`).
+    pub fn widths(self) -> (KDim, NDim) {
+        match self {
+            Self::Affine(g) => (g.k, g.n),
+            Self::Dense(_, _, _, n, k) => (k, n),
+        }
+    }
+}
+
+/// A row-wise op of the result's logit tail ([`MetalStep::SampledLogits`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogitOp {
+    /// `cap * tanh(x / cap)`, the model's final soft cap.
+    SoftCap,
+    /// `x * scale`.
+    Scale(Scale),
 }
 
 /// A MoE block's steps. Off-arena values live in [`MoeRegion`]s of the op scratch.
@@ -504,11 +544,11 @@ pub enum MoeStep {
     /// `(out)`: each token's pair rows summed by its scores.
     Combine(Slot),
     /// `(gate, up width, act, routing)`: the gate and up projections and `act(gate) * up` — the
-    /// up reads the gate's rows, layer and group size — routing the block's token first with
-    /// `routing` and storing its picks and scores (`MetalFusion::MoeRouted`).
+    /// up reads the gate's rows, layer and group size — routing each of the block's tokens first
+    /// with `routing` and storing its picks and scores (`MetalFusion::MoeRouted`).
     GateUpAct(ExpertMatmul, ExpertWidth, GatedAct, Option<RouteProgram>),
-    /// `(up, act, routing)`: an ungated expert's one in-projection and `act(up)`, routing the
-    /// block's token first with `routing` as [`Self::GateUpAct`] does.
+    /// `(up, act, routing)`: an ungated expert's one in-projection and `act(up)`, routing each of
+    /// the block's tokens first with `routing` as [`Self::GateUpAct`] does.
     UpAct(ExpertMatmul, UngatedAct, Option<RouteProgram>),
     /// `(down, out, ends)`: the down projection, the unsort and the combine into `out`, and what
     /// it computes as it stores each row.
@@ -670,7 +710,8 @@ impl MetalStep {
             | S::KvStage(_, l, ..)
             | S::AttnPackedKv(_, _, l, ..)
             | S::SampleRows(
-                AffineMatmul { layer: l, .. },
+                SampledMatmul::Affine(AffineMatmul { layer: l, .. })
+                | SampledMatmul::Dense(_, _, l, ..),
                 SampleRowsStep::Matmul | SampleRowsStep::AllRows,
             )
             | S::Moe(
@@ -707,6 +748,7 @@ impl MetalStep {
             | S::GeluMul(..)
             | S::Activation(..)
             | S::TanhSoftCap(..)
+            | S::SampledLogits(..)
             | S::Add(..)
             | S::EncoderAttention(..)
             | S::VarlenAttention(..)

@@ -49,6 +49,11 @@ pub const METAL_MODULES: ModuleTable = ModuleTable {
                 "TapeLoop",
                 "TapeCommands",
                 "Fence",
+                "SetAxis",
+                "LogitsRows",
+                "RowTile",
+                "DecodePartials",
+                "SplitSteps",
             ],
         },
         ModuleRow {

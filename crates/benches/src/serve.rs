@@ -41,10 +41,20 @@ struct RequestResult {
     /// Timestamp (seconds since benchmark start) when request was sent.
     start_time: f64,
     success: bool,
+    /// The text the stream carried, for `--save-detailed`.
+    generated_text: String,
+    /// Why the request failed; empty when it didn't (vLLM's `errors` entry).
+    error: String,
+    /// `usage.prompt_tokens_details.cached_tokens`, where the server sent it: the prompt tokens
+    /// its prefix cache served.
+    cached_tokens: Option<usize>,
+    /// `usage.prompt_tokens`, where the server sent it.
+    prompt_tokens: Option<usize>,
 }
 
 impl RequestResult {
-    fn failed(start_time: f64, e2el: f64) -> Self {
+    fn failed(start_time: f64, e2el: f64, error: String) -> Self {
+        eprintln!("Request failed: {error}");
         RequestResult {
             ttft: 0.0,
             itl: vec![],
@@ -53,7 +63,17 @@ impl RequestResult {
             chunks: 0,
             start_time,
             success: false,
+            generated_text: String::new(),
+            error,
+            cached_tokens: None,
+            prompt_tokens: None,
         }
+    }
+
+    /// Output tokens per text chunk: 1 where the server sends a token a chunk, more where a
+    /// chunk carries several (speculative decoding, a server holding tokens back).
+    fn tokens_per_chunk(&self) -> Option<f64> {
+        (self.chunks > 0).then(|| self.output_tokens as f64 / self.chunks as f64)
     }
 }
 
@@ -61,6 +81,8 @@ impl RequestResult {
 struct Run {
     /// Every request sent.
     results: Vec<RequestResult>,
+    /// Each request's prompt tokens, in `results`' order.
+    input_lens: Vec<usize>,
     /// Prompt tokens over the successful requests.
     total_input_tokens: usize,
     /// Wall time of the measured requests (seconds).
@@ -99,12 +121,13 @@ impl Client {
 
     fn post(
         &self,
+        url: &str,
         body: &serde_json::Value,
         request_id: &str,
     ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
         let mut req = self
             .agent
-            .post(&self.api_url)
+            .post(url)
             .header("content-type", "application/json")
             .header("x-request-id", request_id);
         if let Some(key) = &self.api_key {
@@ -146,7 +169,19 @@ fn send_request(
         "repetition_penalty": 1.0,
     });
     client.sampling(&mut body);
+    send_body(client, &client.api_url, &body, request_id, bench_start)
+}
 
+/// Post one streaming request body and measure its timing: TTFT, ITL, E2EL, the server's token
+/// counts, and the answer's text. The body is a completions or a chat one; their chunks carry
+/// text as `text` and `delta.content`, both read here.
+fn send_body(
+    client: &Client,
+    url: &str,
+    body: &serde_json::Value,
+    request_id: &str,
+    bench_start: Instant,
+) -> RequestResult {
     let request_start = Instant::now();
     let start_time = request_start.duration_since(bench_start).as_secs_f64();
     let mut first_token_time: Option<Instant> = None;
@@ -154,11 +189,14 @@ fn send_request(
     let mut itl = Vec::new();
     let mut output_tokens = 0usize;
 
-    let resp = match client.post(&body, request_id) {
+    let resp = match client.post(url, body, request_id) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Request failed: {e}");
-            return RequestResult::failed(start_time, request_start.elapsed().as_secs_f64());
+            return RequestResult::failed(
+                start_time,
+                request_start.elapsed().as_secs_f64(),
+                e.to_string(),
+            );
         }
     };
 
@@ -167,8 +205,11 @@ fn send_request(
     if !resp.status().is_success() {
         let status = resp.status();
         let body_text = resp.into_body().read_to_string().unwrap_or_default();
-        eprintln!("Request failed with status {status}: {body_text}");
-        return RequestResult::failed(start_time, request_start.elapsed().as_secs_f64());
+        return RequestResult::failed(
+            start_time,
+            request_start.elapsed().as_secs_f64(),
+            format!("status {status}: {body_text}"),
+        );
     }
 
     // Parse SSE stream. Reading straight off the body reader keeps the
@@ -177,13 +218,26 @@ fn send_request(
     let mut chunk = [0u8; 8192];
     let mut buf = String::new();
     let mut usage_completion_tokens: Option<usize> = None;
+    let mut cached_tokens: Option<usize> = None;
+    let mut prompt_tokens: Option<usize> = None;
     let mut chunks = 0usize;
+    let mut generated_text = String::new();
     let mut last_choices_time: Option<Instant> = None;
+    // Why the stream says the request failed, if it does: the first one wins.
+    let mut failure: Option<String> = None;
+    // Whether the client has read the server's `data: [DONE]`: a read error after that ends a
+    // finished request, not a failed one. It helps only once `[DONE]` is parsed: a server that
+    // resets right after sending it still fails the request when the reset beats this read.
+    let mut done = false;
 
     loop {
         let n = match reader.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => n,
+            Err(e) if !done => {
+                failure.get_or_insert_with(|| format!("stream read failed: {e}"));
+                break;
+            }
             Err(_) => break,
         };
         buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
@@ -196,6 +250,7 @@ fn send_request(
             for line in event.lines() {
                 let line = line.trim();
                 if line == "data: [DONE]" {
+                    done = true;
                     continue;
                 }
                 if let Some(data) = line.strip_prefix("data: ")
@@ -211,9 +266,18 @@ fn send_request(
                     if has_choices(&parsed) {
                         last_choices_time = Some(Instant::now());
                     }
-                    if chunk_has_text(&parsed) {
+                    if let Some(n) =
+                        parsed["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64()
+                    {
+                        cached_tokens = Some(n as usize);
+                    }
+                    if let Some(n) = parsed["usage"]["prompt_tokens"].as_u64() {
+                        prompt_tokens = Some(n as usize);
+                    }
+                    if let Some(text) = chunk_text(&parsed) {
                         let now = Instant::now();
                         chunks += 1;
+                        generated_text.push_str(text);
                         if first_token_time.is_none() {
                             first_token_time = Some(now);
                         } else {
@@ -222,9 +286,18 @@ fn send_request(
                         last_token_time = now;
                     }
                     usage_completion_tokens = merge_usage(usage_completion_tokens, &parsed);
+                    if let Some(why) = chunk_failure(&parsed) {
+                        failure.get_or_insert(why);
+                    }
                 }
             }
         }
+    }
+
+    // A stream that ends the request as aborted or errored failed, whatever it streamed before:
+    // a server whose engine stopped answers every request at once with an empty `abort`.
+    if let Some(why) = failure {
+        return RequestResult::failed(start_time, request_start.elapsed().as_secs_f64(), why);
     }
 
     // No chunk carried text, but the server did answer: mlx_lm.server holds
@@ -257,6 +330,10 @@ fn send_request(
         chunks,
         start_time,
         success: first_token_time.is_some(),
+        generated_text,
+        error: String::new(),
+        cached_tokens,
+        prompt_tokens,
     }
 }
 
@@ -277,15 +354,40 @@ fn has_choices(chunk: &serde_json::Value) -> bool {
         .is_some_and(|c| c.as_array().is_some_and(|a| !a.is_empty()))
 }
 
-/// Whether a streamed chunk carries generated text: `text` on the completions
-/// API, `delta.content` on chat. Keepalive and closing chunks carry none.
-fn chunk_has_text(chunk: &serde_json::Value) -> bool {
-    let Some(first) = chunk["choices"].as_array().and_then(|a| a.first()) else {
-        return false;
-    };
-    [&first["text"], &first["delta"]["content"]]
-        .iter()
-        .any(|t| t.as_str().is_some_and(|s| !s.is_empty()))
+/// Why a streamed chunk says its request failed: an `error` object (an SSE error event; a null
+/// one is no error), or a choice finished `abort` or `error`. `None` for any other chunk, `stop`
+/// and `length` included: a request may stop early on its own (oMLX stops at EOS despite
+/// `ignore_eos`), so the token count alone says nothing.
+fn chunk_failure(chunk: &serde_json::Value) -> Option<String> {
+    if let Some(err) = chunk.get("error").filter(|e| !e.is_null()) {
+        let message = err["message"]
+            .as_str()
+            .map_or_else(|| err.to_string(), str::to_string);
+        return Some(format!("error event: {message}"));
+    }
+    let choices = chunk["choices"].as_array()?;
+    (choices.iter())
+        .filter_map(|c| c["finish_reason"].as_str())
+        .find(|r| matches!(*r, "abort" | "error"))
+        .map(|r| format!("finish_reason {r}"))
+}
+
+/// The generated text a streamed chunk carries: `text` on the completions API;
+/// on chat, `delta.content`, or a reasoning model's thinking, which scratchy
+/// streams as `delta.reasoning` and vLLM as `delta.reasoning_content`. A
+/// thinking chunk is a generated token like any other, as vLLM's bench counts
+/// it. Keepalive and closing chunks carry none.
+fn chunk_text(chunk: &serde_json::Value) -> Option<&str> {
+    let first = chunk["choices"].as_array()?.first()?;
+    let delta = &first["delta"];
+    [
+        &first["text"],
+        &delta["content"],
+        &delta["reasoning"],
+        &delta["reasoning_content"],
+    ]
+    .into_iter()
+    .find_map(|t| t.as_str().filter(|s| !s.is_empty()))
 }
 
 /// A request whose whole multi-token output arrived in one `choices` chunk
@@ -460,7 +562,13 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
     };
 
     if args.is_multi_turn() {
+        if args.save_detailed {
+            anyhow::bail!("--save-detailed keeps single-turn requests; a multi-turn run has none");
+        }
         return run_multi_turn(&args, agent, api_url, &model, &tokenizer);
+    }
+    if args.is_task_dataset() {
+        return run_tasks(&args, agent, api_url, &model, &tokenizer);
     }
 
     let client = Arc::new(Client {
@@ -509,6 +617,7 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
 
     let mut itls: Vec<f64> = timed.iter().flat_map(|r| r.itl.iter().copied()).collect();
     itls.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let chunking = Chunking::of(&timed);
 
     let mut e2els: Vec<f64> = successful.iter().map(|r| r.e2el).collect();
     e2els.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -614,7 +723,10 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
         match *metric {
             "ttft" => print_metric("TTFT", "Time to First Token", &ttfts),
             "tpot" => print_metric("TPOT", "Time per Output Token (excl. 1st token)", &tpots),
-            "itl" => print_metric("ITL", "Inter-token Latency", &itls),
+            "itl" => {
+                print_metric("ITL", "Inter-token Latency", &itls);
+                chunking.print();
+            }
             "e2el" => print_metric("E2EL", "End-to-end Latency", &e2els),
             _ => eprintln!("Unknown metric: {metric}"),
         }
@@ -638,6 +750,10 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
         "unstreamed_requests": num_unstreamed,
     });
     let obj = json.as_object_mut().unwrap();
+    chunking.add_json(obj);
+    if args.save_detailed {
+        add_detailed_json(obj, &run);
+    }
 
     // No samples is "not measured" (null), never 0 ms.
     let add_metric_json =
@@ -666,6 +782,110 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
     }
 
     write_results(&args, &model, &json)
+}
+
+/// How many tokens a stream chunk carried, over the timed requests.
+///
+/// ITL is the gap between text chunks, whatever the server packs into one: a token per chunk
+/// for most engines, several under speculative decoding (scratchy sends a step's accepted
+/// tokens together), and a held-back flush when a server defers undecodable bytes. A chunk
+/// count alone can't tell those apart, so ITL stays per chunk, one rule for every engine
+/// (#161), and this reports how many tokens a chunk carried beside it. ITL reads per token
+/// only where a chunk is one token.
+struct Chunking {
+    /// The median of the requests' output tokens per chunk; `None` with no timed request.
+    median_tokens_per_chunk: Option<f64>,
+    /// Timed requests averaging more than [`Chunking::MULTI_TOKEN`] tokens a chunk.
+    multi_token_requests: usize,
+}
+
+impl Chunking {
+    /// Tokens a chunk above which a request's chunks carry several tokens.
+    const MULTI_TOKEN: f64 = 1.5;
+
+    fn of(timed: &[&RequestResult]) -> Self {
+        let mut per_chunk: Vec<f64> = timed.iter().filter_map(|r| r.tokens_per_chunk()).collect();
+        per_chunk.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        Chunking {
+            median_tokens_per_chunk: (!per_chunk.is_empty()).then(|| percentile(&per_chunk, 50.0)),
+            multi_token_requests: per_chunk.iter().filter(|&&t| t > Self::MULTI_TOKEN).count(),
+        }
+    }
+
+    fn print(&self) {
+        let Some(median) = self.median_tokens_per_chunk else {
+            return;
+        };
+        println!("{:<40} {:<10.2}", "Median tokens per chunk:", median);
+        println!(
+            "{:<40} {:<10}",
+            format!("Requests over {} tokens/chunk:", Self::MULTI_TOKEN),
+            self.multi_token_requests
+        );
+        if self.multi_token_requests > 0 {
+            eprintln!(
+                "note: ITL is the gap between stream chunks; {} requests averaged more than {} \
+                 tokens a chunk, so their gaps span several tokens each",
+                self.multi_token_requests,
+                Self::MULTI_TOKEN
+            );
+        }
+    }
+
+    fn add_json(&self, obj: &mut serde_json::Map<String, serde_json::Value>) {
+        obj.insert(
+            "median_tokens_per_chunk".into(),
+            serde_json::json!(self.median_tokens_per_chunk),
+        );
+        obj.insert(
+            "multi_token_chunk_requests".into(),
+            serde_json::json!(self.multi_token_requests),
+        );
+    }
+}
+
+/// `--save-detailed`: every request's own figures, as vLLM's `vllm bench serve --save-detailed`
+/// keeps them — parallel arrays in request order, latencies in seconds, `errors` empty for a
+/// request that succeeded — plus `chunks`, which vLLM doesn't keep: the text chunks each stream
+/// carried, so an ITL can be read per token afterwards.
+fn add_detailed_json(obj: &mut serde_json::Map<String, serde_json::Value>, run: &Run) {
+    let rs = &run.results;
+    let mut put = |key: &str, v: serde_json::Value| {
+        obj.insert(key.into(), v);
+    };
+    put("input_lens", serde_json::json!(run.input_lens));
+    put(
+        "output_lens",
+        serde_json::json!(rs.iter().map(|r| r.output_tokens).collect::<Vec<_>>()),
+    );
+    put(
+        "ttfts",
+        serde_json::json!(rs.iter().map(|r| r.ttft).collect::<Vec<_>>()),
+    );
+    put(
+        "itls",
+        serde_json::json!(rs.iter().map(|r| &r.itl).collect::<Vec<_>>()),
+    );
+    put(
+        "latencies",
+        serde_json::json!(rs.iter().map(|r| r.e2el).collect::<Vec<_>>()),
+    );
+    put(
+        "start_times",
+        serde_json::json!(rs.iter().map(|r| r.start_time).collect::<Vec<_>>()),
+    );
+    put(
+        "generated_texts",
+        serde_json::json!(rs.iter().map(|r| &r.generated_text).collect::<Vec<_>>()),
+    );
+    put(
+        "errors",
+        serde_json::json!(rs.iter().map(|r| &r.error).collect::<Vec<_>>()),
+    );
+    put(
+        "chunks",
+        serde_json::json!(rs.iter().map(|r| r.chunks).collect::<Vec<_>>()),
+    );
 }
 
 /// Write the results JSON where `--output-json` and `--save-result` say.
@@ -1244,9 +1464,318 @@ fn run_prompts(args: &BenchServeArgs, client: &Arc<Client>, tokenizer: &Tokenize
         .sum();
     Ok(Run {
         results,
+        input_lens: prompt_lens,
         total_input_tokens,
         total_time,
     })
+}
+
+/// The tasks of a dataset workload ([`crate::workloads`]), loaded from its loader, those whose
+/// prompt fits `--max-prompt-tokens`, then `--num-prompts` of them sampled by `--seed` (and the
+/// warmups from a seed disjoint from it).
+fn load_tasks(
+    args: &BenchServeArgs,
+    tokenizer: &Tokenizer,
+) -> Result<(String, Vec<crate::workloads::Task>)> {
+    use crate::args::RagSource;
+    // Loaders read the first N records; take enough that the sample is drawn from many.
+    let pool = (args.num_prompts + args.num_warmups + 1).max(200);
+    let (name, all) = match args.dataset_name {
+        ServeDataset::Longbench => (
+            format!("longbench-v2-{}", args.longbench_length),
+            crate::longbench::tasks(&args.longbench_length, args.output_len)?,
+        ),
+        _ => match args.rag_source {
+            RagSource::Musique => ("musique".to_string(), crate::musique::tasks(pool)?),
+            #[cfg(feature = "datasets")]
+            RagSource::TwoWiki => ("2wikimqa".to_string(), crate::multihop::tasks(pool)?),
+            #[cfg(feature = "datasets")]
+            RagSource::Hotpotqa => ("hotpotqa".to_string(), crate::hotpotqa::tasks(pool)?),
+            #[cfg(not(feature = "datasets"))]
+            other => anyhow::bail!(
+                "--rag-source {other:?} needs scr built with the bench crate's `datasets` feature"
+            ),
+        },
+    };
+    let fits = |t: &crate::workloads::Task| {
+        args.max_prompt_tokens.is_none_or(|max| {
+            let text: String = (t.messages.iter())
+                .filter_map(|m| m["content"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            datasets::token_count(tokenizer, &text).is_ok_and(|n| n <= max)
+        })
+    };
+    let fitting: Vec<_> = all.into_iter().filter(fits).collect();
+    Ok((name, fitting))
+}
+
+/// A dataset workload: each task streamed as a chat request (or, for `rag-spans`, a span query),
+/// its answer ending on its own, timed, scored, and its cached prompt tokens read from the
+/// server's usage.
+fn run_tasks(
+    args: &BenchServeArgs,
+    agent: Agent,
+    api_url: String,
+    model: &str,
+    tokenizer: &Tokenizer,
+) -> Result<()> {
+    let (dataset, fitting) = load_tasks(args, tokenizer)?;
+    anyhow::ensure!(
+        !fitting.is_empty(),
+        "no {dataset} task fits --max-prompt-tokens {:?}",
+        args.max_prompt_tokens
+    );
+    // Warmups from a seed disjoint from --seed, so no measured task is cached before it is timed;
+    // drawn first so they never overlap the measured sample.
+    let mut pool =
+        crate::workloads::sample(fitting, usize::MAX, datasets::throwaway_seed(args.seed));
+    let warmups: Vec<_> = pool
+        .drain(..args.num_warmups.min(pool.len().saturating_sub(1)))
+        .collect();
+    let tasks = crate::workloads::sample(pool, args.num_prompts, args.seed);
+    eprintln!(
+        "{dataset}: {} tasks (seed {}), {} warmups",
+        tasks.len(),
+        args.seed,
+        warmups.len()
+    );
+
+    let spans = args.dataset_name == ServeDataset::RagSpans;
+    let client = Arc::new(Client {
+        agent,
+        api_url,
+        model: model.to_string(),
+        api_key: args.api_key.clone(),
+        // Answers end on their own: a task's tokens are what it took.
+        ignore_eos: false,
+        temperature: Some(args.temperature.unwrap_or(0.0)),
+        top_p: args.top_p,
+        top_k: args.top_k,
+    });
+    let body = |t: &crate::workloads::Task| task_body(&client, args, t, spans);
+    let send = |t: &crate::workloads::Task, id: &str, start: Instant| {
+        send_body(&client, &client.api_url, &body(t), id, start)
+    };
+    if let Some(first) = warmups.first().or(tasks.first()) {
+        preflight(|| send(first, "preflight", Instant::now()).success)?;
+    }
+    warm_up(warmups.len(), |i| {
+        send(&warmups[i], &format!("warmup-{i}"), Instant::now());
+    });
+
+    let pb = progress_bar(args, tasks.len());
+    let semaphore = args.max_concurrency.map(|n| Arc::new(Semaphore::new(n)));
+    let tasks = Arc::new(tasks);
+    let start = Instant::now();
+    let mut handles = Vec::with_capacity(tasks.len());
+    for i in 0..tasks.len() {
+        let (client, tasks, pb) = (client.clone(), tasks.clone(), pb.clone());
+        let body = task_body(&client, args, &tasks[i], spans);
+        let permit = semaphore.as_ref().map(|s| s.acquire_owned());
+        handles.push(std::thread::spawn(move || {
+            let _permit = permit;
+            let r = send_body(
+                &client,
+                &client.api_url,
+                &body,
+                &format!("bench-{i}"),
+                start,
+            );
+            if let Some(ref pb) = pb {
+                pb.inc(1);
+            }
+            r
+        }));
+    }
+    let results = join_all(handles)?;
+    let total_time = start.elapsed().as_secs_f64();
+    if let Some(pb) = pb {
+        pb.finish_and_clear();
+    }
+    if let Some(path) = &args.save_answers {
+        let rows: Vec<serde_json::Value> = (results.iter().zip(tasks.iter()))
+            .map(|(r, t)| {
+                serde_json::json!({
+                    "reference": t.score.reference(),
+                    "answer": r.generated_text,
+                    "score": r.success.then(|| t.score.score(&r.generated_text)),
+                    "answer_tokens": r.output_tokens,
+                })
+            })
+            .collect();
+        std::fs::write(path, serde_json::to_string_pretty(&rows)?)?;
+    }
+    let count = |t: &str| datasets::token_count(tokenizer, t).unwrap_or(0);
+    let json = task_metrics(&results, &tasks, &count, total_time, &dataset, args.seed);
+    print_task_summary(&dataset, &json);
+    write_results(args, model, &json)
+}
+
+/// One task's request body: a streamed chat request, or for `rag-spans` a span query.
+fn task_body(
+    client: &Client,
+    args: &BenchServeArgs,
+    t: &crate::workloads::Task,
+    spans: bool,
+) -> serde_json::Value {
+    let mut body = if spans {
+        serde_json::json!({"g": {
+            "model": client.model,
+            "max_tokens": t.max_tokens,
+            "temperature": client.temperature.unwrap_or(0.0),
+            "input": t.spans_input.clone().unwrap_or(serde_json::Value::Null),
+        }})
+    } else {
+        let mut b = serde_json::json!({
+            "model": client.model,
+            "messages": t.messages,
+            "max_tokens": t.max_tokens,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        });
+        client.sampling(&mut b);
+        b
+    };
+    if !spans && let Some(kwargs) = &args.chat_template_kwargs {
+        body["chat_template_kwargs"] = serde_json::Value::Object(kwargs.clone());
+    }
+    body
+}
+
+/// A dataset workload's JSON: the serving metrics of `bench serve`, over the requests that
+/// answered, plus accuracy, prompt and answer tokens, and cached prompt tokens.
+fn task_metrics(
+    results: &[RequestResult],
+    tasks: &[crate::workloads::Task],
+    count_tokens: &dyn Fn(&str) -> usize,
+    total_time: f64,
+    dataset: &str,
+    seed: u64,
+) -> serde_json::Value {
+    let ok: Vec<(&RequestResult, &crate::workloads::Task)> = (results.iter().zip(tasks))
+        .filter(|(r, _)| r.success)
+        .collect();
+    let sorted = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v
+    };
+    let ms = |v: &[f64], p: f64| (!v.is_empty()).then(|| percentile(v, p) * 1000.0);
+    // A span query's stream carries no usage, so its answer tokens are counted here.
+    let answer_tokens = |r: &RequestResult| {
+        if r.output_tokens > 0 {
+            r.output_tokens
+        } else {
+            count_tokens(&r.generated_text)
+        }
+    };
+    let ttft = sorted(ok.iter().map(|(r, _)| r.ttft).collect());
+    let e2el = sorted(ok.iter().map(|(r, _)| r.e2el).collect());
+    let tpot = sorted(
+        (ok.iter())
+            .filter(|(r, _)| answer_tokens(r) > 1)
+            .map(|(r, _)| (r.e2el - r.ttft) / (answer_tokens(r) - 1) as f64)
+            .collect(),
+    );
+    let out: Vec<usize> = ok.iter().map(|(r, _)| answer_tokens(r)).collect();
+    let total_out: usize = out.iter().sum();
+    let mean = |v: &[f64]| (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64);
+    // Over every task sent: a request that failed scores wrong, as does an answer that ran to its
+    // cap, whose text may hold the answer somewhere in a ramble that never gave it. Over the
+    // answered only, an engine that failed the hard tasks would score higher.
+    let capped = |r: &RequestResult, t: &crate::workloads::Task| answer_tokens(r) >= t.max_tokens;
+    let accuracy = mean(
+        &(results.iter().zip(tasks))
+            .map(|(r, t)| {
+                if r.success && !capped(r, t) {
+                    t.score.score(&r.generated_text)
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
+    // Answers that open as a thought: a request whose `enable_thinking: false` did not reach the
+    // template (a span query has no template kwargs), so its accuracy and tokens count reasoning
+    // too and are no like-for-like with a plain answer.
+    let thought = (ok.iter())
+        .filter(|(r, _)| opens_as_thought(&r.generated_text))
+        .count();
+    let cached: Vec<f64> = (ok.iter())
+        .filter_map(|(r, _)| r.cached_tokens.map(|c| c as f64))
+        .collect();
+    let prompt: Vec<f64> = (ok.iter())
+        .filter_map(|(r, _)| r.prompt_tokens.map(|c| c as f64))
+        .collect();
+    serde_json::json!({
+        "dataset": dataset,
+        "task_seed": seed,
+        "duration": total_time,
+        "completed": ok.len(),
+        "failed": results.len() - ok.len(),
+        // Requests that answered with no tokens at all: with answers ending on their own, the
+        // only sign of a server that had stopped answering.
+        "empty_answers": out.iter().filter(|&&n| n == 0).count(),
+        "total_output_tokens": total_out,
+        "output_throughput": total_out as f64 / total_time,
+        "median_ttft_ms": ms(&ttft, 50.0),
+        "p90_ttft_ms": ms(&ttft, 90.0),
+        "p99_ttft_ms": ms(&ttft, 99.0),
+        "median_tpot_ms": ms(&tpot, 50.0),
+        "median_e2el_ms": ms(&e2el, 50.0),
+        "p90_e2el_ms": ms(&e2el, 90.0),
+        "p99_e2el_ms": ms(&e2el, 99.0),
+        "mean_output_tokens": mean(&out.iter().map(|&n| n as f64).collect::<Vec<_>>()),
+        "mean_prompt_tokens": mean(&prompt),
+        // Null where the server sent no cached-token count, not 0.
+        "mean_cached_tokens": mean(&cached),
+        "accuracy": accuracy,
+        "thinking_answers": thought,
+    })
+}
+
+/// Whether an answer opens as reasoning rather than the answer: a think tag, or the openings the
+/// matrix's reasoning models write when thinking reaches them as plain text ("We need to...",
+/// "Okay, let's see"), as span queries do.
+fn opens_as_thought(text: &str) -> bool {
+    let t = text.trim_start();
+    [
+        "<think>",
+        "<|channel|>analysis",
+        "We need to",
+        "Okay, let's",
+        "Okay, so",
+        "Let me ",
+    ]
+    .iter()
+    .any(|p| t.starts_with(p))
+}
+
+fn print_task_summary(dataset: &str, j: &serde_json::Value) {
+    let f = |k: &str| j[k].as_f64().map_or("-".to_string(), |v| format!("{v:.1}"));
+    println!();
+    println!("{:=^50}", format!(" {dataset} "));
+    println!(
+        "{:<40} {} / {}",
+        "Completed / failed:", j["completed"], j["failed"]
+    );
+    println!("{:<40} {}", "Median TTFT (ms):", f("median_ttft_ms"));
+    println!("{:<40} {}", "Median end-to-end (ms):", f("median_e2el_ms"));
+    println!("{:<40} {}", "Mean answer tokens:", f("mean_output_tokens"));
+    println!("{:<40} {}", "Mean prompt tokens:", f("mean_prompt_tokens"));
+    println!(
+        "{:<40} {}",
+        "Mean cached prompt tokens:",
+        f("mean_cached_tokens")
+    );
+    println!(
+        "{:<40} {}",
+        "Accuracy:",
+        j["accuracy"]
+            .as_f64()
+            .map_or("-".to_string(), |a| format!("{:.0}%", a * 100.0))
+    );
+    println!("{:=^50}", "");
 }
 
 /// Send one request to verify connectivity, and fail fast if it does not land.
@@ -1396,22 +1925,282 @@ mod tests {
     fn only_chunks_with_text_are_tokens() {
         let c = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
         // oMLX's keepalive while it prefills, and llama.cpp's closing chunk.
-        assert!(!chunk_has_text(&c(
-            r#"{"model":"keepalive","choices":[{"index":0,"text":""}]}"#
-        )));
-        assert!(!chunk_has_text(&c(
-            r#"{"choices":[{"text":"","finish_reason":"length"}],"usage":{"completion_tokens":5}}"#
-        )));
-        assert!(!chunk_has_text(&c(
-            r#"{"choices":[],"usage":{"completion_tokens":4}}"#
-        )));
-        assert!(chunk_has_text(&c(
-            r#"{"choices":[{"index":0,"text":" four"}]}"#
-        )));
-        assert!(chunk_has_text(&c(
-            r#"{"choices":[{"delta":{"content":"hi"}}]}"#
-        )));
+        assert_eq!(
+            chunk_text(&c(
+                r#"{"model":"keepalive","choices":[{"index":0,"text":""}]}"#
+            )),
+            None
+        );
+        assert_eq!(
+            chunk_text(&c(
+                r#"{"choices":[{"text":"","finish_reason":"length"}],"usage":{"completion_tokens":5}}"#
+            )),
+            None
+        );
+        assert_eq!(
+            chunk_text(&c(r#"{"choices":[],"usage":{"completion_tokens":4}}"#)),
+            None
+        );
+        assert_eq!(
+            chunk_text(&c(r#"{"choices":[{"index":0,"text":" four"}]}"#)),
+            Some(" four")
+        );
+        assert_eq!(
+            chunk_text(&c(r#"{"choices":[{"delta":{"content":"hi"}}]}"#)),
+            Some("hi")
+        );
+        // A reasoning model's thinking, as scratchy and vLLM stream it, is generated text too.
+        assert_eq!(
+            chunk_text(&c(r#"{"choices":[{"delta":{"reasoning":"Hmm"}}]}"#)),
+            Some("Hmm")
+        );
+        assert_eq!(
+            chunk_text(&c(
+                r#"{"choices":[{"delta":{"content":null,"reasoning_content":"so"}}]}"#
+            )),
+            Some("so")
+        );
         assert!(has_choices(&c(r#"{"choices":[{"text":""}]}"#)));
+    }
+
+    #[test]
+    fn a_stream_that_ends_aborted_or_errored_failed() {
+        let c = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        // A scratchy server whose engine stopped: an empty `abort` delta, at once or after the
+        // no-progress watchdog.
+        assert_eq!(
+            chunk_failure(&c(
+                r#"{"choices":[{"index":0,"text":"","finish_reason":"abort"}]}"#
+            )),
+            Some("finish_reason abort".into())
+        );
+        assert!(
+            chunk_failure(&c(r#"{"choices":[{"delta":{},"finish_reason":"error"}]}"#)).is_some()
+        );
+        assert_eq!(
+            chunk_failure(&c(r#"{"error":{"message":"out of memory","code":500}}"#)),
+            Some("error event: out of memory".into())
+        );
+        // A request that stops early on its own, or runs to its length, did not fail.
+        assert_eq!(
+            chunk_failure(&c(r#"{"choices":[{"text":"","finish_reason":"stop"}]}"#)),
+            None
+        );
+        assert_eq!(
+            chunk_failure(&c(r#"{"choices":[{"text":"x","finish_reason":"length"}]}"#)),
+            None
+        );
+        assert_eq!(chunk_failure(&c(r#"{"choices":[{"text":"x"}]}"#)), None);
+        // A null error is no error.
+        assert_eq!(
+            chunk_failure(&c(r#"{"error":null,"choices":[{"text":"x"}]}"#)),
+            None
+        );
+        assert_eq!(
+            chunk_failure(&c(r#"{"choices":[],"usage":{"completion_tokens":4}}"#)),
+            None
+        );
+    }
+
+    fn task_client() -> Client {
+        Client {
+            agent: crate::http::agent(false),
+            api_url: "http://127.0.0.1:1/v1/chat/completions".into(),
+            model: "m".into(),
+            api_key: None,
+            ignore_eos: false,
+            temperature: Some(0.0),
+            top_p: None,
+            top_k: None,
+        }
+    }
+
+    fn rag(answer: &str) -> crate::workloads::Task {
+        let docs = vec![("Paris".to_string(), "The capital of France.".to_string())];
+        crate::workloads::rag_task(
+            &crate::workloads::DOCUMENTS,
+            &docs,
+            "Capital of France?",
+            &[answer.to_string()],
+            crate::workloads::Rule::AnyAnswer,
+            crate::workloads::RAG_MAX_TOKENS,
+        )
+    }
+
+    /// A dataset task goes as a streamed chat request with its own messages and answer cap, and
+    /// no `ignore_eos`, so the answer ends on its own; `rag-spans` sends the same documents as a
+    /// span query instead.
+    #[test]
+    fn a_task_is_sent_as_chat_or_as_a_span_query() {
+        let args = <BenchServeArgs as clap::Parser>::try_parse_from([
+            "serve",
+            "--dataset-name",
+            "rag",
+            "--chat-template-kwargs",
+            r#"{"enable_thinking":false}"#,
+        ])
+        .unwrap();
+        let (client, t) = (task_client(), rag("Paris"));
+        let chat = task_body(&client, &args, &t, false);
+        assert_eq!(chat["messages"], serde_json::json!(t.messages));
+        assert_eq!(chat["max_tokens"], crate::workloads::RAG_MAX_TOKENS);
+        assert_eq!(chat["stream"], true);
+        assert_eq!(chat["stream_options"]["include_usage"], true);
+        assert!(chat.get("ignore_eos").is_none(), "answers end on their own");
+        assert_eq!(chat["chat_template_kwargs"]["enable_thinking"], false);
+        let spans = task_body(&client, &args, &t, true);
+        assert_eq!(spans["g"]["input"], t.spans_input.clone().unwrap());
+        assert_eq!(spans["g"]["max_tokens"], crate::workloads::RAG_MAX_TOKENS);
+        assert!(spans.get("messages").is_none());
+    }
+
+    /// A dataset workload's metrics: accuracy over every task sent, a failed request or a capped
+    /// answer scoring wrong; cached prompt tokens from the server's usage (null where it sent
+    /// none); and the failed and empty answers counted apart.
+    #[test]
+    fn a_workloads_metrics_score_the_answers_and_read_the_cache() {
+        // A span answer's tokens, where the server sent no count: a word a token, here.
+        let words = |t: &str| t.split_whitespace().count();
+        let tokenizer = &words;
+        let answered = |text: &str, tokens: usize, cached: Option<usize>| {
+            let mut r = req(tokens, tokens, 0.1, 0.5);
+            r.generated_text = text.into();
+            r.cached_tokens = cached;
+            r.prompt_tokens = Some(100);
+            r
+        };
+        let results = vec![
+            answered("Paris.", 2, Some(80)),
+            answered("Lyon.", 2, Some(40)),
+            RequestResult::failed(0.0, 1.0, "timed out".into()),
+        ];
+        let tasks = vec![rag("Paris"), rag("Paris"), rag("Paris")];
+        let j = task_metrics(&results, &tasks, tokenizer, 1.0, "musique", 7);
+        assert_eq!(j["completed"], 2);
+        assert_eq!(j["failed"], 1);
+        assert_eq!(j["accuracy"], 1.0 / 3.0, "the failed request scores wrong");
+        assert_eq!(j["mean_cached_tokens"], 60.0);
+        assert_eq!(j["mean_prompt_tokens"], 100.0);
+        assert_eq!(j["dataset"], "musique");
+        assert_eq!(j["task_seed"], 7);
+        assert_eq!(j["empty_answers"], 0);
+        assert_eq!(j["thinking_answers"], 0);
+        let thinking = vec![answered("We need to answer: what is the capital?", 9, None)];
+        let j = task_metrics(&thinking, &tasks[..1], tokenizer, 1.0, "musique", 7);
+        assert_eq!(j["thinking_answers"], 1);
+        let no_usage = vec![answered("Paris", 1, None)];
+        let j = task_metrics(&no_usage, &tasks[..1], tokenizer, 1.0, "musique", 7);
+        assert!(j["mean_cached_tokens"].is_null(), "no count is not zero");
+        // An answer that ran to its cap scores wrong, though the answer is somewhere in it.
+        let ramble = format!("Paris {}", "and ".repeat(crate::workloads::RAG_MAX_TOKENS));
+        let capped = vec![answered(&ramble, crate::workloads::RAG_MAX_TOKENS, None)];
+        let j = task_metrics(&capped, &tasks[..1], tokenizer, 1.0, "musique", 7);
+        assert_eq!(j["accuracy"], 0.0);
+        // A span answer has no usage: its tokens are counted from its text.
+        let span = vec![answered(&ramble, 0, None)];
+        let j = task_metrics(&span, &tasks[..1], tokenizer, 1.0, "musique", 7);
+        assert_eq!(
+            j["accuracy"], 0.0,
+            "counted from its text, it ran to its cap"
+        );
+    }
+
+    /// A streamed chat answer comes back with its text and the server's cached and prompt token
+    /// counts, read from the usage chunk.
+    #[test]
+    fn a_chat_answer_brings_its_text_and_cached_tokens() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut req = [0u8; 8192];
+            let _ = s.read(&mut req);
+            let events = [
+                r#"{"choices":[{"delta":{"content":"Par"},"finish_reason":null}]}"#,
+                r#"{"choices":[{"delta":{"content":"is"},"finish_reason":"stop"}]}"#,
+                r#"{"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":96}}}"#,
+            ];
+            let mut body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+            body += "data: [DONE]\n\n";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+                body.len()
+            );
+            s.write_all(head.as_bytes()).unwrap();
+            s.write_all(body.as_bytes()).unwrap();
+            s.flush().unwrap();
+            // Half-close, then read what is left of the request, as the read-error test does: a
+            // socket closed with unread input sends a reset, and on macOS the client's next read
+            // then fails before it has read the response this wrote.
+            s.shutdown(std::net::Shutdown::Write).unwrap();
+            let _ = std::io::copy(&mut s, &mut std::io::sink());
+        });
+        let mut client = task_client();
+        client.api_url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        let r = send_body(
+            &client,
+            &client.api_url,
+            &serde_json::json!({"messages": []}),
+            "t",
+            Instant::now(),
+        );
+        server.join().unwrap();
+        assert!(r.success);
+        assert_eq!(r.generated_text, "Paris");
+        assert_eq!(r.output_tokens, 2);
+        assert_eq!(r.cached_tokens, Some(96));
+        assert_eq!(r.prompt_tokens, Some(120));
+    }
+
+    /// A stream that breaks off mid-answer failed; one that breaks off only after `[DONE]` finished.
+    /// The server here streams one token in a chunked body it closes without the final empty
+    /// chunk, so the client's read ends in an error rather than EOF.
+    #[test]
+    fn a_read_error_fails_a_request_only_before_done() {
+        use std::io::{Read as _, Write as _};
+        let served = |done: bool| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (mut s, _) = listener.accept().unwrap();
+                let mut req = [0u8; 4096];
+                let _ = s.read(&mut req);
+                let mut events = String::from(
+                    "data: {\"choices\":[{\"text\":\"x\",\"finish_reason\":null}]}\n\n",
+                );
+                if done {
+                    events += "data: [DONE]\n\n";
+                }
+                let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                            transfer-encoding: chunked\r\n\r\n";
+                let body = format!("{:x}\r\n{events}\r\n", events.len());
+                s.write_all(head.as_bytes()).unwrap();
+                s.write_all(body.as_bytes()).unwrap();
+                s.flush().unwrap();
+                // Closed with no `0\r\n\r\n`, so the body ends unterminated. Half-close, then read
+                // what is left of the request: a socket closed with unread input sends a reset,
+                // and on macOS the client's next read-timeout call then fails (EINVAL) before it
+                // reads the events this wrote.
+                s.shutdown(std::net::Shutdown::Write).unwrap();
+                let _ = std::io::copy(&mut s, &mut std::io::sink());
+            });
+            let client = Client {
+                agent: crate::http::agent(false),
+                api_url: format!("http://127.0.0.1:{port}/v1/completions"),
+                model: "m".into(),
+                api_key: None,
+                ignore_eos: false,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+            };
+            let result = send_request(&client, "p", 4, "r", Instant::now());
+            server.join().unwrap();
+            result.success
+        };
+        assert!(!served(false), "a stream broken off before [DONE] failed");
+        assert!(served(true), "a stream broken off after [DONE] finished");
     }
 
     fn req(output_tokens: usize, chunks: usize, ttft: f64, e2el: f64) -> RequestResult {
@@ -1423,7 +2212,69 @@ mod tests {
             chunks,
             start_time: 0.0,
             success: true,
+            generated_text: String::new(),
+            error: String::new(),
+            cached_tokens: None,
+            prompt_tokens: None,
         }
+    }
+
+    /// Tokens per chunk sit beside ITL: a token a chunk reads 1.0, a speculative stream's
+    /// accepted runs and a held-back flush read more, and the count of such requests says how
+    /// many ITL gaps span several tokens.
+    #[test]
+    fn chunking_reports_how_many_tokens_a_chunk_carried() {
+        let one = req(48, 48, 0.1, 1.0);
+        let spec = req(48, 16, 0.1, 1.0);
+        let held_back = req(128, 3, 0.1, 4.0);
+        let c = Chunking::of(&[&one, &spec, &held_back]);
+        assert_eq!(c.median_tokens_per_chunk, Some(3.0));
+        assert_eq!(c.multi_token_requests, 2);
+        let c = Chunking::of(&[&one]);
+        assert_eq!(
+            (c.median_tokens_per_chunk, c.multi_token_requests),
+            (Some(1.0), 0)
+        );
+        let mut obj = serde_json::Map::new();
+        Chunking::of(&[]).add_json(&mut obj);
+        assert_eq!(obj["median_tokens_per_chunk"], serde_json::Value::Null);
+        assert_eq!(obj["multi_token_chunk_requests"], 0);
+    }
+
+    /// `--save-detailed` keeps vLLM's layout: parallel arrays in request order, seconds, an
+    /// empty error for a request that succeeded; plus each stream's chunk count.
+    #[test]
+    fn detailed_json_is_vllms_layout_plus_chunks() {
+        let ok = RequestResult {
+            itl: vec![0.02, 0.03],
+            start_time: 0.5,
+            generated_text: "Hi there".into(),
+            ..req(3, 3, 0.1, 0.15)
+        };
+        let failed = RequestResult::failed(0.7, 2.0, "status 500: boom".into());
+        let run = Run {
+            results: vec![ok, failed],
+            input_lens: vec![12, 40],
+            total_input_tokens: 12,
+            total_time: 2.5,
+        };
+        let mut obj = serde_json::Map::new();
+        add_detailed_json(&mut obj, &run);
+        let j = serde_json::Value::Object(obj);
+        assert_eq!(
+            j,
+            serde_json::json!({
+                "input_lens": [12, 40],
+                "output_lens": [3, 0],
+                "ttfts": [0.1, 0.0],
+                "itls": [[0.02, 0.03], []],
+                "latencies": [0.15, 2.0],
+                "start_times": [0.5, 0.7],
+                "generated_texts": ["Hi there", ""],
+                "errors": ["", "status 500: boom"],
+                "chunks": [3, 0],
+            })
+        );
     }
 
     #[test]

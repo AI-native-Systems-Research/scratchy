@@ -50,14 +50,8 @@ fn stream_response(
     let stream = UnboundedReceiverStream::new(rx).map(move |delta| {
         let finish_reason_str = delta.finish_reason.map(|r| r.to_string());
 
-        let text = delta.text.unwrap_or_else(|| {
-            use std::fmt::Write;
-            let mut s = String::new();
-            for id in &delta.new_token_ids {
-                let _ = write!(s, "<token_{id}>");
-            }
-            s
-        });
+        // `None` is a delta with no text: a finish.
+        let text = delta.text.unwrap_or_default();
 
         let chunk = protocol::CompletionStreamResponse::new(
             format!("cmpl-{}", request_id),

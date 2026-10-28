@@ -143,7 +143,16 @@ pub fn pointwise_lx_resident_generic(
 ) -> u64 {
     let per_core_mb = plan.per_core_extent("mb") as u64;
     let opt = out_per_time as u64;
-    n_operands * per_core_mb * opt * df.word_length() as u64
+    // ⭐ THE ROW-SPLIT (Y) MODE'S SPRAY CHARGE — the spray dim is a real iteration extent (the
+    // TileOp's `y`), so a core whose slice leaves it unsplit holds ALL its sprays' rows: the
+    // same batch charge the matmul formula makes for its own batch. Billed at the PER-CORE
+    // extent — a core that took the sprays as its share of the cores holds one — and a no-op at
+    // `y == 1` (every non-row-split op: `per_core_extent` floors at 1), so no existing charge
+    // moves. The y-BROADCAST operand itself does not range over `y` (its scale is `RedNonStick`
+    // there), so this over-charges it by its spray count — the safe direction, the same
+    // conservatism the matmul formula applies to its own batch operands.
+    let sprays = plan.per_core_extent("y") as u64;
+    n_operands * per_core_mb * opt * sprays * df.word_length() as u64
 }
 
 /// THE seeded-reduce per-core LX residency formula — the DATA operand at its per-trip width,

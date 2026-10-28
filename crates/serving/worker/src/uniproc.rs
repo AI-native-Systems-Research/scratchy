@@ -137,6 +137,11 @@ impl Executor for UniProcExecutor {
         self.worker.snapshot_budget()
     }
 
+    /// Straight through to the worker, which samples.
+    fn set_stop_token_ids(&mut self, stop_token_ids: &[u32]) {
+        self.worker.set_stop_token_ids(stop_token_ids);
+    }
+
     fn initialize_cache(
         &mut self,
         num_gpu_blocks: usize,
@@ -227,6 +232,17 @@ mod tests {
     fn make_test_executor() -> UniProcExecutor {
         let worker = Box::new(NoopWorker::with_defaults(16 * 1024 * 1024));
         UniProcExecutor::new(worker)
+    }
+
+    /// The engine's stop tokens reach the worker, which samples.
+    #[test]
+    fn the_stop_tokens_reach_the_worker() {
+        let handed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let worker = NoopWorker::with_defaults(16 * 1024 * 1024);
+        let recording = crate::worker::StopRecordingWorker(worker, handed.clone());
+        let mut exec = UniProcExecutor::new(Box::new(recording));
+        exec.set_stop_token_ids(&[2, 0]);
+        assert_eq!(*handed.lock().unwrap(), [2, 0]);
     }
 
     #[test]

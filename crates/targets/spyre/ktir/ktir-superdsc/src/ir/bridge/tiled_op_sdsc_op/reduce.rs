@@ -3,13 +3,14 @@
 //! reduces (sum/mean/max). See `super`'s module doc for why this is its own small file rather
 //! than folded into a bigger one.
 
+use crate::addr::{DevOff, Win};
 use crate::emit::{EmittedOp, op_func_from_str, sen169_bits};
 use crate::ir::island::tile_op::{TileOp, TileOpKind};
 use crate::placement::BundleLayout;
-use crate::sdsc_abstract::{KindTag, StickKind, Stk};
+use crate::sdsc_abstract::{BlockCols, KindTag, RowCount, StickKind, Stk};
 use crate::superdsc_opspec::{
     Allocation, AnyTensorArg, DataFormat, Df, Fp16, Fp32, MAX_CORES, MaxCores, OpFunc, OpInfo,
-    OpSpec, Role, Scale, SdscFoldSet, StickExtent, TensorArg,
+    OpSpec, Role, SamvCoordinateMask, Scale, SdscFoldSet, TensorArg,
 };
 use crate::work::distribute_cores;
 
@@ -36,22 +37,43 @@ fn reduce_tile_kind(op: OpFunc) -> TileOpKind {
     }
 }
 
+/// The stick-padded extent of `cols` under `df` — the reduction axis's TRUE on-device width.
+/// Unlike a matmul's N/K extents ([`crate::superdsc_opspec::StickExtent::new`] REFUSES
+/// sub-stick widths outright — a non-multiple-of-64 tile faults the scheduler,
+/// L3DlOpsScheduler:1040), a reduce PADS UP to the next whole stick and masks the pad lanes
+/// with the reduce's identity ([`reduce_coordinate_mask`]): the padded extent is still a
+/// whole-stick dim the scheduler accepts, and the mask makes the padding numerically inert.
+/// This is the vendor's own shape — `_get_padded_iteration_space` (codegen/superdsc.py:477-507)
+/// pads every iteration space to stick alignment, and their `[mb=32, 514]` max fixture walks
+/// `out_ = 576` with `coordinateMasking_: {"out": [[514, 62]]}` (sdsc_max.json).
+fn reduce_stick_elems(cols: u32, df: Df) -> Result<u32, String> {
+    if cols == 0 {
+        return Err(
+            "reduce width 0: a reduce needs at least one element along its reduced axis"
+                .to_string(),
+        );
+    }
+    let eps = if matches!(df, Df::Fp32) {
+        <Fp32 as DataFormat>::ELEMS_PER_STICK
+    } else {
+        <Fp16 as DataFormat>::ELEMS_PER_STICK
+    };
+    Ok(cols.div_ceil(eps) * eps)
+}
+
 /// The reduce's SHARED `TileOp` front matter — the `[mb, out(stick), y]` iteration domain
 /// (the stick-padded `cols` as the reduction stick axis) plus the arity-picked kind — ONE
 /// constructor behind both `reduce_opspec_df` and `reduce_opspec_off`, so the two variants
 /// cannot drift in what they declare to the tiler. `Err` only where the emission itself
-/// would refuse (a `StickExtent` no stick-legal reduce can state).
+/// would refuse (a `StickExtent` no stick-legal reduce can state). Returns the padded stick
+/// extent alongside, the number the coordinate mask is computed from.
 fn reduce_dims_kind(
     op: OpFunc,
     rows: u32,
     cols: u32,
     df: Df,
-) -> Result<(Vec<crate::superdsc_opspec::ItDim>, TileOpKind), String> {
-    let stick_elems = if matches!(df, Df::Fp32) {
-        StickExtent::<Fp32>::new(cols)?.elems()
-    } else {
-        StickExtent::<Fp16>::new(cols)?.elems()
-    };
+) -> Result<(Vec<crate::superdsc_opspec::ItDim>, TileOpKind, u32), String> {
+    let stick_elems = reduce_stick_elems(cols, df)?;
     let dims = vec![
         crate::superdsc_opspec::ItDim {
             name: "mb",
@@ -75,7 +97,143 @@ fn reduce_dims_kind(
             df,
         },
     ];
-    Ok((dims, reduce_tile_kind(op)))
+    Ok((dims, reduce_tile_kind(op), stick_elems))
+}
+
+/// ⭐ THE SAMV COORDINATE MASK on a padded reduce stick — the vendor's own answer to an
+/// unaligned reduced width. A reduce over `cols` that is not a stick multiple still walks the
+/// STICK-PADDED extent (the allocator hands out whole sticks), so the pad lanes ride the
+/// reduction as whatever the buffer holds — for `max` over non-positive data that is a
+/// zeros-read (`max(−65504, 0, x) = 0`, the measured `mxp=0` signature). The device's fix is
+/// `coordinateMasking_` plus a `samv-maskvalue` constant: every coordinate past `valid` is fed
+/// the mask word instead of a memory read, and the mask word is the reduce's IDENTITY — the
+/// padding then contributes nothing. torch-spyre builds exactly this pair whenever the reduced
+/// stick dim padded (`_get_coordinate_mask` + `constants["samv-maskvalue"] =
+/// _get_mask_value(op)`, codegen/superdsc.py:2357-2365 and :281-319), and the backend's own
+/// multi-row max fixture pins the wire form (`ddc/ddl_templates/test/sdsc_max.json`:
+/// `coordinateMasking_: {"out": [[514, 62]]}`, const word `"65534"`).
+///
+/// `mask_bits` is the RAW SEN169 word, NOT `sen169_bits` of a value: the fixture's `65534` =
+/// `0xFFFE` is the DDL's own `negInf` pattern (`summeanmaxexx2.ddl:69-72` defines it as a
+/// `define_constant`), not the value-true encoding of −65504 (`0xDE00`). `max` masks with
+/// negInf; every other seeded kind (sum/mean/exx2) masks with 0 — the additive identity.
+///
+/// fp32 is REFUSED, not masked: SAMV masking is a ≤16-bit-element mechanism (the vendor's own
+/// element-bit guard in `_get_coordinate_mask`), so an fp32 padded reduce has no faithful
+/// descriptor — it would fold the padding into the result. That is a build `Err` here (garbage
+/// refuses at bake), never a silent wrong answer.
+fn reduce_coordinate_mask(
+    op: OpFunc,
+    cols: u32,
+    stick_elems: u32,
+    df: Df,
+    accum_name: &str,
+) -> Result<Option<SamvCoordinateMask>, String> {
+    let pad = stick_elems - cols;
+    if pad == 0 {
+        return Ok(None);
+    }
+    if matches!(df, Df::Fp32) {
+        return Err(format!(
+            "reduce `{accum_name}`: the reduced width {cols} is not a stick multiple (stick \
+             extent {stick_elems}, pad {pad}) and SAMV coordinate masking is fp16-only (the \
+             vendor's own ≤16-bit element limit) — an fp32 reduce here would fold the padding \
+             into the result. Keep the fp32 reduced width a stick multiple."
+        ));
+    }
+    Ok(Some(SamvCoordinateMask {
+        dim: "out",
+        valid: cols,
+        pad,
+        mask_bits: if matches!(op, OpFunc::Max) { 0xFFFE } else { 0 },
+    }))
+}
+
+/// ⭐ THE REDUCE FAMILY'S MINT — the DATA operand's [`Win`], the DEVICE ACCESS window this family's
+/// own descriptor declares. The reduce walks the STICK-PADDED width (`reduce_stick_elems`: the pad
+/// lanes ride the reduction masked by [`reduce_coordinate_mask`]), so the window's columns are the
+/// padded extent — minting at the logical `cols` would under-bound the very read the descriptor
+/// bills. `rows`/`cols` are the op's own typed dims, so a caller cannot state the extents by hand.
+///
+/// The authority is whichever the caller holds: a [`BundleLayout`] mints through
+/// [`BundleLayout::win`] (both doors — the handle's declared shape and the placement footprint,
+/// resolved by name exactly as the bake-time guard resolves it); without one there IS no placement
+/// authority — the same absence `resolve_seg_base` has, where it checks nothing — so the handle's
+/// own declared shape is the bound. The extents are stated from the typed dims either way; the
+/// [`Win`] binds identity, offset and extents as ONE value, so a name and an offset from different
+/// laws no longer type-check as a pair.
+pub fn win_reduce_data<'a, K: KindTag>(
+    layout: Option<&BundleLayout>,
+    stk: &'a Stk<K>,
+    off: DevOff,
+    rows: RowCount,
+    cols: BlockCols,
+    what: &str,
+) -> Result<Win<'a, K>, String> {
+    let stick_elems = reduce_stick_elems(cols.get(), Df::Fp16)?;
+    mint_reduce_win(layout, stk, off, rows.get(), stick_elems, what)
+}
+
+/// ⭐ THE REDUCE FAMILY'S MINT — the ACCUMULATOR's [`Win`]: ONE STICK PER ROW whatever the trip
+/// (the `Scale::RedStick` collapse — the seeded convention's own law, `reduce_tile_kind`'s doc).
+/// The handle passed here must carry the buffer's true shape (a `[rows, 64]` stick-wide buffer),
+/// not the `1×64` annotation the family's `hm` sites historically used: the mint is the first
+/// reader of a handle's layout as a BOUND, and the bound is only as true as the declaration.
+pub fn win_reduce_accum<'a, K: KindTag>(
+    layout: Option<&BundleLayout>,
+    stk: &'a Stk<K>,
+    off: DevOff,
+    rows: RowCount,
+    what: &str,
+) -> Result<Win<'a, K>, String> {
+    mint_reduce_win(
+        layout,
+        stk,
+        off,
+        rows.get(),
+        <Fp16 as DataFormat>::ELEMS_PER_STICK,
+        what,
+    )
+}
+
+/// The two family mints' shared door: the placement authority when the caller holds one, the
+/// handle's declared shape when it does not. A refusal is an expansion-time `Err` — a `cargo
+/// build` failure — and names `what` (the op and operand role), the offset, the extents and the
+/// bound it exceeded.
+fn mint_reduce_win<'a, K: KindTag>(
+    layout: Option<&BundleLayout>,
+    stk: &'a Stk<K>,
+    off: DevOff,
+    rows: u32,
+    cols: u32,
+    what: &str,
+) -> Result<Win<'a, K>, String> {
+    match layout {
+        Some(l) => l.win(stk, off, rows, cols, what),
+        None => {
+            // No layout was handed to the mint, so there is no placement to consult — the same
+            // absence the bake-time guard has (its `None` arm checks nothing). The handle's own
+            // declared shape is the bound: the SAME shape [`BundleLayout::win`]'s first door
+            // checks, so a mint that passes here cannot refuse there.
+            let declared = stk.layout();
+            let shape_elems = declared.rows as u64 * declared.cols as u64;
+            let off_elems = off.into_raw_elems() as u64;
+            let end_elems = off_elems + rows as u64 * cols as u64;
+            if end_elems > shape_elems {
+                return Err(format!(
+                    "{what}: the operand window [{off_elems}, {end_elems}) (elements) of '{}' \
+                     runs past the end its handle declares — {rows}×{cols} elements over a handle \
+                     that declares {}×{} at {:?}. An op that sweeps past its own tensor is a \
+                     defect in the computation that produced this offset; it cannot compile.",
+                    stk.name(),
+                    declared.rows,
+                    declared.cols,
+                    declared.df,
+                ));
+            }
+            Ok(Win::minted(stk, off, rows, cols))
+        }
+    }
 }
 
 /// `cols` axis. Two operands: `data` (all active) + `accum` (the accumulator,
@@ -107,7 +265,10 @@ pub fn reduce_opspec_df(
     // REAL `lower_one_node` SubtileTape dispatch (every reduce: rmsnorm's mean, softmax's max/sum,
     // fp8's amax), same as `pointwise_opspec`. The kind comes off the DDL's own input arity, and the
     // seeded accum is charged at its TRUE one-stick-per-row size — see [`reduce_tile_kind`].
-    let (dims, kind) = reduce_dims_kind(op, rows, cols, df)?;
+    let (dims, kind, stick_elems) = reduce_dims_kind(op, rows, cols, df)?;
+    // The pad-lane mask, stated before anything else so an unmaskable shape (fp32 + pad) is a
+    // build Err here, not a descriptor that silently folds its padding into the result.
+    let coordinate_mask = reduce_coordinate_mask(op, cols, stick_elems, df, accum_name)?;
     let tile_op = TileOp {
         kind,
         dims: dims.clone(),
@@ -264,6 +425,7 @@ pub fn reduce_opspec_df(
         tiled_symbols,
         time_tile,
         indirect: None,
+        coordinate_mask,
     })
 }
 
@@ -367,64 +529,58 @@ pub fn assemble_reduce_seeded<D: KindTag, A: KindTag>(
 
 /// [`reduce_opspec`] with per-operand ELEMENT offsets — for per-head/offset reduce slices.
 ///
-/// # ⛔⛔⛔ THE reduce-MAX DEFECT THIS DOC USED TO MISSTATE: IT IS THE CONJUNCTION
+/// # ⛔ THIS DOC'S TWO PREVIOUS ATTRIBUTIONS OF THE reduce-MAX DEFECT WERE BOTH WRONG
 ///
-/// This doc previously said the on-card reduce-**MAX** returns 0 (the seed) "when `rows>1`" and is
-/// correct only at `rows=1`, and named the remedy as splitting the softmax max into nqh single-row
-/// reduces. **THAT ATTRIBUTED THE FAILURE TO THE WRONG AXIS, and it was believed downstream** — a
-/// KTIR-door guard was built on this sentence rather than on the code that had already corrected it,
-/// and it refused a CORRECT decoder softmax by name.
+/// v1 said the on-card reduce-**MAX** returns 0 (the seed) "when `rows>1`" and is correct only at
+/// `rows=1`, naming the remedy as splitting the softmax max into nqh single-row reduces. v2
+/// corrected that to "the conjunction `rows>1` **AND** a reduced extent past one stick" — and a
+/// KTIR-door guard was built on v2 that refused the wide multi-row max by name. Each version had
+/// shipping counter-examples against the other's axis (`attn_bmax` reduces MAX at `rows=nqh>1`
+/// with width one stick on card at 31 tok/s; `fq_amax_op` reduces MAX over the whole hidden width
+/// at `m==1` on card at 41 tok/s) — and both attributed to the REDUCE what the template's own DDL
+/// shows was never the reduce's:
 ///
-/// The correction, which is measurable in this tree and not a matter of opinion: the broken cell is
-/// `rows > 1` **AND** a reduced extent past ONE STICK. Exactly one diagnostic ever measured the defect
-/// — `mxp = 0` over `[nqh, cap]` — and that shape moved the row count AND the width off their safe
-/// values TOGETHER (rows = nqh > 1, cols = cap = many sticks), so on its own it cannot say which axis
-/// broke it. Each single-axis reading is refuted by a different piece of shipping, hardware-proven
-/// emission:
+/// * `summeanmaxexx2.ddl` seeds the identity ITSELF — `ddl.define_constant`s at `:69-72` that
+///   the PE accumulator LRFs are initialized from (negInf for max at `:209`/`:235`, zero for sum),
+///   with the accumulator's HBM content read only on second-and-later reduce-dim chunk trips
+///   (`:159-196`, `:583-585`). "Hands back the seed" was mechanically wrong, and a seed-win
+///   reads −65504, not 0.
+/// * The one measured diagnostic (`mxp = 0` over `[nqh, cap]`, 2026-07-28) is the ZEROS-READ
+///   signature — the unaligned `cap` walking its stick padding, which read a fresh buffer's
+///   zeros (`max(−65504, 0, x) = 0`) — and it was measured BEFORE the row-mixing fixes:
+///   `wire.rs`'s `group_stride` law records the same-era SUM signature ("summed a single stick
+///   across 32 consecutive rows (+ zero padding) instead of one row's 32 sticks → Σx²≈0 →
+///   amax≈0"), and that fix landed 2026-09-16 (`d878aceae`), with the `head_major` fix in the
+///   same window. The cell carried OUR addressing defect and OUR unmasked padding at once.
 ///
-/// * **NOT `rows > 1`.** [`super::attn`] records a per-row split TRIED AND REVERTED (2026-07-28) after
-///   direct comparison against the old proven flash-decode's `attn_bmax{b}_o{t}`: that code reduces MAX
-///   at `rows = nqh` (> 1) with `width` one stick, on real hardware, at 31 tok/s — and the reverted
-///   split was measured as zero behavioural change. `assemble_attn_block`'s `width` parameter states the
-///   safe regime at the parameter itself.
-/// * **NOT the width alone.** [`crate::emit::ktir_matmul_fp8`]'s `fq_amax_op` reduces MAX over the FULL
-///   hidden width `k` (2048/4096 — many sticks) on every fp8 matmul of every layer; at decode `m == 1`
-///   and it is proven on card at 41 tok/s.
-///
-/// The conjunction is what the two have in common, and it is already named twice as such: the
-/// `stickmajor` branch in [`reduce_opspec_df`] and in this function fires at exactly
-/// `rows > 1 && cols > 64`, and `ktir_matmul_fp8.rs` calls that regime "scrambled at rows>1 AND
-/// cols>64" — which is the clue that the hazard there is ADDRESSING (a stick-major activation read as
-/// flat), not reduce-MAX arithmetic as such.
-///
-/// So the remedy for a genuinely wide max is to TILE THE REDUCTION to one stick and combine the
-/// partials (what `attention_flash.py` and `swiglu_mlp.py` pin `BLOCK_N = 64` for, as a correctness
-/// constraint), **not** to split it into one reduce per row. reduce-SUM combines correctly multi-row at
-/// any width and needs nothing.
+/// Both causes are closed: the addressing by `group_stride`/`head_major` (sum at
+/// `[rows>1, cols>64]` card-proven since — the rmsnorm prefill parity runs; the template's sum
+/// and max paths differ only in compute type and internal seed) and the padding by
+/// [`reduce_coordinate_mask`] above. The wide multi-row max LOWERS — the door's law doc
+/// ([`crate::emit::lower_ktir_to_superdsc::reduce`]) carries the card gate that arbitrates it,
+/// because `dxp_standalone` executes no arithmetic. Splitting rows remains wrong for the reason
+/// it always was: the reverted per-row experiment bought nothing and costs `rows` descriptors
+/// per softmax.
 ///
 /// None of this changes what THIS function is for: per-operand element offsets, so a per-head or
 /// otherwise offset slice of a shared buffer can be reduced in place. The offsets have callers of their
-/// own (`attn_dp`/`attn_dn`) and are unrelated to the defect above.
-#[allow(clippy::too_many_arguments)]
-pub fn reduce_opspec_off(
+/// own (`attn_dp`/`attn_dn`) and are unrelated to the defect history above. Each operand now
+/// arrives as ONE [`Win`] minted by [`win_reduce_data`]/[`win_reduce_accum`] — name, offset and
+/// extents bound as a single value, checked at the mint — instead of a name and a raw `u32` that
+/// had to be re-paired by convention here.
+pub fn reduce_opspec_off<D: KindTag, A: KindTag>(
     op: OpFunc,
     rows: u32,
     cols: u32,
-    data_name: &str,
-    accum_name: &str,
-    data_off: u32,
-    accum_off: u32,
-    head_major: bool,
+    data: Win<'_, D>,
+    accum: Win<'_, A>,
 ) -> Result<OpSpec, String> {
     reduce_opspec_off_divided(ReduceOffSpec {
         op,
         rows,
         cols,
-        data_name,
-        accum_name,
-        data_off,
-        accum_off,
-        head_major,
+        data,
+        accum,
         division: ReduceDivision::Rows,
     })
 }
@@ -446,15 +602,16 @@ pub enum ReduceDivision {
 
 /// The parameter list of [`reduce_opspec_off_divided`], carried as a struct. Every field but
 /// `division` is [`reduce_opspec_off`]'s argument of the same name, with the same contract.
-pub struct ReduceOffSpec<'a> {
+/// `head_major` is no longer a field: it is DERIVED from the data operand's kind
+/// (`D::kind() == StickKind::Flat` — a `Stk<FlatTag>` data input IS a head-major per-head
+/// attention reduce), which is the derivation the assemble layer always made; as a raw `bool` it
+/// could have disagreed with the handle it arrived beside.
+pub struct ReduceOffSpec<'a, D: KindTag, A: KindTag> {
     pub op: OpFunc,
     pub rows: u32,
     pub cols: u32,
-    pub data_name: &'a str,
-    pub accum_name: &'a str,
-    pub data_off: u32,
-    pub accum_off: u32,
-    pub head_major: bool,
+    pub data: Win<'a, D>,
+    pub accum: Win<'a, A>,
     /// How the cores are spent. [`ReduceDivision::Rows`] is [`reduce_opspec_off`] byte for byte.
     pub division: ReduceDivision,
 }
@@ -462,21 +619,57 @@ pub struct ReduceOffSpec<'a> {
 /// [`reduce_opspec_off`] under a STATED [`ReduceDivision`]. A [`ReduceDivision::ReducedAxis`] reduce
 /// of an op whose template cannot combine the cores' partials is a build `Err` here, before the
 /// emitter's own guard would refuse its shared output.
-pub fn reduce_opspec_off_divided(r: ReduceOffSpec<'_>) -> Result<OpSpec, String> {
+pub fn reduce_opspec_off_divided<D: KindTag, A: KindTag>(
+    r: ReduceOffSpec<'_, D, A>,
+) -> Result<OpSpec, String> {
     let ReduceOffSpec {
         op,
         rows,
         cols,
-        data_name,
-        accum_name,
-        data_off,
-        accum_off,
-        head_major,
+        data,
+        accum,
         division,
     } = r;
+    // TYPED: `head_major` is DERIVED from the DATA operand's kind (see `ReduceOffSpec`'s doc) —
+    // the Win carries the handle, so the kind crosses into this layer by type.
+    let head_major = D::kind() == StickKind::Flat;
+    let data_name = data.name();
+    let accum_name = accum.name();
+    let data_off = data.off().into_raw_elems();
+    let accum_off = accum.off().into_raw_elems();
+    // ── THE AGREEMENT-ASSERT — the mint/guard flip ──
+    // The wins are the DEVICE ACCESS windows this descriptor itself declares (what the bake-time
+    // footprint guard bills as `materialized_bytes`): data `[rows, stick-padded cols]`, accum
+    // `[rows, one stick]`. A win minted at any other extents is a caller whose window and whose
+    // iteration dims come from different laws — the exact pairing the raw `(name, u32)` seam used
+    // to allow. Refused here, naming the op and both extents.
+    let stick_elems = reduce_stick_elems(cols, Df::Fp16)?;
+    let eps = <Fp16 as DataFormat>::ELEMS_PER_STICK;
+    if data.rows() != rows || data.cols() != stick_elems {
+        return Err(format!(
+            "reduce `{accum_name}`: the data operand's window is {}×{} but the op sweeps \
+             {rows}×{stick_elems} (rows × stick-padded width of logical {cols}) — the window and \
+             the iteration dims must come from the SAME law. Mint the data window with \
+             `win_reduce_data`, which states the padded extent from the op's own typed dims.",
+            data.rows(),
+            data.cols(),
+        ));
+    }
+    if accum.rows() != rows || accum.cols() != eps {
+        return Err(format!(
+            "reduce `{accum_name}`: the accumulator's window is {}×{} but the op writes {rows} \
+             rows at ONE stick ({eps} elements) per row — the accumulator is `Scale::RedStick`, \
+             one stick per row whatever the trip. Mint it with `win_reduce_accum`.",
+            accum.rows(),
+            accum.cols(),
+        ));
+    }
     // LOWER to TileIR: same pattern as `reduce_opspec_df` — the per-head/offset reduce variant
     // over the SAME shared declaration, kind picked off the DDL arity ([`reduce_tile_kind`]).
-    let (dims, kind) = reduce_dims_kind(op, rows, cols, Df::Fp16)?;
+    let (dims, kind, stick_elems) = reduce_dims_kind(op, rows, cols, Df::Fp16)?;
+    // The pad-lane mask (see `reduce_opspec_df`'s identical call): stated first so an
+    // unmaskable shape is a build Err, never a silently-wrong descriptor.
+    let coordinate_mask = reduce_coordinate_mask(op, cols, stick_elems, Df::Fp16, accum_name)?;
     let tile_op = TileOp {
         kind,
         dims: dims.clone(),
@@ -625,6 +818,7 @@ pub fn reduce_opspec_off_divided(r: ReduceOffSpec<'_>) -> Result<OpSpec, String>
         tiled_symbols,
         time_tile,
         indirect: None,
+        coordinate_mask,
     })
 }
 
@@ -632,37 +826,25 @@ pub fn reduce_opspec_off_divided(r: ReduceOffSpec<'_>) -> Result<OpSpec, String>
 // The row/width slots are TYPED: `rows` arrives only through `RowCount`'s named doors (the
 // whole-batch `nqh*mq` shared-buffer extent or the per-request `nqh` — a head count, `mq_pad` or a
 // lane count no longer type-checks there), and `cols` names which of the numerically-coincident
-// widths (one stick / `mq_pad` / head dim) the sweep is.
+// widths (one stick / `mq_pad` / head dim) the sweep is. The operands arrive as `Win`s minted by
+// [`win_reduce_data`]/[`win_reduce_accum`] — checked where their offsets are BORN — in place of
+// the `(Stk, DevOff)` pairs whose name and offset could come from different laws (the #717 class).
 pub fn assemble_reduce_off<D: KindTag, A: KindTag>(
     op_name: &str,
     op_func: &'static str,
     rows: crate::sdsc_abstract::RowCount,
     cols: crate::sdsc_abstract::BlockCols,
-    data: &Stk<D>,
-    data_off: crate::addr::DevOff,
-    accum: &Stk<A>,
-    accum_off: crate::addr::DevOff,
+    data: Win<'_, D>,
+    accum: Win<'_, A>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
-    let rows = rows.get();
-    let cols = cols.get();
-    let data_off = data_off.into_raw_elems();
-    let accum_off = accum_off.into_raw_elems();
-
-    // TYPED: `head_major` is DERIVED from the DATA input's kind — a `Stk<FlatTag>` data input IS a
-    // head-major (per-head attention) reduce; a `Stk<RowBlockedTag>` data is the residual stream. Both
-    // operands carry only `.name()`, so the emit is byte-identical.
-    let head_major = D::kind() == StickKind::Flat;
     let op = reduce_opspec_off(
         op_func_from_str(op_func),
-        rows,
-        cols,
-        data.name(),
-        accum.name(),
-        data_off,
-        accum_off,
-        head_major,
+        rows.get(),
+        cols.get(),
+        data,
+        accum,
     )
     .unwrap_or_else(|e| panic!("assemble_reduce_off {op_name}: {e}"));
     let folds = SdscFoldSet::new(op.iter.cores_used());
@@ -677,10 +859,8 @@ pub struct ReduceDivided<'a, D: KindTag, A: KindTag> {
     pub op_func: &'static str,
     pub rows: crate::sdsc_abstract::RowCount,
     pub cols: crate::sdsc_abstract::BlockCols,
-    pub data: &'a Stk<D>,
-    pub data_off: crate::addr::DevOff,
-    pub accum: &'a Stk<A>,
-    pub accum_off: crate::addr::DevOff,
+    pub data: Win<'a, D>,
+    pub accum: Win<'a, A>,
     /// How the cores are spent. [`ReduceDivision::Rows`] is [`assemble_reduce_off`] byte for byte.
     pub division: ReduceDivision,
 }
@@ -698,21 +878,15 @@ pub fn assemble_reduce_off_divided<D: KindTag, A: KindTag>(
         rows,
         cols,
         data,
-        data_off,
         accum,
-        accum_off,
         division,
     } = r;
-    let head_major = D::kind() == StickKind::Flat;
     let op = reduce_opspec_off_divided(ReduceOffSpec {
         op: op_func_from_str(op_func),
         rows: rows.get(),
         cols: cols.get(),
-        data_name: data.name(),
-        accum_name: accum.name(),
-        data_off: data_off.into_raw_elems(),
-        accum_off: accum_off.into_raw_elems(),
-        head_major,
+        data,
+        accum,
         division,
     })
     .unwrap_or_else(|e| panic!("assemble_reduce_off_divided {op_name}: {e}"));

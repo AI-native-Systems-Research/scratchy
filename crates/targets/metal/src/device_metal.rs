@@ -34,9 +34,11 @@ pub struct GpuDevice {
     /// partials are reserved for (`LoweredMetalTape::scratch_bytes`). `None`: a bucket's every
     /// row.
     pub max_decode_rows: Option<crate::tape::ids::DecodeRows>,
-    /// Buffers of a model whose forwards never overlap this device's, which the lazy
-    /// `MetalWorkerPool::for_buckets` places its worker's own in (an MTP head's, its target's).
-    pub lent: crate::interpreter::metal::LentActivation,
+    /// The arena of a pool whose forwards this device's follow on its command buffer, which the
+    /// lazy `MetalWorkerPool::for_buckets` builds this device's pool in (an MTP head's device: its
+    /// target's). A host holds its guest's arena as a fact of its model, not of the device it
+    /// shares with other models (`ScratchyWeights::metal_host`).
+    pub host: Option<Box<crate::interpreter::metal::HostArena>>,
     /// Whether this device's owner reads its logits on the host (a draft model's verify seed), so
     /// the lazy `MetalWorkerPool::for_buckets` keeps the terminal slots shared rather than sparse.
     pub terminal_reads: crate::interpreter::metal::TerminalReads,
@@ -54,7 +56,7 @@ impl GpuDevice {
             metal_bucket_max_m: None,
             kv_addressing: Default::default(),
             max_decode_rows: None,
-            lent: Default::default(),
+            host: None,
             terminal_reads: Default::default(),
         }
     }
