@@ -9,10 +9,6 @@
 //! it, and this is the invoking.
 
 // The pool/slot vocabulary is CARD-ONLY, so its imports carry the cfg of the blocks that use it.
-// The KTIR-emulator twin below (mask/rope pad-row clamping) — the card's twin shares the laws
-// through `ChunkRows` already.
-#[cfg(not(feature = "spyre-hw"))]
-use std::num::NonZeroU32;
 // The runner type is cfg-selected: the KTIR emulator's session on the host, the sendnn one on
 // silicon. Everything around it (weight load, dynamic sources, KV loop, sampling) is shared.
 #[cfg(not(feature = "spyre-hw"))]
@@ -2513,30 +2509,23 @@ pub(crate) fn forward_chunk(
     }
     if start + n > b.capacity {
         return Err(werr(format!(
-            "positions {start}..{} exceed bundle prefix capacity {} — re-emit with KTIR_PREFIX_LEN >= {}",
+            "positions {start}..{} exceed the bundle's KV capacity {} — the model's own context",
             start + n,
             b.capacity,
-            start + n
         )));
     }
     // ⭐ NO `hd` HERE EITHER. The rotary tables are built per class (each cos/sin
     // source's own `RotaryKind`), so this function no longer reads a model-wide
     // head dim.
     let h = sh.hidden;
-    // ⭐ A LAYER'S OWN WIDTH, NOT THE MODEL'S. A hybrid-attention arch (gemma-4) gives sliding
-    // layers `num_kv*hd` and global layers `g_kv*g_hd` — different numbers — so every per-layer
-    // quantity below (cache row count, prefix buffer size, readback count, extend length) reads
-    // the layer's baked `kv_width`, never the model-wide `sh.kv_dim`.
-    let have = req
-        .kv_k
-        .first()
-        .zip(b.layers.first())
-        .map_or(0, |(c, lw)| c.len() / lw.kv_width);
-    if have != start {
-        return Err(werr(format!(
-            "KV cache desync: {have} cached rows but forwarding from position {start}"
-        )));
-    }
+    // ⭐ THE REQUEST'S KV BLOCKS — the scheduler's grant, read out of the one store it was installed
+    // in. Its pages already hold the keys of positions `0..start` (this request's earlier steps, or
+    // the request whose prefix a cache hit shares), and this forward's write scatters positions
+    // `start..start + n` into them; the paged step below checks the grant reaches that far.
+    let blocks: Vec<u32> = tokens
+        .block_table(id)
+        .map(|t| t.iter().map(|&b| b as u32).collect())
+        .unwrap_or_default();
     // The number of activation ROWS the bound buffers carry: the baked `m_cap`. Each forward fills
     // n <= m_cap real rows; the remaining pad rows REPLICATE the last real token (see the staging
     // loop below — the lm-head tail reads the last BAKED row, which must carry the last real token).
@@ -2688,92 +2677,38 @@ pub(crate) fn forward_chunk(
     };
     let vocab = sh.vocab;
 
-    // KTIR: bind the per-layer prefix-KV cache sources (host-grown KV), then one
-    // fused forward through the resident session.
+    // ⭐ THE PAGED STEP — the page table, the mask stack and the write rows, staged from the
+    // request's blocks by `scratchy_target_spyre::paged_step` (the law the bake's numeric gate stages
+    // by too), then one fused forward through the resident session. The pools themselves are not
+    // staged: every layer's write scatters this step's K/V into them and its walk gathers from them,
+    // on the device, step after step.
     {
-        let cap = b.capacity;
-        for (li, lw) in b.layers.iter().enumerate() {
-            let kvw = lw.kv_width;
-            let mut kbuf = vec![0.0f32; cap * kvw];
-            let mut vbuf = vec![0.0f32; cap * kvw];
-            kbuf[..req.kv_k[li].len()].copy_from_slice(&req.kv_k[li]);
-            vbuf[..req.kv_v[li].len()].copy_from_slice(&req.kv_v[li]);
-            dynamic.push((lw.prefix_k_src as u64, kbuf, vec![cap, kvw]));
-            dynamic.push((lw.prefix_v_src as u64, vbuf, vec![cap, kvw]));
-        }
-        // ⭐ THE LENGTH MASK IS FILLED BY WHOEVER KNOWS THE DECODE POSITION. The prefix cache tensor
-        // spans the full structural capacity while only `start` of its rows are valid this step, so
-        // the mask zeroes the valid columns and drives the rest to a large negative — they leave the
-        // softmax through `exp(-inf) = 0`. It is a source like any other.
-        if let Some(mask) = b.attn_mask_src {
-            // ⭐ TWO MASKS, ONE SOURCE, TOLD APART BY THE BUNDLE'S OWN ROW COUNT. A `m_cap == 1`
-            // bundle masks the resident PREFIX: `[1, capacity]`, valid up to `start`. A prompt
-            // chunk (`m_cap > 1`) has no resident prefix — its bundle is baked `ActiveCap::NONE` —
-            // and instead needs the `[mq, mq]` CAUSAL triangle over its own keys, which is what
-            // lets the attention run all `mq` rows in one pass instead of unrolling them.
-            //
-            // ⭐ AND THE TRIANGLE IS TAKEN AT EACH ROW'S **CLAMPED** POSITION, NOT
-            // THE PLAIN `attn_causal_mask_fill(mq)`. The emitter folds the
-            // vocab-wide lm-head tail to m=1 over row `selector_lastrow_col(mq)` —
-            // the LAST BAKED row, which is a PAD row whenever `n < m_cap`. A pad
-            // row's forward must therefore be numerically IDENTICAL to the last
-            // real token's (same token id, see the embed staging above; same rotary
-            // position; same causal extent), or the first sampled token comes from
-            // a row the model never fed. The card path has had this law since
-            // `ChunkRows::row_logical_pos` (Kani-pinned
-            // `prefill_pad_row_holds_last_real_token`); the emulator bound the RAW
-            // triangle, whose pad rows attend at their PAD position's extent — a
-            // row that is not any token's forward. MEASURED on gemma-4-26b-a4b-it
-            // fp8 (23-token prompt on the m=31 rung): first sampled token was EOS
-            // (id 106), `LAST_HIDDEN` ≈ final-norm ROW 0, pad-row logits 0.
-            //
-            // ⛔ NOT `CausalKey::mask`: that returns the CARD's
-            // `[mq, mq_pad]` stick-padded layout (`mq_pad = mq.div_ceil(64)*64`),
-            // and this view is `[mq, mq]` — a 31-row chunk would bind row stride
-            // 64 into a 31-stride view and misalign every row past the first.
-            // The clamp (`row_logical_pos`) is the law; the fill here composes it
-            // with the same `prefill_causal_col_valid` SSOT at THIS bundle's own
-            // width.
-            let (fill, shape) = if b.m_cap > 1 {
-                let mq = b.m_cap;
-                let chunk = scratchy_subtile::sdsc_abstract::ChunkRows::chunk(
-                    NonZeroU32::new(mq as u32).expect("m_cap > 1"),
-                );
-                let mut m = vec![0.0f32; mq * mq];
-                for r in 0..mq {
-                    let pos = chunk.row_logical_pos(r, n);
-                    for c in 0..mq {
-                        if !scratchy_subtile::sdsc_abstract::prefill_causal_col_valid(c, pos) {
-                            m[r * mq + c] = -1.0e38;
-                        }
-                    }
-                }
-                (m, vec![mq, mq])
-            } else {
-                (
-                    scratchy_target_spyre::manifest::attn_mask_fill(cap, start),
-                    vec![1, cap],
-                )
-            };
-            dynamic.push((mask as u64, fill, shape));
-        }
+        let step = b
+            .paged
+            .ok_or_else(|| werr("this bundle states no paged step — its attention has no pools"))?;
+        let rows = scratchy_target_spyre::paged_step::StepRows { start, real: n };
+        let srcs = scratchy_target_spyre::paged_step::step_sources(&step, &blocks, &rows)
+            .map_err(|e| werr(format!("request {id}: paged step: {e}")))?;
+        session
+            .set_typed_sources(
+                srcs.int32
+                    .into_iter()
+                    .map(|(tid, bytes, shape)| {
+                        (tid as usize, bytes, scratchy_tensors::DType::I32, shape)
+                    })
+                    .collect(),
+            )
+            .map_err(|e| werr(format!("paged step: {e}")))?;
+        let (mask_tid, mask, mask_shape) = srcs.mask;
+        dynamic.push((u64::from(mask_tid), mask, mask_shape));
         // ⭐ ASK FOR THE ROWS THIS FORWARD WROTE, NOT THE WHOLE RESIDENT TENSOR. Decode and prefill
         // share one session, so every tensor is resident at the WIDEST program's row count: a
-        // one-row decode step had its outputs decoded at the prefill's `m`. The counts are the ones
-        // the reads below already slice to — `vocab` of the result, `n * kv_width` of each layer's
-        // new K/V (per LAYER: a hybrid arch's layers differ in width).
-        // A rung that draws re-points its result at the idx stick (`[rows, 64]`), so its result is
-        // read whole (`0`); a rung without the draw still hands back its logits row.
+        // one-row decode step had its outputs decoded at the prefill's `m`. The result is the one
+        // readback — `vocab` of the logits row, or, for a rung that draws (its result re-pointed at
+        // the idx stick, `[rows, 64]`), the whole stick (`0`).
         let result_elems = if b.sample_seat.is_some() { 0 } else { vocab };
         let wanted: std::collections::HashMap<u64, usize> =
-            std::iter::once((b.result_id as u64, result_elems))
-                .chain(b.layers.iter().flat_map(|lw| {
-                    [
-                        (lw.new_k_id as u64, n * lw.kv_width),
-                        (lw.new_v_id as u64, n * lw.kv_width),
-                    ]
-                }))
-                .collect();
+            std::iter::once((b.result_id as u64, result_elems)).collect();
         let outputs: Vec<(u64, usize)> = b
             .output_ids
             .iter()
@@ -2829,11 +2764,6 @@ pub(crate) fn forward_chunk(
             .run_step(b.prog, dynamic, &outputs)
             .map_err(|e| werr(format!("run_step: {e}")))?;
         tokens.set_tokens_in_pool(id, start + n);
-        for (li, lw) in b.layers.iter().enumerate() {
-            let kvw = lw.kv_width;
-            req.kv_k[li].extend_from_slice(&out[&(lw.new_k_id as u64)][..n * kvw]);
-            req.kv_v[li].extend_from_slice(&out[&(lw.new_v_id as u64)][..n * kvw]);
-        }
         // ⭐⭐⭐ ONE LOGITS ROW, AT ROW 0 — because that is what the bundle COMPUTES.
         //
         // A prefill bundle does not run its vocab-wide lm_head at `mq`. `lower_one_node`'s
@@ -2882,15 +2812,21 @@ pub(crate) fn forward_chunk(
     }
 }
 
-/// Pick the smallest decode cap bucket whose capacity covers `need` positions.
-/// `buckets` is ascending by capacity and non-empty; if `need` exceeds every
-/// bucket, return the largest so the caller's `forward_chunk` raises the precise
-/// over-capacity error (re-emit with a bigger `KTIR_PREFIX_LEN`).
+/// Pick the smallest decode rung that reaches `need` positions ([`BundleMeta::reach`]).
+/// `buckets` is ascending by reach and non-empty; if `need` exceeds every rung, return the
+/// largest so the caller's `forward_chunk` raises the precise over-capacity error.
 pub(crate) fn select_decode(buckets: &[BundleMeta], need: usize) -> &BundleMeta {
     buckets
         .iter()
-        .find(|b| b.capacity >= need)
+        .find(|b| b.reach() >= need)
         .unwrap_or_else(|| buckets.last().expect("at least one decode bucket"))
+}
+
+/// The smallest prompt-chunk rung that reaches `need` positions, if any does. `rungs` is
+/// ascending by reach.
+#[cfg(not(feature = "spyre-hw"))]
+fn select_prefill(rungs: &[BundleMeta], need: usize) -> Option<&BundleMeta> {
+    rungs.iter().find(|b| b.reach() >= need)
 }
 
 /// Forward `n` positions from `start`, then greedily sample iff this completes
@@ -2945,12 +2881,13 @@ pub(crate) fn run_request_step(
         model.kv_dim / model.head_dim,
         model.head_dim,
     );
-    // A decode step runs on the smallest cap bucket whose capacity covers the last position
-    // this step reaches, so a short context pays cap-256 decode cost rather than max-cap.
-    // `start + n` (not `pos + 1`) because `b` is fixed for the whole step below.
+    // A decode step runs on the smallest rung that reaches the last position this step reaches,
+    // so a short context walks the pages it fills rather than the whole pool. A prompt runs its
+    // chunks on the prefill rungs (each chunk on the smallest that reaches it, below); `b` is the
+    // chunk width's source and the card's fixed meta.
     let b: &BundleMeta = if n == 1 {
         select_decode(&model.decode, start + n)
-    } else if let Some(p) = model.prefill.as_ref() {
+    } else if let Some(p) = model.prefill.first() {
         p
     } else {
         select_decode(&model.decode, start + n)
@@ -3087,17 +3024,19 @@ pub(crate) fn run_request_step(
     let mut pos = start;
     let mut prompt_pick: Option<u32> = None;
     for chunk in toks[..prefill_n].chunks(chunk_w) {
-        // ⛔ THE EMULATOR'S PREFILL RUNG HAS NO RESIDENT PREFIX — it is baked
-        // `ActiveCap::NONE`, so its attention sees the chunk's own keys and nothing
-        // before them. A chunk that starts past position 0 run through it would
-        // attend as if the prompt began at the chunk (MEASURED: a 70-token chat
-        // prompt in three m=31 chunks generated one token, 24 times). The bake
-        // gives the emulator no prefix-capable prefill rung, so every position
-        // past the first chunk walks the DECODE bundle one token at a time — the
-        // rung whose attention reads the host-threaded prefix under its length
-        // mask, the card's own sequential-prefill coherence baseline.
+        // ⭐ A PROMPT CHUNK RUNS ON THE SMALLEST PREFILL RUNG THAT REACHES IT. A rung's
+        // attention walks the request's pages through the page table and the step's mask
+        // stack says which keys each row attends, so a chunk over a cached prefix attends
+        // that prefix exactly as the decode bundle would — as long as the prefix and the
+        // chunk sit inside the blocks the rung walks (`PagedStep::reach`). The ladder tops
+        // at the whole pool, so some rung reaches every chunk the pool can hold; with no
+        // prefill bundle baked, the prompt walks the DECODE bundle one token at a time. The
+        // staging refuses a step past its bundle's reach, so neither choice can silently
+        // drop keys.
         #[cfg(not(feature = "spyre-hw"))]
-        if pos > 0 && b.m_cap > 1 {
+        let rung = select_prefill(&model.prefill, pos + chunk.len());
+        #[cfg(not(feature = "spyre-hw"))]
+        if b.m_cap > 1 && rung.is_none() {
             for one in chunk.chunks(1) {
                 let db = select_decode(&model.decode, pos + 1);
                 if let Some(ts) = forward_chunk(
@@ -3121,6 +3060,8 @@ pub(crate) fn run_request_step(
             }
             continue;
         }
+        #[cfg(not(feature = "spyre-hw"))]
+        let b = rung.unwrap_or(b);
         if let Some(ts) = forward_chunk(
             &sh,
             &mut model.session,

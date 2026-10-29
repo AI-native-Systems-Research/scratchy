@@ -189,9 +189,9 @@ pub(crate) struct Parsed {
     // the layers list whose length the load log prints).
     #[cfg(not(feature = "spyre-hw"))]
     pub(crate) embed_src: usize,
-    /// The attention length-mask source, when the wiring names one.
+    /// The paged step the wiring states — see `BundleMeta::paged`.
     #[cfg(not(feature = "spyre-hw"))]
-    pub(crate) attn_mask_src: Option<usize>,
+    pub(crate) paged: Option<scratchy_target_spyre::wiring::PagedStep>,
     /// cos / sin runtime sources as `(source id, full column width, rotary class)`.
     /// GQA gives more than one width (Q vs K); a hybrid-attention arch (gemma-4)
     /// gives classes different tables. Each is filled by tiling the class's own
@@ -247,12 +247,6 @@ pub(crate) fn wiring_to_parsed(
             prefix_k_src: _l.prefix_k as usize,
             #[cfg(not(feature = "spyre-hw"))]
             prefix_v_src: _l.prefix_v as usize,
-            #[cfg(not(feature = "spyre-hw"))]
-            new_k_id: _l.new_k as usize,
-            #[cfg(not(feature = "spyre-hw"))]
-            new_v_id: _l.new_v as usize,
-            #[cfg(not(feature = "spyre-hw"))]
-            kv_width: _l.kv_width as usize,
         })
         .collect();
     if layers.is_empty() {
@@ -283,20 +277,12 @@ pub(crate) fn wiring_to_parsed(
         layers,
         #[cfg(not(feature = "spyre-hw"))]
         scalarmul_scales: w.scalarmul_scales,
-        // The tensors the host reads back after a pass: the result, plus each layer's new K/V,
-        // which is how the KV is threaded when the device holds no cache of its own. Carries the
-        // field's own `cfg` for exactly that reason — the card DOES hold a cache of its own, so there
-        // is no per-layer readback to name there.
+        // The tensor the host reads back after a pass: the result. The KV stays on the device — each
+        // layer's write scatters it into the pools its attention gathers from.
         #[cfg(not(feature = "spyre-hw"))]
-        output_ids: std::iter::once(w.result as usize)
-            .chain(
-                w.layers
-                    .iter()
-                    .flat_map(|l| [l.new_k as usize, l.new_v as usize]),
-            )
-            .collect(),
+        output_ids: vec![w.result as usize],
         #[cfg(not(feature = "spyre-hw"))]
-        attn_mask_src: w.attn_mask.map(|m| m as usize),
+        paged: w.paged,
     })
 }
 
@@ -999,6 +985,29 @@ impl SpyreWorker {
                 "[weights] staged {} load const(s) for the session",
                 staged.len()
             );
+            // ⭐ THE KV POOLS ARE NEVER STAGED. Every layer's K and V pool is a resident tensor the
+            // device writes (the paged KV write's scatter) and reads (the page walk's gathers) from
+            // step to step, and a step reads only rows its own request wrote — the mask stack keeps
+            // every other row out — so the session's own zeroed allocation is the pool's starting
+            // state. Staging zeros instead would touch every page of a pool sized to the model's
+            // whole context. The decode and prefill programs share one session and therefore must
+            // name the SAME pools.
+            if let Some(p) = &pparsed {
+                for (d, q) in dparsed.layers.iter().zip(&p.layers) {
+                    if (d.prefix_k_src, d.prefix_v_src) != (q.prefix_k_src, q.prefix_v_src) {
+                        return Err(werr(format!(
+                            "the decode and prefill programs name different KV pools (t{}/t{} vs \
+                             t{}/t{}) — one session holds one pool per layer",
+                            d.prefix_k_src, d.prefix_v_src, q.prefix_k_src, q.prefix_v_src
+                        )));
+                    }
+                }
+            }
+            tracing::info!(
+                "[weights] {} KV pool(s) of {} slots resident in the session",
+                2 * dparsed.layers.len(),
+                dparsed.capacity
+            );
             weights
         };
         // NOTE: the RoPE rotate-half permutation P (ROPE_P_TID) is NOT a load-time weight.
@@ -1006,12 +1015,12 @@ impl SpyreWorker {
         // (see the `acts` block there) — a seg1 weight would only be H2D'd at PrepareModel,
         // which binds ONLY the manifest's model weights, leaving a synthetic P at ZERO.
 
-        // KTIR: ONE resident session over [prefill?, decode]. sendnn: N layer-group
+        // KTIR: ONE resident session over [prefill rungs, decode rungs]. sendnn: N layer-group
         // [prefill, decode] sessions (the host threads the hidden state group→group).
-        // Program order: prefill first (index 0) when present, then the decode cap buckets in
-        // ascending-cap order — so a bucket's program index is `decode_prog_base + i`.
+        // Program order: the prefill rungs first, then the decode rungs, each ascending by reach —
+        // so decode rung `j`'s program index is `prefill_rungs.len() + j`.
         #[cfg(not(feature = "spyre-hw"))]
-        let (session, decode_prog_base) = {
+        let (session, decode_rungs, prefill_rungs) = {
             // ⭐ THE PROGRAMS COME OUT OF THE REGISTRY, BY FINGERPRINT. `#[forward]` submitted them
             // as const data; the bundle names which set is this model's. That is the same resolver
             // the ladder rungs and the re-rolled siblings already use, so a program is found in one
@@ -1028,21 +1037,53 @@ impl SpyreWorker {
                 })?;
                 Ok(&code.groups)
             };
+            // ⭐ THE WALK RUNGS — every body a bundle's ladder names (`RerollMeta::rungs`), with the
+            // positions its page walk reaches: one graph walked over fewer or more pages, so the
+            // rungs share the weights and the pools by tensor id. Ascending by reach. A bundle with
+            // no ladder is its own one rung, at the walk its wiring states (`None`).
+            let rungs = |fp: &'static str| -> ExecutorResult<Vec<(Option<usize>, &'static str)>> {
+                let code = scratchy_target_spyre::bundle_code::bundle(fp)
+                    .ok_or_else(|| werr(format!("no KTIR bundle registered for fp={fp}")))?;
+                let mut v: Vec<(Option<usize>, &'static str)> = match &code.reroll {
+                    Some(meta) if !meta.rungs.is_empty() => meta
+                        .rungs
+                        .iter()
+                        .map(|r| match r.bodies.first() {
+                            Some(b) if !b.is_none() => {
+                                Ok((Some(r.active_cap.get() as usize), b.as_str()))
+                            }
+                            _ => Err(werr(format!(
+                                "bundle {fp}: a ladder rung of {} slots names no body",
+                                r.active_cap.get()
+                            ))),
+                        })
+                        .collect::<ExecutorResult<_>>()?,
+                    _ => vec![(None, fp)],
+                };
+                v.sort_by_key(|&(reach, _)| reach);
+                Ok(v)
+            };
+            let prefill_rungs = match (pparsed.as_ref(), bundle.prefill.as_ref()) {
+                (Some(_), Some(pb)) => rungs(pb.fp)?,
+                _ => Vec::new(),
+            };
+            let decode_rungs = rungs(bundle.decode[0].fp)?;
             let mut programs: Vec<(
                 &[scratchy_target_spyre::bundle_code::LaunchGroup<'static>],
                 Vec<u64>,
             )> = Vec::new();
-            if let (Some(pp), Some(pb)) = (pparsed.as_ref(), bundle.prefill.as_ref()) {
-                programs.push((
-                    groups(pb.fp)?,
-                    pp.output_ids.iter().map(|i| *i as u64).collect(),
-                ));
+            if let Some(pp) = pparsed.as_ref() {
+                for &(_, fp) in &prefill_rungs {
+                    programs.push((
+                        groups(fp)?,
+                        pp.output_ids.iter().map(|i| *i as u64).collect(),
+                    ));
+                }
             }
-            let base = programs.len();
-            for dp in dparsed_all.iter() {
+            for &(_, fp) in &decode_rungs {
                 programs.push((
-                    groups(bundle.decode[0].fp)?,
-                    dp.output_ids.iter().map(|i| *i as u64).collect(),
+                    groups(fp)?,
+                    dparsed.output_ids.iter().map(|i| *i as u64).collect(),
                 ));
             }
             let refs: Vec<(
@@ -1057,7 +1098,7 @@ impl SpyreWorker {
                 "[timing] SpyreSession::new_multi took {:.2}s",
                 _t_sess.elapsed().as_secs_f64()
             );
-            (s, base)
+            (s, decode_rungs, prefill_rungs)
         };
         // ⭐ scratchy_target_spyre::wiring::HAT THE BAKE PLACED, per bundle — one value each, not six locals.
         //
@@ -2806,12 +2847,6 @@ impl SpyreWorker {
         // forward; keep these for the BundleMeta (decode/prefill phase index).
         #[cfg(feature = "spyre-hw")]
         let (decode_prog_base, prefill_prog) = (1usize, Some(0usize));
-        #[cfg(not(feature = "spyre-hw"))]
-        let prefill_prog = if pparsed.is_some() {
-            Some(0usize)
-        } else {
-            None
-        };
 
         #[allow(unused_variables)]
         // ⛔ THE FACTS ARE AN ARGUMENT, NOT A PATCH. This built every meta with `false`/`0`
@@ -2825,7 +2860,7 @@ impl SpyreWorker {
                 #[cfg(not(feature = "spyre-hw"))]
                 prog,
                 #[cfg(not(feature = "spyre-hw"))]
-                attn_mask_src: p.attn_mask_src,
+                paged: p.paged,
                 capacity: p.capacity,
                 m_cap: p.m_cap,
                 #[cfg(not(feature = "spyre-hw"))]
@@ -2874,21 +2909,72 @@ impl SpyreWorker {
         // llama-3.2, whose real θ is 500000. Fluent, subtly-wrong output.
         let rope_theta = wirings.decode.geometry.rope_theta();
 
-        let mut decode: Vec<BundleMeta> = dparsed_all
-            .into_iter()
-            .enumerate()
-            .map(|(i, p)| mk_meta(p, decode_prog_base + i, decode_facts, &wirings.decode))
-            .collect();
-        // Ascending by capacity so `select_decode`'s first-fit picks the smallest.
-        decode.sort_by_key(|b| b.capacity);
-        let prefill = pparsed.map(|p| {
-            mk_meta(
-                p,
-                prefill_prog.unwrap(),
-                prefill_facts,
-                wirings.prefill.as_ref().unwrap_or(&wirings.decode),
-            )
-        });
+        #[cfg(feature = "spyre-hw")]
+        let (decode, prefill) = {
+            let mut decode: Vec<BundleMeta> = dparsed_all
+                .into_iter()
+                .enumerate()
+                .map(|(i, p)| mk_meta(p, decode_prog_base + i, decode_facts, &wirings.decode))
+                .collect();
+            // Ascending by reach so `select_decode`'s first-fit picks the smallest.
+            decode.sort_by_key(|b| b.reach());
+            let prefill: Vec<BundleMeta> = pparsed
+                .map(|p| {
+                    mk_meta(
+                        p,
+                        prefill_prog.unwrap(),
+                        prefill_facts,
+                        wirings.prefill.as_ref().unwrap_or(&wirings.decode),
+                    )
+                })
+                .into_iter()
+                .collect();
+            (decode, prefill)
+        };
+        // ⭐ ONE META PER RUNG, each at its rung's own walk: the wiring is the graph's (every rung
+        // binds the same tensors), and the walk is the rung's (`PagedStep::walk`, which sizes the
+        // step's page table and mask stack and bounds the positions it may run).
+        #[cfg(not(feature = "spyre-hw"))]
+        let (decode, prefill) = {
+            drop(dparsed_all);
+            drop(pparsed);
+            let page_slots = scratchy_target_spyre::paged_step::PAGE_SLOTS as usize;
+            let at_walk = |mut meta: BundleMeta, reach: Option<usize>| {
+                if let (Some(r), Some(p)) = (reach, meta.paged.as_mut()) {
+                    p.walk = (r / page_slots) as u32;
+                }
+                meta
+            };
+            let decode = decode_rungs
+                .iter()
+                .enumerate()
+                .map(|(j, &(reach, _))| {
+                    Ok(at_walk(
+                        mk_meta(
+                            wiring_to_parsed(&wirings.decode)?,
+                            prefill_rungs.len() + j,
+                            decode_facts,
+                            &wirings.decode,
+                        ),
+                        reach,
+                    ))
+                })
+                .collect::<ExecutorResult<Vec<BundleMeta>>>()?;
+            let prefill = match wirings.prefill.as_ref() {
+                Some(pw) => prefill_rungs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(reach, _))| {
+                        Ok(at_walk(
+                            mk_meta(wiring_to_parsed(pw)?, i, prefill_facts, pw),
+                            reach,
+                        ))
+                    })
+                    .collect::<ExecutorResult<Vec<BundleMeta>>>()?,
+                None => Vec::new(),
+            };
+            (decode, prefill)
+        };
         // ⛔ DEFAULT-MODE: the single static-SDPA graph IS the decode graph (prefill slot holds the same
         // graph). Its PrimaryInput ids (`t0`/`t5..t8`/prefix-KV) come from the DECODE manifest. The
         // separately-emitted m=prefill prefill manifest has DIFFERENT tensor ids, so using its BundleMeta for
@@ -2898,23 +2984,26 @@ impl SpyreWorker {
         // run_prefill_batch), where the ids DO match — so preserve it in `batched_prefill` (SuperDsc only).
         #[cfg(feature = "spyre-hw")]
         let (prefill, batched_prefill) = if matches!(session, SendnnSession::SuperDsc(_)) {
-            (None, prefill)
+            (Vec::new(), prefill.into_iter().next())
         } else {
             (prefill, None)
         };
         #[cfg(not(feature = "spyre-hw"))]
         let batched_prefill: Option<BundleMeta> = None;
 
-        let caps: Vec<usize> = decode.iter().map(|b| b.capacity).collect();
+        let reaches =
+            |metas: &[BundleMeta]| -> Vec<usize> { metas.iter().map(|b| b.reach()).collect() };
         info!(
             "[spyre-worker] arch {arch} via try_load (decode m={}) prefill={} | {} layers, \
              hidden {hidden}, head_dim {head_dim}, kv_dim {kv_dim}, vocab {vocab}, \
-             decode caps {caps:?}, theta {rope_theta}",
+             decode reaches {:?}, prefill reaches {:?}, theta {rope_theta}",
             decode[0].m_cap,
             prefill
-                .as_ref()
+                .first()
                 .map_or_else(|| "none".to_string(), |p| format!("m={}", p.m_cap)),
             decode[0].layers.len(),
+            reaches(&decode),
+            reaches(&prefill),
         );
 
         Ok(Loaded {

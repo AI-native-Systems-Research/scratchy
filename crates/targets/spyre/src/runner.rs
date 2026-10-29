@@ -40,14 +40,19 @@ fn build_spec(programs: &[bundle::LaunchProgram<'static>], results: &[u64]) -> P
     let mut sources: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut written: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for p in programs {
-        let writes = written_args(&p.func);
+        let Writes { whole, in_part } = written_args(&p.func);
         let mut bindings = Vec::with_capacity(p.args.len());
         for (ssa, id) in p.args.iter() {
             let t = u64::from(id.tid());
-            let is_output = writes.contains(ssa);
+            let is_output = whole.contains(ssa) || in_part.contains(ssa);
             // A tensor first seen as a READ comes from outside this group; one this group writes is
-            // produced by it.
+            // produced by it — unless the write is IN PART (a scatter): the rows it does not name keep
+            // their bytes, so the tensor's prior contents are an input of the group, and it stays a
+            // source (resident state the host stages and the device updates, like a KV pool).
             if is_output {
+                if in_part.contains(ssa) && !written.contains(&t) {
+                    sources.insert(t);
+                }
                 written.insert(t);
             } else if !written.contains(&t) {
                 sources.insert(t);
@@ -72,10 +77,21 @@ fn build_spec(programs: &[bundle::LaunchProgram<'static>], results: &[u64]) -> P
 }
 
 /// Which of a function's arguments it WRITES — read off the program, never declared beside it.
-fn written_args(f: &ktir_core::ir::IRFunction<'static>) -> std::collections::HashSet<Ssa> {
+struct Writes {
+    /// Written through a direct access tile.
+    whole: std::collections::HashSet<Ssa>,
+    /// Written through an INDIRECT access tile — a scatter, which writes only the rows its index
+    /// names.
+    in_part: std::collections::HashSet<Ssa>,
+}
+
+fn written_args(f: &ktir_core::ir::IRFunction<'static>) -> Writes {
     use ktir_core::opkind::OpKind;
     let producer = |v: Ssa| f.operations.iter().find(|o| o.result == Some(v));
-    let mut out = std::collections::HashSet::new();
+    let mut out = Writes {
+        whole: std::collections::HashSet::new(),
+        in_part: std::collections::HashSet::new(),
+    };
     for op in f.operations {
         if op.op_type != OpKind::KtdpStore {
             continue;
@@ -89,7 +105,11 @@ fn written_args(f: &ktir_core::ir::IRFunction<'static>) -> std::collections::Has
         };
         let Some(v) = producer(view) else { continue };
         if let Some(&ptr) = v.operands.first() {
-            out.insert(ptr);
+            if t.op_type == OpKind::KtdpConstructIndirectAccessTile {
+                out.in_part.insert(ptr);
+            } else {
+                out.whole.insert(ptr);
+            }
         }
     }
     out
