@@ -44,8 +44,7 @@ pub use crate::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off;
 // bytes against torch-spyre, i.e. exactly the machinery under suspicion for the composite-m
 // garble. Nothing caught it because CI never builds this crate with `--features superdsc`.
 pub use crate::ir::bridge::tiled_op_sdsc_op::{
-    assemble_attn, assemble_matmul, assemble_matmul_off, assemble_matmul_seeded,
-    assemble_matmul_split,
+    assemble_matmul, assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_split,
 };
 use ktir_core::attrkey::AttrKey;
 use ktir_core::ir::Attr;
@@ -187,18 +186,13 @@ const _: () = assert!(bundle::MAX_SEGMENT_BYTES == SEGMENT_SIZE);
 pub use ktir_superdsc::reserved_tids::{
     ATTN_CAUSAL_TID, ATTN_MASK_TID, ATTN_SCALE_TID, ATTN_ZERO_TID, FP8_INV448_TID, FP8_NEG448_TID,
     FP8_POS448_TID, IDENTITY_TID, KCT_RESIDENT_BASE, KV_BLOCK_INDEX_TID, LAST_HIDDEN_TID,
-    NEW_V_PROBE_TID, ONES_REDUCE_TID, OPROJ_HEADMAJOR_BASE, RESERVED_REGIONS,
+    NEW_V_PROBE_TID, ONES_REDUCE_TID, OPROJ_HEADMAJOR_BASE, PAGED_WRITE_ROWS_TID, RESERVED_REGIONS,
     RESERVED_REGIONS_ARE_DISJOINT, RMS_HALF_TID, RMS_INVCOLS_TID, RMS_RSQRT_PROBE_TID,
     RMS_SEED_TID, RMS_VAR_PROBE_TID, ROPE_P_TID, SCALARMUL_SCALE_BASE, SEL_HEADMAJOR_TID,
     SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID, SENTINELS_ARE_INSIDE_THEIR_REGION, TidRegion,
     identity_class_tid, is_kernel_table_class_tid, kct_resident_tid, oproj_headmajor_tid,
     reserved_region, rope_p_class_hds, rope_p_class_tid, scalarmul_scale_tid,
 };
-
-// The rung facts the walk takes as one explicit struct — the `#[forward]` expansion
-// (which aliases this module as `superdsc`) constructs it, so it spells through this
-// module's path.
-pub use crate::lower_subtile_tape_to_ktir::RungFacts;
 
 // ⭐⭐⭐ THE MEMORY PLAN LIVES IN `ktir_superdsc::placement` — `SegRole`, `TensorPlacement`,
 // `RetileDescriptor`, `BundleLayout` and its whole impl, `SynthAlloc`, `align128`, `syn`.
@@ -692,17 +686,6 @@ fn stage_registry_scalars<F: RopeForm>(op: &mut SubOp<F>) -> bool {
 pub fn compute_bundle_layout<F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
-    // TRUE when this bundle's query rows are separate requests. The prefix mask's reservation
-    // depends on it (a prompt reads one broadcast validity row, a batch reads one per query row),
-    // and so does the attention pad's door: a decode width must be a baked ladder rung
-    // (`PaddedMq::of_bundle`), which is the `Err` this returns.
-    rows_are_requests: bool,
-    // ⭐ TRUE when this bundle's attention reads the paged KV through the page index — the
-    // reference's law: every DECODE gathers its pages (batched rungs and the one-request rung
-    // alike), prefill sweeps. Decides the `KV_BLOCK_INDEX_TID` placement alone; every other
-    // `rows_are_requests` consumer above keeps its own fact. Same value the emitter admits the
-    // gather under — one predicate, both halves.
-    gathers_kv: bool,
     // ⭐ THE LAYER STRUCTURE, so the weight segment can be split into BANKS at a LAYER boundary —
     // see [`bank_weight_segment`]. ONE MAP PER ATTENTION CLASS (a hybrid model's classes have
     // different layer counts, and banking needs the class boundaries), from
@@ -918,24 +901,6 @@ pub fn compute_bundle_layout<F: RopeForm>(
         .collect();
 
     // Sources first (deterministic id order): weights → seg1, activations → seg3 (Activation role).
-    // ⭐⭐⭐ THE HEAD-MAJOR o_proj PERMUTED COPIES — the layout half of the restructure whose
-    //    emission halves are the attention finalize's slab-major form and the o matmul's B-operand
-    //    swap. Where the head dim is multi-slab and the o matmul is fp8 W8A8, every o_proj weight
-    //    gains a SECOND, k-shuffled copy under `oproj_headmajor_tid(w)` — placed in THIS loop,
-    //    immediately after its companion, so each layer's block grows by exactly one copy and the
-    //    per-layer stride stays UNIFORM at S+E (what the executor's one-base-per-segment advance
-    //    needs; the stride guard proves it). ⛔ MINTED BUNDLE-INVARIANTLY: the gate is the GEOMETRY
-    //    (`OprojEdges::geometry_applies`), never this bundle's row count — every bundle of a model
-    //    shares ONE staged weight segment, so a rows-gated mint would hand the single-row body
-    //    addresses no other bundle staged. Only the door's emission gates on rows
-    //    (`BundleAttnParams::headmajor_handoff`), and a bundle that never states the handoff
-    //    simply never names its permuted copy — staged and unread, like any other resident weight.
-    //    ⛔ AND ONE MINT SERVES THE WIRING TOO: [`crate::lower_subtile_tape_to_ktir::oproj_perm_copies`]
-    //    is the shared implementation, because a list the placement pass derives separately from
-    //    the wiring's is a list that can silently disagree — #299's registry rewrite of
-    //    `graph_wiring` dropped the wiring's copy while this pass kept placing, and every copy
-    //    sat never-staged while the m=1 fp8 o matmul read it.
-    let oproj_perm_after = crate::lower_subtile_tape_to_ktir::oproj_perm_copies(ir)?;
     for tid in 0..ir.num_sources {
         if prefix_kv_tids.contains(&tid) {
             continue; // re-placed into seg2 (Kv) below — no dead Activation slot / no per-step re-H2D
@@ -946,28 +911,6 @@ pub fn compute_bundle_layout<F: RopeForm>(
             SegRole::Activation
         };
         pack(tid, role, &mut seg_bytes, &mut placements);
-        // The companion insert — see `oproj_perm_after` above. Hand-built (NOT through `pack`,
-        // which would index `ir.tensors[perm]` for a size a reserved tid has no tensor for): same
-        // role, same segment, same BANK, same SIZE as the weight it permutes, one 128-aligned
-        // block later. The companion is COPIED out (it is `Copy`) so the insert below does not
-        // borrow against it.
-        if let Some(&perm) = oproj_perm_after.get(&tid) {
-            let seg = SegRole::Weight.segment();
-            let off = seg_bytes[seg];
-            let companion = placements[&tid];
-            placements.insert(
-                perm,
-                TensorPlacement {
-                    tid: perm,
-                    role: SegRole::Weight,
-                    segment: seg,
-                    bank: companion.bank,
-                    offset: off,
-                    size: companion.size,
-                },
-            );
-            seg_bytes[seg] = align128(off + companion.size);
-        }
     }
     // ── KSPLIT block WEIGHTS (seg1) ── the lm_head split's B block weights `ksplit_block_tid(b)` are added by
     // the `kernel0` loop (RetileDescriptors) + the worker (bytes), but NOT by the source loop above (they are
@@ -1014,17 +957,12 @@ pub fn compute_bundle_layout<F: RopeForm>(
     //    ⛔ Do NOT reorder these on the grounds that banking is more general. It is more general and
     //    it does not work yet; the spill is narrower and it is measured. Settle the stitcher question
     //    (`ModuleStitcher` in deeptools) before promoting banking.
-    let mut per_layer_tids: std::collections::BTreeSet<u32> = per_layer_ext
+    let per_layer_tids: std::collections::BTreeSet<u32> = per_layer_ext
         .iter()
         .flat_map(|m| m.values())
         .flatten()
         .copied()
         .collect();
-    // ⭐ THE PERMUTED COPIES ARE PER-LAYER WEIGHTS TOO. They ride the same per-layer stride as
-    // their companions (the insert placed one after each layer's o_proj), so they must be SPARED
-    // by the tail spill exactly as the companions are — a perm copy moved to a spill segment is a
-    // per-layer WEIGHT outside the strided segment, which the stride guard below exists to refuse.
-    per_layer_tids.extend(oproj_perm_after.values().copied());
     let per_layer_block_end = placements
         .values()
         .filter(|p| {
@@ -1327,23 +1265,6 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // Collect every produced tensor that is NOT a source and NOT the logits, sorted
     // by first_def (def order == node order). Maintain `live` = currently-assigned
     // (offset, size, expiry=last_use) and `free` = reclaimed (offset, size) holes.
-    // AttnDecode's new_k/new_v (inputs[3]/[4]) are RE-placed at the PADDED [mq_pad, nkvh·hd] size below,
-    // so they must NOT also be placed by this general colored pool: a double-placement reserves a wasted
-    // colored slot AND records a stale (unpadded) placement in the map that the later re-placement
-    // overwrites — the coloring's live-set then reflects the wrong offset/size. Exclude them here; the
-    // AttnDecode loop is their single placement.
-    let replaced_kv: std::collections::HashSet<u32> = ir
-        .nodes
-        .iter()
-        .filter_map(|n| match &n.op {
-            SubOp::AttnDecode { .. } if n.inputs.len() >= 5 => Some([
-                n.inputs[3].tensor.index() as u32,
-                n.inputs[4].tensor.index() as u32,
-            ]),
-            _ => None,
-        })
-        .flatten()
-        .collect();
     // A FOLDED ScalarMul's output is placed by the ALIAS below, not by this pool — a colored
     // slot of its own would be a dead hole beside the producer's bytes its readers are
     // re-pointed at. (An attention-scale fold's node keeps running, so its output is an
@@ -1355,12 +1276,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
     let mut inter: Vec<u32> = first_def
         .keys()
         .copied()
-        .filter(|&t| {
-            t >= ir.num_sources
-                && t != result
-                && !replaced_kv.contains(&t)
-                && !folded_out.contains(&t)
-        })
+        .filter(|&t| t >= ir.num_sources && t != result && !folded_out.contains(&t))
         .collect();
     inter.sort_by_key(|t| (first_def[t], *t));
     // ── SEGMENT COLORING (the multi-op stitching fix): dxp's ModuleStitcher connects
@@ -1424,463 +1340,6 @@ pub fn compute_bundle_layout<F: RopeForm>(
         let fold_out = node.output.tensor.index() as u32;
         let p = placements[&producer_out];
         placements.insert(fold_out, TensorPlacement { tid: fold_out, ..p });
-    }
-
-    // ── Attention KV cache (seg2) + scale const (seg1) for in-bundle attention ──
-    // The IR's AttnDecode K/V cache tensors are reused as the per-layer IDENTITY but
-    // RE-placed (override) at the BATCHED size `[nqh,hd,cap]·2` (the worker fills them
-    // transposed-K + GQA-replicated V each step — they are read-only INPUTS in-bundle,
-    // never written by a SuperDSC op). One shared `scale` const `[1,1]` (worker
-    // synthesizes `1/sqrt(hd)`). Placed LAST so it overrides any earlier source/
-    // intermediate classification of the cache ids.
-    let mut scale_placed = false;
-    // The KV block index's bytes when this bundle gathers — sized below beside the mask whose pass
-    // grid it shares, PLACED after every other activation (see the placement after the scale
-    // registry).
-    let mut kv_block_index_bytes: Option<u64> = None;
-    for node in &ir.nodes {
-        if let SubOp::AttnDecode {
-            geom, layout: kv, ..
-        } = &node.op
-        {
-            let nqh = geom.nqh().get() as u64;
-            let nkvh = geom.nkvh().get() as u64;
-            let hd = geom.hd().get() as u64;
-            let k_id = kv.cache_tensor().index() as u32;
-            let v_id = kv.v_cache_tensor().index() as u32;
-            let cap = ir.tensors[k_id as usize].rows as u64; // prefix cache capacity (rows)
-            let mq32 = node.output.region.rows.len; // chunk query rows (1=decode, >1=prefill)
-            let mq = mq32 as u64;
-            // THE SAME DOOR AS THE EMIT — `PaddedMq::of_bundle`, the one parse boundary from a
-            // bundle's runtime width to the pad law, so the placements and the ops they hold cannot
-            // be sized by different pads (a decode width must be a baked ladder rung here exactly as
-            // it must be in main's `lower_attn_node`). The placements below spend it in TWO roles and each
-            // names its own: the staging tensors' ROW extent and the causal mask's SCORE width.
-            let mq_pad = scratchy_subtile::sdsc_abstract::PaddedMq::of_bundle(
-                mq32,
-                rows_are_requests,
-            )
-            .ok_or_else(|| {
-                SuperDscError(format!(
-                    "AttnDecode t{}: a decode bundle at {mq32} query rows — not a width the \
-                         decode ladder bakes (1, or PagedKvPool::BATCH_RUNGS), so its staging \
-                         tensors and causal mask have no placeable pad.",
-                    node.output.tensor.index() as u32
-                ))
-            })?
-            .pad();
-            // ── PAGED K/V POOL (`sdsc_abstract::PagedKvPool`) ──
-            // This layer's slice of ONE page: Kᵀ, then V, then natural K. NOTHING here is sized by
-            // the pool — the placement covers a single page+layer and the runtime adds
-            // `layer + physical page` per launch, which is what takes the servable context out of
-            // the baked program. All three planes sit in the KV segment because the re-roll executor
-            // advances only that segment (and the weights) per layer.
-            // A PAGE WIDER THAN THE SWEEP IS A WIN, NOT A REGRESSION — the reverse of what this
-            // guard used to assert. It read: "a fold covers one page per launch, so a page wider than
-            // the pre-paged capacity would sweep MORE KV for the same context — a regression, not a
-            // feature." That is an argument about the sweep, and the sweep is not what a pass costs.
-            //
-            // Measured, eight requests, one page, varying ONLY the swept width through the ladder's
-            // own rungs: 64 slots 39.5 ms, 128 slots 39.0 ms, 256 slots 42.0 ms. Four times the sweep
-            // costs six percent. A pass is likewise flat in the ROWS it computes (256 rows to 32:
-            // no measurable change). A fold pass is a fixed cost.
-            //
-            // What it is not flat in is the NUMBER of passes, and `reps = pages * requests`, so the
-            // page width sets the pass count: at 576 tokens a 256-slot page is three passes per
-            // request, and that is 137 ms of a bs=8 step against 39 ms at one page. Making the page
-            // wider than the sweep is how the pass count comes down.
-            //
-            // The real ceiling is MEMORY: a page is `nkvh * hd * slots * 2 * layers`, so the pool has
-            // to be sized for the batch width actually run. That is the constraint a 4-bit KV cache
-            // lifts, by making a page denser instead of bigger.
-            let pool =
-                scratchy_subtile::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize);
-            let _ = cap;
-            let seg = SegRole::Kv.segment();
-            let plane_bytes = pool.plane_stride() as u64 * 2;
-            // THE REQUEST STRIDE THIS PLACEMENT WAS SIZED FOR. `plane_stride` already carries the
-            // `ROWS` factor, so the pool grew ×ROWS per page here and nowhere else; publishing the
-            // stride from the same `pool` is what stops the runtime's shift from disagreeing with the
-            // addresses the ops baked.
-            // ⛔ NO REQUEST STRIDE TO PUBLISH. A page holds slots, not requests, so there is no
-            // "bytes between two requests' KV" for the runtime to shift by — a request is reached by its
-            // PAGE, through the host's block table. Left at 0, which is what an unbatched bundle always
-            // published and what `LaunchPages` reads as "no request dimension".
-            let layer_base = seg_bytes[seg];
-            // Kᵀ at 0, V at `v_plane_base`, natural K at `knat_plane_base` — the offsets
-            // `PagedKvPool` bakes into the ops' plane-relative bases.
-            for (tid, plane_off) in [
-                // natural K, V, transposed K — the pre-paged cache's own order.
-                (k_id, pool.knat_plane_base() as u64 * 2),
-                (v_id, pool.v_plane_base() as u64 * 2),
-                (kct_resident_tid(k_id), pool.kt_plane_base() as u64 * 2),
-            ] {
-                placements.insert(
-                    tid,
-                    TensorPlacement {
-                        tid,
-                        role: SegRole::Kv,
-                        segment: seg,
-                        bank: 0,
-                        offset: layer_base + plane_off,
-                        size: plane_bytes,
-                    },
-                );
-            }
-            // The per-layer stride the executor advances by MUST be exactly the three planes, with
-            // no alignment padding creeping in between layers (hd and page_slots are 64-multiples,
-            // so a plane is already 128-aligned — assert rather than trust).
-            let layer_stride_bytes = pool.layer_stride() as u64 * 2;
-            debug_assert_eq!(
-                align128(layer_base + layer_stride_bytes),
-                layer_base + layer_stride_bytes,
-                "paged KV layer slice must be 128-aligned by construction"
-            );
-            seg_bytes[seg] = layer_base + layer_stride_bytes;
-            let _ = nqh;
-            // new_k/new_v (inputs[3]/[4]) are RE-placed at the PADDED size `[mq_pad,
-            // nkvh·hd]·2` (fresh seg3 high-water) so the in-bundle transpose's
-            // `[mq_pad,…]` read never aliases the next tensor (pad rows are masked).
-            //
-            // ⛔⛔⛔ THE WIDTH IS THE **DEVICE** WIDTH, NOT `nkvh·hd`. new_k/new_v are written by the
-            // k_proj/v_proj MATMULS, and a matmul writes `DeviceWidth::for_output(m, n, k)` columns —
-            // which for a kv width under 8 sticks is WIDER than the logical one
-            // (`bump_sticks_to_splittable`: 192 = 3 sticks → 8 sticks = 512, so the proj fills ≥8
-            // cores). Sizing the placement at the LOGICAL width made the producer address past its own
-            // tensor into whatever seg3 placed next. It is invisible on granite (nkvh·hd = 512 is
-            // already 8 sticks, so the bump is a no-op and both widths agree) and refuses at build time
-            // on SmolLM2-135M (nkvh·hd = 192): `t340: access offset 0B + 31744B exceeds its placement
-            // footprint 24576B`. `for_pointwise` is documented as EQUAL to `for_output` for any
-            // producer matmul above the util floor — every real proj — so this is the SAME rule the
-            // write uses, asked once, which is what that refusal's own last sentence demands.
-            if node.inputs.len() >= 5 {
-                let seg3i = SegRole::Intermediate.segment();
-                for in_idx in [3usize, 4usize] {
-                    let nid = node.inputs[in_idx].tensor.index() as u32;
-                    // nkvh·hd, at the width the producing proj matmul actually writes.
-                    let cols =
-                        DeviceWidth::for_pointwise(ir.tensors[nid as usize].cols).get() as u64;
-                    let _ = nkvh;
-                    let pbytes = mq_pad.rows().row_axis_extent() as u64 * cols * 2;
-                    let off = seg_bytes[seg3i];
-                    placements.insert(
-                        nid,
-                        TensorPlacement {
-                            tid: nid,
-                            bank: 0,
-                            role: SegRole::Intermediate,
-                            segment: seg3i,
-                            offset: off,
-                            size: pbytes,
-                        },
-                    );
-                    seg_bytes[seg3i] = align128(off + pbytes);
-                }
-            }
-            if !scale_placed {
-                // Attention MASKS → seg0 (activation, re-bound per step), worker-TILED to [nqh·mq, *]:
-                // pmask=[nqh·mq, max_pages] (prefix validity), cmask=[nqh·mq, mq_pad] (causal triu).
-                // Shared across layers (same shape every layer). The attention SOFTMAX SCALE is NOT
-                // placed here: it flows through `scalarmul_scales` (config `attention_multiplier`,
-                // via `AttnDecode.scale`), placed below with the other config scales and bound by the
-                // worker's scale loop — the emitter NEVER recomputes 1/sqrt(hd), which would ignore
-                // the model's real attention_multiplier.
-                //
-                // (The 2026-07 note that pmask was "over-reserved" described the pre-windowing
-                // upload: `refill_activations` now sends the BOUND extent as merged aligned runs,
-                // never the reservation, and the host binds only the live blocks — so the tail of a
-                // deep reservation is dead ADDRESS SPACE, not dead H2D.)
-                // PREFIX-VALIDITY MASK stays in the ACTIVATION segment, ONE PAGE wide, describing
-                // the TAIL page — the only page that is partially valid. Its own segment would let a
-                // per-page shift select each page's row, but a bound tensor marks its WHOLE segment
-                // for re-upload every step, and the only spare segments hold ~100-150 MB of
-                // intermediates: that cost 1.8 ms per token. Full pages need no mask at all (see the
-                // zero-masked fold variant), so no shift is needed and this can stay small.
-                // ONE ROW PER PAGE, in the ACTIVATION segment: the fold re-launch walks along it,
-                // so page `i`'s validity sits `i * PAGE_SLOTS` elements in.
-                //
-                // It lives here, and not in a segment of its own, because BINDING a tensor marks its
-                // WHOLE segment for re-upload every step. The spare segments carry a couple of
-                // hundred intermediates (~1.6 MB in the decode bundle), which at the preamble's
-                // measured ~2.5 GB/s is ~0.64 ms per token of pure upload — most of the paged decode
-                // regression. The activation segment is small and is uploaded every step anyway,
-                // so the mask rides along for free.
-                //
-                // Shifting it per page is safe HERE and nowhere else: dumped from the baked bundle,
-                // a fold group addresses exactly two things — the KV segment, and the mask. It
-                // touches nothing else in the activation segment, so the shift moves nothing it reads.
-                let mseg = SegRole::Activation.segment();
-                let pmoff = seg_bytes[mseg];
-                // ⭐⭐⭐⭐⭐ THE CONTEXT CEILING IS DERIVED FROM THE DEVICE, NOT CHOSEN.
-                //
-                // A row may hold as many pages as ONE POOL can, and a pool is a single flex region
-                // (`bundle::MAX_SEGMENT_BYTES` — the same cap the runtime budget takes from
-                // `card_bytes.max_single_allocation()`, which `runtime` guards equal to it).
-                // The reservation is that cap over the model's own page bytes, so it covers every
-                // pool any card can budget for and MEMORY binds at runtime, exactly as it does on
-                // metal: a bigger budget, a wider card or a denser page (fp8 KV) raises the served
-                // context by arithmetic, not by editing a constant. The number is per-bundle fact —
-                // read back at load as `BakedMaskBlocks` — not a shared const, because the page
-                // stride is a MODEL fact and no model-independent constant can be its ceiling.
-                //
-                // The page bytes are this bundle's own placement facts: `layer_stride` (three planes
-                // of `nkvh · hd · PAGE_SLOTS` elements — the same deltas the runtime derives the
-                // pool stride from) × 2 B × the layer count. The layer count is the roll's trip
-                // count for a re-rolled tape; an unrolled graph states its own, one AttnDecode node
-                // per layer.
-                //
-                // ⭐ THE TRIP COUNT, NEVER THE CONTAINER LENGTH. `per_layer_ext` is ONE MAP PER
-                // ATTENTION CLASS, and every value in a class's map is that class's per-layer tid
-                // list — filed by [`per_layer_external_tids`] under the law `pl.len() == iters`, so
-                // a value's LENGTH is the class loop's iteration count. A page spans EVERY layer of
-                // EVERY class, so the count is the SUM of the class trip counts. `.len()` on the
-                // slice is the CLASS COUNT — 1 for any uniform model — which understates the page
-                // 40× on granite, multiplies `max_pages` by the same factor, and reserves two
-                // 10.67 GiB mask/index tensors that seg3 cannot hold. (The merge that brought the
-                // derived ceiling here met the per-class slice type and kept `.len()` silently —
-                // it type-checks against both the single-map and per-class shapes.)
-                let layers = if per_layer_ext.is_empty() {
-                    ir.nodes
-                        .iter()
-                        .filter(|n| matches!(n.op, SubOp::AttnDecode { .. }))
-                        .count()
-                } else {
-                    per_layer_ext
-                        .iter()
-                        .map(|class| class.values().next().map_or(0, Vec::len))
-                        .sum::<usize>()
-                }
-                .max(1) as u64;
-                let page_bytes = pool.layer_stride() as u64 * 2 * layers;
-                let max_pages = (bundle::MAX_SEGMENT_BYTES / page_bytes).max(1);
-                // ONE validity row over the max context, or one PER QUERY ROW when the rows are
-                // separate requests and each carries its own history. The multiplier is the op row
-                // count the attention sweeps (`nqh*mq`), which is what the per-row read addresses.
-                // It stays 1 for a prompt chunk — at prefill's mq=96 the widened form would be
-                // tens of MB of mask re-uploaded every forward, and a prompt does not need it.
-                // ONE BLOCK PER FOLD PASS when the rows are requests. A pass reads ONE request's
-                // page, so every other row must be masked off for it — the mask is `[pass][row][page]`
-                // and the runtime steps it by a whole `rows * page` block. A prompt keeps one
-                // broadcast row per page, which is all its rows can need.
-                // ⭐⭐⭐ AND A GATHERED BUNDLE BLOCKS THE MASK **PER PAGE**, SO ITS PASSES ARE THE PAGES
-                // ONE ROW CAN HOLD — `max_pages` here — where an uncollapsed fold's are `pages × requests`
-                // over the shared pool. That is a SMALLER reservation per page, and since the host stages
-                // only the live blocks it is also `mq`x less mask uploaded every step: at bs=8 and three
-                // pages, 3 blocks instead of 24.
-                //
-                // ⛔ WHICH FORM THIS BUNDLE USES IS THE SAME `rows_are_requests` CONDITION THE INDEX
-                // PLACEMENT AND `assemble_attn`'s gather are gated on — one predicate, three consumers.
-                // Getting it wrong is silent in the dangerous direction: too few blocks against the fold
-                // is a fold reading mask bytes nobody staged, which read as ZERO and therefore VALID.
-                let (pm_rows, pm_blocks) = if rows_are_requests {
-                    (nqh * mq, max_pages)
-                } else {
-                    (1, max_pages)
-                };
-                let pmbytes = pm_rows
-                    * pm_blocks
-                    * scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u64
-                    * 2;
-                placements.insert(
-                    ATTN_MASK_TID,
-                    TensorPlacement {
-                        tid: ATTN_MASK_TID,
-                        bank: 0,
-                        role: SegRole::Activation,
-                        segment: mseg,
-                        offset: pmoff,
-                        size: pmbytes,
-                    },
-                );
-                seg_bytes[mseg] = align128(pmoff + pmbytes);
-                let a = SegRole::Activation.segment();
-                let cmoff = seg_bytes[a];
-                // The mask is `[nqh·mq, mq_pad]`: `mq_pad` is its COLUMN count, the score width —
-                // the row extent answers here only through the new-block identity.
-                let cmbytes = nqh * mq * mq_pad.cols().score_axis_extent() as u64 * 2;
-                placements.insert(
-                    ATTN_CAUSAL_TID,
-                    TensorPlacement {
-                        tid: ATTN_CAUSAL_TID,
-                        bank: 0,
-                        role: SegRole::Activation,
-                        segment: a,
-                        offset: cmoff,
-                        size: cmbytes,
-                    },
-                );
-                seg_bytes[a] = align128(cmoff + cmbytes);
-                // ⭐⭐⭐⭐⭐ THE KV BLOCK INDEX — the index tensor a GATHERED KV read is addressed through.
-                //
-                // A seg0 ACTIVATION, exactly like the two masks above and for the same reason: it is
-                // per-STEP host data (the block table changes as requests grow pages), and a seg1 weight
-                // is only H2D'd at PrepareModel, so a synthetic seg1 index would stay ZERO — which for
-                // an index tensor means every row gathering block 0, i.e. row 0's keys for everyone.
-                //
-                // ⭐⭐⭐ PLACED IFF THE BUNDLE GATHERS, WHICH IS WHAT MAKES THE PLACEMENT THE ANSWER.
-                // It used to be unconditional, and that cost the runtime its only artifact-derived way
-                // to ask the question: `BakeFacts::gathers_kv` is this placement's presence, exactly as
-                // `uses_identity` is `IDENTITY_TID`'s, and it decides whether the forward tape carries a
-                // `KvBlockIndex` step. Unconditional, every bundle claimed to gather, so every launch
-                // would have had to stage a table — including the prompt-chunk and solo-decode paths
-                // that emit no gather at all — and the one condition that must govern both halves would
-                // have had to be re-derived somewhere else.
-                //
-                // ⭐⭐⭐ `gathers_kv` is that condition, and it is the SAME fact
-                // `lower_ktir_to_superdsc` passes `assemble_attn`'s `kv_block_index` from. The
-                // reference gathers its pages on EVERY decode — batched and one-request alike — so
-                // both rungs place the index; prefill's rows are consecutive positions of one
-                // sequence sharing ONE resident history, so there is nothing for an index to
-                // distinguish and its emission stays byte-identical.
-                //
-                // ⛔⛔⛔⛔⛔ AND IT IS **STILL** THE BARE ROW-KIND-ADJACENT PREDICATE, ALONE, AGAINST THE
-                // OBVIOUS FIX, BECAUSE THE 8b BATCHED PATH **READS THESE BYTES** — MEASURED, TWICE, ON
-                // THE CARD.
-                //
-                // The split is real and it is stated on [`GatherScratch::admits`]: `assemble_attn` may
-                // DECLINE the gather on the geometry (`of_fold_pass` refuses a head dim its flat copy
-                // cannot express) and this placement does not ask, so an hd=128 bundle reserves this
-                // activation, `BakeFacts::gathers_kv` answers `true` and the forward tape stages a table
-                // that NO descriptor gathers through — while `GathersKv::of_launch_groups`, the per-BODY
-                // door, answers `false` for the same bundle. Three doors, two answers. At hd=64
-                // `of_fold_pass` never refuses, which is why it was invisible.
-                //
-                // ⛔ NARROWING THIS WITH `GatherScratch::admits` — the one-line fix, which reserves only for
-                // the bundles that really gather — CANNOT BE VERIFIED TODAY, BECAUSE THE 8b BATCHED ORACLE
-                // DOES NOT HOLD. Measured on pod `nickm-7db9667cdd-z2jc6`, `scr batch` over the `c` probe
-                // (420-token generations, one distinct integer sequence per row), each rung against its OWN
-                // `--max-num-seqs 1` run of the identical file:
-                //
-                // | tree | rung 2 | rung 4 | rung 8 |
-                // |---|---|---|---|
-                // | this one, narrowed | `solo_diff=1` | `solo_diff=3` | `solo_diff=7`, 3 DEGEN |
-                // | this one, NOT narrowed (the code below) | `solo_diff=1` | `solo_diff=3` | `solo_diff=7` |
-                // | **`f080bb60a` REBUILT, md5-verified byte-equal** | `solo_diff=1` ×3 trials | — | — |
-                // | `f080bb60a` as recorded in its own commit message | `solo_diff=0` | `solo_diff=0` | `solo_diff=0` |
-                //
-                // ⭐ THE CONTROL IS THE WHOLE POINT. Narrowing this reservation moves every activation after
-                // it, so the first reading — "the hole was load-bearing padding and I removed it" — was
-                // entirely plausible and it is WRONG: the parent commit, restored file-by-file to md5
-                // equality and rebuilt on this same pod, is equally non-solo-exact. `rc=0`, no fault, ITL
-                // and wall unchanged across every variant (rung 8: 173.4 / 173.9 / 175.4 ms), and each bad
-                // row diverges from its own solo at a common prefix of 87-118 of 420 tokens. The SOLO
-                // oracles are byte-identical across all of it (`solo=EXACT` 8/8 against the baseline's own
-                // solo jsonl), so the oracle is not what moved either.
-                //
-                // ⛔ SO "granite-3.1-8b fp8 RUNS EVERY RUNG CLEAN AT 3.66x" IS NOT REPRODUCIBLE FROM THE
-                // COMMIT THAT RECORDS IT, and the 3.66x is a THROUGHPUT number whose correctness column was
-                // one sample. What differs between this morning's binary and the same source rebuilt is not
-                // in the source; the untested candidate is the BUNDLE BUILD (dxp's work division is
-                // thread-count sensitive and these builds are pinned to `taskset -c 0-19`), which would make
-                // the 8b's batched numerics a property of the compile rather than of the emission.
-                //
-                // ⛔⛔⛔ AND IT IS NOT AN hd=128 STORY: **granite-3.1-2b fp8 — the ONE geometry the gather
-                // actually runs on — is WORSE.** Same pod, same probe, same tree (whose 2b emission is
-                // byte-identical to `f080bb60a` by construction: at hd=64 `admits` is `true`, so the name
-                // gate reduces to `rows_are_requests` and this placement is untouched code), two trials per
-                // rung:
-                //
-                // | rung | solo | batched | `solo_diff` |
-                // |---|---|---|---|
-                // | 2 | ITL 27.8 ms | 33.9 / 33.7 ms | **2 of 2**, both trials |
-                // | 4 | ITL 27.7 ms | 39.3 / 40.5 ms | **4 of 4**, both trials |
-                // | 8 | ITL 28.1 ms | 63.5 / 62.4 ms | **8 of 8**, both trials |
-                //
-                // NOT ONE ROW matches its own solo at any width, and rung 4 finished 1385 and 1307 of the
-                // solo's 1680 tokens — rows terminating early, which is the collapse symptom, not noise. The
-                // pre-gather 2b record in `/work/bw/out.pre-gather` has the same probe at width 8 with
-                // `solo_diff=0`. So the gather's own 4.11x rests on a correctness column that does not hold
-                // today either, and the gather is ON in every one of those runs.
-                //
-                // ⛔ AND THAT IS WHY THIS STAYS AS IT IS. Not because the narrowing is wrong — it is right,
-                // and [`GatherScratch::admits`] states the rule — but because landing an address-moving
-                // change against an oracle that fails 1-of-2 rows on the unmodified parent would pin
-                // whatever it produced as "no regression". The order is: give the 8b batched path a STABLE
-                // oracle first (find why the same source rebuilt is not the same numerics), then narrow
-                // this, then measure. Until then only the emitter-side half of the one rule lands:
-                // `lower_ktir_to_superdsc` gates the tensor's NAME on `admits`, which is provably
-                // non-observable (`assemble_attn`'s `kv_block_index.zip(of_fold_pass(..))` is already `None`
-                // at hd=128 whichever way the name goes), so the coupling is stated where it costs no
-                // addresses and this placement keeps every byte it had.
-                if gathers_kv {
-                    // ⛔⛔⛔ SIZE = THE ENTRIES THE **DESCRIPTOR DECLARES**, NOT THE ENTRIES THE HOST
-                    // MEANS TO FILL. This was `WIDEST_BATCH_RUNG * MAX_PAGES_PER_ROW` — 32 x 16 = 512
-                    // entries, "one per (launch row, logical page), the same shape as the host's
-                    // `block_tables`". MEASURED against the real emission
-                    // (`the_declared_index_holds_no_more_entries_than_the_bundle_reserves`), the
-                    // descriptor declares **2048**: the index's dims are the value's PAGED dims and its
-                    // extents come from the op's own iteration space, so along the slot axis it is the KV
-                    // WINDOW WIDTH (256) and not a page count — `["out","mb"] = [256, 8]`.
-                    //
-                    // 512 reserved against 2048 declared is 1536 entries read PAST the placement, and past
-                    // it is the next seg0 tensor's bytes read as block numbers. Block numbers are valid
-                    // addresses, so that bakes clean, faults nothing, and gathers from wherever those
-                    // bytes happen to point.
-                    //
-                    // So the bound is the descriptor's own worst case: the slot axis can declare at most a
-                    // whole page (`PAGE_SLOTS`, the pre-paged capacity every rung's `active_cap` is a
-                    // divisor of) and the batch axis at most the widest rung. Over-reserving is inert — the
-                    // tail is simply unread — while under-reserving is an address, so the asymmetry decides
-                    // which way to round. At `PAGE_SLOTS x WIDEST_BATCH_RUNG x 4 B` this is 32 KB of an
-                    // activation segment that is uploaded every step anyway.
-                    //
-                    // ⛔ ENTRIES ARE GLOBAL STICK-BLOCK INDICES, NOT PAGE NUMBERS. dxp computes
-                    // `addr = idx * skip_addr + base_addr`, and `skip_addr` is what the score leg's Kᵗ
-                    // operand emits as its entry: ONE STICK BLOCK, `hd * ELEMS_PER_STICK` elements —
-                    // MEASURED at 4096 at head_dim 64, and 8192 at head_dim 128. That unit works because
-                    // the whole pool is a uniform array of stick blocks (`plane_block_elems` is four of
-                    // them; `plane_stride` / `layer_stride` / `page_stride` all multiples), so one index
-                    // reaches any cell with no relayout. An entry written as a PAGE number is short by
-                    // `page_stride / stick_block` — hundreds — and lands inside a different layer:
-                    // `sdsc_abstract::gather_entries_per_page` is the factor, and it is NOT a constant.
-                    //
-                    // ⭐⭐⭐⭐⭐ THE SIZE IS **THE MASK'S OWN PASS GRID**, AND THAT PITCH IS FORCED BY THE LAUNCH
-                    // ABI, NOT CHOSEN.
-                    //
-                    // The gather now lives on the KERNEL-less copy op, whose gather dim is `mb` with no
-                    // second pinned axis — so the index is a FLAT rank-1 table of `nkvh * nb * mq` entries
-                    // per fold pass, and dxp's own formula reduces to `ceil_to_stick(mb)` with no per-row
-                    // stick to pad to. What sizes this placement is therefore not the entry layout but the
-                    // PASS layout: pass `p` needs its own entries, and the only per-pass shifts a launch has
-                    // are `kv`, `mask` and `intermediate` (`fold_plan::SegDeltas`). KV is resident and never
-                    // uploaded; the intermediate segment carries `qs` and the whole online-softmax state, so
-                    // shifting it would move every operand the pass reads. The index is an ACTIVATION —
-                    // `SegRole::Activation` IS `SEG_MASK` — so it rides the MASK's shift, and its per-pass
-                    // pitch must BE the mask's block stride.
-                    //
-                    // ⛔ SO THE TWO PLACEMENTS DERIVE THEIR PITCH FROM ONE NUMBER, `pmbytes / pm_blocks`,
-                    // computed just above for the mask itself. A pitch that disagrees puts pass `p`'s gather
-                    // on some other pass's entries — a clean bake reading real block numbers from the wrong
-                    // page. `gather_index_table` takes the SAME value as `pass_stride_entries`.
-                    //
-                    // ⛔ AND IT IS THE MASK'S BLOCK COUNT TOO — the derived page ceiling, whatever
-                    // it is: a gathered fold's passes are the pages ONE ROW holds. Over-reserving
-                    // would be inert here, but agreeing with the mask's own grid is what keeps the
-                    // shift meaningful for both tensors.
-                    kv_block_index_bytes = Some(pmbytes);
-                }
-                // DIAGNOSTIC probe (mq>1 only): persistent seg0 buffer for layer-0's pre-selector new_v
-                // [mq_pad, nkvh·hd]. main's `lower_attn_node` copies layer-0 new_v here; the worker reads it to split
-                // the structural inf (matmul vs selector). Never reused ⇒ survives to post-prefill readback.
-                if mq > 1 {
-                    let npoff = seg_bytes[a];
-                    let npbytes = mq_pad.rows().row_axis_extent() as u64 * nkvh * hd * 2;
-                    placements.insert(
-                        NEW_V_PROBE_TID,
-                        TensorPlacement {
-                            tid: NEW_V_PROBE_TID,
-                            bank: 0,
-                            role: SegRole::Activation,
-                            segment: a,
-                            offset: npoff,
-                            size: npbytes,
-                        },
-                    );
-                    seg_bytes[a] = align128(npoff + npbytes);
-                }
-                scale_placed = true;
-            }
-        }
     }
 
     // ⛔ BUILD GUARD (guard-every-crash-at-build-time, structural class): every RESERVED
@@ -1953,31 +1412,6 @@ pub fn compute_bundle_layout<F: RopeForm>(
         seg_bytes[a] = align128(off + 2);
     }
 
-    // ⛔⛔⛔ THE KV BLOCK INDEX IS THE LAST ACTIVATION, SO ITS PRESENCE MOVES NOTHING ELSE. One session
-    // runs bodies that gather and bodies that do not — the one-request ladder's per-page bodies within
-    // one page under a split-KV chunk ceiling — and the host stages every input at the CEILING's
-    // placements, while each body's descriptors read its OWN layout. Placed where it was, beside the
-    // mask, it pushed the scale registry above down by its size: a non-gathering body read the
-    // RMSNorm epsilon out of the index's bytes (zero, or the previous long request's block numbers)
-    // and paid a separate DMA run every step for the scales the host staged out of reach. Last, the
-    // two layouts agree on every other tensor — which `ladder_stages_one_layout` holds the macro to.
-    if let Some(bibytes) = kv_block_index_bytes {
-        let a = SegRole::Activation.segment();
-        let bioff = seg_bytes[a];
-        placements.insert(
-            KV_BLOCK_INDEX_TID,
-            TensorPlacement {
-                tid: KV_BLOCK_INDEX_TID,
-                bank: 0,
-                role: SegRole::Activation,
-                segment: a,
-                offset: bioff,
-                size: bibytes,
-            },
-        );
-        seg_bytes[a] = align128(bioff + bibytes);
-    }
-
     // Synthetic intermediates (assigned lazily during lowering) start ABOVE the
     // colored intermediates in seg3, so they never overlap a real intermediate.
     let synth = std::cell::RefCell::new(SynthAlloc {
@@ -2012,10 +1446,6 @@ pub fn compute_bundle_layout<F: RopeForm>(
         weight_scale_folds: weight_scale_folds
             .into_iter()
             .map(|(_, tid, scale)| (tid, scale))
-            .collect(),
-        weight_copies: oproj_perm_after
-            .iter()
-            .map(|(w, perm)| (*w, *perm))
             .collect(),
         synth,
         // Pinned-LX registry starts empty (stick 1024 base): it fills only when a
@@ -6512,7 +5942,6 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         kernel_weights,
         scalarmul_scales,
         weight_scale_folds,
-        weight_copies,
         synth,
         // EMIT-ONLY, deliberately not baked: the arrangement authority is the build-time check that a
         // tensor has ONE device layout (`declare_arrangement` returns a build `Err` naming the tensor
@@ -6660,7 +6089,6 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         ),
         scalarmul_scales: std::borrow::Cow::Owned(scalarmul_scales.clone()),
         weight_scale_folds: std::borrow::Cow::Owned(weight_scale_folds.clone()),
-        weight_copies: std::borrow::Cow::Owned(weight_copies.clone()),
         kv_request_stride_bytes: *kv_request_stride_bytes,
         // The rung's op-local pin slots — final by now (the declare pass minted every pin before
         // any bundle was emitted), and shared by every bundle of the rung, so whichever bundle the
@@ -6916,11 +6344,8 @@ fn bundle_fp(
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
 ) -> String {
-    let split = bundle_fingerprint_grouped(ops, FoldGrouping::Split);
-    let base = match attn_params.and_then(|p| p.chunk_pages) {
-        Some(pages) => format!("{split}c{pages}"),
-        None => split,
-    };
+    let _ = attn_params;
+    let base = bundle_fingerprint_grouped(ops, FoldGrouping::Split);
     match fold {
         FoldGrouping::Split => base,
         FoldGrouping::Fused => format!("{base}f"),
@@ -8179,9 +7604,6 @@ pub fn lower_subtile_tape_to_superdsc<F: RopeForm>(
     weight_ids: &std::collections::HashSet<u32>,
     active_cap: ActiveCap,
     rows_are_requests: bool,
-    // The rung's own facts — the one-request flag and the chunk it bakes.
-    // See [`RungFacts`].
-    rung: RungFacts,
 ) -> Result<RolledSuperDsc, SuperDscError> {
     crate::lower_subtile_tape_to_ktir::lower_subtile_tape_to_ktir(
         tape,
@@ -8189,7 +7611,6 @@ pub fn lower_subtile_tape_to_superdsc<F: RopeForm>(
         weight_ids,
         active_cap,
         rows_are_requests,
-        rung,
     )
 }
 
@@ -8567,7 +7988,7 @@ mod tests {
             op_output: Vec::new(),
         };
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, &[])
             .expect("a layout for a plain matmul bundle");
 
         // ⭐ ROLES AND PACKING, ASSERTED AS THE RULES — not as magic numbers. This test pinned
@@ -8679,10 +8100,9 @@ mod tests {
         let plain = lower_region(&input, nz);
         let mut minted = lower_region(&input, nz);
         mint_sample(&mut minted, SampleRows::All);
-        let l_plain =
-            compute_bundle_layout(&plain, &weight_ids, false, false, &[]).expect("plain lays out");
-        let l_minted = compute_bundle_layout(&minted, &weight_ids, false, false, &[])
-            .expect("the minted graph lays out");
+        let l_plain = compute_bundle_layout(&plain, &weight_ids, &[]).expect("plain lays out");
+        let l_minted =
+            compute_bundle_layout(&minted, &weight_ids, &[]).expect("the minted graph lays out");
 
         // Each stamp names ITS OWN graph's count — the whole point of the fix.
         assert_eq!(l_plain.num_sources, plain.num_sources);
@@ -8772,8 +8192,8 @@ mod tests {
         let plain = lower_region(&input, nz);
         let mut minted = lower_region(&input, nz);
         mint_sample(&mut minted, SampleRows::All);
-        let layout = compute_bundle_layout(&minted, &weight_ids, false, false, &[])
-            .expect("the minted graph lays out");
+        let layout =
+            compute_bundle_layout(&minted, &weight_ids, &[]).expect("the minted graph lays out");
 
         // inv_t is the mint's fifth staged source (the seed quadruple's four word
         // tables first, at n_src), so its tid is four past the PRE-mint source
@@ -9131,8 +8551,7 @@ mod tests {
         // the extraction program and the door must Err naming it.
         let (node, ir) = build(mq);
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
-            .expect("the tail's layout mints");
+        let layout = compute_bundle_layout(&ir, &weight_ids, &[]).expect("the tail's layout mints");
         let mut programs = scratchy_triton_splice::lower_all(&node, &ir, false)
             .expect("the splice's fold mints the tail");
         let extract = programs
@@ -9209,8 +8628,7 @@ mod tests {
         // fp8 (arity-3): the placement reserves the PADDED extent — 2176·2816·1 B, the exact
         // bytes the matmul's tile read addresses (the refusal's access side).
         let ir = build(GemmWeight::Fp8Dynamic);
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
-            .expect("the fp8 layout mints");
+        let layout = compute_bundle_layout(&ir, &weight_ids, &[]).expect("the fp8 layout mints");
         let p = layout.placements.get(&1).expect("the fp8 weight is placed");
         assert_eq!(
             p.size, 6_127_616,
@@ -9218,8 +8636,7 @@ mod tests {
         );
         // fp16 (arity-2), SAME shape: raw rows — 2112 = 33 whole fp16 sticks, no pad.
         let ir = build(GemmWeight::Dense);
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
-            .expect("the fp16 layout mints");
+        let layout = compute_bundle_layout(&ir, &weight_ids, &[]).expect("the fp16 layout mints");
         let p = layout
             .placements
             .get(&1)
@@ -9932,7 +9349,7 @@ mod tests {
         let weight_ids: std::collections::HashSet<u32> = [0u32].into_iter().collect();
         // The budget pass refuses the same fixture the wiring accepts — on the UNROLLED graph,
         // with no layer classes, an over-cap weight segment is un-bankable and un-spillable.
-        let err = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
+        let err = compute_bundle_layout(&ir, &weight_ids, &[])
             .expect_err("the placement pass is the budget law and must refuse 32 GiB in seg1");
         assert!(
             err.0.contains("one device region can hold"),

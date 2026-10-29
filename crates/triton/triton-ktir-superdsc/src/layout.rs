@@ -600,7 +600,6 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         weight_scale_folds: Vec::new(),
         // No head-major o_proj copies: the restructure is minted from a spyre bundle's
         // attention→o_proj dataflow, and one Triton kernel's parameter list is not that graph.
-        weight_copies: Vec::new(),
         // The rope-P class set, filled where P itself is placed (see the Rope arm above). `drive_rope`
         // resolves this rope's `p_tid` off it — the same registry the consumer ladder's door resolves
         // through, so the two ladders cannot disagree about which P table a class reads.
@@ -766,12 +765,6 @@ fn is_per_program_node(f: &IRFunction<'static>) -> bool {
 
 fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
     match p {
-        Program::Attn => Some(&[
-            "ATTN_MASK_TID",
-            "ATTN_CAUSAL_TID",
-            "IDENTITY_TID",
-            "kct_resident_tid(k)",
-        ]),
         // `Rope` is HERE and not above: its one reserved constant is placed by [`for_regions`],
         // from an extent the program states.
         Program::Rope
@@ -1039,16 +1032,6 @@ fn scales_for(
         }
         // `scalarmul` resolves ONE value: `scale_slot(layout, program_scalarmul_scale(&k.func))`.
         Program::ScalarMul => L::program_scalarmul_scale(f).into_iter().collect(),
-        // `attn_at` resolves TWO — the score scale AND its square root, in that order:
-        // `scale_idx` on `scale_val`, then `sqrt_scale_idx` on `scale_val.sqrt()`, because
-        // "torch-spyre splits into sqrt_scale on both Q and K". `compute_bundle_layout` pushes the
-        // same pair for `SubOp::AttnDecode` (`push_scale(*scale)` then `push_scale(scale.sqrt())`).
-        // Unreachable today — `for_regions` refuses `Attn` at the reserved-const door above — but
-        // stated here so the registry is not a second place the pair could go missing.
-        Program::Attn => match L::program_score_scale(f) {
-            Some(v) => vec![v, v.sqrt()],
-            None => Vec::new(),
-        },
         // `rmsnorm_unit` resolves ONE value: its epsilon (`scale_slot` after
         // `program_rmsnorm_eps`) — no gain leg, so no offset.
         Program::RmsNormUnit => L::program_rmsnorm_eps(f).into_iter().collect(),

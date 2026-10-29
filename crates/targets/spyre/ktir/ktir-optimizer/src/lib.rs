@@ -11,11 +11,10 @@
 //! a single function where those intermediates are SSA values, eliminating the
 //! per-edge `store → HBM → load` round-trip.
 
-pub mod flash_attn;
 pub mod fusion;
-pub mod head_rewrite;
 #[cfg(test)]
 pub(crate) mod ir_builder;
 pub mod matmul_tile;
+pub mod name_gen;
 pub mod splat_sink;
 pub mod tile_coalesce;

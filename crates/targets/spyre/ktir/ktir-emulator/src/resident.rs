@@ -250,14 +250,6 @@ pub struct ResidentExecutor {
     /// time `last_token_only` is enabled for a `run_program(idx)`. `[idx]` holds the
     /// rewritten `(segments, result-segment-index)` so the rewrite is done once.
     last_token_segs: std::cell::RefCell<HashMap<usize, Vec<Segment<'static>>>>,
-    /// Run isolated decode (m=1) attention segments via the fused CPU GEMV/softmax
-    /// path instead of the decomposed op storm. Read once at construction (the
-    /// planner gates the segment isolation on the same env var, so this only needs
-    /// to recognize+compute the now-Native node). Default `true` — the fused path
-    /// is a measured win (llama decode ~1.33x, smollm2 ~2.0x) and golden-faithful
-    /// (max-abs identical to the decomposed oracle). Set `KTIR_NO_FUSE_ATTN` to
-    /// opt out (falls back to the decomposed oracle path).
-    fuse_attn: bool,
     /// Keep the multi-core grid SERIAL (no worker-pool parallelism). Set by
     /// [`new_native`](Self::new_native): every node runs at its native grid, so a
     /// non-attention multi-tile kernel dispatches per-core Metal GEMV concurrently —
@@ -580,91 +572,10 @@ impl ResidentExecutor {
             seg_keys: std::cell::RefCell::new(HashMap::new()),
             last_token_only: false,
             last_token_segs: std::cell::RefCell::new(HashMap::new()),
-            // Default ON (opt out via KTIR_NO_FUSE_ATTN). KTIR_FORCE_FUSE_ATTN
-            // forces it ON even when KTIR_NO_FUSE_ATTN is set — the conformance
-            // harness uses it to guarantee the decode (m=1) attention island takes
-            // the fused GEMV/softmax/GEMV Metal path (proven by gemm_or_blas_gpu>0)
-            // rather than the decomposed oracle. (The non-decode example attention
-            // programs — sdpa m=32, paged_attention m=8 — are not recognized as the
-            // decode island and run the decomposed grid, which fires the same
-            // per-op gemm_or_blas_gpu offload anyway.)
-            fuse_attn: std::env::var_os("KTIR_FORCE_FUSE_ATTN").is_some()
-                || std::env::var_os("KTIR_NO_FUSE_ATTN").is_none(),
             // Native-grid example runs keep the grid serial (concurrent per-core
             // Metal GEMV is not thread-safe); the fused/attention path stays parallel.
             serial_cores: force_native,
         })
-    }
-
-    /// FUSED CPU m=1 ATTENTION. Resolve each island arg to its resident HBM stick
-    /// (via `node.bindings`: arg name → tensor id → stick → byte addr), decode the
-    /// f16 inputs to f32, run [`DecodeAttnIsland::compute_f32`], and write the f16
-    /// output row back to the O tensor's stick. Reproduces the decomposed path's
-    /// exact arithmetic per head with f32 accumulation (golden-faithful), at ~3·H
-    /// primitives instead of the ~1500-op decomposed storm.
-    fn run_fused_decode_attention(
-        &self,
-        node: &NodeSpec,
-        island: &ktir_optimizer::head_rewrite::DecodeAttnIsland,
-    ) -> Result<(), String> {
-        // argument -> tensor id, from the node bindings.
-        let arg_tid: HashMap<Ssa, u64> = node.bindings.iter().map(|b| (b.arg, b.tensor)).collect();
-        let read_arg = |arg: Ssa, n: usize| -> Result<Vec<f32>, String> {
-            let tid = *arg_tid
-                .get(&arg)
-                .ok_or_else(|| format!("fused attn: arg %{} not bound", arg.0))?;
-            let s = *self
-                .stick
-                .get(&tid)
-                .ok_or_else(|| format!("fused attn: tensor t{tid} has no resident stick"))?;
-            let nbytes = n * self.dtype.bytes_per_elem();
-            let bytes = self.mem.hbm.borrow().read_bytes(s * STICK_BYTES, nbytes);
-            Ok(crate::codec::decode(&bytes, n, self.dtype))
-        };
-
-        let q_cols = island.q_cols as usize;
-        let cap = island.cap as usize;
-        let kv_cols = island.kv_cols as usize;
-        let q = read_arg(island.q_arg, q_cols)?;
-        let mask = read_arg(island.mask_arg, cap)?;
-        // Read only the LIVE context rows. The mask is `[1, cap]` and cheap, but Kc/Vc are
-        // `[cap, kv_cols]` each and every row costs an f16->f32 decode out of HBM — at a
-        // 4096-deep capacity that is most of this function's work, for rows whose softmax
-        // weight is exactly zero. Rows are `[cap, kv_cols]` row-major, so the live prefix
-        // is a leading slice.
-        let live = ktir_optimizer::head_rewrite::DecodeAttnIsland::live_context(&mask);
-        let kc = read_arg(island.kc_arg, live * kv_cols)?;
-        let kd = read_arg(island.kd_arg, kv_cols)?;
-        let vc = read_arg(island.vc_arg, live * kv_cols)?;
-        let vd = read_arg(island.vd_arg, kv_cols)?;
-
-        let mut o = vec![0.0f32; q_cols];
-        island.compute_f32(
-            ktir_optimizer::head_rewrite::DecodeAttnInputs {
-                q: &q,
-                mask: &mask,
-                kc: &kc,
-                kd: &kd,
-                vc: &vc,
-                vd: &vd,
-            },
-            &mut o,
-        );
-
-        // Write the output row back to the O tensor's stick as f16.
-        let o_tid = *arg_tid
-            .get(&island.o_arg)
-            .ok_or_else(|| format!("fused attn: output arg %{} not bound", island.o_arg.0))?;
-        let o_stick = *self
-            .stick
-            .get(&o_tid)
-            .ok_or_else(|| format!("fused attn: output t{o_tid} has no resident stick"))?;
-        let obytes = crate::codec::encode(&o, self.dtype);
-        self.mem
-            .hbm
-            .borrow_mut()
-            .write_bytes(o_stick * STICK_BYTES, &obytes);
-        Ok(())
     }
 
     /// A door operand's shape — the RUNNING program's own statement of it
@@ -1550,34 +1461,11 @@ impl ResidentExecutor {
                         }
                         _ => false,
                     };
-                    // FUSED CPU m=1 ATTENTION (default ON; opt out via
-                    // KTIR_NO_FUSE_ATTN): when the native segment recognizes as the
-                    // decode (m=1) attention island, compute it directly with
-                    // BLAS-style GEMV + softmax + GEMV per head against resident HBM
-                    // — collapsing the ~1500-op decomposed storm to ~3·H primitives.
-                    // Default-on: the planner isolates this node into a Native
-                    // segment unless KTIR_NO_FUSE_ATTN is set (then it stays folded
-                    // in a Fused segment, decomposed — the oracle path), so
-                    // recognition here is the steady-state path for an isolated m=1
-                    // attention node. If recognition fails (a non-decode native
-                    // node), fall through to the decomposed grid run below.
-                    let fused = if !door_ran && self.fuse_attn {
-                        if let Some(island) =
-                            ktir_optimizer::head_rewrite::recognize_head_attention_decode(func)
-                        {
-                            self.run_fused_decode_attention(node, &island)?;
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
                     if seg_prof {
                         native_ops = op_type_histogram(func.operations);
                     }
-                    if fused || door_ran {
-                        // computed in the fused/door path; outputs already resident in HBM.
+                    if door_ran {
+                        // computed by the host door; outputs already resident in HBM.
                     } else {
                         let grid = func.grid;
                         let mut input_ptrs: Vec<(Ssa, Value)> =

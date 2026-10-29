@@ -428,7 +428,6 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         weight_scale_folds: std::borrow::Cow::Owned(Vec::new()),
         // No head-major o_proj copies: the restructure is a spyre-bundle fact, and this runner
         // lowers Triton kernels — no permuted copy exists to materialize.
-        weight_copies: std::borrow::Cow::Owned(Vec::new()),
         // No paged KV: a single-kernel bundle has no per-request cache stride.
         kv_request_stride_bytes: 0,
         // No op-local LX pin slots: this runner lowers Triton kernels — no rmsnorm decomposition

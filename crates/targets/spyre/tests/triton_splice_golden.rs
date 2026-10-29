@@ -56,7 +56,7 @@ fn spliced_rmsnorm_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
         // The splice — the row compiles the kernel for this node. Every width is
@@ -106,7 +106,7 @@ fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
         // collected the convention's own 1.0 alongside the epsilon, or the door's
         // slot lookup fails as a registry desync (the test's own control on the
         // wiring, not an assertion here: the door refuses below).
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
         assert!(
             layout
@@ -171,7 +171,7 @@ fn spliced_oneplus_rmsnorm_lowers_through_the_door() {
         // push is gated on the node's own convention, so a Scale-only model's
         // registry is byte-identical to the form before the row existed.
         let scale_ir = rmsnorm_ir(m, c, GainConvention::Scale);
-        let scale_layout = compute_bundle_layout(&scale_ir, &weight_ids, false, false, &[])
+        let scale_layout = compute_bundle_layout(&scale_ir, &weight_ids, &[])
             .unwrap_or_else(|e| panic!("scale layout minted m={m} c={c}: {e}"));
         assert!(
             !scale_layout
@@ -228,7 +228,7 @@ fn spliced_silumul_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
         // The splice — the row compiles the kernel for this node, at EVERY rung: a
@@ -314,7 +314,7 @@ fn a_column_chunked_silumul_splices_through_the_door() {
     chunked.nodes[0].output = window(2);
 
     let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
-    let layout = compute_bundle_layout(&chunked, &weight_ids, false, false, &[])
+    let layout = compute_bundle_layout(&chunked, &weight_ids, &[])
         .unwrap_or_else(|e| panic!("layout minted for the chunked node: {e}"));
 
     // The splice — the chunked node compiles (the kernels state `C_START`).
@@ -399,7 +399,7 @@ fn spliced_elementwise_lowers_through_the_door() {
             let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
             // The layout the tape walk computes for this graph.
-            let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
+            let layout = compute_bundle_layout(&ir, &weight_ids, &[])
                 .unwrap_or_else(|e| panic!("layout minted {kind:?} m={m} c={c}: {e}"));
 
             // The splice — the row compiles the kernel for this node at every
@@ -502,7 +502,7 @@ fn spliced_dense_matmul_lowers_through_the_door() {
 
         // The layout the tape walk computes for this graph (`rows_are_requests:
         // true` is the decode/batched shape).
-        let layout = compute_bundle_layout(&ir, &weight_ids, true, true, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
         // The splice — the row compiles the kernel for this node.
@@ -860,7 +860,7 @@ fn spliced_scalarmul_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
 
         // The splice — the row compiles `scalarmul.py` for this node.
@@ -909,7 +909,7 @@ fn spliced_column_chunked_scalarmul_lowers_per_chunk() {
     let scale = 0.022_097_087f32;
     let ir = scalarmul_ir(1, LOGITS_COLS, scale);
     let weight_ids: HashSet<u32> = [0u32].into_iter().collect();
-    let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
+    let layout = compute_bundle_layout(&ir, &weight_ids, &[])
         .unwrap_or_else(|e| panic!("layout minted for the chunked logits: {e}"));
 
     // ONE symbol counter across the bundle, the way the bake threads it — chunk k's
@@ -1181,7 +1181,7 @@ fn batched_decode_odd_vocab_lm_head_splices() {
     let ir = matmul_ir(m, k, n);
     let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
 
-    let layout = compute_bundle_layout(&ir, &weight_ids, true, true, &[])
+    let layout = compute_bundle_layout(&ir, &weight_ids, &[])
         .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
     // The splice — the odd vocab must compile at ANY row count (PlanCorelets'
@@ -1230,7 +1230,7 @@ fn spliced_prefill_lm_head_fold_lowers_through_the_door() {
     for &(mq, k, n) in &[(31u32, 2048u32, 49_155u32), (8u32, 2048u32, 49_155u32)] {
         let ir = matmul_ir(mq, k, n);
         let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
-        let layout = compute_bundle_layout(&ir, &weight_ids, false, false, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, &[])
             .unwrap_or_else(|e| panic!("layout minted mq={mq} k={k} n={n}: {e}"));
 
         // The splice — `lower_all` takes the fold route for this shape.
@@ -1292,7 +1292,7 @@ fn spliced_fp8_matmul_lowers_through_the_door() {
         let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32].into_iter().collect();
 
         // The layout the tape walk computes for this graph.
-        let layout = compute_bundle_layout(&ir, &weight_ids, true, true, &[])
+        let layout = compute_bundle_layout(&ir, &weight_ids, &[])
             .unwrap_or_else(|e| panic!("layout minted m={m} k={k} n={n}: {e}"));
 
         // The splice — the Fp8Dynamic row compiles the kernel for this node.
@@ -1570,14 +1570,7 @@ fn spliced_rope_lowers_through_the_door() {
             let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32].into_iter().collect();
 
             // The layout the tape walk computes for this graph.
-            let layout = compute_bundle_layout(
-                &ir,
-                &weight_ids,
-                rows_are_requests,
-                rows_are_requests,
-                &[],
-            )
-            .unwrap_or_else(|e| {
+            let layout = compute_bundle_layout(&ir, &weight_ids, &[]).unwrap_or_else(|e| {
                 panic!("layout minted mq={mq} heads={heads} hd={hd} r_ar={rows_are_requests}: {e}")
             });
 
@@ -1601,21 +1594,8 @@ fn spliced_rope_lowers_through_the_door() {
             // each program's geometry from the program's own views (the
             // hybrid-model law; gemma-4 carries two attention classes, so no
             // per-bundle geometry exists to state here).
-            let attn_params = scratchy_target_spyre::ktir_superdsc_door::BundleAttnParams {
-                rows_are_requests,
-                // The production mint's value for a batched-shape fixture with no one-request
-                // rung to widen it: the gather follows the row kind here.
-                gathers_kv: rows_are_requests,
-                chunk_pages: None,
-                // Not in weights: this fixture's q/k are Ext sources with no projection
-                // matmuls, so the program states its real scale and the door emits the score
-                // multiplies.
-                scale_in_weights: false,
-                // No handoff: this fixture's rope program has no o matmul at all, and a stated
-                // handoff without one is the door's own refusal.
-                headmajor_handoff: false,
-                oproj_wtid: None,
-            };
+            let attn_params =
+                scratchy_target_spyre::ktir_superdsc_door::BundleAttnParams { rows_are_requests };
             let mut sym = 0i64;
             let _emitted = door_lower(
                 spliced.ktir.as_ref().expect("spliced op carries its program"),
@@ -2014,60 +1994,6 @@ fn attn_geometry(
     )
 }
 
-/// ⛔ ONE SESSION STAGES ONE LAYOUT — placing the KV block index moves no other staged activation.
-///
-/// The one-request ladder runs per-page bodies that gather nothing under a split-KV chunk ceiling that
-/// gathers, and the host stages every step at the CEILING's placements. Each fixture's attention
-/// registers its scale (and √scale) after the attention's own placements — exactly the tail an index
-/// placed beside the mask used to push down, so that a non-gathering body read its constants out of the
-/// index's bytes. The macro holds every baked rung to `ladder_stages_one_layout`; this holds the layout.
-#[test]
-fn the_kv_block_index_moves_no_other_staged_activation() {
-    use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{
-        KV_BLOCK_INDEX_TID, ladder_stages_one_layout,
-    };
-    for s in ATTN_SHAPES.iter().filter(|s| s.mq == 1) {
-        let scale = if s.geom.2 == 64 { 0.015625 } else { 0.0078125 };
-        let ir = attn_ir(*s, scale);
-        let weight_ids: HashSet<u32> = HashSet::new();
-        // The one-request rows (`rows_are_requests = false`) at both gather facts: the chunk ceiling's
-        // call and the per-page body's.
-        let layout = |gathers_kv: bool| {
-            compute_bundle_layout(&ir, &weight_ids, false, gathers_kv, &[]).unwrap_or_else(|e| {
-                panic!(
-                    "layout minted geom={:?} gathers_kv={gathers_kv}: {e}",
-                    s.geom
-                )
-            })
-        };
-        let (plain, gathering) = (layout(false), layout(true));
-        assert!(
-            !plain.placements.contains_key(&KV_BLOCK_INDEX_TID),
-            "geom={:?}: a bundle that does not gather placed the index",
-            s.geom
-        );
-        let index = *gathering
-            .placements
-            .get(&KV_BLOCK_INDEX_TID)
-            .unwrap_or_else(|| panic!("geom={:?}: a gathering bundle placed no index", s.geom));
-        ladder_stages_one_layout(&gathering, &plain)
-            .unwrap_or_else(|e| panic!("geom={:?}: {e}", s.geom));
-        let behind: Vec<u32> = gathering
-            .placements
-            .values()
-            .filter(|p| p.segment == index.segment && p.tid != KV_BLOCK_INDEX_TID)
-            .filter(|p| p.role == index.role && p.offset >= index.offset)
-            .map(|p| p.tid)
-            .collect();
-        assert!(
-            behind.is_empty(),
-            "geom={:?}: tensor(s) {behind:?} sit behind the index in its segment — the index must be \
-             the LAST activation, or its presence moves them",
-            s.geom
-        );
-    }
-}
-
 #[test]
 fn the_paged_attention_splices_with_its_contract() {
     for &s in ATTN_SHAPES {
@@ -2268,7 +2194,6 @@ fn attn_stimulus(n: usize, seed: u64, amp: f32) -> Vec<f32> {
 
 #[cfg(feature = "spyre-emu")]
 fn execute_one_paged_step(s: AttnShape, cached: usize) {
-    use ktir_emulator::ktir_optimizer::{flash_attn, head_rewrite};
     use scratchy_target_spyre::paged_step::{StepRows, pool_of_rows, step_sources};
     use std::borrow::Cow;
 
@@ -2291,13 +2216,6 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
         .ktir
         .as_ref()
         .expect("the walk carries its program");
-    assert!(
-        head_rewrite::recognize_head_attention_decode(&walk.func).is_none()
-            && head_rewrite::recognize_head_attention(&walk.func).is_none()
-            && flash_attn::recognize_rerolled_attention(&walk.func).is_none()
-            && flash_attn::recognize_attention(&walk.func).is_none(),
-        "{at}: an emulator attention recognizer claims the walk"
-    );
     let t_out = u64::from(walk.bindings[1].get());
     let groups: Vec<scratchy_target_spyre::bundle_code::LaunchGroup<'static>> = programs
         .into_iter()

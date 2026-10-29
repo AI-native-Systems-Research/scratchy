@@ -28,7 +28,7 @@
 //! byte-for-byte), so the emulator sees the same KTIR it already runs at its measured rate. This
 //! pass is a relocation, not a redesign.
 
-use crate::head_rewrite::NameGen;
+use crate::name_gen::NameGen;
 use ktir_core::affine::{AffineExpr, AffineMap};
 use ktir_core::arena::Arena;
 use ktir_core::attrkey::AttrKey;

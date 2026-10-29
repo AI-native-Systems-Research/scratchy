@@ -282,13 +282,7 @@ fn emit_regions(
         // the geometry is a const parameter, so `Program::Rope` is refused here and driven from
         // `drive_rope` which takes it explicitly. Refused rather than defaulted: a wrong head
         // count is a silently wrong grouping.
-        //
-        // ⛔ `Program::Attn` IS REFUSED FOR A DIFFERENT REASON NOW: its pattern-matched door
-        // (`drive_attn` → `attn_at::<NQH, NKVH, HD>`, scratchy's prebuilt fragment assembly
-        // selected by geometry match) is REMOVED — attention is lowered from its compiled ops
-        // through the whole-function door, and a per-`Program` dispatch would be a second,
-        // hand-rolled path. Do not re-add one.
-        Program::Attn | Program::Rope => {
+        Program::Rope => {
             return Err(Error {
                 stage: "program",
                 message: format!(
