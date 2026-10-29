@@ -161,7 +161,7 @@ pub enum SynthRole {
     /// prepare (the synthetic-constants law), so the lane-64 sentinel pick (`l_tab`'s
     /// past-`pad_vocab` mapping) reads a ZERO ROW, never past the placement. The one-row
     /// cost per request — `hidden · 2 B` — is the price of keeping an already-broken chat
-    /// off the device bus (the loud `idx > vocab` refusal at the readback still fires;
+    /// off the device bus (the loud `idx >= vocab` refusal at the readback still fires;
     /// this row only keeps the bus quiet while it does).
     ChainSlabT,
     /// ⭐⭐ THE REQUEST-MAJOR ROWS, `[width·row_entries, 64]` — `EmbedRowGather`'s leg-3

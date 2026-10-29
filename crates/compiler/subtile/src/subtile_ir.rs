@@ -1390,7 +1390,7 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// hash/fold constants, the lane table, the fold's five f32 constants,
     /// the fp16 island's clamp — ten of them ONE-WORD `[1, 1]` tables, the
     /// wall-5 measured law). An all-NaN row answers past the last real lane (the
-    /// sentinel); the consumer refuses `idx > vocab` loudly rather than feed
+    /// sentinel); the consumer refuses `idx >= vocab` loudly rather than feed
     /// a NaN-born index to the detokenizer.
     Sample { vocab: u32, rows: u32 },
     // ── The chained head (constructed only by the chain mint, `mint_embed_chain`) ──
@@ -1438,7 +1438,7 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// SENTINEL RAMP ([`chain_l_sentinel_ramp`] — word 0 the mark `hidden`,
     /// every word naming a stick in the transposed placement's never-written
     /// zero tail), and the gather stages a ZERO row rather than read past
-    /// the matrix — the refusal the host readback's `idx > vocab` check
+    /// the matrix — the refusal the host readback's `idx >= vocab` check
     /// performed, moved into the op, so an already-broken chat cannot also
     /// fault the device bus.
     EmbedRowGather { hidden: u32, replaces: TensorId },
@@ -1936,12 +1936,24 @@ pub const CHAIN_IDX_BLOCK: u32 = 32;
 // `SAMPLE_GROUP_BLOCKS * SAMPLE_BLOCK + SAMPLE_BLOCK` in both laws).
 
 /// The sampler's sentinel OFFSET from the padded row — the distance from
-/// `PAD_V` to the all-NaN row's answer `PAD_V + G·4096 + 4160`: the staged
-/// tables' `ginc`/`binc`/`linc` combine, `SAMPLE_GROUP_BLOCKS · SAMPLE_BLOCK +
-/// SAMPLE_BLOCK` = 4160. The sampler's own sentinel law (the host
-/// reference's `None` arm) stated as the offset the chain's table range
+/// `PAD_V` to the all-NaN row's answer [`sample_sentinel`], `G·4096 + 4160`
+/// (`G·4096 = PAD_V` at every pad of whole 4096-lane groups): the staged
+/// tables' `ginc`/`binc`/`linc` pad-lane combine, `SAMPLE_GROUP_BLOCKS ·
+/// SAMPLE_BLOCK + SAMPLE_BLOCK` = 4160. The offset the chain's table range
 /// reads — ONE derivation, no argmax twin.
 pub const SAMPLE_SENTINEL_OFFSET: u32 = SAMPLE_GROUP_BLOCKS * SAMPLE_BLOCK + SAMPLE_BLOCK;
+
+/// The sampler's answer for an ALL-NaN row (#666): a NaN lane never wins the
+/// ordered max and never satisfies the equality, so the one-hot falls on the
+/// pad lanes, whose staged tables read back `ginc = G`, `binc =
+/// SAMPLE_GROUP_BLOCKS` and `linc = SAMPLE_BLOCK` — idx = `G·4096 + 4160`,
+/// past the last real lane at every vocab. ONE derivation, read by the host
+/// reference's `None` arm and by the tests that pin the staged tables to it;
+/// the worker's idx-stick readback refuses it.
+pub fn sample_sentinel(vocab: u32) -> u32 {
+    sample_groups(sample_pad_vocab(vocab)) * (SAMPLE_BLOCK * SAMPLE_GROUP_BLOCKS)
+        + SAMPLE_SENTINEL_OFFSET
+}
 
 /// The chained slab's fp16 stick width — the `[hidden, 64]` slab's one-stick
 /// sub-rows. COINCIDENT with [`SAMPLE_BLOCK`] (both 64) but a DIFFERENT fact:
@@ -2894,9 +2906,8 @@ pub fn eval_node<F: RopeForm>(
             // keeps the pad lanes lost, so the scan over `[0, vocab)` is the
             // whole contest; a NaN score never wins the ordered max and
             // never satisfies the equality, so an all-NaN row answers the
-            // sentinel past the last real lane — the consumer's
-            // `idx > vocab` refusal, #666's recorded divergence from
-            // host-argmax-over-NaN). The output is the `[rows, 64]` idx
+            // sentinel past the last real lane, which the worker's readback
+            // refuses (`idx >= vocab`, #666). The output is the `[rows, 64]` idx
             // stick with every lane equal (the store is a whole stick per
             // row); the values are whole numbers below 2^24, exact in f32.
             // The greedy row (gate 0, inv_t 1) is the plain first-max —
@@ -3011,12 +3022,7 @@ pub fn eval_node<F: RopeForm>(
                     // groups) that is PAD_V + 4160, far past the last real
                     // lane. The kernel's own arithmetic, not the flat
                     // ramp's PAD_V + BLOCK.
-                    None => {
-                        sample_groups(sample_pad_vocab(vocab as u32))
-                            * (SAMPLE_BLOCK * SAMPLE_GROUP_BLOCKS)
-                            + SAMPLE_GROUP_BLOCKS * SAMPLE_BLOCK
-                            + SAMPLE_BLOCK
-                    }
+                    None => sample_sentinel(vocab as u32),
                 };
                 out.extend(std::iter::repeat_n(idx as f32, out_cols as usize));
             }
@@ -5746,7 +5752,7 @@ mod tests {
     }
 
     /// ⭐ THE SENTINEL AND THE PAD BOTH STAGE A ZERO ROW — the refusal the
-    /// host readback's `idx > vocab` check performed, moved into the op: a
+    /// host readback's `idx >= vocab` check performed, moved into the op: a
     /// degenerate logits row answers an index past the vocab, and the gather
     /// must stage a zero row rather than read past the matrix (a fault on the
     /// device bus is not a refusal). TWO legs per the op's own law: the
@@ -5939,5 +5945,59 @@ mod tests {
         // entry and a valid lane).
         assert!(std::panic::catch_unwind(|| chain_s_seed(k, &[], 1)).is_err());
         assert!(std::panic::catch_unwind(|| chain_l_seed(&[], hidden, 1)).is_err());
+    }
+
+    /// ⭐ AN ALL-NaN ROW DRAWS THE SENTINEL (#666) — the sampler's host reference,
+    /// greedy (gate 0, inv_t 1), over the K=1 vocab-5 lm-head the mint admits: a
+    /// finite row answers its first max, and the same row all-NaN answers
+    /// [`sample_sentinel`], past the vocab, which the worker's readback refuses.
+    #[test]
+    fn an_all_nan_row_draws_the_sentinel_and_a_finite_row_its_first_max() {
+        let nz = |k| std::num::NonZeroU32::new(k).unwrap();
+        // K=1 and the activation is [1]: the weight row IS the logits row.
+        let draw = |w0: &[f32; 5]| -> Vec<f32> {
+            let input = crate::lower::LoweringInput {
+                exported: None,
+                sources: vec![
+                    SourceShape { rows: 1, cols: 1 },
+                    SourceShape { rows: 1, cols: 5 },
+                ],
+                ops: vec![OpDesc {
+                    op: SubOp::MatmulTile {
+                        n: 5,
+                        weight: crate::lower::GemmWeight::Dense,
+                    },
+                    m: 1,
+                    inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+                }],
+                result: 0,
+            };
+            let mut g = lower_region(&input, nz(64));
+            let mint = mint_sample(&mut g, SampleRows::All);
+            // The seed words stay zero (the greedy gate among them) and inv_t is 1.0.
+            // The twenty tables are the worker's load-time staging, which the reference
+            // never reads, so they ride as zeros at the minted graph's own sizes.
+            let mut srcs: Vec<Vec<f32>> = (0..g.num_sources as usize)
+                .map(|s| vec![0.0; (g.tensors[s].rows * g.tensors[s].cols) as usize])
+                .collect();
+            srcs[0] = vec![1.0];
+            srcs[1] = w0.to_vec();
+            srcs[mint.invt.index()] = vec![1.0];
+            let refs: Vec<&[f32]> = srcs.iter().map(|s| &s[..]).collect();
+            let bufs = eval_dag(&g, &refs);
+            bufs[g.result.index()].clone()
+        };
+        let stick = |v: u32| vec![v as f32; SAMPLE_BLOCK as usize];
+        assert_eq!(
+            draw(&[0.5, 3.0, -1.0, 3.0, 0.0]),
+            stick(1),
+            "a finite row draws its first max"
+        );
+        assert_eq!(
+            draw(&[f32::NAN; 5]),
+            stick(sample_sentinel(5)),
+            "an all-NaN row draws the sentinel: G·4096 + 4160, at vocab 5 (G = 0) 4160"
+        );
+        assert!(sample_sentinel(5) >= 5, "the sentinel is past the vocab");
     }
 }
