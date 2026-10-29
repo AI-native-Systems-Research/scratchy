@@ -962,6 +962,45 @@ impl SpyreWorker {
             "[weights] staged {} weight(s) for the session",
             weights.len()
         );
+        // ⭐ THE LOAD CONSTS RIDE IN WITH THE WEIGHTS. The minted draw's twenty staged tables
+        // (and the chained head's decompose tables) are sources the bake states once at load —
+        // `Wiring::load_consts` — staged here at their TRUE dtypes exactly as the numeric gate
+        // stages them (`LoadConst::build`, the memref-faithful form). Without them the draw reads
+        // zero ramps and zero widen tables and answers token 0, every step. Both bundles mint the
+        // draw at the same tids with the same tables; a tid two bundles state DIFFERENTLY cannot
+        // live in one resident session, so it refuses rather than keep either.
+        #[cfg(not(feature = "spyre-hw"))]
+        let weights = {
+            let mut weights = weights;
+            let mut staged: std::collections::HashMap<u32, Vec<u8>> =
+                std::collections::HashMap::new();
+            let consts = wirings
+                .decode
+                .load_consts
+                .iter()
+                .chain(wirings.prefill.iter().flat_map(|p| p.load_consts.iter()));
+            for &(tid, kind) in consts {
+                let (bytes, dt, shape) = kind.build();
+                match staged.get(&tid) {
+                    Some(prev) if *prev != bytes => {
+                        return Err(werr(format!(
+                            "load const t{tid} is stated differently by the decode and prefill \
+                             bundles — one resident session holds one value per tensor id"
+                        )));
+                    }
+                    Some(_) => {}
+                    None => {
+                        staged.insert(tid, bytes.clone());
+                        weights.push((tid as usize, bytes, dt, shape.to_vec()));
+                    }
+                }
+            }
+            tracing::info!(
+                "[weights] staged {} load const(s) for the session",
+                staged.len()
+            );
+            weights
+        };
         // NOTE: the RoPE rotate-half permutation P (ROPE_P_TID) is NOT a load-time weight.
         // It is a synthetic seg0 ACTIVATION re-bound per step in `superdsc_forward_chunk`
         // (see the `acts` block there) — a seg1 weight would only be H2D'd at PrepareModel,
@@ -2935,6 +2974,8 @@ impl SpyreWorker {
                 scalarmul_scales: p.scalarmul_scales,
                 #[cfg(not(feature = "spyre-hw"))]
                 phase: wiring.phase,
+                #[cfg(not(feature = "spyre-hw"))]
+                sample_seat: wiring.sample_seat,
                 #[cfg(feature = "spyre-hw")]
                 facts,
                 #[cfg(feature = "spyre-hw")]

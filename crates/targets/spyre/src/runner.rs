@@ -246,6 +246,25 @@ impl SpyreSession {
         Ok(Self { session })
     }
 
+    /// Overwrite source tensors from already-TYPED bytes, each landing at its own view's dtype —
+    /// the per-step channel for a source whose view is not f16. [`run_step`](Self::run_step)'s
+    /// sources ride the f16 channel, which would encode the sampler seat's i32 seed words and f32
+    /// inv_t into half the bytes their views span; these go through the same [`weight_arg`]
+    /// mapping the session's construction stages its weights through, so the words land
+    /// verbatim. Weights and every source not named here keep their resident bytes.
+    pub fn set_typed_sources(
+        &mut self,
+        sources: Vec<(usize, Vec<u8>, SDType, Vec<usize>)>,
+    ) -> Result<()> {
+        let args: Vec<(u64, Arg)> = sources
+            .into_iter()
+            .map(|(id, data, dt, shape)| (id as u64, weight_arg(data, dt, shape)))
+            .collect();
+        self.session
+            .set_sources(&args)
+            .map_err(|e| anyhow!("set_typed_sources: {e}"))
+    }
+
     /// Run one fused forward of program `prog`: overwrite this pass's changing sources, run, and
     /// read back `outputs`. Weights stay resident.
     ///
