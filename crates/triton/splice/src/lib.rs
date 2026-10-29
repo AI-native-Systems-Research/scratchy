@@ -3677,12 +3677,6 @@ mod production_ktir_dump {
             "rope_fwd" => Some("the model-geometry const door (rope_at::<HD>)"),
             // The paged step's card lowering is not ported: the door refuses both programs by
             // name. The KTIR-text leg covers them.
-            "paged_attn_decode"
-            | "paged_attn_prefill"
-            | "paged_kv_write"
-            | "paged_kv_write_rows" => {
-                Some("no SuperDSC lowering yet — the door refuses the paged step by name")
-            }
             // No `Program` variant exists and none is inventable here: the MoE lowers
             // only from `kernels/moe.py` through KTIR, and no per-op row names a
             // program for it. Stating one in a dump driver would be routing invented
@@ -3759,7 +3753,14 @@ mod production_ktir_dump {
             | Program::SiluMul
             | Program::RmsNorm
             | Program::ScalarMul
-            | Program::Sample => windowed(lower_function(node, Some(&layout), &mut sym, None)),
+            | Program::Sample
+            | Program::PagedAttn => windowed(lower_function(node, Some(&layout), &mut sym, None)),
+            Program::PagedKvWrite => {
+                Ok(
+                    lk::paged_kv_write(lk_name, node, &regions, &mut sym, Some(&layout))
+                        .map_err(|e| format!("{name}: {e:?}"))?,
+                )
+            }
             // The door's unwrapped whole-function kinds.
             Program::Matmul | Program::LmLast => {
                 Ok(lower_function(node, Some(&layout), &mut sym, None)

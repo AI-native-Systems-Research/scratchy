@@ -481,6 +481,135 @@ pub fn assemble_gather_copy(
         .unwrap_or_else(|e| panic!("assemble_gather_copy {op_name}: {e}"))
 }
 
+/// ⭐⭐⭐ THE SCATTER'S COPY — the mirror of [`gather_copy_opspec`]: an `identity` from a contiguous
+/// source into a PAGED destination written through an index, so row `j` of the source lands at the
+/// destination entry `index[j]` names.
+///
+/// ## The shape, read off `dxp/test/test_scatter_1core/sdsc_1.json`
+/// ```text
+/// allocate-Tensor1_hbm  indirectAllocType_ index_tensor  relatedIndirectAccessAlloc_ allocate-Tensor2_hbm
+/// allocate-Tensor2_hbm  indirectAllocType_ value_tensor  relatedIndirectAccessAlloc_ allocate-Tensor1_hbm
+///                       maxDimSizes_ [1, -1, -1]
+/// computeOp_  opFuncName identity  inputLabeledDs ["Tensor0-idx0"]  outputLabeledDs ["Tensor2-idx2"]
+///             indirectAccessIndexLabeledDs ["Tensor1-idx1"]
+/// ```
+/// The gather's copy with the pair on the OUTPUT ([`OpSpec::attach_scatter_index`]); the scheduler
+/// turns that output's LX→HBM transfer indirect (`L3DlOpsScheduler.cpp:6880-6945`).
+///
+/// ## The same laws as the gather's copy, for the same reasons
+/// `cols` is ONE stick and `rows` counts one-stick SUB-ROWS, `scatter.page` of them per entry (a
+/// `[n, hd]` row is `hd / stick` sub-rows), so one index step moves `page · stick` elements — the
+/// row the index names. At most one index stick of entries per op, and cores split by whole entries
+/// only ([`gather_copy_cores`]): `skip_addr` is derived from the per-core extents, so a split entry
+/// is a clean bake writing the wrong rows. `src_elems` is the source's own base, for a run past the
+/// first.
+pub fn scatter_copy_opspec(
+    src: &str,
+    dst: &str,
+    scatter: crate::superdsc_opspec::GatherIndex,
+    spec: ScatterCopySpec,
+) -> Result<OpSpec, String> {
+    let ScatterCopySpec {
+        rows,
+        cols,
+        df,
+        src_elems,
+    } = spec;
+    crate::superdsc_opspec::assert_df_stick_multiple(cols, df)?;
+    if cols != df.elems_per_stick() {
+        return Err(format!(
+            "scatter_copy_opspec('{src}' -> '{dst}'): `out` is {cols} elements, and a scattered \
+             copy's `out` must be exactly one {stick}-element stick — declare the row as one-stick \
+             sub-rows with the entry `page` covering them",
+            stick = df.elems_per_stick(),
+        ));
+    }
+    let page = scatter.page.get();
+    if page == 0 || !rows.is_multiple_of(page) {
+        return Err(format!(
+            "scatter_copy_opspec('{src}' -> '{dst}'): {rows} `mb` positions do not divide into \
+             whole {page}-position entries, so the last index entry would cover a partial row"
+        ));
+    }
+    let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
+    if rows / page > cap {
+        return Err(format!(
+            "scatter_copy_opspec('{src}' -> '{dst}'): {} index entries, and one op's index is ONE \
+             {cap}-entry stick — entries past it wrap and write another core's rows. Cut the write \
+             into one op per stick of entries.",
+            rows / page
+        ));
+    }
+    let dim = |name: &'static str, size: u32, is_stick: bool| crate::superdsc_opspec::ItDim {
+        name,
+        size,
+        is_reduction: false,
+        is_stick,
+        df,
+    };
+    let tile_op = TileOp {
+        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
+        dims: vec![
+            dim("mb", rows, false),
+            dim("out", cols, true),
+            dim("y", 1, false),
+        ],
+        df,
+    };
+    // Rank-3 and `mb`-only core splits: the gather copy's two card-measured laws (see its call).
+    let mut op = pointwise_opspec_from_tile_split(
+        &tile_op,
+        OpFunc::Identity,
+        &[src],
+        dst,
+        true,
+        |dims: &[crate::superdsc_opspec::ItDim], max_cores: u32| {
+            gather_copy_cores(dims, max_cores, page)
+        },
+        // The destination is addressed THROUGH the index from the pool's own base.
+        OutView::at(0),
+    )?;
+    for a in op.args.iter_mut() {
+        a.set_df(df);
+    }
+    if src_elems > 0 {
+        op.args[0].set_offset_elems(src_elems);
+    }
+    op.attach_scatter_index(scatter).ok_or_else(|| {
+        format!(
+            "scatter_copy_opspec('{src}' -> '{dst}'): the index declaration does not fit this op — \
+             its dims are [mb, out, y], so the paged axis must be `mb`"
+        )
+    })?;
+    Ok(op)
+}
+
+/// One scattered copy's extents: `rows` one-stick sub-rows of `cols` (one stick) elements of `df`,
+/// read from the source starting `src_elems` elements in.
+#[derive(Clone, Copy, Debug)]
+pub struct ScatterCopySpec {
+    pub rows: u32,
+    pub cols: u32,
+    pub df: Df,
+    pub src_elems: u32,
+}
+
+/// [`scatter_copy_opspec`] + `emit_sdsc_tiled` — the one assembler for a scattered copy.
+pub fn assemble_scatter_copy(
+    op_name: &str,
+    src: &str,
+    dst: &str,
+    scatter: crate::superdsc_opspec::GatherIndex,
+    spec: ScatterCopySpec,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
+    let op = scatter_copy_opspec(src, dst, scatter, spec)?;
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+        .map_err(|e| format!("assemble_scatter_copy {op_name}: {e}"))
+}
+
 /// `layout` decides only the work division ([`EwDivision`]), exactly as for
 /// [`pointwise_broadcast_opspec_from_tile`]: `None` has no core-local pins.
 pub fn pointwise_opspec_from_tile(
@@ -1021,4 +1150,59 @@ pub fn assemble_pointwise_seeded_from_tile(
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
         .unwrap_or_else(|e| panic!("assemble_pointwise {op_name}: {e}"))
+}
+
+#[cfg(test)]
+mod scatter_tests {
+    use super::*;
+    use crate::superdsc_opspec::{EntryBase, GatherIndex, PageExtent};
+
+    /// The vendor's `test_scatter_1core` shape: `[input, index, output]`, and the pair's VALUE is the
+    /// output — the operand written through the index — never the input.
+    #[test]
+    fn a_scattered_copy_writes_its_output_through_the_index() {
+        let op = scatter_copy_opspec(
+            "act_1",
+            "act_2",
+            GatherIndex::of_scratch_rows(
+                "act_3".into(),
+                PageExtent::of_positions(2),
+                EntryBase::ZERO,
+            ),
+            ScatterCopySpec {
+                rows: 16,
+                cols: 64,
+                df: Df::Fp16,
+                src_elems: 0,
+            },
+        )
+        .expect("an 8-row, two-stick-per-row scatter builds");
+        let ia = op.indirect.expect("the scatter declares its pair");
+        assert_eq!(op.args.len(), 3, "input, index, output");
+        assert_eq!(ia.value, 2, "the output is the paged value");
+        assert_eq!(ia.index, 1, "the index sits between input and output");
+    }
+
+    /// More entries than one 32-entry index stick is refused: dxp loads one stick per op and the
+    /// entries past it wrap onto another core's rows.
+    #[test]
+    fn a_scatter_past_one_index_stick_is_refused() {
+        let e = scatter_copy_opspec(
+            "act_1",
+            "act_2",
+            GatherIndex::of_scratch_rows(
+                "act_3".into(),
+                PageExtent::of_positions(1),
+                EntryBase::ZERO,
+            ),
+            ScatterCopySpec {
+                rows: 33,
+                cols: 64,
+                df: Df::Fp16,
+                src_elems: 0,
+            },
+        )
+        .expect_err("33 entries do not fit one index stick");
+        assert!(e.contains("ONE 32-entry stick"), "{e}");
+    }
 }
