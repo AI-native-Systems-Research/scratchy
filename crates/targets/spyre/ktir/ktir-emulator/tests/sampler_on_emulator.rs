@@ -227,23 +227,26 @@ fn greedy_draw(argmax: usize) -> u32 {
 #[cfg(metal)]
 const STAGGERED_WINDOWS_PER_DRAW: usize = 2;
 
-/// Whether this machine runs the emulator's Metal offloads: a Metal device that can mint an
-/// MTL4 command queue. The same probe metal.rs's own GPU tests skip by (`no_gpu_here`); CI's
-/// macOS VMs have a device but no MTL4 queue.
+/// True when there is no GPU here fit for the emulator's Metal offloads: no Metal device at
+/// all, or a device that cannot mint an MTL4 command queue (CI's macOS VMs). The same probe
+/// metal.rs's own GPU tests skip by (its `no_gpu_here`).
 #[cfg(metal)]
-fn metal4_gpu_here() -> bool {
+fn no_gpu_here() -> bool {
     use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
-    MTLCreateSystemDefaultDevice().is_some_and(|device| device.newMTL4CommandQueue().is_some())
+    match MTLCreateSystemDefaultDevice() {
+        None => true,
+        Some(device) => device.newMTL4CommandQueue().is_none(),
+    }
 }
 
 /// How many fused map windows that read through the stagger table have run on Metal so far,
-/// where this machine runs the Metal offloads; `None` elsewhere.
+/// where the emulator has its Metal backend; `None` elsewhere.
 #[cfg(metal)]
 fn staggered_windows_on_metal() -> Option<usize> {
-    metal4_gpu_here().then(|| {
+    Some(
         ktir_emulator::metal::MAP_REGION_STAGGERED_GPU_COUNT
-            .load(std::sync::atomic::Ordering::Relaxed)
-    })
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 #[cfg(not(metal))]
@@ -253,14 +256,13 @@ fn staggered_windows_on_metal() -> Option<usize> {
 
 #[test]
 fn a_greedy_draw_answers_the_planted_maximum() {
-    // Built with Metal on a machine with no MTL4 GPU (CI's macOS VMs), a planned fused window
-    // could not dispatch, and the resident has no fallback once it planned one. Keep the windows
-    // on the interpreter there, through the emulator's existing `KTIR_NO_GPU_MAP` switch, so the
-    // exact-draw check still runs; only the Metal-offload check below needs the GPU.
+    // Built with Metal, the row's fused windows dispatch on the GPU, so a machine with no
+    // MTL4-capable GPU cannot run the draw at all: skip there, the way metal.rs's GPU tests do.
+    // Without Metal (Linux) the whole draw runs on the interpreter and every check below runs.
     #[cfg(metal)]
-    if !metal4_gpu_here() {
-        // SAFETY: the only test in this binary, and no session has read the environment yet.
-        unsafe { std::env::set_var("KTIR_NO_GPU_MAP", "1") };
+    if no_gpu_here() {
+        eprintln!("no MTL4-capable GPU here — skipping the sampler draw");
+        return;
     }
     let mut missed = Vec::new();
     let mut on_metal = Vec::new();
