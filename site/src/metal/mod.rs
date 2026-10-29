@@ -19,9 +19,8 @@ use dioxus::prelude::*;
 
 use crate::Site;
 use crate::carbon::{
-    Alignment, ContentPanel, ContentSwitcher, ContentSwitcherItem, Fold, Heading, Layer,
-    Orientation, Section, Stack, TabItem, Table, TableCell, TableRow, Tabs, TabsKind, Tag, TagKind,
-    Tile, Toggletip,
+    Alignment, ContentPanel, ContentSwitcher, ContentSwitcherItem, Fold, Heading, Layer, Section,
+    Stack, TabItem, Table, TableCell, TableRow, Tabs, TabsKind, Tag, TagKind, Tile, Toggletip,
 };
 use crate::charts::{
     Axes, Axis, AxisDomain, BarPoint, Better, Bounds, BubblePoint, Bubbles, Chart, ChartOptions,
@@ -1916,8 +1915,8 @@ impl Latency<'_> {
     /// more of scratchy's requests are done by then, red where fewer; across the middle, a line
     /// from one median to the other, cyan or red as scratchy's is the sooner or later, its factor
     /// written over it. Bare, as an overview's panel: no axis titles or tick labels, `tag` in its
-    /// corner; `side` wide and half as high.
-    fn ecdf(&self, k: CellKey, t: RequestTiming, side: Px, tag: &str, label: &str) -> Element {
+    /// corner; as wide as its column and [`GLANCE_CHART_HEIGHT`] high, as the sparklines are.
+    fn ecdf(&self, k: CellKey, t: RequestTiming, tag: &str, label: &str) -> Element {
         let curves: Vec<(Engine, Vec<f64>)> = (self.engines.iter())
             .filter_map(|&e| {
                 let rs = self.cell(e, k)?.requests.as_ref()?;
@@ -2031,8 +2030,8 @@ impl Latency<'_> {
                         .collect(),
                 }),
                 heatmap: None,
-                height: Px(side.0 / 2).to_string(),
-                width: Some(side.to_string()),
+                height: GLANCE_CHART_HEIGHT.to_string(),
+                width: Some("100%".to_string()),
                 legend: Some(Enabled { enabled: false }),
                 locale: None,
                 // Carbon draws an area's bounds only when the layer holds one series.
@@ -2066,8 +2065,8 @@ impl Latency<'_> {
             },
         };
         rsx! {
-            div { style: "position: relative; width: {side}",
-                {chart(&spec, label, &format!("width: {side}"), None)}
+            div { style: "position: relative; width: 100%",
+                {chart(&spec, label, "width: 100%", None)}
                 span { style: "position: absolute; top: 0; left: 0; padding: 2px 4px; font-size: 0.625rem; font-weight: 600; pointer-events: none",
                     "{tag}"
                 }
@@ -2076,11 +2075,11 @@ impl Latency<'_> {
     }
 
     /// Every cell at answer length `o` as a small multiple, users at once down and prompt size
-    /// across, each column `side` wide, under `title`: `cell` draws each.
+    /// across, each column `column` wide (a grid track), under `title`: `cell` draws each.
     fn multiple(
         &self,
         o: u32,
-        side: Px,
+        column: &str,
         title: &str,
         cell: impl Fn(CellKey) -> Element,
     ) -> Element {
@@ -2091,7 +2090,7 @@ impl Latency<'_> {
         prompts.sort_unstable();
         prompts.dedup();
         let columns = format!(
-            "display: grid; grid-template-columns: max-content repeat({}, {side}); gap: 0.5rem; align-items: center",
+            "display: grid; grid-template-columns: max-content repeat({}, {column}); gap: 0.5rem; align-items: center",
             prompts.len()
         );
         // Each column and row named with its unit: "128 input tokens", "1 user".
@@ -2111,7 +2110,7 @@ impl Latency<'_> {
                     for &u in &users {
                         div { "{users_at(u)}" }
                         for &i in &prompts {
-                            div {
+                            div { style: "min-width: 0",
                                 if ks.contains(&(u, o, i)) {
                                     {cell((u, o, i))}
                                 }
@@ -2124,8 +2123,9 @@ impl Latency<'_> {
     }
 }
 
-/// A chart of the overview's latency panel: four across a machine's model fit the panel.
-const GLANCE_PANEL_SIDE: Px = Px(180);
+/// A glance chart's height, the scaling sparklines' and the latency ECDFs' alike; each is as wide
+/// as its column.
+const GLANCE_CHART_HEIGHT: &str = "4.5rem";
 
 /// An ECDF's fills ([`Latency::ecdf`]): where more of scratchy's requests are done than its
 /// rival's, and where fewer.
@@ -2203,21 +2203,22 @@ struct Crowd {
     tpot: f64,
 }
 
-/// The legend every latency chart shares, in the engines' colours: in a row over the charts, or
-/// a column beside them.
-fn latency_legend(engines: &[Engine], orientation: Orientation) -> Element {
-    let direction = match orientation {
-        Orientation::Horizontal => "row",
-        Orientation::Vertical => "column",
-    };
+/// The legend a model's latency charts share, in the engines' colours.
+fn latency_legend(engines: &[Engine]) -> Element {
     rsx! {
-        div { style: "display: flex; flex-direction: {direction}; gap: 1.5rem; align-items: flex-start",
-            for (e, class) in engines.iter().zip(["s1", "s2"]) {
-                span { style: "display: inline-flex; gap: 0.4rem; align-items: center",
-                    span { style: "width: 10px; height: 10px; border-radius: 50%; background: {colour(class).light}" }
-                    "{e.label()}"
-                }
-            }
+        div { style: "display: flex; gap: 1.5rem; align-items: center",
+            for (&e, class) in engines.iter().zip(["s1", "s2"]) { {engine_key(e, class)} }
+        }
+    }
+}
+
+/// An engine's name after a dot of its series colour `class`: one entry of a legend, or a key in
+/// running text.
+fn engine_key(e: Engine, class: &str) -> Element {
+    rsx! {
+        span { style: "display: inline-flex; gap: 0.4rem; align-items: center",
+            span { style: "width: 10px; height: 10px; border-radius: 50%; background: {colour(class).light}" }
+            "{e.label()}"
         }
     }
 }
@@ -2259,11 +2260,16 @@ fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
     answers.dedup();
     // Each cell's bubble chart, on its own axes or on every cell's across every answer length.
     let multiple = |o: u32, axes: Axes2| {
-        l.multiple(o, PANEL_SIDE, &format!("{o}-token answers"), |(u, o, i)| {
-            let about =
-                format!("TTFT against TPOT, every request, {i} in {o} out {u} at once, {mid}");
-            l.chart((u, o, i), span, axes, PANEL_SIDE, false, &about)
-        })
+        l.multiple(
+            o,
+            &PANEL_SIDE.to_string(),
+            &format!("{o}-token answers"),
+            |(u, o, i)| {
+                let about =
+                    format!("TTFT against TPOT, every request, {i} in {o} out {u} at once, {mid}");
+                l.chart((u, o, i), span, axes, PANEL_SIDE, false, &about)
+            },
+        )
     };
     let table = |t: RequestTiming| -> Element {
         rsx! {
@@ -2305,7 +2311,7 @@ fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
         },
         rsx! {
             Stack { gap: 6,
-                {latency_legend(&l.engines, Orientation::Horizontal)}
+                {latency_legend(&l.engines)}
                 // Own axes first and shown; the same axes a switch away (Carbon draws a chart
                 // in a hidden panel when its panel is shown).
                 ContentSwitcher { selected: format!("{mid}-axes-{}", slug(Axes2::Own.title())),
@@ -2861,7 +2867,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
     }
     let spark = |chip: &str, stem: &str, trend: Trend| -> Element {
         let at = SparkAt { chip, stem, trend };
-        trend_spark(at, &sparks[&at], "4.5rem")
+        trend_spark(at, &sparks[&at], GLANCE_CHART_HEIGHT)
     };
     // A grid with nothing of its own (the model not run on that machine, say)
     // keeps its place as a map of blank squares its set's shape, over why it
@@ -3052,12 +3058,12 @@ fn latency_panel<'l>(
         let o = glance_answer(run);
         let about = format!("{stem} on {chip}");
         // Each cell its TTFT's and TPOT's distributions, one over the other.
-        l.multiple(o, GLANCE_PANEL_SIDE, &format!("{stem} · {o}-token answers"), |(u, o, i)| {
+        l.multiple(o, "minmax(0, 1fr)", &format!("{stem} · {o}-token answers"), |(u, o, i)| {
             let label = |t: RequestTiming| format!("{} of every request, {i} in {o} out {u} at once, {about}", t.title());
             rsx! {
                 Stack { gap: 1,
-                    {l.ecdf((u, o, i), RequestTiming::Ttft, GLANCE_PANEL_SIDE, "TTFT", &label(RequestTiming::Ttft))}
-                    {l.ecdf((u, o, i), RequestTiming::Tpot, GLANCE_PANEL_SIDE, "TPOT", &label(RequestTiming::Tpot))}
+                    {l.ecdf((u, o, i), RequestTiming::Ttft, "TTFT", &label(RequestTiming::Ttft))}
+                    {l.ecdf((u, o, i), RequestTiming::Tpot, "TPOT", &label(RequestTiming::Tpot))}
                 }
             }
         })
@@ -3080,24 +3086,26 @@ fn latency_panel<'l>(
         script { dangerous_inner_html: LATENCY_JS }
         div { style: "padding-top: var(--cds-spacing-05)",
             Stack { gap: 5,
+                // The engines' colours keyed in the text itself: "● scratchy versus ● oMLX".
                 p {
-                    "Each cell's requests at the heat maps' answer length, users at once down and prompt size \
-                     across: per engine, the share of requests (up) done within each time (across), time to \
+                    for (n, (&e, class)) in latency_engines(machines).iter().zip(["s1", "s2"]).enumerate() {
+                        if n > 0 { " versus " }
+                        {engine_key(e, class)}
+                    }
+                    ": in each cell at the heat maps' answer length, users at once down and prompt size \
+                     across, the share of each one's requests (up) done within each time (across), time to \
                      first token over time per output token, each chart on its own range. Further left is \
                      faster; a steeper rise is steadier."
                 }
-                div { style: "display: flex; gap: 2rem; align-items: flex-start",
-                    div {
-                        for &chip in rows {
-                            for &class in classes {
-                                div { id: format!("latency-{}-{}", slug(chip), slug(class)), "data-panel": "", "data-latency-pair": "", "data-machine": machine(chip), "data-model": model(class),
-                                    hidden: (chip != first_chip || class != first_class).then_some(true),
-                                    {pair(chip, class)}
-                                }
+                div {
+                    for &chip in rows {
+                        for &class in classes {
+                            div { id: format!("latency-{}-{}", slug(chip), slug(class)), "data-panel": "", "data-latency-pair": "", "data-machine": machine(chip), "data-model": model(class),
+                                hidden: (chip != first_chip || class != first_class).then_some(true),
+                                {pair(chip, class)}
                             }
                         }
                     }
-                    {latency_legend(&latency_engines(machines), Orientation::Vertical)}
                 }
             }
         }
@@ -3446,7 +3454,7 @@ fn startup_panel(machines: &BTreeMap<&str, MachineRuns>, columns: usize) -> Elem
                     for (k, col) in STARTUP_COLUMNS.iter().enumerate() {
                         div {
                             match &sparks[&(chip, k)] {
-                                Ok(sp) => sparkline(&sp.steps, col.axes, Engine::Scratchy.side(), sp.rival.side(), Some(sp.names()), "4.5rem", &format!("{chip}, {}: {} by model size, scratchy against {}", col.title, col.axes.value, sp.rival.label())),
+                                Ok(sp) => sparkline(&sp.steps, col.axes, Engine::Scratchy.side(), sp.rival.side(), Some(sp.names()), GLANCE_CHART_HEIGHT, &format!("{chip}, {}: {} by model size, scratchy against {}", col.title, col.axes.value, sp.rival.label())),
                                 Err(why) => rsx! { "{why}" },
                             }
                         }
