@@ -439,24 +439,30 @@ Never copy a smoke run, or anything under `/tmp/metal-smoke`.
 
 The site shows each chip's two newest runs, as current and previous, and
 computes the ▲/▼ change badges from them. Add the new run, keep the run
-before it as the previous one, and remove anything older. Copy first, and
-prune only once the copy has worked: `cp -n` refuses to overwrite a run that
-has the same name, and in that case nothing should be removed.
+before it as the previous one, and move anything older to
+`site/data/metal/history/`, which the page's Over time section reads. Copy
+first, and move only once the copy has worked: `cp -n` refuses to overwrite
+a run that has the same name, and in that case nothing should be moved.
 
 ```bash
 m=$(basename "$f" | sed -E 's/-[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9]{6}Z)?-[0-9a-f]{8}\.json$//')   # e.g. apple-m3-pro
 if cp -n "$f" site/data/metal/; then
-  ls site/data/metal/"$m"-*.json | sort | sed '$d' | sed '$d' | xargs -r git rm -q   # keep the newest two
+  ls site/data/metal/"$m"-*.json | sort | sed '$d' | sed '$d' \
+    | xargs -r -I{} git mv {} site/data/metal/history/   # keep the newest two; the rest to history/
 else
-  echo "$(basename "$f") is already in site/data/metal; nothing copied or removed"
+  echo "$(basename "$f") is already in site/data/metal; nothing copied or moved"
 fi
 ```
 
 If it says the file is already there, show the user both files and let them
 decide which one to keep.
 
-**Done when:** `ls site/data/metal/$m-*` lists at most two files, and the
-newest one is `$(basename "$f")`.
+Don't delete a run: move it. The one exception is a Mac retired from the
+round, whose runs can be removed with `git rm`.
+
+**Done when:** `ls site/data/metal/$m-*` lists at most two files, the
+newest one is `$(basename "$f")`, and `git status --short site/data/metal`
+shows the new run as added and any older one as renamed into `history/`.
 
 ## 6. Preview
 

@@ -62,7 +62,7 @@
   }
   // Draws one chart in the theme `t`.
   function draw(el, t) {
-    var charts = { groupedbar: Charts.GroupedBarChart, combo: Charts.ComboChart, heatmap: Charts.HeatmapChart, bubble: Charts.BubbleChart };
+    var charts = { groupedbar: Charts.GroupedBarChart, combo: Charts.ComboChart, heatmap: Charts.HeatmapChart, bubble: Charts.BubbleChart, line: Charts.LineChart };
     var spec = JSON.parse(el.getAttribute('data-chart'));
     if (spec.ratio) {
       var total = spec.options.locale.translations.total;

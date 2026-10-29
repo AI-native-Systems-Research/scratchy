@@ -156,6 +156,11 @@ pub enum Chart<'a> {
         /// [`BubblePoint::radius`].
         unit_radius: f64,
     },
+    /// Carbon's LineChart: a line a group, through its points in `options.axes.bottom`'s order.
+    Line {
+        data: Vec<serde_json::Value>,
+        options: ChartOptions<'a>,
+    },
 }
 
 /// One bubble: its series, where along the bottom axis, its value, and the square root of how
@@ -432,7 +437,8 @@ impl Chart<'_> {
             Chart::GroupedBar { options, .. }
             | Chart::Heatmap { options, .. }
             | Chart::Combo { options, .. }
-            | Chart::Bubble { options, .. } => options,
+            | Chart::Bubble { options, .. }
+            | Chart::Line { options, .. } => options,
         }
     }
 }
