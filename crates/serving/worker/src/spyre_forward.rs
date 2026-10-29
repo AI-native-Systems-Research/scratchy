@@ -1322,15 +1322,11 @@ pub(crate) enum ChunkOut {
     /// generated token is picked by the DECODE launch that runs the prompt's last
     /// token — never by a host readback.
     Prompt,
-    /// TOKENS THE CARD PICKED, one per decode launch this chunk ran, in step order.
-    /// The minted sampler's idx stick, read back raw — the only pick that exists.
-    ///
-    /// ⛔ CARD-ONLY, `cfg`-ed out rather than never-constructed: the mint is a
-    /// decode-bundle CARD fact, and the emulator runs no minted sampler — every
-    /// emulator chunk is a `Prompt` by construction. The shared readers go through
-    /// [`ChunkOut::minted_pick`], which carries that law inside so no reader names
-    /// the variant.
-    #[cfg(feature = "spyre-hw")]
+    /// TOKENS THE DEVICE PICKED, one per launch this chunk ran that drew, in step
+    /// order. The minted sampler's idx stick, read back raw — the only pick that
+    /// exists, on the card and on the emulator alike (the bake mints the draw into
+    /// both tiers' bundles). The shared readers go through
+    /// [`ChunkOut::minted_pick`], so no reader names the variant.
     Tokens(Vec<u32>),
 }
 
@@ -1341,11 +1337,10 @@ impl ChunkOut {
     /// chunk of a build with no minted sampler, where the pick step's own
     /// refusal — not a silent `Prompt` match — is what the caller meets.
     pub(crate) fn minted_pick(&self) -> Option<&[u32]> {
-        #[cfg(feature = "spyre-hw")]
-        if let ChunkOut::Tokens(ts) = self {
-            return Some(ts);
+        match self {
+            ChunkOut::Tokens(ts) => Some(ts),
+            ChunkOut::Prompt => None,
         }
-        None
     }
 }
 
@@ -1356,12 +1351,52 @@ impl ChunkOut {
 /// ABSOLUTE position — the one input that changes every launch of one
 /// generation, so the same seed draws different noise (hence, past rare ties,
 /// a different token) at every position instead of repeating one pick.
-#[cfg(feature = "spyre-hw")]
 pub(crate) struct RowLaw<'a> {
     pub(crate) draw: Option<&'a SampledDraw>,
     /// The row's absolute position — its request's own token count at this
     /// step, or (a prompt chunk's pad row) the last real position it clamps to.
     pub(crate) step: u32,
+}
+
+/// ⭐ ONE ROW'S SEAT WORDS — the seed quadruple `(seed_lo, seed_hi, step, gate)`
+/// and the inv_t this row's law stages, the ONE statement of the law both tiers
+/// lay out (the card scatters these values to its stick heads, the emulator
+/// packs them `[rows, 1]` at its views' own dtypes). Greedy is `(0, 0, 0, 0)`
+/// and 1.0 — the gate word's 0 IS the greedy law, `score = x·inv_t + g·0`. A
+/// sampled row is its request's seed split low/high, the row's step salt, the
+/// gate's 1 and the draw's own 1/T. ⭐ NO ROW WORD (the P3 localization ruling):
+/// the key is request-owned alone, identical in every row.
+pub(crate) fn seat_words(law: &RowLaw<'_>) -> ([i32; 4], f32) {
+    match law.draw {
+        Some(d) => (
+            [
+                d.seed as u32 as i32,
+                (d.seed >> 32) as u32 as i32,
+                law.step as i32,
+                1,
+            ],
+            d.inv_t,
+        ),
+        None => ([0; 4], 1.0),
+    }
+}
+
+/// The idx stick's word for row `r`, checked into a token — both tiers' readbacks
+/// end here. A negative word is not a token id, and one at or past `vocab` is the
+/// sampler's sentinel (the all-NaN row's answer), never a token.
+fn token_of_idx_word(r: usize, w: i32, vocab: usize) -> ExecutorResult<u32> {
+    let t = u32::try_from(w).map_err(|_| {
+        werr(format!(
+            "the token draw for row {r} is {w} — not a token id"
+        ))
+    })?;
+    if t as usize >= vocab {
+        return Err(werr(format!(
+            "the token draw for row {r} is {t} >= vocab {vocab} — the sampler's sentinel, never \
+             a token"
+        )));
+    }
+    Ok(t)
 }
 
 /// ⭐⭐⭐ A PAD SLOT'S LAW IS LIVE 0'S OWN (the pad clamp, auditor ruling
@@ -1521,24 +1556,7 @@ fn sample_binds(
     // request's seed split low/high, its step salt, and the gate's 1. One word
     // per table, at each row's stick head. ⭐ NO ROW WORD (the P3 localization
     // ruling): the key is request-owned alone, identical in every row.
-    let word_of = |k: usize, r: usize| -> i32 {
-        let law = &laws[r];
-        match (k, law.draw) {
-            (0, Some(d)) => d.seed as u32 as i32,
-            (1, Some(d)) => (d.seed >> 32) as u32 as i32,
-            (2, Some(_)) => law.step as i32,
-            (3, Some(_)) => 1,
-            // A greedy row: zeros for the seed, the step and the gate.
-            (_, None) => 0,
-            // The quadruple is FOUR words (the seat's own `[u32; 4]`); a fifth
-            // staged word has no law anywhere — refuse rather than stage a
-            // word nobody defined.
-            (_, Some(_)) => panic!(
-                "seed word {k}: the seat's quadruple is four words, indexed 0..=3 — a \
-                 fifth is a mint/seat disagreement, never a staged guess"
-            ),
-        }
-    };
+    let word_of = |k: usize, r: usize| -> i32 { seat_words(&laws[r]).0[k] };
     // ⭐ THE SEAT STAGES THROUGH THE ONE COL LAW — `stage_col_stick_heads`,
     // the same fn the bake's ten UNIFORM tables spread through
     // (`LoadConst::card_bytes`), so the seat's words and the uniform tables
@@ -1593,7 +1611,7 @@ fn sample_binds(
     // words differ. The same col law and the same stride (an f32 word shares
     // the u32 stick geometry).
     let invt = scratchy_target_spyre::wiring::stage_col_stick_heads::<4>(rows, stride_bytes, |r| {
-        laws[r].draw.map_or(1.0, |d| d.inv_t).to_le_bytes()
+        seat_words(&laws[r]).1.to_le_bytes()
     });
     binds.push((
         scratchy_target_spyre::bundle_code::PlaceId::Act(seat.invt),
@@ -1678,19 +1696,7 @@ fn decode_idx_stick(bytes: &[u8], rows: usize, vocab: usize) -> ExecutorResult<V
     (0..rows)
         .map(|r| {
             let off = scratchy_subtile::sdsc_abstract::dev_off_stk(&[rows, 64], 1, &[r, 0], stk);
-            let w = words.get(off).copied().unwrap_or(-1);
-            let t = u32::try_from(w).map_err(|_| {
-                werr(format!(
-                    "the card's token draw for row {r} is {w} — not a token id"
-                ))
-            })?;
-            if t as usize >= vocab {
-                return Err(werr(format!(
-                    "the card's token draw for row {r} is {t} >= vocab {vocab} — the sampler's \
-                     sentinel, never a token"
-                )));
-            }
-            Ok(t)
+            token_of_idx_word(r, words.get(off).copied().unwrap_or(-1), vocab)
         })
         .collect()
 }
@@ -2609,10 +2615,15 @@ pub(crate) fn forward_chunk(
         // their seed: the LAST REAL token's decompose (the token this forward
         // feeds — the same value the card path's ChainSeed steps state, and
         // idempotent with the device's own ChainStage writes for the same
-        // reason: step t feeds the token step t-1 picked). The sticks carry u32
-        // lane values, so the seed rides this f32 list as BIT-PRESERVING WORDS
-        // (`f32::from_bits`) — the same carrying the reference legs use — and
-        // the gather's eval arm converts them back with `to_bits`.
+        // reason: step t feeds the token step t-1 picked). ⭐ THE WORDS RIDE AS
+        // THEIR VALUES, not their bits: the gather's eval arm reads them as
+        // numbers (`s_stick[..] as usize / k`, `l_stick[..] as usize`) and so do
+        // the emulator's doors, which write the same sticks numerically at the
+        // model dtype. The words the gather reads are f16-exact: the s stick's
+        // lane 0 is `k·s` (granite-3.1-2b: k = 4, s ≤ 768 — a multiple of 4
+        // below 4096) and the l stick's word 0 is `l < 64`. A `f32::from_bits`
+        // word is a denormal the f16 channel flushes to zero, which seeded every
+        // decode step with token 0's row.
         match b.phase {
             scratchy_target_spyre::forward_tape::ForwardPhase::Decode { chain } => {
                 // ⭐ THE SEEDS ARE PER-REQUEST-ROW AT THE FORWARD'S OWN WIDTH —
@@ -2634,12 +2645,12 @@ pub(crate) fn forward_chunk(
                     scratchy_subtile::subtile_ir::chain_l_seed(&toks32, chain.hidden, rows);
                 dynamic.push((
                     chain.s_src as u64,
-                    s_words.iter().map(|w| f32::from_bits(*w)).collect(),
+                    s_words.iter().map(|&w| w as f32).collect(),
                     vec![rows, lanes],
                 ));
                 dynamic.push((
                     chain.l_src as u64,
-                    l_words.iter().map(|w| f32::from_bits(*w)).collect(),
+                    l_words.iter().map(|&w| w as f32).collect(),
                     vec![rows * l_sticks, lanes],
                 ));
             }
@@ -2751,8 +2762,11 @@ pub(crate) fn forward_chunk(
         // one-row decode step had its outputs decoded at the prefill's `m`. The counts are the ones
         // the reads below already slice to — `vocab` of the result, `n * kv_width` of each layer's
         // new K/V (per LAYER: a hybrid arch's layers differ in width).
+        // A rung that draws re-points its result at the idx stick (`[rows, 64]`), so its result is
+        // read whole (`0`); a rung without the draw still hands back its logits row.
+        let result_elems = if b.sample_seat.is_some() { 0 } else { vocab };
         let wanted: std::collections::HashMap<u64, usize> =
-            std::iter::once((b.result_id as u64, vocab))
+            std::iter::once((b.result_id as u64, result_elems))
                 .chain(b.layers.iter().flat_map(|lw| {
                     [
                         (lw.new_k_id as u64, n * lw.kv_width),
@@ -2765,6 +2779,52 @@ pub(crate) fn forward_chunk(
             .iter()
             .map(|id| (*id as u64, wanted.get(&(*id as u64)).copied().unwrap_or(0)))
             .collect();
+        // ⭐ THE MINTED DRAW'S SEAT, STAGED FRESH EVERY STEP. The bake mints the token draw into
+        // this rung (`Wiring::sample_seat`), and its five operands go stale the moment a step
+        // completes — the step word IS the step's freshness, a held one is a held token. One law
+        // per seat row, by the card's own prompt law: row `r` runs this request's draw at
+        // `start + min(r, n - 1)`, a pad row clamped to the last real position (at decode `n = 1`
+        // and the one row sits at `start`). The words are `seat_words`' — the one statement of the
+        // law both tiers lay out — packed `[rows, 1]` at the views' own dtypes (i32 words, f32
+        // inv_t), the memref-faithful layout the bake's numeric gate stages them in; the f16
+        // channel `run_step` takes would encode them into half the bytes their views span.
+        if let Some(seat) = b.sample_seat {
+            let rows = seat.rows as usize;
+            let draw = req.draw;
+            let words: Vec<([i32; 4], f32)> = (0..rows)
+                .map(|r| {
+                    seat_words(&RowLaw {
+                        draw: draw.as_ref(),
+                        step: (start + r.min(n - 1)) as u32,
+                    })
+                })
+                .collect();
+            let mut typed: Vec<(usize, Vec<u8>, scratchy_tensors::DType, Vec<usize>)> = seat
+                .seed_words
+                .iter()
+                .enumerate()
+                .map(|(k, &tid)| {
+                    (
+                        tid as usize,
+                        words.iter().flat_map(|(w, _)| w[k].to_le_bytes()).collect(),
+                        scratchy_tensors::DType::I32,
+                        vec![rows, 1],
+                    )
+                })
+                .collect();
+            typed.push((
+                seat.invt as usize,
+                words
+                    .iter()
+                    .flat_map(|(_, inv_t)| inv_t.to_le_bytes())
+                    .collect(),
+                scratchy_tensors::DType::F32,
+                vec![rows, 1],
+            ));
+            session
+                .set_typed_sources(typed)
+                .map_err(|e| werr(format!("sampler seat: {e}")))?;
+        }
         let out = session
             .run_step(b.prog, dynamic, &outputs)
             .map_err(|e| werr(format!("run_step: {e}")))?;
@@ -2790,10 +2850,35 @@ pub(crate) fn forward_chunk(
         // prompt that fit ONE chunk looked correct. MEASURED: the result tensor comes back with
         // ~one row of `vocab` nonzeros and every argmax below `vocab`, i.e. in row 0.
         //
-        // ⭐ THE HOST PICK IS GONE, so this row is read by NOBODY: the emulator has
-        // no minted sampler (the mint is a decode-bundle card fact), so an emulated
-        // forward produces no token. The card is the only judge.
-        Ok(ChunkOut::Prompt)
+        // ⭐ THE PICK IS THE MINTED SAMPLER'S, READ BACK LIKE THE CARD'S. The bake mints the draw
+        // into this rung and re-points its result at the idx stick — one word per seat row at lane
+        // 0, every lane equal (the store is a whole stick per row) — so no host argmax runs: the
+        // emulator's readback is memref-faithful, row `r`'s lane 0 is element `r·width`, and each
+        // word passes the same token law the card's decode applies (`token_of_idx_word`). The
+        // caller consumes the LAST row's pick, the folded tail's: the last real token's forward.
+        match b.sample_seat {
+            Some(seat) => {
+                let idx = out.get(&(b.result_id as u64)).ok_or_else(|| {
+                    werr(format!(
+                        "the minted draw's idx stick t{} came back unread",
+                        b.result_id
+                    ))
+                })?;
+                let rows = seat.rows as usize;
+                let width = idx.len() / rows.max(1);
+                tracing::debug!(
+                    "EMU_PICK t{} rows={rows} width={width} words={:?} seat={:?}",
+                    b.result_id,
+                    &idx[..idx.len().min(8)],
+                    seat
+                );
+                let picks = (0..rows)
+                    .map(|r| token_of_idx_word(r, idx[r * width] as i32, seat.vocab as usize))
+                    .collect::<ExecutorResult<Vec<u32>>>()?;
+                Ok(ChunkOut::Tokens(picks))
+            }
+            None => Ok(ChunkOut::Prompt),
+        }
     }
 }
 
@@ -3002,6 +3087,40 @@ pub(crate) fn run_request_step(
     let mut pos = start;
     let mut prompt_pick: Option<u32> = None;
     for chunk in toks[..prefill_n].chunks(chunk_w) {
+        // ⛔ THE EMULATOR'S PREFILL RUNG HAS NO RESIDENT PREFIX — it is baked
+        // `ActiveCap::NONE`, so its attention sees the chunk's own keys and nothing
+        // before them. A chunk that starts past position 0 run through it would
+        // attend as if the prompt began at the chunk (MEASURED: a 70-token chat
+        // prompt in three m=31 chunks generated one token, 24 times). The bake
+        // gives the emulator no prefix-capable prefill rung, so every position
+        // past the first chunk walks the DECODE bundle one token at a time — the
+        // rung whose attention reads the host-threaded prefix under its length
+        // mask, the card's own sequential-prefill coherence baseline.
+        #[cfg(not(feature = "spyre-hw"))]
+        if pos > 0 && b.m_cap > 1 {
+            for one in chunk.chunks(1) {
+                let db = select_decode(&model.decode, pos + 1);
+                if let Some(ts) = forward_chunk(
+                    &sh,
+                    &mut model.session,
+                    db,
+                    model.batched_prefill.as_ref(),
+                    Chunk {
+                        state: req,
+                        id,
+                        tokens,
+                        start: pos,
+                        toks: one,
+                    },
+                )?
+                .minted_pick()
+                {
+                    prompt_pick = ts.last().copied();
+                }
+                pos += 1;
+            }
+            continue;
+        }
         if let Some(ts) = forward_chunk(
             &sh,
             &mut model.session,
