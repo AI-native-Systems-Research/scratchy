@@ -711,6 +711,11 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
         let grid = tg(n_seqs, c.num_kv_heads, splits as usize);
         batch.encode(&attention, &binds, &[], &[], &resident, grid, tg(hd, 1, 1));
         batch.barrier();
+        // The sink column joins in the combine alone, as the lowering bakes it: the sink const
+        // and the sinks at buffer 17 (the split's 16 is the partials).
+        if c.sinks.is_some() {
+            consts.push(ConstantValue::uint(21, 1));
+        }
         let combine = pso(
             "attention",
             format!(
@@ -724,6 +729,9 @@ fn run_case(c: &Case, restore: bool) -> Option<Outputs> {
             binds.push((&vb, 15));
         }
         binds.push((&partials, 16));
+        if c.sinks.is_some() {
+            binds.push((&sinks, 17));
+        }
         let grid = tg(n_seqs, c.num_q_heads, 1);
         // Head_dim 64's partials fill two simdgroups' lanes: the combine's
         // ATTN_COMBINE_GROUPS follows the head dim.
@@ -1382,8 +1390,7 @@ fn decode_gqa_mha_head_dim_64() {
     });
 }
 
-/// gpt-oss's geometry without its sinks — a sinks dispatch keeps the twin; this
-/// pins the K/V projection-bias restore on the split's two-simdgroup key groups
+/// gpt-oss's geometry without its sinks: the K/V projection-bias restore on the split's two-simdgroup key groups
 /// (each simdgroup's KBIAS_SLICE of 16 rotary pairs).
 #[test]
 fn decode_gqa_group_eight_biased_kv_head_dim_64() {
@@ -1459,6 +1466,79 @@ fn decode_gpt_oss_sinks_biased_rope_window() {
         window: 128,
         ..gpt_oss_biased_rope("decode gpt-oss sinks biased rope window")
     });
+}
+
+/// gpt-oss's full-attention layers on the split pair: the sink column joins in the combine, the
+/// splits storing the keys' partials alone. One, two and four rows — the short ones leave splits
+/// with no packed keys, a one-key row only its own — over one, two, four and sixteen splits (the
+/// production count at gpt-oss's KV cap: 16 splits over rows of fewer blocks leave most empty
+/// beside the sink), with and without the K/V biases.
+fn gpt_oss_split_cases(name: &'static str, sinks: f32) -> Vec<Case> {
+    let rows = [
+        vec![(1000, 1)],
+        vec![(1000, 1), (257, 1)],
+        vec![(1, 1), (66, 1), (130, 1), (514, 1)],
+    ];
+    let mut cases = vec![];
+    for base in [gpt_oss(name), gpt_oss_biased_rope(name)] {
+        for seqs in &rows {
+            for splits in [1, 2, 4, 16] {
+                cases.push(Case {
+                    seqs: seqs.clone(),
+                    gqa: Some(splits),
+                    sinks: Some(sinks),
+                    ..base.clone()
+                });
+            }
+        }
+    }
+    cases
+}
+
+#[test]
+fn decode_gqa_gpt_oss_sinks() {
+    for c in gpt_oss_split_cases("decode gqa gpt-oss sinks", 2.0) {
+        check(c);
+    }
+}
+
+/// Sinks far above every scaled score: the sink takes nearly the whole softmax, and the combine's
+/// V bias must shrink with the keys' share — a full vb here is the error the twin's merge cancels.
+#[test]
+fn decode_gqa_gpt_oss_dominant_sinks() {
+    for c in gpt_oss_split_cases("decode gqa gpt-oss dominant sinks", 12.0) {
+        check(c);
+    }
+}
+
+/// The split pair and the one-pass twin agree on a sinks decode: both within the dtype's rounding
+/// of the same output, at every head count the twin serves.
+#[test]
+fn decode_gqa_gpt_oss_sinks_matches_the_twin() {
+    for c in gpt_oss_split_cases("decode gqa gpt-oss sinks vs twin", 2.0) {
+        let Some(split) = run_case(&c, true) else {
+            return;
+        };
+        let peak = split.ideal.iter().fold(0f32, |m, x| m.max(x.abs()));
+        let tol = 2.0 * peak * c.dtype.ulp();
+        for twin in head_counts(&Case {
+            gqa: None,
+            ..c.clone()
+        }) {
+            let twin_out = run_case(&twin, true).expect("the device ran the split");
+            let err = (split.got.iter().zip(&twin_out.got))
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            eprintln!(
+                "{} ({} rows, {:?} splits vs {} heads/threadgroup): max diff {err:.2e} (tol {tol:.2e})",
+                c.name,
+                c.seqs.len(),
+                c.gqa,
+                twin.decode_heads
+            );
+            assert!(err <= tol, "{}: split vs twin {err} > {tol}", c.name);
+        }
+    }
 }
 
 /// Head dims 256 and 128: two key groups a threadgroup, and one. Qwen3.6's full attention is the

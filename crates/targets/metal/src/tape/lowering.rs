@@ -1337,7 +1337,9 @@ const fn combine_threads(hd: u32) -> u32 {
 /// threadgroups the rung's KV cap calls for (`ATTN_SPLITS`, [`ATTN_SPLIT_KEYS`] of the cap
 /// each, at most [`ATTN_MAX_SPLITS`]), each storing its heads' partials at the op scratch's
 /// front, `[rows, num_q_heads, splits, 2 + head_dim]` floats, and a combine merges them
-/// into the output. It records a row's bytes and the steps it runs on, as its gate — the
+/// into the output — a sinks layer's (gpt-oss) sink column with them, the combine binding the
+/// sinks and the splits storing the keys' partials alone. A causal layer's only: a sliding
+/// window keeps the twin. It records a row's bytes and the steps it runs on, as its gate — the
 /// command's, or else `row_gate`, the row's — admits them (`partials`,
 /// [`LoweredMetalTape::scratch_bytes`]): gated to decode steps, a row a sequence, the scratch
 /// holds the partials of the rows such a step brings, not of the bucket's every row; a
@@ -1367,16 +1369,7 @@ fn decode_attention_per_kv_head(
             .find(|k| k.index == 9)
             .is_none_or(|pair_off| pair_off.bits % (hd / 32) == 0)
     };
-    let takes = |c: &LoweredCommand| {
-        c.kernel == KernelId::AttentionViaCacheTq
-            // A sinks dispatch stays on its one-pass twin: the split pair
-            // (`attention_decode_gqa_tq` + combine) has no sink math, and the
-            // combine keeps only buffers 0/11/15 — the sink column would be
-            // silently dropped. This is what keeps gpt-oss (head_dim 64, GA 8,
-            // sinks) on the twin now that head_dim 64 takes the geometry below.
-            && !c.bindings.iter().any(|b| b.index() == 16)
-            && lane_stride(c)
-    };
+    let takes = |c: &LoweredCommand| c.kernel == KernelId::AttentionViaCacheTq && lane_stride(c);
     let group = p.num_q_heads / p.num_global_kv_heads.max(1);
     let keys = at.block_cap.saturating_mul(p.global_block_size);
     let splits = keys.div_ceil(ATTN_SPLIT_KEYS).clamp(1, ATTN_MAX_SPLITS);
@@ -1418,29 +1411,38 @@ fn decode_attention_per_kv_head(
         // Running its KV writer, one threadgroup past the splits writes and encodes the row.
         let writer = u32::from(constants.iter().any(|k| k.index == ATTN_FOLD.0));
         let (x, _, _) = command.dispatch.threadgroups;
+        // A sinks dispatch's sink column (the twin's buffer 16) joins in the combine, at its
+        // buffer 17, under the twin's sink const: the split's 16 is the partials, its splits
+        // storing the keys' alone, and it takes neither.
+        let (sinks, bindings): (Vec<_>, Vec<_>) = (command.bindings.iter())
+            .partition(|b| b.index() == super::kernel_bindings::DECODE_SINKS_SLOT);
+        let sinks_const = super::kernel_constants::AttentionViaCacheConstants::SINKS.0;
+        let split_constants: Vec<_> = (constants.iter())
+            .filter(|k| k.index != sinks_const)
+            .copied()
+            .collect();
         let attention = LoweredCommand {
             kernel: KernelId::AttentionDecodeGqaTq,
             function: symbol(
                 "attention_decode_gqa_tq_f16_specialized",
                 "attention_decode_gqa_tq_bf16_specialized",
             ),
-            constants: baked(constants.clone()),
+            constants: baked(split_constants),
             dispatch: DispatchShape {
                 threadgroups: (x, p.num_global_kv_heads, splits + writer),
                 threads_per_threadgroup: (hd, 1, 1),
                 ..command.dispatch
             },
-            bindings: baked(
-                (command.bindings.iter().copied())
-                    .chain([scratch])
-                    .collect(),
-            ),
+            bindings: baked(bindings.iter().copied().chain([scratch]).collect()),
             ..command
         };
         // The output, the rotation's signs and the V bias: the combine's buffers 0, 11 and 15.
-        let kept = (command.bindings.iter())
+        let kept = (bindings.iter())
             .filter(|b| matches!(b.index(), 0 | 11 | 15))
             .copied();
+        let sinks = sinks
+            .into_iter()
+            .map(|b| b.at(super::kernel_bindings::COMBINE_SINKS_SLOT));
         let combine = LoweredCommand {
             kernel: KernelId::AttentionDecodeCombine,
             library: "attention",
@@ -1454,7 +1456,7 @@ fn decode_attention_per_kv_head(
                 threads_per_threadgroup: (combine_threads(hd), 1, 1),
                 ..command.dispatch
             },
-            bindings: baked(kept.chain([scratch]).collect()),
+            bindings: baked(kept.chain([scratch]).chain(sinks).collect()),
             gemm_dims: None,
         };
         let gated = |command| GatedCommand { command, gate };
@@ -8566,9 +8568,6 @@ mod tests {
 
     /// `rows` as a step tape with the attention rows' site carrying gpt-oss's trailing sinks
     /// weight — what a sinks attention's rows look like once the codec carries the operand.
-    /// The split refuses a sinks dispatch (its combine would drop the column), so a sinks
-    /// geometry keeps the twin at head dims the split otherwise takes: the shape the twin's
-    /// own contracts pin at.
     fn sinks_tape(rows: Vec<StepRow>) -> MetalStepTape {
         let mut site = TEST_SITE.clone();
         site.push(RowSource {
@@ -8578,7 +8577,9 @@ mod tests {
         let mut tape = row_tape(rows);
         for (row, row_site) in tape.backbone.iter().zip(&mut tape.backbone_sources) {
             if let StepRow::Step(
-                MetalStep::AttentionViaCache(..) | MetalStep::AttnPackedKv(..),
+                MetalStep::AttentionViaCache(..)
+                | MetalStep::SlidingAttentionViaCache(..)
+                | MetalStep::AttnPackedKv(..),
                 _,
             ) = row
             {
@@ -8590,6 +8591,28 @@ mod tests {
 
     /// The source [`sinks_tape`] names as the attention rows' sink weight.
     const SINKS_IX: SourceIx = SourceIx(500);
+
+    /// gpt-oss's sliding layer, sinks on: a windowed decode keeps the one-pass twin — the split
+    /// pair serves full attention only — so the twin's own contracts pin here.
+    fn sliding_sinks_tape() -> MetalStepTape {
+        sliding_sinks_tape_of(LLAMA_KV)
+    }
+
+    /// [`sliding_sinks_tape`], its writer's K and V carrying `offsets`.
+    fn sliding_sinks_tape_of(offsets: scratchy_ir::KvOffsets) -> MetalStepTape {
+        sinks_tape(coded(
+            tq_writer(0, SW, offsets),
+            attention(MetalStep::SlidingAttentionViaCache, 0, Interleaved),
+        ))
+    }
+
+    /// [`tq_consts`] with [`SW`]'s window: what [`sliding_sinks_tape`] lowers under.
+    fn sliding_tq_consts() -> MetalModelConsts {
+        MetalModelConsts {
+            sliding_window: 1024,
+            ..tq_consts()
+        }
+    }
 
     /// A layer's KV writer whose K and V carry `offsets`.
     fn tq_writer(layer: u32, class: AttnMask, offsets: scratchy_ir::KvOffsets) -> MetalStep {
@@ -9541,9 +9564,9 @@ mod tests {
     ///
     /// Decode: no dequant pass; the plain attention runs only off TurboQuant and the split
     /// pair — the per-KV-head kernel and its combine, the packed store's bindings on the
-    /// first — only on TurboQuant KV. A sinks geometry (gpt-oss — the split refuses the sink
-    /// column) keeps the `AttentionViaCacheTq` twin instead: same geometry as the plain
-    /// command, plus the codebook width and the packed-store bindings.
+    /// first — only on TurboQuant KV. A sliding layer (gpt-oss's, sinks on) keeps the
+    /// `AttentionViaCacheTq` twin instead: same geometry as the plain command, plus the
+    /// codebook width and the packed-store bindings.
     #[test]
     fn decode_turboquant_reads_packed_store_without_dequant() {
         use crate::tape::lowered::RuntimeGate::{self, OnlyIfDecodeStep, UnlessDecodeStep};
@@ -9645,9 +9668,13 @@ mod tests {
             kept.chain([partials]).collect::<Vec<_>>()
         );
 
-        // The twin's own contract, at the sinks geometry that keeps it:
-        let tape = lower_subtile_tape_to_metal(&sinks_tape(rows), &p, bake_point(1, None))
-            .expect("lower_subtile_tape_to_metal");
+        // The twin's own contract, on the sliding layer that keeps it:
+        let tape = lower_subtile_tape_to_metal(
+            &sliding_sinks_tape(),
+            &sliding_tq_consts(),
+            bake_point(1, None),
+        )
+        .expect("lower_subtile_tape_to_metal");
         assert_eq!(
             steps(&tape),
             [
@@ -9713,14 +9740,14 @@ mod tests {
     fn decode_turboquant_twin_keeps_the_attention_sinks() {
         use crate::tape::ids::LayerId;
         use crate::tape::lowered::{Binding, WeightTensor};
-        // The attention rows' site, plus the attention's trailing sinks weight — what a
-        // gpt-oss attention's rows look like once the codec carries the operand.
-        let tape = sinks_tape(coded(
-            tq_writer(0, Causal, LLAMA_KV),
-            attention(MetalStep::AttentionViaCache, 0, Interleaved),
-        ));
-        let tape = lower_subtile_tape_to_metal(&tape, &tq_consts(), bake_point(1, None))
-            .expect("lower_subtile_tape_to_metal");
+        // gpt-oss's sliding layer: the attention rows' site, plus the attention's trailing
+        // sinks weight — what its rows look like once the codec carries the operand.
+        let tape = lower_subtile_tape_to_metal(
+            &sliding_sinks_tape(),
+            &sliding_tq_consts(),
+            bake_point(1, None),
+        )
+        .expect("lower_subtile_tape_to_metal");
         let find = |k| {
             tape.commands
                 .iter()
@@ -9752,29 +9779,106 @@ mod tests {
         assert!(tq.bindings.contains(&sink_binding));
     }
 
+    /// A full-attention sinks decode (gpt-oss's) takes the split pair, the sink column joining
+    /// in the combine: the combine carries the twin's sink const and binds the layer's sinks at
+    /// its slot 17, after the partials; the split takes neither — its slot 16 is the partials,
+    /// and without the const its `ATTN_SINKS` folds away, the same specialization every other
+    /// model's split runs. The successor of the twin's contract on this route: a decode that
+    /// drops the sink column is the bug that made gpt-oss echo.
+    #[test]
+    fn decode_turboquant_split_binds_the_sinks_on_the_combine() {
+        use crate::tape::ids::LayerId;
+        use crate::tape::kernel_bindings::COMBINE_SINKS_SLOT;
+        use crate::tape::lowered::RuntimeGate::{OnlyIfDecodeStep, UnlessDecodeStep};
+        use crate::tape::lowered::{Binding, WeightTensor};
+        let tape = sinks_tape(coded(
+            tq_writer(0, Causal, LLAMA_KV),
+            attention(MetalStep::AttentionViaCache, 0, Interleaved),
+        ));
+        let tape = lower_subtile_tape_to_metal(&tape, &tq_consts(), bake_point(1, None))
+            .expect("lower_subtile_tape_to_metal");
+        let steps: Vec<_> = (tape.commands.iter())
+            .map(|c| (c.command.kernel, c.gate))
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                (KernelId::RopeAppend, None),
+                (KernelId::AttentionViaCache, Some(UnlessDecodeStep)),
+                (KernelId::AttentionDecodeGqaTq, Some(OnlyIfDecodeStep)),
+                (KernelId::AttentionDecodeCombine, Some(OnlyIfDecodeStep)),
+            ]
+        );
+        let (fp16, split, combine) = (
+            &tape.commands[1].command,
+            &tape.commands[2].command,
+            &tape.commands[3].command,
+        );
+        let sinks = |binding_index| Binding::Source {
+            ix: SINKS_IX,
+            which: WeightTensor::Weight,
+            layer: LayerId(0),
+            binding_index,
+        };
+        // The plain command keeps its column: the const and the sinks at slot 16.
+        let sink_const = ConstantValue::uint(21, 1);
+        assert!(fp16.constants.contains(&sink_const));
+        assert!(fp16.bindings.contains(&sinks(16)));
+        // The split: no sink const, no sinks binding, its slot 16 the partials.
+        let partials = scratch_at(16, 0);
+        assert!(split.constants.iter().all(|k| k.index != 21));
+        assert!(
+            (split.bindings.iter()).all(|b| !matches!(b, Binding::Source { ix: SINKS_IX, .. }))
+        );
+        assert_eq!(
+            (split.bindings.iter())
+                .filter(|b| b.index() == 16)
+                .collect::<Vec<_>>(),
+            [&partials]
+        );
+        // The combine: the split's constants plus the sink const, and its whole binding list —
+        // the output and the rotation's signs, the partials, the sinks.
+        assert_eq!(
+            (combine.constants.iter())
+                .filter(|k| **k != sink_const)
+                .copied()
+                .collect::<Vec<_>>(),
+            *split.constants
+        );
+        assert_eq!(
+            (combine.constants.iter())
+                .filter(|k| k.index == 21)
+                .collect::<Vec<_>>(),
+            [&sink_const]
+        );
+        let kept: Vec<_> = (split.bindings.iter())
+            .filter(|b| matches!(b.index(), 0 | 11 | 15))
+            .copied()
+            .collect();
+        assert_eq!(kept.iter().map(|b| b.index()).collect::<Vec<_>>(), [0, 11]);
+        assert_eq!(
+            *combine.bindings,
+            [kept, vec![partials, sinks(COMBINE_SINKS_SLOT)]].concat()
+        );
+    }
+
     /// The TurboQuant decode twin's query heads per threadgroup turn on the
     /// device's GPU core count, which no baked class knows: every class's
     /// profile lowers it at one head, and the pool serves the device's count
     /// at load. The test geometry's GQA group of 8 (head_dim 64) fits 8 heads;
     /// the most that leave 4/5 of the cores a threadgroup is 4 on an 8-core
-    /// M1, 2 on a 16-core M1 Pro, and 1 on a 32-core M1 Max. The rows carry
-    /// gpt-oss's sinks weight: the split refuses a sinks dispatch, so head_dim
-    /// 64 keeps the twin — the shape the heads contract still serves.
+    /// M1, 2 on a 16-core M1 Pro, and 1 on a 32-core M1 Max. The rows are
+    /// gpt-oss's sliding layer, sinks on: the split serves full attention only,
+    /// so the window keeps the twin — the shape the heads contract still serves.
     #[test]
     fn decode_turboquant_heads_follow_the_device_not_the_baked_class() {
         use crate::tape::ids::{GpuCores, HeadDim, NumKvHeads, NumQHeads, TqDecodeHeads};
-        let p = tq_consts();
-        let rows = coded(
-            tq_writer(0, Causal, LLAMA_KV),
-            attention(MetalStep::AttentionViaCache, 0, Interleaved),
-        );
+        let p = sliding_tq_consts();
+        let tape = sliding_sinks_tape();
         let find = |profile, k| {
-            let tape = lower_subtile_tape_to_metal(
-                &sinks_tape(rows.clone()),
-                &p,
-                bake_point(/*bucket_m=*/ 1, Some(profile)),
-            )
-            .expect("lower_subtile_tape_to_metal");
+            let tape =
+                lower_subtile_tape_to_metal(&tape, &p, bake_point(/*bucket_m=*/ 1, Some(profile)))
+                    .expect("lower_subtile_tape_to_metal");
             tape.commands
                 .iter()
                 .find(|c| c.command.kernel == k)
@@ -11649,11 +11753,14 @@ mod tests {
         want.push((combine, vec![partials], vec![]));
         assert_eq!(offsets(LLAMA_KV, prefill, 64), want);
 
-        // The twin's restore survives where the twin does — a sinks geometry (gpt-oss,
-        // biased): the split refuses the sink column, so the twin keeps the biases.
+        // The twin's restore survives where the twin does — gpt-oss's sliding layer (biased,
+        // sinks on): the split serves full attention only, so the twin keeps the biases.
         let sinks = lower_subtile_tape_to_metal(
-            &sinks_tape(coded(tq_writer(0, Causal, qwen2), decode)),
-            &p,
+            &sliding_sinks_tape_of(qwen2),
+            &MetalModelConsts {
+                sliding_window: 1024,
+                ..p
+            },
             bake_point(1, None),
         )
         .expect("lower_subtile_tape_to_metal");
@@ -11661,7 +11768,7 @@ mod tests {
             .find(|c| c.command.kernel == KernelId::AttentionViaCacheTq)
             .expect("the twin")
             .command;
-        // The sink column (slot 16) rides along — it is what keeps this twin.
+        // The sink column (slot 16) rides along.
         assert_eq!(
             bound_from(&twin, 14),
             vec![

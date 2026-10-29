@@ -192,6 +192,12 @@ impl From<RopeOnceNaxBindingSet> for Vec<Binding> {
 /// 3 = BlockTable (runtime), 4 = KvCacheK\[layer\] (runtime),
 /// 5 = KvCacheV\[layer\] (runtime).
 ///
+/// The slot a decode attention binds gpt-oss's sinks at ([`AttentionViaCacheBindingSet::sinks`]).
+pub const DECODE_SINKS_SLOT: u8 = 16;
+
+/// The slot `attention_via_cache_v2_combine` binds them at: its 16 is the split's partials.
+pub const COMBINE_SINKS_SLOT: u8 = 17;
+
 /// Same `kv_layer` payload appears at slots 4 + 5 — the layer index
 /// is single-field on the BindingSet so they can't drift.
 pub struct AttentionViaCacheBindingSet {
@@ -246,7 +252,12 @@ impl From<AttentionViaCacheBindingSet> for Vec<Binding> {
             push_rope_on_read_bindings(&mut v, s.kv_layer, table, 6);
         }
         if let Some(sinks) = s.sinks {
-            v.push(source(sinks, WeightTensor::Weight, s.kv_layer, 16));
+            v.push(source(
+                sinks,
+                WeightTensor::Weight,
+                s.kv_layer,
+                DECODE_SINKS_SLOT,
+            ));
         }
         if s.query_rows == super::kernel_constants::QueryRows::PerToken {
             v.push(Binding::Runtime {
