@@ -408,6 +408,20 @@ pub struct BenchServeArgs {
     #[arg(long)]
     pub dataset_path: Option<String>,
 
+    /// Dataset workloads: time comparable answers. Each request is forced to its task's answer
+    /// length (`ignore_eos`): a RAG task's 64 tokens, a conversation turn's recorded reply, a
+    /// shared-prefix question's 32. Answers ending on their own are each engine's own length,
+    /// so their total time is not like for like. Accuracy is not scored: the answers are forced.
+    /// A span query (`rag-spans`) cannot be forced; its answers still end on their own.
+    #[arg(long)]
+    pub timed_answers: bool,
+
+    /// `sharegpt`: the most tokens a request asks for. A request asks for its conversation's
+    /// recorded reply length, which runs to 800 tokens and more; this caps it, keeping the
+    /// shorter ones as they are. None by default: the recorded lengths, as vLLM's suite sends.
+    #[arg(long)]
+    pub sharegpt_max_output_len: Option<usize>,
+
     /// Ignore EOS token (force generation to max output length).
     /// Defaults to true for random prompts, matching Python's behavior.
     #[arg(long, default_value_t = true)]
@@ -511,6 +525,11 @@ pub struct BenchServeArgs {
     #[arg(long)]
     pub save_answers: Option<String>,
 
+    /// `polyglot`: the Python an answer's tests run under, in `sandbox-exec`. Missing, the answers
+    /// are not run and the cell records no accuracy.
+    #[arg(long, default_value = "python3")]
+    pub coding_python: String,
+
     /// `shared-prefix`: tokens in each group's shared system prompt.
     #[arg(long, default_value_t = 2048)]
     pub shared_prefix_len: usize,
@@ -544,6 +563,8 @@ impl BenchServeArgs {
                 | ServeDataset::Longbench
                 | ServeDataset::SharegptMultiTurn
                 | ServeDataset::SharedPrefix
+                | ServeDataset::Polyglot
+                | ServeDataset::SweBench
         )
     }
 
@@ -578,6 +599,11 @@ pub enum ServeDataset {
     Random,
     /// The first human turn of each ShareGPT conversation (`--dataset-path`).
     Sharegpt,
+    /// Fixed-length prompts of natural text: `--input-len`-token slices of the ShareGPT file's
+    /// human turns (`--dataset-path`), at seeded offsets, each with `--output-len` answer tokens.
+    /// The fixed shape of `random`, with text that routes a mixture-of-experts model's experts
+    /// as real prompts do, where random token IDs do not.
+    Natural,
     /// Closed-loop chats sharing one system prompt, sent non-streaming to the
     /// chat endpoint: measures prefix reuse from one turn to the next.
     MultiTurn,
@@ -596,6 +622,12 @@ pub enum ServeDataset {
     /// Groups of short questions sharing one long system prompt (`--shared-prefix-len`); with
     /// `--no-reuse`, the control, every question has a prompt of its own of the same length.
     SharedPrefix,
+    /// The Python exercises of Aider's polyglot benchmark, as Aider sends them, each answer run
+    /// against the exercise's unit tests in a sandbox (`--coding-python`): pass@1.
+    Polyglot,
+    /// SWE-bench Lite's oracle prompts, an issue and the files its fix touches: prompts only,
+    /// unscored (needs the `datasets` feature).
+    SweBench,
 }
 
 /// Where `--dataset-name rag` takes its tasks from: the multi-document QA loaders.
@@ -1736,7 +1768,12 @@ mod tests {
         assert_eq!(a.rag_source, RagSource::Musique);
         assert_eq!(a.longbench_length, "short");
         assert!(!parse("sharegpt").unwrap().is_task_dataset());
-        for name in ["sharegpt-multi-turn", "shared-prefix"] {
+        for name in [
+            "sharegpt-multi-turn",
+            "shared-prefix",
+            "polyglot",
+            "swe-bench",
+        ] {
             let a = parse(name).unwrap();
             assert!(a.is_task_dataset(), "{name}");
             assert_eq!(a.endpoint(), "/v1/chat/completions", "{name}");
