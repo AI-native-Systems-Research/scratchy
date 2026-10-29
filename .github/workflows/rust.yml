@@ -398,12 +398,22 @@ jobs:
         run: cargo test -p ktir-optimizer
 
       # The Metal matrix's energy sampler on this runner's macOS: its unit
-      # tests, then three real samples, which exit non-zero if any rail has no
-      # live energy channel here.
+      # tests (each reader's channels to joules), then a real run. A VM's
+      # IOReport has no energy channels, so there it must fail with that error
+      # rather than write zeros; on a real Mac it must sample.
       - name: Power sampler
         run: |
           cargo test -p scratchy-power-sampler
-          cargo run --release -p scratchy-power-sampler -- --samples 3
+          cargo build --release -p scratchy-power-sampler
+          if [ "$(sysctl -n kern.hv_vmm_present)" = 1 ]; then
+            if out=$(target/release/scratchy-power-sampler --samples 3 2>&1); then
+              echo "$out"; echo "sampled in a VM, which has no energy channels"; exit 1
+            fi
+            echo "$out"
+            grep -q "no energy channels" <<<"$out"
+          else
+            target/release/scratchy-power-sampler --samples 3
+          fi
 
       # Variant-selection gates (#202). These decide WHICH compiled model
       # variant claims a checkpoint, and both halves fail OPEN — a broken

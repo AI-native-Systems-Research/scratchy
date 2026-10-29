@@ -694,6 +694,7 @@ fn sample_csv(
         clpc_wanted.len()
     );
     if selected_n == 0 {
+        eprintln!("error: no energy channels on this machine (a virtual machine exposes none)");
         std::process::exit(1);
     }
 
@@ -755,26 +756,28 @@ fn sample_csv(
                 .trim()
                 .to_string();
             let v = unsafe { ffi::IOReportSimpleGetIntegerValue(ch, 0) } as f64;
-            if group == "CLPC" {
-                // Our synthesized counters: the channel name is the rail.
-                let idx = match name.as_str() {
-                    "cpu" => 0,
-                    "gpu" => 1,
-                    "ane" => 2,
-                    _ => continue,
-                };
-                saw[idx] = true;
-                clpc[idx] += v / 1e9;
-            } else if group == ENERGY_MODEL {
-                let Some(idx) = ENERGY_MODEL_RAILS.iter().position(|&r| r == name) else {
-                    continue;
-                };
-                let Some(per_joule) = joules_per_unit(&unit) else {
-                    eprintln!("error: {ENERGY_MODEL}/{name} is in {unit:?}, not mJ, uJ or nJ");
+            match read_channel(&group, &name, &unit, v) {
+                Ok(Some(Reading {
+                    clpc: true,
+                    rail,
+                    joules,
+                })) => {
+                    saw[rail] = true;
+                    clpc[rail] += joules;
+                }
+                Ok(Some(Reading {
+                    clpc: false,
+                    rail,
+                    joules,
+                })) => {
+                    saw_global[rail] = true;
+                    global[rail] += joules;
+                }
+                Ok(None) => {}
+                Err(why) => {
+                    eprintln!("error: {why}");
                     std::process::exit(1);
-                };
-                saw_global[idx] = true;
-                global[idx] += v * per_joule;
+                }
             }
         }
         // Where the CLPC counters are live they are the number; global
@@ -812,13 +815,50 @@ fn sample_csv(
     }
 }
 
-/// The IOReport group every release before 27 reads energy from, by name.
-#[cfg(target_os = "macos")]
+/// The IOReport group every release but 27 reads energy from, by name.
+#[cfg(any(target_os = "macos", test))]
 const ENERGY_MODEL: &str = "Energy Model";
 
-/// Its channels for cpu, gpu and ane, in that order.
-#[cfg(target_os = "macos")]
+/// Its channels for cpu, gpu and ane, in that order. Exact names only: the
+/// group's per-core and per-cluster channels would count the same energy twice.
+#[cfg(any(target_os = "macos", test))]
 const ENERGY_MODEL_RAILS: [&str; 3] = ["CPU Energy", "GPU Energy", "ANE"];
+
+/// One channel's energy over an interval: which rail (0 cpu, 1 gpu, 2 ane),
+/// in joules, and whether it came from the CLPC counters.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, PartialEq)]
+struct Reading {
+    clpc: bool,
+    rail: usize,
+    joules: f64,
+}
+
+/// What one sampled channel contributes: a rail's joules, nothing (a channel
+/// that is not a rail), or an error (a rail in a unit this cannot convert).
+/// CLPC channels are the synthesized ones, named by rail, in nJ.
+#[cfg(any(target_os = "macos", test))]
+fn read_channel(
+    group: &str,
+    name: &str,
+    unit: &str,
+    value: f64,
+) -> Result<Option<Reading>, String> {
+    let (clpc, rail) = match group {
+        "CLPC" => (true, ["cpu", "gpu", "ane"].iter().position(|&r| r == name)),
+        ENERGY_MODEL => (false, ENERGY_MODEL_RAILS.iter().position(|&r| r == name)),
+        _ => return Ok(None),
+    };
+    let Some(rail) = rail else { return Ok(None) };
+    let unit = if clpc { "nJ" } else { unit };
+    let per = joules_per_unit(unit)
+        .ok_or_else(|| format!("{group}/{name} is in {unit:?}, not mJ, uJ or nJ"))?;
+    Ok(Some(Reading {
+        clpc,
+        rail,
+        joules: value * per,
+    }))
+}
 
 /// Joules per count of an IOReport energy unit label.
 #[cfg(any(target_os = "macos", test))]
@@ -841,6 +881,53 @@ mod tests {
         assert_eq!(joules_per_unit("uJ"), Some(1e-6));
         assert_eq!(joules_per_unit("nJ"), Some(1e-9));
         assert_eq!(joules_per_unit("mW"), None);
+    }
+
+    #[test]
+    fn energy_model_rails_read_by_exact_name_in_their_own_units() {
+        let r = |n: &str, u: &str, v: f64| read_channel("Energy Model", n, u, v);
+        assert_eq!(
+            r("CPU Energy", "mJ", 2500.0),
+            Ok(Some(Reading {
+                clpc: false,
+                rail: 0,
+                joules: 2.5
+            }))
+        );
+        assert_eq!(
+            r("GPU Energy", "nJ", 3e9),
+            Ok(Some(Reading {
+                clpc: false,
+                rail: 1,
+                joules: 3.0
+            }))
+        );
+        assert_eq!(
+            r("ANE", "mJ", 1000.0),
+            Ok(Some(Reading {
+                clpc: false,
+                rail: 2,
+                joules: 1.0
+            }))
+        );
+        // Per-core, per-cluster and other channels are not rails: no double counting.
+        assert_eq!(r("ECPU0", "mJ", 5.0), Ok(None));
+        assert_eq!(r("GPU", "mJ", 5.0), Ok(None));
+        assert_eq!(r("DRAM", "mJ", 5.0), Ok(None));
+        assert!(r("CPU Energy", "mW", 5.0).is_err());
+    }
+
+    #[test]
+    fn clpc_counters_are_nanojoules_named_by_rail() {
+        assert_eq!(
+            read_channel("CLPC", "gpu", "", 2e9),
+            Ok(Some(Reading {
+                clpc: true,
+                rail: 1,
+                joules: 2.0
+            }))
+        );
+        assert_eq!(read_channel("CPU Stats", "cpu", "nJ", 1.0), Ok(None));
     }
 
     #[cfg(target_os = "macos")]
