@@ -1,0 +1,12 @@
+[package]
+name = "scratchy-power-sampler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Whole-run power sampling for the Metal bench matrix, via Apple's IOReport"
+
+# Zero dependencies on purpose: hand-declared FFI over CoreFoundation and
+# IOReport, so a cold worktree builds this in seconds and nothing third-party
+# sits between the bench and the numbers.
+
+[dependencies]

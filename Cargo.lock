@@ -3658,6 +3658,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "scratchy-power-sampler"
+version = "0.1.0"
+
+[[package]]
 name = "scratchy-quantizations"
 version = "0.1.0"
 dependencies = [

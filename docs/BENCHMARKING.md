@@ -128,6 +128,19 @@ nothing is self-reported.
   already pushed the mark to ~270 MiB.
 - **`evicted`** — KiB that left the page cache when a FROZEN repetition's
   eviction ran, from `/proc/meminfo` `Cached` sampled either side of it.
+- **`power`** — whole-run energy, from the workspace's own
+  [`scratchy-power-sampler`](../crates/benches/power-sampler) binary: Apple's
+  IOReport energy counters (no root, no third-party tool),
+  sampled at 1 Hz from before the first build to after the last server is
+  down, so the number covers everything the run cost — the same window for
+  every engine. Reported per rail (`cpu_j`, `gpu_j`, `ane_j`) and as their
+  sum (`soc_j`, `soc_wh`, `soc_avg_w`, `soc_peak_w`): CPU + GPU + ANE, the
+  rails every reader has. DRAM and display are not in it. On macOS 27 it reads
+  the CLPC counters (cumulative nJ, per-chip-driver ids), because there the
+  "Energy Model" group's `CPU Energy` channel reads 0 under load; on every
+  other release it reads the "Energy Model" group's `CPU Energy`, `GPU Energy`
+  and `ANE` channels by name. A rail with no live channel stops the sampler,
+  and the run, instead of reporting zeros.
 
 ### Proving the eviction happened
 
