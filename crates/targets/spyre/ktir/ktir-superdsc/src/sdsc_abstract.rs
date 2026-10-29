@@ -473,7 +473,7 @@ impl<const NQH: u32, const NKVH: u32, const HD: u32> AttnGeometry<NQH, NKVH, HD>
 /// [`with_baked_rung`]. The method is generic over `MQ` because that is the whole point of the
 /// door: the arm's body receives the width AS A CONST, with the [`Rung`] witness that proves the
 /// ladder bakes it, so everything it derives is the compiler's arithmetic.
-pub(crate) trait OnBakedRung {
+pub trait OnBakedRung {
     /// What the dispatch produces.
     type Out;
     /// The arm's body, at the width the ladder named.
@@ -489,7 +489,7 @@ pub(crate) trait OnBakedRung {
 ///
 /// Every dispatch routes through THIS listing ([`PaddedMq::of_bundle`]'s decode arm,
 /// [`attn_bundle_rows`]'s), so two doors cannot drift about what the ladder is.
-pub(crate) fn with_baked_rung<C: OnBakedRung>(mq: u32, consumer: C) -> Option<C::Out> {
+pub fn with_baked_rung<C: OnBakedRung>(mq: u32, consumer: C) -> Option<C::Out> {
     macro_rules! decode_ladder {
         ($($w:literal),+ $(,)?) => {{
             const LISTED: &[u32] = &[$($w),+];
@@ -3356,6 +3356,25 @@ impl BatchSlot {
 // worker, which is the guard shape this project forbids. What replaced IT is better still — the precondition
 // it witnessed no longer exists to be violated.
 
+/// ⛔ WHETHER THE FOLD ACTUALLY SWEEPS EVERY SLOT A REQUEST HOLDS.
+///
+/// The prefix fold attends `swept_per_pass * passes` slots — `active_cap` columns per pass, once per
+/// pass. A request's keys reach as far as its history's end, and with a SHARED write slot that end is
+/// the batch's maximum, not this request's own length. Nothing tied those two numbers together.
+///
+/// The failure mode is the one that looks like a broken kernel: a request whose middle history falls
+/// outside the swept window attends its prompt and the current token and NOTHING BETWEEN, so its
+/// distribution collapses and it repeats a single token. Indistinguishable, from the output, from a
+/// mis-addressed matmul — which is why it is worth stating rather than assuming.
+///
+/// Returns the first slot that would go unattended, or `None` when the sweep covers everything. Data
+/// dependent (it moves with the write slot), so it is checked where the launch is built rather than at
+/// emit — but checked, and named, instead of hoped for.
+pub fn first_unswept_slot(end: KvSlot, swept_per_pass: SlotCount, passes: u32) -> Option<KvSlot> {
+    let covered = (swept_per_pass.get() as u64) * (passes as u64);
+    (u64::from(end.get()) > covered).then(|| KvSlot::new(covered.min(u32::MAX as u64) as u32))
+}
+
 /// THE ROW A `(head, request)` PAIR OWNS in every batched-over-heads buffer — `qs`, `sc`, the whole
 /// online-softmax state, and the prefix mask.
 ///
@@ -3427,6 +3446,25 @@ impl RungWidth {
     /// The row count as a host-side extent — the arithmetic exit for buffer sizing and loops.
     pub const fn count(self) -> usize {
         self.0.get() as usize
+    }
+}
+
+/// REQUESTS ACTUALLY LIVE THIS STEP — what the scheduler admitted, BEFORE padding to a rung.
+///
+/// Distinct from [`RungWidth`]: a 3-live step runs the 4-row rung, so the two differ on the very
+/// step where confusing them matters, and agree (`bs == rung`) on every full step where a test
+/// would look. A launch is sized, masked and folded by the RUNG width; only rung selection, the
+/// padding diagnostics and the per-request readback are about the live count.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct LiveRows(usize);
+
+impl LiveRows {
+    /// The number of requests the scheduler put into this step.
+    pub const fn of_scheduled(n: usize) -> LiveRows {
+        LiveRows(n)
+    }
+    pub const fn get(self) -> usize {
+        self.0
     }
 }
 
@@ -3743,6 +3781,32 @@ impl BakedMaskBlocks {
 pub struct FoldPages(NonZeroU32);
 
 impl FoldPages {
+    /// THE ONLY CONSTRUCTOR, and it takes the batch's SHARED WRITE SLOT.
+    ///
+    /// ⛔ NOT any one request's page list, and not any request's length. A batch appends every row at
+    /// the maximum over live histories, so a page count derived from a REQUEST is short for every row
+    /// but the deepest — and the row it is short for is the deepest one, whose history then falls
+    /// outside the covered window and whose distribution collapses onto a single repeated token.
+    ///
+    /// `slot` is the index appended AT, so the covered range must include it: `slot + 1` slots, hence
+    /// the `+ 1` before the ceiling. Off by one here and the deepest row loses its newest token.
+    /// ⭐ THE PAGES OF **RESIDENT PREFIX** BEFORE `slot` — `ceil(slot / per_page)`, EXCLUSIVE of the page
+    /// `slot` itself lands in, which is the launch body's to handle rather than a fold pass's.
+    ///
+    /// This is the count a decode step's mask staging must use, and [`Self::covering`] is NOT it:
+    /// `covering` includes `slot`'s own page, so at every exact page multiple the host staged one block
+    /// more than the fold walks and the launch was REFUSED
+    /// (`the launch walks 8 page(s) but the host STAGED the mask for 9`, granite-3.1-8b at `start=2048`,
+    /// batched path only). Which of the two is the truth is not decidable from the arithmetic — it was
+    /// settled by measurement: making the LAUNCH inclusive instead regressed the ragged gate 3/6 → 1/6.
+    pub fn resident_before(slot: BatchSlot, per_page: SlotCount) -> Option<FoldPages> {
+        let per = per_page.get();
+        if per == 0 {
+            return None;
+        }
+        NonZeroU32::new((slot.get() as u64).div_ceil(per as u64) as u32).map(FoldPages)
+    }
+
     /// The pages spanned by `0..=slot`, INCLUDING `slot`'s own page. ⛔ For a decode step's mask
     /// staging you almost certainly want [`Self::resident_before`] — see its note.
     pub fn covering(slot: BatchSlot, per_page: SlotCount) -> Option<FoldPages> {
@@ -5512,6 +5576,97 @@ pub fn gather_index_table(
     Some(out)
 }
 
+/// ⭐⭐⭐⭐⭐ THE PAGE-GRANULAR INDEX TABLE — one entry per `(fold pass, request)`, and **the kv-head and
+/// window loops are gone**, which is the entire difference from [`gather_index_table`].
+///
+/// That function walks `pages × mq × nkvh × windows` and composes `phys * per_page + block_in_page(kvh,
+/// b)`. This one walks `pages × mq` and composes `phys * planes_per_page`. The removed loops are exactly
+/// the ones that made the entry count `nkvh * windows * mq` — 64/128/256 at width 8 against dxp's ONE
+/// 32-word IBR stick, which is the measured rung-8 corruption — and the removed term is the one that had
+/// to agree with the emitter's own window numbering.
+///
+/// ⛔ THE PASS PITCH IS STILL THE PREFIX MASK'S BLOCK STRIDE, and still forced rather than chosen: the
+/// index is a `SegRole::Activation` (== `SEG_MASK`), so it rides the MASK's per-pass segment shift, and one
+/// shift cannot have two pitches. A pitch that disagrees puts pass `p`'s gather on another pass's entries
+/// with a clean bake.
+///
+/// ⛔ AND `None` RATHER THAN A CLAMPED ANSWER on every shape it cannot express — a row with no pages, more
+/// rows than the pass pitch holds, fewer block tables than the batch, an entry that leaves `i32`. Every one
+/// of those would otherwise become entry 0, which is page 0's first plane: a REAL address, so the failure
+/// would be fluent wrong output rather than a fault.
+pub fn page_gather_index_table(
+    scratch: PageScratch,
+    // `block_tables[row][logical_page] = physical page`, exactly as the session holds it.
+    block_tables: &[Vec<i64>],
+    // Fold passes this step walks — the PAGES, since a gathered fold's pass IS a page.
+    pages: usize,
+    // [`gather_entries_per_page`], off the same session `fold_plan::page_base_bytes` reads.
+    planes: EntriesPerPage,
+    // The MASK's own per-pass shift ([`PrefixMaskShape::pass_stride`]).
+    pass_stride: PassStride,
+) -> Option<Vec<GatherEntry>> {
+    let rows = scratch.rows() as usize;
+    let stride = pass_stride.get();
+    let per_row = scratch.entries_per_row() as usize;
+    // ⭐ THE SAME CUT THE EMITTER'S OPS TAKE, from the same two ceilings — `PageScratch::entries_per_op`.
+    // Read off the scratch rather than recomputed, because "how many entries an op reads" and "how many
+    // entries the host writes into that op's stick" are the one number this table exists to keep single.
+    let (cut, ops) = (
+        scratch.entries_per_op() as usize,
+        scratch.ops_per_row() as usize,
+    );
+    if block_tables.is_empty()
+        || pages == 0
+        || planes.get() <= 0
+        || rows == 0
+        || per_row == 0
+        || cut == 0
+        // ⛔ THE PASS BLOCK MUST HOLD THE STICK-STRIDED ENTRIES, NOT THE RAW ROW COUNT. Each copy OP has
+        // its own index stick (see the loop below), so a pass spans `mq * ops_per_row * ENTRIES_PER_OP`
+        // words — 32× the row count at one op per request. Checking `rows` alone would admit a pitch that
+        // puts request 1's stick inside pass 0's block and silently gather another pass's page.
+        || scratch.index_sticks() as usize * CopyDims::ENTRIES_PER_OP as usize > stride
+        || block_tables.len() < scratch.mq() as usize
+    {
+        return None;
+    }
+    // ⛔ THE PAD IS PAGE 0's FIRST PLANE AND THAT IS A REAL ADDRESS — stated, because it is what any entry
+    // this loop does not reach would gather. Sound only because the copy reads `rows` of them and the mask
+    // invalidates the rest; NOT a safe default for a missing row, which is why the checks above refuse.
+    let pad = GatherEntry::of_page_block(planes, 0, 0)?;
+    let mut out = vec![pad; pages * stride];
+    for p in 0..pages {
+        for r in 0..scratch.mq() {
+            let table = block_tables.get(r as usize)?;
+            // ⛔ A SHORT ROW REPEATS **ITS OWN** LAST PAGE, AND AN EMPTY ONE REFUSES. The launch sweeps
+            // `pages` for every row, so a row holding fewer has no address of its own for the tail — and
+            // the filler must be its OWN last page, not 0: a fully-masked column reading this row's own
+            // keys is inert, while page 0 is a DIFFERENT row's keys and an unstaged mask byte reads VALID.
+            let last = *table.last()?;
+            let phys = *table.get(p).unwrap_or(&last);
+            // ⭐⭐⭐ ONE INDEX STICK PER COPY **OP**, ITS OWN `cut` ENTRIES FROM COLUMN 0 — the vendor's
+            // own `[num_blocks, INT32_ELEMS_PER_STICK]` layout, and it is FORCED rather than copied.
+            // `GatherCopy::index_base` must be a whole number of index sticks because dxp loads the IBR
+            // one stick at a time, so op `j` of request `r` has to start at stick `r*ops + j`, column 0;
+            // the words past its run in that stick are pad the op never reads.
+            //
+            // ⛔ AND ENTRY `i` IS THE `i`-th STICK BLOCK OF THE PLANE, IN PLANE ORDER — not a kv head
+            // and not a window. The destination row is the plane itself and the copy fills it linearly,
+            // so `i` is at once the source block and the destination sub-run; re-deriving it from
+            // `(kvh, window)` is what let the emitter's block numbering and the host's disagree.
+            for j in 0..ops {
+                let base = p * stride + (r as usize * ops + j) * CopyDims::ENTRIES_PER_OP as usize;
+                let first = j * cut;
+                for i in 0..(per_row - first).min(cut) {
+                    *out.get_mut(base + i)? =
+                        GatherEntry::of_page_block(planes, phys, u32::try_from(first + i).ok()?)?;
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
 /// ⭐⭐⭐⭐⭐ THE GATHER'S CONTIGUOUS DESTINATION, AS ONE LAW — its row count, its row width, WHICH
 /// (kv head, slot window, request) each row holds, the index entry that fills it, and the `y` step the
 /// score/value matmuls take across it.
@@ -6288,7 +6443,7 @@ impl ChunkScratch {
     /// The most pages one chunk may hold — the top of [`Self::LADDER`]. 64 pages of 256 slots is 16384
     /// tokens, so one launch attends every context the shipped `--max-model-len` serves; the reference
     /// reaches the same depth with a chunk of 32 smaller pages walked over several in-program trips.
-    pub(crate) const PAGES_MAX: u32 = 64;
+    pub const PAGES_MAX: u32 = 64;
 
     /// ⭐ THE ONE-REQUEST DECODE LADDER — one baked body per chunk width, in pages, ascending. The
     /// runtime picks the smallest rung covering the live context (`select_body`'s own law over each
@@ -6647,6 +6802,19 @@ impl ChunkKeysLx {
     /// Kᵗ's core-local tensors, one per (part, kv head).
     pub(crate) const fn tensors(self) -> u32 {
         self.parts() * self.lx.chunk.nkvh()
+    }
+
+    /// ⭐ Kᵗ's RUN ORDER — `(kv head, page, block)` for entry `e`. Stick `p * nkvh + h` is kv head `h`'s
+    /// part `p`, and its word `c` is page `p * part_pages + c / eph`, block `c % eph`: slot stick `c` of
+    /// the part, the stick the part's score hands core `c`.
+    pub const fn entry_coord(self, e: u32) -> (u32, u32, u32) {
+        let (stick, eph) = (
+            CopyDims::ENTRIES_PER_OP,
+            self.lx.chunk.entries_per_head_page(),
+        );
+        let (op, c) = (e / stick, e % stick);
+        let (part, kvh) = (op / self.lx.chunk.nkvh(), op % self.lx.chunk.nkvh());
+        (kvh, part * self.part_pages() + c / eph, c % eph)
     }
 }
 
@@ -7094,6 +7262,63 @@ impl ChunkCorner {
     }
 }
 
+/// ⭐⭐⭐⭐⭐ THE CHUNK GATHER'S INDEX TABLE — the flat entry space in [`ChunkScratch::copies`]' order: word
+/// `e` names entry `e`'s `(kv head, page, block)` source, so stick `j` is exactly copy op `j`'s run.
+///
+/// `pages` is the request's own physical page list in LOGICAL order (the map the launch installed). A
+/// chunk wider than the list repeats the LAST real page for its tail — never page 0, which is another
+/// request's keys; the mask silences the repeat (the reference's `_pad_num_blocks` law).
+///
+/// ⭐ ABOVE ONE FEATURE SLAB THE TABLE IS TWO RUNS: K's entries, then V's in V's own slab-major order
+/// ([`ChunkScratch::value_entry_coord`]), starting at [`ChunkScratch::value_index_base`] — the stick the
+/// V copies read from. At one slab the orders agree and V reads K's run.
+///
+/// ⭐ AND WHERE THE GATHER STAYS IN LX ([`ChunkScratch::lx_form`] at these `rows`), V's run is
+/// part-major, in [`ChunkLx::entry_coord`]'s order, from [`ChunkLx::index_base`]. Before it sits Kᵗ's
+/// own run: part-major ([`ChunkKeysLx::entry_coord`]) where Kᵗ stays in LX, head-major where it does
+/// not. At one slab with Kᵗ in LX the two orders agree and the table is ONE run for both legs. The
+/// copies read the same orders. The bake and this table take the form from the same `(chunk, rows)`
+/// AND the same pin budget (`op_local_bytes` + `prob_pin_bytes` — the bake from the layout, the host
+/// from the baked artifact), so neither can pick another.
+///
+/// `None` on an empty page list or an entry that leaves `i32`.
+pub fn chunk_gather_index_table(
+    scratch: ChunkScratch,
+    rows: ChunkRowKind,
+    pages: &[i64],
+    per_page: EntriesPerPage,
+    op_local_bytes: u64,
+    prob_pin_bytes: u64,
+) -> Option<Vec<GatherEntry>> {
+    let last = *pages.last()?;
+    let entry = |(kvh, page, q): (u32, u32, u32)| {
+        let phys = *pages.get(page as usize).unwrap_or(&last);
+        GatherEntry::of_page_block(per_page, phys, scratch.source_block(kvh, q)?)
+    };
+    if let Some(lx) = scratch.lx_form(rows, op_local_bytes, prob_pin_bytes) {
+        let values = (0..scratch.entries()).map(|e| entry(lx.entry_coord(e)));
+        if lx.index_base() == 0 {
+            return values.collect();
+        }
+        // Kᵗ's own run first: part-major in LX, head-major in HBM. Then V's LX run.
+        let keys = lx.keys();
+        return (0..scratch.entries())
+            .map(|e| {
+                entry(match keys {
+                    Some(k) => k.entry_coord(e),
+                    None => scratch.entry_coord(e),
+                })
+            })
+            .chain(values)
+            .collect();
+    }
+    let keys = (0..scratch.entries()).map(|e| entry(scratch.entry_coord(e)));
+    let values = (0..scratch.entries())
+        .filter(|_| scratch.value_index_base() > 0)
+        .map(|e| entry(scratch.value_entry_coord(e)));
+    keys.chain(values).collect()
+}
+
 /// ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK OVER A DECODE BATCH — one [`ChunkScratch`] holding EVERY request's pages
 /// end to end, and the per-row mask that keeps each request on its own keys.
 ///
@@ -7221,6 +7446,26 @@ impl BatchChunk {
         let (r, c) = (row as usize, slot as usize);
         Some((c / stick) * (rows * stick) + r * stick + c % stick)
     }
+
+    /// ⭐ THE CHUNK's PAGE LIST — every request's own map in LOGICAL order, laid end to end at
+    /// `J` pages each: a map shorter than `J` repeats ITS OWN last page (never another request's, and the
+    /// mask silences the repeat), a map longer than `J` is a body the selector should not have chosen
+    /// and is refused. `maps` is one map per request row, padding rows included, in row order.
+    pub(crate) fn page_list(self, maps: &[Vec<i64>]) -> Option<Vec<i64>> {
+        if maps.len() != self.requests as usize {
+            return None;
+        }
+        let j = self.pages_per_request() as usize;
+        let mut pages = Vec::with_capacity(self.chunk.pages() as usize);
+        for m in maps {
+            let last = *m.last()?;
+            if m.len() > j {
+                return None;
+            }
+            pages.extend((0..j).map(|p| m.get(p).copied().unwrap_or(last)));
+        }
+        Some(pages)
+    }
 }
 
 impl ChunkScratch {
@@ -7235,6 +7480,35 @@ impl ChunkScratch {
         }
         Self::of_chunk(pool, (swept / per) * requests)
     }
+}
+
+/// ⭐⭐⭐ WHAT A DECODE BATCH's PREFIX MASK IS LAID OUT FOR — decided by the BODY the step runs, so it is
+/// one value carrying that body's own geometry: the gathered per-page fold's declared pass grid, or the
+/// batch chunk's law. Staging one form for the other body is silent (an additive byte the body reads
+/// from the other layout is a validity it was never given), so the host cannot hold the geometry of
+/// one and stage the other.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BatchPrefix {
+    /// One block per declared fold pass — [`decode_batch_prefix_mask_f16`].
+    Fold(DeclaredFold),
+    /// One row block every row block reads — [`batch_chunk_mask_f16`].
+    Chunk(BatchChunk),
+    /// ⭐⭐⭐⭐⭐ THE ONE-REQUEST SEAT'S OWN FORM — ONE BROADCAST ROW over the bake's reserve, staged
+    /// by the same law the deleted solo loop staged (an f32 row the bind narrows, validity the
+    /// request's own [`KvHistory`]). The owner session's bodies are ONE-REQUEST bodies: the door
+    /// rules they may take the per-page gather only as a CHUNK "whose read IS the broadcast row"
+    /// (`ktir_superdsc_door`'s `gathers_kv` law), and a body that does not gather reads the row
+    /// broadcast too — so EVERY body of that seat reads this form, fused rung or chunk rung.
+    ///
+    /// ⛔⛔⛔ STAGING THE FOLD'S BLOCKS FOR ONE OF THESE BODIES IS SILENT AND WRONG, and it was the
+    /// W=1 text defect (auditor ruling 2026-10-27): the broadcast read of the block buffer is
+    /// `dev_off(0, c) = (c/64)·(rows·64) + c%64`, which is the TRUE row-0 bytes for `c < 64` and
+    /// ROW `c/64`'s FIRST BLOCK past it — the head rows' own validity, mostly VALID. A step whose
+    /// sweep stays inside one stick is byte-identical either way (the defect hid there), and the
+    /// first step past it — the rung 64→128 switch, on card — attends ~64 PHANTOM COLUMNS of
+    /// unwritten keys: a small deterministic logits perturbation that flips the first near-tie,
+    /// fluent on both sides. Measured 3/3 prompts, one token each at valid_len 67/72/68.
+    OneRequest,
 }
 
 /// ⭐⭐⭐ THE BATCH CHUNK's PER-ROW MASK, in the device's own f16 — one [`BatchChunk::mask_rows`] ×
@@ -7265,6 +7539,29 @@ pub fn batch_chunk_mask_f16(bc: BatchChunk, hists: &[KvHistory], mask_neg: f32) 
         }
     }
     Some(m)
+}
+
+/// ⭐⭐⭐ THE BATCH CHUNK's INDEX TABLE — [`chunk_gather_index_table`] over [`BatchChunk::page_list`],
+/// so the entries the copies read and the runs the mask validates are one layout. `maps` is one page
+/// map per request row (padding rows carry live 0's), in row order. `op_local_bytes` is the same
+/// op-local pin budget [`chunk_gather_index_table`]'s doc states — dead on this path today (a batch
+/// chunk's rows are other requests, so [`ChunkScratch::lx_form`] answers `None` before the window),
+/// threaded anyway so the one budget law has no arm that budgets against nothing.
+pub fn batch_chunk_index_table(
+    bc: BatchChunk,
+    maps: &[Vec<i64>],
+    per_page: EntriesPerPage,
+    op_local_bytes: u64,
+    prob_pin_bytes: u64,
+) -> Option<Vec<GatherEntry>> {
+    chunk_gather_index_table(
+        bc.chunk(),
+        ChunkRowKind::Batch,
+        &bc.page_list(maps)?,
+        per_page,
+        op_local_bytes,
+        prob_pin_bytes,
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -7822,6 +8119,51 @@ impl GatherCopy {
 // declared kernel is EXACTLY one scratch row, or op `r` reads request `r+1`'s keys — lives on that
 // door, where both numbers are the scratch's own.
 
+/// THE POOL A BATCH SHARES — every row owns the WHOLE page list, and the row separates them inside
+/// each page.
+///
+/// A SuperDSC launch resolves exactly ONE page base, so one launch can address B rows only if row
+/// `r`'s base is `base + r * stride` for a single stride, AND that stride is a number the emitter
+/// baked. Whether both hold is not a detail: it is the entire cost of batched decode. Measured on
+/// granite-3.1-2b at eight requests, a launch costs ~88 us of device time whatever it contains — a
+/// one-trip group and a sixteen-trip group both read ~0.09 ms, while the group holding every matmul in
+/// the layer does 79 trips in 0.268 ms. So the step is priced in launches, and a bs=8 layer spends
+/// 27.6 of them: one for the matmuls, one for attn_o, one for fq_absx, and then 8 + 8 + 8.58 because
+/// the cache write, the Kᵀ re-transpose and the prefix fold each run once PER REQUEST. That is 95 ms
+/// of a 119 ms step.
+///
+/// They run per request because the map they consult is a free list. `alloc_pages` hands out the
+/// lowest free page as each request grows, so row `r`'s pages are an arbitrary set and the base is
+/// not affine in `r` — Kani finds the counterexample in under half a second (rows at physical pages
+/// 0, 1, 3 have no single stride). Nothing about the addressing is wrong; it simply cannot be
+/// expressed as one launch.
+///
+/// ⛔ **AND CUTTING THE POOL INTO ONE RUN PER ROW DOES NOT FIX IT.** That was this type's first shape:
+/// row `r` owned pages `[r * pages_per_row, (r+1) * pages_per_row)`, which IS affine in the row. But
+/// its stride is `pages_per_row * page_stride` and `pages_per_row = pool_pages / rows` comes from
+/// `SUPERDSC_POOL_PAGES` or from whatever pool the loaded bundle found — a runtime number. A matmul
+/// steps its batch axis by `in * out` of a kernel declared when the bundle was COMPILED, so a stride
+/// only knowable at launch cannot be stepped at all, however affine it is. Kani
+/// `request_separation_does_not_depend_on_the_pool_size` exhibits two pools of identical geometry
+/// whose rows sit different distances apart.
+///
+/// So the request moved INTO the page instead, where its stride was `hd * PAGE_SLOTS` — geometry, and
+/// the kernel's own declared block size. THAT SHAPE IS THE ONE THAT WAS UNDONE: a page holds SLOTS
+/// again and a row owns its own consecutive PAGES, so `physical(lp) = row * pages_per_row + lp` and the
+/// stride between rows is a PAGE stride. The launch can step it because the fold installs the page maps.
+///
+/// ⛔ **AND THE CAPACITY PRICE IS BACK.** This paragraph used to read "there is no capacity price — a
+/// page belongs to all `ROWS` requests at once, so `8` pages is `2048` positions whether a request is
+/// alone or in a batch of 32". Striping made that false and the sentence survived the rebuild, which is
+/// exactly the doc a reader would trust while hunting the opposite symptom: a soloist now gets
+/// `pool_pages / rows` and NOTHING MORE, because the pages of the 31 rows it is not using are not
+/// addressable from the row it holds. That is why the stripe count is a decision with a type
+/// ([`PoolRows`]) instead of a `max()` over whatever baked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PoolSplit {
+    rows: NonZeroU32,
+}
+
 /// A PREFILL CHUNK'S KV EXTENT — proof that the rows the bundle WRITES are exactly the tokens the host
 /// COUNTS.
 ///
@@ -7862,6 +8204,12 @@ impl ChunkKvExtent {
     /// Rows written AND tokens counted — one number, because they are the same number.
     pub fn get(self) -> u32 {
         self.0
+    }
+
+    /// Padding rows a chunk of `chunk_len` on a `rung_m` bundle would leave uncounted — 0 iff the chunk
+    /// is exact. For the message a caller prints when [`exact`](Self::exact) refuses.
+    pub fn unaccounted_rows(chunk_len: u32, rung_m: u32) -> u32 {
+        rung_m.saturating_sub(chunk_len)
     }
 }
 
@@ -7969,6 +8317,18 @@ impl AdmittedRequests {
     pub fn get(self) -> NonZeroU32 {
         self.0
     }
+}
+
+impl PoolSplit {
+    /// Rows this split was cut for. A launch addressing more of them than this would run off the end
+    /// of the pool.
+    pub fn rows(&self) -> NonZeroU32 {
+        self.rows
+    }
+
+    // ⛔ NO `row()` AND NO `all_rows()`. They were the only way to obtain a `KvRow` and the list `free_row`
+    // picked from. What remains of this type is the WIDTH the pool was cut for — a bound on how many launch
+    // rows can run, not a set of per-request identities to hand out.
 }
 
 // ⛔⛔⛔ `KvRow` WAS HERE, AND ITS DELETION IS THE POINT OF THIS COMMIT: NO REQUEST CONCEPT BELOW THE HOST.
