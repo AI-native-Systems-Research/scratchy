@@ -39,22 +39,36 @@ use numbers::{
 /// The run files, relative to site/; copied to the same place under _site/,
 /// where each run table links to its own.
 pub const DATA: &str = "data/metal";
-/// Runs only the tests read: earlier rounds the page no longer shows, kept for the cases they
-/// hold (a dead server's cells, a run before #510 counted failures).
-#[cfg(test)]
-const TESTDATA: &str = "testdata/metal";
+/// The runs a newer one replaced, relative to site/: only Over time reads them.
+pub const HISTORY: &str = "data/metal/history";
 
 // --------------------------------------------------------------------- load
 
 /// Every run file, checked. Fails naming each bad file, so one build reports
 /// all of them rather than the first.
 fn load(site: &Site) -> Result<Vec<Run>, String> {
-    let dir = site.root.join(DATA);
-    let mut files: Vec<_> = fs::read_dir(&dir)
-        .map_err(|e| format!("{}: {e}", dir.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "json"))
-        .collect();
+    load_from(site, &[DATA])
+}
+
+/// [`load`], over every run file in `dirs` (relative to the site): the page's own runs, or those
+/// and the ones a newer run replaced ([`HISTORY`]), for Over time.
+fn load_from(site: &Site, dirs: &[&str]) -> Result<Vec<Run>, String> {
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for dir in dirs {
+        let dir = site.root.join(dir);
+        // history/ may not exist yet; the page's own folder must.
+        let Ok(entries) = fs::read_dir(&dir) else {
+            if *dir == *site.root.join(DATA) {
+                return Err(format!("{}: not found", dir.display()));
+            }
+            continue;
+        };
+        files.extend(
+            entries
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "json")),
+        );
+    }
     files.sort();
     let (mut runs, mut errors) = (Vec::new(), Vec::new());
     for f in files {
@@ -2437,52 +2451,65 @@ fn model_timelines(entries: &[Entry]) -> Vec<(&'static str, Element)> {
 /// The Over time section's charts, titled: none until some model of the current lineup has two
 /// runs of one shape on one machine. Only the current lineup, as in the overview ([`lineup`]): a
 /// model an older round ran keeps its runs in its machine's own section.
-fn over_time_charts(machines: &BTreeMap<&str, MachineRuns>) -> Vec<(String, Element)> {
+fn over_time_charts(machines: &BTreeMap<&str, MachineRuns>, chip: &str) -> Vec<(String, Element)> {
     let classes = lineup(machines).map_or(&[][..], |l| l.classes);
     let current = |stem: &str| classes.iter().any(|c| c.small == stem || c.large == stem);
     let mut charts = Vec::new();
-    for chip in in_order(machines) {
-        for (stem, entries) in machines[chip].models.iter().filter(|(s, _)| current(s)) {
-            for (value, chart) in model_timelines(entries) {
-                charts.push((format!("{chip} · {stem} · {value}"), chart));
-            }
+    let Some(mr) = machines.get(chip) else {
+        return charts;
+    };
+    for (stem, entries) in mr.models.iter().filter(|(s, _)| current(s)) {
+        for (value, chart) in model_timelines(entries) {
+            charts.push((format!("{stem} · {value}"), chart));
         }
     }
     charts
 }
 
-/// The Over time section: every machine's models over their runs, a small timeline a machine,
-/// model and metric, as the spyre page shows its cells. Nothing until some model has two runs of
-/// one shape on one machine.
-fn over_time(charts: Vec<(String, Element)>) -> Element {
-    if charts.is_empty() {
-        return rsx! {};
+/// The Over time section, one block a Mac: each current model's one-user throughput and time to
+/// first token against its rival, over every run the Mac has published (history/ included) of the
+/// model's newest shape. Nothing where no model has two such runs.
+fn over_time(machines: &BTreeMap<&str, MachineRuns>) -> Option<Element> {
+    let blocks: Vec<(&str, Vec<(String, Element)>)> = (in_order(machines).into_iter())
+        .map(|chip| (chip, over_time_charts(machines, chip)))
+        .filter(|(_, charts)| !charts.is_empty())
+        .collect();
+    if blocks.is_empty() {
+        return None;
     }
     let grid = "display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); \
                 column-gap: 1.5rem; row-gap: 1.25rem; align-items: start";
-    rsx! {
+    Some(rsx! {
         Section { id: "over-time", level: 2,
             Stack { gap: 4,
                 Heading { "Over time" }
                 p {
                     "Each model's one-user throughput and time to first token at its base cell, a \
-                     point a run on its Mac, oldest first, scratchy against the first engine any \
-                     run there measured. A run of scratchy alone (a quick run) takes the other \
-                     engine's line dotted, carried from the last run that measured it, and the fill \
-                     between the lines follows it. The fill is labelled with its ×-factor at the \
-                     first run and the newest: where scratchy started, and where it stands now."
+                     point a run on its Mac, oldest first, over every run the Mac has published \
+                     (the older ones are kept in "
+                    code { "site/data/metal/history/" }
+                    "), scratchy against the first engine any run there measured. A run of \
+                     scratchy alone (a quick run) takes the other engine's line dotted, carried from \
+                     the last run that measured it, and the fill between the lines follows it. The \
+                     fill is labelled with its ×-factor at the first run and the newest: where \
+                     scratchy started, and where it stands now."
                 }
-                div { style: "{grid}",
-                    for (title, chart) in charts {
-                        div {
-                            p { style: "font-size: 0.875rem; margin: 0 0 0.25rem", "{title}" }
-                            {chart}
+                for (chip, charts) in blocks {
+                    Stack { gap: 3,
+                        strong { "{chip}" }
+                        div { style: "{grid}",
+                            for (title, chart) in charts {
+                                div {
+                                    p { style: "font-size: 0.875rem; margin: 0 0 0.25rem", "{title}" }
+                                    {chart}
+                                }
+                            }
                         }
                     }
                 }
             }
         }
-    }
+    })
 }
 
 fn history(entries: &[Entry]) -> Element {
@@ -3624,6 +3651,10 @@ fn rivals_named(machines: &BTreeMap<&str, MachineRuns>) -> Option<String> {
 
 pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     let runs = load(site)?;
+    // Over time reads every published run, the ones a newer run replaced too; the rest of the
+    // page shows each Mac's two newest.
+    let all_runs = load_from(site, &[DATA, HISTORY])?;
+    let all_machines = index(&all_runs);
     let machines = index(&runs);
     let mut sections: Vec<(String, String)> = Vec::new();
     let body = if machines.is_empty() {
@@ -3636,15 +3667,15 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     } else {
         sections.push(("glance".to_string(), "At a glance".to_string()));
         // No link to a section that is not there.
-        let timelines = over_time_charts(&machines);
-        if !timelines.is_empty() {
+        let over = over_time(&all_machines);
+        if over.is_some() {
             sections.push(("over-time".to_string(), "Over time".to_string()));
         }
         let order = in_order(&machines);
         sections.extend(order.iter().map(|chip| (slug(chip), chip.to_string())));
         rsx! {
             {glance(&machines)}
-            {over_time(timelines)}
+            if let Some(over) = over { {over} }
             for chip in &order { {machine_section(chip, &machines[chip])} }
         }
     };
@@ -3745,7 +3776,10 @@ mod tests {
         assert!(old.requests.is_none());
     }
 
-    use super::{DATA, Run, TESTDATA, size_name, slug};
+    use super::{Run, size_name, slug};
+
+    /// The runs the tests read: copies of published runs, trimmed, that no data PR touches.
+    pub(super) const FIXTURES: &str = "tests/fixtures/metal";
 
     #[test]
     fn a_models_name_gives_its_parameter_size() {
@@ -3774,7 +3808,7 @@ mod tests {
         use super::numbers::Engine;
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/data/metal/apple-m5-max-2026-10-14T111352Z-987b06a2.json"
+            "/tests/fixtures/metal/apple-m5-max-2026-10-14T111352Z-987b06a2.json"
         );
         let text = std::fs::read_to_string(path).expect("the published M5 Max run");
         let mut later: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -3832,7 +3866,7 @@ mod tests {
         use super::numbers::Engine;
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/data/metal/apple-m5-max-2026-10-14T111352Z-987b06a2.json"
+            "/tests/fixtures/metal/apple-m5-max-2026-10-14T111352Z-987b06a2.json"
         );
         let text = std::fs::read_to_string(path).expect("the published M5 Max run");
         let mut later: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -3868,7 +3902,7 @@ mod tests {
         use super::numbers::Engine;
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/data/metal/history/apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"
+            "/tests/fixtures/metal/apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"
         );
         let text = std::fs::read_to_string(path).expect("the M3 Pro's full run");
         let mut quick: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -3908,7 +3942,7 @@ mod tests {
         use super::numbers::Engine;
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/data/metal/apple-m5-max-2026-10-14T111352Z-987b06a2.json"
+            "/tests/fixtures/metal/apple-m5-max-2026-10-14T111352Z-987b06a2.json"
         );
         let mut v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
@@ -3978,7 +4012,7 @@ mod tests {
         use super::numbers::Engine;
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/data/metal/history/apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"
+            "/tests/fixtures/metal/apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"
         );
         let mut v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
@@ -4002,6 +4036,27 @@ mod tests {
         assert_eq!(Engine::Splash.key(), "splash");
     }
 
+    /// Over time takes every run of a Mac it is given.
+    #[test]
+    fn over_time_takes_every_run_it_is_given() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let site = crate::Site {
+            repo: root.join(".."),
+            out: root.join("_site"),
+            root,
+        };
+        let runs = super::load_from(&site, &[FIXTURES]).expect("the fixtures");
+        let machines = super::index(&runs);
+        // The M3 Pro fixtures hold two runs of the current round's gpt-oss-20b, a week apart:
+        // Over time draws them, not just the newest.
+        let m3 = &machines["Apple M3 Pro"];
+        let gpt = (m3.models.iter())
+            .find(|(s, _)| *s == "gpt-oss-20b")
+            .map(|(_, es)| es.len());
+        assert_eq!(gpt, Some(2), "gpt-oss-20b runs on the M3 Pro");
+        assert!(super::over_time(&machines).is_some());
+    }
+
     /// Machines read up from the smallest: a 32 GB base M5 before the 36 GB M3 Pro, the 64 GB
     /// M4 Max and M5 Max after. Below 64 GB a Mac's overview row is the small set, at 64 GB the
     /// large one.
@@ -4009,15 +4064,10 @@ mod tests {
     fn machines_order_by_memory_and_take_their_set_by_it() {
         use super::data::Run;
         let read = |name: &str| -> serde_json::Value {
-            let p = format!("{}/data/metal/{name}", env!("CARGO_MANIFEST_DIR"));
+            let p = format!("{}/tests/fixtures/metal/{name}", env!("CARGO_MANIFEST_DIR"));
             serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
         };
-        // The M3 Pro's 2026-10-21 run, the round's first full run, a newer one replaced.
-        let old = |name: &str| -> serde_json::Value {
-            let p = format!("{}/data/metal/history/{name}", env!("CARGO_MANIFEST_DIR"));
-            serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
-        };
-        let mut base = old("apple-m3-pro-2026-10-21T145041Z-a7820fbc.json");
+        let mut base = read("apple-m3-pro-2026-10-21T145041Z-a7820fbc.json");
         base["machine"]["chip"] = "Apple M5".into();
         base["machine"]["memory_gb"] = 32.into();
         // Below 64 GB the grid runs 1, 2 and 4 users; the 36 GB M3 Pro's run is from before that.
@@ -4025,8 +4075,8 @@ mod tests {
         base["generated_utc"] = "2026-10-26T20:05:50Z".into();
         let runs: Vec<Run> = [
             base,
-            old("apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"),
-            old("apple-m4-max-2026-10-13T221900Z-2683d8c3.json"),
+            read("apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"),
+            read("apple-m4-max-2026-10-13T221900Z-2683d8c3.json"),
             read("apple-m5-max-2026-10-14T111352Z-987b06a2.json"),
         ]
         .into_iter()
@@ -4066,7 +4116,7 @@ mod tests {
         use super::data::Run;
         // The M3 Pro's 2026-10-27 run at f9739363, a newer one replaced.
         let read = |name: &str| -> serde_json::Value {
-            let p = format!("{}/data/metal/history/{name}", env!("CARGO_MANIFEST_DIR"));
+            let p = format!("{}/tests/fixtures/metal/{name}", env!("CARGO_MANIFEST_DIR"));
             serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
         };
         let mut small = read("apple-m3-pro-2026-10-27T031941Z-f9739363.json");
@@ -4100,7 +4150,7 @@ mod tests {
         use super::data::Run;
         // The M3 Pro's 2026-10-27 run at f9739363, a newer one replaced.
         let read = |name: &str| -> serde_json::Value {
-            let p = format!("{}/data/metal/history/{name}", env!("CARGO_MANIFEST_DIR"));
+            let p = format!("{}/tests/fixtures/metal/{name}", env!("CARGO_MANIFEST_DIR"));
             serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
         };
         let mut small = read("apple-m3-pro-2026-10-27T031941Z-f9739363.json");
@@ -4131,7 +4181,7 @@ mod tests {
         use super::numbers::{Engine, Metric, SHORT, cfmt, marks_note, short};
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut by_engine = std::collections::BTreeMap::<&str, usize>::new();
-        let mut files: Vec<_> = (std::fs::read_dir(root.join(DATA)).expect(DATA))
+        let mut files: Vec<_> = (std::fs::read_dir(root.join(FIXTURES)).expect(FIXTURES))
             .map(|e| e.unwrap().path())
             .filter(|p| p.extension().is_some_and(|x| x == "json"))
             .collect();
@@ -4170,8 +4220,7 @@ mod tests {
     }
 
     /// The published runs' cells a dead server measured (#413) are marked, and no other: the
-    /// glm-4.5-air and qwen3.6-35b-a3b cells of the M1 Max run in #472, and the M3 Pro's gemma
-    /// 4096-token cells from the one its OOM struck in (#412), 4096x16, which still streamed a
+    /// M3 Pro's gemma 4096-token cells from the one its OOM struck in (#412), 4096x16, which still streamed a
     /// few tokens, on. Every engine that stops at EOS early (ollama, oMLX) keeps its numbers, and
     /// so does scratchy's f378699e gemma cell at 16 users, live at 99% of its tokens. A marked
     /// cell counts every request failed, says why, and shows no number.
@@ -4180,9 +4229,7 @@ mod tests {
         use super::numbers::{DASH, Engine, FAILED, Metric, cfmt, failed, failed_note, partial};
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut runs: Vec<Run> = Vec::new();
-        // Every published run: the page's, the ones a newer run replaced (history/), and the
-        // earlier rounds only tests read.
-        for dir in [DATA, "data/metal/history", TESTDATA] {
+        for dir in [FIXTURES] {
             let mut files: Vec<_> = (std::fs::read_dir(root.join(dir)).expect(dir))
                 .map(|e| e.unwrap().path())
                 .filter(|p| p.extension().is_some_and(|x| x == "json"))
@@ -4223,14 +4270,6 @@ mod tests {
                 "scratchy",
                 3,
             ),
-            ("apple-m1-max", "c8860b1d", "glm-4.5-air", "scratchy", 22),
-            (
-                "apple-m1-max",
-                "c8860b1d",
-                "qwen3.6-35b-a3b",
-                "scratchy",
-                10,
-            ),
             (
                 "apple-m3-pro",
                 "cc51e0d8",
@@ -4245,40 +4284,6 @@ mod tests {
         assert_eq!(dead, want);
     }
 
-    /// A sparkline step compares the two engines on the rungs both measured. The M1 Max run in
-    /// #472 has glm-4.5-air's scratchy cells dead at 1024 and 4096 prompt tokens with 16-token
-    /// answers: averaged over each engine's own cells, scratchy read 1.86x oMLX TurboQuant's
-    /// throughput; on the one rung both have, it is 0.95x.
-    #[test]
-    fn a_sparkline_step_averages_only_the_rungs_both_engines_measured() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let file = root
-            .join(TESTDATA)
-            .join("apple-m1-max-2026-10-14T191550Z-c8860b1d.json");
-        let mut run: Run =
-            serde_json::from_str(&std::fs::read_to_string(&file).expect("the M1 Max run"))
-                .expect("a run");
-        run.mark_dead();
-        let m = run
-            .models
-            .iter()
-            .find(|m| m.stem == "glm-4.5-air")
-            .expect("glm-4.5-air");
-        let (rival, steps) = super::Trend::AnswerDecode
-            .points(m, &run)
-            .expect("a sparkline");
-        assert_eq!(rival.key(), "omlx_tq");
-        let step = steps
-            .iter()
-            .find(|s| s.x == 16.0)
-            .expect("the 16-token step");
-        let ratio = step.scratchy.expect("scratchy") / step.rival.expect("the rival");
-        assert!(
-            (ratio - 0.95).abs() < 0.01,
-            "scratchy against oMLX TurboQuant: {ratio:.3}x"
-        );
-    }
-
     /// The bench's own verdict on a cell is the one the page takes: a scratchy cell it recorded as
     /// a dead server's (`dead_server`, under half its answer tokens) shows no number, even in a
     /// run that counted its failures itself, where the page judges no cell by its tokens. Without
@@ -4289,7 +4294,7 @@ mod tests {
         use super::numbers::{Metric, failed_note, timing};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/data/metal/history/apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"
+            "/tests/fixtures/metal/apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"
         );
         let mut json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
@@ -4317,9 +4322,7 @@ mod tests {
     #[test]
     fn a_run_that_counted_its_failures_is_not_re_judged() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let file = root
-            .join(TESTDATA)
-            .join("apple-m3-pro-2026-10-13T010519Z-cc51e0d8.json");
+        let file = root.join("tests/fixtures/metal/apple-m3-pro-2026-10-13T010519Z-cc51e0d8.json");
         let text = std::fs::read_to_string(&file).expect("the published M3 Pro run");
         let mut json: serde_json::Value = serde_json::from_str(&text).expect("json");
         let judged = |json: &serde_json::Value| {
@@ -4349,7 +4352,7 @@ mod tests {
         use super::numbers::{Engine, Metric};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/data/metal/apple-m5-max-2026-10-14T111352Z-987b06a2.json"
+            "/tests/fixtures/metal/apple-m5-max-2026-10-14T111352Z-987b06a2.json"
         );
         let full: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
@@ -4404,9 +4407,7 @@ mod tests {
     /// other fields stay real, so it loads as one does. Returns the run and the model's index.
     fn with_memory(rss: f64, mem: f64) -> (Run, usize) {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let file = root
-            .join(DATA)
-            .join("history/apple-m3-pro-2026-10-21T145041Z-a7820fbc.json");
+        let file = root.join("tests/fixtures/metal/apple-m3-pro-2026-10-21T145041Z-a7820fbc.json");
         let mut json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&file).expect("a published run"))
                 .expect("json");
