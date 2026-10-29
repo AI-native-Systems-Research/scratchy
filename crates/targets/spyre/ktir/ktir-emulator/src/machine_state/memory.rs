@@ -12,7 +12,7 @@
 //! — the scheduler is single-threaded/cooperative, so no `Arc`/`Mutex` needed.
 
 use crate::dtypes::DType;
-use crate::fxhash::FxHashMap;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 /// An interior-mutability cell with the same `borrow`/`borrow_mut` surface as
@@ -56,8 +56,9 @@ pub use crate::memref::STICK_BYTES;
 #[derive(Debug)]
 pub struct HBMSimulator {
     pub size_bytes: i64,
-    /// base byte address -> raw allocation bytes
-    allocations: FxHashMap<i64, Vec<u8>>,
+    /// base byte address -> raw allocation bytes, ORDERED by base so an interior address finds its
+    /// allocation by a range lookup (see [`find_allocation`])
+    allocations: BTreeMap<i64, Vec<u8>>,
     /// next unallocated byte address (stick-aligned); starts at 0x10000
     pub next_ptr: i64,
 }
@@ -72,7 +73,7 @@ impl HBMSimulator {
     pub fn new(size_gb: i64) -> Self {
         HBMSimulator {
             size_bytes: size_gb * 1024 * 1024 * 1024,
-            allocations: FxHashMap::default(),
+            allocations: BTreeMap::new(),
             next_ptr: 0x10000,
         }
     }
@@ -111,9 +112,7 @@ impl HBMSimulator {
     /// Borrow the backing allocation containing `byte_addr` as `(buffer, offset)`,
     /// so a caller sampling MANY bytes from one region (the weight-cache
     /// fingerprint) resolves the allocation ONCE and then indexes — instead of a
-    /// per-byte [`find_allocation`], which falls to an O(num-allocations) linear
-    /// scan whenever the address isn't an exact allocation base (always true for an
-    /// offset INTO a weight). `None` if `byte_addr` is in no allocation.
+    /// per-byte [`find_allocation`]. `None` if `byte_addr` is in no allocation.
     pub fn allocation_at(&self, byte_addr: i64) -> Option<(&[u8], usize)> {
         let (base, _) = find_allocation(&self.allocations, byte_addr)?;
         let buf = &self.allocations[&base];
@@ -243,7 +242,7 @@ pub struct LXScratchpad {
     /// gate's success log and [`CoreContext::lx_peak_used`].
     pub peak_used: i64,
     pub core_id: usize,
-    allocations: FxHashMap<i64, Vec<u8>>,
+    allocations: BTreeMap<i64, Vec<u8>>,
     pub next_ptr: i64,
 }
 
@@ -254,7 +253,7 @@ impl LXScratchpad {
             used: 0,
             peak_used: 0,
             core_id,
-            allocations: FxHashMap::default(),
+            allocations: BTreeMap::new(),
             next_ptr: 0,
         }
     }
@@ -316,23 +315,30 @@ impl SpyreMemoryHierarchy {
 // --- shared byte-buffer helpers (port of _find_allocation/_read_flat/_write_flat) ---
 
 /// Find the allocation containing `ptr`, returning `(base, len)`.
-fn find_allocation(allocs: &FxHashMap<i64, Vec<u8>>, ptr: i64) -> Option<(i64, usize)> {
+/// The allocation containing `ptr`: the one based exactly there, else the NEAREST allocation below
+/// it that reaches it. Allocations are ordered by base, so the lookup walks down from the greatest
+/// base at or below `ptr` — one step when allocations do not overlap; a grown allocation
+/// ([`write_bytes`]'s `resize`) that swallowed a later base is still found, a step further down.
+/// It was a linear scan of every allocation for every interior address, which an indirect access
+/// pays once per element.
+fn find_allocation(allocs: &BTreeMap<i64, Vec<u8>>, ptr: i64) -> Option<(i64, usize)> {
     if let Some(buf) = allocs.get(&ptr) {
         return Some((ptr, buf.len()));
     }
     allocs
-        .iter()
-        .find(|(base, buf)| ptr > **base && ptr < **base + buf.len() as i64)
+        .range(..ptr)
+        .rev()
+        .find(|(base, buf)| ptr < **base + buf.len() as i64)
         .map(|(&base, buf)| (base, buf.len()))
 }
 
-fn read_bytes(allocs: &FxHashMap<i64, Vec<u8>>, ptr: i64, len: usize) -> Vec<u8> {
+fn read_bytes(allocs: &BTreeMap<i64, Vec<u8>>, ptr: i64, len: usize) -> Vec<u8> {
     let mut out = vec![0u8; len];
     read_bytes_into(allocs, ptr, &mut out);
     out // zero-padded past allocation end (matches Python)
 }
 
-fn read_bytes_into(allocs: &FxHashMap<i64, Vec<u8>>, ptr: i64, buf: &mut [u8]) {
+fn read_bytes_into(allocs: &BTreeMap<i64, Vec<u8>>, ptr: i64, buf: &mut [u8]) {
     buf.fill(0);
     if let Some((base, _)) = find_allocation(allocs, ptr) {
         let src = &allocs[&base];
@@ -346,7 +352,7 @@ fn read_bytes_into(allocs: &FxHashMap<i64, Vec<u8>>, ptr: i64, buf: &mut [u8]) {
 /// Read + decode in one pass: `codec::decode` reads the backing bytes directly
 /// (zero-padding a short tail itself), so the contiguous load fast path skips
 /// the intermediate byte `Vec` and its memmove.
-fn read_decoded(allocs: &FxHashMap<i64, Vec<u8>>, ptr: i64, n: usize, dtype: DType) -> Vec<f32> {
+fn read_decoded(allocs: &BTreeMap<i64, Vec<u8>>, ptr: i64, n: usize, dtype: DType) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
     read_decoded_into(allocs, ptr, &mut out, dtype);
     out
@@ -355,7 +361,7 @@ fn read_decoded(allocs: &FxHashMap<i64, Vec<u8>>, ptr: i64, n: usize, dtype: DTy
 /// Read + decode directly INTO `out` (no allocation) — the no-Vec analogue of
 /// [`read_decoded`], for the row-contiguous load decoding each strided run into
 /// its slice of the result buffer.
-fn read_decoded_into(allocs: &FxHashMap<i64, Vec<u8>>, ptr: i64, out: &mut [f32], dtype: DType) {
+fn read_decoded_into(allocs: &BTreeMap<i64, Vec<u8>>, ptr: i64, out: &mut [f32], dtype: DType) {
     match find_allocation(allocs, ptr) {
         Some((base, _)) => {
             let buf = &allocs[&base];
@@ -367,7 +373,7 @@ fn read_decoded_into(allocs: &FxHashMap<i64, Vec<u8>>, ptr: i64, out: &mut [f32]
     }
 }
 
-fn write_bytes(allocs: &mut FxHashMap<i64, Vec<u8>>, ptr: i64, data: &[u8]) {
+fn write_bytes(allocs: &mut BTreeMap<i64, Vec<u8>>, ptr: i64, data: &[u8]) {
     if let Some((base, buflen)) = find_allocation(allocs, ptr) {
         let off = (ptr - base) as usize;
         let needed = off + data.len();
