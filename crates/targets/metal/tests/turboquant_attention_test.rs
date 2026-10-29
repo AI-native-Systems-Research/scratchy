@@ -1502,8 +1502,10 @@ fn decode_gqa_gpt_oss_sinks() {
     }
 }
 
-/// Sinks far above every scaled score: the sink takes nearly the whole softmax, and the combine's
-/// V bias must shrink with the keys' share — a full vb here is the error the twin's merge cancels.
+/// Sinks drawn at 12x the scaled scores' spread, both regimes at once: the heads whose sink sits
+/// far above every score hand it nearly the whole softmax, and the combine's V bias must shrink
+/// with the keys' share — a full vb there is the error the twin's merge cancels; the heads whose
+/// sink sits far below leave it nothing, and the output is the keys' alone.
 #[test]
 fn decode_gqa_gpt_oss_dominant_sinks() {
     for c in gpt_oss_split_cases("decode gqa gpt-oss dominant sinks", 12.0) {

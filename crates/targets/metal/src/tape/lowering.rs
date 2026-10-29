@@ -1350,6 +1350,7 @@ const fn combine_threads(hd: u32) -> u32 {
 fn decode_attention_per_kv_head(
     p: &MetalModelConsts,
     step: &MetalStep,
+    sinks: Option<SourceIx>,
     cmds: Vec<GatedCommand>,
     at: &BakePoint<'_>,
     row_gate: Option<RuntimeGate>,
@@ -1411,11 +1412,11 @@ fn decode_attention_per_kv_head(
         // Running its KV writer, one threadgroup past the splits writes and encodes the row.
         let writer = u32::from(constants.iter().any(|k| k.index == ATTN_FOLD.0));
         let (x, _, _) = command.dispatch.threadgroups;
-        // A sinks dispatch's sink column (the twin's buffer 16) joins in the combine, at its
-        // buffer 17, under the twin's sink const: the split's 16 is the partials, its splits
-        // storing the keys' alone, and it takes neither.
-        let (sinks, bindings): (Vec<_>, Vec<_>) = (command.bindings.iter())
-            .partition(|b| b.index() == super::kernel_bindings::DECODE_SINKS_SLOT);
+        // A sinks dispatch's sink column (the row's sinks source, the twin binds at its 16)
+        // joins in the combine, at its buffer 17, under the twin's sink const: the split's 16
+        // is the partials, its splits storing the keys' alone, and it takes neither.
+        let is_sinks = |b: &&Binding| matches!(b, Binding::Source { ix, which: WeightTensor::Weight, .. } if Some(*ix) == sinks);
+        let (sinks, bindings): (Vec<_>, Vec<_>) = command.bindings.iter().partition(is_sinks);
         let sinks_const = super::kernel_constants::AttentionViaCacheConstants::SINKS.0;
         let split_constants: Vec<_> = (constants.iter())
             .filter(|k| k.index != sinks_const)
@@ -1686,8 +1687,15 @@ fn lower(
                 let own = own.into_iter().map(GatedCommand::ungated).collect();
                 let cmds = route_small_m(p, step, own, bucket_m, w, profile)?;
                 let cmds = route_gdn(p, step, cmds, bucket_m);
-                let cmds =
-                    decode_attention_per_kv_head(p, step, cmds, at, *gate, &mut decode_partials);
+                let cmds = decode_attention_per_kv_head(
+                    p,
+                    step,
+                    w.sinks(),
+                    cmds,
+                    at,
+                    *gate,
+                    &mut decode_partials,
+                );
                 let (cmds, rows) = sample_rows(p, step, cmds, bucket_m, w, profile)?;
                 logits_rows = writes_logits(logits_rows, rows);
                 // Past the sampled rows, a command over their logits other than the logit tail's
