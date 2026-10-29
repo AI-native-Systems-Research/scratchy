@@ -2182,6 +2182,271 @@ fn spliced_attn_lowers_through_the_door() {
     }
 }
 
+/// ⭐ THE SPLICED ATTENTION, EXECUTED — the numbers half of `attn.py` (torch-spyre's SDPA
+/// decomposition), at every arm the splice takes: decode over the masked swept prefix (the full
+/// sweep and an interior rung, both head dims), decode over a pre-populated unmasked cache, the
+/// first prompt chunk (no prefix, the causal triangle — the one-block arm), and a chunk with a
+/// prefix (the two-block scan with both masks). The REAL program runs through the production
+/// session entry, staged the way the worker stages it, against an f64 softmax over the same bytes.
+///
+/// ⛔ AND IT IS THE KERNEL'S OWN OPS THAT RUN. The emulator recognizes attention idioms and
+/// substitutes a native computation (`resident.rs`'s fused decode, `segmented.rs`'s head re-roll
+/// and flash tiling) for a program it can prove is one; each shape asserts none of them claims
+/// this program, so a pass here is the kernel's arithmetic and not the emulator's.
+#[test]
+#[cfg(feature = "spyre-emu")]
+fn spliced_attn_executes_the_real_program() {
+    for s in [
+        AttnShape {
+            geom: (32, 8, 64),
+            mq: 1,
+            cap: 256,
+            rung: 0,
+            rope_appended: true,
+        },
+        AttnShape {
+            geom: (32, 8, 64),
+            mq: 1,
+            cap: 256,
+            rung: 64,
+            rope_appended: true,
+        },
+        AttnShape {
+            geom: (32, 8, 128),
+            mq: 1,
+            cap: 256,
+            rung: 0,
+            rope_appended: true,
+        },
+        AttnShape {
+            geom: (32, 8, 64),
+            mq: 1,
+            cap: 256,
+            rung: 0,
+            rope_appended: false,
+        },
+        AttnShape {
+            geom: (32, 8, 64),
+            mq: 31,
+            cap: 256,
+            rung: u32::MAX,
+            rope_appended: true,
+        },
+        AttnShape {
+            geom: (32, 8, 64),
+            mq: 31,
+            cap: 256,
+            rung: 0,
+            rope_appended: true,
+        },
+    ] {
+        execute_one_spliced_attn(s);
+    }
+}
+
+/// `n` values uniform in `[-amp, amp)` from a fixed LCG — a stimulus both sides read as the same
+/// f16 bytes (the session narrows each to f16; the reference reads the narrowed value back).
+#[cfg(feature = "spyre-emu")]
+fn attn_stimulus(n: usize, seed: u64, amp: f32) -> Vec<f32> {
+    let mut x = seed;
+    (0..n)
+        .map(|_| {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = (x >> 40) as f32 / (1u64 << 24) as f32;
+            half::f16::from_f32((2.0 * u - 1.0) * amp).to_f32()
+        })
+        .collect()
+}
+
+#[cfg(feature = "spyre-emu")]
+fn execute_one_spliced_attn(s: AttnShape) {
+    use ktir_emulator::ktir_optimizer::{flash_attn, head_rewrite};
+    use std::borrow::Cow;
+
+    let (nqh, nkvh, hd) = s.geom;
+    let scale = if hd == 64 { 0.015625f32 } else { 0.0078125 };
+    let ir = attn_ir(s, scale);
+    let node = ir.nodes.last().unwrap();
+    let cache_rows = ir.tensors[node.inputs[1].tensor.index()].rows;
+    let at = format!(
+        "geom={:?} mq={} rung={} rope_appended={}",
+        s.geom, s.mq, s.rung, s.rope_appended
+    );
+    let spliced = scratchy_triton_splice::lower_attn(node, &ir, cache_rows, s.active_cap())
+        .unwrap_or_else(|e| panic!("splice compiled {at}: {e}"));
+    let k_node = spliced
+        .ktir
+        .as_ref()
+        .expect("spliced op carries its program");
+    assert!(
+        head_rewrite::recognize_head_attention_decode(&k_node.func).is_none()
+            && head_rewrite::recognize_head_attention(&k_node.func).is_none()
+            && flash_attn::recognize_rerolled_attention(&k_node.func).is_none()
+            && flash_attn::recognize_attention(&k_node.func).is_none(),
+        "{at}: an emulator attention recognizer claims the spliced program, so the emulator would \
+         run its own attention in place of the kernel's"
+    );
+
+    // The program's parameters, by the door's order: q, out, kc, kd, vc, vd, then the mask.
+    let tid = |i: usize| u64::from(k_node.bindings[i].get());
+    let (t_q, t_out, t_kc, t_kd, t_vc, t_vd) = (tid(0), tid(1), tid(2), tid(3), tid(4), tid(5));
+    let t_mask = k_node.mask.map(|m| u64::from(m.get()));
+    let args: Vec<(
+        ktir_core::ir::Ssa,
+        scratchy_target_spyre::bundle_code::PlaceId,
+    )> = k_node
+        .func
+        .arguments
+        .iter()
+        .map(|(ssa, _ty)| {
+            (
+                *ssa,
+                scratchy_target_spyre::bundle_code::PlaceId::Act(k_node.bindings[ssa.slot()].get()),
+            )
+        })
+        .collect();
+    let group = scratchy_target_spyre::bundle_code::LaunchGroup {
+        kv: Default::default(),
+        programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
+            func: k_node.func,
+            program: k_node.program,
+            args: Cow::Owned(args),
+            lx_pin_window_bytes: Some(0),
+        }]),
+        init_binary: Cow::Borrowed(&[]),
+        job_bin_ptr: 0,
+        correction: Cow::Borrowed(&[]),
+    };
+
+    // What the program reads: the prefix rows (the masked prefix sweeps from row 0 to the rung,
+    // a pre-populated one reads its own region), how many of them are valid this step (the
+    // rope-appended prefix holds `ATTN_VALID_LEN - 1` positions; the step's own key is the new
+    // block's), and the new block's rows (the chunk's at `mq > 1`, the step's at decode).
+    let (mq, q_width, kv_width) = (s.mq as usize, (nqh * hd) as usize, (nkvh * hd) as usize);
+    let (prefix_start, prefix_len) = if s.rope_appended {
+        let swept = s
+            .active_cap()
+            .resolve(cache_rows, ktir_superdsc::sdsc_abstract::POOL_STICK);
+        (0usize, swept.min(cache_rows) as usize)
+    } else {
+        let r = node.inputs[1].region.rows;
+        (r.start as usize, r.len as usize)
+    };
+    let valid_prefix = if s.rope_appended {
+        (ATTN_VALID_LEN - 1) as usize
+    } else {
+        prefix_len
+    };
+    let new_tensor_rows = ir.tensors[node.inputs[3].tensor.index()].rows as usize;
+    let kd_row = node.inputs[3].region.rows.start as usize;
+    let new_rows = if mq > 1 {
+        mq
+    } else {
+        node.inputs[3].region.rows.len as usize
+    };
+    let cap_rows = cache_rows as usize;
+
+    // Scores of a few units, so the softmax is far from uniform and a wrong key set moves the
+    // output by far more than the gate.
+    let q = attn_stimulus(mq * q_width, 1, 6.0);
+    let kc = attn_stimulus(cap_rows * kv_width, 2, 6.0);
+    let vc = attn_stimulus(cap_rows * kv_width, 3, 1.0);
+    let kd = attn_stimulus(new_tensor_rows * kv_width, 4, 6.0);
+    let vd = attn_stimulus(new_tensor_rows * kv_width, 5, 1.0);
+    // The mask the worker stages: prefix columns first, valid up to `valid_prefix`; then the new
+    // block's causal triangle at `mq > 1`. -1e38 narrows to f16 -inf.
+    let neg = -1.0e38f32;
+    let mask_w = prefix_len + if mq > 1 { mq } else { 0 };
+    let mut mask = vec![0.0f32; mq * mask_w];
+    for r in 0..mq {
+        for c in 0..mask_w {
+            let keep = if c < prefix_len {
+                c < valid_prefix
+            } else {
+                c - prefix_len <= r
+            };
+            if !keep {
+                mask[r * mask_w + c] = neg;
+            }
+        }
+    }
+
+    let mut sources = vec![
+        (t_q, q.clone(), vec![mq, q_width]),
+        (t_kc, kc.clone(), vec![cap_rows, kv_width]),
+        (t_vc, vc.clone(), vec![cap_rows, kv_width]),
+        (t_kd, kd.clone(), vec![new_tensor_rows, kv_width]),
+        (t_vd, vd.clone(), vec![new_tensor_rows, kv_width]),
+    ];
+    if let Some(t) = t_mask {
+        sources.push((t, mask.clone(), vec![mq, mask_w]));
+    }
+    let mut session =
+        scratchy_target_spyre::runner::SpyreSession::new_multi(&[(&[group], &[t_out])], Vec::new())
+            .expect("build the one-program session");
+    let out = session
+        .run_step(0, sources, &[(t_out, 0)])
+        .unwrap_or_else(|e| panic!("run the spliced attention ({at}): {e}"));
+    let got = &out[&t_out];
+    assert_eq!(got.len(), mq * q_width, "{at}");
+
+    // The f64 reference: softmax over exactly the keys the mask leaves, per row and head.
+    let group_size = (nqh / nkvh) as usize;
+    let hd = hd as usize;
+    let dot = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| f64::from(*x) * f64::from(*y))
+            .sum::<f64>()
+    };
+    let mut max_err = 0.0f64;
+    for r in 0..mq {
+        for h in 0..nqh as usize {
+            let kvh = h / group_size;
+            let qrow = &q[r * q_width + h * hd..][..hd];
+            let mut keys: Vec<(f64, &[f32])> = Vec::new();
+            for j in 0..prefix_len {
+                if t_mask.is_some() && j >= valid_prefix {
+                    continue;
+                }
+                let row = prefix_start + j;
+                let k = &kc[row * kv_width + kvh * hd..][..hd];
+                let v = &vc[row * kv_width + kvh * hd..][..hd];
+                keys.push((f64::from(scale) * dot(qrow, k), v));
+            }
+            for t in 0..new_rows {
+                if mq > 1 && t > r {
+                    continue;
+                }
+                let row = kd_row + t;
+                let k = &kd[row * kv_width + kvh * hd..][..hd];
+                let v = &vd[row * kv_width + kvh * hd..][..hd];
+                keys.push((f64::from(scale) * dot(qrow, k), v));
+            }
+            let m = keys
+                .iter()
+                .map(|(s, _)| *s)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let l: f64 = keys.iter().map(|(s, _)| (s - m).exp()).sum();
+            for d in 0..hd {
+                let want: f64 = keys
+                    .iter()
+                    .map(|(s, v)| (s - m).exp() / l * f64::from(v[d]))
+                    .sum();
+                let g = f64::from(got[r * q_width + h * hd + d]);
+                max_err = max_err.max((g - want).abs());
+            }
+        }
+    }
+    println!("  spliced attention {at}: max abs err {max_err:.3e} (gate 0.05)");
+    assert!(
+        max_err < 0.05,
+        "the REAL spliced attention diverged from the f64 softmax ({at}): max abs err {max_err}"
+    );
+}
+
 /// ⭐⭐ THE TWO RMSNORM RECOGNIZERS, PINNED TO EACH OTHER. The door recognizes
 /// rmsnorm chains to fuse them (`ktir_superdsc`'s `program_rmsnorm_chains`); the
 /// emulator re-derives the same walk to land the scalar chain's sticks on the
