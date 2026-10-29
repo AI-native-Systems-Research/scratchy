@@ -758,7 +758,7 @@ pub fn fold_requests(s: &SessionKv) -> i64 {
 /// 64-page chunk, and the worker refused the step ("the chunk ladder's top rung (64 pages) is below
 /// this context") where the per-page fold had served it. Every ladder without a chunk folds on every
 /// rung, so there this is the top, as before. Applied ONCE, at bake, by
-/// [`the_fallback_serves_any_length`]; the runtime reads the index it baked (`RerollMeta::fallback_rung`).
+/// [`fallback_rung`]; the runtime reads the index it baked (`RerollMeta::fallback_rung`).
 pub fn past_every_sweep(folds: &[bool]) -> usize {
     folds
         .iter()
@@ -828,62 +828,23 @@ pub fn fused_rungs<C, T>(
 }
 
 /// What a baked decode-ladder rung can serve past its own sweep — the two bake facts
-/// [`the_fallback_serves_any_length`] needs, read off the rung's emitted ops by the macro.
+/// [`fallback_rung`] needs, read off the rung's emitted ops by the macro.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RungReach {
     /// The body carries a page-fold group: it re-launches per resident page, so it serves any length.
     /// The same fact the runtime reads (`KvShifts::page_fold`, stamped from each op's `kv_page_fold`).
     pub folds: bool,
-    /// The body is a split-KV chunk: it attends exactly its own pages and nothing past them.
-    pub chunk: bool,
     /// The rung baked a fold-fused twin — the body `superdsc_exec::select_body_paged` runs whenever the
     /// fold would make ONE pass, i.e. at most one resident page for one request.
     pub fused_twin: bool,
 }
 
-/// ⛔⛔⛔ NO SPLIT-KV CHUNK RUNG CARRIES A FOLD-FUSED TWIN — the bake's proof, panicked on by the macro.
-///
-/// A chunk body has no fold to fuse, so its twin is the same program again, and the selector's
-/// one-pass arm takes the first FUSED rung that covers the live length. "One pass" is a fact about the
-/// resident PREFIX, the length is the whole context: a prompt chunk over a one-page prefix
-/// (`valid_len` 257, `n_fold_pages` 1) is one pass at a length past every one-page body. Its first
-/// covering twin was the 64-page chunk ceiling's, and granite-2b paid ~0.45 s on that chunk of every
-/// request (the 96- and 128-row ladders both), against ~0.1 s for its neighbours. Without a twin the
-/// step falls to the split ladder's narrowest covering chunk.
-pub fn no_chunk_has_a_fused_twin(rungs: &[RungReach]) -> Result<(), String> {
-    match rungs.iter().position(|r| r.chunk && r.fused_twin) {
-        Some(at) => Err(format!(
-            "rung {at} of {} is a split-KV CHUNK with a fold-fused twin — the selector's one-pass arm \
-             would run that chunk for any context inside its pages whose prefix is one page. Bake no \
-             twin for a chunk rung.",
-            rungs.len()
-        )),
-        None => Ok(()),
-    }
-}
-
-/// ⛔⛔⛔ THE BAKE'S HALF OF [`past_every_sweep`] — and why a ladder that cannot serve the pool DOES NOT
-/// COMPILE. `rungs` ascending, exactly as the runtime holds them.
-///
-/// Returns the rung a context past every sweep will run, or `Err` when that rung is a split-KV CHUNK:
-/// such a step attends a prefix that stops at the chunk's last page, and the worker refuses it at its
-/// first decode step — what #438 shipped for every granite-2b context past 16,384 tokens, because the
-/// ladder's fallback was its widest chunk. The macro panics on the `Err`, so the ladder that fails this
-/// way is a build failure, and the `Ok` index is baked as `RerollMeta::fallback_rung`, which the
+/// The bake's half of [`past_every_sweep`]: the rung a context past every sweep runs, `rungs`
+/// ascending exactly as the runtime holds them. Baked as `RerollMeta::fallback_rung`, which the
 /// runtime reads instead of choosing — so it cannot run another.
-pub fn the_fallback_serves_any_length(rungs: &[RungReach]) -> Result<usize, String> {
+pub fn fallback_rung(rungs: &[RungReach]) -> usize {
     let folds: Vec<bool> = rungs.iter().map(|r| r.folds).collect();
-    let at = past_every_sweep(&folds);
-    match rungs.get(at) {
-        Some(r) if r.chunk => Err(format!(
-            "a context past every sweep falls back to rung {at} of {}, a split-KV CHUNK — it attends \
-             only its own pages, so the first decode step past it is refused. The ladder must bake a \
-             rung that FOLDS (the per-page body) for every context the pool holds past its widest \
-             chunk.",
-            rungs.len()
-        )),
-        _ => Ok(at),
-    }
+    past_every_sweep(&folds)
 }
 
 /// How many times this op's group is launched: once per resident page PER REQUEST for the fold,
@@ -1331,62 +1292,6 @@ mod tests {
         assert_eq!(past_every_sweep(&[false, false]), 1);
     }
 
-    /// ⛔ A LADDER WHOSE FALLBACK IS A CHUNK IS REFUSED — the bake panics on this `Err`. Chunks alone
-    /// are the refused shape; the one-request ladder (sweep rungs and the page body, all folding, then
-    /// chunks) falls back to the page body; a ladder of folds alone (head dim 128) keeps its top; and an
-    /// unpaged ladder that neither folds nor chunks keeps its whole-cap top.
-    #[test]
-    fn a_ladder_that_falls_back_to_a_chunk_is_refused() {
-        use super::{RungReach, the_fallback_serves_any_length};
-        let fold = RungReach {
-            folds: true,
-            chunk: false,
-            fused_twin: true,
-        };
-        let chunk = RungReach {
-            folds: false,
-            chunk: true,
-            fused_twin: false,
-        };
-        let whole = RungReach {
-            folds: false,
-            chunk: false,
-            fused_twin: true,
-        };
-        assert!(the_fallback_serves_any_length(&[chunk, chunk, chunk]).is_err());
-        assert_eq!(
-            the_fallback_serves_any_length(&[fold, fold, fold, chunk, chunk, chunk]),
-            Ok(2)
-        );
-        assert_eq!(the_fallback_serves_any_length(&[fold, fold, fold]), Ok(2));
-        assert_eq!(the_fallback_serves_any_length(&[whole, whole]), Ok(1));
-    }
-
-    /// ⛔ A CHUNK RUNG WITH A FOLD-FUSED TWIN IS REFUSED — the bake panics on this `Err`, wherever in the
-    /// ladder the chunk sits (the prompt chunk's ceiling is rung 0). Twins on folding and whole rungs
-    /// stand, and so does a chunk without one.
-    #[test]
-    fn a_chunk_rung_with_a_fused_twin_is_refused() {
-        use super::{RungReach, no_chunk_has_a_fused_twin};
-        let fold = RungReach {
-            folds: true,
-            chunk: false,
-            fused_twin: true,
-        };
-        let chunk = RungReach {
-            folds: false,
-            chunk: true,
-            fused_twin: false,
-        };
-        let twinned = RungReach {
-            fused_twin: true,
-            ..chunk
-        };
-        assert!(no_chunk_has_a_fused_twin(&[twinned, chunk, chunk]).is_err());
-        assert!(no_chunk_has_a_fused_twin(&[fold, fold, chunk, twinned]).is_err());
-        assert_eq!(no_chunk_has_a_fused_twin(&[chunk, chunk, chunk]), Ok(()));
-        assert_eq!(no_chunk_has_a_fused_twin(&[fold, fold, chunk]), Ok(()));
-    }
     use super::*;
 
     /// The shifts of an op that launches — every op of these fixtures but a page part with no page.

@@ -111,85 +111,6 @@ pub struct FusedSegment<'a> {
     pub inputs: HashSet<u64>,
 }
 
-/// True when `func` is a head-parallel ATTENTION node that must run at its native
-/// grid (NOT be collapsed into a single-grid fused function).
-///
-/// Discriminator: a non-trivial grid (`> [1,1]`, so it has per-core heads) PLUS
-/// the attention op signature — a `linalg.transpose` (the K transpose) and the
-/// softmax `linalg.reduce { arith.maximumf }`. The signature excludes the
-/// `[8,1]` token-parallel pure-matmul nodes (matmul but no transpose/softmax),
-/// which the GPU GEMM reconstruction already runs correctly at grid `[1,1]`. In
-/// DECODE the attention nodes are themselves grid `[1,1]` (single token), so the
-/// grid clause keeps them fused (decode is correct single-grid).
-pub fn is_attention_node(func: &IRFunction<'_>) -> bool {
-    let (gx, gy, gz) = func.grid;
-    if gx * gy * gz <= 1 {
-        return false;
-    }
-    let mut has_transpose = false;
-    let mut has_softmax_reduce = false;
-    fn scan(ops: &[Operation<'_>], has_transpose: &mut bool, has_softmax_reduce: &mut bool) {
-        for op in ops {
-            if op.op_type == OpKind::LinalgTranspose {
-                *has_transpose = true;
-            }
-            // The softmax max-reduce: a `linalg.reduce` whose combiner is
-            // `arith.maximumf`. The parser lifts the `{ arith.maximumf }`
-            // shorthand into a `reduce_fn` attribute; the explicit form keeps
-            // the combiner as a region op. Match either.
-            if op.op_type == OpKind::LinalgReduce
-                && (matches!(
-                    op.attr(AttrKey::ReduceFn),
-                    Some(Attr::Op(OpKind::ArithMaximumf))
-                ) || region_has_op(op.regions, OpKind::ArithMaximumf))
-            {
-                *has_softmax_reduce = true;
-            }
-            for rg in op.regions {
-                scan(rg, has_transpose, has_softmax_reduce);
-            }
-        }
-    }
-    scan(func.operations, &mut has_transpose, &mut has_softmax_reduce);
-    has_transpose && has_softmax_reduce
-}
-
-/// True when `func` is a DECODE (m=1) attention node — the single-token form
-/// whose grid is `[1,1]` (so [`is_attention_node`]'s grid clause excludes it) but
-/// whose body is the unrolled per-head two-block online softmax. Discriminator:
-/// grid `[1,1]`, a `linalg.transpose` (the K transpose) AND the softmax
-/// `linalg.reduce { arith.maximumf }`. Structural, not name/shape based. Used —
-/// by default, unless `KTIR_NO_FUSE_ATTN` is set — to ISOLATE the node into its
-/// own segment so the resident executor runs the fused CPU path, not the op storm.
-pub fn is_decode_attention_node(func: &IRFunction<'_>) -> bool {
-    let (gx, gy, gz) = func.grid;
-    if gx * gy * gz != 1 {
-        return false;
-    }
-    let mut has_transpose = false;
-    let mut has_softmax_reduce = false;
-    fn scan(ops: &[Operation<'_>], has_transpose: &mut bool, has_softmax_reduce: &mut bool) {
-        for op in ops {
-            if op.op_type == OpKind::LinalgTranspose {
-                *has_transpose = true;
-            }
-            if op.op_type == OpKind::LinalgReduce
-                && (matches!(
-                    op.attr(AttrKey::ReduceFn),
-                    Some(Attr::Op(OpKind::ArithMaximumf))
-                ) || region_has_op(op.regions, OpKind::ArithMaximumf))
-            {
-                *has_softmax_reduce = true;
-            }
-            for rg in op.regions {
-                scan(rg, has_transpose, has_softmax_reduce);
-            }
-        }
-    }
-    scan(func.operations, &mut has_transpose, &mut has_softmax_reduce);
-    has_transpose && has_softmax_reduce
-}
-
 /// ROW-LOCALITY — is every cross-node tensor this node touches accessed only at
 /// the node's OWN compute-tile row? A node is grid=[H,1]: compute-tile `k` runs
 /// the body with `ktdp.get_compute_tile_id` ⇒ `k`. The node is **row-local** iff,
@@ -320,52 +241,6 @@ pub fn node_partition_dims(func: &IRFunction, node: &NodeSpec) -> PartitionDims 
     PartitionDims { reads, writes }
 }
 
-/// CONTRACT (B) — the single source of truth that partitions the cap (KV-length)
-/// axis between the project's two attention optimizations, so that **each
-/// attention node receives EXACTLY ONE transform** and the region-free
-/// batched-executor gate (`interpreter.rs`, the `!regions.is_empty()` clause in
-/// `execute_function_gpu`) is never violated:
-///
-/// * **scores tile FITS LX** (below the cap) → leave attention **naive**. The node
-///   stays a region-free [`Segment::Native`] and is eligible for **head-batching**
-///   on the GPU multi-core batched executor (the multi-core-GPU TODO). Head dim is
-///   tiled across cores.
-/// * **scores tile OVERFLOWS LX** (above the cap) → the **flash-attention pass**
-///   (the FA-rewrite TODO) rewrites the node into a tiled `scf.for` online-softmax
-///   form that fits LX. The cap/KV dim is tiled. That node is now *region-bearing*,
-///   so it runs on the generic interpreter (the batched executor's region-free gate
-///   makes it `Err` → fall back, which is the *intended* path above the cap —
-///   head-batching cannot help a node whose scores already overflow LX).
-///
-/// The two are orthogonal (head dim vs cap dim) and compose only via a later
-/// region-aware INC; **neither fleet edits the region-free gate line** (reserved
-/// for that post-merge step). Because the predicate is monotone in `scores_bytes`
-/// and exhaustively partitions the axis, there is no overlap (no double-transform)
-/// and no gap (no silently-unhandled regime).
-///
-/// `scores_bytes` is the byte footprint of the attention scores tile `[m, cap]`
-/// (numel × storage-dtype bytes), as recovered by the FA recognizer; `lx_budget`
-/// is the per-core LX byte budget the segmenter already uses
-/// (`KTIR_LX_FUSION_BUDGET`, default 7/8 of 2 MB). Threshold mirrors that 7/8
-/// convention. **Fail-safe:** callers that cannot prove the scores footprint must
-/// pass a value that keeps this `false` (stay naive) — never force an FA path we
-/// cannot prove correct.
-pub fn attention_needs_flash(scores_bytes: usize, lx_budget: usize) -> bool {
-    // scores_bytes ≥ 7/8 · lx_budget  ⟺  the scores tile would overflow the LX
-    // fusion budget and must be cap-tiled (flash attention). Saturating math so a
-    // pathological huge footprint can't wrap.
-    lx_budget != 0 && scores_bytes.saturating_mul(8) >= lx_budget.saturating_mul(7)
-}
-
-/// Recover the tensor id from a fused pointer-arg name `%t<id>_ptr`.
-/// True if any op at any region depth in `regions` has `op_type`.
-fn region_has_op(regions: &[&[Operation<'_>]], op_type: OpKind) -> bool {
-    regions.iter().any(|rg| {
-        rg.iter()
-            .any(|op| op.op_type == op_type || region_has_op(op.regions, op_type))
-    })
-}
-
 /// Partition `spec` into ordered execution segments: maximal runs of consecutive
 /// non-attention nodes fused into one `[1,1]` function each, with every
 /// attention node kept as its own [`Segment::Native`] to run at its native grid.
@@ -408,36 +283,16 @@ pub fn plan_segments_budgeted<'a>(
     lx_budget: usize,
     tensor_bytes: &HashMap<u64, usize>,
 ) -> Result<Vec<Segment<'a>>, String> {
-    // Per-node attention classification. Nodes flagged here are kept as their own
-    // `Segment::Native` (run at their native grid, NOT collapsed into a fused
-    // [1,1] function). The head-parallel prefill form (grid > 1) is always
-    // isolated. The DECODE (m=1, grid [1,1]) form is ALSO isolated by default — so
-    // the resident executor can run the fused CPU attention for it (a measured
-    // decode win, golden-faithful). Set `KTIR_NO_FUSE_ATTN` to opt out: decode
-    // attention then stays folded into the fused segment (the decomposed oracle
-    // path), so the suite stays byte-identical to the pre-fusion baseline.
-    let fuse_decode_attn = std::env::var_os("KTIR_NO_FUSE_ATTN").is_none();
-    let attn: Vec<bool> = spec
-        .nodes
-        .iter()
-        .map(|n| {
-            module
-                .get_function(&n.func)
-                .map(|f| is_attention_node(f) || (fuse_decode_attn && is_decode_attention_node(f)))
-        })
-        .collect::<Result<_, _>>()?;
-
     // Per-node DOOR classification (the chained head, #603). A door node's KTIR
     // body is a STRUCTURAL SKELETON minted for the card-side door assembly — a
     // load of the first operand's view and a store to the last — not door
     // semantics, so executing it op by op inside a fused function computes a
     // copy, not the door. Isolated as its own `Segment::Native` (the same law
-    // as decode attention) so the resident executor can substitute the host
-    // door, keyed on the node's CARRIED `program` kind — the mint's one
-    // statement of the fact, never the func name (the spelling this crate
-    // retired). NO opt-out env var, unlike attention's KTIR_NO_FUSE_ATTN
-    // oracle: the door's decomposed path is the missing-Strides refusal, not
-    // an oracle, so there is nothing sound to fall back to.
+    // so the resident executor can substitute the host door, keyed on the
+    // node's CARRIED `program` kind — the mint's one statement of the fact,
+    // never the func name (the spelling this crate retired). NO opt-out: the
+    // door's decomposed path is the missing-Strides refusal, not an oracle, so
+    // there is nothing sound to fall back to.
     let door: Vec<bool> = spec
         .nodes
         .iter()
@@ -474,15 +329,15 @@ pub fn plan_segments_budgeted<'a>(
     let mut segments: Vec<Segment> = Vec::new();
     let mut i = 0;
     while i < spec.nodes.len() {
-        if attn[i] || door[i] {
+        if door[i] {
             segments.push(Segment::Native(spec.nodes[i].clone()));
             i += 1;
             continue;
         }
-        // Maximal run [start, j) of consecutive non-attention nodes.
+        // Maximal run [start, j) of consecutive non-door nodes.
         let start = i;
         let mut j = i;
-        while j < spec.nodes.len() && !attn[j] && !door[j] {
+        while j < spec.nodes.len() && !door[j] {
             j += 1;
         }
         // Split the maximal run into sub-runs that each fit the LX live-set
@@ -1630,98 +1485,9 @@ mod tests {
 
     // --- partial fusion: segment plan keeps attention nodes native ----------
 
-    /// A head-parallel attention node: a multi-head grid plus the attention op
-    /// signature (a `linalg.transpose` and the softmax `linalg.reduce {
-    /// arith.maximumf }`). Reads `in_arg`, writes `out_arg`. Mirrors the model's
-    /// `get_compute_tile_id` head select; the body is just enough to trip the
-    /// detector.
-    fn attn_node(name: &str, heads: usize) -> (IRFunction<'static>, Ssa, Ssa) {
-        let mut ops = Ops::new();
-        let hpid = ops.op(Some("%hpid"), OpKind::KtdpGetComputeTileId, &[]);
-        let vin = ops.op(Some("%vin"), OpKind::KtdpConstructMemoryView, &["%in"]);
-        let vin = ops.attr(vin, AttrKey::Shape, ops.int_list(vec![16]));
-        let vin = ops.attr(vin, AttrKey::Dtype, Attr::Dtype(DType::F16));
-        let tin = ops.op(Some("%tin"), OpKind::KtdpConstructAccessTile, &["%vin"]);
-        let tin = ops.attr(tin, AttrKey::Shape, ops.int_list(vec![16]));
-        let loaded = ops.op(Some("%loaded"), OpKind::KtdpLoad, &["%tin"]);
-        let kt = ops.op(Some("%kt"), OpKind::LinalgTranspose, &["%loaded"]);
-        let mx = ops.op(Some("%mx"), OpKind::LinalgReduce, &["%kt"]);
-        let mx = ops.attr(mx, AttrKey::ReduceFn, Attr::Op(OpKind::ArithMaximumf));
-        let vout = ops.op(Some("%vout"), OpKind::KtdpConstructMemoryView, &["%out"]);
-        let vout = ops.attr(vout, AttrKey::Shape, ops.int_list(vec![16]));
-        let vout = ops.attr(vout, AttrKey::Dtype, Attr::Dtype(DType::F16));
-        let tout = ops.op(Some("%tout"), OpKind::KtdpConstructAccessTile, &["%vout"]);
-        let tout = ops.attr(tout, AttrKey::Shape, ops.int_list(vec![16]));
-        let store = ops.op(None, OpKind::KtdpStore, &["%mx", "%tout"]);
-        let ret = ops.op(None, OpKind::FuncReturn, &[]);
-        let body = vec![hpid, vin, tin, loaded, kt, mx, vout, tout, store, ret];
-        let in_ssa = ops.ssa("%in");
-        let out_ssa = ops.ssa("%out");
-        let func = ops.func(
-            name,
-            &[("%in", IrType::Index), ("%out", IrType::Index)],
-            body,
-            (heads, 1, 1),
-        );
-        (func, in_ssa, out_ssa)
-    }
-
-    /// A token-parallel matmul node: a multi-core grid but NO transpose/softmax —
-    /// the GPU GEMM reconstruction runs it correctly at grid [1,1], so it must
-    /// NOT be treated as attention.
-    fn matmul_node(name: &str, cores: usize) -> (IRFunction<'static>, Ssa, Ssa) {
-        let mut ops = Ops::new();
-        let pid = ops.op(Some("%pid"), OpKind::KtdpGetComputeTileId, &[]);
-        let vin = ops.op(Some("%vin"), OpKind::KtdpConstructMemoryView, &["%in"]);
-        let vin = ops.attr(vin, AttrKey::Shape, ops.int_list(vec![16]));
-        let vin = ops.attr(vin, AttrKey::Strides, ops.int_list(vec![1]));
-        let vin = ops.attr(vin, AttrKey::MemorySpace, Attr::Str("HBM"));
-        let vin = ops.attr(vin, AttrKey::Dtype, Attr::Dtype(DType::F16));
-        let tin = ops.op(Some("%tin"), OpKind::KtdpConstructAccessTile, &["%vin"]);
-        let tin = ops.attr(tin, AttrKey::Shape, ops.int_list(vec![16]));
-        let loaded = ops.op(Some("%loaded"), OpKind::KtdpLoad, &["%tin"]);
-        // A linalg.matmul-shaped op — no transpose/softmax, so NOT attention.
-        let y = ops.op(Some("%y"), OpKind::LinalgMatmul, &["%loaded"]);
-        let vout = ops.op(Some("%vout"), OpKind::KtdpConstructMemoryView, &["%out"]);
-        let vout = ops.attr(vout, AttrKey::Shape, ops.int_list(vec![16]));
-        let vout = ops.attr(vout, AttrKey::Strides, ops.int_list(vec![1]));
-        let vout = ops.attr(vout, AttrKey::MemorySpace, Attr::Str("HBM"));
-        let vout = ops.attr(vout, AttrKey::Dtype, Attr::Dtype(DType::F16));
-        let tout = ops.op(Some("%tout"), OpKind::KtdpConstructAccessTile, &["%vout"]);
-        let tout = ops.attr(tout, AttrKey::Shape, ops.int_list(vec![16]));
-        let store = ops.op(None, OpKind::KtdpStore, &["%y", "%tout"]);
-        let ret = ops.op(None, OpKind::FuncReturn, &[]);
-        let body = vec![pid, vin, tin, loaded, y, vout, tout, store, ret];
-        let in_ssa = ops.ssa("%in");
-        let out_ssa = ops.ssa("%out");
-        let func = ops.func(
-            name,
-            &[("%in", IrType::Index), ("%out", IrType::Index)],
-            body,
-            (cores, 1, 1),
-        );
-        (func, in_ssa, out_ssa)
-    }
-
-    #[test]
-    fn detects_head_parallel_attention_node() {
-        // Multi-head grid + transpose + softmax reduce = attention.
-        assert!(is_attention_node(&attn_node("a", 9).0));
-        // Multi-core matmul (no transpose/softmax) = NOT attention.
-        assert!(!is_attention_node(&matmul_node("m", 8).0));
-        // Plain elementwise copy at grid [1,1] = NOT attention.
-        assert!(!is_attention_node(&copy_node("c", 16, true).0));
-        // Even WITH the attention op signature, a [1,1] grid (decode attention,
-        // single token) stays fused — grid clause gates it out.
-        let mut decode_attn = attn_node("d", 1).0;
-        decode_attn.grid = (1, 1, 1);
-        assert!(!is_attention_node(&decode_attn));
-    }
-
-    /// Program: src(1) -[copy a]-> t(2) -[attn b]-> t(3) -[copy c]-> result(4).
-    /// The attention node sits between two non-attention nodes.
+    /// Program: src(1) -[a]-> t(2) -[b]-> t(3) -[c]-> result(4).
     #[allow(clippy::too_many_arguments)]
-    fn three_node_attn_spec(
+    fn three_node_spec(
         a_in: Ssa,
         a_out: Ssa,
         b_in: Ssa,
@@ -1750,8 +1516,7 @@ mod tests {
                 },
                 NodeSpec {
                     func: "b".into(),
-                    // attn_node's body is the attention signature the walk classifies.
-                    program: Program::Attn,
+                    program: Program::Elementwise(Elementwise::Exp),
                     bindings: vec![
                         Binding {
                             arg: b_in,
@@ -1788,81 +1553,16 @@ mod tests {
     }
 
     #[test]
-    fn plan_isolates_attention_into_native_segment() {
-        let (fa, a_in, a_out) = copy_node("a", 16, true);
-        let (fb, b_in, b_out) = attn_node("b", 9);
-        let (fc, c_in, c_out) = copy_node("c", 16, true);
-        let m = module(vec![fa, fb, fc]);
-        let spec = three_node_attn_spec(a_in, a_out, b_in, b_out, c_in, c_out);
-        let segs = plan_segments(Arena::global(), &m, &spec).unwrap();
-        // Three segments: [fused a], [native b], [fused c].
-        assert_eq!(
-            segs.len(),
-            3,
-            "one fused segment per non-attention run + native attn"
-        );
-        assert!(matches!(segs[0], Segment::Fused(_)), "node a fused");
-        match &segs[1] {
-            Segment::Native(n) => assert_eq!(n.func, "b", "attention node b stays native"),
-            _ => panic!("expected native attention segment"),
-        }
-        assert!(matches!(segs[2], Segment::Fused(_)), "node c fused");
-
-        // The boundary edges (t2 into attn, t3 out of attn) must remain HBM
-        // pointer args on the adjacent fused segments — NOT forwarded as SSA.
-        let Segment::Fused(seg_a) = &segs[0] else {
-            unreachable!()
-        };
-        assert!(
-            seg_a.args.iter().any(|&(_, t)| t == 2),
-            "t2 stays HBM out of segment a: {:?}",
-            seg_a.args
-        );
-        // t2 is a's boundary OUTPUT (consumed by the native attn node).
-        assert!(
-            seg_a.outputs.contains(&2),
-            "t2 classified as segment a output"
-        );
-        assert!(
-            seg_a.inputs.contains(&1),
-            "t1 classified as segment a input"
-        );
-        let Segment::Fused(seg_c) = &segs[2] else {
-            unreachable!()
-        };
-        assert!(
-            seg_c.args.iter().any(|&(_, t)| t == 3),
-            "t3 stays HBM into segment c: {:?}",
-            seg_c.args
-        );
-        // t3 is c's boundary INPUT (produced by the native attn node); t4 output.
-        assert!(
-            seg_c.inputs.contains(&3),
-            "t3 classified as segment c input"
-        );
-        assert!(
-            seg_c.outputs.contains(&4),
-            "t4 classified as segment c output"
-        );
-        // Each fused segment still keeps its own load/store (no cross-segment
-        // SSA forwarding); the attention output round-trips HBM.
-        assert!(
-            seg_c.func.grid == (1, 1, 1),
-            "fused segment runs at grid [1,1]"
-        );
-    }
-
-    #[test]
     fn plan_isolates_door_into_native_segment_by_carried_kind() {
         // A door node is isolated by its CARRIED kind, never by its body: the
-        // middle node's body is a plain copy (the attention walk would leave it
-        // fused-eligible), and the `Program::ChainStage` payload alone puts it
+        // middle node's body is a plain copy (fused-eligible on its own), and the
+        // `Program::ChainStage` payload alone puts it
         // Native — the mint's one typed statement is the discriminator.
         let (fa, a_in, a_out) = copy_node("a", 16, true);
         let (fb, b_in, b_out) = copy_node("b", 16, true);
         let (fc, c_in, c_out) = copy_node("c", 16, true);
         let m = module(vec![fa, fb, fc]);
-        let mut spec = three_node_attn_spec(a_in, a_out, b_in, b_out, c_in, c_out);
+        let mut spec = three_node_spec(a_in, a_out, b_in, b_out, c_in, c_out);
         // The door tests' own toy payload (emit's chain_stage_tests consts).
         spec.nodes[1].program = Program::ChainStage {
             pad_vocab: 4096,
@@ -1885,20 +1585,16 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_non_attention_nodes_fuse_into_one_segment() {
-        // a -> b -> c all non-attention: a single fused segment, with the
+    fn consecutive_non_door_nodes_fuse_into_one_segment() {
+        // a -> b -> c, no door among them: a single fused segment, with the
         // intermediate edges forwarded as SSA (no t2/t3 HBM pointers).
         let (fa, a_in, a_out) = copy_node("a", 16, true);
         let (fb, b_in, b_out) = copy_node("b", 16, true);
         let (fc, c_in, c_out) = copy_node("c", 16, true);
         let m = module(vec![fa, fb, fc]);
-        let spec = three_node_attn_spec(a_in, a_out, b_in, b_out, c_in, c_out);
+        let spec = three_node_spec(a_in, a_out, b_in, b_out, c_in, c_out);
         let segs = plan_segments(Arena::global(), &m, &spec).unwrap();
-        assert_eq!(
-            segs.len(),
-            1,
-            "one fused segment for the whole non-attention run"
-        );
+        assert_eq!(segs.len(), 1, "one fused segment for the whole run");
         let Segment::Fused(seg) = &segs[0] else {
             panic!("expected fused")
         };
@@ -1910,31 +1606,5 @@ mod tests {
             vec![1, 4],
             "intra-run edges forwarded: {tensor_ids:?}"
         );
-    }
-
-    // Contract (B): the shared cap-threshold predicate must exhaustively and
-    // disjointly partition the cap axis at 7/8 of the LX budget, and fail safe
-    // (stay naive) at a zero budget.
-    #[test]
-    fn attention_needs_flash_partitions_at_seven_eighths() {
-        let lx = 2 * 1024 * 1024; // 2 MB
-        let thresh = lx * 7 / 8;
-        // Below the 7/8 cap → naive (head-batchable); at/above → flash.
-        assert!(
-            !attention_needs_flash(thresh - 1, lx),
-            "just below cap stays naive"
-        );
-        assert!(attention_needs_flash(thresh, lx), "at cap flips to flash");
-        assert!(attention_needs_flash(thresh + 1, lx), "above cap is flash");
-        assert!(
-            attention_needs_flash(usize::MAX, lx),
-            "huge footprint can't wrap"
-        );
-        // Fail-safe: an unknown/zero budget never forces an FA path.
-        assert!(
-            !attention_needs_flash(usize::MAX, 0),
-            "zero budget fails safe to naive"
-        );
-        assert!(!attention_needs_flash(0, lx), "empty scores never flash");
     }
 }
