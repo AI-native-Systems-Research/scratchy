@@ -1316,12 +1316,12 @@ const ATTN_SPLIT_KEYS: u32 = 1024;
 /// At most this many threadgroups a KV head's keys spread over.
 const ATTN_MAX_SPLITS: u32 = 16;
 
-/// The widest bucket a sinks layer's (gpt-oss) decode takes the split in: the bucket a decode
-/// step of the default `max_num_seqs` (128 rows) lands in. A wider bucket runs a decode step only
-/// past 512 sequences; it is a prefill bucket, and it keeps the twin, so a sinks model's prefill
-/// tapes are the ones it ran before the split took its decode. Carrying the split in the
-/// 2048-token bucket cost 3.2% of gpt-oss-20b's 4096-token TTFT on the M5 Max (#996), with every
-/// prefill kernel as fast or faster.
+/// The widest bucket a sinks layer's (gpt-oss) decode takes the split in. A decode step lands in a
+/// bucket no wider than `max_num_seqs`, which reaches the target only at load, so the bake bounds
+/// it here: 512 covers any `max_num_seqs` up to 512. A sinks model's buckets past it lower
+/// byte-identical to the ones it had before the split took its decode — they are prefill buckets.
+/// Past 512 sequences a sinks decode still runs, correctly, on the twin there; it only loses the
+/// split's speed, a cliff in decode time and never a wrong answer.
 const SINKS_SPLIT_MAX_BUCKET_M: u32 = 512;
 
 /// The query heads `attention_decode_gqa_tq` serves a KV head: the matrix units' row count —
