@@ -73,6 +73,7 @@ use ktir_emulator::interpreter::{Arg, Output};
 use triton_frontend::codegen::KernelSpec;
 use triton_frontend::target::Target;
 use triton_frontend::{codegen, opt};
+use triton_ktir::ir::PartitionClone;
 use triton_ktir_superdsc::cases;
 
 /// What went wrong, and at which leg. Same shape as `triton_ktir_superdsc::Refusal`, and for the
@@ -109,6 +110,11 @@ pub struct Lowered {
     /// `tl.constexpr`s it derived its tolerance from rather than restating them.
     pub spec: KernelSpec,
     pub grid: Vec<i64>,
+    /// The clone protocol's staging contract (`spyre.partition_clones`), empty unless
+    /// `unroll_grid_positions` fired: the arguments after the kernel's own parameters, each
+    /// one position's window of a grid-partitioned parameter. [`execute`] stages them from
+    /// the parameters' bindings and merges stored windows back.
+    pub clones: Vec<PartitionClone>,
 }
 
 /// `.py` SOURCE to their `IRFunction`. Every leg is a value; nothing reads a golden.
@@ -137,11 +143,20 @@ pub fn lower(config: &str) -> Result<Lowered> {
     triton_ktir::passes::to_ktir::run(&mut m, &grid)
         .map_err(|e| refuse("to_ktir", e.to_string()))?;
     refold_matmul_accumulators(&mut m);
+    let clones = m
+        .kernel()
+        .map_err(|e| refuse("to_ktir", e.to_string()))
+        .and_then(|k| PartitionClone::all(k).map_err(|e| refuse("to_ktir", e.to_string())))?;
 
     // LEG 3 -- our module -> THEIR `IRFunction`, in the process-wide arena so it is `'static`.
     let func = triton_ktir::passes::to_ktir_emit::lower(&m, Arena::global())
         .map_err(|e| refuse("to_ktir_emit", e.to_string()))?;
-    Ok(Lowered { func, spec, grid })
+    Ok(Lowered {
+        func,
+        spec,
+        grid,
+        clones,
+    })
 }
 
 /// Fold `decompose_matmul_accumulators`' rewrite BACK to the accumulate form before the emulator
@@ -222,11 +237,17 @@ fn refold_matmul_accumulators(m: &mut triton_ktir::ir::Module) {
         if dot_live_after {
             continue;
         }
-        // Rewrite: the matmul accumulates into `acc` and takes the addf's result name; the addf
-        // itself is dropped. The rewrite is POSITIONAL, not a range delete — the addf may be far
-        // from the matmul (other ops can sit between them and stay), and the splat/constant that
-        // fed `zero_t` is dropped only when the matmul was its LAST reader (it always is when the
-        // decompose minted it, but the check keeps the fold safe on any other program).
+        // Rewrite: the matmul accumulates into `acc` and takes the addf's result name. The rewrite
+        // is POSITIONAL, not a range delete — the addf may be far from the matmul (other ops can
+        // sit between them and stay), and the splat/constant that fed `zero_t` is dropped only
+        // when the matmul was its LAST reader (it always is when the decompose minted it, but the
+        // check keeps the fold safe on any other program).
+        //
+        // ⛔ THE FUSED MATMUL TAKES THE ADDF'S PLACE, NOT ITS OWN. `acc` need not exist yet where
+        // the matmul stood: `tl.dot(q, k.T) + mask` (`sdpa.py`) loads the mask BETWEEN the dot and
+        // the add, so a matmul left at its own index read `acc` before its definition (MEASURED:
+        // "undefined SSA value" on the mask load). At the addf's index every operand dominates it:
+        // `a`/`b` did at the earlier index, and `acc` does because the addf already read it.
         let sum = addf.results.first().copied();
         let Some(sum) = sum else { continue };
         let addf_idx = block
@@ -234,16 +255,15 @@ fn refold_matmul_accumulators(m: &mut triton_ktir::ir::Module) {
             .position(|o| o == &addf)
             .expect("the addf came from this block");
         // The matmul: outs := acc, result := the addf's name (the name every consumer reads).
-        {
-            let o = &mut block[idx];
-            o.operands[2] = acc;
-            o.results[0] = sum;
-            if let Some(ty) = addf.result_types.first() {
-                o.result_types[0] = ty.clone();
-            }
+        let mut fused = block[idx].clone();
+        fused.operands[2] = acc;
+        fused.results[0] = sum;
+        if let Some(ty) = addf.result_types.first() {
+            fused.result_types[0] = ty.clone();
         }
-        // Drop the addf.
-        block.remove(addf_idx);
+        block[addf_idx] = fused;
+        // Drop the matmul's old slot; the addf's slot now holds the fused op.
+        block.remove(idx);
         // Drop the splat/constant chain behind `zero_t` when the matmul was its last reader —
         // dead code once nothing references it (the emulator would charge the splat's tile).
         let mut dead: Vec<KSsa> = vec![zero_t];
@@ -330,13 +350,31 @@ impl Run {
 /// latency-tracked twin is PUBLIC, takes the same `&[(Ssa, Arg)]`, and does the same marshal, run
 /// and read-back -- it just also meters each op. We drop the report. This is a door choice, not an
 /// arithmetic one: both call `comm_sched::execute_with_communication` on the same operations.
+///
+/// ⭐ THE CLONE PROTOCOL IS HONOURED, NOT BYPASSED. When `unroll_grid_positions` fired, the
+/// function's arguments are the kernel's parameters followed by [`Lowered::clones`], and they are
+/// staged the way the protocol's contract says a host stages them -- each clone gets its
+/// parameter's bytes shifted up by the clone's row corner, and after the run every clone's window
+/// is written back into its parameter's read-back. (The program is the door's, up to this crate's
+/// [`refold_matmul_accumulators`].) `bindings` names the kernel's parameters only.
 pub fn execute(l: &Lowered, bindings: &[Binding]) -> Result<Run> {
-    let params: Vec<Ssa> = l.func.arguments.iter().map(|(s, _)| *s).collect();
+    let all: Vec<Ssa> = l.func.arguments.iter().map(|(s, _)| *s).collect();
+    let n_params = all.len().checked_sub(l.clones.len()).ok_or_else(|| {
+        refuse(
+            "bind",
+            format!(
+                "the clone manifest names {} clone(s) but the function takes only {} argument(s)",
+                l.clones.len(),
+                all.len()
+            ),
+        )
+    })?;
+    let params = &all[..n_params];
     if params.len() != bindings.len() {
         return Err(refuse(
             "bind",
             format!(
-                "the lowered function takes {} argument(s) and {} binding(s) were supplied \
+                "the lowered function takes {} parameter(s) and {} binding(s) were supplied \
                  ({:?}). REFUSING rather than binding a prefix: every buffer after a missing one \
                  would be off by one and the run would still produce numbers.",
                 params.len(),
@@ -345,8 +383,19 @@ pub fn execute(l: &Lowered, bindings: &[Binding]) -> Result<Run> {
             ),
         ));
     }
+    for (i, c) in l.clones.iter().enumerate() {
+        if c.clone_arg != n_params + i || c.param_arg >= n_params {
+            return Err(refuse(
+                "bind",
+                format!(
+                    "clone {i} of the manifest is {c:?}, but the clones must be arguments \
+                     {n_params}.. in order, each cloning one of the {n_params} parameters"
+                ),
+            ));
+        }
+    }
 
-    let mut args: Vec<(Ssa, Arg)> = Vec::with_capacity(bindings.len());
+    let mut args: Vec<(Ssa, Arg)> = Vec::with_capacity(all.len());
     for (ssa, b) in params.iter().zip(bindings) {
         let want = b.shape.iter().product::<usize>() * b.dtype.bytes_per_elem();
         if b.bytes.len() != want {
@@ -370,6 +419,17 @@ pub fn execute(l: &Lowered, bindings: &[Binding]) -> Result<Run> {
             },
         ));
     }
+    for c in &l.clones {
+        let b = &bindings[c.param_arg];
+        args.push((
+            all[c.clone_arg],
+            Arg::TensorBytes {
+                data: stage_clone(b, c)?,
+                shape: b.shape.clone(),
+                dtype: b.dtype,
+            },
+        ));
+    }
 
     let (raw, _latency) = ktir_emulator::interpreter::execute_function_with_latency(
         &l.func,
@@ -386,7 +446,95 @@ pub fn execute(l: &Lowered, bindings: &[Binding]) -> Result<Run> {
             outputs.insert(b.name.clone(), o.clone());
         }
     }
+    // Each clone's window back into its parameter. For a parameter the kernel only reads this
+    // writes back the bytes it was staged with; for one it stores to, it is the position's result.
+    for c in &l.clones {
+        let b = &bindings[c.param_arg];
+        let (Some(out), Some(clone)) = (outputs.get_mut(&b.name), raw.get(&all[c.clone_arg]))
+        else {
+            return Err(refuse(
+                "readback",
+                format!("clone {c:?} of `{}` came back without both buffers", b.name),
+            ));
+        };
+        merge_clone_window(out, clone, b, c)?;
+    }
     Ok(Run { outputs })
+}
+
+/// A binding as `[rows, width]`: its leading axis, and every other axis flattened into one row.
+fn rows_and_width(b: &Binding) -> Result<(usize, usize)> {
+    match b.shape.split_first() {
+        Some((&rows, rest)) => Ok((rows, rest.iter().product::<usize>())),
+        None => Err(refuse(
+            "bind",
+            format!(
+                "`{}` is a scalar; the clone protocol stages row windows",
+                b.name
+            ),
+        )),
+    }
+}
+
+/// The clone's window, checked against its parameter's extent: `(row_corner, rows, col_corner,
+/// cols)` as indices. A window that leaves the buffer is refused, never clipped.
+fn clone_window(b: &Binding, c: &PartitionClone) -> Result<(usize, usize, usize, usize)> {
+    let (total_rows, width) = rows_and_width(b)?;
+    let ix = |v: i64| usize::try_from(v).ok();
+    match (ix(c.row_corner), ix(c.rows), ix(c.col_corner), ix(c.cols)) {
+        (Some(r0), Some(rows), Some(c0), Some(cols))
+            if r0 + rows <= total_rows && c0 + cols <= width =>
+        {
+            Ok((r0, rows, c0, cols))
+        }
+        _ => Err(refuse(
+            "bind",
+            format!(
+                "clone {c:?} states a window outside `{}`'s [{total_rows}, {width}]",
+                b.name
+            ),
+        )),
+    }
+}
+
+/// The bytes a host stages at a clone: the parameter's rows from `row_corner` on, moved up to
+/// row 0 (zeros below). That holds the clone's window at the rows its rebased tile reads, at the
+/// same columns.
+fn stage_clone(b: &Binding, c: &PartitionClone) -> Result<Vec<u8>> {
+    let (r0, _, _, _) = clone_window(b, c)?;
+    let (_, width) = rows_and_width(b)?;
+    let skip = r0 * width * b.dtype.bytes_per_elem();
+    let mut staged = vec![0u8; b.bytes.len()];
+    staged[..b.bytes.len() - skip].copy_from_slice(&b.bytes[skip..]);
+    Ok(staged)
+}
+
+/// Write the clone's window (rows `[0, rows)` of the clone, at its columns) back into the
+/// parameter's read-back at rows `[row_corner, row_corner + rows)`, in both the decoded and the
+/// raw view so the two stay one buffer.
+fn merge_clone_window(
+    out: &mut Output,
+    clone: &Output,
+    b: &Binding,
+    c: &PartitionClone,
+) -> Result<()> {
+    let (r0, rows, c0, cols) = clone_window(b, c)?;
+    let (_, width) = rows_and_width(b)?;
+    let eb = b.dtype.bytes_per_elem();
+    if out.data.len() != clone.data.len() || out.raw.len() != clone.raw.len() {
+        return Err(refuse(
+            "readback",
+            format!("clone {c:?} came back a different size from `{}`", b.name),
+        ));
+    }
+    for r in 0..rows {
+        let src = r * width + c0;
+        let dst = (r0 + r) * width + c0;
+        out.data[dst..dst + cols].copy_from_slice(&clone.data[src..src + cols]);
+        out.raw[dst * eb..(dst + cols) * eb]
+            .copy_from_slice(&clone.raw[src * eb..(src + cols) * eb]);
+    }
+    Ok(())
 }
 
 /// The verdict on one comparison, carrying BOTH numbers.

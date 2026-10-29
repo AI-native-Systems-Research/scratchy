@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE THIRTY CONFIGURATIONS, STATED ONCE.
+//! THE THIRTY-THREE CONFIGURATIONS, STATED ONCE.
 //!
 //! A "configuration" is a `.py` fixture plus the `tl.constexpr` values and the launch grid it is
 //! compiled at. Three consumers need that tuple: `examples/bake_py` (the dxp bake),
@@ -95,6 +95,11 @@ pub const ALL: &[&str] = &[
     // NOT a production configuration: delete with the probe.
     "int_bcast",
     "attention_banded_batch",
+    // torch-spyre's SDPA decomposition (`test-fixtures/sdpa.py`), at three tilings its own
+    // planner (`_select_sdpa_tiling`) produces — see the `sdpa_*` case rows.
+    "sdpa_prefill_causal",
+    "sdpa_prefill_causal_scan",
+    "sdpa_decode",
 ];
 
 pub fn root() -> PathBuf {
@@ -745,6 +750,54 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
         // stays multi-dot so `dot_to_linalg`'s single-dot canonical verifiers (which
         // refuse a computed A-offset) never gate it — the same exemption the
         // production kernel rides.
+        // ⭐ TORCH-SPYRE'S SDPA, PORTED (`test-fixtures/sdpa.py`): one kernel, its two
+        // constexpr arms — the one-KV-block stable softmax and the online-softmax scan — at
+        // the plans torch-spyre's own `_select_sdpa_tiling` (decompositions.py:764, at
+        // a9fa997b, 32 cores) returns for each shape -- `test-numeric/torch_spyre_sdpa_plan.py`
+        // reruns it -- GQA 8:2 at HD=64 throughout. The grid is
+        // `(SQ / BLOCK_M, NQH, Z)`: torch-spyre's batch/head/group/query map levels, one query
+        // head per program.
+        //
+        // PREFILL, Lq = Lk = 256, causal: the planner returns `work_divided`, q_tile 256 and
+        // kv_block 256 x 1 — the ONE-BLOCK arm. The 256 query rows divide 4 ways per head, so
+        // the 32 programs land one per core.
+        "sdpa_prefill_causal" => (
+            spec(
+                "sdpa",
+                "sdpa_fwd",
+                SDPA,
+                &sdpa_ce(1, 256, 256, 64, 256, true),
+            ),
+            vec![4, 8, 1],
+            Program::Attn,
+        ),
+        // The SAME prefill shape at kv_block 128 x 2 — a candidate the planner enumerates
+        // (`_sdpa_kv_block_sizes`) but does not pick at 256; it picks this arm (256 x 8) at
+        // Lq = Lk = 2048, H = 32, whose data is 16x this size. The row exists so the MASKED
+        // scan runs: the mask tile walks the KV axis with the carry.
+        "sdpa_prefill_causal_scan" => (
+            spec(
+                "sdpa",
+                "sdpa_fwd",
+                SDPA,
+                &sdpa_ce(1, 256, 256, 64, 128, true),
+            ),
+            vec![4, 8, 1],
+            Program::Attn,
+        ),
+        // DECODE, batch 2, Lq = 1, Lk = 512, no mask: the planner returns `decode_tiled`,
+        // kv_block 256 x 2 and group_tiles 4 (one query head per tile) — the SCAN arm on a
+        // one-row query, the four-pointer entry point.
+        "sdpa_decode" => (
+            spec(
+                "sdpa",
+                "sdpa_fwd_nomask",
+                &SDPA[..4],
+                &sdpa_ce(2, 1, 512, 1, 256, false),
+            ),
+            vec![1, 8, 2],
+            Program::Attn,
+        ),
         "attention_banded_fold" => (banded_attn_spec(1), vec![1, 8, 4], Program::Attn),
         "attention_banded_batch" => (banded_attn_spec(2), vec![2, 8, 4], Program::Attn),
         // ⭐ PROBE-ONLY (front-b-noise): the noise-hash standalone — see the ALL-list
@@ -1179,6 +1232,44 @@ fn attn_ce(stage: i128) -> Vec<(&'static str, Val)> {
     ]
 }
 
+/// `sdpa_fwd`'s buffers in parameter order; the mask is LAST so the four-pointer
+/// `sdpa_fwd_nomask` signature is this table's prefix.
+const SDPA: &[(&str, &str)] = &[
+    ("desc_q", "*fp16"),
+    ("desc_k", "*fp16"),
+    ("desc_v", "*fp16"),
+    ("desc_o", "*fp16"),
+    ("desc_mask", "*fp16"),
+];
+
+/// `sdpa_fwd`'s constexprs: GQA 8:2 at HD=64 (granite's 4:1 group ratio), the scale
+/// torch-spyre defaults to (`1/sqrt(HD)` = 0.125, f16-exact), and the shape and tiling
+/// under test. `HAS_MASK` is `sdpa_fwd`'s alone — the no-mask entry point fixes it.
+fn sdpa_ce(
+    z: i128,
+    sq: i128,
+    skv: i128,
+    block_m: i128,
+    block_n: i128,
+    has_mask: bool,
+) -> Vec<(&'static str, Val)> {
+    let mut ce = vec![
+        ("Z", Val::Int(z)),
+        ("NQH", Val::Int(8)),
+        ("NKVH", Val::Int(2)),
+        ("HD", Val::Int(64)),
+        ("SQ", Val::Int(sq)),
+        ("SKV", Val::Int(skv)),
+        ("BLOCK_M", Val::Int(block_m)),
+        ("BLOCK_N", Val::Int(block_n)),
+        ("SCALE", Val::Float(0.125)),
+    ];
+    if has_mask {
+        ce.push(("HAS_MASK", Val::Bool(true)));
+    }
+    ce
+}
+
 /// The double-unroll count twin's buffers, in `banded_attn_fwd`'s parameter order — the
 /// production decode arm's own five: q/o rows, the transposed K plane, the V pool, and
 /// the i32 row-id table the V gather rides. No mask: the twin has no segment corners.
@@ -1382,7 +1473,7 @@ mod tests {
         }
         assert_eq!(
             super::ALL.len(),
-            30,
+            33,
             "a configuration was added or removed: update ALL (and the module title) deliberately"
         );
     }
