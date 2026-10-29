@@ -1316,6 +1316,14 @@ const ATTN_SPLIT_KEYS: u32 = 1024;
 /// At most this many threadgroups a KV head's keys spread over.
 const ATTN_MAX_SPLITS: u32 = 16;
 
+/// The widest bucket a sinks layer's (gpt-oss) decode takes the split in: the bucket a decode
+/// step of the default `max_num_seqs` (128 rows) lands in. A wider bucket runs a decode step only
+/// past 512 sequences; it is a prefill bucket, and it keeps the twin, so a sinks model's prefill
+/// tapes are the ones it ran before the split took its decode. Carrying the split in the
+/// 2048-token bucket cost 3.2% of gpt-oss-20b's 4096-token TTFT on the M5 Max (#996), with every
+/// prefill kernel as fast or faster.
+const SINKS_SPLIT_MAX_BUCKET_M: u32 = 512;
+
 /// The query heads `attention_decode_gqa_tq` serves a KV head: the matrix units' row count —
 /// the kernel takes the whole group when it divides the count evenly and fits, a smaller one
 /// zero-pads the fragment rows past it.
@@ -1342,8 +1350,8 @@ const fn combine_threads(hd: u32) -> u32 {
 /// each, at most [`ATTN_MAX_SPLITS`]), each storing its heads' partials at the op scratch's
 /// front, `[rows, num_q_heads, splits, 2 + head_dim]` floats, and a combine merges them
 /// into the output — a sinks layer's (gpt-oss) sink column with them, the combine binding the
-/// sinks and the splits storing the keys' partials alone. A causal layer's only: a sliding
-/// window keeps the twin. It records a row's bytes and the steps it runs on, as its gate — the
+/// sinks and the splits storing the keys' partials alone, in the buckets decode steps land in
+/// ([`SINKS_SPLIT_MAX_BUCKET_M`]). A causal layer's only: a sliding window keeps the twin. It records a row's bytes and the steps it runs on, as its gate — the
 /// command's, or else `row_gate`, the row's — admits them (`partials`,
 /// [`LoweredMetalTape::scratch_bytes`]): gated to decode steps, a row a sequence, the scratch
 /// holds the partials of the rows such a step brings, not of the bucket's every row; a
@@ -1393,7 +1401,8 @@ fn decode_attention_per_kv_head(
         // `NSG % SG` assert backs the same set at the bake).
         && matches!(hd, 64 | 128 | 256 | 512)
         && p.global_block_size.is_multiple_of(8)
-        && bucket_partials <= u32::MAX as u64;
+        && bucket_partials <= u32::MAX as u64
+        && (sinks.is_none() || at.bucket_m <= SINKS_SPLIT_MAX_BUCKET_M);
     if !full || !geometry || !cmds.iter().any(|c| takes(&c.command)) {
         return Ok(cmds);
     }
@@ -9883,6 +9892,49 @@ mod tests {
             *combine.bindings,
             [kept, vec![partials, sinks(COMBINE_SINKS_SLOT)]].concat()
         );
+    }
+
+    /// A sinks layer takes the split in every bucket up to [`SINKS_SPLIT_MAX_BUCKET_M`] and no
+    /// wider: a wider bucket is a prefill bucket and keeps the twin, so its tape is the one a sinks
+    /// model ran before the split took its decode. A layer without sinks takes the split in it.
+    #[test]
+    fn a_sinks_decode_keeps_the_twin_past_the_decode_buckets() {
+        let rows = || {
+            coded(
+                tq_writer(0, Causal, LLAMA_KV),
+                attention(MetalStep::AttentionViaCache, 0, Interleaved),
+            )
+        };
+        let kernels = |tape: MetalStepTape, bucket_m| {
+            let lowered = lower_subtile_tape_to_metal(&tape, &tq_consts(), bake_point(bucket_m, None))
+                .expect("lower_subtile_tape_to_metal");
+            (lowered.commands.iter())
+                .map(|c| c.command.kernel)
+                .filter(|k| {
+                    matches!(
+                        k,
+                        KernelId::AttentionViaCacheTq
+                            | KernelId::AttentionDecodeGqaTq
+                            | KernelId::AttentionDecodeCombine
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let split = vec![
+            KernelId::AttentionDecodeGqaTq,
+            KernelId::AttentionDecodeCombine,
+        ];
+        for bucket_m in [1, 8, 64, SINKS_SPLIT_MAX_BUCKET_M] {
+            assert_eq!(kernels(sinks_tape(rows()), bucket_m), split, "bucket {bucket_m}");
+        }
+        for bucket_m in [1024, 2048, 4096] {
+            assert_eq!(
+                kernels(sinks_tape(rows()), bucket_m),
+                [KernelId::AttentionViaCacheTq],
+                "bucket {bucket_m}"
+            );
+            assert_eq!(kernels(row_tape(rows()), bucket_m), split, "no sinks, bucket {bucket_m}");
+        }
     }
 
     /// A twin the split takes binding something other than the row's sinks at the partials' slot
