@@ -1015,10 +1015,12 @@ mod tests {
     // =======================================================================
     // Parity harness: pure-Rust CPU golden vs the REAL metal sampler pipeline.
     //
-    // The golden mirrors cuda `sample_top_k_top_p_core` (the spec) EXACTLY:
+    // The golden mirrors cuda `sample_top_k_top_p_core`'s pipeline:
     //   softmax(logit/T) -> radix-select top-k threshold -> min-p ->
     //   two-phase compaction -> sort desc -> top-p cutoff -> categorical draw
-    //   with the SAME host uniform (cumsum >= uniform*total).
+    //   with the SAME host uniform (cumsum >= uniform*total) —
+    // its top-p cutoff measured against the mass the top-k and min-p cuts keep, as vLLM's
+    // `apply_top_k_top_p` and Splash's `distribution_end` measure it.
     //
     // Because the GPU sum_exp reduction and Metal's `exp` differ from the
     // host by a few ULP, we only demand an EXACT token match when the draw is
@@ -1151,16 +1153,18 @@ mod tests {
         // Phase 5: sort descending by probability.
         cand.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
 
-        // Phase 6: top-p cutoff (inclusive: first index where cumsum > top_p).
+        // Phase 6: top-p cutoff (inclusive: first index where cumsum > top_p of the kept mass).
+        let kept: f32 = cand.iter().map(|c| c.0).sum();
+        let nucleus = top_p * kept;
         let mut cumsum = 0.0f32;
         let mut cutoff = num_candidates;
         let mut topp_margin = f32::INFINITY;
-        for (i, c) in cand.iter().enumerate() {
+        for (i, c) in cand.iter().enumerate().take_while(|_| top_p < 1.0) {
             let before = cumsum;
             cumsum += c.0;
-            if cumsum > top_p {
+            if cumsum > nucleus {
                 cutoff = i + 1;
-                topp_margin = (cumsum - top_p).min(top_p - before);
+                topp_margin = (cumsum - nucleus).min(nucleus - before);
                 break;
             }
         }
@@ -1986,8 +1990,8 @@ mod tests {
     /// cuda's selection and draw on the pipeline's probability row: the threshold
     /// (the cap-th largest bits, then the min-p floor over the row's max
     /// probability), the candidates (every strict one, then each slice's share
-    /// of the tied ones, slices in order), the top-p cutoff and the draw with
-    /// the finalize's sequential f32 sums. Returns the threshold, the drawn
+    /// of the tied ones, slices in order), the top-p cutoff against the mass the
+    /// candidates keep, and the draw, with the finalize's sequential f32 sums. Returns the threshold, the drawn
     /// candidate's probability and the tokens that may carry it.
     fn reference_draw(f: &Formed, draw: Draw, uniform: f32) -> (u32, u32, Vec<u32>) {
         let probs = &f.probs;
@@ -2030,11 +2034,12 @@ mod tests {
         }
         cand.sort_unstable_by(|a, b| b.cmp(a));
         let p = |b: u32| f32::from_bits(b);
+        let nucleus = draw.top_p * cand.iter().fold(0.0f32, |t, &b| t + p(b));
         let mut cumsum = 0.0f32;
         let mut cutoff = cand.len();
-        for (i, &b) in cand.iter().enumerate() {
+        for (i, &b) in cand.iter().enumerate().take_while(|_| draw.top_p < 1.0) {
             cumsum += p(b);
-            if cumsum > draw.top_p {
+            if cumsum > nucleus {
                 cutoff = i + 1;
                 break;
             }

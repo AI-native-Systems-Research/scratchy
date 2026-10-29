@@ -776,13 +776,22 @@ kernel void sample_finalize(
         }
     }
 
-    // ===== Top-p cutoff + renormalize + sample (cuda phase 6, thread 0) =====
+    // ===== Top-p cutoff + renormalize + sample (thread 0) =====
+    // The nucleus is measured against the mass the top-k and min-p cuts keep, as vLLM's
+    // `apply_top_k_top_p` (softmax over the top-k survivors) and Splash's sampling.metal
+    // `distribution_end` (`nucleus = top_p * top.mass`) measure it — not against the whole
+    // vocabulary's, which keeps every candidate whenever they weigh less than top_p together.
     if (tid == 0) {
+        float kept = 0.0f;
+        for (int i = 0; i < num_candidates; i++) {
+            kept += s_probs[i];
+        }
+        const float nucleus = top_p * kept;
         float cumsum = 0.0f;
         int cutoff = num_candidates;
-        for (int i = 0; i < num_candidates; i++) {
+        for (int i = 0; top_p < 1.0f && i < num_candidates; i++) {
             cumsum += s_probs[i];
-            if (cumsum > top_p) {
+            if (cumsum > nucleus) {
                 cutoff = i + 1;
                 break;
             }
