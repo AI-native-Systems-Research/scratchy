@@ -408,6 +408,14 @@ pub struct BenchServeArgs {
     #[arg(long)]
     pub dataset_path: Option<String>,
 
+    /// Dataset workloads: time comparable answers. Each request is forced to its task's answer
+    /// length (`ignore_eos`): a RAG task's 64 tokens, a conversation turn's recorded reply, a
+    /// shared-prefix question's 32. Answers ending on their own are each engine's own length,
+    /// so their total time is not like for like. Accuracy is not scored: the answers are forced.
+    /// A span query (`rag-spans`) cannot be forced; its answers still end on their own.
+    #[arg(long)]
+    pub timed_answers: bool,
+
     /// `sharegpt`: the most tokens a request asks for. A request asks for its conversation's
     /// recorded reply length, which runs to 800 tokens and more; this caps it, keeping the
     /// shorter ones as they are. None by default: the recorded lengths, as vLLM's suite sends.
@@ -584,6 +592,11 @@ pub enum ServeDataset {
     Random,
     /// The first human turn of each ShareGPT conversation (`--dataset-path`).
     Sharegpt,
+    /// Fixed-length prompts of natural text: `--input-len`-token slices of the ShareGPT file's
+    /// human turns (`--dataset-path`), at seeded offsets, each with `--output-len` answer tokens.
+    /// The fixed shape of `random`, with text that routes a mixture-of-experts model's experts
+    /// as real prompts do, where random token IDs do not.
+    Natural,
     /// Closed-loop chats sharing one system prompt, sent non-streaming to the
     /// chat endpoint: measures prefix reuse from one turn to the next.
     MultiTurn,

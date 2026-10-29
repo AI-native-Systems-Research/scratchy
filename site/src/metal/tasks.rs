@@ -203,6 +203,12 @@ pub fn tasks_table(m: &Model) -> Element {
              indicative only. The second total ratio is shown only where both engines' answers were \
              about one length."
         }
+        p { style: "font-size: 0.875rem",
+            "Load: an open-loop cell offers its requests at a fixed rate, a fraction of scratchy's own \
+             one-user rate on that model and workload (1 user (base)), and every engine is offered the \
+             same rate. Engines are compared at equal traffic: one slower than scratchy at one user is \
+             offered more than it gets through alone, so it queues, and its first token comes later."
+        }
     }
 }
 
