@@ -32,7 +32,7 @@ use crate::dtypes::DType;
 use crate::env::ConvertModel;
 use crate::ir::{Attr, IRFunction, Operation, Ssa};
 use crate::opkind::{Dialect, OpKind};
-use ktir_superdsc::element_arrangement::DL16TOFP32_SOURCE_LANE;
+use ktir_superdsc::element_arrangement::DL16TOFP32_PERMUTATION;
 
 // =========================================================================
 // Matmul acceleration tier — the GPU analogue of the BLAS auto-select.
@@ -2725,6 +2725,52 @@ impl StaggeredSite {
             shape: &self.shape,
         }
     }
+}
+
+/// The GATHER side of the card's `dl16tofp32` lane stagger:
+/// `DL16TOFP32_SOURCE_LANE[p]` is the logical lane a `Dl16ToFp32` block holds at
+/// buffer position `p`. The staging scatters (lane `i` is written at
+/// `DL16TOFP32_PERMUTATION[i]`, ktir-superdsc's ABI table); a kernel thread
+/// computes one position, so it gathers, and reads this row. Inverted from that
+/// table at compile time, never re-derived from the rotation and never copied.
+const DL16TOFP32_SOURCE_LANE: [u8; 64] = inverse_of(&DL16TOFP32_PERMUTATION);
+
+// The gather side inverts the scatter side, lane for lane: checked when the crate builds.
+const _: () = {
+    let mut lane = 0;
+    while lane < 64 {
+        assert!(
+            DL16TOFP32_SOURCE_LANE[DL16TOFP32_PERMUTATION[lane] as usize] as usize == lane,
+            "DL16TOFP32_SOURCE_LANE must invert DL16TOFP32_PERMUTATION"
+        );
+        lane += 1;
+    }
+};
+
+/// The inverse of a 64-lane permutation table — the const constructor behind
+/// [`DL16TOFP32_SOURCE_LANE`]. A table that is not a permutation of the block (a
+/// position past it, or one position written twice, which leaves another
+/// unwritten) has no inverse, and is refused: evaluated in a `const`, the panic
+/// is a build error, never a silently mis-inverted lane.
+const fn inverse_of(table: &[u8; 64]) -> [u8; 64] {
+    let mut inverse = [0u8; 64];
+    let mut written = [false; 64];
+    let mut lane = 0;
+    while lane < 64 {
+        let position = table[lane] as usize;
+        assert!(
+            position < 64,
+            "a lane permutation names a position past its 64-lane block"
+        );
+        assert!(
+            !written[position],
+            "a lane permutation writes one position twice, so it is not a permutation"
+        );
+        written[position] = true;
+        inverse[position] = lane as u8;
+        lane += 1;
+    }
+    inverse
 }
 
 /// The MSL gather a staggered widen's operand is read through

@@ -63,53 +63,6 @@ const fn dl16tofp32_permutation() -> [u8; 64] {
     table
 }
 
-/// The GATHER side of the same fact: `DL16TOFP32_SOURCE_LANE[p]` is the logical lane a
-/// [`ElementArrangement::Dl16ToFp32`] block holds at buffer position `p`, so
-/// `DL16TOFP32_SOURCE_LANE[DL16TOFP32_PERMUTATION[i]] == i`. The staging SCATTERS (lane `i` is
-/// written at its row of [`DL16TOFP32_PERMUTATION`]); a consumer that computes one buffer
-/// position at a time — the emulator's fused map kernel, one thread per output element —
-/// GATHERS, and reads this row. Inverted from [`DL16TOFP32_PERMUTATION`] at compile time, never
-/// re-derived from the rotation, so the two sides cannot drift apart.
-pub const DL16TOFP32_SOURCE_LANE: [u8; 64] = inverse_of(&DL16TOFP32_PERMUTATION);
-
-// The gather side inverts the scatter side, lane for lane: checked when the crate builds.
-const _: () = {
-    let mut lane = 0;
-    while lane < 64 {
-        assert!(
-            DL16TOFP32_SOURCE_LANE[DL16TOFP32_PERMUTATION[lane] as usize] as usize == lane,
-            "DL16TOFP32_SOURCE_LANE must invert DL16TOFP32_PERMUTATION"
-        );
-        lane += 1;
-    }
-};
-
-/// The inverse of a 64-lane permutation table — the const constructor behind
-/// [`DL16TOFP32_SOURCE_LANE`]. A table that is not a permutation of the block (a
-/// position past it, or one position written twice, which leaves another
-/// unwritten) has no inverse, and is refused: evaluated in a `const`, the panic
-/// is a build error, never a silently mis-inverted lane.
-const fn inverse_of(table: &[u8; 64]) -> [u8; 64] {
-    let mut inverse = [0u8; 64];
-    let mut written = [false; 64];
-    let mut lane = 0;
-    while lane < 64 {
-        let position = table[lane] as usize;
-        assert!(
-            position < 64,
-            "a lane permutation names a position past its 64-lane block"
-        );
-        assert!(
-            !written[position],
-            "a lane permutation writes one position twice, so it is not a permutation"
-        );
-        written[position] = true;
-        inverse[position] = lane as u8;
-        lane += 1;
-    }
-    inverse
-}
-
 /// ⭐ THE TARGET-ABI CONST TABLE — opcode → the arrangement the op's OUTPUT carries when both
 /// operands are addressed standard. The shared propagation takes this table as INPUT; it never
 /// decides an arrangement by logic of its own (the in-place-kernels/write-bindings law: target
