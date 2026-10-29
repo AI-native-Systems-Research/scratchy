@@ -116,6 +116,13 @@ pub(crate) struct BundleMeta {
     /// straight off its own `wiring` field below.
     #[cfg(not(feature = "spyre-hw"))]
     pub(crate) phase: scratchy_target_spyre::forward_tape::ForwardPhase,
+    /// ⭐ THE MINTED SAMPLER'S SEAT — the wiring's own (`Wiring::sample_seat`), projected at load
+    /// like `phase` above (never a second derivation). `Some` on every rung the bake minted the
+    /// draw into: the emulator forward stages this seat's law every step and reads the pick back
+    /// through the re-pointed result. Emulator-only: the card path reads it straight off its own
+    /// `wiring` field.
+    #[cfg(not(feature = "spyre-hw"))]
+    pub(crate) sample_seat: Option<scratchy_target_spyre::wiring::SampleSeat>,
     /// What the bake placed — asked ONCE, in the target crate, off the generated layout.
     /// Read only by the card launch path, so it carries that cfg like `prog`/`output_ids` above.
     #[cfg(feature = "spyre-hw")]
@@ -733,12 +740,10 @@ pub(crate) struct ReqState {
     /// `top_k`, `min_p`, penalties or `n > 1` is turned away at admission rather than served a
     /// draw that ignores half of what it asked for.
     ///
-    /// ⛔ CARD-ONLY, `cfg`-ed out like the `kv_k` mirror below rather than documented as unused:
-    /// every READER of this field stages the minted sampler's seat laws, and the mint is a
-    /// decode-bundle card fact — the emulator runs no minted sampler (its chunks pick nothing;
-    /// the pick step refuses naming the missing sampler), so under `spyre-emu` a request carries
-    /// no draw and the admission-time knob refusal moves to the pick step's own refusal.
-    #[cfg(feature = "spyre-hw")]
+    /// BOTH TIERS: every reader stages the minted sampler's seat laws, and the bake mints the
+    /// draw into the emulator's bundles exactly as into the card's — the emulator's forward
+    /// stages the same law per step (packed, at its views' own dtypes) and reads the same idx
+    /// stick back.
     pub(crate) draw: Option<SampledDraw>,
     /// ⛔ A HOST MIRROR OF THE KV — and it does not exist on the sendnn path at all.
     ///
@@ -765,11 +770,8 @@ pub(crate) struct ReqState {
 /// added. Carried on [`ReqState::draw`] — one value per request, staged per
 /// step by the seat's binders.
 ///
-/// ⛔ CARD-ONLY (the cfg of [`ReqState::draw`]): the draw exists to stage the
-/// minted sampler's seat laws, and the mint is a decode-bundle card fact — the
-/// emulator runs no minted sampler, so there is nothing on that build to stage
-/// a draw for.
-#[cfg(feature = "spyre-hw")]
+/// Both tiers stage it: the bake mints the draw into every rung it bakes, the
+/// emulator's included (see [`ReqState::draw`]).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SampledDraw {
     /// The seed of the row's quadruple `(seed_lo, seed_hi, step, 1)` — the
@@ -785,7 +787,6 @@ pub(crate) struct SampledDraw {
     pub(crate) inv_t: f32,
 }
 
-#[cfg(feature = "spyre-hw")]
 impl SampledDraw {
     /// ⭐ THE DRAW A REQUEST'S SAMPLING PARAMS ASK FOR — the ONE derivation, run
     /// at admission. `Ok(None)` is the greedy law (no params, or temperature
