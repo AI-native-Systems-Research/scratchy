@@ -1,0 +1,84 @@
+{
+  "config": "sdpa_prefill_causal",
+  "fixture": "sdpa",
+  "kernel": "sdpa_fwd",
+  "inputs_fn": "inputs",
+  "reference_fn": "reference",
+  "seed": 0,
+  "torch": "2.8.0",
+  "generated_by": "test/numeric/gen_numeric_data.py",
+  "constexprs": {
+    "Z": 1,
+    "NQH": 8,
+    "NKVH": 2,
+    "HD": 64,
+    "SQ": 256,
+    "SKV": 256,
+    "BLOCK_M": 64,
+    "BLOCK_N": 256,
+    "SCALE": 0.125,
+    "HAS_MASK": true
+  },
+  "grid": [
+    4,
+    8,
+    1
+  ],
+  "inputs": [
+    {
+      "arg": "desc_q",
+      "file": "in_desc_q.bin",
+      "shape": [
+        256,
+        512
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_k",
+      "file": "in_desc_k.bin",
+      "shape": [
+        256,
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_v",
+      "file": "in_desc_v.bin",
+      "shape": [
+        256,
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
+      "arg": "desc_o",
+      "file": "in_desc_o.bin",
+      "shape": [
+        256,
+        512
+      ],
+      "dtype": "f16",
+      "zeroed": true
+    },
+    {
+      "arg": "desc_mask",
+      "file": "in_desc_mask.bin",
+      "shape": [
+        256,
+        256
+      ],
+      "dtype": "f16"
+    }
+  ],
+  "output": {
+    "arg": "desc_o",
+    "file": "ref_out.bin",
+    "shape": [
+      256,
+      512
+    ],
+    "dtype": "f16"
+  }
+}
