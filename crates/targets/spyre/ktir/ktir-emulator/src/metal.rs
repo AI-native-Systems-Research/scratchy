@@ -2481,6 +2481,9 @@ pub struct MapRegionKernel {
     pub live_out: Ssa,
     pub out_shape: Vec<usize>,
     pub out_dtype: DType,
+    /// Whether the kernel reads a staggered widen's operand through the
+    /// `dl16tofp32` source-lane table: a window the card model permutes.
+    pub reads_staggered: bool,
 }
 
 /// Compile a Map window (the `window` op indices into `ops`, from `plan_kernels`)
@@ -2627,6 +2630,7 @@ fn emit_map_region_kernel_with(
         live_out: live_out_name,
         out_shape,
         out_dtype,
+        reads_staggered,
     })
 }
 
@@ -2806,6 +2810,13 @@ impl MapLowering<'_, '_> {
     /// type, the very lookup the bake's `convert_kind_of` makes when it maps the
     /// pair 1:1 to `dl16tofp32`. A widen shorter than one block has no whole block
     /// to permute (the staging keeps it verbatim), so it reads at its own site.
+    ///
+    /// ⛔ AN UNTYPED OPERAND IS UNDECIDABLE HERE, so it is `Err`, never a plain
+    /// widen by default. With no static element type the interpreter still decides
+    /// — from the tile it holds at run time — and under the card model an f16 tile
+    /// staggers. A planned kernel cannot know which it will be, so a widen whose
+    /// answer turns on it keeps its window on the interpreter (correctness over
+    /// fusion).
     fn staggered_operand_site(
         &mut self,
         op: &Operation,
@@ -2814,13 +2825,20 @@ impl MapLowering<'_, '_> {
         if op.op_type != OpKind::ArithExtf {
             return Ok(None);
         }
-        let from = op
-            .operands
-            .first()
-            .and_then(|v| self.defs.get(v))
+        let operand = op.operands.first().copied();
+        let from = operand
+            .and_then(|v| self.defs.get(&v))
             .and_then(|d| d.result_type)
             .and_then(|t| t.elem());
         let to = op.result_type.and_then(|t| t.elem());
+        if from.is_none() && self.model.widen_staggers(Some(DType::F16), to) {
+            return Err(format!(
+                "metal: widen operand {} has no static element type, and under the card \
+                 model it staggers iff its tile is f16, which a planned kernel cannot \
+                 know — window stays on interpreter",
+                operand.map_or_else(|| "(none)".to_string(), |v| format!("%{}", v.0))
+            ));
+        }
         if !self.model.widen_staggers(from, to) {
             return Ok(None);
         }
@@ -3079,6 +3097,15 @@ fn try_fold_scalar(name: Ssa, defs: &HashMap<Ssa, &Operation>) -> Option<String>
 pub static MAP_REGION_GPU_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Count of fused map windows that read through the `dl16tofp32` source-lane
+/// table ([`MapRegionKernel::reads_staggered`]) and ran on the GPU — the proof
+/// that a staggered widen's window was offloaded, not left on the interpreter
+/// (whose answer is right on its own, so a fallback cannot be seen in the
+/// output). A subset of [`MAP_REGION_GPU_COUNT`].
+#[cfg(metal)]
+pub static MAP_REGION_STAGGERED_GPU_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Run a compiled Map window as one fused GPU kernel, binding its live-out tile
 /// in `ctx`. Reads each live-in's f32 data from the value table (must be a
 /// resident `Tile`), dispatches the kernel (one thread per output element), and
@@ -3151,6 +3178,9 @@ pub fn run_map_region_gpu(
     ctx.set_value(mrk.live_out, crate::ir::Value::Tile(tile));
     ctx.track_lx(mrk.live_out, bytes)?;
     MAP_REGION_GPU_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if mrk.reads_staggered {
+        MAP_REGION_STAGGERED_GPU_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(())
 }
 
@@ -7455,6 +7485,10 @@ kernel void mpp_probe(
             "the IEEE widen is a plain relabel:\n{}",
             ieee.kernel.source
         );
+        assert!(
+            card.reads_staggered && !ieee.reads_staggered,
+            "the kernel states whether it reads through the stagger"
+        );
 
         let mut ops = Ops::new();
         let (stmts, window) = widen_window(&mut ops, 32);
@@ -7463,6 +7497,10 @@ kernel void mpp_probe(
         assert_eq!(
             card.kernel.source, ieee.kernel.source,
             "a widen shorter than one block has nothing to permute"
+        );
+        assert!(
+            !card.reads_staggered,
+            "nor does it read through the stagger"
         );
 
         // `%w + %p` alone: no widen in the window.
@@ -7474,6 +7512,42 @@ kernel void mpp_probe(
             card.map(|k| k.kernel.source),
             ieee.map(|k| k.kernel.source),
             "a window without a widen is the same kernel under both models"
+        );
+    }
+
+    /// Under the card model a widen's answer turns on its operand's element type.
+    /// With none stated, the interpreter still decides — from the tile it holds at
+    /// run time — but a planned kernel cannot, so the window stays on the
+    /// interpreter rather than widening plainly by default. Under IEEE nothing
+    /// staggers, so the same window fuses as before.
+    #[test]
+    fn an_untyped_widen_stays_on_the_interpreter_under_the_card_model() {
+        use DType::F32;
+        use OpKind::{ArithAddf, ArithExtf, KtdpLoad, KtdpStore};
+        let mut ops = Ops::new();
+        let row = [1i64, 200];
+        // `%x` states its shape but no result type: its element type is unknown.
+        let x = ops.op(Some("%x"), KtdpLoad, &["%tx"]);
+        let shape = ops.int_list(row.to_vec());
+        let x = ops.attr(x, AttrKey::Shape, shape);
+        let stmts = vec![
+            x,
+            typed(&mut ops, "%p", KtdpLoad, &["%tp"], &row, F32),
+            typed(&mut ops, "%w", ArithExtf, &["%x"], &row, F32),
+            typed(&mut ops, "%a", ArithAddf, &["%w", "%p"], &row, F32),
+            ops.op(None, KtdpStore, &["%a", "%ta"]),
+        ];
+        let window = [2, 3];
+        let card = emit_map_region_kernel(&stmts, &window, ConvertModel::Card);
+        assert!(
+            card.as_ref()
+                .is_err_and(|e| e.contains("no static element type")),
+            "the card model cannot decide an untyped widen, so it must not fuse it: {card:?}"
+        );
+        let ieee = emit_map_region_kernel(&stmts, &window, ConvertModel::Ieee);
+        assert!(
+            ieee.as_ref().is_ok_and(|k| !k.reads_staggered),
+            "under IEEE the untyped widen fuses as a plain relabel: {ieee:?}"
         );
     }
 

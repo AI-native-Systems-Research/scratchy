@@ -129,15 +129,19 @@ fn greedy_draw(vocab: u32, argmax: usize) -> u32 {
     out[&idx_tid][0] as u32
 }
 
-/// How many map windows the emulator has run as ONE fused Metal kernel so far, where it has the
-/// Metal backend (its `cfg(metal)`: macOS); `None` elsewhere.
+/// How many fused map windows that read through the card's `dl16tofp32` source-lane table — a
+/// staggered widen's window — the emulator has run on Metal so far, where it has the Metal
+/// backend (its `cfg(metal)`: macOS); `None` elsewhere.
 #[cfg(target_os = "macos")]
-fn fused_map_windows() -> Option<usize> {
-    Some(ktir_emulator::metal::MAP_REGION_GPU_COUNT.load(std::sync::atomic::Ordering::Relaxed))
+fn staggered_windows_on_metal() -> Option<usize> {
+    Some(
+        ktir_emulator::metal::MAP_REGION_STAGGERED_GPU_COUNT
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 #[cfg(not(target_os = "macos"))]
-fn fused_map_windows() -> Option<usize> {
+fn staggered_windows_on_metal() -> Option<usize> {
     None
 }
 
@@ -146,20 +150,26 @@ fn a_greedy_draw_answers_the_planted_maximum() {
     let vocab = 49155u32; // granite's
     let mut report = Vec::new();
     for argmax in [0usize, 7, 8, 9, 15, 16, 39752, 39751, 39744, 49154] {
-        let before = fused_map_windows();
+        let before = staggered_windows_on_metal();
         let got = greedy_draw(vocab, argmax);
-        // ⭐ THE OFFLOAD PROOF. The row's widen windows are past the fused-map size gate, so where
-        // the emulator has Metal they run as fused kernels — the path that drew argmax + 8 when it
-        // widened without the card's lane stagger. The interpreter alone already draws right, so
-        // a draw that never reached the kernel would pass here and prove nothing.
-        if let (Some(before), Some(after)) = (before, fused_map_windows()) {
-            assert!(
-                after > before,
-                "planted {argmax}: the draw ran no map window on the fused Metal kernel"
-            );
-        }
+        // ⭐ THE OFFLOAD PROOF. The row's staggered widens sit in windows past the fused-map size
+        // gate, so where the emulator has Metal those windows run as fused kernels that read
+        // through the stagger table — the path that drew argmax + 8 when it widened without the
+        // stagger. The interpreter alone already draws right, so a staggered window that fell
+        // back to it would pass here unseen: EACH draw must run at least one on Metal.
+        let on_metal = match (before, staggered_windows_on_metal()) {
+            (Some(before), Some(after)) => {
+                assert!(
+                    after > before,
+                    "planted {argmax}: the draw ran no staggered widen's window on the fused \
+                     Metal kernel"
+                );
+                format!(", {} staggered window(s) on Metal", after - before)
+            }
+            _ => String::new(),
+        };
         println!(
-            "  planted {argmax:>6} -> drew {got:>6} (diff {:+})",
+            "  planted {argmax:>6} -> drew {got:>6} (diff {:+}){on_metal}",
             got as i64 - argmax as i64
         );
         if got as usize != argmax {
