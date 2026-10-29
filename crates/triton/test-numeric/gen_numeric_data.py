@@ -85,7 +85,7 @@ import numpy as np
 import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_FIXTURES = os.path.abspath(os.path.join(_HERE, "..", "fixtures"))
+_FIXTURES = os.path.abspath(os.path.join(_HERE, "..", "test-fixtures"))
 
 SEED = 0
 
@@ -173,6 +173,15 @@ def _attn_ce_1tile():
     # non-causal 1-tile geometry: STAGE=1, everything else shared with the 16-tile launch.
     return {"Z": 1, "H": 4, "N_CTX": 256, "HEAD_DIM": 128,
             "BLOCK_M": 64, "BLOCK_N": 64, "GQA": 2, "STAGE": 1, "sm_scale": 1.0}
+
+
+def _sdpa_ce(z, sq, skv, block_m, block_n, has_mask):
+    # A copy of `sdpa_ce` in `triton-ktir-superdsc/src/cases.rs` (the authority).
+    ce = {"Z": z, "NQH": 8, "NKVH": 2, "HD": 64, "SQ": sq, "SKV": skv,
+          "BLOCK_M": block_m, "BLOCK_N": block_n, "SCALE": 0.125}
+    if has_mask:
+        ce["HAS_MASK"] = True
+    return ce
 
 
 CONFIGS = {
@@ -297,6 +306,17 @@ CONFIGS = {
         fixture="paged_attention_multiblock", kernel="paged_attn_multiblock_fwd",
         ce={"NUM_BLOCKS": 2, "BLOCK_N": 64, "HEAD_DIM": 64, "V": 1024,
             "BLOCK_M": 64}, grid=[1]),
+    # torch-spyre's SDPA decomposition (`sdpa.py`), at the three plans `cases.rs` records: the
+    # one-KV-block causal prefill, the same prefill scanned in two KV blocks, and the two-block
+    # scan of an unmasked batch-2 decode. The reference is torch's own
+    # `scaled_dot_product_attention` in f32 -- not the decomposition restated.
+    "sdpa_prefill_causal": dict(fixture="sdpa", kernel="sdpa_fwd",
+                                ce=_sdpa_ce(1, 256, 256, 64, 256, True), grid=[4, 8, 1]),
+    "sdpa_prefill_causal_scan": dict(fixture="sdpa", kernel="sdpa_fwd",
+                                     ce=_sdpa_ce(1, 256, 256, 64, 128, True), grid=[4, 8, 1],
+                                     data_dir="sdpa_prefill_causal"),
+    "sdpa_decode": dict(fixture="sdpa", kernel="sdpa_fwd_nomask",
+                        ce=_sdpa_ce(2, 1, 512, 1, 256, False), grid=[1, 8, 2]),
 }
 
 # Above this, the bytes are NOT checked in: `meta.json` carries `"oversized": true`, `"staging"`,
@@ -617,6 +637,28 @@ def _paged_attention_multiblock_inputs(mod, ce):
     return ins, ref, note
 
 
+def _sdpa_inputs(mod, ce):
+    z, nqh, nkvh, hd = ce["Z"], ce["NQH"], ce["NKVH"], ce["HD"]
+    sq, skv = ce["SQ"], ce["SKV"]
+    causal = bool(ce.get("HAS_MASK", False))
+    q, k, v, mask = mod.inputs(seed=SEED, z=z, nqh=nqh, nkvh=nkvh, hd=hd, sq=sq, skv=skv,
+                               causal=causal)
+    ref = mod.reference(q, k, v, z, nqh, nkvh, hd, sq, skv, ce["SCALE"], causal)
+    # torch-spyre's algorithm itself, in torch at this configuration's KV block, must agree with
+    # the reference before any bytes are written.
+    err = mod.check_decomposition(q, k, v, mask, ref, z, nqh, nkvh, hd, sq, skv, ce["SCALE"],
+                                  ce["BLOCK_N"])
+    print(f"      torch-spyre decomposition at BLOCK_N={ce['BLOCK_N']}: "
+          f"max|dec - ref| = {err:.3e}")
+    ins = [("desc_q", q, "f16"), ("desc_k", k, "f16"), ("desc_v", v, "f16"),
+           ("desc_o", torch.zeros(z * sq, nqh * hd, dtype=torch.float16), "f16")]
+    if causal:
+        # `spyre::causal_mask`'s tile, -inf above the diagonal. The REFERENCE never reads it
+        # (torch's `is_causal`), so a wrong mask staging cannot agree with the reference.
+        ins.append(("desc_mask", mask, "f16"))
+    return ins, ref, None
+
+
 def _attn_inputs_1tile(mod, ce):
     z, h, gqa = ce["Z"], ce["H"], ce["GQA"]
     n_ctx, hd, block_m = ce["N_CTX"], ce["HEAD_DIM"], ce["BLOCK_M"]
@@ -719,6 +761,9 @@ BUILD = {
     "paged_score_small": _paged_score_inputs,
     "paged_attention_small": _paged_attention_inputs,
     "paged_attention_multiblock": _paged_attention_multiblock_inputs,
+    "sdpa_prefill_causal": _sdpa_inputs,
+    "sdpa_prefill_causal_scan": _sdpa_inputs,
+    "sdpa_decode": _sdpa_inputs,
 }
 
 # Which function produced each side, for `meta.json`. The default is the FIXTURE's own

@@ -2200,6 +2200,7 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
     if !materialize.is_empty() {
         let fn_args: BlockArgs = kernel.regions[0].args.clone();
         let mut new_args: BlockArgs = Vec::new();
+        let mut clones: Vec<PartitionClone> = Vec::new();
         let mut flat: Vec<Op> = Vec::new();
         // ptr -> its ONE view's body index. A pointer with several views (none in the
         // fixtures here) has no single extent to clone from, so it is refused by name
@@ -2247,6 +2248,52 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
                 .find(|(v, _)| v == &ptr)
                 .map(|(_, t)| t.clone())
                 .unwrap_or(IrType::Index);
+            // THE STAGING CONTRACT for this clone (`spyre.partition_clones`): which
+            // parameter, and which window of it, the host puts here. Without it the clone
+            // is an argument nobody can bind -- a launcher would have to re-derive every
+            // position's corner from the kernel source.
+            let param_arg = fn_args.iter().position(|(v, _)| v == &ptr).ok_or_else(|| {
+                refuse(format!(
+                    "a grid-partitioned view reads {ptr:?}, which is not a function \
+                     argument, so its clone has no parameter to stage from"
+                ))
+            })?;
+            let dims = o
+                .result_types
+                .first()
+                .and_then(|t| t.dims())
+                .map(|d| d.to_vec())
+                .unwrap_or_default();
+            let col_corner = match o.operands.get(2) {
+                None => 0,
+                Some(s) => {
+                    crate::passes::dot_to_linalg::const_int_index(&index, *s).ok_or_else(|| {
+                        refuse(
+                            "a grid-partitioned tile's column corner did not fold to a \
+                             constant, so its clone's window has no stageable columns",
+                        )
+                    })?
+                }
+            };
+            let (rows, cols) = match dims.as_slice() {
+                [r] => (*r, 1),
+                [r, c] => (*r, *c),
+                other => {
+                    return Err(refuse(format!(
+                        "a grid-partitioned tile of rank {} has no row/column window to \
+                         stage; the clone protocol states rank-1 and rank-2 windows only",
+                        other.len()
+                    )));
+                }
+            };
+            clones.push(PartitionClone {
+                clone_arg: fn_args.len() + new_args.len(),
+                param_arg,
+                row_corner: corner.expect("a nonzero corner reached here"),
+                rows,
+                col_corner,
+                cols,
+            });
             // THE CLONE: fresh argument, view of the ORIGINAL extent over it.
             let arg = module.fresh_named(&module.hint(ptr));
             new_args.push((arg, arg_ty));
@@ -2278,6 +2325,7 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
             let kernel = module.kernel_mut().map_err(|e| refuse(e.to_string()))?;
             kernel.regions[0].ops = flat;
             kernel.regions[0].args.extend(new_args);
+            kernel.set_attr(AttrKey::PartitionClones, PartitionClone::encode(&clones));
         }
     }
     Ok(())
