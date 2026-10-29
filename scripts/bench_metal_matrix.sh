@@ -30,8 +30,8 @@
 #
 # Needs: passwordless `sudo purge` for the frozen rung (a sudoers rule for
 # /usr/sbin/purge; see the Metal bench skill), or pass --scenarios cold,warm.
-# Energy needs macOS 27+ (the sampler's CLPC counter ids are per-OS-release
-# constants; it refuses loudly on anything else and the run dies there).
+# Energy: the sampler reads the CLPC counters on macOS 27 and IOReport's Energy
+# Model group elsewhere; a rail with no live channel ends the run.
 # Weights download on first use unless --offline.
 #
 # Scaling (--no-scaling skips it; --scale-axes picks from conc,input,output,grid):

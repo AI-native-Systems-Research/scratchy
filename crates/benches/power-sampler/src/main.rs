@@ -8,6 +8,7 @@
 //! Modes:
 //!   (no args)          sample and print CSV
 //!   --interval-ms N    sampling interval (default 1000)
+//!   --samples N        stop after N lines (default: until signalled)
 //!   --dump             list every IOReport channel this machine exposes
 //!   --dump-clpc        list the CLPC energy counters discovered (debug)
 //!
@@ -134,6 +135,13 @@ mod ffi {
     unsafe extern "C" {
         // The samples-based API libIOReport.tbd exports.
         pub fn IOReportCopyAllChannels(a: u64, b: u64) -> CFDictionaryRef;
+        pub fn IOReportCopyChannelsInGroup(
+            group: CFStringRef,
+            subgroup: CFStringRef,
+            a: u64,
+            b: u64,
+            c: u64,
+        ) -> CFDictionaryRef;
         pub fn IOReportCreateSubscription(
             a: *const u8,
             channels: CFMutableDictionaryRef,
@@ -420,17 +428,15 @@ mod clpc {
         pub channels: Vec<(u64, &'static str)>,
     }
 
+    /// Whether this macOS reads energy from the CLPC counters: on 27, where
+    /// "Energy Model"'s CPU Energy channel reads 0 under load. Every other
+    /// release reads the "Energy Model" group by channel name.
+    pub fn is_clpc_release(version: &str) -> bool {
+        version.starts_with("27.")
+    }
+
     /// Find every AppleCLPC service and the counters it carries.
-    pub fn discover(version: &str) -> Vec<Service> {
-        if !version.starts_with("27.") {
-            eprintln!(
-                "error: CLPC energy counter ids are known for macOS 27 only, this is {version}"
-            );
-            eprintln!(
-                "       (they are extracted per OS release; refusing to read ids that may be wrong)"
-            );
-            std::process::exit(1);
-        }
+    pub fn discover() -> Vec<Service> {
         let (cpu_i, gpu_i, ane_i) = INDICES_27;
         let mut out = Vec::new();
         let name = std::ffi::CString::new("AppleCLPC").unwrap();
@@ -540,6 +546,7 @@ enum Mode {
 #[cfg(target_os = "macos")]
 fn main() {
     let mut interval_ms = 1000u64;
+    let mut samples: Option<u64> = None;
     let mut mode = Mode::Csv;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -547,6 +554,14 @@ fn main() {
         match args[i].as_str() {
             "--dump" => mode = Mode::Dump,
             "--dump-clpc" => mode = Mode::DumpClpc,
+            "--samples" => {
+                i += 1;
+                samples = args.get(i).and_then(|v| v.parse().ok());
+                if samples.is_none() {
+                    eprintln!("--samples takes a count");
+                    std::process::exit(2);
+                }
+            }
             "--interval-ms" => {
                 i += 1;
                 if let Some(v) = args.get(i) {
@@ -562,7 +577,20 @@ fn main() {
     }
 
     let version = ffi::os_product_version();
-    let services = clpc::discover(&version);
+    let clpc_release = clpc::is_clpc_release(&version);
+    let services = if clpc_release {
+        clpc::discover()
+    } else {
+        Vec::new()
+    };
+    eprintln!(
+        "macOS {version}: energy from {}",
+        if clpc_release {
+            "the CLPC counters"
+        } else {
+            "IOReport's Energy Model group"
+        }
+    );
 
     if mode == Mode::DumpClpc {
         if services.is_empty() {
@@ -604,29 +632,48 @@ fn main() {
         return;
     }
 
-    sample_csv(all, all_arr, &channels_key, &services, interval_ms);
+    sample_csv(
+        all,
+        &channels_key,
+        &services,
+        clpc_release,
+        interval_ms,
+        samples,
+    );
 }
 
 #[cfg(target_os = "macos")]
 fn sample_csv(
     all: ffi::CFDictionaryRef,
-    all_arr: ffi::CFArrayRef,
     channels_key: &ffi::Owned,
     services: &[clpc::Service],
+    clpc_release: bool,
     interval_ms: u64,
+    samples: Option<u64>,
 ) {
     use std::thread::sleep;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
-    // The selection: every global channel carrying a power or energy unit
-    // (older chips expose them there), plus the synthesized CLPC counters.
-    let n = unsafe { ffi::CFArrayGetCount(all_arr) };
+    // The selection: the synthesized CLPC counters on a CLPC release, else
+    // the "Energy Model" group's channels, read by name.
     let selected = ffi::array_new();
-    for i in 0..n {
-        let ch = unsafe { ffi::CFArrayGetValueAtIndex(all_arr, i) } as ffi::CFDictionaryRef;
-        let unit = ffi::to_rust(unsafe { ffi::IOReportChannelGetUnitLabel(ch) });
-        if unit.trim() == "mW" || unit.trim() == "nJ" {
-            unsafe { ffi::CFArrayAppendValue(selected.0, ch as ffi::CFTypeRef) };
+    if !clpc_release {
+        let group = ffi::cfstr(ENERGY_MODEL);
+        let em = unsafe { ffi::IOReportCopyChannelsInGroup(group.0, std::ptr::null(), 0, 0, 0) };
+        if em.is_null() {
+            eprintln!("error: IOReport has no {ENERGY_MODEL:?} group on this machine");
+            std::process::exit(1);
+        }
+        let em = ffi::Owned(em);
+        let arr = unsafe { ffi::CFDictionaryGetValue(em.0, channels_key.0) } as ffi::CFArrayRef;
+        let n = if arr.is_null() {
+            0
+        } else {
+            unsafe { ffi::CFArrayGetCount(arr) }
+        };
+        for i in 0..n {
+            let ch = unsafe { ffi::CFArrayGetValueAtIndex(arr, i) };
+            unsafe { ffi::CFArrayAppendValue(selected.0, ch) };
         }
     }
     let clpc_wanted: Vec<&'static str> = services
@@ -674,16 +721,13 @@ fn sample_csv(
         eprintln!("IOReportCreateSamples failed");
         std::process::exit(1);
     }
-    let mut prev_at = Instant::now();
-    let mut warned = false;
-    loop {
+    let mut checked = false;
+    let mut written = 0u64;
+    while samples.is_none_or(|n| written < n) {
         sleep(Duration::from_millis(interval_ms));
         let next = unsafe { ffi::IOReportCreateSamples(subs, subscribed, std::ptr::null()) };
-        let next_at = Instant::now();
         let delta = unsafe { ffi::IOReportCreateSamplesDelta(prev, next, std::ptr::null()) };
-        let elapsed = next_at.duration_since(prev_at).as_secs_f64();
         prev = next;
-        prev_at = next_at;
 
         // One CSV line: unix_seconds,cpu_j,gpu_j,ane_j. CLPC counters are
         // nJ over the interval; global power channels are mW, integrated
@@ -691,6 +735,7 @@ fn sample_csv(
         let mut clpc = [0.0f64; 3];
         let mut global = [0.0f64; 3];
         let mut saw = [false; 3];
+        let mut saw_global = [false; 3];
         let arr = unsafe { ffi::CFDictionaryGetValue(delta, channels_key.0) } as ffi::CFArrayRef;
         if arr.is_null() {
             continue; // a delta with no channel array: nothing to read
@@ -699,7 +744,6 @@ fn sample_csv(
         for i in 0..dn {
             let ch = unsafe { ffi::CFArrayGetValueAtIndex(arr, i) } as ffi::CFDictionaryRef;
             let group = ffi::to_rust(unsafe { ffi::IOReportChannelGetGroup(ch) });
-            let sub = ffi::to_rust(unsafe { ffi::IOReportChannelGetSubGroup(ch) });
             let name = ffi::to_rust(unsafe { ffi::IOReportChannelGetChannelName(ch) });
             let unit = ffi::to_rust(unsafe { ffi::IOReportChannelGetUnitLabel(ch) })
                 .trim()
@@ -715,22 +759,16 @@ fn sample_csv(
                 };
                 saw[idx] = true;
                 clpc[idx] += v / 1e9;
-            } else {
-                let full = format!("{group}/{sub}/{name}").to_lowercase();
-                let idx = if full.contains("gpu") {
-                    1
-                } else if full.contains("ane") {
-                    2
-                } else if full.contains("cpu") || full.contains("ecc") || full.contains("mcu") {
-                    0
-                } else {
+            } else if group == ENERGY_MODEL {
+                let Some(idx) = ENERGY_MODEL_RAILS.iter().position(|&r| r == name) else {
                     continue;
                 };
-                match unit.as_str() {
-                    "nJ" => global[idx] += v / 1e9,
-                    "mW" => global[idx] += v / 1000.0 * elapsed,
-                    _ => {}
-                }
+                let Some(per_joule) = joules_per_unit(&unit) else {
+                    eprintln!("error: {ENERGY_MODEL}/{name} is in {unit:?}, not mJ, uJ or nJ");
+                    std::process::exit(1);
+                };
+                saw_global[idx] = true;
+                global[idx] += v * per_joule;
             }
         }
         // Where the CLPC counters are live they are the number; global
@@ -741,26 +779,68 @@ fn sample_csv(
             if saw[1] { clpc[1] } else { global[1] },
             if saw[2] { clpc[2] } else { global[2] },
         ];
-        if !warned {
+        // Every rail needs a live source on the first interval: a rail with
+        // none would be written as 0 J, so the run stops instead.
+        if !checked {
             let missing: Vec<&str> = ["cpu", "gpu", "ane"]
                 .into_iter()
-                .zip(saw)
-                .filter(|&(rail, live)| clpc_wanted.contains(&rail) && !live)
+                .zip(saw.iter().zip(saw_global))
+                .filter(|&(_, (&c, g))| !c && !g)
                 .map(|(rail, _)| rail)
                 .collect();
             if !missing.is_empty() {
-                eprintln!(
-                    "warning: CLPC returned no samples for: {}",
-                    missing.join(", ")
-                );
-                warned = true;
+                eprintln!("error: no energy channel for: {}", missing.join(", "));
+                std::process::exit(1);
             }
+            checked = true;
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
         println!("{now:.3},{:.3},{:.3},{:.3}", out[0], out[1], out[2]);
+        written += 1;
+    }
+}
+
+/// The IOReport group every release before 27 reads energy from, by name.
+#[cfg(target_os = "macos")]
+const ENERGY_MODEL: &str = "Energy Model";
+
+/// Its channels for cpu, gpu and ane, in that order.
+#[cfg(target_os = "macos")]
+const ENERGY_MODEL_RAILS: [&str; 3] = ["CPU Energy", "GPU Energy", "ANE"];
+
+/// Joules per count of an IOReport energy unit label.
+#[cfg(any(target_os = "macos", test))]
+fn joules_per_unit(unit: &str) -> Option<f64> {
+    match unit {
+        "mJ" => Some(1e-3),
+        "uJ" | "µJ" => Some(1e-6),
+        "nJ" => Some(1e-9),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn energy_units_convert_to_joules() {
+        assert_eq!(joules_per_unit("mJ"), Some(1e-3));
+        assert_eq!(joules_per_unit("uJ"), Some(1e-6));
+        assert_eq!(joules_per_unit("nJ"), Some(1e-9));
+        assert_eq!(joules_per_unit("mW"), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_macos_27_reads_clpc() {
+        assert!(clpc::is_clpc_release("27.0.1"));
+        assert!(clpc::is_clpc_release("27.2"));
+        assert!(!clpc::is_clpc_release("26.4"));
+        assert!(!clpc::is_clpc_release("28.0"));
     }
 }
 

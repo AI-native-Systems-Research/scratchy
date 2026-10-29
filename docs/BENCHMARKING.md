@@ -130,14 +130,16 @@ nothing is self-reported.
   eviction ran, from `/proc/meminfo` `Cached` sampled either side of it.
 - **`power`** — whole-run energy, from the workspace's own
   [`scratchy-power-sampler`](../crates/benches/power-sampler) binary: Apple's
-  IOReport CLPC energy counters (cumulative nJ, no root, no third-party tool),
+  IOReport energy counters (no root, no third-party tool),
   sampled at 1 Hz from before the first build to after the last server is
   down, so the number covers everything the run cost — the same window for
   every engine. Reported per rail (`cpu_j`, `gpu_j`, `ane_j`) and for the SoC
-  total (`soc_j`, `soc_wh`, `soc_avg_w`, `soc_peak_w`). The counter ids are
-  per-OS-release constants, known for macOS 27; on anything else the sampler
-  refuses loudly rather than read ids that may be wrong, and the run dies
-  there instead of reporting zeros.
+  total (`soc_j`, `soc_wh`, `soc_avg_w`, `soc_peak_w`). On macOS 27 it reads
+  the CLPC counters (cumulative nJ, per-chip-driver ids), because there the
+  "Energy Model" group's `CPU Energy` channel reads 0 under load; on every
+  other release it reads the "Energy Model" group's `CPU Energy`, `GPU Energy`
+  and `ANE` channels by name. A rail with no live channel stops the sampler,
+  and the run, instead of reporting zeros.
 
 ### Proving the eviction happened
 

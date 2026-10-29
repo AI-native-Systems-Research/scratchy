@@ -397,6 +397,14 @@ jobs:
       - name: KTIR optimizer tests
         run: cargo test -p ktir-optimizer
 
+      # The Metal matrix's energy sampler on this runner's macOS: its unit
+      # tests, then three real samples, which exit non-zero if any rail has no
+      # live energy channel here.
+      - name: Power sampler
+        run: |
+          cargo test -p scratchy-power-sampler
+          cargo run --release -p scratchy-power-sampler -- --samples 3
+
       # Variant-selection gates (#202). These decide WHICH compiled model
       # variant claims a checkpoint, and both halves fail OPEN — a broken
       # pattern matcher or a dropped per-layer row rejects nothing, so the
