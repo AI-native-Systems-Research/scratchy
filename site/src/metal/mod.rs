@@ -19,14 +19,15 @@ use dioxus::prelude::*;
 
 use crate::Site;
 use crate::carbon::{
-    Alignment, ContentPanel, ContentSwitcher, ContentSwitcherItem, Fold, Heading, Layer,
-    PanelToggle, Section, Stack, Table, TableCell, TableRow, Tag, TagKind, Tile, Toggletip,
+    Alignment, ContentPanel, ContentSwitcher, ContentSwitcherItem, Fold, Heading, Layer, Section,
+    Stack, TabItem, Table, TableCell, TableRow, Tabs, TabsKind, Tag, TagKind, Tile, Toggletip,
 };
 use crate::charts::{
-    Axes, Axis, AxisDomain, BarPoint, Better, BubblePoint, Bubbles, Chart, ChartOptions,
-    ColorLegend, Colour, Enabled, Gradient, HeatPoint, HeatmapOptions, Locale, RATIO_RANGE,
-    RATIO_STEPS, RatioSquare, ScaleFit, SparkAxes, Step, TableAxes, chart, colour, glance_maps,
-    glance_mini, highlight, log2_ratio, mini_heatmap, ratio_scale, ratio_step, sparkline,
+    Axes, Axis, AxisDomain, BarPoint, Better, Bounds, BubblePoint, Bubbles, Chart, ChartOptions,
+    ColorLegend, Colour, ComboLayer, Enabled, Gradient, HeatPoint, HeatmapOptions, Hover,
+    LineOptions, Locale, RATIO_RANGE, RATIO_STEPS, Ramp, RatioSquare, ScaleFit, SparkAxes,
+    SparkPoint, Step, TableAxes, chart, colour, glance_maps, glance_mini, highlight, log2_ratio,
+    mini_heatmap, ratio_scale, ratio_step, sparkline,
 };
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab};
 use data::{At, Bytes, Cell, Model, RequestTiming, Run, Scenario};
@@ -898,6 +899,8 @@ fn bar_chart(
             combo: None,
             bounds: None,
             bubble: None,
+            line: None,
+            hover: None,
             toolbar: Enabled { enabled: false },
         },
     };
@@ -944,6 +947,8 @@ fn grid_heatmap(
             combo: None,
             bounds: None,
             bubble: None,
+            line: None,
+            hover: None,
             toolbar: Enabled { enabled: false },
         },
         ratio,
@@ -1828,16 +1833,7 @@ impl<'a> Latency<'a> {
     /// cell's own ranges ([`Axes2::Own`]) or on `span`, its small multiple's ([`Axes2::Same`]).
     /// Requests an engine landed within one dot of each other are one bubble, its area their
     /// count, so a batch's identical TTFTs show as the crowd they are, not as one dot.
-    /// Bare, no axis titles or tick labels: a panel of a dense grid, its axes the grid's to say.
-    fn chart(
-        &self,
-        k: CellKey,
-        span: Span,
-        axes: Axes2,
-        side: Px,
-        bare: bool,
-        label: &str,
-    ) -> Element {
+    fn chart(&self, k: CellKey, span: Span, axes: Axes2, side: Px, label: &str) -> Element {
         let Some(own) = self.span(&[k]) else {
             return rsx! {};
         };
@@ -1845,16 +1841,15 @@ impl<'a> Latency<'a> {
             Axes2::Own => own,
             Axes2::Same => span,
         };
-        let unit_radius = if bare { 2.5 } else { 3.5 };
+        let unit_radius = 3.5;
         let data = bubbles(&self.requests(k), (ttft, tpot), side, unit_radius);
         let axis = |maps_to, title, scale_type, domain| Axis {
             maps_to,
-            // Kept on a bare chart's hidden axes: Carbon's tooltip names each timing by it.
             title,
             scale_type,
             ticks: None,
             include_zero: Some(false),
-            visible: bare.then_some(false),
+            visible: None,
             domain: Some(AxisDomain::Values(domain)),
         };
         let spec = Chart::Bubble {
@@ -1883,18 +1878,18 @@ impl<'a> Latency<'a> {
                     radius_label: "Requests",
                     fill_opacity: 0.6,
                 }),
+                line: None,
+                hover: None,
                 toolbar: Enabled { enabled: false },
             },
         };
         // Its title inside its plot, top left, letting the pointer through to the dots under it.
         let (u, o, i) = k;
-        let size = if bare { "0.625rem" } else { "0.75rem" };
-        let inset = if bare { "2px 4px" } else { "4px 0 0 3.5rem" };
         rsx! {
             div { style: "position: relative; width: {side}",
                 {chart(&spec, label, &format!("width: {side}"), None)}
-                span { style: "position: absolute; top: 0; left: 0; padding: {inset}; font-size: {size}; pointer-events: none",
-                    if bare { "{i}·×{u}" } else { "{i} in, {o} out, {u} at once" }
+                span { style: "position: absolute; top: 0; left: 0; padding: 4px 0 0 3.5rem; font-size: 0.75rem; pointer-events: none",
+                    "{i} in, {o} out, {u} at once"
                 }
             }
         }
@@ -1902,29 +1897,213 @@ impl<'a> Latency<'a> {
 }
 
 impl Latency<'_> {
-    /// Every cell at one answer length as a dense grid of bare square scatters, users at once
-    /// down and prompt size across, every panel on the same axes.
-    fn inner_grid(&self, o: u32, side: Px, axes: Axes2, label: &str) -> Element {
-        let ks: Vec<CellKey> = self.keys.iter().copied().filter(|k| k.1 == o).collect();
-        let Some(span) = self.span(&ks) else {
+    /// One cell's `t` as each engine's empirical CDF: the share of its requests (up) done within
+    /// each time (across), a step at every request, on the cell's own range, each curve run on to
+    /// the range's end. Between scratchy's curve and its rival's, the sparklines' fills: cyan where
+    /// more of scratchy's requests are done by then, red where fewer; across the middle, a line
+    /// from one median to the other, cyan or red as scratchy's is the sooner or later, its factor
+    /// written over it. Bare, as an overview's panel: no axis titles or tick labels, `tag` in its
+    /// corner; as wide as its column and [`GLANCE_CHART_HEIGHT`] high, as the sparklines are.
+    fn ecdf(&self, k: CellKey, t: RequestTiming, tag: &str, label: &str) -> Element {
+        let curves: Vec<(Engine, Vec<f64>)> = (self.engines.iter())
+            .filter_map(|&e| {
+                let rs = self.cell(e, k)?.requests.as_ref()?;
+                let mut vs: Vec<f64> = rs.of(t).filter_map(|(_, v)| v).collect();
+                vs.sort_by(f64::total_cmp);
+                (!vs.is_empty()).then_some((e, vs))
+            })
+            .collect();
+        let ends = |(_, vs): &(Engine, Vec<f64>)| (vs[0], vs[vs.len() - 1]);
+        let Some((lo, hi)) =
+            (curves.iter().map(ends)).reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))
+        else {
             return rsx! {};
         };
+        // A twentieth of the range either side; where every request took the same time, a
+        // twentieth of that time (at least 1 ms), so the range never closes.
+        let pad = (if hi > lo { hi - lo } else { hi.abs().max(1.0) }) / 20.0;
+        let end = hi + pad;
+        let point = |group, key, value: f64| SparkPoint {
+            group,
+            key,
+            value: Some(value),
+            upper: None,
+            lower: None,
+            factor: None,
+        };
+        let mut data: Vec<SparkPoint> = (curves.iter())
+            .flat_map(|(e, vs)| {
+                let n = vs.len() as f64;
+                std::iter::once(point(e.label(), vs[0], 0.0))
+                    .chain(
+                        (vs.iter().enumerate())
+                            .map(move |(i, &v)| point(e.label(), v, (i + 1) as f64 / n)),
+                    )
+                    .chain(std::iter::once(point(e.label(), end, 1.0)))
+            })
+            .collect();
+        let mut lines: Vec<&'static str> = curves.iter().map(|(e, _)| e.label()).collect();
+        let mut dashed: Vec<&'static str> = Vec::new();
+        if let [(_, mine), (_, theirs)] = curves.as_slice() {
+            // Each curve's share done by `x`, at every step either takes: the fills' bounds.
+            let share =
+                |vs: &[f64], x: f64| vs.partition_point(|&v| v <= x) as f64 / vs.len() as f64;
+            let mut xs: Vec<f64> = mine.iter().chain(theirs).copied().chain([end]).collect();
+            xs.sort_by(f64::total_cmp);
+            xs.dedup();
+            for x in xs {
+                let (a, b) = (share(mine, x), share(theirs, x));
+                // Each fill spans the curves where its side is ahead, and nothing elsewhere.
+                for (group, shown) in [(ECDF_AHEAD, a > b), (ECDF_BEHIND, a < b)] {
+                    let (low, high) = if shown { (a.min(b), a.max(b)) } else { (a, a) };
+                    data.push(SparkPoint {
+                        upper: Some(high),
+                        lower: Some(low),
+                        ..point(group, x, high)
+                    });
+                }
+            }
+            // Both are times, lower better: how many times sooner scratchy's median is.
+            if let (Some(m), Some(r)) = (quantile(mine, 50.0), quantile(theirs, 50.0)) {
+                let factor = r / m;
+                let group = if factor >= 1.0 {
+                    ECDF_SOONER
+                } else {
+                    ECDF_LATER
+                };
+                // The factor sits a little over the line, at its middle.
+                let over = 0.5 + 0.12;
+                data.extend([
+                    point(group, m, 0.5),
+                    SparkPoint {
+                        upper: Some(over),
+                        lower: Some(over),
+                        factor: Some(factor),
+                        ..point(group, (m + r) / 2.0, 0.5)
+                    },
+                    point(group, r, 0.5),
+                ]);
+                lines.push(group);
+                dashed.push(group);
+            }
+        }
+        let axis = |maps_to, title, domain| Axis {
+            maps_to,
+            // Kept on the hidden axes: Carbon's tooltip names each value by it.
+            title,
+            scale_type: None,
+            ticks: None,
+            include_zero: Some(false),
+            visible: Some(false),
+            domain: Some(AxisDomain::Values(domain)),
+        };
+        let fills = curves.len() == 2;
+        let spec = Chart::Combo {
+            data,
+            dashed,
+            options: ChartOptions {
+                title: String::new(),
+                axes: Axes {
+                    bottom: axis("key", "ms", [lo - pad, end]),
+                    left: axis("value", "share of requests", [0.0, 1.0]),
+                },
+                color: Some(Colour::Scale {
+                    scale: (self.engines.iter().zip(["s1", "s2"]))
+                        .map(|(&e, class)| (e.label(), colour(class)))
+                        .chain([
+                            // The heat maps' cyan and red: 50 to fill, 70 for the median line.
+                            (ECDF_AHEAD, Ramp::Cyan.at::<50>()),
+                            (ECDF_BEHIND, Ramp::Red.at::<50>()),
+                            (ECDF_SOONER, Ramp::Cyan.at::<70>()),
+                            (ECDF_LATER, Ramp::Red.at::<70>()),
+                        ])
+                        .collect(),
+                }),
+                heatmap: None,
+                height: GLANCE_CHART_HEIGHT.to_string(),
+                width: Some("100%".to_string()),
+                legend: Some(Enabled { enabled: false }),
+                locale: None,
+                // Carbon draws an area's bounds only when the layer holds one series.
+                combo: Some(
+                    (fills
+                        .then_some([ECDF_AHEAD, ECDF_BEHIND])
+                        .into_iter()
+                        .flatten())
+                    .map(|fill| ComboLayer {
+                        kind: "area",
+                        corresponding_datasets: vec![fill],
+                    })
+                    .chain([ComboLayer {
+                        kind: "line",
+                        corresponding_datasets: lines,
+                    }])
+                    .collect(),
+                ),
+                bounds: Some(Bounds {
+                    upper_bound_maps_to: "upper",
+                    lower_bound_maps_to: "lower",
+                }),
+                bubble: None,
+                line: Some(LineOptions {
+                    curve: "curveStepAfter",
+                    points: Enabled { enabled: false },
+                }),
+                // A step per request, each curve its own: no one step lists every series.
+                hover: Some(Hover::NONE),
+                toolbar: Enabled { enabled: false },
+            },
+        };
+        rsx! {
+            div { style: "position: relative; width: 100%",
+                {chart(&spec, label, "width: 100%", None)}
+                span { style: "position: absolute; top: 0; left: 0; padding: 2px 4px; font-size: 0.625rem; font-weight: 600; pointer-events: none",
+                    "{tag}"
+                }
+            }
+        }
+    }
+
+    /// Every cell at answer length `o` as a small multiple, users at once down and prompt size
+    /// across, each column `column` wide (a grid track), under `title`: `cell` draws each.
+    fn multiple(
+        &self,
+        o: u32,
+        column: &str,
+        title: &str,
+        cell: impl Fn(CellKey) -> Element,
+    ) -> Element {
+        let ks: Vec<CellKey> = self.keys.iter().copied().filter(|k| k.1 == o).collect();
         let mut users: Vec<u32> = ks.iter().map(|k| k.0).collect();
         let mut prompts: Vec<u32> = ks.iter().map(|k| k.2).collect();
         users.dedup();
         prompts.sort_unstable();
         prompts.dedup();
-        let grid = format!(
-            "display: grid; grid-template-columns: repeat({}, {side}); gap: 2px",
+        let columns = format!(
+            "display: grid; grid-template-columns: max-content repeat({}, {column}); gap: 0.5rem; align-items: center",
             prompts.len()
         );
+        // Each column and row named with its unit: "128 input tokens", "1 user".
+        let users_at = |u: u32| {
+            if u == 1 {
+                "1 user".to_string()
+            } else {
+                format!("{u} users")
+            }
+        };
         rsx! {
-            div { style: "{grid}",
-                for &u in &users {
-                    for &i in &prompts {
-                        div { style: "outline: 1px solid var(--cds-border-subtle-01, #e0e0e0); width: {side}; height: {side}",
-                            if ks.contains(&(u, o, i)) {
-                                {self.chart((u, o, i), span, axes, side, true, &format!("{label}, {i} in {u} at once"))}
+            Stack { gap: 3,
+                strong { "{title}" }
+                div { style: "{columns}",
+                    div {}
+                    for i in &prompts { div { style: "text-align: center", "{i} input tokens" } }
+                    for &u in &users {
+                        div { "{users_at(u)}" }
+                        for &i in &prompts {
+                            div { style: "min-width: 0",
+                                if ks.contains(&(u, o, i)) {
+                                    {cell((u, o, i))}
+                                }
                             }
                         }
                     }
@@ -1934,8 +2113,17 @@ impl Latency<'_> {
     }
 }
 
-/// An inner grid's panel in the overview: small enough that a model's whole grid fits its column.
-const INNER_SIDE: Px = Px(80);
+/// A glance chart's height, the scaling sparklines' and the latency ECDFs' alike; each is as wide
+/// as its column.
+const GLANCE_CHART_HEIGHT: &str = "4.5rem";
+
+/// An ECDF's fills ([`Latency::ecdf`]): where more of scratchy's requests are done than its
+/// rival's, and where fewer.
+const ECDF_AHEAD: &str = "scratchy ahead";
+const ECDF_BEHIND: &str = "scratchy behind";
+/// An ECDF's median line: scratchy's median the sooner, or the later.
+const ECDF_SOONER: &str = "median, scratchy sooner";
+const ECDF_LATER: &str = "median, scratchy later";
 
 /// A small multiple's panel: square, so neither timing's spread looks wider by the chart's shape.
 const PANEL_SIDE: Px = Px(214);
@@ -2005,16 +2193,22 @@ struct Crowd {
     tpot: f64,
 }
 
-/// The legend every latency chart shares, in the engines' colours.
+/// The legend a model's latency charts share, in the engines' colours.
 fn latency_legend(engines: &[Engine]) -> Element {
     rsx! {
         div { style: "display: flex; gap: 1.5rem; align-items: center",
-            for (e, class) in engines.iter().zip(["s1", "s2"]) {
-                span { style: "display: inline-flex; gap: 0.4rem; align-items: center",
-                    span { style: "width: 10px; height: 10px; border-radius: 50%; background: {colour(class).light}" }
-                    "{e.label()}"
-                }
-            }
+            for (&e, class) in engines.iter().zip(["s1", "s2"]) { {engine_key(e, class)} }
+        }
+    }
+}
+
+/// An engine's name after a dot of its series colour `class`: one entry of a legend, or a key in
+/// running text.
+fn engine_key(e: Engine, class: &str) -> Element {
+    rsx! {
+        span { style: "display: inline-flex; gap: 0.4rem; align-items: center",
+            span { style: "width: 10px; height: 10px; border-radius: 50%; background: {colour(class)}" }
+            "{e.label()}"
         }
     }
 }
@@ -2047,41 +2241,25 @@ fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
     let Some(l) = Latency::of(m, run) else {
         return rsx! {};
     };
-    let span = l.span(&l.keys);
+    let Some(span) = l.span(&l.keys) else {
+        return rsx! {};
+    };
     let mut answers: Vec<u32> = l.keys.iter().map(|k| k.1).collect();
     answers.dedup();
     answers.sort_unstable();
     answers.dedup();
-    let multiple = |o: u32, axes: Axes2| -> Element {
-        let ks: Vec<CellKey> = l.keys.iter().copied().filter(|k| k.1 == o).collect();
-        let mut users: Vec<u32> = ks.iter().map(|k| k.0).collect();
-        let mut prompts: Vec<u32> = ks.iter().map(|k| k.2).collect();
-        users.dedup();
-        prompts.sort_unstable();
-        prompts.dedup();
-        let columns = format!(
-            "display: grid; grid-template-columns: 4rem repeat({}, {PANEL_SIDE}); gap: 0.5rem; align-items: center",
-            prompts.len()
-        );
-        rsx! {
-            Stack { gap: 2,
-                strong { "{o}-token answers" }
-                div { style: "{columns}",
-                    div { "users ↓ prompt →" }
-                    for i in &prompts { div { style: "text-align: center", "{i}" } }
-                    for &u in &users {
-                        div { "{u}" }
-                        for &i in &prompts {
-                            div {
-                                if let (true, Some(span)) = (ks.contains(&(u, o, i)), span) {
-                                    {l.chart((u, o, i), span, axes, PANEL_SIDE, false, &format!("TTFT against TPOT, every request, {i} in {o} out {u} at once, {mid}"))}
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    // Each cell's bubble chart, on its own axes or on every cell's across every answer length.
+    let multiple = |o: u32, axes: Axes2| {
+        l.multiple(
+            o,
+            &PANEL_SIDE.to_string(),
+            &format!("{o}-token answers"),
+            |(u, o, i)| {
+                let about =
+                    format!("TTFT against TPOT, every request, {i} in {o} out {u} at once, {mid}");
+                l.chart((u, o, i), span, axes, PANEL_SIDE, &about)
+            },
+        )
     };
     let table = |t: RequestTiming| -> Element {
         rsx! {
@@ -2577,6 +2755,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
         .map(|a| a.to_string())
         .collect::<Vec<_>>()
         .join("- and ");
+    let rivals = Engine::RIVALS.map(Engine::label).join(", ");
     // Every grid's ratios first, keyed by machine, model and metric, or why
     // the grid has none: the highlights are picked from all of them.
     let mut grids: BTreeMap<(&str, &str, &str), Result<GlanceGrid, &str>> = BTreeMap::new();
@@ -2678,7 +2857,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
     }
     let spark = |chip: &str, stem: &str, trend: Trend| -> Element {
         let at = SparkAt { chip, stem, trend };
-        trend_spark(at, &sparks[&at], "4.5rem")
+        trend_spark(at, &sparks[&at], GLANCE_CHART_HEIGHT)
     };
     // A grid with nothing of its own (the model not run on that machine, say)
     // keeps its place as a map of blank squares its set's shape, over why it
@@ -2762,32 +2941,31 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                 // the sparkline panels add no width of their own (an intro would
                 // otherwise run on one line as wide as it likes) and stretch to the
                 // heat maps'.
+                // The tabs flush on their panels, so the latency panel's own two rows of tabs
+                // stack right under them; every other panel starts a step down.
                 Tile { style: "width: fit-content; max-width: 100%",
-                    Stack { gap: 5,
-                        ContentSwitcher { selected: slug(HEAT_MAPS),
-                            ContentSwitcherItem { target: slug(HEAT_MAPS), selected: true, "{HEAT_MAPS}" }
-                            ContentSwitcherItem { target: slug(LATENCY), selected: false, "{LATENCY}" }
+                    div {
+                        Tabs { selected: slug(HEAT_MAPS), kind: TabsKind::Contained,
+                            TabItem { value: slug(HEAT_MAPS), target: Some(slug(HEAT_MAPS)), selected: true, "{HEAT_MAPS}" }
+                            TabItem { value: slug(LATENCY), target: Some(slug(LATENCY)), selected: false, "{LATENCY}" }
                             for (title, _, _) in SCALING {
-                                ContentSwitcherItem { target: slug(title), selected: false, "{title}" }
+                                TabItem { value: slug(title), target: Some(slug(title)), selected: false, "{title}" }
                             }
-                            ContentSwitcherItem { target: slug(STARTUP), selected: false, "{STARTUP}" }
+                            TabItem { value: slug(STARTUP), target: Some(slug(STARTUP)), selected: false, "{STARTUP}" }
                         }
                         div {
                             ContentPanel { id: slug(HEAT_MAPS), shown: true,
+                                div { style: "padding-top: var(--cds-spacing-05)",
                                 Stack { gap: 5,
                                     p { style: "contain: inline-size",
-                                        "Every model's users × prompt size grid on every machine, at {answers}-token answers: in \
-                                         each cell, the model's prefill (time to first token) grid, then its decode (throughput) grid \
-                                         (rows: users at once, fewest first; columns: \
-                                         prompt, short to long). A blank square has no ratio: scratchy or the engine it is compared with \
-                                         was not measured there, or never streamed an answer (the model's own grids below say which); runs \
-                                         from before the grid had its own users counts measured it at the base count only. \
-                                         Colour is how many times faster scratchy is than the engine named under the \
-                                         grid: oMLX TurboQuant where the run has it, else the next of oMLX, mlx-lm, vllm-metal, ollama, \
-                                         llama.cpp, mistral.rs, Splash. Blue faster, red slower, the middle step within noise. \
-                                         Hover a square for its ratio."
+                                        "A row per machine, a tile per model: its prefill (time to first token) and decode \
+                                         (throughput) grids at {answers}-token answers, users at once down, prompt size across. \
+                                         Colour is how many times faster scratchy is than the run's first rival, in the order \
+                                         {rivals}: blue faster, red slower, grey within noise. Hover a square for its ratio and engine; \
+                                         a striped one has no ratio, and the model's own section says why."
                                     }
                                     {glance_maps(&rows, &classes, "minmax(0, 1fr)", true, cell)}
+                                }
                                 }
                             }
                             // Each a machine × model matrix, every cell its prefill
@@ -2796,7 +2974,7 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                             // chart's edges.
                             for (title, along, [prefill, decode]) in SCALING {
                                 ContentPanel { id: slug(title), shown: false,
-                                    div { style: "contain: inline-size",
+                                    div { style: "contain: inline-size; padding-top: var(--cds-spacing-05)",
                                         Stack { gap: 5,
                                             p { "scratchy against oMLX TurboQuant (or the next engine a run has, in the order of the heat maps) along {along}. Blue fill where scratchy is ahead, red where it is behind." }
                                             {glance_maps(&rows, &classes, "minmax(0, 1fr)", false, |chip: &str, class: &str| {
@@ -2804,9 +2982,9 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                                         rsx! {
                                                             div { style: "flex: 1 1 0; min-width: 0",
                                                                 Stack { gap: 1,
-                                                                    span { style: "font-size: 0.75rem", "Prefill" }
+                                                                    span { style: "font-size: 0.75rem; font-weight: 600", "Prefill" }
                                                                     {spark(chip, stem, prefill)}
-                                                                    span { style: "font-size: 0.75rem", "Decode" }
+                                                                    span { style: "font-size: 0.75rem; font-weight: 600", "Decode" }
                                                                     {spark(chip, stem, decode)}
                                                                     div { style: "font-size: 0.75rem; text-align: center; overflow-wrap: anywhere", "{stem}" }
                                                                 }
@@ -2818,43 +2996,10 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                 }
                             }
                             ContentPanel { id: slug(STARTUP), shown: false,
-                                div { style: "contain: inline-size", {startup_panel(machines, stems.len())} }
+                                div { style: "contain: inline-size; padding-top: var(--cds-spacing-05)", {startup_panel(machines, stems.len())} }
                             }
                             ContentPanel { id: slug(LATENCY), shown: false,
-                                div { style: "contain: inline-size",
-                                    Stack { gap: 5,
-                                        p {
-                                            "Every request of every cell, a dot each, at the heat maps' answer length: in each \
-                                             model's square, one tiny chart per cell, users at once down (fewest on top) and \
-                                             prompt size across (shortest on the left): time to first token up, time per \
-                                             output token across, each chart on its own ranges (hover a dot for its \
-                                             values), or every chart of a model on the same with the toggle. A request held back behind another \
-                                             lands high and left; one decoding beside others lands low and right; two clouds are \
-                                             a cell that ran two ways. Each model's own section has every cell. A dash is a run \
-                                             from before the runner kept every request."
-                                        }
-                                        div { style: "display: flex; gap: 2rem; align-items: center",
-                                            {latency_legend(&latency_engines(machines))}
-                                            PanelToggle { label: "Same axes in every chart of a model", off: "latency-axes-own", on: "latency-axes-same" }
-                                        }
-                                        // One child of the Stack either way: a hidden panel keeps its place in the
-                                        // flow (styles.css), so two would leave the Stack's gap between them.
-                                        div {
-                                            for axes in Axes2::ALL {
-                                                ContentPanel { id: format!("latency-axes-{}", if axes == Axes2::Own { "own" } else { "same" }), shown: axes == Axes2::Own,
-                                                    Stack { gap: 5,
-                                                        // A model's grid at a readable size is wider than a heat map column.
-                                                        div { style: "overflow-x: auto",
-                                                            {glance_maps(&rows, &classes, "max-content", false, |chip: &str, class: &str| {
-                                                                model_of(chip, class).map_or(rsx! {}, |stem| latency_cell(machines, chip, stem, axes))
-                                                            })}
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                                div { style: "contain: inline-size", {latency_panel(machines, &rows, &classes, model_of)} }
                             }
                         }
                     }
@@ -2876,37 +3021,127 @@ fn spark_grid(columns: usize) -> String {
 /// The glance's latency panel's name.
 const LATENCY: &str = "Latency Distributions";
 
-/// One machine's one model in the overview's latency panel: its every request at the heat maps'
-/// answer length, a dense grid of its cells ([`Latency::inner_grid`]), its name under it; a dash
-/// for a run from before the run file kept requests.
-fn latency_cell(
+/// The overview's latency panel: under the glance's tabs, a row of line tabs choosing a
+/// machine and under it one choosing a model class, stacked flush; then the chosen machine's
+/// model's every request at the heat maps' answer length, each chart on its own axes
+/// ([`Latency::multiple`]), its legend to its right; a dash for a run from before the run file
+/// kept requests. The two rows choose one panel of every pair between them, so the panels are one
+/// flat list, LATENCY_JS showing the pair both rows name.
+fn latency_panel<'l>(
     machines: &BTreeMap<&str, MachineRuns>,
-    chip: &str,
-    stem: &str,
-    axes: Axes2,
+    rows: &[&str],
+    classes: &[&str],
+    model_of: impl Fn(&str, &str) -> Option<&'l str>,
 ) -> Element {
-    let Some(Entry { run, m }) = machines[chip].latest(stem) else {
-        return rsx! {};
+    let machine = |chip: &str| format!("latency-machine-{}", slug(chip));
+    let model = |class: &str| format!("latency-model-{}", slug(class));
+    let pair = |chip: &str, class: &str| -> Element {
+        let Some(stem) = model_of(chip, class) else {
+            return rsx! { div { "not run" } };
+        };
+        let Some(Entry { run, m }) = machines[chip].latest(stem) else {
+            return rsx! { div { "not run" } };
+        };
+        let Some(l) = Latency::of(m, run) else {
+            return rsx! { div { title: "this run did not keep its requests", "{DASH} {stem}" } };
+        };
+        let o = glance_answer(run);
+        let about = format!("{stem} on {chip}");
+        // Each cell its TTFT's and TPOT's distributions, one over the other.
+        l.multiple(o, "minmax(0, 1fr)", &format!("{stem} · {o}-token answers"), |(u, o, i)| {
+            let label = |t: RequestTiming| format!("{} of every request, {i} in {o} out {u} at once, {about}", t.title());
+            rsx! {
+                Stack { gap: 1,
+                    {l.ecdf((u, o, i), RequestTiming::Ttft, "TTFT", &label(RequestTiming::Ttft))}
+                    {l.ecdf((u, o, i), RequestTiming::Tpot, "TPOT", &label(RequestTiming::Tpot))}
+                }
+            }
+        })
     };
-    let body = match Latency::of(m, run) {
-        Some(l) => {
-            let o = glance_answer(run);
-            l.inner_grid(
-                o,
-                INNER_SIDE,
-                axes,
-                &format!("TTFT against TPOT, every request, {stem} on {chip}, {o}-token answers"),
-            )
-        }
-        None => rsx! { div { title: "this run did not keep its requests", "{DASH}" } },
-    };
+    let (first_chip, first_class) = (
+        rows.first().copied().unwrap_or_default(),
+        classes.first().copied().unwrap_or_default(),
+    );
     rsx! {
-        Stack { gap: 1,
-            {body}
-            div { style: "font-size: 0.75rem; overflow-wrap: anywhere", "{stem}" }
+        Tabs { selected: machine(first_chip), id: "latency-machines",
+            for &chip in rows {
+                TabItem { value: machine(chip), selected: chip == first_chip, "{chip}" }
+            }
+        }
+        Tabs { selected: model(first_class), id: "latency-models",
+            for &class in classes {
+                TabItem { value: model(class), selected: class == first_class, "{class}" }
+            }
+        }
+        script { dangerous_inner_html: LATENCY_JS }
+        div { style: "padding-top: var(--cds-spacing-05)",
+            Stack { gap: 5,
+                // The engines' colours keyed in the text itself: "● scratchy versus ● oMLX".
+                p {
+                    for (n, (&e, class)) in latency_engines(machines).iter().zip(["s1", "s2"]).enumerate() {
+                        if n > 0 { " versus " }
+                        {engine_key(e, class)}
+                    }
+                    ": in each cell at the heat maps' answer length, users at once down and prompt size \
+                     across, the share of each one's requests (up) done within each time (across), time to \
+                     first token over time per output token, each chart on its own range. Further left is \
+                     faster; a steeper rise is steadier."
+                }
+                div {
+                    for &chip in rows {
+                        for &class in classes {
+                            div { id: format!("latency-{}-{}", slug(chip), slug(class)), "data-panel": "", "data-latency-pair": "", "data-machine": machine(chip), "data-model": model(class),
+                                hidden: (chip != first_chip || class != first_class).then_some(true),
+                                {pair(chip, class)}
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
+
+/// Shows the latency pair the machine and model tabs both name, hiding the rest, and keeps it in
+/// the address: choosing either tab puts the pair's id there; an address naming a pair, a machine
+/// or a model (on load, or when it changes) opens the glance's latency tab on it.
+const LATENCY_JS: &str = "(function () {\
+  var machine = document.getElementById('latency-machines'), model = document.getElementById('latency-models');\
+  var panel = machine.closest('[data-panel]');\
+  function show() {\
+    var shown;\
+    document.querySelectorAll('[data-latency-pair]').forEach(function (p) {\
+      p.hidden = p.dataset.machine !== machine.value || p.dataset.model !== model.value;\
+      if (!p.hidden) shown = p;\
+    });\
+    return shown;\
+  }\
+  function chose() {\
+    var p = show();\
+    if (p) history.replaceState(null, '', '#' + p.id);\
+  }\
+  function fromHash() {\
+    var id = decodeURIComponent(location.hash.slice(1)), has = function (tabs) {\
+      return id && tabs.querySelector('cds-tab[value=\"' + CSS.escape(id) + '\"]');\
+    };\
+    var p = id && document.getElementById(id);\
+    if (p && p.hasAttribute('data-latency-pair')) { machine.value = p.dataset.machine; model.value = p.dataset.model; }\
+    else if (has(machine)) machine.value = id;\
+    else if (has(model)) model.value = id;\
+    else { show(); return; }\
+    var tab = document.querySelector('cds-tab[target=\"' + CSS.escape(panel.id) + '\"]');\
+    if (tab) tab.closest('cds-tabs').value = panel.id;\
+    show();\
+  }\
+  machine.addEventListener('cds-tabs-selected', chose);\
+  model.addEventListener('cds-tabs-selected', chose);\
+  customElements.whenDefined('cds-tabs')\
+    .then(function () { return Promise.all([machine.updateComplete, model.updateComplete]); })\
+    .then(function () {\
+      fromHash();\
+      window.addEventListener('hashchange', fromHash);\
+    });\
+})();";
 
 /// The engines the overview's latency panel draws: scratchy, and the first rival any machine's
 /// newest run kept requests for.
@@ -3209,7 +3444,7 @@ fn startup_panel(machines: &BTreeMap<&str, MachineRuns>, columns: usize) -> Elem
                     for (k, col) in STARTUP_COLUMNS.iter().enumerate() {
                         div {
                             match &sparks[&(chip, k)] {
-                                Ok(sp) => sparkline(&sp.steps, col.axes, Engine::Scratchy.side(), sp.rival.side(), Some(sp.names()), "4.5rem", &format!("{chip}, {}: {} by model size, scratchy against {}", col.title, col.axes.value, sp.rival.label())),
+                                Ok(sp) => sparkline(&sp.steps, col.axes, Engine::Scratchy.side(), sp.rival.side(), Some(sp.names()), GLANCE_CHART_HEIGHT, &format!("{chip}, {}: {} by model size, scratchy against {}", col.title, col.axes.value, sp.rival.label())),
                                 Err(why) => rsx! { "{why}" },
                             }
                         }
