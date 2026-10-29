@@ -442,11 +442,10 @@ pub enum Program {
 
 impl Program {
     /// Whether this program has a SuperDSC lowering — the card's half of the ladder. The paged
-    /// attention and the paged KV write run as KTIR on the emulator, and their KTIR → SuperDSC
-    /// lowering (a scatter, and page gathers several to a program) is not ported: the door refuses
-    /// them by name, so a card build stops at them rather than shipping a bundle short its attention.
+    /// attention's (page gathers inside its walk loop) is not ported: the door refuses it by name,
+    /// so a card build stops at it rather than shipping a bundle short its attention.
     pub const fn has_card_lowering(self) -> bool {
-        !matches!(self, Program::PagedAttn | Program::PagedKvWrite)
+        !matches!(self, Program::PagedAttn)
     }
 }
 

@@ -42,9 +42,9 @@ pub use matmul::{
     matmul_opspec_off, matmul_opspec_off_operands, matmul_opspec_split, try_assemble_matmul_seeded,
 };
 pub use pointwise::{
-    assemble_gather_copy, assemble_pointwise_broadcast_off_from_tile,
-    assemble_pointwise_seeded_from_tile, gather_copy_opspec, pointwise_broadcast_opspec_from_tile,
-    pointwise_opspec_from_tile,
+    ScatterCopySpec, assemble_gather_copy, assemble_pointwise_broadcast_off_from_tile,
+    assemble_pointwise_seeded_from_tile, assemble_scatter_copy, gather_copy_opspec,
+    pointwise_broadcast_opspec_from_tile, pointwise_opspec_from_tile, scatter_copy_opspec,
 };
 pub use reduce::{
     ReduceDivided, ReduceDivision, ReduceOffSpec, assemble_reduce, assemble_reduce_df,
