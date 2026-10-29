@@ -866,6 +866,10 @@ fn tq_attention_command(
     }
 }
 
+/// The slot `attention_decode_gqa_tq` binds its partials at, the op scratch's front, and
+/// `attention_via_cache_v2_combine` reads them from.
+const SPLIT_PARTIALS_SLOT: u8 = 16;
+
 /// The slots of a decode attention running its KV writer (`attention.metal`'s
 /// `ATTN_FOLD_ROT_DIM` / `ATTN_FOLD_PAIR_OFF`): the writer's rotation, set only on such a command.
 const ATTN_FOLD: (u16, u16) = (19, 20);
@@ -1355,7 +1359,8 @@ fn decode_attention_per_kv_head(
     at: &BakePoint<'_>,
     row_gate: Option<RuntimeGate>,
     partials: &mut DecodePartials,
-) -> Vec<GatedCommand> {
+    index: usize,
+) -> Result<Vec<GatedCommand>, LoweringError> {
     let attention = match step {
         MetalStep::RopedAttention(f) => &f.attention,
         step => step,
@@ -1390,10 +1395,10 @@ fn decode_attention_per_kv_head(
         && p.global_block_size.is_multiple_of(8)
         && bucket_partials <= u32::MAX as u64;
     if !full || !geometry || !cmds.iter().any(|c| takes(&c.command)) {
-        return cmds;
+        return Ok(cmds);
     }
     let row_bytes = row_partials as u32;
-    let scratch = scratch_at(16, 0);
+    let scratch = scratch_at(SPLIT_PARTIALS_SLOT, 0);
     let symbol = |f16, bf16| pick_specialized_symbol(f16, bf16, p.metal_dtype);
     let mut out = Vec::with_capacity(cmds.len() + 1);
     for GatedCommand { command, gate } in cmds {
@@ -1416,7 +1421,16 @@ fn decode_attention_per_kv_head(
         // joins in the combine, at its buffer 17, under the twin's sink const: the split's 16
         // is the partials, its splits storing the keys' alone, and it takes neither.
         let is_sinks = |b: &&Binding| matches!(b, Binding::Source { ix, which: WeightTensor::Weight, .. } if Some(*ix) == sinks);
-        let (sinks, bindings): (Vec<_>, Vec<_>) = command.bindings.iter().partition(is_sinks);
+        let (sinks, bindings): (Vec<Binding>, Vec<Binding>) =
+            command.bindings.iter().partition(is_sinks);
+        // Past the sinks, nothing may sit at the partials' slot: it would overlap them.
+        if bindings.iter().any(|b| b.index() == SPLIT_PARTIALS_SLOT) {
+            return Err(LoweringError::SplitPartialsSlotTaken {
+                index,
+                kernel: command.kernel,
+                slot: SPLIT_PARTIALS_SLOT,
+            });
+        }
         let sinks_const = super::kernel_constants::AttentionViaCacheConstants::SINKS.0;
         let split_constants: Vec<_> = (constants.iter())
             .filter(|k| k.index != sinks_const)
@@ -1463,7 +1477,7 @@ fn decode_attention_per_kv_head(
         let gated = |command| GatedCommand { command, gate };
         out.extend([gated(attention), gated(combine)]);
     }
-    out
+    Ok(out)
 }
 
 /// A gated row's `gate` on every command of it. A command its realization already gated cannot
@@ -1695,7 +1709,8 @@ fn lower(
                     at,
                     *gate,
                     &mut decode_partials,
-                );
+                    i,
+                )?;
                 let (cmds, rows) = sample_rows(p, step, cmds, bucket_m, w, profile)?;
                 logits_rows = writes_logits(logits_rows, rows);
                 // Past the sampled rows, a command over their logits other than the logit tail's
@@ -9868,6 +9883,51 @@ mod tests {
             *combine.bindings,
             [kept, vec![partials, sinks(COMBINE_SINKS_SLOT)]].concat()
         );
+    }
+
+    /// A twin the split takes binding something other than the row's sinks at the partials' slot
+    /// is a lowering error, never a silent overlap with the partials nor a quiet twin: here the
+    /// sliding twin's sinks, which the split is not told are the row's.
+    #[test]
+    fn decode_turboquant_split_refuses_a_buffer_at_its_partials_slot() {
+        let tape = lower_subtile_tape_to_metal(
+            &sliding_sinks_tape(),
+            &sliding_tq_consts(),
+            bake_point(1, None),
+        )
+        .expect("lower_subtile_tape_to_metal");
+        let twin = (tape.commands.iter())
+            .find(|c| c.command.kernel == KernelId::AttentionViaCacheTq)
+            .expect("the twin");
+        assert!((twin.command.bindings.iter()).any(|b| matches!(
+            b,
+            Binding::Source {
+                ix: SINKS_IX,
+                binding_index: 16,
+                ..
+            }
+        )));
+        let causal =
+            MetalStep::AttnPackedKv(Slot(3), Slot(6), LayerId(0), Interleaved, Causal, LLAMA_KV);
+        let mut partials = DecodePartials::default();
+        let lowered = decode_attention_per_kv_head(
+            &tq_consts(),
+            &causal,
+            None,
+            vec![*twin],
+            &bake_point(1, None),
+            None,
+            &mut partials,
+            7,
+        );
+        assert!(matches!(
+            lowered,
+            Err(LoweringError::SplitPartialsSlotTaken {
+                index: 7,
+                kernel: KernelId::AttentionViaCacheTq,
+                slot: 16,
+            })
+        ));
     }
 
     /// The TurboQuant decode twin's query heads per threadgroup turn on the
