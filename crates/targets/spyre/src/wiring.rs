@@ -1254,8 +1254,9 @@ pub fn stage_col_stick_heads<const N: usize>(
 /// pattern. Tables are functions of `pad_vocab`, `k`, and `hidden`, constant
 /// across decode steps, staged ONCE.
 ///
-/// The SENTINEL (all-NaN row, #666): the device answers `PAD_V + 4160`
-/// (`sample_sentinel`), so the tables run to `pad_vocab +
+/// The SENTINEL (all-NaN row, #666): the device answers `G·4096 + 4160`
+/// (`sample_sentinel` — `PAD_V + 4160` at every pad of whole 4096-lane
+/// groups, and below it otherwise), so the tables run to `pad_vocab +
 /// SAMPLE_SENTINEL_OFFSET + 1` rows to keep that pick's gather IN EXTENT.
 /// Past `pad_vocab` every row stages the sentinel's own values — `stab` =
 /// the s=0 LANE PATTERN (every lane names a quarter of slab 0, the clamp's

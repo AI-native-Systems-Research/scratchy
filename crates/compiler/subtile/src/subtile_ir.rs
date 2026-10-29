@@ -1390,7 +1390,7 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// hash/fold constants, the lane table, the fold's five f32 constants,
     /// the fp16 island's clamp — ten of them ONE-WORD `[1, 1]` tables, the
     /// wall-5 measured law). An all-NaN row answers past the last real lane (the
-    /// sentinel); the consumer refuses `idx > vocab` loudly rather than feed
+    /// sentinel); the consumer refuses `idx >= vocab` loudly rather than feed
     /// a NaN-born index to the detokenizer.
     Sample { vocab: u32, rows: u32 },
     // ── The chained head (constructed only by the chain mint, `mint_embed_chain`) ──
@@ -1438,7 +1438,7 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// SENTINEL RAMP ([`chain_l_sentinel_ramp`] — word 0 the mark `hidden`,
     /// every word naming a stick in the transposed placement's never-written
     /// zero tail), and the gather stages a ZERO row rather than read past
-    /// the matrix — the refusal the host readback's `idx > vocab` check
+    /// the matrix — the refusal the host readback's `idx >= vocab` check
     /// performed, moved into the op, so an already-broken chat cannot also
     /// fault the device bus.
     EmbedRowGather { hidden: u32, replaces: TensorId },
@@ -5752,7 +5752,7 @@ mod tests {
     }
 
     /// ⭐ THE SENTINEL AND THE PAD BOTH STAGE A ZERO ROW — the refusal the
-    /// host readback's `idx > vocab` check performed, moved into the op: a
+    /// host readback's `idx >= vocab` check performed, moved into the op: a
     /// degenerate logits row answers an index past the vocab, and the gather
     /// must stage a zero row rather than read past the matrix (a fault on the
     /// device bus is not a refusal). TWO legs per the op's own law: the
