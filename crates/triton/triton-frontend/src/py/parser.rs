@@ -836,6 +836,13 @@ impl Parser {
                 t.col,
             ));
         }
+        self.skip_indented_block()
+    }
+
+    /// An INDENT and everything through its matching DEDENT, consumed as host code: the
+    /// body of a host `def` ([`Parser::skip_block`]) or of a module-level compound
+    /// statement ([`Parser::skip_logical_line`]).
+    fn skip_indented_block(&mut self) -> Result<()> {
         if !self.eat(Tok::Indent) {
             let t = self.peek().clone();
             return Err(err_at("expected an indented block", t.line, t.col));
@@ -848,7 +855,7 @@ impl Parser {
                 Tok::Dedent => depth -= 1,
                 Tok::End => {
                     return Err(err_at(
-                        "unexpected end of file inside a host function body",
+                        "unexpected end of file inside an indented block of host code",
                         t.line,
                         t.col,
                     ));
@@ -878,22 +885,35 @@ impl Parser {
         self.end_statement()
     }
 
-    /// Skip one module-level logical line of host code: consume tokens until a NEWLINE
-    /// at bracket depth zero. The lexer has already joined bracketed lines, so any
-    /// NEWLINE this loop sees is the logical line's end.
+    /// Skip one module-level statement of host code: consume tokens until a NEWLINE at
+    /// bracket depth zero (the lexer has already joined bracketed lines, so any NEWLINE
+    /// this loop sees is the logical line's end) and, when that line opened a block --
+    /// `if __name__ == "__main__":`, a module-level `for`, `with`, `try`, `class` -- the
+    /// whole indented block after it. An `elif`/`else`/`except` clause is its own
+    /// module-level line and lands back here.
+    ///
+    /// EVERY CALL CONSUMES AT LEAST ONE TOKEN or fails. This used to stop at an INDENT
+    /// without consuming it, "to let the caller's loop re-sync" -- and the caller, `parse`,
+    /// called straight back in at the same INDENT, forever: one module-level `if` in a
+    /// fixture hung the whole ladder (measured: 10 minutes at 7 MB before it was killed).
     fn skip_logical_line(&mut self) -> Result<()> {
         let mut depth = 0usize;
         loop {
             let t = self.peek().clone();
             match t.kind {
                 Tok::Newline | Tok::End if depth == 0 => {
-                    let _ = t;
                     break;
                 }
                 Tok::Indent | Tok::Dedent if depth == 0 => {
-                    // A host statement never opens a block we skip; a DEDENT here is
-                    // stray. Stop and let the caller's loop re-sync.
-                    break;
+                    // Python's lexer only emits these at the start of a line, after the
+                    // NEWLINE that ended the line which opened (or closed) the block, and
+                    // that line's own skip consumes the block below. Reaching one here
+                    // means the cursor was left mid-structure by some other path.
+                    return Err(err_at(
+                        "an indentation change at module level that no host statement opened",
+                        t.line,
+                        t.col,
+                    ));
                 }
                 Tok::Op if t.text == "(" || t.text == "[" || t.text == "{" => {
                     depth += 1;
@@ -910,6 +930,9 @@ impl Parser {
             }
         }
         while self.eat(Tok::Newline) {}
+        if self.peek_kind(Tok::Indent) {
+            self.skip_indented_block()?;
+        }
         Ok(())
     }
 
