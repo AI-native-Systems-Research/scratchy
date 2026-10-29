@@ -542,8 +542,17 @@ pub struct Rep {
 #[derive(Deserialize, Clone, Debug)]
 pub struct TaskCell {
     pub workload: String,
-    /// Users at once.
+    /// The cell's load key: a rate step (1, 2, ... of `config.scaling.task_rate_steps`), 0 for the
+    /// 1-user closed-loop `base` cell the rates are fractions of; in runs from before open-loop
+    /// cells, and for `rag-accuracy`, its users at once. Cells of one key are the same load.
     pub conc: u32,
+    /// How the cell was loaded: "rate" (open loop at `request_rate`), "base", or "users" (closed
+    /// loop at `conc` users). None in runs from before it was recorded: users.
+    #[serde(default)]
+    pub load: Option<String>,
+    /// The requests a second it was offered, open loop; None for a closed loop.
+    #[serde(default)]
+    pub request_rate: Option<f64>,
     pub completed: Option<u32>,
     #[serde(default)]
     pub failed: Option<u32>,

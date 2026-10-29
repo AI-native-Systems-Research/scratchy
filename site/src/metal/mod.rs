@@ -3393,13 +3393,16 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                     .map(|w| tasks::workload_label(w).0.to_string())
                     .collect(),
             ),
-            down: ("users at once", users.iter().map(u32::to_string).collect()),
+            down: (
+                "load",
+                users.iter().map(|&u| tasks::key_label(m, u)).collect(),
+            ),
         };
         let squares = squares
             .into_iter()
             .map(|(u, w, ratio)| RatioSquare {
                 across: tasks::workload_label(&w).0.to_string(),
-                down: u.to_string(),
+                down: tasks::key_label(m, u),
                 ratio,
                 highlight: false,
             })
@@ -4426,7 +4429,7 @@ mod tests {
         use super::numbers::Engine;
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/testdata/metal/apple-m3-pro-2026-10-25T150928Z-1bf86114.json"
+            "/tests/fixtures/metal/apple-m3-pro-2026-10-25T150928Z-1bf86114.json"
         );
         let text = std::fs::read_to_string(path).expect("the dataset quick run");
         // An earlier run that timed oMLX TurboQuant on the same workloads (its cells stand in for
@@ -4514,7 +4517,7 @@ mod tests {
     fn dataset_runs_give_their_workloads_a_timeline() {
         use super::data::Run;
         let read = |name: &str| -> Run {
-            let p = format!("{}/testdata/metal/{name}", env!("CARGO_MANIFEST_DIR"));
+            let p = format!("{}/tests/fixtures/metal/{name}", env!("CARGO_MANIFEST_DIR"));
             serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
         };
         let runs = vec![
