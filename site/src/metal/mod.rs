@@ -10,7 +10,6 @@
 //! change reads as a before/after.
 
 mod data;
-mod history;
 mod numbers;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -39,6 +38,8 @@ use numbers::{
 /// The run files, relative to site/; copied to the same place under _site/,
 /// where each run table links to its own.
 pub const DATA: &str = "data/metal";
+/// The runs a newer one replaced, relative to site/: only Over time reads them.
+pub const HISTORY: &str = "data/metal/history";
 
 // --------------------------------------------------------------------- load
 
@@ -49,7 +50,7 @@ fn load(site: &Site) -> Result<Vec<Run>, String> {
 }
 
 /// [`load`], over every run file in `dirs` (relative to the site): the page's own runs, or those
-/// and the ones a newer run replaced ([`history::HISTORY`]), for Over time.
+/// and the ones a newer run replaced ([`HISTORY`]), for Over time.
 fn load_from(site: &Site, dirs: &[&str]) -> Result<Vec<Run>, String> {
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     for dir in dirs {
@@ -2287,24 +2288,13 @@ fn over_time_charts(machines: &BTreeMap<&str, MachineRuns>, chip: &str) -> Vec<(
     charts
 }
 
-/// One Mac's Over time block: its chip, its history chart ([`history::block`]), and its rival
-/// charts ([`over_time_charts`]), each titled.
-type OverTimeBlock<'a> = (&'a str, Option<Element>, Vec<(String, Element)>);
-
-/// The Over time section, one block a Mac: scratchy's warm one-user
-/// speed over every run the Mac has published ([`history::block`]), then each current model's
-/// one-user throughput and time to first token against its rival, over every run of the model's
-/// newest shape, history included. Nothing where neither has two runs.
-fn over_time(
-    machines: &BTreeMap<&str, MachineRuns>,
-    timelines: &history::Timelines,
-) -> Option<Element> {
-    let blocks: Vec<OverTimeBlock> = (in_order(machines).into_iter())
-        .map(|chip| {
-            let line = timelines.get(chip).and_then(|m| history::block(chip, m));
-            (chip, line, over_time_charts(machines, chip))
-        })
-        .filter(|(_, line, rivals)| line.is_some() || !rivals.is_empty())
+/// The Over time section, one block a Mac: each current model's one-user throughput and time to
+/// first token against its rival, over every run the Mac has published (history/ included) of the
+/// model's newest shape. Nothing where no model has two such runs.
+fn over_time(machines: &BTreeMap<&str, MachineRuns>) -> Option<Element> {
+    let blocks: Vec<(&str, Vec<(String, Element)>)> = (in_order(machines).into_iter())
+        .map(|chip| (chip, over_time_charts(machines, chip)))
+        .filter(|(_, charts)| !charts.is_empty())
         .collect();
     if blocks.is_empty() {
         return None;
@@ -2316,30 +2306,24 @@ fn over_time(
             Stack { gap: 4,
                 Heading { "Over time" }
                 p {
-                    "Each Mac of the round, over every run it has published, oldest first. First \
-                     scratchy alone: its warm speed with one user (64-token prompts, 32-token \
-                     answers, 20 requests to a running server), a line a model; a round that changed \
-                     the models ends their lines and starts others, and runs from before 2026-10-06 \
-                     did not record the request they timed (†). Then each current model's one-user \
-                     throughput and time to first token at its base cell, scratchy against the \
-                     first engine any run there measured, over the runs of the model's newest \
-                     shape. A run of scratchy alone (a quick run) takes the other engine's line \
-                     dotted, carried from the last run that measured it. The fill is labelled with \
-                     its ×-factor at the first run and the newest. The older runs are kept in "
+                    "Each model's one-user throughput and time to first token at its base cell, a \
+                     point a run on its Mac, oldest first, over every run the Mac has published \
+                     (the older ones are kept in "
                     code { "site/data/metal/history/" }
-                    "."
+                    "), scratchy against the first engine any run there measured. A run of \
+                     scratchy alone (a quick run) takes the other engine's line dotted, carried from \
+                     the last run that measured it, and the fill between the lines follows it. The \
+                     fill is labelled with its ×-factor at the first run and the newest: where \
+                     scratchy started, and where it stands now."
                 }
-                for (chip, line, rivals) in blocks {
+                for (chip, charts) in blocks {
                     Stack { gap: 3,
                         strong { "{chip}" }
-                        if let Some(line) = line { {line} }
-                        if !rivals.is_empty() {
-                            div { style: "{grid}",
-                                for (title, chart) in rivals {
-                                    div {
-                                        p { style: "font-size: 0.875rem; margin: 0 0 0.25rem", "{title}" }
-                                        {chart}
-                                    }
+                        div { style: "{grid}",
+                            for (title, chart) in charts {
+                                div {
+                                    p { style: "font-size: 0.875rem; margin: 0 0 0.25rem", "{title}" }
+                                    {chart}
                                 }
                             }
                         }
@@ -3432,10 +3416,9 @@ fn rivals_named(machines: &BTreeMap<&str, MachineRuns>) -> Option<String> {
 
 pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     let runs = load(site)?;
-    let timelines = history::load(&site.root, &[DATA, history::HISTORY])?;
     // Over time reads every published run, the ones a newer run replaced too; the rest of the
     // page shows each Mac's two newest.
-    let all_runs = load_from(site, &[DATA, history::HISTORY])?;
+    let all_runs = load_from(site, &[DATA, HISTORY])?;
     let all_machines = index(&all_runs);
     let machines = index(&runs);
     let mut sections: Vec<(String, String)> = Vec::new();
@@ -3449,7 +3432,7 @@ pub fn build(site: &Site, assets: &Published) -> Result<String, String> {
     } else {
         sections.push(("glance".to_string(), "At a glance".to_string()));
         // No link to a section that is not there.
-        let over = over_time(&all_machines, &timelines);
+        let over = over_time(&all_machines);
         if over.is_some() {
             sections.push(("over-time".to_string(), "Over time".to_string()));
         }
@@ -3820,24 +3803,23 @@ mod tests {
 
     /// Over time takes every run of a Mac it is given.
     #[test]
-    fn over_time_shows_the_rounds_macs_over_their_history() {
+    fn over_time_takes_every_run_it_is_given() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let site = crate::Site {
             repo: root.join(".."),
             out: root.join("_site"),
             root,
         };
-        let all = super::load_from(&site, &[FIXTURES]).expect("the fixtures");
-        let machines = super::index(&all);
-        // Over time's charts take every run of a Mac they are given: the M3 Pro fixtures hold two
-        // runs of the current round's gpt-oss-20b, a week apart.
+        let runs = super::load_from(&site, &[FIXTURES]).expect("the fixtures");
+        let machines = super::index(&runs);
+        // The M3 Pro fixtures hold two runs of the current round's gpt-oss-20b, a week apart:
+        // Over time draws them, not just the newest.
         let m3 = &machines["Apple M3 Pro"];
         let gpt = (m3.models.iter())
             .find(|(s, _)| *s == "gpt-oss-20b")
             .map(|(_, es)| es.len());
         assert_eq!(gpt, Some(2), "gpt-oss-20b runs on the M3 Pro");
-        let timelines = super::history::load(&site.root, &[FIXTURES]).unwrap();
-        assert!(super::over_time(&machines, &timelines).is_some());
+        assert!(super::over_time(&machines).is_some());
     }
 
     /// Machines read up from the smallest: a 32 GB base M5 before the 36 GB M3 Pro, the 64 GB
