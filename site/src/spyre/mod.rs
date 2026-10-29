@@ -16,8 +16,8 @@ use dioxus::prelude::*;
 
 use crate::Site;
 use crate::carbon::{
-    ContentPanel, ContentSwitcher, ContentSwitcherItem, Fold, Heading, Layer, Section, Stack,
-    Table, TableCell, TableRow, Tile,
+    ContentPanel, Fold, Heading, Layer, Section, Stack, TabItem, Table, TableCell, TableRow, Tabs,
+    TabsKind, Tile,
 };
 use crate::charts::{
     Axes, Axis, AxisDomain, BarPoint, Chart, ChartOptions, Colour, Enabled, RatioSquare, Side,
@@ -568,6 +568,7 @@ fn bars(
             combo: None,
             bounds: None,
             bubble: None,
+            line: None,
             toolbar: Enabled { enabled: false },
         },
     };
@@ -779,10 +780,10 @@ fn glance(sweep: &Sweep) -> Element {
                 Heading { "At a glance" }
                 Tile { style: "width: fit-content; max-width: 100%",
                     Stack { gap: 5,
-                        ContentSwitcher { selected: slug(HEAT_MAPS),
-                            ContentSwitcherItem { target: slug(HEAT_MAPS), selected: true, "{HEAT_MAPS}" }
-                            ContentSwitcherItem { target: slug(PREFILL_SPARKS), selected: false, "{PREFILL_SPARKS}" }
-                            ContentSwitcherItem { target: slug(DECODE_SPARKS), selected: false, "{DECODE_SPARKS}" }
+                        Tabs { selected: slug(HEAT_MAPS), kind: TabsKind::Contained,
+                            TabItem { value: slug(HEAT_MAPS), target: Some(slug(HEAT_MAPS)), selected: true, "{HEAT_MAPS}" }
+                            TabItem { value: slug(PREFILL_SPARKS), target: Some(slug(PREFILL_SPARKS)), selected: false, "{PREFILL_SPARKS}" }
+                            TabItem { value: slug(DECODE_SPARKS), target: Some(slug(DECODE_SPARKS)), selected: false, "{DECODE_SPARKS}" }
                         }
                         div {
                             ContentPanel { id: slug(HEAT_MAPS), shown: true,

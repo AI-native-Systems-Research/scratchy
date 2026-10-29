@@ -26,16 +26,6 @@ pub struct Themed {
     pub dark: &'static str,
 }
 
-impl Themed {
-    /// The same colour in both themes.
-    pub const fn both(colour: &'static str) -> Self {
-        Themed {
-            light: colour,
-            dark: colour,
-        }
-    }
-}
-
 impl fmt::Display for Themed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "light-dark({}, {})", self.light, self.dark)
@@ -111,17 +101,24 @@ impl Better {
     }
 }
 
-/// A series' colour, fixed per role: blue, orange, aqua from the data-viz
-/// reference palette, validated as a set (all pairs, CVD and normal vision)
-/// against Carbon's white and g100 surfaces, so the same in both themes. Aqua
-/// is under 3:1 on white, so every chart has a legend and a table view. A
-/// previous run is a grey nearer the page than the series, so it reads as
-/// behind.
+/// A series' colour, fixed per role: the first three of Carbon's categorical
+/// palette, in its order, white's on white and g100's on g100 (purple 70 /
+/// 60, cyan 50 / 40, teal 70 / 60). A previous run is a grey nearer the page
+/// than the series, so it reads as behind.
 pub fn colour(class: &str) -> Themed {
     match class {
-        "s1" => Themed::both("#2a78d6"),
-        "s2" => Themed::both("#d95926"),
-        "s3" => Themed::both("#1baf7a"),
+        "s1" => Themed {
+            light: "#6929c4",
+            dark: "#8a3ffc",
+        },
+        "s2" => Themed {
+            light: "#1192e8",
+            dark: "#33b1ff",
+        },
+        "s3" => Themed {
+            light: "#005d5d",
+            dark: "#007d79",
+        },
         _ => Ramp::Gray.at::<40>(),
     }
 }
@@ -156,6 +153,19 @@ pub enum Chart<'a> {
         /// [`BubblePoint::radius`].
         unit_radius: f64,
     },
+    /// Carbon's LineChart: a line per group through its points, joined as `options.line` says.
+    Line {
+        data: Vec<LinePoint<'a>>,
+        options: ChartOptions<'a>,
+    },
+}
+
+/// One point of a line: its series, where along the bottom axis, and its value.
+#[derive(Serialize)]
+pub struct LinePoint<'a> {
+    pub group: &'a str,
+    pub key: f64,
+    pub value: f64,
 }
 
 /// One bubble: its series, where along the bottom axis, its value, and the square root of how
@@ -237,7 +247,17 @@ pub struct ChartOptions<'a> {
     pub bounds: Option<Bounds>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bubble: Option<Bubbles>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub line: Option<LineOptions>,
     pub toolbar: Enabled,
+}
+
+/// A line chart's options: how Carbon joins its points (a d3 curve's name), and whether it marks
+/// each one.
+#[derive(Serialize)]
+pub struct LineOptions {
+    pub curve: &'static str,
+    pub points: Enabled,
 }
 
 #[derive(Serialize)]
@@ -432,7 +452,8 @@ impl Chart<'_> {
             Chart::GroupedBar { options, .. }
             | Chart::Heatmap { options, .. }
             | Chart::Combo { options, .. }
-            | Chart::Bubble { options, .. } => options,
+            | Chart::Bubble { options, .. }
+            | Chart::Line { options, .. } => options,
         }
     }
 }
@@ -594,6 +615,7 @@ pub fn mini_heatmap(
             combo: None,
             bounds: None,
             bubble: None,
+            line: None,
             toolbar: Enabled { enabled: false },
         },
         ratio: true,
@@ -655,9 +677,9 @@ pub fn glance_mini(
 }
 
 /// A glance's heat maps beside their ratio scale: a row per `rows` (a
-/// machine on metal.html, a dtype on spyre.html), its name over its first
-/// tile's upper left, then a tile per `columns` (a model), each the column's
-/// name over `cell(row, column)`, that row's grids of that model as
+/// machine on metal.html, a dtype on spyre.html), its name turned upward
+/// beside its first tile, then a tile per `columns` (a model), each the
+/// column's name over `cell(row, column)`, that row's grids of that model as
 /// glance_minis. The cells are one width, `column_width` (metal.html shares
 /// the panel's width among them), and on a narrow screen shrink together
 /// rather than wrap: so every grid on the page is one size, the columns line
@@ -671,16 +693,17 @@ pub fn glance_maps(
 ) -> Element {
     let grid = format!(
         "flex: 1 1 auto; min-width: 0; align-self: start; display: grid; \
-         grid-template-columns: repeat({}, {column_width}); gap: 1.5rem 0",
+         grid-template-columns: max-content repeat({}, {column_width}); row-gap: var(--cds-spacing-06)",
         columns.len()
     );
     rsx! {
         div { style: "display: flex; gap: 2rem",
             div { style: "{grid}",
                 for row in rows {
-                    div { style: "grid-column: 1 / -1; display: grid; grid-template-columns: subgrid; row-gap: 0.5rem",
-                        // The row's name over its first tile's upper left, in no column of its own.
-                        div { style: "grid-column: 1 / -1", strong { "{row}" } }
+                    div { style: "grid-column: 1 / -1; display: grid; grid-template-columns: subgrid",
+                        // The row's name turned to read upward, spaced from its first tile's left edge by
+                        // padding-left, which the half turn puts on the tile's side.
+                        div { style: "writing-mode: vertical-rl; transform: rotate(180deg); text-align: center; padding-left: var(--cds-spacing-03)", strong { "{row}" } }
                         // Each model on a tile of the next layer, so neighbouring models read apart.
                         for column in columns {
                             Layer { level: 1,
@@ -1003,6 +1026,7 @@ pub fn sparkline(
                 lower_bound_maps_to: "lower",
             }),
             bubble: None,
+            line: None,
             toolbar: Enabled { enabled: false },
         },
     };

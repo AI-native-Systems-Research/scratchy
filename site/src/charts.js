@@ -62,7 +62,7 @@
   }
   // Draws one chart in the theme `t`.
   function draw(el, t) {
-    var charts = { groupedbar: Charts.GroupedBarChart, combo: Charts.ComboChart, heatmap: Charts.HeatmapChart, bubble: Charts.BubbleChart };
+    var charts = { groupedbar: Charts.GroupedBarChart, combo: Charts.ComboChart, heatmap: Charts.HeatmapChart, bubble: Charts.BubbleChart, line: Charts.LineChart };
     var spec = JSON.parse(el.getAttribute('data-chart'));
     if (spec.ratio) {
       var total = spec.options.locale.translations.total;
@@ -83,15 +83,19 @@
         ? function (v) { var k = at.indexOf(v); return k >= 0 ? names[k] : String(v); }
         : String;
     }
-    // Carbon's own tooltip, its series called what they are: a server, not a "Group", and a
+    // Carbon's own tooltip, its series called what they are: a server, not a "Group", a
     // bubble's requests counted, not its radius (the square root of the count, so its area is
-    // the count). Carbon maps radius linearly onto its range, which it takes only as a function:
-    // the range ends at the unit radius times the extremes, so one request draws at the unit.
+    // the count), and its timings to three significant figures. Carbon maps radius linearly onto
+    // its range, which it takes only as a function: the range ends at the unit radius times the
+    // extremes, so one request draws at the unit.
     if (spec.kind === 'bubble') {
       var unit = spec.unit_radius, label = spec.options.bubble.radiusLabel;
       spec.options.tooltip = {
         groupLabel: 'Server',
-        valueFormatter: function (value, l) { return l === label ? String(Math.round(value * value)) : value; },
+        valueFormatter: function (value, l) {
+          if (l === label) return String(Math.round(value * value));
+          return typeof value === 'number' ? String(Number(value.toPrecision(3))) : value;
+        },
       };
       spec.options.bubble.radiusRange = function (size, data) {
         var rs = data.map(function (d) { return d.radius; });
