@@ -190,10 +190,13 @@ pub fn lower(
         // multiplies over generic ops, whole-tensor at corner 0 (the splice's own
         // region guard refuses a windowed one). No door fact is read off the program.
         Program::Sample => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
-        // ⛔ NOT PORTED: the paged attention's card lowering (its page gathers, several to a
-        // program, and the KV write's scatter) is the card's half of the ladder and does not exist
-        // yet — see `Program::has_card_lowering`. Refused by name, so a card build stops here.
-        Program::PagedAttn | Program::PagedKvWrite => Err(Error {
+        // ⭐ THE KV WRITE'S HARDWARE SCATTER — the step's K and V rows written into their pools
+        // through the write-rows table (`lk::paged_kv_write`, the vendor's `test_scatter_1core`).
+        Program::PagedKvWrite => lk::paged_kv_write(name, k, &r, sym_id_base, layout),
+        // ⛔ NOT PORTED: the paged attention's card lowering (its page gathers in the walk loop) does
+        // not exist yet — see `Program::has_card_lowering`. Refused by name, so a card build stops
+        // here.
+        Program::PagedAttn => Err(Error {
             message: format!(
                 "{name}: {:?} has no SuperDSC lowering — the paged attention runs as KTIR on the \
                  emulator; its card lowering (page gathers and the KV scatter) is not ported",

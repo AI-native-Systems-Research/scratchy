@@ -3430,6 +3430,32 @@ impl OpSpec {
         gather: GatherIndex,
         value_idx: usize,
     ) -> Option<IndirectAccess> {
+        let out_idx = self.args.len().saturating_sub(1);
+        if value_idx >= self.args.len() || value_idx == out_idx {
+            return None;
+        }
+        self.attach_index(gather, value_idx)
+    }
+
+    /// ⭐⭐⭐ MAKE THE OUTPUT A SCATTERED WRITE: insert an index operand before the output and declare
+    /// the output the pair's VALUE — the write through an index that [`Self::attach_gather_index`]
+    /// refuses. The vendor's own `dxp/test/test_scatter_1core/sdsc_1.json` is exactly this shape: an
+    /// `identity` whose input is plain, whose index (`Tensor1`, `index_tensor`) sits in the middle,
+    /// and whose output (`Tensor2`, `value_tensor`, `maxDimSizes_ [1, -1, -1]`) is the paged tensor.
+    /// The scheduler turns that output's LX→HBM transfer indirect (`L3DlOpsScheduler.cpp:6880-6945`,
+    /// `convertTransferDirectToIndirect`'s `L3SUIBR` arm), the mirror of the gather's HBM→LX read.
+    ///
+    /// The index is inserted where the gather inserts it, so the output slides one right and stays
+    /// last — and that slid position is the value. Returns `None` on an op with no operands.
+    pub fn attach_scatter_index(&mut self, scatter: GatherIndex) -> Option<IndirectAccess> {
+        let out_idx = self.args.len().checked_sub(1)?;
+        self.attach_index(scatter, out_idx + 1)
+    }
+
+    /// The shared body of [`Self::attach_gather_index`] and [`Self::attach_scatter_index`]: the index
+    /// operand inserted before the output, paired with operand `value_idx` as it stands AFTER that
+    /// insertion (an input keeps its position; the output slides one right).
+    fn attach_index(&mut self, gather: GatherIndex, value_idx: usize) -> Option<IndirectAccess> {
         let GatherIndex {
             name: index_name,
             entry_dim,
@@ -3438,9 +3464,6 @@ impl OpSpec {
             first_entry,
         } = gather;
         let out_idx = self.args.len().saturating_sub(1);
-        if value_idx >= self.args.len() || value_idx == out_idx {
-            return None;
-        }
         // ⭐⭐⭐ THE INDEX IS SHAPED BY THE PAGED DIMS, NOT BY THE VALUE.
         //
         // Both vendor fixtures give the index the value's PINNED dims only, in the value's own order —

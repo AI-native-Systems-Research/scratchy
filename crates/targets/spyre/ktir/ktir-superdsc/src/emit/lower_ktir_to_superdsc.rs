@@ -303,50 +303,18 @@ pub fn gather_of(k: &KtirNode) -> Result<Option<Gather>, Error> {
 pub fn gathers_of(k: &KtirNode) -> Result<Vec<Gather>, Error> {
     let f = &k.func;
     let consts = index_constants(&k.func);
+    // A tile a `ktdp.store` writes THROUGH is a SCATTER ([`scatters_of`]), not a gather: its rows
+    // are a destination, and no load reads them.
     let tiles: Vec<&Operation<'_>> = f
         .operations
         .iter()
-        .filter(|o| o.op_type == OpKind::KtdpConstructIndirectAccessTile)
+        .filter(|o| {
+            o.op_type == OpKind::KtdpConstructIndirectAccessTile && !stored_through(f, o.result)
+        })
         .collect();
     let mut out: Vec<Gather> = Vec::with_capacity(tiles.len());
     for tile in &tiles {
-        // The SAME param walk `gather_of` runs, per tile — a closure over this tile's operands so
-        // the two readings cannot disagree about which parameter a tile's view names.
-        let param_tid = |slot: usize, what: &str| -> Result<u32, Error> {
-            let view_v = tile.operands.get(slot).copied().ok_or_else(|| Error {
-                message: format!(
-                    "{}: the indirect access tile states no {what} operand — a gather needs both the \
-                     tensor it reads and the index vector that chooses the rows",
-                    f.name
-                ),
-            })?;
-            let view = f
-                .operations
-                .iter()
-                .find(|o| o.result == Some(view_v) && o.op_type == OpKind::KtdpConstructMemoryView)
-                .ok_or_else(|| Error {
-                    message: format!(
-                        "{}: the indirect access tile's {what} operand is not a \
-                         `ktdp.construct_memory_view`, so no parameter can be named for it",
-                        f.name
-                    ),
-                })?;
-            let ptr = view.operands.first().copied();
-            let i = f
-                .arguments
-                .iter()
-                .position(|(a, _)| Some(*a) == ptr)
-                .ok_or_else(|| Error {
-                    message: format!(
-                        "{}: the indirect access tile's {what} view does not reinterpret a PARAMETER, \
-                         so the buffer it names has no binding and no placement",
-                        f.name
-                    ),
-                })?;
-            k.bindings.get(i).map(|b| b.get()).ok_or_else(|| Error {
-                message: format!("{}: parameter {i} has no bound buffer", f.name),
-            })
-        };
+        let param_tid = |slot: usize, what: &str| indirect_tile_param(k, tile, slot, what);
         let value_tid = param_tid(0, "gathered")?;
         let index_tid = param_tid(1, "index")?;
         if value_tid == index_tid {
@@ -372,76 +340,14 @@ pub fn gathers_of(k: &KtirNode) -> Result<Vec<Gather>, Error> {
         // resolves); an unrolled sweep's trip `b` states `b · BLOCK_N`, and this walk refuses a
         // tile whose anchor is NOT a constant by name rather than gathering from index word 0 —
         // the silent wrong-row shape `EntryBase` exists to make unrepresentable at the emitter.
-        let first_entry = {
-            let kinds = tile.attr(AttrKey::DimKinds);
-            let vars = tile.attr(AttrKey::IntermediateVars);
-            let subs = tile.attr(AttrKey::DimSubs);
-            let (
-                Some(Attr::StrList(kinds)),
-                Some(Attr::Ssas(vars)),
-                Some(Attr::AffineMapList(subs)),
-            ) = (kinds, vars, subs)
-            else {
-                return err(format!(
-                    "{}: an indirect access tile states no `dim_kinds`/`intermediate_vars`/`dim_subs` \
-                     triple, so where its run of entries starts in the index buffer is unknown — the \
-                     gather would read index word 0 by default",
-                    f.name
-                ));
-            };
-            let Some(d) = kinds.iter().position(|k| *k == "indirect") else {
-                return err(format!(
-                    "{}: an indirect access tile states no `indirect` dim, so no subscript names the \
-                     index buffer it reads",
-                    f.name
-                ));
-            };
-            let Some(sub) = subs.get(d) else {
-                return err(format!(
-                    "{}: the indirect access tile's dim {d} carries no `dim_subs` map",
-                    f.name
-                ));
-            };
-            // ⛔ THE SUBSCRIPT MUST BE `Sym(0) + Dim(0)` AND NOTHING ELSE — the one form
-            // `gather_subscripts` builds and the one this reading can fold into an entry base. A
-            // tile with a scaled or second-symbol subscript names a different addressing program,
-            // and guessing its constant is an address; refusing names the map.
-            let anchor = match sub.exprs.first() {
-                Some(AffineExpr::Add(a, b)) => match (a, b) {
-                    (AffineExpr::Sym(i), AffineExpr::Dim(j)) if *i < vars.len() && *j == 0 => {
-                        consts.get(&vars[*i]).copied()
-                    }
-                    (AffineExpr::Dim(j), AffineExpr::Sym(i)) if *i < vars.len() && *j == 0 => {
-                        consts.get(&vars[*i]).copied()
-                    }
-                    _ => None,
-                },
-                Some(AffineExpr::Dim(j)) if *j == 0 => Some(0),
-                _ => None,
-            };
-            let Some(anchor) = anchor else {
-                return err(format!(
-                    "{}: the indirect access tile's subscript for dim {d} is not the form this \
-                     reader folds (`Sym(0) + Dim(0)` with `Sym(0)` a constant, or a bare `Dim(0)`), so \
-                     where this gather's entries start in the index buffer is unknown — the gather \
-                     would read index word 0 by default. State the trip's anchor as a constant.",
-                    f.name
-                ));
-            };
-            if anchor < 0 || anchor > u32::MAX as i64 {
-                return err(format!(
-                    "{}: the indirect access tile's index anchor is {anchor}, which is not a u32 \
-                     entry count",
-                    f.name
-                ));
-            }
-            // The constructor IS the stick-alignment check (issue 201 item 1): an anchor that is
-            // not a whole `SenUint32` stick into the index buffer refuses HERE, at the walk,
-            // before any descriptor exists — on both the uncut and the cut arm.
-            crate::superdsc_opspec::EntryBase::of_entries(anchor as u32).map_err(|msg| Error {
-                message: format!("{}: {msg}", f.name),
-            })?
-        };
+        // The constructor IS the stick-alignment check (issue 201 item 1): an anchor that is
+        // not a whole `SenUint32` stick into the index buffer refuses HERE, at the walk,
+        // before any descriptor exists — on both the uncut and the cut arm.
+        let first_entry =
+            crate::superdsc_opspec::EntryBase::of_entries(indirect_tile_anchor(k, tile, &consts)?)
+                .map_err(|msg| Error {
+                    message: format!("{}: {msg}", f.name),
+                })?;
         // ⭐ NO CROSS-TILE PAIR CHECK — deliberately. The one-index law is per DESCRIPTOR, and the
         // walk below joins each op to its own tile by load identity, so two tiles over different
         // pairs are two descriptors each carrying one index operand — the batched paged-decode
@@ -492,6 +398,397 @@ pub fn gathers_of(k: &KtirNode) -> Result<Vec<Gather>, Error> {
         });
     }
     Ok(out)
+}
+
+/// The parameter an indirect access tile's operand `slot` names — slot 0 is the DATA view (the
+/// tensor read or written through the index), slot 1 the INDEX view — resolved to its bound buffer.
+/// One reading for [`gathers_of`] and [`scatters_of`], so the two cannot disagree about which
+/// parameter a tile's view names.
+fn indirect_tile_param(
+    k: &KtirNode,
+    tile: &Operation<'_>,
+    slot: usize,
+    what: &str,
+) -> Result<u32, Error> {
+    let f = &k.func;
+    let view_v = tile.operands.get(slot).copied().ok_or_else(|| Error {
+        message: format!(
+            "{}: the indirect access tile states no {what} operand — a gather needs both the \
+                 tensor it reads and the index vector that chooses the rows",
+            f.name
+        ),
+    })?;
+    let view = f
+        .operations
+        .iter()
+        .find(|o| o.result == Some(view_v) && o.op_type == OpKind::KtdpConstructMemoryView)
+        .ok_or_else(|| Error {
+            message: format!(
+                "{}: the indirect access tile's {what} operand is not a \
+                     `ktdp.construct_memory_view`, so no parameter can be named for it",
+                f.name
+            ),
+        })?;
+    let ptr = view.operands.first().copied();
+    let i = f
+        .arguments
+        .iter()
+        .position(|(a, _)| Some(*a) == ptr)
+        .ok_or_else(|| Error {
+            message: format!(
+                "{}: the indirect access tile's {what} view does not reinterpret a PARAMETER, \
+                     so the buffer it names has no binding and no placement",
+                f.name
+            ),
+        })?;
+    k.bindings.get(i).map(|b| b.get()).ok_or_else(|| Error {
+        message: format!("{}: parameter {i} has no bound buffer", f.name),
+    })
+}
+
+/// Where an indirect access tile's run of entries starts in its index buffer — the tile's
+/// `Sym(0) + Dim(0)` subscript folded to a constant, in entries. One reading for [`gathers_of`]
+/// (which holds every gather to a stick-aligned start) and [`scatters_of`] (whose per-row stores
+/// coalesce into stick-aligned runs at the emitter, [`paged_kv_write`]).
+fn indirect_tile_anchor(
+    k: &KtirNode,
+    tile: &Operation<'_>,
+    consts: &std::collections::HashMap<Ssa, i64>,
+) -> Result<u32, Error> {
+    let f = &k.func;
+    let kinds = tile.attr(AttrKey::DimKinds);
+    let vars = tile.attr(AttrKey::IntermediateVars);
+    let subs = tile.attr(AttrKey::DimSubs);
+    let (Some(Attr::StrList(kinds)), Some(Attr::Ssas(vars)), Some(Attr::AffineMapList(subs))) =
+        (kinds, vars, subs)
+    else {
+        return err(format!(
+            "{}: an indirect access tile states no `dim_kinds`/`intermediate_vars`/`dim_subs` \
+                 triple, so where its run of entries starts in the index buffer is unknown — the \
+                 gather would read index word 0 by default",
+            f.name
+        ));
+    };
+    let Some(d) = kinds.iter().position(|k| *k == "indirect") else {
+        return err(format!(
+            "{}: an indirect access tile states no `indirect` dim, so no subscript names the \
+                 index buffer it reads",
+            f.name
+        ));
+    };
+    let Some(sub) = subs.get(d) else {
+        return err(format!(
+            "{}: the indirect access tile's dim {d} carries no `dim_subs` map",
+            f.name
+        ));
+    };
+    // ⛔ THE SUBSCRIPT MUST BE `Sym(0) + Dim(0)` AND NOTHING ELSE — the one form
+    // `gather_subscripts` builds and the one this reading can fold into an entry base. A
+    // tile with a scaled or second-symbol subscript names a different addressing program,
+    // and guessing its constant is an address; refusing names the map.
+    let anchor = match sub.exprs.first() {
+        Some(AffineExpr::Add(a, b)) => match (a, b) {
+            (AffineExpr::Sym(i), AffineExpr::Dim(j)) if *i < vars.len() && *j == 0 => {
+                consts.get(&vars[*i]).copied()
+            }
+            (AffineExpr::Dim(j), AffineExpr::Sym(i)) if *i < vars.len() && *j == 0 => {
+                consts.get(&vars[*i]).copied()
+            }
+            _ => None,
+        },
+        Some(AffineExpr::Dim(j)) if *j == 0 => Some(0),
+        _ => None,
+    };
+    let Some(anchor) = anchor else {
+        return err(format!(
+            "{}: the indirect access tile's subscript for dim {d} is not the form this \
+                 reader folds (`Sym(0) + Dim(0)` with `Sym(0)` a constant, or a bare `Dim(0)`), so \
+                 where this gather's entries start in the index buffer is unknown — the gather \
+                 would read index word 0 by default. State the trip's anchor as a constant.",
+            f.name
+        ));
+    };
+    if anchor < 0 || anchor > u32::MAX as i64 {
+        return err(format!(
+            "{}: the indirect access tile's index anchor is {anchor}, which is not a u32 \
+                 entry count",
+            f.name
+        ));
+    }
+    Ok(anchor as u32)
+}
+
+/// Whether a `ktdp.store` writes THROUGH the value `tile` — the tile is then a scatter's destination.
+fn stored_through(f: &IRFunction<'static>, tile: Option<Ssa>) -> bool {
+    tile.is_some_and(|t| {
+        f.operations
+            .iter()
+            .any(|o| o.op_type == OpKind::KtdpStore && o.operands.get(1) == Some(&t))
+    })
+}
+
+/// ⭐⭐⭐ A SCATTER THE PROGRAM STATES — a `ktdp.store` through a
+/// `ktdp.construct_indirect_access_tile`: rows of [`Scatter::src_tid`] written to the rows of
+/// [`Scatter::value_tid`] that [`Scatter::index_tid`] names. The mirror of [`Gather`], read off the
+/// same tile operands (slot 0 the destination's view, slot 1 the index's).
+#[derive(Clone, Copy, Debug)]
+pub struct Scatter {
+    /// The parameter holding the row index of every written row.
+    pub index_tid: u32,
+    /// The parameter written THROUGH the index (the paged destination).
+    pub value_tid: u32,
+    /// The parameter the stored rows are loaded from.
+    pub src_tid: u32,
+    /// Rows the store writes: the tile's slow extent, one index entry per row.
+    pub entries: u32,
+    /// Where this store's run of entries starts in the index buffer, in entries — any entry: a
+    /// per-row store writes one row at its own entry, and [`paged_kv_write`] coalesces the runs.
+    pub first_entry: u32,
+    /// Where this store's rows start in the source: the corner of the load that produced them.
+    pub src_row: u32,
+}
+
+/// [`Scatter`] for every `ktdp.store` the program makes through an indirect access tile.
+pub fn scatters_of(k: &KtirNode) -> Result<Vec<Scatter>, Error> {
+    let f = &k.func;
+    let consts = index_constants(&k.func);
+    let mut out = Vec::new();
+    for store in f
+        .operations
+        .iter()
+        .filter(|o| o.op_type == OpKind::KtdpStore)
+    {
+        let (Some(&value), Some(&tv)) = (store.operands.first(), store.operands.get(1)) else {
+            continue;
+        };
+        let Some(tile) = f
+            .operations
+            .iter()
+            .find(|o| o.result == Some(tv) && o.op_type == OpKind::KtdpConstructIndirectAccessTile)
+        else {
+            continue;
+        };
+        let value_tid = indirect_tile_param(k, tile, 0, "written")?;
+        let index_tid = indirect_tile_param(k, tile, 1, "index")?;
+        if value_tid == index_tid {
+            return err(format!(
+                "{}: the scatter's index view and the tensor it writes are the SAME parameter \
+                 (t{value_tid}) — one allocation cannot be both the `index_tensor` and the \
+                 `value_tensor` of one pair",
+                f.name
+            ));
+        }
+        let (entries, _) = shape_2d(tile).ok_or_else(|| Error {
+            message: format!(
+                "{}: the scatter's indirect access tile states no 2-D `shape`, so the number of \
+                 written rows is unknown",
+                f.name
+            ),
+        })?;
+        let first_entry = indirect_tile_anchor(k, tile, &consts)?;
+        // The stored value is a plain `ktdp.load` over an access tile of the source parameter.
+        let load = f
+            .operations
+            .iter()
+            .find(|o| o.result == Some(value) && o.op_type == OpKind::KtdpLoad)
+            .ok_or_else(|| Error {
+                message: format!(
+                    "{}: the scatter stores a value no `ktdp.load` produced — the card's scatter is \
+                     a copy, so the written rows must be rows of a parameter",
+                    f.name
+                ),
+            })?;
+        let src_tile_v = load.operands.first().copied();
+        let src_tile = f
+            .operations
+            .iter()
+            .find(|o| o.result == src_tile_v && o.op_type == OpKind::KtdpConstructAccessTile)
+            .ok_or_else(|| Error {
+                message: format!(
+                    "{}: the scatter's stored rows are not loaded through a plain access tile",
+                    f.name
+                ),
+            })?;
+        let src_view_v = src_tile.operands.first().copied();
+        let src_view = f
+            .operations
+            .iter()
+            .find(|o| o.result == src_view_v && o.op_type == OpKind::KtdpConstructMemoryView)
+            .ok_or_else(|| Error {
+                message: format!("{}: the scatter's source tile reads no memory view", f.name),
+            })?;
+        let ptr = src_view.operands.first().copied();
+        let i = f
+            .arguments
+            .iter()
+            .position(|(a, _)| Some(*a) == ptr)
+            .ok_or_else(|| Error {
+                message: format!(
+                    "{}: the scatter's source view does not reinterpret a parameter",
+                    f.name
+                ),
+            })?;
+        let src_tid = k.bindings.get(i).map(|b| b.get()).ok_or_else(|| Error {
+            message: format!("{}: parameter {i} has no bound buffer", f.name),
+        })?;
+        let src_row = src_tile
+            .operands
+            .get(1)
+            .and_then(|r| consts.get(r).copied())
+            .and_then(|r| u32::try_from(r).ok())
+            .ok_or_else(|| Error {
+            message: format!(
+                "{}: the scatter's source tile states no constant row corner, so which source rows \
+                 it writes is unknown",
+                f.name
+            ),
+        })?;
+        out.push(Scatter {
+            index_tid,
+            value_tid,
+            src_tid,
+            entries,
+            first_entry,
+            src_row,
+        });
+    }
+    Ok(out)
+}
+
+/// One store's share of a scatter run: where its entries start, how many rows it writes, and the
+/// source row it writes first. Ordered by entry, so a run's pieces sort into program order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RunPiece {
+    entry: u32,
+    rows: u32,
+    src_row: u32,
+}
+
+/// The stores of one `(source, pool, table)` triple — one run of rows [`paged_kv_write`] cuts into
+/// index-stick ops.
+struct ScatterRun {
+    key: (u32, u32, u32),
+    pieces: Vec<RunPiece>,
+}
+
+/// ⭐⭐⭐ THE PAGED KV WRITE ON THE CARD — spyre-inference's `reshape_and_cache_head_major`
+/// (`kernels/paged_kv_write.py`) as hardware scatters: every row of the step's K (and V) lands in its
+/// pool at the row the write-rows table names, through the index registers.
+///
+/// The program states the write as `ktdp.store`s through indirect access tiles ([`scatters_of`]):
+/// one store per pool at eight rows or more, one per row below Triton's scatter floor. The card's
+/// scatter has no floor, but its index is loaded one 32-entry stick per op, so the stores of one
+/// (source, pool, table) triple are COALESCED back into the one run the program describes — rows
+/// `0..n` of the source to entries `0..n` of the table — and that run is cut into ops of one index
+/// stick each ([`assemble_scatter_copy`], the vendor's `test_scatter_1core` shape). A store that does
+/// not continue the run (a row written at an entry other than its own position) is refused by name:
+/// the copy moves source row `j` through entry `j`, and nothing else.
+pub fn paged_kv_write(
+    name: &str,
+    k: &KtirNode,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let scatters = scatters_of(k)?;
+    if scatters.is_empty() {
+        return err(format!(
+            "{name}: a KV write that states no `ktdp.store` through an indirect access tile — the \
+             write IS the scatter, so a program without one writes nothing"
+        ));
+    }
+    let region = |tid: u32| -> Result<&Region, Error> {
+        r.iter().find(|x| x.tid == tid).ok_or_else(|| Error {
+            message: format!("{name}: t{tid} is not a parameter of the program"),
+        })
+    };
+    let stick = Fp16::ELEMS_PER_STICK;
+    // Each (source, pool, table) triple in first-store order, with its stores' pieces.
+    let mut runs: Vec<ScatterRun> = Vec::new();
+    for sc in &scatters {
+        let key = (sc.src_tid, sc.value_tid, sc.index_tid);
+        let piece = RunPiece {
+            entry: sc.first_entry,
+            rows: sc.entries,
+            src_row: sc.src_row,
+        };
+        match runs.iter_mut().find(|r| r.key == key) {
+            Some(r) => r.pieces.push(piece),
+            None => runs.push(ScatterRun {
+                key,
+                pieces: vec![piece],
+            }),
+        }
+    }
+    let mut ops = Vec::new();
+    for ScatterRun {
+        key: (src_tid, pool_tid, index_tid),
+        mut pieces,
+    } in runs
+    {
+        pieces.sort_unstable();
+        let mut next = 0u32;
+        for &RunPiece {
+            entry,
+            rows,
+            src_row,
+        } in &pieces
+        {
+            if entry != next || src_row != entry {
+                return err(format!(
+                    "{name}: a store writes source rows {src_row}.. through index entries {entry}.. \
+                     where the run so far ends at {next} — the card's scatter copies source row `j` \
+                     through entry `j`, so the program's stores must tile rows `0..n` in order"
+                ));
+            }
+            next += rows;
+        }
+        let total = next;
+        let (src, pool, index) = (region(src_tid)?, region(pool_tid)?, region(index_tid)?);
+        let hd = pool.v_cols;
+        if src.v_cols != hd || hd == 0 || !hd.is_multiple_of(stick) {
+            return err(format!(
+                "{name}: the source t{src_tid} rows are {} wide and the pool t{pool_tid}'s {hd} — a \
+                 KV row is the same whole number of {stick}-element sticks on both sides",
+                src.v_cols
+            ));
+        }
+        if total > src.v_rows {
+            return err(format!(
+                "{name}: the stores write {total} rows of t{src_tid}, whose view holds {}",
+                src.v_rows
+            ));
+        }
+        // One index entry is one pool row: `hd / stick` one-stick sub-rows.
+        let page = crate::superdsc_opspec::PageExtent::of_positions(hd / stick);
+        let per_op = <SenUint32 as DataFormat>::ELEMS_PER_STICK;
+        let (src_name, pool_name, index_name) = (src.name(), pool.name(), index.name());
+        for (i, first) in (0..total).step_by(per_op as usize).enumerate() {
+            let entries = per_op.min(total - first);
+            let scatter = crate::superdsc_opspec::GatherIndex::of_scratch_rows(
+                index_name.clone(),
+                page,
+                crate::superdsc_opspec::EntryBase::of_sticks(i as u32),
+            );
+            let op = crate::ir::bridge::tiled_op_sdsc_op::assemble_scatter_copy(
+                &format!("kvwrite{i}_o{pool_tid}"),
+                &src_name,
+                &pool_name,
+                scatter,
+                crate::ir::bridge::tiled_op_sdsc_op::ScatterCopySpec {
+                    rows: entries * (hd / stick),
+                    cols: stick,
+                    df: Df::Fp16,
+                    src_elems: first * hd,
+                },
+                sym_id_base,
+                layout,
+            )
+            .map_err(|message| Error { message })?;
+            ops.push(op);
+        }
+    }
+    Ok(ops)
 }
 
 /// ⛔⛔⛔ THE GUARD FOR THE FACT THIS FILE USED TO DROP: an operand this emitter addresses at the
