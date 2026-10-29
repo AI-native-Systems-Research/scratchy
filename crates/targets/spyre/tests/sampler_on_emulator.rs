@@ -145,6 +145,19 @@ fn staggered_windows_on_metal() -> Option<usize> {
     None
 }
 
+/// The fused map windows a draw runs that read through the card's stagger table. The sampler
+/// (`kernels/sample_fwd.py`) widens f16 to f32 twice on its padded row — its log islands' own
+/// widens reach the emulator already collapsed to bare f16 logs — and each widen lands in a
+/// window of its own:
+///   1. `x32 = x.to(tl.float32)`, the logits row's widen, alone in its window;
+///   2. `noise = g16.to(tl.float32)`, the Gumbel noise's widen, fused with the second log and its
+///      negation (`lt = tl.log(c2)`, `g16 = -lt`); the `tl.maximum` before them is not a fusable
+///      map op, so the window starts at the log.
+///
+/// PINNED, not counted from the plan: a widen whose window fails to emit drops out of the plan
+/// too, so a count read from the plan would fall with it and hide exactly that fallback.
+const STAGGERED_WINDOWS_PER_DRAW: usize = 2;
+
 #[test]
 fn a_greedy_draw_answers_the_planted_maximum() {
     let vocab = 49155u32; // granite's
@@ -156,15 +169,16 @@ fn a_greedy_draw_answers_the_planted_maximum() {
         // gate, so where the emulator has Metal those windows run as fused kernels that read
         // through the stagger table — the path that drew argmax + 8 when it widened without the
         // stagger. The interpreter alone already draws right, so a staggered window that fell
-        // back to it would pass here unseen: EACH draw must run at least one on Metal.
+        // back to it would pass here unseen: EACH draw must run BOTH on Metal, exactly.
         let on_metal = match (before, staggered_windows_on_metal()) {
             (Some(before), Some(after)) => {
-                assert!(
-                    after > before,
-                    "planted {argmax}: the draw ran no staggered widen's window on the fused \
-                     Metal kernel"
+                assert_eq!(
+                    after - before,
+                    STAGGERED_WINDOWS_PER_DRAW,
+                    "planted {argmax}: the draw must run each staggered widen's window as a \
+                     fused Metal kernel"
                 );
-                format!(", {} staggered window(s) on Metal", after - before)
+                format!(", {} staggered windows on Metal", after - before)
             }
             _ => String::new(),
         };
