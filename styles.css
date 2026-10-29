@@ -13,6 +13,27 @@
   --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
 }
 
+/* Carbon's spacing scale ($spacing-01…13). @carbon/styles compiles it into
+ * its components' rules and declares the custom properties on no element a
+ * page has, so unlike the palette it is declared here, Carbon's values under
+ * Carbon's names, for the layouts no cds-stack can space (a grid whose rows
+ * share its columns). */
+:root {
+  --cds-spacing-01: 0.125rem;
+  --cds-spacing-02: 0.25rem;
+  --cds-spacing-03: 0.5rem;
+  --cds-spacing-04: 0.75rem;
+  --cds-spacing-05: 1rem;
+  --cds-spacing-06: 1.5rem;
+  --cds-spacing-07: 2rem;
+  --cds-spacing-08: 2.5rem;
+  --cds-spacing-09: 3rem;
+  --cds-spacing-10: 4rem;
+  --cds-spacing-11: 5rem;
+  --cds-spacing-12: 6rem;
+  --cds-spacing-13: 10rem;
+}
+
 
 /* Carbon custom elements render unstyled/unboxed until their module has
  * loaded and upgraded them — hide them until then to avoid a FOUC flash. */

@@ -23,9 +23,9 @@ pub enum Module {
     List,
     Select,
     Stack,
+    Tabs,
     Tag,
     Tile,
-    Toggle,
     ToggleTip,
     Tooltip,
     UiShell,
@@ -33,7 +33,7 @@ pub enum Module {
 
 /// Which module defines each `cds-*` tag family: the tag itself and every
 /// `<family>-...` tag.
-const FAMILIES: [(&str, Module); 24] = [
+const FAMILIES: [(&str, Module); 25] = [
     ("cds-accordion", Module::Accordion),
     ("cds-button", Module::Button),
     ("cds-clickable-tile", Module::Tile),
@@ -52,10 +52,11 @@ const FAMILIES: [(&str, Module); 24] = [
     ("cds-select", Module::Select),
     ("cds-side-nav", Module::UiShell),
     ("cds-stack", Module::Stack),
+    ("cds-tab", Module::Tabs),
     ("cds-table", Module::DataTable),
+    ("cds-tabs", Module::Tabs),
     ("cds-tag", Module::Tag),
     ("cds-tile", Module::Tile),
-    ("cds-toggle", Module::Toggle),
     ("cds-toggletip", Module::ToggleTip),
     ("cds-unordered-list", Module::List),
 ];
@@ -106,9 +107,9 @@ impl Module {
             Module::List => "list",
             Module::Select => "select",
             Module::Stack => "stack",
+            Module::Tabs => "tabs",
             Module::Tag => "tag",
             Module::Tile => "tile",
-            Module::Toggle => "toggle",
             Module::ToggleTip => "toggle-tip",
             Module::Tooltip => "tooltip",
             Module::UiShell => "ui-shell",
@@ -158,34 +159,59 @@ pub fn ContentSwitcherItem(target: String, selected: bool, children: Element) ->
     }
 }
 
-/// A content switcher's panel: hidden until its item is selected. Carbon
+/// A `cds-tabs` over panels, as [`ContentSwitcher`] is: each [`TabItem`] with a `target` shows
+/// the element whose id it is and Carbon hides the others' ([`ContentPanel`]), and the panel ids
+/// are links. `id` names it for a script that reads its `value`; `kind` is its style.
+#[component]
+pub fn Tabs(
+    selected: String,
+    #[props(default)] kind: TabsKind,
+    #[props(default)] id: Option<String>,
+    children: Element,
+) -> Element {
+    // Either kind shares the row's whole width, each tab an equal part: Carbon's full-width, which
+    // Carbon lays out for contained tabs only; switcher.js lays line tabs out the same.
+    let kind = match kind {
+        TabsKind::Line => None,
+        TabsKind::Contained => Some("contained"),
+    };
+    rsx! {
+        cds-tabs { id, "value": selected, "type": kind, "full-width": true, {children} }
+        script { dangerous_inner_html: SWITCHER_JS }
+    }
+}
+
+/// A `cds-tabs`' style: Carbon's line tabs, which nest within a panel, or its contained tabs,
+/// always attached to the panel under them.
+#[derive(Clone, Copy, PartialEq, Default)]
+pub enum TabsKind {
+    #[default]
+    Line,
+    Contained,
+}
+
+/// One `cds-tab`: its label, its value, and the id of the panel it shows, if it shows one.
+#[component]
+pub fn TabItem(
+    value: String,
+    #[props(default)] target: Option<String>,
+    selected: bool,
+    children: Element,
+) -> Element {
+    rsx! {
+        cds-tab { "value": value, "target": target, "selected": selected.then_some(true),
+            {children}
+        }
+    }
+}
+
+/// A content switcher's or tabs' panel: hidden until its item is selected. Carbon
 /// sets `hidden` once the switcher runs; rendering it already set keeps the
 /// other panels from showing until then. Hidden, it still has its width
 /// (`[data-panel]` in styles.css), so switching never resizes what holds it.
 #[component]
 pub fn ContentPanel(id: String, shown: bool, children: Element) -> Element {
     rsx! { div { id, "data-panel": "", hidden: (!shown).then_some(true), {children} } }
-}
-
-/// A `cds-toggle` switching between two panels: `off`'s shown until it is toggled, then `on`'s.
-/// Each panel is a [`ContentPanel`], so a chart in the one hidden draws when it is shown.
-#[component]
-pub fn PanelToggle(
-    #[props(into)] label: String,
-    #[props(into)] off: String,
-    #[props(into)] on: String,
-) -> Element {
-    let script = format!(
-        "document.currentScript.previousElementSibling.addEventListener('cds-toggle-changed', function (e) {{\
-         var on = e.detail.toggled;\
-         document.getElementById({off:?}).hidden = on;\
-         document.getElementById({on:?}).hidden = !on;\
-         }});"
-    );
-    rsx! {
-        cds-toggle { "label-text": label, "label-a": "On", "label-b": "Off", size: "sm" }
-        script { dangerous_inner_html: script }
-    }
 }
 
 #[component]
