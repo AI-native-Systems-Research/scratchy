@@ -55,6 +55,7 @@ use scratchy_target_spyre::ktir_superdsc_door::{BundleAttnParams, lower as door_
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{
     ActiveCap, RolledSuperDsc, RungFacts, compute_bundle_layout, lower_subtile_tape_to_superdsc,
 };
+use scratchy_target_spyre::paged_step::PAGE_SLOTS;
 
 /// granite-3.1-8b's attention block: hidden 4096, kv_dim 1024 (8 kv-heads), head_dim 128
 /// (32 q-heads → `nslab = hd / POOL_STICK = 2`, the multi-slab fact the restructure needs).
@@ -92,6 +93,15 @@ const LAYERS: u32 = 2;
 /// gets its own `[1, KV]` pair (sources 14, 15) the way production memoizes per width.
 fn fp8_oproj_one_layer() -> LoweringInput {
     let mut input = fixtures::one_layer_input_shaped(H, KV, I, HD);
+    // The KV caches are the paged attention's pools, read as `[pages, nkvh, PAGE_SLOTS, hd]` over
+    // their own bytes — so each is a whole number of pages (one here), never the shared
+    // fixture's 8-row cache.
+    let pool = SourceShape {
+        rows: PAGE_SLOTS,
+        cols: KV,
+    };
+    input.sources[7] = pool; // 7: prefix_k, one page
+    input.sources[8] = pool; // 8: prefix_v, one page
     input.sources[5] = SourceShape { rows: 1, cols: H }; // 5: cos, q-site tiled [1, 32·128]
     input.sources[6] = SourceShape { rows: 1, cols: H }; // 6: sin, q-site tiled
     input.sources.push(SourceShape { rows: 1, cols: KV }); // 14: cos, k-site tiled [1, 8·128]

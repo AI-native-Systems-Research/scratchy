@@ -8804,7 +8804,7 @@ pub fn emit_per_layer_kv_token_elems_arm_body(
 fn refuse_if_wiring_disagrees_with_manifest(
     stem: &str,
     manifest_json: &str,
-    emitted_layers: &[(u64, u32, u32, u32, u32)],
+    emitted_layers: &[(u64, u32, u32)],
     emitted_embed: u32,
     emitted_cos: &[(u32, u32, proc_macro2::TokenStream)],
     emitted_sin: &[(u32, u32, proc_macro2::TokenStream)],
@@ -8903,7 +8903,7 @@ fn refuse_if_wiring_disagrees_with_manifest(
     }
     // ⛔ POSITION BY POSITION. The worker indexes `layers[i]` for layer `i`, so "same set, other
     // order" is exactly as wrong as a missing entry.
-    for (i, (&(mlayer, mk), &(wlayer, wk, wv, _, _))) in pk.iter().zip(emitted_layers).enumerate() {
+    for (i, (&(mlayer, mk), &(wlayer, wk, wv))) in pk.iter().zip(emitted_layers).enumerate() {
         if mlayer != wlayer || mk != wk as usize {
             fail.push(format!(
                 "layers[{i}]: manifest says layer {mlayer} prefix_k t{mk}, wiring says layer \
@@ -8912,7 +8912,7 @@ fn refuse_if_wiring_disagrees_with_manifest(
         }
         let _ = wv;
     }
-    for (i, (&(mlayer, mv), &(_, _, wv, _, _))) in pv.iter().zip(emitted_layers).enumerate() {
+    for (i, (&(mlayer, mv), &(_, _, wv))) in pv.iter().zip(emitted_layers).enumerate() {
         if mv != wv as usize {
             fail.push(format!(
                 "layers[{i}] (layer {mlayer}): manifest says prefix_v t{mv}, wiring says t{wv}"
@@ -9261,11 +9261,12 @@ fn emit_superdsc_wiring(
         quote! { (#r, #c) }
     });
 
-    // ── Per-layer AttnDecode wiring ──
-    // The worker's own walk, run here: find each node that reads the mask, and
-    // take the prefix-K/V args plus the argument positionally after each as the
-    // new-K/new-V outputs.
-    let mut layers: Vec<(u64, u32, u32, u32, u32)> = Vec::new();
+    // ── Per-layer pools ──
+    // Every paged attention program binds `[q, out, k pool, v pool, page table, mask]`: the node
+    // that reads the mask names its layer's K pool (a `PrefixK` source) and V pool (a `PrefixV`
+    // source). Nothing else of the layer leaves the device — the step's K/V are scattered into the
+    // pools by the layer's own write — so the pools are the whole per-layer wiring.
+    let mut layers: Vec<(u64, u32, u32)> = Vec::new();
     if let Some(mask) = gk.attn_mask {
         let pk: std::collections::HashMap<u32, u64> = lwd
             .bindings
@@ -9289,23 +9290,14 @@ fn emit_superdsc_wiring(
             if !node.args.iter().any(|a| *a as u32 == mask) {
                 continue;
             }
-            let (mut layer, mut k_src, mut new_k) = (None, None, None);
-            let (mut v_src, mut new_v) = (None, None);
-            for (i, a) in node.args.iter().map(|a| *a as u32).enumerate() {
-                if let Some(&l) = pk.get(&a) {
-                    layer = Some(l);
-                    k_src = Some(a);
-                    new_k = node.args.get(i + 1).map(|x| *x as u32);
-                }
-                if pv.contains(&a) {
-                    v_src = Some(a);
-                    new_v = node.args.get(i + 1).map(|x| *x as u32);
-                }
-            }
-            if let (Some(l), Some(ks), Some(nk), Some(vs), Some(nv)) =
-                (layer, k_src, new_k, v_src, new_v)
-            {
-                layers.push((l, ks, vs, nk, nv));
+            let k_pool = node
+                .args
+                .iter()
+                .map(|a| *a as u32)
+                .find(|a| pk.contains_key(a));
+            let v_pool = node.args.iter().map(|a| *a as u32).find(|a| pv.contains(a));
+            if let (Some(ks), Some(vs)) = (k_pool, v_pool) {
+                layers.push((pk[&ks], ks, vs));
             }
         }
         layers.sort_by_key(|x| x.0);
@@ -9646,17 +9638,11 @@ fn emit_superdsc_wiring(
         &emitted_weight_ids,
     );
 
-    let layer_toks = layers.iter().map(|(_, ks, vs, nk, nv)| {
-        // ⭐ THE LAYER'S OWN KV WIDTH, off the prefix-K source's baked shape. A hybrid-attention
-        // arch (gemma-4) gives sliding and global layers DIFFERENT kv_heads×head_dim, so the
-        // model-wide `Geometry::kv_dim` cannot size a per-layer host buffer or readback — the
-        // prefix-K source's column count IS the width this layer's K/V rows carry.
-        let kvw = u32l(gk.tensor_shapes[*ks as usize].1);
-        let (ks, vs, nk, nv) = (u32l(*ks), u32l(*vs), u32l(*nk), u32l(*nv));
+    let layer_toks = layers.iter().map(|(_, ks, vs)| {
+        let (ks, vs) = (u32l(*ks), u32l(*vs));
         quote! {
             ::scratchy_target_spyre::wiring::LayerWiring {
-                prefix_k: #ks, prefix_v: #vs, new_k: #nk, new_v: #nv,
-                kv_width: #kvw,
+                prefix_k: #ks, prefix_v: #vs,
             }
         }
     });
@@ -9695,6 +9681,23 @@ fn emit_superdsc_wiring(
         Some(m) => {
             let m = u32l(m);
             quote! { ::core::option::Option::Some(#m) }
+        }
+        None => quote! { ::core::option::Option::None },
+    };
+    // ⭐ THE PAGED STEP, as the bake derived it (`paged_step_of_ir`) — the worker stages its three
+    // sources every step against this pool.
+    let paged = match gk.paged {
+        Some(p) => {
+            let (m, t, w) = (u32l(p.mask), u32l(p.page_table), u32l(p.write_rows));
+            let (pages, slots) = (u32l(p.pages), u32l(p.page_slots));
+            let (rows, nkvh, gqa, walk) = (u32l(p.rows), u32l(p.nkvh), u32l(p.gqa), u32l(p.walk));
+            quote! {
+                ::core::option::Option::Some(::scratchy_target_spyre::wiring::PagedStep {
+                    mask: #m, page_table: #t, write_rows: #w,
+                    pages: #pages, page_slots: #slots, rows: #rows, nkvh: #nkvh, gqa: #gqa,
+                    walk: #walk,
+                })
+            }
         }
         None => quote! { ::core::option::Option::None },
     };
@@ -9887,6 +9890,7 @@ fn emit_superdsc_wiring(
             result_dtype: #result_dtype,
             num_sources: #num_sources,
             attn_mask: #mask,
+            paged: #paged,
             decode_position: #dp,
             tensor_shapes: &[#(#shapes),*],
             embed_src: #embed_src_lit,
@@ -10977,34 +10981,37 @@ fn dump_wavefront_mega(
     // (which reads this as the prefix CAPACITY and masks past `decode_position`
     // — see `lower_subtile_tape_to_ktir`).
     //
-    // The default is the model's own context length, capped at `PREFIX_CAP_DEFAULT`
-    // so a plain `cargo build -Fspyre` produces a usable chat binary (the cuda/metal
-    // targets need no such knob — their kernels take `decode_position` as a runtime
-    // arg over a host-allocated cache; a KTIR bundle is a static-shape graph, so the
-    // prefix cache is a baked dimension). The cap is deliberately modest: the
-    // ktir-emulator decode is O(capacity) per token — it masks over the WHOLE prefix
-    // cache every step (no paged attention), so a large cap makes the emulator crawl
-    // (4096 ⇒ ~tens of seconds/token). 256 covers a normal short chat while keeping
-    // per-step attention cheap. `KTIR_PREFIX_LEN` overrides up (longer contexts, real
-    // silicon) or down (e.g. the m=1 self-check gate sets `KTIR_PREFIX_LEN=2`).
+    // ⭐ THE KV POOL IS THE MODEL'S OWN CONTEXT. A KTIR bundle is a static-shape graph, so the
+    // resident cache is a baked dimension (the cuda/metal targets take `decode_position` as a
+    // runtime arg over a host-allocated cache instead): every layer's K and V pools hold the
+    // model's `max_position_embeddings` token slots — vLLM's own default `max_model_len` — in whole
+    // scheduler pages. Nothing caps it and nothing in the environment moves it: the page walk reads
+    // only the pages a step's context reaches (its walk rungs, spyre-inference's `num_blocks`
+    // buckets), so the pool's size is memory the steps touch, never time.
     // Resident prefix-cache capacity as `NonZeroU32` end-to-end: the 0-row case
     // (an invalid SubtileIR prefix `Source`) is excluded by the TYPE, not a
     // runtime `.filter`, and the value is wrapped in `to_wavefront::PrefixCapacity`
     // before every `lower_decode_to_wavefront` call so decode + prefill can never
     // be baked at diverging capacities.
-    let prefix_cap_default: std::num::NonZeroU32 =
-        std::num::NonZeroU32::new(256).expect("256 != 0");
-    let model_ctx: std::num::NonZeroU32 = model
+    //
+    // The page is the Spyre pool's (`sdsc_abstract`, compiled only under `spyre`); a build without
+    // that target has no pool to round to, and never calls this function (its one call is gated on
+    // `cfg!(feature = "spyre")`).
+    #[cfg(feature = "spyre")]
+    let page_slots = scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
+    #[cfg(not(feature = "spyre"))]
+    let page_slots = 1u32;
+    let prefix_len: std::num::NonZeroU32 = model
         .bounds
         .get("max_position_embeddings")
-        .map(|&v| v.min(u32::MAX as u64) as u32)
+        .map(|&v| (v.min(u32::MAX as u64) as u32).next_multiple_of(page_slots))
         .and_then(std::num::NonZeroU32::new)
-        .unwrap_or(prefix_cap_default);
-    let prefix_len: std::num::NonZeroU32 = std::env::var("KTIR_PREFIX_LEN")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .and_then(std::num::NonZeroU32::new)
-        .unwrap_or_else(|| model_ctx.min(prefix_cap_default));
+        .unwrap_or_else(|| {
+            panic!(
+                "[spyre] {stem}: the config states no max_position_embeddings — the KV pool is \
+                 the model's own context, and nothing else may size it"
+            )
+        });
     // Primary bundle row count: 1 = decode (default), >1 = the mq golden-gate
     // knob. The worker's batched-prefill bundle is emitted separately below
     // (default m = prefix_len; `KTIR_PREFILL_LEN` overrides).
@@ -11522,6 +11529,7 @@ fn dump_wavefront_mega(
                 let gk = match scratchy_target_spyre::lower_subtile_tape_to_superdsc::graph_wiring(
                     &krg,
                     &weight_ids,
+                    active_cap,
                 ) {
                     Ok(w) => w,
                     Err(e) => panic!("[spyre] {base}: wiring not lowerable — {}", e.0),
@@ -11906,14 +11914,34 @@ fn dump_wavefront_mega(
                                                         .collect::<Vec<_>>(),
                                                 )
                                             };
+                                            // ⭐ THE PAGE WALK'S RUNGS — spyre-inference's
+                                            // `num_blocks` buckets over this bundle's pool
+                                            // (`scratchy_target_spyre::paged_step::walk_buckets`). The body just
+                                            // baked walks `ceiling_walk` pages — the whole pool for a
+                                            // decode bake, the chunk's own pages for a prompt chunk
+                                            // baked with no resident prefix — and every other bucket
+                                            // is a rung, so each step walks the fewest pages that
+                                            // reach its context.
+                                            let pool_pages =
+                                                cap / scratchy_target_spyre::paged_step::PAGE_SLOTS;
+                                            let ceiling_walk =
+                                                scratchy_target_spyre::paged_step::walk_pages(
+                                                    pool_pages,
+                                                    prefill_mq.unwrap_or(decode_rows),
+                                                    active_cap,
+                                                );
                                             let mut decode_rungs: Vec<
                                                 superdsc::bundle::LadderRung<'static>,
                                             > = vec![superdsc::bundle::LadderRung {
                                                 // A chunk body sweeps its whole chunk, so its rung
                                                 // is the chunk's slots PER REQUEST — what
                                                 // `select_body` compares the live context against.
+                                                // A page walk's rung is the slots its walk reaches.
                                                 active_cap: superdsc::bundle::SweptCols::new(
-                                                    chunk_ceiling.map_or(cap, chunk_swept),
+                                                    chunk_ceiling.map_or(
+                                                        ceiling_walk * scratchy_target_spyre::paged_step::PAGE_SLOTS,
+                                                        chunk_swept,
+                                                    ),
                                                 ),
                                                 bodies: rung_fps(&body_fps),
                                                 bodies_fused: std::borrow::Cow::Owned(
@@ -11949,16 +11977,28 @@ fn dump_wavefront_mega(
                                                         .any(|f| !f.is_none()),
                                                 },
                                             )];
-                                            // The per-page sweep rungs below one page — every decode
-                                            // bake's ladder. A prompt chunk never had them (its
-                                            // prefix bundle sweeps whole pages), so it keeps none.
-                                            let sweep = if is_prefill {
-                                                Vec::new()
-                                            } else {
-                                                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::decode_ladder(cap)
-                                            }
-                                            .into_iter()
-                                            .map(|r| (r, None, r.get()));
+                                            // The walk rungs: every bucket below a decode body's
+                                            // whole-pool walk, and — off the card, where a prompt chunk
+                                            // past its first page runs on the prefill ladder rather
+                                            // than the card's prefix-capable chunks — every bucket
+                                            // above a prompt chunk's own pages.
+                                            let sweep = scratchy_target_spyre::paged_step::walk_buckets(pool_pages)
+                                                .into_iter()
+                                                .filter(|&b| {
+                                                    if is_prefill {
+                                                        !card && b > ceiling_walk
+                                                    } else {
+                                                        b < ceiling_walk
+                                                    }
+                                                })
+                                                .map(|b| {
+                                                    let slots = b * scratchy_target_spyre::paged_step::PAGE_SLOTS;
+                                                    (
+                                                        scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::new(slots),
+                                                        None,
+                                                        slots,
+                                                    )
+                                                });
                                             // ⭐ PAST ONE PAGE, THE LADDER IS CHUNK WIDTHS: every chunk
                                             // rung lowers the program at its one-page sweep (`FULL`) and
                                             // differs only in the chunk it attends, so its swept extent
@@ -11998,9 +12038,9 @@ fn dump_wavefront_mega(
                                                 sweep.collect()
                                             };
                                             // A prompt chunk's ladder is its chunk rungs (and the
-                                            // per-page body under them); every other prefill bake
-                                            // keeps its single body.
-                                            if !is_prefill || chunk_ceiling.is_some() {
+                                            // per-page body under them) on the card, and its walk
+                                            // rungs off it.
+                                            if !is_prefill || chunk_ceiling.is_some() || !card {
                                                 // ⭐ EVERY RUNG IS ITS OWN LOWERING of the same tape at
                                                 // its own sweep/chunk, reading nothing another rung
                                                 // writes — so they lower in parallel and are recorded in
@@ -12509,8 +12549,11 @@ fn dump_wavefront_mega(
                                                 );
                                                 // The rung under test, one fact — see
                                                 // `superdsc::GateRung`.
-                                                let gate_rung =
-                                                    superdsc::GateRung { fp: &bfp, cap };
+                                                let gate_rung = superdsc::GateRung {
+                                                    fp: &bfp,
+                                                    cap,
+                                                    active_cap,
+                                                };
                                                 // ⭐ THE SHIPPED BUNDLE'S OWN PIN WINDOW — read
                                                 // from its emitted layout, so the twin's minted
                                                 // programs carry the SAME `lx_window_fits` budget
@@ -13650,19 +13693,17 @@ fn dump_wavefront_mega(
         // ⛔ BUILD GUARD (guard-every-crash, option (b) resident KV): the paged path
         // serves LONGER CONTEXT only if the resident cache (cap = prefix_len, in
         // 64-token pages) holds strictly MORE than one forward's worth of tokens
-        // (`mq`). If the configured KTIR_PREFIX_LEN were <= CB_BATCH_TEMPLATE the
-        // INCREMENTAL forward would overflow the cache after the first chunk (the
-        // shim's slot-bound guard would reject step 2 at RUNTIME) — turn that into a
-        // `cargo build` failure here (this proc-macro body runs at build time). Only
-        // gated to the paged mode (the KTIR/default emulator cap is deliberately tiny).
+        // (`mq`). A model whose context were <= CB_BATCH_TEMPLATE would overflow the
+        // cache after the first chunk (the shim's slot-bound guard would reject step 2
+        // at RUNTIME) — turn that into a `cargo build` failure here (this proc-macro
+        // body runs at build time). Only gated to the paged mode.
         if std::env::var("SCRATCHY_SENDNN_MODE").as_deref() == Ok("paged")
             && prefix_len.get() <= CB_BATCH_TEMPLATE
         {
             panic!(
-                "[spyre-sendnn] paged mode: KTIR_PREFIX_LEN={prefix_len} <= mq \
+                "[spyre-sendnn] paged mode: the model's context {prefix_len} <= mq \
                  (CB_BATCH_TEMPLATE={CB_BATCH_TEMPLATE}). The resident cache must hold MORE than one \
-                 incremental forward's worth of tokens to serve longer context — set KTIR_PREFIX_LEN \
-                 to a multiple of 64 well above {CB_BATCH_TEMPLATE} (e.g. 2048)."
+                 incremental forward's worth of tokens to serve longer context."
             );
         }
         // `_cb_decode_graph` = the whole-graph decode lowering (stays empty under

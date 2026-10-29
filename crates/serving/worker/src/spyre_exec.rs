@@ -453,8 +453,15 @@ impl Worker for SpyreWorker {
                 _ => None,
             })
         }
+        // ⭐ THE EMULATOR's POOL IS ITS BUNDLE's KV CACHE — `pages` of the scheduler's block — and
+        // every block id the scheduler hands out is a page of it, so the allocator holds exactly
+        // that many.
         #[cfg(not(feature = "spyre-hw"))]
-        None
+        self.model
+            .as_ref()
+            .and_then(|m| m.decode.first())
+            .and_then(|b| b.paged)
+            .map(|p| p.pages as usize)
     }
 
     /// THE WIDEST CONCURRENCY ONE BATCHED DECODE CAN EXPRESS — the pool's row count, which is a rung of the
@@ -557,7 +564,6 @@ impl Worker for SpyreWorker {
             // to free — it refcounts them, which is what keeps a cached prefix alive after the request
             // that wrote it is gone.
             requests.remove(fid);
-            #[cfg(feature = "spyre-hw")]
             input_batch.remove_request(fid);
         }
 
@@ -573,8 +579,6 @@ impl Worker for SpyreWorker {
                 .unwrap_or(0);
             let start = nr.num_computed_tokens as usize;
             let prompt = nr.prompt_token_ids.clone().unwrap_or_default();
-            #[cfg(not(feature = "spyre-hw"))]
-            let nlayers = model.decode[0].layers.len();
             requests.insert(
                 nr.req_id.clone(),
                 ReqState {
@@ -588,10 +592,6 @@ impl Worker for SpyreWorker {
                     // door. A request this path cannot serve honestly (a knob with no card leg) is
                     // refused here, naming the knob — on both tiers, which mint the same draw.
                     draw: SampledDraw::of(&nr.req_id, nr.sampling_params.as_ref()).map_err(werr)?,
-                    #[cfg(not(feature = "spyre-hw"))]
-                    kv_k: vec![Vec::new(); nlayers],
-                    #[cfg(not(feature = "spyre-hw"))]
-                    kv_v: vec![Vec::new(); nlayers],
                 },
             );
             // ⭐ THE HOST'S TABLE GOES INTO `InputBatch`, the engine's own per-request store — including,
@@ -659,7 +659,6 @@ impl Worker for SpyreWorker {
         // has to check that the grant reaches the shared write slot — it can no longer draw a page to
         // make that true, which is what let the worker's idea of a request's pages diverge from the
         // scheduler's.
-        #[cfg(feature = "spyre-hw")]
         for (i, id) in cr.req_ids.iter().enumerate() {
             let ids: &[usize] = cr
                 .new_block_ids
@@ -678,6 +677,7 @@ impl Worker for SpyreWorker {
             // This request's table, read back RIGHT AFTER its own update — the fresh value, not a
             // snapshot taken before the loop (which is what made the worker refuse a page the scheduler
             // had already granted).
+            #[cfg(feature = "spyre-hw")]
             let host_now: Vec<usize> = input_batch
                 .block_table(id)
                 .map(|t| t.to_vec())
@@ -695,16 +695,21 @@ impl Worker for SpyreWorker {
                 req.reset_for_resume(computed);
                 input_batch.set_tokens_in_pool(id, computed);
             }
-            let span = req.kv_span_slots(0);
-            install_host_blocks(
-                &mut model.session,
-                req,
-                span,
-                PageMapCtx {
-                    host: host_now.as_slice(),
-                    part,
-                },
-            )?;
+            // The card maps the grant onto its pool here; the emulator's paged step reads the same
+            // table out of `InputBatch` at its forward.
+            #[cfg(feature = "spyre-hw")]
+            {
+                let span = req.kv_span_slots(0);
+                install_host_blocks(
+                    &mut model.session,
+                    req,
+                    span,
+                    PageMapCtx {
+                        host: host_now.as_slice(),
+                        part,
+                    },
+                )?;
+            }
         }
         // ⭐ THE HOST'S TABLES FOR THIS STEP, READ OUT OF `InputBatch` ONCE — **AFTER** THE LOOP ABOVE HAS
         // WRITTEN THIS STEP'S GRANT INTO IT.

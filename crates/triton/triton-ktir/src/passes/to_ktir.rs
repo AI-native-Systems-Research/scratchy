@@ -1520,6 +1520,19 @@ fn fold_grid_work_loop(module: &mut Module) -> Result<()> {
 /// configuration -- would turn any future loop-carrying program into a refusal at a stage that has
 /// nothing to say about it.
 ///
+/// # A LOOP THAT READS MEMORY THROUGH ITS OWN TRIP STAYS A LOOP
+///
+/// A body whose INDIRECT access tile depends on the induction variable -- a page walk reading its
+/// page table at `i · 32` and gathering the page that row names -- is the device's own loop over
+/// tiles (torch-spyre's `for_each_tile`, which holds ONE block body however many blocks it walks),
+/// and its trip count is a length, not a tile count: a walk over a long context is hundreds of
+/// trips, each one gather, and unrolled it is hundreds of copies of the body. The window guard
+/// above has nothing to hoist there either -- the gather's address IS the trip's table row -- so
+/// such a loop is LEFT STANDING with its trip count stated by its constant bounds
+/// ([`loop_reads_through_its_trip`]). Its loop-invariant buffer views are stated once, above it
+/// ([`hoist_invariant_views`]) -- the same one-declaration-per-parameter rule the unrolled copies
+/// keep below.
+///
 /// # THE SUBSTITUTION IS THE WHOLE OF IT
 ///
 /// Copy `t` is the body with three sets of names rewritten: the induction variable becomes the
@@ -1546,6 +1559,10 @@ fn unroll_constant_trip_loops(module: &mut Module) -> Result<()> {
     let index = module.def_index();
     for path in paths.into_iter().rev() {
         let loopp = walk::at(module, &path).expect("path").clone();
+        if loop_reads_through_its_trip(&loopp) {
+            hoist_invariant_views(module, &path);
+            continue;
+        }
         let lb = crate::passes::dot_to_linalg::const_int_index(&index, loopp.operands[0]);
         let ub = crate::passes::dot_to_linalg::const_int_index(&index, loopp.operands[1]);
         let step = crate::passes::dot_to_linalg::const_int_index(&index, loopp.operands[2]);
@@ -2974,6 +2991,81 @@ fn sub_feeds_only_exp2(module: &Module, index: &DefIndex, sub: Ssa) -> bool {
 /// `Op::results` is a LIST (see `ir::Op`'s note), so a five-result `scf.for` contributes all
 /// five; and a region's block arguments are definitions too, which is why they are collected
 /// here rather than only at the top level.
+/// Does this `scf.for`'s body read or write memory through an INDIRECT access tile whose operands
+/// depend on the loop's induction variable -- an address taken from memory at a row the trip
+/// chooses? See [`unroll_constant_trip_loops`]'s last section for why such a loop stays a loop.
+fn loop_reads_through_its_trip(loopp: &Op) -> bool {
+    let Some(body) = loopp.regions.first() else {
+        return false;
+    };
+    let Some(&(iv, _)) = body.args.first() else {
+        return false;
+    };
+    // The values the trip reaches: the induction variable, then every result of a body op that
+    // reads one of them (the body is in program order, so one pass closes the set).
+    let mut tripped: HashSet<Ssa> = HashSet::from([iv]);
+    fn reaches(ops: &[Op], tripped: &mut HashSet<Ssa>) -> bool {
+        for o in ops {
+            let reads = o.operands.iter().any(|v| tripped.contains(v));
+            if reads {
+                if o.kind == OpKind::KtdpConstructIndirectAccessTile {
+                    return true;
+                }
+                tripped.extend(o.results.iter().copied());
+            }
+            for r in &o.regions {
+                if reaches(&r.ops, tripped) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    reaches(&body.ops, &mut tripped)
+}
+
+/// Move the buffer views a standing loop's body declares from loop-invariant operands -- a
+/// `ktdp.construct_memory_view` over a kernel pointer, and the cast that turned the pointer into its
+/// base -- to just above the loop. A view declares a buffer's width, and the handoff pairs each
+/// parameter with ONE declaration among the function's top-level ops, so a view left in the body is a
+/// buffer nothing outside it can size. Both ops are pure, so hoisting them moves no effect.
+fn hoist_invariant_views(module: &mut Module, path: &OpPath) {
+    let Some(loopp) = walk::at(module, path).cloned() else {
+        return;
+    };
+    let Some(body) = loopp.regions.first() else {
+        return;
+    };
+    let mut inside: Vec<Ssa> = body.args.iter().map(|(v, _)| *v).collect();
+    defined_values(&body.ops, &mut inside);
+    let mut inside: HashSet<Ssa> = inside.into_iter().collect();
+    let mut hoisted: Vec<Op> = Vec::new();
+    let mut kept: Vec<Op> = Vec::with_capacity(body.ops.len());
+    for o in body.ops.iter() {
+        let pure_view = matches!(
+            o.kind,
+            OpKind::KtdpConstructMemoryView | OpKind::UnrealizedConversionCast
+        );
+        if pure_view && o.regions.is_empty() && o.operands.iter().all(|v| !inside.contains(v)) {
+            for r in &o.results {
+                inside.remove(r);
+            }
+            hoisted.push(o.clone());
+        } else {
+            kept.push(o.clone());
+        }
+    }
+    if hoisted.is_empty() {
+        return;
+    }
+    walk::at_mut(module, path).expect("path").regions[0].ops = kept;
+    let idx = path.index();
+    let block = walk::block_mut(module, path).expect("path");
+    for (k, o) in hoisted.into_iter().enumerate() {
+        block.insert(idx + k, o);
+    }
+}
+
 fn defined_values(ops: &[Op], out: &mut Vec<Ssa>) {
     for o in ops {
         out.extend(o.results.iter().copied());

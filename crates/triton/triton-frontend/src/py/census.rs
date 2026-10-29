@@ -108,9 +108,10 @@ pub const TL_FUNCTIONS: &[&str] = &[
 
 /// Methods called on a value rather than on a module.
 ///
-/// `gather` is the one entry NOT in the original five-fixture census: it is
-/// `embedding.py`'s indirect read (`tt.descriptor_gather`), added with that fixture.
-pub const VALUE_METHODS: &[&str] = &["load", "store", "to", "gather"];
+/// `gather` and `scatter` are NOT in the original five-fixture census: they are the indirect
+/// read (`tt.descriptor_gather`, added with `embedding.py`) and the indirect write
+/// (`tt.descriptor_scatter`, added with `paged_kv_write.py`, the paged KV cache's store).
+pub const VALUE_METHODS: &[&str] = &["load", "store", "to", "gather", "scatter"];
 
 /// Python builtins the kernels call. `float(x)` is a constexpr cast in
 /// `attention_flash.py`'s `sm_scale` handling.

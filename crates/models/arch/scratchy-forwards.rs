@@ -320,11 +320,9 @@ fn main() {
     for name in [
         "SCRATCHY_GPU",
         // Spyre/KTIR bundle knobs read at emit time by `dump_wavefront_mega`:
-        // they bake the prefix cap, decode row count, and prefill width into the
-        // embedded KTIR bundle, so a change must re-run this build script (which
-        // regenerates the bundle). Without this, cargo keeps the stale OUT_DIR
-        // codegen and e.g. `KTIR_PREFIX_LEN=4096` silently reuses the old cap.
-        "KTIR_PREFIX_LEN",
+        // they bake the decode row count and prefill width into the embedded KTIR
+        // bundle, so a change must re-run this build script (which regenerates the
+        // bundle). Without this, cargo keeps the stale OUT_DIR codegen.
         "KTIR_M",
         "KTIR_PREFILL_LEN",
         // Version + base/instruct precision filter (see config.rs) — a

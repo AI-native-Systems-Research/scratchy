@@ -660,26 +660,16 @@ impl RowCapacity {
     }
 }
 
-/// One layer's AttnDecode wiring.
+/// One layer's KV pools — the K and V cache tensors its paged attention gathers from and its KV
+/// write scatters into (see [`PagedStep`]).
 ///
-/// ⛔ THE WORKER USED TO REDISCOVER THIS BY SEARCHING. It walked every manifest
-/// node for one whose args mentioned the mask tensor, then inferred `new_k` /
-/// `new_v` as *the argument positionally after* the prefix-K / prefix-V args.
-/// Positional inference over a parsed node list, to recover a fact the emitter
-/// knew exactly. Emitted directly, it is four integers.
+/// ⛔ THE WORKER USED TO REDISCOVER THIS BY SEARCHING. It walked every manifest node for one whose
+/// args mentioned the mask tensor and inferred the rest positionally. Emitted directly, it is two
+/// integers.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LayerWiring {
     pub prefix_k: u32,
     pub prefix_v: u32,
-    pub new_k: u32,
-    pub new_v: u32,
-    /// THIS layer's per-token KV width (`kv_heads * head_dim`), off the prefix-K
-    /// source's own baked shape. Hybrid-attention arches (gemma-4: sliding
-    /// 8×256 vs global 1×512) give different layers different widths, so a
-    /// single `Geometry::kv_dim` cannot size a per-layer buffer or readback —
-    /// this is the per-layer answer, from the same `tensor_shapes` the tape
-    /// was lowered at.
-    pub kv_width: u32,
 }
 
 /// Model geometry, baked.
@@ -783,6 +773,51 @@ impl RotaryKind {
     }
 }
 
+/// ⭐ THE PAGED STEP — what a paged forward's host fills each step, and the pool it fills it against.
+///
+/// The attention reads its keys and values out of each layer's K and V POOLS (the cache tensors,
+/// head-major `[pages, nkvh, page_slots, hd]`), gathering the pages a request's block table names;
+/// the KV writers scatter the step's rows into them first. Three sources carry the step: the PAGE
+/// TABLE (`[walk, 32]` int32, block `i`'s page at column 0), the MASK STACK (`[walk · rows · gqa,
+/// page_slots]` additive, one tile per walked block at the score tile's own rows) and the WRITE ROWS (`[1, rows · nkvh]` int32, the
+/// pool row of each (token, kv head)). The pools themselves are never re-staged: the device writes
+/// them and they persist across steps.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PagedStep {
+    pub mask: u32,
+    pub page_table: u32,
+    pub write_rows: u32,
+    /// Pages in each layer's pools — the scheduler's block count.
+    pub pages: u32,
+    /// Token slots per page — the scheduler's block size.
+    pub page_slots: u32,
+    /// Query rows one forward of this bundle carries.
+    pub rows: u32,
+    /// KV heads per layer.
+    pub nkvh: u32,
+    /// Query heads per KV head — the score rows one query row spans: a KV head's group rides its
+    /// walk as `rows · gqa` score rows, row `m · gqa + g` being query row `m` of head `g`.
+    pub gqa: u32,
+    /// Blocks of the page table this bundle's attention walks — the bake's
+    /// `scratchy_triton_splice::walk_pages` for the rung, so at most [`Self::pages`].
+    pub walk: u32,
+}
+
+impl PagedStep {
+    /// The pool's token capacity: every page's slots.
+    pub const fn capacity(self) -> usize {
+        self.pages as usize * self.page_slots as usize
+    }
+
+    /// ⭐ THE BUNDLE'S REACH — the positions its attention's walk covers. A step whose positions end at
+    /// or below this can run on the bundle from ANY start: the mask stack decides which walked keys each
+    /// row attends, so a prompt chunk over a cached prefix is this bundle's to run whenever the prefix
+    /// and the chunk both sit inside the walk. A step that ends past it would lose keys.
+    pub const fn reach(self) -> usize {
+        self.walk as usize * self.page_slots as usize
+    }
+}
+
 /// Everything the worker needs to launch one baked bundle, emitted whole.
 pub struct Wiring {
     /// Tensor id of the logits.
@@ -804,6 +839,8 @@ pub struct Wiring {
     pub num_sources: u32,
     /// The AttnDecode runtime length mask, if the model has a maskable decode.
     pub attn_mask: Option<u32>,
+    /// The paged step's sources and pool — see [`PagedStep`]. `None` for a graph with no attention.
+    pub paged: Option<PagedStep>,
     /// Baked `valid_len - 1`; a worker overrides per generated token.
     pub decode_position: u32,
     /// `[rows, cols]` per tensor id.
@@ -1780,11 +1817,10 @@ impl Wiring {
         r as usize * c as usize
     }
 
-    /// The prefix-capacity the bundle was baked at (the mask's column count).
+    /// The KV capacity the bundle was baked at — its pools' token slots.
     #[inline]
     pub fn capacity(&self) -> Option<usize> {
-        self.attn_mask
-            .map(|m| self.tensor_shapes[m as usize].1 as usize)
+        self.paged.map(PagedStep::capacity)
     }
 }
 
@@ -2654,6 +2690,7 @@ mod constant_tape_tests {
             result_dtype: scratchy_tensors::DType::F16,
             num_sources: 0,
             attn_mask: None,
+            paged: None,
             decode_position: 0,
             tensor_shapes: &[],
             embed_src: 0,

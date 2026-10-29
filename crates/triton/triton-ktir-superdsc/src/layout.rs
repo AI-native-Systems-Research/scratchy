@@ -785,7 +785,13 @@ fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
         // The sampler's tables (and its per-row noise and temperature operands) ride as
         // ORDINARY tensor operands (the node's own inputs, placed like every staged
         // buffer) — no reserved tid names one.
-        | Program::Sample => None,
+        | Program::Sample
+        // The paged attention's pools, page table and mask stack, and the paged write's rows, are
+        // all tensor PARAMETERS the host binds, each at the extent its own view states. Three of them
+        // are bound at the paged step's reserved tids (`PAGED_STEP_BASE`), but as parameters: no
+        // body names one.
+        | Program::PagedAttn
+        | Program::PagedKvWrite => None,
         // ⭐ NO ENTRY POINT ON THIS LADDER, SO NO CONSTANTS TO NAME. None of these programs has a
         // body this crate's door can reach — the splice's registry produces none of them (its
         // by-name refusals stop their SubOps at the producer), and the door itself refuses them by
@@ -1070,6 +1076,10 @@ fn scales_for(
         // The sampler's tables are tensor operands, never `scalarmul_scales` lookups —
         // a value registered for it would occupy a slot nothing asks for.
         | Program::Sample
+        // The paged attention states its score scale as an immediate multiply and the paged
+        // write is a pure scatter; neither reads the registry.
+        | Program::PagedAttn
+        | Program::PagedKvWrite
         // `EmbedRowGather` and `ChainStage` are the spyre door's `#603` bodies (see the
         // same note at `reserved_consts_for`); on THIS ladder they are refused at both
         // the splice and the door, so there is no body to ask.

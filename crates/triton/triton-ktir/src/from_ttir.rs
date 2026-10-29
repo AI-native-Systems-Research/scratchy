@@ -149,6 +149,9 @@ pub const OP_SET: &[&str] = &[
     "tt.descriptor_load",
     "tt.descriptor_store",
     "tt.descriptor_gather",
+    // The gather's write twin -- `paged_kv_write.py`'s KV cache store. `convert_ttir_to_ktdp`
+    // lowers it to the gather's own indirect access tile plus a `ktdp.store`.
+    "tt.descriptor_scatter",
     // The routed expert id of `expert_slab.ttir.mlir`: one SCALAR read through a pointer,
     // `tt.addptr %ids, %p : !tt.ptr<i32>, i32` then `tt.load %ptr : !tt.ptr<i32>` -- no
     // mask, no other, no attributes (the default `isVolatile` prints as nothing). Both
