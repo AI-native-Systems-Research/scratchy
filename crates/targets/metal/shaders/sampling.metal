@@ -693,6 +693,9 @@ kernel void sample_finalize(
     // in closed form, take_s = min(tied_s, avail - min(tied before s, avail)).
     // One lane a slice (the host cuts a row into at most WARP_SIZE slices).
     threadgroup uint s_quota[WARP_SIZE];
+    // The tokens the threshold and the quotas keep, and the ties among them.
+    threadgroup uint s_survivors;
+    threadgroup uint s_ties;
     if (tid < WARP_SIZE) {
         uint strict = tid < nslices ? c[tid * 4 + 0] : 0u;
         uint tied = tid < nslices ? c[tid * 4 + 1] : 0u;
@@ -701,6 +704,10 @@ kernel void sample_finalize(
         uint avail = min(simd_sum(tied), cap - strict_kept);
         uint before = simd_prefix_exclusive_sum(tied);
         s_quota[tid] = min(tied, avail - min(before, avail));
+        if (tid == 0) {
+            s_survivors = strict_kept + avail;
+            s_ties = avail;
+        }
     }
 
     // Gather the slices' runs in order.
@@ -776,15 +783,41 @@ kernel void sample_finalize(
         }
     }
 
+    // ===== The mass the cuts keep =====
+    // The nucleus is measured against the mass the min-p and top-k cuts keep, as vLLM measures it
+    // (min-p first, then a softmax over the top-k survivors in `apply_top_k_top_p`) and as Splash's
+    // sampling.metal `distribution_end` does (`nucleus = top_p * top.mass`). The candidates hold
+    // that mass when a top-k cut keeps no more tokens than they hold. A cut that keeps more — a
+    // top-k past MAX_CANDIDATES, or min-p alone, which the candidates' own MAX_CANDIDATES-token
+    // threshold may cut short — is measured over the row: its tokens above the threshold, and a
+    // top-k's kept ties at it. With no cut the mass is the whole row's, 1.
+    const uint top_k = state[3];
+    const float min_p = as_type<float>(state[5]);
+    const bool top_k_cut = top_k > 0u && top_k < vocab;
+    const bool wide = top_p < 1.0f && (top_k_cut ? s_survivors > MAX_CANDIDATES : min_p > 0.0f);
+    threadgroup float s_mass_warps[NUM_WARPS];
+    float cut_mass = 1.0f;
+    if (wide) {
+        const float cut = top_k_cut ? as_type<float>(state[7])
+                                    : min_p * (1.0f / as_type<float>(state[2]));
+        device const uint* rowp = prob_bits + (size_t)row * vocab;
+        float above = 0.0f;
+        for (uint i = tid; i < vocab; i += SAMPLING_BLOCK_SIZE) {
+            const float p = as_type<float>(rowp[i]);
+            above += (top_k_cut ? p > cut : p >= cut) ? p : 0.0f;
+        }
+        above = block_reduce_sum(above, s_mass_warps, tid);
+        cut_mass = top_k_cut ? above + float(s_ties) * cut : above;
+    }
+
     // ===== Top-p cutoff + renormalize + sample (thread 0) =====
-    // The nucleus is measured against the mass the top-k and min-p cuts keep, as vLLM's
-    // `apply_top_k_top_p` (softmax over the top-k survivors) and Splash's sampling.metal
-    // `distribution_end` (`nucleus = top_p * top.mass`) measure it — not against the whole
-    // vocabulary's, which keeps every candidate whenever they weigh less than top_p together.
     if (tid == 0) {
-        float kept = 0.0f;
-        for (int i = 0; i < num_candidates; i++) {
-            kept += s_probs[i];
+        float kept = cut_mass;
+        if (top_p < 1.0f && top_k_cut && !wide) {
+            kept = 0.0f;
+            for (int i = 0; i < num_candidates; i++) {
+                kept += s_probs[i];
+            }
         }
         const float nucleus = top_p * kept;
         float cumsum = 0.0f;
