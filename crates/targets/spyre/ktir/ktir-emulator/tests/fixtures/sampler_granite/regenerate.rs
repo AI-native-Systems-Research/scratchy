@@ -45,6 +45,13 @@ fn git(args: &[&str]) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// 64-bit FNV-1a: the fixture's pin on each table's bytes (the test computes the same).
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 /// Which of a function's arguments it WRITES: a `ktdp.store`'s tile names a
 /// `construct_access_tile`, whose view names a `construct_memory_view`, whose first operand is
 /// the argument (the rule `scratchy_target_spyre::runner` builds its session spec by).
@@ -305,14 +312,22 @@ fn regenerate_sampler_fixture() {
         .iter()
         .map(|&(tid, kind)| {
             let LoadConst::SampleTable {
+                vocab,
+                rows,
                 operand,
                 arrangement,
-                ..
             } = kind
             else {
                 panic!("the sampler binds only its own tables, got {kind:?}");
             };
             let (_, dt, shape) = kind.build();
+            // The production staging's bytes for this operand in LOGICAL order (before any
+            // stagger), pinned by hash: the test's own table must hash to exactly this.
+            let (logical, _, _) = scratchy_target_spyre::wiring::sample_staged_tables(vocab, rows)
+                .into_iter()
+                .nth((operand - 1) as usize)
+                .expect("the mint emits operand 1..=20");
+            let hash = fnv1a64(&logical);
             let dt = match dt {
                 scratchy_tensors::DType::F32 => ktir_core::dtypes::DType::F32,
                 scratchy_tensors::DType::I32 => ktir_core::dtypes::DType::I32,
@@ -321,7 +336,8 @@ fn regenerate_sampler_fixture() {
             };
             let stag = arrangement == ElementArrangement::Dl16ToFp32;
             format!(
-                "    ({tid}, {operand}, {}, {shape:?}, {stag}),\n",
+                "    Table {{ tid: {tid}, operand: {operand}, dtype: {}, shape: {shape:?}, \
+                 staggered: {stag}, fnv1a: {hash:#018x} }},\n",
                 r.dtype(dt)
             )
         })
@@ -405,9 +421,23 @@ fn regenerate_sampler_fixture() {
          /// (argument, the tensor it is bound to, whether the program writes it)\n\
          pub const BINDINGS: &[(Ssa, u64, bool)] = &[\n{bindings}];\n\
          \n\
-         /// The load-time tables: (tensor, the sampler's operand table number, dtype, [rows, cols],\n\
-         /// staged in the `Dl16ToFp32` arrangement). Their bytes are built by the test.\n\
-         pub const TABLES: &[(u64, u8, DType, [usize; 2], bool)] = &[\n{tables}];\n\
+         /// One load-time table the program binds. Its bytes are built by the test, which checks\n\
+         /// them against `fnv1a`.\n\
+         pub struct Table {{\n\
+         \x20   /// The tensor it is bound to.\n\
+         \x20   pub tid: u64,\n\
+         \x20   /// Which of the sampler's twenty operand tables it is.\n\
+         \x20   pub operand: u8,\n\
+         \x20   pub dtype: DType,\n\
+         \x20   /// `[rows, cols]`.\n\
+         \x20   pub shape: [usize; 2],\n\
+         \x20   /// Staged in the `Dl16ToFp32` arrangement (the bake's propagation says so).\n\
+         \x20   pub staggered: bool,\n\
+         \x20   /// 64-bit FNV-1a of the bytes the production staging builds, in logical order.\n\
+         \x20   pub fnv1a: u64,\n\
+         }}\n\
+         \n\
+         pub const TABLES: &[Table] = &[\n{tables}];\n\
          \n\
          /// What the node computes, as the mint states it.\n\
          pub const PROGRAM: Program = Program::{program:?};\n\

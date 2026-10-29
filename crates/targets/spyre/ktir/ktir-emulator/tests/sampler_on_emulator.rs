@@ -77,14 +77,36 @@ fn logical_table(operand: u8) -> Vec<u8> {
     }
 }
 
+/// 64-bit FNV-1a, the hash the fixture pins each table's bytes by.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 /// A table's bytes as the bundle stages them: the logical words, permuted into the
 /// `Dl16ToFp32` arrangement by ktir-superdsc's own staging when the bake marked it so.
-fn staged_table(operand: u8, dtype: DType, shape: [usize; 2], staggered: bool) -> Vec<u8> {
+///
+/// ⭐ The logical words must hash to `hash`, the fixture's pin on the bytes the production
+/// staging builds for the same operand. A changed value, or an operand renumbered under it,
+/// fails here rather than running the draw on tables production never stages.
+fn staged_table(
+    operand: u8,
+    dtype: DType,
+    shape: [usize; 2],
+    staggered: bool,
+    hash: u64,
+) -> Vec<u8> {
     let bytes = logical_table(operand);
     assert_eq!(
         bytes.len(),
         shape[0] * shape[1] * dtype.bytes_per_elem(),
         "operand {operand}: the table's bytes must fill its [rows, cols] = {shape:?}"
+    );
+    assert_eq!(
+        fnv1a64(&bytes),
+        hash,
+        "operand {operand}: the table differs from the production staging the fixture pins"
     );
     if !staggered {
         return bytes;
@@ -137,9 +159,9 @@ fn session() -> Session {
     };
     let mut weights: Vec<(u64, Arg)> = minted::TABLES
         .iter()
-        .map(|&(tid, operand, dtype, shape, staggered)| {
-            let data = staged_table(operand, dtype, shape, staggered);
-            (tid, tensor(data, shape, dtype))
+        .map(|t| {
+            let data = staged_table(t.operand, t.dtype, t.shape, t.staggered, t.fnv1a);
+            (t.tid, tensor(data, t.shape, t.dtype))
         })
         .collect();
     // The greedy seat: the seed quadruple's words at 0 (the gate word's 0 IS the greedy law),
@@ -205,14 +227,23 @@ fn greedy_draw(argmax: usize) -> u32 {
 #[cfg(metal)]
 const STAGGERED_WINDOWS_PER_DRAW: usize = 2;
 
+/// Whether this machine runs the emulator's Metal offloads: a Metal device that can mint an
+/// MTL4 command queue. The same probe metal.rs's own GPU tests skip by (`no_gpu_here`); CI's
+/// macOS VMs have a device but no MTL4 queue.
+#[cfg(metal)]
+fn metal4_gpu_here() -> bool {
+    use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
+    MTLCreateSystemDefaultDevice().is_some_and(|device| device.newMTL4CommandQueue().is_some())
+}
+
 /// How many fused map windows that read through the stagger table have run on Metal so far,
-/// where the emulator has its Metal backend; `None` elsewhere.
+/// where this machine runs the Metal offloads; `None` elsewhere.
 #[cfg(metal)]
 fn staggered_windows_on_metal() -> Option<usize> {
-    Some(
+    metal4_gpu_here().then(|| {
         ktir_emulator::metal::MAP_REGION_STAGGERED_GPU_COUNT
-            .load(std::sync::atomic::Ordering::Relaxed),
-    )
+            .load(std::sync::atomic::Ordering::Relaxed)
+    })
 }
 
 #[cfg(not(metal))]
@@ -222,6 +253,15 @@ fn staggered_windows_on_metal() -> Option<usize> {
 
 #[test]
 fn a_greedy_draw_answers_the_planted_maximum() {
+    // Built with Metal on a machine with no MTL4 GPU (CI's macOS VMs), a planned fused window
+    // could not dispatch, and the resident has no fallback once it planned one. Keep the windows
+    // on the interpreter there, through the emulator's existing `KTIR_NO_GPU_MAP` switch, so the
+    // exact-draw check still runs; only the Metal-offload check below needs the GPU.
+    #[cfg(metal)]
+    if !metal4_gpu_here() {
+        // SAFETY: the only test in this binary, and no session has read the environment yet.
+        unsafe { std::env::set_var("KTIR_NO_GPU_MAP", "1") };
+    }
     let mut missed = Vec::new();
     let mut on_metal = Vec::new();
     for argmax in [0usize, 7, 8, 9, 15, 16, 39752, 39751, 39744, 49154] {

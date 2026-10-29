@@ -6,7 +6,7 @@
 // over the one-request lm-head `[1, 1] x [1, 49155]`, spliced by `scratchy_triton_splice::lower`
 // from `crates/targets/spyre/kernels/sample_fwd.py`.
 //
-// Dumped at commit 4d32937c83449e8a91464ae79c1dd03ec1617660, where
+// Dumped at commit 1261b4e83c21f38d72a90f4c3168d2b51850cb38, where
 //   crates/targets/spyre/kernels/sample_fwd.py was last changed in 7b202a1711f34e7c69d5fb5acaa3aa3fedb73661, and
 //   crates/triton/splice was last changed in 7b202a1711f34e7c69d5fb5acaa3aa3fedb73661.
 // This fixture pins THAT sampler: a later change to either does not reach the emulator test
@@ -73,29 +73,43 @@ pub const BINDINGS: &[(Ssa, u64, bool)] = &[
     (Ssa(26), 28, true),
 ];
 
-/// The load-time tables: (tensor, the sampler's operand table number, dtype, [rows, cols],
-/// staged in the `Dl16ToFp32` arrangement). Their bytes are built by the test.
-pub const TABLES: &[(u64, u8, DType, [usize; 2], bool)] = &[
-    (7, 1, DType::F32, [1, 65536], true),
-    (8, 2, DType::F32, [1, 65536], true),
-    (9, 3, DType::F32, [1, 65536], true),
-    (10, 4, DType::F32, [1, 65536], true),
-    (11, 5, DType::F32, [1, 64], false),
-    (12, 6, DType::F32, [1, 64], false),
-    (13, 7, DType::F32, [1, 65536], true),
-    (14, 8, DType::F32, [1, 65536], true),
-    (15, 9, DType::F32, [1, 65536], true),
-    (16, 10, DType::I32, [1, 1], false),
-    (17, 11, DType::I32, [1, 1], false),
-    (18, 12, DType::I32, [1, 1], false),
-    (19, 13, DType::I32, [1, 1], false),
-    (20, 14, DType::F32, [1, 65536], false),
-    (21, 15, DType::F32, [1, 1], false),
-    (22, 16, DType::F32, [1, 1], false),
-    (23, 17, DType::F32, [1, 1], false),
-    (24, 18, DType::F32, [1, 1], false),
-    (25, 19, DType::F32, [1, 1], false),
-    (26, 20, DType::F16, [1, 1], false),
+/// One load-time table the program binds. Its bytes are built by the test, which checks
+/// them against `fnv1a`.
+pub struct Table {
+    /// The tensor it is bound to.
+    pub tid: u64,
+    /// Which of the sampler's twenty operand tables it is.
+    pub operand: u8,
+    pub dtype: DType,
+    /// `[rows, cols]`.
+    pub shape: [usize; 2],
+    /// Staged in the `Dl16ToFp32` arrangement (the bake's propagation says so).
+    pub staggered: bool,
+    /// 64-bit FNV-1a of the bytes the production staging builds, in logical order.
+    pub fnv1a: u64,
+}
+
+pub const TABLES: &[Table] = &[
+    Table { tid: 7, operand: 1, dtype: DType::F32, shape: [1, 65536], staggered: true, fnv1a: 0x8f3c3c5a26757a3f },
+    Table { tid: 8, operand: 2, dtype: DType::F32, shape: [1, 65536], staggered: true, fnv1a: 0x0f5466400d14fc8b },
+    Table { tid: 9, operand: 3, dtype: DType::F32, shape: [1, 65536], staggered: true, fnv1a: 0xf02934e30fcf13bf },
+    Table { tid: 10, operand: 4, dtype: DType::F32, shape: [1, 65536], staggered: true, fnv1a: 0x61d6272fe856c2ee },
+    Table { tid: 11, operand: 5, dtype: DType::F32, shape: [1, 64], staggered: false, fnv1a: 0xeafc787127b76d25 },
+    Table { tid: 12, operand: 6, dtype: DType::F32, shape: [1, 64], staggered: false, fnv1a: 0x41c73da30b804b25 },
+    Table { tid: 13, operand: 7, dtype: DType::F32, shape: [1, 65536], staggered: true, fnv1a: 0xd46ead472d398b11 },
+    Table { tid: 14, operand: 8, dtype: DType::F32, shape: [1, 65536], staggered: true, fnv1a: 0xa40b9707de4b3365 },
+    Table { tid: 15, operand: 9, dtype: DType::F32, shape: [1, 65536], staggered: true, fnv1a: 0x1cfc9ce698db42e5 },
+    Table { tid: 16, operand: 10, dtype: DType::I32, shape: [1, 1], staggered: false, fnv1a: 0xa353651ab6a56272 },
+    Table { tid: 17, operand: 11, dtype: DType::I32, shape: [1, 1], staggered: false, fnv1a: 0xcdac72f81f5733d8 },
+    Table { tid: 18, operand: 12, dtype: DType::I32, shape: [1, 1], staggered: false, fnv1a: 0xde6bfa115ddd9a86 },
+    Table { tid: 19, operand: 13, dtype: DType::I32, shape: [1, 1], staggered: false, fnv1a: 0x447bfb7f98e6154a },
+    Table { tid: 20, operand: 14, dtype: DType::F32, shape: [1, 65536], staggered: false, fnv1a: 0x27a069fc1aabf708 },
+    Table { tid: 21, operand: 15, dtype: DType::F32, shape: [1, 1], staggered: false, fnv1a: 0x4b724b7f9c5c3664 },
+    Table { tid: 22, operand: 16, dtype: DType::F32, shape: [1, 1], staggered: false, fnv1a: 0x70542b7088dada4f },
+    Table { tid: 23, operand: 17, dtype: DType::F32, shape: [1, 1], staggered: false, fnv1a: 0x4d25767f9dce13f5 },
+    Table { tid: 24, operand: 18, dtype: DType::F32, shape: [1, 1], staggered: false, fnv1a: 0x4d25477f9dcdc418 },
+    Table { tid: 25, operand: 19, dtype: DType::F32, shape: [1, 1], staggered: false, fnv1a: 0x4b72427f9c5c2719 },
+    Table { tid: 26, operand: 20, dtype: DType::F16, shape: [1, 1], staggered: false, fnv1a: 0x08328407b4eb6921 },
 ];
 
 /// What the node computes, as the mint states it.
