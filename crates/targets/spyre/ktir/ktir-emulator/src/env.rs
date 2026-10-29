@@ -16,6 +16,7 @@
 use std::cell::RefCell;
 
 use crate::dialects::Dispatch;
+use crate::dtypes::DType;
 use crate::latency::LatencyTracker;
 
 /// Grid shape and linear<->(x,y,z) transforms. Mirrors `GridExecutor`'s
@@ -81,7 +82,7 @@ impl GridExecutor {
 /// bundles); every other run — the direct-dispatch paths and a raw IRFunction
 /// (triton-numeric's conformance suite) — stays [`ConvertModel::Ieee`], the
 /// vendor oracle's own semantics.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum ConvertModel {
     /// IEEE widen: value-exact relabel, no lane permutation. The default.
     #[default]
@@ -89,6 +90,24 @@ pub enum ConvertModel {
     /// The card's `dl16tofp32`: value-exact but LANE-PERMUTED output, read from
     /// the same const table the bake reads (`element_arrangement`).
     Card,
+}
+
+impl ConvertModel {
+    /// Whether a `from` → `to` `arith.extf` writes LANE-PERMUTED output under
+    /// this model: only the card's f16→f32 (the pair the bake maps 1:1 to
+    /// `dl16tofp32`), with the arrangement read from the same const table the
+    /// bake reads — the row says `Standard`, nothing permutes.
+    ///
+    /// The ONE decision: a widen runs either on the interpreter (`extf`) or inside
+    /// a fused Metal map window, and both ask here, so the two paths a window can
+    /// take cannot disagree on which widens permute.
+    pub fn widen_staggers(self, from: Option<DType>, to: Option<DType>) -> bool {
+        self == ConvertModel::Card
+            && from == Some(DType::F16)
+            && to == Some(DType::F32)
+            && ktir_superdsc::element_arrangement::output_arrangement_of("dl16tofp32")
+                == Some(ktir_superdsc::element_arrangement::ElementArrangement::Dl16ToFp32)
+    }
 }
 
 /// Resources passed to every handler. Mirrors `ExecutionEnv`. Borrows the

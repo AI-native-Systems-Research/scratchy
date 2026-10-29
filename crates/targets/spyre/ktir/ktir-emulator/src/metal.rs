@@ -29,8 +29,10 @@ mod mtl4;
 
 use crate::attrkey::AttrKey;
 use crate::dtypes::DType;
+use crate::env::ConvertModel;
 use crate::ir::{Attr, IRFunction, Operation, Ssa};
 use crate::opkind::{Dialect, OpKind};
+use ktir_superdsc::element_arrangement::DL16TOFP32_SOURCE_LANE;
 
 // =========================================================================
 // Matmul acceleration tier — the GPU analogue of the BLAS auto-select.
@@ -2486,16 +2488,19 @@ pub struct MapRegionKernel {
 /// used by any op OUTSIDE the window), then lowers from its defining op into one
 /// MSL expression over `gid`, collecting the external LIVE-INS as buffer leaves.
 /// `Err` (≠1 live-out, or an unlowerable op) leaves the window on the interpreter.
+/// `model` is the run's widen model — the kernel widens exactly as the
+/// interpreter's `arith.extf` would under it (see [`MapLowering::compute`]).
 pub fn emit_map_region_kernel(
     ops: &[Operation],
     window: &[usize],
+    model: ConvertModel,
 ) -> Result<MapRegionKernel, String> {
     // Standalone entry: build the function-wide def map and use map once, then
     // delegate. `map_fusion_plan` shares one prebuilt pair across all windows so
     // the (linear-in-ops) analysis isn't redone per window.
     let defs = def_map_all(ops);
     let uses = build_uses(ops);
-    emit_map_region_kernel_with(ops, window, &defs, &uses)
+    emit_map_region_kernel_with(ops, window, &defs, &uses, model)
 }
 
 /// `emit_map_region_kernel` with the function-wide def map and use map supplied
@@ -2507,6 +2512,7 @@ fn emit_map_region_kernel_with(
     window: &[usize],
     defs: &HashMap<Ssa, &Operation>,
     uses: &HashMap<Ssa, HashSet<usize>>,
+    model: ConvertModel,
 ) -> Result<MapRegionKernel, String> {
     if window.is_empty() {
         return Err("metal: empty map window".into());
@@ -2556,10 +2562,29 @@ fn emit_map_region_kernel_with(
         .map(|d| d as usize)
         .collect();
 
-    // Lower the live-out's defining op into one MSL expression, accumulating the
-    // external live-in buffers (first-seen order).
-    let mut live_ins: Vec<Ssa> = Vec::new();
-    let expr = lower_map_compute(root, defs, &in_window, &mut live_ins, &out_shape, 0)?;
+    // Lower the live-out's defining op into one MSL expression evaluated at `gid`
+    // over the window's output, accumulating the external live-in buffers
+    // (first-seen order).
+    let mut lowering = MapLowering {
+        defs,
+        in_window: &in_window,
+        model,
+        live_ins: Vec::new(),
+        reads_staggered: false,
+    };
+    let expr = lowering.compute(
+        root,
+        MapSite {
+            index: "gid",
+            shape: &out_shape,
+        },
+        0,
+    )?;
+    let MapLowering {
+        live_ins,
+        reads_staggered,
+        ..
+    } = lowering;
     let out_dtype = match root.attr(AttrKey::Dtype) {
         Some(Attr::Dtype(dt)) => *dt,
         _ => DType::F16,
@@ -2585,7 +2610,13 @@ fn emit_map_region_kernel_with(
         is_output: true,
         dtype: DType::F32,
     });
-    let source = render_kernel(&kname, &buffers, &expr);
+    // A kernel that reads through the stagger carries its source-lane table.
+    let prelude = if reads_staggered {
+        dl16tofp32_source_msl()
+    } else {
+        String::new()
+    };
+    let source = render_kernel(&kname, &prelude, &buffers, &expr);
     Ok(MapRegionKernel {
         kernel: MslKernel {
             source,
@@ -2631,150 +2662,392 @@ fn build_uses(ops: &[Operation]) -> HashMap<Ssa, HashSet<usize>> {
     uses
 }
 
-/// Lower an in-window compute op into an MSL expression over `gid`, recursing
-/// through in-window operands and turning external operands into live-in buffer
-/// leaves. The map-region twin of [`lower_compute_depth`]: same operator table
-/// (via [`compose_compute_expr`]), different leaf rule — the leaf is decided by
-/// window membership, not by "is it a load".
-fn lower_map_compute(
-    op: &Operation,
-    defs: &HashMap<Ssa, &Operation>,
-    in_window: &HashSet<Ssa>,
-    live_ins: &mut Vec<Ssa>,
-    out_shape: &[usize],
-    depth: usize,
-) -> Result<String, String> {
-    compose_compute_expr(op, &mut |i: usize| -> Result<String, String> {
-        let name = *op
-            .operands
-            .get(i)
-            .ok_or_else(|| format!("metal: {:?} missing operand {i}", op.op_type))?;
-        lower_map_value(name, defs, in_window, live_ins, out_shape, depth)
-    })
+/// WHERE a map-window sub-expression is evaluated: the MSL `uint` expression for
+/// the flat element it computes, and the shape that index runs over. The window's
+/// root is evaluated at `gid` over its output shape, and every operand at its
+/// consumer's site — except a staggered widen's ([`MapLowering::compute`]).
+#[derive(Clone, Copy)]
+struct MapSite<'s> {
+    /// An ATOMIC MSL expression (`gid`, a call, or parenthesized): it is spliced
+    /// into `(index / stride) % dim` forms.
+    index: &'s str,
+    shape: &'s [usize],
 }
 
-/// Resolve one operand SSA name to its MSL sub-expression inside a map window.
-///   * an `arith.constant` -> folded literal,
-///   * a `tensor.splat` of a constant -> its folded literal; of a runtime value
-///     -> a LIVE-IN on the splat's own (resident) result,
-///   * a `linalg.broadcast` whose input is external/a load -> buffer leaf with the
-///     broadcast index expr; if its input is an in-window scalar -> recurse,
-///   * any other in-window compute op -> recurse,
-///   * anything else (a load, a value from outside the window, the reduce sum)
-///     -> a LIVE-IN buffer leaf, read `buf[0]` if scalar, `buf[gid]` if the
-///     live-in's shape equals the window's output shape, else `buf[<broadcast
-///     index>]` (a smaller live-in is broadcast NumPy-style, matching the
-///     interpreter's `broadcast_pair` — `buf[gid]` would run off its buffer).
-fn lower_map_value(
-    name: Ssa,
-    defs: &HashMap<Ssa, &Operation>,
-    in_window: &HashSet<Ssa>,
-    live_ins: &mut Vec<Ssa>,
-    out_shape: &[usize],
-    depth: usize,
-) -> Result<String, String> {
-    if depth > MAX_FUSE_DEPTH {
-        return Err("metal: fused map expression exceeds max depth".into());
-    }
-    let in_win = in_window.contains(&name);
-    match defs.get(&name) {
-        // Constants and splats are scheduling plumbing, never window members, so
-        // they resolve the same regardless of window membership.
-        Some(d) if d.op_type == OpKind::ArithConstant => constant_literal(d),
-        // ⭐ A SPLAT IS TRANSPARENT ONLY WHEN IT FOLDS TO A CONSTANT.
-        //
-        // A splat is plumbing: the interpreter EXECUTES it at its own index, and the
-        // liveness reclaim then frees its operand there — the splat is that operand's
-        // last use. Seeing through a splat of a RUNTIME value would make the operand
-        // the live-in, read at the trigger AFTER it was freed. MEASURED (gemma-4 emu
-        // prefill, the per-layer scalar `splat(load %layer_scalar : [1, 1])` feeding
-        // the residual's `mulf`): `undefined SSA value` at the window's trigger.
-        //
-        // The splat's OWN result is resident (the interpreter materialized it) and a
-        // window op reads it, so its reclaim is deferred to the trigger: it is the
-        // live-in. A constant still folds to its literal, parenthesized so it keeps
-        // its precedence in the parent.
-        Some(d) if d.op_type == OpKind::TensorSplat => match try_fold_scalar(name, defs) {
-            Some(lit) => Ok(format!("({lit})")),
-            None => map_live_in_leaf(name, defs, live_ins, out_shape),
-        },
-        Some(d) if d.op_type == OpKind::LinalgBroadcast => {
-            let input = *d
-                .operands
-                .first()
-                .ok_or("metal: linalg.broadcast missing ins operand")?;
-            // Broadcasting a scalar constant (directly, or via a splat) is
-            // transparent — every output element is that scalar. Fold it so the
-            // constant never becomes a (would-be-Scalar-at-runtime) live-in.
-            if let Some(lit) = try_fold_scalar(input, defs) {
-                return Ok(lit);
-            }
-            let input_in_win = in_window.contains(&input);
-            let input_is_load = defs
-                .get(&input)
-                .is_some_and(|x| x.op_type == OpKind::KtdpLoad);
-            // The input is SCALAR (shape product == 1) iff broadcasting it is a
-            // pure splat: every output lane reads the one value. Only then is
-            // recursing into an in-window input correct — the recursed expression
-            // reads its leaves at fixed (scalar) indices, valid for every `gid`.
-            let input_scalar = shape_attr_vec(defs.get(&input).copied())
-                .map(|s| s.iter().product::<i64>() == 1)
-                .unwrap_or(false);
-            if input_in_win && !input_is_load {
-                // Recursing into an in-window scalar input gives the MLX scalar-tail
-                // fusion (e.g. RMSNorm's `1/rms` folded into the final multiply).
-                // Parenthesized to preserve precedence in the parent expression.
-                if input_scalar {
-                    Ok(format!(
-                        "({})",
-                        lower_map_value(input, defs, in_window, live_ins, out_shape, depth + 1)?
-                    ))
-                } else {
-                    // A rank-reducing broadcast of an in-window NON-scalar value
-                    // (e.g. prefill's per-row `inv[8]` broadcast to `[8,576]`)
-                    // can't be inlined: the recursed expression would index the
-                    // lower-rank value by the output `gid` (out of bounds). The
-                    // value would have to be materialized first, which it isn't in
-                    // this window — so fail and leave the window to the interpreter.
-                    Err(format!(
-                        "metal: rank-reducing broadcast of in-window value %{} \
-                         (not scalar) — window stays on interpreter",
-                        input.0
-                    ))
-                }
-            } else {
-                // An external (load / prior-region) input: read it through the
-                // broadcast index expression (a materialized buffer leaf).
-                lower_map_broadcast(d, input, defs, live_ins)
-            }
+impl MapSite<'_> {
+    /// The flat index of the element a `shape`-shaped value contributes at this
+    /// site: the site's own index when the shapes agree, else the NumPy
+    /// right-aligned broadcast of `shape` up to the site's — the interpreter's
+    /// `broadcast_pair` law, so a smaller value is never read at the site's raw
+    /// index (which would run off its buffer). `None` when `shape` does not
+    /// broadcast to the site's shape.
+    fn index_into(&self, shape: &[i64]) -> Option<String> {
+        if shape
+            .iter()
+            .map(|&d| d as usize)
+            .eq(self.shape.iter().copied())
+        {
+            return Some(self.index.to_string());
         }
-        // An in-window compute op: descend, PARENTHESIZED so the inlined
-        // sub-expression keeps its precedence inside the parent op (e.g. SiLU's
-        // `v2 / (1 + exp(-v2))` must not flatten to `v2 / 1 + exp(-v2)`). Mirrors
-        // the parenthesizing in `lower_value`.
-        Some(d) if in_win => Ok(format!(
-            "({})",
-            lower_map_compute(d, defs, in_window, live_ins, out_shape, depth + 1)?
-        )),
-        // A scalar constant (directly or via splat) reached as a plain operand
-        // folds to its literal — it would be a `Value::Scalar` at runtime, not a
-        // resident tile, so it must never become a live-in buffer.
-        _ if try_fold_scalar(name, defs).is_some() => Ok(try_fold_scalar(name, defs).unwrap()),
-        // A non-constant SCALAR value is a `Value::Scalar` at runtime — it can't be
-        // bound as a tile buffer and we can't fold it. Fail the window.
-        // A non-constant SCALAR value (e.g. an `arith.maximumf : f16` from an
-        // attention softmax's scalar max/sum reduction, or any non-tensor op
-        // result) is a `Value::Scalar` at runtime — it can't be bound as a tile
-        // buffer and we can't fold it. Fail the window so it stays on the
-        // interpreter (correctness over fusion).
-        Some(d) if !is_tensor_valued(d) => Err(format!(
-            "metal: map window needs scalar value %{} (def {:?}) — not a resident tile; \
-             window stays on interpreter",
-            name.0, d.op_type
-        )),
-        // Any other value (a load result, a value produced outside the window —
-        // e.g. a prior region's output or the reduce sum) is an external input.
-        _ => map_live_in_leaf(name, defs, live_ins, out_shape),
+        // Right-align the value's rank under the site's (leading 1s), the same
+        // normalization `broadcast_pair` applies. An axis neither equal nor 1 — or
+        // more axes than the site has — does not broadcast.
+        let lead = self.shape.len().checked_sub(shape.len())?;
+        let mut padded = vec![1i64; lead];
+        padded.extend_from_slice(shape);
+        if padded
+            .iter()
+            .zip(self.shape)
+            .any(|(&s, &o)| s as usize != o && s != 1)
+        {
+            return None;
+        }
+        let site: Vec<i64> = self.shape.iter().map(|&d| d as i64).collect();
+        Some(broadcast_index_expr(self.index, &site, &padded))
+    }
+}
+
+/// The site a staggered widen's operand is read at, built per widen: the
+/// gathered index, over the widen's own shape.
+struct StaggeredSite {
+    index: String,
+    shape: Vec<usize>,
+}
+
+impl StaggeredSite {
+    fn site(&self) -> MapSite<'_> {
+        MapSite {
+            index: &self.index,
+            shape: &self.shape,
+        }
+    }
+}
+
+/// The MSL gather a staggered widen's operand is read through
+/// ([`dl16tofp32_source_msl`]).
+const DL16TOFP32_SOURCE_FN: &str = "dl16tofp32_source";
+
+/// The program-scope MSL a kernel that reads through [`DL16TOFP32_SOURCE_FN`]
+/// carries: the source-lane table, emitted from [`DL16TOFP32_SOURCE_LANE`] (the
+/// gather side of the ABI table the interpreter's staging scatters by), and the
+/// gather. `dl16tofp32_source(p, whole)` is the operand lane that lands at
+/// position `p` of a widen's output: the source lane of `p`'s block inside the
+/// stream's `whole` blocks, `p` itself in the tail past them —
+/// `dl16tofp32_stagger` keeps a tail shorter than a block verbatim.
+fn dl16tofp32_source_msl() -> String {
+    let block = DL16TOFP32_SOURCE_LANE.len();
+    let lanes = DL16TOFP32_SOURCE_LANE
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "constant ushort DL16TOFP32_SOURCE_LANE[{block}] = {{{lanes}}};\n\n\
+         inline uint {DL16TOFP32_SOURCE_FN}(uint p, uint whole) {{\n    \
+         return p < whole ? p - p % {block}u + uint(DL16TOFP32_SOURCE_LANE[p % {block}u]) : p;\n\
+         }}\n\n"
+    )
+}
+
+/// One map window's lowering: what the recursion reads (the function-wide def
+/// map, the window's members, the run's widen model) and what it accumulates
+/// (the external live-in buffers in first-seen order, and whether any operand is
+/// read through the stagger — the kernel then carries [`dl16tofp32_source_msl`]).
+struct MapLowering<'w, 'o> {
+    defs: &'w HashMap<Ssa, &'o Operation<'o>>,
+    in_window: &'w HashSet<Ssa>,
+    model: ConvertModel,
+    live_ins: Vec<Ssa>,
+    reads_staggered: bool,
+}
+
+impl MapLowering<'_, '_> {
+    /// Lower an in-window compute op into an MSL expression evaluated at `site`,
+    /// recursing through in-window operands and turning external operands into
+    /// live-in buffer leaves. The map-region twin of [`lower_compute_depth`]: same
+    /// operator table (via [`compose_compute_expr`]), different leaf rule — the
+    /// leaf is decided by window membership, not by "is it a load".
+    ///
+    /// ⭐ A STAGGERED WIDEN READS ITS OPERAND AT THE SOURCE LANE. Under
+    /// [`ConvertModel::Card`] the interpreter's `arith.extf` f16→f32 writes its
+    /// operand's lane `i` at the `dl16tofp32` buffer position
+    /// `DL16TOFP32_PERMUTATION[i]` (`dl16tofp32_stagger`), and the tables a bundle
+    /// binds are staged in that arrangement. A kernel thread computes ONE output
+    /// position, so it gathers instead: the widen's output at position `p` is its
+    /// operand at the lane [`DL16TOFP32_SOURCE_LANE`] names, so the whole operand
+    /// sub-expression is read there. The `float(..)` relabel stays
+    /// [`compose_compute_expr`]'s; only WHERE the operand is read moves. Reading it
+    /// at `p` — a plain widen beside staggered staged tables — is what drew the
+    /// greedy sampler's argmax + 8.
+    fn compute(
+        &mut self,
+        op: &Operation,
+        site: MapSite<'_>,
+        depth: usize,
+    ) -> Result<String, String> {
+        let staggered = self.staggered_operand_site(op, site)?;
+        let operand_site = staggered.as_ref().map_or(site, StaggeredSite::site);
+        compose_compute_expr(op, &mut |i: usize| -> Result<String, String> {
+            let name = *op
+                .operands
+                .get(i)
+                .ok_or_else(|| format!("metal: {:?} missing operand {i}", op.op_type))?;
+            self.value(name, operand_site, depth)
+        })
+    }
+
+    /// The site a staggered widen reads its operand at, or `None` when `op` is not
+    /// one: every other op reads its operands at its own site.
+    ///
+    /// The decision is [`ConvertModel::widen_staggers`]'s, the one the
+    /// interpreter's `arith.extf` takes. The interpreter asks it with the operand
+    /// tile's dtype; a kernel is planned before any tile exists, so the window
+    /// asks with the operand's STATIC element type — its defining op's result
+    /// type, the very lookup the bake's `convert_kind_of` makes when it maps the
+    /// pair 1:1 to `dl16tofp32`. A widen shorter than one block has no whole block
+    /// to permute (the staging keeps it verbatim), so it reads at its own site.
+    fn staggered_operand_site(
+        &mut self,
+        op: &Operation,
+        site: MapSite<'_>,
+    ) -> Result<Option<StaggeredSite>, String> {
+        if op.op_type != OpKind::ArithExtf {
+            return Ok(None);
+        }
+        let from = op
+            .operands
+            .first()
+            .and_then(|v| self.defs.get(v))
+            .and_then(|d| d.result_type)
+            .and_then(|t| t.elem());
+        let to = op.result_type.and_then(|t| t.elem());
+        if !self.model.widen_staggers(from, to) {
+            return Ok(None);
+        }
+        let shape =
+            shape_attr_vec(Some(op)).ok_or("metal: a staggered widen has no shape attribute")?;
+        let block = DL16TOFP32_SOURCE_LANE.len() as i64;
+        let whole = shape.iter().product::<i64>() / block * block;
+        if whole == 0 {
+            return Ok(None);
+        }
+        // The widen's own output position at this site (a broadcast index when the
+        // widen is smaller than its consumer), then the operand lane landing there.
+        let at = site.index_into(&shape).ok_or_else(|| {
+            format!(
+                "metal: staggered widen shape {shape:?} not broadcastable to its read site \
+                 {:?} — window stays on interpreter",
+                site.shape
+            )
+        })?;
+        self.reads_staggered = true;
+        Ok(Some(StaggeredSite {
+            index: format!("{DL16TOFP32_SOURCE_FN}({at}, {whole}u)"),
+            shape: shape.iter().map(|&d| d as usize).collect(),
+        }))
+    }
+
+    /// Resolve one operand SSA name to its MSL sub-expression, read at `site`.
+    ///   * an `arith.constant` -> folded literal,
+    ///   * a `tensor.splat` of a constant -> its folded literal; of a runtime value
+    ///     -> a LIVE-IN on the splat's own (resident) result,
+    ///   * a `linalg.broadcast` whose input is external/a load -> buffer leaf with the
+    ///     broadcast index expr; if its input is an in-window scalar -> recurse,
+    ///   * any other in-window compute op -> recurse,
+    ///   * anything else (a load, a value from outside the window, the reduce sum)
+    ///     -> a LIVE-IN buffer leaf ([`Self::live_in_leaf`]).
+    fn value(&mut self, name: Ssa, site: MapSite<'_>, depth: usize) -> Result<String, String> {
+        if depth > MAX_FUSE_DEPTH {
+            return Err("metal: fused map expression exceeds max depth".into());
+        }
+        // A copy of the def-map reference, not a borrow of `self`: the arms below
+        // recurse through `&mut self` while holding an op out of it.
+        let defs = self.defs;
+        let in_win = self.in_window.contains(&name);
+        match defs.get(&name) {
+            // Constants and splats are scheduling plumbing, never window members, so
+            // they resolve the same regardless of window membership.
+            Some(d) if d.op_type == OpKind::ArithConstant => constant_literal(d),
+            // ⭐ A SPLAT IS TRANSPARENT ONLY WHEN IT FOLDS TO A CONSTANT.
+            //
+            // A splat is plumbing: the interpreter EXECUTES it at its own index, and the
+            // liveness reclaim then frees its operand there — the splat is that operand's
+            // last use. Seeing through a splat of a RUNTIME value would make the operand
+            // the live-in, read at the trigger AFTER it was freed. MEASURED (gemma-4 emu
+            // prefill, the per-layer scalar `splat(load %layer_scalar : [1, 1])` feeding
+            // the residual's `mulf`): `undefined SSA value` at the window's trigger.
+            //
+            // The splat's OWN result is resident (the interpreter materialized it) and a
+            // window op reads it, so its reclaim is deferred to the trigger: it is the
+            // live-in. A constant still folds to its literal, parenthesized so it keeps
+            // its precedence in the parent.
+            Some(d) if d.op_type == OpKind::TensorSplat => match try_fold_scalar(name, defs) {
+                Some(lit) => Ok(format!("({lit})")),
+                None => self.live_in_leaf(name, site),
+            },
+            Some(d) if d.op_type == OpKind::LinalgBroadcast => {
+                let input = *d
+                    .operands
+                    .first()
+                    .ok_or("metal: linalg.broadcast missing ins operand")?;
+                // Broadcasting a scalar constant (directly, or via a splat) is
+                // transparent — every output element is that scalar. Fold it so the
+                // constant never becomes a (would-be-Scalar-at-runtime) live-in.
+                if let Some(lit) = try_fold_scalar(input, defs) {
+                    return Ok(lit);
+                }
+                let input_in_win = self.in_window.contains(&input);
+                let input_is_load = defs
+                    .get(&input)
+                    .is_some_and(|x| x.op_type == OpKind::KtdpLoad);
+                // The input is SCALAR (shape product == 1) iff broadcasting it is a
+                // pure splat: every output lane reads the one value. Only then is
+                // recursing into an in-window input correct — the recursed expression
+                // reads its leaves at fixed (scalar) indices, valid for every `gid`.
+                let input_scalar = shape_attr_vec(defs.get(&input).copied())
+                    .map(|s| s.iter().product::<i64>() == 1)
+                    .unwrap_or(false);
+                if input_in_win && !input_is_load {
+                    // Recursing into an in-window scalar input gives the MLX scalar-tail
+                    // fusion (e.g. RMSNorm's `1/rms` folded into the final multiply).
+                    // Parenthesized to preserve precedence in the parent expression.
+                    if input_scalar {
+                        Ok(format!("({})", self.value(input, site, depth + 1)?))
+                    } else {
+                        // A rank-reducing broadcast of an in-window NON-scalar value
+                        // (e.g. prefill's per-row `inv[8]` broadcast to `[8,576]`)
+                        // can't be inlined: the recursed expression would index the
+                        // lower-rank value by the output `gid` (out of bounds). The
+                        // value would have to be materialized first, which it isn't in
+                        // this window — so fail and leave the window to the interpreter.
+                        Err(format!(
+                            "metal: rank-reducing broadcast of in-window value %{} \
+                             (not scalar) — window stays on interpreter",
+                            input.0
+                        ))
+                    }
+                } else {
+                    // An external (load / prior-region) input: read it through the
+                    // broadcast index expression (a materialized buffer leaf).
+                    self.broadcast_leaf(d, input, site)
+                }
+            }
+            // An in-window compute op: descend, PARENTHESIZED so the inlined
+            // sub-expression keeps its precedence inside the parent op (e.g. SiLU's
+            // `v2 / (1 + exp(-v2))` must not flatten to `v2 / 1 + exp(-v2)`). Mirrors
+            // the parenthesizing in `lower_value`.
+            Some(d) if in_win => Ok(format!("({})", self.compute(d, site, depth + 1)?)),
+            // A scalar constant (directly or via splat) reached as a plain operand
+            // folds to its literal — it would be a `Value::Scalar` at runtime, not a
+            // resident tile, so it must never become a live-in buffer.
+            _ if try_fold_scalar(name, defs).is_some() => Ok(try_fold_scalar(name, defs).unwrap()),
+            // A non-constant SCALAR value is a `Value::Scalar` at runtime — it can't be
+            // bound as a tile buffer and we can't fold it. Fail the window.
+            // A non-constant SCALAR value (e.g. an `arith.maximumf : f16` from an
+            // attention softmax's scalar max/sum reduction, or any non-tensor op
+            // result) is a `Value::Scalar` at runtime — it can't be bound as a tile
+            // buffer and we can't fold it. Fail the window so it stays on the
+            // interpreter (correctness over fusion).
+            Some(d) if !is_tensor_valued(d) => Err(format!(
+                "metal: map window needs scalar value %{} (def {:?}) — not a resident tile; \
+                 window stays on interpreter",
+                name.0, d.op_type
+            )),
+            // Any other value (a load result, a value produced outside the window —
+            // e.g. a prior region's output or the reduce sum) is an external input.
+            _ => self.live_in_leaf(name, site),
+        }
+    }
+
+    /// Emit a live-in buffer leaf for `name` read at `site`: register it (dedup,
+    /// original SSA) and return `buf[0]` if it's a scalar (shape product == 1, e.g.
+    /// the reduce sum), else `buf[<the site's index into its shape>]`
+    /// ([`MapSite::index_into`]) — the site's own index when the shapes agree, the
+    /// broadcast index for a live-in SMALLER than the site (e.g. the argsort
+    /// tie-break's `[1, E, E]` compare consumed by an `[m, E, E]` window), exactly
+    /// as the interpreter's `broadcast_pair` does for the same op. `buf` is the
+    /// sanitized identifier the buffer binding uses.
+    ///
+    /// ⛔ `buf[gid]` FOR A SMALLER LIVE-IN READS OUT OF BOUNDS. `gid` runs over the
+    /// WINDOW's output extent; a live-in with fewer elements than that gets its
+    /// buffer over-read from the first output element past the live-in's own
+    /// count — MEASURED as the fused-map argsort producing duplicate ranks for
+    /// every row but the first (row 0's gids stay in bounds by coincidence).
+    fn live_in_leaf(&mut self, name: Ssa, site: MapSite<'_>) -> Result<String, String> {
+        if !self.live_ins.contains(&name) {
+            self.live_ins.push(name);
+        }
+        let buf = buf_ident(name);
+        let in_shape = shape_attr_vec(self.defs.get(&name).copied());
+        let scalar = in_shape
+            .as_ref()
+            .map(|s| s.iter().product::<i64>() == 1)
+            .unwrap_or(false);
+        if scalar {
+            return Ok(format!("{buf}[0]"));
+        }
+        let (Some(in_shape), false) = (in_shape, site.shape.is_empty()) else {
+            return Ok(format!("{buf}[{}]", site.index));
+        };
+        // An incompatible shape refuses the window — the interpreter handles it
+        // correctly instead.
+        let idx = site.index_into(&in_shape).ok_or_else(|| {
+            format!(
+                "metal: live-in %{} shape {in_shape:?} not broadcastable to its read site \
+                 {:?} — window stays on interpreter",
+                name.0, site.shape
+            )
+        })?;
+        Ok(format!("{buf}[{idx}]"))
+    }
+
+    /// Lower a `linalg.broadcast` whose input is an external buffer, read at `site`,
+    /// to `buf[idx]`: the broadcast's own output element at the site
+    /// ([`MapSite::index_into`]), mapped to the input element it reads by
+    /// `broadcast_index_expr`. Registers `input` as a live-in (the buffer named
+    /// `buf`). Mirrors [`lower_broadcast`] but takes the input as a live-in rather
+    /// than tracing it to a pointer argument.
+    fn broadcast_leaf(
+        &mut self,
+        op: &Operation,
+        input: Ssa,
+        site: MapSite<'_>,
+    ) -> Result<String, String> {
+        let in_shape = shape_attr_vec(self.defs.get(&input).copied())
+            .ok_or("metal: broadcast input has no shape")?;
+        let out_shape = shape_attr_vec(Some(op)).ok_or("metal: broadcast has no output shape")?;
+        let mut dims = int_list_attr_vec(op, AttrKey::Dimensions).unwrap_or_default();
+        dims.sort_unstable();
+        let mut expanded = in_shape;
+        for &d in &dims {
+            let d = d as usize;
+            if d > expanded.len() {
+                return Err(format!("metal: broadcast dim {d} out of range"));
+            }
+            expanded.insert(d, 1);
+        }
+        // Register the input buffer (dedup).
+        if !self.live_ins.contains(&input) {
+            self.live_ins.push(input);
+        }
+        let buf = buf_ident(input);
+        let at = site.index_into(&out_shape).ok_or_else(|| {
+            format!(
+                "metal: broadcast output {out_shape:?} not broadcastable to its read site {:?} \
+                 — window stays on interpreter",
+                site.shape
+            )
+        })?;
+        // Atomic, for the `(at / stride) % dim` forms it is spliced into.
+        let at = if at == site.index {
+            at
+        } else {
+            format!("({at})")
+        };
+        Ok(format!(
+            "{buf}[{}]",
+            broadcast_index_expr(&at, &out_shape, &expanded)
+        ))
     }
 }
 
@@ -2797,101 +3070,6 @@ fn try_fold_scalar(name: Ssa, defs: &HashMap<Ssa, &Operation>) -> Option<String>
         OpKind::TensorSplat => try_fold_scalar(*d.operands.first()?, defs),
         _ => None,
     }
-}
-
-/// Emit a live-in buffer leaf for `name`: register it (dedup, original SSA) and
-/// return `buf[0]` if it's a scalar (shape product == 1, e.g. the reduce sum),
-/// `buf[gid]` if the live-in's shape equals the window's output shape, else
-/// `buf[<broadcast index>]` — a live-in SMALLER than the output (e.g. the
-/// argsort tie-break's `[1, E, E]` compare consumed by an `[m, E, E]` window)
-/// is broadcast NumPy-style, exactly as the interpreter's `broadcast_pair`
-/// does for the same op. `buf` is the sanitized identifier the buffer binding
-/// uses.
-///
-/// ⛔ `buf[gid]` FOR A SMALLER LIVE-IN READS OUT OF BOUNDS. `gid` runs over the
-/// WINDOW's output extent; a live-in with fewer elements than that gets its
-/// buffer over-read from the first output element past the live-in's own
-/// count — MEASURED as the fused-map argsort producing duplicate ranks for
-/// every row but the first (row 0's gids stay in bounds by coincidence).
-fn map_live_in_leaf(
-    name: Ssa,
-    defs: &HashMap<Ssa, &Operation>,
-    live_ins: &mut Vec<Ssa>,
-    out_shape: &[usize],
-) -> Result<String, String> {
-    if !live_ins.contains(&name) {
-        live_ins.push(name);
-    }
-    let buf = buf_ident(name);
-    let in_shape = shape_attr_vec(defs.get(&name).copied());
-    let scalar = in_shape
-        .as_ref()
-        .map(|s| s.iter().product::<i64>() == 1)
-        .unwrap_or(false);
-    if scalar {
-        return Ok(format!("{buf}[0]"));
-    }
-    let (Some(in_shape), false) = (in_shape, out_shape.is_empty()) else {
-        return Ok(format!("{buf}[gid]"));
-    };
-    if in_shape.iter().map(|&d| d as usize).collect::<Vec<_>>() == out_shape {
-        return Ok(format!("{buf}[gid]"));
-    }
-    // Right-align the live-in's rank under the output's (leading 1s), the same
-    // normalization `broadcast_pair` applies, and read through the broadcast
-    // index expression. An incompatible shape (an axis neither equal nor 1)
-    // refuses the window — the interpreter handles it correctly instead.
-    let mut padded = vec![1i64; out_shape.len().saturating_sub(in_shape.len())];
-    padded.extend_from_slice(&in_shape);
-    for (s, &o) in padded.iter().zip(out_shape) {
-        if *s as usize != o && *s != 1 {
-            return Err(format!(
-                "metal: live-in %{} shape {in_shape:?} not broadcastable to window output \
-                 {out_shape:?} — window stays on interpreter",
-                name.0
-            ));
-        }
-    }
-    let idx = broadcast_index_expr(
-        &out_shape.iter().map(|&d| d as i64).collect::<Vec<_>>(),
-        &padded,
-    );
-    Ok(format!("{buf}[{idx}]"))
-}
-
-/// Lower a `linalg.broadcast` whose input is an external buffer to `buf[idx]`,
-/// where `idx = broadcast_index_expr(out_shape, expanded_in)` maps the output
-/// `gid` to the input element. Registers `input` as a live-in (the buffer named
-/// `buf`). Mirrors [`lower_broadcast`] but takes the input as a live-in rather
-/// than tracing it to a pointer argument.
-fn lower_map_broadcast(
-    op: &Operation,
-    input: Ssa,
-    defs: &HashMap<Ssa, &Operation>,
-    live_ins: &mut Vec<Ssa>,
-) -> Result<String, String> {
-    let in_shape =
-        shape_attr_vec(defs.get(&input).copied()).ok_or("metal: broadcast input has no shape")?;
-    let out_shape = shape_attr_vec(Some(op)).ok_or("metal: broadcast has no output shape")?;
-    let mut dims = int_list_attr_vec(op, AttrKey::Dimensions).unwrap_or_default();
-    dims.sort_unstable();
-    let mut expanded = in_shape;
-    for &d in &dims {
-        let d = d as usize;
-        if d > expanded.len() {
-            return Err(format!("metal: broadcast dim {d} out of range"));
-        }
-        expanded.insert(d, 1);
-    }
-    // Register the input buffer (dedup).
-    if !live_ins.contains(&input) {
-        live_ins.push(input);
-    }
-    let buf = buf_ident(input);
-    Ok(format!(
-        "{buf}[{}]",
-        broadcast_index_expr(&out_shape, &expanded)
-    ))
 }
 
 /// Count of Map windows successfully offloaded to a fused GPU kernel (test /
@@ -3021,10 +3199,14 @@ pub fn force_gpu_map() -> bool {
 /// gate) the window registers its TRIGGER (the last op index — run the kernel
 /// there) and all its op indices in the SKIP set; otherwise the window's ops are
 /// left to the interpreter. Returns `(trigger -> kernel, skip set)`.
+///
+/// The plan is a function of `ops` AND `model`, the run's widen model: its
+/// kernels widen as the interpreter's `arith.extf` does under that model, so a
+/// plan's cache key carries both — an IEEE run's plan is never a card run's.
 pub type MapRegionPlan = (HashMap<usize, MapRegionKernel>, HashSet<usize>);
 
 #[cfg(metal)]
-pub fn map_fusion_plan(ops: &[Operation]) -> MapRegionPlan {
+pub fn map_fusion_plan(ops: &[Operation], model: ConvertModel) -> MapRegionPlan {
     // Build the function-wide def map and use map ONCE; share them across every
     // window's emit (the analysis is linear in ops, so per-window rebuilds would
     // make planning quadratic in a 35k-op fused model).
@@ -3041,7 +3223,7 @@ pub fn map_fusion_plan(ops: &[Operation]) -> MapRegionPlan {
             return;
         }
         let w = std::mem::take(window);
-        let emitted = emit_map_region_kernel_with(ops, &w, &defs, &uses);
+        let emitted = emit_map_region_kernel_with(ops, &w, &defs, &uses, model);
         if let Err(e) = &emitted
             && std::env::var_os("KTIR_REWRITE_VERBOSE").is_some()
         {
@@ -3154,7 +3336,7 @@ pub fn emit_kernel(f: &IRFunction) -> Result<MslKernel, String> {
         dtype,
     });
 
-    let source = render_kernel(f.name, &buffers, &expr);
+    let source = render_kernel(f.name, "", &buffers, &expr);
     Ok(MslKernel {
         source,
         name: f.name.to_string(),
@@ -3327,14 +3509,16 @@ fn lower_broadcast(op: &Operation, defs: &HashMap<Ssa, &Operation>) -> Result<St
     }
     Ok(format!(
         "{buf}[{}]",
-        broadcast_index_expr(&out_shape, &expanded)
+        broadcast_index_expr("gid", &out_shape, &expanded)
     ))
 }
 
-/// MSL index into a broadcast input: sum over axes whose expanded input size is
-/// > 1 of `coord(axis) * input_stride`, where `coord(axis) = (gid / out_stride)
-/// % out_dim`. Size-1 (broadcast) axes contribute nothing. Empty sum -> "0".
-fn broadcast_index_expr(out_shape: &[i64], expanded_in: &[i64]) -> String {
+/// MSL index into a broadcast input at the flat output index `at` (an ATOMIC MSL
+/// expression — `gid`, a call, or parenthesized): sum over axes whose expanded
+/// input size is > 1 of `coord(axis) * input_stride`, where `coord(axis) =
+/// (at / out_stride) % out_dim`. Size-1 (broadcast) axes contribute nothing.
+/// Empty sum -> "0".
+fn broadcast_index_expr(at: &str, out_shape: &[i64], expanded_in: &[i64]) -> String {
     let r = out_shape.len();
     let mut terms: Vec<String> = Vec::new();
     for k in 0..r {
@@ -3344,9 +3528,9 @@ fn broadcast_index_expr(out_shape: &[i64], expanded_in: &[i64]) -> String {
         let out_stride: i64 = out_shape[k + 1..].iter().product();
         let in_stride: i64 = expanded_in[k + 1..].iter().product();
         let coord = if out_stride == 1 {
-            "gid".to_string()
+            at.to_string()
         } else {
-            format!("(gid / {out_stride})")
+            format!("({at} / {out_stride})")
         };
         let coord = format!("({coord} % {})", out_shape[k]);
         terms.push(if in_stride == 1 {
@@ -3468,9 +3652,12 @@ fn constant_literal(op: &Operation) -> Result<String, String> {
 
 // --- rendering -----------------------------------------------------------
 
-fn render_kernel(name: &str, buffers: &[BufferBinding], expr: &str) -> String {
+/// One-thread-per-element kernel source: `prelude` (program-scope MSL the
+/// expression calls into — empty for most kernels) ahead of the kernel itself.
+fn render_kernel(name: &str, prelude: &str, buffers: &[BufferBinding], expr: &str) -> String {
     let mut s = String::new();
     s.push_str("#include <metal_stdlib>\nusing namespace metal;\n\n");
+    s.push_str(prelude);
     s.push_str(&format!("kernel void {name}(\n"));
     for (i, b) in buffers.iter().enumerate() {
         let qual = if b.is_output {
@@ -7186,7 +7373,7 @@ kernel void mpp_probe(
         let z = ops.attr(z, AttrKey::Shape, tile);
         let st = ops.op(None, OpKind::KtdpStore, &["%z", "%tz"]);
         let stmts = vec![x, s, ss, y, c, cs, z, st];
-        let mrk = emit_map_region_kernel(&stmts, &[3, 6]).unwrap();
+        let mrk = emit_map_region_kernel(&stmts, &[3, 6], ConvertModel::Ieee).unwrap();
         assert_eq!(
             mrk.live_ins,
             vec![ops.ssa("%x"), ops.ssa("%ss")],
@@ -7196,6 +7383,182 @@ kernel void mpp_probe(
             mrk.kernel.source.contains("2.0"),
             "the constant splat still folds to its literal"
         );
+    }
+
+    /// `%name = kind operands` typed the way the KTIR emitter types it: the result
+    /// type, plus the `Shape` and `Dtype` attributes it stamps from that type.
+    fn typed(
+        ops: &mut Ops,
+        name: &'static str,
+        kind: OpKind,
+        operands: &[&'static str],
+        dims: &[i64],
+        elem: DType,
+    ) -> Operation<'static> {
+        let op = ops.op(Some(name), kind, operands);
+        let shape = ops.int_list(dims.to_vec());
+        let op = ops.attr(op, AttrKey::Shape, shape);
+        let op = ops.attr(op, AttrKey::Dtype, Attr::Dtype(elem));
+        Operation {
+            result_type: Some(crate::irtype::IrType::Tensor {
+                dims: ops.arena().ints(dims.to_vec()),
+                elem,
+            }),
+            ..op
+        }
+    }
+
+    /// The sampler's widen class, `n` lanes wide: a staged f16 row widened to f32 —
+    /// directly, and through an in-window f16 op — combined with a staged f32 table,
+    /// then broadcast against a `[2, n]` live-in (so the widens are SMALLER than the
+    /// window's output). Returns the ops and the window (every compute op).
+    fn widen_window(ops: &mut Ops, n: i64) -> (Vec<Operation<'static>>, Vec<usize>) {
+        use DType::{F16, F32};
+        use OpKind::{ArithAddf, ArithExtf, ArithMulf, ArithNegf, KtdpLoad, KtdpStore};
+        let (row, rows) = ([1, n], [2, n]);
+        let stmts = vec![
+            typed(ops, "%x", KtdpLoad, &["%tx"], &row, F16),
+            typed(ops, "%p", KtdpLoad, &["%tp"], &row, F32),
+            typed(ops, "%r", KtdpLoad, &["%tr"], &rows, F32),
+            typed(ops, "%nx", ArithNegf, &["%x"], &row, F16),
+            typed(ops, "%w", ArithExtf, &["%x"], &row, F32),
+            typed(ops, "%wn", ArithExtf, &["%nx"], &row, F32),
+            typed(ops, "%a", ArithAddf, &["%w", "%p"], &row, F32),
+            typed(ops, "%b", ArithMulf, &["%a", "%wn"], &row, F32),
+            typed(ops, "%o", ArithAddf, &["%b", "%r"], &rows, F32),
+            ops.op(None, KtdpStore, &["%o", "%to"]),
+        ];
+        (stmts, vec![3, 4, 5, 6, 7, 8])
+    }
+
+    /// Only a STAGGERED widen moves under the card model, so the model changes the
+    /// MSL of exactly the windows holding one: an f16→f32 widen with a whole
+    /// 64-block gathers through the source-lane table, a widen shorter than one
+    /// block (nothing to permute) and a window with no widen emit the same kernel
+    /// under both models.
+    #[test]
+    fn only_a_staggered_widen_changes_the_kernel() {
+        let mut ops = Ops::new();
+        let (stmts, window) = widen_window(&mut ops, 200);
+        let card = emit_map_region_kernel(&stmts, &window, ConvertModel::Card).unwrap();
+        let ieee = emit_map_region_kernel(&stmts, &window, ConvertModel::Ieee).unwrap();
+        assert!(
+            card.kernel
+                .source
+                .contains(&format!("{DL16TOFP32_SOURCE_FN}((gid % 200), 192u)")),
+            "the card's widen reads its operand at the source lane of its own position \
+             (whole blocks: 192 of 200 lanes):\n{}",
+            card.kernel.source
+        );
+        assert!(
+            !ieee.kernel.source.contains(DL16TOFP32_SOURCE_FN),
+            "the IEEE widen is a plain relabel:\n{}",
+            ieee.kernel.source
+        );
+
+        let mut ops = Ops::new();
+        let (stmts, window) = widen_window(&mut ops, 32);
+        let card = emit_map_region_kernel(&stmts, &window, ConvertModel::Card).unwrap();
+        let ieee = emit_map_region_kernel(&stmts, &window, ConvertModel::Ieee).unwrap();
+        assert_eq!(
+            card.kernel.source, ieee.kernel.source,
+            "a widen shorter than one block has nothing to permute"
+        );
+
+        // `%w + %p` alone: no widen in the window.
+        let mut ops = Ops::new();
+        let (stmts, _) = widen_window(&mut ops, 200);
+        let card = emit_map_region_kernel(&stmts, &[6], ConvertModel::Card);
+        let ieee = emit_map_region_kernel(&stmts, &[6], ConvertModel::Ieee);
+        assert_eq!(
+            card.map(|k| k.kernel.source),
+            ieee.map(|k| k.kernel.source),
+            "a window without a widen is the same kernel under both models"
+        );
+    }
+
+    /// ⭐ THE FUSED WINDOW COMPUTES WHAT THE INTERPRETER COMPUTES, LANE ORDER INCLUDED.
+    /// The [`widen_window`] program runs op by op on the interpreter and as one fused
+    /// Metal kernel, under BOTH widen models, and the two must agree bit for bit —
+    /// every value is a small integer, so every op is exact whatever the kernel's
+    /// math mode. Under the card model the interpreter's `arith.extf` staggers
+    /// (`dl16tofp32`), and the kernel must gather the same lanes: a kernel widening
+    /// plainly beside staggered staged tables is what drew the greedy sampler's
+    /// `argmax + 8`. The control proves the comparison can fail: on this program the
+    /// stagger DOES change the answer, so the plain (IEEE) kernel misses the card's.
+    /// 200 lanes: three whole 64-blocks and a tail the staging keeps verbatim.
+    #[cfg(metal)]
+    #[test]
+    fn a_fused_window_widens_in_the_interpreters_lane_order() -> Result<(), String> {
+        use crate::ir::Value;
+        use crate::tile::Tile;
+        if no_gpu_here() {
+            eprintln!("no MTL4-capable GPU here — skipping the fused-window differential");
+            return Ok(());
+        }
+        const N: usize = 200;
+        let mut ops = Ops::new();
+        let (stmts, window) = widen_window(&mut ops, N as i64);
+        let (x, p, r, o) = (ops.ssa("%x"), ops.ssa("%p"), ops.ssa("%r"), ops.ssa("%o"));
+        // Distinct within every 64-block (37 and 53 are units mod 97 and 1009), so any
+        // lane moved within a block moves a value.
+        let xs: Vec<f32> = (0..N).map(|i| ((i * 37) % 97) as f32 - 48.0).collect();
+        let ps: Vec<f32> = (0..N).map(|i| ((i * 53) % 1009) as f32).collect();
+        let rs: Vec<f32> = (0..2 * N).map(|j| ((j * 29) % 499) as f32).collect();
+
+        let run = |model: ConvertModel, fused: bool| -> Result<Vec<u32>, String> {
+            let dispatch = crate::dialects::Dispatch::new();
+            let grid = crate::env::GridExecutor::new((1, 1, 1));
+            let env = crate::env::ExecutionEnv::new(&dispatch, &grid).with_convert_model(model);
+            let mut ctx = crate::interpreter::single_core_context();
+            let tile = |data: &[f32], dtype, dims: [usize; 2]| {
+                Value::Tile(Tile::compute(data.to_vec(), dtype, dims.to_vec()))
+            };
+            ctx.set_value(x, tile(&xs, DType::F16, [1, N]));
+            ctx.set_value(p, tile(&ps, DType::F32, [1, N]));
+            ctx.set_value(r, tile(&rs, DType::F32, [2, N]));
+            if fused {
+                let mrk = emit_map_region_kernel(&stmts, &window, model)?;
+                run_map_region_gpu(&mrk, &mut ctx, &env)?;
+            } else {
+                for &i in &window {
+                    crate::interpreter::execute_op(&stmts[i], &mut ctx, &env)?;
+                }
+            }
+            match ctx.get_value(o)? {
+                Value::Tile(t) => Ok(t.as_f32().iter().map(|v| v.to_bits()).collect()),
+                other => Err(format!("%o is {other:?}, want a tile")),
+            }
+        };
+        let first_diff = |a: &[u32], b: &[u32]| {
+            a.iter()
+                .zip(b)
+                .position(|(x, y)| x != y)
+                .map(|i| (i, f32::from_bits(a[i]), f32::from_bits(b[i])))
+        };
+
+        let card_interp = run(ConvertModel::Card, false)?;
+        let card_fused = run(ConvertModel::Card, true)?;
+        let ieee_interp = run(ConvertModel::Ieee, false)?;
+        let ieee_fused = run(ConvertModel::Ieee, true)?;
+        assert!(
+            first_diff(&ieee_fused, &card_interp).is_some(),
+            "control: the stagger must change this program's answer, or the card \
+             comparison below proves nothing"
+        );
+        assert_eq!(
+            first_diff(&card_fused, &card_interp),
+            None,
+            "card model: the fused kernel (left) must match the interpreter (right) at \
+             every lane — (lane, kernel, interpreter)"
+        );
+        assert_eq!(
+            first_diff(&ieee_fused, &ieee_interp),
+            None,
+            "IEEE model: the fused kernel (left) must match the interpreter (right) at \
+             every lane — (lane, kernel, interpreter)"
+        );
+        Ok(())
     }
 
     #[test]

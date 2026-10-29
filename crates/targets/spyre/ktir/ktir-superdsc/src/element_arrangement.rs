@@ -63,6 +63,27 @@ const fn dl16tofp32_permutation() -> [u8; 64] {
     table
 }
 
+/// The GATHER side of the same fact: `DL16TOFP32_SOURCE_LANE[p]` is the logical lane a
+/// [`ElementArrangement::Dl16ToFp32`] block holds at buffer position `p`, so
+/// `DL16TOFP32_SOURCE_LANE[DL16TOFP32_PERMUTATION[i]] == i`. The staging SCATTERS (lane `i` is
+/// written at its row of [`DL16TOFP32_PERMUTATION`]); a consumer that computes one buffer
+/// position at a time — the emulator's fused map kernel, one thread per output element —
+/// GATHERS, and reads this row. Inverted from [`DL16TOFP32_PERMUTATION`] at compile time, never
+/// re-derived from the rotation, so the two sides cannot drift apart.
+pub const DL16TOFP32_SOURCE_LANE: [u8; 64] = inverse_of(&DL16TOFP32_PERMUTATION);
+
+/// The inverse of a 64-lane permutation table — the const constructor behind
+/// [`DL16TOFP32_SOURCE_LANE`].
+const fn inverse_of(table: &[u8; 64]) -> [u8; 64] {
+    let mut inverse = [0u8; 64];
+    let mut lane = 0;
+    while lane < 64 {
+        inverse[table[lane] as usize] = lane as u8;
+        lane += 1;
+    }
+    inverse
+}
+
 /// ⭐ THE TARGET-ABI CONST TABLE — opcode → the arrangement the op's OUTPUT carries when both
 /// operands are addressed standard. The shared propagation takes this table as INPUT; it never
 /// decides an arrangement by logic of its own (the in-place-kernels/write-bindings law: target
@@ -162,5 +183,22 @@ mod tests {
         a.sort_by(|x, y| x.total_cmp(y));
         b.sort_by(|x, y| x.total_cmp(y));
         assert_eq!(a, b, "the staging permutes, never projects");
+    }
+
+    /// The gather side reads back what the staging scattered: buffer position `p` of every
+    /// staged block holds exactly the logical lane the source table names.
+    #[test]
+    fn the_source_lanes_gather_what_the_staging_scattered() {
+        let logical: Vec<f32> = (0..128).map(|i| i as f32).collect();
+        let staged = dl16tofp32_stagger(&logical);
+        for block in 0..2 {
+            for (p, &source) in DL16TOFP32_SOURCE_LANE.iter().enumerate() {
+                assert_eq!(
+                    staged[block * 64 + p],
+                    (block * 64 + source as usize) as f32,
+                    "position {p} of block {block} must hold logical lane {source}"
+                );
+            }
+        }
     }
 }

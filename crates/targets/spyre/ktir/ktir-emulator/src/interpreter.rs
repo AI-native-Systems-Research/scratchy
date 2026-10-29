@@ -863,7 +863,7 @@ pub(crate) fn execute_function_gpu(
         std::collections::HashMap<usize, crate::metal::MapRegionKernel>,
         std::collections::HashSet<usize>,
     ) = if crate::metal::force_gpu_map() && std::env::var_os("KTIR_NO_GPU_MAP").is_none() {
-        crate::metal::map_fusion_plan(ops)
+        crate::metal::map_fusion_plan(ops, env.convert_model)
     } else {
         (
             std::collections::HashMap::new(),

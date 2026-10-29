@@ -37,8 +37,9 @@ use crate::tile::Tile;
 //
 // The LX-liveness map (`compute_dies_at`) and — under Metal — the matmul-loop
 // schedule (`matmul_loop_schedule`) and map-window fusion plan
-// (`map_fusion_plan`) are PURE functions of a function's `ops`: nothing about
-// them changes between forward passes. But the resident decode loop re-derives
+// (`map_fusion_plan`) are PURE functions of a function's `ops` (the fusion plan
+// also of the run's widen model, which its key carries): nothing about them
+// changes between forward passes. But the resident decode loop re-derives
 // all three on EVERY pass (and every segment), and the flamegraph shows that
 // re-derivation — window analysis + MSL codegen + liveness walks — dominating
 // CPU time while the GPU sits idle. We memoize each by a structural fingerprint
@@ -176,7 +177,7 @@ thread_local! {
 
 #[cfg(metal)]
 thread_local! {
-    static MAP_PLAN_CACHE: std::cell::RefCell<HashMap<u64, Rc<MapPlan>>> =
+    static MAP_PLAN_CACHE: std::cell::RefCell<HashMap<(u64, ConvertModel), Rc<MapPlan>>> =
         std::cell::RefCell::new(HashMap::new());
 }
 
@@ -198,15 +199,22 @@ fn cached_matmul_schedule(
     })
 }
 
-/// Memoized [`crate::metal::map_fusion_plan`] keyed by `key` ([`plan_key`]).
+/// Memoized [`crate::metal::map_fusion_plan`] keyed by `key` ([`plan_key`]) AND
+/// the run's widen model: a plan's kernels widen as the interpreter does under
+/// that model (the card's lane-permuted `dl16tofp32` or the IEEE relabel), so the
+/// same ops run IEEE and run as a card segment are two plans, never one.
 #[cfg(metal)]
-fn cached_map_fusion_plan(ops: &[Operation<'static>], key: u64) -> Rc<MapPlan> {
+fn cached_map_fusion_plan(
+    ops: &[Operation<'static>],
+    key: u64,
+    model: ConvertModel,
+) -> Rc<MapPlan> {
     MAP_PLAN_CACHE.with(|c| {
-        if let Some(v) = c.borrow().get(&key) {
+        if let Some(v) = c.borrow().get(&(key, model)) {
             return Rc::clone(v);
         }
-        let v = Rc::new(crate::metal::map_fusion_plan(ops));
-        c.borrow_mut().insert(key, Rc::clone(&v));
+        let v = Rc::new(crate::metal::map_fusion_plan(ops, model));
+        c.borrow_mut().insert((key, model), Rc::clone(&v));
         v
     })
 }
@@ -1370,7 +1378,7 @@ impl CoreRunner {
             && std::env::var_os("KTIR_NO_GPU_MAP").is_none();
         #[cfg(metal)]
         let map_plan: Rc<MapPlan> = if gpu_map_offload {
-            cached_map_fusion_plan(ops, plan_key)
+            cached_map_fusion_plan(ops, plan_key, env.convert_model)
         } else {
             Rc::new((HashMap::new(), std::collections::HashSet::new()))
         };
