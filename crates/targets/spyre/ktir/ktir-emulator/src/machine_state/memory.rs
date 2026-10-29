@@ -172,6 +172,17 @@ impl HBMSimulator {
         self.allocations.get(&byte_addr).map(Vec::len)
     }
 
+    /// Whether an interior address `byte_addr` past `base` still resolves to `base`'s own
+    /// allocation: no OTHER allocation is based in `(base, byte_addr]`. A grown allocation can
+    /// swallow a later base (see [`allocation_len_at_base`](Self::allocation_len_at_base)), and
+    /// [`find_allocation`] resolves an address past that base to the swallowed allocation.
+    pub fn resolves_to_base(&self, base: i64, byte_addr: i64) -> bool {
+        self.allocations
+            .range(base + 1..=byte_addr)
+            .next()
+            .is_none()
+    }
+
     pub fn write_bytes_owned(&mut self, byte_addr: i64, data: Vec<u8>) {
         match self.allocations.get(&byte_addr) {
             Some(buf) if buf.len() == data.len() => {
@@ -399,6 +410,21 @@ mod tests {
         assert_eq!(s0, 0x10000 / STICK_BYTES);
         assert_eq!(hbm.next_ptr % STICK_BYTES, 0);
         assert_eq!(s1 - s0, 1); // next stick
+    }
+
+    #[test]
+    fn a_swallowed_base_stops_an_interior_address_resolving_to_the_grown_allocation() {
+        let mut hbm = HBMSimulator::default();
+        let a = hbm.allocate(STICK_BYTES) * STICK_BYTES;
+        let b = hbm.allocate(STICK_BYTES) * STICK_BYTES;
+        assert!(hbm.resolves_to_base(a, a + STICK_BYTES - 1));
+        // Grow `a` past `b`'s base: `a`'s buffer now covers `b`'s address, but an address at or
+        // past `b` resolves to `b`.
+        hbm.write_bytes(a, &vec![7u8; (3 * STICK_BYTES) as usize]);
+        assert!(hbm.allocation_len_at_base(a).unwrap() >= (b - a + STICK_BYTES) as usize);
+        assert!(!hbm.resolves_to_base(a, b));
+        assert!(!hbm.resolves_to_base(a, b + 1));
+        assert!(hbm.resolves_to_base(a, b - 1));
     }
 
     #[test]

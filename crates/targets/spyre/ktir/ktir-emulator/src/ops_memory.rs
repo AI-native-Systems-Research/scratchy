@@ -1195,13 +1195,12 @@ fn touched_span(
 ) -> (i64, usize) {
     let hi = offsets.iter().copied().max().unwrap_or(0);
     let lo = offsets.iter().copied().min().unwrap_or(0);
-    let inside = lo > 0
-        && matches!(space, MemorySpace::Hbm)
-        && ctx
-            .hbm
-            .borrow()
-            .allocation_len_at_base(base_ptr)
-            .is_some_and(|len| ((hi + 1) as usize) * bpe <= len);
+    let inside = lo > 0 && matches!(space, MemorySpace::Hbm) && {
+        let hbm = ctx.hbm.borrow();
+        hbm.allocation_len_at_base(base_ptr)
+            .is_some_and(|len| ((hi + 1) as usize) * bpe <= len)
+            && hbm.resolves_to_base(base_ptr, base_ptr + lo * bpe as i64)
+    };
     let lo = if inside { lo } else { 0 };
     (lo, (hi - lo + 1) as usize)
 }
