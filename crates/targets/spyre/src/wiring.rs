@@ -1254,17 +1254,20 @@ pub fn stage_col_stick_heads<const N: usize>(
 /// pattern. Tables are functions of `pad_vocab`, `k`, and `hidden`, constant
 /// across decode steps, staged ONCE.
 ///
-/// The SENTINEL (all-NaN row, #666): the device answers `PAD_V + 4160`, so
-/// the tables run to `pad_vocab + SAMPLE_SENTINEL_OFFSET + 1` rows to keep
-/// that pick's gather IN EXTENT. Past `pad_vocab` every row stages the
-/// sentinel's own values — `stab` = the s=0 LANE PATTERN (every lane names a
-/// quarter of slab 0, the clamp's bus safety: no special-cased row class),
-/// `ltab` = the SENTINEL RAMP (`chain_l_sentinel_ramp` — lanes naming the
-/// transposed placement's unwritten zero tail, word 0 = `hidden` the mark: a
-/// real pick's word 0 is a lane `≤ 63 < 64 ≤ hidden`, so the mark never
-/// collides): the readback refusal (`checked_picked_token`) errors the step
-/// BEFORE any consumer of the sentinel rows runs, so those rows are bus
-/// safety, never a value the forward reads.
+/// The SENTINEL (all-NaN row, #666): the device answers `PAD_V + 4160`
+/// (`sample_sentinel`), so the tables run to `pad_vocab +
+/// SAMPLE_SENTINEL_OFFSET + 1` rows to keep that pick's gather IN EXTENT.
+/// Past `pad_vocab` every row stages the sentinel's own values — `stab` =
+/// the s=0 LANE PATTERN (every lane names a quarter of slab 0, the clamp's
+/// bus safety: no special-cased row class), `ltab` = the SENTINEL RAMP
+/// (`chain_l_sentinel_ramp` — lanes naming the transposed placement's
+/// unwritten zero tail, word 0 = `hidden` the mark: a real pick's word 0 is
+/// a lane `≤ 63 < 64 ≤ hidden`, so the mark never collides). The worker's
+/// idx-stick readback refuses the sentinel and fails the step that drew it,
+/// but under the pipelined decode the next step can already be on the card
+/// by then, gathering through these rows — so they are read, and what they
+/// buy is bus safety: the gather stages a zero row, never a read past the
+/// matrix.
 ///
 /// ⛔ THE WORDS ARE THE DEVICE ENCODING — SENUINT32 lane values as u32 LE
 /// words, `DType::I32`. The staging door for I32 consts is the VERBATIM
@@ -1563,8 +1566,8 @@ pub struct SampleSeat {
 ///
 /// The SENTINEL (all-NaN row, #666): the one-hot falls on the pad lanes,
 /// where the tables stage `ginc = G`, `binc = GROUP_BLOCKS`, `linc = BLOCK`,
-/// so idx = `G·4096 + GROUP_BLOCKS·64 + BLOCK = PAD_V + 4160`, past the last
-/// real lane.
+/// so idx = `G·4096 + GROUP_BLOCKS·64 + BLOCK` =
+/// [`scratchy_subtile::subtile_ir::sample_sentinel`], past the last real lane.
 ///
 /// Every selection value is a small exact integer (`G ≤ 2048` by the admission
 /// gate; `padoff` stages only 0.0 and −inf); every noise value is either an
@@ -2699,6 +2702,40 @@ mod constant_tape_tests {
                     .collect(),
             ),
             ..Default::default()
+        }
+    }
+
+    /// The staged pad lanes spell the sampler's all-NaN answer (#666): an all-NaN row's one-hot
+    /// falls on a pad lane, whose `ginc`, `binc` and `linc` read back idx = `ginc·4096 + binc·64 +
+    /// linc` — `sample_sentinel`, the host reference's answer, past the vocab (the readback's
+    /// refusal) and inside the chain tables' extent (the next step's gather stays in bounds).
+    /// At a small vocab, granite's, and gemma-4's power of two, which pads to the next one.
+    #[test]
+    fn the_staged_pad_lanes_spell_the_all_nan_sentinel() {
+        use scratchy_subtile::subtile_ir::{
+            SAMPLE_BLOCK, SAMPLE_GROUP_BLOCKS, SAMPLE_SENTINEL_OFFSET, sample_pad_vocab,
+            sample_sentinel,
+        };
+        for vocab in [5u32, 49155, 262144] {
+            let tables = sample_staged_tables(vocab, 1);
+            // The last lane of a `[1, pad_v]` f32 table is a pad lane at every vocab.
+            let pad = |t: usize| {
+                let (bytes, dt, _) = &tables[t];
+                assert_eq!(*dt, scratchy_tensors::DType::F32);
+                let last = bytes.len() - 4;
+                f32::from_le_bytes(bytes[last..].try_into().unwrap()) as u32
+            };
+            let (binc, linc, ginc) = (pad(2), pad(3), pad(8));
+            let idx = ginc * (SAMPLE_BLOCK * SAMPLE_GROUP_BLOCKS) + binc * SAMPLE_BLOCK + linc;
+            assert_eq!(idx, sample_sentinel(vocab), "vocab {vocab}");
+            assert!(
+                idx >= vocab,
+                "vocab {vocab}: the sentinel is past the vocab"
+            );
+            assert!(
+                idx < sample_pad_vocab(vocab) + SAMPLE_SENTINEL_OFFSET + 1,
+                "vocab {vocab}: the chain's tables reach the sentinel's row"
+            );
         }
     }
 }

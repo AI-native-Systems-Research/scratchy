@@ -1662,8 +1662,12 @@ pub(crate) fn collect_decode_tokens(
 }
 
 /// The idx stick's own decode law, shared by the sync readback and the deferred
-/// collect so the two cannot drift.
-#[cfg(feature = "spyre-hw")]
+/// collect so the two cannot drift. A word at or past the vocab is refused: the
+/// sampler answers an all-NaN logits row with `sample_sentinel` (#666), and the
+/// card's draw is the only pick, so every path refuses that row alike.
+// The `test` arm makes the fn exist under `spyre-emu`, which has no `spyre-hw`;
+// CI runs `idx_stick_tests` in that shape (the spyre-triton job).
+#[cfg(any(test, feature = "spyre-hw"))]
 fn decode_idx_stick(bytes: &[u8], rows: usize, vocab: usize) -> ExecutorResult<Vec<u32>> {
     let words: Vec<i32> = bytes
         .as_chunks::<4>()
@@ -1685,9 +1689,14 @@ fn decode_idx_stick(bytes: &[u8], rows: usize, vocab: usize) -> ExecutorResult<V
                 ))
             })?;
             if t as usize >= vocab {
+                let why = if t == scratchy_subtile::subtile_ir::sample_sentinel(vocab as u32) {
+                    "the sampler's all-NaN sentinel: the logits row was NaN in every lane"
+                } else {
+                    "not the all-NaN sentinel either, so no answer the sampler gives"
+                };
                 return Err(werr(format!(
-                    "the card's token draw for row {r} is {t} >= vocab {vocab} — the sampler's \
-                     sentinel, never a token"
+                    "the card's token draw for row {r} is {t} >= vocab {vocab} — {why}. \
+                     Refusing rather than serving a token that does not exist."
                 )));
             }
             Ok(t)
@@ -3329,6 +3338,54 @@ mod pad_clamp_tests {
             host_i32.len(),
             2,
             "the s and the l seed both stage through the raw channel"
+        );
+    }
+}
+
+#[cfg(test)]
+mod idx_stick_tests {
+    use super::decode_idx_stick;
+    use scratchy_subtile::subtile_ir::sample_sentinel;
+
+    /// An idx stick as the card writes it: row r's pick in every one of its 64 lanes, each
+    /// lane at its SenUint32 stick address (`dev_off_stk`), the layout the readback reads.
+    fn stick(picks: &[u32]) -> Vec<u8> {
+        let rows = picks.len();
+        let stk = <scratchy_subtile::superdsc_opspec::SenUint32 as scratchy_subtile::superdsc_opspec::DataFormat>::ELEMS_PER_STICK
+            as usize;
+        let mut words = vec![0i32; rows * 64];
+        for (r, &p) in picks.iter().enumerate() {
+            for c in 0..64 {
+                let off =
+                    scratchy_subtile::sdsc_abstract::dev_off_stk(&[rows, 64], 1, &[r, c], stk);
+                words[off] = p as i32;
+            }
+        }
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// The readback passes real picks and refuses the sampler's all-NaN sentinel (#666), at
+    /// granite's vocab, solo and on a batched row; any other word past the vocab refuses too.
+    #[test]
+    fn the_readback_refuses_the_all_nan_sentinel_and_passes_a_real_pick() {
+        let vocab = 49155u32;
+        let v = vocab as usize;
+        assert_eq!(
+            decode_idx_stick(&stick(&[12358, 0]), 2, v).expect("two real picks"),
+            vec![12358, 0]
+        );
+        for picks in [
+            vec![sample_sentinel(vocab)],
+            vec![12358, sample_sentinel(vocab)],
+        ] {
+            let err = decode_idx_stick(&stick(&picks), picks.len(), v)
+                .expect_err("the sentinel is never a token");
+            assert!(err.to_string().contains("all-NaN sentinel:"), "{err}");
+        }
+        let err = decode_idx_stick(&stick(&[vocab]), 1, v).expect_err("past the vocab");
+        assert!(
+            err.to_string().contains("not the all-NaN sentinel"),
+            "{err}"
         );
     }
 }
