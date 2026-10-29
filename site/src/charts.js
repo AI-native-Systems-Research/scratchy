@@ -62,7 +62,7 @@
   }
   // Draws one chart in the theme `t`.
   function draw(el, t) {
-    var charts = { groupedbar: Charts.GroupedBarChart, combo: Charts.ComboChart, heatmap: Charts.HeatmapChart, bubble: Charts.BubbleChart, line: Charts.LineChart };
+    var charts = { groupedbar: Charts.GroupedBarChart, combo: Charts.ComboChart, heatmap: Charts.HeatmapChart, bubble: Charts.BubbleChart };
     var spec = JSON.parse(el.getAttribute('data-chart'));
     if (spec.ratio) {
       var total = spec.options.locale.translations.total;
@@ -106,11 +106,12 @@
     var scale = el.dataset.scale && document.getElementById(el.dataset.scale);
     if (scale) highlightSteps(chart, spec, scale);
     if (spec.kind === 'combo') {
+      var dashed = spec.dashed || [];
       labelGaps(el, chart, spec.data);
-      dashCarried(el);
+      dashLines(el, dashed);
       chart.services.events.addEventListener('render-finished', function () {
         labelGaps(el, chart, spec.data);
-        dashCarried(el);
+        dashLines(el, dashed);
       });
     }
     if (spec.kind === 'bubble') {
@@ -194,17 +195,14 @@
       text.style.fill = 'var(--cds-text-primary)';
     });
   }
-  // Dashes the rival's carried line — the dotted continuation of its line
-  // past its last measurement, on a timeline whose PRs outrun torch's
-  // sweeps. Carbon has no dashed-line option, so this finds its paths by
-  // their dataset's name ("… (carried)", the id the build gave the carried
-  // series) and dashes them, again after every draw.
-  function dashCarried(el) {
+  // Dashes the lines the build named in `dashed`: a timeline's carried
+  // rival (its line on past its last measurement), an ECDF's median line.
+  // Carbon has no dashed-line option, so this finds their paths by their
+  // dataset's name and dashes them, again after every draw.
+  function dashLines(el, dashed) {
     el.querySelectorAll('path.line').forEach(function (path) {
       var name = path.__data__ && path.__data__.name;
-      if (typeof name === 'string' && name.slice(-11) === ' (carried)') {
-        path.setAttribute('stroke-dasharray', '4, 3');
-      }
+      if (dashed.indexOf(name) >= 0) path.setAttribute('stroke-dasharray', '4, 3');
     });
   }
   // The relative luminance of an "rgb(r, g, b)" colour, 0 black to 1 white.

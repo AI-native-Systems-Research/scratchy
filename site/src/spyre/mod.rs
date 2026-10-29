@@ -569,6 +569,7 @@ fn bars(
             bounds: None,
             bubble: None,
             line: None,
+            hover: None,
             toolbar: Enabled { enabled: false },
         },
     };

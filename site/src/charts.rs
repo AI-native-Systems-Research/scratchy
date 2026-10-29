@@ -144,6 +144,9 @@ pub enum Chart<'a> {
     Combo {
         data: Vec<SparkPoint>,
         options: ChartOptions<'a>,
+        /// The line series charts.js dashes, which Carbon's options cannot ask for.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        dashed: Vec<&'static str>,
     },
     /// Carbon's BubbleChart: a bubble per spot measurements share, its area their count.
     Bubble {
@@ -153,19 +156,6 @@ pub enum Chart<'a> {
         /// [`BubblePoint::radius`].
         unit_radius: f64,
     },
-    /// Carbon's LineChart: a line per group through its points, joined as `options.line` says.
-    Line {
-        data: Vec<LinePoint<'a>>,
-        options: ChartOptions<'a>,
-    },
-}
-
-/// One point of a line: its series, where along the bottom axis, and its value.
-#[derive(Serialize)]
-pub struct LinePoint<'a> {
-    pub group: &'a str,
-    pub key: f64,
-    pub value: f64,
 }
 
 /// One bubble: its series, where along the bottom axis, its value, and the square root of how
@@ -249,7 +239,25 @@ pub struct ChartOptions<'a> {
     pub bubble: Option<Bubbles>,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub line: Option<LineOptions>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub hover: Option<Hover>,
     pub toolbar: Enabled,
+}
+
+/// What hovering a chart shows: Carbon's tooltip, and on a line chart its ruler, the line at the
+/// pointer's step whose points the tooltip lists. Unset, Carbon shows both.
+#[derive(Serialize)]
+pub struct Hover {
+    pub tooltip: Enabled,
+    pub ruler: Enabled,
+}
+
+impl Hover {
+    /// Neither: for a chart whose points are not one per step across its series.
+    pub const NONE: Hover = Hover {
+        tooltip: Enabled { enabled: false },
+        ruler: Enabled { enabled: false },
+    };
 }
 
 /// A line chart's options: how Carbon joins its points (a d3 curve's name), and whether it marks
@@ -452,8 +460,7 @@ impl Chart<'_> {
             Chart::GroupedBar { options, .. }
             | Chart::Heatmap { options, .. }
             | Chart::Combo { options, .. }
-            | Chart::Bubble { options, .. }
-            | Chart::Line { options, .. } => options,
+            | Chart::Bubble { options, .. } => options,
         }
     }
 }
@@ -616,6 +623,7 @@ pub fn mini_heatmap(
             bounds: None,
             bubble: None,
             line: None,
+            hover: None,
             toolbar: Enabled { enabled: false },
         },
         ratio: true,
@@ -939,8 +947,8 @@ pub fn sparkline(
     label: &str,
 ) -> Element {
     // The rival's carried continuation is its own line dataset — Carbon has
-    // no way to dash part of one series, so charts.js dashes this one by its
-    // name — in the rival's own colour. The id must live as long as the
+    // no way to dash part of one series, so charts.js dashes this one
+    // (`dashed`) — in the rival's own colour. The id must live as long as the
     // spec; the build is a one-shot process, so one leak a chart is sound.
     let carried: Option<&'static str> = axes
         .carry
@@ -981,6 +989,7 @@ pub fn sparkline(
     };
     let spec = Chart::Combo {
         data: spark_points(pts, axes.better, scratchy, rival, carried),
+        dashed: carried.into_iter().collect(),
         options: ChartOptions {
             title: String::new(),
             // Users, both lengths and model sizes grow by a factor per step:
@@ -1027,6 +1036,7 @@ pub fn sparkline(
             }),
             bubble: None,
             line: None,
+            hover: None,
             toolbar: Enabled { enabled: false },
         },
     };
