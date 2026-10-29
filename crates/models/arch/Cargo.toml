@@ -316,6 +316,7 @@ all-arches = [
 "qwen3.5-0.8b-parity-tiny" = ["arch-qwen3-5"]
 "qwen3.5-9b-text-only" = ["arch-qwen3-5"]
 "qwen3.6-27b-text-only" = ["arch-qwen3-5"]
+"qwen3.8-27b-text-only" = ["arch-qwen3-5"]
 
 # qwen3-5-moe (4 configs)
 "qwen3.5-122b-a10b" = ["arch-qwen3-5-moe"]
@@ -331,6 +332,7 @@ all-arches = [
 "qwen3.5-9b" = ["arch-qwen3-5-vl"]
 "qwen3.5-9b-parity-tiny" = ["arch-qwen3-5-vl"]
 "qwen3.6-27b" = ["arch-qwen3-5-vl"]
+"qwen3.8-27b" = ["arch-qwen3-5-vl"]
 
 # qwen3-moe (2 configs)
 "qwen3-30b-a3b-instruct-2507" = ["arch-qwen3-moe"]
@@ -532,6 +534,7 @@ all-arches = [
     "qwen3.5-0.8b-parity-tiny",
     "qwen3.5-9b-text-only",
     "qwen3.6-27b-text-only",
+    "qwen3.8-27b-text-only",
 ]
 "qwen3-5-moe" = [
     "qwen3.5-122b-a10b",
@@ -547,6 +550,7 @@ all-arches = [
     "qwen3.5-9b",
     "qwen3.5-9b-parity-tiny",
     "qwen3.6-27b",
+    "qwen3.8-27b",
 ]
 "qwen3-moe" = [
     "qwen3-30b-a3b-instruct-2507",
@@ -695,6 +699,7 @@ all = [
     "qwen3.5-0.8b-parity-tiny",
     "qwen3.5-9b-text-only",
     "qwen3.6-27b-text-only",
+    "qwen3.8-27b-text-only",
     "qwen3.5-122b-a10b",
     "qwen3.5-35b-a3b",
     "qwen3.5-35b-a3b-parity-tiny",
@@ -704,6 +709,7 @@ all = [
     "qwen3.5-9b",
     "qwen3.5-9b-parity-tiny",
     "qwen3.6-27b",
+    "qwen3.8-27b",
     "qwen3-30b-a3b-instruct-2507",
     "qwen3-30b-a3b-instruct-2507-parity-tiny",
     "qwen3-moe-1-layer",

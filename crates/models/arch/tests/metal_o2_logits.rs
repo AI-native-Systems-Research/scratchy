@@ -768,6 +768,8 @@ o2_cases! {
     "qwen3.6-35b-a3b" => o2_qwen3_6_35b_a3b_mlx("mlx-community/Qwen3.6-35B-A3B-4bit", Sampled);
     "qwen2.5-7b" => o2_qwen2_5_7b_mlx_qembed("mlx-community/Qwen2.5-7B-Instruct-4bit", Sampled);
     "qwen2-vl-2b-mlx-text-only" => o2_qwen2_vl_2b_text_mlx_qembed("mlx-community/Qwen2-VL-2B-Instruct-4bit", Sampled);
+    // The 27B dense geometry: 3 GDN value heads per key head, 6 query heads per KV head.
+    "qwen3.8-27b-text-only" => o2_qwen3_8_27b_text_mlx_qembed("mlx-community/qwen3.8-27b-4bit", Sampled);
     "granite-4.1-3b" => o2_granite_4_1_3b_mlx_g32("mlx-community/granite-4.1-3b-4bit", Sampled);
     // mlx-affine-b3-g64-qembed: GLM-4.5-Air — first 3-bit checkpoint, first
     // dense-router (no scales sibling) + sigmoid-bias (noaux_tc) MoE, first
