@@ -2109,50 +2109,6 @@ impl Executor {
             self.weight_bank_host[b] = vec![0u8; bytes];
         }
 
-        // ⛔ EVERY PLACED COPY MUST BE BOUND — the owner-scoped mirror of the bound-without-place
-        // refusal in the loop below. The head-major o_proj copies are PLACED by the layout but
-        // STAGED only through the wiring's `weight_copies` list, which the worker turns into bound
-        // rows at load. #299's registry rewrite of `graph_wiring` emptied that list while the
-        // placement pass kept placing, so every copy window sat never-written while the m=1 fp8 o
-        // matmul read it: fluent garbage, card-only, granite-3.1-8b fp8 m=1 alone (every other
-        // geometry never reads a copy, and the emulator executes the KTIR program, not the staging,
-        // so no bench caught it either).
-        //
-        // ⛔ THE CHECK BELONGS TO THE WEIGHT-SEGMENT OWNER ALONE (2026-10-27, granite-3.1-8b fp8:
-        // the borrowing prefill anchor refused at load over 40 copies it never stages). A borrower
-        // BINDS NO WEIGHTS, whatever its `bound` holds: the load-const channel stages resident
-        // constants through the weight channel (`bind_const_fp32` and `bind_weight` both insert
-        // into `weight_ids`), so a borrowing rung or anchor that stages its own tables trips the
-        // `bound ∩ weight_ids` test below — while the copies it "fails" to bind are delivered by
-        // the owner's alias (`alias_seg_from` / `adopt_from_owner`), never by its own staging. The
-        // mint is bundle-invariant (one staged weight segment serves every bundle), so the owner's
-        // check covers every borrower's reads: a wiring list that lost the copies refuses at the
-        // OWNER, naming the same #299 class.
-        let stages_weights = !self.seg_borrowed[SEG_WEIGHT.get()]
-            && self.bound.keys().any(|nm| self.weight_ids.contains(nm));
-        if stages_weights {
-            let unbound: Vec<u32> = self
-                .code
-                .layout
-                .weight_copies
-                .iter()
-                .map(|&(_, to)| to)
-                .filter(|&to| !self.bound.contains_key(&bundle::PlaceId::Act(to)))
-                .collect();
-            if !unbound.is_empty() {
-                bail!(
-                    "stage: {} o_proj head-major cop{} placed but never bound (first: t{}) — the \
-                     wiring's weight_copies list and the layout's placements disagree, so the m=1 \
-                     fp8 o matmul would read never-written windows. REFUSING: this is the #299 \
-                     defect class (graph_wiring's registry rewrite dropped the copy mint), and a \
-                     session that stages weights must stage every copy the layout places.",
-                    unbound.len(),
-                    if unbound.len() == 1 { "y" } else { "ies" },
-                    unbound[0],
-                );
-            }
-        }
-
         // ── Collect the weight placements, validating each against its own extent. ──
         // One bound tensor's staging transform — what the parallel stage loop does to its bytes.
         // ⭐ VERBATIM IS A THIRD THING, NOT THE ABSENCE OF THE SECOND: this used to be

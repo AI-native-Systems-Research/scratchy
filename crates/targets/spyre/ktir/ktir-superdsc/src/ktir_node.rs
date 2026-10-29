@@ -248,7 +248,6 @@ pub enum Program {
     /// The last-row extraction half of an lm-head tail — see [`KtirNode::node_out_tid`].
     LmLast,
     Rope,
-    Attn,
     /// PAGED ATTENTION — `kernels/paged_attn.py`, spyre-inference's head-major online-softmax
     /// page walk: each active block's page id is read from the page table and its `(page, kv
     /// head)` slab GATHERED from the K and V pools (`ktdp.construct_indirect_access_tile`
@@ -441,11 +440,12 @@ pub enum Program {
 }
 
 impl Program {
-    /// Whether this program has a SuperDSC lowering — the card's half of the ladder. The paged
-    /// attention's (page gathers inside its walk loop) is not ported: the door refuses it by name,
-    /// so a card build stops at it rather than shipping a bundle short its attention.
+    /// Whether this program has a SuperDSC lowering — the card's half of the ladder. The paged step
+    /// reaches the card WHOLE: its KV write lowers (`lk::paged_kv_write`, the hardware scatter) but
+    /// its page walk does not yet, so neither is placed or lowered into a card plan until both are —
+    /// a card build stops at the walk rather than shipping a bundle short its attention.
     pub const fn has_card_lowering(self) -> bool {
-        !matches!(self, Program::PagedAttn)
+        !matches!(self, Program::PagedAttn | Program::PagedKvWrite)
     }
 }
 

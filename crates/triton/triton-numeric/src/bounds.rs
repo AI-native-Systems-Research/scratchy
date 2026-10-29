@@ -830,72 +830,6 @@ pub fn decoder(d_model: usize, d_ff: usize, layers: usize) -> Envelope {
     )
 }
 
-/// SDPA — `test-fixtures/sdpa.py`, torch-spyre's decomposition, configs `sdpa_*`, against torch's
-/// f32 `scaled_dot_product_attention` cast once to f16.
-///
-/// THE EMITTED PATH AND ITS ROUNDS, per query row, with `T = skv / block_n` KV blocks:
-/// ```text
-///   q_s  = q * scale              0 rounds when scale is a power of two (0.125 at HD=64: an
-///                                 exponent shift), else 1 plus the constant's own error
-///   s    = q_s . k^T              f32 accumulate over HD, ONE f16 round (Q2)
-///   s   += mask                   exact: the tile is 0 or -inf
-///   m    = max(s)                 exact
-///   d    = s - m                  1 round, at |d|
-///   p    = exp(d)                 f32 exp, 1 f16 round
-///   l    = sum(p)                 fold_depth(block_n) rounds; NONNEGATIVE terms
-///   o    = p . v                  f32 accumulate, 1 f16 round
-///   scan, per block after the first:
-///     c = exp(min(m_old - m_blk, 0)), l = l*c + sum(p), acc = acc*c + p.v
-///                                 2 rounds on l (nonnegative), 2 on acc plus the block dot's
-///   out  = o / l                  1 round
-///   reference .to(f16)            1 round on the REFERENCE side
-/// ```
-///
-/// WHAT CANCELS, which is what keeps this bound from being the sum of everything above. `out` is
-/// the ratio `sum_j p_j v_j / sum_j p_j`, so any error COMMON to a row's `p_j` divides out exactly:
-/// the row max's own score error (`m` shifts every `d_j` alike), and -- in the scan -- the
-/// correction `c`'s error, because `acc` and `l` are multiplied by the SAME rounded `c`. What
-/// survives is the PER-ELEMENT error of each `p_j`: its score's round reaching `exp` as an
-/// absolute exponent perturbation (RMS `sigma_s * r_s`, `sigma_s = sqrt(HD) * scale` the score
-/// RMS on the unit-variance stimulus -- 1 exactly at the torch-spyre default scale), the
-/// subtraction's round at the weights' own exponent scale (`<= 2 sigma_s`: the softmax mass sits
-/// within two score sigmas of the max), and `exp`'s f16 round. Through the weighted average
-/// `out = sum_j w_j v_j` (`w_j >= 0`, `sum w_j = 1`) a per-weight relative error of RMS `r_p`
-/// leaves with RMS at most `r_p * sigma_v * sqrt(sum_j w_j^2) <= r_p * sigma_v` -- the
-/// `sqrt(sum w^2) <= 1` step is where this is LOOSE for long unmasked rows (decode: `e/512`
-/// expected, so about 14x loose there), and it is kept loose rather than estimated, because a
-/// causal row 1 has `sum w^2` near 1/2.
-///
-/// The scan's extra roundings land on the carried `acc` at the PARTIAL output's scale (at most
-/// `sigma_v`, a weighted average of `v` rows): two per extra block (the rescale and the add, the
-/// dot's own round folded into them as the swiglu trip chain does), composed RSS over the blocks
-/// as [`swiglu`] composes its trips. The ones that scale with the FINAL output -- `o`'s round, the
-/// denominator's fold and its per-block rescale/add (nonnegative: no cancellation), the divide and
-/// the reference cast -- are the multiplicative band.
-pub fn sdpa(hd: usize, skv: usize, block_n: usize, scale: f64) -> Envelope {
-    assert!(
-        block_n >= 1 && skv.is_multiple_of(block_n),
-        "sdpa: the scan runs whole blocks"
-    );
-    let u = U_F16;
-    let trips = skv / block_n;
-    let sigma_v = 1.0; // unit-variance stimulus (`sdpa.py`'s `inputs()`)
-    let sigma_s = (hd as f64).sqrt() * scale;
-    // q * scale: free when the scale is a power of two (an exponent shift), else one round plus
-    // the constexpr's own f16 representation error.
-    let scale_err = if scale.log2().fract() == 0.0 {
-        0.0
-    } else {
-        u + const_rel_error(scale)
-    };
-    let r_s = scale_err + u + f32_accum_rel(hd);
-    let r_p = sigma_s * r_s + 2.0 * sigma_s * u + u;
-    let e_abs = r_p * sigma_v + 2.0 * u * sigma_v * ((trips - 1) as f64).sqrt();
-
-    let rounds = 1 + fold_depth(block_n) + 2 * (trips as u32 - 1) + 1 + 1;
-    compose(band_up(rounds), band_down(rounds), GAUSS_TAIL * e_abs)
-}
-
 // ===========================================================================================
 // tests — the COMPOSITION ARITHMETIC only. No emulator, no data, no fixtures.
 // ===========================================================================================
@@ -1064,8 +998,6 @@ mod tests {
             ("swiglu_granite_tiled_k", swiglu(4096, 12800, 64, 2048)),
             ("decoder1", decoder(128, 256, 1)),
             ("decoder2", decoder(128, 256, 2)),
-            ("sdpa_one_block", sdpa(64, 256, 256, 0.125)),
-            ("sdpa_scan", sdpa(64, 512, 256, 0.125)),
         ];
         for (name, e) in all {
             assert!(e.k_plus > 0.0, "{name}: k_plus must be positive");
@@ -1099,12 +1031,6 @@ mod tests {
     fn envelopes_widen_with_the_work_they_bound() {
         // more layers -> strictly more accumulated error
         assert!(decoder(128, 256, 2).floor > decoder(128, 256, 1).floor);
-        // the online-softmax scan re-rounds its carry every block: the same keys in two blocks
-        // must cost MORE than in one, on both the floor and the band
-        let (one, two) = (sdpa(64, 256, 256, 0.125), sdpa(64, 256, 128, 0.125));
-        assert!(two.floor > one.floor && two.k_plus > one.k_plus);
-        // and a scale that is not a power of two costs a round the 0.125 default does not
-        assert!(sdpa(80, 256, 256, 80f64.sqrt().recip()).floor > one.floor);
         // a wider MLP -> a larger down-projection gain -> a larger floor
         assert!(swiglu(4096, 12800, 12800, 4096).floor > swiglu(128, 256, 256, 128).floor);
         // and BLOCKING the same width strictly widens it: more trips, more f16 roundings on both

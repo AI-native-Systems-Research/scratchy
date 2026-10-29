@@ -33,7 +33,7 @@
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::emit::lower_ktir_to_superdsc as lk;
 use ktir_superdsc::emit::lower_ktir_to_superdsc::{
-    Error, Region, attn_at, err, regions, rope_at, split_out,
+    Error, Region, err, regions, rope_at, split_out,
 };
 use ktir_superdsc::emit::whole_function::lower_function;
 use ktir_superdsc::ktir_node::{KtirNode, Program};
@@ -76,63 +76,6 @@ pub struct BundleAttnParams {
     /// fact only the caller knows stays a caller's argument. The row KIND is the one that stays: no
     /// program states it, for the reason its own comment gives.
     pub rows_are_requests: bool,
-    /// ⭐ WHETHER THIS BUNDLE'S ATTENTION READS THE PAGED KV THROUGH AN INDEX — the batched rungs'
-    /// per-page gather (`rows_are_requests`) or the one-request rung's split-KV chunk
-    /// ([`Self::chunk_pages`]). Prefill does not gather: its rows are consecutive positions of one
-    /// sequence sharing one resident history, so there is nothing per-row for an index to select.
-    ///
-    /// ⛔ IT IS `rows_are_requests || chunk_pages.is_some()` AND NOTHING WIDER. A one-request body that
-    /// took the PER-PAGE gather would read its mask per row (the gathered score arm has no broadcast
-    /// arm) while placing and staging the broadcast row — measured on card as garbage from the first
-    /// decode token. So a one-request body gathers only as a chunk, whose read IS the broadcast row
-    /// over the chunk's logical slots. The placement reserves `KV_BLOCK_INDEX_TID` under this fact and
-    /// the emitter names the index under it — one predicate, both halves.
-    pub gathers_kv: bool,
-    /// ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK — how many resident pages this one-request decode body attends in ONE
-    /// pass (`ktir_superdsc::sdsc_abstract::ChunkScratch`). A ladder rung's own bake fact: the attention
-    /// PROGRAM sweeps one page whatever the rung, so the chunk width cannot be read back from it, and it
-    /// is folded into the bundle fingerprint for exactly that reason. `None` = the per-page fold.
-    pub chunk_pages: Option<u32>,
-    /// ⭐ WHETHER THIS BUNDLE'S ATTENTION SCORE SCALE IS CARRIED BY THE STAGED WEIGHTS — and it is
-    /// here because both cases that make it so leave the program UNABLE to state the one fact that
-    /// remains.
-    ///
-    /// The score multiplier was the one thing the program stated and the door read back
-    /// (`program_score_scale`, on the `qk · scale` mulf). A FOLD rewrites the node's scale to 1.0
-    /// before the splice mints the program, and the triton→ktir pipeline folds a multiply by 1.0
-    /// away entirely — so a folded attention program states NO multiplier, which is the truth (no
-    /// device multiply is left to do: the weights carry `√scale` each). A model whose attention
-    /// scale genuinely IS 1.0 (gemma-4's arch defaults `attention_multiplier` to it) states none
-    /// either, for the same reason and just as truthfully — `√1.0` leaves the weights carrying
-    /// the whole scale with nothing folded. This bool is the caller's statement that one of those
-    /// two is the case, and the door HARD-REFUSES a multiplier-less program without it — a fact
-    /// about what the program cannot say, not a value duplicated from what it does (the
-    /// caller-stated `f32` this struct once carried beside the program's own reading, and lost
-    /// for exactly that reason).
-    pub scale_in_weights: bool,
-    /// ⭐ WHETHER THIS BUNDLE'S o_proj READS THE HEAD-MAJOR COPY — the finalize/weight contract of
-    /// the multi-slab single-row body, and the SECOND fact the program cannot state.
-    ///
-    /// At `nslab > 1` the shipped finalize relayouts `out` to token-stream at `nqh·nslab` ops; at
-    /// `mq == 1` a row IS a head, so the alternative is to leave `out` slab-major (one op per slab)
-    /// and permute o_proj's contraction axis to meet it — a SECOND, k-shuffled copy of each layer's
-    /// o_proj weight under [`crate::reserved_tids::oproj_headmajor_tid`]. The finalize cannot say
-    /// which arrangement its bytes are in, and the o matmul cannot say which copy its B operand
-    /// means — this ONE fact is what both consume, so the restructure cannot be half-applied:
-    /// the door swaps the B operand on exactly the bundles whose finalize went slab-major.
-    ///
-    /// Minted ONLY where fully expressible: the attention output is a single row (`mq == 1`),
-    /// the head dim spans more than one feature slab (`hd > POOL_STICK`), and the o matmul is fp8
-    /// W8A8 (the staging walk the permuted copy is derived for). A wider bundle, a single-slab head
-    /// dim, or a dense o_proj keeps the shipped emission byte-for-byte.
-    pub headmajor_handoff: bool,
-    /// The o matmul's weight tid — the MatmulTile found by DATAFLOW (its A operand is an attention
-    /// output), stated per bundle so the matmul door's swap keys on the OPERAND's identity and
-    /// never on a shape: at `k == n` (granite-3.1-8b's `[4096, 4096]` o_proj) the extents cannot
-    /// tell the o matmul from any other square projection, and a shape-keyed swap would re-point
-    /// every square projection at the permuted copy. `None` when the graph's attention has no
-    /// matmul consumer (nothing to swap; the handoff above is `false` with it).
-    pub oproj_wtid: Option<u32>,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -232,39 +175,13 @@ pub fn lower(
         // ⭐ THE WALK PROVES WHAT THIS ARM HARDCODED. The per-`Program` matmul entry assumed
         // `TransposeB` and `OperandOrigin::Staged`; the walk reads the orientation off the op's own
         // `indexing_maps` (`whole_function::matmul_b_orientation`) and states the operands' origin
-        // as windows — the facts the spurious-pad drop in `matmul_oriented` discriminates on. The
-        // head-major swap fact is threaded exactly as before.
-        Program::Matmul => lower_function(
-            k,
-            layout,
-            sym_id_base,
-            // ⭐ THE HEAD-MAJOR SWAP'S DOOR FACT, from the same `BundleAttnParams` the rope/attn
-            // arms read: the o matmul's weight tid, named per bundle by the dataflow walk. Every
-            // other matmul of the bundle (q/k/v, mlp, lm_head) carries a tid the fact does not
-            // name, so it keeps its own staged weight — the swap is keyed on the operand's
-            // identity, never a shape. ⛔ A handoff without an `oproj_wtid` is a malformed bundle
-            // statement — the handoff is minted only where the walk found the o matmul — and a
-            // slab-major finalize with no weight to meet it is refused here, not emitted.
-            match attn_params {
-                Some(p) if p.headmajor_handoff => Some(lk::HeadmajorOproj {
-                    oproj_wtid: p.oproj_wtid.ok_or_else(|| Error {
-                        message: format!(
-                            "{name}: the bundle states the head-major attention finalize but \
-                             names no o_proj weight tid — the handoff is minted only where the \
-                             dataflow walk found the o matmul, so a handoff without one is a \
-                             malformed bundle statement",
-                        ),
-                    })?,
-                }),
-                _ => None,
-            },
-        ),
+        // as windows — the facts the spurious-pad drop in `matmul_oriented` discriminates on.
+        Program::Matmul => lower_function(k, layout, sym_id_base, None),
         // The last-row extraction is a PURE COPY (loads and stores only); the walk's own LmLast
         // arm keys on the stated `Program` and refuses a copy that grew a compute op rather than
         // half-lowering it.
         Program::LmLast => lower_function(k, layout, sym_id_base, None),
         Program::Rope => rope(name, &r, sym_id_base, layout, attn_params),
-        Program::Attn => attn(name, k, &r, sym_id_base, layout, attn_params),
         // ⭐ NO DOOR TO CROSS. A transpose's descriptor is parameterised by the two extents its own
         // program states and by nothing about the model, so the arm is the body — unlike `rope`/`attn`
         // above, whose head geometry has to become const generics on this side.
@@ -283,142 +200,6 @@ fn windowed(
     let ops = ops?;
     lk::column_windows_are_honoured(name, r, &ops)?;
     Ok(ops)
-}
-
-/// The orphan-rule carrier for [`lk::AttnAt`] — see the module header.
-struct AttnAt<'a>(lk::AttnAt<'a>);
-
-impl scratchy_subtile::model_geometry::OnAttnGeometry for AttnAt<'_> {
-    type Out = Result<Vec<EmittedOp>, Error>;
-    fn on_geometry<const NQH: u32, const NKVH: u32, const HD: u32>(
-        self,
-        geom: scratchy_subtile::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
-    ) -> Self::Out {
-        attn_at::<NQH, NKVH, HD>(self.0, geom)
-    }
-}
-
-/// ⭐ THE DOOR. main's `lower_attn_node` read its cache identity off `node.inputs` and `ir.tensors`,
-/// its geometry and multiplier off the node's `SubOp`, and `active_cap`/`rows_are_requests` off its
-/// call site. The cache identity and multiplier the PROGRAM states, so `attn_at` reads them there
-/// (`attn_operands`); the row kind is [`BundleAttnParams`], main's own walk parameter, stated for
-/// this bundle by the caller. `mq` is `q`'s own view's row count, which is what main's `TileOp` `mb`
-/// dim was.
-///
-/// ⭐⭐ THE GEOMETRY IS MINTED HERE, OFF THE PROGRAM'S OWN VIEWS. It used to ride the bundle as one
-/// `SubOp::AttnDecode { geom }` per expansion — sound only while one model had one attention class.
-/// Gemma-4's layers alternate a SLIDING class (nqh=16, nkvh=8, hd=256) with a GLOBAL one
-/// (nqh=16, nkvh=1, hd=512), so one graph carries two and no per-bundle value describes both. The
-/// program states its own: `q`'s view is `[mq, nqh·hd]`, a kv stream's is `[·, nkvh·hd]`, and the
-/// first access tile over `q` is `hd` wide — the same three readings `attn_operands` already makes
-/// under a caller-stated geometry, so minting from them is not a new derivation but the existing one
-/// with its input source moved. The GQA divisibility proof is spent at the same `mint` it always
-/// was; a program whose views do not divide is a build error naming them.
-fn attn(
-    name: &str,
-    k: &KtirNode,
-    r: &[Region],
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-    attn_params: Option<BundleAttnParams>,
-) -> Result<Vec<EmittedOp>, Error> {
-    let p = attn_params.ok_or_else(|| Error {
-        message: format!(
-            "{name}: an attention program reached the lowering with no `BundleAttnParams`. Its row \
-             kind is this bundle's (main's own walk parameter — whether its rows are separate \
-             requests or one prompt's positions) and no KTIR states it, so the caller must state it \
-             at the door."
-        ),
-    })?;
-    // ── THE PROGRAM'S OWN GEOMETRY ── `q` is parameter 0 (checked against the store order in
-    // `attn_operands`); a kv stream is the first K view after `q`/`out`; the head dim is the first
-    // access tile's width over `q` — the tile whose corner is `arith.constant` at decode and
-    // `pid·hd` at prefill, so the TILE's own Shape is the one reading that holds at both.
-    let q = r.first().ok_or_else(|| Error {
-        message: format!(
-            "{name}: an attention program states {} parameter(s); its construction mints at least \
-             six (q, out, and each segment's K then V)",
-            r.len()
-        ),
-    })?;
-    let kv_cols = {
-        // The runtime length mask is a SYNTHETIC parameter (`[1, cap]`) that `KtirFunc::attn` mints
-        // between `out` and the segments — `attn_operands` filters it by `k.mask`, and so does this
-        // reading, or the mask's capacity would be read as a kv stream's width.
-        let mask_tid = k.mask.map(|b| b.get());
-        r.iter().skip(2).find_map(|x| {
-            (x.tid != q.tid && Some(x.tid) != mask_tid && !x.is_out).then_some(x.v_cols)
-        })
-    };
-    let (Some(q_cols), Some(kv_cols), Some((_, hd))) = (
-        Some(q.v_cols),
-        kv_cols,
-        lk::param_first_tile(&k.func, &k.func.arguments[0].0),
-    ) else {
-        return Err(Error {
-            message: format!(
-                "{name}: the program does not state a complete geometry — `q`'s view is \
-                 `[{}, ·]`, a kv stream is {} wide, and `q`'s first access tile is {} — one of the \
-                 three is absent, so the head counts this door needs cannot be read off it",
-                q.v_rows,
-                kv_cols
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "missing".into()),
-                lk::param_first_tile(&k.func, &k.func.arguments[0].0)
-                    .map(|(_, c)| c.to_string())
-                    .unwrap_or_else(|| "absent".into()),
-            ),
-        });
-    };
-    if hd == 0 || q_cols % hd != 0 || kv_cols % hd != 0 {
-        return Err(Error {
-            message: format!(
-                "{name}: the program's own views do not divide into a geometry — `q` is {q_cols} \
-                 wide, a kv stream {kv_cols}, the head-dim window {hd}; a head must tile both \
-                 widths exactly or no GQA grouping exists"
-            ),
-        });
-    }
-    let geom = scratchy_subtile::model_geometry::ModelAttnGeometry::mint(
-        scratchy_subtile::model_geometry::QueryHeads::new(q_cols / hd),
-        scratchy_subtile::model_geometry::KvHeads::new(kv_cols / hd),
-        scratchy_subtile::model_geometry::HeadDim::new(hd),
-    )
-    .ok_or_else(|| Error {
-        message: format!(
-            "{name}: the geometry read off the program's views (nqh={}, nkvh={}, head_dim={hd}) has \
-             no GQA grouping — the kv-head count does not divide the query-head count, so \
-             `AttnGeometry` cannot be named at it",
-            q_cols / hd,
-            kv_cols / hd,
-        ),
-    })?;
-    // ⭐⭐ THE ONE PLACE THE MODEL'S HEAD GEOMETRY STOPS BEING VALUES for the attention path — the SAME
-    // door `lower_one_node` crossed, now crossed with the geometry the program itself states.
-    scratchy_subtile::model_geometry::with_config_attn_geometry(
-        geom,
-        AttnAt(lk::AttnAt {
-            name,
-            k,
-            r,
-            rows_are_requests: p.rows_are_requests,
-            gathers_kv: p.gathers_kv,
-            chunk_pages: p.chunk_pages,
-            scale_in_weights: p.scale_in_weights,
-            headmajor_handoff: p.headmajor_handoff,
-            sym_id_base,
-            layout,
-        }),
-    )
-    .ok_or_else(|| Error {
-        message: format!(
-            "{name}: AttnDecode geometry ({geom}) has no const-generic instantiation. The head counts and \
-             the head dim parameterise the device layout (GQA grouping, slabs, head strides), so \
-             they must be consts, not values. The instantiations are read from the model configs in \
-             scope ({}); this geometry belongs to none of them.",
-            scratchy_subtile::model_geometry::geometry_sources(),
-        ),
-    })?
 }
 
 /// The orphan-rule carrier for [`lk::RopeAt`] — see the module header.

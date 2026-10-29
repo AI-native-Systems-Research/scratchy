@@ -412,7 +412,6 @@ fn program_kind_tokens(
         Program::Sample => quote! { __KProgram::Sample },
         Program::LmLast => quote! { __KProgram::LmLast },
         Program::Rope => quote! { __KProgram::Rope },
-        Program::Attn => quote! { __KProgram::Attn },
         Program::PagedAttn => quote! { __KProgram::PagedAttn },
         Program::PagedKvWrite => quote! { __KProgram::PagedKvWrite },
         Program::Transpose => quote! { __KProgram::Transpose },
