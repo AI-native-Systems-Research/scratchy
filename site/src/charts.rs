@@ -101,10 +101,12 @@ impl Better {
     }
 }
 
-/// A series' colour, fixed per role: the first three of Carbon's categorical
-/// palette, in its order, white's on white and g100's on g100 (purple 70 /
-/// 60, cyan 50 / 40, teal 70 / 60). A previous run is a grey nearer the page
-/// than the series, so it reads as behind.
+/// A series' colour, fixed per role: Carbon's categorical palette in its
+/// order, white's on white and g100's on g100, less its cyan (purple 70 / 60,
+/// teal 70 / 60, magenta 70 / 40). Cyan is the heat maps' "scratchy faster",
+/// which fills the gap between scratchy's line and its rival's, so no line is
+/// cyan. A previous run is a grey nearer the page than the series, so it reads
+/// as behind.
 pub fn colour(class: &str) -> Themed {
     match class {
         "s1" => Themed {
@@ -112,12 +114,12 @@ pub fn colour(class: &str) -> Themed {
             dark: "#8a3ffc",
         },
         "s2" => Themed {
-            light: "#1192e8",
-            dark: "#33b1ff",
-        },
-        "s3" => Themed {
             light: "#005d5d",
             dark: "#007d79",
+        },
+        "s3" => Themed {
+            light: "#9f1853",
+            dark: "#ff7eb6",
         },
         _ => Ramp::Gray.at::<40>(),
     }

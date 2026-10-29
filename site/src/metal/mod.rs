@@ -1833,16 +1833,7 @@ impl<'a> Latency<'a> {
     /// cell's own ranges ([`Axes2::Own`]) or on `span`, its small multiple's ([`Axes2::Same`]).
     /// Requests an engine landed within one dot of each other are one bubble, its area their
     /// count, so a batch's identical TTFTs show as the crowd they are, not as one dot.
-    /// Bare, no axis titles or tick labels: a panel of a dense grid, its axes the grid's to say.
-    fn chart(
-        &self,
-        k: CellKey,
-        span: Span,
-        axes: Axes2,
-        side: Px,
-        bare: bool,
-        label: &str,
-    ) -> Element {
+    fn chart(&self, k: CellKey, span: Span, axes: Axes2, side: Px, label: &str) -> Element {
         let Some(own) = self.span(&[k]) else {
             return rsx! {};
         };
@@ -1850,16 +1841,15 @@ impl<'a> Latency<'a> {
             Axes2::Own => own,
             Axes2::Same => span,
         };
-        let unit_radius = if bare { 2.5 } else { 3.5 };
+        let unit_radius = 3.5;
         let data = bubbles(&self.requests(k), (ttft, tpot), side, unit_radius);
         let axis = |maps_to, title, scale_type, domain| Axis {
             maps_to,
-            // Kept on a bare chart's hidden axes: Carbon's tooltip names each timing by it.
             title,
             scale_type,
             ticks: None,
             include_zero: Some(false),
-            visible: bare.then_some(false),
+            visible: None,
             domain: Some(AxisDomain::Values(domain)),
         };
         let spec = Chart::Bubble {
@@ -1895,13 +1885,11 @@ impl<'a> Latency<'a> {
         };
         // Its title inside its plot, top left, letting the pointer through to the dots under it.
         let (u, o, i) = k;
-        let size = if bare { "0.625rem" } else { "0.75rem" };
-        let inset = if bare { "2px 4px" } else { "4px 0 0 3.5rem" };
         rsx! {
             div { style: "position: relative; width: {side}",
                 {chart(&spec, label, &format!("width: {side}"), None)}
-                span { style: "position: absolute; top: 0; left: 0; padding: {inset}; font-size: {size}; pointer-events: none",
-                    if bare { "{i}·×{u}" } else { "{i} in, {o} out, {u} at once" }
+                span { style: "position: absolute; top: 0; left: 0; padding: 4px 0 0 3.5rem; font-size: 0.75rem; pointer-events: none",
+                    "{i} in, {o} out, {u} at once"
                 }
             }
         }
@@ -1931,7 +1919,9 @@ impl Latency<'_> {
         else {
             return rsx! {};
         };
-        let pad = ((hi - lo) / 20.0).max(f64::EPSILON);
+        // A twentieth of the range either side; where every request took the same time, a
+        // twentieth of that time (at least 1 ms), so the range never closes.
+        let pad = if hi > lo { hi - lo } else { hi.abs().max(1.0) } / 20.0;
         let end = hi + pad;
         let point = |group, key, value: f64| SparkPoint {
             group,
@@ -2267,7 +2257,7 @@ fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
             |(u, o, i)| {
                 let about =
                     format!("TTFT against TPOT, every request, {i} in {o} out {u} at once, {mid}");
-                l.chart((u, o, i), span, axes, PANEL_SIDE, false, &about)
+                l.chart((u, o, i), span, axes, PANEL_SIDE, &about)
             },
         )
     };

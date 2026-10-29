@@ -1,7 +1,8 @@
 // Ties a content switcher or tabs to the address, and lays full-width line tabs
 // out: a hash naming one of its panels selects it (on load, and when the hash
-// changes), and choosing a panel puts its id in the address to link to. replaceState, not a new entry or a
-// jump. Carbon keeps no address of its own. Runs right after its switcher,
+// changes), and choosing a panel puts its id in the address to link to.
+// replaceState, not a new entry or a jump. Carbon keeps no address of its
+// own. Runs right after its switcher,
 // before Carbon has upgraded it: a `value` set then loses to the item rendered
 // selected, so the hash waits until the switcher has first rendered.
 (function (switcher) {
