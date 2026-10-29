@@ -35,7 +35,9 @@ use scratchy_forward_compiler::{
     ArchLoad, HfFingerprint, ScratchyWeights, hash_json_value, try_load,
 };
 use scratchy_target_metal::gdn_state::{GDN_SSM_STATE_DTYPE, GdnSeqSlots, GdnSlot, GdnStatePool};
-use scratchy_target_metal::interpreter::metal::{BLOCKS_PER_CHUNK, MetalDtype, MetalRungs};
+use scratchy_target_metal::interpreter::metal::{
+    BLOCKS_PER_CHUNK, MetalDtype, MetalRungs, TerminalReads,
+};
 use scratchy_target_metal::kv_cache::KvCachePool;
 use scratchy_target_metal::sparse_kv::{KvMapper, SparseStores};
 use scratchy_target_metal::weights::GpuWeights;
@@ -224,6 +226,8 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
     let device = Arc::new(metal.device.clone());
     let allocator = MetalAllocator::new((*device).clone());
     let mut gpu = GpuDevice::new(device.clone(), Arc::new(allocator.clone()));
+    // `run_step` reads each step's logits on the host, so the terminal slots stay shared.
+    gpu.terminal_reads = TerminalReads::Host;
     let mut weights = GpuWeights::from_dir(&dir, allocator).expect("GpuWeights::from_dir");
     weights.set_target_dtype(DType::BF16);
 
