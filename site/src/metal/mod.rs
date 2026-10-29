@@ -3791,7 +3791,7 @@ mod tests {
         let runs: Vec<Run> = [
             base,
             old("apple-m3-pro-2026-10-21T145041Z-a7820fbc.json"),
-            read("apple-m4-max-2026-10-13T221900Z-2683d8c3.json"),
+            old("apple-m4-max-2026-10-13T221900Z-2683d8c3.json"),
             read("apple-m5-max-2026-10-14T111352Z-987b06a2.json"),
         ]
         .into_iter()
