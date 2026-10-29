@@ -1023,9 +1023,9 @@ pub fn compile_carrier(
             // symbol arms). Two variants with identical bounds but
             // drifted specs (qwen2-vl-2b-instruct vs the
             // mlx_vlm-repacked qwen2-vl-2b-mlx) MUST NOT share a
-            // canonical — folding them emits conflicting
-            // `VisionArchWeights` impls (E0119) or, worse, one
-            // variant silently loading the other's paths.
+            // canonical — a shim takes its canonical's loader and
+            // vision glue, so folding them would have one variant
+            // silently loading the other's paths.
             parts.push(format!("a:{:?}", self.model.arch));
             parts.push(dedup_quant_sig(
                 self.model.quantization.as_ref().map(|qc| &qc.method),
