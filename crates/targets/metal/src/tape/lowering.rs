@@ -9906,8 +9906,9 @@ mod tests {
             )
         };
         let kernels = |tape: MetalStepTape, bucket_m| {
-            let lowered = lower_subtile_tape_to_metal(&tape, &tq_consts(), bake_point(bucket_m, None))
-                .expect("lower_subtile_tape_to_metal");
+            let lowered =
+                lower_subtile_tape_to_metal(&tape, &tq_consts(), bake_point(bucket_m, None))
+                    .expect("lower_subtile_tape_to_metal");
             (lowered.commands.iter())
                 .map(|c| c.command.kernel)
                 .filter(|k| {
@@ -9925,7 +9926,11 @@ mod tests {
             KernelId::AttentionDecodeCombine,
         ];
         for bucket_m in [1, 8, 64, SINKS_SPLIT_MAX_BUCKET_M] {
-            assert_eq!(kernels(sinks_tape(rows()), bucket_m), split, "bucket {bucket_m}");
+            assert_eq!(
+                kernels(sinks_tape(rows()), bucket_m),
+                split,
+                "bucket {bucket_m}"
+            );
         }
         for bucket_m in [1024, 2048, 4096] {
             assert_eq!(
@@ -9933,7 +9938,11 @@ mod tests {
                 [KernelId::AttentionViaCacheTq],
                 "bucket {bucket_m}"
             );
-            assert_eq!(kernels(row_tape(rows()), bucket_m), split, "no sinks, bucket {bucket_m}");
+            assert_eq!(
+                kernels(row_tape(rows()), bucket_m),
+                split,
+                "no sinks, bucket {bucket_m}"
+            );
         }
     }
 
