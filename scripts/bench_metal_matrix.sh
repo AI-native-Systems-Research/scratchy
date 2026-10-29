@@ -749,19 +749,21 @@ fold_power() { # stop the sampler and fold its CSV into the run JSON, once
     python3 - "${JSON}" "${POWER_LOG}" <<'PY'
 import csv, json, sys
 js, power_log = sys.argv[1], sys.argv[2]
-rows = [r for r in csv.reader(open(power_log)) if len(r) == 4]
-cpu = sum(float(r[1]) for r in rows)
-gpu = sum(float(r[2]) for r in rows)
-ane = sum(float(r[3]) for r in rows)
-t0, t1 = float(rows[0][0]), float(rows[-1][0])
-window = t1 - t0
-# Peak power: the highest single interval's energy over its own duration.
-peak = max((float(r[1]) + float(r[2]) + float(r[3])) / max(float(rows[i + 1][0]) - float(rows[i][0]), 1e-9)
-           for i, r in enumerate(rows[:-1])) if len(rows) > 1 else 0.0
+# A row: unix_s, interval_s, cpu_j, gpu_j, ane_j, the interval that ended at unix_s.
+rows = [[float(x) for x in r] for r in csv.reader(open(power_log)) if len(r) == 5]
+cpu = sum(r[2] for r in rows)
+gpu = sum(r[3] for r in rows)
+ane = sum(r[4] for r in rows)
+window = sum(r[1] for r in rows)
+# Peak power: the highest single interval's energy over that interval's own length.
+peak = max((r[2] + r[3] + r[4]) / r[1] for r in rows if r[1] > 0)
+# soc: CPU + GPU + ANE, the rails every reader has; DRAM and display are not in it.
 soc = cpu + gpu + ane
+reader = next((l.split("energy from ", 1)[1].strip() for l in open(power_log.replace("power.csv", "power-sampler.log"))
+               if "energy from " in l), "unknown")
 d = json.load(open(js))
 d["power"] = {
-    "source": "scratchy-power-sampler (Apple CLPC energy counters, IOReport)",
+    "source": f"scratchy-power-sampler ({reader})",
     "csv": power_log,
     "samples": len(rows),
     "window_s": round(window, 1),
@@ -775,8 +777,13 @@ print(f"power   : {soc / 3600:.2f} Wh soc ({cpu / 3600:.2f} cpu, {gpu / 3600:.2f
       f" over {window:.0f}s, peak {peak:.1f} W -> {js}")
 PY
 }
-cargo build --release -p scratchy-power-sampler >"${RAW}/power-build.log" 2>&1 \
-    || die "scratchy-power-sampler build failed: see ${RAW}/power-build.log"
+if (( SKIP_BUILD )); then
+    [[ -x "${ROOT}/target/release/scratchy-power-sampler" ]] \
+        || die "--skip-build, but there is no target/release/scratchy-power-sampler to run"
+else
+    cargo build --release -p scratchy-power-sampler >"${RAW}/power-build.log" 2>&1 \
+        || die "scratchy-power-sampler build failed: see ${RAW}/power-build.log"
+fi
 "${ROOT}/target/release/scratchy-power-sampler" --interval-ms 1000 \
     >"${POWER_LOG}" 2>"${RAW}/power-sampler.log" &
 POWER_PID=$!

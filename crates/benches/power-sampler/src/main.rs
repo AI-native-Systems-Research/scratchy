@@ -3,7 +3,9 @@
 //! Reads Apple's IOReport (no root, nothing third-party) and prints one CSV
 //! line per interval to stdout until SIGINT/SIGTERM:
 //!
-//!     unix_seconds,cpu_j,gpu_j,ane_j
+//!     unix_seconds,interval_s,cpu_j,gpu_j,ane_j
+//!
+//! Each line is the interval that ended at its timestamp, `interval_s` long.
 //!
 //! Modes:
 //!   (no args)          sample and print CSV
@@ -723,13 +725,17 @@ fn sample_csv(
     }
     let mut checked = false;
     let mut written = 0u64;
+    let mut prev_at = std::time::Instant::now();
     while samples.is_none_or(|n| written < n) {
         sleep(Duration::from_millis(interval_ms));
         let next = unsafe { ffi::IOReportCreateSamples(subs, subscribed, std::ptr::null()) };
+        let next_at = std::time::Instant::now();
+        let interval_s = next_at.duration_since(prev_at).as_secs_f64();
+        prev_at = next_at;
         let delta = unsafe { ffi::IOReportCreateSamplesDelta(prev, next, std::ptr::null()) };
         prev = next;
 
-        // One CSV line: unix_seconds,cpu_j,gpu_j,ane_j. CLPC counters are
+        // One CSV line: unix_seconds,interval_s,cpu_j,gpu_j,ane_j. CLPC counters are
         // nJ over the interval; global power channels are mW, integrated
         // over the interval. Rail by channel name.
         let mut clpc = [0.0f64; 3];
@@ -798,7 +804,10 @@ fn sample_csv(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
-        println!("{now:.3},{:.3},{:.3},{:.3}", out[0], out[1], out[2]);
+        println!(
+            "{now:.3},{interval_s:.3},{:.3},{:.3},{:.3}",
+            out[0], out[1], out[2]
+        );
         written += 1;
     }
 }

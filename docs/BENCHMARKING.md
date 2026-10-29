@@ -133,8 +133,9 @@ nothing is self-reported.
   IOReport energy counters (no root, no third-party tool),
   sampled at 1 Hz from before the first build to after the last server is
   down, so the number covers everything the run cost — the same window for
-  every engine. Reported per rail (`cpu_j`, `gpu_j`, `ane_j`) and for the SoC
-  total (`soc_j`, `soc_wh`, `soc_avg_w`, `soc_peak_w`). On macOS 27 it reads
+  every engine. Reported per rail (`cpu_j`, `gpu_j`, `ane_j`) and as their
+  sum (`soc_j`, `soc_wh`, `soc_avg_w`, `soc_peak_w`): CPU + GPU + ANE, the
+  rails every reader has. DRAM and display are not in it. On macOS 27 it reads
   the CLPC counters (cumulative nJ, per-chip-driver ids), because there the
   "Energy Model" group's `CPU Energy` channel reads 0 under load; on every
   other release it reads the "Energy Model" group's `CPU Energy`, `GPU Energy`
