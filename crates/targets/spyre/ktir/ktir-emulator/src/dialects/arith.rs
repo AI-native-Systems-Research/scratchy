@@ -608,9 +608,9 @@ fn extf(
     // tables a bundle binds are EMITTED in that arrangement, so an emulator
     // that relabels without permuting reads them at wrong lanes — the W=1 pick
     // flip (golden 12040, emulator 12048: the ramp's lane 16 read at lane 8's
-    // buffer, Δ8 exactly). The arrangement is read from the same table the
-    // bake reads, never re-derived here: the row says `Standard`, nothing
-    // permutes.
+    // buffer, Δ8 exactly). Whether this widen permutes is
+    // `ConvertModel::widen_staggers`'s answer, the same one the fused Metal map
+    // kernel takes; the arrangement comes from the table the bake reads.
     //
     // ⭐ WHICH runs permute is a MODE, not a set (auditor ruling 2026-10-27):
     // the bake maps the pair 1:1 to `dl16tofp32` and refuses a staggered input
@@ -621,16 +621,11 @@ fn extf(
     // direct-dispatch paths), which stays IEEE — the vendor oracle's own
     // semantics.
     let v = unary_operand(op, ctx, "arith.extf")?;
-    let out_f32 = op.result_type.and_then(|t| t.elem()) == Some(DType::F32);
+    let to = op.result_type.and_then(|t| t.elem());
     match v {
         Value::Tile(t) => {
             let data = t.as_f32().to_vec();
-            let data = if out_f32
-                && t.dtype == DType::F16
-                && env.convert_model == crate::env::ConvertModel::Card
-                && ktir_superdsc::element_arrangement::output_arrangement_of("dl16tofp32")
-                    == Some(ktir_superdsc::element_arrangement::ElementArrangement::Dl16ToFp32)
-            {
+            let data = if env.convert_model.widen_staggers(Some(t.dtype), to) {
                 ktir_superdsc::element_arrangement::dl16tofp32_stagger(&data)
             } else {
                 data

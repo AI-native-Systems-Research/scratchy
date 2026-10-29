@@ -111,6 +111,10 @@ path = "tests/port_lx_scoping.rs"
 name = "port_ops"
 path = "tests/port_ops.rs"
 
+[[test]]
+name = "sampler_on_emulator"
+path = "tests/sampler_on_emulator.rs"
+
 [[bench]]
 name = "smollm2_bench"
 path = "benches/smollm2_bench.rs"
