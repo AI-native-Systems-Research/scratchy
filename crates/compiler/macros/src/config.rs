@@ -549,6 +549,7 @@ fn load_dir_mode(
         ("locateanything-3b", "locateanything"),
         ("qwen3.5-9b", "qwen3-5-vl"),
         ("qwen3.6-27b", "qwen3-5-vl"),
+        ("qwen3.8-27b", "qwen3-5-vl"),
         ("gemma-3-12b-it", "gemma3-mm"),
         ("gemma-3-27b-it", "gemma3-mm"),
         ("gemma-3-4b-it", "gemma3-mm"),

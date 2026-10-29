@@ -35,7 +35,9 @@ use scratchy_forward_compiler::{
     ArchLoad, HfFingerprint, ScratchyWeights, hash_json_value, try_load,
 };
 use scratchy_target_metal::gdn_state::{GDN_SSM_STATE_DTYPE, GdnSeqSlots, GdnSlot, GdnStatePool};
-use scratchy_target_metal::interpreter::metal::{BLOCKS_PER_CHUNK, MetalDtype, MetalRungs};
+use scratchy_target_metal::interpreter::metal::{
+    BLOCKS_PER_CHUNK, MetalDtype, MetalRungs, TerminalReads,
+};
 use scratchy_target_metal::kv_cache::KvCachePool;
 use scratchy_target_metal::sparse_kv::{KvMapper, SparseStores};
 use scratchy_target_metal::weights::GpuWeights;
@@ -224,6 +226,8 @@ fn load(repo: &str, bucket_cap: u32) -> Loaded {
     let device = Arc::new(metal.device.clone());
     let allocator = MetalAllocator::new((*device).clone());
     let mut gpu = GpuDevice::new(device.clone(), Arc::new(allocator.clone()));
+    // `run_step` reads each step's logits on the host, so the terminal slots stay shared.
+    gpu.terminal_reads = TerminalReads::Host;
     let mut weights = GpuWeights::from_dir(&dir, allocator).expect("GpuWeights::from_dir");
     weights.set_target_dtype(DType::BF16);
 
@@ -764,6 +768,8 @@ o2_cases! {
     "qwen3.6-35b-a3b" => o2_qwen3_6_35b_a3b_mlx("mlx-community/Qwen3.6-35B-A3B-4bit", Sampled);
     "qwen2.5-7b" => o2_qwen2_5_7b_mlx_qembed("mlx-community/Qwen2.5-7B-Instruct-4bit", Sampled);
     "qwen2-vl-2b-mlx-text-only" => o2_qwen2_vl_2b_text_mlx_qembed("mlx-community/Qwen2-VL-2B-Instruct-4bit", Sampled);
+    // The 27B dense geometry: 3 GDN value heads per key head, 6 query heads per KV head.
+    "qwen3.8-27b-text-only" => o2_qwen3_8_27b_text_mlx_qembed("mlx-community/qwen3.8-27b-4bit", Sampled);
     "granite-4.1-3b" => o2_granite_4_1_3b_mlx_g32("mlx-community/granite-4.1-3b-4bit", Sampled);
     // mlx-affine-b3-g64-qembed: GLM-4.5-Air — first 3-bit checkpoint, first
     // dense-router (no scales sibling) + sigmoid-bias (noaux_tc) MoE, first

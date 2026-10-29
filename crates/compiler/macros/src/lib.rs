@@ -1023,9 +1023,9 @@ pub fn compile_carrier(
             // symbol arms). Two variants with identical bounds but
             // drifted specs (qwen2-vl-2b-instruct vs the
             // mlx_vlm-repacked qwen2-vl-2b-mlx) MUST NOT share a
-            // canonical — folding them emits conflicting
-            // `VisionArchWeights` impls (E0119) or, worse, one
-            // variant silently loading the other's paths.
+            // canonical — a shim takes its canonical's loader and
+            // vision glue, so folding them would have one variant
+            // silently loading the other's paths.
             parts.push(format!("a:{:?}", self.model.arch));
             parts.push(dedup_quant_sig(
                 self.model.quantization.as_ref().map(|qc| &qc.method),
@@ -1761,7 +1761,9 @@ pub fn compile_carrier(
         // for tp ∈ {1,2,4,8}. Decoder mode emits empty TokenStream.
         // `pixel_pack` is None for arches that use the trait's
         // default (delegating to `VisionConfig::patches_from_normalized_chw`).
-        let vision_glue = if matches!(mode.prelude, classified::Prelude::Vision) {
+        // Canonicals only: a shim's `Weights` IS its canonical's (same dedup signature, so the
+        // same glue byte for byte), and a second impl for that type is E0119.
+        let vision_glue = if is_canonical && matches!(mode.prelude, classified::Prelude::Vision) {
             let processor = args.processor.as_ref().ok_or_else(|| {
                 syn::Error::new(
                     args.span,
