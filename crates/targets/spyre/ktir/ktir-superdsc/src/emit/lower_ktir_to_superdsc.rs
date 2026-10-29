@@ -3599,17 +3599,34 @@ pub fn program_score_scale(f: &IRFunction<'static>) -> Option<f32> {
         .filter(|o| o.op_type == OpKind::LinalgMatmul)
         .filter_map(|o| o.result)
         .collect();
-    f.operations
+    // A multiply by a splatted constant: its result -> the constant.
+    let scaled_by: std::collections::HashMap<Ssa, f64> = f
+        .operations
+        .iter()
+        .filter(|o| o.op_type == OpKind::ArithMulf)
+        .filter_map(|o| Some((o.result?, *splat_of.get(o.operands.get(1)?)?)))
+        .collect();
+    // The SCORES scaled, `(q · kᵀ) * s`: the multiply's left operand is the score matmul.
+    let on_scores = f
+        .operations
         .iter()
         .filter(|o| o.op_type == OpKind::ArithMulf)
         .find_map(|o| {
             let l = o.operands.first()?;
-            let rr = o.operands.get(1)?;
             if !is_matmul.contains(l) {
                 return None;
             }
-            Some(*splat_of.get(rr)? as f32)
-        })
+            Some(*scaled_by.get(&o.result?)? as f32)
+        });
+    // ⭐ OR THE QUERY scaled before the score matmul, `(q * s) · kᵀ` — torch-spyre's spelling
+    // (decompositions.py:2175 scales Q once, outside its KV loop). `(q·s)·kᵀ = (q·kᵀ)·s`, so it is
+    // the same multiplier, read where a matmul takes its LEFT operand from such a multiply.
+    on_scores.or_else(|| {
+        f.operations
+            .iter()
+            .filter(|o| o.op_type == OpKind::LinalgMatmul)
+            .find_map(|o| Some(*scaled_by.get(o.operands.first()?)? as f32))
+    })
 }
 
 /// The CAP a [`Program::TanhSoftCap`](crate::ktir_node::Program::TanhSoftCap)
