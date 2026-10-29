@@ -448,6 +448,11 @@ pub enum AttrKey {
     /// things downstream must multiply by the trip factor. `IntList [num_cores,
     /// work_items]`.
     UnrolledGridLoop,
+    /// `spyre.partition_clones` -- THE STAGING CONTRACT `unroll_grid_positions` mints with
+    /// its clone arguments: which parameter window the host stages at each clone, so a
+    /// launcher (or the emulator harness) can bind them. Decoded by [`PartitionClone::all`];
+    /// never read as a raw list.
+    PartitionClones,
     /// `spyre.canonical_verified` -- DotToLinalg's P1.0 trust tag.
     CanonicalVerified,
     /// `noinline`.
@@ -499,6 +504,7 @@ impl AttrKey {
             Reassociation => "reassociation",
             FoldedGridLoop => "spyre.folded_grid_loop",
             UnrolledGridLoop => "spyre.unrolled_grid_loop",
+            PartitionClones => "spyre.partition_clones",
             CanonicalVerified => "spyre.canonical_verified",
             Noinline => "noinline",
             Predicate => "predicate",
@@ -537,6 +543,7 @@ impl AttrKey {
             "reassociation" => Reassociation,
             "spyre.folded_grid_loop" => FoldedGridLoop,
             "spyre.unrolled_grid_loop" => UnrolledGridLoop,
+            "spyre.partition_clones" => PartitionClones,
             "spyre.canonical_verified" => CanonicalVerified,
             "noinline" => Noinline,
             "predicate" => Predicate,
@@ -657,6 +664,102 @@ impl Attr {
             Attr::Float(f) | Attr::SplatFloat(f) => Some(*f),
             _ => None,
         }
+    }
+}
+
+/// One clone argument of `unroll_grid_positions`' clone protocol: a grid position whose
+/// window of a grid-partitioned parameter sits at a NONZERO row corner reads (or writes)
+/// it through a fresh function argument instead, with the tile rebased to row 0. The
+/// host stages `param`'s rows `[row_corner, row_corner + rows)` at the clone's rows
+/// `[0, rows)` -- the column window `[col_corner, col_corner + cols)` is NOT rebased, so
+/// it is the same columns on both sides -- and, for a parameter the kernel stores to,
+/// reads that window back out of the clone after the run.
+///
+/// Positions, not SSA names: an argument's position is the identity a launcher binds by,
+/// and `to_ktir_emit::lower` keeps the function's arguments in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PartitionClone {
+    /// The clone's position in the function's argument list.
+    pub clone_arg: usize,
+    /// The position of the kernel parameter it clones.
+    pub param_arg: usize,
+    /// The row the position's window starts at in `param`; it starts at row 0 in the clone.
+    pub row_corner: i64,
+    pub rows: i64,
+    pub col_corner: i64,
+    pub cols: i64,
+}
+
+impl PartitionClone {
+    /// Fields per clone in the `spyre.partition_clones` list.
+    const FIELDS: usize = 6;
+
+    /// The `spyre.partition_clones` payload for `clones`, in the order given.
+    pub fn encode(clones: &[PartitionClone]) -> Attr {
+        Attr::IntList(
+            clones
+                .iter()
+                .flat_map(|c| {
+                    [
+                        c.clone_arg as i64,
+                        c.param_arg as i64,
+                        c.row_corner,
+                        c.rows,
+                        c.col_corner,
+                        c.cols,
+                    ]
+                })
+                .collect(),
+        )
+    }
+
+    /// Every clone `func` records, in argument order -- empty when the clone protocol did
+    /// not fire. A malformed payload is an error, never a shorter list: binding a prefix of
+    /// the clones would leave the rest unstaged and the run would still produce numbers.
+    pub fn all(func: &Op) -> crate::Result<Vec<PartitionClone>> {
+        let Some(attr) = func.attr(&AttrKey::PartitionClones) else {
+            return Ok(Vec::new());
+        };
+        let list = attr.as_int_list().ok_or_else(|| {
+            crate::Refusal::new(
+                "partition_clones",
+                format!("`spyre.partition_clones` is not an int list: {attr:?}"),
+            )
+        })?;
+        let (clones, rest) = list.as_chunks::<{ Self::FIELDS }>();
+        if !rest.is_empty() {
+            return Err(crate::Refusal::new(
+                "partition_clones",
+                format!(
+                    "`spyre.partition_clones` holds {} ints, not a whole number of {}-field clones",
+                    list.len(),
+                    Self::FIELDS
+                ),
+            ));
+        }
+        clones
+            .iter()
+            .map(
+                |c @ &[clone_arg, param_arg, row_corner, rows, col_corner, cols]| {
+                    let pos = |v: i64| {
+                        usize::try_from(v).map_err(|_| {
+                            crate::Refusal::new(
+                                "partition_clones",
+                                format!("negative argument position {v} in {c:?}"),
+                            )
+                        })
+                    };
+                    Ok(PartitionClone {
+                        clone_arg: pos(clone_arg)?,
+                        param_arg: pos(param_arg)?,
+                        row_corner,
+                        rows,
+                        col_corner,
+                        cols,
+                    })
+                },
+            )
+            .collect()
     }
 }
 
