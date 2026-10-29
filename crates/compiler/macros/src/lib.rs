@@ -1761,7 +1761,9 @@ pub fn compile_carrier(
         // for tp ∈ {1,2,4,8}. Decoder mode emits empty TokenStream.
         // `pixel_pack` is None for arches that use the trait's
         // default (delegating to `VisionConfig::patches_from_normalized_chw`).
-        let vision_glue = if matches!(mode.prelude, classified::Prelude::Vision) {
+        // Canonicals only: a shim's `Weights` IS its canonical's (same dedup signature, so the
+        // same glue byte for byte), and a second impl for that type is E0119.
+        let vision_glue = if is_canonical && matches!(mode.prelude, classified::Prelude::Vision) {
             let processor = args.processor.as_ref().ok_or_else(|| {
                 syn::Error::new(
                     args.span,
