@@ -1921,7 +1921,7 @@ impl Latency<'_> {
         };
         // A twentieth of the range either side; where every request took the same time, a
         // twentieth of that time (at least 1 ms), so the range never closes.
-        let pad = if hi > lo { hi - lo } else { hi.abs().max(1.0) } / 20.0;
+        let pad = (if hi > lo { hi - lo } else { hi.abs().max(1.0) }) / 20.0;
         let end = hi + pad;
         let point = |group, key, value: f64| SparkPoint {
             group,
@@ -2207,7 +2207,7 @@ fn latency_legend(engines: &[Engine]) -> Element {
 fn engine_key(e: Engine, class: &str) -> Element {
     rsx! {
         span { style: "display: inline-flex; gap: 0.4rem; align-items: center",
-            span { style: "width: 10px; height: 10px; border-radius: 50%; background: {colour(class).light}" }
+            span { style: "width: 10px; height: 10px; border-radius: 50%; background: {colour(class)}" }
             "{e.label()}"
         }
     }
