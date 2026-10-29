@@ -268,12 +268,12 @@ fn emit_regions(
         // THIRTEEN parameters — lowered from its compiled ops through the
         // whole-function door (`emit_whole`), and a per-`Program` dispatch would be a
         // second, hand-rolled path. Do not add one.
-        Program::Sample => {
+        Program::Sample | Program::PagedAttn | Program::PagedKvWrite => {
             return Err(Error {
                 stage: "program",
                 message: format!(
-                    "{:?} is a thirteen-parameter whole-function body — `emit_whole` is its \
-                     door, and a per-`Program` dispatch would be a second, hand-rolled path",
+                    "{:?} is a whole-function body — `emit_whole` is its door, and a \
+                     per-`Program` dispatch would be a second, hand-rolled path",
                     node.program
                 ),
             });

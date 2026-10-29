@@ -190,6 +190,16 @@ pub fn lower(
         // multiplies over generic ops, whole-tensor at corner 0 (the splice's own
         // region guard refuses a windowed one). No door fact is read off the program.
         Program::Sample => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
+        // ⛔ NOT PORTED: the paged attention's card lowering (its page gathers, several to a
+        // program, and the KV write's scatter) is the card's half of the ladder and does not exist
+        // yet — see `Program::has_card_lowering`. Refused by name, so a card build stops here.
+        Program::PagedAttn | Program::PagedKvWrite => Err(Error {
+            message: format!(
+                "{name}: {:?} has no SuperDSC lowering — the paged attention runs as KTIR on the \
+                 emulator; its card lowering (page gathers and the KV scatter) is not ported",
+                k.program
+            ),
+        }),
         // ⭐ THE CHAINED HEAD'S ROW PRODUCTION — the same no-door-to-cross shape as the
         // transpose: the three legs (slab gather, restickify transpose, row gather) are
         // parameterised by the extents its own regions state. See [`lk::embed_row_gather`]

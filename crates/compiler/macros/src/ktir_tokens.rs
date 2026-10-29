@@ -413,6 +413,8 @@ fn program_kind_tokens(
         Program::LmLast => quote! { __KProgram::LmLast },
         Program::Rope => quote! { __KProgram::Rope },
         Program::Attn => quote! { __KProgram::Attn },
+        Program::PagedAttn => quote! { __KProgram::PagedAttn },
+        Program::PagedKvWrite => quote! { __KProgram::PagedKvWrite },
         Program::Transpose => quote! { __KProgram::Transpose },
         Program::EmbedRowGather { k } => {
             let k = proc_macro2::Literal::u32_unsuffixed(*k);

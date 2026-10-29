@@ -3249,6 +3249,17 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
             seat_vals
         }
     };
+    // ⭐ A SOURCE IS MATERIALIZED AS FAR AS ANY NODE READS IT. A paged KV pool is the model's whole
+    // context, and the step under test reads a few pages of it; the rows past the last one any
+    // node's region reaches are no reader's (`gather` addresses by region), so they are not built.
+    let mut read_rows: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+    for n in &ir.nodes {
+        for r in &n.inputs {
+            let end = r.region.rows.start + r.region.rows.len;
+            let e = read_rows.entry(r.tensor.index()).or_insert(0);
+            *e = (*e).max(end);
+        }
+    }
     let mut src_vals: Vec<Vec<f32>> = (0..nsrc)
         .map(|id| {
             if staged_weight(id) || covering.is_some_and(|c| !c.contains(&(id as u64))) {
@@ -3259,7 +3270,8 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
                 v.clone()
             } else {
                 let t = ir.tensors[id];
-                let n = (t.rows as usize) * (t.cols as usize);
+                let rows = read_rows.get(&id).copied().unwrap_or(t.rows).min(t.rows);
+                let n = (rows as usize) * (t.cols as usize);
                 match rope_table_half.get(&(id as u32)) {
                     Some(&half) => (0..n).map(|j| dbg_synth_val(id, j % half)).collect(),
                     None => (0..n).map(|j| dbg_synth_val(id, j)).collect(),
@@ -4058,6 +4070,14 @@ pub fn write_eval_golden<F: RopeForm>(
 /// — the reference for those families is the next rung, and a silent skip
 /// would be a hole; a panicking one would break every MoE bake that works
 /// today.
+/// The context the gate's decode step attends: past two page boundaries, ending mid-page — every
+/// page-walk law a decode step reads (a table lookup per page, a fully valid page, a partly valid
+/// one, masked pages past it) at a position a request reaches. See the decode golden's view in
+/// [`numeric_gate`].
+#[cfg(feature = "spyre-emu")]
+pub const GATE_DECODE_CONTEXT: u32 =
+    2 * scratchy_triton_splice::PAGE_SLOTS + scratchy_triton_splice::PAGE_SLOTS / 2;
+
 #[cfg(feature = "spyre-emu")]
 pub struct PrefillGate {
     /// The bundle's query-row count — the rung it was baked at.
@@ -4083,6 +4103,9 @@ pub struct GateRung<'a> {
     /// The rung's KV capacity — the decode length mask's width, and the dump's
     /// directory half.
     pub cap: u32,
+    /// The rung's sweep — its paged walk ([`crate::lower_subtile_tape_to_ktir::paged_step_of_ir`]),
+    /// so the gate stages the step against the reach the bundle was baked with.
+    pub active_cap: ActiveCap,
 }
 
 #[cfg(feature = "spyre-emu")]
@@ -4148,10 +4171,54 @@ pub fn numeric_gate<F: RopeForm>(
     // those input regions to 0 rows — a gate-local VIEW of the same IR, never a
     // law change: every other consumer keeps the original, and a bundle whose
     // prefix is live (decode, a prefix-capable rung) never enters this arm.
+    // ── The decode golden: a step at a REAL position, not the cache's last ──
+    // `lower_region` pins a SameForwardRopeAppend prefix at `valid_len - 1` rows, and a paged
+    // bundle's `valid_len` is its pool: the model's whole context. A step there attends every
+    // slot of the pool, which no request reaches before its last token — and which the paged
+    // walk's model-dtype softmax state cannot hold anyway when the keys score alike (the
+    // denominator passes f16's 65504 past that many keys; spyre-inference's own state is the
+    // model dtype too). The gate's decode step is at [`GATE_DECODE_CONTEXT`] instead — past two
+    // page boundaries, ending mid-page — the same kind of gate-local VIEW of the IR as the
+    // prefill's dead prefix: the prefix regions are re-sliced, and the staging follows.
+    let decode_reslice = prefill.is_none()
+        && ir.nodes.iter().any(|n| {
+            matches!(
+                &n.op,
+                SubOp::AttnDecode {
+                    producer:
+                        scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend { .. },
+                    ..
+                }
+            ) && n
+                .inputs
+                .get(1)
+                .is_some_and(|r| r.region.rows.len > GATE_DECODE_CONTEXT)
+        });
     let ir_owned;
-    let ir: &SubtileIR<F> = if prefill.is_some() || trunc.is_some() {
+    let ir: &SubtileIR<F> = if prefill.is_some() || trunc.is_some() || decode_reslice {
         ir_owned = {
             let mut g = ir.clone();
+            if decode_reslice {
+                for n in &mut g.nodes {
+                    if matches!(
+                        &n.op,
+                        SubOp::AttnDecode {
+                            producer:
+                                scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend { .. },
+                            ..
+                        }
+                    ) {
+                        for idx in [1usize, 2usize] {
+                            if let Some(r) = n.inputs.get_mut(idx) {
+                                r.region.rows = scratchy_subtile::subtile_ir::Range::new(
+                                    r.region.rows.start,
+                                    r.region.rows.len.min(GATE_DECODE_CONTEXT),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             if prefill.is_some() {
                 for n in &mut g.nodes {
                     if matches!(
@@ -4359,6 +4426,68 @@ pub fn numeric_gate<F: RopeForm>(
         Some(pg) => staged_rope_rows(ir, &pg.rotary_cos, &pg.rotary_sin)?,
         None => Default::default(),
     };
+    // ⭐ THE PAGED STEP, STAGED BY THE WORKER'S OWN LAW (`crate::paged_step`). The gate's one step
+    // is the reference's own: at decode, the rope-append prefix's rows cached and the new token at
+    // the next position; at a first prompt chunk, nothing cached and `mq` rows from position 0. The
+    // request's blocks run the pool's pages in REVERSE, so the walk reads every page through the
+    // table rather than at its block's own index. The reference attends the cache's token-major
+    // rows; the pools the paged walk reads are those SAME values laid into their pages
+    // (`pool_of_rows`), so the two read one set of keys.
+    let paged = crate::lower_subtile_tape_to_ktir::paged_step_of_ir(ir, rung.active_cap)
+        .map_err(|e| e.0)?;
+    let paged_hd = ir.nodes.iter().find_map(|n| match &n.op {
+        SubOp::AttnDecode { geom, .. } => Some(geom.hd().get() as usize),
+        _ => None,
+    });
+    let pool_tids: std::collections::HashSet<u32> = ir
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.op {
+            SubOp::AttnDecode { .. } if n.inputs.len() >= 3 => Some([
+                n.inputs[1].tensor.index() as u32,
+                n.inputs[2].tensor.index() as u32,
+            ]),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let step_rows = match (prefill, paged) {
+        (Some(pg), _) => crate::paged_step::StepRows {
+            start: 0,
+            real: pg.mq as usize,
+        },
+        (None, Some(p)) => {
+            let cached = ir
+                .nodes
+                .iter()
+                .filter_map(|n| match &n.op {
+                    SubOp::AttnDecode { .. } if n.inputs.len() >= 5 => {
+                        Some(n.inputs[1].region.rows.len as usize)
+                    }
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0);
+            crate::paged_step::StepRows {
+                start: cached.min(p.capacity().saturating_sub(1)),
+                real: 1,
+            }
+        }
+        (None, None) => crate::paged_step::StepRows { start: 0, real: 1 },
+    };
+    // The request's blocks name the pages ONE ON — block `i` is page `i + 1` — so the walk reads
+    // every page through the table rather than at its block's own index, and the pages the step
+    // touches stay at the pool's start (the staging below writes only that prefix).
+    let blocks: Vec<u32> = paged
+        .map(|p| {
+            let need = step_rows.end().div_ceil(p.page_slots as usize) as u32;
+            if need < p.pages {
+                (1..=need).collect()
+            } else {
+                (0..need).collect()
+            }
+        })
+        .unwrap_or_default();
     let mut sources: Vec<(u64, Vec<f32>, Vec<usize>)> = Vec::new();
     for tid in 0..ir.num_sources {
         // The covering slice: a source only the dropped launches read is not
@@ -4373,7 +4502,13 @@ pub fn numeric_gate<F: RopeForm>(
             continue;
         }
         let t = ir.tensors[tid as usize];
-        let n = (t.rows as usize) * (t.cols as usize);
+        // A pool's stimulus is its cached rows alone: the rows past them are no step's, and the
+        // session's own allocation holds them at zero.
+        let n = if pool_tids.contains(&tid) {
+            step_rows.start * t.cols as usize
+        } else {
+            (t.rows as usize) * (t.cols as usize)
+        };
         let vals = if scale_rows.contains(&tid) {
             vec![1.0; n]
         } else if let Some(v) = staged_rope.get(&tid) {
@@ -4385,7 +4520,17 @@ pub fn numeric_gate<F: RopeForm>(
         } else {
             (0..n).map(|j| dbg_synth_val(tid as usize, j)).collect()
         };
-        sources.push((tid as u64, vals, vec![t.rows as usize, t.cols as usize]));
+        match (paged, paged_hd) {
+            (Some(p), Some(hd)) if pool_tids.contains(&tid) => {
+                let pool = crate::paged_step::pool_of_rows(&p, hd, &blocks, &vals, step_rows.start)
+                    .map_err(|e| format!("the gate's pool t{tid}: {e}"))?;
+                if !pool.is_empty() {
+                    let rows = pool.len() / t.cols as usize;
+                    sources.push((tid as u64, pool, vec![rows, t.cols as usize]));
+                }
+            }
+            _ => sources.push((tid as u64, vals, vec![t.rows as usize, t.cols as usize])),
+        }
     }
     // The compile-time scalars, at their reserved tids — the reader-side law
     // `scalarmul_scales.json` states (same first-seen non-folded walk).
@@ -4403,62 +4548,17 @@ pub fn numeric_gate<F: RopeForm>(
     for (i, v) in sm.iter().enumerate() {
         sources.push((u64::from(scalarmul_scale_tid(i)), vec![*v], vec![1, 1]));
     }
-    // The length mask: the synthetic one-past-the-graph tid (`BundleWiring`'s
-    // own placement law). ⭐ NOT ALL-VALID — the append slot must stay masked.
-    // A rope-append prefix's IR region is sliced to `valid_len - 1` rows (the
-    // keys BEFORE this token) while the spliced program sweeps the rung and
-    // lets THIS mask bound it; all-valid unmasks the append slot itself and
-    // hands the program one extra key the reference does not attend (its
-    // v-cache row is never written — the fresh v rides the new-v segment —
-    // measured: granite decode diverged at every AttnDecode output by exactly
-    // one synth row's v-mix term at weight 1/257). The reference's own key set
-    // is the region, so the mask keeps exactly its rows valid. Pre-populated
-    // prefixes read their region directly (the mask parameter is truncated
-    // away for them), so a tape with no rope-append prefix keeps the
-    // all-valid default — the bind is then simply unused.
-    if let Some(pg) = prefill {
-        // ⭐ THE PREFILL MASK, BY THE RUNTIME'S OWN LAW: the forward's emu
-        // staging binds a `[mq, mq]` clamped causal triangle — the same two
-        // calls the worker's `forward_chunk` composes (`ChunkRows::row_logical_pos`
-        // over `prefill_causal_col_valid`, the SSOT the one-pass kernel's own
-        // `[MQ, MQ]` mask descriptor states) — at a FULL chunk: every row
-        // real, so the clamp is the identity and the golden, which has no
-        // pad-row law, sees exactly the rows the program reads. ⛔ NOT
-        // `CausalKey::mask`: that is the card's `[mq, mq_pad]` stick-padded
-        // layout — a different tensor than the one-pass kernel consumes.
-        let mq = pg.mq as usize;
-        let chunk = scratchy_subtile::sdsc_abstract::ChunkRows::chunk(
-            std::num::NonZeroU32::new(pg.mq).expect("a prefill rung bakes mq > 1"),
-        );
-        let mut m = vec![0.0f32; mq * mq];
-        for r in 0..mq {
-            let pos = chunk.row_logical_pos(r, mq);
-            for c in 0..mq {
-                if !scratchy_subtile::sdsc_abstract::prefill_causal_col_valid(c, pos) {
-                    m[r * mq + c] = -1.0e38;
-                }
-            }
+    // The paged step's three sources, by the worker's law: the mask stack an f16 source like any
+    // other, the page table and the write rows int32 words on the typed channel (the f16 source
+    // channel would encode them into half the bytes their views span).
+    if let Some(p) = paged {
+        let srcs = crate::paged_step::step_sources(&p, &blocks, &step_rows)
+            .map_err(|e| format!("the gate's paged step: {e}"))?;
+        for (tid, bytes, shape) in srcs.int32 {
+            emu_weights.push((tid as usize, bytes, scratchy_tensors::DType::I32, shape));
         }
-        sources.push((u64::from(ir.tensors.len() as u32), m, vec![mq, mq]));
-    } else {
-        let valid_prefix = ir
-            .nodes
-            .iter()
-            .filter_map(|n| match &n.op {
-                SubOp::AttnDecode {
-                    producer:
-                        scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend { .. },
-                    ..
-                } if n.inputs.len() >= 5 => Some(n.inputs[1].region.rows.len as usize),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(cap as usize);
-        sources.push((
-            u64::from(ir.tensors.len() as u32),
-            crate::manifest::attn_mask_fill(cap as usize, valid_prefix),
-            vec![1, cap as usize],
-        ));
+        let (mask_tid, mask, mask_shape) = srcs.mask;
+        sources.push((u64::from(mask_tid), mask, mask_shape));
     }
     // ── Run the bundle on the emulator ──
     // The golden tids, in the writer's own first-seen order — each with the
@@ -9840,8 +9940,9 @@ mod tests {
         );
         // The wiring builds NO placement — it reads only the registries — so the same fixture
         // wires, and the scalar registry it carries is the pure walk's content.
-        let wiring = crate::lower_subtile_tape_to_ktir::graph_wiring(&ir, &weight_ids)
-            .expect("the wiring is a registry and never runs the budget pass");
+        let wiring =
+            crate::lower_subtile_tape_to_ktir::graph_wiring(&ir, &weight_ids, ActiveCap::FULL)
+                .expect("the wiring is a registry and never runs the budget pass");
         assert_eq!(
             wiring.scalarmul_scales,
             vec![2.0],

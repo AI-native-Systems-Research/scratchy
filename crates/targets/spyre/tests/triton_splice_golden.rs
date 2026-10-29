@@ -1925,13 +1925,14 @@ fn attn_ir(s: AttnShape, scale: f32) -> SubtileIR {
                 rows: new_len,
                 cols: kv_width,
             }, // 4: new_v
+            // The K rotation's tables, at the rotated K's own rows and width.
             scratchy_subtile::subtile_ir::SourceShape {
-                rows: mq,
-                cols: q_width,
+                rows: new_len,
+                cols: kv_width,
             }, // 5: cos
             scratchy_subtile::subtile_ir::SourceShape {
-                rows: mq,
-                cols: q_width,
+                rows: new_len,
+                cols: kv_width,
             }, // 6: sin
         ]
     };
@@ -2068,179 +2069,184 @@ fn the_kv_block_index_moves_no_other_staged_activation() {
 }
 
 #[test]
-fn spliced_attn_lowers_through_the_door() {
+fn the_paged_attention_splices_with_its_contract() {
     for &s in ATTN_SHAPES {
-        // ⛔ ROWS-ARE-REQUESTS IS A DECODE-BUNDLE FACT: the bake states it per
-        // bundle — a decode batch's rows are requests, a prefill chunk's rows are
-        // positions of one sequence. The gate states it the way the bake does:
-        // decode (mq == 1) tries BOTH kinds (the door's GQA-replicate and
-        // kv_block_index arms differ), prefill only `false`.
-        let row_kinds: &[bool] = if s.mq == 1 { &[false, true] } else { &[false] };
-        for &rows_are_requests in row_kinds {
-            // granite's attention_multiplier, the config value (NOT a recomputed 1/sqrt(hd)):
-            // 2b (hd 64) 0.015625, 8b (hd 128) 0.0078125 — the f16-exact ones.
-            let scale = if s.geom.2 == 64 { 0.015625 } else { 0.0078125 };
-            let ir = attn_ir(s, scale);
-            // The weight-id census is EMPTY: every source this fixture declares is an
-            // activation or a KV cache (the layout walk re-places the caches into seg2 itself).
-            let weight_ids: HashSet<u32> = HashSet::new();
-
-            // The layout the tape walk computes for this graph.
-            let layout = compute_bundle_layout(
-                &ir,
-                &weight_ids,
-                rows_are_requests,
-                rows_are_requests,
-                &[],
-            )
-            .unwrap_or_else(|e| {
-                panic!(
-                    "layout minted geom={:?} mq={} cap={} rung={} r_ar={rows_are_requests}: {e}",
-                    s.geom, s.mq, s.cap, s.rung
-                )
-            });
-            let node = ir.nodes.last().unwrap();
-            let cap = ir.tensors[node.inputs[1].tensor.index()].rows;
-
-            // The splice — `lower_attn` compiles attn.py for this node's geometry and rung.
-            let spliced = scratchy_triton_splice::lower_attn(node, &ir, cap, s.active_cap())
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "splice compiled geom={:?} mq={} rung={} r_ar={rows_are_requests}: {e}",
-                        s.geom, s.mq, s.rung
-                    )
-                });
-
-            // ⛔ THE NAME LAW — `attn_s{id}`.
-            assert_eq!(
-                spliced.op_name,
-                format!("attn_s{}", node.id.index()),
-                "op_name (geom={:?} mq={} rung={})",
-                s.geom,
-                s.mq,
-                s.rung
-            );
-
-            // ⛔ THE ARM THE SHAPE TOOK, PINNED BY THE MASK SLOT — at `rung == NONE`
-            // (a first-chunk prefill, no runtime length mask) every `MQ > 1` shape
-            // takes the causal one-pass arm and binds the `[mq, mq]` triangle (a
-            // mask parameter); the per-row continuation arm states causality by
-            // slice and binds none. The mq=7 row pins the FRONT END'S OWN LAW: the
-            // TMA 16-byte floor was a GPU validation removed from this target, so
-            // the ladder's bottom rung takes the one-pass arm exactly as the
-            // builder's did — a re-introduced floor would flip this row. Decode and
-            // continuation shapes bind the runtime length mask instead, so they are
-            // outside this pin.
-            if s.rung == u32::MAX {
-                let ktir = spliced
-                    .ktir
-                    .as_ref()
-                    .expect("spliced op carries its program");
-                let one_pass_mask = ktir.mask.is_some();
-                let want_one_pass = s.mq > 1;
-                assert_eq!(
-                    one_pass_mask, want_one_pass,
-                    "the arm the causal one-pass condition picked (geom={:?} mq={}): \
-                     the mask slot is bound exactly when the one-pass arm runs",
-                    s.geom, s.mq
-                );
-            }
-
-            // The program lowers through the production door under the walk's own
-            // layout, with the bundle facts stated exactly as the tape walk states
-            // them (`attn_at` reads the swept extent, the scale, the span guard and
-            // the row laws off the program).
-            let attn_params = scratchy_target_spyre::ktir_superdsc_door::BundleAttnParams {
-                rows_are_requests,
-                // The production mint's value for a batched-shape fixture with no one-request
-                // rung to widen it: the gather follows the row kind here.
-                gathers_kv: rows_are_requests,
-                chunk_pages: None,
-                // Not in weights: same as the rope door's fixture — the program states its real
-                // scale.
-                scale_in_weights: false,
-                // No handoff: this fixture's attention output is the graph RESULT (no o matmul
-                // consumes it), so the dataflow the handoff keys on finds no edge — stated here
-                // exactly as `attn_bundle_params` would state it for such a graph.
-                headmajor_handoff: false,
-                oproj_wtid: None,
+        let scale = if s.geom.2 == 64 { 0.015625 } else { 0.0078125 };
+        let ir = attn_ir(s, scale);
+        let node = ir.nodes.last().unwrap();
+        let at = format!("geom={:?} mq={} rung={}", s.geom, s.mq, s.rung);
+        let spliced = scratchy_triton_splice::lower_attn(node, &ir, s.active_cap());
+        // ⛔ A PRE-POPULATED CACHE IS REFUSED: the walk reads the step's keys from the pools, and
+        // only this forward's RopeAppend scatters them there.
+        if !s.rope_appended {
+            let Err(e) = spliced else {
+                panic!("{at}: a cache no RopeAppend writes must be refused");
             };
-            let mut sym = 0i64;
-            let _emitted = door_lower(
-                spliced.ktir.as_ref().expect("spliced op carries its program"),
-                &mut sym,
-                Some(&layout),
-                Some(attn_params),
-            )
-            .unwrap_or_else(|e| {
-                panic!(
-                    "spliced program lowered (geom={:?} mq={} rung={} r_ar={rows_are_requests}): {}",
-                    s.geom, s.mq, s.rung, e.message
-                )
-            });
+            assert!(
+                e.contains("not written by this forward's RopeAppend"),
+                "{at}: {e}"
+            );
+            continue;
         }
+        let spliced = spliced.unwrap_or_else(|e| panic!("splice compiled {at}: {e}"));
+        // ⛔ THE NAME LAW — `attn_s{id}`.
+        assert_eq!(
+            spliced.op_name,
+            format!("attn_s{}", node.id.index()),
+            "{at}"
+        );
+        let k = spliced
+            .ktir
+            .as_ref()
+            .expect("spliced op carries its program");
+        assert_eq!(
+            k.program,
+            ktir_superdsc::ktir_node::Program::PagedAttn,
+            "{at}"
+        );
+        // The walk's order: q, out, K pool, V pool, page table, mask stack — the step's sources at
+        // the ids the one law (`PagedStepTids`) states.
+        let tids = scratchy_triton_splice::PagedStepTids::RESERVED;
+        let bound: Vec<u32> = k.bindings.iter().map(|b| b.get()).collect();
+        assert_eq!(
+            bound,
+            vec![
+                node.inputs[0].tensor.index() as u32,
+                node.output.tensor.index() as u32,
+                node.inputs[1].tensor.index() as u32,
+                node.inputs[2].tensor.index() as u32,
+                tids.page_table,
+                tids.mask,
+            ],
+            "{at}"
+        );
+        assert_eq!(k.mask.map(|m| m.get()), Some(tids.mask), "{at}");
+        // ⛔ THE CARD's HALF IS NOT PORTED, AND SAYS SO: the door refuses the paged program by name.
+        // This assertion is the one to replace when the SuperDSC lowering lands.
+        let mut sym = 0i64;
+        let Err(refused) = door_lower(k, &mut sym, None, None) else {
+            panic!("{at}: the paged attention has no SuperDSC lowering yet, and must say so");
+        };
+        assert!(
+            refused.message.contains("has no SuperDSC lowering"),
+            "{at}: {}",
+            refused.message
+        );
     }
 }
 
-/// ⭐ THE SPLICED ATTENTION, EXECUTED — the numbers half of `attn.py` (torch-spyre's SDPA
-/// decomposition), at every arm the splice takes: decode over the masked swept prefix (the full
-/// sweep and an interior rung, both head dims), decode over a pre-populated unmasked cache, the
-/// first prompt chunk (no prefix, the causal triangle — the one-block arm), and a chunk with a
-/// prefix (the two-block scan with both masks). The REAL program runs through the production
-/// session entry, staged the way the worker stages it, against an f64 softmax over the same bytes.
+/// ⭐ THE PAGED STEP, EXECUTED — the `RopeAppend`'s two programs (the rotation, then the KV write's
+/// scatter into the pools) and the `AttnDecode`'s page walk, the three REAL spliced programs run in
+/// order through the production session entry, staged by the worker's own law
+/// (`scratchy_target_spyre::paged_step`), against an f64 softmax over the same keys: the cached
+/// prefix the pools already hold, and this step's own rows, causally.
 ///
-/// ⛔ AND IT IS THE KERNEL'S OWN OPS THAT RUN. The emulator recognizes attention idioms and
-/// substitutes a native computation (`resident.rs`'s fused decode, `segmented.rs`'s head re-roll
-/// and flash tiling) for a program it can prove is one; each shape asserts none of them claims
-/// this program, so a pass here is the kernel's arithmetic and not the emulator's.
+/// The rotation tables are cos 1 / sin 0, so the rotated K is the K and the reference reads the new
+/// block straight from its sources; the rotation itself has its own goldens. Every step's blocks
+/// are the pool's pages REVERSED, and two shapes run a TWO-PAGE pool, so the walk's pages come
+/// through the table and not at their block's own index.
+///
+/// ⛔ AND IT IS THE KERNEL'S OWN OPS THAT RUN: each shape asserts none of the emulator's native
+/// attention recognizers claims the walk, so a pass here is the kernel's arithmetic.
 #[test]
 #[cfg(feature = "spyre-emu")]
-fn spliced_attn_executes_the_real_program() {
-    for s in [
-        AttnShape {
-            geom: (32, 8, 64),
-            mq: 1,
-            cap: 256,
-            rung: 0,
-            rope_appended: true,
-        },
-        AttnShape {
-            geom: (32, 8, 64),
-            mq: 1,
-            cap: 256,
-            rung: 64,
-            rope_appended: true,
-        },
-        AttnShape {
-            geom: (32, 8, 128),
-            mq: 1,
-            cap: 256,
-            rung: 0,
-            rope_appended: true,
-        },
-        AttnShape {
-            geom: (32, 8, 64),
-            mq: 1,
-            cap: 256,
-            rung: 0,
-            rope_appended: false,
-        },
-        AttnShape {
-            geom: (32, 8, 64),
-            mq: 31,
-            cap: 256,
-            rung: u32::MAX,
-            rope_appended: true,
-        },
-        AttnShape {
-            geom: (32, 8, 64),
-            mq: 31,
-            cap: 256,
-            rung: 0,
-            rope_appended: true,
-        },
+fn spliced_paged_step_executes_the_real_programs() {
+    // (shape, cached positions before the step)
+    for (s, cached) in [
+        // Decode at the one-page bake, 32 cached keys.
+        (
+            AttnShape {
+                geom: (32, 8, 64),
+                mq: 1,
+                cap: 256,
+                rung: 0,
+                rope_appended: true,
+            },
+            32usize,
+        ),
+        // Decode, head dim 128.
+        (
+            AttnShape {
+                geom: (32, 8, 128),
+                mq: 1,
+                cap: 256,
+                rung: 0,
+                rope_appended: true,
+            },
+            100,
+        ),
+        // Decode over a TWO-PAGE pool, the context spanning both pages.
+        (
+            AttnShape {
+                geom: (32, 8, 64),
+                mq: 1,
+                cap: 512,
+                rung: 0,
+                rope_appended: true,
+            },
+            300,
+        ),
+        // Decode at TWO kv heads (qwen2.5-0.5b's attention, 14 query heads): the step's write is
+        // two rows, under Triton's scatter floor of 8, so the KV write runs row by row.
+        (
+            AttnShape {
+                geom: (14, 2, 64),
+                mq: 1,
+                cap: 256,
+                rung: 0,
+                rope_appended: true,
+            },
+            40,
+        ),
+        // The first prompt chunk: nothing cached, 31 rows.
+        (
+            AttnShape {
+                geom: (32, 8, 64),
+                mq: 31,
+                cap: 256,
+                rung: u32::MAX,
+                rope_appended: true,
+            },
+            0,
+        ),
+        // A prompt chunk over a cached prefix.
+        (
+            AttnShape {
+                geom: (32, 8, 64),
+                mq: 31,
+                cap: 256,
+                rung: 0,
+                rope_appended: true,
+            },
+            40,
+        ),
+        // The PREFIX-FREE rung running a chunk over a cached prefix: its walk is the one page its
+        // rows fill, so a chunk whose prefix sits in that page is the rung's to run — the reach law
+        // the worker routes a continuation chunk by (`PagedStep::reach`).
+        (
+            AttnShape {
+                geom: (32, 8, 64),
+                mq: 31,
+                cap: 256,
+                rung: u32::MAX,
+                rope_appended: true,
+            },
+            40,
+        ),
+        // The same over a TWO-PAGE pool: the one-block walk reads the request's first block, which
+        // the reversed table puts on the pool's LAST page.
+        (
+            AttnShape {
+                geom: (32, 8, 64),
+                mq: 31,
+                cap: 512,
+                rung: u32::MAX,
+                rope_appended: true,
+            },
+            100,
+        ),
     ] {
-        execute_one_spliced_attn(s);
+        execute_one_paged_step(s, cached);
     }
 }
 
@@ -2261,140 +2267,129 @@ fn attn_stimulus(n: usize, seed: u64, amp: f32) -> Vec<f32> {
 }
 
 #[cfg(feature = "spyre-emu")]
-fn execute_one_spliced_attn(s: AttnShape) {
+fn execute_one_paged_step(s: AttnShape, cached: usize) {
     use ktir_emulator::ktir_optimizer::{flash_attn, head_rewrite};
+    use scratchy_target_spyre::paged_step::{StepRows, pool_of_rows, step_sources};
     use std::borrow::Cow;
 
     let (nqh, nkvh, hd) = s.geom;
     let scale = if hd == 64 { 0.015625f32 } else { 0.0078125 };
     let ir = attn_ir(s, scale);
-    let node = ir.nodes.last().unwrap();
-    let cache_rows = ir.tensors[node.inputs[1].tensor.index()].rows;
+    let (rope, attn) = (&ir.nodes[0], &ir.nodes[1]);
     let at = format!(
-        "geom={:?} mq={} rung={} rope_appended={}",
-        s.geom, s.mq, s.rung, s.rope_appended
+        "geom={:?} mq={} cap={} cached={cached}",
+        s.geom, s.mq, s.cap
     );
-    let spliced = scratchy_triton_splice::lower_attn(node, &ir, cache_rows, s.active_cap())
-        .unwrap_or_else(|e| panic!("splice compiled {at}: {e}"));
-    let k_node = spliced
+    let mut programs = scratchy_triton_splice::lower_all(rope, &ir, false)
+        .unwrap_or_else(|e| panic!("the RopeAppend spliced {at}: {e}"));
+    programs.push(
+        scratchy_triton_splice::lower_attn(attn, &ir, s.active_cap())
+            .unwrap_or_else(|e| panic!("the walk spliced {at}: {e}")),
+    );
+    assert_eq!(programs.len(), 3, "{at}: rope, KV write, walk");
+    let walk = programs[2]
         .ktir
         .as_ref()
-        .expect("spliced op carries its program");
+        .expect("the walk carries its program");
     assert!(
-        head_rewrite::recognize_head_attention_decode(&k_node.func).is_none()
-            && head_rewrite::recognize_head_attention(&k_node.func).is_none()
-            && flash_attn::recognize_rerolled_attention(&k_node.func).is_none()
-            && flash_attn::recognize_attention(&k_node.func).is_none(),
-        "{at}: an emulator attention recognizer claims the spliced program, so the emulator would \
-         run its own attention in place of the kernel's"
+        head_rewrite::recognize_head_attention_decode(&walk.func).is_none()
+            && head_rewrite::recognize_head_attention(&walk.func).is_none()
+            && flash_attn::recognize_rerolled_attention(&walk.func).is_none()
+            && flash_attn::recognize_attention(&walk.func).is_none(),
+        "{at}: an emulator attention recognizer claims the walk"
     );
-
-    // The program's parameters, by the door's order: q, out, kc, kd, vc, vd, then the mask.
-    let tid = |i: usize| u64::from(k_node.bindings[i].get());
-    let (t_q, t_out, t_kc, t_kd, t_vc, t_vd) = (tid(0), tid(1), tid(2), tid(3), tid(4), tid(5));
-    let t_mask = k_node.mask.map(|m| u64::from(m.get()));
-    let args: Vec<(
-        ktir_core::ir::Ssa,
-        scratchy_target_spyre::bundle_code::PlaceId,
-    )> = k_node
-        .func
-        .arguments
-        .iter()
-        .map(|(ssa, _ty)| {
-            (
-                *ssa,
-                scratchy_target_spyre::bundle_code::PlaceId::Act(k_node.bindings[ssa.slot()].get()),
-            )
+    let t_out = u64::from(walk.bindings[1].get());
+    let groups: Vec<scratchy_target_spyre::bundle_code::LaunchGroup<'static>> = programs
+        .into_iter()
+        .map(|e| {
+            let k = e.ktir.expect("every spliced op carries its program");
+            let args = k
+                .func
+                .arguments
+                .iter()
+                .map(|(ssa, _)| {
+                    (
+                        *ssa,
+                        scratchy_target_spyre::bundle_code::PlaceId::Act(
+                            k.bindings[ssa.slot()].get(),
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>();
+            scratchy_target_spyre::bundle_code::LaunchGroup {
+                kv: Default::default(),
+                programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
+                    func: k.func,
+                    program: k.program,
+                    args: Cow::Owned(args),
+                    lx_pin_window_bytes: Some(0),
+                }]),
+                init_binary: Cow::Borrowed(&[]),
+                job_bin_ptr: 0,
+                correction: Cow::Borrowed(&[]),
+            }
         })
         .collect();
-    let group = scratchy_target_spyre::bundle_code::LaunchGroup {
-        kv: Default::default(),
-        programs: Cow::Owned(vec![scratchy_target_spyre::bundle_code::LaunchProgram {
-            func: k_node.func,
-            program: k_node.program,
-            args: Cow::Owned(args),
-            lx_pin_window_bytes: Some(0),
-        }]),
-        init_binary: Cow::Borrowed(&[]),
-        job_bin_ptr: 0,
-        correction: Cow::Borrowed(&[]),
-    };
 
-    // What the program reads: the prefix rows (the masked prefix sweeps from row 0 to the rung,
-    // a pre-populated one reads its own region), how many of them are valid this step (the
-    // rope-appended prefix holds `ATTN_VALID_LEN - 1` positions; the step's own key is the new
-    // block's), and the new block's rows (the chunk's at `mq > 1`, the step's at decode).
-    let (mq, q_width, kv_width) = (s.mq as usize, (nqh * hd) as usize, (nkvh * hd) as usize);
-    let (prefix_start, prefix_len) = if s.rope_appended {
-        let swept = s
-            .active_cap()
-            .resolve(cache_rows, ktir_superdsc::sdsc_abstract::POOL_STICK);
-        (0usize, swept.min(cache_rows) as usize)
-    } else {
-        let r = node.inputs[1].region.rows;
-        (r.start as usize, r.len as usize)
+    // The step: `cached` keys already in the pools, this step's `mq` rows after them; the request's
+    // blocks are the pool's pages REVERSED.
+    let step =
+        scratchy_target_spyre::lower_subtile_tape_to_ktir::paged_step_of_ir(&ir, s.active_cap())
+            .expect("the paged step derives")
+            .expect("the graph has attention");
+    let mq = s.mq as usize;
+    let rows = StepRows {
+        start: cached,
+        real: mq,
     };
-    let valid_prefix = if s.rope_appended {
-        (ATTN_VALID_LEN - 1) as usize
-    } else {
-        prefix_len
-    };
-    let new_tensor_rows = ir.tensors[node.inputs[3].tensor.index()].rows as usize;
-    let kd_row = node.inputs[3].region.rows.start as usize;
-    let new_rows = if mq > 1 {
-        mq
-    } else {
-        node.inputs[3].region.rows.len as usize
-    };
-    let cap_rows = cache_rows as usize;
-
-    // Scores of a few units, so the softmax is far from uniform and a wrong key set moves the
-    // output by far more than the gate.
+    let blocks: Vec<u32> = (0..step.pages).rev().collect();
+    let (q_width, kv_width, hd) = ((nqh * hd) as usize, (nkvh * hd) as usize, hd as usize);
+    let kc = attn_stimulus(cached * kv_width, 2, 6.0);
+    let vc = attn_stimulus(cached * kv_width, 3, 1.0);
     let q = attn_stimulus(mq * q_width, 1, 6.0);
-    let kc = attn_stimulus(cap_rows * kv_width, 2, 6.0);
-    let vc = attn_stimulus(cap_rows * kv_width, 3, 1.0);
-    let kd = attn_stimulus(new_tensor_rows * kv_width, 4, 6.0);
-    let vd = attn_stimulus(new_tensor_rows * kv_width, 5, 1.0);
-    // The mask the worker stages: prefix columns first, valid up to `valid_prefix`; then the new
-    // block's causal triangle at `mq > 1`. -1e38 narrows to f16 -inf.
-    let neg = -1.0e38f32;
-    let mask_w = prefix_len + if mq > 1 { mq } else { 0 };
-    let mut mask = vec![0.0f32; mq * mask_w];
-    for r in 0..mq {
-        for c in 0..mask_w {
-            let keep = if c < prefix_len {
-                c < valid_prefix
-            } else {
-                c - prefix_len <= r
-            };
-            if !keep {
-                mask[r * mask_w + c] = neg;
-            }
+    let kd = attn_stimulus(mq * kv_width, 4, 6.0);
+    let vd = attn_stimulus(mq * kv_width, 5, 1.0);
+    let src = |i: usize| u64::from(rope.inputs[i].tensor.index() as u32);
+    let srcs = step_sources(&step, &blocks, &rows).unwrap_or_else(|e| panic!("{at}: {e}"));
+    let typed: Vec<(usize, Vec<u8>, scratchy_tensors::DType, Vec<usize>)> = srcs
+        .int32
+        .into_iter()
+        .map(|(tid, bytes, shape)| (tid as usize, bytes, scratchy_tensors::DType::I32, shape))
+        .collect();
+    let (mask_tid, mask, mask_shape) = srcs.mask;
+    let mut sources = vec![
+        (
+            u64::from(attn.inputs[0].tensor.index() as u32),
+            q.clone(),
+            vec![mq, q_width],
+        ),
+        (src(0), kd.clone(), vec![mq, kv_width]),
+        (src(1), vec![1.0; mq * kv_width], vec![mq, kv_width]),
+        (src(2), vec![0.0; mq * kv_width], vec![mq, kv_width]),
+        (src(3), vd.clone(), vec![mq, kv_width]),
+        (u64::from(mask_tid), mask, mask_shape),
+    ];
+    // The pools' cached rows, as the prefix of each pool they land in (`pool_of_rows`); nothing
+    // cached stages nothing, and the session's zeroed allocation is the pool.
+    for (i, cache) in [(4usize, &kc), (5, &vc)] {
+        let pool = pool_of_rows(&step, hd, &blocks, cache, cached).unwrap();
+        if !pool.is_empty() {
+            let rows = pool.len() / kv_width;
+            sources.push((src(i), pool, vec![rows, kv_width]));
         }
     }
-
-    let mut sources = vec![
-        (t_q, q.clone(), vec![mq, q_width]),
-        (t_kc, kc.clone(), vec![cap_rows, kv_width]),
-        (t_vc, vc.clone(), vec![cap_rows, kv_width]),
-        (t_kd, kd.clone(), vec![new_tensor_rows, kv_width]),
-        (t_vd, vd.clone(), vec![new_tensor_rows, kv_width]),
-    ];
-    if let Some(t) = t_mask {
-        sources.push((t, mask.clone(), vec![mq, mask_w]));
-    }
     let mut session =
-        scratchy_target_spyre::runner::SpyreSession::new_multi(&[(&[group], &[t_out])], Vec::new())
-            .expect("build the one-program session");
+        scratchy_target_spyre::runner::SpyreSession::new_multi(&[(&groups, &[t_out])], typed)
+            .unwrap_or_else(|e| panic!("{at}: the session builds: {e}"));
     let out = session
         .run_step(0, sources, &[(t_out, 0)])
-        .unwrap_or_else(|e| panic!("run the spliced attention ({at}): {e}"));
+        .unwrap_or_else(|e| panic!("{at}: the step runs: {e}"));
     let got = &out[&t_out];
     assert_eq!(got.len(), mq * q_width, "{at}");
 
-    // The f64 reference: softmax over exactly the keys the mask leaves, per row and head.
+    // The f64 reference: row r (position cached + r) attends every cached key and the step's own
+    // rows up to itself.
     let group_size = (nqh / nkvh) as usize;
-    let hd = hd as usize;
     let dot = |a: &[f32], b: &[f32]| {
         a.iter()
             .zip(b)
@@ -2407,22 +2402,14 @@ fn execute_one_spliced_attn(s: AttnShape) {
             let kvh = h / group_size;
             let qrow = &q[r * q_width + h * hd..][..hd];
             let mut keys: Vec<(f64, &[f32])> = Vec::new();
-            for j in 0..prefix_len {
-                if t_mask.is_some() && j >= valid_prefix {
-                    continue;
-                }
-                let row = prefix_start + j;
-                let k = &kc[row * kv_width + kvh * hd..][..hd];
-                let v = &vc[row * kv_width + kvh * hd..][..hd];
+            for t in 0..cached {
+                let k = &kc[t * kv_width + kvh * hd..][..hd];
+                let v = &vc[t * kv_width + kvh * hd..][..hd];
                 keys.push((f64::from(scale) * dot(qrow, k), v));
             }
-            for t in 0..new_rows {
-                if mq > 1 && t > r {
-                    continue;
-                }
-                let row = kd_row + t;
-                let k = &kd[row * kv_width + kvh * hd..][..hd];
-                let v = &vd[row * kv_width + kvh * hd..][..hd];
+            for t in 0..=r {
+                let k = &kd[t * kv_width + kvh * hd..][..hd];
+                let v = &vd[t * kv_width + kvh * hd..][..hd];
                 keys.push((f64::from(scale) * dot(qrow, k), v));
             }
             let m = keys
@@ -2440,10 +2427,10 @@ fn execute_one_spliced_attn(s: AttnShape) {
             }
         }
     }
-    println!("  spliced attention {at}: max abs err {max_err:.3e} (gate 0.05)");
+    println!("  paged step {at}: max abs err {max_err:.3e} (gate 0.05)");
     assert!(
         max_err < 0.05,
-        "the REAL spliced attention diverged from the f64 softmax ({at}): max abs err {max_err}"
+        "the REAL paged step diverged from the f64 softmax ({at}): max abs err {max_err}"
     );
 }
 
@@ -2598,7 +2585,7 @@ fn rmsnormunit_ir(m: u32, c: u32) -> SubtileIR {
 /// rows: 94.7 s to lower; at 512, never finished). Eight times the rows must not grow the program, both
 /// widths must pass the door's guard, and a program that windows its query per row must be refused.
 #[test]
-fn a_continuation_programs_size_does_not_grow_with_its_rows() {
+fn a_paged_walks_program_does_not_grow_with_its_rows() {
     let ops_at = |mq: u32| {
         let s = AttnShape {
             geom: (32, 8, 64),
@@ -2609,52 +2596,20 @@ fn a_continuation_programs_size_does_not_grow_with_its_rows() {
         };
         let ir = attn_ir(s, 0.015625);
         let node = ir.nodes.last().unwrap();
-        let cap = ir.tensors[node.inputs[1].tensor.index()].rows;
-        let spliced = scratchy_triton_splice::lower_attn(node, &ir, cap, s.active_cap())
+        let spliced = scratchy_triton_splice::lower_attn(node, &ir, s.active_cap())
             .unwrap_or_else(|e| panic!("splice compiled mq={mq}: {e}"));
-        let k = spliced.ktir.expect("spliced op carries its program");
-        assert!(k.mask.is_some(), "mq={mq}: the continuation binds its mask");
-        ktir_superdsc::emit::lower_ktir_to_superdsc::attn_program_is_flat_in_rows(
-            "continuation",
-            &k.func,
-            mq,
-            32,
-        )
-        .unwrap_or_else(|e| panic!("mq={mq}: {}", e.message));
-        k.func.ops_deep().len()
+        spliced
+            .ktir
+            .expect("spliced op carries its program")
+            .func
+            .ops_deep()
+            .len()
     };
+    // The prompt walk is one head's rows against each page, so its program is a function of the
+    // heads and the pages, never of the row count: 8x the rows is the same program.
     let (small, wide) = (ops_at(31), ops_at(256));
     assert!(
         wide <= small,
         "8x the rows grew the program: 31 rows {small} ops, 256 rows {wide} ops"
-    );
-    // The door's refusal, on a REAL unrolled program: decode windows its query once for each of its 32
-    // heads, so the same program presented as ONE head over two rows windows its query 32 times for
-    // one head — exactly the shape a per-row unroll has, which the guard exists to refuse.
-    let decode = AttnShape {
-        geom: (32, 8, 64),
-        mq: 1,
-        cap: 256,
-        rung: 0,
-        rope_appended: true,
-    };
-    let ir = attn_ir(decode, 0.015625);
-    let node = ir.nodes.last().unwrap();
-    let cap = ir.tensors[node.inputs[1].tensor.index()].rows;
-    let unrolled = scratchy_triton_splice::lower_attn(node, &ir, cap, decode.active_cap())
-        .expect("the decode splice compiles")
-        .ktir
-        .expect("spliced op carries its program");
-    use ktir_superdsc::emit::lower_ktir_to_superdsc::attn_program_is_flat_in_rows;
-    assert!(
-        attn_program_is_flat_in_rows("decode", &unrolled.func, 1, 32).is_ok(),
-        "decode's one row is exempt"
-    );
-    let refused = attn_program_is_flat_in_rows("unrolled", &unrolled.func, 2, 1)
-        .expect_err("32 query windows for one head over two rows must be refused");
-    assert!(
-        refused.message.contains("unrolls per row") && refused.message.contains("2-row"),
-        "names the row count and the cause: {}",
-        refused.message
     );
 }

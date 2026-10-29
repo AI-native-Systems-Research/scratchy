@@ -1265,9 +1265,17 @@ pub(crate) fn lower_one_node<F: RopeForm>(
                 Err(reason) => Unhandled(reason),
             }
         }
-        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => {
+        SubOp::RopeRotate { .. } => {
             match scratchy_triton_splice::lower(node, ir, rows_are_requests) {
                 Ok(e) => Ops(vec![e]),
+                Err(reason) => Unhandled(reason),
+            }
+        }
+        // ⭐ A KV WRITER LOWERS TO ITS ROTATION AND ITS PAGED WRITE — `lower_all` emits both, the
+        // scatter into the pools right after the rotation it stores.
+        SubOp::RopeAppend { .. } => {
+            match scratchy_triton_splice::lower_all(node, ir, rows_are_requests) {
+                Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
         }
@@ -1293,14 +1301,9 @@ pub(crate) fn lower_one_node<F: RopeForm>(
                 Err(reason) => Unhandled(reason),
             }
         }
-        SubOp::AttnDecode { layout: kv, .. } => {
-            // ⭐ THE CACHE CAPACITY IS THE ONE GRAPH FACT THE SPLICE NEEDS STATED — the
-            // same read main's builder control makes (`ir.tensors[kv.cache_tensor()].rows`),
-            // and the swept rung rides the walk's own `active_cap`. Everything else main's
-            // `lower_attn_node` threaded is either read off the program by the
-            // door (`attn_at`: the swept extent, the scale, the span guard, the row laws)
-            // or is a constexpr the kernel states from the node's own payload.
-            let cap = ir.tensors[kv.cache_tensor().index() as u32 as usize].rows;
+        SubOp::AttnDecode { .. } => {
+            // ⭐ THE PAGED WALK READS ITS POOLS, ITS GEOMETRY AND ITS SCALE OFF THE NODE, and the
+            // rung's walk off `active_cap` — the splice states every one as the kernel's constexprs.
             // ⭐⭐⭐ THE SCALE, REWRITTEN TO 1.0 WHEN ITS FOLD APPLIES. The program is the ONE
             // carrier of the scale (the kernel states it as its `SCALE` constexpr and the door
             // reads that value back), so rewriting it HERE — at the boundary where the program
@@ -1322,7 +1325,7 @@ pub(crate) fn lower_one_node<F: RopeForm>(
             } else {
                 node
             };
-            match scratchy_triton_splice::lower_attn(node_ref, ir, cap, active_cap) {
+            match scratchy_triton_splice::lower_attn(node_ref, ir, active_cap) {
                 Ok(e) => Ops(vec![e]),
                 Err(reason) => Unhandled(reason),
             }
@@ -1512,10 +1515,12 @@ pub struct BundleWiring {
     /// `tensor_shapes[id] = (rows, cols)` for every tensor. When `attn_mask` is set, the LAST entry
     /// is the synthetic mask tensor `[1, capacity]`.
     pub tensor_shapes: Vec<(u32, u32)>,
-    /// Tensor id of the shared attention runtime length-mask source, if the graph has a maskable
-    /// decode. The host fills it `[1, capacity]` per forward step (0 on valid columns, -inf past
-    /// the decode position); it is NOT one of `num_sources` and is written by no node.
+    /// Tensor id of the shared attention mask-stack source, if the graph has attention. The host
+    /// fills it per forward step (see [`crate::wiring::PagedStep`]); it is NOT one of
+    /// `num_sources` and is written by no node.
     pub attn_mask: Option<u32>,
+    /// The paged step's sources and pool — see [`crate::wiring::PagedStep`].
+    pub paged: Option<crate::wiring::PagedStep>,
     /// EVERY compile-time scalar the programs read, in registry order: entry `i` is the value the
     /// worker must bind at [`scalarmul_scale_tid`]`(i)` — the model's own multipliers and RMSNorm
     /// epsilons, exactly the set and exactly the order `subtile→superdsc` registers.
@@ -1718,7 +1723,7 @@ pub(crate) fn gemm_weight_host_pairs<F: RopeForm>(
 
 /// The wiring's `tensor_shapes` — every tensor's HOST pair: the stated shape, with every
 /// gemm weight's entry replaced by the union of its matmul consumers' view regions
-/// ([`gemm_weight_host_pairs`]' law). The caller appends the mask's synthetic entry.
+/// ([`gemm_weight_host_pairs`]' law).
 pub(crate) fn tensor_shapes_of_ir<F: RopeForm>(
     ir: &SubtileIR<F>,
 ) -> Result<Vec<(u32, u32)>, SuperDscError> {
@@ -1729,8 +1734,69 @@ pub(crate) fn tensor_shapes_of_ir<F: RopeForm>(
     Ok(shapes)
 }
 
+/// ⭐ THE PAGED STEP THIS GRAPH's ATTENTION READS — off its own `AttnDecode` nodes: the pool every
+/// layer's cache tensor is (`rows / PAGE_SLOTS` pages), the forward's query rows, and the KV heads
+/// one write row per (token, head) is minted for. One step serves every layer — one page table, one
+/// mask stack, one write-row table — so the layers must agree; a graph whose attentions differ in
+/// pool, rows or kv heads is refused rather than served one layer's tables.
+///
+/// `active_cap` is the rung the bundle is baked at: its walk ([`scratchy_triton_splice::walk_pages`],
+/// the splice's own law) is the one fact of the step that depends on it.
+pub fn paged_step_of_ir<F: RopeForm>(
+    ir: &SubtileIR<F>,
+    active_cap: ActiveCap,
+) -> Result<Option<crate::wiring::PagedStep>, SuperDscError> {
+    let tids = scratchy_triton_splice::PagedStepTids::RESERVED;
+    let slots = scratchy_triton_splice::PAGE_SLOTS;
+    let mut out: Option<crate::wiring::PagedStep> = None;
+    for n in &ir.nodes {
+        let SubOp::AttnDecode { geom, .. } = &n.op else {
+            continue;
+        };
+        let cache = n.inputs.get(1).ok_or_else(|| {
+            SuperDscError(format!(
+                "AttnDecode t{} states no K cache input",
+                n.output.tensor.index()
+            ))
+        })?;
+        let rows = ir.tensors[cache.tensor.index()].rows;
+        if rows == 0 || !rows.is_multiple_of(slots) {
+            return Err(SuperDscError(format!(
+                "AttnDecode t{}: its K cache holds {rows} slots, not a whole number of \
+                 {slots}-slot pages",
+                n.output.tensor.index()
+            )));
+        }
+        let (pages, mq) = (rows / slots, n.output.region.rows.len);
+        let step = crate::wiring::PagedStep {
+            mask: tids.mask,
+            page_table: tids.page_table,
+            write_rows: tids.write_rows,
+            pages,
+            page_slots: slots,
+            rows: mq,
+            nkvh: geom.nkvh().get(),
+            gqa: geom.gqa().get(),
+            walk: scratchy_triton_splice::walk_pages(pages, mq, active_cap),
+        };
+        match out {
+            Some(prev) if prev != step => {
+                return Err(SuperDscError(format!(
+                    "the graph's attentions disagree about the paged step ({prev:?} vs {step:?}) — \
+                     one page table, one mask stack and one write-row table serve every layer"
+                )));
+            }
+            _ => out = Some(step),
+        }
+    }
+    Ok(out)
+}
+
 /// Lower `ir` for its WIRING alone — the same per-node arms a bake runs, read for the parameter
 /// pairings rather than for the programs.
+///
+/// The pairings do not depend on the rung, so the arms lower at `ActiveCap::FULL`; `active_cap` is the
+/// rung the bundle is baked at, read for the one fact that does — the paged step's walk.
 ///
 /// ⛔ THE LAYOUT IS NOT OPTIONAL, even though the pairing does not depend on placement. It is also
 /// the REGISTRY the lowering writes constants into — the door registers its attention
@@ -1739,6 +1805,7 @@ pub(crate) fn tensor_shapes_of_ir<F: RopeForm>(
 pub fn graph_wiring<F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
+    active_cap: ActiveCap,
 ) -> Result<BundleWiring, SuperDscError> {
     // ⛔ A REGISTRY, NOT A PLACEMENT — the wiring reads ONE kind of thing off the layout: the
     // registries ([`WiringRegistries`]). The placement pass [`compute_bundle_layout`] computed
@@ -1821,38 +1888,29 @@ pub fn graph_wiring<F: RopeForm>(
                         .into_iter()
                         .collect::<Vec<_>>();
                     let mask = match k.mask {
-                        // ⭐ THE CAPACITY COMES OFF THE PROGRAM, not off the node: the resident cache's
-                        // own `ktdp.construct_memory_view` states `[capacity, kv_width]`, so the number
-                        // this pass needs to size the host buffer is read where every other extent is
-                        // read. It used to ride on `KtirNode::mask` as the second half of a pair the
-                        // LOWERING never looked at.
-                        //
-                        // ⛔ THE CACHE'S VIEW, NOT THE MASK'S. The mask states `[1, capacity]` only at
-                        // decode; a multi-row continuation binds one `[mq, capacity + mq]` tile (the
-                        // prefix's length mask beside the new block's row mask), whose columns are not
-                        // the capacity. The resident K is the program's third parameter in every arm
-                        // (q, out, kc, kd, vc, vd — `attn_operands`'s order).
+                        // ⭐ THE CAPACITY IS THE K POOL's: the paged walk's parameters are `[q, out,
+                        // k pool, v pool, page table, mask]`, and the K pool is the layer's K cache
+                        // tensor, whose rows are the pool's token slots.
                         Some(mid) => {
-                            let regs = ktir_superdsc::emit::lower_ktir_to_superdsc::regions(&k)
-                                .map_err(|e| SuperDscError(e.message))?;
-                            if !regs.iter().any(|r| r.tid == mid.get()) {
+                            if !k.bindings.contains(&mid) {
                                 return Err(SuperDscError(format!(
                                     "the mask buffer t{mid} is not among this program's parameters \
                                      — the attention bound a mask its own program never declares"
                                 )));
                             }
-                            let cap = regs
+                            let pool = k
+                                .bindings
                                 .get(2)
-                                .filter(|r| r.tid != mid.get())
-                                .map(|r| r.v_rows)
+                                .map(|b| b.get() as usize)
+                                .filter(|&t| t < ir.tensors.len())
                                 .ok_or_else(|| {
                                     SuperDscError(format!(
-                                        "the attention binding mask t{mid} states no resident-cache \
-                                         parameter at position 2, so there is no `[capacity, \
-                                         kv_width]` view to size the host buffer with"
+                                        "the attention binding mask t{mid} binds no K pool at \
+                                         position 2 — the paged walk's order is q, out, k pool, \
+                                         v pool, page table, mask"
                                     ))
                                 })?;
-                            Some((mid.get(), cap))
+                            Some((mid.get(), ir.tensors[pool].rows))
                         }
                         None => None,
                     };
@@ -1896,23 +1954,35 @@ pub fn graph_wiring<F: RopeForm>(
     // ⭐ THE HOST PAIRS, NOT THE STATED SHAPES: every gemm weight's entry is the
     // union of its matmul consumers' view regions (the widen keeps the tied embed
     // weight's STATED cols at the pad while the host stages the real vocab region).
-    let mut tensor_shapes: Vec<(u32, u32)> = tensor_shapes_of_ir(ir)?;
-    let attn_mask = match mask {
-        Some((mid, cap)) => {
-            // The mask tensor sits at id == ir.tensors.len(); append its `[1, capacity]` shape so
-            // host buffer allocation covers it.
-            if mid as usize != tensor_shapes.len() {
+    let tensor_shapes: Vec<(u32, u32)> = tensor_shapes_of_ir(ir)?;
+    let paged = paged_step_of_ir(ir, active_cap)?;
+    let attn_mask = match (mask, paged) {
+        (Some((mid, cap)), Some(p)) => {
+            // The step's three sources are RESERVED tids (their shapes are the paged step's own
+            // statement, not entries of this tid-indexed list).
+            if mid != p.mask {
                 return Err(SuperDscError(format!(
-                    "the mask's tensor id is {mid} but the next free id is {} — the mask is a \
-                     synthetic source placed one past the graph, and an id that is not the next \
-                     free one is an id some real tensor already answers to",
-                    tensor_shapes.len()
+                    "the attention binds its mask at t{mid} but the paged step names t{} — the \
+                     step's sources have one set of ids",
+                    p.mask
                 )));
             }
-            tensor_shapes.push((1, cap));
+            if cap as usize != p.capacity() {
+                return Err(SuperDscError(format!(
+                    "the attention's K pool holds {cap} slots but the paged step states {} — one \
+                     pool, two capacities",
+                    p.capacity()
+                )));
+            }
             Some(mid)
         }
-        None => None,
+        (None, None) => None,
+        (mask, paged) => {
+            return Err(SuperDscError(format!(
+                "the attention programs bind a mask {mask:?} while the graph's paged step is \
+                 {paged:?} — the two are one statement of one attention"
+            )));
+        }
     };
     // ⭐ THE LOAD-CONST LIST AND THE SEAT, derived with the merged arrangement facts in hand —
     // the one derivations, so the wiring's ids, arrangements and the layout's placements cannot
@@ -1951,6 +2021,7 @@ pub fn graph_wiring<F: RopeForm>(
         result_dtype: result_dtype_of_ir(ir)?,
         tensor_shapes,
         attn_mask,
+        paged,
         scalarmul_scales: registries.scalarmul_scales,
         weight_scale_folds: registries.weight_scale_folds,
         weight_copies: registries.weight_copies,
@@ -3018,6 +3089,11 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         let mut declare_syms: i64 = 0;
         for e in ops.iter() {
             let Some(k) = e.ktir.as_ref() else { continue };
+            // A program with no card lowering declares nothing into the card's plan: on the
+            // emulator it runs as KTIR, and a card build refuses it at the door's real pass.
+            if !cfg!(feature = "spyre-hw") && !k.program.has_card_lowering() {
+                continue;
+            }
             crate::ktir_superdsc_door::lower(
                 k,
                 &mut declare_syms,
@@ -4611,18 +4687,18 @@ mod attn_scale_weight_fold_tests {
         let hd = scratchy_subtile::model_geometry::HeadDim::new(128);
         let shape = |rows: u32, cols: u32| scratchy_subtile::subtile_ir::SourceShape { rows, cols };
         let sources = vec![
-            shape(1, 8),    // 0: x (hidden 8)
-            shape(8, 256),  // 1: W_q — q width 2·128
-            shape(8, 128),  // 2: W_k — kv width 1·128
-            shape(1, 128),  // 3: v
-            shape(32, 128), // 4: prefix_k cache
-            shape(32, 128), // 5: prefix_v cache
-            shape(1, 256),  // 6: cos (q side — one per q head pair)
-            shape(1, 256),  // 7: sin (q side)
-            shape(256, 16), // 8: W_o — fp8, k = 2·128
-            shape(1, 16),   // 9: o_scale
-            shape(1, 128),  // 10: cos (k side — kv width 1·128)
-            shape(1, 128),  // 11: sin (k side)
+            shape(1, 8),     // 0: x (hidden 8)
+            shape(8, 256),   // 1: W_q — q width 2·128
+            shape(8, 128),   // 2: W_k — kv width 1·128
+            shape(1, 128),   // 3: v
+            shape(256, 128), // 4: prefix_k cache — one 256-slot page, the pool the walk reads
+            shape(256, 128), // 5: prefix_v cache
+            shape(1, 256),   // 6: cos (q side — one per q head pair)
+            shape(1, 256),   // 7: sin (q side)
+            shape(256, 16),  // 8: W_o — fp8, k = 2·128
+            shape(1, 16),    // 9: o_scale
+            shape(1, 128),   // 10: cos (k side — kv width 1·128)
+            shape(1, 128),   // 11: sin (k side)
         ];
         let ops = vec![
             // 0: q = x · W_q; 1: q_rot = rope_rotate(q, cos, sin)
@@ -4714,8 +4790,8 @@ mod attn_scale_weight_fold_tests {
     fn the_wiring_carries_the_oproj_copy_mint() {
         let ir = uniform_fp8_oproj_graph();
         let weight_ids: std::collections::HashSet<u32> = [1u32, 2, 8, 9].into_iter().collect();
-        let wiring =
-            graph_wiring(&ir, &weight_ids).expect("the uniform multi-slab fp8 graph wires");
+        let wiring = graph_wiring(&ir, &weight_ids, ActiveCap::FULL)
+            .expect("the uniform multi-slab fp8 graph wires");
         let layout = crate::lower_subtile_tape_to_superdsc::compute_bundle_layout(
             &ir,
             &weight_ids,

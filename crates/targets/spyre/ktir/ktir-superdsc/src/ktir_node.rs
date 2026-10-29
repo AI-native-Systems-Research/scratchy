@@ -249,6 +249,18 @@ pub enum Program {
     LmLast,
     Rope,
     Attn,
+    /// PAGED ATTENTION — `kernels/paged_attn.py`, spyre-inference's head-major online-softmax
+    /// page walk: each active block's page id is read from the page table and its `(page, kv
+    /// head)` slab GATHERED from the K and V pools (`ktdp.construct_indirect_access_tile`
+    /// loads). Six parameters: `q`, `out`, the K pool, the V pool, the page table, the mask stack.
+    /// The door reads no fact off it; the paged form's SuperDSC lowering is the generic
+    /// whole-function route.
+    PagedAttn,
+    /// THE PAGED KV CACHE WRITE — `kernels/paged_kv_write.py`, spyre-inference's
+    /// `reshape_and_cache_head_major`: this step's K and V rows SCATTERED into the pools
+    /// (`ktdp.store` through an indirect access tile). Five parameters: the step's K, its V, the
+    /// K pool, the V pool, the destination-row table.
+    PagedKvWrite,
     /// A 2-D BLOCK TRANSPOSE of a whole tensor — `[mb, out]` → `[out, mb]`, one
     /// `interslicetranspose_fp16` on the PT unit. See
     /// [`transpose`](crate::emit::lower_ktir_to_superdsc::transpose).
@@ -426,6 +438,16 @@ pub enum Program {
     WindowedRmsNorm {
         unit: bool,
     },
+}
+
+impl Program {
+    /// Whether this program has a SuperDSC lowering — the card's half of the ladder. The paged
+    /// attention and the paged KV write run as KTIR on the emulator, and their KTIR → SuperDSC
+    /// lowering (a scatter, and page gathers several to a program) is not ported: the door refuses
+    /// them by name, so a card build stops at them rather than shipping a bundle short its attention.
+    pub const fn has_card_lowering(self) -> bool {
+        !matches!(self, Program::PagedAttn | Program::PagedKvWrite)
+    }
 }
 
 /// One buffer of a bundle, as the CALLER numbers it.

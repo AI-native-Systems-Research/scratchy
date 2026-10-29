@@ -26,32 +26,20 @@ use scratchy_target_spyre::sdsc_runner::SuperDscSession;
 #[cfg(feature = "spyre-hw")]
 use crate::spyre_pool::*;
 
-/// Per-layer wiring the decode loop needs: the prefix-KV cache source tensors
-/// it fills, and the op-output tensors holding THIS position's roped-K / V to
-/// lift back into the cache.
+/// One layer's KV pools: the K and V cache tensors its paged attention gathers from and its KV
+/// write scatters into. The emulator never stages them — the session's own zeroed allocation is
+/// their starting state; the device writes them every step and they persist — nothing re-stages or
+/// reads them back.
 pub(crate) struct LayerWiring {
-    // ⛔ EVERY FIELD HERE IS EMULATOR-ONLY NOW (cfg'd like `prefix_v_src` below): the card
-    // keeps the KV cache RESIDENT and writes each step's new K/V device-side, so nothing
-    // on the spyre-hw arm reads a per-layer cache source or lift id. Deleted from the hw
-    // build by cfg rather than by removal — the emulator's host KV threading still reads
-    // all four, and the struct itself stays (its len is the layer count the load log prints).
-    /// Source tensor id of `prefix_k[layer]` (filled with the KV cache).
+    // ⛔ EMULATOR-ONLY (cfg'd): the card keeps its pool through its own placement, so nothing on
+    // the spyre-hw arm reads a per-layer pool id. The struct itself stays on both tiers (its len is
+    // the layer count the load log prints).
+    /// Tensor id of this layer's K pool.
     #[cfg(not(feature = "spyre-hw"))]
     pub(crate) prefix_k_src: usize,
+    /// Tensor id of this layer's V pool.
     #[cfg(not(feature = "spyre-hw"))]
     pub(crate) prefix_v_src: usize,
-    /// Op-output tensor id of the new token's roped K (AttnDecode's seg-1 K).
-    #[cfg(not(feature = "spyre-hw"))]
-    pub(crate) new_k_id: usize,
-    /// Op-output tensor id of the new token's V (AttnDecode's seg-1 V).
-    #[cfg(not(feature = "spyre-hw"))]
-    pub(crate) new_v_id: usize,
-    /// THIS layer's per-token KV width — `kv_heads * head_dim` off the baked
-    /// prefix-K shape. A hybrid-attention arch (gemma-4) gives sliding and global
-    /// layers different widths, so every per-layer buffer size, readback count and
-    /// extend length reads THIS, never the model-wide `kv_dim`.
-    #[cfg(not(feature = "spyre-hw"))]
-    pub(crate) kv_width: usize,
 }
 
 /// Per-phase metadata for one program (decode m=1 or prefill m=M) inside the
@@ -62,16 +50,13 @@ pub(crate) struct BundleMeta {
     /// Program index in the shared session (see [`SpyreSession::run_step`]).
     #[cfg(not(feature = "spyre-hw"))]
     pub(crate) prog: usize,
-    /// The attention length-mask source, when this bundle has one.
+    /// The paged step this bundle's attention reads — its page table, mask stack and write rows,
+    /// staged every step from the request's KV blocks (`scratchy_target_spyre::paged_step`), and
+    /// the pool they index.
     ///
-    /// ⭐ A FACT OF THE WIRING, NOT OF A MANIFEST. The prefix cache tensor spans the full
-    /// structural capacity while only `decode_position` of its rows are valid at run time, so the
-    /// host fills this `[1, capacity]` source per step and the masked columns leave the softmax.
-    ///
-    /// ⛔ EMULATOR-ONLY (cfg'd): the per-step host mask fill is the emulator arm's; the card's
-    /// prefix mask rides the forward tape's `PrefixMask` step straight off the wiring.
+    /// ⛔ EMULATOR-ONLY (cfg'd): the card's own staging rides its forward tape.
     #[cfg(not(feature = "spyre-hw"))]
-    pub(crate) attn_mask_src: Option<usize>,
+    pub(crate) paged: Option<scratchy_target_spyre::wiring::PagedStep>,
     /// Prefix capacity (mask cols) — max context length this bundle serves.
     pub(crate) capacity: usize,
     /// Baked query-row count: 1 (decode) or M (batched prefill).
@@ -91,8 +76,8 @@ pub(crate) struct BundleMeta {
     pub(crate) result_id: usize,
     /// One per layer, in layer order.
     pub(crate) layers: Vec<LayerWiring>,
-    /// Tensors read back from each forward, in a stable order: `result_id`
-    /// then every layer's `new_k_id`, `new_v_id`.
+    /// Tensors read back from each forward: the result. The KV never comes back — the device
+    /// writes it into the pools and reads it there.
     #[cfg(not(feature = "spyre-hw"))]
     pub(crate) output_ids: Vec<usize>,
     /// Every compile-time scalar this bundle's KTIR reads, in registry order — entry `i` is bound at
@@ -133,6 +118,19 @@ pub(crate) struct BundleMeta {
     /// what the bake decided.
     #[cfg(feature = "spyre-hw")]
     pub(crate) wiring: &'static scratchy_target_spyre::wiring::Wiring,
+}
+
+impl BundleMeta {
+    /// The positions this bundle's attention reaches: on the emulator its page walk's
+    /// ([`scratchy_target_spyre::wiring::PagedStep::reach`]), so a step whose positions end at or
+    /// below it can run here from any start; on the card, its prefix capacity.
+    pub(crate) fn reach(&self) -> usize {
+        #[cfg(not(feature = "spyre-hw"))]
+        if let Some(p) = self.paged {
+            return p.reach();
+        }
+        self.capacity
+    }
 }
 
 /// The BAKED logits tensor of a bundle: `[rows, width]`, STICK-BLOCKED on the vocab axis.
@@ -599,8 +597,9 @@ impl SuperDscBundle {
 /// ⛔ NO `kv_dim` HERE, AND ITS ABSENCE IS THE LOCK. A hybrid-attention arch (gemma-4)
 /// gives layers DIFFERENT kv widths (sliding `kv_heads*head_dim` vs global
 /// `g_kv*g_hd`), so a model-wide kv width is a number no per-layer question may
-/// read — every per-layer size, readback count and extend length goes through
-/// [`LayerWiring::kv_width`], off the layer's own baked prefix-K shape.
+/// read — and the KTIR path asks none: each layer's K and V pools are resident
+/// tensors at their own baked shapes ([`LayerWiring`]), written and read on the
+/// device by the layer's paged step.
 pub(crate) struct Shared<'a> {
     pub(crate) embed_tokens: &'a [f32],
     pub(crate) hidden: usize,
@@ -624,12 +623,12 @@ pub(crate) struct Loaded {
     pub(crate) hidden: usize,
     /// spyre-hw ONLY (pool-entry sizing and the sendnn prefill/batch paths). The
     /// KTIR path reads no model-wide head dim: rotary classes are per cos/sin
-    /// source (`RotaryKind`) and KV widths per layer (`LayerWiring::kv_width`).
+    /// source (`RotaryKind`), and each layer's KV pools carry their own baked shapes.
     #[cfg(feature = "spyre-hw")]
     pub(crate) head_dim: usize,
     /// spyre-hw ONLY: the paged-KV pool's per-head group count comes off it. The
-    /// KTIR path reads each layer's own `LayerWiring::kv_width` instead (a hybrid
-    /// arch has no single kv width), so it is unread there.
+    /// KTIR path's pools are per-layer resident tensors at their own baked shapes (a
+    /// hybrid arch has no single kv width), so it is unread there.
     #[cfg(feature = "spyre-hw")]
     pub(crate) kv_dim: usize,
     pub(crate) vocab: usize,
@@ -644,14 +643,15 @@ pub(crate) struct Loaded {
     /// layer-group split — selected from the baked bundle shape.
     #[cfg(feature = "spyre-hw")]
     pub(crate) session: SendnnSession,
-    /// m=1 decode program metas, one per static cap bucket, ASCENDING by
-    /// capacity. The generation loop runs the smallest bucket whose capacity
-    /// covers the current position (decode is O(capacity)); never empty. The
+    /// m=1 decode program metas, one per rung, ASCENDING by reach ([`BundleMeta::reach`]). The
+    /// generation loop runs the smallest rung that reaches the current position — on the emulator the
+    /// page walk's rungs, so a step walks the fewest pages its context fills; never empty. The
     /// sendnn path bakes a single bucket, so its ladder is the full-cap entry.
     pub(crate) decode: Vec<BundleMeta>,
-    /// m=M batched-prefill program meta, if emitted; else prefill falls back to
-    /// the decode program (sequential, one token per forward).
-    pub(crate) prefill: Option<BundleMeta>,
+    /// m=M prompt-chunk program metas, ASCENDING by reach — on the emulator the page walk's rungs,
+    /// each chunk run on the smallest that reaches its context. Empty when none is baked (prefill then
+    /// walks the decode program, one token per forward).
+    pub(crate) prefill: Vec<BundleMeta>,
     /// The prefill program meta PRESERVED for the batched-prefill path. `model.prefill` is nulled for
     /// SuperDsc so the PER-FORWARD binding uses the decode graph (the prefill manifest has different
     /// tensor ids); but `run_prefill_batch` binds this meta to the DISTINCT prefill SESSION (where the ids
@@ -745,18 +745,6 @@ pub(crate) struct ReqState {
     /// stages the same law per step (packed, at its views' own dtypes) and reads the same idx
     /// stick back.
     pub(crate) draw: Option<SampledDraw>,
-    /// ⛔ A HOST MIRROR OF THE KV — and it does not exist on the sendnn path at all.
-    ///
-    /// Per-layer, row-major `[n_computed, kv_dim]`, grown one row per step by the KTIR EMULATOR's
-    /// `forward_chunk` (`#[cfg(not(feature = "spyre-hw"))]`), which threads the prefix KV from the host. On
-    /// the on-silicon paged path the KV is resident on card and addressed by [`PagedKv`] + the host block
-    /// table, so this was allocated per request (`vec![Vec::new(); nlayers]`) and never read — a dead
-    /// mirror of the thing `d6906140` removed. `cfg`-ed out rather than documented as unused: an empty
-    /// mirror is one `extend_from_slice` away from being a real one again.
-    #[cfg(not(feature = "spyre-hw"))]
-    pub(crate) kv_k: Vec<Vec<f32>>,
-    #[cfg(not(feature = "spyre-hw"))]
-    pub(crate) kv_v: Vec<Vec<f32>>,
     // ⛔⛔⛔ THERE IS NO `kv: Option<PagedKv>` ANY MORE, AND THAT IS THE END OF REQUEST IDENTITY BELOW THE
     // HOST. It held the request's POOL ROW — the pages that backed its batched write past its own keys. The
     // scheduler allocates that page now, so a request's on-card KV is fully described by two things this

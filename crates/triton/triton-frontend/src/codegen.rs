@@ -1529,6 +1529,30 @@ impl<'a> CodeGen<'a> {
                     .map(Val::Ir)
                     .map_err(|e| Self::located(e, pos))
             }
+            // `desc.scatter(value, x_offsets, y_offset)` -- Triton's `tensor_descriptor.scatter`
+            // (`core.py`), the VALUE first, then the gather's own two arguments in the gather's
+            // own order, so the constant a literal `y_offset` produces lands immediately before
+            // the scatter, as it does before a gather.
+            "scatter" => {
+                let (Some(value), Some(x), Some(y)) = (args.first(), args.get(1), args.get(2))
+                else {
+                    return Err(Error::new(
+                        "`.scatter` needs a value, an index vector and a column offset",
+                        pos.line,
+                        pos.col,
+                    ));
+                };
+                let value = self
+                    .sem
+                    .to_tensor(value)
+                    .map_err(|e| Self::located(e, pos))?;
+                let x = self.sem.to_tensor(x).map_err(|e| Self::located(e, pos))?;
+                let y = self.make_scalar(y, Type::i32(), pos)?;
+                self.sem
+                    .descriptor_scatter(recv_id, value, x, y)
+                    .map_err(|e| Self::located(e, pos))?;
+                Ok(Val::None)
+            }
             "to" => {
                 let dt = match args.first() {
                     Some(Val::Dtype(t)) => t.clone(),

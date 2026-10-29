@@ -1055,7 +1055,7 @@ fn generic_as_broadcast<'a>(op: &Op, a: &'a Arena) -> Result<Vec<Operation<'a>>>
 /// so `embedding_granite`'s `(d0, d1, d2, d3) -> (d0 + d2)` becomes `(d0, d1)[s0, s1] -> (s0 + d0)`
 /// -- `ids[program_id * BLOCK_M + row]`, which is the address the fixture writes.
 fn indirect_access_tile<'a>(op: &Op, a: &'a Arena) -> Result<Operation<'a>> {
-    // `(base, captures.., index_view)`: the printed operand order, which `convert_gathers`
+    // `(base, captures.., index_view)`: the printed operand order, which `convert_indirect`
     // documents and `triton-superdsc-lower` reads `operands.last()` on.
     if op.operands.len() < 3 {
         return Err(refuse(format!(

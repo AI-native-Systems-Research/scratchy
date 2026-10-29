@@ -3,9 +3,10 @@
 Source: torch-spyre `torch_spyre/_inductor/decompositions.py` at a9fa997b (2026-10-29),
 `spyre__sdpa_overrideable` (:1960) -- the decomposition torch-spyre's Inductor backend
 lowers every `aten._scaled_dot_product_fused_attention_overrideable` to. Nothing here is
-derived from Triton's fused-attention tutorial (that is `attention_flash.py`) or from
-scratchy's hand-built builder arms (that is `crates/targets/spyre/kernels/attn.py`). Each
-construct below names the torch-spyre line it restates.
+derived from Triton's fused-attention tutorial (that is `attention_flash.py`). This is the
+DENSE operator; the attention scratchy serves is torch-spyre's PAGED one (spyre-inference's
+head-major page walk, `crates/targets/spyre/kernels/paged_attn.py`). Each construct below names
+the torch-spyre line it restates.
 
 THE ALGORITHM, as torch-spyre states it
 =======================================
