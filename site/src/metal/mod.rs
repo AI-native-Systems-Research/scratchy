@@ -3829,8 +3829,9 @@ mod tests {
     #[test]
     fn a_small_set_lineup_puts_every_mac_on_the_small_models() {
         use super::data::Run;
+        // The M3 Pro's 2026-10-27 run at f9739363, a newer one replaced.
         let read = |name: &str| -> serde_json::Value {
-            let p = format!("{}/data/metal/{name}", env!("CARGO_MANIFEST_DIR"));
+            let p = format!("{}/data/metal/history/{name}", env!("CARGO_MANIFEST_DIR"));
             serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
         };
         let mut small = read("apple-m3-pro-2026-10-27T031941Z-f9739363.json");
@@ -3862,8 +3863,9 @@ mod tests {
     #[test]
     fn a_run_that_named_its_models_does_not_flip_the_lineup() {
         use super::data::Run;
+        // The M3 Pro's 2026-10-27 run at f9739363, a newer one replaced.
         let read = |name: &str| -> serde_json::Value {
-            let p = format!("{}/data/metal/{name}", env!("CARGO_MANIFEST_DIR"));
+            let p = format!("{}/data/metal/history/{name}", env!("CARGO_MANIFEST_DIR"));
             serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
         };
         let mut small = read("apple-m3-pro-2026-10-27T031941Z-f9739363.json");
