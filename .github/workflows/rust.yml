@@ -345,6 +345,19 @@ jobs:
       - name: Compiled no crate macos-scope skips for
         run: scripts/ci-macos-scope.sh lock
 
+  # The energy sampler on macOS 27, whose reader (the CLPC counters) differs from 26's. GitHub's
+  # macOS 27 image is the `xcode-27` label (preview).
+  power-sampler-macos-27:
+    name: macos-arm64 27 (power sampler)
+    needs: macos-scope
+    if: ${{ !cancelled() && !(needs.macos-scope.result == 'success' && needs.macos-scope.outputs.macos == 'false') }}
+    runs-on: xcode-27
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Power sampler
+        run: scripts/ci-power-sampler.sh
+
   macos-metal-tests:
     name: macos-arm64 (metal tests)
     needs: macos-scope
@@ -397,23 +410,9 @@ jobs:
       - name: KTIR optimizer tests
         run: cargo test -p ktir-optimizer
 
-      # The Metal matrix's energy sampler on this runner's macOS: its unit
-      # tests (each reader's channels to joules), then a real run. A VM's
-      # IOReport has no energy channels, so there it must fail with that error
-      # rather than write zeros; on a real Mac it must sample.
+      # The Metal matrix's energy sampler on macOS 26; power-sampler-macos-27 runs it on 27.
       - name: Power sampler
-        run: |
-          cargo test -p scratchy-power-sampler
-          cargo build --release -p scratchy-power-sampler
-          if [ "$(sysctl -n kern.hv_vmm_present)" = 1 ]; then
-            if out=$(target/release/scratchy-power-sampler --samples 3 2>&1); then
-              echo "$out"; echo "sampled in a VM, which has no energy channels"; exit 1
-            fi
-            echo "$out"
-            grep -q "no energy channels" <<<"$out"
-          else
-            target/release/scratchy-power-sampler --samples 3
-          fi
+        run: scripts/ci-power-sampler.sh
 
       # Variant-selection gates (#202). These decide WHICH compiled model
       # variant claims a checkpoint, and both halves fail OPEN — a broken
