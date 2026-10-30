@@ -18,6 +18,7 @@
 
 pub mod backend;
 pub mod block;
+pub mod draft_context;
 pub mod mtp;
 pub mod ngram;
 pub mod proposer;
