@@ -1105,9 +1105,9 @@ impl SpyreWorker {
                 let vocab = dparsed.vocab;
                 let kv_dim = dparsed.kv_dim;
                 // ⭐ THE KV POOL IS THE BAKE'S — every layer's K and V pools, placed in the KV segment of
-                // every bundle at the decode wiring's own page count, with the pool's statics beside them
-                // (`PagedStep::card_placements`). Nothing here sizes it: the OWNER session allocates the
-                // segment once, and every other session aliases it.
+                // every bundle at the decode wiring's own page count (the model's context, or as much of
+                // it as one device region holds: `paged_step::pool_slots`). Nothing here sizes it: the
+                // OWNER session allocates the segment once, and every other session aliases it.
                 let step = wirings.decode.paged.ok_or_else(|| {
                     werr("the decode bundle states no paged step — its attention reads no KV pool")
                 })?;
