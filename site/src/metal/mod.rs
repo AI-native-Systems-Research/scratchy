@@ -1974,13 +1974,16 @@ impl Latency<'_> {
     /// the range's end. Between scratchy's curve and its rival's, the sparklines' fills: cyan where
     /// more of scratchy's requests are done by then, red where fewer; across the middle, a line
     /// from one median to the other, cyan or red as scratchy's is the sooner or later, its factor
-    /// written over it. Bare, as an overview's panel: no axis titles or tick labels, `tag`'s lines
-    /// in its corner; as wide as its column and [`GLANCE_CHART_HEIGHT`] high, as the sparklines are.
-    fn ecdf(&self, k: CellKey, t: RequestTiming, tag: &[&str], label: &str) -> Element {
+    /// written over it. Time runs on a log axis, so a distance across is a ratio, as the factor
+    /// is. Bare: no axis titles or tick labels, `tag`'s lines in its corner; as wide as its column
+    /// and `height` high.
+    fn ecdf(&self, k: CellKey, t: RequestTiming, tag: &[&str], label: &str, height: &str) -> Element {
         let curves: Vec<(Engine, Vec<f64>)> = (self.engines.iter())
             .filter_map(|&e| {
                 let rs = self.cell(e, k)?.requests.as_ref()?;
-                let mut vs: Vec<f64> = rs.of(t).filter_map(|(_, v)| v).collect();
+                let mut vs: Vec<f64> = (rs.answered(t, k.1).filter_map(|(_, v)| v))
+                    .filter(|&v| v > 0.0)
+                    .collect();
                 vs.sort_by(f64::total_cmp);
                 (!vs.is_empty()).then_some((e, vs))
             })
@@ -1991,10 +1994,10 @@ impl Latency<'_> {
         else {
             return rsx! {};
         };
-        // A twentieth of the range either side; where every request took the same time, a
-        // twentieth of that time (at least 1 ms), so the range never closes.
-        let pad = (if hi > lo { hi - lo } else { hi.abs().max(1.0) }) / 20.0;
-        let end = hi + pad;
+        // A twentieth of the log range either side; where every request took the same time, 5%,
+        // so the range never closes.
+        let pad = if hi > lo { (hi / lo).powf(1.0 / 20.0) } else { 1.05 };
+        let end = hi * pad;
         let point = |group, key, value: f64| SparkPoint {
             group,
             key,
@@ -2043,7 +2046,7 @@ impl Latency<'_> {
                 } else {
                     ECDF_LATER
                 };
-                // The factor sits a little over the line, at its middle.
+                // The factor sits a little over the line, at its middle on the log axis.
                 let over = 0.5 + 0.12;
                 data.extend([
                     point(group, m, 0.5),
@@ -2051,7 +2054,7 @@ impl Latency<'_> {
                         upper: Some(over),
                         lower: Some(over),
                         factor: Some(factor),
-                        ..point(group, (m + r) / 2.0, 0.5)
+                        ..point(group, (m * r).sqrt(), 0.5)
                     },
                     point(group, r, 0.5),
                 ]);
@@ -2059,11 +2062,11 @@ impl Latency<'_> {
                 dashed.push(group);
             }
         }
-        let axis = |maps_to, title, domain| Axis {
+        let axis = |maps_to, title, scale_type, domain| Axis {
             maps_to,
             // Kept on the hidden axes: Carbon's tooltip names each value by it.
             title,
-            scale_type: None,
+            scale_type,
             ticks: None,
             include_zero: Some(false),
             visible: Some(false),
@@ -2076,8 +2079,8 @@ impl Latency<'_> {
             options: ChartOptions {
                 title: String::new(),
                 axes: Axes {
-                    bottom: axis("key", "ms", [lo - pad, end]),
-                    left: axis("value", "share of requests", [0.0, 1.0]),
+                    bottom: axis("key", "ms", Some("log"), [lo / pad, end]),
+                    left: axis("value", "share of requests", None, [0.0, 1.0]),
                 },
                 color: Some(Colour::Scale {
                     scale: (self.engines.iter().zip(["s1", "s2"]))
@@ -2092,7 +2095,7 @@ impl Latency<'_> {
                         .collect(),
                 }),
                 heatmap: None,
-                height: GLANCE_CHART_HEIGHT.to_string(),
+                height: height.to_string(),
                 width: Some("100%".to_string()),
                 legend: Some(Enabled { enabled: false }),
                 locale: None,
@@ -2199,9 +2202,12 @@ enum UsersNamed {
     InCells,
 }
 
-/// A glance chart's height, the scaling sparklines' and the latency ECDFs' alike; each is as wide
-/// as its column.
+/// A glance sparkline's height; each is as wide as its column.
 const GLANCE_CHART_HEIGHT: &str = "4.5rem";
+
+/// The latency tab's ECDFs' height: about 1.8 wide for 1 high in its four prompt columns, so a
+/// quantile reads off the share axis (each of a cell's 50 requests some 3px), not a sparkline's.
+const ECDF_HEIGHT: &str = "9rem";
 
 /// An ECDF's fills ([`Latency::ecdf`]): where more of scratchy's requests are done than its
 /// rival's, and where fewer.
@@ -2357,7 +2363,9 @@ fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
                         "{} of every request, {i} in {o} out {u} at once, {mid}",
                         RequestTiming::E2el.title()
                     );
-                    l.ecdf((u, o, i), RequestTiming::E2el, &["E2EL"], &about)
+                    // As wide as the bubble charts, about 1.8 to 1.
+                    let height = Px(PANEL_SIDE.0 * 5 / 9).to_string();
+                    l.ecdf((u, o, i), RequestTiming::E2el, &["E2EL"], &about, &height)
                 }
             },
         )
@@ -2369,7 +2377,7 @@ fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
                     for &e in &l.engines {
                         if let Some(rs) = l.cell(e, (u, o, i)).and_then(|c| c.requests.as_ref()) {
                             {
-                                let mut vs: Vec<f64> = rs.of(t).filter_map(|(_, v)| v).collect();
+                                let mut vs: Vec<f64> = rs.answered(t, o).filter_map(|(_, v)| v).collect();
                                 vs.sort_by(f64::total_cmp);
                                 let q = |p: f64| fmt(quantile(&vs, p), 1);
                                 rsx! {
@@ -3193,7 +3201,7 @@ fn latency_panel<'l>(
         l.multiple(o, "minmax(0, 1fr)", &format!("{stem} · {o}-token answers"), UsersNamed::InCells, |(u, o, i)| {
             let label = |t: RequestTiming| format!("{} of every request, {i} in {o} out {u} at once, {about}", t.title());
             let users = users_at(u);
-            let ecdf = |t: RequestTiming, tag: &str| l.ecdf((u, o, i), t, &[tag, &users], &label(t));
+            let ecdf = |t: RequestTiming, tag: &str| l.ecdf((u, o, i), t, &[tag, &users], &label(t), ECDF_HEIGHT);
             rsx! {
                 Stack { gap: 1,
                     match Load::of(u) {

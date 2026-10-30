@@ -235,7 +235,7 @@ impl Metric {
         match self {
             Metric::Ttft => c.median_ttft_ms,
             Metric::Tpot => c.median_tpot_ms,
-            Metric::E2el => c.median_e2el_ms,
+            Metric::E2el => c.e2el_ms(),
             Metric::Throughput => c.output_throughput,
             Metric::PeakMem => c.server_mem_peak_mib.filter(|_| !c.mem_below_weights),
         }
