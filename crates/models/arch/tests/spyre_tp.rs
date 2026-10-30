@@ -26,8 +26,22 @@ fn granite_ships_one_two_rank_world() {
         "the two-rank bundle is its own, not the one-rank one"
     );
     assert!(
-        tp.sources.len() as u32 <= tp.wiring.num_sources,
+        tp.sources.len() as u32 <= tp.wirings.decode.num_sources,
         "every sliced source is a source of the two-rank wiring"
+    );
+}
+
+/// The two-rank world ships whole: granite bakes a batched-prefill program in its one-rank world,
+/// so its two-rank world carries one too — its own bundle and its own wiring.
+#[test]
+fn granites_two_rank_world_carries_its_prefill() {
+    let tp = &scratchy_models::granite::granite_3_1_2b_instruct::SUPERDSC_TP[0];
+    let one_rank = &scratchy_models::granite::granite_3_1_2b_instruct::KTIR_BUNDLE;
+    let prefill = tp.prefill.as_ref().expect("the two-rank world bakes a prefill");
+    assert!(tp.wirings.prefill.is_some(), "and its wiring");
+    assert!(
+        one_rank.prefill.as_ref().is_none_or(|p| p.fp != prefill.fp),
+        "the two-rank prefill is its own bundle"
     );
 }
 

@@ -1788,8 +1788,10 @@ pub struct TpForward {
     pub world: crate::bundle_code::collective::TpWorld,
     /// The rank-local decode bundle — the same on every rank (one bake serves the world).
     pub decode: crate::manifest::KtirBundleData,
-    /// Its launch wiring, numbered by the rank-local forward's own tensor ids.
-    pub wiring: Wiring,
+    /// The rank-local batched-prefill bundle, when the model bakes one.
+    pub prefill: Option<crate::manifest::KtirBundleData>,
+    /// Their launch wirings, numbered by the rank-local forwards' own tensor ids.
+    pub wirings: Wirings,
     /// Per source of the one-rank forward (same indices): the slice each rank loads.
     pub sources: &'static [SourceShard],
 }

@@ -13566,7 +13566,14 @@ fn dump_wavefront_mega(
         //
         // A rung that does not lower PANICS inside its own bake — every entry that reaches
         // the commit below is `Ok`, so the committed ladder is every rung asked for.
-        type RungBake = (to_wavefront::LoweredDecode, PrefillPick, Vec<BakeEffect>);
+        // A rung's bake in each world: the one-rank lowering, its pick and effects, and — when the
+        // two-rank world baked its decode — the rung's two-rank lowering and effects.
+        type RungBake = (
+            to_wavefront::LoweredDecode,
+            PrefillPick,
+            Vec<BakeEffect>,
+            Option<(to_wavefront::LoweredDecode, Vec<BakeEffect>)>,
+        );
         let per_rung: Vec<Result<RungBake, (u32, String)>> = {
             use rayon::prelude::*;
             prefill_rung_widths.par_iter().map(|&pl| -> Result<RungBake, (u32, String)> {
@@ -13596,9 +13603,10 @@ fn dump_wavefront_mega(
             );
             match lowered {
                 Ok(lwd_p) => {
-                    let (r, fx) = emit_bundle_deferred(
-                        &lwd_p,
-                        format!("ktir_prefill_{stem_id}"),
+                    // One rung's bake, in whichever world `lwd` was lowered for.
+                    let bake_rung = |lwd: &to_wavefront::LoweredDecode, base: String| emit_bundle_deferred(
+                        lwd,
+                        base,
                         prefix_len.get(),
                         // prefill: rewrite the concrete prompt length `pl` → symbol
                         // s0 (offline_decoder idx-0 graph: prompt sym = Tq = Tkv).
@@ -13631,7 +13639,22 @@ fn dump_wavefront_mega(
                         scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::NONE,
                         1, // a prompt chunk is one request however many positions it spans
                     );
-                    Ok((lwd_p, r, fx))
+                    let (r, fx) = bake_rung(&lwd_p, format!("ktir_prefill_{stem_id}"));
+                    // ⭐ AND THE RUNG IN THE TWO-RANK WORLD, iff that world baked its decode — a
+                    // world ships whole or not at all.
+                    let tp2 = tp2_sources.is_some().then(|| {
+                        let (tp_lwd, _) = scratchy_subtile::tensor_parallel::shard_lowered(
+                            &lwd_p,
+                            scratchy_target_spyre::tp_plan::SpyreWorld::of::<2>().analysis(),
+                            scratchy_target_spyre::tp_plan::SPYRE_SPLIT_GRANULE,
+                        )
+                        .unwrap_or_else(|e| {
+                            panic!("[spyre-tp] {stem}: the two-rank prefill m={pl} is malformed — {e:?}")
+                        });
+                        let (_, fx) = bake_rung(&tp_lwd, format!("ktir_prefill_tp2_{stem_id}"));
+                        (tp_lwd, fx)
+                    });
+                    Ok((lwd_p, r, fx, tp2))
                 }
                 Err(e) if sendnn_superdsc => {
                     panic!(
@@ -13648,8 +13671,11 @@ fn dump_wavefront_mega(
         // entry here is `Ok` — the window guard below still runs, over what baked.
         for rung in per_rung {
             match rung {
-                Ok((lwd_p, r, fx)) => {
+                Ok((lwd_p, r, fx, tp2)) => {
                     commit_bake(&one_rank, &lwd_p, fx);
+                    if let Some((tp_lwd, fx)) = tp2 {
+                        commit_bake(&two_ranks, &tp_lwd, fx);
+                    }
                     prefill = Some(r);
                 }
                 Err((pl, e)) => {
@@ -14254,11 +14280,28 @@ fn dump_wavefront_mega(
             use scratchy_subtile::tensor_parallel::SourceShard as S;
             let tp_forwards: Vec<proc_macro2::TokenStream> = match (
                 tp2_fp.borrow().clone(),
-                tp2_wiring.borrow().0.clone(),
+                tp2_wiring.borrow().clone(),
                 tp2_sources.as_ref(),
             ) {
-                (Some(fp), Some(wiring), Some(sources)) => {
+                (Some(fp), (Some(wiring), prefill_wiring), Some(sources)) => {
                     let fp = proc_macro2::Literal::string(&fp);
+                    // The prefill bundle and its wiring ship together or not at all, as the
+                    // one-rank world's do.
+                    let (prefill, prefill_wiring) = match (tp2_prefill_fp.borrow().clone(), prefill_wiring) {
+                        (Some(pfp), Some(pw)) => {
+                            let pfp = proc_macro2::Literal::string(&pfp);
+                            (
+                                quote! { ::core::option::Option::Some(
+                                    ::scratchy_target_spyre::manifest::KtirBundleData { fp: #pfp }
+                                ) },
+                                quote! { ::core::option::Option::Some(#pw) },
+                            )
+                        }
+                        _ => (
+                            quote! { ::core::option::Option::None },
+                            quote! { ::core::option::Option::None },
+                        ),
+                    };
                     let sources = sources.iter().map(|s| match s {
                         S::Whole => quote! { ::scratchy_target_spyre::wiring::SourceShard::Whole },
                         S::Rows => quote! { ::scratchy_target_spyre::wiring::SourceShard::Rows },
@@ -14279,7 +14322,11 @@ fn dump_wavefront_mega(
                         ::scratchy_target_spyre::wiring::TpForward {
                             world: ::scratchy_target_spyre::bundle_code::collective::TpWorld::of::<2>(),
                             decode: ::scratchy_target_spyre::manifest::KtirBundleData { fp: #fp },
-                            wiring: #wiring,
+                            prefill: #prefill,
+                            wirings: ::scratchy_target_spyre::wiring::Wirings {
+                                decode: #wiring,
+                                prefill: #prefill_wiring,
+                            },
                             sources: &[#(#sources),*],
                         }
                     }]
