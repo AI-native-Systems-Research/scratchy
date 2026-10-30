@@ -790,23 +790,20 @@ impl PagedStep {
                 ),
             ]),
         }
-        // ⛔ THE POOL'S STATICS IN EVERY BUNDLE OF THE POOL, not only the one whose kernel reads them.
-        // Every session of a model shares ONE KV segment by alias, and the alias refuses two
-        // sessions whose placements in it differ (`Executor::alias_seg_from`), so a prompt chunk's
-        // or a decode batch's bundle places `kv_row_pool` beside the pools exactly where the decode
-        // kernel's does.
-        v.extend([
-            (
-                self.kv_row_pool,
-                CardSeat::Pool,
-                self.card_kv_row_pool_bytes(),
-            ),
-            (
-                self.int32_zero,
-                CardSeat::Pool,
-                self.card_int32_zero_bytes(),
-            ),
-        ]);
+        if self.reads_kv_row_pool() {
+            v.extend([
+                (
+                    self.kv_row_pool,
+                    CardSeat::Static,
+                    self.card_kv_row_pool_bytes(),
+                ),
+                (
+                    self.int32_zero,
+                    CardSeat::Static,
+                    self.card_int32_zero_bytes(),
+                ),
+            ]);
+        }
         v
     }
 
@@ -836,8 +833,10 @@ impl PagedStep {
 pub enum CardSeat {
     /// Beside the activations: staged every step, and moved by a walk's relaunch.
     Step,
-    /// Beside the pools, in the segment a relaunch does not shift: staged once, at load.
-    Pool,
+    /// In the segment NEITHER relaunch shifts — not a layer's (which moves the weight and KV
+    /// segments to that layer's copies) and not a walk's (which moves the step's tables): staged once,
+    /// at load, and read at its placement by every layer and every trip.
+    Static,
 }
 
 /// Everything the worker needs to launch one baked bundle, emitted whole.

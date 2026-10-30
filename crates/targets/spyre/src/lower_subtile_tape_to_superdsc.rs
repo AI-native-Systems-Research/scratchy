@@ -1488,8 +1488,9 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // ── THE PAGED STEP'S SOURCES ── spyre-inference's operands the host stages each step
     //    (`crate::paged_step`): the page index table, the mask stack, the KV write index and the
     //    query row index, at their reserved tids in the ACTIVATION segment like every per-step
-    //    binding (the reserved-tid law above), and the decode kernel's `kv_row_pool` beside the pools
-    //    in the KV segment, which a walk's relaunch does not shift. `PagedStep::card_placements` is
+    //    binding (the reserved-tid law above), and the decode kernel's `kv_row_pool` and int32 zero
+    //    in the intermediate segment, which neither a layer's launch nor a walk's relaunch shifts
+    //    (the KV segment moves with every layer). `PagedStep::card_placements` is
     //    the one statement of what they are and how big — the card stagers stage within it.
     if let Some(step) =
         crate::lower_subtile_tape_to_ktir::paged_step_of_ir(ir, ActiveCap::FULL, paged_rows)?
@@ -1497,7 +1498,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
         for (tid, seat, size) in step.card_placements() {
             let role = match seat {
                 crate::wiring::CardSeat::Step => SegRole::Activation,
-                crate::wiring::CardSeat::Pool => SegRole::Kv,
+                crate::wiring::CardSeat::Static => SegRole::Intermediate,
             };
             let seg = role.segment();
             let off = seg_bytes[seg];
