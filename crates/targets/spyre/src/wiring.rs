@@ -1796,6 +1796,55 @@ pub struct TpForward {
     pub sources: &'static [SourceShard],
 }
 
+/// Which forward a session runs — decided by its rank's world, and nothing else.
+pub enum WorldForward {
+    /// A world of one: the model's one-rank wiring.
+    OneRank,
+    /// A sharded world: the forward the bake sharded for it.
+    Sharded(&'static TpForward),
+}
+
+/// A session whose world has no forward.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorldNotBaked {
+    pub world: u32,
+    /// The sharded worlds the model DID bake.
+    pub baked: Vec<u32>,
+}
+
+impl std::fmt::Display for WorldNotBaked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "this model has no forward for a {}-rank world (it baked {:?}); the bake names why \
+             in its `[spyre-tp]` warning",
+            self.world, self.baked
+        )
+    }
+}
+
+/// ⭐ THE ONE SELECTION: the forward a session running as `identity` loads. A world of one runs the
+/// one-rank wiring; a sharded world runs exactly the forward baked for it, or the load refuses by
+/// name — never a fallback to the one-rank forward (whose shapes are the whole model's, not a
+/// rank's) and never another world's.
+pub fn forward_for(
+    sharded: &'static [TpForward],
+    identity: crate::bundle_code::collective::TpIdentity,
+) -> Result<WorldForward, WorldNotBaked> {
+    let world = identity.world();
+    if !world.is_sharded() {
+        return Ok(WorldForward::OneRank);
+    }
+    sharded
+        .iter()
+        .find(|f| f.world == world)
+        .map(WorldForward::Sharded)
+        .ok_or_else(|| WorldNotBaked {
+            world: world.get(),
+            baked: sharded.iter().map(|f| f.world.get()).collect(),
+        })
+}
+
 impl Wiring {
     /// Element count of tensor `id`.
     #[inline]
