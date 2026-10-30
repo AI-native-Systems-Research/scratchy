@@ -990,34 +990,6 @@ impl SpyreWorker {
             );
             (s, decode_rungs, prefill_rungs)
         };
-        // ⭐ scratchy_target_spyre::wiring::HAT THE BAKE PLACED, per bundle — one value each, not six locals.
-        //
-        // These were `scalarmul_scales_v`, `prefill_uses_ones`, `prefill_ones_len`,
-        // `prefill_uses_identity`, `decode_uses_identity` and `baked_lm_head_ksplit`: declared
-        // here, assigned ~350 lines below inside a `#[cfg(feature = "spyre-hw")]` branch, and read
-        // ~600 lines below that. Each needed `#[allow(unused_mut, unused_assignments)]` to
-        // compile, and that allow is what let one of them go on being derived for a bind that had
-        // stopped existing. `BakeFacts::of` asks the layout once.
-        //
-        // ⚠️ ONE `allow` SURVIVES, DOWN FROM SIX, and it is a cfg artifact rather than a silenced
-        // problem: a value computed inside `cfg(sendnn)` and consumed outside it must be declared
-        // before the branch, so its initialiser is dead in exactly the build that assigns it.
-        // `None` IS read on the non-sendnn path, and what it feeds is one call away.
-        // ⛔ ON THE CARD, `decode_facts` HAS NO VALUE UNTIL THE DECODE BAKE GIVES IT ONE: the
-        // branch below that bakes the decode bundle assigns it, and every other card path returns
-        // an error first, so the compiler proves it is set before it is read (the
-        // `served_context_v` pattern below). `BakeFacts::NONE` is not a default for the card.
-        // `prefill_facts` is assigned only when a prefill bundle is baked, and is
-        // `BakeFacts::NONE` (a bundle that placed nothing) when there is none. On the emulator
-        // both are `NONE`, read once.
-        #[cfg(feature = "spyre-hw")]
-        let decode_facts: scratchy_target_spyre::wiring::BakeFacts;
-        #[cfg(not(feature = "spyre-hw"))]
-        let decode_facts = scratchy_target_spyre::wiring::BakeFacts::NONE;
-        #[cfg(feature = "spyre-hw")]
-        let mut prefill_facts = scratchy_target_spyre::wiring::BakeFacts::NONE;
-        #[cfg(not(feature = "spyre-hw"))]
-        let prefill_facts = scratchy_target_spyre::wiring::BakeFacts::NONE;
         // The KV byte budget the paged pool gets sized against — the card's real capacity ×
         // `--gpu-memory-utilization` − the bundle's non-KV segments. Declared out here for the same reason
         // `scalarmul_scales_v` is: it is computed in the SuperDsc branch below (sendnn only) but has to
@@ -1477,7 +1449,6 @@ impl SpyreWorker {
                             .join(", "),
                     )));
                 }
-                decode_facts = df;
                 // ── PREFILL-ALL-BUT-LAST: the DISTINCT m=N prefill dxp bundle (C4 stamps its own fp
                 //    in the prefill graph slot; lm_head skipped). Build a SECOND SuperDscSession from
                 //    it (binding the SAME weights again — 2× resident, the spike cost) so the prompt
@@ -1541,10 +1512,6 @@ impl SpyreWorker {
                                 },
                                 |(rm, _)| *rm as usize,
                             );
-                        // What the PREFILL bake placed. From the bundle, never from
-                        // `SCRATCHY_RMS_MATMUL_REDUCE`, so a bundle-vs-env mismatch cannot leave a
-                        // matmul reading an unbound (zero) seg0.
-                        prefill_facts = scratchy_target_spyre::wiring::BakeFacts::of(pl);
                         // The prefill bake's class sets against ITS placements — the same
                         // cross-check the decode bake just passed, for the same reason.
                         wirings
@@ -2157,40 +2124,34 @@ impl SpyreWorker {
         let (decode_prog_base, prefill_prog) = (1usize, Some(0usize));
 
         #[allow(unused_variables)]
-        // ⛔ THE FACTS ARE AN ARGUMENT, NOT A PATCH. This built every meta with `false`/`0`
-        // placeholders and the callers then assigned the real values field-by-field — so a phase
-        // whose caller forgot one served a bundle claiming it placed nothing.
         let mk_meta =
-            |p: Parsed,
-             prog: usize,
-             facts: scratchy_target_spyre::wiring::BakeFacts,
-             wiring: &'static scratchy_target_spyre::wiring::Wiring| BundleMeta {
-                #[cfg(not(feature = "spyre-hw"))]
-                prog,
-                #[cfg(not(feature = "spyre-hw"))]
-                paged: p.paged,
-                capacity: p.capacity,
-                m_cap: p.m_cap,
-                #[cfg(not(feature = "spyre-hw"))]
-                embed_src: p.embed_src,
-                #[cfg(not(feature = "spyre-hw"))]
-                cos_srcs: p.cos_srcs,
-                #[cfg(not(feature = "spyre-hw"))]
-                sin_srcs: p.sin_srcs,
-                result_id: p.result_id,
-                layers: p.layers,
-                #[cfg(not(feature = "spyre-hw"))]
-                output_ids: p.output_ids,
-                #[cfg(not(feature = "spyre-hw"))]
-                scalarmul_scales: p.scalarmul_scales,
-                #[cfg(not(feature = "spyre-hw"))]
-                phase: wiring.phase,
-                #[cfg(not(feature = "spyre-hw"))]
-                sample_seat: wiring.sample_seat,
-                #[cfg(feature = "spyre-hw")]
-                facts,
-                #[cfg(feature = "spyre-hw")]
-                wiring,
+            |p: Parsed, prog: usize, wiring: &'static scratchy_target_spyre::wiring::Wiring| {
+                BundleMeta {
+                    #[cfg(not(feature = "spyre-hw"))]
+                    prog,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    paged: p.paged,
+                    capacity: p.capacity,
+                    m_cap: p.m_cap,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    embed_src: p.embed_src,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    cos_srcs: p.cos_srcs,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    sin_srcs: p.sin_srcs,
+                    result_id: p.result_id,
+                    layers: p.layers,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    output_ids: p.output_ids,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    scalarmul_scales: p.scalarmul_scales,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    phase: wiring.phase,
+                    #[cfg(not(feature = "spyre-hw"))]
+                    sample_seat: wiring.sample_seat,
+                    #[cfg(feature = "spyre-hw")]
+                    wiring,
+                }
             };
 
         // Model-level dims (identical across cap buckets) from the first decode parse.
@@ -2222,7 +2183,7 @@ impl SpyreWorker {
             let mut decode: Vec<BundleMeta> = dparsed_all
                 .into_iter()
                 .enumerate()
-                .map(|(i, p)| mk_meta(p, decode_prog_base + i, decode_facts, &wirings.decode))
+                .map(|(i, p)| mk_meta(p, decode_prog_base + i, &wirings.decode))
                 .collect();
             // Ascending by reach so `select_decode`'s first-fit picks the smallest.
             decode.sort_by_key(|b| b.reach());
@@ -2231,7 +2192,6 @@ impl SpyreWorker {
                     mk_meta(
                         p,
                         prefill_prog.unwrap(),
-                        prefill_facts,
                         wirings.prefill.as_ref().unwrap_or(&wirings.decode),
                     )
                 })
@@ -2261,7 +2221,6 @@ impl SpyreWorker {
                         mk_meta(
                             wiring_to_parsed(&wirings.decode)?,
                             prefill_rungs.len() + j,
-                            decode_facts,
                             &wirings.decode,
                         ),
                         reach,
@@ -2273,10 +2232,7 @@ impl SpyreWorker {
                     .iter()
                     .enumerate()
                     .map(|(i, &(reach, _))| {
-                        Ok(at_walk(
-                            mk_meta(wiring_to_parsed(pw)?, i, prefill_facts, pw),
-                            reach,
-                        ))
+                        Ok(at_walk(mk_meta(wiring_to_parsed(pw)?, i, pw), reach))
                     })
                     .collect::<ExecutorResult<Vec<BundleMeta>>>()?,
                 None => Vec::new(),
