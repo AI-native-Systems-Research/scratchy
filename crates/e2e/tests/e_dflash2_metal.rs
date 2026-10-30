@@ -162,3 +162,123 @@ async fn drafted_output_is_the_targets() {
         assert_close(&alone, &drafted, &format!("drafting, {width} at once"));
     }
 }
+
+// ── Sampled output (temperature 1) ───────────────────────────────────────────────────────────
+
+/// A prompt whose continuations spread over many tokens past the first: the drafter drafts the
+/// second animal.
+const SAMPLED_PROMPT: &str = "My three favorite animals, in no particular order, are the";
+/// Continuations a run samples; tokens each.
+const SAMPLES: usize = 400;
+const SAMPLED_TOKENS: u32 = 4;
+/// A continuation seen this often in both runs together is its own category; rarer ones pool.
+const CATEGORY_COUNT: usize = 10;
+/// The chi-square test's p-value below which two runs' distributions differ.
+const P_FLOOR: f64 = 1e-3;
+
+/// `SAMPLES` continuations of [`SAMPLED_PROMPT`] at temperature 1, four requests at once.
+async fn samples(base_url: &str) -> Vec<String> {
+    let request = CompletionRequest {
+        prompt: Some(CompletionPrompt::Single(SAMPLED_PROMPT.to_string())),
+        max_tokens: Some(SAMPLED_TOKENS),
+        temperature: Some(1.0),
+        ..serde_json::from_str("{}").unwrap()
+    };
+    let mut out = Vec::with_capacity(SAMPLES);
+    while out.len() < SAMPLES {
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            let (client, request) = (Client::new(base_url), request.clone());
+            set.spawn(async move { client.completion(&request).await });
+        }
+        for response in set.join_all().await {
+            out.push(response.expect("a completion").choices[0].text.clone());
+        }
+    }
+    out
+}
+
+/// The two-sample chi-square test's statistic and degrees of freedom over `a` and `b`: a category
+/// each continuation seen at least [`CATEGORY_COUNT`] times in both together, the rest pooled.
+fn chi_square(a: &[String], b: &[String]) -> (f64, usize) {
+    use std::collections::HashMap;
+    let mut counts: HashMap<&str, (f64, f64)> = HashMap::new();
+    for s in a {
+        counts.entry(s).or_default().0 += 1.0;
+    }
+    for s in b {
+        counts.entry(s).or_default().1 += 1.0;
+    }
+    let (mut cells, mut other) = (Vec::new(), (0.0, 0.0));
+    for &(x, y) in counts.values() {
+        if x + y >= CATEGORY_COUNT as f64 {
+            cells.push((x, y));
+        } else {
+            other = (other.0 + x, other.1 + y);
+        }
+    }
+    cells.push(other);
+    let mut named: Vec<_> = (counts.iter())
+        .filter(|&(_, &(x, y))| x + y >= CATEGORY_COUNT as f64)
+        .collect();
+    named.sort_by(|p, q| ((q.1.0 - q.1.1).abs()).total_cmp(&(p.1.0 - p.1.1).abs()));
+    for (s, (x, y)) in named.iter().take(6) {
+        eprintln!("SAMPLED   {x:4} vs {y:4} {s:?}");
+    }
+    eprintln!("SAMPLED   {:4} vs {:4} (rarer, pooled)", other.0, other.1);
+    let (na, nb) = (a.len() as f64, b.len() as f64);
+    let chi = (cells.iter())
+        .filter(|&&(x, y)| x + y > 0.0)
+        .map(|&(x, y)| {
+            let (ea, eb) = ((x + y) * na / (na + nb), (x + y) * nb / (na + nb));
+            (x - ea).powi(2) / ea + (y - eb).powi(2) / eb
+        })
+        .sum();
+    (chi, cells.len() - 1)
+}
+
+/// The upper-tail p-value of `chi` at `df` degrees of freedom: Wilson-Hilferty's normal
+/// approximation, then the normal tail by Abramowitz-Stegun 7.1.26.
+fn chi_square_p(chi: f64, df: usize) -> f64 {
+    let k = df as f64;
+    let z = ((chi / k).cbrt() - (1.0 - 2.0 / (9.0 * k))) / (2.0 / (9.0 * k)).sqrt();
+    let x = z.abs() / std::f64::consts::SQRT_2;
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let poly = t
+        * (0.254_829_592
+            + t * (-0.284_496_736
+                + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+    let erfc = poly * (-x * x).exp();
+    match z >= 0.0 {
+        true => erfc / 2.0,
+        false => 1.0 - erfc / 2.0,
+    }
+}
+
+/// At temperature 1 the drafter's output is distributed as the target's alone: its continuations,
+/// sampled with drafting, are a sample of the target's own distribution (two-sample chi-square,
+/// p at least [`P_FLOOR`]). An acceptance that ignores the target's probability fails this.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn drafted_sampling_is_the_targets() {
+    scratchy_e2e::skip_if_no_gpu!();
+    let alone = {
+        let server = server(&["--num-speculative-tokens", "0"]).await;
+        samples(server.base_url()).await
+    };
+    let server = server(&["--enable-metrics"]).await;
+    let before = draft_tokens(server.base_url()).await;
+    let drafted = samples(server.base_url()).await;
+    let proposed = draft_tokens(server.base_url()).await - before;
+    let (chi, df) = chi_square(&alone, &drafted);
+    let p = chi_square_p(chi, df);
+    eprintln!(
+        "SAMPLED {proposed} draft tokens proposed; chi-square {chi:.2} at {df} df, p = {p:.4}"
+    );
+    assert!(proposed > 0, "the sampled run drafts");
+    assert!(
+        p >= P_FLOOR,
+        "the drafter's sampled continuations are not the target's: chi-square {chi:.2} at {df} \
+         df, p = {p:.2e}"
+    );
+}
