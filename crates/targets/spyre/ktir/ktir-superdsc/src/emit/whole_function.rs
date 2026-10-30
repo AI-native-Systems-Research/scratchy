@@ -5765,12 +5765,14 @@ fn lower_function_folded(
             // whose every input is a minted band intermediate states no windowed input; its mint
             // stays at the tile and the extents law refuses the sweep mismatch by name — refused
             // at the op that could have extended it, not silently mis-sized.)
-            // A BROADCAST operand's window is the vector it sprays, never the op's sweep (the walk's
-            // mask tile, `[ROWS, BLOCK]` of the stack, sprayed over every kv head's rows).
+            // A BROADCAST operand's window is the vector it sprays, not the op's sweep (the walk's
+            // mask tile, `[ROWS, BLOCK]` of the stack, sprayed over every kv head's rows) — unless
+            // its window is the launch's own flush band, which IS the sweep (the batched sampler's
+            // `pid`-cornered per-row seed, `[B, 1]` sprayed along the `[B, V]` rows it banks).
             let swept: Vec<Region> = per_op
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| bcast_axes.get(*i).is_none_or(Option::is_none))
+                .filter(|(i, r)| bcast_axes.get(*i).is_none_or(Option::is_none) || r.band.is_some())
                 .map(|(_, r)| *r)
                 .collect();
             let dims = [band_rows_of(&swept, dims[0]), dims[1]];
