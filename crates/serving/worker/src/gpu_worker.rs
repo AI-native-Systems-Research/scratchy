@@ -49,7 +49,7 @@ use scratchy_serving_engine::spec_decode::{DraftBudget, Drafting};
 use scratchy_serving_scheduler::scheduler::SnapshotBudget;
 #[cfg(feature = "metal")]
 use scratchy_serving_scheduler::scheduler::output::{
-    KvGranule, SchedulerOutput, SharedMemoryOps, SnapshotUnit, StateSnapshotOp,
+    KvGranule, NewRequestData, SchedulerOutput, SharedMemoryOps, SnapshotUnit, StateSnapshotOp,
 };
 #[cfg(feature = "metal")]
 use tracing::info;
@@ -1724,6 +1724,7 @@ impl MetalWorker {
             rings,
             slots: RingSlots::new(slots as u32),
             cycles: HashMap::new(),
+            contexts: HashMap::new(),
             captured_row_bytes: taps * target.hidden_size() as usize * elem_bytes,
             cycle_buffer: None,
         })
@@ -5196,6 +5197,10 @@ struct Dflash2 {
     slots: RingSlots,
     /// Each request's cycle: drafted by one step, verified by the next.
     cycles: HashMap<String, Cycle>,
+    /// Each request's draft context plan (Splash's `planDraftContext`): which of its prompt's rows
+    /// the drafter captures, for its snapshots' windows and its end's.
+    contexts:
+        HashMap<String, ::scratchy_serving_engine::spec_decode::draft_context::DraftContextPlan>,
     /// A captured row's bytes: the target's hidden state at each layer the drafter reads.
     captured_row_bytes: usize,
     /// The cycle's buffer ([`CycleLayout`](scratchy_target_metal::dflash2::CycleLayout)), grown to
@@ -5216,10 +5221,31 @@ impl Dflash2 {
         scratchy_target_metal::dflash2::DraftSeed::of(seed)
     }
 
-    /// What `req_id` holds of the worker's: its ring slot and its cycle.
+    /// What `req_id` holds of the worker's: its ring slot, its cycle and its draft context plan.
     fn release(&mut self, req_id: &str) {
         self.slots.release(req_id);
         self.cycles.remove(req_id);
+        self.contexts.remove(req_id);
+    }
+
+    /// `request`'s draft context plan: its prompt's replay from the tokens it resumes past, and
+    /// the snapshots it saves on the way.
+    fn plan(&mut self, request: &NewRequestData) -> ExecutorResult<()> {
+        use ::scratchy_serving_engine::spec_decode::draft_context::plan_draft_context;
+        let end = (request.prompt_token_ids.as_ref()).map_or(0, |p| p.len() as u32);
+        let begin = request.num_computed_tokens;
+        let saves: Vec<u32> = (request.state_save_points.iter().copied())
+            .filter(|&p| p > begin && p <= end)
+            .collect();
+        let plan =
+            plan_draft_context(begin, end, &saves, self.drafter.window as u32).map_err(|e| {
+                ExecutorError::WorkerExecution(format!(
+                    "{}: its draft context plan: {e:?}",
+                    request.req_id
+                ))
+            })?;
+        self.contexts.insert(request.req_id.clone(), plan);
+        Ok(())
     }
 }
 
@@ -7396,6 +7422,9 @@ impl Worker for MetalWorker {
             if num_tokens == 0 {
                 continue;
             }
+            if let Some(d) = self.dflash2.as_mut() {
+                d.plan(new_req)?;
+            }
             if let Some(ref params) = new_req.sampling_params {
                 self.sampling_params_map
                     .insert(new_req.req_id.clone(), params.clone());
@@ -8023,10 +8052,12 @@ impl Worker for MetalWorker {
         // block's policy.
         let block_step = match self.dflash2.as_mut() {
             Some(d) if !scheduler_output.draft_req_ids.is_empty() => {
-                match d
-                    .drafter
-                    .passes(&step_rows, &scheduler_output.draft_req_ids)
-                {
+                let passes = (d.drafter)
+                    .passes(&step_rows, &scheduler_output.draft_req_ids, &d.contexts)
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("DFlash2 draft context: {e:?}"))
+                    })?;
+                match passes {
                     Some(passes) => {
                         let commit_slots = (passes.commit.steps.iter())
                             .map(|&i| d.slots.of(&req_ids_in_order[i]))

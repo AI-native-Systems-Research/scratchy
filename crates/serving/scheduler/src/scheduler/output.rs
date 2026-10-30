@@ -57,6 +57,12 @@ pub struct NewRequestData {
     /// scheduler when the ordinal-reuse branch fires.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub reused_block_idxs: Option<Vec<usize>>,
+
+    /// The positions its recurrent state saves prefix-cache snapshots at, this step's and later
+    /// ones, ascending ([`StateSnapshotOp::position`]): a block drafter keeps its context of the
+    /// rows before each (Splash's draft context plan). Empty for a model with no recurrent state.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub state_save_points: Vec<u32>,
 }
 
 impl NewRequestData {
@@ -80,6 +86,7 @@ impl NewRequestData {
             mm_data,
             block_annotations,
             reused_block_idxs: None,
+            state_save_points: Vec::new(),
         }
     }
 }

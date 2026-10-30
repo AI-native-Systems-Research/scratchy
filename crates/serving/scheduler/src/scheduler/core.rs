@@ -192,6 +192,11 @@ pub trait KVCacheManagerOps: Send {
     /// The step that carried `saves` reported back: those snapshots now hold their state.
     fn commit_state_saves(&mut self, _saves: &[StateSnapshotOp]) {}
 
+    /// The save points `request_id`'s chunks have yet to pass, ascending.
+    fn state_save_points(&self, _request_id: &str) -> Vec<u32> {
+        Vec::new()
+    }
+
     /// Step `step` came back, and every step before it came back or failed: each block registered
     /// in the prefix cache while they were scheduled holds the KV it was registered for.
     fn commit_written(&mut self, step: StepId);
@@ -2685,6 +2690,13 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             .collect()
     }
 
+    fn state_save_points(&self, request_id: &str) -> Vec<u32> {
+        let points = (self.recurrent.as_ref()).and_then(|rec| rec.save_points.get(request_id));
+        points.map_or_else(Vec::new, |p| {
+            p.iter().map(|&(position, _)| position).collect()
+        })
+    }
+
     fn commit_state_saves(&mut self, saves: &[StateSnapshotOp]) {
         if let Some(rec) = self.recurrent.as_mut() {
             for op in saves {
@@ -3821,6 +3833,11 @@ impl SchedulerInterface for Scheduler {
                     req.block_annotations,
                 );
                 nrd.reused_block_idxs = reused;
+                // Its save points: those this step passes and saves at, then those ahead.
+                let saved_now = (state_saves.iter()).filter(|op| op.req_id == nrd.req_id);
+                nrd.state_save_points = (saved_now.map(|op| op.position))
+                    .chain(self.kv_cache.state_save_points(&nrd.req_id))
+                    .collect();
                 nrd
             })
             .collect();
@@ -8847,6 +8864,22 @@ mod tests {
             })
             .collect();
         assert_eq!(chunks, vec![(256, vec![]), (256, vec![]), (88, vec![592])]);
+    }
+
+    /// A new request tells its worker every point its state saves at — the one its first chunk
+    /// passes, and those ahead — so a block drafter keeps its context of the rows before each.
+    #[test]
+    fn recurrent_new_request_carries_its_save_points() {
+        let mut sched = recurrent_scheduler(4, 256);
+        let mut request = make_request("r1", 600);
+        request.cache_breakpoints = vec![200];
+        sched.add_request(request);
+        let out = run_step(&mut sched);
+        let saved: Vec<u32> = (out.recurrent_state.saves.iter())
+            .map(|op| op.position)
+            .collect();
+        assert_eq!(saved, [192], "its first chunk saves at the breakpoint");
+        assert_eq!(out.scheduled_new_reqs[0].state_save_points, [192, 592]);
     }
 
     #[test]

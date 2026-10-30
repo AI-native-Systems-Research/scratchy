@@ -34,6 +34,9 @@
 use std::collections::{HashMap, HashSet};
 
 use super::backend::ForwardArgmaxRequest;
+use super::draft_context::{
+    DraftContextError, DraftContextPlan, capture_spans_for_dispatch, plan_draft_context,
+};
 use super::mtp::{DraftBudget, StepRows};
 
 /// A block drafter's passes over one step (module docs), run by the worker that ran it.
@@ -66,10 +69,11 @@ pub struct Commit {
     pub slot_mapping: Vec<u32>,
     pub cu_seqlens_q: Vec<u32>,
     pub seqused_k: Vec<u32>,
-    /// `(row, step row, rows)`: each sequence's rows, reading the target's captured rows at its
-    /// rows of the step.
+    /// `(row, step row, rows)`: each run's rows, reading the target's captured rows at its rows of
+    /// the step.
     pub hidden_rows: Vec<(u32, u32, u32)>,
-    /// Each sequence's index in the step: whose ring it commits to.
+    /// Each run's sequence, its index in the step: whose ring it commits to. A prompt's step may
+    /// commit more than one run of its rows (its draft context plan's capture spans).
     pub steps: Vec<usize>,
     /// Every sequence verifies a block, a lane of [`BlockPasses`]'s acceptance each in order: each
     /// commits the rows it retained.
@@ -166,14 +170,19 @@ fn request<'a>(
 }
 
 impl BlockDrafter {
-    /// The drafter's passes over the rows of `step` that the requests in `plan` run. `None` when
-    /// none is planned.
-    pub fn passes(&self, step: &StepRows<'_>, plan: &HashSet<String>) -> Option<BlockPasses> {
+    /// The drafter's passes over the rows of `step` that the requests in `plan` run, a prompt's
+    /// rows those its draft context plan (`contexts`) captures. `None` when none is planned.
+    pub fn passes(
+        &self,
+        step: &StepRows<'_>,
+        plan: &HashSet<String>,
+        contexts: &HashMap<String, DraftContextPlan>,
+    ) -> Result<Option<BlockPasses>, DraftContextError> {
         let seqs: Vec<usize> = (0..step.req_ids.len())
             .filter(|&i| plan.contains(&step.req_ids[i]))
             .collect();
         if seqs.is_empty() {
-            return None;
+            return Ok(None);
         }
         let rows_of = |i: usize| step.cu_seqlens_q[i] as usize..step.cu_seqlens_q[i + 1] as usize;
         let mut commit = Commit {
@@ -190,30 +199,42 @@ impl BlockDrafter {
         let mut lanes = Vec::new();
         for &i in &seqs {
             let rows = rows_of(i);
-            // Splash's draft context plan (runtime/model/DraftContextPlan.cpp:7-80
-            // `planDraftContext`): what a sequence prefills up to the end of its history is
-            // captured and committed from a window before that end, all its rings hold; a chunk
-            // short of the end drafts nothing.
+            // Splash's draft context plan (runtime/model/DraftContextPlan.cpp `planDraftContext`,
+            // `draftCaptureSpansForDispatch`): a prompt's rows are captured and committed where
+            // its plan says — each state it leaves, the snapshots it saves and its end, holds the
+            // window before it. Rows past the prompt (a decode or verify step's), or of a sequence
+            // with no plan, are the active state's of its history: the window before its end, all
+            // its rings hold. A chunk short of the end drafts nothing.
             let end = step.history_lens[i];
-            let reaches_end = step.positions[rows.end - 1] + 1 >= end;
-            let from = end.saturating_sub(self.window as u32);
-            let skip = (rows.clone())
-                .take_while(|&r| step.positions[r] < from)
-                .count();
-            let kept = rows.start + skip..rows.end;
-            if kept.is_empty() {
+            let (first, last) = (step.positions[rows.start], step.positions[rows.end - 1] + 1);
+            let reaches_end = last >= end;
+            let planned = (contexts.get(&step.req_ids[i])).filter(|c| last <= c.replay_end);
+            let active;
+            let context = match planned {
+                Some(context) => context,
+                None => {
+                    active = plan_draft_context(0, end.max(last), &[], self.window as u32)?;
+                    &active
+                }
+            };
+            let captures = capture_spans_for_dispatch(context, first, last)?;
+            if captures.is_empty() {
                 continue;
             }
-            let start = commit.input_ids.len() as u32;
-            commit.input_ids.extend(&step.input_ids[kept.clone()]);
-            commit.positions.extend(&step.positions[kept.clone()]);
-            commit.slot_mapping.extend(kept.clone().map(|_| u32::MAX));
-            commit.cu_seqlens_q.push(commit.input_ids.len() as u32);
-            commit.seqused_k.push(step.positions[rows.end - 1] + 1);
-            commit
-                .hidden_rows
-                .push((start, kept.start as u32, kept.len() as u32));
-            commit.steps.push(i);
+            for capture in captures {
+                let at = |position: u32| rows.start + (position - first) as usize;
+                let kept = at(capture.begin)..at(capture.end);
+                let start = commit.input_ids.len() as u32;
+                commit.input_ids.extend(&step.input_ids[kept.clone()]);
+                commit.positions.extend(&step.positions[kept.clone()]);
+                commit.slot_mapping.extend(kept.clone().map(|_| u32::MAX));
+                commit.cu_seqlens_q.push(commit.input_ids.len() as u32);
+                commit.seqused_k.push(capture.end);
+                commit
+                    .hidden_rows
+                    .push((start, kept.start as u32, kept.len() as u32));
+                commit.steps.push(i);
+            }
             // A sequence the target samples every row of verifies them; one it samples the last
             // row of gets that row's token; one it samples none of runs a prompt chunk short of
             // its end.
@@ -234,7 +255,7 @@ impl BlockDrafter {
             }
         }
         if commit.steps.is_empty() {
-            return None;
+            return Ok(None);
         }
         // A cycle's commit reads a retained count a lane: every sequence is one.
         commit.cycle &= lanes.len() == commit.steps.len();
@@ -242,7 +263,7 @@ impl BlockDrafter {
             && (lanes.iter()).all(|l| self.fits(l, block_rows))
             && !lanes.is_empty();
         let block = (drafts || commit.cycle).then(|| self.block(step, lanes, drafts));
-        Some(BlockPasses { commit, block })
+        Ok(Some(BlockPasses { commit, block }))
     }
 
     /// Whether `lane`'s next block, after the most rows it can retain, lands within the context.
@@ -368,7 +389,8 @@ mod tests {
             sampled: SampledRows::of(&[0, 8], |_| true).expect("rows"),
         };
         let passes = DRAFTER
-            .passes(&step.rows(), &plan(&["a"]))
+            .passes(&step.rows(), &plan(&["a"]), &HashMap::new())
+            .expect("a plan")
             .expect("planned");
         assert!(passes.commit.cycle);
         assert_eq!(passes.commit.hidden_rows, [(0, 0, 8)]);
@@ -423,8 +445,16 @@ mod tests {
             history: vec![40],
             sampled: SampledRows::of(&[0, to - from], |_| false).expect("rows"),
         };
-        assert_eq!(drafter.passes(&chunk(0, 16).rows(), &plan(&["a"])), None);
-        let middle = (drafter.passes(&chunk(16, 32).rows(), &plan(&["a"]))).expect("commits");
+        assert_eq!(
+            drafter
+                .passes(&chunk(0, 16).rows(), &plan(&["a"]), &HashMap::new())
+                .expect("a plan"),
+            None
+        );
+        let middle = (drafter
+            .passes(&chunk(16, 32).rows(), &plan(&["a"]), &HashMap::new())
+            .expect("a plan"))
+        .expect("commits");
         assert_eq!(middle.commit.positions, (24..32).collect::<Vec<_>>());
         assert_eq!(middle.commit.input_ids, (124..132).collect::<Vec<_>>());
         assert_eq!(middle.commit.hidden_rows, [(0, 8, 8)]);
@@ -432,10 +462,72 @@ mod tests {
             middle.block, None,
             "a chunk short of its end drafts nothing"
         );
-        let last = (drafter.passes(&chunk(32, 40).rows(), &plan(&["a"]))).expect("commits");
+        let last = (drafter
+            .passes(&chunk(32, 40).rows(), &plan(&["a"]), &HashMap::new())
+            .expect("a plan"))
+        .expect("commits");
         assert_eq!(last.commit.positions, (32..40).collect::<Vec<_>>());
         let block = last.block.expect("drafts at its end");
         assert_eq!(block.positions, (40..48).collect::<Vec<_>>());
+    }
+
+    /// A prefill in chunks of 16 of a 64-token prompt that saves a snapshot at 24 (a window of
+    /// 16): the snapshot's window, 8..24, and the end's, 48..64 — farther than a window from the
+    /// snapshot, a fresh one — are committed, and nothing between them: the chunk 32..48 runs no
+    /// pass at all.
+    #[test]
+    fn a_prompt_commits_each_snapshot_s_window_and_its_end_s() {
+        let drafter = BlockDrafter {
+            window: 16,
+            ..DRAFTER
+        };
+        let contexts = HashMap::from([(
+            "a".to_string(),
+            plan_draft_context(0, 64, &[24], 16).expect("a plan"),
+        )]);
+        let chunk = |from: u32, to: u32| Step {
+            req_ids: vec!["a".into()],
+            input_ids: (from + 100..to + 100).collect(),
+            positions: (from..to).collect(),
+            cu: vec![0, to - from],
+            history: vec![64],
+            sampled: SampledRows::of(&[0, to - from], |_| false).expect("rows"),
+        };
+        let commits = |from: u32, to: u32| {
+            (drafter.passes(&chunk(from, to).rows(), &plan(&["a"]), &contexts))
+                .expect("a plan")
+                .map(|p| p.commit.positions)
+        };
+        assert_eq!(commits(0, 16), Some((8..16).collect()));
+        assert_eq!(commits(16, 32), Some((16..24).collect()));
+        assert_eq!(commits(32, 48), None);
+        assert_eq!(commits(48, 64), Some((48..64).collect()));
+    }
+
+    /// A prompt resumed from a hit at 32 whose end is within a window of it continues the
+    /// restored window: it commits every row it replays, from its first.
+    #[test]
+    fn a_hit_commits_its_whole_replay_onto_its_restored_window() {
+        let drafter = BlockDrafter {
+            window: 16,
+            ..DRAFTER
+        };
+        let context = plan_draft_context(32, 40, &[], 16).expect("a plan");
+        assert!(context.restores_draft_state);
+        let contexts = HashMap::from([("a".to_string(), context)]);
+        let step = Step {
+            req_ids: vec!["a".into()],
+            input_ids: (132..140).collect(),
+            positions: (32..40).collect(),
+            cu: vec![0, 8],
+            history: vec![40],
+            sampled: SampledRows::of(&[0, 8], |_| false).expect("rows"),
+        };
+        let passes = (drafter.passes(&step.rows(), &plan(&["a"]), &contexts))
+            .expect("a plan")
+            .expect("commits");
+        assert_eq!(passes.commit.positions, (32..40).collect::<Vec<_>>());
+        assert!(passes.block.is_some(), "it drafts at its end");
     }
 
     /// A sequence verifying the 3 rows of its block its budget chose (its anchor 500, drafts 501
@@ -451,7 +543,8 @@ mod tests {
             sampled: SampledRows::of(&[0, 3], |_| true).expect("rows"),
         };
         let passes = DRAFTER
-            .passes(&step.rows(), &plan(&["a"]))
+            .passes(&step.rows(), &plan(&["a"]), &HashMap::new())
+            .expect("a plan")
             .expect("planned");
         assert!(passes.commit.cycle);
         assert_eq!(passes.commit.hidden_rows, [(0, 0, 3)]);
@@ -473,7 +566,8 @@ mod tests {
             sampled: SampledRows::of(&[0, 5], |_| false).expect("rows"),
         };
         let passes = DRAFTER
-            .passes(&last.rows(), &plan(&["a"]))
+            .passes(&last.rows(), &plan(&["a"]), &HashMap::new())
+            .expect("a plan")
             .expect("planned");
         assert!(!passes.commit.cycle);
         let block = passes.block.expect("drafts");
@@ -494,13 +588,21 @@ mod tests {
             history: vec![31, 13],
             sampled: SampledRows::of(&[0, 1, 2], |_| false).expect("rows"),
         };
-        let passes = (DRAFTER.passes(&decoding.rows(), &plan(&["a", "b"]))).expect("planned");
+        let passes = (DRAFTER
+            .passes(&decoding.rows(), &plan(&["a", "b"]), &HashMap::new())
+            .expect("a plan"))
+        .expect("planned");
         assert!(!passes.commit.cycle, "a decode step commits every row");
         assert_eq!(passes.commit.positions, [30, 12]);
         assert_eq!(
             passes.block, None,
             "two sequences' blocks overflow 8 verify rows"
         );
-        assert_eq!(DRAFTER.passes(&decoding.rows(), &plan(&[])), None);
+        assert_eq!(
+            DRAFTER
+                .passes(&decoding.rows(), &plan(&[]), &HashMap::new())
+                .expect("a plan"),
+            None
+        );
     }
 }
