@@ -2054,42 +2054,27 @@ fn the_paged_attention_splices_with_its_contract() {
         assert_eq!(bound, want, "{at}");
         assert_eq!(k.mask.map(|m| m.get()), Some(tids.mask), "{at}");
         // ⭐ THE CARD'S HALF, through the production door under the bundle's own layout: the walk
-        // lowers — its body at trip 0, marked for the card's per-trip relaunch exactly when the
-        // walk loops (a one-page pool's walk is one trip, which the front end promotes to
-        // straight-line code). At a head two sticks wide the decode lowers too (its pages permuted
-        // per kv head, its output row permuted back); the prefill's wider head is refused by name
-        // (its query relayout and its whole-page gather past LX), rather than lowered at addresses
-        // its frames do not have.
+        // lowers at every geometry — its body at trip 0, marked for the card's per-trip relaunch
+        // exactly when the walk loops (a one-page pool's walk is one trip, which the front end
+        // promotes to straight-line code). At a head two sticks wide the decode's pages are permuted
+        // per kv head and its output row back, and the prefill's query and output are relaid
+        // head-major and back, its page gathered in pieces.
         let layout = triton_ktir_superdsc::layout::for_node(k)
             .unwrap_or_else(|e| panic!("{at}: layout: {e:?}"));
         scratchy_triton_splice::allocate_paged_cache(k, &layout)
             .unwrap_or_else(|e| panic!("{at}: {e}"));
         let mut sym = 0i64;
-        let lowered = door_lower(k, &mut sym, Some(&layout), None);
-        if s.geom.2 == 64 || s.mq == 1 {
-            let ops = lowered.unwrap_or_else(|e| panic!("{at}: the walk lowers: {}", e.message));
-            assert!(!ops.is_empty(), "{at}: the walk emitted nothing");
-            let walking = ktir_superdsc::emit::loop_fold::flatten(k)
-                .expect("the program flattens")
-                .is_some();
-            assert_eq!(
-                ops.iter().any(|e| e.walk.is_some()),
-                walking,
-                "{at}: the body is marked for the relaunch exactly when the walk loops"
-            );
-        } else {
-            let Err(refused) = lowered else {
-                panic!(
-                    "{at}: a {}-wide head's prefill lowered past the one-stick law",
-                    s.geom.2
-                );
-            };
-            assert!(
-                refused.message.contains("stick"),
-                "{at}: {}",
-                refused.message
-            );
-        }
+        let ops = door_lower(k, &mut sym, Some(&layout), None)
+            .unwrap_or_else(|e| panic!("{at}: the walk lowers: {}", e.message));
+        assert!(!ops.is_empty(), "{at}: the walk emitted nothing");
+        let walking = ktir_superdsc::emit::loop_fold::flatten(k)
+            .expect("the program flattens")
+            .is_some();
+        assert_eq!(
+            ops.iter().any(|e| e.walk.is_some()),
+            walking,
+            "{at}: the body is marked for the relaunch exactly when the walk loops"
+        );
     }
 }
 

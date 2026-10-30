@@ -4559,6 +4559,84 @@ mod walk_on_the_card {
         );
     }
 
+    /// ⭐ THE PROMPT WALK AT A HEAD TWO STICKS WIDE. The query's head-major relayout is two
+    /// stick-run copies before the walk — head `a`'s stick `s`, the 64 rows at stick column `2a + s`
+    /// of the gathered `[64, 32·128]` block, to `s·32·64 + a·64` of the head-major `[32·64, 128]` —
+    /// and the output's is their inverse after it. A page (8 kv heads × 64 slots × 128, 128 KB) is
+    /// past dxp's entry bound, so the body gathers it in two 64 KB pieces through its page id
+    /// doubled once, piece `p` read and landed `p · 64 KB` in.
+    #[test]
+    fn a_two_stick_head_prompt_walk_relays_its_heads_and_gathers_pages_in_pieces() {
+        let node = walk_at(64, 4, 128);
+        let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+        allocate_paged_cache(&node, &layout).expect("the cache allocates");
+        let mut sym = 0i64;
+        let ops = ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
+            .unwrap_or_else(|e| panic!("the hd128 prompt walk lowers: {}", e.message));
+        let first_body = ops.iter().position(|e| e.walk.is_some()).expect("a body");
+        let named = |prefix: &str| -> Vec<usize> {
+            (0..ops.len())
+                .filter(|&i| ops[i].op_name.starts_with(prefix))
+                .collect()
+        };
+        // (heads, rows, sticks a head)
+        let (a, b, n) = (32u32, 64u32, 2u32);
+        let stick = 64u32;
+        let heads = named("heads");
+        assert_eq!(heads.len(), 4, "two copies in, two out");
+        for (j, &i) in heads.iter().enumerate() {
+            let e = &ops[i];
+            let s = (j as u32) % n;
+            let offs: Vec<u32> = e.arg_bindings.iter().map(|x| x.offset_elems).collect();
+            let (block, head_major) = (s * b * stick, s * a * b * stick);
+            if j < 2 {
+                assert!(
+                    i < first_body,
+                    "{}: the query's copy precedes the walk",
+                    e.op_name
+                );
+                assert_eq!(offs, [block, head_major], "{}", e.op_name);
+            } else {
+                assert!(
+                    e.walk.is_none() && i > first_body,
+                    "{}: after the walk",
+                    e.op_name
+                );
+                assert_eq!(offs, [head_major, block], "{}", e.op_name);
+            }
+        }
+        let piece = 64 * 1024 / 2;
+        for d in [named("gather0_o"), named("gather1_o")] {
+            assert_eq!(d.len(), 2, "the K page and the V page");
+            for i in d {
+                let e = &ops[i];
+                let p: u32 = e.op_name["gather".len()..e.op_name.len()]
+                    .split('_')
+                    .next()
+                    .and_then(|x| x.parse().ok())
+                    .expect("a piece index");
+                assert!(
+                    e.walk.is_some(),
+                    "{}: a page piece is in the body",
+                    e.op_name
+                );
+                let landed = e
+                    .arg_bindings
+                    .iter()
+                    .find(|x| !x.is_input)
+                    .expect("the landing")
+                    .offset_elems;
+                assert_eq!(landed, p * piece, "{}", e.op_name);
+            }
+        }
+        let doubled = named("addi32toi32");
+        assert_eq!(doubled.len(), 2, "each page's id doubled once");
+        assert!(
+            doubled.iter().all(|&i| ops[i].walk.is_some()),
+            "per trip, in the body"
+        );
+    }
+
     /// ⛔ A PAGE IN BLOCKS IS READ ONLY AS BLOCKS. Read `[KV, BLOCK, 128]`, a page lands as its kv
     /// heads' stick-major blocks one after another — the frame a batched transpose and a batched
     /// contraction's kernel take a block of at its base, and not the flat frame any other op reads.
@@ -4569,11 +4647,11 @@ mod walk_on_the_card {
         // (what the program stores, the refusal's own words)
         for (stored, says) in [
             (
-                "tl.reshape(k + v, [8 * 64, 128])",
+                "tl.reshape(k + v, [4 * 64, 128])",
                 "only a batched transpose's input or a batched contraction's kernel reads",
             ),
             (
-                "tl.reshape(k, [8 * 64, 128]) + tl.reshape(v, [8 * 64, 128])",
+                "tl.reshape(k, [4 * 64, 128]) + tl.reshape(v, [4 * 64, 128])",
                 "every frame a shape op names is the flat frame's",
             ),
         ] {
@@ -4589,14 +4667,14 @@ import triton.language as tl
 
 @triton.jit
 def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
-    k_desc = tl.make_tensor_descriptor(k_pages, shape=[NUM_PAGES, 8 * 64 * 128],
-                                       strides=[8 * 64 * 128, 1], block_shape=[1, 8 * 64 * 128])
-    v_desc = tl.make_tensor_descriptor(v_pages, shape=[NUM_PAGES, 8 * 64 * 128],
-                                       strides=[8 * 64 * 128, 1], block_shape=[1, 8 * 64 * 128])
-    rows = tl.make_tensor_descriptor(out, shape=[8 * 64, 128], strides=[128, 1],
-                                     block_shape=[8 * 64, 128])
-    k = tl.reshape(k_desc.load([tl.load(k_index), 0]), [8, 64, 128])
-    v = tl.reshape(v_desc.load([tl.load(v_index), 0]), [8, 64, 128])
+    k_desc = tl.make_tensor_descriptor(k_pages, shape=[NUM_PAGES, 4 * 64 * 128],
+                                       strides=[4 * 64 * 128, 1], block_shape=[1, 4 * 64 * 128])
+    v_desc = tl.make_tensor_descriptor(v_pages, shape=[NUM_PAGES, 4 * 64 * 128],
+                                       strides=[4 * 64 * 128, 1], block_shape=[1, 4 * 64 * 128])
+    rows = tl.make_tensor_descriptor(out, shape=[4 * 64, 128], strides=[128, 1],
+                                     block_shape=[4 * 64, 128])
+    k = tl.reshape(k_desc.load([tl.load(k_index), 0]), [4, 64, 128])
+    v = tl.reshape(v_desc.load([tl.load(v_index), 0]), [4, 64, 128])
     rows.store([0, 0], STORED)
 "#;
         let src = SRC.replace("STORED", stored);
