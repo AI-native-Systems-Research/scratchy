@@ -1170,11 +1170,12 @@ pub fn load_scatters(
                      contiguous"
                 ));
             }
-            let tid = super::whole_function::mint_inter(
+            let tid = super::whole_function::mint_scratch(
                 k,
                 layout,
                 super::whole_function::mint_floor(k),
                 value,
+                0,
             );
             layout.synth(PlaceId::Act(tid), &[src.v_rows * groups, width]);
             let scratch = crate::place::act_name(tid);
@@ -6049,58 +6050,109 @@ pub fn gather_pieces(page_sticks: u32) -> Option<u32> {
 /// An entry past [`GATHER_ENTRY_BYTES_MAX`] is copied in `pieces` ([`gather_pieces`]): dxp steps a
 /// gather's index by its per-entry extent, so through an index already scaled by `pieces` (the
 /// caller's) a piece's extent steps a whole entry, and piece `p` reads and lands `p` pieces in.
+///
+/// ⭐ SEVERAL ENTRIES IN PIECES (a decode batch's pages at head dim 128) land each piece's entries
+/// one after another — a gather's landing steps by its own extent, the piece — so they land in
+/// `landing`, piece by piece, and runs of one piece copy them into `out` at the entry's pitch.
 pub fn page_gather(
     name: &str,
     g: &Gather,
-    page_sticks: u32,
-    pieces: u32,
+    (page_sticks, pieces): (u32, u32),
     out: &Region,
+    landing: Option<&Region>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
     use crate::ir::bridge::tiled_op_sdsc_op::{
-        GatheredWords, PageGatherRows, assemble_page_gather_copy,
+        GatheredWords, PageGatherRows, StickRuns, assemble_page_gather_copy,
+        assemble_stick_runs_copy,
     };
-    if pieces == 0 || !page_sticks.is_multiple_of(pieces) || (pieces > 1 && g.entries != 1) {
+    if pieces == 0 || !page_sticks.is_multiple_of(pieces) {
         return err(format!(
-            "{name}: {} entr(ies) of {page_sticks} sticks gathered in {pieces} pieces — a piece is \
-             whole sticks of ONE entry (the next entry would land a piece apart, not an entry)",
-            g.entries
+            "{name}: an entry of {page_sticks} sticks gathered in {pieces} pieces — a piece is whole \
+             sticks of the entry"
         ));
     }
     let piece_sticks = page_sticks / pieces;
     let stick = Fp16::ELEMS_PER_STICK;
-    (0..pieces)
-        .map(|p| {
-            let gather = crate::superdsc_opspec::GatherIndex::of_scratch_rows(
-                crate::place::act_name(g.index_tid),
-                crate::superdsc_opspec::PageExtent::of_positions(piece_sticks),
-                g.first_entry,
-            );
-            let op_name = if pieces == 1 {
-                format!("gather_o{}", out.tid)
-            } else {
-                format!("gather{p}_o{}", out.tid)
-            };
+    let interleave = pieces > 1 && g.entries > 1;
+    let (into, mut ops) = match (interleave, landing) {
+        (false, _) => (out, Vec::new()),
+        (true, Some(l)) => (l, Vec::new()),
+        (true, None) => {
+            return err(format!(
+                "{name}: {} entries gathered in {pieces} pieces land a piece apart, and no landing \
+                 holds them for the copy to the entries' pitch",
+                g.entries
+            ));
+        }
+    };
+    // Where piece `p` lands: `p` pieces into each entry, or, interleaving, after the `p` pieces
+    // before it of every entry.
+    let landed_at = |p: u32| {
+        if interleave {
+            p * g.entries * piece_sticks * stick
+        } else {
+            p * piece_sticks * stick
+        }
+    };
+    for p in 0..pieces {
+        let gather = crate::superdsc_opspec::GatherIndex::of_scratch_rows(
+            crate::place::act_name(g.index_tid),
+            crate::superdsc_opspec::PageExtent::of_positions(piece_sticks),
+            g.first_entry,
+        );
+        let op_name = if pieces == 1 {
+            format!("gather_o{}", out.tid)
+        } else {
+            format!("gather{p}_o{}", out.tid)
+        };
+        ops.push(
             assemble_page_gather_copy(
                 &op_name,
                 &crate::place::act_name(g.value_tid),
-                &out.name(),
+                &into.name(),
                 gather,
                 PageGatherRows {
                     rows: g.entries * piece_sticks,
                     words: GatheredWords::Fp16,
                     src_elems: p * piece_sticks * stick,
-                    dst_elems: p * piece_sticks * stick,
+                    dst_elems: landed_at(p),
                 },
                 sym_id_base,
                 layout,
             )
             .map_err(|message| Error {
                 message: format!("{name}: {message}"),
-            })
-        })
-        .collect()
+            })?,
+        );
+    }
+    if interleave {
+        for p in 0..pieces {
+            ops.push(
+                assemble_stick_runs_copy(
+                    &format!("pieces{p}_o{}", out.tid),
+                    &into.name(),
+                    &out.name(),
+                    StickRuns {
+                        runs: g.entries,
+                        run_sticks: piece_sticks,
+                        src_pitch: piece_sticks,
+                        dst_pitch: page_sticks,
+                        src_elems: landed_at(p),
+                        dst_elems: p * piece_sticks * stick,
+                        df: Df::Fp16,
+                    },
+                    sym_id_base,
+                    layout,
+                )
+                .map_err(|message| Error {
+                    message: format!("{name}: {message}"),
+                })?,
+            );
+        }
+    }
+    Ok(ops)
 }
 
 /// ⭐ A CHAINED INDEX'S FIRST GATHER — the run of `g`'s index words for one position, copied into

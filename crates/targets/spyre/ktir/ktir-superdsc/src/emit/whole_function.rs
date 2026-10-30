@@ -2087,7 +2087,13 @@ fn program_broadcast_chains(
                     // CROSS-CHECKED AGAINST THE BROADCAST'S OWN `Dimensions`: two independent
                     // statements of the same axis, so a program where they disagree is refused instead
                     // of one of them being believed.
-                    if want.map(|i| target.get(i).copied()) != Some(Some(1)) {
+                    // ⭐ ONCE THE SPRAYED AXIS IS PROVEN by the expand nearest the broadcast, an expand
+                    // further out only inserts another unit dim — a one-chunk decode batch's leading
+                    // `J = 1` (`[32, 8, 4]` → `[1, 32, 8, 4]` → `[1, 32, 8, 4, 1]`) — which moves no
+                    // element, so the walk crosses it.
+                    if !saw_degenerate_expand
+                        && want.map(|i| target.get(i).copied()) != Some(Some(1))
+                    {
                         return err(format!(
                             "{}: `tensor.expand_shape` targets {target:?}, whose {} axis is not \
                              degenerate, but the `linalg.broadcast` reading it sprays along {axis:?}. \
@@ -3402,8 +3408,24 @@ fn row_tiled_family(
 /// of colliding with that layout's placements. `floor` is the node-derived bound from
 /// [`lower_function`] — see its law doc for why the mint is bundle-seeded, not node-seeded.
 pub(super) fn mint_inter(k: &KtirNode, layout: &BundleLayout, floor: u32, ssa: Ssa) -> u32 {
+    mint(k, layout, floor, crate::ktir_node::MintKey::Value(ssa))
+}
+
+/// [`mint_inter`] for the `n`th scratch the lowering of `ssa` takes beside its own buffer
+/// ([`crate::ktir_node::MintKey::Scratch`]).
+pub(super) fn mint_scratch(
+    k: &KtirNode,
+    layout: &BundleLayout,
+    floor: u32,
+    ssa: Ssa,
+    n: u8,
+) -> u32 {
+    mint(k, layout, floor, crate::ktir_node::MintKey::Scratch(ssa, n))
+}
+
+fn mint(k: &KtirNode, layout: &BundleLayout, floor: u32, key: crate::ktir_node::MintKey) -> u32 {
     let mut minted = k.minted.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(&tid) = minted.get(&ssa)
+    if let Some(&tid) = minted.get(&key)
         && layout
             .synth
             .borrow()
@@ -3413,7 +3435,7 @@ pub(super) fn mint_inter(k: &KtirNode, layout: &BundleLayout, floor: u32, ssa: S
         return tid;
     }
     let tid = layout.take_inter_tid(floor);
-    minted.insert(ssa, tid);
+    minted.insert(key, tid);
     tid
 }
 
@@ -4121,10 +4143,14 @@ fn lower_function_folded(
             // ⭐ ROW-MAJOR ROWS READ STICK-MAJOR — `[R·C, stick]` (a batched dot's per-head rows,
             // `[B, KV, G, D]`) reshaped to `[R, C·stick]` (the `[B, H·D]` output block): the stick
             // permute back, into the parameter the reshape's result is stored to when it is stored
-            // whole, else into a minted buffer.
+            // whole, else into a minted buffer. Head rows several sticks wide (head dim 128) are
+            // stick-major themselves, so they go row-major first ([`HeadRows`]).
+            let back = stick_major_split(&to, &from)
+                .map(|split| (split, None))
+                .or_else(|| HeadRows::of(&to, &from).map(|h| ((h.rows, h.row_sticks), Some(h))));
             if !gathered_loads.contains_key(&src)
                 && !same_card_bytes(&from, &to)
-                && let Some((rows, sticks)) = stick_major_split(&to, &from)
+                && let Some(((rows, sticks), head_rows)) = back
             {
                 let Some(layout) = layout else {
                     return err(format!(
@@ -4195,6 +4221,29 @@ fn lower_function_folded(
                             band: None,
                         }
                     }
+                };
+                let source = match head_rows {
+                    Some(h) => {
+                        let mid = row_major_region(
+                            mint_scratch(k, layout, floor, res, 0),
+                            h.rows * h.row_sticks,
+                            layout,
+                        );
+                        out.push(permute(
+                            f.name,
+                            &source,
+                            &mid,
+                            Permuted::whole((h.head_rows, h.sticks)),
+                            crate::ir::bridge::tiled_op_sdsc_op::StickPermute::StickToRow,
+                            sym_id_base,
+                            Some(layout),
+                        )?);
+                        Region {
+                            is_out: false,
+                            ..mid
+                        }
+                    }
+                    None => source,
                 };
                 out.push(permute(
                     f.name,
@@ -4398,6 +4447,49 @@ fn lower_function_folded(
                                     ..dst
                                 },
                             );
+                        } else if let Some(h) = HeadRows::of(&from, &to) {
+                            // ⭐ GATHERED ROWS OF MULTI-STICK HEADS, READ AS HEAD ROWS — a batch's
+                            // query rows `[R, H·S·stick]` read as `[R·KV, G, S·stick]` at head dim
+                            // 128: the row-major split puts each head row's `S` sticks together,
+                            // and a second permute lays the head rows stick-major, the frame the
+                            // one-row arm above lands (and the batched dot reads a block of).
+                            let mid = row_major_region(
+                                mint_scratch(k, layout, floor, res, 0),
+                                h.rows * h.row_sticks,
+                                layout,
+                            );
+                            out.push(permute(
+                                f.name,
+                                &r,
+                                &mid,
+                                Permuted::whole((h.rows, h.row_sticks)),
+                                crate::ir::bridge::tiled_op_sdsc_op::StickPermute::StickToRow,
+                                sym_id_base,
+                                Some(layout),
+                            )?);
+                            let tid = mint_inter(k, layout, floor, res);
+                            let dst = stick_major_region(tid, h.head_rows, h.sticks, layout);
+                            // The flat stick-major frame: a batched contraction reads its activation
+                            // there, each batch's rows at their row offset in every stick plane.
+                            out.push(permute(
+                                f.name,
+                                &Region {
+                                    is_out: false,
+                                    ..mid
+                                },
+                                &dst,
+                                Permuted::whole((h.head_rows, h.sticks)),
+                                crate::ir::bridge::tiled_op_sdsc_op::StickPermute::RowToStick,
+                                sym_id_base,
+                                Some(layout),
+                            )?);
+                            inter.insert(
+                                res,
+                                Region {
+                                    is_out: false,
+                                    ..dst
+                                },
+                            );
                         } else {
                             return err(format!(
                                 "{}: `{:?}` re-frames a gathered {from:?} as {to:?}, which moves \
@@ -4546,12 +4638,18 @@ fn lower_function_folded(
                         is_fp8: false,
                         band: None,
                     };
+                    // Several entries in pieces land piece by piece first, in a scratch as large.
+                    let landing = (pieces > 1 && g.entries > 1).then(|| {
+                        let tid = mint_scratch(k, layout, floor, src, 0);
+                        layout.synth(crate::place::PlaceId::Act(tid), &[rows, cols]);
+                        Region { tid, ..r }
+                    });
                     out.extend(super::lower_ktir_to_superdsc::page_gather(
                         f.name,
                         &g,
-                        page_sticks,
-                        pieces,
+                        (page_sticks, pieces),
                         &r,
+                        landing.as_ref(),
                         sym_id_base,
                         Some(layout),
                     )?);
@@ -4833,6 +4931,26 @@ fn lower_function_folded(
                 ReduceKind::Max => Elementwise::Maximum,
                 ReduceKind::Sum => Elementwise::Add,
             };
+            // ⭐ A ROW BLOCK SEVERAL STICKS WIDE (head dim 128) combines one stick column at a time: a
+            // window at a row corner is addressable only inside one column plane of its view.
+            let columns = if column {
+                1
+            } else {
+                (src.c_len / stick).max(1)
+            };
+            let in_column = |r: Region, c: u32| {
+                if columns == 1 {
+                    r
+                } else {
+                    let c_start = r.c_start + c * stick;
+                    Region {
+                        c_start,
+                        c_len: stick,
+                        c_cover: (c_start, c_start + stick),
+                        ..r
+                    }
+                }
+            };
             for j in 1..blocks {
                 let lhs = if j == 1 {
                     window(0)
@@ -4842,14 +4960,20 @@ fn lower_function_folded(
                         ..acc
                     })
                 };
-                out.extend(super::lower_ktir_to_superdsc::elementwise(
-                    f.name,
-                    combine,
-                    &[lhs, window(j), sticks(acc)],
-                    &[],
-                    sym_id_base,
-                    Some(layout),
-                )?);
+                for c in 0..columns {
+                    out.extend(super::lower_ktir_to_superdsc::elementwise(
+                        f.name,
+                        combine,
+                        &[
+                            in_column(lhs, c),
+                            in_column(window(j), c),
+                            in_column(sticks(acc), c),
+                        ],
+                        &[],
+                        sym_id_base,
+                        Some(layout),
+                    )?);
+                }
             }
             inter.insert(
                 res,
@@ -6351,6 +6475,40 @@ fn stick_major_split(stick_major: &[i64], row_major: &[i64]) -> Option<(u32, u32
         && sticks >= 2
         && same_card_bytes(row_major, &[i64::from(rows * sticks), i64::from(stick)]))
     .then_some((rows, sticks))
+}
+
+/// ⭐ STICK-MAJOR ROWS READ AS HEAD ROWS OF SEVERAL STICKS — a `[R, C·stick]` block (`R ≥ 2`) read
+/// in a frame whose flat form is `[N, S·stick]`, `S ≥ 2`, `N` a multiple of `R` and `N·S = R·C`: row
+/// `r`'s sticks split into `N / R` head rows of `S` sticks each. On the card that is two stick
+/// permutes — the row-major split `[R·C, stick]`, then its `N` rows of `S` sticks back to stick-major
+/// `[N, S·stick]` — since an element moves across all three of the head, the stick and the row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HeadRows {
+    rows: u32,
+    row_sticks: u32,
+    head_rows: u32,
+    sticks: u32,
+}
+
+impl HeadRows {
+    fn of(stick_major: &[i64], heads: &[i64]) -> Option<Self> {
+        let stick = crate::work::FP16_ELEMS_PER_STICK;
+        let [rows, cols] = flat_frame(stick_major);
+        let [head_rows, width] = flat_frame(heads);
+        let (row_sticks, sticks) = (cols / stick, width / stick);
+        (rows >= 2
+            && cols.is_multiple_of(stick)
+            && width.is_multiple_of(stick)
+            && sticks >= 2
+            && head_rows.is_multiple_of(rows)
+            && head_rows * sticks == rows * row_sticks)
+            .then_some(Self {
+                rows,
+                row_sticks,
+                head_rows,
+                sticks,
+            })
+    }
 }
 
 /// A minted row-major `[rows, stick]` buffer's region.
