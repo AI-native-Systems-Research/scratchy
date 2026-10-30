@@ -11284,6 +11284,17 @@ fn dump_wavefront_mega(
         // `lower_subtile_tape_to_superdsc::weight_segment_parity` — the build-time half
         // of the runtime's `alias_seg` size guard, so the next bundle skew is a BUILD
         // error, never a card-load refusal.
+        // ⭐ THE REGISTRY LEDGER — every bake's scalar registry, by phase, beside the registry of
+        // the wiring that phase's launches bind (`registry_bound`: decode, prefill). The worker binds
+        // ONE wiring per phase for every bundle of it (a prompt chunk's rung, a decode batch rung),
+        // so a bundle placing a different registry reads its constants by the wrong index. Judged
+        // once, after the last bake.
+        let registry_ledger: std::cell::RefCell<Vec<(bool, String, Vec<f32>)>> =
+            std::cell::RefCell::new(Vec::new());
+        /// `(decode, prefill)`: the registry each phase's bound wiring places.
+        type PhaseRegistries = (Option<Vec<f32>>, Option<Vec<f32>>);
+        let registry_bound: std::cell::RefCell<PhaseRegistries> =
+            std::cell::RefCell::new((None, None));
         let weight_seg_ledger: std::cell::RefCell<Vec<(String, u64, Vec<u64>)>> =
             std::cell::RefCell::new(Vec::new());
         // ⭐ WHAT ONE BAKE DOES TO THE EXPANSION'S SHARED STATE, recorded in the order it happens and
@@ -11334,6 +11345,12 @@ fn dump_wavefront_mega(
                 base: String,
                 bank0: u64,
                 banks: Vec<u64>,
+            },
+            // ⭐ THIS BAKE'S SCALAR REGISTRY, by phase — the registry ledger's entry.
+            Registry {
+                prefill: bool,
+                base: String,
+                scales: Vec<f32>,
             },
         }
         /// What one bake returns: its manifest, nodes, sengraph json and launch groups.
@@ -12924,6 +12941,13 @@ fn dump_wavefront_mega(
                     } else {
                         None
                     };
+                    fx.push(BakeEffect::Registry {
+                        prefill: is_prefill,
+                        base: format!(
+                            "{base} (prefill_mq={prefill_mq:?}, rows={decode_rows}, sweep={active_cap:?})"
+                        ),
+                        scales: gk.scalarmul_scales.clone(),
+                    });
                     fx.push(BakeEffect::Wiring {
                         slot,
                         gk: Box::new(gk),
@@ -13003,9 +13027,16 @@ fn dump_wavefront_mega(
                     } => {
                         let w = emit_superdsc_wiring(&gk, lwd, model, decode_position, &man);
                         let mut s = wiring_tokens.borrow_mut();
+                        let mut bound = registry_bound.borrow_mut();
                         match slot {
-                            Some(WiringSlot::Prefill) => s.1 = Some(w),
-                            Some(WiringSlot::Decode) => s.0 = Some(w),
+                            Some(WiringSlot::Prefill) => {
+                                s.1 = Some(w);
+                                bound.1 = Some(gk.scalarmul_scales.clone());
+                            }
+                            Some(WiringSlot::Decode) => {
+                                s.0 = Some(w);
+                                bound.0 = Some(gk.scalarmul_scales.clone());
+                            }
                             None => {}
                         }
                     }
@@ -13014,6 +13045,11 @@ fn dump_wavefront_mega(
                     BakeEffect::WeightSeg { base, bank0, banks } => {
                         weight_seg_ledger.borrow_mut().push((base, bank0, banks));
                     }
+                    BakeEffect::Registry {
+                        prefill,
+                        base,
+                        scales,
+                    } => registry_ledger.borrow_mut().push((prefill, base, scales)),
                 }
             }
         };
@@ -13580,6 +13616,36 @@ fn dump_wavefront_mega(
             &weight_seg_ledger.borrow(),
         ) {
             panic!("[spyre-superdsc] {stem}: {e}");
+        }
+        // ⛔⛔ AND EVERY BUNDLE OF A PHASE PLACES THE REGISTRY ITS PHASE'S WIRING BINDS — the emulator
+        // worker stages one wiring's scales for every bundle of a phase. (A card launch binds its own
+        // session's placed registry, `SuperDscSession::bake_facts`, so its rungs may differ: a decode
+        // batch rung's carries the batched kernel's clamp.)
+        if !cfg!(feature = "spyre-hw") {
+            let (decode_bound, prefill_bound) = &*registry_bound.borrow();
+            let wrong: Vec<String> = registry_ledger
+                .borrow()
+                .iter()
+                .filter_map(|(prefill, base, scales)| {
+                    let bound = if *prefill {
+                        prefill_bound
+                    } else {
+                        decode_bound
+                    };
+                    bound
+                        .as_ref()
+                        .filter(|b| *b != scales)
+                        .map(|b| format!("{base}: places {scales:?}, its wiring binds {b:?}"))
+                })
+                .collect();
+            if !wrong.is_empty() {
+                panic!(
+                    "[spyre-superdsc] {stem}: {} bundle(s) place a scalar registry other than the \
+                     one their phase's wiring binds, so their constants are read by the wrong index:\n{}",
+                    wrong.len(),
+                    wrong.join("\n")
+                );
+            }
         }
 
         // ── CB decode sengraph (the baked `--target sendnn` decode graph). The
