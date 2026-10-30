@@ -1345,41 +1345,78 @@ pub fn hal_r5_section_encode(
     }
 }
 
+/// The Rdma12 unicast-send door's own argument bundle — one home, both
+/// consumers (the one-spelling law): [`crate::hal_sbf::rdma12_unicast_send`]
+/// checks its laws against these fields and hands the bundle to this door,
+/// which splats it flat across the C boundary (the `extern "C"` declaration
+/// above stays scalar; the bundle never crosses it).
+#[derive(Debug, Clone, Copy)]
+pub struct Rdma12UnicastSendParams<'a> {
+    /// The wdone signal index (the signal is from OUR rank).
+    pub sid: u64,
+    /// The destination peer(s) by BAT index — the vendor's own plural shape
+    /// (`dest_ranks`), carried plural so the unicast law at the semantic face
+    /// can name the fan-out it refused rather than silently dropping peers.
+    pub dest_tids: &'a [u64],
+    /// This chunk's byte length.
+    pub length_bytes: u64,
+    /// The source device address's segment.
+    pub src_segment: u64,
+    /// The source device address's byte offset.
+    pub src_offset_bytes: u64,
+    /// The peer's remote base for this transfer, compensation already
+    /// applied by the caller.
+    pub dest_remote_base_bytes: u64,
+    /// The caller's protocol bit: first chunk.
+    pub first: bool,
+    /// The caller's protocol bit: last chunk.
+    pub last: bool,
+    /// The caller's protocol bit: synchronized send.
+    pub sync: bool,
+    /// The T-send preamble ask — must be false (the F-send law, at the
+    /// semantic face).
+    pub xsegv: bool,
+}
+
 /// Safe wrapper: the Rdma12 RDMA_SINGLECAST send DMO section (2 words) from
-/// semantic scalars — the vendor scheduler's ten-setter unicast shape, all
-/// bit packing inside the shim. The protocol bits (`first`/`last`/`sync`/
-/// `xsegv`) are the caller's; the F-send law that governs them is Rust's and
-/// lives at the semantic face (`crate::hal_sbf::rdma12_unicast_send`).
+/// the door's argument bundle — the vendor scheduler's ten-setter unicast
+/// shape, all bit packing inside the shim. The protocol bits
+/// (`first`/`last`/`sync`/`xsegv`) are the caller's; the laws that govern
+/// them (the unicast law, the F-send law) are Rust's and live at the
+/// semantic face (`crate::hal_sbf::rdma12_unicast_send`), checked against
+/// the same bundle's fields before this door is reached. This door still
+/// refuses a bundle that does not name exactly one destination rather than
+/// dropping peers or panicking past the wire — the C boundary is unicast,
+/// one `tid` scalar.
 ///
 /// # Errors
-/// Returns `Err` with the shim's message on any refused input.
+/// Returns `Err` naming the refused precondition (not exactly one
+/// destination), or the shim's message on any refused input.
 pub fn hal_rdma12_unicast_send_encode(
-    sid: u64,
-    tid: u64,
-    length_bytes: u64,
-    src_segment: u64,
-    src_offset_bytes: u64,
-    dest_remote_base_bytes: u64,
-    first: bool,
-    last: bool,
-    sync: bool,
-    xsegv: bool,
+    params: &Rdma12UnicastSendParams<'_>,
 ) -> Result<[u64; 2], String> {
+    if params.dest_tids.len() != 1 {
+        return Err(format!(
+            "the send door is unicast: dest_tids carries {} destination(s) — the unicast law lives at crate::hal_sbf::rdma12_unicast_send",
+            params.dest_tids.len()
+        ));
+    }
+    let tid = params.dest_tids[0];
     let mut words = [0u64; 2];
     // SAFETY: `words` is a valid out-pointer for the duration of the call;
     // every argument is a plain scalar.
     let rc = unsafe {
         flex_hal_rdma12_unicast_send_encode(
-            sid,
+            params.sid,
             tid,
-            length_bytes,
-            src_segment,
-            src_offset_bytes,
-            dest_remote_base_bytes,
-            first as u8,
-            last as u8,
-            sync as u8,
-            xsegv as u8,
+            params.length_bytes,
+            params.src_segment,
+            params.src_offset_bytes,
+            params.dest_remote_base_bytes,
+            params.first as u8,
+            params.last as u8,
+            params.sync as u8,
+            params.xsegv as u8,
             words.as_mut_ptr(),
         )
     };

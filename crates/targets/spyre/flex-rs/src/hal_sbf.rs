@@ -22,7 +22,7 @@
 //! The raw C-ABI-shaped wrappers live in `crate::senlib_ffi` (the crate's
 //! one unsafe home); everything here is safe and semantic.
 
-use crate::senlib_ffi::{self, HalR5AppData};
+use crate::senlib_ffi::{self, HalR5AppData, Rdma12UnicastSendParams};
 
 /// The R5 control-block section's mode, by meaning. The mapping from meaning
 /// to the shim door's own ordinal protocol is this enum's private business
@@ -81,9 +81,11 @@ pub fn r5_section(
 }
 
 /// The Rdma12 RDMA_SINGLECAST send DMO section: two finished words, packed
-/// by the shim from semantic scalars — the vendor scheduler's ten-setter
-/// unicast shape (`submitP2PRdma.cpp`'s unicast loop), with `ta` hardwired
-/// and the endian field left at its default, both per that loop.
+/// by the shim from the door's argument bundle
+/// ([`Rdma12UnicastSendParams`], defined beside the FFI door — one home,
+/// both consumers) — the vendor scheduler's ten-setter unicast shape
+/// (`submitP2PRdma.cpp`'s unicast loop), with `ta` hardwired and the endian
+/// field left at its default, both per that loop.
 ///
 /// - `sid` is the wdone signal index (the signal is from OUR rank);
 /// - `dest_tids` names the destination peer(s) by BAT index — the vendor's
@@ -99,7 +101,8 @@ pub fn r5_section(
 ///   verbatim;
 /// - `xsegv` must be false at this door — the T-send law below.
 ///
-/// The laws are ours, at this door (the shim packs, it never decides):
+/// The laws are ours, at this door (the shim packs, it never decides), and
+/// they are written against the bundle's fields:
 ///
 /// - **The unicast law**: the tp=2 ring is unicast. An empty `dest_tids`
 ///   refuses (a send names the peer it lands on), and more than one
@@ -126,48 +129,26 @@ pub fn r5_section(
 /// # Errors
 /// Returns `Err` naming the refused law (empty destination, multicast
 /// fan-out, T-send preamble), or the shim's message on any refused input.
-pub fn rdma12_unicast_send(
-    sid: u64,
-    dest_tids: &[u64],
-    length_bytes: u64,
-    src_segment: u64,
-    src_offset_bytes: u64,
-    dest_remote_base_bytes: u64,
-    first: bool,
-    last: bool,
-    sync: bool,
-    xsegv: bool,
-) -> Result<[u64; 2], String> {
-    if dest_tids.is_empty() {
+pub fn rdma12_unicast_send(params: &Rdma12UnicastSendParams<'_>) -> Result<[u64; 2], String> {
+    if params.dest_tids.is_empty() {
         return Err(
             "the RDMA send has no destination: dest_tids is empty — a send names the peer it lands on by BAT index"
                 .to_string(),
         );
     }
-    if dest_tids.len() != 1 {
+    if params.dest_tids.len() != 1 {
         return Err(format!(
             "multicast fan-out is un-ported: dest_tids names {} peers — the tp=2 ring is unicast, one destination per send",
-            dest_tids.len()
+            params.dest_tids.len()
         ));
     }
-    if xsegv {
+    if params.xsegv {
         return Err(
             "the T-send preamble is un-ported (the F-send law): xsegv=true asks the wire to deliver the CB's xseg word into the peer's XSEG table ahead of the payload — measured as a preamble overwrite that fires +1 with no wait pending (E8b/H10). The receiver host-programs the table instead: senlib_ffi::write_xseg with the same composed word the send encoder produces"
                 .to_string(),
         );
     }
-    senlib_ffi::hal_rdma12_unicast_send_encode(
-        sid,
-        dest_tids[0],
-        length_bytes,
-        src_segment,
-        src_offset_bytes,
-        dest_remote_base_bytes,
-        first,
-        last,
-        sync,
-        xsegv,
-    )
+    senlib_ffi::hal_rdma12_unicast_send_encode(params)
 }
 
 /// The Rdma10 RDMA_WDONE_BARRIER wait DMI section: two finished words,
@@ -247,11 +228,30 @@ mod tests {
     // path — the law fires before any shim call, so these are pure Rust
     // and assert our own named messages, never golden bytes.
 
+    /// The send bundle the refusal tests drive: one call-site spelling of
+    /// the door's argument bundle, with the field under test varied per
+    /// test. Every other field's value is inert on the refusal paths (the
+    /// laws fire before any shim call reads them).
+    fn send_params(dest_tids: &[u64], xsegv: bool) -> Rdma12UnicastSendParams<'_> {
+        Rdma12UnicastSendParams {
+            sid: 0,
+            dest_tids,
+            length_bytes: 128,
+            src_segment: 0,
+            src_offset_bytes: 0,
+            dest_remote_base_bytes: 0,
+            first: true,
+            last: true,
+            sync: false,
+            xsegv,
+        }
+    }
+
     /// A send with no destination refuses by name — a send names the peer
     /// it lands on by BAT index.
     #[test]
     fn rdma12_send_refuses_an_empty_destination_list() {
-        let err = rdma12_unicast_send(0, &[], 128, 0, 0, 0, true, true, false, false)
+        let err = rdma12_unicast_send(&send_params(&[], false))
             .expect_err("an empty dest_tids must refuse");
         assert!(
             err.contains("no destination"),
@@ -264,7 +264,7 @@ mod tests {
     /// encoder here.
     #[test]
     fn rdma12_send_refuses_multicast_fan_out() {
-        let err = rdma12_unicast_send(0, &[3, 7], 128, 0, 0, 0, true, true, false, false)
+        let err = rdma12_unicast_send(&send_params(&[3, 7], false))
             .expect_err("a two-peer dest_tids must refuse");
         assert!(
             err.contains("multicast fan-out is un-ported"),
@@ -281,7 +281,7 @@ mod tests {
     /// pending); the receiver host-programs the table via write_xseg.
     #[test]
     fn rdma12_send_refuses_the_t_send_preamble() {
-        let err = rdma12_unicast_send(0, &[3], 128, 0, 0, 0, true, true, false, true)
+        let err = rdma12_unicast_send(&send_params(&[3], true))
             .expect_err("xsegv=true must refuse");
         assert!(
             err.contains("T-send preamble is un-ported"),
