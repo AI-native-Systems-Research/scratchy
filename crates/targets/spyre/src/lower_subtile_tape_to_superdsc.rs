@@ -595,8 +595,7 @@ pub(crate) fn scalar_registry<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<f32> {
 }
 
 /// ⭐⭐⭐ THE BUNDLE'S SCALAR REGISTRY — the graph's own multipliers ([`scalar_registry`]), then
-/// every constant a WALKING program of this rung reads through the registry that the graph does not
-/// state (`triton_ktir_superdsc::layout::registry_constants`), in node order, each once. A walk
+/// every constant a WALKING program reads through the registry that the graph does not state (`triton_ktir_superdsc::layout::registry_constants`), in node order, each once. A walk
 /// states constants of its own — the batched decode's `finfo(f16).min` clamp — that no node's
 /// config names, and the door looks every one up by value ("registry desync" otherwise).
 ///
@@ -608,19 +607,26 @@ pub(crate) fn scalar_registry<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<f32> {
 ///
 /// ONE derivation for the two lists that must agree index for index: the placement's
 /// ([`compute_bundle_layout`], which the door looks values up in) and the wiring's
-/// ([`crate::lower_subtile_tape_to_ktir::graph_wiring`], which the worker binds). Both are taken
-/// at the bundle's own rung, the programs it bakes. Appended, never interleaved: a bundle whose
-/// programs read only graph constants keeps every index it had.
+/// ([`crate::lower_subtile_tape_to_ktir::graph_wiring`], which the worker binds). Appended, never
+/// interleaved: a bundle whose programs read only graph constants keeps every index it had.
+///
+/// ⛔ TAKEN AT THE FULL WALK, NOT AT A RUNG'S. One session stages one layout — its ceiling's
+/// ([`ladder_stages_one_layout`]) — and every rung of its ladder reads it. A rung that walks fewer
+/// blocks reads a subset of the full walk's constants (a one-trip program does not walk, and its
+/// carried seeds are not read), so a registry taken at the rung was SHORTER: it moved every host
+/// source placed after it, and the rung read the paged step 128 B away from where the host staged
+/// it (llama-3.2-1b, `active_cap=128`). A constant a rung reads that the full walk does not is the
+/// door's refusal, never a silent slot.
 pub fn bundle_registry<F: RopeForm>(
     ir: &SubtileIR<F>,
-    active_cap: ActiveCap,
     paged_rows: scratchy_triton_splice::PagedRows,
 ) -> Result<Vec<f32>, SuperDscError> {
     use crate::lower_subtile_tape_to_ktir::{NodeLowering, lower_one_node};
     let mut registry = scalar_registry(ir);
     let rows_are_requests = paged_rows == scratchy_triton_splice::PagedRows::Batch;
     for node in &ir.nodes {
-        let NodeLowering::Ops(ops) = lower_one_node(node, ir, active_cap, rows_are_requests) else {
+        let NodeLowering::Ops(ops) = lower_one_node(node, ir, ActiveCap::FULL, rows_are_requests)
+        else {
             continue;
         };
         for k in ops
@@ -739,9 +745,6 @@ pub fn kv_pool_tids<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<u32> {
 pub fn compute_bundle_layout<F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
-    // ⭐ THE RUNG — the programs the bundle bakes, whose constants its registry holds
-    // ([`bundle_registry`]).
-    active_cap: ActiveCap,
     // ⭐ THE LAYER STRUCTURE, so the weight segment can be split into BANKS at a LAYER boundary —
     // see [`bank_weight_segment`]. ONE MAP PER ATTENTION CLASS (a hybrid model's classes have
     // different layer counts, and banking needs the class boundaries), from
@@ -1463,7 +1466,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
     //    only the placement: a `[1,1]` worker-bound const per scale in seg0 (ACTIVATION,
     //    exactly like ATTN_SCALE). The pointwise `mul` the door lowers reads the index here →
     //    the const TID it multiplies by; the worker binds each `t{tid}=[scale]`.
-    let scalarmul_scales = bundle_registry(ir, active_cap, paged_rows)?;
+    let scalarmul_scales = bundle_registry(ir, paged_rows)?;
     for i in 0..scalarmul_scales.len() {
         let a = SegRole::Activation.segment();
         let off = seg_bytes[a];
@@ -6475,6 +6478,16 @@ pub fn emit_bundle(
         let _pc = crate::pc::Pc::start("fp");
         bundle_fp(ops, fold, attn_params)
     };
+    // ⛔ THE CHECK AND THE EMIT ARE ONE STEP PER FINGERPRINT. Ladder rungs bake in parallel, and two
+    // rungs can be one program: a decode batch pads its walk to whole chunks, so at two sequences
+    // the 64-, 128- and 256-slot rungs are all one chunk of four block slots. Both emits passed the
+    // check before either inserted, both staged the same group directory, and the second's cleanup
+    // deleted it under the first's compile (dxp: `no bundle to compile`). The second now waits for
+    // the first and takes its fingerprint.
+    let gate = emitting(&fp);
+    let _one_emit = gate
+        .lock()
+        .map_err(|_| std::io::Error::other("a bundle emit panicked holding its fingerprint"))?;
     if emitted().lock().is_ok_and(|c| c.contains_key(&fp)) {
         return Ok(fp);
     }
@@ -6703,6 +6716,18 @@ fn emitted()
         std::sync::Mutex<BTreeMap<String, (EmittedBundle, Option<bundle::RerollMeta<'static>>)>>,
     > = std::sync::OnceLock::new();
     C.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// The lock [`emit_bundle`] holds for one fingerprint while it checks [`emitted`] and emits.
+fn emitting(fp: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+    static L: std::sync::OnceLock<
+        std::sync::Mutex<BTreeMap<String, std::sync::Arc<std::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let mut gates = L
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::sync::Arc::clone(gates.entry(fp.to_string()).or_default())
 }
 
 /// Take every emitted bundle, complete with its compiled device code — what the macro bakes.
@@ -8197,7 +8222,6 @@ mod tests {
         let layout = compute_bundle_layout(
             &ir,
             &weight_ids,
-            ActiveCap::FULL,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
         )
@@ -8315,7 +8339,6 @@ mod tests {
         let l_plain = compute_bundle_layout(
             &plain,
             &weight_ids,
-            ActiveCap::FULL,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
         )
@@ -8323,7 +8346,6 @@ mod tests {
         let l_minted = compute_bundle_layout(
             &minted,
             &weight_ids,
-            ActiveCap::FULL,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
         )
@@ -8420,7 +8442,6 @@ mod tests {
         let layout = compute_bundle_layout(
             &minted,
             &weight_ids,
-            ActiveCap::FULL,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
         )
@@ -8785,7 +8806,6 @@ mod tests {
         let layout = compute_bundle_layout(
             &ir,
             &weight_ids,
-            ActiveCap::FULL,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
         )
@@ -8869,7 +8889,6 @@ mod tests {
         let layout = compute_bundle_layout(
             &ir,
             &weight_ids,
-            ActiveCap::FULL,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
         )
@@ -8884,7 +8903,6 @@ mod tests {
         let layout = compute_bundle_layout(
             &ir,
             &weight_ids,
-            ActiveCap::FULL,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
         )
@@ -9604,7 +9622,6 @@ mod tests {
         let err = compute_bundle_layout(
             &ir,
             &weight_ids,
-            ActiveCap::FULL,
             scratchy_triton_splice::PagedRows::Sequence,
             &[],
         )
