@@ -1329,9 +1329,13 @@ impl Executor {
     /// names — the same rule the prefix/suffix follow. A single-class model's `bodies` is exactly
     /// `[self.code]`.
     fn load_bodies(&mut self) -> Result<()> {
+        // ⭐ A LADDER OF ONE RUNG IS STILL A LADDER: the rung states the body's sweep, which a paged
+        // step stages its walk by (`StepBody::swept`). A prompt chunk's bundle on the card bakes
+        // exactly one (its own pages); read as ladderless it swept the unpaged default — 0 slots —
+        // and its first forward was refused.
         let rungs: &[bundle::LadderRung<'static>] = match &self.code.reroll {
-            Some(m) if m.rungs.len() > 1 => &m.rungs,
-            _ => &[],
+            Some(m) => &m.rungs,
+            None => &[],
         };
         // ONE LIST PER CLASS, this bundle as class 0's anchor and every other class a sibling.
         let class_ops = |m: &'static bundle::RerollMeta<'static>| -> Result<Vec<Ops>> {
