@@ -3800,7 +3800,15 @@ mod production_ktir_dump {
                 vec![1],
             ));
         }
-        for (name, nkvh) in [("paged_kv_write", 8i128), ("paged_kv_write_rows", 2)] {
+        // A decode step's write (8 kv heads, one store per head), one below the scatter floor (2
+        // heads, one store per row), and at head dim 128 those two and a prompt chunk's.
+        for (name, t, nkvh, hd) in [
+            ("paged_kv_write", 1i128, 8i128, 64i128),
+            ("paged_kv_write_rows", 1, 2, 64),
+            ("paged_kv_write_hd128", 1, 8, 128),
+            ("paged_kv_write_rows_hd128", 1, 2, 128),
+            ("paged_kv_write_prompt_hd128", 96, 8, 128),
+        ] {
             v.push((
                 name,
                 PAGED_KV_WRITE,
@@ -3815,9 +3823,9 @@ mod production_ktir_dump {
                         ("row_index", "*i32"),
                     ],
                     &[
-                        ("T", Val::Int(1)),
+                        ("T", Val::Int(t)),
                         ("NUM_KV_HEADS", Val::Int(nkvh)),
-                        ("HEAD_SIZE", Val::Int(64)),
+                        ("HEAD_SIZE", Val::Int(hd)),
                         ("NUM_ROWS", Val::Int(4 * nkvh * i128::from(PAGE_SLOTS))),
                     ],
                 ),
@@ -3990,7 +3998,11 @@ mod production_ktir_dump {
             | "batched_decode_chunks"
             | "batched_decode_floor"
             | "batched_decode_one_slot" => Program::PagedAttn,
-            "paged_kv_write" | "paged_kv_write_rows" => Program::PagedKvWrite,
+            "paged_kv_write"
+            | "paged_kv_write_rows"
+            | "paged_kv_write_hd128"
+            | "paged_kv_write_rows_hd128"
+            | "paged_kv_write_prompt_hd128" => Program::PagedKvWrite,
             other => panic!(
                 "`{other}` is in the dump table but `program_of` states no Program for it — \
                  a dumped kernel with no program is a silent skip of the SDSC leg, which the \
@@ -4731,5 +4743,86 @@ def two_pages(k_index, v_index, k_pages, v_pages, out, NUM_PAGES: tl.constexpr):
         let ops = ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
             .unwrap_or_else(|e| panic!("the one-block walk lowers: {}", e.message));
         assert!(!ops.is_empty() && ops.iter().all(|e| e.walk.is_none()));
+    }
+
+    /// `reshape_and_cache_head_major` writing `t` tokens of `nkvh` kv heads at head dim `hd` into a
+    /// four-page-per-head pool, through the card's lowering against its one-kernel layout.
+    fn kv_write_ops(t: i128, nkvh: i128, hd: i128) -> Vec<ktir_superdsc::emit::EmittedOp> {
+        let TritonKernelRow::Spliced {
+            src, file, entry, ..
+        } = kv_write_row()
+        else {
+            panic!("the KV write row is spliced");
+        };
+        let mut signature = HashMap::new();
+        let mut constexprs = HashMap::new();
+        for p in ["key", "value", "k_rows", "v_rows"] {
+            signature.insert(p.to_string(), ArgSpec::parse("*fp16").expect("spec"));
+        }
+        signature.insert(
+            "row_index".to_string(),
+            ArgSpec::parse("*i32").expect("spec"),
+        );
+        for (k, v) in [
+            ("T", t),
+            ("NUM_KV_HEADS", nkvh),
+            ("HEAD_SIZE", hd),
+            ("NUM_ROWS", 4 * nkvh * i128::from(PAGE_SLOTS)),
+        ] {
+            signature.insert(k.to_string(), ArgSpec::Constexpr);
+            constexprs.insert(k.to_string(), Val::Int(v));
+        }
+        let spec = KernelSpec {
+            kernel: entry.to_string(),
+            signature,
+            constexprs,
+            file: file.to_string(),
+        };
+        let module = compile_kernel(src, &spec, &[1]).expect("the write compiles");
+        let node = triton_ktir_superdsc::node_for(&module, Program::PagedKvWrite)
+            .expect("the write mints");
+        let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the write places");
+        allocate_paged_cache(&node, &layout).expect("the cache allocates");
+        let mut sym = 0i64;
+        ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
+            .unwrap_or_else(|e| {
+                panic!("t={t} nkvh={nkvh} hd={hd}: the write lowers: {}", e.message)
+            })
+    }
+
+    /// ⭐ A HEAD TWO STICKS WIDE IS WRITTEN WHOLE, one index entry per row. The pool is row-outermost,
+    /// so a row's two sticks are one entry there; a prompt chunk's rows are first relaid row-major,
+    /// one stick permute per kv head of K and of V, and a decode step's one row per head already is.
+    /// At head dim 64 nothing is relaid.
+    #[test]
+    fn a_two_stick_head_is_scattered_one_row_per_entry() {
+        let count = |ops: &[ktir_superdsc::emit::EmittedOp], prefix: &str| {
+            ops.iter().filter(|e| e.op_name.starts_with(prefix)).count()
+        };
+        for (t, hd, permutes) in [(1, 64, 0), (96, 64, 0), (1, 128, 0), (96, 128, 2 * 8)] {
+            let ops = kv_write_ops(t, 8, hd);
+            assert_eq!(
+                count(&ops, "scatter_rows"),
+                permutes,
+                "t={t} hd={hd}: one relayout per kv head of K and of V, and only at two sticks"
+            );
+            // 32 index entries an op, `t · 8` rows each for K and for V.
+            let per_op = 32;
+            assert_eq!(
+                count(&ops, "scatter_run"),
+                2 * (t as usize * 8).div_ceil(per_op),
+                "t={t} hd={hd}"
+            );
+            assert_eq!(
+                ops.len(),
+                count(&ops, "scatter_"),
+                "t={t} hd={hd}: nothing else"
+            );
+        }
+        // Below the scatter floor (two kv heads, one store per row) the rows coalesce the same way.
+        let rows = kv_write_ops(1, 2, 128);
+        assert_eq!(rows.len(), 2, "one scatter each for K and V: {:?}", {
+            rows.iter().map(|e| e.op_name.clone()).collect::<Vec<_>>()
+        });
     }
 }
