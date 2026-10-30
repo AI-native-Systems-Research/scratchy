@@ -1974,9 +1974,9 @@ impl Latency<'_> {
     /// the range's end. Between scratchy's curve and its rival's, the sparklines' fills: cyan where
     /// more of scratchy's requests are done by then, red where fewer; across the middle, a line
     /// from one median to the other, cyan or red as scratchy's is the sooner or later, its factor
-    /// written over it. Bare, as an overview's panel: no axis titles or tick labels, `tag` in its
-    /// corner; as wide as its column and [`GLANCE_CHART_HEIGHT`] high, as the sparklines are.
-    fn ecdf(&self, k: CellKey, t: RequestTiming, tag: &str, label: &str) -> Element {
+    /// written over it. Bare, as an overview's panel: no axis titles or tick labels, `tag`'s lines
+    /// in its corner; as wide as its column and [`GLANCE_CHART_HEIGHT`] high, as the sparklines are.
+    fn ecdf(&self, k: CellKey, t: RequestTiming, tag: &[&str], label: &str) -> Element {
         let curves: Vec<(Engine, Vec<f64>)> = (self.engines.iter())
             .filter_map(|&e| {
                 let rs = self.cell(e, k)?.requests.as_ref()?;
@@ -2129,48 +2129,45 @@ impl Latency<'_> {
         rsx! {
             div { style: "position: relative; width: 100%",
                 {chart(&spec, label, "width: 100%", None)}
-                span { style: "position: absolute; top: 0; left: 0; padding: 2px 4px; font-size: 0.625rem; font-weight: 600; pointer-events: none",
-                    "{tag}"
+                div { style: "position: absolute; top: 0; left: 0; padding: 2px 4px; font-size: 0.625rem; font-weight: 600; pointer-events: none",
+                    for line in tag { div { "{line}" } }
                 }
             }
         }
     }
 
     /// Every cell at answer length `o` as a small multiple, users at once down and prompt size
-    /// across, each column `column` wide (a grid track), under `title`: `cell` draws each.
+    /// across, each column `column` wide (a grid track), under `title`: `cell` draws each, and
+    /// names its own users count where `users` says the rows don't.
     fn multiple(
         &self,
         o: u32,
         column: &str,
         title: &str,
+        users: UsersNamed,
         cell: impl Fn(CellKey) -> Element,
     ) -> Element {
         let ks: Vec<CellKey> = self.keys.iter().copied().filter(|k| k.1 == o).collect();
-        let mut users: Vec<u32> = ks.iter().map(|k| k.0).collect();
+        let mut rows: Vec<u32> = ks.iter().map(|k| k.0).collect();
         let mut prompts: Vec<u32> = ks.iter().map(|k| k.2).collect();
-        users.dedup();
+        rows.dedup();
         prompts.sort_unstable();
         prompts.dedup();
+        let beside = users == UsersNamed::Beside;
         let columns = format!(
-            "display: grid; grid-template-columns: max-content repeat({}, {column}); gap: 0.5rem; align-items: center",
+            "display: grid; grid-template-columns: {}repeat({}, {column}); gap: 0.5rem; align-items: center",
+            if beside { "max-content " } else { "" },
             prompts.len()
         );
-        // Each column and row named with its unit: "128 input tokens", "1 user".
-        let users_at = |u: u32| {
-            if u == 1 {
-                "1 user".to_string()
-            } else {
-                format!("{u} users")
-            }
-        };
+        // Each column named with its unit, "128 input tokens", and each row, "1 user", beside it.
         rsx! {
             Stack { gap: 3,
                 strong { "{title}" }
                 div { style: "{columns}",
-                    div {}
+                    if beside { div {} }
                     for i in &prompts { div { style: "text-align: center", "{i} input tokens" } }
-                    for &u in &users {
-                        div { "{users_at(u)}" }
+                    for &u in &rows {
+                        if beside { div { "{users_at(u)}" } }
                         for &i in &prompts {
                             div { style: "min-width: 0",
                                 if ks.contains(&(u, o, i)) {
@@ -2183,6 +2180,23 @@ impl Latency<'_> {
             }
         }
     }
+}
+
+/// A users count with its unit: "1 user", "4 users".
+fn users_at(u: u32) -> String {
+    if u == 1 {
+        "1 user".to_string()
+    } else {
+        format!("{u} users")
+    }
+}
+
+/// Where a small multiple ([`Latency::multiple`]) names each cell's users count: beside its row,
+/// or in the cell itself.
+#[derive(Clone, Copy, PartialEq)]
+enum UsersNamed {
+    Beside,
+    InCells,
 }
 
 /// A glance chart's height, the scaling sparklines' and the latency ECDFs' alike; each is as wide
@@ -2331,6 +2345,7 @@ fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
             o,
             &PANEL_SIDE.to_string(),
             &format!("{o}-token answers"),
+            UsersNamed::Beside,
             |(u, o, i)| match Load::of(u) {
                 Load::Alone => {
                     let about =
@@ -2342,7 +2357,7 @@ fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
                         "{} of every request, {i} in {o} out {u} at once, {mid}",
                         RequestTiming::E2el.title()
                     );
-                    l.ecdf((u, o, i), RequestTiming::E2el, "E2EL", &about)
+                    l.ecdf((u, o, i), RequestTiming::E2el, &["E2EL"], &about)
                 }
             },
         )
@@ -3174,10 +3189,11 @@ fn latency_panel<'l>(
         let o = glance_answer(run);
         let about = format!("{stem} on {chip}");
         // A 1-user cell its TTFT's and TPOT's distributions, one over the other; a cell under load
-        // its end-to-end time's ([`Load`]).
-        l.multiple(o, "minmax(0, 1fr)", &format!("{stem} · {o}-token answers"), |(u, o, i)| {
+        // its end-to-end time's ([`Load`]). Each chart names its own users count, under its timing.
+        l.multiple(o, "minmax(0, 1fr)", &format!("{stem} · {o}-token answers"), UsersNamed::InCells, |(u, o, i)| {
             let label = |t: RequestTiming| format!("{} of every request, {i} in {o} out {u} at once, {about}", t.title());
-            let ecdf = |t: RequestTiming, tag: &str| l.ecdf((u, o, i), t, tag, &label(t));
+            let users = users_at(u);
+            let ecdf = |t: RequestTiming, tag: &str| l.ecdf((u, o, i), t, &[tag, &users], &label(t));
             rsx! {
                 Stack { gap: 1,
                     match Load::of(u) {
