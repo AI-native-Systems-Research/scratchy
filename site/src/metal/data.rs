@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer};
 
-use super::numbers::Engine;
+use super::numbers::{Engine, median};
 
 #[derive(Deserialize)]
 pub struct Run {
@@ -72,13 +72,18 @@ impl Run {
     /// Mark the live cells whose answers came back short of the tokens asked for (#479): an
     /// engine that ignores `ignore_eos` stops at EOS, so its tok/s, TPOT and E2E latency come from
     /// a shorter decode than the cell's label says. Done as the run loads, after
-    /// [`mark_dead`](Self::mark_dead), so a dead cell is never also short.
+    /// [`mark_dead`](Self::mark_dead), so a dead cell is never also short. Each cell's end-to-end
+    /// time is taken over its requests that did answer to length ([`Cell::answered_e2el_ms`]).
     pub fn mark_short(&mut self) {
         let base = self.config.base().and_then(|b| b.output);
         for m in &mut self.models {
             for e in Engine::ALL {
                 for c in e.cells_mut(m) {
                     c.short = (c.delivered(base)).filter(|&share| !c.dead && share < FULL_SHARE);
+                    c.answered_e2el_ms = (c.asked(base).zip(c.requests.as_ref()))
+                        .and_then(|(asked, rs)| {
+                            median(rs.answered(RequestTiming::E2el, asked).filter_map(|(_, v)| v).collect())
+                        });
                 }
             }
         }
@@ -565,6 +570,11 @@ pub struct Cell {
     pub at: At,
     pub median_ttft_ms: Option<f64>,
     pub median_tpot_ms: Option<f64>,
+    /// The median request's send-to-last-token time; None in runs from before the run file kept it.
+    pub median_e2el_ms: Option<f64>,
+    /// The median send-to-last-token time of the requests that answered to the cell's length,
+    /// where the run file kept its requests ([`Run::mark_short`]); None where none did.
+    pub answered_e2el_ms: Option<f64>,
     pub output_throughput: Option<f64>,
     pub completed: Option<u32>,
     /// Requests that arrived in one piece and so were left out of TTFT/TPOT;
@@ -610,9 +620,30 @@ pub struct Requests {
     pub ttft_ms: Vec<Option<f64>>,
     pub tpot_ms: Vec<Option<f64>>,
     pub e2el_ms: Vec<Option<f64>>,
+    /// The answer tokens each delivered; empty in runs from before the run file kept them.
+    #[serde(default)]
+    pub output_tokens: Vec<Option<u64>>,
 }
 
 impl Requests {
+    /// [`of`](Self::of), less, for the end-to-end time, the requests whose answer came back short
+    /// of `asked` tokens: a shorter answer is less work, not a faster one. A request with no count
+    /// (a run from before the file kept them) stays in.
+    pub fn answered(
+        &self,
+        t: RequestTiming,
+        asked: u32,
+    ) -> impl Iterator<Item = (u32, Option<f64>)> + '_ {
+        let full = move |i: usize| {
+            t != RequestTiming::E2el
+                || (self.output_tokens.get(i).copied().flatten())
+                    .is_none_or(|n| n >= u64::from(asked))
+        };
+        (self.of(t).enumerate())
+            .filter(move |&(i, _)| full(i))
+            .map(|(_, timing)| timing)
+    }
+
     /// Each request's value of one timing, with its repeat.
     pub fn of(&self, t: RequestTiming) -> impl Iterator<Item = (u32, Option<f64>)> + '_ {
         let vs = match t {
@@ -649,16 +680,29 @@ impl RequestTiming {
 }
 
 impl Cell {
+    /// The answer tokens each of its requests asked for: its rung's, or the run's `base` length.
+    pub fn asked(&self, base: Option<u32>) -> Option<u32> {
+        match self.at {
+            At::Grid { output, .. } | At::Output(output) => Some(output),
+            At::Conc(_) | At::Input(_) => base,
+        }
+    }
+
+    /// The end-to-end time the page scores: over the requests that answered to length where the
+    /// run file kept its requests ([`Cell::answered_e2el_ms`]), else the bench's own median.
+    pub fn e2el_ms(&self) -> Option<f64> {
+        match self.requests {
+            Some(_) => self.answered_e2el_ms,
+            None => self.median_e2el_ms,
+        }
+    }
+
     /// The share of the answer tokens its completed requests asked for that they delivered: its
     /// answer length is its rung's, or the run's `base` one. None where it can't say: no count in
     /// the file, no request completed, or a count of 0 from requests that each got a first token,
     /// which is a server that sent no usage (the bench takes the count from it), not a dead one.
     fn delivered(&self, base: Option<u32>) -> Option<f64> {
-        let asked = match self.at {
-            At::Grid { output, .. } | At::Output(output) => Some(output),
-            At::Conc(_) | At::Input(_) => base,
-        };
-        let asked = u64::from(asked?) * u64::from(self.completed.filter(|&n| n > 0)?);
+        let asked = u64::from(self.asked(base)?) * u64::from(self.completed.filter(|&n| n > 0)?);
         let got = self.total_output_tokens?;
         if got == 0 && self.median_ttft_ms.is_some_and(|t| t > 0.0) && self.median_tpot_ms.is_some()
         {
@@ -690,6 +734,8 @@ struct RawCell {
     rung: RawRung,
     median_ttft_ms: Option<f64>,
     median_tpot_ms: Option<f64>,
+    #[serde(default)]
+    median_e2el_ms: Option<f64>,
     output_throughput: Option<f64>,
     completed: Option<u32>,
     unstreamed_requests: Option<u32>,
@@ -735,6 +781,8 @@ impl TryFrom<RawCell> for Cell {
             at,
             median_ttft_ms: c.median_ttft_ms,
             median_tpot_ms: c.median_tpot_ms,
+            median_e2el_ms: c.median_e2el_ms,
+            answered_e2el_ms: None,
             output_throughput: c.output_throughput,
             completed: c.completed,
             unstreamed_requests: c.unstreamed_requests,

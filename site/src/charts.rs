@@ -506,6 +506,7 @@ pub fn ratio_scale(fit: ScaleFit, id: &str) -> Element {
                 .to_string(),
             "1fr",
         ),
+        ScaleFit::Fill => ("flex: none; align-self: stretch; ".to_string(), "1fr"),
     };
     rsx! {
         div { id: "{id}", style: "{place}display: grid; grid-template-columns: 0.75rem max-content; grid-template-rows: repeat({rows}, {track}); column-gap: 0.5rem; font-size: 0.75rem; line-height: 1",
@@ -548,6 +549,8 @@ pub fn ratio_scale(fit: ScaleFit, id: &str) -> Element {
 pub enum ScaleFit {
     Fixed,
     Beside,
+    /// Stretched to the whole height of the box it sits in: the one map's grid rows.
+    Fill,
 }
 
 /// A ratio map's two axes, read like a table: `across` left to right, `down`

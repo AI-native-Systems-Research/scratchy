@@ -19,14 +19,15 @@ use dioxus::prelude::*;
 
 use crate::Site;
 use crate::carbon::{
-    Alignment, ContentPanel, ContentSwitcher, ContentSwitcherItem, Fold, Heading, Layer, Section,
-    Stack, TabItem, Table, TableCell, TableRow, Tabs, TabsKind, Tag, TagKind, Tile, Toggletip,
+    Alignment, ContentPanel, ContentSwitcher, ContentSwitcherItem, Definition, Fold, Heading,
+    Layer, Section, Stack, TabItem, Table, TableCell, TableRow, Tabs, TabsKind, Tag, TagKind,
+    Tile, TipHeading, Toggletip,
 };
 use crate::charts::{
     Axes, Axis, AxisDomain, BarPoint, Better, Bounds, BubblePoint, Bubbles, Chart, ChartOptions,
     ColorLegend, Colour, ComboLayer, Enabled, Gradient, HeatPoint, HeatmapOptions, Hover,
-    LineOptions, Locale, RATIO_RANGE, RATIO_STEPS, Ramp, RatioSquare, ScaleFit, SparkAxes,
-    SparkPoint, Step, TableAxes, chart, colour, glance_maps, glance_mini, highlight, log2_ratio,
+    LineOptions, Locale, RATIO_RANGE, RATIO_STEPS, Ramp, ScaleFit, SparkAxes, SparkPoint, Step,
+    TableAxes, chart, colour, glance_maps, highlight, log2_ratio,
     mini_heatmap, ratio_scale, ratio_step, sparkline,
 };
 use crate::chrome::{self, Content, Head, Library, Published, REPO, Root, Tab};
@@ -833,9 +834,9 @@ impl Sweep {
                     "tok/s",
                 ),
                 (
-                    Metric::Tpot,
-                    "Time per output token (ms, lower is better)",
-                    "TPOT ms",
+                    Metric::E2el,
+                    "End-to-end time (ms, lower is better)",
+                    "E2EL ms",
                 ),
             ],
             Sweep::Prompt => [
@@ -1144,10 +1145,11 @@ fn sweep_part<'a>(m: &'a Model, run: &Run, prev: Option<Entry<'a>>, sweep: Sweep
         Sweep::Users => (
             "As users are added",
             rsx! {
-                "Throughput and time per output token with {xs_text} users at once " {users_info()}
+                "Throughput and end-to-end time with {xs_text} users at once " {users_info()}
                 "; {opt(ui)}-token prompts, {opt(uo)}-token answers{from_grid}. One small chart per engine, each scratchy \
                  against that engine, scratchy's previous run in grey. A line that rises in the second row means \
-                 each user's answer slows down as more share the engine."
+                 each request takes longer as more share the engine; once the GPU is busy, scheduling only moves \
+                 that wait between the first token and the rest, so the end-to-end time is what is compared."
             },
         ),
         Sweep::Prompt => (
@@ -1164,8 +1166,7 @@ fn sweep_part<'a>(m: &'a Model, run: &Run, prev: Option<Entry<'a>>, sweep: Sweep
     let table_metrics: &[(Metric, &str)] = match sweep {
         Sweep::Users => &[
             (Metric::Throughput, "tok/s"),
-            (Metric::Ttft, "TTFT ms"),
-            (Metric::Tpot, "TPOT ms"),
+            (Metric::E2el, "E2EL ms"),
         ],
         Sweep::Prompt => &[
             (Metric::Ttft, "TTFT ms"),
@@ -1242,6 +1243,7 @@ impl Slice {
 
 /// A model's grid at one slice: its rows and columns, each engine's cells,
 /// and the engines scratchy is compared against.
+#[derive(Clone)]
 struct ShapeGrid<'a> {
     slice: Slice,
     down: Vec<u32>,
@@ -1369,6 +1371,20 @@ impl<'a> ShapeGrid<'a> {
         self.slice.axes(&self.down, &self.across)
     }
 
+    /// Only the users counts `load` scores ([`Load`]); a slice at one users count is kept whole
+    /// where `load` scores that count, and emptied where it doesn't.
+    fn under(&self, load: Load) -> Self {
+        let down = match self.slice {
+            Slice::Answer(_) => load.users(&self.down),
+            Slice::Users(u) if Load::of(u) != load => Vec::new(),
+            Slice::Users(_) => self.down.clone(),
+        };
+        ShapeGrid {
+            down,
+            ..self.clone()
+        }
+    }
+
     /// Every (row, column), row by row.
     fn rungs(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
         self.down
@@ -1399,7 +1415,7 @@ impl<'a> ShapeGrid<'a> {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Trend {
     UsersDecode,
-    UsersPrefill,
+    UsersEndToEnd,
     PromptPrefill,
     AnswerDecode,
 }
@@ -1408,16 +1424,26 @@ impl Trend {
     fn metric(self) -> Metric {
         match self {
             Trend::UsersDecode | Trend::AnswerDecode => Metric::Throughput,
-            Trend::UsersPrefill | Trend::PromptPrefill => Metric::Ttft,
+            Trend::UsersEndToEnd => Metric::E2el,
+            Trend::PromptPrefill => Metric::Ttft,
         }
     }
 
     fn title(self) -> &'static str {
         match self {
             Trend::UsersDecode => "Concurrency scaling — Decode",
-            Trend::UsersPrefill => "Concurrency scaling — Prefill",
+            Trend::UsersEndToEnd => "Concurrency scaling — End-to-end",
             Trend::PromptPrefill => "Input length scaling — Prefill",
             Trend::AnswerDecode => "Output length scaling — Decode",
+        }
+    }
+
+    /// Its name over its sparkline in the overview.
+    fn label(self) -> &'static str {
+        match self {
+            Trend::UsersDecode | Trend::AnswerDecode => "Decode",
+            Trend::UsersEndToEnd => "End-to-end",
+            Trend::PromptPrefill => "Prefill",
         }
     }
 
@@ -1425,7 +1451,7 @@ impl Trend {
     /// label for the x value.
     fn along(self) -> &'static str {
         match self {
-            Trend::UsersDecode | Trend::UsersPrefill => "users at once",
+            Trend::UsersDecode | Trend::UsersEndToEnd => "users at once",
             Trend::PromptPrefill => "prompt tokens",
             Trend::AnswerDecode => "answer tokens",
         }
@@ -1436,10 +1462,10 @@ impl Trend {
         SparkAxes {
             better: metric.better(),
             along: self.along(),
-            value: if metric == Metric::Ttft {
-                "TTFT ms"
-            } else {
-                metric.unit()
+            value: match metric {
+                Metric::Ttft => "TTFT ms",
+                Metric::E2el => "E2EL ms",
+                _ => metric.unit(),
             },
             carry: false,
         }
@@ -1452,7 +1478,7 @@ impl Trend {
     fn points(self, m: &Model, run: &Run) -> Option<(Engine, Vec<Step>)> {
         let metric = self.metric();
         match self {
-            Trend::UsersDecode | Trend::UsersPrefill => {
+            Trend::UsersDecode | Trend::UsersEndToEnd => {
                 let mine = by_users(m, run, Engine::Scratchy);
                 // The first rival with a live cell along users, as `ShapeGrid::of` picks.
                 let rival = Engine::RIVALS
@@ -1559,10 +1585,49 @@ fn trend_spark(at: SparkAt, spark: &Result<Spark, &str>, height: &str) -> Elemen
     )
 }
 
-/// Prefill first, then decode, as in the overview.
-const GRID_METRICS: [(Metric, &str); 2] = [
-    (Metric::Ttft, "time to first token"),
-    (Metric::Throughput, "throughput"),
+/// What a users × prompt grid scores, at the users counts it scores it at ([`Load`]).
+#[derive(Clone, Copy)]
+struct GridMetric {
+    metric: Metric,
+    load: Load,
+    /// Its name: the head of its row's tooltip in the overview, and in each square's.
+    name: &'static str,
+    /// What it measures, under its name in its row's tooltip; under load, after the users count.
+    about: &'static str,
+    /// A model section's title for its full map.
+    title: &'static str,
+    /// The one map's row label: on its own at 1 user, after the users count under load ("2u").
+    letter: &'static str,
+}
+
+/// Prefill and decode at 1 user, then the end-to-end time under load: the overview and every
+/// model section alike.
+const GRID_METRICS: [GridMetric; 3] = [
+    GridMetric {
+        metric: Metric::Ttft,
+        load: Load::Alone,
+        name: "Prefill",
+        about: "Time to first token with 1 user: how long the prompt takes before the answer starts.",
+        title: "time to first token, 1 user",
+        letter: "P",
+    },
+    GridMetric {
+        metric: Metric::Tpot,
+        load: Load::Alone,
+        name: "Decode",
+        about: "Time per output token with 1 user: how fast the answer streams once it has started.",
+        title: "time per output token, 1 user",
+        letter: "D",
+    },
+    GridMetric {
+        metric: Metric::E2el,
+        load: Load::Shared,
+        name: "End-to-end Latency",
+        about: "From sending a request to its last token. Once the GPU is busy, scheduling only moves \
+                each request's wait between its first token and the rest, so their sum is what compares.",
+        title: "end-to-end time, 2 or more users",
+        letter: "u",
+    },
 ];
 
 /// The marks any of these cells carries, each once.
@@ -1718,27 +1783,32 @@ fn grid_maps(m: &Model, mid: &str, run: &Run) -> Element {
             ),
         };
         let others: Vec<Engine> = g.present.iter().copied().skip(1).collect();
+        // Each metric's map over the users counts it scores, where the grid ran any.
+        let parts: Vec<(GridMetric, ShapeGrid)> = (GRID_METRICS.iter())
+            .map(|&gm| (gm, g.under(gm.load)))
+            .filter(|(_, s)| !s.down.is_empty())
+            .collect();
         rsx! {
             Stack { gap: 3,
                 strong { "{a}-token answers" }
                 p { "{note}." }
                 div { style: "display: flex; flex-wrap: wrap; gap: 1.5rem; align-items: flex-start",
-                    for (metric, title) in GRID_METRICS { {heat_map(g, metric, title, &format!("scale-{mid}-{a}"))} }
+                    for (gm, s) in &parts { {heat_map(s, gm.metric, gm.title, &format!("scale-{mid}-{a}"))} }
                     if g.rival.is_some() { {ratio_scale(ScaleFit::Fixed, &format!("scale-{mid}-{a}"))} }
                 }
                 if !others.is_empty() {
-                    for (metric, title) in GRID_METRICS {
+                    for (gm, s) in &parts {
                         Stack { gap: 1,
-                            span { "{title}, vs every engine" }
+                            span { "{gm.title}, vs every engine" }
                             div { style: "display: flex; flex-wrap: wrap; gap: 1rem",
-                                for e in &others { {versus_mini(g, metric, *e, &format!("{title}, scratchy vs {}, {a}-token answers", e.label()))} }
+                                for e in &others { {versus_mini(s, gm.metric, *e, &format!("{}, scratchy vs {}, {a}-token answers", gm.title, e.label()))} }
                             }
                         }
                     }
                 }
                 Fold { title: "Table view, {a}-token answers",
                     Stack { gap: 4,
-                        for (metric, title) in GRID_METRICS { {heat_table(g, metric, title)} }
+                        for (gm, s) in &parts { {heat_table(s, gm.metric, gm.title)} }
                     }
                 }
             }
@@ -1912,34 +1982,38 @@ impl<'a> Latency<'a> {
 
 impl Latency<'_> {
     /// One cell's `t` as each engine's empirical CDF: the share of its requests (up) done within
-    /// each time (across), a step at every request, on the cell's own range, each curve run on to
-    /// the range's end. Between scratchy's curve and its rival's, the sparklines' fills: cyan where
-    /// more of scratchy's requests are done by then, red where fewer; across the middle, a line
-    /// from one median to the other, cyan or red as scratchy's is the sooner or later, its factor
-    /// written over it. Bare, as an overview's panel: no axis titles or tick labels, `tag` in its
-    /// corner; as wide as its column and [`GLANCE_CHART_HEIGHT`] high, as the sparklines are.
-    fn ecdf(&self, k: CellKey, t: RequestTiming, tag: &str, label: &str) -> Element {
+    /// each time (across), a step at every request, each curve run on to the range's end. Between
+    /// scratchy's curve and its rival's, the sparklines' fills: cyan where more of scratchy's
+    /// requests are done by then, red where fewer; across the middle, a line from one median to
+    /// the other, cyan or red as scratchy's is the sooner or later, its factor written over it.
+    /// Time runs on a log axis [`ECDF_SPAN`] wide, centred on the engines' medians: a ratio, the
+    /// factor's included, is one width on every chart. Bare: no axis titles or tick labels,
+    /// `tag`'s lines in its corner; as wide as its column, [`ECDF_ASPECT`] wide for its height.
+    fn ecdf(&self, k: CellKey, t: RequestTiming, tag: &[&str], label: &str) -> Element {
         let curves: Vec<(Engine, Vec<f64>)> = (self.engines.iter())
             .filter_map(|&e| {
                 let rs = self.cell(e, k)?.requests.as_ref()?;
-                let mut vs: Vec<f64> = rs.of(t).filter_map(|(_, v)| v).collect();
+                let mut vs: Vec<f64> = (rs.answered(t, k.1).filter_map(|(_, v)| v))
+                    .filter(|&v| v > 0.0)
+                    .collect();
                 vs.sort_by(f64::total_cmp);
                 (!vs.is_empty()).then_some((e, vs))
             })
             .collect();
-        let ends = |(_, vs): &(Engine, Vec<f64>)| (vs[0], vs[vs.len() - 1]);
-        let Some((lo, hi)) =
-            (curves.iter().map(ends)).reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))
-        else {
+        // Centred on the engines' medians (their geometric mean), so the factor between them sits
+        // in the middle; a request past either edge is drawn at it.
+        let medians: Vec<f64> = curves.iter().filter_map(|(_, vs)| quantile(vs, 50.0)).collect();
+        if medians.is_empty() {
             return rsx! {};
-        };
-        // A twentieth of the range either side; where every request took the same time, a
-        // twentieth of that time (at least 1 ms), so the range never closes.
-        let pad = (if hi > lo { hi - lo } else { hi.abs().max(1.0) }) / 20.0;
-        let end = hi + pad;
-        let point = |group, key, value: f64| SparkPoint {
+        }
+        let centre = (medians.iter().map(|m| m.ln()).sum::<f64>() / medians.len() as f64).exp();
+        let half = ECDF_SPAN.sqrt();
+        let (start, end) = (centre / half, centre * half);
+        // Plotted as log10(ms) on a linear axis: Carbon rounds a log axis out to whole decades,
+        // which would undo the common span.
+        let point = |group, key: f64, value: f64| SparkPoint {
             group,
-            key,
+            key: key.clamp(start, end).log10(),
             value: Some(value),
             upper: None,
             lower: None,
@@ -1985,7 +2059,7 @@ impl Latency<'_> {
                 } else {
                     ECDF_LATER
                 };
-                // The factor sits a little over the line, at its middle.
+                // The factor sits a little over the line, at its middle on the log axis.
                 let over = 0.5 + 0.12;
                 data.extend([
                     point(group, m, 0.5),
@@ -1993,7 +2067,7 @@ impl Latency<'_> {
                         upper: Some(over),
                         lower: Some(over),
                         factor: Some(factor),
-                        ..point(group, (m + r) / 2.0, 0.5)
+                        ..point(group, (m * r).sqrt(), 0.5)
                     },
                     point(group, r, 0.5),
                 ]);
@@ -2001,11 +2075,11 @@ impl Latency<'_> {
                 dashed.push(group);
             }
         }
-        let axis = |maps_to, title, domain| Axis {
+        let axis = |maps_to, title, scale_type, domain| Axis {
             maps_to,
             // Kept on the hidden axes: Carbon's tooltip names each value by it.
             title,
-            scale_type: None,
+            scale_type,
             ticks: None,
             include_zero: Some(false),
             visible: Some(false),
@@ -2018,8 +2092,8 @@ impl Latency<'_> {
             options: ChartOptions {
                 title: String::new(),
                 axes: Axes {
-                    bottom: axis("key", "ms", [lo - pad, end]),
-                    left: axis("value", "share of requests", [0.0, 1.0]),
+                    bottom: axis("key", "log10 ms", None, [start.log10(), end.log10()]),
+                    left: axis("value", "share of requests", None, [0.0, 1.0]),
                 },
                 color: Some(Colour::Scale {
                     scale: (self.engines.iter().zip(["s1", "s2"]))
@@ -2034,7 +2108,9 @@ impl Latency<'_> {
                         .collect(),
                 }),
                 heatmap: None,
-                height: GLANCE_CHART_HEIGHT.to_string(),
+                // Its box decides, as the mini heat maps' does: as wide as its column, as tall as
+                // ECDF_ASPECT makes it.
+                height: "100%".to_string(),
                 width: Some("100%".to_string()),
                 legend: Some(Enabled { enabled: false }),
                 locale: None,
@@ -2070,49 +2146,46 @@ impl Latency<'_> {
         };
         rsx! {
             div { style: "position: relative; width: 100%",
-                {chart(&spec, label, "width: 100%", None)}
-                span { style: "position: absolute; top: 0; left: 0; padding: 2px 4px; font-size: 0.625rem; font-weight: 600; pointer-events: none",
-                    "{tag}"
+                {chart(&spec, label, &format!("width: 100%; aspect-ratio: {ECDF_ASPECT}"), None)}
+                div { style: "position: absolute; top: 0; left: 0; padding: 2px 4px; font-size: 0.625rem; font-weight: 600; pointer-events: none",
+                    for line in tag { div { "{line}" } }
                 }
             }
         }
     }
 
     /// Every cell at answer length `o` as a small multiple, users at once down and prompt size
-    /// across, each column `column` wide (a grid track), under `title`: `cell` draws each.
+    /// across, each column `column` wide (a grid track), under `title`: `cell` draws each, and
+    /// names its own users count where `users` says the rows don't.
     fn multiple(
         &self,
         o: u32,
         column: &str,
         title: &str,
+        users: UsersNamed,
         cell: impl Fn(CellKey) -> Element,
     ) -> Element {
         let ks: Vec<CellKey> = self.keys.iter().copied().filter(|k| k.1 == o).collect();
-        let mut users: Vec<u32> = ks.iter().map(|k| k.0).collect();
+        let mut rows: Vec<u32> = ks.iter().map(|k| k.0).collect();
         let mut prompts: Vec<u32> = ks.iter().map(|k| k.2).collect();
-        users.dedup();
+        rows.dedup();
         prompts.sort_unstable();
         prompts.dedup();
+        let beside = users == UsersNamed::Beside;
         let columns = format!(
-            "display: grid; grid-template-columns: max-content repeat({}, {column}); gap: 0.5rem; align-items: center",
+            "display: grid; grid-template-columns: {}repeat({}, {column}); gap: 0.5rem; align-items: center",
+            if beside { "max-content " } else { "" },
             prompts.len()
         );
-        // Each column and row named with its unit: "128 input tokens", "1 user".
-        let users_at = |u: u32| {
-            if u == 1 {
-                "1 user".to_string()
-            } else {
-                format!("{u} users")
-            }
-        };
+        // Each column named with its unit, "128 input tokens", and each row, "1 user", beside it.
         rsx! {
             Stack { gap: 3,
                 strong { "{title}" }
                 div { style: "{columns}",
-                    div {}
+                    if beside { div {} }
                     for i in &prompts { div { style: "text-align: center", "{i} input tokens" } }
-                    for &u in &users {
-                        div { "{users_at(u)}" }
+                    for &u in &rows {
+                        if beside { div { "{users_at(u)}" } }
                         for &i in &prompts {
                             div { style: "min-width: 0",
                                 if ks.contains(&(u, o, i)) {
@@ -2127,9 +2200,39 @@ impl Latency<'_> {
     }
 }
 
-/// A glance chart's height, the scaling sparklines' and the latency ECDFs' alike; each is as wide
-/// as its column.
+/// A users count with its unit: "1 user", "4 users".
+fn users_at(u: u32) -> String {
+    if u == 1 {
+        "1 user".to_string()
+    } else {
+        format!("{u} users")
+    }
+}
+
+/// Where a small multiple ([`Latency::multiple`]) names each cell's users count: beside its row,
+/// or in the cell itself.
+#[derive(Clone, Copy, PartialEq)]
+enum UsersNamed {
+    Beside,
+    InCells,
+}
+
+/// A glance sparkline's height; each is as wide as its column.
 const GLANCE_CHART_HEIGHT: &str = "4.5rem";
+
+/// Every latency ECDF's width for its height, whatever its column's width: wide enough that a
+/// ratio across reads, tall enough that a quantile reads off the share axis, not a sparkline's.
+const ECDF_ASPECT: &str = "9 / 5";
+
+/// The latency tab's prompt columns: at least wide enough that at [`ECDF_ASPECT`] each of a
+/// cell's 50 requests is some 3px up its share axis; the tab's tile widens to hold them.
+const ECDF_COLUMN: &str = "minmax(16rem, 1fr)";
+
+/// The ratio every latency ECDF spans edge to edge, so a ratio is one width on all of them
+/// ([`Latency::ecdf`]): ×1.8 a little over half. Over the runs published by 2026-10-30, it holds
+/// the middle 90% (p5 to p95) of 90% of the charts' requests and every gap between medians (the
+/// widest ×2.7); the tails of the rest are drawn at the edges.
+const ECDF_SPAN: f64 = 3.0;
 
 /// An ECDF's fills ([`Latency::ecdf`]): where more of scratchy's requests are done than its
 /// rival's, and where fewer.
@@ -2255,23 +2358,38 @@ fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
     let Some(l) = Latency::of(m, run) else {
         return rsx! {};
     };
-    let Some(span) = l.span(&l.keys) else {
+    // The same axes span the bubble charts only: the 1-user cells ([`Load`]).
+    let alone: Vec<CellKey> = (l.keys.iter().copied())
+        .filter(|&(u, _, _)| Load::of(u) == Load::Alone)
+        .collect();
+    let Some(span) = l.span(&alone).or_else(|| l.span(&l.keys)) else {
         return rsx! {};
     };
     let mut answers: Vec<u32> = l.keys.iter().map(|k| k.1).collect();
     answers.dedup();
     answers.sort_unstable();
     answers.dedup();
-    // Each cell's bubble chart, on its own axes or on every cell's across every answer length.
+    // A 1-user cell's bubble chart, on its own axes or on every cell's across every answer length;
+    // a cell under load its end-to-end time's distribution ([`Load`]).
     let multiple = |o: u32, axes: Axes2| {
         l.multiple(
             o,
             &PANEL_SIDE.to_string(),
             &format!("{o}-token answers"),
-            |(u, o, i)| {
-                let about =
-                    format!("TTFT against TPOT, every request, {i} in {o} out {u} at once, {mid}");
-                l.chart((u, o, i), span, axes, PANEL_SIDE, &about)
+            UsersNamed::Beside,
+            |(u, o, i)| match Load::of(u) {
+                Load::Alone => {
+                    let about =
+                        format!("TTFT against TPOT, every request, {i} in {o} out {u} at once, {mid}");
+                    l.chart((u, o, i), span, axes, PANEL_SIDE, &about)
+                }
+                Load::Shared => {
+                    let about = format!(
+                        "{} of every request, {i} in {o} out {u} at once, {mid}",
+                        RequestTiming::E2el.title()
+                    );
+                    l.ecdf((u, o, i), RequestTiming::E2el, &["E2EL"], &about)
+                }
             },
         )
     };
@@ -2282,7 +2400,7 @@ fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
                     for &e in &l.engines {
                         if let Some(rs) = l.cell(e, (u, o, i)).and_then(|c| c.requests.as_ref()) {
                             {
-                                let mut vs: Vec<f64> = rs.of(t).filter_map(|(_, v)| v).collect();
+                                let mut vs: Vec<f64> = rs.answered(t, o).filter_map(|(_, v)| v).collect();
                                 vs.sort_by(f64::total_cmp);
                                 let q = |p: f64| fmt(quantile(&vs, p), 1);
                                 rsx! {
@@ -2307,11 +2425,13 @@ fn request_plots(m: &Model, mid: &str, run: &Run) -> Element {
     part(
         "Latency distributions",
         rsx! {
-            "Every request, a dot each: time to first token up, time per output token across, both \
-             linear. Each panel on its own ranges (its ticks say them), or every panel on the same: the \
-             switch below. A request held back behind another lands high and left; one decoding \
-             beside others lands low and right; a cell that ran two ways shows two clouds. Requests that \
-             failed, or whose answer arrived in one piece, have neither timing to plot."
+            "With 1 user, every request a dot: time to first token up, time per output token across, \
+             both linear, each panel on its own ranges (its ticks say them) or every panel on the same: \
+             the switch below. Requests that failed, or whose answer arrived in one piece, have neither \
+             timing to plot. With more users, the share of requests (up) done within each end-to-end \
+             time (across): once the GPU is busy, scheduling only moves each request's wait between \
+             its first token and the rest, so their sum is what compares. Its time axis is a log one \
+             ×3 wide on every chart, centred on the two medians, so a factor is one width everywhere."
         },
         rsx! {
             Stack { gap: 6,
@@ -2598,11 +2718,9 @@ struct Square<'a> {
     prompt: u32,
 }
 
-/// One overview heat map's ratios, at its run's [`glance_answer`]: its prompt lengths, the
-/// rival, and each square's (users, prompt, how many times faster scratchy
-/// is).
+/// One overview heat map's ratios, at its run's [`glance_answer`]: the rival, and each square's
+/// (users, prompt, how many times faster scratchy is).
 struct GlanceGrid {
-    prompts: Vec<u32>,
     rival: Engine,
     cells: Vec<(u32, u32, Option<f64>)>,
 }
@@ -2627,7 +2745,6 @@ impl GlanceGrid {
             .map(|(u, i)| (u, i, g.versus(metric, (u, i), rival).0))
             .collect();
         Ok(GlanceGrid {
-            prompts: prompts.to_vec(),
             rival,
             cells,
         })
@@ -2651,6 +2768,27 @@ impl Set {
         } else {
             Set::Small
         }
+    }
+}
+
+/// Which of a heat map's users counts it scores. One user leaves the GPU room, so prefill and
+/// decode speed are each a fact of their own; with more, scheduling only moves each request's
+/// wait between its TTFT and its TPOT, so only their sum, the end-to-end time, is a score.
+#[derive(Clone, Copy, PartialEq)]
+enum Load {
+    Alone,
+    Shared,
+}
+
+impl Load {
+    fn of(users: u32) -> Load {
+        if users == 1 { Load::Alone } else { Load::Shared }
+    }
+
+    fn users(self, all: &[u32]) -> Vec<u32> {
+        (all.iter().copied())
+            .filter(|&u| Load::of(u) == self)
+            .collect()
     }
 }
 
@@ -2771,7 +2909,6 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
             stems.push(stem);
         }
     }
-    let metrics = [(Metric::Ttft, "Prefill"), (Metric::Throughput, "Decode")];
     let shape = |chip: &str| &lineup.shapes[&lineup.set(memory(chip))];
     // The answer lengths the maps are at: one, unless machines are on runs of different shapes.
     let answers: BTreeSet<u32> = (shown.iter())
@@ -2787,14 +2924,14 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
     // the grid has none: the highlights are picked from all of them.
     let mut grids: BTreeMap<(&str, &str, &str), Result<GlanceGrid, &str>> = BTreeMap::new();
     for &(chip, stem) in &shown {
-        for (metric, name) in metrics {
+        for gm in GRID_METRICS {
             grids.insert(
-                (chip, stem, name),
+                (chip, stem, gm.name),
                 GlanceGrid::of(
                     &machines[chip],
                     stem,
-                    metric,
-                    &shape(chip).users,
+                    gm.metric,
+                    &gm.load.users(&shape(chip).users),
                     &shape(chip).prompts,
                 ),
             );
@@ -2886,74 +3023,204 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
         let at = SparkAt { chip, stem, trend };
         trend_spark(at, &sparks[&at], GLANCE_CHART_HEIGHT)
     };
-    // A grid with nothing of its own (the model not run on that machine, say)
-    // keeps its place as a map of blank squares its set's shape, over why it
-    // has nothing to show.
-    let mini = |chip: &str, stem: &str, name: &str| -> Element {
-        let Shape { users, prompts } = shape(chip);
-        let (ins, cells, total_label, none) = match &grids[&(chip, stem, name)] {
-            Ok(g) => (
-                &g.prompts,
-                g.cells.clone(),
-                format!("scratchy/{}", g.rival.label()),
-                "no ratios",
-            ),
-            Err(why) => (
-                prompts,
-                users
-                    .iter()
-                    .flat_map(|&u| prompts.iter().map(move |&i| (u, i, None)))
-                    .collect(),
-                "scratchy".to_string(),
-                *why,
-            ),
-        };
-        let squares = cells
-            .into_iter()
-            .map(|(u, i, r)| RatioSquare {
-                across: i.to_string(),
-                down: u.to_string(),
-                ratio: r,
-                highlight: highlights.contains(&Square {
-                    chip,
-                    stem,
-                    metric: name,
-                    users: u,
-                    prompt: i,
-                }),
-            })
-            .collect();
-        glance_mini(
-            Slice::Answer(0).axes(users, ins),
-            squares,
-            total_label,
-            name,
-            none,
-            &format!("{stem} on {chip}"),
-        )
-    };
     let chips: Vec<&str> = in_order(machines);
-    // The heat maps a matrix per set, each in its own shape: machines read up within it.
-    // Every machine a row of one grid, the small set's first.
+    // Every machine a row, the small set's first.
     let rows: Vec<&str> = (Set::ALL.into_iter())
         .flat_map(|set| {
             let lineup = &lineup;
             (chips.iter().copied()).filter(move |&chip| lineup.set(memory(chip)) == set)
         })
         .collect();
-    let cell = |chip: &str, class: &str| -> Element {
-        let Some(stem) = model_of(chip, class) else {
-            return rsx! {};
+    // The one map: every machine, model, measure and users count in a single grid, a square a
+    // cell, on the one ratio scale, under one header. Under each model (its class) a column per
+    // prompt size, shortest first; where the sets of Macs ran different sizes there, its header
+    // names each set's, small set first. Under each machine its rows: prefill and decode with 1
+    // user, then end-to-end time with each users count ([`GRID_METRICS`]).
+    let one_map = {
+        enum Line<'a> {
+            Classes,
+            Models,
+            Prompts,
+            Measure(&'a str, GridMetric, u32),
+        }
+        let most = (lineup.shapes.values()).map(|s| s.prompts.len()).max().unwrap_or(0);
+        let col = |k: usize, p: usize| 3 + k * most + p;
+        let mut lines: Vec<Line> = vec![Line::Classes, Line::Models, Line::Prompts];
+        // Each machine's label spans its rows: (machine, first line, last line).
+        let mut spans: Vec<(&str, usize, usize)> = Vec::new();
+        for &chip in &rows {
+            let start = lines.len();
+            let users = &shape(chip).users;
+            for &gm in &GRID_METRICS {
+                lines.extend(gm.load.users(users).into_iter().map(|u| Line::Measure(chip, gm, u)));
+            }
+            spans.push((chip, start, lines.len() - 1));
+        }
+        // A model per class, or each model the Macs run there where sets differ.
+        let models = |class: &str| {
+            let mut names: Vec<&str> = Vec::new();
+            for &chip in &rows {
+                if let Some(stem) = model_of(chip, class).filter(|s| !names.contains(s)) {
+                    names.push(stem);
+                }
+            }
+            names.join(" / ")
         };
-        // The whole column's width, not its model name's: the maps fill it, so every map on the
-        // page is one size, and a name wider than the column wraps under them.
-        rsx! {
-            div { style: "flex: 1 1 0; min-width: 0",
-                Stack { gap: 1,
-                    div { style: "display: flex; gap: 0.5rem; align-items: flex-start",
-                        for (_, name) in metrics { {mini(chip, stem, name)} }
+        let template_columns =
+            format!("max-content max-content repeat({}, 2.25rem)", classes.len() * most);
+        let k_prompt = |i: u32| {
+            if i >= 1024 && i.is_multiple_of(1024) {
+                format!("{}k", i / 1024)
+            } else {
+                i.to_string()
+            }
+        };
+        // Each column's prompt size, or each set's where they differ: "512/1k".
+        let header = |p: usize| {
+            let mut sizes: Vec<u32> = Vec::new();
+            for set in Set::ALL {
+                if let Some(&i) = lineup.shapes.get(&set).and_then(|s| s.prompts.get(p))
+                    && !sizes.contains(&i)
+                    && rows.iter().any(|&chip| lineup.set(memory(chip)) == set)
+                {
+                    sizes.push(i);
+                }
+            }
+            sizes.into_iter().map(k_prompt).collect::<Vec<_>>().join("/")
+        };
+        // A row's slowest and fastest ratio, over every model and prompt size in it, printed at
+        // its right.
+        let range = |chip: &str, gm: GridMetric, u: u32| -> Option<(f64, f64)> {
+            (classes.iter())
+                .filter_map(|class| grids[&(chip, model_of(chip, class)?, gm.name)].as_ref().ok())
+                .flat_map(|g| g.cells.iter().filter(|c| c.0 == u).filter_map(|c| c.2))
+                .fold(None, |acc, r| match acc {
+                    None => Some((r, r)),
+                    Some((lo, hi)) => Some((f64::min(lo, r), f64::max(hi, r))),
+                })
+        };
+        // Over the grid's first and last two columns the tooltip reaches inward, not off its edge.
+        let align = |k: usize, p: usize| match (k, p) {
+            (0, p) if p < 2 => "top-left",
+            (k, p) if k + 1 == classes.len() && p + 2 >= most => "top-right",
+            _ => "top",
+        };
+        // Each square with Carbon's tooltip: the square is its trigger, focusable so a keyboard
+        // opens it too; the tooltip gives the ratio (or why there is none), the model on its
+        // machine, and the measure, prompt size and users.
+        let square = |chip: &str, stem: &str, gm: GridMetric, u: u32, i: u32, align: &str, place: String| -> Element {
+            let ratio = match &grids[&(chip, stem, gm.name)] {
+                Ok(g) => match g.cells.iter().find(|&&(cu, ci, _)| (cu, ci) == (u, i)) {
+                    Some(&(_, _, Some(r))) => Ok((r, g.rival)),
+                    _ => Err("no ratio"),
+                },
+                Err(why) => Err(*why),
+            };
+            let (fill, label, verdict) = match ratio {
+                Ok((r, rival)) => {
+                    let step = ratio_step(r);
+                    let shown = highlights.contains(&Square { chip, stem, metric: gm.name, users: u, prompt: i });
+                    // The steps far from ×1 are dark in light mode and light in dark mode.
+                    let ink = if step.abs_diff(RATIO_STEPS.len() / 2) >= 6 {
+                        "light-dark(#ffffff, #161616)"
+                    } else {
+                        "light-dark(#161616, #ffffff)"
+                    };
+                    (
+                        format!("background: {}; color: {ink}", RATIO_STEPS[step]),
+                        shown.then(|| format!("×{r:.1}")),
+                        format!("×{r:.2} vs {}", rival.label()),
+                    )
+                }
+                Err(why) => (
+                    "background: repeating-linear-gradient(135deg, transparent 0 4px, \
+                     light-dark(#c6c6c6, #525252) 4px 5px)"
+                        .to_string(),
+                    None,
+                    why.to_string(),
+                ),
+            };
+            rsx! {
+                // The grid's own cell, and a flex box: Carbon puts the trigger in an inline box in its
+                // shadow DOM, whose line would add room for text under every square.
+                cds-tooltip { "align": align, style: "{place}; display: flex",
+                    // Its own width: Carbon wraps the trigger in an inline box, so an empty square would
+                    // shrink to nothing.
+                    div { tabindex: "0",
+                        style: "width: 2.25rem; height: 2.25rem; {fill}; display: flex; align-items: center; justify-content: center; font-size: 0.625rem; font-weight: 600",
+                        if let Some(label) = label { "{label}" }
                     }
-                    div { style: "text-align: center; font-size: 0.75rem; overflow-wrap: anywhere", "{stem}" }
+                    cds-tooltip-content { style: "text-align: left",
+                        TipHeading { heading: verdict }
+                        div { "{stem} on {chip}" }
+                        div { "{gm.name} · {i} prompt tokens · {users_at(u)}" }
+                    }
+                }
+            }
+        };
+        rsx! {
+            div { style: "display: grid; grid-template-columns: {template_columns} max-content max-content; column-gap: 2px; row-gap: 2px; align-items: center",
+                for (n, line) in lines.iter().enumerate() {
+                    match *line {
+                        Line::Classes => rsx! {
+                            for (k, class) in classes.iter().enumerate() {
+                                div { style: "grid-row: {n + 1}; grid-column: {col(k, 0)} / span {most}; text-align: center; font-weight: 600", "{class}" }
+                            }
+                        },
+                        Line::Models => rsx! {
+                            for (k, class) in classes.iter().enumerate() {
+                                div { style: "grid-row: {n + 1}; grid-column: {col(k, 0)} / span {most}; text-align: center; font-size: 0.75rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap",
+                                    {models(class)}
+                                }
+                            }
+                        },
+                        Line::Prompts => rsx! {
+                            for k in 0..classes.len() {
+                                for p in 0..most {
+                                    div { style: "grid-row: {n + 1}; grid-column: {col(k, p)}; text-align: center; font-size: 0.625rem; white-space: nowrap", {header(p)} }
+                                }
+                            }
+                        },
+                        Line::Measure(chip, gm, u) => {
+                            let (label, about) = match gm.load {
+                                Load::Alone => (gm.letter.to_string(), gm.about.to_string()),
+                                Load::Shared => (
+                                    format!("{u}{}", gm.letter),
+                                    format!("With {u} users at once. {}", gm.about),
+                                ),
+                            };
+                            rsx! {
+                                div { style: "grid-row: {n + 1}; grid-column: 2; font-size: 0.875rem; font-weight: 600; text-align: right; padding-right: 0.5rem; white-space: nowrap",
+                                    Definition { alignment: Alignment::BottomLeft, heading: gm.name.to_string(), definition: about, strong { "{label}" } }
+                                }
+                                for (k, class) in classes.iter().enumerate() {
+                                    if let Some(stem) = model_of(chip, class) {
+                                        for (p, &i) in shape(chip).prompts.iter().enumerate() {
+                                            {square(chip, stem, gm, u, i, align(k, p), format!("grid-row: {}; grid-column: {}", n + 1, col(k, p)))}
+                                        }
+                                    }
+                                }
+                                if let Some((lo, hi)) = range(chip, gm, u) {
+                                    div { style: "grid-row: {n + 1}; grid-column: {col(classes.len(), 0) + 1}; font-size: 0.75rem; white-space: nowrap; padding-left: 1.5rem",
+                                        "×{lo:.2}–×{hi:.2}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for &(chip, start, end) in &spans {
+                    // A margin, not padding: the rotation would turn padding onto the label's far side.
+                    div { style: "grid-row: {start + 1} / {end + 2}; grid-column: 1; writing-mode: vertical-rl; transform: rotate(180deg); text-align: center; font-weight: 600; font-size: 0.875rem; margin-right: 1rem",
+                        "{chip}"
+                    }
+                }
+                // The ratio scale right beside the squares, as tall as their rows: one cell over
+                // all of them, so each row's range, a column further on, stays on its row.
+                if let (Some(&(_, first, _)), Some(&(_, _, last))) = (spans.first(), spans.last()) {
+                    div { style: "grid-row: {first + 1} / {last + 2}; grid-column: {col(classes.len(), 0)}; align-self: stretch; display: flex; padding-left: 0.5rem",
+                        {ratio_scale(ScaleFit::Fill, "scale-one-map")}
+                    }
                 }
             }
         }
@@ -2972,34 +3239,40 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                 // stack right under them; every other panel starts a step down.
                 Tile { style: "width: fit-content; max-width: 100%",
                     div {
-                        Tabs { selected: slug(HEAT_MAPS), kind: TabsKind::Contained,
-                            TabItem { value: slug(HEAT_MAPS), target: Some(slug(HEAT_MAPS)), selected: true, "{HEAT_MAPS}" }
+                        Tabs { selected: slug(ONE_MAP), kind: TabsKind::Contained,
+                            TabItem { value: slug(ONE_MAP), target: Some(slug(ONE_MAP)), selected: true, "{ONE_MAP}" }
                             TabItem { value: slug(LATENCY), target: Some(slug(LATENCY)), selected: false, "{LATENCY}" }
-                            for (title, _, _) in SCALING {
-                                TabItem { value: slug(title), target: Some(slug(title)), selected: false, "{title}" }
+                            if GLANCE_TREND_TABS {
+                                for (title, _, _) in SCALING {
+                                    TabItem { value: slug(title), target: Some(slug(title)), selected: false, "{title}" }
+                                }
+                                TabItem { value: slug(STARTUP), target: Some(slug(STARTUP)), selected: false, "{STARTUP}" }
                             }
-                            TabItem { value: slug(STARTUP), target: Some(slug(STARTUP)), selected: false, "{STARTUP}" }
                         }
                         div {
-                            ContentPanel { id: slug(HEAT_MAPS), shown: true,
+                            ContentPanel { id: slug(ONE_MAP), shown: true,
                                 div { style: "padding-top: var(--cds-spacing-05)",
                                 Stack { gap: 5,
                                     p { style: "contain: inline-size",
-                                        "A row per machine, a tile per model: its prefill (time to first token) and decode \
-                                         (throughput) grids at {answers}-token answers, users at once down, prompt size across. \
-                                         Colour is how many times faster scratchy is than the run's first rival, in the order \
-                                         {rivals}: blue faster, red slower, grey within noise. Hover a square for its ratio and engine; \
-                                         a striped one has no ratio, and the model's own section says why."
+                                        "Every Mac, model and measure in one map at {answers}-token answers: a column per \
+                                         prompt size under each model, shortest first (where the 32–36 GB and 64 GB Macs ran \
+                                         different sizes, the header gives both, smaller Macs' first; hover a square for its \
+                                         own), and under each Mac, with 1 user, P its prefill (time to \
+                                         first token) and D its decode (time per output token), then 2u and 4u its end-to-end \
+                                         time with 2 and 4 users, since once the GPU is busy scheduling only moves each \
+                                         request's wait between those two. Colour is how many times faster scratchy is than the run's \
+                                         first rival, in the order {rivals}: blue faster, red slower, grey within noise; right \
+                                         of each row, its slowest and fastest. Hover a square for its ratio and engine."
                                     }
-                                    {glance_maps(&rows, &classes, "minmax(0, 1fr)", true, cell)}
+                                    {one_map}
                                 }
                                 }
                             }
-                            // Each a machine × model matrix, every cell its prefill
-                            // sparkline over its decode. The 2rem between models
+                            // Each a machine × model matrix, every cell its panel's two
+                            // sparklines, one over the other. The 2rem between models
                             // holds the end tick labels Carbon centres on each
                             // chart's edges.
-                            for (title, along, [prefill, decode]) in SCALING {
+                            for (title, along, [upper, lower]) in SCALING.into_iter().filter(|_| GLANCE_TREND_TABS) {
                                 ContentPanel { id: slug(title), shown: false,
                                     div { style: "contain: inline-size; padding-top: var(--cds-spacing-05)",
                                         Stack { gap: 5,
@@ -3009,10 +3282,10 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                                         rsx! {
                                                             div { style: "flex: 1 1 0; min-width: 0",
                                                                 Stack { gap: 1,
-                                                                    span { style: "font-size: 0.75rem; font-weight: 600", "Prefill" }
-                                                                    {spark(chip, stem, prefill)}
-                                                                    span { style: "font-size: 0.75rem; font-weight: 600", "Decode" }
-                                                                    {spark(chip, stem, decode)}
+                                                                    span { style: "font-size: 0.75rem; font-weight: 600", "{upper.label()}" }
+                                                                    {spark(chip, stem, upper)}
+                                                                    span { style: "font-size: 0.75rem; font-weight: 600", "{lower.label()}" }
+                                                                    {spark(chip, stem, lower)}
                                                                     div { style: "font-size: 0.75rem; text-align: center; overflow-wrap: anywhere", "{stem}" }
                                                                 }
                                                             }
@@ -3022,11 +3295,15 @@ fn glance(machines: &BTreeMap<&str, MachineRuns>) -> Element {
                                     }
                                 }
                             }
-                            ContentPanel { id: slug(STARTUP), shown: false,
-                                div { style: "contain: inline-size; padding-top: var(--cds-spacing-05)", {startup_panel(machines, stems.len())} }
+                            if GLANCE_TREND_TABS {
+                                ContentPanel { id: slug(STARTUP), shown: false,
+                                    div { style: "contain: inline-size; padding-top: var(--cds-spacing-05)", {startup_panel(machines, stems.len())} }
+                                }
                             }
                             ContentPanel { id: slug(LATENCY), shown: false,
-                                div { style: "contain: inline-size", {latency_panel(machines, &rows, &classes, model_of)} }
+                                // Not contained: its charts' columns (ECDF_COLUMN) widen the tile to
+                                // hold them; its text adds no width of its own.
+                                div { {latency_panel(machines, &rows, &classes, model_of)} }
                             }
                         }
                     }
@@ -3074,13 +3351,21 @@ fn latency_panel<'l>(
         };
         let o = glance_answer(run);
         let about = format!("{stem} on {chip}");
-        // Each cell its TTFT's and TPOT's distributions, one over the other.
-        l.multiple(o, "minmax(0, 1fr)", &format!("{stem} · {o}-token answers"), |(u, o, i)| {
+        // A 1-user cell its TTFT's and TPOT's distributions, one over the other; a cell under load
+        // its end-to-end time's ([`Load`]). Each chart names its own users count, under its timing.
+        l.multiple(o, ECDF_COLUMN, &format!("{stem} · {o}-token answers"), UsersNamed::InCells, |(u, o, i)| {
             let label = |t: RequestTiming| format!("{} of every request, {i} in {o} out {u} at once, {about}", t.title());
+            let users = users_at(u);
+            let ecdf = |t: RequestTiming, tag: &str| l.ecdf((u, o, i), t, &[tag, &users], &label(t));
             rsx! {
                 Stack { gap: 1,
-                    {l.ecdf((u, o, i), RequestTiming::Ttft, "TTFT", &label(RequestTiming::Ttft))}
-                    {l.ecdf((u, o, i), RequestTiming::Tpot, "TPOT", &label(RequestTiming::Tpot))}
+                    match Load::of(u) {
+                        Load::Alone => rsx! {
+                            {ecdf(RequestTiming::Ttft, "TTFT")}
+                            {ecdf(RequestTiming::Tpot, "TPOT")}
+                        },
+                        Load::Shared => ecdf(RequestTiming::E2el, "E2EL"),
+                    }
                 }
             }
         })
@@ -3103,16 +3388,19 @@ fn latency_panel<'l>(
         script { dangerous_inner_html: LATENCY_JS }
         div { style: "padding-top: var(--cds-spacing-05)",
             Stack { gap: 5,
-                // The engines' colours keyed in the text itself: "● scratchy versus ● oMLX".
-                p {
+                // The engines' colours keyed in the text itself: "● scratchy versus ● oMLX". It
+                // wraps to the charts' width, adding none of its own.
+                p { style: "contain: inline-size",
                     for (n, (&e, class)) in latency_engines(machines).iter().zip(["s1", "s2"]).enumerate() {
                         if n > 0 { " versus " }
                         {engine_key(e, class)}
                     }
                     ": in each cell at the heat maps' answer length, users at once down and prompt size \
-                     across, the share of each one's requests (up) done within each time (across), time to \
-                     first token over time per output token, each chart on its own range. Further left is \
-                     faster; a steeper rise is steadier."
+                     across, the share of each one's requests (up) done within each time (across): with 1 user, \
+                     time to first token over time per output token; with more, end-to-end time, since once the \
+                     GPU is busy scheduling only moves each request's wait between those two. Time runs on a log \
+                     axis ×3 wide on every chart, centred on its two medians, so a factor is one width everywhere; \
+                     a request past an edge is drawn at it. Further left is faster; a steeper rise is steadier."
                 }
                 div {
                     for &chip in rows {
@@ -3508,16 +3796,18 @@ fn startup_panel(machines: &BTreeMap<&str, MachineRuns>, columns: usize) -> Elem
     }
 }
 
-/// The glance's first panel's name.
-const HEAT_MAPS: &str = "Heat maps";
+/// The glance's first panel's name: every heat map as one.
+const ONE_MAP: &str = "Heat map";
 
-/// The sparkline panels: a dimension, what runs along it, and its prefill and
-/// decode trends.
+/// Whether the overview shows its sparkline ([`SCALING`]) and startup tabs: not for now, so its
+/// heat maps and latency distributions carry it; the panels stay built.
+const GLANCE_TREND_TABS: bool = false;
+/// The sparkline panels: a dimension, what runs along it, and its two trends.
 const SCALING: [(&str, &str, [Trend; 2]); 2] = [
     (
         "Concurrency scaling",
         "users at once, at the grid's one-user summary cell (1024-token prompts, and the answer length the heat maps use); runs from before the grid had its own users (#349) at 1, 4 and 16 users, 512-token prompts and 128-token answers",
-        [Trend::UsersPrefill, Trend::UsersDecode],
+        [Trend::UsersEndToEnd, Trend::UsersDecode],
     ),
     (
         "Length scaling",
