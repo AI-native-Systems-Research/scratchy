@@ -298,7 +298,8 @@ These favour one side or the other and must travel with any published number.
   its `model_settings.json`) is the like-for-like rival for a default
   scratchy build, and **oMLX** as shipped (FP16 KV) the like-for-like one for
   mlx-lm.
-- **oMLX is the Metal matrix's default rival, run as it ships.** Its own
+- **oMLX is the Metal matrix's default rival, run as it ships** (from a branch
+  that lets it answer to length: see "Not every engine answers to length"). Its own
   caching stays on (the SSD cache kept in the run's output, a fresh one per
   variant, so nothing carries between runs), because `--no-cache` drops it to
   plain mlx-lm batching. Its memory guard stays at its default tier and
@@ -334,10 +335,13 @@ These favour one side or the other and must travel with any published number.
 - **Not every engine answers to length.** `bench serve` asks every engine to
   ignore EOS (`ignore_eos: true`), so each request decodes its full
   `--output-len`. scratchy does.
-  - oMLX's HTTP API takes no `ignore_eos`. Its own flag of that name, added in
-    oMLX 2026-10-21 (#4687 there), is internal to its admin benchmark. Its answers
-    stop at EOS: on the M1 Max run in #479, qwen3.6-35b-a3b's oMLX cells delivered
-    62–64% of the tokens asked for.
+  - oMLX releases through 0.7.x take no `ignore_eos` over HTTP. Their own flag of
+    that name, added in oMLX 2026-10-21 (#4687 there), is internal to their admin
+    benchmark, so their answers stop at EOS: on the M1 Max run in #479,
+    qwen3.6-35b-a3b's oMLX cells delivered 62–64% of the tokens asked for. The
+    matrix therefore builds oMLX from starpit/omlx's `feat/api-ignore-eos` branch
+    (jundot/omlx#4978), whose HTTP API takes it, and records that build by its
+    commit; runs on a release still stop at EOS.
   - ollama ignores `ignore_eos` too, and mlx-lm sometimes stops short.
   - Such a cell measures less decode than its label says, over shorter answers
     with smaller KV, which flatters tok/s. So the page marks every number from a

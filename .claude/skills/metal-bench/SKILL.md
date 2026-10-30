@@ -111,10 +111,16 @@ internet for that too.
 
 oMLX goes in from source, with its native kernels: a plain install (Homebrew
 included) skips them, and the Qwen3.5/3.6 family then falls back to much
-slower paths. Building them needs full Xcode, not only the Command Line Tools:
+slower paths. Building them needs full Xcode, not only the Command Line Tools.
+For now it comes from starpit/omlx's `feat/api-ignore-eos` branch: oMLX main
+plus jundot/omlx#4978, which lets its HTTP API take `ignore_eos`. Releases
+through 0.7.x drop the field, so their answers stop at EOS and are timed over
+less work than the other engines did. Go back to a jundot/omlx release once
+one includes it. An older `~/omlx` (a release, or not a git checkout) goes
+aside first, its `.venv` with it, since the branch needs newer MLX:
 
 ```bash
-git clone --branch <tag> https://github.com/jundot/omlx ~/omlx && cd ~/omlx
+git clone --branch feat/api-ignore-eos https://github.com/starpit/omlx ~/omlx && cd ~/omlx
 python3.13 -m venv .venv && OMLX_WITH_CUSTOM_KERNEL=1 .venv/bin/pip install -e .
 .venv/bin/python -c "from omlx.custom_kernels import native_kernel_status; print(native_kernel_status())"
 ln -s ~/omlx/.venv/bin/omlx /opt/homebrew/bin/omlx   # the script looks for omlx on PATH
@@ -217,13 +223,15 @@ the `--models` flag (none for this Mac's set, or `--models full`).
 Full run. Pin every engine the run uses and scratchy's commit to the versions
 agreed for this round, so all the Macs run the same thing; the script refuses
 to start while any pin is missing or doesn't match, and lists what's wrong.
-Names match in any case, scratchy's pin is a commit prefix, and llama.cpp's
-is its build number:
+Names match in any case. scratchy's pin is a commit prefix, and so is oMLX's
+when it is a git checkout, as the branch above is (`git -C ~/omlx rev-parse
+--short HEAD`); a release install pins its version. llama.cpp's is its build
+number:
 
 ```bash
 source ~/.venvs/mlx/bin/activate
 caffeinate -dims ./scripts/bench_metal_matrix.sh --fail-fast [--models full] \
-  --pin scratchy=<sha> --pin oMLX=<v> 2>&1 | tee ~/metal-matrix-run.log
+  --pin scratchy=<sha> --pin oMLX=<commit> 2>&1 | tee ~/metal-matrix-run.log
 echo "exit ${PIPESTATUS[0]}"
 ```
 

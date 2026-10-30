@@ -73,8 +73,10 @@
 #   oMLX        `omlx serve` over the downloaded MLX checkpoint, twice:
 #               as installed (FP16 KV), and with its TurboQuant KV turned on
 #               (4-bit), so scratchy's TurboQuant default meets a like-for-like
-#               rival as well as oMLX's own default. Its HTTP API takes no
-#               ignore_eos, so its answers stop at EOS (§ on the page, #479)
+#               rival as well as oMLX's own default. Built from starpit/omlx's
+#               feat/api-ignore-eos branch (jundot/omlx#4978), its HTTP API
+#               takes ignore_eos and answers to length; releases through 0.7.x
+#               drop it and stop at EOS (§ on the page, #479)
 #   mistral.rs  `mistralrs serve`, the same Q4_K_M GGUF as llama.cpp; a Rust
 #               control: is scratchy fast because of its compiler, or Rust?
 #   Splash      `splash serve` (Inco AI), the same MLX checkpoint as scratchy;
@@ -86,7 +88,8 @@
 # Pins: an agreed run names every engine's version and scratchy's commit, and
 # the runner refuses to start if anything installed differs:
 #   --pin scratchy=f378699ec --pin mlx-lm=0.31.3 --pin ollama=0.35.1 ...
-# (llama.cpp pins its build number, b1234). --unpinned runs anyway and says so.
+# (llama.cpp pins its build number, b1234; scratchy and a source-built oMLX a
+# commit prefix). --unpinned runs anyway and says so.
 #
 # --serve-args "..." adds extra `scr serve` flags (recorded in the JSON). None
 # by default: `scr serve` sizes --max-num-batched-tokens to the largest resident
@@ -514,7 +517,12 @@ engine_version() { # key
                     [[ -n "${v}" ]] && echo "${v}" \
                         || { local -a py; read -r -a py <<<"$(head -1 "${VLLM_BIN}" | sed 's/^#!//')"
                              "${py[@]}" -c 'import importlib.metadata as m; print(m.version("vllm-metal"))'; } ;;
-        omlx)       "${OMLX_BIN}" --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -1 ;;
+        omlx)       # a source checkout (the Metal bench skill's install) by its commit, which
+                    # tells a branch from the release it was cut after; else the release it prints
+                    local -a py; read -r -a py <<<"$(head -1 "${OMLX_BIN}" | sed 's/^#!//')"
+                    local src; src="$("${py[@]}" -c 'import omlx, os; print(os.path.dirname(os.path.dirname(omlx.__file__)))')"
+                    git -C "${src}" rev-parse HEAD \
+                        || "${OMLX_BIN}" --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -1 ;;
         mistralrs)  "${MISTRALRS_BIN}" --version | grep -oE '[0-9]+(\.[0-9]+)+' | head -1 ;;
         splash)     # the Homebrew formula's version, else what the binary prints
                     local v; v="$(brew list --versions splash 2>/dev/null | awk '{print $2}')"
@@ -535,8 +543,8 @@ check_pin() { # label installed
     local want; want="$(pin_for "$1")"
     if [[ -z "${want}" ]]; then
         pin_problems+=("$1 is not pinned (installed: ${2:-unknown})")
-    elif [[ "$1" == scratchy ]]; then
-        [[ "$2" == "${want}"* ]] || pin_problems+=("scratchy is at ${2:0:12}, pinned ${want}")
+    elif [[ "$2" =~ ^[0-9a-f]{40}$ ]]; then # a commit (scratchy, a source-built oMLX): its prefix
+        [[ "$2" == "${want}"* ]] || pin_problems+=("$1 is at ${2:0:12}, pinned ${want}")
     elif [[ "${2#b}" != "${want#b}" ]]; then
         pin_problems+=("$1 is ${2:-unknown}, pinned ${want}")
     fi
