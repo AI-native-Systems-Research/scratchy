@@ -234,13 +234,21 @@ pub(crate) fn launch_site(
     // handing a different region here is the whole mechanism that lets one segment's
     // worth of addresses span several regions. Bank 0 (`weight_bank` = 0, every unbanked
     // bundle) is `seg_addr[SEG_WEIGHT]`, exactly as before.
-    let wbase = segment_base(seg, banks, where_.weight_bank, SEG_WEIGHT.get())?;
+    // ⭐ AND A COLLECTIVE'S CONSUME TAKES NEITHER: its weight-segment operand is the receive window,
+    // one placement in the base region, so `weight_slot` pins it to shift 0 in bank 0 — the one law
+    // the walk and the plan twin both read through this function.
+    let (weight_shift, weight_bank) =
+        op.code
+            .kv
+            .weight_slot(off[SEG_WEIGHT.get()], where_.weight_bank);
+    off[SEG_WEIGHT.get()] = weight_shift;
+    let wbase = segment_base(seg, banks, weight_bank, SEG_WEIGHT.get())?;
     let mut ta = Vec::with_capacity(NUM_SEGMENTS);
     for (i, &sh) in off.iter().enumerate() {
         let base = if i == SEG_WEIGHT.get() {
             wbase
         } else {
-            segment_base(seg, banks, where_.weight_bank, i)?
+            segment_base(seg, banks, weight_bank, i)?
         };
         ta.push(
             if sh > 0

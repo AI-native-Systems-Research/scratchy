@@ -415,6 +415,21 @@ impl KvShifts {
     pub const fn slab_write(self) -> bool {
         self.slab_stride_bytes > 0
     }
+
+    /// ⭐ WHERE THIS LAUNCH'S WEIGHT SLOT RESOLVES — `(byte shift, bank)` from the layer's own
+    /// `(layer_shift, layer_bank)`.
+    ///
+    /// ⛔ A CONSUME IS NEVER SHIFTED OR BANKED. Its weight-segment operand is the receive window, ONE
+    /// placement in the base region where the peer's send lands; a rolled body hands layer `v` a
+    /// weight base shifted by `v · weight_stride`, and a banked launch resolves the slot through
+    /// another region entirely — either one aims the consume at bytes no send ever wrote. Every
+    /// other group takes the layer's own pair unchanged.
+    pub const fn weight_slot(self, layer_shift: u64, layer_bank: usize) -> (u64, usize) {
+        match self.tp {
+            Some(_) => (0, 0),
+            None => (layer_shift, layer_bank),
+        }
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
