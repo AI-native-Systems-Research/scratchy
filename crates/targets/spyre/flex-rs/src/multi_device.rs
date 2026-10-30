@@ -2039,6 +2039,139 @@ impl RdmaUnit {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The p2p PUSH as a control block — the data leg of an RDMA send
+// ---------------------------------------------------------------------------
+
+/// Why a p2p push cannot be built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum P2pPushError {
+    /// The bytes would land past the peer window the mapping covers.
+    PastWindow {
+        offset: u64,
+        len: u64,
+        window: u64,
+    },
+    /// The destination or the length is not whole flits — every CB address and length field
+    /// counts in flits, so a partial one is not a transfer the engine can state.
+    NotFlitAligned { offset: u64, len: u64 },
+    /// The source segment's translation length exceeds the hardware's XLAT field.
+    Xlat(crate::control_block_wire::XlatLengthTooLarge),
+}
+
+/// ⭐ ONE P2P PUSH AS ONE CONTROL BLOCK — `len` bytes of THIS card's memory at `src` written into
+/// the peer's mapped window at `dst_offset`, by this card's own DMA engine on its DMO slot (device
+/// → PCIe address), the PCIe address being the peer's memory the cross-port IOMMU mapping made
+/// reachable. No host memory is touched, and nothing on the host runs between the CB before it
+/// and the CB after it: the push is a CB in the same stream as the compute around it.
+///
+/// It is the DATA leg of an RDMA send and nothing more. The peer learns the bytes landed through
+/// the write-done increment, an R5-section command this crate does not encode yet (only
+/// [`crate::control_block_wire::R5Section::none`] is ported), so `PfRuntimeScheduler`'s
+/// `submit_p2p_rdma_send` / `submit_p2p_rdma_wait` stay refusals until it is.
+pub fn p2p_push_cb(
+    tag: crate::control_block_wire::ResponseTag,
+    src: crate::control_block_wire::VirtualAddressSbf,
+    src_xlat: crate::control_block_wire::XlatWindow,
+    window: &PeerTransferWindow,
+    dst_offset: u64,
+    len: crate::control_block_wire::TransferSize,
+    pipeline_barrier: bool,
+) -> Result<crate::control_block_wire::ControlBlockWire, P2pPushError> {
+    use crate::control_block_wire::{ControlBlockWire, DmaTransfer, Flits, HostPhysicalAddress};
+    let n = len.0;
+    if !dst_offset.is_multiple_of(Flits::BYTES) || n == 0 || !n.is_multiple_of(Flits::BYTES) {
+        return Err(P2pPushError::NotFlitAligned {
+            offset: dst_offset,
+            len: n,
+        });
+    }
+    let past = P2pPushError::PastWindow {
+        offset: dst_offset,
+        len: n,
+        window: window.len_bytes,
+    };
+    if dst_offset.checked_add(n).is_none_or(|end| end > window.len_bytes) {
+        return Err(past);
+    }
+    let host_addr = HostPhysicalAddress::of_peer_window(window, dst_offset).ok_or(past)?;
+    ControlBlockWire::dma_immediate(
+        tag,
+        false,
+        DmaTransfer {
+            dmva: src,
+            host_addr,
+            size_bytes: len,
+        },
+        src_xlat,
+        pipeline_barrier,
+    )
+    .map_err(P2pPushError::Xlat)
+}
+
+#[cfg(test)]
+mod p2p_push_tests {
+    use super::*;
+    use crate::control_block_wire::{
+        DevicePhysicalAddress, Flits, ResponseTag, SegmentExtent, TransferSize, VirtualAddressSbf,
+        XlatWindow,
+    };
+
+    fn window() -> PeerTransferWindow {
+        PeerTransferWindow {
+            target: RankId(1),
+            address: 0x4000_0000,
+            len_bytes: 4 * 1024 * 1024,
+        }
+    }
+
+    fn words(bytes: &[u8], at: usize) -> [u64; 2] {
+        let w = |o: usize| u64::from_le_bytes(bytes[at + o..at + o + 8].try_into().unwrap());
+        [w(0), w(8)]
+    }
+
+    /// The push is a DMO-immediate CB (DMI skipped) reading this card's `src` and writing the peer
+    /// window `dst_offset` bytes in — the two addresses, the length and the type read straight back
+    /// off the wire bytes.
+    #[test]
+    fn a_push_is_one_dmo_immediate_from_the_source_into_the_peer_window() {
+        let src = VirtualAddressSbf::new(5, Flits(64));
+        let xlat = XlatWindow {
+            region_paddr: DevicePhysicalAddress(0x1_0000_0000),
+            length: SegmentExtent(64 * 128 + 4096),
+        };
+        let cb = p2p_push_cb(ResponseTag(7), src, xlat, &window(), 8192, TransferSize(4096), false)
+            .unwrap();
+        let bytes = cb.to_bytes();
+        let [dmi0, dmi1] = words(&bytes, 16);
+        let [dmo0, dmo1] = words(&bytes, 32);
+        assert_eq!(dmi1 & 0xF, 0b0011, "DMI is skipped");
+        let _ = dmi0;
+        assert_eq!(dmo1 & 0xF, 0b0100, "DMO is an immediate transfer");
+        assert_eq!((dmo0 >> 32) & ((1 << 30) - 1), src.value(), "DMO reads this card's source");
+        assert_eq!(dmo1 >> 7, (window().address + 8192) / 128, "DMO writes the peer window");
+        assert_eq!(dmo0 & ((1 << 27) - 1), 4096 / 128, "DMO moves the fragment's flits");
+    }
+
+    #[test]
+    fn a_push_refuses_bytes_outside_the_window_or_off_the_flit_grid() {
+        let src = VirtualAddressSbf::new(5, Flits(0));
+        let xlat = XlatWindow {
+            region_paddr: DevicePhysicalAddress(0),
+            length: SegmentExtent(4096),
+        };
+        let w = window();
+        assert!(matches!(
+            p2p_push_cb(ResponseTag(0), src, xlat, &w, w.len_bytes - 128, TransferSize(256), false),
+            Err(P2pPushError::PastWindow { .. })
+        ));
+        assert!(matches!(
+            p2p_push_cb(ResponseTag(0), src, xlat, &w, 64, TransferSize(128), false),
+            Err(P2pPushError::NotFlitAligned { .. })
+        ));
+    }
+}
+
 /// Ported (adapted) C++ test, source:
 /// `flex/tests/multi_device/rdma_negative_counter_test.cpp`
 /// (`RdmaUnitNegativeCounter.DetectPeerExit`).
