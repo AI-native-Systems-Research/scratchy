@@ -1232,8 +1232,8 @@ fn log_seat_readback(
 
 /// ⭐ THE PREFILL LADDERS THE CHUNK LOOP CLIMBS, ONE BUNDLE: the ladder a prompt's first chunk picks
 /// from (each rung walks only its own chunk's pages), and the ladder a continuation chunk picks from
-/// (each rung walks the whole pool) — both borrowed mutably because the picked rung's session is run
-/// in place.
+/// (each rung's walks reach up to the whole pool) — both borrowed mutably because the picked rung's
+/// session is run in place.
 #[cfg(feature = "spyre-hw")]
 pub(crate) struct PrefillLadders<'a> {
     /// Ascending by baked width. A chunk at position 0 runs on the smallest rung holding it.
