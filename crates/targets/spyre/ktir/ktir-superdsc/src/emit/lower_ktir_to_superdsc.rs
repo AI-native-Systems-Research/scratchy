@@ -263,10 +263,10 @@ pub struct ChainedIndex {
 
 /// ⭐ THE CARD WIDTH OF ONE POSITION'S INDEX RUN, in int32 words — what a chained index's first
 /// gather copies per position ([`index_run_gather`]), and so the pitch the index table holds each
-/// position's run at on the card. The copy is `zero + run` (dxp binds no int32 `identity`), and the
-/// int32 zero is made by the converts, which sweep the 64-element device width
-/// ([`DeviceWidth::for_convert`](crate::work::DeviceWidth::for_convert)); one tensor has one
-/// arrangement, so the run is that width too: two SENUINT32 sticks, the run's words in the first.
+/// position's run at on the card. The copy is `zero + run` (dxp binds no int32 `identity`) against
+/// the host-staged zero stick ([`PAGED_INT32_ZERO_TID`](crate::reserved_tids::PAGED_INT32_ZERO_TID)),
+/// at the 64-element device width the int32 ops mint at (one 32-word stick does not): two SENUINT32
+/// sticks, the run's words in the first.
 pub const INDEX_RUN_WORDS: u32 = crate::work::FP16_ELEMS_PER_STICK;
 
 /// [`Gather`] for this program, or `None` when it states no indirect access.

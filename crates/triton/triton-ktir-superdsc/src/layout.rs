@@ -433,12 +433,13 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     // ── THE CHAINED INDEX'S INT32 ZERO ──────────────────────────────────────────────────────────
     // A chained index copies its run against the host-staged int32 zero stick
     // (`PAGED_INT32_ZERO_TID`, `addi32toi32(zero, run)`), which the door reads by its reserved tid —
-    // placed, as the bake places it, in the segment a walk's relaunch does not shift.
+    // placed, as the bake places it (`PagedStep::card_placements`), in the segment neither a walk's
+    // relaunch nor a layer's launch shifts.
     if !chained.is_empty() {
         pack(
             name,
             ktir_superdsc::reserved_tids::PAGED_INT32_ZERO_TID,
-            SegRole::Kv,
+            SegRole::Intermediate,
             u64::from(ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS) * 4,
             &mut placements,
             &mut segment_bytes,

@@ -3024,6 +3024,34 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
             }
         }
     }
+    // ⛔ AND A BODY READS ONLY PER-LAYER TENSORS IN THE KV SEGMENT. Every layer's launch shifts the
+    // whole segment by that layer's offset, so a tensor in it that is not one of a layer's own
+    // copies is read at its placement plus each layer's shift — another layer's keys, or bytes past
+    // the pools — by every launch after the first. (The prefix and suffix launch unshifted, so a
+    // tensor only they read is read where it sits.)
+    if launches.len() > 1 {
+        let per_layer_tids: std::collections::HashSet<u32> =
+            per_layer.values().flatten().copied().collect();
+        let body_reads: std::collections::HashSet<&str> = bodies
+            .iter()
+            .flat_map(|b| b.ops.iter())
+            .flat_map(|e| e.arg_bindings.iter().map(|a| a.buffer.as_str()))
+            .collect();
+        if let Some(p) = bundle_layout.placements.values().find(|p| {
+            p.segment == kv_seg
+                && !per_layer_tids.contains(&p.tid)
+                && body_reads.contains(ktir_superdsc::place::act_name(p.tid).as_str())
+        }) {
+            return Err(SuperDscError(format!(
+                "reroll-superdsc: a layer's body reads t{}, which is placed in the KV segment \
+                 (seg{kv_seg}) but is no layer's own tensor — each of the {} layer launches shifts \
+                 that segment by its layer's offset, so every layer past the first would read it \
+                 elsewhere",
+                p.tid,
+                launches.len(),
+            )));
+        }
+    }
     // The PAGE stride: one pool page covers every layer of every class, so the stride is the
     // extent of the packed per-layer KV — the max end over every class's LAST layer placement
     // (classes are packed contiguously; per-class strides differ, which is exactly why this is a

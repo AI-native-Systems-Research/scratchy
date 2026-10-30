@@ -1760,8 +1760,8 @@ impl SpyreWorker {
                 // binds and stages them; the batched-prefill session and every ladder rung borrow seg1
                 // from it by alias. So this takes `weights` by MOVE and no copy of that ~2.6 GB host
                 // buffer is ever made.
-                // ⭐ AND THE POOL'S STATICS — `kv_row_pool` and the int32 zero, beside the pools in the
-                // KV segment every session aliases from this one.
+                // ⭐ AND THE POOL'S STATICS — `kv_row_pool` and the int32 zero, which the one-request
+                // decode kernel's walk reads; every other session's kernels read none.
                 let pool_statics = scratchy_target_spyre::paged_step::card_statics(&step)
                     .map_err(|e| werr(format!("the KV pool's statics: {e}")))?;
                 let mut ss = SuperDscSession::new(
@@ -1809,8 +1809,7 @@ impl SpyreWorker {
                     spill_images.push((seg, image));
                 }
 
-                // The pools start zeroed: `prepare` uploads the KV segment's host image — zeros, and the
-                // pool's statics beside them.
+                // The pools start zeroed: `prepare` uploads the KV segment's host image.
                 debug!(
                     "[timing] SuperDscSession::new (bind weights + prepare) took {:.2}s",
                     _t_sess.elapsed().as_secs_f64()
@@ -2127,7 +2126,8 @@ impl SpyreWorker {
                     }
                     fault(&mut ss, 1)?;
                     info!(
-                        "[spyre-worker] sendnn: chunk sessions' activation shadows faulted in at load                          ({} KB, {:.0} ms)",
+                        "[spyre-worker] sendnn: chunk sessions' activation shadows faulted in at load \
+                         ({} KB, {:.0} ms)",
                         shadow_bytes >> 10,
                         _t.elapsed().as_secs_f64() * 1e3,
                     );

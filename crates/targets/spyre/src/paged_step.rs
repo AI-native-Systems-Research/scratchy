@@ -465,12 +465,16 @@ pub fn card_batch_sources(
 
 /// ⭐ THE POOL'S STATICS ON THE CARD — `kv_row_pool` at the card's run pitch (page `p`'s `nkvh` rows
 /// in the first words of its [`INDEX_RUN_WORDS`] run: the run the decode walk's chained index copies
-/// per page) and the int32 zero that copy adds to. The pool's, not a kernel's: the same for every
-/// step and every bundle of the pool ([`PagedStep::card_placements`]), so the session that owns the
-/// pool stages them once, at load, and every session aliasing its KV segment reads them there.
+/// per page) and the int32 zero that copy adds to. The same for every step, so the session whose
+/// bundles read them (the decode kernel's) stages them once, at load, where
+/// [`PagedStep::card_placements`] puts them. Empty for a bundle whose attention reads no
+/// `kv_row_pool`.
 ///
 /// [`INDEX_RUN_WORDS`]: ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS
 pub fn card_statics(step: &PagedStep) -> Result<Vec<(u32, Vec<u8>)>, PagedStepError> {
+    if !step.reads_kv_row_pool() {
+        return Ok(Vec::new());
+    }
     let run = ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS as usize;
     let nkvh = step.nkvh as usize;
     if nkvh > run {
@@ -818,15 +822,13 @@ mod tests {
             .1;
         assert_eq!(zero.len(), run * 4);
         assert!(zero.iter().all(|&b| b == 0));
-        // The pool's, so every bundle of it stages the same bytes.
-        assert_eq!(card_statics(&step()).unwrap(), statics);
-        assert_eq!(
-            card_statics(&PagedStep {
-                pages: 4,
-                ..batch()
-            })
-            .unwrap(),
-            statics
+        assert!(
+            card_statics(&step()).unwrap().is_empty(),
+            "a prompt chunk reads none"
+        );
+        assert!(
+            card_statics(&batch()).unwrap().is_empty(),
+            "nor does a decode batch"
         );
     }
 
@@ -853,7 +855,7 @@ mod tests {
             for (tid, w) in statics {
                 assert_eq!(
                     w.len() as u64,
-                    size(*tid, crate::wiring::CardSeat::Pool),
+                    size(*tid, crate::wiring::CardSeat::Static),
                     "t{tid}"
                 );
             }

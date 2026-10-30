@@ -164,8 +164,8 @@ impl SuperDscSession {
     /// covers.
     ///
     /// `pool_statics` are the KV pool's own int32 tables
-    /// ([`crate::paged_step::card_statics`]) — placed beside the pools, staged VERBATIM once here by
-    /// the session that owns the pool, and read by every session that aliases its KV segment.
+    /// ([`crate::paged_step::card_statics`]) — staged VERBATIM once here by the session whose
+    /// bundles read them (the one-request decode's).
     pub fn new(
         code: &'static crate::bundle_code::BundleCode<'static>,
         dims: SessionDims,
