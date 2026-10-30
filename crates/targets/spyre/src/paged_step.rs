@@ -50,6 +50,44 @@ pub const fn page_of_block(b: u32) -> u32 {
     b + 1
 }
 
+/// ⭐⭐ EVERY POSITION A PAGED BUNDLE ADMITS STAGES A WALK — the bake's proof, over the ladder the
+/// card executor reads and the selection it runs ([`RerollMeta::ladder`],
+/// [`Ladder::rung_for`](crate::bundle_code::Ladder::rung_for)): for every `valid_len` up to the
+/// ladder's widest sweep, the rung selected covers it, and its sweep is a walk of `step`'s pool that
+/// the worker stages ([`PagedStep::on_body`], at the step's own rows). Panicked on by the bake, so a
+/// ladder the executor would read as no walk — or a rung it would select that stages none — fails
+/// `cargo build` rather than a card's first forward.
+pub fn prove_ladder_walks(
+    meta: &crate::bundle_code::RerollMeta<'_>,
+    step: PagedStep,
+) -> Result<(), String> {
+    let ladder = meta.ladder()?;
+    let top = ladder
+        .rungs()
+        .iter()
+        .map(|r| r.active_cap.get())
+        .max()
+        .unwrap_or(0);
+    for p in 1..=u64::from(top) {
+        let (at, rung) = ladder.rung_for(p);
+        let swept = rung.active_cap.get();
+        if !rung.active_cap.covers(p) {
+            return Err(format!(
+                "a step reaching {p} position(s) selects rung {at}, whose {swept}-slot sweep does not \
+                 reach it"
+            ));
+        }
+        if step.on_body(step.rows, step.paged_rows, swept).is_none() {
+            return Err(format!(
+                "a step reaching {p} position(s) selects rung {at}, whose {swept}-slot sweep is no \
+                 walk of the {}-page pool ({} slots a page) — the worker has no walk to stage",
+                step.pages, step.page_slots
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// ⭐ THE POOL ONE DEVICE REGION HOLDS, in token slots. Every layer's K and V pools are one segment,
 /// one allocation of at most [`scratchy_spyre_bundle::MAX_SEGMENT_BYTES`], at `kv_slot_bytes` a slot
 /// (every layer's K and V row of one token). So the pool is the model's own context,
@@ -593,6 +631,47 @@ mod tests {
             paged_rows: PagedRows::Batch,
             ..step()
         }
+    }
+
+    /// A ladder proves its walks: one rung (a prompt chunk's own pages) and several (a decode body's
+    /// walk buckets) stage a walk at every position they admit; a sweep that is no whole number of
+    /// pages, or reaches past the pool, does not.
+    #[test]
+    fn every_position_a_ladder_admits_stages_a_walk() {
+        use crate::bundle_code::{LadderRung, RerollMeta, SiblingFp, SweptCols};
+        use std::borrow::Cow;
+        let meta = |caps: &[u32]| RerollMeta {
+            prefix: SiblingFp::none(),
+            suffix: SiblingFp::none(),
+            bodies: Cow::Owned(vec![SiblingFp::none()]),
+            bodies_fused: Cow::Owned(vec![SiblingFp::none()]),
+            rungs: Cow::Owned(
+                caps.iter()
+                    .map(|&c| LadderRung {
+                        active_cap: SweptCols::new(c),
+                        bodies: Cow::Owned(vec![SiblingFp::none()]),
+                        bodies_fused: Cow::Owned(vec![SiblingFp::none()]),
+                    })
+                    .collect(),
+            ),
+            fallback_rung: caps.len().saturating_sub(1) as u32,
+            launches: Cow::Owned(Vec::new()),
+            kv_page_stride: 0,
+            prefix_weight_bank: 0,
+            suffix_weight_bank: 0,
+        };
+        // `step()`: a 4-page pool of 4-slot pages.
+        assert_eq!(prove_ladder_walks(&meta(&[8]), step()), Ok(()));
+        assert_eq!(prove_ladder_walks(&meta(&[4, 8, 16]), step()), Ok(()));
+        assert!(
+            prove_ladder_walks(&meta(&[6]), step()).is_err(),
+            "half a page"
+        );
+        assert!(
+            prove_ladder_walks(&meta(&[4, 32]), step()).is_err(),
+            "past the pool"
+        );
+        assert!(prove_ladder_walks(&meta(&[]), step()).is_err(), "no rung");
     }
 
     /// The pool is the model's context where every layer's K and V of it fit one device region,
