@@ -230,10 +230,14 @@ number:
 
 ```bash
 source ~/.venvs/mlx/bin/activate
-caffeinate -dims ./scripts/bench_metal_matrix.sh --fail-fast [--models full] \
+caffeinate -dims ./scripts/bench_metal_matrix.sh --full --fail-fast [--models full] \
   --pin scratchy=<sha> --pin oMLX=<commit> 2>&1 | tee ~/metal-matrix-run.log
 echo "exit ${PIPESTATUS[0]}"
 ```
+
+`--full` is what makes it a full run. Without it the script runs a quick
+run under the pins: scratchy alone, no frozen rung, one rep, and step 4
+reports its scope as `quick`.
 
 With `--engines all`, pin the others too: `--pin mlx-lm=<v> --pin ollama=<v>
 --pin llama.cpp=b<build> --pin vllm-metal=<v> --pin mistral.rs=<v> --pin
