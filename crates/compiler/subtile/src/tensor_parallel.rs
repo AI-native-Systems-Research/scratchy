@@ -63,7 +63,10 @@ impl WorldSize {
     pub const fn of<const W: u32>() -> Self {
         const {
             assert!(W >= 1, "a tensor-parallel world has at least one rank");
-            assert!(W <= MAX_RANKS, "a world wider than the runtime's 64-bit rank mask");
+            assert!(
+                W <= MAX_RANKS,
+                "a world wider than the runtime's 64-bit rank mask"
+            );
         }
         match NonZeroU32::new(W) {
             Some(w) => Self(w),
@@ -626,68 +629,67 @@ impl Weave<'_> {
                 })
                 .collect()
         };
-        let (split, hd, op, sinks): (Vec<usize>, u32, _, Option<(usize, SourceShard)>) =
-            match desc.op {
-                SubOp::RopeRotate { head_dim, .. } => {
-                    let mut split = vec![0];
-                    split.extend(tables_as_wide(self));
-                    (split, head_dim.get(), desc.op, None)
-                }
-                // `[K, cos, sin, V, K_cache, V_cache]` (a legacy fixture may stop at V).
-                SubOp::RopeAppend { head_dim, .. } => {
-                    let mut split: Vec<usize> = [0, 3, 4, 5]
-                        .into_iter()
-                        .filter(|k| *k < desc.inputs.len())
-                        .collect();
-                    split.extend(tables_as_wide(self));
-                    (split, head_dim.get(), desc.op, None)
-                }
-                // `[K, V, K_cache, V_cache]`.
-                SubOp::KvAppend { head_dim, .. } => {
-                    (vec![0, 1, 2, 3], head_dim.get(), desc.op, None)
-                }
-                SubOp::AttnDecode {
-                    geom,
-                    scale,
-                    valid_len,
-                    mask,
-                    ..
-                } => {
-                    let (nq, nkv) = (geom.nqh().get(), geom.nkvh().get());
-                    let local = (nq.is_multiple_of(self.w) && nkv.is_multiple_of(self.w))
-                        .then(|| {
-                            ModelAttnGeometry::mint(
-                                QueryHeads::new(nq / self.w),
-                                KvHeads::new(nkv / self.w),
-                                HeadDim::new(geom.hd().get()),
-                            )
-                        })
-                        .flatten();
-                    let Some(local) = local else {
+        let (split, hd, op, sinks): (Vec<usize>, u32, _, Option<(usize, SourceShard)>) = match desc
+            .op
+        {
+            SubOp::RopeRotate { head_dim, .. } => {
+                let mut split = vec![0];
+                split.extend(tables_as_wide(self));
+                (split, head_dim.get(), desc.op, None)
+            }
+            // `[K, cos, sin, V, K_cache, V_cache]` (a legacy fixture may stop at V).
+            SubOp::RopeAppend { head_dim, .. } => {
+                let mut split: Vec<usize> = [0, 3, 4, 5]
+                    .into_iter()
+                    .filter(|k| *k < desc.inputs.len())
+                    .collect();
+                split.extend(tables_as_wide(self));
+                (split, head_dim.get(), desc.op, None)
+            }
+            // `[K, V, K_cache, V_cache]`.
+            SubOp::KvAppend { head_dim, .. } => (vec![0, 1, 2, 3], head_dim.get(), desc.op, None),
+            SubOp::AttnDecode {
+                geom,
+                scale,
+                valid_len,
+                mask,
+                ..
+            } => {
+                let (nq, nkv) = (geom.nqh().get(), geom.nkvh().get());
+                let local = (nq.is_multiple_of(self.w) && nkv.is_multiple_of(self.w))
+                    .then(|| {
+                        ModelAttnGeometry::mint(
+                            QueryHeads::new(nq / self.w),
+                            KvHeads::new(nkv / self.w),
+                            HeadDim::new(geom.hd().get()),
+                        )
+                    })
+                    .flatten();
+                let Some(local) = local else {
+                    return self.replicate(i);
+                };
+                // `[q, (k, v)…]`, or `[q, pk, pv, nk, nv, sinks]`.
+                let n = desc.inputs.len();
+                let sinks = if n == 6 {
+                    let InputRef::Ext(se) = desc.inputs[5] else {
                         return self.replicate(i);
                     };
-                    // `[q, (k, v)…]`, or `[q, pk, pv, nk, nv, sinks]`.
-                    let n = desc.inputs.len();
-                    let sinks = if n == 6 {
-                        let InputRef::Ext(se) = desc.inputs[5] else {
-                            return self.replicate(i);
-                        };
-                        let (sr, sc) = self.src_shape(se);
-                        let shard = match (sr == nq, sc == nq) {
-                            (_, true) => SourceShard::Cols,
-                            (true, false) => SourceShard::Rows,
-                            (false, false) => return self.replicate(i),
-                        };
-                        Some((se, shard))
-                    } else {
-                        None
+                    let (sr, sc) = self.src_shape(se);
+                    let shard = match (sr == nq, sc == nq) {
+                        (_, true) => SourceShard::Cols,
+                        (true, false) => SourceShard::Rows,
+                        (false, false) => return self.replicate(i),
                     };
-                    let segs = if sinks.is_some() { 5 } else { n };
-                    let op = SubOp::attn_decode(local, scale, valid_len, mask);
-                    ((0..segs).collect(), geom.hd().get(), op, sinks)
-                }
-                _ => return self.replicate(i),
-            };
+                    Some((se, shard))
+                } else {
+                    None
+                };
+                let segs = if sinks.is_some() { 5 } else { n };
+                let op = SubOp::attn_decode(local, scale, valid_len, mask);
+                ((0..segs).collect(), geom.hd().get(), op, sinks)
+            }
+            _ => return self.replicate(i),
+        };
         let head_split = |me: &Self, r: InputRef| -> bool {
             match r {
                 InputRef::Op(j) => {
@@ -828,7 +830,10 @@ pub fn shard(
         };
         for (e, s) in d.adopt {
             // `can_adopt` was every rule's gate, so a commit never overwrites a different slice.
-            debug_assert!(wv.src[e].is_none_or(|p| p == s), "source {e} sliced two ways");
+            debug_assert!(
+                wv.src[e].is_none_or(|p| p == s),
+                "source {e} sliced two ways"
+            );
             wv.src[e] = Some(s);
         }
         wv.op_map.push(wv.ops.len());
@@ -942,7 +947,11 @@ pub fn slice_source<T: Copy>(
         SourceShard::Cols => {
             let lc = cols / w;
             (0..rows)
-                .flat_map(|i| full[i * cols + r * lc..i * cols + (r + 1) * lc].iter().copied())
+                .flat_map(|i| {
+                    full[i * cols + r * lc..i * cols + (r + 1) * lc]
+                        .iter()
+                        .copied()
+                })
                 .collect()
         }
         SourceShard::HeadRows { heads } => {
@@ -1082,8 +1091,8 @@ mod tests {
         assert_eq!(
             sf.sources,
             vec![
-                Whole, Whole, Cols, Cols, Cols, Whole, Whole, Cols, Cols, Rows, Whole, Cols,
-                Cols, Rows
+                Whole, Whole, Cols, Cols, Cols, Whole, Whole, Cols, Cols, Rows, Whole, Cols, Cols,
+                Rows
             ]
         );
         assert_eq!(
@@ -1097,7 +1106,11 @@ mod tests {
                 matches!(o.op, SubOp::Elementwise(crate::subtile_ir::EwKind::Add))
                     && o.inputs.contains(&InputRef::Op(c.op))
             });
-            assert!(feeds_add, "an all-reduce at {} that no residual add reads", c.op);
+            assert!(
+                feeds_add,
+                "an all-reduce at {} that no residual add reads",
+                c.op
+            );
         }
         assert_eq!(sf.placements[input.result], Placement::Whole);
     }
@@ -1213,7 +1226,10 @@ mod tests {
         assert_eq!(two.op_tiles.len(), two.input.ops.len());
         assert_eq!(two.op_expansion.len(), two.input.ops.len());
         for (i, &k) in sf.op_map.iter().enumerate() {
-            assert_eq!(two.op_tiles[k], lowered.op_tiles[i], "op {i}'s tile moved to {k}");
+            assert_eq!(
+                two.op_tiles[k], lowered.op_tiles[i],
+                "op {i}'s tile moved to {k}"
+            );
         }
         for c in &sf.collectives {
             assert_eq!(two.op_tiles[c.op], None);
