@@ -3761,12 +3761,16 @@ mod production_ktir_dump {
         // states (`BatchChunking::of`): 4 sequences on the 4-page rung (one chunk), on the 64-page
         // rung (8 chunks, each block slot its own softmax), 2 sequences on the 2-page rung (a
         // chunk under the gather floor), and 32 on the 4-page rung (4 chunks of ONE block slot —
-        // the widest batch rung, where the slots' merge folds one).
-        for (name, seqs, walk) in [
-            ("batched_decode", 4u32, 4u32),
-            ("batched_decode_chunks", 4, 64),
-            ("batched_decode_floor", 2, 2),
-            ("batched_decode_one_slot", 32, 4),
+        // the widest batch rung, where the slots' merge folds one). At head dim 128 (granite-3.1-8b)
+        // the one-chunk and many-chunk batches, and the widest rung on its one-page walk.
+        for (name, seqs, walk, hd) in [
+            ("batched_decode", 4u32, 4u32, 64i128),
+            ("batched_decode_chunks", 4, 64, 64),
+            ("batched_decode_floor", 2, 2, 64),
+            ("batched_decode_one_slot", 32, 4, 64),
+            ("batched_decode_hd128", 4, 4, 128),
+            ("batched_decode_chunks_hd128", 4, 64, 128),
+            ("batched_decode_one_slot_hd128", 32, 1, 128),
         ] {
             let c = BatchChunking::of(seqs, walk);
             v.push((
@@ -3792,7 +3796,7 @@ mod production_ktir_dump {
                         ("NUM_KV_HEADS", Val::Int(8)),
                         ("NUM_QUERIES_PER_KV", Val::Int(4)),
                         ("BLOCK_SIZE", Val::Int(i128::from(PAGE_SLOTS))),
-                        ("HEAD_SIZE", Val::Int(64)),
+                        ("HEAD_SIZE", Val::Int(hd)),
                         ("NUM_PAGES", Val::Int(2048)),
                         ("SCALE", Val::Float(0.125)),
                     ],
@@ -3997,7 +4001,10 @@ mod production_ktir_dump {
             | "batched_decode"
             | "batched_decode_chunks"
             | "batched_decode_floor"
-            | "batched_decode_one_slot" => Program::PagedAttn,
+            | "batched_decode_one_slot"
+            | "batched_decode_hd128"
+            | "batched_decode_chunks_hd128"
+            | "batched_decode_one_slot_hd128" => Program::PagedAttn,
             "paged_kv_write"
             | "paged_kv_write_rows"
             | "paged_kv_write_hd128"
@@ -4310,6 +4317,11 @@ mod walk_on_the_card {
     /// `batched_decode_head_major` at granite's geometry over its 2048-page pool: `seqs` sequences
     /// walking `walk` blocks, at the chunking a decode batch rung states.
     fn batched_walk(seqs: u32, walk: u32) -> (KtirNode, BatchChunking) {
+        batched_walk_at(seqs, walk, 64)
+    }
+
+    /// [`batched_walk`] at head dim `hd`.
+    fn batched_walk_at(seqs: u32, walk: u32, hd: u32) -> (KtirNode, BatchChunking) {
         let TritonKernelRow::Spliced {
             src, file, entry, ..
         } = batched_decode_row()
@@ -4333,7 +4345,7 @@ mod walk_on_the_card {
             ("NUM_KV_HEADS", 8),
             ("NUM_QUERIES_PER_KV", 4),
             ("BLOCK_SIZE", PAGE_SLOTS),
-            ("HEAD_SIZE", 64),
+            ("HEAD_SIZE", hd),
             ("NUM_PAGES", 2048),
         ] {
             signature.insert(k.to_string(), ArgSpec::Constexpr);
@@ -4398,6 +4410,32 @@ mod walk_on_the_card {
                 e.op_name
             );
             assert!(e.kv_page_fold && e.kv_gathered, "{}", e.op_name);
+        }
+    }
+
+    /// ⭐ A DECODE BATCH LOWERS AT EVERY RUNG SHAPE THE BAKE ASKS FOR — two sequences to thirty-two,
+    /// one chunk to many, at head dim 64 and at 128 (granite-3.1-8b, its query rows split into head
+    /// rows of two sticks) — its body marked for the relaunch exactly when the walk loops. The widest
+    /// rung's one-page walk (32 sequences, one chunk of one block slot) is the one a bake used to skip.
+    #[test]
+    fn a_decode_batch_lowers_at_every_rung_shape() {
+        for hd in [64, 128] {
+            for (seqs, walk) in [(2, 1), (2, 64), (32, 1), (32, 64), (4, 2048)] {
+                let at = format!("{seqs} sequences over {walk} blocks at head dim {hd}");
+                let (node, c) = batched_walk_at(seqs, walk, hd);
+                let layout = triton_ktir_superdsc::layout::for_node(&node)
+                    .unwrap_or_else(|e| panic!("{at}: {e:?}"));
+                allocate_paged_cache(&node, &layout).expect("the cache allocates");
+                let mut sym = 0i64;
+                let ops =
+                    ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
+                        .unwrap_or_else(|e| panic!("{at}: {}", e.message));
+                assert_eq!(
+                    ops.iter().any(|e| e.walk.is_some()),
+                    c.num_chunks > 1,
+                    "{at}"
+                );
+            }
         }
     }
 

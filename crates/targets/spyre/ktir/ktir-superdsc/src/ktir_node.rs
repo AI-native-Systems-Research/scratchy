@@ -643,7 +643,17 @@ pub struct KtirNode {
     /// A `Mutex` and not a `RefCell` because the splice's whole-function memo holds
     /// `KtirNode` in a process-wide `static` and requires `Sync`. The clone the memo hands
     /// each rung carries the record BY CONTENTS — see the manual `Clone` below.
-    pub minted: std::sync::Mutex<std::collections::HashMap<ktir_core::ir::Ssa, u32>>,
+    pub minted: std::sync::Mutex<std::collections::HashMap<MintKey, u32>>,
+}
+
+/// What a node's lowering mints an intermediate for ([`KtirNode::minted`]): an SSA value's own
+/// buffer, or the `n`th scratch the lowering of that value takes beside it — a relayout's middle
+/// frame, a gather's landing — which no value of the program names, and which the declare pass and
+/// the real pass must still find under one name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MintKey {
+    Value(ktir_core::ir::Ssa),
+    Scratch(ktir_core::ir::Ssa, u8),
 }
 
 impl Clone for KtirNode {
