@@ -676,7 +676,53 @@ pub struct RerollMeta<'a> {
     pub suffix_weight_bank: u32,
 }
 
+/// ⭐ A ROLLED BODY'S LADDER — its rungs, never empty, and the rung a context past every sweep runs.
+///
+/// The ONE reading of [`RerollMeta::rungs`] and the one selection over it ([`Ladder::rung_for`]): the
+/// card executor binds its bodies from it and asks it which body serves a step, and the bake proves,
+/// through the same two calls, that every position each paged bundle admits stages a walk
+/// (`scratchy_target_spyre::wiring::prove_ladder_walks`). So a reading of the ladder the bake did not
+/// prove cannot run — MEASURED as the miss this closes: the executor read a ladder only past one
+/// rung, a prompt chunk's bundle bakes exactly one, and the card's first forward was refused.
+#[derive(Clone, Copy, Debug)]
+pub struct Ladder<'m, 'a> {
+    rungs: &'m [LadderRung<'a>],
+    fallback: usize,
+}
+
+impl<'m, 'a> Ladder<'m, 'a> {
+    /// The rungs, ascending by sweep — at least one.
+    pub fn rungs(self) -> &'m [LadderRung<'a>] {
+        self.rungs
+    }
+
+    /// ⭐ THE RUNG A STEP REACHING `positions` RUNS — its index and the rung: the narrowest whose sweep
+    /// covers them, else the baked fallback.
+    pub fn rung_for(self, positions: u64) -> (usize, &'m LadderRung<'a>) {
+        self.rungs
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.active_cap.covers(positions))
+            .unwrap_or((self.fallback, &self.rungs[self.fallback]))
+    }
+}
+
 impl<'a> RerollMeta<'a> {
+    /// This body's [`Ladder`]. `Err` when it bakes no rung, or a fallback that is none of them — the
+    /// bake emits neither, so such a bundle is not one it emitted.
+    pub fn ladder(&self) -> Result<Ladder<'_, 'a>, String> {
+        let rungs: &[LadderRung<'a>] = &self.rungs;
+        let fallback = self.fallback_rung as usize;
+        if fallback >= rungs.len() {
+            return Err(format!(
+                "a rolled body's ladder of {} rung(s) names rung {fallback} as its fallback — a ladder \
+                 has at least one rung, and its fallback is one of them",
+                rungs.len()
+            ));
+        }
+        Ok(Ladder { rungs, fallback })
+    }
+
     /// Every sibling fingerprint this meta names, whatever kind it is — one walk over the fields, so a
     /// sibling cannot be named in the struct and missed by the resolver.
     pub fn siblings(&self) -> impl Iterator<Item = &str> {
@@ -902,6 +948,49 @@ mod tests {
         assert!(code.groups[0].kv.slot_write());
         assert!(!code.groups[0].kv.slab_write());
         assert!(!code.groups[1].kv.slot_write());
+    }
+
+    /// ⭐ A LADDER OF ONE RUNG IS A LADDER — every position up to its sweep runs that rung — and a
+    /// longer one runs the narrowest rung covering a step, the fallback past them all. No rung, or a
+    /// fallback that is none of them, is no ladder.
+    #[test]
+    fn a_ladder_runs_its_narrowest_covering_rung() {
+        let rung = |cap: u32| LadderRung {
+            active_cap: SweptCols::new(cap),
+            bodies: Cow::Owned(vec![SiblingFp::from(format!("{cap:016x}"))]),
+            bodies_fused: Cow::Owned(vec![SiblingFp::none()]),
+        };
+        let meta = |rungs: Vec<LadderRung<'static>>, fallback_rung: u32| RerollMeta {
+            prefix: SiblingFp::none(),
+            suffix: SiblingFp::none(),
+            bodies: Cow::Owned(vec![SiblingFp::none()]),
+            bodies_fused: Cow::Owned(vec![SiblingFp::none()]),
+            rungs: Cow::Owned(rungs),
+            fallback_rung,
+            launches: Cow::Owned(Vec::new()),
+            kv_page_stride: 0,
+            prefix_weight_bank: 0,
+            suffix_weight_bank: 0,
+        };
+        // One rung: a prompt chunk's own pages.
+        let one = meta(vec![rung(128)], 0);
+        let l = one.ladder().expect("one rung is a ladder");
+        for p in [1, 64, 128] {
+            assert_eq!(l.rung_for(p).0, 0, "position {p}");
+        }
+        // Three: the narrowest covering, and the fallback past them all.
+        let three = meta(vec![rung(64), rung(128), rung(256)], 2);
+        let l = three.ladder().expect("a ladder");
+        assert_eq!(l.rung_for(1).0, 0);
+        assert_eq!(l.rung_for(64).0, 0);
+        assert_eq!(l.rung_for(65).0, 1);
+        assert_eq!(l.rung_for(256).0, 2);
+        assert_eq!(l.rung_for(257).0, 2, "past every sweep: the fallback");
+        assert!(meta(Vec::new(), 0).ladder().is_err(), "no rung");
+        assert!(
+            meta(vec![rung(64)], 1).ladder().is_err(),
+            "a fallback past the rungs"
+        );
     }
 
     /// ⛔ EVERY ONE OF THESE IS A BUNDLE THE LOAD OPENS, and a missing interior ladder rung is a fatal

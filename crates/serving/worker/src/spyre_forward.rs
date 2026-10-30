@@ -190,7 +190,15 @@ pub(crate) fn run_card_launch(
             "card launch at {seq_pos}: the session could not say which body runs: {e}"
         ))
     })?;
-    let swept = body.swept().get();
+    let swept = body
+        .swept()
+        .ok_or_else(|| {
+            werr(format!(
+                "card launch at {seq_pos}: the session selected a body with no ladder rung — an \
+                 unrolled bundle, which states no walk to stage"
+            ))
+        })?
+        .get();
     let step = b
         .wiring
         .paged
