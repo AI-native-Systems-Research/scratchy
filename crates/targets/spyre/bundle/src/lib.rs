@@ -402,6 +402,11 @@ pub struct KvShifts {
     /// the receive window — a weight-segment placement no per-layer weight shift or bank may move.
     /// Always `None` in a world of one.
     pub tp: Option<collective::TpConsume>,
+    /// ⭐ `Some` iff this group is a COLLECTIVE'S SEND: its program stores this rank's fragment into
+    /// the receive window, and its launch translates the weight segment to the PEER's region, so the
+    /// store lands on the peer card — device p2p ([`collective::TpSend`]). Always `None` in a world
+    /// of one.
+    pub send: Option<collective::TpSend>,
 }
 
 impl KvShifts {
@@ -425,10 +430,16 @@ impl KvShifts {
     /// another region entirely — either one aims the consume at bytes no send ever wrote. Every
     /// other group takes the layer's own pair unchanged.
     pub const fn weight_slot(self, layer_shift: u64, layer_bank: usize) -> (u64, usize) {
-        match self.tp {
-            Some(_) => (0, 0),
-            None => (layer_shift, layer_bank),
+        match (self.tp, self.send) {
+            (None, None) => (layer_shift, layer_bank),
+            // A consume reads the window, a send writes it (on the peer): both name it absolutely.
+            _ => (0, 0),
         }
+    }
+
+    /// Whether this launch's weight segment is the PEER's — a send's.
+    pub const fn writes_the_peer(self) -> bool {
+        self.send.is_some()
     }
 }
 

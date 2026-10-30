@@ -357,6 +357,24 @@ pub struct TpConsume {
     pub plays_at: Option<PlaysAt>,
 }
 
+/// ⭐ WHAT MAKES A LAUNCH GROUP A COLLECTIVE'S SEND — the p2p RDMA leg, as a DEVICE PROGRAM.
+///
+/// The send is a block copy (`block_copy`, the same identity program dxp compiles for a consume)
+/// from this rank's operand fragment into the receive window — `[RecvWindow::SEGMENT] +
+/// window offset`. What makes it a SEND is its launch alone: that one launch's weight-segment
+/// translation is the PEER's weight-segment region, so the program's store lands in the peer's
+/// window, card to card, through this card's own store path — no host memory, no host DMA. The
+/// window sits at the same offset on every card (the layout is card-symmetric), so the program is
+/// byte-identical on every rank; the peer is a launch-time translation, never a baked address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TpSend {
+    pub kind: CollectiveKind,
+    /// The tensor this rank sends.
+    pub operand: crate::place::PlaceId,
+    /// Which run of the operand's stick columns this send carries.
+    pub fragment: Fragment,
+}
+
 /// The one rank that launches a rank-selected consume. Minted from a [`TpIdentity`], or re-minted
 /// from baked tokens through [`PlaysAt::baked`], which refuses at BUILD a rank its world does not
 /// have — a consume for rank 2 of a two-rank world would never launch, silently.

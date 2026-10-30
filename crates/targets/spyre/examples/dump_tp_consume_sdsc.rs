@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Write the dxp input of a tensor-parallel forward's collective CONSUMES, for compiling by hand
-//! with `dxp_standalone`.
+//! Write the dxp input of a tensor-parallel forward's collective SENDS and CONSUMES, for compiling
+//! by hand with `dxp_standalone`.
 //!
 //! A two-rank MLP sublayer (`scratchy_subtile::fixtures::mlp_sublayer`, sharded by the shared
 //! analysis, which column-splits gate/up, row-splits down and weaves ONE all-reduce between down and
 //! the residual add) is lowered through the producer and the SuperDSC door exactly as a bake lowers
-//! it, and only the launch groups that consume a collective are written: one `group_{gi}/` per
-//! consume under the directory given as the only argument. Those are the programs that read the
-//! receive window, the one operand no other program in the tree has placed in the weight segment.
+//! it, and only the launch groups of a collective are written: one `group_{gi}/` per send or
+//! consume under the directory given as the only argument. The send stores the operand into the
+//! receive window (launched against the peer's segment 1, a device-to-device store); the consume
+//! reads the window, the one operand no other program in the tree has placed in the weight segment.
 //!
 //! ```text
 //! cargo run -p scratchy-target-spyre --features spyre --example dump_tp_consume_sdsc -- <dir>
@@ -36,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("the two-rank sublayer does not lower: {e:?}"))?;
     let consumes: Vec<_> = ops
         .iter()
-        .filter(|e| e.tp_consume.is_some())
+        .filter(|e| e.tp_consume.is_some() || e.tp_send.is_some())
         .map(|e| e.shallow_copy())
         .collect();
     let window = layout
@@ -44,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get(&ktir_superdsc::reserved_tids::TP_RECV_TID)
         .ok_or("the sharded layout carries no receive window")?;
     eprintln!(
-        "{} op(s), {} consume(s); window seg{} @ {} ({} B)",
+        "{} op(s), {} collective op(s); window seg{} @ {} ({} B)",
         ops.len(),
         consumes.len(),
         window.segment,
@@ -52,9 +53,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         window.size
     );
     write_dxp_input(&dir, &consumes, FoldGrouping::Split)?;
-    eprintln!("wrote the all-reduce consume's dxp input under {}", dir.display());
+    eprintln!("wrote the all-reduce's send and consume dxp input under {}", dir.display());
 
-    // And the ALL-GATHER's consumes — one group per rank, from a two-rank vocabulary projection.
+    // And the ALL-GATHER's send and consumes — one consume group per rank, from a two-rank
+    // vocabulary projection.
     let gather = tp_bake(
         &scratchy_subtile::fixtures::vocab_projection(2048, 8192),
         SpyreWorld::of::<2>(),
@@ -66,13 +68,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("the two-rank projection does not lower: {e:?}"))?;
     let consumes: Vec<_> = ops
         .iter()
-        .filter(|e| e.tp_consume.is_some())
+        .filter(|e| e.tp_consume.is_some() || e.tp_send.is_some())
         .map(|e| e.shallow_copy())
         .collect();
     let gather_dir = dir.join("all_gather");
     write_dxp_input(&gather_dir, &consumes, FoldGrouping::Split)?;
     eprintln!(
-        "wrote the all-gather's {} consume op(s) under {}",
+        "wrote the all-gather's {} collective op(s) under {}",
         consumes.len(),
         gather_dir.display()
     );

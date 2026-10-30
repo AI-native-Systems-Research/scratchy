@@ -5143,6 +5143,11 @@ pub enum GroupKind {
     /// would send twice. So trips fuse iff they carry the SAME consume, and the run is never
     /// chunked by the group size ([`GroupKind::run_may_be_chunked`]).
     TpConsume(ktir_superdsc::collective::TpConsume),
+    /// A COLLECTIVE'S SEND ([`EmittedOp::tp_send`]) — ONE launch group per send, holding every
+    /// descriptor op its program lowered to and nothing else: the whole group launches against the
+    /// PEER's weight segment, so a neighbour fused in would write the peer too, and a send split in
+    /// two would signal twice. Fuses only with the same send, never chunked.
+    TpSend(ktir_superdsc::collective::TpSend),
 }
 
 /// WHICH REQUEST A TRIP'S ADDRESSING BELONGS TO.
@@ -5198,6 +5203,7 @@ impl GroupKind {
             (GroupKind::Slot { req: a }, GroupKind::Slot { req: b }) => a == b,
             // One consume's descriptor ops are one launch; two consumes never share one.
             (GroupKind::TpConsume(a), GroupKind::TpConsume(b)) => a == b,
+            (GroupKind::TpSend(a), GroupKind::TpSend(b)) => a == b,
             // SlotSolo: distinct baked slot per entry — one per-group shift cannot express two.
             // HostKv: the shim's `oi += skip` must land on this exact entry.
             _ => false,
@@ -5272,7 +5278,7 @@ impl GroupKind {
         // second peer send that never comes.
         !matches!(
             self,
-            GroupKind::PageFold { gathered: true } | GroupKind::TpConsume(_)
+            GroupKind::PageFold { gathered: true } | GroupKind::TpConsume(_) | GroupKind::TpSend(_)
         )
     }
 }
@@ -5650,7 +5656,9 @@ fn trip_kinds_and_owner(ops: &[EmittedOp]) -> (Vec<Trip>, Vec<usize>) {
     for (oi, e) in ops.iter().enumerate() {
         let nt = (e.time.max(1)) as usize; // == concrete_trips(e).len()
         for ti in 0..nt {
-            let k = if let Some(consume) = e.tp_consume {
+            let k = if let Some(send) = e.tp_send {
+                GroupKind::TpSend(send)
+            } else if let Some(consume) = e.tp_consume {
                 GroupKind::TpConsume(consume)
             } else if e.host_kv_write && ti == 0 {
                 GroupKind::HostKv {
@@ -6063,6 +6071,11 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
             // A consume group holds exactly one consume's trips, so its kind names it.
             tp: match kinds[r.start].kind {
                 GroupKind::TpConsume(consume) => Some(consume),
+                _ => None,
+            },
+            // A send group holds exactly one send's trips, so its kind names it.
+            send: match kinds[r.start].kind {
+                GroupKind::TpSend(send) => Some(send),
                 _ => None,
             },
         });
@@ -7711,6 +7724,7 @@ pub fn ktir_groups(
             // One group per op here, so a consume op is its own group and carries its marker.
             kv: bundle::KvShifts {
                 tp: e.tp_consume,
+                send: e.tp_send,
                 ..bundle::KvShifts::default()
             },
             programs: std::borrow::Cow::Owned(vec![bundle::LaunchProgram {

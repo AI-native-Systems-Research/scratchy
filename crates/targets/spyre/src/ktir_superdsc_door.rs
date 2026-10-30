@@ -265,7 +265,7 @@ pub fn lower(
 /// producer stated and the program does not carried onto EVERY descriptor op it yields.
 ///
 /// ⛔ ONE STAMP SITE. The door mints fresh ops from the program, so a fact the producer put on its
-/// op (today: the collective consume marker) is dropped unless something copies it, and a program
+/// op (today: the collective send and consume markers) is dropped unless something copies it, and a program
 /// can lower to several descriptor ops — each must carry it, or the ones that don't fuse into an
 /// ordinary group that takes the per-layer weight shift and reads the receive window somewhere
 /// else. The callers that keep the door's output call this, so none of them can forget the copy.
@@ -281,6 +281,7 @@ pub fn lower_op(
     let mut ops = lower(k, sym_id_base, layout, attn_params)?;
     for o in &mut ops {
         o.tp_consume = e.tp_consume;
+        o.tp_send = e.tp_send;
     }
     Ok(ops)
 }
