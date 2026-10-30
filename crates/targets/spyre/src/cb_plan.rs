@@ -237,10 +237,10 @@ pub(crate) fn launch_site(
     // ⭐ AND A COLLECTIVE'S CONSUME TAKES NEITHER: its weight-segment operand is the receive window,
     // one placement in the base region, so `weight_slot` pins it to shift 0 in bank 0 — the one law
     // the walk and the plan twin both read through this function.
-    let (weight_shift, weight_bank) =
-        op.code
-            .kv
-            .weight_slot(off[SEG_WEIGHT.get()], where_.weight_bank);
+    let (weight_shift, weight_bank) = op
+        .code
+        .kv
+        .weight_slot(off[SEG_WEIGHT.get()], where_.weight_bank);
     off[SEG_WEIGHT.get()] = weight_shift;
     let wbase = segment_base(seg, banks, weight_bank, SEG_WEIGHT.get())?;
     let mut ta = Vec::with_capacity(NUM_SEGMENTS);

@@ -92,8 +92,14 @@ impl TpWorld {
     /// ```
     pub const fn of<const W: u32>() -> Self {
         const {
-            assert!(is_spyre_world(W), "spyre bakes only the worlds in SPYRE_TP_WORLDS");
-            assert!(W <= MAX_SIDS, "one sid per rank: a world wider than the card's sids");
+            assert!(
+                is_spyre_world(W),
+                "spyre bakes only the worlds in SPYRE_TP_WORLDS"
+            );
+            assert!(
+                W <= MAX_SIDS,
+                "one sid per rank: a world wider than the card's sids"
+            );
         }
         Self(W)
     }
@@ -344,35 +350,22 @@ pub fn fragments(rows: u32, cols: u32, width: WireBytes) -> Result<Vec<Fragment>
 /// ⭐ WHAT MAKES A LAUNCH GROUP A COLLECTIVE'S CONSUME — carried on the group, so a bundle's CB
 /// pipeline is a function of its own groups (the bundle crate's `collective::cb_pipeline`) and a
 /// rolled body replays its collectives per layer exactly as it replays its launches.
+///
+/// ⭐ AND IT NAMES THE SEND. The send in front of a consume is not a program but an F-send control
+/// block (device p2p RDMA, flex-rs `ControlBlockWire::rdma_unicast_send`): this rank's `fragment`
+/// of `operand`, from its own placement, into the peer's receive window. Everything it moves is
+/// named here, so a consume and its send cannot come apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TpConsume {
     pub kind: CollectiveKind,
     /// The tensor this rank SENDS — the collective's operand, read from its own placement.
     pub operand: crate::place::PlaceId,
-    /// Which run of the operand's stick columns this consume covers.
+    /// Which run of the operand's stick columns this rank sends, and this consume covers.
     pub fragment: Fragment,
     /// `Some(rank)` when only that rank launches this consume — an all-gather's, whose blocks land
     /// at columns that depend on which rank is which, so the bake carries one consume per rank.
     /// `None` when every rank launches it (an all-reduce's sum is the same on every rank).
     pub plays_at: Option<PlaysAt>,
-}
-
-/// ⭐ WHAT MAKES A LAUNCH GROUP A COLLECTIVE'S SEND — the p2p RDMA leg, as a DEVICE PROGRAM.
-///
-/// The send is a block copy (`block_copy`, the same identity program dxp compiles for a consume)
-/// from this rank's operand fragment into the receive window — `[RecvWindow::SEGMENT] +
-/// window offset`. What makes it a SEND is its launch alone: that one launch's weight-segment
-/// translation is the PEER's weight-segment region, so the program's store lands in the peer's
-/// window, card to card, through this card's own store path — no host memory, no host DMA. The
-/// window sits at the same offset on every card (the layout is card-symmetric), so the program is
-/// byte-identical on every rank; the peer is a launch-time translation, never a baked address.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct TpSend {
-    pub kind: CollectiveKind,
-    /// The tensor this rank sends.
-    pub operand: crate::place::PlaceId,
-    /// Which run of the operand's stick columns this send carries.
-    pub fragment: Fragment,
 }
 
 /// The one rank that launches a rank-selected consume. Minted from a [`TpIdentity`], or re-minted
@@ -393,7 +386,10 @@ impl PlaysAt {
     /// const P: PlaysAt = PlaysAt::baked(TpWorld::of::<2>(), 2);
     /// ```
     pub const fn baked(world: TpWorld, rank: u32) -> Self {
-        assert!(rank < world.0, "a rank-selected consume names a rank its world does not have");
+        assert!(
+            rank < world.0,
+            "a rank-selected consume names a rank its world does not have"
+        );
         Self(TpIdentity { rank, world })
     }
 

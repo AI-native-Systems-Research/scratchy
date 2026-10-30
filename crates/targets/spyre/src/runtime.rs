@@ -29,7 +29,9 @@ const _: () = {
         crate::bundle_code::collective::RDMA_MESSAGE_CAP_BYTES
             == flex_rs::multi_device::MAX_HDMA_MESSAGE_BYTES
     );
-    assert!(crate::bundle_code::collective::FLIT_BYTES == flex_rs::control_block_wire::Flits::BYTES);
+    assert!(
+        crate::bundle_code::collective::FLIT_BYTES == flex_rs::control_block_wire::Flits::BYTES
+    );
 };
 
 use flex_rs::address::{Chunk, CompositeAddress, LogicalAddress, RegionId};

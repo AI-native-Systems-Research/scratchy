@@ -19,7 +19,10 @@ fn granite_ships_one_two_rank_world() {
     assert_eq!(model.len(), 1, "granite bakes exactly one sharded world");
     let tp = &model[0];
     assert_eq!(tp.world.get(), 2);
-    assert!(!tp.decode.fp.is_empty(), "the two-rank decode bundle has a fingerprint");
+    assert!(
+        !tp.decode.fp.is_empty(),
+        "the two-rank decode bundle has a fingerprint"
+    );
     let one_rank = &scratchy_models::granite::granite_3_1_2b_instruct::KTIR_BUNDLE;
     assert!(
         one_rank.decode.iter().all(|d| d.fp != tp.decode.fp),
@@ -37,7 +40,10 @@ fn granite_ships_one_two_rank_world() {
 fn granites_two_rank_world_carries_its_prefill() {
     let tp = &scratchy_models::granite::granite_3_1_2b_instruct::SUPERDSC_TP[0];
     let one_rank = &scratchy_models::granite::granite_3_1_2b_instruct::KTIR_BUNDLE;
-    let prefill = tp.prefill.as_ref().expect("the two-rank world bakes a prefill");
+    let prefill = tp
+        .prefill
+        .as_ref()
+        .expect("the two-rank world bakes a prefill");
     assert!(tp.wirings.prefill.is_some(), "and its wiring");
     assert!(
         one_rank.prefill.as_ref().is_none_or(|p| p.fp != prefill.fp),

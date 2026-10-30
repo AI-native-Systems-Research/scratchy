@@ -10457,36 +10457,7 @@ fn launch_tokens(
         gathered,
         fold_rows,
         tp,
-        send,
     } = kv;
-    // A collective's send: its kind, operand and fragment, re-minted through the same const
-    // `Fragment::baked` the consume's is.
-    let send = match send {
-        None => quote! { ::core::option::Option::None },
-        Some(s) => {
-            use scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::collective::CollectiveKind as K;
-            let kind = match s.kind {
-                K::AllReduce => {
-                    quote! { ::scratchy_target_spyre::bundle_code::collective::CollectiveKind::AllReduce }
-                }
-                K::AllGather => {
-                    quote! { ::scratchy_target_spyre::bundle_code::collective::CollectiveKind::AllGather }
-                }
-            };
-            let operand = place_id_tokens(&s.operand);
-            let [first, sticks, rows] = [s.fragment.first_stick(), s.fragment.sticks(), s.fragment.rows()]
-                .map(proc_macro2::Literal::u32_unsuffixed);
-            quote! {
-                ::core::option::Option::Some(::scratchy_target_spyre::bundle_code::collective::TpSend {
-                    kind: #kind,
-                    operand: #operand,
-                    fragment: ::scratchy_target_spyre::bundle_code::collective::Fragment::baked(
-                        #first, #sticks, #rows,
-                    ),
-                })
-            }
-        }
-    };
     // A collective's consume: its kind, the operand it sends, and the fragment — re-minted through
     // `Fragment::baked`, a `const fn`, so the static this lands in re-proves the fragment's law.
     let tp = match tp {
@@ -10502,8 +10473,12 @@ fn launch_tokens(
                 }
             };
             let operand = place_id_tokens(&c.operand);
-            let [first, sticks, rows] = [c.fragment.first_stick(), c.fragment.sticks(), c.fragment.rows()]
-                .map(proc_macro2::Literal::u32_unsuffixed);
+            let [first, sticks, rows] = [
+                c.fragment.first_stick(),
+                c.fragment.sticks(),
+                c.fragment.rows(),
+            ]
+            .map(proc_macro2::Literal::u32_unsuffixed);
             // A rank-selected consume's rank, re-minted against its world through the const fn that
             // refuses a rank the world does not have.
             let plays_at = match c.plays_at {
@@ -10580,7 +10555,6 @@ fn launch_tokens(
                 gathered: #gathered,
                 fold_rows: #fold_rows,
                 tp: #tp,
-                send: #send,
             },
             programs: ::std::borrow::Cow::Borrowed(&[#(#progs),*]),
             init_binary: #image,
@@ -13198,7 +13172,10 @@ fn dump_wavefront_mega(
                     // ⭐ ONE LEDGER ENTRY per baked bundle — the parity law judges the
                     // whole ledger once, after the last bake.
                     BakeEffect::WeightSeg { base, bank0, banks } => {
-                        world.weight_seg_ledger.borrow_mut().push((base, bank0, banks));
+                        world
+                            .weight_seg_ledger
+                            .borrow_mut()
+                            .push((base, bank0, banks));
                     }
                 }
             }
@@ -14344,7 +14321,10 @@ fn dump_wavefront_mega(
                     let fp = proc_macro2::Literal::string(&fp);
                     // The prefill bundle and its wiring ship together or not at all, as the
                     // one-rank world's do.
-                    let (prefill, prefill_wiring) = match (tp2_prefill_fp.borrow().clone(), prefill_wiring) {
+                    let (prefill, prefill_wiring) = match (
+                        tp2_prefill_fp.borrow().clone(),
+                        prefill_wiring,
+                    ) {
                         (Some(pfp), Some(pw)) => {
                             let pfp = proc_macro2::Literal::string(&pfp);
                             (

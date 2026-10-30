@@ -281,7 +281,6 @@ pub fn lower_op(
     let mut ops = lower(k, sym_id_base, layout, attn_params)?;
     for o in &mut ops {
         o.tp_consume = e.tp_consume;
-        o.tp_send = e.tp_send;
     }
     Ok(ops)
 }

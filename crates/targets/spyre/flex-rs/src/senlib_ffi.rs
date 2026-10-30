@@ -1232,6 +1232,11 @@ unsafe extern "C" {
     /// section words of a response block) into the semantic mirror above.
     /// Returns 0 on success, -1 on refusal.
     fn flex_hal_r5_appdata_decode(app_words: *const u64, out: *mut HalR5AppData) -> i32;
+
+    /// `cxx-shim/hal_sbf.cpp`: the xseg word alone, by the same compose the
+    /// Rdma12 send encoder fills its xseg field with. Returns 0 on success,
+    /// -1 on refusal.
+    fn flex_hal_xseg_compose(dest_remote_base_bytes: u64, out_xseg: *mut u32) -> i32;
 }
 
 /// The calling thread's most recent hal_sbf error message, for attaching to
@@ -1268,6 +1273,25 @@ pub fn write_xseg(sid: u8, xseg: u32) -> Result<(), String> {
         Ok(())
     } else {
         Err(last_shim_error())
+    }
+}
+
+/// Safe wrapper: the xseg word for a (compensated) remote base, composed by
+/// the SAME shim function that fills the Rdma12 send section's xseg field —
+/// so the word a receiver hands [`write_xseg`] and the word its peer's send
+/// carries agree by construction, never by two spellings of one compose.
+///
+/// # Errors
+/// Returns `Err` with the shim's message on a refused base (misaligned, or
+/// past the word's flit field).
+pub fn hal_xseg_compose(dest_remote_base_bytes: u64) -> Result<u32, String> {
+    let mut xseg = 0u32;
+    // SAFETY: a plain integer in and a valid out-pointer.
+    let rc = unsafe { flex_hal_xseg_compose(dest_remote_base_bytes, &mut xseg) };
+    if rc == 0 {
+        Ok(xseg)
+    } else {
+        Err(last_hal_error())
     }
 }
 

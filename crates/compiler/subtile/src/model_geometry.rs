@@ -43,10 +43,16 @@ const _: () = {
         SPYRE_TP_WORLDS_SEEN,
         ktir_superdsc::collective::SPYRE_TP_WORLDS,
     );
-    assert!(seen.len() == row.len(), "build.rs's world row drifted from SPYRE_TP_WORLDS");
+    assert!(
+        seen.len() == row.len(),
+        "build.rs's world row drifted from SPYRE_TP_WORLDS"
+    );
     let mut i = 0;
     while i < row.len() {
-        assert!(seen[i] == row[i], "build.rs's world row drifted from SPYRE_TP_WORLDS");
+        assert!(
+            seen[i] == row[i],
+            "build.rs's world row drifted from SPYRE_TP_WORLDS"
+        );
         i += 1;
     }
 };

@@ -5138,16 +5138,11 @@ pub enum GroupKind {
     Gathered,
     /// A COLLECTIVE'S CONSUME ([`EmittedOp::tp_consume`]) — ONE launch group per consume, holding
     /// every descriptor op its program lowered to and nothing else. The bundle's CB pipeline puts
-    /// this rank's send and the wait for the peer's in front of exactly this launch: a neighbour
-    /// fused in would run before its operand's exchange, and a consume split across two groups
-    /// would send twice. So trips fuse iff they carry the SAME consume, and the run is never
-    /// chunked by the group size ([`GroupKind::run_may_be_chunked`]).
+    /// this rank's send (the F-send the consume names) and the wait for the peer's in front of
+    /// exactly this launch: a neighbour fused in would run before its operand's exchange, and a
+    /// consume split across two groups would send twice. So trips fuse iff they carry the SAME
+    /// consume, and the run is never chunked by the group size ([`GroupKind::run_may_be_chunked`]).
     TpConsume(ktir_superdsc::collective::TpConsume),
-    /// A COLLECTIVE'S SEND ([`EmittedOp::tp_send`]) — ONE launch group per send, holding every
-    /// descriptor op its program lowered to and nothing else: the whole group launches against the
-    /// PEER's weight segment, so a neighbour fused in would write the peer too, and a send split in
-    /// two would signal twice. Fuses only with the same send, never chunked.
-    TpSend(ktir_superdsc::collective::TpSend),
 }
 
 /// WHICH REQUEST A TRIP'S ADDRESSING BELONGS TO.
@@ -5203,7 +5198,6 @@ impl GroupKind {
             (GroupKind::Slot { req: a }, GroupKind::Slot { req: b }) => a == b,
             // One consume's descriptor ops are one launch; two consumes never share one.
             (GroupKind::TpConsume(a), GroupKind::TpConsume(b)) => a == b,
-            (GroupKind::TpSend(a), GroupKind::TpSend(b)) => a == b,
             // SlotSolo: distinct baked slot per entry — one per-group shift cannot express two.
             // HostKv: the shim's `oi += skip` must land on this exact entry.
             _ => false,
@@ -5278,7 +5272,7 @@ impl GroupKind {
         // second peer send that never comes.
         !matches!(
             self,
-            GroupKind::PageFold { gathered: true } | GroupKind::TpConsume(_) | GroupKind::TpSend(_)
+            GroupKind::PageFold { gathered: true } | GroupKind::TpConsume(_)
         )
     }
 }
@@ -5656,9 +5650,7 @@ fn trip_kinds_and_owner(ops: &[EmittedOp]) -> (Vec<Trip>, Vec<usize>) {
     for (oi, e) in ops.iter().enumerate() {
         let nt = (e.time.max(1)) as usize; // == concrete_trips(e).len()
         for ti in 0..nt {
-            let k = if let Some(send) = e.tp_send {
-                GroupKind::TpSend(send)
-            } else if let Some(consume) = e.tp_consume {
+            let k = if let Some(consume) = e.tp_consume {
                 GroupKind::TpConsume(consume)
             } else if e.host_kv_write && ti == 0 {
                 GroupKind::HostKv {
@@ -6071,11 +6063,6 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
             // A consume group holds exactly one consume's trips, so its kind names it.
             tp: match kinds[r.start].kind {
                 GroupKind::TpConsume(consume) => Some(consume),
-                _ => None,
-            },
-            // A send group holds exactly one send's trips, so its kind names it.
-            send: match kinds[r.start].kind {
-                GroupKind::TpSend(send) => Some(send),
                 _ => None,
             },
         });
@@ -7691,7 +7678,7 @@ pub fn ktir_groups(
     _fold: FoldGrouping,
     lx_pin_window_bytes: Option<u64>,
 ) -> Result<Vec<bundle::LaunchGroup<'static>>, SuperDscError> {
-    let mut out = Vec::with_capacity(ops.len());
+    let mut out: Vec<bundle::LaunchGroup<'static>> = Vec::with_capacity(ops.len());
     for e in ops {
         let k = e.ktir.as_ref().ok_or_else(|| {
             SuperDscError(format!(
@@ -7720,19 +7707,29 @@ pub fn ktir_groups(
             .zip(k.bindings.iter())
             .map(|((ssa, _), b)| (*ssa, bundle::PlaceId::Act(b.get())))
             .collect();
+        let program = bundle::LaunchProgram {
+            func: k.func,
+            program: k.program,
+            args: std::borrow::Cow::Owned(args),
+            lx_pin_window_bytes,
+        };
+        // ⭐ ONE GROUP PER OP — EXCEPT A COLLECTIVE'S CONSUME, whose ops are ONE group: the CB
+        // pipeline puts the send and the wait in front of a consume group, so a consume split
+        // over two groups would send twice and wait for a second send that never comes (the
+        // descriptor path's `GroupKind::TpConsume` fuses them the same way).
+        if let Some(last) = out.last_mut()
+            && e.tp_consume.is_some()
+            && last.kv.tp == e.tp_consume
+        {
+            last.programs.to_mut().push(program);
+            continue;
+        }
         out.push(bundle::LaunchGroup {
-            // One group per op here, so a consume op is its own group and carries its marker.
             kv: bundle::KvShifts {
                 tp: e.tp_consume,
-                send: e.tp_send,
                 ..bundle::KvShifts::default()
             },
-            programs: std::borrow::Cow::Owned(vec![bundle::LaunchProgram {
-                func: k.func,
-                program: k.program,
-                args: std::borrow::Cow::Owned(args),
-                lx_pin_window_bytes,
-            }]),
+            programs: std::borrow::Cow::Owned(vec![program]),
             init_binary: std::borrow::Cow::Borrowed(&[]),
             job_bin_ptr: 0,
             correction: std::borrow::Cow::Borrowed(&[]),
