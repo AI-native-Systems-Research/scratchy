@@ -76,6 +76,9 @@ pub const ALL: &[&str] = &[
     // shape; the verdict is a host bit-for-bit compare of the `[1, 512]` sum.
     // NOT a production configuration: delete with the probe.
     "int_bcast",
+    // ⭐ THE PROMPT CHUNK'S KV WRITE, from the card's own kernel (`kernels/` — see the row): a
+    // 20-token prompt's 160 index entries, five scatter ops of 32, the first card runs' lead.
+    "paged_kv_write_prompt",
 ];
 
 pub fn root() -> PathBuf {
@@ -109,6 +112,27 @@ pub fn spec(fixture: &str, kernel: &str, ptrs: &[(&str, &str)], ces: &[(&str, Va
             .join(format!("{fixture}.py"))
             .to_string_lossy()
             .to_string(),
+    }
+}
+
+/// [`spec`] for one of the card's own kernels (`crates/targets/spyre/kernels/<kernel_file>.py`):
+/// the paged step's kernels are the production ones, and a fixture copy would be a second
+/// statement of them.
+pub fn kernel_spec(
+    kernel_file: &str,
+    kernel: &str,
+    ptrs: &[(&str, &str)],
+    ces: &[(&str, Val)],
+) -> KernelSpec {
+    KernelSpec {
+        file: root()
+            .parent()
+            .expect("crates/triton sits under crates/")
+            .join("targets/spyre/kernels")
+            .join(format!("{kernel_file}.py"))
+            .to_string_lossy()
+            .to_string(),
+        ..spec(kernel_file, kernel, ptrs, ces)
     }
 }
 
@@ -586,6 +610,31 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
         // fptosi exits). No selection: the walk's Reduce arm cannot lower a wide
         // f32 reduce (the partials law), and the auditor's statistics are
         // host-side reads of u and g.
+        // ⭐ spyre-inference's `reshape_and_cache_head_major` writing a 20-token prompt chunk of 8
+        // kv heads at head dim 64 into a four-page-per-head pool: 160 index entries, `h · 20 + t`,
+        // cut into five scatter ops of 32 for K and for V — the cut a decode step's 8 entries never
+        // make. Bind `row_index` raw (int32) and read `k_rows` / `v_rows` back.
+        "paged_kv_write_prompt" => (
+            kernel_spec(
+                "reshape_and_cache_head_major",
+                "reshape_and_cache_head_major_kernel",
+                &[
+                    ("key", "*fp16"),
+                    ("value", "*fp16"),
+                    ("k_rows", "*fp16"),
+                    ("v_rows", "*fp16"),
+                    ("row_index", "*i32"),
+                ],
+                &[
+                    ("T", Val::Int(20)),
+                    ("NUM_KV_HEADS", Val::Int(8)),
+                    ("HEAD_SIZE", Val::Int(64)),
+                    ("NUM_ROWS", Val::Int(4 * 8 * 64)),
+                ],
+            ),
+            vec![1],
+            Program::PagedKvWrite,
+        ),
         "hash_noise" => (
             spec(
                 "hash_noise_probe",
