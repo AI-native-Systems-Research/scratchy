@@ -53,9 +53,10 @@ const TOP: u32 = 5;
 /// How far below the reference's token a diverging token may score in the reference's own row:
 /// a near tie. Mutual top-5 alone is no test of a drafter, whose wrong proposals are plausible
 /// tokens: an acceptance that keeps one draft past the target's rejection passes it, at 1.75-3.88
-/// nats. On Qwen3.6-35B-A3B (base M5), a batch's numerics move the target's tokens by at most
-/// 0.375 nats (its logits are bf16: 0.125-nat steps), and so does a correct drafter.
-const MAX_MARGIN: f64 = 0.5;
+/// nats. On Qwen3.6-35B-A3B (base M5), the target's own numerics move its tokens less: 0.375 nats
+/// between one request and a batch, and up to 0.875 when which requests happen to share a step
+/// changes the batch's kernels (its logits are bf16: 0.125-nat steps); a correct drafter, no more.
+const MAX_MARGIN: f64 = 1.0;
 
 fn request(prompt: &str) -> CompletionRequest {
     CompletionRequest {
