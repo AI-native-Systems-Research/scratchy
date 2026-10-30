@@ -260,7 +260,9 @@ pub(crate) fn run_card_launch(
     }
     let launch_rows = scratchy_target_spyre::wiring::StagedRows::of_launch(mq)
         .ok_or_else(|| werr("card launch with zero rows".to_string()))?;
-    let consts = scratchy_target_spyre::wiring::synthetic_constants(&b.facts.constant_env(
+    // ⭐ THE SESSION'S OWN FACTS: the constants this launch's bundle placed, index for index —
+    // never the wiring's bundle's (a decode batch rung runs under the one-request decode's wiring).
+    let consts = scratchy_target_spyre::wiring::synthetic_constants(&pf.bake_facts().constant_env(
         b.wiring,
         mq_pad,
         launch_rows,

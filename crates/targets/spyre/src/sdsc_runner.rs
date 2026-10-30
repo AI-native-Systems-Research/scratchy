@@ -498,6 +498,15 @@ impl SuperDscSession {
     /// call sites agreeing.
     ///
     /// [`superdsc_exec::StepBody`]: crate::superdsc_exec::StepBody
+    /// ⭐ WHAT THIS SESSION'S OWN BUNDLE PLACED ([`crate::wiring::BakeFacts::of`] its layout) — the
+    /// constants a launch on it binds, its scalar registry index for index. Every rung's bundle
+    /// places its own: a decode batch rung's registry carries the batched kernel's clamp, which the
+    /// one-request decode's does not, so a launch bound through another bundle's facts read that
+    /// slot unbound.
+    pub fn bake_facts(&self) -> crate::wiring::BakeFacts {
+        crate::wiring::BakeFacts::of(&self.exec.code().layout)
+    }
+
     pub fn step_body(&mut self, start: usize) -> Result<crate::superdsc_exec::StepBody> {
         self.exec
             .step_body(crate::superdsc_exec::SeqPos(start as i64))

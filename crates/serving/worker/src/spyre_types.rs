@@ -101,10 +101,6 @@ pub(crate) struct BundleMeta {
     /// `wiring` field.
     #[cfg(not(feature = "spyre-hw"))]
     pub(crate) sample_seat: Option<scratchy_target_spyre::wiring::SampleSeat>,
-    /// What the bake placed — asked ONCE, in the target crate, off the generated layout.
-    /// Read only by the card launch path, so it carries that cfg like `prog`/`output_ids` above.
-    #[cfg(feature = "spyre-hw")]
-    pub(crate) facts: scratchy_target_spyre::wiring::BakeFacts,
     /// ⭐ THE GENERATED scratchy_target_spyre::wiring::IRING THIS BUNDLE scratchy_target_spyre::wiring::AS BAKED scratchy_target_spyre::wiring::ITH. Everything above it is a copy taken
     /// out of this static on the way through `Parsed`; the forward tape is read straight off it
     /// (`Wiring::forward_shape`) so the shape a forward plays cannot be a second opinion about

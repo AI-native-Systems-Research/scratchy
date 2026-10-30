@@ -3059,6 +3059,11 @@ impl Executor {
     /// site — it is that `DecodeRung` no longer HAS a `swept` or a `gathers_kv` field to read, and the
     /// only value that answers either question is minted here, by the selector, from the selector's own
     /// answer.
+    /// The baked bundle this executor runs.
+    pub fn code(&self) -> &'static bundle::BundleCode<'static> {
+        self.code
+    }
+
     pub fn step_body(&mut self, seq_pos: SeqPos) -> Result<StepBody> {
         let n_fold_pages = self.n_fold_pages(seq_pos);
         // `valid_len = seq_pos + 1` — positions [0..seq_pos] are filled, including the token written to
