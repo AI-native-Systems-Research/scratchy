@@ -20,6 +20,18 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, OnceLock};
 
+// ⭐ THE COLLECTIVE PLAN'S TWO WIRE FACTS ARE THE RUNTIME'S. The bundle crate is a leaf and cannot
+// name flex-rs, so it declares the message cap and the flit itself; this is the one place both
+// crates are in scope, and a disagreement fails the build here rather than cutting a fragment the
+// card refuses or misaligning a window.
+const _: () = {
+    assert!(
+        crate::bundle_code::collective::RDMA_MESSAGE_CAP_BYTES
+            == flex_rs::multi_device::MAX_HDMA_MESSAGE_BYTES
+    );
+    assert!(crate::bundle_code::collective::FLIT_BYTES == flex_rs::control_block_wire::Flits::BYTES);
+};
+
 use flex_rs::address::{Chunk, CompositeAddress, LogicalAddress, RegionId};
 use flex_rs::allocator::{
     AllocationDirective, AllocationDirectiveError, FlexAllocator, FlexAllocatorError,

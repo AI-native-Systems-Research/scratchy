@@ -10456,7 +10456,36 @@ fn launch_tokens(
         batched_requests,
         gathered,
         fold_rows,
+        tp,
     } = kv;
+    // A collective's consume: its kind, the operand it sends, and the fragment — re-minted through
+    // `Fragment::baked`, a `const fn`, so the static this lands in re-proves the fragment's law.
+    let tp = match tp {
+        None => quote! { ::core::option::Option::None },
+        Some(c) => {
+            use scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::collective::CollectiveKind as K;
+            let kind = match c.kind {
+                K::AllReduce => {
+                    quote! { ::scratchy_target_spyre::bundle_code::collective::CollectiveKind::AllReduce }
+                }
+                K::AllGather => {
+                    quote! { ::scratchy_target_spyre::bundle_code::collective::CollectiveKind::AllGather }
+                }
+            };
+            let operand = place_id_tokens(&c.operand);
+            let [first, sticks, rows] = [c.fragment.first_stick(), c.fragment.sticks(), c.fragment.rows()]
+                .map(proc_macro2::Literal::u32_unsuffixed);
+            quote! {
+                ::core::option::Option::Some(::scratchy_target_spyre::bundle_code::collective::TpConsume {
+                    kind: #kind,
+                    operand: #operand,
+                    fragment: ::scratchy_target_spyre::bundle_code::collective::Fragment::baked(
+                        #first, #sticks, #rows,
+                    ),
+                })
+            }
+        }
+    };
     let [slot, slab, slots, req, slot_off] = [
         *slot_stride_bytes,
         *slab_stride_bytes,
@@ -10500,6 +10529,7 @@ fn launch_tokens(
                 batched_requests: #batched_requests,
                 gathered: #gathered,
                 fold_rows: #fold_rows,
+                tp: #tp,
             },
             programs: ::std::borrow::Cow::Borrowed(&[#(#progs),*]),
             init_binary: #image,

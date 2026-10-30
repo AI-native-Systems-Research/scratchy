@@ -2406,6 +2406,11 @@ pub struct EmittedOp {
     /// (no shift, since prefill `slot_pos == 0`). Decode cachewr (same slot) leaves this
     /// `false` and keeps the fused-`Slot` launch reduction. Default `false`.
     pub slot_no_fuse: bool,
+    /// ⭐ `Some` iff this op is a COLLECTIVE'S CONSUME — classified `GroupKind::TpConsume`, its OWN
+    /// singleton launch group, which the bundle's CB pipeline precedes with this rank's send and
+    /// the wait for the peer's. Never fused, not even with another consume: the send and the wait
+    /// belong to exactly this launch. Default `None`.
+    pub tp_consume: Option<crate::collective::TpConsume>,
     /// HOST KV-CACHE WRITE (Route B). Set on ONE op per `AttnDecode` (the first cachewr).
     /// The shim does NOT run this op's program (nor the next [`kv_n_skip`] on-card cachewr
     /// copies): instead it host-scatters this token's roped K into the resident K cache in the
@@ -2495,6 +2500,7 @@ impl EmittedOp {
             slab_write: false,
             slab_stride_bytes: 0,
             slot_no_fuse: false,
+            tp_consume: None,
             kv_page_fold: false,
             kv_batched_requests: false,
             kv_gathered: false,
@@ -2536,6 +2542,7 @@ impl EmittedOp {
             slab_write: self.slab_write,
             slab_stride_bytes: self.slab_stride_bytes,
             slot_no_fuse: self.slot_no_fuse,
+            tp_consume: self.tp_consume,
             host_kv_write: self.host_kv_write,
             kv_n_skip: self.kv_n_skip,
             kv_new_k_tid: self.kv_new_k_tid,
@@ -2614,6 +2621,7 @@ impl EmittedOp {
             slab_write: false,
             slab_stride_bytes: 0,
             slot_no_fuse: false,
+            tp_consume: None,
             host_kv_write: false,
             kv_n_skip: 0,
             kv_new_k_tid: 0,
