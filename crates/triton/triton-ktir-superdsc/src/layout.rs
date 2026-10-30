@@ -100,6 +100,31 @@ fn registry_at_trip0(
 /// Calls [`regions`] itself so the driver needs nothing but the node. A `regions` failure is
 /// reported under the SAME stage label [`crate::emit_node`] uses for it, so adding a layout does not
 /// move where a program that never had a readable parameter list is refused.
+/// Where spyre-inference's paged kernels take the KV cache: `k_pages`/`v_pages` (the write's
+/// `k_rows`/`v_rows`) are parameters 2 and 3 of every one, the positions the splice's `lower_attn`
+/// and `lower_kv_write` bind the model's cache at.
+const PAGED_CACHE_PARAMS: [usize; 2] = [2, 3];
+
+/// ⭐ THE KV CACHE'S ALLOCATION IN A ONE-KERNEL BUNDLE — spyre-inference's `allocate_pages`: the
+/// cache a paged kernel reads or writes is allocated row-outermost (`head_major_kv_layout`,
+/// [`ktir_superdsc::placement::BundleLayout::allocate_row_outermost`]). A model bundle's cache is
+/// allocated where the bake places it (`compute_bundle_layout`).
+pub fn allocate_paged_cache(node: &KtirNode, layout: &BundleLayout) -> Result<(), String> {
+    for i in PAGED_CACHE_PARAMS {
+        let Some(b) = node.bindings.get(i) else {
+            return Err(format!(
+                "{}: a paged kernel binds {} buffers, so no cache at parameter {i}",
+                node.func.name,
+                node.bindings.len()
+            ));
+        };
+        layout
+            .allocate_row_outermost(b.get())
+            .map_err(|e| format!("{}: {}", node.func.name, e.0))?;
+    }
+    Ok(())
+}
+
 pub fn for_node(node: &KtirNode) -> Result<BundleLayout, Error> {
     // A walking program's windows are its trip-0 windows (`loop_fold::flatten`).
     let flat = ktir_superdsc::emit::loop_fold::flatten(node).map_err(|e| Error {
@@ -355,7 +380,9 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // `scalarmul_scale_tid(i)` and a rung-3 scale at its own parameter tid, which is
         // what `scalarmul_bound` passes `split_out_excluding` as a skip tid so the region
         // never counts as tensor arity.
-        let is_bound_scale = reg.v_rows == 1 && reg.v_cols == 1;
+        // An int32 `[1,1]` view (a one-block walk's page table, read at its one entry) is an
+        // index, not a launcher-bound fp16 scalar: it keeps its stick.
+        let is_bound_scale = reg.v_rows == 1 && reg.v_cols == 1 && df == Df::Fp16;
         // ⭐⭐⭐ β FIRST, BEFORE THE BOUND-SCALE ARM — a `[1,1]` parameter a convert sweeps
         // (the sampler's gate at the b1 rung) is NOT a launcher-bound fp16 const: the door
         // addresses it at the 64-element device width, so the 2-B `SCALE_BYTES` placement is

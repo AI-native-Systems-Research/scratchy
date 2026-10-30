@@ -1678,33 +1678,9 @@ pub fn walk_buckets(pages: u32) -> Vec<u32> {
     buckets
 }
 
-/// Where spyre-inference's paged kernels take the KV cache: `k_pages`/`v_pages` (the write's
-/// `k_rows`/`v_rows`) are parameters 2 and 3 of every one, the positions [`lower_attn`] and
-/// [`lower_kv_write`] bind the model's cache at.
-const PAGED_CACHE_PARAMS: [usize; 2] = [2, 3];
-
-/// ⭐ THE KV CACHE'S ALLOCATION IN A ONE-KERNEL BUNDLE — spyre-inference's `allocate_pages`: the
-/// cache a paged kernel reads or writes is allocated row-outermost (`head_major_kv_layout`,
-/// [`ktir_superdsc::placement::BundleLayout::allocate_row_outermost`]). A model bundle's cache is
-/// allocated where the bake places it (`compute_bundle_layout`).
-pub fn allocate_paged_cache(
-    node: &KtirNode,
-    layout: &ktir_superdsc::placement::BundleLayout,
-) -> Result<(), String> {
-    for i in PAGED_CACHE_PARAMS {
-        let Some(b) = node.bindings.get(i) else {
-            return Err(format!(
-                "{}: a paged kernel binds {} buffers, so no cache at parameter {i}",
-                node.func.name,
-                node.bindings.len()
-            ));
-        };
-        layout
-            .allocate_row_outermost(b.get())
-            .map_err(|e| format!("{}: {}", node.func.name, e.0))?;
-    }
-    Ok(())
-}
+/// The KV cache's allocation in a one-kernel bundle — see
+/// [`triton_ktir_superdsc::layout::allocate_paged_cache`], where the one-kernel layout lives.
+pub use triton_ktir_superdsc::layout::allocate_paged_cache;
 
 /// THE ATTENTION SPLICE — compile spyre-inference's kernel for this node's rows (one sequence's:
 /// the decode kernel at one row, the prefill kernel past it; a decode batch's: the batched decode
