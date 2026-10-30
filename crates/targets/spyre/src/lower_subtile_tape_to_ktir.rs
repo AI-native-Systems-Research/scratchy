@@ -1341,6 +1341,7 @@ pub fn paged_step_of_ir<F: RopeForm>(
             rep_rows: tids.rep_rows,
             chunk_pages: tids.chunk_pages,
             chunk_masks: tids.chunk_masks,
+            int32_zero: tids.int32_zero,
             pages,
             page_slots: slots,
             rows: mq,

@@ -430,6 +430,21 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         )?;
     }
 
+    // ── THE CHAINED INDEX'S INT32 ZERO ──────────────────────────────────────────────────────────
+    // A chained index copies its run against the host-staged int32 zero stick
+    // (`PAGED_INT32_ZERO_TID`, `addi32toi32(zero, run)`), which the door reads by its reserved tid —
+    // placed, as the bake places it, in the segment a walk's relaunch does not shift.
+    if !chained.is_empty() {
+        pack(
+            name,
+            ktir_superdsc::reserved_tids::PAGED_INT32_ZERO_TID,
+            SegRole::Kv,
+            u64::from(ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS) * 4,
+            &mut placements,
+            &mut segment_bytes,
+        )?;
+    }
+
     // ── THE ROTATE MATRIX P ──────────────────────────────────────────────────────────────────────
     // `rope_at` opens with `crate::place::act_name(ROPE_P_TID)` and reaches it from BOTH its forms —
     // the head-major collapse as one `[hd, hd]` kernel matmul, the slab path as a per-slab ±I block

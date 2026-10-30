@@ -431,6 +431,11 @@ pub const PAGED_REP_ROWS_TID: u32 = reserved_region("paged_step").at(5);
 pub const PAGED_CHUNK_PAGES_TID: u32 = reserved_region("paged_step").at(6);
 /// A decode batch's `mask_by_chunk` — see [`PAGED_STEP_BASE`].
 pub const PAGED_CHUNK_MASKS_TID: u32 = reserved_region("paged_step").at(7);
+/// The decode step's int32 ZERO stick — `INDEX_RUN_WORDS` i32 zeros the host stages beside
+/// `kv_row_pool`: the add identity the chained index's run copy reads (`addi32toi32(zero, run)`, the
+/// int32 copy dxp binds — it has no int32 `identity`). Host-staged, as every int32 the attention
+/// reads is (SENUINT32-tagged i32 bytes) — see [`PAGED_STEP_BASE`].
+pub const PAGED_INT32_ZERO_TID: u32 = reserved_region("paged_step").at(8);
 
 /// Every reserved region, in one place. Order is high tid → low.
 pub const RESERVED_REGIONS: [TidRegion; 8] = [
@@ -496,7 +501,7 @@ pub const RESERVED_REGIONS: [TidRegion; 8] = [
     TidRegion {
         name: "paged_step",
         base: PAGED_STEP_BASE,
-        slots: 8,
+        slots: 9,
     },
 ];
 
