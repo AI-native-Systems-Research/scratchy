@@ -2419,6 +2419,18 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
+    let superdsc_tp_arms: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|a| {
+            let variant_ident = pascal_case(&a.model_ident);
+            let model_ident = &a.model_ident;
+            quote! {
+                Weights::#variant_ident(_) => &#model_ident::SUPERDSC_TP
+                    as &'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync),
+            }
+        })
+        .collect();
+
     let sengraph_bundle_arms: Vec<proc_macro2::TokenStream> = arms
         .iter()
         .map(|a| {
@@ -3163,6 +3175,17 @@ fn emit_arch_dispatcher(
             {
                 Some(match self {
                     #(#superdsc_wiring_arms)*
+                })
+            }
+
+            // Spyre: the sharded worlds, beside the one-rank wiring — a `&'static [TpForward]`.
+            #[cfg(feature = "spyre")]
+            fn superdsc_tp(
+                &self,
+            ) -> Option<&'static (dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync)>
+            {
+                Some(match self {
+                    #(#superdsc_tp_arms)*
                 })
             }
 
