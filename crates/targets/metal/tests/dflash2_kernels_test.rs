@@ -4,9 +4,9 @@
 //! 1482f6bb `dev/tests/engine/draft_attention_metal_test.mm`, `draft_selector_metal_test.mm`,
 //! `dflash_batch_control_metal_test.mm`), transcribed at Qwen3.6-35B-A3B's drafter geometry, with
 //! their cases, their tolerances and their exactness claims. Where the port changed a kernel's
-//! interface (a lane's ring is a pool's slot, a row's RoPE pair is the model's table's at its
-//! position, a prompt's commit finds its sequence by `cu_seqlens`), the reference follows the
-//! port and the cases cover the change.
+//! interface (a lane's ring is a pool's slot, a row's RoPE pair is computed at its position from
+//! the baked rotary base, a prompt's commit finds its sequence by `cu_seqlens`), the reference
+//! follows the port and the cases cover the change.
 //!
 //! GPU tests — run with `--test-threads=1` (standing rule).
 
