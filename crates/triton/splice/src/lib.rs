@@ -3805,10 +3805,12 @@ mod production_ktir_dump {
             ));
         }
         // A decode step's write (8 kv heads, one store per head), one below the scatter floor (2
-        // heads, one store per row), and at head dim 128 those two and a prompt chunk's.
+        // heads, one store per row), a 20-token prompt chunk's (160 index entries, five scatter ops
+        // of 32), and at head dim 128 the first two and a prompt chunk's.
         for (name, t, nkvh, hd) in [
             ("paged_kv_write", 1i128, 8i128, 64i128),
             ("paged_kv_write_rows", 1, 2, 64),
+            ("paged_kv_write_prompt", 20, 8, 64),
             ("paged_kv_write_hd128", 1, 8, 128),
             ("paged_kv_write_rows_hd128", 1, 2, 128),
             ("paged_kv_write_prompt_hd128", 96, 8, 128),
@@ -4007,6 +4009,7 @@ mod production_ktir_dump {
             | "batched_decode_one_slot_hd128" => Program::PagedAttn,
             "paged_kv_write"
             | "paged_kv_write_rows"
+            | "paged_kv_write_prompt"
             | "paged_kv_write_hd128"
             | "paged_kv_write_rows_hd128"
             | "paged_kv_write_prompt_hd128" => Program::PagedKvWrite,
