@@ -953,6 +953,7 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
     let bundle_layout = compute_bundle_layout(
         ir,
         weight_ids,
+        active_cap,
         scratchy_triton_splice::PagedRows::of_requests(rows_are_requests),
         &[],
     )?;
@@ -1388,7 +1389,9 @@ pub fn graph_wiring<F: RopeForm>(
     // card.
     let _ = weight_ids;
     let registries = WiringRegistries {
-        scalarmul_scales: scalar_registry(ir),
+        scalarmul_scales: crate::lower_subtile_tape_to_superdsc::bundle_registry(
+            ir, active_cap, paged_rows,
+        )?,
         // Same rule as the placement pass's own field: the fold list the worker applies to
         // staged bytes at load, keyed by weight tid (the `SubtileId` half is a placement-pass
         // fact and does not ship).
@@ -2099,6 +2102,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     let mut bundle_layout = compute_bundle_layout(
         ir,
         weight_ids,
+        active_cap,
         scratchy_triton_splice::PagedRows::of_requests(rows_are_requests),
         &per_layer_ext,
     )?;
