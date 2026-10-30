@@ -724,7 +724,7 @@ fn stick_columns(a_rows: u32, b_rows: u32, cols: u32) -> Vec<(u32, u32, u32)> {
 
 /// [`RowScatter`]'s card form: the stick-major `[entries, cols]` rows of `src` written through the
 /// index onto the stick-major destination's rows ([`stick_columns`]), one scatter per stick column and
-/// per 32 index entries — the KV write's own scatter ([`paged_kv_write`]).
+/// per 32 index entries — the same scatter a parameter's rows take ([`load_scatters`]).
 pub fn row_scatter(
     name: &str,
     src: &Region,
@@ -867,22 +867,23 @@ fn stored_through(f: &IRFunction<'static>, tile: Option<Ssa>) -> bool {
     })
 }
 
-/// ⭐⭐⭐ A SCATTER THE PROGRAM STATES — a `ktdp.store` through a
+/// ⭐⭐⭐ A PARAMETER'S ROWS SCATTERED — a `ktdp.store` of a `ktdp.load` through a
 /// `ktdp.construct_indirect_access_tile`: rows of [`Scatter::src_tid`] written to the rows of
 /// [`Scatter::value_tid`] that [`Scatter::index_tid`] names. The mirror of [`Gather`], read off the
-/// same tile operands (slot 0 the destination's view, slot 1 the index's).
+/// same tile operands (slot 0 the destination's view, slot 1 the index's). A store of a COMPUTED
+/// value through an indirect tile is that op's own scatter ([`RowScatter`]).
 #[derive(Clone, Copy, Debug)]
 pub struct Scatter {
     /// The parameter holding the row index of every written row.
     pub index_tid: u32,
-    /// The parameter written THROUGH the index (the paged destination).
+    /// The parameter written THROUGH the index.
     pub value_tid: u32,
     /// The parameter the stored rows are loaded from.
     pub src_tid: u32,
     /// Rows the store writes: the tile's slow extent, one index entry per row.
     pub entries: u32,
     /// Where this store's run of entries starts in the index buffer, in entries — any entry: a
-    /// per-row store writes one row at its own entry, and [`paged_kv_write`] coalesces the runs.
+    /// per-row store writes one row at its own entry, and [`load_scatters`] coalesces the runs.
     pub first_entry: u32,
     /// Where this store's rows start in the source, in the source's own STICKS: the source is
     /// stick-major `[rows, cols]`, so the one-stick row at `(r, c)` is stick `(c / stick) · rows + r`
@@ -891,7 +892,8 @@ pub struct Scatter {
     pub src_stick: u32,
 }
 
-/// [`Scatter`] for every `ktdp.store` the program makes through an indirect access tile.
+/// [`Scatter`] for every `ktdp.store` of a `ktdp.load` the program makes through an indirect access
+/// tile.
 pub fn scatters_of(k: &KtirNode) -> Result<Vec<Scatter>, Error> {
     let f = &k.func;
     let consts = index_constants(&k.func);
@@ -928,19 +930,16 @@ pub fn scatters_of(k: &KtirNode) -> Result<Vec<Scatter>, Error> {
                 f.name
             ),
         })?;
-        let first_entry = indirect_tile_anchor(k, tile, &consts)?;
-        // The stored value is a plain `ktdp.load` over an access tile of the source parameter.
-        let load = f
+        // A parameter's rows: a plain `ktdp.load` over an access tile of the source parameter.
+        // Any other stored value is computed, and its op scatters it.
+        let Some(load) = f
             .operations
             .iter()
             .find(|o| o.result == Some(value) && o.op_type == OpKind::KtdpLoad)
-            .ok_or_else(|| Error {
-                message: format!(
-                    "{}: the scatter stores a value no `ktdp.load` produced — the card's scatter is \
-                     a copy, so the written rows must be rows of a parameter",
-                    f.name
-                ),
-            })?;
+        else {
+            continue;
+        };
+        let first_entry = indirect_tile_anchor(k, tile, &consts)?;
         let src_tile_v = load.operands.first().copied();
         let src_tile = f
             .operations
@@ -1023,48 +1022,45 @@ struct RunPiece {
     src_stick: u32,
 }
 
-/// The stores of one `(source, pool, table)` triple — one run of rows [`paged_kv_write`] cuts into
-/// index-stick ops.
+/// The stores of one `(source, destination, table)` triple — one run of rows [`load_scatters`]
+/// cuts into index-stick ops.
 struct ScatterRun {
     key: (u32, u32, u32),
     pieces: Vec<RunPiece>,
 }
 
-/// ⭐⭐⭐ THE PAGED KV WRITE ON THE CARD — spyre-inference's `reshape_and_cache_head_major`
-/// (`kernels/reshape_and_cache_head_major.py`) as hardware scatters: every row of the step's K (and V) lands in its
-/// pool at the row the write-rows table names, through the index registers.
+/// ⭐⭐⭐ A PARAMETER'S ROWS SCATTERED, ON THE CARD — the program's `ktdp.store`s of loaded rows
+/// through indirect access tiles ([`scatters_of`]) as hardware scatters: every stored row lands in its
+/// destination at the row the index names, through the index registers. Empty when the program
+/// states none. (spyre-inference's `reshape_and_cache_head_major` is nothing else.)
 ///
-/// The program states the write as `ktdp.store`s through indirect access tiles ([`scatters_of`]):
-/// one store per kv head per pool (`k_rows.index_copy_(0, idx, key[:, h])`) at eight rows or more,
-/// one per row below Triton's scatter floor. Each stored row is one stick of the stick-major source
-/// (`key[:, h]` row `t` is its stick `h · T + t`), and spyre-inference's head-major
-/// `kv_write_index` puts that row at entry `h · T + t` — so source stick and index entry advance
-/// together across every store of one (source, pool, table) triple, and the stores COALESCE into
-/// one run: sticks `s0..s0 + n` of the source through entries `e0..e0 + n` of the table, cut into
-/// ops of one index stick each ([`assemble_scatter_copy`], the vendor's `test_scatter_1core`
-/// shape). A store that does not continue the run is refused by name: the copy moves source stick
-/// `s0 + j` through entry `e0 + j`, and nothing else.
-pub fn paged_kv_write(
+/// Each stored row is one stick of the stick-major source: at eight rows or more one store per head
+/// (`k_rows.index_copy_(0, idx, key[:, h])`), one per row below Triton's scatter floor, and row `t` of
+/// `key[:, h]` is the source's stick `h · T + t`. When the index puts that row at entry `h · T + t`
+/// (their head-major `kv_write_index`), source stick and index entry advance together across every
+/// store of one (source, destination, table) triple, and the stores COALESCE into one run: sticks
+/// `s0..s0 + n` of the source through entries `e0..e0 + n` of the table, cut into ops of one index
+/// stick each ([`assemble_scatter_copy`], the vendor's `test_scatter_1core` shape). A store that does
+/// not continue the run is refused by name: the copy moves source stick `s0 + j` through entry
+/// `e0 + j`, and nothing else.
+pub fn load_scatters(
     name: &str,
     k: &KtirNode,
-    r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
     let scatters = scatters_of(k)?;
     if scatters.is_empty() {
-        return err(format!(
-            "{name}: a KV write that states no `ktdp.store` through an indirect access tile — the \
-             write IS the scatter, so a program without one writes nothing"
-        ));
+        return Ok(Vec::new());
     }
+    let r = regions(k)?;
     let region = |tid: u32| -> Result<&Region, Error> {
         r.iter().find(|x| x.tid == tid).ok_or_else(|| Error {
             message: format!("{name}: t{tid} is not a parameter of the program"),
         })
     };
     let stick = Fp16::ELEMS_PER_STICK;
-    // Each (source, pool, table) triple in first-store order, with its stores' pieces.
+    // Each (source, destination, table) triple in first-store order, with its stores' pieces.
     let mut runs: Vec<ScatterRun> = Vec::new();
     for sc in &scatters {
         let key = (sc.src_tid, sc.value_tid, sc.index_tid);
@@ -1083,7 +1079,7 @@ pub fn paged_kv_write(
     }
     let mut ops = Vec::new();
     for ScatterRun {
-        key: (src_tid, pool_tid, index_tid),
+        key: (src_tid, dst_tid, index_tid),
         mut pieces,
     } in runs
     {
@@ -1110,12 +1106,12 @@ pub fn paged_kv_write(
             next += rows;
         }
         let total = next - e0;
-        let (src, pool, index) = (region(src_tid)?, region(pool_tid)?, region(index_tid)?);
-        if pool.v_cols != stick {
+        let (src, dst, index) = (region(src_tid)?, region(dst_tid)?, region(index_tid)?);
+        if dst.v_cols != stick {
             return err(format!(
-                "{name}: the pool t{pool_tid} is written as {}-wide rows — a KV row is ONE \
-                 {stick}-element stick, one kv head's slot (`kv_slot_views`)",
-                pool.v_cols
+                "{name}: t{dst_tid} is written as {}-wide rows — the scatter copies ONE \
+                 {stick}-element stick per index entry",
+                dst.v_cols
             ));
         }
         if s0 + total > src.v_rows * (src.v_cols / stick) {
@@ -1127,7 +1123,7 @@ pub fn paged_kv_write(
         }
         let page = crate::superdsc_opspec::PageExtent::of_positions(1);
         let per_op = <SenUint32 as DataFormat>::ELEMS_PER_STICK;
-        let (src_name, pool_name, index_name) = (src.name(), pool.name(), index.name());
+        let (src_name, dst_name, index_name) = (src.name(), dst.name(), index.name());
         for (i, first) in (0..total).step_by(per_op as usize).enumerate() {
             let entries = per_op.min(total - first);
             let base =
@@ -1142,9 +1138,9 @@ pub fn paged_kv_write(
                 base,
             );
             let op = crate::ir::bridge::tiled_op_sdsc_op::assemble_scatter_copy(
-                &format!("kvwrite{i}_o{pool_tid}"),
+                &format!("scatter_run{i}_o{dst_tid}"),
                 &src_name,
-                &pool_name,
+                &dst_name,
                 scatter,
                 crate::ir::bridge::tiled_op_sdsc_op::ScatterCopySpec {
                     rows: entries,

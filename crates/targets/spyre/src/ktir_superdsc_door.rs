@@ -113,9 +113,10 @@ pub fn lower(
     // The name is still the program's identity for the emulator (which keys functions by it) and for
     // the descriptor suffixes, so it is READ — but nothing is parsed out of it.
     let name = k.func.name;
-    // ⭐ THE PAGE WALK reads its windows at trip 0 (`loop_fold::flatten`), which the walk itself
-    // does — the top-level `regions` reading below stops at the loop.
-    if k.program == Program::PagedAttn {
+    // ⭐ A PROGRAM THAT WALKS reads its windows at trip 0 (`loop_fold::flatten`), which the walk
+    // itself does — the top-level `regions` reading below stops at the loop. Whatever it computes:
+    // the loop is the program's shape, not its kind.
+    if ktir_superdsc::emit::loop_fold::walks(k) {
         return lower_walk(k, layout, sym_id_base);
     }
     let r = regions(k)?;
@@ -138,12 +139,12 @@ pub fn lower(
         // multiplies over generic ops, whole-tensor at corner 0 (the splice's own
         // region guard refuses a windowed one). No door fact is read off the program.
         Program::Sample => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
-        // ⭐ THE KV WRITE'S HARDWARE SCATTER — the step's K and V rows written into their pools
-        // through the write-rows table (`lk::paged_kv_write`, the vendor's `test_scatter_1core`).
-        Program::PagedKvWrite => lk::paged_kv_write(name, k, &r, sym_id_base, layout),
-        // ⭐ THE PAGE WALK — its block body built once at trip 0 and marked for the card's per-trip
-        // relaunch (`whole_function::lower_walk`). Reached above, before the top-level reading.
-        Program::PagedAttn => lower_walk(k, layout, sym_id_base),
+        // The KV write is its stores of loaded rows through the write-rows table — the walk's
+        // scatter of a parameter's rows (`lk::load_scatters`), as for any program.
+        Program::PagedKvWrite => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
+        // A walk was lowered above; a one-block walk states no loop (the front end promotes a
+        // one-trip `scf.for` to its body) and is the straight-line program it reads as.
+        Program::PagedAttn => windowed(name, &r, lower_function(k, layout, sym_id_base, None)),
         // ⭐ THE CHAINED HEAD'S ROW PRODUCTION — the same no-door-to-cross shape as the
         // transpose: the three legs (slab gather, restickify transpose, row gather) are
         // parameterised by the extents its own regions state. See [`lk::embed_row_gather`]

@@ -448,19 +448,6 @@ impl Program {
     pub const fn declares_on_emulator(self) -> bool {
         !matches!(self, Program::PagedAttn | Program::PagedKvWrite)
     }
-
-    /// ⭐ THE PARAMETERS THAT ARE PAGED KV POOLS — a target-ABI fact of the paged step's two kernels
-    /// (spyre-inference's operand order: the K and V pools are parameters 2 and 3 of both). A pool
-    /// is written and read only as runs of whole sticks — the KV write's one-stick rows, the page
-    /// walk's gathered pages and `(page, kv head)` slabs — so its bytes are those runs in order, and
-    /// a gather of one of its rows is a contiguous run. Every other 2-D buffer is stick-major on the
-    /// card, its rows strided one stick column apart. Empty for every other program.
-    pub const fn paged_pool_params(self) -> &'static [usize] {
-        match self {
-            Program::PagedAttn | Program::PagedKvWrite => &[2, 3],
-            _ => &[],
-        }
-    }
 }
 
 /// One buffer of a bundle, as the CALLER numbers it.

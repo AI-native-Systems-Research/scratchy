@@ -21,7 +21,7 @@
 
 use crate::addr::{DevOff, Win};
 use crate::place::PlaceId;
-use crate::sdsc_abstract::{KindTag, StickLayout, Stk};
+use crate::sdsc_abstract::{KindTag, StickKind, StickLayout, Stk};
 use crate::superdsc_error::SuperDscError;
 use crate::superdsc_opspec::Df;
 
@@ -1021,5 +1021,41 @@ impl BundleLayout {
                 Ok(want)
             }
         }
+    }
+
+    /// ⭐ A BUFFER ALLOCATED ROW-OUTERMOST — its fp16 elements in order, `[rows][sticks][stick]`:
+    /// torch-spyre's row-outermost `SpyreTensorLayout`, the one spyre-inference allocates its paged
+    /// KV cache in (`head_major_kv_layout`, device `[pages·kv, block, sticks, stick]`, which keeps the
+    /// indexed row whole at device position 0). One row of it is one contiguous run in whatever frame
+    /// a program reads it, so a gather of a row is one copy. Stated by whoever allocates the buffer,
+    /// through the arrangement authority and before any op addresses it, so an op that then addresses
+    /// it stick-major is the authority's build `Err`.
+    pub fn allocate_row_outermost(&self, tid: u32) -> Result<(), SuperDscError> {
+        let Some(p) = self.placements.get(&tid) else {
+            return Err(SuperDscError(format!(
+                "t{tid} is allocated row-outermost but this bundle never placed it"
+            )));
+        };
+        let stick = u64::from(Df::Fp16.elems_per_stick());
+        let elems = p.size / 2;
+        if !elems.is_multiple_of(stick) {
+            return Err(SuperDscError(format!(
+                "t{tid}: a row-outermost allocation of {elems} fp16 elements is not whole \
+                 {stick}-element sticks"
+            )));
+        }
+        self.declare_arrangement(
+            &crate::place::act_name(tid),
+            StickLayout::flat((elems / stick) as usize, stick as usize),
+        )
+        .map(drop)
+    }
+
+    /// Whether `tid`'s arrangement is row-major — allocated so ([`Self::allocate_row_outermost`]).
+    pub fn is_row_outermost(&self, tid: u32) -> bool {
+        self.arrangements
+            .borrow()
+            .get(&crate::place::act_name(tid))
+            .is_some_and(|a| a.kind == StickKind::Flat)
     }
 }
