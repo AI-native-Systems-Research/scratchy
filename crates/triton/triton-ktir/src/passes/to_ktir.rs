@@ -912,6 +912,10 @@ fn combiner_identity(kind: &OpKind, elem: DType) -> Option<Attr> {
                 Attr::Float(FloatBits::f32(f32::INFINITY))
             }
         }
+        // `standard.min` over an int32 (`_elementwise_min` → `arith.minsi`): the largest int32.
+        OpKind::Other(s) if s == "arith.minsi" && elem == DType::I32 => {
+            Attr::Int(i64::from(i32::MAX))
+        }
         _ => return None,
     })
 }
@@ -948,7 +952,12 @@ fn convert_reduce(module: &mut Module, index: &DefIndex, path: &OpPath) -> Resul
         .cloned()
         .ok_or_else(|| refuse("tt.reduce has no result type"))?;
     let (src_rank, res_rank) = (src_ty.rank(), res_ty.rank());
-    if src_ty.dims().is_none() || res_ty.dims().is_none() || res_rank + 1 != src_rank {
+    // ⭐ A RANK-1 SOURCE REDUCED TO A SCALAR (`tl.min(kv_rows, 0)`): reduced as `[1, N]` to `[1]`
+    // and its one element extracted, so the generic keeps a ranked output.
+    let to_scalar = src_rank == 1 && matches!(res_ty, IrType::Scalar(_));
+    if !to_scalar
+        && (src_ty.dims().is_none() || res_ty.dims().is_none() || res_rank + 1 != src_rank)
+    {
         return Err(refuse(
             "tt.reduce does not drop exactly one dimension of a ranked tensor",
         ));
@@ -960,12 +969,11 @@ fn convert_reduce(module: &mut Module, index: &DefIndex, path: &OpPath) -> Resul
     if axis < 0 || axis as usize >= src_rank {
         return Err(refuse(format!("tt.reduce axis {axis} is out of range")));
     }
-    let elem = src_ty.elem().filter(|e| e.is_float()).ok_or_else(|| {
-        refuse(
-            "only a float tt.reduce is supported (an integer reduction needs its own \
-             identity table)",
-        )
-    })?;
+    // An integer reduction is served exactly where its combiner has an identity
+    // ([`combiner_identity`]): the refusal below names any other.
+    let elem = src_ty
+        .elem()
+        .ok_or_else(|| refuse("tt.reduce's operand has no element type"))?;
 
     // The combiner must be ONE recognized associative op plus the terminator.
     let region = op
@@ -1027,8 +1035,39 @@ fn convert_reduce(module: &mut Module, index: &DefIndex, path: &OpPath) -> Resul
     let ident_op = Op::new(OpKind::ArithConstant)
         .with_result(ident_scalar, IrType::Scalar(elem))
         .with_attr(AttrKey::Value, ident);
+    // The scalar form reduces `[1, N]` over axis 1 into `[1]`.
+    let mut pre: Vec<Op> = Vec::new();
+    let (source, src_rank, axis, out_ty, out) = if to_scalar {
+        let n = src_ty.dims().expect("rank 1")[0];
+        let expanded = module.fresh_named(&hint);
+        pre.push(
+            Op::new(OpKind::TensorExpandShape)
+                .with_result(
+                    expanded,
+                    IrType::Tensor {
+                        dims: vec![1, n],
+                        elem,
+                    },
+                )
+                .with_operands([op.operands[0]])
+                .with_attr(AttrKey::Axis, Attr::Int(0)),
+        );
+        let one = IrType::Tensor {
+            dims: vec![1],
+            elem,
+        };
+        (expanded, 2, 1, one, module.fresh_named(&hint))
+    } else {
+        (
+            op.operands[0],
+            src_rank,
+            axis,
+            res_ty.clone(),
+            op.results[0],
+        )
+    };
     let init_op = Op::new(OpKind::TensorSplat)
-        .with_result(init, res_ty.clone())
+        .with_result(init, out_ty.clone())
         .with_operands([ident_scalar]);
 
     // ins: identity over the source rank; outs: drop the reduced axis.
@@ -1053,8 +1092,8 @@ fn convert_reduce(module: &mut Module, index: &DefIndex, path: &OpPath) -> Resul
         ],
     };
     let generic = Op::new(OpKind::LinalgGeneric)
-        .with_result(op.results[0], res_ty)
-        .with_operands([op.operands[0], init])
+        .with_result(out, out_ty)
+        .with_operands([source, init])
         .with_attr(
             AttrKey::IndexingMaps,
             Attr::AffineMapList(vec![identity_map(src_rank), projected_map(src_rank, &keep)]),
@@ -1062,11 +1101,26 @@ fn convert_reduce(module: &mut Module, index: &DefIndex, path: &OpPath) -> Resul
         .with_attr(AttrKey::IteratorTypes, Attr::StrList(iters))
         .with_region(generic_body);
 
+    let mut ops = pre;
+    ops.push(ident_op);
+    ops.push(init_op);
+    ops.push(generic);
+    if to_scalar {
+        let zero = module.fresh_named(&hint);
+        ops.push(
+            Op::new(OpKind::ArithConstant)
+                .with_result(zero, IrType::Index)
+                .with_attr(AttrKey::Value, Attr::Int(0)),
+        );
+        ops.push(
+            Op::new(OpKind::Other("tensor.extract".into()))
+                .with_result(op.results[0], res_ty)
+                .with_operands([out, zero]),
+        );
+    }
     let idx = path.index();
     let block = walk::block_mut(module, path).expect("path");
-    block[idx] = generic;
-    block.insert(idx, init_op);
-    block.insert(idx, ident_op);
+    block.splice(idx..=idx, ops);
     Ok(())
 }
 

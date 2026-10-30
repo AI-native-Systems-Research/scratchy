@@ -591,7 +591,7 @@ pub fn lower_all<F: scratchy_subtile::subtile_ir::RopeForm>(
         return lower_one(&at_m1, ir, rows_are_requests).map(|e| vec![e]);
     }
     // ⭐ A KV WRITER IS TWO PROGRAMS: the rotation (`rope.py`, the node's own output) and the paged
-    // write that scatters the rotated K and the V into the pools (`paged_kv_write.py`) — spyre-
+    // write that scatters the rotated K and the V into the pools (`reshape_and_cache_head_major.py`) — spyre-
     // inference's `do_kv_cache_update`, run before the step's attention reads the pages.
     if let SubOp::RopeAppend { .. } = &node.op {
         return Ok(vec![
@@ -1397,57 +1397,59 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
 //  PAGED ATTENTION — spyre-inference's serving step (`SpyreHeadMajorAttentionImpl`, the decoder
 //  backend its default `SPYRE_ATTN_KV_LAYOUT=head_major` selects): the KV cache write
 //  (`reshape_and_cache_head_major`) and the online-softmax page walk
-//  (`page_attn_head_major_decode` / `_prefill`), as `kernels/paged_kv_write.py` and
-//  `kernels/paged_attn.py`.
+//  (`page_attn_head_major_decode` / `_prefill`), as `kernels/reshape_and_cache_head_major.py`,
+//  `kernels/page_attn_head_major_decode.py` and `kernels/page_attn_head_major_prefill.py` —
+//  their kernels, operand for operand.
 //
 //  * the K and V CACHE TENSORS the layout names ARE THE POOLS, read head-major as
 //    `[pages, nkvh, PAGE_SLOTS, hd]` — the same bytes as the cache's `[cap, nkvh·hd]`, so the
 //    graph's own tensors carry the pages and nothing is re-allocated;
-//  * a PAGE is the scheduler's KV block (`PagedKvPool::PAGE_SLOTS` slots, the block size the
-//    worker hands the engine), so a block id the scheduler allocates IS a page of these pools;
-//  * the PAGE TABLE, the MASK STACK and the WRITE ROWS are the step's host sources — tensors at
-//    RESERVED tids ([`PagedStepTids`]), filled each step from the request's blocks;
+//  * a PAGE is the scheduler's KV block ([`PAGE_SLOTS`] slots, the block size the worker hands
+//    the engine), so a block id the scheduler allocates IS a page of these pools;
+//  * the PAGE INDEX TABLE, the MASK STACK, the QUERY ROW INDEX, `kv_row_pool` and the KV WRITE
+//    INDEX are the step's host sources — tensors at RESERVED tids ([`PagedStepTids`]), filled from
+//    the request's blocks (spyre-inference's `SpyreAttentionMetadataBuilder.build` and
+//    `kv_write_index`);
 //  * the write runs BEFORE the attention — the `RopeAppend` precedes its `AttnDecode` on the tape,
 //    as `do_kv_cache_update` precedes the page walk — so a step's own keys are in the pool when its
 //    pages are gathered, and the attention reads nothing but the pools.
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// Token slots per KV page — the scheduler's block (`PagedKvPool::PAGE_SLOTS`), the block the page
-/// walk tiles and the modulus the write's rows step by.
-pub const PAGE_SLOTS: u32 = ktir_superdsc::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
+/// Token slots per KV page — the scheduler's block, the block the page walk tiles (`BLOCK_SIZE`) and
+/// the modulus the write's rows step by.
+///
+/// spyre-inference's block size is any multiple of 64 (`SpyrePlatform._align_block_size`, the
+/// backend's own `block_size % 64` check in `spyre_attn.py`; 128 when the user names none), and the
+/// card fixes which: the prompt kernel gathers a whole page (`k_pages.index_select(0, page_idx)`, all
+/// kv heads) as ONE index entry, and dxp double-buffers the first chunk of a gather in one core's LX.
+/// At granite's 8 kv heads × 64 head dims a 64-slot page is 64 KB and compiles; a 128-slot page
+/// (128 KB) and a 256-slot one (256 KB) fail dxp's "initial chunk parameters must fit in LX"
+/// (`L3DlOpsScheduler.cpp:1537`).
+pub const PAGE_SLOTS: u32 = 64;
 
 /// An int32 stick (spyre-inference's `INT32_ELEMS_PER_STICK`).
 pub const INT32_STICK: u32 = 32;
 
-/// ⭐ THE PAGE TABLE'S ROW PITCH, in int32 — one int32 stick per score row (`paged_attn.py`'s
-/// `PT_PITCH`). The card runs the walk's block body once per trip and steps the step's sources by ONE
-/// shift per trip, and a trip's mask tile moves `score_rows` stick rows of the stick-major mask stack
-/// — so the table's rows sit exactly that far apart.
-pub const fn page_table_pitch(score_rows: u32) -> u32 {
-    score_rows * INT32_STICK
-}
-
-/// ⭐ WHAT A PAGE TABLE ROW HOLDS — the block's `nkvh` folded-cache rows `page · nkvh + kv`
-/// (`kv_row_pool[page]`, the decode kernel's per-kv-head gather) when the walk gathers one kv head's
-/// slab per index entry, which it does from Triton's gather floor of 8 rows up (`paged_attn.py`'s
-/// `NKVH >= 8`); under it, the block's page at column 0 (the whole page is one entry).
-pub const fn page_table_holds_kv_rows(nkvh: u32) -> bool {
-    nkvh >= 8
-}
-
-/// ⭐⭐⭐ THE PAGED STEP'S HOST SOURCES — the three per-step buffers a paged forward reads, at their
-/// RESERVED tids (`ktir_superdsc::reserved_tids::PAGED_STEP_BASE`): one session holds every bundle's
-/// programs, so a source numbered past ONE graph can be a real tensor of another, and the reserved
-/// region names the same three ids for every bundle. The splice that binds them and the wiring that
-/// exposes them read them here.
+/// ⭐⭐⭐ THE PAGED STEP'S HOST SOURCES — the buffers a paged forward's attention and KV write read
+/// besides the pools, at their RESERVED tids (`ktir_superdsc::reserved_tids::PAGED_STEP_BASE`): one
+/// session holds every bundle's programs, so a source numbered past ONE graph can be a real tensor of
+/// another, and the reserved region names the same ids for every bundle. The splice that binds them
+/// and the wiring that exposes them read them here. Each is spyre-inference's own operand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PagedStepTids {
-    /// The mask stack: one `[mq, PAGE_SLOTS]` additive tile per walked block.
+    /// `mask_stack` `[num_blocks, padded_query_len, block_size]`: one additive tile per walked block.
     pub mask: u32,
-    /// The page table: one row per walked block ([`page_table_pitch`] int32), its page at column 0.
+    /// `page_index_table` `[num_blocks, INT32_ELEMS_PER_STICK]` int32: row i holds the i-th block's
+    /// page id at column 0.
     pub page_table: u32,
-    /// The write rows: the pool row of every (token, kv head) the step writes.
+    /// `kv_write_index`: one `[T]` int32 index per kv head, one after another — the cache row of
+    /// each token of each head.
     pub write_rows: u32,
+    /// `query_row_index` `[padded_query_len]` int32: the sequence's rows of the query.
+    pub query_rows: u32,
+    /// `kv_row_pool` `[num_pages, num_kv_heads, 1]` int32: every page's folded-cache rows
+    /// `page * num_kv_heads + kv` (the decode kernel's).
+    pub kv_row_pool: u32,
 }
 
 impl PagedStepTids {
@@ -1455,26 +1457,42 @@ impl PagedStepTids {
         mask: ktir_superdsc::reserved_tids::PAGED_MASK_TID,
         page_table: ktir_superdsc::reserved_tids::PAGED_PAGE_TABLE_TID,
         write_rows: ktir_superdsc::reserved_tids::PAGED_WRITE_ROWS_TID,
+        query_rows: ktir_superdsc::reserved_tids::PAGED_QUERY_ROWS_TID,
+        kv_row_pool: ktir_superdsc::reserved_tids::PAGED_KV_ROW_POOL_TID,
     };
 }
 
-/// THE ATTENTION FAMILY — one row, one kernel, every shape: `paged_attn.py` walks the pages at any
-/// query width, its decode arm folding the query group into rows.
+/// THE ATTENTION FAMILY's prefill kernel — `page_attn_head_major_prefill.py`, spyre-inference's
+/// `page_attn_head_major_prefill_kernel`. [`lower_attn`] dispatches as spyre-inference does: this
+/// kernel past one query row, [`attn_decode_row`]'s at one.
 pub fn attn_row() -> TritonKernelRow {
     TritonKernelRow::Spliced {
-        src: include_str!("../../../targets/spyre/kernels/paged_attn.py"),
-        file: "paged_attn.py",
-        entry: "paged_attn_fwd",
+        src: include_str!("../../../targets/spyre/kernels/page_attn_head_major_prefill.py"),
+        file: "page_attn_head_major_prefill.py",
+        entry: "page_attn_head_major_prefill_kernel",
         program: Program::PagedAttn,
     }
 }
 
-/// The paged KV write's row — the scatter half of a KV writer (`RopeAppend`), its own program.
+/// THE ATTENTION FAMILY's decode kernel — `page_attn_head_major_decode.py`, spyre-inference's
+/// `page_attn_head_major_decode_kernel`, at one query row.
+pub fn attn_decode_row() -> TritonKernelRow {
+    TritonKernelRow::Spliced {
+        src: include_str!("../../../targets/spyre/kernels/page_attn_head_major_decode.py"),
+        file: "page_attn_head_major_decode.py",
+        entry: "page_attn_head_major_decode_kernel",
+        program: Program::PagedAttn,
+    }
+}
+
+/// The paged KV write's row — `reshape_and_cache_head_major.py`, spyre-inference's
+/// `reshape_and_cache_head_major_kernel`: the scatter half of a KV writer (`RopeAppend`), its own
+/// program.
 pub fn kv_write_row() -> TritonKernelRow {
     TritonKernelRow::Spliced {
-        src: include_str!("../../../targets/spyre/kernels/paged_kv_write.py"),
-        file: "paged_kv_write.py",
-        entry: "paged_kv_write_fwd",
+        src: include_str!("../../../targets/spyre/kernels/reshape_and_cache_head_major.py"),
+        file: "reshape_and_cache_head_major.py",
+        entry: "reshape_and_cache_head_major_kernel",
         program: Program::PagedKvWrite,
     }
 }
@@ -1567,17 +1585,28 @@ pub fn walk_buckets(pages: u32) -> Vec<u32> {
     buckets
 }
 
-/// THE ATTENTION SPLICE — compile `paged_attn.py` for this node's geometry and the rung's walk
-/// ([`walk_pages`]), and mint the `Program::PagedAttn` node: `[q, out, k pool, v pool, page table,
-/// mask stack]`.
+/// THE ATTENTION SPLICE — compile spyre-inference's kernel for this node's query width (the decode
+/// kernel at one row, the prefill kernel past it) at its geometry and the rung's walk
+/// ([`walk_pages`]), and mint the `Program::PagedAttn` node over their operands, in their order:
+/// `[query, query_row_index, k_pages, v_pages, page_index_table, (kv_row_pool,) mask_stack, out]`.
 pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     active_cap: ktir_superdsc::ktir_node::ActiveCap,
 ) -> Result<EmittedOp, String> {
-    let row = attn_row();
-    let (src, program) = match &row {
-        TritonKernelRow::Spliced { src, program, .. } => (*src, *program),
+    let decode = node.output.region.rows.len == 1;
+    let row = if decode {
+        attn_decode_row()
+    } else {
+        attn_row()
+    };
+    let (src, file, entry, program) = match &row {
+        TritonKernelRow::Spliced {
+            src,
+            file,
+            entry,
+            program,
+        } => (*src, *file, *entry, *program),
         TritonKernelRow::Refused(why) => return Err(why.to_string()),
     };
     let SubOp::AttnDecode {
@@ -1627,52 +1656,63 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     let tids = PagedStepTids::RESERVED;
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
-    for (p, ty) in [
-        ("desc_q", "*fp16"),
-        ("desc_o", "*fp16"),
-        ("desc_kp", "*fp16"),
-        ("desc_vp", "*fp16"),
-        ("desc_pt", "*i32"),
-        ("desc_mask", "*fp16"),
-    ] {
+    let mut pointers = vec![
+        ("query", "*fp16"),
+        ("query_row_index", "*i32"),
+        ("k_pages", "*fp16"),
+        ("v_pages", "*fp16"),
+        ("page_index_table", "*i32"),
+    ];
+    if decode {
+        pointers.push(("kv_row_pool", "*i32"));
+    }
+    pointers.extend([("mask_stack", "*fp16"), ("out", "*fp16")]);
+    for (p, ty) in pointers {
         signature.insert(
             p.to_string(),
             ArgSpec::parse(ty).map_err(|e| e.to_string())?,
         );
     }
-    for (k, v) in [
-        ("MQ", mq),
-        ("NQH", nqh),
-        ("NKVH", nkvh),
-        ("HD", hd),
-        ("BLOCK", PAGE_SLOTS),
+    let mut sizes = vec![
+        ("NUM_TOKENS", mq),
+        ("NUM_HEADS", nqh),
+        ("NUM_KV_HEADS", nkvh),
+        ("HEAD_SIZE", hd),
+        ("BLOCK_SIZE", PAGE_SLOTS),
         ("NUM_PAGES", pages),
         ("NUM_BLOCKS", blocks),
-    ] {
+    ];
+    if !decode {
+        sizes.push(("PADDED_QUERY_LEN", mq));
+    }
+    for (k, v) in sizes {
         signature.insert(k.to_string(), ArgSpec::Constexpr);
         constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
     }
     signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
     constexprs.insert("SCALE".to_string(), Val::Float(f64::from(*scale)));
     let spec = KernelSpec {
-        kernel: "paged_attn_fwd".to_string(),
+        kernel: entry.to_string(),
         signature,
         constexprs,
-        file: "paged_attn.py".to_string(),
+        file: file.to_string(),
     };
     let module = compile_kernel(src, &spec, &[1])?;
     let positional = triton_ktir_superdsc::node_for(&module, program)
         .map_err(|e| format!("triton splice: node_for: {e}"))?;
     let t =
         |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
-    let bindings = vec![
+    let mut bindings = vec![
         t(&node.inputs[0]),
-        t(&node.output),
+        BufferId::new(tids.query_rows),
         t(&node.inputs[1]),
         t(&node.inputs[2]),
         BufferId::new(tids.page_table),
-        BufferId::new(tids.mask),
     ];
+    if decode {
+        bindings.push(BufferId::new(tids.kv_row_pool));
+    }
+    bindings.extend([BufferId::new(tids.mask), t(&node.output)]);
     let k = rebind(
         positional,
         format!("attn_s{}", node.id.index()),
@@ -1684,16 +1724,22 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     Ok(e)
 }
 
-/// THE KV WRITE'S SPLICE — the scatter half of a `RopeAppend`: compile `paged_kv_write.py` for the
-/// node's rows and pools, and mint the `Program::PagedKvWrite` node: `[k, v, k pool, v pool, write
-/// rows]`, where `k` is the RopeAppend's own output (the rotated K) and `v` its V input.
+/// THE KV WRITE'S SPLICE — the scatter half of a `RopeAppend`: compile spyre-inference's
+/// `reshape_and_cache_head_major_kernel` for the node's rows and pools, and mint the
+/// `Program::PagedKvWrite` node over their operands: `[key, value, k_rows, v_rows, row_index]`, where
+/// `key` is the RopeAppend's own output (the rotated K) and `value` its V input.
 pub fn lower_kv_write<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
 ) -> Result<EmittedOp, String> {
     let row = kv_write_row();
-    let (src, program) = match &row {
-        TritonKernelRow::Spliced { src, program, .. } => (*src, *program),
+    let (src, file, entry, program) = match &row {
+        TritonKernelRow::Spliced {
+            src,
+            file,
+            entry,
+            program,
+        } => (*src, *file, *entry, *program),
         TritonKernelRow::Refused(why) => return Err(why.to_string()),
     };
     let SubOp::RopeAppend { head_dim, .. } = &node.op else {
@@ -1730,11 +1776,11 @@ pub fn lower_kv_write<F: scratchy_subtile::subtile_ir::RopeForm>(
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
     for (p, ty) in [
-        ("desc_k", "*fp16"),
-        ("desc_v", "*fp16"),
-        ("desc_kp", "*fp16"),
-        ("desc_vp", "*fp16"),
-        ("desc_rows", "*i32"),
+        ("key", "*fp16"),
+        ("value", "*fp16"),
+        ("k_rows", "*fp16"),
+        ("v_rows", "*fp16"),
+        ("row_index", "*i32"),
     ] {
         signature.insert(
             p.to_string(),
@@ -1743,18 +1789,18 @@ pub fn lower_kv_write<F: scratchy_subtile::subtile_ir::RopeForm>(
     }
     for (k, v) in [
         ("T", rows),
-        ("NKVH", nkvh),
-        ("HD", hd),
-        ("POOL_ROWS", pages * nkvh * PAGE_SLOTS),
+        ("NUM_KV_HEADS", nkvh),
+        ("HEAD_SIZE", hd),
+        ("NUM_ROWS", pages * nkvh * PAGE_SLOTS),
     ] {
         signature.insert(k.to_string(), ArgSpec::Constexpr);
         constexprs.insert(k.to_string(), Val::Int(i128::from(v)));
     }
     let spec = KernelSpec {
-        kernel: "paged_kv_write_fwd".to_string(),
+        kernel: entry.to_string(),
         signature,
         constexprs,
-        file: "paged_kv_write.py".to_string(),
+        file: file.to_string(),
     };
     let module = compile_kernel(src, &spec, &[1])?;
     let positional = triton_ktir_superdsc::node_for(&module, program)
@@ -3061,8 +3107,12 @@ mod production_ktir_dump {
     //! production emits.
     use super::*;
 
-    const PAGED_ATTN: &str = include_str!("../../../targets/spyre/kernels/paged_attn.py");
-    const PAGED_KV_WRITE: &str = include_str!("../../../targets/spyre/kernels/paged_kv_write.py");
+    const PAGED_DECODE: &str =
+        include_str!("../../../targets/spyre/kernels/page_attn_head_major_decode.py");
+    const PAGED_PREFILL: &str =
+        include_str!("../../../targets/spyre/kernels/page_attn_head_major_prefill.py");
+    const PAGED_KV_WRITE: &str =
+        include_str!("../../../targets/spyre/kernels/reshape_and_cache_head_major.py");
     const ELEMENTWISE: &str = include_str!("../../../targets/spyre/kernels/elementwise.py");
     const LMLAST: &str = include_str!("../../../targets/spyre/kernels/lmlast.py");
     const MATMUL: &str = include_str!("../../../targets/spyre/kernels/matmul.py");
@@ -3109,7 +3159,7 @@ mod production_ktir_dump {
     };
 
     /// One entry per (kernel file, entry point) — the multi-entry files (`elementwise.py`,
-    /// `rmsnorm.py`, `windowedrmsnorm.py`, `matmul.py`, `paged_attn.py`) state every entry, so a
+    /// `rmsnorm.py`, `windowedrmsnorm.py`, `matmul.py`, `page_attn_head_major_*.py`) state every entry, so a
     /// guard that only one arm trips is itself covered.
     fn entries() -> Vec<(&'static str, &'static str, KernelSpec, Vec<i64>)> {
         // The whole-region pointwise constants every `blocks_of(1, c, live)` answers.
@@ -3454,68 +3504,76 @@ mod production_ktir_dump {
                 vec![1],
             ));
         }
-        // ── paged_attn.py: the decode walk (the query group folded into rows) and the prompt
-        // walk, at granite's head geometry over a four-page pool (`lower_attn`'s spec); and
-        // paged_kv_write.py: one decode token's write (`lower_kv_write`'s spec), at granite's 8
-        // kv heads (the scatter arm) and at 2 (the row-at-a-time arm, under the scatter's floor
-        // of 8 rows). Grid [1]. ──
-        let attn_ptrs: &[(&str, &str)] = &[
-            ("desc_q", "*fp16"),
-            ("desc_o", "*fp16"),
-            ("desc_kp", "*fp16"),
-            ("desc_vp", "*fp16"),
-            ("desc_pt", "*i32"),
-            ("desc_mask", "*fp16"),
-        ];
-        // ...plus the walk at granite-3.1-2b's own pool — `max_position_embeddings` 131072 in 512
+        // ── spyre-inference's paged step: `page_attn_head_major_decode` (one query row) and
+        // `page_attn_head_major_prefill` (a prompt chunk) at granite's head geometry over a four-page
+        // pool (`lower_attn`'s spec), and `reshape_and_cache_head_major`: one decode token's write
+        // (`lower_kv_write`'s spec) at granite's 8 kv heads and at 2. Grid [1]. ──
+        // ...plus the walk at granite-3.1-2b's own pool — `max_position_embeddings` 131072 in 2048
         // pages — decoding over the whole of it and a prompt chunk walking four pages, so the card
         // compile is checked at the extents a bake states, not only at a toy pool.
         for (name, mq, blocks, pages) in [
             ("paged_attn_decode", 1i128, 4i128, 4i128),
             ("paged_attn_prefill", 64, 1, 4),
-            ("paged_attn_decode_pool", 1, 512, 512),
-            ("paged_attn_prefill_walk", 64, 4, 512),
+            ("paged_attn_decode_pool", 1, 2048, 2048),
+            ("paged_attn_prefill_walk", 64, 4, 2048),
         ] {
-            v.push((
-                name,
-                PAGED_ATTN,
-                spec(
-                    "paged_attn.py",
-                    "paged_attn_fwd",
-                    attn_ptrs,
-                    &[
-                        ("MQ", Val::Int(mq)),
-                        ("NQH", Val::Int(32)),
-                        ("NKVH", Val::Int(8)),
-                        ("HD", Val::Int(64)),
-                        ("BLOCK", Val::Int(i128::from(PAGE_SLOTS))),
-                        ("NUM_PAGES", Val::Int(pages)),
-                        ("NUM_BLOCKS", Val::Int(blocks)),
-                        ("SCALE", Val::Float(0.125)),
-                    ],
-                ),
-                vec![1],
-            ));
+            let decode = mq == 1;
+            let mut ptrs: Vec<(&str, &str)> = vec![
+                ("query", "*fp16"),
+                ("query_row_index", "*i32"),
+                ("k_pages", "*fp16"),
+                ("v_pages", "*fp16"),
+                ("page_index_table", "*i32"),
+            ];
+            if decode {
+                ptrs.push(("kv_row_pool", "*i32"));
+            }
+            ptrs.extend([("mask_stack", "*fp16"), ("out", "*fp16")]);
+            let mut ces = vec![
+                ("NUM_TOKENS", Val::Int(mq)),
+                ("NUM_HEADS", Val::Int(32)),
+                ("NUM_KV_HEADS", Val::Int(8)),
+                ("HEAD_SIZE", Val::Int(64)),
+                ("BLOCK_SIZE", Val::Int(i128::from(PAGE_SLOTS))),
+                ("NUM_PAGES", Val::Int(pages)),
+                ("NUM_BLOCKS", Val::Int(blocks)),
+                ("SCALE", Val::Float(0.125)),
+            ];
+            let (src, file, entry) = if decode {
+                (
+                    PAGED_DECODE,
+                    "page_attn_head_major_decode.py",
+                    "page_attn_head_major_decode_kernel",
+                )
+            } else {
+                ces.push(("PADDED_QUERY_LEN", Val::Int(mq)));
+                (
+                    PAGED_PREFILL,
+                    "page_attn_head_major_prefill.py",
+                    "page_attn_head_major_prefill_kernel",
+                )
+            };
+            v.push((name, src, spec(file, entry, &ptrs, &ces), vec![1]));
         }
         for (name, nkvh) in [("paged_kv_write", 8i128), ("paged_kv_write_rows", 2)] {
             v.push((
                 name,
                 PAGED_KV_WRITE,
                 spec(
-                    "paged_kv_write.py",
-                    "paged_kv_write_fwd",
+                    "reshape_and_cache_head_major.py",
+                    "reshape_and_cache_head_major_kernel",
                     &[
-                        ("desc_k", "*fp16"),
-                        ("desc_v", "*fp16"),
-                        ("desc_kp", "*fp16"),
-                        ("desc_vp", "*fp16"),
-                        ("desc_rows", "*i32"),
+                        ("key", "*fp16"),
+                        ("value", "*fp16"),
+                        ("k_rows", "*fp16"),
+                        ("v_rows", "*fp16"),
+                        ("row_index", "*i32"),
                     ],
                     &[
                         ("T", Val::Int(1)),
-                        ("NKVH", Val::Int(nkvh)),
-                        ("HD", Val::Int(64)),
-                        ("POOL_ROWS", Val::Int(4 * nkvh * i128::from(PAGE_SLOTS))),
+                        ("NUM_KV_HEADS", Val::Int(nkvh)),
+                        ("HEAD_SIZE", Val::Int(64)),
+                        ("NUM_ROWS", Val::Int(4 * nkvh * i128::from(PAGE_SLOTS))),
                     ],
                 ),
                 vec![1],
@@ -3917,8 +3975,8 @@ mod production_ktir_dump {
     }
 }
 
-/// ⭐ THE PAGE WALK ON THE CARD — `paged_attn.py` at granite-3.1-2b's own pool (512 pages of 256
-/// slots, 32 query heads over 8 kv heads at head dim 64), through the card's walk lowering
+/// ⭐ THE PAGE WALK ON THE CARD — spyre-inference's page walk at granite-3.1-2b's own pool (2048 pages of
+/// [`PAGE_SLOTS`] slots, 32 query heads over 8 kv heads at head dim 64), through the card's walk lowering
 /// (`whole_function::lower_walk`): the loop becomes ONE body built at trip 0 that the card relaunches
 /// once per trip, and every fact of that relaunch is read off the program.
 #[cfg(test)]
@@ -3926,52 +3984,71 @@ mod walk_on_the_card {
     use super::*;
     use ktir_superdsc::emit::loop_fold::{WalkTrips, flatten};
 
-    const PAGED_ATTN: &str = include_str!("../../../targets/spyre/kernels/paged_attn.py");
-
     fn walk(mq: i128, blocks: i128) -> KtirNode {
+        let decode = mq == 1;
+        let row = if decode {
+            attn_decode_row()
+        } else {
+            attn_row()
+        };
+        let TritonKernelRow::Spliced {
+            src, file, entry, ..
+        } = row
+        else {
+            panic!("the attention rows are spliced");
+        };
         let mut signature = HashMap::new();
         let mut constexprs = HashMap::new();
-        for p in ["desc_q", "desc_o", "desc_kp", "desc_vp", "desc_mask"] {
+        for p in ["query", "k_pages", "v_pages", "mask_stack", "out"] {
             signature.insert(p.to_string(), ArgSpec::parse("*fp16").expect("spec"));
         }
-        signature.insert("desc_pt".to_string(), ArgSpec::parse("*i32").expect("spec"));
-        for (k, v) in [
-            ("MQ", mq),
-            ("NQH", 32),
-            ("NKVH", 8),
-            ("HD", 64),
-            ("BLOCK", i128::from(PAGE_SLOTS)),
-            ("NUM_PAGES", 512),
+        let mut ints = vec!["query_row_index", "page_index_table"];
+        if decode {
+            ints.push("kv_row_pool");
+        }
+        for p in ints {
+            signature.insert(p.to_string(), ArgSpec::parse("*i32").expect("spec"));
+        }
+        let mut sizes = vec![
+            ("NUM_TOKENS", mq),
+            ("NUM_HEADS", 32),
+            ("NUM_KV_HEADS", 8),
+            ("HEAD_SIZE", 64),
+            ("BLOCK_SIZE", i128::from(PAGE_SLOTS)),
+            ("NUM_PAGES", 2048),
             ("NUM_BLOCKS", blocks),
-        ] {
+        ];
+        if !decode {
+            sizes.push(("PADDED_QUERY_LEN", mq));
+        }
+        for (k, v) in sizes {
             signature.insert(k.to_string(), ArgSpec::Constexpr);
             constexprs.insert(k.to_string(), Val::Int(v));
         }
         signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
         constexprs.insert("SCALE".to_string(), Val::Float(0.125));
         let spec = KernelSpec {
-            kernel: "paged_attn_fwd".to_string(),
+            kernel: entry.to_string(),
             signature,
             constexprs,
-            file: "paged_attn.py".to_string(),
+            file: file.to_string(),
         };
-        let module = compile_kernel(PAGED_ATTN, &spec, &[1]).expect("the walk compiles");
+        let module = compile_kernel(src, &spec, &[1]).expect("the walk compiles");
         triton_ktir_superdsc::node_for(&module, Program::PagedAttn).expect("the walk mints")
     }
 
-    /// The walk's trips are its blocks, and ONE trip moves the page-table row and the mask tile by
-    /// the same card bytes — `ROWS` stick rows of the stick-major stack, `ROWS` int32 sticks of the
-    /// table — which is the one shift a relaunch applies.
+    /// The walk's trips are its blocks, and ONE trip moves the mask tile `[P, block]` — `P` stick rows
+    /// of the stick-major stack — and the page index table's row by the same card bytes, which is
+    /// the one shift a relaunch applies.
     #[test]
     fn the_walk_relaunches_its_body_once_per_block() {
-        for (mq, blocks) in [(1i128, 512i128), (64, 4)] {
+        for (mq, blocks) in [(1i128, 2048i128), (64, 4)] {
             let node = walk(mq, blocks);
             let flat = flatten(&node)
                 .expect("the walk flattens")
                 .expect("a multi-block walk states its loop");
-            let rows = mq as u32 * 4;
             assert_eq!(flat.fold.trips, blocks as u32, "mq={mq}");
-            assert_eq!(flat.fold.step_bytes, rows * 128, "mq={mq}");
+            assert_eq!(flat.fold.step_bytes, mq as u32 * 128, "mq={mq}");
             assert_eq!(
                 flat.fold.carried.len(),
                 3,
@@ -3994,18 +4071,45 @@ mod walk_on_the_card {
                     e.walk,
                     Some(WalkTrips {
                         trips: blocks as u32,
-                        step_bytes: rows * 128
+                        step_bytes: mq as u32 * 128
                     }),
                     "mq={mq}: {}",
                     e.op_name
                 );
                 assert!(e.kv_page_fold && e.kv_gathered, "mq={mq}: {}", e.op_name);
             }
-            // The carried buffers are seeded, and the body's constants filled, BEFORE the body: a
-            // relaunch shifts the segment the registry constants live in.
+            // The carried buffers are seeded, and the body's constants filled, BEFORE the body (a
+            // relaunch shifts the segment the registry constants live in) — beside the query's own
+            // `index_select`, which spyre-inference runs before its walk. The decode walk's
+            // constants include the int32 zero its `kv_row_pool` run is copied against, a fill
+            // converted to int32.
+            let int_zero = ["dl16tofp32", "fp32toint32"];
             assert!(
-                ops[..first].iter().all(|e| e.op_name.starts_with("fill")),
-                "mq={mq}: only fills precede the body"
+                ops[..first].iter().all(|e| {
+                    e.op_name.starts_with("fill")
+                        || e.op_name.starts_with("gather")
+                        || int_zero.iter().any(|c| e.op_name.starts_with(c))
+                }),
+                "mq={mq}: only fills, the int32 zero's converts and the query's gather precede the \
+                 body"
+            );
+            assert_eq!(
+                int_zero
+                    .iter()
+                    .all(|c| ops[..first].iter().any(|e| e.op_name.starts_with(c))),
+                mq == 1,
+                "mq={mq}: the int32 zero is made before the body exactly when the walk chains \
+                 `kv_row_pool`"
+            );
+            assert!(
+                ops[..first].iter().any(|e| e.op_name.starts_with("gather")),
+                "mq={mq}: the query's rows are gathered through `query_row_index`"
+            );
+            assert!(
+                ops[last + 1..]
+                    .iter()
+                    .any(|e| e.op_name.starts_with("scatter")),
+                "mq={mq}: the output rows are scattered through `query_row_index`"
             );
             assert!(
                 ops[first..=last]

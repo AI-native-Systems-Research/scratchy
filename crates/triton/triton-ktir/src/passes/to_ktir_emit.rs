@@ -622,6 +622,7 @@ fn opkind(k: &OpKind) -> Result<KOpKind> {
             // name -- that is the loud-by-design edge for a KERNEL; this arm is the parsed-
             // text and future-kernel surface.
             "arith.subi" => KOpKind::ArithSubi,
+            "arith.minsi" => KOpKind::ArithMinsi,
             "arith.extsi" => KOpKind::ArithExtsi,
             "arith.trunci" => KOpKind::ArithTrunci,
             "arith.ori" => KOpKind::ArithOri,

@@ -248,17 +248,17 @@ pub enum Program {
     /// The last-row extraction half of an lm-head tail — see [`KtirNode::node_out_tid`].
     LmLast,
     Rope,
-    /// PAGED ATTENTION — `kernels/paged_attn.py`, spyre-inference's head-major online-softmax
-    /// page walk: each active block's page id is read from the page table and its `(page, kv
-    /// head)` slab GATHERED from the K and V pools (`ktdp.construct_indirect_access_tile`
-    /// loads). Six parameters: `q`, `out`, the K pool, the V pool, the page table, the mask stack.
-    /// The door reads no fact off it; the paged form's SuperDSC lowering is the generic
-    /// whole-function route.
+    /// PAGED ATTENTION — `kernels/page_attn_head_major_decode.py` / `_prefill.py`, spyre-inference's
+    /// head-major online-softmax page walk: each active block's page is read from the page index
+    /// table and its K and V GATHERED from the pools (`ktdp.construct_indirect_access_tile` loads).
+    /// Their parameters, in their order: `query`, `query_row_index`, the K pool, the V pool, the
+    /// page index table, `kv_row_pool` (the decode kernel's), the mask stack, `out`. The paged form's
+    /// SuperDSC lowering is the generic whole-function route.
     PagedAttn,
-    /// THE PAGED KV CACHE WRITE — `kernels/paged_kv_write.py`, spyre-inference's
+    /// THE PAGED KV CACHE WRITE — `kernels/reshape_and_cache_head_major.py`, spyre-inference's
     /// `reshape_and_cache_head_major`: this step's K and V rows SCATTERED into the pools
-    /// (`ktdp.store` through an indirect access tile). Five parameters: the step's K, its V, the
-    /// K pool, the V pool, the destination-row table.
+    /// (`ktdp.store` through an indirect access tile). Their parameters: `key`, `value`, the K pool,
+    /// the V pool, the per-kv-head row index.
     PagedKvWrite,
     /// A 2-D BLOCK TRANSPOSE of a whole tensor — `[mb, out]` → `[out, mb]`, one
     /// `interslicetranspose_fp16` on the PT unit. See
@@ -447,6 +447,19 @@ impl Program {
     /// not meet (the walk's one-stick head dim). A card build declares them like everything else.
     pub const fn declares_on_emulator(self) -> bool {
         !matches!(self, Program::PagedAttn | Program::PagedKvWrite)
+    }
+
+    /// ⭐ THE PARAMETERS THAT ARE PAGED KV POOLS — a target-ABI fact of the paged step's two kernels
+    /// (spyre-inference's operand order: the K and V pools are parameters 2 and 3 of both). A pool
+    /// is written and read only as runs of whole sticks — the KV write's one-stick rows, the page
+    /// walk's gathered pages and `(page, kv head)` slabs — so its bytes are those runs in order, and
+    /// a gather of one of its rows is a contiguous run. Every other 2-D buffer is stick-major on the
+    /// card, its rows strided one stick column apart. Empty for every other program.
+    pub const fn paged_pool_params(self) -> &'static [usize] {
+        match self {
+            Program::PagedAttn | Program::PagedKvWrite => &[2, 3],
+            _ => &[],
+        }
     }
 }
 

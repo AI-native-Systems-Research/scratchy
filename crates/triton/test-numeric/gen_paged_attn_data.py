@@ -13,7 +13,7 @@ Python walk (`SPYRE_ATTN_FOR_EACH_TILE=0`), the same block body `for_each_tile` 
 
 Per config, into `<out-root>/<config>/`:
 
-  * the step's inputs, in the Triton kernels' own layouts (`paged_kv_write.py`, `paged_attn.py`):
+  * the step's inputs (the numeric test binds them as the Triton kernels' operands):
     `q.bin` `[MQ, NQH*HD]` f16, `k_new.bin`/`v_new.bin` `[T*NKVH, HD]` f16, `kp_pre.bin`/`vp_pre.bin`
     `[NUM_PAGES, NKVH, BLOCK, HD]` f16 (the pools before this step, holding the earlier context),
     `write_rows.bin` `[T*NKVH]` i32, `page_table.bin` `[NUM_BLOCKS, 32]` i32, `mask.bin`

@@ -11,7 +11,7 @@
 //! addresses memory through a value it LOADED, so the access is INDIRECT: it must lower to a
 //! `ktdp.store` through a `ktdp.construct_indirect_access_tile` whose row dim is addressed
 //! through the row table's memory view, every other dim direct. It is the spelling Triton leaves
-//! for a write under `desc.scatter`'s floor of 8 rows (`paged_kv_write.py`'s row-at-a-time arm).
+//! for a write under `desc.scatter`'s floor of 8 rows (`reshape_and_cache_head_major.py`'s row-at-a-time arm).
 
 use std::collections::HashMap;
 
@@ -113,10 +113,12 @@ def k(rows, x, pool, N: tl.constexpr):
     }
 }
 
-/// A loaded value may select ONE row block; a store several rows tall on the indirect axis would
-/// need one index per row, which is `tt.descriptor_scatter`.
+/// A loaded value selects ONE row block of an indirect tile; a store several rows tall at a loaded
+/// row writes the rows that start there (`out_tile.store([first, 0], attn)`, spyre-inference's
+/// prompt output under Triton's scatter floor of 8 rows): a DIRECT tile whose corner is the read
+/// value, the read lowered to a one-element load and its `tensor.extract`, and no indirect tile.
 #[test]
-fn a_data_offset_on_a_multi_row_store_is_refused_by_name() {
+fn a_data_offset_on_a_multi_row_store_is_a_direct_tile_at_the_read_row() {
     let src = r#"
 import triton
 import triton.language as tl
@@ -127,11 +129,16 @@ def k(rows, x, pool, N: tl.constexpr):
     row = tl.load(rows)
     pd.store([row, 0], xd.load([0, 0]))
 "#;
-    let Err(msg) = to_ktdp(src) else {
-        panic!("the ladder accepted a data offset on a multi-row store");
-    };
-    assert!(
-        msg.contains("tt.descriptor_store") && msg.contains("selects ONE slab"),
-        "refused for the wrong reason: {msg}"
+    let m = to_ktdp(src).unwrap_or_else(|e| panic!("the read-row store did not lower: {e}"));
+    assert_eq!(
+        count(&m, OpKind::KtdpConstructIndirectAccessTile),
+        0,
+        "the store writes the rows at the read offset, not a scatter"
+    );
+    assert_eq!(count(&m, OpKind::TtLoad), 0, "the scalar read is lowered");
+    assert_eq!(
+        count(&m, OpKind::Other("tensor.extract".into())),
+        1,
+        "the read value is extracted from its one-element load"
     );
 }

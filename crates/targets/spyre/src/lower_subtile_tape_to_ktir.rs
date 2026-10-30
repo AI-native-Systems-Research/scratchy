@@ -1322,11 +1322,12 @@ pub fn paged_step_of_ir<F: RopeForm>(
             mask: tids.mask,
             page_table: tids.page_table,
             write_rows: tids.write_rows,
+            query_rows: tids.query_rows,
+            kv_row_pool: tids.kv_row_pool,
             pages,
             page_slots: slots,
             rows: mq,
             nkvh: geom.nkvh().get(),
-            gqa: geom.gqa().get(),
             walk: scratchy_triton_splice::walk_pages(pages, mq, active_cap),
         };
         match out {

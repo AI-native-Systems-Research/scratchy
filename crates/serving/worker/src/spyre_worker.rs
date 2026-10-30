@@ -32,7 +32,6 @@ use std::path::Path;
 
 use crate::spyre_types::*;
 use scratchy_core_model::weight::HfModelConfig;
-use scratchy_subtile::sdsc_abstract::PagedKvPool;
 
 use crate::error::ExecutorError;
 use crate::worker::{Worker, WorkerConfig};
@@ -231,7 +230,7 @@ impl scratchy_serving_engine::worker_factory::WorkerFactory for SpyreWorkerFacto
     ///    so the free-list search that used to fill the map (a second allocator over the scheduler's own
     ///    pool) cannot be written again, and a hit hands both requests the same physical page.
     /// 2. **THE POOL AND THE ALLOCATOR AGREE ON THE PAGE SPACE.** `required_block_size` is the pool's
-    ///    `PAGE_SLOTS` and `kv_cache_num_blocks_override` is the pool's page count, so `block_id` IS a
+    ///    page and `kv_cache_num_blocks_override` is the pool's page count, so `block_id` IS a
     ///    page and no id can name one the pool lacks.
     /// 3. **THE HOST CACHES ONLY WHAT IS TOKEN-ADDRESSED.** A batched step appends every row at ONE slot,
     ///    so a request shorter than its batch-mates spreads its keys over more slots than it has tokens.
@@ -246,10 +245,13 @@ impl scratchy_serving_engine::worker_factory::WorkerFactory for SpyreWorkerFacto
     }
 
     /// The pool's page IS the KV block, so the scheduler's `slot = block_id * block_size + offset` and
-    /// the worker's page map address the same cells. Sourced from the pool constant — the literal `64`
-    /// this used to be in `effective_block_size` described a pool that no longer exists.
+    /// the worker's page map address the same cells. Sourced from the page the forward's attention
+    /// walks (`paged_step::PAGE_SLOTS`, its kernels' `BLOCK_SIZE`), the one constant the bake sized
+    /// the pools by.
     fn required_block_size(&self) -> Option<scratchy_core_common::KvBlockTokens> {
-        scratchy_core_common::KvBlockTokens::new(PagedKvPool::PAGE_SLOTS)
+        scratchy_core_common::KvBlockTokens::new(
+            scratchy_target_spyre::paged_step::PAGE_SLOTS as usize,
+        )
     }
 
     fn create(

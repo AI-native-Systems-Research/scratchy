@@ -2006,14 +2006,17 @@ impl<'a> CodeGen<'a> {
         let (mangle_args, def_line, combiner, widen_to): (Vec<Val>, u32, &str, Option<Type>) =
             match which {
                 // max(input, axis, return_indices=False, return_indices_tie_break_left=True,
-                //     keep_dims=False)
-                "max" => {
+                //     keep_dims=False), and `min` (`standard.py:236`), its mirror through
+                // `_elementwise_min`.
+                "max" | "min" => {
                     let ri = kwv("return_indices").unwrap_or(Val::Bool(false));
                     if ri.as_int() != Some(0) {
                         return Err(Error::new(
-                            "tl.max(..., return_indices=True) is not lowered: it uses \
-                             `_reduce_with_indices` and a two-value combiner, and no fixture \
-                             uses it",
+                            format!(
+                                "tl.{which}(..., return_indices=True) is not lowered: it uses \
+                                 `_reduce_with_indices` and a two-value combiner, and no \
+                                 fixture uses it"
+                            ),
                             pos.line,
                             pos.col,
                         ));
@@ -2025,10 +2028,15 @@ impl<'a> CodeGen<'a> {
                         Type::Int(b, _) if *b < 32 => Some(Type::i32()),
                         _ => None,
                     };
+                    let (def_line, combiner) = if which == "max" {
+                        (177, "_elementwise_max")
+                    } else {
+                        (236, "_elementwise_min")
+                    };
                     (
                         vec![Val::Int(axis_i as i128), ri, tb, keep_dims.clone()],
-                        177,
-                        "_elementwise_max",
+                        def_line,
+                        combiner,
                         widen,
                     )
                 }
@@ -2212,10 +2220,10 @@ impl<'a> CodeGen<'a> {
         if self.generated.contains(&symbol) {
             return Ok(symbol);
         }
-        let def_line = if which == "_elementwise_max" {
-            169
-        } else {
-            262
+        let def_line = match which {
+            "_elementwise_max" => 169,
+            "_elementwise_min" => 228,
+            _ => 262,
         };
         let std_py: std::rc::Rc<str> = std::rc::Rc::from(STANDARD_PY);
         let func_loc = Loc::File {
@@ -2237,6 +2245,10 @@ impl<'a> CodeGen<'a> {
             "_elementwise_max" => self
                 .sem
                 .max_min(&Val::Ir(a), &Val::Ir(b), true)
+                .map_err(|e| Self::located(e, pos))?,
+            "_elementwise_min" => self
+                .sem
+                .max_min(&Val::Ir(a), &Val::Ir(b), false)
                 .map_err(|e| Self::located(e, pos))?,
             _ => self
                 .sem
@@ -2748,7 +2760,7 @@ impl<'a> CodeGen<'a> {
             // `tl.max` / `tl.sum` are `@jit` helpers in `standard.py`, so each becomes a call
             // to a generated function whose body is a `tt.reduce` with a combiner region that
             // itself calls another generated helper.
-            "max" | "sum" => {
+            "max" | "min" | "sum" => {
                 let input = self.ir_arg(&get(0, "input"), &format!("tl.{name}"), pos)?;
                 let axis = get(1, "axis");
                 self.call_std_reduction(name, input, axis, kw, pos)

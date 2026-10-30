@@ -239,7 +239,35 @@ pub struct Gather {
     /// reads: a TID comparison cannot prove it (a plain load of the same table resolves to the
     /// same tid), the load's own SSA can.
     pub load: Ssa,
+    /// ⭐ WHEN THE RUN'S POSITION IS ITSELF READ THROUGH A TABLE — spyre-inference's decode gather
+    /// `k_pages[kv_row_pool.index_select(0, page_index[0, 0:1])]`: the index view is `kv_row_pool`
+    /// and the run starts at `page · scale`, `page` read from the page table. `None` for a run whose
+    /// start is a constant ([`Gather::first_entry`]).
+    pub via: Option<ChainedIndex>,
 }
+
+/// ⭐ A CHAINED INDEX — a gather's run of index words starts at `position · scale`, the position read
+/// from entry `via_entry` of `via_tid`. The card runs it as the two gathers it is: one entry of the
+/// index table (the run, [`INDEX_RUN_WORDS`] per position) copied through `via_tid` into a scratch,
+/// then the gather through the scratch — the two device ops torch-spyre runs for the same two
+/// subscripts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainedIndex {
+    /// The parameter the position is read from.
+    pub via_tid: u32,
+    /// The entry of `via_tid` holding the position.
+    pub via_entry: crate::superdsc_opspec::EntryBase,
+    /// Index words per position: position `p`'s run is the words `p · scale ..`.
+    pub scale: u32,
+}
+
+/// ⭐ THE CARD WIDTH OF ONE POSITION'S INDEX RUN, in int32 words — what a chained index's first
+/// gather copies per position ([`index_run_gather`]), and so the pitch the index table holds each
+/// position's run at on the card. The copy is `zero + run` (dxp binds no int32 `identity`), and the
+/// int32 zero is made by the converts, which sweep the 64-element device width
+/// ([`DeviceWidth::for_convert`](crate::work::DeviceWidth::for_convert)); one tensor has one
+/// arrangement, so the run is that width too: two SENUINT32 sticks, the run's words in the first.
+pub const INDEX_RUN_WORDS: u32 = crate::work::FP16_ELEMS_PER_STICK;
 
 /// [`Gather`] for this program, or `None` when it states no indirect access.
 ///
@@ -340,11 +368,14 @@ pub fn gathers_of(k: &KtirNode) -> Result<Vec<Gather>, Error> {
         // The constructor IS the stick-alignment check (issue 201 item 1): an anchor that is
         // not a whole `SenUint32` stick into the index buffer refuses HERE, at the walk,
         // before any descriptor exists — on both the uncut and the cut arm.
+        let (anchor, via) = match chained_index_of(k, tile, &consts)? {
+            Some(chain) => (0, Some(chain)),
+            None => (indirect_tile_anchor(k, tile, &consts)?, None),
+        };
         let first_entry =
-            crate::superdsc_opspec::EntryBase::of_entries(indirect_tile_anchor(k, tile, &consts)?)
-                .map_err(|msg| Error {
-                    message: format!("{}: {msg}", f.name),
-                })?;
+            crate::superdsc_opspec::EntryBase::of_entries(anchor).map_err(|msg| Error {
+                message: format!("{}: {msg}", f.name),
+            })?;
         // ⭐ NO CROSS-TILE PAIR CHECK — deliberately. The one-index law is per DESCRIPTOR, and the
         // walk below joins each op to its own tile by load identity, so two tiles over different
         // pairs are two descriptors each carrying one index operand — the batched paged-decode
@@ -392,6 +423,7 @@ pub fn gathers_of(k: &KtirNode) -> Result<Vec<Gather>, Error> {
             first_entry,
             tile: tv,
             load,
+            via,
         });
     }
     Ok(out)
@@ -515,6 +547,317 @@ fn indirect_tile_anchor(
     Ok(anchor as u32)
 }
 
+/// ⭐ THE CHAINED INDEX an indirect tile states, if its run starts at a position read from a table:
+/// the indirect dim's `Sym(0) + Dim(0)` subscript with `Sym(0)` the value
+///
+/// ```text
+///   index_cast( muli( tensor.extract( ktdp.load( construct_access_tile %table[c] ) ), scale ) )
+/// ```
+///
+/// (`muli` absent at scale 1), `c` a constant entry of the table's view. `None` when the subscript's
+/// symbol is a constant or not this chain — [`indirect_tile_anchor`] then reads it, and names any
+/// other form.
+fn chained_index_of(
+    k: &KtirNode,
+    tile: &Operation<'_>,
+    consts: &std::collections::HashMap<Ssa, i64>,
+) -> Result<Option<ChainedIndex>, Error> {
+    let f = &k.func;
+    let (Some(Attr::StrList(kinds)), Some(Attr::Ssas(vars)), Some(Attr::AffineMapList(subs))) = (
+        tile.attr(AttrKey::DimKinds),
+        tile.attr(AttrKey::IntermediateVars),
+        tile.attr(AttrKey::DimSubs),
+    ) else {
+        return Ok(None);
+    };
+    let Some(d) = kinds.iter().position(|k| *k == "indirect") else {
+        return Ok(None);
+    };
+    let sym = match subs.get(d).and_then(|m| m.exprs.first()) {
+        Some(AffineExpr::Add(a, b)) => match (a, b) {
+            (AffineExpr::Sym(i), AffineExpr::Dim(0)) | (AffineExpr::Dim(0), AffineExpr::Sym(i)) => {
+                vars.get(*i).copied()
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(sym) = sym.filter(|v| !consts.contains_key(v)) else {
+        return Ok(None);
+    };
+    let def = |v: Ssa| f.operations.iter().find(|o| o.result == Some(v));
+    let Some(cast) = def(sym).filter(|o| o.op_type == OpKind::ArithIndexCast) else {
+        return Ok(None);
+    };
+    let Some(mut v) = cast.operands.first().copied() else {
+        return Ok(None);
+    };
+    let mut scale = 1i64;
+    if let Some(mul) = def(v).filter(|o| o.op_type == OpKind::ArithMuli) {
+        let (Some(&a), Some(&b)) = (mul.operands.first(), mul.operands.get(1)) else {
+            return Ok(None);
+        };
+        let (x, c) = match (consts.get(&a), consts.get(&b)) {
+            (_, Some(&c)) => (a, c),
+            (Some(&c), _) => (b, c),
+            _ => return Ok(None),
+        };
+        scale = c;
+        v = x;
+    }
+    let Some(extract) = def(v).filter(|o| o.op_type == OpKind::TensorExtract) else {
+        return Ok(None);
+    };
+    let Some(load) = extract
+        .operands
+        .first()
+        .and_then(|&l| def(l))
+        .filter(|o| o.op_type == OpKind::KtdpLoad)
+    else {
+        return Ok(None);
+    };
+    let Some(read) = load
+        .operands
+        .first()
+        .and_then(|&t| def(t))
+        .filter(|o| o.op_type == OpKind::KtdpConstructAccessTile)
+    else {
+        return Ok(None);
+    };
+    let entry = read.operands.get(1).and_then(|c| consts.get(c)).copied();
+    let Some(entry) = entry.filter(|e| (0..=i64::from(u32::MAX)).contains(e)) else {
+        return err(format!(
+            "{}: a chained gather reads its position from a table entry this walk cannot fold to              a constant, so which entry the card reads it from is unknown",
+            f.name
+        ));
+    };
+    let scale = u32::try_from(scale).ok().filter(|s| (1..=32).contains(s)).ok_or_else(|| Error {
+        message: format!(
+            "{}: a chained gather's run is {scale} index words per position — the card copies a              position's run as ONE int32 stick, so a run must be 1..=32 words",
+            f.name
+        ),
+    })?;
+    let via_tid = indirect_tile_param(k, read, 0, "position table")?;
+    let via_entry =
+        crate::superdsc_opspec::EntryBase::of_entries(entry as u32).map_err(|msg| Error {
+            message: format!("{}: the chained gather's position entry: {msg}", f.name),
+        })?;
+    Ok(Some(ChainedIndex {
+        via_tid,
+        via_entry,
+        scale,
+    }))
+}
+
+/// ⭐ A ROW SCATTER OF A COMPUTED VALUE — `entries` rows written to the rows of `value_tid` that
+/// `index_tid` names from `first_entry` on, each `cols` wide (spyre-inference's
+/// `out.index_copy_(0, query_row_index, attn)`).
+#[derive(Clone, Copy, Debug)]
+pub struct RowScatter {
+    pub index_tid: u32,
+    pub value_tid: u32,
+    pub entries: u32,
+    pub first_entry: crate::superdsc_opspec::EntryBase,
+    pub cols: u32,
+    /// The destination view's rows — its stick columns sit this many sticks apart.
+    pub value_rows: u32,
+}
+
+/// The [`RowScatter`] an indirect store tile states.
+pub fn row_scatter_of(k: &KtirNode, tile: &Operation<'_>) -> Result<RowScatter, Error> {
+    let f = &k.func;
+    let consts = index_constants(f);
+    let value_tid = indirect_tile_param(k, tile, 0, "scattered")?;
+    let index_tid = indirect_tile_param(k, tile, 1, "index")?;
+    let (entries, cols) = shape_2d(tile).ok_or_else(|| Error {
+        message: format!(
+            "{}: the scatter's indirect tile states no 2-D `shape`, so how many rows it writes is \
+             unknown",
+            f.name
+        ),
+    })?;
+    let first_entry =
+        crate::superdsc_opspec::EntryBase::of_entries(indirect_tile_anchor(k, tile, &consts)?)
+            .map_err(|msg| Error {
+                message: format!("{}: {msg}", f.name),
+            })?;
+    let value_rows = tile
+        .operands
+        .first()
+        .and_then(|&v| f.operations.iter().find(|o| o.result == Some(v)))
+        .and_then(|v| v.result_type)
+        .and_then(|t| t.dims())
+        .and_then(|d| d.first().copied())
+        .ok_or_else(|| Error {
+            message: format!(
+                "{}: the scatter's destination view states no rows, so where its stick columns \
+                 sit is unknown",
+                f.name
+            ),
+        })? as u32;
+    Ok(RowScatter {
+        index_tid,
+        value_tid,
+        entries,
+        first_entry,
+        cols,
+        value_rows,
+    })
+}
+
+/// ⭐ ONE STICK COLUMN AT A TIME — how rows of a stick-major `[a_rows, cols]` buffer move through an
+/// index into (or out of) a stick-major `[b_rows, cols]` one. Stick column `j` of row `r` sits at
+/// `(j · rows + r) · stick`, so a row's sticks are `rows` sticks apart and no index entry names a
+/// whole row; column `j`'s sticks are one contiguous run, so each column moves as its own copy, one
+/// stick per entry, from each side's own column base. When both sides are ONE row, the row is one
+/// contiguous run on both and moves whole. `(a base, b base, sticks per entry)` per copy, in
+/// elements.
+fn stick_columns(a_rows: u32, b_rows: u32, cols: u32) -> Vec<(u32, u32, u32)> {
+    let stick = Fp16::ELEMS_PER_STICK;
+    if a_rows == 1 && b_rows == 1 {
+        return vec![(0, 0, cols / stick)];
+    }
+    (0..cols / stick)
+        .map(|j| (j * a_rows * stick, j * b_rows * stick, 1))
+        .collect()
+}
+
+/// [`RowScatter`]'s card form: the stick-major `[entries, cols]` rows of `src` written through the
+/// index onto the stick-major destination's rows ([`stick_columns`]), one scatter per stick column and
+/// per 32 index entries — the KV write's own scatter ([`paged_kv_write`]).
+pub fn row_scatter(
+    name: &str,
+    src: &Region,
+    sc: RowScatter,
+    dst_rows: u32,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let stick = Fp16::ELEMS_PER_STICK;
+    if sc.cols == 0 || !sc.cols.is_multiple_of(stick) {
+        return err(format!(
+            "{name}: a scatter of {}-wide rows — a scattered row is a whole number of \
+             {stick}-element sticks",
+            sc.cols
+        ));
+    }
+    if (src.v_rows, src.v_cols) != (sc.entries, sc.cols) {
+        return err(format!(
+            "{name}: the scattered value is `[{}, {}]` and the store writes {} rows of {}",
+            src.v_rows, src.v_cols, sc.entries, sc.cols
+        ));
+    }
+    let per_op = <SenUint32 as DataFormat>::ELEMS_PER_STICK;
+    let (src_name, dst_name, index_name) = (
+        src.name(),
+        crate::place::act_name(sc.value_tid),
+        crate::place::act_name(sc.index_tid),
+    );
+    let mut ops = Vec::new();
+    for (c, (src_base, dst_base, page_sticks)) in stick_columns(sc.entries, dst_rows, sc.cols)
+        .into_iter()
+        .enumerate()
+    {
+        let page = crate::superdsc_opspec::PageExtent::of_positions(page_sticks);
+        for (i, first) in (0..sc.entries).step_by(per_op as usize).enumerate() {
+            let entries = per_op.min(sc.entries - first);
+            let base =
+                crate::superdsc_opspec::EntryBase::of_entries(sc.first_entry.entries() + first)
+                    .map_err(|message| Error {
+                        message: format!("{name}: {message}"),
+                    })?;
+            let scatter = crate::superdsc_opspec::GatherIndex::of_scratch_rows(
+                index_name.clone(),
+                page,
+                base,
+            );
+            let op = crate::ir::bridge::tiled_op_sdsc_op::assemble_scatter_copy(
+                &format!("scatter{c}_{i}_o{}", sc.value_tid),
+                &src_name,
+                &dst_name,
+                scatter,
+                crate::ir::bridge::tiled_op_sdsc_op::ScatterCopySpec {
+                    rows: entries * page_sticks,
+                    cols: stick,
+                    df: Df::Fp16,
+                    src_elems: src_base + first * page_sticks * stick,
+                    dst_elems: dst_base,
+                },
+                sym_id_base,
+                layout,
+            )
+            .map_err(|message| Error { message })?;
+            ops.push(op);
+        }
+    }
+    Ok(ops)
+}
+
+/// ⭐ A ROW GATHER FROM A STICK-MAJOR TABLE — `g.entries` rows of the `[table_rows, cols]` table
+/// through the index, landed stick-major `[g.entries, cols]` in `out` ([`stick_columns`]): one gather
+/// per stick column and per 32 index entries, each moving one stick per entry from the column's own
+/// base (spyre-inference's `query.index_select(0, query_row_index)`).
+pub fn row_gather(
+    name: &str,
+    g: &Gather,
+    table_rows: u32,
+    cols: u32,
+    out: &Region,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    use crate::ir::bridge::tiled_op_sdsc_op::{
+        GatheredWords, PageGatherRows, assemble_page_gather_copy,
+    };
+    let stick = Fp16::ELEMS_PER_STICK;
+    if cols == 0 || !cols.is_multiple_of(stick) || (out.v_rows, out.v_cols) != (g.entries, cols) {
+        return err(format!(
+            "{name}: a gather of {} {cols}-wide rows into t{} `[{}, {}]` — a gathered row is a whole \
+             number of {stick}-element sticks, landed at its own shape",
+            g.entries, out.tid, out.v_rows, out.v_cols
+        ));
+    }
+    let per_op = <SenUint32 as DataFormat>::ELEMS_PER_STICK;
+    let mut ops = Vec::new();
+    for (c, (src_base, dst_base, page_sticks)) in stick_columns(table_rows, g.entries, cols)
+        .into_iter()
+        .enumerate()
+    {
+        for (i, first) in (0..g.entries).step_by(per_op as usize).enumerate() {
+            let entries = per_op.min(g.entries - first);
+            let base =
+                crate::superdsc_opspec::EntryBase::of_entries(g.first_entry.entries() + first)
+                    .map_err(|message| Error {
+                        message: format!("{name}: {message}"),
+                    })?;
+            let gather = crate::superdsc_opspec::GatherIndex::of_scratch_rows(
+                crate::place::act_name(g.index_tid),
+                crate::superdsc_opspec::PageExtent::of_positions(page_sticks),
+                base,
+            );
+            let op = assemble_page_gather_copy(
+                &format!("gather{c}_{i}_o{}", out.tid),
+                &crate::place::act_name(g.value_tid),
+                &out.name(),
+                gather,
+                PageGatherRows {
+                    rows: entries * page_sticks,
+                    words: GatheredWords::Fp16,
+                    src_elems: src_base,
+                    dst_elems: dst_base + first * page_sticks * stick,
+                },
+                sym_id_base,
+                layout,
+            )
+            .map_err(|message| Error {
+                message: format!("{name}: {message}"),
+            })?;
+            ops.push(op);
+        }
+    }
+    Ok(ops)
+}
+
 /// Whether a `ktdp.store` writes THROUGH the value `tile` — the tile is then a scatter's destination.
 fn stored_through(f: &IRFunction<'static>, tile: Option<Ssa>) -> bool {
     tile.is_some_and(|t| {
@@ -541,8 +884,11 @@ pub struct Scatter {
     /// Where this store's run of entries starts in the index buffer, in entries — any entry: a
     /// per-row store writes one row at its own entry, and [`paged_kv_write`] coalesces the runs.
     pub first_entry: u32,
-    /// Where this store's rows start in the source: the corner of the load that produced them.
-    pub src_row: u32,
+    /// Where this store's rows start in the source, in the source's own STICKS: the source is
+    /// stick-major `[rows, cols]`, so the one-stick row at `(r, c)` is stick `(c / stick) · rows + r`
+    /// — spyre-inference's `key[:, h]` row `t` is stick `h · T + t`, which is where their head-major
+    /// `kv_write_index` puts its entry.
+    pub src_stick: u32,
 }
 
 /// [`Scatter`] for every `ktdp.store` the program makes through an indirect access tile.
@@ -628,25 +974,41 @@ pub fn scatters_of(k: &KtirNode) -> Result<Vec<Scatter>, Error> {
         let src_tid = k.bindings.get(i).map(|b| b.get()).ok_or_else(|| Error {
             message: format!("{}: parameter {i} has no bound buffer", f.name),
         })?;
-        let src_row = src_tile
-            .operands
-            .get(1)
-            .and_then(|r| consts.get(r).copied())
-            .and_then(|r| u32::try_from(r).ok())
-            .ok_or_else(|| Error {
-            message: format!(
-                "{}: the scatter's source tile states no constant row corner, so which source rows \
-                 it writes is unknown",
+        let corner = |slot: usize| {
+            src_tile
+                .operands
+                .get(slot)
+                .and_then(|r| consts.get(r).copied())
+                .and_then(|r| u32::try_from(r).ok())
+        };
+        let (Some(src_row), Some(src_col)) = (corner(1), corner(2)) else {
+            return err(format!(
+                "{}: the scatter's source tile states no constant corner, so which source rows it \
+                 writes is unknown",
                 f.name
-            ),
-        })?;
+            ));
+        };
+        let stick = Fp16::ELEMS_PER_STICK;
+        let view_rows = src_view
+            .result_type
+            .and_then(|t| t.dims())
+            .and_then(|d| d.first().copied())
+            .unwrap_or(0) as u32;
+        let tile_cols = shape_2d(src_tile).map(|(_, c)| c);
+        if tile_cols != Some(stick) || !src_col.is_multiple_of(stick) {
+            return err(format!(
+                "{}: the scatter's source rows are {tile_cols:?} wide at column {src_col} — a \
+                 scattered row is ONE {stick}-element stick of the source, its own head",
+                f.name
+            ));
+        }
         out.push(Scatter {
             index_tid,
             value_tid,
             src_tid,
             entries,
             first_entry,
-            src_row,
+            src_stick: (src_col / stick) * view_rows + src_row,
         });
     }
     Ok(out)
@@ -658,7 +1020,7 @@ pub fn scatters_of(k: &KtirNode) -> Result<Vec<Scatter>, Error> {
 struct RunPiece {
     entry: u32,
     rows: u32,
-    src_row: u32,
+    src_stick: u32,
 }
 
 /// The stores of one `(source, pool, table)` triple — one run of rows [`paged_kv_write`] cuts into
@@ -669,17 +1031,19 @@ struct ScatterRun {
 }
 
 /// ⭐⭐⭐ THE PAGED KV WRITE ON THE CARD — spyre-inference's `reshape_and_cache_head_major`
-/// (`kernels/paged_kv_write.py`) as hardware scatters: every row of the step's K (and V) lands in its
+/// (`kernels/reshape_and_cache_head_major.py`) as hardware scatters: every row of the step's K (and V) lands in its
 /// pool at the row the write-rows table names, through the index registers.
 ///
 /// The program states the write as `ktdp.store`s through indirect access tiles ([`scatters_of`]):
-/// one store per pool at eight rows or more, one per row below Triton's scatter floor. The card's
-/// scatter has no floor, but its index is loaded one 32-entry stick per op, so the stores of one
-/// (source, pool, table) triple are COALESCED back into the one run the program describes — rows
-/// `0..n` of the source to entries `0..n` of the table — and that run is cut into ops of one index
-/// stick each ([`assemble_scatter_copy`], the vendor's `test_scatter_1core` shape). A store that does
-/// not continue the run (a row written at an entry other than its own position) is refused by name:
-/// the copy moves source row `j` through entry `j`, and nothing else.
+/// one store per kv head per pool (`k_rows.index_copy_(0, idx, key[:, h])`) at eight rows or more,
+/// one per row below Triton's scatter floor. Each stored row is one stick of the stick-major source
+/// (`key[:, h]` row `t` is its stick `h · T + t`), and spyre-inference's head-major
+/// `kv_write_index` puts that row at entry `h · T + t` — so source stick and index entry advance
+/// together across every store of one (source, pool, table) triple, and the stores COALESCE into
+/// one run: sticks `s0..s0 + n` of the source through entries `e0..e0 + n` of the table, cut into
+/// ops of one index stick each ([`assemble_scatter_copy`], the vendor's `test_scatter_1core`
+/// shape). A store that does not continue the run is refused by name: the copy moves source stick
+/// `s0 + j` through entry `e0 + j`, and nothing else.
 pub fn paged_kv_write(
     name: &str,
     k: &KtirNode,
@@ -707,7 +1071,7 @@ pub fn paged_kv_write(
         let piece = RunPiece {
             entry: sc.first_entry,
             rows: sc.entries,
-            src_row: sc.src_row,
+            src_stick: sc.src_stick,
         };
         match runs.iter_mut().find(|r| r.key == key) {
             Some(r) => r.pieces.push(piece),
@@ -724,48 +1088,58 @@ pub fn paged_kv_write(
     } in runs
     {
         pieces.sort_unstable();
-        let mut next = 0u32;
+        let (e0, s0) = pieces
+            .first()
+            .map(|p| (p.entry, p.src_stick))
+            .unwrap_or_default();
+        let mut next = e0;
         for &RunPiece {
             entry,
             rows,
-            src_row,
+            src_stick,
         } in &pieces
         {
-            if entry != next || src_row != entry {
+            if entry != next || src_stick - s0 != entry - e0 {
                 return err(format!(
-                    "{name}: a store writes source rows {src_row}.. through index entries {entry}.. \
-                     where the run so far ends at {next} — the card's scatter copies source row `j` \
-                     through entry `j`, so the program's stores must tile rows `0..n` in order"
+                    "{name}: a store writes source sticks {src_stick}.. through index entries \
+                     {entry}.. where the run so far ends at {next} — the card's scatter copies \
+                     source stick `{s0} + j` through entry `{e0} + j`, so the program's stores must \
+                     tile the run in order"
                 ));
             }
             next += rows;
         }
-        let total = next;
+        let total = next - e0;
         let (src, pool, index) = (region(src_tid)?, region(pool_tid)?, region(index_tid)?);
-        let hd = pool.v_cols;
-        if src.v_cols != hd || hd == 0 || !hd.is_multiple_of(stick) {
+        if pool.v_cols != stick {
             return err(format!(
-                "{name}: the source t{src_tid} rows are {} wide and the pool t{pool_tid}'s {hd} — a \
-                 KV row is the same whole number of {stick}-element sticks on both sides",
-                src.v_cols
+                "{name}: the pool t{pool_tid} is written as {}-wide rows — a KV row is ONE \
+                 {stick}-element stick, one kv head's slot (`kv_slot_views`)",
+                pool.v_cols
             ));
         }
-        if total > src.v_rows {
+        if s0 + total > src.v_rows * (src.v_cols / stick) {
             return err(format!(
-                "{name}: the stores write {total} rows of t{src_tid}, whose view holds {}",
-                src.v_rows
+                "{name}: the stores write sticks {s0}..{} of t{src_tid}, whose view holds {}",
+                s0 + total,
+                src.v_rows * (src.v_cols / stick)
             ));
         }
-        // One index entry is one pool row: `hd / stick` one-stick sub-rows.
-        let page = crate::superdsc_opspec::PageExtent::of_positions(hd / stick);
+        let page = crate::superdsc_opspec::PageExtent::of_positions(1);
         let per_op = <SenUint32 as DataFormat>::ELEMS_PER_STICK;
         let (src_name, pool_name, index_name) = (src.name(), pool.name(), index.name());
         for (i, first) in (0..total).step_by(per_op as usize).enumerate() {
             let entries = per_op.min(total - first);
+            let base =
+                crate::superdsc_opspec::EntryBase::of_entries(e0 + first).map_err(|message| {
+                    Error {
+                        message: format!("{name}: {message}"),
+                    }
+                })?;
             let scatter = crate::superdsc_opspec::GatherIndex::of_scratch_rows(
                 index_name.clone(),
                 page,
-                crate::superdsc_opspec::EntryBase::of_sticks(i as u32),
+                base,
             );
             let op = crate::ir::bridge::tiled_op_sdsc_op::assemble_scatter_copy(
                 &format!("kvwrite{i}_o{pool_tid}"),
@@ -773,10 +1147,11 @@ pub fn paged_kv_write(
                 &pool_name,
                 scatter,
                 crate::ir::bridge::tiled_op_sdsc_op::ScatterCopySpec {
-                    rows: entries * (hd / stick),
+                    rows: entries,
                     cols: stick,
                     df: Df::Fp16,
-                    src_elems: first * hd,
+                    src_elems: (s0 + first) * stick,
+                    dst_elems: 0,
                 },
                 sym_id_base,
                 layout,
@@ -2407,10 +2782,50 @@ fn elementwise_broadcast(
     // contiguous `[rows, stick]` block `j·rows·stick` in, and a wider `out` dim would stride past
     // the rows the source occupies. So a multi-stick spray is its stick columns, each exactly that
     // one-stick form: the walk's mask tile `[ROWS, BLOCK]`, sprayed over every kv head's rows.
+    // ⭐ AND A ROW VECTOR THAT IS ONE ROW OF A MULTI-ROW STICK-MAJOR VIEW is that spray at one row per
+    // spray: its sticks sit a whole row-block apart, so no flat row presents it, and each column
+    // reads its one stick at the row's own offset (spyre-inference's decode mask tile, row `i` of the
+    // `[num_blocks, block]` stack, added to every kv head's scores).
+    // ⭐ A ROW-SPLIT SOURCE THAT IS A WINDOW OF ITS VIEW goes the same way at any width: the split
+    // law below addresses the source's whole view, and the column-wise spray addresses its window
+    // (spyre-inference's prompt mask tile, rows `i · P..(i + 1) · P` of the `[num_blocks · P,
+    // block]` stack).
+    let lanes = df.elems_per_stick();
+    if out.c_len > lanes
+        && ins
+            .iter()
+            .zip(bcast)
+            .any(|(x, b)| matches!(b, Some(BcastAxis::Mb)) && x.v_rows > 1 && x.v_cols > lanes)
+    {
+        let as_rows: Vec<Option<BcastAxis>> = bcast
+            .iter()
+            .map(|b| match b {
+                Some(BcastAxis::Mb) => Some(BcastAxis::Y(rows)),
+                other => *other,
+            })
+            .collect();
+        return elementwise_y_by_column(
+            BcastReq {
+                name,
+                what,
+                op_func,
+                ins,
+                out,
+                bcast: &as_rows,
+                df,
+            },
+            (rows, rows),
+            sym_id_base,
+            layout,
+        );
+    }
     if let Some(y) = bcast.iter().find_map(|b| match b {
         Some(BcastAxis::Y(y)) => Some(*y),
         _ => None,
-    }) && out.c_len > df.elems_per_stick()
+    }) && (out.c_len > lanes
+        || ins.iter().zip(bcast).any(|(x, b)| {
+            matches!(b, Some(BcastAxis::Y(_))) && (x.r_start, x.r_len) != (0, x.v_rows)
+        }))
     {
         return elementwise_y_by_column(
             BcastReq {
@@ -5460,7 +5875,9 @@ pub fn page_gather(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
-    use crate::ir::bridge::tiled_op_sdsc_op::{PageGatherRows, assemble_page_gather_copy};
+    use crate::ir::bridge::tiled_op_sdsc_op::{
+        GatheredWords, PageGatherRows, assemble_page_gather_copy,
+    };
     let gather = crate::superdsc_opspec::GatherIndex::of_scratch_rows(
         crate::place::act_name(g.index_tid),
         crate::superdsc_opspec::PageExtent::of_positions(page_sticks),
@@ -5473,7 +5890,62 @@ pub fn page_gather(
         gather,
         PageGatherRows {
             rows: g.entries * page_sticks,
-            df: Df::Fp16,
+            words: GatheredWords::Fp16,
+            src_elems: 0,
+            dst_elems: 0,
+        },
+        sym_id_base,
+        layout,
+    )
+    .map_err(|message| Error {
+        message: format!("{name}: {message}"),
+    })?;
+    Ok(vec![op])
+}
+
+/// ⭐ A CHAINED INDEX'S FIRST GATHER — the run of `g`'s index words for one position, copied into
+/// the one-stick scratch `run` through entry `chain.via_entry` of the position table: the index table
+/// (`g.index_tid`, one stick per position on the card) is the gathered value, the position its
+/// index. The gather proper then reads its index words from `run` ([`ChainedIndex`]). The words are
+/// int32, so the copy is `zero + run` against the one-stick `zero`
+/// ([`GatheredWords::SenUint32`](crate::ir::bridge::tiled_op_sdsc_op::GatheredWords::SenUint32)).
+pub fn index_run_gather(
+    name: &str,
+    g: &Gather,
+    chain: ChainedIndex,
+    (run, zero): (u32, u32),
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    use crate::ir::bridge::tiled_op_sdsc_op::{
+        GatheredWords, PageGatherRows, assemble_page_gather_copy,
+    };
+    let stick = <SenUint32 as DataFormat>::ELEMS_PER_STICK;
+    if g.entries > chain.scale || chain.scale > stick {
+        return err(format!(
+            "{name}: a chained gather takes {} index words of a {}-word run — a run is at most \
+             the one {stick}-word index stick its gather reads",
+            g.entries, chain.scale
+        ));
+    }
+    let sticks = INDEX_RUN_WORDS / stick;
+    let gather = crate::superdsc_opspec::GatherIndex::of_scratch_rows(
+        crate::place::act_name(chain.via_tid),
+        crate::superdsc_opspec::PageExtent::of_positions(sticks),
+        chain.via_entry,
+    );
+    let op = assemble_page_gather_copy(
+        &format!("gather_run_o{run}"),
+        &crate::place::act_name(g.index_tid),
+        &crate::place::act_name(run),
+        gather,
+        PageGatherRows {
+            rows: sticks,
+            words: GatheredWords::SenUint32 {
+                zero: &crate::place::act_name(zero),
+            },
+            src_elems: 0,
+            dst_elems: 0,
         },
         sym_id_base,
         layout,
