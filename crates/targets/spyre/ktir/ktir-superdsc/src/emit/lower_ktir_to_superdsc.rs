@@ -5928,18 +5928,47 @@ pub fn batch_transpose(
     Ok(ops)
 }
 
+/// ⭐ dxp's BOUND ON ONE GATHERED ENTRY, in bytes. A gather's initial chunk is one entry
+/// (`getInitialChunkParams` sets the chunk dims to their minimum), and at double buffering that chunk
+/// must fit LX (`L3DlOpsScheduler.cpp:1537`, "initial chunk parameters must fit in LX"). Measured
+/// through `dxp_standalone` on whole-page gathers at 8 kv heads: a 64 KB entry (64 slots × 64 head
+/// dims) compiles, and 128 KB (128 slots × 64, or 64 slots × 128 head dims) is refused there.
+pub const GATHER_ENTRY_BYTES_MAX: u32 = 64 * 1024;
+
+/// The pieces a gathered entry of `page_sticks` fp16 sticks is copied in: the fewest, a power of two
+/// (so its index scales by doubling, [`page_gather`]), whose piece fits [`GATHER_ENTRY_BYTES_MAX`]
+/// and is whole sticks. `None` when no power of two divides the entry so.
+pub fn gather_pieces(page_sticks: u32) -> Option<u32> {
+    let stick_bytes = Fp16::ELEMS_PER_STICK * Fp16::WORD_LENGTH;
+    let mut pieces = 1u32;
+    loop {
+        if !page_sticks.is_multiple_of(pieces) {
+            return None;
+        }
+        if (page_sticks / pieces) * stick_bytes <= GATHER_ENTRY_BYTES_MAX {
+            return Some(pieces);
+        }
+        pieces *= 2;
+    }
+}
+
 /// ⭐ THE PAGE GATHER — a load through an indirect tile whose one index entry selects a whole
-/// contiguous slab (`kp_desc.load([page, 0, 0, 0])`, every kv head of a pool page), copied into the
+/// contiguous slab (`kp_desc.load([page, 0, 0, 0])`, every kv head of a page), copied into the
 /// contiguous scratch `out` its consumers read ([`crate::ir::bridge::tiled_op_sdsc_op::page_gather_copy_opspec`]).
 ///
 /// `entries` index words from `first_entry`, `page_sticks` one-stick sub-rows each: the slab is read
 /// as one-stick rows because a gathered entry is a contiguous RUN, which is also what keeps the
 /// scratch's bytes the gathered slab's own row-major bytes. The consumers read the scratch in the flat
 /// frame — the same bytes only while a row is one stick wide; the caller refuses a wider one.
+///
+/// An entry past [`GATHER_ENTRY_BYTES_MAX`] is copied in `pieces` ([`gather_pieces`]): dxp steps a
+/// gather's index by its per-entry extent, so through an index already scaled by `pieces` (the
+/// caller's) a piece's extent steps a whole entry, and piece `p` reads and lands `p` pieces in.
 pub fn page_gather(
     name: &str,
     g: &Gather,
     page_sticks: u32,
+    pieces: u32,
     out: &Region,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
@@ -5947,29 +5976,46 @@ pub fn page_gather(
     use crate::ir::bridge::tiled_op_sdsc_op::{
         GatheredWords, PageGatherRows, assemble_page_gather_copy,
     };
-    let gather = crate::superdsc_opspec::GatherIndex::of_scratch_rows(
-        crate::place::act_name(g.index_tid),
-        crate::superdsc_opspec::PageExtent::of_positions(page_sticks),
-        g.first_entry,
-    );
-    let op = assemble_page_gather_copy(
-        &format!("gather_o{}", out.tid),
-        &crate::place::act_name(g.value_tid),
-        &out.name(),
-        gather,
-        PageGatherRows {
-            rows: g.entries * page_sticks,
-            words: GatheredWords::Fp16,
-            src_elems: 0,
-            dst_elems: 0,
-        },
-        sym_id_base,
-        layout,
-    )
-    .map_err(|message| Error {
-        message: format!("{name}: {message}"),
-    })?;
-    Ok(vec![op])
+    if pieces == 0 || !page_sticks.is_multiple_of(pieces) || (pieces > 1 && g.entries != 1) {
+        return err(format!(
+            "{name}: {} entr(ies) of {page_sticks} sticks gathered in {pieces} pieces — a piece is \
+             whole sticks of ONE entry (the next entry would land a piece apart, not an entry)",
+            g.entries
+        ));
+    }
+    let piece_sticks = page_sticks / pieces;
+    let stick = Fp16::ELEMS_PER_STICK;
+    (0..pieces)
+        .map(|p| {
+            let gather = crate::superdsc_opspec::GatherIndex::of_scratch_rows(
+                crate::place::act_name(g.index_tid),
+                crate::superdsc_opspec::PageExtent::of_positions(piece_sticks),
+                g.first_entry,
+            );
+            let op_name = if pieces == 1 {
+                format!("gather_o{}", out.tid)
+            } else {
+                format!("gather{p}_o{}", out.tid)
+            };
+            assemble_page_gather_copy(
+                &op_name,
+                &crate::place::act_name(g.value_tid),
+                &out.name(),
+                gather,
+                PageGatherRows {
+                    rows: g.entries * piece_sticks,
+                    words: GatheredWords::Fp16,
+                    src_elems: p * piece_sticks * stick,
+                    dst_elems: p * piece_sticks * stick,
+                },
+                sym_id_base,
+                layout,
+            )
+            .map_err(|message| Error {
+                message: format!("{name}: {message}"),
+            })
+        })
+        .collect()
 }
 
 /// ⭐ A CHAINED INDEX'S FIRST GATHER — the run of `g`'s index words for one position, copied into
@@ -8582,6 +8628,26 @@ mod elementwise_tests {
         assert!(
             ops1[0].arg_bindings.iter().all(|b| b.offset_elems != 0),
             "every binding of the chunked piece sits at its window's corner"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gather_pieces_tests {
+    use super::*;
+
+    /// A page of 8 kv heads × 64 slots: 64 KB at a head of 64 is one piece, 128 KB at 128 is two,
+    /// and an entry no power of two divides into whole sticks under the bound has no split.
+    #[test]
+    fn an_entry_past_the_bound_is_halved_until_it_fits() {
+        assert_eq!(gather_pieces(8 * 64), Some(1));
+        assert_eq!(gather_pieces(8 * 64 * 2), Some(2));
+        assert_eq!(gather_pieces(8 * 64 * 4), Some(4));
+        assert_eq!(gather_pieces(1536), Some(4), "3 × 64 KB: four 48 KB pieces");
+        assert_eq!(
+            gather_pieces(513),
+            None,
+            "odd and past the bound: no half is whole sticks"
         );
     }
 }

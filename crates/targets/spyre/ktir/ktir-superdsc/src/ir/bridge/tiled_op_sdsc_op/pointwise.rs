@@ -866,6 +866,106 @@ pub fn assemble_stick_permute(
         .map_err(|e| format!("assemble_stick_permute {op_name}: {e}"))
 }
 
+/// ⭐ RUNS OF STICKS, COPIED AT TWO PITCHES — `runs` runs of `run_sticks` contiguous sticks of `df`,
+/// run `r` read at `src_elems + r · src_pitch` sticks into the source and written at
+/// `dst_elems + r · dst_pitch` sticks into the destination.
+#[derive(Clone, Copy, Debug)]
+pub struct StickRuns {
+    pub runs: u32,
+    pub run_sticks: u32,
+    pub src_pitch: u32,
+    pub dst_pitch: u32,
+    pub src_elems: u32,
+    pub dst_elems: u32,
+    pub df: Df,
+}
+
+/// [`StickRuns`] as an `identity` over `[mb = runs, y = run_sticks, out = stick]`: both sides lay a
+/// run's sticks contiguous (`["mb", "y", "out"]`) and each states its own pitch as the physical
+/// extent of `y` ([`TensorArg::with_device_extent`]) — the scatter-row output's form
+/// ([`pointwise_opspec_from_tile_split`]) on both sides.
+pub fn stick_runs_copy_opspec(src: &str, dst: &str, runs: StickRuns) -> Result<OpSpec, String> {
+    let StickRuns {
+        runs: n,
+        run_sticks,
+        src_pitch,
+        dst_pitch,
+        src_elems,
+        dst_elems,
+        df,
+    } = runs;
+    if n == 0 || run_sticks == 0 || src_pitch < run_sticks || dst_pitch < run_sticks {
+        return Err(format!(
+            "stick_runs_copy('{src}' -> '{dst}'): {n} run(s) of {run_sticks} stick(s) at pitches \
+             {src_pitch} and {dst_pitch} — a run is at least one stick, and a pitch at least a run"
+        ));
+    }
+    let stick = df.elems_per_stick();
+    let tile_op =
+        crate::emit::lower_ktir_to_superdsc::pointwise_tile_op_df(n, stick, run_sticks, 2, df);
+    let tiled = tile_op
+        .tile(
+            MaxCores::<MAX_CORES>,
+            EwDivision::Law.resolve(false, false).splitter(),
+            "out",
+        )
+        .map_err(|e| e.0)?;
+    let (plan, time_tile) = (tiled.plan, tiled.time_tile);
+    let arg =
+        |is_input: bool, name: &str, pitch: u32, elems: u32| -> Result<AnyTensorArg, String> {
+            let t = TensorArg::<3>::new(
+                is_input,
+                name.to_string(),
+                Role::Output,
+                [Scale::Active, Scale::Active, Scale::Active],
+                plan.iter_syms(["mb", "y", "out"]),
+                ["mb", "y", "out"],
+                "out",
+                Allocation::Hbm,
+            )
+            .map_err(|e| e.0)?
+            .with_df(df)
+            .with_offset(elems);
+            let t = if pitch == run_sticks {
+                t
+            } else {
+                t.with_device_extent("y", pitch).map_err(|e| e.0)?
+            };
+            Ok(AnyTensorArg::R3(t))
+        };
+    let args = vec![
+        arg(true, src, src_pitch, src_elems)?,
+        arg(false, dst, dst_pitch, dst_elems)?,
+    ];
+    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
+    Ok(OpSpec {
+        op: OpFunc::Identity,
+        is_reduction: false,
+        iter: plan,
+        args,
+        op_info: OpInfo::None,
+        tiled_symbols,
+        time_tile,
+        indirect: None,
+        coordinate_mask: None,
+    })
+}
+
+/// [`stick_runs_copy_opspec`] + `emit_sdsc_tiled`.
+pub fn assemble_stick_runs_copy(
+    op_name: &str,
+    src: &str,
+    dst: &str,
+    runs: StickRuns,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
+    let op = stick_runs_copy_opspec(src, dst, runs)?;
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+        .map_err(|e| format!("assemble_stick_runs_copy {op_name}: {e}"))
+}
+
 /// One scattered copy's extents: `rows` one-stick sub-rows of `cols` (one stick) elements of `df`,
 /// read from the source starting `src_elems` elements in, written through the index from the
 /// destination's base plus `dst_elems`.
@@ -1565,5 +1665,50 @@ mod stick_permute_tests {
         .expect("the permute writes the stick-major block");
         l.declare_arrangement(&out, StickLayout::row_blocked(32, 128))
             .expect("a consumer reading [32, 128] stick-major agrees");
+    }
+}
+
+#[cfg(test)]
+mod stick_runs_tests {
+    use super::*;
+
+    fn runs(src_pitch: u32, dst_pitch: u32) -> StickRuns {
+        StickRuns {
+            runs: 32,
+            run_sticks: 64,
+            src_pitch,
+            dst_pitch,
+            src_elems: 64 * 64,
+            dst_elems: 32 * 64 * 64,
+            df: Df::Fp16,
+        }
+    }
+
+    /// Each side states its own pitch as `y`'s physical extent, and only where it is not the run.
+    #[test]
+    fn each_side_states_its_own_pitch() {
+        let op = stick_runs_copy_opspec("t1", "t2", runs(128, 64)).expect("the copy builds");
+        let v: Vec<_> = op.args.iter().map(|a| a.view()).collect();
+        assert_eq!(
+            v[0].device_extent,
+            [None, Some(128), None],
+            "the source's pitch"
+        );
+        assert_eq!(
+            v[1].device_extent,
+            [None, None, None],
+            "the destination is dense"
+        );
+        assert_eq!(
+            (v[0].offset_elems, v[1].offset_elems),
+            (64 * 64, 32 * 64 * 64)
+        );
+        assert_eq!(v[0].layout, ["mb", "y", "out"]);
+    }
+
+    /// A pitch shorter than a run would overlap its runs.
+    #[test]
+    fn a_pitch_under_a_run_is_refused() {
+        assert!(stick_runs_copy_opspec("t1", "t2", runs(32, 64)).is_err());
     }
 }

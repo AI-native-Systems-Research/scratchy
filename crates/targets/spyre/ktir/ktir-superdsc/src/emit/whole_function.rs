@@ -784,8 +784,9 @@ fn reframed(r: Region, [rows, cols]: [u32; 2]) -> Region {
     }
 }
 
-/// ⭐ THE HEAD-MAJOR PAIR at `op` — a byte-free reshape/transpose pair on the card, and the frame its
-/// result's bytes are in: `(the pair's last result, [rows, cols])`.
+/// ⭐ THE HEAD-MAJOR PAIR at `op` — a reshape/transpose pair between a stick-major `[B, A·W]` block
+/// and the head-major `[A·B, W]`: `(the pair's last result, the frame it is read in, W in sticks)`.
+/// At `W` one stick the pair moves no byte (below); wider, it is [`HeadMajorCopies`].
 ///
 /// A stick-major `[B, A·S]` buffer (`S` one stick) holds stick column `a` of row `b` at
 /// `(a·B + b)·S` — head-major `[A, B, S]` row-major, byte for byte. So
@@ -801,7 +802,7 @@ fn head_major_pair(
     op: &ktir_core::ir::Operation<'static>,
     from: &[i64],
     to: &[i64],
-) -> Option<(Ssa, [u32; 2])> {
+) -> Option<(Ssa, [u32; 2], u32)> {
     let stick = i64::from(crate::work::FP16_ELEMS_PER_STICK);
     let res = op.result?;
     let deep = f.ops_deep();
@@ -827,29 +828,149 @@ fn head_major_pair(
             let ([b, aw], [b2, a, s]) = (from, to) else {
                 return None;
             };
-            if b != b2 || *s != stick || a * s != *aw {
+            if b != b2 || s % stick != 0 || a * s != *aw {
                 return None;
             }
             let t = sole_reader(res).filter(|o| perm_102(o))?;
             if dims_of(t)? != [*a, *b, *s] {
                 return None;
             }
-            Some((t.result?, [(a * b) as u32, *s as u32]))
+            Some((t.result?, [(a * b) as u32, *s as u32], (s / stick) as u32))
         }
         OpKind::LinalgTranspose if perm_102(op) => {
             let [a, b, s] = from else {
                 return None;
             };
-            if *s != stick || to != [*b, *a, *s] {
+            if s % stick != 0 || to != [*b, *a, *s] {
                 return None;
             }
             let r = sole_reader(res).filter(|o| o.op_type == OpKind::TensorReshape)?;
             if dims_of(r)? != [*b, a * s] {
                 return None;
             }
-            Some((r.result?, [*b as u32, (a * s) as u32]))
+            Some((r.result?, [*b as u32, (a * s) as u32], (s / stick) as u32))
         }
         _ => None,
+    }
+}
+
+/// ⭐ THE HEAD-MAJOR PAIR AT A HEAD `S > 1` STICKS WIDE — the stick-major `[B, A·S·stick]` block
+/// holds head `a`'s stick `s` as the run of `B` sticks at stick column `a·S + s`, and the head-major
+/// `[A·B, S·stick]` holds it at `s·A·B + a·B`. So the relayout either way is `S` copies — one per
+/// stick of a head — of `A` runs of `B` sticks, at pitch `S·B` on the block's side and `B` on the
+/// head-major side ([`crate::ir::bridge::tiled_op_sdsc_op::StickRuns`]): spyre-inference's
+/// `q_rows.unsqueeze(0).transpose(1, 2).reshape(...)` and its output's inverse, at head dim 128.
+struct HeadMajorCopies<'a> {
+    block: &'a Region,
+    heads: &'a Region,
+    a: u32,
+    b: u32,
+    sticks: u32,
+}
+
+impl<'a> HeadMajorCopies<'a> {
+    /// The copies between `block` (`[B, A·S·stick]`) and `heads` (`[A·B, S·stick]`), `A·B` rows of
+    /// `S` sticks on the head-major side.
+    fn of(block: &'a Region, heads: &'a Region, rows: u32, sticks: u32) -> Result<Self, Error> {
+        let stick = crate::work::FP16_ELEMS_PER_STICK;
+        let b = block.v_rows;
+        if b == 0 || !rows.is_multiple_of(b) || block.v_cols != (rows / b) * sticks * stick {
+            return err(format!(
+                "a head-major relayout between t{} `[{}, {}]` and t{} `[{rows}, {}]`: the block is \
+                 not `B` rows of the `A·S` sticks the head-major side's `A·B` rows hold",
+                block.tid,
+                block.v_rows,
+                block.v_cols,
+                heads.tid,
+                sticks * stick
+            ));
+        }
+        Ok(Self {
+            block,
+            heads,
+            a: rows / b,
+            b,
+            sticks,
+        })
+    }
+
+    /// Stick `s` of every head, block to head-major.
+    fn to_heads(
+        &self,
+        name: &str,
+        sym_id_base: &mut i64,
+        layout: &BundleLayout,
+    ) -> Result<Vec<super::EmittedOp>, Error> {
+        self.copies(name, true, sym_id_base, layout)
+    }
+
+    /// Stick `s` of every head, head-major to block.
+    fn to_block(
+        &self,
+        name: &str,
+        sym_id_base: &mut i64,
+        layout: &BundleLayout,
+    ) -> Result<Vec<super::EmittedOp>, Error> {
+        self.copies(name, false, sym_id_base, layout)
+    }
+
+    fn copies(
+        &self,
+        name: &str,
+        to_heads: bool,
+        sym_id_base: &mut i64,
+        layout: &BundleLayout,
+    ) -> Result<Vec<super::EmittedOp>, Error> {
+        use crate::ir::bridge::tiled_op_sdsc_op::{StickRuns, assemble_stick_runs_copy};
+        let stick = crate::work::FP16_ELEMS_PER_STICK;
+        let (a, b, n) = (self.a, self.b, self.sticks);
+        (0..n)
+            .map(|s| {
+                // Block side: run `a` at `a·S·B + s·B` sticks; head-major side: at `s·A·B + a·B`.
+                let (block_pitch, block_elems) = (n * b, s * b * stick);
+                let (heads_pitch, heads_elems) = (b, s * a * b * stick);
+                let (src, dst, runs) = if to_heads {
+                    (
+                        self.block,
+                        self.heads,
+                        StickRuns {
+                            runs: a,
+                            run_sticks: b,
+                            src_pitch: block_pitch,
+                            dst_pitch: heads_pitch,
+                            src_elems: block_elems,
+                            dst_elems: heads_elems,
+                            df: crate::superdsc_opspec::Df::Fp16,
+                        },
+                    )
+                } else {
+                    (
+                        self.heads,
+                        self.block,
+                        StickRuns {
+                            runs: a,
+                            run_sticks: b,
+                            src_pitch: heads_pitch,
+                            dst_pitch: block_pitch,
+                            src_elems: heads_elems,
+                            dst_elems: block_elems,
+                            df: crate::superdsc_opspec::Df::Fp16,
+                        },
+                    )
+                };
+                assemble_stick_runs_copy(
+                    &format!("heads{s}_o{}", dst.tid),
+                    &src.name(),
+                    &dst.name(),
+                    runs,
+                    sym_id_base,
+                    Some(layout),
+                )
+                .map_err(|message| Error {
+                    message: format!("{name}: {message}"),
+                })
+            })
+            .collect()
     }
 }
 
@@ -3959,7 +4080,7 @@ fn lower_function_folded(
             // transpose's result is the source's own bytes in the `[A·B, S]` frame, and both lower
             // to nothing (spyre-inference's `q_rows.unsqueeze(0).transpose(1, 2).reshape(...)`).
             if !gathered_loads.contains_key(&src)
-                && let Some((t_res, frame)) = head_major_pair(f, op, &from, &to)
+                && let Some((t_res, frame, sticks)) = head_major_pair(f, op, &from, &to)
             {
                 let source = match region_for_operand(k, src)?.or_else(|| inter.get(&src).copied())
                 {
@@ -3971,7 +4092,24 @@ fn lower_function_folded(
                         ));
                     }
                 };
-                let r = reframed(source, frame);
+                let r = match layout {
+                    Some(layout) if sticks > 1 => {
+                        let tid = mint_inter(k, layout, floor, res);
+                        let dst = stick_major_region(tid, frame[0], sticks, layout);
+                        out.extend(
+                            HeadMajorCopies::of(&source, &dst, frame[0], sticks)?.to_heads(
+                                f.name,
+                                sym_id_base,
+                                layout,
+                            )?,
+                        );
+                        Region {
+                            is_out: false,
+                            ..dst
+                        }
+                    }
+                    _ => reframed(source, frame),
+                };
                 inter.insert(res, r);
                 inter.insert(t_res, r);
                 head_major_skip.insert(t_res);
@@ -4184,8 +4322,24 @@ fn lower_function_folded(
                         gather_carried[gi] = true;
                         let r = Region { is_out: false, ..r };
                         inter.insert(src, r);
-                        if let Some((t_res, frame)) = head_major_pair(f, op, &from, &to) {
-                            let r2 = reframed(r, frame);
+                        if let Some((t_res, frame, sticks)) = head_major_pair(f, op, &from, &to) {
+                            let r2 = if sticks > 1 {
+                                let tid = mint_inter(k, layout, floor, res);
+                                let dst = stick_major_region(tid, frame[0], sticks, layout);
+                                out.extend(
+                                    HeadMajorCopies::of(&r, &dst, frame[0], sticks)?.to_heads(
+                                        f.name,
+                                        sym_id_base,
+                                        layout,
+                                    )?,
+                                );
+                                Region {
+                                    is_out: false,
+                                    ..dst
+                                }
+                            } else {
+                                reframed(r, frame)
+                            };
                             inter.insert(res, r2);
                             inter.insert(t_res, r2);
                             head_major_skip.insert(t_res);
@@ -4291,6 +4445,81 @@ fn lower_function_folded(
                         }
                         None => g,
                     };
+                    // ⭐ AN ENTRY PAST dxp's CHUNK BOUND is copied in pieces through its index
+                    // scaled by the piece count — doubled, `addi32toi32(x, x)`, into a scratch
+                    // stick, so no constant is placed (the walk's body reads none).
+                    let Some(pieces) = super::lower_ktir_to_superdsc::gather_pieces(page_sticks)
+                    else {
+                        return err(format!(
+                            "{}: a gathered entry of {page_sticks} sticks splits into no power of \
+                             two of whole-stick pieces under dxp's {}-byte entry bound",
+                            f.name,
+                            super::lower_ktir_to_superdsc::GATHER_ENTRY_BYTES_MAX
+                        ));
+                    };
+                    let g = if pieces > 1 {
+                        if g.first_entry != crate::superdsc_opspec::EntryBase::ZERO {
+                            return err(format!(
+                                "{}: a gathered entry split in {pieces} pieces reads its index at \
+                                 entry {} — the doubling reads the index stick at its base",
+                                f.name,
+                                g.first_entry.entries()
+                            ));
+                        }
+                        // The integer ops' device width, the chained index run's own
+                        // ([`super::lower_ktir_to_superdsc::INDEX_RUN_WORDS`]).
+                        let words = super::lower_ktir_to_superdsc::INDEX_RUN_WORDS;
+                        let index_stick = |tid: u32, is_out: bool| Region {
+                            tid,
+                            v_rows: 1,
+                            v_cols: words,
+                            r_start: 0,
+                            c_start: 0,
+                            r_len: 1,
+                            c_len: words,
+                            r_cover: (0, 1),
+                            c_cover: (0, words),
+                            is_out,
+                            is_fp8: false,
+                            band: None,
+                        };
+                        // The doubling reads the index's first `words` words: the page id and
+                        // the rest of its stick — inside the table's card pitch of a stick a
+                        // score row, and refused by name where the placement is shorter.
+                        let placed = layout.placements.get(&g.index_tid).map_or(0, |p| p.size);
+                        if placed < u64::from(words) * 4 {
+                            return err(format!(
+                                "{}: a gathered entry split in {pieces} pieces scales its index \
+                                 t{} by `addi32toi32` over {words} words, and t{} is placed in \
+                                 {placed} bytes",
+                                f.name, g.index_tid, g.index_tid
+                            ));
+                        }
+                        let mut scaled = index_stick(g.index_tid, false);
+                        for _ in 0..pieces.trailing_zeros() {
+                            let tid = layout.take_inter_tid(floor);
+                            layout.synth_df(
+                                crate::place::PlaceId::Act(tid),
+                                &[1, words],
+                                crate::superdsc_opspec::Df::SenUint32,
+                            );
+                            out.extend(super::lower_ktir_to_superdsc::int_binary(
+                                f.name,
+                                super::lower_ktir_to_superdsc::IntBinary::Add,
+                                &[scaled, scaled, index_stick(tid, true)],
+                                &[],
+                                sym_id_base,
+                                Some(layout),
+                            )?);
+                            scaled = index_stick(tid, false);
+                        }
+                        Gather {
+                            index_tid: scaled.tid,
+                            ..g
+                        }
+                    } else {
+                        g
+                    };
                     let [rows, cols] = flat_frame(&from);
                     if cols != crate::work::FP16_ELEMS_PER_STICK {
                         return err(format!(
@@ -4320,6 +4549,7 @@ fn lower_function_folded(
                         f.name,
                         &g,
                         page_sticks,
+                        pieces,
                         &r,
                         sym_id_base,
                         Some(layout),
@@ -4426,7 +4656,7 @@ fn lower_function_folded(
                     .map(<[i64]>::to_vec)
                     .unwrap_or_default()
             };
-            if let Some((r_res, frame)) = head_major_pair(f, op, &dims(src), &dims(res)) {
+            if let Some((r_res, frame, sticks)) = head_major_pair(f, op, &dims(src), &dims(res)) {
                 let Some(source) = region_for_operand(k, src)?.or_else(|| inter.get(&src).copied())
                 else {
                     return err(format!(
@@ -4441,7 +4671,27 @@ fn lower_function_folded(
                         f.name, source.tid
                     ));
                 }
-                let r = reframed(source, frame);
+                let r =
+                    match layout {
+                        Some(layout) if sticks > 1 => {
+                            let tid = mint_inter(k, layout, floor, r_res);
+                            let dst = stick_major_region(
+                                tid,
+                                frame[0],
+                                frame[1] / crate::work::FP16_ELEMS_PER_STICK,
+                                layout,
+                            );
+                            out.extend(
+                                HeadMajorCopies::of(&dst, &source, source.v_rows, sticks)?
+                                    .to_block(f.name, sym_id_base, layout)?,
+                            );
+                            Region {
+                                is_out: false,
+                                ..dst
+                            }
+                        }
+                        _ => reframed(source, frame),
+                    };
                 inter.insert(res, r);
                 inter.insert(r_res, r);
                 head_major_skip.insert(r_res);
