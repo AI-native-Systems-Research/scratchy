@@ -482,6 +482,16 @@ where
         )
         .map_err(|e| e.0)?
         .with_offset(a_off);
+        // ⭐ THE ACTIVATION'S OWN ROW COUNT, WHEN THIS OP SWEEPS A SLICE OF IT — the same law the
+        // output takes below: a stick-blocked view's stick-group stride comes from its `mb` DEVICE
+        // extent, so a slice of a taller activation (a batched contraction's batch rows, read out of
+        // the flat frame) is addressed with the TENSOR's rows, not the op's.
+        let input = match phys_mb {
+            Some(phys) if phys > plan.extent(MbAxis::NAME) => input
+                .with_device_extent(MbAxis::NAME, phys)
+                .map_err(|e| e.0)?,
+            _ => input,
+        };
         let output_walk = Walk2::output_rows_by_n();
         let output = TensorArg::<2>::new(
             false,

@@ -345,6 +345,10 @@ pub struct OpKv {
     /// `addr = idx * skip_addr + base` from whatever base the launch installed, so a per-pass page shift
     /// on top of an absolute entry composes two bases and lands inside neither: fluent, no fault.
     pub gathered: bool,
+    /// ⭐ A WALK'S BLOCK BODY (`bundle::KvShifts::walk`): launched the walk's own trip count, the
+    /// activation segment shifted one step per trip and nothing else — the bake's facts, read before
+    /// any of the session's fold arithmetic, which it replaces.
+    pub walk: Option<scratchy_spyre_bundle::Walk>,
 }
 
 /// The session state the arithmetic reads.
@@ -865,6 +869,11 @@ pub fn fallback_rung(rungs: &[RungReach]) -> usize {
 /// no single stride reads the wrong rows' pages; a strided pool with a kernel that has no request axis
 /// computes one request's attention and hands it to all of them.
 pub fn reps(op: &OpKv, s: &SessionKv, n_fold_pages: i64) -> i64 {
+    // A WALK'S BODY runs its walk's trip count, baked with the rung: the blocks past a sequence's own
+    // are fully masked, so the count is the walk's, never the session's pages.
+    if let Some(w) = op.walk {
+        return i64::from(w.trips);
+    }
     if !is_paged_fold(op, s) {
         return 1;
     }
@@ -1202,6 +1211,16 @@ pub fn seg_deltas(
     launch: SlotPos,
     caller_page_base: Bytes,
 ) -> OpAim {
+    // ⭐ A WALK'S BODY: trip `rep` reads the step's page-table row and mask tile `rep` steps into the
+    // activation segment, and everything else where the bake placed it — its gathers carry their own
+    // pages (the entries are absolute), so no KV shift, and its state is the one carried buffer.
+    if let Some(w) = op.walk {
+        return OpAim::At(SegDeltas {
+            kv: Bytes(0),
+            mask: Bytes((rep as u64).wrapping_mul(u64::from(w.step_bytes))),
+            intermediate: Bytes(0),
+        });
+    }
     let pos = op_slot_pos(op, s, launch);
     let Some(page) = nonfold_page_delta(op, s, pos, caller_page_base) else {
         return OpAim::UnheldPage;

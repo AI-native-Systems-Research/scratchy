@@ -623,6 +623,7 @@ impl OpProg {
                 // ⭐ THE OTHER HALF OF `fold_plan::collapsed`, and what sends the fold's KV shift to
                 // zero — a bake fact, carried on the group exactly like the axis itself.
                 gathered: kv.gathered,
+                walk: kv.walk,
             },
         }
     }

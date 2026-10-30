@@ -387,6 +387,21 @@ pub struct KvShifts {
     pub gathered: bool,
     /// What one fold pass covers — see [`FoldRows`]. Meaningful only when [`Self::page_fold`].
     pub fold_rows: FoldRows,
+    /// ⭐ A WALK'S BLOCK BODY — this group is the `scf.for` page walk's one body, built at trip 0: the
+    /// runtime launches it [`Walk::trips`] times, the activation segment (the step's page table and
+    /// mask stack) shifted [`Walk::step_bytes`] further each time, and nothing else. A bake fact — the
+    /// rung's walk — so the count and the step never come from the session. `None` for every group
+    /// outside a walk.
+    pub walk: Option<Walk>,
+}
+
+/// How a walk's body group relaunches — see [`KvShifts::walk`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Walk {
+    /// The walk's trip count: how many times the body runs.
+    pub trips: u32,
+    /// The bytes the activation segment advances per trip — one trip's page-table row and mask tile.
+    pub step_bytes: u32,
 }
 
 impl KvShifts {

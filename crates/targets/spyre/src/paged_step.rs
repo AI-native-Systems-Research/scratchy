@@ -5,15 +5,17 @@
 //! These are spyre-inference's own per-step tables (`SpyreAttentionMetadataBuilder.build`,
 //! `SpyreHeadMajorAttentionImpl.kv_write_index`), at the shapes the Triton kernels read them:
 //!
-//! * the PAGE TABLE `[walk, 32]` int32 — `page_index_tables_cpu`: block `i`'s page at column 0 of a
-//!   one-stick row, the blocks past the request's own repeating its last page (spyre-inference pads
-//!   the same way: a padded block repeats the last real one under a fully-masked tile);
-//! * the MASK STACK `[walk · rows · gqa, page_slots]` — `attention_mask_stacks`: 0 where a row may
+//! * the PAGE TABLE `[walk, pitch]` int32 — `page_index_tables_cpu`: block `i`'s page (or its `nkvh`
+//!   folded-cache rows, [`page_table`]) in its row, the blocks past the request's own repeating its last
+//!   page (spyre-inference pads the same way: a padded block repeats the last real one under a
+//!   fully-masked tile). A row is one int32 stick per score row
+//!   ([`scratchy_triton_splice::page_table_pitch`]), so the walk's per-trip step moves the table row
+//!   and the mask tile together;
+//! * the MASK STACK `[walk · gqa · rows, page_slots]` — `attention_mask_stacks`: 0 where a row may
 //!   attend the key, `finfo(f16).min` where it may not (past the row's position: the causal limit,
 //!   which at the sequence's last row is also its length). Staged at the SCORE TILE's rows: a KV
-//!   head's `gqa` query heads ride its walk as rows `m · gqa + g`, and each repeats query row `m`'s
-//!   mask, so the kernel adds the tile with no broadcast (the device's pointwise operands address a
-//!   row once or every row, never every `gqa`-th);
+//!   head's `gqa` query heads ride its walk as rows `g · rows + m`, and each repeats query row `m`'s
+//!   mask, so the kernel broadcasts the tile over the kv heads alone;
 //! * the WRITE ROWS `[1, rows · nkvh]` int32 — `kv_write_index`: the pool row
 //!   `(page · nkvh + h) · page_slots + slot` of each row's key, `(token, head)`-major.
 //!
@@ -107,9 +109,12 @@ fn check(step: &PagedStep, blocks: &[u32], rows: &StepRows) -> Result<(), PagedS
     Ok(())
 }
 
-/// The page table: `[walk, 32]` int32 — one row per block the bundle's attention walks — block `i`'s
-/// page at column 0. Blocks past the ones this step reaches repeat the last of them — a padded
-/// block's tile is fully masked, so the page it names is read and weighted by zero.
+/// The page table: `[walk, pitch]` int32 — one row per block the bundle's attention walks. Block
+/// `i`'s row holds its `nkvh` folded-cache rows `page · nkvh + kv` (`kv_row_pool[page]`) when the walk
+/// gathers a kv head's slab per entry, its page at column 0 otherwise
+/// ([`scratchy_triton_splice::page_table_holds_kv_rows`]). Blocks past the ones this step reaches
+/// repeat the last of them — a padded block's tile is fully masked, so the page it names is read and
+/// weighted by zero.
 pub fn page_table(
     step: &PagedStep,
     blocks: &[u32],
@@ -117,24 +122,32 @@ pub fn page_table(
 ) -> Result<Vec<i32>, PagedStepError> {
     check(step, blocks, rows)?;
     let used = rows.end().div_ceil(step.page_slots as usize);
-    let stick = scratchy_triton_splice::INT32_STICK as usize;
-    let mut t = vec![0i32; step.walk as usize * stick];
+    let pitch = step.page_table_pitch() as usize;
+    let mut t = vec![0i32; step.walk as usize * pitch];
     for i in 0..step.walk as usize {
-        t[i * stick] = blocks[i.min(used - 1)] as i32;
+        let page = blocks[i.min(used - 1)] as i32;
+        if scratchy_triton_splice::page_table_holds_kv_rows(step.nkvh) {
+            let nkvh = step.nkvh as i32;
+            for kv in 0..nkvh {
+                t[i * pitch + kv as usize] = page * nkvh + kv;
+            }
+        } else {
+            t[i * pitch] = page;
+        }
     }
     Ok(t)
 }
 
-/// The mask stack: `[walk · rows · gqa, page_slots]`, tile `i` (score rows `i · rows · gqa ..`)
+/// The mask stack: `[walk · gqa · rows, page_slots]`, tile `i` (score rows `i · gqa · rows ..`)
 /// column `c` keyed by position `i · page_slots + c` — 0 at or before the position of score row
-/// `m · gqa + g`'s query row `m`, [`MASKED`] after it.
+/// `g · rows + m`'s query row `m`, [`MASKED`] after it.
 pub fn mask_stack(step: &PagedStep, rows: &StepRows) -> Vec<f32> {
     let (slots, gqa) = (step.page_slots as usize, step.gqa as usize);
     let score_rows = step.rows as usize * gqa;
     let mut m = vec![MASKED; step.walk as usize * score_rows * slots];
     for i in 0..step.walk as usize {
         for r in 0..score_rows {
-            let pos = rows.pos(r / gqa);
+            let pos = rows.pos(r % step.rows as usize);
             let base = (i * score_rows + r) * slots;
             for c in 0..slots {
                 if i * slots + c <= pos {
@@ -180,7 +193,6 @@ pub fn step_sources(
     rows: &StepRows,
 ) -> Result<StepSources, PagedStepError> {
     let words = |w: Vec<i32>| -> Vec<u8> { w.into_iter().flat_map(i32::to_le_bytes).collect() };
-    let stick = scratchy_triton_splice::INT32_STICK as usize;
     Ok(StepSources {
         mask: (
             step.mask,
@@ -194,7 +206,7 @@ pub fn step_sources(
             (
                 step.page_table,
                 words(page_table(step, blocks, rows)?),
-                vec![step.walk as usize, stick],
+                vec![step.walk as usize, step.page_table_pitch() as usize],
             ),
             (
                 step.write_rows,
@@ -283,7 +295,11 @@ mod tests {
         let rows = StepRows { start: 5, real: 2 };
         let blocks = [2u32, 0];
         let pt = page_table(&s, &blocks, &rows).unwrap();
-        let col0: Vec<i32> = pt.iter().step_by(32).copied().collect();
+        let col0: Vec<i32> = pt
+            .iter()
+            .step_by(s.page_table_pitch() as usize)
+            .copied()
+            .collect();
         assert_eq!(
             col0,
             vec![2, 0, 0, 0],
@@ -304,7 +320,7 @@ mod tests {
         assert!(m[24..].iter().all(|&v| v == MASKED));
     }
 
-    /// A KV head's query group rides its walk as score rows `m · gqa + g`: each of the `gqa` rows of
+    /// A KV head's query group rides its walk as score rows `g · rows + m`: each of the `gqa` rows of
     /// query row `m` carries `m`'s mask.
     #[test]
     fn every_head_of_a_group_carries_its_query_row_s_mask() {
@@ -318,12 +334,12 @@ mod tests {
         let row = |tile: usize, r: usize| &m[(tile * 6 + r) * 4..(tile * 6 + r + 1) * 4];
         // Block 1 (positions 4..8): query row 0 (position 5) attends 4, 5 — on both of its heads.
         assert_eq!(row(1, 0), &[0.0, 0.0, MASKED, MASKED]);
-        assert_eq!(row(1, 1), row(1, 0));
+        assert_eq!(row(1, 3), row(1, 0));
         // Query row 1 (position 6), both heads; the pad row 2 repeats it.
-        assert_eq!(row(1, 2), &[0.0, 0.0, 0.0, MASKED]);
-        assert_eq!(row(1, 3), row(1, 2));
-        assert_eq!(row(1, 4), row(1, 2));
-        assert_eq!(row(1, 5), row(1, 2));
+        assert_eq!(row(1, 1), &[0.0, 0.0, 0.0, MASKED]);
+        assert_eq!(row(1, 4), row(1, 1));
+        assert_eq!(row(1, 2), row(1, 1));
+        assert_eq!(row(1, 5), row(1, 1));
     }
 
     #[test]

@@ -1416,9 +1416,24 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// walk tiles and the modulus the write's rows step by.
 pub const PAGE_SLOTS: u32 = ktir_superdsc::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
 
-/// An int32 stick: a page-table row is one stick wide, its page id at column 0 (spyre-inference's
-/// `INT32_ELEMS_PER_STICK`).
+/// An int32 stick (spyre-inference's `INT32_ELEMS_PER_STICK`).
 pub const INT32_STICK: u32 = 32;
+
+/// ⭐ THE PAGE TABLE'S ROW PITCH, in int32 — one int32 stick per score row (`paged_attn.py`'s
+/// `PT_PITCH`). The card runs the walk's block body once per trip and steps the step's sources by ONE
+/// shift per trip, and a trip's mask tile moves `score_rows` stick rows of the stick-major mask stack
+/// — so the table's rows sit exactly that far apart.
+pub const fn page_table_pitch(score_rows: u32) -> u32 {
+    score_rows * INT32_STICK
+}
+
+/// ⭐ WHAT A PAGE TABLE ROW HOLDS — the block's `nkvh` folded-cache rows `page · nkvh + kv`
+/// (`kv_row_pool[page]`, the decode kernel's per-kv-head gather) when the walk gathers one kv head's
+/// slab per index entry, which it does from Triton's gather floor of 8 rows up (`paged_attn.py`'s
+/// `NKVH >= 8`); under it, the block's page at column 0 (the whole page is one entry).
+pub const fn page_table_holds_kv_rows(nkvh: u32) -> bool {
+    nkvh >= 8
+}
 
 /// ⭐⭐⭐ THE PAGED STEP'S HOST SOURCES — the three per-step buffers a paged forward reads, at their
 /// RESERVED tids (`ktir_superdsc::reserved_tids::PAGED_STEP_BASE`): one session holds every bundle's
@@ -1429,7 +1444,7 @@ pub const INT32_STICK: u32 = 32;
 pub struct PagedStepTids {
     /// The mask stack: one `[mq, PAGE_SLOTS]` additive tile per walked block.
     pub mask: u32,
-    /// The page table: one int32 stick per walked block, the block's page at column 0.
+    /// The page table: one row per walked block ([`page_table_pitch`] int32), its page at column 0.
     pub page_table: u32,
     /// The write rows: the pool row of every (token, kv head) the step writes.
     pub write_rows: u32,
@@ -3452,9 +3467,14 @@ mod production_ktir_dump {
             ("desc_pt", "*i32"),
             ("desc_mask", "*fp16"),
         ];
-        for (name, mq, blocks) in [
-            ("paged_attn_decode", 1i128, 4i128),
-            ("paged_attn_prefill", 64, 1),
+        // ...plus the walk at granite-3.1-2b's own pool — `max_position_embeddings` 131072 in 512
+        // pages — decoding over the whole of it and a prompt chunk walking four pages, so the card
+        // compile is checked at the extents a bake states, not only at a toy pool.
+        for (name, mq, blocks, pages) in [
+            ("paged_attn_decode", 1i128, 4i128, 4i128),
+            ("paged_attn_prefill", 64, 1, 4),
+            ("paged_attn_decode_pool", 1, 512, 512),
+            ("paged_attn_prefill_walk", 64, 4, 512),
         ] {
             v.push((
                 name,
@@ -3469,7 +3489,7 @@ mod production_ktir_dump {
                         ("NKVH", Val::Int(8)),
                         ("HD", Val::Int(64)),
                         ("BLOCK", Val::Int(i128::from(PAGE_SLOTS))),
-                        ("NUM_PAGES", Val::Int(4)),
+                        ("NUM_PAGES", Val::Int(pages)),
                         ("NUM_BLOCKS", Val::Int(blocks)),
                         ("SCALE", Val::Float(0.125)),
                     ],
@@ -3657,7 +3677,10 @@ mod production_ktir_dump {
             }
             "windowedrmsnorm_unit_fwd" => Program::WindowedRmsNorm { unit: true },
             "sample_fwd_b1" | "sample_fwd_b2" | "sample_fwd_b32" => Program::Sample,
-            "paged_attn_decode" | "paged_attn_prefill" => Program::PagedAttn,
+            "paged_attn_decode"
+            | "paged_attn_prefill"
+            | "paged_attn_decode_pool"
+            | "paged_attn_prefill_walk" => Program::PagedAttn,
             "paged_kv_write" | "paged_kv_write_rows" => Program::PagedKvWrite,
             other => panic!(
                 "`{other}` is in the dump table but `program_of` states no Program for it — \
@@ -3721,6 +3744,7 @@ mod production_ktir_dump {
             "slab_stride_bytes".into(),
             serde_json::json!(op.slab_stride_bytes),
         );
+        obj.insert("walk".into(), serde_json::json!(format!("{:?}", op.walk)));
         serde_json::Value::Object(obj).to_string()
     }
 
@@ -3737,7 +3761,12 @@ mod production_ktir_dump {
         use ktir_superdsc::emit::whole_function::lower_function;
 
         let lk_name = node.func.name;
-        let regions = lk::regions(node).map_err(|e| format!("{name}: regions: {e:?}"))?;
+        // A WALKING program's windows are its trip-0 windows (`loop_fold::flatten`), the reading
+        // the walk's own lowering takes.
+        let flat = ktir_superdsc::emit::loop_fold::flatten(node)
+            .map_err(|e| format!("{name}: flatten: {e:?}"))?;
+        let at_trip0 = flat.as_ref().map_or(node, |f| &f.node);
+        let regions = lk::regions(at_trip0).map_err(|e| format!("{name}: regions: {e:?}"))?;
         let layout = triton_ktir_superdsc::layout::for_regions(node, &regions)
             .map_err(|e| format!("{name}: layout: {e}"))?;
         let windowed = |ops: Result<Vec<ktir_superdsc::emit::EmittedOp>, lk::Error>| {
@@ -3753,8 +3782,14 @@ mod production_ktir_dump {
             | Program::SiluMul
             | Program::RmsNorm
             | Program::ScalarMul
-            | Program::Sample
-            | Program::PagedAttn => windowed(lower_function(node, Some(&layout), &mut sym, None)),
+            | Program::Sample => windowed(lower_function(node, Some(&layout), &mut sym, None)),
+            // The door's walk: the page walk's body at trip 0, marked for the card's relaunch.
+            Program::PagedAttn => {
+                Ok(
+                    ktir_superdsc::emit::whole_function::lower_walk(node, Some(&layout), &mut sym)
+                        .map_err(|e| format!("{name}: {e:?}"))?,
+                )
+            }
             Program::PagedKvWrite => {
                 Ok(
                     lk::paged_kv_write(lk_name, node, &regions, &mut sym, Some(&layout))
@@ -3879,5 +3914,128 @@ mod production_ktir_dump {
                 }
             }
         }
+    }
+}
+
+/// ⭐ THE PAGE WALK ON THE CARD — `paged_attn.py` at granite-3.1-2b's own pool (512 pages of 256
+/// slots, 32 query heads over 8 kv heads at head dim 64), through the card's walk lowering
+/// (`whole_function::lower_walk`): the loop becomes ONE body built at trip 0 that the card relaunches
+/// once per trip, and every fact of that relaunch is read off the program.
+#[cfg(test)]
+mod walk_on_the_card {
+    use super::*;
+    use ktir_superdsc::emit::loop_fold::{WalkTrips, flatten};
+
+    const PAGED_ATTN: &str = include_str!("../../../targets/spyre/kernels/paged_attn.py");
+
+    fn walk(mq: i128, blocks: i128) -> KtirNode {
+        let mut signature = HashMap::new();
+        let mut constexprs = HashMap::new();
+        for p in ["desc_q", "desc_o", "desc_kp", "desc_vp", "desc_mask"] {
+            signature.insert(p.to_string(), ArgSpec::parse("*fp16").expect("spec"));
+        }
+        signature.insert("desc_pt".to_string(), ArgSpec::parse("*i32").expect("spec"));
+        for (k, v) in [
+            ("MQ", mq),
+            ("NQH", 32),
+            ("NKVH", 8),
+            ("HD", 64),
+            ("BLOCK", i128::from(PAGE_SLOTS)),
+            ("NUM_PAGES", 512),
+            ("NUM_BLOCKS", blocks),
+        ] {
+            signature.insert(k.to_string(), ArgSpec::Constexpr);
+            constexprs.insert(k.to_string(), Val::Int(v));
+        }
+        signature.insert("SCALE".to_string(), ArgSpec::Constexpr);
+        constexprs.insert("SCALE".to_string(), Val::Float(0.125));
+        let spec = KernelSpec {
+            kernel: "paged_attn_fwd".to_string(),
+            signature,
+            constexprs,
+            file: "paged_attn.py".to_string(),
+        };
+        let module = compile_kernel(PAGED_ATTN, &spec, &[1]).expect("the walk compiles");
+        triton_ktir_superdsc::node_for(&module, Program::PagedAttn).expect("the walk mints")
+    }
+
+    /// The walk's trips are its blocks, and ONE trip moves the page-table row and the mask tile by
+    /// the same card bytes — `ROWS` stick rows of the stick-major stack, `ROWS` int32 sticks of the
+    /// table — which is the one shift a relaunch applies.
+    #[test]
+    fn the_walk_relaunches_its_body_once_per_block() {
+        for (mq, blocks) in [(1i128, 512i128), (64, 4)] {
+            let node = walk(mq, blocks);
+            let flat = flatten(&node)
+                .expect("the walk flattens")
+                .expect("a multi-block walk states its loop");
+            let rows = mq as u32 * 4;
+            assert_eq!(flat.fold.trips, blocks as u32, "mq={mq}");
+            assert_eq!(flat.fold.step_bytes, rows * 128, "mq={mq}");
+            assert_eq!(
+                flat.fold.carried.len(),
+                3,
+                "the running max, sum and output (mq={mq})"
+            );
+            let layout = triton_ktir_superdsc::layout::for_node(&node).expect("the walk places");
+            let mut sym = 0i64;
+            let ops =
+                ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
+                    .unwrap_or_else(|e| panic!("mq={mq}: the walk lowers: {}", e.message));
+            let marked: Vec<usize> = (0..ops.len()).filter(|&i| ops[i].walk.is_some()).collect();
+            let (first, last) = (marked[0], *marked.last().expect("a body"));
+            assert_eq!(
+                marked.len(),
+                last - first + 1,
+                "mq={mq}: the body's descriptors are one contiguous run — one launch group"
+            );
+            for e in &ops[first..=last] {
+                assert_eq!(
+                    e.walk,
+                    Some(WalkTrips {
+                        trips: blocks as u32,
+                        step_bytes: rows * 128
+                    }),
+                    "mq={mq}: {}",
+                    e.op_name
+                );
+                assert!(e.kv_page_fold && e.kv_gathered, "mq={mq}: {}", e.op_name);
+            }
+            // The carried buffers are seeded, and the body's constants filled, BEFORE the body: a
+            // relaunch shifts the segment the registry constants live in.
+            assert!(
+                ops[..first].iter().all(|e| e.op_name.starts_with("fill")),
+                "mq={mq}: only fills precede the body"
+            );
+            assert!(
+                ops[first..=last]
+                    .iter()
+                    .all(|e| !e.op_name.starts_with("fill") && !e.op_name.starts_with("scalarmul")),
+                "mq={mq}: the body reads no registry constant"
+            );
+            assert!(
+                ops[first..=last]
+                    .iter()
+                    .any(|e| e.op_name.starts_with("gather")),
+                "mq={mq}: the body gathers its pages"
+            );
+            assert!(
+                ops[last + 1..].iter().all(|e| e.walk.is_none()),
+                "mq={mq}: the epilogue runs once"
+            );
+        }
+    }
+
+    /// A one-block walk states no loop — the front end promotes a one-trip `scf.for` to its body —
+    /// and lowers as the straight-line program it is, nothing marked for a relaunch.
+    #[test]
+    fn a_one_block_walk_is_straight_line() {
+        let node = walk(1, 1);
+        assert!(flatten(&node).expect("flattens").is_none());
+        let layout = triton_ktir_superdsc::layout::for_node(&node).expect("places");
+        let mut sym = 0i64;
+        let ops = ktir_superdsc::emit::whole_function::lower_walk(&node, Some(&layout), &mut sym)
+            .unwrap_or_else(|e| panic!("the one-block walk lowers: {}", e.message));
+        assert!(!ops.is_empty() && ops.iter().all(|e| e.walk.is_none()));
     }
 }

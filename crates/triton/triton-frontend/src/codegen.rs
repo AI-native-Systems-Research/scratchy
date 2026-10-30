@@ -2600,6 +2600,43 @@ impl<'a> CodeGen<'a> {
                     .map(Val::Ir)
                     .map_err(|e| Self::located(e, pos))
             }
+            // `tl.trans(input, *dims)` -> `tt.trans` with `dims` as its `order` (upstream
+            // `semantic.permute`). The dims arrive as one tuple or as positional ints; with none,
+            // a rank-2 tensor swaps its two axes, as upstream's default does.
+            "trans" => {
+                let x = self.ir_arg(&get(0, "input"), "tl.trans", pos)?;
+                let rank = self.sem.ty(x).shape().len();
+                let dims: Vec<Val> = match &args[1.min(args.len())..] {
+                    [Val::Seq(d)] => d.clone(),
+                    rest => rest.to_vec(),
+                };
+                let order: Vec<i64> = if dims.is_empty() && rank == 2 {
+                    vec![1, 0]
+                } else {
+                    let mut sorted: Vec<i64> = dims
+                        .iter()
+                        .map(|d| d.as_int().and_then(|v| i64::try_from(v).ok()))
+                        .collect::<Option<Vec<i64>>>()
+                        .unwrap_or_default();
+                    let order = sorted.clone();
+                    sorted.sort_unstable();
+                    if sorted != (0..rank as i64).collect::<Vec<_>>() {
+                        return Err(Error::new(
+                            format!(
+                                "tl.trans needs a compile-time permutation of the {rank} axes of \
+                                 its input"
+                            ),
+                            pos.line,
+                            pos.col,
+                        ));
+                    }
+                    order
+                };
+                self.sem
+                    .trans(x, &order)
+                    .map(Val::Ir)
+                    .map_err(|e| Self::located(e, pos))
+            }
             "arange" => {
                 let a = get(0, "start")
                     .and_then(|v| v.as_int())

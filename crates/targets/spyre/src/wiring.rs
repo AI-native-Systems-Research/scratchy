@@ -778,8 +778,9 @@ impl RotaryKind {
 /// The attention reads its keys and values out of each layer's K and V POOLS (the cache tensors,
 /// head-major `[pages, nkvh, page_slots, hd]`), gathering the pages a request's block table names;
 /// the KV writers scatter the step's rows into them first. Three sources carry the step: the PAGE
-/// TABLE (`[walk, 32]` int32, block `i`'s page at column 0), the MASK STACK (`[walk · rows · gqa,
-/// page_slots]` additive, one tile per walked block at the score tile's own rows) and the WRITE ROWS (`[1, rows · nkvh]` int32, the
+/// TABLE (`[walk, pitch]` int32, block `i`'s page at column 0 of a row one mask tile wide —
+/// [`Self::page_table_pitch`]), the MASK STACK (`[walk · gqa · rows, page_slots]` additive, one tile
+/// per walked block at the score tile's own rows) and the WRITE ROWS (`[1, rows · nkvh]` int32, the
 /// pool row of each (token, kv head)). The pools themselves are never re-staged: the device writes
 /// them and they persist across steps.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -796,7 +797,7 @@ pub struct PagedStep {
     /// KV heads per layer.
     pub nkvh: u32,
     /// Query heads per KV head — the score rows one query row spans: a KV head's group rides its
-    /// walk as `rows · gqa` score rows, row `m · gqa + g` being query row `m` of head `g`.
+    /// walk as `gqa · rows` score rows, row `g · rows + m` being query row `m` of head `g`.
     pub gqa: u32,
     /// Blocks of the page table this bundle's attention walks — the bake's
     /// `scratchy_triton_splice::walk_pages` for the rung, so at most [`Self::pages`].
@@ -815,6 +816,12 @@ impl PagedStep {
     /// and the chunk both sit inside the walk. A step that ends past it would lose keys.
     pub const fn reach(self) -> usize {
         self.walk as usize * self.page_slots as usize
+    }
+
+    /// The page table's row pitch in int32 — one mask tile's bytes, so the walk's per-trip step moves
+    /// the table row and the mask tile together (`scratchy_triton_splice::page_table_pitch`).
+    pub const fn page_table_pitch(self) -> u32 {
+        scratchy_triton_splice::page_table_pitch(self.rows * self.gqa)
     }
 }
 

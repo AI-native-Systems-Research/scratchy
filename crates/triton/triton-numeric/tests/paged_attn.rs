@@ -152,18 +152,18 @@ fn the_step_reaches_the_emulator_as_hardware_gathers_and_scatters() {
         num_blocks: 3,
     };
     let a = lower(ATTN, &attn_spec(&decode));
-    // ⭐ THE WALK IS A LOOP — `for_each_tile`'s ONE block body, not a copy per block: each kv head
-    // walks its blocks in an `scf.for` whose body gathers one K page and one V page through the
-    // trip's own page-table row.
+    // ⭐ THE WALK IS A LOOP — `walk_tiles`' ONE block body, not a copy per block: ONE walk over the
+    // blocks, every kv head in it, whose body gathers one whole K page and one whole V page through
+    // the trip's own page-table row.
     assert_eq!(
         count(&a, OpKind::ScfFor),
-        8,
-        "one page walk per kv head, standing as a loop"
+        1,
+        "one page walk, standing as a loop"
     );
     assert_eq!(
         count(&a, OpKind::KtdpConstructIndirectAccessTile),
-        2 * 8,
-        "one K and one V page gather in each walk's one block body"
+        2,
+        "one K and one V page gather in the walk's one block body"
     );
     // And the program is the same size however long the walk: a 64-block walk is the 3-block
     // walk's ops with a different trip count.
@@ -180,14 +180,14 @@ fn the_step_reaches_the_emulator_as_hardware_gathers_and_scatters() {
         a.ops_deep().len(),
         "a longer walk grew the program"
     );
-    // The prompt walk gathers each page ONCE per kv head too: its four query heads ride one
-    // walk as rows (spyre-inference's batched GQA), not one walk each.
+    // The prompt walk gathers each page ONCE too: every query head rides the one walk
+    // (spyre-inference's batched GQA), not one walk each.
     let prompt = AttnShape { mq: 32, ..decode };
     let p = lower(ATTN, &attn_spec(&prompt));
     assert_eq!(
         count(&p, OpKind::KtdpConstructIndirectAccessTile),
-        2 * 8,
-        "one K and one V page gather per kv head's block body, whatever the query group"
+        2,
+        "one K and one V page gather in the block body, whatever the query width"
     );
     // ⛔ NO WIDEN SURVIVES. The kernel's `exp` islands (`x.to(f32)` → exp → `.to(f16)`) collapse
     // to the bare f16 op, so neither program carries an f16→f32 `arith.extf` — the convert whose
@@ -343,6 +343,36 @@ fn max_abs(a: &[f64], b: &[f64]) -> f64 {
         .fold(0.0, f64::max)
 }
 
+/// spyre-inference's `[NUM_BLOCKS, 32]` page table, re-pitched to the kernel's rows — one int32 stick
+/// per score row (`paged_attn.py`'s `PT_PITCH`, `GQA * MQ * 32`) — each row holding the block's page at
+/// column 0, or from 8 kv heads up its `NKVH` folded-cache rows `page * NKVH + kv`
+/// (`kv_row_pool[page]`), after rotating the blocks left by `rotate` (a control's wrong table).
+fn page_table(s: &Step, rotate: usize) -> Arg {
+    let (raw, shape, _) = s.file("page_table");
+    let (nb, stick) = (shape[0], shape[1]);
+    let nkvh = s.geom("NKVH");
+    let pitch = (s.mq() * s.geom("NQH") / nkvh * 32) as usize;
+    let mut data = vec![0u8; nb * pitch * 4];
+    for b in 0..nb {
+        let from = (b + rotate) % nb * stick * 4;
+        let page = i32::from_le_bytes(raw[from..from + 4].try_into().expect("one word"));
+        let words: Vec<i32> = if nkvh >= 8 {
+            (0..nkvh as i32).map(|kv| page * nkvh as i32 + kv).collect()
+        } else {
+            vec![page]
+        };
+        for (w, v) in words.iter().enumerate() {
+            let at = (b * pitch + w) * 4;
+            data[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+    Arg::TensorBytes {
+        data,
+        shape: vec![nb, pitch],
+        dtype: DType::I32,
+    }
+}
+
 /// The step's attention, on the emulator, over pools `kp`/`vp` with page table `pt`.
 fn attend(s: &Step, kp: &[f64], vp: &[f64], pt: Arg) -> Vec<f64> {
     let (mq, nqh, nkvh, hd) = (s.mq(), s.geom("NQH"), s.geom("NKVH"), s.geom("HD"));
@@ -360,13 +390,13 @@ fn attend(s: &Step, kp: &[f64], vp: &[f64], pt: Arg) -> Vec<f64> {
     let q_shape = vec![mq as usize, (nqh * hd) as usize];
     let pool = vec![pages as usize, nkvh as usize, block as usize, hd as usize];
     // spyre-inference's `[NUM_BLOCKS, MQ, BLOCK]` mask stack, staged at the score rows the way the
-    // worker stages it (`paged_step::mask_stack`): row `m * GQA + g` of each tile is their row `m`.
+    // worker stages it (`paged_step::mask_stack`): row `g * MQ + m` of each tile is their row `m`.
     let gqa = (nqh / nkvh) as usize;
     let theirs = s.values("mask");
     let (b, rows) = (block as usize, mq as usize);
     let mask: Vec<f64> = (0..nb as usize * rows * gqa)
         .flat_map(|r| {
-            let (tile, m) = (r / (rows * gqa), r % (rows * gqa) / gqa);
+            let (tile, m) = (r / (rows * gqa), r % rows);
             theirs[(tile * rows + m) * b..(tile * rows + m + 1) * b].to_vec()
         })
         .collect();
@@ -424,7 +454,7 @@ fn the_step_matches_spyre_inference(config: &str) {
 
     // THE ATTENTION, over the pools our scatter wrote.
     let nb = s.num_blocks() as usize;
-    let got = attend(&s, &kp, &vp, s.arg("page_table", vec![nb, 32]));
+    let got = attend(&s, &kp, &vp, page_table(&s, 0));
     let (exact, served) = (s.values("out_f32"), s.values("out_f16"));
     let err = max_abs(&got, &exact);
     let theirs = max_abs(&served, &exact);
@@ -448,18 +478,7 @@ fn the_step_matches_spyre_inference(config: &str) {
     // CONTROL 1 — the pages are read THROUGH the table: the same pools under a rotated table
     // must miss (a direct read of the pool, or the table ignored, would not).
     if nb > 1 {
-        let (mut table, shape, _) = s.file("page_table");
-        table.rotate_left(32 * 4);
-        let rotated = attend(
-            &s,
-            &kp,
-            &vp,
-            Arg::TensorBytes {
-                data: table,
-                shape,
-                dtype: DType::I32,
-            },
-        );
+        let rotated = attend(&s, &kp, &vp, page_table(&s, 1));
         let miss = max_abs(&rotated, &exact);
         println!("{config}: rotated page table misses by {miss:.3e}");
         assert!(
@@ -473,7 +492,7 @@ fn the_step_matches_spyre_inference(config: &str) {
         &s,
         &s.values("kp_pre"),
         &s.values("vp_pre"),
-        s.arg("page_table", vec![nb, 32]),
+        page_table(&s, 0),
     );
     let miss = max_abs(&stale, &exact);
     println!("{config}: attending the pre-write pools misses by {miss:.3e}");
