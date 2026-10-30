@@ -609,19 +609,39 @@ impl Weave<'_> {
         // The operands that split by heads (op outputs must already be head-split; sources
         // adopt a column split), the head dim the split must fall on, the local op, and the
         // attention sinks' own slice (one sink per query head) when there are sinks.
+        // ⭐ A ROTARY TABLE SPLITS WITH ITS ACTIVATION WHEN IT IS AS WIDE AS IT. `cos`/`sin` are
+        // either one head's `[·, head_dim]` table, broadcast over every head (whole on every
+        // rank), or that table already repeated across the heads (`[·, heads · head_dim]`, as
+        // wide as the rotated activation), in which case each rank's heads read their own
+        // columns of it. The shape says which; a whole wide table against a split activation is
+        // a rope whose views disagree about the width.
+        let tables_as_wide = |me: &Self| -> Vec<usize> {
+            let width = me.operand_shape(desc.inputs[0]).1;
+            [1, 2]
+                .into_iter()
+                .filter(|k| {
+                    desc.inputs
+                        .get(*k)
+                        .is_some_and(|r| me.operand_shape(*r).1 == width)
+                })
+                .collect()
+        };
         let (split, hd, op, sinks): (Vec<usize>, u32, _, Option<(usize, SourceShard)>) =
             match desc.op {
-                SubOp::RopeRotate { head_dim, .. } => (vec![0], head_dim.get(), desc.op, None),
+                SubOp::RopeRotate { head_dim, .. } => {
+                    let mut split = vec![0];
+                    split.extend(tables_as_wide(self));
+                    (split, head_dim.get(), desc.op, None)
+                }
                 // `[K, cos, sin, V, K_cache, V_cache]` (a legacy fixture may stop at V).
-                SubOp::RopeAppend { head_dim, .. } => (
-                    [0, 3, 4, 5]
+                SubOp::RopeAppend { head_dim, .. } => {
+                    let mut split: Vec<usize> = [0, 3, 4, 5]
                         .into_iter()
                         .filter(|k| *k < desc.inputs.len())
-                        .collect(),
-                    head_dim.get(),
-                    desc.op,
-                    None,
-                ),
+                        .collect();
+                    split.extend(tables_as_wide(self));
+                    (split, head_dim.get(), desc.op, None)
+                }
                 // `[K, V, K_cache, V_cache]`.
                 SubOp::KvAppend { head_dim, .. } => {
                     (vec![0, 1, 2, 3], head_dim.get(), desc.op, None)
@@ -855,6 +875,50 @@ pub fn shard(
         collectives: wv.collectives,
         placements: wv.place,
     })
+}
+
+/// [`shard`] over a whole compiler→target handoff: the sharded forward, plus every fact the handoff
+/// keeps parallel to the forward's ops carried onto the op that now computes it. A collective the
+/// analysis inserted realizes no FUF tile and belongs to no expansion, so it carries neither.
+///
+/// Sources keep their indices (only their per-rank shapes change), so the source bindings carry over
+/// unchanged; how each one is sliced is [`ShardedForward::sources`].
+pub fn shard_lowered(
+    lowered: &crate::handoff::LoweredDecode,
+    world: WorldSize,
+    granule: SplitGranule,
+) -> Result<(crate::handoff::LoweredDecode, ShardedForward), ShardRefusal> {
+    let sharded = shard(&lowered.input, world, granule)?;
+    let n_local = sharded.local.ops.len();
+    let at = |i: usize| sharded.op_map[i];
+    let mut op_tiles = vec![None; n_local];
+    let mut op_expansion = vec![None; n_local];
+    for (i, (tile, exp)) in lowered
+        .op_tiles
+        .iter()
+        .zip(&lowered.op_expansion)
+        .enumerate()
+    {
+        op_tiles[at(i)] = *tile;
+        op_expansion[at(i)] = *exp;
+    }
+    let out = crate::handoff::LoweredDecode {
+        input: sharded.local.clone(),
+        bindings: lowered.bindings.clone(),
+        op_tiles,
+        norm_gain_add_tiles: lowered
+            .norm_gain_add_tiles
+            .iter()
+            .map(|(&i, &tile)| (at(i), tile))
+            .collect(),
+        op_expansion,
+        unnamed_reads: lowered
+            .unnamed_reads
+            .iter()
+            .map(|&(w, r)| (at(w), at(r)))
+            .collect(),
+    };
+    Ok((out, sharded))
 }
 
 /// THE SLICE LAW: rank `rank`'s share of a source of `shape` under `shard`. One function, read
@@ -1131,6 +1195,34 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
         assert!(worst < 1e-4, "sharded result off by {worst}");
+    }
+
+    /// The handoff's op-parallel facts follow their ops: at one rank the handoff comes back as it
+    /// went in; at two, each original op's tile lands on the op that now computes it, and each
+    /// inserted collective realizes no tile and belongs to no expansion.
+    #[test]
+    fn the_handoff_facts_follow_their_ops() {
+        use crate::fixtures::front_end_lowered;
+        let lowered = front_end_lowered(one_layer_input());
+        let (one, _) =
+            shard_lowered(&lowered, WorldSize::of::<1>(), SplitGranule::of::<64>()).unwrap();
+        assert_eq!(format!("{one:?}"), format!("{lowered:?}"));
+
+        let (two, sf) =
+            shard_lowered(&lowered, WorldSize::of::<2>(), SplitGranule::of::<64>()).unwrap();
+        assert_eq!(two.op_tiles.len(), two.input.ops.len());
+        assert_eq!(two.op_expansion.len(), two.input.ops.len());
+        for (i, &k) in sf.op_map.iter().enumerate() {
+            assert_eq!(two.op_tiles[k], lowered.op_tiles[i], "op {i}'s tile moved to {k}");
+        }
+        for c in &sf.collectives {
+            assert_eq!(two.op_tiles[c.op], None);
+            assert_eq!(two.op_expansion[c.op], None);
+        }
+        assert_eq!(
+            two.norm_gain_add_tiles.get(&sf.op_map[0]),
+            lowered.norm_gain_add_tiles.get(&0)
+        );
     }
 
     /// A front end that states a collective is refused: placement is the analysis's alone.
