@@ -37,6 +37,7 @@ pub fn run(module: &mut Module) -> Result<()> {
     // traced. The C++ gets the same effect from a conversion adaptor, which hands the pattern
     // the post-conversion value.
     convert_indirect(module)?;
+    convert_scalar_reads(module)?;
     fold_trans_into_access_tile_order(module);
     refuse_raw_tile_access(module)?;
     Ok(())
@@ -577,10 +578,14 @@ fn erase_consumed_id_reads(module: &mut Module, reads: &[Ssa]) {
 /// `None` when no offset is data -- the direct path then lowers the access as before. `Some`
 /// carries the replacement ops and the scalar read the tile now subsumes.
 ///
+/// ⭐ A DATA OFFSET ON AN AXIS WIDER THAN ONE IS THE DIRECT PATH'S: the block starts at the read
+/// row and runs `extent` rows on from it (`k_page = k_tiles.load([first, 0])`, a kernel reading
+/// the consecutive rows an index names under Triton's gather floor). Its anchor is the read's
+/// own value ([`convert_scalar_reads`]), so the tile is a direct one at a corner known only at
+/// run time — a single index cannot stand for `extent` rows in an indirect tile.
+///
 /// ⛔ REFUSED BY NAME, NEVER GUESSED: two data offsets (one index view per tile, the
-/// `to_ktir_emit` law); a data offset on a dim whose block extent is not 1 (the id selects ONE
-/// slab; a wider block would need an index per row, which is `tt.descriptor_gather` /
-/// `tt.descriptor_scatter`); a data offset that is not a direct `tt.load` of `ptr + p`, `p` a constant
+/// `to_ktir_emit` law); a data offset that is not a direct `tt.load` of `ptr + p`, `p` a constant
 /// or an affine function of a constant-trip loop's induction variable (arithmetic on a read value
 /// has no index view to point at); and a non-constant direct offset beside a data one.
 fn slab_access(
@@ -632,14 +637,7 @@ fn slab_access(
         .ok_or_else(|| Refusal::new(PASS, "descriptor operand has no type"))?;
     let block_shape = desc_ty.dims().map(|d| d.to_vec()).unwrap_or_default();
     if block_shape.get(dim).copied() != Some(1) {
-        return Err(Refusal::new(
-            PASS,
-            format!(
-                "a {what} offsets axis {dim} by a loaded value, but the block is \
-                 {block_shape:?} on that axis. A loaded offset selects ONE slab (block extent \
-                 1); selecting several rows by data is a gather or a scatter"
-            ),
-        ));
+        return Ok(None);
     }
     // The scalar read: `tt.load %p` where `%p` is the ids argument or `tt.addptr %ids, %c`.
     let read = index.def_of(offsets[dim]).expect("filtered on a def above");
@@ -884,6 +882,172 @@ fn slab_access(
         );
     }
     Ok(Some((out, offsets[dim])))
+}
+
+/// ⭐⭐ A SCALAR READ WHOSE VALUE IS A VALUE — `page = tl.load(page_index_table + i * 32)` feeding
+/// `page * NUM_KV_HEADS`, where no slab access consumed the read ([`slab_access`]) and the program
+/// computes with what it read.
+///
+/// Lowered to the read it is: a `[n]` memory view over the pointer argument, a one-element direct
+/// tile at the read's element offset, a `ktdp.load` of it, and a `tensor.extract` of the element:
+///
+/// ```text
+///   tt.load %ids + p      ->   ktdp.load (ktdp.construct_access_tile %ids_view[p] {block [1]})
+///                              tensor.extract %t[0]
+/// ```
+///
+/// The offset `p` is a constant or an affine function of a constant-trip loop's induction variable
+/// ([`SlabOffset`]), so the view spans every element any trip reads.
+///
+/// ⛔ REFUSED BY NAME: a read through a computed pointer (no argument to view), and an offset the
+/// view cannot bound (data, or a loop the ladder cannot range).
+fn convert_scalar_reads(module: &mut Module) -> Result<()> {
+    let paths: Vec<OpPath> = walk::paths(module)
+        .into_iter()
+        .filter(|p| {
+            walk::at(module, p)
+                .map(|o| {
+                    o.kind == OpKind::TtLoad && matches!(o.result_type(), Some(IrType::Scalar(_)))
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let index = module.def_index();
+    let loops = loop_ranges(module, &index);
+    let mut edits: Vec<(OpPath, Vec<Op>)> = Vec::with_capacity(paths.len());
+    let mut addptrs: Vec<Ssa> = Vec::new();
+    for path in paths {
+        let op = walk::at(module, &path).expect("path").clone();
+        let res = op.result().expect("a tt.load defines a value");
+        let ty = op
+            .result_type()
+            .cloned()
+            .expect("filtered on a scalar type");
+        let ptr = *op
+            .operands
+            .first()
+            .ok_or_else(|| Refusal::new(PASS, "tt.load with no pointer operand"))?;
+        let (ids, off) = match index.def_of(ptr) {
+            Some(add) if add.kind == OpKind::TtAddptr => {
+                addptrs.push(ptr);
+                let o = add
+                    .operands
+                    .get(1)
+                    .ok_or_else(|| Refusal::new(PASS, "tt.addptr with no offset operand"))?;
+                (add.operands[0], SlabOffset::of(&index, &loops, *o)?)
+            }
+            _ => (ptr, SlabOffset::Const(0)),
+        };
+        let elem = match index.type_of(ids) {
+            Some(IrType::Ptr { elem }) => elem,
+            other => {
+                return Err(Refusal::new(
+                    PASS,
+                    format!(
+                        "a scalar tt.load reads through a {other:?}, not a kernel pointer \
+                         argument; there is no memory view to read it from"
+                    ),
+                ));
+            }
+        };
+        if index.def_of(ids).is_some() {
+            return Err(Refusal::new(
+                PASS,
+                "a scalar tt.load's pointer is computed, not a kernel argument; there is no \
+                 memory view to read it from",
+            ));
+        }
+        let hint = module.hint(res);
+        let n = off.last() + 1;
+        let mut out: Vec<Op> = Vec::new();
+        let ids_idx = module.fresh_named(&hint);
+        out.push(
+            Op::new(OpKind::UnrealizedConversionCast)
+                .with_result(ids_idx, IrType::Index)
+                .with_operands([ids]),
+        );
+        let view = module.fresh_named(&hint);
+        out.push(
+            Op::new(OpKind::KtdpConstructMemoryView)
+                .with_result(
+                    view,
+                    IrType::MemRef {
+                        dims: vec![n],
+                        elem,
+                    },
+                )
+                .with_operands([ids_idx])
+                .with_attr(AttrKey::Shape, Attr::IntList(vec![n]))
+                .with_attr(AttrKey::Strides, Attr::IntList(vec![1]))
+                .with_attr(
+                    AttrKey::CoordinateSet,
+                    Attr::AffineSet(build_range_set_nd(&[n])),
+                )
+                .with_attr(AttrKey::MemorySpace, Attr::Str("HBM".into())),
+        );
+        let at = match off {
+            SlabOffset::Const(c) => {
+                let v = module.fresh_named(&hint);
+                out.push(
+                    Op::new(OpKind::ArithConstant)
+                        .with_result(v, IrType::Index)
+                        .with_attr(AttrKey::Value, Attr::Int(c)),
+                );
+                v
+            }
+            SlabOffset::Loop { value, .. } => value,
+        };
+        let (casts, tile_op) =
+            build_direct_access_tile(module, &index, view, &[1], &[at], &[], &hint);
+        let tile = tile_op.result().expect("the tile defines a value");
+        out.extend(casts);
+        out.push(tile_op);
+        let one = module.fresh_named(&hint);
+        out.push(
+            Op::new(OpKind::KtdpLoad)
+                .with_result(
+                    one,
+                    IrType::Tensor {
+                        dims: vec![1],
+                        elem,
+                    },
+                )
+                .with_operands([tile]),
+        );
+        let zero = module.fresh_named(&hint);
+        out.push(
+            Op::new(OpKind::ArithConstant)
+                .with_result(zero, IrType::Index)
+                .with_attr(AttrKey::Value, Attr::Int(0)),
+        );
+        out.push(
+            Op::new(OpKind::Other("tensor.extract".into()))
+                .with_result(res, ty)
+                .with_operands([one, zero]),
+        );
+        edits.push((path, out));
+    }
+    walk::splice_many(module, edits);
+    // The `tt.addptr`s the reads went through have no reader left.
+    let used = walk::used_values(module);
+    let dead: Vec<OpPath> = walk::paths(module)
+        .into_iter()
+        .filter(|p| {
+            walk::at(module, p)
+                .map(|o| {
+                    o.kind == OpKind::TtAddptr
+                        && o.results
+                            .iter()
+                            .all(|v| addptrs.contains(v) && !used.contains(v))
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    walk::splice_many(module, dead.into_iter().map(|p| (p, Vec::new())).collect());
+    Ok(())
 }
 
 /// The values a constant-trip `scf.for`'s induction variable takes: `first`, then every `step` up to

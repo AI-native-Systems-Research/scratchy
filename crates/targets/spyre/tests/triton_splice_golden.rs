@@ -2030,22 +2030,23 @@ fn the_paged_attention_splices_with_its_contract() {
             ktir_superdsc::ktir_node::Program::PagedAttn,
             "{at}"
         );
-        // The walk's order: q, out, K pool, V pool, page table, mask stack — the step's sources at
-        // the ids the one law (`PagedStepTids`) states.
+        // spyre-inference's operands, in their order: query, query_row_index, the K and V pools, the
+        // page index table, `kv_row_pool` (the decode kernel's, at one query row), the mask stack
+        // and out — the step's sources at the ids the one law (`PagedStepTids`) states.
         let tids = scratchy_triton_splice::PagedStepTids::RESERVED;
         let bound: Vec<u32> = k.bindings.iter().map(|b| b.get()).collect();
-        assert_eq!(
-            bound,
-            vec![
-                node.inputs[0].tensor.index() as u32,
-                node.output.tensor.index() as u32,
-                node.inputs[1].tensor.index() as u32,
-                node.inputs[2].tensor.index() as u32,
-                tids.page_table,
-                tids.mask,
-            ],
-            "{at}"
-        );
+        let mut want = vec![
+            node.inputs[0].tensor.index() as u32,
+            tids.query_rows,
+            node.inputs[1].tensor.index() as u32,
+            node.inputs[2].tensor.index() as u32,
+            tids.page_table,
+        ];
+        if s.mq == 1 {
+            want.push(tids.kv_row_pool);
+        }
+        want.extend([tids.mask, node.output.tensor.index() as u32]);
+        assert_eq!(bound, want, "{at}");
         assert_eq!(k.mask.map(|m| m.get()), Some(tids.mask), "{at}");
         // ⭐ THE CARD'S HALF, through the production door under the bundle's own layout: at a
         // one-stick head dim the walk lowers — its body at trip 0, marked for the card's per-trip
@@ -2091,48 +2092,52 @@ fn the_paged_attention_splices_with_its_contract() {
 ///
 /// The rotation tables are cos 1 / sin 0, so the rotated K is the K and the reference reads the new
 /// block straight from its sources; the rotation itself has its own goldens. Every step's blocks
-/// are the pool's pages REVERSED, and two shapes run a TWO-PAGE pool, so the walk's pages come
-/// through the table and not at their block's own index.
+/// are the pool's pages REVERSED, and the multi-page shapes run a TWO-PAGE pool, so the walk's pages
+/// come through the table and not at their block's own index. Pools and contexts are stated in
+/// pages of `PAGE_SLOTS`, so each shape keeps its place against the page boundaries.
 ///
 /// ⛔ AND IT IS THE KERNEL'S OWN OPS THAT RUN: each shape asserts none of the emulator's native
 /// attention recognizers claims the walk, so a pass here is the kernel's arithmetic.
 #[test]
 #[cfg(feature = "spyre-emu")]
 fn spliced_paged_step_executes_the_real_programs() {
+    // One page, and a position in pages.
+    const P: u32 = scratchy_triton_splice::PAGE_SLOTS;
+    let at = |pages: u32, offset: u32| (pages * P + offset) as usize;
     // (shape, cached positions before the step)
     for (s, cached) in [
-        // Decode at the one-page bake, 32 cached keys.
+        // Decode at a one-page pool, half a page cached.
         (
             AttnShape {
                 geom: (32, 8, 64),
                 mq: 1,
-                cap: 256,
+                cap: P,
                 rung: 0,
                 rope_appended: true,
             },
-            32usize,
+            at(0, P / 2),
         ),
-        // Decode, head dim 128.
+        // Decode, head dim 128, past the first page.
         (
             AttnShape {
                 geom: (32, 8, 128),
                 mq: 1,
-                cap: 256,
+                cap: 2 * P,
                 rung: 0,
                 rope_appended: true,
             },
-            100,
+            at(1, P / 2),
         ),
         // Decode over a TWO-PAGE pool, the context spanning both pages.
         (
             AttnShape {
                 geom: (32, 8, 64),
                 mq: 1,
-                cap: 512,
+                cap: 2 * P,
                 rung: 0,
                 rope_appended: true,
             },
-            300,
+            at(1, P / 2 + 3),
         ),
         // Decode at TWO kv heads (qwen2.5-0.5b's attention, 14 query heads): the step's write is
         // two rows, under Triton's scatter floor of 8, so the KV write runs row by row.
@@ -2140,33 +2145,33 @@ fn spliced_paged_step_executes_the_real_programs() {
             AttnShape {
                 geom: (14, 2, 64),
                 mq: 1,
-                cap: 256,
+                cap: P,
                 rung: 0,
                 rope_appended: true,
             },
-            40,
+            at(0, P / 2 + 8),
         ),
         // The first prompt chunk: nothing cached, 31 rows.
         (
             AttnShape {
                 geom: (32, 8, 64),
                 mq: 31,
-                cap: 256,
+                cap: P,
                 rung: u32::MAX,
                 rope_appended: true,
             },
             0,
         ),
-        // A prompt chunk over a cached prefix.
+        // A prompt chunk over a cached prefix, its rows crossing into the second page.
         (
             AttnShape {
                 geom: (32, 8, 64),
                 mq: 31,
-                cap: 256,
+                cap: 2 * P,
                 rung: 0,
                 rope_appended: true,
             },
-            40,
+            at(0, P / 2 + 8),
         ),
         // The PREFIX-FREE rung running a chunk over a cached prefix: its walk is the one page its
         // rows fill, so a chunk whose prefix sits in that page is the rung's to run — the reach law
@@ -2175,11 +2180,11 @@ fn spliced_paged_step_executes_the_real_programs() {
             AttnShape {
                 geom: (32, 8, 64),
                 mq: 31,
-                cap: 256,
+                cap: P,
                 rung: u32::MAX,
                 rope_appended: true,
             },
-            40,
+            at(0, P - 31 - 5),
         ),
         // The same over a TWO-PAGE pool: the one-block walk reads the request's first block, which
         // the reversed table puts on the pool's LAST page.
@@ -2187,11 +2192,11 @@ fn spliced_paged_step_executes_the_real_programs() {
             AttnShape {
                 geom: (32, 8, 64),
                 mq: 31,
-                cap: 512,
+                cap: 2 * P,
                 rung: u32::MAX,
                 rope_appended: true,
             },
-            100,
+            at(0, P - 31 - 5),
         ),
     ] {
         execute_one_paged_step(s, cached);
@@ -2238,7 +2243,12 @@ fn execute_one_paged_step(s: AttnShape, cached: usize) {
         .ktir
         .as_ref()
         .expect("the walk carries its program");
-    let t_out = u64::from(walk.bindings[1].get());
+    let t_out = u64::from(
+        walk.bindings
+            .last()
+            .expect("out is the walk's last operand")
+            .get(),
+    );
     let groups: Vec<scratchy_target_spyre::bundle_code::LaunchGroup<'static>> = programs
         .into_iter()
         .map(|e| {

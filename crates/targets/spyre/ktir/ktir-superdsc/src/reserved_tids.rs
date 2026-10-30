@@ -400,15 +400,15 @@ pub fn rope_p_class_hds(hds: impl Iterator<Item = u32>) -> Vec<u32> {
     out
 }
 
-/// ⭐⭐⭐ THE PAGED STEP's THREE HOST SOURCES — the mask stack, the page table and the write rows a
-/// paged forward's attention and KV writes read, staged by the host every step.
+/// ⭐⭐⭐ THE PAGED STEP's HOST SOURCES — spyre-inference's own attention operands besides the pools:
+/// the mask stack, the page index table, the KV write index, the query row index and `kv_row_pool`.
 ///
 /// ⛔ RESERVED, NOT NUMBERED PAST THE GRAPH. They were `ir.tensors.len() + k`, the attention mask's
 /// old law — and a resident session holds the decode AND the prefill programs, whose graphs differ in
 /// size (the prefill's sampler mint and lm-head fold give it fewer tensors): MEASURED on granite-2b,
 /// the prefill's sources sat at t1157–t1159, which are REAL tensors of the decode graph, so every
 /// prompt step's staging overwrote decode-program state and the forward printed garbage. A reserved
-/// region names the same three ids for every bundle and no graph can produce one.
+/// region names the same ids for every bundle and no graph can produce one.
 ///
 /// A NEW REGION, below `kct_resident`'s floor: the gaps above it are burned (stale artifacts may still
 /// carry their old slots), and nothing has ever been baked here.
@@ -418,8 +418,12 @@ pub const PAGED_STEP_BASE: u32 = u32::MAX - 2_000_171;
 pub const PAGED_MASK_TID: u32 = reserved_region("paged_step").at(0);
 /// The paged step's page table — see [`PAGED_STEP_BASE`].
 pub const PAGED_PAGE_TABLE_TID: u32 = reserved_region("paged_step").at(1);
-/// The paged step's write rows — see [`PAGED_STEP_BASE`].
+/// The paged step's KV write index — see [`PAGED_STEP_BASE`].
 pub const PAGED_WRITE_ROWS_TID: u32 = reserved_region("paged_step").at(2);
+/// The paged step's query row index — see [`PAGED_STEP_BASE`].
+pub const PAGED_QUERY_ROWS_TID: u32 = reserved_region("paged_step").at(3);
+/// The paged step's `kv_row_pool` — see [`PAGED_STEP_BASE`].
+pub const PAGED_KV_ROW_POOL_TID: u32 = reserved_region("paged_step").at(4);
 
 /// Every reserved region, in one place. Order is high tid → low.
 pub const RESERVED_REGIONS: [TidRegion; 8] = [
@@ -485,7 +489,7 @@ pub const RESERVED_REGIONS: [TidRegion; 8] = [
     TidRegion {
         name: "paged_step",
         base: PAGED_STEP_BASE,
-        slots: 3,
+        slots: 5,
     },
 ];
 

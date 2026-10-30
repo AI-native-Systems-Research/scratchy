@@ -777,17 +777,19 @@ impl RotaryKind {
 ///
 /// The attention reads its keys and values out of each layer's K and V POOLS (the cache tensors,
 /// head-major `[pages, nkvh, page_slots, hd]`), gathering the pages a request's block table names;
-/// the KV writers scatter the step's rows into them first. Three sources carry the step: the PAGE
-/// TABLE (`[walk, pitch]` int32, block `i`'s page at column 0 of a row one mask tile wide —
-/// [`Self::page_table_pitch`]), the MASK STACK (`[walk · gqa · rows, page_slots]` additive, one tile
-/// per walked block at the score tile's own rows) and the WRITE ROWS (`[1, rows · nkvh]` int32, the
-/// pool row of each (token, kv head)). The pools themselves are never re-staged: the device writes
-/// them and they persist across steps.
+/// the KV writers scatter the step's rows into them first. spyre-inference's own operands carry the
+/// step (`crate::paged_step` builds each as their metadata builder does): the PAGE INDEX TABLE
+/// (`[walk, 32]` int32, block `i`'s page at column 0), the MASK STACK (`[walk, rows, page_slots]`
+/// additive, one tile per walked block), the KV WRITE INDEX (`nkvh` `[rows]` int32 indices, one per
+/// kv head), the QUERY ROW INDEX (`[rows]` int32) and `kv_row_pool` (`[pages, nkvh, 1]` int32). The
+/// pools themselves are never re-staged: the device writes them and they persist across steps.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PagedStep {
     pub mask: u32,
     pub page_table: u32,
     pub write_rows: u32,
+    pub query_rows: u32,
+    pub kv_row_pool: u32,
     /// Pages in each layer's pools — the scheduler's block count.
     pub pages: u32,
     /// Token slots per page — the scheduler's block size.
@@ -796,9 +798,6 @@ pub struct PagedStep {
     pub rows: u32,
     /// KV heads per layer.
     pub nkvh: u32,
-    /// Query heads per KV head — the score rows one query row spans: a KV head's group rides its
-    /// walk as `gqa · rows` score rows, row `g · rows + m` being query row `m` of head `g`.
-    pub gqa: u32,
     /// Blocks of the page table this bundle's attention walks — the bake's
     /// `scratchy_triton_splice::walk_pages` for the rung, so at most [`Self::pages`].
     pub walk: u32,
@@ -818,10 +817,26 @@ impl PagedStep {
         self.walk as usize * self.page_slots as usize
     }
 
-    /// The page table's row pitch in int32 — one mask tile's bytes, so the walk's per-trip step moves
-    /// the table row and the mask tile together (`scratchy_triton_splice::page_table_pitch`).
-    pub const fn page_table_pitch(self) -> u32 {
-        scratchy_triton_splice::page_table_pitch(self.rows * self.gqa)
+    /// Whether this bundle's attention reads `kv_row_pool` — spyre-inference's dispatch: the decode
+    /// kernel at one query row does, the prefill kernel past it does not.
+    pub const fn reads_kv_row_pool(self) -> bool {
+        self.rows == 1
+    }
+
+    /// ⭐ THE PAGE TABLE'S PITCH ON THE CARD — bytes from one page table row to the next: the walk's
+    /// relaunch shift. A trip moves the mask tile `[rows, page_slots]`, `rows` rows of the
+    /// stick-major stack one 128-B stick apart, and the relaunch shifts every step source in the
+    /// activation segment by that one step (`loop_fold`'s pitched index table), so the card holds
+    /// row `i` at `i · rows · 128` B. One int32 stick at decode.
+    pub const fn card_page_table_pitch(self) -> u64 {
+        self.rows as u64 * Df::Fp16.elems_per_stick() as u64 * 2
+    }
+
+    /// `kv_row_pool` on the card: each page's run of `nkvh` rows held at
+    /// [`INDEX_RUN_WORDS`](ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS) int32
+    /// words, the run the decode walk's chained index copies per page.
+    pub const fn card_kv_row_pool_bytes(self) -> u64 {
+        self.pages as u64 * ktir_superdsc::emit::lower_ktir_to_superdsc::INDEX_RUN_WORDS as u64 * 4
     }
 }
 

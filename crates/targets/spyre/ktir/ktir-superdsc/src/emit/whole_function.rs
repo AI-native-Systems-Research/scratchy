@@ -733,9 +733,174 @@ pub fn program_silu_mul_chains(f: &IRFunction<'static>) -> Result<Vec<SiluMulCha
         if readers.next().is_some() || head.is_none_or(|o| o.op_type != OpKind::MathExp) {
             continue;
         }
+        // ⭐ AND THE `exp` FEEDS A SIGMOID'S `1 + e`. An exponential of a negation that no `addf`
+        // reads is not a sigmoid at all but the program's own `exp(-x)` — spyre-inference's
+        // online-softmax rescale `exp(-relu(scores_max - tile_max))`, read by the running sum and
+        // the running output — and lowers as the two ops it states. One that does feed an `addf`
+        // is claimed, and every link of its chain must close.
+        let Some(exp_v) = head.and_then(|o| o.result) else {
+            continue;
+        };
+        if !deep
+            .iter()
+            .any(|o| o.op_type == OpKind::ArithAddf && o.operands.contains(&exp_v))
+        {
+            continue;
+        }
         out.push(silu_mul_chain_from(f, neg)?);
     }
     Ok(out)
+}
+
+/// Whether `tid` is one of the program's paged KV pools ([`crate::ktir_node::Program::paged_pool_params`]).
+fn pool_param(k: &KtirNode, tid: u32) -> bool {
+    k.program
+        .paged_pool_params()
+        .iter()
+        .any(|&i| k.bindings.get(i).is_some_and(|b| b.get() == tid))
+}
+
+/// A gathered table's `[rows, cols]` — the gather's tile's data view.
+fn gather_table_dims(f: &IRFunction<'static>, g: &Gather) -> Result<(u32, u32), Error> {
+    let tile = f.operations.iter().find(|o| o.result == Some(g.tile));
+    let view = tile
+        .and_then(|t| t.operands.first().copied())
+        .and_then(|v| f.operations.iter().find(|o| o.result == Some(v)));
+    let dims = view.and_then(|v| v.result_type).and_then(|t| t.dims());
+    match dims {
+        Some(&[r, c]) => Ok((r as u32, c as u32)),
+        other => err(format!(
+            "{}: a gathered table states a {other:?} view — a row gather reads a 2-D `[rows, cols]` \
+             table",
+            f.name
+        )),
+    }
+}
+
+/// `r`'s buffer read in the `[rows, cols]` frame of the same card bytes.
+fn reframed(r: Region, [rows, cols]: [u32; 2]) -> Region {
+    Region {
+        v_rows: rows,
+        v_cols: cols,
+        r_start: 0,
+        c_start: 0,
+        r_len: rows,
+        c_len: cols,
+        r_cover: (0, rows),
+        c_cover: (0, cols),
+        ..r
+    }
+}
+
+/// ⭐ THE HEAD-MAJOR PAIR at `op` — a byte-free reshape/transpose pair on the card, and the frame its
+/// result's bytes are in: `(the pair's last result, [rows, cols])`.
+///
+/// A stick-major `[B, A·S]` buffer (`S` one stick) holds stick column `a` of row `b` at
+/// `(a·B + b)·S` — head-major `[A, B, S]` row-major, byte for byte. So
+///
+/// * `reshape [B, A·S] → [B, A, S]` read only by `transpose [1, 0, 2] → [A, B, S]` is the source in
+///   the `[A·B, S]` frame (`op` the reshape), and
+/// * `transpose [1, 0, 2]` of `[A, B, S]` row-major `→ [B, A, S]` read only by
+///   `reshape → [B, A·S]` is the source in the stick-major `[B, A·S]` frame (`op` the transpose).
+///
+/// `None` for anything else.
+fn head_major_pair(
+    f: &IRFunction<'static>,
+    op: &ktir_core::ir::Operation<'static>,
+    from: &[i64],
+    to: &[i64],
+) -> Option<(Ssa, [u32; 2])> {
+    let stick = i64::from(crate::work::FP16_ELEMS_PER_STICK);
+    let res = op.result?;
+    let deep = f.ops_deep();
+    let sole_reader = |v: Ssa| {
+        let mut rs = deep
+            .iter()
+            .copied()
+            .filter(move |o| o.operands.contains(&v));
+        let first = rs.next();
+        if rs.next().is_some() { None } else { first }
+    };
+    let perm_102 = |o: &ktir_core::ir::Operation<'static>| {
+        o.op_type == OpKind::LinalgTranspose
+            && o.attributes.iter().any(|(k, v)| {
+                matches!((k, v), (AttrKey::Permutation, Attr::IntList(p)) if *p == [1, 0, 2])
+            })
+    };
+    let dims_of = |o: &ktir_core::ir::Operation<'static>| -> Option<Vec<i64>> {
+        o.result_type.and_then(|t| t.dims()).map(<[i64]>::to_vec)
+    };
+    match op.op_type {
+        OpKind::TensorReshape => {
+            let ([b, aw], [b2, a, s]) = (from, to) else {
+                return None;
+            };
+            if b != b2 || *s != stick || a * s != *aw {
+                return None;
+            }
+            let t = sole_reader(res).filter(|o| perm_102(o))?;
+            if dims_of(t)? != [*a, *b, *s] {
+                return None;
+            }
+            Some((t.result?, [(a * b) as u32, *s as u32]))
+        }
+        OpKind::LinalgTranspose if perm_102(op) => {
+            let [a, b, s] = from else {
+                return None;
+            };
+            if *s != stick || to != [*b, *a, *s] {
+                return None;
+            }
+            let r = sole_reader(res).filter(|o| o.op_type == OpKind::TensorReshape)?;
+            if dims_of(r)? != [*b, a * s] {
+                return None;
+            }
+            Some((r.result?, [*b as u32, (a * s) as u32]))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `tile` is a `ktdp.construct_indirect_access_tile`.
+fn indirect_tile_of(f: &IRFunction<'static>, tile: Option<Ssa>) -> bool {
+    tile.is_some_and(|t| {
+        f.operations
+            .iter()
+            .any(|o| o.result == Some(t) && o.op_type == OpKind::KtdpConstructIndirectAccessTile)
+    })
+}
+
+/// ⭐ THE SCATTER A VALUE IS STORED THROUGH — `res`, or a shape op that moves no byte of it, written
+/// by a `ktdp.store` through an indirect access tile: its rows land on the rows of the destination
+/// parameter its index names. `None` when no such store reads it.
+fn indirect_store_of(
+    k: &KtirNode,
+    res: Ssa,
+) -> Result<Option<super::lower_ktir_to_superdsc::RowScatter>, Error> {
+    let f = &k.func;
+    let reshaped = f
+        .operations
+        .iter()
+        .find(|o| {
+            matches!(
+                o.op_type,
+                OpKind::TensorReshape | OpKind::TensorCollapseShape | OpKind::TensorExpandShape
+            ) && o.operands.first() == Some(&res)
+        })
+        .and_then(|o| o.result);
+    let Some(store) = f.operations.iter().find(|s| {
+        s.op_type == OpKind::KtdpStore
+            && (s.operands.first() == Some(&res) || s.operands.first().copied() == reshaped)
+            && indirect_tile_of(f, s.operands.get(1).copied())
+    }) else {
+        return Ok(None);
+    };
+    let tile = f
+        .operations
+        .iter()
+        .find(|o| o.result == store.operands.get(1).copied())
+        .expect("indirect_tile_of found it");
+    super::lower_ktir_to_superdsc::row_scatter_of(k, tile).map(Some)
 }
 
 /// The one chain headed by `neg`, proven link by link.
@@ -1627,11 +1792,20 @@ fn program_broadcast_chains(
         };
         // Mutable because the Y ADMISSION below re-states a leading multi-row spray's axis and
         // flat flag after the walk-back has resolved the source's own row count.
+        // ⭐ A RUN OF LEADING AXES IS ONE LEADING AXIS OF THE FLAT FRAME: the flat frame folds every
+        // axis but the last into its rows, so spraying `[0..k)` (spyre-inference's mask tile over
+        // `[kv_head, group]`, `mask_tile[0]` broadcast against `[kv, group, query, block]`) is the
+        // leading spray `[0]` is, its count the product of the k sprayed extents (the Y admission
+        // below).
+        let leading = rank > 2
+            && !dims.is_empty()
+            && dims.len() < rank
+            && dims.iter().enumerate().all(|(i, &d)| d == i as i64);
         let (mut axis, mut flat) = match (rank, dims) {
             (_, [1]) if rank <= 2 => (BcastAxis::Col, false),
             (_, [0]) if rank <= 2 => (BcastAxis::Mb, false),
             (r, [d]) if r > 2 && *d as usize == r - 1 => (BcastAxis::Col, true),
-            (r, [d]) if r > 2 && *d == 0 => (BcastAxis::Mb, true),
+            _ if leading => (BcastAxis::Mb, true),
             (r, [d]) if r > 2 => {
                 return err(format!(
                     "{}: `linalg.broadcast` adds dim {d} of a rank-{r} tensor — a MIDDLE axis of \
@@ -1944,7 +2118,11 @@ fn program_broadcast_chains(
                         source_rows.unwrap_or(0)
                     ));
                 };
-                let y = s.first().copied().unwrap_or(0);
+                // The spray count: the leading axes the broadcast adds, folded; the source's rows must
+                // then be the rest of the row axes, folded.
+                let lead = dims.len().min(s.len());
+                let y: i64 = s[..lead].iter().product();
+                let mb: i64 = s[lead..s.len().saturating_sub(1)].iter().product();
                 if y <= 1 {
                     return err(format!(
                         "{}: `linalg.broadcast` sprays a rank > 2 source of {} flat rows down its \
@@ -1969,7 +2147,7 @@ fn program_broadcast_chains(
                             f.name
                         ));
                     }
-                    Some(rows) if s.get(1).is_some_and(|&m| m as u32 == rows) => {
+                    Some(rows) if mb as u32 == rows => {
                         axis = BcastAxis::Y(y as u32);
                         flat = false;
                         y_admitted = true;
@@ -2127,6 +2305,18 @@ fn presented_flat(r: &Region, axis: BcastAxis) -> Result<Region, String> {
     );
     let presented = match axis {
         BcastAxis::Col => frame.flat_col()?,
+        // ⭐ ONE WHOLE ROW OF A MULTI-ROW, MULTI-STICK VIEW is already the row vector — the rank-2
+        // `Mb` window the emitter sprays one stick column at a time when its sticks sit a
+        // row-block apart (`elementwise_broadcast`'s strided row vector). No flat row presents
+        // it. A ONE-stick view's row is one contiguous stick, which the flat row below presents.
+        BcastAxis::Mb
+            if r.r_len == 1
+                && r.c_start == 0
+                && r.c_len == r.v_cols
+                && r.v_cols > crate::superdsc_opspec::Df::Fp16.elems_per_stick() =>
+        {
+            return Ok(*r);
+        }
         BcastAxis::Mb => frame.flat_mb()?,
         // The row-split mode addresses the source's OWN `[mb, out]` region — the presentation
         // is the identity, and this arm exists only because the match is exhaustive.
@@ -2376,6 +2566,10 @@ fn windowed_region(k: &KtirNode, mut r: Region, tile: &Operation<'_>) -> Result<
     // descriptor can carry.
     let window = match row.and_then(|s| consts.get(&s).copied()) {
         Some(rs) => Some((rs as u32, tr)),
+        // ⭐ A TILE AS TALL AS ITS VIEW SITS AT ROW 0 whatever its corner computes: any other corner
+        // reads rows past the view. spyre-inference's prompt kernel under Triton's gather floor
+        // reads its `[P, D]` query as the one tile at `query_row_index[0]` over the `[P, D]` view.
+        None if tr == r.v_rows => Some((0, tr)),
         None => row.and_then(|s| {
             let u = uniform.get(&s)?;
             let band = positions.checked_mul(u.stride)?;
@@ -3396,6 +3590,8 @@ fn lower_function_folded(
         .map(|(i, g)| (g.load, i))
         .collect();
     let mut gather_carried = vec![false; gathers.len()];
+    // The second op of every head-major pair ([`head_major_pair`]), lowered with the first.
+    let mut head_major_skip: std::collections::HashSet<Ssa> = std::collections::HashSet::new();
     // The row fold's own view of the same analyses — built once here so its helpers read ONE
     // value rather than threading three slices each (see [`FoldAnalyses`]).
     let analyses = FoldAnalyses {
@@ -3479,6 +3675,8 @@ fn lower_function_folded(
         Some((*at.first()?, *at.last()? + 1))
     });
     let mut body_out: (usize, Option<usize>) = (0, None);
+    // The int32 zero every chained index's run is copied against ([`int_zero_run`]).
+    let mut int_zero: Option<u32> = None;
     // A carried buffer may take its yielded value's write only once nothing later reads the value it
     // holds: the last op reading each carried arg, by position.
     let last_read = |arg: Ssa| -> Option<usize> {
@@ -3513,6 +3711,13 @@ fn lower_function_folded(
                         }
                     }
                 }
+                if let Some(layout) = layout
+                    && gathers.iter().any(|g| g.via.is_some())
+                {
+                    let (tid, ops) = int_zero_run(f.name, layout, floor, sym_id_base)?;
+                    out.extend(ops);
+                    int_zero = Some(tid);
+                }
                 body_out.0 = out.len();
             }
             if oi == end {
@@ -3532,12 +3737,25 @@ fn lower_function_folded(
         {
             continue;
         }
+        // ⭐ AN INTEGER SCALAR EXTRACTED FROM A LOAD IS AN ADDRESS — a position read through a table
+        // (`page = tl.load(page_index_table + i * 32)`), which a chained gather reads in place
+        // ([`super::lower_ktir_to_superdsc::ChainedIndex`]); no node kind consumes it as data.
+        if op.op_type == OpKind::TensorExtract
+            && matches!(
+                op.result_type,
+                Some(ktir_core::irtype::IrType::Scalar(DType::I32 | DType::I64))
+                    | Some(ktir_core::irtype::IrType::Index)
+            )
+        {
+            continue;
+        }
         // The chain's INTERIOR — negate, exp, 1+, divide — is lowered by nothing at all: the one
         // `Program::SiluMul` below stands for all five ops, and the device primitive never
         // materialises these values. Skipped BEFORE `program_of`, which would otherwise refuse the
         // `arith.negf` for having no 1:1 mapping (correctly, in isolation).
         if op.result.is_some_and(|r| {
-            silus.iter().any(|c| c.consumed.contains(&r))
+            head_major_skip.contains(&r)
+                || silus.iter().any(|c| c.consumed.contains(&r))
                 || rmsnorms.iter().any(|c| c.consumed.contains(&r))
                 // The expand/collapse/broadcast chain itself: no descriptor, the consumer states it.
                 || bcast_consumed.contains(&r)
@@ -3576,14 +3794,42 @@ fn lower_function_folded(
                     .unwrap_or_default()
             };
             let (mut from, to) = (def_dims(src), def_dims(res));
-            // A GATHERED source is held as the page gather lands it — one-stick sub-rows, its
-            // slabs' own row-major bytes — whatever shape the load states.
+            // A GATHERED POOL is held as the page gather lands it — one-stick sub-rows, its slabs'
+            // own row-major bytes — whatever shape the load states. Any other gathered table lands
+            // stick-major at the load's own shape ([`super::lower_ktir_to_superdsc::row_gather`]).
             let stick = i64::from(crate::work::FP16_ELEMS_PER_STICK);
             let numel: i64 = from.iter().product();
-            if gathered_loads.contains_key(&src) && numel % stick == 0 {
+            let pooled = |gi: usize| pool_param(k, gathers[gi].value_tid);
+            if gathered_loads.get(&src).is_some_and(|&gi| pooled(gi)) && numel % stick == 0 {
                 from = vec![numel / stick, stick];
             }
-            if !same_card_bytes(&from, &to) {
+            // ⭐ THE HEAD-MAJOR PAIR — a reshape of a stick-major `[B, A·S]` row block into
+            // `[B, A, S]` read only by the `[1, 0, 2]` transpose into `[A, B, S]`: on the card the
+            // two together move no byte (stick column `a` of the block IS head `a`'s rows), so the
+            // transpose's result is the source's own bytes in the `[A·B, S]` frame, and both lower
+            // to nothing (spyre-inference's `q_rows.unsqueeze(0).transpose(1, 2).reshape(...)`).
+            if !gathered_loads.contains_key(&src)
+                && let Some((t_res, frame)) = head_major_pair(f, op, &from, &to)
+            {
+                let source = match region_for_operand(k, src)?.or_else(|| inter.get(&src).copied())
+                {
+                    Some(r) => r,
+                    None => {
+                        return err(format!(
+                            "{}: the head-major reshape reads a value this walk holds no buffer for",
+                            f.name
+                        ));
+                    }
+                };
+                let r = reframed(source, frame);
+                inter.insert(res, r);
+                inter.insert(t_res, r);
+                head_major_skip.insert(t_res);
+                continue;
+            }
+            if !same_card_bytes(&from, &to)
+                && !gathered_loads.get(&src).is_some_and(|&gi| !pooled(gi))
+            {
                 return err(format!(
                     "{}: `{:?}` re-frames {from:?} as {to:?}, which moves bytes on the card (the \
                      two stick-major frames place an element at different addresses) — a \
@@ -3599,7 +3845,93 @@ fn lower_function_folded(
                             f.name
                         ));
                     };
+                    if !pool_param(k, gathers[gi].value_tid) {
+                        let g = gathers[gi];
+                        let (table_rows, cols) = gather_table_dims(f, &g)?;
+                        let tid = mint_inter(k, layout, floor, src);
+                        layout.synth(crate::place::PlaceId::Act(tid), &[g.entries, cols]);
+                        let r = Region {
+                            tid,
+                            v_rows: g.entries,
+                            v_cols: cols,
+                            r_start: 0,
+                            c_start: 0,
+                            r_len: g.entries,
+                            c_len: cols,
+                            r_cover: (0, g.entries),
+                            c_cover: (0, cols),
+                            is_out: true,
+                            is_fp8: false,
+                            band: None,
+                        };
+                        out.extend(super::lower_ktir_to_superdsc::row_gather(
+                            f.name,
+                            &g,
+                            table_rows,
+                            cols,
+                            &r,
+                            sym_id_base,
+                            Some(layout),
+                        )?);
+                        gather_carried[gi] = true;
+                        let r = Region { is_out: false, ..r };
+                        inter.insert(src, r);
+                        if let Some((t_res, frame)) = head_major_pair(f, op, &from, &to) {
+                            let r2 = reframed(r, frame);
+                            inter.insert(res, r2);
+                            inter.insert(t_res, r2);
+                            head_major_skip.insert(t_res);
+                        } else if same_card_bytes(&from, &to) {
+                            inter.insert(res, reframed(r, flat_frame(&to)));
+                        } else {
+                            return err(format!(
+                                "{}: `{:?}` re-frames a gathered {from:?} as {to:?}, which moves \
+                                 bytes on the card — a relayout this door does not state. A \
+                                 stick-major row is its heads in stick order only while a head is \
+                                 ONE {stick}-element stick",
+                                f.name, op.op_type
+                            ));
+                        }
+                        continue;
+                    }
                     let (g, page_sticks) = page_gather_of(f, gathers[gi])?;
+                    // ⭐ A CHAINED INDEX runs as its two gathers: the run of index words is copied
+                    // first, through the position table, into a scratch stick the gather then reads.
+                    let g = match g.via {
+                        Some(chain) => {
+                            let zero = match int_zero {
+                                Some(z) => z,
+                                None => {
+                                    let (z, ops) =
+                                        int_zero_run(f.name, layout, floor, sym_id_base)?;
+                                    out.extend(ops);
+                                    int_zero = Some(z);
+                                    z
+                                }
+                            };
+                            let run = layout.take_inter_tid(floor);
+                            layout.synth_df(
+                                crate::place::PlaceId::Act(run),
+                                &[1, super::lower_ktir_to_superdsc::INDEX_RUN_WORDS],
+                                crate::superdsc_opspec::Df::SenUint32,
+                            );
+                            out.extend(super::lower_ktir_to_superdsc::index_run_gather(
+                                f.name,
+                                &g,
+                                chain,
+                                (run, zero),
+                                sym_id_base,
+                                Some(layout),
+                            )?);
+                            Gather {
+                                index_tid: run,
+                                first_entry: crate::superdsc_opspec::EntryBase::ZERO,
+                                via: None,
+                                ..g
+                            }
+                        }
+                        None => g,
+                    };
                     let [rows, cols] = flat_frame(&from);
                     if cols != crate::work::FP16_ELEMS_PER_STICK {
                         return err(format!(
@@ -3648,8 +3980,60 @@ fn lower_function_folded(
                     }
                 },
             };
+            // The same bytes, in the frame the result is typed in — the frame its consumers read
+            // (a `[1, 2048]` gathered query row is the `[8, 4, 64]` batched dot's `[32, 64]`).
+            let [rr, rc] = flat_frame(&to);
+            let whole = source.r_start == 0
+                && source.c_start == 0
+                && source.r_len == source.v_rows
+                && source.c_len == source.v_cols;
+            let source = if whole && source.v_rows * source.v_cols == rr * rc {
+                reframed(source, [rr, rc])
+            } else {
+                source
+            };
             inter.insert(res, source);
             continue;
+        }
+        // ⭐ THE HEAD-MAJOR PAIR FROM THE TRANSPOSE's SIDE — spyre-inference's
+        // `attn.reshape(1, num_heads, P, D).transpose(1, 2).reshape(P, num_heads, D)`: the source's
+        // own bytes in the stick-major frame, and the rows a scatter takes from there.
+        if op.op_type == OpKind::LinalgTranspose
+            && let (Some(res), Some(&src)) = (op.result, op.operands.first())
+        {
+            let dims = |v: Ssa| -> Vec<i64> {
+                f.operations
+                    .iter()
+                    .find(|o| o.result == Some(v))
+                    .and_then(|o| o.result_type)
+                    .and_then(|t| t.dims())
+                    .map(<[i64]>::to_vec)
+                    .unwrap_or_default()
+            };
+            if let Some((r_res, frame)) = head_major_pair(f, op, &dims(src), &dims(res)) {
+                let Some(source) = region_for_operand(k, src)?.or_else(|| inter.get(&src).copied())
+                else {
+                    return err(format!(
+                        "{}: the head-major transpose reads a value this walk holds no buffer for",
+                        f.name
+                    ));
+                };
+                let r = reframed(source, frame);
+                inter.insert(res, r);
+                inter.insert(r_res, r);
+                head_major_skip.insert(r_res);
+                if let Some(sc) = indirect_store_of(k, r_res)? {
+                    out.extend(super::lower_ktir_to_superdsc::row_scatter(
+                        f.name,
+                        &reframed(r, [sc.entries, sc.cols]),
+                        sc,
+                        sc.value_rows,
+                        sym_id_base,
+                        layout,
+                    )?);
+                }
+                continue;
+            }
         }
         // The terminal — the `up` multiply for the fused form, the divide itself for a bare one —
         // IS the fused program, and its inputs are the chain's gate and up rather than its own
@@ -4030,7 +4414,10 @@ fn lower_function_folded(
             let r = per_op[i];
             let degenerate = match axis {
                 BcastAxis::Col => r.c_len == 1,
-                BcastAxis::Mb => r.v_rows == 1,
+                // One row of its view: the whole view at one row, or a one-row window of a taller
+                // one (the walk's mask tile, row `i` of the stack), which the emitter addresses at
+                // its own row.
+                BcastAxis::Mb => r.v_rows == 1 || r.r_len == 1,
                 // ⭐ THE ROW-SPLIT SOURCE IS A FULL TILE ON PURPOSE — the opposite of degenerate
                 // — so there is nothing to check in THIS frame. Its proof is the consumer's own
                 // want check (`elementwise_broadcast`: the source at `[rows/y, c_len]` against
@@ -4313,10 +4700,15 @@ fn lower_function_folded(
         // THIS OP'S OUTPUT: the parameter a `ktdp.store` writes from this op's result — directly, or
         // through a shape op that moves no byte (the walk's `[NKVH, ROWS, HD]` result stored as the
         // `[NQH, MQ, HD]` the output view states).
+        // ⭐ A STORE THROUGH AN INDIRECT TILE IS A SCATTER, NOT THIS OP's OUTPUT: the value is an
+        // intermediate, and [`indirect_store_of`] copies it to the rows its index names after the op
+        // writes it (spyre-inference's `out.index_copy_(0, query_row_index, attn)`).
         let stores_of = |v: Option<Ssa>| {
-            f.operations
-                .iter()
-                .find(|s| s.op_type == OpKind::KtdpStore && s.operands.first().copied() == v)
+            f.operations.iter().find(|s| {
+                s.op_type == OpKind::KtdpStore
+                    && s.operands.first().copied() == v
+                    && !indirect_tile_of(f, s.operands.get(1).copied())
+            })
         };
         let mut stored = stores_of(op.result).or_else(|| {
             let res = op.result?;
@@ -4684,6 +5076,17 @@ fn lower_function_folded(
             if let Lowering::BatchTranspose { .. } = program {
                 kernel_blocks.insert(r.tid);
             }
+            // ⭐ AND WHERE THE PROGRAM STORES THE VALUE THROUGH AN INDEX, THE ROWS GO THERE NOW.
+            if let Some(sc) = indirect_store_of(k, res)? {
+                out.extend(super::lower_ktir_to_superdsc::row_scatter(
+                    f.name,
+                    &reframed(r, [sc.entries, sc.cols]),
+                    sc,
+                    sc.value_rows,
+                    sym_id_base,
+                    Some(layout),
+                )?);
+            }
             lowered += 1;
             continue;
         };
@@ -4974,6 +5377,61 @@ fn splat_buffer(
         },
         value,
     )))
+}
+
+/// ⭐ THE INT32 ZERO a chained index's run is copied against
+/// ([`super::lower_ktir_to_superdsc::index_run_gather`]): [`INDEX_RUN_WORDS`] SENUINT32 zeros. The
+/// card writes int32 words from a constant only through its converts, so the zero is an fp16 0.0
+/// fill widened (`dl16tofp32`) and converted (`fp32toint32`) — the sampler's own fp32 island, at the
+/// converts' 64-element device width. A walk makes it before its body, beside the splat buffers,
+/// since the fill reads a registry constant a relaunch would shift.
+///
+/// [`INDEX_RUN_WORDS`]: super::lower_ktir_to_superdsc::INDEX_RUN_WORDS
+fn int_zero_run(
+    name: &str,
+    layout: &BundleLayout,
+    floor: u32,
+    sym_id_base: &mut i64,
+) -> Result<(u32, Vec<super::EmittedOp>), Error> {
+    use super::lower_ktir_to_superdsc::{ConvertKind, INDEX_RUN_WORDS, convert, fill};
+    use crate::superdsc_opspec::Df;
+    let words = INDEX_RUN_WORDS;
+    let buffer = |df: Df| {
+        let tid = layout.take_inter_tid(floor);
+        layout.synth_df(crate::place::PlaceId::Act(tid), &[1, words], df);
+        Region {
+            tid,
+            v_rows: 1,
+            v_cols: words,
+            r_start: 0,
+            c_start: 0,
+            r_len: 1,
+            c_len: words,
+            r_cover: (0, 1),
+            c_cover: (0, words),
+            is_out: true,
+            is_fp8: false,
+            band: None,
+        }
+    };
+    let read = |r: Region| Region { is_out: false, ..r };
+    let (z16, z32, zero) = (buffer(Df::Fp16), buffer(Df::Fp32), buffer(Df::SenUint32));
+    let mut ops = fill(name, 0.0, &z16, sym_id_base, Some(layout))?;
+    ops.extend(convert(
+        name,
+        ConvertKind::Dl16ToFp32,
+        &[read(z16), z32],
+        sym_id_base,
+        Some(layout),
+    )?);
+    ops.extend(convert(
+        name,
+        ConvertKind::Fp32ToInt32,
+        &[read(z32), zero],
+        sym_id_base,
+        Some(layout),
+    )?);
+    Ok((zero.tid, ops))
 }
 
 /// A value's FLAT FRAME — every axis but the last folded into rows ([`shape_2d`]'s reading).

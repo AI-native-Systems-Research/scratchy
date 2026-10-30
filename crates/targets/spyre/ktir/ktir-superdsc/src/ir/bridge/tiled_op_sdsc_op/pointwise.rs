@@ -514,6 +514,7 @@ pub fn scatter_copy_opspec(
         cols,
         df,
         src_elems,
+        dst_elems,
     } = spec;
     crate::superdsc_opspec::assert_df_stick_multiple(cols, df)?;
     if cols != df.elems_per_stick() {
@@ -581,22 +582,51 @@ pub fn scatter_copy_opspec(
              its dims are [mb, out, y], so the paged axis must be `mb`"
         )
     })?;
+    if dst_elems > 0
+        && let Some(o) = op.args.last_mut()
+    {
+        o.set_offset_elems(dst_elems);
+    }
     Ok(op)
 }
 
-/// THE PAGE GATHER — the scatter's mirror image: an `identity` copy whose INPUT is the paged value,
+/// THE WORDS A PAGE GATHER MOVES, and so the op that moves them unchanged. dxp binds `identity` on
+/// fp16 and fp32 data only (`unary_parallel.ddl`); the binds over SENUINT32 data are
+/// `int32idxtoaddr`, `addi32toi32` and `muli32toi32` (`broadcast_ops.ddl:26`), so a run of int32
+/// index words is gathered as `zero + run` — the wrapping add of a stick of zeros, which moves every
+/// word as it is.
+#[derive(Clone, Copy, Debug)]
+pub enum GatheredWords<'a> {
+    /// fp16 rows — an `identity` copy.
+    Fp16,
+    /// int32 index words — `addi32toi32(zero, run)`, `zero` one stick of zeros.
+    SenUint32 { zero: &'a str },
+}
+
+impl GatheredWords<'_> {
+    fn df(self) -> Df {
+        match self {
+            GatheredWords::Fp16 => Df::Fp16,
+            GatheredWords::SenUint32 { .. } => Df::SenUint32,
+        }
+    }
+}
+
+/// THE PAGE GATHER — the scatter's mirror image: a copy whose gathered INPUT is the paged value,
 /// read through the index one whole entry at a time (`dxp/test/test_gather_1core/sdsc_1.json`'s
 /// shape), into a contiguous scratch. `rows` one-stick sub-rows of the scratch, `gather.page` of them
 /// per index entry, so `skip_addr` — the page times the unpinned extents — is one entry's own size and
-/// the paged value's entries must sit exactly that far apart (a whole page of a pool does).
+/// the paged value's entries must sit exactly that far apart (a whole page of a pool does). The copy
+/// is the op [`GatheredWords`] names; the gathered input is its LAST, next to the index.
 pub fn page_gather_copy_opspec(
     src: &str,
     dst: &str,
     gather: crate::superdsc_opspec::GatherIndex,
     rows: u32,
     cols: u32,
-    df: Df,
+    words: GatheredWords<'_>,
 ) -> Result<OpSpec, String> {
+    let df = words.df();
     crate::superdsc_opspec::assert_df_stick_multiple(cols, df)?;
     if cols != df.elems_per_stick() {
         return Err(format!(
@@ -628,8 +658,14 @@ pub fn page_gather_copy_opspec(
         is_stick,
         df,
     };
+    let (op_func, ins): (OpFunc, Vec<&str>) = match words {
+        GatheredWords::Fp16 => (OpFunc::Identity, vec![src]),
+        GatheredWords::SenUint32 { zero } => (OpFunc::AddI32ToI32, vec![zero, src]),
+    };
     let tile_op = TileOp {
-        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce { n_operands: 2 },
+        kind: crate::ir::island::tile_op::TileOpKind::PointwiseOrReduce {
+            n_operands: ins.len() as u32 + 1,
+        },
         dims: vec![
             dim("mb", rows, false),
             dim("out", cols, true),
@@ -639,8 +675,8 @@ pub fn page_gather_copy_opspec(
     };
     let mut op = pointwise_opspec_from_tile_split(
         &tile_op,
-        OpFunc::Identity,
-        &[src],
+        op_func,
+        &ins,
         dst,
         true,
         |dims: &[crate::superdsc_opspec::ItDim], max_cores: u32| {
@@ -651,7 +687,7 @@ pub fn page_gather_copy_opspec(
     for a in op.args.iter_mut() {
         a.set_df(df);
     }
-    op.attach_gather_index(gather, 0).ok_or_else(|| {
+    op.attach_gather_index(gather, ins.len() - 1).ok_or_else(|| {
         format!(
             "page_gather_copy_opspec('{src}' -> '{dst}'): the index declaration does not fit this \
              op — its dims are [mb, out, y], so the paged axis must be `mb`"
@@ -660,11 +696,15 @@ pub fn page_gather_copy_opspec(
     Ok(op)
 }
 
-/// A page gather's extent: `rows` one-stick sub-rows of `df` in the scratch it fills.
+/// A page gather's extent: `rows` one-stick sub-rows of `words` in the scratch it fills, read from
+/// `src_elems` into the gathered value (its entries counted from there) and written `dst_elems`
+/// into the scratch.
 #[derive(Clone, Copy, Debug)]
-pub struct PageGatherRows {
+pub struct PageGatherRows<'a> {
     pub rows: u32,
-    pub df: Df,
+    pub words: GatheredWords<'a>,
+    pub src_elems: u32,
+    pub dst_elems: u32,
 }
 
 /// [`page_gather_copy_opspec`] + `emit_sdsc_tiled`.
@@ -673,24 +713,44 @@ pub fn assemble_page_gather_copy(
     src: &str,
     dst: &str,
     gather: crate::superdsc_opspec::GatherIndex,
-    PageGatherRows { rows, df }: PageGatherRows,
+    PageGatherRows {
+        rows,
+        words,
+        src_elems,
+        dst_elems,
+    }: PageGatherRows<'_>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<EmittedOp, String> {
-    let op = page_gather_copy_opspec(src, dst, gather, rows, df.elems_per_stick(), df)?;
+    let gathered = match words {
+        GatheredWords::Fp16 => 0,
+        GatheredWords::SenUint32 { .. } => 1,
+    };
+    let mut op =
+        page_gather_copy_opspec(src, dst, gather, rows, words.df().elems_per_stick(), words)?;
+    if src_elems > 0 {
+        op.args[gathered].set_offset_elems(src_elems);
+    }
+    if dst_elems > 0
+        && let Some(o) = op.args.last_mut()
+    {
+        o.set_offset_elems(dst_elems);
+    }
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
         .map_err(|e| format!("assemble_page_gather_copy {op_name}: {e}"))
 }
 
 /// One scattered copy's extents: `rows` one-stick sub-rows of `cols` (one stick) elements of `df`,
-/// read from the source starting `src_elems` elements in.
+/// read from the source starting `src_elems` elements in, written through the index from the
+/// destination's base plus `dst_elems`.
 #[derive(Clone, Copy, Debug)]
 pub struct ScatterCopySpec {
     pub rows: u32,
     pub cols: u32,
     pub df: Df,
     pub src_elems: u32,
+    pub dst_elems: u32,
 }
 
 /// [`scatter_copy_opspec`] + `emit_sdsc_tiled` — the one assembler for a scattered copy.
@@ -1273,6 +1333,7 @@ mod scatter_tests {
                 cols: 64,
                 df: Df::Fp16,
                 src_elems: 0,
+                dst_elems: 0,
             },
         )
         .expect("an 8-row, two-stick-per-row scatter builds");
@@ -1299,6 +1360,7 @@ mod scatter_tests {
                 cols: 64,
                 df: Df::Fp16,
                 src_elems: 0,
+                dst_elems: 0,
             },
         )
         .expect_err("33 entries do not fit one index stick");
