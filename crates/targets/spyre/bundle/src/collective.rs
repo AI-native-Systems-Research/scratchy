@@ -90,4 +90,22 @@ mod tests {
         );
         assert_eq!(wdone_balance(cb_pipeline(&groups)), 0);
     }
+
+    /// A consume's weight slot is pinned to the base region at shift 0 whatever layer or bank the
+    /// launch is for; every other group keeps the layer's own pair.
+    #[test]
+    fn a_consume_reads_the_window_unshifted_and_unbanked() {
+        let consume = TpConsume {
+            kind: CollectiveKind::AllReduce,
+            operand: crate::PlaceId::Act(7),
+            fragment: fragments(1, 2048, WireBytes::CAP).unwrap()[0],
+        };
+        let plain = crate::KvShifts::default();
+        let consuming = crate::KvShifts {
+            tp: Some(consume),
+            ..Default::default()
+        };
+        assert_eq!(plain.weight_slot(4096, 2), (4096, 2));
+        assert_eq!(consuming.weight_slot(4096, 2), (0, 0));
+    }
 }
