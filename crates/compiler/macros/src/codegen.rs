@@ -11743,16 +11743,6 @@ fn dump_wavefront_mega(
                                     // re-launched. The runtime picks this one whenever the context fits
                                     // a single page, which is the case that has to stay at the
                                     // baseline's cost.
-                                    // ⛔⛔⛔ AND THE FOLD PASS DOES HAVE A KTIR COUNTERPART — this
-                                    // read "NO FUSED TWIN … a fold pass with no KTIR counterpart",
-                                    // which is false. `assemble_attn` still stamps
-                                    // `kv_page_fold = true` on its prefix-fold ops (one file, shared
-                                    // by both paths), so `trip_kinds_for` still has `PageFold` trips
-                                    // to reclassify. MEASURED, smollm2-135m under `-Fspyre-hw`: the
-                                    // ladder rungs — whose twin was never removed — report `5
-                                    // group(s)` split against `3 group(s)` fused for the same 75
-                                    // trips. Two launches per layer, on the path the runtime prefers.
-                                    //
                                     // ⭐ THE TWIN IS A LAUNCH-*GROUPING* VARIANT, SO IT IS THE CARD'S.
                                     // Off-card `ktir_groups` takes `_fold` and never reads it — one
                                     // launch group per op, always — so an emulator twin is a
@@ -11764,21 +11754,20 @@ fn dump_wavefront_mega(
                                     // emit failure is logged and left `none()` — silent at runtime
                                     // only in the sense the selector documented: it falls through
                                     // to the split body, one launch per layer dearer.
-                                    // ⛔ NOT FOR A CHUNK CEILING, like no chunk rung: a chunk body has
-                                    // no fold to fuse, so its "twin" is the same program again — and
-                                    // the selector's single-page arm takes the first FUSED rung that
-                                    // covers the context, which past the per-page bodies was this one.
-                                    // A prompt chunk whose prefix is exactly one page (`valid_len` 257,
-                                    // `n_fold_pages` 1) ran the 64-page chunk: ~0.45 s against ~0.1 s
-                                    // for its neighbours, on every request (granite-2b, 96 and 128
-                                    // rows). Without the twin it falls to the split ladder's 2-page
-                                    // chunk. The ladder proves it (`no_chunk_has_a_fused_twin`).
+                                    // ⛔ AND ONLY WHERE THERE IS A FOLD TO FUSE
+                                    // (`superdsc::has_fused_twin`). A body with none — every paged
+                                    // step's, whose walk is never fused away — has a "twin" that is
+                                    // its split program again under a second name: a second dxp
+                                    // compile and a second copy in the card image, for every rung.
                                     let bodies_fused: Vec<superdsc::bundle::SiblingFp<'static>> =
                                         if card {
                                             rolled
                                                 .bodies
                                                 .iter()
                                                 .map(|b| {
+                                                    if !superdsc::has_fused_twin(&b.ops) {
+                                                        return superdsc::bundle::SiblingFp::none();
+                                                    }
                                                     superdsc::emit_bundle(
                                                         &b.ops,
                                                         Some(&rolled.layout),
@@ -12024,16 +12013,12 @@ fn dump_wavefront_mega(
                                                                         // is `&rung_unrolled` while
                                                                         // this is `&b.ops`, so the
                                                                         // "twin" was named after a
-                                                                        // bundle nothing else emitted.
-                                                                        // ⛔ NOT FOR A CHUNK RUNG: a chunk body
-                                                                        // has no fold group, so its "fused" twin
-                                                                        // is the same program under a second
-                                                                        // name — a whole extra bake per rung —
-                                                                        // and the selector's one-pass arm keys
-                                                                        // on a one-page PREFIX, which a prompt
-                                                                        // chunk past one page has. Proven below
-                                                                        // (`no_chunk_has_a_fused_twin`).
-                                                                        rfused.push(if card {
+                                                                        // bundle nothing else emitted. And
+                                                                        // only where there is a fold to fuse,
+                                                                        // as for the ceiling's.
+                                                                        rfused.push(if card
+                                                                            && superdsc::has_fused_twin(&b.ops)
+                                                                        {
                                                                         superdsc::emit_bundle(
                                                                             &b.ops,
                                                                             Some(&rr.layout),

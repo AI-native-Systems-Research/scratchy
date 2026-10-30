@@ -2075,6 +2075,12 @@ fn the_paged_attention_splices_with_its_contract() {
             walking,
             "{at}: the body is marked for the relaunch exactly when the walk loops"
         );
+        // And a walk's body never fuses away, so the attention has no fold-fused twin: the bake
+        // would compile its split program twice, under two names.
+        assert!(
+            !scratchy_target_spyre::lower_subtile_tape_to_superdsc::has_fused_twin(&ops),
+            "{at}: the paged attention has a fold-fused twin"
+        );
     }
 }
 
